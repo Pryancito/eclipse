@@ -356,6 +356,16 @@ mod tests {
             check_alignment(BASE, K + 8),
             Err(BandRefusal::NotPageAligned)
         );
+        // Half a page is not a page either, and it is the near miss that a
+        // base built out of somebody's own allocation actually produces.
+        assert_eq!(
+            check_alignment(BASE + K / 2, K),
+            Err(BandRefusal::NotPageAligned)
+        );
+        assert_eq!(
+            check_alignment(BASE, K + K / 2),
+            Err(BandRefusal::NotPageAligned)
+        );
     }
 
     #[test]
@@ -403,6 +413,24 @@ mod tests {
         t.pages.get_mut(&(BASE + 2 * K)).unwrap().1 = RO;
         assert_eq!(
             survey(&t, BASE, 4 * K, Take::Everything),
+            Err(BandRefusal::NotUniform)
+        );
+    }
+
+    #[test]
+    fn a_page_that_carries_more_than_the_others_is_refused_too() {
+        // "Uniform" has to mean equal and not "at least": the band is put
+        // back from the one value recorded here, so a page carrying
+        // something the rest do not carry would have that permission taken
+        // away from it for good on the way back.
+        let mut t = Table::band(4, RW);
+        t.pages.get_mut(&(BASE + 2 * K)).unwrap().1 = RW | MMUFlags::EXECUTE;
+        assert_eq!(
+            survey(&t, BASE, 4 * K, Take::Everything),
+            Err(BandRefusal::NotUniform)
+        );
+        assert_eq!(
+            survey(&t, BASE, 4 * K, Take::WriteOnly),
             Err(BandRefusal::NotUniform)
         );
     }
@@ -579,5 +607,83 @@ mod tests {
     fn a_huge_entry_is_named_by_its_size() {
         assert_eq!(refuse_huge(PageSize::Size2M), BandRefusal::Huge2M);
         assert_eq!(refuse_huge(PageSize::Size1G), BandRefusal::Huge1G);
+    }
+    #[test]
+    fn no_two_refusals_read_alike() {
+        // The reason is the only thing the boot log carries out of this
+        // module: whoever reads "band ... is not mapped" goes looking at the
+        // executor's stack allocation, and whoever reads "is covered by a
+        // 2 MiB PTE" goes looking at the split. Two refusals that print the
+        // same words send both of them to the same wrong place, and the
+        // checks above -- non-empty, lower-case, and the three that depend on
+        // what was being taken -- all hold while any two of them are swapped.
+        let all = [
+            BandRefusal::NotPageAligned,
+            BandRefusal::NotMapped,
+            BandRefusal::NoSplitFrames,
+            BandRefusal::Huge2M,
+            BandRefusal::Huge1G,
+            BandRefusal::NothingToTakeAway,
+            BandRefusal::NotUniform,
+            BandRefusal::RegistryFull,
+            BandRefusal::EditFailed,
+            BandRefusal::NoEffect,
+        ];
+        for take in [Take::Everything, Take::WriteOnly] {
+            for (i, a) in all.iter().enumerate() {
+                for b in &all[i + 1..] {
+                    assert_ne!(a.reason(take), b.reason(take), "{:?} and {:?}", a, b);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn each_refusal_names_the_thing_it_is_about() {
+        // Distinctness is not enough: two refusals can be swapped and stay
+        // distinct, which is the shape this whole module was written to stop
+        // -- the two halves of the job differ in three lines and used to
+        // disagree about which of them a huge mapping belonged to.
+        let cases = [
+            (
+                BandRefusal::NotPageAligned,
+                Take::Everything,
+                "page aligned",
+            ),
+            (BandRefusal::NotMapped, Take::Everything, "not mapped"),
+            (BandRefusal::NoSplitFrames, Take::Everything, "split"),
+            (BandRefusal::Huge2M, Take::Everything, "2 MiB"),
+            (BandRefusal::Huge1G, Take::Everything, "1 GiB"),
+            (BandRefusal::NotUniform, Take::Everything, "4 KiB"),
+            (BandRefusal::RegistryFull, Take::Everything, "registry slot"),
+            // The three that read differently for the two jobs name the
+            // permission each one was after.
+            (
+                BandRefusal::NothingToTakeAway,
+                Take::Everything,
+                "no permissions",
+            ),
+            (
+                BandRefusal::NothingToTakeAway,
+                Take::WriteOnly,
+                "not writable",
+            ),
+            (
+                BandRefusal::EditFailed,
+                Take::Everything,
+                "permissions cleared",
+            ),
+            (
+                BandRefusal::EditFailed,
+                Take::WriteOnly,
+                "write permission cleared",
+            ),
+            (BandRefusal::NoEffect, Take::Everything, "still readable"),
+            (BandRefusal::NoEffect, Take::WriteOnly, "still writable"),
+        ];
+        for (r, take, needle) in cases {
+            let s = r.reason(take);
+            assert!(s.contains(needle), "{:?} for {:?} reads {:?}", r, take, s);
+        }
     }
 }

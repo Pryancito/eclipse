@@ -467,4 +467,125 @@ mod tests {
         assert_eq!(t.slot_of(K + 0x8_1000), None);
         assert_eq!(t.slot_of(K + 0xfff), None);
     }
+    #[test]
+    fn a_slot_taken_below_the_mark_does_not_pull_the_mark_down_with_it() {
+        // Slots are handed out lowest-first and freed in whatever order the
+        // executors die, so the slot a claim wins is routinely *below* the
+        // highest one in use. The mark bounds the walk on the fault path: one
+        // that followed the last claim instead of the highest would leave
+        // every band above it unfindable, which reads as an ordinary kernel
+        // fault on a guard page.
+        let t: SlotTable<4> = SlotTable::new();
+        let a = t.claim(K, 0x1000, 0).unwrap();
+        let b = t.claim(K + 0x1000, 0x1000, 0).unwrap();
+        assert_eq!((a, b), (0, 1));
+        t.free(a);
+        assert_eq!(
+            t.claim(K + 0x2000, 0x1000, 0),
+            Some(0),
+            "the hole is reused"
+        );
+        assert_eq!(t.high_water(), 2);
+        assert_eq!(
+            t.slot_of(K + 0x1000),
+            Some(b),
+            "and the one above it is still found"
+        );
+    }
+
+    #[test]
+    fn asking_about_a_slot_the_table_does_not_have_answers_nothing() {
+        // The index comes back from `claim` and is kept by the caller across
+        // the page-table edit and the roll-back; one past the end is the
+        // index the array itself would refuse, on a path where a panic takes
+        // the kernel with it.
+        let t: SlotTable<2> = SlotTable::new();
+        t.claim(K, 0x1000, 7).unwrap();
+        assert_eq!(t.range(2), None);
+        assert_eq!(t.flags(2), None);
+        assert_eq!(t.range(usize::MAX), None);
+        assert_eq!(t.flags(usize::MAX), None);
+    }
+
+    #[test]
+    fn a_slot_another_cpu_is_in_the_middle_of_writing_is_not_taken_from_under_it() {
+        let t: SlotTable<3> = SlotTable::new();
+        // What slot 0 looks like between the claim that won it and the stores
+        // that fill it in: the counter is odd and `base` is still the free
+        // marker. Reading only `base` there says "free", and two executors
+        // starting at once would then be given the same slot -- the second
+        // one's band silently replacing the first one's.
+        t.slots[0].seq.store(1, Ordering::Release);
+        assert_eq!(t.claim(K, 0x1000, 0), Some(1), "it is skipped, not taken");
+        // Skipped, not lost: once its writer publishes it, it is a slot like
+        // any other.
+        t.slots[0].seq.store(2, Ordering::Release);
+        assert_eq!(t.claim(K + 0x1000, 0x1000, 0), Some(0));
+    }
+
+    #[test]
+    fn a_half_written_slot_is_not_believed_by_anything_that_reads_it() {
+        // The other side of the same counter: every reader here -- the fault
+        // path's walk and the two diagnostics -- has to refuse a slot whose
+        // three words may not belong together.
+        let t: SlotTable<2> = SlotTable::new();
+        let i = t.claim(K, 0x1000, 3).unwrap();
+        assert_eq!(t.slot_of(K + 0x800), Some(i));
+        t.slots[i].seq.fetch_add(1, Ordering::Release);
+        assert_eq!(t.slot_of(K + 0x800), None);
+        assert_eq!(t.range(i), None);
+        assert_eq!(t.flags(i), None);
+        assert_eq!(t.live(), 0);
+        t.slots[i].seq.fetch_add(1, Ordering::Release);
+        assert_eq!(t.slot_of(K + 0x800), Some(i));
+        assert_eq!(t.range(i), Some((K, K + 0x1000)));
+        assert_eq!(t.live(), 1);
+    }
+
+    #[test]
+    fn a_reader_racing_the_writers_never_believes_a_band_that_never_was() {
+        // `covers` is asked the question above with snapshots made by hand;
+        // this asks it of the real loads, with writers actually running. One
+        // slot takes the two bands in turn, and they are far apart, so the
+        // pair a reader can straddle -- the base of the one that was there
+        // with the end of the one that replaced it -- covers PROBE, which was
+        // never inside either. Believing it reports "stack overflow" for an
+        // ordinary kernel fault, and stops that fault being resolved against
+        // the VMAR that could have explained it.
+        //
+        // The race is what it is: this test can only ever fail, never pass
+        // spuriously.
+        const LOW: usize = K;
+        const HIGH: usize = K + 0x10_0000;
+        const PROBE: usize = K + 0x8_0000;
+
+        let table: std::sync::Arc<SlotTable<1>> = std::sync::Arc::new(SlotTable::new());
+        let stop = std::sync::Arc::new(core::sync::atomic::AtomicBool::new(false));
+        let reader = {
+            let table = table.clone();
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                let mut bogus = 0usize;
+                while !stop.load(Ordering::Relaxed) {
+                    if table.slot_of(PROBE).is_some() {
+                        bogus += 1;
+                    }
+                    if let Some((b, e)) = table.range(0) {
+                        let real = (b == LOW || b == HIGH) && e == b + 0x1000;
+                        if !real {
+                            bogus += 1;
+                        }
+                    }
+                }
+                bogus
+            })
+        };
+        for round in 0..200_000u32 {
+            let base = if round % 2 == 0 { LOW } else { HIGH };
+            let i = table.claim(base, 0x1000, 0).unwrap();
+            table.free(i);
+        }
+        stop.store(true, Ordering::Relaxed);
+        assert_eq!(reader.join().unwrap(), 0, "a torn pair was believed");
+    }
 }

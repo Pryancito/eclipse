@@ -206,6 +206,7 @@ pub(crate) mod test_waker {
         wakes: AtomicUsize,
         clones: AtomicUsize,
         on_next_clone: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+        on_next_drop: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     }
 
     impl Probe {
@@ -214,6 +215,7 @@ pub(crate) mod test_waker {
                 wakes: AtomicUsize::new(0),
                 clones: AtomicUsize::new(0),
                 on_next_clone: Mutex::new(None),
+                on_next_drop: Mutex::new(None),
             })
         }
 
@@ -230,6 +232,15 @@ pub(crate) mod test_waker {
         /// Run `f` once, from inside the next clone of this probe's waker.
         pub(crate) fn interrupt_next_clone(&self, f: Box<dyn FnOnce() + Send>) {
             *self.on_next_clone.lock() = Some(f);
+        }
+
+        /// Run `f` once, from inside the next *drop* of this probe's waker,
+        /// while it is still there to be taken. Letting go of the waker is
+        /// the other half of a cancel, and the order it happens in relative
+        /// to the rest of the cancel is the whole of what stops a callback
+        /// running on another CPU from taking it.
+        pub(crate) fn interrupt_next_drop(&self, f: Box<dyn FnOnce() + Send>) {
+            *self.on_next_drop.lock() = Some(f);
         }
     }
 
@@ -264,6 +275,15 @@ pub(crate) mod test_waker {
     }
 
     unsafe fn drop_raw(data: *const ()) {
+        {
+            let probe = unsafe { &*(data as *const Probe) };
+            // Out from under the lock, as in `clone`, and before the waker is
+            // actually let go: a hook here stands where the other CPU is.
+            let hook = probe.on_next_drop.lock().take();
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
         unsafe { drop(Arc::from_raw(data as *const Probe)) };
     }
 }
@@ -492,6 +512,96 @@ mod tests {
             probe.wakes(),
             1,
             "the fire counts once, the cancel not at all"
+        );
+    }
+    /// The order a cancel does its two jobs in.
+    ///
+    /// A callback firing on another CPU takes whatever waker it finds, so
+    /// marking the cell first is what makes it return without touching the
+    /// cell at all; the waker is then let go with nobody left who could have
+    /// taken it. The other way round leaves a moment where the cell does not
+    /// read as done and the waker is still in it -- a wake delivered through
+    /// a task that is being freed, which is the shape this whole module was
+    /// written to remove.
+    #[test]
+    fn a_cancel_marks_the_cell_done_before_it_lets_the_waker_go() {
+        let probe = Probe::new();
+        let cell = Arc::new(TimerWakerInner {
+            deadline: DL,
+            done: AtomicBool::new(false),
+            waker: Mutex::new(Some(waker_of(&probe))),
+        });
+        let done_when_let_go = Arc::new(AtomicBool::new(false));
+        probe.interrupt_next_drop(Box::new({
+            let cell = cell.clone();
+            let seen = done_when_let_go.clone();
+            move || seen.store(cell.done.load(Ordering::SeqCst), Ordering::SeqCst)
+        }));
+        cell.cancel();
+        assert!(cell.done.load(Ordering::SeqCst), "a cancelled cell says so");
+        assert!(cell.waker.lock().is_none(), "and holds no waker");
+        assert!(
+            done_when_let_go.load(Ordering::SeqCst),
+            "the waker was let go while the cell still read as live"
+        );
+        assert_eq!(probe.wakes(), 0, "a cancel is not a wake");
+    }
+
+    #[test]
+    fn cancelling_a_cell_twice_is_the_same_as_cancelling_it_once() {
+        // Reached from `Drop` as well as from `kill_timer_waker`, on paths
+        // where a panic is a kernel panic.
+        let probe = Probe::new();
+        let cell = Arc::new(TimerWakerInner {
+            deadline: DL,
+            done: AtomicBool::new(false),
+            waker: Mutex::new(Some(waker_of(&probe))),
+        });
+        cell.cancel();
+        cell.cancel();
+        assert!(cell.done.load(Ordering::SeqCst));
+        assert!(cell.waker.lock().is_none());
+        assert_eq!(probe.wakes(), 0);
+    }
+
+    /// A fire hands the waker out; it does not leave a copy of it behind.
+    ///
+    /// The cell outlives the fire -- the owner's slot holds it until the
+    /// future is polled again or dropped -- so a waker still in it after the
+    /// timer has come and gone is a live reference to a task that has just
+    /// been woken and may already be finishing.
+    #[test]
+    fn a_timer_that_fired_keeps_no_waker_behind() {
+        let probe = Probe::new();
+        let mut slot = None;
+        let callback = arm(&mut slot, DL, &probe);
+        assert_eq!(Arc::strong_count(&probe), 2, "the parked waker holds one");
+        callback(TICK);
+        assert_eq!(probe.wakes(), 1);
+        assert_eq!(
+            Arc::strong_count(&probe),
+            1,
+            "nothing points at the task now"
+        );
+        assert!(slot.as_ref().unwrap().is_done());
+    }
+
+    /// ...and neither does the wake the refresh has to deliver itself.
+    #[test]
+    fn the_orphan_wake_takes_the_waker_rather_than_copying_it() {
+        let armed_by = Probe::new();
+        let polled_by = Probe::new();
+        let mut slot = None;
+        let callback = arm(&mut slot, DL, &armed_by);
+
+        polled_by.interrupt_next_clone(Box::new(move || callback(TICK)));
+        refresh(&mut slot, DL, &polled_by);
+
+        assert_eq!(polled_by.wakes(), 1);
+        assert_eq!(
+            Arc::strong_count(&polled_by),
+            1,
+            "the cell's timer has already come and gone, so a waker left in it is one no timer will ever visit again"
         );
     }
 }
