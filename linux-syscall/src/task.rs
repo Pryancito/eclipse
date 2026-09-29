@@ -3102,6 +3102,62 @@ mod wait_option_tests {
         assert_eq!(wait_opts::WAITID_REQUIRED, 0x0000_000E);
     }
 
+    /// The interest is `(exited, stopped, continued)` **in that order**, and
+    /// the last two are separate bits asking for separate things.
+    ///
+    /// Swapping the two in `wait4_options` passed green: the tests that ask
+    /// about them pass both at once, or neither, so the two fields were never
+    /// told apart. A `wait4(-1, &st, WUNTRACED)` that reports a child resumed
+    /// by `SIGCONT` instead of one stopped by `SIGTSTP` is a shell that
+    /// prints "Continued" when you press Ctrl-Z.
+    #[test]
+    fn stopped_and_continued_are_asked_for_one_at_a_time() {
+        assert_eq!(
+            wait4_options(WUNTRACED).unwrap().interest,
+            (true, true, false),
+            "WUNTRACED asked for the wrong state change"
+        );
+        assert_eq!(
+            wait4_options(WCONTINUED).unwrap().interest,
+            (true, false, true),
+            "WCONTINUED asked for the wrong state change"
+        );
+        // And `waitid`, which reads the same two bits into the same two
+        // places, with its own `exited` rather than an implied one.
+        assert_eq!(
+            waitid_options(WUNTRACED).unwrap().interest,
+            (false, true, false)
+        );
+        assert_eq!(
+            waitid_options(WCONTINUED).unwrap().interest,
+            (false, false, true)
+        );
+    }
+
+    /// `waitid(2)`'s `idtype_t`, from `include/uapi/linux/wait.h`.
+    ///
+    /// `P_PIDFD` was **wrongly 5** here, so `waitid(P_PIDFD, fd, ...)` --
+    /// which is what glib's `g_child_watch_source_new()` does -- matched no
+    /// arm of the dispatch and came back `EINVAL`. The fix had no test, and
+    /// putting the 5 back passed green: the four numbers are read inside an
+    /// `async` method on `Syscall`, which no unit test can build, so the only
+    /// thing that can guard them is pinning them here.
+    #[test]
+    fn the_four_waitid_id_types_are_the_numbers_linux_gives_them() {
+        assert_eq!(P_ALL, 0);
+        assert_eq!(P_PID, 1);
+        assert_eq!(P_PGID, 2);
+        assert_eq!(P_PIDFD, 3, "P_PIDFD is back to the wrong number");
+        // And no two of them are the same, which is what a dispatch on them
+        // needs and what a copy-paste would break.
+        let all = [P_ALL, P_PID, P_PGID, P_PIDFD];
+        for (i, a) in all.iter().enumerate() {
+            for b in &all[i + 1..] {
+                assert_ne!(a, b, "two id types share a number");
+            }
+        }
+    }
+
     /// `WEXITED` and `WNOWAIT` belong to `waitid`. `kernel_wait4`'s mask
     /// leaves both out, so naming either is EINVAL there.
     #[test]
@@ -3215,7 +3271,10 @@ mod prctl_arg_tests {
     /// that is not UTF-8 is kept as a `?` rather than refused.
     #[test]
     fn the_comm_is_bytes_to_the_first_nul_and_never_refused() {
-        assert_eq!(comm_from_user_bytes(b"worker junk"), "worker");
+        // The NUL is written as an escape, not as a raw byte: a raw one in
+        // the source makes grep, diff and half the editors in the tree call
+        // this whole 3700-line file binary and skip it.
+        assert_eq!(comm_from_user_bytes(b"worker\0junk"), "worker");
         assert_eq!(comm_from_user_bytes(b"worker"), "worker");
         assert_eq!(comm_from_user_bytes(b""), "");
         assert_eq!(
@@ -3231,6 +3290,37 @@ mod prctl_arg_tests {
         assert_eq!(comm_from_user_bytes(&cut), "pool-1-thread-?");
         // Whole multibyte characters survive.
         assert_eq!(comm_from_user_bytes("señal".as_bytes()), "señal");
+    }
+}
+
+#[cfg(test)]
+mod comm_from_path_tests {
+    //! `comm` after an `execve`: the last component of the path, which is
+    //! what `ps`, `top` and `/proc/<pid>/comm` show. It had no test at all --
+    //! turning the `rsplit` into a `split` passed green, and that answers the
+    //! **first** component, so every absolute path would have named the
+    //! process the empty string.
+
+    use super::comm_from_path;
+
+    #[test]
+    fn the_name_is_the_last_component_of_the_path() {
+        assert_eq!(comm_from_path("/bin/ls"), "ls");
+        assert_eq!(comm_from_path("/usr/lib/firefox/firefox"), "firefox");
+        // A bare name is already the name.
+        assert_eq!(comm_from_path("ls"), "ls");
+        // A relative path is the same question.
+        assert_eq!(comm_from_path("./a.out"), "a.out");
+        assert_eq!(comm_from_path("../bin/sh"), "sh");
+    }
+
+    #[test]
+    fn the_odd_shapes_answer_something_rather_than_panicking() {
+        // These are paths `execve` would refuse, but this runs on whatever
+        // reached it, so none of them may be a panic.
+        assert_eq!(comm_from_path(""), "");
+        assert_eq!(comm_from_path("/"), "");
+        assert_eq!(comm_from_path("/bin/"), "");
     }
 }
 
@@ -3605,6 +3695,22 @@ mod setpgid_argument_tests {
     fn the_group_is_judged_before_the_process_is_looked_up() {
         assert_eq!(setpgid_args(ME, -7, -1), Err(LxError::EINVAL));
         assert_eq!(setpgid_args(ME, -7, 0), Err(LxError::ESRCH));
+    }
+
+    /// The two halves of the answer are "which process" and "into which
+    /// group", and they are not the same number.
+    ///
+    /// Every other case here asks for `pgid == 0`, where the group *is* the
+    /// target, so the two are equal and swapping them is invisible: the pair
+    /// came back the wrong way round and passed green. A shell filing a job
+    /// into an existing job's group -- `setpgid(child, leader)`, which is how
+    /// a pipeline is built -- is the ordinary call where they differ, and
+    /// reversing it would make the leader join the new child's group instead.
+    #[test]
+    fn the_process_and_the_group_are_not_interchangeable() {
+        assert_eq!(setpgid_args(ME, 42, 7), Ok((42, 7)));
+        // Including when the caller is the one being moved.
+        assert_eq!(setpgid_args(ME, 0, 7), Ok((ME, 7)));
     }
 
     /// A negative pid names no process: `find_task_by_vpid` can only fail.
