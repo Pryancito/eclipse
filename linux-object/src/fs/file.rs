@@ -1697,6 +1697,146 @@ mod setfl_tests {
         flags.take_settable(OpenFlags::WRONLY | OpenFlags::CREATE);
         assert_eq!(flags, OpenFlags::RDWR);
     }
+
+    #[test]
+    fn each_status_flag_is_asked_about_by_its_own_name() {
+        // Every one of the three questions is answered by its own bit and
+        // never by a neighbour. Making `is_append` read `O_NONBLOCK` passed
+        // the whole suite green, and `O_APPEND` is what sends a write to the
+        // end of the file: every shell `>>` and every log line would have
+        // landed at the current offset instead, while a non-blocking socket
+        // would have appended.
+        let append = OpenFlags::RDWR | OpenFlags::APPEND;
+        assert!(append.is_append(), "O_APPEND was not seen");
+        assert!(!append.non_block(), "O_APPEND answered for O_NONBLOCK");
+        assert!(!append.close_on_exec(), "O_APPEND answered for O_CLOEXEC");
+
+        let non_block = OpenFlags::RDWR | OpenFlags::NON_BLOCK;
+        assert!(non_block.non_block(), "O_NONBLOCK was not seen");
+        assert!(!non_block.is_append(), "O_NONBLOCK answered for O_APPEND");
+        assert!(
+            !non_block.close_on_exec(),
+            "O_NONBLOCK answered for O_CLOEXEC"
+        );
+
+        let cloexec = OpenFlags::RDWR | OpenFlags::CLOEXEC;
+        assert!(cloexec.close_on_exec(), "O_CLOEXEC was not seen");
+        assert!(!cloexec.is_append(), "O_CLOEXEC answered for O_APPEND");
+        assert!(!cloexec.non_block(), "O_CLOEXEC answered for O_NONBLOCK");
+
+        // And a plain `open(path, O_RDONLY)` is none of the three.
+        let plain = OpenFlags::RDONLY;
+        assert!(!plain.is_append() && !plain.non_block() && !plain.close_on_exec());
+    }
+
+    #[test]
+    fn the_access_mode_is_the_low_two_bits_read_as_a_number() {
+        // `O_RDONLY`, `O_WRONLY` and `O_RDWR` are 0, 1 and 2: one number in
+        // the low two bits, not three independent flags. That is why masking
+        // with `0b1` instead of `0b11` answers the same for all four values
+        // -- `RDWR & 0b1` is 0, which is `RDONLY` -- and why no test can tell
+        // the two masks apart. The table is what makes that true, so it is
+        // pinned here rather than left to be rediscovered.
+        let cases = [
+            (OpenFlags::RDONLY, true, false),
+            (OpenFlags::WRONLY, false, true),
+            (OpenFlags::RDWR, true, true),
+            // 3 is `O_ACCMODE`, which upstream `open` refuses; nothing here
+            // calls it readable or writable either.
+            (OpenFlags::from_bits_truncate(3), false, false),
+        ];
+        for (flags, readable, writable) in cases {
+            assert_eq!(flags.readable(), readable, "readable() for {flags:?}");
+            assert_eq!(flags.writable(), writable, "writable() for {flags:?}");
+            // Nothing above the access mode changes either answer.
+            let dressed = flags | OpenFlags::CLOEXEC | OpenFlags::APPEND | OpenFlags::TRUNCATE;
+            assert_eq!(dressed.readable(), readable, "readable() for {dressed:?}");
+            assert_eq!(dressed.writable(), writable, "writable() for {dressed:?}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod poll_events_tests {
+    //! `poll(2)` on `POLLERR` and `POLLHUP`: "these bits are output only, and
+    //! are ignored in `events`". They are reported whether the caller asked
+    //! for them or not, and `epoll` gets there by forcing the two into every
+    //! stored mask. Dropping either one from the pair `revents` forces in
+    //! passed the whole suite green.
+
+    use super::{PollEvents, PollStatus};
+
+    fn status(read: bool, write: bool, error: bool, hangup: bool) -> PollStatus {
+        PollStatus {
+            read,
+            write,
+            error,
+            hangup,
+        }
+    }
+
+    #[test]
+    fn a_hangup_and_an_error_are_reported_whether_they_were_asked_for_or_not() {
+        // The caller asked about reading only. `poll` still has to tell it the
+        // other end is gone, or it goes back to sleep on a pipe nobody will
+        // ever write to again: that is a shell pipeline hanging instead of
+        // seeing end-of-file.
+        let hung_up = status(false, false, false, true);
+        assert_eq!(
+            PollEvents::revents(&hung_up, PollEvents::IN),
+            PollEvents::HUP,
+            "POLLHUP was not reported to a caller that only asked to read"
+        );
+        let broken = status(false, false, true, false);
+        assert_eq!(
+            PollEvents::revents(&broken, PollEvents::OUT),
+            PollEvents::ERR,
+            "POLLERR was not reported to a caller that only asked to write"
+        );
+        // Both at once, to a caller that asked for neither.
+        let both = status(false, false, true, true);
+        assert_eq!(
+            PollEvents::revents(&both, PollEvents::empty()),
+            PollEvents::ERR | PollEvents::HUP
+        );
+        // And a caller that did ask for them gets the same answer, so the
+        // forcing is not what carries them.
+        assert_eq!(
+            PollEvents::revents(&both, PollEvents::ERR | PollEvents::HUP),
+            PollEvents::ERR | PollEvents::HUP
+        );
+    }
+
+    #[test]
+    fn readiness_the_caller_did_not_ask_about_is_not_reported() {
+        // The other half of the rule, which is what keeps the forced pair from
+        // turning into "report everything": a poller waiting to write is not
+        // woken because there is something to read.
+        let both_ways = status(true, true, false, false);
+        assert_eq!(
+            PollEvents::revents(&both_ways, PollEvents::IN),
+            PollEvents::IN
+        );
+        assert_eq!(
+            PollEvents::revents(&both_ways, PollEvents::OUT),
+            PollEvents::OUT
+        );
+        assert_eq!(
+            PollEvents::revents(&both_ways, PollEvents::empty()),
+            PollEvents::empty(),
+            "a request for nothing was answered with something"
+        );
+        // Asking under the streams name gets the streams name back: `ready`
+        // reports both names and the mask keeps the one that was asked for.
+        assert_eq!(
+            PollEvents::revents(&both_ways, PollEvents::RDNORM),
+            PollEvents::RDNORM
+        );
+        assert_eq!(
+            PollEvents::revents(&both_ways, PollEvents::IN | PollEvents::RDNORM),
+            PollEvents::IN | PollEvents::RDNORM
+        );
+    }
 }
 
 #[cfg(test)]

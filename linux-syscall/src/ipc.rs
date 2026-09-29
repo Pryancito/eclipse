@@ -232,12 +232,7 @@ impl Syscall<'_> {
         info!("semop: id: {}", id);
         // semop(2): EINVAL for an empty array, E2BIG for one over SEMOPM.
         // Checked before reading the pointer, as Linux does.
-        if num_ops == 0 {
-            return Err(LxError::EINVAL);
-        }
-        if num_ops > SEMOPM {
-            return Err(LxError::E2BIG);
-        }
+        let num_ops = semop_count(num_ops)?;
         let ops = ops.as_slice(num_ops)?;
 
         let sem_array = self
@@ -1214,6 +1209,25 @@ impl SemBuf {
 /// Linux `SEMOPM`: the most operations one `semop(2)` may carry.
 const SEMOPM: usize = 500;
 
+/// How many operations one `semop(2)` will carry out, or why it will carry
+/// out none.
+///
+/// Both refusals come before the `sembuf` array is read, as Linux does, and
+/// both are boundaries: zero operations is `EINVAL` while one is fine, and
+/// `SEMOPM` operations is the largest call that works while one more is
+/// `E2BIG`. Written out here because `sys_semop` is an `async` method on
+/// `Syscall`, which a unit test has no way to build: with the two guards
+/// inside it, moving either boundary by one passed green.
+fn semop_count(num_ops: usize) -> Result<usize, LxError> {
+    if num_ops == 0 {
+        return Err(LxError::EINVAL);
+    }
+    if num_ops > SEMOPM {
+        return Err(LxError::E2BIG);
+    }
+    Ok(num_ops)
+}
+
 /// What a whole `sembuf` array does to a semaphore set, decided in one go.
 #[derive(Debug, PartialEq, Eq)]
 pub enum SemopPlan {
@@ -1862,7 +1876,9 @@ mod shmat_place_tests {
     //! requested address was ignored (the segment landed wherever the kernel
     //! chose, and the caller was told so only by the return value).
 
-    use super::{shmat_flags_and_place, ShmatPlace, SHMLBA, SHM_RDONLY, SHM_RND};
+    use super::{
+        semop_count, shmat_flags_and_place, ShmatPlace, SEMOPM, SHMLBA, SHM_RDONLY, SHM_RND,
+    };
     use crate::vm::MMAP_MIN_ADDR;
     use crate::LxError;
     use zircon_object::vm::*;
@@ -1886,14 +1902,55 @@ mod shmat_place_tests {
         );
         // USER is never dropped, whatever else changes (the glxgears #PF).
         assert!(flags.contains(MMUFlags::USER));
+        // And EXECUTE stays even here: see the note on the default attach.
+        assert!(flags.contains(MMUFlags::EXECUTE));
     }
 
     /// The default attach is read/write. Nothing about adding the read-only
     /// path may quietly make the ordinary attach read-only.
+    ///
+    /// **And it is executable**, which is not what Linux does: `do_shmat`
+    /// asks for `PROT_EXEC` only when the caller passed `SHM_EXEC`. This
+    /// pins what Eclipse does today rather than changing it -- every
+    /// attachment here has been executable from the start, the graphics path
+    /// runs over `shmat`, and narrowing it is a behaviour change that wants
+    /// its own look. Dropping `EXECUTE` used to pass green, so the day
+    /// somebody does narrow it, it will be on purpose and it will show here.
     #[test]
-    fn a_default_attach_is_read_write() {
+    fn a_default_attach_is_read_write_and_executable() {
         let (flags, _) = shmat_flags_and_place(0, 0).unwrap();
         assert!(flags.contains(MMUFlags::READ | MMUFlags::WRITE | MMUFlags::USER));
+        assert!(
+            flags.contains(MMUFlags::EXECUTE),
+            "an attachment stopped being executable; Linux would agree, but say so on purpose"
+        );
+    }
+
+    /// `semop(2)`'s two boundaries, neither of which a unit test could reach
+    /// while they lived inside an `async` method of `Syscall`.
+    #[test]
+    fn semop_takes_between_one_and_semopm_operations() {
+        assert_eq!(
+            semop_count(0),
+            Err(LxError::EINVAL),
+            "an empty array is EINVAL"
+        );
+        assert_eq!(semop_count(1), Ok(1), "one operation is a real call");
+        assert_eq!(
+            semop_count(SEMOPM),
+            Ok(SEMOPM),
+            "SEMOPM operations is the largest call that works"
+        );
+        assert_eq!(
+            semop_count(SEMOPM + 1),
+            Err(LxError::E2BIG),
+            "one past SEMOPM is E2BIG, not a shorter call"
+        );
+        assert_eq!(semop_count(usize::MAX), Err(LxError::E2BIG));
+
+        // And the limit is the number Linux uses, not whatever the guard
+        // happens to compare against.
+        assert_eq!(SEMOPM, 500);
     }
 
     /// `addr == 0` lets the kernel choose -- the MIT-SHM path, and the only

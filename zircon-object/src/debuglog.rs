@@ -486,4 +486,100 @@ mod tests {
         assert_eq!(data, &long[..DLOG_MAX_DATA]);
         assert_eq!(h.wire_size(), DLOG_MAX_LEN);
     }
+    /// The six severities are the byte userspace reads out of
+    /// `zx_log_record_t`, and it reads them as an **order**: a log viewer
+    /// keeps what is at or above the level it was asked for, so the six have
+    /// to ascend, evenly, in the steps `ZX_LOG_SEVERITY_*` is defined in.
+    ///
+    /// Checked as a relation between the six rather than six copies of the
+    /// numbers above, because a test that restated each value would move
+    /// along with the enum and catch nothing. Moving one of them off the
+    /// step -- `Info` to 0x31, say -- passed everything else green, and it
+    /// silently reshuffles what a filter keeps.
+    #[test]
+    fn the_six_severities_climb_in_even_steps_the_way_a_filter_reads_them() {
+        let ladder = [
+            Severity::Trace,
+            Severity::Debug,
+            Severity::Info,
+            Severity::Warning,
+            Severity::Error,
+            Severity::Fatal,
+        ];
+        assert_eq!(ladder[0] as u8, 0x10, "the ladder does not start at Trace");
+        for (i, pair) in ladder.windows(2).enumerate() {
+            let (lower, higher) = (pair[0] as u8, pair[1] as u8);
+            assert_eq!(
+                higher as u16 - lower as u16,
+                0x10,
+                "{:?} and {:?} are not one step apart",
+                pair[0],
+                pair[1]
+            );
+            assert_eq!(
+                higher,
+                (i as u8 + 2) * 0x10,
+                "{:?} is not where the ladder puts it",
+                pair[1]
+            );
+        }
+
+        // And the byte a reader gets is the one the writer asked for: the
+        // severity travels in `out[6]`, next to the flags, so swapping the
+        // two would still keep the ladder above intact.
+        let log = DebugLog::create(0);
+        let pid = 0x5e_1e_c7;
+        log.write(Severity::Warning, 0, 1, pid, b"warn");
+        let (header, _) = next_record(&log, pid).expect("the record went missing");
+        assert_eq!(
+            header.severity,
+            Severity::Warning as u8,
+            "the reader got a different severity than the writer wrote"
+        );
+    }
+
+    /// The log's cap is a cap: the kernel keeps the newest `DLOG_SIZE` bytes
+    /// and not one more, because this buffer is kernel heap that any process
+    /// holding a writable debuglog handle can make grow.
+    ///
+    /// `make_room` is told the size the record takes **on the wire**, padding
+    /// included, rather than the size of its contents. Told the smaller of
+    /// the two it would behave identically, and that is worth writing down
+    /// rather than leaving to be rediscovered: every record occupies
+    /// `HEADER_SIZE + align_up_4(datalen)` bytes, so `buf.len()` is always a
+    /// multiple of four, and so is `DLOG_SIZE`. The two numbers differ by
+    /// less than four and therefore bracket the same multiple of four, so the
+    /// loop always drops the same records either way.
+    ///
+    /// That equality rests entirely on records staying four-aligned. The day
+    /// one is not -- a header that grows by two bytes, a padding rule that
+    /// changes -- the wire size is the only one of the two that still bounds
+    /// the buffer, and this test is what says so.
+    #[test]
+    fn the_log_never_grows_past_its_cap() {
+        let mut buffer = DlogBuffer {
+            buf: VecDeque::new(),
+            base: 0,
+        };
+        // 33 bytes of data: 32 + 33 = 65 on the nose, 68 once padded, so the
+        // two numbers `make_room` could be given differ by three.
+        let data = [b'x'; 33];
+        assert_eq!(
+            align_up_4(data.len()) - data.len(),
+            3,
+            "this record carries no padding, so it does not exercise the rule above"
+        );
+        for i in 0..(DLOG_SIZE / HEADER_SIZE) {
+            buffer.write(Severity::Info, 0, 1, 2, &data);
+            assert!(
+                buffer.buf.len() <= DLOG_SIZE,
+                "the log holds {} bytes after {} records, over its {} byte cap",
+                buffer.buf.len(),
+                i + 1,
+                DLOG_SIZE
+            );
+        }
+        // It really did wrap, or the cap was never under pressure.
+        assert!(buffer.base > 0, "the log never dropped a record");
+    }
 }

@@ -2248,3 +2248,324 @@ mod sched_tests {
         );
     }
 }
+
+/// The thread's own state machine, its signals, and the accounting a dying
+/// thread hands back to its process.
+///
+/// The 28 tests above are almost all about how the scheduler hands out CPU
+/// slices. Everything else a `Thread` is — what state it reports while it is
+/// suspended, which signals each transition publishes, the generic "blocked in
+/// a syscall" marker, its CPU affinity, its two time counters and whether it
+/// is the first thread of its process — had no test at all, and mutating it
+/// left 16 of 26 mutants alive.
+#[cfg(test)]
+mod state_and_accounting_tests {
+    use super::*;
+    use crate::task::*;
+
+    fn a_thread() -> Arc<Thread> {
+        let root = Job::root();
+        let proc = Process::create(&root, "proc").expect("process");
+        Thread::create(&proc, "thread").expect("thread")
+    }
+
+    /// Suspension does not overwrite what the thread was actually doing.
+    ///
+    /// The comment on the gate says the order is `Dying > Exception > Suspend >
+    /// Blocked`: a thread stopped in an exception reports the exception even
+    /// while a suspend token is held over it, because that is what the debugger
+    /// on the other end of the exception channel needs to see. Only a thread
+    /// with nothing more specific to say reports `Suspended`.
+    #[test]
+    fn a_suspended_thread_still_reports_what_stopped_it() {
+        let t = a_thread();
+        {
+            let mut inner = t.inner.lock();
+            inner.suspend_count = 1;
+            inner.state = ThreadState::BlockedException;
+        }
+        assert_eq!(
+            t.state(),
+            ThreadState::BlockedException,
+            "a suspend hid the exception the thread is stopped in"
+        );
+
+        t.inner.lock().state = ThreadState::BlockedChannel;
+        assert_eq!(
+            t.state(),
+            ThreadState::Suspended,
+            "a plain blocked thread under a suspend reports the suspend"
+        );
+
+        t.inner.lock().state = ThreadState::Dying;
+        assert_eq!(
+            t.state(),
+            ThreadState::Dying,
+            "a dying thread outranks the suspend over it"
+        );
+
+        t.inner.lock().suspend_count = 0;
+        assert_eq!(t.state(), ThreadState::Dying);
+    }
+
+    /// A thread with no context saved is not suspended, whatever the count
+    /// says: there is nothing parked to hold.
+    #[test]
+    fn a_thread_with_no_context_is_never_reported_suspended() {
+        let t = a_thread();
+        let mut inner = t.inner.lock();
+        inner.suspend_count = 3;
+        inner.state = ThreadState::Running;
+        inner.context = None;
+        assert_eq!(inner.state(), ThreadState::Running);
+    }
+
+    /// Each transition publishes the signal set `zx_object_wait_one` is
+    /// waiting on, and clears the ones that no longer hold. Leaving a stale
+    /// bit behind is a waiter that wakes on a thread state that is over.
+    #[test]
+    fn every_transition_leaves_exactly_the_signals_that_still_hold() {
+        let t = a_thread();
+
+        t.inner.lock().change_state(ThreadState::Running, &t.base);
+        let s = t.base.signal();
+        assert!(s.contains(Signal::THREAD_RUNNING));
+        assert!(!s.contains(Signal::THREAD_SUSPENDED));
+        assert!(!s.contains(Signal::THREAD_TERMINATED));
+
+        t.suspend();
+        let s = t.base.signal();
+        assert!(
+            s.contains(Signal::THREAD_SUSPENDED),
+            "a suspended thread has to publish THREAD_SUSPENDED"
+        );
+        assert!(
+            !s.contains(Signal::THREAD_RUNNING),
+            "and stop publishing THREAD_RUNNING"
+        );
+
+        t.resume();
+        let s = t.base.signal();
+        assert!(s.contains(Signal::THREAD_RUNNING));
+        assert!(
+            !s.contains(Signal::THREAD_SUSPENDED),
+            "a resumed thread still looked suspended to anyone waiting"
+        );
+
+        t.inner.lock().change_state(ThreadState::Dead, &t.base);
+        let s = t.base.signal();
+        assert!(s.contains(Signal::THREAD_TERMINATED));
+        assert!(!s.contains(Signal::THREAD_RUNNING));
+        assert!(!s.contains(Signal::THREAD_SUSPENDED));
+    }
+
+    /// `New` and `Dying` publish nothing at all — and that includes taking
+    /// `THREAD_TERMINATED` back down. A thread that reached `Dead` and is then
+    /// moved to `Dying` (a kill racing teardown) would otherwise stay
+    /// terminated for every waiter while it is still being taken apart.
+    #[test]
+    fn a_dying_thread_publishes_none_of_the_three_signals() {
+        let t = a_thread();
+        t.inner.lock().change_state(ThreadState::Dead, &t.base);
+        assert!(t.base.signal().contains(Signal::THREAD_TERMINATED));
+
+        t.inner.lock().change_state(ThreadState::Dying, &t.base);
+        let s = t.base.signal();
+        assert!(
+            !s.contains(Signal::THREAD_TERMINATED),
+            "a dying thread was still publishing THREAD_TERMINATED"
+        );
+        assert!(!s.contains(Signal::THREAD_RUNNING));
+        assert!(!s.contains(Signal::THREAD_SUSPENDED));
+    }
+
+    /// Only a `Running` thread becomes `Blocked`, and only the generic
+    /// `Blocked` goes back to `Running`.
+    ///
+    /// This is the marker `/proc/<pid>/status` reads. It defers to everything
+    /// more specific on purpose: `blocking_run` records *why* a thread waits
+    /// and asserts on return that nobody moved the state under it, so
+    /// overwriting `BlockedFutex` both loses that reason and trips the
+    /// assertion. Teardown wins for the same reason — an unblock racing a kill
+    /// must not resurrect a dying thread into `Running`.
+    #[test]
+    fn the_generic_blocked_marker_defers_to_every_more_specific_state() {
+        let t = a_thread();
+        t.inner.lock().state = ThreadState::Running;
+        assert!(t.set_blocked(true), "a running thread blocks");
+        assert_eq!(t.inner.lock().state, ThreadState::Blocked);
+
+        assert!(
+            !t.set_blocked(true),
+            "blocking an already blocked thread changes nothing"
+        );
+
+        assert!(t.set_blocked(false), "and the generic block comes back");
+        assert_eq!(t.inner.lock().state, ThreadState::Running);
+
+        for specific in [
+            ThreadState::BlockedFutex,
+            ThreadState::BlockedChannel,
+            ThreadState::BlockedPort,
+            ThreadState::Dying,
+            ThreadState::Dead,
+            ThreadState::New,
+            ThreadState::Suspended,
+        ] {
+            t.inner.lock().state = specific;
+            assert!(
+                !t.set_blocked(true),
+                "{:?} was overwritten by the generic blocked marker",
+                specific
+            );
+            assert!(
+                !t.set_blocked(false),
+                "{:?} was resurrected into Running by an unblock",
+                specific
+            );
+            assert_eq!(t.inner.lock().state, specific, "{:?} moved", specific);
+        }
+    }
+
+    /// An all-zero affinity mask would make the thread unschedulable, so it is
+    /// refused; every other mask is stored as given.
+    #[test]
+    fn a_thread_may_not_be_pinned_to_no_cpu_at_all() {
+        let t = a_thread();
+        let before = t.affinity();
+
+        assert_eq!(t.set_affinity(0), Err(ZxError::INVALID_ARGS));
+        assert_eq!(t.affinity(), before, "the refused mask was stored anyway");
+
+        assert!(t.set_affinity(0b1010).is_ok());
+        assert_eq!(t.affinity(), 0b1010);
+        assert!(t.set_affinity(u64::MAX).is_ok());
+        assert_eq!(t.affinity(), u64::MAX);
+        assert!(t.set_affinity(1).is_ok());
+        assert_eq!(t.affinity(), 1);
+    }
+
+    /// `ZX_INFO_THREAD` publishes the mask in the FIRST word of the eight it
+    /// carries, which is where `zx_object_get_info` and `sched_getaffinity`
+    /// read CPUs 0..63. Putting it anywhere else reports a thread pinned to no
+    /// CPU at all.
+    #[test]
+    fn the_affinity_mask_is_published_in_the_first_word_of_the_info() {
+        let t = a_thread();
+        t.set_affinity(0b1101).unwrap();
+        let info = t.get_thread_info();
+        assert_eq!(info.cpu_affinity_mask[0], 0b1101);
+        assert!(
+            info.cpu_affinity_mask[1..].iter().all(|w| *w == 0),
+            "the mask leaked into a word nobody reads"
+        );
+        assert_eq!(info.state, ThreadState::New as u32);
+        assert_eq!(
+            info.wait_exception_channel_type, 0,
+            "a thread in no exception waits on no channel"
+        );
+    }
+
+    /// The two time counters are separate: user time and kernel time, each
+    /// accumulating rather than replacing. `/proc/<pid>/stat` fields 14 and 15
+    /// are these two, and `times(2)` adds them up.
+    #[test]
+    fn the_two_clocks_of_a_thread_accumulate_and_do_not_mix() {
+        let t = a_thread();
+        assert_eq!((t.get_time(), t.get_sys_time()), (0, 0));
+
+        t.time_add(700);
+        t.time_add(300);
+        assert_eq!(t.get_time(), 1000, "user time replaced instead of adding");
+        assert_eq!(t.get_sys_time(), 0, "user time landed in the kernel clock");
+
+        t.sys_time_add(40);
+        t.sys_time_add(2);
+        assert_eq!(
+            t.get_sys_time(),
+            42,
+            "kernel time replaced instead of adding"
+        );
+        assert_eq!(t.get_time(), 1000, "kernel time landed in the user clock");
+    }
+
+    /// Runtime info reports the CPU time twice, as cpu and queue time, because
+    /// zCore does not measure run-queue latency separately yet. Reporting zero
+    /// for the second is a thread that looks like it never waited.
+    #[test]
+    fn runtime_info_carries_the_cpu_time_in_both_of_the_fields_it_fills() {
+        let t = a_thread();
+        t.time_add(5_000);
+        let info = t.get_runtime_info();
+        assert_eq!(info.cpu_time, 5_000);
+        assert_eq!(info.queue_time, 5_000);
+        assert_eq!(info.page_fault_time, 0);
+        assert_eq!(info.lock_contention_time, 0);
+    }
+
+    /// A thread that exits hands both of its clocks to its process before it
+    /// leaves the thread list, so `getrusage`, `times` and the parent's
+    /// `wait4` still see the time it burned.
+    #[test]
+    fn a_dying_thread_hands_both_its_clocks_to_its_process() {
+        let root = Job::root();
+        let proc = Process::create(&root, "proc").expect("process");
+        let t = Thread::create(&proc, "thread").expect("thread");
+        t.time_add(9_000);
+        t.sys_time_add(1_500);
+
+        assert_eq!(
+            (proc.dead_threads_time(), proc.dead_threads_sys_time()),
+            (0, 0)
+        );
+        t.terminate_abandoned();
+
+        assert_eq!(
+            proc.dead_threads_time(),
+            9_000,
+            "the thread's user time died with it"
+        );
+        assert_eq!(
+            proc.dead_threads_sys_time(),
+            1_500,
+            "the thread's kernel time died with it"
+        );
+    }
+
+    /// Only the thread a process was started with is its first thread; every
+    /// later one is not. `Process::exit` and the initial-thread rules hang off
+    /// this.
+    #[test]
+    fn only_the_thread_a_process_started_with_is_its_first() {
+        let root = Job::root();
+        let proc = Process::create(&root, "proc").expect("process");
+        let first = Thread::create(&proc, "first").expect("thread");
+        let second = Thread::create(&proc, "second").expect("thread");
+
+        assert!(!first.is_first_thread(), "no thread is first before start");
+        first.set_first_thread();
+        assert!(first.is_first_thread());
+        assert!(
+            !second.is_first_thread(),
+            "a later thread came out as the first one"
+        );
+    }
+
+    /// The flags a thread carries are its own, and `update_flags` is the only
+    /// way they move.
+    #[test]
+    fn a_threads_flags_are_what_was_last_written_into_them() {
+        let t = a_thread();
+        assert_eq!(t.flags(), ThreadFlag::empty());
+
+        t.update_flags(|f| f.insert(ThreadFlag::VCPU));
+        assert_eq!(
+            t.flags(),
+            ThreadFlag::VCPU,
+            "the flag went in but the reader does not see it"
+        );
+
+        t.update_flags(|f| f.remove(ThreadFlag::VCPU));
+        assert_eq!(t.flags(), ThreadFlag::empty());
+    }
+}

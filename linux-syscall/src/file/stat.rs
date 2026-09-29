@@ -595,6 +595,48 @@ mod mode_tests {
         }
     }
 
+    /// The invariant that makes `type_ | mode` and `type_ ^ mode` the same
+    /// answer.
+    ///
+    /// The conversion ends in an `or`, and putting an `xor` there passes
+    /// green: the two halves can never light the same bit, so the two
+    /// operators agree on every input. That is not a coincidence to leave
+    /// unwritten -- the mask confines `mode` to `0o7777` and every `S_IFMT`
+    /// value sits above it -- because the day either half reaches into the
+    /// other's ground the two stop agreeing, and an inode comes back with a
+    /// permission bit cancelling part of its own type.
+    #[test]
+    fn the_type_bits_and_the_permission_bits_never_share_ground() {
+        assert_eq!(
+            StatMode::TYPE_MASK.bits() & StatMode::PERMISSION_MASK,
+            0,
+            "S_IFMT and the permission bits now overlap"
+        );
+        let types = [
+            ("S_IFREG", StatMode::FILE),
+            ("S_IFDIR", StatMode::DIR),
+            ("S_IFLNK", StatMode::LINK),
+            ("S_IFCHR", StatMode::CHAR),
+            ("S_IFBLK", StatMode::BLOCK),
+            ("S_IFSOCK", StatMode::SOCKET),
+            ("S_IFIFO", StatMode::FIFO),
+        ];
+        for (name, type_) in types {
+            assert_eq!(
+                type_.bits() & StatMode::PERMISSION_MASK,
+                0,
+                "{} reaches into the permission bits",
+                name
+            );
+            assert_eq!(
+                type_.bits() & StatMode::TYPE_MASK.bits(),
+                type_.bits(),
+                "{} is not inside S_IFMT",
+                name
+            );
+        }
+    }
+
     /// `Metadata::mode` is a `u16`, wide enough for the `S_IFMT` bits, and
     /// filesystems that store `st_mode` whole do leave them in it. Without
     /// the mask those are read as a type and ORed in, so one inode comes back

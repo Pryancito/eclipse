@@ -3057,19 +3057,36 @@ mod staging_tests {
     }
 
     #[test]
+    fn the_stack_buffer_is_five_hundred_and_twelve_bytes() {
+        // Pinned on its own, because every other test here feeds
+        // `STAGING_STACK_BUF` back in: move the constant and the tests move
+        // with it, so the boundary they claim to guard goes untested and
+        // halving it to 256 passes the whole suite green.
+        //
+        // The number is a kernel stack-frame budget. This array sits in the
+        // frame of every write syscall, so growing it eats the kernel stack
+        // on a path that is already several frames deep, and shrinking it
+        // sends ordinary small writes -- a shell echoing a line, a log
+        // record -- through the heap allocator instead.
+        assert_eq!(STAGING_STACK_BUF, 512, "the staging stack budget moved");
+    }
+
+    #[test]
     fn a_chunk_of_exactly_the_stack_ceiling_still_fits_on_the_stack() {
         // The boundary, because `>` and `>=` here disagree only at this one
         // value and both look right: at `>=` the heap buffer is never made
-        // yet `buf()` would index it.
-        let mut s = Staging::new(STAGING_STACK_BUF).unwrap();
-        assert_eq!(s.buf().len(), STAGING_STACK_BUF);
+        // yet `buf()` would index it. The size is written out rather than
+        // read from the constant -- see
+        // `the_stack_buffer_is_five_hundred_and_twelve_bytes`.
+        let mut s = Staging::new(512).unwrap();
+        assert_eq!(s.buf().len(), 512);
         assert!(s.heap.is_empty());
     }
 
     #[test]
     fn a_chunk_past_the_ceiling_moves_to_the_heap_at_its_full_length() {
-        let mut s = Staging::new(STAGING_STACK_BUF + 1).unwrap();
-        assert_eq!(s.buf().len(), STAGING_STACK_BUF + 1);
+        let mut s = Staging::new(513).unwrap();
+        assert_eq!(s.buf().len(), 513);
         let n = s.buf().len();
         assert_eq!(s.heap.len(), n);
     }
@@ -3163,6 +3180,28 @@ mod pipe_write_tests {
         assert!(!sigpipe_due(LxError::EPIPE, false));
         assert!(!sigpipe_due(LxError::EAGAIN, true));
         assert!(!sigpipe_due(LxError::EBADF, true));
+    }
+
+    #[test]
+    fn a_single_byte_already_out_is_still_a_partial_write() {
+        // The boundary of "any bytes at all", which is one. `write(2)` reports
+        // that byte; a caller told `EAGAIN` instead has no count at all, so it
+        // resends from the same offset and the peer receives the byte twice --
+        // the bug the whole partial-write rule exists to stop. Every case
+        // below it used to be measured with 0 or with a comfortable 100.
+        assert_eq!(
+            after_write_error(LxError::EAGAIN, false, 1),
+            AfterWriteError::Partial
+        );
+        assert_eq!(
+            after_write_error(LxError::EPIPE, false, 1),
+            AfterWriteError::Partial
+        );
+        // And nothing out is still the error itself.
+        assert_eq!(
+            after_write_error(LxError::EAGAIN, false, 0),
+            AfterWriteError::Fail
+        );
     }
 }
 
@@ -3883,12 +3922,20 @@ mod copy_range_tests {
         refill: usize,
         stall: bool,
         waits: AtomicUsize,
+        /// What it reports for its access mode. A socket does not police this
+        /// itself the way a `File` does, which is what makes the two `EBADF`
+        /// checks `copy_range`'s own business.
+        flags: OpenFlags,
     }
 
     impl_kobject!(Bounded);
 
     impl Bounded {
         fn new(room: usize, refill: usize, stall: bool) -> Arc<Self> {
+            Self::with_flags(room, refill, stall, OpenFlags::RDWR)
+        }
+
+        fn with_flags(room: usize, refill: usize, stall: bool, flags: OpenFlags) -> Arc<Self> {
             Arc::new(Bounded {
                 base: KObjectBase::new(),
                 taken: lock::Mutex::new(Vec::new()),
@@ -3896,6 +3943,7 @@ mod copy_range_tests {
                 refill,
                 stall,
                 waits: AtomicUsize::new(0),
+                flags,
             })
         }
         fn as_file_like(self: &Arc<Self>) -> Arc<dyn FileLike> {
@@ -3906,7 +3954,7 @@ mod copy_range_tests {
     #[async_trait::async_trait]
     impl FileLike for Bounded {
         fn flags(&self) -> OpenFlags {
-            OpenFlags::RDWR
+            self.flags
         }
         fn set_flags(&self, _: OpenFlags) -> LxResult {
             Ok(())
@@ -4098,5 +4146,123 @@ mod copy_range_tests {
                 .unwrap_err(),
             LxError::EBADF
         );
+    }
+
+    /// The two `EBADF` checks are `copy_range`'s own, and on two `File`s the
+    /// mutation is invisible: a `File` polices its own access mode, so the read
+    /// or the write fails with the same `EBADF` a moment later. A socket does
+    /// not -- it takes whatever it is handed. So `sendfile` into a socket the
+    /// caller opened read-only copied the file straight into it.
+    #[async_std::test]
+    async fn a_socket_that_does_not_police_its_own_mode_is_still_ebadf() {
+        let f = file(&bytes(64));
+        let sock = Bounded::with_flags(1000, 0, false, OpenFlags::RDONLY);
+        assert_eq!(
+            copy_range(&f, Some(0), &sock.as_file_like(), None, 64, false)
+                .await
+                .unwrap_err(),
+            LxError::EBADF
+        );
+        assert!(
+            sock.taken.lock().is_empty(),
+            "bytes reached a socket opened read-only"
+        );
+        // And the input end: a socket the caller opened write-only. Reading it
+        // would answer `ENOSYS` here, which is not the answer `sendfile` owes.
+        let src = Bounded::with_flags(0, 0, false, OpenFlags::WRONLY);
+        let dst = file(b"");
+        assert_eq!(
+            copy_range(&src.as_file_like(), Some(0), &dst, None, 4, false)
+                .await
+                .unwrap_err(),
+            LxError::EBADF
+        );
+    }
+
+    /// An input that hands over at most `per_read` bytes at a time, the way a
+    /// pipe or a socket does.
+    ///
+    /// Every test above it reads from a ramfs `File`, which always returns
+    /// everything it has: the loop goes round **once** and nothing that
+    /// depends on a second pass can be seen. That is one `File` hiding three
+    /// separate mutations.
+    struct Trickle {
+        base: KObjectBase,
+        content: Vec<u8>,
+        per_read: usize,
+    }
+
+    impl_kobject!(Trickle);
+
+    impl Trickle {
+        fn new(content: Vec<u8>, per_read: usize) -> Arc<dyn FileLike> {
+            Arc::new(Trickle {
+                base: KObjectBase::new(),
+                content,
+                per_read,
+            })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl FileLike for Trickle {
+        fn flags(&self) -> OpenFlags {
+            OpenFlags::RDWR
+        }
+        fn set_flags(&self, _: OpenFlags) -> LxResult {
+            Ok(())
+        }
+        async fn read(&self, _: &mut [u8]) -> LxResult<usize> {
+            Err(LxError::ENOSYS)
+        }
+        fn write(&self, _: &[u8]) -> LxResult<usize> {
+            Err(LxError::ENOSYS)
+        }
+        async fn read_at(&self, offset: u64, buf: &mut [u8]) -> LxResult<usize> {
+            let start = offset as usize;
+            if start >= self.content.len() {
+                return Ok(0);
+            }
+            let n = self.per_read.min(buf.len()).min(self.content.len() - start);
+            buf[..n].copy_from_slice(&self.content[start..start + n]);
+            Ok(n)
+        }
+        fn poll(&self, _: PollEvents) -> LxResult<PollStatus> {
+            Ok(PollStatus::default())
+        }
+        async fn async_poll(&self, _: PollEvents) -> LxResult<PollStatus> {
+            Ok(PollStatus::default())
+        }
+    }
+
+    /// `count` is a ceiling, not a hint. The clamp that enforces it only ever
+    /// decides on a second pass, so with a `File` on the input it was dead
+    /// code: dropping it let a `copy_file_range` for 20 bytes move 24.
+    #[async_std::test]
+    async fn a_count_is_a_ceiling_even_when_the_input_dribbles() {
+        let src = Trickle::new(bytes(40), 8);
+        let dst = file(b"");
+        let c = copy_range(&src, Some(0), &dst, Some(0), 20, false)
+            .await
+            .unwrap();
+        assert_eq!(c.moved, 20, "the copy ran past its count");
+        assert_eq!(c.in_offset, Some(20));
+        assert_eq!(c.out_offset, Some(20));
+    }
+
+    /// Each read starts where the last one ended, and each write lands after
+    /// the bytes already delivered. Get either wrong and the output is the head
+    /// of the input over and over -- silently, with the right byte count.
+    #[async_std::test]
+    async fn the_copy_walks_forward_on_both_ends_across_reads() {
+        let src = Trickle::new(bytes(24), 8);
+        let dst = file(b"");
+        let c = copy_range(&src, Some(0), &dst, Some(0), 24, false)
+            .await
+            .unwrap();
+        assert_eq!(c.moved, 24);
+        let mut out = alloc::vec![0u8; 24];
+        assert_eq!(dst.read_at(0, &mut out).await.unwrap(), 24);
+        assert_eq!(out, bytes(24), "the output is not the input, in order");
     }
 }

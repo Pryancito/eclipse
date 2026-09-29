@@ -355,6 +355,55 @@ mod tests {
         assert_eq!(channel1.read().err(), Some(ZxError::SHOULD_WAIT));
     }
 
+    /// `check_and_read` exists so that a read whose check fails **keeps** the
+    /// message: that is the whole difference between it and `read`, and it is
+    /// how `zx_channel_read` refuses a buffer that is too small without
+    /// destroying what it could not hand over. Every test in this file went
+    /// through `read`, which passes a check that never fails, so throwing the
+    /// check's error away and eating the message passed green.
+    #[test]
+    fn a_read_whose_check_fails_leaves_the_message_where_it_was() {
+        let (channel0, channel1) = Channel::create();
+        channel0.write(message(b"keep me")).unwrap();
+
+        // The check sees the message it is being asked about, and its refusal
+        // is what comes back.
+        let refused = channel1.check_and_read(|msg| {
+            assert_eq!(msg.data.as_slice(), b"keep me");
+            Err(ZxError::BUFFER_TOO_SMALL)
+        });
+        assert_eq!(refused.err(), Some(ZxError::BUFFER_TOO_SMALL));
+
+        // And the message is still there, still readable, still the same one.
+        assert_eq!(
+            channel1.read().unwrap().data.as_slice(),
+            b"keep me",
+            "the refused read ate the message anyway"
+        );
+        assert_eq!(channel1.read().err(), Some(ZxError::SHOULD_WAIT));
+    }
+
+    /// A channel is a queue, and nothing here said so: every test wrote one
+    /// message per direction, so a queue that handed messages back in the
+    /// order it was emptied -- newest first -- passed all of them.
+    #[test]
+    fn messages_come_back_in_the_order_they_were_written() {
+        let (channel0, channel1) = Channel::create();
+        for i in 0..4u8 {
+            channel0.write(message(&[i])).unwrap();
+        }
+        for i in 0..4u8 {
+            assert_eq!(
+                channel1.read().unwrap().data.as_slice(),
+                &[i],
+                "the {}th message out is not the {}th that went in",
+                i,
+                i
+            );
+        }
+        assert_eq!(channel1.read().err(), Some(ZxError::SHOULD_WAIT));
+    }
+
     #[test]
     fn peer_closed() {
         let (channel0, channel1) = Channel::create();

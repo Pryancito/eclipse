@@ -359,6 +359,57 @@ pub struct SharedLegacyIrqHandler {
     device_handler: Mutex<Vec<Arc<PcieDevice>>>,
 }
 
+/// What to do to one device after the line it shares has been asserted.
+#[derive(Debug, PartialEq, Eq)]
+struct LegacyIrqVerdict {
+    /// Put its vector back under the mask.
+    remask: bool,
+    /// Write INT_DISABLE into its command register, i.e. quiet it down.
+    silence: bool,
+}
+
+/// `code` is what the device's handler answered, or `None` if it was not
+/// called.
+///
+/// A device nobody answers for is silenced: the legacy line is shared and
+/// level-triggered, so one nobody services just asserts again forever and eats
+/// the CPU. One that does answer is silenced only if it asks to be.
+///
+/// The rule lives here rather than inside the walk because the walk calls the
+/// HAL (`interrupt::mask_irq`), which the host does not implement: with the
+/// rule inside it, three mutations of this branch passed green.
+fn legacy_irq_verdict(code: Option<u32>) -> LegacyIrqVerdict {
+    match code {
+        Some(code) => {
+            let asked = (code & PCIE_IRQRET_MASK) != 0;
+            LegacyIrqVerdict {
+                remask: asked,
+                silence: asked,
+            }
+        }
+        None => LegacyIrqVerdict {
+            remask: false,
+            silence: true,
+        },
+    }
+}
+
+/// Is this device's handler called when the line is asserted?
+///
+/// **`masked` reads backwards, and is left that way on purpose.** Masking a
+/// vector is what `mask_legacy_irq` does, and it writes INT_DISABLE too: so
+/// `masked` means "do not service this one", and this services exactly the
+/// masked ones. What compensates is that **nothing ever unmasks a legacy
+/// vector**: `allocate_irq_handler` creates it masked, `enable_irq` only
+/// touches `enabled` -- a field nothing reads -- and the one `mask_legacy_irq`
+/// call in the tree always passes `true`. With both halves wrong the path
+/// works, and fixing either one alone leaves it dead: they are a single
+/// change, and it needs a card with INTx to try, which there is none of here.
+/// Written out separately so that it can be seen, and tested as it stands.
+fn services_its_own_interrupt(masked: bool, has_handler: bool) -> bool {
+    has_handler && masked
+}
+
 impl SharedLegacyIrqHandler {
     /// Create a new SharedLegacyIrqHandler.
     pub fn create(irq_id: usize) -> Option<Arc<SharedLegacyIrqHandler>> {
@@ -388,27 +439,34 @@ impl SharedLegacyIrqHandler {
             //     continue;
             // }
             let inner = dev.inner.lock();
-            let handler_lock = inner.irq.handlers[0].handler.lock();
-            let handler = if inner.irq.handlers.is_empty() {
-                None
-            } else {
-                let handler = &inner.irq.handlers[0];
-                if handler.get_masked() {
-                    handler_lock.as_ref()
-                } else {
-                    None
+            // `first()` and not `handlers[0]`: the vector table can be empty
+            // with the device still on the shared line -- `set_irq_mode` takes
+            // it off the line and only then clears the table, and this runs
+            // from an interrupt, which waits for nobody. The empty-list branch
+            // was already written below, but the index was evaluated *above*
+            // it, so there was no reaching it without panicking first.
+            //
+            // Looked up once and kept: the remask below acts on the same
+            // vector, under the same hold of `inner`.
+            let vector = inner.irq.handlers.first();
+            let code = match vector {
+                Some(state) => {
+                    let handler = state.handler.lock();
+                    if services_its_own_interrupt(state.get_masked(), handler.is_some()) {
+                        handler.as_ref().map(|h| h())
+                    } else {
+                        None
+                    }
                 }
+                None => None,
             };
-            let ret = if let Some(h) = handler {
-                let code = h();
-                if (code & PCIE_IRQRET_MASK) != 0 {
-                    inner.irq.handlers[0].set_masked(true);
+            let verdict = legacy_irq_verdict(code);
+            if verdict.remask {
+                if let Some(state) = vector {
+                    state.set_masked(true);
                 }
-                code
-            } else {
-                PCIE_IRQRET_MASK
-            };
-            if (ret & PCIE_IRQRET_MASK) != 0 {
+            }
+            if verdict.silence {
                 cfg.write16(
                     PciReg16::Command,
                     cfg.read16(PciReg16::Command) | PCIE_CFG_COMMAND_INT_DISABLE,
@@ -2997,5 +3055,394 @@ mod bus_master_tests {
         // Other bits of the register are none of its business.
         assert!(!cmd_bit_needs_change(0xffff & !bit, bit, false));
         assert!(cmd_bit_needs_change(0xffff & !bit, bit, true));
+    }
+}
+
+/// The legacy (INTx) interrupt path: the one line several cards share, and the
+/// rule that decides what happens to each of them when it is asserted.
+///
+/// None of it had a test. It runs from an interrupt, and the walk that applies
+/// the rule calls the HAL (`interrupt::mask_irq` / `unmask_irq`), which the
+/// host does not implement — so every mutation of the rule passed green, and
+/// the empty-vector-table branch that is written into `handle` could not be
+/// reached without panicking on the index above it first.
+#[cfg(test)]
+mod legacy_irq_tests {
+    use super::super::harness::ConfigSpace;
+    use super::*;
+    use core::sync::atomic::{AtomicUsize, Ordering};
+
+    fn a_card(space: &mut ConfigSpace) -> Arc<PcieDevice> {
+        let dev = Arc::new(PcieDevice {
+            bus_id: 0,
+            dev_id: 3,
+            func_id: 0,
+            bar_count: 6,
+            cfg: Some(space.config()),
+            _cfg_phys: 0,
+            dev_lock: Mutex::default(),
+            command_lock: Mutex::default(),
+            vendor_id: 0x10de,
+            device_id: 0x1f06,
+            class_id: 0x03,
+            subclass_id: 0x00,
+            prog_if: 0x00,
+            rev_id: 0xa1,
+            inner: Default::default(),
+        });
+        let mut inner = dev.inner.lock();
+        inner.plugged_in = true;
+        inner.irq.legacy.pin = 1;
+        drop(inner);
+        dev
+    }
+
+    /// A card in legacy mode with `vectors` entries in its table, exactly as
+    /// `set_irq_mode(Legacy, 1)` leaves it: masked, with no handler yet.
+    fn a_card_in_legacy_mode(space: &mut ConfigSpace, vectors: usize) -> Arc<PcieDevice> {
+        let dev = a_card(space);
+        let mut inner = dev.inner.lock();
+        dev.allocate_irq_handler(&mut inner, vectors, true);
+        inner.irq.mode = PcieIrqMode::Legacy;
+        drop(inner);
+        dev
+    }
+
+    /// The shared line, without going through `create` — that registers with
+    /// the HAL, which the host does not have.
+    fn a_shared_line(devices: &[Arc<PcieDevice>]) -> SharedLegacyIrqHandler {
+        let shared = SharedLegacyIrqHandler::default();
+        shared.device_handler.lock().extend(devices.iter().cloned());
+        shared
+    }
+
+    fn command_of(dev: &Arc<PcieDevice>) -> u16 {
+        dev.config().unwrap().read16(PciReg16::Command)
+    }
+
+    fn silenced(dev: &Arc<PcieDevice>) -> bool {
+        command_of(dev) & PCIE_CFG_COMMAND_INT_DISABLE != 0
+    }
+
+    // ---------- The rule on its own ----------
+
+    /// A device nobody answered for is silenced but not re-masked; there is no
+    /// vector to re-mask, and a shared level-triggered line that nobody
+    /// services just asserts again forever and eats the CPU.
+    #[test]
+    fn a_device_nobody_answers_for_is_silenced_and_not_remasked() {
+        assert_eq!(
+            legacy_irq_verdict(None),
+            LegacyIrqVerdict {
+                remask: false,
+                silence: true,
+            }
+        );
+    }
+
+    /// A handler that asks to be masked gets both: its vector back under the
+    /// mask, and its device quiet. One without the other is either a vector
+    /// that fires into a handler that asked to stop, or a device that goes on
+    /// asserting a line it has been taken off.
+    #[test]
+    fn a_handler_that_asks_to_be_masked_gets_the_mask_and_the_silence() {
+        assert_eq!(
+            legacy_irq_verdict(Some(PCIE_IRQRET_MASK)),
+            LegacyIrqVerdict {
+                remask: true,
+                silence: true,
+            }
+        );
+        // Any other bit in the code is somebody else's business.
+        assert_eq!(
+            legacy_irq_verdict(Some(PCIE_IRQRET_MASK | 0x80)),
+            LegacyIrqVerdict {
+                remask: true,
+                silence: true,
+            }
+        );
+    }
+
+    /// A handler that says it is done leaves the device exactly as it was, so
+    /// the next interrupt on the line reaches it too.
+    #[test]
+    fn a_handler_that_is_done_leaves_its_device_alone() {
+        assert_eq!(
+            legacy_irq_verdict(Some(0)),
+            LegacyIrqVerdict {
+                remask: false,
+                silence: false,
+            }
+        );
+        assert_eq!(
+            legacy_irq_verdict(Some(0xFFFF_FFFE)),
+            LegacyIrqVerdict {
+                remask: false,
+                silence: false,
+            },
+            "only the bottom bit means 'mask me'"
+        );
+    }
+
+    /// A vector with nothing installed is never called, whatever its mask
+    /// says. (The mask half reads backwards on purpose — see the function's
+    /// own comment; this pins what it does today so that flipping it, when
+    /// somebody has a card to try it on, shows up here.)
+    #[test]
+    fn a_vector_with_no_handler_is_never_called() {
+        assert!(!services_its_own_interrupt(true, false));
+        assert!(!services_its_own_interrupt(false, false));
+        assert!(services_its_own_interrupt(true, true));
+        assert!(!services_its_own_interrupt(false, true));
+    }
+
+    // ---------- The rule applied to a card ----------
+
+    /// A card still on the line whose vector table has already been emptied.
+    ///
+    /// `set_irq_mode` takes the device off the line and only then clears the
+    /// table, and this runs from an interrupt, which waits for nobody. The
+    /// branch for it was written; reaching it was a kernel panic, because the
+    /// index that took the handler's lock was evaluated above it.
+    #[test]
+    fn a_card_with_an_empty_vector_table_is_silenced_and_not_a_panic() {
+        let mut space = ConfigSpace::new();
+        let dev = a_card(&mut space);
+        assert!(dev.inner.lock().irq.handlers.is_empty());
+
+        a_shared_line(&[dev.clone()]).handle();
+
+        assert!(
+            silenced(&dev),
+            "a card no vector answers for has to be taken off the line"
+        );
+    }
+
+    /// The ordinary case: the handler runs, says it is done, and the card is
+    /// left able to interrupt again.
+    #[test]
+    fn a_card_whose_handler_is_done_keeps_its_interrupts_on() {
+        let mut space = ConfigSpace::new();
+        let dev = a_card_in_legacy_mode(&mut space, 1);
+        let ran = Arc::new(AtomicUsize::new(0));
+        let counter = ran.clone();
+        dev.inner.lock().irq.handlers[0].set_handler(Some(alloc::boxed::Box::new(move || {
+            counter.fetch_add(1, Ordering::SeqCst);
+            0
+        })));
+
+        let line = a_shared_line(&[dev.clone()]);
+        line.handle();
+        assert_eq!(ran.load(Ordering::SeqCst), 1, "the handler never ran");
+        assert!(!silenced(&dev), "a serviced card was taken off the line");
+
+        line.handle();
+        assert_eq!(ran.load(Ordering::SeqCst), 2, "and it runs on every line");
+    }
+
+    /// A handler that asks to be masked is not called again on the next
+    /// assertion of the line, and its card is silenced.
+    #[test]
+    fn a_card_whose_handler_asks_to_stop_is_masked_and_silenced() {
+        let mut space = ConfigSpace::new();
+        let dev = a_card_in_legacy_mode(&mut space, 1);
+        let ran = Arc::new(AtomicUsize::new(0));
+        let counter = ran.clone();
+        dev.inner.lock().irq.handlers[0].set_handler(Some(alloc::boxed::Box::new(move || {
+            counter.fetch_add(1, Ordering::SeqCst);
+            PCIE_IRQRET_MASK
+        })));
+
+        a_shared_line(&[dev.clone()]).handle();
+        assert_eq!(ran.load(Ordering::SeqCst), 1);
+        assert!(
+            dev.inner.lock().irq.handlers[0].get_masked(),
+            "the vector was not put back under the mask it asked for"
+        );
+        assert!(silenced(&dev), "and the card goes quiet");
+    }
+
+    /// Every card on the line is looked at, not just the first.
+    #[test]
+    fn every_card_on_the_line_gets_its_turn() {
+        let mut one_space = ConfigSpace::new();
+        let mut other_space = ConfigSpace::new();
+        let one = a_card_in_legacy_mode(&mut one_space, 1);
+        let other = a_card(&mut other_space);
+        let ran = Arc::new(AtomicUsize::new(0));
+        let counter = ran.clone();
+        one.inner.lock().irq.handlers[0].set_handler(Some(alloc::boxed::Box::new(move || {
+            counter.fetch_add(1, Ordering::SeqCst);
+            0
+        })));
+
+        a_shared_line(&[one.clone(), other.clone()]).handle();
+
+        assert_eq!(ran.load(Ordering::SeqCst), 1);
+        assert!(!silenced(&one));
+        assert!(
+            silenced(&other),
+            "the second card on the line was never looked at"
+        );
+    }
+
+    // ---------- Masking one card's legacy vector ----------
+
+    /// Masking writes INT_DISABLE into the card's command register and records
+    /// the vector as masked; unmasking takes both back. Getting the two halves
+    /// out of step is a card that looks masked and still interrupts, or the
+    /// other way round.
+    #[test]
+    fn masking_a_legacy_vector_silences_the_card_and_writes_it_down() {
+        let mut space = ConfigSpace::new();
+        let dev = a_card_in_legacy_mode(&mut space, 1);
+        // `allocate_irq_handler` starts it masked; the command register has
+        // not been touched yet.
+        assert!(!silenced(&dev));
+
+        let inner = dev.inner.lock();
+        assert_eq!(dev.mask_legacy_irq(&inner, true), Ok(()));
+        assert!(inner.irq.handlers[0].get_masked());
+        drop(inner);
+        assert!(silenced(&dev), "a masked card still had its interrupts on");
+
+        let inner = dev.inner.lock();
+        assert_eq!(dev.mask_legacy_irq(&inner, false), Ok(()));
+        assert!(
+            !inner.irq.handlers[0].get_masked(),
+            "the unmask was not written down"
+        );
+        drop(inner);
+        assert!(
+            !silenced(&dev),
+            "an unmasked card was left with its interrupts off"
+        );
+    }
+
+    /// There is nothing to mask on a card with no vectors, and saying so beats
+    /// indexing an empty table.
+    #[test]
+    fn a_card_with_no_vectors_cannot_have_one_masked() {
+        let mut space = ConfigSpace::new();
+        let dev = a_card(&mut space);
+        let inner = dev.inner.lock();
+        assert_eq!(
+            dev.mask_legacy_irq(&inner, true),
+            Err(ZxError::INVALID_ARGS)
+        );
+        assert_eq!(
+            dev.mask_legacy_irq(&inner, false),
+            Err(ZxError::INVALID_ARGS)
+        );
+    }
+
+    /// Enabling a legacy vector clears INT_DISABLE so the card can assert the
+    /// line; disabling sets it again. Backwards, a driver that arms its
+    /// interrupt gets silence and one that tears down gets a line that never
+    /// stops.
+    #[test]
+    fn enabling_a_legacy_vector_lets_the_card_reach_the_line() {
+        let mut space = ConfigSpace::new();
+        let dev = a_card_in_legacy_mode(&mut space, 1);
+        dev.register_irq_handle(0, alloc::boxed::Box::new(|| 0))
+            .unwrap();
+        // The mode was entered with the card silenced, as `set_irq_mode` does.
+        let inner = dev.inner.lock();
+        dev.mask_legacy_irq(&inner, true).unwrap();
+        drop(inner);
+        assert!(silenced(&dev));
+
+        assert_eq!(dev.enable_irq(0, true), Ok(()));
+        assert!(
+            !silenced(&dev),
+            "an enabled vector left the card unable to interrupt"
+        );
+
+        assert_eq!(dev.enable_irq(0, false), Ok(()));
+        assert!(silenced(&dev), "a disabled vector still reaches the line");
+    }
+
+    /// A vector nothing answers for cannot be armed, and a vector the card was
+    /// never given is not a vector at all.
+    #[test]
+    fn a_legacy_vector_with_nothing_behind_it_cannot_be_armed() {
+        let mut space = ConfigSpace::new();
+        let dev = a_card_in_legacy_mode(&mut space, 1);
+        assert_eq!(dev.enable_irq(0, true), Err(ZxError::BAD_STATE));
+        assert_eq!(dev.enable_irq(1, true), Err(ZxError::INVALID_ARGS));
+        assert_eq!(dev.enable_irq(9, false), Err(ZxError::INVALID_ARGS));
+    }
+
+    /// Entering legacy mode leaves the card's one vector MASKED.
+    ///
+    /// Nothing unmasks a legacy vector afterwards, so the state it is created
+    /// in is the state it keeps, and `handle` reads it on every assertion of
+    /// the shared line. A vector that came out unmasked would be skipped for
+    /// the rest of the card's life and its device silenced on the first
+    /// interrupt.
+    #[test]
+    fn entering_legacy_mode_starts_the_cards_vector_masked_and_on_the_line() {
+        let mut space = ConfigSpace::new();
+        let dev = a_card(&mut space);
+        let node: Arc<dyn IPciNode> = Arc::new(PciDeviceNode {
+            base_device: dev.clone(),
+        });
+        dev.inner.lock().weak_super = Arc::downgrade(&node);
+        // Somebody else is already on this line, so joining it does not have
+        // to reach the HAL to unmask it.
+        let mut other_space = ConfigSpace::new();
+        let neighbour = a_card(&mut other_space);
+        dev.inner
+            .lock()
+            .irq
+            .legacy
+            .shared_handler
+            .device_handler
+            .lock()
+            .push(neighbour);
+
+        assert_eq!(dev.set_irq_mode(PcieIrqMode::Legacy, 1), Ok(()));
+
+        let inner = dev.inner.lock();
+        assert_eq!(inner.irq.mode, PcieIrqMode::Legacy);
+        assert_eq!(inner.irq.handlers.len(), 1);
+        assert!(
+            inner.irq.handlers[0].get_masked(),
+            "the card's vector came out of set_irq_mode unmasked"
+        );
+        assert_eq!(
+            inner.irq.legacy.shared_handler.device_handler.lock().len(),
+            2,
+            "the card never joined the line it just armed a vector for"
+        );
+        drop(inner);
+        assert!(
+            silenced(&dev),
+            "a card just armed is quiet until it is enabled"
+        );
+    }
+
+    /// The table a mode allocates has exactly the vectors that were asked for,
+    /// numbered from zero, and every one of them starts in the state the
+    /// caller named. Legacy mode asks for them masked, so no card can assert
+    /// the line before its driver has armed it.
+    #[test]
+    fn a_new_vector_table_starts_where_the_mode_put_it() {
+        let mut space = ConfigSpace::new();
+        let dev = a_card(&mut space);
+        let mut inner = dev.inner.lock();
+        dev.allocate_irq_handler(&mut inner, 3, true);
+
+        assert_eq!(inner.irq.handlers.len(), 3);
+        for (i, state) in inner.irq.handlers.iter().enumerate() {
+            assert_eq!(state.irq_id, i, "vector {} is numbered wrong", i);
+            assert!(state.get_masked(), "vector {} came out unmasked", i);
+            assert!(!state.has_handler());
+        }
+
+        let other = a_card(&mut ConfigSpace::new());
+        let mut other_inner = other.inner.lock();
+        other.allocate_irq_handler(&mut other_inner, 2, false);
+        assert!(other_inner.irq.handlers.iter().all(|s| !s.get_masked()));
     }
 }

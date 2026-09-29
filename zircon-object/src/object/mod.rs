@@ -1067,6 +1067,31 @@ mod tests {
         assert_eq!(future.as_mut().poll(&mut cx), Poll::Ready(Signal::READABLE));
     }
 
+    /// And when the room is not there, the cap holds.
+    ///
+    /// The list is pruned before the cap is re-tested, so the second test is
+    /// the one that actually refuses: a thousand callbacks that are all still
+    /// live survive the prune, and the next one is dropped rather than pushing
+    /// the list past its limit. Letting exactly one more through at the
+    /// boundary is how a cap stops being a cap.
+    #[test]
+    fn a_list_of_callbacks_that_are_all_alive_takes_no_more() {
+        let object = DummyObject::new();
+        for _ in 0..MAX_SIGNAL_CALLBACKS {
+            // Never retires: answering `false` is a callback saying it is not
+            // done with this object yet.
+            object.base.add_signal_callback(Box::new(|_| false));
+        }
+        assert_eq!(callbacks(&object), MAX_SIGNAL_CALLBACKS);
+
+        object.base.add_signal_callback(Box::new(|_| false));
+        assert_eq!(
+            callbacks(&object),
+            MAX_SIGNAL_CALLBACKS,
+            "a callback got in past the cap once the prune found nothing to drop"
+        );
+    }
+
     #[test]
     fn a_wait_wakes_the_waker_of_its_latest_poll() {
         let object = DummyObject::new();

@@ -57,6 +57,23 @@ impl Slack {
     }
 }
 
+/// Has `deadline` arrived, as of `now`?
+///
+/// A deadline falling exactly on `now` **has** arrived: `zx_timer_set` with a
+/// deadline in the past, and the past includes this instant, signals at once
+/// rather than arming anything.
+///
+/// Written out here because the two places that ask -- [`Timer::set`], which
+/// signals on the spot instead of handing the HAL a deadline, and
+/// [`Timer::touch`], which the HAL calls back -- both read the clock
+/// themselves. That leaves no way in from a test to the one case where `<=`
+/// and `<` part company, because the clock has moved on between the caller
+/// picking a deadline and the body reading `timer_now()`. With the comparison
+/// inside those bodies, both of its boundaries passed green under mutation.
+fn has_arrived(deadline: Duration, now: Duration) -> bool {
+    deadline <= now
+}
+
 impl Timer {
     /// Create a new `Timer`.
     pub fn new() -> Arc<Self> {
@@ -95,7 +112,7 @@ impl Timer {
         // comes back, and two of those have already been found in this kernel.
         let already_passed = {
             let mut inner = self.inner.lock();
-            if deadline <= timer_now() {
+            if has_arrived(deadline, timer_now()) {
                 inner.deadline = None;
                 inner.slack = Duration::ZERO;
                 true
@@ -146,7 +163,7 @@ impl Timer {
         let arrived = {
             let mut inner = self.inner.lock();
             match inner.deadline {
-                Some(deadline) if now >= deadline => {
+                Some(deadline) if has_arrived(deadline, now) => {
                     inner.deadline = None;
                     inner.slack = Duration::ZERO;
                     true
@@ -290,6 +307,101 @@ mod tests {
             let info = seen.lock().expect("the callback never ran");
             assert_eq!(info.1, 0, "a timer that has fired holds no deadline");
         });
+    }
+
+    /// The one case `<=` and `<` disagree about, which neither `set` nor
+    /// `touch` can be steered to from outside: both read the clock themselves.
+    #[test]
+    fn a_deadline_falling_exactly_on_the_instant_asked_about_has_arrived() {
+        let t = Duration::from_secs(9);
+        assert!(
+            has_arrived(t, t),
+            "a deadline of exactly now is in the past, not the future"
+        );
+        assert!(has_arrived(t, t + Duration::from_nanos(1)));
+        assert!(!has_arrived(t, t - Duration::from_nanos(1)));
+
+        // And the far ends, since this is what decides between signalling on
+        // the spot and handing the HAL a deadline.
+        assert!(has_arrived(Duration::ZERO, Duration::ZERO));
+        assert!(!has_arrived(Duration::MAX, Duration::ZERO));
+    }
+
+    /// `ZX_INFO_TIMER` is three fields and the file had no test that read any
+    /// of them: the creation-time slack **mode**, the deadline in
+    /// **nanoseconds**, and the slack of the pending `set`, also in
+    /// nanoseconds. Five mutations of this passed green, including handing
+    /// back the mode where the slack goes and the slack where the mode goes.
+    #[test]
+    fn the_three_fields_of_the_timer_info_are_the_mode_the_deadline_and_the_slack() {
+        // The mode is the one the timer was created with, and it is the raw
+        // `zx_timer_slack_t` a process would read back.
+        for mode in [Slack::Center, Slack::Early, Slack::Late] {
+            assert_eq!(
+                Timer::with_slack(mode).get_info().0,
+                mode as u32,
+                "{:?} did not come back as the creation mode",
+                mode
+            );
+        }
+        assert_eq!(
+            Timer::new().get_info().0,
+            Slack::Center as u32,
+            "a timer created without a mode is not centred"
+        );
+
+        // The deadline and the slack are the two of the pending `set`, both in
+        // nanoseconds, and each in its own field.
+        let timer = Timer::with_slack(Slack::Late);
+        let deadline = timer_now() + FAR;
+        let slack = Duration::from_millis(7);
+        timer.set(deadline, slack);
+
+        let (mode, reported_deadline, reported_slack) = timer.get_info();
+        assert_eq!(mode, Slack::Late as u32);
+        assert_eq!(
+            reported_deadline,
+            deadline.as_nanos() as u64,
+            "the deadline came back in the wrong unit"
+        );
+        assert_eq!(
+            reported_slack, 7_000_000,
+            "the slack came back in the wrong unit, or is not the slack"
+        );
+
+        // `one_shot` asks for no slack at all, which is not the same as asking
+        // for the deadline's worth of it.
+        assert_eq!(Timer::one_shot(timer_now() + FAR).get_info().2, 0);
+    }
+
+    /// A timer that has fired holds no deadline any more, and `cancel` leaves
+    /// none either: `ZX_INFO_TIMER` reports 0 for "nothing pending", so a
+    /// deadline left behind is a timer that reads as still armed.
+    #[test]
+    fn a_timer_that_is_done_reports_no_deadline_left() {
+        let timer = Timer::new();
+        assert_eq!(timer.get_info().1, 0, "a fresh timer has nothing pending");
+
+        // Cancelled.
+        timer.set(timer_now() + FAR, Duration::from_millis(3));
+        assert_ne!(timer.get_info().1, 0);
+        timer.cancel();
+        assert_eq!(timer.get_info().1, 0, "a cancelled deadline is still there");
+        assert_eq!(timer.get_info().2, 0, "and its slack with it");
+
+        // Arrived, which is the half that goes through `touch` rather than
+        // through `set` or `cancel`.
+        timer.set(
+            timer_now() + Duration::from_millis(5),
+            Duration::from_millis(3),
+        );
+        wait_signaled(&timer);
+        assert_eq!(
+            timer.get_info().1,
+            0,
+            "the deadline survived the firing that consumed it"
+        );
+        assert_eq!(timer.get_info().2, 0);
     }
 
     #[test]

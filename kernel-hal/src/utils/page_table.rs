@@ -1252,6 +1252,25 @@ mod walker_tests {
             .map(Page::new_aligned(7 * G + 4 * M, PageSize::Size2M), 0, rw())
             .unwrap();
         assert_eq!(seen(&three), vec![(1, 5 * G), (2, 7 * G + 4 * M)]);
+
+        // The LAST entry of the root table, which is where the kernel half
+        // lives: the top of the address space is index 511 of the top table.
+        // A table slice one entry short does not fail -- it simply never
+        // names that entry, so a dump of a kernel page table shows no kernel
+        // at all, and a walk that frees what it finds would walk past it.
+        let mut top = a_table::<PageTableLevel4>();
+        let last4 = 511usize << 39;
+        top.map(Page::new_aligned(last4, PageSize::Size1G), 0, rw())
+            .unwrap();
+        assert_eq!(seen(&top), vec![(1, last4)], "the P4's last entry");
+
+        // Same for the 3-level tree, whose root IS the P3 and whose last
+        // entry is the last gigabyte of the address space.
+        let mut top3 = a_table::<PageTableLevel3>();
+        let last3 = 511usize << 30;
+        top3.map(Page::new_aligned(last3, PageSize::Size1G), 0, rw())
+            .unwrap();
+        assert_eq!(seen(&top3), vec![(1, last3)], "the P3's last entry");
     }
 
     /// The walk stops at the last level, and a 4 KiB entry is the last level.
@@ -1383,6 +1402,66 @@ mod walker_tests {
         pt.update_no_shootdown(vaddr + 3 * K, None, Some(MMUFlags::READ))
             .unwrap();
         assert!(pt.set_gather(false));
+    }
+
+    /// `update` rewrites an entry's flags in place, and a huge leaf carries
+    /// how big it is in the same word as those flags -- the PS bit on x86,
+    /// the absent NON_BLOCK on AArch64. Writing them back as though the entry
+    /// were a 4 KiB one drops that, and the next walk reads the leaf as a
+    /// pointer to the next table: straight into the megabytes of data it
+    /// maps. `mprotect` over a huge mapping is exactly this call.
+    #[test]
+    fn updating_a_huge_page_leaves_it_huge() {
+        for (size, vaddr) in [
+            (PageSize::Size2M, 0x3600_0000_0000usize),
+            (PageSize::Size1G, 0x3640_0000_0000usize),
+        ] {
+            let mut pt = a_table::<PageTableLevel4>();
+            let paddr = 0x4000_0000;
+            pt.map(Page::new_aligned(vaddr, size), paddr, rw()).unwrap();
+            assert_eq!(
+                pt.update(vaddr, None, Some(MMUFlags::READ)).unwrap(),
+                size,
+                "{:?}: update reported another size",
+                size
+            );
+
+            let (found, flags, back) = pt.query(vaddr).unwrap();
+            assert_eq!(back, size, "{:?} stopped being huge", size);
+            assert_eq!(found, paddr, "{:?} moved", size);
+            assert_eq!(flags, MMUFlags::READ, "{:?} kept the old flags", size);
+            // And it is still in the way of a small mapping inside it, which
+            // is the thing a leaf that forgot its size stops being.
+            assert!(
+                matches!(
+                    pt.map(Page::new_aligned(vaddr + K, PageSize::Size4K), 0x9000, rw()),
+                    Err(PagingError::AlreadyMapped)
+                ),
+                "{:?} let a 4 KiB page in on top of it",
+                size
+            );
+        }
+    }
+
+    /// Closing a window that was never opened has to be harmless, and
+    /// `set_gather` saturates rather than wrapping for exactly that reason: a
+    /// depth that goes to `usize::MAX` instead of staying at zero can never
+    /// come back down, and the table then skips every local flush and
+    /// swallows every shootdown for the rest of its life.
+    #[test]
+    fn a_close_without_an_open_leaves_the_window_shut() {
+        let mut pt = a_table::<PageTableLevel4>();
+        let vaddr = 0x3700_0000_0000;
+        pt.map(Page::new_aligned(vaddr, PageSize::Size4K), 0x1000, rw())
+            .unwrap();
+
+        assert!(!pt.set_gather(false), "a debt out of nowhere");
+        assert!(!pt.set_gather(false));
+
+        // And the next real window still opens, records and pays.
+        assert!(!pt.set_gather(true));
+        pt.unmap_no_shootdown(vaddr).unwrap();
+        assert!(pt.set_gather(false), "the table is stuck inside a window");
     }
 
     /// Nested windows: an inner close must not end a window an outer caller

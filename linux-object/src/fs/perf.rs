@@ -706,6 +706,12 @@ mod tests {
     use super::*;
     use core::convert::TryInto;
 
+    /// `PERF_EVENTS` is a process-wide registry and the test binary runs the
+    /// whole crate in one process, so `sample_user` reaches every live event
+    /// any test has opened -- including the ones whose ring another test is
+    /// about to read back. The tests that measure a ring or a count take turns.
+    static SAMPLER_TURN: Mutex<()> = Mutex::new(());
+
     /// A `perf_event_attr` image carrying the fields this implementation
     /// reads. Real ones are 128 bytes; the syscall clamps the caller's
     /// `attr.size` to `[64, 4096]`.
@@ -771,6 +777,7 @@ mod tests {
 
     #[test]
     fn a_record_carries_a_header_that_says_its_own_size() {
+        let _turn = SAMPLER_TURN.lock();
         let ev = mapped(PERF_SAMPLE_IP | PERF_SAMPLE_TID, 1);
         ev.record_sample(7, 9, 3, 0xdead_beef, 12_345);
         let b = written(&ev);
@@ -795,6 +802,7 @@ mod tests {
     /// wrong width or in the wrong place spoils everything after it.
     #[test]
     fn the_body_follows_the_canonical_field_order() {
+        let _turn = SAMPLER_TURN.lock();
         let all = PERF_SAMPLE_IDENTIFIER
             | PERF_SAMPLE_IP
             | PERF_SAMPLE_TID
@@ -856,6 +864,7 @@ mod tests {
     /// consumer to skip four, putting every later field four bytes out.
     #[test]
     fn a_raw_sample_accounts_for_the_bytes_it_writes() {
+        let _turn = SAMPLER_TURN.lock();
         let ev = mapped(PERF_SAMPLE_RAW | PERF_SAMPLE_PHYS_ADDR, 1);
         ev.record_sample(1, 1, 0, 0, 0);
         let b = written(&ev);
@@ -893,6 +902,7 @@ mod tests {
 
     #[test]
     fn an_event_opened_disabled_stays_quiet_until_it_is_enabled() {
+        let _turn = SAMPLER_TURN.lock();
         let ev = PerfEvent::new(
             &attr(PERF_SAMPLE_IP, 0, ATTR_FLAG_DISABLED, 1),
             -1,
@@ -966,6 +976,7 @@ mod tests {
 
     #[test]
     fn the_control_page_tells_the_consumer_where_the_data_is() {
+        let _turn = SAMPLER_TURN.lock();
         let ev = mapped(0, 4);
         let inner = ev.inner.lock();
         let vmo = &inner.ring.as_ref().unwrap().vmo;
@@ -1016,6 +1027,7 @@ mod tests {
     /// `(void*)-1`.
     #[test]
     fn a_control_page_only_mapping_is_allowed_and_holds_no_samples() {
+        let _turn = SAMPLER_TURN.lock();
         let ev = mapped(PERF_SAMPLE_IP, 0);
         assert_eq!(ev.inner.lock().ring.as_ref().unwrap().data_size, 0);
         ev.record_sample(1, 1, 0, 0x1000, 0);
@@ -1027,6 +1039,7 @@ mod tests {
 
     #[test]
     fn a_full_ring_loses_the_sample_rather_than_overwrite_what_is_unread() {
+        let _turn = SAMPLER_TURN.lock();
         let ev = mapped(PERF_SAMPLE_IP, 1);
         let record = 16; // header + ip
         for i in 0..(PAGE_SIZE / record) {
@@ -1055,6 +1068,7 @@ mod tests {
 
     #[test]
     fn a_record_that_reaches_the_end_of_the_ring_is_written_in_two_halves() {
+        let _turn = SAMPLER_TURN.lock();
         // 24-byte records over a 4096-byte region: 170 fit, leaving 16 bytes.
         let ev = mapped(PERF_SAMPLE_IP | PERF_SAMPLE_TIME, 1);
         let record = 24;
@@ -1085,6 +1099,7 @@ mod tests {
     /// empty ring makes `async_poll`'s wait return at once, every time.
     #[test]
     fn a_drained_ring_stops_reporting_itself_readable() {
+        let _turn = SAMPLER_TURN.lock();
         let ev = mapped(PERF_SAMPLE_IP, 1);
         assert!(!ev.poll(PollEvents::empty()).unwrap().read);
 
@@ -1111,6 +1126,7 @@ mod tests {
 
     #[test]
     fn the_ioctls_perf_sends() {
+        let _turn = SAMPLER_TURN.lock();
         let ev = mapped(PERF_SAMPLE_IP, 1);
         ev.record_sample(1, 1, 0, 0x20, 0);
         assert_eq!(ev.inner.lock().count, 1);
@@ -1140,6 +1156,277 @@ mod tests {
         let period = ev.inner.lock().period;
         assert_ne!(period, 0);
         assert_eq!(ev.ioctl(0x1234, 0, 0, 0), Err(LxError::ENOTTY));
+    }
+
+    /// An event bound to one pid and cpu, with `data_pages` data pages.
+    fn mapped_on(sample_type: u64, data_pages: usize, pid: i32, cpu: i32) -> Arc<PerfEvent> {
+        let ev = PerfEvent::new(&attr(sample_type, 0, 0, 1), pid, cpu, OpenFlags::empty());
+        ev.get_vmo(0, (data_pages + 1) * PAGE_SIZE).unwrap();
+        ev
+    }
+
+    // ── what the event counts of its own running time ──────────────────
+
+    #[test]
+    fn the_stretch_an_event_is_enabled_for_is_the_time_it_reports() {
+        // `perf stat` divides by this: `perf_counts_values__scale` prints
+        // `<not counted>` for a zero, and scales the count by
+        // enabled/running otherwise. A stretch that restarts, never opens, or
+        // banks the wrong number is a rate nobody asked for.
+        assert!(now_ns() > 0, "the monotonic clock has not started");
+
+        // Opening disabled opens no stretch; opening enabled opens one.
+        let off = open(0, 0, 1, 1);
+        assert!(off.inner.lock().enabled_since.is_none());
+        let on = open(0, 0, 0, 1);
+        assert!(on.inner.lock().enabled_since.is_some());
+
+        // Enabling opens the stretch.
+        off.inner.lock().set_enabled(true);
+        assert!(
+            off.inner.lock().enabled_since.is_some(),
+            "enabled and not counting"
+        );
+
+        // A stretch that started at instant zero is the whole clock so far.
+        on.inner.lock().enabled_since = Some(0);
+        on.inner.lock().time_enabled = 0;
+        assert!(on.inner.lock().time_ns() > 0);
+
+        // Enabling again keeps it: restarting would lose the time already run.
+        on.inner.lock().set_enabled(true);
+        assert_eq!(
+            on.inner.lock().enabled_since,
+            Some(0),
+            "the stretch restarted"
+        );
+
+        // Disabling banks the time RUN, not the instant it started.
+        on.inner.lock().set_enabled(false);
+        assert!(
+            on.inner.lock().time_enabled > 0,
+            "the stretch banked nothing"
+        );
+        assert!(on.inner.lock().enabled_since.is_none());
+
+        // And a reset leaves an enabled event still counting.
+        let ev = open(0, 0, 0, 1);
+        ev.ioctl(PERF_EVENT_IOC_RESET, 0, 0, 0).unwrap();
+        assert!(
+            ev.inner.lock().enabled_since.is_some(),
+            "a reset stopped the clock of an event that is still running"
+        );
+        assert_eq!(ev.inner.lock().time_enabled, 0);
+    }
+
+    // ── the numbers of the ABI, written out rather than referred to ────
+
+    #[test]
+    fn the_attr_fields_are_where_perf_puts_them() {
+        // Written as literals on purpose: a test that indexes the attr with
+        // the same constant the code does agrees with it whatever it says.
+        // `perf_event_attr` is `{ u32 type; u32 size; u64 config;
+        // u64 sample_period; u64 sample_type; u64 read_format; u64 flags; }`,
+        // and the flags word carries `disabled` at bit 0 and `freq` at bit 10.
+        let with = |f: &dyn Fn(&mut Vec<u8>)| {
+            let mut a = alloc::vec![0u8; 128];
+            f(&mut a);
+            PerfEvent::new(&a, -1, -1, OpenFlags::empty())
+        };
+        assert!(
+            !with(&|a| a[40] = 1).inner.lock().enabled,
+            "disabled is bit 0 of byte 40"
+        );
+        assert!(with(&|a| a[40] = 0).inner.lock().enabled);
+
+        // freq is bit 10, so byte 41 bit 2; in freq mode the period reported
+        // is 1 whatever Hz was asked for.
+        let freq = with(&|a| {
+            a[41] = 1 << 2;
+            a[16..24].copy_from_slice(&4000u64.to_ne_bytes());
+        });
+        assert_eq!(freq.inner.lock().period, 1);
+        let by_count = with(&|a| a[16..24].copy_from_slice(&4000u64.to_ne_bytes()));
+        assert_eq!(by_count.inner.lock().period, 4000, "period is at byte 16");
+
+        let st = with(&|a| a[24..32].copy_from_slice(&0x1234u64.to_ne_bytes()));
+        assert_eq!(
+            st.inner.lock().sample_type,
+            0x1234,
+            "sample_type is at byte 24"
+        );
+        let rf = with(&|a| a[32..40].copy_from_slice(&0x5678u64.to_ne_bytes()));
+        assert_eq!(
+            rf.inner.lock().read_format,
+            0x5678,
+            "read_format is at byte 32"
+        );
+    }
+
+    #[test]
+    fn an_attr_that_ends_exactly_on_its_last_field_is_read_whole() {
+        // The syscall clamps `attr.size` to at least 64, but the guard here is
+        // `off + width <= len`, and the only image that tells `<=` from `<` is
+        // one that ends on the very last byte of a field.
+        let read = |len: usize, off: usize, byte: u8| {
+            let mut a = alloc::vec![0u8; len];
+            a[off] = byte;
+            PerfEvent::new(&a, -1, -1, OpenFlags::empty())
+        };
+        // sample_type is bytes 24..32: 32 is exactly enough, 31 is one short.
+        assert_eq!(read(32, 24, 0xff).inner.lock().sample_type, 0xff);
+        assert_eq!(
+            read(31, 24, 0xff).inner.lock().sample_type,
+            0,
+            "a field that straddles the end reads as zero, not as part of it"
+        );
+        // and the flags word is bytes 40..48.
+        assert!(!read(48, 40, 1).inner.lock().enabled);
+        assert!(
+            read(47, 40, 1).inner.lock().enabled,
+            "no flags word, no disabled bit"
+        );
+        // `type` is the one u32, bytes 0..4.
+        assert_eq!(read(4, 0, 0xab).inner.lock()._type, 0xab);
+        assert_eq!(read(3, 0, 0xab).inner.lock()._type, 0);
+    }
+
+    #[test]
+    fn a_record_header_carries_the_numbers_a_consumer_switches_on() {
+        let _turn = SAMPLER_TURN.lock();
+        // `PERF_RECORD_SAMPLE` is 9 and `PERF_RECORD_MISC_USER` is 2 in perf's
+        // own ABI; unmodified perf reads the first to know what this record is
+        // and the second to attribute the sample to user space.
+        let ev = mapped(PERF_SAMPLE_IP, 1);
+        ev.record_sample(1, 2, 0, 0x30, 0);
+        let b = written(&ev);
+        assert_eq!(u32_at(&b, 0), 9);
+        assert_eq!(u16::from_ne_bytes(b[4..6].try_into().unwrap()), 2);
+    }
+
+    #[async_std::test]
+    async fn the_read_format_bits_are_the_ones_perf_asks_with() {
+        // `evsel__config` sets TOTAL_TIME_ENABLED|TOTAL_TIME_RUNNING on every
+        // event it opens, and PERF_FORMAT_ID when it needs to tell a group's
+        // samples apart. They are bits 0, 1 and 2.
+        let mut buf = [0u8; 64];
+        for (rf, words) in [(0u64, 1usize), (1, 2), (2, 2), (3, 3), (4, 2), (7, 4)] {
+            let ev = open(0, rf, 0, 1);
+            let n = ev.read(&mut buf).await.unwrap();
+            assert_eq!(n, words * 8, "read_format {}", rf);
+        }
+        // With ID alone the second word is the id, not a time.
+        let ev = open(0, 4, 0, 1);
+        let n = ev.read(&mut buf).await.unwrap();
+        assert_eq!(n, 16);
+        assert_eq!(u64_at(&buf, 8), ev.inner.lock().id);
+    }
+
+    #[test]
+    fn the_ioctl_numbers_perf_actually_sends() {
+        let _turn = SAMPLER_TURN.lock();
+        // ENABLE, DISABLE and RESET are 0x2400, 0x2401 and 0x2403; an event
+        // that answers ENOTTY to them is one `perf record` gives up on.
+        let ev = mapped(PERF_SAMPLE_IP, 1);
+        ev.ioctl(0x2401, 0, 0, 0).unwrap();
+        assert!(!ev.inner.lock().enabled, "0x2401 is DISABLE");
+        ev.ioctl(0x2400, 0, 0, 0).unwrap();
+        assert!(ev.inner.lock().enabled, "0x2400 is ENABLE");
+        ev.record_sample(1, 1, 0, 0x40, 0);
+        assert_eq!(ev.inner.lock().count, 1);
+        ev.ioctl(0x2403, 0, 0, 0).unwrap();
+        assert_eq!(ev.inner.lock().count, 0, "0x2403 is RESET");
+    }
+
+    // ── the ring, the period and the mapping ───────────────────────────
+
+    #[test]
+    fn a_second_record_lands_after_the_first_and_not_over_it() {
+        let _turn = SAMPLER_TURN.lock();
+        // The write position comes from the producer's own head. Taking it
+        // from `data_tail` — the word the consumer moves — puts every record
+        // at the same place until perf drains, so a ring that looks full of
+        // samples holds one.
+        let ev = mapped(PERF_SAMPLE_IP, 1);
+        ev.record_sample(1, 1, 0, 0xaaaa, 0);
+        let first_len = written(&ev).len();
+        ev.record_sample(1, 1, 0, 0xbbbb, 0);
+        let b = written(&ev);
+        assert_eq!(b.len(), 2 * first_len, "two records, two record lengths");
+        assert_eq!(u64_at(&b, 8), 0xaaaa, "the first record was overwritten");
+        assert_eq!(u64_at(&b, first_len + 8), 0xbbbb);
+    }
+
+    #[test]
+    fn the_period_ioctl_refuses_zero_and_keeps_what_it_is_given() {
+        let _turn = SAMPLER_TURN.lock();
+        // `_perf_event_period` is `if (!value) return -EINVAL;`. Turning a 0
+        // into a 1 is the fastest rate there is, out of a value that means
+        // "stop sampling by count"; and a period the caller did not ask for is
+        // `perf record -F` told its request was honoured when it was not.
+        let ev = mapped(PERF_SAMPLE_PERIOD, 1);
+        let zero: u64 = 0;
+        assert_eq!(
+            ev.ioctl(PERF_EVENT_IOC_PERIOD, &zero as *const u64 as usize, 0, 0),
+            Err(LxError::EINVAL)
+        );
+        let want: u64 = 7;
+        assert_eq!(
+            ev.ioctl(PERF_EVENT_IOC_PERIOD, &want as *const u64 as usize, 0, 0),
+            Ok(0)
+        );
+        assert_eq!(ev.inner.lock().period, 7);
+        ev.record_sample(1, 1, 0, 0, 0);
+        assert_eq!(ev.inner.lock().count, 7, "a sample counts for one period");
+        assert_eq!(u64_at(&written(&ev), 8), 7, "and the record says which");
+    }
+
+    #[test]
+    fn a_mapping_that_wants_data_pages_is_not_given_a_control_page_only_ring() {
+        // A one-page mapping is legal and holds no samples; handing that ring
+        // back to `perf`, which mapped data pages, would leave it reading a
+        // region this side never writes.
+        let ev = open(PERF_SAMPLE_IP, 0, 0, 1);
+        let _control_only = ev.get_vmo(0, PAGE_SIZE).unwrap();
+        assert_eq!(ev.inner.lock().ring.as_ref().unwrap().data_size, 0);
+        let big = ev.get_vmo(0, 2 * PAGE_SIZE).unwrap();
+        assert!(big.len() >= 2 * PAGE_SIZE);
+        assert_eq!(
+            ev.inner.lock().ring.as_ref().unwrap().data_size,
+            PAGE_SIZE,
+            "the data-page mapping was answered with the control-only ring"
+        );
+        // The other way round the ring is reused: it is big enough.
+        let again = ev.get_vmo(0, PAGE_SIZE).unwrap();
+        assert!(
+            Arc::ptr_eq(&again, &big),
+            "a ring big enough was built again"
+        );
+    }
+
+    #[test]
+    fn a_sample_reaches_the_events_it_matches_and_goes_on_reaching_them() {
+        let _turn = SAMPLER_TURN.lock();
+        // `sample_user` runs from the timer-interrupt return path and is the
+        // only caller of `record_sample`. Two things it has to get right: who
+        // the sample is for, and that the cheap flag it checks first stays set
+        // while anything is still profiling.
+        let mine = mapped_on(PERF_SAMPLE_IP, 1, 77, 3);
+        let other = mapped_on(PERF_SAMPLE_IP, 1, 78, 3);
+        sample_user(77, 77, 3, 0xaaaa);
+        assert_eq!(mine.inner.lock().count, 1);
+        assert_eq!(
+            other.inner.lock().count,
+            0,
+            "an event opened for another process took this one's sample"
+        );
+        sample_user(77, 77, 3, 0xbbbb);
+        assert_eq!(
+            mine.inner.lock().count,
+            2,
+            "sampling stopped while the event was still enabled"
+        );
+        assert_eq!(other.inner.lock().count, 0);
     }
 
     #[test]

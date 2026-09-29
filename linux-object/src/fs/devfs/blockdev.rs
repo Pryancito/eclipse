@@ -645,6 +645,7 @@ mod tests {
     use alloc::string::String;
     use alloc::vec;
     use alloc::vec::Vec;
+    use lock::Mutex;
     use zcore_drivers::{DeviceError, DeviceResult};
 
     /// A disk made of a `Vec<u8>`, addressed the way a driver addresses one:
@@ -956,6 +957,721 @@ mod tests {
         put_gpt(&mut disk.data, 512, 1, 2, 128, &[(2048, 3071)]);
         let parts = scan_partitions(&disk.into_scheme());
         assert_eq!(parts, vec![(2048, 1024)]);
+    }
+
+    /// Byte `i` of a test disk. Period 251 rather than 256 so that two
+    /// offsets a whole number of sectors apart never hold the same byte:
+    /// with a 256-long pattern a read from the wrong sector is invisible.
+    fn pat(i: usize) -> u8 {
+        (i % 251) as u8
+    }
+
+    /// A disk that accepts writes and remembers every transfer.
+    ///
+    /// What `read_at` and `write_at` decide is not only which bytes move but
+    /// *how many* transfers they make and at which block, and that is
+    /// invisible in the bytes alone: a half-filled sector has to be read
+    /// before it is written back, and the whole-sector middle has to go out
+    /// in one call rather than one per sector.
+    struct RecordingDisk {
+        name: String,
+        data: Mutex<Vec<u8>>,
+        reads: Mutex<Vec<(usize, usize)>>,
+        writes: Mutex<Vec<(usize, usize)>>,
+        flushes: Mutex<usize>,
+    }
+
+    impl RecordingDisk {
+        fn new(blocks: usize) -> Arc<Self> {
+            Arc::new(Self {
+                name: String::from("rec"),
+                data: Mutex::new((0..blocks * 512).map(pat).collect()),
+                reads: Mutex::new(Vec::new()),
+                writes: Mutex::new(Vec::new()),
+                flushes: Mutex::new(0),
+            })
+        }
+
+        fn reads(&self) -> Vec<(usize, usize)> {
+            self.reads.lock().clone()
+        }
+
+        fn writes(&self) -> Vec<(usize, usize)> {
+            self.writes.lock().clone()
+        }
+
+        fn flushes(&self) -> usize {
+            *self.flushes.lock()
+        }
+
+        fn byte(&self, i: usize) -> u8 {
+            self.data.lock()[i]
+        }
+    }
+
+    impl Scheme for RecordingDisk {
+        fn name(&self) -> &str {
+            &self.name
+        }
+    }
+
+    impl BlockScheme for RecordingDisk {
+        fn read_block(&self, block_id: usize, buf: &mut [u8]) -> DeviceResult {
+            let data = self.data.lock();
+            let off = block_id * 512;
+            if buf.is_empty() || !buf.len().is_multiple_of(512) || off + buf.len() > data.len() {
+                return Err(DeviceError::InvalidParam);
+            }
+            buf.copy_from_slice(&data[off..off + buf.len()]);
+            self.reads.lock().push((block_id, buf.len()));
+            Ok(())
+        }
+
+        fn write_block(&self, block_id: usize, buf: &[u8]) -> DeviceResult {
+            let mut data = self.data.lock();
+            let off = block_id * 512;
+            if buf.is_empty() || !buf.len().is_multiple_of(512) || off + buf.len() > data.len() {
+                return Err(DeviceError::InvalidParam);
+            }
+            data[off..off + buf.len()].copy_from_slice(buf);
+            self.writes.lock().push((block_id, buf.len()));
+            Ok(())
+        }
+
+        fn flush(&self) -> DeviceResult {
+            *self.flushes.lock() += 1;
+            Ok(())
+        }
+
+        fn block_count(&self) -> usize {
+            self.data.lock().len() / 512
+        }
+
+        fn logical_block_size(&self) -> usize {
+            512
+        }
+    }
+
+    /// A disk that reports `lbs` as its logical block size and nothing else of
+    /// interest, for the sanity check that reads it.
+    fn disk_with_lbs(lbs: usize) -> Arc<dyn BlockScheme> {
+        FakeDisk {
+            name: String::from("fake"),
+            data: vec![0u8; 4096],
+            lbs,
+        }
+        .into_scheme()
+    }
+
+    // ── the device node: reads and writes in whole sectors ──────────────
+
+    #[test]
+    fn a_read_that_straddles_sectors_is_a_head_one_middle_and_a_tail() {
+        // Three transfers, and the middle is a single multi-sector one rather
+        // than a call per sector: an unaligned 4 KiB read is the every-time
+        // case, and a per-sector loop is eight times the round trips.
+        let disk = RecordingDisk::new(8);
+        let dev = BlockDev::new(0, disk.clone(), String::from("rec"));
+        let mut buf = [0u8; 512 + 512 + 100];
+        // 100 bytes into sector 1: 412 of head, 512 of middle, 200 of tail.
+        assert_eq!(dev.read_at(612, &mut buf).unwrap(), buf.len());
+        assert_eq!(
+            disk.reads(),
+            vec![(1, 512), (2, 512), (3, 512)],
+            "the half-filled ends one sector each, the middle in one go"
+        );
+        for (k, &b) in buf.iter().enumerate() {
+            assert_eq!(b, pat(612 + k), "byte {k} of the read");
+        }
+    }
+
+    #[test]
+    fn a_read_of_whole_sectors_makes_no_trip_for_a_tail_that_is_not_there() {
+        let disk = RecordingDisk::new(8);
+        let dev = BlockDev::new(0, disk.clone(), String::from("rec"));
+        let mut buf = [0u8; 1024];
+        assert_eq!(dev.read_at(1024, &mut buf).unwrap(), 1024);
+        assert_eq!(
+            disk.reads(),
+            vec![(2, 1024)],
+            "nothing to fix up at either end"
+        );
+        assert_eq!(buf[0], pat(1024));
+    }
+
+    #[test]
+    fn a_write_that_half_fills_a_sector_reads_it_back_before_writing_it() {
+        // The bytes of the first and last sectors the caller did not name
+        // have to survive, which is what makes those two a read-modify-write
+        // and the middle a plain write.
+        let disk = RecordingDisk::new(8);
+        let dev = BlockDev::new(0, disk.clone(), String::from("rec"));
+        let src: Vec<u8> = (0..512 + 512 + 100)
+            .map(|i| 0x80 | (i % 101) as u8)
+            .collect();
+        assert_eq!(dev.write_at(612, &src).unwrap(), src.len());
+        assert_eq!(
+            disk.reads(),
+            vec![(1, 512), (3, 512)],
+            "only the half-filled ends"
+        );
+        assert_eq!(disk.writes(), vec![(1, 512), (2, 512), (3, 512)]);
+        assert_eq!(
+            disk.byte(611),
+            pat(611),
+            "the byte before the write is still the disk's"
+        );
+        for (k, &b) in src.iter().enumerate() {
+            assert_eq!(disk.byte(612 + k), b, "byte {k} of the write");
+        }
+        assert_eq!(
+            disk.byte(612 + src.len()),
+            pat(612 + src.len()),
+            "and the one after it"
+        );
+    }
+
+    #[test]
+    fn a_write_with_a_single_byte_past_the_last_whole_sector_still_writes_it() {
+        let disk = RecordingDisk::new(8);
+        let dev = BlockDev::new(0, disk.clone(), String::from("rec"));
+        assert_eq!(dev.write_at(512, &[0x5Au8; 513]).unwrap(), 513);
+        assert_eq!(
+            disk.byte(1024),
+            0x5A,
+            "the byte that is a whole sector short"
+        );
+        assert_eq!(disk.byte(1025), pat(1025));
+    }
+
+    // ── the device node: what it tells userspace about itself ──────────
+
+    #[test]
+    fn the_size_ioctls_answer_in_the_units_their_names_promise() {
+        // `BLKGETSIZE64` is bytes and `BLKGETSIZE` is 512-byte sectors. A
+        // partitioner that reads the wrong one lays the table out at the
+        // wrong end of the disk.
+        let dev = BlockDev::new(0, RecordingDisk::new(8), String::from("rec"));
+        let mut bytes = 0u64;
+        assert_eq!(
+            dev.io_control(0x8008_1272, &mut bytes as *mut u64 as usize)
+                .unwrap(),
+            0
+        );
+        assert_eq!(bytes, 8 * 512);
+        let mut sectors = 0usize;
+        assert_eq!(
+            dev.io_control(0x0000_1260, &mut sectors as *mut usize as usize)
+                .unwrap(),
+            0
+        );
+        assert_eq!(sectors, 8);
+    }
+
+    #[test]
+    fn flushing_the_buffers_reaches_the_driver_and_then_says_it_worked() {
+        // This used to answer ENOSYS, which an installer reads as "your write
+        // may not have landed".
+        let disk = RecordingDisk::new(8);
+        let dev = BlockDev::new(0, disk.clone(), String::from("rec"));
+        assert_eq!(dev.io_control(0x0000_1261, 0).unwrap(), 0);
+        assert_eq!(
+            disk.flushes(),
+            1,
+            "the driver's own flush is what makes it true"
+        );
+    }
+
+    #[test]
+    fn an_ioctl_this_device_does_not_know_is_refused() {
+        let dev = BlockDev::new(0, RecordingDisk::new(8), String::from("rec"));
+        assert_eq!(dev.io_control(0x0000_1299, 0), Err(FsError::NotSupported));
+        // The number one below the re-read-partition-table ioctl is not it.
+        assert_eq!(dev.io_control(0x0000_125e, 0), Err(FsError::NotSupported));
+    }
+
+    #[test]
+    fn the_metadata_is_a_block_device_measured_in_512_byte_sectors() {
+        let dev = BlockDev::new(5, RecordingDisk::new(8), String::from("rec"));
+        let m = dev.metadata().unwrap();
+        assert_eq!(m.type_, FileType::BlockDevice);
+        assert_eq!(m.blocks, 8);
+        assert_eq!(m.blk_size, 512);
+        assert_eq!(m.size, 8 * 512, "the size a stat(2) reports is bytes");
+        assert_eq!(
+            m.rdev,
+            make_rdev(3, 5),
+            "major 3 is the disk major and the minor is the device's index"
+        );
+    }
+
+    #[test]
+    fn every_driver_error_becomes_the_filesystem_error_that_means_the_same() {
+        // `NotReady` is the one that matters: a disk that is merely busy has
+        // to read as busy, not as a hardware failure the caller gives up on.
+        for (dev, fs) in [
+            (DeviceError::NotSupported, FsError::NotSupported),
+            (DeviceError::NotReady, FsError::Busy),
+            (DeviceError::InvalidParam, FsError::InvalidParam),
+            (DeviceError::BufferTooSmall, FsError::DeviceError),
+            (DeviceError::DmaError, FsError::DeviceError),
+            (DeviceError::IoError, FsError::DeviceError),
+            (DeviceError::AlreadyExists, FsError::DeviceError),
+            (DeviceError::NoResources, FsError::DeviceError),
+        ] {
+            assert_eq!(convert_error(dev), fs, "{dev:?}");
+        }
+    }
+
+    // ── a partition as a block device of its own ───────────────────────
+
+    #[test]
+    fn a_partition_addresses_the_parent_from_its_own_first_block() {
+        let disk = RecordingDisk::new(64);
+        let part = PartitionBlock::new(disk.clone(), String::from("p1"), 8, 4);
+        let mut buf = [0u8; 512];
+        part.read_block(0, &mut buf).unwrap();
+        assert_eq!(
+            disk.reads(),
+            vec![(8, 512)],
+            "block 0 of the partition is block 8 of the disk"
+        );
+        assert_eq!(buf[0], pat(8 * 512));
+        part.write_block(3, &[0x77u8; 512]).unwrap();
+        assert_eq!(disk.writes(), vec![(11, 512)]);
+        assert_eq!(disk.byte(11 * 512), 0x77);
+        assert_eq!(part.block_count(), 4, "its own size, not the whole disk's");
+        // A partition is addressed in its parent's blocks, because anything
+        // laid out inside it is.
+        let big = PartitionBlock::new(disk_with_lbs(4096), String::from("p2"), 0, 8);
+        assert_eq!(big.logical_block_size(), 4096);
+    }
+
+    #[test]
+    fn a_partition_refuses_the_transfer_that_would_run_past_its_end() {
+        // The last sector is inside and the one after it is not: a partition
+        // that let a read run over its end would hand out the next one's
+        // data.
+        let disk = RecordingDisk::new(64);
+        let part = PartitionBlock::new(disk, String::from("p1"), 8, 4);
+        let mut one = [0u8; 512];
+        assert!(
+            part.read_block(3, &mut one).is_ok(),
+            "the last sector is inside"
+        );
+        assert_eq!(part.read_block(4, &mut one), Err(DeviceError::InvalidParam));
+        assert_eq!(
+            part.write_block(4, &[0u8; 512]),
+            Err(DeviceError::InvalidParam)
+        );
+        let mut four = [0u8; 2048];
+        assert!(
+            part.read_block(0, &mut four).is_ok(),
+            "four sectors is exactly the partition"
+        );
+        assert_eq!(
+            part.read_block(1, &mut four),
+            Err(DeviceError::InvalidParam)
+        );
+    }
+
+    #[test]
+    fn a_logical_block_size_that_is_not_a_sane_power_of_two_falls_back_to_512() {
+        // Everything a partition table says is in device blocks, so a garbage
+        // value here reads the table at the wrong place or turns a header
+        // read into a multi-megabyte transfer.
+        for lbs in [0, 1, 256, 1536, 3072, 8192] {
+            assert_eq!(device_block_size(&disk_with_lbs(lbs)), 512, "lbs {lbs}");
+        }
+        for lbs in [512, 1024, 2048, 4096] {
+            assert_eq!(device_block_size(&disk_with_lbs(lbs)), lbs, "lbs {lbs}");
+        }
+    }
+
+    // ── the sliding window the table is read through ───────────────────
+
+    #[test]
+    fn the_window_starts_on_the_sector_below_the_range_and_fills_itself() {
+        let disk = RecordingDisk::new(16);
+        let d: Arc<dyn BlockScheme> = disk.clone();
+        let mut w = Window::new();
+        let got = w.get(&d, 600, 24).unwrap();
+        assert_eq!(
+            got[0],
+            pat(600),
+            "the byte asked for, not the one the window starts on"
+        );
+        assert_eq!(got[23], pat(623));
+        assert_eq!(
+            disk.reads(),
+            vec![(1, MAX_LBS)],
+            "the 512-boundary at or below 600"
+        );
+    }
+
+    #[test]
+    fn the_window_answers_from_itself_while_the_range_is_inside_it() {
+        // The GPT entry array is addressed in bytes and its entries need not
+        // line up with sectors, so a walk of it asks for one arbitrary range
+        // after another. Re-reading for each would be a transfer per entry.
+        let disk = RecordingDisk::new(16);
+        let d: Arc<dyn BlockScheme> = disk.clone();
+        let mut w = Window::new();
+        assert_eq!(w.get(&d, 600, 24).unwrap()[0], pat(600));
+        assert_eq!(disk.reads().len(), 1);
+        assert_eq!(
+            w.get(&d, 512, 8).unwrap()[0],
+            pat(512),
+            "the window's own first byte"
+        );
+        assert_eq!(w.get(&d, 4000, 48).unwrap()[0], pat(4000));
+        let win = MAX_LBS as u64;
+        assert_eq!(
+            w.get(&d, 512 + win - 8, 8).unwrap()[0],
+            pat(512 + MAX_LBS - 8),
+            "a range that ends exactly where the window does"
+        );
+        assert_eq!(disk.reads().len(), 1, "all of that out of one read");
+        // And one byte further is a new window.
+        assert_eq!(w.get(&d, 512 + win, 8).unwrap()[0], pat(512 + MAX_LBS));
+        assert_eq!(disk.reads().len(), 2);
+    }
+
+    #[test]
+    fn a_window_range_of_no_length_or_of_more_than_one_window_is_refused() {
+        let disk = RecordingDisk::new(16);
+        let d: Arc<dyn BlockScheme> = disk.clone();
+        let mut w = Window::new();
+        assert!(w.get(&d, 0, 0).is_none(), "no length is not a range");
+        assert!(
+            w.get(&d, 0, MAX_LBS + 1).is_none(),
+            "more than the window holds"
+        );
+        assert!(
+            w.get(&d, 0, MAX_LBS).is_some(),
+            "exactly the window is allowed"
+        );
+    }
+
+    #[test]
+    fn a_window_range_that_runs_off_the_end_of_the_device_is_refused() {
+        // The backup GPT header sits on the very last block, so the window is
+        // clamped to what the device has -- and a range that needs more than
+        // the clamp leaves has to be refused, not served from stale bytes.
+        let disk = RecordingDisk::new(9);
+        let d: Arc<dyn BlockScheme> = disk.clone();
+        let mut w = Window::new();
+        assert!(
+            w.get(&d, 4600, 8).is_some(),
+            "the last eight bytes of the device"
+        );
+        let mut w2 = Window::new();
+        assert!(
+            w2.get(&d, 4604, 8).is_none(),
+            "four bytes past the end of it"
+        );
+    }
+
+    #[test]
+    fn a_partition_that_ends_on_the_last_sector_fits_and_one_past_it_does_not() {
+        // 4Kn: one device block is eight API sectors.
+        assert_eq!(to_api_sectors(0, 1, 4096, 8), Some((0, 8)));
+        assert_eq!(to_api_sectors(1, 1, 4096, 16), Some((8, 8)));
+        assert_eq!(
+            to_api_sectors(1, 1, 4096, 15),
+            None,
+            "one sector short of fitting"
+        );
+        assert_eq!(
+            to_api_sectors(0, 8, 512, 8),
+            Some((0, 8)),
+            "exactly the whole device"
+        );
+        assert_eq!(to_api_sectors(0, 9, 512, 8), None);
+        assert_eq!(
+            to_api_sectors(0, 0, 512, 8),
+            None,
+            "an empty partition is not one"
+        );
+        assert_eq!(
+            to_api_sectors(u64::MAX, 2, 4096, 8),
+            None,
+            "the multiply overflows"
+        );
+    }
+
+    // ── the MBR, its containers and its chains ─────────────────────────
+
+    #[test]
+    fn a_protective_mbr_is_recognised_in_any_slot_and_by_its_type_byte() {
+        // The 0xEE entry is meant to be the first one, but nothing on disk
+        // enforces that; and its type lives at byte 4 of the entry, not at
+        // byte 0, which is the boot flag. Either mistake hands out one
+        // partition covering the whole GPT disk.
+        for slot in 0..4 {
+            let mut disk = FakeDisk::new(512, 4096);
+            put_mbr_entry(&mut disk.data, slot, 0xEE, 1, 4095);
+            disk.data[510] = 0x55;
+            disk.data[511] = 0xAA;
+            assert!(
+                scan_partitions(&disk.into_scheme()).is_empty(),
+                "protective entry in slot {}",
+                slot
+            );
+        }
+    }
+
+    #[test]
+    fn an_empty_mbr_slot_is_not_a_partition_even_with_numbers_left_in_it() {
+        // Type zero means unused. A table rewritten in place leaves the old
+        // start and length sitting behind it.
+        let mut disk = FakeDisk::new(512, 4096);
+        put_mbr_entry(&mut disk.data, 0, 0x83, 2048, 1024);
+        put_mbr_entry(&mut disk.data, 1, 0x00, 1024, 512);
+        disk.data[510] = 0x55;
+        disk.data[511] = 0xAA;
+        assert_eq!(scan_partitions(&disk.into_scheme()), vec![(2048, 1024)]);
+    }
+
+    #[test]
+    fn an_mbr_partition_that_starts_on_the_sector_after_the_table_is_kept() {
+        // LBA 0 is the table itself, so a partition claiming it is garbage.
+        // LBA 1 is the first sector a real one can have, and superfloppy and
+        // embedded images do start there.
+        let mut disk = FakeDisk::new(512, 4096);
+        put_mbr_entry(&mut disk.data, 0, 0x83, 1, 2047);
+        put_mbr_entry(&mut disk.data, 1, 0x83, 0, 512);
+        disk.data[510] = 0x55;
+        disk.data[511] = 0xAA;
+        assert_eq!(
+            scan_partitions(&disk.into_scheme()),
+            vec![(1, 2047)],
+            "the one at LBA 1 is real and the one at LBA 0 is not"
+        );
+    }
+
+    #[test]
+    fn a_linux_extended_container_is_walked_and_not_handed_out() {
+        // 0x85 is the Linux extended type. Treating it as a filesystem hands
+        // out the container, which overlaps every logical partition in it.
+        let mut disk = FakeDisk::new(512, 8192);
+        put_mbr_entry(&mut disk.data, 0, 0x85, 4096, 4096);
+        disk.data[510] = 0x55;
+        disk.data[511] = 0xAA;
+        let ebr = 4096 * 512;
+        put_mbr_entry(&mut disk.data[ebr..ebr + 512], 0, 0x83, 64, 1000);
+        disk.data[ebr + 510] = 0x55;
+        disk.data[ebr + 511] = 0xAA;
+        assert_eq!(scan_partitions(&disk.into_scheme()), vec![(4160, 1000)]);
+    }
+
+    #[test]
+    fn an_extended_entry_that_starts_on_lba_zero_is_not_a_chain() {
+        // LBA 0 is the partition table, not an EBR. Walking it reads the
+        // table's own first entry as a logical partition and hands out the
+        // primary a second time.
+        let mut disk = FakeDisk::new(512, 4096);
+        put_mbr_entry(&mut disk.data, 0, 0x83, 2048, 1024);
+        put_mbr_entry(&mut disk.data, 1, 0x05, 0, 4096);
+        disk.data[510] = 0x55;
+        disk.data[511] = 0xAA;
+        assert_eq!(scan_partitions(&disk.into_scheme()), vec![(2048, 1024)]);
+    }
+
+    #[test]
+    fn a_logical_partition_has_to_fit_inside_its_container() {
+        // The container ends at its own start plus its length. One that ends
+        // exactly there is inside; one that ends a block later is a table
+        // that lies, and handing it out overlaps whatever comes next.
+        let scan = |count: u32| {
+            let mut disk = FakeDisk::new(512, 8192);
+            put_mbr_entry(&mut disk.data, 0, 0x05, 64, 16);
+            disk.data[510] = 0x55;
+            disk.data[511] = 0xAA;
+            let ebr = 64 * 512;
+            put_mbr_entry(&mut disk.data[ebr..ebr + 512], 0, 0x83, 1, count);
+            disk.data[ebr + 510] = 0x55;
+            disk.data[ebr + 511] = 0xAA;
+            scan_partitions(&disk.into_scheme())
+        };
+        assert_eq!(
+            scan(15),
+            vec![(65, 15)],
+            "ends exactly at the container's end"
+        );
+        assert!(scan(16).is_empty(), "one block past it");
+    }
+
+    #[test]
+    fn the_next_ebr_is_addressed_from_the_container_not_from_the_one_before() {
+        // An EBR's second entry is relative to the *container*; its first is
+        // relative to the EBR itself. Following the link from the current EBR
+        // walks off down the disk and loses the rest of the chain.
+        let mut disk = FakeDisk::new(512, 8192);
+        put_mbr_entry(&mut disk.data, 0, 0x05, 1024, 3072);
+        disk.data[510] = 0x55;
+        disk.data[511] = 0xAA;
+        for (i, &(rel_next, size)) in [(Some(512u32), 100u32), (Some(1024), 200), (None, 300)]
+            .iter()
+            .enumerate()
+        {
+            let at = (1024 + i * 512) * 512;
+            put_mbr_entry(&mut disk.data[at..at + 512], 0, 0x83, 1, size);
+            if let Some(r) = rel_next {
+                put_mbr_entry(&mut disk.data[at..at + 512], 1, 0x05, r, 512);
+            }
+            disk.data[at + 510] = 0x55;
+            disk.data[at + 511] = 0xAA;
+        }
+        assert_eq!(
+            scan_partitions(&disk.into_scheme()),
+            vec![(1025, 100), (1537, 200), (2049, 300)]
+        );
+    }
+
+    #[test]
+    fn a_chain_that_links_out_of_its_container_stops_at_the_boundary() {
+        // The container's last block is `ext_start + ext_count - 1`, so a link
+        // landing *on* `ext_end` is already outside it -- that sector belongs
+        // to whatever partition comes next. Following it reads a stranger's
+        // table, and its own second entry points back inside the container, so
+        // the scan comes out with a partition it only reached by leaving.
+        let mut disk = FakeDisk::new(512, 8192);
+        put_mbr_entry(&mut disk.data, 0, 0x05, 1024, 512); // 1024..1536
+        disk.data[510] = 0x55;
+        disk.data[511] = 0xAA;
+        let mut ebr = |lba: usize, count: u32, next_rel: u32| {
+            let at = lba * 512;
+            put_mbr_entry(&mut disk.data[at..at + 512], 0, 0x83, 1, count);
+            if next_rel != 0 {
+                put_mbr_entry(&mut disk.data[at..at + 512], 1, 0x05, next_rel, 512);
+            }
+            disk.data[at + 510] = 0x55;
+            disk.data[at + 511] = 0xAA;
+        };
+        // The chain proper, then the stranger on the boundary, then the EBR it
+        // would send us back to -- whose logical partition does fit inside.
+        ebr(1024, 100, 512);
+        ebr(1536, 10, 256);
+        ebr(1280, 50, 0);
+        assert_eq!(scan_partitions(&disk.into_scheme()), vec![(1025, 100)]);
+    }
+
+    #[test]
+    fn an_extended_chain_on_a_4kn_disk_is_addressed_in_device_blocks() {
+        // Every LBA in a partition table is a *device* block. Reading an EBR
+        // in 512-byte units lands an eighth of the way in, where there is no
+        // signature at all.
+        let mut disk = FakeDisk::new(4096, 512);
+        put_mbr_entry(&mut disk.data, 0, 0x05, 64, 16);
+        disk.data[510] = 0x55;
+        disk.data[511] = 0xAA;
+        let ebr = 64 * 4096;
+        put_mbr_entry(&mut disk.data[ebr..ebr + 512], 0, 0x83, 1, 8);
+        disk.data[ebr + 510] = 0x55;
+        disk.data[ebr + 511] = 0xAA;
+        // 65 device blocks in and eight blocks long, in 512-byte API sectors.
+        assert_eq!(scan_partitions(&disk.into_scheme()), vec![(65 * 8, 8 * 8)]);
+    }
+
+    // ── the GPT header and its entry array ─────────────────────────────
+
+    #[test]
+    fn the_backup_gpt_of_a_4kn_disk_is_on_its_last_device_block() {
+        // The backup header's place is the last *device* block. Counting the
+        // disk in 512-byte sectors puts it eight times too far out, where
+        // there is nothing to read -- and a disk whose primary header is
+        // damaged then comes up with no partitions at all.
+        let mut disk = FakeDisk::new(4096, 64);
+        put_protective_mbr(&mut disk.data);
+        put_gpt(&mut disk.data, 4096, 63, 2, 128, &[(8, 15)]);
+        assert_eq!(scan_partitions(&disk.into_scheme()), vec![(64, 64)]);
+    }
+
+    #[test]
+    fn a_gpt_header_that_is_not_quite_right_is_not_a_gpt_header() {
+        // Each of these is the difference between reading a table and walking
+        // the array at the wrong stride or the wrong place. The MBR entry
+        // underneath is what says the scan fell through rather than simply
+        // finding nothing.
+        let build = |fix: &dyn Fn(&mut Vec<u8>)| {
+            let mut disk = FakeDisk::new(512, 4096);
+            put_gpt(&mut disk.data, 512, 1, 2, 128, &[(2048, 3071)]);
+            put_mbr_entry(&mut disk.data, 0, 0x83, 100, 200);
+            disk.data[510] = 0x55;
+            disk.data[511] = 0xAA;
+            fix(&mut disk.data);
+            scan_partitions(&disk.into_scheme())
+        };
+        assert_eq!(build(&|_| {}), vec![(2048, 1024)], "as written it is a GPT");
+        assert_eq!(
+            build(&|d| d[512 + 7] = b'X'),
+            vec![(100, 200)],
+            "the whole eight-byte signature has to match"
+        );
+        assert_eq!(
+            build(&|d| d[512 + 72..512 + 80].copy_from_slice(&1u64.to_le_bytes())),
+            vec![(100, 200)],
+            "an entry array that overlaps the header itself"
+        );
+        assert_eq!(
+            build(&|d| d[512 + 80..512 + 84].copy_from_slice(&0u32.to_le_bytes())),
+            vec![(100, 200)],
+            "a header that declares no entries at all"
+        );
+        assert_eq!(
+            build(&|d| d[512 + 84..512 + 88].copy_from_slice(&192u32.to_le_bytes())),
+            vec![(100, 200)],
+            "an entry size that is not a multiple of 128"
+        );
+    }
+
+    #[test]
+    fn only_the_entries_the_header_declares_are_read() {
+        // The array is as long as the header says it is. Reading further
+        // finds whatever a previous, longer table left behind: partitions
+        // that are not in this one.
+        let mut disk = FakeDisk::new(512, 4096);
+        put_protective_mbr(&mut disk.data);
+        put_gpt(
+            &mut disk.data,
+            512,
+            1,
+            2,
+            128,
+            &[(2048, 2559), (2560, 3071), (3072, 3583)],
+        );
+        disk.data[512 + 80..512 + 84].copy_from_slice(&2u32.to_le_bytes());
+        assert_eq!(
+            scan_partitions(&disk.into_scheme()),
+            vec![(2048, 512), (2560, 512)],
+            "the third entry is written but not declared"
+        );
+    }
+
+    #[test]
+    fn a_gpt_entry_is_read_by_its_whole_type_guid_and_its_whole_range() {
+        let mut disk = FakeDisk::new(512, 4096);
+        put_protective_mbr(&mut disk.data);
+        put_gpt(
+            &mut disk.data,
+            512,
+            1,
+            2,
+            128,
+            &[(2048, 2048), (2560, 2600), (3000, 3100)],
+        );
+        let e = 2 * 512;
+        // A type GUID whose first eight bytes are zero is still a type GUID.
+        disk.data[e..e + 8].copy_from_slice(&[0u8; 8]);
+        // An entry that starts on LBA 0 is not a partition, whatever it says
+        // its last block is.
+        disk.data[e + 128 + 32..e + 128 + 40].copy_from_slice(&0u64.to_le_bytes());
+        assert_eq!(
+            scan_partitions(&disk.into_scheme()),
+            vec![(2048, 1), (3000, 101)],
+            "a one-block partition is a partition; an LBA-0 entry is not"
+        );
     }
 
     #[test]

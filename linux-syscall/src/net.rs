@@ -1587,3 +1587,139 @@ mod peercred_tests {
         assert_eq!(words(ucred_of(43_102)), [43_102, u32::MAX, u32::MAX]);
     }
 }
+
+#[cfg(test)]
+mod bounded_queue_tests {
+    //! Which sockets a blocking `send` has to WAIT on: the ones whose `write`
+    //! queues into a bounded buffer and answers `EAGAIN` when it is full.
+    //! `send_mode`'s tests pass that answer in as a `bool`, so the question of
+    //! which sockets it is true for had nobody asking it: with the two arms
+    //! ANDed instead of ORed nothing is bounded at all, and a blocking
+    //! `sendto` on a full unix socket goes back to answering `EAGAIN` --
+    //! which is the bug this pair was written for.
+
+    use super::*;
+
+    #[test]
+    fn a_unix_socket_queues_into_a_bounded_buffer() {
+        let unix: Arc<dyn FileLike> = UnixSocketState::new();
+        assert!(
+            queue_is_bounded(&unix),
+            "a unix socket writes into its peer's bounded buffer"
+        );
+    }
+}
+
+#[cfg(test)]
+mod sockopt_out_tests {
+    //! `optlen` is a value-result argument: `sock_getsockopt()` clamps
+    //! (`if (len > lv) len = lv;`) before its `put_user(len, optlen)`. Telling
+    //! a caller the option's full size instead says the kernel filled bytes it
+    //! never touched, and the caller reads its own uninitialised stack as part
+    //! of the answer. `SO_PEERCRED` (a 12-byte `struct ucred`) into an `int`
+    //! is the case that turns up.
+
+    use super::*;
+
+    // `libos` addresses are ordinary host addresses, so a local buffer is a
+    // valid stand-in for the caller's and the copy below runs for real.
+    fn out(buf: &mut [u8]) -> UserOutPtr<u32> {
+        UserOutPtr::from(buf.as_mut_ptr() as usize)
+    }
+    fn in_out(slot: &mut u32) -> UserInOutPtr<u32> {
+        UserInOutPtr::from(slot as *mut u32 as usize)
+    }
+
+    #[test]
+    fn a_buffer_smaller_than_the_option_is_told_what_was_written() {
+        let value = [1u8, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
+        let mut buf = [0xEEu8; 16];
+        let mut len = 4u32;
+        let optlen = in_out(&mut len);
+        assert_eq!(write_sockopt_out(out(&mut buf), optlen, &value), Ok(0));
+        assert_eq!(len, 4, "the caller was told more than the kernel wrote");
+        assert_eq!(buf[..4], value[..4]);
+        assert_eq!(
+            buf[4..],
+            [0xEEu8; 12],
+            "the kernel wrote past the buffer the caller supplied"
+        );
+    }
+
+    #[test]
+    fn a_buffer_larger_than_the_option_is_told_the_option_s_size() {
+        let value = [1u8, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
+        let mut buf = [0xEEu8; 32];
+        let mut len = 32u32;
+        let optlen = in_out(&mut len);
+        assert_eq!(write_sockopt_out(out(&mut buf), optlen, &value), Ok(0));
+        assert_eq!(len, 12, "a roomy buffer is told the option's real size");
+        assert_eq!(buf[..12], value[..]);
+        assert_eq!(buf[12..], [0xEEu8; 20], "wrote past the option's value");
+    }
+
+    #[test]
+    fn a_buffer_of_no_length_is_not_written_at_all() {
+        // `getsockopt(fd, ..., &val, &zero)` is how a caller asks only for the
+        // size, and it must not take a single byte of `val`.
+        let value = [1u8, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
+        let mut buf = [0xEEu8; 16];
+        let mut len = 0u32;
+        let optlen = in_out(&mut len);
+        assert_eq!(write_sockopt_out(out(&mut buf), optlen, &value), Ok(0));
+        assert_eq!(len, 0);
+        assert_eq!(buf, [0xEEu8; 16], "a zero-length buffer was written");
+    }
+}
+
+#[cfg(test)]
+#[allow(unsafe_code)]
+mod read_sockaddr_tests {
+    //! `move_addr_to_kernel`: copy exactly the `addrlen` the caller declared,
+    //! at one-byte alignment, and leave the rest zero. Reading the whole
+    //! `SockAddr` union instead had two bugs -- it needed 4-byte alignment,
+    //! which a `sockaddr_un` does not have (this is what answered "unable to
+    //! connect to X server: Bad address"), and it over-read past a short user
+    //! buffer.
+
+    use super::*;
+
+    #[test]
+    fn a_null_address_is_efault_even_with_nothing_to_read() {
+        // `addrlen == 0` is the length that tells the two apart: with no bytes
+        // to copy, the NULL check is the only thing left to refuse it, and
+        // without it `bind(fd, NULL, 0)` comes back with a zeroed address
+        // instead of an error.
+        for len in [0usize, 1, 2, size_of::<SockAddr>(), usize::MAX] {
+            assert_eq!(
+                read_sockaddr(0, len).err(),
+                Some(LxError::EFAULT),
+                "addrlen {}",
+                len
+            );
+        }
+    }
+
+    #[test]
+    fn only_the_bytes_the_caller_declared_are_copied() {
+        // A caller that declares two bytes must not have the 106 bytes of
+        // path that happen to follow them dragged in as its socket's name.
+        let src = [0xAAu8; size_of::<SockAddr>()];
+        let sa = read_sockaddr(src.as_ptr() as usize, 2).expect("two bytes are readable");
+        let un = unsafe { sa.addr_un };
+        assert_eq!(un.sun_family, 0xAAAA);
+        assert!(
+            un.sun_path.iter().all(|&b| b == 0),
+            "the path came from memory the caller never declared"
+        );
+    }
+
+    #[test]
+    fn a_single_declared_byte_is_still_copied() {
+        let src = [0x7Fu8; size_of::<SockAddr>()];
+        let sa = read_sockaddr(src.as_ptr() as usize, 1).expect("one byte is readable");
+        let family = unsafe { sa.family }.to_ne_bytes();
+        assert_eq!(family[0], 0x7F, "the one byte declared never arrived");
+        assert_eq!(family[1], 0, "a byte the caller did not declare arrived");
+    }
+}

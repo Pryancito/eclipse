@@ -539,6 +539,52 @@ mod page_size_tests {
         assert!(sizes(&t).iter().all(|&s| s == M), "{:?}", sizes(&t));
     }
 
+    /// And the same rule from the other side. The 2 MiB case has both halves
+    /// covered; the gigabyte one only had the physical half, so a virtual
+    /// address that starts 2 MiB into a gigabyte could have taken a 1 GiB
+    /// page. One PTE cannot describe that: the entry IS the slot, and a
+    /// 1 GiB slot only exists at a 1 GiB boundary.
+    #[test]
+    fn the_virtual_side_has_a_vote_on_the_gigabyte_page_too() {
+        let mut t = RecordingTable::default();
+        t.map_cont(G + M, G, G, MMUFlags::HUGE_PAGE).unwrap();
+        assert_eq!(t.mapped.len(), G / M);
+        assert!(sizes(&t).iter().all(|&s| s == M), "{:?}", sizes(&t));
+        // Every page still starts where it was asked to.
+        assert_eq!(t.mapped[0].0, G + M);
+        assert_eq!(t.mapped[0].1, G);
+    }
+
+    // ── a page is aligned to its own size ──────────────────────────────────
+
+    /// `Page::new_aligned` is the only constructor, and every caller works
+    /// the address out itself. A page whose address is not aligned to its own
+    /// size is an entry in the wrong slot of the wrong table: the walker
+    /// indexes by the very bits the alignment is supposed to have zeroed, so
+    /// the page silently lands somewhere else.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic]
+    fn a_2m_page_cannot_start_in_the_middle_of_one() {
+        let _ = Page::new_aligned(M + K, PageSize::Size2M);
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic]
+    fn a_4k_page_cannot_start_in_the_middle_of_one() {
+        let _ = Page::new_aligned(K + 8, PageSize::Size4K);
+    }
+
+    #[test]
+    fn a_page_that_is_aligned_keeps_its_address_and_its_size() {
+        for size in [PageSize::Size4K, PageSize::Size2M, PageSize::Size1G] {
+            let p = Page::new_aligned(3 * size as usize, size);
+            assert_eq!(p.vaddr, 3 * size as usize, "{:?}", size);
+            assert_eq!(p.size, size);
+        }
+    }
+
     /// The default [`GenericPageTable::set_gather`]: a table with no gather
     /// window of its own owes nothing, opening one or closing it.
     ///
@@ -550,8 +596,8 @@ mod page_size_tests {
     #[test]
     fn a_table_that_cannot_gather_never_owes_a_flush() {
         let mut t = RecordingTable::default();
-        assert!(!t.set_gather(true), "abrir una ventana no debe nada");
-        assert!(!t.set_gather(false), "y cerrarla tampoco");
+        assert!(!t.set_gather(true), "opening a window owed something");
+        assert!(!t.set_gather(false), "and closing it owed something");
     }
 
     // ── unmapping a range ──────────────────────────────────────────────────
@@ -610,6 +656,22 @@ mod page_size_tests {
         };
         t.unmap_cont(0, M + 2 * K).unwrap();
         assert_eq!(t.unmapped, alloc::vec![0, M, M + K]);
+    }
+
+    /// `unmap_cont` advances by the size the table reports, and it checks
+    /// that the size fits the address it just unmapped. It has to: a 2 MiB
+    /// answer for an address that is not 2 MiB aligned means the walk is
+    /// about to step past the end of the range it was given, over pages that
+    /// belong to whatever is mapped next.
+    #[test]
+    #[should_panic]
+    fn a_size_that_does_not_fit_the_address_stops_the_unmap() {
+        let mut t = RecordingTable {
+            unmap_sizes: alloc::vec![PageSize::Size2M],
+            ..Default::default()
+        };
+        // Starts 4 KiB in, so the first address is not 2 MiB aligned.
+        let _ = t.unmap_cont(K, 4 * M);
     }
 
     #[test]

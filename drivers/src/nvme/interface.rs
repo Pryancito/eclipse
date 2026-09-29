@@ -1777,3 +1777,85 @@ mod cap_tests {
         assert_eq!(w.stride, 4);
     }
 }
+
+#[cfg(test)]
+mod command_layout_tests {
+    //! The commands themselves, as bytes the controller reads back out of
+    //! DMA memory. `command_tests` above covers the arithmetic that fills
+    //! them in; this covers what they say.
+    //!
+    //! Nothing in here is computed: these are the numbers NVM Express gives
+    //! each command, and the driver fills a struct with them and hands the
+    //! controller the address. So the failure mode is not a wrong answer, it
+    //! is a different command carried out in full -- a read issued as a
+    //! write overwrites the sector it was asked to fetch, and the two
+    //! opcodes are one digit apart. Nothing else in this file can tell:
+    //! every path that builds one of these ends at a doorbell.
+
+    use super::*;
+
+    #[test]
+    fn the_admin_opcodes_are_the_ones_the_specification_assigns() {
+        // NVM Express 1.4, figure 139 (admin command set).
+        assert_eq!(NvmeIdentify::new().opcode, 0x06, "Identify is 06h");
+        assert_eq!(
+            NvmeCreateCq::new().opcode,
+            0x05,
+            "Create I/O Completion Queue is 05h"
+        );
+        assert_eq!(
+            NvmeCreateSq::new().opcode,
+            0x01,
+            "Create I/O Submission Queue is 01h"
+        );
+        // The two queue commands share the admin opcode space with the NVM
+        // read and write below, which is why each is pinned here by name.
+        assert_ne!(NvmeCreateCq::new().opcode, NvmeCreateSq::new().opcode);
+    }
+
+    #[test]
+    fn a_read_command_is_not_a_write_command() {
+        // NVM Express 1.4, figure 348 (NVM command set).
+        assert_eq!(
+            NvmeRWCommand::new_read_command().opcode,
+            0x02,
+            "Read is 02h"
+        );
+        assert_eq!(
+            NvmeRWCommand::new_write_command().opcode,
+            0x01,
+            "Write is 01h"
+        );
+    }
+
+    #[test]
+    fn every_command_fills_the_slot_it_is_copied_into() {
+        // A submission queue entry is 64 bytes and a completion 16, and the
+        // driver copies these structs straight into the ring. One byte of
+        // padding anywhere and every field past it lands in the controller's
+        // next field -- and every entry after this one starts in the wrong
+        // place.
+        assert_eq!(core::mem::size_of::<NvmeCommonCommand>(), 64);
+        assert_eq!(core::mem::size_of::<NvmeIdentify>(), 64);
+        assert_eq!(core::mem::size_of::<NvmeCreateCq>(), 64);
+        assert_eq!(core::mem::size_of::<NvmeCreateSq>(), 64);
+        assert_eq!(core::mem::size_of::<NvmeRWCommand>(), 64);
+        assert_eq!(core::mem::size_of::<NvmeCompletion>(), 16);
+    }
+
+    #[test]
+    fn the_opcode_is_the_first_byte_of_every_command() {
+        // The controller reads the opcode at offset 0 of the entry, whatever
+        // the struct behind it looks like.
+        assert_eq!(core::mem::offset_of!(NvmeCommonCommand, opcode), 0);
+        assert_eq!(core::mem::offset_of!(NvmeIdentify, opcode), 0);
+        assert_eq!(core::mem::offset_of!(NvmeCreateCq, opcode), 0);
+        assert_eq!(core::mem::offset_of!(NvmeCreateSq, opcode), 0);
+        assert_eq!(core::mem::offset_of!(NvmeRWCommand, opcode), 0);
+        // And the data pointers sit at dwords 6 and 8, where the read and
+        // write path puts the buffer's physical address.
+        assert_eq!(core::mem::offset_of!(NvmeRWCommand, prp1), 24);
+        assert_eq!(core::mem::offset_of!(NvmeRWCommand, prp2), 32);
+        assert_eq!(core::mem::offset_of!(NvmeRWCommand, slba), 40);
+    }
+}

@@ -398,9 +398,16 @@ mod tests {
     /// answers `OUT_OF_RANGE`.
     #[test]
     fn the_job_tree_stops_at_the_root_max_height() {
+        // The depth is written out rather than read from `ROOT_JOB_MAX_HEIGHT`:
+        // a loop over the constant it is checking climbs however far the
+        // constant says, so moving the constant to 31 passed green -- the
+        // guard refused one level earlier and the loop asked for one level
+        // less. The number is the ABI a process tree is built against, so it
+        // is pinned here on its own.
+        assert_eq!(ROOT_JOB_MAX_HEIGHT, 32, "the root job's depth moved");
         let root = Job::root();
         let mut job = root.clone();
-        for level in 1..=ROOT_JOB_MAX_HEIGHT {
+        for level in 1..=32 {
             job = job
                 .create_child()
                 .unwrap_or_else(|e| panic!("level {} refused: {:?}", level, e));

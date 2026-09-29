@@ -349,6 +349,32 @@ mod aarch64_syndrome_tests {
     }
 
     #[test]
+    fn the_translation_level_is_the_low_two_bits_of_the_status_code() {
+        // Not the two above them, which is a reading the witness used by
+        // `an_abort_carries_its_fault_and_its_level` cannot tell apart: for
+        // the codes it uses the two happen to agree. The level is the table
+        // the walk stopped at, and it is what the fault report prints.
+        let cases = [
+            (0b0011_10u32, Fault::Permission, 2u8),
+            (0b0010_11, Fault::AccessFlag, 3),
+            (0b0001_01, Fault::Translation, 1),
+            (0b0000_00, Fault::AddressSize, 0),
+        ];
+        for (iss, kind, level) in cases {
+            assert_eq!(
+                Syndrome::from(esr(0b10_0100, iss)),
+                Syndrome::DataAbort { kind, level },
+                "ISS {iss:#08b}"
+            );
+            assert_eq!(
+                Syndrome::from(esr(0b10_0000, iss)),
+                Syndrome::InstructionAbort { kind, level },
+                "ISS {iss:#08b}"
+            );
+        }
+    }
+
+    #[test]
     fn a_brk_instruction_carries_its_comment() {
         // `brk #imm16` is what a debugger plants and what `abort()` compiles
         // to on this architecture.
@@ -432,5 +458,112 @@ mod aarch64_syndrome_tests {
                 level: 0,
             }
         );
+    }
+}
+
+#[cfg(test)]
+mod generic_flag_tests {
+    use super::*;
+    use core::convert::TryFrom;
+
+    /// The eight generic flags are this crate's own vocabulary, so their
+    /// numbers look free to choose. They are not: two pieces of the page-table
+    /// glue read them as a number rather than by name, and neither would fail
+    /// loudly if a bit moved.
+    #[test]
+    fn the_eight_generic_flags_are_eight_different_bits() {
+        let all = [
+            ("CACHE_1", MMUFlags::CACHE_1),
+            ("CACHE_2", MMUFlags::CACHE_2),
+            ("READ", MMUFlags::READ),
+            ("WRITE", MMUFlags::WRITE),
+            ("EXECUTE", MMUFlags::EXECUTE),
+            ("USER", MMUFlags::USER),
+            ("HUGE_PAGE", MMUFlags::HUGE_PAGE),
+            ("DEVICE", MMUFlags::DEVICE),
+        ];
+        let mut seen = 0usize;
+        for (name, f) in all {
+            assert_eq!(f.bits().count_ones(), 1, "{} is not a single bit", name);
+            assert_eq!(seen & f.bits(), 0, "{} reuses a bit already taken", name);
+            seen |= f.bits();
+        }
+        assert_eq!(seen.count_ones(), 8);
+    }
+
+    /// `From<MMUFlags> for PTF` (every architecture's, in `utils/pte/`) reads
+    /// the cache policy out of a flag set as `f.bits() & 3` and
+    /// `unreachable!("invalid cache policy")`s on anything that is not one of
+    /// the four -- from inside the page-table walk, on every mapping.
+    #[test]
+    fn the_cache_policy_lives_in_the_low_two_bits_and_the_four_all_fit() {
+        assert_eq!(MMUFlags::CACHE_1.bits() | MMUFlags::CACHE_2.bits(), 0b11);
+        for (policy, n) in [
+            (CachePolicy::Cached, 0usize),
+            (CachePolicy::Uncached, 1),
+            (CachePolicy::UncachedDevice, 2),
+            (CachePolicy::WriteCombining, 3),
+        ] {
+            assert_eq!(policy as usize, n, "{:?} is not the number it was", policy);
+            // ...and every value those two bits can hold names one of them,
+            // which is what makes that `unreachable!` unreachable.
+            assert_eq!(CachePolicy::try_from(n as u32).ok(), Some(policy));
+        }
+    }
+
+    /// `frame_flush_range` builds "map this uncached" as
+    /// `MMUFlags::from_bits_truncate(CachePolicy::Uncached as usize)`, and the
+    /// cache-repair walk asks `flags.bits() & 3 != CachePolicy::Cached as
+    /// usize`. A policy number that fell outside the two cache bits would be
+    /// truncated away silently: MMIO mapped write-back, whose stale dirty
+    /// lines evict over whoever owns the page next.
+    #[test]
+    fn a_policy_survives_the_trip_through_a_flag_set() {
+        for policy in [
+            CachePolicy::Cached,
+            CachePolicy::Uncached,
+            CachePolicy::UncachedDevice,
+            CachePolicy::WriteCombining,
+        ] {
+            let flags =
+                MMUFlags::READ | MMUFlags::WRITE | MMUFlags::from_bits_truncate(policy as usize);
+            assert_eq!(
+                flags.bits() & 0b11,
+                policy as usize,
+                "{:?} did not survive being put into a flag set",
+                policy
+            );
+        }
+        // A flag set that says nothing about caching is cached, which is what
+        // the repair walk's `!= Cached` comparison assumes.
+        assert_eq!(
+            (MMUFlags::READ | MMUFlags::WRITE | MMUFlags::USER).bits() & 0b11,
+            CachePolicy::Cached as usize
+        );
+    }
+
+    /// `RXW` is the mask `zx_vmar_protect` works in: it asks
+    /// `permissions.contains(flags & MMUFlags::RXW)` before a change and then
+    /// `new_flags.remove(MMUFlags::RXW)` to drop what was there. A mask
+    /// missing one of the three lets that permission through a protect that
+    /// was supposed to take it away -- a page dropped to read-only that stays
+    /// executable.
+    #[test]
+    fn rxw_is_the_three_permissions_and_only_those() {
+        for f in [MMUFlags::READ, MMUFlags::WRITE, MMUFlags::EXECUTE] {
+            assert!(MMUFlags::RXW.contains(f), "{:?} is not in RXW", f);
+        }
+        for f in [
+            MMUFlags::USER,
+            MMUFlags::HUGE_PAGE,
+            MMUFlags::DEVICE,
+            MMUFlags::CACHE_1,
+            MMUFlags::CACHE_2,
+        ] {
+            assert!(!MMUFlags::RXW.intersects(f), "{:?} is in RXW", f);
+        }
+        let mut flags = MMUFlags::RXW | MMUFlags::USER | MMUFlags::CACHE_2;
+        flags.remove(MMUFlags::RXW);
+        assert_eq!(flags, MMUFlags::USER | MMUFlags::CACHE_2);
     }
 }

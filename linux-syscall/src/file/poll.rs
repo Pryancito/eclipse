@@ -1366,6 +1366,26 @@ mod poll_tests {
         assert_eq!(poll_wait_decision(0, T0, T0), PollWait::ReturnEmpty);
     }
 
+    /// The arm that decides a finite timeout is `1..`, and the arm under it
+    /// is "any other value, wait for ever". Narrowing it to `2..` dropped a
+    /// one-millisecond poll straight through to that arm and parked the
+    /// caller with no deadline at all -- green, because every other case
+    /// here asks for ten milliseconds or more. `poll(fds, n, 1)` is what a
+    /// caller writes when it wants one pass and the shortest wait there is,
+    /// and it must not be the call that never comes back.
+    #[test]
+    fn the_shortest_finite_timeout_is_still_finite() {
+        assert_eq!(
+            poll_wait_decision(1, T0, T0),
+            PollWait::Sleep(Some(Duration::from_millis(1)))
+        );
+        // And it runs out after its one millisecond, rather than never.
+        assert_eq!(
+            poll_wait_decision(1, T0, T0 + Duration::from_millis(1)),
+            PollWait::ReturnEmpty
+        );
+    }
+
     #[test]
     fn a_live_deadline_sleeps_for_what_is_left_of_it() {
         let now = T0 + Duration::from_millis(30);
@@ -1457,6 +1477,35 @@ mod poll_tests {
     }
 
     // ---- the re-poll interval -------------------------------------------
+
+    /// The two intervals themselves, written out rather than compared
+    /// against the constants that hold them.
+    ///
+    /// Every other test here asks *which* tick is picked and asserts against
+    /// the constant it is checking, so both follow it: moving
+    /// `SLOW_IO_WAIT_TICK` to 10 ms passed green. Neither number is
+    /// arbitrary. The slow tick has to stay far enough above the fast one to
+    /// be worth demoting to at all -- that is the whole point of it -- and
+    /// far enough below the buffers that get re-scanned at this rate:
+    /// PulseAudio's is 108 ms, which is what 100 ms was chosen against, and
+    /// what the last regression here underran.
+    #[test]
+    fn the_fast_tick_is_four_milliseconds_and_the_slow_one_a_hundred() {
+        assert_eq!(
+            IO_WAIT_TICK,
+            Duration::from_millis(4),
+            "the fast re-poll tick moved"
+        );
+        assert_eq!(
+            SLOW_IO_WAIT_TICK,
+            Duration::from_millis(100),
+            "the slow re-poll tick moved"
+        );
+        assert!(
+            SLOW_IO_WAIT_TICK >= IO_WAIT_TICK * 10,
+            "the slow tick stopped being slower than the fast one by enough to pay for itself"
+        );
+    }
 
     /// The shape the slow tick exists for: a shell parked in `poll(stdin)` on
     /// a VT nobody is looking at. Its keypress can only arrive once that VT is

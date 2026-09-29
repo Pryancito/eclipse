@@ -279,4 +279,295 @@ mod tests {
         assert!(!Rights::DEFAULT_CHANNEL.contains(Rights::DUPLICATE));
         assert!(Rights::DEFAULT_CHANNEL.contains(Rights::TRANSFER));
     }
+    /// Every right is its own bit. Nothing else in the tree says so, and the
+    /// one test that happens to notice a collision only notices *one*:
+    /// `a_handle_one_right_short_opens_nothing` asks for `READ | WRITE`, so
+    /// putting `READ` on `WRITE`'s bit fails it, while putting `WAIT` on
+    /// `INSPECT`'s bit passes everything green.
+    ///
+    /// Two rights sharing a bit is not a cosmetic mistake: it hands out an
+    /// authority nobody granted. A handle created with one of them opens
+    /// every door the other one guards, because `get_object_with_rights`
+    /// compares bits and has no idea two names mean the same one.
+    #[test]
+    fn no_two_rights_share_a_bit() {
+        let named: &[(&str, Rights)] = &[
+            ("DUPLICATE", Rights::DUPLICATE),
+            ("TRANSFER", Rights::TRANSFER),
+            ("READ", Rights::READ),
+            ("WRITE", Rights::WRITE),
+            ("EXECUTE", Rights::EXECUTE),
+            ("MAP", Rights::MAP),
+            ("GET_PROPERTY", Rights::GET_PROPERTY),
+            ("SET_PROPERTY", Rights::SET_PROPERTY),
+            ("ENUMERATE", Rights::ENUMERATE),
+            ("DESTROY", Rights::DESTROY),
+            ("SET_POLICY", Rights::SET_POLICY),
+            ("GET_POLICY", Rights::GET_POLICY),
+            ("SIGNAL", Rights::SIGNAL),
+            ("SIGNAL_PEER", Rights::SIGNAL_PEER),
+            ("WAIT", Rights::WAIT),
+            ("INSPECT", Rights::INSPECT),
+            ("MANAGE_JOB", Rights::MANAGE_JOB),
+            ("MANAGE_PROCESS", Rights::MANAGE_PROCESS),
+            ("MANAGE_THREAD", Rights::MANAGE_THREAD),
+            ("APPLY_PROFILE", Rights::APPLY_PROFILE),
+            ("MANAGE_SOCKET", Rights::MANAGE_SOCKET),
+            ("OP_CHILDREN", Rights::OP_CHILDREN),
+            ("RESIZE", Rights::RESIZE),
+            ("ATTACH_VMO", Rights::ATTACH_VMO),
+            ("MANAGE_VMO", Rights::MANAGE_VMO),
+            ("SAME_RIGHTS", Rights::SAME_RIGHTS),
+        ];
+        let mut union = Rights::empty();
+        for (name, right) in named {
+            assert_eq!(right.bits().count_ones(), 1, "{} is not a single bit", name);
+            assert!(
+                !union.contains(*right),
+                "{} shares its bit with a right named earlier",
+                name
+            );
+            union |= *right;
+        }
+        assert_eq!(
+            union.bits().count_ones(),
+            named.len() as u32,
+            "the rights above do not add up to one bit each"
+        );
+    }
+
+    /// A default right set is only useful if it covers what the syscalls ask
+    /// of that kind of handle: a right left out of the set is an operation
+    /// that can only ever answer `ACCESS_DENIED` on a handle straight out of
+    /// the call that creates the object.
+    ///
+    /// Each row names the caller that asks, so the table says *why* rather
+    /// than repeating the definitions above -- a test that restated the set
+    /// would move along with it and catch nothing. `zircon-syscall` is the
+    /// crate that asks, and this one cannot see it, so the callers are named
+    /// rather than called.
+    #[test]
+    fn the_rights_the_syscalls_ask_for_are_in_each_default_set() {
+        let asked: &[(&str, Rights, Rights, &str)] = &[
+            ("VMO", Rights::DEFAULT_VMO, Rights::MAP, "sys_vmar_map"),
+            (
+                "VMO",
+                Rights::DEFAULT_VMO,
+                Rights::IO,
+                "sys_vmo_read / sys_vmo_write",
+            ),
+            ("BTI", Rights::DEFAULT_BTI, Rights::MAP, "sys_bti_pin"),
+            (
+                "FIFO",
+                Rights::DEFAULT_FIFO,
+                Rights::SIGNAL_PEER,
+                "sys_object_signal_peer",
+            ),
+            (
+                "FIFO",
+                Rights::DEFAULT_FIFO,
+                Rights::WRITE,
+                "sys_fifo_write",
+            ),
+            (
+                "EVENTPAIR",
+                Rights::DEFAULT_EVENTPAIR,
+                Rights::SIGNAL_PEER,
+                "sys_object_signal_peer",
+            ),
+            (
+                "SOCKET",
+                Rights::DEFAULT_SOCKET,
+                Rights::MANAGE_SOCKET,
+                "sys_socket_set_disposition",
+            ),
+            (
+                "SOCKET",
+                Rights::DEFAULT_SOCKET,
+                Rights::WRITE,
+                "sys_socket_write",
+            ),
+            (
+                "SOCKET",
+                Rights::DEFAULT_SOCKET,
+                Rights::GET_PROPERTY,
+                "sys_object_get_property",
+            ),
+            (
+                "CHANNEL",
+                Rights::DEFAULT_CHANNEL,
+                Rights::SIGNAL_PEER,
+                "sys_object_signal_peer",
+            ),
+            (
+                "JOB",
+                Rights::DEFAULT_JOB,
+                Rights::SET_POLICY,
+                "sys_job_set_policy",
+            ),
+            (
+                "JOB",
+                Rights::DEFAULT_JOB,
+                Rights::MANAGE_JOB,
+                "sys_job_create",
+            ),
+            ("JOB", Rights::DEFAULT_JOB, Rights::DESTROY, "sys_task_kill"),
+            (
+                "JOB",
+                Rights::DEFAULT_JOB,
+                Rights::ENUMERATE,
+                "ZX_INFO_JOB_CHILDREN",
+            ),
+            (
+                "THREAD",
+                Rights::DEFAULT_THREAD,
+                Rights::MANAGE_THREAD,
+                "sys_task_suspend",
+            ),
+            (
+                "THREAD",
+                Rights::DEFAULT_THREAD,
+                Rights::WRITE,
+                "sys_process_start",
+            ),
+            (
+                "PROCESS",
+                Rights::DEFAULT_PROCESS,
+                Rights::MANAGE_THREAD,
+                "sys_thread_create",
+            ),
+            (
+                "PROCESS",
+                Rights::DEFAULT_PROCESS,
+                Rights::WRITE,
+                "sys_process_start",
+            ),
+            (
+                "PROCESS",
+                Rights::DEFAULT_PROCESS,
+                Rights::SET_PROPERTY,
+                "sys_object_set_property",
+            ),
+            (
+                "PROCESS",
+                Rights::DEFAULT_PROCESS,
+                Rights::ENUMERATE,
+                "ZX_INFO_PROCESS_THREADS",
+            ),
+            (
+                "VCPU",
+                Rights::DEFAULT_VCPU,
+                Rights::EXECUTE,
+                "sys_vcpu_resume",
+            ),
+            (
+                "VCPU",
+                Rights::DEFAULT_VCPU,
+                Rights::SIGNAL,
+                "sys_vcpu_interrupt",
+            ),
+            (
+                "GUEST",
+                Rights::DEFAULT_GUEST,
+                Rights::MANAGE_PROCESS,
+                "sys_vcpu_create",
+            ),
+            (
+                "TIMER",
+                Rights::DEFAULT_TIMER,
+                Rights::WRITE,
+                "sys_timer_set / sys_timer_cancel",
+            ),
+            (
+                "DEBUGLOG",
+                Rights::DEFAULT_DEBUGLOG,
+                Rights::WRITE,
+                "sys_debuglog_write",
+            ),
+            (
+                "PORT",
+                Rights::DEFAULT_PORT,
+                Rights::WRITE,
+                "sys_port_queue",
+            ),
+            ("PORT", Rights::DEFAULT_PORT, Rights::READ, "sys_port_wait"),
+            (
+                "INTERRUPT",
+                Rights::DEFAULT_INTERRUPT,
+                Rights::SIGNAL,
+                "sys_interrupt_trigger",
+            ),
+            (
+                "EXCEPTION",
+                Rights::DEFAULT_EXCEPTION,
+                Rights::TRANSFER,
+                "handing the exception on",
+            ),
+        ];
+        for (kind, set, needed, caller) in asked {
+            assert!(
+                set.contains(*needed),
+                "DEFAULT_{} is missing {:?}, which {} asks for",
+                kind,
+                needed,
+                caller
+            );
+        }
+    }
+
+    /// The five sets that leave `WAIT` out leave it out on purpose: these are
+    /// the handles you do not wait on with `zx_object_wait_one`, which is the
+    /// call that asks for `WAIT`.
+    ///
+    /// A port has its own `zx_port_wait`; a VMAR, a resource and a BTI raise
+    /// no signals to wait for; and a suspend token is a receipt you drop to
+    /// resume the thread, not something that ever becomes readable. Handing
+    /// them `WAIT` does not open a door -- it parks the caller on a wait that
+    /// nothing will ever satisfy, which reads as a hang rather than an error.
+    #[test]
+    fn the_handles_you_do_not_wait_on_do_not_carry_wait() {
+        for (name, rights) in [
+            ("PORT", Rights::DEFAULT_PORT),
+            ("VMAR", Rights::DEFAULT_VMAR),
+            ("RESOURCE", Rights::DEFAULT_RESOURCE),
+            ("BTI", Rights::DEFAULT_BTI),
+            ("SUSPEND_TOKEN", Rights::DEFAULT_SUSPEND_TOKEN),
+        ] {
+            assert!(
+                !rights.contains(Rights::WAIT),
+                "DEFAULT_{} carries WAIT, so zx_object_wait_one on it would park forever",
+                name
+            );
+        }
+        // And the ones that are waited on that way do carry it, so the test
+        // above is not passing for want of anyone holding WAIT at all.
+        for (name, rights) in [
+            ("EVENT", Rights::DEFAULT_EVENT),
+            ("CHANNEL", Rights::DEFAULT_CHANNEL),
+            ("PROCESS", Rights::DEFAULT_PROCESS),
+        ] {
+            assert!(
+                rights.contains(Rights::WAIT),
+                "DEFAULT_{} cannot be waited on",
+                name
+            );
+        }
+    }
+
+    /// An exception handle is not duplicatable, and that is what makes
+    /// "the last handle" mean anything: letting go of it is what resumes the
+    /// faulting thread. With a second copy in play, the handler dropping its
+    /// end would leave the thread parked on a handle it cannot see, which is
+    /// the one failure mode a debugger cannot diagnose from the outside.
+    ///
+    /// A suspend token is the same shape for the same reason.
+    #[test]
+    fn the_handles_whose_last_drop_means_something_cannot_be_duplicated() {
+        assert!(!Rights::DEFAULT_EXCEPTION.contains(Rights::DUPLICATE));
+        assert!(!Rights::DEFAULT_SUSPEND_TOKEN.contains(Rights::DUPLICATE));
+        // Both are still transferable: handing the exception to another
+        // process is how a debugger further up the chain gets it.
+        assert!(Rights::DEFAULT_EXCEPTION.contains(Rights::TRANSFER));
+        assert!(Rights::DEFAULT_SUSPEND_TOKEN.contains(Rights::TRANSFER));
+    }
 }

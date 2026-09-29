@@ -552,6 +552,77 @@ mod ksyms_tests {
         assert!(lookup(BASE + 0x1000).is_none());
     }
 
+    #[test]
+    fn a_word_that_ends_exactly_at_the_end_of_the_reservation_is_still_read() {
+        // The bound is the last byte the word touches, not the first byte past
+        // it. Off by one, the last word of the reservation reads back as zero,
+        // and every check in `header` is written as "did this read as zero",
+        // so a table that ends flush against the reservation would be read as
+        // absent rather than as itself. Nothing in `lookup` reaches that far
+        // today -- `header` keeps the index below `strtab_off` -- which is
+        // exactly why the guard needs asking directly.
+        let _g = test_lock();
+        let mut b: Vec<u8> = Vec::new();
+        b.resize(KSYMS_CAP, 0);
+        b[KSYMS_CAP - 4..].copy_from_slice(&0xdead_beefu32.to_le_bytes());
+        install(&b);
+        assert_eq!(u32_at(KSYMS_CAP - 4), 0xdead_beef);
+        assert_eq!(
+            u32_at(KSYMS_CAP - 3),
+            0,
+            "a word that runs one byte past the end is not a word"
+        );
+    }
+
+    #[test]
+    fn a_string_table_that_starts_half_way_through_the_entries_is_refused() {
+        // Each entry is EIGHT bytes, so the index of `count` symbols ends at
+        // `HEADER_LEN + count * 8`. The overlap case above claims a strtab
+        // inside the header's own entry array, which a check of any stride
+        // catches; this one claims a strtab that clears half the index, and
+        // only the real stride sees it. Accepted, `entry_addr` reads the
+        // second half of the index -- names -- as addresses.
+        let _g = test_lock();
+        let mut b = blob(BASE, &[(0x1000, "arranca"), (0x2000, "para")]);
+        b[12..16].copy_from_slice(&((HEADER_LEN + 2 * 4) as u32).to_le_bytes());
+        install(&b);
+        assert!(!available(), "a strtab inside the index is not a table");
+    }
+
+    #[test]
+    fn a_name_that_is_empty_is_not_a_name() {
+        // A name offset that lands on a terminator is a table that lost a
+        // name, not a symbol called "". Reported as one, the crash line prints
+        // `0x… <+0x1c>`: a name field with nothing in it, which reads as a bug
+        // in the reporter rather than as a table that needs regenerating.
+        let _g = test_lock();
+        let mut b = blob(BASE, &[(0x1000, "arranca")]);
+        // Point the entry's name at the NUL that ends its own name.
+        b[HEADER_LEN + 4..HEADER_LEN + 8].copy_from_slice(&7u32.to_le_bytes());
+        install(&b);
+        assert!(lookup(BASE + 0x1000).is_none());
+    }
+
+    #[test]
+    fn the_last_symbol_is_bounded_by_the_megabyte_and_not_by_the_string_table() {
+        // `lo + 1 < count` is what stops the walk reading one entry past the
+        // end of the index. What sits there is the first four bytes of the
+        // string table -- a NAME, not an address -- so taking it as the next
+        // symbol's address gives the last symbol whatever extent those letters
+        // happen to spell. Here they spell 1, so the last symbol would end one
+        // byte after it starts and every backtrace through it would lose its
+        // name. With ordinary names they spell something over a megabyte, and
+        // `MAX_SYM_SPAN` hides the whole thing.
+        let _g = test_lock();
+        install(&blob(BASE, &[(0x1000, "\u{1}")]));
+        assert_eq!(lookup(BASE + 0x1000 + 0x100), Some(("\u{1}", 0x100)));
+        assert_eq!(
+            lookup(BASE + 0x1000 + (1 << 20)),
+            None,
+            "and the megabyte is still the bound"
+        );
+    }
+
     // ── what the reporters print ───────────────────────────────────────────
 
     #[test]

@@ -1528,9 +1528,14 @@ mod ioprio_tests {
         assert_eq!(ioprio_set_verdict(word(RT, 8), true), Err(LxError::EINVAL));
     }
 
+    /// The count is written out rather than read from `IOPRIO_NR_LEVELS`:
+    /// a loop over the constant it is checking shrinks along with it, and
+    /// moving the constant to 7 passed green because both the guard and this
+    /// test followed it.
     #[test]
     fn best_effort_has_eight_levels() {
-        for level in 0..IOPRIO_NR_LEVELS {
+        assert_eq!(IOPRIO_NR_LEVELS, 8, "the level count moved");
+        for level in 0..8 {
             assert_eq!(
                 ioprio_set_verdict(word(BE, level), false),
                 Ok(ioprio_value(BE, level))
