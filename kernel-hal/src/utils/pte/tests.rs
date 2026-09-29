@@ -112,6 +112,27 @@ fn the_contract<P: GenericPTE>(zeroed: fn() -> P, arch: &str) {
         arch
     );
 
+    // `set_flags` REWRITES the non-address bits; it does not add to them.
+    // `split_huge_page` fills each of a new table's 512 entries with
+    // `set_addr` and `set_flags` alone, so whatever the previous occupant of
+    // that word left behind has to be gone by the second call. Uncached,
+    // executable and user, then plain cached read-only kernel memory:
+    // nothing of the first survives.
+    let mut e = a_leaf(
+        zeroed(),
+        FRAME,
+        MMUFlags::READ | MMUFlags::EXECUTE | MMUFlags::USER | MMUFlags::CACHE_1,
+        false,
+    );
+    e.set_flags(MMUFlags::READ, false);
+    assert_eq!(
+        e.flags(),
+        MMUFlags::READ,
+        "{}: set_flags added to what was already there",
+        arch
+    );
+    assert_eq!(e.addr(), FRAME, "{}: set_flags moved the frame", arch);
+
     // `is_leaf` is the walker's only way to tell a mapping from a pointer to
     // the next table, and it asks at the P3 and P2 levels, where a mapping is
     // a 1 GiB or 2 MiB block. (What a 4 KiB entry answers is not part of the
