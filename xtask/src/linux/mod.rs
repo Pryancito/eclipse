@@ -3586,38 +3586,12 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
 
         fs::write(
             localbin.join("eclipse-lunarbg"),
-            format!(
-                "#!/bin/sh\n\
-                 # Eclipse OS: wallpaper client for eclipse-init (not labwc autostart).\n\
-                 LOG=/tmp/lunarbg.log\n\
-                 exec >>\"$LOG\" 2>&1\n\
-                 {wait}\
-                 command -v lunarbg >/dev/null 2>&1 || {{ echo 'eclipse-lunarbg: lunarbg missing'; sleep 5; exit 127; }}\n\
-                 echo \"[eclipse-lunarbg] WAYLAND_DISPLAY=$WAYLAND_DISPLAY\"\n\
-                 # labwc writes LUNARBG_ASPECT into its environment file, but\n\
-                 # this client is started by eclipse-init — not as a labwc\n\
-                 # child — so re-export a default for panels without EDID mm.\n\
-                 export LUNARBG_ASPECT=\"${{LUNARBG_ASPECT:-16:9}}\"\n\
-                 exec lunarbg --fps \"${{LUNARBG_FPS:-8}}\"\n",
-                wait = wait_wayland
-            )
-            .as_bytes(),
+            wallpaper_wrapper(wait_wayland).as_bytes(),
         )
         .unwrap();
         fs::write(
             localbin.join("eclipse-lunarbar"),
-            format!(
-                "#!/bin/sh\n\
-                 # Eclipse OS: panel client for eclipse-init (not labwc autostart).\n\
-                 LOG=/tmp/lunarbar.log\n\
-                 exec >>\"$LOG\" 2>&1\n\
-                 {wait}\
-                 command -v lunarbar >/dev/null 2>&1 || {{ echo 'eclipse-lunarbar: lunarbar missing'; sleep 5; exit 127; }}\n\
-                 echo \"[eclipse-lunarbar] WAYLAND_DISPLAY=$WAYLAND_DISPLAY\"\n\
-                 exec lunarbar\n",
-                wait = wait_wayland
-            )
-            .as_bytes(),
+            panel_wrapper(wait_wayland).as_bytes(),
         )
         .unwrap();
 
@@ -3859,6 +3833,123 @@ fn check_so<P: AsRef<Path>>(path: P) -> bool {
     seg.all(|it| !it.is_empty() && it.chars().all(|ch| ch.is_ascii_digit()))
 }
 
+/// The `look` line of `/etc/eclipse/look`, read the way `eclipse-look`
+/// itself reads it. Shared by both session wrappers on purpose: two readers
+/// of one file that disagree about `look = plasma ` is a setting that looks
+/// applied and is not.
+///
+/// Whitespace comes out of the VALUE too, not just from around the key,
+/// because `eclipse-look`'s awk does `gsub(/[[:space:]]/, "")`, and a
+/// trailing `# comment` comes off BEFORE that: squeezing it instead turns
+/// `look=plasma # nota` into `plasma#nota`, which is a look that was set and
+/// did not take. A `#` LINE never matches the key pattern at all, so a
+/// commented-out look stays commented out.
+const READ_LOOK: &str =
+    "look=$(sed -n 's/^[[:space:]]*look[[:space:]]*=//p' /etc/eclipse/look \\\n\
+     \x20 \x20 2>/dev/null | head -n 1 | sed 's/#.*$//' | tr -d '[:space:]')\n";
+
+/// The wallpaper service's wrapper. Under `look=plasma` it paints NOTHING and
+/// parks, because plasmashell's own DesktopView is a `wlr-layer-shell` surface
+/// on the **background** layer too (`LayerShellQt::Window::LayerBackground`
+/// with `setExclusiveZone(-1)`, shell/desktopview.cpp of plasma-workspace
+/// 6.6.5) -- the same layer lunarbg uses. Measured on wlroots with two
+/// `swaybg`s: the surface committed FIRST stays on top. lunarbg starts with
+/// the session and plasmashell's desktop needs seconds of QML, so lunarbg
+/// would reliably cover Plasma's desktop -- wallpaper, icons, right-click
+/// menu and all -- while still burning frames under an opaque surface.
+///
+/// Parking rather than exiting: the service is `type = respawn`, so a wrapper
+/// that exits is a wrapper that init restarts every 8 seconds forever. The
+/// hourly re-read is the self-healing path for someone editing
+/// `/etc/eclipse/look` by hand; the fast path is `eclipse-look`, which kills
+/// this wrapper by name so the switch is immediate.
+fn wallpaper_wrapper(wait_wayland: &str) -> String {
+    format!(
+        "#!/bin/sh\n\
+         # Eclipse OS: wallpaper client for eclipse-init (not labwc autostart).\n\
+         LOG=/tmp/lunarbg.log\n\
+         exec >>\"$LOG\" 2>&1\n\
+         {wait}\
+         {look}\
+         if [ \"$look\" = plasma ]; then\n\
+         \x20 echo '[eclipse-lunarbg] look=plasma: plasmashell draws the desktop on'\n\
+         \x20 echo '  the background layer itself, so lunarbg stands aside. Parking;'\n\
+         \x20 echo '  eclipse-look kills this wrapper when the look changes.'\n\
+         \x20 while [ \"$look\" = plasma ]; do\n\
+         \x20 \x20 sleep 3600\n\
+         {look_indented}\
+         \x20 done\n\
+         \x20 echo '[eclipse-lunarbg] look is no longer plasma; letting init respawn us'\n\
+         \x20 exit 0\n\
+         fi\n\
+         command -v lunarbg >/dev/null 2>&1 || {{ echo 'eclipse-lunarbg: lunarbg missing'; sleep 5; exit 127; }}\n\
+         echo \"[eclipse-lunarbg] WAYLAND_DISPLAY=$WAYLAND_DISPLAY\"\n\
+         # labwc writes LUNARBG_ASPECT into its environment file, but this\n\
+         # client is started by eclipse-init — not as a labwc child — so\n\
+         # re-export a default for panels without EDID mm.\n\
+         export LUNARBG_ASPECT=\"${{LUNARBG_ASPECT:-16:9}}\"\n\
+         exec lunarbg --fps \"${{LUNARBG_FPS:-8}}\"\n",
+        wait = wait_wayland,
+        look = READ_LOOK,
+        look_indented = READ_LOOK
+            .lines()
+            .map(|l| format!("\x20 \x20 {l}\n"))
+            .collect::<String>(),
+    )
+}
+
+/// The panel service's wrapper. WHICH panel is a runtime choice: `look=plasma`
+/// in `/etc/eclipse/look` asks for KDE's own shell, anything else for
+/// lunarbar. One service and one wrapper rather than two services, because a
+/// service whose job is to not run would exit at once and `type = respawn`
+/// would restart it every 8 seconds forever.
+///
+/// Its own function so a test can run the script: it and
+/// [`wallpaper_wrapper`] are the two wrappers in the image with a branch
+/// in them, and both branch on the same file.
+fn panel_wrapper(wait_wayland: &str) -> String {
+    format!(
+        "#!/bin/sh\n\
+         # Eclipse OS: panel client for eclipse-init (not labwc autostart).\n\
+         LOG=/tmp/lunarbar.log\n\
+         exec >>\"$LOG\" 2>&1\n\
+         {wait}\
+{look}         if [ \"$look\" = plasma ]; then\n\
+         \x20 if command -v plasmashell >/dev/null 2>&1; then\n\
+         # plasmashell places BOTH its panel and its desktop with\n\
+         # wlr-layer-shell (LayerShellQt: PanelView on the top layer,\n\
+         # DesktopView on the background one), which labwc serves --\n\
+         # that is why the KDE shell works here at all. What labwc\n\
+         # does NOT serve is org_kde_plasma_window_management, so the\n\
+         # Task Manager widget stays empty; see docs/README-desktop.md.\n\
+         \x20 \x20 KDE_FULL_SESSION=true; export KDE_FULL_SESSION\n\
+         \x20 \x20 KDE_SESSION_VERSION=6; export KDE_SESSION_VERSION\n\
+         # Services do not inherit labwc's session environment (init\n\
+         # execs them itself), so the two variables Plasma's own QML\n\
+         # needs are set here: Wayland with NO xcb fallback (a shell\n\
+         # on Xwayland cannot own layer surfaces), and, on the pixman\n\
+         # session, Qt Quick's software raster -- all of Plasma is\n\
+         # QML, and llvmpipe GL is slower than the CPU rasterizer.\n\
+         \x20 \x20 QT_QPA_PLATFORM=wayland; export QT_QPA_PLATFORM\n\
+         \x20 \x20 XDG_CURRENT_DESKTOP=KDE; export XDG_CURRENT_DESKTOP\n\
+         \x20 \x20 if [ \"${{WLR_RENDERER:-}}\" = pixman ]; then\n\
+         \x20 \x20 \x20 : \"${{QT_QUICK_BACKEND:=software}}\"; export QT_QUICK_BACKEND\n\
+         \x20 \x20 fi\n\
+         \x20 \x20 echo \"[eclipse-lunarbar] look=plasma -> plasmashell\"\n\
+         \x20 \x20 exec plasmashell\n\
+         \x20 fi\n\
+         \x20 echo 'eclipse-lunarbar: look=plasma but plasmashell is not installed'\n\
+         \x20 echo '  (the image was built with ECLIPSE_PLASMA=0 or ECLIPSE_KDE=0);'\n\
+         \x20 echo '  falling back to lunarbar so the session keeps a panel.'\n\
+         fi\n\
+         command -v lunarbar >/dev/null 2>&1 || {{ echo 'eclipse-lunarbar: lunarbar missing'; sleep 5; exit 127; }}\n\
+         echo \"[eclipse-lunarbar] WAYLAND_DISPLAY=$WAYLAND_DISPLAY\"\n\
+         exec lunarbar\n",
+        wait = wait_wayland,
+        look = READ_LOOK,
+    )
+}
+
 #[cfg(test)]
 mod var_run_tests {
     use super::*;
@@ -4062,6 +4153,157 @@ mod var_run_tests {
         unix::fs::symlink("../nowhere", &link).unwrap();
         LinuxRootfs::ensure_var_run(&dir);
         assert_eq!(fs::read_link(&link).unwrap(), Path::new("../run"));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod panel_wrapper_tests {
+    use super::*;
+
+    /// The wrapper that picks KDE's shell or Eclipse's panel from
+    /// `/etc/eclipse/look`. It has to be valid shell
+    /// (init runs it with nothing attached), it must never leave the session
+    /// with no panel at all, and it must set Plasma's environment BEFORE the
+    /// exec -- a variable exported after one is a variable nobody reads.
+    #[test]
+    fn the_panel_wrapper_picks_a_shell_and_always_leaves_one() {
+        let script = panel_wrapper("# (wait for the compositor)\n");
+        let dir = std::env::temp_dir().join(format!("eclipse-panel-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("eclipse-lunarbar");
+        fs::write(&path, &script).unwrap();
+        let st = std::process::Command::new("sh")
+            .arg("-n")
+            .arg(&path)
+            .status()
+            .unwrap();
+        assert!(st.success(), "sh -n rejected the panel wrapper");
+
+        // plasmashell is only reached when the look asks for it AND it is
+        // installed; either way the script goes on to lunarbar.
+        let plasma = script.find("exec plasmashell").expect("the plasma branch");
+        let lunarbar = script.find("exec lunarbar").expect("the fallback");
+        assert!(
+            plasma < lunarbar,
+            "the fallback must come after the plasma branch, not instead of it"
+        );
+        assert!(
+            script.contains("command -v plasmashell"),
+            "a missing plasmashell must fall through, not exec nothing"
+        );
+        for var in [
+            "QT_QPA_PLATFORM=wayland",
+            "KDE_FULL_SESSION",
+            "XDG_CURRENT_DESKTOP=KDE",
+        ] {
+            let at = script
+                .find(var)
+                .unwrap_or_else(|| panic!("{var} must be set"));
+            assert!(at < plasma, "{var} is exported after the exec, so unread");
+        }
+        // Qt Quick on the software session: Plasma is all QML, and llvmpipe
+        // GL is slower than the CPU rasterizer.
+        assert!(script.contains("QT_QUICK_BACKEND:=software"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod wallpaper_wrapper_tests {
+    use super::*;
+
+    /// Run the generated wrapper for real, with the look file and the log
+    /// redirected into a temp dir and a fake `lunarbg` on `$PATH`. Reading the
+    /// script back with `contains` is what let the panel wrapper ship a reader
+    /// that disagreed with `eclipse-look` about `look = plasma ` (trailing
+    /// space); executing it is what caught that, so this one executes it.
+    ///
+    /// `sleep 3600` becomes `exit 42` so the parked branch ends on its first
+    /// pass instead of blocking the suite for an hour.
+    fn run(dir: &Path, look_file: &str, have_lunarbg: bool) -> (i32, String) {
+        let _ = fs::remove_dir_all(dir);
+        let bin = dir.join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        fs::write(dir.join("look"), look_file).unwrap();
+        if have_lunarbg {
+            let fake = bin.join("lunarbg");
+            fs::write(&fake, "#!/bin/sh\necho \"RAN lunarbg $*\"\n").unwrap();
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let script = wallpaper_wrapper("# (wait for the compositor)\n")
+            .replace("/etc/eclipse/look", dir.join("look").to_str().unwrap())
+            .replace(
+                "LOG=/tmp/lunarbg.log",
+                &format!("LOG={}", dir.join("log").display()),
+            )
+            .replace("sleep 3600", "exit 42");
+        let path = dir.join("eclipse-lunarbg");
+        fs::write(&path, &script).unwrap();
+        let st = std::process::Command::new("sh")
+            .arg(&path)
+            .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+            .env("WAYLAND_DISPLAY", "wayland-0")
+            .status()
+            .unwrap();
+        let log = fs::read_to_string(dir.join("log")).unwrap_or_default();
+        (st.code().unwrap_or(-1), log)
+    }
+
+    /// plasmashell's own DesktopView is a background-layer surface
+    /// (`LayerBackground`, shell/desktopview.cpp of plasma-workspace 6.6.5),
+    /// the same layer lunarbg paints on, and on wlroots the surface committed
+    /// first stays on top -- which lunarbg always is, since it starts with the
+    /// session while plasmashell needs seconds of QML. So under `look=plasma`
+    /// lunarbg must not paint at all, or it covers Plasma's wallpaper, icons
+    /// and desktop menu while burning frames nobody sees.
+    #[test]
+    fn the_wallpaper_stands_aside_for_plasma_and_paints_for_everything_else() {
+        let dir = std::env::temp_dir().join(format!("eclipse-bg-test-{}", std::process::id()));
+
+        // Every spelling eclipse-look would accept as plasma, including the
+        // one with whitespace around the value.
+        for look in [
+            "look=plasma\n",
+            "look = plasma \n",
+            "look=plasma",
+            "look=plasma # el shell de KDE\n",
+        ] {
+            let (code, log) = run(&dir, look, true);
+            assert!(
+                !log.contains("RAN lunarbg"),
+                "lunarbg painted under {look:?}, on top of Plasma's own desktop"
+            );
+            assert_eq!(code, 42, "the parked branch must be what ran for {look:?}");
+            assert!(log.contains("stands aside"), "it must say why: {log}");
+        }
+
+        // A commented-out look is not a look, and neither is a missing file.
+        // `look=kde # ...` is the case that made the reader strip a trailing
+        // comment before squeezing whitespace: without that step the value
+        // reads `kde#nota` and every look silently becomes the default.
+        for look in [
+            "#look=plasma\n",
+            "look=kde\n",
+            "look=kde # el escritorio de KDE\n",
+            "look=eclipse\n",
+            "",
+        ] {
+            let (_, log) = run(&dir, look, true);
+            assert!(
+                log.contains("RAN lunarbg --fps"),
+                "lunarbg must paint under {look:?}, got: {log}"
+            );
+        }
+
+        // No lunarbg in the image: say so and back off, rather than exiting
+        // instantly into init's respawn loop.
+        let (code, log) = run(&dir, "look=eclipse\n", false);
+        assert_eq!(code, 127, "a missing lunarbg must exit 127");
+        assert!(log.contains("lunarbg missing"), "got: {log}");
 
         let _ = fs::remove_dir_all(&dir);
     }
