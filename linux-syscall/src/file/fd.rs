@@ -1082,6 +1082,29 @@ mod dup_limit_tests {
         assert_eq!(dupfd_start(1 << 32, u64::MAX), Err(LxError::EINVAL));
     }
 
+    /// With `RLIMIT_NOFILE` unlimited the soft limit stops deciding
+    /// anything, and the only thing left is that a descriptor has to fit in
+    /// the `int` that `fcntl` and `dup2` hand back. Both helpers draw that
+    /// line at exactly `INT_MAX`, which is *allowed*, and moving either `>`
+    /// to `>=` passed green: every other case here uses a small `nofile`,
+    /// where the first half of the condition refuses long before the second
+    /// one is reached, so only an unlimited process can tell them apart.
+    #[test]
+    fn the_largest_descriptor_number_is_int_max_even_with_no_limit() {
+        const NO_LIMIT: u64 = u64::MAX;
+        const INT_MAX: usize = i32::MAX as usize;
+
+        assert_eq!(dupfd_start(INT_MAX, NO_LIMIT), Ok(INT_MAX));
+        assert_eq!(dupfd_start(INT_MAX + 1, NO_LIMIT), Err(LxError::EINVAL));
+        assert_eq!(dup_target(INT_MAX, NO_LIMIT), Ok(FileDesc::from(INT_MAX)));
+        assert_eq!(dup_target(INT_MAX + 1, NO_LIMIT), Err(LxError::EBADF));
+
+        // And where the limit is the lower of the two, it is the one that
+        // answers -- with its own errno, which is not the same errno.
+        assert_eq!(dupfd_start(INT_MAX, NOFILE), Err(LxError::EINVAL));
+        assert_eq!(dup_target(INT_MAX, NOFILE), Err(LxError::EBADF));
+    }
+
     #[test]
     fn a_dupfd_that_lands_past_the_limit_is_emfile_not_a_descriptor() {
         // Start 1000 with 1000..1023 all open: the lowest free number is
@@ -1111,6 +1134,88 @@ mod dup_limit_tests {
         // Not EINVAL: `dup2` and `dup3` say EBADF here, and `F_DUPFD` says
         // EINVAL, and callers tell the two apart.
         assert_ne!(dup_target(MINUS_ONE, NOFILE), Err(LxError::EINVAL));
+    }
+}
+
+#[cfg(test)]
+mod itimerspec_tests {
+    //! `timerfd_settime` and `timerfd_gettime` convert between `struct
+    //! itimerspec` and the nanoseconds the timer itself runs on, and nothing
+    //! asked them to: four mutations passed green. Both multipliers moved
+    //! from a second to a millisecond, the two halves changed places, and `/`
+    //! swapped with `%` -- each of which is a timer that fires at the wrong
+    //! moment, or a `timerfd_gettime` that answers a time nobody armed.
+
+    use super::{ITimerSpec, TimeSpec};
+
+    const NS: u64 = 1_000_000_000;
+
+    fn spec(iv: (usize, usize), val: (usize, usize)) -> ITimerSpec {
+        ITimerSpec {
+            it_interval: TimeSpec {
+                sec: iv.0,
+                nsec: iv.1,
+            },
+            it_value: TimeSpec {
+                sec: val.0,
+                nsec: val.1,
+            },
+        }
+    }
+
+    #[test]
+    fn a_second_on_the_way_in_is_a_thousand_million_nanoseconds() {
+        // A timerfd armed for five seconds must not fire in five
+        // milliseconds: `sec` is scaled by 1e9, not by 1e6.
+        assert_eq!(spec((0, 0), (5, 0)).value_ns(), 5 * NS);
+        assert_eq!(spec((2, 0), (0, 0)).interval_ns(), 2 * NS);
+        // And the nanoseconds ride along with the seconds rather than
+        // replacing them.
+        assert_eq!(spec((0, 0), (1, 500_000_000)).value_ns(), NS + 500_000_000);
+        assert_eq!(spec((3, 250), (0, 0)).interval_ns(), 3 * NS + 250);
+    }
+
+    #[test]
+    fn the_interval_and_the_first_shot_never_change_places() {
+        // `it_interval` is how often it repeats; `it_value` is when it first
+        // fires. Reading either for the other turns a one-shot into a
+        // repeating timer, and makes `timerfd_gettime` report the two the
+        // wrong way round.
+        let s = spec((7, 0), (3, 0));
+        assert_eq!(s.interval_ns(), 7 * NS);
+        assert_eq!(s.value_ns(), 3 * NS);
+
+        let out = ITimerSpec::from_ns(7 * NS, 3 * NS);
+        assert_eq!(
+            out.it_interval.sec, 7,
+            "the interval came back as the value"
+        );
+        assert_eq!(out.it_value.sec, 3, "the value came back as the interval");
+    }
+
+    #[test]
+    fn nanoseconds_split_back_into_whole_seconds_and_the_rest() {
+        // The way out: `sec` is the quotient and `nsec` the remainder.
+        let out = ITimerSpec::from_ns(0, 2 * NS + 250_000_000);
+        assert_eq!(
+            out.it_value,
+            TimeSpec {
+                sec: 2,
+                nsec: 250_000_000
+            }
+        );
+        assert_eq!(out.it_interval, TimeSpec { sec: 0, nsec: 0 });
+
+        // Less than a second is all remainder and no quotient.
+        let out = ITimerSpec::from_ns(999, 0);
+        assert_eq!(out.it_interval, TimeSpec { sec: 0, nsec: 999 });
+
+        // And it is a round trip: what `timerfd_settime` reads is what
+        // `timerfd_gettime` gives back.
+        let armed = spec((4, 5), (6, 7));
+        let back = ITimerSpec::from_ns(armed.interval_ns(), armed.value_ns());
+        assert_eq!(back.it_interval, TimeSpec { sec: 4, nsec: 5 });
+        assert_eq!(back.it_value, TimeSpec { sec: 6, nsec: 7 });
     }
 }
 
