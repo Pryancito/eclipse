@@ -1050,6 +1050,11 @@ const USB_DESC_IFACE: u8 = 0x04;
 const USB_DESC_EP: u8 = 0x05;
 const USB_DESC_HID: u8 = 0x21;
 const USB_DESC_HID_REPORT: u8 = 0x22;
+/// How much of a report descriptor `/proc/usbhid` keeps. A wheel mouse's
+/// descriptor runs past 64 bytes (Microsoft's hi-res wheel sample is over
+/// 120), and the wheel is declared near the end: a 64-byte snapshot cut off
+/// exactly the part a dead wheel needs read.
+const REPORT_DESC_SNAPSHOT: usize = 256;
 const EP_TYPE_CONTROL: u32 = 4 << 3;
 const EP_TYPE_INT_IN: u32 = 7 << 3;
 const HID_PROTO_KEY: u8 = 1;
@@ -1571,6 +1576,12 @@ const USAGE_KEY_LEFTCTRL: u32 = 0x0007_00E0;
 /// every Input item tracking the running bit position per report ID; the
 /// first report that has buttons, a relative X and a relative Y becomes the
 /// mouse layout, and every report's size feeds `max_report_bytes`.
+///
+/// A report ID can be interrupted and come back: Microsoft's hi-res wheel
+/// sample declares X/Y under the input report's ID, switches to a Feature
+/// report ID for the Resolution Multiplier, then switches BACK to declare the
+/// Wheel. Those fields continue the same input report (Linux's hid-core
+/// appends them to it), so each ID keeps its own walk and resumes it.
 fn parse_hid_descriptor(desc: &[u8]) -> HidDescInfo {
     // Global items (saved/restored by Push/Pop).
     let mut usage_page: u32 = 0;
@@ -1585,25 +1596,10 @@ fn parse_hid_descriptor(desc: &[u8]) -> HidDescInfo {
     let mut n_local = 0usize;
     let mut usage_min: u32 = 0;
     let mut usage_max: u32 = 0;
-    // Per-report state.
-    let mut report_id: Option<u8> = None;
-    let mut bit_pos = 0usize;
-    let mut buttons: Option<BitField> = None;
-    let mut x: Option<BitField> = None;
-    let mut y: Option<BitField> = None;
-    let mut wheel: Option<BitField> = None;
-    let mut hwheel: Option<BitField> = None;
-    let mut kmods: Option<BitField> = None;
-    let mut kkeys: Option<(BitField, usize)> = None;
-
-    let mut info = HidDescInfo::default();
-
-    /// Close the report walked so far: account its size and, if it is the
-    /// first complete mouse report, promote it to the layout.
-    #[allow(clippy::too_many_arguments)]
-    fn finish(
-        info: &mut HidDescInfo,
-        report_id: Option<u8>,
+    /// One input report as walked so far.
+    #[derive(Clone, Copy, Default)]
+    struct ReportWalk {
+        id: Option<u8>,
         bit_pos: usize,
         buttons: Option<BitField>,
         x: Option<BitField>,
@@ -1612,13 +1608,29 @@ fn parse_hid_descriptor(desc: &[u8]) -> HidDescInfo {
         hwheel: Option<BitField>,
         kmods: Option<BitField>,
         kkeys: Option<(BitField, usize)>,
-    ) {
-        let bytes = bit_pos.div_ceil(8);
+    }
+    let mut cur = ReportWalk::default();
+    // Every report left by a Report ID switch, in order of first appearance,
+    // so one that comes back resumes where it stopped.
+    let mut parked: Vec<ReportWalk> = Vec::new();
+    fn park(parked: &mut Vec<ReportWalk>, r: ReportWalk) {
+        match parked.iter_mut().find(|p| p.id == r.id) {
+            Some(slot) => *slot = r,
+            None => parked.push(r),
+        }
+    }
+
+    let mut info = HidDescInfo::default();
+
+    /// Close a walked report: account its size and, if it is the first
+    /// complete mouse report, promote it to the layout.
+    fn finish(info: &mut HidDescInfo, r: &ReportWalk) {
+        let bytes = r.bit_pos.div_ceil(8);
         info.max_report_bytes = info.max_report_bytes.max(bytes);
         if info.key.is_none() {
-            if let (Some(mods), Some((keys, key_count))) = (kmods, kkeys) {
+            if let (Some(mods), Some((keys, key_count))) = (r.kmods, r.kkeys) {
                 info.key = Some(KeyLayout {
-                    report_id,
+                    report_id: r.id,
                     mods,
                     keys,
                     key_count,
@@ -1627,14 +1639,14 @@ fn parse_hid_descriptor(desc: &[u8]) -> HidDescInfo {
             }
         }
         if info.mouse.is_none() {
-            if let (Some(buttons), Some(x), Some(y)) = (buttons, x, y) {
+            if let (Some(buttons), Some(x), Some(y)) = (r.buttons, r.x, r.y) {
                 info.mouse = Some(MouseLayout {
-                    report_id,
+                    report_id: r.id,
                     buttons,
                     x,
                     y,
-                    wheel,
-                    hwheel,
+                    wheel: r.wheel,
+                    hwheel: r.hwheel,
                     report_bytes: bytes,
                 });
             }
@@ -1693,26 +1705,23 @@ fn parse_hid_descriptor(desc: &[u8]) -> HidDescInfo {
             }
             (1, 8) => {
                 // Global Report ID: every report on the interface starts with
-                // its ID byte, so fields begin at bit 8. A different ID starts
-                // a new report — close the previous one (it may already be the
-                // mouse) and keep walking for the sizes of the others.
+                // its ID byte, so a new report's fields begin at bit 8. Park
+                // the report walked so far, and resume this ID's walk if it
+                // was interrupted earlier (see the doc comment above).
                 let id = data as u8;
-                if report_id != Some(id) {
-                    if report_id.is_some() || bit_pos > 0 {
-                        finish(
-                            &mut info, report_id, bit_pos, buttons, x, y, wheel, hwheel, kmods,
-                            kkeys,
-                        );
-                        buttons = None;
-                        x = None;
-                        y = None;
-                        wheel = None;
-                        hwheel = None;
-                        kmods = None;
-                        kkeys = None;
+                if cur.id != Some(id) {
+                    if cur.id.is_some() || cur.bit_pos > 0 {
+                        park(&mut parked, cur);
                     }
-                    report_id = Some(id);
-                    bit_pos = 8;
+                    cur = parked
+                        .iter()
+                        .find(|p| p.id == Some(id))
+                        .copied()
+                        .unwrap_or(ReportWalk {
+                            id: Some(id),
+                            bit_pos: 8,
+                            ..ReportWalk::default()
+                        });
                 }
             }
             (2, 0) => {
@@ -1739,14 +1748,14 @@ fn parse_hid_descriptor(desc: &[u8]) -> HidDescInfo {
                         // them by shape rather than assuming the boot layout is
                         // what lets a report-protocol keyboard work at all.
                         if variable && fbits == 1 && usage_min == USAGE_KEY_LEFTCTRL {
-                            kmods.get_or_insert(BitField {
-                                off: bit_pos,
+                            cur.kmods.get_or_insert(BitField {
+                                off: cur.bit_pos,
                                 len: count.min(8),
                             });
                         } else if !variable && count > 0 {
-                            kkeys.get_or_insert((
+                            cur.kkeys.get_or_insert((
                                 BitField {
-                                    off: bit_pos,
+                                    off: cur.bit_pos,
                                     len: fbits,
                                 },
                                 count,
@@ -1756,9 +1765,9 @@ fn parse_hid_descriptor(desc: &[u8]) -> HidDescInfo {
                         // Button block: one bit per button. Only the first 8
                         // map onto BTN_LEFT..BTN_EXTRA; the rest are skipped
                         // but still counted in `bit_pos`.
-                        if fbits == 1 && buttons.is_none() {
-                            buttons = Some(BitField {
-                                off: bit_pos,
+                        if fbits == 1 && cur.buttons.is_none() {
+                            cur.buttons = Some(BitField {
+                                off: cur.bit_pos,
                                 len: count.min(8),
                             });
                         }
@@ -1778,28 +1787,29 @@ fn parse_hid_descriptor(desc: &[u8]) -> HidDescInfo {
                                 0
                             };
                             let f = BitField {
-                                off: bit_pos + j * fbits,
+                                off: cur.bit_pos + j * fbits,
                                 len: fbits,
                             };
                             match usage {
                                 USAGE_GD_X if relative => {
-                                    x.get_or_insert(f);
+                                    cur.x.get_or_insert(f);
                                 }
                                 USAGE_GD_Y if relative => {
-                                    y.get_or_insert(f);
+                                    cur.y.get_or_insert(f);
                                 }
                                 USAGE_GD_WHEEL if relative => {
-                                    wheel.get_or_insert(f);
+                                    cur.wheel.get_or_insert(f);
                                 }
                                 USAGE_CONSUMER_AC_PAN if relative => {
-                                    hwheel.get_or_insert(f);
+                                    cur.hwheel.get_or_insert(f);
                                 }
                                 _ => {}
                             }
                         }
                     }
                 }
-                bit_pos = bit_pos
+                cur.bit_pos = cur
+                    .bit_pos
                     .saturating_add(fbits.saturating_mul(count))
                     .min(HID_MAX_REPORT_BITS);
                 n_local = 0;
@@ -1816,9 +1826,10 @@ fn parse_hid_descriptor(desc: &[u8]) -> HidDescInfo {
             _ => {}
         }
     }
-    finish(
-        &mut info, report_id, bit_pos, buttons, x, y, wheel, hwheel, kmods, kkeys,
-    );
+    park(&mut parked, cur);
+    for r in &parked {
+        finish(&mut info, r);
+    }
     // Axes wider than the decoder are not a mouse we can drive.
     if let Some(ml) = info.mouse {
         let bad = |f: BitField| f.len == 0 || f.len > 32;
@@ -1954,7 +1965,7 @@ struct HidDev {
     last_wheel: (i32, i32),
     /// First bytes of the HID report descriptor (proto-0 interfaces), for
     /// /proc/usbhid. Empty for boot-protocol devices (no descriptor read).
-    report_desc: [u8; 64],
+    report_desc: [u8; REPORT_DESC_SNAPSHOT],
     report_desc_len: usize,
     /// Parsed relative-mouse report layout, when the descriptor gave one.
     /// `None` → parse the boot `[buttons, dx, dy, …]` layout.
@@ -3230,7 +3241,7 @@ impl XhciInner {
         report_desc_len: u16,
         vid: u16,
         pid: u16,
-        desc_out: &mut ([u8; 64], usize),
+        desc_out: &mut ([u8; REPORT_DESC_SNAPSHOT], usize),
         parsed_out: &mut HidDescInfo,
     ) -> DeviceResult<u8> {
         if is_vm_abs_tablet(vid, pid, proto) {
@@ -3284,7 +3295,7 @@ impl XhciInner {
         slot: u8,
         iface: u8,
         report_desc_len: u16,
-        desc_out: &mut ([u8; 64], usize),
+        desc_out: &mut ([u8; REPORT_DESC_SNAPSHOT], usize),
         parsed_out: &mut HidDescInfo,
     ) -> Option<HidClass> {
         // `HID_MAX_DESCRIPTOR_SIZE` in Linux. A 1024-byte ceiling truncated
@@ -3362,7 +3373,7 @@ impl XhciInner {
         vid: u16,
         pid: u16,
     ) -> DeviceResult<()> {
-        let mut report_desc: ([u8; 64], usize) = ([0; 64], 0);
+        let mut report_desc: ([u8; REPORT_DESC_SNAPSHOT], usize) = ([0; REPORT_DESC_SNAPSHOT], 0);
         let mut parsed = HidDescInfo::default();
         let real_proto = self.classify_hid_iface(
             slot,
@@ -5169,6 +5180,30 @@ mod tests {
         0x15, 0x81, 0x25, 0x7F, 0x75, 0x08, 0x95, 0x03, 0x81, 0x06, //
         0xC0, 0xC0,
     ];
+    /// Microsoft's hi-res wheel sample: the input report (ID 2) is
+    /// interrupted by a Feature report (ID 3) for the Resolution Multiplier,
+    /// and the descriptor switches BACK to ID 2 to declare the Wheel and
+    /// again for AC Pan. Both belong to the same six-byte input report
+    /// `[02, buttons, X, Y, wheel, pan]`. Mice that copy this sample are why a
+    /// real wheel can be dead while QEMU's (no report IDs at all) works.
+    const SPLIT_REPORT_ID: &[u8] = &[
+        0x05, 0x01, 0x09, 0x02, 0xA1, 0x01, 0x05, 0x01, 0x09, 0x02, 0xA1, 0x02, //
+        0x85, 0x02, 0x09, 0x01, 0xA1, 0x00, //       Report ID (2), Pointer
+        0x05, 0x09, 0x19, 0x01, 0x29, 0x05, 0x15, 0x00, 0x25, 0x01, //
+        0x75, 0x01, 0x95, 0x05, 0x81, 0x02, 0x95, 0x03, 0x81, 0x01, //
+        0x05, 0x01, 0x09, 0x30, 0x09, 0x31, 0x15, 0x81, 0x25, 0x7F, //
+        0x75, 0x08, 0x95, 0x02, 0x81, 0x06, //       X, Y
+        0xA1, 0x02, 0x85, 0x03, 0x09, 0x48, //       Report ID (3), Res. Multiplier
+        0x15, 0x00, 0x25, 0x01, 0x35, 0x01, 0x45, 0x04, //
+        0x75, 0x02, 0x95, 0x01, 0xA4, 0xB1, 0x02, // Push, Feature
+        0x85, 0x02, 0x09, 0x38, 0x35, 0x00, 0x45, 0x00, // back to ID 2, Wheel
+        0x15, 0x81, 0x25, 0x7F, 0x75, 0x08, 0x81, 0x06, 0xC0, //
+        0xA1, 0x02, 0x85, 0x03, 0x09, 0x48, 0xB4, 0xB1, 0x02, // ID 3, Pop, Feature
+        0x35, 0x00, 0x45, 0x00, 0x75, 0x04, 0xB1, 0x03, //
+        0x85, 0x02, 0x05, 0x0C, 0x0A, 0x38, 0x02, // back to ID 2, AC Pan
+        0x15, 0x81, 0x25, 0x7F, 0x75, 0x08, 0x95, 0x01, 0x81, 0x06, 0xC0, //
+        0xC0, 0xC0, 0xC0,
+    ];
 
     /// A boot-shaped keyboard that also declares a Consumer Control
     /// collection for its media keys, under its own report ID. This is the
@@ -5333,7 +5368,7 @@ mod tests {
     #[test]
     fn the_wheel_is_found_in_every_shape_a_real_mouse_ships() {
         // (descriptor, report id, wheel bit offset, report bytes).
-        let cases: [(&str, &[u8], Option<u8>, usize, usize); 7] = [
+        let cases: [(&str, &[u8], Option<u8>, usize, usize); 8] = [
             ("boot-shaped", BOOT_SHAPED, None, 24, 4),
             ("wide axes + pan", WIDE_AXES_AND_PAN, Some(1), 48, 8),
             ("hi-res wheel", HI_RES_WHEEL, Some(2), 40, 6),
@@ -5341,6 +5376,7 @@ mod tests {
             ("wheel first", WHEEL_FIRST, None, 8, 4),
             ("push/pop", PUSH_POP, None, 40, 6),
             ("combo receiver", COMBO_RECEIVER, Some(2), 32, 5),
+            ("split report id", SPLIT_REPORT_ID, Some(2), 32, 6),
         ];
         for (name, desc, id, wheel_off, bytes) in cases {
             let info = parse_hid_descriptor(desc);
@@ -5640,9 +5676,43 @@ mod tests {
                 COMBO_RECEIVER,
                 alloc::vec![0x02, 0x00, 0x00, 0x00, 0x01],
             ),
+            (
+                "split report id",
+                SPLIT_REPORT_ID,
+                alloc::vec![0x02, 0x00, 0x00, 0x00, 0x01, 0x00],
+            ),
         ] {
             assert_eq!(mouse_frame(desc, &report), want, "{}", name);
         }
+    }
+
+    #[test]
+    fn a_report_id_that_comes_back_continues_its_report() {
+        // The Wheel and AC Pan are declared after a detour through Feature
+        // report 3. Starting a fresh report at bit 8 on the way back put them
+        // in a report of their own that never had X/Y, so the mouse layout
+        // came out with no wheel and no pan, four bytes long instead of six.
+        let info = parse_hid_descriptor(SPLIT_REPORT_ID);
+        let ml = info.mouse.expect("a mouse layout");
+        assert_eq!(ml.x, BitField { off: 16, len: 8 });
+        assert_eq!(ml.y, BitField { off: 24, len: 8 });
+        assert_eq!(ml.wheel, Some(BitField { off: 32, len: 8 }));
+        assert_eq!(ml.hwheel, Some(BitField { off: 40, len: 8 }));
+        assert_eq!(ml.report_bytes, 6);
+        // The endpoint is armed for the largest report: split in two, report
+        // 2 counted as four bytes and the TD could not hold a whole one.
+        assert_eq!(info.max_report_bytes, 6);
+        // And the pan really comes out of byte 5, one frame with the wheel.
+        assert_eq!(
+            mouse_frame(SPLIT_REPORT_ID, &[0x02, 0x00, 0x00, 0x00, 0xFF, 0x01]),
+            alloc::vec![
+                (EV_REL, REL_WHEEL, -1),
+                (EV_REL, REL_WHEEL_HI_RES, -120),
+                (EV_REL, REL_HWHEEL, 1),
+                (EV_REL, REL_HWHEEL_HI_RES, 120),
+                (EV_SYN, SYN_REPORT, 0),
+            ]
+        );
     }
 
     #[test]
