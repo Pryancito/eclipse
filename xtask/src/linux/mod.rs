@@ -2413,6 +2413,59 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
         executable
     }
 
+    /// Persist contained kernel faults. The fault path records them in RAM
+    /// (`kernel_hal::oops_log` -> /proc/oops) because it cannot touch a
+    /// filesystem: interrupts are off, the heap may be the thing that just
+    /// got smashed, and `oops` only proceeds with NO kernel lock held. This
+    /// is the userspace half that turns that RAM record into a file that
+    /// survives the console scrollback -- the same split Linux uses between
+    /// the printk ring and syslogd.
+    ///
+    /// The chmod is NOT optional and is why this lives in its own function:
+    /// the script shipped 0644 for its whole life, so `execve` of the service's
+    /// `exec =` returned EACCES, the child `_exit(127)`ed in under a
+    /// millisecond, and eclipse-init respawned it forever (backing off to
+    /// MAX_BACKOFF, i.e. an `exit 127` line on the console every 8 s for the
+    /// rest of the boot). The regression test below asserts the x bit.
+    fn write_oopslog(localbin: &Path, svc_dir: &Path) {
+        let script = localbin.join("eclipse-oopslog");
+        fs::write(
+            &script,
+            b"#!/bin/sh\n\
+              # Drain /proc/oops into /var/log/oops.log.\n\
+              # Contained faults leave the machine RUNNING, so this can take its\n\
+              # time; it only needs to beat the next reboot.\n\
+              OUT=/var/log/oops.log\n\
+              mkdir -p /var/log 2>/dev/null\n\
+              last=\n\
+              while :; do\n\
+              \x20 cur=$(cat /proc/oops 2>/dev/null)\n\
+              \x20 case \"$cur\" in ''|'# no contained kernel faults since boot') : ;; *)\n\
+              \x20 \x20 if [ \"$cur\" != \"$last\" ]; then\n\
+              \x20 \x20 \x20 { echo \"=== $(date 2>/dev/null || echo 'boot+?') ===\"; echo \"$cur\"; } >> \"$OUT\"\n\
+              \x20 \x20 \x20 last=$cur\n\
+              \x20 \x20 \x20 echo 'eclipse-oopslog: a kernel fault was contained; see /var/log/oops.log' > /dev/console 2>/dev/null\n\
+              \x20 \x20 fi\n\
+              \x20 esac\n\
+              \x20 sleep 10\n\
+              done\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        fs::write(
+            svc_dir.join("oopslog.service"),
+            b"# Persist contained kernel faults (/proc/oops -> /var/log/oops.log).\n\
+              exec = /usr/local/bin/eclipse-oopslog\n\
+              type = respawn\n",
+        )
+        .unwrap();
+    }
+
     /// The session bus, in the foreground so eclipse-init supervises it.
     ///
     /// Two implementations, in this order: Alpine's dbus-daemon when the
@@ -3444,43 +3497,7 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
               exec udhcpc -i eth0 -f -R -s \"$SCRIPTv4\"\n",
         )
         .unwrap();
-        // Persist contained kernel faults. The fault path records them in RAM
-        // (`kernel_hal::oops_log` -> /proc/oops) because it cannot touch a
-        // filesystem: interrupts are off, the heap may be the thing that just
-        // got smashed, and `oops` only proceeds with NO kernel lock held. This
-        // is the userspace half that turns that RAM record into a file that
-        // survives the console scrollback -- the same split Linux uses between
-        // the printk ring and syslogd.
-        fs::write(
-            localbin.join("eclipse-oopslog"),
-            b"#!/bin/sh\n\
-              # Drain /proc/oops into /var/log/oops.log.\n\
-              # Contained faults leave the machine RUNNING, so this can take its\n\
-              # time; it only needs to beat the next reboot.\n\
-              OUT=/var/log/oops.log\n\
-              mkdir -p /var/log 2>/dev/null\n\
-              last=\n\
-              while :; do\n\
-              \x20 cur=$(cat /proc/oops 2>/dev/null)\n\
-              \x20 case \"$cur\" in ''|'# no contained kernel faults since boot') : ;; *)\n\
-              \x20 \x20 if [ \"$cur\" != \"$last\" ]; then\n\
-              \x20 \x20 \x20 { echo \"=== $(date 2>/dev/null || echo 'boot+?') ===\"; echo \"$cur\"; } >> \"$OUT\"\n\
-              \x20 \x20 \x20 last=$cur\n\
-              \x20 \x20 \x20 echo 'eclipse-oopslog: a kernel fault was contained; see /var/log/oops.log' > /dev/console 2>/dev/null\n\
-              \x20 \x20 fi\n\
-              \x20 esac\n\
-              \x20 sleep 10\n\
-              done\n",
-        )
-        .unwrap();
-
-        fs::write(
-            svc_dir.join("oopslog.service"),
-            b"# Persist contained kernel faults (/proc/oops -> /var/log/oops.log).\n\
-              exec = /usr/local/bin/eclipse-oopslog\n\
-              type = respawn\n",
-        )
-        .unwrap();
+        Self::write_oopslog(&localbin, &svc_dir);
 
         Self::write_dbus_wrapper(&localbin);
 
@@ -3661,6 +3678,23 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
                 "halt",
             ] {
                 let _ = fs::set_permissions(localbin.join(w), fs::Permissions::from_mode(0o755));
+            }
+            // Belt and braces: /usr/local/bin holds nothing but wrappers, so
+            // every regular file in it must be executable. The list above is a
+            // list, and `eclipse-oopslog` was added to the writes and NOT to
+            // the list, which shipped it 0644; `execve` then failed with EACCES
+            // and eclipse-init respawned the service for the whole boot. This
+            // pass makes the next omission harmless instead of a respawn storm.
+            if let Ok(entries) = fs::read_dir(&localbin) {
+                for entry in entries.flatten() {
+                    // `is_file()` on the entry's own type, not the path's:
+                    // following a symlink here would chmod whatever it points
+                    // at, outside this directory.
+                    if entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
+                        let _ =
+                            fs::set_permissions(entry.path(), fs::Permissions::from_mode(0o755));
+                    }
+                }
             }
         }
 
@@ -3869,6 +3903,62 @@ mod var_run_tests {
         );
         // And the applet it shadows in /bin is still there.
         assert!(bin.join("env").is_symlink());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// `/usr/local/bin/eclipse-oopslog` shipped **0644** from the day it was
+    /// added: the script was written next to the other wrappers but never added
+    /// to the `chmod 0755` list beside them. `oopslog.service` is
+    /// `type = respawn`, so on every boot eclipse-init forked, `execve` failed
+    /// with EACCES, the child `_exit(127)`ed in well under a millisecond, and
+    /// the supervisor respawned it -- backing off to MAX_BACKOFF and then
+    /// printing an `exit 127` line every 8 s for the rest of the boot. That is
+    /// the "the service resets over and over" report from real hardware.
+    ///
+    /// The x bit is the whole fix, so it is what this asserts; the rest checks
+    /// the script is shell the image's /bin/sh will accept and that the service
+    /// file actually points at the file being chmodded.
+    #[test]
+    fn the_oopslog_wrapper_is_installed_executable() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("eclipse-oopslog-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let localbin = dir.join("usr/local/bin");
+        let svc_dir = dir.join("etc/eclipse/services");
+        fs::create_dir_all(&localbin).unwrap();
+        fs::create_dir_all(&svc_dir).unwrap();
+
+        LinuxRootfs::write_oopslog(&localbin, &svc_dir);
+
+        let script = localbin.join("eclipse-oopslog");
+        let mode = fs::metadata(&script).unwrap().permissions().mode();
+        assert_ne!(
+            mode & 0o111,
+            0,
+            "eclipse-oopslog is {:04o}: execve fails with EACCES and init respawns it forever",
+            mode & 0o7777
+        );
+
+        let src = fs::read_to_string(&script).unwrap();
+        assert!(src.starts_with("#!/bin/sh\n"), "shebang");
+        let st = std::process::Command::new("sh")
+            .arg("-n")
+            .arg(&script)
+            .status()
+            .unwrap();
+        assert!(st.success(), "sh -n rejected eclipse-oopslog");
+
+        // The loop must never fall out of the bottom: `type = respawn` would
+        // make a script that returns look exactly like the bug above.
+        assert!(src.contains("while :; do"), "the drain has to be a loop");
+
+        let unit = fs::read_to_string(svc_dir.join("oopslog.service")).unwrap();
+        assert!(
+            unit.contains("exec = /usr/local/bin/eclipse-oopslog"),
+            "the service must point at the script this chmods: {unit}"
+        );
+        assert!(unit.contains("type = respawn"), "{unit}");
+
         let _ = fs::remove_dir_all(&dir);
     }
 
