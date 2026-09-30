@@ -93,6 +93,11 @@ static MOCK_CORE: AtomicBool = AtomicBool::new(false);
 /// "threshold set to 0". The detector then never fired, which is exactly the
 /// failure the knob was added for: a hang read as "not a deadlock, no banner
 /// appeared" when the threshold had simply not been reached.
+///
+/// Its one caller is in the bare-metal half of `primary_main`; a LibOS build
+/// has no deadlock detector to tune, and under `deny(warnings)` the unused
+/// helper stopped the LibOS build from compiling at all.
+#[cfg(any(not(feature = "libos"), test))]
 fn deadlock_spins(cmdline: &str) -> Option<Result<u64, &str>> {
     let spelled = kernel_hal::cmdline::value(cmdline, "DEADLOCKSPINS")?;
     Some(kernel_hal::cmdline::parse_number(spelled).ok_or(spelled))
