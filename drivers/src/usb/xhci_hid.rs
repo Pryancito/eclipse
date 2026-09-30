@@ -1583,11 +1583,12 @@ const USAGE_KEY_LEFTCTRL: u32 = 0x0007_00E0;
 /// Wheel. Those fields continue the same input report (Linux's hid-core
 /// appends them to it), so each ID keeps its own walk and resumes it.
 fn parse_hid_descriptor(desc: &[u8]) -> HidDescInfo {
-    // Global items (saved/restored by Push/Pop).
+    // Global items (saved/restored by Push/Pop). Report ID is a global item
+    // too (HID 1.11 §6.2.2.7), so the stack carries it; it lives in `cur.id`.
     let mut usage_page: u32 = 0;
     let mut report_size: u32 = 0;
     let mut report_count: u32 = 0;
-    let mut stack: [(u32, u32, u32); 8] = [(0, 0, 0); 8];
+    let mut stack: [(u32, u32, u32, Option<u8>); 8] = [(0, 0, 0, None); 8];
     let mut sp = 0usize;
     // Local items (cleared by every Main item). Usages are normalised to
     // `(page << 16) | id` so 4-byte extended usages and 2-byte ones compare
@@ -1618,6 +1619,26 @@ fn parse_hid_descriptor(desc: &[u8]) -> HidDescInfo {
             Some(slot) => *slot = r,
             None => parked.push(r),
         }
+    }
+    /// Make `id` the report being walked: park the current one, and resume
+    /// `id`'s walk if it was interrupted earlier (see the doc comment above).
+    /// A report with an ID starts at bit 8, after the ID byte.
+    fn switch_to(cur: &mut ReportWalk, parked: &mut Vec<ReportWalk>, id: Option<u8>) {
+        if cur.id == id {
+            return;
+        }
+        if cur.id.is_some() || cur.bit_pos > 0 {
+            park(parked, *cur);
+        }
+        *cur = parked
+            .iter()
+            .find(|p| p.id == id)
+            .copied()
+            .unwrap_or(ReportWalk {
+                id,
+                bit_pos: if id.is_some() { 8 } else { 0 },
+                ..ReportWalk::default()
+            });
     }
 
     let mut info = HidDescInfo::default();
@@ -1692,7 +1713,7 @@ fn parse_hid_descriptor(desc: &[u8]) -> HidDescInfo {
             (1, 0xa) => {
                 // Push
                 if sp < stack.len() {
-                    stack[sp] = (usage_page, report_size, report_count);
+                    stack[sp] = (usage_page, report_size, report_count, cur.id);
                     sp += 1;
                 }
             }
@@ -1700,29 +1721,17 @@ fn parse_hid_descriptor(desc: &[u8]) -> HidDescInfo {
                 // Pop
                 if sp > 0 {
                     sp -= 1;
-                    (usage_page, report_size, report_count) = stack[sp];
+                    let id;
+                    (usage_page, report_size, report_count, id) = stack[sp];
+                    // Popping back to another report ID moves the walk
+                    // there, exactly as a Report ID item would.
+                    switch_to(&mut cur, &mut parked, id);
                 }
             }
             (1, 8) => {
                 // Global Report ID: every report on the interface starts with
-                // its ID byte, so a new report's fields begin at bit 8. Park
-                // the report walked so far, and resume this ID's walk if it
-                // was interrupted earlier (see the doc comment above).
-                let id = data as u8;
-                if cur.id != Some(id) {
-                    if cur.id.is_some() || cur.bit_pos > 0 {
-                        park(&mut parked, cur);
-                    }
-                    cur = parked
-                        .iter()
-                        .find(|p| p.id == Some(id))
-                        .copied()
-                        .unwrap_or(ReportWalk {
-                            id: Some(id),
-                            bit_pos: 8,
-                            ..ReportWalk::default()
-                        });
-                }
+                // its ID byte, so a new report's fields begin at bit 8.
+                switch_to(&mut cur, &mut parked, Some(data as u8));
             }
             (2, 0) => {
                 if n_local < local_usages.len() {
@@ -5204,6 +5213,23 @@ mod tests {
         0x15, 0x81, 0x25, 0x7F, 0x75, 0x08, 0x95, 0x01, 0x81, 0x06, 0xC0, //
         0xC0, 0xC0, 0xC0,
     ];
+    /// Report ID is a global item, so Push saves it and Pop restores it.
+    /// Report 1 is a mouse; after Push a 16-bit consumer report 2 is
+    /// declared, and the Pop takes the descriptor back to report 1 for the
+    /// Wheel, with no Report ID item on the way back.
+    const POP_RESTORES_REPORT_ID: &[u8] = &[
+        0x05, 0x01, 0x09, 0x02, 0xA1, 0x01, 0x85, 0x01, 0x09, 0x01, 0xA1, 0x00, //
+        0x05, 0x09, 0x19, 0x01, 0x29, 0x03, 0x15, 0x00, 0x25, 0x01, //
+        0x75, 0x01, 0x95, 0x03, 0x81, 0x02, 0x75, 0x05, 0x95, 0x01, 0x81, 0x01, //
+        0x05, 0x01, 0x09, 0x30, 0x09, 0x31, 0x15, 0x81, 0x25, 0x7F, //
+        0x75, 0x08, 0x95, 0x02, 0x81, 0x06, //       X, Y
+        0xA4, //                                     Push (ID 1)
+        0x85, 0x02, 0x05, 0x0C, 0x09, 0xE9, 0x15, 0x00, 0x26, 0xFF, 0x00, //
+        0x75, 0x10, 0x95, 0x01, 0x81, 0x00, //       report 2: 16-bit consumer
+        0xB4, //                                     Pop (back to ID 1)
+        0x09, 0x38, 0x95, 0x01, 0x81, 0x06, //       Wheel
+        0xC0, 0xC0,
+    ];
 
     /// A boot-shaped keyboard that also declares a Consumer Control
     /// collection for its media keys, under its own report ID. This is the
@@ -5368,7 +5394,7 @@ mod tests {
     #[test]
     fn the_wheel_is_found_in_every_shape_a_real_mouse_ships() {
         // (descriptor, report id, wheel bit offset, report bytes).
-        let cases: [(&str, &[u8], Option<u8>, usize, usize); 8] = [
+        let cases: [(&str, &[u8], Option<u8>, usize, usize); 9] = [
             ("boot-shaped", BOOT_SHAPED, None, 24, 4),
             ("wide axes + pan", WIDE_AXES_AND_PAN, Some(1), 48, 8),
             ("hi-res wheel", HI_RES_WHEEL, Some(2), 40, 6),
@@ -5377,6 +5403,13 @@ mod tests {
             ("push/pop", PUSH_POP, None, 40, 6),
             ("combo receiver", COMBO_RECEIVER, Some(2), 32, 5),
             ("split report id", SPLIT_REPORT_ID, Some(2), 32, 6),
+            (
+                "pop restores report id",
+                POP_RESTORES_REPORT_ID,
+                Some(1),
+                32,
+                5,
+            ),
         ];
         for (name, desc, id, wheel_off, bytes) in cases {
             let info = parse_hid_descriptor(desc);
@@ -5681,6 +5714,11 @@ mod tests {
                 SPLIT_REPORT_ID,
                 alloc::vec![0x02, 0x00, 0x00, 0x00, 0x01, 0x00],
             ),
+            (
+                "pop restores report id",
+                POP_RESTORES_REPORT_ID,
+                alloc::vec![0x01, 0x00, 0x00, 0x00, 0x01],
+            ),
         ] {
             assert_eq!(mouse_frame(desc, &report), want, "{}", name);
         }
@@ -5713,6 +5751,20 @@ mod tests {
                 (EV_SYN, SYN_REPORT, 0),
             ]
         );
+    }
+
+    #[test]
+    fn a_pop_takes_the_walk_back_to_the_report_id_it_restores() {
+        // Without the Report ID on the stack the Wheel after the Pop was
+        // walked as part of the consumer report 2, and the mouse had none.
+        let info = parse_hid_descriptor(POP_RESTORES_REPORT_ID);
+        let ml = info.mouse.expect("a mouse layout");
+        assert_eq!(ml.report_id, Some(1));
+        assert_eq!(ml.wheel, Some(BitField { off: 32, len: 8 }));
+        assert_eq!(ml.report_bytes, 5);
+        // The largest report is the mouse's five bytes. Walked into report 2,
+        // the wheel grew that one to four and left the mouse at four.
+        assert_eq!(info.max_report_bytes, 5);
     }
 
     #[test]
