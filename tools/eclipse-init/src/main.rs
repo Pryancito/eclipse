@@ -950,6 +950,42 @@ fn ordered_names(services: &BTreeMap<String, Service>) -> Vec<String> {
 // Launching & supervision
 // ---------------------------------------------------------------------------
 
+/// Why an absolute `exec =` cannot be run, if it cannot, as a line to log.
+///
+/// `execve` failures happen in the forked child, which can only `_exit(127)`:
+/// its stdio is already `/dev/null`, so the reason never reaches the console
+/// and all the supervisor sees is "exited after 400us (exit 127, crash)" every
+/// MAX_BACKOFF for the rest of the boot. That exact storm shipped -- the
+/// installer wrote `/usr/local/bin/eclipse-oopslog` 0644, so the service
+/// respawned forever on EACCES with nothing saying "not executable" anywhere.
+/// Checking before the fork costs one `stat` and names the cause.
+///
+/// Only absolute paths are checked: a bare `exec = seatd` goes through
+/// `execvp`'s PATH search, which this cannot replicate, and a wrong answer
+/// there would be worse than none. Returns `None` when there is nothing to
+/// report, including every case this cannot decide.
+fn exec_problem(prog: &str) -> Option<String> {
+    if !prog.starts_with('/') {
+        return None;
+    }
+    let path = Path::new(prog);
+    let Ok(meta) = fs::metadata(path) else {
+        return Some(format!("{prog} does not exist"));
+    };
+    if meta.is_dir() {
+        return Some(format!("{prog} is a directory"));
+    }
+    use std::os::unix::fs::PermissionsExt;
+    if meta.permissions().mode() & 0o111 == 0 {
+        return Some(format!(
+            "{prog} is not executable (mode {:04o}) -- `chmod +x` it; \
+             execve will fail with EACCES and this service will respawn forever",
+            meta.permissions().mode() & 0o7777
+        ));
+    }
+    None
+}
+
 /// Start a service. `oneshot` runs to completion (blocking) before returning;
 /// `respawn` is forked and its pid recorded for the supervision loop.
 fn start_service(svc: &mut Service) {
@@ -977,6 +1013,11 @@ fn start_service(svc: &mut Service) {
         if Path::new(&path).is_dir() {
             wait_for_dir_settled(&path, Duration::from_secs(8), Duration::from_secs(1));
         }
+    }
+    // Name an unrunnable `exec =` on the console: the child that fails execve
+    // cannot (see `exec_problem`).
+    if let Some(problem) = svc.exec.first().and_then(|p| exec_problem(p)) {
+        log(&format!("error: {}: {}", svc.name, problem));
     }
     match svc.kind {
         Kind::Oneshot => {
@@ -1377,9 +1418,7 @@ fn child_env_for(
                     env.push(CString::new("GALLIUM_DRIVER=zink").unwrap());
                     env.push(CString::new("MESA_LOADER_DRIVER_OVERRIDE=zink").unwrap());
                     push_sdl_render_env(&mut env, SdlRender::Gles2);
-                    log(
-                        "renderer=gl: NVIDIA GPU -> pinning GL clients to zink+NVK",
-                    );
+                    log("renderer=gl: NVIDIA GPU -> pinning GL clients to zink+NVK");
                 } else {
                     env.push(CString::new("WLR_RENDERER=pixman").unwrap());
                     env.push(CString::new("WLR_RENDERER_ALLOW_SOFTWARE=1").unwrap());
@@ -2586,6 +2625,60 @@ mod tests {
                 );
             }
         }
+    }
+
+    // -- Unrunnable `exec =` ------------------------------------------------
+
+    /// The bug this exists for: `/usr/local/bin/eclipse-oopslog` shipped 0644,
+    /// so its service respawned forever on EACCES and the console only ever
+    /// said "exit 127". The mode must be named, and so must the fix.
+    #[test]
+    fn a_non_executable_exec_is_named_with_its_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("eclipse-init-exec-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let script = dir.join("eclipse-oopslog");
+        fs::write(&script, b"#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o644)).unwrap();
+        let msg = exec_problem(script.to_str().unwrap()).expect("0644 must be reported");
+        assert!(msg.contains("not executable"), "{msg}");
+        assert!(
+            msg.contains("0644"),
+            "the mode itself has to be in the line: {msg}"
+        );
+
+        // And the same file, once executable, is reported as fine.
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(exec_problem(script.to_str().unwrap()), None);
+
+        // Group- or other-only x still execs for those users: not our call.
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o644 | 0o010)).unwrap();
+        assert_eq!(exec_problem(script.to_str().unwrap()), None);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_missing_or_directory_exec_is_named_and_a_relative_one_is_not_judged() {
+        let dir = std::env::temp_dir().join(format!("eclipse-init-exec2-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let missing = dir.join("no-such-binary");
+        let msg = exec_problem(missing.to_str().unwrap()).expect("a missing exec is reportable");
+        assert!(msg.contains("does not exist"), "{msg}");
+
+        let msg = exec_problem(dir.to_str().unwrap()).expect("a directory is reportable");
+        assert!(msg.contains("is a directory"), "{msg}");
+
+        // A bare name is resolved by execvp's PATH search, which this cannot
+        // replicate: staying silent beats guessing wrong.
+        assert_eq!(exec_problem("seatd"), None);
+        assert_eq!(exec_problem("no-such-binary-anywhere"), None);
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
