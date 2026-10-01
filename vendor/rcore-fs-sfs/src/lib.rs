@@ -80,6 +80,14 @@ impl Debug for INodeImpl {
     }
 }
 
+fn check_entry_name(name: &str) -> vfs::Result<()> {
+    if name.len() >= 256 {
+        Err(FsError::NameTooLong)
+    } else {
+        Ok(())
+    }
+}
+
 impl INodeImpl {
     /// Map file block id to disk block id
     fn get_disk_block_id(&self, file_block_id: BlockId) -> vfs::Result<BlockId> {
@@ -425,6 +433,7 @@ impl INodeImpl {
     }
 
     pub fn link_inodeimpl(&self, name: &str, other: &Arc<INodeImpl>) -> vfs::Result<()> {
+        check_entry_name(name)?;
         let info = self.metadata()?;
         if info.type_ != vfs::FileType::Dir {
             return Err(FsError::NotDir);
@@ -561,6 +570,7 @@ impl vfs::INode for INodeImpl {
         _mode: u32,
         data: usize,
     ) -> vfs::Result<Arc<dyn vfs::INode>> {
+        check_entry_name(name)?;
         let info = self.metadata()?;
         if info.type_ != vfs::FileType::Dir {
             return Err(FsError::NotDir);
@@ -598,6 +608,7 @@ impl vfs::INode for INodeImpl {
     }
 
     fn link(&self, name: &str, other: &Arc<dyn INode>) -> vfs::Result<()> {
+        check_entry_name(name)?;
         let info = self.metadata()?;
         if info.type_ != vfs::FileType::Dir {
             return Err(FsError::NotDir);
@@ -661,9 +672,7 @@ impl vfs::INode for INodeImpl {
         Ok(())
     }
     fn move_(&self, old_name: &str, target: &Arc<dyn INode>, new_name: &str) -> vfs::Result<()> {
-        if new_name.len() >= 256 {
-            return Err(FsError::NameTooLong);
-        }
+        check_entry_name(new_name)?;
         if new_name == "." || new_name == ".." {
             return Err(FsError::InvalidParam);
         }
