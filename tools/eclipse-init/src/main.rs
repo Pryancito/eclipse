@@ -964,6 +964,8 @@ fn ordered_names(services: &BTreeMap<String, Service>) -> Vec<String> {
 /// `execvp`'s PATH search, which this cannot replicate, and a wrong answer
 /// there would be worse than none. Returns `None` when there is nothing to
 /// report, including every case this cannot decide.
+///
+/// See [`repair_exec_mode`] for the one case init does not merely report.
 fn exec_problem(prog: &str) -> Option<String> {
     if !prog.starts_with('/') {
         return None;
@@ -984,6 +986,48 @@ fn exec_problem(prog: &str) -> Option<String> {
         ));
     }
     None
+}
+
+/// Add the missing x bits to a service's own `exec =` and say whether it worked.
+///
+/// Reporting is not enough for this one failure, because of where the file
+/// lives. `/usr/local/bin` is part of `rootfs.btrfs.gz`, which only the
+/// *installer* writes to the disk: upgrading the kernel on a machine that is
+/// already installed does not rewrite it. So the image that shipped
+/// `eclipse-oopslog` 0644 leaves every such disk with a service that respawns
+/// forever on EACCES, and no new kernel can fix it -- the user would have to
+/// reinstall, or know to `chmod +x` a file they have never heard of.
+///
+/// One `chmod` from init fixes it on the next boot instead, and is safe to do
+/// unconditionally: this runs only for a path named by an `exec =` in
+/// /etc/eclipse/services, a file whose entire purpose is to be executed, and
+/// only when it is a regular file with no x bit at all -- a state in which the
+/// service cannot work however long it is left alone. It is logged either way,
+/// so a repaired boot is still a boot that says what was wrong.
+///
+/// Returns `None` if nothing was attempted, otherwise the line to log.
+fn repair_exec_mode(prog: &str) -> Option<String> {
+    use std::os::unix::fs::PermissionsExt;
+    let path = Path::new(prog);
+    let meta = fs::metadata(path).ok()?;
+    if !meta.is_file() || meta.permissions().mode() & 0o111 != 0 {
+        return None;
+    }
+    // Mirror `chmod +x`: add x wherever the file is already readable, which for
+    // a 0644 wrapper means 0755. Never touches setuid/setgid or the read and
+    // write bits.
+    let old = meta.permissions().mode() & 0o7777;
+    let add = ((old & 0o444) >> 2) & 0o111;
+    let new = old | if add == 0 { 0o100 } else { add };
+    match fs::set_permissions(path, fs::Permissions::from_mode(new)) {
+        Ok(()) => Some(format!(
+            "{prog} was {old:04o} (not executable); chmod'ed it to {new:04o} and starting it"
+        )),
+        Err(e) => Some(format!(
+            "{prog} is {old:04o} (not executable) and chmod to {new:04o} failed: {e}; \
+             the service cannot start -- is the root filesystem read-only?"
+        )),
+    }
 }
 
 /// Start a service. `oneshot` runs to completion (blocking) before returning;
@@ -1015,9 +1059,16 @@ fn start_service(svc: &mut Service) {
         }
     }
     // Name an unrunnable `exec =` on the console: the child that fails execve
-    // cannot (see `exec_problem`).
-    if let Some(problem) = svc.exec.first().and_then(|p| exec_problem(p)) {
-        log(&format!("error: {}: {}", svc.name, problem));
+    // cannot (see `exec_problem`). A missing x bit is also repaired in place,
+    // because no kernel upgrade can reach the installed /usr/local/bin that
+    // carries it (see `repair_exec_mode`).
+    if let Some(prog) = svc.exec.first() {
+        if let Some(problem) = exec_problem(prog) {
+            log(&format!("error: {}: {}", svc.name, problem));
+            if let Some(repair) = repair_exec_mode(prog) {
+                log(&format!("{}: {}", svc.name, repair));
+            }
+        }
     }
     match svc.kind {
         Kind::Oneshot => {
@@ -2656,6 +2707,66 @@ mod tests {
         // Group- or other-only x still execs for those users: not our call.
         fs::set_permissions(&script, fs::Permissions::from_mode(0o644 | 0o010)).unwrap();
         assert_eq!(exec_problem(script.to_str().unwrap()), None);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// An image already installed on a disk keeps the 0644 wrapper forever: a
+    /// new kernel does not rewrite `/usr/local/bin`, only the installer does.
+    /// So init repairs the mode itself rather than only naming it.
+    #[test]
+    fn a_non_executable_exec_is_chmoded_so_an_installed_disk_heals_itself() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("eclipse-init-heal-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        // Exactly what the image shipped.
+        let script = dir.join("eclipse-oopslog");
+        fs::write(&script, b"#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o644)).unwrap();
+
+        let msg = repair_exec_mode(script.to_str().unwrap()).expect("0644 must be repaired");
+        assert!(msg.contains("0644"), "{msg}");
+        assert!(msg.contains("0755"), "{msg}");
+        let mode = fs::metadata(&script).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(
+            mode, 0o755,
+            "chmod +x on a 0644 wrapper is 0755, got {mode:04o}"
+        );
+        // And `exec_problem` now has nothing to say about it, so the service runs.
+        assert_eq!(exec_problem(script.to_str().unwrap()), None);
+
+        // Idempotent: an already-executable file is left alone, mode untouched.
+        assert_eq!(repair_exec_mode(script.to_str().unwrap()), None);
+        assert_eq!(
+            fs::metadata(&script).unwrap().permissions().mode() & 0o7777,
+            0o755
+        );
+
+        // A root-only 0600 file gains only owner-x, and the setuid bit of a
+        // 04644 file survives the repair -- `chmod +x`, not `chmod 755`.
+        let private = dir.join("private");
+        fs::write(&private, b"x").unwrap();
+        fs::set_permissions(&private, fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(repair_exec_mode(private.to_str().unwrap()).is_some());
+        assert_eq!(
+            fs::metadata(&private).unwrap().permissions().mode() & 0o7777,
+            0o700
+        );
+
+        let suid = dir.join("suid");
+        fs::write(&suid, b"x").unwrap();
+        fs::set_permissions(&suid, fs::Permissions::from_mode(0o4644)).unwrap();
+        assert!(repair_exec_mode(suid.to_str().unwrap()).is_some());
+        assert_eq!(
+            fs::metadata(&suid).unwrap().permissions().mode() & 0o7777,
+            0o4755
+        );
+
+        // Nothing to repair for a directory or a path that is not there.
+        assert_eq!(repair_exec_mode(dir.to_str().unwrap()), None);
+        assert_eq!(repair_exec_mode(dir.join("absent").to_str().unwrap()), None);
 
         let _ = fs::remove_dir_all(&dir);
     }
