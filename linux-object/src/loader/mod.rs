@@ -110,6 +110,32 @@ fn entry_address(base: usize, entry_point: u64) -> LxResult<usize> {
 /// with the stack.  Linux uses a similar high-address default for the stack.
 const STACK_TOP: usize = USER_ASPACE_BASE as usize + USER_ASPACE_SIZE as usize;
 
+/// `RLIMIT_STACK` has to report the size the loader actually maps.
+///
+/// Programs believe it. A C library sizes its own guards by it, and
+/// `-fstack-clash-protection` makes a compiler emit a probe loop that walks a
+/// large frame a page at a time on the way down, writing to each page because
+/// it is entitled to assume the stack reaches that far. Advertising more than
+/// is mapped turns an ordinary frame into a `SIGSEGV` on the guard page -- see
+/// [`USER_STACK_PAGES`], which carries the `halloy`/`libvulkan` crash this
+/// assertion exists to stop coming back.
+const _: () = assert!(
+    USER_STACK_PAGES * PAGE_SIZE == crate::process::USER_STACK_SIZE as usize,
+    "RLIMIT_STACK must report the stack size the loader maps"
+);
+
+/// Where a new process's main stack goes, as `(bottom, top)`.
+///
+/// The stack sits at the top of the process VMAR -- which is the top of the
+/// user address space on bare metal and a smaller window in
+/// aspace-separate/libos builds -- so the heap, which grows up from
+/// `initial_brk`, never collides with it. `pages` is [`USER_STACK_PAGES`] for
+/// every caller in this tree.
+fn stack_placement(vmar_end: usize, pages: usize) -> (usize, usize) {
+    let top = vmar_end.min(STACK_TOP);
+    (top - pages * PAGE_SIZE, top)
+}
+
 /// Base of the program break, well away from the mmap arena.
 ///
 /// The heap used to start immediately after the loaded image, which reads
@@ -546,17 +572,14 @@ impl LinuxElfLoader {
 
             let stack_vmo = VmObject::new_paged(self.stack_pages);
             let stack_flags = MMUFlags::READ | MMUFlags::WRITE | MMUFlags::USER;
-            // Place the stack at the top of the process VMAR (which equals the
-            // top of the user address space on bare metal, but is a smaller
-            // window in aspace-separate/libos builds) so the heap, which grows
-            // up from initial_brk, never collides with the stack.
-            let stack_top = vmar.end_addr().min(STACK_TOP);
-            let stack_bottom = stack_top - stack_vmo.len();
-            // map_range=false: don't commit all 128 stack pages eagerly on every
-            // exec — the argv/env/auxv tail is committed by the `stack_vmo.write`
+            let (stack_bottom, stack_top) = stack_placement(vmar.end_addr(), self.stack_pages);
+            // map_range=false: don't commit the stack eagerly on every exec —
+            // the argv/env/auxv tail is committed by the `stack_vmo.write`
             // below and the rest demand-zeroes on first touch like any anon
-            // mmap. Eager commit cost ~0.5 MB zero-fill + 128 PTE installs per
-            // spawn, and every later fork re-walked those committed pages.
+            // mmap. Eager commit cost a zero-fill and a PTE install per page
+            // per spawn, and every later fork re-walked those committed pages.
+            // It is also what makes an 8 MiB stack free: a program that uses a
+            // few pages of it pays for a few pages.
             vmar.map_ext(
                 Some(stack_bottom - vmar.addr()),
                 stack_vmo.clone(),
@@ -699,12 +722,7 @@ impl LinuxElfLoader {
 
         let stack_vmo = VmObject::new_paged(self.stack_pages);
         let flags = MMUFlags::READ | MMUFlags::WRITE | MMUFlags::USER;
-        // Place the stack at the top of the process VMAR (which equals the top
-        // of the user address space on bare metal, but is a smaller window in
-        // aspace-separate/libos builds) so the heap, which grows up from
-        // initial_brk, never collides with the stack.
-        let stack_top = vmar.end_addr().min(STACK_TOP);
-        let stack_bottom = stack_top - stack_vmo.len();
+        let (stack_bottom, stack_top) = stack_placement(vmar.end_addr(), self.stack_pages);
         // map_range=false: lazy stack, same rationale as the interpreter path
         // above — the init_stack tail is committed by `stack_vmo.write` below,
         // everything else demand-zeroes on first touch.
@@ -2355,5 +2373,79 @@ mod elf_bounds_tests {
         let mut buf = [0u8; 4];
         image.read_memory(image.addr() + at, &mut buf).unwrap();
         assert_eq!(buf, image.addr().to_ne_bytes()[..4]);
+    }
+}
+
+#[cfg(test)]
+mod stack_tests {
+    use super::*;
+    use crate::process::USER_STACK_SIZE;
+
+    /// What the dmesg of 2026-10-01 recorded, as distances below the top of the
+    /// stack rather than the absolute addresses of that boot (which are
+    /// `STACK_TOP`-relative and so differ per architecture).
+    ///
+    /// `halloy` had 453 KiB of stack live -- `rbp = 0x7ffffff8da60` against a
+    /// stack top of `0x7ffffffff000` -- and `libvulkan.so.1+0x52ecf` was
+    /// claiming a 90 KiB frame with the probe loop
+    /// `orq $0,0xff8(%rsp)` / `cmp %rdx,%rsp` / `jne`, walking down to
+    /// `rdx = 0x7ffffff77030`.
+    const HALLOY_LIVE: usize = 464_288;
+    /// The frame the probe loop was claiming, `rbp - rdx`.
+    const HALLOY_FRAME: usize = 92_720;
+
+    /// The one thing that has to hold: a process gets the stack its
+    /// `RLIMIT_STACK` promises. Advertising 8 MiB and mapping 512 KiB is what
+    /// killed `halloy`, and the `const` assert beside [`stack_placement`]
+    /// fails the build if the two constants ever drift again -- this names the
+    /// same fact as a test so a reader of the loader meets it here too.
+    #[test]
+    fn the_stack_is_as_big_as_rlimit_stack_promises() {
+        let (bottom, top) = stack_placement(STACK_TOP, USER_STACK_PAGES);
+        assert_eq!(top, STACK_TOP);
+        assert_eq!(top - bottom, USER_STACK_SIZE as usize);
+    }
+
+    /// The crash itself. The deepest address the probe loop would write has to
+    /// land inside the stack mapping; with the 128 pages this used to map it
+    /// landed a page BELOW the bottom, in the guard page the vDSO placement
+    /// leaves there, and the write became an undeliverable `SIGSEGV`.
+    #[test]
+    fn halloys_vulkan_frame_fits_in_the_stack() {
+        let deepest = STACK_TOP - HALLOY_LIVE - HALLOY_FRAME;
+
+        let (bottom, top) = stack_placement(STACK_TOP, USER_STACK_PAGES);
+        assert!(
+            (bottom..top).contains(&deepest),
+            "the frame reaches {:#x}, below a stack that starts at {:#x}",
+            deepest,
+            bottom
+        );
+
+        // And the regression it is: 544 KiB of stack over a 512 KiB mapping.
+        let (old_bottom, _) = stack_placement(STACK_TOP, 128);
+        assert!(
+            deepest < old_bottom,
+            "this is the crash being reproduced: it must not fit in 128 pages"
+        );
+        // And it crossed the bottom from above, which is what the reported
+        // fault address says: the probe loop started inside the stack and the
+        // first probe to land outside it hit the guard page immediately below
+        // (`0x7ffffff7e028`, one page under a bottom of `0x7ffffff7f000`),
+        // which is the page `vdso::placement` keeps clear.
+        assert!(STACK_TOP - HALLOY_LIVE > old_bottom);
+        assert_eq!((old_bottom - 1 - deepest) / PAGE_SIZE, 7);
+    }
+
+    /// `aspace-separate` and libos builds hand out a window, not the whole
+    /// user address space, so the stack goes at the top of the window. The
+    /// clamp is the reason this is `vmar.end_addr().min(STACK_TOP)` and not
+    /// `STACK_TOP`.
+    #[test]
+    fn a_smaller_window_puts_the_stack_at_its_own_top() {
+        let window_end = STACK_TOP - 0x1_0000_0000;
+        let (bottom, top) = stack_placement(window_end, USER_STACK_PAGES);
+        assert_eq!(top, window_end);
+        assert_eq!(top - bottom, USER_STACK_SIZE as usize);
     }
 }

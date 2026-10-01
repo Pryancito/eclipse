@@ -1077,10 +1077,11 @@ impl Syscall<'_> {
         // expanding to thousands of paths -- fails with E2BIG instead of
         // overrunning the initial stack image the loader builds. Without this
         // the stack builder's `assert!` tripped and PANICKED THE KERNEL from an
-        // ordinary userspace command. Matches Linux's "1/4 of the stack" rule:
-        // the user stack is USER_STACK_PAGES (128) * 4 KiB = 512 KiB, so cap the
-        // arg/env bytes (plus one 8-byte table pointer per entry) at 128 KiB.
-        const ARG_MAX: usize = 128 * 1024;
+        // ordinary userspace command. Linux's rule is a quarter of the
+        // stack (`_STK_LIM / 4`), so derive it from the stack the loader maps
+        // rather than restating a number: the cap covers the arg/env bytes
+        // plus one 8-byte table pointer per entry.
+        const ARG_MAX: usize = USER_STACK_PAGES * PAGE_SIZE / 4;
         let arg_bytes: usize = args.iter().map(|s| s.len() + 1 + 8).sum::<usize>()
             + envs.iter().map(|s| s.len() + 1 + 8).sum::<usize>();
         if arg_bytes > ARG_MAX {
