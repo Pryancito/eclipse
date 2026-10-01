@@ -39,6 +39,120 @@ fn create_new_sfs() {
 }
 
 #[test]
+fn directory_names_at_storage_limit_do_not_panic_or_mutate() -> Result<()> {
+    let sfs = _create_new_sfs();
+    let root = sfs.root_inode();
+    let max_name = "x".repeat(255);
+    let too_long = "x".repeat(256);
+    let source = root.create("source", FileType::File, 0o777)?;
+    let max_file = root.create(&max_name, FileType::File, 0o777)?;
+    assert_eq!(
+        root.find(&max_name)?.metadata()?.inode,
+        max_file.metadata()?.inode
+    );
+
+    let entries_before = root.list()?;
+    let links_before = source.metadata()?.nlinks;
+    assert!(matches!(
+        root.create(&too_long, FileType::File, 0o777),
+        Err(FsError::NameTooLong)
+    ));
+    assert_eq!(root.link(&too_long, &source), Err(FsError::NameTooLong));
+    assert_eq!(
+        root.move_("source", &root, &too_long),
+        Err(FsError::NameTooLong)
+    );
+    assert_eq!(root.list()?, entries_before);
+    assert_eq!(source.metadata()?.nlinks, links_before);
+    assert_eq!(
+        root.find("source")?.metadata()?.inode,
+        source.metadata()?.inode
+    );
+    Ok(())
+}
+
+#[test]
+fn rename_over_existing_file_preserves_other_entries() -> Result<()> {
+    let sfs = _create_new_sfs();
+    let root = sfs.root_inode();
+    let source = root.create("source", FileType::File, 0o777)?;
+    let other = root.create("other", FileType::File, 0o777)?;
+    let replaced = root.create("replaced", FileType::File, 0o777)?;
+    source.write_at(0, b"source data")?;
+
+    assert_eq!(
+        root.move_("missing", &root, "replaced"),
+        Err(FsError::EntryNotFound)
+    );
+    assert_eq!(
+        root.find("replaced")?.metadata()?.inode,
+        replaced.metadata()?.inode
+    );
+    root.move_("source", &root, "source")?;
+    assert_eq!(source.metadata()?.nlinks, 1);
+    root.move_("source", &root, "replaced")?;
+    assert!(root.find("source").is_err());
+    assert_eq!(
+        root.find("replaced")?.metadata()?.inode,
+        source.metadata()?.inode
+    );
+    assert_eq!(
+        root.find("other")?.metadata()?.inode,
+        other.metadata()?.inode
+    );
+    assert_eq!(replaced.metadata()?.nlinks, 0);
+    let mut data = [0; 11];
+    root.find("replaced")?.read_at(0, &mut data)?;
+    assert_eq!(&data, b"source data");
+    Ok(())
+}
+
+#[test]
+fn move_directory_updates_parent_and_replaced_links() -> Result<()> {
+    let sfs = _create_new_sfs();
+    let root = sfs.root_inode();
+    let source_parent = root.create("from", FileType::Dir, 0o777)?;
+    let dest_parent = root.create("to", FileType::Dir, 0o777)?;
+    let source = source_parent.create("source", FileType::Dir, 0o777)?;
+    let replaced = dest_parent.create("dest", FileType::Dir, 0o777)?;
+    source_parent.move_("source", &dest_parent, "dest")?;
+    assert!(source_parent.find("source").is_err());
+    assert_eq!(
+        dest_parent.find("dest")?.metadata()?.inode,
+        source.metadata()?.inode
+    );
+    assert_eq!(
+        source.find("..")?.metadata()?.inode,
+        dest_parent.metadata()?.inode
+    );
+    assert_eq!(replaced.metadata()?.nlinks, 0);
+    assert_eq!(source_parent.metadata()?.nlinks, 2);
+    assert_eq!(dest_parent.metadata()?.nlinks, 3);
+    Ok(())
+}
+
+#[test]
+fn moving_directory_into_descendant_keeps_tree_reachable() -> Result<()> {
+    let sfs = _create_new_sfs();
+    let root = sfs.root_inode();
+    let parent = root.create("parent", FileType::Dir, 0o777)?;
+    let child = parent.create("child", FileType::Dir, 0o777)?;
+    assert_eq!(
+        root.move_("parent", &child, "moved"),
+        Err(FsError::InvalidParam)
+    );
+    assert_eq!(
+        root.find("parent")?.metadata()?.inode,
+        parent.metadata()?.inode
+    );
+    assert_eq!(
+        child.find("..")?.metadata()?.inode,
+        parent.metadata()?.inode
+    );
+    Ok(())
+}
+
+#[test]
 fn create_file() -> Result<()> {
     let sfs = _create_new_sfs();
     let root = sfs.root_inode();
