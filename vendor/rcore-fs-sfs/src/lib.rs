@@ -699,6 +699,22 @@ impl vfs::INode for INodeImpl {
             .ok_or(FsError::EntryNotFound)?;
         let inode = self.fs.get_inode(inode_id);
         let source_type = inode.metadata()?.type_;
+        if source_type == vfs::FileType::Dir && info.inode != dest_info.inode {
+            let mut ancestor = dest.id;
+            for _ in 0..self.fs.super_block.read().blocks {
+                if ancestor == inode_id {
+                    return Err(FsError::InvalidParam);
+                }
+                let parent = self.fs.get_inode(ancestor).read_direntry(1)?.id as INodeId;
+                if parent == ancestor {
+                    break;
+                }
+                ancestor = parent;
+            }
+            if ancestor != BLKN_ROOT {
+                return Err(FsError::InvalidParam);
+            }
+        }
         let replaced = dest.get_file_inode_and_entry_id(new_name);
         if replaced.is_some_and(|(id, _)| id == inode_id) {
             return Ok(());

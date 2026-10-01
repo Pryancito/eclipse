@@ -51,13 +51,22 @@ fn rename_over_existing_file_preserves_other_entries() -> Result<()> {
         root.move_("missing", &root, "replaced"),
         Err(FsError::EntryNotFound)
     );
-    assert_eq!(root.find("replaced")?.metadata()?.inode, replaced.metadata()?.inode);
+    assert_eq!(
+        root.find("replaced")?.metadata()?.inode,
+        replaced.metadata()?.inode
+    );
     root.move_("source", &root, "source")?;
     assert_eq!(source.metadata()?.nlinks, 1);
     root.move_("source", &root, "replaced")?;
     assert!(root.find("source").is_err());
-    assert_eq!(root.find("replaced")?.metadata()?.inode, source.metadata()?.inode);
-    assert_eq!(root.find("other")?.metadata()?.inode, other.metadata()?.inode);
+    assert_eq!(
+        root.find("replaced")?.metadata()?.inode,
+        source.metadata()?.inode
+    );
+    assert_eq!(
+        root.find("other")?.metadata()?.inode,
+        other.metadata()?.inode
+    );
     assert_eq!(replaced.metadata()?.nlinks, 0);
     let mut data = [0; 11];
     root.find("replaced")?.read_at(0, &mut data)?;
@@ -75,11 +84,38 @@ fn move_directory_updates_parent_and_replaced_links() -> Result<()> {
     let replaced = dest_parent.create("dest", FileType::Dir, 0o777)?;
     source_parent.move_("source", &dest_parent, "dest")?;
     assert!(source_parent.find("source").is_err());
-    assert_eq!(dest_parent.find("dest")?.metadata()?.inode, source.metadata()?.inode);
-    assert_eq!(source.find("..")?.metadata()?.inode, dest_parent.metadata()?.inode);
+    assert_eq!(
+        dest_parent.find("dest")?.metadata()?.inode,
+        source.metadata()?.inode
+    );
+    assert_eq!(
+        source.find("..")?.metadata()?.inode,
+        dest_parent.metadata()?.inode
+    );
     assert_eq!(replaced.metadata()?.nlinks, 0);
     assert_eq!(source_parent.metadata()?.nlinks, 2);
     assert_eq!(dest_parent.metadata()?.nlinks, 3);
+    Ok(())
+}
+
+#[test]
+fn moving_directory_into_descendant_keeps_tree_reachable() -> Result<()> {
+    let sfs = _create_new_sfs();
+    let root = sfs.root_inode();
+    let parent = root.create("parent", FileType::Dir, 0o777)?;
+    let child = parent.create("child", FileType::Dir, 0o777)?;
+    assert_eq!(
+        root.move_("parent", &child, "moved"),
+        Err(FsError::InvalidParam)
+    );
+    assert_eq!(
+        root.find("parent")?.metadata()?.inode,
+        parent.metadata()?.inode
+    );
+    assert_eq!(
+        child.find("..")?.metadata()?.inode,
+        parent.metadata()?.inode
+    );
     Ok(())
 }
 
