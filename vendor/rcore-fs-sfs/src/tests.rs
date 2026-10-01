@@ -39,6 +39,51 @@ fn create_new_sfs() {
 }
 
 #[test]
+fn rename_over_existing_file_preserves_other_entries() -> Result<()> {
+    let sfs = _create_new_sfs();
+    let root = sfs.root_inode();
+    let source = root.create("source", FileType::File, 0o777)?;
+    let other = root.create("other", FileType::File, 0o777)?;
+    let replaced = root.create("replaced", FileType::File, 0o777)?;
+    source.write_at(0, b"source data")?;
+
+    assert_eq!(
+        root.move_("missing", &root, "replaced"),
+        Err(FsError::EntryNotFound)
+    );
+    assert_eq!(root.find("replaced")?.metadata()?.inode, replaced.metadata()?.inode);
+    root.move_("source", &root, "source")?;
+    assert_eq!(source.metadata()?.nlinks, 1);
+    root.move_("source", &root, "replaced")?;
+    assert!(root.find("source").is_err());
+    assert_eq!(root.find("replaced")?.metadata()?.inode, source.metadata()?.inode);
+    assert_eq!(root.find("other")?.metadata()?.inode, other.metadata()?.inode);
+    assert_eq!(replaced.metadata()?.nlinks, 0);
+    let mut data = [0; 11];
+    root.find("replaced")?.read_at(0, &mut data)?;
+    assert_eq!(&data, b"source data");
+    Ok(())
+}
+
+#[test]
+fn move_directory_updates_parent_and_replaced_links() -> Result<()> {
+    let sfs = _create_new_sfs();
+    let root = sfs.root_inode();
+    let source_parent = root.create("from", FileType::Dir, 0o777)?;
+    let dest_parent = root.create("to", FileType::Dir, 0o777)?;
+    let source = source_parent.create("source", FileType::Dir, 0o777)?;
+    let replaced = dest_parent.create("dest", FileType::Dir, 0o777)?;
+    source_parent.move_("source", &dest_parent, "dest")?;
+    assert!(source_parent.find("source").is_err());
+    assert_eq!(dest_parent.find("dest")?.metadata()?.inode, source.metadata()?.inode);
+    assert_eq!(source.find("..")?.metadata()?.inode, dest_parent.metadata()?.inode);
+    assert_eq!(replaced.metadata()?.nlinks, 0);
+    assert_eq!(source_parent.metadata()?.nlinks, 2);
+    assert_eq!(dest_parent.metadata()?.nlinks, 3);
+    Ok(())
+}
+
+#[test]
 fn create_file() -> Result<()> {
     let sfs = _create_new_sfs();
     let root = sfs.root_inode();
