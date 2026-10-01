@@ -690,8 +690,8 @@ impl Socket for TcpSocketState {
 
             (socket.can_recv(), socket.can_send())
         };
-        if (events.contains(PollEvents::IN) && !recv_state)
-            || (events.contains(PollEvents::OUT) && !send_state)
+        if (events.wants_read() && !recv_state)
+            || (events.wants_write() && !send_state)
         {
             crate::net::drain_net_tick();
         }
@@ -1073,12 +1073,10 @@ impl FileLike for TcpSocketState {
     }
 
     fn set_flags(&self, f: OpenFlags) -> LxResult {
-        let flags = &mut self.inner.lock().flags;
-
-        // See fcntl, only O_APPEND, O_ASYNC, O_DIRECT, O_NOATIME, O_NONBLOCK
-        flags.set(OpenFlags::APPEND, f.contains(OpenFlags::APPEND));
-        flags.set(OpenFlags::NON_BLOCK, f.contains(OpenFlags::NON_BLOCK));
-        flags.set(OpenFlags::CLOEXEC, f.contains(OpenFlags::CLOEXEC));
+        // `take_settable` includes O_ASYNC: the hand-rolled sets named it in
+        // the comment and then dropped it, so FIOASYNC/F_SETFL(O_ASYNC) on a
+        // socket "succeeded" while F_GETFL never showed the bit.
+        self.inner.lock().flags.take_settable(f);
         Ok(())
     }
 
@@ -1107,8 +1105,8 @@ impl FileLike for TcpSocketState {
 
     async fn async_poll(&self, events: PollEvents) -> LxResult<PollStatus> {
         let (mut read, mut write, mut error) = Socket::poll(self, events);
-        let ready = (events.contains(PollEvents::IN) && read)
-            || (events.contains(PollEvents::OUT) && write)
+        let ready = (events.wants_read() && read)
+            || (events.wants_write() && write)
             || error;
         if !ready {
             kernel_hal::net::NetRxOrTimeoutFuture::new(5).await;

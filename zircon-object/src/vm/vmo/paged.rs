@@ -2301,8 +2301,13 @@ impl VMObjectPagedInner {
             info.flags |= VmoInfoFlags::CONTIGUOUS;
         }
         // info.num_children = if self.type_.is_hidden() { 2 } else { 0 };
-        info.num_mappings = self.mappings.len() as u64; // FIXME remove weak ptr
-        info.share_count = self.mappings.len() as u64; // FIXME share_count should be the count of unique aspace
+        // Drop already ran `forget_mapping` without pruning this list, so dead
+        // weaks linger until the next `remove_mapping`. Count only the live ones.
+        let live_mappings = self.mappings.iter().filter(|m| m.strong_count() > 0).count() as u64;
+        info.num_mappings = live_mappings;
+        // Unique address spaces would need an aspace id on each mapping; until
+        // then the live mapping count is the honest figure (never dead weaks).
+        info.share_count = live_mappings;
         info.committed_bytes =
             (self.committed_pages_in_range(0, self.size / PAGE_SIZE) * PAGE_SIZE) as u64;
         info.populated_bytes = info.committed_bytes;

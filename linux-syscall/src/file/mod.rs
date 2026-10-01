@@ -7,6 +7,9 @@ use linux_object::fs::*;
 
 mod dir;
 mod fd;
+/// Shared by `socket`/`socketpair` (and the anonymous-fd constructors in `fd`)
+/// so a stray bit is `EINVAL`, not a silently truncated `OpenFlags`.
+pub(crate) use fd::{anon_fd_flags, open_flags, ANON_CLOEXEC, ANON_NONBLOCK};
 #[allow(clippy::module_inception)]
 mod file;
 pub(crate) use file::{after_write_error, sigpipe_due, AfterWriteError};

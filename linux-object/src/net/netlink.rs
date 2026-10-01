@@ -6,8 +6,9 @@ use crate::{
     error::{LxError, LxResult},
     fs::FileLike,
     net::{
-        AddressFamily, Endpoint, Socket, SysResult, ARPHRD_ETHER, ARPHRD_LOOPBACK, IFF_BROADCAST,
-        IFF_CHANGE_ALL, IFF_LOOPBACK, IFF_LOWER_UP, IFF_MULTICAST, IFF_NOARP, IFF_RUNNING, IFF_UP,
+        shutdown_sides, AddressFamily, Endpoint, Socket, SysResult, ARPHRD_ETHER, ARPHRD_LOOPBACK,
+        IFF_BROADCAST, IFF_CHANGE_ALL, IFF_LOOPBACK, IFF_LOWER_UP, IFF_MULTICAST, IFF_NOARP,
+        IFF_RUNNING, IFF_UP,
     },
 };
 use alloc::{boxed::Box, sync::Arc, vec::Vec};
@@ -644,9 +645,12 @@ impl Socket for NetlinkSocketState {
         Err(LxError::EINVAL)
     }
 
-    fn shutdown(&self, _howto: usize) -> SysResult {
-        // Accept shutdown silently — some userland code calls shutdown() before
-        // close() even on netlink sockets. Return success to avoid EINVAL noise.
+    fn shutdown(&self, howto: usize) -> SysResult {
+        // Netlink has no half-close to act on, but `howto` is still checked:
+        // userland that calls `shutdown()` before `close()` on a netlink fd
+        // must get success for `SHUT_RD`/`WR`/`RDWR` and `EINVAL` past that,
+        // the same gate `__sys_shutdown_sock` runs before any protocol ops.
+        let _ = shutdown_sides(howto)?;
         Ok(0)
     }
 
@@ -704,10 +708,7 @@ impl FileLike for NetlinkSocketState {
     }
 
     fn set_flags(&self, f: OpenFlags) -> LxResult {
-        let flags = &mut *self.flags.lock();
-        flags.set(OpenFlags::APPEND, f.contains(OpenFlags::APPEND));
-        flags.set(OpenFlags::NON_BLOCK, f.contains(OpenFlags::NON_BLOCK));
-        flags.set(OpenFlags::CLOEXEC, f.contains(OpenFlags::CLOEXEC));
+        self.flags.lock().take_settable(f);
         Ok(())
     }
 
@@ -1739,5 +1740,18 @@ mod netlink_tests {
         assert_eq!(q.len(), NETLINK_RX_QUEUE_MAX);
         assert_eq!(q.last().unwrap()[0], (NETLINK_RX_QUEUE_MAX + 9) as u8);
         assert_eq!(q[0][0], 10u8);
+    }
+
+    /// `shutdown` on netlink is a no-op for the three valid `how` values, but
+    /// used to succeed for anything — `shutdown(nl, 99)` returned 0 where
+    /// Linux says `EINVAL`.
+    #[test]
+    fn shutdown_refuses_a_how_that_is_not_a_how() {
+        let nl = NetlinkSocketState::default();
+        assert!(Socket::shutdown(&nl, 0).is_ok());
+        assert!(Socket::shutdown(&nl, 1).is_ok());
+        assert!(Socket::shutdown(&nl, 2).is_ok());
+        assert_eq!(Socket::shutdown(&nl, 3), Err(LxError::EINVAL));
+        assert_eq!(Socket::shutdown(&nl, 99), Err(LxError::EINVAL));
     }
 }

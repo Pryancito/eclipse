@@ -163,6 +163,13 @@ impl Pipe {
         self.direction == PipeEnd::Read
     }
 
+    /// Whether `other` shares this pipe's buffer. `tee`/`splice` between
+    /// both ends of the same pipe is `EINVAL` (`do_tee` / `do_splice`);
+    /// without the check, a peek-and-write loop fills the buffer forever.
+    pub fn same_buffer(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.data, &other.data)
+    }
+
     /// Park `waker` on this pipe's event bus for the next readiness
     /// transition (see `FileLike::subscribe_readiness`; reached through
     /// `File`'s inode downcast). The bus lives inside `PipeData`, so the
@@ -482,6 +489,19 @@ mod tests {
             RawWaker::new(ptr, &RawWakerVTable::new(clone, wake, wake_by_ref, drop))
         }
         unsafe { Waker::from_raw(raw(flag as *const AtomicBool as *const ())) }
+    }
+
+    /// Both ends of `create_pair` share a buffer; two pairs do not. That is
+    /// the predicate `tee`/`splice` use for `EINVAL`.
+    #[test]
+    fn ends_of_one_pair_share_a_buffer_and_two_pairs_do_not() {
+        let (r1, w1) = Pipe::create_pair();
+        let (r2, w2) = Pipe::create_pair();
+        assert!(r1.same_buffer(&w1));
+        assert!(w1.same_buffer(&r1));
+        assert!(!r1.same_buffer(&r2));
+        assert!(!r1.same_buffer(&w2));
+        assert!(!w1.same_buffer(&w2));
     }
 
     /// poll/epoll drops Pending async_poll futures every re-scan; without

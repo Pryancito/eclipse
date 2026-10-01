@@ -434,9 +434,11 @@ pub fn clock_nanosleep_base(clock: usize) -> crate::error::LxResult<ClockBase> {
 /// What `clock_nanosleep` should do, worked out before anything sleeps.
 ///
 /// `request` is a length when `TIMER_ABSTIME` is clear, and a point on
-/// `clock`'s own timeline when it is set. Only that one bit is looked at:
-/// `common_nsleep` does `flags & TIMER_ABSTIME`, so a flag word carrying
-/// other bits is a relative sleep in Linux and not an error.
+/// `clock`'s own timeline when it is set. For the ordinary clocks,
+/// `common_nsleep` only looks at that one bit, so a flag word carrying
+/// other bits is still a relative sleep in Linux and not an error. The
+/// ALARM clocks go through `alarmtimer_nsleep`, which answers `EINVAL`
+/// for any bit outside `TIMER_ABSTIME`.
 ///
 /// The answer is always on the monotonic timeline, because that is the only
 /// one the kernel's timer can be asked to wake on.
@@ -447,7 +449,16 @@ pub fn plan_clock_nanosleep(
     now_monotonic: Duration,
     now_wall: Duration,
 ) -> crate::error::LxResult<SleepPlan> {
+    use crate::error::LxError;
     let base = clock_nanosleep_base(clock)?;
+    // `alarmtimer_nsleep`: `if (flags & ~TIMER_ABSTIME) return -EINVAL`.
+    if matches!(
+        ClockId::from_raw(clock)?,
+        ClockId::ClockRealTimeAlarm | ClockId::ClockBootTimeAlarm
+    ) && flags & !TIMER_ABSTIME != 0
+    {
+        return Err(LxError::EINVAL);
+    }
     if flags & TIMER_ABSTIME == 0 {
         return Ok(SleepPlan::Until(now_monotonic.saturating_add(request)));
     }
@@ -980,7 +991,8 @@ mod time_tests {
 
     /// `common_nsleep` does `flags & TIMER_ABSTIME`, so a flag word with
     /// other bits in it is a relative sleep in Linux, not an error and
-    /// certainly not a panic.
+    /// certainly not a panic — on the ordinary clocks. The ALARM clocks
+    /// go through `alarmtimer_nsleep` and refuse those bits.
     #[test]
     fn only_the_abstime_bit_of_the_flag_word_is_looked_at() {
         let now_mono = Duration::from_secs(3_600);
@@ -1006,6 +1018,32 @@ mod time_tests {
                 relative,
                 "flags {:#x}",
                 flags
+            );
+        }
+    }
+
+    /// `CLOCK_*_ALARM` refuse any flag outside `TIMER_ABSTIME`
+    /// (`alarmtimer_nsleep`); masking only that bit used to sleep anyway.
+    #[test]
+    fn an_alarm_clock_rejects_unknown_nanosleep_flags() {
+        use crate::error::LxError;
+        let now = Duration::from_secs(1);
+        for clock in [8usize, 9] {
+            assert_eq!(
+                plan_clock_nanosleep(clock, 2, Duration::from_secs(1), now, now),
+                Err(LxError::EINVAL),
+                "clock {clock}"
+            );
+            assert_eq!(
+                plan_clock_nanosleep(clock, TIMER_ABSTIME | 2, Duration::from_secs(1), now, now),
+                Err(LxError::EINVAL),
+                "clock {clock} with ABSTIME"
+            );
+            // The two legal words still sleep.
+            assert!(plan_clock_nanosleep(clock, 0, Duration::from_millis(1), now, now).is_ok());
+            assert!(
+                plan_clock_nanosleep(clock, TIMER_ABSTIME, now + Duration::from_secs(1), now, now)
+                    .is_ok()
             );
         }
     }

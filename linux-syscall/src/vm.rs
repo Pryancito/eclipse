@@ -177,6 +177,11 @@ impl Syscall<'_> {
         let prot = MmapProt::from_bits_truncate(prot);
         let shared = mmap_shared(flags, flags & MMAP_ANONYMOUS != 0)?;
         shared_validate_flags(flags)?;
+        // No hugepages here. `MAP_HUGETLB` is in `LEGACY_MAP_MASK` so
+        // `MAP_SHARED_VALIDATE` does not refuse it, and `from_bits_truncate`
+        // then dropped the bit and handed back a normal mapping — probes
+        // that asked for huge pages thought they got them.
+        mmap_no_hugetlb(flags)?;
         let flags = MmapFlags::from_bits_truncate(flags);
         info!(
             "mmap: addr={:#x}, size={:#x}, prot={:?}, flags={:?}, fd={:?}, offset={:#x}",
@@ -1403,6 +1408,16 @@ const MAP_HUGE_1GB: usize = 30 << 26;
 fn shared_validate_flags(flags: usize) -> LxResult<()> {
     if flags & MAP_TYPE == MAP_SHARED_VALIDATE && flags & !LEGACY_MAP_MASK != 0 {
         return Err(LxError::EOPNOTSUPP);
+    }
+    Ok(())
+}
+
+/// This kernel has no hugepage pool. `MAP_HUGETLB` must be `EINVAL`, not a
+/// silently truncated anonymous/file mapping (`ksys_mmap_pgoff` fails the
+/// same way when no `hstate` exists for the request).
+fn mmap_no_hugetlb(flags: usize) -> LxResult<()> {
+    if flags & MAP_HUGETLB != 0 {
+        return Err(LxError::EINVAL);
     }
     Ok(())
 }
@@ -3024,6 +3039,25 @@ mod mmap_flag_tests {
                 kind
             );
         }
+    }
+
+    /// `MAP_HUGETLB` is a known legacy bit, but this kernel has no hugepages:
+    /// it must be refused, not truncated into a normal mapping.
+    #[test]
+    fn hugetlb_is_einval_not_a_silent_normal_mapping() {
+        assert_eq!(mmap_no_hugetlb(0), Ok(()));
+        assert_eq!(mmap_no_hugetlb(MAP_PRIVATE | MMAP_ANONYMOUS), Ok(()));
+        assert_eq!(
+            mmap_no_hugetlb(MAP_PRIVATE | MMAP_ANONYMOUS | MAP_HUGETLB),
+            Err(LxError::EINVAL)
+        );
+        assert_eq!(
+            mmap_no_hugetlb(MAP_SHARED_VALIDATE | MAP_HUGETLB | MAP_HUGE_2MB),
+            Err(LxError::EINVAL)
+        );
+        // Huge-size encodings alone are meaningless without MAP_HUGETLB;
+        // Linux ignores them on a normal mmap, and so do we.
+        assert_eq!(mmap_no_hugetlb(MAP_PRIVATE | MAP_HUGE_2MB), Ok(()));
     }
 }
 

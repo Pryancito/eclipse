@@ -335,16 +335,7 @@ impl FileLike for IcmpSocketState {
     }
 
     fn set_flags(&self, f: OpenFlags) -> LxResult {
-        let mut inner = self.inner.lock();
-        inner
-            .flags
-            .set(OpenFlags::APPEND, f.contains(OpenFlags::APPEND));
-        inner
-            .flags
-            .set(OpenFlags::NON_BLOCK, f.contains(OpenFlags::NON_BLOCK));
-        inner
-            .flags
-            .set(OpenFlags::CLOEXEC, f.contains(OpenFlags::CLOEXEC));
+        self.inner.lock().flags.take_settable(f);
         Ok(())
     }
 
@@ -383,8 +374,8 @@ impl FileLike for IcmpSocketState {
     async fn async_poll(&self, events: PollEvents) -> LxResult<PollStatus> {
         kernel_hal::deferred_job::drain_deferred_jobs();
         let (mut read, mut write, mut error) = Socket::poll(self, events);
-        let ready = (events.contains(PollEvents::IN) && read)
-            || (events.contains(PollEvents::OUT) && write)
+        let ready = (events.wants_read() && read)
+            || (events.wants_write() && write)
             || error;
         if !ready {
             // Park on RX IRQ (fallback timeout) like UDP — avoid busy-spin.

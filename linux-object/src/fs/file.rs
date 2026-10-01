@@ -80,9 +80,11 @@ impl OpenFlags {
     }
     /// The bits `fcntl(F_SETFL)` may change: `SETFL_MASK` in `fs/fcntl.c`,
     /// the status flags. The access mode, the creation flags and `O_CLOEXEC`
-    /// (per descriptor, `F_SETFD`) are not among them.
+    /// (per descriptor, `F_SETFD`) are not among them. Linux's mask is
+    /// `O_APPEND|O_ASYNC|O_DIRECT|O_NOATIME|O_NONBLOCK`; without `DIRECT` and
+    /// `NOATIME` here, `F_SETFL` could neither set nor clear them.
     fn setfl_mask() -> Self {
-        Self::APPEND | Self::NON_BLOCK
+        Self::APPEND | Self::NON_BLOCK | Self::ASYNC | Self::DIRECT | Self::NOATIME
     }
     /// What an open file's flags become after `fcntl(F_SETFL, requested)`.
     /// Linux (`setfl`) copies only `SETFL_MASK` out of the argument and keeps
@@ -101,7 +103,14 @@ impl OpenFlags {
     /// `fcntl(F_SETFL, O_NONBLOCK)` on them changed nothing and the next read
     /// with nothing pending blocked for good.
     pub fn take_settable(&mut self, requested: Self) {
-        for bit in [Self::APPEND, Self::NON_BLOCK, Self::CLOEXEC] {
+        for bit in [
+            Self::APPEND,
+            Self::NON_BLOCK,
+            Self::ASYNC,
+            Self::DIRECT,
+            Self::NOATIME,
+            Self::CLOEXEC,
+        ] {
             self.set(bit, requested.contains(bit));
         }
     }
@@ -1682,10 +1691,23 @@ mod setfl_tests {
         // An argument of 0 clears the status flags and nothing else: it does
         // not turn the file read-only (`RDONLY` is 0) or drop CLOEXEC.
         let cleared = OpenFlags::after_setfl(
-            rw | OpenFlags::APPEND | OpenFlags::NON_BLOCK,
+            rw | OpenFlags::APPEND | OpenFlags::NON_BLOCK | OpenFlags::ASYNC,
             OpenFlags::empty(),
         );
         assert_eq!(cleared, rw);
+        // O_ASYNC is a status flag too (FASYNC / ioctl FIOASYNC).
+        let async_on = OpenFlags::after_setfl(rw, OpenFlags::ASYNC);
+        assert_eq!(async_on, rw | OpenFlags::ASYNC);
+        // O_DIRECT and O_NOATIME are in Linux's SETFL_MASK; without them
+        // here, F_SETFL could neither set nor clear either bit.
+        let direct = OpenFlags::after_setfl(rw, OpenFlags::DIRECT | OpenFlags::NOATIME);
+        assert_eq!(direct, rw | OpenFlags::DIRECT | OpenFlags::NOATIME);
+        let cleared_direct = OpenFlags::after_setfl(direct, OpenFlags::NON_BLOCK);
+        assert_eq!(
+            cleared_direct,
+            rw | OpenFlags::NON_BLOCK,
+            "F_SETFL(O_NONBLOCK) must clear O_DIRECT|O_NOATIME that were set"
+        );
     }
 
     #[test]
@@ -1705,12 +1727,23 @@ mod setfl_tests {
     }
 
     #[test]
-    fn take_settable_is_the_three_bits_every_set_flags_used_to_copy_by_hand() {
+    fn take_settable_is_the_status_bits_every_set_flags_used_to_copy_by_hand() {
         let mut flags = OpenFlags::RDWR | OpenFlags::NON_BLOCK;
-        flags.take_settable(OpenFlags::APPEND | OpenFlags::CLOEXEC);
+        flags.take_settable(
+            OpenFlags::APPEND
+                | OpenFlags::ASYNC
+                | OpenFlags::DIRECT
+                | OpenFlags::NOATIME
+                | OpenFlags::CLOEXEC,
+        );
         assert_eq!(
             flags,
-            OpenFlags::RDWR | OpenFlags::APPEND | OpenFlags::CLOEXEC
+            OpenFlags::RDWR
+                | OpenFlags::APPEND
+                | OpenFlags::ASYNC
+                | OpenFlags::DIRECT
+                | OpenFlags::NOATIME
+                | OpenFlags::CLOEXEC
         );
         // Bits it does not own are left alone in both directions.
         flags.take_settable(OpenFlags::WRONLY | OpenFlags::CREATE);

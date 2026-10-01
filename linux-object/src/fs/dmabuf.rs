@@ -15,6 +15,7 @@
 
 use super::*;
 use alloc::sync::Arc;
+use lock::Mutex;
 use zircon_object::object::*;
 
 /// A dma-buf file object.
@@ -32,6 +33,7 @@ pub struct DmaBuf {
     /// / [`Self::dup`] and released in [`Drop`]. `None` for dumb/generic
     /// exports, which stay alive via `vmo` alone.
     nouveau_handle: Option<u32>,
+    flags: Mutex<OpenFlags>,
 }
 
 impl_kobject!(DmaBuf);
@@ -48,6 +50,7 @@ impl DmaBuf {
             size,
             vmo,
             nouveau_handle: None,
+            flags: Mutex::new(OpenFlags::RDWR | OpenFlags::CLOEXEC),
         })
     }
 
@@ -72,6 +75,7 @@ impl DmaBuf {
             size,
             vmo,
             nouveau_handle,
+            flags: Mutex::new(OpenFlags::RDWR | OpenFlags::CLOEXEC),
         })
     }
 
@@ -92,10 +96,14 @@ impl Drop for DmaBuf {
 #[async_trait]
 impl FileLike for DmaBuf {
     fn flags(&self) -> OpenFlags {
-        OpenFlags::RDWR | OpenFlags::CLOEXEC
+        *self.flags.lock()
     }
 
-    fn set_flags(&self, _f: OpenFlags) -> LxResult {
+    fn set_flags(&self, f: OpenFlags) -> LxResult {
+        // Same trap as syncobj/epoll/perf before `take_settable`: a hardcoded
+        // `flags()` plus a no-op `set_flags` made `fcntl(F_SETFL, O_NONBLOCK)`
+        // "succeed" while `F_GETFL` never changed.
+        self.flags.lock().take_settable(f);
         Ok(())
     }
 
@@ -151,5 +159,24 @@ impl FileLike for DmaBuf {
     /// software renderer / scanout).
     fn get_vmo(&self, _offset: usize, _len: usize) -> LxResult<Arc<VmObject>> {
         Ok(self.vmo.clone())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `fcntl(F_SETFL, O_NONBLOCK)` on a dma-buf fd used to return success
+    /// while `F_GETFL` stayed forever at the hardcoded RDWR|CLOEXEC.
+    #[test]
+    fn set_flags_turns_a_blocking_dmabuf_non_blocking() {
+        let vmo = VmObject::new_paged(1);
+        let fd = DmaBuf::new(0, 4096, vmo);
+        assert!(!fd.flags().non_block());
+        assert!(fd.flags().close_on_exec());
+        let mut f = fd.flags();
+        f.set(OpenFlags::NON_BLOCK, true);
+        fd.set_flags(f).unwrap();
+        assert!(fd.flags().non_block() && fd.flags().close_on_exec());
     }
 }

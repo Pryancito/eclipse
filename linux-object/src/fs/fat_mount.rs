@@ -771,21 +771,27 @@ impl INode for FatMountINode {
         if !self.is_dir {
             return Err(FsError::NotDir);
         }
-        if id < 2 {
-            let name = self.get_entry(id)?;
-            return Ok((self.metadata()?, name));
+        match id {
+            // `.` is this directory; `..` must carry the *parent*'s inode
+            // (Linux `filldir`). Reusing `self.metadata()` for both made
+            // every subdirectory report the same `d_ino` for `.` and `..`,
+            // so mount-point / cycle detection via inode numbers broke.
+            0 => Ok((self.metadata()?, String::from("."))),
+            1 => Ok((self.find("..")?.metadata()?, String::from(".."))),
+            i => {
+                let guard = self.fs.inner.lock();
+                let fs = guard.as_ref().ok_or(FsError::DeviceError)?;
+                let entries = self.fs.listing(fs, &self.path)?;
+                drop(guard);
+                let entry = entries.get(i - 2).ok_or(FsError::EntryNotFound)?;
+                let child = FatMountINode {
+                    fs: self.fs.clone(),
+                    path: self.child_path(&entry.name),
+                    is_dir: entry.is_dir,
+                };
+                Ok((child.metadata()?, entry.name.clone()))
+            }
         }
-        let guard = self.fs.inner.lock();
-        let fs = guard.as_ref().ok_or(FsError::DeviceError)?;
-        let entries = self.fs.listing(fs, &self.path)?;
-        drop(guard);
-        let entry = entries.get(id - 2).ok_or(FsError::EntryNotFound)?;
-        let child = FatMountINode {
-            fs: self.fs.clone(),
-            path: self.child_path(&entry.name),
-            is_dir: entry.is_dir,
-        };
-        Ok((child.metadata()?, entry.name.clone()))
     }
 
     fn create(
@@ -1120,6 +1126,36 @@ mod fat_tests {
         assert!(up3.find("a").is_ok());
 
         assert!(b.find(".").unwrap().find("leaf.txt").is_ok());
+    }
+
+    /// `getdents` used to stamp `..` with this directory's own inode, so
+    /// `.` and `..` shared `d_ino` in every subdirectory.
+    #[test]
+    fn dotdot_dirent_carries_the_parent_inode() {
+        let (_blk, fs) = mount_default();
+        let root = fs.root_inode();
+        let a = root.create("a", FileType::Dir, 0o755).unwrap();
+        let b = a.create("b", FileType::Dir, 0o755).unwrap();
+
+        let (dot, _) = b.get_entry_with_metadata(0).unwrap();
+        let (dotdot, name) = b.get_entry_with_metadata(1).unwrap();
+        assert_eq!(name, "..");
+        assert_eq!(
+            dot.inode,
+            b.metadata().unwrap().inode,
+            "`.` must be this directory"
+        );
+        assert_eq!(
+            dotdot.inode,
+            a.metadata().unwrap().inode,
+            "`..` must be the parent, not a clone of `.`"
+        );
+        assert_ne!(dot.inode, dotdot.inode);
+
+        // At the mount root, parent == self (cannot escape the mount).
+        let (root_dot, _) = root.get_entry_with_metadata(0).unwrap();
+        let (root_dotdot, _) = root.get_entry_with_metadata(1).unwrap();
+        assert_eq!(root_dot.inode, root_dotdot.inode);
     }
 
     /// `move_` was not implemented at all, so `mv` on FAT returned ENOSYS.

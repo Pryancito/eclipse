@@ -488,10 +488,7 @@ impl FileLike for PacketSocketState {
     }
 
     fn set_flags(&self, f: OpenFlags) -> LxResult {
-        let mut flags = self.inner.flags.lock();
-        flags.set(OpenFlags::APPEND, f.contains(OpenFlags::APPEND));
-        flags.set(OpenFlags::NON_BLOCK, f.contains(OpenFlags::NON_BLOCK));
-        flags.set(OpenFlags::CLOEXEC, f.contains(OpenFlags::CLOEXEC));
+        self.inner.flags.lock().take_settable(f);
         Ok(())
     }
 
@@ -526,8 +523,10 @@ impl FileLike for PacketSocketState {
         // and the queue is currently empty, sleep briefly and re-poll.
         // Without this, select() returns immediately with read=false every 5 ms
         // (from the executor tick), burning CPU and missing DHCPOFFER/DHCPACK
-        // windows on slow links.
-        if events.contains(PollEvents::IN) && !read && !error {
+        // windows on slow links. `wants_read` (not `contains(IN)`): interest
+        // of RDNORM alone is still a readability wait — same trap tcp/udp/
+        // icmp/unix already fixed.
+        if events.wants_read() && !read && !error {
             kernel_hal::net::NetRxOrTimeoutFuture::new(5).await;
             kernel_hal::deferred_job::drain_deferred_jobs();
             let (read2, write2, error2) = Socket::poll(self, events);

@@ -40,31 +40,8 @@ static HOLD: Mutex<()> = Mutex::new(());
 
 /// The CPU budget `eclipse.tlbhammer=N` asks for. `None` = disabled.
 ///
-/// Read through `kernel_hal::cmdline`, which is the kernel's one parser for
-/// this string, rather than by splitting on `"eclipse.tlbhammer="` -- that had
-/// no notion of a key, so `xeclipse.tlbhammer=6` armed the hammer and so did
-/// the text appearing inside somebody else's value, and it read a value that
-/// is not a number as however many digits it happened to start with.
-///
-/// `=0` DISABLES it. It used to clamp up to three, i.e. the one spelling
-/// anybody reaches for to turn a thing off armed three threads hammering the
-/// TLB instead -- the same kill-switch inversion `cmdline` was written to end.
-pub fn parse_tlbhammer(cmdline: &str) -> Option<usize> {
-    let spelled = kernel_hal::cmdline::value(cmdline, "eclipse.tlbhammer")?;
-    let Some(n) = kernel_hal::cmdline::parse_number(spelled).and_then(|n| usize::try_from(n).ok())
-    else {
-        warn!(
-            "eclipse.tlbhammer={} is not a CPU budget; the hammer stays off",
-            spelled
-        );
-        return None;
-    };
-    if n == 0 {
-        return None;
-    }
-    // Need at least 1 mapper + holder + churn.
-    Some(n.max(3))
-}
+/// Shared with the host-testable crate so the cmdline rules cannot drift.
+pub use zcore_boot_opts::parse_tlbhammer;
 
 /// Spawn the hammer. Call once after SMP is up and the executor is running
 /// (same window as other deferred boot tasks).

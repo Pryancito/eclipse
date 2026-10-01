@@ -148,6 +148,21 @@ pub(crate) fn anon_fd_flags(flags: usize, allowed: usize) -> Result<OpenFlags, L
     Ok(OpenFlags::from_bits_truncate(flags))
 }
 
+/// Decode an `open`/`openat` flag word, or `EINVAL` for any bit this kernel
+/// does not name.
+///
+/// `OpenFlags::from_bits_truncate` alone drops `O_PATH` and `O_TMPFILE` (and
+/// anything else unnamed) in silence, so `openat(..., O_PATH)` used to hand
+/// back a normal readable fd — the same silent lie the FreeBSD personality
+/// already refuses one layer up. Also used by `TIOCGPTPEER`, whose `arg`
+/// is the same open(2) flag word.
+pub(crate) fn open_flags(flags: usize) -> Result<OpenFlags, LxError> {
+    if flags & !OpenFlags::all().bits() != 0 {
+        return Err(LxError::EINVAL);
+    }
+    Ok(OpenFlags::from_bits_truncate(flags))
+}
+
 impl Syscall<'_> {
     /// `timerfd_create(2)`: a timer delivered through a readable fd. The
     /// `wl_event_loop` (libwayland) arms one for all its timers.
@@ -286,7 +301,7 @@ impl Syscall<'_> {
         } else {
             path
         };
-        let flags = OpenFlags::from_bits_truncate(flags);
+        let flags = open_flags(flags)?;
         info!(
             "openat: dir_fd={:?}, path={:?}, flags={:?}, mode={:#o}",
             dir_fd, path, flags, mode
@@ -403,7 +418,11 @@ impl Syscall<'_> {
                         (file_inode, false)
                     }
                     Err(FsError::EntryNotFound) => {
-                        let create_mode = proc.apply_umask(mode as u16);
+                        // `build_open_flags`: `op->mode = mode & S_IALLUGO`.
+                        // Without the mask, `open(..., O_CREAT, 0o100644)`
+                        // left `S_IFREG` in the inode mode (mkdir/mknod
+                        // already strip via `create_perm`).
+                        let create_mode = proc.apply_umask(super::dir::create_perm(mode));
                         let inode =
                             dir_inode.create(file_name, FileType::File, create_mode as u32)?;
                         linux_object::fs::dcache_invalidate();
@@ -1641,13 +1660,25 @@ mod open_flag_tests {
     }
 
     /// `O_PATH` and `O_TMPFILE` stay unnamed on purpose: each changes what the
-    /// descriptor IS, and naming a flag this kernel does not honour is the
-    /// same silent lie as dropping one it should.
+    /// descriptor IS. Truncating them used to hand back a normal readable fd;
+    /// `open_flags` now answers `EINVAL` instead of that silent lie.
     #[test]
-    fn the_flags_this_kernel_does_not_honour_stay_out() {
+    fn the_flags_this_kernel_does_not_honour_are_einval() {
         for bit in [0o10000000usize, 0o20000000] {
-            assert_eq!(OpenFlags::from_bits_truncate(bit), OpenFlags::RDONLY);
+            assert_eq!(
+                open_flags(bit),
+                Err(LxError::EINVAL),
+                "flag {bit:#o} must not open as a normal fd"
+            );
+            assert_eq!(
+                open_flags(bit | OpenFlags::RDONLY.bits() | OpenFlags::CLOEXEC.bits()),
+                Err(LxError::EINVAL),
+                "a valid bit must not hide flag {bit:#o}"
+            );
         }
+        // Known flags still parse.
+        let ok = open_flags(OpenFlags::RDWR.bits() | OpenFlags::CLOEXEC.bits()).unwrap();
+        assert!(ok.readable() && ok.writable() && ok.close_on_exec());
     }
 
     #[test]

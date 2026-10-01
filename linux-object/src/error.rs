@@ -117,6 +117,8 @@ pub enum LxError {
     ENOTSOCK = 88,
     /// Protocol not available
     ENOPROTOOPT = 92,
+    /// Protocol not supported
+    EPROTONOSUPPORT = 93,
     /// Operation not supported
     EOPNOTSUPP = 95,
     /// Protocol family not supported
@@ -200,6 +202,7 @@ impl fmt::Display for LxError {
             EBADFD => "File descriptor in bad state",
             ENOTSOCK => "Socket operation on non-socket",
             ENOPROTOOPT => "Protocol not available",
+            EPROTONOSUPPORT => "Protocol not supported",
             EOPNOTSUPP => "Operation not supported",
             EPFNOSUPPORT => "Protocol family not supported",
             EAFNOSUPPORT => "Address family not supported by protocol",
@@ -374,6 +377,8 @@ mod errno_tests {
             (LxError::EOVERFLOW, 75),
             (LxError::EBADFD, 77),
             (LxError::ENOTSOCK, 88),
+            (LxError::ENOPROTOOPT, 92),
+            (LxError::EPROTONOSUPPORT, 93),
             (LxError::EOPNOTSUPP, 95),
             (LxError::ETIMEDOUT, 110),
             (LxError::ECONNREFUSED, 111),

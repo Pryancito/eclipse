@@ -257,6 +257,23 @@ impl UnixSocketState {
         self.inner.lock().is_listening
     }
 
+    /// Whether `connect_pair` / `mark_connected` has wired a peer. A second
+    /// `connect(2)` must see this and answer `EISCONN`.
+    pub fn is_connected(&self) -> bool {
+        self.inner.lock().connected
+    }
+
+    /// `unix_stream_connect`'s gate before wiring: already connected or a
+    /// listener is `EISCONN`.
+    pub fn may_connect(&self) -> LxResult<()> {
+        let inner = self.inner.lock();
+        if inner.connected || inner.is_listening {
+            Err(LxError::EISCONN)
+        } else {
+            Ok(())
+        }
+    }
+
     /// Mark this socket as connected (used by sys_connect for the client side).
     pub fn mark_connected(&self) {
         self.inner.lock().connected = true;
@@ -523,8 +540,8 @@ impl Future for UnixPollWait<'_> {
                 || (inner.is_listening && !inner.accept_queue.is_empty())
                 || inner.read_closed
                 || peer_gone;
-            let want_read = this.events.contains(PollEvents::IN);
-            let want_write = this.events.contains(PollEvents::OUT);
+            let want_read = this.events.wants_read();
+            let want_write = this.events.wants_write();
             let ready =
                 (want_read && readable) || (want_write && peer_gone) || (!want_read && !want_write);
             if ready {
@@ -767,7 +784,14 @@ impl Socket for UnixSocketState {
     // listen — mark socket as passive
     // -----------------------------------------------------------------------
     fn listen(&self) -> SysResult {
-        self.inner.lock().is_listening = true;
+        // `unix_listen`: no local address (`!u->addr`) is `EINVAL`. Without
+        // the check, `socket(); listen()` succeeded and produced a listener
+        // nothing can connect to (no path in the bind table).
+        let mut inner = self.inner.lock();
+        if inner.path.is_empty() {
+            return Err(LxError::EINVAL);
+        }
+        inner.is_listening = true;
         Ok(0)
     }
 
@@ -1002,16 +1026,7 @@ impl FileLike for UnixSocketState {
     }
 
     fn set_flags(&self, f: OpenFlags) -> LxResult {
-        let mut inner = self.inner.lock();
-        inner
-            .flags
-            .set(OpenFlags::APPEND, f.contains(OpenFlags::APPEND));
-        inner
-            .flags
-            .set(OpenFlags::NON_BLOCK, f.contains(OpenFlags::NON_BLOCK));
-        inner
-            .flags
-            .set(OpenFlags::CLOEXEC, f.contains(OpenFlags::CLOEXEC));
+        self.inner.lock().flags.take_settable(f);
         Ok(())
     }
 
@@ -1113,6 +1128,52 @@ impl FileLike for UnixSocketState {
 mod tests {
     use super::*;
     use alloc::string::String;
+
+    /// FIOASYNC / F_SETFL(O_ASYNC) used to "succeed" on sockets while the
+    /// hand-rolled `set_flags` never copied the bit — same silent lie as
+    /// the missing ASYNC in take_settable before that was fixed.
+    #[test]
+    fn set_flags_keeps_o_async_on_a_socket() {
+        let s = UnixSocketState::new();
+        assert!(!s.flags().contains(OpenFlags::ASYNC));
+        let mut f = s.flags();
+        f.set(OpenFlags::ASYNC, true);
+        s.set_flags(f).unwrap();
+        assert!(
+            s.flags().contains(OpenFlags::ASYNC),
+            "O_ASYNC must survive set_flags so F_GETFL can see it"
+        );
+        f.set(OpenFlags::ASYNC, false);
+        s.set_flags(f).unwrap();
+        assert!(!s.flags().contains(OpenFlags::ASYNC));
+    }
+
+    /// `listen` without `bind` must be `EINVAL` (`unix_listen`: no local
+    /// address). It used to mark the socket listening with an empty path.
+    #[test]
+    fn listen_without_bind_is_einval() {
+        let s = UnixSocketState::new();
+        assert_eq!(Socket::listen(&*s), Err(LxError::EINVAL));
+        Socket::bind(&*s, Endpoint::Unix(String::from("/tmp/listen.sock"))).unwrap();
+        assert!(Socket::listen(&*s).is_ok());
+        assert!(s.is_listening());
+    }
+
+    /// A second `connect` on an already-wired or listening socket is
+    /// `EISCONN`. It used to rewire the peer and queue another accept.
+    #[test]
+    fn a_second_connect_is_eisconn() {
+        let fresh = UnixSocketState::new();
+        assert!(fresh.may_connect().is_ok());
+        let (a, b) = (UnixSocketState::new(), UnixSocketState::new());
+        UnixSocketState::connect_pair(&a, &b);
+        assert_eq!(a.may_connect(), Err(LxError::EISCONN));
+        assert!(a.is_connected());
+        let listener = UnixSocketState::new();
+        Socket::bind(&*listener, Endpoint::Unix(String::from("/tmp/eisconn.sock"))).unwrap();
+        Socket::listen(&*listener).unwrap();
+        assert_eq!(listener.may_connect(), Err(LxError::EISCONN));
+    }
 
     /// Reproduces the X11 connection-setup race: an X client writes its first
     /// bytes (the connection setup) immediately after `connect()`, before the
@@ -1366,6 +1427,47 @@ mod tests {
             }
             other => panic!("POLLOUT expected Ready(write), got {:?}", other),
         }
+    }
+
+    /// `POLLRDNORM` alone is the streams spelling of "readable". Using
+    /// `contains(IN)` made `want_read` false, so the
+    /// `(!want_read && !want_write)` fallback answered Ready on an empty
+    /// socket — the wait never blocked.
+    #[test]
+    fn poll_rdnorm_empty_connected_stays_pending() {
+        use core::task::{RawWaker, RawWakerVTable, Waker};
+
+        fn raw(ptr: *const ()) -> RawWaker {
+            fn clone(ptr: *const ()) -> RawWaker {
+                raw(ptr)
+            }
+            fn wake(_: *const ()) {}
+            fn wake_by_ref(_: *const ()) {}
+            fn drop(_: *const ()) {}
+            RawWaker::new(ptr, &RawWakerVTable::new(clone, wake, wake_by_ref, drop))
+        }
+
+        let a = UnixSocketState::new();
+        let b = UnixSocketState::new();
+        UnixSocketState::connect_pair(&a, &b);
+        let waker = unsafe { Waker::from_raw(raw(core::ptr::null())) };
+        let mut cx = Context::from_waker(&waker);
+        let mut fut = UnixPollWait {
+            sock: &a,
+            events: PollEvents::RDNORM,
+            sub_id: None,
+        };
+        match Pin::new(&mut fut).poll(&mut cx) {
+            Poll::Pending => {}
+            Poll::Ready(Ok(_)) => {
+                panic!("POLLRDNORM on empty connected socket must be Pending, not Ready")
+            }
+            Poll::Ready(Err(e)) => panic!("unexpected err {:?}", e),
+        }
+        assert!(
+            fut.sub_id.is_some(),
+            "RDNORM waiter must park on READABLE like IN"
+        );
     }
 
     /// `unix_stream_read_generic`: `if (sk->sk_state != TCP_ESTABLISHED)

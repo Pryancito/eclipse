@@ -183,7 +183,7 @@ lazy_static::lazy_static! {
 pub struct Epoll {
     base: KObjectBase,
     inner: Mutex<EpollInner>,
-    flags: OpenFlags,
+    flags: Mutex<OpenFlags>,
 }
 
 struct EpollInner {
@@ -223,7 +223,7 @@ impl Epoll {
                 interest_list: BTreeMap::new(),
                 edge: BTreeMap::new(),
             }),
-            flags,
+            flags: Mutex::new(flags),
         })
     }
 
@@ -479,10 +479,14 @@ impl Epoll {
 #[async_trait]
 impl FileLike for Epoll {
     fn flags(&self) -> OpenFlags {
-        self.flags
+        *self.flags.lock()
     }
 
-    fn set_flags(&self, _f: OpenFlags) -> LxResult {
+    fn set_flags(&self, f: OpenFlags) -> LxResult {
+        // Same trap as eventfd/signalfd/timerfd before `take_settable`: a
+        // no-op `Ok(())` made `fcntl(F_SETFL, O_NONBLOCK)` "succeed" while
+        // `F_GETFL` never changed.
+        self.flags.lock().take_settable(f);
         Ok(())
     }
 
@@ -713,6 +717,26 @@ mod tests {
 
     fn epoll() -> Arc<Epoll> {
         Epoll::new(OpenFlags::empty())
+    }
+
+    /// `fcntl(F_SETFL, O_NONBLOCK)` on an epoll fd used to return success
+    /// while leaving the bit clear — the same silent no-op eventfd had
+    /// before `take_settable`.
+    #[test]
+    fn set_flags_turns_a_blocking_epoll_non_blocking() {
+        let ep = epoll();
+        assert!(!ep.flags().non_block());
+        ep.set_flags(OpenFlags::NON_BLOCK).unwrap();
+        assert!(ep.flags().non_block());
+        ep.set_flags(OpenFlags::empty()).unwrap();
+        assert!(!ep.flags().non_block());
+        // F_SETFL goes through `after_setfl`, which keeps CLOEXEC; the ioctl
+        // path mutates a copy of the current flags the same way.
+        let with_cloexec = Epoll::new(OpenFlags::CLOEXEC);
+        let mut f = with_cloexec.flags();
+        f.set(OpenFlags::NON_BLOCK, true);
+        with_cloexec.set_flags(f).unwrap();
+        assert!(with_cloexec.flags().non_block() && with_cloexec.flags().close_on_exec());
     }
 
     /// An eventfd, readable iff `ready`.

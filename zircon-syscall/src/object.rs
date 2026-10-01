@@ -343,8 +343,7 @@ impl Syscall<'_> {
             }
             Topic::HandleCount => {
                 let object = proc.get_dyn_object_with_rights(handle, Rights::INSPECT)?;
-                // FIXME: count Handle instead of Arc
-                output.write(Arc::strong_count(&object) as u32 - 1)?;
+                output.write(proc.count_handles_to(object.id()))?;
             }
             Topic::Job => {
                 let job = proc.get_object_with_rights::<Job>(handle, Rights::INSPECT)?;

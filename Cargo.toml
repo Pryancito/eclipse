@@ -40,6 +40,8 @@ members = [
     # test`, `cargo fmt` or `cargo clippy` line in the tree ever named it**.
     "vendor/region-allocator",
     "hunter",
+    # Host-testable cmdline parsers extracted from zCore (binary stays test=false).
+    "zcore-boot-opts",
 ]
 default-members = ["xtask"]
 exclude = [

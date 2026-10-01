@@ -42,14 +42,18 @@ impl EventFd {
         self.flags().bits() & EFD_SEMAPHORE != 0
     }
 
-    /// Publish readiness from the counter, which is the only thing that makes
-    /// this fd readable.
+    /// Publish readiness from the counter.
     ///
-    /// The bit must never say READABLE while the counter is zero. A blocking
-    /// `read` loops "check the counter, then `wait_for_event(READABLE)`", and
-    /// `wait_for_event` returns immediately when the bit is already set — so a
-    /// set bit over a zero counter is not a spurious wakeup, it is a spin at
-    /// 100 % CPU that never makes progress. `write` used to set the bit for
+    /// READABLE must never be set while the counter is zero (see below).
+    /// WRITABLE is cleared only when the counter sits at `u64::MAX - 1`, the
+    /// ceiling that refuses any further non-zero add — a blocking writer then
+    /// waits on that bit the same way a pipe waits for room.
+    ///
+    /// The READABLE bit must never say ready while the counter is zero. A
+    /// blocking `read` loops "check the counter, then `wait_for_event(READABLE)`",
+    /// and `wait_for_event` returns immediately when the bit is already set —
+    /// so a set bit over a zero counter is not a spurious wakeup, it is a spin
+    /// at 100 % CPU that never makes progress. `write` used to set the bit for
     /// every accepted write, and `write(0)` is legal and adds nothing, which
     /// reached that state on purpose; a reader that drained between a writer's
     /// compare-exchange and its `set` reached it by accident.
@@ -60,10 +64,16 @@ impl EventFd {
     /// counter after the other's change.
     fn publish_readiness(&self) {
         let mut bus = self.eventbus.lock();
-        if self.counter.load(Ordering::SeqCst) > 0 {
+        let counter = self.counter.load(Ordering::SeqCst);
+        if counter > 0 {
             bus.set(Event::READABLE);
         } else {
             bus.clear(Event::READABLE);
+        }
+        if counter < u64::MAX - 1 {
+            bus.set(Event::WRITABLE);
+        } else {
+            bus.clear(Event::WRITABLE);
         }
     }
 }
@@ -138,10 +148,11 @@ impl FileLike for EventFd {
                     return Ok(8);
                 }
             } else {
-                if self.flags().non_block() {
-                    return Err(LxError::EAGAIN);
-                }
-                // TODO: wait for writeable? EventFd is almost always writeable unless overflow
+                // Full: non-blocking writers get EAGAIN; blocking ones also
+                // return EAGAIN here so `sys_write`'s `waits_for_room` path
+                // can `async_poll(OUT)` until a read frees the ceiling — the
+                // same shape as a full pipe. Returning EAGAIN to userspace for
+                // a blocking fd was the bug the TODO below named.
                 return Err(LxError::EAGAIN);
             }
         }
@@ -172,8 +183,22 @@ impl FileLike for EventFd {
             if ready {
                 return Ok(status);
             }
+            // Wait only for the bits the caller asked for. Waiting for
+            // READABLE|WRITABLE always spun when the counter was full (readable
+            // but not writable): READABLE was already set, so wait_for_event
+            // returned at once and the loop never yielded.
+            let mut mask = Event::empty();
+            if want_read {
+                mask |= Event::READABLE;
+            }
+            if want_write {
+                mask |= Event::WRITABLE;
+            }
+            if mask.is_empty() {
+                mask = Event::READABLE | Event::WRITABLE;
+            }
             let bus = self.eventbus.clone();
-            crate::sync::wait_for_event(bus, Event::READABLE | Event::WRITABLE).await?;
+            crate::sync::wait_for_event(bus, mask).await?;
         }
     }
 
@@ -477,6 +502,42 @@ mod tests {
         }
         assert_eq!(u64::from_ne_bytes(buf), 9);
         assert!(!bit_says_readable(&fd));
+    }
+
+    #[test]
+    fn a_blocking_write_parks_on_a_full_counter_and_is_woken_by_a_read() {
+        use core::task::{Context, Poll};
+
+        // Fill to the ceiling so the next non-zero write would overflow.
+        let fd = efd(0, OpenFlags::empty());
+        assert_eq!(fd.write(&(u64::MAX - 1).to_ne_bytes()).unwrap(), 8);
+        assert!(
+            !fd.poll(PollEvents::OUT).unwrap().write,
+            "full counter must not advertise WRITABLE"
+        );
+
+        let (waker, woke) = flag_waker();
+        let mut cx = Context::from_waker(&waker);
+        {
+            let mut fut = fd.async_poll(PollEvents::OUT);
+            assert!(
+                fut.as_mut().poll(&mut cx).is_pending(),
+                "a blocking wait for room on a full eventfd must park"
+            );
+            assert!(!woke(), "nothing has drained yet");
+
+            // Drain: frees the ceiling and must publish WRITABLE.
+            let mut buf = [0u8; 8];
+            assert_eq!(block_on(fd.read(&mut buf)).unwrap(), 8);
+            assert!(woke(), "the parked writer was never woken by the read");
+
+            match fut.as_mut().poll(&mut cx) {
+                Poll::Ready(Ok(s)) => assert!(s.write, "room must be advertised after the drain"),
+                Poll::Ready(Err(e)) => panic!("async_poll failed: {:?}", e),
+                Poll::Pending => panic!("room was there and the wait parked again"),
+            }
+        }
+        assert_eq!(fd.write(&1u64.to_ne_bytes()).unwrap(), 8);
     }
 
     #[test]

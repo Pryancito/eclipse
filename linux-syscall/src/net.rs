@@ -1,4 +1,5 @@
 use super::*;
+use crate::file::{anon_fd_flags, ANON_CLOEXEC, ANON_NONBLOCK};
 use crate::outparams::hand_out_pair;
 use alloc::vec::Vec;
 use core::convert::TryInto;
@@ -13,6 +14,13 @@ use linux_object::{
 const MSG_DONTWAIT: usize = 0x40;
 const MSG_PEEK: usize = 0x2;
 const MSG_NOSIGNAL: usize = 0x4000;
+/// Close-on-exec for fds installed from `SCM_RIGHTS` (`linux/socket.h`).
+const MSG_CMSG_CLOEXEC: usize = 0x4000_0000;
+
+/// Whether `recvmsg`/`recvmmsg` should mark SCM_RIGHTS fds `FD_CLOEXEC`.
+fn scm_rights_cloexec(flags: usize) -> bool {
+    flags & MSG_CMSG_CLOEXEC != 0
+}
 
 /// A socket whose `write` answers `EAGAIN` for "queue full": unix (bounded
 /// peer buffer) and UDP (smoltcp's transmit ring). TCP waits on its own.
@@ -256,8 +264,11 @@ impl Syscall<'_> {
                 return Err(LxError::EINVAL);
             }
         };
-        // socket flags: SOCK_CLOEXEC SOCK_NONBLOCK
-        let flags = OpenFlags::from_bits_truncate(_type & !SOCKET_TYPE_MASK);
+        // Same trap as the old `pipe2` / `eventfd2` path: the high bits of
+        // `type` are only SOCK_CLOEXEC | SOCK_NONBLOCK. Truncating let a
+        // stray bit succeed, and worse, a bit that coincides with some other
+        // `OpenFlags` name (APPEND, …) was applied to the new socket.
+        let flags = anon_fd_flags(_type & !SOCKET_TYPE_MASK, ANON_CLOEXEC | ANON_NONBLOCK)?;
         let protocol_num = protocol;
         let protocol = Protocol::try_from(protocol_num).ok();
 
@@ -317,14 +328,19 @@ impl Syscall<'_> {
             }
             // AF_UNIX sockets
             (Domain::AF_UNIX, _, _) => {
+                // Same gate as `socketpair`: only STREAM/DGRAM/SEQPACKET.
+                // This arm used to take every `SocketType` and implement them
+                // all as a byte stream, so `socket(AF_UNIX, SOCK_RDM, 0)`
+                // succeeded where Linux says `ESOCKTNOSUPPORT`.
+                let socket_type = unix_socket_type(socket_type)?;
+                unix_protocol(protocol_num)?;
                 let s = UnixSocketState::new();
                 // Record our PID so a peer (e.g. seatd) can read it via
                 // SO_PEERCRED when it accepts our connection.
                 s.set_owner_pid(self.zircon_process().id() as i32);
-                // This arm takes EVERY AF_UNIX type, and the implementation is
-                // a byte stream whichever one was asked for. Record the request
-                // anyway: `sendmsg` must not truncate an oversized message on a
-                // socket the user created as a datagram or seqpacket.
+                // Record the request: `sendmsg` must not truncate an oversized
+                // message on a socket the user created as a datagram or
+                // seqpacket.
                 s.set_socket_type(socket_type);
                 s
             }
@@ -359,6 +375,10 @@ impl Syscall<'_> {
 
         if let Endpoint::Unix(path) = &endpoint {
             if let Ok(client) = file_like.clone().downcast_arc::<UnixSocketState>() {
+                // `unix_stream_connect`: already connected (or a listener)
+                // is `EISCONN`. Without the check a second `connect` rewired
+                // the peer and queued another accept silently.
+                client.may_connect()?;
                 // ENOENT / ECONNREFUSED exactly as `UnixSocketState::
                 // resolve_listener` decides (pathname vs abstract, bound
                 // but not listening): this fast path is the one every
@@ -862,9 +882,14 @@ impl Syscall<'_> {
                 let fds = socket.recv_fds(max_fds);
                 if !fds.is_empty() {
                     let proc = self.linux_process();
+                    // Same case as `dup`/`pidfd_getfd`: a new descriptor onto
+                    // an already-open description. `add_file` would copy
+                    // `O_CLOEXEC` from the FileLike (the sender's bit);
+                    // Linux keys it off `MSG_CMSG_CLOEXEC` alone.
+                    let cloexec = scm_rights_cloexec(flags);
                     let mut installed: Vec<i32> = Vec::with_capacity(fds.len());
                     for fl in fds {
-                        installed.push(proc.add_file(fl)?.into());
+                        installed.push(proc.add_file_cloexec(fl, cloexec)?.into());
                     }
                     let cbuf = build_scm_rights_cmsg(&installed);
                     ctrl_written = cbuf.len().min(hdr.msg_controllen);
@@ -970,6 +995,12 @@ impl Syscall<'_> {
     /// shutdown a socket
     pub fn sys_shutdown(&mut self, sockfd: usize, howto: usize) -> SysResult {
         info!("sys_shutdown: sockfd:{}, howto:{}", sockfd, howto);
+        // `__sys_shutdown_sock`: `how > SHUT_RDWR` is `EINVAL` before the
+        // protocol handler runs. Netlink (and any other socket that used to
+        // ignore `howto`) must not turn `shutdown(fd, 99)` into success.
+        if howto > 2 {
+            return Err(LxError::EINVAL);
+        }
         let file_like = self.linux_process().get_file_like(sockfd.into())?;
         file_like.clone().as_socket()?.shutdown(howto)
     }
@@ -1009,11 +1040,7 @@ impl Syscall<'_> {
         // other bit is invalid (GLib's GDBus path only ever passes these two).
         // Previously this ran after accept(), so a bad flag accepted then
         // dropped an established client connection.
-        const SOCK_NONBLOCK: usize = 0o4000;
-        const SOCK_CLOEXEC: usize = 0o2000000;
-        if flags & !(SOCK_NONBLOCK | SOCK_CLOEXEC) != 0 {
-            return Err(LxError::EINVAL);
-        }
+        let new_flags = anon_fd_flags(flags, ANON_CLOEXEC | ANON_NONBLOCK)?;
 
         // smoltcp tcp sockets do not support backlog
         // open multiple sockets for each connection
@@ -1026,8 +1053,7 @@ impl Syscall<'_> {
             new_socket.flags()
         );
 
-        if flags != 0 {
-            let new_flags = OpenFlags::from_bits_truncate(flags);
+        if new_flags.bits() != 0 {
             new_socket.set_flags(new_flags)?;
         }
 
@@ -1086,11 +1112,7 @@ impl Syscall<'_> {
             return Err(LxError::EINVAL);
         }
         let file_like = self.linux_process().get_file_like(sockfd.into())?;
-        let remote_endpoint = file_like
-            .clone()
-            .as_socket()?
-            .remote_endpoint()
-            .ok_or(LxError::EINVAL)?;
+        let remote_endpoint = peer_endpoint(file_like.clone().as_socket()?.remote_endpoint())?;
         SockAddr::from(remote_endpoint).write_to(addr, addrlen)?;
         Ok(0)
     }
@@ -1111,32 +1133,32 @@ impl Syscall<'_> {
         if domain != Domain::AF_UNIX as usize {
             return Err(LxError::EAFNOSUPPORT);
         }
+        // Same gate as `sys_socket`: an unrecognized type is `EINVAL`, not a
+        // silent SOCK_STREAM pair. AF_UNIX only knows STREAM/DGRAM/SEQPACKET
+        // (`unix_create`); anything else named by `SocketType` is
+        // `EOPNOTSUPP` (Linux's `ESOCKTNOSUPPORT`).
+        let socket_type = unix_socketpair_type(_type & SOCKET_TYPE_MASK)?;
+        // `unix_create`: non-zero protocol other than PF_UNIX is
+        // `EPROTONOSUPPORT`. The argument used to be logged and ignored.
+        unix_protocol(protocol)?;
         let proc = self.linux_process();
         let socket1 = Arc::new(UnixSocketState::default());
         let socket2 = Arc::new(UnixSocketState::default());
         UnixSocketState::connect_pair(&socket1, &socket2);
-        // Same as `sys_socket`: keep the requested type so `sendmsg` can tell a
-        // datagram/seqpacket pair from a stream one. `SOCKET_TYPE_MASK` strips
-        // the SOCK_NONBLOCK / SOCK_CLOEXEC bits handled just below; an
-        // unrecognized type leaves the SOCK_STREAM default, which is what this
-        // transport actually is.
-        if let Ok(t) = SocketType::try_from(_type & SOCKET_TYPE_MASK) {
-            socket1.set_socket_type(t);
-            socket2.set_socket_type(t);
-        }
+        socket1.set_socket_type(socket_type);
+        socket2.set_socket_type(socket_type);
         // The type argument packs SOCK_NONBLOCK / SOCK_CLOEXEC alongside the
         // socket type (same bit values as O_NONBLOCK / O_CLOEXEC, like
-        // accept4). These were silently dropped, handing out BLOCKING sockets
-        // to callers whose event loops assume nonblocking semantics —
+        // accept4). These used to be silently dropped, handing out BLOCKING
+        // sockets to callers whose event loops assume nonblocking semantics —
         // Firefox's WaylandProxy (socketpair(AF_UNIX, SOCK_STREAM |
         // SOCK_NONBLOCK | SOCK_CLOEXEC)) drains with read-until-EAGAIN, so a
         // blocking pair wedged its forwarding thread and Wayland startup died
-        // with "ProxiedConnection: broken source socket".
-        const SOCK_NONBLOCK: usize = 0o4000;
-        const SOCK_CLOEXEC: usize = 0o2000000;
-        let flag_bits = _type & (SOCK_NONBLOCK | SOCK_CLOEXEC);
-        if flag_bits != 0 {
-            let new_flags = OpenFlags::from_bits_truncate(flag_bits);
+        // with "ProxiedConnection: broken source socket". Masking only the
+        // two known bits also hid any other flag as success; validate like
+        // `sys_socket` / `accept4`.
+        let new_flags = anon_fd_flags(_type & !SOCKET_TYPE_MASK, ANON_CLOEXEC | ANON_NONBLOCK)?;
+        if new_flags.bits() != 0 {
             socket1.set_flags(new_flags)?;
             socket2.set_flags(new_flags)?;
         }
@@ -1268,6 +1290,44 @@ impl Syscall<'_> {
     }
 }
 
+/// AF_UNIX socket types Linux's `unix_create` accepts. Anything else named
+/// by `SocketType` is `EOPNOTSUPP` (`ESOCKTNOSUPPORT`).
+fn unix_socket_type(t: SocketType) -> Result<SocketType, LxError> {
+    match t {
+        SocketType::SOCK_STREAM | SocketType::SOCK_DGRAM | SocketType::SOCK_SEQPACKET => Ok(t),
+        _ => Err(LxError::EOPNOTSUPP),
+    }
+}
+
+/// AF_UNIX `socketpair`'s type word (already stripped of SOCK_* flags): the
+/// three Linux knows, or the errno it answers for anything else.
+///
+/// An unrecognized value used to be ignored and the pair born as
+/// `SOCK_STREAM`, so `socketpair(AF_UNIX, 99, 0, sv)` succeeded where
+/// `socket` and Linux say `EINVAL`. `socket(AF_UNIX, …)` used the same
+/// silent fallback until it shared [`unix_socket_type`].
+fn unix_socketpair_type(type_bits: usize) -> Result<SocketType, LxError> {
+    let t = SocketType::try_from(type_bits).map_err(|_| LxError::EINVAL)?;
+    unix_socket_type(t)
+}
+
+/// AF_UNIX protocol word (`unix_create`: `if (protocol && protocol !=
+/// PF_UNIX) return -EPROTONOSUPPORT`). Zero and `PF_UNIX`/`AF_UNIX` are
+/// the only values that mean anything; anything else used to succeed.
+fn unix_protocol(protocol: usize) -> Result<(), LxError> {
+    if protocol != 0 && protocol != Domain::AF_UNIX as usize {
+        return Err(LxError::EPROTONOSUPPORT);
+    }
+    Ok(())
+}
+
+/// `getpeername(2)`: no peer is `ENOTCONN`, not `EINVAL` (that one is for a
+/// bad `addr`/`addrlen`). Used to answer `EINVAL`, so callers that probe
+/// before `connect` returns branched on the wrong errno.
+fn peer_endpoint(ep: Option<Endpoint>) -> Result<Endpoint, LxError> {
+    ep.ok_or(LxError::ENOTCONN)
+}
+
 /// The unix-socket control path: passing a file descriptor from one process to
 /// another, which had no tests at all.
 ///
@@ -1319,6 +1379,17 @@ mod scm_rights_tests {
     fn one_message_yields_the_descriptors_it_carries() {
         let ctrl = cmsg(SOL_SOCKET_LEVEL, SCM_RIGHTS, &fd_bytes(&[7, 9, 11]));
         assert_eq!(parse_scm_rights_fds(&ctrl), Ok(vec![7, 9, 11]));
+    }
+
+    /// `MSG_CMSG_CLOEXEC` is the only bit that decides FD_CLOEXEC on the
+    /// installed descriptors — not the sender's `O_CLOEXEC` on the FileLike.
+    #[test]
+    fn msg_cmsg_cloexec_is_the_install_bit() {
+        assert!(!scm_rights_cloexec(0));
+        assert!(!scm_rights_cloexec(MSG_DONTWAIT | MSG_PEEK));
+        assert!(scm_rights_cloexec(MSG_CMSG_CLOEXEC));
+        assert!(scm_rights_cloexec(MSG_CMSG_CLOEXEC | MSG_DONTWAIT));
+        assert_eq!(MSG_CMSG_CLOEXEC, 0x4000_0000);
     }
 
     #[test]
@@ -1721,5 +1792,111 @@ mod read_sockaddr_tests {
         let family = unsafe { sa.family }.to_ne_bytes();
         assert_eq!(family[0], 0x7F, "the one byte declared never arrived");
         assert_eq!(family[1], 0, "a byte the caller did not declare arrived");
+    }
+}
+
+#[cfg(test)]
+mod socket_type_flag_tests {
+    //! `socket` and `socketpair` pack SOCK_NONBLOCK/SOCK_CLOEXEC into the
+    //! type word. The high bits used to go through `from_bits_truncate`, so a
+    //! stray bit was success (or worse, an unrelated `OpenFlags` name).
+
+    use super::*;
+    use crate::file::{anon_fd_flags, ANON_CLOEXEC, ANON_NONBLOCK};
+
+    const SOCK_FLAGS: usize = ANON_CLOEXEC | ANON_NONBLOCK;
+
+    #[test]
+    fn the_two_known_bits_survive_and_nothing_else() {
+        let f = anon_fd_flags(ANON_CLOEXEC | ANON_NONBLOCK, SOCK_FLAGS).unwrap();
+        assert!(f.close_on_exec() && f.non_block());
+        let none = anon_fd_flags(0, SOCK_FLAGS).unwrap();
+        assert!(!none.close_on_exec() && !none.non_block());
+    }
+
+    #[test]
+    fn a_stray_high_bit_is_einval_not_a_working_socket() {
+        // Bit that lands on `OpenFlags::APPEND` if truncated — the silent
+        // mis-apply case, not just the silent-ignore case.
+        const APPEND: usize = 0o2000;
+        assert_eq!(
+            anon_fd_flags(APPEND, SOCK_FLAGS),
+            Err(LxError::EINVAL),
+            "APPEND must not become a socket open flag"
+        );
+        assert_eq!(
+            anon_fd_flags(1usize << 30, SOCK_FLAGS),
+            Err(LxError::EINVAL)
+        );
+        assert_eq!(
+            anon_fd_flags(APPEND | ANON_CLOEXEC, SOCK_FLAGS),
+            Err(LxError::EINVAL),
+            "a valid bit must not hide a stray one"
+        );
+    }
+
+    #[test]
+    fn the_type_nibble_is_stripped_before_the_flag_check() {
+        // Callers pass `SOCK_STREAM | SOCK_NONBLOCK`; only the high bits
+        // reach `anon_fd_flags`.
+        let packed = (SocketType::SOCK_STREAM as usize) | ANON_NONBLOCK;
+        let flag_bits = packed & !SOCKET_TYPE_MASK;
+        let f = anon_fd_flags(flag_bits, SOCK_FLAGS).unwrap();
+        assert!(f.non_block());
+        assert!(!f.close_on_exec());
+    }
+
+    /// `socket` / `socketpair` on AF_UNIX used to accept every `SocketType`
+    /// (or, for socketpair, swallow unknowns as SOCK_STREAM). The three
+    /// Linux knows succeed; garbage is EINVAL; named-but-unsupported types
+    /// are EOPNOTSUPP.
+    #[test]
+    fn af_unix_refuses_a_type_that_is_not_a_unix_type() {
+        assert_eq!(
+            unix_socket_type(SocketType::SOCK_STREAM),
+            Ok(SocketType::SOCK_STREAM)
+        );
+        assert_eq!(
+            unix_socket_type(SocketType::SOCK_DGRAM),
+            Ok(SocketType::SOCK_DGRAM)
+        );
+        assert_eq!(
+            unix_socket_type(SocketType::SOCK_SEQPACKET),
+            Ok(SocketType::SOCK_SEQPACKET)
+        );
+        assert_eq!(
+            unix_socket_type(SocketType::SOCK_RAW),
+            Err(LxError::EOPNOTSUPP)
+        );
+        assert_eq!(
+            unix_socket_type(SocketType::SOCK_RDM),
+            Err(LxError::EOPNOTSUPP)
+        );
+        assert_eq!(
+            unix_socket_type(SocketType::SOCK_PACKET),
+            Err(LxError::EOPNOTSUPP)
+        );
+        assert_eq!(unix_socketpair_type(99), Err(LxError::EINVAL));
+        assert_eq!(unix_socketpair_type(0), Err(LxError::EINVAL));
+        assert_eq!(
+            unix_socketpair_type(SocketType::SOCK_STREAM as usize),
+            Ok(SocketType::SOCK_STREAM)
+        );
+    }
+
+    /// `unix_create` only accepts protocol 0 or `PF_UNIX`. Any other value
+    /// used to succeed on both `socket` and `socketpair`.
+    #[test]
+    fn af_unix_refuses_a_protocol_that_is_not_unix() {
+        assert_eq!(unix_protocol(0), Ok(()));
+        assert_eq!(unix_protocol(Domain::AF_UNIX as usize), Ok(()));
+        assert_eq!(unix_protocol(99), Err(LxError::EPROTONOSUPPORT));
+        assert_eq!(unix_protocol(6), Err(LxError::EPROTONOSUPPORT)); // IPPROTO_TCP
+    }
+
+    /// `getpeername` with no peer must be `ENOTCONN`, not `EINVAL`.
+    #[test]
+    fn getpeername_without_a_peer_is_enotconn() {
+        assert_eq!(peer_endpoint(None).err(), Some(LxError::ENOTCONN));
     }
 }

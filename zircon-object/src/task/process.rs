@@ -749,6 +749,21 @@ impl Process {
         self.inner.lock().get_handle(handle_value)
     }
 
+    /// How many handles in this process refer to the object with `koid`.
+    ///
+    /// Used by `ZX_INFO_HANDLE_COUNT`. The Zircon figure is global; without a
+    /// cross-process registry this answers for the caller's table — still the
+    /// number of *handles*, not `Arc::strong_count` (which also counted every
+    /// kernel-held `Arc`).
+    pub fn count_handles_to(&self, koid: KoID) -> u32 {
+        let inner = self.inner.lock();
+        inner
+            .handles
+            .values()
+            .filter(|(h, _)| h.object.id() == koid)
+            .count() as u32
+    }
+
     /// Get a futex from the process
     pub fn get_futex(&self, addr: &'static AtomicI32) -> Arc<Futex> {
         // The table's sweep hands its victims out rather than dropping them, so

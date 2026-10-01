@@ -184,6 +184,21 @@ fn epoll_create_size(raw: usize) -> Result<usize, LxError> {
     Ok(n as usize)
 }
 
+/// `poll(2)` / `ppoll(2)`'s `nfds`: an `unsigned int`, refused when it
+/// exceeds the soft `RLIMIT_NOFILE` (`do_sys_poll`: `if (nfds >
+/// rlimit(RLIMIT_NOFILE)) return -EINVAL`).
+///
+/// Unchecked, a huge `nfds` made `read_array(nfds)` try to copy an absurd
+/// `pollfd` vector out of userspace before anything else ran — and the
+/// man page's documented `EINVAL` never answered.
+fn poll_nfds(raw: usize, nofile: u64) -> Result<usize, LxError> {
+    let n = raw as u32 as usize;
+    if n as u64 > nofile {
+        return Err(LxError::EINVAL);
+    }
+    Ok(n)
+}
+
 /// What a poll/select pass does once it has scanned every fd and found
 /// nothing ready.
 #[derive(Debug, PartialEq, Eq)]
@@ -282,6 +297,8 @@ impl Syscall<'_> {
         timeout_msecs: isize,
     ) -> SysResult {
         let _ = self.maybe_handle_tty_intr()?;
+        // `nfds > RLIMIT_NOFILE` is EINVAL before the array is touched.
+        let nfds = poll_nfds(nfds, self.linux_process().file_limit().cur)?;
         let mut polls = ufds.read_array(nfds)?;
         info!(
             "poll: ufds: {:?}, nfds: {:?}, timeout_msecs: {}",
@@ -986,10 +1003,13 @@ impl Syscall<'_> {
         // keeps the epoll object itself alive for the whole wait; `wait`
         // likewise holds each watched file by Arc, so the future carries no
         // reference that outlives what it points at.
+        // `get_file_like` answers EBADF for a closed fd; a live fd that is
+        // not an epoll is EINVAL (`do_epoll_wait`), same as `epoll_ctl`
+        // above. Mapping the downcast to EBADF used to erase that distinction.
         let epoll = match self
             .linux_process()
             .get_file_like(epfd)
-            .and_then(|f| f.downcast_arc::<Epoll>().map_err(|_| LxError::EBADF))
+            .and_then(|f| f.downcast_arc::<Epoll>().map_err(|_| LxError::EINVAL))
         {
             Ok(e) => e,
             Err(e) => {
@@ -998,7 +1018,6 @@ impl Syscall<'_> {
             }
         };
 
-        // TODO: handle timeout
         let result = match epoll.wait(maxevents, timeout).await {
             Ok(v) => {
                 if let Err(e) = events.write_array(&v) {
@@ -1597,6 +1616,29 @@ mod poll_tests {
         assert_eq!(select_nfds(0x1_0000_0008), Ok(8));
         // 0xffff_ffff is `int` -1, not four billion fds.
         assert_eq!(select_nfds(0x0000_0000_ffff_ffff), Err(LxError::EINVAL));
+    }
+
+    // ---- poll(2)'s nfds vs RLIMIT_NOFILE ---------------------------------
+
+    #[test]
+    fn poll_nfds_at_or_under_the_limit_is_fine() {
+        assert_eq!(poll_nfds(0, 1024), Ok(0));
+        assert_eq!(poll_nfds(1024, 1024), Ok(1024));
+        assert_eq!(poll_nfds(1, 1), Ok(1));
+    }
+
+    #[test]
+    fn poll_nfds_past_rlimit_nofile_is_einval() {
+        assert_eq!(poll_nfds(1025, 1024), Err(LxError::EINVAL));
+        assert_eq!(poll_nfds(u32::MAX as usize, 1024), Err(LxError::EINVAL));
+    }
+
+    #[test]
+    fn poll_nfds_is_an_unsigned_int_not_a_whole_usize() {
+        // High half discarded: same narrowing as the syscall's `unsigned int`.
+        assert_eq!(poll_nfds(0x1_0000_0008, 1024), Ok(8));
+        // Soft limit unlimited: every unsigned int fits.
+        assert_eq!(poll_nfds(u32::MAX as usize, u64::MAX), Ok(u32::MAX as usize));
     }
 
     // ---- epoll_wait(2)'s maxevents ---------------------------------------

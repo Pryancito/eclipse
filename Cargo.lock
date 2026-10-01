@@ -2945,9 +2945,14 @@ dependencies = [
  "riscv 0.10.1",
  "sbi-rt",
  "spin 0.9.4",
+ "zcore-boot-opts",
  "zcore-loader",
  "zircon-object",
 ]
+
+[[package]]
+name = "zcore-boot-opts"
+version = "0.1.0"
 
 [[package]]
 name = "zcore-drivers"

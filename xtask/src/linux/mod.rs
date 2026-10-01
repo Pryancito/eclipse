@@ -3302,14 +3302,19 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
         .unwrap();
 
         // PulseAudio: system instance over ALSA hw:0,0. Session-agnostic so
-        // both labwc and Xorg get a mixer. wait_path: the HDA PCM node is
-        // created at kernel probe, which can lag the first userspace tick.
+        // both labwc and Xorg get a mixer.
+        //
+        // Do NOT `wait_path = /dev/snd/pcmC0D0p`: start order is alphabetical,
+        // so that wait sat ahead of seatd/labwc and burned a full 8 s on every
+        // machine without HDA (VirtualBox AC97 has no driver here; the node
+        // never appears). Pulse loads the ALSA sink after its socket, and
+        // `eclipse-boot-sound` already polls for a PCM; a missing card just
+        // means no sink, not a delayed desktop.
         fs::write(
             svc_dir.join("pulseaudio.service"),
             b"# PulseAudio sound server (system instance). See eclipse-pulseaudio.\n\
               exec = /usr/local/bin/eclipse-pulseaudio\n\
               type = respawn\n\
-              wait_path = /dev/snd/pcmC0D0p\n\
               log = /tmp/pulseaudio.log\n",
         )
         .unwrap();

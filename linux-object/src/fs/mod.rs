@@ -382,8 +382,9 @@ lazy_static! {
 /// `mmap`/`ftruncate`/`read`/`write` reuse the regular-file machinery. Wayland
 /// (`os_create_anonymous_file`), wlroots and Mesa use this to share xkb keymaps
 /// and shm pools.
-/// `memfd_create(2)` flags. `MFD_HUGETLB` is ignored (there are no huge pages
-/// to back the file with); `MFD_NOEXEC_SEAL` implies sealing is available
+/// `memfd_create(2)` flags. `MFD_HUGETLB` is refused (`EINVAL`): there are
+/// no huge pages to back the file with — same answer as `MAP_HUGETLB` /
+/// `SHM_HUGETLB` here. `MFD_NOEXEC_SEAL` implies sealing is available
 /// (Linux 6.3) and is otherwise a no-op here, since a memfd is never executed.
 pub const MFD_CLOEXEC: usize = 0x0001;
 /// See [`MFD_CLOEXEC`].
@@ -415,21 +416,19 @@ pub const MFD_NAME_MAX_LEN: usize = 255 - "memfd:".len();
 /// `unsigned int`: the bits above it never reached `memfd_create` on Linux, so
 /// they cannot be rejected here either.
 pub fn memfd_args(name: &str, flags: usize) -> LxResult<usize> {
-    /// Where a huge-page size is encoded, and how wide. Only meaningful with
-    /// `MFD_HUGETLB`, so only allowed with it.
-    const MFD_HUGE_SHIFT: usize = 26;
-    /// See [`MFD_HUGE_SHIFT`].
-    const MFD_HUGE_MASK: usize = 63;
     const MFD_ALL_FLAGS: usize =
-        MFD_CLOEXEC | MFD_ALLOW_SEALING | MFD_HUGETLB | MFD_NOEXEC_SEAL | MFD_EXEC;
+        MFD_CLOEXEC | MFD_ALLOW_SEALING | MFD_NOEXEC_SEAL | MFD_EXEC;
 
     let flags = flags & u32::MAX as usize;
-    let allowed = if flags & MFD_HUGETLB != 0 {
-        MFD_ALL_FLAGS | (MFD_HUGE_MASK << MFD_HUGE_SHIFT)
-    } else {
-        MFD_ALL_FLAGS
-    };
-    if flags & !allowed != 0 {
+    // No hugepage pool. Accepting `MFD_HUGETLB` used to hand back a normal
+    // ramfs memfd, so a probe thought it got huge pages (same trap as
+    // `MAP_HUGETLB` / `SHM_HUGETLB` before those were refused). The size
+    // encoding in bits 26..31 is only meaningful with that bit, so it falls
+    // out of the allowed mask with it.
+    if flags & MFD_HUGETLB != 0 {
+        return Err(LxError::EINVAL);
+    }
+    if flags & !MFD_ALL_FLAGS != 0 {
         return Err(LxError::EINVAL);
     }
     // "executable" and "sealed shut against ever becoming executable" are not
@@ -3639,34 +3638,35 @@ mod memfd_args_tests {
         assert_eq!(MFD_NAME_MAX_LEN, 249);
     }
 
-    /// The five that exist come through; anything else is a caller asking for
-    /// a feature, and answering "granted" to a feature this kernel does not
-    /// have is the failure mode the check exists to stop.
+    /// The four that this kernel can honour come through; `MFD_HUGETLB` and
+    /// anything else is a caller asking for a feature, and answering
+    /// "granted" to a feature this kernel does not have is the failure mode
+    /// the check exists to stop.
     #[test]
     fn a_bit_memfd_create_does_not_have_is_einval() {
-        let all = MFD_CLOEXEC | MFD_ALLOW_SEALING | MFD_HUGETLB | MFD_NOEXEC_SEAL;
+        let all = MFD_CLOEXEC | MFD_ALLOW_SEALING | MFD_NOEXEC_SEAL;
         assert_eq!(memfd_args("x", 0), Ok(0));
         assert_eq!(memfd_args("x", all), Ok(all));
         assert_eq!(memfd_args("x", MFD_EXEC), Ok(MFD_EXEC));
-        for bad in [0x20usize, 0x40, 0x80, 0x100, 1 << 20, 1 << 25] {
+        for bad in [MFD_HUGETLB, 0x20usize, 0x40, 0x80, 0x100, 1 << 20, 1 << 25] {
             assert_eq!(memfd_args("x", bad), Err(LxError::EINVAL), "{bad:#x}");
         }
     }
 
-    /// The huge-page size sits in the top six bits, and only means anything
-    /// next to `MFD_HUGETLB`.
+    /// `MFD_HUGETLB` (and its size encoding) used to be accepted and then
+    /// ignored — a normal ramfs memfd answered success. No hugepages here.
     #[test]
-    fn the_huge_page_size_encoding_only_rides_along_with_mfd_hugetlb() {
+    fn hugetlb_is_einval_not_a_silent_normal_memfd() {
         let size_2mb = 21usize << 26;
+        assert_eq!(memfd_args("x", MFD_HUGETLB), Err(LxError::EINVAL));
         assert_eq!(
             memfd_args("x", MFD_HUGETLB | size_2mb),
-            Ok(MFD_HUGETLB | size_2mb)
+            Err(LxError::EINVAL)
         );
         assert_eq!(memfd_args("x", size_2mb), Err(LxError::EINVAL));
-        // The whole field, not just the one size.
         assert_eq!(
-            memfd_args("x", MFD_HUGETLB | (63 << 26)),
-            Ok(MFD_HUGETLB | (63 << 26))
+            new_memfd("huge", MFD_HUGETLB).err(),
+            Some(LxError::EINVAL)
         );
     }
 

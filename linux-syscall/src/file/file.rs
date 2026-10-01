@@ -337,13 +337,16 @@ impl Syscall<'_> {
         self.is_pipe(file_like) || file_like.as_socket().is_ok()
     }
 
-    /// True for a pipe, unix or UDP socket fd without `O_NONBLOCK`: the fds
-    /// whose `write` this syscall waits on, as `pipe_write`,
-    /// `unix_stream_sendmsg` and `sock_alloc_send_skb` do, instead of
-    /// handing the caller the `EAGAIN` that only a non-blocking fd may see.
-    /// (A TCP socket's `write` waits for window on its own, synchronously.)
+    /// True for a pipe, unix/UDP socket, or eventfd without `O_NONBLOCK`: the
+    /// fds whose `write` this syscall waits on, as `pipe_write`,
+    /// `unix_stream_sendmsg`, `sock_alloc_send_skb` and `eventfd_write` do,
+    /// instead of handing the caller the `EAGAIN` that only a non-blocking fd
+    /// may see. (A TCP socket's `write` waits for window on its own,
+    /// synchronously.)
     fn waits_for_room(&self, file_like: &Arc<dyn FileLike>) -> bool {
-        (self.is_pipe(file_like) || self.is_bounded_socket(file_like))
+        (self.is_pipe(file_like)
+            || self.is_bounded_socket(file_like)
+            || file_like.downcast_ref::<linux_object::fs::EventFd>().is_some())
             && !file_like.flags().non_block()
     }
 
@@ -2128,6 +2131,7 @@ impl Syscall<'_> {
         const FIOCLEX: usize = 0x5451;
         const FIONCLEX: usize = 0x5450;
         const FIONREAD: usize = 0x541B;
+        const FIOASYNC: usize = 0x5452;
         match request {
             // FIONREAD/SIOCINQ: bytes waiting to be read. Legal on sockets and
             // pipes, and answered per object kind (see `FileLike::
@@ -2153,6 +2157,18 @@ impl Syscall<'_> {
                 let on = on.read()? != 0;
                 let mut flags = file_like.flags();
                 flags.set(OpenFlags::NON_BLOCK, on);
+                file_like.set_flags(flags)?;
+                return Ok(0);
+            }
+            // Same shape as FIONBIO: nonzero = O_ASYNC / FASYNC on. The
+            // ENOTTY remap below already exempted 0x5452 as a "VFS ioctl
+            // answered elsewhere", but there was no arm here, so the call
+            // still fell through to ENOTTY.
+            FIOASYNC => {
+                let on: UserInPtr<i32> = arg1.into();
+                let on = on.read()? != 0;
+                let mut flags = file_like.flags();
+                flags.set(OpenFlags::ASYNC, on);
                 file_like.set_flags(flags)?;
                 return Ok(0);
             }
@@ -2293,7 +2309,10 @@ impl Syscall<'_> {
                     .downcast_ref::<linux_object::fs::pty::PtyMaster>()
                 {
                     let slave = master.open_peer().ok_or(LxError::ENXIO)?;
-                    let flags = linux_object::fs::OpenFlags::from_bits_truncate(arg1);
+                    // Same open(2) flag word as `openat`: reject unnamed bits
+                    // (O_PATH, O_TMPFILE, …) instead of truncating them into
+                    // a normal peer fd.
+                    let flags = super::open_flags(arg1)?;
                     let path = alloc::format!("/dev/pts/{}", master.pty_id());
                     let peer = linux_object::fs::File::new(slave, flags, path);
                     let fd = proc.add_file(peer)?;
@@ -2605,7 +2624,13 @@ impl Syscall<'_> {
         );
         let proc = self.linux_process();
         let follow = !flags.contains(AtFlags::SYMLINK_NOFOLLOW);
-        let inode = proc.lookup_inode_at(dirfd, path, follow)?;
+        // `AT_EMPTY_PATH` names the file `dirfd` is open on (`do_faccessat`
+        // takes `LOOKUP_EMPTY`); without it an empty path is `ENOENT`.
+        let inode = if flags.contains(AtFlags::EMPTY_PATH) && path.is_empty() {
+            super::dir::inode_of_dirfd(proc, dirfd)?
+        } else {
+            proc.lookup_inode_at(dirfd, path, follow)?
+        };
         let metadata = inode.metadata()?;
         let requested = Self::access_mode(mode)?;
         let use_effective = flags.contains(AtFlags::EACCESS);
@@ -2746,14 +2771,16 @@ impl Syscall<'_> {
                 "utimensat: dirfd: {:?}, pathname: {:?}, times: {:?}, flags: {:#x}",
                 dirfd, pathname, times, flags
             );
-            let follow = if flags == 0 {
-                true
-            } else if flags == AtFlags::SYMLINK_NOFOLLOW.bits() {
-                false
+            let flags = super::dir::at_flags(flags, super::dir::UTIMENSAT_FLAGS)?;
+            let follow = !flags.contains(AtFlags::SYMLINK_NOFOLLOW);
+            // `AT_EMPTY_PATH` names the file `dirfd` is open on
+            // (`do_utimes_path` takes `LOOKUP_EMPTY`); without it an empty
+            // path is `ENOENT`.
+            if flags.contains(AtFlags::EMPTY_PATH) && pathname.is_empty() {
+                super::dir::inode_of_dirfd(proc, dirfd)?
             } else {
-                return Err(LxError::EINVAL);
-            };
-            proc.lookup_inode_at(dirfd, pathname, follow)?
+                proc.lookup_inode_at(dirfd, pathname, follow)?
+            }
         };
         self.apply_utimes(&inode, request)
     }
@@ -2843,9 +2870,12 @@ static_assertions::const_assert_eq!(120, core::mem::size_of::<StatFs>());
 impl From<FsInfo> for StatFs {
     fn from(info: FsInfo) -> Self {
         StatFs {
-            // TODO 文件系统的魔数，需要 rcore-fs 提供一个渠道获取
-            // 但是这个似乎并没有什么用处，新的 vfs 相关函数都去掉了，也许永远填个常数就好了
-            f_type: 0,
+            // Linux `f_type` is the filesystem magic (`statfs(2)`). Until
+            // `FsInfo` carries a real type per mount, a non-zero placeholder
+            // beats `0` (which every userspace probe treats as "unknown" —
+            // `df -T`, busybox, etc.). EXT4_SUPER_MAGIC is the conventional
+            // stand-in the TODO above already contemplated.
+            f_type: 0xEF53,
             f_bsize: info.bsize as _,
             f_blocks: info.blocks as _,
             f_bfree: info.bfree as _,
@@ -2860,6 +2890,28 @@ impl From<FsInfo> for StatFs {
             f_flags: 0,
             f_spare: [0; 4],
         }
+    }
+}
+
+#[cfg(test)]
+mod statfs_type_tests {
+    use super::*;
+
+    #[test]
+    fn f_type_is_a_real_magic_not_zero() {
+        let info = FsInfo {
+            bsize: 4096,
+            frsize: 4096,
+            blocks: 1,
+            bfree: 1,
+            bavail: 1,
+            files: 1,
+            ffree: 1,
+            namemax: 255,
+        };
+        let st: StatFs = info.into();
+        assert_ne!(st.f_type, 0, "userspace treats f_type=0 as unknown FS");
+        assert_eq!(st.f_type, 0xEF53);
     }
 }
 

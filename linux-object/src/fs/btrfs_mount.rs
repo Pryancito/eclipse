@@ -662,7 +662,8 @@ impl INode for BtrfsMountINode {
     fn get_entry_with_metadata(&self, id: usize) -> Result<(Metadata, String)> {
         match id {
             0 => Ok((self.metadata()?, String::from("."))),
-            1 => Ok((self.metadata()?, String::from(".."))),
+            // Same as FAT: `..` must report the parent's inode, not ours.
+            1 => Ok((self.find("..")?.metadata()?, String::from(".."))),
             i => {
                 let entries = self.fs.cached_readdir(self.ino)?;
                 let entry = entries.get(i - 2).ok_or(FsError::EntryNotFound)?;

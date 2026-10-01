@@ -417,10 +417,7 @@ impl FileLike for RawSocketState {
     }
 
     fn set_flags(&self, f: OpenFlags) -> LxResult {
-        let mut flags = self.inner.flags.lock();
-        flags.set(OpenFlags::APPEND, f.contains(OpenFlags::APPEND));
-        flags.set(OpenFlags::NON_BLOCK, f.contains(OpenFlags::NON_BLOCK));
-        flags.set(OpenFlags::CLOEXEC, f.contains(OpenFlags::CLOEXEC));
+        self.inner.flags.lock().take_settable(f);
         Ok(())
     }
 

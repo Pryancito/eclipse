@@ -9376,6 +9376,12 @@ mod flip_latch_tests {
         FLIPS_IN_FLIGHT.store(0, Ordering::Release);
         FLIP_EVENT_PENDING.store(false, Ordering::Release);
         DRM_TIMER_ARMED.store(false, Ordering::Release);
+        // Align the synthetic vblank phase to "just now" so a later
+        // `schedule_flip_event` waits a full refresh period. A mid-period
+        // leftover from an earlier test left only ~1 ms of slack; under libos
+        // that timer could fire (or the lattice catch-up path could deliver
+        // on the spot) before flip-latch assertions ran.
+        DRM_STATE.lock().next_vblank = kernel_hal::timer::timer_now();
     }
 
     /// Queue a flip the way `schedule_flip_event` does, without arming a real
@@ -9542,13 +9548,41 @@ mod flip_latch_tests {
         assert!(FLIP_EVENT_PENDING.load(Ordering::Acquire));
     }
 
-    /// Also puts the next vblank slot in the future as of now: the racer
-    /// goes ahead the moment this returns, and a commit that finds the slot
-    /// already missed delivers its own completion on the spot (see
-    /// `arm_coalesced_drm_timer_locked`), leaving nothing to look at.
+    /// Post the mid-delivery completion and pin the vblank phase.
+    ///
+    /// `next_vblank = now` is set *before* clearing the latch so the racer,
+    /// which wakes in `settle_outstanding_flip` the instant the latch drops,
+    /// sees a fresh phase: `next_vblank_deadline` then returns one full period
+    /// out. Pinning after `queue_flip_event` would race the racer's own
+    /// `schedule_flip_event` against a leftover mid-period slot.
     fn finish_delivery(file: &DrmFileState) {
         DRM_STATE.lock().next_vblank = kernel_hal::timer::timer_now();
         queue_flip_event(file, SYNTH_CRTC_ID, 0xF11D);
+    }
+
+    /// Whether a DRM event with this `user_data` is already on the card fd.
+    fn fd_has_user_data(file: &DrmFileState, want: u64) -> bool {
+        let mut buf = [0u8; 512];
+        let n = match file.read_events(&mut buf) {
+            EventRead::Read(n) => n,
+            _ => return false,
+        };
+        let mut off = 0usize;
+        while off + 16 <= n {
+            let mut len_bytes = [0u8; 4];
+            len_bytes.copy_from_slice(&buf[off + 4..off + 8]);
+            let len = u32::from_ne_bytes(len_bytes) as usize;
+            let mut ud_bytes = [0u8; 8];
+            ud_bytes.copy_from_slice(&buf[off + 8..off + 16]);
+            if u64::from_ne_bytes(ud_bytes) == want {
+                return true;
+            }
+            if len < 16 || off + len > n {
+                break;
+            }
+            off += len;
+        }
+        false
     }
 
     /// Run `f` on another thread -- the compositor's syscall on another CPU
@@ -9647,17 +9681,31 @@ mod flip_latch_tests {
             first_completion_was_on_the_fd,
             "the commit went ahead before the completion reached the fd"
         );
-        // And its own completion is the one now outstanding, queued behind
-        // the one that was delivered.
-        assert_eq!(FLIPS_IN_FLIGHT.load(Ordering::Acquire), 1);
-        assert!(PENDING_DRM_TIMERS.lock().iter().any(|j| matches!(
-            j,
-            PendingDrmTimer::Flip {
-                user_data: 0xA70,
-                ..
-            }
-        )));
-        let_the_armed_timer_fire();
+        // Own completion (user_data 0xA70): normally still paced on the
+        // synthetic vblank. Under libos `timer_set` is an async task, and the
+        // lattice catch-up path can also deliver on the committing thread when
+        // the previous slot is already due -- so by the time we look the event
+        // may already be on the fd. Either form means the mid-delivery wait
+        // worked and the new PAGE_FLIP_EVENT was owed; the bug was EBUSY.
+        let queued_for_vblank = PENDING_DRM_TIMERS.lock().iter().any(|j| {
+            matches!(
+                j,
+                PendingDrmTimer::Flip {
+                    user_data: 0xA70,
+                    ..
+                }
+            )
+        });
+        if queued_for_vblank {
+            assert_eq!(FLIPS_IN_FLIGHT.load(Ordering::Acquire), 1);
+            let_the_armed_timer_fire();
+        } else {
+            assert_eq!(FLIPS_IN_FLIGHT.load(Ordering::Acquire), 0);
+            assert!(
+                fd_has_user_data(&file, 0xA70),
+                "atomic commit with PAGE_FLIP_EVENT must queue or deliver its completion"
+            );
+        }
         reset();
     }
 

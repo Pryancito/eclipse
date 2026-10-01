@@ -63,7 +63,7 @@ const IN_ISDIR: u32 = 0x4000_0000;
 /// `IN_ONESHOT`: remove the watch after its first event.
 pub const IN_ONESHOT: u32 = 0x8000_0000;
 /// `ALL_INOTIFY_BITS`: every bit `inotify_add_watch` knows. A mask with no
-/// bit in it is `EINVAL`.
+/// bit in it, or with any bit outside it, is `EINVAL`.
 pub const ALL_INOTIFY_BITS: u32 = IN_ALL_EVENTS
     | IN_KERNEL_EVENTS
     | IN_ONLYDIR
@@ -84,18 +84,21 @@ pub struct WatchLookup {
     pub only_dir: bool,
 }
 
-/// `inotify_add_watch`'s two refusals of the mask, in its order: no known
-/// bit at all (`!(mask & ALL_INOTIFY_BITS)`, `EINVAL`), then `IN_MASK_ADD`
-/// together with `IN_MASK_CREATE` (`EINVAL`, they contradict). Then how to
-/// look the path up.
+/// `inotify_add_watch`'s mask refusals, in Linux's order: any unknown bit
+/// (`mask & ~ALL_INOTIFY_BITS`, `EINVAL`), then no known bit at all
+/// (`EINVAL`), then `IN_MASK_ADD` together with `IN_MASK_CREATE` (`EINVAL`,
+/// they contradict). Then how to look the path up.
 ///
 /// Nothing was checked, and the path was never looked up at all: a mask of
 /// zero took a watch, `IN_MASK_ADD|IN_MASK_CREATE` took one, and
 /// `inotifywait /nonexistent` reported success and waited forever where
 /// Linux says `ENOENT`, which is the answer glib's `GFileMonitor`, systemd's
 /// path units and Python's watchdog read to fall back to watching the
-/// parent directory.
+/// parent directory. Unknown bits beside a known one used to be ignored too.
 pub fn inotify_watch_lookup(mask: u32) -> LxResult<WatchLookup> {
+    if mask & !ALL_INOTIFY_BITS != 0 {
+        return Err(LxError::EINVAL);
+    }
     if mask & ALL_INOTIFY_BITS == 0 {
         return Err(LxError::EINVAL);
     }
@@ -345,13 +348,11 @@ mod tests {
                 only_dir: false
             })
         );
-        // An unknown bit beside a known one is ignored, as Linux ignores it.
+        // An unknown bit beside a known one is EINVAL in Linux
+        // (`mask & ~ALL_INOTIFY_BITS`), not a silently truncated success.
         assert_eq!(
             inotify_watch_lookup(IN_MODIFY | 0x0000_1000 | IN_DONT_FOLLOW | IN_ONLYDIR),
-            Ok(WatchLookup {
-                follow: false,
-                only_dir: true
-            })
+            Err(LxError::EINVAL)
         );
         // The lookup flags alone are a mask with a known bit.
         assert!(inotify_watch_lookup(IN_ONLYDIR).is_ok());
