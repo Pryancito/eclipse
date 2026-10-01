@@ -416,8 +416,7 @@ pub const MFD_NAME_MAX_LEN: usize = 255 - "memfd:".len();
 /// `unsigned int`: the bits above it never reached `memfd_create` on Linux, so
 /// they cannot be rejected here either.
 pub fn memfd_args(name: &str, flags: usize) -> LxResult<usize> {
-    const MFD_ALL_FLAGS: usize =
-        MFD_CLOEXEC | MFD_ALLOW_SEALING | MFD_NOEXEC_SEAL | MFD_EXEC;
+    const MFD_ALL_FLAGS: usize = MFD_CLOEXEC | MFD_ALLOW_SEALING | MFD_NOEXEC_SEAL | MFD_EXEC;
 
     let flags = flags & u32::MAX as usize;
     // No hugepage pool. Accepting `MFD_HUGETLB` used to hand back a normal
@@ -3664,10 +3663,7 @@ mod memfd_args_tests {
             Err(LxError::EINVAL)
         );
         assert_eq!(memfd_args("x", size_2mb), Err(LxError::EINVAL));
-        assert_eq!(
-            new_memfd("huge", MFD_HUGETLB).err(),
-            Some(LxError::EINVAL)
-        );
+        assert_eq!(new_memfd("huge", MFD_HUGETLB).err(), Some(LxError::EINVAL));
     }
 
     /// "executable" and "sealed shut against ever becoming executable" are not

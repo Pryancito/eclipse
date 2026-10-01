@@ -1638,7 +1638,10 @@ mod poll_tests {
         // High half discarded: same narrowing as the syscall's `unsigned int`.
         assert_eq!(poll_nfds(0x1_0000_0008, 1024), Ok(8));
         // Soft limit unlimited: every unsigned int fits.
-        assert_eq!(poll_nfds(u32::MAX as usize, u64::MAX), Ok(u32::MAX as usize));
+        assert_eq!(
+            poll_nfds(u32::MAX as usize, u64::MAX),
+            Ok(u32::MAX as usize)
+        );
     }
 
     // ---- epoll_wait(2)'s maxevents ---------------------------------------

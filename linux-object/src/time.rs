@@ -1041,10 +1041,14 @@ mod time_tests {
             );
             // The two legal words still sleep.
             assert!(plan_clock_nanosleep(clock, 0, Duration::from_millis(1), now, now).is_ok());
-            assert!(
-                plan_clock_nanosleep(clock, TIMER_ABSTIME, now + Duration::from_secs(1), now, now)
-                    .is_ok()
-            );
+            assert!(plan_clock_nanosleep(
+                clock,
+                TIMER_ABSTIME,
+                now + Duration::from_secs(1),
+                now,
+                now
+            )
+            .is_ok());
         }
     }
 

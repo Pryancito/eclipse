@@ -2303,7 +2303,11 @@ impl VMObjectPagedInner {
         // info.num_children = if self.type_.is_hidden() { 2 } else { 0 };
         // Drop already ran `forget_mapping` without pruning this list, so dead
         // weaks linger until the next `remove_mapping`. Count only the live ones.
-        let live_mappings = self.mappings.iter().filter(|m| m.strong_count() > 0).count() as u64;
+        let live_mappings = self
+            .mappings
+            .iter()
+            .filter(|m| m.strong_count() > 0)
+            .count() as u64;
         info.num_mappings = live_mappings;
         // Unique address spaces would need an aspace id on each mapping; until
         // then the live mapping count is the honest figure (never dead weaks).

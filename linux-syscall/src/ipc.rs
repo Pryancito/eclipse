@@ -1903,14 +1903,8 @@ mod shmctl_subject_tests {
     /// but they must not be reported as unknown.
     #[test]
     fn lock_and_unlock_are_named_id_commands() {
-        assert_eq!(
-            shmctl_subject(ShmctlCmds::SHM_LOCK, 1),
-            IpcSubject::Id(1)
-        );
-        assert_eq!(
-            shmctl_subject(ShmctlCmds::SHM_UNLOCK, 1),
-            IpcSubject::Id(1)
-        );
+        assert_eq!(shmctl_subject(ShmctlCmds::SHM_LOCK, 1), IpcSubject::Id(1));
+        assert_eq!(shmctl_subject(ShmctlCmds::SHM_UNLOCK, 1), IpcSubject::Id(1));
         assert_eq!(ShmctlCmds::try_from(11usize), Ok(ShmctlCmds::SHM_LOCK));
         assert_eq!(ShmctlCmds::try_from(12usize), Ok(ShmctlCmds::SHM_UNLOCK));
         assert!(ShmctlCmds::try_from(99usize).is_err());
@@ -2035,10 +2029,7 @@ mod shmat_place_tests {
             sem_flags(SemFlags::IPC_NOWAIT.bits()),
             Ok(SemFlags::IPC_NOWAIT)
         );
-        assert_eq!(
-            sem_flags(SemFlags::SEM_UNDO.bits()),
-            Ok(SemFlags::SEM_UNDO)
-        );
+        assert_eq!(sem_flags(SemFlags::SEM_UNDO.bits()), Ok(SemFlags::SEM_UNDO));
         assert_eq!(
             sem_flags((SemFlags::IPC_NOWAIT | SemFlags::SEM_UNDO).bits()),
             Ok(SemFlags::IPC_NOWAIT | SemFlags::SEM_UNDO)
@@ -2092,10 +2083,7 @@ mod shmat_place_tests {
     /// free placement that pretends the flag was never set.
     #[test]
     fn shm_remap_with_a_null_address_is_einval() {
-        assert_eq!(
-            shmat_flags_and_place(SHM_REMAP, 0),
-            Err(LxError::EINVAL)
-        );
+        assert_eq!(shmat_flags_and_place(SHM_REMAP, 0), Err(LxError::EINVAL));
         assert_eq!(
             shmat_flags_and_place(SHM_REMAP | SHM_RDONLY | SHM_RND, 0),
             Err(LxError::EINVAL),
