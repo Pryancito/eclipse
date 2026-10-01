@@ -1126,6 +1126,47 @@ fn is_vm_abs_tablet(vid: u16, pid: u16, proto: u8) -> bool {
     (vid == VBOX_USB_TABLET_VID && pid == VBOX_USB_TABLET_PID) || vid == QEMU_USB_VID
 }
 
+/// Whether enumeration reads an interface's report descriptor: every
+/// interface that has one, except a boot keyboard (decoded with the fixed boot
+/// layout) and a VM tablet (decoded with its known VM layout).
+///
+/// A mouse is NOT an exception, even when `bInterfaceProtocol` already says
+/// "mouse". Almost every real USB mouse is boot subclass with protocol 2, and
+/// we used to classify it by those two fields alone and never read its
+/// descriptor. With no layout, `hid_protocol_request` then asked for BOOT
+/// protocol, whose report is three bytes with no wheel in it: the pointer
+/// moved and the wheel was dead, on every real mouse, with nothing logged.
+/// QEMU's `usb-mouse` hid it by sending its wheel byte in boot protocol too.
+fn reads_report_descriptor(proto: u8, vid: u16, pid: u16, report_desc_len: u16) -> bool {
+    report_desc_len > 0 && proto != HID_PROTO_KEY && !is_vm_abs_tablet(vid, pid, proto)
+}
+
+/// What an interface keeps from its parsed report descriptor. `class` is what
+/// the descriptor classified as; `mouse_by_protocol` is true when the
+/// interface's own protocol fields already made it a mouse.
+fn iface_desc_info(class: HidClass, parsed: HidDescInfo, mouse_by_protocol: bool) -> HidDescInfo {
+    HidDescInfo {
+        // Only a mouse-classified interface gets a pointer layout; the
+        // largest-report size matters for every interface's TD sizing.
+        mouse: if class == HidClass::Mouse {
+            parsed.mouse
+        } else {
+            MouseReports::default()
+        },
+        // The keyboard layout, on the other hand, is kept whatever the
+        // interface classified as: a combo receiver classifies as Mouse (it
+        // has relative X/Y) and still carries the keyboard reports, and so
+        // does a gaming mouse with macro keys. On an interface that is a
+        // mouse by protocol, though, a keyboard report WITHOUT a Report ID
+        // would claim every report on the endpoint, the mouse's included, so
+        // only one under its own ID is kept there.
+        key: parsed
+            .key
+            .filter(|k| !mouse_by_protocol || k.report_id.is_some()),
+        max_report_bytes: parsed.max_report_bytes,
+    }
+}
+
 /// How to drive a protocol-0 HID interface after sniffing its report descriptor.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum HidClass {
@@ -3321,17 +3362,26 @@ impl XhciInner {
         if proto == HID_PROTO_KEY {
             return Ok(HID_PROTO_KEY);
         }
-        if proto == HID_PROTO_MOUSE || (proto == 0 && subclass == HID_SUBCLASS_BOOT) {
+        let mouse_by_protocol =
+            proto == HID_PROTO_MOUSE || (proto == 0 && subclass == HID_SUBCLASS_BOOT);
+        let sniffed = if reads_report_descriptor(proto, vid, pid, report_desc_len) {
+            self.sniff_hid_report(
+                slot,
+                iface,
+                report_desc_len,
+                mouse_by_protocol,
+                desc_out,
+                parsed_out,
+            )
+            .unwrap_or(HidClass::Unknown)
+        } else {
+            HidClass::Unknown
+        };
+        if mouse_by_protocol {
             return Ok(HID_PROTO_MOUSE);
         }
         // protocol 0: real hardware. Never default this to tablet — that flag
         // silences PS/2 and boot-protocol USB mice (keyboard still works).
-        let sniffed = if report_desc_len > 0 {
-            self.sniff_hid_report(slot, iface, report_desc_len, desc_out, parsed_out)
-                .unwrap_or(HidClass::Unknown)
-        } else {
-            HidClass::Unknown
-        };
         let role = match sniffed {
             HidClass::Key => HID_PROTO_KEY,
             HidClass::Mouse => HID_PROTO_MOUSE,
@@ -3366,6 +3416,7 @@ impl XhciInner {
         slot: u8,
         iface: u8,
         report_desc_len: u16,
+        mouse_by_protocol: bool,
         desc_out: &mut ([u8; REPORT_DESC_SNAPSHOT], usize),
         parsed_out: &mut HidDescInfo,
     ) -> Option<HidClass> {
@@ -3411,21 +3462,7 @@ impl XhciInner {
         desc_out.0[..keep].copy_from_slice(&raw[..keep]);
         desc_out.1 = keep;
         let class = classify_hid_report(&raw);
-        let parsed = parse_hid_descriptor(&raw);
-        *parsed_out = HidDescInfo {
-            // Only a mouse-classified interface gets a pointer layout; the
-            // largest-report size matters for every interface's TD sizing.
-            mouse: if class == HidClass::Mouse {
-                parsed.mouse
-            } else {
-                MouseReports::default()
-            },
-            // The keyboard layout, on the other hand, is kept whatever the
-            // interface classified as: a combo receiver classifies as Mouse
-            // (it has relative X/Y) and still carries the keyboard reports.
-            key: parsed.key,
-            max_report_bytes: parsed.max_report_bytes,
-        };
+        *parsed_out = iface_desc_info(class, parse_hid_descriptor(&raw), mouse_by_protocol);
         Some(class)
     }
 
@@ -5446,6 +5483,54 @@ mod tests {
             hid_protocol_request(HID_PROTO_KEY, &kbd),
             HID_PROTOCOL_REPORT
         );
+    }
+
+    #[test]
+    fn a_boot_mouse_reads_its_descriptor_and_is_put_in_report_protocol() {
+        // Moebius's mouse, 30fa:0400: boot subclass, bInterfaceProtocol 2.
+        // Its descriptor was never read, so it had no layout, was asked for
+        // boot protocol and sent three-byte reports with no wheel in them.
+        assert!(reads_report_descriptor(HID_PROTO_MOUSE, 0x30fa, 0x0400, 67));
+        assert!(reads_report_descriptor(0, 0x30fa, 0x0400, 67));
+        let info = iface_desc_info(
+            classify_hid_report(MOUSE_5BTN_12BIT),
+            parse_hid_descriptor(MOUSE_5BTN_12BIT),
+            true,
+        );
+        assert!(info.mouse.has_wheel());
+        assert_eq!(
+            hid_protocol_request(HID_PROTO_MOUSE, &info),
+            HID_PROTOCOL_REPORT
+        );
+    }
+
+    #[test]
+    fn a_boot_keyboard_a_vm_tablet_and_no_descriptor_are_not_read() {
+        assert!(!reads_report_descriptor(HID_PROTO_KEY, 0x30fa, 0x0400, 63));
+        assert!(!reads_report_descriptor(0, QEMU_USB_VID, 0x0001, 74));
+        assert!(!reads_report_descriptor(HID_PROTO_MOUSE, 0x30fa, 0x0400, 0));
+    }
+
+    #[test]
+    fn a_mouse_by_protocol_keeps_only_a_keyboard_report_with_its_own_id() {
+        // A keyboard report with no Report ID would take every report on the
+        // endpoint, the mouse's included.
+        let mut parsed = parse_hid_descriptor(MOUSE_5BTN_12BIT);
+        parsed.key = Some(BOOT_KEY_LAYOUT);
+        let class = classify_hid_report(MOUSE_5BTN_12BIT);
+        assert_eq!(iface_desc_info(class, parsed, true).key, None);
+        assert_eq!(
+            iface_desc_info(class, parsed, false).key,
+            Some(BOOT_KEY_LAYOUT)
+        );
+        let combo = parse_hid_descriptor(COMBO_RECEIVER);
+        assert!(combo.key.unwrap().report_id.is_some());
+        let class = classify_hid_report(COMBO_RECEIVER);
+        assert_eq!(iface_desc_info(class, combo, true).key, combo.key);
+        // And the pointer layout still follows what the descriptor is.
+        let kbd = parse_hid_descriptor(KBD_WITH_CONSUMER);
+        let class = classify_hid_report(KBD_WITH_CONSUMER);
+        assert!(iface_desc_info(class, kbd, true).mouse.is_empty());
     }
 
     #[test]
