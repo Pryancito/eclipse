@@ -983,9 +983,8 @@ pub(crate) const FCHOWNAT_FLAGS: usize =
 /// `AT_EMPTY_PATH` has been legal since Linux 5.8; without it here,
 /// `faccessat2(fd, "", mode, AT_EMPTY_PATH)` was `EINVAL` before the inode
 /// of `fd` was ever looked at.
-pub(crate) const FACCESSAT_FLAGS: usize = AtFlags::EACCESS.bits()
-    | AtFlags::SYMLINK_NOFOLLOW.bits()
-    | AtFlags::EMPTY_PATH.bits();
+pub(crate) const FACCESSAT_FLAGS: usize =
+    AtFlags::EACCESS.bits() | AtFlags::SYMLINK_NOFOLLOW.bits() | AtFlags::EMPTY_PATH.bits();
 
 /// What `fchmodat2(2)` accepts (`do_fchmodat`, `fs/open.c`), which is what
 /// the FreeBSD `fchmodat` translation hands `sys_fchmodat`; the Linux
@@ -1592,9 +1591,8 @@ mod at_flags_tests {
     /// used to omit it, so the flag never reached `sys_faccessat`.
     #[test]
     fn faccessat_accepts_at_empty_path() {
-        let flags = AtFlags::EACCESS.bits()
-            | AtFlags::SYMLINK_NOFOLLOW.bits()
-            | AtFlags::EMPTY_PATH.bits();
+        let flags =
+            AtFlags::EACCESS.bits() | AtFlags::SYMLINK_NOFOLLOW.bits() | AtFlags::EMPTY_PATH.bits();
         let parsed = at_flags(flags, FACCESSAT_FLAGS).unwrap();
         assert!(parsed.contains(AtFlags::EACCESS));
         assert!(parsed.contains(AtFlags::SYMLINK_NOFOLLOW));

@@ -3073,7 +3073,9 @@ mod clone3_tests {
             Err(LxError::EINVAL)
         );
         // Known flags still decode.
-        assert!(clone3_to_clone(args(CloneFlags::VFORK.bits() as u64, 0, 0, 0, 0, 0, 0, 0)).is_ok());
+        assert!(
+            clone3_to_clone(args(CloneFlags::VFORK.bits() as u64, 0, 0, 0, 0, 0, 0, 0)).is_ok()
+        );
     }
 
     /// Legacy `clone` truncates the same unknown bits; it must refuse them

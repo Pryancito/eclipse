@@ -1170,7 +1170,11 @@ mod tests {
         assert_eq!(a.may_connect(), Err(LxError::EISCONN));
         assert!(a.is_connected());
         let listener = UnixSocketState::new();
-        Socket::bind(&*listener, Endpoint::Unix(String::from("/tmp/eisconn.sock"))).unwrap();
+        Socket::bind(
+            &*listener,
+            Endpoint::Unix(String::from("/tmp/eisconn.sock")),
+        )
+        .unwrap();
         Socket::listen(&*listener).unwrap();
         assert_eq!(listener.may_connect(), Err(LxError::EISCONN));
     }

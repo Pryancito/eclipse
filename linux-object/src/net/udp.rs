@@ -414,9 +414,7 @@ impl Socket for UdpSocketState {
             let socket = sets.get::<UdpSocket>(inner.handle.0);
             (socket.can_recv(), socket.can_send())
         };
-        if (events.wants_read() && !recv_state)
-            || (events.wants_write() && !send_state)
-        {
+        if (events.wants_read() && !recv_state) || (events.wants_write() && !send_state) {
             crate::net::drain_net_tick();
         }
 
@@ -624,9 +622,7 @@ impl FileLike for UdpSocketState {
 
     async fn async_poll(&self, events: PollEvents) -> LxResult<PollStatus> {
         let (mut read, mut write, mut error) = Socket::poll(self, events);
-        let ready = (events.wants_read() && read)
-            || (events.wants_write() && write)
-            || error;
+        let ready = (events.wants_read() && read) || (events.wants_write() && write) || error;
         if !ready {
             kernel_hal::net::NetRxOrTimeoutFuture::new(5).await;
             (read, write, error) = Socket::poll(self, events);

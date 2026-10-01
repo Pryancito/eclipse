@@ -346,7 +346,9 @@ impl Syscall<'_> {
     fn waits_for_room(&self, file_like: &Arc<dyn FileLike>) -> bool {
         (self.is_pipe(file_like)
             || self.is_bounded_socket(file_like)
-            || file_like.downcast_ref::<linux_object::fs::EventFd>().is_some())
+            || file_like
+                .downcast_ref::<linux_object::fs::EventFd>()
+                .is_some())
             && !file_like.flags().non_block()
     }
 
