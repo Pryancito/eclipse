@@ -189,6 +189,25 @@ impl FileLike for EventFd {
             waker,
         ))
     }
+
+    fn readiness_seq(&self) -> Option<u64> {
+        Some(self.eventbus.lock().seq())
+    }
+
+    fn subscribe_edge(
+        &self,
+        events: PollEvents,
+        waker: &core::task::Waker,
+        seen: u64,
+    ) -> Option<crate::sync::ReadinessSub> {
+        let mask = super::poll_events_to_bus_mask(events);
+        Some(crate::sync::subscribe_edge_on(
+            &self.eventbus,
+            mask,
+            waker,
+            seen,
+        ))
+    }
 }
 
 #[cfg(test)]

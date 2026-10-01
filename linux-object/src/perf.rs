@@ -1239,7 +1239,7 @@ fn render_ktop(t: &kernel_hal::ktop::Taken, name: impl Fn(u64) -> String) -> Str
     };
     for (title, rows) in [("SELF", sorted(leaf)), ("TOTAL", sorted(total))] {
         let _ = writeln!(out);
-        let _ = writeln!(out, "  {:>7}  {:>8}  {}", title, "SAMPLES", "FUNCTION");
+        let _ = writeln!(out, "  {:>7}  {:>8}  FUNCTION", title, "SAMPLES");
         for (a, n) in rows.into_iter().take(KTOP_ROWS) {
             let _ = writeln!(out, "  {:>6.2}%  {:>8}  {}", ktop_pct(n, kept), n, name(a));
         }
@@ -1249,8 +1249,8 @@ fn render_ktop(t: &kernel_hal::ktop::Taken, name: impl Fn(u64) -> String) -> Str
     let _ = writeln!(out);
     let _ = writeln!(
         out,
-        "  {:>7}  {:>8}  {}",
-        "PATHS", "SAMPLES", "CALL PATH (leaf <- callers)"
+        "  {:>7}  {:>8}  CALL PATH (leaf <- callers)",
+        "PATHS", "SAMPLES"
     );
     for (path, n) in paths.into_iter().take(KTOP_ROWS) {
         let names: Vec<String> = path

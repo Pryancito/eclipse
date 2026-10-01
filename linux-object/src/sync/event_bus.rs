@@ -59,12 +59,21 @@ pub struct EventBus {
     callbacks: Vec<(u64, EventHandler)>,
     /// counter for subscription IDs
     next_id: u64,
+    /// How many times a producer has published readiness (`set`/`change`
+    /// with a non-empty `set`), whether or not the flags changed. A level does
+    /// not move when data lands on a file that already had some, and an
+    /// edge-triggered `epoll` still owes its waiter an event for it: this is
+    /// the counter it compares against. See [`EventBus::subscribe_edge`].
+    seq: u64,
+    /// Waiters parked by [`EventBus::subscribe_edge`]: `(id, mask, waker)`.
+    edges: Vec<(u64, Event, core::task::Waker)>,
 }
 impl core::fmt::Debug for EventBus {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("EventBus")
             .field("event", &self.event)
             .field("callbacks_len", &self.callbacks.len())
+            .field("seq", &self.seq)
             .finish()
     }
 }
@@ -94,6 +103,19 @@ impl EventBus {
     /// cannot deadlock holding this mutex, and late `subscribe`s during fire
     /// are preserved.
     pub fn change(&mut self, reset: Event, set: Event) {
+        if !set.is_empty() {
+            self.seq = self.seq.wrapping_add(1);
+            if !self.edges.is_empty() {
+                self.edges.retain(|(_, mask, waker)| {
+                    if mask.intersects(set) {
+                        waker.wake_by_ref();
+                        false
+                    } else {
+                        true
+                    }
+                });
+            }
+        }
         let orig = self.event;
         let mut new = self.event;
         new.remove(reset);
@@ -178,11 +200,46 @@ impl EventBus {
     /// Unsubscribe a previously registered callback by its ID.
     pub fn unsubscribe(&mut self, id: u64) {
         self.callbacks.retain(|(item_id, _)| *item_id != id);
+        self.edges.retain(|(item_id, _, _)| *item_id != id);
+    }
+
+    /// The publication counter (see the `seq` field).
+    pub fn seq(&self) -> u64 {
+        self.seq
+    }
+
+    /// Park `waker` until a producer next publishes an event in `mask`, even
+    /// one that leaves the flags as they were: edge-triggered `epoll`.
+    ///
+    /// [`EventBus::subscribe`] cannot do this. It fires at once on a latched
+    /// flag, and an edge-triggered waiter that has already been told about a
+    /// readable file would be woken by that latch forever: the spin this
+    /// exists to end. It fires only on a *change* of the flags, too, and a
+    /// second write to a file that is already readable changes none.
+    ///
+    /// `seen` is the [`EventBus::seq`] the waiter last looked at, read before
+    /// it looked at the file's level. If anything was published since, the
+    /// waker fires here and `None` is returned, so no publication between that
+    /// look and this call can be missed.
+    pub fn subscribe_edge(
+        &mut self,
+        mask: Event,
+        waker: &core::task::Waker,
+        seen: u64,
+    ) -> Option<u64> {
+        if self.seq != seen {
+            waker.wake_by_ref();
+            return None;
+        }
+        let id = self.next_id;
+        self.next_id = self.next_id.wrapping_add(1);
+        self.edges.push((id, mask, waker.clone()));
+        Some(id)
     }
 
     /// get the callback vector length
     pub fn get_callback_len(&self) -> usize {
-        self.callbacks.len()
+        self.callbacks.len() + self.edges.len()
     }
 }
 
@@ -246,6 +303,25 @@ pub fn subscribe_readiness_on(
     waker: &core::task::Waker,
 ) -> ReadinessSub {
     match subscribe_waker(&mut bus.lock(), mask, waker) {
+        Some(id) => {
+            let bus = bus.clone();
+            ReadinessSub::new(Box::new(move || {
+                bus.lock().unsubscribe(id);
+            }))
+        }
+        None => ReadinessSub::noop(),
+    }
+}
+
+/// [`EventBus::subscribe_edge`] + RAII handle for the `Arc<Mutex<EventBus>>`
+/// bus owners, as [`subscribe_readiness_on`] is for level subscriptions.
+pub fn subscribe_edge_on(
+    bus: &Arc<Mutex<EventBus>>,
+    mask: Event,
+    waker: &core::task::Waker,
+    seen: u64,
+) -> ReadinessSub {
+    match bus.lock().subscribe_edge(mask, waker, seen) {
         Some(id) => {
             let bus = bus.clone();
             ReadinessSub::new(Box::new(move || {

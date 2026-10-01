@@ -188,6 +188,33 @@ impl Pipe {
         }
     }
 
+    /// The pipe's publication counter (see `FileLike::readiness_seq`). One
+    /// bus serves both ends, so it also moves for the other end's events.
+    pub fn readiness_seq(&self) -> u64 {
+        self.data.lock().eventbus.seq()
+    }
+
+    /// Park `waker` for the pipe's next published event in `events` (see
+    /// `FileLike::subscribe_edge`).
+    pub fn subscribe_edge(
+        &self,
+        events: crate::fs::PollEvents,
+        waker: &core::task::Waker,
+        seen: u64,
+    ) -> crate::sync::ReadinessSub {
+        let mask = crate::fs::poll_events_to_bus_mask(events);
+        let id = self.data.lock().eventbus.subscribe_edge(mask, waker, seen);
+        match id {
+            Some(id) => {
+                let data = self.data.clone();
+                crate::sync::ReadinessSub::new(Box::new(move || {
+                    data.lock().eventbus.unsubscribe(id);
+                }))
+            }
+            None => crate::sync::ReadinessSub::noop(),
+        }
+    }
+
     /// Nominal capacity, as reported by `fcntl(F_GETPIPE_SZ)`. Shared between
     /// both ends, like the kernel's pipe buffer is.
     pub fn capacity(&self) -> usize {
