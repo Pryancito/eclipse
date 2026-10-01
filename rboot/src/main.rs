@@ -466,10 +466,28 @@ fn init_graphic(bs: &BootServices, resolution: Resolution) -> (GraphicInfo, [u8;
             }
         }
     }
+    // `GraphicsOutput::frame_buffer()` asserts the current mode is not
+    // `BltOnly` (uefi 0.26), so ask before touching it: a firmware that only
+    // offers `BltOnly` modes has no linear framebuffer, and that must boot
+    // without one rather than panic in the loader. Zero is exactly what the
+    // kernel reads as "no framebuffer from bootloader", and every drawing
+    // entry point here already refuses a null base.
+    let mode = gop.current_mode_info();
+    let (fb_addr, fb_size) = if fb::is_direct(mode.pixel_format()) {
+        let mut fb = gop.frame_buffer();
+        (fb.as_mut_ptr() as u64, fb.size() as u64)
+    } else {
+        warn!(
+            "graphic mode {:?} has no linear framebuffer ({:?}); booting without one",
+            mode.resolution(),
+            mode.pixel_format()
+        );
+        (0, 0)
+    };
     let info = GraphicInfo {
-        mode: gop.current_mode_info(),
-        fb_addr: gop.frame_buffer().as_mut_ptr() as u64,
-        fb_size: gop.frame_buffer().size() as u64,
+        mode,
+        fb_addr,
+        fb_size,
     };
     (info, edid, edid_size)
 }
