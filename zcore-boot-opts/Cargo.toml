@@ -1,0 +1,12 @@
+[package]
+name = "zcore-boot-opts"
+version = "0.1.0"
+edition = "2021"
+description = "Host-testable kernel cmdline parsers shared with the zcore binary."
+
+[lib]
+name = "zcore_boot_opts"
+path = "src/lib.rs"
+doctest = false
+
+[dependencies]
