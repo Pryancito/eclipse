@@ -429,19 +429,39 @@ fn init_graphic(bs: &BootServices, resolution: Resolution) -> (GraphicInfo, [u8;
     // The policy itself lives in `rboot::video` so it can be tested without a
     // GOP; `gop.modes()` is a stable enumeration of `query_mode(0..max_mode)`,
     // so the index it returns is the index we set.
-    let modes: Vec<(usize, usize)> = gop.modes(bs).map(|m| m.info().resolution()).collect();
+    let modes: Vec<video::Mode> = gop
+        .modes(bs)
+        .map(|m| {
+            let (w, h) = m.info().resolution();
+            video::Mode::new(w, h, fb::is_direct(m.info().pixel_format()))
+        })
+        .collect();
     let preferred = video::edid_preferred_resolution(&edid, edid_size);
     match video::choose_mode(resolution, preferred, &modes).and_then(|i| gop.modes(bs).nth(i)) {
         Some(mode) => {
-            gop.set_mode(&mode).expect("Failed to set graphics mode");
+            // A firmware may refuse to set a mode it listed. That is not worth
+            // a panic: a panic here is a machine that does not boot because of
+            // one line in rboot.conf, and it happens before the splash so the
+            // message is wiped off the screen anyway. Keep the current mode.
+            if let Err(e) = gop.set_mode(&mode) {
+                warn!(
+                    "firmware refused graphic mode {:?} ({:?}); keeping current {:?}",
+                    mode.info().resolution(),
+                    e.status(),
+                    gop.current_mode_info().resolution()
+                );
+            }
         }
         None => {
             if resolution != Resolution::Keep {
+                // The offered list is the answer to "why did my resolution= do
+                // nothing": `Exact` only sets a mode the firmware enumerates.
                 warn!(
-                    "no graphic mode matches {:?} (edid says {:?}); keeping current {:?}",
+                    "no graphic mode matches {:?} (edid says {:?}); keeping current {:?}. firmware offers {:?}",
                     resolution,
                     preferred,
-                    gop.current_mode_info().resolution()
+                    gop.current_mode_info().resolution(),
+                    modes.as_slice()
                 );
             }
         }

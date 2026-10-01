@@ -27,6 +27,31 @@ pub enum Resolution {
     Exact(usize, usize),
 }
 
+/// The `resolution=` value: `auto`, or `WxH`.
+///
+/// `auto` is matched case-insensitively, so `1920X1080` has to work too: a
+/// capital X used to fall all the way through to "invalid resolution; using
+/// auto", i.e. the loader quietly ignored the one line it was told to obey and
+/// there was no way to tell from the screen. Spaces around the numbers
+/// (`1920 x 1080`) are the same class of typo, and `×` is what a word
+/// processor turns an `x` into.
+///
+/// Anything else is `None` (caller warns and uses auto). In particular only
+/// the first separator is a separator: `1920x1080x768` is not a request for
+/// `1920x1080`, it is a value nobody should guess the meaning of.
+pub fn parse_resolution(value: &str) -> Option<Resolution> {
+    if value.eq_ignore_ascii_case("auto") {
+        return Some(Resolution::Auto);
+    }
+    let (w, h) = value.split_once(['x', 'X', '\u{d7}'])?;
+    let w = usize::from_str(w.trim()).ok()?;
+    let h = usize::from_str(h.trim()).ok()?;
+    if w == 0 || h == 0 {
+        return None;
+    }
+    Some(Resolution::Exact(w, h))
+}
+
 /// Config for the bootloader
 #[derive(Debug)]
 pub struct Config<'a> {
@@ -200,20 +225,11 @@ impl<'a> Config<'a> {
             "resolution" => {
                 // NEVER panic on a config value: unknown/malformed values
                 // degrade to Auto with a warning -- the machine always boots.
-                if value.eq_ignore_ascii_case("auto") {
-                    self.resolution = Resolution::Auto;
-                } else {
-                    let mut iter = value.split('x');
-                    let x = iter.next().and_then(|v| usize::from_str(v).ok());
-                    let y = iter.next().and_then(|v| usize::from_str(v).ok());
-                    match (x, y) {
-                        (Some(x), Some(y)) if x > 0 && y > 0 => {
-                            self.resolution = Resolution::Exact(x, y);
-                        }
-                        _ => {
-                            warn!("invalid resolution {:?}; using auto", value);
-                            self.resolution = Resolution::Auto;
-                        }
+                match parse_resolution(value) {
+                    Some(r) => self.resolution = r,
+                    None => {
+                        warn!("invalid resolution {:?}; using auto", value);
+                        self.resolution = Resolution::Auto;
                     }
                 }
             }
@@ -354,6 +370,25 @@ mod tests {
     }
 
     #[test]
+    fn resolution_takes_the_separators_a_human_writes() {
+        // `auto` is case-insensitive, so refusing `1920X1080` meant the loader
+        // silently ignored the line it was told to obey -- and the warning is
+        // wiped off the screen by the splash, so nothing said so.
+        for text in [
+            "resolution=1920X1080",
+            "resolution=1920 x 1080",
+            "resolution= 1920x1080 ",
+            "resolution=1920\u{d7}1080",
+        ] {
+            assert_eq!(
+                Config::parse(text.as_bytes()).resolution,
+                Resolution::Exact(1920, 1080),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
     fn a_malformed_resolution_degrades_to_auto() {
         for text in [
             "resolution=",
@@ -363,6 +398,11 @@ mod tests {
             "resolution=1920x",
             "resolution=1920xNaN",
             "resolution=-1x-1",
+            // Only the first separator is one: this is not a request for
+            // 1920x1080, it is a value nobody should guess at.
+            "resolution=1920x1080x768",
+            "resolution=1920x1080@60",
+            "resolution=1920x1080p",
         ] {
             assert_eq!(
                 Config::parse(text.as_bytes()).resolution,
