@@ -56,11 +56,41 @@ pub fn edid_preferred_resolution(edid: &[u8; 128], edid_size: u32) -> Option<(us
     Some((h, v))
 }
 
+/// One mode the firmware offers, as [`choose_mode`] needs to see it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Mode {
+    pub width: usize,
+    pub height: usize,
+    /// Whether this mode has a linear framebuffer we can store into
+    /// (`crate::fb::is_direct` of its pixel format).
+    ///
+    /// Choosing a `BltOnly` mode is worse than not changing the mode at all:
+    /// its framebuffer base is null, so rboot draws no splash *and* the kernel
+    /// is handed `fb_addr = 0`, logs "no framebuffer from bootloader" and comes
+    /// up with no graphic console. A resolution can be listed more than once
+    /// with different pixel formats, so which of the two we pick matters.
+    pub direct: bool,
+}
+
+impl Mode {
+    pub fn new(width: usize, height: usize, direct: bool) -> Self {
+        Mode {
+            width,
+            height,
+            direct,
+        }
+    }
+
+    fn pixels(&self) -> usize {
+        self.width.saturating_mul(self.height)
+    }
+}
+
 /// Pick the index in `modes` of the GOP mode to set, or `None` to keep the
 /// mode the firmware already selected.
 ///
 /// - [`Resolution::Keep`]: never changes the mode.
-/// - [`Resolution::Exact`]: that mode, or keep the current one. (The old
+/// - [`Resolution::Exact`]: that resolution, or keep the current one. (The old
 ///   behaviour panicked with "graphic mode not found", bricking boot over a
 ///   config value the firmware happens not to offer.)
 /// - [`Resolution::Auto`]: the EDID-preferred timing if the firmware offers
@@ -68,34 +98,58 @@ pub fn edid_preferred_resolution(edid: &[u8; 128], edid_size: u32) -> Option<(us
 ///   within that cap. If every offered mode is over the cap, the smallest one
 ///   -- some VMs only list huge modes and we would rather boot at 8K than not
 ///   boot at all.
+///
+/// Modes with no linear framebuffer are skipped in both policies (see
+/// [`Mode::direct`]); only if *nothing* on offer is drawable do we fall back to
+/// considering them, because on such a machine there is no better mode to be
+/// had and today's behaviour at least boots.
 pub fn choose_mode(
     resolution: Resolution,
     preferred: Option<(usize, usize)>,
-    modes: &[(usize, usize)],
+    modes: &[Mode],
 ) -> Option<usize> {
     let target = match resolution {
         Resolution::Keep => None,
         Resolution::Exact(x, y) => Some((x, y)),
         Resolution::Auto => preferred.filter(|&(w, h)| mode_fits_auto_cap(w, h)),
     };
-    if let Some(want) = target {
-        if let Some(i) = modes.iter().position(|&m| m == want) {
+    if let Some((w, h)) = target {
+        let matches = |m: &Mode| m.width == w && m.height == h;
+        if let Some(i) = modes.iter().position(|m| matches(m) && m.direct) {
             return Some(i);
+        }
+        if resolution != Resolution::Auto {
+            // `Exact` never picks a different resolution behind the user's
+            // back, and a listing that only offers this one as `BltOnly` is
+            // not usable, so keep whatever the firmware already set.
+            return if modes.iter().any(|m| m.direct) {
+                None
+            } else {
+                modes.iter().position(matches)
+            };
         }
     }
     if resolution != Resolution::Auto {
         return None;
     }
+    auto_pick(modes, true).or_else(|| auto_pick(modes, false))
+}
+
+/// `Auto`'s fallback: the largest mode under the cap, else the smallest mode
+/// at all. With `direct_only`, modes we cannot draw on are not candidates.
+fn auto_pick(modes: &[Mode], direct_only: bool) -> Option<usize> {
+    let usable = |m: &Mode| m.direct || !direct_only;
     modes
         .iter()
         .enumerate()
-        .filter(|(_, &(w, h))| mode_fits_auto_cap(w, h))
-        .max_by_key(|(_, &(w, h))| w.saturating_mul(h))
+        .filter(|(_, m)| usable(m) && mode_fits_auto_cap(m.width, m.height))
+        .max_by_key(|(_, m)| m.pixels())
         .or_else(|| {
             modes
                 .iter()
                 .enumerate()
-                .min_by_key(|(_, &(w, h))| w.saturating_mul(h))
+                .filter(|(_, m)| usable(m))
+                .min_by_key(|(_, m)| m.pixels())
         })
         .map(|(i, _)| i)
 }
@@ -184,21 +238,28 @@ mod tests {
         assert!(!mode_fits_auto_cap(usize::MAX, usize::MAX));
     }
 
-    const MODES: &[(usize, usize)] = &[(640, 480), (800, 600), (1024, 768), (1920, 1080)];
+    /// Firmware mode lists in these tests are all drawable unless a test says
+    /// otherwise, which is the normal case.
+    fn direct(modes: &[(usize, usize)]) -> alloc::vec::Vec<Mode> {
+        modes.iter().map(|&(w, h)| Mode::new(w, h, true)).collect()
+    }
+
+    const RES: &[(usize, usize)] = &[(640, 480), (800, 600), (1024, 768), (1920, 1080)];
 
     #[test]
     fn keep_never_changes_the_mode() {
+        let modes = direct(RES);
         assert_eq!(
-            choose_mode(Resolution::Keep, Some((1920, 1080)), MODES),
+            choose_mode(Resolution::Keep, Some((1920, 1080)), &modes),
             None
         );
-        assert_eq!(choose_mode(Resolution::Keep, None, MODES), None);
+        assert_eq!(choose_mode(Resolution::Keep, None, &modes), None);
     }
 
     #[test]
     fn exact_picks_that_mode() {
         assert_eq!(
-            choose_mode(Resolution::Exact(1024, 768), None, MODES),
+            choose_mode(Resolution::Exact(1024, 768), None, &direct(RES)),
             Some(2)
         );
     }
@@ -207,14 +268,14 @@ mod tests {
     fn exact_that_the_firmware_does_not_offer_keeps_the_current_mode() {
         // Never a panic, and never a different mode behind the user's back.
         assert_eq!(
-            choose_mode(Resolution::Exact(1280, 1024), None, MODES),
+            choose_mode(Resolution::Exact(1280, 1024), None, &direct(RES)),
             None
         );
     }
 
     #[test]
     fn exact_is_not_capped() {
-        let modes = [(1024, 768), (7680, 4320)];
+        let modes = direct(&[(1024, 768), (7680, 4320)]);
         assert_eq!(
             choose_mode(Resolution::Exact(7680, 4320), None, &modes),
             Some(1)
@@ -222,10 +283,53 @@ mod tests {
     }
 
     #[test]
+    fn exact_skips_a_bltonly_listing_of_the_resolution_it_asks_for() {
+        // The one that makes `resolution=WxH` "not work" while `auto` does:
+        // a mode with no linear framebuffer hands the kernel `fb_addr = 0`, so
+        // the machine boots with no splash and no graphic console at all.
+        let modes = [
+            Mode::new(1920, 1080, false),
+            Mode::new(1024, 768, true),
+            Mode::new(1920, 1080, true),
+        ];
+        assert_eq!(
+            choose_mode(Resolution::Exact(1920, 1080), None, &modes),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn exact_keeps_the_current_mode_when_its_only_listing_is_bltonly() {
+        // Setting it would blank the machine; the mode the firmware already
+        // chose is at least on screen.
+        let modes = [Mode::new(1920, 1080, false), Mode::new(1024, 768, true)];
+        assert_eq!(
+            choose_mode(Resolution::Exact(1920, 1080), None, &modes),
+            None
+        );
+    }
+
+    #[test]
+    fn a_firmware_with_nothing_drawable_is_not_made_worse() {
+        // Nothing to choose between, so behave exactly as before: honour the
+        // request, and let `auto` still pick the largest under the cap.
+        let modes = [
+            Mode::new(1024, 768, false),
+            Mode::new(1920, 1080, false),
+            Mode::new(7680, 4320, false),
+        ];
+        assert_eq!(
+            choose_mode(Resolution::Exact(1024, 768), None, &modes),
+            Some(0)
+        );
+        assert_eq!(choose_mode(Resolution::Auto, None, &modes), Some(1));
+    }
+
+    #[test]
     fn auto_prefers_the_edid_timing_over_the_largest_mode() {
         // The 1366x768 TV: its firmware offers better modes, and stretching a
         // 4:3 1024x768 across a 16:9 panel is what it used to do.
-        let modes = [(640, 480), (1024, 768), (1366, 768), (1920, 1080)];
+        let modes = direct(&[(640, 480), (1024, 768), (1366, 768), (1920, 1080)]);
         assert_eq!(
             choose_mode(Resolution::Auto, Some((1366, 768)), &modes),
             Some(2)
@@ -234,13 +338,27 @@ mod tests {
 
     #[test]
     fn auto_without_edid_takes_the_largest_mode_under_the_cap() {
-        assert_eq!(choose_mode(Resolution::Auto, None, MODES), Some(3));
+        assert_eq!(choose_mode(Resolution::Auto, None, &direct(RES)), Some(3));
+    }
+
+    #[test]
+    fn auto_skips_modes_it_cannot_draw_on() {
+        let modes = [
+            Mode::new(1024, 768, true),
+            Mode::new(1920, 1080, false),
+            Mode::new(1366, 768, false),
+        ];
+        assert_eq!(choose_mode(Resolution::Auto, None, &modes), Some(0));
+        assert_eq!(
+            choose_mode(Resolution::Auto, Some((1366, 768)), &modes),
+            Some(0)
+        );
     }
 
     #[test]
     fn auto_never_picks_an_8k_virtualbox_mode() {
         // The kernel shadows every VT at width*height*4; 8K OOMs the heap.
-        let modes = [(1024, 768), (1920, 1080), (7680, 4320)];
+        let modes = direct(&[(1024, 768), (1920, 1080), (7680, 4320)]);
         assert_eq!(choose_mode(Resolution::Auto, None, &modes), Some(1));
         // Not even when the (bogus) EDID asks for it.
         assert_eq!(
@@ -251,14 +369,14 @@ mod tests {
 
     #[test]
     fn auto_falls_back_to_the_smallest_when_every_mode_is_over_the_cap() {
-        let modes = [(7680, 4320), (5120, 2880)];
+        let modes = direct(&[(7680, 4320), (5120, 2880)]);
         assert_eq!(choose_mode(Resolution::Auto, None, &modes), Some(1));
     }
 
     #[test]
     fn auto_with_an_edid_mode_the_firmware_does_not_offer_falls_back_to_largest() {
         assert_eq!(
-            choose_mode(Resolution::Auto, Some((2560, 1440)), MODES),
+            choose_mode(Resolution::Auto, Some((2560, 1440)), &direct(RES)),
             Some(3)
         );
     }
@@ -267,5 +385,11 @@ mod tests {
     fn no_modes_at_all_keeps_the_current_one() {
         assert_eq!(choose_mode(Resolution::Auto, Some((1920, 1080)), &[]), None);
         assert_eq!(choose_mode(Resolution::Exact(640, 480), None, &[]), None);
+    }
+
+    #[test]
+    fn a_zero_sized_mode_is_never_chosen_over_a_real_one() {
+        let modes = direct(&[(0, 0), (1024, 768)]);
+        assert_eq!(choose_mode(Resolution::Auto, None, &modes), Some(1));
     }
 }
