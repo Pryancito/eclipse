@@ -885,6 +885,32 @@ pub trait FileLike: KernelObject + downcast_rs::DowncastSync {
         let _ = (events, waker);
         None
     }
+    /// How many times this file's producer has published readiness: the
+    /// [`crate::sync::EventBus::seq`] of its event source. It moves on every
+    /// write to an eventfd, every message to a socket, every pipe write --
+    /// including the ones that find the file already readable.
+    ///
+    /// This is what `EPOLLET` is measured against. `None` (the default) means
+    /// the file has no such counter, and `epoll` keeps reporting it by level
+    /// even when edge-triggered: a spurious event costs a wakeup, a missed
+    /// one hangs the program.
+    fn readiness_seq(&self) -> Option<u64> {
+        None
+    }
+    /// Park `waker` until this file's producer next publishes an event
+    /// relevant to `events`, ignoring the flags already set; or fire at once
+    /// if [`FileLike::readiness_seq`] has moved past `seen`. See
+    /// [`crate::sync::EventBus::subscribe_edge`]. Offered exactly by the files
+    /// that offer `readiness_seq`.
+    fn subscribe_edge(
+        &self,
+        events: PollEvents,
+        waker: &core::task::Waker,
+        seen: u64,
+    ) -> Option<crate::sync::ReadinessSub> {
+        let _ = (events, waker, seen);
+        None
+    }
     /// manipulates the underlying device parameters of special files
     fn ioctl(&self, _request: usize, _arg1: usize, _arg2: usize, _arg3: usize) -> LxResult<usize> {
         Err(LxError::ENOSYS)

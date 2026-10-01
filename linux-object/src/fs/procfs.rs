@@ -1375,6 +1375,10 @@ fn proc_perf_kernel_content() -> String {
     crate::perf::kernel_report()
 }
 
+fn proc_perf_ktop_content() -> String {
+    crate::perf::ktop_report()
+}
+
 fn proc_perf_tasks_content() -> String {
     let mut out = String::new();
     let _ = writeln!(out, "eclipse perf — tasks (processes / kernel threads)");
@@ -1444,6 +1448,7 @@ impl INode for ProcPerfDirINode {
             "tasks" => Ok(PROC_PERF_TASKS.clone()),
             "top" => Ok(PROC_PERF_TOP.clone()),
             "kernel" => Ok(PROC_PERF_KERNEL.clone()),
+            "ktop" => Ok(PROC_PERF_KTOP.clone()),
             _ => Err(FsError::EntryNotFound),
         }
     }
@@ -1455,6 +1460,7 @@ impl INode for ProcPerfDirINode {
             3 => Ok("tasks".into()),
             4 => Ok("top".into()),
             5 => Ok("kernel".into()),
+            6 => Ok("ktop".into()),
             _ => Err(FsError::EntryNotFound),
         }
     }
@@ -3560,6 +3566,10 @@ lazy_static! {
 // Second block: lazy_static! is recursive over its items and the main block
 // above is already at the macro recursion limit.
 lazy_static! {
+    static ref PROC_PERF_KTOP: Arc<dyn INode> = Arc::new(ProcSeqINode {
+        inode: 113,
+        generate: proc_perf_ktop_content,
+    });
     static ref PROC_VERSION: Arc<dyn INode> = Arc::new(ProcSeqINode {
         inode: 50,
         generate: proc_version_content,

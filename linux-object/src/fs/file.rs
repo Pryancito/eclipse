@@ -1189,6 +1189,25 @@ impl FileLike for File {
         None
     }
 
+    fn readiness_seq(&self) -> Option<u64> {
+        let inode = self.inner.read().inode.clone();
+        inode
+            .downcast_ref::<super::pipe::Pipe>()
+            .map(|pipe| pipe.readiness_seq())
+    }
+
+    fn subscribe_edge(
+        &self,
+        events: PollEvents,
+        waker: &core::task::Waker,
+        seen: u64,
+    ) -> Option<crate::sync::ReadinessSub> {
+        let inode = self.inner.read().inode.clone();
+        inode
+            .downcast_ref::<super::pipe::Pipe>()
+            .map(|pipe| pipe.subscribe_edge(events, waker, seen))
+    }
+
     fn ioctl(&self, request: usize, arg1: usize, _arg2: usize, _arg3: usize) -> LxResult<usize> {
         // ioctl syscall
         let inner = self.inner.read();

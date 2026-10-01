@@ -36,11 +36,67 @@ const EPOLLWAKEUP: u32 = 1 << 29;
 /// See [`EPOLLEXCLUSIVE`]. Report the fd once, then disable the entry until
 /// an `EPOLL_CTL_MOD` re-arms it.
 const EPOLLONESHOT: u32 = 1 << 30;
-/// See [`EPOLLEXCLUSIVE`]. Edge-triggered. **Still level-triggered here**:
-/// the bit is stored and round-trips, but the readiness scan reports a level.
-/// A half-done edge trigger is worse than none -- a program that misses an
-/// edge waits forever -- so it is left honest and untouched.
+/// See [`EPOLLEXCLUSIVE`]. Edge-triggered: see [`edge_step`]. Honoured for
+/// the files that count their readiness publications
+/// (`FileLike::readiness_seq`: eventfd, unix sockets, pipes); every other file
+/// is still reported by level, which costs wakeups but never loses one.
 const EPOLLET: u32 = 1 << 31;
+
+/// How long an edge-triggered entry stays quiet about a level that has not
+/// moved, before it is reported again anyway.
+///
+/// Linux would stay quiet for ever. This is the insurance for an edge this
+/// kernel does not see: a file whose level can rise without its producer
+/// publishing anything. A program waiting on such an edge is late by this
+/// much instead of asleep for good; one that is not waiting gets a spurious
+/// event, which edge-triggered programs are written to absorb.
+const EDGE_REARM: core::time::Duration = core::time::Duration::from_millis(250);
+
+/// Where an edge-triggered entry stands: the file's publication counter when
+/// the entry was last scanned, the bits it has already reported and has not
+/// seen fall since, and when it last reported.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct EdgeState {
+    seq: u64,
+    quiet: u32,
+    since: core::time::Duration,
+}
+
+/// One scan of an edge-triggered entry: whether it reports `ready` now, and
+/// its state afterwards.
+///
+/// An edge is a publication (`seq` moved: data arrived, room freed, a write to
+/// an eventfd that was readable already) or a bit that was low the last time
+/// and is high now. Without one, a bit that was already reported stays quiet
+/// however long it stays high -- which is the whole point. `mio`, under every
+/// `tokio` program, never reads its eventfd waker: it registers it with
+/// `EPOLLET` and lets each `write` be the edge. Reported by level, an eventfd
+/// woken once is readable for ever and its event loop spins on `epoll_wait`.
+/// Firefox's parent process did 31 million of them in five minutes (01-oct).
+///
+/// When it reports, it reports every ready bit, as `ep_item_poll` does.
+fn edge_step(
+    prev: Option<EdgeState>,
+    seq: u64,
+    ready: u32,
+    now: core::time::Duration,
+) -> (bool, EdgeState) {
+    let quiet = match prev {
+        Some(p) if p.seq == seq && now.saturating_sub(p.since) < EDGE_REARM => p.quiet & ready,
+        _ => 0,
+    };
+    if ready & !quiet != 0 {
+        let next = EdgeState {
+            seq,
+            quiet: ready,
+            since: now,
+        };
+        (true, next)
+    } else {
+        let since = prev.map_or(now, |p| p.since);
+        (false, EdgeState { seq, quiet, since })
+    }
+}
 
 /// The bits `EPOLLEXCLUSIVE` may be combined with (Linux's
 /// `EPOLLEXCLUSIVE_OK_BITS`): the two readiness bits, the two that are always
@@ -139,6 +195,10 @@ struct EpollInner {
     /// epoll fd) to its `wl_event_loop` epoll, so the outer epoll must surface
     /// the inner epoll's readiness or input events are never dispatched.
     interest_list: BTreeMap<FileDesc, (EpollEvent, Arc<dyn FileLike>)>,
+    /// [`EdgeState`] of the `EPOLLET` entries that have been scanned. Any
+    /// `EPOLL_CTL_*` on the fd starts it over, as `ep_modify` re-reports a
+    /// level that is already up.
+    edge: BTreeMap<FileDesc, EdgeState>,
 }
 
 /// epoll event
@@ -161,6 +221,7 @@ impl Epoll {
             base: KObjectBase::new(),
             inner: Mutex::new(EpollInner {
                 interest_list: BTreeMap::new(),
+                edge: BTreeMap::new(),
             }),
             flags,
         })
@@ -200,6 +261,7 @@ impl Epoll {
             event
         };
         let mut inner = self.inner.lock();
+        inner.edge.remove(&fd);
         match op {
             EPOLL_CTL_ADD => {
                 let file = file.ok_or(LxError::EBADF)?;
@@ -311,7 +373,30 @@ impl Epoll {
         inner
             .interest_list
             .retain(|_, (_, watched)| !Arc::ptr_eq(watched, file));
+        let EpollInner {
+            interest_list,
+            edge,
+        } = &mut *inner;
+        edge.retain(|fd, _| interest_list.contains_key(fd));
         before - inner.interest_list.len()
+    }
+
+    /// Store the [`EdgeState`]s a scan computed, for the entries that still
+    /// watch the file the scan looked at.
+    fn store_edges(&self, scanned: &[(FileDesc, Arc<dyn FileLike>, EdgeState)]) {
+        if scanned.is_empty() {
+            return;
+        }
+        let mut inner = self.inner.lock();
+        for (fd, file, state) in scanned {
+            let current = match inner.interest_list.get(fd) {
+                Some((event, current)) => event.events & EPOLLET != 0 && Arc::ptr_eq(current, file),
+                None => false,
+            };
+            if current {
+                inner.edge.insert(*fd, *state);
+            }
+        }
     }
 
     /// Whether `needle` (some other epoll, compared by identity) is
@@ -435,6 +520,9 @@ impl FileLike for Epoll {
     }
 }
 
+/// One interest-list entry as a scan sees it: the fd, its mask, its file.
+type Watched = (FileDesc, EpollEvent, Arc<dyn FileLike>);
+
 impl Epoll {
     /// wait for events on the interest list
     pub async fn wait(&self, maxevents: usize, timeout_msecs: isize) -> LxResult<Vec<EpollEvent>> {
@@ -456,13 +544,15 @@ impl Epoll {
             //    (a use-after-free #GP with the free-poison pattern in the
             //    faulting register). The Arc keeps exactly what we touch
             //    alive for as long as we touch it.
-            let interest_list: Vec<(FileDesc, EpollEvent, Arc<dyn FileLike>)> = self
-                .inner
-                .lock()
-                .interest_list
-                .iter()
-                .map(|(fd, (event, file))| (*fd, *event, file.clone()))
-                .collect();
+            let (interest_list, edges): (Vec<Watched>, _) = {
+                let inner = self.inner.lock();
+                let list = inner
+                    .interest_list
+                    .iter()
+                    .map(|(fd, (event, file))| (*fd, *event, file.clone()))
+                    .collect();
+                (list, inner.edge.clone())
+            };
             let watch_net = interest_list
                 .iter()
                 .any(|(fd, _, _)| crate::net::fd_is_socket(*fd));
@@ -479,13 +569,31 @@ impl Epoll {
             // IoMultiplexWait tick (and HID/NET IRQ registration there).
             let mut events = Vec::new();
             let mut delivered = Vec::new();
+            let mut scanned_edges = Vec::new();
+            let now = kernel_hal::timer::timer_now();
             for (fd, event, file) in &interest_list {
                 let interest = PollEvents::from_bits_truncate(event.events as u16);
+                // An edge-triggered entry on a file that counts its
+                // publications. The counter is read BEFORE the level: a
+                // publication after this line moves it past what is stored,
+                // and the next scan (or the edge subscription below) sees it.
+                let seq = if event.events & EPOLLET != 0 {
+                    file.readiness_seq()
+                } else {
+                    None
+                };
                 let status = match file.poll(interest) {
                     Ok(status) => status,
                     Err(err) => return Err(err),
                 };
-                let ready = ready_events(event.events, &status);
+                let mut ready = ready_events(event.events, &status);
+                if let Some(seq) = seq {
+                    let (report, state) = edge_step(edges.get(fd).copied(), seq, ready, now);
+                    scanned_edges.push((*fd, file.clone(), state));
+                    if !report {
+                        ready = 0;
+                    }
+                }
                 if ready != 0 {
                     events.push(EpollEvent {
                         events: ready,
@@ -502,6 +610,7 @@ impl Epoll {
                 }
             }
 
+            self.store_edges(&scanned_edges);
             if !events.is_empty() {
                 self.disarm_oneshot(&delivered);
                 return Ok(events);
@@ -536,11 +645,23 @@ impl Epoll {
             // tick for its whole set, preserving the old behavior exactly.
             let waker =
                 core::future::poll_fn(|cx| core::task::Poll::Ready(cx.waker().clone())).await;
+            //
+            // An edge-triggered entry parks on its file's next publication
+            // instead: a level subscription fires at once on a flag that is
+            // already up, and the level of a quiet entry is up by definition.
             let mut subs = alloc::vec::Vec::with_capacity(interest_list.len());
             let mut covered = !interest_list.is_empty();
-            for (_fd, event, file) in &interest_list {
+            for (fd, event, file) in &interest_list {
                 let interest = PollEvents::from_bits_truncate(event.events as u16);
-                match file.subscribe_readiness(interest, &waker) {
+                let edge = scanned_edges
+                    .iter()
+                    .find(|(f, _, _)| f == fd)
+                    .map(|(_, _, state)| state.seq);
+                let sub = match edge {
+                    Some(seen) => file.subscribe_edge(interest, &waker, seen),
+                    None => file.subscribe_readiness(interest, &waker),
+                };
+                match sub {
                     Some(sub) => subs.push(sub),
                     None => covered = false,
                 }
@@ -1385,5 +1506,334 @@ mod close_forgets_tests {
         let epfd = proc.add_file_cloexec(ep.clone(), false).unwrap();
         proc.close_file(epfd).unwrap();
         assert!(watches(&ep, fd));
+    }
+}
+
+/// `EPOLLET`: an edge-triggered entry is reported once per edge, not once per
+/// `epoll_wait`. Reported by level, `mio`'s eventfd waker (which nobody ever
+/// reads) made every `epoll_wait` of its loop return at once, for ever.
+#[cfg(test)]
+mod edge_trigger_tests {
+    use super::*;
+    use crate::fs::eventfd::EventFd;
+    use alloc::sync::Arc;
+    use alloc::task::Wake;
+    use core::future::Future;
+    use core::sync::atomic::{AtomicUsize, Ordering};
+    use core::task::{Context, Poll, Waker};
+    use core::time::Duration;
+
+    const ADD: i32 = 1;
+    const MOD: i32 = 3;
+    const IN: u32 = PollEvents::IN.bits() as u32;
+    const OUT: u32 = PollEvents::OUT.bits() as u32;
+
+    struct Count(AtomicUsize);
+    impl Wake for Count {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    fn counting_waker() -> (Arc<Count>, Waker) {
+        let count = Arc::new(Count(AtomicUsize::new(0)));
+        (count.clone(), Waker::from(count))
+    }
+
+    /// One `epoll_wait(ep, events, 16, 0)`: the events it returns.
+    fn wait_now(ep: &Epoll) -> Vec<(u32, u64)> {
+        let (_, waker) = counting_waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut fut = alloc::boxed::Box::pin(ep.wait(16, 0));
+        match fut.as_mut().poll(&mut cx) {
+            Poll::Ready(Ok(v)) => v.iter().map(|e| (e.events, e.data)).collect(),
+            other => panic!(
+                "a zero-timeout wait finishes at once: {:?}",
+                other.is_ready()
+            ),
+        }
+    }
+
+    fn ev(events: u32, data: u64) -> EpollEvent {
+        EpollEvent { events, data }
+    }
+
+    fn mio_waker() -> (Arc<EventFd>, Arc<Epoll>) {
+        let efd = EventFd::new(0, OpenFlags::empty());
+        let ep = Epoll::new(OpenFlags::empty());
+        ep.ctl(
+            ADD,
+            FileDesc::from(5),
+            ev(IN | EPOLLET, 9),
+            Some(efd.clone()),
+        )
+        .unwrap();
+        (efd, ep)
+    }
+
+    fn wake(efd: &EventFd) {
+        efd.write(&1u64.to_ne_bytes()).unwrap();
+    }
+
+    #[test]
+    fn an_eventfd_nobody_reads_is_reported_once_per_write() {
+        let (efd, ep) = mio_waker();
+        assert_eq!(wait_now(&ep), Vec::new(), "nothing written yet");
+        wake(&efd);
+        assert_eq!(wait_now(&ep), alloc::vec![(IN, 9)]);
+        // Still readable -- mio never reads it -- and nothing new happened.
+        assert_eq!(wait_now(&ep), Vec::new());
+        assert_eq!(wait_now(&ep), Vec::new());
+        // A second write to a file that is already readable is an edge.
+        wake(&efd);
+        assert_eq!(wait_now(&ep), alloc::vec![(IN, 9)]);
+        assert_eq!(wait_now(&ep), Vec::new());
+    }
+
+    #[test]
+    fn without_epollet_the_same_eventfd_is_reported_on_every_wait() {
+        let efd = EventFd::new(0, OpenFlags::empty());
+        let ep = Epoll::new(OpenFlags::empty());
+        ep.ctl(ADD, FileDesc::from(5), ev(IN, 9), Some(efd.clone()))
+            .unwrap();
+        wake(&efd);
+        for _ in 0..3 {
+            assert_eq!(wait_now(&ep), alloc::vec![(IN, 9)]);
+        }
+    }
+
+    #[test]
+    fn epoll_ctl_mod_reports_a_level_that_is_already_up() {
+        let (efd, ep) = mio_waker();
+        wake(&efd);
+        assert_eq!(wait_now(&ep), alloc::vec![(IN, 9)]);
+        assert_eq!(wait_now(&ep), Vec::new());
+        ep.ctl(
+            MOD,
+            FileDesc::from(5),
+            ev(IN | EPOLLET, 10),
+            Some(efd.clone()),
+        )
+        .unwrap();
+        assert_eq!(wait_now(&ep), alloc::vec![(IN, 10)]);
+        assert_eq!(wait_now(&ep), Vec::new());
+    }
+
+    #[test]
+    fn a_quiet_entry_parks_and_the_next_write_wakes_it() {
+        let (efd, ep) = mio_waker();
+        wake(&efd);
+        assert_eq!(wait_now(&ep), alloc::vec![(IN, 9)]);
+        // A blocking wait on the quiet entry must sleep. Parked with a level
+        // subscription, the latched READABLE fired the waker at once, and the
+        // wait went round again: the same spin, inside the kernel.
+        let (count, waker) = counting_waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut fut = alloc::boxed::Box::pin(ep.wait(16, -1));
+        assert!(fut.as_mut().poll(&mut cx).is_pending());
+        assert_eq!(count.0.load(Ordering::SeqCst), 0, "woken with nothing new");
+        wake(&efd);
+        assert!(count.0.load(Ordering::SeqCst) >= 1, "the write is the edge");
+        match fut.as_mut().poll(&mut cx) {
+            Poll::Ready(Ok(v)) => assert_eq!(v.len(), 1),
+            _ => panic!("the woken wait reports the write"),
+        }
+    }
+
+    #[test]
+    fn a_publication_between_the_scan_and_the_park_still_wakes_the_wait() {
+        // The counter is read before the level: a write that lands after the
+        // scan moved it past what the subscription is told it has seen.
+        let mut bus = crate::sync::EventBus::default();
+        let seen = bus.seq();
+        bus.set(crate::sync::Event::READABLE);
+        let (count, waker) = counting_waker();
+        assert_eq!(
+            bus.subscribe_edge(crate::sync::Event::READABLE, &waker, seen),
+            None
+        );
+        assert_eq!(count.0.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn the_bus_counts_every_publication_and_wakes_edge_waiters_on_the_next() {
+        use crate::sync::{Event, EventBus};
+        let mut bus = EventBus::default();
+        bus.set(Event::READABLE);
+        let s1 = bus.seq();
+        // Already set: no change of the flags, still a publication.
+        bus.set(Event::READABLE);
+        assert_eq!(bus.seq(), s1 + 1);
+        // Clearing publishes nothing.
+        bus.clear(Event::READABLE);
+        assert_eq!(bus.seq(), s1 + 1);
+        bus.set(Event::READABLE);
+        let seen = bus.seq();
+        let (count, waker) = counting_waker();
+        // A latched flag does not fire an edge subscription...
+        let id = bus.subscribe_edge(Event::READABLE, &waker, seen);
+        assert!(id.is_some());
+        assert_eq!(count.0.load(Ordering::SeqCst), 0);
+        // ...nor does a publication of something it did not ask for...
+        bus.set(Event::WRITABLE);
+        assert_eq!(count.0.load(Ordering::SeqCst), 0);
+        // ...and the next one it did ask for fires it, once.
+        bus.set(Event::READABLE);
+        assert_eq!(count.0.load(Ordering::SeqCst), 1);
+        bus.set(Event::READABLE);
+        assert_eq!(count.0.load(Ordering::SeqCst), 1, "one-shot");
+        // Unsubscribing removes a parked edge waiter.
+        let seen = bus.seq();
+        let id = bus.subscribe_edge(Event::READABLE, &waker, seen).unwrap();
+        assert_eq!(bus.get_callback_len(), 1);
+        bus.unsubscribe(id);
+        assert_eq!(bus.get_callback_len(), 0);
+        bus.set(Event::READABLE);
+        assert_eq!(count.0.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn a_unix_socket_with_unread_data_is_reported_once_per_message() {
+        use crate::net::unix::UnixSocketState;
+        let a = UnixSocketState::new();
+        let b = UnixSocketState::new();
+        UnixSocketState::connect_pair(&a, &b);
+        let ep = Epoll::new(OpenFlags::empty());
+        ep.ctl(ADD, FileDesc::from(5), ev(IN | EPOLLET, 1), Some(a.clone()))
+            .unwrap();
+        assert_eq!(wait_now(&ep), Vec::new());
+        FileLike::write(&*b, b"one").unwrap();
+        assert_eq!(wait_now(&ep), alloc::vec![(IN, 1)]);
+        // Unread, and nothing new: tokio leaves it there under backpressure.
+        assert_eq!(wait_now(&ep), Vec::new());
+        FileLike::write(&*b, b"two").unwrap();
+        assert_eq!(wait_now(&ep), alloc::vec![(IN, 1)]);
+        assert_eq!(wait_now(&ep), Vec::new());
+    }
+
+    #[test]
+    fn a_pipe_with_unread_data_is_reported_once_per_write() {
+        use crate::fs::pipe::Pipe;
+        use crate::fs::File;
+        use rcore_fs::vfs::INode;
+        let (r, w) = Pipe::create_pair();
+        let w = Arc::new(w);
+        let read_end: Arc<dyn FileLike> = File::new(
+            Arc::new(r),
+            OpenFlags::RDONLY,
+            alloc::string::String::from("pipe"),
+        );
+        let ep = Epoll::new(OpenFlags::empty());
+        ep.ctl(ADD, FileDesc::from(5), ev(IN | EPOLLET, 2), Some(read_end))
+            .unwrap();
+        assert_eq!(wait_now(&ep), Vec::new());
+        w.write_at(0, b"one").unwrap();
+        assert_eq!(wait_now(&ep), alloc::vec![(IN, 2)]);
+        assert_eq!(wait_now(&ep), Vec::new());
+        w.write_at(0, b"two").unwrap();
+        assert_eq!(wait_now(&ep), alloc::vec![(IN, 2)]);
+        assert_eq!(wait_now(&ep), Vec::new());
+    }
+
+    /// Always readable, and keeps no publication counter.
+    struct Uncounted {
+        base: KObjectBase,
+    }
+    impl_kobject!(Uncounted);
+    #[async_trait]
+    impl FileLike for Uncounted {
+        fn flags(&self) -> OpenFlags {
+            OpenFlags::empty()
+        }
+        fn set_flags(&self, _f: OpenFlags) -> LxResult {
+            Ok(())
+        }
+        async fn read(&self, _buf: &mut [u8]) -> LxResult<usize> {
+            Ok(0)
+        }
+        fn write(&self, _buf: &[u8]) -> LxResult<usize> {
+            Ok(0)
+        }
+        async fn read_at(&self, _offset: u64, _buf: &mut [u8]) -> LxResult<usize> {
+            Ok(0)
+        }
+        fn poll(&self, _events: PollEvents) -> LxResult<PollStatus> {
+            Ok(PollStatus {
+                read: true,
+                write: false,
+                error: false,
+                hangup: false,
+            })
+        }
+        async fn async_poll(&self, events: PollEvents) -> LxResult<PollStatus> {
+            self.poll(events)
+        }
+    }
+
+    #[test]
+    fn a_file_that_counts_nothing_is_still_reported_by_level() {
+        // Without a counter this kernel cannot see the file's edges, and an
+        // edge it cannot see must not become an event it never reports.
+        let ep = Epoll::new(OpenFlags::empty());
+        let file: Arc<dyn FileLike> = Arc::new(Uncounted {
+            base: KObjectBase::new(),
+        });
+        ep.ctl(ADD, FileDesc::from(5), ev(IN | EPOLLET, 3), Some(file))
+            .unwrap();
+        for _ in 0..3 {
+            assert_eq!(wait_now(&ep), alloc::vec![(IN, 3)]);
+        }
+    }
+
+    const T0: Duration = Duration::from_secs(10);
+
+    #[test]
+    fn edge_step_reports_new_bits_and_every_ready_bit_with_them() {
+        let (report, st) = edge_step(None, 4, IN, T0);
+        assert!(report);
+        assert_eq!(st.quiet, IN);
+        // OUT rises with no publication: new, and IN rides along.
+        let (report, st) = edge_step(Some(st), 4, IN | OUT, T0);
+        assert!(report);
+        assert_eq!(st.quiet, IN | OUT);
+        let (report, _) = edge_step(Some(st), 4, IN | OUT, T0);
+        assert!(!report);
+    }
+
+    #[test]
+    fn edge_step_rearms_a_bit_it_has_seen_fall() {
+        let (_, st) = edge_step(None, 4, IN, T0);
+        // IN fell (the program drained it) with no publication to see.
+        let (report, st) = edge_step(Some(st), 4, 0, T0);
+        assert!(!report);
+        assert_eq!(st.quiet, 0);
+        let (report, _) = edge_step(Some(st), 4, IN, T0);
+        assert!(report, "low then high is an edge");
+    }
+
+    #[test]
+    fn edge_step_follows_the_counter_even_when_nothing_is_ready() {
+        let (_, st) = edge_step(None, 4, IN, T0);
+        let (report, st) = edge_step(Some(st), 7, 0, T0);
+        assert!(!report);
+        // The stored counter is the one just read: a park after this scan
+        // must not be woken by the publications this scan already saw.
+        assert_eq!(st.seq, 7);
+        let (report, _) = edge_step(Some(st), 7, 0, T0);
+        assert!(!report);
+    }
+
+    #[test]
+    fn edge_step_reports_a_quiet_level_again_after_the_rearm_delay() {
+        let (_, st) = edge_step(None, 4, IN, T0);
+        let (report, st2) = edge_step(Some(st), 4, IN, T0 + EDGE_REARM / 2);
+        assert!(!report);
+        assert_eq!(st2.since, T0, "quiet scans do not push the deadline");
+        let (report, st3) = edge_step(Some(st2), 4, IN, T0 + EDGE_REARM);
+        assert!(report);
+        assert_eq!(st3.since, T0 + EDGE_REARM);
     }
 }

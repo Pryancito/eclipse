@@ -1389,6 +1389,16 @@ fn write_firefox_wrapper(rootfs: &Path) {
 /// are dropped at the socket, which QUIC reads as congestion and slows down.
 /// HTTP/2 over TCP carries the same streams without that cliff.
 ///
+/// The last block is what Firefox does on its own at start-up. The QEMU root
+/// is a RAM image loaded fresh at every boot, so the profile never survives
+/// and EVERY launch is a first run: the privacy-notice tab, about:welcome,
+/// telemetry, Normandy and a prelaunched spare content process all ran each
+/// time, and Firefox sat at 50-80% of the six CPUs with nothing open. Safe
+/// Browsing and site isolation (Fission) stay on: they are protection, not
+/// overhead to trim here. (`MOZ_FORCE_DISABLE_E10S` in the wrapper does not
+/// help: an official build ignores it unless non-local connections are
+/// disabled, see `BrowserTabsRemoteAutostart` in `nsAppRunner.cpp`.)
+///
 /// Both package names are covered because `firefox` and `firefox-esr` are
 /// separate Alpine packages with separate install dirs (see the wrapper).
 /// Nothing is written when neither is installed in the rootfs -- which is
@@ -1438,7 +1448,30 @@ pub fn write_firefox_default_prefs(rootfs: &Path) {
               pref(\"network.http.http3.enable\", false);\n\
               // Session store less often: each write is msync + profile IO on\n\
               // a RAM rootfs that still pays the syscall path.\n\
-              pref(\"browser.sessionstore.interval\", 60000);\n",
+              pref(\"browser.sessionstore.interval\", 60000);\n\
+              // The QEMU root is a RAM image loaded fresh at every boot, so\n\
+              // every launch is a first run. Skip the first-run pages (the\n\
+              // privacy notice, about:welcome, the what's-new page) and the\n\
+              // default-browser check: each is a page load on a CPU-only\n\
+              // renderer before the user has opened anything.\n\
+              pref(\"datareporting.policy.dataSubmissionPolicyBypassNotification\", true);\n\
+              pref(\"datareporting.policy.firstRunURL\", \"\");\n\
+              pref(\"browser.aboutwelcome.enabled\", false);\n\
+              pref(\"browser.startup.homepage_override.mstone\", \"ignore\");\n\
+              pref(\"browser.shell.checkDefaultBrowser\", false);\n\
+              // Background work that runs whether or not a page is open:\n\
+              // telemetry collection and upload, Normandy studies, and the\n\
+              // Pocket stories feed on the new-tab page.\n\
+              pref(\"datareporting.healthreport.uploadEnabled\", false);\n\
+              pref(\"toolkit.telemetry.unified\", false);\n\
+              pref(\"toolkit.telemetry.archive.enabled\", false);\n\
+              pref(\"app.normandy.enabled\", false);\n\
+              pref(\"app.shield.optoutstudies.enabled\", false);\n\
+              pref(\"browser.newtabpage.activity-stream.feeds.section.topstories\", false);\n\
+              // No spare content process launched ahead of time: here a new\n\
+              // process is a full fork+exec that maps libxul and starts a JS\n\
+              // engine, so a spare costs seconds of CPU at every launch.\n\
+              pref(\"dom.ipc.processPrelaunch.enabled\", false);\n",
         )
         .unwrap();
     }
@@ -2905,6 +2938,48 @@ mod tests {
     /// The prefs every profile reads (`defaults/pref/eclipse-os.js`), for
     /// both install dirs. The media and HTTP/3 lines are what make YouTube
     /// play on a CPU-only machine; see `write_firefox_default_prefs`.
+    /// Every QEMU boot is a first run (the root is a fresh RAM image), so the
+    /// first-run pages and Firefox's own background work ran at every launch.
+    /// Safe Browsing and Fission are protection and must stay at their
+    /// defaults.
+    #[test]
+    fn firefox_skips_first_run_and_background_work_but_keeps_its_protections() {
+        let dir =
+            std::env::temp_dir().join(format!("eclipse-ff-firstrun-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        for (_, app) in FIREFOX_PACKAGES {
+            fs::create_dir_all(dir.join(app)).unwrap();
+        }
+        write_firefox_default_prefs(&dir);
+        for (pkg, app) in FIREFOX_PACKAGES {
+            let prefs =
+                fs::read_to_string(dir.join(app).join("defaults/pref/eclipse-os.js")).unwrap();
+            for line in [
+                "pref(\"datareporting.policy.dataSubmissionPolicyBypassNotification\", true);\n",
+                "pref(\"datareporting.policy.firstRunURL\", \"\");\n",
+                "pref(\"browser.aboutwelcome.enabled\", false);\n",
+                "pref(\"browser.startup.homepage_override.mstone\", \"ignore\");\n",
+                "pref(\"browser.shell.checkDefaultBrowser\", false);\n",
+                "pref(\"datareporting.healthreport.uploadEnabled\", false);\n",
+                "pref(\"toolkit.telemetry.unified\", false);\n",
+                "pref(\"toolkit.telemetry.archive.enabled\", false);\n",
+                "pref(\"app.normandy.enabled\", false);\n",
+                "pref(\"app.shield.optoutstudies.enabled\", false);\n",
+                "pref(\"browser.newtabpage.activity-stream.feeds.section.topstories\", false);\n",
+                "pref(\"dom.ipc.processPrelaunch.enabled\", false);\n",
+            ] {
+                assert!(prefs.contains(line), "{pkg}: missing {line:?} in\n{prefs}");
+            }
+            for kept in ["browser.safebrowsing", "fission.autostart"] {
+                assert!(
+                    !prefs.contains(kept),
+                    "{pkg}: {kept} is protection and stays at Firefox's default"
+                );
+            }
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn firefox_prefers_h264_and_http2_on_a_cpu_only_machine() {
         let dir =

@@ -917,6 +917,15 @@ pub extern "C" fn trap_handler(tf: &mut TrapFrame) {
             // core's busy time to user vs kernel for /proc/perf.
             if vector == X86_INT_APIC_TIMER {
                 crate::kstats::note_tick_context(tf.cs & 0b11 == 0b11, tf.rip as u64);
+                // Kernel CPU profile (`/proc/perf/ktop`): a tick that caught
+                // ring 0 doing work, as opposed to halted in the idle loop.
+                if tf.cs & 0b11 == 0b00 {
+                    if crate::kstats::current_cpu_in_idle() {
+                        crate::ktop::note_idle_tick();
+                    } else {
+                        crate::ktop::note_kernel_tick(tf.rip as u64, tf.rbp as u64);
+                    }
+                }
             }
             // Woke a halted idle executor: verify its resume path is still a
             // callable return chain BEFORE running any tick work on it (and
