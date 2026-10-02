@@ -1816,6 +1816,25 @@ NV_STATUS eclipse_rm_step17(NvU32 gpuInstance, EclipseGrChannel *pOut)
         threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
         return status;
     }
+    /* The GPU lock, not just the API lock. `RMAPI_GPU_LOCK_INTERNAL` is the
+     * caller's assertion that the per-GPU lock is already held, and every
+     * other entry point in this file that uses that interface takes it (see
+     * eclipse_rm_hwflip_init). These four did not, so any control that
+     * reaches the GSP RPC path landed in `rpcRmApiControl_GSP`'s
+     * `!rmDeviceGpuLockIsOwner` arm: NVIDIA logged "Calling RPC RmControl
+     * ... without adequate locks!", asserted "RPC locking violation" and
+     * then did the safe-lock upgrade itself. It worked, which is why nobody
+     * noticed, but the window between the control and that upgrade ran
+     * unlocked -- and on a dual-GPU box that is a real race, not a cosmetic
+     * assert. Seen on hardware at 150.102539 (ctx_alloc for halloy). */
+    status = rmGpuLocksAcquire(GPUS_LOCK_FLAGS_NONE, RM_LOCK_MODULES_INIT);
+    if (status != NV_OK)
+    {
+        rmapiLockRelease();
+        gpumgrThreadDisableExpandedGpuVisibility();
+        threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
+        return status;
+    }
 
     pRmApi = rmapiGetInterface(RMAPI_GPU_LOCK_INTERNAL);
     status = serverGetClientUnderLock(&g_resServ, g_grAllocCache.hClient, &pRsClient);
@@ -2034,6 +2053,7 @@ done:
     status = NV_OK; /* per-stage statuses carry the failure */
 
 unlock:
+    rmGpuLocksRelease(GPUS_LOCK_FLAGS_NONE, NULL);
     rmapiLockRelease();
     gpumgrThreadDisableExpandedGpuVisibility();
     threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
@@ -2166,6 +2186,16 @@ NV_STATUS eclipse_rm_ctx_alloc(NvU32 gpuInstance, NvU32 ctxIdx, EclipseCtxAlloc 
     status = rmapiLockAcquire(API_LOCK_FLAGS_NONE, RM_LOCK_MODULES_INIT);
     if (status != NV_OK)
     {
+        gpumgrThreadDisableExpandedGpuVisibility();
+        threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
+        return status;
+    }
+    /* The GPU lock as well as the API lock -- see eclipse_rm_step17 for why
+     * `RMAPI_GPU_LOCK_INTERNAL` without it is the "RPC locking violation". */
+    status = rmGpuLocksAcquire(GPUS_LOCK_FLAGS_NONE, RM_LOCK_MODULES_INIT);
+    if (status != NV_OK)
+    {
+        rmapiLockRelease();
         gpumgrThreadDisableExpandedGpuVisibility();
         threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
         return status;
@@ -2426,6 +2456,7 @@ done:
     status = NV_OK; /* per-stage status carries the failure */
 
 unlock:
+    rmGpuLocksRelease(GPUS_LOCK_FLAGS_NONE, NULL);
     rmapiLockRelease();
     gpumgrThreadDisableExpandedGpuVisibility();
     threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
@@ -2489,6 +2520,16 @@ NV_STATUS eclipse_rm_ctx_free(NvU32 gpuInstance, NvU32 ctxIdx)
         threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
         return status;
     }
+    /* The GPU lock as well as the API lock -- see eclipse_rm_step17 for why
+     * `RMAPI_GPU_LOCK_INTERNAL` without it is the "RPC locking violation". */
+    status = rmGpuLocksAcquire(GPUS_LOCK_FLAGS_NONE, RM_LOCK_MODULES_INIT);
+    if (status != NV_OK)
+    {
+        rmapiLockRelease();
+        gpumgrThreadDisableExpandedGpuVisibility();
+        threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
+        return status;
+    }
     pRmApi = rmapiGetInterface(RMAPI_GPU_LOCK_INTERNAL);
 
     pCtx = &g_ctxAlloc[ctxIdx];
@@ -2542,6 +2583,7 @@ NV_STATUS eclipse_rm_ctx_free(NvU32 gpuInstance, NvU32 ctxIdx)
     portMemSet(pCtx, 0, sizeof(*pCtx));
     g_ctxDone[ctxIdx] = NV_FALSE;
 
+    rmGpuLocksRelease(GPUS_LOCK_FLAGS_NONE, NULL);
     rmapiLockRelease();
     gpumgrThreadDisableExpandedGpuVisibility();
     threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
@@ -2600,6 +2642,16 @@ NV_STATUS eclipse_rm_ctx0_reset(NvU32 gpuInstance)
         threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
         return status;
     }
+    /* The GPU lock as well as the API lock -- see eclipse_rm_step17 for why
+     * `RMAPI_GPU_LOCK_INTERNAL` without it is the "RPC locking violation". */
+    status = rmGpuLocksAcquire(GPUS_LOCK_FLAGS_NONE, RM_LOCK_MODULES_INIT);
+    if (status != NV_OK)
+    {
+        rmapiLockRelease();
+        gpumgrThreadDisableExpandedGpuVisibility();
+        threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
+        return status;
+    }
     pRmApi = rmapiGetInterface(RMAPI_GPU_LOCK_INTERNAL);
 
     /* Drop peer-fence mappings that involve ctx0 (as consumer or producer)
@@ -2631,6 +2683,7 @@ NV_STATUS eclipse_rm_ctx0_reset(NvU32 gpuInstance)
         {
             nv_printf(0, "[eclipse-rm-trace] ctx0_reset: Free(hCompute=0x%x) -> 0x%x\n",
                       g_grChanCache.hCompute, status);
+            rmGpuLocksRelease(GPUS_LOCK_FLAGS_NONE, NULL);
             rmapiLockRelease();
             gpumgrThreadDisableExpandedGpuVisibility();
             threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
@@ -2655,6 +2708,7 @@ NV_STATUS eclipse_rm_ctx0_reset(NvU32 gpuInstance)
         {
             nv_printf(0, "[eclipse-rm-trace] ctx0_reset: Free(hChannel=0x%x) -> 0x%x (cache kept)\n",
                       g_grChanCache.hChannel, status);
+            rmGpuLocksRelease(GPUS_LOCK_FLAGS_NONE, NULL);
             rmapiLockRelease();
             gpumgrThreadDisableExpandedGpuVisibility();
             threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
@@ -2674,6 +2728,7 @@ NV_STATUS eclipse_rm_ctx0_reset(NvU32 gpuInstance)
     g_grChanDone = NV_FALSE;
     nv_printf(0, "[eclipse-rm-trace] ctx0_reset: step17 channel cache cleared; next step17 rebuilds ctx0\n");
 
+    rmGpuLocksRelease(GPUS_LOCK_FLAGS_NONE, NULL);
     rmapiLockRelease();
     gpumgrThreadDisableExpandedGpuVisibility();
     threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
