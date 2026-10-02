@@ -364,6 +364,15 @@ pub fn try_contain(what: &str, restore_kd: Option<u32>) {
         kernel_hal::console::set_kd_mode(mode);
     }
 
+    // Containment is about to succeed, so whatever stop screen the fault path
+    // painted on its way here is void: the machine keeps running, the
+    // compositor repaints over it, and a LATER stop must be free to claim the
+    // screen from the top again rather than append under a report nobody can
+    // see any more. (The stop screen is cumulative so that a panic, a kernel
+    // #PF and the deadlock detector all fit in one photograph -- see
+    // `kernel_hal::stop_screen`.)
+    kernel_hal::stop_screen::reset();
+
     // The delicate part is done and only the context switch is left, so release
     // the re-entrancy guard: a later fault on this CPU should get its own
     // chance to be contained.

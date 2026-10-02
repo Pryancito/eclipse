@@ -129,7 +129,7 @@ const VERDICT_RESERVE: usize = 256;
 ///   the end. There is no scrolling back on a photograph of a wedged machine.
 /// * `dropped` counts what was lost, so [`truncated`] can say so out loud
 ///   instead of leaving a reader to wonder whether the banner ended or was cut.
-struct StackBuf {
+pub(crate) struct StackBuf {
     buf: [u8; BANNER_BYTES],
     len: usize,
     /// Bytes at the end of `buf` that `write_str` will not fill.
@@ -140,7 +140,7 @@ struct StackBuf {
 
 impl StackBuf {
     /// A buffer whose whole length is writable.
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             buf: [0u8; BANNER_BYTES],
             len: 0,
@@ -171,7 +171,7 @@ impl StackBuf {
     /// The banner as a string. Truncation can split a multi-byte character, so
     /// what is returned is the valid prefix -- this used to be spelled out at
     /// each call site.
-    fn valid_str(&self) -> &str {
+    pub(crate) fn valid_str(&self) -> &str {
         match core::str::from_utf8(&self.buf[..self.len]) {
             Ok(s) => s,
             Err(e) => core::str::from_utf8(&self.buf[..e.valid_up_to()]).unwrap_or(""),
