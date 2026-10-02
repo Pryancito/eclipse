@@ -465,6 +465,20 @@ impl Syscall<'_> {
                         .unwrap_or(1);
                     return write_sockopt_out(optval, optlen, &ucred_of(pid));
                 }
+                // SO_TYPE (3): SOCK_STREAM / SOCK_DGRAM / ... Python's `ssl`
+                // asks it of every socket it wraps (`SSLSocket._create` raises
+                // unless the answer is SOCK_STREAM), so without it every HTTPS
+                // request from Python -- `requests`, ytmusicapi -- failed with
+                // OSError(92, 'Protocol not available').
+                const SO_TYPE: usize = 3;
+                if optname == SO_TYPE {
+                    let file_like = self.linux_process().get_file_like(sockfd.into())?;
+                    let ty = file_like
+                        .as_socket()?
+                        .socket_type()
+                        .ok_or(LxError::ENOPROTOOPT)?;
+                    return write_sockopt_out(optval, optlen, &(ty as u32).to_ne_bytes());
+                }
                 let optname = match SolOptname::try_from(optname) {
                     Ok(optname) => optname,
                     Err(_) => {
