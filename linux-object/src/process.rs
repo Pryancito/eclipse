@@ -291,14 +291,21 @@ impl ProcessExt for Process {
                         // drop is the detach of every attachment, which
                         // locks each segment, and `fork` locks the segments
                         // under this process's lock.
+                        // The futex table is the third: `clear()` dropped
+                        // every `Arc<Futex>` in place, and the last one takes
+                        // its waiter queue and its owner `Thread` -- whose
+                        // `proc` is a strong `Arc` back to this very process --
+                        // with it. It has its own lock now (see
+                        // `LinuxProcess::futexes`), so it comes out the same
+                        // way and goes with every lock released.
                         let dropped = {
+                            let futexes = core::mem::take(&mut *lp.futexes.lock());
                             let mut inner = lp.inner.lock();
                             let files = core::mem::take(&mut inner.files);
                             inner.cloexec_fds.clear();
-                            inner.futexes.clear();
                             inner.semaphores = Default::default();
                             let shm = core::mem::take(&mut inner.shm_identifiers);
-                            (files, shm)
+                            (files, shm, futexes)
                         };
                         drop(dropped);
                     }
@@ -511,6 +518,7 @@ impl ProcessExt for Process {
             parent: Mutex::new(Arc::downgrade(parent)),
             vt: linux_parent.vt,
             perf: crate::perf::ProcPerf::new(),
+            futexes: Default::default(),
             itimers: Default::default(),
             aspace_lock: Mutex::new(()),
             inner: Mutex::new(linux_parent_inner.forked_child(
@@ -577,14 +585,21 @@ impl ProcessExt for Process {
                         // drop is the detach of every attachment, which
                         // locks each segment, and `fork` locks the segments
                         // under this process's lock.
+                        // The futex table is the third: `clear()` dropped
+                        // every `Arc<Futex>` in place, and the last one takes
+                        // its waiter queue and its owner `Thread` -- whose
+                        // `proc` is a strong `Arc` back to this very process --
+                        // with it. It has its own lock now (see
+                        // `LinuxProcess::futexes`), so it comes out the same
+                        // way and goes with every lock released.
                         let dropped = {
+                            let futexes = core::mem::take(&mut *lp.futexes.lock());
                             let mut inner = lp.inner.lock();
                             let files = core::mem::take(&mut inner.files);
                             inner.cloexec_fds.clear();
-                            inner.futexes.clear();
                             inner.semaphores = Default::default();
                             let shm = core::mem::take(&mut inner.shm_identifiers);
-                            (files, shm)
+                            (files, shm, futexes)
                         };
                         drop(dropped);
                     }
@@ -969,6 +984,29 @@ pub struct LinuxProcess {
     inner: Mutex<LinuxProcessInner>,
     /// Per-process syscall accounting (surfaced at `/proc/<pid>/perf`).
     perf: crate::perf::ProcPerf,
+    /// The process's futex objects, keyed by the address of their word.
+    ///
+    /// Outside `inner` ON PURPOSE, like `itimers` right below. `inner` is this
+    /// process's big lock: the file-descriptor table, the credentials, the
+    /// job-control state and the child list all live under it, and well over a
+    /// hundred call sites in this file take it -- among them every descriptor
+    /// lookup, so every `read`, `write` and `ioctl`. The futex table is on an entirely
+    /// different hot path -- every contended `pthread_mutex_lock`, every
+    /// `pthread_cond_wait` and every `pthread_cond_signal` of a threaded
+    /// program looks one up here -- and nothing correlates the two. These are
+    /// IRQ-off spin locks, so sharing one made each path burn another CPU's
+    /// cycles waiting on the other for no reason: a thread handing off a
+    /// condition variable queued behind a `fork` cloning the whole file table
+    /// under that same lock.
+    ///
+    /// A fresh `LinuxProcess` always starts with an empty table, `fork`
+    /// included: the objects are keyed by address in *this* address space and
+    /// hold *this* process's waiters. The child's memory is a copy -- same
+    /// addresses, different pages, nobody waiting -- so handing it the parent's
+    /// objects would let a `futex_wake` in the child reach threads of the
+    /// parent waiting on their own memory. Living outside `inner` makes that
+    /// structural: there is no inheritance to forget.
+    futexes: Mutex<FutexTable>,
     /// Interval timers (`setitimer(2)`), indexed by ITIMER_REAL/VIRTUAL/PROF.
     /// Outside `inner` so timer-wheel callbacks never contend the big lock.
     /// A fresh process starts disarmed, and `fork` deliberately does not copy
@@ -1041,8 +1079,6 @@ struct LinuxProcessInner {
     semaphores: SemProc,
     /// Share Memory
     shm_identifiers: ShmProc,
-    /// Futexes
-    futexes: FutexTable,
     /// Child processes
     children: HashMap<KoID, Arc<Process>>,
     /// Exit codes and final CPU usage for children already detached (freed
@@ -1484,6 +1520,7 @@ impl LinuxProcess {
             parent: Mutex::new(Weak::default()),
             vt,
             perf: crate::perf::ProcPerf::new(),
+            futexes: Default::default(),
             itimers: Default::default(),
             aspace_lock: Mutex::new(()),
             inner: Mutex::new(LinuxProcessInner {
@@ -1706,10 +1743,10 @@ impl LinuxProcess {
             return None;
         }
         // The table's sweep hands its victims out rather than dropping them in
-        // place, so they go with `inner` released: see
+        // place, so they go with the futex lock released: see
         // `FutexTable::get_or_create`.
         let mut swept = Vec::new();
-        let futex = self.inner.lock().futexes.get_or_create(
+        let futex = self.futexes.lock().get_or_create(
             uaddr,
             || {
                 let value = unsafe { &*(uaddr as *const AtomicI32) };
@@ -3961,9 +3998,6 @@ impl LinuxProcessInner {
             job_stop_sig: 0,
             job_stop_pending: false,
             job_continued_pending: false,
-            // Kernel-side futex objects are keyed by address in *this*
-            // address space; the child gets its own.
-            futexes: Default::default(),
             // `SemProc`'s own `Clone` says what a fork needs -- "Fork the
             // semaphore table. Clear undo info." -- and fork was not using
             // it. Through `..Default::default()` the child lost the sets its
@@ -5926,14 +5960,53 @@ mod fork_inheritance_tests {
         // different pages, and nobody waiting. Handing the child the
         // parent's objects would have a `futex_wake` in the child reach
         // threads of the parent that are waiting on their own memory.
+        //
+        // The table hangs off the PROCESS now rather than the inner state a
+        // fork clones (see `LinuxProcess::futexes`), so there is no
+        // inheritance step left to get wrong. What is left to pin is the
+        // consequence: `fork` builds a fresh `LinuxProcess`, and a fresh one
+        // starts with an empty table however full the process it came from is.
         static WORD: AtomicI32 = AtomicI32::new(0);
-        let mut parent = a_configured_parent();
+        let parent = super::dup_fd_tests::a_process();
         parent
             .futexes
+            .lock()
             .get_or_create_dropping_swept(0x1000, || Futex::new(&WORD));
+        assert_eq!(parent.futexes.lock().len(), 1);
 
-        let child = fork_of(&parent);
-        assert!(child.futexes.is_empty());
+        let child = super::dup_fd_tests::a_process();
+        assert!(child.futexes.lock().is_empty());
+    }
+
+    #[test]
+    fn a_futex_lookup_and_the_big_process_lock_do_not_wait_for_each_other() {
+        // The point of giving the table its own lock. On the machine both are
+        // IRQ-off spin locks, so a holder of one really does burn the other
+        // CPU's cycles: a thread handing off a condition variable used to
+        // queue behind an unrelated descriptor lookup, or behind a `fork`
+        // cloning the whole file table under that same lock.
+        static WORD: AtomicI32 = AtomicI32::new(0);
+        let proc = super::dup_fd_tests::a_process();
+
+        let futexes = proc.futexes.lock();
+        assert!(
+            proc.inner.try_lock().is_some(),
+            "a futex lookup must not hold the big process lock"
+        );
+        drop(futexes);
+
+        let inner = proc.inner.lock();
+        assert!(
+            proc.futexes.try_lock().is_some(),
+            "a futex lookup must not wait for the big process lock"
+        );
+        // And it really does complete with that lock held, rather than merely
+        // finding the table's own lock free.
+        proc.futexes
+            .lock()
+            .get_or_create_dropping_swept(0x2000, || Futex::new(&WORD));
+        assert_eq!(proc.futexes.lock().len(), 1);
+        drop(inner);
     }
 }
 
@@ -9672,6 +9745,7 @@ mod dup_fd_tests {
             parent: Mutex::new(Weak::default()),
             vt: 0,
             perf: crate::perf::ProcPerf::new(),
+            futexes: Default::default(),
             itimers: Default::default(),
             aspace_lock: Mutex::new(()),
             inner: Mutex::new(LinuxProcessInner::default()),
