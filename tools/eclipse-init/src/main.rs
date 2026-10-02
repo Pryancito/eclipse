@@ -56,6 +56,11 @@ static COMPOSITOR_EXITS: AtomicU32 = AtomicU32::new(0);
 /// Exits of the GPU-rendered compositor tolerated before degrading to pixman.
 const COMPOSITOR_DEGRADE_AFTER: u32 = 2;
 
+/// Written when the session's compositor is on pixman although a GPU renderer
+/// was asked for; `/run` is wiped at boot, so it lasts one boot. The labwc
+/// wrapper writes it too (xtask `write_labwc_wrapper`).
+const RENDERER_FALLBACK_MARKER: &str = "/run/labwc-renderer-fallback";
+
 /// Whether this boot wants the GPU-rendered wlroots compositor (GLES2/zink or
 /// Vulkan). True for `nvidia.nouveau_uapi` on NVIDIA unless
 /// `nvidia.wlr_pixman` kills the path; `nvidia.wlr_vulkan` / `nvidia.wlr_gles2`
@@ -1707,6 +1712,10 @@ fn supervise(services: &mut BTreeMap<String, Service>) {
                 let n = COMPOSITOR_EXITS.fetch_add(1, Ordering::Relaxed) + 1;
                 if n >= COMPOSITOR_DEGRADE_AFTER {
                     COMPOSITOR_DEGRADED.store(true, Ordering::Relaxed);
+                    // Same marker the labwc wrapper writes when it falls back
+                    // itself: the GL wrappers (eclipse-firefox) read it and stay
+                    // off zink, which with no GPU path lands on lavapipe.
+                    let _ = std::fs::write(RENDERER_FALLBACK_MARKER, "init-degraded\n");
                     log(&format!(
                         "respawn: labwc died {n}x this boot on the GPU renderer ({how}); \
                          degrading the compositor to pixman for the rest of this boot -- \
