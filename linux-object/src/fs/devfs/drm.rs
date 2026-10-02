@@ -5994,6 +5994,20 @@ fn next_vblank_deadline() -> Duration {
     let period = vblank_period_ns();
     let mut st = DRM_STATE.lock();
     let last_ns = u64::try_from(st.next_vblank.as_nanos()).unwrap_or(0);
+    // There has been no vblank at all yet: `next_vblank` starts at zero and
+    // only a completion (or a test) ever seeds it, so the FIRST frame of a
+    // boot measured its "time since the last vblank" from the epoch. On
+    // hardware that printed `missed refresh slot (12430386us since last
+    // vblank)` at the very first present -- twelve seconds, which is the
+    // uptime, not a missed frame. Worse than cosmetic: that message is
+    // deliberately one-shot, so the first frame spent it and a REAL catch-up
+    // later in the session could never be reported. Seed the lattice and
+    // deliver immediately, silently, which is what the catch-up arm below
+    // would do anyway.
+    if last_ns == 0 {
+        st.next_vblank = Duration::from_nanos((now_ns / period) * period);
+        return now;
+    }
     let next_from_last = last_ns.saturating_add(period);
     if next_from_last <= now_ns {
         static CATCHUP_LOGGED: AtomicBool = AtomicBool::new(false);
@@ -9364,6 +9378,60 @@ mod partial_present_cursor_sync_tests {
 /// Tests for the "one page flip outstanding" invariant, driven single-threaded
 /// with no timers: the queue and the pending latch are private statics in this
 /// module, so a test can put them into exactly the state the race produced.
+#[cfg(test)]
+mod vblank_phase_tests {
+    use super::*;
+
+    /// The first frame of a boot has had no vblank, so there is no "time since
+    /// the last vblank" to report. `next_vblank` starts at zero, and measuring
+    /// from the epoch printed `missed refresh slot (12430386us since last
+    /// vblank)` at the very first present on real hardware -- twelve seconds,
+    /// which was the uptime. The message is one-shot, so that false alarm also
+    /// spent the one report a REAL catch-up would ever get.
+    ///
+    /// What the first call must do instead: seed the lattice and deliver now,
+    /// silently. This test pins the seeding, which is the observable half --
+    /// the phase has to land on a period boundary at or just below `now`, not
+    /// stay at zero and not jump ahead of `now`.
+    #[test]
+    fn the_first_frame_of_a_boot_seeds_the_phase_instead_of_reporting_a_missed_slot() {
+        let period = vblank_period_ns();
+        DRM_STATE.lock().next_vblank = Duration::ZERO;
+
+        let before = kernel_hal::timer::timer_now();
+        let deadline = next_vblank_deadline();
+        let after = kernel_hal::timer::timer_now();
+
+        // Delivered immediately: the deadline is the `now` it read, which lies
+        // in the window this test bracketed.
+        assert!(
+            deadline >= before && deadline <= after,
+            "first frame must deliver at once, got {:?} outside {:?}..={:?}",
+            deadline,
+            before,
+            after
+        );
+
+        // And the phase is now on the lattice, below `now`, not still zero.
+        let seeded = u64::try_from(DRM_STATE.lock().next_vblank.as_nanos()).unwrap();
+        assert_ne!(seeded, 0, "the phase was left unseeded");
+        assert_eq!(seeded % period, 0, "the phase sits off-grid");
+        let now_ns = u64::try_from(deadline.as_nanos()).unwrap();
+        assert!(seeded <= now_ns && now_ns - seeded < period);
+
+        // A second call, one period on, is an ordinary on-time frame: it waits
+        // for the slot rather than taking the catch-up path again.
+        let next = next_vblank_deadline();
+        assert!(
+            next > deadline,
+            "a seeded phase must pace the next frame, got {:?} <= {:?}",
+            next,
+            deadline
+        );
+        DRM_STATE.lock().next_vblank = Duration::ZERO;
+    }
+}
+
 #[cfg(test)]
 mod flip_latch_tests {
     extern crate std;
