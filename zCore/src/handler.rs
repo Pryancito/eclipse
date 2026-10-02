@@ -270,6 +270,27 @@ impl KernelHandler for ZcoreKernelHandler {
             // The rev tag answers "which kernel produced this paste?" from the
             // crash text alone — klog lines are invisible at LOG=warn, and two
             // hunts have already stalled on exactly that ambiguity.
+            // Onto the stop screen as well, for the same reason as the
+            // unresolved-vmar path below: on a box with a monitor and no
+            // serial capture, a halt that printed only to serial is a silent
+            // freeze. After `try_contain`, so a contained fault leaves the
+            // live desktop alone.
+            #[cfg(not(feature = "libos"))]
+            {
+                use core::fmt::Write;
+                let mut b = crate::lang::StackBuf::new();
+                let _ = write!(
+                    b,
+                    "KERNEL NULL-RANGE PAGE FAULT cpu={} vaddr={:#x} flags={:?}\nrip={}\n\
+                     in_timer={} (not a userspace-caused fault)",
+                    kernel_hal::cpu::cpu_id(),
+                    fault_vaddr,
+                    access_flags,
+                    kernel_hal::ksyms::Addr(kernel_hal::kstats::last_fault_rip()),
+                    in_timer,
+                );
+                kernel_hal::console::panic_banner(b.valid_str());
+            }
             serial_literal_spin("\n[KERNEL BUG] halting (diag rev 10)\n");
             loop {
                 core::hint::spin_loop();
@@ -478,7 +499,8 @@ fn report_unresolved_kernel_fault(
     kernel_hal::console::serial_write_fmt_spin(format_args!(
         "\n[KERNEL PAGE FAULT] vaddr={:#x} flags={:?} rip={} have_thread={} \
          (unresolved by the user vmar — a kernel-side bug, not a userspace \
-         SIGSEGV; serial-only so a torn graphic console cannot re-fault us)\n",
+         SIGSEGV; the text console is skipped so a torn graphic console cannot \
+         re-fault us)\n",
         fault_vaddr,
         access_flags,
         kernel_hal::ksyms::Addr(rip),
@@ -495,6 +517,37 @@ fn report_unresolved_kernel_fault(
     crate::oops::try_contain("kernel #PF unresolved by user vmar", None);
     // Containment declined (a lock was held, no coroutine to abandon, or the
     // budget is spent): halt with the single diagnosis above — no cascade.
+    //
+    // Put that diagnosis on the stop screen too, which on a machine with a
+    // monitor and no serial capture is the only place anybody will ever read
+    // it. The report above is serial-only, and the reasoning for that ("a torn
+    // framebuffer mapping re-faults us") is about the GRAPHIC CONSOLE --
+    // `vt_console_write_str`, with its cell cache and its locks.
+    // `panic_banner` is the other thing entirely: raw pixel writes to the GOP
+    // framebuffer behind atomics, no locks, no allocation, which is exactly why
+    // the panic handler reaches for it first. Without it, a kernel #PF that
+    // stranded a lock showed the owner nothing but the deadlock detector's
+    // banner eight seconds later -- a convoy of CPUs stuck on a lock, and no
+    // sign of the fault that stranded it.
+    //
+    // AFTER `try_contain`, not before: a contained fault leaves the machine
+    // running, and a full-screen "the machine is halted" over a live desktop
+    // would be a lie that costs the user their session.
+    {
+        use core::fmt::Write;
+        let mut b = crate::lang::StackBuf::new();
+        let _ = write!(
+            b,
+            "KERNEL PAGE FAULT cpu={} vaddr={:#x} flags={:?}\nrip={}\nhave_thread={} \
+             (unresolved by the user vmar: a kernel-side bug, not a userspace SIGSEGV)",
+            kernel_hal::cpu::cpu_id(),
+            fault_vaddr,
+            access_flags,
+            kernel_hal::ksyms::Addr(rip),
+            have_thread,
+        );
+        kernel_hal::console::panic_banner(b.valid_str());
+    }
     serial_literal_spin("\n[KERNEL BUG] halting (diag rev 11)\n");
     loop {
         core::hint::spin_loop();

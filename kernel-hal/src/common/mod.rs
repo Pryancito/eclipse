@@ -33,6 +33,7 @@ pub mod panic_lock;
 pub mod phys_watch;
 pub mod rand;
 pub mod rtc;
+pub mod stop_screen;
 pub mod timer_waker;
 pub mod tsc_cal;
 pub mod user;

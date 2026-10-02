@@ -80,7 +80,7 @@ pub use common::boot_logo;
 pub use common::{
     addr, affinity_walk, cache_maint, cmdline, console, context, deadline, defs::*, dma_pin,
     dma_quarantine, fault_diag, fault_slots, hart_walk, ipi::*, kaddr, kstats, ksyms, ktop,
-    oops_log, panic_lock, phys_watch, timer_waker, user, watchpoint,
+    oops_log, panic_lock, phys_watch, stop_screen, timer_waker, user, watchpoint,
 };
 pub use config::KernelConfig;
 pub use imp::{
