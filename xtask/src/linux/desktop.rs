@@ -1320,10 +1320,30 @@ fn write_firefox_wrapper(rootfs: &Path) {
           export MOZ_DISABLE_GPU_SANDBOX=1\n\
           export MOZ_DISABLE_SOCKET_PROCESS_SANDBOX=1\n\
           # GPU WebRender when NVIDIA + nouveau_uapi and not forced to pixman;\n\
-          # otherwise software (QEMU / no GPU / nvidia.wlr_pixman).\n\
+          # otherwise software (QEMU / no GPU / nvidia.wlr_pixman, or the labwc\n\
+          # wrapper fell back to pixman because the GPU renderer failed to init).\n\
+          #\n\
+          # And only when NVK really exposes the GPU. Zink takes ANY Vulkan\n\
+          # device, and lavapipe (mesa-vulkan-swrast) is installed as the\n\
+          # floor for Xwayland's glamor. So with NVK unusable, the GPU path\n\
+          # silently became GL on zink on lavapipe -- GL_RENDERER 'zink Vulkan\n\
+          # 1.4(llvmpipe ...)', seen on the RTX -- slower than software\n\
+          # WebRender, and Firefox logs a GraphicsCriticalError 'Couldn't\n\
+          # sanitize GL_RENDERER' for every window. So pin the Vulkan loader to\n\
+          # NVK's manifest alone, and ask vulkaninfo (vulkan-tools) whether NVK\n\
+          # enumerates a device before taking the GPU path at all.\n\
+          NVK_ICD=\n\
+          for f in /usr/share/vulkan/icd.d/nouveau_icd.*.json; do\n\
+          \x20 [ -r \"$f\" ] && { NVK_ICD=$f; break; }\n\
+          done\n\
           if grep -q 'nvidia\\.nouveau_uapi' /proc/cmdline 2>/dev/null && \\\n\
           \x20\x20 [ \"$(tr -d '[:space:]' < /sys/class/drm/card0/device/vendor 2>/dev/null)\" = \"0x10de\" ] && \\\n\
-          \x20\x20 ! grep -q 'nvidia\\.wlr_pixman' /proc/cmdline 2>/dev/null; then\n\
+          \x20\x20 ! grep -q 'nvidia\\.wlr_pixman' /proc/cmdline 2>/dev/null && \\\n\
+          \x20\x20 [ ! -e /run/labwc-renderer-fallback ] && [ -n \"$NVK_ICD\" ] && \\\n\
+          \x20\x20 { ! command -v vulkaninfo >/dev/null 2>&1 || \\\n\
+          \x20\x20\x20 VK_DRIVER_FILES=\"$NVK_ICD\" VK_ICD_FILENAMES=\"$NVK_ICD\" \\\n\
+          \x20\x20\x20 vulkaninfo --summary 2>/dev/null | grep -q 'PHYSICAL_DEVICE_TYPE_DISCRETE_GPU\\|PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU'; }; then\n\
+          \x20 export VK_DRIVER_FILES=\"$NVK_ICD\" VK_ICD_FILENAMES=\"$NVK_ICD\"\n\
           \x20 export GALLIUM_DRIVER=\"${GALLIUM_DRIVER:-zink}\"\n\
           \x20 export MESA_LOADER_DRIVER_OVERRIDE=\"${MESA_LOADER_DRIVER_OVERRIDE:-zink}\"\n\
           \x20 unset LIBGL_ALWAYS_SOFTWARE MOZ_WEBRENDER_SOFTWARE 2>/dev/null\n\
@@ -1333,6 +1353,11 @@ fn write_firefox_wrapper(rootfs: &Path) {
           \x20 export LIBGL_ALWAYS_SOFTWARE=1\n\
           \x20 export MOZ_WEBRENDER_SOFTWARE=1\n\
           \x20 export MOZ_ACCELERATED=0\n\
+          \x20 # An NVK-less GPU session lands here too; log why, once per launch.\n\
+          \x20 if grep -q 'nvidia\\.nouveau_uapi' /proc/cmdline 2>/dev/null && \\\n\
+          \x20\x20\x20 [ ! -e /run/labwc-renderer-fallback ]; then\n\
+          \x20\x20 NVK_SW_REASON='NVK exposes no GPU (vulkaninfo); software WebRender instead of zink on lavapipe'\n\
+          \x20 fi\n\
           fi\n\
           export MOZ_CRASHREPORTER_DISABLE=1\n\
           export NO_AT_BRIDGE=1\n\
@@ -1350,6 +1375,7 @@ fn write_firefox_wrapper(rootfs: &Path) {
           \x20 exit 127\n\
           fi\n\
           echo \"[$(date '+%H:%M:%S')] $FFBIN $* (WAYLAND_DISPLAY=${WAYLAND_DISPLAY:-UNSET} GL=${GALLIUM_DRIVER:-sw} ACCEL=${MOZ_ACCELERATED:-?})\" >>\"$FLOG\"\n\
+          [ -n \"${NVK_SW_REASON:-}\" ] && echo \"eclipse-firefox: $NVK_SW_REASON\" >>\"$FLOG\"\n\
           exec \"$FFBIN\" \"$@\" 2>>\"$FLOG\"\n",
     )
     .unwrap();
@@ -2901,14 +2927,62 @@ fn write_labwc_wrapper(rootfs: &Path) {
           : > \"$LOG\" 2>/dev/null || true\n\
           for d in /usr/bin /bin /usr/sbin /sbin; do\n\
           \x20 if [ -x \"$d/labwc\" ]; then\n\
+          \x20 set -- \"$d/labwc\" \"$@\"\n\
           \x20 # tty7: land the compositor on the reserved graphics VT even when\n\
           \x20 # launched by hand from a text VT. eclipse-init --exec-on-graphics-vt\n\
           \x20 # chvt's to tty7 then execs labwc there (reuses the existing init\n\
           \x20 # binary, no new tool); plain-exec fallback if it is absent.\n\
           \x20 if [ -x /sbin/eclipse-init ]; then\n\
-          \x20\x20 exec /sbin/eclipse-init --exec-on-graphics-vt \"$d/labwc\" \"$@\" >>\"$LOG\" 2>&1\n\
+          \x20\x20 set -- /sbin/eclipse-init --exec-on-graphics-vt \"$@\"\n\
           \x20 fi\n\
-          \x20 exec \"$d/labwc\" \"$@\" >>\"$LOG\" 2>&1\n\
+          \x20 # GPU renderer that fails to INITIALIZE: retry it once, then pixman.\n\
+          \x20 # On the NVIDIA + nvidia.nouveau_uapi path wlroots asks Mesa for EGL\n\
+          \x20 # on zink, and zink needs NVK to enumerate the GPU. When it does not\n\
+          \x20 # ('MESA: error: ZINK: failed to choose pdev' -> 'DRI2: failed to\n\
+          \x20 # create screen' -> eglInitialize EGL_NOT_INITIALIZED), labwc exits\n\
+          \x20 # at once with 'unable to create renderer', and wlroots never falls\n\
+          \x20 # back to pixman on its own. On hardware this hits the FIRST start of\n\
+          \x20 # a boot and the respawn ~250 ms later comes up on the GPU, so a\n\
+          \x20 # labwc started by hand left a shell with no desktop. So: run the GPU\n\
+          \x20 # attempt as a child; if THAT is how it died, retry it once on the\n\
+          \x20 # GPU after a short pause, and only if the retry dies the same way\n\
+          \x20 # exec labwc on pixman. Any other exit is passed through unchanged\n\
+          \x20 # for init to count. Each failed attempt's log is kept as\n\
+          \x20 # /tmp/labwc-<renderer>-<n>.log, and the marker tells the GL wrappers\n\
+          \x20 # (eclipse-firefox) that this session has no GPU path.\n\
+          \x20 # ECLIPSE_LABWC_NO_FALLBACK=1 keeps the old fail-hard behaviour.\n\
+          \x20 case \"${WLR_RENDERER:-}\" in\n\
+          \x20 gles2|vulkan)\n\
+          \x20\x20 if [ -z \"${ECLIPSE_LABWC_NO_FALLBACK:-}\" ]; then\n\
+          \x20\x20\x20 rm -f /run/labwc-renderer-fallback 2>/dev/null\n\
+          \x20\x20\x20 n=0\n\
+          \x20\x20\x20 while :; do\n\
+          \x20\x20\x20\x20 n=$((n + 1))\n\
+          \x20\x20\x20\x20 \"$@\" >>\"$LOG\" 2>&1\n\
+          \x20\x20\x20\x20 rc=$?\n\
+          \x20\x20\x20\x20 grep -q 'unable to create renderer' \"$LOG\" 2>/dev/null || exit \"$rc\"\n\
+          \x20\x20\x20\x20 FAILED=\"/tmp/labwc-$WLR_RENDERER-$n.log\"\n\
+          \x20\x20\x20\x20 cp \"$LOG\" \"$FAILED\" 2>/dev/null || true\n\
+          \x20\x20\x20\x20 [ \"$n\" -ge 2 ] && break\n\
+          \x20\x20\x20\x20 MSG=\"labwc: the $WLR_RENDERER renderer failed to initialize (log: $FAILED); retrying it once\"\n\
+          \x20\x20\x20\x20 echo \"$MSG\" > /dev/console 2>/dev/null || true\n\
+          \x20\x20\x20\x20 sleep \"${ECLIPSE_LABWC_RETRY_DELAY:-1}\"\n\
+          \x20\x20\x20\x20 : > \"$LOG\" 2>/dev/null || true\n\
+          \x20\x20\x20 done\n\
+          \x20\x20\x20 echo \"$WLR_RENDERER\" > /run/labwc-renderer-fallback 2>/dev/null || true\n\
+          \x20\x20\x20 MSG=\"labwc: the $WLR_RENDERER renderer failed to initialize twice (log: $FAILED); falling back to pixman. Check: dmesg | grep nouveau-uapi\"\n\
+          \x20\x20\x20 echo \"$MSG\" >>\"$LOG\" 2>/dev/null || true\n\
+          \x20\x20\x20 echo \"$MSG\" > /dev/console 2>/dev/null || true\n\
+          \x20\x20\x20 # Forced, not `:=`: the inherited pins are what just failed.\n\
+          \x20\x20\x20 # Clients inherit labwc's env, so they go llvmpipe too.\n\
+          \x20\x20\x20 export WLR_RENDERER=pixman WLR_RENDERER_ALLOW_SOFTWARE=1\n\
+          \x20\x20\x20 export LIBGL_ALWAYS_SOFTWARE=1 QT_QUICK_BACKEND=software\n\
+          \x20\x20\x20 export SDL_RENDER_DRIVER=software SDL_FRAMEBUFFER_ACCELERATION=0\n\
+          \x20\x20\x20 unset GALLIUM_DRIVER MESA_LOADER_DRIVER_OVERRIDE WLR_DRM_NO_MODIFIERS\n\
+          \x20\x20 fi\n\
+          \x20\x20 ;;\n\
+          \x20 esac\n\
+          \x20 exec \"$@\" >>\"$LOG\" 2>&1\n\
           \x20 fi\n\
           done\n\
           # NOT INSTALLED -- see the matching note in eclipse-seatd. `>&2` alone\n\
@@ -3774,6 +3848,118 @@ mod tests {
                 assert_eq!(gate_var(&w, "LIBGL_ALWAYS_SOFTWARE"), None, "{ctx}");
             }
         }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// GL_RENDERER 'zink Vulkan 1.4(llvmpipe ...)' on the RTX: with NVK
+    /// unusable, zink took lavapipe and Firefox's "GPU" path ran GL on CPU
+    /// Vulkan. The GPU path must be pinned to NVK and gated on NVK enumerating.
+    #[test]
+    fn firefox_gpu_path_never_lands_zink_on_lavapipe() {
+        let dir = std::env::temp_dir().join(format!("eclipse-ff-nvk-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        write_firefox_wrapper(&dir);
+        let ff = fs::read_to_string(dir.join("usr/local/bin/eclipse-firefox")).unwrap();
+        let gpu = ff.find("export GALLIUM_DRIVER=").unwrap();
+        let gate = &ff[..gpu];
+        assert!(gate.contains("/usr/share/vulkan/icd.d/nouveau_icd.*.json"));
+        assert!(gate.contains("vulkaninfo --summary"));
+        assert!(gate.contains("[ -n \"$NVK_ICD\" ]"));
+        assert!(gate.contains("export VK_DRIVER_FILES=\"$NVK_ICD\" VK_ICD_FILENAMES=\"$NVK_ICD\""));
+        assert!(!ff.contains("lvp_icd"));
+        if let Ok(st) = std::process::Command::new("sh")
+            .arg("-n")
+            .arg(dir.join("usr/local/bin/eclipse-firefox"))
+            .status()
+        {
+            assert!(st.success(), "eclipse-firefox does not parse as sh");
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Runs the generated wrapper against a fake `labwc` that fails the way
+    /// a real one does when zink cannot find the GPU, with every absolute path
+    /// it touches redirected into `dir`. Returns the fake's call log.
+    fn run_wrapper_with_fake_labwc(dir: &Path, renderer: &str, fail_on: &str) -> Option<String> {
+        let _ = fs::remove_dir_all(dir);
+        write_labwc_wrapper(dir);
+        let bin = dir.join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        let d = dir.display();
+        let fake = format!(
+            "#!/bin/sh\n\
+             echo \"$WLR_RENDERER ${{GALLIUM_DRIVER:-none}}\" >> {d}/calls\n\
+             echo x >> {d}/starts\n\
+             if [ \"$WLR_RENDERER\" = {fail_on} ] || \\\n\
+             \x20 {{ [ {fail_on} = first ] && [ \"$(wc -l < {d}/starts)\" -eq 1 ]; }}; then\n\
+             \x20 echo '[../src/server.c:532] unable to create renderer'\n\
+             \x20 exit 1\n\
+             fi\n\
+             exit 0\n"
+        );
+        fs::write(bin.join("labwc"), fake).unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(bin.join("labwc"), fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let script = fs::read_to_string(dir.join("usr/local/bin/labwc"))
+            .unwrap()
+            .replace("/usr/bin /bin /usr/sbin /sbin", &format!("{d}/bin"))
+            .replace("/sbin/eclipse-init", &format!("{d}/no-init"))
+            .replace("/tmp/labwc", &format!("{d}/labwc"))
+            .replace("/run/labwc-renderer-fallback", &format!("{d}/fallback"))
+            .replace("/dev/console", "/dev/null");
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&script)
+            .env("WLR_RENDERER", renderer)
+            .env("GALLIUM_DRIVER", "zink")
+            .env_remove("LIBGL_ALWAYS_SOFTWARE")
+            .env_remove("ECLIPSE_LABWC_NO_FALLBACK")
+            .env("ECLIPSE_LABWC_RETRY_DELAY", "0")
+            .env("SEATD_SOCK", "/nonexistent")
+            .output()
+            .ok()?;
+        assert!(
+            out.status.success(),
+            "wrapper failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        Some(fs::read_to_string(dir.join("calls")).unwrap())
+    }
+
+    /// The real-hardware failure: `nvidia.nouveau_uapi` on the RTX pins
+    /// GLES2/zink, NVK does not enumerate the GPU ('ZINK: failed to choose
+    /// pdev'), and labwc exits with 'unable to create renderer'. On hardware
+    /// only the first start of a boot does that, so the wrapper retries the
+    /// GPU once, and goes to pixman only when the retry fails too.
+    #[test]
+    fn a_gpu_renderer_that_fails_to_init_is_retried_then_falls_back_to_pixman() {
+        let dir = std::env::temp_dir().join(format!("eclipse-labwc-fb-{}", std::process::id()));
+        // Fails once, then works: the second GPU attempt is the session.
+        let Some(calls) = run_wrapper_with_fake_labwc(&dir, "gles2", "first") else {
+            return; // no host sh
+        };
+        assert_eq!(calls, "gles2 zink\ngles2 zink\n");
+        assert!(!dir.join("fallback").exists());
+        assert!(fs::read_to_string(dir.join("labwc-gles2-1.log"))
+            .unwrap()
+            .contains("unable to create renderer"));
+
+        // Fails every time: two GPU attempts, then pixman with software GL.
+        let calls = run_wrapper_with_fake_labwc(&dir, "gles2", "gles2").unwrap();
+        assert_eq!(calls, "gles2 zink\ngles2 zink\npixman none\n");
+        assert_eq!(fs::read_to_string(dir.join("fallback")).unwrap(), "gles2\n");
+        assert!(dir.join("labwc-gles2-2.log").exists());
+
+        // A GPU renderer that works is run once, and leaves no marker.
+        let calls = run_wrapper_with_fake_labwc(&dir, "gles2", "never").unwrap();
+        assert_eq!(calls, "gles2 zink\n");
+        assert!(!dir.join("fallback").exists());
+
+        // pixman is exec'd directly; nothing to retry.
+        let calls = run_wrapper_with_fake_labwc(&dir, "pixman", "never").unwrap();
+        assert_eq!(calls, "pixman zink\n");
         let _ = fs::remove_dir_all(&dir);
     }
 

@@ -12546,8 +12546,22 @@ impl NvidiaGpu {
                 let channel = match channel {
                     Ok(c) if c.sched_status == 0 => c,
                     Ok(c) => {
+                        // Every stage, not just the last: 0xffffffff means the
+                        // stage never ran, so the first non-zero one is where
+                        // step17 stopped. The 3D (TURING_A) object between
+                        // compute and sched has no status of its own: compute
+                        // 0 with sched 0xffffffff means it was that one.
                         crate::klog_warn!(
-                            "[nouveau-uapi] CHANNEL_ALLOC: compute channel incomplete (sched status {:#x})",
+                            "[nouveau-uapi] CHANNEL_ALLOC: compute channel incomplete \
+                             (userd {:#x} buf {:#x} virt {:#x} map {:#x} notif {:#x} \
+                             chan {:#x} compute {:#x} sched {:#x})",
+                            c.userd_status,
+                            c.buf_status,
+                            c.virt_status,
+                            c.map_status,
+                            c.notif_status,
+                            c.chan_status,
+                            c.compute_status,
                             c.sched_status
                         );
                         return Err(nv::ENODEV);
