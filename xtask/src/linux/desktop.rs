@@ -1322,10 +1322,28 @@ fn write_firefox_wrapper(rootfs: &Path) {
           # GPU WebRender when NVIDIA + nouveau_uapi and not forced to pixman;\n\
           # otherwise software (QEMU / no GPU / nvidia.wlr_pixman, or the labwc\n\
           # wrapper fell back to pixman because the GPU renderer failed to init).\n\
+          #\n\
+          # And only when NVK really exposes the GPU. Zink takes ANY Vulkan\n\
+          # device, and lavapipe (mesa-vulkan-swrast) is installed as the\n\
+          # floor for Xwayland's glamor. So with NVK unusable, the GPU path\n\
+          # silently became GL on zink on lavapipe -- GL_RENDERER 'zink Vulkan\n\
+          # 1.4(llvmpipe ...)', seen on the RTX -- slower than software\n\
+          # WebRender, and Firefox logs a GraphicsCriticalError 'Couldn't\n\
+          # sanitize GL_RENDERER' for every window. So pin the Vulkan loader to\n\
+          # NVK's manifest alone, and ask vulkaninfo (vulkan-tools) whether NVK\n\
+          # enumerates a device before taking the GPU path at all.\n\
+          NVK_ICD=\n\
+          for f in /usr/share/vulkan/icd.d/nouveau_icd.*.json; do\n\
+          \x20 [ -r \"$f\" ] && { NVK_ICD=$f; break; }\n\
+          done\n\
           if grep -q 'nvidia\\.nouveau_uapi' /proc/cmdline 2>/dev/null && \\\n\
           \x20\x20 [ \"$(tr -d '[:space:]' < /sys/class/drm/card0/device/vendor 2>/dev/null)\" = \"0x10de\" ] && \\\n\
           \x20\x20 ! grep -q 'nvidia\\.wlr_pixman' /proc/cmdline 2>/dev/null && \\\n\
-          \x20\x20 [ ! -e /run/labwc-renderer-fallback ]; then\n\
+          \x20\x20 [ ! -e /run/labwc-renderer-fallback ] && [ -n \"$NVK_ICD\" ] && \\\n\
+          \x20\x20 { ! command -v vulkaninfo >/dev/null 2>&1 || \\\n\
+          \x20\x20\x20 VK_DRIVER_FILES=\"$NVK_ICD\" VK_ICD_FILENAMES=\"$NVK_ICD\" \\\n\
+          \x20\x20\x20 vulkaninfo --summary 2>/dev/null | grep -q 'PHYSICAL_DEVICE_TYPE_DISCRETE_GPU\\|PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU'; }; then\n\
+          \x20 export VK_DRIVER_FILES=\"$NVK_ICD\" VK_ICD_FILENAMES=\"$NVK_ICD\"\n\
           \x20 export GALLIUM_DRIVER=\"${GALLIUM_DRIVER:-zink}\"\n\
           \x20 export MESA_LOADER_DRIVER_OVERRIDE=\"${MESA_LOADER_DRIVER_OVERRIDE:-zink}\"\n\
           \x20 unset LIBGL_ALWAYS_SOFTWARE MOZ_WEBRENDER_SOFTWARE 2>/dev/null\n\
@@ -1335,6 +1353,11 @@ fn write_firefox_wrapper(rootfs: &Path) {
           \x20 export LIBGL_ALWAYS_SOFTWARE=1\n\
           \x20 export MOZ_WEBRENDER_SOFTWARE=1\n\
           \x20 export MOZ_ACCELERATED=0\n\
+          \x20 # An NVK-less GPU session lands here too; log why, once per launch.\n\
+          \x20 if grep -q 'nvidia\\.nouveau_uapi' /proc/cmdline 2>/dev/null && \\\n\
+          \x20\x20\x20 [ ! -e /run/labwc-renderer-fallback ]; then\n\
+          \x20\x20 NVK_SW_REASON='NVK exposes no GPU (vulkaninfo); software WebRender instead of zink on lavapipe'\n\
+          \x20 fi\n\
           fi\n\
           export MOZ_CRASHREPORTER_DISABLE=1\n\
           export NO_AT_BRIDGE=1\n\
@@ -1352,6 +1375,7 @@ fn write_firefox_wrapper(rootfs: &Path) {
           \x20 exit 127\n\
           fi\n\
           echo \"[$(date '+%H:%M:%S')] $FFBIN $* (WAYLAND_DISPLAY=${WAYLAND_DISPLAY:-UNSET} GL=${GALLIUM_DRIVER:-sw} ACCEL=${MOZ_ACCELERATED:-?})\" >>\"$FLOG\"\n\
+          [ -n \"${NVK_SW_REASON:-}\" ] && echo \"eclipse-firefox: $NVK_SW_REASON\" >>\"$FLOG\"\n\
           exec \"$FFBIN\" \"$@\" 2>>\"$FLOG\"\n",
     )
     .unwrap();
@@ -3823,6 +3847,32 @@ mod tests {
                 );
                 assert_eq!(gate_var(&w, "LIBGL_ALWAYS_SOFTWARE"), None, "{ctx}");
             }
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// GL_RENDERER 'zink Vulkan 1.4(llvmpipe ...)' on the RTX: with NVK
+    /// unusable, zink took lavapipe and Firefox's "GPU" path ran GL on CPU
+    /// Vulkan. The GPU path must be pinned to NVK and gated on NVK enumerating.
+    #[test]
+    fn firefox_gpu_path_never_lands_zink_on_lavapipe() {
+        let dir = std::env::temp_dir().join(format!("eclipse-ff-nvk-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        write_firefox_wrapper(&dir);
+        let ff = fs::read_to_string(dir.join("usr/local/bin/eclipse-firefox")).unwrap();
+        let gpu = ff.find("export GALLIUM_DRIVER=").unwrap();
+        let gate = &ff[..gpu];
+        assert!(gate.contains("/usr/share/vulkan/icd.d/nouveau_icd.*.json"));
+        assert!(gate.contains("vulkaninfo --summary"));
+        assert!(gate.contains("[ -n \"$NVK_ICD\" ]"));
+        assert!(gate.contains("export VK_DRIVER_FILES=\"$NVK_ICD\" VK_ICD_FILENAMES=\"$NVK_ICD\""));
+        assert!(!ff.contains("lvp_icd"));
+        if let Ok(st) = std::process::Command::new("sh")
+            .arg("-n")
+            .arg(dir.join("usr/local/bin/eclipse-firefox"))
+            .status()
+        {
+            assert!(st.success(), "eclipse-firefox does not parse as sh");
         }
         let _ = fs::remove_dir_all(&dir);
     }
