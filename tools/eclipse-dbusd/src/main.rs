@@ -73,6 +73,19 @@ use message::{Message, MAX_MESSAGE_LEN};
 /// `DBUS_SESSION_BUS_ADDRESS` every Eclipse session already exports.
 const DEFAULT_ADDRESS: &str = "unix:path=/run/user/0/bus";
 
+/// Where the system bus lives when nothing says otherwise: the one path
+/// libdbus compiles in, so every client that asks for the system bus without
+/// an address finds it here. This daemon used to answer `--system` with
+/// "there is no system bus on Eclipse OS" and exit 2, which is what left
+/// pulseaudio logging "Unable to contact D-Bus system bus: Failed to connect
+/// to socket /run/dbus/system_bus_socket: No such file or directory" on every
+/// boot. Nothing in the daemon is session-specific --- it is the same router
+/// either way --- so the only difference is the default path and that
+/// `DBUS_SESSION_BUS_ADDRESS` must NOT be consulted here: in a desktop session
+/// that variable points at the session bus, and honouring it would make
+/// `--system` quietly serve (or collide with) the session socket.
+const DEFAULT_SYSTEM_ADDRESS: &str = "unix:path=/run/dbus/system_bus_socket";
+
 fn log(msg: &str) {
     println!("[eclipse-dbusd] {msg}");
     let _ = io::Write::flush(&mut io::stdout());
@@ -84,6 +97,7 @@ fn main() {
     let mut selftest = false;
     let mut print_address = false;
     let mut hold = false;
+    let mut system = false;
 
     for a in &args {
         if let Some(v) = a.strip_prefix("--address=") {
@@ -105,15 +119,13 @@ fn main() {
                 }
                 "--help" | "-h" => {
                     println!(
-                        "usage: eclipse-dbusd [--session] [--address=unix:path=PATH] \
-                         [--print-address] [--selftest] [--hold]"
+                        "usage: eclipse-dbusd [--session|--system] \
+                         [--address=unix:path=PATH] [--print-address] \
+                         [--selftest] [--hold]"
                     );
                     return;
                 }
-                "--system" => {
-                    eprintln!("eclipse-dbusd: there is no system bus on Eclipse OS");
-                    exit(2);
-                }
+                "--system" => system = true,
                 other => {
                     eprintln!("eclipse-dbusd: unknown argument {other}");
                     exit(2);
@@ -122,9 +134,11 @@ fn main() {
         }
     }
 
-    let address = address
-        .or_else(|| std::env::var("DBUS_SESSION_BUS_ADDRESS").ok())
-        .unwrap_or_else(|| DEFAULT_ADDRESS.to_string());
+    let address = chosen_address(
+        address,
+        system,
+        std::env::var("DBUS_SESSION_BUS_ADDRESS").ok(),
+    );
     let path = match socket_path(&address) {
         Some(p) => p,
         None => {
@@ -156,10 +170,26 @@ fn main() {
         libc::signal(libc::SIGPIPE, libc::SIG_IGN);
     }
 
-    if let Err(e) = serve(&path, print_address) {
+    if let Err(e) = serve(&path, print_address, system) {
         eprintln!("eclipse-dbusd: {e}");
         exit(1);
     }
+}
+
+/// Which address this run serves. `--address=` always wins. Otherwise a
+/// session bus follows `DBUS_SESSION_BUS_ADDRESS` and falls back to
+/// [`DEFAULT_ADDRESS`], while a system bus ignores that variable entirely and
+/// uses [`DEFAULT_SYSTEM_ADDRESS`]: inside a desktop session the variable
+/// names the session socket, and honouring it under `--system` would have the
+/// two buses fight over one path.
+fn chosen_address(explicit: Option<String>, system: bool, session_env: Option<String>) -> String {
+    if let Some(a) = explicit {
+        return a;
+    }
+    if system {
+        return DEFAULT_SYSTEM_ADDRESS.to_string();
+    }
+    session_env.unwrap_or_else(|| DEFAULT_ADDRESS.to_string())
 }
 
 /// Extract the filesystem path from a `unix:path=…` (or `unix:abstract=…`,
@@ -237,12 +267,23 @@ impl Drop for Peer {
     }
 }
 
-fn serve(path: &str, print_address: bool) -> Result<(), String> {
-    // The socket's directory is the only access control a `unix:path=` bus
-    // has, so create it 0700 when it is missing.
+/// `system` only changes who may reach the socket. A session bus belongs to one
+/// uid, so its directory is 0700 and the socket 0600. The system bus is the
+/// opposite by definition: `--system` clients run as other uids (pulseaudio
+/// drops to its own), so 0700/0600 would hand them EACCES instead of the
+/// "no such file" they used to get, which is no better. Everything else ---
+/// routing, names, signals --- is identical.
+fn serve(path: &str, print_address: bool, system: bool) -> Result<(), String> {
+    let (dir_mode, sock_mode) = if system {
+        (0o755, 0o666)
+    } else {
+        (0o700, 0o600)
+    };
+    // The socket's directory is part of the access control a `unix:path=` bus
+    // has, so create it with that mode when it is missing.
     if let Some(dir) = Path::new(path).parent() {
         let _ = fs::create_dir_all(dir);
-        set_mode(dir, 0o700);
+        set_mode(dir, dir_mode);
     }
     // A stale socket from a previous boot makes bind() fail with EADDRINUSE
     // even though nothing is listening. init clears /run at boot, but a
@@ -255,7 +296,7 @@ fn serve(path: &str, print_address: bool) -> Result<(), String> {
     }
 
     let listener = UnixListener::bind(path).map_err(|e| format!("bind {path}: {e}"))?;
-    set_mode(Path::new(path), 0o600);
+    set_mode(Path::new(path), sock_mode);
     set_nonblocking(listener.as_raw_fd());
 
     let machine_id = read_machine_id();
@@ -266,7 +307,10 @@ fn serve(path: &str, print_address: bool) -> Result<(), String> {
         println!("unix:path={path},guid={guid}");
         let _ = io::Write::flush(&mut io::stdout());
     }
-    log(&format!("session bus listening on {path} (guid {guid})"));
+    log(&format!(
+        "{} bus listening on {path} (guid {guid})",
+        if system { "system" } else { "session" }
+    ));
 
     let my_uid = unsafe { libc::getuid() };
     let mut peers: Vec<(u64, Peer)> = Vec::new();
@@ -309,7 +353,13 @@ fn serve(path: &str, print_address: bool) -> Result<(), String> {
                         std::mem::forget(stream); // the Peer owns the fd now
                         set_nonblocking(fd);
                         let (pid, uid) = peer_cred(fd);
-                        if uid != my_uid {
+                        // A session bus belongs to one uid and refusing the
+                        // rest is its whole access control. A system bus is
+                        // the opposite: it runs as root precisely so that
+                        // clients under other uids can reach it (pulseaudio
+                        // drops to its own), so this check would turn the
+                        // socket we just created into a closed door.
+                        if !system && uid != my_uid {
                             log(&format!(
                                 "refused a connection from uid {uid} (bus runs as {my_uid})"
                             ));
@@ -1027,6 +1077,50 @@ mod tests {
     use super::*;
 
     #[test]
+    fn the_system_bus_lands_on_the_path_libdbus_compiles_in() {
+        // pulseaudio and every other `--system` client with no address asks
+        // libdbus, which has exactly this path built in. Getting it wrong is
+        // indistinguishable, from the client's side, from the daemon not
+        // running at all: "Failed to connect to socket
+        // /run/dbus/system_bus_socket: No such file or directory".
+        assert_eq!(
+            chosen_address(None, true, None),
+            "unix:path=/run/dbus/system_bus_socket"
+        );
+    }
+
+    #[test]
+    fn a_session_address_in_the_environment_never_reaches_the_system_bus() {
+        // The regression this guards: inside a desktop session
+        // DBUS_SESSION_BUS_ADDRESS is always set, so a `--system` daemon that
+        // read it would bind the session socket --- either colliding with the
+        // session bus or silently serving it as if it were the system one.
+        let session = Some("unix:path=/run/user/0/bus".to_string());
+        assert_eq!(
+            chosen_address(None, true, session.clone()),
+            "unix:path=/run/dbus/system_bus_socket"
+        );
+        // And the session bus does follow it, which is why it is read at all.
+        assert_eq!(
+            chosen_address(None, false, session),
+            "unix:path=/run/user/0/bus"
+        );
+    }
+
+    #[test]
+    fn an_explicit_address_wins_over_both_defaults() {
+        let want = "unix:path=/tmp/some-other-bus";
+        for system in [false, true] {
+            assert_eq!(
+                chosen_address(Some(want.to_string()), system, None),
+                want,
+                "--address= must win with system={system}"
+            );
+        }
+        assert_eq!(chosen_address(None, false, None), DEFAULT_ADDRESS);
+    }
+
+    #[test]
     fn address_parsing() {
         assert_eq!(
             socket_path("unix:path=/run/user/0/bus").as_deref(),
@@ -1061,7 +1155,7 @@ mod tests {
         );
         let p = path.clone();
         std::thread::spawn(move || {
-            let _ = serve(&p, false);
+            let _ = serve(&p, false, false);
         });
         // Wait for the socket to appear rather than sleeping a fixed time.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -1128,7 +1222,7 @@ mod tests {
         );
         let p = path.clone();
         std::thread::spawn(move || {
-            let _ = serve(&p, false);
+            let _ = serve(&p, false, false);
         });
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while !Path::new(&path).exists() {
