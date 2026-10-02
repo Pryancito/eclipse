@@ -2911,33 +2911,42 @@ fn write_labwc_wrapper(rootfs: &Path) {
           \x20 if [ -x /sbin/eclipse-init ]; then\n\
           \x20\x20 set -- /sbin/eclipse-init --exec-on-graphics-vt \"$@\"\n\
           \x20 fi\n\
-          \x20 # GPU renderer that cannot even INITIALIZE -> pixman, right now.\n\
-          \x20 # On the NVIDIA + nvidia.nouveau_uapi path wlroots asks Mesa for\n\
-          \x20 # EGL on zink, and zink needs NVK to enumerate the GPU. When it\n\
-          \x20 # does not ('MESA: error: ZINK: failed to choose pdev' -> 'DRI2:\n\
-          \x20 # failed to create screen' -> eglInitialize EGL_NOT_INITIALIZED),\n\
-          \x20 # labwc exits at once with 'unable to create renderer': wlroots\n\
-          \x20 # never falls back to pixman on its own, and a labwc started by\n\
-          \x20 # hand left the user at a shell with no desktop. eclipse-init's\n\
-          \x20 # COMPOSITOR_DEGRADED only rescues a supervised session, and only\n\
-          \x20 # after two deaths. A renderer that fails to init is deterministic\n\
-          \x20 # (not a wedged channel worth a retry), so run the GPU attempt as a\n\
-          \x20 # child and, if THAT is how it died, exec labwc again on pixman. Any\n\
-          \x20 # other exit is passed through unchanged for init to count. The\n\
-          \x20 # failed log is kept for diagnosis, and the marker tells the GL\n\
-          \x20 # wrappers (eclipse-firefox) that this session has no GPU path.\n\
+          \x20 # GPU renderer that fails to INITIALIZE: retry it once, then pixman.\n\
+          \x20 # On the NVIDIA + nvidia.nouveau_uapi path wlroots asks Mesa for EGL\n\
+          \x20 # on zink, and zink needs NVK to enumerate the GPU. When it does not\n\
+          \x20 # ('MESA: error: ZINK: failed to choose pdev' -> 'DRI2: failed to\n\
+          \x20 # create screen' -> eglInitialize EGL_NOT_INITIALIZED), labwc exits\n\
+          \x20 # at once with 'unable to create renderer', and wlroots never falls\n\
+          \x20 # back to pixman on its own. On hardware this hits the FIRST start of\n\
+          \x20 # a boot and the respawn ~250 ms later comes up on the GPU, so a\n\
+          \x20 # labwc started by hand left a shell with no desktop. So: run the GPU\n\
+          \x20 # attempt as a child; if THAT is how it died, retry it once on the\n\
+          \x20 # GPU after a short pause, and only if the retry dies the same way\n\
+          \x20 # exec labwc on pixman. Any other exit is passed through unchanged\n\
+          \x20 # for init to count. Each failed attempt's log is kept as\n\
+          \x20 # /tmp/labwc-<renderer>-<n>.log, and the marker tells the GL wrappers\n\
+          \x20 # (eclipse-firefox) that this session has no GPU path.\n\
           \x20 # ECLIPSE_LABWC_NO_FALLBACK=1 keeps the old fail-hard behaviour.\n\
           \x20 case \"${WLR_RENDERER:-}\" in\n\
           \x20 gles2|vulkan)\n\
           \x20\x20 if [ -z \"${ECLIPSE_LABWC_NO_FALLBACK:-}\" ]; then\n\
           \x20\x20\x20 rm -f /run/labwc-renderer-fallback 2>/dev/null\n\
-          \x20\x20\x20 \"$@\" >>\"$LOG\" 2>&1\n\
-          \x20\x20\x20 rc=$?\n\
-          \x20\x20\x20 grep -q 'unable to create renderer' \"$LOG\" 2>/dev/null || exit \"$rc\"\n\
-          \x20\x20\x20 FAILED=\"/tmp/labwc-$WLR_RENDERER.log\"\n\
-          \x20\x20\x20 cp \"$LOG\" \"$FAILED\" 2>/dev/null || true\n\
+          \x20\x20\x20 n=0\n\
+          \x20\x20\x20 while :; do\n\
+          \x20\x20\x20\x20 n=$((n + 1))\n\
+          \x20\x20\x20\x20 \"$@\" >>\"$LOG\" 2>&1\n\
+          \x20\x20\x20\x20 rc=$?\n\
+          \x20\x20\x20\x20 grep -q 'unable to create renderer' \"$LOG\" 2>/dev/null || exit \"$rc\"\n\
+          \x20\x20\x20\x20 FAILED=\"/tmp/labwc-$WLR_RENDERER-$n.log\"\n\
+          \x20\x20\x20\x20 cp \"$LOG\" \"$FAILED\" 2>/dev/null || true\n\
+          \x20\x20\x20\x20 [ \"$n\" -ge 2 ] && break\n\
+          \x20\x20\x20\x20 MSG=\"labwc: the $WLR_RENDERER renderer failed to initialize (log: $FAILED); retrying it once\"\n\
+          \x20\x20\x20\x20 echo \"$MSG\" > /dev/console 2>/dev/null || true\n\
+          \x20\x20\x20\x20 sleep \"${ECLIPSE_LABWC_RETRY_DELAY:-1}\"\n\
+          \x20\x20\x20\x20 : > \"$LOG\" 2>/dev/null || true\n\
+          \x20\x20\x20 done\n\
           \x20\x20\x20 echo \"$WLR_RENDERER\" > /run/labwc-renderer-fallback 2>/dev/null || true\n\
-          \x20\x20\x20 MSG=\"labwc: the $WLR_RENDERER renderer failed to initialize (log: $FAILED); falling back to pixman. Check: dmesg | grep nouveau-uapi\"\n\
+          \x20\x20\x20 MSG=\"labwc: the $WLR_RENDERER renderer failed to initialize twice (log: $FAILED); falling back to pixman. Check: dmesg | grep nouveau-uapi\"\n\
           \x20\x20\x20 echo \"$MSG\" >>\"$LOG\" 2>/dev/null || true\n\
           \x20\x20\x20 echo \"$MSG\" > /dev/console 2>/dev/null || true\n\
           \x20\x20\x20 # Forced, not `:=`: the inherited pins are what just failed.\n\
@@ -3830,7 +3839,9 @@ mod tests {
         let fake = format!(
             "#!/bin/sh\n\
              echo \"$WLR_RENDERER ${{GALLIUM_DRIVER:-none}}\" >> {d}/calls\n\
-             if [ \"$WLR_RENDERER\" = {fail_on} ]; then\n\
+             echo x >> {d}/starts\n\
+             if [ \"$WLR_RENDERER\" = {fail_on} ] || \\\n\
+             \x20 {{ [ {fail_on} = first ] && [ \"$(wc -l < {d}/starts)\" -eq 1 ]; }}; then\n\
              \x20 echo '[../src/server.c:532] unable to create renderer'\n\
              \x20 exit 1\n\
              fi\n\
@@ -3855,6 +3866,7 @@ mod tests {
             .env("GALLIUM_DRIVER", "zink")
             .env_remove("LIBGL_ALWAYS_SOFTWARE")
             .env_remove("ECLIPSE_LABWC_NO_FALLBACK")
+            .env("ECLIPSE_LABWC_RETRY_DELAY", "0")
             .env("SEATD_SOCK", "/nonexistent")
             .output()
             .ok()?;
@@ -3868,26 +3880,34 @@ mod tests {
 
     /// The real-hardware failure: `nvidia.nouveau_uapi` on the RTX pins
     /// GLES2/zink, NVK does not enumerate the GPU ('ZINK: failed to choose
-    /// pdev'), and labwc exits with 'unable to create renderer'. The wrapper
-    /// must bring the desktop up on pixman instead of leaving a shell.
+    /// pdev'), and labwc exits with 'unable to create renderer'. On hardware
+    /// only the first start of a boot does that, so the wrapper retries the
+    /// GPU once, and goes to pixman only when the retry fails too.
     #[test]
-    fn a_gpu_renderer_that_fails_to_init_falls_back_to_pixman() {
+    fn a_gpu_renderer_that_fails_to_init_is_retried_then_falls_back_to_pixman() {
         let dir = std::env::temp_dir().join(format!("eclipse-labwc-fb-{}", std::process::id()));
-        let Some(calls) = run_wrapper_with_fake_labwc(&dir, "gles2", "gles2") else {
+        // Fails once, then works: the second GPU attempt is the session.
+        let Some(calls) = run_wrapper_with_fake_labwc(&dir, "gles2", "first") else {
             return; // no host sh
         };
-        assert_eq!(calls, "gles2 zink\npixman none\n");
-        assert_eq!(fs::read_to_string(dir.join("fallback")).unwrap(), "gles2\n");
-        assert!(fs::read_to_string(dir.join("labwc-gles2.log"))
+        assert_eq!(calls, "gles2 zink\ngles2 zink\n");
+        assert!(!dir.join("fallback").exists());
+        assert!(fs::read_to_string(dir.join("labwc-gles2-1.log"))
             .unwrap()
             .contains("unable to create renderer"));
+
+        // Fails every time: two GPU attempts, then pixman with software GL.
+        let calls = run_wrapper_with_fake_labwc(&dir, "gles2", "gles2").unwrap();
+        assert_eq!(calls, "gles2 zink\ngles2 zink\npixman none\n");
+        assert_eq!(fs::read_to_string(dir.join("fallback")).unwrap(), "gles2\n");
+        assert!(dir.join("labwc-gles2-2.log").exists());
 
         // A GPU renderer that works is run once, and leaves no marker.
         let calls = run_wrapper_with_fake_labwc(&dir, "gles2", "never").unwrap();
         assert_eq!(calls, "gles2 zink\n");
         assert!(!dir.join("fallback").exists());
 
-        // pixman is exec'd directly; nothing to fall back from.
+        // pixman is exec'd directly; nothing to retry.
         let calls = run_wrapper_with_fake_labwc(&dir, "pixman", "never").unwrap();
         assert_eq!(calls, "pixman zink\n");
         let _ = fs::remove_dir_all(&dir);
