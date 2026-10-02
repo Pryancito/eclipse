@@ -835,6 +835,17 @@ cfg_if! {
         const HEAP_GROW_CHUNKS: [usize; 3] =
             [32 * 1024 * 1024, 8 * 1024 * 1024, 2 * 1024 * 1024];
         const HEAP_MAX_TOTAL: usize = 2 * 1024 * 1024 * 1024;
+        // The wild-block registry must be able to hold every region this
+        // policy can ever create -- the static arena plus one per growth, all
+        // of them at the SMALLEST fallback chunk. If it cannot, a machine
+        // under memory pressure silently turns the guard off, which is the one
+        // machine that needs it. Shrinking the fallback chunk or raising the
+        // ceiling fails the build here rather than in the field.
+        const _: () = assert!(
+            heap_regions::MAX_REGIONS
+                >= 1 + (HEAP_MAX_TOTAL - KERNEL_HEAP_SIZE)
+                    / HEAP_GROW_CHUNKS[HEAP_GROW_CHUNKS.len() - 1]
+        );
         /// Never take the machine's last quarter of RAM for the kernel heap:
         /// user pages must still be commitable, or we trade an OOM here for a
         /// worse one in the page-fault path.
@@ -957,15 +968,22 @@ cfg_if! {
                 return false;
             };
             let va = kernel_hal::mem::phys_to_virt(pa);
+            // Register BEFORE the buddy is told about the region, never after.
+            // The guard from `.lock()` below dies at the end of its own
+            // statement, so registering afterwards leaves a window in which
+            // another CPU can allocate out of the new chunk and free it again
+            // while the registry still says those addresses are not the
+            // heap's -- and a perfectly sound block would be leaked and
+            // reported as corruption. Registering first cannot misfire in the
+            // other direction: it only ever widens the set of addresses the
+            // heap may own, and nothing can be freed out of a region the buddy
+            // has not handed anything out of yet.
+            heap_regions::register(va, va + chunk);
             // SAFETY: these frames were just allocated to us, are inside the
             // kernel's linear map, and overlap nothing the heap manages.
             unsafe {
                 HEAP_ALLOCATOR.0.lock().add_to_heap(va, va + chunk);
             }
-            // A grown region is as much the heap as the static arena: register
-            // it in the same breath, or every block the kernel later frees out
-            // of it is refused as wild.
-            heap_regions::register(va, va + chunk);
             HEAP_TOTAL.fetch_add(chunk, Ordering::Relaxed);
             // The vtable-liveness ceiling (`set_vtable_max`) is deliberately
             // LEFT ALONE here. It rests on "the image links .rodata below
@@ -996,15 +1014,16 @@ cfg_if! {
             const HEAP_BLOCK: usize = KERNEL_HEAP_SIZE / MACHINE_ALIGN;
             static mut HEAP: [usize; HEAP_BLOCK] = [0; HEAP_BLOCK];
             let heap_start = (&raw const HEAP).cast::<u8>() as usize;
+            // Tell the allocator which addresses are actually its own, so a
+            // free of anything else is refused instead of corrupting the free
+            // lists. Before `init`, for the same reason as in
+            // `grow_heap_once`: the registry must never lag the buddy.
+            heap_regions::register(heap_start, heap_start + HEAP_BLOCK * MACHINE_ALIGN);
             unsafe {
                 HEAP_ALLOCATOR
                     .lock()
                     .init(heap_start, HEAP_BLOCK * MACHINE_ALIGN);
             }
-            // Tell the allocator which addresses are actually its own, so a
-            // free of anything else is refused instead of corrupting the free
-            // lists. See `heap_regions`.
-            heap_regions::register(heap_start, heap_start + HEAP_BLOCK * MACHINE_ALIGN);
             // Teach the fat-pointer liveness gate where the heap begins. A real
             // vtable lives in `.rodata`, always below this address; any dyn
             // pointer whose vtable word lands at or above it is a use-after-free
@@ -1828,10 +1847,20 @@ pub mod heap_regions {
     use core::sync::atomic::{AtomicUsize, Ordering};
 
     /// Regions the registry can hold: the static arena, plus one per elastic
-    /// growth. Growth takes 32 MiB at a time up to a 2 GiB ceiling, so 64 is
-    /// the realistic worst case; `unregistered` covers the rest honestly
-    /// rather than letting the registry lie about what the heap owns.
-    pub const MAX_REGIONS: usize = 64;
+    /// growth.
+    ///
+    /// This has to cover the allocator's *worst* case, not its typical one. A
+    /// growth takes 32 MiB when it can, but under memory pressure it falls
+    /// back to 8 MiB and then 2 MiB, so the heap can reach its 2 GiB ceiling
+    /// from a 512 MiB arena in 768 small steps. An overflow does not merely
+    /// lose a region: `check` then stops answering `Outside` at all, so the
+    /// whole guard would switch itself off exactly on the machine that is
+    /// short of memory. A `const` assertion next to the growth policy ties
+    /// this number to those chunk sizes, so it cannot silently fall behind.
+    ///
+    /// At two words a region this is 16 KiB of `.bss`, which is the cheapest
+    /// part of the bargain.
+    pub const MAX_REGIONS: usize = 1024;
 
     static STARTS: [AtomicUsize; MAX_REGIONS] = [const { AtomicUsize::new(0) }; MAX_REGIONS];
     static ENDS: [AtomicUsize; MAX_REGIONS] = [const { AtomicUsize::new(0) }; MAX_REGIONS];
@@ -2145,6 +2174,45 @@ mod heap_region_tests {
 
     /// An empty or inverted region is not recorded: it would otherwise take a
     /// slot and push a real region into the overflow count.
+    /// The capacity is not a round number picked by feel: a 512 MiB arena
+    /// growing to the 2 GiB ceiling in 2 MiB fallback steps is 768 growths,
+    /// and if the registry cannot hold them it silently stops answering
+    /// `Outside` on the machine that is short of memory. The `const`
+    /// assertion beside the growth policy enforces this for the real
+    /// constants; this pins the arithmetic so the number cannot be lowered
+    /// here without a test saying why.
+    #[test]
+    fn the_registry_holds_every_region_the_growth_policy_can_create() {
+        let worst_case = 1 + (2 * 1024 * 1024 * 1024 - 512 * 1024 * 1024) / (2 * 1024 * 1024);
+        assert_eq!(worst_case, 769);
+        assert!(
+            heap_regions::MAX_REGIONS >= worst_case,
+            "{} slots cannot hold {} regions",
+            heap_regions::MAX_REGIONS,
+            worst_case
+        );
+    }
+
+    /// And filling it to the brim keeps the verdicts sound: the last region
+    /// registered is still recognised, and nothing has been declared wild.
+    #[test]
+    fn a_full_registry_still_answers_for_its_last_region() {
+        let _alone = alone();
+        heap_regions::reset();
+        for i in 0..heap_regions::MAX_REGIONS {
+            let base = ARENA + i * 0x10_0000;
+            heap_regions::register(base, base + 0x1000);
+        }
+        assert_eq!(heap_regions::registered(), heap_regions::MAX_REGIONS);
+        assert_eq!(heap_regions::unregistered(), 0);
+        let last = ARENA + (heap_regions::MAX_REGIONS - 1) * 0x10_0000;
+        assert_eq!(heap_regions::check(last, 64, 8), None);
+        assert_eq!(
+            heap_regions::check(last + 0x8000, 64, 8),
+            Some(BlockFault::Outside)
+        );
+    }
+
     #[test]
     fn an_empty_region_is_not_recorded() {
         let _alone = alone();
