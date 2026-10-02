@@ -42,6 +42,19 @@ fn alloc_error(layout: Layout) -> ! {
             reentrancy,
         ));
     }
+    // Blocks the allocator refused because they were not its own. Each one is
+    // leaked on purpose (see `heap_regions`), so a non-zero count both
+    // explains bytes missing from this heap and says that something in the
+    // kernel is freeing memory it does not own -- which is a far more serious
+    // finding than the OOM it may have caused.
+    let wild = crate::memory::heap_wild_blocks();
+    if wild > 0 {
+        emit(format_args!(
+            "heap has refused and LEAKED {} wild block(s) -- something freed memory the \
+             heap never handed out; see [heap-wild] above for the call chain\n",
+            wild,
+        ));
+    }
     // Attribution: live allocations per size class, so the OOM report says
     // WHICH class holds the heap (each line: class upper bound, live count,
     // total bytes if every allocation were at the bound).

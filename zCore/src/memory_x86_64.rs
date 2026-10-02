@@ -472,6 +472,77 @@ cfg_if! {
         const HEAP_GROW_LOG: bool = false;
         const HEAP_REENTRANT_LOG: bool = false;
 
+        /// Blocks the allocator refused, by [`heap_regions::check`].
+        static HEAP_WILD_BLOCKS: core::sync::atomic::AtomicU32 =
+            core::sync::atomic::AtomicU32::new(0);
+
+        /// Wild blocks refused so far. Non-zero is a diagnosis, not a warning:
+        /// something in this kernel handed the allocator a block that is not
+        /// the allocator's.
+        pub fn heap_wild_blocks() -> u32 {
+            HEAP_WILD_BLOCKS.load(core::sync::atomic::Ordering::Relaxed)
+        }
+
+        /// Name the code that handed the allocator a block it must not touch.
+        ///
+        /// The backtrace is the whole value here. `what` says which side
+        /// caught it, but a free list only ever reveals its corruption later,
+        /// in another subsystem, on another CPU -- the call chain on this
+        /// stack right now is the only place the culprit appears.
+        #[cold]
+        #[inline(never)]
+        fn report_wild_block(
+            what: &str,
+            fault: heap_regions::BlockFault,
+            ptr: usize,
+            sz: usize,
+            align: usize,
+        ) {
+            use core::sync::atomic::{AtomicU32, Ordering};
+            HEAP_WILD_BLOCKS.fetch_add(1, Ordering::Relaxed);
+            static REPORTED: AtomicU32 = AtomicU32::new(0);
+            if REPORTED.fetch_add(1, Ordering::Relaxed) >= 8 {
+                return;
+            }
+            emit(format_args!(
+                "\n[heap-wild] {} ptr={:#x} size={:#x} align={} -- {}. The heap owns \
+                 {} region(s){}. Leaking this block rather than splicing a wild \
+                 address into the free lists; the call chain below is the code \
+                 that produced it:\n",
+                what,
+                ptr,
+                sz,
+                align,
+                fault.why(),
+                heap_regions::registered(),
+                if heap_regions::unregistered() > 0 {
+                    " (and some that did not fit the registry)"
+                } else {
+                    ""
+                },
+            ));
+            let mut rbp: usize;
+            unsafe { core::arch::asm!("mov {}, rbp", out(reg) rbp) };
+            for _ in 0..24 {
+                if !kernel_hal::kaddr::is_kernel_stack_qword(rbp as u64) {
+                    break;
+                }
+                let ret = unsafe { core::ptr::read_volatile((rbp + 8) as *const usize) };
+                let next = unsafe { core::ptr::read_volatile(rbp as *const usize) };
+                if ret == 0 {
+                    break;
+                }
+                emit(format_args!(
+                    "[heap-wild]   ret={}\n",
+                    kernel_hal::ksyms::Addr(ret as u64)
+                ));
+                if next <= rbp {
+                    break;
+                }
+                rbp = next;
+            }
+        }
+
         #[cold]
         #[inline(never)]
         fn report_heap_reentrancy(what: &str, sz: usize) {
@@ -764,6 +835,20 @@ cfg_if! {
         const HEAP_GROW_CHUNKS: [usize; 3] =
             [32 * 1024 * 1024, 8 * 1024 * 1024, 2 * 1024 * 1024];
         const HEAP_MAX_TOTAL: usize = 2 * 1024 * 1024 * 1024;
+        // The wild-block registry must be able to hold every region this
+        // policy can ever create -- the static arena plus one per growth, all
+        // of them at the SMALLEST fallback chunk. If it cannot, a machine
+        // under memory pressure silently turns the guard off, which is the one
+        // machine that needs it. Shrinking the fallback chunk or raising the
+        // ceiling fails the build here rather than in the field.
+        // Written as a strict `>` rather than `>= 1 + n`: the arena itself is
+        // the one extra region beyond the growths, and `clippy::int_plus_one`
+        // rejects the other spelling.
+        const _: () = assert!(
+            heap_regions::MAX_REGIONS
+                > (HEAP_MAX_TOTAL - KERNEL_HEAP_SIZE)
+                    / HEAP_GROW_CHUNKS[HEAP_GROW_CHUNKS.len() - 1]
+        );
         /// Never take the machine's last quarter of RAM for the kernel heap:
         /// user pages must still be commitable, or we trade an OOM here for a
         /// worse one in the page-fault path.
@@ -886,6 +971,17 @@ cfg_if! {
                 return false;
             };
             let va = kernel_hal::mem::phys_to_virt(pa);
+            // Register BEFORE the buddy is told about the region, never after.
+            // The guard from `.lock()` below dies at the end of its own
+            // statement, so registering afterwards leaves a window in which
+            // another CPU can allocate out of the new chunk and free it again
+            // while the registry still says those addresses are not the
+            // heap's -- and a perfectly sound block would be leaked and
+            // reported as corruption. Registering first cannot misfire in the
+            // other direction: it only ever widens the set of addresses the
+            // heap may own, and nothing can be freed out of a region the buddy
+            // has not handed anything out of yet.
+            heap_regions::register(va, va + chunk);
             // SAFETY: these frames were just allocated to us, are inside the
             // kernel's linear map, and overlap nothing the heap manages.
             unsafe {
@@ -921,6 +1017,11 @@ cfg_if! {
             const HEAP_BLOCK: usize = KERNEL_HEAP_SIZE / MACHINE_ALIGN;
             static mut HEAP: [usize; HEAP_BLOCK] = [0; HEAP_BLOCK];
             let heap_start = (&raw const HEAP).cast::<u8>() as usize;
+            // Tell the allocator which addresses are actually its own, so a
+            // free of anything else is refused instead of corrupting the free
+            // lists. Before `init`, for the same reason as in
+            // `grow_heap_once`: the registry must never lag the buddy.
+            heap_regions::register(heap_start, heap_start + HEAP_BLOCK * MACHINE_ALIGN);
             unsafe {
                 HEAP_ALLOCATOR
                     .lock()
@@ -1329,6 +1430,23 @@ cfg_if! {
                 let prof = kernel_hal::kstats::heap_prof_enabled();
                 let t0 = if prof { core::arch::x86_64::_rdtsc() } else { 0 };
                 let sz = layout.size();
+                // BEFORE anything touches this block, and before the front
+                // cache gets a chance to keep it. The buddy's free lists are
+                // intrusive -- a freed block's own first words become the
+                // links -- so freeing a pointer the heap never handed out is
+                // not a failed free, it is a wild write into the allocator's
+                // bookkeeping. It surfaces much later, on another CPU, as the
+                // allocator walking into memory that is not its own, with
+                // nothing left on screen to name the code that did it.
+                //
+                // Leaking the block is the right refusal: a leak is bytes, and
+                // the alternative is the machine.
+                if let Some(fault) =
+                    heap_regions::check(ptr as usize, sz + REDZONE, layout.align())
+                {
+                    report_wild_block("dealloc", fault, ptr as usize, sz, layout.align());
+                    return;
+                }
                 hot_track(sz, -1);
                 #[cfg(feature = "mem-debug")]
                 {
@@ -1704,5 +1822,406 @@ mod table_walk_tests {
                 "level {level} with flags"
             );
         }
+    }
+}
+
+/// Which addresses the kernel heap owns, and the question the allocator has to
+/// answer before it touches a block.
+///
+/// A buddy allocator's free lists are *intrusive*: a freed block's own first
+/// words become the list links. So a `dealloc` of a pointer the heap never
+/// handed out does not fail — it splices a wild address into the free list,
+/// and the damage surfaces later, somewhere else, as the allocator walking
+/// into memory that is not its own. That is what a KERNEL STOP on real
+/// hardware showed: a read of `0xffff_ffff_ffff_ffff` from inside
+/// `GlobalAlloc::dealloc`, with the heap lock held and never released, and
+/// three unrelated subsystems faulting on near-null pointers behind it. By
+/// then nothing on the screen named the code that did it.
+///
+/// This module is what lets the allocator refuse. It is deliberately separate
+/// from the allocator itself (which is `cfg(not(libos))` and so compiles for
+/// no `cargo test` at all) so the judgement has tests.
+// The allocator this serves is `cfg(not(libos))`, so in a libos build nothing
+// here has a caller -- and `#![deny(warnings)]` makes that an error rather than
+// the quiet dead code it is. The host test suite (which builds libos) does
+// exercise it.
+#[cfg_attr(feature = "libos", allow(dead_code))]
+pub mod heap_regions {
+    use core::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Regions the registry can hold: the static arena, plus one per elastic
+    /// growth.
+    ///
+    /// This has to cover the allocator's *worst* case, not its typical one. A
+    /// growth takes 32 MiB when it can, but under memory pressure it falls
+    /// back to 8 MiB and then 2 MiB, so the heap can reach its 2 GiB ceiling
+    /// from a 512 MiB arena in 768 small steps. An overflow does not merely
+    /// lose a region: `check` then stops answering `Outside` at all, so the
+    /// whole guard would switch itself off exactly on the machine that is
+    /// short of memory. A `const` assertion next to the growth policy ties
+    /// this number to those chunk sizes, so it cannot silently fall behind.
+    ///
+    /// At two words a region this is 16 KiB of `.bss`, which is the cheapest
+    /// part of the bargain.
+    pub const MAX_REGIONS: usize = 1024;
+
+    static STARTS: [AtomicUsize; MAX_REGIONS] = [const { AtomicUsize::new(0) }; MAX_REGIONS];
+    static ENDS: [AtomicUsize; MAX_REGIONS] = [const { AtomicUsize::new(0) }; MAX_REGIONS];
+    /// Slots handed out. Always `>= COUNT`: a slot is reserved here, written,
+    /// and only then published through `COUNT`.
+    static RESERVED: AtomicUsize = AtomicUsize::new(0);
+    /// Slots that are fully written. Readers never look past this.
+    static COUNT: AtomicUsize = AtomicUsize::new(0);
+    static UNREGISTERED: AtomicUsize = AtomicUsize::new(0);
+    /// The region that answered last. Every free runs through [`contains`], so
+    /// the common case -- block after block out of the same region -- is two
+    /// comparisons instead of a walk over every region the heap has grown.
+    static HINT: AtomicUsize = AtomicUsize::new(0);
+
+    /// Why a block must not be handed to the allocator.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum BlockFault {
+        /// A null pointer.
+        Null,
+        /// Not aligned to what its own layout asked for.
+        Unaligned,
+        /// `ptr + size` wraps the address space.
+        Wraps,
+        /// Inside no region the heap owns.
+        Outside,
+    }
+
+    impl BlockFault {
+        /// One phrase for a report.
+        pub fn why(self) -> &'static str {
+            match self {
+                BlockFault::Null => "null pointer",
+                BlockFault::Unaligned => "not aligned to its own layout",
+                BlockFault::Wraps => "ptr + size wraps the address space",
+                BlockFault::Outside => "outside every region the kernel heap owns",
+            }
+        }
+    }
+
+    /// Record a region the heap owns, `[start, end)`.
+    ///
+    /// Called from `init` for the static arena and from the elastic growth
+    /// right where it hands the frames to the buddy. A region that does not
+    /// fit is counted, not dropped: see [`check`].
+    pub fn register(start: usize, end: usize) {
+        if end <= start {
+            return;
+        }
+        let slot = RESERVED.fetch_add(1, Ordering::SeqCst);
+        if slot >= MAX_REGIONS {
+            RESERVED.store(MAX_REGIONS, Ordering::SeqCst);
+            UNREGISTERED.fetch_add(1, Ordering::SeqCst);
+            return;
+        }
+        // End first: a reader that sees the start must see a complete pair.
+        ENDS[slot].store(end, Ordering::SeqCst);
+        STARTS[slot].store(start, Ordering::SeqCst);
+        // Publish last, and in slot order. A reader that saw `COUNT` cover a
+        // slot still being written would find it empty and call a perfectly
+        // sound block wild -- which leaks it and prints a false accusation.
+        // Growth is serialised behind the heap lock, so this never spins in
+        // practice; it is here so that the invariant does not rest on that.
+        while COUNT
+            .compare_exchange(slot, slot + 1, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            core::hint::spin_loop();
+        }
+    }
+
+    /// Whether `[addr, addr + size)` lies inside one region.
+    ///
+    /// One region, not several: the heap's regions are separate allocations
+    /// and a block never straddles two.
+    pub fn contains(addr: usize, size: usize) -> bool {
+        let Some(end) = addr.checked_add(size) else {
+            return false;
+        };
+        let n = COUNT.load(Ordering::SeqCst).min(MAX_REGIONS);
+        let hint = HINT.load(Ordering::Relaxed);
+        if hint < n && in_region(hint, addr, end) {
+            return true;
+        }
+        for i in 0..n {
+            if i != hint && in_region(i, addr, end) {
+                HINT.store(i, Ordering::Relaxed);
+                return true;
+            }
+        }
+        false
+    }
+
+    fn in_region(i: usize, addr: usize, end: usize) -> bool {
+        let start = STARTS[i].load(Ordering::SeqCst);
+        start != 0 && addr >= start && end <= ENDS[i].load(Ordering::SeqCst)
+    }
+
+    /// Regions on record.
+    pub fn registered() -> usize {
+        COUNT.load(Ordering::SeqCst).min(MAX_REGIONS)
+    }
+
+    /// Regions the heap owns that did not fit in the registry.
+    pub fn unregistered() -> usize {
+        UNREGISTERED.load(Ordering::SeqCst)
+    }
+
+    /// Judge a block the allocator is about to take back, or has just handed
+    /// out. `None` means "nothing to say" — which is not the same as "sound".
+    ///
+    /// Two deliberate silences, both so that a healthy kernel is never
+    /// slandered. Before `init` there are no regions and no basis for an
+    /// opinion; and once a growth has failed to fit in the registry, the
+    /// registry no longer knows the whole heap, so `Outside` stops being
+    /// evidence. The cheap checks — null, alignment, wrap — hold either way,
+    /// because they need no map of the heap at all.
+    pub fn check(ptr: usize, size: usize, align: usize) -> Option<BlockFault> {
+        if ptr == 0 {
+            return Some(BlockFault::Null);
+        }
+        if align != 0 && !ptr.is_multiple_of(align) {
+            return Some(BlockFault::Unaligned);
+        }
+        if ptr.checked_add(size).is_none() {
+            return Some(BlockFault::Wraps);
+        }
+        if registered() == 0 || unregistered() > 0 {
+            return None;
+        }
+        if contains(ptr, size) {
+            return None;
+        }
+        Some(BlockFault::Outside)
+    }
+
+    /// Forget every region. Tests only — the heap's regions are never given
+    /// back while the kernel runs.
+    #[cfg(test)]
+    pub(super) fn reset() {
+        for i in 0..MAX_REGIONS {
+            STARTS[i].store(0, Ordering::SeqCst);
+            ENDS[i].store(0, Ordering::SeqCst);
+        }
+        COUNT.store(0, Ordering::SeqCst);
+        RESERVED.store(0, Ordering::SeqCst);
+        UNREGISTERED.store(0, Ordering::SeqCst);
+        HINT.store(0, Ordering::SeqCst);
+    }
+}
+
+#[cfg(test)]
+mod heap_region_tests {
+    //! A wild `dealloc` is not a failed free: the buddy's lists are intrusive,
+    //! so it is a wild WRITE into the allocator's own bookkeeping, and what
+    //! surfaces afterwards is unrelated code faulting on pointers that make no
+    //! sense. These tests are about never being wrong in the direction that
+    //! would make the allocator refuse a sound block.
+
+    use super::heap_regions::{self, BlockFault};
+
+    /// The registry is one `static`; serialise.
+    #[must_use = "bind it to `_alone`: a bare `_` releases the turnstile at once"]
+    fn alone() -> spin::MutexGuard<'static, ()> {
+        static GUARD: spin::Mutex<()> = spin::Mutex::new(());
+        GUARD.lock()
+    }
+
+    const ARENA: usize = 0xffff_ff00_1000_0000;
+    const ARENA_LEN: usize = 512 * 1024 * 1024;
+
+    fn with_arena() {
+        heap_regions::reset();
+        heap_regions::register(ARENA, ARENA + ARENA_LEN);
+    }
+
+    /// The whole point: a pointer the heap never handed out is named, instead
+    /// of being spliced into a free list.
+    #[test]
+    fn a_pointer_from_outside_the_heap_is_refused() {
+        let _alone = alone();
+        with_arena();
+        assert_eq!(
+            heap_regions::check(0xffff_8000_0000_0000, 64, 8),
+            Some(BlockFault::Outside)
+        );
+    }
+
+    /// ... and every ordinary block inside it is not. A check that cried wolf
+    /// would leak the whole heap one block at a time.
+    #[test]
+    fn every_block_inside_the_arena_passes() {
+        let _alone = alone();
+        with_arena();
+        for off in [0usize, 8, 4096, ARENA_LEN / 2, ARENA_LEN - 64] {
+            assert_eq!(
+                heap_regions::check(ARENA + off, 64, 8),
+                None,
+                "off={off:#x}"
+            );
+        }
+    }
+
+    /// A block that starts inside and ends past the end is outside: it is the
+    /// shape a size that no longer matches its allocation takes.
+    #[test]
+    fn a_block_running_past_the_end_of_its_region_is_refused() {
+        let _alone = alone();
+        with_arena();
+        assert_eq!(
+            heap_regions::check(ARENA + ARENA_LEN - 32, 64, 8),
+            Some(BlockFault::Outside)
+        );
+    }
+
+    /// A grown region is as much the heap as the static arena.
+    #[test]
+    fn a_block_in_a_grown_region_passes() {
+        let _alone = alone();
+        with_arena();
+        const GROWN: usize = 0xffff_8002_0000_0000;
+        assert_eq!(
+            heap_regions::check(GROWN + 128, 64, 8),
+            Some(BlockFault::Outside),
+            "not registered yet"
+        );
+        heap_regions::register(GROWN, GROWN + 32 * 1024 * 1024);
+        assert_eq!(heap_regions::check(GROWN + 128, 64, 8), None);
+    }
+
+    /// The hint is a fast path, never an answer. Blocks arriving from two
+    /// regions in turn must all pass: a hint that shortcut the walk without
+    /// re-checking would refuse every other free.
+    #[test]
+    fn alternating_between_two_regions_passes_every_time() {
+        let _alone = alone();
+        heap_regions::reset();
+        const A: usize = 0x1000_0000;
+        const B: usize = 0x9000_0000;
+        heap_regions::register(A, A + 0x10_0000);
+        heap_regions::register(B, B + 0x10_0000);
+        for i in 0..8usize {
+            assert_eq!(heap_regions::check(A + i * 64, 64, 8), None, "A round {i}");
+            assert_eq!(heap_regions::check(B + i * 64, 64, 8), None, "B round {i}");
+        }
+        assert_eq!(
+            heap_regions::check(A + 0x20_0000, 64, 8),
+            Some(heap_regions::BlockFault::Outside),
+            "the gap between the two regions is not the heap"
+        );
+    }
+
+    /// A block never straddles two regions, because they are separate
+    /// allocations -- so one that appears to is a corrupt size, not a merge.
+    #[test]
+    fn a_block_straddling_two_regions_is_refused() {
+        let _alone = alone();
+        heap_regions::reset();
+        heap_regions::register(0x1_0000, 0x2_0000);
+        heap_regions::register(0x2_0000, 0x3_0000);
+        assert_eq!(
+            heap_regions::check(0x1_fff0, 0x40, 8),
+            Some(BlockFault::Outside)
+        );
+    }
+
+    /// Null, misalignment and a wrapping end need no map of the heap, so they
+    /// are answered even before `init` has registered anything.
+    #[test]
+    fn the_cheap_faults_are_answered_with_no_regions_on_record() {
+        let _alone = alone();
+        heap_regions::reset();
+        assert_eq!(heap_regions::check(0, 64, 8), Some(BlockFault::Null));
+        assert_eq!(
+            heap_regions::check(0x1004, 64, 8),
+            Some(BlockFault::Unaligned)
+        );
+        assert_eq!(
+            heap_regions::check(usize::MAX - 8, 64, 1),
+            Some(BlockFault::Wraps)
+        );
+    }
+
+    /// With nothing registered there is no basis for `Outside`, and guessing
+    /// would make the allocator refuse every block the kernel frees before
+    /// `memory::init` runs.
+    #[test]
+    fn before_init_nothing_is_called_outside_the_heap() {
+        let _alone = alone();
+        heap_regions::reset();
+        assert_eq!(heap_regions::check(0xdead_0000, 64, 8), None);
+    }
+
+    /// Once a region has not fitted, the registry no longer knows the whole
+    /// heap -- so it stops claiming a block is outside it. Getting this wrong
+    /// turns a machine that merely grew its heap a lot into one that leaks
+    /// every free.
+    #[test]
+    fn a_registry_that_overflowed_stops_claiming_blocks_are_outside() {
+        let _alone = alone();
+        heap_regions::reset();
+        for i in 0..heap_regions::MAX_REGIONS + 1 {
+            let base = 0x10_0000 + i * 0x10_0000;
+            heap_regions::register(base, base + 0x1000);
+        }
+        assert_eq!(heap_regions::unregistered(), 1);
+        assert_eq!(heap_regions::registered(), heap_regions::MAX_REGIONS);
+        assert_eq!(heap_regions::check(0xffff_8000_0000_0000, 64, 8), None);
+        // ... and the cheap ones still hold.
+        assert_eq!(heap_regions::check(0, 64, 8), Some(BlockFault::Null));
+    }
+
+    /// An empty or inverted region is not recorded: it would otherwise take a
+    /// slot and push a real region into the overflow count.
+    /// The capacity is not a round number picked by feel: a 512 MiB arena
+    /// growing to the 2 GiB ceiling in 2 MiB fallback steps is 768 growths,
+    /// and if the registry cannot hold them it silently stops answering
+    /// `Outside` on the machine that is short of memory. The `const`
+    /// assertion beside the growth policy enforces this for the real
+    /// constants; this pins the arithmetic so the number cannot be lowered
+    /// here without a test saying why.
+    #[test]
+    fn the_registry_holds_every_region_the_growth_policy_can_create() {
+        let worst_case = 1 + (2 * 1024 * 1024 * 1024 - 512 * 1024 * 1024) / (2 * 1024 * 1024);
+        assert_eq!(worst_case, 769);
+        assert!(
+            heap_regions::MAX_REGIONS >= worst_case,
+            "{} slots cannot hold {} regions",
+            heap_regions::MAX_REGIONS,
+            worst_case
+        );
+    }
+
+    /// And filling it to the brim keeps the verdicts sound: the last region
+    /// registered is still recognised, and nothing has been declared wild.
+    #[test]
+    fn a_full_registry_still_answers_for_its_last_region() {
+        let _alone = alone();
+        heap_regions::reset();
+        for i in 0..heap_regions::MAX_REGIONS {
+            let base = ARENA + i * 0x10_0000;
+            heap_regions::register(base, base + 0x1000);
+        }
+        assert_eq!(heap_regions::registered(), heap_regions::MAX_REGIONS);
+        assert_eq!(heap_regions::unregistered(), 0);
+        let last = ARENA + (heap_regions::MAX_REGIONS - 1) * 0x10_0000;
+        assert_eq!(heap_regions::check(last, 64, 8), None);
+        assert_eq!(
+            heap_regions::check(last + 0x8000, 64, 8),
+            Some(BlockFault::Outside)
+        );
+    }
+
+    #[test]
+    fn an_empty_region_is_not_recorded() {
+        let _alone = alone();
+        heap_regions::reset();
+        heap_regions::register(0x1000, 0x1000);
+        heap_regions::register(0x2000, 0x1000);
+        assert_eq!(heap_regions::registered(), 0);
     }
 }
