@@ -372,6 +372,13 @@ pub fn heap_reentrancy_events() -> u32 {
     0
 }
 
+/// Wild blocks refused by the allocator (mirrors
+/// `memory_x86_64::heap_wild_blocks`). This build does not check.
+#[allow(dead_code)]
+pub fn heap_wild_blocks() -> u32 {
+    0
+}
+
 /// The allocator this file is, driven on the host.
 ///
 /// Everything here is a process global: one `HEAP`, two counters and one 2 MiB
