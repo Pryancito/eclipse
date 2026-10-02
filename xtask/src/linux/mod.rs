@@ -2552,16 +2552,34 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
               # with EADDRINUSE although nothing listens. Same reasoning as\n\
               # eclipse-dbus -- init has already reaped the previous daemon.\n\
               rm -f \"$BUS\"\n\
+              # dbus-daemon --system drops to the user its system.conf names\n\
+              # and exits 1 if that name is not in /etc/passwd. On the console\n\
+              # that failure is invisible --- the daemon's stderr goes to the\n\
+              # service log --- and init just respawns it for ever, which is\n\
+              # the loop this check exists to name out loud.\n\
+              WANT=$(sed -n \x27s|.*<user>\\([^<]*\\)</user>.*|\\1|p\x27 \\\n\
+              \x20 /usr/share/dbus-1/system.conf 2>/dev/null | head -n 1)\n\
+              USE_DAEMON=yes\n\
+              if [ -n \"$WANT\" ] && ! grep -q \"^$WANT:\" /etc/passwd 2>/dev/null; then\n\
+              \x20 M=\"eclipse-dbus-system: system.conf wants user \x27$WANT\x27 and\n\
+              /etc/passwd has no such line, so dbus-daemon --system would exit 1\n\
+              on every start; using eclipse-dbusd instead\"\n\
+              \x20 echo \"$M\" > /dev/console 2>/dev/null || true\n\
+              \x20 echo \"$M\" >&2\n\
+              \x20 USE_DAEMON=no\n\
+              fi\n\
               # Alpine's dbus-daemon first: --system brings the real policy\n\
               # from /usr/share/dbus-1/system.conf, which is what decides who\n\
               # may own a name here.\n\
-              for d in /usr/bin /bin /usr/sbin /sbin; do\n\
-              \x20 if [ -x \"$d/dbus-daemon\" ]; then\n\
-              \x20 \x20 echo \"eclipse-dbus-system: $d/dbus-daemon on unix:path=$BUS\" > /dev/console 2>/dev/null\n\
-              \x20 \x20 exec \"$d/dbus-daemon\" --system --nofork --nopidfile \\\n\
-              \x20 \x20 \x20 --address=\"unix:path=$BUS\"\n\
-              \x20 fi\n\
-              done\n\
+              if [ \"$USE_DAEMON\" = yes ]; then\n\
+              \x20 for d in /usr/bin /bin /usr/sbin /sbin; do\n\
+              \x20 \x20 if [ -x \"$d/dbus-daemon\" ]; then\n\
+              \x20 \x20 \x20 echo \"eclipse-dbus-system: $d/dbus-daemon on unix:path=$BUS\" > /dev/console 2>/dev/null\n\
+              \x20 \x20 \x20 exec \"$d/dbus-daemon\" --system --nofork --nopidfile \\\n\
+              \x20 \x20 \x20 \x20 --address=\"unix:path=$BUS\"\n\
+              \x20 \x20 fi\n\
+              \x20 done\n\
+              fi\n\
               for d in /usr/local/bin /usr/bin /bin; do\n\
               \x20 if [ -x \"$d/eclipse-dbusd\" ]; then\n\
               \x20 \x20 echo \"eclipse-dbus-system: $d/eclipse-dbusd on unix:path=$BUS\" > /dev/console 2>/dev/null\n\
@@ -3022,6 +3040,19 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
                         "_ntp:",
                         "_ntp:x:123:123:OpenNTPD:/var/empty:/sbin/nologin\n",
                     ),
+                    // dbus-daemon's own user, same reason: its system.conf
+                    // says `<user>messagebus</user>` and the daemon drops to
+                    // it right after binding the listener, so without this
+                    // line `--system` cannot look the name up and exits 1
+                    // within tens of milliseconds -- which is exactly the
+                    // restart loop the dbus-system service fell into. uid/gid
+                    // 81 is what Alpine's dbus pre-install reserves, so the
+                    // file ownerships apk laid down line up. The session bus
+                    // never needed it: session.conf names no user.
+                    (
+                        "messagebus:",
+                        "messagebus:x:81:81:dbus:/dev/null:/sbin/nologin\n",
+                    ),
                 ] {
                     if !updated.lines().any(|l| l.starts_with(prefix)) {
                         if !updated.ends_with('\n') {
@@ -3041,6 +3072,7 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
                     "root:x:0:0:root:/root:/bin/sh\n\
                      pulse:x:51:51:PulseAudio:/var/run/pulse:/bin/false\n\
                      _ntp:x:123:123:OpenNTPD:/var/empty:/sbin/nologin\n\
+                     messagebus:x:81:81:dbus:/dev/null:/sbin/nologin\n\
                      nobody:x:65534:65534:nobody:/:/bin/false\n",
                 )
                 .unwrap();
@@ -3052,6 +3084,7 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
             ("pulse-access:", "pulse-access:x:52:root\n"),
             ("audio:", "audio:x:29:root,pulse\n"),
             ("_ntp:", "_ntp:x:123:\n"),
+            ("messagebus:", "messagebus:x:81:\n"),
         ];
         match fs::read_to_string(&group) {
             Ok(existing) => {
