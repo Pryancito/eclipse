@@ -229,7 +229,7 @@ mod tests {
         );
         let p = path.clone();
         std::thread::spawn(move || {
-            let _ = crate::serve(&p, false);
+            let _ = crate::serve(&p, false, false);
         });
         let deadline = Instant::now() + TIMEOUT;
         while !std::path::Path::new(&path).exists() {

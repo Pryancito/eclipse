@@ -2521,6 +2521,62 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
               exit 127\n",
         )
         .unwrap();
+        // D-Bus SYSTEM bus. PulseAudio runs `--system` (user-mode pulse
+        // refuses uid 0), and in that mode its main.c connects to the system
+        // bus. There was none, so every boot logged
+        //   W: [pulseaudio] main.c: Unable to contact D-Bus:
+        //   org.freedesktop.DBus.Error.FileNotFound: Failed to connect to
+        //   socket /run/dbus/system_bus_socket: No such file or directory
+        // and anything else that wanted a system name had nowhere to put it.
+        //
+        // This is a SECOND bus, not a view of the session one: names
+        // registered here are invisible on unix:path=/run/user/0/bus and vice
+        // versa, which is exactly how Linux works. It cannot be a symlink to
+        // the session bus either -- /run/user/0 is 0700 root and `--system`
+        // drops pulse to its own uid, so it could not reach it.
+        fs::write(
+            localbin.join("eclipse-dbus-system"),
+            b"#!/bin/sh\n\
+              # Eclipse OS: D-Bus system bus for eclipse-init, on the path\n\
+              # libdbus compiles in as the default system address.\n\
+              BUS=/run/dbus/system_bus_socket\n\
+              mkdir -p /run/dbus\n\
+              # /run/dbus itself must be traversable by every uid: the whole\n\
+              # point of the system bus is that unprivileged services reach\n\
+              # it. The socket's own mode is the daemon's business.\n\
+              chmod 0755 /run/dbus 2>/dev/null || true\n\
+              [ -s /etc/machine-id ] || dbus-uuidgen > /etc/machine-id 2>/dev/null\n\
+              mkdir -p /var/lib/dbus 2>/dev/null\n\
+              [ -s /var/lib/dbus/machine-id ] || cp /etc/machine-id /var/lib/dbus/machine-id 2>/dev/null\n\
+              # Stale socket from an earlier run of THIS boot: bind() fails\n\
+              # with EADDRINUSE although nothing listens. Same reasoning as\n\
+              # eclipse-dbus -- init has already reaped the previous daemon.\n\
+              rm -f \"$BUS\"\n\
+              # Alpine's dbus-daemon first: --system brings the real policy\n\
+              # from /usr/share/dbus-1/system.conf, which is what decides who\n\
+              # may own a name here.\n\
+              for d in /usr/bin /bin /usr/sbin /sbin; do\n\
+              \x20 if [ -x \"$d/dbus-daemon\" ]; then\n\
+              \x20 \x20 echo \"eclipse-dbus-system: $d/dbus-daemon on unix:path=$BUS\" > /dev/console 2>/dev/null\n\
+              \x20 \x20 exec \"$d/dbus-daemon\" --system --nofork --nopidfile \\\n\
+              \x20 \x20 \x20 --address=\"unix:path=$BUS\"\n\
+              \x20 fi\n\
+              done\n\
+              for d in /usr/local/bin /usr/bin /bin; do\n\
+              \x20 if [ -x \"$d/eclipse-dbusd\" ]; then\n\
+              \x20 \x20 echo \"eclipse-dbus-system: $d/eclipse-dbusd on unix:path=$BUS\" > /dev/console 2>/dev/null\n\
+              \x20 \x20 exec \"$d/eclipse-dbusd\" --system\n\
+              \x20 fi\n\
+              done\n\
+              MSG='eclipse-dbus-system: no dbus-daemon and no eclipse-dbusd --\n\
+              there is no system bus. pulseaudio will log \"Unable to contact\n\
+              D-Bus\" and carry on; anything that needs a system name will not.'\n\
+              echo \"$MSG\" > /dev/console 2>/dev/null || true\n\
+              echo \"$MSG\" >&2\n\
+              sleep 60\n\
+              exit 127\n",
+        )
+        .unwrap();
     }
 
     /// Cross-compile `tools/eclipse-dbusd` (Rust) as a static, non-PIE musl
@@ -3188,6 +3244,21 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
         )
         .unwrap();
 
+        // D-Bus system bus, on libdbus's compiled-in default address. A second
+        // bus, independent of the session one above; see eclipse-dbus-system
+        // for why it cannot be the same socket.
+        fs::write(
+            svc_dir.join("dbus-system.service"),
+            b"# D-Bus system bus. See /usr/local/bin/eclipse-dbus-system.\n\
+              # Address: unix:path=/run/dbus/system_bus_socket, which libdbus\n\
+              # uses with no environment variable set -- which is how\n\
+              # pulseaudio --system looks for it.\n\
+              exec = /usr/local/bin/eclipse-dbus-system\n\
+              type = respawn\n\
+              log = /tmp/dbus-system.log\n",
+        )
+        .unwrap();
+
         // Session-bus probe, opt-in. `cmdline = dbus.selftest` keeps it out of
         // a normal boot entirely; a boot with `dbus.selftest` on the kernel
         // command line runs the same checks the desktop menu offers and prints
@@ -3315,6 +3386,7 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
             b"# PulseAudio sound server (system instance). See eclipse-pulseaudio.\n\
               exec = /usr/local/bin/eclipse-pulseaudio\n\
               type = respawn\n\
+              after = dbus-system\n\
               log = /tmp/pulseaudio.log\n",
         )
         .unwrap();
@@ -3671,6 +3743,7 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
             for w in [
                 "eclipse-udhcpc",
                 "eclipse-dbus",
+                "eclipse-dbus-system",
                 "eclipse-seatd",
                 "eclipse-xorg",
                 "eclipse-lunarbg",
