@@ -841,9 +841,12 @@ cfg_if! {
         // under memory pressure silently turns the guard off, which is the one
         // machine that needs it. Shrinking the fallback chunk or raising the
         // ceiling fails the build here rather than in the field.
+        // Written as a strict `>` rather than `>= 1 + n`: the arena itself is
+        // the one extra region beyond the growths, and `clippy::int_plus_one`
+        // rejects the other spelling.
         const _: () = assert!(
             heap_regions::MAX_REGIONS
-                >= 1 + (HEAP_MAX_TOTAL - KERNEL_HEAP_SIZE)
+                > (HEAP_MAX_TOTAL - KERNEL_HEAP_SIZE)
                     / HEAP_GROW_CHUNKS[HEAP_GROW_CHUNKS.len() - 1]
         );
         /// Never take the machine's last quarter of RAM for the kernel heap:
