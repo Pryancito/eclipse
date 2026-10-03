@@ -170,6 +170,14 @@ const CMSG_HDR_LEN: usize = 16;
 const SOL_SOCKET_LEVEL: i32 = 1;
 /// `SCM_RIGHTS`, as it appears in `cmsg_type`.
 const SCM_RIGHTS: i32 = 1;
+/// `SCM_CREDENTIALS`, as it appears in `cmsg_type`: a `struct ucred` the
+/// KERNEL fills in, which is what makes it worth anything to the receiver.
+const SCM_CREDENTIALS: i32 = 2;
+/// `SOL_SOCKET`, as `setsockopt`/`getsockopt` take it in `level`.
+const SOL_SOCKET: usize = 1;
+/// `SO_PASSCRED`: attach the sender's credentials to every message read from
+/// this socket.
+const SO_PASSCRED: usize = 16;
 /// Most file descriptors one `sendmsg` may carry (`SCM_MAX_FD`,
 /// include/net/scm.h). Linux answers `EINVAL` above it; without a cap, one
 /// `sendmsg` with a 64 KiB control buffer asks the receiver to install 16000
@@ -228,13 +236,53 @@ fn parse_scm_rights_fds(ctrl: &[u8]) -> Result<Vec<i32>, LxError> {
 /// which is why the tests below round-trip them against each other rather than
 /// each against a hand-written blob.
 fn build_scm_rights_cmsg(fds: &[i32]) -> Vec<u8> {
-    let cmsg_len = CMSG_HDR_LEN + fds.len() * 4;
-    let mut buf = Vec::with_capacity(cmsg_len);
+    build_cmsg(
+        SCM_RIGHTS,
+        &fds.iter()
+            .flat_map(|f| f.to_ne_bytes())
+            .collect::<Vec<u8>>(),
+    )
+}
+
+/// Build one `SOL_SOCKET` control message around `payload`.
+///
+/// `cmsg_len` counts the header and the payload and NOT the padding, exactly
+/// as `CMSG_LEN` does; the padding that follows is what `CMSG_NXTHDR` steps
+/// over to reach the next message. Writing the padded length into the header
+/// instead would make a lone message look longer than it is and a reader
+/// walking two of them land past the second.
+fn build_cmsg(typ: i32, payload: &[u8]) -> Vec<u8> {
+    let cmsg_len = CMSG_HDR_LEN + payload.len();
+    let mut buf = Vec::with_capacity(cmsg_align(cmsg_len));
     buf.extend_from_slice(&(cmsg_len as u64).to_ne_bytes());
     buf.extend_from_slice(&SOL_SOCKET_LEVEL.to_ne_bytes());
-    buf.extend_from_slice(&SCM_RIGHTS.to_ne_bytes());
-    for fd in fds {
-        buf.extend_from_slice(&fd.to_ne_bytes());
+    buf.extend_from_slice(&typ.to_ne_bytes());
+    buf.extend_from_slice(payload);
+    buf
+}
+
+/// `CMSG_ALIGN`: control messages sit on 8-byte boundaries.
+fn cmsg_align(len: usize) -> usize {
+    (len + 7) & !7
+}
+
+/// The control buffer `recvmsg` hands back: the descriptors the peer attached,
+/// then -- when `SO_PASSCRED` is on -- the sender's credentials.
+///
+/// The second message only exists because the first may be short: a message of
+/// 20 bytes is followed by 4 bytes of padding before the next header, and a
+/// reader that walked without it would read the credentials out of the middle
+/// of the descriptors.
+fn build_recv_cmsgs(fds: &[i32], creds: Option<&[u8; 12]>) -> Vec<u8> {
+    let mut buf = Vec::new();
+    if !fds.is_empty() {
+        buf.extend(build_scm_rights_cmsg(fds));
+    }
+    if let Some(creds) = creds {
+        if !buf.is_empty() {
+            buf.resize(cmsg_align(buf.len()), 0);
+        }
+        buf.extend(build_cmsg(SCM_CREDENTIALS, creds));
     }
     buf
 }
@@ -413,10 +461,23 @@ impl Syscall<'_> {
             sockfd, level, optname, optval, optlen
         );
         let file_like = self.linux_process().get_file_like(sockfd.into())?;
-        file_like
-            .clone()
-            .as_socket()?
-            .setsockopt(level, optname, optval.as_slice(optlen)?)
+        let socket = file_like.as_socket()?;
+        let data = optval.as_slice(optlen)?;
+        // `SO_PASSCRED` is answered here rather than inside a socket family,
+        // because it is a generic `sock` flag in Linux too (`sock_setsockopt`)
+        // and the matching `getsockopt` below has to read back exactly what
+        // this stored. See `Socket::set_passcred` for why every family takes
+        // it and only AF_UNIX acts on it.
+        if level == SOL_SOCKET && optname == SO_PASSCRED {
+            // `sock_setsockopt` reads the value as an `int` and refuses a
+            // shorter one -- unlike the IP level, which falls back to a byte.
+            if data.len() < 4 {
+                return Err(LxError::EINVAL);
+            }
+            let on = u32::from_ne_bytes([data[0], data[1], data[2], data[3]]) != 0;
+            return socket.set_passcred(on);
+        }
+        socket.setsockopt(level, optname, data)
     }
 
     /// get options for the socket referred to by the file descriptor sockfd.
@@ -470,6 +531,20 @@ impl Syscall<'_> {
                 // unless the answer is SOCK_STREAM), so without it every HTTPS
                 // request from Python -- `requests`, ytmusicapi -- failed with
                 // OSError(92, 'Protocol not available').
+                // SO_PASSCRED (16): the flag `setsockopt` stored. crashpad
+                // READS it before setting it -- the handler may not be allowed
+                // to set it and does not need to if the client already did
+                // (`InstallClientSocket`) -- and a `getsockopt` that answers
+                // ENOPROTOOPT there is a hard `return false`, so every
+                // chromium process logged
+                //     ERROR:exception_handler_server.cc:361 getsockopt:
+                //     Protocol not available (92)
+                // and started with no crash handler at all.
+                if optname == SO_PASSCRED {
+                    let file_like = self.linux_process().get_file_like(sockfd.into())?;
+                    let on = u32::from(file_like.as_socket()?.passcred());
+                    return write_sockopt_out(optval, optlen, &on.to_ne_bytes());
+                }
                 const SO_TYPE: usize = 3;
                 if optname == SO_TYPE {
                     let file_like = self.linux_process().get_file_like(sockfd.into())?;
@@ -618,9 +693,7 @@ impl Syscall<'_> {
                     TcpOptname::KEEPINTVL => {
                         write_sockopt_out(optval, optlen, &75u32.to_ne_bytes())
                     }
-                    TcpOptname::KEEPCNT => {
-                        write_sockopt_out(optval, optlen, &9u32.to_ne_bytes())
-                    }
+                    TcpOptname::KEEPCNT => write_sockopt_out(optval, optlen, &9u32.to_ne_bytes()),
                     TcpOptname::CONGESTION => {
                         // Linux returns a NUL-terminated CCA name. We have no
                         // pluggable congestion control; answer a fixed "reno"
@@ -991,11 +1064,30 @@ impl Syscall<'_> {
                 let sockaddr_in = SockAddr::from(endpoint);
                 sockaddr_in.write_to_msg(msg)?;
             }
-            // SCM_RIGHTS: install any fds the peer attached and emit a cmsg.
+            // SCM_RIGHTS: install any fds the peer attached, and SCM_CREDENTIALS
+            // when this end asked for credentials, and emit the cmsgs.
             let mut ctrl_written = 0usize;
-            if !hdr.msg_control.is_null() && hdr.msg_controllen >= 16 {
-                let max_fds = (hdr.msg_controllen - 16) / 4;
+            if !hdr.msg_control.is_null() && hdr.msg_controllen >= CMSG_HDR_LEN {
+                // Credentials, when wanted, are reserved out of the control
+                // buffer BEFORE the descriptors are counted: they are the
+                // kernel's own word about who sent this, so dropping them to
+                // fit one more fd would quietly answer the receiver's question
+                // wrong.
+                let creds = if socket.passcred() {
+                    // The peer of a connected socket IS the sender; there is
+                    // one. Linux records the credentials per message at send
+                    // time, which matters for a DGRAM socket many processes
+                    // write to -- noted, and not what the connected case
+                    // needs.
+                    socket.peer_pid().map(ucred_of)
+                } else {
+                    None
+                };
+                let creds_room = creds.map_or(0, |_| cmsg_align(CMSG_HDR_LEN + 12));
+                let fd_room = hdr.msg_controllen.saturating_sub(creds_room);
+                let max_fds = fd_room.saturating_sub(CMSG_HDR_LEN) / 4;
                 let fds = socket.recv_fds(max_fds);
+                let mut installed: Vec<i32> = Vec::with_capacity(fds.len());
                 if !fds.is_empty() {
                     let proc = self.linux_process();
                     // Same case as `dup`/`pidfd_getfd`: a new descriptor onto
@@ -1003,11 +1095,12 @@ impl Syscall<'_> {
                     // `O_CLOEXEC` from the FileLike (the sender's bit);
                     // Linux keys it off `MSG_CMSG_CLOEXEC` alone.
                     let cloexec = scm_rights_cloexec(flags);
-                    let mut installed: Vec<i32> = Vec::with_capacity(fds.len());
                     for fl in fds {
                         installed.push(proc.add_file_cloexec(fl, cloexec)?.into());
                     }
-                    let cbuf = build_scm_rights_cmsg(&installed);
+                }
+                let cbuf = build_recv_cmsgs(&installed, creds.as_ref());
+                if !cbuf.is_empty() {
                     ctrl_written = cbuf.len().min(hdr.msg_controllen);
                     hdr.msg_control.write_array(&cbuf[..ctrl_written])?;
                 }
@@ -1534,6 +1627,59 @@ mod scm_rights_tests {
         ctrl.extend(cmsg(SOL_SOCKET_LEVEL, 2, &fd_bytes(&[99])));
         ctrl.extend(cmsg(SOL_SOCKET_LEVEL, SCM_RIGHTS, &fd_bytes(&[5, 6])));
         assert_eq!(parse_scm_rights_fds(&ctrl), Ok(vec![3, 5, 6]));
+    }
+
+    /// `SO_PASSCRED` is why chromium's zygote works at all: the browser hands
+    /// the zygote a `SOCK_SEQPACKET` pair, the forked child pings it, and the
+    /// browser reads the child's REAL pid out of `SCM_CREDENTIALS`
+    /// (`RecvMsgWithPid`). With no credentials message the pid stayed -1, the
+    /// browser sent that -1 back, and the zygote answered
+    ///     Zygote could not fork: process_type gpu-process numfds 6 child_pid -1
+    /// after killing a child that had forked perfectly well.
+    #[test]
+    fn the_credentials_message_is_the_one_scm_rights_is_not() {
+        let creds = ucred_of(1282);
+        let buf = build_recv_cmsgs(&[], Some(&creds));
+        assert_eq!(buf.len(), CMSG_HDR_LEN + 12);
+        assert_eq!(
+            i32::from_ne_bytes(buf[12..16].try_into().unwrap()),
+            SCM_CREDENTIALS
+        );
+        assert_eq!(
+            u64::from_ne_bytes(buf[0..8].try_into().unwrap()) as usize,
+            CMSG_HDR_LEN + 12,
+            "cmsg_len counts the header and the ucred, not the padding"
+        );
+        assert_eq!(buf[16..28], creds[..], "the ucred rides in the payload");
+        // It is NOT a descriptor message, so the fd walk must not take it for
+        // one -- a `ucred` read as fd numbers would install whatever pid, uid
+        // and gid happened to be.
+        assert_eq!(parse_scm_rights_fds(&buf), Ok(vec![]));
+        // And with the option off there is no message at all, rather than an
+        // empty one: Linux reports `msg_controllen` 0 there.
+        assert!(build_recv_cmsgs(&[], None).is_empty());
+    }
+
+    /// Both messages in one buffer. The descriptor message is 20 bytes for one
+    /// fd, so the credentials start at 24, not 20: a reader stepping by
+    /// `CMSG_ALIGN(cmsg_len)` lands on the header, and one stepping by
+    /// `cmsg_len` lands in the middle of it.
+    #[test]
+    fn descriptors_and_credentials_sit_on_the_alignment_a_reader_steps_by() {
+        let creds = ucred_of(7);
+        let buf = build_recv_cmsgs(&[9], Some(&creds));
+        assert_eq!(buf.len(), 24 + CMSG_HDR_LEN + 12);
+        // The fd walk finds the descriptor and stops there.
+        assert_eq!(parse_scm_rights_fds(&buf), Ok(vec![9]));
+        // The second header begins at the aligned offset.
+        assert_eq!(
+            i32::from_ne_bytes(buf[24 + 12..24 + 16].try_into().unwrap()),
+            SCM_CREDENTIALS
+        );
+        assert_eq!(buf[24 + 16..], creds[..]);
+        // The padding the alignment introduced is zero, not whatever the
+        // kernel stack held.
+        assert_eq!(&buf[20..24], &[0, 0, 0, 0]);
     }
 
     #[test]

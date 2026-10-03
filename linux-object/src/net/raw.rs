@@ -148,8 +148,7 @@ impl Socket for RawSocketState {
                     proto
                 };
                 if proto == IpProtocol::Icmp {
-                    if let Some((n, full, src)) = super::icmp_rx::pop_ipv4_raw_reply(remote, data)
-                    {
+                    if let Some((n, full, src)) = super::icmp_rx::pop_ipv4_raw_reply(remote, data) {
                         self.note_truncation(full, n);
                         return (Ok(n), Endpoint::Ip(IpEndpoint::new(src, 0)));
                     }
@@ -198,19 +197,15 @@ impl Socket for RawSocketState {
                             (payload_copy, payload_full, src)
                         })
                     } else {
-                        Ipv4Packet::new_checked(buffer).map(|p| {
-                            (size, full, IpAddress::Ipv4(p.src_addr()))
-                        })
+                        Ipv4Packet::new_checked(buffer)
+                            .map(|p| (size, full, IpAddress::Ipv4(p.src_addr())))
                     };
                     drop(socket);
                     drop(sockets);
                     return match parsed {
                         Ok((copied, full_len, addr)) => {
                             self.note_truncation(full_len, copied);
-                            (
-                                Ok(copied),
-                                Endpoint::Ip(IpEndpoint { addr, port: 0 }),
-                            )
+                            (Ok(copied), Endpoint::Ip(IpEndpoint { addr, port: 0 }))
                         }
                         Err(_) => (Err(LxError::EINVAL), Endpoint::Ip(IpEndpoint::UNSPECIFIED)),
                     };
@@ -922,10 +917,7 @@ mod tests {
         let _g = LOCK.lock();
         while super::super::icmp_rx::pop_for(false, None).is_some() {}
         let s = sock(false);
-        assert_eq!(
-            async_std::task::block_on(Socket::connect(&s, lo())),
-            Ok(0)
-        );
+        assert_eq!(async_std::task::block_on(Socket::connect(&s, lo())), Ok(0));
         assert_eq!(Socket::shutdown(&s, 0), Ok(0));
         let mut buf = [0u8; 8];
         assert_eq!(

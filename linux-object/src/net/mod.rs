@@ -2253,6 +2253,31 @@ pub trait Socket: Send + Sync + Debug + downcast_rs::DowncastSync {
     fn peer_pid(&self) -> Option<i32> {
         None
     }
+    /// Whether every message read from this socket should come with the
+    /// sender's credentials attached as an `SCM_CREDENTIALS` control message
+    /// (`SO_PASSCRED`).
+    ///
+    /// It is how a receiver learns WHICH process sent a message, and it cannot
+    /// be forged: the kernel fills the `ucred` in, so the number is as
+    /// trustworthy as the kernel. chromium's zygote is built on exactly that
+    /// -- the browser hands the zygote a `SOCK_SEQPACKET` pair, the forked
+    /// child pings it, and the browser reads the child's REAL pid out of the
+    /// credentials, because the zygote's own idea of the pid is not one the
+    /// browser can check.
+    fn passcred(&self) -> bool {
+        false
+    }
+    /// Turn `SO_PASSCRED` on or off.
+    ///
+    /// Only AF_UNIX carries credentials, and only AF_UNIX stores the bit. On
+    /// every other socket Linux still ACCEPTS the option (it is a generic
+    /// `sock` flag set in `sock_setsockopt`, not a per-family one), so
+    /// refusing it here would fail a call that succeeds on Linux, and the
+    /// default answers accordingly: taken, and inert, since no credentials
+    /// will ever ride a TCP segment.
+    fn set_passcred(&self, _on: bool) -> SysResult {
+        Ok(0)
+    }
     /// Queue file descriptors to be received by the peer (`SCM_RIGHTS` ancillary
     /// data over a unix socket). Only AF_UNIX supports it. This is how seatd
     /// hands an opened DRM/input device to a Wayland compositor and how clients
@@ -2379,10 +2404,10 @@ pub(crate) fn check_setsockopt_len(level: usize, opt: usize, data: &[u8]) -> LxR
     const IPPROTO_IP: usize = 0;
     const IPPROTO_TCP: usize = 6;
     let need = match (level, opt) {
-        (SOL_SOCKET, 13) => 8,              // struct linger
-        (SOL_SOCKET, 20 | 21) => 16,        // struct timeval
+        (SOL_SOCKET, 13) => 8,                     // struct linger
+        (SOL_SOCKET, 20 | 21) => 16,               // struct timeval
         (SOL_SOCKET, 2 | 6 | 7 | 8 | 9 | 15) => 4, // int options
-        (IPPROTO_TCP, 1 | 4 | 5 | 6) => 4,  // int TCP_* (not CONGESTION)
+        (IPPROTO_TCP, 1 | 4 | 5 | 6) => 4,         // int TCP_* (not CONGESTION)
         (IPPROTO_IP, 1 | 2 | 3 | 32 | 33 | 35) => 4,
         _ => 0,
     };
@@ -2410,6 +2435,7 @@ mod setsockopt_len_tests {
         assert_eq!(check_setsockopt_len(1, 20, &[0u8; 8]), Err(LxError::EINVAL));
         assert_eq!(check_setsockopt_len(1, 20, &[0u8; 16]), Ok(()));
     }
+
 }
 
 downcast_rs::impl_downcast!(sync Socket);
