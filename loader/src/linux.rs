@@ -892,7 +892,9 @@ fn handle_signal(
     let signal_context = SignalUserContext {
         stack: uc_stack,
         sig_mask: sigmask,
-        context: MachineContext::new(user_pc),
+        // The registers the signal interrupted, not just the program counter:
+        // a handler reads them out of here (`MachineContext::from_context`).
+        context: MachineContext::from_context(&mut ctx),
         ..Default::default()
     };
     // Where the frame goes. `SA_ONSTACK` is the reason `sigaltstack(2)` exists:
