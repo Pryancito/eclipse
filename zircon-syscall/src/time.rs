@@ -317,9 +317,7 @@ mod clock_update_flags_tests {
             Err(ZxError::INVALID_ARGS)
         );
         assert_eq!(
-            clock_update_flags(
-                v2 | ZX_CLOCK_UPDATE_OPTION_SYNTHETIC_VALUE_VALID | (1 << 20)
-            ),
+            clock_update_flags(v2 | ZX_CLOCK_UPDATE_OPTION_SYNTHETIC_VALUE_VALID | (1 << 20)),
             Err(ZxError::INVALID_ARGS)
         );
     }
@@ -348,10 +346,7 @@ mod clock_create_options_tests {
 
     #[test]
     fn unknown_create_bits_are_invalid_args() {
-        assert_eq!(
-            clock_create_options(1u64 << 20),
-            Err(ZxError::INVALID_ARGS)
-        );
+        assert_eq!(clock_create_options(1u64 << 20), Err(ZxError::INVALID_ARGS));
     }
 }
 

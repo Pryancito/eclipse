@@ -685,6 +685,9 @@ mod channel_read_options_tests {
             Err(ZxError::INVALID_ARGS),
             "unknown bits used to be NOT_SUPPORTED"
         );
-        assert_eq!(channel_read_options(1 | (1 << 8)), Err(ZxError::INVALID_ARGS));
+        assert_eq!(
+            channel_read_options(1 | (1 << 8)),
+            Err(ZxError::INVALID_ARGS)
+        );
     }
 }
