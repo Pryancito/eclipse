@@ -1953,9 +1953,9 @@ mod shmat_place_tests {
     //! chose, and the caller was told so only by the return value).
 
     use super::{
-        msgrcv_bufsz, msgrcv_copy_flags, sem_flags, semop_count, shmat_flags_and_place, SemFlags, ShmatPlace,
-        IPC_NOWAIT, MSG_COPY, MSG_EXCEPT, MSG_NOERROR, SEMOPM, SHMLBA, SHM_RDONLY, SHM_REMAP,
-        SHM_RND,
+        msgrcv_bufsz, msgrcv_copy_flags, sem_flags, semop_count, shmat_flags_and_place, SemFlags,
+        ShmatPlace, IPC_NOWAIT, MSG_COPY, MSG_EXCEPT, MSG_NOERROR, SEMOPM, SHMLBA, SHM_RDONLY,
+        SHM_REMAP, SHM_RND,
     };
     use crate::vm::MMAP_MIN_ADDR;
     use crate::LxError;

@@ -364,14 +364,23 @@ impl Socket for RawSocketState {
             if self.inner.ipv6 {
                 return Err(LxError::ENOPROTOOPT);
             }
-            // `do_ip_setsockopt`: `optlen < sizeof(int)` is EINVAL; a lone
-            // byte used to flip the flag from garbage.
-            if data.len() < 4 {
-                return Err(LxError::EINVAL);
-            }
-            *self.inner.header_included.lock() = u32::from_ne_bytes([
-                data[0], data[1], data[2], data[3],
-            ]) != 0;
+            // `do_ip_setsockopt` reads the value from four bytes when it has
+            // them and from ONE when it does not:
+            //
+            //     if (optlen >= sizeof(int)) { ... get_user(val, ...) }
+            //     else if (optlen >= sizeof(char)) { ... val = (int) ucval; }
+            //
+            // so `setsockopt(fd, IPPROTO_IP, IP_HDRINCL, "\1", 1)` is a
+            // perfectly ordinary way to turn the option on, and only an empty
+            // value has nothing to read. Demanding four bytes refused the
+            // one-byte form every caller of `setsockopt` with a `char` uses.
+            let on = match *data {
+                [] => return Err(LxError::EINVAL),
+                [a, b, c, d, ..] => u32::from_ne_bytes([a, b, c, d]) != 0,
+                // Fewer than four bytes: the first one, as `unsigned char`.
+                [a, ..] => a != 0,
+            };
+            *self.inner.header_included.lock() = on;
             debug!("hdrincl set to {}", *self.inner.header_included.lock());
         }
         Ok(0)
