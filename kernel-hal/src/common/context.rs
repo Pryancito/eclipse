@@ -25,6 +25,12 @@ pub enum UserContextField {
     ThreadPointer,
     AbiRegister,
     ReturnValue,
+    /// The processor status word: `rflags`, `spsr_el1` or `sstatus`. The
+    /// signal frame carries it so a handler can read the condition flags it
+    /// was interrupted with (`MachineContext::from_context`); writing it back
+    /// from a handler is filtered down to the bits userspace owns, because
+    /// the rest decide the exception level and which interrupts are masked.
+    CpuFlags,
 }
 
 /// Reason of the trap.
@@ -621,6 +627,7 @@ impl UserContext {
                     UserContextField::ThreadPointer => &mut self.0.general.fsbase,
                     UserContextField::AbiRegister => &mut self.0.general.r10,
                     UserContextField::ReturnValue => &mut self.0.general.rax,
+                    UserContextField::CpuFlags => &mut self.0.general.rflags,
                 }
             } else if #[cfg(target_arch = "aarch64")] {
                 match which {
@@ -629,6 +636,7 @@ impl UserContext {
                     UserContextField::ThreadPointer => &mut self.0.tpidr,
                     UserContextField::AbiRegister => &mut self.0.general.x18,
                     UserContextField::ReturnValue => &mut self.0.general.x0,
+                    UserContextField::CpuFlags => &mut self.0.spsr,
                 }
             } else if #[cfg(target_arch = "riscv64")] {
                 match which {
@@ -637,6 +645,7 @@ impl UserContext {
                     UserContextField::ThreadPointer => &mut self.0.general.tp,
                     UserContextField::AbiRegister => &mut self.0.general.a7,
                     UserContextField::ReturnValue => &mut self.0.general.a0,
+                    UserContextField::CpuFlags => &mut self.0.sstatus,
                 }
             } else {
                 unimplemented!()

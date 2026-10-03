@@ -122,6 +122,7 @@ pub mod x86_64 {
     /// zero there: their bases live in `MSR_FS_BASE`/`MSR_KERNEL_GS_BASE`, not
     /// in the selectors, so a handler reading those two learns nothing either
     /// way.
+    #[cfg(target_arch = "x86_64")]
     const USER_CS: u16 = 0x33;
 
     #[cfg(target_arch = "x86_64")]
@@ -277,7 +278,9 @@ pub mod riscv64 {
         /// costs a handler that reads its own `ucontext`.
         pub fn from_context(ctx: &mut super::UserContext) -> Self {
             let mut m = Self::default();
-            let g = ctx.general();
+            // Copied out, not borrowed: `get_field` below takes `&mut ctx`,
+            // and `GeneralRegs` is `Copy`.
+            let g = *ctx.general();
             m.general_regs[0] = ctx.get_field(kernel_hal::context::UserContextField::InstrPointer);
             m.general_regs[1..].copy_from_slice(&[
                 g.ra, g.sp, g.gp, g.tp, g.t0, g.t1, g.t2, g.s0, g.s1, g.a0, g.a1, g.a2, g.a3, g.a4,
@@ -409,6 +412,14 @@ pub mod aarch64 {
         }
     }
 
+    /// The `pstate` bits a handler may change through its own `ucontext`: the
+    /// condition flags `N`, `Z`, `C` and `V`, which are userspace's own. The
+    /// rest of `spsr_el1` -- the exception level, the `DAIF` interrupt masks,
+    /// the execution state -- is the kernel's, and `sigreturn` reads this
+    /// struct straight off the user stack. The x86_64 twin is
+    /// [`super::x86_64::RESTORABLE_EFLAGS`].
+    pub const RESTORABLE_PSTATE: usize = 0xf000_0000;
+
     /// `regs` is `x0..x30` in order, which is not the order `trapframe` stores
     /// them in (`x0` and `x30` sit at the end of its `GeneralRegs`, put there
     /// for the trap entry assembly), so both directions spell the mapping out.
@@ -426,6 +437,7 @@ pub mod aarch64 {
             let mut m = Self {
                 pc: ctx.get_field(kernel_hal::context::UserContextField::InstrPointer),
                 sp: ctx.get_field(kernel_hal::context::UserContextField::StackPointer),
+                pstate: ctx.get_field(kernel_hal::context::UserContextField::CpuFlags),
                 ..Default::default()
             };
             m.regs = [
@@ -436,10 +448,18 @@ pub mod aarch64 {
             m
         }
 
-        /// Put them back on `sigreturn(2)`. `pstate` is not carried back: it
-        /// holds the exception-level and mask bits `spsr_el1` needs, which are
-        /// the kernel's to set, not a handler's.
+        /// Put them back on `sigreturn(2)`. Of `pstate` only
+        /// [`RESTORABLE_PSTATE`] comes back, the arm64 half of what
+        /// `RESTORABLE_EFLAGS` does for x86_64: the rest of `spsr_el1` picks
+        /// the exception level and which interrupts are masked, and this
+        /// struct is read off the user stack.
         pub fn restore_into(&self, ctx: &mut super::UserContext) {
+            let kept =
+                ctx.get_field(kernel_hal::context::UserContextField::CpuFlags) & !RESTORABLE_PSTATE;
+            ctx.set_field(
+                kernel_hal::context::UserContextField::CpuFlags,
+                kept | (self.pstate & RESTORABLE_PSTATE),
+            );
             ctx.set_field(kernel_hal::context::UserContextField::InstrPointer, self.pc);
             ctx.set_field(kernel_hal::context::UserContextField::StackPointer, self.sp);
             let r = &self.regs;
