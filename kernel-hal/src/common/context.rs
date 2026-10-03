@@ -49,6 +49,72 @@ pub enum TrapReason {
 #[cfg(not(feature = "libos"))]
 pub const TIMER_INTERRUPT_VEC: usize = crate::timer_interrupt_vector();
 
+/// The error code an x86 fault pushed, rendered as what it means.
+///
+/// `{:#x?}` of the trap frame prints `error_code: 0x0` and stops there, which
+/// is the least useful thing it could say. On #TS, #NP, #SS and #GP a
+/// *non-zero* code names the descriptor that was refused, and a *zero* one
+/// says the fault had nothing to do with a selector at all — which rules out
+/// half the causes of a #GP before anyone opens a disassembler. Both readings
+/// were left to whoever was staring at a photo of the screen.
+///
+/// Not gated on the architecture: these are the numbers the Intel manual
+/// assigns (volume 3, "Error Code"), so a host of any architecture can check
+/// the decision.
+pub struct X86TrapErrorCode {
+    /// The exception vector, as the trap frame carries it.
+    pub vec: usize,
+    /// The error code the CPU (or the entry stub, for a vector that has none)
+    /// pushed under it.
+    pub error_code: usize,
+}
+
+impl fmt::Display for X86TrapErrorCode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        const SELECTOR_VECTORS: [usize; 4] = [10, 11, 12, 13];
+        let ec = self.error_code;
+        if SELECTOR_VECTORS.contains(&self.vec) && ec != 0 {
+            // bit0 EXT, bit1 IDT, bit2 TI (GDT/LDT, only when IDT is clear),
+            // bits 3.. the index into whichever table those two name.
+            let table = if ec & 0b010 != 0 {
+                "IDT"
+            } else if ec & 0b100 != 0 {
+                "LDT"
+            } else {
+                "GDT"
+            };
+            return write!(
+                f,
+                "error_code {:#x} names a descriptor: {} index {}{}",
+                ec,
+                table,
+                ec >> 3,
+                if ec & 1 != 0 {
+                    ", raised by an external event"
+                } else {
+                    ""
+                },
+            );
+        }
+        match self.vec {
+            13 => f.write_str(
+                "error_code 0 on a #GP means no descriptor was involved, so it is \
+                 none of the selector causes: look for a memory operand that is \
+                 not canonical, an SSE access that is not 16-byte aligned \
+                 (movaps/movdqa), RDMSR/WRMSR of a reserved MSR, a privileged \
+                 instruction executed outside ring 0, or an iret/sysret returning \
+                 to a non-canonical address",
+            ),
+            10..=12 => f.write_str("error_code 0: no descriptor was involved"),
+            8 | 14 | 17 | 21 | 29 | 30 => write!(f, "error_code {ec:#x}"),
+            _ => f.write_str(
+                "this vector pushes no error code: the 0 above is the placeholder \
+                 the entry stub pushed in its place",
+            ),
+        }
+    }
+}
+
 impl TrapReason {
     /// Decode an x86 trap from the vector and error code the trap frame
     /// carries.
@@ -755,6 +821,56 @@ cfg_if! {
 mod tests {
     use super::*;
     use crate::{Kind, Source};
+
+    // ---- x86 error codes --------------------------------------------------
+
+    fn hint(vec: usize, error_code: usize) -> alloc::string::String {
+        alloc::format!("{}", X86TrapErrorCode { vec, error_code })
+    }
+
+    /// The reading that would have saved a round trip on the #GP photographed
+    /// on 2026-10-03: `error_code: 0x0` under vector 13 is not "no
+    /// information", it positively rules out every selector cause.
+    #[test]
+    fn a_zero_error_code_on_a_gp_rules_out_the_selector_causes() {
+        let s = hint(13, 0);
+        assert!(s.contains("no descriptor was involved"), "{}", s);
+        assert!(s.contains("canonical"), "{}", s);
+        assert!(s.contains("movaps"), "{}", s);
+    }
+
+    #[test]
+    fn a_non_zero_error_code_names_the_descriptor() {
+        // 0x58 is the kernel code selector in this tree's GDT: index 11, GDT,
+        // not external.
+        let s = hint(13, 0x58);
+        assert!(s.contains("GDT index 11"), "{}", s);
+        assert!(!s.contains("external"), "{}", s);
+        // bit 1 set: the descriptor is in the IDT, and the TI bit must not be
+        // read as LDT once it is.
+        let s = hint(11, 0b110);
+        assert!(s.contains("IDT index 0"), "{}", s);
+        // bit 2 set, bit 1 clear: LDT. bit 0 set: external event.
+        let s = hint(12, 0b1101);
+        assert!(s.contains("LDT index 1"), "{}", s);
+        assert!(s.contains("external event"), "{}", s);
+    }
+
+    /// Only #TS, #NP, #SS and #GP carry a selector. Reading one out of #DF's
+    /// or #AC's always-zero code, or out of the placeholder the entry stub
+    /// pushes for a vector with no error code at all, would invent a
+    /// descriptor that was never refused.
+    #[test]
+    fn the_other_vectors_do_not_get_a_selector_read_out_of_them() {
+        for (vec, code) in [(8usize, 0usize), (17, 0), (14, 0x2), (21, 0x58)] {
+            let s = hint(vec, code);
+            assert!(!s.contains("index"), "vector {}: {}", vec, s);
+        }
+        let s = hint(6, 0);
+        assert!(s.contains("pushes no error code"), "{}", s);
+        let s = hint(0x10e, 0);
+        assert!(s.contains("pushes no error code"), "{}", s);
+    }
 
     // ---- AArch64 ----------------------------------------------------------
 

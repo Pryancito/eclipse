@@ -1068,23 +1068,39 @@ pub extern "C" fn trap_handler(tf: &mut TrapFrame) {
                 }
             }
             crate::kstats::note_fault_regs(tf.rip as u64, tf.rbp as u64, fault_sp as u64);
+            // The two lines after the frame are deliberately last: the header
+            // above scrolls off a 25-line console long before anyone can
+            // photograph it, and the frame alone carries neither a symbol for
+            // `rip` nor any reading of `error_code`. Repeating both at the tail
+            // makes the bottom of the screen enough to start a diagnosis.
             panic!(
                 "\nCPU EXCEPTION on CPU{}: {} (vec={:#x})\n\
-                 error_code={:#x}\n{:#x?}",
+                 error_code={:#x}\n{:#x?}\n\
+                 {} at rip={}\n{}",
                 super::cpu::cpu_id(),
                 name,
                 vec,
                 tf.error_code,
-                tf
+                tf,
+                name,
+                crate::ksyms::Addr(tf.rip as u64),
+                crate::context::X86TrapErrorCode {
+                    vec,
+                    error_code: tf.error_code,
+                },
             );
         }
         TrapReason::UndefinedInstruction => {
             report_ud_shape(tf.rip as u64);
+            // Symbol repeated after the frame for the same reason as the
+            // GernelFault arm above: the header scrolls off the console.
             panic!(
-                "\nCPU EXCEPTION on CPU{}: Invalid Opcode (#UD) at RIP={}\n{:#x?}",
+                "\nCPU EXCEPTION on CPU{}: Invalid Opcode (#UD) at RIP={}\n{:#x?}\n\
+                 Invalid Opcode (#UD) at rip={}",
                 super::cpu::cpu_id(),
                 crate::ksyms::Addr(tf.rip as u64),
-                tf
+                tf,
+                crate::ksyms::Addr(tf.rip as u64),
             )
         }
         TrapReason::UnalignedAccess => panic!(
