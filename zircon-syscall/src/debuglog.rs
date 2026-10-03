@@ -3,6 +3,21 @@ use {
     zircon_object::{debuglog::*, dev::*},
 };
 
+/// `ZX_LOG_FLAG_READABLE`: the only non-zero `options` `zx_debuglog_create`
+/// accepts (`zircon/system/public/zircon/syscalls/log.h`).
+const FLAG_READABLE: u32 = 0x4000_0000;
+
+/// Validate `zx_debuglog_create`'s `options`: only `0` and
+/// `ZX_LOG_FLAG_READABLE` are legal (`ZX_ERR_INVALID_ARGS` otherwise).
+/// Unknown bits used to succeed and also poison every later
+/// `debuglog_write` via `flags | self.flags`.
+fn debuglog_create_options(options: u32) -> ZxResult {
+    if options & !FLAG_READABLE != 0 {
+        return Err(ZxError::INVALID_ARGS);
+    }
+    Ok(())
+}
+
 impl Syscall<'_> {
     /// Create a kernel managed debuglog reader or writer.
     pub fn sys_debuglog_create(
@@ -15,13 +30,13 @@ impl Syscall<'_> {
             "debuglog.create: resource_handle={:#x?}, options={:#x?}",
             rsrc, options,
         );
+        debuglog_create_options(options)?;
         let proc = self.thread.proc();
         if rsrc != 0 {
             proc.get_object::<Resource>(rsrc)?
                 .validate_system(SystemResource::Debuglog)?;
         }
         let dlog = DebugLog::create(options);
-        const FLAG_READABLE: u32 = 0x4000_0000u32;
         let dlog_right = if options & FLAG_READABLE == 0 {
             Rights::DEFAULT_DEBUGLOG
         } else {
@@ -96,5 +111,34 @@ impl Syscall<'_> {
         }
         buf.write_array(&buffer[..actual_len])?;
         Ok(actual_len)
+    }
+}
+
+#[cfg(test)]
+mod debuglog_create_options_tests {
+    use super::*;
+
+    #[test]
+    fn zero_and_readable_are_ok() {
+        assert_eq!(debuglog_create_options(0), Ok(()));
+        assert_eq!(debuglog_create_options(FLAG_READABLE), Ok(()));
+    }
+
+    #[test]
+    fn any_other_bit_is_invalid_args() {
+        assert_eq!(
+            debuglog_create_options(1),
+            Err(ZxError::INVALID_ARGS),
+            "bit 0 used to poison every later write"
+        );
+        assert_eq!(debuglog_create_options(0x10), Err(ZxError::INVALID_ARGS));
+        assert_eq!(
+            debuglog_create_options(FLAG_READABLE | 1),
+            Err(ZxError::INVALID_ARGS)
+        );
+        assert_eq!(
+            debuglog_create_options(u32::MAX),
+            Err(ZxError::INVALID_ARGS)
+        );
     }
 }

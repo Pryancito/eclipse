@@ -490,16 +490,19 @@ impl FileLike for Epoll {
         Ok(())
     }
 
+    // Linux `eventpoll_fops` has no `.read`/`.write` — vfs returns `-EINVAL`,
+    // not `-ENOSYS` (which means "syscall missing"). Probes that treat those
+    // differently must see the Linux errno.
     async fn read(&self, _buf: &mut [u8]) -> LxResult<usize> {
-        Err(LxError::ENOSYS)
+        Err(LxError::EINVAL)
     }
 
     fn write(&self, _buf: &[u8]) -> LxResult<usize> {
-        Err(LxError::ENOSYS)
+        Err(LxError::EINVAL)
     }
 
     async fn read_at(&self, _offset: u64, _buf: &mut [u8]) -> LxResult<usize> {
-        Err(LxError::ENOSYS)
+        Err(LxError::EINVAL)
     }
 
     fn poll(&self, _events: PollEvents) -> LxResult<PollStatus> {
@@ -717,6 +720,18 @@ mod tests {
 
     fn epoll() -> Arc<Epoll> {
         Epoll::new(OpenFlags::empty())
+    }
+
+    /// `read`/`write` on an epoll fd must be `-EINVAL`, not `-ENOSYS`:
+    /// Linux has no fops for them, and glibc probes treat the two differently.
+    #[test]
+    fn read_write_on_epoll_are_einval_not_enosys() {
+        use async_std::task::block_on;
+        let ep = epoll();
+        let mut buf = [0u8; 8];
+        assert_eq!(block_on(ep.read(&mut buf)), Err(LxError::EINVAL));
+        assert_eq!(ep.write(&[0u8; 8]), Err(LxError::EINVAL));
+        assert_eq!(block_on(ep.read_at(0, &mut buf)), Err(LxError::EINVAL));
     }
 
     /// `fcntl(F_SETFL, O_NONBLOCK)` on an epoll fd used to return success

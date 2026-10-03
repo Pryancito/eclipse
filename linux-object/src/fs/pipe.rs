@@ -228,6 +228,12 @@ impl Pipe {
         self.data.lock().capacity
     }
 
+    /// Bytes currently queued (`FIONREAD` / `pipe_ioctl`). Shared between
+    /// ends — Linux reports the same occupancy on either fd.
+    pub fn buffered_len(&self) -> usize {
+        self.data.lock().buf.len()
+    }
+
     /// Set the capacity (`fcntl(F_SETPIPE_SZ)`); the caller has already
     /// rounded and bounds-checked the value. Shrinking below what is queued
     /// is refused with `Busy` (`EBUSY`), as `pipe_set_size` does.

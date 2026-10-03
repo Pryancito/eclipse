@@ -37,7 +37,37 @@ const ZX_CLOCK_OPTS_ALL: u64 = ZX_CLOCK_OPT_MONOTONIC
     | ZX_CLOCK_OPT_BOOT
     | ZX_CLOCK_OPT_MAPPABLE;
 const ZX_CLOCK_UPDATE_OPTION_SYNTHETIC_VALUE_VALID: u64 = 1 << 0;
+const ZX_CLOCK_UPDATE_OPTION_RATE_ADJUST: u64 = 1 << 1;
+const ZX_CLOCK_UPDATE_OPTION_ERROR_BOUND: u64 = 1 << 2;
 const ZX_CLOCK_UPDATE_OPTION_REFERENCE_VALUE_VALID: u64 = 1 << 3;
+const ZX_CLOCK_UPDATE_OPTIONS_ALL: u64 = ZX_CLOCK_UPDATE_OPTION_SYNTHETIC_VALUE_VALID
+    | ZX_CLOCK_UPDATE_OPTION_RATE_ADJUST
+    | ZX_CLOCK_UPDATE_OPTION_ERROR_BOUND
+    | ZX_CLOCK_UPDATE_OPTION_REFERENCE_VALUE_VALID;
+
+/// Strip the version nibble and refuse an empty or unknown update-options
+/// word (`zx_clock_update`). Unknown bits used to succeed with no effect.
+fn clock_update_flags(options: u64) -> ZxResult<(u64, u64)> {
+    let version = options >> ZX_CLOCK_ARGS_VERSION_SHIFT;
+    let flags = options & !ZX_CLOCK_ARGS_VERSION_MASK;
+    if flags & !ZX_CLOCK_UPDATE_OPTIONS_ALL != 0 || flags == 0 {
+        return Err(ZxError::INVALID_ARGS);
+    }
+    Ok((version, flags))
+}
+
+/// Validate `zx_clock_create` options: known bits only, and CONTINUOUS only
+/// with MONOTONIC.
+fn clock_create_options(options: u64) -> ZxResult<u64> {
+    let version = options >> ZX_CLOCK_ARGS_VERSION_SHIFT;
+    if version > 1 || options & !(ZX_CLOCK_ARGS_VERSION_MASK | ZX_CLOCK_OPTS_ALL) != 0 {
+        return Err(ZxError::INVALID_ARGS);
+    }
+    if options & ZX_CLOCK_OPT_CONTINUOUS != 0 && options & ZX_CLOCK_OPT_MONOTONIC == 0 {
+        return Err(ZxError::INVALID_ARGS);
+    }
+    Ok(version)
+}
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -72,10 +102,7 @@ impl Syscall<'_> {
         user_args: UserInPtr<u8>,
         mut out: UserOutPtr<HandleValue>,
     ) -> ZxResult {
-        let version = options >> ZX_CLOCK_ARGS_VERSION_SHIFT;
-        if version > 1 || options & !(ZX_CLOCK_ARGS_VERSION_MASK | ZX_CLOCK_OPTS_ALL) != 0 {
-            return Err(ZxError::INVALID_ARGS);
-        }
+        let version = clock_create_options(options)?;
         let backstop = match version {
             0 => 0,
             1 => {
@@ -159,8 +186,7 @@ impl Syscall<'_> {
             .thread
             .proc()
             .get_object_with_rights::<Clock>(handle, Rights::WRITE)?;
-        let version = options >> ZX_CLOCK_ARGS_VERSION_SHIFT;
-        let flags = options & !ZX_CLOCK_ARGS_VERSION_MASK;
+        let (version, flags) = clock_update_flags(options)?;
         let now = timer_now().as_nanos() as i64;
         match version {
             1 => {
@@ -253,6 +279,79 @@ impl Debug for Deadline {
         } else {
             write!(f, "At({:?})", Duration::from_nanos(self.0 as u64))
         }
+    }
+}
+
+#[cfg(test)]
+mod clock_update_flags_tests {
+    use super::*;
+
+    #[test]
+    fn a_known_update_bit_survives() {
+        let v1 = 1u64 << ZX_CLOCK_ARGS_VERSION_SHIFT;
+        assert_eq!(
+            clock_update_flags(v1 | ZX_CLOCK_UPDATE_OPTION_SYNTHETIC_VALUE_VALID),
+            Ok((1, ZX_CLOCK_UPDATE_OPTION_SYNTHETIC_VALUE_VALID))
+        );
+        let v2 = 2u64 << ZX_CLOCK_ARGS_VERSION_SHIFT;
+        assert_eq!(
+            clock_update_flags(
+                v2 | ZX_CLOCK_UPDATE_OPTION_SYNTHETIC_VALUE_VALID
+                    | ZX_CLOCK_UPDATE_OPTION_REFERENCE_VALUE_VALID
+            ),
+            Ok((
+                2,
+                ZX_CLOCK_UPDATE_OPTION_SYNTHETIC_VALUE_VALID
+                    | ZX_CLOCK_UPDATE_OPTION_REFERENCE_VALUE_VALID
+            ))
+        );
+    }
+
+    #[test]
+    fn empty_or_unknown_bits_are_invalid_args() {
+        let v2 = 2u64 << ZX_CLOCK_ARGS_VERSION_SHIFT;
+        // Version alone used to succeed with no effect.
+        assert_eq!(clock_update_flags(v2), Err(ZxError::INVALID_ARGS));
+        assert_eq!(
+            clock_update_flags(v2 | (1 << 20)),
+            Err(ZxError::INVALID_ARGS)
+        );
+        assert_eq!(
+            clock_update_flags(
+                v2 | ZX_CLOCK_UPDATE_OPTION_SYNTHETIC_VALUE_VALID | (1 << 20)
+            ),
+            Err(ZxError::INVALID_ARGS)
+        );
+    }
+}
+
+#[cfg(test)]
+mod clock_create_options_tests {
+    use super::*;
+
+    #[test]
+    fn continuous_without_monotonic_is_invalid_args() {
+        assert_eq!(
+            clock_create_options(ZX_CLOCK_OPT_CONTINUOUS),
+            Err(ZxError::INVALID_ARGS)
+        );
+        assert_eq!(
+            clock_create_options(ZX_CLOCK_OPT_MONOTONIC | ZX_CLOCK_OPT_CONTINUOUS),
+            Ok(0)
+        );
+        assert_eq!(clock_create_options(0), Ok(0));
+        assert_eq!(
+            clock_create_options(ZX_CLOCK_OPT_MONOTONIC | ZX_CLOCK_OPT_MAPPABLE),
+            Ok(0)
+        );
+    }
+
+    #[test]
+    fn unknown_create_bits_are_invalid_args() {
+        assert_eq!(
+            clock_create_options(1u64 << 20),
+            Err(ZxError::INVALID_ARGS)
+        );
     }
 }
 

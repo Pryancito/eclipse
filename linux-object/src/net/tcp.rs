@@ -56,6 +56,9 @@ pub struct TcpInner {
     bound: Option<IpEndpoint>,
     /// `SO_REUSEADDR`.
     reuse_addr: bool,
+    /// `TCP_NODELAY` (Nagle disabled). Stored so `getsockopt` can report it;
+    /// smoltcp's nagle query is not a reliable mirror of this flag.
+    nodelay: bool,
     /// `shutdown(SHUT_RD)`: reads drain what is queued and then report EOF.
     read_closed: bool,
 }
@@ -155,15 +158,14 @@ fn connect_error(e: smoltcp::Error) -> LxError {
     }
 }
 
-/// A `setsockopt` integer: four native-endian bytes, or a lone byte.
+/// A `setsockopt` integer: exactly four native-endian bytes (`sizeof(int)`).
+/// A shorter `optlen` is `EINVAL`, as `sock_setsockopt` / `do_tcp_setsockopt`
+/// require — accepting 1–3 bytes used to apply a lone byte as if it were an int.
 fn sockopt_int(data: &[u8]) -> LxResult<u32> {
-    if data.len() >= 4 {
-        Ok(u32::from_ne_bytes([data[0], data[1], data[2], data[3]]))
-    } else if let Some(&b) = data.first() {
-        Ok(b as u32)
-    } else {
-        Err(LxError::EINVAL)
+    if data.len() < 4 {
+        return Err(LxError::EINVAL);
     }
+    Ok(u32::from_ne_bytes([data[0], data[1], data[2], data[3]]))
 }
 
 /// Build a TCP socket with delayed ACK disabled.
@@ -228,6 +230,7 @@ impl TcpSocketState {
                 was_connected: false,
                 bound: None,
                 reuse_addr: false,
+                nodelay: false,
                 read_closed: false,
             })),
         })
@@ -816,6 +819,10 @@ impl Socket for TcpSocketState {
         Ok(0)
     }
 
+    fn is_listening(&self) -> bool {
+        self.inner.lock().is_listening
+    }
+
     fn shutdown(&self, howto: usize) -> SysResult {
         let (shut_rd, shut_wr) = shutdown_sides(howto)?;
         let mut inner = self.inner.lock();
@@ -925,6 +932,7 @@ impl Socket for TcpSocketState {
                         was_connected: true,
                         bound: None,
                         reuse_addr: false,
+                        nodelay: false,
                         read_closed: false,
                     })),
                 });
@@ -1005,6 +1013,14 @@ impl Socket for TcpSocketState {
         Some(SocketType::SOCK_STREAM)
     }
 
+    fn so_reuseaddr(&self) -> bool {
+        self.inner.lock().reuse_addr
+    }
+
+    fn tcp_nodelay(&self) -> bool {
+        self.inner.lock().nodelay
+    }
+
     fn setsockopt(&self, level: usize, opt: usize, data: &[u8]) -> SysResult {
         const SOL_SOCKET: usize = 1;
         const SO_REUSEADDR: usize = 2;
@@ -1018,7 +1034,11 @@ impl Socket for TcpSocketState {
         if level == IPPROTO_TCP && opt == TCP_NODELAY {
             let optval = sockopt_int(data)?;
             // TCP_NODELAY disables Nagle; smoltcp's API is the inverse flag.
-            let handle = self.inner.lock().handle.0;
+            let handle = {
+                let mut inner = self.inner.lock();
+                inner.nodelay = optval != 0;
+                inner.handle.0
+            };
             get_sockets()
                 .lock()
                 .get::<TcpSocket>(handle)
@@ -1093,11 +1113,14 @@ impl FileLike for TcpSocketState {
 
     fn poll(&self, events: PollEvents) -> LxResult<PollStatus> {
         let (read, write, error) = Socket::poll(self, events);
+        // `Socket::poll` sets `error` only when `!is_open()` (closed/RST).
+        // That is also `POLLHUP` on Linux (`TCP_CLOSE`); leaving hangup false
+        // made epoll see only `POLLERR`.
         Ok(PollStatus {
             read,
             write,
             error,
-            hangup: false,
+            hangup: error,
         })
     }
 
@@ -1112,13 +1135,25 @@ impl FileLike for TcpSocketState {
             read,
             write,
             error,
-            hangup: false,
+            hangup: error,
         })
     }
 
     fn ioctl(&self, request: usize, arg1: usize, arg2: usize, arg3: usize) -> LxResult<usize> {
         let ipv6 = self.inner.lock().ipv6;
         handle_net_ioctl(request, arg1, arg2, arg3, ipv6)
+    }
+
+    /// `FIONREAD`/`SIOCINQ`: bytes in the TCP receive queue. Without this the
+    /// ioctl fell through to ENOTTY (same Firefox Wayland proxy trap as
+    /// unix sockets had before they answered). Listening sockets are refused
+    /// with `EINVAL` in the syscall via `is_listening`.
+    fn readable_bytes(&self) -> Option<usize> {
+        let handle = self.inner.lock().handle.0;
+        let sockets = get_sockets();
+        let mut set = sockets.lock();
+        let n = set.get::<TcpSocket>(handle).recv_queue();
+        Some(n)
     }
 
     fn as_socket(&self) -> LxResult<&dyn Socket> {
@@ -1245,6 +1280,28 @@ mod transfer_bench {
     #[test]
     fn large_transfer_fast_reader() {
         run_transfer(16 * 1024 * 1024, 256 * 1024);
+    }
+}
+
+#[cfg(test)]
+mod sockopt_int_tests {
+    use super::sockopt_int;
+    use crate::error::LxError;
+
+    #[test]
+    fn four_bytes_are_the_native_int() {
+        assert_eq!(sockopt_int(&1u32.to_ne_bytes()), Ok(1));
+        assert_eq!(sockopt_int(&0u32.to_ne_bytes()), Ok(0));
+        assert_eq!(sockopt_int(&[0xff, 0xff, 0xff, 0xff]), Ok(u32::MAX));
+    }
+
+    #[test]
+    fn a_short_optlen_is_einval_not_a_lone_byte() {
+        // Used to accept 1–3 bytes and apply `data[0] as u32`.
+        assert_eq!(sockopt_int(&[]), Err(LxError::EINVAL));
+        assert_eq!(sockopt_int(&[1]), Err(LxError::EINVAL));
+        assert_eq!(sockopt_int(&[1, 0]), Err(LxError::EINVAL));
+        assert_eq!(sockopt_int(&[1, 0, 0]), Err(LxError::EINVAL));
     }
 }
 
@@ -1737,5 +1794,56 @@ mod port_tests {
         assert_eq!(Socket::listen(&server), Ok(0));
         assert_eq!(Socket::shutdown(&server, 2), Ok(0));
         assert!(crate::net::LISTEN_TABLE.can_listen(any(41070)));
+    }
+}
+
+#[cfg(test)]
+mod fionread_tests {
+    use super::*;
+    use crate::net::NET_TEST_LOCK as LOCK;
+
+    /// Idle TCP must answer `FIONREAD` with 0, not fall through to ENOTTY
+    /// via a missing `readable_bytes`.
+    #[test]
+    fn an_idle_tcp_socket_reports_zero_bytes_readable() {
+        let _g = LOCK.lock();
+        let s = TcpSocketState::new(false).unwrap();
+        assert_eq!(FileLike::readable_bytes(&s), Some(0));
+    }
+
+    /// `getsockopt(SO_REUSEADDR)` must mirror what `setsockopt` stored,
+    /// not a hardcoded 1.
+    #[test]
+    fn so_reuseaddr_defaults_off_and_follows_setsockopt() {
+        let _g = LOCK.lock();
+        let s = TcpSocketState::new(false).unwrap();
+        assert!(!Socket::so_reuseaddr(&s));
+        Socket::setsockopt(&s, 1, 2, &1i32.to_ne_bytes()).unwrap();
+        assert!(Socket::so_reuseaddr(&s));
+        Socket::setsockopt(&s, 1, 2, &0i32.to_ne_bytes()).unwrap();
+        assert!(!Socket::so_reuseaddr(&s));
+    }
+
+    /// `getsockopt(TCP_NODELAY)` used to be `ENOPROTOOPT` even after a
+    /// successful `setsockopt`.
+    #[test]
+    fn tcp_nodelay_defaults_off_and_follows_setsockopt() {
+        let _g = LOCK.lock();
+        let s = TcpSocketState::new(false).unwrap();
+        assert!(!Socket::tcp_nodelay(&s));
+        Socket::setsockopt(&s, 6, 1, &1i32.to_ne_bytes()).unwrap();
+        assert!(Socket::tcp_nodelay(&s));
+        Socket::setsockopt(&s, 6, 1, &0i32.to_ne_bytes()).unwrap();
+        assert!(!Socket::tcp_nodelay(&s));
+    }
+
+    /// A never-connected TCP socket is closed (`!is_open`); poll must report
+    /// hangup, not only `error` with `hangup: false`.
+    #[test]
+    fn a_closed_tcp_socket_reports_hangup() {
+        let _g = LOCK.lock();
+        let s = TcpSocketState::new(false).unwrap();
+        let status = FileLike::poll(&s, PollEvents::IN).unwrap();
+        assert!(status.error && status.hangup);
     }
 }

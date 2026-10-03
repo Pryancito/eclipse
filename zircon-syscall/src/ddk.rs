@@ -25,6 +25,14 @@ fn interrupt_options(options: u32) -> ZxResult<InterruptOptions> {
     InterruptOptions::from_bits(options).ok_or(ZxError::INVALID_ARGS)
 }
 
+/// `zx_interrupt_trigger`: `options` must be zero.
+fn interrupt_trigger_options(options: u32) -> ZxResult {
+    if options != 0 {
+        return Err(ZxError::INVALID_ARGS);
+    }
+    Ok(())
+}
+
 impl Syscall<'_> {
     /// Create a new object in the kernel representing an IOMMU device.
     pub fn sys_iommu_create(
@@ -250,6 +258,7 @@ impl Syscall<'_> {
             "interrupt.trigger: interrupt={:?} options={:?} timestamp={:?}",
             interrupt, options, timestamp
         );
+        interrupt_trigger_options(options)?;
         let interrupt = self
             .thread
             .proc()
@@ -412,6 +421,16 @@ mod tests {
         assert_eq!(
             interrupt_options(u32::MAX).err(),
             Some(ZxError::INVALID_ARGS)
+        );
+    }
+
+    #[test]
+    fn interrupt_trigger_requires_options_zero() {
+        assert_eq!(interrupt_trigger_options(0), Ok(()));
+        assert_eq!(interrupt_trigger_options(1), Err(ZxError::INVALID_ARGS));
+        assert_eq!(
+            interrupt_trigger_options(u32::MAX),
+            Err(ZxError::INVALID_ARGS)
         );
     }
 }

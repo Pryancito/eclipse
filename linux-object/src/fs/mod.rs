@@ -837,9 +837,11 @@ pub trait FileLike: KernelObject + downcast_rs::DowncastSync {
     fn write(&self, buf: &[u8]) -> LxResult<usize>;
     /// read to buffer at given offset
     async fn read_at(&self, offset: u64, buf: &mut [u8]) -> LxResult<usize>;
-    /// write from buffer at given offset
+    /// write from buffer at given offset. Default: not seekable (`ESPIPE`),
+    /// like a pipe/socket — the same answer as [`seek`](Self::seek). It used
+    /// to be `ENOSYS`, which told callers the *syscall* was missing.
     fn write_at(&self, _offset: u64, _buf: &[u8]) -> LxResult<usize> {
-        Err(LxError::ENOSYS)
+        Err(LxError::ESPIPE)
     }
     /// reposition the file offset. Default: not seekable (`ESPIPE`), like a
     /// pipe/socket. Seekable objects (regular files, dma-bufs whose size Mesa

@@ -346,6 +346,15 @@ impl Socket for RawSocketState {
         Ok(0)
     }
 
+    /// `inet_shutdown` on a raw IP socket: `ENOTCONN` without a peer.
+    fn shutdown(&self, howto: usize) -> SysResult {
+        let _ = shutdown_sides(howto)?;
+        if self.inner.remote.lock().is_none() {
+            return Err(LxError::ENOTCONN);
+        }
+        Ok(0)
+    }
+
     fn setsockopt(&self, level: usize, opt: usize, data: &[u8]) -> SysResult {
         if let (IPPROTO_IP, IP_HDRINCL) = (level, opt) {
             // `IP_HDRINCL` is an AF_INET option; on an AF_INET6 socket Linux
@@ -355,10 +364,15 @@ impl Socket for RawSocketState {
             if self.inner.ipv6 {
                 return Err(LxError::ENOPROTOOPT);
             }
-            if let Some(arg) = data.first() {
-                *self.inner.header_included.lock() = *arg > 0;
-                debug!("hdrincl set to {}", *self.inner.header_included.lock());
+            // `do_ip_setsockopt`: `optlen < sizeof(int)` is EINVAL; a lone
+            // byte used to flip the flag from garbage.
+            if data.len() < 4 {
+                return Err(LxError::EINVAL);
             }
+            *self.inner.header_included.lock() = u32::from_ne_bytes([
+                data[0], data[1], data[2], data[3],
+            ]) != 0;
+            debug!("hdrincl set to {}", *self.inner.header_included.lock());
         }
         Ok(0)
     }
@@ -385,6 +399,10 @@ impl Socket for RawSocketState {
     }
     fn socket_type(&self) -> Option<SocketType> {
         Some(SocketType::SOCK_RAW)
+    }
+
+    fn ip_hdrincl(&self) -> bool {
+        *self.inner.header_included.lock()
     }
 
     fn poll(&self, _events: PollEvents) -> (bool, bool, bool) {
@@ -751,5 +769,23 @@ mod tests {
             async_std::task::block_on(FileLike::read(&s, &mut buf)),
             Err(LxError::EAGAIN)
         );
+    }
+
+    /// `getsockopt(IP_HDRINCL)` must mirror what `setsockopt` stored.
+    #[test]
+    fn ip_hdrincl_defaults_off_and_follows_setsockopt() {
+        let _g = LOCK.lock();
+        let s = sock(false);
+        assert!(!Socket::ip_hdrincl(&s));
+        assert_eq!(
+            Socket::setsockopt(&s, IPPROTO_IP, IP_HDRINCL, &1u32.to_ne_bytes()),
+            Ok(0)
+        );
+        assert!(Socket::ip_hdrincl(&s));
+        assert_eq!(
+            Socket::setsockopt(&s, IPPROTO_IP, IP_HDRINCL, &0u32.to_ne_bytes()),
+            Ok(0)
+        );
+        assert!(!Socket::ip_hdrincl(&s));
     }
 }

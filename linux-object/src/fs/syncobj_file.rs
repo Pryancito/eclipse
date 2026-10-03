@@ -336,16 +336,18 @@ impl FileLike for SyncobjHandle {
         Ok(())
     }
 
+    // Linux `drm_syncobj_file_fops` / `sync_file_fops` have no `.read`/`.write`
+    // — vfs returns `-EINVAL`, not `-ENOSYS`.
     async fn read(&self, _buf: &mut [u8]) -> LxResult<usize> {
-        Err(LxError::ENOSYS)
+        Err(LxError::EINVAL)
     }
 
     fn write(&self, _buf: &[u8]) -> LxResult<usize> {
-        Err(LxError::ENOSYS)
+        Err(LxError::EINVAL)
     }
 
     async fn read_at(&self, _offset: u64, _buf: &mut [u8]) -> LxResult<usize> {
-        Err(LxError::ENOSYS)
+        Err(LxError::EINVAL)
     }
 
     /// Match Linux `sync_file_poll`: `POLLIN` once the wrapped fence is
@@ -395,6 +397,18 @@ impl FileLike for SyncobjHandle {
 #[cfg(test)]
 mod sync_file_poll_tests {
     use super::*;
+
+    /// `read`/`write` on a syncobj fd must be `-EINVAL`, not `-ENOSYS`:
+    /// Linux syncobj/sync_file fops have no read/write ops.
+    #[test]
+    fn read_write_on_syncobj_are_einval_not_enosys() {
+        use async_std::task::block_on;
+        let fd = SyncobjHandle::new(0);
+        let mut buf = [0u8; 8];
+        assert_eq!(block_on(fd.read(&mut buf)), Err(LxError::EINVAL));
+        assert_eq!(fd.write(&[0u8; 8]), Err(LxError::EINVAL));
+        assert_eq!(block_on(fd.read_at(0, &mut buf)), Err(LxError::EINVAL));
+    }
 
     /// `fcntl(F_SETFL, O_NONBLOCK)` on a syncobj/sync_file fd used to return
     /// success while `F_GETFL` stayed forever at the hardcoded RDWR|CLOEXEC.

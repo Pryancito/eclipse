@@ -561,6 +561,7 @@ impl Syscall<'_> {
             "msgrcv: id={}, msgp={:#x}, msgsz={}, msgtyp={}, flags={:#x}",
             id, msgp, msgsz, msgtyp, msgflg
         );
+        let msgsz = msgrcv_bufsz(msgsz)?;
         let queue = msg_queue(id).ok_or(LxError::EINVAL)?;
         let proc = self.linux_process();
         if !queue.may_access(proc.euid(), proc.egid(), &proc.groups(), IPC_R) {
@@ -1450,6 +1451,16 @@ fn msgrcv_copy_flags(msgflg: usize) -> Result<(), LxError> {
     Err(LxError::ENOSYS)
 }
 
+/// `do_msgrcv`: `(long)bufsz < 0` is `EINVAL`. As `usize`, that is the high
+/// bit set (`(size_t)-1`, etc.); without the check those values became an
+/// unlimited buffer and every message "fit".
+fn msgrcv_bufsz(msgsz: usize) -> Result<usize, LxError> {
+    if (msgsz as i64) < 0 {
+        return Err(LxError::EINVAL);
+    }
+    Ok(msgsz)
+}
+
 /// The System V IPC syscalls, tested where they can be: the parts that are a
 /// decision about a userspace value rather than a walk through process state.
 ///
@@ -1942,7 +1953,7 @@ mod shmat_place_tests {
     //! chose, and the caller was told so only by the return value).
 
     use super::{
-        msgrcv_copy_flags, sem_flags, semop_count, shmat_flags_and_place, SemFlags, ShmatPlace,
+        msgrcv_bufsz, msgrcv_copy_flags, sem_flags, semop_count, shmat_flags_and_place, SemFlags, ShmatPlace,
         IPC_NOWAIT, MSG_COPY, MSG_EXCEPT, MSG_NOERROR, SEMOPM, SHMLBA, SHM_RDONLY, SHM_REMAP,
         SHM_RND,
     };
@@ -2064,6 +2075,15 @@ mod shmat_place_tests {
             Err(LxError::ENOSYS),
             "supported shape, unsupported feature"
         );
+    }
+
+    /// `msgrcv(..., (size_t)-1, …)` must be `EINVAL`, not an unlimited buffer.
+    #[test]
+    fn a_negative_msgrcv_bufsz_is_einval() {
+        assert_eq!(msgrcv_bufsz(0), Ok(0));
+        assert_eq!(msgrcv_bufsz(8192), Ok(8192));
+        assert_eq!(msgrcv_bufsz(1usize << 63), Err(LxError::EINVAL));
+        assert_eq!(msgrcv_bufsz(usize::MAX), Err(LxError::EINVAL));
     }
 
     /// `addr == 0` lets the kernel choose -- the MIT-SHM path, and the only

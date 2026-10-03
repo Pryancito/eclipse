@@ -6,9 +6,9 @@ use crate::{
     error::{LxError, LxResult},
     fs::FileLike,
     net::{
-        shutdown_sides, AddressFamily, Endpoint, Socket, SysResult, ARPHRD_ETHER, ARPHRD_LOOPBACK,
-        IFF_BROADCAST, IFF_CHANGE_ALL, IFF_LOOPBACK, IFF_LOWER_UP, IFF_MULTICAST, IFF_NOARP,
-        IFF_RUNNING, IFF_UP,
+        shutdown_sides, AddressFamily, Endpoint, Socket, SocketType, SysResult, ARPHRD_ETHER,
+        ARPHRD_LOOPBACK, IFF_BROADCAST, IFF_CHANGE_ALL, IFF_LOOPBACK, IFF_LOWER_UP, IFF_MULTICAST,
+        IFF_NOARP, IFF_RUNNING, IFF_UP,
     },
 };
 use alloc::{boxed::Box, sync::Arc, vec::Vec};
@@ -41,19 +41,28 @@ pub struct NetlinkSocketState {
     data: Arc<Mutex<Vec<Vec<u8>>>>,
     local_endpoint: Arc<Mutex<Option<NetlinkEndpoint>>>,
     flags: Arc<Mutex<OpenFlags>>,
+    /// Type requested at `socket(2)` — `SO_TYPE` must report this, not a
+    /// hardcoded `SOCK_RAW` (callers may open `SOCK_DGRAM`).
+    sock_type: SocketType,
 }
 
 impl Default for NetlinkSocketState {
     fn default() -> Self {
+        Self::new(SocketType::SOCK_RAW)
+    }
+}
+impl NetlinkSocketState {
+    /// Create a netlink socket of the given type (`SOCK_RAW` or `SOCK_DGRAM`).
+    pub fn new(sock_type: SocketType) -> Self {
         Self {
             base: zircon_object::object::KObjectBase::new(),
             data: Arc::new(Mutex::new(Vec::new())),
             local_endpoint: Arc::new(Mutex::new(None)),
             flags: Arc::new(Mutex::new(OpenFlags::RDWR)),
+            sock_type,
         }
     }
-}
-impl NetlinkSocketState {
+
     fn auto_port_id(&self) -> u32 {
         let reduced = self.base.id % u32::MAX as u64;
         (reduced as u32).max(1)
@@ -621,11 +630,11 @@ impl Socket for NetlinkSocketState {
 
     /// connect (netlink sockets do not support connect)
     async fn connect(&self, _endpoint: Endpoint) -> SysResult {
-        // Netlink sockets do not support connect(2). Returning ENOTSUP is
-        // correct for SOCK_RAW/SOCK_DGRAM netlink; prevents panic on `ip`
-        // tool usage inside udhcpc default.script.
+        // Netlink sockets do not support connect(2). `EOPNOTSUPP` (= Linux
+        // `ENOTSUP`) is the answer; `EINVAL` made probes think the address
+        // was wrong rather than the operation.
         warn!("[netlink] connect: not supported on netlink sockets");
-        Err(LxError::EINVAL)
+        Err(LxError::EOPNOTSUPP)
     }
 
     fn bind(&self, endpoint: Endpoint) -> SysResult {
@@ -642,7 +651,7 @@ impl Socket for NetlinkSocketState {
 
     fn listen(&self) -> SysResult {
         warn!("[netlink] listen: not supported on netlink sockets");
-        Err(LxError::EINVAL)
+        Err(LxError::EOPNOTSUPP)
     }
 
     fn shutdown(&self, howto: usize) -> SysResult {
@@ -656,7 +665,7 @@ impl Socket for NetlinkSocketState {
 
     async fn accept(&self) -> LxResult<(Arc<dyn FileLike>, Endpoint)> {
         warn!("[netlink] accept: not supported on netlink sockets");
-        Err(LxError::EINVAL)
+        Err(LxError::EOPNOTSUPP)
     }
 
     fn endpoint(&self) -> Option<Endpoint> {
@@ -675,6 +684,10 @@ impl Socket for NetlinkSocketState {
     fn remote_endpoint(&self) -> Option<Endpoint> {
         // Netlink sockets are connectionless; no remote endpoint.
         None
+    }
+
+    fn socket_type(&self) -> Option<SocketType> {
+        Some(self.sock_type)
     }
 
     fn setsockopt(&self, _level: usize, _opt: usize, _data: &[u8]) -> SysResult {
@@ -1753,5 +1766,19 @@ mod netlink_tests {
         assert!(Socket::shutdown(&nl, 2).is_ok());
         assert_eq!(Socket::shutdown(&nl, 3), Err(LxError::EINVAL));
         assert_eq!(Socket::shutdown(&nl, 99), Err(LxError::EINVAL));
+    }
+
+    /// `getsockopt(SO_TYPE)` must report the type passed to `socket(2)`,
+    /// not a hardcoded `SOCK_RAW`.
+    #[test]
+    fn so_type_reports_the_type_the_socket_was_opened_with() {
+        assert_eq!(
+            Socket::socket_type(&NetlinkSocketState::new(SocketType::SOCK_RAW)),
+            Some(SocketType::SOCK_RAW)
+        );
+        assert_eq!(
+            Socket::socket_type(&NetlinkSocketState::new(SocketType::SOCK_DGRAM)),
+            Some(SocketType::SOCK_DGRAM)
+        );
     }
 }

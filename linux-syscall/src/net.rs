@@ -301,14 +301,6 @@ impl Syscall<'_> {
             (Domain::AF_INET6, SocketType::SOCK_DGRAM, Some(Protocol::IPPROTO_ICMPV6)) => {
                 Arc::new(IcmpSocketState::new(true)?)
             }
-            // Be tolerant for AF_INET/AF_INET6 datagram sockets.
-            // Some userlands pass unexpected protocol numbers; for DHCP we only need UDP semantics.
-            (Domain::AF_INET, SocketType::SOCK_DGRAM, None) => {
-                Arc::new(UdpSocketState::new(false)?)
-            }
-            (Domain::AF_INET6, SocketType::SOCK_DGRAM, None) => {
-                Arc::new(UdpSocketState::new(true)?)
-            }
             // AF_INET/AF_INET6 raw sockets (some userlands probe these)
             (Domain::AF_INET, SocketType::SOCK_RAW, _) => {
                 Arc::new(RawSocketState::new((protocol_num & 0xff) as u8, false)?)
@@ -319,7 +311,7 @@ impl Syscall<'_> {
             // AF_NETLINK sockets for interface/address discovery (iproute-style)
             (Domain::AF_NETLINK, SocketType::SOCK_RAW, _)
             | (Domain::AF_NETLINK, SocketType::SOCK_DGRAM, _) => {
-                Arc::new(NetlinkSocketState::default())
+                Arc::new(NetlinkSocketState::new(socket_type))
             }
             // AF_PACKET sockets (used by udhcpc for raw ethernet operations)
             (Domain::AF_PACKET, SocketType::SOCK_RAW, _)
@@ -345,11 +337,16 @@ impl Syscall<'_> {
                 s
             }
             (_, _, _) => {
+                // A domain/type/protocol combo this kernel does not wire up
+                // is `EPROTONOSUPPORT`, not `ENOSYS`. `ENOSYS` told callers
+                // the *syscall* was missing (glibc then disables whole
+                // families); Linux and busybox probe with this and expect
+                // a protocol errno so they can fall back cleanly.
                 info!(
                     "sys_socket: unsupported socket type: domain={:?}, type={:?}, protocol={:?}",
                     domain, socket_type, protocol_num
                 );
-                return Err(LxError::ENOSYS);
+                return Err(LxError::EPROTONOSUPPORT);
             }
         };
 
@@ -438,9 +435,12 @@ impl Syscall<'_> {
         let level = match Level::try_from(level) {
             Ok(level) => level,
             Err(_) => {
-                // Unknown levels (e.g. SOL_PACKET=263) — return a zeroed int.
+                // Unknown levels (SOL_PACKET, SOL_IPV6, …) are
+                // `ENOPROTOOPT`, same as an unknown optname under a known
+                // level. Returning a zeroed int used to tell probes they
+                // got a real option value of 0.
                 warn!("getsockopt: unsupported level: {}", level);
-                return write_sockopt_out(optval, optlen, &0u32.to_ne_bytes());
+                return Err(LxError::ENOPROTOOPT);
             }
         };
         if optval.is_null() {
@@ -526,6 +526,16 @@ impl Syscall<'_> {
                 };
 
                 match optname {
+                    SolOptname::TYPE => {
+                        // `SO_TYPE` is mandatory on every socket; without it
+                        // glibc and many libraries treat the fd as broken.
+                        let ty = file_like
+                            .clone()
+                            .as_socket()?
+                            .socket_type()
+                            .ok_or(LxError::ENOPROTOOPT)? as u32;
+                        write_sockopt_out(optval, optlen, &ty.to_ne_bytes())
+                    }
                     SolOptname::SNDBUF => {
                         let (_, send_buf_ca) = buffer_capacity();
                         write_sockopt_out(optval, optlen, &(send_buf_ca as u32).to_ne_bytes())
@@ -534,7 +544,25 @@ impl Syscall<'_> {
                         let (recv_buf_ca, _) = buffer_capacity();
                         write_sockopt_out(optval, optlen, &(recv_buf_ca as u32).to_ne_bytes())
                     }
-                    SolOptname::REUSEADDR => write_sockopt_out(optval, optlen, &1u32.to_ne_bytes()),
+                    SolOptname::REUSEADDR => {
+                        // Report the flag `setsockopt` stored — hardcoding 1
+                        // made `getsockopt` lie after `setsockopt(..., 0)` and
+                        // disagreed with Linux's default of 0.
+                        let on = file_like.clone().as_socket()?.so_reuseaddr();
+                        write_sockopt_out(optval, optlen, &(u32::from(on)).to_ne_bytes())
+                    }
+                    SolOptname::BROADCAST => {
+                        // `setsockopt` accepts this (opt 6); without the enum
+                        // arm `getsockopt` was `ENOPROTOOPT`. Default is off;
+                        // the set path is still a no-op success.
+                        write_sockopt_out(optval, optlen, &0u32.to_ne_bytes())
+                    }
+                    SolOptname::KEEPALIVE => {
+                        // Same asymmetry as BROADCAST: set accepts opt 9, get
+                        // used to be ENOPROTOOPT. Default off; set is still a
+                        // no-op until we plumb smoltcp keepalives.
+                        write_sockopt_out(optval, optlen, &0u32.to_ne_bytes())
+                    }
                     SolOptname::ERROR => {
                         let err = file_like.clone().as_socket()?.take_so_error();
                         write_sockopt_out(optval, optlen, &(err as u32).to_ne_bytes())
@@ -551,8 +579,20 @@ impl Syscall<'_> {
                         return Err(LxError::ENOPROTOOPT);
                     }
                 };
+                let file_like = self.linux_process().get_file_like(sockfd.into())?;
                 match optname {
-                    TcpOptname::CONGESTION => Ok(0),
+                    TcpOptname::NODELAY => {
+                        let on = file_like.as_socket()?.tcp_nodelay();
+                        write_sockopt_out(optval, optlen, &(u32::from(on)).to_ne_bytes())
+                    }
+                    TcpOptname::CONGESTION => {
+                        // Linux returns a NUL-terminated CCA name. We have no
+                        // pluggable congestion control; answer a fixed "reno"
+                        // rather than Ok(0) with an untouched user buffer
+                        // (and without requiring a socket → ENOTSOCK).
+                        let _ = file_like.as_socket()?;
+                        write_sockopt_out(optval, optlen, b"reno\0")
+                    }
                 }
             }
             Level::IPPROTO_IP => {
@@ -563,8 +603,14 @@ impl Syscall<'_> {
                         return Err(LxError::ENOPROTOOPT);
                     }
                 };
+                let file_like = self.linux_process().get_file_like(sockfd.into())?;
                 match optname {
-                    IpOptname::HDRINCL => write_sockopt_out(optval, optlen, &0u32.to_ne_bytes()),
+                    IpOptname::HDRINCL => {
+                        // Report what `setsockopt` stored — hardcoding 0 made
+                        // `getsockopt` lie after enabling header-included mode.
+                        let on = file_like.as_socket()?.ip_hdrincl();
+                        write_sockopt_out(optval, optlen, &(u32::from(on)).to_ne_bytes())
+                    }
                 }
             }
         }
@@ -987,6 +1033,11 @@ impl Syscall<'_> {
 
                 let file_like = proc.get_file_like(sockfd.into())?;
                 if let Ok(unix) = file_like.clone().downcast_arc::<UnixSocketState>() {
+                    // Refuse before `register`: otherwise a second bind to a
+                    // different path would claim two registry slots.
+                    if !unix.bound_path().is_empty() {
+                        return Err(LxError::EINVAL);
+                    }
                     UnixSocketState::register(path.clone(), unix)?;
                 }
             }
@@ -1706,6 +1757,31 @@ mod sockopt_out_tests {
 
     use super::*;
 
+    /// `SO_TYPE` is optname 3; it used to fall through as `ENOPROTOOPT`.
+    /// `SO_BROADCAST` is 6; without the enum arm, getsockopt was ENOPROTOOPT
+    /// after setsockopt accepted it.
+    #[test]
+    fn so_type_is_a_known_sol_socket_optname() {
+        assert_eq!(SolOptname::try_from(3usize), Ok(SolOptname::TYPE));
+        assert_eq!(SolOptname::TYPE as usize, 3);
+        assert_eq!(SolOptname::try_from(6usize), Ok(SolOptname::BROADCAST));
+        assert_eq!(SolOptname::try_from(9usize), Ok(SolOptname::KEEPALIVE));
+        assert_eq!(TcpOptname::try_from(1usize), Ok(TcpOptname::NODELAY));
+        assert_eq!(TcpOptname::try_from(13usize), Ok(TcpOptname::CONGESTION));
+    }
+
+    /// A level this kernel does not wire up is `ENOPROTOOPT`, not a fake 0.
+    #[test]
+    fn unknown_getsockopt_levels_are_not_sol_socket_or_ip() {
+        // The three `Level` knows; anything else used to succeed with 0.
+        assert!(Level::try_from(1usize).is_ok()); // SOL_SOCKET
+        assert!(Level::try_from(0usize).is_ok()); // IPPROTO_IP
+        assert!(Level::try_from(6usize).is_ok()); // IPPROTO_TCP
+        assert!(Level::try_from(263usize).is_err()); // SOL_PACKET
+        assert!(Level::try_from(41usize).is_err()); // SOL_IPV6
+        assert!(Level::try_from(99usize).is_err());
+    }
+
     // `libos` addresses are ordinary host addresses, so a local buffer is a
     // valid stand-in for the caller's and the copy below runs for real.
     fn out(buf: &mut [u8]) -> UserOutPtr<u32> {
@@ -1906,6 +1982,21 @@ mod socket_type_flag_tests {
         assert_eq!(unix_protocol(Domain::AF_UNIX as usize), Ok(()));
         assert_eq!(unix_protocol(99), Err(LxError::EPROTONOSUPPORT));
         assert_eq!(unix_protocol(6), Err(LxError::EPROTONOSUPPORT)); // IPPROTO_TCP
+    }
+
+    /// `socket(AF_INET, SOCK_DGRAM, 99)` used to succeed as UDP because
+    /// `Protocol::try_from` failed → `None` matched a "tolerant" arm.
+    /// Linux says `EPROTONOSUPPORT`; only 0/`IPPROTO_UDP`/`IPPROTO_ICMP`
+    /// are wired for datagram.
+    #[test]
+    fn an_unknown_inet_dgram_protocol_is_not_silently_udp() {
+        assert!(Protocol::try_from(0usize).is_ok()); // IPPROTO_IP → UDP arm
+        assert!(Protocol::try_from(17usize).is_ok()); // IPPROTO_UDP
+        assert!(Protocol::try_from(1usize).is_ok()); // IPPROTO_ICMP (ping)
+        assert!(
+            Protocol::try_from(99usize).is_err(),
+            "unknown protocol must not become None→UDP; catch-all is EPROTONOSUPPORT"
+        );
     }
 
     /// `getpeername` with no peer must be `ENOTCONN`, not `EINVAL`.

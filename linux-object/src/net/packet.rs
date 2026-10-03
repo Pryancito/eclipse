@@ -398,7 +398,24 @@ impl Socket for PacketSocketState {
     }
 
     async fn connect(&self, _endpoint: Endpoint) -> SysResult {
-        Err(LxError::EINVAL)
+        // AF_PACKET has no connect(2); `EOPNOTSUPP` matches Linux
+        // `packet_ops`. `EINVAL` made probes think the address was wrong.
+        Err(LxError::EOPNOTSUPP)
+    }
+
+    fn listen(&self) -> SysResult {
+        Err(LxError::EOPNOTSUPP)
+    }
+
+    async fn accept(&self) -> LxResult<(Arc<dyn FileLike>, Endpoint)> {
+        Err(LxError::EOPNOTSUPP)
+    }
+
+    fn shutdown(&self, howto: usize) -> SysResult {
+        // `__sys_shutdown` validates `howto` first; then packet has no
+        // shutdown op (`sock_no_shutdown` → `EOPNOTSUPP`).
+        let _ = shutdown_sides(howto)?;
+        Err(LxError::EOPNOTSUPP)
     }
 
     fn bind(&self, endpoint: Endpoint) -> SysResult {
@@ -549,6 +566,20 @@ impl FileLike for PacketSocketState {
         Socket::ioctl(self, request, arg1, arg2, arg3)
     }
 
+    /// `FIONREAD`/`SIOCINQ`: size of the next queued frame (0 if empty).
+    /// Without this the ioctl fell through to ENOTTY, same as TCP/UDP before
+    /// they answered.
+    fn readable_bytes(&self) -> Option<usize> {
+        Some(
+            self.inner
+                .packet_queue
+                .lock()
+                .front()
+                .map(|f| f.len())
+                .unwrap_or(0),
+        )
+    }
+
     fn as_socket(&self) -> LxResult<&dyn Socket> {
         Ok(self)
     }
@@ -590,5 +621,12 @@ mod tests {
         frame[16..18].copy_from_slice(&0x0800u16.to_be_bytes());
         assert_eq!(eth_l2_header_len(&frame), Some((18, 0x0800)));
         assert_eq!(eth_l2_header_len(&frame[..14]), None);
+    }
+
+    /// Idle AF_PACKET must answer `FIONREAD` with 0, not fall through to ENOTTY.
+    #[test]
+    fn an_idle_packet_socket_reports_zero_bytes_readable() {
+        let s = PacketSocketState::new(SocketType::SOCK_RAW, 0x0800).unwrap();
+        assert_eq!(FileLike::readable_bytes(&*s), Some(0));
     }
 }

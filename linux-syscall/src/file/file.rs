@@ -2147,6 +2147,15 @@ impl Syscall<'_> {
             //   Warning: ProxiedConnection::TransferOrQueue() broken source
             //            socket : Not a tty
             FIONREAD => {
+                // `SIOCINQ` on a listening stream is `EINVAL` (unix(7)/tcp(7)).
+                // Without the check, a listener answered 0 as if empty.
+                if file_like
+                    .as_socket()
+                    .map(|s| s.is_listening())
+                    .unwrap_or(false)
+                {
+                    return Err(LxError::EINVAL);
+                }
                 if let Some(n) = file_like.readable_bytes() {
                     let mut out: UserOutPtr<i32> = arg1.into();
                     out.write(n.min(i32::MAX as usize) as i32)?;
@@ -2504,7 +2513,10 @@ impl Syscall<'_> {
                     // also cleared the file's `O_CLOEXEC` record, which is
                     // `F_SETFD`'s to change.
                     let requested = OpenFlags::from_bits_truncate(arg);
-                    file_like.set_flags(OpenFlags::after_setfl(file_like.flags(), requested))?;
+                    let next = OpenFlags::after_setfl(file_like.flags(), requested);
+                    // Same policy as `pipe2`: no packet mode on pipes.
+                    setfl_pipe_direct(&file_like, next)?;
+                    file_like.set_flags(next)?;
                     Ok(0)
                 }
                 FcntlCmd::DUPFD | FcntlCmd::DUPFD_CLOEXEC => {
@@ -2892,6 +2904,45 @@ impl From<FsInfo> for StatFs {
             f_flags: 0,
             f_spare: [0; 4],
         }
+    }
+}
+
+/// `F_SETFL(O_DIRECT)` on a pipe: same answer as `pipe2(O_DIRECT)`.
+///
+/// This kernel has no packet-mode pipes. `pipe2` already refuses the bit;
+/// letting `fcntl` set it made `F_GETFL` report packet mode that never
+/// existed.
+fn setfl_pipe_direct(file_like: &Arc<dyn FileLike>, next: OpenFlags) -> LxResult<()> {
+    if !next.contains(OpenFlags::DIRECT) {
+        return Ok(());
+    }
+    if let Some(file) = file_like.downcast_ref::<File>() {
+        if file.inode().downcast_ref::<Pipe>().is_some() {
+            return Err(LxError::EINVAL);
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod setfl_pipe_direct_tests {
+    use super::*;
+    use alloc::string::String;
+    use alloc::sync::Arc;
+
+    #[test]
+    fn o_direct_on_a_pipe_is_einval() {
+        let (r, _w) = Pipe::create_pair();
+        let like: Arc<dyn FileLike> =
+            File::new(Arc::new(r), OpenFlags::RDONLY, String::from("pipe_r:[]"));
+        assert_eq!(
+            setfl_pipe_direct(&like, OpenFlags::RDONLY | OpenFlags::DIRECT),
+            Err(LxError::EINVAL)
+        );
+        assert_eq!(
+            setfl_pipe_direct(&like, OpenFlags::RDONLY | OpenFlags::NON_BLOCK),
+            Ok(())
+        );
     }
 }
 
