@@ -936,7 +936,12 @@ fn is_canonical_user_addr(addr: usize) -> bool {
 
 /// `ZX_PROP_REGISTER_{FS,GS}` set: current thread only + canonical address.
 #[cfg(target_arch = "x86_64")]
-fn thread_segbase_set(current: &Thread, target: &Thread, which: SegBase, addr: usize) -> ZxResult {
+fn thread_segbase_set(
+    current: &Thread,
+    target: &Thread,
+    which: SegBase,
+    addr: usize,
+) -> ZxResult {
     use zircon_object::object::KernelObject;
     if target.id() != current.id() {
         return Err(ZxError::ACCESS_DENIED);

@@ -1334,7 +1334,10 @@ mod is_tcp_tests {
         let tcp = TcpSocketState::new(false).unwrap();
         assert!(Socket::is_tcp(&tcp));
         // Short SO_KEEPALIVE on TCP is EINVAL (not a silent Ok(0)).
-        assert_eq!(Socket::setsockopt(&tcp, 1, 9, &[]), Err(LxError::EINVAL));
+        assert_eq!(
+            Socket::setsockopt(&tcp, 1, 9, &[]),
+            Err(LxError::EINVAL)
+        );
     }
 }
 

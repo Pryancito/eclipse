@@ -366,7 +366,8 @@ impl Socket for IcmpSocketState {
         let sets = get_sockets();
         let mut sets = sets.lock();
         let sock = sets.get::<IcmpSocket>(inner.handle.0);
-        let readable = sock.can_recv() || icmp_rx::pending_for(inner.ipv6) || inner.read_closed;
+        let readable =
+            sock.can_recv() || icmp_rx::pending_for(inner.ipv6) || inner.read_closed;
         // Was hardcoded `true`; a full TX ring must clear POLLOUT like UDP/raw.
         let writable = sock.can_send();
         (readable, writable, false)
@@ -471,7 +472,11 @@ impl FileLike for IcmpSocketState {
     fn readable_bytes(&self) -> Option<usize> {
         let (handle, ipv6, remote) = {
             let inner = self.inner.lock();
-            (inner.handle.0, inner.ipv6, inner.remote.map(|e| e.addr))
+            (
+                inner.handle.0,
+                inner.ipv6,
+                inner.remote.map(|e| e.addr),
+            )
         };
         if let Some(n) = icmp_rx::peek_len(ipv6, remote) {
             return Some(n);
