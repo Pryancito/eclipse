@@ -173,6 +173,9 @@ const SCM_RIGHTS: i32 = 1;
 /// `SCM_CREDENTIALS`, as it appears in `cmsg_type`: a `struct ucred` the
 /// KERNEL fills in, which is what makes it worth anything to the receiver.
 const SCM_CREDENTIALS: i32 = 2;
+/// `msg_flags`: ancillary data was dropped because the caller's control buffer
+/// could not hold it.
+const MSG_CTRUNC: i32 = 0x8;
 /// `SOL_SOCKET`, as `setsockopt`/`getsockopt` take it in `level`.
 const SOL_SOCKET: usize = 1;
 /// `SO_PASSCRED`: attach the sender's credentials to every message read from
@@ -1067,6 +1070,7 @@ impl Syscall<'_> {
             // SCM_RIGHTS: install any fds the peer attached, and SCM_CREDENTIALS
             // when this end asked for credentials, and emit the cmsgs.
             let mut ctrl_written = 0usize;
+            let mut ctrunc = false;
             if !hdr.msg_control.is_null() && hdr.msg_controllen >= CMSG_HDR_LEN {
                 // Credentials, when wanted, are reserved out of the control
                 // buffer BEFORE the descriptors are counted: they are the
@@ -1074,12 +1078,18 @@ impl Syscall<'_> {
                 // fit one more fd would quietly answer the receiver's question
                 // wrong.
                 let creds = if socket.passcred() {
-                    // The peer of a connected socket IS the sender; there is
-                    // one. Linux records the credentials per message at send
-                    // time, which matters for a DGRAM socket many processes
-                    // write to -- noted, and not what the connected case
-                    // needs.
-                    socket.peer_pid().map(ucred_of)
+                    // The record stamped when the message was WRITTEN, which
+                    // is the only one that answers "who sent this": the writer
+                    // need not be whoever created the socket. chromium's
+                    // zygote is that case -- it writes through a `socketpair`
+                    // end inherited across `fork`, and a `socketpair` records
+                    // no creator, so the endpoint's owner is pid 0.
+                    //
+                    // Falling back to the peer's owner covers a read of bytes
+                    // that predate this option being turned on.
+                    socket
+                        .recv_creds()
+                        .or_else(|| socket.peer_pid().map(ucred_of))
                 } else {
                     None
                 };
@@ -1100,9 +1110,26 @@ impl Syscall<'_> {
                     }
                 }
                 let cbuf = build_recv_cmsgs(&installed, creds.as_ref());
-                if !cbuf.is_empty() {
-                    ctrl_written = cbuf.len().min(hdr.msg_controllen);
-                    hdr.msg_control.write_array(&cbuf[..ctrl_written])?;
+                if cbuf.len() <= hdr.msg_controllen {
+                    ctrl_written = cbuf.len();
+                    if ctrl_written > 0 {
+                        hdr.msg_control.write_array(&cbuf[..ctrl_written])?;
+                    }
+                } else {
+                    // The credentials are what did not fit -- the descriptors
+                    // were counted against the room left over for them, and
+                    // `recv_fds` honoured that budget. Writing the cmsg
+                    // half-way would hand the reader a header whose
+                    // `cmsg_len` runs off the end of its own buffer, which is
+                    // how a strict parser walks into garbage. So drop the
+                    // credentials whole and say so with `MSG_CTRUNC`, as
+                    // Linux does.
+                    ctrunc = true;
+                    let fitting = build_recv_cmsgs(&installed, None);
+                    ctrl_written = fitting.len();
+                    if ctrl_written > 0 {
+                        hdr.msg_control.write_array(&fitting[..ctrl_written])?;
+                    }
                 }
             }
             // Linux ALWAYS reports how much ancillary data it wrote through
@@ -1120,7 +1147,7 @@ impl Syscall<'_> {
                 p.write(ctrl_written)?;
             }
             // Report truncation (and any other recv flags) via msg_flags.
-            let msg_flags = socket.take_msg_flags();
+            let msg_flags = socket.take_msg_flags() | if ctrunc { MSG_CTRUNC } else { 0 };
             {
                 let flags_addr = msg_addr + core::mem::offset_of!(MsgHdr, msg_flags);
                 let mut p = UserOutPtr::<i32>::from(flags_addr);

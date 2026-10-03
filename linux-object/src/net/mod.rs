@@ -2278,6 +2278,21 @@ pub trait Socket: Send + Sync + Debug + downcast_rs::DowncastSync {
     fn set_passcred(&self, _on: bool) -> SysResult {
         Ok(0)
     }
+    /// Take the credentials of the process that SENT the bytes this `recvmsg`
+    /// has just read, stamped when they were written.
+    ///
+    /// Sampling at send time is the whole point. The alternative -- reading the
+    /// peer endpoint's owner back afterwards, as `peer_pid` does -- answers a
+    /// different question, and chromium is the case where the two differ: the
+    /// zygote hands an inherited `socketpair` end to a child it just forked,
+    /// so the writer is a process that never created the socket. A `socketpair`
+    /// has no creator recorded at all, and the browser would read pid 0.
+    ///
+    /// `None` when nothing was stamped (no credentials queued, or a non-unix
+    /// socket); the caller then has nothing to attach.
+    fn recv_creds(&self) -> Option<[u8; 12]> {
+        None
+    }
     /// Queue file descriptors to be received by the peer (`SCM_RIGHTS` ancillary
     /// data over a unix socket). Only AF_UNIX supports it. This is how seatd
     /// hands an opened DRM/input device to a Wayland compositor and how clients

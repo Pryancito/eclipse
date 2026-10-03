@@ -149,7 +149,28 @@ struct UnixInner {
     /// end, as an `SCM_CREDENTIALS` control message. Off until a `setsockopt`
     /// asks for it, as in Linux.
     passcred: bool,
+    /// The sender's `struct ucred` for each message sitting in `buffer`, tagged
+    /// with the `total_written` offset of its first byte, exactly as
+    /// `pending_fds` is. Linux samples credentials in `scm_send`, at SEND time,
+    /// and the reason is chromium: the zygote writes through a `socketpair` end
+    /// it inherited, so the writer is NOT whoever created the socket, and a
+    /// `socketpair` records no creator at all. Reading an owner back later
+    /// would answer pid 0.
+    ///
+    /// Consecutive messages from the same process share one entry, so a busy
+    /// one-writer socket (the common case) keeps a single record.
+    pending_creds: VecDeque<(usize, [u8; 12])>,
+    /// The last record `recv_creds` handed out, for a `recvmsg` that reads no
+    /// new message: Linux answers such a call with the credentials still
+    /// associated with the connection rather than with nothing.
+    last_creds: Option<[u8; 12]>,
 }
+
+/// How many per-message credential records may pile up unclaimed before
+/// `write` starts retiring the ones whose bytes have already been read. Small
+/// on purpose: a socket with one writer only ever holds a single record, and a
+/// deep queue only happens when several processes alternate on one end.
+const PENDING_CREDS_SOFT_MAX: usize = 16;
 
 impl UnixInner {
     /// Room left in this end's inbound queue.
@@ -194,6 +215,8 @@ impl Default for UnixSocketState {
                 owner_pid: 0,
                 pending_fds: VecDeque::new(),
                 passcred: false,
+                pending_creds: VecDeque::new(),
+                last_creds: None,
             })),
         }
     }
@@ -741,6 +764,37 @@ impl Socket for UnixSocketState {
             return Err(LxError::EAGAIN);
         }
         let n = data.len().min(space);
+        let n_offset = pi.total_written;
+        // Stamp the writer's credentials onto this message before its bytes go
+        // in, so `total_written` is still the index of its FIRST byte -- the
+        // same tagging `send_fds` uses, and the same gate (`offset <
+        // total_read`) delivers both. Nothing is stamped when the kernel
+        // itself is writing: there is no process to name.
+        //
+        // A reader using plain `read` never drains these records, so retire the
+        // ones whose bytes it has already consumed once the queue grows past a
+        // handful: such a record can no longer be reported to anyone, and
+        // `last_creds` keeps the most recent of them as the fallback answer.
+        // Without this, writers alternating on a socket nobody calls `recvmsg`
+        // on would grow the queue without bound.
+        while pi.pending_creds.len() > PENDING_CREDS_SOFT_MAX {
+            match pi.pending_creds.front() {
+                Some((offset, _)) if *offset < pi.total_read => {
+                    let (_, rec) = pi.pending_creds.pop_front().unwrap();
+                    pi.last_creds = Some(rec);
+                }
+                _ => break,
+            }
+        }
+        if let Some((pid, uid, gid)) = crate::process::current_ucred() {
+            let mut rec = [0u8; 12];
+            for (i, w) in [pid as u32, uid, gid].iter().enumerate() {
+                rec[i * 4..i * 4 + 4].copy_from_slice(&w.to_ne_bytes());
+            }
+            if pi.pending_creds.back().map(|(_, c)| *c) != Some(rec) {
+                pi.pending_creds.push_back((n_offset, rec));
+            }
+        }
         // `extend(&slice)` takes VecDeque's Copy-slice specialization (a pair
         // of memcpys) instead of the element-wise TrustedLen loop.
         pi.buffer.extend(&data[..n]);
@@ -1027,6 +1081,28 @@ impl Socket for UnixSocketState {
         out
     }
 
+    fn recv_creds(&self) -> Option<[u8; 12]> {
+        let mut inner = self.inner.lock();
+        // Every record whose message has been consumed (`offset` is its first
+        // byte, so the gate is strict `<`) belongs to bytes already handed out
+        // and can never apply to a later read. The one to report is the
+        // EARLIEST of them -- Linux attaches the credentials of the first
+        // message a `recvmsg` returns -- and the rest are retired behind it.
+        let mut first = None;
+        while inner
+            .pending_creds
+            .front()
+            .is_some_and(|(offset, _)| *offset < inner.total_read)
+        {
+            let (_, rec) = inner.pending_creds.pop_front().unwrap();
+            if first.is_none() {
+                first = Some(rec);
+            }
+            inner.last_creds = Some(rec);
+        }
+        first.or(inner.last_creds)
+    }
+
     fn ioctl(&self, request: usize, arg1: usize, arg2: usize, arg3: usize) -> SysResult {
         crate::net::handle_net_ioctl(request, arg1, arg2, arg3, false)
     }
@@ -1200,6 +1276,44 @@ mod tests {
         f.set(OpenFlags::ASYNC, false);
         s.set_flags(f).unwrap();
         assert!(!s.flags().contains(OpenFlags::ASYNC));
+    }
+
+    /// A credential record only comes out once the bytes it was stamped on
+    /// have been read, the earliest applicable one is the one reported, and a
+    /// `recvmsg` that reads nothing new still gets the last answer -- the same
+    /// byte/ancillary synchronization `pending_fds` uses.
+    #[test]
+    fn credentials_follow_the_bytes_they_were_stamped_on() {
+        let s = UnixSocketState::new();
+        let first = [1u8; 12];
+        let second = [2u8; 12];
+        {
+            let mut inner = s.inner.lock();
+            // Two messages of four bytes each, as `write` would tag them: the
+            // offset is the index of the message's FIRST byte.
+            inner.pending_creds.push_back((0, first));
+            inner.pending_creds.push_back((4, second));
+            inner.total_written = 8;
+        }
+        assert_eq!(
+            Socket::recv_creds(&*s),
+            None,
+            "nothing has been read yet, so no message's credentials are due"
+        );
+        s.inner.lock().total_read = 4;
+        assert_eq!(
+            Socket::recv_creds(&*s),
+            Some(first),
+            "only the first message's bytes are consumed"
+        );
+        assert_eq!(
+            Socket::recv_creds(&*s),
+            Some(first),
+            "a read that advances nothing keeps the connection's last answer"
+        );
+        s.inner.lock().total_read = 8;
+        assert_eq!(Socket::recv_creds(&*s), Some(second));
+        assert!(s.inner.lock().pending_creds.is_empty());
     }
 
     /// `listen` / `accept` on `SOCK_DGRAM` is `EOPNOTSUPP` (`unix_listen` /
