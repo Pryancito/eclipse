@@ -151,16 +151,33 @@ pub(crate) fn anon_fd_flags(flags: usize, allowed: usize) -> Result<OpenFlags, L
 /// Decode an `open`/`openat` flag word, or `EINVAL` for any bit this kernel
 /// does not name.
 ///
-/// `OpenFlags::from_bits_truncate` alone drops `O_PATH` and `O_TMPFILE` (and
-/// anything else unnamed) in silence, so `openat(..., O_PATH)` used to hand
-/// back a normal readable fd — the same silent lie the FreeBSD personality
-/// already refuses one layer up. Also used by `TIOCGPTPEER`, whose `arg`
-/// is the same open(2) flag word.
+/// `OpenFlags::from_bits_truncate` alone drops anything unnamed in silence,
+/// so `openat(..., O_TMPFILE)` would hand back a normal readable fd — the
+/// same silent lie the FreeBSD personality already refuses one layer up.
+/// Also used by `TIOCGPTPEER`, whose `arg` is the same open(2) flag word.
+///
+/// `O_PATH` is named now and so is honoured; `O_TMPFILE` is still `EINVAL`,
+/// because it changes what the call CREATES and nothing here does that.
 pub(crate) fn open_flags(flags: usize) -> Result<OpenFlags, LxError> {
     if flags & !OpenFlags::all().bits() != 0 {
         return Err(LxError::EINVAL);
     }
-    Ok(OpenFlags::from_bits_truncate(flags))
+    Ok(path_open_flags(OpenFlags::from_bits_truncate(flags)))
+}
+
+/// `build_open_flags`: under `O_PATH` the kernel keeps `O_DIRECTORY`,
+/// `O_NOFOLLOW` and `O_CLOEXEC` and **drops every other bit**, the access
+/// mode among them.
+///
+/// Dropping them is not tidiness. `open("/proc/self", O_PATH|O_RDWR)` must
+/// not take write permission on `/proc/self`, `O_PATH|O_TRUNC` must not
+/// truncate, and `O_PATH|O_CREAT` must not create: a path descriptor opens
+/// no file, so no flag about an open file can apply to it.
+fn path_open_flags(flags: OpenFlags) -> OpenFlags {
+    if !flags.is_path() {
+        return flags;
+    }
+    flags & (OpenFlags::PATH | OpenFlags::DIRECTORY | OpenFlags::NOFOLLOW | OpenFlags::CLOEXEC)
 }
 
 impl Syscall<'_> {
@@ -321,16 +338,25 @@ impl Syscall<'_> {
             // Every path handled specially below hands back a character
             // device, so an `O_DIRECTORY` over one of them is answered before
             // the work of minting a PTY starts.
-            if path == "/dev/ptmx" || path == "/dev/tty" || pty::pts_id_from_path(path).is_some() {
+            // ... unless this is an `O_PATH` open, which opens no file at
+            // all: Linux never calls `f_op->open` for one, so it mints no
+            // PTY and claims no single-client device. The generic path below
+            // hands back the node itself, which is what a path descriptor is.
+            let open_file = !flags.is_path();
+            if open_file
+                && (path == "/dev/ptmx"
+                    || path == "/dev/tty"
+                    || pty::pts_id_from_path(path).is_some())
+            {
                 open_resolved_type(flags, FileType::CharDevice)?;
             }
-            if path == "/dev/ptmx" {
+            if open_file && path == "/dev/ptmx" {
                 let inode = pty::alloc_ptmx();
                 let file = File::new(inode, flags, String::from("/dev/ptmx"));
                 let fd = proc.add_file(file)?;
                 return Ok(fd.into());
             }
-            if let Some(id) = pty::pts_id_from_path(path) {
+            if let Some(id) = pty::pts_id_from_path(path).filter(|_| open_file) {
                 let inode = pty::open_pts(id).ok_or(LxError::ENXIO)?;
                 let file = File::new(inode, flags, String::from(path));
                 let fd = proc.add_file(file)?;
@@ -344,7 +370,7 @@ impl Syscall<'_> {
             // and busybox spins forever on `killpg(0, SIGTTIN)` (a CPU-burning busy
             // loop on every spare VT — the dominant idle heat once the signal
             // self-deadlock is fixed).
-            if path == "/dev/tty" {
+            if open_file && path == "/dev/tty" {
                 // A process RUNNING ON A PTY (the shell inside foot/alacritty) must
                 // get its own pts back, not the VT. busybox ash opens /dev/tty for
                 // job control, and handing it the VT reads/writes ANOTHER
@@ -512,10 +538,17 @@ impl Syscall<'_> {
                 .downcast_ref::<linux_object::fs::devfs::DspDev>()
                 .is_some()
                 && !flags.writable()
+                && !flags.is_path()
             {
                 return Err(LxError::EINVAL);
             }
-            let inode = prepare_open_inode(inode)?;
+            // `f_op->open` is not called for an `O_PATH` descriptor, so the
+            // cloning and single-client devices are not claimed by one.
+            let inode = if flags.is_path() {
+                inode
+            } else {
+                prepare_open_inode(inode)?
+            };
             let abs_path = proc.get_absolute_path(dir_fd, path)?;
             let file = File::new(inode, flags, abs_path);
             let fd = proc.add_file(file)?;
@@ -1659,26 +1692,78 @@ mod open_flag_tests {
         assert!(parsed.writable());
     }
 
-    /// `O_PATH` and `O_TMPFILE` stay unnamed on purpose: each changes what the
-    /// descriptor IS. Truncating them used to hand back a normal readable fd;
-    /// `open_flags` now answers `EINVAL` instead of that silent lie.
+    /// `O_TMPFILE` stays unnamed on purpose: it changes what the call
+    /// CREATES, and nothing here creates it. Truncating it used to hand back
+    /// a normal readable fd; `open_flags` answers `EINVAL` instead of that
+    /// silent lie.
     #[test]
     fn the_flags_this_kernel_does_not_honour_are_einval() {
-        for bit in [0o10000000usize, 0o20000000] {
-            assert_eq!(
-                open_flags(bit),
-                Err(LxError::EINVAL),
-                "flag {bit:#o} must not open as a normal fd"
-            );
-            assert_eq!(
-                open_flags(bit | OpenFlags::RDONLY.bits() | OpenFlags::CLOEXEC.bits()),
-                Err(LxError::EINVAL),
-                "a valid bit must not hide flag {bit:#o}"
-            );
-        }
+        let bit = 0o20000000usize;
+        assert_eq!(
+            open_flags(bit),
+            Err(LxError::EINVAL),
+            "flag {bit:#o} must not open as a normal fd"
+        );
+        assert_eq!(
+            open_flags(bit | OpenFlags::RDONLY.bits() | OpenFlags::CLOEXEC.bits()),
+            Err(LxError::EINVAL),
+            "a valid bit must not hide flag {bit:#o}"
+        );
         // Known flags still parse.
         let ok = open_flags(OpenFlags::RDWR.bits() | OpenFlags::CLOEXEC.bits()).unwrap();
         assert!(ok.readable() && ok.writable() && ok.close_on_exec());
+    }
+
+    /// `O_PATH` is the one procps opens `/proc/self` with, and `EINVAL` on it
+    /// is what made `ps aux` print "Error, do this: mount -t proc proc /proc"
+    /// and exit 47 with `/proc` mounted the whole time.
+    #[test]
+    fn o_path_opens_and_is_neither_readable_nor_writable() {
+        const O_PATH: usize = 0o10000000;
+        const O_DIRECTORY: usize = 0o200000;
+        // What `look_up_our_self` asks for.
+        let f = open_flags(O_PATH | O_DIRECTORY).expect("O_PATH|O_DIRECTORY must open");
+        assert!(f.is_path());
+        assert!(f.contains(OpenFlags::DIRECTORY));
+        // Neither: `read(2)` and `write(2)` on a path descriptor are EBADF,
+        // and every reader here answers off these two.
+        assert!(!f.readable(), "a path descriptor reads nothing");
+        assert!(!f.writable(), "a path descriptor writes nothing");
+    }
+
+    /// `build_open_flags` drops every other bit under `O_PATH`. Keeping them
+    /// would have `O_PATH|O_RDWR` take write permission on the name, and
+    /// `O_PATH|O_TRUNC` empty the file it was only supposed to point at.
+    #[test]
+    fn o_path_keeps_only_cloexec_directory_and_nofollow() {
+        const O_PATH: usize = 0o10000000;
+        let kept = open_flags(
+            O_PATH
+                | OpenFlags::DIRECTORY.bits()
+                | OpenFlags::NOFOLLOW.bits()
+                | OpenFlags::CLOEXEC.bits(),
+        )
+        .unwrap();
+        assert_eq!(
+            kept,
+            OpenFlags::PATH | OpenFlags::DIRECTORY | OpenFlags::NOFOLLOW | OpenFlags::CLOEXEC
+        );
+        for dropped in [
+            OpenFlags::RDWR,
+            OpenFlags::WRONLY,
+            OpenFlags::TRUNCATE,
+            OpenFlags::APPEND,
+            OpenFlags::CREATE,
+            OpenFlags::NON_BLOCK,
+            OpenFlags::NOATIME,
+        ] {
+            let f = open_flags(O_PATH | dropped.bits()).unwrap();
+            assert_eq!(f, OpenFlags::PATH, "{dropped:?} must not survive O_PATH");
+            assert!(!f.readable() && !f.writable());
+        }
+        // Without O_PATH nothing is dropped.
+        let plain = open_flags(OpenFlags::RDWR.bits() | OpenFlags::TRUNCATE.bits()).unwrap();
+        assert!(plain.contains(OpenFlags::TRUNCATE) && plain.writable());
     }
 
     #[test]

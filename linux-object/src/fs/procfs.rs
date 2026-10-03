@@ -324,17 +324,9 @@ fn proc_comm(proc: &Process) -> String {
         }
     }
     // try_linux: /proc readers run on processes looked up by pid, which may be
-    // tearing down concurrently. Fall back to the kobject name on a miss rather
-    // than panicking the reader.
-    let path = proc
-        .try_linux()
-        .map(|lp| lp.execute_path())
-        .unwrap_or_default();
-    if !path.is_empty() {
-        let base = path.rsplit('/').next().unwrap_or(&path);
-        return sanitize_comm(base);
-    }
-    sanitize_comm(&proc.name())
+    // tearing down concurrently. `exe_basename_comm` falls back to the kobject
+    // name on a miss rather than panicking the reader.
+    exe_basename_comm(proc)
 }
 
 fn proc_ppid(proc: &Process) -> u64 {
@@ -352,16 +344,84 @@ fn proc_first_thread(proc: &Process) -> Option<Arc<Thread>> {
 }
 
 fn proc_pid_stat(proc: &Process) -> String {
-    let pid = proc.id();
-    let comm = proc_comm(proc);
-    let state = proc_state_char(proc);
+    proc_task_stat(proc, None)
+}
+
+/// The name a thread reports when it never named itself: the executable's
+/// basename, which is where a task's `comm` starts in Linux.
+///
+/// Deliberately not [`proc_comm`], which prefers the LEADER thread's name: a
+/// thread inherits `comm` from its creator at `clone` time and keeps it, so
+/// renaming the main thread does not rename its siblings, and a fallback
+/// through the leader would have one `pthread_setname_np` rewrite what every
+/// unnamed thread in the process reports.
+fn exe_basename_comm(proc: &Process) -> String {
+    let path = proc
+        .try_linux()
+        .map(|lp| lp.execute_path())
+        .unwrap_or_default();
+    if path.is_empty() {
+        sanitize_comm(&proc.name())
+    } else {
+        sanitize_comm(path.rsplit('/').next().unwrap_or(&path))
+    }
+}
+
+/// A thread's own name, or the executable's basename if it never set one.
+fn thread_comm(proc: &Process, thread: &Arc<Thread>) -> String {
+    use crate::thread::ThreadExt;
+    // try_lock: a thread tearing down may hold its own lock, and a /proc read
+    // must never block on it.
+    thread
+        .try_lock_linux()
+        .map(|lt| lt.comm.clone())
+        .filter(|c| !c.is_empty())
+        .map(|c| sanitize_comm(&c))
+        .unwrap_or_else(|| exe_basename_comm(proc))
+}
+
+/// `/proc/<pid>/stat`, and `/proc/<pid>/task/<tid>/stat` when `thread` names
+/// one.
+///
+/// Linux serves both from `do_task_stat`, with `whole` deciding which fields
+/// describe the task and which the thread group. The per-thread fields are
+/// the ones a reader opened a `task/<tid>/stat` to see: the tid in field 1,
+/// that thread's name, state, CPU times, scheduling attributes and last CPU.
+/// Everything built on the address space -- `vsize`, `rss`, `starttime`, the
+/// job-control ids -- is shared by every thread of the process and stays the
+/// process's, as it is in Linux.
+///
+/// Serving the process's `stat` under every tid, as this first did, is what a
+/// thread directory exists to avoid: each tid reported the leader's name,
+/// the leader's state and the CPU time of all the threads at once, so the one
+/// question `task/<tid>/stat` answers -- which thread is burning the CPU, and
+/// in what state -- could not be asked.
+fn proc_task_stat(proc: &Process, thread: Option<&Arc<Thread>>) -> String {
+    let pid = match thread {
+        Some(t) => t.id(),
+        None => proc.id(),
+    };
+    let comm = match thread {
+        Some(t) => thread_comm(proc, t),
+        None => proc_comm(proc),
+    };
+    let state = match thread {
+        Some(t) => thread_state_char(t.state()),
+        None => proc_state_char(proc),
+    };
     let ppid = proc_ppid(proc);
 
+    // Field 20 is the thread-group count, and Linux reports it on a thread's
+    // own `stat` too: it describes the group the task belongs to.
     let nthreads = proc.thread_ids().len().max(1) as i64;
-    // priority(18)/nice(19)/rt_priority(40)/policy(41) come from the leader
-    // thread. Per proc(5): for real-time policies the priority field is
+    // priority(18)/nice(19)/rt_priority(40)/policy(41) are the task's own, so
+    // they come from `thread` when there is one and from the leader
+    // otherwise. Per proc(5): for real-time policies the priority field is
     // `-1 - rt_priority`; for the fair policies it is `20 + nice`.
-    let first_thread = proc_first_thread(proc);
+    let first_thread = match thread {
+        Some(t) => Some(t.clone()),
+        None => proc_first_thread(proc),
+    };
     let (priority, nice, rt_priority, policy) = match first_thread.as_ref() {
         Some(t) => {
             let rt = t.sched_rt_priority() as i64;
@@ -381,17 +441,27 @@ fn proc_pid_stat(proc: &Process) -> String {
     // credited from threads that already exited. Both accumulators are real
     // measured CPU time (see `ThreadSwitchFuture::poll` in zircon-object) —
     // not wall-clock time a blocked/waiting thread happened to sit for.
+    //
+    // On a thread's own `stat` they are that thread's alone: `do_task_stat`
+    // sums the group's only when `whole` is set, and the exited threads
+    // `dead_threads_time` carries belong to the group, not to this task.
     const NS_PER_TICK: u64 = 10_000_000; // 1e7 ns = 10 ms = 1 / USER_HZ(100)
-    let mut utime_ns = proc.dead_threads_time();
-    let mut stime_ns = proc.dead_threads_sys_time();
-    for tid in proc.thread_ids() {
-        if let Ok(child) = proc.get_child(tid) {
-            if let Ok(t) = child.downcast_arc::<Thread>() {
-                utime_ns += t.get_time();
-                stime_ns += t.get_sys_time();
+    let (utime_ns, stime_ns) = match thread {
+        Some(t) => (t.get_time(), t.get_sys_time()),
+        None => {
+            let mut u = proc.dead_threads_time();
+            let mut s = proc.dead_threads_sys_time();
+            for tid in proc.thread_ids() {
+                if let Ok(child) = proc.get_child(tid) {
+                    if let Ok(t) = child.downcast_arc::<Thread>() {
+                        u += t.get_time();
+                        s += t.get_sys_time();
+                    }
+                }
             }
+            (u, s)
         }
-    }
+    };
     let utime = (utime_ns / NS_PER_TICK) as i64;
     let stime = (stime_ns / NS_PER_TICK) as i64;
 
@@ -418,7 +488,8 @@ fn proc_pid_stat(proc: &Process) -> String {
         stats.private_bytes() + stats.shared_bytes(),
     );
 
-    // Field 39 (processor): the CPU the leader thread last ran on.
+    // Field 39 (processor): the CPU this task last ran on -- the thread's own
+    // when one was named, the leader's otherwise.
     let processor = first_thread
         .as_ref()
         .map(|t| t.last_cpu() as i64)
@@ -427,8 +498,11 @@ fn proc_pid_stat(proc: &Process) -> String {
     // Job-control ids (proc(5) fields 5-8): the effective pgid/sid resolve the
     // "0 = own pid" convention, tty_nr encodes the per-process VT console as
     // major 4 (TTY_MAJOR) + minor, and tpgid is the tty's foreground group.
-    let pgrp = crate::process::get_process_pgid(pid).unwrap_or(pid) as i64;
-    let session = crate::process::get_process_sid(pid).unwrap_or(pid) as i64;
+    // Keyed by the PROCESS id even on a thread's `stat`: a thread has no
+    // process group or session of its own, and `pid` above may be a tid.
+    let tgid = proc.id();
+    let pgrp = crate::process::get_process_pgid(tgid).unwrap_or(tgid) as i64;
+    let session = crate::process::get_process_sid(tgid).unwrap_or(tgid) as i64;
     let tty_nr = proc
         .try_linux()
         .map(|lp| (4 << 8) | (lp.vt() as i64 + 1))
@@ -505,10 +579,32 @@ fn status_state_text(letter: char) -> &'static str {
 }
 
 fn proc_pid_status(proc: &Process) -> String {
+    proc_task_status(proc, None)
+}
+
+/// `/proc/<pid>/status`, and `/proc/<pid>/task/<tid>/status` when `thread`
+/// names one.
+///
+/// `Name:` and `State:` are the task's own, `Tgid:` is always the process and
+/// `Pid:` the task -- which is the whole point of those two lines being
+/// separate, and is how a reader holding a tid tells which group it is in.
+/// The memory and credential lines belong to the address space, so they are
+/// the process's for every thread, as in Linux.
+fn proc_task_status(proc: &Process, thread: Option<&Arc<Thread>>) -> String {
     let pid = proc.id();
-    let name = escaped_comm(&proc_comm(proc));
+    let tid = match thread {
+        Some(t) => t.id(),
+        None => pid,
+    };
+    let name = escaped_comm(&match thread {
+        Some(t) => thread_comm(proc, t),
+        None => proc_comm(proc),
+    });
     let ppid = proc_ppid(proc);
-    let state = status_state_text(proc_state_char(proc));
+    let state = status_state_text(match thread {
+        Some(t) => thread_state_char(t.state()),
+        None => proc_state_char(proc),
+    });
     // VmSize = total mapped address space; VmRSS = committed (resident)
     // bytes, private + shared — the fields `ps`/`top`/OOM-watchers read.
     let stats = proc.vmar().get_task_stats();
@@ -523,7 +619,7 @@ fn proc_pid_status(proc: &Process) -> String {
         .unwrap_or_default();
     format!(
         "Name:\t{}\nState:\t{}\nTgid:\t{}\nPid:\t{}\nPPid:\t{}\n{}VmSize:\t{:8} kB\nVmRSS:\t{:8} kB\nThreads:\t{}\n",
-        name, state, pid, pid, ppid, ids, vm_size_kb, vm_rss_kb, threads
+        name, state, pid, tid, ppid, ids, vm_size_kb, vm_rss_kb, threads
     )
 }
 
@@ -760,10 +856,28 @@ pub(crate) const PID_INODE_BASE: usize = 0x1_0000;
 pub(crate) const PID_INODE_SLOTS: usize = 16;
 /// Slot of `/proc/<pid>/fd` (`proc_self.rs`); the files use their kind's.
 pub(crate) const PID_FD_DIR_SLOT: usize = 10;
+/// Slot of `/proc/<pid>/task`.
+pub(crate) const PID_TASK_DIR_SLOT: usize = 11;
 
 pub(crate) fn pid_inode(pid: u64, slot: usize) -> usize {
     debug_assert!(slot < PID_INODE_SLOTS);
     PID_INODE_BASE + (pid as usize) * PID_INODE_SLOTS + slot
+}
+
+/// Inode numbers of `/proc/<pid>/task/<tid>` and the files under it.
+///
+/// They have to miss both the fixed `/proc` numbers (10..=999) and the whole
+/// per-pid range, which `pid_inode` can take as high as
+/// `PID_INODE_BASE + pid_max * PID_INODE_SLOTS` -- `pid_max` is 4194304 here,
+/// so that range ends just past `0x400_0000`. This one starts above it and
+/// leaves `TID_INODE_SLOTS` per thread: slot 0 is the directory, the rest its
+/// files.
+const TID_INODE_BASE: usize = 0x1000_0000;
+const TID_INODE_SLOTS: usize = 8;
+
+fn tid_inode(tid: u64, slot: usize) -> usize {
+    debug_assert!(slot < TID_INODE_SLOTS);
+    TID_INODE_BASE + (tid as usize) * TID_INODE_SLOTS + slot
 }
 
 /// `/proc/<pid>/` — `stat`, `cmdline`, `status` for BusyBox `ps`.
@@ -799,10 +913,10 @@ impl ProcPidDirINode {
         }
     }
 
-    fn entries() -> [&'static str; 13] {
+    fn entries() -> [&'static str; 14] {
         [
             ".", "..", "stat", "cmdline", "status", "perf", "maps", "fd", "comm", "environ",
-            "statm", "exe", "threads",
+            "statm", "exe", "threads", "task",
         ]
     }
 }
@@ -837,8 +951,8 @@ impl INode for ProcPidDirINode {
             ctime: Timespec { sec: 0, nsec: 0 },
             type_: FileType::Dir,
             mode: 0o555,
-            // `.`, the name in `/proc`, and `fd`'s `..`.
-            nlinks: 3,
+            // `.`, the name in `/proc`, and the `..` of `fd` and of `task`.
+            nlinks: 4,
             uid: 0,
             gid: 0,
             rdev: 0,
@@ -910,6 +1024,7 @@ impl INode for ProcPidDirINode {
                 pid: self.pid,
                 kind: ProcPidFileKind::Threads,
             })),
+            "task" => Ok(Arc::new(ProcPidTaskDirINode { pid: self.pid })),
             "exe" => {
                 self.check_read_innards()?;
                 let proc = self.process().ok_or(FsError::EntryNotFound)?;
@@ -932,6 +1047,402 @@ impl INode for ProcPidDirINode {
             return Err(FsError::EntryNotFound);
         }
         Ok(entries[id].into())
+    }
+}
+
+/// `/proc/<pid>/task` — a directory per thread, which is where every library
+/// that wants to know about a *thread* rather than a process looks.
+///
+/// It was not here, and three well-trodden paths dead-end on that:
+///
+/// * Chromium's sandbox calls `fstatat(proc_fd, "self/task/", ...)` in
+///   `sandbox/linux/services/thread_helpers.cc` and wraps it in a `PCHECK`,
+///   so the miss is not a fallback but a **`FATAL` abort** of the zygote:
+///   "Check failed: . : No such file or directory (2)". With the zygote dead
+///   every `GPU process launch failed: error_code=1002`, and the browser
+///   finishes with "GPU process isn't usable. Goodbye." and a
+///   `Trace/breakpoint trap`.
+/// * glibc's `pthread_setname_np`/`pthread_getname_np` open
+///   `/proc/self/task/<tid>/comm` (musl's do too), so naming a thread failed
+///   with `ENOENT` for every program that did not go through
+///   `prctl(PR_SET_NAME)` on itself.
+/// * Anything counting threads by reading the directory -- Java, Go and the
+///   sanitizers all do -- saw none.
+///
+/// `nlinks` is the one number that carries meaning here: Linux reports
+/// `2 + <threads>` (`.`, the name in `/proc/<pid>`, and one `..` per thread
+/// directory), and chromium reads exactly that to decide whether it is
+/// single-threaded (`st_nlink == 3`) before it forks. Reporting a constant
+/// would make every process look single-threaded, which is the opposite of
+/// the check's purpose, so it is counted live.
+struct ProcPidTaskDirINode {
+    pid: u64,
+}
+
+impl ProcPidTaskDirINode {
+    fn process(&self) -> Option<Arc<Process>> {
+        ROOT_JOB.find_process(self.pid as _)
+    }
+
+    fn tids(&self) -> Vec<u64> {
+        self.process()
+            .map(|p| p.thread_ids())
+            .unwrap_or_default()
+            .to_vec()
+    }
+}
+
+impl INode for ProcPidTaskDirINode {
+    fn read_at(&self, _offset: usize, _buf: &mut [u8]) -> Result<usize> {
+        Ok(0)
+    }
+
+    fn write_at(&self, _offset: usize, _buf: &[u8]) -> Result<usize> {
+        Err(FsError::NotSupported)
+    }
+
+    fn poll(&self) -> Result<PollStatus> {
+        Ok(PollStatus {
+            read: true,
+            write: false,
+            error: false,
+            hangup: false,
+        })
+    }
+
+    fn metadata(&self) -> Result<Metadata> {
+        if self.process().is_none() {
+            return Err(FsError::EntryNotFound);
+        }
+        // A live process always has at least the thread that is running, so
+        // the floor is 1 -- `st_nlink` of 2 would say "a task with no tasks",
+        // which is both impossible and below the `CHECK_LE(3, nlink)` every
+        // reader of this directory makes.
+        let threads = self.tids().len().max(1);
+        Ok(dir_metadata(
+            pid_inode(self.pid, PID_TASK_DIR_SLOT),
+            threads,
+        ))
+    }
+
+    fn as_any_ref(&self) -> &dyn Any {
+        self
+    }
+
+    fn fs(&self) -> Arc<dyn FileSystem> {
+        Arc::new(ProcFS)
+    }
+
+    fn find(&self, name: &str) -> Result<Arc<dyn INode>> {
+        if self.process().is_none() {
+            return Err(FsError::EntryNotFound);
+        }
+        match name {
+            "." => Ok(Arc::new(ProcPidTaskDirINode { pid: self.pid })),
+            ".." => Ok(pid_dir_inode(self.pid)),
+            _ => {
+                let tid = name.parse::<u64>().map_err(|_| FsError::EntryNotFound)?;
+                if !self.tids().contains(&tid) {
+                    return Err(FsError::EntryNotFound);
+                }
+                Ok(Arc::new(ProcTidDirINode { pid: self.pid, tid }))
+            }
+        }
+    }
+
+    fn get_entry(&self, id: usize) -> Result<String> {
+        match id {
+            0 => Ok(".".into()),
+            1 => Ok("..".into()),
+            _ => {
+                let tids = self.tids();
+                let idx = id - 2;
+                if idx >= tids.len() {
+                    return Err(FsError::EntryNotFound);
+                }
+                Ok(alloc::format!("{}", tids[idx]))
+            }
+        }
+    }
+}
+
+/// `/proc/<pid>/task/<tid>` — the per-thread view.
+///
+/// `comm` is the thread's own name and is the only file here that is not the
+/// process's: `stat` and `status` are served from the process, which is what
+/// those readers want from a thread directory they reached by tid and is
+/// closer than the `ENOENT` they got before. `comm` is writable, because
+/// `pthread_setname_np` names a thread by writing to it.
+struct ProcTidDirINode {
+    pid: u64,
+    tid: u64,
+}
+
+impl ProcTidDirINode {
+    fn entries() -> [&'static str; 5] {
+        [".", "..", "comm", "stat", "status"]
+    }
+
+    fn alive(&self) -> Result<()> {
+        tid_task(self.pid, self.tid).map(|_| ())
+    }
+}
+
+impl INode for ProcTidDirINode {
+    fn read_at(&self, _offset: usize, _buf: &mut [u8]) -> Result<usize> {
+        Ok(0)
+    }
+
+    fn write_at(&self, _offset: usize, _buf: &[u8]) -> Result<usize> {
+        Err(FsError::NotSupported)
+    }
+
+    fn poll(&self) -> Result<PollStatus> {
+        Ok(PollStatus {
+            read: true,
+            write: false,
+            error: false,
+            hangup: false,
+        })
+    }
+
+    fn metadata(&self) -> Result<Metadata> {
+        self.alive()?;
+        Ok(dir_metadata(tid_inode(self.tid, 0), 0))
+    }
+
+    fn as_any_ref(&self) -> &dyn Any {
+        self
+    }
+
+    fn fs(&self) -> Arc<dyn FileSystem> {
+        Arc::new(ProcFS)
+    }
+
+    fn find(&self, name: &str) -> Result<Arc<dyn INode>> {
+        self.alive()?;
+        match name {
+            "." => Ok(Arc::new(ProcTidDirINode {
+                pid: self.pid,
+                tid: self.tid,
+            })),
+            ".." => Ok(Arc::new(ProcPidTaskDirINode { pid: self.pid })),
+            "comm" => Ok(Arc::new(ProcTidCommINode {
+                pid: self.pid,
+                tid: self.tid,
+            })),
+            "stat" => Ok(Arc::new(ProcTidFileINode {
+                pid: self.pid,
+                tid: self.tid,
+                kind: ProcTidFileKind::Stat,
+            })),
+            "status" => Ok(Arc::new(ProcTidFileINode {
+                pid: self.pid,
+                tid: self.tid,
+                kind: ProcTidFileKind::Status,
+            })),
+            _ => Err(FsError::EntryNotFound),
+        }
+    }
+
+    fn get_entry(&self, id: usize) -> Result<String> {
+        let entries = Self::entries();
+        if id >= entries.len() {
+            return Err(FsError::EntryNotFound);
+        }
+        Ok(entries[id].into())
+    }
+}
+
+/// `/proc/<pid>/task/<tid>/{stat,status}`.
+#[derive(Clone, Copy)]
+enum ProcTidFileKind {
+    Stat,
+    Status,
+}
+
+impl ProcTidFileKind {
+    /// The file's slot in its thread's inode numbers (see `tid_inode`), none
+    /// of them the directory's 0 or `comm`'s 1.
+    fn slot(self) -> usize {
+        match self {
+            Self::Stat => 2,
+            Self::Status => 3,
+        }
+    }
+}
+
+struct ProcTidFileINode {
+    pid: u64,
+    tid: u64,
+    kind: ProcTidFileKind,
+}
+
+impl ProcTidFileINode {
+    fn bytes(&self) -> Result<Vec<u8>> {
+        let (proc, thread) = tid_task(self.pid, self.tid)?;
+        Ok(match self.kind {
+            ProcTidFileKind::Stat => proc_task_stat(&proc, Some(&thread)).into_bytes(),
+            ProcTidFileKind::Status => proc_task_status(&proc, Some(&thread)).into_bytes(),
+        })
+    }
+}
+
+impl INode for ProcTidFileINode {
+    fn read_at(&self, offset: usize, buf: &mut [u8]) -> Result<usize> {
+        slice_read_at(&self.bytes()?, offset, buf)
+    }
+
+    fn write_at(&self, _offset: usize, _buf: &[u8]) -> Result<usize> {
+        Err(FsError::NotSupported)
+    }
+
+    fn poll(&self) -> Result<PollStatus> {
+        Ok(PollStatus {
+            read: true,
+            write: false,
+            error: false,
+            hangup: false,
+        })
+    }
+
+    fn metadata(&self) -> Result<Metadata> {
+        let size = self.bytes()?.len();
+        Ok(Metadata {
+            dev: 0,
+            inode: tid_inode(self.tid, self.kind.slot()),
+            size,
+            blk_size: 4096,
+            blocks: size.div_ceil(4096),
+            atime: Timespec { sec: 0, nsec: 0 },
+            mtime: Timespec { sec: 0, nsec: 0 },
+            ctime: Timespec { sec: 0, nsec: 0 },
+            type_: FileType::File,
+            mode: 0o444,
+            nlinks: 1,
+            uid: 0,
+            gid: 0,
+            rdev: 0,
+        })
+    }
+
+    fn as_any_ref(&self) -> &dyn Any {
+        self
+    }
+
+    fn fs(&self) -> Arc<dyn FileSystem> {
+        Arc::new(ProcFS)
+    }
+}
+
+/// The process and the thread behind a `/proc/<pid>/task/<tid>` path, or
+/// `EntryNotFound` if either is gone -- or if the tid is live but belongs to
+/// another process, which is not this directory's thread however real it is.
+fn tid_task(pid: u64, tid: u64) -> Result<(Arc<Process>, Arc<Thread>)> {
+    let proc = ROOT_JOB
+        .find_process(pid as _)
+        .ok_or(FsError::EntryNotFound)?;
+    if !proc.thread_ids().contains(&tid) {
+        return Err(FsError::EntryNotFound);
+    }
+    let thread = proc
+        .get_child(tid)
+        .map_err(|_| FsError::EntryNotFound)?
+        .downcast_arc::<Thread>()
+        .map_err(|_| FsError::EntryNotFound)?;
+    Ok((proc, thread))
+}
+
+/// The bytes `/proc/<pid>/task/<tid>/comm` keeps from what was written to it.
+///
+/// `comm_write` in `fs/proc/base.c` copies at most `TASK_COMM_LEN - 1` bytes
+/// and cuts the trailing newline `echo` adds, which is why
+/// `echo hilo > .../comm` does not store a name ending in `\n`. Bytes that
+/// are not UTF-8 become `?`, as `prctl(PR_SET_NAME)` already does here --
+/// `comm` is a `String`, and a JVM cutting a multibyte name to 15 bytes
+/// hands over half a character.
+fn comm_from_written_bytes(bytes: &[u8]) -> String {
+    use crate::thread::TASK_COMM_LEN;
+    let end = bytes
+        .iter()
+        .position(|&b| b == 0 || b == b'\n')
+        .unwrap_or(bytes.len())
+        .min(TASK_COMM_LEN - 1);
+    let mut comm = String::with_capacity(end);
+    for chunk in bytes[..end].utf8_chunks() {
+        comm.push_str(chunk.valid());
+        for _ in 0..chunk.invalid().len() {
+            comm.push('?');
+        }
+    }
+    comm
+}
+
+/// `/proc/<pid>/task/<tid>/comm`.
+struct ProcTidCommINode {
+    pid: u64,
+    tid: u64,
+}
+
+impl ProcTidCommINode {
+    fn bytes(&self) -> Result<Vec<u8>> {
+        let (proc, thread) = tid_task(self.pid, self.tid)?;
+        Ok(alloc::format!("{}\n", thread_comm(&proc, &thread)).into_bytes())
+    }
+}
+
+impl INode for ProcTidCommINode {
+    fn read_at(&self, offset: usize, buf: &mut [u8]) -> Result<usize> {
+        slice_read_at(&self.bytes()?, offset, buf)
+    }
+
+    fn write_at(&self, _offset: usize, buf: &[u8]) -> Result<usize> {
+        use crate::thread::ThreadExt;
+        let (_proc, thread) = tid_task(self.pid, self.tid)?;
+        // Whatever the offset, the whole file is the one name: Linux ignores
+        // `*ppos` in `comm_write` too.
+        thread.lock_linux().comm = comm_from_written_bytes(buf);
+        // The caller wrote every byte it handed over, even the ones past
+        // `TASK_COMM_LEN` that the kernel drops; a short count would have
+        // `write(2)` loop and re-write the tail as a new name.
+        Ok(buf.len())
+    }
+
+    fn poll(&self) -> Result<PollStatus> {
+        Ok(PollStatus {
+            read: true,
+            write: true,
+            error: false,
+            hangup: false,
+        })
+    }
+
+    fn metadata(&self) -> Result<Metadata> {
+        let size = self.bytes()?.len();
+        Ok(Metadata {
+            dev: 0,
+            inode: tid_inode(self.tid, 1),
+            size,
+            blk_size: 4096,
+            blocks: size.div_ceil(4096),
+            atime: Timespec { sec: 0, nsec: 0 },
+            mtime: Timespec { sec: 0, nsec: 0 },
+            ctime: Timespec { sec: 0, nsec: 0 },
+            type_: FileType::File,
+            mode: 0o644,
+            nlinks: 1,
+            uid: 0,
+            gid: 0,
+            rdev: 0,
+        })
+    }
+
+    fn as_any_ref(&self) -> &dyn Any {
+        self
+    }
+
+    fn fs(&self) -> Arc<dyn FileSystem> {
+        Arc::new(ProcFS)
     }
 }
 
@@ -1297,7 +1808,7 @@ impl INode for ProcSysFsDirINode {
         })
     }
     fn metadata(&self) -> Result<Metadata> {
-        Ok(dir_metadata(65, 0))
+        Ok(dir_metadata(65, 1))
     }
     fn as_any_ref(&self) -> &dyn Any {
         self
@@ -1312,6 +1823,7 @@ impl INode for ProcSysFsDirINode {
             "file-max" => Ok(PROC_SYS_FILE_MAX.clone()),
             "nr_open" => Ok(PROC_SYS_NR_OPEN.clone()),
             "pipe-max-size" => Ok(PROC_SYS_PIPE_MAX_SIZE.clone()),
+            "inotify" => Ok(PROC_SYS_FS_INOTIFY_DIR.clone()),
             _ => Err(FsError::EntryNotFound),
         }
     }
@@ -1322,9 +1834,89 @@ impl INode for ProcSysFsDirINode {
             2 => Ok("file-max".into()),
             3 => Ok("nr_open".into()),
             4 => Ok("pipe-max-size".into()),
+            5 => Ok("inotify".into()),
             _ => Err(FsError::EntryNotFound),
         }
     }
+}
+
+/// `/proc/sys/fs/inotify` — the three per-user inotify limits
+/// (Documentation/filesystems/inotify.rst).
+///
+/// Every file watcher reads them before it decides how to watch: chromium's
+/// `base/files/file_path_watcher_inotify.cc` reads `max_user_watches` to size
+/// its watch pool and logs
+/// "Failed to read /proc/sys/fs/inotify/max_user_watches" per process when it
+/// cannot; GLib, libuv, systemd, `inotifywait` and every file-sync daemon do
+/// the same. Reading the knob is also how a program tells "the limit is
+/// small, watch directories instead of files" from "there is no limit worth
+/// worrying about", so a missing file leaves it guessing.
+///
+/// `Inotify` here keeps no per-user accounting, so these are what the
+/// implementation actually imposes -- no ceiling -- published as the numbers
+/// a current Linux ships rather than as something larger that would read as a
+/// lie to anything that sizes a pool from them.
+struct ProcSysFsInotifyDirINode;
+
+impl INode for ProcSysFsInotifyDirINode {
+    fn read_at(&self, _offset: usize, _buf: &mut [u8]) -> Result<usize> {
+        Ok(0)
+    }
+    fn write_at(&self, _offset: usize, _buf: &[u8]) -> Result<usize> {
+        Err(FsError::NotSupported)
+    }
+    fn poll(&self) -> Result<PollStatus> {
+        Ok(PollStatus {
+            read: true,
+            write: false,
+            error: false,
+            hangup: false,
+        })
+    }
+    fn metadata(&self) -> Result<Metadata> {
+        Ok(dir_metadata(69, 0))
+    }
+    fn as_any_ref(&self) -> &dyn Any {
+        self
+    }
+    fn fs(&self) -> Arc<dyn FileSystem> {
+        Arc::new(ProcFS)
+    }
+    fn find(&self, name: &str) -> Result<Arc<dyn INode>> {
+        match name {
+            "." => Ok(PROC_SYS_FS_INOTIFY_DIR.clone()),
+            ".." => Ok(PROC_SYS_FS_DIR.clone()),
+            "max_user_watches" => Ok(PROC_SYS_INOTIFY_MAX_USER_WATCHES.clone()),
+            "max_user_instances" => Ok(PROC_SYS_INOTIFY_MAX_USER_INSTANCES.clone()),
+            "max_queued_events" => Ok(PROC_SYS_INOTIFY_MAX_QUEUED_EVENTS.clone()),
+            _ => Err(FsError::EntryNotFound),
+        }
+    }
+    fn get_entry(&self, id: usize) -> Result<String> {
+        match id {
+            0 => Ok(".".into()),
+            1 => Ok("..".into()),
+            2 => Ok("max_user_watches".into()),
+            3 => Ok("max_user_instances".into()),
+            4 => Ok("max_queued_events".into()),
+            _ => Err(FsError::EntryNotFound),
+        }
+    }
+}
+
+/// Linux's own default since 5.x (`inotify_user.c`: `watches_max`).
+fn proc_sys_inotify_max_user_watches_content() -> String {
+    String::from("65536\n")
+}
+
+/// `instances_max`.
+fn proc_sys_inotify_max_user_instances_content() -> String {
+    String::from("128\n")
+}
+
+/// `queued_events_max`.
+fn proc_sys_inotify_max_queued_events_content() -> String {
+    String::from("16384\n")
 }
 
 /// The metadata of a `/proc` directory that holds `subdirs` directories of its
@@ -3665,6 +4257,19 @@ lazy_static! {
         inode: 68,
         generate: proc_sys_pipe_max_size_content,
     });
+    static ref PROC_SYS_FS_INOTIFY_DIR: Arc<dyn INode> = Arc::new(ProcSysFsInotifyDirINode);
+    static ref PROC_SYS_INOTIFY_MAX_USER_WATCHES: Arc<dyn INode> = Arc::new(ProcSeqINode {
+        inode: 25,
+        generate: proc_sys_inotify_max_user_watches_content,
+    });
+    static ref PROC_SYS_INOTIFY_MAX_USER_INSTANCES: Arc<dyn INode> = Arc::new(ProcSeqINode {
+        inode: 26,
+        generate: proc_sys_inotify_max_user_instances_content,
+    });
+    static ref PROC_SYS_INOTIFY_MAX_QUEUED_EVENTS: Arc<dyn INode> = Arc::new(ProcSeqINode {
+        inode: 27,
+        generate: proc_sys_inotify_max_queued_events_content,
+    });
     static ref PROC_NET_TCP: Arc<dyn INode> = Arc::new(ProcSeqINode {
         inode: 70,
         generate: proc_net_tcp_content,
@@ -5236,5 +5841,442 @@ mod proc_numbers_tests {
         assert_eq!(fields[1].len(), 8); // destination
         assert_eq!(fields[2].len(), 8); // gateway
         assert_eq!(fields[7].len(), 8); // mask
+    }
+}
+
+#[cfg(test)]
+mod pid_task_dir_tests {
+    //! `/proc/<pid>/task` was not there, and chromium's sandbox does not
+    //! treat that as a miss: `thread_helpers.cc` `PCHECK`s the `fstatat` of
+    //! `self/task/`, so the zygote aborted with "Check failed: . : No such
+    //! file or directory (2)" and the browser went on to
+    //! "GPU process isn't usable. Goodbye."
+
+    use super::*;
+    use crate::process::LinuxProcess;
+    use crate::thread::ThreadExt;
+    use alloc::string::ToString;
+    use rcore_fs_ramfs::RamFS;
+
+    fn a_process(pid: u64, name: &str) -> Arc<Process> {
+        Process::create_with_fixed_id_ext(&ROOT_JOB, pid, name, LinuxProcess::new(RamFS::new(), 0))
+            .unwrap()
+    }
+
+    fn names_of(dir: &dyn INode) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut id = 0;
+        while let Ok(name) = dir.get_entry(id) {
+            out.push(name);
+            id += 1;
+        }
+        out
+    }
+
+    #[test]
+    fn the_pid_directory_lists_and_resolves_task() {
+        let proc = a_process(9_100_001, "navegador");
+        let dir = ProcPidDirINode { pid: proc.id() };
+        assert!(names_of(&dir).contains(&"task".to_string()));
+        let task = dir.find("task").unwrap();
+        assert_eq!(task.metadata().unwrap().type_, FileType::Dir);
+        // And `..` climbs back to the process directory, which is what
+        // `fts(3)` walks out through.
+        assert_eq!(
+            task.find("..").unwrap().metadata().unwrap().inode,
+            dir.metadata().unwrap().inode
+        );
+    }
+
+    /// The number chromium reads: `st_nlink == 3` means "single-threaded"
+    /// (`.`, `..` and one thread), so it has to move with the thread count or
+    /// every process looks monothreaded to the sandbox.
+    #[test]
+    fn the_task_directory_counts_its_threads_in_nlinks() {
+        let proc = a_process(9_100_002, "hilos");
+        let task = ProcPidTaskDirINode { pid: proc.id() };
+        // No thread yet: a live process still reports the floor of one, never
+        // the 2 that would fail every `CHECK_LE(3, nlink)`.
+        assert_eq!(task.metadata().unwrap().nlinks, 3);
+        let _first = Thread::create_linux(&proc).unwrap();
+        assert_eq!(task.metadata().unwrap().nlinks, 3);
+        let _second = Thread::create_linux(&proc).unwrap();
+        assert_eq!(task.metadata().unwrap().nlinks, 4);
+        let _third = Thread::create_linux(&proc).unwrap();
+        assert_eq!(task.metadata().unwrap().nlinks, 5);
+    }
+
+    #[test]
+    fn the_task_directory_lists_one_entry_per_thread_and_resolves_each() {
+        let proc = a_process(9_100_003, "listado");
+        let first = Thread::create_linux(&proc).unwrap();
+        let second = Thread::create_linux(&proc).unwrap();
+        let task = ProcPidTaskDirINode { pid: proc.id() };
+        let listed = names_of(&task);
+        assert_eq!(listed[0], ".");
+        assert_eq!(listed[1], "..");
+        let tids: Vec<String> = listed[2..].to_vec();
+        assert_eq!(tids.len(), 2);
+        for t in [&first, &second] {
+            let name = alloc::format!("{}", t.id());
+            assert!(tids.contains(&name), "{} no esta en {:?}", name, tids);
+            assert_eq!(
+                task.find(&name).unwrap().metadata().unwrap().type_,
+                FileType::Dir
+            );
+        }
+        // A tid that is not this process's is not found here, however live it
+        // is elsewhere: `/proc/<pid>/task` is the threads of THAT process.
+        let other = a_process(9_100_004, "ajeno");
+        let alien = Thread::create_linux(&other).unwrap();
+        let err = |r: Result<Arc<dyn INode>>| r.map(|_| ()).unwrap_err();
+        assert_eq!(
+            err(task.find(&alloc::format!("{}", alien.id()))),
+            FsError::EntryNotFound
+        );
+        assert_eq!(err(task.find("noesunnumero")), FsError::EntryNotFound);
+    }
+
+    #[test]
+    fn a_thread_directory_carries_comm_stat_and_status() {
+        let proc = a_process(9_100_005, "ficheros");
+        let thread = Thread::create_linux(&proc).unwrap();
+        let dir = ProcTidDirINode {
+            pid: proc.id(),
+            tid: thread.id(),
+        };
+        assert_eq!(
+            names_of(&dir),
+            alloc::vec![".", "..", "comm", "stat", "status"]
+        );
+        for name in ["comm", "stat", "status"] {
+            let file = dir.find(name).unwrap();
+            assert_eq!(file.metadata().unwrap().type_, FileType::File);
+            let mut buf = [0u8; 16];
+            assert!(file.read_at(0, &mut buf).unwrap() > 0, "{} vacio", name);
+        }
+        // `..` is the task directory, not the process one.
+        assert_eq!(
+            dir.find("..").unwrap().metadata().unwrap().inode,
+            pid_inode(proc.id(), PID_TASK_DIR_SLOT)
+        );
+    }
+
+    /// `pthread_setname_np` names a thread by writing here, and
+    /// `pthread_getname_np` reads it back; both got `ENOENT` before.
+    #[test]
+    fn comm_is_the_thread_s_own_name_and_writing_it_renames_the_thread() {
+        let proc = a_process(9_100_006, "programa");
+        let first = Thread::create_linux(&proc).unwrap();
+        let second = Thread::create_linux(&proc).unwrap();
+        let comm_of = |t: &Arc<Thread>| ProcTidCommINode {
+            pid: proc.id(),
+            tid: t.id(),
+        };
+        // A thread that never named itself answers with the process's name.
+        let mut buf = [0u8; 64];
+        let n = comm_of(&first).read_at(0, &mut buf).unwrap();
+        assert_eq!(&buf[..n], b"programa\n");
+
+        // The newline `echo name > comm` adds is not part of the name, and
+        // the write reports every byte it was handed.
+        let written = comm_of(&first).write_at(0, b"renderizador\n").unwrap();
+        assert_eq!(written, b"renderizador\n".len());
+        assert_eq!(first.lock_linux().comm, "renderizador");
+        let n = comm_of(&first).read_at(0, &mut buf).unwrap();
+        assert_eq!(&buf[..n], b"renderizador\n");
+        // And it named THAT thread, not the process or its sibling.
+        let n = comm_of(&second).read_at(0, &mut buf).unwrap();
+        assert_eq!(&buf[..n], b"programa\n");
+    }
+
+    #[test]
+    fn a_written_name_is_cut_to_fifteen_bytes_at_the_first_nul_or_newline() {
+        use crate::thread::TASK_COMM_LEN;
+        assert_eq!(comm_from_written_bytes(b"corto"), "corto");
+        assert_eq!(comm_from_written_bytes(b"corto\nbasura"), "corto");
+        assert_eq!(comm_from_written_bytes(b"corto\0basura"), "corto");
+        // Sixteen bytes: the sixteenth is the NUL the kernel keeps for
+        // itself, so fifteen is all that is stored.
+        let long = "0123456789abcdefghij";
+        assert_eq!(
+            comm_from_written_bytes(long.as_bytes()),
+            &long[..TASK_COMM_LEN - 1]
+        );
+        // Fourteen bytes of two-byte characters fit whole and stay whole.
+        assert_eq!(comm_from_written_bytes("ñññññññ".as_bytes()), "ñññññññ");
+        // Sixteen bytes of them do not: the cut to fifteen lands in the
+        // MIDDLE of the eighth character and leaves its lead byte alone. A
+        // JVM's `pthread_setname_np` does exactly this -- it cuts a name to
+        // fifteen bytes before handing it over -- and `comm` is a `String`,
+        // so the orphan byte becomes `?` rather than the refusal Linux never
+        // makes.
+        let eight = "ññññññññ";
+        assert_eq!(eight.len(), 16);
+        assert_eq!(comm_from_written_bytes(eight.as_bytes()), "ñññññññ?");
+    }
+
+    /// The directory and its files need numbers of their own, clear of the
+    /// fixed `/proc` ones and of the whole per-pid range: `cmp`, `tar` and
+    /// `[ a -ef b ]` take two files with the same (dev, ino) for one file and
+    /// never read the second.
+    #[test]
+    fn a_thread_s_directory_and_comm_are_distinct_inodes_above_every_pid_one() {
+        let pid_max = 4_194_304usize;
+        let highest_pid_inode = PID_INODE_BASE + pid_max * PID_INODE_SLOTS;
+        let mut seen = Vec::new();
+        for tid in [1u64, 2, 1000, 4_194_303] {
+            for slot in 0..2 {
+                let ino = tid_inode(tid, slot);
+                assert!(
+                    ino > highest_pid_inode,
+                    "tid {} slot {} cae en el rango de pid ({})",
+                    tid,
+                    slot,
+                    ino
+                );
+                assert!(!seen.contains(&ino), "{} repetido", ino);
+                seen.push(ino);
+            }
+        }
+    }
+
+    /// What Copilot caught on the first push: `stat` and `status` under a tid
+    /// were the PROCESS's files, inode and all, so every thread reported the
+    /// leader's name and state and the CPU time of all of them at once -- the
+    /// one question a `task/<tid>` exists to answer could not be asked, and
+    /// `cmp`, `tar` and `[ a -ef b ]` took the file for `/proc/<pid>/stat`.
+    #[test]
+    fn a_thread_s_stat_describes_that_thread_and_not_the_process() {
+        let proc = a_process(9_100_007, "programa");
+        let leader = Thread::create_linux(&proc).unwrap();
+        let worker = Thread::create_linux(&proc).unwrap();
+        leader.lock_linux().comm = "principal".into();
+        worker.lock_linux().comm = "renderizador".into();
+
+        let stat_of = |t: &Arc<Thread>| -> String {
+            let inode = ProcTidFileINode {
+                pid: proc.id(),
+                tid: t.id(),
+                kind: ProcTidFileKind::Stat,
+            };
+            let mut buf = [0u8; 512];
+            let n = inode.read_at(0, &mut buf).unwrap();
+            String::from_utf8(buf[..n].to_vec()).unwrap()
+        };
+
+        // Field 1 is the TID and field 2 that thread's own name.
+        let line = stat_of(&worker);
+        assert!(
+            line.starts_with(&alloc::format!("{} (renderizador) ", worker.id())),
+            "{}",
+            line
+        );
+        assert!(
+            stat_of(&leader).starts_with(&alloc::format!("{} (principal) ", leader.id())),
+            "{}",
+            stat_of(&leader)
+        );
+        // And the process's own file still names the process.
+        assert!(
+            proc_pid_stat(&proc).starts_with(&alloc::format!("{} (", proc.id())),
+            "{}",
+            proc_pid_stat(&proc)
+        );
+        // Field 20 is the thread-group count, which a thread reports too.
+        let fields: Vec<&str> = line
+            .rsplit(')')
+            .next()
+            .unwrap()
+            .split_whitespace()
+            .collect();
+        // The tail starts at field 3, so field 20 is index 17.
+        assert_eq!(fields[17], "2");
+    }
+
+    #[test]
+    fn a_thread_s_status_separates_tgid_from_pid() {
+        let proc = a_process(9_100_008, "programa");
+        let thread = Thread::create_linux(&proc).unwrap();
+        thread.lock_linux().comm = "io-child".into();
+        let inode = ProcTidFileINode {
+            pid: proc.id(),
+            tid: thread.id(),
+            kind: ProcTidFileKind::Status,
+        };
+        let mut buf = [0u8; 512];
+        let n = inode.read_at(0, &mut buf).unwrap();
+        let text = String::from_utf8(buf[..n].to_vec()).unwrap();
+        assert!(text.contains("Name:\tio-child\n"), "{}", text);
+        // `Tgid:` is the process and `Pid:` the thread -- which is the whole
+        // reason those two lines are separate, and how a reader holding a tid
+        // learns which group it is in.
+        assert!(
+            text.contains(&alloc::format!("Tgid:\t{}\n", proc.id())),
+            "{}",
+            text
+        );
+        assert!(
+            text.contains(&alloc::format!("Pid:\t{}\n", thread.id())),
+            "{}",
+            text
+        );
+    }
+
+    /// Two files that share a (dev, ino) are one file to `cmp`, `diff`, `cp`,
+    /// `tar` and `[ a -ef b ]`, which then never read the second.
+    #[test]
+    fn a_thread_s_files_do_not_alias_the_process_s_or_each_other_s() {
+        let proc = a_process(9_100_009, "inodos");
+        let first = Thread::create_linux(&proc).unwrap();
+        let second = Thread::create_linux(&proc).unwrap();
+        let mut inodes = Vec::new();
+        for t in [&first, &second] {
+            let dir = ProcTidDirINode {
+                pid: proc.id(),
+                tid: t.id(),
+            };
+            inodes.push(dir.metadata().unwrap().inode);
+            for name in ["comm", "stat", "status"] {
+                inodes.push(dir.find(name).unwrap().metadata().unwrap().inode);
+            }
+        }
+        // The process's own directory and files, which these must miss.
+        inodes.push(ProcPidDirINode { pid: proc.id() }.metadata().unwrap().inode);
+        for kind in [
+            ProcPidFileKind::Stat,
+            ProcPidFileKind::Status,
+            ProcPidFileKind::Comm,
+        ] {
+            inodes.push(
+                ProcPidFileINode {
+                    pid: proc.id(),
+                    kind,
+                }
+                .metadata()
+                .unwrap()
+                .inode,
+            );
+        }
+        inodes.push(pid_inode(proc.id(), PID_TASK_DIR_SLOT));
+        let mut sorted = inodes.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), inodes.len(), "inodos repetidos: {:?}", inodes);
+    }
+
+    /// A tid that is alive in ANOTHER process is not this directory's thread,
+    /// and reading its files through here must not describe it.
+    #[test]
+    fn a_foreign_tid_is_not_served_under_this_process_s_task() {
+        let proc = a_process(9_100_010, "propio");
+        let _mine = Thread::create_linux(&proc).unwrap();
+        let other = a_process(9_100_011, "ajeno");
+        let alien = Thread::create_linux(&other).unwrap();
+        for kind in [ProcTidFileKind::Stat, ProcTidFileKind::Status] {
+            let inode = ProcTidFileINode {
+                pid: proc.id(),
+                tid: alien.id(),
+                kind,
+            };
+            let mut buf = [0u8; 64];
+            assert_eq!(
+                inode.read_at(0, &mut buf).map(|_| ()).unwrap_err(),
+                FsError::EntryNotFound
+            );
+        }
+        let comm = ProcTidCommINode {
+            pid: proc.id(),
+            tid: alien.id(),
+        };
+        assert_eq!(
+            comm.write_at(0, b"intruso").map(|_| ()).unwrap_err(),
+            FsError::EntryNotFound
+        );
+    }
+
+    #[test]
+    fn a_dead_process_has_no_task_directory_to_walk() {
+        let task = ProcPidTaskDirINode { pid: 9_100_777 };
+        let err = |r: Result<Arc<dyn INode>>| r.map(|_| ()).unwrap_err();
+        assert_eq!(
+            task.metadata().map(|_| ()).unwrap_err(),
+            FsError::EntryNotFound
+        );
+        assert_eq!(err(task.find("1")), FsError::EntryNotFound);
+        assert_eq!(err(task.find(".")), FsError::EntryNotFound);
+    }
+}
+
+#[cfg(test)]
+mod sys_fs_inotify_tests {
+    //! Every file watcher reads `/proc/sys/fs/inotify/max_user_watches`
+    //! before it decides how to watch. It was not there, so chromium logged
+    //! "Failed to read /proc/sys/fs/inotify/max_user_watches" once per
+    //! process.
+
+    use super::*;
+    use alloc::string::ToString;
+
+    fn read_all(inode: &Arc<dyn INode>) -> String {
+        let mut buf = [0u8; 64];
+        let n = inode.read_at(0, &mut buf).unwrap();
+        String::from_utf8(buf[..n].to_vec()).unwrap()
+    }
+
+    #[test]
+    fn sys_fs_lists_and_resolves_inotify() {
+        let fs = PROC_SYS_DIR.find("fs").unwrap();
+        let mut listed = Vec::new();
+        let mut id = 0;
+        while let Ok(name) = fs.get_entry(id) {
+            listed.push(name);
+            id += 1;
+        }
+        assert!(listed.contains(&"inotify".to_string()), "{:?}", listed);
+        let dir = fs.find("inotify").unwrap();
+        assert_eq!(dir.metadata().unwrap().type_, FileType::Dir);
+        // A directory that holds one subdirectory more than `fs` reported
+        // stops `find`/`du` descending into it (`2 + subdirs`).
+        assert_eq!(fs.metadata().unwrap().nlinks, 3);
+    }
+
+    #[test]
+    fn the_three_limits_are_there_and_parse_as_numbers() {
+        let dir = PROC_SYS_DIR.find("fs").unwrap().find("inotify").unwrap();
+        let mut listed = Vec::new();
+        let mut id = 0;
+        while let Ok(name) = dir.get_entry(id) {
+            listed.push(name);
+            id += 1;
+        }
+        assert_eq!(
+            listed,
+            alloc::vec![
+                ".",
+                "..",
+                "max_user_watches",
+                "max_user_instances",
+                "max_queued_events"
+            ]
+        );
+        for name in [
+            "max_user_watches",
+            "max_user_instances",
+            "max_queued_events",
+        ] {
+            let text = read_all(&dir.find(name).unwrap());
+            // One number and a newline is the whole sysctl format; a reader
+            // that `atoi`s it must not find anything else.
+            assert!(text.ends_with('\n'), "{}: {:?}", name, text);
+            let value: u64 = text.trim_end().parse().unwrap();
+            assert!(value > 0, "{} vale {}", name, value);
+        }
+        assert_eq!(read_all(&dir.find("max_user_watches").unwrap()), "65536\n");
+        // And `..` climbs back to /proc/sys/fs.
+        assert_eq!(
+            dir.find("..").unwrap().metadata().unwrap().inode,
+            PROC_SYS_FS_DIR.metadata().unwrap().inode
+        );
     }
 }
