@@ -52,17 +52,45 @@ bitflags::bitflags! {
         /// a write returns once data AND metadata are on the disk.
         /// `O_SYNC` is `__O_SYNC | O_DSYNC` upstream, both bits together.
         const SYNC = (1 << 20) | (1 << 12);
+        /// `O_PATH`: open the FILE ITSELF, not its contents. The descriptor
+        /// names a place in the tree and nothing more -- it is neither
+        /// readable nor writable -- and what it is for is `fstat`, `fchdir`
+        /// and standing in as the `dirfd` of an `*at` call.
+        ///
+        /// It is also what `ps` opens: procps-ng's `look_up_our_self`
+        /// (`library/readproc.c`) does
+        /// `open("/proc/self", O_PATH|O_DIRECTORY)` and, when that fails,
+        /// prints "Error, do this: mount -t proc proc /proc" and `_exit(47)`.
+        /// Refusing the flag therefore took down every procps tool -- `ps`,
+        /// `top`, `free`, `vmstat`, `w`, `uptime`, `pgrep`, `pkill` -- with a
+        /// message about a filesystem that was mounted all along.
+        const PATH = 1 << 21;
     }
 }
 
 impl OpenFlags {
+    /// `O_PATH`: the descriptor names a place in the tree, not an open file.
+    pub fn is_path(self) -> bool {
+        self.contains(Self::PATH)
+    }
     /// check if the OpenFlags is readable
+    ///
+    /// Never under `O_PATH`, whatever the access mode says. `O_RDONLY` is
+    /// `0`, so an `O_PATH` open that named no mode at all would otherwise
+    /// read as readable, and `read(2)` on such a descriptor is `EBADF` --
+    /// which every reader here already answers off this one question.
     pub fn readable(self) -> bool {
+        if self.is_path() {
+            return false;
+        }
         let b = self.bits() & 0b11;
         b == Self::RDONLY.bits() || b == Self::RDWR.bits()
     }
     /// check if the OpenFlags is writable
     pub fn writable(self) -> bool {
+        if self.is_path() {
+            return false;
+        }
         let b = self.bits() & 0b11;
         b == Self::WRONLY.bits() || b == Self::RDWR.bits()
     }
