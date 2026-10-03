@@ -1110,8 +1110,23 @@ cfg_if! {
                         // freed. Dump the allocating call chain a few times as each
                         // suspect class climbs, so the leaking site can be symbolized
                         // from the printed return addresses. Fires at most 3x/class.
-                        let hunt = matches!(size, 8 | 96)
-                            && matches!(live, 100_000 | 400_000 | 800_000);
+                        //
+                        // 512 B joined them from an OOM report taken on hardware:
+                        // `512B x 131156 (~64 MiB)`, the largest exact class on the
+                        // screen, against a heap that then could not find 4 MiB. No
+                        // call site in the tree allocates exactly 512 bytes often
+                        // enough to explain 131k live blocks, and nothing bounded
+                        // holds that many (the console's scrollback caps at 1000
+                        // lines per VT, and there are 7 VTs), so it is either a leak
+                        // or a cache with no ceiling -- and either way the only way
+                        // to name it is to catch it allocating. Thresholds are set
+                        // below what the report showed so the dump lands before the
+                        // heap is gone.
+                        let hunt = match size {
+                            8 | 96 => matches!(live, 100_000 | 400_000 | 800_000),
+                            512 => matches!(live, 20_000 | 60_000 | 120_000),
+                            _ => false,
+                        };
                         if (size == 4096 && (live == 50_000 || live == 90_000)) || hunt {
                             leak_trace_dump(size, live);
                         }
