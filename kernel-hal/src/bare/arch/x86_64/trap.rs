@@ -993,28 +993,9 @@ pub extern "C" fn trap_handler(tf: &mut TrapFrame) {
             }
             // x86 CPU exception — translate the vector to a readable name so
             // the panic message is immediately actionable without a debugger.
-            let name = match vec {
-                0 => "Divide Error (#DE)",
-                1 => "Debug (#DB)",
-                2 => "NMI",
-                3 => "Breakpoint (#BP)",
-                4 => "Overflow (#OF)",
-                5 => "Bound Range Exceeded (#BR)",
-                6 => "Invalid Opcode (#UD)",
-                7 => "Device Not Available / No Math Coprocessor (#NM)",
-                8 => "Double Fault (#DF)",
-                9 => "Coprocessor Segment Overrun",
-                10 => "Invalid TSS (#TS)",
-                11 => "Segment Not Present (#NP)",
-                12 => "Stack Segment Fault (#SS)",
-                13 => "General Protection Fault (#GP)",
-                14 => "Page Fault (#PF via GernelFault — should not happen)",
-                16 => "x87 FPU Floating-Point Error (#MF)",
-                17 => "Alignment Check (#AC)",
-                18 => "Machine Check (#MC)",
-                19 => "SIMD Floating-Point Exception (#XF)",
-                _ => "Unknown CPU exception",
-            };
+            // The table lives in `context` because the panic handler needs the
+            // same name for the summary it prints after the backtrace.
+            let name = crate::context::x86_vector_name(vec);
             // Stash the faulting frame BEFORE panicking. A #DF (and #GP) runs
             // on its own IST stack, so by the time `oops` looks at the current
             // SP it can no longer tell which coroutine stack actually faulted.
@@ -1068,11 +1049,18 @@ pub extern "C" fn trap_handler(tf: &mut TrapFrame) {
                 }
             }
             crate::kstats::note_fault_regs(tf.rip as u64, tf.rbp as u64, fault_sp as u64);
-            // The two lines after the frame are deliberately last: the header
-            // above scrolls off a 25-line console long before anyone can
-            // photograph it, and the frame alone carries neither a symbol for
-            // `rip` nor any reading of `error_code`. Repeating both at the tail
-            // makes the bottom of the screen enough to start a diagnosis.
+            // The two lines after the frame are deliberately last *in the
+            // message*: the header above scrolls off a 25-line console long
+            // before anyone can photograph it, and the frame alone carries
+            // neither a symbol for `rip` nor any reading of `error_code`.
+            //
+            // The message is not the end of the output, though — the panic
+            // handler prints up to 32 backtrace lines after it, and the early
+            // framebuffer console clears the screen instead of scrolling when
+            // it fills, so a deep backtrace takes the message off the glass
+            // with it. This arms the same summary for the handler to print
+            // once more *after* the backtrace, where nothing follows it.
+            crate::kstats::note_exception(vec, tf.error_code, tf.rip as u64);
             panic!(
                 "\nCPU EXCEPTION on CPU{}: {} (vec={:#x})\n\
                  error_code={:#x}\n{:#x?}\n\
@@ -1092,8 +1080,9 @@ pub extern "C" fn trap_handler(tf: &mut TrapFrame) {
         }
         TrapReason::UndefinedInstruction => {
             report_ud_shape(tf.rip as u64);
-            // Symbol repeated after the frame for the same reason as the
-            // GernelFault arm above: the header scrolls off the console.
+            // Symbol repeated after the frame, and armed for after the
+            // backtrace, for the same reasons as the GernelFault arm above.
+            crate::kstats::note_exception(6, tf.error_code, tf.rip as u64);
             panic!(
                 "\nCPU EXCEPTION on CPU{}: Invalid Opcode (#UD) at RIP={}\n{:#x?}\n\
                  Invalid Opcode (#UD) at rip={}",

@@ -49,14 +49,51 @@ pub enum TrapReason {
 #[cfg(not(feature = "libos"))]
 pub const TIMER_INTERRUPT_VEC: usize = crate::timer_interrupt_vector();
 
+/// The name of an x86 exception vector.
+///
+/// Lives here rather than in the x86 trap handler because the panic handler
+/// needs it too: the one-line summary it prints after the backtrace is built
+/// from the vector alone, with no trap frame in reach. Not gated on the
+/// architecture, for the same reason the error-code reading below is not.
+pub fn x86_vector_name(vec: usize) -> &'static str {
+    match vec {
+        0 => "Divide Error (#DE)",
+        1 => "Debug (#DB)",
+        2 => "NMI",
+        3 => "Breakpoint (#BP)",
+        4 => "Overflow (#OF)",
+        5 => "Bound Range Exceeded (#BR)",
+        6 => "Invalid Opcode (#UD)",
+        7 => "Device Not Available / No Math Coprocessor (#NM)",
+        8 => "Double Fault (#DF)",
+        9 => "Coprocessor Segment Overrun",
+        10 => "Invalid TSS (#TS)",
+        11 => "Segment Not Present (#NP)",
+        12 => "Stack Segment Fault (#SS)",
+        13 => "General Protection Fault (#GP)",
+        14 => "Page Fault (#PF via GernelFault — should not happen)",
+        16 => "x87 FPU Floating-Point Error (#MF)",
+        17 => "Alignment Check (#AC)",
+        18 => "Machine Check (#MC)",
+        19 => "SIMD Floating-Point Exception (#XF)",
+        _ => "Unknown CPU exception",
+    }
+}
+
 /// The error code an x86 fault pushed, rendered as what it means.
 ///
 /// `{:#x?}` of the trap frame prints `error_code: 0x0` and stops there, which
 /// is the least useful thing it could say. On #TS, #NP, #SS and #GP a
-/// *non-zero* code names the descriptor that was refused, and a *zero* one
-/// says the fault had nothing to do with a selector at all — which rules out
-/// half the causes of a #GP before anyone opens a disassembler. Both readings
-/// were left to whoever was staring at a photo of the screen.
+/// *non-zero* code names the descriptor that was refused, which is most of the
+/// diagnosis. Both readings were left to whoever was staring at a photo of the
+/// screen.
+///
+/// Zero is weaker than it looks, and is worded as such: it means the CPU named
+/// no descriptor, NOT that no descriptor was involved. A null selector has
+/// nothing to name, so an `iretq` whose saved CS was overwritten with zero
+/// also raises #GP(0) — with a perfectly canonical return address. That is a
+/// live shape in this tree (an overwritten kernel return frame), so it is
+/// listed as a cause rather than excluded.
 ///
 /// Not gated on the architecture: these are the numbers the Intel manual
 /// assigns (volume 3, "Error Code"), so a host of any architecture can check
@@ -98,14 +135,20 @@ impl fmt::Display for X86TrapErrorCode {
         }
         match self.vec {
             13 => f.write_str(
-                "error_code 0 on a #GP means no descriptor was involved, so it is \
-                 none of the selector causes: look for a memory operand that is \
-                 not canonical, an SSE access that is not 16-byte aligned \
-                 (movaps/movdqa), RDMSR/WRMSR of a reserved MSR, a privileged \
-                 instruction executed outside ring 0, or an iret/sysret returning \
-                 to a non-canonical address",
+                "error_code 0 on a #GP names no descriptor, which is not the same \
+                 as none being involved: a NULL selector has nothing to name. So \
+                 look either at the selectors a return reloads (an iretq whose \
+                 saved CS or SS was overwritten with 0) or at the causes that are \
+                 not segmentation at all: a memory operand that is not canonical, \
+                 an SSE access that is not 16-byte aligned (movaps/movdqa), \
+                 RDMSR/WRMSR of a reserved MSR, a privileged instruction executed \
+                 outside ring 0, or an iret/sysret returning to a non-canonical \
+                 address",
             ),
-            10..=12 => f.write_str("error_code 0: no descriptor was involved"),
+            10..=12 => f.write_str(
+                "error_code 0 names no descriptor; a NULL selector has none to \
+                 name, so one is not ruled out",
+            ),
             8 | 14 | 17 | 21 | 29 | 30 => write!(f, "error_code {ec:#x}"),
             _ => f.write_str(
                 "this vector pushes no error code: the 0 above is the placeholder \
@@ -830,13 +873,33 @@ mod tests {
 
     /// The reading that would have saved a round trip on the #GP photographed
     /// on 2026-10-03: `error_code: 0x0` under vector 13 is not "no
-    /// information", it positively rules out every selector cause.
+    /// information". It is also not "no descriptor was involved -- a NULL
+    /// selector has none to name, so an `iretq` onto an overwritten CS lands
+    /// here too, and saying otherwise would send the next reader away from a
+    /// shape this tree actually produces.
     #[test]
-    fn a_zero_error_code_on_a_gp_rules_out_the_selector_causes() {
+    fn a_zero_error_code_on_a_gp_names_no_descriptor_but_rules_none_out() {
         let s = hint(13, 0);
-        assert!(s.contains("no descriptor was involved"), "{}", s);
+        assert!(s.contains("names no descriptor"), "{}", s);
+        assert!(s.contains("NULL selector"), "{}", s);
+        assert!(s.contains("iretq"), "{}", s);
         assert!(s.contains("canonical"), "{}", s);
         assert!(s.contains("movaps"), "{}", s);
+        // The claim the CPU cannot support: that segmentation is excluded.
+        assert!(!s.contains("no descriptor was involved"), "{}", s);
+        let s = hint(11, 0);
+        assert!(s.contains("not ruled out"), "{}", s);
+    }
+
+    /// The panic handler builds its post-backtrace line from the vector alone,
+    /// so a vector that lost its name there would print "Unknown CPU
+    /// exception" over a fault the trap frame named perfectly well.
+    #[test]
+    fn the_vectors_a_panic_reports_keep_their_names() {
+        assert_eq!(x86_vector_name(6), "Invalid Opcode (#UD)");
+        assert_eq!(x86_vector_name(8), "Double Fault (#DF)");
+        assert_eq!(x86_vector_name(13), "General Protection Fault (#GP)");
+        assert_eq!(x86_vector_name(0x10e), "Unknown CPU exception");
     }
 
     #[test]
