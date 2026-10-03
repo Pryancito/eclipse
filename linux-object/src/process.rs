@@ -5221,6 +5221,27 @@ pub fn current_process_pid_name() -> (u64, String) {
     (0, String::from("kernel"))
 }
 
+/// The calling process's `struct ucred` -- pid, EFFECTIVE uid, EFFECTIVE gid.
+///
+/// This is what Linux stamps onto a message at SEND time (`scm_send`), and the
+/// reason it has to be sampled there rather than read back later: by the time
+/// a receiver asks, the sender may be gone, may have changed its ids, or -- the
+/// case that matters -- may never have been the process that created the
+/// socket. chromium's zygote passes an inherited `socketpair` end to a forked
+/// child, and it is the CHILD's pid the browser is waiting to read.
+///
+/// `None` when no user thread is on this CPU, i.e. when the kernel itself is
+/// the writer: there is no process to speak for, and the caller leaves the
+/// message unstamped rather than inventing pid 0.
+pub fn current_ucred() -> Option<(i32, u32, u32)> {
+    let arc = kernel_hal::thread::get_current_thread()?;
+    let thread = arc.downcast::<Thread>().ok()?;
+    let proc = thread.proc();
+    let lp = proc.try_linux()?;
+    let c = lp.credentials();
+    Some((proc.id() as i32, c.euid, c.egid))
+}
+
 /// A process name for the `[signal]`/`[wait]` traces that never blocks.
 ///
 /// These traces run from arbitrary contexts, including INSIDE the object

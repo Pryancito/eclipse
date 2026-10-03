@@ -2561,12 +2561,63 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
               \x20 /usr/share/dbus-1/system.conf 2>/dev/null | head -n 1)\n\
               USE_DAEMON=yes\n\
               if [ -n \"$WANT\" ] && ! grep -q \"^$WANT:\" /etc/passwd 2>/dev/null; then\n\
+              \x20 # Create it here rather than only complaining. The image\n\
+              \x20 # build lays this account down, but a rootfs built before\n\
+              \x20 # that did not, and the cost of being wrong is a boot with\n\
+              \x20 # no system bus at all. uid/gid 81 is what Alpine reserves.\n\
+              \x20 #\n\
+              \x20 # Both numbers and both names have to be free, or already\n\
+              \x20 # this account\x27s, before either file is touched: handing dbus\n\
+              \x20 # a gid that belongs to some other group would hand it that\n\
+              \x20 # group\x27s files, and writing a passwd line whose gid has no\n\
+              \x20 # group, or a group whose gid does not match, is worse than\n\
+              \x20 # no account at all. On any conflict we touch nothing and\n\
+              \x20 # fall back.\n\
+              \x20 UID_FREE=no\n\
+              \x20 grep -q \"^[^:]*:[^:]*:81:\" /etc/passwd 2>/dev/null || UID_FREE=yes\n\
+              \x20 GID_OK=no\n\
+              \x20 ADD_GROUP=no\n\
+              \x20 if grep -q \"^$WANT:[^:]*:81:\" /etc/group 2>/dev/null; then\n\
+              \x20 \x20 # The group is already there and already 81: reuse it.\n\
+              \x20 \x20 GID_OK=yes\n\
+              \x20 elif ! grep -q \"^$WANT:\" /etc/group 2>/dev/null \\\n\
+              \x20 \x20 \x20 && ! grep -q \"^[^:]*:[^:]*:81:\" /etc/group 2>/dev/null; then\n\
+              \x20 \x20 GID_OK=yes\n\
+              \x20 \x20 ADD_GROUP=yes\n\
+              \x20 fi\n\
+              \x20 WRITE=no\n\
+              \x20 if [ \"$UID_FREE\" = yes ] && [ \"$GID_OK\" = yes ] && [ -w /etc/passwd ]; then\n\
+              \x20 \x20 WRITE=yes\n\
+              \x20 \x20 if [ \"$ADD_GROUP\" = yes ] && [ ! -w /etc/group ]; then\n\
+              \x20 \x20 \x20 WRITE=no\n\
+              \x20 \x20 fi\n\
+              \x20 fi\n\
+              \x20 if [ \"$WRITE\" = yes ]; then\n\
+              \x20 \x20 # Group first, so there is never a passwd line whose gid\n\
+              \x20 \x20 # has no group behind it.\n\
+              \x20 \x20 if [ \"$ADD_GROUP\" = yes ]; then\n\
+              \x20 \x20 \x20 echo \"$WANT:x:81:\" >> /etc/group\n\
+              \x20 \x20 fi\n\
+              \x20 \x20 echo \"$WANT:x:81:81:dbus:/dev/null:/sbin/nologin\" >> /etc/passwd\n\
+              \x20 \x20 echo \"eclipse-dbus-system: added the missing user \x27$WANT\x27 (81:81)\" \\\n\
+              \x20 \x20 \x20 > /dev/console 2>/dev/null || true\n\
+              \x20 fi\n\
+              fi\n\
+              if [ -n \"$WANT\" ] && ! grep -q \"^$WANT:\" /etc/passwd 2>/dev/null; then\n\
               \x20 M=\"eclipse-dbus-system: system.conf wants user \x27$WANT\x27 and\n\
               /etc/passwd has no such line, so dbus-daemon --system would exit 1\n\
               on every start; using eclipse-dbusd instead\"\n\
               \x20 echo \"$M\" > /dev/console 2>/dev/null || true\n\
               \x20 echo \"$M\" >&2\n\
               \x20 USE_DAEMON=no\n\
+              fi\n\
+              # Whatever dbus-daemon says on its way out has to reach the\n\
+              # CONSOLE, because that is the only thing anybody reads during a\n\
+              # boot: the service log lives in /tmp, so the first version of\n\
+              # this service restarted for ever without a word about why. The\n\
+              # exec below inherits this, and stdout still goes to the log.\n\
+              if [ -w /dev/console ]; then\n\
+              \x20 exec 2>/dev/console\n\
               fi\n\
               # Alpine's dbus-daemon first: --system brings the real policy\n\
               # from /usr/share/dbus-1/system.conf, which is what decides who\n\
