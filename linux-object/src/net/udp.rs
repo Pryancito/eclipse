@@ -639,6 +639,19 @@ impl FileLike for UdpSocketState {
         Socket::ioctl(self, request, arg1, arg2, arg3)
     }
 
+    /// `FIONREAD`/`SIOCINQ`: size of the next datagram (0 if none). Without
+    /// this the ioctl fell through to ENOTTY, same as TCP before it answered.
+    fn readable_bytes(&self) -> Option<usize> {
+        let handle = self.inner.lock().handle.0;
+        let sockets = get_sockets();
+        let mut set = sockets.lock();
+        let n = match set.get::<UdpSocket>(handle).peek() {
+            Ok((payload, _)) => payload.len(),
+            Err(_) => 0,
+        };
+        Some(n)
+    }
+
     fn as_socket(&self) -> LxResult<&dyn Socket> {
         Ok(self)
     }
@@ -971,5 +984,13 @@ mod tests {
             async_std::task::block_on(Socket::accept(&s)),
             Err(LxError::EOPNOTSUPP)
         ));
+    }
+
+    /// Idle UDP must answer `FIONREAD` with 0, not fall through to ENOTTY.
+    #[test]
+    fn an_idle_udp_socket_reports_zero_bytes_readable() {
+        let _g = LOCK.lock();
+        let s = sock();
+        assert_eq!(FileLike::readable_bytes(&s), Some(0));
     }
 }

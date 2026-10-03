@@ -773,7 +773,14 @@ impl Socket for UnixSocketState {
     // -----------------------------------------------------------------------
     fn bind(&self, endpoint: Endpoint) -> SysResult {
         if let Endpoint::Unix(path) = endpoint {
-            self.inner.lock().path = path;
+            // `unix_bind`: already bound (`u->addr`) is `EINVAL`. Without the
+            // check a second bind overwrote `path` and left the old registry
+            // entry orphaned (or raced a second `register`).
+            let mut inner = self.inner.lock();
+            if !inner.path.is_empty() {
+                return Err(LxError::EINVAL);
+            }
+            inner.path = path;
             Ok(0)
         } else {
             Err(LxError::EINVAL)
@@ -784,21 +791,50 @@ impl Socket for UnixSocketState {
     // listen — mark socket as passive
     // -----------------------------------------------------------------------
     fn listen(&self) -> SysResult {
+        // `unix_listen`: only STREAM/SEQPACKET; DGRAM is `EOPNOTSUPP`.
+        // Without the type check, `socket(AF_UNIX, SOCK_DGRAM); bind;
+        // listen` succeeded and produced a "listener" nothing can accept
+        // on (datagram sockets have no accept queue).
+        let mut inner = self.inner.lock();
+        match inner.sock_type {
+            SocketType::SOCK_STREAM | SocketType::SOCK_SEQPACKET => {}
+            _ => return Err(LxError::EOPNOTSUPP),
+        }
         // `unix_listen`: no local address (`!u->addr`) is `EINVAL`. Without
         // the check, `socket(); listen()` succeeded and produced a listener
         // nothing can connect to (no path in the bind table).
-        let mut inner = self.inner.lock();
         if inner.path.is_empty() {
+            return Err(LxError::EINVAL);
+        }
+        // Connected (or already has a peer) is not `TCP_CLOSE`/`TCP_LISTEN`.
+        if inner.connected || inner.peer.is_some() {
             return Err(LxError::EINVAL);
         }
         inner.is_listening = true;
         Ok(0)
     }
 
+    fn is_listening(&self) -> bool {
+        UnixSocketState::is_listening(self)
+    }
+
     // -----------------------------------------------------------------------
     // accept — dequeue a pending connection and return connected pair
     // -----------------------------------------------------------------------
     async fn accept(&self) -> LxResult<(Arc<dyn FileLike>, Endpoint)> {
+        // `unix_accept`: DGRAM has no accept (`EOPNOTSUPP`); not listening is
+        // `EINVAL` before waiting. Without the checks, `accept` on a
+        // fresh/connected/datagram socket blocked (or `EAGAIN`ed) forever.
+        {
+            let inner = self.inner.lock();
+            match inner.sock_type {
+                SocketType::SOCK_STREAM | SocketType::SOCK_SEQPACKET => {}
+                _ => return Err(LxError::EOPNOTSUPP),
+            }
+            if !inner.is_listening {
+                return Err(LxError::EINVAL);
+            }
+        }
         loop {
             let mut inner = self.inner.lock();
             if let Some(server_side) = inner.accept_queue.pop_front() {
@@ -878,12 +914,10 @@ impl Socket for UnixSocketState {
     }
 
     fn endpoint(&self) -> Option<Endpoint> {
-        let path = self.inner.lock().path.clone();
-        if !path.is_empty() {
-            Some(Endpoint::Unix(path))
-        } else {
-            None
-        }
+        // Unbound / unnamed AF_UNIX still has a local address: just
+        // `AF_UNIX` with empty `sun_path` (`unix_getname`). Returning
+        // `None` made `getsockname` fail with `EINVAL`.
+        Some(Endpoint::Unix(self.inner.lock().path.clone()))
     }
 
     fn remote_endpoint(&self) -> Option<Endpoint> {
@@ -1129,6 +1163,16 @@ mod tests {
     use super::*;
     use alloc::string::String;
 
+    /// `SIOCINQ`/`FIONREAD` on a listening socket is `EINVAL`.
+    #[test]
+    fn a_listening_socket_reports_is_listening() {
+        let s = UnixSocketState::new();
+        assert!(!Socket::is_listening(&*s));
+        Socket::bind(&*s, Endpoint::Unix(String::from("/tmp/inq.sock"))).unwrap();
+        Socket::listen(&*s).unwrap();
+        assert!(Socket::is_listening(&*s));
+    }
+
     /// FIOASYNC / F_SETFL(O_ASYNC) used to "succeed" on sockets while the
     /// hand-rolled `set_flags` never copied the bit — same silent lie as
     /// the missing ASYNC in take_settable before that was fixed.
@@ -1148,6 +1192,23 @@ mod tests {
         assert!(!s.flags().contains(OpenFlags::ASYNC));
     }
 
+    /// `listen` / `accept` on `SOCK_DGRAM` is `EOPNOTSUPP` (`unix_listen` /
+    /// `unix_accept`). They used to succeed (listen) or hang (accept).
+    #[test]
+    fn listen_and_accept_refuse_datagram() {
+        let s = UnixSocketState::new();
+        s.set_socket_type(SocketType::SOCK_DGRAM);
+        Socket::bind(&*s, Endpoint::Unix(String::from("/tmp/dgram.sock"))).unwrap();
+        assert_eq!(Socket::listen(&*s), Err(LxError::EOPNOTSUPP));
+    }
+
+    #[async_std::test]
+    async fn accept_on_datagram_is_eopnotsupp() {
+        let s = UnixSocketState::new();
+        s.set_socket_type(SocketType::SOCK_DGRAM);
+        assert_eq!(Socket::accept(&*s).await.err(), Some(LxError::EOPNOTSUPP));
+    }
+
     /// `listen` without `bind` must be `EINVAL` (`unix_listen`: no local
     /// address). It used to mark the socket listening with an empty path.
     #[test]
@@ -1157,6 +1218,58 @@ mod tests {
         Socket::bind(&*s, Endpoint::Unix(String::from("/tmp/listen.sock"))).unwrap();
         assert!(Socket::listen(&*s).is_ok());
         assert!(s.is_listening());
+    }
+
+    /// Unbound `getsockname` must succeed with an empty path (`unix_getname`
+    /// returns just `AF_UNIX`). `endpoint()` used to yield `None` → `EINVAL`.
+    #[test]
+    fn unbound_endpoint_is_empty_unix_not_none() {
+        let s = UnixSocketState::new();
+        match s.endpoint() {
+            Some(Endpoint::Unix(p)) => assert!(p.is_empty(), "unnamed: empty path"),
+            other => panic!("expected Some(Unix(\"\")), got {:?}", other),
+        }
+        Socket::bind(&*s, Endpoint::Unix(String::from("/tmp/named.sock"))).unwrap();
+        match s.endpoint() {
+            Some(Endpoint::Unix(p)) => assert_eq!(p, "/tmp/named.sock"),
+            other => panic!("expected Some(Unix(/tmp/named.sock)), got {:?}", other),
+        }
+    }
+
+    /// `SO_TYPE` must report what `socket`/`socketpair` asked for. The default
+    /// is STREAM; DGRAM/SEQPACKET survive `set_socket_type`.
+    #[test]
+    fn socket_type_reports_what_was_asked_for() {
+        let s = UnixSocketState::new();
+        assert_eq!(Socket::socket_type(&*s), Some(SocketType::SOCK_STREAM));
+        s.set_socket_type(SocketType::SOCK_DGRAM);
+        assert_eq!(Socket::socket_type(&*s), Some(SocketType::SOCK_DGRAM));
+        s.set_socket_type(SocketType::SOCK_SEQPACKET);
+        assert_eq!(Socket::socket_type(&*s), Some(SocketType::SOCK_SEQPACKET));
+    }
+
+    /// A second `bind` on an already-bound socket is `EINVAL` (`unix_bind`).
+    /// It used to overwrite the path and leave the first registry entry.
+    #[test]
+    fn binding_twice_is_einval() {
+        let s = UnixSocketState::new();
+        Socket::bind(&*s, Endpoint::Unix(String::from("/tmp/once.sock"))).unwrap();
+        assert_eq!(
+            Socket::bind(&*s, Endpoint::Unix(String::from("/tmp/twice.sock"))),
+            Err(LxError::EINVAL)
+        );
+        assert_eq!(s.bound_path(), "/tmp/once.sock");
+    }
+
+    /// `accept` on a socket that never listened is `EINVAL`. It used to
+    /// wait (or `EAGAIN`) as if a queue existed.
+    #[async_std::test]
+    async fn accept_without_listen_is_einval() {
+        let s = UnixSocketState::new();
+        assert_eq!(Socket::accept(&*s).await.err(), Some(LxError::EINVAL));
+        Socket::bind(&*s, Endpoint::Unix(String::from("/tmp/accept.sock"))).unwrap();
+        // Bound but not listening is still EINVAL.
+        assert_eq!(Socket::accept(&*s).await.err(), Some(LxError::EINVAL));
     }
 
     /// A second `connect` on an already-wired or listening socket is

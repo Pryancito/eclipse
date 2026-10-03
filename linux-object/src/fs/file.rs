@@ -926,8 +926,25 @@ impl File {
         &self.path
     }
 
+    /// True for a `pipe2` pipe or a FIFO node — not seekable / not
+    /// `pread`/`pwrite`-able (`ESPIPE`).
+    fn is_pipe_or_fifo(&self) -> bool {
+        let inner = self.inner.read();
+        inner.inode.downcast_ref::<super::pipe::Pipe>().is_some()
+            || matches!(
+                inner.inode.metadata(),
+                Ok(m) if m.type_ == FileType::NamedPipe
+            )
+    }
+
     /// seek from given type and offset
     pub fn seek(&self, pos: SeekFrom) -> LxResult<u64> {
+        // Pipes and FIFOs are not seekable (`ESPIPE`); `fallocate` already
+        // refuses them the same way. Without this, `lseek(pipe_fd, 0, SEEK_SET)`
+        // "succeeds" and advances a phantom offset that nothing else uses.
+        if self.is_pipe_or_fifo() {
+            return Err(LxError::ESPIPE);
+        }
         let mut inner = self.inner.write();
         // Compute the new offset with checked arithmetic and reject results
         // that would be negative; otherwise a negative relative seek would wrap
@@ -1172,6 +1189,11 @@ impl FileLike for File {
     }
 
     async fn read_at(&self, offset: u64, buf: &mut [u8]) -> LxResult<usize> {
+        // `pread` on a pipe is `ESPIPE`, same as `lseek` (Linux `pipe_read`
+        // has no `FMODE_PREAD` path that succeeds).
+        if self.is_pipe_or_fifo() {
+            return Err(LxError::ESPIPE);
+        }
         let (flags, inode) = {
             let inner = self.inner.read();
             (inner.flags, inner.inode.clone())
@@ -1212,6 +1234,10 @@ impl FileLike for File {
     }
 
     fn write_at(&self, offset: u64, buf: &[u8]) -> LxResult<usize> {
+        // `pwrite` on a pipe is `ESPIPE`, same as `lseek`/`pread`.
+        if self.is_pipe_or_fifo() {
+            return Err(LxError::ESPIPE);
+        }
         let mut inner = self.inner.write();
         let r = inner.write_at(offset, buf);
         if matches!(r, Err(LxError::ENOSPC)) {
@@ -1370,8 +1396,15 @@ impl FileLike for File {
     /// It fell through to the inode's `io_control`, which knows no ioctl, so
     /// the answer was ENOTTY: bash's `read -t 0` (`input_avail`), which asks
     /// this first, took a redirected file for a terminal with nothing typed.
+    ///
+    /// A pipe answers the same way Linux `pipe_ioctl` does: the shared
+    /// buffer's occupancy (either end). Without this, `FIONREAD` on a pipe
+    /// also fell through to ENOTTY.
     fn readable_bytes(&self) -> Option<usize> {
         let inner = self.inner.read();
+        if let Some(pipe) = inner.inode.downcast_ref::<super::pipe::Pipe>() {
+            return Some(pipe.buffered_len());
+        }
         let metadata = inner.inode.metadata().ok()?;
         regular_file_readable_bytes(metadata.type_, metadata.size, inner.offset)
     }
@@ -1581,6 +1614,63 @@ mod fionread_tests {
         assert_eq!(FileLike::readable_bytes(&*file), Some(0));
         let dir = File::new(root, OpenFlags::RDONLY, String::from("/"));
         assert_eq!(FileLike::readable_bytes(&*dir), None);
+    }
+
+    /// `FIONREAD` on a pipe must report buffer occupancy, not fall through
+    /// to ENOTTY via a missing `metadata`/`io_control`.
+    #[test]
+    fn a_pipe_reports_how_many_bytes_are_queued() {
+        let (r, w) = crate::fs::Pipe::create_pair();
+        let reader = File::new(Arc::new(r), OpenFlags::RDONLY, String::from("pipe:[r]"));
+        let writer = File::new(Arc::new(w), OpenFlags::WRONLY, String::from("pipe:[w]"));
+        assert_eq!(FileLike::readable_bytes(&*reader), Some(0));
+        assert_eq!(FileLike::readable_bytes(&*writer), Some(0));
+        writer.write(&[1, 2, 3, 4, 5]).unwrap();
+        assert_eq!(FileLike::readable_bytes(&*reader), Some(5));
+        assert_eq!(
+            FileLike::readable_bytes(&*writer),
+            Some(5),
+            "Linux reports the same occupancy on either end"
+        );
+    }
+}
+
+#[cfg(test)]
+mod pipe_seek_tests {
+    use super::*;
+
+    /// `lseek` on a pipe must be `ESPIPE`, not a silent success.
+    #[test]
+    fn seeking_a_pipe_is_espipe() {
+        let (r, w) = crate::fs::Pipe::create_pair();
+        let reader = File::new(Arc::new(r), OpenFlags::RDONLY, String::from("pipe:[r]"));
+        let _writer = File::new(Arc::new(w), OpenFlags::WRONLY, String::from("pipe:[w]"));
+        assert_eq!(
+            FileLike::seek(&*reader, SeekFrom::Start(0)),
+            Err(LxError::ESPIPE)
+        );
+        assert_eq!(
+            FileLike::seek(&*reader, SeekFrom::Current(0)),
+            Err(LxError::ESPIPE)
+        );
+    }
+
+    /// `pread`/`pwrite` on a pipe must be `ESPIPE` too (same as Linux).
+    #[test]
+    fn positioned_io_on_a_pipe_is_espipe() {
+        use async_std::task::block_on;
+        let (r, w) = crate::fs::Pipe::create_pair();
+        let reader = File::new(Arc::new(r), OpenFlags::RDONLY, String::from("pipe:[r]"));
+        let writer = File::new(Arc::new(w), OpenFlags::WRONLY, String::from("pipe:[w]"));
+        let mut buf = [0u8; 4];
+        assert_eq!(
+            block_on(FileLike::read_at(&*reader, 0, &mut buf)),
+            Err(LxError::ESPIPE)
+        );
+        assert_eq!(
+            FileLike::write_at(&*writer, 0, &[1, 2, 3, 4]),
+            Err(LxError::ESPIPE)
+        );
     }
 }
 

@@ -638,12 +638,18 @@ numeric_enum! {
     pub enum SolOptname {
         /// reuseaddr
         REUSEADDR = 2,
+        /// `SO_TYPE`: the `SOCK_*` this socket was created with (sans CLOEXEC/NONBLOCK).
+        TYPE = 3,
         /// error
         ERROR = 4,
+        /// `SO_BROADCAST` — allow datagrams to the broadcast address.
+        BROADCAST = 6,
         /// sndbuf
         SNDBUF = 7,  // 获取发送缓冲区长度
         /// rcvbuf
         RCVBUF = 8,  // 获取接收缓冲区长度
+        /// `SO_KEEPALIVE` — periodic probes on idle TCP connections.
+        KEEPALIVE = 9,
         /// linger
         LINGER = 13,
     }
@@ -654,6 +660,8 @@ numeric_enum! {
     #[derive(Debug, PartialEq, Eq, Clone, Copy)]
     /// Generic musl socket optname.
     pub enum TcpOptname {
+        /// TCP_NODELAY — disable Nagle
+        NODELAY = 1,
         /// congestion
         CONGESTION = 13,
     }
@@ -2193,7 +2201,12 @@ pub trait Socket: Send + Sync + Debug + downcast_rs::DowncastSync {
     }
     /// missing documentation
     fn listen(&self) -> SysResult {
-        Err(LxError::EINVAL)
+        Err(LxError::EOPNOTSUPP)
+    }
+    /// Whether this socket is a passive listener (`SIOCINQ`/`FIONREAD` is
+    /// `EINVAL` on one, per unix(7) / tcp(7)).
+    fn is_listening(&self) -> bool {
+        false
     }
     /// missing documentation
     fn shutdown(&self, _howto: usize) -> SysResult {
@@ -2201,7 +2214,7 @@ pub trait Socket: Send + Sync + Debug + downcast_rs::DowncastSync {
     }
     /// missing documentation
     async fn accept(&self) -> LxResult<(Arc<dyn FileLike>, Endpoint)> {
-        Err(LxError::EINVAL)
+        Err(LxError::EOPNOTSUPP)
     }
     /// missing documentation
     fn endpoint(&self) -> Option<Endpoint> {
@@ -2275,6 +2288,20 @@ pub trait Socket: Send + Sync + Debug + downcast_rs::DowncastSync {
     /// `getsockopt(SO_ERROR)`: return and clear the pending socket error (0 if none).
     fn take_so_error(&self) -> i32 {
         0
+    }
+    /// `getsockopt(SO_REUSEADDR)`: current flag. Default false (Linux default);
+    /// TCP overrides with the value `setsockopt` stored.
+    fn so_reuseaddr(&self) -> bool {
+        false
+    }
+    /// `getsockopt(IP_HDRINCL)`: whether the caller supplies the IPv4 header.
+    /// Default false; raw AF_INET overrides.
+    fn ip_hdrincl(&self) -> bool {
+        false
+    }
+    /// `getsockopt(TCP_NODELAY)`: Nagle disabled. Default false; TCP overrides.
+    fn tcp_nodelay(&self) -> bool {
+        false
     }
     /// Flags for the last `recv`/`recvmsg` (e.g. `MSG_TRUNC`); cleared on take.
     fn take_msg_flags(&self) -> i32 {

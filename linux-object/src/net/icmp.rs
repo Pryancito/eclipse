@@ -12,7 +12,8 @@ use lock::Mutex;
 use smoltcp::phy::ChecksumCapabilities;
 use smoltcp::socket::{IcmpEndpoint, IcmpPacketMetadata, IcmpSocket, IcmpSocketBuffer};
 use smoltcp::wire::{
-    Icmpv4Packet, Icmpv4Repr, Icmpv6Packet, Icmpv6Repr, IpAddress, IpEndpoint, Ipv6Address,
+    Icmpv4Packet, Icmpv4Repr, Icmpv6Packet, Icmpv6Repr, IpAddress, IpEndpoint, Ipv4Address,
+    Ipv6Address,
 };
 
 #[allow(unused_imports)]
@@ -282,6 +283,15 @@ impl Socket for IcmpSocketState {
         Ok(0)
     }
 
+    /// `inet_shutdown` on a datagram ICMP socket: `ENOTCONN` without a peer.
+    fn shutdown(&self, howto: usize) -> SysResult {
+        let _ = shutdown_sides(howto)?;
+        if self.inner.lock().remote.is_none() {
+            return Err(LxError::ENOTCONN);
+        }
+        Ok(0)
+    }
+
     fn setsockopt(&self, _level: usize, _opt: usize, _data: &[u8]) -> SysResult {
         Ok(0)
     }
@@ -292,6 +302,24 @@ impl Socket for IcmpSocketState {
 
     fn socket_type(&self) -> Option<SocketType> {
         Some(SocketType::SOCK_DGRAM)
+    }
+
+    /// Unspecified local: ICMP datagram sockets do not bind a port the way
+    /// UDP does; without this, `getsockname` was always `EINVAL`.
+    fn endpoint(&self) -> Option<Endpoint> {
+        let ipv6 = self.inner.lock().ipv6;
+        let addr = if ipv6 {
+            IpAddress::Ipv6(Ipv6Address::UNSPECIFIED)
+        } else {
+            IpAddress::Ipv4(Ipv4Address::UNSPECIFIED)
+        };
+        Some(Endpoint::Ip(IpEndpoint { addr, port: 0 }))
+    }
+
+    /// Peer from `connect`; without this, `getpeername` after connect was
+    /// `ENOTCONN`.
+    fn remote_endpoint(&self) -> Option<Endpoint> {
+        self.inner.lock().remote.map(Endpoint::Ip)
     }
 
     fn poll(&self, _events: PollEvents) -> (bool, bool, bool) {
@@ -394,5 +422,40 @@ impl FileLike for IcmpSocketState {
 
     fn as_socket(&self) -> LxResult<&dyn Socket> {
         Ok(self)
+    }
+}
+
+#[cfg(test)]
+mod endpoint_tests {
+    use super::*;
+    use async_std::task::block_on;
+    use smoltcp::wire::Ipv4Address;
+
+    #[test]
+    fn getsockname_on_icmp_is_unspecified_not_einval() {
+        let s = IcmpSocketState::new(false).unwrap();
+        let ep = Socket::endpoint(&s).expect("local name");
+        match ep {
+            Endpoint::Ip(ip) => {
+                assert!(ip.addr.is_unspecified());
+                assert_eq!(ip.port, 0);
+            }
+            other => panic!("expected Ip, got {:?}", other),
+        }
+        assert!(Socket::remote_endpoint(&s).is_none());
+    }
+
+    #[test]
+    fn getpeername_after_connect_sees_the_peer() {
+        let s = IcmpSocketState::new(false).unwrap();
+        let peer = IpEndpoint::new(IpAddress::Ipv4(Ipv4Address::new(8, 8, 8, 8)), 0);
+        block_on(Socket::connect(&s, Endpoint::Ip(peer))).unwrap();
+        match Socket::remote_endpoint(&s) {
+            Some(Endpoint::Ip(ip)) => {
+                assert_eq!(ip.addr, peer.addr);
+                assert_eq!(ip.port, peer.port);
+            }
+            other => panic!("expected peer {:?}, got {:?}", peer, other),
+        }
     }
 }

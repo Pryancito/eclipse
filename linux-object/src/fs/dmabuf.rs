@@ -107,16 +107,18 @@ impl FileLike for DmaBuf {
         Ok(())
     }
 
+    // Linux `dma_buf_fops` can have read/write for CPU access; without that
+    // path here, vfs-style "unsupported on this fd" is `-EINVAL`, not `-ENOSYS`.
     async fn read(&self, _buf: &mut [u8]) -> LxResult<usize> {
-        Err(LxError::ENOSYS)
+        Err(LxError::EINVAL)
     }
 
     fn write(&self, _buf: &[u8]) -> LxResult<usize> {
-        Err(LxError::ENOSYS)
+        Err(LxError::EINVAL)
     }
 
     async fn read_at(&self, _offset: u64, _buf: &mut [u8]) -> LxResult<usize> {
-        Err(LxError::ENOSYS)
+        Err(LxError::EINVAL)
     }
 
     /// Mesa's software dma-buf import (`kms_sw_displaytarget_from_handle`) sizes
@@ -165,6 +167,19 @@ impl FileLike for DmaBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `read`/`write` on a dma-buf fd must be `-EINVAL`, not `-ENOSYS`, when
+    /// CPU access is not implemented here.
+    #[test]
+    fn read_write_on_dmabuf_are_einval_not_enosys() {
+        use async_std::task::block_on;
+        let vmo = VmObject::new_paged(1);
+        let fd = DmaBuf::new(0, 4096, vmo);
+        let mut buf = [0u8; 8];
+        assert_eq!(block_on(fd.read(&mut buf)), Err(LxError::EINVAL));
+        assert_eq!(fd.write(&[0u8; 8]), Err(LxError::EINVAL));
+        assert_eq!(block_on(fd.read_at(0, &mut buf)), Err(LxError::EINVAL));
+    }
 
     /// `fcntl(F_SETFL, O_NONBLOCK)` on a dma-buf fd used to return success
     /// while `F_GETFL` stayed forever at the hardcoded RDWR|CLOEXEC.
