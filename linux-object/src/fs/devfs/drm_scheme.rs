@@ -15481,6 +15481,13 @@ mod wsi_display_probe_tests {
             {
                 continue; // libdrm's `goto retry`
             }
+            // libdrm copies out only as many ids as the FILL pass reported
+            // (`drmAllocCpy(ptr, res.count_x, ...)`), so a count that SHRANK
+            // between the passes leaves the tail of the probe-sized buffer
+            // untouched -- and a helper that returned it whole would hand the
+            // caller trailing zeros and probe connector 0.
+            crtcs.truncate(res.count_crtcs as usize);
+            conns.truncate(res.count_connectors as usize);
             return Some((crtcs, conns, res.count_encoders));
         }
         None
@@ -15514,6 +15521,7 @@ mod wsi_display_probe_tests {
             {
                 continue;
             }
+            props.truncate(conn.count_props as usize);
             return Some((conn.connection, conn.count_modes, props));
         }
         None
@@ -15551,16 +15559,32 @@ mod wsi_display_probe_tests {
         );
     }
 
-    /// THE BUG. `software_kms_active()` is live state -- the NVIDIA driver's
-    /// `has_hardware_kms()` is `surfaceflip_enabled() && hwflip_ready()`, and
-    /// `hwflip_ready()` latches during bring-up -- and the connector lookup
-    /// used to ask it before deciding whether a DRIVER id was answerable at
-    /// all. So a client that read the topology while the driver owned scanout
-    /// got driver connector ids, and then had every one of them refused with
-    /// EINVAL the moment the driver gave scanout back. That is exactly the
-    /// window `vulkaninfo` lands in, and Mesa reports a miss on an advertised
-    /// id as `VK_ERROR_OUT_OF_HOST_MEMORY` for the whole `VK_KHR_display`
-    /// query -- the error in the photo.
+    /// The invariant: an id GETRESOURCES advertised stays answerable even if
+    /// scanout ownership changes before the client's next ioctl.
+    ///
+    /// The lookups used to ask `software_kms_active()` before deciding whether
+    /// a DRIVER id was answerable AT ALL, and the fallback behind that gate
+    /// only knows the synthetic ids (1..4). So a client that read the topology
+    /// with the driver owning scanout got driver ids, and the moment the
+    /// answer flipped, every one of them came back EINVAL. Mesa's
+    /// `wsi_get_connectors` reports a miss on an advertised id as
+    /// `VK_ERROR_OUT_OF_HOST_MEMORY` for the whole `VK_KHR_display` query.
+    ///
+    /// On the flip's DIRECTION, because it matters for what this does and does
+    /// not claim: in production `software_kms_active()` is
+    /// `primary_display().is_some() && !drivers.first().has_hardware_kms()`,
+    /// and the NVIDIA driver's `has_hardware_kms()` is
+    /// `surfaceflip_enabled() && hwflip_ready()`. `g_hwflip.ready` is only
+    /// ever assigned `NV_TRUE` and never cleared
+    /// (`nvidia-rm-sys/vendor/eclipse_rm_init.c`), so THAT lever moves
+    /// `software_kms_active()` true -> false only, which is the harmless
+    /// direction: the synthetic fallback still answers the synthetic ids. The
+    /// levers that can move it the other way are the boot framebuffer
+    /// appearing and `register_driver` putting a different driver at index 0,
+    /// both of which are boot-time events here. So this is a latent hole, not
+    /// a proven cause of anything; the emulator moves the KMS flag because it
+    /// is the one lever it has, and the code under test reads nothing but
+    /// `software_kms_active()`.
     #[test]
     fn a_connector_stays_answerable_when_scanout_moves_mid_probe() {
         let screen = kms_emu::attach(640, 480);

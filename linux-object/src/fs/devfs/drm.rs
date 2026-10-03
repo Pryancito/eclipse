@@ -7313,6 +7313,12 @@ pub fn get_plane(id: u32) -> Option<DrmPlane> {
         }
         return None;
     }
+    // No framebuffer display, no synthetic plane -- `get_connector` and
+    // `get_crtc` gate their synthetic objects on `display_mode()` for the same
+    // reason. Without it a headless primary node would report zero planes from
+    // GETPLANERESOURCES and still answer GETPLANE(4), which is a topology no
+    // client can reconcile.
+    display_mode()?;
     Some(DrmPlane {
         id: SYNTH_PLANE_ID,
         crtc_id: SYNTH_CRTC_ID,
