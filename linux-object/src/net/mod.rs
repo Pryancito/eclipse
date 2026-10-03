@@ -652,6 +652,14 @@ numeric_enum! {
         KEEPALIVE = 9,
         /// linger
         LINGER = 13,
+        /// `SO_REUSEPORT` — allow multiple binds on the same port.
+        REUSEPORT = 15,
+        /// `SO_RCVTIMEO` — receive timeout (`struct timeval`).
+        RCVTIMEO = 20,
+        /// `SO_SNDTIMEO` — send timeout (`struct timeval`).
+        SNDTIMEO = 21,
+        /// `SO_ACCEPTCONN` — nonzero while the socket is a passive listener.
+        ACCEPTCONN = 30,
     }
 }
 
@@ -662,6 +670,12 @@ numeric_enum! {
     pub enum TcpOptname {
         /// TCP_NODELAY — disable Nagle
         NODELAY = 1,
+        /// TCP_KEEPIDLE — idle seconds before the first keepalive probe
+        KEEPIDLE = 4,
+        /// TCP_KEEPINTVL — seconds between keepalive probes
+        KEEPINTVL = 5,
+        /// TCP_KEEPCNT — number of unacked probes before giving up
+        KEEPCNT = 6,
         /// congestion
         CONGESTION = 13,
     }
@@ -672,8 +686,18 @@ numeric_enum! {
     #[derive(Debug, PartialEq, Eq, Clone, Copy)]
     /// Generic musl socket optname.
     pub enum IpOptname {
+        /// IP_TOS — type of service
+        TOS = 1,
+        /// IP_TTL — unicast hop limit
+        TTL = 2,
         /// hdrincl
         HDRINCL = 3,
+        /// IP_MULTICAST_IF — outbound multicast interface
+        MulticastIf = 32,
+        /// IP_MULTICAST_TTL — multicast hop limit
+        MulticastTtl = 33,
+        /// IP_MULTICAST_LOOP — loopback multicast locally
+        MulticastLoop = 35,
     }
 }
 
@@ -2234,7 +2258,9 @@ pub trait Socket: Send + Sync + Debug + downcast_rs::DowncastSync {
     /// hands an opened DRM/input device to a Wayland compositor and how clients
     /// pass shm/dmabuf buffers back.
     fn send_fds(&self, _fds: alloc::vec::Vec<Arc<dyn FileLike>>) -> SysResult {
-        Err(LxError::ENOSYS)
+        // `ENOSYS` told callers the *syscall* was missing; Linux answers
+        // `EOPNOTSUPP` for SCM_RIGHTS on a non-unix socket.
+        Err(LxError::EOPNOTSUPP)
     }
     /// Take up to `_max` file descriptors the peer attached via `SCM_RIGHTS`.
     fn recv_fds(&self, _max: usize) -> alloc::vec::Vec<Arc<dyn FileLike>> {
@@ -2250,10 +2276,30 @@ pub trait Socket: Send + Sync + Debug + downcast_rs::DowncastSync {
     /// only note a genuinely unknown option, instead of crying "unimplemented"
     /// on every ordinary `SO_*`/`TCP_*` call (which was a red herring while
     /// debugging download failures). The data path is unchanged.
-    fn setsockopt(&self, level: usize, opt: usize, _data: &[u8]) -> SysResult {
+    fn setsockopt(&self, level: usize, opt: usize, data: &[u8]) -> SysResult {
         const SOL_SOCKET: usize = 1;
         const IPPROTO_IP: usize = 0;
         const IPPROTO_TCP: usize = 6;
+        const IP_HDRINCL: usize = 3;
+        // Read-only SOL_SOCKET options — Linux rejects set with ENOPROTOOPT.
+        if level == SOL_SOCKET && matches!(opt, 3 | 4 | 30) {
+            // SO_TYPE / SO_ERROR / SO_ACCEPTCONN
+            return Err(LxError::ENOPROTOOPT);
+        }
+        // `do_tcp_setsockopt` is TCP-only; other families must not swallow TCP_*.
+        if level == IPPROTO_TCP && !self.is_tcp() {
+            return Err(LxError::ENOPROTOOPT);
+        }
+        // `do_ip_setsockopt` is inet-only; IP_HDRINCL further needs SOCK_RAW IPv4.
+        if level == IPPROTO_IP {
+            if !self.is_inet() {
+                return Err(LxError::ENOPROTOOPT);
+            }
+            if opt == IP_HDRINCL && !self.is_raw_ipv4() {
+                return Err(LxError::ENOPROTOOPT);
+            }
+        }
+        check_setsockopt_len(level, opt, data)?;
         let known = match level {
             // SO_REUSEADDR, BROADCAST, SNDBUF, RCVBUF, KEEPALIVE, LINGER,
             // REUSEPORT, RCVTIMEO, SNDTIMEO — the usual setsockopt traffic.
@@ -2303,9 +2349,66 @@ pub trait Socket: Send + Sync + Debug + downcast_rs::DowncastSync {
     fn tcp_nodelay(&self) -> bool {
         false
     }
+    /// True only for real `IPPROTO_TCP` sockets (`TcpSocketState`).
+    /// `SOCK_STREAM` alone is not enough (AF_UNIX streams are not TCP).
+    fn is_tcp(&self) -> bool {
+        false
+    }
+    /// True for AF_INET / AF_INET6 sockets that speak `IPPROTO_IP` options
+    /// (TCP/UDP/ICMP/raw). AF_UNIX / netlink / AF_PACKET stay false.
+    fn is_inet(&self) -> bool {
+        false
+    }
+    /// True for `SOCK_RAW` IPv4 that may set/get `IP_HDRINCL`.
+    fn is_raw_ipv4(&self) -> bool {
+        false
+    }
     /// Flags for the last `recv`/`recvmsg` (e.g. `MSG_TRUNC`); cleared on take.
     fn take_msg_flags(&self) -> i32 {
         0
+    }
+}
+
+/// Minimum `optlen` for a known sockopt before we accept it as a no-op.
+///
+/// Linux rejects short buffers with `EINVAL` (`sock_setsockopt` /
+/// `do_tcp_setsockopt`); accepting 0–3 bytes for an `int` option used to
+/// succeed silently.
+pub(crate) fn check_setsockopt_len(level: usize, opt: usize, data: &[u8]) -> LxResult<()> {
+    const SOL_SOCKET: usize = 1;
+    const IPPROTO_IP: usize = 0;
+    const IPPROTO_TCP: usize = 6;
+    let need = match (level, opt) {
+        (SOL_SOCKET, 13) => 8,              // struct linger
+        (SOL_SOCKET, 20 | 21) => 16,        // struct timeval
+        (SOL_SOCKET, 2 | 6 | 7 | 8 | 9 | 15) => 4, // int options
+        (IPPROTO_TCP, 1 | 4 | 5 | 6) => 4,  // int TCP_* (not CONGESTION)
+        (IPPROTO_IP, 1 | 2 | 3 | 32 | 33 | 35) => 4,
+        _ => 0,
+    };
+    if need > 0 && data.len() < need {
+        return Err(LxError::EINVAL);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod setsockopt_len_tests {
+    use super::check_setsockopt_len;
+    use crate::error::LxError;
+
+    #[test]
+    fn a_short_int_optlen_is_einval() {
+        // SO_KEEPALIVE = 9; used to succeed with an empty buffer.
+        assert_eq!(check_setsockopt_len(1, 9, &[]), Err(LxError::EINVAL));
+        assert_eq!(check_setsockopt_len(1, 9, &[1]), Err(LxError::EINVAL));
+        assert_eq!(check_setsockopt_len(1, 9, &1u32.to_ne_bytes()), Ok(()));
+        // TCP_KEEPIDLE = 4
+        assert_eq!(check_setsockopt_len(6, 4, &[1, 0]), Err(LxError::EINVAL));
+        assert_eq!(check_setsockopt_len(6, 4, &7200u32.to_ne_bytes()), Ok(()));
+        // timeval needs 16
+        assert_eq!(check_setsockopt_len(1, 20, &[0u8; 8]), Err(LxError::EINVAL));
+        assert_eq!(check_setsockopt_len(1, 20, &[0u8; 16]), Ok(()));
     }
 }
 

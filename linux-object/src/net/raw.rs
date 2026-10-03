@@ -26,6 +26,12 @@ struct RawSocketInner {
     flags: Mutex<OpenFlags>,
     remote: Mutex<Option<Endpoint>>,
     ipv6: bool,
+    /// Last recvmsg flags (`MSG_TRUNC`, …); cleared by [`Socket::take_msg_flags`].
+    last_msg_flags: Mutex<i32>,
+    /// `shutdown(SHUT_RD)`: empty queue reads as EOF.
+    read_closed: Mutex<bool>,
+    /// `shutdown(SHUT_WR)`: with `read_closed`, poll reports hangup.
+    write_closed: Mutex<bool>,
 }
 
 impl RawSocketState {
@@ -59,8 +65,19 @@ impl RawSocketState {
                 flags: Mutex::new(OpenFlags::RDWR),
                 remote: Mutex::new(None),
                 ipv6,
+                last_msg_flags: Mutex::new(0),
+                read_closed: Mutex::new(false),
+                write_closed: Mutex::new(false),
             }),
         })
+    }
+
+    fn hangup(&self) -> bool {
+        *self.inner.read_closed.lock() && *self.inner.write_closed.lock()
+    }
+
+    fn note_truncation(&self, full_len: usize, copied: usize) {
+        *self.inner.last_msg_flags.lock() = if full_len > copied { 0x20 } else { 0 };
     }
 
     /// `raw_send_hdrinc`: with `IP_HDRINCL` the caller supplies the IPv4
@@ -131,7 +148,9 @@ impl Socket for RawSocketState {
                     proto
                 };
                 if proto == IpProtocol::Icmp {
-                    if let Some((n, src)) = super::icmp_rx::pop_ipv4_raw_reply(remote, data) {
+                    if let Some((n, full, src)) = super::icmp_rx::pop_ipv4_raw_reply(remote, data)
+                    {
+                        self.note_truncation(full, n);
                         return (Ok(n), Endpoint::Ip(IpEndpoint::new(src, 0)));
                     }
                     // RxToken also enqueues the same frame on smoltcp RawSocket; drop it
@@ -141,8 +160,11 @@ impl Socket for RawSocketState {
                         let mut sockets = net_sockets.lock();
                         let mut socket = sockets.get::<RawSocket>(self.inner.handle.0);
                         if socket.can_recv() {
-                            let _ = socket.recv_slice(data);
+                            let _ = socket.recv();
                         }
+                    }
+                    if *self.inner.read_closed.lock() {
+                        return (Ok(0), Endpoint::Ip(IpEndpoint::UNSPECIFIED));
                     }
                     let non_block = self.inner.flags.lock().contains(OpenFlags::NON_BLOCK);
                     if non_block {
@@ -159,39 +181,47 @@ impl Socket for RawSocketState {
             let mut sockets = net_sockets.lock();
             let mut socket = sockets.get::<RawSocket>(self.inner.handle.0);
             if socket.can_recv() {
-                if let Ok(size) = socket.recv_slice(data) {
+                // Use recv() so we know the full datagram length for MSG_TRUNC.
+                // Parse from `buffer` (full packet) before dropping the socket.
+                if let Ok(buffer) = socket.recv() {
+                    let full = buffer.len();
+                    let size = data.len().min(full);
+                    data[..size].copy_from_slice(&buffer[..size]);
+                    let parsed = if self.inner.ipv6 {
+                        Ipv6Packet::new_checked(buffer).map(|p| {
+                            let src = IpAddress::Ipv6(p.src_addr());
+                            let payload_full = full.saturating_sub(40);
+                            let payload_copy = size.saturating_sub(40);
+                            if payload_copy > 0 {
+                                data.copy_within(40..size, 0);
+                            }
+                            (payload_copy, payload_full, src)
+                        })
+                    } else {
+                        Ipv4Packet::new_checked(buffer).map(|p| {
+                            (size, full, IpAddress::Ipv4(p.src_addr()))
+                        })
+                    };
                     drop(socket);
                     drop(sockets);
-                    if self.inner.ipv6 {
-                        if let Ok(packet) = Ipv6Packet::new_checked(&data[..size]) {
-                            let src_addr = packet.src_addr();
-                            let payload_len = size.saturating_sub(40);
-                            data.copy_within(40..size, 0);
-                            return (
-                                Ok(payload_len),
-                                Endpoint::Ip(IpEndpoint {
-                                    addr: IpAddress::Ipv6(src_addr),
-                                    port: 0,
-                                }),
-                            );
+                    return match parsed {
+                        Ok((copied, full_len, addr)) => {
+                            self.note_truncation(full_len, copied);
+                            (
+                                Ok(copied),
+                                Endpoint::Ip(IpEndpoint { addr, port: 0 }),
+                            )
                         }
-                    } else {
-                        if let Ok(packet) = Ipv4Packet::new_checked(&data[..size]) {
-                            return (
-                                Ok(size),
-                                Endpoint::Ip(IpEndpoint {
-                                    addr: IpAddress::Ipv4(packet.src_addr()),
-                                    port: 0,
-                                }),
-                            );
-                        }
-                    }
-                    return (Err(LxError::EINVAL), Endpoint::Ip(IpEndpoint::UNSPECIFIED));
+                        Err(_) => (Err(LxError::EINVAL), Endpoint::Ip(IpEndpoint::UNSPECIFIED)),
+                    };
                 }
             }
-            let non_block = self.inner.flags.lock().contains(OpenFlags::NON_BLOCK);
             drop(socket);
             drop(sockets);
+            if *self.inner.read_closed.lock() {
+                return (Ok(0), Endpoint::Ip(IpEndpoint::UNSPECIFIED));
+            }
+            let non_block = self.inner.flags.lock().contains(OpenFlags::NON_BLOCK);
             if non_block {
                 return (Err(LxError::EAGAIN), Endpoint::Ip(IpEndpoint::UNSPECIFIED));
             }
@@ -346,9 +376,12 @@ impl Socket for RawSocketState {
         Ok(0)
     }
 
-    /// `inet_shutdown` on a raw IP socket: `ENOTCONN` without a peer.
+    /// `inet_shutdown` on a raw IP socket: record sides (like UDP/ICMP),
+    /// `ENOTCONN` without a peer.
     fn shutdown(&self, howto: usize) -> SysResult {
-        let _ = shutdown_sides(howto)?;
+        let (rd, wr) = shutdown_sides(howto)?;
+        *self.inner.read_closed.lock() |= rd;
+        *self.inner.write_closed.lock() |= wr;
         if self.inner.remote.lock().is_none() {
             return Err(LxError::ENOTCONN);
         }
@@ -356,6 +389,12 @@ impl Socket for RawSocketState {
     }
 
     fn setsockopt(&self, level: usize, opt: usize, data: &[u8]) -> SysResult {
+        const SOL_SOCKET: usize = 1;
+        const IPPROTO_TCP: usize = 6;
+        // Same read-only SOL_SOCKET gate as the trait default / TCP / UDP.
+        if level == SOL_SOCKET && matches!(opt, 3 | 4 | 30) {
+            return Err(LxError::ENOPROTOOPT);
+        }
         if let (IPPROTO_IP, IP_HDRINCL) = (level, opt) {
             // `IP_HDRINCL` is an AF_INET option; on an AF_INET6 socket Linux
             // answers ENOPROTOOPT. Accepting it here put the raw bytes of an
@@ -382,7 +421,12 @@ impl Socket for RawSocketState {
             };
             *self.inner.header_included.lock() = on;
             debug!("hdrincl set to {}", *self.inner.header_included.lock());
+            return Ok(0);
         }
+        if level == IPPROTO_TCP {
+            return Err(LxError::ENOPROTOOPT);
+        }
+        crate::net::check_setsockopt_len(level, opt, data)?;
         Ok(0)
     }
     fn get_buffer_capacity(&self) -> Option<(usize, usize)> {
@@ -410,6 +454,18 @@ impl Socket for RawSocketState {
         Some(SocketType::SOCK_RAW)
     }
 
+    fn is_inet(&self) -> bool {
+        true
+    }
+
+    fn is_raw_ipv4(&self) -> bool {
+        !self.inner.ipv6
+    }
+
+    fn take_msg_flags(&self) -> i32 {
+        core::mem::replace(&mut *self.inner.last_msg_flags.lock(), 0)
+    }
+
     fn ip_hdrincl(&self) -> bool {
         *self.inner.header_included.lock()
     }
@@ -422,7 +478,8 @@ impl Socket for RawSocketState {
         let readable = socket.can_recv()
             || (!self.inner.ipv6
                 && socket.ip_protocol() == IpProtocol::Icmp
-                && super::icmp_rx::pending_for(false));
+                && super::icmp_rx::pending_for(false))
+            || *self.inner.read_closed.lock();
         (readable, socket.can_send(), false)
     }
 }
@@ -467,7 +524,7 @@ impl FileLike for RawSocketState {
             read,
             write,
             error,
-            hangup: false,
+            hangup: self.hangup(),
         })
     }
 
@@ -477,12 +534,33 @@ impl FileLike for RawSocketState {
             read,
             write,
             error,
-            hangup: false,
+            hangup: self.hangup(),
         })
     }
 
     fn ioctl(&self, request: usize, arg1: usize, arg2: usize, arg3: usize) -> LxResult<usize> {
         handle_net_ioctl(request, arg1, arg2, arg3, self.inner.ipv6)
+    }
+
+    /// `FIONREAD`/`SIOCINQ`: bytes waiting (0 if none). Without this the ioctl
+    /// fell through to ENOTTY. smoltcp raw has no public peek, so a queued
+    /// packet reports 1 until it is read.
+    fn readable_bytes(&self) -> Option<usize> {
+        let handle = self.inner.handle.0;
+        let sockets = get_sockets();
+        let mut set = sockets.lock();
+        let socket = set.get::<RawSocket>(handle);
+        let n = if socket.can_recv() {
+            1
+        } else if !self.inner.ipv6
+            && socket.ip_protocol() == IpProtocol::Icmp
+            && super::icmp_rx::pending_for(false)
+        {
+            super::icmp_rx::peek_len(false, None).unwrap_or(1)
+        } else {
+            0
+        };
+        Some(n)
     }
 
     fn as_socket(&self) -> LxResult<&dyn Socket> {
@@ -780,6 +858,15 @@ mod tests {
         );
     }
 
+    /// Idle raw must answer `FIONREAD` with 0, not fall through to ENOTTY.
+    #[test]
+    fn an_idle_raw_socket_reports_zero_bytes_readable() {
+        let _g = LOCK.lock();
+        let s = sock(false);
+        while super::super::icmp_rx::pop_for(false, None).is_some() {}
+        assert_eq!(FileLike::readable_bytes(&s), Some(0));
+    }
+
     /// `getsockopt(IP_HDRINCL)` must mirror what `setsockopt` stored.
     #[test]
     fn ip_hdrincl_defaults_off_and_follows_setsockopt() {
@@ -796,5 +883,57 @@ mod tests {
             Ok(0)
         );
         assert!(!Socket::ip_hdrincl(&s));
+    }
+
+    /// Read-only SOL_SOCKET opts must not be silent Ok(0) on raw.
+    #[test]
+    fn readonly_sol_socket_setsockopt_on_raw_is_enoprotoopt() {
+        let _g = LOCK.lock();
+        let s = sock(false);
+        assert_eq!(
+            Socket::setsockopt(&s, 1, 3, &0u32.to_ne_bytes()),
+            Err(LxError::ENOPROTOOPT)
+        );
+        assert_eq!(
+            Socket::setsockopt(&s, 1, 4, &0u32.to_ne_bytes()),
+            Err(LxError::ENOPROTOOPT)
+        );
+        assert_eq!(
+            Socket::setsockopt(&s, 1, 30, &0u32.to_ne_bytes()),
+            Err(LxError::ENOPROTOOPT)
+        );
+    }
+
+    /// Truncation must surface as `MSG_TRUNC` (0x20) via `take_msg_flags`.
+    /// (Full RX needs a routed IPv4 address; the flag path is what recvmsg reads.)
+    #[test]
+    fn note_truncation_sets_msg_trunc_for_recvmsg() {
+        let _g = LOCK.lock();
+        let s = sock(false);
+        s.note_truncation(64, 16);
+        assert_eq!(Socket::take_msg_flags(&s), 0x20, "MSG_TRUNC");
+        s.note_truncation(16, 16);
+        assert_eq!(Socket::take_msg_flags(&s), 0, "full copy clears the flag");
+    }
+
+    /// After `shutdown(SHUT_RD)`, an empty raw socket reads EOF (like UDP/ICMP).
+    #[test]
+    fn shutdown_rd_makes_an_empty_raw_socket_read_eof() {
+        let _g = LOCK.lock();
+        while super::super::icmp_rx::pop_for(false, None).is_some() {}
+        let s = sock(false);
+        assert_eq!(
+            async_std::task::block_on(Socket::connect(&s, lo())),
+            Ok(0)
+        );
+        assert_eq!(Socket::shutdown(&s, 0), Ok(0));
+        let mut buf = [0u8; 8];
+        assert_eq!(
+            async_std::task::block_on(Socket::read(&s, &mut buf)).0,
+            Ok(0)
+        );
+        assert!(!FileLike::poll(&s, PollEvents::IN).unwrap().hangup);
+        assert_eq!(Socket::shutdown(&s, 1), Ok(0));
+        assert!(FileLike::poll(&s, PollEvents::IN).unwrap().hangup);
     }
 }

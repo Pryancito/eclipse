@@ -931,10 +931,6 @@ impl Socket for UnixSocketState {
         Some(Endpoint::Unix(path))
     }
 
-    fn setsockopt(&self, _level: usize, _opt: usize, _data: &[u8]) -> SysResult {
-        Ok(0)
-    }
-
     fn peer_pid(&self) -> Option<i32> {
         // The connected peer's `owner_pid` — i.e. the process on the other end.
         // Release our own lock before taking the peer's to avoid holding both.

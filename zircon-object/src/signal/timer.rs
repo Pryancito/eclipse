@@ -15,6 +15,8 @@ pub struct Timer {
     _counter: CountHelper,
     #[allow(dead_code)]
     slack: Slack,
+    /// `ZX_CLOCK_MONOTONIC` (0) or `ZX_CLOCK_BOOT` (1) from `zx_timer_create`.
+    clock_id: u32,
     inner: Mutex<TimerInner>,
 }
 
@@ -80,12 +82,18 @@ impl Timer {
         Self::with_slack(Slack::Center)
     }
 
-    /// Create a new `Timer` with slack.
+    /// Create a new `Timer` with slack (monotonic clock).
     pub fn with_slack(slack: Slack) -> Arc<Self> {
+        Self::with_slack_clock(slack, 0)
+    }
+
+    /// Create a new `Timer` with slack and the create-time `clock_id`.
+    pub fn with_slack_clock(slack: Slack, clock_id: u32) -> Arc<Self> {
         Arc::new(Timer {
             base: KObjectBase::default(),
             _counter: CountHelper::new(),
             slack,
+            clock_id,
             inner: Mutex::default(),
         })
     }
@@ -145,11 +153,12 @@ impl Timer {
         self.base.signal_clear(Signal::SIGNALED);
     }
 
-    /// Return the creation options, next deadline, and slack for ZX_INFO_TIMER.
-    pub fn get_info(&self) -> (u32, u64, u64) {
+    /// Return (options, clock_id, deadline, slack) for `ZX_INFO_TIMER`.
+    pub fn get_info(&self) -> (u32, u32, u64, u64) {
         let inner = self.inner.lock();
         (
             self.slack as u32,
+            self.clock_id,
             inner
                 .deadline
                 .map(|value| value.as_nanos() as u64)
@@ -327,11 +336,8 @@ mod tests {
         assert!(!has_arrived(Duration::MAX, Duration::ZERO));
     }
 
-    /// `ZX_INFO_TIMER` is three fields and the file had no test that read any
-    /// of them: the creation-time slack **mode**, the deadline in
-    /// **nanoseconds**, and the slack of the pending `set`, also in
-    /// nanoseconds. Five mutations of this passed green, including handing
-    /// back the mode where the slack goes and the slack where the mode goes.
+    /// `ZX_INFO_TIMER` fields: creation-time slack **mode**, `clock_id`,
+    /// deadline in **nanoseconds**, and the slack of the pending `set`.
     #[test]
     fn the_three_fields_of_the_timer_info_are_the_mode_the_deadline_and_the_slack() {
         // The mode is the one the timer was created with, and it is the raw
@@ -349,6 +355,11 @@ mod tests {
             Slack::Center as u32,
             "a timer created without a mode is not centred"
         );
+        assert_eq!(
+            Timer::with_slack_clock(Slack::Center, 1).get_info().1,
+            1,
+            "boot clock_id must round-trip through get_info"
+        );
 
         // The deadline and the slack are the two of the pending `set`, both in
         // nanoseconds, and each in its own field.
@@ -357,7 +368,8 @@ mod tests {
         let slack = Duration::from_millis(7);
         timer.set(deadline, slack);
 
-        let (mode, reported_deadline, reported_slack) = timer.get_info();
+        let (mode, clock_id, reported_deadline, reported_slack) = timer.get_info();
+        assert_eq!(clock_id, 0, "default create clock is monotonic");
         assert_eq!(mode, Slack::Late as u32);
         assert_eq!(
             reported_deadline,
@@ -370,8 +382,8 @@ mod tests {
         );
 
         // `one_shot` asks for no slack at all, which is not the same as asking
-        // for the deadline's worth of it.
-        assert_eq!(Timer::one_shot(timer_now() + FAR).get_info().2, 0);
+        // for the deadline's worth of it. (index 3 = pending slack)
+        assert_eq!(Timer::one_shot(timer_now() + FAR).get_info().3, 0);
     }
 
     /// A timer that has fired holds no deadline any more, and `cancel` leaves
@@ -380,14 +392,15 @@ mod tests {
     #[test]
     fn a_timer_that_is_done_reports_no_deadline_left() {
         let timer = Timer::new();
-        assert_eq!(timer.get_info().1, 0, "a fresh timer has nothing pending");
+        // get_info: (mode, clock_id, deadline, slack)
+        assert_eq!(timer.get_info().2, 0, "a fresh timer has nothing pending");
 
         // Cancelled.
         timer.set(timer_now() + FAR, Duration::from_millis(3));
-        assert_ne!(timer.get_info().1, 0);
+        assert_ne!(timer.get_info().2, 0);
         timer.cancel();
-        assert_eq!(timer.get_info().1, 0, "a cancelled deadline is still there");
-        assert_eq!(timer.get_info().2, 0, "and its slack with it");
+        assert_eq!(timer.get_info().2, 0, "a cancelled deadline is still there");
+        assert_eq!(timer.get_info().3, 0, "and its slack with it");
 
         // Arrived, which is the half that goes through `touch` rather than
         // through `set` or `cancel`.
@@ -397,11 +410,11 @@ mod tests {
         );
         wait_signaled(&timer);
         assert_eq!(
-            timer.get_info().1,
+            timer.get_info().2,
             0,
             "the deadline survived the firing that consumed it"
         );
-        assert_eq!(timer.get_info().2, 0);
+        assert_eq!(timer.get_info().3, 0);
     }
 
     #[test]

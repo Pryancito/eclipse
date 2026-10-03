@@ -44,6 +44,8 @@ pub struct NetlinkSocketState {
     /// Type requested at `socket(2)` — `SO_TYPE` must report this, not a
     /// hardcoded `SOCK_RAW` (callers may open `SOCK_DGRAM`).
     sock_type: SocketType,
+    /// Last recvmsg flags (`MSG_TRUNC`, …); cleared by [`Socket::take_msg_flags`].
+    last_msg_flags: Mutex<i32>,
 }
 
 impl Default for NetlinkSocketState {
@@ -60,6 +62,7 @@ impl NetlinkSocketState {
             local_endpoint: Arc::new(Mutex::new(None)),
             flags: Arc::new(Mutex::new(OpenFlags::RDWR)),
             sock_type,
+            last_msg_flags: Mutex::new(0),
         }
     }
 
@@ -121,10 +124,11 @@ impl Socket for NetlinkSocketState {
                         data[..n].copy_from_slice(&msg[..n]);
                     }
                     // Netlink is a datagram protocol: a message larger than the
-                    // caller's buffer is truncated and its remainder DISCARDED
-                    // (Linux would set MSG_TRUNC). Do NOT re-queue `msg[n..]` as a
-                    // new message — a headerless fragment corrupts netlink framing
-                    // for the next reader and can be indexed out of bounds.
+                    // caller's buffer is truncated and its remainder DISCARDED.
+                    // Do NOT re-queue `msg[n..]` as a new message — a headerless
+                    // fragment corrupts netlink framing for the next reader.
+                    // Report MSG_TRUNC (0x20) so recvmsg callers see the cut.
+                    *self.last_msg_flags.lock() = if msg.len() > data.len() { 0x20 } else { 0 };
                     info!("[netlink] read hex: {:?}", &msg[..n]);
                     return (Ok(n), endpoint);
                 }
@@ -690,8 +694,8 @@ impl Socket for NetlinkSocketState {
         Some(self.sock_type)
     }
 
-    fn setsockopt(&self, _level: usize, _opt: usize, _data: &[u8]) -> SysResult {
-        Ok(0)
+    fn take_msg_flags(&self) -> i32 {
+        core::mem::replace(&mut *self.last_msg_flags.lock(), 0)
     }
 
     fn ioctl(&self, request: usize, arg1: usize, arg2: usize, arg3: usize) -> SysResult {
@@ -760,6 +764,17 @@ impl FileLike for NetlinkSocketState {
 
     fn ioctl(&self, request: usize, arg1: usize, arg2: usize, arg3: usize) -> LxResult<usize> {
         Socket::ioctl(self, request, arg1, arg2, arg3)
+    }
+
+    /// `FIONREAD`/`SIOCINQ`: size of the next queued netlink message (0 if empty).
+    fn readable_bytes(&self) -> Option<usize> {
+        Some(
+            self.data
+                .lock()
+                .first()
+                .map(|m| m.len())
+                .unwrap_or(0),
+        )
     }
 
     fn as_socket(&self) -> LxResult<&dyn Socket> {
@@ -1780,5 +1795,44 @@ mod netlink_tests {
             Socket::socket_type(&NetlinkSocketState::new(SocketType::SOCK_DGRAM)),
             Some(SocketType::SOCK_DGRAM)
         );
+    }
+
+    /// Idle netlink must answer `FIONREAD` with 0, not fall through to ENOTTY.
+    #[test]
+    fn an_idle_netlink_socket_reports_zero_bytes_readable() {
+        let nl = NetlinkSocketState::default();
+        assert_eq!(FileLike::readable_bytes(&nl), Some(0));
+    }
+
+    /// Netlink is not inet: `IPPROTO_IP` / `IPPROTO_TCP` must be ENOPROTOOPT.
+    #[test]
+    fn ip_and_tcp_sockopts_on_netlink_are_enoprotoopt() {
+        let nl = NetlinkSocketState::default();
+        assert!(!Socket::is_inet(&nl));
+        assert_eq!(
+            Socket::setsockopt(&nl, 0, 2, &64u32.to_ne_bytes()),
+            Err(LxError::ENOPROTOOPT)
+        );
+        assert_eq!(
+            Socket::setsockopt(&nl, 6, 1, &1u32.to_ne_bytes()),
+            Err(LxError::ENOPROTOOPT)
+        );
+    }
+
+    /// A short recv on a queued netlink message must set `MSG_TRUNC` (0x20).
+    #[async_std::test]
+    async fn a_short_netlink_read_reports_msg_trunc() {
+        let nl = NetlinkSocketState::new(SocketType::SOCK_RAW);
+        FileLike::set_flags(&nl, OpenFlags::RDWR | OpenFlags::NON_BLOCK).unwrap();
+        push_netlink_rx(&mut nl.data.lock(), alloc::vec![0u8; 64]);
+        let mut buf = [0u8; 16];
+        let (n, _) = Socket::read(&nl, &mut buf).await;
+        assert_eq!(n, Ok(16));
+        assert_eq!(Socket::take_msg_flags(&nl), 0x20, "MSG_TRUNC");
+        // A whole message is not truncated.
+        push_netlink_rx(&mut nl.data.lock(), alloc::vec![1u8; 8]);
+        let mut whole = [0u8; 32];
+        assert_eq!(Socket::read(&nl, &mut whole).await.0, Ok(8));
+        assert_eq!(Socket::take_msg_flags(&nl), 0);
     }
 }

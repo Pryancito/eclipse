@@ -41,6 +41,18 @@ pub struct UdpInner {
     /// `shutdown(SHUT_WR)`: recorded for `poll` (`SHUTDOWN_MASK` is a hangup);
     /// UDP sends are not refused by it on Linux either.
     write_closed: bool,
+    /// `SO_REUSEADDR`.
+    reuse_addr: bool,
+    /// Endpoint registered in `UDP_BIND_TABLE` (released on drop).
+    bound: Option<IpEndpoint>,
+}
+
+impl Drop for UdpInner {
+    fn drop(&mut self) {
+        if let Some(ep) = self.bound.take() {
+            crate::net::UDP_BIND_TABLE.release(ep);
+        }
+    }
 }
 
 /// `datagram_poll` from the three facts a smoltcp socket exposes.
@@ -77,34 +89,29 @@ fn send_error(e: smoltcp::Error) -> LxError {
     }
 }
 
-/// `udp_lib_lport_inuse` without `SO_REUSEADDR`: `want` collides with an
-/// open UDP socket on the same port when either side is bound to the
-/// wildcard address or both are bound to the same one. smoltcp itself lets
-/// any number of sockets bind one port and delivers each datagram to the
-/// first that matches, so a second daemon on a busy port used to bind fine
-/// and never hear anything.
-fn udp_port_taken(set: &SocketSet<'_>, want: IpEndpoint) -> bool {
-    set.iter().any(|socket| match socket {
-        smoltcp::socket::Socket::Udp(udp) if udp.is_open() => {
-            let bound = udp.endpoint();
-            bound.port == want.port
-                && (bound.addr.is_unspecified()
-                    || want.addr.is_unspecified()
-                    || bound.addr == want.addr)
-        }
-        _ => false,
-    })
+/// `udp_lib_lport_inuse`: `want` collides with a bound UDP socket on the same
+/// port when either side is the wildcard or both share an address — unless
+/// both ends set `SO_REUSEADDR`. smoltcp itself lets any number of sockets
+/// bind one port; without this check a second daemon bound fine and never
+/// heard anything.
+fn udp_port_taken(want: IpEndpoint, reuse_addr: bool) -> bool {
+    crate::net::UDP_BIND_TABLE
+        .snapshot()
+        .into_iter()
+        .any(|holder| {
+            endpoints_collide(holder.endpoint, want) && !(reuse_addr && holder.reuse_addr)
+        })
 }
 
 /// An ephemeral port no open UDP socket holds on `addr`, or `None` when the
 /// whole dynamic range is taken. `get_ephemeral_port` alone hands out the
 /// next number whatever is bound to it, so an autobind could land on a port
 /// a daemon had bound explicitly and the replies went to the daemon.
-fn free_ephemeral_port(set: &SocketSet<'_>, addr: IpAddress) -> Option<u16> {
+fn free_ephemeral_port(addr: IpAddress) -> Option<u16> {
     const RANGE: usize = 65535 - 49152;
     (0..RANGE)
         .map(|_| get_ephemeral_port())
-        .find(|&port| !udp_port_taken(set, IpEndpoint::new(addr, port)))
+        .find(|&port| !udp_port_taken(IpEndpoint::new(addr, port), false))
 }
 
 // Moved to mod.rs as public constants
@@ -138,6 +145,8 @@ impl UdpSocketState {
                 last_msg_flags: 0,
                 read_closed: false,
                 write_closed: false,
+                reuse_addr: false,
+                bound: None,
             })),
         })
     }
@@ -145,23 +154,28 @@ impl UdpSocketState {
     /// Give an unbound smoltcp socket a free ephemeral port on the family's
     /// wildcard address (`inet_autobind`); `EAGAIN` when none is free, as
     /// `udp_lib_get_port` reports it. A socket that already has a port is
-    /// left alone.
-    fn autobind(
-        set: &mut SocketSet<'_>,
-        handle: smoltcp::socket::SocketHandle,
-        ipv6: bool,
-    ) -> LxResult {
+    /// left alone. Registers the port in `UDP_BIND_TABLE`.
+    fn autobind(&self, set: &mut SocketSet<'_>) -> LxResult {
+        let (handle, ipv6, reuse_addr) = {
+            let inner = self.inner.lock();
+            if inner.bound.is_some() {
+                return Ok(());
+            }
+            (inner.handle.0, inner.ipv6, inner.reuse_addr)
+        };
         if set.get::<UdpSocket>(handle).is_open() {
             return Ok(());
         }
         let addr = Self::family_addr(ipv6);
-        let port = free_ephemeral_port(set, addr).ok_or(LxError::EAGAIN)?;
-        set.get::<UdpSocket>(handle)
-            .bind(IpEndpoint::new(addr, port))
-            .map_err(|e| {
-                warn!("udp autobind failed: {:?}", e);
-                LxError::EINVAL
-            })
+        let port = free_ephemeral_port(addr).ok_or(LxError::EAGAIN)?;
+        let ep = IpEndpoint::new(addr, port);
+        set.get::<UdpSocket>(handle).bind(ep).map_err(|e| {
+            warn!("udp autobind failed: {:?}", e);
+            LxError::EINVAL
+        })?;
+        crate::net::UDP_BIND_TABLE.insert(ep, reuse_addr);
+        self.inner.lock().bound = Some(ep);
+        Ok(())
     }
 
     fn family_addr(ipv6: bool) -> IpAddress {
@@ -352,28 +366,30 @@ impl Socket for UdpSocketState {
     /// write from buffer
     fn write(&self, data: &[u8], sendto_endpoint: Option<Endpoint>) -> SysResult {
         info!("udp write");
-        let inner = self.inner.lock();
-        let remote_endpoint = {
-            if let Some(Endpoint::Ip(ref endpoint)) = sendto_endpoint {
-                endpoint
-            } else if let Some(ref endpoint) = inner.remote_endpoint {
-                endpoint
-            } else {
-                return Err(LxError::ENOTCONN);
+        let (handle, remote_endpoint) = {
+            let inner = self.inner.lock();
+            let remote = {
+                if let Some(Endpoint::Ip(ref endpoint)) = sendto_endpoint {
+                    *endpoint
+                } else if let Some(endpoint) = inner.remote_endpoint {
+                    endpoint
+                } else {
+                    return Err(LxError::ENOTCONN);
+                }
+            };
+            if !Self::endpoint_matches_family(inner.ipv6, &remote) {
+                return Err(LxError::EINVAL);
             }
+            (inner.handle.0, remote)
         };
-        if !Self::endpoint_matches_family(inner.ipv6, remote_endpoint) {
-            return Err(LxError::EINVAL);
-        }
 
         let sets = get_sockets();
         let mut sets = sets.lock();
-        Self::autobind(&mut sets, inner.handle.0, inner.ipv6)?;
+        self.autobind(&mut sets)?;
         let sent = sets
-            .get::<UdpSocket>(inner.handle.0)
-            .send_slice(data, *remote_endpoint);
+            .get::<UdpSocket>(handle)
+            .send_slice(data, remote_endpoint);
         drop(sets);
-        drop(inner);
         flush_socket_egress();
 
         match sent {
@@ -391,10 +407,9 @@ impl Socket for UdpSocketState {
             if !Self::endpoint_matches_family(is_ipv6, &ip) {
                 return Err(LxError::EINVAL);
             }
-            let handle = self.inner.lock().handle.0;
             let sockets = get_sockets();
             let mut set = sockets.lock();
-            Self::autobind(&mut set, handle, is_ipv6)?;
+            self.autobind(&mut set)?;
             drop(set);
 
             self.inner.lock().remote_endpoint = Some(ip);
@@ -438,9 +453,9 @@ impl Socket for UdpSocketState {
             // Copy out of `inner` before locking SOCKETS (inner->SOCKETS is
             // the order everywhere else; the old `set.get(self.inner.lock()..)`
             // nested them the other way round).
-            let (handle, is_ipv6) = {
+            let (handle, is_ipv6, reuse_addr) = {
                 let inner = self.inner.lock();
-                (inner.handle.0, inner.ipv6)
+                (inner.handle.0, inner.ipv6, inner.reuse_addr)
             };
             if !Self::endpoint_matches_family(is_ipv6, &ip) {
                 return Err(LxError::EINVAL);
@@ -453,14 +468,16 @@ impl Socket for UdpSocketState {
                 return Err(LxError::EINVAL);
             }
             if ip.port == 0 {
-                ip.port = free_ephemeral_port(&set, ip.addr).ok_or(LxError::EADDRINUSE)?;
-            } else if udp_port_taken(&set, ip) {
+                ip.port = free_ephemeral_port(ip.addr).ok_or(LxError::EADDRINUSE)?;
+            } else if udp_port_taken(ip, reuse_addr) {
                 return Err(LxError::EADDRINUSE);
             }
             let bound = set.get::<UdpSocket>(handle).bind(ip);
             drop(set);
             match bound {
                 Ok(()) => {
+                    crate::net::UDP_BIND_TABLE.insert(ip, reuse_addr);
+                    self.inner.lock().bound = Some(ip);
                     crate::net::drain_net_urgent();
                     Ok(0)
                 }
@@ -533,12 +550,40 @@ impl Socket for UdpSocketState {
             Endpoint::Ip(IpEndpoint::new(addr, ep.port))
         })
     }
-    fn setsockopt(&self, _level: usize, _opt: usize, _data: &[u8]) -> SysResult {
-        // Accept harmlessly, like TCP's fallthrough and the `Socket` default.
-        // debug, not warn: this is a no-op success, and a client that sets an
-        // option on every send (Firefox's resolver does) turned it into a
-        // steady stream of kernel warnings -- expensive on a serial console
-        // and misleading, since nothing is failing.
+    fn so_reuseaddr(&self) -> bool {
+        self.inner.lock().reuse_addr
+    }
+
+    fn is_inet(&self) -> bool {
+        true
+    }
+
+    fn setsockopt(&self, level: usize, opt: usize, data: &[u8]) -> SysResult {
+        const SOL_SOCKET: usize = 1;
+        const SO_REUSEADDR: usize = 2;
+        const IPPROTO_IP: usize = 0;
+        const IPPROTO_TCP: usize = 6;
+        const IP_HDRINCL: usize = 3;
+        if level == SOL_SOCKET && matches!(opt, 3 | 4 | 30) {
+            return Err(LxError::ENOPROTOOPT);
+        }
+        if level == SOL_SOCKET && opt == SO_REUSEADDR {
+            // Same trap as TCP: a short `optlen` used to apply a lone byte.
+            if data.len() < 4 {
+                return Err(LxError::EINVAL);
+            }
+            let on = u32::from_ne_bytes([data[0], data[1], data[2], data[3]]) != 0;
+            self.inner.lock().reuse_addr = on;
+            return Ok(0);
+        }
+        // TCP_* on UDP is ENOPROTOOPT; known int options need a full `int`.
+        if level == IPPROTO_TCP {
+            return Err(LxError::ENOPROTOOPT);
+        }
+        if level == IPPROTO_IP && opt == IP_HDRINCL {
+            return Err(LxError::ENOPROTOOPT);
+        }
+        crate::net::check_setsockopt_len(level, opt, data)?;
         debug!("udp setsockopt: accepted as a no-op");
         Ok(0)
     }
@@ -692,6 +737,32 @@ mod tests {
         s
     }
 
+    #[test]
+    fn tcp_sockopts_on_udp_are_enoprotoopt_and_short_int_is_einval() {
+        let _g = LOCK.lock();
+        let s = sock();
+        assert!(!Socket::is_tcp(&s));
+        assert!(Socket::is_inet(&s));
+        assert_eq!(
+            Socket::setsockopt(&s, 6, 1, &1u32.to_ne_bytes()),
+            Err(LxError::ENOPROTOOPT)
+        );
+        // IP_HDRINCL is SOCK_RAW only.
+        assert_eq!(
+            Socket::setsockopt(&s, 0, 3, &1u32.to_ne_bytes()),
+            Err(LxError::ENOPROTOOPT)
+        );
+        // Read-only SOL_SOCKET options.
+        assert_eq!(
+            Socket::setsockopt(&s, 1, 3, &0u32.to_ne_bytes()),
+            Err(LxError::ENOPROTOOPT)
+        );
+        assert_eq!(
+            Socket::setsockopt(&s, 1, 9, &[]),
+            Err(LxError::EINVAL)
+        );
+    }
+
     fn loopback() -> Interface<'static, Loopback> {
         InterfaceBuilder::new(Loopback::new(Medium::Ip))
             .ip_addrs([IpCidr::new(IpAddress::v4(127, 0, 0, 1), 8)])
@@ -796,15 +867,12 @@ mod tests {
         assert!(taken.len() >= 30, "could not pin the range: {:?}", taken);
         let first = taken[0];
         crate::net::rewind_ephemeral_port_to(first);
-        let sets = get_sockets();
-        let sets = sets.lock();
-        let picked = free_ephemeral_port(&sets, IpAddress::Ipv4(Ipv4Address::UNSPECIFIED)).unwrap();
+        let picked = free_ephemeral_port(IpAddress::Ipv4(Ipv4Address::UNSPECIFIED)).unwrap();
         assert!(!taken.contains(&picked), "picked {} which is bound", picked);
         assert!(!udp_port_taken(
-            &sets,
-            IpEndpoint::new(IpAddress::Ipv4(Ipv4Address::UNSPECIFIED), picked)
+            IpEndpoint::new(IpAddress::Ipv4(Ipv4Address::UNSPECIFIED), picked),
+            false
         ));
-        drop(sets);
         // An implicit bind (first sendto) lands on a free one too...
         crate::net::rewind_ephemeral_port_to(first);
         let s = sock();
@@ -992,5 +1060,28 @@ mod tests {
         let _g = LOCK.lock();
         let s = sock();
         assert_eq!(FileLike::readable_bytes(&s), Some(0));
+    }
+
+    /// `getsockopt(SO_REUSEADDR)` must mirror the flag, and two sockets with
+    /// it set may share a port.
+    #[test]
+    fn so_reuseaddr_lets_a_second_udp_bind_share_the_port() {
+        let _g = LOCK.lock();
+        let a = sock();
+        let b = sock();
+        assert!(!Socket::so_reuseaddr(&a));
+        assert_eq!(
+            Socket::setsockopt(&a, 1, 2, &1u32.to_ne_bytes()),
+            Ok(0)
+        );
+        assert!(Socket::so_reuseaddr(&a));
+        assert_eq!(Socket::bind(&a, v4(40100)), Ok(0));
+        // Without the flag, the second bind is refused.
+        assert_eq!(Socket::bind(&b, v4(40100)), Err(LxError::EADDRINUSE));
+        assert_eq!(
+            Socket::setsockopt(&b, 1, 2, &1u32.to_ne_bytes()),
+            Ok(0)
+        );
+        assert_eq!(Socket::bind(&b, v4(40100)), Ok(0));
     }
 }

@@ -51,8 +51,12 @@ impl Syscall<'_> {
                 Ok(())
             }
             Property::ProcessVdsoBaseAddress => {
+                // Must be a Process handle (not any GET_PROPERTY object), and
+                // the vDSO base is that process's — not the caller's.
                 let mut info_ptr = UserOutPtr::<usize>::from_addr_size(buffer, buffer_size)?;
-                let vdso_base = proc.vmar().vdso_base_addr().unwrap_or(0);
+                let process =
+                    proc.get_object_with_rights::<Process>(handle_value, Rights::GET_PROPERTY)?;
+                let vdso_base = process.vmar().vdso_base_addr().unwrap_or(0);
                 info_ptr.write(vdso_base)?;
                 Ok(())
             }
@@ -114,10 +118,22 @@ impl Syscall<'_> {
                 info_ptr.write(strategy)?;
                 Ok(())
             }
-            _ => {
-                warn!("unknown property {:?}", property);
-                Err(ZxError::INVALID_ARGS)
+            #[cfg(target_arch = "x86_64")]
+            Property::RegisterFs => {
+                let thread = proc.get_object::<Thread>(handle_value)?;
+                let fsbase = thread_segbase_get(&self.thread, &thread, SegBase::Fs)?;
+                UserOutPtr::<usize>::from_addr_size(buffer, buffer_size)?.write(fsbase)?;
+                Ok(())
             }
+            #[cfg(target_arch = "x86_64")]
+            Property::RegisterGs => {
+                let thread = proc.get_object::<Thread>(handle_value)?;
+                let gsbase = thread_segbase_get(&self.thread, &thread, SegBase::Gs)?;
+                UserOutPtr::<usize>::from_addr_size(buffer, buffer_size)?.write(gsbase)?;
+                Ok(())
+            }
+            #[cfg(not(target_arch = "x86_64"))]
+            Property::RegisterFs | Property::RegisterGs => Err(ZxError::NOT_SUPPORTED),
         }
     }
 
@@ -153,15 +169,13 @@ impl Syscall<'_> {
             Property::RegisterFs => {
                 let thread = proc.get_object::<Thread>(handle_value)?;
                 let fsbase = UserInPtr::<usize>::from_addr_size(buffer, buffer_size)?.read()?;
-                thread.with_context(|ctx| ctx.general_mut().fsbase = fsbase)?;
-                Ok(())
+                thread_segbase_set(&self.thread, &thread, SegBase::Fs, fsbase)
             }
             #[cfg(target_arch = "x86_64")]
             Property::RegisterGs => {
                 let thread = proc.get_object::<Thread>(handle_value)?;
                 let gsbase = UserInPtr::<usize>::from_addr_size(buffer, buffer_size)?.read()?;
-                thread.with_context(|ctx| ctx.general_mut().gsbase = gsbase)?;
-                Ok(())
+                thread_segbase_set(&self.thread, &thread, SegBase::Gs, gsbase)
             }
             Property::ProcessBreakOnLoad => {
                 let addr = UserInPtr::<usize>::from_addr_size(buffer, buffer_size)?.read()?;
@@ -351,18 +365,19 @@ impl Syscall<'_> {
             }
             Topic::Timer => {
                 let timer = proc.get_object_with_rights::<Timer>(handle, Rights::INSPECT)?;
-                let (options, deadline, slack) = timer.get_info();
+                let (options, clock_id, deadline, slack) = timer.get_info();
                 output.write(TimerInfo {
                     options,
-                    clock_id: 0,
+                    clock_id,
                     deadline,
                     slack,
                 })?;
             }
             Topic::ProcessVmos => {
-                warn!(
-                    "A dummy implementation for utest Bti.NoDelayedUnpin, it does not check the reture value"
-                );
+                // Stub list (empty) is fine for the BTI utest, but the handle
+                // must still be a Process with INSPECT — a BAD_HANDLE / wrong
+                // type used to succeed with zeros.
+                let _ = proc.get_object_with_rights::<Process>(handle, Rights::INSPECT)?;
                 output.actual.write_if_not_null(0)?;
                 output.avail.write_if_not_null(0)?;
             }
@@ -903,6 +918,72 @@ fn name_buffer(name: &str) -> [u8; MAX_NAME_LEN] {
     let bytes = stored_name(name).as_bytes();
     out[..bytes.len()].copy_from_slice(bytes);
     out
+}
+
+#[cfg(target_arch = "x86_64")]
+#[derive(Clone, Copy)]
+enum SegBase {
+    Fs,
+    Gs,
+}
+
+/// x86-64 canonical user VA: bits 63:48 must equal bit 47.
+#[cfg(target_arch = "x86_64")]
+fn is_canonical_user_addr(addr: usize) -> bool {
+    let sign_ext = ((addr as i64) << 16) >> 16;
+    sign_ext as usize == addr
+}
+
+/// `ZX_PROP_REGISTER_{FS,GS}` set: current thread only + canonical address.
+#[cfg(target_arch = "x86_64")]
+fn thread_segbase_set(
+    current: &Thread,
+    target: &Thread,
+    which: SegBase,
+    addr: usize,
+) -> ZxResult {
+    use zircon_object::object::KernelObject;
+    if target.id() != current.id() {
+        return Err(ZxError::ACCESS_DENIED);
+    }
+    if !is_canonical_user_addr(addr) {
+        return Err(ZxError::INVALID_ARGS);
+    }
+    target.with_context(|ctx| match which {
+        SegBase::Fs => ctx.general_mut().fsbase = addr,
+        SegBase::Gs => ctx.general_mut().gsbase = addr,
+    })
+}
+
+/// `ZX_PROP_REGISTER_{FS,GS}` get: current thread only.
+#[cfg(target_arch = "x86_64")]
+fn thread_segbase_get(current: &Thread, target: &Thread, which: SegBase) -> ZxResult<usize> {
+    use zircon_object::object::KernelObject;
+    if target.id() != current.id() {
+        return Err(ZxError::ACCESS_DENIED);
+    }
+    let mut out = 0usize;
+    target.with_context(|ctx| {
+        out = match which {
+            SegBase::Fs => ctx.general().fsbase,
+            SegBase::Gs => ctx.general().gsbase,
+        };
+    })?;
+    Ok(out)
+}
+
+#[cfg(all(test, target_arch = "x86_64"))]
+mod segbase_property_tests {
+    use super::*;
+
+    #[test]
+    fn a_canonical_user_addr_is_accepted() {
+        assert!(is_canonical_user_addr(0));
+        assert!(is_canonical_user_addr(0x0000_7fff_ffff_ffff));
+        // Non-canonical: bit 47 clear but high bits set.
+        assert!(!is_canonical_user_addr(0x0000_8000_0000_0000));
+        assert!(!is_canonical_user_addr(0xffff_0000_0000_0000));
+    }
 }
 
 #[cfg(test)]

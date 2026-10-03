@@ -1021,11 +1021,24 @@ impl Socket for TcpSocketState {
         self.inner.lock().nodelay
     }
 
+    fn is_tcp(&self) -> bool {
+        true
+    }
+
+    fn is_inet(&self) -> bool {
+        true
+    }
+
     fn setsockopt(&self, level: usize, opt: usize, data: &[u8]) -> SysResult {
         const SOL_SOCKET: usize = 1;
         const SO_REUSEADDR: usize = 2;
+        const IPPROTO_IP: usize = 0;
         const IPPROTO_TCP: usize = 6;
         const TCP_NODELAY: usize = 1;
+        const IP_HDRINCL: usize = 3;
+        if level == SOL_SOCKET && matches!(opt, 3 | 4 | 30) {
+            return Err(LxError::ENOPROTOOPT);
+        }
         if level == SOL_SOCKET && opt == SO_REUSEADDR {
             // Read at bind time (`sk_reuse`); set it before `bind`, as servers do.
             self.inner.lock().reuse_addr = sockopt_int(data)? != 0;
@@ -1045,7 +1058,12 @@ impl Socket for TcpSocketState {
                 .set_nagle_enabled(optval == 0);
             return Ok(0);
         }
-        // Other options: accept harmlessly (same lenient default as Socket).
+        // IP_HDRINCL is SOCK_RAW only; TCP must not swallow it as a no-op.
+        if level == IPPROTO_IP && opt == IP_HDRINCL {
+            return Err(LxError::ENOPROTOOPT);
+        }
+        // Other options: same len check as the trait default, then no-op.
+        crate::net::check_setsockopt_len(level, opt, data)?;
         Ok(0)
     }
 
@@ -1302,6 +1320,24 @@ mod sockopt_int_tests {
         assert_eq!(sockopt_int(&[1]), Err(LxError::EINVAL));
         assert_eq!(sockopt_int(&[1, 0]), Err(LxError::EINVAL));
         assert_eq!(sockopt_int(&[1, 0, 0]), Err(LxError::EINVAL));
+    }
+}
+
+#[cfg(test)]
+mod is_tcp_tests {
+    use super::*;
+    use crate::net::NET_TEST_LOCK as LOCK;
+
+    #[test]
+    fn only_tcp_sockets_report_is_tcp() {
+        let _g = LOCK.lock();
+        let tcp = TcpSocketState::new(false).unwrap();
+        assert!(Socket::is_tcp(&tcp));
+        // Short SO_KEEPALIVE on TCP is EINVAL (not a silent Ok(0)).
+        assert_eq!(
+            Socket::setsockopt(&tcp, 1, 9, &[]),
+            Err(LxError::EINVAL)
+        );
     }
 }
 
@@ -1845,5 +1881,16 @@ mod fionread_tests {
         let s = TcpSocketState::new(false).unwrap();
         let status = FileLike::poll(&s, PollEvents::IN).unwrap();
         assert!(status.error && status.hangup);
+    }
+
+    /// `SCM_RIGHTS` on a non-unix socket is `EOPNOTSUPP`, not `ENOSYS`.
+    #[test]
+    fn send_fds_on_tcp_is_eopnotsupp_not_enosys() {
+        let _g = LOCK.lock();
+        let s = TcpSocketState::new(false).unwrap();
+        assert_eq!(
+            Socket::send_fds(&s, alloc::vec::Vec::new()),
+            Err(LxError::EOPNOTSUPP)
+        );
     }
 }

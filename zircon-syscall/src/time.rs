@@ -47,10 +47,29 @@ const ZX_CLOCK_UPDATE_OPTIONS_ALL: u64 = ZX_CLOCK_UPDATE_OPTION_SYNTHETIC_VALUE_
 
 /// Strip the version nibble and refuse an empty or unknown update-options
 /// word (`zx_clock_update`). Unknown bits used to succeed with no effect.
+///
+/// `RATE_ADJUST` / `ERROR_BOUND` are named in the ABI but not implemented —
+/// accepting them used to return `Ok` with no effect. `REFERENCE` alone
+/// (no `SYNTHETIC`) likewise did nothing; Fuchsia rejects it as `INVALID_ARGS`.
 fn clock_update_flags(options: u64) -> ZxResult<(u64, u64)> {
     let version = options >> ZX_CLOCK_ARGS_VERSION_SHIFT;
     let flags = options & !ZX_CLOCK_ARGS_VERSION_MASK;
     if flags & !ZX_CLOCK_UPDATE_OPTIONS_ALL != 0 || flags == 0 {
+        return Err(ZxError::INVALID_ARGS);
+    }
+    const UNIMPLEMENTED: u64 =
+        ZX_CLOCK_UPDATE_OPTION_RATE_ADJUST | ZX_CLOCK_UPDATE_OPTION_ERROR_BOUND;
+    if flags & UNIMPLEMENTED != 0 {
+        return Err(ZxError::NOT_SUPPORTED);
+    }
+    if flags & ZX_CLOCK_UPDATE_OPTION_SYNTHETIC_VALUE_VALID == 0 {
+        return Err(ZxError::INVALID_ARGS);
+    }
+    // REFERENCE is a v2 args field; with v1 it used to succeed and be ignored.
+    if flags & ZX_CLOCK_UPDATE_OPTION_REFERENCE_VALUE_VALID != 0 && version != 2 {
+        return Err(ZxError::INVALID_ARGS);
+    }
+    if version != 1 && version != 2 {
         return Err(ZxError::INVALID_ARGS);
     }
     Ok((version, flags))
@@ -104,7 +123,13 @@ impl Syscall<'_> {
     ) -> ZxResult {
         let version = clock_create_options(options)?;
         let backstop = match version {
-            0 => 0,
+            // v0 has no args struct; a non-null pointer is INVALID_ARGS.
+            0 => {
+                if !user_args.is_null() {
+                    return Err(ZxError::INVALID_ARGS);
+                }
+                0
+            }
             1 => {
                 UserInPtr::<ClockCreateArgsV1>::from(user_args.as_addr())
                     .read()?
@@ -126,6 +151,7 @@ impl Syscall<'_> {
     /// + Returns whether `clock_id` was valid.
     pub fn sys_clock_get(&self, clock_id: u32, mut time: UserOutPtr<u64>) -> ZxResult {
         info!("clock.get: id={}", clock_id);
+        clock_id_ok(clock_id)?;
         match clock_id {
             ZX_CLOCK_MONOTONIC => {
                 time.write(timer_now().as_nanos() as u64)?;
@@ -142,7 +168,7 @@ impl Syscall<'_> {
                 time.write(self.thread.get_time())?;
                 Ok(())
             }
-            _ => Err(ZxError::NOT_SUPPORTED),
+            _ => unreachable!(),
         }
     }
 
@@ -321,6 +347,41 @@ mod clock_update_flags_tests {
             Err(ZxError::INVALID_ARGS)
         );
     }
+
+    #[test]
+    fn unimplemented_or_reference_only_bits_are_rejected() {
+        let v2 = 2u64 << ZX_CLOCK_ARGS_VERSION_SHIFT;
+        // Named but unimplemented: used to succeed with no effect.
+        assert_eq!(
+            clock_update_flags(v2 | ZX_CLOCK_UPDATE_OPTION_RATE_ADJUST),
+            Err(ZxError::NOT_SUPPORTED)
+        );
+        assert_eq!(
+            clock_update_flags(v2 | ZX_CLOCK_UPDATE_OPTION_ERROR_BOUND),
+            Err(ZxError::NOT_SUPPORTED)
+        );
+        assert_eq!(
+            clock_update_flags(
+                v2 | ZX_CLOCK_UPDATE_OPTION_SYNTHETIC_VALUE_VALID
+                    | ZX_CLOCK_UPDATE_OPTION_RATE_ADJUST
+            ),
+            Err(ZxError::NOT_SUPPORTED)
+        );
+        // REFERENCE alone: no synthetic value to apply.
+        assert_eq!(
+            clock_update_flags(v2 | ZX_CLOCK_UPDATE_OPTION_REFERENCE_VALUE_VALID),
+            Err(ZxError::INVALID_ARGS)
+        );
+        // REFERENCE with v1 args: the field does not exist on v1.
+        let v1 = 1u64 << ZX_CLOCK_ARGS_VERSION_SHIFT;
+        assert_eq!(
+            clock_update_flags(
+                v1 | ZX_CLOCK_UPDATE_OPTION_SYNTHETIC_VALUE_VALID
+                    | ZX_CLOCK_UPDATE_OPTION_REFERENCE_VALUE_VALID
+            ),
+            Err(ZxError::INVALID_ARGS)
+        );
+    }
 }
 
 #[cfg(test)]
@@ -347,6 +408,43 @@ mod clock_create_options_tests {
     #[test]
     fn unknown_create_bits_are_invalid_args() {
         assert_eq!(clock_create_options(1u64 << 20), Err(ZxError::INVALID_ARGS));
+    }
+}
+
+/// Classify a `zx_clock_get` / `zx_clock_adjust` clock_id (unit-tested).
+fn clock_id_ok(clock_id: u32) -> ZxResult<()> {
+    match clock_id {
+        ZX_CLOCK_MONOTONIC | ZX_CLOCK_UTC | ZX_CLOCK_THREAD => Ok(()),
+        _ => Err(ZxError::INVALID_ARGS),
+    }
+}
+
+#[cfg(test)]
+mod clock_get_id_tests {
+    use super::*;
+
+    /// Unknown `clock_id` used to be `NOT_SUPPORTED`; Fuchsia/`clock_adjust`
+    /// use `INVALID_ARGS`.
+    #[test]
+    fn an_unknown_clock_id_is_invalid_args_not_not_supported() {
+        assert_eq!(clock_id_ok(ZX_CLOCK_MONOTONIC), Ok(()));
+        assert_eq!(clock_id_ok(ZX_CLOCK_UTC), Ok(()));
+        assert_eq!(clock_id_ok(ZX_CLOCK_THREAD), Ok(()));
+        assert_eq!(clock_id_ok(99), Err(ZxError::INVALID_ARGS));
+        assert_ne!(clock_id_ok(99), Err(ZxError::NOT_SUPPORTED));
+    }
+
+    #[test]
+    fn v0_create_rejects_a_non_null_args_pointer() {
+        // Mirrors the v0 arm in `sys_clock_create`.
+        fn v0_args(is_null: bool) -> ZxResult<()> {
+            if !is_null {
+                return Err(ZxError::INVALID_ARGS);
+            }
+            Ok(())
+        }
+        assert_eq!(v0_args(true), Ok(()));
+        assert_eq!(v0_args(false), Err(ZxError::INVALID_ARGS));
     }
 }
 

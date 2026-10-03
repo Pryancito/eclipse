@@ -143,6 +143,11 @@ impl Socket {
             return Err(ZxError::BAD_STATE);
         }
         let peer = self.peer.upgrade().ok_or(ZxError::PEER_CLOSED)?;
+        // A zero-length write needs no room (Fuchsia allows `buffer_size == 0`).
+        // Checking capacity first made a full peer answer SHOULD_WAIT for 0 bytes.
+        if count == 0 {
+            return Ok(0);
+        }
         let rest_size = SOCKET_SIZE - peer.inner.lock().data.len();
         if rest_size == 0 {
             return Err(ZxError::SHOULD_WAIT);
@@ -181,6 +186,11 @@ impl Socket {
             // whose reader may already have seen the end of the stream.
             if inner.read_disabled {
                 return Err(ZxError::BAD_STATE);
+            }
+            // Zero bytes never need capacity — a full peer used to return
+            // SHOULD_WAIT (stream) or INVALID_ARGS (datagram) for an empty write.
+            if data.is_empty() {
+                return Ok(0);
             }
             let curr_size = inner.data.len();
             let was_empty = curr_size == 0;
@@ -225,9 +235,7 @@ impl Socket {
     /// Takes the guard its caller already holds: the measure and the push are
     /// one step, see [`Socket::write_data`].
     fn write_datagram(inner: &mut SocketInner, data: &[u8]) -> ZxResult<usize> {
-        if data.is_empty() {
-            return Err(ZxError::INVALID_ARGS);
-        }
+        // Empty writes are handled in `write_data` before capacity checks.
         let actual_count = data.len();
         inner.data.extend(data);
         inner.datagram_len.push_back(actual_count);
@@ -778,6 +786,9 @@ mod tests {
         // write much data
         assert_eq!(end0.write(&[0; SOCKET_SIZE * 2]).unwrap(), SOCKET_SIZE);
         assert_eq!(end0.write(&[0; 1]).unwrap_err(), ZxError::SHOULD_WAIT);
+        // A zero-length write still succeeds when the peer is full.
+        assert_eq!(end0.write(&[]).unwrap(), 0);
+        assert_eq!(end0.write_size(0).unwrap(), 0);
         assert!(!end0.signal().contains(Signal::WRITABLE));
         end1.read(false, &mut [0; 1]).unwrap();
         assert!(end0.signal().contains(Signal::WRITABLE));
@@ -792,7 +803,8 @@ mod tests {
             end0.read(false, &mut [0; 10]).unwrap_err(),
             ZxError::SHOULD_WAIT
         );
-        assert_eq!(end0.write(&[]).unwrap_err(), ZxError::INVALID_ARGS);
+        // Zero-length write is Ok(0), even for datagram (Fuchsia allows size 0).
+        assert_eq!(end0.write(&[]).unwrap(), 0);
 
         assert_eq!(end0.write(&[1, 2, 3]), Ok(3));
         assert_eq!(end0.write(&[4, 5, 6, 7]), Ok(4));

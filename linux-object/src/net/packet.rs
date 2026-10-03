@@ -190,6 +190,9 @@ pub fn push_packet(packet: &[u8]) {
 pub struct PacketSocketState {
     base: KObjectBase,
     inner: Arc<PacketSocketInner>,
+    /// Last recvmsg flags (`MSG_TRUNC`, …); cleared by [`Socket::take_msg_flags`].
+    /// Per-fd (not on the shared queue) so dup'd descriptors keep their own.
+    last_msg_flags: Mutex<i32>,
 }
 
 #[derive(Debug)]
@@ -222,6 +225,7 @@ impl PacketSocketState {
         let state = Arc::new(Self {
             base: KObjectBase::with_signal(Signal::WRITABLE),
             inner: inner.clone(),
+            last_msg_flags: Mutex::new(0),
         });
         register_fd(&inner, &state);
         registry.push(Arc::downgrade(&inner));
@@ -294,6 +298,9 @@ impl Socket for PacketSocketState {
                 let actual_len = payload.len();
                 let copy_len = actual_len.min(data.len());
                 data[..copy_len].copy_from_slice(&payload[..copy_len]);
+                // Datagram truncation: remainder is discarded; report MSG_TRUNC
+                // so recvmsg sees the cut (same bit UDP/netlink already set).
+                *self.last_msg_flags.lock() = if actual_len > data.len() { 0x20 } else { 0 };
 
                 if self.inner.packet_queue.lock().is_empty() {
                     self.base.signal_clear(Signal::READABLE);
@@ -443,10 +450,6 @@ impl Socket for PacketSocketState {
         None
     }
 
-    fn setsockopt(&self, _level: usize, _opt: usize, _data: &[u8]) -> SysResult {
-        Ok(0)
-    }
-
     fn poll(&self, _events: PollEvents) -> (bool, bool, bool) {
         kernel_hal::deferred_job::drain_deferred_jobs();
         let ifindex = *self.inner.ifindex.lock();
@@ -485,6 +488,10 @@ impl Socket for PacketSocketState {
 
     fn socket_type(&self) -> Option<SocketType> {
         Some(self.inner.socket_type)
+    }
+
+    fn take_msg_flags(&self) -> i32 {
+        core::mem::replace(&mut *self.last_msg_flags.lock(), 0)
     }
 }
 
@@ -628,5 +635,18 @@ mod tests {
     fn an_idle_packet_socket_reports_zero_bytes_readable() {
         let s = PacketSocketState::new(SocketType::SOCK_RAW, 0x0800).unwrap();
         assert_eq!(FileLike::readable_bytes(&*s), Some(0));
+    }
+
+    /// A short recv on a queued frame must set `MSG_TRUNC` (0x20).
+    #[async_std::test]
+    async fn a_short_packet_read_reports_msg_trunc() {
+        let s = PacketSocketState::new(SocketType::SOCK_RAW, 0x0800).unwrap();
+        FileLike::set_flags(&*s, OpenFlags::RDWR | OpenFlags::NON_BLOCK).unwrap();
+        let frame: PacketFrame = Arc::from(alloc::vec![0xAAu8; 64].into_boxed_slice());
+        s.inner.packet_queue.lock().push_back(frame);
+        let mut buf = [0u8; 16];
+        let (n, _) = Socket::read(&*s, &mut buf).await;
+        assert_eq!(n, Ok(16));
+        assert_eq!(Socket::take_msg_flags(&*s), 0x20, "MSG_TRUNC");
     }
 }

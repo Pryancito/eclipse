@@ -31,7 +31,10 @@ impl Syscall<'_> {
             2 => Slack::Late,
             _ => return Err(ZxError::INVALID_ARGS),
         };
-        let handle = Handle::new(Timer::with_slack(slack), Rights::DEFAULT_TIMER);
+        let handle = Handle::new(
+            Timer::with_slack_clock(slack, clock_id),
+            Rights::DEFAULT_TIMER,
+        );
         install_handle(proc, handle, &mut out)
     }
 
