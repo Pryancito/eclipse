@@ -145,6 +145,10 @@ struct UnixInner {
     /// seatd's ENABLE_SEAT event) would steal the fd queued for a later
     /// OPEN_DEVICE reply, so the compositor's device fd arrives mismatched.
     pending_fds: VecDeque<(usize, Vec<Arc<dyn FileLike>>)>,
+    /// `SO_PASSCRED`: hand the peer's credentials to every `recvmsg` on this
+    /// end, as an `SCM_CREDENTIALS` control message. Off until a `setsockopt`
+    /// asks for it, as in Linux.
+    passcred: bool,
 }
 
 impl UnixInner {
@@ -189,6 +193,7 @@ impl Default for UnixSocketState {
                 write_closed: false,
                 owner_pid: 0,
                 pending_fds: VecDeque::new(),
+                passcred: false,
             })),
         }
     }
@@ -942,6 +947,15 @@ impl Socket for UnixSocketState {
         Some(pid)
     }
 
+    fn passcred(&self) -> bool {
+        self.inner.lock().passcred
+    }
+
+    fn set_passcred(&self, on: bool) -> SysResult {
+        self.inner.lock().passcred = on;
+        Ok(0)
+    }
+
     fn send_fds(&self, fds: Vec<Arc<dyn FileLike>>) -> SysResult {
         if fds.is_empty() {
             return Ok(0);
@@ -1230,6 +1244,31 @@ mod tests {
             Some(Endpoint::Unix(p)) => assert_eq!(p, "/tmp/named.sock"),
             other => panic!("expected Some(Unix(/tmp/named.sock)), got {:?}", other),
         }
+    }
+
+    /// `SO_PASSCRED` is off until someone asks for it, it survives being asked
+    /// for, and it is PER END: chromium's browser turns it on for its own end
+    /// of the pair and never touches the end it hands to the zygote, so a flag
+    /// that leaked across would have the child's `recvmsg` carrying
+    /// credentials nobody asked it to carry.
+    #[test]
+    fn passcred_is_off_by_default_and_belongs_to_one_end() {
+        let mine = UnixSocketState::new();
+        let theirs = UnixSocketState::new();
+        UnixSocketState::connect_pair(&mine, &theirs);
+        assert!(!Socket::passcred(&*mine));
+        assert!(!Socket::passcred(&*theirs));
+
+        assert_eq!(Socket::set_passcred(&*mine, true), Ok(0));
+        assert!(Socket::passcred(&*mine));
+        assert!(
+            !Socket::passcred(&*theirs),
+            "the peer never asked for credentials"
+        );
+
+        // And it can be turned back off, which is what a zero `optval` means.
+        assert_eq!(Socket::set_passcred(&*mine, false), Ok(0));
+        assert!(!Socket::passcred(&*mine));
     }
 
     /// `SO_TYPE` must report what `socket`/`socketpair` asked for. The default
