@@ -7080,21 +7080,32 @@ pub fn get_resources() -> (Vec<u32>, Vec<u32>, Vec<u32>) {
 }
 
 pub fn get_connector(id: u32) -> Option<DrmConnector> {
-    // Software KMS: serve the synthetic connector directly. Do NOT fall out to
-    // the drivers first — `nvidia.get_connector` runs a live GSP/DDC EDID probe
-    // (rm_display_state) before it even range-checks the id, so a GETCONNECTOR
-    // for the synthetic id would still drive an RPC on both GPUs (incl. the
-    // compute GPU) and stall wlroots' bind. See get_resources for detail.
-    if !software_kms_active() {
+    // Keyed on the ID, never on which scanout path happens to be active right
+    // now. The synthetic id is still served without touching a driver -- that
+    // is what this gate was for: `nvidia.get_connector` runs a live GSP/DDC
+    // EDID probe (rm_display_state) before it even range-checks the id, so a
+    // GETCONNECTOR for the synthetic id would otherwise drive an RPC on both
+    // GPUs (incl. the compute GPU) and stall wlroots' bind.
+    //
+    // What it must NOT do is decide, from `software_kms_active()`, whether a
+    // DRIVER id is answerable at all. `software_kms_active()` is live state:
+    // the NVIDIA driver's `has_hardware_kms()` is
+    // `surfaceflip_enabled() && hwflip_ready()`, and `hwflip_ready()` latches
+    // during bring-up. So the answer to this question could change BETWEEN a
+    // client's GETRESOURCES and its GETCONNECTOR -- and when it flipped to
+    // "software KMS", every driver id GETRESOURCES had just advertised started
+    // coming back EINVAL. Mesa's `wsi_get_connectors` (VK_KHR_display) treats
+    // a miss on any advertised id as fatal and reports the whole query as
+    // VK_ERROR_OUT_OF_HOST_MEMORY, which is what `vulkaninfo` died with. The
+    // id spaces do not overlap (synthetic 1..4, VirtIO 1000/2000, NVIDIA
+    // 1001+), so an id is enough to decide who owns it.
+    if id != SYNTH_CONNECTOR_ID {
         // Driver calls run with DRM_STATE released — see `snapshot_drivers`.
         for driver in snapshot_drivers() {
             if let Some(conn) = driver.get_connector(id) {
                 return Some(conn);
             }
         }
-    }
-    // Software framebuffer fallback (no driver, or driver without KMS).
-    if id != SYNTH_CONNECTOR_ID {
         return None;
     }
     let (w, h, _) = display_mode()?;
@@ -7214,9 +7225,11 @@ pub fn get_connector_edid(id: u32) -> Option<[u8; 128]> {
 }
 
 pub fn get_crtc(id: u32) -> Option<DrmCrtc> {
-    // Software KMS: serve the synthetic CRTC directly (see get_resources —
-    // avoids driving a GSP/EDID probe through the drivers).
-    if !software_kms_active() {
+    // Keyed on the ID, not on the live scanout path -- see `get_connector`
+    // for why asking `software_kms_active()` here made advertised ids come
+    // back EINVAL mid-probe. The synthetic id is still served without
+    // touching a driver.
+    if id != SYNTH_CRTC_ID {
         // Driver calls run with DRM_STATE released — see `snapshot_drivers`.
         for driver in snapshot_drivers() {
             if let Some(mut crtc) = driver.get_crtc(id) {
@@ -7229,9 +7242,6 @@ pub fn get_crtc(id: u32) -> Option<DrmCrtc> {
                 return Some(crtc);
             }
         }
-    }
-    // Software framebuffer fallback (no driver, or driver without KMS).
-    if id != SYNTH_CRTC_ID {
         return None;
     }
     display_mode()?;
@@ -7266,19 +7276,31 @@ pub fn get_planes() -> Vec<u32> {
     // only expose its planes to avoid a mixed 2-plane topology.
     let drivers = snapshot_drivers();
     let has_hardware_kms = drivers.iter().any(|d| d.has_hardware_kms());
-    let mut planes = Vec::new();
+    let mut planes: Vec<u32> = Vec::new();
     for driver in &drivers {
         if !has_hardware_kms || driver.has_hardware_kms() {
-            planes.extend(driver.get_planes());
+            // De-duplicate, for the same reason `get_resources` does it with
+            // CRTCs and connectors: two cards of the same model return the
+            // same synthetic ids (both NVIDIA GPUs say plane 3001), and a
+            // plane list with the same id twice is a topology no client can
+            // make sense of -- `drmModeGetPlane` on either entry answers with
+            // the one plane, so index 1 contradicts index 0.
+            for id in driver.get_planes() {
+                if !planes.contains(&id) {
+                    planes.push(id);
+                }
+            }
         }
     }
     planes
 }
 
 pub fn get_plane(id: u32) -> Option<DrmPlane> {
-    // Software KMS: serve the synthetic plane directly (see get_resources —
-    // avoids driving a GSP/EDID probe through the drivers).
-    if !software_kms_active() {
+    // Keyed on the ID, not on the live scanout path -- see `get_connector`
+    // for why asking `software_kms_active()` here made advertised ids come
+    // back EINVAL mid-probe. The synthetic id is still served without
+    // touching a driver.
+    if id != SYNTH_PLANE_ID {
         // Driver calls run with DRM_STATE released — see `snapshot_drivers`.
         for driver in snapshot_drivers() {
             if let Some(mut plane) = driver.get_plane(id) {
@@ -7289,17 +7311,15 @@ pub fn get_plane(id: u32) -> Option<DrmPlane> {
                 return Some(plane);
             }
         }
+        return None;
     }
-    if software_kms_active() && id == SYNTH_PLANE_ID {
-        return Some(DrmPlane {
-            id: SYNTH_PLANE_ID,
-            crtc_id: SYNTH_CRTC_ID,
-            fb_id: 0,
-            possible_crtcs: 1, // bitmask: CRTC index 0
-            plane_type: 1,     // DRM_PLANE_TYPE_PRIMARY
-        });
-    }
-    None
+    Some(DrmPlane {
+        id: SYNTH_PLANE_ID,
+        crtc_id: SYNTH_CRTC_ID,
+        fb_id: 0,
+        possible_crtcs: 1, // bitmask: CRTC index 0
+        plane_type: 1,     // DRM_PLANE_TYPE_PRIMARY
+    })
 }
 
 /// Put the process-wide output state a present depends on back to its defaults.
