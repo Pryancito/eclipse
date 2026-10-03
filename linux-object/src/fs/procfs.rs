@@ -2754,7 +2754,6 @@ fn uptime_text(uptime_secs: f64, idle_ns: u64, ncpus: usize) -> String {
 /// report rather than a number being withheld.
 fn proc_stat_content() -> String {
     let running = crate::loadavg::runnable_count();
-    let ncpus = kernel_hal::online_cpu_count().max(1);
     let btime = boot_time_secs(
         kernel_hal::timer::timer_now_realtime(),
         kernel_hal::timer::timer_now(),
@@ -2770,8 +2769,19 @@ fn proc_stat_content() -> String {
     // it stays 0, as it was everywhere before.
     let ctxt = kernel_hal::kstats::sched_stats().0;
 
-    let times: Vec<(u64, u64, u64)> = (0..ncpus)
-        .map(kernel_hal::kstats::cpu_times_jiffies)
+    // One line per ONLINE cpu, keyed by that cpu's own logical id — not by a
+    // position in `0..count`. The two differ exactly when SMP bring-up is
+    // partial: `online_cpu_count` is the POPCOUNT of the online bitmask, so a
+    // machine that brought up CPUs 0, 1 and 3 printed `cpu0 cpu1 cpu2`, and
+    // `cpu2`'s row carried CPU 2's counters — a core that never ran, i.e. an
+    // all-idle row — while CPU 3's real time appeared nowhere. `mpstat -P ALL`
+    // and every per-core meter then showed one core missing and one core
+    // permanently idle, which is precisely the picture of a machine "running on
+    // fewer cores than it has".
+    let online = kernel_hal::cpu_online_mask();
+    let times: Vec<(usize, (u64, u64, u64))> = (0..64)
+        .filter(|cpu| online & (1u64 << cpu) != 0)
+        .map(|cpu| (cpu, kernel_hal::kstats::cpu_times_jiffies(cpu)))
         .collect();
     let cpu_lines = cpu_times_text(&times);
 
@@ -2797,10 +2807,10 @@ fn proc_stat_content() -> String {
 /// scheduler this build does not run: on the host every column is 0, and two
 /// columns can be swapped, or the sum taken over the wrong one, without a
 /// single test changing its answer.
-fn cpu_times_text(times: &[(u64, u64, u64)]) -> String {
+fn cpu_times_text(times: &[(usize, (u64, u64, u64))]) -> String {
     let (mut total_user, mut total_sys, mut total_idle) = (0u64, 0u64, 0u64);
     let mut per_cpu = String::new();
-    for (cpu, &(user, sys, idle)) in times.iter().enumerate() {
+    for &(cpu, (user, sys, idle)) in times.iter() {
         total_user += user;
         total_sys += sys;
         total_idle += idle;
@@ -5776,7 +5786,7 @@ mod proc_numbers_tests {
 
     #[test]
     fn the_cpu_summary_adds_the_columns_up_one_by_one() {
-        let text = cpu_times_text(&[(10, 20, 30), (1, 2, 3)]);
+        let text = cpu_times_text(&[(0, (10, 20, 30)), (1, (1, 2, 3))]);
         let summary = text.lines().next().unwrap();
         assert_eq!(column(summary, 0), "cpu");
         assert_eq!(column(summary, 1), "11"); // user
@@ -5788,7 +5798,7 @@ mod proc_numbers_tests {
     /// column out of place is a busy machine reading as an idle one.
     #[test]
     fn each_cpu_line_puts_its_time_in_the_column_its_readers_index() {
-        let text = cpu_times_text(&[(7, 0, 0), (0, 9, 0), (0, 0, 11)]);
+        let text = cpu_times_text(&[(0, (7, 0, 0)), (1, (0, 9, 0)), (2, (0, 0, 11))]);
         let lines: Vec<&str> = text.lines().skip(1).collect();
         assert_eq!(lines.len(), 3);
         assert_eq!(column(lines[0], 0), "cpu0");
@@ -5799,6 +5809,21 @@ mod proc_numbers_tests {
         for line in text.lines() {
             assert_eq!(line.split_whitespace().count(), 11, "{:?}", line);
         }
+    }
+
+    /// The row names are the cpus' own logical ids, so a partial SMP bring-up
+    /// does not rename the cores it did bring up. With `(0..popcount)` the
+    /// online set {0, 1, 3} printed `cpu0 cpu1 cpu2`: CPU 3's time was lost and
+    /// CPU 2 — a core that never came online — was reported as a live, idle one.
+    #[test]
+    fn a_partial_bring_up_names_each_row_after_the_cpu_whose_time_it_carries() {
+        let text = cpu_times_text(&[(0, (5, 0, 0)), (1, (6, 0, 0)), (3, (7, 0, 0))]);
+        let lines: Vec<&str> = text.lines().skip(1).collect();
+        assert_eq!(lines.len(), 3);
+        assert_eq!(column(lines[2], 0), "cpu3");
+        assert_eq!(column(lines[2], 1), "7");
+        // And the summary still adds up every row it printed.
+        assert_eq!(column(text.lines().next().unwrap(), 1), "18");
     }
 
     #[test]
