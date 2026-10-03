@@ -2408,7 +2408,20 @@ pub(crate) fn check_setsockopt_len(level: usize, opt: usize, data: &[u8]) -> LxR
         (SOL_SOCKET, 20 | 21) => 16,               // struct timeval
         (SOL_SOCKET, 2 | 6 | 7 | 8 | 9 | 15) => 4, // int options
         (IPPROTO_TCP, 1 | 4 | 5 | 6) => 4,         // int TCP_* (not CONGESTION)
-        (IPPROTO_IP, 1 | 2 | 3 | 32 | 33 | 35) => 4,
+        // The IP level is NOT the socket level: `do_ip_setsockopt` reads the
+        // value from four bytes when it has them and from ONE when it does
+        // not --
+        //     if (optlen >= sizeof(int)) { ... get_user(val, ...) }
+        //     else if (optlen >= sizeof(char)) { ... val = (int) ucval; }
+        // -- so `setsockopt(fd, IPPROTO_IP, IP_TTL, "\100", 1)` is an
+        // ordinary call, and demanding four bytes refused it. IP_TOS (1),
+        // IP_TTL (2), IP_HDRINCL (3) and IP_MULTICAST_TTL (33) all go through
+        // that path.
+        (IPPROTO_IP, 1 | 2 | 3 | 33) => 1,
+        // These two do not: IP_MULTICAST_IF (32) takes an address and
+        // IP_ADD_MEMBERSHIP (35) a `struct ip_mreq`, and `ip_mcast_join_leave`
+        // checks the length itself before reading either.
+        (IPPROTO_IP, 32 | 35) => 4,
         _ => 0,
     };
     if need > 0 && data.len() < need {
@@ -2436,6 +2449,29 @@ mod setsockopt_len_tests {
         assert_eq!(check_setsockopt_len(1, 20, &[0u8; 16]), Ok(()));
     }
 
+    /// The IP level takes a one-byte value where the socket level does not:
+    /// `do_ip_setsockopt` falls back to reading an `unsigned char`. Demanding
+    /// four bytes there refused `setsockopt(fd, IPPROTO_IP, IP_TTL, "\100", 1)`,
+    /// which is how a caller with a `char` has always set it.
+    #[test]
+    fn the_ip_level_reads_a_lone_byte_where_the_socket_level_will_not() {
+        for opt in [1, 2, 3, 33] {
+            assert_eq!(check_setsockopt_len(0, opt, &[64]), Ok(()), "opt {}", opt);
+            assert_eq!(
+                check_setsockopt_len(0, opt, &64u32.to_ne_bytes()),
+                Ok(()),
+                "opt {}",
+                opt
+            );
+            // Nothing to read is still nothing to read.
+            assert_eq!(check_setsockopt_len(0, opt, &[]), Err(LxError::EINVAL));
+        }
+        // An address or a `struct ip_mreq` is not an int with a short form.
+        assert_eq!(check_setsockopt_len(0, 32, &[1]), Err(LxError::EINVAL));
+        assert_eq!(check_setsockopt_len(0, 35, &[1]), Err(LxError::EINVAL));
+        // And the socket level keeps its four-byte minimum.
+        assert_eq!(check_setsockopt_len(1, 9, &[1]), Err(LxError::EINVAL));
+    }
 }
 
 downcast_rs::impl_downcast!(sync Socket);
