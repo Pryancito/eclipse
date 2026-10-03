@@ -477,7 +477,7 @@ impl Syscall<'_> {
                 // `readlinkat`s a symbolic link it holds by descriptor
                 // (`path_openat` routes it to `do_o_path` with the link as
                 // the result). Every other `O_NOFOLLOW` open is `ELOOP`.
-                let o_path_link = flags.is_path() && !follow;
+                let o_path_link = o_path_holds_the_link(flags, follow, path);
                 if !follow && !o_path_link {
                     let (dir_path, file_name) = split_path(path);
                     let dir_inode = proc.lookup_inode_at(dir_fd, dir_path, true)?;
@@ -488,9 +488,23 @@ impl Syscall<'_> {
                         return Err(LxError::ELOOP);
                     }
                 }
-                // ... and only that combination asks the walk not to follow,
-                // so the symbolic link's own inode is what comes back.
-                let inode = proc.lookup_inode_at(dir_fd, path, !o_path_link)?;
+                // ... and only that combination stops short of the link.
+                //
+                // It cannot be done by asking the walk not to follow: that
+                // budget covers EVERY hop, so a link met on the WAY would be
+                // left in place too and the next component would come back
+                // `ENOTDIR` (`lookup_with_budget` in `vendor/rcore-fs/src/
+                // vfs.rs`, and the `lookup("l3/x") == NotDir` its own test
+                // asserts). Linux clears `LOOKUP_FOLLOW` for the LAST
+                // component alone, so the directory is resolved the ordinary
+                // way and the last name is looked up inside it.
+                let inode = if o_path_link {
+                    let (dir_path, file_name) = split_path(path);
+                    let dir_inode = proc.lookup_inode_at(dir_fd, dir_path, true)?;
+                    dir_inode.find(file_name)?
+                } else {
+                    proc.lookup_inode_at(dir_fd, path, true)?
+                };
                 let metadata = inode.metadata()?;
                 // `may_open`: the type's refusals (ELOOP, EISDIR) come before
                 // `inode_permission`.
@@ -1596,6 +1610,22 @@ pub(crate) fn nodev_applies_to(type_: FileType) -> bool {
     matches!(type_, FileType::CharDevice | FileType::BlockDevice)
 }
 
+/// Whether this open must come back holding the symbolic link itself rather
+/// than what it points at.
+///
+/// `O_PATH|O_NOFOLLOW` is the documented way to get a descriptor for a link
+/// (`path_openat` routes it to `do_o_path` with the link as the result), and
+/// the only `O_NOFOLLOW` open that is not `ELOOP`.
+///
+/// A trailing slash is the exception, and it is not cosmetic: `link_path_walk`
+/// turns one into `LOOKUP_DIRECTORY | LOOKUP_FOLLOW` on the last component, so
+/// `open("l/", O_PATH|O_NOFOLLOW)` follows `l` like every other caller does --
+/// what the caller named is a directory, not a link. Answering with the link
+/// there would hand back a descriptor for something the path did not name.
+pub(crate) fn o_path_holds_the_link(flags: OpenFlags, follow: bool, path: &str) -> bool {
+    flags.is_path() && !follow && !path.ends_with('/')
+}
+
 /// Whether a `nodev` mount may refuse this open.
 ///
 /// `may_open` is where Linux calls `may_open_dev`, and `path_openat` routes an
@@ -1795,6 +1825,41 @@ mod open_flag_tests {
             open_resolved_type(with_dir, FileType::SymLink),
             Err(LxError::ENOTDIR)
         );
+    }
+
+    /// The resolution itself: `O_PATH|O_NOFOLLOW` has to stop at the LAST
+    /// component, never at the first link on the way. Asking the walk not to
+    /// follow anything would do the latter -- `lookup_with_budget` leaves
+    /// every link in place with a zero budget, and the component after one is
+    /// `NotDir`, which `vendor/rcore-fs/src/vfs.rs` asserts for itself
+    /// (`lookup("l3/x") == NotDir`). So `sysfs/.../device/driver`, where
+    /// `device` is a link, must still resolve.
+    #[test]
+    fn o_path_stops_at_the_last_component_and_not_at_the_first_link() {
+        const O_PATH: usize = 0o10000000;
+        let path_nofollow = open_flags(O_PATH | OpenFlags::NOFOLLOW.bits()).unwrap();
+        assert!(
+            o_path_holds_the_link(path_nofollow, false, "through-link/final-link"),
+            "the walk must resolve `through-link` and then look `final-link` up in it"
+        );
+        assert!(o_path_holds_the_link(path_nofollow, false, "link"));
+
+        // A trailing slash names a directory, so the link is followed.
+        assert!(
+            !o_path_holds_the_link(path_nofollow, false, "link/"),
+            "`LOOKUP_DIRECTORY | LOOKUP_FOLLOW` on the last component"
+        );
+        assert!(!o_path_holds_the_link(path_nofollow, false, "/"));
+
+        // And every other open resolves the ordinary way, O_PATH on its own
+        // included: without O_NOFOLLOW it follows the link like any open.
+        assert!(!o_path_holds_the_link(
+            open_flags(O_PATH).unwrap(),
+            true,
+            "link"
+        ));
+        assert!(!o_path_holds_the_link(OpenFlags::NOFOLLOW, false, "link"));
+        assert!(!o_path_holds_the_link(OpenFlags::RDONLY, true, "link"));
     }
 
     /// Second: a `nodev` mount refuses to OPEN a device node, and `/tmp`,
