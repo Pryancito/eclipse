@@ -2561,12 +2561,35 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
               \x20 /usr/share/dbus-1/system.conf 2>/dev/null | head -n 1)\n\
               USE_DAEMON=yes\n\
               if [ -n \"$WANT\" ] && ! grep -q \"^$WANT:\" /etc/passwd 2>/dev/null; then\n\
+              \x20 # Create it here rather than only complaining. The image\n\
+              \x20 # build lays this account down, but a rootfs built before\n\
+              \x20 # that did not, and the cost of being wrong is a boot with\n\
+              \x20 # no system bus at all. uid/gid 81 is what Alpine reserves;\n\
+              \x20 # if either the name or that id is already taken by\n\
+              \x20 # something else we touch nothing and say so.\n\
+              \x20 if [ -w /etc/passwd ] && ! grep -q \"^[^:]*:[^:]*:81:\" /etc/passwd 2>/dev/null; then\n\
+              \x20 \x20 echo \"$WANT:x:81:81:dbus:/dev/null:/sbin/nologin\" >> /etc/passwd\n\
+              \x20 \x20 grep -q \"^$WANT:\" /etc/group 2>/dev/null || \\\n\
+              \x20 \x20 \x20 echo \"$WANT:x:81:\" >> /etc/group 2>/dev/null\n\
+              \x20 \x20 echo \"eclipse-dbus-system: added the missing user \x27$WANT\x27 to /etc/passwd\" \\\n\
+              \x20 \x20 \x20 > /dev/console 2>/dev/null || true\n\
+              \x20 fi\n\
+              fi\n\
+              if [ -n \"$WANT\" ] && ! grep -q \"^$WANT:\" /etc/passwd 2>/dev/null; then\n\
               \x20 M=\"eclipse-dbus-system: system.conf wants user \x27$WANT\x27 and\n\
               /etc/passwd has no such line, so dbus-daemon --system would exit 1\n\
               on every start; using eclipse-dbusd instead\"\n\
               \x20 echo \"$M\" > /dev/console 2>/dev/null || true\n\
               \x20 echo \"$M\" >&2\n\
               \x20 USE_DAEMON=no\n\
+              fi\n\
+              # Whatever dbus-daemon says on its way out has to reach the\n\
+              # CONSOLE, because that is the only thing anybody reads during a\n\
+              # boot: the service log lives in /tmp, so the first version of\n\
+              # this service restarted for ever without a word about why. The\n\
+              # exec below inherits this, and stdout still goes to the log.\n\
+              if [ -w /dev/console ]; then\n\
+              \x20 exec 2>/dev/console\n\
               fi\n\
               # Alpine's dbus-daemon first: --system brings the real policy\n\
               # from /usr/share/dbus-1/system.conf, which is what decides who\n\
