@@ -394,7 +394,12 @@ struct GpuCalls {
 /// and attach it with [`Screen::attach_gpu`].
 pub(crate) struct EmuGpu {
     name: &'static str,
-    hardware_kms: bool,
+    /// Whether this GPU owns scanout. Live, like the real thing: the NVIDIA
+    /// driver's `has_hardware_kms()` is
+    /// `surfaceflip_enabled() && hwflip_ready()`, and `hwflip_ready()` latches
+    /// during bring-up -- so the answer really does change under a client that
+    /// is mid-probe.
+    hardware_kms: AtomicBool,
     crtcs: Vec<u32>,
     connectors: Vec<u32>,
     planes: Vec<u32>,
@@ -421,7 +426,7 @@ impl EmuGpu {
     pub(crate) fn new(name: &'static str) -> EmuGpu {
         EmuGpu {
             name,
-            hardware_kms: false,
+            hardware_kms: AtomicBool::new(false),
             crtcs: alloc::vec![40],
             connectors: alloc::vec![41],
             planes: alloc::vec![42],
@@ -443,10 +448,9 @@ impl EmuGpu {
     /// A GPU that declares `has_hardware_kms()`, like the NVIDIA driver with
     /// `nvidia.hwflip`.
     pub(crate) fn hardware_kms(name: &'static str) -> EmuGpu {
-        EmuGpu {
-            hardware_kms: true,
-            ..EmuGpu::new(name)
-        }
+        let gpu = EmuGpu::new(name);
+        gpu.hardware_kms.store(true, Ordering::Relaxed);
+        gpu
     }
 
     /// The CRTC, connector and plane ids this GPU reports. Two GPUs given the
@@ -486,7 +490,7 @@ impl DrmScheme for EmuGpu {
     }
 
     fn has_hardware_kms(&self) -> bool {
-        self.hardware_kms
+        self.hardware_kms.load(Ordering::Relaxed)
     }
 
     fn get_connector_edid(&self, id: u32) -> Option<[u8; 128]> {
@@ -630,6 +634,14 @@ impl Gpu {
     /// How many times the driver's `wait_vblank` was called.
     pub(crate) fn vblank_waits(&self) -> u32 {
         self.gpu.calls.lock().vblank_waits
+    }
+
+    /// Take scanout away from this driver, or give it back, with the GPU
+    /// already registered -- which is what the NVIDIA driver does to itself
+    /// when `hwflip_ready()` latches. A client that is part way through a
+    /// multi-ioctl query sees the topology answer change underneath it.
+    pub(crate) fn set_hardware_kms(&self, on: bool) {
+        self.gpu.hardware_kms.store(on, Ordering::Relaxed);
     }
 
     /// Make the driver refuse every following flip, as a real one does when the
