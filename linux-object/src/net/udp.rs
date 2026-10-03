@@ -757,10 +757,7 @@ mod tests {
             Socket::setsockopt(&s, 1, 3, &0u32.to_ne_bytes()),
             Err(LxError::ENOPROTOOPT)
         );
-        assert_eq!(
-            Socket::setsockopt(&s, 1, 9, &[]),
-            Err(LxError::EINVAL)
-        );
+        assert_eq!(Socket::setsockopt(&s, 1, 9, &[]), Err(LxError::EINVAL));
     }
 
     fn loopback() -> Interface<'static, Loopback> {
@@ -1070,18 +1067,12 @@ mod tests {
         let a = sock();
         let b = sock();
         assert!(!Socket::so_reuseaddr(&a));
-        assert_eq!(
-            Socket::setsockopt(&a, 1, 2, &1u32.to_ne_bytes()),
-            Ok(0)
-        );
+        assert_eq!(Socket::setsockopt(&a, 1, 2, &1u32.to_ne_bytes()), Ok(0));
         assert!(Socket::so_reuseaddr(&a));
         assert_eq!(Socket::bind(&a, v4(40100)), Ok(0));
         // Without the flag, the second bind is refused.
         assert_eq!(Socket::bind(&b, v4(40100)), Err(LxError::EADDRINUSE));
-        assert_eq!(
-            Socket::setsockopt(&b, 1, 2, &1u32.to_ne_bytes()),
-            Ok(0)
-        );
+        assert_eq!(Socket::setsockopt(&b, 1, 2, &1u32.to_ne_bytes()), Ok(0));
         assert_eq!(Socket::bind(&b, v4(40100)), Ok(0));
     }
 }

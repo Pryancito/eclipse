@@ -618,9 +618,7 @@ impl Syscall<'_> {
                     TcpOptname::KEEPINTVL => {
                         write_sockopt_out(optval, optlen, &75u32.to_ne_bytes())
                     }
-                    TcpOptname::KEEPCNT => {
-                        write_sockopt_out(optval, optlen, &9u32.to_ne_bytes())
-                    }
+                    TcpOptname::KEEPCNT => write_sockopt_out(optval, optlen, &9u32.to_ne_bytes()),
                     TcpOptname::CONGESTION => {
                         // Linux returns a NUL-terminated CCA name. We have no
                         // pluggable congestion control; answer a fixed "reno"

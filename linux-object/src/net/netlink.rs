@@ -768,13 +768,7 @@ impl FileLike for NetlinkSocketState {
 
     /// `FIONREAD`/`SIOCINQ`: size of the next queued netlink message (0 if empty).
     fn readable_bytes(&self) -> Option<usize> {
-        Some(
-            self.data
-                .lock()
-                .first()
-                .map(|m| m.len())
-                .unwrap_or(0),
-        )
+        Some(self.data.lock().first().map(|m| m.len()).unwrap_or(0))
     }
 
     fn as_socket(&self) -> LxResult<&dyn Socket> {

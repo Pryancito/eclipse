@@ -2379,10 +2379,10 @@ pub(crate) fn check_setsockopt_len(level: usize, opt: usize, data: &[u8]) -> LxR
     const IPPROTO_IP: usize = 0;
     const IPPROTO_TCP: usize = 6;
     let need = match (level, opt) {
-        (SOL_SOCKET, 13) => 8,              // struct linger
-        (SOL_SOCKET, 20 | 21) => 16,        // struct timeval
+        (SOL_SOCKET, 13) => 8,                     // struct linger
+        (SOL_SOCKET, 20 | 21) => 16,               // struct timeval
         (SOL_SOCKET, 2 | 6 | 7 | 8 | 9 | 15) => 4, // int options
-        (IPPROTO_TCP, 1 | 4 | 5 | 6) => 4,  // int TCP_* (not CONGESTION)
+        (IPPROTO_TCP, 1 | 4 | 5 | 6) => 4,         // int TCP_* (not CONGESTION)
         (IPPROTO_IP, 1 | 2 | 3 | 32 | 33 | 35) => 4,
         _ => 0,
     };
