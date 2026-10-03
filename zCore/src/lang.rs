@@ -750,6 +750,28 @@ fn panic(info: &PanicInfo) -> ! {
         }
     }
 
+    // The last word on the screen. The early framebuffer console does not
+    // scroll: it clears and restarts at the top when it fills, so on a 25-line
+    // display the backtrace just printed above can have wiped the panic
+    // message -- vector, symbolized RIP, error code and all -- off the glass.
+    // A photo of the screen is the only artifact that comes back from a real
+    // machine, so the one line that has to survive is printed last, after
+    // everything that could overwrite it. Armed by the x86 trap handler
+    // immediately before it panics, and taken rather than peeked so an
+    // ordinary panic is never decorated with an exception it did not take.
+    #[cfg(target_arch = "x86_64")]
+    if let Some((vec, error_code, rip)) = kernel_hal::kstats::take_exception() {
+        let summary = format_args!(
+            "[exception] {} (vec={:#x}) at rip={}\n[exception] {}\n",
+            kernel_hal::context::x86_vector_name(vec),
+            vec,
+            kernel_hal::ksyms::Addr(rip),
+            kernel_hal::context::X86TrapErrorCode { vec, error_code },
+        );
+        kernel_hal::console::serial_write_fmt_spin(summary);
+        kernel_hal::console::graphic_console_write_fmt_spin(summary);
+    }
+
     // How many kernel faults this boot has already survived. A panic arriving
     // behind others that were contained is usually the same root cause coming
     // back, and that is worth knowing from the banner alone.

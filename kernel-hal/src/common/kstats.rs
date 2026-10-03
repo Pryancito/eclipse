@@ -533,6 +533,58 @@ pub fn note_fault_regs(rip: u64, rbp: u64, rsp: u64) {
     }
 }
 
+/// [diag] The CPU exception a panic is about to report, so the panic handler
+/// can repeat it *after* the backtrace.
+///
+/// Packed as `vec << 32 | error_code` with bit 63 as "armed", alongside the
+/// faulting RIP. Zero means nothing is armed, which is also what an ordinary
+/// `panic!()` leaves behind.
+///
+/// Why a stash and not just a longer panic message: on a real machine the only
+/// artifact that comes back is a photo of the framebuffer, and the early
+/// framebuffer console does not scroll — it clears the screen and restarts at
+/// the top when it fills (`early_fb_console::newline`). The panic handler
+/// prints the message and then up to 32 backtrace lines, so on a 25-line
+/// display a deep backtrace wipes the message off the glass before the
+/// operator ever sees it. Whatever has to survive must therefore be printed
+/// last, which is after the backtrace, which is somewhere the trap frame no
+/// longer exists.
+static EXCEPTION_SUMMARY: [AtomicU64; MAX_CORE_NUM] = [const { AtomicU64::new(0) }; MAX_CORE_NUM];
+static EXCEPTION_RIP: [AtomicU64; MAX_CORE_NUM] = [const { AtomicU64::new(0) }; MAX_CORE_NUM];
+
+const EXCEPTION_ARMED: u64 = 1 << 63;
+
+/// [diag] Arm the one-line exception summary for the panic that is about to
+/// happen on this cpu. Call immediately before `panic!`.
+pub fn note_exception(vec: usize, error_code: usize, rip: u64) {
+    if let Some(cpu) = fault_slot() {
+        EXCEPTION_RIP[cpu].store(rip, Relaxed);
+        EXCEPTION_SUMMARY[cpu].store(
+            EXCEPTION_ARMED
+                | ((vec as u64 & 0x7fff_ffff) << 32)
+                | (error_code as u64 & 0xffff_ffff),
+            Relaxed,
+        );
+    }
+}
+
+/// [diag] Take the armed exception summary, leaving nothing behind.
+///
+/// Taking rather than peeking is what keeps a later, unrelated `panic!()` from
+/// being decorated with the last exception this cpu happened to survive.
+pub fn take_exception() -> Option<(usize, usize, u64)> {
+    let cpu = fault_slot()?;
+    let packed = EXCEPTION_SUMMARY[cpu].swap(0, Relaxed);
+    if packed & EXCEPTION_ARMED == 0 {
+        return None;
+    }
+    Some((
+        ((packed >> 32) & 0x7fff_ffff) as usize,
+        (packed & 0xffff_ffff) as usize,
+        EXCEPTION_RIP[cpu].load(Relaxed),
+    ))
+}
+
 /// [diag] Read back the last page-fault RIP recorded by `note_fault_rip`.
 pub fn last_fault_rip() -> u64 {
     fault_slot().map_or(0, |cpu| FAULT_RIP[cpu].load(Relaxed))
