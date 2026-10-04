@@ -350,6 +350,10 @@ impl FileLike for SyncobjHandle {
         Err(LxError::EINVAL)
     }
 
+    fn write_at(&self, _offset: u64, _buf: &[u8]) -> LxResult<usize> {
+        Err(LxError::EINVAL)
+    }
+
     /// Match Linux `sync_file_poll`: `POLLIN` once the wrapped fence is
     /// signaled. Opaque syncobj fds stay never-ready (Mesa does not poll them
     /// via `sync_wait`).

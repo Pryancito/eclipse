@@ -490,6 +490,15 @@ impl Socket for PacketSocketState {
         Some(self.inner.socket_type)
     }
 
+    fn so_domain(&self) -> Option<u32> {
+        Some(crate::net::Domain::AF_PACKET as u32)
+    }
+
+    fn so_protocol(&self) -> Option<u32> {
+        // Ethertype stored at create/bind (host order in our state).
+        Some(*self.inner.protocol.lock() as u32)
+    }
+
     fn take_msg_flags(&self) -> i32 {
         core::mem::replace(&mut *self.last_msg_flags.lock(), 0)
     }

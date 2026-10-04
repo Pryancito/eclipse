@@ -43,6 +43,24 @@ pub struct UdpInner {
     write_closed: bool,
     /// `SO_REUSEADDR`.
     reuse_addr: bool,
+    /// `SO_BROADCAST`.
+    broadcast: bool,
+    /// `SO_KEEPALIVE` (harmless on UDP; still stored for getsockopt symmetry).
+    keepalive: bool,
+    /// `SO_REUSEPORT`.
+    reuse_port: bool,
+    /// `SO_LINGER`.
+    linger_on: bool,
+    linger_sec: i32,
+    /// `SO_RCVTIMEO` / `SO_SNDTIMEO`.
+    rcv_timeo: [u8; 16],
+    snd_timeo: [u8; 16],
+    /// `IP_TOS` / `IP_TTL` / multicast knobs.
+    ip_tos: u32,
+    ip_ttl: u32,
+    mcast_ttl: u32,
+    mcast_loop: bool,
+    mcast_if: u32,
     /// Endpoint registered in `UDP_BIND_TABLE` (released on drop).
     bound: Option<IpEndpoint>,
 }
@@ -146,6 +164,18 @@ impl UdpSocketState {
                 read_closed: false,
                 write_closed: false,
                 reuse_addr: false,
+                broadcast: false,
+                keepalive: false,
+                reuse_port: false,
+                linger_on: false,
+                linger_sec: 0,
+                rcv_timeo: [0; 16],
+                snd_timeo: [0; 16],
+                ip_tos: 0,
+                ip_ttl: 64,
+                mcast_ttl: 1,
+                mcast_loop: true,
+                mcast_if: 0,
                 bound: None,
             })),
         })
@@ -554,17 +584,81 @@ impl Socket for UdpSocketState {
         self.inner.lock().reuse_addr
     }
 
+    fn so_broadcast(&self) -> bool {
+        self.inner.lock().broadcast
+    }
+
+    fn so_keepalive(&self) -> bool {
+        self.inner.lock().keepalive
+    }
+
+    fn so_reuseport(&self) -> bool {
+        self.inner.lock().reuse_port
+    }
+
+    fn so_linger(&self) -> (bool, i32) {
+        let inner = self.inner.lock();
+        (inner.linger_on, inner.linger_sec)
+    }
+
+    fn so_rcvtimeo(&self) -> [u8; 16] {
+        self.inner.lock().rcv_timeo
+    }
+
+    fn so_sndtimeo(&self) -> [u8; 16] {
+        self.inner.lock().snd_timeo
+    }
+
+    fn ip_tos(&self) -> u32 {
+        self.inner.lock().ip_tos
+    }
+
+    fn ip_ttl(&self) -> u32 {
+        self.inner.lock().ip_ttl
+    }
+
+    fn ip_multicast_ttl(&self) -> u32 {
+        self.inner.lock().mcast_ttl
+    }
+
+    fn ip_multicast_loop(&self) -> bool {
+        self.inner.lock().mcast_loop
+    }
+
+    fn ip_multicast_if(&self) -> u32 {
+        self.inner.lock().mcast_if
+    }
+
     fn is_inet(&self) -> bool {
         true
+    }
+
+    fn so_domain(&self) -> Option<u32> {
+        Some(if self.inner.lock().ipv6 {
+            crate::net::Domain::AF_INET6 as u32
+        } else {
+            crate::net::Domain::AF_INET as u32
+        })
+    }
+
+    fn so_protocol(&self) -> Option<u32> {
+        Some(17) // IPPROTO_UDP
     }
 
     fn setsockopt(&self, level: usize, opt: usize, data: &[u8]) -> SysResult {
         const SOL_SOCKET: usize = 1;
         const SO_REUSEADDR: usize = 2;
+        const SO_BROADCAST: usize = 6;
+        const SO_KEEPALIVE: usize = 9;
+        const SO_LINGER: usize = 13;
+        const SO_REUSEPORT: usize = 15;
+        const SO_RCVTIMEO: usize = 20;
+        const SO_SNDTIMEO: usize = 21;
         const IPPROTO_IP: usize = 0;
         const IPPROTO_TCP: usize = 6;
         const IP_HDRINCL: usize = 3;
-        if level == SOL_SOCKET && matches!(opt, 3 | 4 | 30) {
+        // SO_TYPE / SO_ERROR / SO_ACCEPTCONN / SO_PROTOCOL / SO_DOMAIN
+        if level == SOL_SOCKET && matches!(opt, 3 | 4 | 30 | 38 | 39) {
             return Err(LxError::ENOPROTOOPT);
         }
         if level == SOL_SOCKET && opt == SO_REUSEADDR {
@@ -576,12 +670,84 @@ impl Socket for UdpSocketState {
             self.inner.lock().reuse_addr = on;
             return Ok(0);
         }
+        if level == SOL_SOCKET && matches!(opt, SO_BROADCAST | SO_KEEPALIVE | SO_REUSEPORT) {
+            if data.len() < 4 {
+                return Err(LxError::EINVAL);
+            }
+            let on = u32::from_ne_bytes([data[0], data[1], data[2], data[3]]) != 0;
+            let mut inner = self.inner.lock();
+            match opt {
+                SO_BROADCAST => inner.broadcast = on,
+                SO_KEEPALIVE => inner.keepalive = on,
+                _ => inner.reuse_port = on,
+            }
+            return Ok(0);
+        }
+        if level == SOL_SOCKET && opt == SO_LINGER {
+            if data.len() < 8 {
+                return Err(LxError::EINVAL);
+            }
+            let on = i32::from_ne_bytes([data[0], data[1], data[2], data[3]]);
+            let sec = i32::from_ne_bytes([data[4], data[5], data[6], data[7]]);
+            let mut inner = self.inner.lock();
+            inner.linger_on = on != 0;
+            inner.linger_sec = sec;
+            return Ok(0);
+        }
+        if level == SOL_SOCKET && (opt == SO_RCVTIMEO || opt == SO_SNDTIMEO) {
+            if data.len() < 16 {
+                return Err(LxError::EINVAL);
+            }
+            let mut tv = [0u8; 16];
+            tv.copy_from_slice(&data[..16]);
+            let usec = i64::from_ne_bytes([
+                tv[8], tv[9], tv[10], tv[11], tv[12], tv[13], tv[14], tv[15],
+            ]);
+            if !(0..1_000_000).contains(&usec) {
+                return Err(LxError::EINVAL);
+            }
+            let mut inner = self.inner.lock();
+            if opt == SO_RCVTIMEO {
+                inner.rcv_timeo = tv;
+            } else {
+                inner.snd_timeo = tv;
+            }
+            return Ok(0);
+        }
         // TCP_* on UDP is ENOPROTOOPT; known int options need a full `int`.
         if level == IPPROTO_TCP {
             return Err(LxError::ENOPROTOOPT);
         }
         if level == IPPROTO_IP && opt == IP_HDRINCL {
             return Err(LxError::ENOPROTOOPT);
+        }
+        if level == IPPROTO_IP {
+            const IP_TOS: usize = 1;
+            const IP_TTL: usize = 2;
+            const IP_MULTICAST_IF: usize = 32;
+            const IP_MULTICAST_TTL: usize = 33;
+            const IP_MULTICAST_LOOP: usize = 34;
+            if matches!(
+                opt,
+                IP_TOS | IP_TTL | IP_MULTICAST_IF | IP_MULTICAST_TTL | IP_MULTICAST_LOOP
+            ) {
+                let val = if data.len() >= 4 {
+                    u32::from_ne_bytes([data[0], data[1], data[2], data[3]])
+                } else if !data.is_empty() {
+                    u32::from(data[0])
+                } else {
+                    return Err(LxError::EINVAL);
+                };
+                let mut inner = self.inner.lock();
+                match opt {
+                    IP_TOS => inner.ip_tos = val,
+                    IP_TTL => inner.ip_ttl = val,
+                    IP_MULTICAST_IF => inner.mcast_if = val,
+                    IP_MULTICAST_TTL => inner.mcast_ttl = val,
+                    _ => inner.mcast_loop = val != 0,
+                }
+                return Ok(0);
+            }
         }
         crate::net::check_setsockopt_len(level, opt, data)?;
         debug!("udp setsockopt: accepted as a no-op");

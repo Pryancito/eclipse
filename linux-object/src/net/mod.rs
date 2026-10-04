@@ -660,6 +660,10 @@ numeric_enum! {
         SNDTIMEO = 21,
         /// `SO_ACCEPTCONN` — nonzero while the socket is a passive listener.
         ACCEPTCONN = 30,
+        /// `SO_PROTOCOL` — protocol passed to `socket(2)` (read-only).
+        PROTOCOL = 38,
+        /// `SO_DOMAIN` — address family / domain (read-only).
+        DOMAIN = 39,
     }
 }
 
@@ -696,8 +700,8 @@ numeric_enum! {
         MulticastIf = 32,
         /// IP_MULTICAST_TTL — multicast hop limit
         MulticastTtl = 33,
-        /// IP_MULTICAST_LOOP — loopback multicast locally
-        MulticastLoop = 35,
+        /// IP_MULTICAST_LOOP — loopback multicast locally (`IP_ADD_MEMBERSHIP` is 35).
+        MulticastLoop = 34,
     }
 }
 
@@ -2322,8 +2326,8 @@ pub trait Socket: Send + Sync + Debug + downcast_rs::DowncastSync {
         const IPPROTO_TCP: usize = 6;
         const IP_HDRINCL: usize = 3;
         // Read-only SOL_SOCKET options — Linux rejects set with ENOPROTOOPT.
-        if level == SOL_SOCKET && matches!(opt, 3 | 4 | 30) {
-            // SO_TYPE / SO_ERROR / SO_ACCEPTCONN
+        if level == SOL_SOCKET && matches!(opt, 3 | 4 | 30 | 38 | 39) {
+            // SO_TYPE / SO_ERROR / SO_ACCEPTCONN / SO_PROTOCOL / SO_DOMAIN
             return Err(LxError::ENOPROTOOPT);
         }
         // `do_tcp_setsockopt` is TCP-only; other families must not swallow TCP_*.
@@ -2347,7 +2351,7 @@ pub trait Socket: Send + Sync + Debug + downcast_rs::DowncastSync {
             // TCP_NODELAY, TCP_KEEPIDLE/CNT/INTVL, TCP_CONGESTION.
             IPPROTO_TCP => matches!(opt, 1 | 4 | 5 | 6 | 13),
             // IP_TOS, IP_TTL, IP_HDRINCL, multicast knobs.
-            IPPROTO_IP => matches!(opt, 1 | 2 | 3 | 32 | 33 | 35),
+            IPPROTO_IP => matches!(opt, 1 | 2 | 3 | 32 | 33 | 34 | 35),
             _ => false,
         };
         if !known {
@@ -2380,10 +2384,66 @@ pub trait Socket: Send + Sync + Debug + downcast_rs::DowncastSync {
     fn so_reuseaddr(&self) -> bool {
         false
     }
+    /// `getsockopt(SO_BROADCAST)`: current flag. Default false.
+    fn so_broadcast(&self) -> bool {
+        false
+    }
+    /// `getsockopt(SO_KEEPALIVE)`: current flag. Default false.
+    fn so_keepalive(&self) -> bool {
+        false
+    }
+    /// `getsockopt(SO_REUSEPORT)`: current flag. Default false.
+    fn so_reuseport(&self) -> bool {
+        false
+    }
+    /// `getsockopt(SO_LINGER)`: `(l_onoff, l_linger)`. Default off.
+    fn so_linger(&self) -> (bool, i32) {
+        (false, 0)
+    }
+    /// `getsockopt(SO_RCVTIMEO)`: 16-byte `struct timeval`. Default zero.
+    fn so_rcvtimeo(&self) -> [u8; 16] {
+        [0; 16]
+    }
+    /// `getsockopt(SO_SNDTIMEO)`: 16-byte `struct timeval`. Default zero.
+    fn so_sndtimeo(&self) -> [u8; 16] {
+        [0; 16]
+    }
+    /// `getsockopt(TCP_KEEPIDLE)`. Default 7200.
+    fn tcp_keepidle(&self) -> Option<u32> {
+        None
+    }
+    /// `getsockopt(TCP_KEEPINTVL)`. Default 75.
+    fn tcp_keepintvl(&self) -> Option<u32> {
+        None
+    }
+    /// `getsockopt(TCP_KEEPCNT)`. Default 9.
+    fn tcp_keepcnt(&self) -> Option<u32> {
+        None
+    }
     /// `getsockopt(IP_HDRINCL)`: whether the caller supplies the IPv4 header.
     /// Default false; raw AF_INET overrides.
     fn ip_hdrincl(&self) -> bool {
         false
+    }
+    /// `getsockopt(IP_TOS)`. Default 0.
+    fn ip_tos(&self) -> u32 {
+        0
+    }
+    /// `getsockopt(IP_TTL)`. Default 64.
+    fn ip_ttl(&self) -> u32 {
+        64
+    }
+    /// `getsockopt(IP_MULTICAST_TTL)`. Default 1.
+    fn ip_multicast_ttl(&self) -> u32 {
+        1
+    }
+    /// `getsockopt(IP_MULTICAST_LOOP)`. Default true.
+    fn ip_multicast_loop(&self) -> bool {
+        true
+    }
+    /// `getsockopt(IP_MULTICAST_IF)` as `in_addr` (network order word). Default 0.
+    fn ip_multicast_if(&self) -> u32 {
+        0
     }
     /// `getsockopt(TCP_NODELAY)`: Nagle disabled. Default false; TCP overrides.
     fn tcp_nodelay(&self) -> bool {
@@ -2403,9 +2463,148 @@ pub trait Socket: Send + Sync + Debug + downcast_rs::DowncastSync {
     fn is_raw_ipv4(&self) -> bool {
         false
     }
+    /// `getsockopt(SO_DOMAIN)`: `AF_*` this socket was opened with.
+    fn so_domain(&self) -> Option<u32> {
+        None
+    }
+    /// `getsockopt(SO_PROTOCOL)`: protocol number from `socket(2)`.
+    fn so_protocol(&self) -> Option<u32> {
+        None
+    }
     /// Flags for the last `recv`/`recvmsg` (e.g. `MSG_TRUNC`); cleared on take.
     fn take_msg_flags(&self) -> i32 {
         0
+    }
+}
+
+/// Stored `SOL_SOCKET` / `IPPROTO_IP` knobs for inet sockets that used to
+/// accept set as a no-op while get always answered the defaults (ICMP, raw).
+#[derive(Debug, Clone)]
+pub(crate) struct StoredInetOpts {
+    pub reuse_addr: bool,
+    pub broadcast: bool,
+    pub keepalive: bool,
+    pub reuse_port: bool,
+    pub linger_on: bool,
+    pub linger_sec: i32,
+    pub rcv_timeo: [u8; 16],
+    pub snd_timeo: [u8; 16],
+    pub ip_tos: u32,
+    pub ip_ttl: u32,
+    pub mcast_ttl: u32,
+    pub mcast_loop: bool,
+    pub mcast_if: u32,
+}
+
+impl Default for StoredInetOpts {
+    fn default() -> Self {
+        Self {
+            reuse_addr: false,
+            broadcast: false,
+            keepalive: false,
+            reuse_port: false,
+            linger_on: false,
+            linger_sec: 0,
+            rcv_timeo: [0; 16],
+            snd_timeo: [0; 16],
+            ip_tos: 0,
+            ip_ttl: 64,
+            mcast_ttl: 1,
+            mcast_loop: true,
+            mcast_if: 0,
+        }
+    }
+}
+
+impl StoredInetOpts {
+    /// Apply a common inet sockopt. `Some` = handled (incl. errors);
+    /// `None` = caller should keep going (e.g. raw `IP_HDRINCL`).
+    pub fn try_setsockopt(
+        &mut self,
+        level: usize,
+        opt: usize,
+        data: &[u8],
+    ) -> Option<SysResult> {
+        const SOL_SOCKET: usize = 1;
+        const IPPROTO_IP: usize = 0;
+        const IPPROTO_TCP: usize = 6;
+        if level == SOL_SOCKET && matches!(opt, 3 | 4 | 30 | 38 | 39) {
+            return Some(Err(LxError::ENOPROTOOPT));
+        }
+        if level == IPPROTO_TCP {
+            return Some(Err(LxError::ENOPROTOOPT));
+        }
+        if level == SOL_SOCKET {
+            match opt {
+                2 | 6 | 9 | 15 => {
+                    if data.len() < 4 {
+                        return Some(Err(LxError::EINVAL));
+                    }
+                    let on = u32::from_ne_bytes([data[0], data[1], data[2], data[3]]) != 0;
+                    match opt {
+                        2 => self.reuse_addr = on,
+                        6 => self.broadcast = on,
+                        9 => self.keepalive = on,
+                        _ => self.reuse_port = on,
+                    }
+                    return Some(Ok(0));
+                }
+                13 => {
+                    if data.len() < 8 {
+                        return Some(Err(LxError::EINVAL));
+                    }
+                    self.linger_on =
+                        i32::from_ne_bytes([data[0], data[1], data[2], data[3]]) != 0;
+                    self.linger_sec =
+                        i32::from_ne_bytes([data[4], data[5], data[6], data[7]]);
+                    return Some(Ok(0));
+                }
+                20 | 21 => {
+                    if data.len() < 16 {
+                        return Some(Err(LxError::EINVAL));
+                    }
+                    let mut tv = [0u8; 16];
+                    tv.copy_from_slice(&data[..16]);
+                    let usec = i64::from_ne_bytes([
+                        tv[8], tv[9], tv[10], tv[11], tv[12], tv[13], tv[14], tv[15],
+                    ]);
+                    if !(0..1_000_000).contains(&usec) {
+                        return Some(Err(LxError::EINVAL));
+                    }
+                    if opt == 20 {
+                        self.rcv_timeo = tv;
+                    } else {
+                        self.snd_timeo = tv;
+                    }
+                    return Some(Ok(0));
+                }
+                _ => {}
+            }
+        }
+        if level == IPPROTO_IP {
+            // Leave HDRINCL to the caller (raw only).
+            if opt == 3 {
+                return None;
+            }
+            if matches!(opt, 1 | 2 | 32 | 33 | 34) {
+                let val = if data.len() >= 4 {
+                    u32::from_ne_bytes([data[0], data[1], data[2], data[3]])
+                } else if !data.is_empty() {
+                    u32::from(data[0])
+                } else {
+                    return Some(Err(LxError::EINVAL));
+                };
+                match opt {
+                    1 => self.ip_tos = val,
+                    2 => self.ip_ttl = val,
+                    32 => self.mcast_if = val,
+                    33 => self.mcast_ttl = val,
+                    _ => self.mcast_loop = val != 0,
+                }
+                return Some(Ok(0));
+            }
+        }
+        None
     }
 }
 
@@ -2432,10 +2631,9 @@ pub(crate) fn check_setsockopt_len(level: usize, opt: usize, data: &[u8]) -> LxR
         // ordinary call, and demanding four bytes refused it. IP_TOS (1),
         // IP_TTL (2), IP_HDRINCL (3) and IP_MULTICAST_TTL (33) all go through
         // that path.
-        (IPPROTO_IP, 1 | 2 | 3 | 33) => 1,
-        // These two do not: IP_MULTICAST_IF (32) takes an address and
-        // IP_ADD_MEMBERSHIP (35) a `struct ip_mreq`, and `ip_mcast_join_leave`
-        // checks the length itself before reading either.
+        (IPPROTO_IP, 1 | 2 | 3 | 33 | 34) => 1, // TOS/TTL/HDRINCL/mcast TTL/LOOP
+        // IP_MULTICAST_IF (32) takes an address; IP_ADD_MEMBERSHIP (35) a
+        // `struct ip_mreq` (not LOOP — that is 34).
         (IPPROTO_IP, 32 | 35) => 4,
         _ => 0,
     };

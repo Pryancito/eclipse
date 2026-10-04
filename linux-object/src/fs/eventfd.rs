@@ -158,8 +158,9 @@ impl FileLike for EventFd {
         }
     }
 
-    async fn read_at(&self, _offset: u64, buf: &mut [u8]) -> LxResult<usize> {
-        self.read(buf).await
+    async fn read_at(&self, _offset: u64, _buf: &mut [u8]) -> LxResult<usize> {
+        // eventfd is not seekable; pread must be ESPIPE (not a silent read).
+        Err(LxError::ESPIPE)
     }
 
     fn poll(&self, _events: PollEvents) -> LxResult<PollStatus> {
@@ -561,5 +562,16 @@ mod tests {
 
         write8(&fd, 1).unwrap();
         assert!(woke(), "a parked epoll waiter was never told");
+    }
+
+    /// eventfd is not seekable: `pread` must be `ESPIPE`, not a silent read
+    /// of the counter (which used to ignore the offset entirely).
+    #[test]
+    fn pread_is_espipe() {
+        let fd = efd(1, nonblock());
+        let mut buf = [0u8; 8];
+        assert_eq!(block_on(fd.read_at(0, &mut buf)), Err(LxError::ESPIPE));
+        // Ordinary read still drains the counter.
+        assert_eq!(read8(&fd).unwrap(), 1);
     }
 }

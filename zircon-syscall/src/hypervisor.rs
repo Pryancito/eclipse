@@ -24,12 +24,13 @@ impl Syscall<'_> {
             "hypervisor.guest_create: resource={:#x?}, options={:?}",
             resource, options
         );
-        if options != 0 {
-            return Err(ZxError::INVALID_ARGS);
-        }
         let proc = self.thread.proc();
         proc.get_object::<Resource>(resource)?
             .validate_system(SystemResource::Hypervisor)?;
+        // Handle first: options!=0 used to hide BAD_HANDLE / WRONG_TYPE.
+        if options != 0 {
+            return Err(ZxError::INVALID_ARGS);
+        }
 
         let guest = Guest::new()?;
         let vmar = guest.vmar();
@@ -96,11 +97,12 @@ impl Syscall<'_> {
             "hypervisor.vcpu_create: guest_handle={:#x?}, options={:?}, entry={:#x?}",
             guest_handle, options, entry
         );
+        let proc = self.thread.proc();
+        let guest = proc.get_object_with_rights::<Guest>(guest_handle, Rights::MANAGE_PROCESS)?;
+        // Handle first: options!=0 used to hide BAD_HANDLE / WRONG_TYPE.
         if options != 0 {
             return Err(ZxError::INVALID_ARGS);
         }
-        let proc = self.thread.proc();
-        let guest = proc.get_object_with_rights::<Guest>(guest_handle, Rights::MANAGE_PROCESS)?;
         let vcpu = Vcpu::new(guest, entry, (*self.thread).clone())?;
         install_handle(proc, Handle::new(vcpu, Rights::DEFAULT_VCPU), &mut out)
     }
@@ -146,13 +148,15 @@ impl Syscall<'_> {
             "hypervisor.vcpu_read_state: handle={:#x?}, kind={:?}, buffer_size={:?}",
             handle, kind, buffer_size
         );
-        if kind != VcpuReadWriteKind::VcpuState as u32 || buffer_size != size_of::<VcpuState>() {
-            return Err(ZxError::INVALID_ARGS);
-        }
+        // Handle first: a bad kind/size used to hide BAD_HANDLE / WRONG_TYPE
+        // (write_state already resolves the VCPU before validating kind).
         let proc = self.thread.proc();
         let vcpu = proc.get_object_with_rights::<Vcpu>(handle, Rights::READ)?;
         if !vcpu.same_thread(&self.thread) {
             return Err(ZxError::BAD_STATE);
+        }
+        if kind != VcpuReadWriteKind::VcpuState as u32 || buffer_size != size_of::<VcpuState>() {
+            return Err(ZxError::INVALID_ARGS);
         }
         let state = vcpu.read_state()?;
         user_buffer.write(state)?;

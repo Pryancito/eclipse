@@ -38,30 +38,33 @@ impl Syscall<'_> {
             "socket.write: socket={:#x?}, options={:#x?}, buffer={:#x?}, size={:#x?}",
             handle_value, options, user_bytes, count,
         );
-        if (count == 0 || !user_bytes.is_null()) && options == 0 {
-            let proc = self.thread.proc();
-            let socket = proc.get_object_with_rights::<Socket>(handle_value, Rights::WRITE)?;
-            let write_size = socket.write_size(count)?;
+        let proc = self.thread.proc();
+        // Handle first: options/null used to hide BAD_HANDLE / WRONG_TYPE.
+        let socket = proc.get_object_with_rights::<Socket>(handle_value, Rights::WRITE)?;
+        if options != 0 {
+            return Err(ZxError::INVALID_ARGS);
+        }
+        if count > 0 && user_bytes.is_null() {
+            return Err(ZxError::INVALID_ARGS);
+        }
+        let write_size = socket.write_size(count)?;
+        crate::user_memory::validate_user_range(
+            proc,
+            user_bytes.as_addr(),
+            write_size,
+            MMUFlags::READ,
+        )?;
+        if !actual_count_ptr.is_null() {
             crate::user_memory::validate_user_range(
                 proc,
-                user_bytes.as_addr(),
-                write_size,
-                MMUFlags::READ,
+                actual_count_ptr.as_addr(),
+                core::mem::size_of::<usize>(),
+                MMUFlags::WRITE,
             )?;
-            if !actual_count_ptr.is_null() {
-                crate::user_memory::validate_user_range(
-                    proc,
-                    actual_count_ptr.as_addr(),
-                    core::mem::size_of::<usize>(),
-                    MMUFlags::WRITE,
-                )?;
-            }
-            let actual_count = socket.write(user_bytes.as_slice(write_size)?)?;
-            actual_count_ptr.write_if_not_null(actual_count)?;
-            Ok(())
-        } else {
-            Err(ZxError::INVALID_ARGS)
         }
+        let actual_count = socket.write(user_bytes.as_slice(write_size)?)?;
+        actual_count_ptr.write_if_not_null(actual_count)?;
+        Ok(())
     }
 
     /// Read data from a socket.
@@ -77,6 +80,8 @@ impl Syscall<'_> {
             "socket.read: socket={:#x?}, options={:#x?}, buffer={:#x?}, size={:#x?}",
             handle_value, options, user_bytes, count,
         );
+        let proc = self.thread.proc();
+        let socket = proc.get_object_with_rights::<Socket>(handle_value, Rights::READ)?;
         if count > 0 && user_bytes.is_null() {
             return Err(ZxError::INVALID_ARGS);
         }
@@ -84,8 +89,6 @@ impl Syscall<'_> {
         if !(options - SocketFlags::SOCKET_PEEK).is_empty() {
             return Err(ZxError::INVALID_ARGS);
         }
-        let proc = self.thread.proc();
-        let socket = proc.get_object_with_rights::<Socket>(handle_value, Rights::READ)?;
         crate::user_memory::validate_user_range(
             proc,
             user_bytes.as_addr(),
@@ -119,13 +122,13 @@ impl Syscall<'_> {
         const NONE: u32 = 0;
         const WRITE_DISABLED: u32 = 1;
         const WRITE_ENABLED: u32 = 2;
+        let proc = self.thread.proc();
+        let socket = proc.get_object_with_rights::<Socket>(handle, Rights::MANAGE_SOCKET)?;
         if !matches!(disposition, NONE | WRITE_DISABLED | WRITE_ENABLED)
             || !matches!(peer_disposition, NONE | WRITE_DISABLED | WRITE_ENABLED)
         {
             return Err(ZxError::INVALID_ARGS);
         }
-        let proc = self.thread.proc();
-        let socket = proc.get_object_with_rights::<Socket>(handle, Rights::MANAGE_SOCKET)?;
         let decode = |value| match value {
             WRITE_DISABLED => Some(true),
             WRITE_ENABLED => Some(false),
@@ -136,13 +139,13 @@ impl Syscall<'_> {
 
     /// Prevent future reading or writing on a socket.
     pub fn sys_socket_shutdown(&self, socket: HandleValue, options: u32) -> ZxResult {
-        let options = shutdown_options(options)?;
         info!(
             "socket.shutdown: socket={:#x?}, options={:#x?}",
             socket, options
         );
         let proc = self.thread.proc();
         let socket = proc.get_object_with_rights::<Socket>(socket, Rights::WRITE)?;
+        let options = shutdown_options(options)?;
         let read = options.contains(SocketFlags::SHUTDOWN_READ);
         let write = options.contains(SocketFlags::SHUTDOWN_WRITE);
         socket.shutdown(read, write)?;

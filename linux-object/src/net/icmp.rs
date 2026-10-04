@@ -44,6 +44,8 @@ struct IcmpInner {
     read_closed: bool,
     /// `shutdown(SHUT_WR)`: with `read_closed`, poll reports hangup.
     write_closed: bool,
+    /// SOL_SOCKET / IPPROTO_IP knobs (get must mirror set).
+    opts: StoredInetOpts,
 }
 
 impl IcmpSocketState {
@@ -70,6 +72,7 @@ impl IcmpSocketState {
                 last_msg_flags: 0,
                 read_closed: false,
                 write_closed: false,
+                opts: StoredInetOpts::default(),
             })),
         })
     }
@@ -337,6 +340,70 @@ impl Socket for IcmpSocketState {
         true
     }
 
+    fn so_reuseaddr(&self) -> bool {
+        self.inner.lock().opts.reuse_addr
+    }
+    fn so_broadcast(&self) -> bool {
+        self.inner.lock().opts.broadcast
+    }
+    fn so_keepalive(&self) -> bool {
+        self.inner.lock().opts.keepalive
+    }
+    fn so_reuseport(&self) -> bool {
+        self.inner.lock().opts.reuse_port
+    }
+    fn so_linger(&self) -> (bool, i32) {
+        let o = &self.inner.lock().opts;
+        (o.linger_on, o.linger_sec)
+    }
+    fn so_rcvtimeo(&self) -> [u8; 16] {
+        self.inner.lock().opts.rcv_timeo
+    }
+    fn so_sndtimeo(&self) -> [u8; 16] {
+        self.inner.lock().opts.snd_timeo
+    }
+    fn ip_tos(&self) -> u32 {
+        self.inner.lock().opts.ip_tos
+    }
+    fn ip_ttl(&self) -> u32 {
+        self.inner.lock().opts.ip_ttl
+    }
+    fn ip_multicast_ttl(&self) -> u32 {
+        self.inner.lock().opts.mcast_ttl
+    }
+    fn ip_multicast_loop(&self) -> bool {
+        self.inner.lock().opts.mcast_loop
+    }
+    fn ip_multicast_if(&self) -> u32 {
+        self.inner.lock().opts.mcast_if
+    }
+
+    fn setsockopt(&self, level: usize, opt: usize, data: &[u8]) -> SysResult {
+        const IPPROTO_IP: usize = 0;
+        const IP_HDRINCL: usize = 3;
+        // ICMP is not SOCK_RAW; HDRINCL is ENOPROTOOPT.
+        if level == IPPROTO_IP && opt == IP_HDRINCL {
+            return Err(LxError::ENOPROTOOPT);
+        }
+        if let Some(r) = self.inner.lock().opts.try_setsockopt(level, opt, data) {
+            return r;
+        }
+        crate::net::check_setsockopt_len(level, opt, data)?;
+        Ok(0)
+    }
+
+    fn so_domain(&self) -> Option<u32> {
+        Some(if self.inner.lock().ipv6 {
+            crate::net::Domain::AF_INET6 as u32
+        } else {
+            crate::net::Domain::AF_INET as u32
+        })
+    }
+
+    fn so_protocol(&self) -> Option<u32> {
+        Some(if self.inner.lock().ipv6 { 58 } else { 1 }) // ICMPV6 / ICMP
+    }
+
     fn take_msg_flags(&self) -> i32 {
         core::mem::replace(&mut self.inner.lock().last_msg_flags, 0)
     }
@@ -564,5 +631,23 @@ mod endpoint_tests {
         assert!(!FileLike::poll(&s, PollEvents::IN).unwrap().hangup);
         assert_eq!(Socket::shutdown(&s, 1), Ok(0));
         assert!(FileLike::poll(&s, PollEvents::IN).unwrap().hangup);
+    }
+
+    /// SO_BROADCAST / IP_TTL must mirror set (used to stay at defaults).
+    #[test]
+    fn sockopts_mirror_setsockopt() {
+        let _g = crate::net::NET_TEST_LOCK.lock();
+        let s = IcmpSocketState::new(false).unwrap();
+        assert!(!Socket::so_broadcast(&s));
+        assert_eq!(Socket::ip_ttl(&s), 64);
+        assert_eq!(Socket::setsockopt(&s, 1, 6, &1u32.to_ne_bytes()), Ok(0));
+        assert_eq!(Socket::setsockopt(&s, 0, 2, &[42]), Ok(0));
+        assert!(Socket::so_broadcast(&s));
+        assert_eq!(Socket::ip_ttl(&s), 42);
+        assert_eq!(
+            Socket::setsockopt(&s, 0, 3, &[1]),
+            Err(LxError::ENOPROTOOPT),
+            "IP_HDRINCL is raw-only"
+        );
     }
 }

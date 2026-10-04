@@ -283,8 +283,14 @@ impl FileLike for SignalFd {
         Err(LxError::EINVAL)
     }
 
-    async fn read_at(&self, _offset: u64, buf: &mut [u8]) -> LxResult<usize> {
-        self.read(buf).await
+    fn write_at(&self, _offset: u64, _buf: &[u8]) -> LxResult<usize> {
+        // signalfd is not seekable; pwrite must be ESPIPE (write stays EINVAL).
+        Err(LxError::ESPIPE)
+    }
+
+    async fn read_at(&self, _offset: u64, _buf: &mut [u8]) -> LxResult<usize> {
+        // signalfd is not seekable; pread must be ESPIPE.
+        Err(LxError::ESPIPE)
     }
 
     fn poll(&self, _events: PollEvents) -> LxResult<PollStatus> {
@@ -477,6 +483,14 @@ mod tests {
         assert!(fd.pending_matched().is_empty());
         assert!(!fd.poll(PollEvents::IN).unwrap().read);
         assert!(fd.consume_one().is_none());
+    }
+
+    #[test]
+    fn pread_is_espipe() {
+        let fd = sfd(mask_of(&[LinuxSignal::SIGINT]), OpenFlags::NON_BLOCK);
+        let mut buf = [0u8; SIGINFO_SIZE];
+        assert_eq!(block_on(fd.read_at(0, &mut buf)), Err(LxError::ESPIPE));
+        assert_eq!(fd.write_at(0, b"x"), Err(LxError::ESPIPE));
     }
 }
 

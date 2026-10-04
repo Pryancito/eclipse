@@ -505,6 +505,10 @@ impl FileLike for Epoll {
         Err(LxError::EINVAL)
     }
 
+    fn write_at(&self, _offset: u64, _buf: &[u8]) -> LxResult<usize> {
+        Err(LxError::EINVAL)
+    }
+
     fn poll(&self, _events: PollEvents) -> LxResult<PollStatus> {
         // An epoll fd is readable iff any watched fd is ready. Surfacing this is
         // what lets a nested epoll (e.g. libinput's fd inside wlroots' event
@@ -732,6 +736,7 @@ mod tests {
         assert_eq!(block_on(ep.read(&mut buf)), Err(LxError::EINVAL));
         assert_eq!(ep.write(&[0u8; 8]), Err(LxError::EINVAL));
         assert_eq!(block_on(ep.read_at(0, &mut buf)), Err(LxError::EINVAL));
+        assert_eq!(ep.write_at(0, &[0u8; 8]), Err(LxError::EINVAL));
     }
 
     /// `fcntl(F_SETFL, O_NONBLOCK)` on an epoll fd used to return success
