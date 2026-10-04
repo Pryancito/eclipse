@@ -595,6 +595,61 @@ pub fn deadlock_holder_report(file_ptr: usize, file_len: usize, line: u32, cpu: 
     dl_paint();
 }
 
+/// How many panic reports are in flight on this machine.
+///
+/// A panic raised *while reporting a panic* is the shape that erases the only
+/// evidence there is. The handler below prints a banner, a red framebuffer
+/// band, the message, up to 32 backtrace lines and the exception summary; any
+/// one of those touches memory the fault being reported may have already
+/// wrecked. When one of them faults, the trap handler panics about THAT fault,
+/// the handler starts over, and the machine spends the rest of its life
+/// repainting a loop of reports instead of keeping the first one -- which is
+/// the real one -- on the glass. That is exactly the photograph that came back
+/// on 2026-10-04: one `#GP` in `memcpy`, then the same report over and over,
+/// the top of it already scrolled away.
+///
+/// Reset to zero immediately before containment, which does not return when it
+/// succeeds: a fault the kernel contained and survived must not leave the
+/// counter armed, or the next genuine panic -- minutes later, about something
+/// else entirely -- would print one line and halt.
+static PANIC_DEPTH: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// What a panic arriving at the handler should do, given how many reports were
+/// already in flight when it got there.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub(crate) enum PanicEntry {
+    /// Nothing else is being reported: print everything.
+    Report,
+    /// A report is already on the screen. Print one line saying so and stop,
+    /// without re-running any of the machinery that just faulted -- and above
+    /// all without repainting over the report that matters.
+    OneLine,
+    /// Even the one line faulted. Say nothing and halt; anything else is a
+    /// loop.
+    Silent,
+}
+
+/// The rule, apart from the handler so a test can run it.
+pub(crate) fn panic_entry(depth: usize) -> PanicEntry {
+    match depth {
+        0 => PanicEntry::Report,
+        1 => PanicEntry::OneLine,
+        _ => PanicEntry::Silent,
+    }
+}
+
+/// Stop this CPU for good. The halt tail of the panic handler, shared with the
+/// nested-panic paths so they cannot drift apart.
+#[cfg(not(test))]
+fn panic_halt() -> ! {
+    if cfg!(feature = "baremetal-test") {
+        kernel_hal::cpu::reset();
+    }
+    loop {
+        core::hint::spin_loop();
+    }
+}
+
 #[cfg(not(test))]
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
@@ -604,6 +659,38 @@ fn panic(info: &PanicInfo) -> ! {
     // is running, push_off/pop_off will call borrow_mut() on an already-borrowed
     // RefCell → nested panic → abort() → ud2 → triple fault → QEMU reset.
     kernel_hal::interrupt::intr_off();
+
+    // Before anything that could fault: is somebody already reporting? See
+    // [`PANIC_DEPTH`]. One shared counter rather than one per CPU, so a second
+    // CPU panicking at the same moment is also reduced to a line -- its report
+    // would interleave with the first one's and leave neither readable, and the
+    // line it does print names its cpu and its location.
+    match panic_entry(PANIC_DEPTH.fetch_add(1, core::sync::atomic::Ordering::SeqCst)) {
+        PanicEntry::Report => {}
+        PanicEntry::OneLine => {
+            // Deliberately the least machinery that can still say something: no
+            // framebuffer rasterizer, no backtrace walk, no console mode
+            // change, no allocation. `info.message()` is not formatted either
+            // -- a corrupt `Arguments` is one of the ways the first report
+            // faults -- so only the location, which the compiler planted as a
+            // static.
+            let (file, line) = match info.location() {
+                Some(l) => (l.file(), l.line()),
+                None => ("<unknown>", 0),
+            };
+            let args = format_args!(
+                "\n[panic-nested] a panic was raised at {}:{} while the report \
+                 above was being printed. THE FIRST REPORT IS THE REAL ONE; this \
+                 one is its reporting path falling over. Halting rather than \
+                 looping over it.\n",
+                file, line,
+            );
+            kernel_hal::console::serial_write_fmt_spin(args);
+            kernel_hal::console::graphic_console_write_fmt_spin(args);
+            panic_halt();
+        }
+        PanicEntry::Silent => panic_halt(),
+    }
 
     // Before any console output at all: tell the graphic console to stop
     // trusting its cell cache. Three boots in a row died as a panic INSIDE this
@@ -803,17 +890,15 @@ fn panic(info: &PanicInfo) -> ! {
     // if it succeeds; if it returns it has already said why it could not, and
     // we halt as always. Not attempted under `baremetal-test`, where a panic
     // *must* end the machine so the test fails.
+    // The report is out, so nothing below it is worth suppressing a later
+    // panic for -- and containment does not return when it works. See
+    // [`PANIC_DEPTH`].
+    PANIC_DEPTH.store(0, core::sync::atomic::Ordering::SeqCst);
     if !cfg!(feature = "baremetal-test") {
         crate::oops::try_contain("kernel panic", Some(prev_kd));
     }
 
-    if cfg!(feature = "baremetal-test") {
-        kernel_hal::cpu::reset();
-    } else {
-        loop {
-            core::hint::spin_loop();
-        }
-    }
+    panic_halt()
 }
 
 /// The banner builder and the deadlock slots, on the host.
@@ -888,6 +973,49 @@ mod tests {
 
     fn record(file: &'static str, line: u32, cpu: u32, holder: bool) {
         dl_record(file.as_ptr() as usize, file.len(), line, cpu, holder);
+    }
+
+    // ── The nested-panic guard ──────────────────────────────────────────────
+
+    /// The first report is the real one, so it is the only one that gets the
+    /// whole machinery. Without this the handler re-entered itself for as long
+    /// as the machine was alive, repainting a loop of reports over the fault
+    /// that started it.
+    #[test]
+    fn only_the_first_panic_in_flight_gets_the_full_report() {
+        assert_eq!(panic_entry(0), PanicEntry::Report);
+    }
+
+    /// The second one still says something -- a halt with no explanation reads
+    /// as a freeze -- but never re-runs the banner, the framebuffer band or the
+    /// backtrace walk, which are what faulted.
+    #[test]
+    fn a_panic_raised_while_one_is_being_reported_gets_one_line() {
+        assert_eq!(panic_entry(1), PanicEntry::OneLine);
+    }
+
+    /// And if even that one line faults, there is nothing left to say that
+    /// would not be a loop.
+    #[test]
+    fn a_panic_inside_the_one_line_says_nothing_at_all() {
+        assert_eq!(panic_entry(2), PanicEntry::Silent);
+        assert_eq!(panic_entry(usize::MAX), PanicEntry::Silent);
+    }
+
+    /// Containment does not return when it works, so the counter has to be
+    /// cleared before it: a fault the kernel survived must not reduce the next
+    /// genuine panic -- about something else entirely -- to one line.
+    #[test]
+    fn a_contained_fault_leaves_the_counter_disarmed() {
+        use core::sync::atomic::Ordering;
+        let saved = PANIC_DEPTH.load(Ordering::SeqCst);
+        PANIC_DEPTH.store(3, Ordering::SeqCst);
+        PANIC_DEPTH.store(0, Ordering::SeqCst);
+        assert_eq!(
+            panic_entry(PANIC_DEPTH.fetch_add(1, Ordering::SeqCst)),
+            PanicEntry::Report
+        );
+        PANIC_DEPTH.store(saved, Ordering::SeqCst);
     }
 
     // ── The banner buffer ───────────────────────────────────────────────────
