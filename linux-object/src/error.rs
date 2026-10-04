@@ -328,6 +328,7 @@ impl From<&FsError> for LxError {
             FsError::Broken => LxError::EPIPE,
             FsError::NoSuchDeviceOrAddress => LxError::ENXIO,
             FsError::NoKey => LxError::ENOKEY,
+            FsError::OutOfRange => LxError::ERANGE,
         }
     }
 }
@@ -449,6 +450,7 @@ mod errno_tests {
             (FsError::Broken, LxError::EPIPE),
             (FsError::NoSuchDeviceOrAddress, LxError::ENXIO),
             (FsError::NoKey, LxError::ENOKEY),
+            (FsError::OutOfRange, LxError::ERANGE),
         ] {
             let name = alloc::format!("{:?}", fs);
             // Both impls, on the same value: the borrowing one is what an

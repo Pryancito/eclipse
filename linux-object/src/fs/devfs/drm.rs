@@ -6984,6 +6984,17 @@ pub fn src_coords_fit(fb_width: u32, fb_height: u32, (x, y, w, h): (u32, u32, u3
     w <= fb_w && x <= fb_w - w && h <= fb_h && y <= fb_h - h
 }
 
+/// `__setplane_check` and `drm_atomic_plane_check`, "give drivers some help
+/// against integer overflows": the CRTC rectangle `(x, y, w, h)` has `w` and
+/// `h` at most `INT_MAX`, and `x + w` and `y + h` too (`crtc_x > INT_MAX -
+/// crtc_w`), else ERANGE. Measured after the CRTC mask and before the source
+/// rectangle, so a request wrong on both counts is ERANGE, not ENOSPC.
+pub fn crtc_coords_in_range((x, y, w, h): (i32, i32, u32, u32)) -> bool {
+    const MAX: i64 = i32::MAX as i64;
+    let (x, y, w, h) = (x as i64, y as i64, w as i64, h as i64);
+    w <= MAX && x + w <= MAX && h <= MAX && y + h <= MAX
+}
+
 /// A legacy `SETPLANE` with an fb, as `drm_atomic_helper_update_plane` commits
 /// it: all eight rectangles from the request, `src_*` in 16.16 as given.
 pub fn legacy_update_plane(crtc: (i32, i32, u32, u32), src: (u32, u32, u32, u32)) {
@@ -7186,6 +7197,9 @@ pub enum AtomicError {
     /// The plane's source rectangle does not fit its framebuffer
     /// (`drm_atomic_plane_check`: ENOSPC, not EINVAL).
     NoSpace,
+    /// The plane's CRTC rectangle does not fit in `int`
+    /// (`drm_atomic_plane_check`: ERANGE).
+    Range,
 }
 
 /// Validate and (unless `test_only`) apply an atomic update, queueing one
@@ -7321,6 +7335,29 @@ pub fn atomic_commit(
             );
             return Err(AtomicError::NotFound);
         };
+        // "Give drivers some help against integer overflows": the CRTC
+        // rectangle the commit ends with has to fit in `int`, `x + w` and
+        // `y + h` included (`drm_atomic_plane_check`, ERANGE), before the
+        // source rectangle is measured. CRTC_W and CRTC_H past INT_MAX
+        // already fail at the property; CRTC_X = INT_MAX with any width
+        // passed through here and was committed.
+        let crtc_rect = (
+            upd.crtc_x.unwrap_or(cur.crtc_x),
+            upd.crtc_y.unwrap_or(cur.crtc_y),
+            upd.crtc_w.unwrap_or(cur.crtc_w),
+            upd.crtc_h.unwrap_or(cur.crtc_h),
+        );
+        if !crtc_coords_in_range(crtc_rect) {
+            log::error!(
+                "[drm] ATOMIC reject (test_only={}): CRTC rect {}x{}+{}+{} overflows int",
+                test_only,
+                crtc_rect.2,
+                crtc_rect.3,
+                crtc_rect.0,
+                crtc_rect.1
+            );
+            return Err(AtomicError::Range);
+        }
         // The source rectangle, in 16.16, inside the fb: `src_w > fb_width
         // || src_x > fb_width - src_w`, so a fractional edge counts (31.5
         // wide from x = 0.75 is past 32), and the answer is ENOSPC. This
