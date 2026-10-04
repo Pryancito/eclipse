@@ -172,6 +172,26 @@ pub fn sched_switches() -> (bool, bool) {
     (false, false)
 }
 
+/// `(timers pending across every CPU's heap, timers adopted from a CPU that
+/// had stopped taking ticks)`.
+///
+/// Timer heaps are per-CPU, so no core is woken for another core's deadline.
+/// The second number is the safety net for that split and should stay 0: it
+/// only moves when some CPU went so long without a tick that another had to
+/// serve its callbacks.
+#[cfg(target_os = "none")]
+pub fn timer_heap_stats() -> (usize, u64) {
+    (
+        crate::timer::timer_pending_count(),
+        crate::timer::timer_stray_count(),
+    )
+}
+
+#[cfg(not(target_os = "none"))]
+pub fn timer_heap_stats() -> (usize, u64) {
+    (0, 0)
+}
+
 /// `(wake-up preemption requests, requests honoured)`.
 ///
 /// A request is raised when a task becomes runnable on a CPU that is busy with
