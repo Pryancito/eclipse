@@ -126,7 +126,13 @@ pub fn is_ever_writable(pid: u64, addr: usize, len: usize) -> bool {
 
 /// Drops tracked writable intervals overlapping `[addr, addr+len)` (on munmap).
 pub fn clear_region(pid: u64, addr: usize, len: usize) {
-    let q = (addr, end_of(addr, len.max(1)));
+    // Not `len.max(1)`, which is what the query below it does. Widening a
+    // zero-length *query* to one byte is conservative; widening a zero-length
+    // *unmap* subtracts a byte from the record instead -- the one direction
+    // this module promises never to take. `check_munmap` passes the syscall's
+    // length straight through, so an `munmap(addr, 0)` reaching the hook used
+    // to drop the first byte of whatever interval started there.
+    let q = (addr, end_of(addr, len));
     let mut map = REGIONS.lock();
     if let Some(pr) = map.get_mut(&pid) {
         if pr.saturated {
@@ -408,5 +414,192 @@ mod tests {
         // must not silently answer "no" just because the length rounded to
         // nothing -- `is_ever_writable` widens it to one byte on purpose.
         assert!(is_ever_writable(pid, 0x1000, 0));
+    }
+}
+
+#[cfg(test)]
+mod region_bookkeeping_tests {
+    use super::*;
+    use crate::test_globals;
+    use core::sync::atomic::Ordering;
+
+    fn reset() {
+        REGIONS.lock().clear();
+        EVICTED_UP_TO.store(0, Ordering::Relaxed);
+    }
+
+    /// Returns this process's tracked intervals, or `None` when it is
+    /// saturated (an imprecise "everything" set).
+    fn intervals_of(pid: u64) -> Option<Vec<(usize, usize)>> {
+        let map = REGIONS.lock();
+        match map.get(&pid) {
+            Some(pr) if pr.saturated => None,
+            Some(pr) => Some(pr.intervals.clone()),
+            None => Some(Vec::new()),
+        }
+    }
+
+    /// Both bounds are driven as literals by the tests below, and this is what
+    /// holds the constants to those literals. Every test that came first
+    /// looped over `MAX_REGIONS` or `MAX_TRACKED_PIDS` itself, so moving
+    /// either constant moved the test with it and passed in green.
+    #[test]
+    fn the_two_bounds_are_the_numbers_the_tests_drive() {
+        // 1024 intervals is the per-process budget. Lowering it turns precise
+        // tracking into a blanket "everything is writable" sooner than the
+        // module documents; raising it raises what one process can pin.
+        assert_eq!(MAX_REGIONS, 1024, "the per-process interval budget moved");
+        // 4096 processes is what bounds the table against a spawn flood. Every
+        // process dropped past it reads as ever-writable from then on, so the
+        // number is also how much collateral a flood causes.
+        assert_eq!(MAX_TRACKED_PIDS, 4096, "the tracked-process cap moved");
+    }
+
+    #[test]
+    fn exactly_the_budget_is_tracked_precisely_and_one_more_saturates() {
+        let _g = test_globals::lock();
+        reset();
+        let pid = 2_001;
+        for i in 0..1024 {
+            record_writable(pid, 0x100_0000 + i * 0x2000, 0x1000);
+        }
+        assert_eq!(
+            intervals_of(pid).map(|ivs| ivs.len()),
+            Some(1024),
+            "the budget itself must still be tracked interval by interval"
+        );
+        record_writable(pid, 0x100_0000 + 1024 * 0x2000, 0x1000);
+        assert!(
+            intervals_of(pid).is_none(),
+            "the first interval past the budget is what saturates"
+        );
+    }
+
+    #[test]
+    fn a_mapping_that_runs_off_the_end_of_the_address_space_is_clamped() {
+        let _g = test_globals::lock();
+        reset();
+        let pid = 2_002;
+        let last_page = usize::MAX - 0xfff;
+        // A length that carries the end past the top of memory. Clamping keeps
+        // an interval covering the last page; wrapping turns it inside out,
+        // and then the page just recorded writable reads as never writable --
+        // the fail-open this module exists to prevent.
+        record_writable(pid, last_page, 0x2000);
+        assert_eq!(
+            intervals_of(pid).unwrap(),
+            alloc::vec![(last_page, usize::MAX)]
+        );
+        assert!(
+            is_ever_writable(pid, last_page, 0x1000),
+            "the last page was just recorded writable"
+        );
+    }
+
+    #[test]
+    fn a_zero_length_unmap_forgets_nothing() {
+        let _g = test_globals::lock();
+        reset();
+        let pid = 2_003;
+        record_writable(pid, 0x1000, 0x2000);
+        // `munmap(addr, 0)` is EINVAL at the syscall layer, and the hook gets
+        // the length unchanged. Widening it the way a query is widened would
+        // subtract the first byte of the interval from the record.
+        clear_region(pid, 0x1000, 0);
+        assert_eq!(
+            intervals_of(pid).unwrap(),
+            alloc::vec![(0x1000, 0x3000)],
+            "an unmap of nothing must not drop a byte"
+        );
+        assert!(is_ever_writable(pid, 0x1000, 1));
+        // One byte, though, really is one byte.
+        clear_region(pid, 0x1000, 1);
+        assert_eq!(intervals_of(pid).unwrap(), alloc::vec![(0x1001, 0x3000)]);
+    }
+
+    #[test]
+    fn unmapping_an_end_of_an_interval_leaves_no_empty_sliver() {
+        let _g = test_globals::lock();
+        reset();
+        let pid = 2_004;
+        record_writable(pid, 0x4000, 0x4000);
+        // The head, exactly: there is no sliver in front of it to keep, and a
+        // kept-anyway `(0x4000, 0x4000)` would be an empty interval in a list
+        // documented as sorted and disjoint -- and one slot closer to the
+        // saturation cliff on every round of this.
+        clear_region(pid, 0x4000, 0x1000);
+        assert_eq!(intervals_of(pid).unwrap(), alloc::vec![(0x5000, 0x8000)]);
+        // And the tail, exactly.
+        clear_region(pid, 0x7000, 0x1000);
+        assert_eq!(intervals_of(pid).unwrap(), alloc::vec![(0x5000, 0x7000)]);
+        assert!(!is_ever_writable(pid, 0x4000, 0x1000));
+        assert!(!is_ever_writable(pid, 0x7000, 0x1000));
+    }
+
+    #[test]
+    fn a_table_below_the_cap_evicts_nobody() {
+        let _g = test_globals::lock();
+        reset();
+        record_writable(10, 0x1000, 0x1000);
+        record_writable(11, 0x1000, 0x1000);
+        assert_eq!(
+            REGIONS.lock().len(),
+            2,
+            "two processes fit far below the cap"
+        );
+        assert!(is_ever_writable(10, 0x1000, 0x1000));
+        assert_eq!(
+            EVICTED_UP_TO.load(Ordering::Relaxed),
+            0,
+            "nothing was evicted, so nothing is unanswerable"
+        );
+    }
+
+    #[test]
+    fn a_process_already_tracked_needs_no_room_made_for_it() {
+        let _g = test_globals::lock();
+        reset();
+        for pid in 1..=4096u64 {
+            record_writable(pid, 0x1000, 0x1000);
+        }
+        record_writable(4_096, 0x3000, 0x1000);
+        assert_eq!(
+            REGIONS.lock().len(),
+            4096,
+            "a second mapping for a tracked process evicts nobody"
+        );
+        assert_eq!(
+            EVICTED_UP_TO.load(Ordering::Relaxed),
+            0,
+            "and leaves every other process answerable"
+        );
+        assert!(!is_ever_writable(1, 0x9000, 0x1000));
+        reset();
+    }
+
+    #[test]
+    fn the_eviction_victim_is_the_least_recently_touched_not_the_lowest_pid() {
+        let _g = test_globals::lock();
+        reset();
+        for pid in 1..=4096u64 {
+            record_writable(pid, 0x1000, 0x1000);
+        }
+        // Touch pid 1 again: it is now the most recently active process, so
+        // the next insertion has to drop pid 2 instead. Both halves have to
+        // work for that -- a stamp source that never advances, or a record
+        // that forgets to take a stamp, leaves the order as the pid order,
+        // which is exactly the order an attacker controls by spawning.
+        record_writable(1, 0x2000, 0x1000);
+        record_writable(4_097, 0x1000, 0x1000);
+        assert!(
+            REGIONS.lock().contains_key(&1),
+            "pid 1 was touched last, it cannot be the victim"
+        );
+        assert!(
+            REGIONS.lock().get(&2).is_none(),
+            "pid 2 was the least recently touched"
+        );
+        assert_eq!(EVICTED_UP_TO.load(Ordering::Relaxed), 2);
+        reset();
     }
 }

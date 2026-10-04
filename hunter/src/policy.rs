@@ -82,7 +82,7 @@ pub enum Mode {
 }
 
 impl Mode {
-    fn to_u8(self) -> u8 {
+    const fn to_u8(self) -> u8 {
         match self {
             Mode::Off => 0,
             Mode::Report => 1,
@@ -109,10 +109,23 @@ impl Mode {
 // Default stance: enforce explicit syscall whitelists (opt-in per process, so
 // safe), but only *report* W^X / exec-path / anomaly violations so real
 // dynamic linkers, JITs and the base system are never broken by default.
-static SYSCALL_MODE: AtomicU8 = AtomicU8::new(2); // Enforce
-static WX_MODE: AtomicU8 = AtomicU8::new(1); // Report
-static EXEC_MODE: AtomicU8 = AtomicU8::new(1); // Report
-static ANOMALY_MODE: AtomicU8 = AtomicU8::new(1); // Report
+//
+// The stance is written once, here, because it was written twice: these four
+// words started from a literal `2` or `1` and `reset_for_test` stored its own
+// copy of the same numbers. Nothing tied either to the paragraph above, so the
+// defaults were the one part of the control plane a test could not hold to
+// anything -- a test binary only ever sees the state the reset installed.
+const DEFAULT_SYSCALL_MODE: Mode = Mode::Enforce;
+const DEFAULT_WX_MODE: Mode = Mode::Report;
+const DEFAULT_EXEC_MODE: Mode = Mode::Report;
+const DEFAULT_ANOMALY_MODE: Mode = Mode::Report;
+/// Whether exec learning starts enabled (see [`EXEC_LEARN`]).
+const DEFAULT_EXEC_LEARN: bool = false;
+
+static SYSCALL_MODE: AtomicU8 = AtomicU8::new(DEFAULT_SYSCALL_MODE.to_u8());
+static WX_MODE: AtomicU8 = AtomicU8::new(DEFAULT_WX_MODE.to_u8());
+static EXEC_MODE: AtomicU8 = AtomicU8::new(DEFAULT_EXEC_MODE.to_u8());
+static ANOMALY_MODE: AtomicU8 = AtomicU8::new(DEFAULT_ANOMALY_MODE.to_u8());
 
 /// One-way latch: once set, modes may only move towards stricter enforcement.
 static TIGHTEN_ONLY: AtomicBool = AtomicBool::new(false);
@@ -120,7 +133,7 @@ static TIGHTEN_ONLY: AtomicBool = AtomicBool::new(false);
 /// Whether exec learning (trust-on-first-use) is enabled: safe programs are
 /// auto-added to the allowlist and never denied. Off by default (the crate
 /// changes nothing until the kernel opts in at boot).
-static EXEC_LEARN: AtomicBool = AtomicBool::new(false);
+static EXEC_LEARN: AtomicBool = AtomicBool::new(DEFAULT_EXEC_LEARN);
 
 /// Cap on auto-learned entries, bounding kernel memory if exec churns through
 /// many distinct binaries.
@@ -270,11 +283,11 @@ pub fn is_tighten_only() -> bool {
 #[cfg(test)]
 pub(crate) fn reset_for_test() {
     TIGHTEN_ONLY.store(false, Ordering::SeqCst);
-    SYSCALL_MODE.store(Mode::Enforce.to_u8(), Ordering::SeqCst);
-    WX_MODE.store(Mode::Report.to_u8(), Ordering::SeqCst);
-    EXEC_MODE.store(Mode::Report.to_u8(), Ordering::SeqCst);
-    ANOMALY_MODE.store(Mode::Report.to_u8(), Ordering::SeqCst);
-    EXEC_LEARN.store(false, Ordering::SeqCst);
+    SYSCALL_MODE.store(DEFAULT_SYSCALL_MODE.to_u8(), Ordering::SeqCst);
+    WX_MODE.store(DEFAULT_WX_MODE.to_u8(), Ordering::SeqCst);
+    EXEC_MODE.store(DEFAULT_EXEC_MODE.to_u8(), Ordering::SeqCst);
+    ANOMALY_MODE.store(DEFAULT_ANOMALY_MODE.to_u8(), Ordering::SeqCst);
+    EXEC_LEARN.store(DEFAULT_EXEC_LEARN, Ordering::SeqCst);
     TRUSTED_EXEC_PATHS.lock().clear();
     TRUSTED_EXEC_PREFIXES.lock().clear();
     LEARNED_EXEC_PATHS.lock().clear();
@@ -637,6 +650,10 @@ pub fn learn_exec_path(path: &str) -> bool {
     }
     let canon = canonicalize(path);
     let mut learned = LEARNED_EXEC_PATHS.lock();
+    // The duplicate test looks redundant after `is_exec_listed` above, and is
+    // not: that check released the list lock before this one took it, so two
+    // CPUs exec'ing the same new program both got past it. Without this line
+    // they both push, and the allowlist grows a duplicate entry per race.
     if learned.len() >= MAX_LEARNED_EXEC || learned.iter().any(|p| *p == canon) {
         return false;
     }
@@ -962,5 +979,412 @@ mod tests {
         assert!(is_syscall_allowed(90, 2).is_err());
         remove_policy(89);
         remove_policy(90);
+    }
+}
+
+#[cfg(test)]
+mod boot_stance_tests {
+    use super::*;
+    use crate::test_globals;
+
+    fn start() -> impl Drop {
+        let g = test_globals::lock();
+        reset_for_test();
+        crate::event_log::reset_for_test();
+        g
+    }
+
+    fn lines_with(needle: &str) -> usize {
+        crate::event_log::render()
+            .lines()
+            .filter(|l| l.contains(needle))
+            .count()
+    }
+
+    #[test]
+    fn the_boot_stance_is_enforce_for_syscalls_and_report_for_everything_else() {
+        let _g = start();
+        // The module's opening paragraph is the contract, and this is what
+        // holds the code to it. Syscall whitelists are opt-in per process, so
+        // enforcing them by default breaks nothing; a W^X, exec-path or
+        // anomaly default of Enforce would break real dynamic linkers and JITs
+        // on the first boot that switched hunter on.
+        assert_eq!(syscall_mode(), Mode::Enforce);
+        assert_eq!(wx_mode(), Mode::Report);
+        assert_eq!(exec_mode(), Mode::Report);
+        assert_eq!(anomaly_mode(), Mode::Report);
+        assert!(
+            !is_tighten_only(),
+            "the latch is engaged once boot is done, not before it"
+        );
+        assert!(
+            !exec_learning_enabled(),
+            "the crate changes nothing until the kernel opts in"
+        );
+    }
+
+    #[test]
+    fn every_mode_has_the_name_proc_hunter_prints() {
+        // The three words are a userspace contract: /proc/hunter's header is
+        // what a helper script reads to find out what hunter is doing.
+        assert_eq!(Mode::Off.as_str(), "off");
+        assert_eq!(Mode::Report.as_str(), "report");
+        assert_eq!(Mode::Enforce.as_str(), "enforce");
+    }
+
+    #[test]
+    fn a_mode_change_reports_the_mode_that_is_actually_in_effect() {
+        let _g = start();
+        // The documented return is "the mode actually in effect after", which
+        // is the only way a caller can tell a refused change from an applied
+        // one. All four public setters discard it, so nothing held it there.
+        assert_eq!(apply_mode(&WX_MODE, "wx", Mode::Enforce), Mode::Enforce);
+        assert_eq!(
+            apply_mode(&WX_MODE, "wx", Mode::Enforce),
+            Mode::Enforce,
+            "asking for the mode already in effect reports that mode"
+        );
+        seal_tighten_only();
+        assert_eq!(
+            apply_mode(&WX_MODE, "wx", Mode::Off),
+            Mode::Enforce,
+            "a refused relaxation reports the mode that stayed, not the one asked for"
+        );
+        assert_eq!(wx_mode(), Mode::Enforce);
+    }
+
+    #[test]
+    fn the_latch_announces_itself_on_the_call_that_engages_it() {
+        let _g = start();
+        seal_tighten_only();
+        assert!(is_tighten_only());
+        assert_eq!(
+            lines_with("tighten-only latch engaged"),
+            1,
+            "the call that engaged the latch is the one that records it"
+        );
+        seal_tighten_only();
+        seal_tighten_only();
+        assert_eq!(
+            lines_with("tighten-only latch engaged"),
+            1,
+            "and sealing an already-sealed control plane is not an event"
+        );
+    }
+}
+
+#[cfg(test)]
+mod syscall_whitelist_tests {
+    use super::*;
+    use crate::test_globals;
+
+    fn start() -> impl Drop {
+        let g = test_globals::lock();
+        reset_for_test();
+        g
+    }
+
+    /// The mirror counter is what lets the per-syscall check skip a globally
+    /// contended, IRQ-off lock, and it is only sound while it equals the map
+    /// it mirrors: stuck above the truth it costs a lock, stuck below it skips
+    /// the whitelist of every process on the machine. Every mutator has to
+    /// refresh it before releasing the lock, so check it after each one.
+    fn mirror_is_exact() {
+        assert_eq!(
+            POLICY_COUNT.load(Ordering::Acquire),
+            GLOBAL_POLICIES.lock().len(),
+            "POLICY_COUNT stopped mirroring GLOBAL_POLICIES"
+        );
+    }
+
+    #[test]
+    fn every_mutator_leaves_the_mirror_counter_exact() {
+        let _g = start();
+        mirror_is_exact();
+        register_policy(70, alloc::vec![1, 2, 3]);
+        mirror_is_exact();
+        inherit_policy(70, 71);
+        mirror_is_exact();
+        set_default_whitelist(Some(alloc::vec![4]));
+        apply_default_policy(72);
+        mirror_is_exact();
+        remove_policy(71);
+        mirror_is_exact();
+        remove_policy(70);
+        remove_policy(72);
+        mirror_is_exact();
+        assert_eq!(active_policy_count(), 0);
+    }
+
+    #[test]
+    fn a_whitelist_registered_out_of_order_still_allows_every_call_in_it() {
+        let _g = start();
+        // The check is a binary search, so the registration paths sort what
+        // they store. An operator writing the numbers in the order they
+        // thought of them is the normal case, not the odd one.
+        register_policy(80, alloc::vec![202, 1, 60, 39]);
+        for nr in [1, 39, 60, 202] {
+            assert!(
+                is_syscall_allowed(80, nr).is_ok(),
+                "syscall {} is on the list",
+                nr
+            );
+        }
+        assert_eq!(is_syscall_allowed(80, 101), Err(true));
+    }
+
+    #[test]
+    fn a_default_whitelist_given_out_of_order_is_sorted_too() {
+        let _g = start();
+        set_default_whitelist(Some(alloc::vec![202, 1, 60]));
+        apply_default_policy(81);
+        for nr in [1, 60, 202] {
+            assert!(
+                is_syscall_allowed(81, nr).is_ok(),
+                "syscall {} is on the default list",
+                nr
+            );
+        }
+        assert_eq!(is_syscall_allowed(81, 5), Err(true));
+    }
+
+    #[test]
+    fn each_mode_of_the_syscall_domain_answers_a_violation_differently() {
+        let _g = start();
+        register_policy(82, alloc::vec![1]);
+        assert_eq!(is_syscall_allowed(82, 2), Err(true), "enforce blocks it");
+        set_syscall_mode(Mode::Report);
+        assert_eq!(
+            is_syscall_allowed(82, 2),
+            Err(false),
+            "report tells the caller to allow it, and still calls it a violation"
+        );
+        set_syscall_mode(Mode::Off);
+        assert!(
+            is_syscall_allowed(82, 2).is_ok(),
+            "off does not look at the list at all"
+        );
+    }
+
+    #[test]
+    fn a_process_without_a_whitelist_is_allowed_everything() {
+        let _g = start();
+        // The domain is opt-in: one process registering a whitelist must not
+        // turn the check on for every other process on the machine. The
+        // lock-free fast path is skipped from here on, so this is the arm that
+        // keeps the promise once anybody has opted in.
+        register_policy(83, alloc::vec![1]);
+        assert!(is_syscall_allowed(84, 999).is_ok());
+        assert_eq!(is_syscall_allowed(83, 999), Err(true));
+    }
+
+    #[test]
+    fn the_old_boolean_switch_still_means_the_same_two_modes() {
+        let _g = start();
+        set_enforcement_mode(false);
+        assert_eq!(syscall_mode(), Mode::Report);
+        assert!(!get_enforcement_mode(), "report is not enforcement");
+        set_enforcement_mode(true);
+        assert_eq!(syscall_mode(), Mode::Enforce);
+        assert!(get_enforcement_mode());
+        set_syscall_mode(Mode::Off);
+        assert!(!get_enforcement_mode(), "and off is not enforcement either");
+    }
+}
+
+#[cfg(test)]
+mod path_policy_tests {
+    use super::*;
+    use crate::test_globals;
+
+    fn start() -> impl Drop {
+        let g = test_globals::lock();
+        reset_for_test();
+        g
+    }
+
+    #[test]
+    fn a_dotdot_climbs_one_component_and_not_all_the_way_to_the_root() {
+        // Resolving `..` by emptying the stack would send every path that
+        // contains one to the top of the tree, where /tmp and friends live --
+        // and the untrusted-prefix check is a string comparison against the
+        // result.
+        assert_eq!(
+            canonicalize("/usr/local/../bin/ls"),
+            String::from("/usr/bin/ls")
+        );
+        assert_eq!(canonicalize("/a/b/c/../../d"), String::from("/a/d"));
+        assert_eq!(
+            canonicalize("/../etc/passwd"),
+            String::from("/etc/passwd"),
+            "a .. above the root stays at the root"
+        );
+    }
+
+    #[test]
+    fn a_directory_merely_called_proc_is_not_the_proc_filesystem() {
+        let _g = start();
+        // The magic-link test is anchored at the start of the path on purpose:
+        // /opt/proc/fd/blob is an ordinary file in an ordinary directory, and
+        // treating it as a magic link would make it permanently unlearnable.
+        assert!(!is_untrusted_exec_path("/opt/proc/fd/blob"));
+        assert!(!is_world_writable_exec_path("/opt/proc/fd/blob"));
+        assert!(is_untrusted_exec_path("/proc/self/fd/3"));
+    }
+
+    #[test]
+    fn a_relative_path_is_untrusted_but_still_learnable() {
+        let _g = start();
+        // Two tests that read alike and are deliberately different: without a
+        // cwd we cannot prove a relative path lands somewhere trusted, so the
+        // exec policy flags it -- but a package manager exec'ing
+        // lib/apk/.../busybox relatively must still be learnable, so the
+        // world-writable test does not.
+        assert!(is_untrusted_exec_path("lib/apk/db/busybox"));
+        assert!(!is_world_writable_exec_path("lib/apk/db/busybox"));
+    }
+
+    #[test]
+    fn an_untrusted_directory_does_not_lend_its_name_to_a_longer_one() {
+        let _g = start();
+        add_untrusted_exec_prefix(String::from("/opt/drop"));
+        assert!(is_untrusted_exec_path("/opt/drop/payload"));
+        assert!(
+            !is_untrusted_exec_path("/opt/dropbox/bin/dropbox"),
+            "a prefix names a directory, not the start of a string"
+        );
+    }
+
+    #[test]
+    fn a_blacklisted_directory_does_not_lend_its_name_to_a_longer_one() {
+        let _g = start();
+        add_blacklisted_exec_prefix(String::from("/opt/bad"));
+        assert!(is_exec_blacklisted("/opt/bad/nc"));
+        assert!(
+            !is_exec_blacklisted("/opt/badger/bin/badger"),
+            "the one hard deny in the exec policy must deny exactly what it says"
+        );
+    }
+
+    #[test]
+    fn a_blacklisted_program_denies_however_either_side_spells_it() {
+        let _g = start();
+        add_blacklisted_exec_path(String::from("/usr/bin/../bin/nc"));
+        assert!(
+            is_exec_blacklisted("/usr/bin/nc"),
+            "the stored path is canonicalized"
+        );
+        assert!(
+            is_exec_blacklisted("/usr/./bin/../bin/nc"),
+            "and so is the queried one"
+        );
+        assert!(!is_exec_blacklisted("/usr/bin/ncat"));
+    }
+
+    #[test]
+    fn the_default_trusted_locations_are_directories() {
+        let _g = start();
+        install_default_trusted_exec();
+        assert!(is_exec_listed("/bin/ls"));
+        assert!(is_exec_listed("/usr/lib64/ld-linux.so"));
+        assert!(
+            !is_exec_listed("/binary/evil"),
+            "a trusted directory does not trust a name that merely starts like it"
+        );
+    }
+}
+
+#[cfg(test)]
+mod exec_learning_tests {
+    use super::*;
+    use crate::test_globals;
+
+    fn start() -> impl Drop {
+        let g = test_globals::lock();
+        reset_for_test();
+        crate::event_log::reset_for_test();
+        g
+    }
+
+    fn lines_with(needle: &str) -> usize {
+        crate::event_log::render()
+            .lines()
+            .filter(|l| l.contains(needle))
+            .count()
+    }
+
+    #[test]
+    fn one_learned_program_is_enough_to_activate_the_allowlist() {
+        let _g = start();
+        assert!(!exec_allowlist_active());
+        assert!(
+            is_exec_allowed("/opt/anything"),
+            "while inactive the allowlist permits everything, preserving boot"
+        );
+        assert!(learn_exec_path("/usr/bin/apk"));
+        assert!(
+            exec_allowlist_active(),
+            "a learned program activates it exactly like a configured one"
+        );
+        assert!(is_exec_allowed("/usr/bin/apk"));
+        assert!(
+            !is_exec_allowed("/opt/anything"),
+            "once active, only what is listed runs"
+        );
+    }
+
+    #[test]
+    fn turning_learning_on_is_recorded_by_the_call_that_changes_it() {
+        let _g = start();
+        set_exec_learning(true);
+        assert!(exec_learning_enabled());
+        assert_eq!(
+            lines_with("exec learning enabled"),
+            1,
+            "the call that changed the setting is the one that records it"
+        );
+        set_exec_learning(true);
+        assert_eq!(
+            lines_with("exec learning enabled"),
+            1,
+            "and setting it to what it already is is not a configuration event"
+        );
+        set_exec_learning(false);
+        assert_eq!(lines_with("exec learning disabled"), 1);
+        assert_eq!(
+            lines_with("exec learning enabled"),
+            1,
+            "turning it off does not re-announce turning it on"
+        );
+    }
+
+    #[test]
+    fn the_learned_allowlist_stops_growing_at_its_budget() {
+        let _g = start();
+        // 8192 entries is the kernel-memory budget for trust-on-first-use, and
+        // the number is pinned here and driven as a literal below: a test that
+        // fills `0..MAX_LEARNED_EXEC` and then checks the cap moves with the
+        // constant and passes in green.
+        assert_eq!(MAX_LEARNED_EXEC, 8192, "the learned-exec budget moved");
+        {
+            let mut learned = LEARNED_EXEC_PATHS.lock();
+            for i in 0..8191 {
+                learned.push(format!("/opt/p{}", i));
+            }
+        }
+        assert!(
+            learn_exec_path("/opt/the-last-one"),
+            "the 8192nd entry still fits"
+        );
+        assert_eq!(learned_exec_count(), 8192);
+        assert!(
+            !learn_exec_path("/opt/one-too-many"),
+            "and past the budget nothing more is learned"
+        );
+        assert_eq!(learned_exec_count(), 8192);
+        assert!(
+            !is_exec_allowed("/opt/one-too-many"),
+            "a program the cap refused to learn is not quietly trusted either"
+        );
     }
 }
