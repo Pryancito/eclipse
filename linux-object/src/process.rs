@@ -11290,3 +11290,658 @@ mod exit_hook_tests {
         assert_eq!(LAST_DEAD.load(Ordering::SeqCst), pid);
     }
 }
+
+#[cfg(test)]
+mod reparenting_tests {
+    //! Who reaps an orphan, and what the handover moves with it.
+    //!
+    //! `reaper_for`, `nearest_live_subreaper` and
+    //! `reparent_live_children_to_init` are the whole of this kernel's orphan
+    //! reparenting -- the `prctl(PR_SET_CHILD_SUBREAPER)` chain a session
+    //! manager like `tmux` or `systemd --user` relies on, the
+    //! `prctl(PR_SET_PDEATHSIG)` a child asked for, and the `getppid()` that
+    //! the daemonize idiom polls until it reads 1. Not one of the three had a
+    //! test, and the comment inside the handover records that the adopter was
+    //! once not written into the orphan at all, so `getppid()` kept naming the
+    //! corpse.
+
+    use super::*;
+    use crate::signal::Signal as LinuxSignal;
+    use crate::thread::ThreadExt;
+    use rcore_fs_ramfs::RamFS;
+
+    /// A process of its own, with the termination callback installed (it is
+    /// `create_linux` that installs it, and the callback is what runs the
+    /// handover).
+    fn a_process(pid: KoID) -> Arc<Process> {
+        Process::create_linux(&ROOT_JOB, RamFS::new(), 0, None, pid).unwrap()
+    }
+
+    /// A forked child, which is how a process acquires a parent link and a
+    /// termination callback of its own.
+    fn a_child_of(parent: &Arc<Process>) -> Arc<Process> {
+        Process::fork_from(parent).unwrap()
+    }
+
+    fn ppid_of(proc: &Arc<Process>) -> Option<KoID> {
+        proc.linux().parent().map(|p| p.id())
+    }
+
+    fn holds_child(proc: &Arc<Process>, child: KoID) -> bool {
+        proc.linux().inner.lock().children.contains_key(&child)
+    }
+
+    fn holds_zombie(proc: &Arc<Process>, child: KoID) -> bool {
+        proc.linux()
+            .inner
+            .lock()
+            .reaped_children
+            .contains_key(&child)
+    }
+
+    #[test]
+    fn a_living_parent_reaps_its_own_child() {
+        let parent = a_process(46_001);
+        assert_eq!(
+            reaper_for(&parent).map(|p| p.id()),
+            Some(parent.id()),
+            "a live parent is the reaper, with no walk at all"
+        );
+    }
+
+    #[test]
+    fn a_dead_parent_hands_the_child_to_the_nearest_subreaper() {
+        let top = a_process(46_002);
+        let mid = a_child_of(&top);
+        let parent = a_child_of(&mid);
+        assert!(
+            !top.linux().is_child_subreaper(),
+            "nobody starts volunteered"
+        );
+        top.linux().set_child_subreaper(true);
+        assert!(top.linux().is_child_subreaper());
+        parent.exit(0);
+
+        assert_eq!(
+            reaper_for(&parent).map(|p| p.id()),
+            Some(top.id()),
+            "the subreaper ancestor reaps, not init"
+        );
+        assert_eq!(
+            nearest_live_subreaper(&parent).map(|p| p.id()),
+            Some(top.id()),
+            "and the walk finds it past a parent that never volunteered"
+        );
+    }
+
+    /// The nearest volunteer wins: `systemd --user` under a `tmux` that also
+    /// volunteered must keep its own descendants.
+    #[test]
+    fn the_nearest_volunteer_wins_over_one_further_up() {
+        let top = a_process(46_003);
+        let mid = a_child_of(&top);
+        let parent = a_child_of(&mid);
+        top.linux().set_child_subreaper(true);
+        mid.linux().set_child_subreaper(true);
+        parent.exit(0);
+
+        assert_eq!(
+            nearest_live_subreaper(&parent).map(|p| p.id()),
+            Some(mid.id())
+        );
+    }
+
+    /// A volunteer that has itself died cannot reap anything, and the walk
+    /// has to carry on above it instead of stopping there.
+    ///
+    /// The chain is wired with `set_parent` and not with forks: a fork would
+    /// put the middle process's children in its own table, and its death
+    /// would then hand them straight to the top before this walk ever ran.
+    #[test]
+    fn a_subreaper_that_has_died_is_skipped_for_the_one_above_it() {
+        let top = a_process(46_004);
+        let mid = a_process(46_014);
+        let child = a_process(46_015);
+        mid.linux().set_parent(&top);
+        child.linux().set_parent(&mid);
+        top.linux().set_child_subreaper(true);
+        mid.linux().set_child_subreaper(true);
+        assert_eq!(
+            nearest_live_subreaper(&child).map(|p| p.id()),
+            Some(mid.id()),
+            "while it lives, the nearest volunteer is the middle one"
+        );
+
+        mid.exit(0);
+
+        assert_eq!(
+            nearest_live_subreaper(&child).map(|p| p.id()),
+            Some(top.id()),
+            "a dead volunteer was taken for a live one"
+        );
+    }
+
+    /// `PR_SET_CHILD_SUBREAPER` makes a process the reaper for its
+    /// *descendants'* orphans, so a process that volunteered is never a
+    /// candidate for its own children: the walk starts at the parent.
+    #[test]
+    fn a_process_that_volunteered_is_not_its_own_subreaper() {
+        let top = a_process(46_005);
+        let me = a_child_of(&top);
+        me.linux().set_child_subreaper(true);
+        assert!(me.linux().is_child_subreaper());
+
+        assert_eq!(
+            nearest_live_subreaper(&me).map(|p| p.id()),
+            None,
+            "a live volunteer answered for its own orphans"
+        );
+        // And the one above it is found, so the walk is not simply broken.
+        top.linux().set_child_subreaper(true);
+        assert_eq!(nearest_live_subreaper(&me).map(|p| p.id()), Some(top.id()));
+    }
+
+    #[test]
+    fn with_nobody_volunteering_the_walk_finds_no_subreaper() {
+        let top = a_process(46_006);
+        let parent = a_child_of(&top);
+        parent.exit(0);
+
+        assert!(nearest_live_subreaper(&parent).is_none());
+    }
+
+    /// A parent chain that points back at itself must not cost the teardown
+    /// path the CPU it is running on. The cap is what makes that true, and
+    /// `set_parent` is public, so the loop is reachable without corruption.
+    #[test]
+    fn a_parent_chain_that_loops_ends_the_walk_instead_of_wedging_it() {
+        let a = a_process(46_007);
+        let b = a_process(46_008);
+        a.linux().set_parent(&b);
+        b.linux().set_parent(&a);
+
+        assert!(
+            nearest_live_subreaper(&a).is_none(),
+            "a cycle with no volunteer in it must end the walk"
+        );
+
+        // And a volunteer inside the cycle is still found rather than missed.
+        b.linux().set_child_subreaper(true);
+        assert_eq!(nearest_live_subreaper(&a).map(|p| p.id()), Some(b.id()));
+    }
+
+    /// The bug the handover's own comment records: the adopter was inserted
+    /// into the orphan's new parent's table but never written into the orphan,
+    /// so `getppid()` went on naming the dead process -- which is exactly what
+    /// the daemonize idiom waits on -- and the walk above climbed a chain
+    /// through the dead.
+    #[test]
+    fn an_adopted_orphan_names_its_adopter_as_its_parent() {
+        let top = a_process(46_009);
+        top.linux().set_child_subreaper(true);
+        let parent = a_child_of(&top);
+        let orphan = a_child_of(&parent);
+        assert_eq!(ppid_of(&orphan), Some(parent.id()));
+
+        parent.exit(0);
+
+        assert_eq!(
+            ppid_of(&orphan),
+            Some(top.id()),
+            "the orphan still names the process that died"
+        );
+        assert!(
+            holds_child(&top, orphan.id()),
+            "the adopter does not hold the orphan it adopted"
+        );
+        assert!(
+            !holds_child(&parent, orphan.id()),
+            "the dead process still holds the child it handed over"
+        );
+    }
+
+    /// An exit status the dying process collected but never reaped is still
+    /// owed to somebody: it moves to the adopter so an adopter blocked in
+    /// `wait(-1)` sees it.
+    #[test]
+    fn the_zombies_the_dying_process_never_reaped_move_to_the_adopter() {
+        let top = a_process(46_010);
+        top.linux().set_child_subreaper(true);
+        let parent = a_child_of(&top);
+        parent
+            .linux()
+            .record_child_exit(46_777, 9, Default::default());
+        assert!(holds_zombie(&parent, 46_777));
+
+        parent.exit(0);
+
+        assert!(
+            holds_zombie(&top, 46_777),
+            "an uncollected exit status was dropped on the floor"
+        );
+        assert!(!holds_zombie(&parent, 46_777));
+    }
+
+    /// `PR_SET_PDEATHSIG`: the child asked to be told when *this* parent dies,
+    /// and the signal has to go out whoever adopts it afterwards.
+    #[test]
+    fn an_orphan_that_asked_for_a_parent_death_signal_gets_it() {
+        let top = a_process(46_011);
+        top.linux().set_child_subreaper(true);
+        let parent = a_child_of(&top);
+        let orphan = a_child_of(&parent);
+        let thread = Thread::create_linux(&orphan).unwrap();
+        orphan.linux().set_pdeathsig(LinuxSignal::SIGUSR1 as u8);
+        assert!(!thread.lock_linux().signals.contains(LinuxSignal::SIGUSR1));
+
+        parent.exit(0);
+
+        assert!(
+            thread.lock_linux().signals.contains(LinuxSignal::SIGUSR1),
+            "the parent died and the child was never told"
+        );
+    }
+
+    /// Without the `prctl`, nothing is sent: a signal on every parent death
+    /// would kill every child of every shell.
+    #[test]
+    fn an_orphan_that_asked_for_nothing_is_signalled_with_nothing() {
+        let top = a_process(46_012);
+        top.linux().set_child_subreaper(true);
+        let parent = a_child_of(&top);
+        let orphan = a_child_of(&parent);
+        let thread = Thread::create_linux(&orphan).unwrap();
+        assert_eq!(orphan.linux().pdeathsig(), 0);
+
+        parent.exit(0);
+
+        assert!(
+            thread.lock_linux().signals.is_empty(),
+            "a child that asked for no parent-death signal was signalled anyway"
+        );
+    }
+
+    /// A process whose children have all been reaped already has nothing to
+    /// hand over, and must not pulse `SIGCHLD` at an adopter that is owed
+    /// nothing: a spurious wake is a `wait` that returns with no child.
+    #[test]
+    fn a_process_with_nothing_to_hand_over_leaves_the_adopter_alone() {
+        let top = a_process(46_013);
+        top.linux().set_child_subreaper(true);
+        let top_thread = Thread::create_linux(&top).unwrap();
+        let parent = a_child_of(&top);
+        top_thread.lock_linux().signals = Sigset::default();
+
+        reparent_live_children_to_init(&parent);
+
+        assert!(
+            !top.signal().contains(Signal::SIGCHLD),
+            "the adopter was woken for a handover that moved nothing"
+        );
+    }
+}
+
+#[cfg(test)]
+mod init_adoption_tests {
+    //! INIT (pid 1) as the reaper of last resort, and as the one process the
+    //! handover must leave alone.
+    //!
+    //! **One test, on purpose.** `INIT_PID` is a single fixed pid in a shared
+    //! `ROOT_JOB`, so only one test in the binary can own it; creating it
+    //! twice is an error and leaving it alive would make every later orphan in
+    //! the binary adoptable by it. So the whole question is asked here, in
+    //! order, and init is exited at the end -- `live_init` then answers `None`
+    //! for the rest of the run, which is the state every other test was
+    //! written against.
+
+    use super::*;
+    use core::sync::atomic::AtomicBool;
+    use rcore_fs_ramfs::RamFS;
+
+    fn a_process(pid: KoID) -> Arc<Process> {
+        Process::create_linux(&ROOT_JOB, RamFS::new(), 0, None, pid).unwrap()
+    }
+
+    static INIT_DEATH_SEEN: AtomicBool = AtomicBool::new(false);
+    static INIT_STILL_LIVE_WHILE_DYING: AtomicBool = AtomicBool::new(false);
+
+    /// `live_init` asked from inside init's own death, which is the only place
+    /// its `Status::Exited` check is doing anything: after the exit returns,
+    /// pid 1 is out of the job and the lookup fails on its own. An init that
+    /// answered while terminating would be handed orphans it can never reap.
+    fn look_at_the_dying_init(pid: KoID) {
+        if pid != INIT_PID {
+            return;
+        }
+        INIT_STILL_LIVE_WHILE_DYING.store(live_init().is_some(), Ordering::SeqCst);
+        INIT_DEATH_SEEN.store(true, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn init_reaps_what_nobody_else_will_and_hands_over_nothing_itself() {
+        register_process_exit_hook(look_at_the_dying_init);
+        let init = a_process(INIT_PID);
+        assert_eq!(init.id(), 1, "the pid every orphan falls back to");
+        assert_eq!(
+            live_init().map(|p| p.id()),
+            Some(INIT_PID),
+            "init is not being seen while it runs"
+        );
+
+        // 1. A dead parent with nobody volunteering resolves to live init.
+        //    This is the fallback `reaper_for` exists for, and the only
+        //    position from which it is reachable.
+        let lonely = a_process(46_201);
+        let orphan = Process::fork_from(&lonely).unwrap();
+        assert!(nearest_live_subreaper(&lonely).is_none(), "no volunteer");
+        lonely.exit(0);
+        assert_eq!(
+            reaper_for(&lonely).map(|p| p.id()),
+            Some(INIT_PID),
+            "a dead parent with no subreaper was left with no reaper at all"
+        );
+
+        // 2. And the handover that ran inside that exit put the orphan on
+        //    init, parent link included.
+        assert_eq!(
+            orphan.linux().parent().map(|p| p.id()),
+            Some(INIT_PID),
+            "the orphan still names the process that died"
+        );
+        assert!(
+            init.linux()
+                .inner
+                .lock()
+                .children
+                .contains_key(&orphan.id()),
+            "init does not hold the orphan it adopted"
+        );
+
+        // 3. A volunteer closer than init wins even with init alive, so the
+        //    fallback is a fallback and not the only answer.
+        let volunteer = a_process(46_202);
+        volunteer.linux().set_child_subreaper(true);
+        let parent = Process::fork_from(&volunteer).unwrap();
+        let kept = Process::fork_from(&parent).unwrap();
+        parent.exit(0);
+        assert_eq!(
+            kept.linux().parent().map(|p| p.id()),
+            Some(volunteer.id()),
+            "init took a child the volunteer had asked for"
+        );
+
+        // 4. Init itself hands over nothing. `set_parent` gives init an
+        //    adopter that the walk could reach, which is the only way to tell
+        //    the pid-1 guard from its absence: without it, `live_init` would
+        //    make init adopt from itself, and with a reachable volunteer above
+        //    it the children would leave altogether.
+        let its_own = Process::fork_from(&init).unwrap();
+        init.linux().set_parent(&volunteer);
+        assert_eq!(
+            nearest_live_subreaper(&init).map(|p| p.id()),
+            Some(volunteer.id()),
+            "the adopter this step needs is not reachable"
+        );
+
+        reparent_live_children_to_init(&init);
+
+        assert!(
+            init.linux()
+                .inner
+                .lock()
+                .children
+                .contains_key(&its_own.id()),
+            "init handed its own children away"
+        );
+        assert_eq!(
+            its_own.linux().parent().map(|p| p.id()),
+            Some(INIT_PID),
+            "init's child was given another parent"
+        );
+
+        // 5. Clean up, and on the way out the last question: with init exited,
+        //    `live_init` is `None` again -- which is both what every other test
+        //    in this binary was written against and, asked from inside the
+        //    death itself, the only place that answer is not free.
+        init.exit(0);
+        assert!(
+            INIT_DEATH_SEEN.load(Ordering::SeqCst),
+            "the hook never saw init die"
+        );
+        assert!(
+            !INIT_STILL_LIVE_WHILE_DYING.load(Ordering::SeqCst),
+            "a terminating init still offered itself as the reaper of last resort"
+        );
+        assert!(live_init().is_none(), "init outlived its own test");
+    }
+}
+
+#[cfg(test)]
+mod session_and_group_tests {
+    //! The two ids job control reads out of a process: its session and its
+    //! process group, each stored raw with `0` meaning "my own pid".
+    //!
+    //! The raw-to-effective resolution is what makes a `Ctrl-C` reach a
+    //! shell's foreground child, and `getpgid`/`getsid` answer with it, but
+    //! neither entry point had a test: the suite stopped at the `setsid`
+    //! verdict and never read a value back out.
+
+    use super::*;
+    use rcore_fs_ramfs::RamFS;
+
+    fn a_process(pid: KoID) -> Arc<Process> {
+        Process::create_linux(&ROOT_JOB, RamFS::new(), 0, None, pid).unwrap()
+    }
+
+    #[test]
+    fn an_unset_group_and_session_resolve_to_the_processs_own_pid() {
+        let proc = a_process(46_101);
+        assert_eq!(proc.linux().pgid_raw(), 0, "stored unset");
+        assert_eq!(proc.linux().sid_raw(), 0);
+        assert_eq!(effective_pgid(&proc), proc.id());
+        assert_eq!(effective_sid(&proc), proc.id());
+    }
+
+    #[test]
+    fn a_group_that_was_set_is_the_one_that_answers() {
+        let proc = a_process(46_102);
+        proc.linux().set_pgid_raw(46_102);
+        assert_eq!(effective_pgid(&proc), 46_102);
+        // `setpgid(0, 0)` stores the argument as given; the resolution turns
+        // it back into the own pid rather than into group zero.
+        proc.linux().set_pgid_raw(0);
+        assert_eq!(effective_pgid(&proc), proc.id());
+    }
+
+    /// `setsid` moves both ids at once: a session leader that kept its old
+    /// group would leave the new session sharing a group with the old one, and
+    /// job control reads the group.
+    #[test]
+    fn becoming_a_session_leader_moves_both_ids_together() {
+        let leader = a_process(46_103);
+        leader.linux().set_pgid_raw(46_000);
+        assert_eq!(leader.linux().sid_raw(), 0, "no session of its own yet");
+        leader.linux().become_session_leader(leader.id());
+        assert_eq!(leader.linux().sid_raw(), leader.id());
+        assert_eq!(leader.linux().pgid_raw(), leader.id());
+        assert_eq!(effective_sid(&leader), leader.id());
+        assert_eq!(effective_pgid(&leader), leader.id());
+    }
+
+    /// A fork resolves both ids into concrete numbers for the child, so a
+    /// parent that never called `setpgid` still passes on a group a `Ctrl-C`
+    /// can name.
+    #[test]
+    fn a_child_inherits_its_parents_group_and_session_concretely() {
+        let parent = a_process(46_104);
+        assert_eq!(parent.linux().pgid_raw(), 0, "the parent's is unset");
+        let child = Process::fork_from(&parent).unwrap();
+
+        assert_eq!(
+            child.linux().pgid_raw(),
+            parent.id(),
+            "the child's group must be a number, not another unset"
+        );
+        assert_eq!(child.linux().sid_raw(), parent.id());
+        assert_eq!(effective_pgid(&child), parent.id());
+        assert_eq!(effective_sid(&child), parent.id());
+    }
+
+    /// The two getters are asked about a process whose group and session are
+    /// NOT its own pid, and whose group and session differ from each other.
+    /// Asked about a leader, `Ok(proc.id())` is the right answer for every
+    /// wrong reason: a getter that ignored the stored ids and answered with
+    /// the pid would pass.
+    #[test]
+    fn getpgid_and_getsid_answer_with_the_effective_values() {
+        let parent = a_process(46_105);
+        // Unset: the own pid is the answer, and here it is the only one.
+        assert_eq!(get_process_pgid(parent.id()), Ok(parent.id()));
+        assert_eq!(get_process_sid(parent.id()), Ok(parent.id()));
+
+        // A forked child inherits both ids as the PARENT's pid, so its own pid
+        // is now the wrong answer to both questions.
+        let child = Process::fork_from(&parent).unwrap();
+        assert_ne!(child.id(), parent.id());
+        assert_eq!(get_process_pgid(child.id()), Ok(parent.id()));
+        assert_eq!(get_process_sid(child.id()), Ok(parent.id()));
+
+        // And with the group moved off the session, the two questions have
+        // three distinct candidate answers and each getter picks its own.
+        let its_own_group: KoID = 46_115;
+        child.linux().set_pgid_raw(its_own_group);
+        assert_eq!(get_process_pgid(child.id()), Ok(its_own_group));
+        assert_eq!(
+            get_process_sid(child.id()),
+            Ok(parent.id()),
+            "setpgid moved the session as well"
+        );
+    }
+
+    #[test]
+    fn getpgid_and_getsid_of_a_pid_nobody_has_are_esrch() {
+        let nobody: KoID = 46_199;
+        assert_eq!(get_process_pgid(nobody), Err(LxError::ESRCH));
+        assert_eq!(get_process_sid(nobody), Err(LxError::ESRCH));
+    }
+
+    /// `setsid` refuses when the caller's pid already names a group, and the
+    /// list it checks against is this one.
+    ///
+    /// The member's group is deliberately NOT its own pid: that is the case
+    /// the list exists for -- a group whose leader has exited while members
+    /// remain -- and the case a list of pids would get wrong while looking
+    /// right.
+    #[test]
+    fn the_live_group_list_holds_the_group_a_member_was_put_in() {
+        let member = a_process(46_106);
+        let the_group: KoID = 46_116;
+        member.linux().set_pgid_raw(the_group);
+
+        let groups = live_effective_pgids();
+        assert!(
+            groups.contains(&the_group),
+            "the group its only member is in is missing from the list setsid reads"
+        );
+        assert!(
+            !groups.contains(&member.id()),
+            "the list answered with the member's pid instead of its group"
+        );
+        assert!(
+            !groups.contains(&46_199),
+            "a group nobody is in is in the list"
+        );
+    }
+
+    #[test]
+    fn a_pid_nobody_has_is_not_a_process_that_exists() {
+        let proc = a_process(46_107);
+        assert!(process_exists(proc.id()));
+        assert!(!process_exists(46_199), "a pid nobody has");
+    }
+
+    #[test]
+    fn the_real_uid_of_a_pid_nobody_has_is_root() {
+        let proc = a_process(46_108);
+        // Real and effective apart: this answers the REAL uid, which is what
+        // a `kill` permission check compares against.
+        proc.linux().set_resuid(1000, 1001, 1001).unwrap();
+        assert_eq!(real_uid_of(proc.id()), 1000);
+        assert_eq!(
+            real_uid_of(46_199),
+            0,
+            "an unknown pid answers root, which is what the callers assume"
+        );
+    }
+
+    #[test]
+    fn the_live_process_list_holds_a_process_that_is_running() {
+        let proc = a_process(46_109);
+        let ids: Vec<KoID> = all_live_processes().iter().map(|p| p.id()).collect();
+        assert!(ids.contains(&proc.id()));
+    }
+}
+
+#[cfg(test)]
+mod dying_process_tests {
+    //! A process that has been terminated but is still in its job.
+    //!
+    //! `Process::exit` fires `PROCESS_TERMINATED`, runs every callback and
+    //! only then takes the process out of its job, so for the whole of that
+    //! window `Job::find_process` still answers with it. Everything that asks
+    //! "who is still there?" during a teardown -- a group signal fanning out,
+    //! `send_signal_to_process`, the `wait` bookkeeping -- runs inside that
+    //! window, which is why `all_live_processes` and `process_exists` check
+    //! the status as well as the lookup. A test that asks after the exit has
+    //! returned cannot see any of it: by then the lookup fails on its own and
+    //! the status check is doing nothing.
+
+    use super::*;
+    use core::sync::atomic::AtomicBool;
+    use rcore_fs_ramfs::RamFS;
+
+    /// The pid the hook below is watching, so every other process's death
+    /// costs the hook one comparison and nothing else.
+    const DYING_PID: KoID = 46_301;
+
+    static HOOK_RAN: AtomicBool = AtomicBool::new(false);
+    static LISTED_AS_LIVE: AtomicBool = AtomicBool::new(false);
+    static SAID_TO_EXIST: AtomicBool = AtomicBool::new(false);
+
+    /// Asked from inside the death, where the lookup still succeeds.
+    fn look_at_the_dying(pid: KoID) {
+        if pid != DYING_PID {
+            return;
+        }
+        LISTED_AS_LIVE.store(
+            all_live_processes().iter().any(|p| p.id() == pid),
+            Ordering::SeqCst,
+        );
+        SAID_TO_EXIST.store(process_exists(pid), Ordering::SeqCst);
+        HOOK_RAN.store(true, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn a_terminated_process_is_already_neither_live_nor_existing() {
+        register_process_exit_hook(look_at_the_dying);
+        let proc = Process::create_linux(&ROOT_JOB, RamFS::new(), 0, None, DYING_PID).unwrap();
+        assert!(
+            ROOT_JOB.find_process(DYING_PID).is_some(),
+            "the lookup this test turns on"
+        );
+        assert!(process_exists(DYING_PID), "and it exists while it runs");
+
+        proc.exit(0);
+
+        assert!(HOOK_RAN.load(Ordering::SeqCst), "the hook never ran");
+        assert!(
+            !LISTED_AS_LIVE.load(Ordering::SeqCst),
+            "a terminated process was still counted among the living, so a \
+             group signal would have been sent to a corpse"
+        );
+        assert!(
+            !SAID_TO_EXIST.load(Ordering::SeqCst),
+            "a terminated process still said it exists"
+        );
+    }
+}
