@@ -2413,7 +2413,9 @@ fn vm_bind_and_exec_answer_enosys_until_the_client_ran_vm_init() {
     // One ending exactly at the end fits: on to the next gates.
     assert_eq!(init(A, END - 4096, 4096), Ok(0));
     assert_eq!(bind(A), Err(nv::ENODEV));
-    assert_eq!(submit(A), Err(nv::ENODEV));
+    // EXEC looks the channel up in the caller's list first, and A has
+    // none: ENOENT (`nouveau_exec_ioctl_exec`), whatever the GPU has.
+    assert_eq!(submit(A), Err(nv::ENOENT));
     // Again is fine.
     assert_eq!(init(A, 0, 1 << 32), Ok(0));
     assert_eq!(bind(A), Err(nv::ENODEV));
@@ -2448,8 +2450,9 @@ fn exec_needs_the_callers_own_rm_channel_and_a_well_formed_request() {
     let _live = LiveBytes::hold();
     let gpu = gpu_rm();
     let p = [push(PUSH_VA, 16)];
-    // No RM-backed channel on this GPU at all.
-    assert_eq!(exec(&gpu, A, 0, &p, &[], &[]), Err(nv::ENODEV));
+    // No channel of A's at all, RM-backed or not: the id is in no list
+    // of A's, ENOENT as in `nouveau_exec_ioctl_exec` (it was ENODEV).
+    assert_eq!(exec(&gpu, A, 0, &p, &[], &[]), Err(nv::ENOENT));
     // A discovery channel is not a GPFIFO.
     FAKE_RM.lock().fail_ctx_alloc = true;
     let disc = channel_alloc(&gpu, STRANGER).unwrap().channel as u32;
@@ -2464,8 +2467,8 @@ fn exec_needs_the_callers_own_rm_channel_and_a_well_formed_request() {
     );
     assert_eq!(
         exec(&gpu, B, ch, &p, &[], &[]),
-        Err(nv::ENODEV),
-        "B owns no RM channel"
+        Err(nv::ENOENT),
+        "B owns no channel at all, and this id is A's: not in B's list"
     );
     channel_alloc(&gpu, B).unwrap();
     assert_eq!(
@@ -2517,6 +2520,49 @@ fn exec_needs_the_callers_own_rm_channel_and_a_well_formed_request() {
     r.wait_count = 257;
     r.wait_ptr = many_syncs.as_ptr() as u64;
     assert_eq!(exec_raw(&gpu, A, &mut r), Err(nv::EOPNOTSUPP), "257 waits");
+    // `nouveau_exec_ioctl_exec` looks the channel up first, then
+    // measures the push count against its maximum, and only then copies
+    // the arrays: a channel not the caller's is ENOENT ahead of 257
+    // waits and of a null array, and 65 pushes are EINVAL ahead of
+    // both. The arrays and the sync caps used to come first.
+    r.channel = ch + 7;
+    assert_eq!(
+        exec_raw(&gpu, A, &mut r),
+        Err(nv::ENOENT),
+        "a channel not the caller's, ahead of 257 waits"
+    );
+    r.wait_ptr = 0;
+    assert_eq!(
+        exec_raw(&gpu, A, &mut r),
+        Err(nv::ENOENT),
+        "and ahead of a null wait array with a count"
+    );
+    r.push_ptr = 0;
+    assert_eq!(
+        exec_raw(&gpu, A, &mut r),
+        Err(nv::ENOENT),
+        "and ahead of a null push array"
+    );
+    r.push_count = 65;
+    assert_eq!(
+        exec_raw(&gpu, A, &mut r),
+        Err(nv::ENOENT),
+        "and ahead of 65 pushes: the channel before the push cap"
+    );
+    r.channel = ch;
+    assert_eq!(
+        exec_raw(&gpu, A, &mut r),
+        Err(nv::EINVAL),
+        "65 pushes, ahead of the null push and wait arrays"
+    );
+    r.push_ptr = p.as_ptr() as u64;
+    r.wait_ptr = many_syncs.as_ptr() as u64;
+    assert_eq!(
+        exec_raw(&gpu, A, &mut r),
+        Err(nv::EINVAL),
+        "65 pushes, ahead of 257 waits"
+    );
+    r.push_count = 1;
     r.wait_count = 0;
     r.wait_ptr = 0;
     r.sig_count = 1;
