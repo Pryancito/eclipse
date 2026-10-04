@@ -369,3 +369,103 @@ fn an_empty_vm_bind_is_a_job_that_does_nothing_and_a_list_with_no_array_is_a_fau
     gpu.nouveau_release_process(B);
     assert_eq!(FAKE_RM.lock().bad, 0);
 }
+
+/// `nouveau_uvmm_bind_job_submit` walks a `VM_BIND`'s ops twice: the
+/// first walk looks a `MAP`'s object up (`drm_gem_object_lookup`,
+/// ENOENT) and only then measures its window (`bind_validate_op`) and
+/// its range (`nouveau_uvmm_validate_range`, EINVAL), op by op; the
+/// second refuses an op it does not know (EINVAL), once every op was
+/// looked up and measured. Here the range came first, so a `MAP` of no
+/// object off the page, past the VA space or inside the kernel's
+/// reservation was EINVAL, and an unknown op was refused before the
+/// lookups, hiding the ENOENT of a `MAP` behind it.
+#[test]
+fn a_vm_bind_map_names_its_object_before_its_window_and_an_unknown_op_fails_after_every_lookup() {
+    let _g = LOCK.lock();
+    let _live = LiveBytes::hold();
+    let gpu = gpu_rm_fast();
+    let _ch_a = client_with_pushbuf(&gpu, A);
+    let _ch_b = client_with_pushbuf(&gpu, B);
+    let ha = gem_new_rm(&gpu, 65536, nv::NOUVEAU_GEM_DOMAIN_GART, A)
+        .unwrap()
+        .handle;
+    let hb = gem_new_rm(&gpu, 4096, nv::NOUVEAU_GEM_DOMAIN_GART, B)
+        .unwrap()
+        .handle;
+    const VA: u64 = 0x1_9000_0000;
+    const END: u64 = nv::NOUVEAU_VA_SPACE_END;
+    assert_eq!(vm_bind_ops(&gpu, A, &mut [map(ha, VA, 65536)]), Ok(0));
+    let live = driver_maps(&gpu, A);
+    let before = FAKE_RM.lock().calls.len();
+    // No object of A's (handle 0, or B's): ENOENT whatever the window
+    // and the range say.
+    for (what, bad) in [
+        ("off the page", map(0, VA + 1, 4096)),
+        ("an empty range", map(0, VA, 0)),
+        ("a range off the page", map(0, VA, 100)),
+        ("a range that wraps", map(0, u64::MAX - 4095, 8192)),
+        ("past the VA space", map(0, END, 4096)),
+        ("inside the kernel's reservation", map(0, 0x1000_0000, 4096)),
+        ("an offset off the page", map_at(0, VA, 4096, 1)),
+        ("B's object, off the page", map(hb, VA + 1, 4096)),
+        ("B's object, past the VA space", map(hb, END - 4096, 8192)),
+    ] {
+        assert_eq!(vm_bind_ops(&gpu, A, &mut [bad]), Err(nv::ENOENT), "{what}");
+    }
+    // With the object in hand, the window and the range are measured;
+    // an UNMAP names no object, so its range is all there is.
+    assert_eq!(
+        vm_bind_ops(&gpu, A, &mut [map(ha, VA + 1, 4096)]),
+        Err(nv::EINVAL)
+    );
+    assert_eq!(
+        vm_bind_ops(&gpu, A, &mut [unmap(VA + 1, 4096)]),
+        Err(nv::EINVAL)
+    );
+    // An op nobody knows is refused after every op was looked up and
+    // measured: behind it, a MAP of no object is still ENOENT and a
+    // good MAP leaves it EINVAL; its own range is measured in the
+    // first walk, like any op's; and ahead of a good MAP it binds
+    // nothing.
+    let unknown = |addr: u64| op(7, 0, ha, addr, 4096);
+    assert_eq!(
+        vm_bind_ops(
+            &gpu,
+            A,
+            &mut [unknown(VA + 0x10_0000), map(0, VA + 0x20_0000, 4096)]
+        ),
+        Err(nv::ENOENT)
+    );
+    assert_eq!(
+        vm_bind_ops(
+            &gpu,
+            A,
+            &mut [unknown(VA + 0x10_0000), map(ha, VA + 0x20_0000, 4096)]
+        ),
+        Err(nv::EINVAL)
+    );
+    assert_eq!(
+        vm_bind_ops(
+            &gpu,
+            A,
+            &mut [unknown(VA + 0x10_0001), map(0, VA + 0x20_0000, 4096)]
+        ),
+        Err(nv::EINVAL)
+    );
+    assert_eq!(
+        vm_bind_ops(
+            &gpu,
+            A,
+            &mut [map(ha, VA + 0x20_0000, 4096), unknown(VA + 0x10_0000)]
+        ),
+        Err(nv::EINVAL)
+    );
+    assert_eq!(driver_maps(&gpu, A), live, "nothing bound, nothing lost");
+    assert_eq!(
+        rm_calls_since(before),
+        [] as [&str; 0],
+        "nothing reached the RM"
+    );
+    gpu.nouveau_release_process(A);
+    gpu.nouveau_release_process(B);
+}
