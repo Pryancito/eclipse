@@ -451,20 +451,22 @@ impl DspDev {
     /// Every open starts from the node's defaults: the runtime (format,
     /// fragments, trigger) belongs to the fd, as on Linux.
     pub fn open_client(&self) -> Result<Arc<dyn INode>> {
-        let (audio, release_opened_on_drop) =
-            match self.audio.open_stream().map_err(|_| FsError::DeviceError)? {
-                Some(stream) => (stream, false),
-                None => {
-                    if self
-                        .opened
-                        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                        .is_err()
-                    {
-                        return Err(FsError::Busy);
-                    }
-                    (self.audio.clone(), true)
+        let (audio, release_opened_on_drop) = match self.audio.open_stream().map_err(|e| {
+            warn!("[dsp{}] open: open_stream failed: {:?}", self.index, e);
+            FsError::DeviceError
+        })? {
+            Some(stream) => (stream, false),
+            None => {
+                if self
+                    .opened
+                    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                    .is_err()
+                {
+                    return Err(FsError::Busy);
                 }
-            };
+                (self.audio.clone(), true)
+            }
+        };
         Ok(Arc::new(DspDev {
             audio,
             index: self.index,
@@ -564,10 +566,13 @@ impl DspDev {
     /// every geometry query goes through here first.
     fn make_ready(&self, rt: &mut OssRuntime) -> Result<()> {
         if rt.params_dirty {
-            let (hw_rate, _) = self
-                .audio
-                .set_params(rt.params.rate, 2)
-                .map_err(|_| FsError::DeviceError)?;
+            let (hw_rate, _) = self.audio.set_params(rt.params.rate, 2).map_err(|e| {
+                warn!(
+                    "[dsp{}] configure: set_params({} Hz, 2ch) failed: {:?} -> EIO",
+                    self.index, rt.params.rate, e
+                );
+                FsError::DeviceError
+            })?;
             rt.hw_rate = hw_rate;
             let (period, periods) = self.geometry(&rt.params, hw_rate);
             rt.period_bytes = period;
@@ -587,14 +592,21 @@ impl DspDev {
                 periods
             );
         } else if rt.prepare {
-            self.audio.reset().map_err(|_| FsError::DeviceError)?;
+            self.audio.reset().map_err(|e| {
+                warn!("[dsp{}] prepare: reset failed: {:?} -> EIO", self.index, e);
+                FsError::DeviceError
+            })?;
             rt.prepare = false;
             rt.partial_len = 0;
         }
         // A stream held by `SETTRIGGER` stays held across a prepare.
-        self.audio
-            .set_start_hold(!rt.trigger)
-            .map_err(|_| FsError::DeviceError)?;
+        self.audio.set_start_hold(!rt.trigger).map_err(|e| {
+            warn!(
+                "[dsp{}] configure: set_start_hold({}) failed: {:?} -> EIO",
+                self.index, !rt.trigger, e
+            );
+            FsError::DeviceError
+        })?;
         Ok(())
     }
 
@@ -680,14 +692,27 @@ impl DspDev {
             let accepted = if take == 0 {
                 0
             } else if passthrough {
-                self.audio
-                    .write(&src[..take * cf])
-                    .map_err(|_| FsError::DeviceError)?
-                    / HW_FRAME
+                self.audio.write(&src[..take * cf]).map_err(|e| {
+                    warn!(
+                        "[dsp{}] write: device refused {} B: {:?} -> EIO",
+                        self.index,
+                        take * cf,
+                        e
+                    );
+                    FsError::DeviceError
+                })? / HW_FRAME
             } else {
                 hw.clear();
                 convert_frames(format, channels, src, take, &mut hw);
-                self.audio.write(&hw).map_err(|_| FsError::DeviceError)? / HW_FRAME
+                self.audio.write(&hw).map_err(|e| {
+                    warn!(
+                        "[dsp{}] write: device refused {} converted B: {:?} -> EIO",
+                        self.index,
+                        hw.len(),
+                        e
+                    );
+                    FsError::DeviceError
+                })? / HW_FRAME
             };
             if accepted > 0 {
                 if head_done {
@@ -710,8 +735,19 @@ impl DspDev {
             // thread's `GETODELAY` is not held up behind a blocked write.
             if kernel_hal::timer::timer_now() >= deadline {
                 warn!(
-                    "[dsp{}] playback ring made no progress; giving up",
-                    self.index
+                    "[dsp{}] playback ring made no progress; giving up: room {} B, \
+                     frame {} B, OSS buffer {} B ({} B x {}), device queued {} B, \
+                     ring free {} B, playing {}, hold {}",
+                    self.index,
+                    self.room(&rt),
+                    cf,
+                    rt.buffer_bytes(),
+                    rt.period_bytes,
+                    rt.periods,
+                    self.audio.queued_bytes(),
+                    self.audio.free_bytes(),
+                    self.audio.is_playing(),
+                    !rt.trigger,
                 );
                 break;
             }
@@ -728,11 +764,18 @@ impl DspDev {
         }
         rt.bytes += consumed as u64;
         if consumed == 0 {
-            return Err(if nonblock {
-                FsError::Again
-            } else {
-                FsError::DeviceError
-            });
+            if nonblock {
+                return Err(FsError::Again);
+            }
+            // A blocking write that took nothing: the ring never freed a
+            // whole client frame before the deadline above. The numbers are
+            // in that `warn!`; this says which `write(2)` it answered.
+            warn!(
+                "[dsp{}] write: nothing taken from a {} B write -> EIO",
+                self.index,
+                buf.len()
+            );
+            return Err(FsError::DeviceError);
         }
         Ok(consumed)
     }
@@ -1529,5 +1572,232 @@ mod tests {
         assert!(matches!(node.open_client(), Err(FsError::Busy)));
         drop(first);
         assert!(node.open_client().is_ok());
+    }
+}
+
+#[cfg(test)]
+mod write_failure_tests {
+    //! What a failing `write(2)` on `/dev/dsp` answers, and which call
+    //! produced it.
+    //!
+    //! Five different things in [`DspDev::write_pcm`] and
+    //! [`DspDev::make_ready`] answered the same bare `EIO`, and four of them
+    //! logged nothing, so `wavplay: write: I/O error (os error 5)` named
+    //! none of them. These pin the errno of each; the message that says
+    //! which is a `warn!` on the same paths.
+
+    use super::*;
+    use alloc::sync::Arc;
+    use alloc::vec::Vec;
+    use lock::Mutex;
+    use zcore_drivers::{DeviceError, DeviceResult};
+
+    /// An audio device that fails whichever call the test names, and
+    /// otherwise swallows everything.
+    struct PickyAudio {
+        /// Room the ring reports, in bytes. `0` is a ring that never frees
+        /// a frame -- the shape a stalled stream has.
+        room: usize,
+        fail_params: bool,
+        fail_reset: bool,
+        fail_hold: bool,
+        fail_write: bool,
+        queued: Mutex<usize>,
+        /// Bytes handed to [`AudioScheme::write`]. The converted path offers
+        /// a different count from what the client wrote; the passthrough one
+        /// offers exactly it.
+        offered: Mutex<usize>,
+    }
+
+    impl PickyAudio {
+        fn roomy() -> Self {
+            PickyAudio {
+                room: 1 << 16,
+                fail_params: false,
+                fail_reset: false,
+                fail_hold: false,
+                fail_write: false,
+                queued: Mutex::new(0),
+                offered: Mutex::new(0),
+            }
+        }
+    }
+
+    impl zcore_drivers::scheme::Scheme for PickyAudio {
+        fn name(&self) -> &str {
+            "picky-audio"
+        }
+    }
+
+    impl AudioScheme for PickyAudio {
+        fn set_params(&self, rate: u32, channels: u8) -> DeviceResult<(u32, u8)> {
+            if self.fail_params {
+                return Err(DeviceError::NotReady);
+            }
+            Ok((rate, channels))
+        }
+        fn params(&self) -> (u32, u8) {
+            (48_000, 2)
+        }
+        fn write(&self, pcm: &[u8]) -> DeviceResult<usize> {
+            *self.offered.lock() += pcm.len();
+            if self.fail_write {
+                return Err(DeviceError::NotReady);
+            }
+            let mut queued = self.queued.lock();
+            let n = self.room.saturating_sub(*queued).min(pcm.len()) / 4 * 4;
+            *queued += n;
+            Ok(n)
+        }
+        fn free_bytes(&self) -> usize {
+            self.room.saturating_sub(*self.queued.lock())
+        }
+        fn buffer_bytes(&self) -> usize {
+            self.room
+        }
+        fn queued_bytes(&self) -> usize {
+            *self.queued.lock()
+        }
+        fn is_playing(&self) -> bool {
+            false
+        }
+        fn reset(&self) -> DeviceResult {
+            if self.fail_reset {
+                return Err(DeviceError::NotReady);
+            }
+            *self.queued.lock() = 0;
+            Ok(())
+        }
+        fn set_start_hold(&self, _hold: bool) -> DeviceResult {
+            if self.fail_hold {
+                return Err(DeviceError::NotReady);
+            }
+            Ok(())
+        }
+    }
+
+    fn node(audio: PickyAudio) -> Arc<dyn INode> {
+        DspDev::new(Arc::new(audio), 0).open_client().unwrap()
+    }
+
+    /// Three frames of S16LE stereo: a write that any working device takes.
+    fn pcm() -> Vec<u8> {
+        alloc::vec![0u8; 12]
+    }
+
+    /// `set_params` is the first thing the first write does, and its failure
+    /// is the configure step's, not the data path's.
+    #[test]
+    fn a_device_that_cannot_be_configured_answers_eio() {
+        let audio = PickyAudio {
+            fail_params: true,
+            ..PickyAudio::roomy()
+        };
+        assert_eq!(node(audio).write_at(0, &pcm()), Err(FsError::DeviceError));
+    }
+
+    /// `set_start_hold` runs on every write, configured or not.
+    #[test]
+    fn a_device_that_refuses_the_start_hold_answers_eio() {
+        let audio = PickyAudio {
+            fail_hold: true,
+            ..PickyAudio::roomy()
+        };
+        assert_eq!(node(audio).write_at(0, &pcm()), Err(FsError::DeviceError));
+    }
+
+    /// The data path's own failure.
+    #[test]
+    fn a_device_that_refuses_the_pcm_answers_eio() {
+        let audio = PickyAudio {
+            fail_write: true,
+            ..PickyAudio::roomy()
+        };
+        assert_eq!(node(audio).write_at(0, &pcm()), Err(FsError::DeviceError));
+    }
+
+    /// A ring with no room is the one failure that is not an error from the
+    /// device: every call succeeds and the write still takes nothing. It is
+    /// `EIO` when blocking and `EAGAIN` when not, and the blocking answer is
+    /// the one `wavplay` would have seen -- so a `write: I/O error` here
+    /// means a stalled ring, not a device that said no.
+    #[test]
+    fn a_ring_that_never_frees_a_frame_is_eio_blocking_and_eagain_not() {
+        let roomless = || PickyAudio {
+            room: 0,
+            ..PickyAudio::roomy()
+        };
+        let blocking = node(roomless());
+        assert_eq!(blocking.write_at(0, &pcm()), Err(FsError::DeviceError));
+        let nonblocking = node(roomless());
+        let dsp = nonblocking.downcast_ref::<DspDev>().unwrap();
+        assert_eq!(dsp.write_pcm(&pcm(), true), Err(FsError::Again));
+    }
+
+    /// The prepare's `reset`, which only a write AFTER an
+    /// `SNDCTL_DSP_RESET` reaches: the first write configures the stream,
+    /// and `set_params` IS the prepare, so it takes the other branch.
+    #[test]
+    fn a_device_that_cannot_be_prepared_answers_eio() {
+        let audio = PickyAudio {
+            fail_reset: true,
+            ..PickyAudio::roomy()
+        };
+        let node = node(audio);
+        assert_eq!(node.write_at(0, &pcm()), Ok(pcm().len()), "configured");
+        // `SNDCTL_DSP_RESET` marks the stream for a prepare and swallows the
+        // device's own error; the next write is where it surfaces.
+        node.io_control(SNDCTL_DSP_RESET, 0).unwrap();
+        assert_eq!(node.write_at(0, &pcm()), Err(FsError::DeviceError));
+    }
+
+    /// The converted write, which is a different call from the passthrough
+    /// one: `/dev/audio`'s µ-law 8 kHz mono is not S16LE stereo, so the PCM
+    /// goes through `convert_frames` first.
+    #[test]
+    fn a_device_that_refuses_converted_pcm_answers_eio() {
+        let sun = |audio: Arc<PickyAudio>| {
+            DspDev::with_defaults(audio, 0, new_audio_claim(), OssDefaults::Audio)
+                .open_client()
+                .unwrap()
+        };
+        // First, that this really is the converted path and not the
+        // passthrough one: four µ-law mono client bytes reach the device as
+        // sixteen bytes of S16LE stereo. The errnos below are the same on
+        // both paths by design -- only the `warn!` tells them apart -- so
+        // this is what says which call the test exercised.
+        let working = Arc::new(PickyAudio::roomy());
+        assert_eq!(sun(working.clone()).write_at(0, &[0x7fu8; 4]), Ok(4));
+        assert_eq!(
+            *working.offered.lock(),
+            16,
+            "µ-law mono must be converted to S16LE stereo on the way in"
+        );
+
+        let refusing = Arc::new(PickyAudio {
+            fail_write: true,
+            ..PickyAudio::roomy()
+        });
+        assert_eq!(
+            sun(refusing.clone()).write_at(0, &[0x7fu8; 4]),
+            Err(FsError::DeviceError)
+        );
+        assert_eq!(
+            *refusing.offered.lock(),
+            16,
+            "and the refusal came from that same converted call"
+        );
+    }
+
+    /// An empty write is not a failure on any of these paths: Linux's
+    /// `write(fd, buf, 0)` is `0`, and it must not reach the device at all.
+    #[test]
+    fn an_empty_write_never_touches_the_device() {
+        let audio = PickyAudio {
+            fail_params: true,
+            fail_write: true,
+            ..PickyAudio::roomy()
+        };
+        assert_eq!(node(audio).write_at(0, &[]), Ok(0));
     }
 }
