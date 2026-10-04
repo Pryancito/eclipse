@@ -2413,6 +2413,59 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
         executable
     }
 
+    /// Persist contained kernel faults. The fault path records them in RAM
+    /// (`kernel_hal::oops_log` -> /proc/oops) because it cannot touch a
+    /// filesystem: interrupts are off, the heap may be the thing that just
+    /// got smashed, and `oops` only proceeds with NO kernel lock held. This
+    /// is the userspace half that turns that RAM record into a file that
+    /// survives the console scrollback -- the same split Linux uses between
+    /// the printk ring and syslogd.
+    ///
+    /// The chmod is NOT optional and is why this lives in its own function:
+    /// the script shipped 0644 for its whole life, so `execve` of the service's
+    /// `exec =` returned EACCES, the child `_exit(127)`ed in under a
+    /// millisecond, and eclipse-init respawned it forever (backing off to
+    /// MAX_BACKOFF, i.e. an `exit 127` line on the console every 8 s for the
+    /// rest of the boot). The regression test below asserts the x bit.
+    fn write_oopslog(localbin: &Path, svc_dir: &Path) {
+        let script = localbin.join("eclipse-oopslog");
+        fs::write(
+            &script,
+            b"#!/bin/sh\n\
+              # Drain /proc/oops into /var/log/oops.log.\n\
+              # Contained faults leave the machine RUNNING, so this can take its\n\
+              # time; it only needs to beat the next reboot.\n\
+              OUT=/var/log/oops.log\n\
+              mkdir -p /var/log 2>/dev/null\n\
+              last=\n\
+              while :; do\n\
+              \x20 cur=$(cat /proc/oops 2>/dev/null)\n\
+              \x20 case \"$cur\" in ''|'# no contained kernel faults since boot') : ;; *)\n\
+              \x20 \x20 if [ \"$cur\" != \"$last\" ]; then\n\
+              \x20 \x20 \x20 { echo \"=== $(date 2>/dev/null || echo 'boot+?') ===\"; echo \"$cur\"; } >> \"$OUT\"\n\
+              \x20 \x20 \x20 last=$cur\n\
+              \x20 \x20 \x20 echo 'eclipse-oopslog: a kernel fault was contained; see /var/log/oops.log' > /dev/console 2>/dev/null\n\
+              \x20 \x20 fi\n\
+              \x20 esac\n\
+              \x20 sleep 10\n\
+              done\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        fs::write(
+            svc_dir.join("oopslog.service"),
+            b"# Persist contained kernel faults (/proc/oops -> /var/log/oops.log).\n\
+              exec = /usr/local/bin/eclipse-oopslog\n\
+              type = respawn\n",
+        )
+        .unwrap();
+    }
+
     /// The session bus, in the foreground so eclipse-init supervises it.
     ///
     /// Two implementations, in this order: Alpine's dbus-daemon when the
@@ -2462,6 +2515,131 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
               MSG='eclipse-dbus: no dbus-daemon and no eclipse-dbusd -- there is\n\
               no session bus. Fix: apk add dbus, or rebuild the image so\n\
               /usr/local/bin/eclipse-dbusd is installed.'\n\
+              echo \"$MSG\" > /dev/console 2>/dev/null || true\n\
+              echo \"$MSG\" >&2\n\
+              sleep 60\n\
+              exit 127\n",
+        )
+        .unwrap();
+        // D-Bus SYSTEM bus. PulseAudio runs `--system` (user-mode pulse
+        // refuses uid 0), and in that mode its main.c connects to the system
+        // bus. There was none, so every boot logged
+        //   W: [pulseaudio] main.c: Unable to contact D-Bus:
+        //   org.freedesktop.DBus.Error.FileNotFound: Failed to connect to
+        //   socket /run/dbus/system_bus_socket: No such file or directory
+        // and anything else that wanted a system name had nowhere to put it.
+        //
+        // This is a SECOND bus, not a view of the session one: names
+        // registered here are invisible on unix:path=/run/user/0/bus and vice
+        // versa, which is exactly how Linux works. It cannot be a symlink to
+        // the session bus either -- /run/user/0 is 0700 root and `--system`
+        // drops pulse to its own uid, so it could not reach it.
+        fs::write(
+            localbin.join("eclipse-dbus-system"),
+            b"#!/bin/sh\n\
+              # Eclipse OS: D-Bus system bus for eclipse-init, on the path\n\
+              # libdbus compiles in as the default system address.\n\
+              BUS=/run/dbus/system_bus_socket\n\
+              mkdir -p /run/dbus\n\
+              # /run/dbus itself must be traversable by every uid: the whole\n\
+              # point of the system bus is that unprivileged services reach\n\
+              # it. The socket's own mode is the daemon's business.\n\
+              chmod 0755 /run/dbus 2>/dev/null || true\n\
+              [ -s /etc/machine-id ] || dbus-uuidgen > /etc/machine-id 2>/dev/null\n\
+              mkdir -p /var/lib/dbus 2>/dev/null\n\
+              [ -s /var/lib/dbus/machine-id ] || cp /etc/machine-id /var/lib/dbus/machine-id 2>/dev/null\n\
+              # Stale socket from an earlier run of THIS boot: bind() fails\n\
+              # with EADDRINUSE although nothing listens. Same reasoning as\n\
+              # eclipse-dbus -- init has already reaped the previous daemon.\n\
+              rm -f \"$BUS\"\n\
+              # dbus-daemon --system drops to the user its system.conf names\n\
+              # and exits 1 if that name is not in /etc/passwd. On the console\n\
+              # that failure is invisible --- the daemon's stderr goes to the\n\
+              # service log --- and init just respawns it for ever, which is\n\
+              # the loop this check exists to name out loud.\n\
+              WANT=$(sed -n \x27s|.*<user>\\([^<]*\\)</user>.*|\\1|p\x27 \\\n\
+              \x20 /usr/share/dbus-1/system.conf 2>/dev/null | head -n 1)\n\
+              USE_DAEMON=yes\n\
+              if [ -n \"$WANT\" ] && ! grep -q \"^$WANT:\" /etc/passwd 2>/dev/null; then\n\
+              \x20 # Create it here rather than only complaining. The image\n\
+              \x20 # build lays this account down, but a rootfs built before\n\
+              \x20 # that did not, and the cost of being wrong is a boot with\n\
+              \x20 # no system bus at all. uid/gid 81 is what Alpine reserves.\n\
+              \x20 #\n\
+              \x20 # Both numbers and both names have to be free, or already\n\
+              \x20 # this account\x27s, before either file is touched: handing dbus\n\
+              \x20 # a gid that belongs to some other group would hand it that\n\
+              \x20 # group\x27s files, and writing a passwd line whose gid has no\n\
+              \x20 # group, or a group whose gid does not match, is worse than\n\
+              \x20 # no account at all. On any conflict we touch nothing and\n\
+              \x20 # fall back.\n\
+              \x20 UID_FREE=no\n\
+              \x20 grep -q \"^[^:]*:[^:]*:81:\" /etc/passwd 2>/dev/null || UID_FREE=yes\n\
+              \x20 GID_OK=no\n\
+              \x20 ADD_GROUP=no\n\
+              \x20 if grep -q \"^$WANT:[^:]*:81:\" /etc/group 2>/dev/null; then\n\
+              \x20 \x20 # The group is already there and already 81: reuse it.\n\
+              \x20 \x20 GID_OK=yes\n\
+              \x20 elif ! grep -q \"^$WANT:\" /etc/group 2>/dev/null \\\n\
+              \x20 \x20 \x20 && ! grep -q \"^[^:]*:[^:]*:81:\" /etc/group 2>/dev/null; then\n\
+              \x20 \x20 GID_OK=yes\n\
+              \x20 \x20 ADD_GROUP=yes\n\
+              \x20 fi\n\
+              \x20 WRITE=no\n\
+              \x20 if [ \"$UID_FREE\" = yes ] && [ \"$GID_OK\" = yes ] && [ -w /etc/passwd ]; then\n\
+              \x20 \x20 WRITE=yes\n\
+              \x20 \x20 if [ \"$ADD_GROUP\" = yes ] && [ ! -w /etc/group ]; then\n\
+              \x20 \x20 \x20 WRITE=no\n\
+              \x20 \x20 fi\n\
+              \x20 fi\n\
+              \x20 if [ \"$WRITE\" = yes ]; then\n\
+              \x20 \x20 # Group first, so there is never a passwd line whose gid\n\
+              \x20 \x20 # has no group behind it.\n\
+              \x20 \x20 if [ \"$ADD_GROUP\" = yes ]; then\n\
+              \x20 \x20 \x20 echo \"$WANT:x:81:\" >> /etc/group\n\
+              \x20 \x20 fi\n\
+              \x20 \x20 echo \"$WANT:x:81:81:dbus:/dev/null:/sbin/nologin\" >> /etc/passwd\n\
+              \x20 \x20 echo \"eclipse-dbus-system: added the missing user \x27$WANT\x27 (81:81)\" \\\n\
+              \x20 \x20 \x20 > /dev/console 2>/dev/null || true\n\
+              \x20 fi\n\
+              fi\n\
+              if [ -n \"$WANT\" ] && ! grep -q \"^$WANT:\" /etc/passwd 2>/dev/null; then\n\
+              \x20 M=\"eclipse-dbus-system: system.conf wants user \x27$WANT\x27 and\n\
+              /etc/passwd has no such line, so dbus-daemon --system would exit 1\n\
+              on every start; using eclipse-dbusd instead\"\n\
+              \x20 echo \"$M\" > /dev/console 2>/dev/null || true\n\
+              \x20 echo \"$M\" >&2\n\
+              \x20 USE_DAEMON=no\n\
+              fi\n\
+              # Whatever dbus-daemon says on its way out has to reach the\n\
+              # CONSOLE, because that is the only thing anybody reads during a\n\
+              # boot: the service log lives in /tmp, so the first version of\n\
+              # this service restarted for ever without a word about why. The\n\
+              # exec below inherits this, and stdout still goes to the log.\n\
+              if [ -w /dev/console ]; then\n\
+              \x20 exec 2>/dev/console\n\
+              fi\n\
+              # Alpine's dbus-daemon first: --system brings the real policy\n\
+              # from /usr/share/dbus-1/system.conf, which is what decides who\n\
+              # may own a name here.\n\
+              if [ \"$USE_DAEMON\" = yes ]; then\n\
+              \x20 for d in /usr/bin /bin /usr/sbin /sbin; do\n\
+              \x20 \x20 if [ -x \"$d/dbus-daemon\" ]; then\n\
+              \x20 \x20 \x20 echo \"eclipse-dbus-system: $d/dbus-daemon on unix:path=$BUS\" > /dev/console 2>/dev/null\n\
+              \x20 \x20 \x20 exec \"$d/dbus-daemon\" --system --nofork --nopidfile \\\n\
+              \x20 \x20 \x20 \x20 --address=\"unix:path=$BUS\"\n\
+              \x20 \x20 fi\n\
+              \x20 done\n\
+              fi\n\
+              for d in /usr/local/bin /usr/bin /bin; do\n\
+              \x20 if [ -x \"$d/eclipse-dbusd\" ]; then\n\
+              \x20 \x20 echo \"eclipse-dbus-system: $d/eclipse-dbusd on unix:path=$BUS\" > /dev/console 2>/dev/null\n\
+              \x20 \x20 exec \"$d/eclipse-dbusd\" --system\n\
+              \x20 fi\n\
+              done\n\
+              MSG='eclipse-dbus-system: no dbus-daemon and no eclipse-dbusd --\n\
+              there is no system bus. pulseaudio will log \"Unable to contact\n\
+              D-Bus\" and carry on; anything that needs a system name will not.'\n\
               echo \"$MSG\" > /dev/console 2>/dev/null || true\n\
               echo \"$MSG\" >&2\n\
               sleep 60\n\
@@ -2913,6 +3091,19 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
                         "_ntp:",
                         "_ntp:x:123:123:OpenNTPD:/var/empty:/sbin/nologin\n",
                     ),
+                    // dbus-daemon's own user, same reason: its system.conf
+                    // says `<user>messagebus</user>` and the daemon drops to
+                    // it right after binding the listener, so without this
+                    // line `--system` cannot look the name up and exits 1
+                    // within tens of milliseconds -- which is exactly the
+                    // restart loop the dbus-system service fell into. uid/gid
+                    // 81 is what Alpine's dbus pre-install reserves, so the
+                    // file ownerships apk laid down line up. The session bus
+                    // never needed it: session.conf names no user.
+                    (
+                        "messagebus:",
+                        "messagebus:x:81:81:dbus:/dev/null:/sbin/nologin\n",
+                    ),
                 ] {
                     if !updated.lines().any(|l| l.starts_with(prefix)) {
                         if !updated.ends_with('\n') {
@@ -2932,6 +3123,7 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
                     "root:x:0:0:root:/root:/bin/sh\n\
                      pulse:x:51:51:PulseAudio:/var/run/pulse:/bin/false\n\
                      _ntp:x:123:123:OpenNTPD:/var/empty:/sbin/nologin\n\
+                     messagebus:x:81:81:dbus:/dev/null:/sbin/nologin\n\
                      nobody:x:65534:65534:nobody:/:/bin/false\n",
                 )
                 .unwrap();
@@ -2943,6 +3135,7 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
             ("pulse-access:", "pulse-access:x:52:root\n"),
             ("audio:", "audio:x:29:root,pulse\n"),
             ("_ntp:", "_ntp:x:123:\n"),
+            ("messagebus:", "messagebus:x:81:\n"),
         ];
         match fs::read_to_string(&group) {
             Ok(existing) => {
@@ -3135,6 +3328,21 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
         )
         .unwrap();
 
+        // D-Bus system bus, on libdbus's compiled-in default address. A second
+        // bus, independent of the session one above; see eclipse-dbus-system
+        // for why it cannot be the same socket.
+        fs::write(
+            svc_dir.join("dbus-system.service"),
+            b"# D-Bus system bus. See /usr/local/bin/eclipse-dbus-system.\n\
+              # Address: unix:path=/run/dbus/system_bus_socket, which libdbus\n\
+              # uses with no environment variable set -- which is how\n\
+              # pulseaudio --system looks for it.\n\
+              exec = /usr/local/bin/eclipse-dbus-system\n\
+              type = respawn\n\
+              log = /tmp/dbus-system.log\n",
+        )
+        .unwrap();
+
         // Session-bus probe, opt-in. `cmdline = dbus.selftest` keeps it out of
         // a normal boot entirely; a boot with `dbus.selftest` on the kernel
         // command line runs the same checks the desktop menu offers and prints
@@ -3207,32 +3415,6 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
               desktop = labwc\n",
         )
         .unwrap();
-        // KDE's session daemon, and the one-time palette seeding that has to
-        // land before any KDE client reads kdeglobals. Both wrappers check
-        // for their own binary and exit quietly when KDE was left out of the
-        // image (ECLIPSE_KDE=0), so these two services are always written.
-        fs::write(
-            svc_dir.join("kde-colors.service"),
-            b"# Seed kdeglobals with Breeze Dark once. See eclipse-kde-colors.\n\
-              exec = /usr/local/bin/eclipse-kde-colors\n\
-              type = oneshot\n",
-        )
-        .unwrap();
-        fs::write(
-            svc_dir.join("kded.service"),
-            b"# KDE background services (kded6). See eclipse-kded.\n\
-              exec = /usr/local/bin/eclipse-kded\n\
-              type = respawn\n\
-              after = labwc dbus\n\
-              # Both gates, because kded6 needs both: a QGuiApplication (the\n\
-              # compositor socket) and a bus for every module it hosts. A\n\
-              # kded6 started without the bus exits at once and respawns\n\
-              # forever. Native stat polls, no forked `sleep` loops.\n\
-              wait_socket = /run/user/0/wayland-0\n\
-              wait_path = /run/user/0/bus\n\
-              desktop = labwc\n",
-        )
-        .unwrap();
         fs::write(
             svc_dir.join("lunarbar.service"),
             b"# Two-bar panel (wlr-layer-shell). See eclipse-lunarbar.\n\
@@ -3275,14 +3457,20 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
         .unwrap();
 
         // PulseAudio: system instance over ALSA hw:0,0. Session-agnostic so
-        // both labwc and Xorg get a mixer. wait_path: the HDA PCM node is
-        // created at kernel probe, which can lag the first userspace tick.
+        // both labwc and Xorg get a mixer.
+        //
+        // Do NOT `wait_path = /dev/snd/pcmC0D0p`: start order is alphabetical,
+        // so that wait sat ahead of seatd/labwc and burned a full 8 s on every
+        // machine without HDA (VirtualBox AC97 has no driver here; the node
+        // never appears). Pulse loads the ALSA sink after its socket, and
+        // `eclipse-boot-sound` already polls for a PCM; a missing card just
+        // means no sink, not a delayed desktop.
         fs::write(
             svc_dir.join("pulseaudio.service"),
             b"# PulseAudio sound server (system instance). See eclipse-pulseaudio.\n\
               exec = /usr/local/bin/eclipse-pulseaudio\n\
               type = respawn\n\
-              wait_path = /dev/snd/pcmC0D0p\n\
+              after = dbus-system\n\
               log = /tmp/pulseaudio.log\n",
         )
         .unwrap();
@@ -3470,43 +3658,7 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
               exec udhcpc -i eth0 -f -R -s \"$SCRIPTv4\"\n",
         )
         .unwrap();
-        // Persist contained kernel faults. The fault path records them in RAM
-        // (`kernel_hal::oops_log` -> /proc/oops) because it cannot touch a
-        // filesystem: interrupts are off, the heap may be the thing that just
-        // got smashed, and `oops` only proceeds with NO kernel lock held. This
-        // is the userspace half that turns that RAM record into a file that
-        // survives the console scrollback -- the same split Linux uses between
-        // the printk ring and syslogd.
-        fs::write(
-            localbin.join("eclipse-oopslog"),
-            b"#!/bin/sh\n\
-              # Drain /proc/oops into /var/log/oops.log.\n\
-              # Contained faults leave the machine RUNNING, so this can take its\n\
-              # time; it only needs to beat the next reboot.\n\
-              OUT=/var/log/oops.log\n\
-              mkdir -p /var/log 2>/dev/null\n\
-              last=\n\
-              while :; do\n\
-              \x20 cur=$(cat /proc/oops 2>/dev/null)\n\
-              \x20 case \"$cur\" in ''|'# no contained kernel faults since boot') : ;; *)\n\
-              \x20 \x20 if [ \"$cur\" != \"$last\" ]; then\n\
-              \x20 \x20 \x20 { echo \"=== $(date 2>/dev/null || echo 'boot+?') ===\"; echo \"$cur\"; } >> \"$OUT\"\n\
-              \x20 \x20 \x20 last=$cur\n\
-              \x20 \x20 \x20 echo 'eclipse-oopslog: a kernel fault was contained; see /var/log/oops.log' > /dev/console 2>/dev/null\n\
-              \x20 \x20 fi\n\
-              \x20 esac\n\
-              \x20 sleep 10\n\
-              done\n",
-        )
-        .unwrap();
-
-        fs::write(
-            svc_dir.join("oopslog.service"),
-            b"# Persist contained kernel faults (/proc/oops -> /var/log/oops.log).\n\
-              exec = /usr/local/bin/eclipse-oopslog\n\
-              type = respawn\n",
-        )
-        .unwrap();
+        Self::write_oopslog(&localbin, &svc_dir);
 
         Self::write_dbus_wrapper(&localbin);
 
@@ -3586,12 +3738,38 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
 
         fs::write(
             localbin.join("eclipse-lunarbg"),
-            wallpaper_wrapper(wait_wayland).as_bytes(),
+            format!(
+                "#!/bin/sh\n\
+                 # Eclipse OS: wallpaper client for eclipse-init (not labwc autostart).\n\
+                 LOG=/tmp/lunarbg.log\n\
+                 exec >>\"$LOG\" 2>&1\n\
+                 {wait}\
+                 command -v lunarbg >/dev/null 2>&1 || {{ echo 'eclipse-lunarbg: lunarbg missing'; sleep 5; exit 127; }}\n\
+                 echo \"[eclipse-lunarbg] WAYLAND_DISPLAY=$WAYLAND_DISPLAY\"\n\
+                 # labwc writes LUNARBG_ASPECT into its environment file, but\n\
+                 # this client is started by eclipse-init — not as a labwc\n\
+                 # child — so re-export a default for panels without EDID mm.\n\
+                 export LUNARBG_ASPECT=\"${{LUNARBG_ASPECT:-16:9}}\"\n\
+                 exec lunarbg --fps \"${{LUNARBG_FPS:-8}}\"\n",
+                wait = wait_wayland
+            )
+            .as_bytes(),
         )
         .unwrap();
         fs::write(
             localbin.join("eclipse-lunarbar"),
-            panel_wrapper(wait_wayland).as_bytes(),
+            format!(
+                "#!/bin/sh\n\
+                 # Eclipse OS: panel client for eclipse-init (not labwc autostart).\n\
+                 LOG=/tmp/lunarbar.log\n\
+                 exec >>\"$LOG\" 2>&1\n\
+                 {wait}\
+                 command -v lunarbar >/dev/null 2>&1 || {{ echo 'eclipse-lunarbar: lunarbar missing'; sleep 5; exit 127; }}\n\
+                 echo \"[eclipse-lunarbar] WAYLAND_DISPLAY=$WAYLAND_DISPLAY\"\n\
+                 exec lunarbar\n",
+                wait = wait_wayland
+            )
+            .as_bytes(),
         )
         .unwrap();
 
@@ -3649,6 +3827,7 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
             for w in [
                 "eclipse-udhcpc",
                 "eclipse-dbus",
+                "eclipse-dbus-system",
                 "eclipse-seatd",
                 "eclipse-xorg",
                 "eclipse-lunarbg",
@@ -3661,6 +3840,23 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
                 "halt",
             ] {
                 let _ = fs::set_permissions(localbin.join(w), fs::Permissions::from_mode(0o755));
+            }
+            // Belt and braces: /usr/local/bin holds nothing but wrappers, so
+            // every regular file in it must be executable. The list above is a
+            // list, and `eclipse-oopslog` was added to the writes and NOT to
+            // the list, which shipped it 0644; `execve` then failed with EACCES
+            // and eclipse-init respawned the service for the whole boot. This
+            // pass makes the next omission harmless instead of a respawn storm.
+            if let Ok(entries) = fs::read_dir(&localbin) {
+                for entry in entries.flatten() {
+                    // `is_file()` on the entry's own type, not the path's:
+                    // following a symlink here would chmod whatever it points
+                    // at, outside this directory.
+                    if entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
+                        let _ =
+                            fs::set_permissions(entry.path(), fs::Permissions::from_mode(0o755));
+                    }
+                }
             }
         }
 
@@ -3833,123 +4029,6 @@ fn check_so<P: AsRef<Path>>(path: P) -> bool {
     seg.all(|it| !it.is_empty() && it.chars().all(|ch| ch.is_ascii_digit()))
 }
 
-/// The `look` line of `/etc/eclipse/look`, read the way `eclipse-look`
-/// itself reads it. Shared by both session wrappers on purpose: two readers
-/// of one file that disagree about `look = plasma ` is a setting that looks
-/// applied and is not.
-///
-/// Whitespace comes out of the VALUE too, not just from around the key,
-/// because `eclipse-look`'s awk does `gsub(/[[:space:]]/, "")`, and a
-/// trailing `# comment` comes off BEFORE that: squeezing it instead turns
-/// `look=plasma # nota` into `plasma#nota`, which is a look that was set and
-/// did not take. A `#` LINE never matches the key pattern at all, so a
-/// commented-out look stays commented out.
-const READ_LOOK: &str =
-    "look=$(sed -n 's/^[[:space:]]*look[[:space:]]*=//p' /etc/eclipse/look \\\n\
-     \x20 \x20 2>/dev/null | head -n 1 | sed 's/#.*$//' | tr -d '[:space:]')\n";
-
-/// The wallpaper service's wrapper. Under `look=plasma` it paints NOTHING and
-/// parks, because plasmashell's own DesktopView is a `wlr-layer-shell` surface
-/// on the **background** layer too (`LayerShellQt::Window::LayerBackground`
-/// with `setExclusiveZone(-1)`, shell/desktopview.cpp of plasma-workspace
-/// 6.6.5) -- the same layer lunarbg uses. Measured on wlroots with two
-/// `swaybg`s: the surface committed FIRST stays on top. lunarbg starts with
-/// the session and plasmashell's desktop needs seconds of QML, so lunarbg
-/// would reliably cover Plasma's desktop -- wallpaper, icons, right-click
-/// menu and all -- while still burning frames under an opaque surface.
-///
-/// Parking rather than exiting: the service is `type = respawn`, so a wrapper
-/// that exits is a wrapper that init restarts every 8 seconds forever. The
-/// hourly re-read is the self-healing path for someone editing
-/// `/etc/eclipse/look` by hand; the fast path is `eclipse-look`, which kills
-/// this wrapper by name so the switch is immediate.
-fn wallpaper_wrapper(wait_wayland: &str) -> String {
-    format!(
-        "#!/bin/sh\n\
-         # Eclipse OS: wallpaper client for eclipse-init (not labwc autostart).\n\
-         LOG=/tmp/lunarbg.log\n\
-         exec >>\"$LOG\" 2>&1\n\
-         {wait}\
-         {look}\
-         if [ \"$look\" = plasma ]; then\n\
-         \x20 echo '[eclipse-lunarbg] look=plasma: plasmashell draws the desktop on'\n\
-         \x20 echo '  the background layer itself, so lunarbg stands aside. Parking;'\n\
-         \x20 echo '  eclipse-look kills this wrapper when the look changes.'\n\
-         \x20 while [ \"$look\" = plasma ]; do\n\
-         \x20 \x20 sleep 3600\n\
-         {look_indented}\
-         \x20 done\n\
-         \x20 echo '[eclipse-lunarbg] look is no longer plasma; letting init respawn us'\n\
-         \x20 exit 0\n\
-         fi\n\
-         command -v lunarbg >/dev/null 2>&1 || {{ echo 'eclipse-lunarbg: lunarbg missing'; sleep 5; exit 127; }}\n\
-         echo \"[eclipse-lunarbg] WAYLAND_DISPLAY=$WAYLAND_DISPLAY\"\n\
-         # labwc writes LUNARBG_ASPECT into its environment file, but this\n\
-         # client is started by eclipse-init — not as a labwc child — so\n\
-         # re-export a default for panels without EDID mm.\n\
-         export LUNARBG_ASPECT=\"${{LUNARBG_ASPECT:-16:9}}\"\n\
-         exec lunarbg --fps \"${{LUNARBG_FPS:-8}}\"\n",
-        wait = wait_wayland,
-        look = READ_LOOK,
-        look_indented = READ_LOOK
-            .lines()
-            .map(|l| format!("\x20 \x20 {l}\n"))
-            .collect::<String>(),
-    )
-}
-
-/// The panel service's wrapper. WHICH panel is a runtime choice: `look=plasma`
-/// in `/etc/eclipse/look` asks for KDE's own shell, anything else for
-/// lunarbar. One service and one wrapper rather than two services, because a
-/// service whose job is to not run would exit at once and `type = respawn`
-/// would restart it every 8 seconds forever.
-///
-/// Its own function so a test can run the script: it and
-/// [`wallpaper_wrapper`] are the two wrappers in the image with a branch
-/// in them, and both branch on the same file.
-fn panel_wrapper(wait_wayland: &str) -> String {
-    format!(
-        "#!/bin/sh\n\
-         # Eclipse OS: panel client for eclipse-init (not labwc autostart).\n\
-         LOG=/tmp/lunarbar.log\n\
-         exec >>\"$LOG\" 2>&1\n\
-         {wait}\
-{look}         if [ \"$look\" = plasma ]; then\n\
-         \x20 if command -v plasmashell >/dev/null 2>&1; then\n\
-         # plasmashell places BOTH its panel and its desktop with\n\
-         # wlr-layer-shell (LayerShellQt: PanelView on the top layer,\n\
-         # DesktopView on the background one), which labwc serves --\n\
-         # that is why the KDE shell works here at all. What labwc\n\
-         # does NOT serve is org_kde_plasma_window_management, so the\n\
-         # Task Manager widget stays empty; see docs/README-desktop.md.\n\
-         \x20 \x20 KDE_FULL_SESSION=true; export KDE_FULL_SESSION\n\
-         \x20 \x20 KDE_SESSION_VERSION=6; export KDE_SESSION_VERSION\n\
-         # Services do not inherit labwc's session environment (init\n\
-         # execs them itself), so the two variables Plasma's own QML\n\
-         # needs are set here: Wayland with NO xcb fallback (a shell\n\
-         # on Xwayland cannot own layer surfaces), and, on the pixman\n\
-         # session, Qt Quick's software raster -- all of Plasma is\n\
-         # QML, and llvmpipe GL is slower than the CPU rasterizer.\n\
-         \x20 \x20 QT_QPA_PLATFORM=wayland; export QT_QPA_PLATFORM\n\
-         \x20 \x20 XDG_CURRENT_DESKTOP=KDE; export XDG_CURRENT_DESKTOP\n\
-         \x20 \x20 if [ \"${{WLR_RENDERER:-}}\" = pixman ]; then\n\
-         \x20 \x20 \x20 : \"${{QT_QUICK_BACKEND:=software}}\"; export QT_QUICK_BACKEND\n\
-         \x20 \x20 fi\n\
-         \x20 \x20 echo \"[eclipse-lunarbar] look=plasma -> plasmashell\"\n\
-         \x20 \x20 exec plasmashell\n\
-         \x20 fi\n\
-         \x20 echo 'eclipse-lunarbar: look=plasma but plasmashell is not installed'\n\
-         \x20 echo '  (the image was built with ECLIPSE_PLASMA=0 or ECLIPSE_KDE=0);'\n\
-         \x20 echo '  falling back to lunarbar so the session keeps a panel.'\n\
-         fi\n\
-         command -v lunarbar >/dev/null 2>&1 || {{ echo 'eclipse-lunarbar: lunarbar missing'; sleep 5; exit 127; }}\n\
-         echo \"[eclipse-lunarbar] WAYLAND_DISPLAY=$WAYLAND_DISPLAY\"\n\
-         exec lunarbar\n",
-        wait = wait_wayland,
-        look = READ_LOOK,
-    )
-}
-
 #[cfg(test)]
 mod var_run_tests {
     use super::*;
@@ -3986,6 +4065,62 @@ mod var_run_tests {
         );
         // And the applet it shadows in /bin is still there.
         assert!(bin.join("env").is_symlink());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// `/usr/local/bin/eclipse-oopslog` shipped **0644** from the day it was
+    /// added: the script was written next to the other wrappers but never added
+    /// to the `chmod 0755` list beside them. `oopslog.service` is
+    /// `type = respawn`, so on every boot eclipse-init forked, `execve` failed
+    /// with EACCES, the child `_exit(127)`ed in well under a millisecond, and
+    /// the supervisor respawned it -- backing off to MAX_BACKOFF and then
+    /// printing an `exit 127` line every 8 s for the rest of the boot. That is
+    /// the "the service resets over and over" report from real hardware.
+    ///
+    /// The x bit is the whole fix, so it is what this asserts; the rest checks
+    /// the script is shell the image's /bin/sh will accept and that the service
+    /// file actually points at the file being chmodded.
+    #[test]
+    fn the_oopslog_wrapper_is_installed_executable() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("eclipse-oopslog-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let localbin = dir.join("usr/local/bin");
+        let svc_dir = dir.join("etc/eclipse/services");
+        fs::create_dir_all(&localbin).unwrap();
+        fs::create_dir_all(&svc_dir).unwrap();
+
+        LinuxRootfs::write_oopslog(&localbin, &svc_dir);
+
+        let script = localbin.join("eclipse-oopslog");
+        let mode = fs::metadata(&script).unwrap().permissions().mode();
+        assert_ne!(
+            mode & 0o111,
+            0,
+            "eclipse-oopslog is {:04o}: execve fails with EACCES and init respawns it forever",
+            mode & 0o7777
+        );
+
+        let src = fs::read_to_string(&script).unwrap();
+        assert!(src.starts_with("#!/bin/sh\n"), "shebang");
+        let st = std::process::Command::new("sh")
+            .arg("-n")
+            .arg(&script)
+            .status()
+            .unwrap();
+        assert!(st.success(), "sh -n rejected eclipse-oopslog");
+
+        // The loop must never fall out of the bottom: `type = respawn` would
+        // make a script that returns look exactly like the bug above.
+        assert!(src.contains("while :; do"), "the drain has to be a loop");
+
+        let unit = fs::read_to_string(svc_dir.join("oopslog.service")).unwrap();
+        assert!(
+            unit.contains("exec = /usr/local/bin/eclipse-oopslog"),
+            "the service must point at the script this chmods: {unit}"
+        );
+        assert!(unit.contains("type = respawn"), "{unit}");
+
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -4153,157 +4288,6 @@ mod var_run_tests {
         unix::fs::symlink("../nowhere", &link).unwrap();
         LinuxRootfs::ensure_var_run(&dir);
         assert_eq!(fs::read_link(&link).unwrap(), Path::new("../run"));
-
-        let _ = fs::remove_dir_all(&dir);
-    }
-}
-
-#[cfg(test)]
-mod panel_wrapper_tests {
-    use super::*;
-
-    /// The wrapper that picks KDE's shell or Eclipse's panel from
-    /// `/etc/eclipse/look`. It has to be valid shell
-    /// (init runs it with nothing attached), it must never leave the session
-    /// with no panel at all, and it must set Plasma's environment BEFORE the
-    /// exec -- a variable exported after one is a variable nobody reads.
-    #[test]
-    fn the_panel_wrapper_picks_a_shell_and_always_leaves_one() {
-        let script = panel_wrapper("# (wait for the compositor)\n");
-        let dir = std::env::temp_dir().join(format!("eclipse-panel-test-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("eclipse-lunarbar");
-        fs::write(&path, &script).unwrap();
-        let st = std::process::Command::new("sh")
-            .arg("-n")
-            .arg(&path)
-            .status()
-            .unwrap();
-        assert!(st.success(), "sh -n rejected the panel wrapper");
-
-        // plasmashell is only reached when the look asks for it AND it is
-        // installed; either way the script goes on to lunarbar.
-        let plasma = script.find("exec plasmashell").expect("the plasma branch");
-        let lunarbar = script.find("exec lunarbar").expect("the fallback");
-        assert!(
-            plasma < lunarbar,
-            "the fallback must come after the plasma branch, not instead of it"
-        );
-        assert!(
-            script.contains("command -v plasmashell"),
-            "a missing plasmashell must fall through, not exec nothing"
-        );
-        for var in [
-            "QT_QPA_PLATFORM=wayland",
-            "KDE_FULL_SESSION",
-            "XDG_CURRENT_DESKTOP=KDE",
-        ] {
-            let at = script
-                .find(var)
-                .unwrap_or_else(|| panic!("{var} must be set"));
-            assert!(at < plasma, "{var} is exported after the exec, so unread");
-        }
-        // Qt Quick on the software session: Plasma is all QML, and llvmpipe
-        // GL is slower than the CPU rasterizer.
-        assert!(script.contains("QT_QUICK_BACKEND:=software"));
-        let _ = fs::remove_dir_all(&dir);
-    }
-}
-
-#[cfg(test)]
-mod wallpaper_wrapper_tests {
-    use super::*;
-
-    /// Run the generated wrapper for real, with the look file and the log
-    /// redirected into a temp dir and a fake `lunarbg` on `$PATH`. Reading the
-    /// script back with `contains` is what let the panel wrapper ship a reader
-    /// that disagreed with `eclipse-look` about `look = plasma ` (trailing
-    /// space); executing it is what caught that, so this one executes it.
-    ///
-    /// `sleep 3600` becomes `exit 42` so the parked branch ends on its first
-    /// pass instead of blocking the suite for an hour.
-    fn run(dir: &Path, look_file: &str, have_lunarbg: bool) -> (i32, String) {
-        let _ = fs::remove_dir_all(dir);
-        let bin = dir.join("bin");
-        fs::create_dir_all(&bin).unwrap();
-        fs::write(dir.join("look"), look_file).unwrap();
-        if have_lunarbg {
-            let fake = bin.join("lunarbg");
-            fs::write(&fake, "#!/bin/sh\necho \"RAN lunarbg $*\"\n").unwrap();
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
-        }
-        let script = wallpaper_wrapper("# (wait for the compositor)\n")
-            .replace("/etc/eclipse/look", dir.join("look").to_str().unwrap())
-            .replace(
-                "LOG=/tmp/lunarbg.log",
-                &format!("LOG={}", dir.join("log").display()),
-            )
-            .replace("sleep 3600", "exit 42");
-        let path = dir.join("eclipse-lunarbg");
-        fs::write(&path, &script).unwrap();
-        let st = std::process::Command::new("sh")
-            .arg(&path)
-            .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
-            .env("WAYLAND_DISPLAY", "wayland-0")
-            .status()
-            .unwrap();
-        let log = fs::read_to_string(dir.join("log")).unwrap_or_default();
-        (st.code().unwrap_or(-1), log)
-    }
-
-    /// plasmashell's own DesktopView is a background-layer surface
-    /// (`LayerBackground`, shell/desktopview.cpp of plasma-workspace 6.6.5),
-    /// the same layer lunarbg paints on, and on wlroots the surface committed
-    /// first stays on top -- which lunarbg always is, since it starts with the
-    /// session while plasmashell needs seconds of QML. So under `look=plasma`
-    /// lunarbg must not paint at all, or it covers Plasma's wallpaper, icons
-    /// and desktop menu while burning frames nobody sees.
-    #[test]
-    fn the_wallpaper_stands_aside_for_plasma_and_paints_for_everything_else() {
-        let dir = std::env::temp_dir().join(format!("eclipse-bg-test-{}", std::process::id()));
-
-        // Every spelling eclipse-look would accept as plasma, including the
-        // one with whitespace around the value.
-        for look in [
-            "look=plasma\n",
-            "look = plasma \n",
-            "look=plasma",
-            "look=plasma # el shell de KDE\n",
-        ] {
-            let (code, log) = run(&dir, look, true);
-            assert!(
-                !log.contains("RAN lunarbg"),
-                "lunarbg painted under {look:?}, on top of Plasma's own desktop"
-            );
-            assert_eq!(code, 42, "the parked branch must be what ran for {look:?}");
-            assert!(log.contains("stands aside"), "it must say why: {log}");
-        }
-
-        // A commented-out look is not a look, and neither is a missing file.
-        // `look=kde # ...` is the case that made the reader strip a trailing
-        // comment before squeezing whitespace: without that step the value
-        // reads `kde#nota` and every look silently becomes the default.
-        for look in [
-            "#look=plasma\n",
-            "look=kde\n",
-            "look=kde # el escritorio de KDE\n",
-            "look=eclipse\n",
-            "",
-        ] {
-            let (_, log) = run(&dir, look, true);
-            assert!(
-                log.contains("RAN lunarbg --fps"),
-                "lunarbg must paint under {look:?}, got: {log}"
-            );
-        }
-
-        // No lunarbg in the image: say so and back off, rather than exiting
-        // instantly into init's respawn loop.
-        let (code, log) = run(&dir, "look=eclipse\n", false);
-        assert_eq!(code, 127, "a missing lunarbg must exit 127");
-        assert!(log.contains("lunarbg missing"), "got: {log}");
 
         let _ = fs::remove_dir_all(&dir);
     }

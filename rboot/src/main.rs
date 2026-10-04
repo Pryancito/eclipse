@@ -429,27 +429,65 @@ fn init_graphic(bs: &BootServices, resolution: Resolution) -> (GraphicInfo, [u8;
     // The policy itself lives in `rboot::video` so it can be tested without a
     // GOP; `gop.modes()` is a stable enumeration of `query_mode(0..max_mode)`,
     // so the index it returns is the index we set.
-    let modes: Vec<(usize, usize)> = gop.modes(bs).map(|m| m.info().resolution()).collect();
+    let modes: Vec<video::Mode> = gop
+        .modes(bs)
+        .map(|m| {
+            let (w, h) = m.info().resolution();
+            video::Mode::new(w, h, fb::is_direct(m.info().pixel_format()))
+        })
+        .collect();
     let preferred = video::edid_preferred_resolution(&edid, edid_size);
     match video::choose_mode(resolution, preferred, &modes).and_then(|i| gop.modes(bs).nth(i)) {
         Some(mode) => {
-            gop.set_mode(&mode).expect("Failed to set graphics mode");
-        }
-        None => {
-            if resolution != Resolution::Keep {
+            // A firmware may refuse to set a mode it listed. That is not worth
+            // a panic: a panic here is a machine that does not boot because of
+            // one line in rboot.conf, and it happens before the splash so the
+            // message is wiped off the screen anyway. Keep the current mode.
+            if let Err(e) = gop.set_mode(&mode) {
                 warn!(
-                    "no graphic mode matches {:?} (edid says {:?}); keeping current {:?}",
-                    resolution,
-                    preferred,
+                    "firmware refused graphic mode {:?} ({:?}); keeping current {:?}",
+                    mode.info().resolution(),
+                    e.status(),
                     gop.current_mode_info().resolution()
                 );
             }
         }
+        None => {
+            if resolution != Resolution::Keep {
+                // The offered list is the answer to "why did my resolution= do
+                // nothing": `Exact` only sets a mode the firmware enumerates.
+                warn!(
+                    "no graphic mode matches {:?} (edid says {:?}); keeping current {:?}. firmware offers {:?}",
+                    resolution,
+                    preferred,
+                    gop.current_mode_info().resolution(),
+                    modes.as_slice()
+                );
+            }
+        }
     }
+    // `GraphicsOutput::frame_buffer()` asserts the current mode is not
+    // `BltOnly` (uefi 0.26), so ask before touching it: a firmware that only
+    // offers `BltOnly` modes has no linear framebuffer, and that must boot
+    // without one rather than panic in the loader. Zero is exactly what the
+    // kernel reads as "no framebuffer from bootloader", and every drawing
+    // entry point here already refuses a null base.
+    let mode = gop.current_mode_info();
+    let (fb_addr, fb_size) = if fb::is_direct(mode.pixel_format()) {
+        let mut fb = gop.frame_buffer();
+        (fb.as_mut_ptr() as u64, fb.size() as u64)
+    } else {
+        warn!(
+            "graphic mode {:?} has no linear framebuffer ({:?}); booting without one",
+            mode.resolution(),
+            mode.pixel_format()
+        );
+        (0, 0)
+    };
     let info = GraphicInfo {
-        mode: gop.current_mode_info(),
-        fb_addr: gop.frame_buffer().as_mut_ptr() as u64,
-        fb_size: gop.frame_buffer().size() as u64,
+        mode,
+        fb_addr,
+        fb_size,
     };
     (info, edid, edid_size)
 }

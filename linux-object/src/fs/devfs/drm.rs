@@ -2672,6 +2672,25 @@ pub fn fb_owned_by_caller(fb: &DrmFramebuffer) -> bool {
     owned_by(fb.owner, current_pid())
 }
 
+/// The framebuffer ids `GETRESOURCES` lists for `pid`: the ones it may
+/// touch, by the same rule `RMFB` and `GETFB`'s handle use ([`owned_by`]).
+///
+/// Linux walks `file_priv->fbs`, the framebuffers THIS file created, and
+/// nothing else: a client never learns another client's fb ids from the
+/// card. Here the whole table was listed to everyone, so any process could
+/// read the compositor's scanout fb id (and then `SETCRTC` its own frame
+/// over it, or `GETFB` its geometry). The kernel's own framebuffers (owner
+/// 0) stay listed, as they stay removable, for every caller.
+pub fn framebuffer_ids_for(pid: u64) -> Vec<u32> {
+    DRM_STATE
+        .lock()
+        .framebuffers
+        .iter()
+        .filter(|f| owned_by(f.owner, pid))
+        .map(|f| f.id)
+        .collect()
+}
+
 /// Look up a framebuffer object by id (`DRM_IOCTL_MODE_GETFB`/`GETFB2`).
 pub fn get_fb(fb_id: u32) -> Option<DrmFramebuffer> {
     DRM_STATE
@@ -5994,6 +6013,20 @@ fn next_vblank_deadline() -> Duration {
     let period = vblank_period_ns();
     let mut st = DRM_STATE.lock();
     let last_ns = u64::try_from(st.next_vblank.as_nanos()).unwrap_or(0);
+    // There has been no vblank at all yet: `next_vblank` starts at zero and
+    // only a completion (or a test) ever seeds it, so the FIRST frame of a
+    // boot measured its "time since the last vblank" from the epoch. On
+    // hardware that printed `missed refresh slot (12430386us since last
+    // vblank)` at the very first present -- twelve seconds, which is the
+    // uptime, not a missed frame. Worse than cosmetic: that message is
+    // deliberately one-shot, so the first frame spent it and a REAL catch-up
+    // later in the session could never be reported. Seed the lattice and
+    // deliver immediately, silently, which is what the catch-up arm below
+    // would do anyway.
+    if last_ns == 0 {
+        st.next_vblank = Duration::from_nanos((now_ns / period) * period);
+        return now;
+    }
     let next_from_last = last_ns.saturating_add(period);
     if next_from_last <= now_ns {
         static CATCHUP_LOGGED: AtomicBool = AtomicBool::new(false);
@@ -7066,21 +7099,32 @@ pub fn get_resources() -> (Vec<u32>, Vec<u32>, Vec<u32>) {
 }
 
 pub fn get_connector(id: u32) -> Option<DrmConnector> {
-    // Software KMS: serve the synthetic connector directly. Do NOT fall out to
-    // the drivers first — `nvidia.get_connector` runs a live GSP/DDC EDID probe
-    // (rm_display_state) before it even range-checks the id, so a GETCONNECTOR
-    // for the synthetic id would still drive an RPC on both GPUs (incl. the
-    // compute GPU) and stall wlroots' bind. See get_resources for detail.
-    if !software_kms_active() {
+    // Keyed on the ID, never on which scanout path happens to be active right
+    // now. The synthetic id is still served without touching a driver -- that
+    // is what this gate was for: `nvidia.get_connector` runs a live GSP/DDC
+    // EDID probe (rm_display_state) before it even range-checks the id, so a
+    // GETCONNECTOR for the synthetic id would otherwise drive an RPC on both
+    // GPUs (incl. the compute GPU) and stall wlroots' bind.
+    //
+    // What it must NOT do is decide, from `software_kms_active()`, whether a
+    // DRIVER id is answerable at all. `software_kms_active()` is live state:
+    // the NVIDIA driver's `has_hardware_kms()` is
+    // `surfaceflip_enabled() && hwflip_ready()`, and `hwflip_ready()` latches
+    // during bring-up. So the answer to this question could change BETWEEN a
+    // client's GETRESOURCES and its GETCONNECTOR -- and when it flipped to
+    // "software KMS", every driver id GETRESOURCES had just advertised started
+    // coming back EINVAL. Mesa's `wsi_get_connectors` (VK_KHR_display) treats
+    // a miss on any advertised id as fatal and reports the whole query as
+    // VK_ERROR_OUT_OF_HOST_MEMORY, which is what `vulkaninfo` died with. The
+    // id spaces do not overlap (synthetic 1..4, VirtIO 1000/2000, NVIDIA
+    // 1001+), so an id is enough to decide who owns it.
+    if id != SYNTH_CONNECTOR_ID {
         // Driver calls run with DRM_STATE released — see `snapshot_drivers`.
         for driver in snapshot_drivers() {
             if let Some(conn) = driver.get_connector(id) {
                 return Some(conn);
             }
         }
-    }
-    // Software framebuffer fallback (no driver, or driver without KMS).
-    if id != SYNTH_CONNECTOR_ID {
         return None;
     }
     let (w, h, _) = display_mode()?;
@@ -7200,9 +7244,11 @@ pub fn get_connector_edid(id: u32) -> Option<[u8; 128]> {
 }
 
 pub fn get_crtc(id: u32) -> Option<DrmCrtc> {
-    // Software KMS: serve the synthetic CRTC directly (see get_resources —
-    // avoids driving a GSP/EDID probe through the drivers).
-    if !software_kms_active() {
+    // Keyed on the ID, not on the live scanout path -- see `get_connector`
+    // for why asking `software_kms_active()` here made advertised ids come
+    // back EINVAL mid-probe. The synthetic id is still served without
+    // touching a driver.
+    if id != SYNTH_CRTC_ID {
         // Driver calls run with DRM_STATE released — see `snapshot_drivers`.
         for driver in snapshot_drivers() {
             if let Some(mut crtc) = driver.get_crtc(id) {
@@ -7215,9 +7261,6 @@ pub fn get_crtc(id: u32) -> Option<DrmCrtc> {
                 return Some(crtc);
             }
         }
-    }
-    // Software framebuffer fallback (no driver, or driver without KMS).
-    if id != SYNTH_CRTC_ID {
         return None;
     }
     display_mode()?;
@@ -7252,19 +7295,31 @@ pub fn get_planes() -> Vec<u32> {
     // only expose its planes to avoid a mixed 2-plane topology.
     let drivers = snapshot_drivers();
     let has_hardware_kms = drivers.iter().any(|d| d.has_hardware_kms());
-    let mut planes = Vec::new();
+    let mut planes: Vec<u32> = Vec::new();
     for driver in &drivers {
         if !has_hardware_kms || driver.has_hardware_kms() {
-            planes.extend(driver.get_planes());
+            // De-duplicate, for the same reason `get_resources` does it with
+            // CRTCs and connectors: two cards of the same model return the
+            // same synthetic ids (both NVIDIA GPUs say plane 3001), and a
+            // plane list with the same id twice is a topology no client can
+            // make sense of -- `drmModeGetPlane` on either entry answers with
+            // the one plane, so index 1 contradicts index 0.
+            for id in driver.get_planes() {
+                if !planes.contains(&id) {
+                    planes.push(id);
+                }
+            }
         }
     }
     planes
 }
 
 pub fn get_plane(id: u32) -> Option<DrmPlane> {
-    // Software KMS: serve the synthetic plane directly (see get_resources —
-    // avoids driving a GSP/EDID probe through the drivers).
-    if !software_kms_active() {
+    // Keyed on the ID, not on the live scanout path -- see `get_connector`
+    // for why asking `software_kms_active()` here made advertised ids come
+    // back EINVAL mid-probe. The synthetic id is still served without
+    // touching a driver.
+    if id != SYNTH_PLANE_ID {
         // Driver calls run with DRM_STATE released — see `snapshot_drivers`.
         for driver in snapshot_drivers() {
             if let Some(mut plane) = driver.get_plane(id) {
@@ -7275,17 +7330,21 @@ pub fn get_plane(id: u32) -> Option<DrmPlane> {
                 return Some(plane);
             }
         }
+        return None;
     }
-    if software_kms_active() && id == SYNTH_PLANE_ID {
-        return Some(DrmPlane {
-            id: SYNTH_PLANE_ID,
-            crtc_id: SYNTH_CRTC_ID,
-            fb_id: 0,
-            possible_crtcs: 1, // bitmask: CRTC index 0
-            plane_type: 1,     // DRM_PLANE_TYPE_PRIMARY
-        });
-    }
-    None
+    // No framebuffer display, no synthetic plane -- `get_connector` and
+    // `get_crtc` gate their synthetic objects on `display_mode()` for the same
+    // reason. Without it a headless primary node would report zero planes from
+    // GETPLANERESOURCES and still answer GETPLANE(4), which is a topology no
+    // client can reconcile.
+    display_mode()?;
+    Some(DrmPlane {
+        id: SYNTH_PLANE_ID,
+        crtc_id: SYNTH_CRTC_ID,
+        fb_id: 0,
+        possible_crtcs: 1, // bitmask: CRTC index 0
+        plane_type: 1,     // DRM_PLANE_TYPE_PRIMARY
+    })
 }
 
 /// Put the process-wide output state a present depends on back to its defaults.
@@ -8925,6 +8984,34 @@ mod gem_ownership_tests {
 
         forget(0, 9803);
     }
+
+    /// `GETRESOURCES` lists a client's own framebuffers, as Linux lists
+    /// `file_priv->fbs`, plus the kernel's; never another client's. The
+    /// whole table used to be listed to everyone, so any process could read
+    /// the compositor's scanout fb id off the card.
+    #[test]
+    fn the_resource_list_carries_only_the_callers_framebuffers() {
+        let _serialised = super::test_globals::lock();
+        plant_fb(9804, A);
+        plant_fb(9805, B);
+        plant_fb(9806, 0);
+
+        let a = framebuffer_ids_for(A);
+        assert!(a.contains(&9804), "A sees its own");
+        assert!(!a.contains(&9805), "A must not see B's");
+        assert!(a.contains(&9806), "the kernel's is everyone's");
+        let b = framebuffer_ids_for(B);
+        assert!(b.contains(&9805) && !b.contains(&9804) && b.contains(&9806));
+        let kernel = framebuffer_ids_for(0);
+        assert!(
+            kernel.contains(&9804) && kernel.contains(&9805) && kernel.contains(&9806),
+            "kernel-internal callers see everything"
+        );
+
+        forget(0, 9804);
+        forget(0, 9805);
+        forget(0, 9806);
+    }
 }
 
 /// The same rule seen from the other side: the hops an X11 GL client's buffer
@@ -9365,6 +9452,60 @@ mod partial_present_cursor_sync_tests {
 /// with no timers: the queue and the pending latch are private statics in this
 /// module, so a test can put them into exactly the state the race produced.
 #[cfg(test)]
+mod vblank_phase_tests {
+    use super::*;
+
+    /// The first frame of a boot has had no vblank, so there is no "time since
+    /// the last vblank" to report. `next_vblank` starts at zero, and measuring
+    /// from the epoch printed `missed refresh slot (12430386us since last
+    /// vblank)` at the very first present on real hardware -- twelve seconds,
+    /// which was the uptime. The message is one-shot, so that false alarm also
+    /// spent the one report a REAL catch-up would ever get.
+    ///
+    /// What the first call must do instead: seed the lattice and deliver now,
+    /// silently. This test pins the seeding, which is the observable half --
+    /// the phase has to land on a period boundary at or just below `now`, not
+    /// stay at zero and not jump ahead of `now`.
+    #[test]
+    fn the_first_frame_of_a_boot_seeds_the_phase_instead_of_reporting_a_missed_slot() {
+        let period = vblank_period_ns();
+        DRM_STATE.lock().next_vblank = Duration::ZERO;
+
+        let before = kernel_hal::timer::timer_now();
+        let deadline = next_vblank_deadline();
+        let after = kernel_hal::timer::timer_now();
+
+        // Delivered immediately: the deadline is the `now` it read, which lies
+        // in the window this test bracketed.
+        assert!(
+            deadline >= before && deadline <= after,
+            "first frame must deliver at once, got {:?} outside {:?}..={:?}",
+            deadline,
+            before,
+            after
+        );
+
+        // And the phase is now on the lattice, below `now`, not still zero.
+        let seeded = u64::try_from(DRM_STATE.lock().next_vblank.as_nanos()).unwrap();
+        assert_ne!(seeded, 0, "the phase was left unseeded");
+        assert_eq!(seeded % period, 0, "the phase sits off-grid");
+        let now_ns = u64::try_from(deadline.as_nanos()).unwrap();
+        assert!(seeded <= now_ns && now_ns - seeded < period);
+
+        // A second call, one period on, is an ordinary on-time frame: it waits
+        // for the slot rather than taking the catch-up path again.
+        let next = next_vblank_deadline();
+        assert!(
+            next > deadline,
+            "a seeded phase must pace the next frame, got {:?} <= {:?}",
+            next,
+            deadline
+        );
+        DRM_STATE.lock().next_vblank = Duration::ZERO;
+    }
+}
+
+#[cfg(test)]
 mod flip_latch_tests {
     extern crate std;
 
@@ -9376,6 +9517,12 @@ mod flip_latch_tests {
         FLIPS_IN_FLIGHT.store(0, Ordering::Release);
         FLIP_EVENT_PENDING.store(false, Ordering::Release);
         DRM_TIMER_ARMED.store(false, Ordering::Release);
+        // Align the synthetic vblank phase to "just now" so a later
+        // `schedule_flip_event` waits a full refresh period. A mid-period
+        // leftover from an earlier test left only ~1 ms of slack; under libos
+        // that timer could fire (or the lattice catch-up path could deliver
+        // on the spot) before flip-latch assertions ran.
+        DRM_STATE.lock().next_vblank = kernel_hal::timer::timer_now();
     }
 
     /// Queue a flip the way `schedule_flip_event` does, without arming a real
@@ -9542,13 +9689,41 @@ mod flip_latch_tests {
         assert!(FLIP_EVENT_PENDING.load(Ordering::Acquire));
     }
 
-    /// Also puts the next vblank slot in the future as of now: the racer
-    /// goes ahead the moment this returns, and a commit that finds the slot
-    /// already missed delivers its own completion on the spot (see
-    /// `arm_coalesced_drm_timer_locked`), leaving nothing to look at.
+    /// Post the mid-delivery completion and pin the vblank phase.
+    ///
+    /// `next_vblank = now` is set *before* clearing the latch so the racer,
+    /// which wakes in `settle_outstanding_flip` the instant the latch drops,
+    /// sees a fresh phase: `next_vblank_deadline` then returns one full period
+    /// out. Pinning after `queue_flip_event` would race the racer's own
+    /// `schedule_flip_event` against a leftover mid-period slot.
     fn finish_delivery(file: &DrmFileState) {
         DRM_STATE.lock().next_vblank = kernel_hal::timer::timer_now();
         queue_flip_event(file, SYNTH_CRTC_ID, 0xF11D);
+    }
+
+    /// Whether a DRM event with this `user_data` is already on the card fd.
+    fn fd_has_user_data(file: &DrmFileState, want: u64) -> bool {
+        let mut buf = [0u8; 512];
+        let n = match file.read_events(&mut buf) {
+            EventRead::Read(n) => n,
+            _ => return false,
+        };
+        let mut off = 0usize;
+        while off + 16 <= n {
+            let mut len_bytes = [0u8; 4];
+            len_bytes.copy_from_slice(&buf[off + 4..off + 8]);
+            let len = u32::from_ne_bytes(len_bytes) as usize;
+            let mut ud_bytes = [0u8; 8];
+            ud_bytes.copy_from_slice(&buf[off + 8..off + 16]);
+            if u64::from_ne_bytes(ud_bytes) == want {
+                return true;
+            }
+            if len < 16 || off + len > n {
+                break;
+            }
+            off += len;
+        }
+        false
     }
 
     /// Run `f` on another thread -- the compositor's syscall on another CPU
@@ -9647,17 +9822,31 @@ mod flip_latch_tests {
             first_completion_was_on_the_fd,
             "the commit went ahead before the completion reached the fd"
         );
-        // And its own completion is the one now outstanding, queued behind
-        // the one that was delivered.
-        assert_eq!(FLIPS_IN_FLIGHT.load(Ordering::Acquire), 1);
-        assert!(PENDING_DRM_TIMERS.lock().iter().any(|j| matches!(
-            j,
-            PendingDrmTimer::Flip {
-                user_data: 0xA70,
-                ..
-            }
-        )));
-        let_the_armed_timer_fire();
+        // Own completion (user_data 0xA70): normally still paced on the
+        // synthetic vblank. Under libos `timer_set` is an async task, and the
+        // lattice catch-up path can also deliver on the committing thread when
+        // the previous slot is already due -- so by the time we look the event
+        // may already be on the fd. Either form means the mid-delivery wait
+        // worked and the new PAGE_FLIP_EVENT was owed; the bug was EBUSY.
+        let queued_for_vblank = PENDING_DRM_TIMERS.lock().iter().any(|j| {
+            matches!(
+                j,
+                PendingDrmTimer::Flip {
+                    user_data: 0xA70,
+                    ..
+                }
+            )
+        });
+        if queued_for_vblank {
+            assert_eq!(FLIPS_IN_FLIGHT.load(Ordering::Acquire), 1);
+            let_the_armed_timer_fire();
+        } else {
+            assert_eq!(FLIPS_IN_FLIGHT.load(Ordering::Acquire), 0);
+            assert!(
+                fd_has_user_data(&file, 0xA70),
+                "atomic commit with PAGE_FLIP_EVENT must queue or deliver its completion"
+            );
+        }
         reset();
     }
 

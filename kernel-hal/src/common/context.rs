@@ -25,6 +25,12 @@ pub enum UserContextField {
     ThreadPointer,
     AbiRegister,
     ReturnValue,
+    /// The processor status word: `rflags`, `spsr_el1` or `sstatus`. The
+    /// signal frame carries it so a handler can read the condition flags it
+    /// was interrupted with (`MachineContext::from_context`); writing it back
+    /// from a handler is filtered down to the bits userspace owns, because
+    /// the rest decide the exception level and which interrupts are masked.
+    CpuFlags,
 }
 
 /// Reason of the trap.
@@ -42,6 +48,115 @@ pub enum TrapReason {
 
 #[cfg(not(feature = "libos"))]
 pub const TIMER_INTERRUPT_VEC: usize = crate::timer_interrupt_vector();
+
+/// The name of an x86 exception vector.
+///
+/// Lives here rather than in the x86 trap handler because the panic handler
+/// needs it too: the one-line summary it prints after the backtrace is built
+/// from the vector alone, with no trap frame in reach. Not gated on the
+/// architecture, for the same reason the error-code reading below is not.
+pub fn x86_vector_name(vec: usize) -> &'static str {
+    match vec {
+        0 => "Divide Error (#DE)",
+        1 => "Debug (#DB)",
+        2 => "NMI",
+        3 => "Breakpoint (#BP)",
+        4 => "Overflow (#OF)",
+        5 => "Bound Range Exceeded (#BR)",
+        6 => "Invalid Opcode (#UD)",
+        7 => "Device Not Available / No Math Coprocessor (#NM)",
+        8 => "Double Fault (#DF)",
+        9 => "Coprocessor Segment Overrun",
+        10 => "Invalid TSS (#TS)",
+        11 => "Segment Not Present (#NP)",
+        12 => "Stack Segment Fault (#SS)",
+        13 => "General Protection Fault (#GP)",
+        14 => "Page Fault (#PF via GernelFault — should not happen)",
+        16 => "x87 FPU Floating-Point Error (#MF)",
+        17 => "Alignment Check (#AC)",
+        18 => "Machine Check (#MC)",
+        19 => "SIMD Floating-Point Exception (#XF)",
+        _ => "Unknown CPU exception",
+    }
+}
+
+/// The error code an x86 fault pushed, rendered as what it means.
+///
+/// `{:#x?}` of the trap frame prints `error_code: 0x0` and stops there, which
+/// is the least useful thing it could say. On #TS, #NP, #SS and #GP a
+/// *non-zero* code names the descriptor that was refused, which is most of the
+/// diagnosis. Both readings were left to whoever was staring at a photo of the
+/// screen.
+///
+/// Zero is weaker than it looks, and is worded as such: it means the CPU named
+/// no descriptor, NOT that no descriptor was involved. A null selector has
+/// nothing to name, so an `iretq` whose saved CS was overwritten with zero
+/// also raises #GP(0) — with a perfectly canonical return address. That is a
+/// live shape in this tree (an overwritten kernel return frame), so it is
+/// listed as a cause rather than excluded.
+///
+/// Not gated on the architecture: these are the numbers the Intel manual
+/// assigns (volume 3, "Error Code"), so a host of any architecture can check
+/// the decision.
+pub struct X86TrapErrorCode {
+    /// The exception vector, as the trap frame carries it.
+    pub vec: usize,
+    /// The error code the CPU (or the entry stub, for a vector that has none)
+    /// pushed under it.
+    pub error_code: usize,
+}
+
+impl fmt::Display for X86TrapErrorCode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        const SELECTOR_VECTORS: [usize; 4] = [10, 11, 12, 13];
+        let ec = self.error_code;
+        if SELECTOR_VECTORS.contains(&self.vec) && ec != 0 {
+            // bit0 EXT, bit1 IDT, bit2 TI (GDT/LDT, only when IDT is clear),
+            // bits 3.. the index into whichever table those two name.
+            let table = if ec & 0b010 != 0 {
+                "IDT"
+            } else if ec & 0b100 != 0 {
+                "LDT"
+            } else {
+                "GDT"
+            };
+            return write!(
+                f,
+                "error_code {:#x} names a descriptor: {} index {}{}",
+                ec,
+                table,
+                ec >> 3,
+                if ec & 1 != 0 {
+                    ", raised by an external event"
+                } else {
+                    ""
+                },
+            );
+        }
+        match self.vec {
+            13 => f.write_str(
+                "error_code 0 on a #GP names no descriptor, which is not the same \
+                 as none being involved: a NULL selector has nothing to name. So \
+                 look either at the selectors a return reloads (an iretq whose \
+                 saved CS or SS was overwritten with 0) or at the causes that are \
+                 not segmentation at all: a memory operand that is not canonical, \
+                 an SSE access that is not 16-byte aligned (movaps/movdqa), \
+                 RDMSR/WRMSR of a reserved MSR, a privileged instruction executed \
+                 outside ring 0, or an iret/sysret returning to a non-canonical \
+                 address",
+            ),
+            10..=12 => f.write_str(
+                "error_code 0 names no descriptor; a NULL selector has none to \
+                 name, so one is not ruled out",
+            ),
+            8 | 14 | 17 | 21 | 29 | 30 => write!(f, "error_code {ec:#x}"),
+            _ => f.write_str(
+                "this vector pushes no error code: the 0 above is the placeholder \
+                 the entry stub pushed in its place",
+            ),
+        }
+    }
+}
 
 impl TrapReason {
     /// Decode an x86 trap from the vector and error code the trap frame
@@ -621,6 +736,7 @@ impl UserContext {
                     UserContextField::ThreadPointer => &mut self.0.general.fsbase,
                     UserContextField::AbiRegister => &mut self.0.general.r10,
                     UserContextField::ReturnValue => &mut self.0.general.rax,
+                    UserContextField::CpuFlags => &mut self.0.general.rflags,
                 }
             } else if #[cfg(target_arch = "aarch64")] {
                 match which {
@@ -629,6 +745,7 @@ impl UserContext {
                     UserContextField::ThreadPointer => &mut self.0.tpidr,
                     UserContextField::AbiRegister => &mut self.0.general.x18,
                     UserContextField::ReturnValue => &mut self.0.general.x0,
+                    UserContextField::CpuFlags => &mut self.0.spsr,
                 }
             } else if #[cfg(target_arch = "riscv64")] {
                 match which {
@@ -637,6 +754,7 @@ impl UserContext {
                     UserContextField::ThreadPointer => &mut self.0.general.tp,
                     UserContextField::AbiRegister => &mut self.0.general.a7,
                     UserContextField::ReturnValue => &mut self.0.general.a0,
+                    UserContextField::CpuFlags => &mut self.0.sstatus,
                 }
             } else {
                 unimplemented!()
@@ -746,6 +864,76 @@ cfg_if! {
 mod tests {
     use super::*;
     use crate::{Kind, Source};
+
+    // ---- x86 error codes --------------------------------------------------
+
+    fn hint(vec: usize, error_code: usize) -> alloc::string::String {
+        alloc::format!("{}", X86TrapErrorCode { vec, error_code })
+    }
+
+    /// The reading that would have saved a round trip on the #GP photographed
+    /// on 2026-10-03: `error_code: 0x0` under vector 13 is not "no
+    /// information". It is also not "no descriptor was involved -- a NULL
+    /// selector has none to name, so an `iretq` onto an overwritten CS lands
+    /// here too, and saying otherwise would send the next reader away from a
+    /// shape this tree actually produces.
+    #[test]
+    fn a_zero_error_code_on_a_gp_names_no_descriptor_but_rules_none_out() {
+        let s = hint(13, 0);
+        assert!(s.contains("names no descriptor"), "{}", s);
+        assert!(s.contains("NULL selector"), "{}", s);
+        assert!(s.contains("iretq"), "{}", s);
+        assert!(s.contains("canonical"), "{}", s);
+        assert!(s.contains("movaps"), "{}", s);
+        // The claim the CPU cannot support: that segmentation is excluded.
+        assert!(!s.contains("no descriptor was involved"), "{}", s);
+        let s = hint(11, 0);
+        assert!(s.contains("not ruled out"), "{}", s);
+    }
+
+    /// The panic handler builds its post-backtrace line from the vector alone,
+    /// so a vector that lost its name there would print "Unknown CPU
+    /// exception" over a fault the trap frame named perfectly well.
+    #[test]
+    fn the_vectors_a_panic_reports_keep_their_names() {
+        assert_eq!(x86_vector_name(6), "Invalid Opcode (#UD)");
+        assert_eq!(x86_vector_name(8), "Double Fault (#DF)");
+        assert_eq!(x86_vector_name(13), "General Protection Fault (#GP)");
+        assert_eq!(x86_vector_name(0x10e), "Unknown CPU exception");
+    }
+
+    #[test]
+    fn a_non_zero_error_code_names_the_descriptor() {
+        // 0x58 is the kernel code selector in this tree's GDT: index 11, GDT,
+        // not external.
+        let s = hint(13, 0x58);
+        assert!(s.contains("GDT index 11"), "{}", s);
+        assert!(!s.contains("external"), "{}", s);
+        // bit 1 set: the descriptor is in the IDT, and the TI bit must not be
+        // read as LDT once it is.
+        let s = hint(11, 0b110);
+        assert!(s.contains("IDT index 0"), "{}", s);
+        // bit 2 set, bit 1 clear: LDT. bit 0 set: external event.
+        let s = hint(12, 0b1101);
+        assert!(s.contains("LDT index 1"), "{}", s);
+        assert!(s.contains("external event"), "{}", s);
+    }
+
+    /// Only #TS, #NP, #SS and #GP carry a selector. Reading one out of #DF's
+    /// or #AC's always-zero code, or out of the placeholder the entry stub
+    /// pushes for a vector with no error code at all, would invent a
+    /// descriptor that was never refused.
+    #[test]
+    fn the_other_vectors_do_not_get_a_selector_read_out_of_them() {
+        for (vec, code) in [(8usize, 0usize), (17, 0), (14, 0x2), (21, 0x58)] {
+            let s = hint(vec, code);
+            assert!(!s.contains("index"), "vector {}: {}", vec, s);
+        }
+        let s = hint(6, 0);
+        assert!(s.contains("pushes no error code"), "{}", s);
+        let s = hint(0x10e, 0);
+        assert!(s.contains("pushes no error code"), "{}", s);
+    }
 
     // ---- AArch64 ----------------------------------------------------------
 

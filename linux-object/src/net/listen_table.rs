@@ -150,6 +150,10 @@ impl BindTable {
 lazy_static::lazy_static! {
     pub static ref LISTEN_TABLE: ListenTable = ListenTable::new();
     pub static ref BIND_TABLE: BindTable = BindTable::new();
+    /// UDP binds with their `SO_REUSEADDR` bit — smoltcp does not track it,
+    /// so a second `bind` on a busy port needs this table to decide
+    /// `EADDRINUSE` the way `udp_lib_lport_inuse` does.
+    pub static ref UDP_BIND_TABLE: BindTable = BindTable::new();
 }
 
 #[cfg(test)]

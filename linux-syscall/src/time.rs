@@ -970,6 +970,10 @@ impl Syscall<'_> {
         if !spec.interval.valid() || !spec.value.valid() {
             return Err(LxError::EINVAL);
         }
+        // `do_timer_settime`: anything outside TIMER_ABSTIME is EINVAL.
+        // Masking only the known bit used to arm a relative timer and answer
+        // success when the caller asked for an unknown flag.
+        let abs = timer_settime_abs(flags)?;
         let interval = timespec_to_duration(spec.interval);
         let init = timespec_to_duration(spec.value);
         // Both clocks read before the lock, so the deadline arithmetic below
@@ -998,8 +1002,7 @@ impl Syscall<'_> {
                 // `init` is a point on the timer's OWN clock when
                 // TIMER_ABSTIME is set, and the kernel timer only takes
                 // monotonic deadlines.
-                let deadline =
-                    timer_arm_deadline(t.clock, flags & TIMER_ABSTIME != 0, init, now, now_wall);
+                let deadline = timer_arm_deadline(t.clock, abs, init, now, now_wall);
                 t.next = deadline;
                 Some((deadline, t.generation))
             };
@@ -1229,6 +1232,15 @@ fn register_posix_timer(
         return Err(e);
     }
     Ok(())
+}
+
+/// Decode `timer_settime`'s `flags`: absolute or relative, or `EINVAL` for
+/// any bit outside `TIMER_ABSTIME` (`do_timer_settime`).
+fn timer_settime_abs(flags: usize) -> Result<bool, LxError> {
+    if flags & !TIMER_ABSTIME != 0 {
+        return Err(LxError::EINVAL);
+    }
+    Ok(flags & TIMER_ABSTIME != 0)
 }
 
 fn timespec_to_duration(ts: TimeSpec) -> Duration {
@@ -2774,6 +2786,21 @@ mod overrun_tests {
             Duration::from_nanos(1),
             "y los nanosegundos, nanosegundos"
         );
+    }
+
+    /// Anything outside `TIMER_ABSTIME` is EINVAL — masking the one known bit
+    /// used to arm a relative timer and answer success for a typo.
+    #[test]
+    fn timer_settime_rejects_unknown_flags() {
+        assert_eq!(timer_settime_abs(0), Ok(false));
+        assert_eq!(timer_settime_abs(TIMER_ABSTIME), Ok(true));
+        assert_eq!(timer_settime_abs(2), Err(LxError::EINVAL));
+        assert_eq!(
+            timer_settime_abs(TIMER_ABSTIME | 2),
+            Err(LxError::EINVAL),
+            "a valid bit must not hide a stray one"
+        );
+        assert_eq!(timer_settime_abs(1usize << 30), Err(LxError::EINVAL));
     }
 
     /// What `getitimer(2)` and `alarm(2)` both report, in the one place it is

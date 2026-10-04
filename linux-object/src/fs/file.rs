@@ -52,17 +52,45 @@ bitflags::bitflags! {
         /// a write returns once data AND metadata are on the disk.
         /// `O_SYNC` is `__O_SYNC | O_DSYNC` upstream, both bits together.
         const SYNC = (1 << 20) | (1 << 12);
+        /// `O_PATH`: open the FILE ITSELF, not its contents. The descriptor
+        /// names a place in the tree and nothing more -- it is neither
+        /// readable nor writable -- and what it is for is `fstat`, `fchdir`
+        /// and standing in as the `dirfd` of an `*at` call.
+        ///
+        /// It is also what `ps` opens: procps-ng's `look_up_our_self`
+        /// (`library/readproc.c`) does
+        /// `open("/proc/self", O_PATH|O_DIRECTORY)` and, when that fails,
+        /// prints "Error, do this: mount -t proc proc /proc" and `_exit(47)`.
+        /// Refusing the flag therefore took down every procps tool -- `ps`,
+        /// `top`, `free`, `vmstat`, `w`, `uptime`, `pgrep`, `pkill` -- with a
+        /// message about a filesystem that was mounted all along.
+        const PATH = 1 << 21;
     }
 }
 
 impl OpenFlags {
+    /// `O_PATH`: the descriptor names a place in the tree, not an open file.
+    pub fn is_path(self) -> bool {
+        self.contains(Self::PATH)
+    }
     /// check if the OpenFlags is readable
+    ///
+    /// Never under `O_PATH`, whatever the access mode says. `O_RDONLY` is
+    /// `0`, so an `O_PATH` open that named no mode at all would otherwise
+    /// read as readable, and `read(2)` on such a descriptor is `EBADF` --
+    /// which every reader here already answers off this one question.
     pub fn readable(self) -> bool {
+        if self.is_path() {
+            return false;
+        }
         let b = self.bits() & 0b11;
         b == Self::RDONLY.bits() || b == Self::RDWR.bits()
     }
     /// check if the OpenFlags is writable
     pub fn writable(self) -> bool {
+        if self.is_path() {
+            return false;
+        }
         let b = self.bits() & 0b11;
         b == Self::WRONLY.bits() || b == Self::RDWR.bits()
     }
@@ -80,9 +108,11 @@ impl OpenFlags {
     }
     /// The bits `fcntl(F_SETFL)` may change: `SETFL_MASK` in `fs/fcntl.c`,
     /// the status flags. The access mode, the creation flags and `O_CLOEXEC`
-    /// (per descriptor, `F_SETFD`) are not among them.
+    /// (per descriptor, `F_SETFD`) are not among them. Linux's mask is
+    /// `O_APPEND|O_ASYNC|O_DIRECT|O_NOATIME|O_NONBLOCK`; without `DIRECT` and
+    /// `NOATIME` here, `F_SETFL` could neither set nor clear them.
     fn setfl_mask() -> Self {
-        Self::APPEND | Self::NON_BLOCK
+        Self::APPEND | Self::NON_BLOCK | Self::ASYNC | Self::DIRECT | Self::NOATIME
     }
     /// What an open file's flags become after `fcntl(F_SETFL, requested)`.
     /// Linux (`setfl`) copies only `SETFL_MASK` out of the argument and keeps
@@ -101,7 +131,14 @@ impl OpenFlags {
     /// `fcntl(F_SETFL, O_NONBLOCK)` on them changed nothing and the next read
     /// with nothing pending blocked for good.
     pub fn take_settable(&mut self, requested: Self) {
-        for bit in [Self::APPEND, Self::NON_BLOCK, Self::CLOEXEC] {
+        for bit in [
+            Self::APPEND,
+            Self::NON_BLOCK,
+            Self::ASYNC,
+            Self::DIRECT,
+            Self::NOATIME,
+            Self::CLOEXEC,
+        ] {
             self.set(bit, requested.contains(bit));
         }
     }
@@ -330,12 +367,15 @@ lazy_static::lazy_static! {
     /// so the shared VMO *is* the file's storage for as long as an fd keeps the
     /// inode alive. Dead-inode entries are pruned on every access, freeing the
     /// VMO (and its frames) once the last fd closes.
+    ///
+    /// LOCKING RULE: this is a ticket spinlock, held with interrupts off and
+    /// not re-entrant. Under it, do refcount reads, pointer compares and map
+    /// surgery -- nothing else. No filesystem call, no VMO creation or resize,
+    /// and no VMO drop: see `take_prunable`.
     static ref SHARED_FILE_VMOS: lock::Mutex<SharedVmoMap> =
         lock::Mutex::new(alloc::collections::BTreeMap::new());
 }
 
-/// Drop shared-VMO entries whose backing inode has been freed (all fds closed).
-/// Called under the registry lock before any lookup/insert.
 /// Entry count and committed bytes held by the MAP_SHARED file-VMO registry.
 ///
 /// These VMOs are held with a STRONG ref and are NOT attributable to any
@@ -443,30 +483,40 @@ fn inode_cache_vmo(
     // is a trait method, so the arithmetic defends itself too.
     let end = offset.checked_add(len)?;
     let key = cache_key(inode);
-    let mut registry = SHARED_FILE_VMOS.lock();
-    prune_shared_vmos(&mut registry);
-    if let Some((vmo, inode_weak, ever_shared)) = registry.get_mut(&key) {
-        if end > vmo.len() {
-            // The file grew since the cache was made: grow the cache, so the
-            // new window shares the very same pages as every earlier mapper
-            // and `read(2)`. The old fallback (a private snapshot) was what
-            // made a mapping of a grown memfd read zeros for its head.
-            if vmo.set_len(end).is_err() {
-                return None;
-            }
-        }
-        if mark_shared {
-            *ever_shared = true;
-        }
-        // Point the weak handle at the LATEST opener's Arc: the one captured
-        // at creation dies with its fd even while other opens keep the file
-        // busy, and eviction-time writeback needs a live inode to write to.
-        *inode_weak = Arc::downgrade(inode);
-        return Some(vmo.clone());
+
+    // Pass 1: find a usable cache and collect what is prunable. Everything in
+    // this block is a pointer compare or a refcount read -- see
+    // `take_prunable` for why nothing heavier may happen under this lock.
+    let (hit, evicted) = {
+        let mut registry = SHARED_FILE_VMOS.lock();
+        let evicted = take_prunable(&mut registry);
+        let hit = registry
+            .get_mut(&key)
+            .map(|(vmo, inode_weak, ever_shared)| {
+                if mark_shared {
+                    *ever_shared = true;
+                }
+                // Point the weak handle at the LATEST opener's Arc: the one
+                // captured at creation dies with its fd even while other opens
+                // keep the file busy, and eviction-time writeback needs a live
+                // inode to write to.
+                *inode_weak = Arc::downgrade(inode);
+                vmo.clone()
+            });
+        (hit, evicted)
+    };
+    finish_eviction(evicted);
+
+    if let Some(vmo) = hit {
+        // The file grew since the cache was made: grow the cache, so the new
+        // window shares the very same pages as every earlier mapper and
+        // `read(2)`. The old fallback (a private snapshot) was what made a
+        // mapping of a grown memfd read zeros for its head.
+        return grow_cache_vmo(&vmo, end).then_some(vmo);
     }
-    // Cover the whole file (so later mappers at other offsets share it too),
-    // demand-paged from the inode. Created under the registry lock so a
-    // concurrent first-map cannot race us into two caches.
+
+    // Miss. Build the cache VMO with NO lock held: `new_paged_cache` allocates,
+    // and the registry lock runs with interrupts off.
     let vmo_len = file_size.max(end);
     let source: Arc<dyn zircon_object::vm::FrameFiller> = Arc::new(FileFrameFiller {
         inode: inode.clone(),
@@ -475,8 +525,52 @@ fn inode_cache_vmo(
     });
     let vmo = VmObject::new_paged_cache(pages(vmo_len), source);
     vmo.set_name(path);
-    registry.insert(key, (vmo.clone(), Arc::downgrade(inode), mark_shared));
-    Some(vmo)
+
+    // Pass 2: publish it, unless another CPU created one for this inode while
+    // we were building ours. Whoever loses hands their VMO back as `loser` and
+    // drops it below, outside the lock -- freeing its frames goes through the
+    // heap, and that is exactly the dealloc the deadlock report caught a
+    // registry holder sitting in.
+    let (winner, loser) = {
+        let mut registry = SHARED_FILE_VMOS.lock();
+        match registry.get_mut(&key) {
+            Some((cached, inode_weak, ever_shared)) => {
+                if mark_shared {
+                    *ever_shared = true;
+                }
+                *inode_weak = Arc::downgrade(inode);
+                (cached.clone(), Some(vmo))
+            }
+            None => {
+                registry.insert(key, (vmo.clone(), Arc::downgrade(inode), mark_shared));
+                (vmo, None)
+            }
+        }
+    };
+    drop(loser);
+
+    grow_cache_vmo(&winner, end).then_some(winner)
+}
+
+/// Make `vmo` cover at least `end` bytes, growing only.
+///
+/// Called with no registry lock held, so two CPUs can be here at once for the
+/// same VMO: the one that wants less can shrink the object under the one that
+/// wants more (`set_len` sets an exact length). Re-reading after the resize is
+/// what makes that benign -- the loser simply asks again. Bounded, because a
+/// caller that keeps losing is being raced by `cache_truncate`, and then the
+/// honest answer is "this cache does not cover your window" and the caller
+/// falls back to a private snapshot.
+fn grow_cache_vmo(vmo: &Arc<VmObject>, end: usize) -> bool {
+    for _ in 0..8 {
+        if vmo.len() >= end {
+            return true;
+        }
+        if vmo.set_len(end).is_err() {
+            return false;
+        }
+    }
+    vmo.len() >= end
 }
 
 /// The page cache of `inode`, if one exists. Never creates one.
@@ -559,28 +653,67 @@ pub fn cache_truncate(inode: &Arc<dyn INode>, new_len: usize) {
     }
 }
 
-fn prune_shared_vmos(registry: &mut SharedVmoMap) {
-    registry.retain(|_, (vmo, inode_weak, ever_shared)| {
-        if Arc::strong_count(vmo) > 1 || inode_weak.strong_count() > 1 {
-            return true;
-        }
-        // Sole cycle holder: drop the entry. Writeback is only for durable
-        // (still-linked) files so a later open sees MAP_SHARED writes.
+/// Entries the registry no longer needs, REMOVED from it but still alive.
+///
+/// Returned by `take_prunable` so that `finish_eviction` can do the work the
+/// registry lock must never cover.
+type EvictedVmos = alloc::vec::Vec<(Arc<VmObject>, alloc::sync::Weak<dyn INode>, bool)>;
+
+/// Take every entry whose backing inode has been freed (all fds closed) OUT of
+/// the registry, without touching it further.
+///
+/// Called under the registry lock, which is a ticket spinlock held with
+/// interrupts off. That is why this does nothing but compare refcounts and
+/// move entries out: the version that pruned in place called
+/// `writeback_shared_vmo` -- `inode.write_at`, a whole filesystem write, plus
+/// the page faults `vmo.read` triggers back into `inode.read_at` -- from
+/// inside the critical section, and dropped the evicted VMOs (and all their
+/// frames) there too. That is the KERNEL STOP Moebius photographed: the holder
+/// of this lock parked in `GlobalAlloc::dealloc` while every other CPU spun on
+/// `cache_vmo_of`. It is also a genuine AB-BA, because a filesystem write
+/// takes inode locks that `read(2)`/`write(2)` already hold when they come the
+/// other way round through `cache_overlay_read` / `cache_overlay_write`.
+///
+/// The returned vector is the only allocation left here, and only when there
+/// IS something to evict: an empty `collect` does not allocate.
+fn take_prunable(registry: &mut SharedVmoMap) -> EvictedVmos {
+    let dead: alloc::vec::Vec<(usize, usize)> = registry
+        .iter()
+        .filter(|(_, (vmo, inode_weak, _))| {
+            // The cycle contributes exactly ONE strong reference to each, so
+            // an entry is live while something still maps the VMO or some fd
+            // is still open. Both halves matter -- see `inode_cache_vmo`.
+            Arc::strong_count(vmo) <= 1 && inode_weak.strong_count() <= 1
+        })
+        .map(|(key, _)| *key)
+        .collect();
+    dead.into_iter()
+        .filter_map(|key| registry.remove(&key))
+        .collect()
+}
+
+/// Write back and drop what `take_prunable` removed. MUST be called with the
+/// registry lock down.
+fn finish_eviction(evicted: EvictedVmos) {
+    for (vmo, inode_weak, ever_shared) in evicted {
+        // Writeback is only for durable (still-linked) files so a later open
+        // sees MAP_SHARED writes.
         //
-        // memfd / unlinked shm (`nlinks == 0`) dies with the inode — densifying
-        // into ramfs first doubles residency (VMO frames still held + one
-        // heap 4KiB block per page) and was the desktop-start OOM
-        // (`4096B x ~99000`, leaktrace → `PagedBytes::write_at`).
-        if *ever_shared {
+        // memfd / unlinked shm (`nlinks == 0`) dies with the inode --
+        // densifying into ramfs first doubles residency (VMO frames still held
+        // + one heap 4KiB block per page) and was the desktop-start OOM
+        // (`4096B x ~99000`, leaktrace -> `PagedBytes::write_at`).
+        if ever_shared {
             if let Some(inode) = inode_weak.upgrade() {
                 let nlinks = inode.metadata().map(|m| m.nlinks).unwrap_or(0);
                 if nlinks > 0 {
-                    writeback_shared_vmo(vmo, &inode);
+                    writeback_shared_vmo(&vmo, &inode);
                 }
             }
         }
-        false
-    });
+        // ... and the frames go back to the allocator here, lock-free.
+        drop(vmo);
+    }
 }
 
 /// Flush a shared VMO's committed pages to its inode before the VMO is dropped.
@@ -793,8 +926,25 @@ impl File {
         &self.path
     }
 
+    /// True for a `pipe2` pipe or a FIFO node — not seekable / not
+    /// `pread`/`pwrite`-able (`ESPIPE`).
+    fn is_pipe_or_fifo(&self) -> bool {
+        let inner = self.inner.read();
+        inner.inode.downcast_ref::<super::pipe::Pipe>().is_some()
+            || matches!(
+                inner.inode.metadata(),
+                Ok(m) if m.type_ == FileType::NamedPipe
+            )
+    }
+
     /// seek from given type and offset
     pub fn seek(&self, pos: SeekFrom) -> LxResult<u64> {
+        // Pipes and FIFOs are not seekable (`ESPIPE`); `fallocate` already
+        // refuses them the same way. Without this, `lseek(pipe_fd, 0, SEEK_SET)`
+        // "succeeds" and advances a phantom offset that nothing else uses.
+        if self.is_pipe_or_fifo() {
+            return Err(LxError::ESPIPE);
+        }
         let mut inner = self.inner.write();
         // Compute the new offset with checked arithmetic and reject results
         // that would be negative; otherwise a negative relative seek would wrap
@@ -1039,6 +1189,11 @@ impl FileLike for File {
     }
 
     async fn read_at(&self, offset: u64, buf: &mut [u8]) -> LxResult<usize> {
+        // `pread` on a pipe is `ESPIPE`, same as `lseek` (Linux `pipe_read`
+        // has no `FMODE_PREAD` path that succeeds).
+        if self.is_pipe_or_fifo() {
+            return Err(LxError::ESPIPE);
+        }
         let (flags, inode) = {
             let inner = self.inner.read();
             (inner.flags, inner.inode.clone())
@@ -1079,6 +1234,10 @@ impl FileLike for File {
     }
 
     fn write_at(&self, offset: u64, buf: &[u8]) -> LxResult<usize> {
+        // `pwrite` on a pipe is `ESPIPE`, same as `lseek`/`pread`.
+        if self.is_pipe_or_fifo() {
+            return Err(LxError::ESPIPE);
+        }
         let mut inner = self.inner.write();
         let r = inner.write_at(offset, buf);
         if matches!(r, Err(LxError::ENOSPC)) {
@@ -1189,6 +1348,25 @@ impl FileLike for File {
         None
     }
 
+    fn readiness_seq(&self, events: PollEvents) -> Option<u64> {
+        let inode = self.inner.read().inode.clone();
+        inode
+            .downcast_ref::<super::pipe::Pipe>()
+            .map(|pipe| pipe.readiness_seq(events))
+    }
+
+    fn subscribe_edge(
+        &self,
+        events: PollEvents,
+        waker: &core::task::Waker,
+        seen: u64,
+    ) -> Option<crate::sync::ReadinessSub> {
+        let inode = self.inner.read().inode.clone();
+        inode
+            .downcast_ref::<super::pipe::Pipe>()
+            .map(|pipe| pipe.subscribe_edge(events, waker, seen))
+    }
+
     fn ioctl(&self, request: usize, arg1: usize, _arg2: usize, _arg3: usize) -> LxResult<usize> {
         // ioctl syscall
         let inner = self.inner.read();
@@ -1218,8 +1396,15 @@ impl FileLike for File {
     /// It fell through to the inode's `io_control`, which knows no ioctl, so
     /// the answer was ENOTTY: bash's `read -t 0` (`input_avail`), which asks
     /// this first, took a redirected file for a terminal with nothing typed.
+    ///
+    /// A pipe answers the same way Linux `pipe_ioctl` does: the shared
+    /// buffer's occupancy (either end). Without this, `FIONREAD` on a pipe
+    /// also fell through to ENOTTY.
     fn readable_bytes(&self) -> Option<usize> {
         let inner = self.inner.read();
+        if let Some(pipe) = inner.inode.downcast_ref::<super::pipe::Pipe>() {
+            return Some(pipe.buffered_len());
+        }
         let metadata = inner.inode.metadata().ok()?;
         regular_file_readable_bytes(metadata.type_, metadata.size, inner.offset)
     }
@@ -1429,6 +1614,63 @@ mod fionread_tests {
         assert_eq!(FileLike::readable_bytes(&*file), Some(0));
         let dir = File::new(root, OpenFlags::RDONLY, String::from("/"));
         assert_eq!(FileLike::readable_bytes(&*dir), None);
+    }
+
+    /// `FIONREAD` on a pipe must report buffer occupancy, not fall through
+    /// to ENOTTY via a missing `metadata`/`io_control`.
+    #[test]
+    fn a_pipe_reports_how_many_bytes_are_queued() {
+        let (r, w) = crate::fs::Pipe::create_pair();
+        let reader = File::new(Arc::new(r), OpenFlags::RDONLY, String::from("pipe:[r]"));
+        let writer = File::new(Arc::new(w), OpenFlags::WRONLY, String::from("pipe:[w]"));
+        assert_eq!(FileLike::readable_bytes(&*reader), Some(0));
+        assert_eq!(FileLike::readable_bytes(&*writer), Some(0));
+        writer.write(&[1, 2, 3, 4, 5]).unwrap();
+        assert_eq!(FileLike::readable_bytes(&*reader), Some(5));
+        assert_eq!(
+            FileLike::readable_bytes(&*writer),
+            Some(5),
+            "Linux reports the same occupancy on either end"
+        );
+    }
+}
+
+#[cfg(test)]
+mod pipe_seek_tests {
+    use super::*;
+
+    /// `lseek` on a pipe must be `ESPIPE`, not a silent success.
+    #[test]
+    fn seeking_a_pipe_is_espipe() {
+        let (r, w) = crate::fs::Pipe::create_pair();
+        let reader = File::new(Arc::new(r), OpenFlags::RDONLY, String::from("pipe:[r]"));
+        let _writer = File::new(Arc::new(w), OpenFlags::WRONLY, String::from("pipe:[w]"));
+        assert_eq!(
+            FileLike::seek(&*reader, SeekFrom::Start(0)),
+            Err(LxError::ESPIPE)
+        );
+        assert_eq!(
+            FileLike::seek(&*reader, SeekFrom::Current(0)),
+            Err(LxError::ESPIPE)
+        );
+    }
+
+    /// `pread`/`pwrite` on a pipe must be `ESPIPE` too (same as Linux).
+    #[test]
+    fn positioned_io_on_a_pipe_is_espipe() {
+        use async_std::task::block_on;
+        let (r, w) = crate::fs::Pipe::create_pair();
+        let reader = File::new(Arc::new(r), OpenFlags::RDONLY, String::from("pipe:[r]"));
+        let writer = File::new(Arc::new(w), OpenFlags::WRONLY, String::from("pipe:[w]"));
+        let mut buf = [0u8; 4];
+        assert_eq!(
+            block_on(FileLike::read_at(&*reader, 0, &mut buf)),
+            Err(LxError::ESPIPE)
+        );
+        assert_eq!(
+            FileLike::write_at(&*writer, 0, &[1, 2, 3, 4]),
+            Err(LxError::ESPIPE)
+        );
     }
 }
 
@@ -1663,10 +1905,23 @@ mod setfl_tests {
         // An argument of 0 clears the status flags and nothing else: it does
         // not turn the file read-only (`RDONLY` is 0) or drop CLOEXEC.
         let cleared = OpenFlags::after_setfl(
-            rw | OpenFlags::APPEND | OpenFlags::NON_BLOCK,
+            rw | OpenFlags::APPEND | OpenFlags::NON_BLOCK | OpenFlags::ASYNC,
             OpenFlags::empty(),
         );
         assert_eq!(cleared, rw);
+        // O_ASYNC is a status flag too (FASYNC / ioctl FIOASYNC).
+        let async_on = OpenFlags::after_setfl(rw, OpenFlags::ASYNC);
+        assert_eq!(async_on, rw | OpenFlags::ASYNC);
+        // O_DIRECT and O_NOATIME are in Linux's SETFL_MASK; without them
+        // here, F_SETFL could neither set nor clear either bit.
+        let direct = OpenFlags::after_setfl(rw, OpenFlags::DIRECT | OpenFlags::NOATIME);
+        assert_eq!(direct, rw | OpenFlags::DIRECT | OpenFlags::NOATIME);
+        let cleared_direct = OpenFlags::after_setfl(direct, OpenFlags::NON_BLOCK);
+        assert_eq!(
+            cleared_direct,
+            rw | OpenFlags::NON_BLOCK,
+            "F_SETFL(O_NONBLOCK) must clear O_DIRECT|O_NOATIME that were set"
+        );
     }
 
     #[test]
@@ -1686,12 +1941,23 @@ mod setfl_tests {
     }
 
     #[test]
-    fn take_settable_is_the_three_bits_every_set_flags_used_to_copy_by_hand() {
+    fn take_settable_is_the_status_bits_every_set_flags_used_to_copy_by_hand() {
         let mut flags = OpenFlags::RDWR | OpenFlags::NON_BLOCK;
-        flags.take_settable(OpenFlags::APPEND | OpenFlags::CLOEXEC);
+        flags.take_settable(
+            OpenFlags::APPEND
+                | OpenFlags::ASYNC
+                | OpenFlags::DIRECT
+                | OpenFlags::NOATIME
+                | OpenFlags::CLOEXEC,
+        );
         assert_eq!(
             flags,
-            OpenFlags::RDWR | OpenFlags::APPEND | OpenFlags::CLOEXEC
+            OpenFlags::RDWR
+                | OpenFlags::APPEND
+                | OpenFlags::ASYNC
+                | OpenFlags::DIRECT
+                | OpenFlags::NOATIME
+                | OpenFlags::CLOEXEC
         );
         // Bits it does not own are left alone in both directions.
         flags.take_settable(OpenFlags::WRONLY | OpenFlags::CREATE);
@@ -2319,5 +2585,188 @@ mod prefill_tests {
             "page by page was {} commands",
             disk.commands()
         );
+    }
+}
+
+#[cfg(test)]
+mod shared_vmo_registry_tests {
+    //! The registry lock is a ticket spinlock held with interrupts off, so
+    //! what may run under it is the whole story. A KERNEL STOP on real
+    //! hardware (build `c7bdfaf`) caught the holder of this lock parked in
+    //! `GlobalAlloc::dealloc` while eight other CPUs spun on `cache_vmo_of`:
+    //! eviction used to write back to the filesystem and free the evicted
+    //! VMO's frames from *inside* the critical section.
+    //!
+    //! These tests pin the two halves of the fix: the writeback still happens,
+    //! and it happens with the lock down.
+
+    use super::*;
+    use core::sync::atomic::{AtomicUsize, Ordering};
+    use rcore_fs::vfs::{FileSystem, FsError, Metadata, PollStatus};
+    use rcore_fs_ramfs::RamFS;
+
+    /// What the probe saw, kept by the test: the probe inode itself must die
+    /// with the registry entry, so it cannot hold the counters.
+    #[derive(Default)]
+    struct Probe {
+        writes: AtomicUsize,
+        /// `write_at` calls that found the registry lock already held.
+        writes_under_lock: AtomicUsize,
+    }
+
+    /// A ramfs file that reports, on every `write_at`, whether the registry
+    /// lock was free at that moment.
+    struct ProbeInode {
+        inner: Arc<dyn INode>,
+        probe: Arc<Probe>,
+    }
+
+    impl INode for ProbeInode {
+        fn read_at(&self, offset: usize, buf: &mut [u8]) -> Result<usize, FsError> {
+            self.inner.read_at(offset, buf)
+        }
+
+        fn write_at(&self, offset: usize, buf: &[u8]) -> Result<usize, FsError> {
+            self.probe.writes.fetch_add(1, Ordering::SeqCst);
+            match SHARED_FILE_VMOS.try_lock() {
+                // Free: taking and releasing it here is exactly what a real
+                // filesystem write may end up doing underneath us.
+                Some(guard) => drop(guard),
+                None => {
+                    self.probe.writes_under_lock.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+            self.inner.write_at(offset, buf)
+        }
+
+        fn poll(&self) -> Result<PollStatus, FsError> {
+            self.inner.poll()
+        }
+
+        fn metadata(&self) -> Result<Metadata, FsError> {
+            self.inner.metadata()
+        }
+
+        fn as_any_ref(&self) -> &dyn core::any::Any {
+            self
+        }
+    }
+
+    /// A fresh ramfs file of `content`. Returns the raw ramfs node (to read
+    /// back through, since the probe will be gone) and the probe wrapper.
+    fn probe_file(content: &[u8]) -> (Arc<dyn INode>, Arc<dyn INode>, Arc<Probe>) {
+        let fs = RamFS::new();
+        let root = fs.root_inode();
+        let node = root
+            .create("f", FileType::File, 0o777)
+            .expect("create failed");
+        node.resize(content.len()).expect("resize failed");
+        node.write_at(0, content).expect("write failed");
+        let probe = Arc::new(Probe::default());
+        let wrapper: Arc<dyn INode> = Arc::new(ProbeInode {
+            inner: node.clone(),
+            probe: probe.clone(),
+        });
+        (node, wrapper, probe)
+    }
+
+    /// Register a cache for `wrapper`, dirty its first page, and consume every
+    /// reference to it so the registry's own cycle is all that keeps it alive:
+    /// the state `take_prunable` evicts.
+    ///
+    /// Takes `wrapper` BY VALUE on purpose. The eviction rule is "nothing maps
+    /// the VMO and no fd is still open", and a second `Arc<dyn INode>` in the
+    /// test is indistinguishable from an open fd.
+    fn register_dirty_cache(wrapper: Arc<dyn INode>, dirty: &[u8]) {
+        let size = wrapper.metadata().unwrap().size;
+        let vmo = inode_cache_vmo(&wrapper, "probe", size, 0, PAGE_SIZE, true)
+            .expect("the cache vmo should have been created");
+        vmo.write(0, dirty).expect("dirtying the cache failed");
+        // Both handles go; the registry entry stays, holding the only strong
+        // reference to the VMO and -- through the VMO's FrameFiller -- the only
+        // strong reference to the inode.
+        drop(vmo);
+        drop(wrapper);
+    }
+
+    /// The evicted entry's dirty pages still reach the file. This is the whole
+    /// point of eviction-time writeback: a `MAP_SHARED` store must survive the
+    /// writer's `munmap`, which is what the wl_keyboard keymap depends on.
+    #[test]
+    fn eviction_writes_the_dirty_cache_back_to_the_file() {
+        let (node, wrapper, probe) = probe_file(b"old content, to be overwritten..");
+        register_dirty_cache(wrapper, b"NEW");
+
+        // Any later registry access prunes. Use an unrelated file so nothing
+        // about this call can resurrect the entry under test.
+        let (_other_node, other, _) = probe_file(b"x");
+        let _ = inode_cache_vmo(&other, "other", 1, 0, PAGE_SIZE, false);
+
+        assert!(
+            probe.writes.load(Ordering::SeqCst) > 0,
+            "writeback never called the inode"
+        );
+        let mut buf = [0u8; 3];
+        node.read_at(0, &mut buf).unwrap();
+        assert_eq!(&buf, b"NEW", "the evicted cache was not written back");
+    }
+
+    /// ... and no part of that writeback runs under the registry lock. This is
+    /// the regression: with the lock held, a filesystem write reaches inode
+    /// locks that `read(2)` and `write(2)` already hold when they come the
+    /// other way round through `cache_overlay_read` -- an AB-BA -- and any
+    /// allocation it makes parks the holder on the heap lock with interrupts
+    /// off.
+    #[test]
+    fn eviction_writeback_runs_with_the_registry_lock_down() {
+        let (_node, wrapper, probe) = probe_file(b"old content, to be overwritten..");
+        register_dirty_cache(wrapper, b"NEW");
+
+        let (_other_node, other, _) = probe_file(b"x");
+        let _ = inode_cache_vmo(&other, "other", 1, 0, PAGE_SIZE, false);
+
+        assert!(
+            probe.writes.load(Ordering::SeqCst) > 0,
+            "writeback never ran, so this test proved nothing"
+        );
+        assert_eq!(
+            probe.writes_under_lock.load(Ordering::SeqCst),
+            0,
+            "writeback ran inside the registry's critical section"
+        );
+    }
+
+    /// `take_prunable` keeps what is still in use and takes only the dead,
+    /// handing the entries out alive so the caller drops them outside the
+    /// lock.
+    #[test]
+    fn take_prunable_keeps_live_entries_and_hands_dead_ones_out_alive() {
+        let (_live_node, live, _) = probe_file(b"still mapped");
+        let live_vmo = inode_cache_vmo(&live, "live", 12, 0, PAGE_SIZE, false)
+            .expect("the cache vmo should have been created");
+
+        let (_dead_node, dead, _) = probe_file(b"nobody holds this");
+        register_dirty_cache(dead, b"Z");
+
+        let evicted = {
+            let mut registry = SHARED_FILE_VMOS.lock();
+            take_prunable(&mut registry)
+        };
+        assert_eq!(evicted.len(), 1, "exactly the dead entry should be taken");
+        for (vmo, _, _) in &evicted {
+            assert_eq!(
+                Arc::strong_count(vmo),
+                1,
+                "the evicted VMO must still be alive, for the caller to drop"
+            );
+        }
+        finish_eviction(evicted);
+
+        // The live one is untouched and still registered.
+        assert!(
+            cache_vmo_of(&live).is_some(),
+            "a mapped cache was pruned out from under its mapper"
+        );
+        drop(live_vmo);
     }
 }

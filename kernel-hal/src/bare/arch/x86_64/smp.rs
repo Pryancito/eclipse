@@ -433,13 +433,13 @@ pub fn start_application_processors() {
     // one bogus APIC id once the LAPIC switched to x2APIC — has been fixed).
     // The BSP is already registered above, so single-core is fully functional.
     if !crate::common::ipi::smp_enabled() {
-        warn!("[smp] AP bring-up disabled by `smp=off` — single-core");
+        crate::klog_warn!("[smp] AP bring-up disabled by `smp=off` — single-core");
         return;
     }
 
     let acpi_rsdp = KCONFIG.acpi_rsdp as usize;
     if acpi_rsdp == 0 {
-        warn!("[smp] No ACPI RSDP — skipping AP startup");
+        crate::klog_warn!("[smp] No ACPI RSDP — skipping AP startup; booting single-core");
         return;
     }
 
@@ -449,11 +449,11 @@ pub fn start_application_processors() {
     };
 
     if ap_lapic_ids.is_empty() {
-        warn!("[smp] no application processors in ACPI MADT");
+        crate::klog_warn!("[smp] no application processors in ACPI MADT; booting single-core");
         return;
     }
 
-    warn!(
+    crate::klog_info!(
         "[smp] starting {} AP(s), LAPIC IDs: {:?}",
         ap_lapic_ids.len(),
         ap_lapic_ids
@@ -692,10 +692,11 @@ pub fn start_application_processors() {
     }
 
     let online = AP_ONLINE_COUNT.load(Ordering::Acquire);
-    warn!(
-        "[smp] done — {}/{} AP(s) online (launched {})",
+    crate::klog_info!(
+        "[smp] done — {}/{} AP(s) online, {} CPU(s) total (launched {})",
         online,
         ap_lapic_ids.len(),
+        online + 1,
         latched
     );
 }

@@ -63,6 +63,7 @@ pub struct SyncobjHandle {
     signaled: Arc<AtomicBool>,
     /// Wakes `sys_poll` subscribers when the fence becomes ready.
     eventbus: Arc<Mutex<EventBus>>,
+    flags: Mutex<OpenFlags>,
 }
 
 /// One live sync_file that is still waiting for its point. Dropped once
@@ -89,6 +90,7 @@ impl SyncobjHandle {
             sync_file_point: None,
             signaled: Arc::new(AtomicBool::new(false)),
             eventbus: EventBus::new(),
+            flags: Mutex::new(OpenFlags::RDWR | OpenFlags::CLOEXEC),
         })
     }
 
@@ -115,6 +117,7 @@ impl SyncobjHandle {
             sync_file_point: Some(point),
             signaled,
             eventbus,
+            flags: Mutex::new(OpenFlags::RDWR | OpenFlags::CLOEXEC),
         })
     }
 
@@ -322,23 +325,33 @@ impl Drop for SyncobjHandle {
 #[async_trait]
 impl FileLike for SyncobjHandle {
     fn flags(&self) -> OpenFlags {
-        OpenFlags::RDWR | OpenFlags::CLOEXEC
+        *self.flags.lock()
     }
 
-    fn set_flags(&self, _f: OpenFlags) -> LxResult {
+    fn set_flags(&self, f: OpenFlags) -> LxResult {
+        // Same trap as epoll/perf before `take_settable`: a hardcoded
+        // `flags()` plus a no-op `set_flags` made `fcntl(F_SETFL, O_NONBLOCK)`
+        // "succeed" while `F_GETFL` never changed.
+        self.flags.lock().take_settable(f);
         Ok(())
     }
 
+    // Linux `drm_syncobj_file_fops` / `sync_file_fops` have no `.read`/`.write`
+    // — vfs returns `-EINVAL`, not `-ENOSYS`.
     async fn read(&self, _buf: &mut [u8]) -> LxResult<usize> {
-        Err(LxError::ENOSYS)
+        Err(LxError::EINVAL)
     }
 
     fn write(&self, _buf: &[u8]) -> LxResult<usize> {
-        Err(LxError::ENOSYS)
+        Err(LxError::EINVAL)
     }
 
     async fn read_at(&self, _offset: u64, _buf: &mut [u8]) -> LxResult<usize> {
-        Err(LxError::ENOSYS)
+        Err(LxError::EINVAL)
+    }
+
+    fn write_at(&self, _offset: u64, _buf: &[u8]) -> LxResult<usize> {
+        Err(LxError::EINVAL)
     }
 
     /// Match Linux `sync_file_poll`: `POLLIN` once the wrapped fence is
@@ -388,6 +401,31 @@ impl FileLike for SyncobjHandle {
 #[cfg(test)]
 mod sync_file_poll_tests {
     use super::*;
+
+    /// `read`/`write` on a syncobj fd must be `-EINVAL`, not `-ENOSYS`:
+    /// Linux syncobj/sync_file fops have no read/write ops.
+    #[test]
+    fn read_write_on_syncobj_are_einval_not_enosys() {
+        use async_std::task::block_on;
+        let fd = SyncobjHandle::new(0);
+        let mut buf = [0u8; 8];
+        assert_eq!(block_on(fd.read(&mut buf)), Err(LxError::EINVAL));
+        assert_eq!(fd.write(&[0u8; 8]), Err(LxError::EINVAL));
+        assert_eq!(block_on(fd.read_at(0, &mut buf)), Err(LxError::EINVAL));
+    }
+
+    /// `fcntl(F_SETFL, O_NONBLOCK)` on a syncobj/sync_file fd used to return
+    /// success while `F_GETFL` stayed forever at the hardcoded RDWR|CLOEXEC.
+    #[test]
+    fn set_flags_turns_a_blocking_syncobj_fd_non_blocking() {
+        let fd = SyncobjHandle::new(0);
+        assert!(!fd.flags().non_block());
+        assert!(fd.flags().close_on_exec());
+        let mut f = fd.flags();
+        f.set(OpenFlags::NON_BLOCK, true);
+        fd.set_flags(f).unwrap();
+        assert!(fd.flags().non_block() && fd.flags().close_on_exec());
+    }
 
     /// The regression this guards. Mesa's `sync_wait(fd, 0)` is a zero-timeout
     /// `poll(POLLIN)`. With EXEC having already signaled the syncobj before

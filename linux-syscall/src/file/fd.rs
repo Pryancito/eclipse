@@ -148,6 +148,38 @@ pub(crate) fn anon_fd_flags(flags: usize, allowed: usize) -> Result<OpenFlags, L
     Ok(OpenFlags::from_bits_truncate(flags))
 }
 
+/// Decode an `open`/`openat` flag word, or `EINVAL` for any bit this kernel
+/// does not name.
+///
+/// `OpenFlags::from_bits_truncate` alone drops anything unnamed in silence,
+/// so `openat(..., O_TMPFILE)` would hand back a normal readable fd — the
+/// same silent lie the FreeBSD personality already refuses one layer up.
+/// Also used by `TIOCGPTPEER`, whose `arg` is the same open(2) flag word.
+///
+/// `O_PATH` is named now and so is honoured; `O_TMPFILE` is still `EINVAL`,
+/// because it changes what the call CREATES and nothing here does that.
+pub(crate) fn open_flags(flags: usize) -> Result<OpenFlags, LxError> {
+    if flags & !OpenFlags::all().bits() != 0 {
+        return Err(LxError::EINVAL);
+    }
+    Ok(path_open_flags(OpenFlags::from_bits_truncate(flags)))
+}
+
+/// `build_open_flags`: under `O_PATH` the kernel keeps `O_DIRECTORY`,
+/// `O_NOFOLLOW` and `O_CLOEXEC` and **drops every other bit**, the access
+/// mode among them.
+///
+/// Dropping them is not tidiness. `open("/proc/self", O_PATH|O_RDWR)` must
+/// not take write permission on `/proc/self`, `O_PATH|O_TRUNC` must not
+/// truncate, and `O_PATH|O_CREAT` must not create: a path descriptor opens
+/// no file, so no flag about an open file can apply to it.
+fn path_open_flags(flags: OpenFlags) -> OpenFlags {
+    if !flags.is_path() {
+        return flags;
+    }
+    flags & (OpenFlags::PATH | OpenFlags::DIRECTORY | OpenFlags::NOFOLLOW | OpenFlags::CLOEXEC)
+}
+
 impl Syscall<'_> {
     /// `timerfd_create(2)`: a timer delivered through a readable fd. The
     /// `wl_event_loop` (libwayland) arms one for all its timers.
@@ -286,7 +318,7 @@ impl Syscall<'_> {
         } else {
             path
         };
-        let flags = OpenFlags::from_bits_truncate(flags);
+        let flags = open_flags(flags)?;
         info!(
             "openat: dir_fd={:?}, path={:?}, flags={:?}, mode={:#o}",
             dir_fd, path, flags, mode
@@ -306,16 +338,25 @@ impl Syscall<'_> {
             // Every path handled specially below hands back a character
             // device, so an `O_DIRECTORY` over one of them is answered before
             // the work of minting a PTY starts.
-            if path == "/dev/ptmx" || path == "/dev/tty" || pty::pts_id_from_path(path).is_some() {
+            // ... unless this is an `O_PATH` open, which opens no file at
+            // all: Linux never calls `f_op->open` for one, so it mints no
+            // PTY and claims no single-client device. The generic path below
+            // hands back the node itself, which is what a path descriptor is.
+            let open_file = !flags.is_path();
+            if open_file
+                && (path == "/dev/ptmx"
+                    || path == "/dev/tty"
+                    || pty::pts_id_from_path(path).is_some())
+            {
                 open_resolved_type(flags, FileType::CharDevice)?;
             }
-            if path == "/dev/ptmx" {
+            if open_file && path == "/dev/ptmx" {
                 let inode = pty::alloc_ptmx();
                 let file = File::new(inode, flags, String::from("/dev/ptmx"));
                 let fd = proc.add_file(file)?;
                 return Ok(fd.into());
             }
-            if let Some(id) = pty::pts_id_from_path(path) {
+            if let Some(id) = pty::pts_id_from_path(path).filter(|_| open_file) {
                 let inode = pty::open_pts(id).ok_or(LxError::ENXIO)?;
                 let file = File::new(inode, flags, String::from(path));
                 let fd = proc.add_file(file)?;
@@ -329,7 +370,7 @@ impl Syscall<'_> {
             // and busybox spins forever on `killpg(0, SIGTTIN)` (a CPU-burning busy
             // loop on every spare VT — the dominant idle heat once the signal
             // self-deadlock is fixed).
-            if path == "/dev/tty" {
+            if open_file && path == "/dev/tty" {
                 // A process RUNNING ON A PTY (the shell inside foot/alacritty) must
                 // get its own pts back, not the VT. busybox ash opens /dev/tty for
                 // job control, and handing it the VT reads/writes ANOTHER
@@ -403,7 +444,11 @@ impl Syscall<'_> {
                         (file_inode, false)
                     }
                     Err(FsError::EntryNotFound) => {
-                        let create_mode = proc.apply_umask(mode as u16);
+                        // `build_open_flags`: `op->mode = mode & S_IALLUGO`.
+                        // Without the mask, `open(..., O_CREAT, 0o100644)`
+                        // left `S_IFREG` in the inode mode (mkdir/mknod
+                        // already strip via `create_perm`).
+                        let create_mode = proc.apply_umask(super::dir::create_perm(mode));
                         let inode =
                             dir_inode.create(file_name, FileType::File, create_mode as u32)?;
                         linux_object::fs::dcache_invalidate();
@@ -425,7 +470,15 @@ impl Syscall<'_> {
                 // its budget covers every hop, so the last component is asked
                 // about on its own -- and only when the flag is there, so the
                 // ordinary open pays nothing for it.
-                if !follow {
+                //
+                // `O_PATH|O_NOFOLLOW` is the one combination that does NOT
+                // refuse: it is the documented way to get a descriptor for
+                // the LINK itself, which is how a caller `fstat`s or
+                // `readlinkat`s a symbolic link it holds by descriptor
+                // (`path_openat` routes it to `do_o_path` with the link as
+                // the result). Every other `O_NOFOLLOW` open is `ELOOP`.
+                let o_path_link = o_path_holds_the_link(flags, follow, path);
+                if !follow && !o_path_link {
                     let (dir_path, file_name) = split_path(path);
                     let dir_inode = proc.lookup_inode_at(dir_fd, dir_path, true)?;
                     if matches!(
@@ -435,7 +488,23 @@ impl Syscall<'_> {
                         return Err(LxError::ELOOP);
                     }
                 }
-                let inode = proc.lookup_inode_at(dir_fd, path, true)?;
+                // ... and only that combination stops short of the link.
+                //
+                // It cannot be done by asking the walk not to follow: that
+                // budget covers EVERY hop, so a link met on the WAY would be
+                // left in place too and the next component would come back
+                // `ENOTDIR` (`lookup_with_budget` in `vendor/rcore-fs/src/
+                // vfs.rs`, and the `lookup("l3/x") == NotDir` its own test
+                // asserts). Linux clears `LOOKUP_FOLLOW` for the LAST
+                // component alone, so the directory is resolved the ordinary
+                // way and the last name is looked up inside it.
+                let inode = if o_path_link {
+                    let (dir_path, file_name) = split_path(path);
+                    let dir_inode = proc.lookup_inode_at(dir_fd, dir_path, true)?;
+                    dir_inode.find(file_name)?
+                } else {
+                    proc.lookup_inode_at(dir_fd, path, true)?
+                };
                 let metadata = inode.metadata()?;
                 // `may_open`: the type's refusals (ELOOP, EISDIR) come before
                 // `inode_permission`.
@@ -463,7 +532,7 @@ impl Syscall<'_> {
             // The type test comes first and short-circuits: an ordinary file
             // open pays one comparison, not a mount-table lock and a path
             // allocation.
-            if nodev_applies_to(metadata.type_)
+            if nodev_blocks(flags, metadata.type_)
                 && linux_object::fs::path_is_nodev(
                     &proc
                         .get_absolute_path(dir_fd, path)
@@ -493,10 +562,17 @@ impl Syscall<'_> {
                 .downcast_ref::<linux_object::fs::devfs::DspDev>()
                 .is_some()
                 && !flags.writable()
+                && !flags.is_path()
             {
                 return Err(LxError::EINVAL);
             }
-            let inode = prepare_open_inode(inode)?;
+            // `f_op->open` is not called for an `O_PATH` descriptor, so the
+            // cloning and single-client devices are not claimed by one.
+            let inode = if flags.is_path() {
+                inode
+            } else {
+                prepare_open_inode(inode)?
+            };
             let abs_path = proc.get_absolute_path(dir_fd, path)?;
             let file = File::new(inode, flags, abs_path);
             let fd = proc.add_file(file)?;
@@ -1534,6 +1610,34 @@ pub(crate) fn nodev_applies_to(type_: FileType) -> bool {
     matches!(type_, FileType::CharDevice | FileType::BlockDevice)
 }
 
+/// Whether this open must come back holding the symbolic link itself rather
+/// than what it points at.
+///
+/// `O_PATH|O_NOFOLLOW` is the documented way to get a descriptor for a link
+/// (`path_openat` routes it to `do_o_path` with the link as the result), and
+/// the only `O_NOFOLLOW` open that is not `ELOOP`.
+///
+/// A trailing slash is the exception, and it is not cosmetic: `link_path_walk`
+/// turns one into `LOOKUP_DIRECTORY | LOOKUP_FOLLOW` on the last component, so
+/// `open("l/", O_PATH|O_NOFOLLOW)` follows `l` like every other caller does --
+/// what the caller named is a directory, not a link. Answering with the link
+/// there would hand back a descriptor for something the path did not name.
+pub(crate) fn o_path_holds_the_link(flags: OpenFlags, follow: bool, path: &str) -> bool {
+    flags.is_path() && !follow && !path.ends_with('/')
+}
+
+/// Whether a `nodev` mount may refuse this open.
+///
+/// `may_open` is where Linux calls `may_open_dev`, and `path_openat` routes an
+/// `O_PATH` open to `do_o_path` INSTEAD of `do_open`, so `may_open` never runs
+/// for one. A path descriptor opens no device: it names the node, which is
+/// exactly what a caller wants in order to `fstat` a node on `/tmp`, `/run` or
+/// `/dev/shm` that it may not open, and refusing it would be a rule Linux does
+/// not have.
+pub(crate) fn nodev_blocks(flags: OpenFlags, type_: FileType) -> bool {
+    !flags.is_path() && nodev_applies_to(type_)
+}
+
 pub(crate) fn open_resolved_type(flags: OpenFlags, type_: FileType) -> Result<(), LxError> {
     // `do_open`: `if (open_flag & O_CREAT) { ... if (d_is_dir(dentry))
     // return -EISDIR; }`, ahead of the `O_DIRECTORY` test. An `O_CREAT`
@@ -1545,8 +1649,13 @@ pub(crate) fn open_resolved_type(flags: OpenFlags, type_: FileType) -> Result<()
         return Err(LxError::ENOTDIR);
     }
     // Resolution only ever stops at a symbolic link when `O_NOFOLLOW` told it
-    // to, so reaching one here is that flag's answer.
-    if type_ == FileType::SymLink {
+    // to, so reaching one here is that flag's answer -- except under `O_PATH`,
+    // where the pair is not a refusal but a request: it is how a caller takes
+    // hold of the LINK rather than of what it points at, and the only way to
+    // `fstat` or `readlinkat` one by descriptor. The `O_DIRECTORY` test above
+    // still answers first, so `O_PATH|O_NOFOLLOW|O_DIRECTORY` over a link is
+    // `ENOTDIR`, as in Linux.
+    if type_ == FileType::SymLink && !(flags.is_path() && flags.contains(OpenFlags::NOFOLLOW)) {
         return Err(LxError::ELOOP);
     }
     // `build_open_flags`: `if (flags & O_TRUNC) acc_mode |= MAY_WRITE;` and
@@ -1640,14 +1749,189 @@ mod open_flag_tests {
         assert!(parsed.writable());
     }
 
-    /// `O_PATH` and `O_TMPFILE` stay unnamed on purpose: each changes what the
-    /// descriptor IS, and naming a flag this kernel does not honour is the
-    /// same silent lie as dropping one it should.
+    /// `O_TMPFILE` stays unnamed on purpose: it changes what the call
+    /// CREATES, and nothing here creates it. Truncating it used to hand back
+    /// a normal readable fd; `open_flags` answers `EINVAL` instead of that
+    /// silent lie.
     #[test]
-    fn the_flags_this_kernel_does_not_honour_stay_out() {
-        for bit in [0o10000000usize, 0o20000000] {
-            assert_eq!(OpenFlags::from_bits_truncate(bit), OpenFlags::RDONLY);
+    fn the_flags_this_kernel_does_not_honour_are_einval() {
+        let bit = 0o20000000usize;
+        assert_eq!(
+            open_flags(bit),
+            Err(LxError::EINVAL),
+            "flag {bit:#o} must not open as a normal fd"
+        );
+        assert_eq!(
+            open_flags(bit | OpenFlags::RDONLY.bits() | OpenFlags::CLOEXEC.bits()),
+            Err(LxError::EINVAL),
+            "a valid bit must not hide flag {bit:#o}"
+        );
+        // Known flags still parse.
+        let ok = open_flags(OpenFlags::RDWR.bits() | OpenFlags::CLOEXEC.bits()).unwrap();
+        assert!(ok.readable() && ok.writable() && ok.close_on_exec());
+    }
+
+    /// `O_PATH` is the one procps opens `/proc/self` with, and `EINVAL` on it
+    /// is what made `ps aux` print "Error, do this: mount -t proc proc /proc"
+    /// and exit 47 with `/proc` mounted the whole time.
+    #[test]
+    fn o_path_opens_and_is_neither_readable_nor_writable() {
+        const O_PATH: usize = 0o10000000;
+        const O_DIRECTORY: usize = 0o200000;
+        // What `look_up_our_self` asks for.
+        let f = open_flags(O_PATH | O_DIRECTORY).expect("O_PATH|O_DIRECTORY must open");
+        assert!(f.is_path());
+        assert!(f.contains(OpenFlags::DIRECTORY));
+        // Neither: `read(2)` and `write(2)` on a path descriptor are EBADF,
+        // and every reader here answers off these two.
+        assert!(!f.readable(), "a path descriptor reads nothing");
+        assert!(!f.writable(), "a path descriptor writes nothing");
+    }
+
+    /// `O_PATH` is decided in `open_flags`, before the path is looked at, so
+    /// it is not a procfs affair: the same descriptor opens on sysfs,
+    /// devtmpfs, tmpfs and the real disk. These are the two per-filesystem
+    /// rules the open path still applies, and both had to learn about it.
+    ///
+    /// First: `O_PATH|O_NOFOLLOW` opens the LINK, where every other
+    /// `O_NOFOLLOW` open is `ELOOP`. That is the combination `fstat` and
+    /// `readlinkat` on a descriptor need, and sysfs is built out of symbolic
+    /// links (`/sys/class/*/*`, `subsystem`, `device`), so refusing it there
+    /// refuses the normal way to walk that tree.
+    #[test]
+    fn o_path_with_nofollow_takes_hold_of_the_link_itself() {
+        const O_PATH: usize = 0o10000000;
+        let path_nofollow = open_flags(O_PATH | OpenFlags::NOFOLLOW.bits()).unwrap();
+        assert_eq!(
+            open_resolved_type(path_nofollow, FileType::SymLink),
+            Ok(()),
+            "O_PATH|O_NOFOLLOW is how a caller holds a symbolic link"
+        );
+        // Without O_PATH it stays ELOOP, and so does O_PATH on its own --
+        // that one follows the link like any other open and never sees it.
+        assert_eq!(
+            open_resolved_type(OpenFlags::NOFOLLOW, FileType::SymLink),
+            Err(LxError::ELOOP)
+        );
+        assert_eq!(
+            open_resolved_type(open_flags(O_PATH).unwrap(), FileType::SymLink),
+            Err(LxError::ELOOP)
+        );
+        // `O_DIRECTORY` still answers first: a link is not a directory
+        // whatever it points at.
+        let with_dir =
+            open_flags(O_PATH | OpenFlags::NOFOLLOW.bits() | OpenFlags::DIRECTORY.bits()).unwrap();
+        assert_eq!(
+            open_resolved_type(with_dir, FileType::SymLink),
+            Err(LxError::ENOTDIR)
+        );
+    }
+
+    /// The resolution itself: `O_PATH|O_NOFOLLOW` has to stop at the LAST
+    /// component, never at the first link on the way. Asking the walk not to
+    /// follow anything would do the latter -- `lookup_with_budget` leaves
+    /// every link in place with a zero budget, and the component after one is
+    /// `NotDir`, which `vendor/rcore-fs/src/vfs.rs` asserts for itself
+    /// (`lookup("l3/x") == NotDir`). So `sysfs/.../device/driver`, where
+    /// `device` is a link, must still resolve.
+    #[test]
+    fn o_path_stops_at_the_last_component_and_not_at_the_first_link() {
+        const O_PATH: usize = 0o10000000;
+        let path_nofollow = open_flags(O_PATH | OpenFlags::NOFOLLOW.bits()).unwrap();
+        assert!(
+            o_path_holds_the_link(path_nofollow, false, "through-link/final-link"),
+            "the walk must resolve `through-link` and then look `final-link` up in it"
+        );
+        assert!(o_path_holds_the_link(path_nofollow, false, "link"));
+
+        // A trailing slash names a directory, so the link is followed.
+        assert!(
+            !o_path_holds_the_link(path_nofollow, false, "link/"),
+            "`LOOKUP_DIRECTORY | LOOKUP_FOLLOW` on the last component"
+        );
+        assert!(!o_path_holds_the_link(path_nofollow, false, "/"));
+
+        // And every other open resolves the ordinary way, O_PATH on its own
+        // included: without O_NOFOLLOW it follows the link like any open.
+        assert!(!o_path_holds_the_link(
+            open_flags(O_PATH).unwrap(),
+            true,
+            "link"
+        ));
+        assert!(!o_path_holds_the_link(OpenFlags::NOFOLLOW, false, "link"));
+        assert!(!o_path_holds_the_link(OpenFlags::RDONLY, true, "link"));
+    }
+
+    /// Second: a `nodev` mount refuses to OPEN a device node, and `/tmp`,
+    /// `/run` and `/dev/shm` are all mounted `nodev` here. An `O_PATH`
+    /// descriptor opens no device, so `may_open_dev` never runs for one
+    /// (`path_openat` sends it to `do_o_path` instead of `do_open`) and the
+    /// node can still be named, which is what `fstat`ing it needs.
+    #[test]
+    fn a_nodev_mount_does_not_refuse_a_path_descriptor() {
+        const O_PATH: usize = 0o10000000;
+        let path = open_flags(O_PATH).unwrap();
+        let plain = open_flags(OpenFlags::RDONLY.bits()).unwrap();
+        for dev in [FileType::CharDevice, FileType::BlockDevice] {
+            assert!(
+                nodev_blocks(plain, dev),
+                "{:?} opened for real is still what nodev is about",
+                dev
+            );
+            assert!(
+                !nodev_blocks(path, dev),
+                "{:?} named by an O_PATH descriptor is not an open",
+                dev
+            );
         }
+        // And the types `nodev` was never about stay out of it, path
+        // descriptor or not: FIFOs and Unix sockets live on exactly those
+        // mounts.
+        for other in [
+            FileType::File,
+            FileType::Dir,
+            FileType::SymLink,
+            FileType::NamedPipe,
+            FileType::Socket,
+        ] {
+            assert!(!nodev_blocks(plain, other), "{:?}", other);
+            assert!(!nodev_blocks(path, other), "{:?}", other);
+        }
+    }
+
+    /// `build_open_flags` drops every other bit under `O_PATH`. Keeping them
+    /// would have `O_PATH|O_RDWR` take write permission on the name, and
+    /// `O_PATH|O_TRUNC` empty the file it was only supposed to point at.
+    #[test]
+    fn o_path_keeps_only_cloexec_directory_and_nofollow() {
+        const O_PATH: usize = 0o10000000;
+        let kept = open_flags(
+            O_PATH
+                | OpenFlags::DIRECTORY.bits()
+                | OpenFlags::NOFOLLOW.bits()
+                | OpenFlags::CLOEXEC.bits(),
+        )
+        .unwrap();
+        assert_eq!(
+            kept,
+            OpenFlags::PATH | OpenFlags::DIRECTORY | OpenFlags::NOFOLLOW | OpenFlags::CLOEXEC
+        );
+        for dropped in [
+            OpenFlags::RDWR,
+            OpenFlags::WRONLY,
+            OpenFlags::TRUNCATE,
+            OpenFlags::APPEND,
+            OpenFlags::CREATE,
+            OpenFlags::NON_BLOCK,
+            OpenFlags::NOATIME,
+        ] {
+            let f = open_flags(O_PATH | dropped.bits()).unwrap();
+            assert_eq!(f, OpenFlags::PATH, "{dropped:?} must not survive O_PATH");
+            assert!(!f.readable() && !f.writable());
+        }
+        // Without O_PATH nothing is dropped.
+        let plain = open_flags(OpenFlags::RDWR.bits() | OpenFlags::TRUNCATE.bits()).unwrap();
+        assert!(plain.contains(OpenFlags::TRUNCATE) && plain.writable());
     }
 
     #[test]

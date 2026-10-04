@@ -237,6 +237,23 @@ pub fn pending_for(ipv6: bool) -> bool {
     })
 }
 
+/// Size of the next queued reply for `FIONREAD`, without consuming it.
+pub fn peek_len(ipv6: bool, remote: Option<IpAddress>) -> Option<usize> {
+    RX_QUEUE.lock().iter().find_map(|pkt| {
+        let family_ok = matches!(
+            (ipv6, pkt.src),
+            (true, IpAddress::Ipv6(_)) | (false, IpAddress::Ipv4(_))
+        );
+        if !family_ok {
+            return None;
+        }
+        match remote {
+            Some(remote_ip) if pkt.src != remote_ip => None,
+            _ => Some(pkt.data.len()),
+        }
+    })
+}
+
 /// Build a full IPv4 frame (header + ICMP) for `SOCK_RAW` recv (BusyBox ping as root).
 pub fn wrap_icmpv4_raw_frame(src_addr: Ipv4Address, dst_addr: Ipv4Address, icmp: &[u8]) -> Vec<u8> {
     let total = 20 + icmp.len();
@@ -255,7 +272,12 @@ pub fn wrap_icmpv4_raw_frame(src_addr: Ipv4Address, dst_addr: Ipv4Address, icmp:
 }
 
 /// Dequeue an echo reply and wrap it for `SOCK_RAW` + `IPPROTO_ICMP` read(2).
-pub fn pop_ipv4_raw_reply(remote: Option<IpAddress>, buf: &mut [u8]) -> Option<(usize, IpAddress)> {
+///
+/// Returns `(copied, full_frame_len, peer)` so the caller can set `MSG_TRUNC`.
+pub fn pop_ipv4_raw_reply(
+    remote: Option<IpAddress>,
+    buf: &mut [u8],
+) -> Option<(usize, usize, IpAddress)> {
     let (icmp, peer) = pop_for(false, remote)?;
     let IpAddress::Ipv4(peer_v4) = peer else {
         return None;
@@ -267,9 +289,10 @@ pub fn pop_ipv4_raw_reply(remote: Option<IpAddress>, buf: &mut [u8]) -> Option<(
     // SOCK_RAW + IPPROTO_ICMP delivers a full IPv4 datagram as received:
     // source = peer that sent the reply, destination = us.
     let frame = wrap_icmpv4_raw_frame(peer_v4, our, &icmp);
-    let n = frame.len().min(buf.len());
+    let full = frame.len();
+    let n = full.min(buf.len());
     buf[..n].copy_from_slice(&frame[..n]);
-    Some((n, peer))
+    Some((n, full, peer))
 }
 
 #[cfg(test)]

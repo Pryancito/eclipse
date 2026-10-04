@@ -696,8 +696,25 @@ pub fn untracked_live_stacks() -> usize {
 // `run` never returns). A pool re-poison can only touch an UNREGISTERED slot,
 // so any hit on a registered slot is the corruptor.
 
-/// Registry capacity. Live executors ≈ CPUs + parked weaks; 16 is generous.
-pub const SPINE_SLOTS: usize = 16;
+/// Registry capacity: two slots per CPU this kernel can run on.
+///
+/// Live executors are one strong executor per CPU plus that CPU's parked
+/// weaks, so the bound has to come from the CPU count and not from a guess.
+/// It was a flat 16 and "16 is generous" — on a 20-thread desktop (two RTX
+/// 2060 Super, `-smp 20`) the strong executors alone overflowed it: four
+/// `[spine] registry full (16 slots): executor id=17..20 goes UNWATCHED`
+/// lines 4.47 s into a real boot, i.e. the null-exec hunt reported a clean
+/// sweep on a machine where four live executors were watched by nobody.
+/// `MAX_CORE_NUM` is what every other per-CPU array in the system is sized
+/// by, and the sibling [`STACK_POOL_CAP`] took the same lesson from a GL=1
+/// spawn burst.
+///
+/// Cost is a sweep of this many atomic loads per timer tick, with an early
+/// `continue` on every empty slot, and `4 * 8 * SPINE_SLOTS` bytes of BSS —
+/// 4 KiB. The overflow counter and its message stay: `weak_executors` is a
+/// `Vec` with no cap, so no constant can promise "always enough", and a
+/// blind spot nobody counts still reads exactly like a clean run.
+pub const SPINE_SLOTS: usize = 2 * lock::MAX_CORE_NUM;
 static SPINE_ADDR: [core::sync::atomic::AtomicUsize; SPINE_SLOTS] =
     [const { core::sync::atomic::AtomicUsize::new(0) }; SPINE_SLOTS];
 static SPINE_VAL: [core::sync::atomic::AtomicU64; SPINE_SLOTS] =
@@ -2834,15 +2851,47 @@ mod spine_tests {
         assert_eq!(spine_owner_of(elsewhere), Some(4));
     }
 
+    /// The registry has to be big enough for the machines this kernel runs
+    /// on. It was a flat 16, and a 20-thread desktop overflowed it with its
+    /// strong executors alone -- four `goes UNWATCHED` lines 4.47 s into a
+    /// real boot, with the hunt then reporting a clean sweep. One slot per CPU
+    /// is the floor; the constant leaves a second for that CPU's parked weaks.
     #[test]
-    fn a_full_registry_says_so_instead_of_dropping_the_slot_in_silence() {
-        // 16 slots cover "CPUs plus parked weaks", and the sibling stack pool
-        // was already found too small by a GL=1 spawn burst. Unwatched and
-        // uncounted, the hunt reports a clean sweep on a machine where the
-        // victim was never watched at all.
+    fn every_cpu_the_kernel_supports_has_a_slot_to_be_watched_in() {
+        assert!(
+            SPINE_SLOTS >= lock::MAX_CORE_NUM,
+            "{} slots cannot watch {} CPUs",
+            SPINE_SLOTS,
+            lock::MAX_CORE_NUM
+        );
+        // And the 20 of the machine this came from, with room for weaks.
         let _c = clean();
         let base = 0x1000_0000;
-        for i in 0..16 {
+        for id in 1..=20 {
+            spine_register(
+                base + id * 0x20_0000,
+                RETURN_INTO_RUN_EXECUTOR,
+                id,
+                base + id * 0x20_0000,
+            );
+        }
+        assert_eq!(
+            unwatched_spine_slots(),
+            0,
+            "executor id=17..20 are the ones the real boot dropped"
+        );
+        assert_eq!(spine_owner_of(base + 20 * 0x20_0000), Some(20));
+    }
+
+    #[test]
+    fn a_full_registry_says_so_instead_of_dropping_the_slot_in_silence() {
+        // Unwatched and uncounted, the hunt reports a clean sweep on a
+        // machine where the victim was never watched at all. `weak_executors`
+        // has no cap, so the table CAN still fill however it is sized -- what
+        // must never happen is filling in silence.
+        let _c = clean();
+        let base = 0x1000_0000;
+        for i in 0..SPINE_SLOTS {
             spine_register(
                 base + i * 0x20_0000,
                 RETURN_INTO_RUN_EXECUTOR,
@@ -2851,12 +2900,12 @@ mod spine_tests {
             );
         }
         assert_eq!(unwatched_spine_slots(), 0);
-        let unlucky = base + 16 * 0x20_0000;
+        let unlucky = base + SPINE_SLOTS * 0x20_0000;
         spine_register(unlucky, RETURN_INTO_RUN_EXECUTOR, 99, unlucky);
         assert_eq!(unwatched_spine_slots(), 1);
         assert_eq!(spine_owner_of(unlucky), None);
         // And it evicted nobody: dropping the newcomer is the whole point.
-        assert_eq!(watched().len(), 16);
+        assert_eq!(watched().len(), SPINE_SLOTS);
         assert_eq!(spine_owner_of(base), Some(0));
     }
 
@@ -2866,7 +2915,7 @@ mod spine_tests {
         // permanently over a boot's worth of spawn and exit.
         let _c = clean();
         let base = 0x1000_0000;
-        for i in 0..16 {
+        for i in 0..SPINE_SLOTS {
             spine_register(
                 base + i * 0x20_0000,
                 RETURN_INTO_RUN_EXECUTOR,
@@ -2875,7 +2924,7 @@ mod spine_tests {
             );
         }
         spine_unregister(base + 3 * 0x20_0000);
-        let newcomer = base + 40 * 0x20_0000;
+        let newcomer = base + (SPINE_SLOTS + 8) * 0x20_0000;
         spine_register(newcomer, RETURN_INTO_RUN_EXECUTOR, 77, newcomer);
         assert_eq!(spine_owner_of(newcomer), Some(77));
         assert_eq!(unwatched_spine_slots(), 0);

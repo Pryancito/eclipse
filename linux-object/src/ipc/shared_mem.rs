@@ -299,6 +299,9 @@ impl ShmIdentifier {
         gid: u32,
         groups: &[u32],
     ) -> Result<Arc<Mutex<ShmGuard>>, LxError> {
+        if flags & SHM_HUGETLB != 0 {
+            return Err(LxError::EINVAL);
+        }
         let mut key2shm = KEY2SHM.write();
         let flag = IpcGetFlag::from_bits_truncate(flags);
 
@@ -466,6 +469,13 @@ pub const SHMMIN: usize = 1;
 /// `SHMMAX`: the largest, Linux's `ULONG_MAX - (1UL << 24)` default. The
 /// same number `shmctl(IPC_INFO)` reports.
 pub const SHMMAX: usize = usize::MAX - (1 << 24);
+/// `SHM_HUGETLB`: ask for a hugepage-backed segment. This kernel has no
+/// hugepage pool, so the bit is `EINVAL` — the same answer as
+/// `mmap(..., MAP_HUGETLB)` here and as a Linux build without
+/// `CONFIG_HUGETLBFS`. It shares the numeric value of `IPC_NOWAIT` (which
+/// `shmget` does not take), and `from_bits_truncate` used to swallow it
+/// while creating a normal paged VMO.
+pub const SHM_HUGETLB: usize = 0o4000;
 
 /// `newseg`'s size check, and the page count the segment gets: `size <
 /// SHMMIN || size > ns->shm_ctlmax` is `EINVAL`; what is left cannot
@@ -775,6 +785,20 @@ mod shm_tests {
         // flags say, so the ENOENT rule must not reach this path.
         let a = get(0, 8192, 0o666).unwrap();
         assert_eq!(a.lock().shared_guard.len(), 8192);
+    }
+
+    /// `SHM_HUGETLB` shares the value of `IPC_NOWAIT`; truncating it used to
+    /// create a normal segment and answer success. No hugepages here →
+    /// `EINVAL`, same as `mmap(..., MAP_HUGETLB)`.
+    #[test]
+    fn hugetlb_is_einval_not_a_silent_normal_segment() {
+        let _guard = test_lock();
+        assert_eq!(
+            get(0, 4096, CREAT | 0o666 | SHM_HUGETLB).err(),
+            Some(LxError::EINVAL)
+        );
+        // Without the bit, the same request still works.
+        assert!(get(0, 4096, CREAT | 0o666).is_ok());
     }
 
     #[test]

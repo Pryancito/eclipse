@@ -190,6 +190,9 @@ pub fn push_packet(packet: &[u8]) {
 pub struct PacketSocketState {
     base: KObjectBase,
     inner: Arc<PacketSocketInner>,
+    /// Last recvmsg flags (`MSG_TRUNC`, …); cleared by [`Socket::take_msg_flags`].
+    /// Per-fd (not on the shared queue) so dup'd descriptors keep their own.
+    last_msg_flags: Mutex<i32>,
 }
 
 #[derive(Debug)]
@@ -222,6 +225,7 @@ impl PacketSocketState {
         let state = Arc::new(Self {
             base: KObjectBase::with_signal(Signal::WRITABLE),
             inner: inner.clone(),
+            last_msg_flags: Mutex::new(0),
         });
         register_fd(&inner, &state);
         registry.push(Arc::downgrade(&inner));
@@ -294,6 +298,9 @@ impl Socket for PacketSocketState {
                 let actual_len = payload.len();
                 let copy_len = actual_len.min(data.len());
                 data[..copy_len].copy_from_slice(&payload[..copy_len]);
+                // Datagram truncation: remainder is discarded; report MSG_TRUNC
+                // so recvmsg sees the cut (same bit UDP/netlink already set).
+                *self.last_msg_flags.lock() = if actual_len > data.len() { 0x20 } else { 0 };
 
                 if self.inner.packet_queue.lock().is_empty() {
                     self.base.signal_clear(Signal::READABLE);
@@ -398,7 +405,24 @@ impl Socket for PacketSocketState {
     }
 
     async fn connect(&self, _endpoint: Endpoint) -> SysResult {
-        Err(LxError::EINVAL)
+        // AF_PACKET has no connect(2); `EOPNOTSUPP` matches Linux
+        // `packet_ops`. `EINVAL` made probes think the address was wrong.
+        Err(LxError::EOPNOTSUPP)
+    }
+
+    fn listen(&self) -> SysResult {
+        Err(LxError::EOPNOTSUPP)
+    }
+
+    async fn accept(&self) -> LxResult<(Arc<dyn FileLike>, Endpoint)> {
+        Err(LxError::EOPNOTSUPP)
+    }
+
+    fn shutdown(&self, howto: usize) -> SysResult {
+        // `__sys_shutdown` validates `howto` first; then packet has no
+        // shutdown op (`sock_no_shutdown` → `EOPNOTSUPP`).
+        let _ = shutdown_sides(howto)?;
+        Err(LxError::EOPNOTSUPP)
     }
 
     fn bind(&self, endpoint: Endpoint) -> SysResult {
@@ -424,10 +448,6 @@ impl Socket for PacketSocketState {
 
     fn remote_endpoint(&self) -> Option<Endpoint> {
         None
-    }
-
-    fn setsockopt(&self, _level: usize, _opt: usize, _data: &[u8]) -> SysResult {
-        Ok(0)
     }
 
     fn poll(&self, _events: PollEvents) -> (bool, bool, bool) {
@@ -469,6 +489,19 @@ impl Socket for PacketSocketState {
     fn socket_type(&self) -> Option<SocketType> {
         Some(self.inner.socket_type)
     }
+
+    fn so_domain(&self) -> Option<u32> {
+        Some(crate::net::Domain::AF_PACKET as u32)
+    }
+
+    fn so_protocol(&self) -> Option<u32> {
+        // Ethertype stored at create/bind (host order in our state).
+        Some(*self.inner.protocol.lock() as u32)
+    }
+
+    fn take_msg_flags(&self) -> i32 {
+        core::mem::replace(&mut *self.last_msg_flags.lock(), 0)
+    }
 }
 
 zircon_object::impl_kobject!(PacketSocketState);
@@ -488,10 +521,7 @@ impl FileLike for PacketSocketState {
     }
 
     fn set_flags(&self, f: OpenFlags) -> LxResult {
-        let mut flags = self.inner.flags.lock();
-        flags.set(OpenFlags::APPEND, f.contains(OpenFlags::APPEND));
-        flags.set(OpenFlags::NON_BLOCK, f.contains(OpenFlags::NON_BLOCK));
-        flags.set(OpenFlags::CLOEXEC, f.contains(OpenFlags::CLOEXEC));
+        self.inner.flags.lock().take_settable(f);
         Ok(())
     }
 
@@ -526,8 +556,10 @@ impl FileLike for PacketSocketState {
         // and the queue is currently empty, sleep briefly and re-poll.
         // Without this, select() returns immediately with read=false every 5 ms
         // (from the executor tick), burning CPU and missing DHCPOFFER/DHCPACK
-        // windows on slow links.
-        if events.contains(PollEvents::IN) && !read && !error {
+        // windows on slow links. `wants_read` (not `contains(IN)`): interest
+        // of RDNORM alone is still a readability wait — same trap tcp/udp/
+        // icmp/unix already fixed.
+        if events.wants_read() && !read && !error {
             kernel_hal::net::NetRxOrTimeoutFuture::new(5).await;
             kernel_hal::deferred_job::drain_deferred_jobs();
             let (read2, write2, error2) = Socket::poll(self, events);
@@ -548,6 +580,20 @@ impl FileLike for PacketSocketState {
 
     fn ioctl(&self, request: usize, arg1: usize, arg2: usize, arg3: usize) -> LxResult<usize> {
         Socket::ioctl(self, request, arg1, arg2, arg3)
+    }
+
+    /// `FIONREAD`/`SIOCINQ`: size of the next queued frame (0 if empty).
+    /// Without this the ioctl fell through to ENOTTY, same as TCP/UDP before
+    /// they answered.
+    fn readable_bytes(&self) -> Option<usize> {
+        Some(
+            self.inner
+                .packet_queue
+                .lock()
+                .front()
+                .map(|f| f.len())
+                .unwrap_or(0),
+        )
     }
 
     fn as_socket(&self) -> LxResult<&dyn Socket> {
@@ -591,5 +637,25 @@ mod tests {
         frame[16..18].copy_from_slice(&0x0800u16.to_be_bytes());
         assert_eq!(eth_l2_header_len(&frame), Some((18, 0x0800)));
         assert_eq!(eth_l2_header_len(&frame[..14]), None);
+    }
+
+    /// Idle AF_PACKET must answer `FIONREAD` with 0, not fall through to ENOTTY.
+    #[test]
+    fn an_idle_packet_socket_reports_zero_bytes_readable() {
+        let s = PacketSocketState::new(SocketType::SOCK_RAW, 0x0800).unwrap();
+        assert_eq!(FileLike::readable_bytes(&*s), Some(0));
+    }
+
+    /// A short recv on a queued frame must set `MSG_TRUNC` (0x20).
+    #[async_std::test]
+    async fn a_short_packet_read_reports_msg_trunc() {
+        let s = PacketSocketState::new(SocketType::SOCK_RAW, 0x0800).unwrap();
+        FileLike::set_flags(&*s, OpenFlags::RDWR | OpenFlags::NON_BLOCK).unwrap();
+        let frame: PacketFrame = Arc::from(alloc::vec![0xAAu8; 64].into_boxed_slice());
+        s.inner.packet_queue.lock().push_back(frame);
+        let mut buf = [0u8; 16];
+        let (n, _) = Socket::read(&*s, &mut buf).await;
+        assert_eq!(n, Ok(16));
+        assert_eq!(Socket::take_msg_flags(&*s), 0x20, "MSG_TRUNC");
     }
 }

@@ -1245,7 +1245,41 @@ impl DrmDev {
             }
             DRM_IOCTL_MODE_ADDFB => {
                 let cmd = unsafe { &mut *(data as *mut DrmModeFbCmd) };
-                if let Some(fb_id) = drm::create_fb(cmd.handle, cmd.width, cmd.height, cmd.pitch) {
+                // `drm_mode_addfb` is `drm_mode_addfb2` with the fourcc
+                // derived from (bpp, depth): a pair the table does not know is
+                // EINVAL, and the derived format then goes through the same
+                // checks as an ADDFB2, which refuse every format no plane
+                // scans out. This arm read neither field, so a 16-bit or a
+                // 10-bit framebuffer was wrapped as XRGB8888 and scanned out
+                // as garbage, and an ARGB8888 one (32/32) was registered as
+                // XRGB8888 and reported back with depth 24.
+                let Some(pixel_format) = legacy_fb_format(cmd.bpp, cmd.depth) else {
+                    log::debug!(
+                        "[drm] ADDFB bpp={} depth={} -> EINVAL (no such format)",
+                        cmd.bpp,
+                        cmd.depth
+                    );
+                    return Err(FsError::InvalidParam);
+                };
+                let as_fb2 = DrmModeFbCmd2 {
+                    fb_id: 0,
+                    width: cmd.width,
+                    height: cmd.height,
+                    pixel_format,
+                    flags: 0,
+                    handles: [cmd.handle, 0, 0, 0],
+                    pitches: [cmd.pitch, 0, 0, 0],
+                    offsets: [0; 4],
+                    modifier: [0; 4],
+                };
+                addfb2_check(&as_fb2)?;
+                if let Some(fb_id) = drm::create_fb_with_format(
+                    cmd.handle,
+                    cmd.width,
+                    cmd.height,
+                    cmd.pitch,
+                    pixel_format,
+                ) {
                     cmd.fb_id = fb_id;
                     Ok(0)
                 } else {
@@ -1307,13 +1341,15 @@ impl DrmDev {
                 // Our software-KMS `rmfb` already only drops the fb object —
                 // scanout keeps showing the last blitted frame until the next
                 // present — which is exactly CLOSEFB's "close without
-                // disabling" contract. Reject unknown ids like Linux (EINVAL
-                // via DeviceError is close enough for wlroots' fallback).
+                // disabling" contract. An id that is not the caller's is
+                // ENOENT, as in `drm_mode_closefb_ioctl` (the lookup and the
+                // "is it in this file's list" check both answer that) and as
+                // RMFB above already did; this arm said EINVAL.
                 let fb_id = unsafe { *(data as *const u32) };
                 if drm::rmfb_for(fb_id, drm::current_pid()) {
                     Ok(0)
                 } else {
-                    Err(FsError::InvalidParam)
+                    Err(FsError::EntryNotFound)
                 }
             }
             DRM_IOCTL_MODE_MAP_DUMB => {
@@ -1356,6 +1392,33 @@ impl DrmDev {
             DRM_IOCTL_MODE_SETCRTC => {
                 // struct drm_mode_crtc has the same layout as DrmModeGetCrtc.
                 let req = unsafe { &mut *(data as *mut DrmModeGetCrtc) };
+                // `drm_mode_setcrtc` finds the CRTC before anything else
+                // (ENOENT), refuses a connector list with no mode or no fb to
+                // set them to (EINVAL) or longer than the card's connectors
+                // (EINVAL), and looks every connector in it up (ENOENT). None
+                // of it was read: a modeset on a CRTC the card does not have
+                // went to the one it has, and a connector list of any content
+                // was accepted unread.
+                if drm::get_crtc(req.crtc_id).is_none() {
+                    return Err(FsError::EntryNotFound);
+                }
+                if req.count_connectors > 0 {
+                    if req.mode_valid == 0 || req.fb_id == 0 {
+                        return Err(FsError::InvalidParam);
+                    }
+                    let connectors = drm::get_resources().2;
+                    if req.count_connectors as usize > connectors.len() {
+                        return Err(FsError::InvalidParam);
+                    }
+                    let n = req.count_connectors as usize;
+                    ucheck_n::<u32>(req.set_connectors_ptr as usize, n)?;
+                    for i in 0..n {
+                        let id = unsafe { *(req.set_connectors_ptr as *const u32).add(i) };
+                        if !connectors.contains(&id) {
+                            return Err(FsError::EntryNotFound);
+                        }
+                    }
+                }
                 if req.mode_valid != 0 {
                     drm::set_vblank_period_from_modeinfo(&req.mode);
                 }
@@ -1391,6 +1454,13 @@ impl DrmDev {
                     || flip.flags & (DRM_MODE_PAGE_FLIP_ASYNC | DRM_MODE_PAGE_FLIP_TARGET) != 0
                 {
                     return Err(FsError::InvalidParam);
+                }
+                // The CRTC first, then the fb, both ENOENT: `drm_crtc_find`
+                // and `drm_framebuffer_lookup` in that order. The CRTC id was
+                // never read, so a flip aimed at a CRTC the card does not have
+                // landed on the one it has.
+                if drm::get_crtc(flip.crtc_id).is_none() {
+                    return Err(FsError::EntryNotFound);
                 }
                 if drm::get_fb(flip.fb_id).is_none() {
                     return Err(FsError::EntryNotFound);
@@ -1494,7 +1564,20 @@ impl DrmDev {
                 // Primary-plane update: present immediately on the target CRTC.
                 // fb_id == 0 disables the plane, which we treat as a no-op.
                 let req = unsafe { *(data as *const DrmModeSetPlane) };
+                // `drm_mode_setplane` looks the plane up before anything else
+                // and answers ENOENT for one that does not exist. The id was
+                // not read at all, so a stale or invented plane id presented
+                // the fb on the CRTC as if it named the primary plane.
+                if drm::get_plane(req.plane_id).is_none() {
+                    return Err(FsError::EntryNotFound);
+                }
                 if req.fb_id != 0 {
+                    // With an fb to show, `drm_mode_setplane` looks the fb up
+                    // and then the CRTC, both ENOENT. The CRTC id was not
+                    // read either.
+                    if drm::get_fb(req.fb_id).is_none() || drm::get_crtc(req.crtc_id).is_none() {
+                        return Err(FsError::EntryNotFound);
+                    }
                     if let Err(e) = drm::present_now_checked(req.fb_id, req.crtc_id, None) {
                         present_failed("SETPLANE", req.fb_id, req.crtc_id, e)?;
                     }
@@ -1666,6 +1749,13 @@ impl DrmDev {
                 Ok(0)
             }
             DRM_IOCTL_MODE_GETGAMMA | DRM_IOCTL_MODE_SETGAMMA => {
+                // `struct drm_mode_crtc_lut` starts with `crtc_id`; both
+                // `drm_mode_gamma_{get,set}_ioctl` look it up first and answer
+                // ENOENT for a CRTC that does not exist.
+                let crtc_id = unsafe { *(data as *const u32) };
+                if drm::get_crtc(crtc_id).is_none() {
+                    return Err(FsError::EntryNotFound);
+                }
                 // No programmable gamma on the software scanout: accept and
                 // ignore. (Get leaves the caller's ramp buffers untouched, which
                 // Xorg treats as the identity it will "restore" on exit — a
@@ -1685,6 +1775,14 @@ impl DrmDev {
                 // The software scanout has no programmable object state, so
                 // accept and ignore rather than failing the client's modeset.
                 let req = unsafe { *(data as *const DrmModeObjSetProperty) };
+                // `drm_mode_obj_set_property_ioctl`: an object that does not
+                // exist is ENOENT, and so is a property id that does not. This
+                // arm accepted both, so a write to an object the client never
+                // got from GETRESOURCES, or with a property id it made up, was
+                // reported as done.
+                if !mode_object_exists(req.obj_id) || prop_spec(req.prop_id).is_none() {
+                    return Err(FsError::EntryNotFound);
+                }
                 // Same DPMS handling as the connector-specific setter above:
                 // `drm_mode_obj_set_property_ioctl` funnels into the very same
                 // `drm_mode_connector_set_obj_prop`.
@@ -1714,6 +1812,12 @@ impl DrmDev {
                         *(data.wrapping_add(12) as *const u32),
                     )
                 };
+                // `drm_connector_property_set_ioctl` is the OBJ_SETPROPERTY
+                // above with the type fixed to connector: an unknown
+                // connector or property id is ENOENT.
+                if drm::get_connector(connector_id).is_none() || prop_spec(prop_id).is_none() {
+                    return Err(FsError::EntryNotFound);
+                }
                 // DPMS is the one legacy connector property with an effect
                 // here. Linux routes it through `connector->funcs->dpms`,
                 // which disables the CRTC for anything but "On"; the other
@@ -1760,6 +1864,13 @@ impl DrmDev {
                 const DRM_MODE_CURSOR_BO: u32 = 0x01;
                 const DRM_MODE_CURSOR_MOVE: u32 = 0x02;
                 let cur = unsafe { &*(data as *const DrmModeCursor) };
+                // `drm_mode_cursor_common` finds the CRTC before it reads the
+                // flags: "Unknown CRTC ID" is ENOENT. The id was not looked
+                // at, so a cursor aimed at a CRTC that does not exist moved the
+                // one that does.
+                if drm::get_crtc(cur.crtc_id).is_none() {
+                    return Err(FsError::EntryNotFound);
+                }
                 let mut changed = false;
                 if cur.flags & DRM_MODE_CURSOR_BO != 0 {
                     // Linux: a cursor larger than DRM_CAP_CURSOR_WIDTH/HEIGHT
@@ -1826,7 +1937,10 @@ impl DrmDev {
                     res.count_encoders = 0;
                     return Ok(0);
                 }
-                let (fbs, crtcs, connectors) = drm::get_resources();
+                let (_, crtcs, connectors) = drm::get_resources();
+                // The caller's framebuffers, as `drm_mode_getresources` walks
+                // `file_priv->fbs`; the whole table went to everyone.
+                let fbs = drm::framebuffer_ids_for(drm::current_pid());
 
                 if res.fb_id_ptr != 0 && res.count_fbs >= fbs.len() as u32 {
                     ucheck_n::<u32>(res.fb_id_ptr as usize, fbs.len())?;
@@ -1994,16 +2108,23 @@ impl DrmDev {
                     // trace: a retry loop on a refused id must not storm klog.
                     if wsi_trace_take() {
                         kernel_hal::klog_info!(
-                            "[drm-wsi] GETCONNECTOR id={} -> NOT FOUND (EINVAL)",
+                            "[drm-wsi] GETCONNECTOR id={} -> NOT FOUND (ENOENT)",
                             conn_res.connector_id
                         );
                     }
-                    Err(FsError::InvalidParam)
+                    // ENOENT, as `drm_mode_getconnector`'s lookup answers.
+                    Err(FsError::EntryNotFound)
                 }
             }
             DRM_IOCTL_MODE_GETENCODER => {
                 let enc = unsafe { &mut *(data as *mut DrmModeGetEncoder) };
-                enc.encoder_id = drm::SYNTH_ENCODER_ID;
+                // There is one encoder, the synthetic one GETRESOURCES and
+                // GETCONNECTOR name; `drm_mode_getencoder` answers ENOENT for
+                // any other id. This arm answered every id with that encoder,
+                // rewriting the id the client asked about.
+                if enc.encoder_id != drm::SYNTH_ENCODER_ID {
+                    return Err(FsError::EntryNotFound);
+                }
                 // DRM_MODE_ENCODER_VIRTUAL=6: correct type for a software/
                 // virtual encoder that drives a dumb-buffer scanout path.
                 // Reporting NONE(0) causes some compositors to skip property
@@ -2046,11 +2167,12 @@ impl DrmDev {
                 } else {
                     if wsi_trace_take() {
                         kernel_hal::klog_info!(
-                            "[drm-wsi] GETCRTC id={} -> NOT FOUND (EINVAL)",
+                            "[drm-wsi] GETCRTC id={} -> NOT FOUND (ENOENT)",
                             crtc_res.crtc_id
                         );
                     }
-                    Err(FsError::InvalidParam)
+                    // ENOENT, as `drm_mode_getcrtc`'s lookup answers.
+                    Err(FsError::EntryNotFound)
                 }
             }
             DRM_IOCTL_MODE_GETPLANERESOURCES => {
@@ -2093,11 +2215,12 @@ impl DrmDev {
                 } else {
                     if wsi_trace_take() {
                         kernel_hal::klog_info!(
-                            "[drm-wsi] GETPLANE id={} -> NOT FOUND (EINVAL)",
+                            "[drm-wsi] GETPLANE id={} -> NOT FOUND (ENOENT)",
                             res.plane_id
                         );
                     }
-                    Err(FsError::InvalidParam)
+                    // ENOENT, as `drm_mode_getplane`'s lookup answers.
+                    Err(FsError::EntryNotFound)
                 }
             }
             DRM_IOCTL_MODE_OBJ_GETPROPERTIES => {
@@ -2117,12 +2240,18 @@ impl DrmDev {
                     crtc_props(atomic)
                 } else if drm::get_connector(res.obj_id).is_some() {
                     connector_props(res.obj_id, atomic)
-                } else {
-                    // Encoders exist but carry no properties; anything
-                    // else is unknown. Keep the historical empty-list
-                    // answer (Linux: EINVAL/ENOENT) — some clients probe
-                    // every id returned by GETRESOURCES.
+                } else if res.obj_id == drm::SYNTH_ENCODER_ID {
+                    // The encoder exists but carries no properties. Linux
+                    // answers EINVAL for an object without a property list;
+                    // keep the historical empty list, since GETRESOURCES
+                    // names this id and some clients probe every id it
+                    // returns.
                     alloc::vec::Vec::new()
+                } else {
+                    // Anything else is no object at all: ENOENT, as
+                    // `drm_mode_obj_get_properties_ioctl`'s lookup answers.
+                    // This used to be the same empty list as the encoder's.
+                    return Err(FsError::EntryNotFound);
                 };
                 let n = props.len();
                 // Both output arrays are written below, so both pointers must be
@@ -2238,10 +2367,14 @@ impl DrmDev {
                         res.length = edid.len() as u32;
                         Ok(0)
                     } else {
-                        Err(FsError::InvalidParam)
+                        // The connector has no EDID, so no blob carries this
+                        // id: ENOENT, as `drm_property_lookup_blob` answers.
+                        Err(FsError::EntryNotFound)
                     }
                 } else {
-                    Err(FsError::InvalidParam)
+                    // No blob carries this id: ENOENT, as
+                    // `drm_property_lookup_blob` answers. Both were EINVAL.
+                    Err(FsError::EntryNotFound)
                 }
             }
             DRM_IOCTL_MODE_CREATEPROPBLOB => {
@@ -4036,6 +4169,35 @@ struct DrmModeFbCmd2 {
     modifier: [u64; 4],
 }
 
+/// The fourcc `drm_mode_legacy_fb_format` derives from an `ADDFB`'s
+/// (`bpp`, `depth`), or `None` for a pair it does not know
+/// (`DRM_FORMAT_INVALID`, which `drm_mode_addfb` turns into EINVAL). The
+/// formats other than the two [`drm::SCANOUT_FORMATS`] are real fourccs that
+/// [`addfb2_check`] then refuses, exactly as Linux refuses them on a device
+/// whose planes do not scan them out.
+fn legacy_fb_format(bpp: u32, depth: u32) -> Option<u32> {
+    /// `DRM_FORMAT_C8`
+    const C8: u32 = 0x2020_3843;
+    /// `DRM_FORMAT_XRGB1555`
+    const XRGB1555: u32 = 0x3531_5258;
+    /// `DRM_FORMAT_RGB565`
+    const RGB565: u32 = 0x3631_4752;
+    /// `DRM_FORMAT_RGB888`
+    const RGB888: u32 = 0x3432_4752;
+    /// `DRM_FORMAT_XRGB2101010`
+    const XRGB2101010: u32 = 0x3033_5258;
+    Some(match (bpp, depth) {
+        (8, 8) => C8,
+        (16, 15) => XRGB1555,
+        (16, 16) => RGB565,
+        (24, 24) => RGB888,
+        (32, 24) => drm::DRM_FORMAT_XRGB8888,
+        (32, 30) => XRGB2101010,
+        (32, 32) => drm::DRM_FORMAT_ARGB8888,
+        _ => return None,
+    })
+}
+
 /// `drm_mode_fb_cmd2.flags`: the two Linux knows. Anything else is EINVAL.
 const DRM_MODE_FB_INTERLACED: u32 = 1 << 0;
 const DRM_MODE_FB_MODIFIERS: u32 = 1 << 1;
@@ -4543,6 +4705,16 @@ struct PropSpec {
 /// The property table of the synthetic pipeline. Names, types and ranges
 /// match Linux's standard properties (`drm_mode_create_standard_properties`,
 /// `drm_plane_create_*`, `drm_connector_create_standard_properties`).
+/// Whether `id` names a mode object a client can set a property on: a plane,
+/// a CRTC, a connector or the one encoder. What `drm_mode_object_get` with
+/// `DRM_MODE_OBJECT_ANY` finds.
+fn mode_object_exists(id: u32) -> bool {
+    id == drm::SYNTH_ENCODER_ID
+        || drm::get_plane(id).is_some()
+        || drm::get_crtc(id).is_some()
+        || drm::get_connector(id).is_some()
+}
+
 fn prop_spec(prop_id: u32) -> Option<PropSpec> {
     Some(match prop_id {
         PROP_TYPE => PropSpec {
@@ -6326,6 +6498,7 @@ mod ioctl_size_reconciliation_tests {
 #[cfg(test)]
 mod gl_client_sequence_tests {
     use super::*;
+    use crate::fs::devfs::kms_emu;
 
     /// One open DRM file, driven the way libdrm drives it: a request number and
     /// a pointer to a struct the caller owns. Deliberately NOT a set of direct
@@ -6535,7 +6708,10 @@ mod gl_client_sequence_tests {
     /// once.
     #[test]
     fn one_frame_allocates_wraps_flips_and_gets_its_completion() {
-        let _serialised = drm::test_globals::lock();
+        // An output, so CRTC 1 exists: `PAGE_FLIP` looks the CRTC up first,
+        // as Linux does, and a card with nothing to scan out reports no
+        // CRTC at all. The screen holds the DRM test lock.
+        let _screen = kms_emu::attach(64, 64);
         let client = Client::open(0);
         let before = table_sizes();
 
@@ -6547,9 +6723,7 @@ mod gl_client_sequence_tests {
 
         let fb = client.addfb2(&buf);
 
-        // The flip itself. There is no display to blit into, and the arms treat
-        // that as a frame that could not be copied rather than a modeset that
-        // failed -- so a flip is still accepted and still owes an event.
+        // The flip itself, onto the emulated output; it owes an event.
         assert_eq!(client.page_flip(1, fb, 0xDEAD_BEEF), Ok(0));
 
         // The completion is scheduled for the next synthetic vblank, and
@@ -6587,7 +6761,8 @@ mod gl_client_sequence_tests {
     /// above passes happily with a flip counter that never decrements.
     #[test]
     fn a_double_buffered_loop_runs_clean_for_many_frames() {
-        let _serialised = drm::test_globals::lock();
+        // Same output as the single frame above, for the same reason.
+        let _screen = kms_emu::attach(64, 64);
         let client = Client::open(0);
         let before = table_sizes();
 
@@ -11617,6 +11792,264 @@ mod hw_kms_tests {
         assert_eq!(drm::get_connector_edid(41), Some(completed));
         drop(gpu);
     }
+
+    /// A zeroed ioctl argument, for the arms whose structs have no
+    /// `Default`. All of them are `repr(C)` integers, for which zero is a
+    /// value.
+    fn zeroed<T: Copy>() -> T {
+        // SAFETY: every struct this is used for is plain integers.
+        unsafe { core::mem::zeroed() }
+    }
+
+    /// Every mode-object lookup Linux answers ENOENT for an id that does not
+    /// exist (`drm_mode_object_find` and its typed wrappers), and the one
+    /// encoder is the only encoder. Here GETCRTC, GETPLANE, GETCONNECTOR,
+    /// GETPROPBLOB and CLOSEFB said EINVAL; GETENCODER answered any id with
+    /// the synthetic encoder and rewrote the id; OBJ_GETPROPERTIES gave an
+    /// unknown id the encoder's empty list; and SETPLANE, CURSOR, the gamma
+    /// pair, OBJ_SETPROPERTY and SETPROPERTY never looked the object up at
+    /// all and reported success. The ids the client really has keep
+    /// working.
+    #[test]
+    fn unknown_mode_object_ids_answer_enoent_like_linux() {
+        let screen = kms_emu::attach(32, 8);
+        let _gpu = screen.attach_gpu(EmuGpu::hardware_kms("emu-gpu").with_ids(60, 61, 62));
+        let c = Client::open(0);
+        const BOGUS: u32 = 4242;
+        let enoent = Err(FsError::EntryNotFound);
+
+        // GETCRTC / GETPLANE / GETCONNECTOR: the typed lookups.
+        let mut crtc: DrmModeGetCrtc = zeroed();
+        crtc.crtc_id = BOGUS;
+        assert_eq!(c.ioctl(DRM_IOCTL_MODE_GETCRTC, &mut crtc), enoent);
+        crtc.crtc_id = 60;
+        assert_eq!(c.ioctl(DRM_IOCTL_MODE_GETCRTC, &mut crtc), Ok(0));
+
+        let mut plane: DrmModeGetPlane = zeroed();
+        plane.plane_id = BOGUS;
+        assert_eq!(c.ioctl(DRM_IOCTL_MODE_GETPLANE, &mut plane), enoent);
+        plane.plane_id = 62;
+        assert_eq!(c.ioctl(DRM_IOCTL_MODE_GETPLANE, &mut plane), Ok(0));
+
+        let mut conn: DrmModeGetConnector = zeroed();
+        conn.connector_id = BOGUS;
+        assert_eq!(c.ioctl(DRM_IOCTL_MODE_GETCONNECTOR, &mut conn), enoent);
+        conn.connector_id = 61;
+        assert_eq!(c.ioctl(DRM_IOCTL_MODE_GETCONNECTOR, &mut conn), Ok(0));
+
+        // GETENCODER: one encoder, and an unknown id is not renamed to it.
+        let mut enc: DrmModeGetEncoder = zeroed();
+        enc.encoder_id = BOGUS;
+        assert_eq!(c.ioctl(DRM_IOCTL_MODE_GETENCODER, &mut enc), enoent);
+        assert_eq!(
+            enc.encoder_id, BOGUS,
+            "the id the client asked about was rewritten"
+        );
+        enc.encoder_id = drm::SYNTH_ENCODER_ID;
+        assert_eq!(c.ioctl(DRM_IOCTL_MODE_GETENCODER, &mut enc), Ok(0));
+        assert_eq!(enc.encoder_id, drm::SYNTH_ENCODER_ID);
+
+        // OBJ_GETPROPERTIES: an unknown id is not "an object with no
+        // properties"; the encoder still is.
+        let mut props: DrmModeObjGetProperties = zeroed();
+        props.obj_id = BOGUS;
+        assert_eq!(
+            c.ioctl(DRM_IOCTL_MODE_OBJ_GETPROPERTIES, &mut props),
+            enoent
+        );
+        props.obj_id = drm::SYNTH_ENCODER_ID;
+        assert_eq!(c.ioctl(DRM_IOCTL_MODE_OBJ_GETPROPERTIES, &mut props), Ok(0));
+        assert_eq!(props.count_props, 0, "the encoder carries no properties");
+        props.obj_id = 61;
+        assert_eq!(c.ioctl(DRM_IOCTL_MODE_OBJ_GETPROPERTIES, &mut props), Ok(0));
+        assert!(props.count_props > 0, "the connector does");
+
+        // GETPROPBLOB: neither a blob id nor an EDID id of a connector that
+        // does not exist.
+        let mut blob: DrmModeGetBlob = zeroed();
+        blob.blob_id = BOGUS;
+        assert_eq!(c.ioctl(DRM_IOCTL_MODE_GETPROPBLOB, &mut blob), enoent);
+        blob.blob_id = edid_blob_id(BOGUS);
+        assert_eq!(c.ioctl(DRM_IOCTL_MODE_GETPROPBLOB, &mut blob), enoent);
+
+        // CLOSEFB, like RMFB.
+        let mut fb_id = BOGUS;
+        assert_eq!(c.ioctl(DRM_IOCTL_MODE_CLOSEFB, &mut fb_id), enoent);
+
+        // SETPLANE looks the plane up first; disabling the real one is fine.
+        let mut set_plane: DrmModeSetPlane = zeroed();
+        set_plane.plane_id = BOGUS;
+        set_plane.crtc_id = 60;
+        assert_eq!(c.ioctl(DRM_IOCTL_MODE_SETPLANE, &mut set_plane), enoent);
+        set_plane.plane_id = 62;
+        assert_eq!(c.ioctl(DRM_IOCTL_MODE_SETPLANE, &mut set_plane), Ok(0));
+
+        // CURSOR: "Unknown CRTC ID".
+        let mut cur = ModeCursor {
+            flags: 0x02, // MOVE
+            crtc_id: BOGUS,
+            x: 1,
+            y: 1,
+            width: 0,
+            height: 0,
+            handle: 0,
+        };
+        assert_eq!(c.ioctl(DRM_IOCTL_MODE_CURSOR, &mut cur), enoent);
+        cur.crtc_id = 60;
+        assert_eq!(c.ioctl(DRM_IOCTL_MODE_CURSOR, &mut cur), Ok(0));
+
+        // GETGAMMA / SETGAMMA: `struct drm_mode_crtc_lut` starts with the
+        // CRTC id.
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        struct CrtcLut {
+            crtc_id: u32,
+            gamma_size: u32,
+            red: u64,
+            green: u64,
+            blue: u64,
+        }
+        let mut lut: CrtcLut = zeroed();
+        lut.crtc_id = BOGUS;
+        assert_eq!(c.ioctl(DRM_IOCTL_MODE_GETGAMMA, &mut lut), enoent);
+        assert_eq!(c.ioctl(DRM_IOCTL_MODE_SETGAMMA, &mut lut), enoent);
+        lut.crtc_id = 60;
+        assert_eq!(c.ioctl(DRM_IOCTL_MODE_GETGAMMA, &mut lut), Ok(0));
+        assert_eq!(c.ioctl(DRM_IOCTL_MODE_SETGAMMA, &mut lut), Ok(0));
+
+        // OBJ_SETPROPERTY: the object and the property must both exist.
+        let mut set = DrmModeObjSetProperty {
+            value: DRM_MODE_DPMS_ON,
+            prop_id: PROP_DPMS,
+            obj_id: BOGUS,
+            obj_type: 0,
+        };
+        assert_eq!(c.ioctl(DRM_IOCTL_MODE_OBJ_SETPROPERTY, &mut set), enoent);
+        set.obj_id = 61;
+        set.prop_id = BOGUS;
+        assert_eq!(c.ioctl(DRM_IOCTL_MODE_OBJ_SETPROPERTY, &mut set), enoent);
+        set.prop_id = PROP_DPMS;
+        assert_eq!(c.ioctl(DRM_IOCTL_MODE_OBJ_SETPROPERTY, &mut set), Ok(0));
+
+        // SETPROPERTY: `struct drm_mode_connector_set_property`.
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        struct ConnectorSetProperty {
+            value: u64,
+            prop_id: u32,
+            connector_id: u32,
+        }
+        let mut cset = ConnectorSetProperty {
+            value: DRM_MODE_DPMS_ON,
+            prop_id: PROP_DPMS,
+            connector_id: BOGUS,
+        };
+        assert_eq!(c.ioctl(DRM_IOCTL_MODE_SETPROPERTY, &mut cset), enoent);
+        cset.connector_id = 61;
+        cset.prop_id = BOGUS;
+        assert_eq!(c.ioctl(DRM_IOCTL_MODE_SETPROPERTY, &mut cset), enoent);
+        cset.prop_id = PROP_DPMS;
+        assert_eq!(c.ioctl(DRM_IOCTL_MODE_SETPROPERTY, &mut cset), Ok(0));
+    }
+
+    /// `drm_mode_setcrtc` finds the CRTC first and every connector it is
+    /// handed (ENOENT), and refuses a connector list with no mode or no fb
+    /// to set, or longer than the card's connectors (EINVAL);
+    /// `drm_mode_page_flip_ioctl` and `drm_mode_setplane` find the CRTC
+    /// too. None of the three read the CRTC id, and SETCRTC never read its
+    /// connector list: a modeset or a flip aimed at a CRTC the card does not
+    /// have landed on the one it has. The real ids keep working.
+    #[test]
+    fn setcrtc_page_flip_and_setplane_look_the_crtc_and_the_connectors_up() {
+        let screen = kms_emu::attach(32, 8);
+        let _gpu = screen.attach_gpu(EmuGpu::hardware_kms("emu-gpu").with_ids(60, 61, 62));
+        let c = Client::open(0);
+        const BOGUS: u32 = 4242;
+        let enoent = Err(FsError::EntryNotFound);
+        let buf = c.create_dumb(32, 8);
+        paint(&buf, 0x0000_3333);
+        let fb = c.addfb2(&buf);
+        // What the CRTC shows before this test touches it (the core's
+        // `crtc_fb` is process-wide, so it may carry a neighbour's id).
+        let before = get_crtc_fb(&c, 60);
+        assert_ne!(before, fb);
+
+        let setcrtc = |crtc_id: u32, connectors: &[u32], mode_valid: u32, fb_id: u32| {
+            let mut req = DrmModeGetCrtc {
+                set_connectors_ptr: connectors.as_ptr() as u64,
+                count_connectors: connectors.len() as u32,
+                crtc_id,
+                fb_id,
+                x: 0,
+                y: 0,
+                gamma_size: 0,
+                mode_valid,
+                mode: make_modeinfo(32, 8),
+            };
+            c.ioctl(DRM_IOCTL_MODE_SETCRTC, &mut req)
+        };
+        assert_eq!(
+            setcrtc(BOGUS, &[61], 1, fb),
+            enoent,
+            "a CRTC the card does not have"
+        );
+        assert_eq!(
+            setcrtc(60, &[BOGUS], 1, fb),
+            enoent,
+            "a connector it does not have"
+        );
+        assert_eq!(
+            setcrtc(60, &[61, BOGUS], 1, fb),
+            Err(FsError::InvalidParam),
+            "more connectors than the card has"
+        );
+        assert_eq!(
+            setcrtc(60, &[61], 0, fb),
+            Err(FsError::InvalidParam),
+            "connectors but no mode"
+        );
+        assert_eq!(
+            setcrtc(60, &[61], 1, 0),
+            Err(FsError::InvalidParam),
+            "connectors but no fb"
+        );
+        assert_eq!(
+            get_crtc_fb(&c, 60),
+            before,
+            "a refused modeset presented anyway"
+        );
+        assert_eq!(
+            setcrtc(60, &[61], 1, fb),
+            Ok(0),
+            "the real CRTC and connector"
+        );
+        assert_eq!(get_crtc_fb(&c, 60), fb);
+
+        let mut flip = DrmModeCrtcPageFlip {
+            crtc_id: BOGUS,
+            fb_id: fb,
+            flags: 0x01, // DRM_MODE_PAGE_FLIP_EVENT
+            reserved: 0,
+            user_data: 7,
+        };
+        assert_eq!(c.ioctl(DRM_IOCTL_MODE_PAGE_FLIP, &mut flip), enoent);
+        let mut events = [0u8; 256];
+        assert!(
+            matches!(c.read_events(&mut events), Err(_) | Ok(0)),
+            "a refused flip queued a completion"
+        );
+
+        let mut set_plane: DrmModeSetPlane = zeroed();
+        set_plane.plane_id = 62;
+        set_plane.crtc_id = BOGUS;
+        set_plane.fb_id = fb;
+        assert_eq!(c.ioctl(DRM_IOCTL_MODE_SETPLANE, &mut set_plane), enoent);
+        set_plane.crtc_id = 60;
+        assert_eq!(c.ioctl(DRM_IOCTL_MODE_SETPLANE, &mut set_plane), Ok(0));
+
+        c.rmfb(fb).expect("RMFB");
+        c.destroy_dumb(buf.handle).expect("DESTROY_DUMB");
+    }
 }
 
 #[cfg(test)]
@@ -15174,6 +15607,119 @@ mod addfb2_validation_tests {
 
         assert_eq!(client.destroy_dumb(buf.handle), Ok(0));
     }
+
+    /// `ADDFB` with `bpp`/`depth`, and the framebuffer table before and
+    /// after.
+    fn addfb(
+        client: &Client,
+        buf: &DrmModeCreateDumb,
+        bpp: u32,
+        depth: u32,
+    ) -> (Result<usize>, u32, usize, usize) {
+        let mut cmd = DrmModeFbCmd {
+            fb_id: 0,
+            width: buf.width,
+            height: buf.height,
+            pitch: buf.pitch,
+            bpp,
+            depth,
+            handle: buf.handle,
+        };
+        let before = drm::table_sizes_for_test().0;
+        let r = client.ioctl(DRM_IOCTL_MODE_ADDFB, &mut cmd);
+        (r, cmd.fb_id, before, drm::table_sizes_for_test().0)
+    }
+
+    /// `drm_mode_legacy_fb_format`'s table, and nothing outside it.
+    #[test]
+    fn the_legacy_bpp_depth_table_is_linuxs() {
+        assert_eq!(legacy_fb_format(32, 24), Some(drm::DRM_FORMAT_XRGB8888));
+        assert_eq!(legacy_fb_format(32, 32), Some(drm::DRM_FORMAT_ARGB8888));
+        // Real formats no plane here scans out: fourccs, spelled as Linux
+        // spells them.
+        assert_eq!(legacy_fb_format(8, 8), Some(u32::from_le_bytes(*b"C8  ")));
+        assert_eq!(legacy_fb_format(16, 15), Some(u32::from_le_bytes(*b"XR15")));
+        assert_eq!(legacy_fb_format(16, 16), Some(u32::from_le_bytes(*b"RG16")));
+        assert_eq!(legacy_fb_format(24, 24), Some(u32::from_le_bytes(*b"RG24")));
+        assert_eq!(legacy_fb_format(32, 30), Some(u32::from_le_bytes(*b"XR30")));
+        for (bpp, depth) in [
+            (0, 0),
+            (32, 16),
+            (16, 24),
+            (24, 32),
+            (64, 64),
+            (32, 0),
+            (0, 24),
+        ] {
+            assert_eq!(legacy_fb_format(bpp, depth), None, "{bpp}/{depth}");
+        }
+    }
+
+    /// The legacy `ADDFB` is an `ADDFB2` with the fourcc derived from
+    /// (bpp, depth): 32/24 registers XRGB8888 and 32/32 ARGB8888 (`GETFB2`
+    /// gives the format back and `GETFB` the depth), every other pair is
+    /// EINVAL with no framebuffer created, whether the table knows it
+    /// (16/16 is RGB565, which nothing here scans out) or not (32/16), and
+    /// a pitch shorter than a row is refused as it is on `ADDFB2`. This
+    /// arm read neither field: a 16-bit framebuffer scanned out as
+    /// XRGB8888 garbage, and an ARGB8888 one came back as depth 24.
+    #[test]
+    fn legacy_addfb_derives_the_format_from_bpp_and_depth() {
+        let _serialised = drm::test_globals::lock();
+        let client = Client::open(0);
+        let buf = client.create_dumb(64, 64);
+
+        let (r, fb, before, after) = addfb(&client, &buf, 32, 24);
+        assert_eq!(r, Ok(0));
+        assert_eq!(after, before + 1);
+        assert_eq!(getfb2(&client, fb).pixel_format, drm::DRM_FORMAT_XRGB8888);
+        assert_eq!(getfb_depth(&client, fb), 24);
+        assert_eq!(client.rmfb(fb), Ok(0));
+
+        let (r, fb, before, after) = addfb(&client, &buf, 32, 32);
+        assert_eq!(r, Ok(0));
+        assert_eq!(after, before + 1);
+        assert_eq!(getfb2(&client, fb).pixel_format, drm::DRM_FORMAT_ARGB8888);
+        assert_eq!(getfb_depth(&client, fb), 32, "32/32 is ARGB8888, depth 32");
+        assert_eq!(client.rmfb(fb), Ok(0));
+
+        for (bpp, depth) in [
+            (16, 16),
+            (16, 15),
+            (24, 24),
+            (8, 8),
+            (32, 30),
+            (32, 16),
+            (0, 0),
+        ] {
+            let (r, fb, before, after) = addfb(&client, &buf, bpp, depth);
+            assert_eq!(r, Err(FsError::InvalidParam), "{bpp}/{depth}: not EINVAL");
+            assert_eq!(fb, 0, "{bpp}/{depth}: an fb id came back with the error");
+            assert_eq!(
+                after, before,
+                "{bpp}/{depth}: a framebuffer was created anyway"
+            );
+        }
+
+        // The ADDFB2 checks apply to the legacy form too: a pitch shorter
+        // than a row of 4-byte pixels.
+        let mut short = DrmModeFbCmd {
+            fb_id: 0,
+            width: buf.width,
+            height: buf.height,
+            pitch: buf.width * 4 - 4,
+            bpp: 32,
+            depth: 24,
+            handle: buf.handle,
+        };
+        assert_eq!(
+            client.ioctl(DRM_IOCTL_MODE_ADDFB, &mut short),
+            Err(FsError::InvalidParam)
+        );
+        assert_eq!(short.fb_id, 0);
+
+        assert_eq!(client.destroy_dumb(buf.handle), Ok(0));
+    }
 }
 
 #[cfg(test)]
@@ -15412,5 +15958,289 @@ mod pre_wait_resolve_tests {
                 kind
             );
         }
+    }
+}
+
+/// Mesa's `VK_KHR_display` probe, driven exactly as libdrm and `wsi_display`
+/// drive it.
+///
+/// `vulkaninfo` dies on this machine's RTX pair with
+/// `vkGetPhysicalDeviceDisplayPlanePropertiesKHR failed with
+/// ERROR_OUT_OF_HOST_MEMORY`, and that code is not a memory shortage: Mesa's
+/// `wsi_get_connectors` returns it when `drmModeGetResources` OR
+/// `drmModeGetConnector` hands back NULL, and libdrm hands back NULL when the
+/// ioctl fails. So the whole error is "one of two KMS queries returned an
+/// errno", and the only way to see which from here is to make the two-pass
+/// sequence libdrm actually makes -- `memclear`, probe for the counts,
+/// allocate, ask again -- rather than the one-shot call the rest of these
+/// tests make.
+#[cfg(test)]
+mod wsi_display_probe_tests {
+    use super::gl_client_sequence_tests::{blank_card_res, Client};
+    use super::*;
+    use crate::fs::devfs::kms_emu::{self, EmuGpu};
+    use alloc::vec::Vec;
+
+    fn blank_connector(id: u32) -> DrmModeGetConnector {
+        DrmModeGetConnector {
+            encoders_ptr: 0,
+            modes_ptr: 0,
+            props_ptr: 0,
+            prop_values_ptr: 0,
+            count_modes: 0,
+            count_props: 0,
+            count_encoders: 0,
+            encoder_id: 0,
+            connector_id: id,
+            connector_type: 0,
+            connector_type_id: 0,
+            connection: 0,
+            mm_width: 0,
+            mm_height: 0,
+            subpixel: 0,
+            pad: 0,
+        }
+    }
+
+    /// `drmModeGetResources`, pass for pass. `None` is libdrm's NULL.
+    fn drm_mode_get_resources(c: &Client) -> Option<(Vec<u32>, Vec<u32>, u32)> {
+        for _ in 0..4 {
+            let mut res = blank_card_res();
+            c.ioctl(DRM_IOCTL_MODE_GETRESOURCES, &mut res).ok()?;
+            let counts = res;
+            let mut crtcs = alloc::vec![0u32; res.count_crtcs as usize];
+            let mut conns = alloc::vec![0u32; res.count_connectors as usize];
+            let mut encs = alloc::vec![0u32; res.count_encoders as usize];
+            if res.count_crtcs != 0 {
+                res.crtc_id_ptr = crtcs.as_mut_ptr() as u64;
+            }
+            if res.count_connectors != 0 {
+                res.connector_id_ptr = conns.as_mut_ptr() as u64;
+            }
+            if res.count_encoders != 0 {
+                res.encoder_id_ptr = encs.as_mut_ptr() as u64;
+            }
+            c.ioctl(DRM_IOCTL_MODE_GETRESOURCES, &mut res).ok()?;
+            if counts.count_crtcs < res.count_crtcs
+                || counts.count_connectors < res.count_connectors
+                || counts.count_encoders < res.count_encoders
+            {
+                continue; // libdrm's `goto retry`
+            }
+            // libdrm copies out only as many ids as the FILL pass reported
+            // (`drmAllocCpy(ptr, res.count_x, ...)`), so a count that SHRANK
+            // between the passes leaves the tail of the probe-sized buffer
+            // untouched -- and a helper that returned it whole would hand the
+            // caller trailing zeros and probe connector 0.
+            crtcs.truncate(res.count_crtcs as usize);
+            conns.truncate(res.count_connectors as usize);
+            return Some((crtcs, conns, res.count_encoders));
+        }
+        None
+    }
+
+    /// `drmModeGetConnector`, pass for pass. `None` is libdrm's NULL, which is
+    /// what Mesa turns into `VK_ERROR_OUT_OF_HOST_MEMORY`.
+    fn drm_mode_get_connector(c: &Client, id: u32) -> Option<(u32, u32, Vec<u32>)> {
+        for _ in 0..4 {
+            let mut conn = blank_connector(id);
+            c.ioctl(DRM_IOCTL_MODE_GETCONNECTOR, &mut conn).ok()?;
+            let counts = conn;
+            let mut props = alloc::vec![0u32; conn.count_props as usize];
+            let mut prop_values = alloc::vec![0u64; conn.count_props as usize];
+            let mut modes = alloc::vec![0u8; conn.count_modes as usize * 68];
+            let mut encoders = alloc::vec![0u32; conn.count_encoders as usize];
+            if conn.count_props != 0 {
+                conn.props_ptr = props.as_mut_ptr() as u64;
+                conn.prop_values_ptr = prop_values.as_mut_ptr() as u64;
+            }
+            if conn.count_modes != 0 {
+                conn.modes_ptr = modes.as_mut_ptr() as u64;
+            }
+            if conn.count_encoders != 0 {
+                conn.encoders_ptr = encoders.as_mut_ptr() as u64;
+            }
+            c.ioctl(DRM_IOCTL_MODE_GETCONNECTOR, &mut conn).ok()?;
+            if counts.count_props < conn.count_props
+                || counts.count_modes < conn.count_modes
+                || counts.count_encoders < conn.count_encoders
+            {
+                continue;
+            }
+            props.truncate(conn.count_props as usize);
+            return Some((conn.connection, conn.count_modes, props));
+        }
+        None
+    }
+
+    /// Mesa's `wsi_get_connectors`: every id `drmModeGetResources` advertised
+    /// has to answer `drmModeGetConnector`, or the whole `VK_KHR_display`
+    /// query dies with `ERROR_OUT_OF_HOST_MEMORY`.
+    fn wsi_get_connectors(c: &Client) -> core::result::Result<usize, &'static str> {
+        let (_, conns, _) = drm_mode_get_resources(c).ok_or("drmModeGetResources -> NULL")?;
+        for id in &conns {
+            if drm_mode_get_connector(c, *id).is_none() {
+                return Err("drmModeGetConnector -> NULL");
+            }
+        }
+        Ok(conns.len())
+    }
+
+    #[test]
+    fn vulkaninfo_probes_the_software_kms_topology_without_an_error() {
+        let _screen = kms_emu::attach(640, 480);
+        let c = Client::open(0);
+        assert_eq!(wsi_get_connectors(&c), Ok(1));
+    }
+
+    #[test]
+    fn vulkaninfo_probes_a_hardware_kms_gpu_without_an_error() {
+        let screen = kms_emu::attach(640, 480);
+        let _gpu = screen.attach_gpu(EmuGpu::hardware_kms("emu-gpu"));
+        let c = Client::open(0);
+        assert!(
+            wsi_get_connectors(&c).is_ok(),
+            "{:?}",
+            wsi_get_connectors(&c)
+        );
+    }
+
+    /// The invariant: an id GETRESOURCES advertised stays answerable even if
+    /// scanout ownership changes before the client's next ioctl.
+    ///
+    /// The lookups used to ask `software_kms_active()` before deciding whether
+    /// a DRIVER id was answerable AT ALL, and the fallback behind that gate
+    /// only knows the synthetic ids (1..4). So a client that read the topology
+    /// with the driver owning scanout got driver ids, and the moment the
+    /// answer flipped, every one of them came back EINVAL. Mesa's
+    /// `wsi_get_connectors` reports a miss on an advertised id as
+    /// `VK_ERROR_OUT_OF_HOST_MEMORY` for the whole `VK_KHR_display` query.
+    ///
+    /// On the flip's DIRECTION, because it matters for what this does and does
+    /// not claim: in production `software_kms_active()` is
+    /// `primary_display().is_some() && !drivers.first().has_hardware_kms()`,
+    /// and the NVIDIA driver's `has_hardware_kms()` is
+    /// `surfaceflip_enabled() && hwflip_ready()`. `g_hwflip.ready` is only
+    /// ever assigned `NV_TRUE` and never cleared
+    /// (`nvidia-rm-sys/vendor/eclipse_rm_init.c`), so THAT lever moves
+    /// `software_kms_active()` true -> false only, which is the harmless
+    /// direction: the synthetic fallback still answers the synthetic ids. The
+    /// levers that can move it the other way are the boot framebuffer
+    /// appearing and `register_driver` putting a different driver at index 0,
+    /// both of which are boot-time events here. So this is a latent hole, not
+    /// a proven cause of anything; the emulator moves the KMS flag because it
+    /// is the one lever it has, and the code under test reads nothing but
+    /// `software_kms_active()`.
+    #[test]
+    fn a_connector_stays_answerable_when_scanout_moves_mid_probe() {
+        let screen = kms_emu::attach(640, 480);
+        let gpu = screen.attach_gpu(EmuGpu::hardware_kms("gpu0").with_ids(2001, 1001, 3001));
+        let c = Client::open(0);
+
+        // What `drmModeGetResources` advertised while the driver owned scanout.
+        let (crtcs, conns, _) = drm_mode_get_resources(&c).expect("GETRESOURCES");
+        assert_eq!(conns, alloc::vec![1001]);
+        assert_eq!(crtcs, alloc::vec![2001]);
+        assert_eq!(drm_mode_get_plane_resources(&c), alloc::vec![3001]);
+
+        // The flip ladder goes away between the two ioctls, as it does when
+        // `hwflip_ready()` has not latched yet.
+        gpu.set_hardware_kms(false);
+
+        assert!(
+            drm_mode_get_connector(&c, 1001).is_some(),
+            "GETCONNECTOR refused an id GETRESOURCES had just advertised: \
+             that is the EINVAL Mesa reports as ERROR_OUT_OF_HOST_MEMORY"
+        );
+        assert_eq!(wsi_get_connectors(&c), Ok(1));
+
+        // The same window exists for the other two object types a compositor
+        // reads back after GETRESOURCES/GETPLANERESOURCES.
+        let mut crtc = blank_get_crtc(2001);
+        assert!(
+            c.ioctl(DRM_IOCTL_MODE_GETCRTC, &mut crtc).is_ok(),
+            "GETCRTC refused an advertised CRTC id"
+        );
+        let mut plane = blank_get_plane(3001);
+        assert!(
+            c.ioctl(DRM_IOCTL_MODE_GETPLANE, &mut plane).is_ok(),
+            "GETPLANE refused an advertised plane id"
+        );
+    }
+
+    fn blank_get_crtc(id: u32) -> DrmModeGetCrtc {
+        DrmModeGetCrtc {
+            set_connectors_ptr: 0,
+            count_connectors: 0,
+            crtc_id: id,
+            fb_id: 0,
+            x: 0,
+            y: 0,
+            gamma_size: 0,
+            mode_valid: 0,
+            mode: [0u8; 68],
+        }
+    }
+
+    fn blank_get_plane(id: u32) -> DrmModeGetPlane {
+        DrmModeGetPlane {
+            plane_id: id,
+            crtc_id: 0,
+            fb_id: 0,
+            possible_crtcs: 0,
+            gamma_size: 0,
+            count_format_types: 0,
+            format_type_ptr: 0,
+        }
+    }
+
+    /// `drmModeGetPlaneResources`, both passes.
+    fn drm_mode_get_plane_resources(c: &Client) -> Vec<u32> {
+        let mut probe = DrmModeGetPlaneRes {
+            plane_id_ptr: 0,
+            count_planes: 0,
+        };
+        c.ioctl(DRM_IOCTL_MODE_GETPLANERESOURCES, &mut probe)
+            .expect("GETPLANERESOURCES");
+        let mut ids = alloc::vec![0u32; probe.count_planes as usize];
+        let mut fill = DrmModeGetPlaneRes {
+            plane_id_ptr: ids.as_mut_ptr() as u64,
+            count_planes: probe.count_planes,
+        };
+        c.ioctl(DRM_IOCTL_MODE_GETPLANERESOURCES, &mut fill)
+            .expect("GETPLANERESOURCES fill");
+        ids
+    }
+
+    /// Two cards, as on the machine the bug was photographed on.
+    #[test]
+    fn vulkaninfo_probes_two_hardware_kms_gpus_without_an_error() {
+        let screen = kms_emu::attach(640, 480);
+        let _g0 = screen.attach_gpu(EmuGpu::hardware_kms("gpu0").with_ids(2001, 1001, 3001));
+        let _g1 = screen.attach_gpu(EmuGpu::hardware_kms("gpu1").with_ids(2101, 1101, 3101));
+        let c = Client::open(0);
+        assert!(
+            wsi_get_connectors(&c).is_ok(),
+            "{:?}",
+            wsi_get_connectors(&c)
+        );
+    }
+
+    /// Two cards of the SAME model, which is what is actually in the machine:
+    /// the driver returns the same synthetic ids from both, and
+    /// GETPLANERESOURCES used to list the id twice. `drmModeGetPlane` on
+    /// either entry answers with the one plane, so the second entry
+    /// contradicts the first. `get_resources` has de-duplicated CRTCs and
+    /// connectors for this reason all along; the plane list had not.
+    #[test]
+    fn two_cards_of_the_same_model_do_not_list_the_same_plane_twice() {
+        let screen = kms_emu::attach(640, 480);
+        let _g0 = screen.attach_gpu(EmuGpu::hardware_kms("gpu0").with_ids(2001, 1001, 3001));
+        let _g1 = screen.attach_gpu(EmuGpu::hardware_kms("gpu1").with_ids(2001, 1001, 3001));
+        let c = Client::open(0);
+        assert_eq!(drm_mode_get_plane_resources(&c), alloc::vec![3001]);
+        let (crtcs, conns, _) = drm_mode_get_resources(&c).expect("GETRESOURCES");
+        assert_eq!(crtcs, alloc::vec![2001]);
+        assert_eq!(conns, alloc::vec![1001]);
     }
 }

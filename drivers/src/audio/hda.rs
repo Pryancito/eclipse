@@ -1160,7 +1160,10 @@ impl HdaInner {
     /// lands long after PCI probe), zero the ring, prime [`FILL_DEPTH`] of
     /// mix at offset 0, and set RUN.
     fn start_engine(&mut self) -> DeviceResult {
-        warn!(
+        // Unconditional (see the note in `DspDev::open_client`): a machine
+        // booted with `LOG=error` would otherwise show an engine that never
+        // started as silence with an empty `dmesg`.
+        crate::klog_warn!(
             "[hda] engine start: {} stream(s), repick + stream reset next",
             self.streams.len()
         );
@@ -1181,7 +1184,7 @@ impl HdaInner {
         let now = timer_now_as_micros();
         self.fill_ring(now, 0);
         self.start_stream()?;
-        warn!(
+        crate::klog_warn!(
             "[hda] engine started: {} B primed, CTL {:#x}",
             self.fill_pos,
             mmio_r32(self.bar, self.sd_base + SD_CTL)

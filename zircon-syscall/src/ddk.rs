@@ -25,6 +25,14 @@ fn interrupt_options(options: u32) -> ZxResult<InterruptOptions> {
     InterruptOptions::from_bits(options).ok_or(ZxError::INVALID_ARGS)
 }
 
+/// `zx_interrupt_trigger`: `options` must be zero.
+fn interrupt_trigger_options(options: u32) -> ZxResult {
+    if options != 0 {
+        return Err(ZxError::INVALID_ARGS);
+    }
+    Ok(())
+}
+
 impl Syscall<'_> {
     /// Create a new object in the kernel representing an IOMMU device.
     pub fn sys_iommu_create(
@@ -56,7 +64,7 @@ impl Syscall<'_> {
         }
         let _copied_desc = desc.read_array(desc_size)?;
         let iommu = Iommu::create();
-        install_handle(proc, Handle::new(iommu, Rights::DEFAULT_CHANNEL), &mut out)
+        install_handle(proc, Handle::new(iommu, Rights::DEFAULT_IOMMU), &mut out)
     }
     /// Creates a new bus transaction initiator.
     ///
@@ -75,10 +83,11 @@ impl Syscall<'_> {
             iommu, options, bti_id
         );
         let proc = self.thread.proc();
+        let iommu = proc.get_object::<Iommu>(iommu)?;
+        // Handle first: options!=0 used to hide BAD_HANDLE / WRONG_TYPE.
         if options != 0 {
             return Err(ZxError::INVALID_ARGS);
         }
-        let iommu = proc.get_object::<Iommu>(iommu)?;
         if !iommu.is_valid_bus_txn_id() {
             return Err(ZxError::INVALID_ARGS);
         }
@@ -99,13 +108,14 @@ impl Syscall<'_> {
         addrs_count: usize,
         mut out: UserOutPtr<HandleValue>,
     ) -> ZxResult {
-        let options = bti_options(options)?;
+        let proc = self.thread.proc();
         info!(
-            "bti.pin: bti={:#x}, options={:?}, vmo={:#x}, offset={:#x}, size={:#x}, addrs={:#x?}, addrs_count={:#x}",
+            "bti.pin: bti={:#x}, options={:#x}, vmo={:#x}, offset={:#x}, size={:#x}, addrs={:#x?}, addrs_count={:#x}",
             bti, options, vmo, offset, size, addrs, addrs_count
         );
-        let proc = self.thread.proc();
         let bti = proc.get_object_with_rights::<BusTransactionInitiator>(bti, Rights::MAP)?;
+        // Handle first: bad options used to hide BAD_HANDLE / WRONG_TYPE.
+        let options = bti_options(options)?;
         if !page_aligned(offset) || !page_aligned(size) {
             return Err(ZxError::INVALID_ARGS);
         }
@@ -192,14 +202,18 @@ impl Syscall<'_> {
             resource, src_num, options
         );
         let proc = self.thread.proc();
-        let options = interrupt_options(options)?;
-        let interrupt = if options.contains(InterruptOptions::VIRTUAL) {
+        // Physical interrupts need the resource handle first so a bad handle
+        // is not masked by INVALID_ARGS from options. Virtual interrupts have
+        // no resource.
+        let interrupt = if options & InterruptOptions::VIRTUAL.bits() != 0 {
+            let options = interrupt_options(options)?;
             if options != InterruptOptions::VIRTUAL {
                 return Err(ZxError::INVALID_ARGS);
             }
             Interrupt::new_virtual()
         } else {
             let resource = proc.get_object::<Resource>(resource)?;
+            let options = interrupt_options(options)?;
             resource.validate_ranged_resource(ResourceKind::IRQ, src_num, 1)?;
             Interrupt::new_physical(src_num, options)?
         };
@@ -254,6 +268,8 @@ impl Syscall<'_> {
             .thread
             .proc()
             .get_object_with_rights::<Interrupt>(interrupt, Rights::SIGNAL)?;
+        // Handle first: options!=0 used to hide BAD_HANDLE / WRONG_TYPE.
+        interrupt_trigger_options(options)?;
         interrupt.trigger(timestamp)
     }
 
@@ -412,6 +428,16 @@ mod tests {
         assert_eq!(
             interrupt_options(u32::MAX).err(),
             Some(ZxError::INVALID_ARGS)
+        );
+    }
+
+    #[test]
+    fn interrupt_trigger_requires_options_zero() {
+        assert_eq!(interrupt_trigger_options(0), Ok(()));
+        assert_eq!(interrupt_trigger_options(1), Err(ZxError::INVALID_ARGS));
+        assert_eq!(
+            interrupt_trigger_options(u32::MAX),
+            Err(ZxError::INVALID_ARGS)
         );
     }
 }

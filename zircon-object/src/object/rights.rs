@@ -165,6 +165,10 @@ bitflags! {
         /// (BASIC & !WAIT) | IO | PROPERTY | MAP
         const DEFAULT_BTI = (Self::BASIC.bits & !Self::WAIT.bits) | Self::IO.bits | Self::PROPERTY.bits | Self::MAP.bits;
 
+        /// BASIC without WAIT: TRANSFER | DUPLICATE | INSPECT (Fuchsia IOMMU).
+        /// Used to incorrectly install with `DEFAULT_CHANNEL` (IO/SIGNAL_PEER).
+        const DEFAULT_IOMMU = Self::BASIC.bits & !Self::WAIT.bits;
+
         /// BASIC | IO | SIGNAL
         const DEFAULT_INTERRUPT = Self::BASIC.bits | Self::IO.bits | Self::SIGNAL.bits;
 
@@ -231,6 +235,15 @@ mod tests {
         );
     }
 
+    #[test]
+    fn an_iommu_handle_is_not_a_channel() {
+        // Used to install with DEFAULT_CHANNEL (IO | SIGNAL_PEER).
+        assert!(!Rights::DEFAULT_IOMMU.contains(Rights::IO));
+        assert!(!Rights::DEFAULT_IOMMU.contains(Rights::SIGNAL_PEER));
+        assert!(Rights::DEFAULT_IOMMU.contains(Rights::DUPLICATE));
+        assert!(Rights::DEFAULT_IOMMU.contains(Rights::INSPECT));
+    }
+
     /// Every `DEFAULT_*` set names rights that exist, and none of them carries
     /// `SAME_RIGHTS`, which is the marker `zx_handle_duplicate` reads and not a
     /// right an object can hold.
@@ -256,6 +269,7 @@ mod tests {
             ("SOCKET", Rights::DEFAULT_SOCKET),
             ("STREAM", Rights::DEFAULT_STREAM),
             ("BTI", Rights::DEFAULT_BTI),
+            ("IOMMU", Rights::DEFAULT_IOMMU),
             ("INTERRUPT", Rights::DEFAULT_INTERRUPT),
             ("DEVICE", Rights::DEFAULT_DEVICE),
             ("PCI_INTERRUPT", Rights::DEFAULT_PCI_INTERRUPT),

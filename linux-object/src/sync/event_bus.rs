@@ -59,12 +59,30 @@ pub struct EventBus {
     callbacks: Vec<(u64, EventHandler)>,
     /// counter for subscription IDs
     next_id: u64,
+    /// How many times a producer has published readiness (`set`/`change`
+    /// with a non-empty `set`), whether or not the flags changed. A level does
+    /// not move when data lands on a file that already had some, and an
+    /// edge-triggered `epoll` still owes its waiter an event for it: this is
+    /// the counter it compares against. See [`EventBus::subscribe_edge`].
+    seq: u64,
+    /// [`seq`](Self::seq) split by direction: one counter per file-readiness
+    /// bit (`READABLE`, `WRITABLE`, `ERROR`, `CLOSED`, in that order).
+    ///
+    /// The whole-bus counter cannot answer "did anything *this waiter cares
+    /// about* get published": a producer pulsing `WRITABLE` to wake a writer
+    /// parked on room moves it too, and an edge-triggered `EPOLLIN` entry
+    /// measured against it then reports the same readable level `epoll_wait`
+    /// had already handed out. See [`EventBus::seq_for`].
+    seq_bits: [u64; 4],
+    /// Waiters parked by [`EventBus::subscribe_edge`]: `(id, mask, waker)`.
+    edges: Vec<(u64, Event, core::task::Waker)>,
 }
 impl core::fmt::Debug for EventBus {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("EventBus")
             .field("event", &self.event)
             .field("callbacks_len", &self.callbacks.len())
+            .field("seq", &self.seq)
             .finish()
     }
 }
@@ -94,6 +112,24 @@ impl EventBus {
     /// cannot deadlock holding this mutex, and late `subscribe`s during fire
     /// are preserved.
     pub fn change(&mut self, reset: Event, set: Event) {
+        if !set.is_empty() {
+            self.seq = self.seq.wrapping_add(1);
+            for (i, bit) in Self::SEQ_BITS.iter().enumerate() {
+                if set.contains(*bit) {
+                    self.seq_bits[i] = self.seq_bits[i].wrapping_add(1);
+                }
+            }
+            if !self.edges.is_empty() {
+                self.edges.retain(|(_, mask, waker)| {
+                    if mask.intersects(set) {
+                        waker.wake_by_ref();
+                        false
+                    } else {
+                        true
+                    }
+                });
+            }
+        }
         let orig = self.event;
         let mut new = self.event;
         new.remove(reset);
@@ -178,11 +214,89 @@ impl EventBus {
     /// Unsubscribe a previously registered callback by its ID.
     pub fn unsubscribe(&mut self, id: u64) {
         self.callbacks.retain(|(item_id, _)| *item_id != id);
+        self.edges.retain(|(item_id, _, _)| *item_id != id);
+    }
+
+    /// The file-readiness bits [`seq_for`](Self::seq_for) counts separately,
+    /// in the order of [`seq_bits`](Self::seq_bits).
+    const SEQ_BITS: [Event; 4] = [
+        Event::READABLE,
+        Event::WRITABLE,
+        Event::ERROR,
+        Event::CLOSED,
+    ];
+
+    /// The publication counter (see the `seq` field).
+    pub fn seq(&self) -> u64 {
+        self.seq
+    }
+
+    /// The publication counter restricted to `mask`: it moves only when a
+    /// producer publishes a bit the caller asked about.
+    ///
+    /// This is what an edge-triggered waiter must measure against. A unix
+    /// stream socket pulses `WRITABLE` on its peer's bus whenever a reader
+    /// drains a full queue (`pulse_writable`), to wake a writer parked on
+    /// room; nothing about that peer's own receive queue changed, so an
+    /// `EPOLLIN | EPOLLET` entry on it owes its waiter nothing. Measured
+    /// against the whole-bus [`seq`](Self::seq) it re-reported the level it
+    /// had already delivered, which is the `epoll_wait` spin `EPOLLET` exists
+    /// to stop. An eventfd does the same on every `read` that empties it.
+    ///
+    /// A mask naming none of the four file bits gets the whole-bus counter:
+    /// there is nothing finer to answer with.
+    pub fn seq_for(&self, mask: Event) -> u64 {
+        let mut sum: u64 = 0;
+        let mut any = false;
+        for (i, bit) in Self::SEQ_BITS.iter().enumerate() {
+            if mask.contains(*bit) {
+                any = true;
+                sum = sum.wrapping_add(self.seq_bits[i]);
+            }
+        }
+        if any {
+            sum
+        } else {
+            self.seq
+        }
+    }
+
+    /// Park `waker` until a producer next publishes an event in `mask`, even
+    /// one that leaves the flags as they were: edge-triggered `epoll`.
+    ///
+    /// [`EventBus::subscribe`] cannot do this. It fires at once on a latched
+    /// flag, and an edge-triggered waiter that has already been told about a
+    /// readable file would be woken by that latch forever: the spin this
+    /// exists to end. It fires only on a *change* of the flags, too, and a
+    /// second write to a file that is already readable changes none.
+    ///
+    /// `seen` is the [`EventBus::seq_for`] of this same `mask` that the
+    /// waiter last looked at, read before it looked at the file's level. If
+    /// anything in `mask` was published since, the waker fires here and
+    /// `None` is returned, so no publication between that look and this call
+    /// can be missed. It is compared against the same mask-restricted
+    /// counter, not the whole-bus one: measured against `seq`, a publication
+    /// in the *other* direction would make every subscription fire at once
+    /// and the edge wait would degenerate into a busy re-poll.
+    pub fn subscribe_edge(
+        &mut self,
+        mask: Event,
+        waker: &core::task::Waker,
+        seen: u64,
+    ) -> Option<u64> {
+        if self.seq_for(mask) != seen {
+            waker.wake_by_ref();
+            return None;
+        }
+        let id = self.next_id;
+        self.next_id = self.next_id.wrapping_add(1);
+        self.edges.push((id, mask, waker.clone()));
+        Some(id)
     }
 
     /// get the callback vector length
     pub fn get_callback_len(&self) -> usize {
-        self.callbacks.len()
+        self.callbacks.len() + self.edges.len()
     }
 }
 
@@ -246,6 +360,25 @@ pub fn subscribe_readiness_on(
     waker: &core::task::Waker,
 ) -> ReadinessSub {
     match subscribe_waker(&mut bus.lock(), mask, waker) {
+        Some(id) => {
+            let bus = bus.clone();
+            ReadinessSub::new(Box::new(move || {
+                bus.lock().unsubscribe(id);
+            }))
+        }
+        None => ReadinessSub::noop(),
+    }
+}
+
+/// [`EventBus::subscribe_edge`] + RAII handle for the `Arc<Mutex<EventBus>>`
+/// bus owners, as [`subscribe_readiness_on`] is for level subscriptions.
+pub fn subscribe_edge_on(
+    bus: &Arc<Mutex<EventBus>>,
+    mask: Event,
+    waker: &core::task::Waker,
+    seen: u64,
+) -> ReadinessSub {
+    match bus.lock().subscribe_edge(mask, waker, seen) {
         Some(id) => {
             let bus = bus.clone();
             ReadinessSub::new(Box::new(move || {
@@ -837,5 +970,73 @@ mod interruptible_wait_tests {
             Pin::new(&mut fut).poll(&mut cx),
             Poll::Ready(Err(LxError::EINTR))
         ));
+    }
+}
+
+#[cfg(test)]
+mod seq_for_tests {
+    //! The publication counter split by direction.
+
+    use super::{Event, EventBus};
+
+    const IN_MASK: Event = Event::READABLE.union(Event::ERROR).union(Event::CLOSED);
+
+    /// What `poll_events_to_bus_mask(POLLIN)` asks for must not move when a
+    /// producer publishes `WRITABLE` alone -- the pulse a unix socket sends a
+    /// peer when a reader drains a full queue, and the one an eventfd sends
+    /// on every `read` that empties it.
+    #[test]
+    fn a_writable_only_publication_leaves_the_readable_counter_alone() {
+        let mut bus = EventBus::default();
+        let before = bus.seq_for(IN_MASK);
+        bus.set(Event::WRITABLE);
+        assert_eq!(
+            bus.seq_for(IN_MASK),
+            before,
+            "nothing readable was published"
+        );
+        assert_eq!(bus.seq(), 1, "the whole-bus counter still counts it");
+        // And the other way round, which is the same bug for an EPOLLOUT entry.
+        let out_before = bus.seq_for(Event::WRITABLE);
+        bus.set(Event::READABLE);
+        assert_eq!(bus.seq_for(Event::WRITABLE), out_before);
+        assert_eq!(bus.seq_for(IN_MASK), before + 1);
+    }
+
+    /// A publication in the mask moves it even when the flag was already set:
+    /// that republication is the whole reason the counter exists.
+    #[test]
+    fn a_republication_of_a_latched_flag_still_moves_the_masked_counter() {
+        let mut bus = EventBus::default();
+        bus.set(Event::READABLE);
+        let once = bus.seq_for(IN_MASK);
+        bus.set(Event::READABLE);
+        assert_eq!(bus.seq_for(IN_MASK), once + 1);
+        // Clearing publishes nothing, on either counter.
+        bus.clear(Event::READABLE);
+        assert_eq!(bus.seq_for(IN_MASK), once + 1);
+    }
+
+    /// One `change` publishing both directions moves both counters, and the
+    /// sum a multi-bit mask reports moves by one per bit it covers.
+    #[test]
+    fn a_publication_of_several_bits_counts_on_each_of_them() {
+        let mut bus = EventBus::default();
+        bus.change(Event::empty(), Event::READABLE | Event::WRITABLE);
+        assert_eq!(bus.seq_for(Event::READABLE), 1);
+        assert_eq!(bus.seq_for(Event::WRITABLE), 1);
+        assert_eq!(bus.seq_for(Event::READABLE | Event::WRITABLE), 2);
+        assert_eq!(bus.seq(), 1, "one call, one whole-bus publication");
+    }
+
+    /// A mask naming none of the four file bits has nothing finer to measure,
+    /// so it gets the whole-bus counter.
+    #[test]
+    fn a_mask_outside_the_file_bits_falls_back_to_the_whole_bus_counter() {
+        let mut bus = EventBus::default();
+        bus.set(Event::READABLE);
+        bus.set(Event::PROCESS_QUIT);
+        assert_eq!(bus.seq_for(Event::PROCESS_QUIT), bus.seq());
+        assert_eq!(bus.seq_for(Event::empty()), bus.seq());
     }
 }

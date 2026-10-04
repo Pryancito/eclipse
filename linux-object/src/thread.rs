@@ -560,7 +560,12 @@ fn unmodified_check(siginfo: &SigInfo, delivered: &SigInfo, user_ctx: &SignalUse
     // `uc_stack` is not compared: the kernel fills it (`__save_altstack`)
     // and the handler may change it, which `sigreturn` honours.
     check |= ((user_ctx._pad != default_ctx._pad) as usize) << 4;
-    check |= ((user_ctx.context != default_ctx.context) as usize) << 5;
+    // `uc_mcontext` is not compared either, for the same reason as `uc_stack`:
+    // the kernel fills it with the interrupted registers and `sigreturn`
+    // honours whatever the handler left there. It used to be compared against
+    // a struct holding only the program counter, so every ordinary signal
+    // logged "unsupported signal fields" at `error!` -- and once the registers
+    // were actually filled in, every single one would have.
     #[cfg(target_arch = "x86_64")]
     {
         check |= ((user_ctx.fpregs_mem != default_ctx.fpregs_mem) as usize) << 6;
@@ -593,7 +598,10 @@ impl LinuxThread {
         self.signal_alternate_stack
             .restore_from_frame(user_ctx.stack, handler_sp);
         *ctx = *old_ctx;
-        ctx.set_field(UserContextField::InstrPointer, user_ctx.context.get_pc());
+        // Everything the frame carries, not just the program counter: a
+        // handler that rewrote a register in its `ucontext` asked for the
+        // interrupted code to resume with it (`MachineContext::restore_into`).
+        user_ctx.context.restore_into(ctx);
         // The ucontext is userland's to modify between the handler running
         // and `sigreturn`, so this mask is untrusted input like any other:
         // without the filter a handler could return with SIGKILL blocked.
@@ -1192,6 +1200,53 @@ mod signal_delivery_tests {
         assert_eq!(
             t.signal_alternate_stack, alt,
             "sigreturn did not put the auto-disarmed stack back"
+        );
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn sigreturn_resumes_on_the_stack_the_handler_chose() {
+        use crate::signal::MachineContext;
+        // A handler is allowed to rewrite the registers in its `ucontext`, and
+        // `sigreturn` is where that takes effect. Only the PC was honoured, so
+        // the one mechanism built entirely out of this -- Go's asynchronous
+        // preemption, which pushes a return address, moves `rsp` down over it
+        // and points `rip` at `asyncPreempt` -- got the new entry point on the
+        // old stack, and `asyncPreempt` returned to whatever word the
+        // goroutine was holding at its stack pointer.
+        let mut t = thread();
+        t.handling_signal = Some(Signal::SIGURG as u32);
+
+        let mut old_ctx = UserContext::default();
+        old_ctx.general_mut().rsp = 0xc000_040000;
+        old_ctx.general_mut().r14 = 0xaaaa;
+
+        let info = SigInfo::default();
+        let mut uctx = SignalUserContext {
+            context: MachineContext::from_context(&mut old_ctx.clone()),
+            ..Default::default()
+        };
+        uctx.context.rsp = 0xc000_03fff8;
+        uctx.context.rip = 0x4812_00;
+
+        let mut ctx = UserContext::default();
+        t.restore_after_handle_signal(
+            &mut ctx,
+            &old_ctx,
+            &info as *const SigInfo as usize,
+            &uctx as *const SignalUserContext as usize,
+        );
+
+        assert_eq!(
+            ctx.general().rsp,
+            0xc000_03fff8,
+            "sigreturn put the old stack pointer back under the handler's new pc"
+        );
+        assert_eq!(ctx.general().rip, 0x4812_00);
+        assert_eq!(
+            ctx.general().r14,
+            0xaaaa,
+            "a register the handler left alone must come back as it was"
         );
     }
 

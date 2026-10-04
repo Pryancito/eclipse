@@ -6,8 +6,9 @@ use crate::{
     error::{LxError, LxResult},
     fs::FileLike,
     net::{
-        AddressFamily, Endpoint, Socket, SysResult, ARPHRD_ETHER, ARPHRD_LOOPBACK, IFF_BROADCAST,
-        IFF_CHANGE_ALL, IFF_LOOPBACK, IFF_LOWER_UP, IFF_MULTICAST, IFF_NOARP, IFF_RUNNING, IFF_UP,
+        shutdown_sides, AddressFamily, Endpoint, Socket, SocketType, SysResult, ARPHRD_ETHER,
+        ARPHRD_LOOPBACK, IFF_BROADCAST, IFF_CHANGE_ALL, IFF_LOOPBACK, IFF_LOWER_UP, IFF_MULTICAST,
+        IFF_NOARP, IFF_RUNNING, IFF_UP,
     },
 };
 use alloc::{boxed::Box, sync::Arc, vec::Vec};
@@ -40,19 +41,31 @@ pub struct NetlinkSocketState {
     data: Arc<Mutex<Vec<Vec<u8>>>>,
     local_endpoint: Arc<Mutex<Option<NetlinkEndpoint>>>,
     flags: Arc<Mutex<OpenFlags>>,
+    /// Type requested at `socket(2)` — `SO_TYPE` must report this, not a
+    /// hardcoded `SOCK_RAW` (callers may open `SOCK_DGRAM`).
+    sock_type: SocketType,
+    /// Last recvmsg flags (`MSG_TRUNC`, …); cleared by [`Socket::take_msg_flags`].
+    last_msg_flags: Mutex<i32>,
 }
 
 impl Default for NetlinkSocketState {
     fn default() -> Self {
+        Self::new(SocketType::SOCK_RAW)
+    }
+}
+impl NetlinkSocketState {
+    /// Create a netlink socket of the given type (`SOCK_RAW` or `SOCK_DGRAM`).
+    pub fn new(sock_type: SocketType) -> Self {
         Self {
             base: zircon_object::object::KObjectBase::new(),
             data: Arc::new(Mutex::new(Vec::new())),
             local_endpoint: Arc::new(Mutex::new(None)),
             flags: Arc::new(Mutex::new(OpenFlags::RDWR)),
+            sock_type,
+            last_msg_flags: Mutex::new(0),
         }
     }
-}
-impl NetlinkSocketState {
+
     fn auto_port_id(&self) -> u32 {
         let reduced = self.base.id % u32::MAX as u64;
         (reduced as u32).max(1)
@@ -111,10 +124,11 @@ impl Socket for NetlinkSocketState {
                         data[..n].copy_from_slice(&msg[..n]);
                     }
                     // Netlink is a datagram protocol: a message larger than the
-                    // caller's buffer is truncated and its remainder DISCARDED
-                    // (Linux would set MSG_TRUNC). Do NOT re-queue `msg[n..]` as a
-                    // new message — a headerless fragment corrupts netlink framing
-                    // for the next reader and can be indexed out of bounds.
+                    // caller's buffer is truncated and its remainder DISCARDED.
+                    // Do NOT re-queue `msg[n..]` as a new message — a headerless
+                    // fragment corrupts netlink framing for the next reader.
+                    // Report MSG_TRUNC (0x20) so recvmsg callers see the cut.
+                    *self.last_msg_flags.lock() = if msg.len() > data.len() { 0x20 } else { 0 };
                     info!("[netlink] read hex: {:?}", &msg[..n]);
                     return (Ok(n), endpoint);
                 }
@@ -620,11 +634,11 @@ impl Socket for NetlinkSocketState {
 
     /// connect (netlink sockets do not support connect)
     async fn connect(&self, _endpoint: Endpoint) -> SysResult {
-        // Netlink sockets do not support connect(2). Returning ENOTSUP is
-        // correct for SOCK_RAW/SOCK_DGRAM netlink; prevents panic on `ip`
-        // tool usage inside udhcpc default.script.
+        // Netlink sockets do not support connect(2). `EOPNOTSUPP` (= Linux
+        // `ENOTSUP`) is the answer; `EINVAL` made probes think the address
+        // was wrong rather than the operation.
         warn!("[netlink] connect: not supported on netlink sockets");
-        Err(LxError::EINVAL)
+        Err(LxError::EOPNOTSUPP)
     }
 
     fn bind(&self, endpoint: Endpoint) -> SysResult {
@@ -641,18 +655,21 @@ impl Socket for NetlinkSocketState {
 
     fn listen(&self) -> SysResult {
         warn!("[netlink] listen: not supported on netlink sockets");
-        Err(LxError::EINVAL)
+        Err(LxError::EOPNOTSUPP)
     }
 
-    fn shutdown(&self, _howto: usize) -> SysResult {
-        // Accept shutdown silently — some userland code calls shutdown() before
-        // close() even on netlink sockets. Return success to avoid EINVAL noise.
+    fn shutdown(&self, howto: usize) -> SysResult {
+        // Netlink has no half-close to act on, but `howto` is still checked:
+        // userland that calls `shutdown()` before `close()` on a netlink fd
+        // must get success for `SHUT_RD`/`WR`/`RDWR` and `EINVAL` past that,
+        // the same gate `__sys_shutdown_sock` runs before any protocol ops.
+        let _ = shutdown_sides(howto)?;
         Ok(0)
     }
 
     async fn accept(&self) -> LxResult<(Arc<dyn FileLike>, Endpoint)> {
         warn!("[netlink] accept: not supported on netlink sockets");
-        Err(LxError::EINVAL)
+        Err(LxError::EOPNOTSUPP)
     }
 
     fn endpoint(&self) -> Option<Endpoint> {
@@ -673,8 +690,22 @@ impl Socket for NetlinkSocketState {
         None
     }
 
-    fn setsockopt(&self, _level: usize, _opt: usize, _data: &[u8]) -> SysResult {
-        Ok(0)
+    fn socket_type(&self) -> Option<SocketType> {
+        Some(self.sock_type)
+    }
+
+    fn so_domain(&self) -> Option<u32> {
+        Some(crate::net::Domain::AF_NETLINK as u32)
+    }
+
+    fn so_protocol(&self) -> Option<u32> {
+        // Netlink family/protocol is chosen at socket(); we do not track the
+        // NETLINK_* number yet — report 0 (generic), same default as unbound.
+        Some(0)
+    }
+
+    fn take_msg_flags(&self) -> i32 {
+        core::mem::replace(&mut *self.last_msg_flags.lock(), 0)
     }
 
     fn ioctl(&self, request: usize, arg1: usize, arg2: usize, arg3: usize) -> SysResult {
@@ -704,10 +735,7 @@ impl FileLike for NetlinkSocketState {
     }
 
     fn set_flags(&self, f: OpenFlags) -> LxResult {
-        let flags = &mut *self.flags.lock();
-        flags.set(OpenFlags::APPEND, f.contains(OpenFlags::APPEND));
-        flags.set(OpenFlags::NON_BLOCK, f.contains(OpenFlags::NON_BLOCK));
-        flags.set(OpenFlags::CLOEXEC, f.contains(OpenFlags::CLOEXEC));
+        self.flags.lock().take_settable(f);
         Ok(())
     }
 
@@ -746,6 +774,11 @@ impl FileLike for NetlinkSocketState {
 
     fn ioctl(&self, request: usize, arg1: usize, arg2: usize, arg3: usize) -> LxResult<usize> {
         Socket::ioctl(self, request, arg1, arg2, arg3)
+    }
+
+    /// `FIONREAD`/`SIOCINQ`: size of the next queued netlink message (0 if empty).
+    fn readable_bytes(&self) -> Option<usize> {
+        Some(self.data.lock().first().map(|m| m.len()).unwrap_or(0))
     }
 
     fn as_socket(&self) -> LxResult<&dyn Socket> {
@@ -1739,5 +1772,71 @@ mod netlink_tests {
         assert_eq!(q.len(), NETLINK_RX_QUEUE_MAX);
         assert_eq!(q.last().unwrap()[0], (NETLINK_RX_QUEUE_MAX + 9) as u8);
         assert_eq!(q[0][0], 10u8);
+    }
+
+    /// `shutdown` on netlink is a no-op for the three valid `how` values, but
+    /// used to succeed for anything — `shutdown(nl, 99)` returned 0 where
+    /// Linux says `EINVAL`.
+    #[test]
+    fn shutdown_refuses_a_how_that_is_not_a_how() {
+        let nl = NetlinkSocketState::default();
+        assert!(Socket::shutdown(&nl, 0).is_ok());
+        assert!(Socket::shutdown(&nl, 1).is_ok());
+        assert!(Socket::shutdown(&nl, 2).is_ok());
+        assert_eq!(Socket::shutdown(&nl, 3), Err(LxError::EINVAL));
+        assert_eq!(Socket::shutdown(&nl, 99), Err(LxError::EINVAL));
+    }
+
+    /// `getsockopt(SO_TYPE)` must report the type passed to `socket(2)`,
+    /// not a hardcoded `SOCK_RAW`.
+    #[test]
+    fn so_type_reports_the_type_the_socket_was_opened_with() {
+        assert_eq!(
+            Socket::socket_type(&NetlinkSocketState::new(SocketType::SOCK_RAW)),
+            Some(SocketType::SOCK_RAW)
+        );
+        assert_eq!(
+            Socket::socket_type(&NetlinkSocketState::new(SocketType::SOCK_DGRAM)),
+            Some(SocketType::SOCK_DGRAM)
+        );
+    }
+
+    /// Idle netlink must answer `FIONREAD` with 0, not fall through to ENOTTY.
+    #[test]
+    fn an_idle_netlink_socket_reports_zero_bytes_readable() {
+        let nl = NetlinkSocketState::default();
+        assert_eq!(FileLike::readable_bytes(&nl), Some(0));
+    }
+
+    /// Netlink is not inet: `IPPROTO_IP` / `IPPROTO_TCP` must be ENOPROTOOPT.
+    #[test]
+    fn ip_and_tcp_sockopts_on_netlink_are_enoprotoopt() {
+        let nl = NetlinkSocketState::default();
+        assert!(!Socket::is_inet(&nl));
+        assert_eq!(
+            Socket::setsockopt(&nl, 0, 2, &64u32.to_ne_bytes()),
+            Err(LxError::ENOPROTOOPT)
+        );
+        assert_eq!(
+            Socket::setsockopt(&nl, 6, 1, &1u32.to_ne_bytes()),
+            Err(LxError::ENOPROTOOPT)
+        );
+    }
+
+    /// A short recv on a queued netlink message must set `MSG_TRUNC` (0x20).
+    #[async_std::test]
+    async fn a_short_netlink_read_reports_msg_trunc() {
+        let nl = NetlinkSocketState::new(SocketType::SOCK_RAW);
+        FileLike::set_flags(&nl, OpenFlags::RDWR | OpenFlags::NON_BLOCK).unwrap();
+        push_netlink_rx(&mut nl.data.lock(), alloc::vec![0u8; 64]);
+        let mut buf = [0u8; 16];
+        let (n, _) = Socket::read(&nl, &mut buf).await;
+        assert_eq!(n, Ok(16));
+        assert_eq!(Socket::take_msg_flags(&nl), 0x20, "MSG_TRUNC");
+        // A whole message is not truncated.
+        push_netlink_rx(&mut nl.data.lock(), alloc::vec![1u8; 8]);
+        let mut whole = [0u8; 32];
+        assert_eq!(Socket::read(&nl, &mut whole).await.0, Ok(8));
+        assert_eq!(Socket::take_msg_flags(&nl), 0);
     }
 }

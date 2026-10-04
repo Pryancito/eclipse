@@ -97,6 +97,13 @@ pub(super) async fn splice_bytes(
     let inode_out = pipe_inode(file_out);
     if let Some(inode_out) = &inode_out {
         let pipe_out = inode_out.downcast_ref::<Pipe>().ok_or(LxError::EINVAL)?;
+        // `do_splice`: pipe→pipe on the same buffer is `EINVAL`, same as tee.
+        if let Some(inode_in) = pipe_inode(file_in) {
+            let pipe_in = inode_in.downcast_ref::<Pipe>().ok_or(LxError::EINVAL)?;
+            if pipe_in.same_buffer(pipe_out) {
+                return Err(LxError::EINVAL);
+            }
+        }
         loop {
             match pipe_out.write_room() {
                 None => return Err(LxError::EPIPE),
@@ -256,6 +263,12 @@ impl Syscall<'_> {
         if !pipe_in.is_read_end() || pipe_out.is_read_end() {
             return Err(LxError::EBADF);
         }
+        // `do_tee`: both ends of the same pipe is `EINVAL`. Peeking and
+        // writing back into the same buffer never consumes and fills until
+        // hang.
+        if pipe_in.same_buffer(pipe_out) {
+            return Err(LxError::EINVAL);
+        }
         if len == 0 {
             return Ok(0);
         }
@@ -375,6 +388,18 @@ mod tests {
         nonblock: bool,
     ) -> LxResult<Spliced> {
         splice_bytes(file_in, off_in, file_out, off_out, len, nonblock).await
+    }
+
+    /// Splicing both ends of the same pipe is `EINVAL` (`do_splice`). Without
+    /// the check the peek-and-write loop never drains.
+    #[async_std::test]
+    async fn splicing_a_pipe_into_itself_is_einval() {
+        let (r, w, _) = pipe(OpenFlags::empty());
+        w.write(b"hello").unwrap();
+        assert_eq!(
+            splice(&r, None, &w, None, 5, true).await.unwrap_err(),
+            LxError::EINVAL
+        );
     }
 
     /// Pipe to full pipe, non-blocking: `EAGAIN`, and the input still holds

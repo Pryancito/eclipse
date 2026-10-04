@@ -95,7 +95,7 @@ impl Syscall<'_> {
             return Err(LxError::EEXIST);
         }
         proc.check_access(&dir_metadata, 0o3, true)?;
-        let create_mode = proc.apply_umask(mode as u16);
+        let create_mode = proc.apply_umask(create_perm(mode));
         let created = inode.create(file_name, FileType::Dir, create_mode as u32)?;
         proc.initialize_created_metadata(&created, Some(&dir_metadata), create_mode, true)?;
         linux_object::fs::dcache_invalidate();
@@ -150,7 +150,7 @@ impl Syscall<'_> {
             return Err(LxError::EEXIST);
         }
         proc.check_access(&dir_metadata, 0o3, true)?;
-        let create_mode = proc.apply_umask((mode & 0o7777) as u16);
+        let create_mode = proc.apply_umask(create_perm(mode));
         let rdev = if matches!(file_type, FileType::CharDevice | FileType::BlockDevice) {
             dev
         } else {
@@ -979,15 +979,34 @@ pub(crate) const FCHOWNAT_FLAGS: usize =
     AtFlags::SYMLINK_NOFOLLOW.bits() | AtFlags::EMPTY_PATH.bits();
 
 /// What `faccessat2(2)` accepts (`do_faccessat`, `fs/open.c`: `if (flags &
-/// ~(AT_EACCESS | AT_SYMLINK_NOFOLLOW)) return -EINVAL;`).
+/// ~(AT_EACCESS | AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH)) return -EINVAL;`).
+/// `AT_EMPTY_PATH` has been legal since Linux 5.8; without it here,
+/// `faccessat2(fd, "", mode, AT_EMPTY_PATH)` was `EINVAL` before the inode
+/// of `fd` was ever looked at.
 pub(crate) const FACCESSAT_FLAGS: usize =
-    AtFlags::EACCESS.bits() | AtFlags::SYMLINK_NOFOLLOW.bits();
+    AtFlags::EACCESS.bits() | AtFlags::SYMLINK_NOFOLLOW.bits() | AtFlags::EMPTY_PATH.bits();
 
 /// What `fchmodat2(2)` accepts (`do_fchmodat`, `fs/open.c`), which is what
 /// the FreeBSD `fchmodat` translation hands `sys_fchmodat`; the Linux
 /// `fchmodat` number carries no flags at all.
 pub(crate) const FCHMODAT_FLAGS: usize =
     AtFlags::SYMLINK_NOFOLLOW.bits() | AtFlags::EMPTY_PATH.bits();
+
+/// What `utimensat(2)` accepts when given a path (`do_utimes_path`,
+/// `fs/utimes.c`: `flags & ~(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH)`).
+/// `AT_EMPTY_PATH` has been legal since Linux 5.8; the hand-rolled check
+/// only admitted `0` or exactly `AT_SYMLINK_NOFOLLOW`, so
+/// `utimensat(fd, "", times, AT_EMPTY_PATH)` was `EINVAL`.
+pub(crate) const UTIMENSAT_FLAGS: usize =
+    AtFlags::SYMLINK_NOFOLLOW.bits() | AtFlags::EMPTY_PATH.bits();
+
+/// Permission bits create syscalls keep (`vfs_mkdir` /
+/// `build_open_flags`: `mode &= S_IRWXUGO|S_ISVTX` / `S_IALLUGO`). Type
+/// bits in the argument (`S_IFDIR` / `S_IFREG` from a caller that reused
+/// `st_mode`) must not land in the inode's mode.
+pub(crate) fn create_perm(mode: usize) -> u16 {
+    (mode & 0o7777) as u16
+}
 
 /// The file `dirfd` is open on, for a syscall given `AT_EMPTY_PATH` and an
 /// empty path (`LOOKUP_EMPTY`): `AT_FDCWD` names the working directory.
@@ -1540,6 +1559,7 @@ mod at_flags_tests {
             FCHOWNAT_FLAGS,
             FACCESSAT_FLAGS,
             FCHMODAT_FLAGS,
+            UTIMENSAT_FLAGS,
         ] {
             assert_eq!(at_flags(0, allowed), Ok(AtFlags::empty()));
             for bit in 0..usize::BITS as usize {
@@ -1565,6 +1585,53 @@ mod at_flags_tests {
         assert!(parsed.contains(AtFlags::SYMLINK_NOFOLLOW));
         assert!(parsed.contains(AtFlags::EMPTY_PATH));
         assert!(!parsed.contains(AtFlags::SYMLINK_FOLLOW));
+    }
+
+    /// `faccessat2` has accepted `AT_EMPTY_PATH` since Linux 5.8; the mask
+    /// used to omit it, so the flag never reached `sys_faccessat`.
+    #[test]
+    fn faccessat_accepts_at_empty_path() {
+        let flags =
+            AtFlags::EACCESS.bits() | AtFlags::SYMLINK_NOFOLLOW.bits() | AtFlags::EMPTY_PATH.bits();
+        let parsed = at_flags(flags, FACCESSAT_FLAGS).unwrap();
+        assert!(parsed.contains(AtFlags::EACCESS));
+        assert!(parsed.contains(AtFlags::SYMLINK_NOFOLLOW));
+        assert!(parsed.contains(AtFlags::EMPTY_PATH));
+        assert_eq!(
+            at_flags(AtFlags::SYMLINK_FOLLOW.bits(), FACCESSAT_FLAGS).err(),
+            Some(LxError::EINVAL)
+        );
+    }
+
+    /// `utimensat` has accepted `AT_EMPTY_PATH` since Linux 5.8; the
+    /// hand-rolled check only admitted `0` or exactly `NOFOLLOW`.
+    #[test]
+    fn utimensat_accepts_at_empty_path() {
+        let flags = AtFlags::SYMLINK_NOFOLLOW.bits() | AtFlags::EMPTY_PATH.bits();
+        let parsed = at_flags(flags, UTIMENSAT_FLAGS).unwrap();
+        assert!(parsed.contains(AtFlags::SYMLINK_NOFOLLOW));
+        assert!(parsed.contains(AtFlags::EMPTY_PATH));
+        assert_eq!(
+            at_flags(AtFlags::EACCESS.bits(), UTIMENSAT_FLAGS).err(),
+            Some(LxError::EINVAL)
+        );
+    }
+}
+
+#[cfg(test)]
+mod mkdir_perm_tests {
+    use super::create_perm;
+
+    /// Create syscalls keep only `S_IRWXUGO|S_ISVTX`. A caller that passes
+    /// `0o100644` / `0o40755` (with type bits) must not leave them in the mode.
+    #[test]
+    fn type_bits_are_stripped_before_umask() {
+        assert_eq!(create_perm(0o755), 0o755);
+        assert_eq!(create_perm(0o40755), 0o755);
+        assert_eq!(create_perm(0o100644), 0o644);
+        assert_eq!(create_perm(0o1777), 0o1777);
+        assert_eq!(create_perm(0o41777), 0o1777);
+        assert_eq!(create_perm(usize::MAX), 0o7777);
     }
 }
 

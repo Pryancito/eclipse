@@ -31,11 +31,7 @@ impl Syscall<'_> {
         );
         let proc = self.thread.proc();
         let channel = proc.get_object_with_rights::<Channel>(handle_value, Rights::READ)?;
-        const MAY_DISCARD: u32 = 1;
-        if options & !MAY_DISCARD != 0 {
-            return Err(ZxError::NOT_SUPPORTED);
-        }
-        let never_discard = options & MAY_DISCARD == 0;
+        let never_discard = channel_read_options(options)?;
 
         let msg = if never_discard {
             channel.check_and_read(|front_msg| {
@@ -273,7 +269,10 @@ impl Syscall<'_> {
         );
         let thread_state = self.thread.state();
         if thread_state == ThreadState::BlockedChannel {
-            unimplemented!();
+            // Finish of an interrupted channel_call is not wired yet; panic
+            // used to take down the kernel. Report NOT_SUPPORTED until the
+            // reply path is completed.
+            Err(ZxError::NOT_SUPPORTED)
         } else {
             Err(ZxError::BAD_STATE)
         }
@@ -451,10 +450,11 @@ fn prepare_message(
     // Resolve the channel before consuming a possible self-transfer handle.
     let object = proc.get_object_with_rights::<Channel>(channel, rights);
     let handles = handle_buffer.take(proc, num_handles)?;
+    // Channel error before options: bad options used to hide BAD_HANDLE.
+    let object = object?;
     if options & !USE_IOVEC != 0 {
         return Err(ZxError::INVALID_ARGS);
     }
-    let object = object?;
     let data = if options & USE_IOVEC != 0 {
         read_channel_iovecs(proc, bytes, num_bytes)?
     } else {
@@ -630,6 +630,16 @@ fn read_channel_iovecs(proc: &Process, ptr: UserInPtr<u8>, count: u32) -> ZxResu
     Ok(data)
 }
 
+/// `zx_channel_read` options: only `ZX_CHANNEL_READ_MAY_DISCARD` (bit 0).
+/// Unknown bits are `INVALID_ARGS`, not `NOT_SUPPORTED` — same as write/call.
+fn channel_read_options(options: u32) -> ZxResult<bool> {
+    const MAY_DISCARD: u32 = 1;
+    if options & !MAY_DISCARD != 0 {
+        return Err(ZxError::INVALID_ARGS);
+    }
+    Ok(options & MAY_DISCARD == 0)
+}
+
 #[repr(C)]
 #[derive(Debug)]
 pub struct ChannelCallArgs {
@@ -664,4 +674,24 @@ pub struct HandleDisposition {
     type_: u32,
     rights: u32,
     result: i32,
+}
+
+#[cfg(test)]
+mod channel_read_options_tests {
+    use super::*;
+
+    #[test]
+    fn only_may_discard_is_accepted() {
+        assert_eq!(channel_read_options(0), Ok(true));
+        assert_eq!(channel_read_options(1), Ok(false));
+        assert_eq!(
+            channel_read_options(2),
+            Err(ZxError::INVALID_ARGS),
+            "unknown bits used to be NOT_SUPPORTED"
+        );
+        assert_eq!(
+            channel_read_options(1 | (1 << 8)),
+            Err(ZxError::INVALID_ARGS)
+        );
+    }
 }

@@ -1363,12 +1363,26 @@ pub fn running_thread_count() -> usize {
 
 /// Runtime accounting returned by the current `ZX_INFO_TASK_RUNTIME` topic.
 #[repr(C)]
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Copy, Clone, Default)]
 pub struct TaskRuntimeInfo {
-    cpu_time: u64,
-    queue_time: u64,
-    page_fault_time: u64,
-    lock_contention_time: u64,
+    pub cpu_time: u64,
+    pub queue_time: u64,
+    pub page_fault_time: u64,
+    pub lock_contention_time: u64,
+}
+
+impl TaskRuntimeInfo {
+    /// Saturating sum of two runtime samples (process/job aggregation).
+    pub fn saturating_add(self, other: Self) -> Self {
+        Self {
+            cpu_time: self.cpu_time.saturating_add(other.cpu_time),
+            queue_time: self.queue_time.saturating_add(other.queue_time),
+            page_fault_time: self.page_fault_time.saturating_add(other.page_fault_time),
+            lock_contention_time: self
+                .lock_contention_time
+                .saturating_add(other.lock_contention_time),
+        }
+    }
 }
 
 /// Runtime accounting returned by `ZX_INFO_TASK_RUNTIME_V1`.
@@ -2501,6 +2515,21 @@ mod state_and_accounting_tests {
         assert_eq!(info.queue_time, 5_000);
         assert_eq!(info.page_fault_time, 0);
         assert_eq!(info.lock_contention_time, 0);
+    }
+
+    /// `ZX_INFO_TASK_RUNTIME` on a Process sums its live threads (not
+    /// `WRONG_TYPE`).
+    #[test]
+    fn process_runtime_info_sums_its_threads() {
+        let root = Job::root();
+        let proc = Process::create(&root, "proc").expect("process");
+        let t1 = Thread::create(&proc, "t1").expect("thread");
+        let t2 = Thread::create(&proc, "t2").expect("thread");
+        t1.time_add(1_000);
+        t2.time_add(2_000);
+        let info = proc.get_runtime_info();
+        assert_eq!(info.cpu_time, 3_000);
+        assert_eq!(info.queue_time, 3_000);
     }
 
     /// A thread that exits hands both of its clocks to its process before it

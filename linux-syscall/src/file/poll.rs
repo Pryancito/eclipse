@@ -184,6 +184,21 @@ fn epoll_create_size(raw: usize) -> Result<usize, LxError> {
     Ok(n as usize)
 }
 
+/// `poll(2)` / `ppoll(2)`'s `nfds`: an `unsigned int`, refused when it
+/// exceeds the soft `RLIMIT_NOFILE` (`do_sys_poll`: `if (nfds >
+/// rlimit(RLIMIT_NOFILE)) return -EINVAL`).
+///
+/// Unchecked, a huge `nfds` made `read_array(nfds)` try to copy an absurd
+/// `pollfd` vector out of userspace before anything else ran — and the
+/// man page's documented `EINVAL` never answered.
+fn poll_nfds(raw: usize, nofile: u64) -> Result<usize, LxError> {
+    let n = raw as u32 as usize;
+    if n as u64 > nofile {
+        return Err(LxError::EINVAL);
+    }
+    Ok(n)
+}
+
 /// What a poll/select pass does once it has scanned every fd and found
 /// nothing ready.
 #[derive(Debug, PartialEq, Eq)]
@@ -224,6 +239,33 @@ fn wake_after(limit: Option<Duration>, tick: Duration) -> Duration {
         Some(remaining) => remaining.min(tick),
         None => tick,
     }
+}
+
+/// Whether a wait's fd set is the one shape [`io_wait_interval`] may demote to
+/// the background-VT tick: at least one fd that counts, and every one of them
+/// a terminal. `None` is an fd that does not count -- a negative `pollfd`
+/// (POSIX says they are ignored), or an fd in none of `select`'s three sets;
+/// `Some` is whether that fd is a terminal, an fd the process cannot resolve
+/// counting as not one.
+///
+/// Written once because both wait loops computed it inline, and the decision
+/// it feeds has regressed in both directions. Keyed on `watch_interactive`
+/// alone it demoted PulseAudio's ALSA sink thread (`[pcm, timer]`, never on
+/// the active VT) to a 100 ms re-scan, and its 108 ms buffer underran on every
+/// wake; and a set with no terminal in it at all -- DRM fds, timerfds, pipes,
+/// the shape of a compositor's startup waits -- must not be demoted either, or
+/// every roundtrip is gated at a tenth of a second. An empty set is not the
+/// shape: there is no terminal in it to be on a background VT.
+fn only_terminals(fds: impl Iterator<Item = Option<bool>>) -> bool {
+    let mut any = false;
+    for is_terminal in fds {
+        match is_terminal {
+            None => continue,
+            Some(true) => any = true,
+            Some(false) => return false,
+        }
+    }
+    any
 }
 
 /// Pick the io-wait re-poll interval. The slow tick exists for exactly one
@@ -282,6 +324,8 @@ impl Syscall<'_> {
         timeout_msecs: isize,
     ) -> SysResult {
         let _ = self.maybe_handle_tty_intr()?;
+        // `nfds > RLIMIT_NOFILE` is EINVAL before the array is touched.
+        let nfds = poll_nfds(nfds, self.linux_process().file_limit().cur)?;
         let mut polls = ufds.read_array(nfds)?;
         info!(
             "poll: ufds: {:?}, nfds: {:?}, timeout_msecs: {}",
@@ -340,14 +384,17 @@ impl Syscall<'_> {
                 }
                 linux_object::net::io_wait_tick(watch_net, watch_interactive);
                 let proc = this.syscall.linux_process();
-                this.terminal_only = !this.polls.is_empty()
-                    && this.polls.iter().all(|p| {
-                        <FileDesc as Into<i32>>::into(p.fd) < 0
-                            || proc
-                                .get_file_like(p.fd)
+                this.terminal_only = only_terminals(this.polls.iter().map(|p| {
+                    if <FileDesc as Into<i32>>::into(p.fd) < 0 {
+                        None
+                    } else {
+                        Some(
+                            proc.get_file_like(p.fd)
                                 .map(|f| f.is_terminal())
-                                .unwrap_or(false)
-                    });
+                                .unwrap_or(false),
+                        )
+                    }
+                }));
                 let terminal_only = this.terminal_only;
                 let mut events = 0;
                 let mut early_err = None;
@@ -437,11 +484,20 @@ impl Syscall<'_> {
                 // the short tick for the whole set.
                 let mut covered = false;
                 if this.timeout_msecs != 0 {
-                    covered = !this.polls.is_empty();
+                    // Counted over the fds that could park a waker, not over
+                    // the array: a set of nothing but negative `pollfd`s is
+                    // all ignored slots, and calling that "every watched fd
+                    // has a subscription doing the real waking" stretched the
+                    // backstop to the covered tick with no event source
+                    // anywhere in the set. `select` already counted it this
+                    // way (`covered &= any_watched`).
+                    let mut any_watched = false;
+                    covered = true;
                     for p in this.polls.iter() {
                         if <FileDesc as Into<i32>>::into(p.fd) < 0 {
                             continue; // ignored slot (POSIX): nothing to wake on
                         }
+                        any_watched = true;
                         match proc
                             .get_file_like(p.fd)
                             .ok()
@@ -451,6 +507,7 @@ impl Syscall<'_> {
                             None => covered = false,
                         }
                     }
+                    covered &= any_watched;
                 }
                 let covered_tick =
                     Duration::from_millis(linux_object::net::wait::IO_WAIT_COVERED_TICK_MS);
@@ -695,16 +752,14 @@ impl Syscall<'_> {
         // shape `io_wait_interval` may demote to the background-VT tick.
         let terminal_only = {
             let files = self.linux_process().get_files()?;
-            let mut any = false;
-            let all = (0..nfds).all(|fd| {
+            only_terminals((0..nfds).map(|fd| {
                 let fd = FileDesc::from(fd);
                 if !(read_fds.contains(fd) || write_fds.contains(fd) || err_fds.contains(fd)) {
-                    return true;
+                    None
+                } else {
+                    Some(files.get(&fd).map(|f| f.is_terminal()).unwrap_or(false))
                 }
-                any = true;
-                files.get(&fd).map(|f| f.is_terminal()).unwrap_or(false)
-            });
-            any && all
+            }))
         };
 
         #[must_use = "future does nothing unless polled/`await`-ed"]
@@ -986,10 +1041,13 @@ impl Syscall<'_> {
         // keeps the epoll object itself alive for the whole wait; `wait`
         // likewise holds each watched file by Arc, so the future carries no
         // reference that outlives what it points at.
+        // `get_file_like` answers EBADF for a closed fd; a live fd that is
+        // not an epoll is EINVAL (`do_epoll_wait`), same as `epoll_ctl`
+        // above. Mapping the downcast to EBADF used to erase that distinction.
         let epoll = match self
             .linux_process()
             .get_file_like(epfd)
-            .and_then(|f| f.downcast_arc::<Epoll>().map_err(|_| LxError::EBADF))
+            .and_then(|f| f.downcast_arc::<Epoll>().map_err(|_| LxError::EINVAL))
         {
             Ok(e) => e,
             Err(e) => {
@@ -998,7 +1056,6 @@ impl Syscall<'_> {
             }
         };
 
-        // TODO: handle timeout
         let result = match epoll.wait(maxevents, timeout).await {
             Ok(v) => {
                 if let Err(e) = events.write_array(&v) {
@@ -1561,6 +1618,65 @@ mod poll_tests {
         assert_eq!(io_wait_interval_for(true, true, true, false), IO_WAIT_TICK);
     }
 
+    // ---- the shape that feeds that decision ------------------------------
+
+    /// `terminal_only` is the *input* the two regressions above turned on, and
+    /// both wait loops computed it inline. A set of terminals alone is the
+    /// shape; one fd that is not a terminal takes the whole set out of it,
+    /// wherever in the set it sits.
+    #[test]
+    fn a_set_of_terminals_alone_is_the_shape_and_one_stranger_ends_it() {
+        let t = Some(true);
+        let f = Some(false);
+        assert!(only_terminals([t].iter().copied()));
+        assert!(only_terminals([t, t, t].iter().copied()));
+        assert!(!only_terminals([f, t, t].iter().copied()), "first");
+        assert!(!only_terminals([t, f, t].iter().copied()), "middle");
+        assert!(!only_terminals([t, t, f].iter().copied()), "last");
+        assert!(!only_terminals([f].iter().copied()));
+    }
+
+    /// An fd that does not count must not be able to *make* the shape: a
+    /// `poll` set of nothing but the `-1`s udhcpc6 leaves behind, or a
+    /// `select` whose three sets are empty below `nfds`, has no terminal in it
+    /// to be on a background VT.
+    #[test]
+    fn fds_that_do_not_count_cannot_make_the_shape_on_their_own() {
+        assert!(!only_terminals(core::iter::empty()));
+        assert!(!only_terminals([None].iter().copied()));
+        assert!(!only_terminals([None, None, None].iter().copied()));
+    }
+
+    /// But they do not break it either: one real terminal beside them is
+    /// still a shell on a VT.
+    #[test]
+    fn an_ignored_fd_beside_a_terminal_leaves_the_shape_alone() {
+        assert!(only_terminals([None, Some(true), None].iter().copied()));
+        assert!(
+            !only_terminals([None, Some(false), None].iter().copied()),
+            "an ignored fd does not excuse the one that is not a terminal"
+        );
+    }
+
+    /// The decision this shape feeds, end to end: it is only ever a demotion
+    /// for a set of terminals that is not on the active VT.
+    #[test]
+    fn only_a_background_set_of_terminals_reaches_the_slow_tick() {
+        let demoted = |fds: &[Option<bool>], on_active_vt| {
+            io_wait_interval_for(
+                false,
+                true,
+                only_terminals(fds.iter().copied()),
+                on_active_vt,
+            ) == SLOW_IO_WAIT_TICK
+        };
+        assert!(demoted(&[Some(true)], false));
+        assert!(!demoted(&[Some(true)], true));
+        assert!(!demoted(&[Some(true), Some(false)], false));
+        assert!(!demoted(&[None], false));
+        assert!(!demoted(&[], false));
+    }
+
     // ---- select(2)'s nfds -----------------------------------------------
 
     #[test]
@@ -1597,6 +1713,32 @@ mod poll_tests {
         assert_eq!(select_nfds(0x1_0000_0008), Ok(8));
         // 0xffff_ffff is `int` -1, not four billion fds.
         assert_eq!(select_nfds(0x0000_0000_ffff_ffff), Err(LxError::EINVAL));
+    }
+
+    // ---- poll(2)'s nfds vs RLIMIT_NOFILE ---------------------------------
+
+    #[test]
+    fn poll_nfds_at_or_under_the_limit_is_fine() {
+        assert_eq!(poll_nfds(0, 1024), Ok(0));
+        assert_eq!(poll_nfds(1024, 1024), Ok(1024));
+        assert_eq!(poll_nfds(1, 1), Ok(1));
+    }
+
+    #[test]
+    fn poll_nfds_past_rlimit_nofile_is_einval() {
+        assert_eq!(poll_nfds(1025, 1024), Err(LxError::EINVAL));
+        assert_eq!(poll_nfds(u32::MAX as usize, 1024), Err(LxError::EINVAL));
+    }
+
+    #[test]
+    fn poll_nfds_is_an_unsigned_int_not_a_whole_usize() {
+        // High half discarded: same narrowing as the syscall's `unsigned int`.
+        assert_eq!(poll_nfds(0x1_0000_0008, 1024), Ok(8));
+        // Soft limit unlimited: every unsigned int fits.
+        assert_eq!(
+            poll_nfds(u32::MAX as usize, u64::MAX),
+            Ok(u32::MAX as usize)
+        );
     }
 
     // ---- epoll_wait(2)'s maxevents ---------------------------------------

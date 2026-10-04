@@ -3518,8 +3518,30 @@ pub const ZIRCON_USER_ASPACE_BASE: u64 = 0x0100_0000;
 pub const USER_ASPACE_SIZE: u64 = (1u64 << 38) - USER_ASPACE_BASE;
 #[cfg(not(target_arch = "riscv64"))]
 pub const USER_ASPACE_SIZE: u64 = (1u64 << 47) - 4096 - USER_ASPACE_BASE;
-/// The default number of user stack pages
-pub const USER_STACK_PAGES: usize = 128;
+/// The number of pages in a new process's main stack: 2048, i.e. 8 MiB.
+///
+/// This is Linux's `_STK_LIM`, and it is the number `RLIMIT_STACK` reports to
+/// userspace (`linux_object::process::USER_STACK_SIZE`, which a `const` assert
+/// in the ELF loader keeps equal to this). The two have to agree, because a C
+/// library and a compiler both believe `RLIMIT_STACK`: it is what decides how
+/// much stack a thread may use, and `-fstack-clash-protection` probes every
+/// page of a large frame on the way down expecting all of it to be there.
+///
+/// It was 128 pages (512 KiB) and that is a sixteenth of what was advertised,
+/// so an ordinary desktop program died on an ordinary frame. `halloy` (an IRC
+/// client) took a `SIGSEGV` on real hardware inside `libvulkan.so.1` with
+/// 453 KiB of stack already live and a 90 KiB frame to claim: its probe loop
+/// (`orq $0,0xff8(%rsp)` / `cmp %rdx,%rsp` / `jne`) wrote at
+/// `0x7ffffff7e028`, one page below the bottom of a 512 KiB stack, and the
+/// guard page there turned the overflow into an undeliverable `SIGSEGV`
+/// instead of growing the stack. 544 KiB of stack is nothing; a program is
+/// entitled to the 8 MiB it was promised.
+///
+/// The mapping costs no memory: the loader maps it with `map_range=false` and
+/// a paged VMO keeps its frames in a `BTreeMap`, so only the pages a process
+/// actually touches are ever committed. What it costs is 8 MiB of the top of
+/// a 128 TiB address space.
+pub const USER_STACK_PAGES: usize = 2048;
 
 #[cfg(test)]
 mod tests {

@@ -1050,6 +1050,11 @@ const USB_DESC_IFACE: u8 = 0x04;
 const USB_DESC_EP: u8 = 0x05;
 const USB_DESC_HID: u8 = 0x21;
 const USB_DESC_HID_REPORT: u8 = 0x22;
+/// How much of a report descriptor `/proc/usbhid` keeps. A wheel mouse's
+/// descriptor runs past 64 bytes (Microsoft's hi-res wheel sample is over
+/// 120), and the wheel is declared near the end: a 64-byte snapshot cut off
+/// exactly the part a dead wheel needs read.
+const REPORT_DESC_SNAPSHOT: usize = 256;
 const EP_TYPE_CONTROL: u32 = 4 << 3;
 const EP_TYPE_INT_IN: u32 = 7 << 3;
 const HID_PROTO_KEY: u8 = 1;
@@ -1083,7 +1088,7 @@ fn mouse_report_is_truncated(ml: &MouseLayout, actual_len: usize, boot_layout_ok
 /// fixed boot layout and therefore needs the device to be in boot protocol.
 fn hid_protocol_request(role: u8, parsed: &HidDescInfo) -> u8 {
     let have_layout = match role {
-        HID_PROTO_MOUSE => parsed.mouse.is_some(),
+        HID_PROTO_MOUSE => !parsed.mouse.is_empty(),
         HID_PROTO_KEY => parsed.key.is_some(),
         _ => false,
     };
@@ -1119,6 +1124,47 @@ fn is_vm_abs_tablet(vid: u16, pid: u16, proto: u8) -> bool {
         return false;
     }
     (vid == VBOX_USB_TABLET_VID && pid == VBOX_USB_TABLET_PID) || vid == QEMU_USB_VID
+}
+
+/// Whether enumeration reads an interface's report descriptor: every
+/// interface that has one, except a boot keyboard (decoded with the fixed boot
+/// layout) and a VM tablet (decoded with its known VM layout).
+///
+/// A mouse is NOT an exception, even when `bInterfaceProtocol` already says
+/// "mouse". Almost every real USB mouse is boot subclass with protocol 2, and
+/// we used to classify it by those two fields alone and never read its
+/// descriptor. With no layout, `hid_protocol_request` then asked for BOOT
+/// protocol, whose report is three bytes with no wheel in it: the pointer
+/// moved and the wheel was dead, on every real mouse, with nothing logged.
+/// QEMU's `usb-mouse` hid it by sending its wheel byte in boot protocol too.
+fn reads_report_descriptor(proto: u8, vid: u16, pid: u16, report_desc_len: u16) -> bool {
+    report_desc_len > 0 && proto != HID_PROTO_KEY && !is_vm_abs_tablet(vid, pid, proto)
+}
+
+/// What an interface keeps from its parsed report descriptor. `class` is what
+/// the descriptor classified as; `mouse_by_protocol` is true when the
+/// interface's own protocol fields already made it a mouse.
+fn iface_desc_info(class: HidClass, parsed: HidDescInfo, mouse_by_protocol: bool) -> HidDescInfo {
+    HidDescInfo {
+        // Only a mouse-classified interface gets a pointer layout; the
+        // largest-report size matters for every interface's TD sizing.
+        mouse: if class == HidClass::Mouse {
+            parsed.mouse
+        } else {
+            MouseReports::default()
+        },
+        // The keyboard layout, on the other hand, is kept whatever the
+        // interface classified as: a combo receiver classifies as Mouse (it
+        // has relative X/Y) and still carries the keyboard reports, and so
+        // does a gaming mouse with macro keys. On an interface that is a
+        // mouse by protocol, though, a keyboard report WITHOUT a Report ID
+        // would claim every report on the endpoint, the mouse's included, so
+        // only one under its own ID is kept there.
+        key: parsed
+            .key
+            .filter(|k| !mouse_by_protocol || k.report_id.is_some()),
+        max_report_bytes: parsed.max_report_bytes,
+    }
 }
 
 /// How to drive a protocol-0 HID interface after sniffing its report descriptor.
@@ -1259,21 +1305,69 @@ struct BitField {
     len: usize,
 }
 
-/// Layout of a relative-mouse input report, extracted from its HID report
-/// descriptor.
+/// The pointer fields one input report carries, extracted from its HID report
+/// descriptor. Any of them can be missing: a mouse may split itself across
+/// report IDs (see [`MouseReports`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct MouseLayout {
     report_id: Option<u8>,
     /// Button bitmap (bit0 = left, bit1 = right, bit2 = middle, …), ≤ 8 bits.
-    buttons: BitField,
-    x: BitField,
-    y: BitField,
+    /// Only a block that starts at Button 1 counts: a second block of extra
+    /// buttons in another report is not left/right/middle.
+    buttons: Option<BitField>,
+    x: Option<BitField>,
+    y: Option<BitField>,
     /// Vertical wheel (Generic Desktop usage 0x38), if present.
     wheel: Option<BitField>,
     /// Horizontal pan (Consumer usage 0x238 "AC Pan"), if present.
     hwheel: Option<BitField>,
     /// Size in bytes of this report, ID byte included.
     report_bytes: usize,
+}
+
+/// How many input reports of one interface can carry pointer fields.
+const MAX_MOUSE_REPORTS: usize = 4;
+
+/// Every input report of an interface that carries a pointer field.
+///
+/// Linux maps each field of each report on its own, so a mouse is free to put
+/// its buttons and wheel in one report ID and its X/Y in another -- Xiaomi's
+/// wireless mouse dongle does exactly that (`MIDongleMIWirelessMouse` in the
+/// kernel's HID selftests). Requiring one report with buttons, X and Y found
+/// no mouse at all there, which on a boot-subclass interface meant falling
+/// back to boot protocol: pointer alive, wheel dead, and nothing logged.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct MouseReports {
+    reports: [Option<MouseLayout>; MAX_MOUSE_REPORTS],
+}
+
+impl MouseReports {
+    fn is_empty(&self) -> bool {
+        self.reports[0].is_none()
+    }
+
+    fn iter(&self) -> impl Iterator<Item = MouseLayout> + '_ {
+        self.reports.iter().map_while(|r| *r)
+    }
+
+    /// The report that moves the pointer: the first one with X and Y.
+    fn primary(&self) -> Option<MouseLayout> {
+        self.iter().find(|r| r.x.is_some() && r.y.is_some())
+    }
+
+    /// A vertical wheel somewhere. A pan alone does not scroll a page.
+    fn has_wheel(&self) -> bool {
+        self.iter().any(|r| r.wheel.is_some())
+    }
+
+    /// The layout of the report in `buf`: by its Report ID, or the only
+    /// report of an interface that has none.
+    fn for_report(&self, buf: &[u8]) -> Option<MouseLayout> {
+        self.iter().find(|r| match r.report_id {
+            Some(id) => buf.first().copied() == Some(id),
+            None => true,
+        })
+    }
 }
 
 /// Layout of a keyboard input report, extracted from its HID report
@@ -1322,8 +1416,9 @@ fn decode_keyboard(buf: &[u8], kl: &KeyLayout) -> (u8, [u8; 6]) {
 /// What a HID report descriptor tells us about an interface.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct HidDescInfo {
-    /// The first complete relative-mouse report on the interface, if any.
-    mouse: Option<MouseLayout>,
+    /// The reports that carry pointer fields; empty when the interface is not
+    /// a relative mouse.
+    mouse: MouseReports,
     /// The first keyboard report on the interface, if any. An interface can
     /// carry BOTH this and `mouse` under different report IDs — that is what
     /// every wireless combo receiver looks like.
@@ -1415,8 +1510,9 @@ fn emit_scroll(lis: &EventListener<InputEvent>, wheel: i32, hwheel: i32) {
 /// One relative-mouse report, decoded into what evdev wants.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct MouseDelta {
-    /// Button bitmap, bit 0 = left, as the report carries it.
-    buttons: u8,
+    /// Button bitmap, bit 0 = left, as the report carries it; `None` when
+    /// this report has no buttons, so the ones held stay held.
+    buttons: Option<u8>,
     dx: i32,
     dy: i32,
     wheel: i32,
@@ -1437,7 +1533,7 @@ struct MouseDelta {
 /// multiplexes report IDs, and the keyboard side of a combo receiver must not
 /// have its keycodes decoded as buttons and deltas.
 fn decode_mouse_report(
-    layout: Option<MouseLayout>,
+    layouts: &MouseReports,
     buf: &[u8],
     report_len: usize,
     boot_layout_ok: bool,
@@ -1445,31 +1541,21 @@ fn decode_mouse_report(
     if report_len < 3 || buf.len() < 3 {
         return None;
     }
-    match layout {
-        Some(ml) => {
-            let id_ok = match ml.report_id {
-                Some(id) => buf.first().copied() == Some(id),
-                None => true,
-            };
-            if !id_ok {
-                return None;
-            }
-            Some(MouseDelta {
-                buttons: read_bits(buf, ml.buttons.off, ml.buttons.len) as u8,
-                dx: read_signed_bits(buf, ml.x.off, ml.x.len),
-                dy: read_signed_bits(buf, ml.y.off, ml.y.len),
-                wheel: ml
-                    .wheel
-                    .map(|f| read_signed_bits(buf, f.off, f.len))
-                    .unwrap_or(0),
-                hwheel: ml
-                    .hwheel
-                    .map(|f| read_signed_bits(buf, f.off, f.len))
-                    .unwrap_or(0),
-            })
-        }
-        None if boot_layout_ok => Some(MouseDelta {
-            buttons: buf[0],
+    if !layouts.is_empty() {
+        let ml = layouts.for_report(buf)?;
+        let signed =
+            |f: Option<BitField>| f.map(|f| read_signed_bits(buf, f.off, f.len)).unwrap_or(0);
+        return Some(MouseDelta {
+            buttons: ml.buttons.map(|f| read_bits(buf, f.off, f.len) as u8),
+            dx: signed(ml.x),
+            dy: signed(ml.y),
+            wheel: signed(ml.wheel),
+            hwheel: signed(ml.hwheel),
+        });
+    }
+    match boot_layout_ok {
+        true => Some(MouseDelta {
+            buttons: Some(buf[0]),
             dx: buf[1] as i8 as i32,
             dy: buf[2] as i8 as i32,
             wheel: if report_len >= 4 {
@@ -1483,7 +1569,7 @@ fn decode_mouse_report(
                 0
             },
         }),
-        None => None,
+        false => None,
     }
 }
 
@@ -1491,6 +1577,7 @@ fn decode_mouse_report(
 /// bitmap to remember. Buttons are edges, axes are deltas, and the frame is
 /// closed by exactly one `SYN_REPORT` however little moved.
 fn emit_mouse(lis: &EventListener<InputEvent>, d: MouseDelta, last_buttons: u8) -> u8 {
+    let buttons = d.buttons.unwrap_or(last_buttons);
     for (mask, code) in [
         (1u8, BTN_LEFT),
         (2u8, BTN_RIGHT),
@@ -1498,7 +1585,7 @@ fn emit_mouse(lis: &EventListener<InputEvent>, d: MouseDelta, last_buttons: u8) 
         (8u8, BTN_SIDE),
         (16u8, BTN_EXTRA),
     ] {
-        let down = (d.buttons & mask) != 0;
+        let down = (buttons & mask) != 0;
         let was = (last_buttons & mask) != 0;
         if down != was {
             lis.trigger(InputEvent {
@@ -1532,7 +1619,7 @@ fn emit_mouse(lis: &EventListener<InputEvent>, d: MouseDelta, last_buttons: u8) 
         code: SYN_REPORT,
         value: 0,
     });
-    d.buttons
+    buttons
 }
 
 /// Linux's own ceilings on a HID report descriptor (`hid_parser_global` in
@@ -1571,12 +1658,19 @@ const USAGE_KEY_LEFTCTRL: u32 = 0x0007_00E0;
 /// every Input item tracking the running bit position per report ID; the
 /// first report that has buttons, a relative X and a relative Y becomes the
 /// mouse layout, and every report's size feeds `max_report_bytes`.
+///
+/// A report ID can be interrupted and come back: Microsoft's hi-res wheel
+/// sample declares X/Y under the input report's ID, switches to a Feature
+/// report ID for the Resolution Multiplier, then switches BACK to declare the
+/// Wheel. Those fields continue the same input report (Linux's hid-core
+/// appends them to it), so each ID keeps its own walk and resumes it.
 fn parse_hid_descriptor(desc: &[u8]) -> HidDescInfo {
-    // Global items (saved/restored by Push/Pop).
+    // Global items (saved/restored by Push/Pop). Report ID is a global item
+    // too (HID 1.11 §6.2.2.7), so the stack carries it; it lives in `cur.id`.
     let mut usage_page: u32 = 0;
     let mut report_size: u32 = 0;
     let mut report_count: u32 = 0;
-    let mut stack: [(u32, u32, u32); 8] = [(0, 0, 0); 8];
+    let mut stack: [(u32, u32, u32, Option<u8>); 8] = [(0, 0, 0, None); 8];
     let mut sp = 0usize;
     // Local items (cleared by every Main item). Usages are normalised to
     // `(page << 16) | id` so 4-byte extended usages and 2-byte ones compare
@@ -1585,25 +1679,10 @@ fn parse_hid_descriptor(desc: &[u8]) -> HidDescInfo {
     let mut n_local = 0usize;
     let mut usage_min: u32 = 0;
     let mut usage_max: u32 = 0;
-    // Per-report state.
-    let mut report_id: Option<u8> = None;
-    let mut bit_pos = 0usize;
-    let mut buttons: Option<BitField> = None;
-    let mut x: Option<BitField> = None;
-    let mut y: Option<BitField> = None;
-    let mut wheel: Option<BitField> = None;
-    let mut hwheel: Option<BitField> = None;
-    let mut kmods: Option<BitField> = None;
-    let mut kkeys: Option<(BitField, usize)> = None;
-
-    let mut info = HidDescInfo::default();
-
-    /// Close the report walked so far: account its size and, if it is the
-    /// first complete mouse report, promote it to the layout.
-    #[allow(clippy::too_many_arguments)]
-    fn finish(
-        info: &mut HidDescInfo,
-        report_id: Option<u8>,
+    /// One input report as walked so far.
+    #[derive(Clone, Copy, Default)]
+    struct ReportWalk {
+        id: Option<u8>,
         bit_pos: usize,
         buttons: Option<BitField>,
         x: Option<BitField>,
@@ -1612,13 +1691,49 @@ fn parse_hid_descriptor(desc: &[u8]) -> HidDescInfo {
         hwheel: Option<BitField>,
         kmods: Option<BitField>,
         kkeys: Option<(BitField, usize)>,
-    ) {
-        let bytes = bit_pos.div_ceil(8);
+    }
+    let mut cur = ReportWalk::default();
+    // Every report left by a Report ID switch, in order of first appearance,
+    // so one that comes back resumes where it stopped.
+    let mut parked: Vec<ReportWalk> = Vec::new();
+    fn park(parked: &mut Vec<ReportWalk>, r: ReportWalk) {
+        match parked.iter_mut().find(|p| p.id == r.id) {
+            Some(slot) => *slot = r,
+            None => parked.push(r),
+        }
+    }
+    /// Make `id` the report being walked: park the current one, and resume
+    /// `id`'s walk if it was interrupted earlier (see the doc comment above).
+    /// A report with an ID starts at bit 8, after the ID byte.
+    fn switch_to(cur: &mut ReportWalk, parked: &mut Vec<ReportWalk>, id: Option<u8>) {
+        if cur.id == id {
+            return;
+        }
+        if cur.id.is_some() || cur.bit_pos > 0 {
+            park(parked, *cur);
+        }
+        *cur = parked
+            .iter()
+            .find(|p| p.id == id)
+            .copied()
+            .unwrap_or(ReportWalk {
+                id,
+                bit_pos: if id.is_some() { 8 } else { 0 },
+                ..ReportWalk::default()
+            });
+    }
+
+    let mut info = HidDescInfo::default();
+
+    /// Close a walked report: account its size, and keep it if it carries a
+    /// pointer field or is the first keyboard report.
+    fn finish(info: &mut HidDescInfo, r: &ReportWalk) {
+        let bytes = r.bit_pos.div_ceil(8);
         info.max_report_bytes = info.max_report_bytes.max(bytes);
         if info.key.is_none() {
-            if let (Some(mods), Some((keys, key_count))) = (kmods, kkeys) {
+            if let (Some(mods), Some((keys, key_count))) = (r.kmods, r.kkeys) {
                 info.key = Some(KeyLayout {
-                    report_id,
+                    report_id: r.id,
                     mods,
                     keys,
                     key_count,
@@ -1626,15 +1741,20 @@ fn parse_hid_descriptor(desc: &[u8]) -> HidDescInfo {
                 });
             }
         }
-        if info.mouse.is_none() {
-            if let (Some(buttons), Some(x), Some(y)) = (buttons, x, y) {
-                info.mouse = Some(MouseLayout {
-                    report_id,
-                    buttons,
-                    x,
-                    y,
-                    wheel,
-                    hwheel,
+        let pointer = r.buttons.is_some()
+            || r.x.is_some()
+            || r.y.is_some()
+            || r.wheel.is_some()
+            || r.hwheel.is_some();
+        if pointer {
+            if let Some(slot) = info.mouse.reports.iter_mut().find(|s| s.is_none()) {
+                *slot = Some(MouseLayout {
+                    report_id: r.id,
+                    buttons: r.buttons,
+                    x: r.x,
+                    y: r.y,
+                    wheel: r.wheel,
+                    hwheel: r.hwheel,
                     report_bytes: bytes,
                 });
             }
@@ -1680,7 +1800,7 @@ fn parse_hid_descriptor(desc: &[u8]) -> HidDescInfo {
             (1, 0xa) => {
                 // Push
                 if sp < stack.len() {
-                    stack[sp] = (usage_page, report_size, report_count);
+                    stack[sp] = (usage_page, report_size, report_count, cur.id);
                     sp += 1;
                 }
             }
@@ -1688,32 +1808,17 @@ fn parse_hid_descriptor(desc: &[u8]) -> HidDescInfo {
                 // Pop
                 if sp > 0 {
                     sp -= 1;
-                    (usage_page, report_size, report_count) = stack[sp];
+                    let id;
+                    (usage_page, report_size, report_count, id) = stack[sp];
+                    // Popping back to another report ID moves the walk
+                    // there, exactly as a Report ID item would.
+                    switch_to(&mut cur, &mut parked, id);
                 }
             }
             (1, 8) => {
                 // Global Report ID: every report on the interface starts with
-                // its ID byte, so fields begin at bit 8. A different ID starts
-                // a new report — close the previous one (it may already be the
-                // mouse) and keep walking for the sizes of the others.
-                let id = data as u8;
-                if report_id != Some(id) {
-                    if report_id.is_some() || bit_pos > 0 {
-                        finish(
-                            &mut info, report_id, bit_pos, buttons, x, y, wheel, hwheel, kmods,
-                            kkeys,
-                        );
-                        buttons = None;
-                        x = None;
-                        y = None;
-                        wheel = None;
-                        hwheel = None;
-                        kmods = None;
-                        kkeys = None;
-                    }
-                    report_id = Some(id);
-                    bit_pos = 8;
-                }
+                // its ID byte, so a new report's fields begin at bit 8.
+                switch_to(&mut cur, &mut parked, Some(data as u8));
             }
             (2, 0) => {
                 if n_local < local_usages.len() {
@@ -1739,14 +1844,14 @@ fn parse_hid_descriptor(desc: &[u8]) -> HidDescInfo {
                         // them by shape rather than assuming the boot layout is
                         // what lets a report-protocol keyboard work at all.
                         if variable && fbits == 1 && usage_min == USAGE_KEY_LEFTCTRL {
-                            kmods.get_or_insert(BitField {
-                                off: bit_pos,
+                            cur.kmods.get_or_insert(BitField {
+                                off: cur.bit_pos,
                                 len: count.min(8),
                             });
                         } else if !variable && count > 0 {
-                            kkeys.get_or_insert((
+                            cur.kkeys.get_or_insert((
                                 BitField {
-                                    off: bit_pos,
+                                    off: cur.bit_pos,
                                     len: fbits,
                                 },
                                 count,
@@ -1755,10 +1860,21 @@ fn parse_hid_descriptor(desc: &[u8]) -> HidDescInfo {
                     } else if usage_page == USAGE_PAGE_BUTTON {
                         // Button block: one bit per button. Only the first 8
                         // map onto BTN_LEFT..BTN_EXTRA; the rest are skipped
-                        // but still counted in `bit_pos`.
-                        if fbits == 1 && buttons.is_none() {
-                            buttons = Some(BitField {
-                                off: bit_pos,
+                        // but still counted in `bit_pos`. The block has to
+                        // start at Button 1 for its bits to be left, right,
+                        // middle: a mouse that sends buttons 6..16 in a
+                        // report of their own must not have them read as
+                        // left and right.
+                        let first = if usage_min != 0 {
+                            usage_min
+                        } else if n_local > 0 {
+                            local_usages[0]
+                        } else {
+                            1
+                        };
+                        if fbits == 1 && cur.buttons.is_none() && first & 0xffff == 1 {
+                            cur.buttons = Some(BitField {
+                                off: cur.bit_pos,
                                 len: count.min(8),
                             });
                         }
@@ -1778,28 +1894,29 @@ fn parse_hid_descriptor(desc: &[u8]) -> HidDescInfo {
                                 0
                             };
                             let f = BitField {
-                                off: bit_pos + j * fbits,
+                                off: cur.bit_pos + j * fbits,
                                 len: fbits,
                             };
                             match usage {
                                 USAGE_GD_X if relative => {
-                                    x.get_or_insert(f);
+                                    cur.x.get_or_insert(f);
                                 }
                                 USAGE_GD_Y if relative => {
-                                    y.get_or_insert(f);
+                                    cur.y.get_or_insert(f);
                                 }
                                 USAGE_GD_WHEEL if relative => {
-                                    wheel.get_or_insert(f);
+                                    cur.wheel.get_or_insert(f);
                                 }
                                 USAGE_CONSUMER_AC_PAN if relative => {
-                                    hwheel.get_or_insert(f);
+                                    cur.hwheel.get_or_insert(f);
                                 }
                                 _ => {}
                             }
                         }
                     }
                 }
-                bit_pos = bit_pos
+                cur.bit_pos = cur
+                    .bit_pos
                     .saturating_add(fbits.saturating_mul(count))
                     .min(HID_MAX_REPORT_BITS);
                 n_local = 0;
@@ -1816,15 +1933,21 @@ fn parse_hid_descriptor(desc: &[u8]) -> HidDescInfo {
             _ => {}
         }
     }
-    finish(
-        &mut info, report_id, bit_pos, buttons, x, y, wheel, hwheel, kmods, kkeys,
-    );
-    // Axes wider than the decoder are not a mouse we can drive.
-    if let Some(ml) = info.mouse {
-        let bad = |f: BitField| f.len == 0 || f.len > 32;
-        if bad(ml.x) || bad(ml.y) || ml.buttons.len == 0 {
-            info.mouse = None;
-        }
+    park(&mut parked, cur);
+    for r in &parked {
+        finish(&mut info, r);
+    }
+    // A relative mouse is a report with X and Y plus buttons somewhere, in
+    // that report or another. Axes wider than the decoder are not a mouse we
+    // can drive.
+    let bad = |f: Option<BitField>| f.is_none_or(|f| f.len == 0 || f.len > 32);
+    let drivable = info.mouse.primary().is_some_and(|p| !bad(p.x) && !bad(p.y))
+        && info
+            .mouse
+            .iter()
+            .any(|r| r.buttons.is_some_and(|b| b.len > 0));
+    if !drivable {
+        info.mouse = MouseReports::default();
     }
     info
 }
@@ -1954,11 +2077,11 @@ struct HidDev {
     last_wheel: (i32, i32),
     /// First bytes of the HID report descriptor (proto-0 interfaces), for
     /// /proc/usbhid. Empty for boot-protocol devices (no descriptor read).
-    report_desc: [u8; 64],
+    report_desc: [u8; REPORT_DESC_SNAPSHOT],
     report_desc_len: usize,
     /// Parsed relative-mouse report layout, when the descriptor gave one.
     /// `None` → parse the boot `[buttons, dx, dy, …]` layout.
-    mouse_layout: Option<MouseLayout>,
+    mouse_layout: MouseReports,
     /// Latched when this interface turned out to be speaking boot protocol
     /// after all (it refused SET_PROTOCOL(Report), or its BIOS left it there):
     /// its reports are shorter than `mouse_layout` describes, so decode the
@@ -3230,7 +3353,7 @@ impl XhciInner {
         report_desc_len: u16,
         vid: u16,
         pid: u16,
-        desc_out: &mut ([u8; 64], usize),
+        desc_out: &mut ([u8; REPORT_DESC_SNAPSHOT], usize),
         parsed_out: &mut HidDescInfo,
     ) -> DeviceResult<u8> {
         if is_vm_abs_tablet(vid, pid, proto) {
@@ -3239,17 +3362,26 @@ impl XhciInner {
         if proto == HID_PROTO_KEY {
             return Ok(HID_PROTO_KEY);
         }
-        if proto == HID_PROTO_MOUSE || (proto == 0 && subclass == HID_SUBCLASS_BOOT) {
+        let mouse_by_protocol =
+            proto == HID_PROTO_MOUSE || (proto == 0 && subclass == HID_SUBCLASS_BOOT);
+        let sniffed = if reads_report_descriptor(proto, vid, pid, report_desc_len) {
+            self.sniff_hid_report(
+                slot,
+                iface,
+                report_desc_len,
+                mouse_by_protocol,
+                desc_out,
+                parsed_out,
+            )
+            .unwrap_or(HidClass::Unknown)
+        } else {
+            HidClass::Unknown
+        };
+        if mouse_by_protocol {
             return Ok(HID_PROTO_MOUSE);
         }
         // protocol 0: real hardware. Never default this to tablet — that flag
         // silences PS/2 and boot-protocol USB mice (keyboard still works).
-        let sniffed = if report_desc_len > 0 {
-            self.sniff_hid_report(slot, iface, report_desc_len, desc_out, parsed_out)
-                .unwrap_or(HidClass::Unknown)
-        } else {
-            HidClass::Unknown
-        };
         let role = match sniffed {
             HidClass::Key => HID_PROTO_KEY,
             HidClass::Mouse => HID_PROTO_MOUSE,
@@ -3284,7 +3416,8 @@ impl XhciInner {
         slot: u8,
         iface: u8,
         report_desc_len: u16,
-        desc_out: &mut ([u8; 64], usize),
+        mouse_by_protocol: bool,
+        desc_out: &mut ([u8; REPORT_DESC_SNAPSHOT], usize),
         parsed_out: &mut HidDescInfo,
     ) -> Option<HidClass> {
         // `HID_MAX_DESCRIPTOR_SIZE` in Linux. A 1024-byte ceiling truncated
@@ -3329,21 +3462,7 @@ impl XhciInner {
         desc_out.0[..keep].copy_from_slice(&raw[..keep]);
         desc_out.1 = keep;
         let class = classify_hid_report(&raw);
-        let parsed = parse_hid_descriptor(&raw);
-        *parsed_out = HidDescInfo {
-            // Only a mouse-classified interface gets a pointer layout; the
-            // largest-report size matters for every interface's TD sizing.
-            mouse: if class == HidClass::Mouse {
-                parsed.mouse
-            } else {
-                None
-            },
-            // The keyboard layout, on the other hand, is kept whatever the
-            // interface classified as: a combo receiver classifies as Mouse
-            // (it has relative X/Y) and still carries the keyboard reports.
-            key: parsed.key,
-            max_report_bytes: parsed.max_report_bytes,
-        };
+        *parsed_out = iface_desc_info(class, parse_hid_descriptor(&raw), mouse_by_protocol);
         Some(class)
     }
 
@@ -3362,7 +3481,7 @@ impl XhciInner {
         vid: u16,
         pid: u16,
     ) -> DeviceResult<()> {
-        let mut report_desc: ([u8; 64], usize) = ([0; 64], 0);
+        let mut report_desc: ([u8; REPORT_DESC_SNAPSHOT], usize) = ([0; REPORT_DESC_SNAPSHOT], 0);
         let mut parsed = HidDescInfo::default();
         let real_proto = self.classify_hid_iface(
             slot,
@@ -3598,7 +3717,7 @@ impl XhciInner {
         // console is the only diagnostic left. /proc/usbhid has the detail;
         // these lines are what says to go look.
         if real_proto == HID_PROTO_MOUSE
-            && parsed.mouse.is_none()
+            && parsed.mouse.is_empty()
             && subclass != HID_SUBCLASS_BOOT
             && proto == 0
         {
@@ -3608,7 +3727,10 @@ impl XhciInner {
                  Paste `cat /proc/usbhid` to get its report_desc.",
                 slot, vid, pid, iface
             );
-        } else if real_proto == HID_PROTO_MOUSE && parsed.mouse.is_some_and(|m| m.wheel.is_none()) {
+        } else if real_proto == HID_PROTO_MOUSE
+            && !parsed.mouse.is_empty()
+            && !parsed.mouse.has_wheel()
+        {
             // ERROR, not info: a mouse whose descriptor declares no Wheel is
             // a mouse whose wheel cannot ever work, and a rig booted with
             // `LOG=error` prints nothing else. This is the line that answers
@@ -3788,7 +3910,7 @@ impl XhciInner {
                     let boot_layout_ok = h.subclass == HID_SUBCLASS_BOOT || h.if_proto != 0;
                     if !h.boot_reports
                         && h.protocol == HID_PROTO_MOUSE
-                        && h.mouse_layout.is_some_and(|ml| {
+                        && h.mouse_layout.primary().is_some_and(|ml| {
                             mouse_report_is_truncated(&ml, report_len, boot_layout_ok)
                         })
                     {
@@ -3803,12 +3925,19 @@ impl XhciInner {
                             h.pid,
                             h.iface,
                             report_len,
-                            h.mouse_layout.map(|ml| ml.report_bytes).unwrap_or(0),
+                            h.mouse_layout
+                                .primary()
+                                .map(|ml| ml.report_bytes)
+                                .unwrap_or(0),
                         );
                     }
-                    let layout = if h.boot_reports { None } else { h.mouse_layout };
+                    let layout = if h.boot_reports {
+                        MouseReports::default()
+                    } else {
+                        h.mouse_layout
+                    };
                     let decoded = decode_mouse_report(
-                        layout,
+                        &layout,
                         &tmp,
                         report_len,
                         h.protocol == HID_PROTO_MOUSE && boot_layout_ok,
@@ -4885,16 +5014,16 @@ impl InputScheme for XhciUsbHid {
                 let _ = write!(s, "{}{:02x}", if i == 0 { "" } else { " " }, b);
             }
             let _ = writeln!(s, "]");
-            if let Some(ml) = h.mouse_layout {
+            for ml in h.mouse_layout.iter() {
                 let bf = |f: BitField| alloc::format!("bit{}:{}", f.off, f.len);
                 let _ = writeln!(
                     s,
-                    "[usbhid]   layout report_id={:?} bytes={} buttons@{} x@{} y@{} wheel={:?} hwheel={:?}",
+                    "[usbhid]   layout report_id={:?} bytes={} buttons={:?} x={:?} y={:?} wheel={:?} hwheel={:?}",
                     ml.report_id,
                     ml.report_bytes,
-                    bf(ml.buttons),
-                    bf(ml.x),
-                    bf(ml.y),
+                    ml.buttons.map(bf),
+                    ml.x.map(bf),
+                    ml.y.map(bf),
                     ml.wheel.map(bf),
                     ml.hwheel.map(bf),
                 );
@@ -4906,7 +5035,7 @@ impl InputScheme for XhciUsbHid {
                      decoded with the fixed boot layout, no wheel"
                 );
             }
-            if h.mouse_layout.is_none()
+            if h.mouse_layout.is_empty()
                 && h.protocol == HID_PROTO_MOUSE
                 && h.subclass != HID_SUBCLASS_BOOT
                 && h.if_proto == 0
@@ -5169,6 +5298,92 @@ mod tests {
         0x15, 0x81, 0x25, 0x7F, 0x75, 0x08, 0x95, 0x03, 0x81, 0x06, //
         0xC0, 0xC0,
     ];
+    /// Microsoft's hi-res wheel sample: the input report (ID 2) is
+    /// interrupted by a Feature report (ID 3) for the Resolution Multiplier,
+    /// and the descriptor switches BACK to ID 2 to declare the Wheel and
+    /// again for AC Pan. Both belong to the same six-byte input report
+    /// `[02, buttons, X, Y, wheel, pan]`. Mice that copy this sample are why a
+    /// real wheel can be dead while QEMU's (no report IDs at all) works.
+    const SPLIT_REPORT_ID: &[u8] = &[
+        0x05, 0x01, 0x09, 0x02, 0xA1, 0x01, 0x05, 0x01, 0x09, 0x02, 0xA1, 0x02, //
+        0x85, 0x02, 0x09, 0x01, 0xA1, 0x00, //       Report ID (2), Pointer
+        0x05, 0x09, 0x19, 0x01, 0x29, 0x05, 0x15, 0x00, 0x25, 0x01, //
+        0x75, 0x01, 0x95, 0x05, 0x81, 0x02, 0x95, 0x03, 0x81, 0x01, //
+        0x05, 0x01, 0x09, 0x30, 0x09, 0x31, 0x15, 0x81, 0x25, 0x7F, //
+        0x75, 0x08, 0x95, 0x02, 0x81, 0x06, //       X, Y
+        0xA1, 0x02, 0x85, 0x03, 0x09, 0x48, //       Report ID (3), Res. Multiplier
+        0x15, 0x00, 0x25, 0x01, 0x35, 0x01, 0x45, 0x04, //
+        0x75, 0x02, 0x95, 0x01, 0xA4, 0xB1, 0x02, // Push, Feature
+        0x85, 0x02, 0x09, 0x38, 0x35, 0x00, 0x45, 0x00, // back to ID 2, Wheel
+        0x15, 0x81, 0x25, 0x7F, 0x75, 0x08, 0x81, 0x06, 0xC0, //
+        0xA1, 0x02, 0x85, 0x03, 0x09, 0x48, 0xB4, 0xB1, 0x02, // ID 3, Pop, Feature
+        0x35, 0x00, 0x45, 0x00, 0x75, 0x04, 0xB1, 0x03, //
+        0x85, 0x02, 0x05, 0x0C, 0x0A, 0x38, 0x02, // back to ID 2, AC Pan
+        0x15, 0x81, 0x25, 0x7F, 0x75, 0x08, 0x95, 0x01, 0x81, 0x06, 0xC0, //
+        0xC0, 0xC0, 0xC0,
+    ];
+    /// Report ID is a global item, so Push saves it and Pop restores it.
+    /// Report 1 is a mouse; after Push a 16-bit consumer report 2 is
+    /// declared, and the Pop takes the descriptor back to report 1 for the
+    /// Wheel, with no Report ID item on the way back.
+    const POP_RESTORES_REPORT_ID: &[u8] = &[
+        0x05, 0x01, 0x09, 0x02, 0xA1, 0x01, 0x85, 0x01, 0x09, 0x01, 0xA1, 0x00, //
+        0x05, 0x09, 0x19, 0x01, 0x29, 0x03, 0x15, 0x00, 0x25, 0x01, //
+        0x75, 0x01, 0x95, 0x03, 0x81, 0x02, 0x75, 0x05, 0x95, 0x01, 0x81, 0x01, //
+        0x05, 0x01, 0x09, 0x30, 0x09, 0x31, 0x15, 0x81, 0x25, 0x7F, //
+        0x75, 0x08, 0x95, 0x02, 0x81, 0x06, //       X, Y
+        0xA4, //                                     Push (ID 1)
+        0x85, 0x02, 0x05, 0x0C, 0x09, 0xE9, 0x15, 0x00, 0x26, 0xFF, 0x00, //
+        0x75, 0x10, 0x95, 0x01, 0x81, 0x00, //       report 2: 16-bit consumer
+        0xB4, //                                     Pop (back to ID 1)
+        0x09, 0x38, 0x95, 0x01, 0x81, 0x06, //       Wheel
+        0xC0, 0xC0,
+    ];
+    /// Xiaomi's wireless mouse dongle (2717:003b), byte for byte as the
+    /// kernel's own HID selftests carry it (`MIDongleMIWirelessMouse` in
+    /// `tools/testing/selftests/hid/tests/test_mouse.py`). It spreads one
+    /// mouse over two report IDs: report 1 is `[01, buttons, wheel, pan]`,
+    /// report 2 is `[02, X12, Y12]`. Report 3 is the media keys.
+    const XIAOMI_SPLIT_MOUSE: &[u8] = &[
+        0x05, 0x01, 0x09, 0x02, 0xA1, 0x01, 0x85, 0x01, 0x09, 0x01, 0xA1, 0x00, 0x95, 0x05, 0x75,
+        0x01, 0x05, 0x09, 0x19, 0x01, 0x29, 0x05, 0x15, 0x00, 0x25, 0x01, 0x81, 0x02, 0x95, 0x01,
+        0x75, 0x03, 0x81, 0x01, 0x75, 0x08, 0x95, 0x01, 0x05, 0x01, 0x09, 0x38, 0x15, 0x81, 0x25,
+        0x7F, 0x81, 0x06, 0x05, 0x0C, 0x0A, 0x38, 0x02, 0x95, 0x01, 0x81, 0x06, 0xC0, 0x85, 0x02,
+        0x09, 0x01, 0xA1, 0x00, 0x75, 0x0C, 0x95, 0x02, 0x05, 0x01, 0x09, 0x30, 0x09, 0x31, 0x16,
+        0x01, 0xF8, 0x26, 0xFF, 0x07, 0x81, 0x06, 0xC0, 0xC0, 0x05, 0x0C, 0x09, 0x01, 0xA1, 0x01,
+        0x85, 0x03, 0x15, 0x00, 0x25, 0x01, 0x75, 0x01, 0x95, 0x01, 0x09, 0xCD, 0x81, 0x06, 0x0A,
+        0x83, 0x01, 0x81, 0x06, 0x09, 0xB5, 0x81, 0x06, 0x09, 0xB6, 0x81, 0x06, 0x09, 0xEA, 0x81,
+        0x06, 0x09, 0xE9, 0x81, 0x06, 0x0A, 0x25, 0x02, 0x81, 0x06, 0x0A, 0x24, 0x02, 0x81, 0x06,
+        0xC0,
+    ];
+    /// Microsoft-style hi-res wheel AND pan with 16-bit fields, from the same
+    /// selftests (`ResolutionMultiplierHWheelMouse`): report 26 is
+    /// `[1a, buttons, X16, Y16, wheel16, pan16]`.
+    const SIXTEEN_BIT_WHEEL_AND_PAN: &[u8] = &[
+        0x05, 0x01, 0x09, 0x02, 0xA1, 0x01, 0x05, 0x01, 0x09, 0x02, 0xA1, 0x02, 0x85, 0x1A, 0x09,
+        0x01, 0xA1, 0x00, 0x05, 0x09, 0x19, 0x01, 0x29, 0x05, 0x95, 0x05, 0x75, 0x01, 0x15, 0x00,
+        0x25, 0x01, 0x81, 0x02, 0x75, 0x03, 0x95, 0x01, 0x81, 0x01, 0x05, 0x01, 0x09, 0x30, 0x09,
+        0x31, 0x95, 0x02, 0x75, 0x10, 0x16, 0x01, 0x80, 0x26, 0xFF, 0x7F, 0x81, 0x06, 0xA1, 0x02,
+        0x85, 0x12, 0x09, 0x48, 0x95, 0x01, 0x75, 0x02, 0x15, 0x00, 0x25, 0x01, 0x35, 0x01, 0x45,
+        0x0C, 0xB1, 0x02, 0x85, 0x1A, 0x09, 0x38, 0x35, 0x00, 0x45, 0x00, 0x95, 0x01, 0x75, 0x10,
+        0x16, 0x01, 0x80, 0x26, 0xFF, 0x7F, 0x81, 0x06, 0xC0, 0xA1, 0x02, 0x85, 0x12, 0x09, 0x48,
+        0x75, 0x02, 0x15, 0x00, 0x25, 0x01, 0x35, 0x01, 0x45, 0x0C, 0xB1, 0x02, 0x35, 0x00, 0x45,
+        0x00, 0x75, 0x04, 0xB1, 0x01, 0x85, 0x1A, 0x05, 0x0C, 0x95, 0x01, 0x75, 0x10, 0x16, 0x01,
+        0x80, 0x26, 0xFF, 0x7F, 0x0A, 0x38, 0x02, 0x81, 0x06, 0xC0, 0xC0, 0xC0, 0xC0,
+    ];
+    /// Five buttons, X/Y and a wheel in report 1, and buttons 6..13 in report
+    /// 2 on their own. Gaming mice with side buttons do this. Report 2's first
+    /// bit is button 6, not the left button.
+    const EXTRA_BUTTONS_REPORT: &[u8] = &[
+        0x05, 0x01, 0x09, 0x02, 0xA1, 0x01, 0x85, 0x01, 0x09, 0x01, 0xA1, 0x00, //
+        0x05, 0x09, 0x19, 0x01, 0x29, 0x05, 0x15, 0x00, 0x25, 0x01, //
+        0x75, 0x01, 0x95, 0x05, 0x81, 0x02, 0x75, 0x03, 0x95, 0x01, 0x81, 0x01, //
+        0x05, 0x01, 0x09, 0x30, 0x09, 0x31, 0x09, 0x38, 0x15, 0x81, 0x25, 0x7F, //
+        0x75, 0x08, 0x95, 0x03, 0x81, 0x06, //       X, Y, Wheel
+        0x85, 0x02, 0x05, 0x09, 0x19, 0x06, 0x29, 0x0D, //   report 2, buttons 6..13
+        0x75, 0x01, 0x95, 0x08, 0x81, 0x02, //
+        0xC0, 0xC0,
+    ];
 
     /// A boot-shaped keyboard that also declares a Consumer Control
     /// collection for its media keys, under its own report ID. This is the
@@ -5222,11 +5437,11 @@ mod tests {
     #[test]
     fn a_plain_wheel_mouse_descriptor_yields_every_field() {
         let info = parse_hid_descriptor(MOUSE_5BTN_12BIT);
-        let ml = info.mouse.expect("a mouse layout");
+        let ml = info.mouse.primary().expect("a mouse layout");
         assert_eq!(ml.report_id, None);
-        assert_eq!(ml.buttons, BitField { off: 0, len: 5 });
-        assert_eq!(ml.x, BitField { off: 8, len: 12 });
-        assert_eq!(ml.y, BitField { off: 20, len: 12 });
+        assert_eq!(ml.buttons, Some(BitField { off: 0, len: 5 }));
+        assert_eq!(ml.x, Some(BitField { off: 8, len: 12 }));
+        assert_eq!(ml.y, Some(BitField { off: 20, len: 12 }));
         assert_eq!(ml.wheel, Some(BitField { off: 32, len: 8 }));
         assert_eq!(ml.hwheel, Some(BitField { off: 40, len: 8 }));
         assert_eq!(ml.report_bytes, 6);
@@ -5237,12 +5452,12 @@ mod tests {
     #[test]
     fn a_report_id_mouse_keeps_its_wheel_and_sizes_the_other_report() {
         let info = parse_hid_descriptor(MOUSE_WITH_REPORT_IDS);
-        let ml = info.mouse.expect("a mouse layout");
+        let ml = info.mouse.primary().expect("a mouse layout");
         assert_eq!(ml.report_id, Some(1));
         // Fields start after the report-ID byte.
-        assert_eq!(ml.buttons, BitField { off: 8, len: 3 });
-        assert_eq!(ml.x, BitField { off: 16, len: 8 });
-        assert_eq!(ml.y, BitField { off: 24, len: 8 });
+        assert_eq!(ml.buttons, Some(BitField { off: 8, len: 3 }));
+        assert_eq!(ml.x, Some(BitField { off: 16, len: 8 }));
+        assert_eq!(ml.y, Some(BitField { off: 24, len: 8 }));
         assert_eq!(ml.wheel, Some(BitField { off: 32, len: 8 }));
         assert_eq!(ml.report_bytes, 5);
         // The consumer report (ID byte + 16 bits) must be counted too, or the
@@ -5258,7 +5473,7 @@ mod tests {
         // the wheel was dead on real hardware: its Wheel field lives at byte 4
         // of a six-byte report the device then stops sending.
         let parsed = parse_hid_descriptor(MOUSE_5BTN_12BIT);
-        assert_eq!(parsed.mouse.unwrap().wheel.unwrap().off / 8, 4);
+        assert_eq!(parsed.mouse.primary().unwrap().wheel.unwrap().off / 8, 4);
         assert_eq!(
             hid_protocol_request(HID_PROTO_MOUSE, &parsed),
             HID_PROTOCOL_REPORT
@@ -5268,6 +5483,54 @@ mod tests {
             hid_protocol_request(HID_PROTO_KEY, &kbd),
             HID_PROTOCOL_REPORT
         );
+    }
+
+    #[test]
+    fn a_boot_mouse_reads_its_descriptor_and_is_put_in_report_protocol() {
+        // Moebius's mouse, 30fa:0400: boot subclass, bInterfaceProtocol 2.
+        // Its descriptor was never read, so it had no layout, was asked for
+        // boot protocol and sent three-byte reports with no wheel in them.
+        assert!(reads_report_descriptor(HID_PROTO_MOUSE, 0x30fa, 0x0400, 67));
+        assert!(reads_report_descriptor(0, 0x30fa, 0x0400, 67));
+        let info = iface_desc_info(
+            classify_hid_report(MOUSE_5BTN_12BIT),
+            parse_hid_descriptor(MOUSE_5BTN_12BIT),
+            true,
+        );
+        assert!(info.mouse.has_wheel());
+        assert_eq!(
+            hid_protocol_request(HID_PROTO_MOUSE, &info),
+            HID_PROTOCOL_REPORT
+        );
+    }
+
+    #[test]
+    fn a_boot_keyboard_a_vm_tablet_and_no_descriptor_are_not_read() {
+        assert!(!reads_report_descriptor(HID_PROTO_KEY, 0x30fa, 0x0400, 63));
+        assert!(!reads_report_descriptor(0, QEMU_USB_VID, 0x0001, 74));
+        assert!(!reads_report_descriptor(HID_PROTO_MOUSE, 0x30fa, 0x0400, 0));
+    }
+
+    #[test]
+    fn a_mouse_by_protocol_keeps_only_a_keyboard_report_with_its_own_id() {
+        // A keyboard report with no Report ID would take every report on the
+        // endpoint, the mouse's included.
+        let mut parsed = parse_hid_descriptor(MOUSE_5BTN_12BIT);
+        parsed.key = Some(BOOT_KEY_LAYOUT);
+        let class = classify_hid_report(MOUSE_5BTN_12BIT);
+        assert_eq!(iface_desc_info(class, parsed, true).key, None);
+        assert_eq!(
+            iface_desc_info(class, parsed, false).key,
+            Some(BOOT_KEY_LAYOUT)
+        );
+        let combo = parse_hid_descriptor(COMBO_RECEIVER);
+        assert!(combo.key.unwrap().report_id.is_some());
+        let class = classify_hid_report(COMBO_RECEIVER);
+        assert_eq!(iface_desc_info(class, combo, true).key, combo.key);
+        // And the pointer layout still follows what the descriptor is.
+        let kbd = parse_hid_descriptor(KBD_WITH_CONSUMER);
+        let class = classify_hid_report(KBD_WITH_CONSUMER);
+        assert!(iface_desc_info(class, kbd, true).mouse.is_empty());
     }
 
     #[test]
@@ -5297,7 +5560,10 @@ mod tests {
     fn the_wheel_byte_of_a_boot_report_is_simply_not_there() {
         // The regression in two assertions: the same layout over a full report
         // and over a boot report.
-        let ml = parse_hid_descriptor(MOUSE_5BTN_12BIT).mouse.unwrap();
+        let ml = parse_hid_descriptor(MOUSE_5BTN_12BIT)
+            .mouse
+            .primary()
+            .unwrap();
         let wheel = ml.wheel.unwrap();
         let mut full = [0u8; 6];
         full[4] = 1;
@@ -5314,12 +5580,18 @@ mod tests {
         // An interface that multiplexes Report IDs sends reports of several
         // lengths by design, so a short one there is a different report, not a
         // device stuck in boot protocol.
-        let ids = parse_hid_descriptor(MOUSE_WITH_REPORT_IDS).mouse.unwrap();
+        let ids = parse_hid_descriptor(MOUSE_WITH_REPORT_IDS)
+            .mouse
+            .primary()
+            .unwrap();
         assert!(!mouse_report_is_truncated(&ids, 3, true));
         // And an interface with no boot layout to fall back to (subclass 0,
         // bInterfaceProtocol 0) must keep decoding its descriptor, whatever
         // length its reports come in.
-        let plain = parse_hid_descriptor(MOUSE_5BTN_12BIT).mouse.unwrap();
+        let plain = parse_hid_descriptor(MOUSE_5BTN_12BIT)
+            .mouse
+            .primary()
+            .unwrap();
         assert!(!mouse_report_is_truncated(&plain, 3, false));
     }
 
@@ -5333,7 +5605,7 @@ mod tests {
     #[test]
     fn the_wheel_is_found_in_every_shape_a_real_mouse_ships() {
         // (descriptor, report id, wheel bit offset, report bytes).
-        let cases: [(&str, &[u8], Option<u8>, usize, usize); 7] = [
+        let cases: [(&str, &[u8], Option<u8>, usize, usize); 9] = [
             ("boot-shaped", BOOT_SHAPED, None, 24, 4),
             ("wide axes + pan", WIDE_AXES_AND_PAN, Some(1), 48, 8),
             ("hi-res wheel", HI_RES_WHEEL, Some(2), 40, 6),
@@ -5341,11 +5613,20 @@ mod tests {
             ("wheel first", WHEEL_FIRST, None, 8, 4),
             ("push/pop", PUSH_POP, None, 40, 6),
             ("combo receiver", COMBO_RECEIVER, Some(2), 32, 5),
+            ("split report id", SPLIT_REPORT_ID, Some(2), 32, 6),
+            (
+                "pop restores report id",
+                POP_RESTORES_REPORT_ID,
+                Some(1),
+                32,
+                5,
+            ),
         ];
         for (name, desc, id, wheel_off, bytes) in cases {
             let info = parse_hid_descriptor(desc);
             let ml = info
                 .mouse
+                .primary()
                 .unwrap_or_else(|| panic!("{}: no mouse layout at all", name));
             assert_eq!(ml.report_id, id, "{}: report id", name);
             assert_eq!(
@@ -5366,11 +5647,13 @@ mod tests {
         // The pan axis only exists where the descriptor declares AC Pan.
         assert!(parse_hid_descriptor(WIDE_AXES_AND_PAN)
             .mouse
+            .primary()
             .unwrap()
             .hwheel
             .is_some());
         assert!(parse_hid_descriptor(BOOT_SHAPED)
             .mouse
+            .primary()
             .unwrap()
             .hwheel
             .is_none());
@@ -5381,7 +5664,7 @@ mod tests {
     /// QEMU has never run, because it only ever attaches `usb-tablet`.
     fn mouse_frame(desc: &[u8], report: &[u8]) -> Vec<(u16, u16, i32)> {
         let ml = parse_hid_descriptor(desc).mouse;
-        let d = decode_mouse_report(ml, report, report.len(), false)
+        let d = decode_mouse_report(&ml, report, report.len(), false)
             .expect("this report should belong to this mouse");
         capture(|lis| {
             emit_mouse(lis, d, 0);
@@ -5390,7 +5673,7 @@ mod tests {
 
     /// The same, for a device decoded with the fixed boot layout.
     fn boot_frame(report: &[u8]) -> Vec<(u16, u16, i32)> {
-        let d = decode_mouse_report(None, report, report.len(), true)
+        let d = decode_mouse_report(&MouseReports::default(), report, report.len(), true)
             .expect("a boot mouse report always decodes");
         capture(|lis| {
             emit_mouse(lis, d, 0);
@@ -5505,16 +5788,16 @@ mod tests {
         // its keycodes as buttons and deltas is how a keystroke used to move
         // the pointer.
         let ml = parse_hid_descriptor(COMBO_RECEIVER).mouse;
-        assert_eq!(ml.map(|m| m.report_id), Some(Some(2)));
+        assert_eq!(ml.primary().map(|m| m.report_id), Some(Some(2)));
         let keyboard_report = [0x01, 0x02, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00];
         assert_eq!(
-            decode_mouse_report(ml, &keyboard_report, keyboard_report.len(), false),
+            decode_mouse_report(&ml, &keyboard_report, keyboard_report.len(), false),
             None
         );
         // ...and its own report still decodes.
         let mouse_report = [0x02, 0x00, 0x00, 0x00, 0x01];
         assert_eq!(
-            decode_mouse_report(ml, &mouse_report, mouse_report.len(), false)
+            decode_mouse_report(&ml, &mouse_report, mouse_report.len(), false)
                 .map(|d| (d.wheel, d.hwheel)),
             Some((1, 0))
         );
@@ -5545,11 +5828,19 @@ mod tests {
         // A report-protocol interface whose descriptor we could not parse: its
         // report ID would decode as a stuck button and its payload as motion.
         assert_eq!(
-            decode_mouse_report(None, &[0x01, 0x7F, 0x7F, 0x01], 4, false),
+            decode_mouse_report(
+                &MouseReports::default(),
+                &[0x01, 0x7F, 0x7F, 0x01],
+                4,
+                false
+            ),
             None
         );
         // And a report too short to be one at all.
-        assert_eq!(decode_mouse_report(None, &[0x00, 0x00], 2, true), None);
+        assert_eq!(
+            decode_mouse_report(&MouseReports::default(), &[0x00, 0x00], 2, true),
+            None
+        );
     }
 
     #[test]
@@ -5560,8 +5851,8 @@ mod tests {
         let ml = parse_hid_descriptor(BOOT_SHAPED).mouse;
         let first = [0x01u8, 0x00, 0x00, 0x01];
         let second = [0x01u8, 0x00, 0x00, 0x01];
-        let d1 = decode_mouse_report(ml, &first, first.len(), false).unwrap();
-        let d2 = decode_mouse_report(ml, &second, second.len(), false).unwrap();
+        let d1 = decode_mouse_report(&ml, &first, first.len(), false).unwrap();
+        let d2 = decode_mouse_report(&ml, &second, second.len(), false).unwrap();
         let mut held = 0u8;
         let frame1 = capture(|lis| held = emit_mouse(lis, d1, 0));
         assert_eq!(held, 1);
@@ -5584,7 +5875,7 @@ mod tests {
         );
         // Releasing it sends the up edge.
         let up = [0x00u8, 0x00, 0x00, 0x00];
-        let d3 = decode_mouse_report(ml, &up, up.len(), false).unwrap();
+        let d3 = decode_mouse_report(&ml, &up, up.len(), false).unwrap();
         let frame3 = capture(|lis| {
             emit_mouse(lis, d3, held);
         });
@@ -5640,19 +5931,240 @@ mod tests {
                 COMBO_RECEIVER,
                 alloc::vec![0x02, 0x00, 0x00, 0x00, 0x01],
             ),
+            (
+                "split report id",
+                SPLIT_REPORT_ID,
+                alloc::vec![0x02, 0x00, 0x00, 0x00, 0x01, 0x00],
+            ),
+            (
+                "pop restores report id",
+                POP_RESTORES_REPORT_ID,
+                alloc::vec![0x01, 0x00, 0x00, 0x00, 0x01],
+            ),
+            (
+                "xiaomi split mouse",
+                XIAOMI_SPLIT_MOUSE,
+                alloc::vec![0x01, 0x00, 0x01, 0x00],
+            ),
+            (
+                "sixteen-bit wheel and pan",
+                SIXTEEN_BIT_WHEEL_AND_PAN,
+                alloc::vec![0x1A, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00],
+            ),
         ] {
             assert_eq!(mouse_frame(desc, &report), want, "{}", name);
         }
     }
 
     #[test]
+    fn a_report_id_that_comes_back_continues_its_report() {
+        // The Wheel and AC Pan are declared after a detour through Feature
+        // report 3. Starting a fresh report at bit 8 on the way back put them
+        // in a report of their own that never had X/Y, so the mouse layout
+        // came out with no wheel and no pan, four bytes long instead of six.
+        let info = parse_hid_descriptor(SPLIT_REPORT_ID);
+        let ml = info.mouse.primary().expect("a mouse layout");
+        assert_eq!(ml.x, Some(BitField { off: 16, len: 8 }));
+        assert_eq!(ml.y, Some(BitField { off: 24, len: 8 }));
+        assert_eq!(ml.wheel, Some(BitField { off: 32, len: 8 }));
+        assert_eq!(ml.hwheel, Some(BitField { off: 40, len: 8 }));
+        assert_eq!(ml.report_bytes, 6);
+        // The endpoint is armed for the largest report: split in two, report
+        // 2 counted as four bytes and the TD could not hold a whole one.
+        assert_eq!(info.max_report_bytes, 6);
+        // And the pan really comes out of byte 5, one frame with the wheel.
+        assert_eq!(
+            mouse_frame(SPLIT_REPORT_ID, &[0x02, 0x00, 0x00, 0x00, 0xFF, 0x01]),
+            alloc::vec![
+                (EV_REL, REL_WHEEL, -1),
+                (EV_REL, REL_WHEEL_HI_RES, -120),
+                (EV_REL, REL_HWHEEL, 1),
+                (EV_REL, REL_HWHEEL_HI_RES, 120),
+                (EV_SYN, SYN_REPORT, 0),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_pop_takes_the_walk_back_to_the_report_id_it_restores() {
+        // Without the Report ID on the stack the Wheel after the Pop was
+        // walked as part of the consumer report 2, and the mouse had none.
+        let info = parse_hid_descriptor(POP_RESTORES_REPORT_ID);
+        let ml = info.mouse.primary().expect("a mouse layout");
+        assert_eq!(ml.report_id, Some(1));
+        assert_eq!(ml.wheel, Some(BitField { off: 32, len: 8 }));
+        assert_eq!(ml.report_bytes, 5);
+        // The largest report is the mouse's five bytes. Walked into report 2,
+        // the wheel grew that one to four and left the mouse at four.
+        assert_eq!(info.max_report_bytes, 5);
+    }
+
+    #[test]
+    fn a_mouse_split_across_report_ids_is_still_a_mouse() {
+        // Buttons, wheel and pan in report 1, X and Y in report 2. Asking for
+        // one report with all three found no mouse here, and a boot-subclass
+        // interface then fell back to boot protocol: three-byte reports, a
+        // pointer that moves and a wheel that never does, and nothing logged.
+        let info = parse_hid_descriptor(XIAOMI_SPLIT_MOUSE);
+        assert_eq!(classify_hid_report(XIAOMI_SPLIT_MOUSE), HidClass::Mouse);
+        let r: Vec<_> = info.mouse.iter().collect();
+        assert_eq!(r.len(), 2, "{:?}", r);
+        assert_eq!(r[0].report_id, Some(1));
+        assert_eq!(r[0].buttons, Some(BitField { off: 8, len: 5 }));
+        assert_eq!(r[0].wheel, Some(BitField { off: 16, len: 8 }));
+        assert_eq!(r[0].hwheel, Some(BitField { off: 24, len: 8 }));
+        assert_eq!((r[0].x, r[0].y), (None, None));
+        assert_eq!(r[1].report_id, Some(2));
+        assert_eq!(r[1].x, Some(BitField { off: 8, len: 12 }));
+        assert_eq!(r[1].y, Some(BitField { off: 20, len: 12 }));
+        assert_eq!(r[1].buttons, None);
+        assert!(info.mouse.has_wheel());
+        assert_eq!(
+            hid_protocol_request(HID_PROTO_MOUSE, &info),
+            HID_PROTOCOL_REPORT
+        );
+    }
+
+    #[test]
+    fn a_split_mouse_scrolls_from_one_report_and_moves_from_the_other() {
+        assert_eq!(
+            mouse_frame(XIAOMI_SPLIT_MOUSE, &[0x01, 0x00, 0xFF, 0x01]),
+            alloc::vec![
+                (EV_REL, REL_WHEEL, -1),
+                (EV_REL, REL_WHEEL_HI_RES, -120),
+                (EV_REL, REL_HWHEEL, 1),
+                (EV_REL, REL_HWHEEL_HI_RES, 120),
+                (EV_SYN, SYN_REPORT, 0),
+            ]
+        );
+        // X = -1 and Y = +1, twelve bits each.
+        assert_eq!(
+            mouse_frame(XIAOMI_SPLIT_MOUSE, &[0x02, 0xFF, 0x1F, 0x00]),
+            alloc::vec![
+                (EV_REL, REL_X, -1),
+                (EV_REL, REL_Y, 1),
+                (EV_SYN, SYN_REPORT, 0),
+            ]
+        );
+        // The media-key report is not the mouse's.
+        let ml = parse_hid_descriptor(XIAOMI_SPLIT_MOUSE).mouse;
+        assert_eq!(
+            decode_mouse_report(&ml, &[0x03, 0xFF, 0x00], 3, false),
+            None
+        );
+    }
+
+    #[test]
+    fn a_report_without_buttons_does_not_release_the_held_ones() {
+        // Dragging with the split mouse: the left button goes down in report
+        // 1, the motion arrives in report 2, which has no buttons. Reading
+        // that as "all released" dropped every drag after its first step.
+        let ml = parse_hid_descriptor(XIAOMI_SPLIT_MOUSE).mouse;
+        let press = decode_mouse_report(&ml, &[0x01, 0x01, 0x00, 0x00], 4, false).unwrap();
+        let mut held = 0u8;
+        let frame = capture(|lis| held = emit_mouse(lis, press, 0));
+        assert_eq!(
+            frame,
+            alloc::vec![(EV_KEY, BTN_LEFT, 1), (EV_SYN, SYN_REPORT, 0)]
+        );
+        let motion = decode_mouse_report(&ml, &[0x02, 0x05, 0x00, 0x00], 4, false).unwrap();
+        assert_eq!(motion.buttons, None);
+        let frame = capture(|lis| held = emit_mouse(lis, motion, held));
+        assert_eq!(held, 1);
+        assert_eq!(
+            frame,
+            alloc::vec![(EV_REL, REL_X, 5), (EV_SYN, SYN_REPORT, 0)]
+        );
+        let release = decode_mouse_report(&ml, &[0x01, 0x00, 0x00, 0x00], 4, false).unwrap();
+        let frame = capture(|lis| held = emit_mouse(lis, release, held));
+        assert_eq!(held, 0);
+        assert_eq!(
+            frame,
+            alloc::vec![(EV_KEY, BTN_LEFT, 0), (EV_SYN, SYN_REPORT, 0)]
+        );
+    }
+
+    #[test]
+    fn buttons_of_another_report_are_not_left_and_right() {
+        // Report 2 carries buttons 6..13. Its first bit is button 6, so it
+        // must not come out as BTN_LEFT; it has no other pointer field, so it
+        // is not one of the mouse's reports at all.
+        let info = parse_hid_descriptor(EXTRA_BUTTONS_REPORT);
+        assert_eq!(info.mouse.iter().count(), 1);
+        let ml = info.mouse.primary().unwrap();
+        assert_eq!(ml.report_id, Some(1));
+        assert_eq!(ml.buttons, Some(BitField { off: 8, len: 5 }));
+        assert_eq!(ml.wheel, Some(BitField { off: 32, len: 8 }));
+        assert_eq!(
+            decode_mouse_report(&info.mouse, &[0x02, 0xFF, 0x00], 3, false),
+            None
+        );
+    }
+
+    #[test]
+    fn sixteen_bit_wheel_and_pan_come_out_whole() {
+        let ml = parse_hid_descriptor(SIXTEEN_BIT_WHEEL_AND_PAN)
+            .mouse
+            .primary()
+            .unwrap();
+        assert_eq!(ml.report_id, Some(26));
+        assert_eq!(ml.wheel, Some(BitField { off: 48, len: 16 }));
+        assert_eq!(ml.hwheel, Some(BitField { off: 64, len: 16 }));
+        assert_eq!(ml.report_bytes, 10);
+        // Wheel -1 is 0xFFFF; reading eight of its sixteen bits would give 255.
+        assert_eq!(
+            mouse_frame(
+                SIXTEEN_BIT_WHEEL_AND_PAN,
+                &[0x1A, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0x02, 0x00]
+            ),
+            alloc::vec![
+                (EV_REL, REL_WHEEL, -1),
+                (EV_REL, REL_WHEEL_HI_RES, -120),
+                (EV_REL, REL_HWHEEL, 2),
+                (EV_REL, REL_HWHEEL_HI_RES, 240),
+                (EV_SYN, SYN_REPORT, 0),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_pan_is_not_a_wheel_and_axes_without_buttons_are_not_a_mouse() {
+        // Buttons, X, Y and AC Pan, no Wheel: a mouse, but one whose page
+        // scrolling cannot work, which is what the boot-time error says.
+        const PAN_ONLY: &[u8] = &[
+            0x05, 0x01, 0x09, 0x02, 0xA1, 0x01, 0x09, 0x01, 0xA1, 0x00, //
+            0x05, 0x09, 0x19, 0x01, 0x29, 0x03, 0x15, 0x00, 0x25, 0x01, //
+            0x75, 0x01, 0x95, 0x03, 0x81, 0x02, 0x75, 0x05, 0x95, 0x01, 0x81, 0x01, //
+            0x05, 0x01, 0x09, 0x30, 0x09, 0x31, 0x15, 0x81, 0x25, 0x7F, //
+            0x75, 0x08, 0x95, 0x02, 0x81, 0x06, //
+            0x05, 0x0C, 0x0A, 0x38, 0x02, 0x95, 0x01, 0x81, 0x06, //
+            0xC0, 0xC0,
+        ];
+        let pan = parse_hid_descriptor(PAN_ONLY).mouse;
+        assert!(!pan.is_empty());
+        assert!(!pan.has_wheel());
+        // Relative X and Y with no button anywhere is not a mouse to bind.
+        const AXES_ONLY: &[u8] = &[
+            0x05, 0x01, 0x09, 0x02, 0xA1, 0x01, 0x09, 0x01, 0xA1, 0x00, //
+            0x05, 0x01, 0x09, 0x30, 0x09, 0x31, 0x15, 0x81, 0x25, 0x7F, //
+            0x75, 0x08, 0x95, 0x02, 0x81, 0x06, //
+            0xC0, 0xC0,
+        ];
+        assert!(parse_hid_descriptor(AXES_ONLY).mouse.is_empty());
+    }
+
+    #[test]
     fn twelve_bit_axes_sign_extend() {
         // buttons=0b00001 (left), X = -1 (0xFFF), Y = +1.
         let report = [0x01, 0xFF, 0x1F, 0x00, 0x00, 0x00];
-        let ml = parse_hid_descriptor(MOUSE_5BTN_12BIT).mouse.unwrap();
-        assert_eq!(read_bits(&report, ml.buttons.off, ml.buttons.len), 1);
-        assert_eq!(read_signed_bits(&report, ml.x.off, ml.x.len), -1);
-        assert_eq!(read_signed_bits(&report, ml.y.off, ml.y.len), 1);
+        let ml = parse_hid_descriptor(MOUSE_5BTN_12BIT)
+            .mouse
+            .primary()
+            .unwrap();
+        let (b, x, y) = (ml.buttons.unwrap(), ml.x.unwrap(), ml.y.unwrap());
+        assert_eq!(read_bits(&report, b.off, b.len), 1);
+        assert_eq!(read_signed_bits(&report, x.off, x.len), -1);
+        assert_eq!(read_signed_bits(&report, y.off, y.len), 1);
     }
 
     #[test]
@@ -5843,6 +6355,7 @@ mod tests {
         // decoder itself: byte 5 of a 3-byte report is not the wheel.
         let ml = parse_hid_descriptor(MOUSE_5BTN_12BIT)
             .mouse
+            .primary()
             .expect("a mouse layout");
         let mut tmp = [0u8; 64];
         // Full 6-byte report with a wheel detent, then only the first 3 bytes

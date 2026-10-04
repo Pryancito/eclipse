@@ -1,4 +1,5 @@
 use super::*;
+use crate::file::{anon_fd_flags, ANON_CLOEXEC, ANON_NONBLOCK};
 use crate::outparams::hand_out_pair;
 use alloc::vec::Vec;
 use core::convert::TryInto;
@@ -13,6 +14,13 @@ use linux_object::{
 const MSG_DONTWAIT: usize = 0x40;
 const MSG_PEEK: usize = 0x2;
 const MSG_NOSIGNAL: usize = 0x4000;
+/// Close-on-exec for fds installed from `SCM_RIGHTS` (`linux/socket.h`).
+const MSG_CMSG_CLOEXEC: usize = 0x4000_0000;
+
+/// Whether `recvmsg`/`recvmmsg` should mark SCM_RIGHTS fds `FD_CLOEXEC`.
+fn scm_rights_cloexec(flags: usize) -> bool {
+    flags & MSG_CMSG_CLOEXEC != 0
+}
 
 /// A socket whose `write` answers `EAGAIN` for "queue full": unix (bounded
 /// peer buffer) and UDP (smoltcp's transmit ring). TCP waits on its own.
@@ -121,6 +129,16 @@ fn ucred_of(pid: i32) -> [u8; 12] {
     bytes
 }
 
+/// Bytes for `getsockopt(SO_PEERCRED)`: a live peer via [`ucred_of`], or an
+/// all-zero `ucred` when there is no peer (unconnected / non-unix). Used to
+/// invent pid 1, which made seatd authorize random TCP sockets as init.
+fn peercred_bytes(peer_pid: Option<i32>) -> [u8; 12] {
+    match peer_pid {
+        Some(pid) => ucred_of(pid),
+        None => [0u8; 12],
+    }
+}
+
 fn write_sockopt_out(
     optval: UserOutPtr<u32>,
     mut optlen: UserInOutPtr<u32>,
@@ -162,6 +180,17 @@ const CMSG_HDR_LEN: usize = 16;
 const SOL_SOCKET_LEVEL: i32 = 1;
 /// `SCM_RIGHTS`, as it appears in `cmsg_type`.
 const SCM_RIGHTS: i32 = 1;
+/// `SCM_CREDENTIALS`, as it appears in `cmsg_type`: a `struct ucred` the
+/// KERNEL fills in, which is what makes it worth anything to the receiver.
+const SCM_CREDENTIALS: i32 = 2;
+/// `msg_flags`: ancillary data was dropped because the caller's control buffer
+/// could not hold it.
+const MSG_CTRUNC: i32 = 0x8;
+/// `SOL_SOCKET`, as `setsockopt`/`getsockopt` take it in `level`.
+const SOL_SOCKET: usize = 1;
+/// `SO_PASSCRED`: attach the sender's credentials to every message read from
+/// this socket.
+const SO_PASSCRED: usize = 16;
 /// Most file descriptors one `sendmsg` may carry (`SCM_MAX_FD`,
 /// include/net/scm.h). Linux answers `EINVAL` above it; without a cap, one
 /// `sendmsg` with a 64 KiB control buffer asks the receiver to install 16000
@@ -220,13 +249,53 @@ fn parse_scm_rights_fds(ctrl: &[u8]) -> Result<Vec<i32>, LxError> {
 /// which is why the tests below round-trip them against each other rather than
 /// each against a hand-written blob.
 fn build_scm_rights_cmsg(fds: &[i32]) -> Vec<u8> {
-    let cmsg_len = CMSG_HDR_LEN + fds.len() * 4;
-    let mut buf = Vec::with_capacity(cmsg_len);
+    build_cmsg(
+        SCM_RIGHTS,
+        &fds.iter()
+            .flat_map(|f| f.to_ne_bytes())
+            .collect::<Vec<u8>>(),
+    )
+}
+
+/// Build one `SOL_SOCKET` control message around `payload`.
+///
+/// `cmsg_len` counts the header and the payload and NOT the padding, exactly
+/// as `CMSG_LEN` does; the padding that follows is what `CMSG_NXTHDR` steps
+/// over to reach the next message. Writing the padded length into the header
+/// instead would make a lone message look longer than it is and a reader
+/// walking two of them land past the second.
+fn build_cmsg(typ: i32, payload: &[u8]) -> Vec<u8> {
+    let cmsg_len = CMSG_HDR_LEN + payload.len();
+    let mut buf = Vec::with_capacity(cmsg_align(cmsg_len));
     buf.extend_from_slice(&(cmsg_len as u64).to_ne_bytes());
     buf.extend_from_slice(&SOL_SOCKET_LEVEL.to_ne_bytes());
-    buf.extend_from_slice(&SCM_RIGHTS.to_ne_bytes());
-    for fd in fds {
-        buf.extend_from_slice(&fd.to_ne_bytes());
+    buf.extend_from_slice(&typ.to_ne_bytes());
+    buf.extend_from_slice(payload);
+    buf
+}
+
+/// `CMSG_ALIGN`: control messages sit on 8-byte boundaries.
+fn cmsg_align(len: usize) -> usize {
+    (len + 7) & !7
+}
+
+/// The control buffer `recvmsg` hands back: the descriptors the peer attached,
+/// then -- when `SO_PASSCRED` is on -- the sender's credentials.
+///
+/// The second message only exists because the first may be short: a message of
+/// 20 bytes is followed by 4 bytes of padding before the next header, and a
+/// reader that walked without it would read the credentials out of the middle
+/// of the descriptors.
+fn build_recv_cmsgs(fds: &[i32], creds: Option<&[u8; 12]>) -> Vec<u8> {
+    let mut buf = Vec::new();
+    if !fds.is_empty() {
+        buf.extend(build_scm_rights_cmsg(fds));
+    }
+    if let Some(creds) = creds {
+        if !buf.is_empty() {
+            buf.resize(cmsg_align(buf.len()), 0);
+        }
+        buf.extend(build_cmsg(SCM_CREDENTIALS, creds));
     }
     buf
 }
@@ -256,8 +325,11 @@ impl Syscall<'_> {
                 return Err(LxError::EINVAL);
             }
         };
-        // socket flags: SOCK_CLOEXEC SOCK_NONBLOCK
-        let flags = OpenFlags::from_bits_truncate(_type & !SOCKET_TYPE_MASK);
+        // Same trap as the old `pipe2` / `eventfd2` path: the high bits of
+        // `type` are only SOCK_CLOEXEC | SOCK_NONBLOCK. Truncating let a
+        // stray bit succeed, and worse, a bit that coincides with some other
+        // `OpenFlags` name (APPEND, …) was applied to the new socket.
+        let flags = anon_fd_flags(_type & !SOCKET_TYPE_MASK, ANON_CLOEXEC | ANON_NONBLOCK)?;
         let protocol_num = protocol;
         let protocol = Protocol::try_from(protocol_num).ok();
 
@@ -290,14 +362,6 @@ impl Syscall<'_> {
             (Domain::AF_INET6, SocketType::SOCK_DGRAM, Some(Protocol::IPPROTO_ICMPV6)) => {
                 Arc::new(IcmpSocketState::new(true)?)
             }
-            // Be tolerant for AF_INET/AF_INET6 datagram sockets.
-            // Some userlands pass unexpected protocol numbers; for DHCP we only need UDP semantics.
-            (Domain::AF_INET, SocketType::SOCK_DGRAM, None) => {
-                Arc::new(UdpSocketState::new(false)?)
-            }
-            (Domain::AF_INET6, SocketType::SOCK_DGRAM, None) => {
-                Arc::new(UdpSocketState::new(true)?)
-            }
             // AF_INET/AF_INET6 raw sockets (some userlands probe these)
             (Domain::AF_INET, SocketType::SOCK_RAW, _) => {
                 Arc::new(RawSocketState::new((protocol_num & 0xff) as u8, false)?)
@@ -308,7 +372,7 @@ impl Syscall<'_> {
             // AF_NETLINK sockets for interface/address discovery (iproute-style)
             (Domain::AF_NETLINK, SocketType::SOCK_RAW, _)
             | (Domain::AF_NETLINK, SocketType::SOCK_DGRAM, _) => {
-                Arc::new(NetlinkSocketState::default())
+                Arc::new(NetlinkSocketState::new(socket_type))
             }
             // AF_PACKET sockets (used by udhcpc for raw ethernet operations)
             (Domain::AF_PACKET, SocketType::SOCK_RAW, _)
@@ -317,23 +381,33 @@ impl Syscall<'_> {
             }
             // AF_UNIX sockets
             (Domain::AF_UNIX, _, _) => {
+                // Same gate as `socketpair`: only STREAM/DGRAM/SEQPACKET.
+                // This arm used to take every `SocketType` and implement them
+                // all as a byte stream, so `socket(AF_UNIX, SOCK_RDM, 0)`
+                // succeeded where Linux says `ESOCKTNOSUPPORT`.
+                let socket_type = unix_socket_type(socket_type)?;
+                unix_protocol(protocol_num)?;
                 let s = UnixSocketState::new();
                 // Record our PID so a peer (e.g. seatd) can read it via
                 // SO_PEERCRED when it accepts our connection.
                 s.set_owner_pid(self.zircon_process().id() as i32);
-                // This arm takes EVERY AF_UNIX type, and the implementation is
-                // a byte stream whichever one was asked for. Record the request
-                // anyway: `sendmsg` must not truncate an oversized message on a
-                // socket the user created as a datagram or seqpacket.
+                // Record the request: `sendmsg` must not truncate an oversized
+                // message on a socket the user created as a datagram or
+                // seqpacket.
                 s.set_socket_type(socket_type);
                 s
             }
             (_, _, _) => {
+                // A domain/type/protocol combo this kernel does not wire up
+                // is `EPROTONOSUPPORT`, not `ENOSYS`. `ENOSYS` told callers
+                // the *syscall* was missing (glibc then disables whole
+                // families); Linux and busybox probe with this and expect
+                // a protocol errno so they can fall back cleanly.
                 info!(
                     "sys_socket: unsupported socket type: domain={:?}, type={:?}, protocol={:?}",
                     domain, socket_type, protocol_num
                 );
-                return Err(LxError::ENOSYS);
+                return Err(LxError::EPROTONOSUPPORT);
             }
         };
 
@@ -359,6 +433,10 @@ impl Syscall<'_> {
 
         if let Endpoint::Unix(path) = &endpoint {
             if let Ok(client) = file_like.clone().downcast_arc::<UnixSocketState>() {
+                // `unix_stream_connect`: already connected (or a listener)
+                // is `EISCONN`. Without the check a second `connect` rewired
+                // the peer and queued another accept silently.
+                client.may_connect()?;
                 // ENOENT / ECONNREFUSED exactly as `UnixSocketState::
                 // resolve_listener` decides (pathname vs abstract, bound
                 // but not listening): this fast path is the one every
@@ -396,10 +474,23 @@ impl Syscall<'_> {
             sockfd, level, optname, optval, optlen
         );
         let file_like = self.linux_process().get_file_like(sockfd.into())?;
-        file_like
-            .clone()
-            .as_socket()?
-            .setsockopt(level, optname, optval.as_slice(optlen)?)
+        let socket = file_like.as_socket()?;
+        let data = optval.as_slice(optlen)?;
+        // `SO_PASSCRED` is answered here rather than inside a socket family,
+        // because it is a generic `sock` flag in Linux too (`sock_setsockopt`)
+        // and the matching `getsockopt` below has to read back exactly what
+        // this stored. See `Socket::set_passcred` for why every family takes
+        // it and only AF_UNIX acts on it.
+        if level == SOL_SOCKET && optname == SO_PASSCRED {
+            // `sock_setsockopt` reads the value as an `int` and refuses a
+            // shorter one -- unlike the IP level, which falls back to a byte.
+            if data.len() < 4 {
+                return Err(LxError::EINVAL);
+            }
+            let on = u32::from_ne_bytes([data[0], data[1], data[2], data[3]]) != 0;
+            return socket.set_passcred(on);
+        }
+        socket.setsockopt(level, optname, data)
     }
 
     /// get options for the socket referred to by the file descriptor sockfd.
@@ -418,9 +509,12 @@ impl Syscall<'_> {
         let level = match Level::try_from(level) {
             Ok(level) => level,
             Err(_) => {
-                // Unknown levels (e.g. SOL_PACKET=263) — return a zeroed int.
+                // Unknown levels (SOL_PACKET, SOL_IPV6, …) are
+                // `ENOPROTOOPT`, same as an unknown optname under a known
+                // level. Returning a zeroed int used to tell probes they
+                // got a real option value of 0.
                 warn!("getsockopt: unsupported level: {}", level);
-                return write_sockopt_out(optval, optlen, &0u32.to_ne_bytes());
+                return Err(LxError::ENOPROTOOPT);
             }
         };
         if optval.is_null() {
@@ -438,12 +532,36 @@ impl Syscall<'_> {
                 const SO_PEERCRED: usize = 17;
                 if optname == SO_PEERCRED {
                     let file_like = self.linux_process().get_file_like(sockfd.into())?;
-                    let pid = file_like
-                        .as_socket()
-                        .ok()
-                        .and_then(|s| s.peer_pid())
-                        .unwrap_or(1);
-                    return write_sockopt_out(optval, optlen, &ucred_of(pid));
+                    let peer = file_like.as_socket().ok().and_then(|s| s.peer_pid());
+                    return write_sockopt_out(optval, optlen, &peercred_bytes(peer));
+                }
+                // SO_TYPE (3): SOCK_STREAM / SOCK_DGRAM / ... Python's `ssl`
+                // asks it of every socket it wraps (`SSLSocket._create` raises
+                // unless the answer is SOCK_STREAM), so without it every HTTPS
+                // request from Python -- `requests`, ytmusicapi -- failed with
+                // OSError(92, 'Protocol not available').
+                // SO_PASSCRED (16): the flag `setsockopt` stored. crashpad
+                // READS it before setting it -- the handler may not be allowed
+                // to set it and does not need to if the client already did
+                // (`InstallClientSocket`) -- and a `getsockopt` that answers
+                // ENOPROTOOPT there is a hard `return false`, so every
+                // chromium process logged
+                //     ERROR:exception_handler_server.cc:361 getsockopt:
+                //     Protocol not available (92)
+                // and started with no crash handler at all.
+                if optname == SO_PASSCRED {
+                    let file_like = self.linux_process().get_file_like(sockfd.into())?;
+                    let on = u32::from(file_like.as_socket()?.passcred());
+                    return write_sockopt_out(optval, optlen, &on.to_ne_bytes());
+                }
+                const SO_TYPE: usize = 3;
+                if optname == SO_TYPE {
+                    let file_like = self.linux_process().get_file_like(sockfd.into())?;
+                    let ty = file_like
+                        .as_socket()?
+                        .socket_type()
+                        .ok_or(LxError::ENOPROTOOPT)?;
+                    return write_sockopt_out(optval, optlen, &(ty as u32).to_ne_bytes());
                 }
                 let optname = match SolOptname::try_from(optname) {
                     Ok(optname) => optname,
@@ -492,6 +610,16 @@ impl Syscall<'_> {
                 };
 
                 match optname {
+                    SolOptname::TYPE => {
+                        // `SO_TYPE` is mandatory on every socket; without it
+                        // glibc and many libraries treat the fd as broken.
+                        let ty = file_like
+                            .clone()
+                            .as_socket()?
+                            .socket_type()
+                            .ok_or(LxError::ENOPROTOOPT)? as u32;
+                        write_sockopt_out(optval, optlen, &ty.to_ne_bytes())
+                    }
                     SolOptname::SNDBUF => {
                         let (_, send_buf_ca) = buffer_capacity();
                         write_sockopt_out(optval, optlen, &(send_buf_ca as u32).to_ne_bytes())
@@ -500,13 +628,67 @@ impl Syscall<'_> {
                         let (recv_buf_ca, _) = buffer_capacity();
                         write_sockopt_out(optval, optlen, &(recv_buf_ca as u32).to_ne_bytes())
                     }
-                    SolOptname::REUSEADDR => write_sockopt_out(optval, optlen, &1u32.to_ne_bytes()),
+                    SolOptname::REUSEADDR => {
+                        // Report the flag `setsockopt` stored — hardcoding 1
+                        // made `getsockopt` lie after `setsockopt(..., 0)` and
+                        // disagreed with Linux's default of 0.
+                        let on = file_like.clone().as_socket()?.so_reuseaddr();
+                        write_sockopt_out(optval, optlen, &(u32::from(on)).to_ne_bytes())
+                    }
+                    SolOptname::BROADCAST => {
+                        let on = file_like.clone().as_socket()?.so_broadcast();
+                        write_sockopt_out(optval, optlen, &(u32::from(on)).to_ne_bytes())
+                    }
+                    SolOptname::KEEPALIVE => {
+                        let on = file_like.clone().as_socket()?.so_keepalive();
+                        write_sockopt_out(optval, optlen, &(u32::from(on)).to_ne_bytes())
+                    }
                     SolOptname::ERROR => {
                         let err = file_like.clone().as_socket()?.take_so_error();
                         write_sockopt_out(optval, optlen, &(err as u32).to_ne_bytes())
                     }
-                    // struct linger { int l_onoff; int l_linger; } — zero-linger.
-                    SolOptname::LINGER => write_sockopt_out(optval, optlen, &[0u8; 8]),
+                    SolOptname::LINGER => {
+                        let (on, sec) = file_like.clone().as_socket()?.so_linger();
+                        let mut bytes = [0u8; 8];
+                        bytes[0..4].copy_from_slice(&(i32::from(on)).to_ne_bytes());
+                        bytes[4..8].copy_from_slice(&sec.to_ne_bytes());
+                        write_sockopt_out(optval, optlen, &bytes)
+                    }
+                    SolOptname::REUSEPORT => {
+                        let on = file_like.clone().as_socket()?.so_reuseport();
+                        write_sockopt_out(optval, optlen, &(u32::from(on)).to_ne_bytes())
+                    }
+                    SolOptname::RCVTIMEO => {
+                        let tv = file_like.clone().as_socket()?.so_rcvtimeo();
+                        write_sockopt_out(optval, optlen, &tv)
+                    }
+                    SolOptname::SNDTIMEO => {
+                        let tv = file_like.clone().as_socket()?.so_sndtimeo();
+                        write_sockopt_out(optval, optlen, &tv)
+                    }
+                    SolOptname::ACCEPTCONN => {
+                        // Whether `listen(2)` put this socket in the passive
+                        // state. Without the enum arm, `getsockopt` was
+                        // ENOPROTOOPT even for a listening TCP/UNIX socket.
+                        let on = file_like.clone().as_socket()?.is_listening();
+                        write_sockopt_out(optval, optlen, &(u32::from(on)).to_ne_bytes())
+                    }
+                    SolOptname::PROTOCOL => {
+                        let proto = file_like
+                            .clone()
+                            .as_socket()?
+                            .so_protocol()
+                            .ok_or(LxError::ENOPROTOOPT)?;
+                        write_sockopt_out(optval, optlen, &proto.to_ne_bytes())
+                    }
+                    SolOptname::DOMAIN => {
+                        let domain = file_like
+                            .clone()
+                            .as_socket()?
+                            .so_domain()
+                            .ok_or(LxError::ENOPROTOOPT)?;
+                        write_sockopt_out(optval, optlen, &domain.to_ne_bytes())
+                    }
                 }
             }
             Level::IPPROTO_TCP => {
@@ -517,8 +699,36 @@ impl Syscall<'_> {
                         return Err(LxError::ENOPROTOOPT);
                     }
                 };
+                let file_like = self.linux_process().get_file_like(sockfd.into())?;
+                let sock = file_like.as_socket()?;
+                // `do_tcp_getsockopt` — not STREAM alone (AF_UNIX is STREAM).
+                if !sock.is_tcp() {
+                    return Err(LxError::ENOPROTOOPT);
+                }
                 match optname {
-                    TcpOptname::CONGESTION => Ok(0),
+                    TcpOptname::NODELAY => {
+                        let on = sock.tcp_nodelay();
+                        write_sockopt_out(optval, optlen, &(u32::from(on)).to_ne_bytes())
+                    }
+                    TcpOptname::KEEPIDLE => {
+                        let v = sock.tcp_keepidle().unwrap_or(7200);
+                        write_sockopt_out(optval, optlen, &v.to_ne_bytes())
+                    }
+                    TcpOptname::KEEPINTVL => {
+                        let v = sock.tcp_keepintvl().unwrap_or(75);
+                        write_sockopt_out(optval, optlen, &v.to_ne_bytes())
+                    }
+                    TcpOptname::KEEPCNT => {
+                        let v = sock.tcp_keepcnt().unwrap_or(9);
+                        write_sockopt_out(optval, optlen, &v.to_ne_bytes())
+                    }
+                    TcpOptname::CONGESTION => {
+                        // Linux returns a NUL-terminated CCA name. We have no
+                        // pluggable congestion control; answer a fixed "reno"
+                        // rather than Ok(0) with an untouched user buffer
+                        // (and without requiring a socket → ENOTSOCK).
+                        write_sockopt_out(optval, optlen, b"reno\0")
+                    }
                 }
             }
             Level::IPPROTO_IP => {
@@ -529,8 +739,37 @@ impl Syscall<'_> {
                         return Err(LxError::ENOPROTOOPT);
                     }
                 };
+                let file_like = self.linux_process().get_file_like(sockfd.into())?;
+                let sock = file_like.as_socket()?;
+                // `do_ip_getsockopt` is inet-only (not UNIX/netlink/packet).
+                if !sock.is_inet() {
+                    return Err(LxError::ENOPROTOOPT);
+                }
                 match optname {
-                    IpOptname::HDRINCL => write_sockopt_out(optval, optlen, &0u32.to_ne_bytes()),
+                    IpOptname::TOS => {
+                        write_sockopt_out(optval, optlen, &sock.ip_tos().to_ne_bytes())
+                    }
+                    IpOptname::TTL => {
+                        write_sockopt_out(optval, optlen, &sock.ip_ttl().to_ne_bytes())
+                    }
+                    IpOptname::HDRINCL => {
+                        // Only SOCK_RAW IPv4; others get ENOPROTOOPT like Linux.
+                        if !sock.is_raw_ipv4() {
+                            return Err(LxError::ENOPROTOOPT);
+                        }
+                        let on = sock.ip_hdrincl();
+                        write_sockopt_out(optval, optlen, &(u32::from(on)).to_ne_bytes())
+                    }
+                    IpOptname::MulticastIf => {
+                        write_sockopt_out(optval, optlen, &sock.ip_multicast_if().to_ne_bytes())
+                    }
+                    IpOptname::MulticastTtl => {
+                        write_sockopt_out(optval, optlen, &sock.ip_multicast_ttl().to_ne_bytes())
+                    }
+                    IpOptname::MulticastLoop => {
+                        let on = u32::from(sock.ip_multicast_loop());
+                        write_sockopt_out(optval, optlen, &on.to_ne_bytes())
+                    }
                 }
             }
         }
@@ -793,7 +1032,10 @@ impl Syscall<'_> {
         // message had been read.
         let fds_queued = !passed_fds.is_empty();
         if fds_queued {
-            let _ = socket.send_fds(passed_fds);
+            // Do not swallow the error: on a non-unix socket SCM_RIGHTS must
+            // fail the whole `sendmsg` (`EOPNOTSUPP`), not queue nothing and
+            // still send the bytes.
+            socket.send_fds(passed_fds)?;
         }
         let mode = self.send_mode_for(&file_like, flags);
         let sent = self.send_all(&file_like, &data, endpoint, mode).await;
@@ -855,20 +1097,69 @@ impl Syscall<'_> {
                 let sockaddr_in = SockAddr::from(endpoint);
                 sockaddr_in.write_to_msg(msg)?;
             }
-            // SCM_RIGHTS: install any fds the peer attached and emit a cmsg.
+            // SCM_RIGHTS: install any fds the peer attached, and SCM_CREDENTIALS
+            // when this end asked for credentials, and emit the cmsgs.
             let mut ctrl_written = 0usize;
-            if !hdr.msg_control.is_null() && hdr.msg_controllen >= 16 {
-                let max_fds = (hdr.msg_controllen - 16) / 4;
+            let mut ctrunc = false;
+            if !hdr.msg_control.is_null() && hdr.msg_controllen >= CMSG_HDR_LEN {
+                // Credentials, when wanted, are reserved out of the control
+                // buffer BEFORE the descriptors are counted: they are the
+                // kernel's own word about who sent this, so dropping them to
+                // fit one more fd would quietly answer the receiver's question
+                // wrong.
+                let creds = if socket.passcred() {
+                    // The record stamped when the message was WRITTEN, which
+                    // is the only one that answers "who sent this": the writer
+                    // need not be whoever created the socket. chromium's
+                    // zygote is that case -- it writes through a `socketpair`
+                    // end inherited across `fork`, and a `socketpair` records
+                    // no creator, so the endpoint's owner is pid 0.
+                    //
+                    // Falling back to the peer's owner covers a read of bytes
+                    // that predate this option being turned on.
+                    socket
+                        .recv_creds()
+                        .or_else(|| socket.peer_pid().map(ucred_of))
+                } else {
+                    None
+                };
+                let creds_room = creds.map_or(0, |_| cmsg_align(CMSG_HDR_LEN + 12));
+                let fd_room = hdr.msg_controllen.saturating_sub(creds_room);
+                let max_fds = fd_room.saturating_sub(CMSG_HDR_LEN) / 4;
                 let fds = socket.recv_fds(max_fds);
+                let mut installed: Vec<i32> = Vec::with_capacity(fds.len());
                 if !fds.is_empty() {
                     let proc = self.linux_process();
-                    let mut installed: Vec<i32> = Vec::with_capacity(fds.len());
+                    // Same case as `dup`/`pidfd_getfd`: a new descriptor onto
+                    // an already-open description. `add_file` would copy
+                    // `O_CLOEXEC` from the FileLike (the sender's bit);
+                    // Linux keys it off `MSG_CMSG_CLOEXEC` alone.
+                    let cloexec = scm_rights_cloexec(flags);
                     for fl in fds {
-                        installed.push(proc.add_file(fl)?.into());
+                        installed.push(proc.add_file_cloexec(fl, cloexec)?.into());
                     }
-                    let cbuf = build_scm_rights_cmsg(&installed);
-                    ctrl_written = cbuf.len().min(hdr.msg_controllen);
-                    hdr.msg_control.write_array(&cbuf[..ctrl_written])?;
+                }
+                let cbuf = build_recv_cmsgs(&installed, creds.as_ref());
+                if cbuf.len() <= hdr.msg_controllen {
+                    ctrl_written = cbuf.len();
+                    if ctrl_written > 0 {
+                        hdr.msg_control.write_array(&cbuf[..ctrl_written])?;
+                    }
+                } else {
+                    // The credentials are what did not fit -- the descriptors
+                    // were counted against the room left over for them, and
+                    // `recv_fds` honoured that budget. Writing the cmsg
+                    // half-way would hand the reader a header whose
+                    // `cmsg_len` runs off the end of its own buffer, which is
+                    // how a strict parser walks into garbage. So drop the
+                    // credentials whole and say so with `MSG_CTRUNC`, as
+                    // Linux does.
+                    ctrunc = true;
+                    let fitting = build_recv_cmsgs(&installed, None);
+                    ctrl_written = fitting.len();
+                    if ctrl_written > 0 {
+                        hdr.msg_control.write_array(&fitting[..ctrl_written])?;
+                    }
                 }
             }
             // Linux ALWAYS reports how much ancillary data it wrote through
@@ -886,7 +1177,7 @@ impl Syscall<'_> {
                 p.write(ctrl_written)?;
             }
             // Report truncation (and any other recv flags) via msg_flags.
-            let msg_flags = socket.take_msg_flags();
+            let msg_flags = socket.take_msg_flags() | if ctrunc { MSG_CTRUNC } else { 0 };
             {
                 let flags_addr = msg_addr + core::mem::offset_of!(MsgHdr, msg_flags);
                 let mut p = UserOutPtr::<i32>::from(flags_addr);
@@ -948,6 +1239,11 @@ impl Syscall<'_> {
 
                 let file_like = proc.get_file_like(sockfd.into())?;
                 if let Ok(unix) = file_like.clone().downcast_arc::<UnixSocketState>() {
+                    // Refuse before `register`: otherwise a second bind to a
+                    // different path would claim two registry slots.
+                    if !unix.bound_path().is_empty() {
+                        return Err(LxError::EINVAL);
+                    }
                     UnixSocketState::register(path.clone(), unix)?;
                 }
             }
@@ -970,6 +1266,12 @@ impl Syscall<'_> {
     /// shutdown a socket
     pub fn sys_shutdown(&mut self, sockfd: usize, howto: usize) -> SysResult {
         info!("sys_shutdown: sockfd:{}, howto:{}", sockfd, howto);
+        // `__sys_shutdown_sock`: `how > SHUT_RDWR` is `EINVAL` before the
+        // protocol handler runs. Netlink (and any other socket that used to
+        // ignore `howto`) must not turn `shutdown(fd, 99)` into success.
+        if howto > 2 {
+            return Err(LxError::EINVAL);
+        }
         let file_like = self.linux_process().get_file_like(sockfd.into())?;
         file_like.clone().as_socket()?.shutdown(howto)
     }
@@ -1009,11 +1311,7 @@ impl Syscall<'_> {
         // other bit is invalid (GLib's GDBus path only ever passes these two).
         // Previously this ran after accept(), so a bad flag accepted then
         // dropped an established client connection.
-        const SOCK_NONBLOCK: usize = 0o4000;
-        const SOCK_CLOEXEC: usize = 0o2000000;
-        if flags & !(SOCK_NONBLOCK | SOCK_CLOEXEC) != 0 {
-            return Err(LxError::EINVAL);
-        }
+        let new_flags = anon_fd_flags(flags, ANON_CLOEXEC | ANON_NONBLOCK)?;
 
         // smoltcp tcp sockets do not support backlog
         // open multiple sockets for each connection
@@ -1026,8 +1324,7 @@ impl Syscall<'_> {
             new_socket.flags()
         );
 
-        if flags != 0 {
-            let new_flags = OpenFlags::from_bits_truncate(flags);
+        if new_flags.bits() != 0 {
             new_socket.set_flags(new_flags)?;
         }
 
@@ -1086,11 +1383,7 @@ impl Syscall<'_> {
             return Err(LxError::EINVAL);
         }
         let file_like = self.linux_process().get_file_like(sockfd.into())?;
-        let remote_endpoint = file_like
-            .clone()
-            .as_socket()?
-            .remote_endpoint()
-            .ok_or(LxError::EINVAL)?;
+        let remote_endpoint = peer_endpoint(file_like.clone().as_socket()?.remote_endpoint())?;
         SockAddr::from(remote_endpoint).write_to(addr, addrlen)?;
         Ok(0)
     }
@@ -1111,32 +1404,32 @@ impl Syscall<'_> {
         if domain != Domain::AF_UNIX as usize {
             return Err(LxError::EAFNOSUPPORT);
         }
+        // Same gate as `sys_socket`: an unrecognized type is `EINVAL`, not a
+        // silent SOCK_STREAM pair. AF_UNIX only knows STREAM/DGRAM/SEQPACKET
+        // (`unix_create`); anything else named by `SocketType` is
+        // `EOPNOTSUPP` (Linux's `ESOCKTNOSUPPORT`).
+        let socket_type = unix_socketpair_type(_type & SOCKET_TYPE_MASK)?;
+        // `unix_create`: non-zero protocol other than PF_UNIX is
+        // `EPROTONOSUPPORT`. The argument used to be logged and ignored.
+        unix_protocol(protocol)?;
         let proc = self.linux_process();
         let socket1 = Arc::new(UnixSocketState::default());
         let socket2 = Arc::new(UnixSocketState::default());
         UnixSocketState::connect_pair(&socket1, &socket2);
-        // Same as `sys_socket`: keep the requested type so `sendmsg` can tell a
-        // datagram/seqpacket pair from a stream one. `SOCKET_TYPE_MASK` strips
-        // the SOCK_NONBLOCK / SOCK_CLOEXEC bits handled just below; an
-        // unrecognized type leaves the SOCK_STREAM default, which is what this
-        // transport actually is.
-        if let Ok(t) = SocketType::try_from(_type & SOCKET_TYPE_MASK) {
-            socket1.set_socket_type(t);
-            socket2.set_socket_type(t);
-        }
+        socket1.set_socket_type(socket_type);
+        socket2.set_socket_type(socket_type);
         // The type argument packs SOCK_NONBLOCK / SOCK_CLOEXEC alongside the
         // socket type (same bit values as O_NONBLOCK / O_CLOEXEC, like
-        // accept4). These were silently dropped, handing out BLOCKING sockets
-        // to callers whose event loops assume nonblocking semantics —
+        // accept4). These used to be silently dropped, handing out BLOCKING
+        // sockets to callers whose event loops assume nonblocking semantics —
         // Firefox's WaylandProxy (socketpair(AF_UNIX, SOCK_STREAM |
         // SOCK_NONBLOCK | SOCK_CLOEXEC)) drains with read-until-EAGAIN, so a
         // blocking pair wedged its forwarding thread and Wayland startup died
-        // with "ProxiedConnection: broken source socket".
-        const SOCK_NONBLOCK: usize = 0o4000;
-        const SOCK_CLOEXEC: usize = 0o2000000;
-        let flag_bits = _type & (SOCK_NONBLOCK | SOCK_CLOEXEC);
-        if flag_bits != 0 {
-            let new_flags = OpenFlags::from_bits_truncate(flag_bits);
+        // with "ProxiedConnection: broken source socket". Masking only the
+        // two known bits also hid any other flag as success; validate like
+        // `sys_socket` / `accept4`.
+        let new_flags = anon_fd_flags(_type & !SOCKET_TYPE_MASK, ANON_CLOEXEC | ANON_NONBLOCK)?;
+        if new_flags.bits() != 0 {
             socket1.set_flags(new_flags)?;
             socket2.set_flags(new_flags)?;
         }
@@ -1268,6 +1561,44 @@ impl Syscall<'_> {
     }
 }
 
+/// AF_UNIX socket types Linux's `unix_create` accepts. Anything else named
+/// by `SocketType` is `EOPNOTSUPP` (`ESOCKTNOSUPPORT`).
+fn unix_socket_type(t: SocketType) -> Result<SocketType, LxError> {
+    match t {
+        SocketType::SOCK_STREAM | SocketType::SOCK_DGRAM | SocketType::SOCK_SEQPACKET => Ok(t),
+        _ => Err(LxError::EOPNOTSUPP),
+    }
+}
+
+/// AF_UNIX `socketpair`'s type word (already stripped of SOCK_* flags): the
+/// three Linux knows, or the errno it answers for anything else.
+///
+/// An unrecognized value used to be ignored and the pair born as
+/// `SOCK_STREAM`, so `socketpair(AF_UNIX, 99, 0, sv)` succeeded where
+/// `socket` and Linux say `EINVAL`. `socket(AF_UNIX, …)` used the same
+/// silent fallback until it shared [`unix_socket_type`].
+fn unix_socketpair_type(type_bits: usize) -> Result<SocketType, LxError> {
+    let t = SocketType::try_from(type_bits).map_err(|_| LxError::EINVAL)?;
+    unix_socket_type(t)
+}
+
+/// AF_UNIX protocol word (`unix_create`: `if (protocol && protocol !=
+/// PF_UNIX) return -EPROTONOSUPPORT`). Zero and `PF_UNIX`/`AF_UNIX` are
+/// the only values that mean anything; anything else used to succeed.
+fn unix_protocol(protocol: usize) -> Result<(), LxError> {
+    if protocol != 0 && protocol != Domain::AF_UNIX as usize {
+        return Err(LxError::EPROTONOSUPPORT);
+    }
+    Ok(())
+}
+
+/// `getpeername(2)`: no peer is `ENOTCONN`, not `EINVAL` (that one is for a
+/// bad `addr`/`addrlen`). Used to answer `EINVAL`, so callers that probe
+/// before `connect` returns branched on the wrong errno.
+fn peer_endpoint(ep: Option<Endpoint>) -> Result<Endpoint, LxError> {
+    ep.ok_or(LxError::ENOTCONN)
+}
+
 /// The unix-socket control path: passing a file descriptor from one process to
 /// another, which had no tests at all.
 ///
@@ -1321,6 +1652,17 @@ mod scm_rights_tests {
         assert_eq!(parse_scm_rights_fds(&ctrl), Ok(vec![7, 9, 11]));
     }
 
+    /// `MSG_CMSG_CLOEXEC` is the only bit that decides FD_CLOEXEC on the
+    /// installed descriptors — not the sender's `O_CLOEXEC` on the FileLike.
+    #[test]
+    fn msg_cmsg_cloexec_is_the_install_bit() {
+        assert!(!scm_rights_cloexec(0));
+        assert!(!scm_rights_cloexec(MSG_DONTWAIT | MSG_PEEK));
+        assert!(scm_rights_cloexec(MSG_CMSG_CLOEXEC));
+        assert!(scm_rights_cloexec(MSG_CMSG_CLOEXEC | MSG_DONTWAIT));
+        assert_eq!(MSG_CMSG_CLOEXEC, 0x4000_0000);
+    }
+
     #[test]
     fn a_message_of_another_level_or_type_carries_no_descriptors() {
         // SCM_CREDENTIALS (type 2) and IPPROTO_IP (level 0) both hold plain
@@ -1342,6 +1684,59 @@ mod scm_rights_tests {
         ctrl.extend(cmsg(SOL_SOCKET_LEVEL, 2, &fd_bytes(&[99])));
         ctrl.extend(cmsg(SOL_SOCKET_LEVEL, SCM_RIGHTS, &fd_bytes(&[5, 6])));
         assert_eq!(parse_scm_rights_fds(&ctrl), Ok(vec![3, 5, 6]));
+    }
+
+    /// `SO_PASSCRED` is why chromium's zygote works at all: the browser hands
+    /// the zygote a `SOCK_SEQPACKET` pair, the forked child pings it, and the
+    /// browser reads the child's REAL pid out of `SCM_CREDENTIALS`
+    /// (`RecvMsgWithPid`). With no credentials message the pid stayed -1, the
+    /// browser sent that -1 back, and the zygote answered
+    ///     Zygote could not fork: process_type gpu-process numfds 6 child_pid -1
+    /// after killing a child that had forked perfectly well.
+    #[test]
+    fn the_credentials_message_is_the_one_scm_rights_is_not() {
+        let creds = ucred_of(1282);
+        let buf = build_recv_cmsgs(&[], Some(&creds));
+        assert_eq!(buf.len(), CMSG_HDR_LEN + 12);
+        assert_eq!(
+            i32::from_ne_bytes(buf[12..16].try_into().unwrap()),
+            SCM_CREDENTIALS
+        );
+        assert_eq!(
+            u64::from_ne_bytes(buf[0..8].try_into().unwrap()) as usize,
+            CMSG_HDR_LEN + 12,
+            "cmsg_len counts the header and the ucred, not the padding"
+        );
+        assert_eq!(buf[16..28], creds[..], "the ucred rides in the payload");
+        // It is NOT a descriptor message, so the fd walk must not take it for
+        // one -- a `ucred` read as fd numbers would install whatever pid, uid
+        // and gid happened to be.
+        assert_eq!(parse_scm_rights_fds(&buf), Ok(vec![]));
+        // And with the option off there is no message at all, rather than an
+        // empty one: Linux reports `msg_controllen` 0 there.
+        assert!(build_recv_cmsgs(&[], None).is_empty());
+    }
+
+    /// Both messages in one buffer. The descriptor message is 20 bytes for one
+    /// fd, so the credentials start at 24, not 20: a reader stepping by
+    /// `CMSG_ALIGN(cmsg_len)` lands on the header, and one stepping by
+    /// `cmsg_len` lands in the middle of it.
+    #[test]
+    fn descriptors_and_credentials_sit_on_the_alignment_a_reader_steps_by() {
+        let creds = ucred_of(7);
+        let buf = build_recv_cmsgs(&[9], Some(&creds));
+        assert_eq!(buf.len(), 24 + CMSG_HDR_LEN + 12);
+        // The fd walk finds the descriptor and stops there.
+        assert_eq!(parse_scm_rights_fds(&buf), Ok(vec![9]));
+        // The second header begins at the aligned offset.
+        assert_eq!(
+            i32::from_ne_bytes(buf[24 + 12..24 + 16].try_into().unwrap()),
+            SCM_CREDENTIALS
+        );
+        assert_eq!(buf[24 + 16..], creds[..]);
+        // The padding the alignment introduced is zero, not whatever the
+        // kernel stack held.
+        assert_eq!(&buf[20..24], &[0, 0, 0, 0]);
     }
 
     #[test]
@@ -1586,6 +1981,17 @@ mod peercred_tests {
         // Linux's `overflowuid`: the answer for credentials it does not hold.
         assert_eq!(words(ucred_of(43_102)), [43_102, u32::MAX, u32::MAX]);
     }
+
+    #[test]
+    fn no_peer_is_an_all_zero_ucred_not_init() {
+        // Fabricating pid 1 made seatd treat an unconnected socket as init.
+        assert_eq!(words(peercred_bytes(None)), [0, 0, 0]);
+        // A known-but-gone pid still reports overflowuid, not zeros.
+        assert_eq!(
+            words(peercred_bytes(Some(43_102))),
+            [43_102, u32::MAX, u32::MAX]
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1620,6 +2026,47 @@ mod sockopt_out_tests {
     //! is the case that turns up.
 
     use super::*;
+
+    /// `SO_TYPE` is optname 3; it used to fall through as `ENOPROTOOPT`.
+    /// `SO_BROADCAST` is 6; without the enum arm, getsockopt was ENOPROTOOPT
+    /// after setsockopt accepted it.
+    #[test]
+    fn so_type_is_a_known_sol_socket_optname() {
+        assert_eq!(SolOptname::try_from(3usize), Ok(SolOptname::TYPE));
+        assert_eq!(SolOptname::TYPE as usize, 3);
+        assert_eq!(SolOptname::try_from(6usize), Ok(SolOptname::BROADCAST));
+        assert_eq!(SolOptname::try_from(9usize), Ok(SolOptname::KEEPALIVE));
+        assert_eq!(SolOptname::try_from(15usize), Ok(SolOptname::REUSEPORT));
+        assert_eq!(SolOptname::try_from(20usize), Ok(SolOptname::RCVTIMEO));
+        assert_eq!(SolOptname::try_from(21usize), Ok(SolOptname::SNDTIMEO));
+        assert_eq!(SolOptname::try_from(30usize), Ok(SolOptname::ACCEPTCONN));
+        assert_eq!(SolOptname::try_from(38usize), Ok(SolOptname::PROTOCOL));
+        assert_eq!(SolOptname::try_from(39usize), Ok(SolOptname::DOMAIN));
+        assert_eq!(TcpOptname::try_from(1usize), Ok(TcpOptname::NODELAY));
+        assert_eq!(TcpOptname::try_from(4usize), Ok(TcpOptname::KEEPIDLE));
+        assert_eq!(TcpOptname::try_from(5usize), Ok(TcpOptname::KEEPINTVL));
+        assert_eq!(TcpOptname::try_from(6usize), Ok(TcpOptname::KEEPCNT));
+        assert_eq!(TcpOptname::try_from(13usize), Ok(TcpOptname::CONGESTION));
+        assert_eq!(IpOptname::try_from(1usize), Ok(IpOptname::TOS));
+        assert_eq!(IpOptname::try_from(2usize), Ok(IpOptname::TTL));
+        assert_eq!(IpOptname::try_from(3usize), Ok(IpOptname::HDRINCL));
+        assert_eq!(IpOptname::try_from(32usize), Ok(IpOptname::MulticastIf));
+        assert_eq!(IpOptname::try_from(33usize), Ok(IpOptname::MulticastTtl));
+        assert_eq!(IpOptname::try_from(34usize), Ok(IpOptname::MulticastLoop));
+        assert!(IpOptname::try_from(35usize).is_err()); // ADD_MEMBERSHIP, set-only
+    }
+
+    /// A level this kernel does not wire up is `ENOPROTOOPT`, not a fake 0.
+    #[test]
+    fn unknown_getsockopt_levels_are_not_sol_socket_or_ip() {
+        // The three `Level` knows; anything else used to succeed with 0.
+        assert!(Level::try_from(1usize).is_ok()); // SOL_SOCKET
+        assert!(Level::try_from(0usize).is_ok()); // IPPROTO_IP
+        assert!(Level::try_from(6usize).is_ok()); // IPPROTO_TCP
+        assert!(Level::try_from(263usize).is_err()); // SOL_PACKET
+        assert!(Level::try_from(41usize).is_err()); // SOL_IPV6
+        assert!(Level::try_from(99usize).is_err());
+    }
 
     // `libos` addresses are ordinary host addresses, so a local buffer is a
     // valid stand-in for the caller's and the copy below runs for real.
@@ -1721,5 +2168,126 @@ mod read_sockaddr_tests {
         let family = unsafe { sa.family }.to_ne_bytes();
         assert_eq!(family[0], 0x7F, "the one byte declared never arrived");
         assert_eq!(family[1], 0, "a byte the caller did not declare arrived");
+    }
+}
+
+#[cfg(test)]
+mod socket_type_flag_tests {
+    //! `socket` and `socketpair` pack SOCK_NONBLOCK/SOCK_CLOEXEC into the
+    //! type word. The high bits used to go through `from_bits_truncate`, so a
+    //! stray bit was success (or worse, an unrelated `OpenFlags` name).
+
+    use super::*;
+    use crate::file::{anon_fd_flags, ANON_CLOEXEC, ANON_NONBLOCK};
+
+    const SOCK_FLAGS: usize = ANON_CLOEXEC | ANON_NONBLOCK;
+
+    #[test]
+    fn the_two_known_bits_survive_and_nothing_else() {
+        let f = anon_fd_flags(ANON_CLOEXEC | ANON_NONBLOCK, SOCK_FLAGS).unwrap();
+        assert!(f.close_on_exec() && f.non_block());
+        let none = anon_fd_flags(0, SOCK_FLAGS).unwrap();
+        assert!(!none.close_on_exec() && !none.non_block());
+    }
+
+    #[test]
+    fn a_stray_high_bit_is_einval_not_a_working_socket() {
+        // Bit that lands on `OpenFlags::APPEND` if truncated — the silent
+        // mis-apply case, not just the silent-ignore case.
+        const APPEND: usize = 0o2000;
+        assert_eq!(
+            anon_fd_flags(APPEND, SOCK_FLAGS),
+            Err(LxError::EINVAL),
+            "APPEND must not become a socket open flag"
+        );
+        assert_eq!(
+            anon_fd_flags(1usize << 30, SOCK_FLAGS),
+            Err(LxError::EINVAL)
+        );
+        assert_eq!(
+            anon_fd_flags(APPEND | ANON_CLOEXEC, SOCK_FLAGS),
+            Err(LxError::EINVAL),
+            "a valid bit must not hide a stray one"
+        );
+    }
+
+    #[test]
+    fn the_type_nibble_is_stripped_before_the_flag_check() {
+        // Callers pass `SOCK_STREAM | SOCK_NONBLOCK`; only the high bits
+        // reach `anon_fd_flags`.
+        let packed = (SocketType::SOCK_STREAM as usize) | ANON_NONBLOCK;
+        let flag_bits = packed & !SOCKET_TYPE_MASK;
+        let f = anon_fd_flags(flag_bits, SOCK_FLAGS).unwrap();
+        assert!(f.non_block());
+        assert!(!f.close_on_exec());
+    }
+
+    /// `socket` / `socketpair` on AF_UNIX used to accept every `SocketType`
+    /// (or, for socketpair, swallow unknowns as SOCK_STREAM). The three
+    /// Linux knows succeed; garbage is EINVAL; named-but-unsupported types
+    /// are EOPNOTSUPP.
+    #[test]
+    fn af_unix_refuses_a_type_that_is_not_a_unix_type() {
+        assert_eq!(
+            unix_socket_type(SocketType::SOCK_STREAM),
+            Ok(SocketType::SOCK_STREAM)
+        );
+        assert_eq!(
+            unix_socket_type(SocketType::SOCK_DGRAM),
+            Ok(SocketType::SOCK_DGRAM)
+        );
+        assert_eq!(
+            unix_socket_type(SocketType::SOCK_SEQPACKET),
+            Ok(SocketType::SOCK_SEQPACKET)
+        );
+        assert_eq!(
+            unix_socket_type(SocketType::SOCK_RAW),
+            Err(LxError::EOPNOTSUPP)
+        );
+        assert_eq!(
+            unix_socket_type(SocketType::SOCK_RDM),
+            Err(LxError::EOPNOTSUPP)
+        );
+        assert_eq!(
+            unix_socket_type(SocketType::SOCK_PACKET),
+            Err(LxError::EOPNOTSUPP)
+        );
+        assert_eq!(unix_socketpair_type(99), Err(LxError::EINVAL));
+        assert_eq!(unix_socketpair_type(0), Err(LxError::EINVAL));
+        assert_eq!(
+            unix_socketpair_type(SocketType::SOCK_STREAM as usize),
+            Ok(SocketType::SOCK_STREAM)
+        );
+    }
+
+    /// `unix_create` only accepts protocol 0 or `PF_UNIX`. Any other value
+    /// used to succeed on both `socket` and `socketpair`.
+    #[test]
+    fn af_unix_refuses_a_protocol_that_is_not_unix() {
+        assert_eq!(unix_protocol(0), Ok(()));
+        assert_eq!(unix_protocol(Domain::AF_UNIX as usize), Ok(()));
+        assert_eq!(unix_protocol(99), Err(LxError::EPROTONOSUPPORT));
+        assert_eq!(unix_protocol(6), Err(LxError::EPROTONOSUPPORT)); // IPPROTO_TCP
+    }
+
+    /// `socket(AF_INET, SOCK_DGRAM, 99)` used to succeed as UDP because
+    /// `Protocol::try_from` failed → `None` matched a "tolerant" arm.
+    /// Linux says `EPROTONOSUPPORT`; only 0/`IPPROTO_UDP`/`IPPROTO_ICMP`
+    /// are wired for datagram.
+    #[test]
+    fn an_unknown_inet_dgram_protocol_is_not_silently_udp() {
+        assert!(Protocol::try_from(0usize).is_ok()); // IPPROTO_IP → UDP arm
+        assert!(Protocol::try_from(17usize).is_ok()); // IPPROTO_UDP
+        assert!(Protocol::try_from(1usize).is_ok()); // IPPROTO_ICMP (ping)
+        assert!(
+            Protocol::try_from(99usize).is_err(),
+            "unknown protocol must not become None→UDP; catch-all is EPROTONOSUPPORT"
+        );
+    }
+
+    /// `getpeername` with no peer must be `ENOTCONN`, not `EINVAL`.
+    #[test]
+    fn getpeername_without_a_peer_is_enotconn() {
+        assert_eq!(peer_endpoint(None).err(), Some(LxError::ENOTCONN));
     }
 }

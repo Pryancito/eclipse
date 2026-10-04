@@ -12,7 +12,8 @@ use lock::Mutex;
 use smoltcp::phy::ChecksumCapabilities;
 use smoltcp::socket::{IcmpEndpoint, IcmpPacketMetadata, IcmpSocket, IcmpSocketBuffer};
 use smoltcp::wire::{
-    Icmpv4Packet, Icmpv4Repr, Icmpv6Packet, Icmpv6Repr, IpAddress, IpEndpoint, Ipv6Address,
+    Icmpv4Packet, Icmpv4Repr, Icmpv6Packet, Icmpv6Repr, IpAddress, IpEndpoint, Ipv4Address,
+    Ipv6Address,
 };
 
 #[allow(unused_imports)]
@@ -37,6 +38,14 @@ struct IcmpInner {
     echo_seq: u16,
     echo_id: u16,
     ipv6: bool,
+    /// Last recvmsg flags (`MSG_TRUNC`, …); cleared by [`Socket::take_msg_flags`].
+    last_msg_flags: i32,
+    /// `shutdown(SHUT_RD)`: empty queue reads as EOF.
+    read_closed: bool,
+    /// `shutdown(SHUT_WR)`: with `read_closed`, poll reports hangup.
+    write_closed: bool,
+    /// SOL_SOCKET / IPPROTO_IP knobs (get must mirror set).
+    opts: StoredInetOpts,
 }
 
 impl IcmpSocketState {
@@ -60,8 +69,16 @@ impl IcmpSocketState {
                 echo_seq: 0,
                 echo_id: (kernel_hal::timer::timer_now().as_micros() as u16).wrapping_add(1),
                 ipv6,
+                last_msg_flags: 0,
+                read_closed: false,
+                write_closed: false,
+                opts: StoredInetOpts::default(),
             })),
         })
+    }
+
+    fn note_truncation(inner: &mut IcmpInner, full_len: usize, copied: usize) {
+        inner.last_msg_flags = if full_len > copied { 0x20 } else { 0 };
     }
 
     fn bind_ident(inner: &IcmpInner) -> LxResult<()> {
@@ -158,12 +175,13 @@ impl IcmpSocketState {
 impl Socket for IcmpSocketState {
     async fn read(&self, data: &mut [u8]) -> (SysResult, Endpoint) {
         loop {
-            let (ipv6, remote, non_block) = {
+            let (ipv6, remote, non_block, read_closed) = {
                 let inner = self.inner.lock();
                 (
                     inner.ipv6,
                     inner.remote.map(|e| e.addr),
                     inner.flags.contains(OpenFlags::NON_BLOCK),
+                    inner.read_closed,
                 )
             };
 
@@ -171,18 +189,29 @@ impl Socket for IcmpSocketState {
             if let Some((pkt, src)) = icmp_rx::pop_for(ipv6, remote) {
                 let n = pkt.len().min(data.len());
                 data[..n].copy_from_slice(&pkt[..n]);
+                Self::note_truncation(&mut self.inner.lock(), pkt.len(), n);
                 return (Ok(n), Endpoint::Ip(IpEndpoint::new(src, 0)));
             }
 
             let handle = self.inner.lock().handle.0;
+            // Use recv() so we know the full datagram length for MSG_TRUNC.
             let copied = {
                 let sets = get_sockets();
                 let mut sets = sets.lock();
                 let mut sock = sets.get::<IcmpSocket>(handle);
-                sock.recv_slice(data)
+                match sock.recv() {
+                    Ok((buffer, src)) => {
+                        let full = buffer.len();
+                        let n = data.len().min(full);
+                        data[..n].copy_from_slice(&buffer[..n]);
+                        Ok((n, src, full))
+                    }
+                    Err(e) => Err(e),
+                }
             };
             match copied {
-                Ok((n, src)) => {
+                Ok((n, src, full)) => {
+                    Self::note_truncation(&mut self.inner.lock(), full, n);
                     return (Ok(n), Endpoint::Ip(IpEndpoint::new(src, 0)));
                 }
                 Err(smoltcp::Error::Exhausted) => {
@@ -191,7 +220,11 @@ impl Socket for IcmpSocketState {
                     if let Some((pkt, src)) = icmp_rx::pop_for(ipv6, remote) {
                         let n = pkt.len().min(data.len());
                         data[..n].copy_from_slice(&pkt[..n]);
+                        Self::note_truncation(&mut self.inner.lock(), pkt.len(), n);
                         return (Ok(n), Endpoint::Ip(IpEndpoint::new(src, 0)));
+                    }
+                    if read_closed {
+                        return (Ok(0), Endpoint::Ip(IpEndpoint::UNSPECIFIED));
                     }
                     if non_block {
                         return (Err(LxError::EAGAIN), Endpoint::Ip(IpEndpoint::UNSPECIFIED));
@@ -282,7 +315,16 @@ impl Socket for IcmpSocketState {
         Ok(0)
     }
 
-    fn setsockopt(&self, _level: usize, _opt: usize, _data: &[u8]) -> SysResult {
+    /// `inet_shutdown` on a datagram ICMP socket: record sides (like UDP),
+    /// `ENOTCONN` without a peer.
+    fn shutdown(&self, howto: usize) -> SysResult {
+        let (rd, wr) = shutdown_sides(howto)?;
+        let mut inner = self.inner.lock();
+        inner.read_closed |= rd;
+        inner.write_closed |= wr;
+        if inner.remote.is_none() {
+            return Err(LxError::ENOTCONN);
+        }
         Ok(0)
     }
 
@@ -294,17 +336,107 @@ impl Socket for IcmpSocketState {
         Some(SocketType::SOCK_DGRAM)
     }
 
+    fn is_inet(&self) -> bool {
+        true
+    }
+
+    fn so_reuseaddr(&self) -> bool {
+        self.inner.lock().opts.reuse_addr
+    }
+    fn so_broadcast(&self) -> bool {
+        self.inner.lock().opts.broadcast
+    }
+    fn so_keepalive(&self) -> bool {
+        self.inner.lock().opts.keepalive
+    }
+    fn so_reuseport(&self) -> bool {
+        self.inner.lock().opts.reuse_port
+    }
+    fn so_linger(&self) -> (bool, i32) {
+        let o = &self.inner.lock().opts;
+        (o.linger_on, o.linger_sec)
+    }
+    fn so_rcvtimeo(&self) -> [u8; 16] {
+        self.inner.lock().opts.rcv_timeo
+    }
+    fn so_sndtimeo(&self) -> [u8; 16] {
+        self.inner.lock().opts.snd_timeo
+    }
+    fn ip_tos(&self) -> u32 {
+        self.inner.lock().opts.ip_tos
+    }
+    fn ip_ttl(&self) -> u32 {
+        self.inner.lock().opts.ip_ttl
+    }
+    fn ip_multicast_ttl(&self) -> u32 {
+        self.inner.lock().opts.mcast_ttl
+    }
+    fn ip_multicast_loop(&self) -> bool {
+        self.inner.lock().opts.mcast_loop
+    }
+    fn ip_multicast_if(&self) -> u32 {
+        self.inner.lock().opts.mcast_if
+    }
+
+    fn setsockopt(&self, level: usize, opt: usize, data: &[u8]) -> SysResult {
+        const IPPROTO_IP: usize = 0;
+        const IP_HDRINCL: usize = 3;
+        // ICMP is not SOCK_RAW; HDRINCL is ENOPROTOOPT.
+        if level == IPPROTO_IP && opt == IP_HDRINCL {
+            return Err(LxError::ENOPROTOOPT);
+        }
+        if let Some(r) = self.inner.lock().opts.try_setsockopt(level, opt, data) {
+            return r;
+        }
+        crate::net::check_setsockopt_len(level, opt, data)?;
+        Ok(0)
+    }
+
+    fn so_domain(&self) -> Option<u32> {
+        Some(if self.inner.lock().ipv6 {
+            crate::net::Domain::AF_INET6 as u32
+        } else {
+            crate::net::Domain::AF_INET as u32
+        })
+    }
+
+    fn so_protocol(&self) -> Option<u32> {
+        Some(if self.inner.lock().ipv6 { 58 } else { 1 }) // ICMPV6 / ICMP
+    }
+
+    fn take_msg_flags(&self) -> i32 {
+        core::mem::replace(&mut self.inner.lock().last_msg_flags, 0)
+    }
+
+    /// Unspecified local: ICMP datagram sockets do not bind a port the way
+    /// UDP does; without this, `getsockname` was always `EINVAL`.
+    fn endpoint(&self) -> Option<Endpoint> {
+        let ipv6 = self.inner.lock().ipv6;
+        let addr = if ipv6 {
+            IpAddress::Ipv6(Ipv6Address::UNSPECIFIED)
+        } else {
+            IpAddress::Ipv4(Ipv4Address::UNSPECIFIED)
+        };
+        Some(Endpoint::Ip(IpEndpoint { addr, port: 0 }))
+    }
+
+    /// Peer from `connect`; without this, `getpeername` after connect was
+    /// `ENOTCONN`.
+    fn remote_endpoint(&self) -> Option<Endpoint> {
+        self.inner.lock().remote.map(Endpoint::Ip)
+    }
+
     fn poll(&self, _events: PollEvents) -> (bool, bool, bool) {
         kernel_hal::deferred_job::drain_deferred_jobs();
         crate::net::drain_net_tick();
         let inner = self.inner.lock();
-        let readable = {
-            let sets = get_sockets();
-            let mut sets = sets.lock();
-            let sock = sets.get::<IcmpSocket>(inner.handle.0);
-            sock.can_recv() || icmp_rx::pending_for(inner.ipv6)
-        };
-        (readable, true, false)
+        let sets = get_sockets();
+        let mut sets = sets.lock();
+        let sock = sets.get::<IcmpSocket>(inner.handle.0);
+        let readable = sock.can_recv() || icmp_rx::pending_for(inner.ipv6) || inner.read_closed;
+        // Was hardcoded `true`; a full TX ring must clear POLLOUT like UDP/raw.
+        let writable = sock.can_send();
+        (readable, writable, false)
     }
 }
 
@@ -335,26 +467,18 @@ impl FileLike for IcmpSocketState {
     }
 
     fn set_flags(&self, f: OpenFlags) -> LxResult {
-        let mut inner = self.inner.lock();
-        inner
-            .flags
-            .set(OpenFlags::APPEND, f.contains(OpenFlags::APPEND));
-        inner
-            .flags
-            .set(OpenFlags::NON_BLOCK, f.contains(OpenFlags::NON_BLOCK));
-        inner
-            .flags
-            .set(OpenFlags::CLOEXEC, f.contains(OpenFlags::CLOEXEC));
+        self.inner.lock().flags.take_settable(f);
         Ok(())
     }
 
     async fn read(&self, buf: &mut [u8]) -> LxResult<usize> {
-        let inner = self.inner.lock();
+        let mut inner = self.inner.lock();
         if icmp_rx::pending_for(inner.ipv6) {
             let remote = inner.remote.map(|e| e.addr);
             if let Some((pkt, _src)) = icmp_rx::pop_for(inner.ipv6, remote) {
                 let n = pkt.len().min(buf.len());
                 buf[..n].copy_from_slice(&pkt[..n]);
+                Self::note_truncation(&mut inner, pkt.len(), n);
                 return Ok(n);
             }
         }
@@ -372,30 +496,36 @@ impl FileLike for IcmpSocketState {
 
     fn poll(&self, events: PollEvents) -> LxResult<PollStatus> {
         let (read, write, error) = Socket::poll(self, events);
+        let hangup = {
+            let inner = self.inner.lock();
+            inner.read_closed && inner.write_closed
+        };
         Ok(PollStatus {
             read,
             write,
             error,
-            hangup: false,
+            hangup,
         })
     }
 
     async fn async_poll(&self, events: PollEvents) -> LxResult<PollStatus> {
         kernel_hal::deferred_job::drain_deferred_jobs();
         let (mut read, mut write, mut error) = Socket::poll(self, events);
-        let ready = (events.contains(PollEvents::IN) && read)
-            || (events.contains(PollEvents::OUT) && write)
-            || error;
+        let ready = (events.wants_read() && read) || (events.wants_write() && write) || error;
         if !ready {
             // Park on RX IRQ (fallback timeout) like UDP — avoid busy-spin.
             kernel_hal::net::NetRxOrTimeoutFuture::new(25).await;
             (read, write, error) = Socket::poll(self, events);
         }
+        let hangup = {
+            let inner = self.inner.lock();
+            inner.read_closed && inner.write_closed
+        };
         Ok(PollStatus {
             read,
             write,
             error,
-            hangup: false,
+            hangup,
         })
     }
 
@@ -403,7 +533,121 @@ impl FileLike for IcmpSocketState {
         handle_net_ioctl(request, arg1, arg2, arg3, self.inner.lock().ipv6)
     }
 
+    /// `FIONREAD`/`SIOCINQ`: next datagram size (0 if none). Without this the
+    /// ioctl fell through to ENOTTY.
+    fn readable_bytes(&self) -> Option<usize> {
+        let (handle, ipv6, remote) = {
+            let inner = self.inner.lock();
+            (inner.handle.0, inner.ipv6, inner.remote.map(|e| e.addr))
+        };
+        if let Some(n) = icmp_rx::peek_len(ipv6, remote) {
+            return Some(n);
+        }
+        let sockets = get_sockets();
+        let mut set = sockets.lock();
+        // smoltcp's ICMP socket has no public peek; report 0 when empty and
+        // 1 when something is queued (enough for "is there data?" probes).
+        Some(if set.get::<IcmpSocket>(handle).can_recv() {
+            1
+        } else {
+            0
+        })
+    }
+
     fn as_socket(&self) -> LxResult<&dyn Socket> {
         Ok(self)
+    }
+}
+
+#[cfg(test)]
+mod endpoint_tests {
+    use super::*;
+    use async_std::task::block_on;
+    use smoltcp::wire::Ipv4Address;
+
+    #[test]
+    fn getsockname_on_icmp_is_unspecified_not_einval() {
+        let s = IcmpSocketState::new(false).unwrap();
+        let ep = Socket::endpoint(&s).expect("local name");
+        match ep {
+            Endpoint::Ip(ip) => {
+                assert!(ip.addr.is_unspecified());
+                assert_eq!(ip.port, 0);
+            }
+            other => panic!("expected Ip, got {:?}", other),
+        }
+        assert!(Socket::remote_endpoint(&s).is_none());
+    }
+
+    #[test]
+    fn getpeername_after_connect_sees_the_peer() {
+        let s = IcmpSocketState::new(false).unwrap();
+        let peer = IpEndpoint::new(IpAddress::Ipv4(Ipv4Address::new(8, 8, 8, 8)), 0);
+        block_on(Socket::connect(&s, Endpoint::Ip(peer))).unwrap();
+        match Socket::remote_endpoint(&s) {
+            Some(Endpoint::Ip(ip)) => {
+                assert_eq!(ip.addr, peer.addr);
+                assert_eq!(ip.port, peer.port);
+            }
+            other => panic!("expected peer {:?}, got {:?}", peer, other),
+        }
+    }
+
+    /// Idle ICMP must answer `FIONREAD` with 0, not fall through to ENOTTY.
+    #[test]
+    fn an_idle_icmp_socket_reports_zero_bytes_readable() {
+        let s = IcmpSocketState::new(false).unwrap();
+        assert_eq!(FileLike::readable_bytes(&s), Some(0));
+    }
+
+    /// A short recv on a queued echo reply must set `MSG_TRUNC` (0x20).
+    #[test]
+    fn a_short_icmp_read_reports_msg_trunc() {
+        let _g = crate::net::NET_TEST_LOCK.lock();
+        while icmp_rx::pop_for(false, None).is_some() {}
+        let s = IcmpSocketState::new(false).unwrap();
+        FileLike::set_flags(&s, OpenFlags::RDWR | OpenFlags::NON_BLOCK).unwrap();
+        icmp_rx::queue_echo_reply(
+            IpAddress::Ipv4(Ipv4Address::new(127, 0, 0, 1)),
+            alloc::vec![0u8; 32],
+        );
+        let mut buf = [0u8; 8];
+        assert_eq!(block_on(Socket::read(&s, &mut buf)).0, Ok(8));
+        assert_eq!(Socket::take_msg_flags(&s), 0x20, "MSG_TRUNC");
+    }
+
+    /// After `shutdown(SHUT_RD)`, an empty ICMP socket reads EOF (like UDP).
+    #[test]
+    fn shutdown_rd_makes_an_empty_icmp_socket_read_eof() {
+        let _g = crate::net::NET_TEST_LOCK.lock();
+        while icmp_rx::pop_for(false, None).is_some() {}
+        let s = IcmpSocketState::new(false).unwrap();
+        FileLike::set_flags(&s, OpenFlags::RDWR | OpenFlags::NON_BLOCK).unwrap();
+        let peer = IpEndpoint::new(IpAddress::Ipv4(Ipv4Address::new(8, 8, 8, 8)), 0);
+        block_on(Socket::connect(&s, Endpoint::Ip(peer))).unwrap();
+        assert_eq!(Socket::shutdown(&s, 0), Ok(0));
+        let mut buf = [0u8; 8];
+        assert_eq!(block_on(Socket::read(&s, &mut buf)).0, Ok(0));
+        assert!(!FileLike::poll(&s, PollEvents::IN).unwrap().hangup);
+        assert_eq!(Socket::shutdown(&s, 1), Ok(0));
+        assert!(FileLike::poll(&s, PollEvents::IN).unwrap().hangup);
+    }
+
+    /// SO_BROADCAST / IP_TTL must mirror set (used to stay at defaults).
+    #[test]
+    fn sockopts_mirror_setsockopt() {
+        let _g = crate::net::NET_TEST_LOCK.lock();
+        let s = IcmpSocketState::new(false).unwrap();
+        assert!(!Socket::so_broadcast(&s));
+        assert_eq!(Socket::ip_ttl(&s), 64);
+        assert_eq!(Socket::setsockopt(&s, 1, 6, &1u32.to_ne_bytes()), Ok(0));
+        assert_eq!(Socket::setsockopt(&s, 0, 2, &[42]), Ok(0));
+        assert!(Socket::so_broadcast(&s));
+        assert_eq!(Socket::ip_ttl(&s), 42);
+        assert_eq!(
+            Socket::setsockopt(&s, 0, 3, &[1]),
+            Err(LxError::ENOPROTOOPT),
+            "IP_HDRINCL is raw-only"
+        );
     }
 }

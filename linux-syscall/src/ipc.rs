@@ -9,6 +9,9 @@ pub use linux_object::ipc::*;
 /// `shmat(2)` attach flags (`linux/shm.h`).
 const SHM_RDONLY: usize = 0o10000;
 const SHM_RND: usize = 0o20000;
+/// Replace any mapping already at `shmaddr`. Requires a non-NULL address
+/// (`do_shmat`); with NULL it is EINVAL, not a silent "anywhere" attach.
+const SHM_REMAP: usize = 0o40000;
 
 /// `SHMLBA`: the boundary `SHM_RND` rounds a requested attach address down to.
 /// Every architecture this kernel targets (x86-64, aarch64, riscv64) defines
@@ -121,6 +124,11 @@ fn shmat_flags_and_place(shmflg: usize, addr: VirtAddr) -> Result<(MMUFlags, Shm
     let place = if addr == 0 {
         // shmat(2): "If shmaddr is NULL, the system chooses a suitable
         // (unused) page-aligned address." This is the case MIT-SHM uses.
+        // SHM_REMAP needs a concrete range to take over; with NULL it is
+        // EINVAL (`do_shmat`), not a free placement that ignores the flag.
+        if shmflg & SHM_REMAP != 0 {
+            return Err(LxError::EINVAL);
+        }
         ShmatPlace::Anywhere
     } else if shmflg & SHM_RND != 0 {
         // "the attach occurs at the address rounded down to the nearest
@@ -234,6 +242,11 @@ impl Syscall<'_> {
         // Checked before reading the pointer, as Linux does.
         let num_ops = semop_count(num_ops)?;
         let ops = ops.as_slice(num_ops)?;
+        // Linux `ipc/sem.c`: any bit outside IPC_NOWAIT|SEM_UNDO is EINVAL for
+        // the whole array. Truncating used to drop garbage and keep going.
+        for op in ops.iter() {
+            sem_flags(op.flags)?;
+        }
 
         let sem_array = self
             .linux_process()
@@ -275,7 +288,7 @@ impl Syscall<'_> {
                             }
                         }
                         for &SemBuf { num, op, flags } in ops {
-                            if SemFlags::from_bits_truncate(flags).contains(SemFlags::SEM_UNDO) {
+                            if sem_flags(flags).unwrap().contains(SemFlags::SEM_UNDO) {
                                 self.linux_process().semaphores_add_undo(id, num, op);
                             }
                         }
@@ -294,7 +307,8 @@ impl Syscall<'_> {
                     // miss a change that lands in between), and whether the
                     // blocking operation asked not to wait.
                     SemopPlan::WouldBlock { sem_num, op_index } => {
-                        let nowait = SemFlags::from_bits_truncate(ops[op_index].flags)
+                        let nowait = sem_flags(ops[op_index].flags)
+                            .unwrap()
                             .contains(SemFlags::IPC_NOWAIT);
                         (sem_num, snapshot[sem_num].1, nowait)
                     }
@@ -547,11 +561,13 @@ impl Syscall<'_> {
             "msgrcv: id={}, msgp={:#x}, msgsz={}, msgtyp={}, flags={:#x}",
             id, msgp, msgsz, msgtyp, msgflg
         );
+        let msgsz = msgrcv_bufsz(msgsz)?;
         let queue = msg_queue(id).ok_or(LxError::EINVAL)?;
         let proc = self.linux_process();
         if !queue.may_access(proc.euid(), proc.egid(), &proc.groups(), IPC_R) {
             return Err(LxError::EACCES);
         }
+        msgrcv_copy_flags(msgflg)?;
         let receiver = self.zircon_process().id() as u32;
         let noerror = msgflg & MSG_NOERROR != 0;
         let except = msgflg & MSG_EXCEPT != 0;
@@ -901,6 +917,17 @@ impl Syscall<'_> {
                 // caller learns it from the index it walked to.
                 Ok(ipc_stat_result(cmd != ShmctlCmds::IPC_STAT, id))
             }
+            // No swap here, so locking a segment into RAM is already true
+            // (same honesty as `mlock`). The commands themselves are real —
+            // falling through to `EINVAL` made `shmctl(id, SHM_LOCK, 0)` look
+            // like an unknown cmd to anything that probes them (busybox
+            // `ipcrm`, postgres startup). Ownership still gates them.
+            ShmctlCmds::SHM_LOCK | ShmctlCmds::SHM_UNLOCK => {
+                if !guard.lock().may_control(self.linux_process().euid()) {
+                    return Err(LxError::EPERM);
+                }
+                Ok(0)
+            }
             _ => {
                 warn!("unsupported shmctl cmd: {:?}", cmd);
                 Err(LxError::EINVAL)
@@ -1206,6 +1233,15 @@ impl SemBuf {
     }
 }
 
+/// Decode `sem_flg`, or `EINVAL` if it carries anything beyond
+/// `IPC_NOWAIT | SEM_UNDO` (Linux `perform_atomic_semop_slow`).
+///
+/// `SemFlags::from_bits_truncate` used to drop the rest in silence, so a
+/// caller's typo sailed through as a successful op.
+fn sem_flags(flags: i16) -> Result<SemFlags, LxError> {
+    SemFlags::from_bits(flags).ok_or(LxError::EINVAL)
+}
+
 /// Linux `SEMOPM`: the most operations one `semop(2)` may carry.
 const SEMOPM: usize = 500;
 
@@ -1396,6 +1432,34 @@ const MSG_NOERROR: usize = 0o10000;
 /// msgrcv(2) `MSG_EXCEPT`: with msgtyp > 0, take the first message of a
 /// *different* type.
 const MSG_EXCEPT: usize = 0o20000;
+/// msgrcv(2) `MSG_COPY`: nondestructive peek by ordinal (checkpoint/restore).
+/// This kernel has no C/R support; the flag must still be recognised so it
+/// is not silently turned into a destructive receive.
+const MSG_COPY: usize = 0o40000;
+
+/// Refuse `MSG_COPY` the way Linux does without `CONFIG_CHECKPOINT_RESTORE`:
+/// `EINVAL` for the illegal combinations first, then `ENOSYS`. Leaving the
+/// bit unchecked used to dequeue the message and answer success.
+fn msgrcv_copy_flags(msgflg: usize) -> Result<(), LxError> {
+    if msgflg & MSG_COPY == 0 {
+        return Ok(());
+    }
+    // Linux 3.14+: COPY without NOWAIT, or COPY|EXCEPT, before the ENOSYS.
+    if msgflg & IPC_NOWAIT == 0 || msgflg & MSG_EXCEPT != 0 {
+        return Err(LxError::EINVAL);
+    }
+    Err(LxError::ENOSYS)
+}
+
+/// `do_msgrcv`: `(long)bufsz < 0` is `EINVAL`. As `usize`, that is the high
+/// bit set (`(size_t)-1`, etc.); without the check those values became an
+/// unlimited buffer and every message "fit".
+fn msgrcv_bufsz(msgsz: usize) -> Result<usize, LxError> {
+    if (msgsz as i64) < 0 {
+        return Err(LxError::EINVAL);
+    }
+    Ok(msgsz)
+}
 
 /// The System V IPC syscalls, tested where they can be: the parts that are a
 /// decision about a userspace value rather than a walk through process state.
@@ -1845,6 +1909,18 @@ mod shmctl_subject_tests {
         }
     }
 
+    /// `SHM_LOCK` / `SHM_UNLOCK` are real commands (not the `_` EINVAL
+    /// bucket). With no swap they are no-ops after the ownership check,
+    /// but they must not be reported as unknown.
+    #[test]
+    fn lock_and_unlock_are_named_id_commands() {
+        assert_eq!(shmctl_subject(ShmctlCmds::SHM_LOCK, 1), IpcSubject::Id(1));
+        assert_eq!(shmctl_subject(ShmctlCmds::SHM_UNLOCK, 1), IpcSubject::Id(1));
+        assert_eq!(ShmctlCmds::try_from(11usize), Ok(ShmctlCmds::SHM_LOCK));
+        assert_eq!(ShmctlCmds::try_from(12usize), Ok(ShmctlCmds::SHM_UNLOCK));
+        assert!(ShmctlCmds::try_from(99usize).is_err());
+    }
+
     /// `SHM_INFO` returns the highest index, 0 for an empty table; the
     /// `SHM_STAT`s return the id found there; `IPC_STAT` returns 0.
     #[test]
@@ -1877,7 +1953,9 @@ mod shmat_place_tests {
     //! chose, and the caller was told so only by the return value).
 
     use super::{
-        semop_count, shmat_flags_and_place, ShmatPlace, SEMOPM, SHMLBA, SHM_RDONLY, SHM_RND,
+        msgrcv_bufsz, msgrcv_copy_flags, sem_flags, semop_count, shmat_flags_and_place, SemFlags,
+        ShmatPlace, IPC_NOWAIT, MSG_COPY, MSG_EXCEPT, MSG_NOERROR, SEMOPM, SHMLBA, SHM_RDONLY,
+        SHM_REMAP, SHM_RND,
     };
     use crate::vm::MMAP_MIN_ADDR;
     use crate::LxError;
@@ -1953,9 +2031,64 @@ mod shmat_place_tests {
         assert_eq!(SEMOPM, 500);
     }
 
+    /// `sem_flg` may only carry IPC_NOWAIT and SEM_UNDO; anything else is
+    /// EINVAL for the whole array, not a truncated success.
+    #[test]
+    fn sem_flg_rejects_bits_outside_nowait_and_undo() {
+        assert_eq!(sem_flags(0), Ok(SemFlags::empty()));
+        assert_eq!(
+            sem_flags(SemFlags::IPC_NOWAIT.bits()),
+            Ok(SemFlags::IPC_NOWAIT)
+        );
+        assert_eq!(sem_flags(SemFlags::SEM_UNDO.bits()), Ok(SemFlags::SEM_UNDO));
+        assert_eq!(
+            sem_flags((SemFlags::IPC_NOWAIT | SemFlags::SEM_UNDO).bits()),
+            Ok(SemFlags::IPC_NOWAIT | SemFlags::SEM_UNDO)
+        );
+        assert_eq!(sem_flags(0x1), Err(LxError::EINVAL), "bit 0 is not a flag");
+        assert_eq!(
+            sem_flags(SemFlags::IPC_NOWAIT.bits() | 0x1),
+            Err(LxError::EINVAL),
+            "a valid bit must not hide a stray one"
+        );
+    }
+
+    /// `MSG_COPY` peeks without consuming. Without checkpoint/restore support
+    /// Linux answers ENOSYS (after EINVAL for the illegal combinations);
+    /// truncating the bit used to dequeue the message and say success.
+    #[test]
+    fn msg_copy_is_refused_not_turned_into_a_destructive_recv() {
+        assert_eq!(msgrcv_copy_flags(0), Ok(()));
+        assert_eq!(msgrcv_copy_flags(MSG_NOERROR | MSG_EXCEPT), Ok(()));
+        assert_eq!(
+            msgrcv_copy_flags(MSG_COPY),
+            Err(LxError::EINVAL),
+            "COPY without IPC_NOWAIT"
+        );
+        assert_eq!(
+            msgrcv_copy_flags(MSG_COPY | MSG_EXCEPT | IPC_NOWAIT),
+            Err(LxError::EINVAL),
+            "COPY|EXCEPT"
+        );
+        assert_eq!(
+            msgrcv_copy_flags(MSG_COPY | IPC_NOWAIT),
+            Err(LxError::ENOSYS),
+            "supported shape, unsupported feature"
+        );
+    }
+
+    /// `msgrcv(..., (size_t)-1, …)` must be `EINVAL`, not an unlimited buffer.
+    #[test]
+    fn a_negative_msgrcv_bufsz_is_einval() {
+        assert_eq!(msgrcv_bufsz(0), Ok(0));
+        assert_eq!(msgrcv_bufsz(8192), Ok(8192));
+        assert_eq!(msgrcv_bufsz(1usize << 63), Err(LxError::EINVAL));
+        assert_eq!(msgrcv_bufsz(usize::MAX), Err(LxError::EINVAL));
+    }
+
     /// `addr == 0` lets the kernel choose -- the MIT-SHM path, and the only
     /// one the old code ever really took. It must stay `Anywhere` regardless
-    /// of the other flags.
+    /// of the other flags, except `SHM_REMAP`, which needs a concrete range.
     #[test]
     fn a_null_address_is_placed_anywhere() {
         assert_eq!(shmat_flags_and_place(0, 0).unwrap().1, ShmatPlace::Anywhere);
@@ -1963,6 +2096,18 @@ mod shmat_place_tests {
             shmat_flags_and_place(SHM_RND, 0).unwrap().1,
             ShmatPlace::Anywhere,
             "SHM_RND on a null address still means 'anywhere', not 'at 0'"
+        );
+    }
+
+    /// `SHM_REMAP` with a NULL address is EINVAL (`do_shmat`), not a silent
+    /// free placement that pretends the flag was never set.
+    #[test]
+    fn shm_remap_with_a_null_address_is_einval() {
+        assert_eq!(shmat_flags_and_place(SHM_REMAP, 0), Err(LxError::EINVAL));
+        assert_eq!(
+            shmat_flags_and_place(SHM_REMAP | SHM_RDONLY | SHM_RND, 0),
+            Err(LxError::EINVAL),
+            "other valid bits must not hide SHM_REMAP|NULL"
         );
     }
 

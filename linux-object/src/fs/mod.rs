@@ -382,8 +382,9 @@ lazy_static! {
 /// `mmap`/`ftruncate`/`read`/`write` reuse the regular-file machinery. Wayland
 /// (`os_create_anonymous_file`), wlroots and Mesa use this to share xkb keymaps
 /// and shm pools.
-/// `memfd_create(2)` flags. `MFD_HUGETLB` is ignored (there are no huge pages
-/// to back the file with); `MFD_NOEXEC_SEAL` implies sealing is available
+/// `memfd_create(2)` flags. `MFD_HUGETLB` is refused (`EINVAL`): there are
+/// no huge pages to back the file with — same answer as `MAP_HUGETLB` /
+/// `SHM_HUGETLB` here. `MFD_NOEXEC_SEAL` implies sealing is available
 /// (Linux 6.3) and is otherwise a no-op here, since a memfd is never executed.
 pub const MFD_CLOEXEC: usize = 0x0001;
 /// See [`MFD_CLOEXEC`].
@@ -415,21 +416,18 @@ pub const MFD_NAME_MAX_LEN: usize = 255 - "memfd:".len();
 /// `unsigned int`: the bits above it never reached `memfd_create` on Linux, so
 /// they cannot be rejected here either.
 pub fn memfd_args(name: &str, flags: usize) -> LxResult<usize> {
-    /// Where a huge-page size is encoded, and how wide. Only meaningful with
-    /// `MFD_HUGETLB`, so only allowed with it.
-    const MFD_HUGE_SHIFT: usize = 26;
-    /// See [`MFD_HUGE_SHIFT`].
-    const MFD_HUGE_MASK: usize = 63;
-    const MFD_ALL_FLAGS: usize =
-        MFD_CLOEXEC | MFD_ALLOW_SEALING | MFD_HUGETLB | MFD_NOEXEC_SEAL | MFD_EXEC;
+    const MFD_ALL_FLAGS: usize = MFD_CLOEXEC | MFD_ALLOW_SEALING | MFD_NOEXEC_SEAL | MFD_EXEC;
 
     let flags = flags & u32::MAX as usize;
-    let allowed = if flags & MFD_HUGETLB != 0 {
-        MFD_ALL_FLAGS | (MFD_HUGE_MASK << MFD_HUGE_SHIFT)
-    } else {
-        MFD_ALL_FLAGS
-    };
-    if flags & !allowed != 0 {
+    // No hugepage pool. Accepting `MFD_HUGETLB` used to hand back a normal
+    // ramfs memfd, so a probe thought it got huge pages (same trap as
+    // `MAP_HUGETLB` / `SHM_HUGETLB` before those were refused). The size
+    // encoding in bits 26..31 is only meaningful with that bit, so it falls
+    // out of the allowed mask with it.
+    if flags & MFD_HUGETLB != 0 {
+        return Err(LxError::EINVAL);
+    }
+    if flags & !MFD_ALL_FLAGS != 0 {
         return Err(LxError::EINVAL);
     }
     // "executable" and "sealed shut against ever becoming executable" are not
@@ -839,9 +837,11 @@ pub trait FileLike: KernelObject + downcast_rs::DowncastSync {
     fn write(&self, buf: &[u8]) -> LxResult<usize>;
     /// read to buffer at given offset
     async fn read_at(&self, offset: u64, buf: &mut [u8]) -> LxResult<usize>;
-    /// write from buffer at given offset
+    /// write from buffer at given offset. Default: not seekable (`ESPIPE`),
+    /// like a pipe/socket — the same answer as [`seek`](Self::seek). It used
+    /// to be `ENOSYS`, which told callers the *syscall* was missing.
     fn write_at(&self, _offset: u64, _buf: &[u8]) -> LxResult<usize> {
-        Err(LxError::ENOSYS)
+        Err(LxError::ESPIPE)
     }
     /// reposition the file offset. Default: not seekable (`ESPIPE`), like a
     /// pipe/socket. Seekable objects (regular files, dma-bufs whose size Mesa
@@ -883,6 +883,43 @@ pub trait FileLike: KernelObject + downcast_rs::DowncastSync {
         waker: &core::task::Waker,
     ) -> Option<crate::sync::ReadinessSub> {
         let _ = (events, waker);
+        None
+    }
+    /// How many times this file's producer has published readiness *in the
+    /// directions `events` names*: the
+    /// [`crate::sync::EventBus::seq_for`] of its event source. It moves on
+    /// every write to an eventfd, every message to a socket, every pipe write
+    /// -- including the ones that find the file already readable.
+    ///
+    /// `events` is not a filter for tidiness. The whole-bus counter moves for
+    /// a publication in *either* direction, and producers publish one
+    /// direction to wake waiters on it alone: a unix socket pulses `WRITABLE`
+    /// on its peer's bus when a reader drains a full queue, and an eventfd
+    /// publishes `WRITABLE` on every `read` that empties it. An `EPOLLIN`
+    /// entry measured against that re-reported the readable level
+    /// `epoll_wait` had already delivered -- the spin `EPOLLET` exists to
+    /// stop.
+    ///
+    /// This is what `EPOLLET` is measured against. `None` (the default) means
+    /// the file has no such counter, and `epoll` keeps reporting it by level
+    /// even when edge-triggered: a spurious event costs a wakeup, a missed
+    /// one hangs the program.
+    fn readiness_seq(&self, events: PollEvents) -> Option<u64> {
+        let _ = events;
+        None
+    }
+    /// Park `waker` until this file's producer next publishes an event
+    /// relevant to `events`, ignoring the flags already set; or fire at once
+    /// if [`FileLike::readiness_seq`] has moved past `seen`. See
+    /// [`crate::sync::EventBus::subscribe_edge`]. Offered exactly by the files
+    /// that offer `readiness_seq`.
+    fn subscribe_edge(
+        &self,
+        events: PollEvents,
+        waker: &core::task::Waker,
+        seen: u64,
+    ) -> Option<crate::sync::ReadinessSub> {
+        let _ = (events, waker, seen);
         None
     }
     /// manipulates the underlying device parameters of special files
@@ -3613,35 +3650,33 @@ mod memfd_args_tests {
         assert_eq!(MFD_NAME_MAX_LEN, 249);
     }
 
-    /// The five that exist come through; anything else is a caller asking for
-    /// a feature, and answering "granted" to a feature this kernel does not
-    /// have is the failure mode the check exists to stop.
+    /// The four that this kernel can honour come through; `MFD_HUGETLB` and
+    /// anything else is a caller asking for a feature, and answering
+    /// "granted" to a feature this kernel does not have is the failure mode
+    /// the check exists to stop.
     #[test]
     fn a_bit_memfd_create_does_not_have_is_einval() {
-        let all = MFD_CLOEXEC | MFD_ALLOW_SEALING | MFD_HUGETLB | MFD_NOEXEC_SEAL;
+        let all = MFD_CLOEXEC | MFD_ALLOW_SEALING | MFD_NOEXEC_SEAL;
         assert_eq!(memfd_args("x", 0), Ok(0));
         assert_eq!(memfd_args("x", all), Ok(all));
         assert_eq!(memfd_args("x", MFD_EXEC), Ok(MFD_EXEC));
-        for bad in [0x20usize, 0x40, 0x80, 0x100, 1 << 20, 1 << 25] {
+        for bad in [MFD_HUGETLB, 0x20usize, 0x40, 0x80, 0x100, 1 << 20, 1 << 25] {
             assert_eq!(memfd_args("x", bad), Err(LxError::EINVAL), "{bad:#x}");
         }
     }
 
-    /// The huge-page size sits in the top six bits, and only means anything
-    /// next to `MFD_HUGETLB`.
+    /// `MFD_HUGETLB` (and its size encoding) used to be accepted and then
+    /// ignored — a normal ramfs memfd answered success. No hugepages here.
     #[test]
-    fn the_huge_page_size_encoding_only_rides_along_with_mfd_hugetlb() {
+    fn hugetlb_is_einval_not_a_silent_normal_memfd() {
         let size_2mb = 21usize << 26;
+        assert_eq!(memfd_args("x", MFD_HUGETLB), Err(LxError::EINVAL));
         assert_eq!(
             memfd_args("x", MFD_HUGETLB | size_2mb),
-            Ok(MFD_HUGETLB | size_2mb)
+            Err(LxError::EINVAL)
         );
         assert_eq!(memfd_args("x", size_2mb), Err(LxError::EINVAL));
-        // The whole field, not just the one size.
-        assert_eq!(
-            memfd_args("x", MFD_HUGETLB | (63 << 26)),
-            Ok(MFD_HUGETLB | (63 << 26))
-        );
+        assert_eq!(new_memfd("huge", MFD_HUGETLB).err(), Some(LxError::EINVAL));
     }
 
     /// "executable" and "sealed shut against ever becoming executable" are not

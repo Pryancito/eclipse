@@ -56,6 +56,31 @@ pub struct TcpInner {
     bound: Option<IpEndpoint>,
     /// `SO_REUSEADDR`.
     reuse_addr: bool,
+    /// `SO_BROADCAST`.
+    broadcast: bool,
+    /// `SO_KEEPALIVE`.
+    keepalive: bool,
+    /// `SO_REUSEPORT`.
+    reuse_port: bool,
+    /// `SO_LINGER` (`l_onoff`, `l_linger` seconds).
+    linger_on: bool,
+    linger_sec: i32,
+    /// `SO_RCVTIMEO` / `SO_SNDTIMEO` (`struct timeval`, 16 bytes on x86_64).
+    rcv_timeo: [u8; 16],
+    snd_timeo: [u8; 16],
+    /// `TCP_KEEPIDLE` / `KEEPINTVL` / `KEEPCNT` (Linux sysctl defaults).
+    keepidle: u32,
+    keepintvl: u32,
+    keepcnt: u32,
+    /// `IP_TOS` / `IP_TTL` / multicast knobs (stored for getsockopt symmetry).
+    ip_tos: u32,
+    ip_ttl: u32,
+    mcast_ttl: u32,
+    mcast_loop: bool,
+    mcast_if: u32,
+    /// `TCP_NODELAY` (Nagle disabled). Stored so `getsockopt` can report it;
+    /// smoltcp's nagle query is not a reliable mirror of this flag.
+    nodelay: bool,
     /// `shutdown(SHUT_RD)`: reads drain what is queued and then report EOF.
     read_closed: bool,
 }
@@ -155,15 +180,25 @@ fn connect_error(e: smoltcp::Error) -> LxError {
     }
 }
 
-/// A `setsockopt` integer: four native-endian bytes, or a lone byte.
-fn sockopt_int(data: &[u8]) -> LxResult<u32> {
+/// `do_ip_setsockopt` accepts a full `int` or a single byte.
+fn sockopt_ip_byte_or_int(data: &[u8]) -> LxResult<u32> {
     if data.len() >= 4 {
         Ok(u32::from_ne_bytes([data[0], data[1], data[2], data[3]]))
-    } else if let Some(&b) = data.first() {
-        Ok(b as u32)
+    } else if !data.is_empty() {
+        Ok(u32::from(data[0]))
     } else {
         Err(LxError::EINVAL)
     }
+}
+
+/// A `setsockopt` integer: exactly four native-endian bytes (`sizeof(int)`).
+/// A shorter `optlen` is `EINVAL`, as `sock_setsockopt` / `do_tcp_setsockopt`
+/// require — accepting 1–3 bytes used to apply a lone byte as if it were an int.
+fn sockopt_int(data: &[u8]) -> LxResult<u32> {
+    if data.len() < 4 {
+        return Err(LxError::EINVAL);
+    }
+    Ok(u32::from_ne_bytes([data[0], data[1], data[2], data[3]]))
 }
 
 /// Build a TCP socket with delayed ACK disabled.
@@ -228,6 +263,22 @@ impl TcpSocketState {
                 was_connected: false,
                 bound: None,
                 reuse_addr: false,
+                broadcast: false,
+                keepalive: false,
+                reuse_port: false,
+                linger_on: false,
+                linger_sec: 0,
+                rcv_timeo: [0; 16],
+                snd_timeo: [0; 16],
+                keepidle: 7200,
+                keepintvl: 75,
+                keepcnt: 9,
+                ip_tos: 0,
+                ip_ttl: 64,
+                mcast_ttl: 1,
+                mcast_loop: true,
+                mcast_if: 0,
+                nodelay: false,
                 read_closed: false,
             })),
         })
@@ -690,9 +741,7 @@ impl Socket for TcpSocketState {
 
             (socket.can_recv(), socket.can_send())
         };
-        if (events.contains(PollEvents::IN) && !recv_state)
-            || (events.contains(PollEvents::OUT) && !send_state)
-        {
+        if (events.wants_read() && !recv_state) || (events.wants_write() && !send_state) {
             crate::net::drain_net_tick();
         }
 
@@ -818,6 +867,10 @@ impl Socket for TcpSocketState {
         Ok(0)
     }
 
+    fn is_listening(&self) -> bool {
+        self.inner.lock().is_listening
+    }
+
     fn shutdown(&self, howto: usize) -> SysResult {
         let (shut_rd, shut_wr) = shutdown_sides(howto)?;
         let mut inner = self.inner.lock();
@@ -927,6 +980,22 @@ impl Socket for TcpSocketState {
                         was_connected: true,
                         bound: None,
                         reuse_addr: false,
+                        broadcast: false,
+                        keepalive: false,
+                        reuse_port: false,
+                        linger_on: false,
+                        linger_sec: 0,
+                        rcv_timeo: [0; 16],
+                        snd_timeo: [0; 16],
+                        keepidle: 7200,
+                        keepintvl: 75,
+                        keepcnt: 9,
+                        ip_tos: 0,
+                        ip_ttl: 64,
+                        mcast_ttl: 1,
+                        mcast_loop: true,
+                        mcast_if: 0,
+                        nodelay: false,
                         read_closed: false,
                     })),
                 });
@@ -1007,27 +1076,211 @@ impl Socket for TcpSocketState {
         Some(SocketType::SOCK_STREAM)
     }
 
+    fn so_reuseaddr(&self) -> bool {
+        self.inner.lock().reuse_addr
+    }
+
+    fn so_broadcast(&self) -> bool {
+        self.inner.lock().broadcast
+    }
+
+    fn so_keepalive(&self) -> bool {
+        self.inner.lock().keepalive
+    }
+
+    fn so_reuseport(&self) -> bool {
+        self.inner.lock().reuse_port
+    }
+
+    fn so_linger(&self) -> (bool, i32) {
+        let inner = self.inner.lock();
+        (inner.linger_on, inner.linger_sec)
+    }
+
+    fn so_rcvtimeo(&self) -> [u8; 16] {
+        self.inner.lock().rcv_timeo
+    }
+
+    fn so_sndtimeo(&self) -> [u8; 16] {
+        self.inner.lock().snd_timeo
+    }
+
+    fn tcp_keepidle(&self) -> Option<u32> {
+        Some(self.inner.lock().keepidle)
+    }
+
+    fn tcp_keepintvl(&self) -> Option<u32> {
+        Some(self.inner.lock().keepintvl)
+    }
+
+    fn tcp_keepcnt(&self) -> Option<u32> {
+        Some(self.inner.lock().keepcnt)
+    }
+
+    fn ip_tos(&self) -> u32 {
+        self.inner.lock().ip_tos
+    }
+
+    fn ip_ttl(&self) -> u32 {
+        self.inner.lock().ip_ttl
+    }
+
+    fn ip_multicast_ttl(&self) -> u32 {
+        self.inner.lock().mcast_ttl
+    }
+
+    fn ip_multicast_loop(&self) -> bool {
+        self.inner.lock().mcast_loop
+    }
+
+    fn ip_multicast_if(&self) -> u32 {
+        self.inner.lock().mcast_if
+    }
+
+    fn tcp_nodelay(&self) -> bool {
+        self.inner.lock().nodelay
+    }
+
+    fn is_tcp(&self) -> bool {
+        true
+    }
+
+    fn is_inet(&self) -> bool {
+        true
+    }
+
+    fn so_domain(&self) -> Option<u32> {
+        Some(if self.inner.lock().ipv6 {
+            crate::net::Domain::AF_INET6 as u32
+        } else {
+            crate::net::Domain::AF_INET as u32
+        })
+    }
+
+    fn so_protocol(&self) -> Option<u32> {
+        Some(6) // IPPROTO_TCP
+    }
+
     fn setsockopt(&self, level: usize, opt: usize, data: &[u8]) -> SysResult {
         const SOL_SOCKET: usize = 1;
         const SO_REUSEADDR: usize = 2;
+        const SO_BROADCAST: usize = 6;
+        const SO_KEEPALIVE: usize = 9;
+        const SO_LINGER: usize = 13;
+        const SO_REUSEPORT: usize = 15;
+        const SO_RCVTIMEO: usize = 20;
+        const SO_SNDTIMEO: usize = 21;
+        const IPPROTO_IP: usize = 0;
         const IPPROTO_TCP: usize = 6;
         const TCP_NODELAY: usize = 1;
+        const TCP_KEEPIDLE: usize = 4;
+        const TCP_KEEPINTVL: usize = 5;
+        const TCP_KEEPCNT: usize = 6;
+        const IP_HDRINCL: usize = 3;
+        // SO_TYPE / SO_ERROR / SO_ACCEPTCONN / SO_PROTOCOL / SO_DOMAIN
+        if level == SOL_SOCKET && matches!(opt, 3 | 4 | 30 | 38 | 39) {
+            return Err(LxError::ENOPROTOOPT);
+        }
         if level == SOL_SOCKET && opt == SO_REUSEADDR {
             // Read at bind time (`sk_reuse`); set it before `bind`, as servers do.
             self.inner.lock().reuse_addr = sockopt_int(data)? != 0;
             return Ok(0);
         }
+        if level == SOL_SOCKET && opt == SO_BROADCAST {
+            self.inner.lock().broadcast = sockopt_int(data)? != 0;
+            return Ok(0);
+        }
+        if level == SOL_SOCKET && opt == SO_KEEPALIVE {
+            self.inner.lock().keepalive = sockopt_int(data)? != 0;
+            return Ok(0);
+        }
+        if level == SOL_SOCKET && opt == SO_REUSEPORT {
+            self.inner.lock().reuse_port = sockopt_int(data)? != 0;
+            return Ok(0);
+        }
+        if level == SOL_SOCKET && opt == SO_LINGER {
+            if data.len() < 8 {
+                return Err(LxError::EINVAL);
+            }
+            let on = i32::from_ne_bytes([data[0], data[1], data[2], data[3]]);
+            let sec = i32::from_ne_bytes([data[4], data[5], data[6], data[7]]);
+            let mut inner = self.inner.lock();
+            inner.linger_on = on != 0;
+            inner.linger_sec = sec;
+            return Ok(0);
+        }
+        if level == SOL_SOCKET && (opt == SO_RCVTIMEO || opt == SO_SNDTIMEO) {
+            if data.len() < 16 {
+                return Err(LxError::EINVAL);
+            }
+            let mut tv = [0u8; 16];
+            tv.copy_from_slice(&data[..16]);
+            // `tv_usec` must be in 0..1_000_000 (Linux `sock_set_timeout`).
+            let usec =
+                i64::from_ne_bytes([tv[8], tv[9], tv[10], tv[11], tv[12], tv[13], tv[14], tv[15]]);
+            if !(0..1_000_000).contains(&usec) {
+                return Err(LxError::EINVAL);
+            }
+            let mut inner = self.inner.lock();
+            if opt == SO_RCVTIMEO {
+                inner.rcv_timeo = tv;
+            } else {
+                inner.snd_timeo = tv;
+            }
+            return Ok(0);
+        }
         if level == IPPROTO_TCP && opt == TCP_NODELAY {
             let optval = sockopt_int(data)?;
             // TCP_NODELAY disables Nagle; smoltcp's API is the inverse flag.
-            let handle = self.inner.lock().handle.0;
+            let handle = {
+                let mut inner = self.inner.lock();
+                inner.nodelay = optval != 0;
+                inner.handle.0
+            };
             get_sockets()
                 .lock()
                 .get::<TcpSocket>(handle)
                 .set_nagle_enabled(optval == 0);
             return Ok(0);
         }
-        // Other options: accept harmlessly (same lenient default as Socket).
+        if level == IPPROTO_TCP && matches!(opt, TCP_KEEPIDLE | TCP_KEEPINTVL | TCP_KEEPCNT) {
+            let val = sockopt_int(data)?;
+            let mut inner = self.inner.lock();
+            match opt {
+                TCP_KEEPIDLE => inner.keepidle = val,
+                TCP_KEEPINTVL => inner.keepintvl = val,
+                _ => inner.keepcnt = val,
+            }
+            return Ok(0);
+        }
+        // IP_HDRINCL is SOCK_RAW only; TCP must not swallow it as a no-op.
+        if level == IPPROTO_IP && opt == IP_HDRINCL {
+            return Err(LxError::ENOPROTOOPT);
+        }
+        if level == IPPROTO_IP {
+            const IP_TOS: usize = 1;
+            const IP_TTL: usize = 2;
+            const IP_MULTICAST_IF: usize = 32;
+            const IP_MULTICAST_TTL: usize = 33;
+            const IP_MULTICAST_LOOP: usize = 34;
+            if matches!(
+                opt,
+                IP_TOS | IP_TTL | IP_MULTICAST_IF | IP_MULTICAST_TTL | IP_MULTICAST_LOOP
+            ) {
+                let val = sockopt_ip_byte_or_int(data)?;
+                let mut inner = self.inner.lock();
+                match opt {
+                    IP_TOS => inner.ip_tos = val,
+                    IP_TTL => inner.ip_ttl = val,
+                    IP_MULTICAST_IF => inner.mcast_if = val,
+                    IP_MULTICAST_TTL => inner.mcast_ttl = val,
+                    _ => inner.mcast_loop = val != 0,
+                }
+                return Ok(0);
+            }
+        }
+        // Other options: same len check as the trait default, then no-op.
+        crate::net::check_setsockopt_len(level, opt, data)?;
         Ok(0)
     }
 
@@ -1073,12 +1326,10 @@ impl FileLike for TcpSocketState {
     }
 
     fn set_flags(&self, f: OpenFlags) -> LxResult {
-        let flags = &mut self.inner.lock().flags;
-
-        // See fcntl, only O_APPEND, O_ASYNC, O_DIRECT, O_NOATIME, O_NONBLOCK
-        flags.set(OpenFlags::APPEND, f.contains(OpenFlags::APPEND));
-        flags.set(OpenFlags::NON_BLOCK, f.contains(OpenFlags::NON_BLOCK));
-        flags.set(OpenFlags::CLOEXEC, f.contains(OpenFlags::CLOEXEC));
+        // `take_settable` includes O_ASYNC: the hand-rolled sets named it in
+        // the comment and then dropped it, so FIOASYNC/F_SETFL(O_ASYNC) on a
+        // socket "succeeded" while F_GETFL never showed the bit.
+        self.inner.lock().flags.take_settable(f);
         Ok(())
     }
 
@@ -1097,19 +1348,20 @@ impl FileLike for TcpSocketState {
 
     fn poll(&self, events: PollEvents) -> LxResult<PollStatus> {
         let (read, write, error) = Socket::poll(self, events);
+        // `Socket::poll` sets `error` only when `!is_open()` (closed/RST).
+        // That is also `POLLHUP` on Linux (`TCP_CLOSE`); leaving hangup false
+        // made epoll see only `POLLERR`.
         Ok(PollStatus {
             read,
             write,
             error,
-            hangup: false,
+            hangup: error,
         })
     }
 
     async fn async_poll(&self, events: PollEvents) -> LxResult<PollStatus> {
         let (mut read, mut write, mut error) = Socket::poll(self, events);
-        let ready = (events.contains(PollEvents::IN) && read)
-            || (events.contains(PollEvents::OUT) && write)
-            || error;
+        let ready = (events.wants_read() && read) || (events.wants_write() && write) || error;
         if !ready {
             kernel_hal::net::NetRxOrTimeoutFuture::new(5).await;
             (read, write, error) = Socket::poll(self, events);
@@ -1118,13 +1370,25 @@ impl FileLike for TcpSocketState {
             read,
             write,
             error,
-            hangup: false,
+            hangup: error,
         })
     }
 
     fn ioctl(&self, request: usize, arg1: usize, arg2: usize, arg3: usize) -> LxResult<usize> {
         let ipv6 = self.inner.lock().ipv6;
         handle_net_ioctl(request, arg1, arg2, arg3, ipv6)
+    }
+
+    /// `FIONREAD`/`SIOCINQ`: bytes in the TCP receive queue. Without this the
+    /// ioctl fell through to ENOTTY (same Firefox Wayland proxy trap as
+    /// unix sockets had before they answered). Listening sockets are refused
+    /// with `EINVAL` in the syscall via `is_listening`.
+    fn readable_bytes(&self) -> Option<usize> {
+        let handle = self.inner.lock().handle.0;
+        let sockets = get_sockets();
+        let mut set = sockets.lock();
+        let n = set.get::<TcpSocket>(handle).recv_queue();
+        Some(n)
     }
 
     fn as_socket(&self) -> LxResult<&dyn Socket> {
@@ -1251,6 +1515,90 @@ mod transfer_bench {
     #[test]
     fn large_transfer_fast_reader() {
         run_transfer(16 * 1024 * 1024, 256 * 1024);
+    }
+}
+
+#[cfg(test)]
+mod sockopt_int_tests {
+    use super::sockopt_int;
+    use crate::error::LxError;
+
+    #[test]
+    fn four_bytes_are_the_native_int() {
+        assert_eq!(sockopt_int(&1u32.to_ne_bytes()), Ok(1));
+        assert_eq!(sockopt_int(&0u32.to_ne_bytes()), Ok(0));
+        assert_eq!(sockopt_int(&[0xff, 0xff, 0xff, 0xff]), Ok(u32::MAX));
+    }
+
+    #[test]
+    fn a_short_optlen_is_einval_not_a_lone_byte() {
+        // Used to accept 1–3 bytes and apply `data[0] as u32`.
+        assert_eq!(sockopt_int(&[]), Err(LxError::EINVAL));
+        assert_eq!(sockopt_int(&[1]), Err(LxError::EINVAL));
+        assert_eq!(sockopt_int(&[1, 0]), Err(LxError::EINVAL));
+        assert_eq!(sockopt_int(&[1, 0, 0]), Err(LxError::EINVAL));
+    }
+}
+
+#[cfg(test)]
+mod is_tcp_tests {
+    use super::*;
+    use crate::net::NET_TEST_LOCK as LOCK;
+
+    #[test]
+    fn only_tcp_sockets_report_is_tcp() {
+        let _g = LOCK.lock();
+        let tcp = TcpSocketState::new(false).unwrap();
+        assert!(Socket::is_tcp(&tcp));
+        // Short SO_KEEPALIVE on TCP is EINVAL (not a silent Ok(0)).
+        assert_eq!(Socket::setsockopt(&tcp, 1, 9, &[]), Err(LxError::EINVAL));
+        assert_eq!(Socket::so_domain(&tcp), Some(2)); // AF_INET
+        assert_eq!(Socket::so_protocol(&tcp), Some(6)); // IPPROTO_TCP
+        let tcp6 = TcpSocketState::new(true).unwrap();
+        assert_eq!(Socket::so_domain(&tcp6), Some(10)); // AF_INET6
+
+        // SO_DOMAIN / SO_PROTOCOL are read-only.
+        assert_eq!(
+            Socket::setsockopt(&tcp, 1, 38, &0u32.to_ne_bytes()),
+            Err(LxError::ENOPROTOOPT)
+        );
+        assert_eq!(
+            Socket::setsockopt(&tcp, 1, 39, &0u32.to_ne_bytes()),
+            Err(LxError::ENOPROTOOPT)
+        );
+        // SO_BROADCAST / SO_KEEPALIVE: get mirrors set (not stuck at 0).
+        assert!(!Socket::so_broadcast(&tcp));
+        assert!(!Socket::so_keepalive(&tcp));
+        assert_eq!(Socket::setsockopt(&tcp, 1, 6, &1u32.to_ne_bytes()), Ok(0));
+        assert_eq!(Socket::setsockopt(&tcp, 1, 9, &1u32.to_ne_bytes()), Ok(0));
+        assert!(Socket::so_broadcast(&tcp));
+        assert!(Socket::so_keepalive(&tcp));
+        assert_eq!(Socket::setsockopt(&tcp, 1, 6, &0u32.to_ne_bytes()), Ok(0));
+        assert!(!Socket::so_broadcast(&tcp));
+        // SO_REUSEPORT / SO_LINGER likewise mirror set.
+        assert!(!Socket::so_reuseport(&tcp));
+        assert_eq!(Socket::setsockopt(&tcp, 1, 15, &1u32.to_ne_bytes()), Ok(0));
+        assert!(Socket::so_reuseport(&tcp));
+        let mut linger = [0u8; 8];
+        linger[0..4].copy_from_slice(&1i32.to_ne_bytes());
+        linger[4..8].copy_from_slice(&30i32.to_ne_bytes());
+        assert_eq!(Socket::setsockopt(&tcp, 1, 13, &linger), Ok(0));
+        assert_eq!(Socket::so_linger(&tcp), (true, 30));
+        // TIMEO + TCP_KEEP* also mirror set.
+        let mut tv = [0u8; 16];
+        tv[0..8].copy_from_slice(&2i64.to_ne_bytes());
+        assert_eq!(Socket::setsockopt(&tcp, 1, 20, &tv), Ok(0));
+        assert_eq!(Socket::so_rcvtimeo(&tcp), tv);
+        assert_eq!(Socket::tcp_keepidle(&tcp), Some(7200));
+        assert_eq!(Socket::setsockopt(&tcp, 6, 4, &60u32.to_ne_bytes()), Ok(0));
+        assert_eq!(Socket::tcp_keepidle(&tcp), Some(60));
+        // IP_TTL / IP_MULTICAST_LOOP: get mirrors set (LOOP is opt 34, not 35).
+        assert_eq!(Socket::ip_ttl(&tcp), 64);
+        assert_eq!(Socket::setsockopt(&tcp, 0, 2, &[42]), Ok(0));
+        assert_eq!(Socket::ip_ttl(&tcp), 42);
+        assert!(Socket::ip_multicast_loop(&tcp));
+        assert_eq!(Socket::setsockopt(&tcp, 0, 34, &[0]), Ok(0));
+        assert!(!Socket::ip_multicast_loop(&tcp));
     }
 }
 
@@ -1743,5 +2091,67 @@ mod port_tests {
         assert_eq!(Socket::listen(&server), Ok(0));
         assert_eq!(Socket::shutdown(&server, 2), Ok(0));
         assert!(crate::net::LISTEN_TABLE.can_listen(any(41070)));
+    }
+}
+
+#[cfg(test)]
+mod fionread_tests {
+    use super::*;
+    use crate::net::NET_TEST_LOCK as LOCK;
+
+    /// Idle TCP must answer `FIONREAD` with 0, not fall through to ENOTTY
+    /// via a missing `readable_bytes`.
+    #[test]
+    fn an_idle_tcp_socket_reports_zero_bytes_readable() {
+        let _g = LOCK.lock();
+        let s = TcpSocketState::new(false).unwrap();
+        assert_eq!(FileLike::readable_bytes(&s), Some(0));
+    }
+
+    /// `getsockopt(SO_REUSEADDR)` must mirror what `setsockopt` stored,
+    /// not a hardcoded 1.
+    #[test]
+    fn so_reuseaddr_defaults_off_and_follows_setsockopt() {
+        let _g = LOCK.lock();
+        let s = TcpSocketState::new(false).unwrap();
+        assert!(!Socket::so_reuseaddr(&s));
+        Socket::setsockopt(&s, 1, 2, &1i32.to_ne_bytes()).unwrap();
+        assert!(Socket::so_reuseaddr(&s));
+        Socket::setsockopt(&s, 1, 2, &0i32.to_ne_bytes()).unwrap();
+        assert!(!Socket::so_reuseaddr(&s));
+    }
+
+    /// `getsockopt(TCP_NODELAY)` used to be `ENOPROTOOPT` even after a
+    /// successful `setsockopt`.
+    #[test]
+    fn tcp_nodelay_defaults_off_and_follows_setsockopt() {
+        let _g = LOCK.lock();
+        let s = TcpSocketState::new(false).unwrap();
+        assert!(!Socket::tcp_nodelay(&s));
+        Socket::setsockopt(&s, 6, 1, &1i32.to_ne_bytes()).unwrap();
+        assert!(Socket::tcp_nodelay(&s));
+        Socket::setsockopt(&s, 6, 1, &0i32.to_ne_bytes()).unwrap();
+        assert!(!Socket::tcp_nodelay(&s));
+    }
+
+    /// A never-connected TCP socket is closed (`!is_open`); poll must report
+    /// hangup, not only `error` with `hangup: false`.
+    #[test]
+    fn a_closed_tcp_socket_reports_hangup() {
+        let _g = LOCK.lock();
+        let s = TcpSocketState::new(false).unwrap();
+        let status = FileLike::poll(&s, PollEvents::IN).unwrap();
+        assert!(status.error && status.hangup);
+    }
+
+    /// `SCM_RIGHTS` on a non-unix socket is `EOPNOTSUPP`, not `ENOSYS`.
+    #[test]
+    fn send_fds_on_tcp_is_eopnotsupp_not_enosys() {
+        let _g = LOCK.lock();
+        let s = TcpSocketState::new(false).unwrap();
+        assert_eq!(
+            Socket::send_fds(&s, alloc::vec::Vec::new()),
+            Err(LxError::EOPNOTSUPP)
+        );
     }
 }

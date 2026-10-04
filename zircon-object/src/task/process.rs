@@ -95,6 +95,17 @@ pub struct Process {
     dead_threads_time: AtomicU64,
     /// Kernel-mode counterpart of `dead_threads_time` (see `Thread::sys_time_ns`).
     dead_threads_sys_time: AtomicU64,
+    /// The process's futex objects, keyed by the address of their word.
+    ///
+    /// Outside `inner` ON PURPOSE, for the same reason as `LinuxProcess`'s
+    /// `itimers`: every futex wait and every futex wake looks a futex up here,
+    /// and `inner` is the process's big lock -- the handle table and the thread
+    /// list, which the whole of `zx_object_*`, thread creation and thread exit
+    /// go through. These locks are IRQ-off spin locks, so a thread blocking on
+    /// a contended `pthread_mutex` used to burn another CPU's cycles waiting
+    /// for an unrelated handle operation to finish, and vice versa. Nothing
+    /// correlates the two tables, so nothing wanted them under one lock.
+    futexes: Mutex<FutexTable>,
     inner: Mutex<ProcessInner>,
 }
 
@@ -201,7 +212,6 @@ struct ProcessInner {
     status: Status,
     max_handle_id: u32,
     handles: HashMap<HandleValue, (Handle, Vec<Sender<()>>)>,
-    futexes: FutexTable,
     threads: Vec<Arc<Thread>>,
 
     // special info
@@ -267,6 +277,7 @@ impl Process {
             debug_exceptionate: Exceptionate::new(ExceptionChannelType::Debugger),
             dead_threads_time: AtomicU64::new(0),
             dead_threads_sys_time: AtomicU64::new(0),
+            futexes: Mutex::new(FutexTable::default()),
             inner: Mutex::new(ProcessInner::default()),
         });
         proc.record_ext_birth();
@@ -298,6 +309,7 @@ impl Process {
             debug_exceptionate: Exceptionate::new(ExceptionChannelType::Debugger),
             dead_threads_time: AtomicU64::new(0),
             dead_threads_sys_time: AtomicU64::new(0),
+            futexes: Mutex::new(FutexTable::default()),
             inner: Mutex::new(ProcessInner::default()),
         });
         proc.record_ext_birth();
@@ -326,6 +338,7 @@ impl Process {
             debug_exceptionate: Exceptionate::new(ExceptionChannelType::Debugger),
             dead_threads_time: AtomicU64::new(0),
             dead_threads_sys_time: AtomicU64::new(0),
+            futexes: Mutex::new(FutexTable::default()),
             inner: Mutex::new(ProcessInner::default()),
         });
         proc.record_ext_birth();
@@ -485,18 +498,18 @@ impl Process {
                 0
             }
         };
-        // Take the table out and let it go with `inner` released, for the same
-        // reason as the handle table in `exit`: dropping the last `Arc<Futex>`
-        // drops its waiter queue and its owner, and that runs code this module
-        // does not own -- a `Waker`'s vtable, the oneshot send in
+        // Take the table out and let it go with ITS OWN lock released, for the
+        // same reason as the handle table in `exit`: dropping the last
+        // `Arc<Futex>` drops its waiter queue and its owner, and that runs code
+        // this module does not own -- a `Waker`'s vtable, the oneshot send in
         // `ExceptionObject::drop`, and a `Thread` whose `proc` field is a
         // strong `Arc` back to this very process. `clear()` ran all of it under
-        // this lock. No test pins this one: the chain has no acquire of
-        // `self.inner` in it today, so the shape is a hazard rather than a
+        // the lock. No test pins this one: the chain has no acquire of the
+        // futex lock in it today, so the shape is a hazard rather than a
         // reproducible wedge, and a test that only checked the table came out
         // empty would pass with the bug in place.
-        let futexes = core::mem::take(&mut inner.futexes);
         drop(inner);
+        let futexes = core::mem::take(&mut *self.futexes.lock());
         drop(futexes);
 
         // Keep the exited process object around for wait/status, but release
@@ -749,12 +762,27 @@ impl Process {
         self.inner.lock().get_handle(handle_value)
     }
 
+    /// How many handles in this process refer to the object with `koid`.
+    ///
+    /// Used by `ZX_INFO_HANDLE_COUNT`. The Zircon figure is global; without a
+    /// cross-process registry this answers for the caller's table — still the
+    /// number of *handles*, not `Arc::strong_count` (which also counted every
+    /// kernel-held `Arc`).
+    pub fn count_handles_to(&self, koid: KoID) -> u32 {
+        let inner = self.inner.lock();
+        inner
+            .handles
+            .values()
+            .filter(|(h, _)| h.object.id() == koid)
+            .count() as u32
+    }
+
     /// Get a futex from the process
     pub fn get_futex(&self, addr: &'static AtomicI32) -> Arc<Futex> {
         // The table's sweep hands its victims out rather than dropping them, so
-        // they go with `inner` released: see `FutexTable::get_or_create`.
+        // they go with the futex lock released: see `FutexTable::get_or_create`.
         let mut swept = Vec::new();
-        let futex = self.inner.lock().futexes.get_or_create(
+        let futex = self.futexes.lock().get_or_create(
             addr as *const AtomicI32 as usize,
             || Futex::new(addr),
             &mut swept,
@@ -960,6 +988,15 @@ impl Process {
     /// Get KoIDs of Threads.
     pub fn thread_ids(&self) -> Vec<KoID> {
         self.inner.lock().threads.iter().map(|t| t.id()).collect()
+    }
+
+    /// Sum of per-thread `ZX_INFO_TASK_RUNTIME` for this process.
+    pub fn get_runtime_info(&self) -> crate::task::TaskRuntimeInfo {
+        let mut total = crate::task::TaskRuntimeInfo::default();
+        for thread in self.inner.lock().threads.iter() {
+            total = total.saturating_add(thread.get_runtime_info());
+        }
+        total
     }
 
     /// Wait for process exit and get return code.

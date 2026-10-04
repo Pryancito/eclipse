@@ -27,13 +27,6 @@
 //!   * `ECLIPSE_XORG=0|off|no|false` — skip entirely (lean/minimal images).
 //!   * `ECLIPSE_XORG_PACKAGES="pkg1 pkg2 …"` — replace the default package set
 //!     (e.g. to match a non-Alpine repository whose names differ).
-//!   * `ECLIPSE_KDE=0|off|no|false` — leave out Qt 6 / KF6 / the KDE
-//!     applications (~1.2 GiB of the image).
-//!   * `ECLIPSE_PLASMA=0|off|no|false` — leave out Plasma's own shell: the
-//!     whole of [`PLASMA_PACKAGES`], which is `plasma-workspace`
-//!     (plasmashell), `plasma-desktop` (the Plasma/Shell package plasmashell
-//!     loads — it is not optional) and `systemsettings`, ~1 GiB more. On by
-//!     default, because `look=plasma` runs `plasmashell` as the panel.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -390,100 +383,6 @@ const DEFAULT_PACKAGES: &[&str] = &[
     "pciutils-libs",
 ];
 
-/// KDE: Qt 6, KDE Frameworks 6 and the KDE applications. Alpine 3.24
-/// community carries Plasma 6.6 and KF6 6.26, so these are all top-level
-/// names apk resolves the closure for (qt6-qtbase, the ~40 kf6-* libraries
-/// and their icons arrive as dependencies). Installed unless `ECLIPSE_KDE`
-/// is off: it is roughly 1.2 GiB installed, by far the largest single
-/// addition to the image, and a lean build has a switch for that reason.
-///
-/// What makes these RUN on Eclipse, rather than merely install:
-///   - a session bus with **activation**. KDE opens a kiod/kwalletd/kded
-///     module by asking the bus to start it, so `dbus-daemon` (already in
-///     DEFAULT_PACKAGES) is the one that must serve the bus; Eclipse's own
-///     `eclipse-dbusd` answers ServiceUnknown to `StartServiceByName` by
-///     design, which is a bus KDE apps connect to and then stall on.
-///   - Wayland: `qt6-qtwayland` is the QPA plugin; without it every Qt app
-///     falls back to xcb/Xwayland and looks and scales differently.
-///   - `plasma-integration` is the `kde` Qt platform theme (file dialogs,
-///     colours, icons). The labwc wrapper exports QT_QPA_PLATFORMTHEME only
-///     when this plugin is really on disk.
-///
-/// What is still missing and cannot be installed away: there is no system
-/// bus, so polkit (root actions in systemsettings), accountsservice (the
-/// user name and avatar) and logind (seat/power management) have nothing to
-/// talk to. Those pieces degrade to "unavailable", they do not crash.
-const KDE_PACKAGES: &[&str] = &[
-    // Qt's Wayland platform plugin + the KDE platform theme.
-    "qt6-qtwayland",
-    "plasma-integration",
-    // The session daemon Moebius asked for by name: `kded6`, the host
-    // process every KDE background module (device notifications, kscreen,
-    // ...) is loaded into. Started by /etc/eclipse/services/kded.service.
-    "kded",
-    // Look: the widget style, the colour schemes the kdeglobals below is
-    // seeded from, and the icon set every KDE app looks up by name.
-    "breeze",
-    "breeze-icons",
-    // The KIO worker set: thumbnails, `fish://`, archives-as-folders. Dolphin
-    // without it is a file manager that cannot preview or browse anything
-    // that is not a plain directory.
-    "kio-extras",
-    "kdegraphics-thumbnailers",
-    // Passwords for anything that stores one (kio, Falkon). Activated on
-    // demand over the bus, which is the activation requirement above.
-    "kwallet",
-    // The command-line side of a KDE session: `kcmshell6` (open one settings
-    // module without systemsettings), `kioclient`, `kstart`.
-    "kde-cli-tools",
-    // The portal backend, so a GTK or Flatpak-style file chooser in this
-    // session is the KDE one. xdg-desktop-portal itself comes as its
-    // dependency.
-    "xdg-desktop-portal-kde",
-    // The applications themselves.
-    "dolphin",
-    "konsole",
-    "kate",
-    "ark",
-    "okular",
-    "gwenview",
-    "kcalc",
-    "spectacle",
-];
-
-/// Plasma's own shell: the panel and desktop (`plasmashell`), the shell
-/// package that gives it a layout, and System Settings. ON by default
-/// (`ECLIPSE_PLASMA=0` drops it) because `look=plasma` execs `plasmashell`
-/// in place of `lunarbar` — without this set that look has nothing to run.
-///
-/// Both names are load-bearing and neither is a subset of the other:
-/// `plasma-workspace` is the binary, and `plasma-desktop` is where the
-/// `org.kde.plasma.desktop` Plasma/Shell package lives (its `metadata.json`
-/// carries `"KPackageStructure": "Plasma/Shell"`), so `plasmashell` without
-/// it has no shell to load.
-///
-/// What it costs, stated plainly rather than discovered at boot:
-///   - another ~1 GiB, and `plasma-workspace`'s runtime `depends` pull in
-///     kwin, accountsservice, fprintd, kactivitymanagerd and a
-///     pipewire-session-manager. accountsservice, fprintd and logind want the
-///     **system** bus, which Eclipse does not have, so the user name, the
-///     avatar and the fingerprint page stay empty; kwin is installed and
-///     never run, since labwc is the compositor.
-///   - the panel's Task Manager speaks `org_kde_plasma_window_management` and
-///     NOTHING ELSE — verified against the tag Alpine builds,
-///     `libtaskmanager/waylandtasksmodel.cpp` of plasma-workspace v6.6.5,
-///     whose only protocol include is `qwayland-plasma-window-management.h`.
-///     labwc adds wlr-layer-shell and wlr-output-power-management to what
-///     wlroots ships (labwc/protocols/meson.build) and neither carries the
-///     KDE protocol, so the window list is **permanently empty** under
-///     labwc. The launcher, the clock, the system tray and the desktop do
-///     work: those are layer-shell + D-Bus.
-///
-/// So this is the Plasma panel on labwc, minus the task list. A full Plasma
-/// session (task list included) needs `kwin_wayland` as the compositor, which
-/// is a different decision and not this one.
-const PLASMA_PACKAGES: &[&str] = &["plasma-workspace", "plasma-desktop", "systemsettings"];
-
 /// Whether the build is running as root (euid 0), via `id -u` — no extra crate
 /// dependency. If `id` can't be run we assume NON-root: that is the common
 /// developer-build case, and it makes apk take the `--usermode` path (which a
@@ -508,33 +407,6 @@ fn knob_off(value: &str) -> bool {
         value.trim().to_ascii_lowercase().as_str(),
         "0" | "off" | "no" | "false" | ""
     )
-}
-
-/// Whether the KDE set is installed. On unless `ECLIPSE_KDE` says otherwise,
-/// the same spellings `enabled()` accepts. `pub(crate)` because the session
-/// config has to agree with it: `desktop.rs` writes `XDG_CURRENT_DESKTOP`
-/// from this answer, and a session that calls itself KDE with no KDE
-/// installed sends every portal and `.desktop` lookup down the wrong path.
-pub(crate) fn kde_enabled() -> bool {
-    match std::env::var("ECLIPSE_KDE") {
-        Ok(v) => !knob_off(&v),
-        Err(_) => true,
-    }
-}
-
-/// Whether Plasma's shell is installed. On unless `ECLIPSE_PLASMA` says
-/// otherwise, and gated on [`kde_enabled`] as well: plasmashell against a
-/// rootfs with no Qt 6, no KF6 and no Breeze would start and find nothing, so
-/// `ECLIPSE_KDE=0` takes the shell out with the rest rather than leaving a
-/// `look=plasma` that cannot work.
-fn plasma_enabled() -> bool {
-    if !kde_enabled() {
-        return false;
-    }
-    match std::env::var("ECLIPSE_PLASMA") {
-        Ok(v) => !knob_off(&v),
-        Err(_) => true,
-    }
 }
 
 /// Returns `true` unless `ECLIPSE_XORG` is explicitly set to a falsey value.
@@ -795,26 +667,10 @@ pub(super) fn install(rootfs: &Path, apk_bin: &Path, arch: &str) {
     let _ = std::fs::create_dir_all(&cache);
 
     let packages: Vec<String> = match std::env::var("ECLIPSE_XORG_PACKAGES") {
-        // An explicit list REPLACES the defaults, KDE included: the knob is
-        // documented for a repository whose names differ, where appending
-        // Alpine's names would just fail to resolve.
         Ok(list) if !list.trim().is_empty() => {
             list.split_whitespace().map(str::to_string).collect()
         }
-        _ => {
-            let kde: &[&str] = if kde_enabled() { KDE_PACKAGES } else { &[] };
-            let plasma: &[&str] = if plasma_enabled() {
-                PLASMA_PACKAGES
-            } else {
-                &[]
-            };
-            DEFAULT_PACKAGES
-                .iter()
-                .chain(kde)
-                .chain(plasma)
-                .map(|s| s.to_string())
-                .collect()
-        }
+        _ => DEFAULT_PACKAGES.iter().map(|s| s.to_string()).collect(),
     };
 
     println!(
@@ -2301,55 +2157,6 @@ mod tests {
     /// `[GFX1-]: glxtest: libpci missing` when the library is not there. The
     /// library comes in its own Alpine package, separate from `pciutils`
     /// (the `lspci` tool, which nothing in the image needs).
-    /// The three package sets are separate on purpose, and their contents
-    /// are what the session config assumes: `desktop.rs` waits for `kded6`,
-    /// exports the `kde` platform theme behind plasma-integration's plugin
-    /// and seeds kdeglobals from breeze's colour schemes. A name dropped
-    /// from KDE_PACKAGES turns each of those into a silent no-op.
-    #[test]
-    fn the_kde_set_carries_what_the_session_config_expects() {
-        for pkg in [
-            "kded",               // kded.service execs kded6
-            "plasma-integration", // the `kde` Qt platform theme
-            "qt6-qtwayland",      // or every Qt app lands on Xwayland
-            "breeze",             // BreezeDark.colors, seeded into kdeglobals
-            "breeze-icons",       // kdeglobals asks for the breeze-dark icons
-        ] {
-            assert!(KDE_PACKAGES.contains(&pkg), "KDE_PACKAGES must carry {pkg}");
-        }
-        // `look=plasma` execs plasmashell, and plasmashell needs a Plasma/Shell
-        // package to load, which is the second name here. A set that lost
-        // either one would leave that look falling back to lunarbar for a
-        // reason nobody could see from the look file.
-        for pkg in ["plasma-workspace", "plasma-desktop"] {
-            assert!(
-                PLASMA_PACKAGES.contains(&pkg),
-                "PLASMA_PACKAGES must carry {pkg} for look=plasma"
-            );
-        }
-        // Plasma's shell stays its OWN list even though both are on by
-        // default, because `ECLIPSE_PLASMA=0` has to be able to drop ~1 GiB
-        // (kwin, accountsservice, fprintd) and keep the KDE applications.
-        for pkg in PLASMA_PACKAGES {
-            assert!(
-                !DEFAULT_PACKAGES.contains(pkg) && !KDE_PACKAGES.contains(pkg),
-                "{pkg} would ship from another list, so ECLIPSE_PLASMA=0 could not drop it"
-            );
-        }
-        // One name, one list: a package in two sets is installed twice on
-        // the apk command line, and the second copy is the one nobody
-        // maintains.
-        let mut all: Vec<&&str> = DEFAULT_PACKAGES
-            .iter()
-            .chain(KDE_PACKAGES.iter())
-            .chain(PLASMA_PACKAGES.iter())
-            .collect();
-        let before = all.len();
-        all.sort_unstable();
-        all.dedup();
-        assert_eq!(before, all.len(), "a package name appears in two sets");
-    }
-
     #[test]
     fn firefox_gpu_probe_finds_libpci() {
         assert!(

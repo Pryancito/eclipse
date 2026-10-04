@@ -42,6 +42,19 @@ fn alloc_error(layout: Layout) -> ! {
             reentrancy,
         ));
     }
+    // Blocks the allocator refused because they were not its own. Each one is
+    // leaked on purpose (see `heap_regions`), so a non-zero count both
+    // explains bytes missing from this heap and says that something in the
+    // kernel is freeing memory it does not own -- which is a far more serious
+    // finding than the OOM it may have caused.
+    let wild = crate::memory::heap_wild_blocks();
+    if wild > 0 {
+        emit(format_args!(
+            "heap has refused and LEAKED {} wild block(s) -- something freed memory the \
+             heap never handed out; see [heap-wild] above for the call chain\n",
+            wild,
+        ));
+    }
     // Attribution: live allocations per size class, so the OOM report says
     // WHICH class holds the heap (each line: class upper bound, live count,
     // total bytes if every allocation were at the bound).
@@ -129,7 +142,7 @@ const VERDICT_RESERVE: usize = 256;
 ///   the end. There is no scrolling back on a photograph of a wedged machine.
 /// * `dropped` counts what was lost, so [`truncated`] can say so out loud
 ///   instead of leaving a reader to wonder whether the banner ended or was cut.
-struct StackBuf {
+pub(crate) struct StackBuf {
     buf: [u8; BANNER_BYTES],
     len: usize,
     /// Bytes at the end of `buf` that `write_str` will not fill.
@@ -140,7 +153,7 @@ struct StackBuf {
 
 impl StackBuf {
     /// A buffer whose whole length is writable.
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             buf: [0u8; BANNER_BYTES],
             len: 0,
@@ -171,7 +184,7 @@ impl StackBuf {
     /// The banner as a string. Truncation can split a multi-byte character, so
     /// what is returned is the valid prefix -- this used to be spelled out at
     /// each call site.
-    fn valid_str(&self) -> &str {
+    pub(crate) fn valid_str(&self) -> &str {
         match core::str::from_utf8(&self.buf[..self.len]) {
             Ok(s) => s,
             Err(e) => core::str::from_utf8(&self.buf[..e.valid_up_to()]).unwrap_or(""),
@@ -735,6 +748,28 @@ fn panic(info: &PanicInfo) -> ! {
             }
             rbp = next;
         }
+    }
+
+    // The last word on the screen. The early framebuffer console does not
+    // scroll: it clears and restarts at the top when it fills, so on a 25-line
+    // display the backtrace just printed above can have wiped the panic
+    // message -- vector, symbolized RIP, error code and all -- off the glass.
+    // A photo of the screen is the only artifact that comes back from a real
+    // machine, so the one line that has to survive is printed last, after
+    // everything that could overwrite it. Armed by the x86 trap handler
+    // immediately before it panics, and taken rather than peeked so an
+    // ordinary panic is never decorated with an exception it did not take.
+    #[cfg(target_arch = "x86_64")]
+    if let Some((vec, error_code, rip)) = kernel_hal::kstats::take_exception() {
+        let summary = format_args!(
+            "[exception] {} (vec={:#x}) at rip={}\n[exception] {}\n",
+            kernel_hal::context::x86_vector_name(vec),
+            vec,
+            kernel_hal::ksyms::Addr(rip),
+            kernel_hal::context::X86TrapErrorCode { vec, error_code },
+        );
+        kernel_hal::console::serial_write_fmt_spin(summary);
+        kernel_hal::console::graphic_console_write_fmt_spin(summary);
     }
 
     // How many kernel faults this boot has already survived. A panic arriving

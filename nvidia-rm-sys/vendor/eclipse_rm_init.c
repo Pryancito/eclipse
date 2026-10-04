@@ -1809,6 +1809,15 @@ NV_STATUS eclipse_rm_step17(NvU32 gpuInstance, EclipseGrChannel *pOut)
         threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
         return (pGpu == NULL) ? NV_ERR_INVALID_ARGUMENT : NV_ERR_INVALID_STATE;
     }
+    /* API lock ONLY -- do NOT add rmGpuLocksAcquire here. The RM's channel
+     * and TSG constructors take the GPU lock themselves
+     * (kernel_channel.c:497, kernel_channel_group_api.c), so holding it
+     * already fails them with NV_ERR_STATE_IN_USE: commit f8a5d56 did that,
+     * the GPFIFO channel came back 0x63, CHANNEL_ALLOC returned ENODEV and
+     * NVK saw no GPU ("ZINK: failed to choose pdev"). The "RPC locking
+     * violation" assert that commit chased is the RM noticing a control
+     * without the GPU lock and upgrading to it itself -- noisy but safe.
+     * Same lock state as eclipse_rm_step16. */
     status = rmapiLockAcquire(API_LOCK_FLAGS_NONE, RM_LOCK_MODULES_INIT);
     if (status != NV_OK)
     {
@@ -2163,6 +2172,7 @@ NV_STATUS eclipse_rm_ctx_alloc(NvU32 gpuInstance, NvU32 ctxIdx, EclipseCtxAlloc 
         threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
         return (pGpu == NULL) ? NV_ERR_INVALID_ARGUMENT : NV_ERR_INVALID_STATE;
     }
+    /* API lock ONLY; see eclipse_rm_step17 for why not the GPU lock. */
     status = rmapiLockAcquire(API_LOCK_FLAGS_NONE, RM_LOCK_MODULES_INIT);
     if (status != NV_OK)
     {
@@ -2482,6 +2492,7 @@ NV_STATUS eclipse_rm_ctx_free(NvU32 gpuInstance, NvU32 ctxIdx)
         threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
         return (pGpu == NULL) ? NV_ERR_INVALID_ARGUMENT : NV_ERR_INVALID_STATE;
     }
+    /* API lock ONLY; see eclipse_rm_step17 for why not the GPU lock. */
     status = rmapiLockAcquire(API_LOCK_FLAGS_NONE, RM_LOCK_MODULES_INIT);
     if (status != NV_OK)
     {
@@ -2593,6 +2604,7 @@ NV_STATUS eclipse_rm_ctx0_reset(NvU32 gpuInstance)
         threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
         return (pGpu == NULL) ? NV_ERR_INVALID_ARGUMENT : NV_ERR_INVALID_STATE;
     }
+    /* API lock ONLY; see eclipse_rm_step17 for why not the GPU lock. */
     status = rmapiLockAcquire(API_LOCK_FLAGS_NONE, RM_LOCK_MODULES_INIT);
     if (status != NV_OK)
     {

@@ -23,8 +23,8 @@ use linux_object::time::TimeSpec;
 use linux_object::{fs::INodeExt, loader::LinuxElfLoader};
 use zircon_object::object::{KernelObject, KoID, Signal};
 use zircon_object::task::{
-    Status, Thread, MAX_NICE, MAX_RT_PRIO, MIN_NICE, MIN_RT_PRIO, SCHED_BATCH, SCHED_DEADLINE,
-    SCHED_FIFO, SCHED_IDLE, SCHED_NORMAL, SCHED_RR,
+    Thread, MAX_NICE, MAX_RT_PRIO, MIN_NICE, MIN_RT_PRIO, SCHED_BATCH, SCHED_DEADLINE, SCHED_FIFO,
+    SCHED_IDLE, SCHED_NORMAL, SCHED_RR,
 };
 use zircon_object::vm::USER_STACK_PAGES;
 
@@ -35,6 +35,17 @@ const P_PGID: i32 = 2;
 // pidfd — as glib's g_child_watch_source_new() uses — matched no arm and
 // returned EINVAL).
 const P_PIDFD: i32 = 3;
+
+/// Empty `waitid(P_PIDFD)` after the pidfd's `O_NONBLOCK` forced a non-blocking
+/// wait: explicit `WNOHANG` stays success-with-no-child; otherwise `EAGAIN`
+/// (`kernel_waitid`).
+fn pidfd_waitid_empty(caller_nohang: bool) -> Result<(), LxError> {
+    if caller_nohang {
+        Ok(())
+    } else {
+        Err(LxError::EAGAIN)
+    }
+}
 
 /// `SCHED_RESET_ON_FORK`: OR-ed into the policy by `sched_setscheduler` /
 /// `sched_setattr`. Accepted but not modelled (we never fork-reset).
@@ -540,7 +551,7 @@ impl Syscall<'_> {
         newtls: usize,
         child_tid: UserOutPtr<i32>,
     ) -> SysResult {
-        let clone_flags = CloneFlags::from_bits_truncate(flags);
+        let clone_flags = clone_flags_from_word(flags)?;
         info!(
             "clone: flags={:#x}, newsp={:#x}, parent_tid={:?}, child_tid={:?}, newtls={:#x}",
             flags, newsp, parent_tid, child_tid, newtls
@@ -959,15 +970,18 @@ impl Syscall<'_> {
                 if !is_child_process(caller, target) {
                     return Err(LxError::ECHILD);
                 }
-                if FileLike::flags(pidfd.as_ref()).non_block()
-                    && !matches!(target.status(), Status::Exited(_))
-                    && !nohang
-                {
-                    return Err(LxError::EAGAIN);
-                }
-                match wait_child_interest(caller, target.id(), nohang, reap, interest).await {
+                // `kernel_waitid`: `O_NONBLOCK` on the pidfd forces `WNOHANG`
+                // for the wait; an empty result becomes `EAGAIN` only when the
+                // caller did not already ask for `WNOHANG`. An early return of
+                // `EAGAIN` whenever the child was still running skipped
+                // `WSTOPPED`/`WCONTINUED` that were already waitable.
+                let wait_nohang = nohang || FileLike::flags(pidfd.as_ref()).non_block();
+                match wait_child_interest(caller, target.id(), wait_nohang, reap, interest).await {
                     Ok((code, cpu)) => Ok(Some((target.id(), code, cpu))),
-                    Err(LxError::EAGAIN) if nohang => Ok(None),
+                    Err(LxError::EAGAIN) => {
+                        pidfd_waitid_empty(nohang)?;
+                        Ok(None)
+                    }
                     Err(e) => Err(e),
                 }
             }
@@ -1063,10 +1077,11 @@ impl Syscall<'_> {
         // expanding to thousands of paths -- fails with E2BIG instead of
         // overrunning the initial stack image the loader builds. Without this
         // the stack builder's `assert!` tripped and PANICKED THE KERNEL from an
-        // ordinary userspace command. Matches Linux's "1/4 of the stack" rule:
-        // the user stack is USER_STACK_PAGES (128) * 4 KiB = 512 KiB, so cap the
-        // arg/env bytes (plus one 8-byte table pointer per entry) at 128 KiB.
-        const ARG_MAX: usize = 128 * 1024;
+        // ordinary userspace command. Linux's rule is a quarter of the
+        // stack (`_STK_LIM / 4`), so derive it from the stack the loader maps
+        // rather than restating a number: the cap covers the arg/env bytes
+        // plus one 8-byte table pointer per entry.
+        const ARG_MAX: usize = USER_STACK_PAGES * PAGE_SIZE / 4;
         let arg_bytes: usize = args.iter().map(|s| s.len() + 1 + 8).sum::<usize>()
             + envs.iter().map(|s| s.len() + 1 + 8).sum::<usize>();
         if arg_bytes > ARG_MAX {
@@ -2446,6 +2461,16 @@ bitflags! {
     }
 }
 
+/// Decode a legacy `clone`/`clone3` flag word, or `EINVAL` for any bit this
+/// kernel does not name (e.g. `CLONE_CLEAR_SIGHAND`). Truncating used to
+/// answer success while leaving the requested work undone.
+fn clone_flags_from_word(flags: usize) -> Result<CloneFlags, LxError> {
+    if flags & !CloneFlags::all().bits() != 0 {
+        return Err(LxError::EINVAL);
+    }
+    Ok(CloneFlags::from_bits_truncate(flags))
+}
+
 /// `prctl(PR_SET_PDEATHSIG)` took its argument as a byte, so any number whose
 /// low byte happened to name a signal was latched as that signal.
 /// Size of `struct clone_args` version 0 (Linux `CLONE_ARGS_SIZE_VER0`).
@@ -2674,6 +2699,15 @@ pub(crate) fn clone3_to_clone(words: [u64; 8]) -> LxResult<Clone3Args> {
     } else {
         0
     };
+    // Unknown flag bits (CLONE_CLEAR_SIGHAND = 1<<32, CLONE_INTO_CGROUP, …)
+    // must be EINVAL so callers like glibc/`posix_spawn` fall back and do
+    // the work in userspace. `from_bits_truncate` used to drop them and
+    // answer success — a silent lie that left signal handlers uncleared.
+    // Checked on the `u64` before the `usize` cast so a high bit cannot
+    // vanish on a narrow pointer width.
+    if flags & !(CloneFlags::all().bits() as u64) != 0 {
+        return Err(LxError::EINVAL);
+    }
     let clone_flags = CloneFlags::from_bits_truncate(flags as usize);
     // Legacy clone reports the pidfd through the parent_tid slot; clone3
     // gives it a dedicated field. PARENT_SETTID and PIDFD together can't
@@ -3017,6 +3051,52 @@ mod clone3_tests {
         );
     }
 
+    /// `CLONE_CLEAR_SIGHAND` (1<<32) and friends are not in `CloneFlags`.
+    /// Truncating them used to answer success while leaving handlers alone;
+    /// glibc/`posix_spawn` need `EINVAL` so they can fall back.
+    #[test]
+    fn an_unknown_clone3_flag_is_einval_not_a_silent_success() {
+        const CLONE_CLEAR_SIGHAND: u64 = 1 << 32;
+        const CLONE_INTO_CGROUP: u64 = 1 << 33;
+        assert_eq!(
+            clone3_to_clone(args(CLONE_CLEAR_SIGHAND, 0, 0, 0, 0, 0, 0, 0)),
+            Err(LxError::EINVAL)
+        );
+        assert_eq!(
+            clone3_to_clone(args(CLONE_INTO_CGROUP, 0, 0, 0, 0, 0, 0, 0)),
+            Err(LxError::EINVAL)
+        );
+        // A known bit beside an unknown one is still EINVAL.
+        let with_vfork = CloneFlags::VFORK.bits() as u64 | CLONE_CLEAR_SIGHAND;
+        assert_eq!(
+            clone3_to_clone(args(with_vfork, 0, 0, 0, 0, 0, 0, 0)),
+            Err(LxError::EINVAL)
+        );
+        // Known flags still decode.
+        assert!(
+            clone3_to_clone(args(CloneFlags::VFORK.bits() as u64, 0, 0, 0, 0, 0, 0, 0)).is_ok()
+        );
+    }
+
+    /// Legacy `clone` truncates the same unknown bits; it must refuse them
+    /// for the same reason `clone3` does.
+    #[test]
+    fn legacy_clone_also_rejects_unknown_flags() {
+        const CLONE_CLEAR_SIGHAND: usize = 1 << 32;
+        assert_eq!(
+            clone_flags_from_word(CLONE_CLEAR_SIGHAND),
+            Err(LxError::EINVAL)
+        );
+        assert_eq!(
+            clone_flags_from_word(CloneFlags::VFORK.bits() | CLONE_CLEAR_SIGHAND),
+            Err(LxError::EINVAL)
+        );
+        let known = CloneFlags::VFORK.bits() | 17; // SIGCHLD in CSIGNAL
+        let f = clone_flags_from_word(known).unwrap();
+        assert!(f.contains(CloneFlags::VFORK));
+        assert_eq!(f.bits() & 0xff, 17);
+    }
+
     #[test]
     fn a_signal_number_that_does_not_exist_is_refused() {
         assert!(clone3_to_clone(args(0, 0, 0, 0, 64, 0, 0, 0)).is_ok());
@@ -3156,6 +3236,14 @@ mod wait_option_tests {
                 assert_ne!(a, b, "two id types share a number");
             }
         }
+    }
+
+    /// A non-blocking pidfd without `WNOHANG` turns an empty wait into
+    /// `EAGAIN`; with `WNOHANG` it stays the usual empty success.
+    #[test]
+    fn a_nonblocking_pidfd_empty_wait_is_eagain_unless_wnohang() {
+        assert_eq!(pidfd_waitid_empty(true), Ok(()));
+        assert_eq!(pidfd_waitid_empty(false), Err(LxError::EAGAIN));
     }
 
     /// `WEXITED` and `WNOWAIT` belong to `waitid`. `kernel_wait4`'s mask

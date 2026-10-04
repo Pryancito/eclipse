@@ -638,14 +638,32 @@ numeric_enum! {
     pub enum SolOptname {
         /// reuseaddr
         REUSEADDR = 2,
+        /// `SO_TYPE`: the `SOCK_*` this socket was created with (sans CLOEXEC/NONBLOCK).
+        TYPE = 3,
         /// error
         ERROR = 4,
+        /// `SO_BROADCAST` — allow datagrams to the broadcast address.
+        BROADCAST = 6,
         /// sndbuf
         SNDBUF = 7,  // 获取发送缓冲区长度
         /// rcvbuf
         RCVBUF = 8,  // 获取接收缓冲区长度
+        /// `SO_KEEPALIVE` — periodic probes on idle TCP connections.
+        KEEPALIVE = 9,
         /// linger
         LINGER = 13,
+        /// `SO_REUSEPORT` — allow multiple binds on the same port.
+        REUSEPORT = 15,
+        /// `SO_RCVTIMEO` — receive timeout (`struct timeval`).
+        RCVTIMEO = 20,
+        /// `SO_SNDTIMEO` — send timeout (`struct timeval`).
+        SNDTIMEO = 21,
+        /// `SO_ACCEPTCONN` — nonzero while the socket is a passive listener.
+        ACCEPTCONN = 30,
+        /// `SO_PROTOCOL` — protocol passed to `socket(2)` (read-only).
+        PROTOCOL = 38,
+        /// `SO_DOMAIN` — address family / domain (read-only).
+        DOMAIN = 39,
     }
 }
 
@@ -654,6 +672,14 @@ numeric_enum! {
     #[derive(Debug, PartialEq, Eq, Clone, Copy)]
     /// Generic musl socket optname.
     pub enum TcpOptname {
+        /// TCP_NODELAY — disable Nagle
+        NODELAY = 1,
+        /// TCP_KEEPIDLE — idle seconds before the first keepalive probe
+        KEEPIDLE = 4,
+        /// TCP_KEEPINTVL — seconds between keepalive probes
+        KEEPINTVL = 5,
+        /// TCP_KEEPCNT — number of unacked probes before giving up
+        KEEPCNT = 6,
         /// congestion
         CONGESTION = 13,
     }
@@ -664,8 +690,18 @@ numeric_enum! {
     #[derive(Debug, PartialEq, Eq, Clone, Copy)]
     /// Generic musl socket optname.
     pub enum IpOptname {
+        /// IP_TOS — type of service
+        TOS = 1,
+        /// IP_TTL — unicast hop limit
+        TTL = 2,
         /// hdrincl
         HDRINCL = 3,
+        /// IP_MULTICAST_IF — outbound multicast interface
+        MulticastIf = 32,
+        /// IP_MULTICAST_TTL — multicast hop limit
+        MulticastTtl = 33,
+        /// IP_MULTICAST_LOOP — loopback multicast locally (`IP_ADD_MEMBERSHIP` is 35).
+        MulticastLoop = 34,
     }
 }
 
@@ -823,14 +859,51 @@ fn mono_us() -> u64 {
     kernel_hal::timer::timer_now().as_micros() as u64
 }
 
-fn net_poll_interval_elapsed(interval_us: u64) -> bool {
-    let now = mono_us();
-    let last = LAST_NET_POLL_US.load(Ordering::Relaxed);
-    if now.wrapping_sub(last) < interval_us {
-        return false;
+/// Claim one turn of a periodic job, for exactly one caller per interval.
+///
+/// `load` / compare / `store` is not a throttle under SMP, it is a starting
+/// gun: every CPU that reaches the check inside the same interval reads the
+/// same `last`, every one of them passes, and every one of them stores `now`
+/// and runs the body. That is not theoretical -- it is the six-CPU pile-up on
+/// the e1000e `iface` lock captured on real hardware, where the HOLDER sat in
+/// `add_route` (reached from [`maybe_run_net_housekeeping`] via
+/// [`prepare_ipv4_stack`]) and the other five spun in `seed_neighbor` (reached
+/// from the *same* housekeeping pass, via
+/// [`sync_neighbor_cache_into_smoltcp`]). Both ends of that banner are inside
+/// the body this throttle is supposed to let one CPU run.
+///
+/// The `compare_exchange` makes the stamp the claim: the winner moves it and
+/// runs, the losers see the moved stamp on the retry and go home. Returns
+/// whether the caller won the turn.
+fn claim_interval(slot: &AtomicU64, now: u64, interval_us: u64) -> bool {
+    claim_interval_seen(slot, slot.load(Ordering::Relaxed), now, interval_us)
+}
+
+/// [`claim_interval`] from a stamp the caller has already read.
+///
+/// Split out for the tests, and only for them: a test that calls
+/// `claim_interval` one CPU after another cannot fail, because by the time the
+/// second one loads the stamp the first has already stored it -- the bug needs
+/// every CPU to have loaded the *old* stamp before any of them stores, which is
+/// precisely what handing them all the same `last` reproduces, without threads
+/// and without a timing window.
+fn claim_interval_seen(slot: &AtomicU64, mut last: u64, now: u64, interval_us: u64) -> bool {
+    loop {
+        if now.wrapping_sub(last) < interval_us {
+            return false;
+        }
+        match slot.compare_exchange_weak(last, now, Ordering::AcqRel, Ordering::Relaxed) {
+            Ok(_) => return true,
+            // Someone else moved it. Re-read and re-judge rather than assume
+            // they claimed *this* interval: the stamp they wrote may still be
+            // old enough that this caller is owed the turn.
+            Err(current) => last = current,
+        }
     }
-    LAST_NET_POLL_US.store(now, Ordering::Relaxed);
-    true
+}
+
+fn net_poll_interval_elapsed(interval_us: u64) -> bool {
+    claim_interval(&LAST_NET_POLL_US, mono_us(), interval_us)
 }
 
 #[inline]
@@ -843,13 +916,46 @@ fn adaptive_net_poll_interval_us() -> u64 {
     adaptive::net_poll_interval_us(kernel_hal::deferred_job::pending_deferred_jobs())
 }
 
+/// Held while a housekeeping pass is in flight, so only one CPU is ever inside
+/// the body.
+///
+/// [`claim_interval`] already hands the turn to one caller, but it hands it out
+/// by the clock, and `force` skips the clock entirely. This is the structural
+/// half: whatever the stamp says, a second CPU that arrives while the body is
+/// running turns around. The body's work is idempotent housekeeping, so the one
+/// that turns around loses nothing -- the pass already in flight does it.
+static NET_HOUSEKEEPING_RUNNING: AtomicBool = AtomicBool::new(false);
+
 #[inline]
 fn maybe_run_net_housekeeping(now_us: u64, force: bool) {
-    let last = LAST_NET_HOUSEKEEPING_US.load(Ordering::Relaxed);
-    if !force && now_us.wrapping_sub(last) < NET_HOUSEKEEPING_INTERVAL_US {
+    // One CPU per interval, or all of them at once -- see [`claim_interval`].
+    let won = claim_interval(
+        &LAST_NET_HOUSEKEEPING_US,
+        now_us,
+        NET_HOUSEKEEPING_INTERVAL_US,
+    );
+    if force {
+        // A forced pass runs whether or not it won the turn, and publishes the
+        // stamp as the old code did, so the periodic pass whose work it just
+        // did does not follow it a microsecond later.
+        LAST_NET_HOUSEKEEPING_US.store(now_us, Ordering::Relaxed);
+    } else if !won {
         return;
     }
-    LAST_NET_HOUSEKEEPING_US.store(now_us, Ordering::Relaxed);
+    if NET_HOUSEKEEPING_RUNNING.swap(true, Ordering::Acquire) {
+        return;
+    }
+    // Cleared by `Drop`, not by a store at the end: an early `return` added to
+    // the body later would otherwise latch the flag and kill housekeeping for
+    // the life of the kernel, which is exactly how `poll_pending` got stuck
+    // once already.
+    struct Running;
+    impl Drop for Running {
+        fn drop(&mut self) {
+            NET_HOUSEKEEPING_RUNNING.store(false, Ordering::Release);
+        }
+    }
+    let _running = Running;
     sync_neighbor_cache_into_smoltcp();
     if has_usable_ipv4() {
         prepare_ipv4_stack();
@@ -925,10 +1031,7 @@ pub fn io_wait_tick(watch_net: bool, _watch_interactive: bool) {
         kernel_hal::deferred_job::drain_deferred_jobs_max(adaptive_deferred_jobs_per_tick());
         poll_ifaces_throttled();
     } else {
-        let now = mono_us();
-        let last = LAST_DEFERRED_IDLE_US.load(Ordering::Relaxed);
-        if now.wrapping_sub(last) >= DEFERRED_IDLE_INTERVAL_US {
-            LAST_DEFERRED_IDLE_US.store(now, Ordering::Relaxed);
+        if claim_interval(&LAST_DEFERRED_IDLE_US, mono_us(), DEFERRED_IDLE_INTERVAL_US) {
             kernel_hal::deferred_job::drain_deferred_jobs_max(1);
         }
     }
@@ -2126,7 +2229,12 @@ pub trait Socket: Send + Sync + Debug + downcast_rs::DowncastSync {
     }
     /// missing documentation
     fn listen(&self) -> SysResult {
-        Err(LxError::EINVAL)
+        Err(LxError::EOPNOTSUPP)
+    }
+    /// Whether this socket is a passive listener (`SIOCINQ`/`FIONREAD` is
+    /// `EINVAL` on one, per unix(7) / tcp(7)).
+    fn is_listening(&self) -> bool {
+        false
     }
     /// missing documentation
     fn shutdown(&self, _howto: usize) -> SysResult {
@@ -2134,7 +2242,7 @@ pub trait Socket: Send + Sync + Debug + downcast_rs::DowncastSync {
     }
     /// missing documentation
     async fn accept(&self) -> LxResult<(Arc<dyn FileLike>, Endpoint)> {
-        Err(LxError::EINVAL)
+        Err(LxError::EOPNOTSUPP)
     }
     /// missing documentation
     fn endpoint(&self) -> Option<Endpoint> {
@@ -2149,12 +2257,54 @@ pub trait Socket: Send + Sync + Debug + downcast_rs::DowncastSync {
     fn peer_pid(&self) -> Option<i32> {
         None
     }
+    /// Whether every message read from this socket should come with the
+    /// sender's credentials attached as an `SCM_CREDENTIALS` control message
+    /// (`SO_PASSCRED`).
+    ///
+    /// It is how a receiver learns WHICH process sent a message, and it cannot
+    /// be forged: the kernel fills the `ucred` in, so the number is as
+    /// trustworthy as the kernel. chromium's zygote is built on exactly that
+    /// -- the browser hands the zygote a `SOCK_SEQPACKET` pair, the forked
+    /// child pings it, and the browser reads the child's REAL pid out of the
+    /// credentials, because the zygote's own idea of the pid is not one the
+    /// browser can check.
+    fn passcred(&self) -> bool {
+        false
+    }
+    /// Turn `SO_PASSCRED` on or off.
+    ///
+    /// Only AF_UNIX carries credentials, and only AF_UNIX stores the bit. On
+    /// every other socket Linux still ACCEPTS the option (it is a generic
+    /// `sock` flag set in `sock_setsockopt`, not a per-family one), so
+    /// refusing it here would fail a call that succeeds on Linux, and the
+    /// default answers accordingly: taken, and inert, since no credentials
+    /// will ever ride a TCP segment.
+    fn set_passcred(&self, _on: bool) -> SysResult {
+        Ok(0)
+    }
+    /// Take the credentials of the process that SENT the bytes this `recvmsg`
+    /// has just read, stamped when they were written.
+    ///
+    /// Sampling at send time is the whole point. The alternative -- reading the
+    /// peer endpoint's owner back afterwards, as `peer_pid` does -- answers a
+    /// different question, and chromium is the case where the two differ: the
+    /// zygote hands an inherited `socketpair` end to a child it just forked,
+    /// so the writer is a process that never created the socket. A `socketpair`
+    /// has no creator recorded at all, and the browser would read pid 0.
+    ///
+    /// `None` when nothing was stamped (no credentials queued, or a non-unix
+    /// socket); the caller then has nothing to attach.
+    fn recv_creds(&self) -> Option<[u8; 12]> {
+        None
+    }
     /// Queue file descriptors to be received by the peer (`SCM_RIGHTS` ancillary
     /// data over a unix socket). Only AF_UNIX supports it. This is how seatd
     /// hands an opened DRM/input device to a Wayland compositor and how clients
     /// pass shm/dmabuf buffers back.
     fn send_fds(&self, _fds: alloc::vec::Vec<Arc<dyn FileLike>>) -> SysResult {
-        Err(LxError::ENOSYS)
+        // `ENOSYS` told callers the *syscall* was missing; Linux answers
+        // `EOPNOTSUPP` for SCM_RIGHTS on a non-unix socket.
+        Err(LxError::EOPNOTSUPP)
     }
     /// Take up to `_max` file descriptors the peer attached via `SCM_RIGHTS`.
     fn recv_fds(&self, _max: usize) -> alloc::vec::Vec<Arc<dyn FileLike>> {
@@ -2170,10 +2320,30 @@ pub trait Socket: Send + Sync + Debug + downcast_rs::DowncastSync {
     /// only note a genuinely unknown option, instead of crying "unimplemented"
     /// on every ordinary `SO_*`/`TCP_*` call (which was a red herring while
     /// debugging download failures). The data path is unchanged.
-    fn setsockopt(&self, level: usize, opt: usize, _data: &[u8]) -> SysResult {
+    fn setsockopt(&self, level: usize, opt: usize, data: &[u8]) -> SysResult {
         const SOL_SOCKET: usize = 1;
         const IPPROTO_IP: usize = 0;
         const IPPROTO_TCP: usize = 6;
+        const IP_HDRINCL: usize = 3;
+        // Read-only SOL_SOCKET options — Linux rejects set with ENOPROTOOPT.
+        if level == SOL_SOCKET && matches!(opt, 3 | 4 | 30 | 38 | 39) {
+            // SO_TYPE / SO_ERROR / SO_ACCEPTCONN / SO_PROTOCOL / SO_DOMAIN
+            return Err(LxError::ENOPROTOOPT);
+        }
+        // `do_tcp_setsockopt` is TCP-only; other families must not swallow TCP_*.
+        if level == IPPROTO_TCP && !self.is_tcp() {
+            return Err(LxError::ENOPROTOOPT);
+        }
+        // `do_ip_setsockopt` is inet-only; IP_HDRINCL further needs SOCK_RAW IPv4.
+        if level == IPPROTO_IP {
+            if !self.is_inet() {
+                return Err(LxError::ENOPROTOOPT);
+            }
+            if opt == IP_HDRINCL && !self.is_raw_ipv4() {
+                return Err(LxError::ENOPROTOOPT);
+            }
+        }
+        check_setsockopt_len(level, opt, data)?;
         let known = match level {
             // SO_REUSEADDR, BROADCAST, SNDBUF, RCVBUF, KEEPALIVE, LINGER,
             // REUSEPORT, RCVTIMEO, SNDTIMEO — the usual setsockopt traffic.
@@ -2181,7 +2351,7 @@ pub trait Socket: Send + Sync + Debug + downcast_rs::DowncastSync {
             // TCP_NODELAY, TCP_KEEPIDLE/CNT/INTVL, TCP_CONGESTION.
             IPPROTO_TCP => matches!(opt, 1 | 4 | 5 | 6 | 13),
             // IP_TOS, IP_TTL, IP_HDRINCL, multicast knobs.
-            IPPROTO_IP => matches!(opt, 1 | 2 | 3 | 32 | 33 | 35),
+            IPPROTO_IP => matches!(opt, 1 | 2 | 3 | 32 | 33 | 34 | 35),
             _ => false,
         };
         if !known {
@@ -2209,9 +2379,304 @@ pub trait Socket: Send + Sync + Debug + downcast_rs::DowncastSync {
     fn take_so_error(&self) -> i32 {
         0
     }
+    /// `getsockopt(SO_REUSEADDR)`: current flag. Default false (Linux default);
+    /// TCP overrides with the value `setsockopt` stored.
+    fn so_reuseaddr(&self) -> bool {
+        false
+    }
+    /// `getsockopt(SO_BROADCAST)`: current flag. Default false.
+    fn so_broadcast(&self) -> bool {
+        false
+    }
+    /// `getsockopt(SO_KEEPALIVE)`: current flag. Default false.
+    fn so_keepalive(&self) -> bool {
+        false
+    }
+    /// `getsockopt(SO_REUSEPORT)`: current flag. Default false.
+    fn so_reuseport(&self) -> bool {
+        false
+    }
+    /// `getsockopt(SO_LINGER)`: `(l_onoff, l_linger)`. Default off.
+    fn so_linger(&self) -> (bool, i32) {
+        (false, 0)
+    }
+    /// `getsockopt(SO_RCVTIMEO)`: 16-byte `struct timeval`. Default zero.
+    fn so_rcvtimeo(&self) -> [u8; 16] {
+        [0; 16]
+    }
+    /// `getsockopt(SO_SNDTIMEO)`: 16-byte `struct timeval`. Default zero.
+    fn so_sndtimeo(&self) -> [u8; 16] {
+        [0; 16]
+    }
+    /// `getsockopt(TCP_KEEPIDLE)`. Default 7200.
+    fn tcp_keepidle(&self) -> Option<u32> {
+        None
+    }
+    /// `getsockopt(TCP_KEEPINTVL)`. Default 75.
+    fn tcp_keepintvl(&self) -> Option<u32> {
+        None
+    }
+    /// `getsockopt(TCP_KEEPCNT)`. Default 9.
+    fn tcp_keepcnt(&self) -> Option<u32> {
+        None
+    }
+    /// `getsockopt(IP_HDRINCL)`: whether the caller supplies the IPv4 header.
+    /// Default false; raw AF_INET overrides.
+    fn ip_hdrincl(&self) -> bool {
+        false
+    }
+    /// `getsockopt(IP_TOS)`. Default 0.
+    fn ip_tos(&self) -> u32 {
+        0
+    }
+    /// `getsockopt(IP_TTL)`. Default 64.
+    fn ip_ttl(&self) -> u32 {
+        64
+    }
+    /// `getsockopt(IP_MULTICAST_TTL)`. Default 1.
+    fn ip_multicast_ttl(&self) -> u32 {
+        1
+    }
+    /// `getsockopt(IP_MULTICAST_LOOP)`. Default true.
+    fn ip_multicast_loop(&self) -> bool {
+        true
+    }
+    /// `getsockopt(IP_MULTICAST_IF)` as `in_addr` (network order word). Default 0.
+    fn ip_multicast_if(&self) -> u32 {
+        0
+    }
+    /// `getsockopt(TCP_NODELAY)`: Nagle disabled. Default false; TCP overrides.
+    fn tcp_nodelay(&self) -> bool {
+        false
+    }
+    /// True only for real `IPPROTO_TCP` sockets (`TcpSocketState`).
+    /// `SOCK_STREAM` alone is not enough (AF_UNIX streams are not TCP).
+    fn is_tcp(&self) -> bool {
+        false
+    }
+    /// True for AF_INET / AF_INET6 sockets that speak `IPPROTO_IP` options
+    /// (TCP/UDP/ICMP/raw). AF_UNIX / netlink / AF_PACKET stay false.
+    fn is_inet(&self) -> bool {
+        false
+    }
+    /// True for `SOCK_RAW` IPv4 that may set/get `IP_HDRINCL`.
+    fn is_raw_ipv4(&self) -> bool {
+        false
+    }
+    /// `getsockopt(SO_DOMAIN)`: `AF_*` this socket was opened with.
+    fn so_domain(&self) -> Option<u32> {
+        None
+    }
+    /// `getsockopt(SO_PROTOCOL)`: protocol number from `socket(2)`.
+    fn so_protocol(&self) -> Option<u32> {
+        None
+    }
     /// Flags for the last `recv`/`recvmsg` (e.g. `MSG_TRUNC`); cleared on take.
     fn take_msg_flags(&self) -> i32 {
         0
+    }
+}
+
+/// Stored `SOL_SOCKET` / `IPPROTO_IP` knobs for inet sockets that used to
+/// accept set as a no-op while get always answered the defaults (ICMP, raw).
+#[derive(Debug, Clone)]
+pub(crate) struct StoredInetOpts {
+    pub reuse_addr: bool,
+    pub broadcast: bool,
+    pub keepalive: bool,
+    pub reuse_port: bool,
+    pub linger_on: bool,
+    pub linger_sec: i32,
+    pub rcv_timeo: [u8; 16],
+    pub snd_timeo: [u8; 16],
+    pub ip_tos: u32,
+    pub ip_ttl: u32,
+    pub mcast_ttl: u32,
+    pub mcast_loop: bool,
+    pub mcast_if: u32,
+}
+
+impl Default for StoredInetOpts {
+    fn default() -> Self {
+        Self {
+            reuse_addr: false,
+            broadcast: false,
+            keepalive: false,
+            reuse_port: false,
+            linger_on: false,
+            linger_sec: 0,
+            rcv_timeo: [0; 16],
+            snd_timeo: [0; 16],
+            ip_tos: 0,
+            ip_ttl: 64,
+            mcast_ttl: 1,
+            mcast_loop: true,
+            mcast_if: 0,
+        }
+    }
+}
+
+impl StoredInetOpts {
+    /// Apply a common inet sockopt. `Some` = handled (incl. errors);
+    /// `None` = caller should keep going (e.g. raw `IP_HDRINCL`).
+    pub fn try_setsockopt(&mut self, level: usize, opt: usize, data: &[u8]) -> Option<SysResult> {
+        const SOL_SOCKET: usize = 1;
+        const IPPROTO_IP: usize = 0;
+        const IPPROTO_TCP: usize = 6;
+        if level == SOL_SOCKET && matches!(opt, 3 | 4 | 30 | 38 | 39) {
+            return Some(Err(LxError::ENOPROTOOPT));
+        }
+        if level == IPPROTO_TCP {
+            return Some(Err(LxError::ENOPROTOOPT));
+        }
+        if level == SOL_SOCKET {
+            match opt {
+                2 | 6 | 9 | 15 => {
+                    if data.len() < 4 {
+                        return Some(Err(LxError::EINVAL));
+                    }
+                    let on = u32::from_ne_bytes([data[0], data[1], data[2], data[3]]) != 0;
+                    match opt {
+                        2 => self.reuse_addr = on,
+                        6 => self.broadcast = on,
+                        9 => self.keepalive = on,
+                        _ => self.reuse_port = on,
+                    }
+                    return Some(Ok(0));
+                }
+                13 => {
+                    if data.len() < 8 {
+                        return Some(Err(LxError::EINVAL));
+                    }
+                    self.linger_on = i32::from_ne_bytes([data[0], data[1], data[2], data[3]]) != 0;
+                    self.linger_sec = i32::from_ne_bytes([data[4], data[5], data[6], data[7]]);
+                    return Some(Ok(0));
+                }
+                20 | 21 => {
+                    if data.len() < 16 {
+                        return Some(Err(LxError::EINVAL));
+                    }
+                    let mut tv = [0u8; 16];
+                    tv.copy_from_slice(&data[..16]);
+                    let usec = i64::from_ne_bytes([
+                        tv[8], tv[9], tv[10], tv[11], tv[12], tv[13], tv[14], tv[15],
+                    ]);
+                    if !(0..1_000_000).contains(&usec) {
+                        return Some(Err(LxError::EINVAL));
+                    }
+                    if opt == 20 {
+                        self.rcv_timeo = tv;
+                    } else {
+                        self.snd_timeo = tv;
+                    }
+                    return Some(Ok(0));
+                }
+                _ => {}
+            }
+        }
+        if level == IPPROTO_IP {
+            // Leave HDRINCL to the caller (raw only).
+            if opt == 3 {
+                return None;
+            }
+            if matches!(opt, 1 | 2 | 32 | 33 | 34) {
+                let val = if data.len() >= 4 {
+                    u32::from_ne_bytes([data[0], data[1], data[2], data[3]])
+                } else if !data.is_empty() {
+                    u32::from(data[0])
+                } else {
+                    return Some(Err(LxError::EINVAL));
+                };
+                match opt {
+                    1 => self.ip_tos = val,
+                    2 => self.ip_ttl = val,
+                    32 => self.mcast_if = val,
+                    33 => self.mcast_ttl = val,
+                    _ => self.mcast_loop = val != 0,
+                }
+                return Some(Ok(0));
+            }
+        }
+        None
+    }
+}
+
+/// Minimum `optlen` for a known sockopt before we accept it as a no-op.
+///
+/// Linux rejects short buffers with `EINVAL` (`sock_setsockopt` /
+/// `do_tcp_setsockopt`); accepting 0–3 bytes for an `int` option used to
+/// succeed silently.
+pub(crate) fn check_setsockopt_len(level: usize, opt: usize, data: &[u8]) -> LxResult<()> {
+    const SOL_SOCKET: usize = 1;
+    const IPPROTO_IP: usize = 0;
+    const IPPROTO_TCP: usize = 6;
+    let need = match (level, opt) {
+        (SOL_SOCKET, 13) => 8,                     // struct linger
+        (SOL_SOCKET, 20 | 21) => 16,               // struct timeval
+        (SOL_SOCKET, 2 | 6 | 7 | 8 | 9 | 15) => 4, // int options
+        (IPPROTO_TCP, 1 | 4 | 5 | 6) => 4,         // int TCP_* (not CONGESTION)
+        // The IP level is NOT the socket level: `do_ip_setsockopt` reads the
+        // value from four bytes when it has them and from ONE when it does
+        // not --
+        //     if (optlen >= sizeof(int)) { ... get_user(val, ...) }
+        //     else if (optlen >= sizeof(char)) { ... val = (int) ucval; }
+        // -- so `setsockopt(fd, IPPROTO_IP, IP_TTL, "\100", 1)` is an
+        // ordinary call, and demanding four bytes refused it. IP_TOS (1),
+        // IP_TTL (2), IP_HDRINCL (3) and IP_MULTICAST_TTL (33) all go through
+        // that path.
+        (IPPROTO_IP, 1 | 2 | 3 | 33 | 34) => 1, // TOS/TTL/HDRINCL/mcast TTL/LOOP
+        // IP_MULTICAST_IF (32) takes an address; IP_ADD_MEMBERSHIP (35) a
+        // `struct ip_mreq` (not LOOP — that is 34).
+        (IPPROTO_IP, 32 | 35) => 4,
+        _ => 0,
+    };
+    if need > 0 && data.len() < need {
+        return Err(LxError::EINVAL);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod setsockopt_len_tests {
+    use super::check_setsockopt_len;
+    use crate::error::LxError;
+
+    #[test]
+    fn a_short_int_optlen_is_einval() {
+        // SO_KEEPALIVE = 9; used to succeed with an empty buffer.
+        assert_eq!(check_setsockopt_len(1, 9, &[]), Err(LxError::EINVAL));
+        assert_eq!(check_setsockopt_len(1, 9, &[1]), Err(LxError::EINVAL));
+        assert_eq!(check_setsockopt_len(1, 9, &1u32.to_ne_bytes()), Ok(()));
+        // TCP_KEEPIDLE = 4
+        assert_eq!(check_setsockopt_len(6, 4, &[1, 0]), Err(LxError::EINVAL));
+        assert_eq!(check_setsockopt_len(6, 4, &7200u32.to_ne_bytes()), Ok(()));
+        // timeval needs 16
+        assert_eq!(check_setsockopt_len(1, 20, &[0u8; 8]), Err(LxError::EINVAL));
+        assert_eq!(check_setsockopt_len(1, 20, &[0u8; 16]), Ok(()));
+    }
+
+    /// The IP level takes a one-byte value where the socket level does not:
+    /// `do_ip_setsockopt` falls back to reading an `unsigned char`. Demanding
+    /// four bytes there refused `setsockopt(fd, IPPROTO_IP, IP_TTL, "\100", 1)`,
+    /// which is how a caller with a `char` has always set it.
+    #[test]
+    fn the_ip_level_reads_a_lone_byte_where_the_socket_level_will_not() {
+        for opt in [1, 2, 3, 33] {
+            assert_eq!(check_setsockopt_len(0, opt, &[64]), Ok(()), "opt {}", opt);
+            assert_eq!(
+                check_setsockopt_len(0, opt, &64u32.to_ne_bytes()),
+                Ok(()),
+                "opt {}",
+                opt
+            );
+            // Nothing to read is still nothing to read.
+            assert_eq!(check_setsockopt_len(0, opt, &[]), Err(LxError::EINVAL));
+        }
+        // An address or a `struct ip_mreq` is not an int with a short form.
+        assert_eq!(check_setsockopt_len(0, 32, &[1]), Err(LxError::EINVAL));
+        assert_eq!(check_setsockopt_len(0, 35, &[1]), Err(LxError::EINVAL));
+        // And the socket level keeps its four-byte minimum.
+        assert_eq!(check_setsockopt_len(1, 9, &[1]), Err(LxError::EINVAL));
     }
 }
 
@@ -2378,6 +2843,81 @@ pub fn proc_net_unix_content() -> alloc::string::String {
 mod tests {
     use super::*;
     use smoltcp::wire::Ipv4Address;
+
+    /// Six CPUs reaching the same throttle in the same interval: exactly one
+    /// gets the turn.
+    ///
+    /// The old `load` / compare / `store` gave the turn to all six, which is
+    /// the e1000e pile-up in the hardware panic -- one CPU inside `add_route`
+    /// holding the smoltcp `iface` lock and the other five spinning on it in
+    /// `seed_neighbor`, both reached from this one body.
+    #[test]
+    fn claim_interval_admits_one_caller_per_interval() {
+        let slot = AtomicU64::new(500_000);
+        let now = 1_000_000;
+        // All six have loaded the same stamp before any of them stores: the
+        // interleaving the old `load` / compare / `store` could not survive.
+        let winners = (0..6)
+            .filter(|_| claim_interval_seen(&slot, 500_000, now, 250_000))
+            .count();
+        assert_eq!(winners, 1);
+        assert_eq!(slot.load(Ordering::Relaxed), now);
+    }
+
+    /// The same interleaving, but the stamp the racers read is old enough that
+    /// the *next* interval is owed too: the loser must not be handed the turn
+    /// by the retry, because the winner has just run the body.
+    #[test]
+    fn claim_interval_losers_do_not_win_on_the_retry() {
+        let slot = AtomicU64::new(0);
+        let now = 10_000_000;
+        let winners = (0..6)
+            .filter(|_| claim_interval_seen(&slot, 0, now, 250_000))
+            .count();
+        assert_eq!(winners, 1);
+    }
+
+    #[test]
+    fn claim_interval_refuses_before_the_interval_is_up() {
+        let slot = AtomicU64::new(0);
+        assert!(claim_interval(&slot, 1_000_000, 250_000));
+        assert!(!claim_interval(&slot, 1_000_000 + 249_999, 250_000));
+        // The refusals must not move the stamp, or a stream of early callers
+        // would push the next real turn out forever.
+        assert_eq!(slot.load(Ordering::Relaxed), 1_000_000);
+    }
+
+    #[test]
+    fn claim_interval_gives_the_turn_again_once_the_interval_elapses() {
+        let slot = AtomicU64::new(0);
+        assert!(claim_interval(&slot, 1_000_000, 250_000));
+        assert!(claim_interval(&slot, 1_250_000, 250_000));
+        assert_eq!(slot.load(Ordering::Relaxed), 1_250_000);
+    }
+
+    /// A fresh slot reads 0, so during the first interval of uptime the stamp
+    /// is indistinguishable from "ran just now" and the turn is refused. That
+    /// is the old behaviour kept deliberately: the first caller is a DHCP-time
+    /// poll, the work is periodic housekeeping, and it simply happens one
+    /// interval later.
+    #[test]
+    fn claim_interval_waits_out_the_first_interval_of_uptime() {
+        let slot = AtomicU64::new(0);
+        assert!(!claim_interval(&slot, 1, 250_000));
+        assert!(claim_interval(&slot, 250_000, 250_000));
+    }
+
+    /// The clock is `u64` micros and never wraps in any plausible uptime, but
+    /// the arithmetic is `wrapping_sub` on purpose; keep it that way, because
+    /// a plain subtraction here panics in debug rather than merely misjudging.
+    #[test]
+    fn claim_interval_survives_a_clock_that_went_backwards() {
+        let slot = AtomicU64::new(5_000_000);
+        // now < last: `wrapping_sub` yields a huge number, so the turn is
+        // granted and the stamp is repaired to the new reading.
+        assert!(claim_interval(&slot, 1_000, 250_000));
+        assert_eq!(slot.load(Ordering::Relaxed), 1_000);
+    }
 
     #[test]
     fn ipv4_placeholder_is_class_e_sentinel() {

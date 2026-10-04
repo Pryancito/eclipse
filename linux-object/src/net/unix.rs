@@ -1,7 +1,7 @@
 use crate::fs::{FileLike, OpenFlags, PollEvents, PollStatus};
 use crate::{
     error::{LxError, LxResult},
-    net::{Endpoint, Socket, SocketType, SysResult},
+    net::{Domain, Endpoint, Socket, SocketType, SysResult},
     sync::{Event, EventBus},
 };
 use alloc::{
@@ -145,7 +145,32 @@ struct UnixInner {
     /// seatd's ENABLE_SEAT event) would steal the fd queued for a later
     /// OPEN_DEVICE reply, so the compositor's device fd arrives mismatched.
     pending_fds: VecDeque<(usize, Vec<Arc<dyn FileLike>>)>,
+    /// `SO_PASSCRED`: hand the peer's credentials to every `recvmsg` on this
+    /// end, as an `SCM_CREDENTIALS` control message. Off until a `setsockopt`
+    /// asks for it, as in Linux.
+    passcred: bool,
+    /// The sender's `struct ucred` for each message sitting in `buffer`, tagged
+    /// with the `total_written` offset of its first byte, exactly as
+    /// `pending_fds` is. Linux samples credentials in `scm_send`, at SEND time,
+    /// and the reason is chromium: the zygote writes through a `socketpair` end
+    /// it inherited, so the writer is NOT whoever created the socket, and a
+    /// `socketpair` records no creator at all. Reading an owner back later
+    /// would answer pid 0.
+    ///
+    /// Consecutive messages from the same process share one entry, so a busy
+    /// one-writer socket (the common case) keeps a single record.
+    pending_creds: VecDeque<(usize, [u8; 12])>,
+    /// The last record `recv_creds` handed out, for a `recvmsg` that reads no
+    /// new message: Linux answers such a call with the credentials still
+    /// associated with the connection rather than with nothing.
+    last_creds: Option<[u8; 12]>,
 }
+
+/// How many per-message credential records may pile up unclaimed before
+/// `write` starts retiring the ones whose bytes have already been read. Small
+/// on purpose: a socket with one writer only ever holds a single record, and a
+/// deep queue only happens when several processes alternate on one end.
+const PENDING_CREDS_SOFT_MAX: usize = 16;
 
 impl UnixInner {
     /// Room left in this end's inbound queue.
@@ -189,6 +214,9 @@ impl Default for UnixSocketState {
                 write_closed: false,
                 owner_pid: 0,
                 pending_fds: VecDeque::new(),
+                passcred: false,
+                pending_creds: VecDeque::new(),
+                last_creds: None,
             })),
         }
     }
@@ -255,6 +283,23 @@ impl UnixSocketState {
     /// Return true if this socket has been marked as listening.
     pub fn is_listening(&self) -> bool {
         self.inner.lock().is_listening
+    }
+
+    /// Whether `connect_pair` / `mark_connected` has wired a peer. A second
+    /// `connect(2)` must see this and answer `EISCONN`.
+    pub fn is_connected(&self) -> bool {
+        self.inner.lock().connected
+    }
+
+    /// `unix_stream_connect`'s gate before wiring: already connected or a
+    /// listener is `EISCONN`.
+    pub fn may_connect(&self) -> LxResult<()> {
+        let inner = self.inner.lock();
+        if inner.connected || inner.is_listening {
+            Err(LxError::EISCONN)
+        } else {
+            Ok(())
+        }
     }
 
     /// Mark this socket as connected (used by sys_connect for the client side).
@@ -523,8 +568,8 @@ impl Future for UnixPollWait<'_> {
                 || (inner.is_listening && !inner.accept_queue.is_empty())
                 || inner.read_closed
                 || peer_gone;
-            let want_read = this.events.contains(PollEvents::IN);
-            let want_write = this.events.contains(PollEvents::OUT);
+            let want_read = this.events.wants_read();
+            let want_write = this.events.wants_write();
             let ready =
                 (want_read && readable) || (want_write && peer_gone) || (!want_read && !want_write);
             if ready {
@@ -686,6 +731,14 @@ impl Socket for UnixSocketState {
         Some(self.inner.lock().sock_type)
     }
 
+    fn so_domain(&self) -> Option<u32> {
+        Some(Domain::AF_UNIX as u32)
+    }
+
+    fn so_protocol(&self) -> Option<u32> {
+        Some(0)
+    }
+
     fn write(&self, data: &[u8], _sendto_endpoint: Option<Endpoint>) -> SysResult {
         // Resolve the peer and release our own lock BEFORE taking the peer's, so
         // two connected ends writing concurrently can't deadlock: holding
@@ -719,6 +772,37 @@ impl Socket for UnixSocketState {
             return Err(LxError::EAGAIN);
         }
         let n = data.len().min(space);
+        let n_offset = pi.total_written;
+        // Stamp the writer's credentials onto this message before its bytes go
+        // in, so `total_written` is still the index of its FIRST byte -- the
+        // same tagging `send_fds` uses, and the same gate (`offset <
+        // total_read`) delivers both. Nothing is stamped when the kernel
+        // itself is writing: there is no process to name.
+        //
+        // A reader using plain `read` never drains these records, so retire the
+        // ones whose bytes it has already consumed once the queue grows past a
+        // handful: such a record can no longer be reported to anyone, and
+        // `last_creds` keeps the most recent of them as the fallback answer.
+        // Without this, writers alternating on a socket nobody calls `recvmsg`
+        // on would grow the queue without bound.
+        while pi.pending_creds.len() > PENDING_CREDS_SOFT_MAX {
+            match pi.pending_creds.front() {
+                Some((offset, _)) if *offset < pi.total_read => {
+                    let (_, rec) = pi.pending_creds.pop_front().unwrap();
+                    pi.last_creds = Some(rec);
+                }
+                _ => break,
+            }
+        }
+        if let Some((pid, uid, gid)) = crate::process::current_ucred() {
+            let mut rec = [0u8; 12];
+            for (i, w) in [pid as u32, uid, gid].iter().enumerate() {
+                rec[i * 4..i * 4 + 4].copy_from_slice(&w.to_ne_bytes());
+            }
+            if pi.pending_creds.back().map(|(_, c)| *c) != Some(rec) {
+                pi.pending_creds.push_back((n_offset, rec));
+            }
+        }
         // `extend(&slice)` takes VecDeque's Copy-slice specialization (a pair
         // of memcpys) instead of the element-wise TrustedLen loop.
         pi.buffer.extend(&data[..n]);
@@ -756,7 +840,14 @@ impl Socket for UnixSocketState {
     // -----------------------------------------------------------------------
     fn bind(&self, endpoint: Endpoint) -> SysResult {
         if let Endpoint::Unix(path) = endpoint {
-            self.inner.lock().path = path;
+            // `unix_bind`: already bound (`u->addr`) is `EINVAL`. Without the
+            // check a second bind overwrote `path` and left the old registry
+            // entry orphaned (or raced a second `register`).
+            let mut inner = self.inner.lock();
+            if !inner.path.is_empty() {
+                return Err(LxError::EINVAL);
+            }
+            inner.path = path;
             Ok(0)
         } else {
             Err(LxError::EINVAL)
@@ -767,14 +858,50 @@ impl Socket for UnixSocketState {
     // listen — mark socket as passive
     // -----------------------------------------------------------------------
     fn listen(&self) -> SysResult {
-        self.inner.lock().is_listening = true;
+        // `unix_listen`: only STREAM/SEQPACKET; DGRAM is `EOPNOTSUPP`.
+        // Without the type check, `socket(AF_UNIX, SOCK_DGRAM); bind;
+        // listen` succeeded and produced a "listener" nothing can accept
+        // on (datagram sockets have no accept queue).
+        let mut inner = self.inner.lock();
+        match inner.sock_type {
+            SocketType::SOCK_STREAM | SocketType::SOCK_SEQPACKET => {}
+            _ => return Err(LxError::EOPNOTSUPP),
+        }
+        // `unix_listen`: no local address (`!u->addr`) is `EINVAL`. Without
+        // the check, `socket(); listen()` succeeded and produced a listener
+        // nothing can connect to (no path in the bind table).
+        if inner.path.is_empty() {
+            return Err(LxError::EINVAL);
+        }
+        // Connected (or already has a peer) is not `TCP_CLOSE`/`TCP_LISTEN`.
+        if inner.connected || inner.peer.is_some() {
+            return Err(LxError::EINVAL);
+        }
+        inner.is_listening = true;
         Ok(0)
+    }
+
+    fn is_listening(&self) -> bool {
+        UnixSocketState::is_listening(self)
     }
 
     // -----------------------------------------------------------------------
     // accept — dequeue a pending connection and return connected pair
     // -----------------------------------------------------------------------
     async fn accept(&self) -> LxResult<(Arc<dyn FileLike>, Endpoint)> {
+        // `unix_accept`: DGRAM has no accept (`EOPNOTSUPP`); not listening is
+        // `EINVAL` before waiting. Without the checks, `accept` on a
+        // fresh/connected/datagram socket blocked (or `EAGAIN`ed) forever.
+        {
+            let inner = self.inner.lock();
+            match inner.sock_type {
+                SocketType::SOCK_STREAM | SocketType::SOCK_SEQPACKET => {}
+                _ => return Err(LxError::EOPNOTSUPP),
+            }
+            if !inner.is_listening {
+                return Err(LxError::EINVAL);
+            }
+        }
         loop {
             let mut inner = self.inner.lock();
             if let Some(server_side) = inner.accept_queue.pop_front() {
@@ -854,12 +981,10 @@ impl Socket for UnixSocketState {
     }
 
     fn endpoint(&self) -> Option<Endpoint> {
-        let path = self.inner.lock().path.clone();
-        if !path.is_empty() {
-            Some(Endpoint::Unix(path))
-        } else {
-            None
-        }
+        // Unbound / unnamed AF_UNIX still has a local address: just
+        // `AF_UNIX` with empty `sun_path` (`unix_getname`). Returning
+        // `None` made `getsockname` fail with `EINVAL`.
+        Some(Endpoint::Unix(self.inner.lock().path.clone()))
     }
 
     fn remote_endpoint(&self) -> Option<Endpoint> {
@@ -873,10 +998,6 @@ impl Socket for UnixSocketState {
         Some(Endpoint::Unix(path))
     }
 
-    fn setsockopt(&self, _level: usize, _opt: usize, _data: &[u8]) -> SysResult {
-        Ok(0)
-    }
-
     fn peer_pid(&self) -> Option<i32> {
         // The connected peer's `owner_pid` — i.e. the process on the other end.
         // Release our own lock before taking the peer's to avoid holding both.
@@ -886,6 +1007,15 @@ impl Socket for UnixSocketState {
         };
         let pid = peer.lock().owner_pid;
         Some(pid)
+    }
+
+    fn passcred(&self) -> bool {
+        self.inner.lock().passcred
+    }
+
+    fn set_passcred(&self, on: bool) -> SysResult {
+        self.inner.lock().passcred = on;
+        Ok(0)
     }
 
     fn send_fds(&self, fds: Vec<Arc<dyn FileLike>>) -> SysResult {
@@ -959,6 +1089,28 @@ impl Socket for UnixSocketState {
         out
     }
 
+    fn recv_creds(&self) -> Option<[u8; 12]> {
+        let mut inner = self.inner.lock();
+        // Every record whose message has been consumed (`offset` is its first
+        // byte, so the gate is strict `<`) belongs to bytes already handed out
+        // and can never apply to a later read. The one to report is the
+        // EARLIEST of them -- Linux attaches the credentials of the first
+        // message a `recvmsg` returns -- and the rest are retired behind it.
+        let mut first = None;
+        while inner
+            .pending_creds
+            .front()
+            .is_some_and(|(offset, _)| *offset < inner.total_read)
+        {
+            let (_, rec) = inner.pending_creds.pop_front().unwrap();
+            if first.is_none() {
+                first = Some(rec);
+            }
+            inner.last_creds = Some(rec);
+        }
+        first.or(inner.last_creds)
+    }
+
     fn ioctl(&self, request: usize, arg1: usize, arg2: usize, arg3: usize) -> SysResult {
         crate::net::handle_net_ioctl(request, arg1, arg2, arg3, false)
     }
@@ -1002,16 +1154,7 @@ impl FileLike for UnixSocketState {
     }
 
     fn set_flags(&self, f: OpenFlags) -> LxResult {
-        let mut inner = self.inner.lock();
-        inner
-            .flags
-            .set(OpenFlags::APPEND, f.contains(OpenFlags::APPEND));
-        inner
-            .flags
-            .set(OpenFlags::NON_BLOCK, f.contains(OpenFlags::NON_BLOCK));
-        inner
-            .flags
-            .set(OpenFlags::CLOEXEC, f.contains(OpenFlags::CLOEXEC));
+        self.inner.lock().flags.take_settable(f);
         Ok(())
     }
 
@@ -1058,6 +1201,30 @@ impl FileLike for UnixSocketState {
         })
     }
 
+    fn readiness_seq(&self, events: PollEvents) -> Option<u64> {
+        let mask = crate::fs::poll_events_to_bus_mask(events);
+        Some(self.inner.lock().eventbus.seq_for(mask))
+    }
+
+    fn subscribe_edge(
+        &self,
+        events: PollEvents,
+        waker: &core::task::Waker,
+        seen: u64,
+    ) -> Option<crate::sync::ReadinessSub> {
+        let mask = crate::fs::poll_events_to_bus_mask(events);
+        let id = self.inner.lock().eventbus.subscribe_edge(mask, waker, seen);
+        Some(match id {
+            Some(id) => {
+                let inner = self.inner.clone();
+                crate::sync::ReadinessSub::new(Box::new(move || {
+                    inner.lock().eventbus.unsubscribe(id);
+                }))
+            }
+            None => crate::sync::ReadinessSub::noop(),
+        })
+    }
+
     async fn async_poll(&self, events: PollEvents) -> LxResult<PollStatus> {
         // Event-driven readiness: stay Pending with a waker parked on the
         // socket's eventbus until a requested event (or EOF/close) holds, then
@@ -1090,6 +1257,198 @@ impl FileLike for UnixSocketState {
 mod tests {
     use super::*;
     use alloc::string::String;
+
+    /// `SIOCINQ`/`FIONREAD` on a listening socket is `EINVAL`.
+    #[test]
+    fn a_listening_socket_reports_is_listening() {
+        let s = UnixSocketState::new();
+        assert!(!Socket::is_listening(&*s));
+        Socket::bind(&*s, Endpoint::Unix(String::from("/tmp/inq.sock"))).unwrap();
+        Socket::listen(&*s).unwrap();
+        assert!(Socket::is_listening(&*s));
+    }
+
+    /// FIOASYNC / F_SETFL(O_ASYNC) used to "succeed" on sockets while the
+    /// hand-rolled `set_flags` never copied the bit — same silent lie as
+    /// the missing ASYNC in take_settable before that was fixed.
+    #[test]
+    fn set_flags_keeps_o_async_on_a_socket() {
+        let s = UnixSocketState::new();
+        assert!(!s.flags().contains(OpenFlags::ASYNC));
+        let mut f = s.flags();
+        f.set(OpenFlags::ASYNC, true);
+        s.set_flags(f).unwrap();
+        assert!(
+            s.flags().contains(OpenFlags::ASYNC),
+            "O_ASYNC must survive set_flags so F_GETFL can see it"
+        );
+        f.set(OpenFlags::ASYNC, false);
+        s.set_flags(f).unwrap();
+        assert!(!s.flags().contains(OpenFlags::ASYNC));
+    }
+
+    /// A credential record only comes out once the bytes it was stamped on
+    /// have been read, the earliest applicable one is the one reported, and a
+    /// `recvmsg` that reads nothing new still gets the last answer -- the same
+    /// byte/ancillary synchronization `pending_fds` uses.
+    #[test]
+    fn credentials_follow_the_bytes_they_were_stamped_on() {
+        let s = UnixSocketState::new();
+        let first = [1u8; 12];
+        let second = [2u8; 12];
+        {
+            let mut inner = s.inner.lock();
+            // Two messages of four bytes each, as `write` would tag them: the
+            // offset is the index of the message's FIRST byte.
+            inner.pending_creds.push_back((0, first));
+            inner.pending_creds.push_back((4, second));
+            inner.total_written = 8;
+        }
+        assert_eq!(
+            Socket::recv_creds(&*s),
+            None,
+            "nothing has been read yet, so no message's credentials are due"
+        );
+        s.inner.lock().total_read = 4;
+        assert_eq!(
+            Socket::recv_creds(&*s),
+            Some(first),
+            "only the first message's bytes are consumed"
+        );
+        assert_eq!(
+            Socket::recv_creds(&*s),
+            Some(first),
+            "a read that advances nothing keeps the connection's last answer"
+        );
+        s.inner.lock().total_read = 8;
+        assert_eq!(Socket::recv_creds(&*s), Some(second));
+        assert!(s.inner.lock().pending_creds.is_empty());
+    }
+
+    /// `listen` / `accept` on `SOCK_DGRAM` is `EOPNOTSUPP` (`unix_listen` /
+    /// `unix_accept`). They used to succeed (listen) or hang (accept).
+    #[test]
+    fn listen_and_accept_refuse_datagram() {
+        let s = UnixSocketState::new();
+        s.set_socket_type(SocketType::SOCK_DGRAM);
+        Socket::bind(&*s, Endpoint::Unix(String::from("/tmp/dgram.sock"))).unwrap();
+        assert_eq!(Socket::listen(&*s), Err(LxError::EOPNOTSUPP));
+    }
+
+    #[async_std::test]
+    async fn accept_on_datagram_is_eopnotsupp() {
+        let s = UnixSocketState::new();
+        s.set_socket_type(SocketType::SOCK_DGRAM);
+        assert_eq!(Socket::accept(&*s).await.err(), Some(LxError::EOPNOTSUPP));
+    }
+
+    /// `listen` without `bind` must be `EINVAL` (`unix_listen`: no local
+    /// address). It used to mark the socket listening with an empty path.
+    #[test]
+    fn listen_without_bind_is_einval() {
+        let s = UnixSocketState::new();
+        assert_eq!(Socket::listen(&*s), Err(LxError::EINVAL));
+        Socket::bind(&*s, Endpoint::Unix(String::from("/tmp/listen.sock"))).unwrap();
+        assert!(Socket::listen(&*s).is_ok());
+        assert!(s.is_listening());
+    }
+
+    /// Unbound `getsockname` must succeed with an empty path (`unix_getname`
+    /// returns just `AF_UNIX`). `endpoint()` used to yield `None` → `EINVAL`.
+    #[test]
+    fn unbound_endpoint_is_empty_unix_not_none() {
+        let s = UnixSocketState::new();
+        match s.endpoint() {
+            Some(Endpoint::Unix(p)) => assert!(p.is_empty(), "unnamed: empty path"),
+            other => panic!("expected Some(Unix(\"\")), got {:?}", other),
+        }
+        Socket::bind(&*s, Endpoint::Unix(String::from("/tmp/named.sock"))).unwrap();
+        match s.endpoint() {
+            Some(Endpoint::Unix(p)) => assert_eq!(p, "/tmp/named.sock"),
+            other => panic!("expected Some(Unix(/tmp/named.sock)), got {:?}", other),
+        }
+    }
+
+    /// `SO_PASSCRED` is off until someone asks for it, it survives being asked
+    /// for, and it is PER END: chromium's browser turns it on for its own end
+    /// of the pair and never touches the end it hands to the zygote, so a flag
+    /// that leaked across would have the child's `recvmsg` carrying
+    /// credentials nobody asked it to carry.
+    #[test]
+    fn passcred_is_off_by_default_and_belongs_to_one_end() {
+        let mine = UnixSocketState::new();
+        let theirs = UnixSocketState::new();
+        UnixSocketState::connect_pair(&mine, &theirs);
+        assert!(!Socket::passcred(&*mine));
+        assert!(!Socket::passcred(&*theirs));
+
+        assert_eq!(Socket::set_passcred(&*mine, true), Ok(0));
+        assert!(Socket::passcred(&*mine));
+        assert!(
+            !Socket::passcred(&*theirs),
+            "the peer never asked for credentials"
+        );
+
+        // And it can be turned back off, which is what a zero `optval` means.
+        assert_eq!(Socket::set_passcred(&*mine, false), Ok(0));
+        assert!(!Socket::passcred(&*mine));
+    }
+
+    /// `SO_TYPE` must report what `socket`/`socketpair` asked for. The default
+    /// is STREAM; DGRAM/SEQPACKET survive `set_socket_type`.
+    #[test]
+    fn socket_type_reports_what_was_asked_for() {
+        let s = UnixSocketState::new();
+        assert_eq!(Socket::socket_type(&*s), Some(SocketType::SOCK_STREAM));
+        s.set_socket_type(SocketType::SOCK_DGRAM);
+        assert_eq!(Socket::socket_type(&*s), Some(SocketType::SOCK_DGRAM));
+        s.set_socket_type(SocketType::SOCK_SEQPACKET);
+        assert_eq!(Socket::socket_type(&*s), Some(SocketType::SOCK_SEQPACKET));
+    }
+
+    /// A second `bind` on an already-bound socket is `EINVAL` (`unix_bind`).
+    /// It used to overwrite the path and leave the first registry entry.
+    #[test]
+    fn binding_twice_is_einval() {
+        let s = UnixSocketState::new();
+        Socket::bind(&*s, Endpoint::Unix(String::from("/tmp/once.sock"))).unwrap();
+        assert_eq!(
+            Socket::bind(&*s, Endpoint::Unix(String::from("/tmp/twice.sock"))),
+            Err(LxError::EINVAL)
+        );
+        assert_eq!(s.bound_path(), "/tmp/once.sock");
+    }
+
+    /// `accept` on a socket that never listened is `EINVAL`. It used to
+    /// wait (or `EAGAIN`) as if a queue existed.
+    #[async_std::test]
+    async fn accept_without_listen_is_einval() {
+        let s = UnixSocketState::new();
+        assert_eq!(Socket::accept(&*s).await.err(), Some(LxError::EINVAL));
+        Socket::bind(&*s, Endpoint::Unix(String::from("/tmp/accept.sock"))).unwrap();
+        // Bound but not listening is still EINVAL.
+        assert_eq!(Socket::accept(&*s).await.err(), Some(LxError::EINVAL));
+    }
+
+    /// A second `connect` on an already-wired or listening socket is
+    /// `EISCONN`. It used to rewire the peer and queue another accept.
+    #[test]
+    fn a_second_connect_is_eisconn() {
+        let fresh = UnixSocketState::new();
+        assert!(fresh.may_connect().is_ok());
+        let (a, b) = (UnixSocketState::new(), UnixSocketState::new());
+        UnixSocketState::connect_pair(&a, &b);
+        assert_eq!(a.may_connect(), Err(LxError::EISCONN));
+        assert!(a.is_connected());
+        let listener = UnixSocketState::new();
+        Socket::bind(
+            &*listener,
+            Endpoint::Unix(String::from("/tmp/eisconn.sock")),
+        )
+        .unwrap();
+        Socket::listen(&*listener).unwrap();
+        assert_eq!(listener.may_connect(), Err(LxError::EISCONN));
+    }
 
     /// Reproduces the X11 connection-setup race: an X client writes its first
     /// bytes (the connection setup) immediately after `connect()`, before the
@@ -1343,6 +1702,47 @@ mod tests {
             }
             other => panic!("POLLOUT expected Ready(write), got {:?}", other),
         }
+    }
+
+    /// `POLLRDNORM` alone is the streams spelling of "readable". Using
+    /// `contains(IN)` made `want_read` false, so the
+    /// `(!want_read && !want_write)` fallback answered Ready on an empty
+    /// socket — the wait never blocked.
+    #[test]
+    fn poll_rdnorm_empty_connected_stays_pending() {
+        use core::task::{RawWaker, RawWakerVTable, Waker};
+
+        fn raw(ptr: *const ()) -> RawWaker {
+            fn clone(ptr: *const ()) -> RawWaker {
+                raw(ptr)
+            }
+            fn wake(_: *const ()) {}
+            fn wake_by_ref(_: *const ()) {}
+            fn drop(_: *const ()) {}
+            RawWaker::new(ptr, &RawWakerVTable::new(clone, wake, wake_by_ref, drop))
+        }
+
+        let a = UnixSocketState::new();
+        let b = UnixSocketState::new();
+        UnixSocketState::connect_pair(&a, &b);
+        let waker = unsafe { Waker::from_raw(raw(core::ptr::null())) };
+        let mut cx = Context::from_waker(&waker);
+        let mut fut = UnixPollWait {
+            sock: &a,
+            events: PollEvents::RDNORM,
+            sub_id: None,
+        };
+        match Pin::new(&mut fut).poll(&mut cx) {
+            Poll::Pending => {}
+            Poll::Ready(Ok(_)) => {
+                panic!("POLLRDNORM on empty connected socket must be Pending, not Ready")
+            }
+            Poll::Ready(Err(e)) => panic!("unexpected err {:?}", e),
+        }
+        assert!(
+            fut.sub_id.is_some(),
+            "RDNORM waiter must park on READABLE like IN"
+        );
     }
 
     /// `unix_stream_read_generic`: `if (sk->sk_state != TCP_ESTABLISHED)
@@ -1860,5 +2260,111 @@ mod write_room_tests {
         Socket::write(&*a, b"hola", None).unwrap();
         a.retract_fds();
         assert_eq!(b.inner.lock().pending_fds.len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod edge_direction_tests {
+    //! An edge-triggered `epoll` entry must not be re-armed by a publication
+    //! in a direction it never asked about.
+    //!
+    //! `edge_step` takes an fd's publication counter whole, and
+    //! `readiness_seq` hands it the whole **bus**: one counter shared by
+    //! READABLE and WRITABLE. A producer that publishes only WRITABLE moves
+    //! the counter an `EPOLLET | EPOLLIN` entry is watching, and the next
+    //! scan reports the same readable level `epoll_wait` already handed out.
+    //!
+    //! A unix stream socket does exactly that on the one path that matters
+    //! under load: a reader draining a **full** queue pulses WRITABLE on its
+    //! peer's bus ([`pulse_writable`]) to wake a writer parked on room.
+    //! Nothing about the peer's own receive queue changed.
+
+    use super::*;
+    use crate::fs::{Epoll, EpollEvent};
+    /// `EPOLLET`, which `fs::epoll` keeps private.
+    const EPOLLET: u32 = 1 << 31;
+    use crate::fs::FileLike;
+    use alloc::sync::Arc;
+    use core::future::Future;
+    use core::task::{Context, Poll, Waker};
+
+    const IN: u32 = PollEvents::IN.bits() as u32;
+    const ADD: i32 = 1;
+
+    struct Nop;
+    impl alloc::task::Wake for Nop {
+        fn wake(self: Arc<Self>) {}
+    }
+
+    fn wait_now(ep: &Epoll) -> Vec<(u32, u64)> {
+        let waker = Waker::from(Arc::new(Nop));
+        let mut cx = Context::from_waker(&waker);
+        let mut fut = alloc::boxed::Box::pin(ep.wait(16, 0));
+        match fut.as_mut().poll(&mut cx) {
+            Poll::Ready(r) => r.unwrap().iter().map(|e| (e.events, e.data)).collect(),
+            Poll::Pending => panic!("a zero-timeout wait finishes at once"),
+        }
+    }
+
+    #[test]
+    fn a_writable_only_pulse_does_not_re_report_an_already_reported_readable_level() {
+        let a = UnixSocketState::new();
+        let b = UnixSocketState::new();
+        UnixSocketState::connect_pair(&a, &b);
+
+        // A has ten bytes waiting, and never reads them.
+        Socket::write(&*b, b"0123456789", None).unwrap();
+        // Fill B's queue: a drain from full is the one that pulses A's bus.
+        let chunk = alloc::vec![0u8; 256 * 1024];
+        while b.inner.lock().buffer.len() < UNIX_STREAM_BUF_MAX {
+            match Socket::write(&*a, &chunk, None) {
+                Ok(n) if n > 0 => {}
+                _ => break,
+            }
+        }
+        assert_eq!(
+            b.inner.lock().buffer.len(),
+            UNIX_STREAM_BUF_MAX,
+            "the drain must be a drain from full, the only one that pulses"
+        );
+
+        let ep = Epoll::new(OpenFlags::empty());
+        ep.ctl(
+            ADD,
+            crate::fs::FileDesc::from(3),
+            EpollEvent {
+                events: IN | EPOLLET,
+                data: 7,
+            },
+            Some(a.clone()),
+        )
+        .unwrap();
+
+        assert_eq!(wait_now(&ep), alloc::vec![(IN, 7)], "the first edge");
+        assert!(
+            wait_now(&ep).is_empty(),
+            "a level nobody republished is quiet: that is what EPOLLET means"
+        );
+
+        // B drains one byte of its full queue. A's ten bytes are untouched.
+        let seq_before = a.readiness_seq(PollEvents::IN);
+        let mut buf = [0u8; 1];
+        async_std::task::block_on(Socket::read(&*b, &mut buf))
+            .0
+            .unwrap();
+        assert_eq!(
+            a.inner.lock().buffer.len(),
+            10,
+            "A's receive queue did not change"
+        );
+
+        assert!(
+            wait_now(&ep).is_empty(),
+            "a WRITABLE-only pulse (A's seq {:?} -> {:?}) re-armed an \
+             EPOLLIN|EPOLLET entry and re-reported a level epoll_wait had \
+             already handed out",
+            seq_before,
+            a.readiness_seq(PollEvents::IN)
+        );
     }
 }

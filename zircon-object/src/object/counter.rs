@@ -8,7 +8,9 @@ pub struct Counter {
 
 impl_kobject!(Counter
     fn allowed_signals(&self) -> Signal {
-        Signal::USER_ALL | Signal::SIGNALED
+        // USER_ALL only: SIGNALED is for Event/EventPair. COUNTER_POSITIVE /
+        // NON_POSITIVE are kernel-owned (via `signal_change`), not object_signal.
+        Signal::USER_ALL
     }
 );
 
@@ -101,5 +103,14 @@ mod tests {
         assert!(!counter
             .allowed_signals()
             .intersects(Signal::COUNTER_POSITIVE | Signal::COUNTER_NON_POSITIVE));
+    }
+
+    #[test]
+    fn object_signal_cannot_assert_signaled_on_a_counter() {
+        // SIGNALED used to be in allowed_signals (copied from Event).
+        assert!(
+            !Counter::new().allowed_signals().contains(Signal::SIGNALED),
+            "SIGNALED is for Event, not Counter"
+        );
     }
 }

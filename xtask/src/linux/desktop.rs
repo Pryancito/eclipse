@@ -63,7 +63,6 @@ pub fn install(rootfs: &Path) {
     write_eclipse_tz(rootfs);
     write_eclipse_look(rootfs);
     write_kde_helpers(rootfs);
-    write_kde_session(rootfs);
 }
 
 /// `/usr/local/bin/eclipse-xkbmap`: load the X keyboard map into Xwayland once
@@ -763,23 +762,20 @@ fn write_eclipse_look(rootfs: &Path) {
     fs::write(
         &script,
         b"#!/bin/sh\n\
-          # Eclipse OS: desktop look. eclipse = violet, kde = Breeze Dark and\n\
-          # win11 = Windows 11, all three drawn by lunarbar; plasma = the same\n\
-          # Breeze window theme with KDE's OWN shell (plasmashell) as the\n\
-          # panel instead of lunarbar. See docs/README-desktop.md.\n\
+          # Eclipse OS: desktop look (kde = KDE Breeze Dark, eclipse = violet).\n\
           CONF=/etc/eclipse/look\n\
           CFG=\"${HOME:-/root}/.config\"\n\
           RC=\"$CFG/labwc/rc.xml\"\n\
           LOG=\"${HOME:-/root}/.eclipse-look.log\"\n\
           \n\
           look_ok() {\n\
-          \x20 case \"$1\" in win11|kde|eclipse|plasma) return 0 ;; *) return 1 ;; esac\n\
+          \x20 case \"$1\" in win11|kde|eclipse) return 0 ;; *) return 1 ;; esac\n\
           }\n\
           \n\
           theme_for() {\n\
           \x20 case \"$1\" in\n\
           \x20 win11) echo Win11-Dark ;;\n\
-          \x20 kde|plasma) echo Breeze-Dark ;;\n\
+          \x20 kde) echo Breeze-Dark ;;\n\
           \x20 *) echo Eclipse-Dark ;;\n\
           \x20 esac\n\
           }\n\
@@ -790,11 +786,7 @@ fn write_eclipse_look(rootfs: &Path) {
           \x20   { sub(/\\r$/, \"\") }\n\
           \x20   /^[[:space:]]*#/ { next }\n\
           \x20   /^[[:space:]]*look[[:space:]]*=/ {\n\
-          # Trailing comment first, then whitespace: without the first step\n\
-          # `look=plasma # nota` squeezes down to `plasma#nota` and matches\n\
-          # nothing, which reads as a look that was set and did not take.\n\
-          \x20     sub(/^[^=]*=/, \"\"); sub(/#.*$/, \"\")\n\
-          \x20     gsub(/[[:space:]]/, \"\"); print; exit\n\
+          \x20     sub(/^[^=]*=/, \"\"); gsub(/[[:space:]]/, \"\"); print; exit\n\
           \x20   }\n\
           \x20 ' \"$CONF\"\n\
           }\n\
@@ -842,31 +834,15 @@ fn write_eclipse_look(rootfs: &Path) {
           \x20   elif [ -x /usr/bin/labwc ]; then\n\
           \x20     /usr/bin/labwc --reconfigure >>\"$LOG\" 2>&1 || true\n\
           \x20   fi\n\
-          # The panel and the wallpaper read /etc/eclipse/look once at\n\
-          # start; eclipse-init respawns both with the new look immediately.\n\
-          # Three names for the panel and two for the wallpaper, because each\n\
-          # service runs whichever binary the look asked for, and a switch\n\
-          # between them only takes effect on that respawn.\n\
+          # The panel reads /etc/eclipse/look once at start; eclipse-init\n\
+          # respawns it with the new look immediately.\n\
           \x20   pkill -x lunarbar 2>/dev/null || true\n\
-          \x20   pkill -x plasmashell 2>/dev/null || true\n\
-          # `-x lunarbg` catches it while it paints (the wrapper exec's it,\n\
-          # so by then the name is lunarbg); the second catches the wrapper\n\
-          # parked under look=plasma, which never exec'd anything and so is\n\
-          # still `sh /usr/local/bin/eclipse-lunarbg`. The pattern is the\n\
-          # FULL path, not the basename: busybox pkill -f matches a substring\n\
-          # of the whole command line as a regex, so a bare `eclipse-lunarbg`\n\
-          # would also hit anything that merely mentions it -- an editor, a\n\
-          # `tail` on its log, a shell reading the script. Neither pattern\n\
-          # matches this script (its own cmdline is eclipse-look) nor the\n\
-          # panel's (eclipse-lunarbar does not contain eclipse-lunarbg).\n\
-          \x20   pkill -x lunarbg 2>/dev/null || true\n\
-          \x20   pkill -f /usr/local/bin/eclipse-lunarbg 2>/dev/null || true\n\
           \x20 fi\n\
           \x20 echo \"[$(date '+%H:%M:%S')] look=$look theme=$theme boot=$boot\" >>\"$LOG\"\n\
           }\n\
           \n\
           usage() {\n\
-          \x20 echo \"usage: eclipse-look [win11|kde|eclipse|plasma|--boot]\" >&2\n\
+          \x20 echo \"usage: eclipse-look [win11|kde|eclipse|--boot]\" >&2\n\
           \x20 exit 2\n\
           }\n\
           \n\
@@ -878,7 +854,7 @@ fn write_eclipse_look(rootfs: &Path) {
           \x20 current\n\
           \x20 exit 0\n\
           \x20 ;;\n\
-          win11|kde|eclipse|plasma)\n\
+          win11|kde|eclipse)\n\
           \x20 apply \"$1\"\n\
           \x20 echo \"$1\"\n\
           \x20 ;;\n\
@@ -899,8 +875,8 @@ fn write_eclipse_look(rootfs: &Path) {
 /// binary behind it here:
 ///   * `eclipse-run`   -- Alt+Space / Alt+F2 / Ctrl+Alt+Del: `lunarrun`, the
 ///     native KRunner stand-in (krunner itself is a D-Bus service).
-///   * `eclipse-files` -- Super+E: Dolphin when the KDE set was built in,
-///     else the best TUI file manager installed, else a shell in $HOME.
+///   * `eclipse-files` -- Super+E: no Dolphin (no Qt/KF6 in the image), so the
+///     best TUI file manager installed, else a shell in $HOME.
 ///   * `eclipse-showdesktop` -- Super+D: minimise/restore every window through
 ///     wlr-foreign-toplevel-management (`lunarrun --toggle-desktop`), which
 ///     works on every labwc release regardless of its action list.
@@ -942,16 +918,11 @@ fn write_kde_helpers(rootfs: &Path) {
     fs::write(
         &files,
         b"#!/bin/sh\n\
-          # Eclipse OS: KDE's Super+E (file manager). Dolphin is in the image\n\
-          # now (Qt 6 and KF6 ship with the KDE set), so it goes first and the\n\
-          # key does what it does on KDE. It is still only best-effort --\n\
-          # `apk` is, and ECLIPSE_KDE=0 takes it out -- so the text file\n\
-          # managers stay as the fallback, and a shell in the home directory\n\
-          # behind them, which is what the key is really for.\n\
+          # Eclipse OS: KDE's Super+E (file manager). Dolphin needs Qt + KF6,\n\
+          # neither of which is in this image, so run the best file manager\n\
+          # that IS installed inside a terminal; failing that, a shell in the\n\
+          # home directory, which is what the key is really for.\n\
           DIR=\"${1:-${HOME:-/root}}\"\n\
-          if command -v dolphin >/dev/null 2>&1; then\n\
-          \x20 exec dolphin \"$DIR\"\n\
-          fi\n\
           for fm in mc nnn lf ranger vifm; do\n\
           \x20 if command -v \"$fm\" >/dev/null 2>&1; then\n\
           \x20   exec /usr/local/bin/eclipse-terminal \"$fm\" \"$DIR\"\n\
@@ -1349,10 +1320,30 @@ fn write_firefox_wrapper(rootfs: &Path) {
           export MOZ_DISABLE_GPU_SANDBOX=1\n\
           export MOZ_DISABLE_SOCKET_PROCESS_SANDBOX=1\n\
           # GPU WebRender when NVIDIA + nouveau_uapi and not forced to pixman;\n\
-          # otherwise software (QEMU / no GPU / nvidia.wlr_pixman).\n\
+          # otherwise software (QEMU / no GPU / nvidia.wlr_pixman, or the labwc\n\
+          # wrapper fell back to pixman because the GPU renderer failed to init).\n\
+          #\n\
+          # And only when NVK really exposes the GPU. Zink takes ANY Vulkan\n\
+          # device, and lavapipe (mesa-vulkan-swrast) is installed as the\n\
+          # floor for Xwayland's glamor. So with NVK unusable, the GPU path\n\
+          # silently became GL on zink on lavapipe -- GL_RENDERER 'zink Vulkan\n\
+          # 1.4(llvmpipe ...)', seen on the RTX -- slower than software\n\
+          # WebRender, and Firefox logs a GraphicsCriticalError 'Couldn't\n\
+          # sanitize GL_RENDERER' for every window. So pin the Vulkan loader to\n\
+          # NVK's manifest alone, and ask vulkaninfo (vulkan-tools) whether NVK\n\
+          # enumerates a device before taking the GPU path at all.\n\
+          NVK_ICD=\n\
+          for f in /usr/share/vulkan/icd.d/nouveau_icd.*.json; do\n\
+          \x20 [ -r \"$f\" ] && { NVK_ICD=$f; break; }\n\
+          done\n\
           if grep -q 'nvidia\\.nouveau_uapi' /proc/cmdline 2>/dev/null && \\\n\
           \x20\x20 [ \"$(tr -d '[:space:]' < /sys/class/drm/card0/device/vendor 2>/dev/null)\" = \"0x10de\" ] && \\\n\
-          \x20\x20 ! grep -q 'nvidia\\.wlr_pixman' /proc/cmdline 2>/dev/null; then\n\
+          \x20\x20 ! grep -q 'nvidia\\.wlr_pixman' /proc/cmdline 2>/dev/null && \\\n\
+          \x20\x20 [ ! -e /run/labwc-renderer-fallback ] && [ -n \"$NVK_ICD\" ] && \\\n\
+          \x20\x20 { ! command -v vulkaninfo >/dev/null 2>&1 || \\\n\
+          \x20\x20\x20 VK_DRIVER_FILES=\"$NVK_ICD\" VK_ICD_FILENAMES=\"$NVK_ICD\" \\\n\
+          \x20\x20\x20 vulkaninfo --summary 2>/dev/null | grep -q 'PHYSICAL_DEVICE_TYPE_DISCRETE_GPU\\|PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU'; }; then\n\
+          \x20 export VK_DRIVER_FILES=\"$NVK_ICD\" VK_ICD_FILENAMES=\"$NVK_ICD\"\n\
           \x20 export GALLIUM_DRIVER=\"${GALLIUM_DRIVER:-zink}\"\n\
           \x20 export MESA_LOADER_DRIVER_OVERRIDE=\"${MESA_LOADER_DRIVER_OVERRIDE:-zink}\"\n\
           \x20 unset LIBGL_ALWAYS_SOFTWARE MOZ_WEBRENDER_SOFTWARE 2>/dev/null\n\
@@ -1362,6 +1353,11 @@ fn write_firefox_wrapper(rootfs: &Path) {
           \x20 export LIBGL_ALWAYS_SOFTWARE=1\n\
           \x20 export MOZ_WEBRENDER_SOFTWARE=1\n\
           \x20 export MOZ_ACCELERATED=0\n\
+          \x20 # An NVK-less GPU session lands here too; log why, once per launch.\n\
+          \x20 if grep -q 'nvidia\\.nouveau_uapi' /proc/cmdline 2>/dev/null && \\\n\
+          \x20\x20\x20 [ ! -e /run/labwc-renderer-fallback ]; then\n\
+          \x20\x20 NVK_SW_REASON='NVK exposes no GPU (vulkaninfo); software WebRender instead of zink on lavapipe'\n\
+          \x20 fi\n\
           fi\n\
           export MOZ_CRASHREPORTER_DISABLE=1\n\
           export NO_AT_BRIDGE=1\n\
@@ -1379,6 +1375,7 @@ fn write_firefox_wrapper(rootfs: &Path) {
           \x20 exit 127\n\
           fi\n\
           echo \"[$(date '+%H:%M:%S')] $FFBIN $* (WAYLAND_DISPLAY=${WAYLAND_DISPLAY:-UNSET} GL=${GALLIUM_DRIVER:-sw} ACCEL=${MOZ_ACCELERATED:-?})\" >>\"$FLOG\"\n\
+          [ -n \"${NVK_SW_REASON:-}\" ] && echo \"eclipse-firefox: $NVK_SW_REASON\" >>\"$FLOG\"\n\
           exec \"$FFBIN\" \"$@\" 2>>\"$FLOG\"\n",
     )
     .unwrap();
@@ -1417,6 +1414,16 @@ fn write_firefox_wrapper(rootfs: &Path) {
 /// saturated, the thread that drains the socket runs late and QUIC's packets
 /// are dropped at the socket, which QUIC reads as congestion and slows down.
 /// HTTP/2 over TCP carries the same streams without that cliff.
+///
+/// The last block is what Firefox does on its own at start-up. The QEMU root
+/// is a RAM image loaded fresh at every boot, so the profile never survives
+/// and EVERY launch is a first run: the privacy-notice tab, about:welcome,
+/// telemetry, Normandy and a prelaunched spare content process all ran each
+/// time, and Firefox sat at 50-80% of the six CPUs with nothing open. Safe
+/// Browsing and site isolation (Fission) stay on: they are protection, not
+/// overhead to trim here. (`MOZ_FORCE_DISABLE_E10S` in the wrapper does not
+/// help: an official build ignores it unless non-local connections are
+/// disabled, see `BrowserTabsRemoteAutostart` in `nsAppRunner.cpp`.)
 ///
 /// Both package names are covered because `firefox` and `firefox-esr` are
 /// separate Alpine packages with separate install dirs (see the wrapper).
@@ -1467,7 +1474,30 @@ pub fn write_firefox_default_prefs(rootfs: &Path) {
               pref(\"network.http.http3.enable\", false);\n\
               // Session store less often: each write is msync + profile IO on\n\
               // a RAM rootfs that still pays the syscall path.\n\
-              pref(\"browser.sessionstore.interval\", 60000);\n",
+              pref(\"browser.sessionstore.interval\", 60000);\n\
+              // The QEMU root is a RAM image loaded fresh at every boot, so\n\
+              // every launch is a first run. Skip the first-run pages (the\n\
+              // privacy notice, about:welcome, the what's-new page) and the\n\
+              // default-browser check: each is a page load on a CPU-only\n\
+              // renderer before the user has opened anything.\n\
+              pref(\"datareporting.policy.dataSubmissionPolicyBypassNotification\", true);\n\
+              pref(\"datareporting.policy.firstRunURL\", \"\");\n\
+              pref(\"browser.aboutwelcome.enabled\", false);\n\
+              pref(\"browser.startup.homepage_override.mstone\", \"ignore\");\n\
+              pref(\"browser.shell.checkDefaultBrowser\", false);\n\
+              // Background work that runs whether or not a page is open:\n\
+              // telemetry collection and upload, Normandy studies, and the\n\
+              // Pocket stories feed on the new-tab page.\n\
+              pref(\"datareporting.healthreport.uploadEnabled\", false);\n\
+              pref(\"toolkit.telemetry.unified\", false);\n\
+              pref(\"toolkit.telemetry.archive.enabled\", false);\n\
+              pref(\"app.normandy.enabled\", false);\n\
+              pref(\"app.shield.optoutstudies.enabled\", false);\n\
+              pref(\"browser.newtabpage.activity-stream.feeds.section.topstories\", false);\n\
+              // No spare content process launched ahead of time: here a new\n\
+              // process is a full fork+exec that maps libxul and starts a JS\n\
+              // engine, so a spare costs seconds of CPU at every launch.\n\
+              pref(\"dom.ipc.processPrelaunch.enabled\", false);\n",
         )
         .unwrap();
     }
@@ -2339,9 +2369,9 @@ fn write_labwc_rc(rootfs: &Path) {
     <keybind key="A-space"><action name="Execute"><command>/usr/local/bin/eclipse-run</command></action></keybind>
     <keybind key="A-F2"><action name="Execute"><command>/usr/local/bin/eclipse-run</command></action></keybind>
     <keybind key="C-A-Delete"><action name="Execute"><command>/usr/local/bin/eclipse-run</command></action></keybind>
-    <!-- Super+E: KDE's file manager key. eclipse-files opens Dolphin when
-         it is installed, and otherwise the best text file manager there is,
-         or a shell in $HOME. -->
+    <!-- Super+E: KDE's file manager key. No Dolphin here (Qt/KF6 are not in
+         the image), so eclipse-files opens the best text file manager
+         installed, or a shell in $HOME. -->
     <keybind key="W-E"><action name="Execute"><command>/usr/local/bin/eclipse-files</command></action></keybind>
     <!-- Super+D: show desktop. labwc has no such action on every release, so
          this minimises (or restores) every window through
@@ -2484,10 +2514,9 @@ const MENU_EN: &[u8] = br#"<?xml version="1.0" encoding="UTF-8"?>
 fn write_labwc_environment(rootfs: &Path) {
     let cfg = rootfs.join("root/.config/labwc");
     let _ = fs::create_dir_all(&cfg);
-    // Built as a String rather than written as one literal: the last line
-    // depends on whether KDE was built into this image (see below).
-    let mut env = String::from(
-        "# Eclipse OS - env for the labwc session (sourced by labwc itself).\n\
+    fs::write(
+        cfg.join("environment"),
+        b"# Eclipse OS - env for the labwc session (sourced by labwc itself).\n\
           # PATH first: the per-VT console shells do NOT source /etc/profile,\n\
           # so a labwc launched from one inherits a PATH without\n\
           # /usr/local/bin - bypassing the labwc wrapper and making keybinds\n\
@@ -2564,31 +2593,22 @@ fn write_labwc_environment(rootfs: &Path) {
           # the connect is refused at once and apps carry on bus-less; a\n\
           # dbus-daemon bound to this path later is picked up automatically.\n\
           DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/0/bus\n\
-          # Qt: native Wayland first, Xwayland as fallback. The\n\
-          # renderer-dependent half (QT_QUICK_BACKEND=software on pixman) is\n\
-          # exported by the labwc wrapper, like SDL's, and so is\n\
-          # QT_QPA_PLATFORMTHEME -- deliberately NOT here, because naming the\n\
-          # `kde` theme is only right when plasma-integration really landed,\n\
-          # and a name with no plugin behind it makes every Qt app warn at\n\
-          # startup. The wrapper looks for the plugin file and decides.\n\
+          # Qt, for the KDE look: native Wayland first, Xwayland as fallback.\n\
+          # The renderer-dependent half (QT_QUICK_BACKEND=software on pixman)\n\
+          # is exported by the labwc wrapper, like SDL's. NOT set here:\n\
+          # QT_QPA_PLATFORMTHEME=kde and XDG_CURRENT_DESKTOP=KDE, which the\n\
+          # usual \"KDE on labwc\" recipes recommend -- the first needs the\n\
+          # plasma-integration plugin and the second makes portals and GTK\n\
+          # look for a KDE session that is not there. Neither exists in this\n\
+          # image, so both only produce warnings and wrong lookups.\n\
           QT_QPA_PLATFORM=wayland;xcb\n\
           QT_AUTO_SCREEN_SCALE_FACTOR=1\n\
-          # Desktop identity, for .desktop OnlyShowIn/NotShowIn filtering, for\n\
-          # xdg-desktop-portal's backend choice, and for any app that asks.\n\
-          # This IS a wlroots session whatever it looks like, so labwc:wlroots\n\
-          # is always in the list; KDE goes in FRONT of it only when the KDE\n\
-          # set was actually built into this image, because the first entry is\n\
-          # the portal backend the session asks for and a name with no\n\
-          # kde.portal behind it is a file dialog that falls back silently.\n\
-          ",
-    );
-    env.push_str(if crate::linux::xorg::kde_enabled() {
-        "XDG_CURRENT_DESKTOP=KDE:labwc:wlroots\n"
-    } else {
-        "XDG_CURRENT_DESKTOP=labwc:wlroots\n"
-    });
-    env.push_str("XDG_SESSION_DESKTOP=labwc\n");
-    fs::write(cfg.join("environment"), env).unwrap();
+          # Desktop identity, for .desktop OnlyShowIn/NotShowIn filtering and\n\
+          # any app that asks: this IS a wlroots session, whatever it looks like.\n\
+          XDG_CURRENT_DESKTOP=labwc:wlroots\n\
+          XDG_SESSION_DESKTOP=labwc\n",
+    )
+    .unwrap();
 }
 
 /// Session clients used to launch from labwc's `autostart` via
@@ -2619,111 +2639,6 @@ fn write_labwc_autostart(rootfs: &Path) {
     .unwrap();
 }
 
-/// KDE proper (Qt 6 + KF6 + the KDE applications, see `KDE_PACKAGES` in
-/// `xorg.rs`): the `kded6` wrapper eclipse-init runs as a service, the
-/// palette seeding, and the `kdeglobals` every KDE app reads first.
-///
-/// These files are written whatever the build knob says. They cost a few
-/// hundred bytes, every one of them checks for its binary before doing
-/// anything, and writing them unconditionally means an image built without
-/// KDE and then `apk add`ed on the machine comes up configured.
-fn write_kde_session(rootfs: &Path) {
-    use std::os::unix::fs::PermissionsExt;
-    let localbin = rootfs.join("usr/local/bin");
-    let _ = fs::create_dir_all(&localbin);
-
-    // kdeglobals is read by every KF6 app (and by plasma-integration for Qt
-    // apps that are not KDE's). Only the choices go here: the Breeze Dark
-    // COLOURS are copied in at first boot by eclipse-kde-colors below, from
-    // the scheme the breeze package ships, rather than transcribed -- a
-    // hand-typed palette is a palette that drifts from the real one.
-    let cfg = rootfs.join("root/.config");
-    let _ = fs::create_dir_all(&cfg);
-    fs::write(
-        cfg.join("kdeglobals"),
-        b"# Eclipse OS: defaults for KDE applications (dolphin, konsole,\n\
-          # kate, okular, ...). eclipse-kde-colors appends the Breeze Dark\n\
-          # [Colors:*] groups on first boot; everything else lives here.\n\
-          [General]\n\
-          widgetStyle=Breeze\n\
-          ColorScheme=BreezeDark\n\
-          \n\
-          [Icons]\n\
-          Theme=breeze-dark\n\
-          \n\
-          [KDE]\n\
-          LookAndFeelPackage=org.kde.breezedark.desktop\n\
-          # Double click to open, like the rest of this desktop (Thunar, the\n\
-          # lunarrun launcher). KDE's own default is single click.\n\
-          SingleClick=false\n\
-          \n\
-          # KIO asks the portal for file dialogs only in a session that has\n\
-          # one; here the KDE dialog IS the backend, so ask for it directly.\n\
-          [FileDialog]\n\
-          Sorting Style=Default\n",
-    )
-    .unwrap();
-
-    // kded6: the host process for KDE's background modules. Non-GUI as a
-    // binary but it builds a QGuiApplication, so it needs the compositor,
-    // and everything it does is D-Bus, so it needs the bus. BOTH gates live
-    // in kded.service (`wait_socket` for the wayland socket, `wait_path` for
-    // the bus socket): those are init's native 10 ms stat polls, where a
-    // wait loop here would fork a busybox `sleep` per iteration -- the same
-    // trade the labwc and lunarbg wrappers already made. What is left here
-    // is the one-shot diagnose, because a `type = respawn` service that
-    // exits immediately is otherwise a silent restart storm.
-    let kded = localbin.join("eclipse-kded");
-    fs::write(
-        &kded,
-        b"#!/bin/sh\n\
-          # Eclipse OS: KDE's session daemon (kded6). Started by\n\
-          # /etc/eclipse/services/kded.service; init wires a service's stdio\n\
-          # to /dev/null, so keep our own log.\n\
-          LOG=/tmp/kded.log\n\
-          : > \"$LOG\" 2>/dev/null || true\n\
-          : \"${XDG_RUNTIME_DIR:=/run/user/0}\"; export XDG_RUNTIME_DIR\n\
-          BUS=\"$XDG_RUNTIME_DIR/bus\"\n\
-          # kded6 without a bus prints one line and exits, which under\n\
-          # respawn looks like nothing at all. Say which bus was missing.\n\
-          [ -S \"$BUS\" ] || echo \"eclipse-kded: no session bus at $BUS\" >>\"$LOG\"\n\
-          for d in /usr/bin /bin /usr/local/bin; do\n\
-          \x20 [ -x \"$d/kded6\" ] && exec \"$d/kded6\" >>\"$LOG\" 2>&1\n\
-          done\n\
-          # NOT INSTALLED: say so where it can be found, and do not spin.\n\
-          MSG='eclipse-kded: kded6 is NOT INSTALLED -- no KDE background\n\
-          services (device notifications, kscreen, ...). Fix: apk add kded,\n\
-          or rebuild without ECLIPSE_KDE=0.'\n\
-          echo \"$MSG\" >>\"$LOG\"\n\
-          echo \"$MSG\" > /dev/console 2>/dev/null || true\n\
-          sleep 60\n\
-          exit 127\n",
-    )
-    .unwrap();
-    fs::set_permissions(&kded, fs::Permissions::from_mode(0o755)).unwrap();
-
-    // The colours. `.colors` files are KConfig files whose [Colors:*] groups
-    // are exactly what kdeglobals wants, so appending the file IS the merge
-    // (KConfig folds repeated groups, last value wins). Guarded on
-    // [Colors:Window] so a palette the user changed later is never
-    // overwritten on the next boot.
-    let colors = localbin.join("eclipse-kde-colors");
-    fs::write(
-        &colors,
-        b"#!/bin/sh\n\
-          # Eclipse OS: seed kdeglobals with Breeze Dark, once. Run as a\n\
-          # oneshot service before the session's KDE clients start.\n\
-          KG=/root/.config/kdeglobals\n\
-          SRC=/usr/share/color-schemes/BreezeDark.colors\n\
-          [ -f \"$SRC\" ] || exit 0\n\
-          [ -f \"$KG\" ] || exit 0\n\
-          grep -q '^\\[Colors:Window\\]' \"$KG\" 2>/dev/null && exit 0\n\
-          { printf '\\n'; cat \"$SRC\"; } >> \"$KG\"\n",
-    )
-    .unwrap();
-    fs::set_permissions(&colors, fs::Permissions::from_mode(0o755)).unwrap();
-}
-
 /// Prefer dark GTK everywhere (file managers, editors, dialogs).
 fn write_gtk_settings(rootfs: &Path) {
     for ver in ["gtk-3.0", "gtk-4.0"] {
@@ -2751,10 +2666,6 @@ fn write_foot_config(rootfs: &Path) {
     // (a running foot keeps its colours until restarted).
     fs::write(dir.join("foot.eclipse.ini"), foot_ini(FOOT_ECLIPSE)).unwrap();
     fs::write(dir.join("foot.kde.ini"), foot_ini(FOOT_BREEZE)).unwrap();
-    // `plasma` is the KDE look with KDE's own shell, so it takes KDE's
-    // terminal palette too. Its own file rather than a special case in
-    // eclipse-look, which copies `foot.$look.ini` and nothing else.
-    fs::write(dir.join("foot.plasma.ini"), foot_ini(FOOT_BREEZE)).unwrap();
     fs::write(dir.join("foot.win11.ini"), foot_ini(FOOT_CAMPBELL)).unwrap();
     fs::write(dir.join("foot.ini"), foot_ini(FOOT_ECLIPSE)).unwrap();
 }
@@ -2925,25 +2836,17 @@ fn write_labwc_wrapper(rootfs: &Path) {
           # through Pulse so several clients share the HDA PCM.\n\
           : \"${ALSOFT_DRIVERS:=pulse,alsa}\"; export ALSOFT_DRIVERS\n\
           : \"${PULSE_SERVER:=unix:/run/pulse/native}\"; export PULSE_SERVER\n\
-          # Qt 6 policy. Native Wayland first, Xwayland as fallback, exactly\n\
-          # like SDL. Qt and KF6 ARE installed now (see KDE_PACKAGES in\n\
-          # xorg.rs), and kded6 runs as a service against the session bus.\n\
+          # Qt 5/6 policy, for the KDE look. Nothing Qt is installed today\n\
+          # (no Qt, no KF6, and no way to run Plasma itself: plasmashell,\n\
+          # kded and krunner are D-Bus services and there is no session bus\n\
+          # -- see the DBUS_SESSION_BUS_ADDRESS note below). These make a Qt\n\
+          # app behave the day one IS installed, and cost nothing until then.\n\
+          # Native Wayland first, Xwayland as fallback, exactly like SDL.\n\
+          # QT_QPA_PLATFORMTHEME is deliberately NOT set to `kde`: that plugin\n\
+          # lives in plasma-integration/KF6 and, absent, makes every Qt app\n\
+          # warn about a missing platform theme at startup.\n\
           : \"${QT_QPA_PLATFORM:=wayland;xcb}\"; export QT_QPA_PLATFORM\n\
           : \"${QT_AUTO_SCREEN_SCALE_FACTOR:=1}\"; export QT_AUTO_SCREEN_SCALE_FACTOR\n\
-          # The KDE platform theme (Breeze colours, KDE file dialogs, icon\n\
-          # lookup) is the plasma-integration plugin. Name the theme only\n\
-          # when the plugin is really on disk: `kde` with nothing behind it\n\
-          # makes EVERY Qt app print a missing-platform-theme warning at\n\
-          # startup and then use the default anyway. This is a runtime test\n\
-          # rather than a build-time one because apk is best-effort here --\n\
-          # an unreachable mirror leaves the knob on and the plugin absent.\n\
-          for _t in /usr/lib/qt6/plugins/platformthemes/KDEPlasmaPlatformTheme*.so \\\n\
-          \x20 \x20 \x20 \x20 /usr/lib/qt5/plugins/platformthemes/KDEPlasmaPlatformTheme*.so; do\n\
-          \x20 [ -e \"$_t\" ] || continue\n\
-          \x20 : \"${QT_QPA_PLATFORMTHEME:=kde}\"; export QT_QPA_PLATFORMTHEME\n\
-          \x20 break\n\
-          done\n\
-          unset _t\n\
           # Qt Quick (all of Plasma's UI, and any QML app) needs GL. On the\n\
           # pixman session the only GL is llvmpipe, where Qt Quick's own\n\
           # software rasterizer is both faster and safer, so derive the backend\n\
@@ -3024,14 +2927,62 @@ fn write_labwc_wrapper(rootfs: &Path) {
           : > \"$LOG\" 2>/dev/null || true\n\
           for d in /usr/bin /bin /usr/sbin /sbin; do\n\
           \x20 if [ -x \"$d/labwc\" ]; then\n\
+          \x20 set -- \"$d/labwc\" \"$@\"\n\
           \x20 # tty7: land the compositor on the reserved graphics VT even when\n\
           \x20 # launched by hand from a text VT. eclipse-init --exec-on-graphics-vt\n\
           \x20 # chvt's to tty7 then execs labwc there (reuses the existing init\n\
           \x20 # binary, no new tool); plain-exec fallback if it is absent.\n\
           \x20 if [ -x /sbin/eclipse-init ]; then\n\
-          \x20\x20 exec /sbin/eclipse-init --exec-on-graphics-vt \"$d/labwc\" \"$@\" >>\"$LOG\" 2>&1\n\
+          \x20\x20 set -- /sbin/eclipse-init --exec-on-graphics-vt \"$@\"\n\
           \x20 fi\n\
-          \x20 exec \"$d/labwc\" \"$@\" >>\"$LOG\" 2>&1\n\
+          \x20 # GPU renderer that fails to INITIALIZE: retry it once, then pixman.\n\
+          \x20 # On the NVIDIA + nvidia.nouveau_uapi path wlroots asks Mesa for EGL\n\
+          \x20 # on zink, and zink needs NVK to enumerate the GPU. When it does not\n\
+          \x20 # ('MESA: error: ZINK: failed to choose pdev' -> 'DRI2: failed to\n\
+          \x20 # create screen' -> eglInitialize EGL_NOT_INITIALIZED), labwc exits\n\
+          \x20 # at once with 'unable to create renderer', and wlroots never falls\n\
+          \x20 # back to pixman on its own. On hardware this hits the FIRST start of\n\
+          \x20 # a boot and the respawn ~250 ms later comes up on the GPU, so a\n\
+          \x20 # labwc started by hand left a shell with no desktop. So: run the GPU\n\
+          \x20 # attempt as a child; if THAT is how it died, retry it once on the\n\
+          \x20 # GPU after a short pause, and only if the retry dies the same way\n\
+          \x20 # exec labwc on pixman. Any other exit is passed through unchanged\n\
+          \x20 # for init to count. Each failed attempt's log is kept as\n\
+          \x20 # /tmp/labwc-<renderer>-<n>.log, and the marker tells the GL wrappers\n\
+          \x20 # (eclipse-firefox) that this session has no GPU path.\n\
+          \x20 # ECLIPSE_LABWC_NO_FALLBACK=1 keeps the old fail-hard behaviour.\n\
+          \x20 case \"${WLR_RENDERER:-}\" in\n\
+          \x20 gles2|vulkan)\n\
+          \x20\x20 if [ -z \"${ECLIPSE_LABWC_NO_FALLBACK:-}\" ]; then\n\
+          \x20\x20\x20 rm -f /run/labwc-renderer-fallback 2>/dev/null\n\
+          \x20\x20\x20 n=0\n\
+          \x20\x20\x20 while :; do\n\
+          \x20\x20\x20\x20 n=$((n + 1))\n\
+          \x20\x20\x20\x20 \"$@\" >>\"$LOG\" 2>&1\n\
+          \x20\x20\x20\x20 rc=$?\n\
+          \x20\x20\x20\x20 grep -q 'unable to create renderer' \"$LOG\" 2>/dev/null || exit \"$rc\"\n\
+          \x20\x20\x20\x20 FAILED=\"/tmp/labwc-$WLR_RENDERER-$n.log\"\n\
+          \x20\x20\x20\x20 cp \"$LOG\" \"$FAILED\" 2>/dev/null || true\n\
+          \x20\x20\x20\x20 [ \"$n\" -ge 2 ] && break\n\
+          \x20\x20\x20\x20 MSG=\"labwc: the $WLR_RENDERER renderer failed to initialize (log: $FAILED); retrying it once\"\n\
+          \x20\x20\x20\x20 echo \"$MSG\" > /dev/console 2>/dev/null || true\n\
+          \x20\x20\x20\x20 sleep \"${ECLIPSE_LABWC_RETRY_DELAY:-1}\"\n\
+          \x20\x20\x20\x20 : > \"$LOG\" 2>/dev/null || true\n\
+          \x20\x20\x20 done\n\
+          \x20\x20\x20 echo \"$WLR_RENDERER\" > /run/labwc-renderer-fallback 2>/dev/null || true\n\
+          \x20\x20\x20 MSG=\"labwc: the $WLR_RENDERER renderer failed to initialize twice (log: $FAILED); falling back to pixman. Check: dmesg | grep nouveau-uapi\"\n\
+          \x20\x20\x20 echo \"$MSG\" >>\"$LOG\" 2>/dev/null || true\n\
+          \x20\x20\x20 echo \"$MSG\" > /dev/console 2>/dev/null || true\n\
+          \x20\x20\x20 # Forced, not `:=`: the inherited pins are what just failed.\n\
+          \x20\x20\x20 # Clients inherit labwc's env, so they go llvmpipe too.\n\
+          \x20\x20\x20 export WLR_RENDERER=pixman WLR_RENDERER_ALLOW_SOFTWARE=1\n\
+          \x20\x20\x20 export LIBGL_ALWAYS_SOFTWARE=1 QT_QUICK_BACKEND=software\n\
+          \x20\x20\x20 export SDL_RENDER_DRIVER=software SDL_FRAMEBUFFER_ACCELERATION=0\n\
+          \x20\x20\x20 unset GALLIUM_DRIVER MESA_LOADER_DRIVER_OVERRIDE WLR_DRM_NO_MODIFIERS\n\
+          \x20\x20 fi\n\
+          \x20\x20 ;;\n\
+          \x20 esac\n\
+          \x20 exec \"$@\" >>\"$LOG\" 2>&1\n\
           \x20 fi\n\
           done\n\
           # NOT INSTALLED -- see the matching note in eclipse-seatd. `>&2` alone\n\
@@ -3061,6 +3012,48 @@ mod tests {
     /// The prefs every profile reads (`defaults/pref/eclipse-os.js`), for
     /// both install dirs. The media and HTTP/3 lines are what make YouTube
     /// play on a CPU-only machine; see `write_firefox_default_prefs`.
+    /// Every QEMU boot is a first run (the root is a fresh RAM image), so the
+    /// first-run pages and Firefox's own background work ran at every launch.
+    /// Safe Browsing and Fission are protection and must stay at their
+    /// defaults.
+    #[test]
+    fn firefox_skips_first_run_and_background_work_but_keeps_its_protections() {
+        let dir =
+            std::env::temp_dir().join(format!("eclipse-ff-firstrun-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        for (_, app) in FIREFOX_PACKAGES {
+            fs::create_dir_all(dir.join(app)).unwrap();
+        }
+        write_firefox_default_prefs(&dir);
+        for (pkg, app) in FIREFOX_PACKAGES {
+            let prefs =
+                fs::read_to_string(dir.join(app).join("defaults/pref/eclipse-os.js")).unwrap();
+            for line in [
+                "pref(\"datareporting.policy.dataSubmissionPolicyBypassNotification\", true);\n",
+                "pref(\"datareporting.policy.firstRunURL\", \"\");\n",
+                "pref(\"browser.aboutwelcome.enabled\", false);\n",
+                "pref(\"browser.startup.homepage_override.mstone\", \"ignore\");\n",
+                "pref(\"browser.shell.checkDefaultBrowser\", false);\n",
+                "pref(\"datareporting.healthreport.uploadEnabled\", false);\n",
+                "pref(\"toolkit.telemetry.unified\", false);\n",
+                "pref(\"toolkit.telemetry.archive.enabled\", false);\n",
+                "pref(\"app.normandy.enabled\", false);\n",
+                "pref(\"app.shield.optoutstudies.enabled\", false);\n",
+                "pref(\"browser.newtabpage.activity-stream.feeds.section.topstories\", false);\n",
+                "pref(\"dom.ipc.processPrelaunch.enabled\", false);\n",
+            ] {
+                assert!(prefs.contains(line), "{pkg}: missing {line:?} in\n{prefs}");
+            }
+            for kept in ["browser.safebrowsing", "fission.autostart"] {
+                assert!(
+                    !prefs.contains(kept),
+                    "{pkg}: {kept} is protection and stays at Firefox's default"
+                );
+            }
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn firefox_prefers_h264_and_http2_on_a_cpu_only_machine() {
         let dir =
@@ -3567,7 +3560,6 @@ mod tests {
             ("win11", "Win11-Dark"),
             ("kde", "Breeze-Dark"),
             ("eclipse", "Eclipse-Dark"),
-            ("plasma", "Breeze-Dark"),
         ] {
             assert!(script.contains(theme), "eclipse-look does not know {theme}");
             assert!(script.contains(name), "eclipse-look does not accept {name}");
@@ -3599,222 +3591,38 @@ mod tests {
             win.contains("background=0c0c0c"),
             "Windows terminal palette is Campbell"
         );
-
-        // RUN it, once per look. `contains(name)` above cannot tell a look
-        // apart from a comment mentioning it, and that is not hypothetical:
-        // `plasma` was added to the validator, to the theme map and to the
-        // usage line while the argv `case` still ended at `eclipse`, so
-        // `eclipse-look plasma` answered with usage and exit 2. Only running
-        // it says which looks the command actually accepts.
-        let sandbox = dir.join("run");
-        fs::create_dir_all(sandbox.join("bin")).unwrap();
-        // apply() signals the session's clients; neither the panel nor the
-        // wallpaper of the machine running this suite is ours to kill.
-        let nopkill = sandbox.join("bin/pkill");
-        fs::write(&nopkill, "#!/bin/sh\nexit 0\n").unwrap();
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&nopkill, fs::Permissions::from_mode(0o755)).unwrap();
-        }
-        let runnable = sandbox.join("eclipse-look");
-        fs::write(
-            &runnable,
-            script
-                .replace(
-                    "CONF=/etc/eclipse/look",
-                    &format!("CONF={}/look", sandbox.display()),
-                )
-                .replace(
-                    "mkdir -p /etc/eclipse",
-                    "mkdir -p /dev/null/nope 2>/dev/null; true",
-                )
-                .replace("/usr/bin/labwc", "/nonexistent/labwc"),
-        )
-        .unwrap();
-        for (name, theme) in [
-            ("plasma", "Breeze-Dark"),
-            ("win11", "Win11-Dark"),
-            ("kde", "Breeze-Dark"),
-            ("eclipse", "Eclipse-Dark"),
-        ] {
-            let out = std::process::Command::new("sh")
-                .arg(&runnable)
-                .arg(name)
-                .env("HOME", dir.join("root"))
-                .env("PATH", format!("{}/bin:/usr/bin:/bin", sandbox.display()))
-                .output()
-                .unwrap();
-            assert!(
-                out.status.success(),
-                "`eclipse-look {name}` exited {:?}: {}",
-                out.status.code(),
-                String::from_utf8_lossy(&out.stderr)
-            );
-            let saved = fs::read_to_string(sandbox.join("look")).unwrap();
-            assert_eq!(saved.trim(), format!("look={name}"), "look not saved");
-            let rc = fs::read_to_string(dir.join("root/.config/labwc/rc.xml")).unwrap();
-            assert!(
-                rc.contains(&format!("<name>{theme}</name>")),
-                "`eclipse-look {name}` did not put {theme} in rc.xml"
-            );
-            let want = fs::read_to_string(
-                dir.join("root/.config/foot")
-                    .join(format!("foot.{name}.ini")),
-            )
-            .unwrap();
-            let got = fs::read_to_string(dir.join("root/.config/foot/foot.ini")).unwrap();
-            assert_eq!(want, got, "`eclipse-look {name}` did not copy its palette");
-        }
-        // `eclipse-look` with no argument reports what the FILE says, and its
-        // awk has to agree with the wrappers' sed about a trailing comment:
-        // two readers that disagree are a look that reads as applied in one
-        // place and not in the other, which is the whole reason they were
-        // written to match.
-        for (written, want) in [
-            ("look=win11\n", "win11"),
-            ("look = win11 \n", "win11"),
-            ("look=win11 # la barra de Windows\n", "win11"),
-            ("#look=win11\n", "eclipse"),
-            ("", "eclipse"),
-        ] {
-            fs::write(sandbox.join("look"), written).unwrap();
-            let out = std::process::Command::new("sh")
-                .arg(&runnable)
-                .env("HOME", dir.join("root"))
-                .env("PATH", format!("{}/bin:/usr/bin:/bin", sandbox.display()))
-                .output()
-                .unwrap();
-            assert_eq!(
-                String::from_utf8_lossy(&out.stdout).trim(),
-                want,
-                "eclipse-look read {written:?} as something other than {want}"
-            );
-        }
-
-        // And a look nobody defined is still refused, so the `case` cannot be
-        // "fixed" by making it accept everything.
-        let out = std::process::Command::new("sh")
-            .arg(&runnable)
-            .arg("gnome")
-            .env("HOME", dir.join("root"))
-            .env("PATH", format!("{}/bin:/usr/bin:/bin", sandbox.display()))
-            .output()
-            .unwrap();
-        assert!(
-            !out.status.success(),
-            "eclipse-look accepted an unknown look"
-        );
-
         let _ = fs::remove_dir_all(&dir);
     }
 
     /// The Qt policy is split between the static session environment and the
-    /// wrapper, exactly like SDL's. What must NOT appear is as load-bearing
-    /// as what must: `QT_QPA_PLATFORMTHEME=kde` names a plugin file, so it
-    /// belongs to the wrapper's runtime test and never to the static file --
-    /// apk is best-effort, so "KDE was asked for" and "KDE is on disk" are
-    /// different facts. `XDG_CURRENT_DESKTOP` is the opposite case: it is a
-    /// build-time fact, and it must track the knob rather than claim a
-    /// session that was never built.
+    /// wrapper (the renderer-dependent half), exactly like SDL's. What must
+    /// NOT appear is as load-bearing as what must: `QT_QPA_PLATFORMTHEME=kde`
+    /// and `XDG_CURRENT_DESKTOP=KDE` are the two lines every "KDE on labwc"
+    /// recipe recommends, and both point at pieces this image does not have.
     #[test]
-    fn qt_policy_is_present_and_kde_is_claimed_only_when_built() {
+    fn qt_policy_is_present_without_claiming_to_be_kde() {
         let dir = std::env::temp_dir().join(format!("eclipse-qt-test-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         write_labwc_environment(&dir);
         write_labwc_wrapper(&dir);
         let env = fs::read_to_string(dir.join("root/.config/labwc/environment")).unwrap();
         assert!(env.lines().any(|l| l == "QT_QPA_PLATFORM=wayland;xcb"));
-        let desktop = env
+        assert!(env
             .lines()
-            .find(|l| l.starts_with("XDG_CURRENT_DESKTOP="))
-            .expect("the session must say what desktop it is");
-        if crate::linux::xorg::kde_enabled() {
-            // KDE first: it is the portal backend the session asks for.
-            assert_eq!(desktop, "XDG_CURRENT_DESKTOP=KDE:labwc:wlroots");
-        } else {
-            assert_eq!(desktop, "XDG_CURRENT_DESKTOP=labwc:wlroots");
-        }
-        // Always a wlroots session, whatever the front of the list says.
-        assert!(desktop.ends_with("labwc:wlroots"));
+            .any(|l| l == "XDG_CURRENT_DESKTOP=labwc:wlroots"));
+        // Mentioned in a comment saying why it is absent, never as a setting.
         assert!(
             !env.lines().any(|l| {
                 let l = l.trim();
                 !l.starts_with('#') && l.starts_with("QT_QPA_PLATFORMTHEME=")
             }),
-            "the theme depends on a plugin file, so only the wrapper may set it"
+            "no plasma-integration plugin exists here; setting the theme only warns"
         );
+        assert!(!env.lines().any(|l| l.trim() == "XDG_CURRENT_DESKTOP=KDE"));
         let wrapper = fs::read_to_string(dir.join("usr/local/bin/labwc")).unwrap();
         assert!(
             wrapper.contains("QT_QUICK_BACKEND:=software"),
             "Qt Quick must fall back to its software raster on the pixman session"
-        );
-        assert!(
-            wrapper.contains("KDEPlasmaPlatformTheme"),
-            "the theme is set from the plugin file, so the wrapper must name it"
-        );
-        let theme = wrapper
-            .lines()
-            .position(|l| l.contains("QT_QPA_PLATFORMTHEME:=kde"))
-            .expect("the wrapper sets the KDE theme");
-        let guard = wrapper
-            .lines()
-            .position(|l| l.contains("KDEPlasmaPlatformTheme"))
-            .unwrap();
-        assert!(
-            guard < theme,
-            "the plugin test must come BEFORE the export, or it is not a test"
-        );
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    /// The KDE session files: both wrappers must be valid shell (init runs
-    /// them with no terminal and no one watching), must check for what they
-    /// need before using it, and kdeglobals must name the pieces the
-    /// packages provide.
-    #[test]
-    fn kde_session_files_check_before_they_act() {
-        let dir = std::env::temp_dir().join(format!("eclipse-kde-test-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        write_kde_session(&dir);
-        write_labwc_wrapper(&dir);
-
-        for name in ["eclipse-kded", "eclipse-kde-colors", "labwc"] {
-            let path = dir.join("usr/local/bin").join(name);
-            let st = std::process::Command::new("sh")
-                .arg("-n")
-                .arg(&path)
-                .status()
-                .unwrap();
-            assert!(st.success(), "sh -n rejected {name}");
-        }
-
-        let kded = fs::read_to_string(dir.join("usr/local/bin/eclipse-kded")).unwrap();
-        // kded6 without a bus exits at once, and `type = respawn` would then
-        // spin on it for the life of the session.
-        assert!(kded.contains("$BUS"), "kded must wait for the session bus");
-        assert!(
-            kded.contains("-x \"$d/kded6\""),
-            "and must look for the binary before exec'ing it"
-        );
-        let colors = fs::read_to_string(dir.join("usr/local/bin/eclipse-kde-colors")).unwrap();
-        assert!(
-            colors.contains("Colors:Window"),
-            "seeding twice would overwrite a palette the user changed"
-        );
-        assert!(colors.contains("BreezeDark.colors"));
-
-        let kg = fs::read_to_string(dir.join("root/.config/kdeglobals")).unwrap();
-        for line in [
-            "widgetStyle=Breeze",
-            "ColorScheme=BreezeDark",
-            "Theme=breeze-dark",
-        ] {
-            assert!(kg.lines().any(|l| l.trim() == line), "kdeglobals: {line}");
-        }
-        // The colours themselves come from the breeze package at first boot.
-        assert!(
-            !kg.lines().any(|l| l.trim_start().starts_with("[Colors:")),
-            "a hand-typed palette drifts from the real Breeze Dark"
         );
         let _ = fs::remove_dir_all(&dir);
     }
@@ -4040,6 +3848,118 @@ mod tests {
                 assert_eq!(gate_var(&w, "LIBGL_ALWAYS_SOFTWARE"), None, "{ctx}");
             }
         }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// GL_RENDERER 'zink Vulkan 1.4(llvmpipe ...)' on the RTX: with NVK
+    /// unusable, zink took lavapipe and Firefox's "GPU" path ran GL on CPU
+    /// Vulkan. The GPU path must be pinned to NVK and gated on NVK enumerating.
+    #[test]
+    fn firefox_gpu_path_never_lands_zink_on_lavapipe() {
+        let dir = std::env::temp_dir().join(format!("eclipse-ff-nvk-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        write_firefox_wrapper(&dir);
+        let ff = fs::read_to_string(dir.join("usr/local/bin/eclipse-firefox")).unwrap();
+        let gpu = ff.find("export GALLIUM_DRIVER=").unwrap();
+        let gate = &ff[..gpu];
+        assert!(gate.contains("/usr/share/vulkan/icd.d/nouveau_icd.*.json"));
+        assert!(gate.contains("vulkaninfo --summary"));
+        assert!(gate.contains("[ -n \"$NVK_ICD\" ]"));
+        assert!(gate.contains("export VK_DRIVER_FILES=\"$NVK_ICD\" VK_ICD_FILENAMES=\"$NVK_ICD\""));
+        assert!(!ff.contains("lvp_icd"));
+        if let Ok(st) = std::process::Command::new("sh")
+            .arg("-n")
+            .arg(dir.join("usr/local/bin/eclipse-firefox"))
+            .status()
+        {
+            assert!(st.success(), "eclipse-firefox does not parse as sh");
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Runs the generated wrapper against a fake `labwc` that fails the way
+    /// a real one does when zink cannot find the GPU, with every absolute path
+    /// it touches redirected into `dir`. Returns the fake's call log.
+    fn run_wrapper_with_fake_labwc(dir: &Path, renderer: &str, fail_on: &str) -> Option<String> {
+        let _ = fs::remove_dir_all(dir);
+        write_labwc_wrapper(dir);
+        let bin = dir.join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        let d = dir.display();
+        let fake = format!(
+            "#!/bin/sh\n\
+             echo \"$WLR_RENDERER ${{GALLIUM_DRIVER:-none}}\" >> {d}/calls\n\
+             echo x >> {d}/starts\n\
+             if [ \"$WLR_RENDERER\" = {fail_on} ] || \\\n\
+             \x20 {{ [ {fail_on} = first ] && [ \"$(wc -l < {d}/starts)\" -eq 1 ]; }}; then\n\
+             \x20 echo '[../src/server.c:532] unable to create renderer'\n\
+             \x20 exit 1\n\
+             fi\n\
+             exit 0\n"
+        );
+        fs::write(bin.join("labwc"), fake).unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(bin.join("labwc"), fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let script = fs::read_to_string(dir.join("usr/local/bin/labwc"))
+            .unwrap()
+            .replace("/usr/bin /bin /usr/sbin /sbin", &format!("{d}/bin"))
+            .replace("/sbin/eclipse-init", &format!("{d}/no-init"))
+            .replace("/tmp/labwc", &format!("{d}/labwc"))
+            .replace("/run/labwc-renderer-fallback", &format!("{d}/fallback"))
+            .replace("/dev/console", "/dev/null");
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&script)
+            .env("WLR_RENDERER", renderer)
+            .env("GALLIUM_DRIVER", "zink")
+            .env_remove("LIBGL_ALWAYS_SOFTWARE")
+            .env_remove("ECLIPSE_LABWC_NO_FALLBACK")
+            .env("ECLIPSE_LABWC_RETRY_DELAY", "0")
+            .env("SEATD_SOCK", "/nonexistent")
+            .output()
+            .ok()?;
+        assert!(
+            out.status.success(),
+            "wrapper failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        Some(fs::read_to_string(dir.join("calls")).unwrap())
+    }
+
+    /// The real-hardware failure: `nvidia.nouveau_uapi` on the RTX pins
+    /// GLES2/zink, NVK does not enumerate the GPU ('ZINK: failed to choose
+    /// pdev'), and labwc exits with 'unable to create renderer'. On hardware
+    /// only the first start of a boot does that, so the wrapper retries the
+    /// GPU once, and goes to pixman only when the retry fails too.
+    #[test]
+    fn a_gpu_renderer_that_fails_to_init_is_retried_then_falls_back_to_pixman() {
+        let dir = std::env::temp_dir().join(format!("eclipse-labwc-fb-{}", std::process::id()));
+        // Fails once, then works: the second GPU attempt is the session.
+        let Some(calls) = run_wrapper_with_fake_labwc(&dir, "gles2", "first") else {
+            return; // no host sh
+        };
+        assert_eq!(calls, "gles2 zink\ngles2 zink\n");
+        assert!(!dir.join("fallback").exists());
+        assert!(fs::read_to_string(dir.join("labwc-gles2-1.log"))
+            .unwrap()
+            .contains("unable to create renderer"));
+
+        // Fails every time: two GPU attempts, then pixman with software GL.
+        let calls = run_wrapper_with_fake_labwc(&dir, "gles2", "gles2").unwrap();
+        assert_eq!(calls, "gles2 zink\ngles2 zink\npixman none\n");
+        assert_eq!(fs::read_to_string(dir.join("fallback")).unwrap(), "gles2\n");
+        assert!(dir.join("labwc-gles2-2.log").exists());
+
+        // A GPU renderer that works is run once, and leaves no marker.
+        let calls = run_wrapper_with_fake_labwc(&dir, "gles2", "never").unwrap();
+        assert_eq!(calls, "gles2 zink\n");
+        assert!(!dir.join("fallback").exists());
+
+        // pixman is exec'd directly; nothing to retry.
+        let calls = run_wrapper_with_fake_labwc(&dir, "pixman", "never").unwrap();
+        assert_eq!(calls, "pixman zink\n");
         let _ = fs::remove_dir_all(&dir);
     }
 

@@ -62,9 +62,10 @@ impl FileLike for PidFd {
     }
 
     fn set_flags(&self, f: OpenFlags) -> LxResult {
-        let mut flags = self.open_flags.lock();
-        flags.set(OpenFlags::NON_BLOCK, f.contains(OpenFlags::NON_BLOCK));
-        flags.set(OpenFlags::CLOEXEC, f.contains(OpenFlags::CLOEXEC));
+        // Same trap as eventfd/epoll before `take_settable`: copying only
+        // NON_BLOCK/CLOEXEC made `fcntl(F_SETFL, O_ASYNC)` "succeed" while
+        // `F_GETFL` never showed the bit.
+        self.open_flags.lock().take_settable(f);
         Ok(())
     }
 
@@ -77,6 +78,11 @@ impl FileLike for PidFd {
     }
 
     async fn read_at(&self, _offset: u64, _buf: &mut [u8]) -> LxResult<usize> {
+        // pidfd is not seekable; pread must be ESPIPE (write stays EINVAL).
+        Err(LxError::ESPIPE)
+    }
+
+    fn write_at(&self, _offset: u64, _buf: &[u8]) -> LxResult<usize> {
         Err(LxError::EINVAL)
     }
 
@@ -101,5 +107,34 @@ impl FileLike for PidFd {
         proc_obj.wait_signal(Signal::PROCESS_TERMINATED).await;
         self.eventbus.lock().set(Event::READABLE);
         self.poll(events)
+    }
+}
+
+#[cfg(test)]
+mod set_flags_tests {
+    use super::*;
+    use zircon_object::task::Job;
+
+    #[test]
+    fn set_flags_keeps_o_async_on_a_pidfd() {
+        let proc = Process::create(&Job::root(), "pidfd-flags").unwrap();
+        let fd = PidFd::new(proc, OpenFlags::empty());
+        assert!(!fd.flags().contains(OpenFlags::ASYNC));
+        let mut f = fd.flags();
+        f.set(OpenFlags::ASYNC, true);
+        f.set(OpenFlags::NON_BLOCK, true);
+        fd.set_flags(f).unwrap();
+        assert!(fd.flags().contains(OpenFlags::ASYNC));
+        assert!(fd.flags().non_block());
+    }
+
+    #[test]
+    fn pread_is_espipe_and_pwrite_is_einval() {
+        use async_std::task::block_on;
+        let proc = Process::create(&Job::root(), "pidfd-seek").unwrap();
+        let fd = PidFd::new(proc, OpenFlags::empty());
+        let mut buf = [0u8; 8];
+        assert_eq!(block_on(fd.read_at(0, &mut buf)), Err(LxError::ESPIPE));
+        assert_eq!(fd.write_at(0, &[0u8; 8]), Err(LxError::EINVAL));
     }
 }

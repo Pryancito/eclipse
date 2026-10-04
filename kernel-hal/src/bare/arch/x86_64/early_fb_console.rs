@@ -262,18 +262,22 @@ pub fn write_str(s: &str) {
     }
 }
 
-/// LAST-RESORT panic banner: draw `text` on a red band across the top of the
-/// framebuffer, using ONLY atomics and raw pixel writes — no mutex, no RefCell,
-/// no allocation. This is the output of record when a panic happens while some
-/// CPU (possibly the panicking one) holds the console/serial locks: every other
-/// path can be silently dropped or deadlock, this one cannot. Multi-line text
-/// wraps; the band grows to fit.
-/// Full-screen kernel-stop screen ("BSOD"): a solid ground colour over the WHOLE
-/// display with a title, the diagnostic text, and a footer. On real hardware
-/// with no serial the screen is the only output channel, so this makes a fatal
-/// stop unmistakable and easy to photograph in one frame — the whole message is
-/// laid out with margins instead of a thin red band at the top edge.
+/// Full-screen kernel-stop screen ("BSOD"), using ONLY atomics and raw pixel
+/// writes — no mutex, no RefCell, no allocation. This is the output of record
+/// when a machine stops while some CPU (possibly this one) holds the
+/// console/serial locks: every other path can be silently dropped or deadlock,
+/// this one cannot. On real hardware with no serial the screen is the only
+/// output channel, so the whole message is laid out with margins and a footer
+/// instead of a thin band at the top edge.
+///
+/// **Cumulative.** The first report fills the ground and draws the title; every
+/// later one lands underneath it. It used to refill the whole screen each time,
+/// and a stop is rarely one report: a KERNEL PANIC on one CPU, an unresolved
+/// kernel #PF on another, and the deadlock detector eight seconds behind them
+/// both. The last writer won, so the photograph showed the deadlock and not the
+/// panic that caused it. See [`kernel_hal::stop_screen`](crate::stop_screen).
 pub fn panic_banner(text: &str) {
+    use crate::stop_screen;
     if !try_init() {
         return;
     }
@@ -282,56 +286,83 @@ pub fn panic_banner(text: &str) {
     if sw == 0 || sh == 0 {
         return;
     }
+    let Some(place) = stop_screen::claim(sw, sh) else {
+        // Screen full: the report is counted (and the footer of the report that
+        // did fit says so), not scribbled over what is already there.
+        return;
+    };
     // Classic stop-screen blue; white text; a red title bar so the eye lands on
-    // it. Fill the ENTIRE screen so nothing of the wedged desktop shows through.
+    // it.
     const BLUE: u32 = 0xFF00_2C82;
     const RED: u32 = 0xFFCC_0000;
     const WHITE: u32 = 0xFFFF_FFFF;
-    const MARGIN_X: u32 = CHAR_W * 2;
-    fill_rect(0, 0, sw, sh, BLUE);
+    const MARGIN_X: u32 = stop_screen::MARGIN_COLS * CHAR_W;
 
-    let cols = ((sw.saturating_sub(MARGIN_X * 2)) / CHAR_W).max(1);
-    let mut y: u32 = CHAR_H;
+    if place.first {
+        // Fill the ENTIRE screen so nothing of the wedged desktop shows
+        // through. Only the first report may do this.
+        fill_rect(0, 0, sw, sh, BLUE);
+        // The band lives entirely inside the rows `stop_screen` reserves for
+        // the title (the first two), so the first body row cannot punch a
+        // blue-backed glyph through the bottom of it.
+        const TITLE: &[u8] = b"*** ECLIPSE OS - KERNEL STOP ***";
+        fill_rect(0, 0, sw, CHAR_H + CHAR_H / 2, RED);
+        for (i, &c) in TITLE.iter().enumerate() {
+            draw_char_at(MARGIN_X + (i as u32) * CHAR_W, CHAR_H / 4, c, WHITE, RED);
+        }
+    }
 
-    // Title bar.
-    const TITLE: &[u8] = b"*** ECLIPSE OS - KERNEL STOP ***";
-    fill_rect(
-        0,
-        y.saturating_sub(CHAR_H / 4),
-        sw,
-        CHAR_H + CHAR_H / 2,
-        RED,
+    // Body — wrapped to the margin box, under whatever came before.
+    let end = stop_screen::lay_out(text, &place, |col, row, b| {
+        draw_char_at(MARGIN_X + col * CHAR_W, row * CHAR_H, b, WHITE, BLUE);
+    });
+    stop_screen::release(end);
+
+    // Footer hint, rewritten by every report so the count of what did not fit
+    // is the current one.
+    let fy = stop_screen::footer_row(sh) * CHAR_H;
+    fill_rect(0, fy, sw, CHAR_H, BLUE);
+    let cut = stop_screen::cut_reports();
+    let mut foot = [0u8; 96];
+    let mut n = 0usize;
+    let mut push = |bytes: &[u8], n: &mut usize| {
+        for &b in bytes {
+            if *n < foot.len() {
+                foot[*n] = b;
+                *n += 1;
+            }
+        }
+    };
+    push(
+        b"take a photo of this screen; the machine is halted.",
+        &mut n,
     );
-    for (i, &c) in TITLE.iter().enumerate() {
-        draw_char_at(MARGIN_X + (i as u32) * CHAR_W, y, c, WHITE, RED);
-    }
-    y += CHAR_H * 2;
-
-    // Body — wrapped to the margin box.
-    let mut x: u32 = 0;
-    for &b in text.as_bytes() {
-        if b == b'\n' || x >= cols {
-            x = 0;
-            y += CHAR_H;
-            if b == b'\n' {
-                continue;
-            }
+    if cut > 0 {
+        push(b"  [", &mut n);
+        // No `write!` here: formatting machinery is the one thing this path
+        // must not reach for. At most a few reports are ever cut.
+        let mut digits = [0u8; 10];
+        let mut d = 0usize;
+        let mut v = cut;
+        while v > 0 && d < digits.len() {
+            digits[d] = b'0' + (v % 10) as u8;
+            v /= 10;
+            d += 1;
         }
-        if y + CHAR_H < sh {
-            draw_char_at(MARGIN_X + x * CHAR_W, y, b, WHITE, BLUE);
+        if d == 0 {
+            digits[0] = b'0';
+            d = 1;
         }
-        x += 1;
+        while d > 0 {
+            d -= 1;
+            push(&[digits[d]], &mut n);
+        }
+        push(b" more report(s) did not fit]", &mut n);
     }
-
-    // Footer hint.
-    const FOOT: &[u8] = b"take a photo of this screen; the machine is halted.";
-    let fy = sh.saturating_sub(CHAR_H * 2);
-    if fy > y {
-        for (i, &c) in FOOT.iter().enumerate() {
-            let fx = MARGIN_X + (i as u32) * CHAR_W;
-            if fx + CHAR_W < sw {
-                draw_char_at(fx, fy, c, WHITE, BLUE);
-            }
+    for (i, &c) in foot[..n].iter().enumerate() {
+        let fx = MARGIN_X + (i as u32) * CHAR_W;
+        if fx + CHAR_W < sw {
+            draw_char_at(fx, fy, c, WHITE, BLUE);
         }
     }
 }

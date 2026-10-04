@@ -56,7 +56,49 @@ pub struct ShadowFramebuffer {
     /// One presenter at a time, so snapshots reach the device in order. A
     /// plain (non IRQ-disabling) spinlock that is only ever `try_lock`ed:
     /// held across the device blit, never spun on -- see [`Self::present`].
-    blit_lock: spin::Mutex<()>,
+    ///
+    /// It guards the presenter's scratch buffers as well as the ordering,
+    /// because they are the same thing: only the one presenter holding this
+    /// lock ever touches them. See [`PresentScratch`].
+    blit_lock: spin::Mutex<PresentScratch>,
+}
+
+/// The buffers a present copies the shadow into before handing them to the
+/// device, kept alive between presents and reused in place.
+///
+/// They used to be three fresh `Vec`s per present, and a full-screen one is
+/// the whole framebuffer: a VT switch repaints everything, so
+/// `present_with_cursor` asked the kernel heap for `width * height * 4` bytes
+/// -- 4 MiB at 1366x768 -- in one contiguous block, ~60 times a second at
+/// worst and once per VT switch at least. That request is the one that killed
+/// the machine:
+///
+///     [PANIC] cpu=1 memory allocation of 4196352 bytes failed
+///       zcore::lang::alloc_error
+///       <ShadowFramebuffer>::present_with_cursor
+///       <GraphicConsole>::repaint
+///       kernel_hal::common::console::switch_vt_impl
+///       __rustc::rust_begin_unwind      <-- a panic was ALREADY running
+///
+/// Note the frame below the console: the repaint was the panic handler
+/// printing its report, so the allocation ran on an exhausted, fragmented
+/// heap at the exact moment nothing may fail -- and the OOM replaced the
+/// crash report with an OOM report about itself. Everything else on that path
+/// is already allocation-free and says so (`StackBuf`, the no-alloc banner
+/// formatter in `zCore/src/lang.rs`); the framebuffer present was the hole.
+///
+/// Reusing the buffers closes it: the capacity is taken once, early, while
+/// the heap is healthy, and every later present is `clear` + `extend_from_slice`
+/// into memory that is already there. It also drops a 4 MiB alloc/free pair
+/// out of the console's steady state.
+#[derive(Default)]
+struct PresentScratch {
+    /// The dirty content rectangle.
+    dirty: Vec<u32>,
+    /// The cell the cursor is being erased from.
+    erase: Vec<u32>,
+    /// The cell the cursor is being drawn into.
+    draw: Vec<u32>,
 }
 
 impl ShadowFramebuffer {
@@ -70,7 +112,7 @@ impl ShadowFramebuffer {
                 dirty: None,
                 prev_cursor: None,
             }),
-            blit_lock: spin::Mutex::new(()),
+            blit_lock: spin::Mutex::new(PresentScratch::default()),
         })
     }
 
@@ -219,19 +261,19 @@ impl ShadowFramebuffer {
     /// spinning (the timer-tick cursor blink runs in IRQ context on the CPU
     /// that may be mid-blit, so it must never wait).
     pub fn present(&self, display: &dyn DisplayScheme) {
-        let Some(_blit) = self.blit_lock.try_lock() else {
+        let Some(mut scratch) = self.blit_lock.try_lock() else {
             return;
         };
-        let snap = {
+        let rect = {
             let Some(mut g) = self.lock_inner() else {
                 return;
             };
-            self.take_dirty(&mut g, display.fb_write_combining())
+            self.take_dirty(&mut g, display.fb_write_combining(), &mut scratch.dirty)
         };
-        let Some(((x, y, w, h), pixels)) = snap else {
+        let Some((x, y, w, h)) = rect else {
             return;
         };
-        display.blit_from(x as u32, y as u32, &pixels, w, w as u32, h as u32);
+        display.blit_from(x as u32, y as u32, &scratch.dirty, w, w as u32, h as u32);
         if display.need_flush() {
             let _ = display.flush();
         }
@@ -254,9 +296,16 @@ impl ShadowFramebuffer {
         cw: usize,
         ch: usize,
     ) {
-        let Some(_blit) = self.blit_lock.try_lock() else {
+        let Some(mut scratch) = self.blit_lock.try_lock() else {
             return;
         };
+        // Split the guard once so the three buffers can be filled independently
+        // while the shadow lock is held.
+        let PresentScratch {
+            dirty: dirty_buf,
+            erase: erase_buf,
+            draw: draw_buf,
+        } = &mut *scratch;
 
         // Pixel rectangle of the requested cursor cell, clamped to the screen.
         let new_rect = cursor.and_then(|(cx, cy)| {
@@ -280,33 +329,45 @@ impl ShadowFramebuffer {
             // [`Self::wc_expand_x`].
             let wc = display.fb_write_combining();
             // 1. The dirty content region.
-            let dirty = self.take_dirty(&mut g, wc);
+            let dirty = self.take_dirty(&mut g, wc, dirty_buf);
             // Widen a cell blit to whole write-combining lines, keeping any
             // inversion on the cell's own columns.
-            let cell_blit = |rect: DirtyRect, invert: bool| {
+            let widen = |rect: DirtyRect| {
                 let (x, y, w, h) = rect;
                 let (x0, x1) = if wc {
                     Self::wc_expand_x(x, x + w, self.width)
                 } else {
                     (x, x + w)
                 };
-                let window = if invert { x..x + w } else { 0..0 };
-                let wide = (x0, y, x1 - x0, h);
-                (wide, Self::cell_pixels(&g.data, self.width, wide, window))
+                (x0, y, x1 - x0, h)
             };
             // 2. The previously drawn cursor, if it moved or is hidden.
             let erase = match g.prev_cursor {
-                Some(prev) if Some(prev) != new_rect => Some(cell_blit(prev, false)),
+                Some(prev) if Some(prev) != new_rect => Some((widen(prev), prev)),
                 _ => None,
             };
             // 3. The cursor (inverted) at its new position.
-            let draw = new_rect.map(|rect| cell_blit(rect, true));
+            let draw = new_rect.map(|rect| (widen(rect), rect));
+            if let Some((wide, _)) = erase {
+                Self::cell_pixels(&g.data, self.width, wide, 0..0, erase_buf);
+            }
+            if let Some((wide, cell)) = draw {
+                let window = cell.0..cell.0 + cell.2;
+                Self::cell_pixels(&g.data, self.width, wide, window, draw_buf);
+            }
             g.prev_cursor = new_rect;
-            (dirty, erase, draw)
+            (dirty, erase.map(|(w, _)| w), draw.map(|(w, _)| w))
         };
 
-        for ((x, y, w, h), pixels) in dirty.into_iter().chain(erase).chain(draw) {
-            display.blit_from(x as u32, y as u32, &pixels, w, w as u32, h as u32);
+        for (rect, pixels) in [
+            (dirty, &*dirty_buf),
+            (erase, &*erase_buf),
+            (draw, &*draw_buf),
+        ] {
+            let Some((x, y, w, h)) = rect else {
+                continue;
+            };
+            display.blit_from(x as u32, y as u32, pixels, w, w as u32, h as u32);
         }
         if display.need_flush() {
             let _ = display.flush();
@@ -347,10 +408,16 @@ impl ShadowFramebuffer {
 
     /// Take the dirty rectangle, clamped to the screen and -- when `wc` says the
     /// destination aperture is write-combining -- widened to whole write-combining
-    /// lines, as `((x, y, w, h), pixels)` with the rows tightly packed (`w` pixels
-    /// per row). `None` when nothing is dirty. Must be called with the shadow lock
-    /// held.
-    fn take_dirty(&self, g: &mut ShadowInner, wc: bool) -> Option<(DirtyRect, Vec<u32>)> {
+    /// lines. The pixels are written into `out` with the rows tightly packed
+    /// (`w` pixels per row) and the rectangle is returned as `(x, y, w, h)`;
+    /// `None` when nothing is dirty, in which case `out` is left alone. Must be
+    /// called with the shadow lock held.
+    ///
+    /// `out` is the caller's reusable scratch buffer ([`PresentScratch`]), not a
+    /// fresh `Vec`: a full-screen rectangle here is the whole framebuffer, and
+    /// asking the kernel heap for it on every present is what turned a VT switch
+    /// during a panic into an OOM.
+    fn take_dirty(&self, g: &mut ShadowInner, wc: bool, out: &mut Vec<u32>) -> Option<DirtyRect> {
         let (x0, y0, x1, y1) = g.dirty.take()?;
         let x0 = x0.min(self.width);
         let y0 = y0.min(self.height);
@@ -365,17 +432,19 @@ impl ShadowFramebuffer {
             (x0, x1)
         };
         let (w, h) = (x1 - x0, y1 - y0);
-        let mut pixels = Vec::with_capacity(w * h);
+        out.clear();
+        out.reserve(w * h);
         for r in y0..y1 {
             let start = r * self.width + x0;
-            pixels.extend_from_slice(&g.data[start..start + w]);
+            out.extend_from_slice(&g.data[start..start + w]);
         }
-        Some(((x0, y0, w, h), pixels))
+        Some((x0, y0, w, h))
     }
 
-    /// Copy a strip of the shadow, inverting only the columns in `invert` (an
-    /// absolute x range, empty for none). `rect` is `(x, y, w, h)` in pixels;
-    /// the result is tightly packed.
+    /// Copy a strip of the shadow into `out`, inverting only the columns in
+    /// `invert` (an absolute x range, empty for none). `rect` is `(x, y, w, h)`
+    /// in pixels; the result is tightly packed. `out` is the caller's reusable
+    /// scratch buffer and is overwritten.
     ///
     /// The invert window is separate from the rect because the blit is widened
     /// to whole write-combining lines (see [`Self::wc_expand_x`]) while the
@@ -386,9 +455,11 @@ impl ShadowFramebuffer {
         width: usize,
         rect: DirtyRect,
         invert: core::ops::Range<usize>,
-    ) -> Vec<u32> {
+        out: &mut Vec<u32>,
+    ) {
         let (x, y, w, h) = rect;
-        let mut out = Vec::with_capacity(w * h);
+        out.clear();
+        out.reserve(w * h);
         for r in 0..h {
             let base = (y + r) * width + x;
             out.extend(data[base..base + w].iter().enumerate().map(|(c, px)| {
@@ -399,7 +470,6 @@ impl ShadowFramebuffer {
                 }
             }));
         }
-        out
     }
 }
 
@@ -666,6 +736,41 @@ mod tests {
         assert!(dev.pixels(0).iter().all(|p| *p == 0x0000_0000));
     }
 
+    /// The present path must not ask the heap for anything once it is warm.
+    ///
+    /// A full-screen rectangle is the whole framebuffer, so the `Vec` this used
+    /// to build per present was a 4 MiB contiguous request at 1366x768 -- taken
+    /// on a VT switch, which is exactly what the panic handler does while it is
+    /// printing a crash report. It failed, and the OOM ate the report. The
+    /// scratch buffers are now reused, so the allocation happens once and never
+    /// again: same pointer, same capacity.
+    #[test]
+    fn a_warm_present_reuses_its_scratch_instead_of_allocating() {
+        let fb = ShadowFramebuffer::new(64, 8);
+        let dev = Recorder::new(64, 8);
+
+        // First full-screen present: this is the one that may allocate.
+        fb.clear(0);
+        fb.present_with_cursor(dev.as_ref(), Some((0, 0)), 8, 8);
+        let (dirty_ptr, dirty_cap, draw_ptr) = {
+            let s = fb.blit_lock.lock();
+            (s.dirty.as_ptr(), s.dirty.capacity(), s.draw.as_ptr())
+        };
+        assert!(dirty_cap >= 64 * 8, "the content scratch was not sized");
+
+        // Every later present, full-screen or not, reuses that memory.
+        for _ in 0..4 {
+            fb.clear(0x00AB_CDEF);
+            fb.present_with_cursor(dev.as_ref(), Some((1, 0)), 8, 8);
+            fb.fill_rect(0, 0, 8, 8, 0);
+            fb.present_with_cursor(dev.as_ref(), Some((0, 0)), 8, 8);
+        }
+        let s = fb.blit_lock.lock();
+        assert_eq!(s.dirty.as_ptr(), dirty_ptr, "the content scratch moved");
+        assert_eq!(s.dirty.capacity(), dirty_cap, "the content scratch regrew");
+        assert_eq!(s.draw.as_ptr(), draw_ptr, "the cursor scratch moved");
+    }
+
     #[test]
     fn a_cursor_cell_past_the_right_edge_is_dropped_not_clamped() {
         let fb = ShadowFramebuffer::new(16, 8);
@@ -844,7 +949,8 @@ mod wc_dirty_tests {
         // not. Check against the pixels the shadow would hand over.
         let rect = (32usize, 0usize, 16usize, 18usize);
         let data = alloc::vec![0x0000_0000u32; 1920 * 64];
-        let pixels = ShadowFramebuffer::cell_pixels(&data, 1920, rect, 36..45);
+        let mut pixels = Vec::new();
+        ShadowFramebuffer::cell_pixels(&data, 1920, rect, 36..45, &mut pixels);
         for (i, px) in pixels.iter().take(16).enumerate() {
             let abs = 32 + i;
             if (36..45).contains(&abs) {

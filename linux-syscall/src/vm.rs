@@ -177,6 +177,11 @@ impl Syscall<'_> {
         let prot = MmapProt::from_bits_truncate(prot);
         let shared = mmap_shared(flags, flags & MMAP_ANONYMOUS != 0)?;
         shared_validate_flags(flags)?;
+        // No hugepages here. `MAP_HUGETLB` is in `LEGACY_MAP_MASK` so
+        // `MAP_SHARED_VALIDATE` does not refuse it, and `from_bits_truncate`
+        // then dropped the bit and handed back a normal mapping — probes
+        // that asked for huge pages thought they got them.
+        mmap_no_hugetlb(flags)?;
         let flags = MmapFlags::from_bits_truncate(flags);
         info!(
             "mmap: addr={:#x}, size={:#x}, prot={:?}, flags={:?}, fd={:?}, offset={:#x}",
@@ -1407,6 +1412,16 @@ fn shared_validate_flags(flags: usize) -> LxResult<()> {
     Ok(())
 }
 
+/// This kernel has no hugepage pool. `MAP_HUGETLB` must be `EINVAL`, not a
+/// silently truncated anonymous/file mapping (`ksys_mmap_pgoff` fails the
+/// same way when no `hstate` exists for the request).
+fn mmap_no_hugetlb(flags: usize) -> LxResult<()> {
+    if flags & MAP_HUGETLB != 0 {
+        return Err(LxError::EINVAL);
+    }
+    Ok(())
+}
+
 /// `do_mmap`'s check of the descriptor's open mode against the mapping
 /// asked for: a shared mapping with `PROT_WRITE` needs the file open for
 /// writing (`!(file->f_mode & FMODE_WRITE)` is `EACCES`), and any file
@@ -2099,6 +2114,25 @@ mod mmap_file_access_tests {
             mmap_file_access(true, true, OpenFlags::RDWR | OpenFlags::APPEND),
             Ok(())
         );
+    }
+
+    /// A dma-buf exported without `DRM_RDWR` is `O_RDONLY`, so mapping it
+    /// `MAP_SHARED | PROT_WRITE` is `EACCES` as on Linux; with the flag the
+    /// mapping goes through. The fd used to be `O_RDWR` whatever the export
+    /// asked for.
+    #[test]
+    fn a_dma_buf_exported_without_drm_rdwr_cannot_be_mapped_writable() {
+        use linux_object::fs::devfs::drm_scheme::{DRM_CLOEXEC, DRM_RDWR};
+        use linux_object::fs::{DmaBuf, FileLike};
+        use zircon_object::vm::VmObject;
+        let ro = DmaBuf::from_prime(1, 0, 4096, VmObject::new_paged(1), DRM_CLOEXEC);
+        assert_eq!(
+            mmap_file_access(true, true, ro.flags()),
+            Err(LxError::EACCES)
+        );
+        assert_eq!(mmap_file_access(true, false, ro.flags()), Ok(()));
+        let rw = DmaBuf::from_prime(1, 0, 4096, VmObject::new_paged(1), DRM_CLOEXEC | DRM_RDWR);
+        assert_eq!(mmap_file_access(true, true, rw.flags()), Ok(()));
     }
 }
 
@@ -3024,6 +3058,25 @@ mod mmap_flag_tests {
                 kind
             );
         }
+    }
+
+    /// `MAP_HUGETLB` is a known legacy bit, but this kernel has no hugepages:
+    /// it must be refused, not truncated into a normal mapping.
+    #[test]
+    fn hugetlb_is_einval_not_a_silent_normal_mapping() {
+        assert_eq!(mmap_no_hugetlb(0), Ok(()));
+        assert_eq!(mmap_no_hugetlb(MAP_PRIVATE | MMAP_ANONYMOUS), Ok(()));
+        assert_eq!(
+            mmap_no_hugetlb(MAP_PRIVATE | MMAP_ANONYMOUS | MAP_HUGETLB),
+            Err(LxError::EINVAL)
+        );
+        assert_eq!(
+            mmap_no_hugetlb(MAP_SHARED_VALIDATE | MAP_HUGETLB | MAP_HUGE_2MB),
+            Err(LxError::EINVAL)
+        );
+        // Huge-size encodings alone are meaningless without MAP_HUGETLB;
+        // Linux ignores them on a normal mmap, and so do we.
+        assert_eq!(mmap_no_hugetlb(MAP_PRIVATE | MAP_HUGE_2MB), Ok(()));
     }
 }
 

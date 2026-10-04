@@ -1150,6 +1150,125 @@ fn render_top(total: u64, dropped: u64, mut rows: Vec<(u64, u64)>) -> String {
     out
 }
 
+/// Render `/proc/perf/ktop`: the kernel CPU profile since the previous read.
+///
+/// Reading empties it (see `kernel_hal::ktop`), so the useful pattern is a
+/// read to start the window, the workload, and a second read: `cat
+/// /proc/perf/ktop >/dev/null; sleep 10; cat /proc/perf/ktop`.
+pub fn ktop_report() -> String {
+    let t = kernel_hal::ktop::take();
+    let name = |a: u64| match kernel_hal::ksyms::lookup(a) {
+        Some((n, 0)) => String::from(n),
+        Some((n, off)) => alloc::format!("{}+{:#x}", n, off),
+        None => alloc::format!("{:#x}", a),
+    };
+    let mut out = render_ktop(&t, name);
+    if !kernel_hal::ksyms::available() {
+        let _ = writeln!(
+            out,
+            "\n(this kernel carries no symbol table: addresses are bare; symbolize \
+             them with `make sym ADDRS=\"...\"` where it was built)"
+        );
+    }
+    out
+}
+
+/// Rows each table shows.
+const KTOP_ROWS: usize = 30;
+
+fn ktop_pct(n: u64, of: u64) -> f64 {
+    if of == 0 {
+        0.0
+    } else {
+        n as f64 * 100.0 / of as f64
+    }
+}
+
+/// The body of [`ktop_report`], with the symbolizer passed in so the tests can
+/// name their own addresses.
+///
+/// Three views of the same samples:
+/// - SELF: the function the tick interrupted. Where the instructions are.
+/// - TOTAL: every function on the sampled paths, each counted once per sample
+///   however often it recurs. Where the time is *spent on behalf of*: a lock
+///   released by `pop_off` shows up under whoever took it.
+/// - PATHS: the whole call paths, hottest first, leaf on the left.
+fn render_ktop(t: &kernel_hal::ktop::Taken, name: impl Fn(u64) -> String) -> String {
+    use alloc::collections::BTreeMap;
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "eclipse perf — kernel CPU profile (ring 0, since the previous read)"
+    );
+    let _ = writeln!(out);
+    let ticks = t.samples + t.idle_ticks + t.lock_misses;
+    let _ = writeln!(
+        out,
+        "kernel ticks: {} busy ({:.1}%), {} idle; lost: {} (table locked) + {} (table full)",
+        t.samples + t.lock_misses,
+        ktop_pct(t.samples + t.lock_misses, ticks),
+        t.idle_ticks,
+        t.lock_misses,
+        t.full
+    );
+    let kept = t.samples - t.full;
+    if kept == 0 {
+        let _ = writeln!(
+            out,
+            "(no busy kernel tick in this window: read once, run the workload, read again)"
+        );
+        return out;
+    }
+    let mut leaf: BTreeMap<u64, u64> = BTreeMap::new();
+    let mut total: BTreeMap<u64, u64> = BTreeMap::new();
+    for (path, n) in t.rows.iter() {
+        let n = *n as u64;
+        *leaf.entry(path[0]).or_default() += n;
+        let frames = path.iter().take_while(|a| **a != 0);
+        for (i, a) in frames.clone().enumerate() {
+            // Once per sample: a recursive path names a function twice.
+            if !frames.clone().take(i).any(|b| b == a) {
+                *total.entry(*a).or_default() += n;
+            }
+        }
+    }
+    let sorted = |m: BTreeMap<u64, u64>| {
+        let mut v: Vec<(u64, u64)> = m.into_iter().collect();
+        v.sort_by_key(|r| (core::cmp::Reverse(r.1), r.0));
+        v
+    };
+    for (title, rows) in [("SELF", sorted(leaf)), ("TOTAL", sorted(total))] {
+        let _ = writeln!(out);
+        let _ = writeln!(out, "  {:>7}  {:>8}  FUNCTION", title, "SAMPLES");
+        for (a, n) in rows.into_iter().take(KTOP_ROWS) {
+            let _ = writeln!(out, "  {:>6.2}%  {:>8}  {}", ktop_pct(n, kept), n, name(a));
+        }
+    }
+    let mut paths: Vec<&(kernel_hal::ktop::Path, u32)> = t.rows.iter().collect();
+    paths.sort_by_key(|r| (core::cmp::Reverse(r.1), r.0));
+    let _ = writeln!(out);
+    let _ = writeln!(
+        out,
+        "  {:>7}  {:>8}  CALL PATH (leaf <- callers)",
+        "PATHS", "SAMPLES"
+    );
+    for (path, n) in paths.into_iter().take(KTOP_ROWS) {
+        let names: Vec<String> = path
+            .iter()
+            .take_while(|a| **a != 0)
+            .map(|a| name(*a))
+            .collect();
+        let _ = writeln!(
+            out,
+            "  {:>6.2}%  {:>8}  {}",
+            ktop_pct(*n as u64, kept),
+            n,
+            names.join(" <- ")
+        );
+    }
+    out
+}
+
 /// Render `/proc/<pid>/perf`: one process's syscall accounting.
 pub fn proc_report(proc: &LinuxProcess, pid: u64) -> String {
     let perf = proc.perf();
@@ -1805,5 +1924,132 @@ mod tests {
         let out = render_top(50, 50, Vec::new());
         assert!(out.contains("every sample was dropped"), "{}", out);
         assert!(!out.contains("OVERHEAD"), "{}", out);
+    }
+
+    fn ktop_taken(rows: &[([u64; kernel_hal::ktop::DEPTH], u32)]) -> kernel_hal::ktop::Taken {
+        kernel_hal::ktop::Taken {
+            rows: rows.to_vec(),
+            samples: rows.iter().map(|r| r.1 as u64).sum(),
+            full: 0,
+            lock_misses: 0,
+            idle_ticks: 0,
+        }
+    }
+
+    fn ktop_name(a: u64) -> String {
+        match a {
+            0x10 => "pop_off".into(),
+            0x20 => "MutexGuard::drop".into(),
+            0x30 => "VmAddressRegion::fork".into(),
+            0x40 => "sys_clone".into(),
+            0x50 => "pmem_copy".into(),
+            0x60 => "sys_futex".into(),
+            _ => alloc::format!("{:#x}", a),
+        }
+    }
+
+    /// The table that starts with `title` in a ktop report, as
+    /// `(percent, function)` rows.
+    fn ktop_table(out: &str, title: &str) -> Vec<(String, String)> {
+        out.lines()
+            .skip_while(|l| l.split_whitespace().next() != Some(title))
+            .skip(1)
+            .take_while(|l| !l.trim().is_empty())
+            .map(|l| {
+                let mut w = l.split_whitespace();
+                let pct = String::from(w.next().unwrap());
+                let _samples = w.next();
+                (pct, w.collect::<Vec<_>>().join(" "))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn ktop_charges_a_released_lock_to_the_function_that_held_it() {
+        // 60 ticks were delivered at the `pop_off` of a lock taken by `fork`,
+        // 30 in `pmem_copy` under `fork`, 10 in `sys_futex`. Where the
+        // instructions are is `pop_off`; where the time goes is `fork`.
+        let t = ktop_taken(&[
+            ([0x10, 0x20, 0x30, 0x40, 0, 0], 60),
+            ([0x50, 0x30, 0x40, 0, 0, 0], 30),
+            ([0x60, 0, 0, 0, 0, 0], 10),
+        ]);
+        let out = render_ktop(&t, ktop_name);
+        let own = ktop_table(&out, "SELF");
+        assert_eq!(own[0], ("60.00%".into(), "pop_off".into()), "{}", out);
+        assert_eq!(own[1], ("30.00%".into(), "pmem_copy".into()), "{}", out);
+        assert_eq!(own[2], ("10.00%".into(), "sys_futex".into()), "{}", out);
+        let total = ktop_table(&out, "TOTAL");
+        assert_eq!(
+            total[0],
+            ("90.00%".into(), "VmAddressRegion::fork".into()),
+            "{}",
+            out
+        );
+        assert_eq!(total[1], ("90.00%".into(), "sys_clone".into()), "{}", out);
+        let paths = ktop_table(&out, "PATHS");
+        assert_eq!(
+            paths[0],
+            (
+                "60.00%".into(),
+                "pop_off <- MutexGuard::drop <- VmAddressRegion::fork <- sys_clone".into()
+            ),
+            "{}",
+            out
+        );
+        assert_eq!(paths.len(), 3, "{}", out);
+    }
+
+    #[test]
+    fn ktop_counts_a_recursive_function_once_per_sample() {
+        // `fork` twice on one path is still one sample spent in `fork`, and
+        // the total column cannot pass 100%.
+        let t = ktop_taken(&[([0x50, 0x30, 0x30, 0x40, 0, 0], 4)]);
+        let out = render_ktop(&t, ktop_name);
+        let total = ktop_table(&out, "TOTAL");
+        assert!(
+            total.contains(&("100.00%".into(), "VmAddressRegion::fork".into())),
+            "{}",
+            out
+        );
+        assert!(total.iter().all(|r| r.0 == "100.00%"), "{}", out);
+    }
+
+    #[test]
+    fn ktop_shares_are_of_the_samples_kept_and_the_header_says_what_was_lost() {
+        let mut t = ktop_taken(&[([0x60, 0, 0, 0, 0, 0], 50)]);
+        // 10 more were offered but had no room; they are in `samples`.
+        t.samples += 10;
+        t.full = 10;
+        t.lock_misses = 5;
+        t.idle_ticks = 35;
+        let out = render_ktop(&t, ktop_name);
+        assert!(
+            out.contains(
+                "kernel ticks: 65 busy (65.0%), 35 idle; lost: 5 (table locked) + 10 (table full)"
+            ),
+            "{}",
+            out
+        );
+        assert_eq!(
+            ktop_table(&out, "SELF")[0],
+            ("100.00%".into(), "sys_futex".into()),
+            "{}",
+            out
+        );
+    }
+
+    #[test]
+    fn ktop_with_no_busy_tick_says_how_to_take_a_window() {
+        let mut t = ktop_taken(&[]);
+        t.idle_ticks = 100;
+        let out = render_ktop(&t, ktop_name);
+        assert!(out.contains("0 busy (0.0%), 100 idle"), "{}", out);
+        assert!(
+            out.contains("read once, run the workload, read again"),
+            "{}",
+            out
+        );
+        assert!(!out.contains("SELF"), "{}", out);
     }
 }

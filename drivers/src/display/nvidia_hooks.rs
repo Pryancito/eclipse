@@ -185,3 +185,172 @@ pub fn install(mapper: &Option<Arc<dyn IoMapper>>) {
     }
     nvidia_rm_sys::hooks::register_hooks(&ECLIPSE_NVRM_HOOKS);
 }
+
+#[cfg(test)]
+mod nvidia_hooks_tests {
+    use super::*;
+    use crate::nvme::nvme_queue::test_clock;
+
+    /// The handle the RM carries around is packed on the other side of the FFI
+    /// boundary, by `os_pci_init_handle` in `nvidia-rm-sys`, and unpacked here.
+    /// Nothing links the two but this layout: if either side moves a field, the
+    /// RM goes on reading and WRITING config space at a different PCI function
+    /// than the GPU it thinks it is talking to. So the test is the round trip
+    /// through the real packer, not a copy of its arithmetic.
+    #[test]
+    fn a_packed_pci_handle_decodes_back_to_the_same_location() {
+        for (bus, slot, function) in [
+            (0u8, 0u8, 0u8),
+            (0x01, 0x00, 0x00),
+            (0x65, 0x00, 0x01),
+            (0xFF, 0xFF, 0x07),
+        ] {
+            let handle = nvidia_rm_sys::os_interface::os_pci_init_handle(
+                0,
+                bus,
+                slot,
+                function,
+                core::ptr::null_mut(),
+                core::ptr::null_mut(),
+            ) as usize;
+            let loc = decode_handle(handle);
+            assert_eq!(
+                (loc.bus, loc.device, loc.function),
+                (bus, slot, function),
+                "handle {:#x} decoded to {:?}",
+                handle,
+                (loc.bus, loc.device, loc.function)
+            );
+        }
+    }
+
+    /// The top bit is a "valid handle" tag, there so that a real
+    /// bus=device=function=0 location -- this GPU's own function 0 -- does not
+    /// pack to 0 and read as a null handle. Decoding has to mask it off rather
+    /// than let it land in the bus number.
+    #[test]
+    fn the_valid_tag_never_reaches_the_bus_number() {
+        let handle = nvidia_rm_sys::os_interface::os_pci_init_handle(
+            0,
+            0,
+            0,
+            0,
+            core::ptr::null_mut(),
+            core::ptr::null_mut(),
+        ) as usize;
+        assert_ne!(handle, 0, "a valid location must not pack to a null handle");
+        let loc = decode_handle(handle);
+        assert_eq!((loc.bus, loc.device, loc.function), (0, 0, 0));
+    }
+
+    /// A handle that was never packed (an `NV_STATUS` default of 0 arriving
+    /// where a handle was expected) decodes to 0/0/0 rather than to something
+    /// random: reads there are no-ops, because real hardware only exists where
+    /// the PCI scan already found it.
+    #[test]
+    fn an_unpacked_handle_decodes_to_the_harmless_location() {
+        let loc = decode_handle(0);
+        assert_eq!((loc.bus, loc.device, loc.function), (0, 0, 0));
+    }
+
+    /// The RM builds every timeout out of this clock as an absolute deadline
+    /// (`now + timeout`), so a reading that wraps round sends the deadline
+    /// backwards and the wait ends instantly -- or never. Microseconds times a
+    /// thousand overflows a `u64` above ~1.8e16 us, which a TSC-derived
+    /// reading can reach on a machine that has been up a while or whose TSC
+    /// starts high; it has to saturate, not wrap.
+    #[test]
+    fn the_nanosecond_clock_saturates_instead_of_wrapping() {
+        let hooks = EclipseNvrmHooks::new();
+        test_clock::set_auto_advance(0);
+
+        test_clock::set(0);
+        assert_eq!(hooks.monotonic_time_ns(), 0);
+
+        test_clock::set(1_234_567);
+        assert_eq!(hooks.monotonic_time_ns(), 1_234_567_000);
+
+        test_clock::set(u64::MAX);
+        assert_eq!(
+            hooks.monotonic_time_ns(),
+            u64::MAX,
+            "a clock that wraps sends every RM deadline into the past"
+        );
+        // One microsecond above where the multiply stops fitting: still
+        // forward, never a small number.
+        test_clock::set(u64::MAX / 1000 + 1);
+        assert_eq!(hooks.monotonic_time_ns(), u64::MAX);
+
+        test_clock::set(0);
+    }
+
+    /// The delay must run to true completion while the timer advances. The
+    /// previous version capped TOTAL spins, which on real hardware truncated
+    /// every long wait to about 140 ms however healthy the timer was: the
+    /// "500 ms" SEC2 silent window really waited 140 ms, and count-based
+    /// firmware waits shrank with it.
+    #[test]
+    fn a_delay_waits_the_whole_time_it_was_asked_for() {
+        test_clock::set(0);
+        // One microsecond per reading: the loop's own progress, nothing else.
+        test_clock::set_auto_advance(1);
+        for us in [1u64, 10, 1_000, 500_000] {
+            test_clock::set(0);
+            udelay(us);
+            let reached = {
+                test_clock::set_auto_advance(0);
+                let now = test_clock::now();
+                test_clock::set_auto_advance(1);
+                now
+            };
+            assert!(
+                reached >= us,
+                "a {} us delay returned after only {} us",
+                us,
+                reached
+            );
+            // And it stops there. One reading per microsecond is all this
+            // clock gives, so a deadline check that is off by one spends a
+            // whole extra microsecond on every delay the RM asks for -- and
+            // the RM asks for tens of thousands of them per GSP boot.
+            assert!(
+                reached <= us + 1,
+                "a {} us delay overshot to {} us",
+                us,
+                reached
+            );
+        }
+        test_clock::set_auto_advance(0);
+        test_clock::set(0);
+    }
+
+    /// A delay of zero is not a delay: the first reading is already past the
+    /// deadline, so it must not spin at all.
+    #[test]
+    fn a_zero_delay_returns_at_once() {
+        test_clock::set_auto_advance(0);
+        test_clock::set(50_000);
+        udelay(0);
+        assert_eq!(
+            test_clock::now(),
+            50_000,
+            "a zero delay moved the clock, so it spun"
+        );
+        test_clock::set(0);
+    }
+
+    /// And a delay asked for across the point where the microsecond reading
+    /// wraps still ends: the elapsed-time check is a wrapping subtraction, so
+    /// a timer that rolls over mid-wait does not turn a 10 us delay into a
+    /// half-million-year one.
+    #[test]
+    fn a_delay_across_the_timer_wrap_still_ends() {
+        test_clock::set(u64::MAX - 4);
+        test_clock::set_auto_advance(1);
+        udelay(10);
+        test_clock::set_auto_advance(0);
+        // It came back, and it came back past the wrap rather than before it.
+        assert!(test_clock::now() < 100, "the wait did not cross the wrap");
+        test_clock::set(0);
+    }
+}

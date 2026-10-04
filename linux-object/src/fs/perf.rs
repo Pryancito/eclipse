@@ -181,7 +181,7 @@ pub struct PerfEvent {
     cpu: i32,
     /// PID this event profiles, or `-1` for all processes.
     pid: i32,
-    flags: OpenFlags,
+    flags: Mutex<OpenFlags>,
     eventbus: Arc<Mutex<EventBus>>,
     inner: Arc<Mutex<PerfInner>>,
 }
@@ -223,7 +223,7 @@ impl PerfEvent {
             base: KObjectBase::new(),
             cpu,
             pid,
-            flags,
+            flags: Mutex::new(flags),
             eventbus: EventBus::new(),
             inner: Arc::new(Mutex::new(PerfInner {
                 _type: type_,
@@ -452,10 +452,13 @@ impl PerfEvent {
 #[async_trait]
 impl FileLike for PerfEvent {
     fn flags(&self) -> OpenFlags {
-        self.flags
+        *self.flags.lock()
     }
 
-    fn set_flags(&self, _f: OpenFlags) -> LxResult {
+    fn set_flags(&self, f: OpenFlags) -> LxResult {
+        // Same trap as epoll/eventfd before `take_settable`: a no-op made
+        // `fcntl(F_SETFL, O_NONBLOCK)` "succeed" while `F_GETFL` never changed.
+        self.flags.lock().take_settable(f);
         Ok(())
     }
 
@@ -500,8 +503,14 @@ impl FileLike for PerfEvent {
         Err(LxError::EINVAL)
     }
 
-    async fn read_at(&self, _offset: u64, buf: &mut [u8]) -> LxResult<usize> {
-        self.read(buf).await
+    fn write_at(&self, _offset: u64, _buf: &[u8]) -> LxResult<usize> {
+        // perf fds are not seekable; pwrite must be ESPIPE (write stays EINVAL).
+        Err(LxError::ESPIPE)
+    }
+
+    async fn read_at(&self, _offset: u64, _buf: &mut [u8]) -> LxResult<usize> {
+        // perf fds are not seekable; pread must be ESPIPE, not a silent read.
+        Err(LxError::ESPIPE)
     }
 
     fn poll(&self, _events: PollEvents) -> LxResult<PollStatus> {
@@ -733,6 +742,18 @@ mod tests {
             -1,
             OpenFlags::empty(),
         )
+    }
+
+    /// `fcntl(F_SETFL, O_NONBLOCK)` on a perf fd used to return success while
+    /// leaving the bit clear.
+    #[test]
+    fn set_flags_turns_a_blocking_perf_event_non_blocking() {
+        let fd = open(0, 0, 0, 1);
+        assert!(!fd.flags().non_block());
+        fd.set_flags(OpenFlags::NON_BLOCK).unwrap();
+        assert!(fd.flags().non_block());
+        fd.set_flags(OpenFlags::empty()).unwrap();
+        assert!(!fd.flags().non_block());
     }
 
     /// An event with `data_pages` data pages behind its control page.
@@ -1448,8 +1469,12 @@ mod tests {
         let ev = open(0, 0, 0, 1);
         assert_eq!(ev.write(b"x").unwrap_err(), LxError::EINVAL);
         assert!(!ev.poll(PollEvents::empty()).unwrap().write);
-        // read_at ignores the offset: the fd has no seekable contents.
+        // Not seekable: pread/pwrite are ESPIPE (write stays EINVAL).
         let mut buf = [0u8; 8];
-        assert_eq!(ev.read_at(4096, &mut buf).await.unwrap(), 8);
+        assert_eq!(
+            ev.read_at(4096, &mut buf).await.unwrap_err(),
+            LxError::ESPIPE
+        );
+        assert_eq!(ev.write_at(0, b"x").unwrap_err(), LxError::ESPIPE);
     }
 }
