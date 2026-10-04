@@ -450,9 +450,16 @@ impl DspDev {
     ///
     /// Every open starts from the node's defaults: the runtime (format,
     /// fragments, trigger) belongs to the fd, as on Linux.
+    ///
+    /// The diagnostics on this path and on the data path go out through
+    /// `klog_*` rather than `log::`: `log::` is gated by `LOG=<level>` from
+    /// the boot cmdline, so a machine booted with `LOG=error` -- which is
+    /// what the CI images use -- reports an `EIO` with nothing in `dmesg`
+    /// to say which of its causes it was. That is exactly how the first
+    /// instrumentation of this node came back empty.
     pub fn open_client(&self) -> Result<Arc<dyn INode>> {
         let (audio, release_opened_on_drop) = match self.audio.open_stream().map_err(|e| {
-            warn!("[dsp{}] open: open_stream failed: {:?}", self.index, e);
+            kernel_hal::klog_warn!("[dsp{}] open: open_stream failed: {:?}", self.index, e);
             FsError::DeviceError
         })? {
             Some(stream) => (stream, false),
@@ -567,9 +574,11 @@ impl DspDev {
     fn make_ready(&self, rt: &mut OssRuntime) -> Result<()> {
         if rt.params_dirty {
             let (hw_rate, _) = self.audio.set_params(rt.params.rate, 2).map_err(|e| {
-                warn!(
+                kernel_hal::klog_warn!(
                     "[dsp{}] configure: set_params({} Hz, 2ch) failed: {:?} -> EIO",
-                    self.index, rt.params.rate, e
+                    self.index,
+                    rt.params.rate,
+                    e
                 );
                 FsError::DeviceError
             })?;
@@ -581,7 +590,7 @@ impl DspDev {
             // `set_params` wiped the ring: that is the prepare.
             rt.prepare = false;
             rt.partial_len = 0;
-            info!(
+            kernel_hal::klog_info!(
                 "[dsp{}] configured: fmt {:#x} {}ch {} Hz (device {} Hz), fragment {} B x {}",
                 self.index,
                 rt.params.format,
@@ -593,7 +602,7 @@ impl DspDev {
             );
         } else if rt.prepare {
             self.audio.reset().map_err(|e| {
-                warn!("[dsp{}] prepare: reset failed: {:?} -> EIO", self.index, e);
+                kernel_hal::klog_warn!("[dsp{}] prepare: reset failed: {:?} -> EIO", self.index, e);
                 FsError::DeviceError
             })?;
             rt.prepare = false;
@@ -601,9 +610,11 @@ impl DspDev {
         }
         // A stream held by `SETTRIGGER` stays held across a prepare.
         self.audio.set_start_hold(!rt.trigger).map_err(|e| {
-            warn!(
+            kernel_hal::klog_warn!(
                 "[dsp{}] configure: set_start_hold({}) failed: {:?} -> EIO",
-                self.index, !rt.trigger, e
+                self.index,
+                !rt.trigger,
+                e
             );
             FsError::DeviceError
         })?;
@@ -693,7 +704,7 @@ impl DspDev {
                 0
             } else if passthrough {
                 self.audio.write(&src[..take * cf]).map_err(|e| {
-                    warn!(
+                    kernel_hal::klog_warn!(
                         "[dsp{}] write: device refused {} B: {:?} -> EIO",
                         self.index,
                         take * cf,
@@ -705,7 +716,7 @@ impl DspDev {
                 hw.clear();
                 convert_frames(format, channels, src, take, &mut hw);
                 self.audio.write(&hw).map_err(|e| {
-                    warn!(
+                    kernel_hal::klog_warn!(
                         "[dsp{}] write: device refused {} converted B: {:?} -> EIO",
                         self.index,
                         hw.len(),
@@ -734,7 +745,7 @@ impl DspDev {
             // the writer forever. The lock is released meanwhile so another
             // thread's `GETODELAY` is not held up behind a blocked write.
             if kernel_hal::timer::timer_now() >= deadline {
-                warn!(
+                kernel_hal::klog_warn!(
                     "[dsp{}] playback ring made no progress; giving up: room {} B, \
                      frame {} B, OSS buffer {} B ({} B x {}), device queued {} B, \
                      ring free {} B, playing {}, hold {}",
@@ -770,7 +781,7 @@ impl DspDev {
             // A blocking write that took nothing: the ring never freed a
             // whole client frame before the deadline above. The numbers are
             // in that `warn!`; this says which `write(2)` it answered.
-            warn!(
+            kernel_hal::klog_warn!(
                 "[dsp{}] write: nothing taken from a {} B write -> EIO",
                 self.index,
                 buf.len()
