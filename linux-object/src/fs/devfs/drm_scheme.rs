@@ -1755,6 +1755,17 @@ impl DrmDev {
                     }
                     active_area = Some((w, h));
                 }
+                // "Count connectors is 0 but mode set" (`drm_mode_setcrtc`,
+                // EINVAL): a mode is set *on* connectors, so a mode with an
+                // empty list is refused, after the viewport and before the
+                // list is read; the call without a mode is the one that
+                // takes an empty list, since it turns the pipe off. Accepted
+                // here: the mode was set and shown with nothing routed to
+                // the CRTC, so GETCRTC reported a mode the connector's
+                // CRTC_ID never had.
+                if req.count_connectors == 0 && req.mode_valid != 0 {
+                    return Err(FsError::InvalidParam);
+                }
                 if req.count_connectors > 0 {
                     if req.mode_valid == 0 || fb_id == 0 {
                         return Err(FsError::InvalidParam);
@@ -1767,7 +1778,11 @@ impl DrmDev {
                     ucheck_n::<u32>(req.set_connectors_ptr as usize, n)?;
                     for i in 0..n {
                         let id = unsafe { *(req.set_connectors_ptr as *const u32).add(i) };
-                        if !connectors.contains(&id) {
+                        // `drm_connector_lookup`: the object, by id, as
+                        // `get_crtc` above -- the synthetic connector stays
+                        // answerable beside a card that owns the resource
+                        // list, like its CRTC does.
+                        if drm::get_connector(id).is_none() {
                             return Err(FsError::EntryNotFound);
                         }
                     }
