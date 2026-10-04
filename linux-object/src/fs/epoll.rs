@@ -589,7 +589,7 @@ impl Epoll {
                 // publication after this line moves it past what is stored,
                 // and the next scan (or the edge subscription below) sees it.
                 let seq = if event.events & EPOLLET != 0 {
-                    file.readiness_seq()
+                    file.readiness_seq(interest)
                 } else {
                     None
                 };
@@ -1692,7 +1692,7 @@ mod edge_trigger_tests {
         // The counter is read before the level: a write that lands after the
         // scan moved it past what the subscription is told it has seen.
         let mut bus = crate::sync::EventBus::default();
-        let seen = bus.seq();
+        let seen = bus.seq_for(crate::sync::Event::READABLE);
         bus.set(crate::sync::Event::READABLE);
         let (count, waker) = counting_waker();
         assert_eq!(
@@ -1715,7 +1715,9 @@ mod edge_trigger_tests {
         bus.clear(Event::READABLE);
         assert_eq!(bus.seq(), s1 + 1);
         bus.set(Event::READABLE);
-        let seen = bus.seq();
+        // `seen` is the counter for the mask the subscription asks about, not
+        // the whole bus: a `WRITABLE` publication below must leave it alone.
+        let seen = bus.seq_for(Event::READABLE);
         let (count, waker) = counting_waker();
         // A latched flag does not fire an edge subscription...
         let id = bus.subscribe_edge(Event::READABLE, &waker, seen);
@@ -1730,7 +1732,7 @@ mod edge_trigger_tests {
         bus.set(Event::READABLE);
         assert_eq!(count.0.load(Ordering::SeqCst), 1, "one-shot");
         // Unsubscribing removes a parked edge waiter.
-        let seen = bus.seq();
+        let seen = bus.seq_for(Event::READABLE);
         let id = bus.subscribe_edge(Event::READABLE, &waker, seen).unwrap();
         assert_eq!(bus.get_callback_len(), 1);
         bus.unsubscribe(id);

@@ -2519,12 +2519,7 @@ impl Default for StoredInetOpts {
 impl StoredInetOpts {
     /// Apply a common inet sockopt. `Some` = handled (incl. errors);
     /// `None` = caller should keep going (e.g. raw `IP_HDRINCL`).
-    pub fn try_setsockopt(
-        &mut self,
-        level: usize,
-        opt: usize,
-        data: &[u8],
-    ) -> Option<SysResult> {
+    pub fn try_setsockopt(&mut self, level: usize, opt: usize, data: &[u8]) -> Option<SysResult> {
         const SOL_SOCKET: usize = 1;
         const IPPROTO_IP: usize = 0;
         const IPPROTO_TCP: usize = 6;
@@ -2553,10 +2548,8 @@ impl StoredInetOpts {
                     if data.len() < 8 {
                         return Some(Err(LxError::EINVAL));
                     }
-                    self.linger_on =
-                        i32::from_ne_bytes([data[0], data[1], data[2], data[3]]) != 0;
-                    self.linger_sec =
-                        i32::from_ne_bytes([data[4], data[5], data[6], data[7]]);
+                    self.linger_on = i32::from_ne_bytes([data[0], data[1], data[2], data[3]]) != 0;
+                    self.linger_sec = i32::from_ne_bytes([data[4], data[5], data[6], data[7]]);
                     return Some(Ok(0));
                 }
                 20 | 21 => {

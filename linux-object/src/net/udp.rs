@@ -700,9 +700,8 @@ impl Socket for UdpSocketState {
             }
             let mut tv = [0u8; 16];
             tv.copy_from_slice(&data[..16]);
-            let usec = i64::from_ne_bytes([
-                tv[8], tv[9], tv[10], tv[11], tv[12], tv[13], tv[14], tv[15],
-            ]);
+            let usec =
+                i64::from_ne_bytes([tv[8], tv[9], tv[10], tv[11], tv[12], tv[13], tv[14], tv[15]]);
             if !(0..1_000_000).contains(&usec) {
                 return Err(LxError::EINVAL);
             }

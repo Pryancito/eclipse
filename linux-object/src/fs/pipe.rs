@@ -195,10 +195,12 @@ impl Pipe {
         }
     }
 
-    /// The pipe's publication counter (see `FileLike::readiness_seq`). One
-    /// bus serves both ends, so it also moves for the other end's events.
-    pub fn readiness_seq(&self) -> u64 {
-        self.data.lock().eventbus.seq()
+    /// The pipe's publication counter for the directions `events` names (see
+    /// `FileLike::readiness_seq`). One bus serves both ends, so it also moves
+    /// for the other end's events -- but only in the directions asked for.
+    pub fn readiness_seq(&self, events: crate::fs::PollEvents) -> u64 {
+        let mask = crate::fs::poll_events_to_bus_mask(events);
+        self.data.lock().eventbus.seq_for(mask)
     }
 
     /// Park `waker` for the pipe's next published event in `events` (see
