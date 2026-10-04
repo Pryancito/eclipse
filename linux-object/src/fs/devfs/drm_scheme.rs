@@ -1392,6 +1392,33 @@ impl DrmDev {
             DRM_IOCTL_MODE_SETCRTC => {
                 // struct drm_mode_crtc has the same layout as DrmModeGetCrtc.
                 let req = unsafe { &mut *(data as *mut DrmModeGetCrtc) };
+                // `drm_mode_setcrtc` finds the CRTC before anything else
+                // (ENOENT), refuses a connector list with no mode or no fb to
+                // set them to (EINVAL) or longer than the card's connectors
+                // (EINVAL), and looks every connector in it up (ENOENT). None
+                // of it was read: a modeset on a CRTC the card does not have
+                // went to the one it has, and a connector list of any content
+                // was accepted unread.
+                if drm::get_crtc(req.crtc_id).is_none() {
+                    return Err(FsError::EntryNotFound);
+                }
+                if req.count_connectors > 0 {
+                    if req.mode_valid == 0 || req.fb_id == 0 {
+                        return Err(FsError::InvalidParam);
+                    }
+                    let connectors = drm::get_resources().2;
+                    if req.count_connectors as usize > connectors.len() {
+                        return Err(FsError::InvalidParam);
+                    }
+                    let n = req.count_connectors as usize;
+                    ucheck_n::<u32>(req.set_connectors_ptr as usize, n)?;
+                    for i in 0..n {
+                        let id = unsafe { *(req.set_connectors_ptr as *const u32).add(i) };
+                        if !connectors.contains(&id) {
+                            return Err(FsError::EntryNotFound);
+                        }
+                    }
+                }
                 if req.mode_valid != 0 {
                     drm::set_vblank_period_from_modeinfo(&req.mode);
                 }
@@ -1427,6 +1454,13 @@ impl DrmDev {
                     || flip.flags & (DRM_MODE_PAGE_FLIP_ASYNC | DRM_MODE_PAGE_FLIP_TARGET) != 0
                 {
                     return Err(FsError::InvalidParam);
+                }
+                // The CRTC first, then the fb, both ENOENT: `drm_crtc_find`
+                // and `drm_framebuffer_lookup` in that order. The CRTC id was
+                // never read, so a flip aimed at a CRTC the card does not have
+                // landed on the one it has.
+                if drm::get_crtc(flip.crtc_id).is_none() {
+                    return Err(FsError::EntryNotFound);
                 }
                 if drm::get_fb(flip.fb_id).is_none() {
                     return Err(FsError::EntryNotFound);
@@ -1538,6 +1572,12 @@ impl DrmDev {
                     return Err(FsError::EntryNotFound);
                 }
                 if req.fb_id != 0 {
+                    // With an fb to show, `drm_mode_setplane` looks the fb up
+                    // and then the CRTC, both ENOENT. The CRTC id was not
+                    // read either.
+                    if drm::get_fb(req.fb_id).is_none() || drm::get_crtc(req.crtc_id).is_none() {
+                        return Err(FsError::EntryNotFound);
+                    }
                     if let Err(e) = drm::present_now_checked(req.fb_id, req.crtc_id, None) {
                         present_failed("SETPLANE", req.fb_id, req.crtc_id, e)?;
                     }
@@ -6455,6 +6495,7 @@ mod ioctl_size_reconciliation_tests {
 #[cfg(test)]
 mod gl_client_sequence_tests {
     use super::*;
+    use crate::fs::devfs::kms_emu;
 
     /// One open DRM file, driven the way libdrm drives it: a request number and
     /// a pointer to a struct the caller owns. Deliberately NOT a set of direct
@@ -6664,7 +6705,10 @@ mod gl_client_sequence_tests {
     /// once.
     #[test]
     fn one_frame_allocates_wraps_flips_and_gets_its_completion() {
-        let _serialised = drm::test_globals::lock();
+        // An output, so CRTC 1 exists: `PAGE_FLIP` looks the CRTC up first,
+        // as Linux does, and a card with nothing to scan out reports no
+        // CRTC at all. The screen holds the DRM test lock.
+        let _screen = kms_emu::attach(64, 64);
         let client = Client::open(0);
         let before = table_sizes();
 
@@ -6676,9 +6720,7 @@ mod gl_client_sequence_tests {
 
         let fb = client.addfb2(&buf);
 
-        // The flip itself. There is no display to blit into, and the arms treat
-        // that as a frame that could not be copied rather than a modeset that
-        // failed -- so a flip is still accepted and still owes an event.
+        // The flip itself, onto the emulated output; it owes an event.
         assert_eq!(client.page_flip(1, fb, 0xDEAD_BEEF), Ok(0));
 
         // The completion is scheduled for the next synthetic vblank, and
@@ -6716,7 +6758,8 @@ mod gl_client_sequence_tests {
     /// above passes happily with a flip counter that never decrements.
     #[test]
     fn a_double_buffered_loop_runs_clean_for_many_frames() {
-        let _serialised = drm::test_globals::lock();
+        // Same output as the single frame above, for the same reason.
+        let _screen = kms_emu::attach(64, 64);
         let client = Client::open(0);
         let before = table_sizes();
 
@@ -11904,6 +11947,105 @@ mod hw_kms_tests {
         assert_eq!(c.ioctl(DRM_IOCTL_MODE_SETPROPERTY, &mut cset), enoent);
         cset.prop_id = PROP_DPMS;
         assert_eq!(c.ioctl(DRM_IOCTL_MODE_SETPROPERTY, &mut cset), Ok(0));
+    }
+
+    /// `drm_mode_setcrtc` finds the CRTC first and every connector it is
+    /// handed (ENOENT), and refuses a connector list with no mode or no fb
+    /// to set, or longer than the card's connectors (EINVAL);
+    /// `drm_mode_page_flip_ioctl` and `drm_mode_setplane` find the CRTC
+    /// too. None of the three read the CRTC id, and SETCRTC never read its
+    /// connector list: a modeset or a flip aimed at a CRTC the card does not
+    /// have landed on the one it has. The real ids keep working.
+    #[test]
+    fn setcrtc_page_flip_and_setplane_look_the_crtc_and_the_connectors_up() {
+        let screen = kms_emu::attach(32, 8);
+        let _gpu = screen.attach_gpu(EmuGpu::hardware_kms("emu-gpu").with_ids(60, 61, 62));
+        let c = Client::open(0);
+        const BOGUS: u32 = 4242;
+        let enoent = Err(FsError::EntryNotFound);
+        let buf = c.create_dumb(32, 8);
+        paint(&buf, 0x0000_3333);
+        let fb = c.addfb2(&buf);
+        // What the CRTC shows before this test touches it (the core's
+        // `crtc_fb` is process-wide, so it may carry a neighbour's id).
+        let before = get_crtc_fb(&c, 60);
+        assert_ne!(before, fb);
+
+        let setcrtc = |crtc_id: u32, connectors: &[u32], mode_valid: u32, fb_id: u32| {
+            let mut req = DrmModeGetCrtc {
+                set_connectors_ptr: connectors.as_ptr() as u64,
+                count_connectors: connectors.len() as u32,
+                crtc_id,
+                fb_id,
+                x: 0,
+                y: 0,
+                gamma_size: 0,
+                mode_valid,
+                mode: make_modeinfo(32, 8),
+            };
+            c.ioctl(DRM_IOCTL_MODE_SETCRTC, &mut req)
+        };
+        assert_eq!(
+            setcrtc(BOGUS, &[61], 1, fb),
+            enoent,
+            "a CRTC the card does not have"
+        );
+        assert_eq!(
+            setcrtc(60, &[BOGUS], 1, fb),
+            enoent,
+            "a connector it does not have"
+        );
+        assert_eq!(
+            setcrtc(60, &[61, BOGUS], 1, fb),
+            Err(FsError::InvalidParam),
+            "more connectors than the card has"
+        );
+        assert_eq!(
+            setcrtc(60, &[61], 0, fb),
+            Err(FsError::InvalidParam),
+            "connectors but no mode"
+        );
+        assert_eq!(
+            setcrtc(60, &[61], 1, 0),
+            Err(FsError::InvalidParam),
+            "connectors but no fb"
+        );
+        assert_eq!(
+            get_crtc_fb(&c, 60),
+            before,
+            "a refused modeset presented anyway"
+        );
+        assert_eq!(
+            setcrtc(60, &[61], 1, fb),
+            Ok(0),
+            "the real CRTC and connector"
+        );
+        assert_eq!(get_crtc_fb(&c, 60), fb);
+
+        let mut flip = DrmModeCrtcPageFlip {
+            crtc_id: BOGUS,
+            fb_id: fb,
+            flags: 0x01, // DRM_MODE_PAGE_FLIP_EVENT
+            reserved: 0,
+            user_data: 7,
+        };
+        assert_eq!(c.ioctl(DRM_IOCTL_MODE_PAGE_FLIP, &mut flip), enoent);
+        let mut events = [0u8; 256];
+        assert!(
+            matches!(c.read_events(&mut events), Err(_) | Ok(0)),
+            "a refused flip queued a completion"
+        );
+
+        let mut set_plane: DrmModeSetPlane = zeroed();
+        set_plane.plane_id = 62;
+        set_plane.crtc_id = BOGUS;
+        set_plane.fb_id = fb;
+        assert_eq!(c.ioctl(DRM_IOCTL_MODE_SETPLANE, &mut set_plane), enoent);
+        set_plane.crtc_id = 60;
+        assert_eq!(c.ioctl(DRM_IOCTL_MODE_SETPLANE, &mut set_plane), Ok(0));
+
+        c.rmfb(fb).expect("RMFB");
+        c.destroy_dumb(buf.handle).expect("DESTROY_DUMB");
     }
 }
 
