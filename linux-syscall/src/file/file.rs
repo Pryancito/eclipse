@@ -1357,9 +1357,12 @@ impl Syscall<'_> {
                     }
                 };
                 match op {
-                    PrimeRequest::Export { handle, flags: _ } => {
+                    PrimeRequest::Export { handle, flags } => {
                         // handle -> new dma-buf fd. `h.fd` is an OUTPUT here:
-                        // whatever the caller left in it is not read.
+                        // whatever the caller left in it is not read. `flags`
+                        // says what the fd is open as (`DRM_RDWR`) and whether
+                        // it is close-on-exec (`DRM_CLOEXEC`); `add_file` reads
+                        // the second off the object, as it does for `open`.
                         let (phys, size, vmo) = match drm::export_handle(handle) {
                             Some(v) => v,
                             None => {
@@ -1370,7 +1373,7 @@ impl Syscall<'_> {
                                 return Err(LxError::EINVAL);
                             }
                         };
-                        let dmabuf = DmaBuf::from_prime(handle, phys, size, vmo);
+                        let dmabuf = DmaBuf::from_prime(handle, phys, size, vmo, flags);
                         let new_fd = match proc.add_file(dmabuf) {
                             Ok(fd) => fd,
                             Err(e) => {

@@ -2115,6 +2115,25 @@ mod mmap_file_access_tests {
             Ok(())
         );
     }
+
+    /// A dma-buf exported without `DRM_RDWR` is `O_RDONLY`, so mapping it
+    /// `MAP_SHARED | PROT_WRITE` is `EACCES` as on Linux; with the flag the
+    /// mapping goes through. The fd used to be `O_RDWR` whatever the export
+    /// asked for.
+    #[test]
+    fn a_dma_buf_exported_without_drm_rdwr_cannot_be_mapped_writable() {
+        use linux_object::fs::devfs::drm_scheme::{DRM_CLOEXEC, DRM_RDWR};
+        use linux_object::fs::{DmaBuf, FileLike};
+        use zircon_object::vm::VmObject;
+        let ro = DmaBuf::from_prime(1, 0, 4096, VmObject::new_paged(1), DRM_CLOEXEC);
+        assert_eq!(
+            mmap_file_access(true, true, ro.flags()),
+            Err(LxError::EACCES)
+        );
+        assert_eq!(mmap_file_access(true, false, ro.flags()), Ok(()));
+        let rw = DmaBuf::from_prime(1, 0, 4096, VmObject::new_paged(1), DRM_CLOEXEC | DRM_RDWR);
+        assert_eq!(mmap_file_access(true, true, rw.flags()), Ok(()));
+    }
 }
 
 #[cfg(test)]
