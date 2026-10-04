@@ -880,3 +880,96 @@ fn process_read_memory_reads_past_one_kernel_buffer_in_order() {
         Box::pin(async move { drop(ct) })
     });
 }
+
+/// Handle / type errors must win over options, kind, buffer, and rights-bits
+/// validation. Several syscalls used to answer INVALID_ARGS / ACCESS_DENIED
+/// for a bad or wrong-typed handle when the caller also passed a bad argument.
+#[test]
+fn handle_errors_are_not_masked_by_bad_options_or_args() {
+    use zircon_object::signal::EventPair;
+    // No user mapping: every path below fails before writing an out pointer.
+    with_test_thread(|ct| {
+        let sc = Syscall {
+            thread: &ct,
+            thread_fn: finish_thread,
+        };
+        let proc = ct.proc();
+        let bad = 0x7777_7777u32;
+        let null = 0usize;
+        let event = proc.add_handle(Handle::new(Event::new(), Rights::DEFAULT_EVENT));
+
+        // exception_channel: wrong type before options/rights.
+        assert_eq!(
+            sc.sys_create_exception_channel(event, 2, null.into()),
+            Err(ZxError::WRONG_TYPE)
+        );
+        assert_eq!(
+            sc.sys_create_exception_channel(bad, 0, null.into()),
+            Err(ZxError::BAD_HANDLE)
+        );
+
+        // get_child: WRONG_TYPE before missing ENUMERATE / bad rights bits.
+        assert_eq!(
+            sc.sys_object_get_child(event, 0, !0, null.into()),
+            Err(ZxError::WRONG_TYPE)
+        );
+
+        // vmar_allocate / map: BAD_HANDLE before unknown option bits.
+        const UNKNOWN_OPT: u32 = 1 << 13;
+        assert_eq!(
+            sc.sys_vmar_allocate(
+                bad,
+                UNKNOWN_OPT,
+                0,
+                PAGE_SIZE as u64,
+                null.into(),
+                null.into()
+            ),
+            Err(ZxError::BAD_HANDLE)
+        );
+        assert_eq!(
+            sc.sys_vmar_map(bad, UNKNOWN_OPT, 0, bad, 0, PAGE_SIZE, null.into()),
+            Err(ZxError::BAD_HANDLE)
+        );
+        assert_eq!(
+            sc.sys_vmar_map_clock(bad, UNKNOWN_OPT, 0, bad, 0, null.into()),
+            Err(ZxError::BAD_HANDLE)
+        );
+
+        // job_set_critical: BAD_HANDLE before options!=0/1.
+        assert_eq!(
+            sc.sys_job_set_critical(bad, 2, bad),
+            Err(ZxError::BAD_HANDLE)
+        );
+
+        // thread_*_state: BAD_HANDLE before a bad kind.
+        assert_eq!(
+            sc.sys_thread_read_state(bad, u32::MAX, null.into(), 8),
+            Err(ZxError::BAD_HANDLE)
+        );
+        assert_eq!(
+            sc.sys_thread_write_state(bad, u32::MAX, null.into(), 8),
+            Err(ZxError::BAD_HANDLE)
+        );
+
+        // process_*_memory: BAD_HANDLE / WRONG_TYPE before a null buffer.
+        assert_eq!(
+            sc.sys_process_read_memory(bad, 0, null.into(), 0, null.into()),
+            Err(ZxError::BAD_HANDLE)
+        );
+        assert_eq!(
+            sc.sys_process_write_memory(event, 0, null.into(), 0, null.into()),
+            Err(ZxError::WRONG_TYPE)
+        );
+
+        // signal_peer: PEER_CLOSED before invalid masks.
+        let (a, b) = EventPair::create();
+        drop(b);
+        let pair = proc.add_handle(Handle::new(a, Rights::DEFAULT_EVENTPAIR));
+        assert_eq!(
+            sc.sys_object_signal_peer(pair, !0, !0),
+            Err(ZxError::PEER_CLOSED)
+        );
+        Box::pin(async move { drop(ct) })
+    });
+}

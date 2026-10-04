@@ -25,6 +25,8 @@ struct RawSocketInner {
     header_included: Mutex<bool>,
     flags: Mutex<OpenFlags>,
     remote: Mutex<Option<Endpoint>>,
+    /// Protocol number from `socket(2)` (`SO_PROTOCOL`).
+    protocol: u8,
     ipv6: bool,
     /// Last recvmsg flags (`MSG_TRUNC`, …); cleared by [`Socket::take_msg_flags`].
     last_msg_flags: Mutex<i32>,
@@ -32,6 +34,8 @@ struct RawSocketInner {
     read_closed: Mutex<bool>,
     /// `shutdown(SHUT_WR)`: with `read_closed`, poll reports hangup.
     write_closed: Mutex<bool>,
+    /// SOL_SOCKET / IPPROTO_IP knobs (get must mirror set).
+    opts: Mutex<StoredInetOpts>,
 }
 
 impl RawSocketState {
@@ -64,10 +68,12 @@ impl RawSocketState {
                 header_included: Mutex::new(false),
                 flags: Mutex::new(OpenFlags::RDWR),
                 remote: Mutex::new(None),
+                protocol,
                 ipv6,
                 last_msg_flags: Mutex::new(0),
                 read_closed: Mutex::new(false),
                 write_closed: Mutex::new(false),
+                opts: Mutex::new(StoredInetOpts::default()),
             }),
         })
     }
@@ -384,11 +390,8 @@ impl Socket for RawSocketState {
     }
 
     fn setsockopt(&self, level: usize, opt: usize, data: &[u8]) -> SysResult {
-        const SOL_SOCKET: usize = 1;
-        const IPPROTO_TCP: usize = 6;
-        // Same read-only SOL_SOCKET gate as the trait default / TCP / UDP.
-        if level == SOL_SOCKET && matches!(opt, 3 | 4 | 30) {
-            return Err(LxError::ENOPROTOOPT);
+        if let Some(r) = self.inner.opts.lock().try_setsockopt(level, opt, data) {
+            return r;
         }
         if let (IPPROTO_IP, IP_HDRINCL) = (level, opt) {
             // `IP_HDRINCL` is an AF_INET option; on an AF_INET6 socket Linux
@@ -418,11 +421,46 @@ impl Socket for RawSocketState {
             debug!("hdrincl set to {}", *self.inner.header_included.lock());
             return Ok(0);
         }
-        if level == IPPROTO_TCP {
-            return Err(LxError::ENOPROTOOPT);
-        }
         crate::net::check_setsockopt_len(level, opt, data)?;
         Ok(0)
+    }
+
+    fn so_reuseaddr(&self) -> bool {
+        self.inner.opts.lock().reuse_addr
+    }
+    fn so_broadcast(&self) -> bool {
+        self.inner.opts.lock().broadcast
+    }
+    fn so_keepalive(&self) -> bool {
+        self.inner.opts.lock().keepalive
+    }
+    fn so_reuseport(&self) -> bool {
+        self.inner.opts.lock().reuse_port
+    }
+    fn so_linger(&self) -> (bool, i32) {
+        let o = self.inner.opts.lock();
+        (o.linger_on, o.linger_sec)
+    }
+    fn so_rcvtimeo(&self) -> [u8; 16] {
+        self.inner.opts.lock().rcv_timeo
+    }
+    fn so_sndtimeo(&self) -> [u8; 16] {
+        self.inner.opts.lock().snd_timeo
+    }
+    fn ip_tos(&self) -> u32 {
+        self.inner.opts.lock().ip_tos
+    }
+    fn ip_ttl(&self) -> u32 {
+        self.inner.opts.lock().ip_ttl
+    }
+    fn ip_multicast_ttl(&self) -> u32 {
+        self.inner.opts.lock().mcast_ttl
+    }
+    fn ip_multicast_loop(&self) -> bool {
+        self.inner.opts.lock().mcast_loop
+    }
+    fn ip_multicast_if(&self) -> u32 {
+        self.inner.opts.lock().mcast_if
     }
     fn get_buffer_capacity(&self) -> Option<(usize, usize)> {
         let sockets = get_sockets();
@@ -455,6 +493,18 @@ impl Socket for RawSocketState {
 
     fn is_raw_ipv4(&self) -> bool {
         !self.inner.ipv6
+    }
+
+    fn so_domain(&self) -> Option<u32> {
+        Some(if self.inner.ipv6 {
+            crate::net::Domain::AF_INET6 as u32
+        } else {
+            crate::net::Domain::AF_INET as u32
+        })
+    }
+
+    fn so_protocol(&self) -> Option<u32> {
+        Some(self.inner.protocol as u32)
     }
 
     fn take_msg_flags(&self) -> i32 {
@@ -878,6 +928,19 @@ mod tests {
             Ok(0)
         );
         assert!(!Socket::ip_hdrincl(&s));
+    }
+
+    /// SO_BROADCAST / IP_TTL must mirror set (not stay at trait defaults).
+    #[test]
+    fn so_broadcast_and_ip_ttl_follow_setsockopt() {
+        let _g = LOCK.lock();
+        let s = sock(false);
+        assert!(!Socket::so_broadcast(&s));
+        assert_eq!(Socket::ip_ttl(&s), 64);
+        assert_eq!(Socket::setsockopt(&s, 1, 6, &1u32.to_ne_bytes()), Ok(0));
+        assert_eq!(Socket::setsockopt(&s, IPPROTO_IP, 2, &[7]), Ok(0));
+        assert!(Socket::so_broadcast(&s));
+        assert_eq!(Socket::ip_ttl(&s), 7);
     }
 
     /// Read-only SOL_SOCKET opts must not be silent Ok(0) on raw.

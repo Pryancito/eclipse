@@ -265,6 +265,15 @@ impl Job {
         self.inner.lock().processes.iter().map(|p| p.id()).collect()
     }
 
+    /// Sum of per-process `ZX_INFO_TASK_RUNTIME` for this job (direct members).
+    pub fn get_runtime_info(&self) -> crate::task::TaskRuntimeInfo {
+        let mut total = crate::task::TaskRuntimeInfo::default();
+        for process in self.inner.lock().processes.iter() {
+            total = total.saturating_add(process.get_runtime_info());
+        }
+        total
+    }
+
     /// Get KoIDs of children Jobs.
     pub fn children_ids(&self) -> Vec<KoID> {
         self.inner

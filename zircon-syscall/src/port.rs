@@ -14,13 +14,14 @@ impl Syscall<'_> {
 
     /// Cancel all waits and queued user packets associated with a key.
     pub fn sys_port_cancel_key(&self, handle: HandleValue, options: u32, key: u64) -> ZxResult {
-        if options != 0 {
-            return Err(ZxError::INVALID_ARGS);
-        }
         let port = self
             .thread
             .proc()
             .get_object_with_rights::<Port>(handle, Rights::WRITE)?;
+        // Handle first: options!=0 used to hide BAD_HANDLE / WRONG_TYPE.
+        if options != 0 {
+            return Err(ZxError::INVALID_ARGS);
+        }
         port.cancel(None, key)
     }
 

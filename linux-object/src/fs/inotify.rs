@@ -202,8 +202,14 @@ impl FileLike for Inotify {
         Err(LxError::EINVAL)
     }
 
-    async fn read_at(&self, _offset: u64, buf: &mut [u8]) -> LxResult<usize> {
-        self.read(buf).await
+    fn write_at(&self, _offset: u64, _buf: &[u8]) -> LxResult<usize> {
+        // inotify is not seekable; pwrite must be ESPIPE (write stays EINVAL).
+        Err(LxError::ESPIPE)
+    }
+
+    async fn read_at(&self, _offset: u64, _buf: &mut [u8]) -> LxResult<usize> {
+        // inotify is not seekable; pread must be ESPIPE.
+        Err(LxError::ESPIPE)
     }
 
     fn poll(&self, _events: PollEvents) -> LxResult<PollStatus> {
@@ -400,6 +406,9 @@ mod tests {
     fn an_inotify_fd_is_read_only() {
         let i = inotify(OpenFlags::NON_BLOCK);
         assert_eq!(i.write(b"anything"), Err(LxError::EINVAL));
+        let mut buf = [0u8; 256];
+        assert_eq!(block_on(i.read_at(0, &mut buf)), Err(LxError::ESPIPE));
+        assert_eq!(i.write_at(0, b"anything"), Err(LxError::ESPIPE));
     }
 
     #[test]

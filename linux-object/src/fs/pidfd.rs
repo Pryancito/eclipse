@@ -78,6 +78,11 @@ impl FileLike for PidFd {
     }
 
     async fn read_at(&self, _offset: u64, _buf: &mut [u8]) -> LxResult<usize> {
+        // pidfd is not seekable; pread must be ESPIPE (write stays EINVAL).
+        Err(LxError::ESPIPE)
+    }
+
+    fn write_at(&self, _offset: u64, _buf: &[u8]) -> LxResult<usize> {
         Err(LxError::EINVAL)
     }
 
@@ -121,5 +126,15 @@ mod set_flags_tests {
         fd.set_flags(f).unwrap();
         assert!(fd.flags().contains(OpenFlags::ASYNC));
         assert!(fd.flags().non_block());
+    }
+
+    #[test]
+    fn pread_is_espipe_and_pwrite_is_einval() {
+        use async_std::task::block_on;
+        let proc = Process::create(&Job::root(), "pidfd-seek").unwrap();
+        let fd = PidFd::new(proc, OpenFlags::empty());
+        let mut buf = [0u8; 8];
+        assert_eq!(block_on(fd.read_at(0, &mut buf)), Err(LxError::ESPIPE));
+        assert_eq!(fd.write_at(0, &[0u8; 8]), Err(LxError::EINVAL));
     }
 }

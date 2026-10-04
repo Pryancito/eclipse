@@ -269,7 +269,10 @@ impl Syscall<'_> {
         );
         let thread_state = self.thread.state();
         if thread_state == ThreadState::BlockedChannel {
-            unimplemented!();
+            // Finish of an interrupted channel_call is not wired yet; panic
+            // used to take down the kernel. Report NOT_SUPPORTED until the
+            // reply path is completed.
+            Err(ZxError::NOT_SUPPORTED)
         } else {
             Err(ZxError::BAD_STATE)
         }
@@ -447,10 +450,11 @@ fn prepare_message(
     // Resolve the channel before consuming a possible self-transfer handle.
     let object = proc.get_object_with_rights::<Channel>(channel, rights);
     let handles = handle_buffer.take(proc, num_handles)?;
+    // Channel error before options: bad options used to hide BAD_HANDLE.
+    let object = object?;
     if options & !USE_IOVEC != 0 {
         return Err(ZxError::INVALID_ARGS);
     }
-    let object = object?;
     let data = if options & USE_IOVEC != 0 {
         read_channel_iovecs(proc, bytes, num_bytes)?
     } else {

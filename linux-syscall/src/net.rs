@@ -129,6 +129,16 @@ fn ucred_of(pid: i32) -> [u8; 12] {
     bytes
 }
 
+/// Bytes for `getsockopt(SO_PEERCRED)`: a live peer via [`ucred_of`], or an
+/// all-zero `ucred` when there is no peer (unconnected / non-unix). Used to
+/// invent pid 1, which made seatd authorize random TCP sockets as init.
+fn peercred_bytes(peer_pid: Option<i32>) -> [u8; 12] {
+    match peer_pid {
+        Some(pid) => ucred_of(pid),
+        None => [0u8; 12],
+    }
+}
+
 fn write_sockopt_out(
     optval: UserOutPtr<u32>,
     mut optlen: UserInOutPtr<u32>,
@@ -522,12 +532,8 @@ impl Syscall<'_> {
                 const SO_PEERCRED: usize = 17;
                 if optname == SO_PEERCRED {
                     let file_like = self.linux_process().get_file_like(sockfd.into())?;
-                    let pid = file_like
-                        .as_socket()
-                        .ok()
-                        .and_then(|s| s.peer_pid())
-                        .unwrap_or(1);
-                    return write_sockopt_out(optval, optlen, &ucred_of(pid));
+                    let peer = file_like.as_socket().ok().and_then(|s| s.peer_pid());
+                    return write_sockopt_out(optval, optlen, &peercred_bytes(peer));
                 }
                 // SO_TYPE (3): SOCK_STREAM / SOCK_DGRAM / ... Python's `ssl`
                 // asks it of every socket it wraps (`SSLSocket._create` raises
@@ -630,33 +636,35 @@ impl Syscall<'_> {
                         write_sockopt_out(optval, optlen, &(u32::from(on)).to_ne_bytes())
                     }
                     SolOptname::BROADCAST => {
-                        // `setsockopt` accepts this (opt 6); without the enum
-                        // arm `getsockopt` was `ENOPROTOOPT`. Default is off;
-                        // the set path is still a no-op success.
-                        write_sockopt_out(optval, optlen, &0u32.to_ne_bytes())
+                        let on = file_like.clone().as_socket()?.so_broadcast();
+                        write_sockopt_out(optval, optlen, &(u32::from(on)).to_ne_bytes())
                     }
                     SolOptname::KEEPALIVE => {
-                        // Same asymmetry as BROADCAST: set accepts opt 9, get
-                        // used to be ENOPROTOOPT. Default off; set is still a
-                        // no-op until we plumb smoltcp keepalives.
-                        write_sockopt_out(optval, optlen, &0u32.to_ne_bytes())
+                        let on = file_like.clone().as_socket()?.so_keepalive();
+                        write_sockopt_out(optval, optlen, &(u32::from(on)).to_ne_bytes())
                     }
                     SolOptname::ERROR => {
                         let err = file_like.clone().as_socket()?.take_so_error();
                         write_sockopt_out(optval, optlen, &(err as u32).to_ne_bytes())
                     }
-                    // struct linger { int l_onoff; int l_linger; } — zero-linger.
-                    SolOptname::LINGER => write_sockopt_out(optval, optlen, &[0u8; 8]),
-                    SolOptname::REUSEPORT => {
-                        // `setsockopt` accepts opt 15; without the enum arm
-                        // `getsockopt` was ENOPROTOOPT. Default off; set is a
-                        // no-op until we plumb reuseport into the bind tables.
-                        write_sockopt_out(optval, optlen, &0u32.to_ne_bytes())
+                    SolOptname::LINGER => {
+                        let (on, sec) = file_like.clone().as_socket()?.so_linger();
+                        let mut bytes = [0u8; 8];
+                        bytes[0..4].copy_from_slice(&(i32::from(on)).to_ne_bytes());
+                        bytes[4..8].copy_from_slice(&sec.to_ne_bytes());
+                        write_sockopt_out(optval, optlen, &bytes)
                     }
-                    // struct timeval { time_t tv_sec; suseconds_t tv_usec; }
-                    // — 16 bytes on x86_64; zero means "no timeout" (default).
-                    SolOptname::RCVTIMEO | SolOptname::SNDTIMEO => {
-                        write_sockopt_out(optval, optlen, &[0u8; 16])
+                    SolOptname::REUSEPORT => {
+                        let on = file_like.clone().as_socket()?.so_reuseport();
+                        write_sockopt_out(optval, optlen, &(u32::from(on)).to_ne_bytes())
+                    }
+                    SolOptname::RCVTIMEO => {
+                        let tv = file_like.clone().as_socket()?.so_rcvtimeo();
+                        write_sockopt_out(optval, optlen, &tv)
+                    }
+                    SolOptname::SNDTIMEO => {
+                        let tv = file_like.clone().as_socket()?.so_sndtimeo();
+                        write_sockopt_out(optval, optlen, &tv)
                     }
                     SolOptname::ACCEPTCONN => {
                         // Whether `listen(2)` put this socket in the passive
@@ -664,6 +672,22 @@ impl Syscall<'_> {
                         // ENOPROTOOPT even for a listening TCP/UNIX socket.
                         let on = file_like.clone().as_socket()?.is_listening();
                         write_sockopt_out(optval, optlen, &(u32::from(on)).to_ne_bytes())
+                    }
+                    SolOptname::PROTOCOL => {
+                        let proto = file_like
+                            .clone()
+                            .as_socket()?
+                            .so_protocol()
+                            .ok_or(LxError::ENOPROTOOPT)?;
+                        write_sockopt_out(optval, optlen, &proto.to_ne_bytes())
+                    }
+                    SolOptname::DOMAIN => {
+                        let domain = file_like
+                            .clone()
+                            .as_socket()?
+                            .so_domain()
+                            .ok_or(LxError::ENOPROTOOPT)?;
+                        write_sockopt_out(optval, optlen, &domain.to_ne_bytes())
                     }
                 }
             }
@@ -686,17 +710,18 @@ impl Syscall<'_> {
                         let on = sock.tcp_nodelay();
                         write_sockopt_out(optval, optlen, &(u32::from(on)).to_ne_bytes())
                     }
-                    // Linux defaults (`tcp_keepalive_*` sysctls). `setsockopt`
-                    // already accepts these; without the enum arms `getsockopt`
-                    // was ENOPROTOOPT. Values are stubs until smoltcp keepalives
-                    // are plumbed.
                     TcpOptname::KEEPIDLE => {
-                        write_sockopt_out(optval, optlen, &7200u32.to_ne_bytes())
+                        let v = sock.tcp_keepidle().unwrap_or(7200);
+                        write_sockopt_out(optval, optlen, &v.to_ne_bytes())
                     }
                     TcpOptname::KEEPINTVL => {
-                        write_sockopt_out(optval, optlen, &75u32.to_ne_bytes())
+                        let v = sock.tcp_keepintvl().unwrap_or(75);
+                        write_sockopt_out(optval, optlen, &v.to_ne_bytes())
                     }
-                    TcpOptname::KEEPCNT => write_sockopt_out(optval, optlen, &9u32.to_ne_bytes()),
+                    TcpOptname::KEEPCNT => {
+                        let v = sock.tcp_keepcnt().unwrap_or(9);
+                        write_sockopt_out(optval, optlen, &v.to_ne_bytes())
+                    }
                     TcpOptname::CONGESTION => {
                         // Linux returns a NUL-terminated CCA name. We have no
                         // pluggable congestion control; answer a fixed "reno"
@@ -721,8 +746,12 @@ impl Syscall<'_> {
                     return Err(LxError::ENOPROTOOPT);
                 }
                 match optname {
-                    IpOptname::TOS => write_sockopt_out(optval, optlen, &0u32.to_ne_bytes()),
-                    IpOptname::TTL => write_sockopt_out(optval, optlen, &64u32.to_ne_bytes()),
+                    IpOptname::TOS => {
+                        write_sockopt_out(optval, optlen, &sock.ip_tos().to_ne_bytes())
+                    }
+                    IpOptname::TTL => {
+                        write_sockopt_out(optval, optlen, &sock.ip_ttl().to_ne_bytes())
+                    }
                     IpOptname::HDRINCL => {
                         // Only SOCK_RAW IPv4; others get ENOPROTOOPT like Linux.
                         if !sock.is_raw_ipv4() {
@@ -732,13 +761,14 @@ impl Syscall<'_> {
                         write_sockopt_out(optval, optlen, &(u32::from(on)).to_ne_bytes())
                     }
                     IpOptname::MulticastIf => {
-                        write_sockopt_out(optval, optlen, &0u32.to_ne_bytes())
+                        write_sockopt_out(optval, optlen, &sock.ip_multicast_if().to_ne_bytes())
                     }
                     IpOptname::MulticastTtl => {
-                        write_sockopt_out(optval, optlen, &1u32.to_ne_bytes())
+                        write_sockopt_out(optval, optlen, &sock.ip_multicast_ttl().to_ne_bytes())
                     }
                     IpOptname::MulticastLoop => {
-                        write_sockopt_out(optval, optlen, &1u32.to_ne_bytes())
+                        let on = u32::from(sock.ip_multicast_loop());
+                        write_sockopt_out(optval, optlen, &on.to_ne_bytes())
                     }
                 }
             }
@@ -1951,6 +1981,14 @@ mod peercred_tests {
         // Linux's `overflowuid`: the answer for credentials it does not hold.
         assert_eq!(words(ucred_of(43_102)), [43_102, u32::MAX, u32::MAX]);
     }
+
+    #[test]
+    fn no_peer_is_an_all_zero_ucred_not_init() {
+        // Fabricating pid 1 made seatd treat an unconnected socket as init.
+        assert_eq!(words(peercred_bytes(None)), [0, 0, 0]);
+        // A known-but-gone pid still reports overflowuid, not zeros.
+        assert_eq!(words(peercred_bytes(Some(43_102))), [43_102, u32::MAX, u32::MAX]);
+    }
 }
 
 #[cfg(test)]
@@ -1999,6 +2037,8 @@ mod sockopt_out_tests {
         assert_eq!(SolOptname::try_from(20usize), Ok(SolOptname::RCVTIMEO));
         assert_eq!(SolOptname::try_from(21usize), Ok(SolOptname::SNDTIMEO));
         assert_eq!(SolOptname::try_from(30usize), Ok(SolOptname::ACCEPTCONN));
+        assert_eq!(SolOptname::try_from(38usize), Ok(SolOptname::PROTOCOL));
+        assert_eq!(SolOptname::try_from(39usize), Ok(SolOptname::DOMAIN));
         assert_eq!(TcpOptname::try_from(1usize), Ok(TcpOptname::NODELAY));
         assert_eq!(TcpOptname::try_from(4usize), Ok(TcpOptname::KEEPIDLE));
         assert_eq!(TcpOptname::try_from(5usize), Ok(TcpOptname::KEEPINTVL));
@@ -2009,7 +2049,8 @@ mod sockopt_out_tests {
         assert_eq!(IpOptname::try_from(3usize), Ok(IpOptname::HDRINCL));
         assert_eq!(IpOptname::try_from(32usize), Ok(IpOptname::MulticastIf));
         assert_eq!(IpOptname::try_from(33usize), Ok(IpOptname::MulticastTtl));
-        assert_eq!(IpOptname::try_from(35usize), Ok(IpOptname::MulticastLoop));
+        assert_eq!(IpOptname::try_from(34usize), Ok(IpOptname::MulticastLoop));
+        assert!(IpOptname::try_from(35usize).is_err()); // ADD_MEMBERSHIP, set-only
     }
 
     /// A level this kernel does not wire up is `ENOPROTOOPT`, not a fake 0.

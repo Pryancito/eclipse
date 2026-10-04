@@ -30,12 +30,13 @@ impl Syscall<'_> {
             "debuglog.create: resource_handle={:#x?}, options={:#x?}",
             rsrc, options,
         );
-        debuglog_create_options(options)?;
         let proc = self.thread.proc();
         if rsrc != 0 {
+            // Handle first when a resource is supplied.
             proc.get_object::<Resource>(rsrc)?
                 .validate_system(SystemResource::Debuglog)?;
         }
+        debuglog_create_options(options)?;
         let dlog = DebugLog::create(options);
         let dlog_right = if options & FLAG_READABLE == 0 {
             Rights::DEFAULT_DEBUGLOG
@@ -57,7 +58,10 @@ impl Syscall<'_> {
             "debuglog.write: handle={:#x?}, options={:#x?}, buf=({:#x?}; {:#x?})",
             handle_value, options, buf, len,
         );
+        let proc = self.thread.proc();
+        let dlog = proc.get_object_with_rights::<DebugLog>(handle_value, Rights::WRITE)?;
         const LOG_FLAGS_MASK: u32 = 0x10;
+        // Handle first: bad options used to hide BAD_HANDLE / WRONG_TYPE.
         if options & !LOG_FLAGS_MASK != 0 {
             return Err(ZxError::INVALID_ARGS);
         }
@@ -66,8 +70,6 @@ impl Syscall<'_> {
         // used to be refused whole as invalid UTF-8.
         let datalen = len.min(DLOG_MAX_DATA);
         let data = buf.as_slice(datalen)?;
-        let proc = self.thread.proc();
-        let dlog = proc.get_object_with_rights::<DebugLog>(handle_value, Rights::WRITE)?;
         dlog.write(Severity::Info, options, self.thread.id(), proc.id(), data);
         // print to kernel console
         kernel_hal::console::console_write_str(&alloc::string::String::from_utf8_lossy(data));
@@ -96,12 +98,13 @@ impl Syscall<'_> {
             "debuglog.read: handle={:#x?}, options={:#x?}, buf=({:#x?}; {:#x?})",
             handle_value, options, buf, len,
         );
+        let proc = self.thread.proc();
+        let dlog = proc.get_object_with_rights::<DebugLog>(handle_value, Rights::READ)?;
+        // Handle first: options!=0 used to hide BAD_HANDLE / WRONG_TYPE.
         if options != 0 {
             return Err(ZxError::INVALID_ARGS);
         }
-        let proc = self.thread.proc();
         let mut buffer = [0; DLOG_MAX_LEN];
-        let dlog = proc.get_object_with_rights::<DebugLog>(handle_value, Rights::READ)?;
         // The whole record or none of it: `min(len)` used to hand back the
         // head of a record and swallow the rest, which no later read can ask
         // for again.

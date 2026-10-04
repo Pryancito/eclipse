@@ -14,29 +14,34 @@ impl Syscall<'_> {
         );
         let proc = self.thread.proc();
         let (task, rights) = proc.get_dyn_object_and_rights(task)?;
-        if !rights.contains(
-            Rights::INSPECT | Rights::DUPLICATE | Rights::TRANSFER | Rights::MANAGE_THREAD,
-        ) {
-            return Err(ZxError::ACCESS_DENIED);
-        }
-        let option = ExceptionChannelOption::try_from(option).map_err(|_| ZxError::INVALID_ARGS)?;
+        // Type first: rights/options used to hide WRONG_TYPE on a VMO/Event/etc.
+        let base = Rights::INSPECT | Rights::DUPLICATE | Rights::TRANSFER | Rights::MANAGE_THREAD;
         let exceptionate = if let Ok(job) = task.clone().downcast_arc::<Job>() {
-            if !rights.contains(Rights::ENUMERATE) {
+            if !rights.contains(base | Rights::ENUMERATE) {
                 return Err(ZxError::ACCESS_DENIED);
             }
+            let option =
+                ExceptionChannelOption::try_from(option).map_err(|_| ZxError::INVALID_ARGS)?;
             match option {
                 ExceptionChannelOption::None => job.exceptionate(),
                 ExceptionChannelOption::Debugger => job.debug_exceptionate(),
             }
         } else if let Ok(process) = task.clone().downcast_arc::<Process>() {
-            if !rights.contains(Rights::ENUMERATE) {
+            if !rights.contains(base | Rights::ENUMERATE) {
                 return Err(ZxError::ACCESS_DENIED);
             }
+            let option =
+                ExceptionChannelOption::try_from(option).map_err(|_| ZxError::INVALID_ARGS)?;
             match option {
                 ExceptionChannelOption::None => process.exceptionate(),
                 ExceptionChannelOption::Debugger => process.debug_exceptionate(),
             }
         } else if let Ok(thread) = task.clone().downcast_arc::<Thread>() {
+            if !rights.contains(base) {
+                return Err(ZxError::ACCESS_DENIED);
+            }
+            let option =
+                ExceptionChannelOption::try_from(option).map_err(|_| ZxError::INVALID_ARGS)?;
             match option {
                 ExceptionChannelOption::None => thread.exceptionate(),
                 ExceptionChannelOption::Debugger => return Err(ZxError::INVALID_ARGS),

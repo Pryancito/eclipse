@@ -135,19 +135,28 @@ impl Syscall<'_> {
             "stream.create: options={:#x?}, vmo_handle={:#x?}, seek={:#x?}",
             options, vmo_handle, seek
         );
+        let proc = self.thread.proc();
+        let (vmo, available) = proc.get_object_and_rights::<VmObject>(vmo_handle)?;
+        // Handle first: bad options used to hide BAD_HANDLE / WRONG_TYPE.
         let options = StreamOptions::from_bits(options).ok_or(ZxError::INVALID_ARGS)?;
+        // Fuchsia requires at least MODE_READ or MODE_WRITE; append alone (or
+        // zero) used to create a stream with empty VMO rights.
+        if !options.intersects(StreamOptions::MODE_READ | StreamOptions::MODE_WRITE) {
+            return Err(ZxError::INVALID_ARGS);
+        }
         let mut rights = Rights::DEFAULT_STREAM;
-        let mut vmo_rights = Rights::empty();
+        let mut need = Rights::empty();
         if options.contains(StreamOptions::MODE_READ) {
             rights |= Rights::READ;
-            vmo_rights |= Rights::READ;
+            need |= Rights::READ;
         }
         if options.contains(StreamOptions::MODE_WRITE) {
             rights |= Rights::WRITE;
-            vmo_rights |= Rights::WRITE;
+            need |= Rights::WRITE;
         }
-        let proc = self.thread.proc();
-        let vmo = proc.get_object_with_rights::<VmObject>(vmo_handle, vmo_rights)?;
+        if !available.contains(need) {
+            return Err(ZxError::ACCESS_DENIED);
+        }
         let stream = Stream::create(vmo, seek, options.bits());
         install_handle(proc, Handle::new(stream, rights), &mut out)
     }
@@ -170,9 +179,9 @@ impl Syscall<'_> {
                 const APPEND = 1;
             }
         }
-        let options = WriteOptions::from_bits(options).ok_or(ZxError::INVALID_ARGS)?;
         let proc = self.thread.proc();
         let stream = proc.get_object_with_rights::<Stream>(handle_value, Rights::WRITE)?;
+        let options = WriteOptions::from_bits(options).ok_or(ZxError::INVALID_ARGS)?;
         let data = read_iovecs(proc, vector, vector_size)?;
         stream.check_write_size(
             data.total_len(),
@@ -204,11 +213,11 @@ impl Syscall<'_> {
             "stream.write_at: stream={:#x?}, options={:#x?}, offset={:#x?}, vector=({:#x?}; {:#x?})",
             handle_value, options, offset, vector, vector_size,
         );
+        let proc = self.thread.proc();
+        let stream = proc.get_object_with_rights::<Stream>(handle_value, Rights::WRITE)?;
         if options != 0 {
             return Err(ZxError::INVALID_ARGS);
         }
-        let proc = self.thread.proc();
-        let stream = proc.get_object_with_rights::<Stream>(handle_value, Rights::WRITE)?;
         let data = read_iovecs(proc, vector, vector_size)?;
         stream.check_write_size(data.total_len(), false, Some(offset))?;
         validate_iovec_buffers(proc, &data, MMUFlags::READ)?;
@@ -236,11 +245,11 @@ impl Syscall<'_> {
             "stream.read: stream={:#x?}, options={:#x?}, vector=({:#x?}; {:#x?})",
             handle_value, options, vector, vector_size,
         );
+        let proc = self.thread.proc();
+        let stream = proc.get_object_with_rights::<Stream>(handle_value, Rights::READ)?;
         if options != 0 {
             return Err(ZxError::INVALID_ARGS);
         }
-        let proc = self.thread.proc();
-        let stream = proc.get_object_with_rights::<Stream>(handle_value, Rights::READ)?;
         let mut data = read_iovecs(proc, vector, vector_size)?;
         validate_iovec_buffers(proc, &data, MMUFlags::WRITE)?;
         // The stream carries the offset from one buffer to the next itself.
@@ -267,11 +276,11 @@ impl Syscall<'_> {
             "stream.read_at: stream={:#x?}, options={:#x?}, offset={:#x?}, vector=({:#x?}; {:#x?})",
             handle_value, options, offset, vector, vector_size,
         );
+        let proc = self.thread.proc();
+        let stream = proc.get_object_with_rights::<Stream>(handle_value, Rights::READ)?;
         if options != 0 {
             return Err(ZxError::INVALID_ARGS);
         }
-        let proc = self.thread.proc();
-        let stream = proc.get_object_with_rights::<Stream>(handle_value, Rights::READ)?;
         let mut data = read_iovecs(proc, vector, vector_size)?;
         validate_iovec_buffers(proc, &data, MMUFlags::WRITE)?;
         // Each buffer is served right after the bytes read into the ones
@@ -466,5 +475,21 @@ mod read_gather_tests {
             alloc::vec![Ok(&mut first[..]), Err(ZxError::INVALID_ARGS)];
         let got = read_gather(parts.into_iter(), |buffer, _| Ok(buffer.len()));
         assert_eq!(got, Err(ZxError::INVALID_ARGS));
+    }
+
+    #[test]
+    fn stream_create_requires_read_or_write_mode() {
+        use zircon_object::vm::StreamOptions;
+        let modes = StreamOptions::MODE_READ | StreamOptions::MODE_WRITE;
+        assert!(
+            !StreamOptions::empty().intersects(modes),
+            "options=0 must be refused"
+        );
+        assert!(
+            !StreamOptions::MODE_APPEND.intersects(modes),
+            "append alone must be refused"
+        );
+        assert!(StreamOptions::MODE_READ.intersects(modes));
+        assert!(StreamOptions::MODE_WRITE.intersects(modes));
     }
 }

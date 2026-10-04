@@ -243,8 +243,14 @@ impl FileLike for TimerFd {
         Err(LxError::EINVAL)
     }
 
-    async fn read_at(&self, _offset: u64, buf: &mut [u8]) -> LxResult<usize> {
-        self.read(buf).await
+    fn write_at(&self, _offset: u64, _buf: &[u8]) -> LxResult<usize> {
+        // timerfd is not seekable; pwrite must be ESPIPE (write stays EINVAL).
+        Err(LxError::ESPIPE)
+    }
+
+    async fn read_at(&self, _offset: u64, _buf: &mut [u8]) -> LxResult<usize> {
+        // timerfd is not seekable; pread must be ESPIPE.
+        Err(LxError::ESPIPE)
     }
 
     fn poll(&self, _events: PollEvents) -> LxResult<PollStatus> {
@@ -447,6 +453,8 @@ mod tests {
         // on an fd it can never write.
         let s = fd.poll(PollEvents::IN | PollEvents::OUT).unwrap();
         assert!(!s.write && !s.error && !s.hangup);
+        assert_eq!(block_on(fd.read_at(0, &mut [0u8; 8])), Err(LxError::ESPIPE));
+        assert_eq!(fd.write_at(0, &[0u8; 8]), Err(LxError::ESPIPE));
     }
 
     #[test]

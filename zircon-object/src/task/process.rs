@@ -990,6 +990,15 @@ impl Process {
         self.inner.lock().threads.iter().map(|t| t.id()).collect()
     }
 
+    /// Sum of per-thread `ZX_INFO_TASK_RUNTIME` for this process.
+    pub fn get_runtime_info(&self) -> crate::task::TaskRuntimeInfo {
+        let mut total = crate::task::TaskRuntimeInfo::default();
+        for thread in self.inner.lock().threads.iter() {
+            total = total.saturating_add(thread.get_runtime_info());
+        }
+        total
+    }
+
     /// Wait for process exit and get return code.
     pub async fn wait_for_exit(self: &Arc<Self>) -> i64 {
         let object: Arc<dyn KernelObject> = self.clone();
