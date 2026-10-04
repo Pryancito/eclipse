@@ -215,8 +215,9 @@ impl FileLike for EventFd {
         ))
     }
 
-    fn readiness_seq(&self) -> Option<u64> {
-        Some(self.eventbus.lock().seq())
+    fn readiness_seq(&self, events: PollEvents) -> Option<u64> {
+        let mask = super::poll_events_to_bus_mask(events);
+        Some(self.eventbus.lock().seq_for(mask))
     }
 
     fn subscribe_edge(

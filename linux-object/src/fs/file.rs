@@ -1348,11 +1348,11 @@ impl FileLike for File {
         None
     }
 
-    fn readiness_seq(&self) -> Option<u64> {
+    fn readiness_seq(&self, events: PollEvents) -> Option<u64> {
         let inode = self.inner.read().inode.clone();
         inode
             .downcast_ref::<super::pipe::Pipe>()
-            .map(|pipe| pipe.readiness_seq())
+            .map(|pipe| pipe.readiness_seq(events))
     }
 
     fn subscribe_edge(
