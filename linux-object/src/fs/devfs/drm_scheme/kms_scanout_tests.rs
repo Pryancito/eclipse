@@ -4478,8 +4478,7 @@ fn removing_the_framebuffer_on_the_crtc_turns_it_off_and_closing_it_does_not() {
     // CLOSEFB: the object goes, the scanout stays.
     c.page_flip(drm::SYNTH_CRTC_ID, fb_c, 0xF00E).expect("flip");
     assert!(!drm::crtc_blanked());
-    let mut id = fb_c;
-    assert_eq!(c.ioctl(DRM_IOCTL_MODE_CLOSEFB, &mut id), Ok(0));
+    assert_eq!(c.closefb(fb_c, 0), Ok(0));
     assert!(!drm::crtc_blanked(), "CLOSEFB turned the CRTC off");
     assert_eq!(screen.pixel(3, 2), tag(0x0099_0000, 3, 2));
     let mut id = fb_c;
@@ -4488,6 +4487,34 @@ fn removing_the_framebuffer_on_the_crtc_turns_it_off_and_closing_it_does_not() {
         Err(FsError::EntryNotFound),
         "a closed fb is gone"
     );
+}
+
+/// `drm_mode_closefb_ioctl` refuses a `pad` that is not zero (EINVAL)
+/// before it looks the framebuffer up (ENOENT). Here only the id was
+/// read, so a request with its pad set closed the framebuffer.
+#[test]
+fn closefb_refuses_a_nonzero_pad_before_it_looks_the_framebuffer_up() {
+    let _serialised = drm::test_globals::lock();
+    let c = Client::open(0);
+    let buf = c.create_dumb(64, 16);
+    let fb = c.addfb2(&buf);
+    let einval = Err(FsError::InvalidParam);
+    assert_eq!(c.closefb(fb, 1), einval, "a pad of 1");
+    assert_eq!(c.closefb(fb, 0x8000_0000), einval, "a pad with the top bit");
+    assert_eq!(
+        c.closefb(0xdead_beef, 1),
+        einval,
+        "the pad is refused before the id is looked up"
+    );
+    assert_eq!(
+        c.closefb(0xdead_beef, 0),
+        Err(FsError::EntryNotFound),
+        "with a clean pad, an unknown id is ENOENT"
+    );
+    // The refused requests closed nothing: the fb is still there to close.
+    assert_eq!(c.closefb(fb, 0), Ok(0));
+    assert_eq!(c.rmfb(fb), Err(FsError::EntryNotFound), "closed once");
+    c.destroy_dumb(buf.handle).expect("DESTROY_DUMB");
 }
 
 /// `drm_mode_create_dumb` refuses a width, height or bpp of 0 and a bpp

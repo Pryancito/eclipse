@@ -1662,9 +1662,15 @@ impl DrmDev {
                 // caller's is
                 // ENOENT, as in `drm_mode_closefb_ioctl` (the lookup and the
                 // "is it in this file's list" check both answer that) and as
-                // RMFB above already did; this arm said EINVAL.
-                let fb_id = unsafe { *(data as *const u32) };
-                if drm::rmfb_for(fb_id, drm::current_pid()) {
+                // RMFB above already did; this arm said EINVAL. Before the
+                // lookup, `pad` "must be zero" (EINVAL): this read the fb id
+                // alone, so a request with a pad set closed the framebuffer
+                // where Linux refuses it, whether the id exists or not.
+                let r = unsafe { &*(data as *const DrmModeCloseFb) };
+                if r.pad != 0 {
+                    return Err(FsError::InvalidParam);
+                }
+                if drm::rmfb_for(r.fb_id, drm::current_pid()) {
                     Ok(0)
                 } else {
                     Err(FsError::EntryNotFound)
@@ -5153,6 +5159,14 @@ struct DrmCrtcQueueSequence {
     user_data: u64,
 }
 
+/// `struct drm_mode_closefb`: the fb and a `pad` that "must be zero".
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+struct DrmModeCloseFb {
+    fb_id: u32,
+    pad: u32,
+}
+
 /// `struct drm_mode_set_plane` (48 bytes).
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
@@ -5281,6 +5295,7 @@ const _: () = {
     assert!(size_of::<DrmWaitVblank>() == 24); // DRM_IOCTL_WAIT_VBLANK   0x..18..
     assert!(size_of::<DrmCrtcGetSequence>() == 24); // CRTC_GET_SEQUENCE   0x..18..
     assert!(size_of::<DrmCrtcQueueSequence>() == 24); // CRTC_QUEUE_SEQUENCE 0x..18..
+    assert!(size_of::<DrmModeCloseFb>() == 8); // CLOSEFB             0x..08..
     assert!(size_of::<DrmModeSetPlane>() == 48); // DRM_IOCTL_MODE_SETPLANE 0x..30..
     assert!(size_of::<DrmModeObjSetProperty>() == 24); // OBJ_SETPROPERTY  0x..18..
     assert!(size_of::<DrmModeFbDirtyCmd>() == 24); // DRM_IOCTL_MODE_DIRTYFB 0x..18..

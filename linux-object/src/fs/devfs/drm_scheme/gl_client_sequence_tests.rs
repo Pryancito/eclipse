@@ -144,6 +144,12 @@ impl Client {
         self.ioctl(DRM_IOCTL_MODE_RMFB, &mut id)
     }
 
+    /// `drmModeCloseFB`, with the `pad` the caller wants to send.
+    pub(super) fn closefb(&self, fb_id: u32, pad: u32) -> Result<usize> {
+        let mut r = DrmModeCloseFb { fb_id, pad };
+        self.ioctl(DRM_IOCTL_MODE_CLOSEFB, &mut r)
+    }
+
     /// `drmModeDestroyDumbBuffer`.
     pub(super) fn destroy_dumb(&self, handle: u32) -> Result<usize> {
         let mut h = handle;
