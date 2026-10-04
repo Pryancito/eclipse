@@ -1556,7 +1556,8 @@ mod is_tcp_tests {
         assert_eq!(Socket::so_protocol(&tcp), Some(6)); // IPPROTO_TCP
         let tcp6 = TcpSocketState::new(true).unwrap();
         assert_eq!(Socket::so_domain(&tcp6), Some(10)); // AF_INET6
-                                                        // SO_DOMAIN / SO_PROTOCOL are read-only.
+
+        // SO_DOMAIN / SO_PROTOCOL are read-only.
         assert_eq!(
             Socket::setsockopt(&tcp, 1, 38, &0u32.to_ne_bytes()),
             Err(LxError::ENOPROTOOPT)

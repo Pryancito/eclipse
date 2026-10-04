@@ -885,16 +885,27 @@ pub trait FileLike: KernelObject + downcast_rs::DowncastSync {
         let _ = (events, waker);
         None
     }
-    /// How many times this file's producer has published readiness: the
-    /// [`crate::sync::EventBus::seq`] of its event source. It moves on every
-    /// write to an eventfd, every message to a socket, every pipe write --
-    /// including the ones that find the file already readable.
+    /// How many times this file's producer has published readiness *in the
+    /// directions `events` names*: the
+    /// [`crate::sync::EventBus::seq_for`] of its event source. It moves on
+    /// every write to an eventfd, every message to a socket, every pipe write
+    /// -- including the ones that find the file already readable.
+    ///
+    /// `events` is not a filter for tidiness. The whole-bus counter moves for
+    /// a publication in *either* direction, and producers publish one
+    /// direction to wake waiters on it alone: a unix socket pulses `WRITABLE`
+    /// on its peer's bus when a reader drains a full queue, and an eventfd
+    /// publishes `WRITABLE` on every `read` that empties it. An `EPOLLIN`
+    /// entry measured against that re-reported the readable level
+    /// `epoll_wait` had already delivered -- the spin `EPOLLET` exists to
+    /// stop.
     ///
     /// This is what `EPOLLET` is measured against. `None` (the default) means
     /// the file has no such counter, and `epoll` keeps reporting it by level
     /// even when edge-triggered: a spurious event costs a wakeup, a missed
     /// one hangs the program.
-    fn readiness_seq(&self) -> Option<u64> {
+    fn readiness_seq(&self, events: PollEvents) -> Option<u64> {
+        let _ = events;
         None
     }
     /// Park `waker` until this file's producer next publishes an event

@@ -484,11 +484,20 @@ impl Syscall<'_> {
                 // the short tick for the whole set.
                 let mut covered = false;
                 if this.timeout_msecs != 0 {
-                    covered = !this.polls.is_empty();
+                    // Counted over the fds that could park a waker, not over
+                    // the array: a set of nothing but negative `pollfd`s is
+                    // all ignored slots, and calling that "every watched fd
+                    // has a subscription doing the real waking" stretched the
+                    // backstop to the covered tick with no event source
+                    // anywhere in the set. `select` already counted it this
+                    // way (`covered &= any_watched`).
+                    let mut any_watched = false;
+                    covered = true;
                     for p in this.polls.iter() {
                         if <FileDesc as Into<i32>>::into(p.fd) < 0 {
                             continue; // ignored slot (POSIX): nothing to wake on
                         }
+                        any_watched = true;
                         match proc
                             .get_file_like(p.fd)
                             .ok()
@@ -498,6 +507,7 @@ impl Syscall<'_> {
                             None => covered = false,
                         }
                     }
+                    covered &= any_watched;
                 }
                 let covered_tick =
                     Duration::from_millis(linux_object::net::wait::IO_WAIT_COVERED_TICK_MS);

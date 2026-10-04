@@ -1201,8 +1201,9 @@ impl FileLike for UnixSocketState {
         })
     }
 
-    fn readiness_seq(&self) -> Option<u64> {
-        Some(self.inner.lock().eventbus.seq())
+    fn readiness_seq(&self, events: PollEvents) -> Option<u64> {
+        let mask = crate::fs::poll_events_to_bus_mask(events);
+        Some(self.inner.lock().eventbus.seq_for(mask))
     }
 
     fn subscribe_edge(
@@ -2259,5 +2260,111 @@ mod write_room_tests {
         Socket::write(&*a, b"hola", None).unwrap();
         a.retract_fds();
         assert_eq!(b.inner.lock().pending_fds.len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod edge_direction_tests {
+    //! An edge-triggered `epoll` entry must not be re-armed by a publication
+    //! in a direction it never asked about.
+    //!
+    //! `edge_step` takes an fd's publication counter whole, and
+    //! `readiness_seq` hands it the whole **bus**: one counter shared by
+    //! READABLE and WRITABLE. A producer that publishes only WRITABLE moves
+    //! the counter an `EPOLLET | EPOLLIN` entry is watching, and the next
+    //! scan reports the same readable level `epoll_wait` already handed out.
+    //!
+    //! A unix stream socket does exactly that on the one path that matters
+    //! under load: a reader draining a **full** queue pulses WRITABLE on its
+    //! peer's bus ([`pulse_writable`]) to wake a writer parked on room.
+    //! Nothing about the peer's own receive queue changed.
+
+    use super::*;
+    use crate::fs::{Epoll, EpollEvent};
+    /// `EPOLLET`, which `fs::epoll` keeps private.
+    const EPOLLET: u32 = 1 << 31;
+    use crate::fs::FileLike;
+    use alloc::sync::Arc;
+    use core::future::Future;
+    use core::task::{Context, Poll, Waker};
+
+    const IN: u32 = PollEvents::IN.bits() as u32;
+    const ADD: i32 = 1;
+
+    struct Nop;
+    impl alloc::task::Wake for Nop {
+        fn wake(self: Arc<Self>) {}
+    }
+
+    fn wait_now(ep: &Epoll) -> Vec<(u32, u64)> {
+        let waker = Waker::from(Arc::new(Nop));
+        let mut cx = Context::from_waker(&waker);
+        let mut fut = alloc::boxed::Box::pin(ep.wait(16, 0));
+        match fut.as_mut().poll(&mut cx) {
+            Poll::Ready(r) => r.unwrap().iter().map(|e| (e.events, e.data)).collect(),
+            Poll::Pending => panic!("a zero-timeout wait finishes at once"),
+        }
+    }
+
+    #[test]
+    fn a_writable_only_pulse_does_not_re_report_an_already_reported_readable_level() {
+        let a = UnixSocketState::new();
+        let b = UnixSocketState::new();
+        UnixSocketState::connect_pair(&a, &b);
+
+        // A has ten bytes waiting, and never reads them.
+        Socket::write(&*b, b"0123456789", None).unwrap();
+        // Fill B's queue: a drain from full is the one that pulses A's bus.
+        let chunk = alloc::vec![0u8; 256 * 1024];
+        while b.inner.lock().buffer.len() < UNIX_STREAM_BUF_MAX {
+            match Socket::write(&*a, &chunk, None) {
+                Ok(n) if n > 0 => {}
+                _ => break,
+            }
+        }
+        assert_eq!(
+            b.inner.lock().buffer.len(),
+            UNIX_STREAM_BUF_MAX,
+            "the drain must be a drain from full, the only one that pulses"
+        );
+
+        let ep = Epoll::new(OpenFlags::empty());
+        ep.ctl(
+            ADD,
+            crate::fs::FileDesc::from(3),
+            EpollEvent {
+                events: IN | EPOLLET,
+                data: 7,
+            },
+            Some(a.clone()),
+        )
+        .unwrap();
+
+        assert_eq!(wait_now(&ep), alloc::vec![(IN, 7)], "the first edge");
+        assert!(
+            wait_now(&ep).is_empty(),
+            "a level nobody republished is quiet: that is what EPOLLET means"
+        );
+
+        // B drains one byte of its full queue. A's ten bytes are untouched.
+        let seq_before = a.readiness_seq(PollEvents::IN);
+        let mut buf = [0u8; 1];
+        async_std::task::block_on(Socket::read(&*b, &mut buf))
+            .0
+            .unwrap();
+        assert_eq!(
+            a.inner.lock().buffer.len(),
+            10,
+            "A's receive queue did not change"
+        );
+
+        assert!(
+            wait_now(&ep).is_empty(),
+            "a WRITABLE-only pulse (A's seq {:?} -> {:?}) re-armed an \
+             EPOLLIN|EPOLLET entry and re-reported a level epoll_wait had \
+             already handed out",
+            seq_before,
+            a.readiness_seq(PollEvents::IN)
+        );
     }
 }
