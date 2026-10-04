@@ -1603,6 +1603,10 @@ mod write_failure_tests {
         fail_hold: bool,
         fail_write: bool,
         queued: Mutex<usize>,
+        /// Bytes handed to [`AudioScheme::write`]. The converted path offers
+        /// a different count from what the client wrote; the passthrough one
+        /// offers exactly it.
+        offered: Mutex<usize>,
     }
 
     impl PickyAudio {
@@ -1614,6 +1618,7 @@ mod write_failure_tests {
                 fail_hold: false,
                 fail_write: false,
                 queued: Mutex::new(0),
+                offered: Mutex::new(0),
             }
         }
     }
@@ -1635,6 +1640,7 @@ mod write_failure_tests {
             (48_000, 2)
         }
         fn write(&self, pcm: &[u8]) -> DeviceResult<usize> {
+            *self.offered.lock() += pcm.len();
             if self.fail_write {
                 return Err(DeviceError::NotReady);
             }
@@ -1726,6 +1732,61 @@ mod write_failure_tests {
         let nonblocking = node(roomless());
         let dsp = nonblocking.downcast_ref::<DspDev>().unwrap();
         assert_eq!(dsp.write_pcm(&pcm(), true), Err(FsError::Again));
+    }
+
+    /// The prepare's `reset`, which only a write AFTER an
+    /// `SNDCTL_DSP_RESET` reaches: the first write configures the stream,
+    /// and `set_params` IS the prepare, so it takes the other branch.
+    #[test]
+    fn a_device_that_cannot_be_prepared_answers_eio() {
+        let audio = PickyAudio {
+            fail_reset: true,
+            ..PickyAudio::roomy()
+        };
+        let node = node(audio);
+        assert_eq!(node.write_at(0, &pcm()), Ok(pcm().len()), "configured");
+        // `SNDCTL_DSP_RESET` marks the stream for a prepare and swallows the
+        // device's own error; the next write is where it surfaces.
+        node.io_control(SNDCTL_DSP_RESET, 0).unwrap();
+        assert_eq!(node.write_at(0, &pcm()), Err(FsError::DeviceError));
+    }
+
+    /// The converted write, which is a different call from the passthrough
+    /// one: `/dev/audio`'s µ-law 8 kHz mono is not S16LE stereo, so the PCM
+    /// goes through `convert_frames` first.
+    #[test]
+    fn a_device_that_refuses_converted_pcm_answers_eio() {
+        let sun = |audio: Arc<PickyAudio>| {
+            DspDev::with_defaults(audio, 0, new_audio_claim(), OssDefaults::Audio)
+                .open_client()
+                .unwrap()
+        };
+        // First, that this really is the converted path and not the
+        // passthrough one: four µ-law mono client bytes reach the device as
+        // sixteen bytes of S16LE stereo. The errnos below are the same on
+        // both paths by design -- only the `warn!` tells them apart -- so
+        // this is what says which call the test exercised.
+        let working = Arc::new(PickyAudio::roomy());
+        assert_eq!(sun(working.clone()).write_at(0, &[0x7fu8; 4]), Ok(4));
+        assert_eq!(
+            *working.offered.lock(),
+            16,
+            "µ-law mono must be converted to S16LE stereo on the way in"
+        );
+
+        let refusing = Arc::new(PickyAudio {
+            fail_write: true,
+            ..PickyAudio::roomy()
+        });
+        assert_eq!(
+            sun(refusing.clone()).write_at(0, &[0x7fu8; 4]),
+            Err(FsError::DeviceError)
+        );
+        assert_eq!(
+            *refusing.offered.lock(),
+            16,
+            "and the refusal came from that same converted call"
+        );
     }
 
     /// An empty write is not a failure on any of these paths: Linux's
