@@ -241,6 +241,33 @@ fn wake_after(limit: Option<Duration>, tick: Duration) -> Duration {
     }
 }
 
+/// Whether a wait's fd set is the one shape [`io_wait_interval`] may demote to
+/// the background-VT tick: at least one fd that counts, and every one of them
+/// a terminal. `None` is an fd that does not count -- a negative `pollfd`
+/// (POSIX says they are ignored), or an fd in none of `select`'s three sets;
+/// `Some` is whether that fd is a terminal, an fd the process cannot resolve
+/// counting as not one.
+///
+/// Written once because both wait loops computed it inline, and the decision
+/// it feeds has regressed in both directions. Keyed on `watch_interactive`
+/// alone it demoted PulseAudio's ALSA sink thread (`[pcm, timer]`, never on
+/// the active VT) to a 100 ms re-scan, and its 108 ms buffer underran on every
+/// wake; and a set with no terminal in it at all -- DRM fds, timerfds, pipes,
+/// the shape of a compositor's startup waits -- must not be demoted either, or
+/// every roundtrip is gated at a tenth of a second. An empty set is not the
+/// shape: there is no terminal in it to be on a background VT.
+fn only_terminals(fds: impl Iterator<Item = Option<bool>>) -> bool {
+    let mut any = false;
+    for is_terminal in fds {
+        match is_terminal {
+            None => continue,
+            Some(true) => any = true,
+            Some(false) => return false,
+        }
+    }
+    any
+}
+
 /// Pick the io-wait re-poll interval. The slow tick exists for exactly one
 /// pattern: a shell parked in poll(stdin) on a *background* VT, whose input can
 /// only ever arrive once its VT becomes active — re-polling that at 4 ms just
@@ -357,14 +384,17 @@ impl Syscall<'_> {
                 }
                 linux_object::net::io_wait_tick(watch_net, watch_interactive);
                 let proc = this.syscall.linux_process();
-                this.terminal_only = !this.polls.is_empty()
-                    && this.polls.iter().all(|p| {
-                        <FileDesc as Into<i32>>::into(p.fd) < 0
-                            || proc
-                                .get_file_like(p.fd)
+                this.terminal_only = only_terminals(this.polls.iter().map(|p| {
+                    if <FileDesc as Into<i32>>::into(p.fd) < 0 {
+                        None
+                    } else {
+                        Some(
+                            proc.get_file_like(p.fd)
                                 .map(|f| f.is_terminal())
-                                .unwrap_or(false)
-                    });
+                                .unwrap_or(false),
+                        )
+                    }
+                }));
                 let terminal_only = this.terminal_only;
                 let mut events = 0;
                 let mut early_err = None;
@@ -712,16 +742,14 @@ impl Syscall<'_> {
         // shape `io_wait_interval` may demote to the background-VT tick.
         let terminal_only = {
             let files = self.linux_process().get_files()?;
-            let mut any = false;
-            let all = (0..nfds).all(|fd| {
+            only_terminals((0..nfds).map(|fd| {
                 let fd = FileDesc::from(fd);
                 if !(read_fds.contains(fd) || write_fds.contains(fd) || err_fds.contains(fd)) {
-                    return true;
+                    None
+                } else {
+                    Some(files.get(&fd).map(|f| f.is_terminal()).unwrap_or(false))
                 }
-                any = true;
-                files.get(&fd).map(|f| f.is_terminal()).unwrap_or(false)
-            });
-            any && all
+            }))
         };
 
         #[must_use = "future does nothing unless polled/`await`-ed"]
@@ -1578,6 +1606,65 @@ mod poll_tests {
     #[test]
     fn a_socket_in_the_set_keeps_the_fast_tick() {
         assert_eq!(io_wait_interval_for(true, true, true, false), IO_WAIT_TICK);
+    }
+
+    // ---- the shape that feeds that decision ------------------------------
+
+    /// `terminal_only` is the *input* the two regressions above turned on, and
+    /// both wait loops computed it inline. A set of terminals alone is the
+    /// shape; one fd that is not a terminal takes the whole set out of it,
+    /// wherever in the set it sits.
+    #[test]
+    fn a_set_of_terminals_alone_is_the_shape_and_one_stranger_ends_it() {
+        let t = Some(true);
+        let f = Some(false);
+        assert!(only_terminals([t].iter().copied()));
+        assert!(only_terminals([t, t, t].iter().copied()));
+        assert!(!only_terminals([f, t, t].iter().copied()), "first");
+        assert!(!only_terminals([t, f, t].iter().copied()), "middle");
+        assert!(!only_terminals([t, t, f].iter().copied()), "last");
+        assert!(!only_terminals([f].iter().copied()));
+    }
+
+    /// An fd that does not count must not be able to *make* the shape: a
+    /// `poll` set of nothing but the `-1`s udhcpc6 leaves behind, or a
+    /// `select` whose three sets are empty below `nfds`, has no terminal in it
+    /// to be on a background VT.
+    #[test]
+    fn fds_that_do_not_count_cannot_make_the_shape_on_their_own() {
+        assert!(!only_terminals(core::iter::empty()));
+        assert!(!only_terminals([None].iter().copied()));
+        assert!(!only_terminals([None, None, None].iter().copied()));
+    }
+
+    /// But they do not break it either: one real terminal beside them is
+    /// still a shell on a VT.
+    #[test]
+    fn an_ignored_fd_beside_a_terminal_leaves_the_shape_alone() {
+        assert!(only_terminals([None, Some(true), None].iter().copied()));
+        assert!(
+            !only_terminals([None, Some(false), None].iter().copied()),
+            "an ignored fd does not excuse the one that is not a terminal"
+        );
+    }
+
+    /// The decision this shape feeds, end to end: it is only ever a demotion
+    /// for a set of terminals that is not on the active VT.
+    #[test]
+    fn only_a_background_set_of_terminals_reaches_the_slow_tick() {
+        let demoted = |fds: &[Option<bool>], on_active_vt| {
+            io_wait_interval_for(
+                false,
+                true,
+                only_terminals(fds.iter().copied()),
+                on_active_vt,
+            ) == SLOW_IO_WAIT_TICK
+        };
+        assert!(demoted(&[Some(true)], false));
+        assert!(!demoted(&[Some(true)], true));
+        assert!(!demoted(&[Some(true), Some(false)], false));
+        assert!(!demoted(&[None], false));
+        assert!(!demoted(&[], false));
     }
 
     // ---- select(2)'s nfds -----------------------------------------------

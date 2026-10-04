@@ -1876,3 +1876,359 @@ mod edge_trigger_tests {
         assert_eq!(st3.since, T0 + EDGE_REARM);
     }
 }
+
+#[cfg(test)]
+mod wait_batch_tests {
+    //! What one `epoll_wait` hands back, and what it leaves for the next one.
+    //!
+    //! The whole of `Epoll::wait` had been exercised through one shape:
+    //! `epoll_wait(ep, events, 16, 0)` on a single watched fd. The two things
+    //! it does with a set of several -- stop at `maxevents`, and give up on a
+    //! file whose `poll` fails -- had no test, and both are where userspace
+    //! either loses an event or is told a wrong number of them.
+
+    use super::*;
+    use crate::fs::eventfd::EventFd;
+    use core::future::Future;
+    use core::sync::atomic::{AtomicUsize, Ordering};
+    use core::task::{Context, Poll, Waker};
+
+    const IN: u32 = PollEvents::IN.bits() as u32;
+    const ADD: i32 = 1;
+
+    struct Nop;
+
+    impl alloc::task::Wake for Nop {
+        fn wake(self: Arc<Self>) {}
+    }
+
+    /// `epoll_wait(ep, events, maxevents, 0)`: the `(events, data)` pairs it
+    /// returns, or the error it fails with.
+    fn wait_now(ep: &Epoll, maxevents: usize) -> LxResult<Vec<(u32, u64)>> {
+        let waker = Waker::from(Arc::new(Nop));
+        let mut cx = Context::from_waker(&waker);
+        let mut fut = alloc::boxed::Box::pin(ep.wait(maxevents, 0));
+        match fut.as_mut().poll(&mut cx) {
+            Poll::Ready(r) => r.map(|v| v.iter().map(|e| (e.events, e.data)).collect()),
+            Poll::Pending => panic!("a zero-timeout wait finishes at once"),
+        }
+    }
+
+    /// Three readable eventfds under three numbers, each with its own `data`.
+    fn three_ready() -> Arc<Epoll> {
+        let ep = Epoll::new(OpenFlags::empty());
+        for n in 0..3u64 {
+            let efd = EventFd::new(0, OpenFlags::empty());
+            efd.write(&1u64.to_ne_bytes()).unwrap();
+            ep.ctl(
+                ADD,
+                FileDesc::from(n as i32 + 3),
+                EpollEvent {
+                    events: IN,
+                    data: n,
+                },
+                Some(efd),
+            )
+            .unwrap();
+        }
+        ep
+    }
+
+    /// `maxevents` is the size of the caller's array, so returning more than
+    /// it asked for is a write past the end of it. One event means one, and
+    /// the fds that did not fit are still ready for the next call -- a batch
+    /// that dropped them would lose the event for good, which is the bug
+    /// `maxevents` exists to prevent rather than cause.
+    #[test]
+    fn a_batch_stops_at_maxevents_and_the_rest_wait_for_the_next_call() {
+        let ep = three_ready();
+        for ask in 1..=3usize {
+            let got = wait_now(&ep, ask).unwrap();
+            assert_eq!(got.len(), ask, "asked for {}", ask);
+            // Nothing was consumed: every fd is still readable, so the next
+            // call sees the same set.
+            assert_eq!(wait_now(&ep, 3).unwrap().len(), 3, "after asking {}", ask);
+        }
+    }
+
+    /// Asking for more than are ready returns what there is, not a short
+    /// batch padded or a wait.
+    #[test]
+    fn asking_for_more_than_are_ready_returns_what_there_is() {
+        let ep = three_ready();
+        let got = wait_now(&ep, 16).unwrap();
+        assert_eq!(got.len(), 3);
+        let mut data: Vec<u64> = got.iter().map(|(_, d)| *d).collect();
+        data.sort_unstable();
+        assert_eq!(data, alloc::vec![0, 1, 2]);
+    }
+
+    /// A file whose `poll` fails, the way a device node whose driver has gone
+    /// away does.
+    struct Broken {
+        base: KObjectBase,
+        polled: AtomicUsize,
+    }
+
+    impl_kobject!(Broken);
+
+    #[async_trait]
+    impl FileLike for Broken {
+        fn flags(&self) -> OpenFlags {
+            OpenFlags::empty()
+        }
+        fn set_flags(&self, _f: OpenFlags) -> LxResult {
+            Ok(())
+        }
+        async fn read(&self, _buf: &mut [u8]) -> LxResult<usize> {
+            Err(LxError::EIO)
+        }
+        fn write(&self, _buf: &[u8]) -> LxResult<usize> {
+            Err(LxError::EIO)
+        }
+        async fn read_at(&self, _offset: u64, _buf: &mut [u8]) -> LxResult<usize> {
+            Err(LxError::EIO)
+        }
+        fn poll(&self, _events: PollEvents) -> LxResult<PollStatus> {
+            self.polled.fetch_add(1, Ordering::SeqCst);
+            Err(LxError::ENODEV)
+        }
+        async fn async_poll(&self, events: PollEvents) -> LxResult<PollStatus> {
+            self.poll(events)
+        }
+    }
+
+    fn broken() -> Arc<Broken> {
+        Arc::new(Broken {
+            base: KObjectBase::new(),
+            polled: AtomicUsize::new(0),
+        })
+    }
+
+    /// The scan gives up on the whole wait with that error. The alternative
+    /// -- skip the fd and report the others -- is what makes a broken fd
+    /// invisible: an event loop that never learns the fd is gone keeps it in
+    /// the interest list and is scanned for it on every pass for ever.
+    #[test]
+    fn a_file_whose_poll_fails_fails_the_whole_wait() {
+        let ep = Epoll::new(OpenFlags::empty());
+        let bad = broken();
+        ep.ctl(
+            ADD,
+            FileDesc::from(4),
+            EpollEvent {
+                events: IN,
+                data: 1,
+            },
+            Some(bad.clone()),
+        )
+        .unwrap();
+        assert_eq!(wait_now(&ep, 16), Err(LxError::ENODEV));
+        assert_eq!(bad.polled.load(Ordering::SeqCst), 1);
+    }
+
+    /// And it does so whatever else is in the set: the error is the answer
+    /// even when another fd is ready, and the ready fd is still ready once
+    /// the broken one is gone. The ready one must not have been counted as
+    /// delivered -- an `EPOLLONESHOT` entry disarmed by a wait that returned
+    /// an error would have been spent without userspace ever seeing it.
+    #[test]
+    fn a_ready_fd_beside_a_broken_one_is_not_spent_by_the_failed_wait() {
+        let ep = Epoll::new(OpenFlags::empty());
+        let efd = EventFd::new(0, OpenFlags::empty());
+        efd.write(&1u64.to_ne_bytes()).unwrap();
+        ep.ctl(
+            ADD,
+            FileDesc::from(3),
+            EpollEvent {
+                events: IN | EPOLLONESHOT,
+                data: 7,
+            },
+            Some(efd),
+        )
+        .unwrap();
+        let bad = broken();
+        ep.ctl(
+            ADD,
+            FileDesc::from(4),
+            EpollEvent {
+                events: IN,
+                data: 9,
+            },
+            Some(bad),
+        )
+        .unwrap();
+        assert_eq!(wait_now(&ep, 16), Err(LxError::ENODEV));
+        // Drop the broken fd the way `EPOLL_CTL_DEL` would, and the one-shot
+        // entry is still armed.
+        ep.ctl(
+            2,
+            FileDesc::from(4),
+            EpollEvent { events: 0, data: 0 },
+            None,
+        )
+        .unwrap();
+        assert_eq!(wait_now(&ep, 16).unwrap(), alloc::vec![(IN, 7)]);
+        assert_eq!(wait_now(&ep, 16).unwrap(), Vec::new(), "now it is spent");
+    }
+}
+
+#[cfg(test)]
+mod edge_bookkeeping_tests {
+    //! The two places the edge-trigger state is pruned, neither of which any
+    //! test named.
+    //!
+    //! The state is what keeps an edge-triggered entry quiet about a level
+    //! that has not moved. Left behind on an entry that is no longer the one
+    //! it was computed for, it silences the wrong fd -- and a silenced fd is
+    //! an event loop that never wakes, which is the whole failure mode
+    //! `EPOLLET` support exists to get right (`mio`, under every `tokio`
+    //! program, registers its eventfd waker this way).
+
+    use super::*;
+    use crate::fs::eventfd::EventFd;
+
+    const ADD: i32 = 1;
+    const DEL: i32 = 2;
+    const MOD: i32 = 3;
+    const IN: u32 = PollEvents::IN.bits() as u32;
+
+    fn evfd() -> Arc<dyn FileLike> {
+        let fd = EventFd::new(0, OpenFlags::empty());
+        fd.write(&1u64.to_ne_bytes()).unwrap();
+        fd
+    }
+
+    fn state() -> EdgeState {
+        EdgeState {
+            seq: 11,
+            quiet: IN,
+            since: core::time::Duration::from_millis(5),
+        }
+    }
+
+    fn stored_edge(ep: &Epoll, fd: FileDesc) -> Option<EdgeState> {
+        ep.inner.lock().edge.get(&fd).copied()
+    }
+
+    fn add(ep: &Epoll, fd: FileDesc, events: u32, file: Arc<dyn FileLike>) {
+        ep.ctl(ADD, fd, EpollEvent { events, data: 0 }, Some(file))
+            .unwrap();
+    }
+
+    /// The entry the scan looked at is still there, still edge-triggered and
+    /// still the same file: its state is what the next scan must compare
+    /// against.
+    #[test]
+    fn a_scan_of_a_live_edge_entry_stores_what_it_computed() {
+        let ep = Epoll::new(OpenFlags::empty());
+        let fd = FileDesc::from(4);
+        let f = evfd();
+        add(&ep, fd, IN | EPOLLET, f.clone());
+        assert_eq!(stored_edge(&ep, fd), None, "nothing scanned yet");
+        ep.store_edges(&[(fd, f, state())]);
+        assert_eq!(stored_edge(&ep, fd), Some(state()));
+    }
+
+    /// `EPOLL_CTL_MOD` that drops `EPOLLET` puts the entry back on level
+    /// reporting, and a level-reported entry has no quiet state to honour.
+    /// Storing one anyway would hand the next `MOD` back to `EPOLLET` a
+    /// counter and a `quiet` mask from before the entry was re-armed, and
+    /// `edge_step` would hold the entry quiet on a level it had never
+    /// reported under this mask.
+    #[test]
+    fn a_scan_stores_nothing_for_an_entry_that_is_no_longer_edge_triggered() {
+        let ep = Epoll::new(OpenFlags::empty());
+        let fd = FileDesc::from(4);
+        let f = evfd();
+        add(&ep, fd, IN | EPOLLET, f.clone());
+        ep.ctl(
+            MOD,
+            fd,
+            EpollEvent {
+                events: IN,
+                data: 0,
+            },
+            Some(f.clone()),
+        )
+        .unwrap();
+        ep.store_edges(&[(fd, f, state())]);
+        assert_eq!(stored_edge(&ep, fd), None);
+    }
+
+    /// The scan runs on a snapshot taken without the lock, so by the time it
+    /// writes back, the number may have been closed and handed to another
+    /// file -- one this scan never looked at. Its state belongs to the file
+    /// that is gone, and the new one must start from nothing. Same reasoning
+    /// as `disarm_oneshot`, and the same pointer comparison.
+    #[test]
+    fn a_scan_stores_nothing_for_a_number_that_now_holds_a_different_file() {
+        let ep = Epoll::new(OpenFlags::empty());
+        let fd = FileDesc::from(4);
+        let scanned = evfd();
+        add(&ep, fd, IN | EPOLLET, scanned.clone());
+        ep.ctl(DEL, fd, EpollEvent { events: 0, data: 0 }, None)
+            .unwrap();
+        let reused = evfd();
+        add(&ep, fd, IN | EPOLLET, reused);
+        ep.store_edges(&[(fd, scanned, state())]);
+        assert_eq!(stored_edge(&ep, fd), None);
+    }
+
+    /// And nothing at all for a number that is no longer watched.
+    #[test]
+    fn a_scan_stores_nothing_for_an_entry_that_has_been_removed() {
+        let ep = Epoll::new(OpenFlags::empty());
+        let fd = FileDesc::from(4);
+        let f = evfd();
+        add(&ep, fd, IN | EPOLLET, f.clone());
+        ep.ctl(DEL, fd, EpollEvent { events: 0, data: 0 }, None)
+            .unwrap();
+        ep.store_edges(&[(fd, f, state())]);
+        assert_eq!(stored_edge(&ep, fd), None);
+        assert!(ep.inner.lock().interest_list.is_empty());
+    }
+
+    /// `forget_closed` answers how many entries it dropped: `eventpoll_release`
+    /// runs for every epoll in the system when a description dies, and the
+    /// count is how its caller knows which ones held it.
+    #[test]
+    fn forget_closed_counts_the_entries_of_that_description_and_no_others() {
+        let ep = Epoll::new(OpenFlags::empty());
+        let closing = evfd();
+        let other = evfd();
+        // The same description under two numbers, as a `dup` leaves it.
+        add(&ep, FileDesc::from(4), IN, closing.clone());
+        add(&ep, FileDesc::from(9), IN, closing.clone());
+        add(&ep, FileDesc::from(5), IN, other);
+        assert_eq!(ep.forget_closed(&closing), 2);
+        assert_eq!(ep.forget_closed(&closing), 0, "already gone");
+        assert_eq!(ep.inner.lock().interest_list.len(), 1);
+    }
+
+    /// The edge state of a dropped entry goes with it. Kept, it would silence
+    /// the number as soon as it was watched again: `epoll_ctl` clears the
+    /// state on ADD, but only the state under the number being added -- an
+    /// entry under a *different* number, never re-added, would carry a
+    /// counter belonging to a file that no longer exists for as long as the
+    /// epoll lived.
+    #[test]
+    fn forget_closed_takes_the_edge_state_of_what_it_dropped() {
+        let ep = Epoll::new(OpenFlags::empty());
+        let closing = evfd();
+        let other = evfd();
+        let gone = FileDesc::from(4);
+        let staying = FileDesc::from(5);
+        add(&ep, gone, IN | EPOLLET, closing.clone());
+        add(&ep, staying, IN | EPOLLET, other.clone());
+        ep.store_edges(&[(gone, closing.clone(), state()), (staying, other, state())]);
+        assert_eq!(stored_edge(&ep, gone), Some(state()));
+        assert_eq!(ep.forget_closed(&closing), 1);
+        assert_eq!(stored_edge(&ep, gone), None, "state of a dropped entry");
+        assert_eq!(
+            stored_edge(&ep, staying),
+            Some(state()),
+            "the entry that stayed must keep what its own scan computed"
+        );
+    }
+}
