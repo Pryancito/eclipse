@@ -1915,7 +1915,10 @@ mod wait_batch_tests {
     }
 
     /// Three readable eventfds under three numbers, each with its own `data`.
-    fn three_ready() -> Arc<Epoll> {
+    ///
+    /// `extra` goes into every stored mask, so the caller can make the
+    /// entries one-shot and have each delivery consume its own.
+    fn three_ready(extra: u32) -> Arc<Epoll> {
         let ep = Epoll::new(OpenFlags::empty());
         for n in 0..3u64 {
             let efd = EventFd::new(0, OpenFlags::empty());
@@ -1924,7 +1927,7 @@ mod wait_batch_tests {
                 ADD,
                 FileDesc::from(n as i32 + 3),
                 EpollEvent {
-                    events: IN,
+                    events: IN | extra,
                     data: n,
                 },
                 Some(efd),
@@ -1939,15 +1942,34 @@ mod wait_batch_tests {
     /// the fds that did not fit are still ready for the next call -- a batch
     /// that dropped them would lose the event for good, which is the bug
     /// `maxevents` exists to prevent rather than cause.
+    ///
+    /// The entries are `EPOLLONESHOT` so that each delivery consumes its own
+    /// and nothing else: on level-triggered entries nothing is consumed
+    /// either way, and a `wait` that scanned every entry and only truncated
+    /// the batch it returns would pass just the same while disarming the
+    /// one-shots it never handed out -- userspace would never see those
+    /// events, which is exactly what `maxevents` must not cost. So the
+    /// second call is asked for an exact set, not a count that happens to
+    /// match.
     #[test]
     fn a_batch_stops_at_maxevents_and_the_rest_wait_for_the_next_call() {
-        let ep = three_ready();
         for ask in 1..=3usize {
-            let got = wait_now(&ep, ask).unwrap();
-            assert_eq!(got.len(), ask, "asked for {}", ask);
-            // Nothing was consumed: every fd is still readable, so the next
-            // call sees the same set.
-            assert_eq!(wait_now(&ep, 3).unwrap().len(), 3, "after asking {}", ask);
+            let ep = three_ready(EPOLLONESHOT);
+            let first = wait_now(&ep, ask).unwrap();
+            assert_eq!(first.len(), ask, "asked for {}", ask);
+            // Exactly the entries the first batch did not reach, and they are
+            // still armed: a scan that went past `ask` would have spent them.
+            let rest = wait_now(&ep, 16).unwrap();
+            assert_eq!(rest.len(), 3 - ask, "left over after asking {}", ask);
+            let mut seen: Vec<u64> = first
+                .iter()
+                .chain(rest.iter())
+                .map(|(_, data)| *data)
+                .collect();
+            seen.sort_unstable();
+            assert_eq!(seen, alloc::vec![0, 1, 2], "after asking {}", ask);
+            // And now every one of them is spent, none twice.
+            assert_eq!(wait_now(&ep, 16).unwrap(), Vec::new());
         }
     }
 
@@ -1955,7 +1977,7 @@ mod wait_batch_tests {
     /// batch padded or a wait.
     #[test]
     fn asking_for_more_than_are_ready_returns_what_there_is() {
-        let ep = three_ready();
+        let ep = three_ready(0);
         let got = wait_now(&ep, 16).unwrap();
         assert_eq!(got.len(), 3);
         let mut data: Vec<u64> = got.iter().map(|(_, d)| *d).collect();
