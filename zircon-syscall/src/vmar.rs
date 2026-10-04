@@ -42,15 +42,18 @@ impl Syscall<'_> {
         mut out_child_vmar: UserOutPtr<HandleValue>,
         mut out_child_addr: UserOutPtr<usize>,
     ) -> ZxResult {
-        let (vm_options, align) = vmar_options(options)?;
         info!(
             "vmar.allocate: parent={:#x?}, options={:#x?}, offset={:#x?}, size={:#x?}",
             parent_vmar, options, offset, size,
         );
-        // try to get parent_vmar
-        let perm_rights = vm_options.to_rights();
+        // Handle first: bad options used to hide BAD_HANDLE / WRONG_TYPE.
         let proc = self.thread.proc();
-        let parent = proc.get_object_with_rights::<VmAddressRegion>(parent_vmar, perm_rights)?;
+        let (parent, available) = proc.get_object_and_rights::<VmAddressRegion>(parent_vmar)?;
+        let (vm_options, align) = vmar_options(options)?;
+        let perm_rights = vm_options.to_rights();
+        if !available.contains(perm_rights) {
+            return Err(ZxError::ACCESS_DENIED);
+        }
 
         if vm_options.intersects(VmOptions::PERM_RXW | VmOptions::MAP_RANGE) {
             return Err(ZxError::INVALID_ARGS);
@@ -70,7 +73,9 @@ impl Syscall<'_> {
         let offset = if vm_options.contains(VmOptions::SPECIFIC) {
             Some(offset as usize)
         } else if vm_options.contains(VmOptions::SPECIFIC_OVERWRITE) {
-            unimplemented!()
+            // Allocate does not overwrite existing mappings; map() handles that.
+            // Panic used to take down the kernel on a userspace flag.
+            return Err(ZxError::NOT_SUPPORTED);
         } else {
             if offset != 0 {
                 return Err(ZxError::INVALID_ARGS);
@@ -118,13 +123,20 @@ impl Syscall<'_> {
             "vmar.map: vmar_handle={:#x?}, options={:#x?}, vmar_offset={:#x?}, vmo_handle={:#x?}, vmo_offset={:#x?}, len={:#x?}",
             vmar_handle, options, vmar_offset, vmo_handle, vmo_offset, len
         );
-        let options = VmOptions::from_bits(options).ok_or(ZxError::INVALID_ARGS)?;
+        // Handles first: bad options/align used to hide BAD_HANDLE / WRONG_TYPE.
         let proc = self.thread.proc();
         let (vmar, vmar_rights) = proc.get_object_and_rights::<VmAddressRegion>(vmar_handle)?;
         let (vmo, vmo_rights) = proc.get_object_and_rights::<VmObject>(vmo_handle)?;
         if !vmo_rights.contains(Rights::MAP) {
             return Err(ZxError::ACCESS_DENIED);
         };
+        // Same ALIGN_FIELD mask as allocate: `from_bits` on the whole word
+        // refused every `ZX_VM_ALIGN_*` request.
+        let (options, align) = vmar_options(options)?;
+        if align != PAGE_SIZE {
+            // Super-page placement is not plumbed through `map_ext` yet.
+            return Err(ZxError::NOT_SUPPORTED);
+        }
         if options
             .intersects(VmOptions::CAN_MAP_RXW | VmOptions::CAN_MAP_SPECIFIC | VmOptions::COMPACT)
         {
@@ -211,16 +223,20 @@ impl Syscall<'_> {
         len: usize,
         mut mapped_addr: UserOutPtr<VirtAddr>,
     ) -> ZxResult {
-        const DISALLOWED_OPTIONS: u32 = (1 << 1) | (1 << 2) | (1 << 14) | (1 << 15);
-        if options & DISALLOWED_OPTIONS != 0 || len != PAGE_SIZE {
-            return Err(ZxError::INVALID_ARGS);
-        }
-        let options = VmOptions::from_bits(options).ok_or(ZxError::INVALID_ARGS)?;
+        // Handles first: bad options/len used to hide BAD_HANDLE / WRONG_TYPE.
         let proc = self.thread.proc();
         let (vmar, vmar_rights) = proc.get_object_and_rights::<VmAddressRegion>(vmar_handle)?;
         let (clock, clock_rights) = proc.get_object_and_rights::<Clock>(clock_handle)?;
         if !clock_rights.contains(Rights::READ | Rights::MAP) {
             return Err(ZxError::ACCESS_DENIED);
+        }
+        const DISALLOWED_OPTIONS: u32 = (1 << 1) | (1 << 2) | (1 << 14) | (1 << 15);
+        if options & DISALLOWED_OPTIONS != 0 || len != PAGE_SIZE {
+            return Err(ZxError::INVALID_ARGS);
+        }
+        let (options, align) = vmar_options(options)?;
+        if align != PAGE_SIZE {
+            return Err(ZxError::NOT_SUPPORTED);
         }
         let vmo = clock.mapped_vmo().ok_or(ZxError::INVALID_ARGS)?;
         if !vmar_rights.contains(options.to_required_rights()) {
@@ -268,14 +284,18 @@ impl Syscall<'_> {
         addr: u64,
         len: u64,
     ) -> ZxResult {
+        let proc = self.thread.proc();
+        let (vmar, available) = proc.get_object_and_rights::<VmAddressRegion>(handle_value)?;
+        // Handle first: bad options used to hide BAD_HANDLE / WRONG_TYPE.
         let options = VmOptions::from_bits(options).ok_or(ZxError::INVALID_ARGS)?;
         let rights = options.to_required_rights();
+        if !available.contains(rights) {
+            return Err(ZxError::ACCESS_DENIED);
+        }
         info!(
             "vmar.protect: handle={:#x}, options={:#x}, addr={:#x}, len={:#x}",
             handle_value, options, addr, len
         );
-        let proc = self.thread.proc();
-        let vmar = proc.get_object_with_rights::<VmAddressRegion>(handle_value, rights)?;
         if options.intersects(!VmOptions::PERM_RXW) {
             return Err(ZxError::INVALID_ARGS);
         }
@@ -451,5 +471,14 @@ mod vmar_options_tests {
             vmar_options(align_option(20) | (1 << 13)),
             Err(ZxError::INVALID_ARGS)
         );
+    }
+
+    #[test]
+    fn map_accepts_page_alignment_the_way_allocate_does() {
+        // `sys_vmar_map` used `from_bits` on the whole word, so ALIGN_4KB
+        // (and every other ZX_VM_ALIGN_*) was INVALID_ARGS.
+        let (flags, align) = vmar_options(align_option(PAGE_SIZE_LOG2 as u32)).unwrap();
+        assert_eq!(align, PAGE_SIZE);
+        assert!(flags.is_empty());
     }
 }

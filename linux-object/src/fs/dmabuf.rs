@@ -121,6 +121,10 @@ impl FileLike for DmaBuf {
         Err(LxError::EINVAL)
     }
 
+    fn write_at(&self, _offset: u64, _buf: &[u8]) -> LxResult<usize> {
+        Err(LxError::EINVAL)
+    }
+
     /// Mesa's software dma-buf import (`kms_sw_displaytarget_from_handle`) sizes
     /// the buffer with `lseek(fd, 0, SEEK_END)` before mmap()ing it. Report the
     /// backing size so the import succeeds; without this lseek failed (EBADF on

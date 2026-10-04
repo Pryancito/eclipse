@@ -694,6 +694,16 @@ impl Socket for NetlinkSocketState {
         Some(self.sock_type)
     }
 
+    fn so_domain(&self) -> Option<u32> {
+        Some(crate::net::Domain::AF_NETLINK as u32)
+    }
+
+    fn so_protocol(&self) -> Option<u32> {
+        // Netlink family/protocol is chosen at socket(); we do not track the
+        // NETLINK_* number yet — report 0 (generic), same default as unbound.
+        Some(0)
+    }
+
     fn take_msg_flags(&self) -> i32 {
         core::mem::replace(&mut *self.last_msg_flags.lock(), 0)
     }

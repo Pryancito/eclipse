@@ -503,8 +503,14 @@ impl FileLike for PerfEvent {
         Err(LxError::EINVAL)
     }
 
-    async fn read_at(&self, _offset: u64, buf: &mut [u8]) -> LxResult<usize> {
-        self.read(buf).await
+    fn write_at(&self, _offset: u64, _buf: &[u8]) -> LxResult<usize> {
+        // perf fds are not seekable; pwrite must be ESPIPE (write stays EINVAL).
+        Err(LxError::ESPIPE)
+    }
+
+    async fn read_at(&self, _offset: u64, _buf: &mut [u8]) -> LxResult<usize> {
+        // perf fds are not seekable; pread must be ESPIPE, not a silent read.
+        Err(LxError::ESPIPE)
     }
 
     fn poll(&self, _events: PollEvents) -> LxResult<PollStatus> {
@@ -1463,8 +1469,9 @@ mod tests {
         let ev = open(0, 0, 0, 1);
         assert_eq!(ev.write(b"x").unwrap_err(), LxError::EINVAL);
         assert!(!ev.poll(PollEvents::empty()).unwrap().write);
-        // read_at ignores the offset: the fd has no seekable contents.
+        // Not seekable: pread/pwrite are ESPIPE (write stays EINVAL).
         let mut buf = [0u8; 8];
-        assert_eq!(ev.read_at(4096, &mut buf).await.unwrap(), 8);
+        assert_eq!(ev.read_at(4096, &mut buf).await.unwrap_err(), LxError::ESPIPE);
+        assert_eq!(ev.write_at(0, b"x").unwrap_err(), LxError::ESPIPE);
     }
 }

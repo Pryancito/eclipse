@@ -25,13 +25,14 @@ impl Syscall<'_> {
         buffer: usize,
         buffer_size: usize,
     ) -> ZxResult {
+        let proc = self.thread.proc();
+        let object = proc.get_dyn_object_with_rights(handle_value, Rights::GET_PROPERTY)?;
+        // Handle first: unknown property used to hide BAD_HANDLE / WRONG_TYPE.
         let property = Property::try_from(property).map_err(|_| ZxError::INVALID_ARGS)?;
         info!(
             "object.get_property: handle={:#x?}, property={:?}, buffer=({:#x}; {:#x?})",
             handle_value, property, buffer, buffer_size
         );
-        let proc = self.thread.proc();
-        let object = proc.get_dyn_object_with_rights(handle_value, Rights::GET_PROPERTY)?;
         match property {
             Property::Name => {
                 if buffer_size < MAX_NAME_LEN {
@@ -145,13 +146,14 @@ impl Syscall<'_> {
         buffer: usize,
         buffer_size: usize,
     ) -> ZxResult {
+        let proc = self.thread.proc();
+        let object = proc.get_dyn_object_with_rights(handle_value, Rights::SET_PROPERTY)?;
+        // Handle first: unknown property used to hide BAD_HANDLE / WRONG_TYPE.
         let property = Property::try_from(property).map_err(|_| ZxError::INVALID_ARGS)?;
         info!(
             "object.set_property: handle={:#x?}, property={:?}, buffer=({:#x}; {:#x?})",
             handle_value, property, buffer, buffer_size
         );
-        let proc = self.thread.proc();
-        let object = proc.get_dyn_object_with_rights(handle_value, Rights::SET_PROPERTY)?;
         match property {
             Property::Name => {
                 let length = buffer_size.min(MAX_NAME_LEN);
@@ -276,12 +278,14 @@ impl Syscall<'_> {
         actual: UserOutPtr<usize>,
         avail: UserOutPtr<usize>,
     ) -> ZxResult {
+        let proc = self.thread.proc();
+        // Handle first: unknown topic used to hide BAD_HANDLE / WRONG_TYPE.
+        let _ = proc.get_dyn_object_and_rights(handle)?;
         let topic = Topic::try_from(topic).map_err(|_| ZxError::INVALID_ARGS)?;
         info!(
             "object.get_info: handle={:#x?}, topic={:?}, buffer=({:#x}; {:#x})",
             handle, topic, buffer, buffer_size,
         );
-        let proc = self.thread.proc();
         let mut output = InfoBuffer {
             proc,
             buffer,
@@ -348,12 +352,12 @@ impl Syscall<'_> {
                 output.write(thread.get_thread_exception_info()?)?;
             }
             Topic::TaskRuntimeV1 => {
-                let thread = proc.get_object_with_rights::<Thread>(handle, Rights::INSPECT)?;
-                output.write(TaskRuntimeInfoV1::from(thread.get_runtime_info()))?;
+                let info = task_runtime_info(proc, handle)?;
+                output.write(TaskRuntimeInfoV1::from(info))?;
             }
             Topic::TaskRuntime => {
-                let thread = proc.get_object_with_rights::<Thread>(handle, Rights::INSPECT)?;
-                output.write(thread.get_runtime_info())?;
+                let info = task_runtime_info(proc, handle)?;
+                output.write(info)?;
             }
             Topic::HandleCount => {
                 let object = proc.get_dyn_object_with_rights(handle, Rights::INSPECT)?;
@@ -498,10 +502,17 @@ impl Syscall<'_> {
                 }
                 output.write(clock.mapped_size() as u64)?;
             }
-            _ => {
-                error!("not supported info topic: {:?}", topic);
+            // Stubs: still require a correctly typed handle so BAD_HANDLE /
+            // WRONG_TYPE are not masked by a blanket NOT_SUPPORTED.
+            Topic::ProcessMaps | Topic::ProcessHandleStats => {
+                let _ = proc.get_object_with_rights::<Process>(handle, Rights::INSPECT)?;
                 return Err(ZxError::NOT_SUPPORTED);
             }
+            Topic::CpuStats => {
+                let _ = proc.get_object_with_rights::<Resource>(handle, Rights::INSPECT)?;
+                return Err(ZxError::NOT_SUPPORTED);
+            }
+            Topic::None => return Err(ZxError::INVALID_ARGS),
         }
         Ok(())
     }
@@ -519,10 +530,12 @@ impl Syscall<'_> {
         );
         let proc = self.thread.proc();
         let object = proc.get_dyn_object_with_rights(handle_value, Rights::SIGNAL_PEER)?;
+        // Peer first: bad masks used to hide PEER_CLOSED.
+        let peer = object.peer()?;
         let allowed_signals = object.allowed_signals();
         let clear_signal = Signal::verify_user_signal(allowed_signals, clear_mask)?;
         let set_signal = Signal::verify_user_signal(allowed_signals, set_mask)?;
-        object.peer()?.signal_change(clear_signal, set_signal);
+        peer.signal_change(clear_signal, set_signal);
         Ok(())
     }
 
@@ -540,13 +553,14 @@ impl Syscall<'_> {
             "object.wait_async: handle={:#x}, port={:#x}, key={:#x}, signal={:?}, options={:#X}",
             handle_value, port_handle_value, key, signals, options
         );
+        let proc = self.thread.proc();
+        let object = proc.get_dyn_object_with_rights(handle_value, Rights::WAIT)?;
+        let port = proc.get_object_with_rights::<Port>(port_handle_value, Rights::WRITE)?;
+        // Handles first: bad options used to hide BAD_HANDLE / WRONG_TYPE.
         let options = WaitAsyncOptions::from_bits(options).ok_or(ZxError::INVALID_ARGS)?;
         if options.contains(WaitAsyncOptions::TIMESTAMP | WaitAsyncOptions::BOOT_TIMESTAMP) {
             return Err(ZxError::INVALID_ARGS);
         }
-        let proc = self.thread.proc();
-        let object = proc.get_dyn_object_with_rights(handle_value, Rights::WAIT)?;
-        let port = proc.get_object_with_rights::<Port>(port_handle_value, Rights::WRITE)?;
         let cancel = proc.get_cancel_token(handle_value)?;
         port.wait_async(
             &object,
@@ -625,12 +639,19 @@ impl Syscall<'_> {
             "object.get_child: handle={:#x}, koid={:#x}, rights={:#x}",
             handle, koid, rights
         );
-        let mut rights = Rights::from_bits(rights).ok_or(ZxError::INVALID_ARGS)?;
         let proc = self.thread.proc();
         let (task, parent_rights) = proc.get_dyn_object_and_rights(handle)?;
+        // Type first: missing ENUMERATE used to hide WRONG_TYPE on a VMO/etc.
+        if task.clone().downcast_arc::<Job>().is_err()
+            && task.clone().downcast_arc::<Process>().is_err()
+        {
+            return Err(ZxError::WRONG_TYPE);
+        }
         if !parent_rights.contains(Rights::ENUMERATE) {
             return Err(ZxError::ACCESS_DENIED);
         }
+        // Rights bits after type/ENUMERATE: unknown bits used to hide WRONG_TYPE.
+        let mut rights = Rights::from_bits(rights).ok_or(ZxError::INVALID_ARGS)?;
         if rights == Rights::SAME_RIGHTS {
             rights = parent_rights;
         } else if (rights & parent_rights) != rights {
@@ -890,6 +911,22 @@ struct KmemInfoExtended {
     ipc_bytes: u64,
     other_bytes: u64,
     vmo_reclaim_disabled_bytes: u64,
+}
+
+/// `ZX_INFO_TASK_RUNTIME{,_V1}`: Thread, Process, or Job with INSPECT.
+fn task_runtime_info(proc: &Process, handle: HandleValue) -> ZxResult<TaskRuntimeInfo> {
+    if let Ok(thread) = proc.get_object_with_rights::<Thread>(handle, Rights::INSPECT) {
+        return Ok(thread.get_runtime_info());
+    }
+    if let Ok(process) = proc.get_object_with_rights::<Process>(handle, Rights::INSPECT) {
+        return Ok(process.get_runtime_info());
+    }
+    if let Ok(job) = proc.get_object_with_rights::<Job>(handle, Rights::INSPECT) {
+        return Ok(job.get_runtime_info());
+    }
+    // Prefer the Thread error (WRONG_TYPE / BAD_HANDLE / ACCESS_DENIED).
+    proc.get_object_with_rights::<Thread>(handle, Rights::INSPECT)
+        .map(|t| t.get_runtime_info())
 }
 
 /// How much of a `ZX_PROP_NAME` write is kept.

@@ -171,12 +171,17 @@ impl Syscall<'_> {
         size: usize,
         mut out: UserOutPtr<HandleValue>,
     ) -> ZxResult {
+        let proc = self.thread.proc();
+        let (vmo, parent_rights) = proc.get_object_and_rights::<VmObject>(handle_value)?;
+        if !parent_rights.contains(Rights::DUPLICATE | Rights::READ) {
+            return Err(ZxError::ACCESS_DENIED);
+        }
+        // Handle first: bad options/size used to hide BAD_HANDLE / WRONG_TYPE.
         let mut options = VmoCloneFlags::from_bits(options).ok_or(ZxError::INVALID_ARGS)?;
         info!(
             "vmo_create_child: handle={:#x}, options={:?}, offset={:#x}, size={:#x}",
             handle_value, options, offset, size
         );
-        // check options given
         let no_write = options.contains(VmoCloneFlags::NO_WRITE);
         if no_write {
             options.remove(VmoCloneFlags::NO_WRITE);
@@ -188,12 +193,6 @@ impl Syscall<'_> {
             return Err(ZxError::OUT_OF_RANGE);
         }
         info!("size of child vmo: {:#x}", child_size);
-
-        let proc = self.thread.proc();
-        let (vmo, parent_rights) = proc.get_object_and_rights::<VmObject>(handle_value)?;
-        if !parent_rights.contains(Rights::DUPLICATE | Rights::READ) {
-            return Err(ZxError::ACCESS_DENIED);
-        }
         let child_vmo = if options.contains(VmoCloneFlags::SLICE) {
             if options != VmoCloneFlags::SLICE {
                 Err(ZxError::INVALID_ARGS)
@@ -316,9 +315,10 @@ impl Syscall<'_> {
             "vmo.op_range: handle={:#x}, op={:#X}, offset={:#x}, len={:#x}, buffer_size={:#x}",
             handle_value, op, offset, len, _buffer_size,
         );
-        let op = VmoOpType::try_from(op).or(Err(ZxError::INVALID_ARGS))?;
         let proc = self.thread.proc();
         let (vmo, rights) = proc.get_object_and_rights::<VmObject>(handle_value)?;
+        // Handle first: a bad `op` used to hide BAD_HANDLE / WRONG_TYPE.
+        let op = VmoOpType::try_from(op).or(Err(ZxError::INVALID_ARGS))?;
         match op {
             VmoOpType::Commit => {
                 if !rights.contains(Rights::WRITE) {

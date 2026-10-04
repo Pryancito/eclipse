@@ -21,13 +21,14 @@ impl Syscall<'_> {
             "proc.create: job={:#x?}, name={:?}, options={:#x?}",
             job, name, options,
         );
-        if options != 0 {
-            return Err(ZxError::INVALID_ARGS);
-        }
         let proc = self.thread.proc();
         let job = proc
             .get_object_with_rights::<Job>(job, Rights::MANAGE_PROCESS)
             .or_else(|_| proc.get_object_with_rights::<Job>(job, Rights::WRITE))?;
+        // Handle first: options!=0 used to hide BAD_HANDLE on the parent job.
+        if options != 0 {
+            return Err(ZxError::INVALID_ARGS);
+        }
         // Zircon processes get an address space that does not start at zero;
         // see `VmAddressRegion::new_root_zircon`.
         let new_proc = Process::create_with_vmar(
@@ -74,11 +75,12 @@ impl Syscall<'_> {
             "thread.create: proc={:#x?}, name={:?}, options={:#x?}",
             proc_handle, name, options,
         );
+        let proc = self.thread.proc();
+        let process = proc.get_object_with_rights::<Process>(proc_handle, Rights::MANAGE_THREAD)?;
+        // Handle first: options!=0 used to hide BAD_HANDLE on the parent.
         if options != 0 {
             return Err(ZxError::INVALID_ARGS);
         }
-        let proc = self.thread.proc();
-        let process = proc.get_object_with_rights::<Process>(proc_handle, Rights::MANAGE_THREAD)?;
         let thread = Thread::create(&process, name)?;
         install_handle(
             proc,
@@ -132,13 +134,14 @@ impl Syscall<'_> {
         mut buffer: UserOutPtr<u8>,
         buffer_size: usize,
     ) -> ZxResult {
-        let kind = ThreadStateKind::try_from(kind).map_err(|_| ZxError::INVALID_ARGS)?;
         info!(
             "thread.read_state: handle={:#x?}, kind={:#x?}, buf=({:#x?}; {:#x?})",
             handle, kind, buffer, buffer_size,
         );
+        // Handle first: a bad kind used to hide BAD_HANDLE / WRONG_TYPE.
         let proc = self.thread.proc();
         let thread = proc.get_object_with_rights::<Thread>(handle, Rights::READ)?;
+        let kind = ThreadStateKind::try_from(kind).map_err(|_| ZxError::INVALID_ARGS)?;
         // The kernel buffer is as large as a state can be, not as large as the
         // caller says: `vec![0; buffer_size]` with a `buffer_size` from
         // userspace was an allocation of any size, and past what the heap
@@ -160,15 +163,17 @@ impl Syscall<'_> {
         buffer: UserInPtr<u8>,
         buffer_size: usize,
     ) -> ZxResult {
-        let kind = ThreadStateKind::try_from(kind).map_err(|_| ZxError::INVALID_ARGS)?;
         info!(
             "thread.write_state: handle={:#x?}, kind={:#x?}, buf=({:#x?}; {:#x?})",
             handle, kind, buffer, buffer_size,
         );
-        self.thread
+        // Handle first: a bad kind used to hide BAD_HANDLE / WRONG_TYPE.
+        let thread = self
+            .thread
             .proc()
-            .get_object_with_rights::<Thread>(handle, Rights::WRITE)?
-            .write_state(kind, buffer.as_slice(buffer_size)?)
+            .get_object_with_rights::<Thread>(handle, Rights::WRITE)?;
+        let kind = ThreadStateKind::try_from(kind).map_err(|_| ZxError::INVALID_ARGS)?;
+        thread.write_state(kind, buffer.as_slice(buffer_size)?)
     }
 
     /// Sets process as critical to job.
@@ -184,6 +189,10 @@ impl Syscall<'_> {
             "job.set_critical: job={:#x?}, options={:#x}, process={:#x?}",
             job_handle, options, process_handle,
         );
+        // Handles first: bad options used to hide BAD_HANDLE / WRONG_TYPE.
+        let proc = self.thread.proc();
+        let job = proc.get_object_with_rights::<Job>(job_handle, Rights::DESTROY)?;
+        let process = proc.get_object_with_rights::<Process>(process_handle, Rights::WAIT)?;
         // Any other option is the caller's mistake, not a kernel panic: this
         // used to be `unimplemented!()`.
         let retcode_nonzero = match options {
@@ -191,9 +200,6 @@ impl Syscall<'_> {
             1 => true,
             _ => return Err(ZxError::INVALID_ARGS),
         };
-        let proc = self.thread.proc();
-        let job = proc.get_object_with_rights::<Job>(job_handle, Rights::DESTROY)?;
-        let process = proc.get_object_with_rights::<Process>(process_handle, Rights::WAIT)?;
         process.set_critical_at_job(&job, retcode_nonzero)?;
         Ok(())
     }
@@ -360,16 +366,16 @@ impl Syscall<'_> {
             "job.create: parent={:#x}, options={:#x}, out={:#x?}",
             parent, options, out
         );
+        let proc = self.thread.proc();
+        let parent_job = proc
+            .get_object_with_rights::<Job>(parent, Rights::MANAGE_JOB)
+            .or_else(|_| proc.get_object_with_rights::<Job>(parent, Rights::WRITE))?;
+        // Handle first: options!=0 used to hide BAD_HANDLE on the parent.
         if options != 0 {
-            Err(ZxError::INVALID_ARGS)
-        } else {
-            let proc = self.thread.proc();
-            let parent_job = proc
-                .get_object_with_rights::<Job>(parent, Rights::MANAGE_JOB)
-                .or_else(|_| proc.get_object_with_rights::<Job>(parent, Rights::WRITE))?;
-            let child = parent_job.create_child()?;
-            install_handle(proc, Handle::new(child, Rights::DEFAULT_JOB), &mut out)
+            return Err(ZxError::INVALID_ARGS);
         }
+        let child = parent_job.create_child()?;
+        install_handle(proc, Handle::new(child, Rights::DEFAULT_JOB), &mut out)
     }
 
     /// Sets one or more security and/or resource policies to an empty job.
@@ -422,12 +428,13 @@ impl Syscall<'_> {
         buffer_size: usize,
         mut actual: UserOutPtr<usize>,
     ) -> ZxResult {
-        if buffer.is_null() || buffer_size == 0 || buffer_size > MAX_BLOCK {
-            return Err(ZxError::INVALID_ARGS);
-        }
+        // Handle first: a null/empty/huge buffer used to hide BAD_HANDLE / WRONG_TYPE.
         let proc = self.thread.proc();
         let process =
             proc.get_object_with_rights::<Process>(handle_value, Rights::READ | Rights::WRITE)?;
+        if buffer.is_null() || buffer_size == 0 || buffer_size > MAX_BLOCK {
+            return Err(ZxError::INVALID_ARGS);
+        }
         // Through a bounded kernel buffer, a chunk at a time. `vec![0u8;
         // buffer_size]` was an allocation of whatever the caller asked for, up
         // to `MAX_BLOCK`: 64 MiB of kernel heap that a machine may not have
@@ -461,18 +468,19 @@ impl Syscall<'_> {
         buffer_size: usize,
         mut actual: UserOutPtr<usize>,
     ) -> ZxResult {
+        // Handle first: a null/empty/huge buffer used to hide BAD_HANDLE / WRONG_TYPE.
+        let process = self
+            .thread
+            .proc()
+            .get_object_with_rights::<Process>(handle_value, Rights::READ | Rights::WRITE)?;
         if buffer.is_null() || buffer_size == 0 || buffer_size > MAX_BLOCK {
-            Err(ZxError::INVALID_ARGS)
-        } else {
-            let len = self
-                .thread
-                .proc()
-                .get_object_with_rights::<Process>(handle_value, Rights::READ | Rights::WRITE)?
-                .vmar()
-                .write_memory(vaddr, buffer.as_slice(buffer_size)?)?;
-            actual.write(len)?;
-            Ok(())
+            return Err(ZxError::INVALID_ARGS);
         }
+        let len = process
+            .vmar()
+            .write_memory(vaddr, buffer.as_slice(buffer_size)?)?;
+        actual.write(len)?;
+        Ok(())
     }
 }
 

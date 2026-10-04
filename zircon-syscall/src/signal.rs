@@ -58,8 +58,10 @@ impl Syscall<'_> {
         mut out1: UserOutPtr<HandleValue>,
     ) -> ZxResult {
         info!("eventpair.create: options={:#x}", options);
+        // Same as event/fifo/channel create: unknown options are INVALID_ARGS,
+        // not NOT_SUPPORTED (Fuchsia ABI).
         if options != 0 {
-            return Err(ZxError::NOT_SUPPORTED);
+            return Err(ZxError::INVALID_ARGS);
         }
         let proc = self.thread.proc();
         proc.check_policy(PolicyCondition::NewEvent)?;
@@ -78,11 +80,12 @@ impl Syscall<'_> {
             "timer.set: handle={:#x}, deadline={:#x?}, slack={:#x}",
             handle, deadline, slack
         );
+        let proc = self.thread.proc();
+        let timer = proc.get_object_with_rights::<Timer>(handle, Rights::WRITE)?;
+        // Handle first: negative slack used to hide BAD_HANDLE / WRONG_TYPE.
         if slack.is_negative() {
             return Err(ZxError::OUT_OF_RANGE);
         }
-        let proc = self.thread.proc();
-        let timer = proc.get_object_with_rights::<Timer>(handle, Rights::WRITE)?;
         timer.set(Duration::from(deadline), Duration::from_nanos(slack as u64));
         Ok(())
     }

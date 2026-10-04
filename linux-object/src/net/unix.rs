@@ -1,7 +1,7 @@
 use crate::fs::{FileLike, OpenFlags, PollEvents, PollStatus};
 use crate::{
     error::{LxError, LxResult},
-    net::{Endpoint, Socket, SocketType, SysResult},
+    net::{Domain, Endpoint, Socket, SocketType, SysResult},
     sync::{Event, EventBus},
 };
 use alloc::{
@@ -729,6 +729,14 @@ impl Socket for UnixSocketState {
     /// (`None`) is indistinguishable from "no idea".
     fn socket_type(&self) -> Option<SocketType> {
         Some(self.inner.lock().sock_type)
+    }
+
+    fn so_domain(&self) -> Option<u32> {
+        Some(Domain::AF_UNIX as u32)
+    }
+
+    fn so_protocol(&self) -> Option<u32> {
+        Some(0)
     }
 
     fn write(&self, data: &[u8], _sendto_endpoint: Option<Endpoint>) -> SysResult {

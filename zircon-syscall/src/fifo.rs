@@ -50,32 +50,32 @@ impl Syscall<'_> {
             "fifo.write: handle={:?}, item_size={}, count={:#x}",
             handle_value, elem_size, count
         );
-        if count != 0 {
-            let byte_count = count.checked_mul(elem_size).ok_or(ZxError::INVALID_ARGS)?;
-            let proc = self.thread.proc();
+        let proc = self.thread.proc();
+        // Validate the handle before rejecting count==0 so BAD_HANDLE/WRONG_TYPE
+        // are not masked by OUT_OF_RANGE.
+        let fifo = proc.get_object_with_rights::<Fifo>(handle_value, Rights::WRITE)?;
+        if count == 0 {
+            return Err(ZxError::OUT_OF_RANGE);
+        }
+        let byte_count = count.checked_mul(elem_size).ok_or(ZxError::INVALID_ARGS)?;
+        crate::user_memory::validate_user_range(
+            proc,
+            user_bytes.as_addr(),
+            byte_count,
+            MMUFlags::READ,
+        )?;
+        if !actual_count_ptr.is_null() {
             crate::user_memory::validate_user_range(
                 proc,
-                user_bytes.as_addr(),
-                byte_count,
-                MMUFlags::READ,
+                actual_count_ptr.as_addr(),
+                core::mem::size_of::<usize>(),
+                MMUFlags::WRITE,
             )?;
-            if !actual_count_ptr.is_null() {
-                crate::user_memory::validate_user_range(
-                    proc,
-                    actual_count_ptr.as_addr(),
-                    core::mem::size_of::<usize>(),
-                    MMUFlags::WRITE,
-                )?;
-            }
-            let data = user_bytes.as_slice(byte_count)?;
-            let actual_count = proc
-                .get_object_with_rights::<Fifo>(handle_value, Rights::WRITE)?
-                .write(elem_size, data, count)?;
-            actual_count_ptr.write_if_not_null(actual_count)?;
-            Ok(())
-        } else {
-            Err(ZxError::OUT_OF_RANGE)
         }
+        let data = user_bytes.as_slice(byte_count)?;
+        let actual_count = fifo.write(elem_size, data, count)?;
+        actual_count_ptr.write_if_not_null(actual_count)?;
+        Ok(())
     }
 
     /// Read data from a fifo.
@@ -91,11 +91,12 @@ impl Syscall<'_> {
             "fifo.read: handle={:?}, item_size={}, count={:#x}",
             handle_value, elem_size, count
         );
+        let proc = self.thread.proc();
+        // Handle first: count==0 used to hide BAD_HANDLE / WRONG_TYPE.
+        let fifo = proc.get_object_with_rights::<Fifo>(handle_value, Rights::READ)?;
         if count == 0 {
             return Err(ZxError::OUT_OF_RANGE);
         }
-        let proc = self.thread.proc();
-        let fifo = proc.get_object_with_rights::<Fifo>(handle_value, Rights::READ)?;
         let byte_count = count.checked_mul(elem_size).ok_or(ZxError::INVALID_ARGS)?;
         crate::user_memory::validate_user_range(
             proc,
