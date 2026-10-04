@@ -247,66 +247,100 @@ fn format_breadcrumb(milestone: u8, narr: u8) -> alloc::string::String {
     s
 }
 
-/// The three breadcrumb bytes, as one read. The CMOS access behind it is a
-/// pair of privileged `in`/`out` instructions, which no hosted test can issue,
-/// so under `cfg(test)` the bytes come from [`test_cmos`] instead -- that is
-/// what lets the magic check, the clear and the once-a-boot note below be
-/// tested at all, rather than only on the machine we are trying to diagnose.
-#[cfg(not(test))]
+/// The three breadcrumb bytes, as one read.
 fn read_breadcrumb() -> (u8, u8, u8) {
-    unsafe {
-        (
-            cmos_read(CMOS_MAGIC_OFF),
-            cmos_read(CMOS_MILESTONE_OFF),
-            cmos_read(CMOS_NARR_OFF),
-        )
-    }
+    (
+        read_breadcrumb_byte(CMOS_MAGIC_OFF),
+        read_breadcrumb_byte(CMOS_MILESTONE_OFF),
+        read_breadcrumb_byte(CMOS_NARR_OFF),
+    )
 }
 
-/// Zero the three breadcrumb bytes. On hardware every write here is a no-op
-/// (see [`cmos_write`]); it is spelled out all the same so the intent of the
-/// clear survives if the bytes ever move somewhere writable.
-#[cfg(not(test))]
+/// Zero the three breadcrumb bytes -- or rather, ask to: the write is a
+/// deliberate no-op on every architecture (see [`cmos_write`]), so on the
+/// machine this ships to the bytes keep their values and the "already read
+/// this boot" note below is the only thing that marks a re-read. It is spelled
+/// out all the same so the intent of the clear survives if the bytes ever move
+/// somewhere writable.
 fn clear_breadcrumb() {
-    unsafe {
-        cmos_write(CMOS_MAGIC_OFF, 0);
-        cmos_write(CMOS_MILESTONE_OFF, milestone::NONE);
-        cmos_write(CMOS_NARR_OFF, 0);
-    }
+    write_breadcrumb_byte(CMOS_MAGIC_OFF, 0);
+    write_breadcrumb_byte(CMOS_MILESTONE_OFF, milestone::NONE);
+    write_breadcrumb_byte(CMOS_NARR_OFF, 0);
 }
 
-/// Test-only stand-in for the battery-backed bytes: three words a test can
-/// stamp and read back, in place of the port accesses.
+/// The storage seam, and it sits BELOW `read_breadcrumb`/`clear_breadcrumb` on
+/// purpose: both of those run the same code in a test as in the kernel, and
+/// only the bytes underneath them change. The kernel's are the battery-backed
+/// CMOS ones, reached with a pair of privileged `in`/`out` instructions that no
+/// hosted test can issue; a test's are three words in [`test_cmos`], whose
+/// write is the same no-op the hardware one is, so a test sees the clear path
+/// behave exactly as it does on the machine.
+#[cfg(not(test))]
+fn read_breadcrumb_byte(idx: u8) -> u8 {
+    unsafe { cmos_read(idx) }
+}
+
+#[cfg(not(test))]
+fn write_breadcrumb_byte(idx: u8, value: u8) {
+    unsafe { cmos_write(idx, value) }
+}
+
+#[cfg(test)]
+fn read_breadcrumb_byte(idx: u8) -> u8 {
+    test_cmos::read(idx)
+}
+
+#[cfg(test)]
+fn write_breadcrumb_byte(idx: u8, value: u8) {
+    test_cmos::write(idx, value)
+}
+
+/// Test-only stand-in for the battery-backed bytes.
 #[cfg(test)]
 mod test_cmos {
+    use super::{CMOS_MAGIC_OFF, CMOS_MILESTONE_OFF, CMOS_NARR_OFF};
     use core::sync::atomic::{AtomicU8, Ordering};
-    pub static MAGIC_BYTE: AtomicU8 = AtomicU8::new(0);
-    pub static MILESTONE_BYTE: AtomicU8 = AtomicU8::new(0);
-    pub static NARR_BYTE: AtomicU8 = AtomicU8::new(0);
+    static MAGIC_BYTE: AtomicU8 = AtomicU8::new(0);
+    static MILESTONE_BYTE: AtomicU8 = AtomicU8::new(0);
+    static NARR_BYTE: AtomicU8 = AtomicU8::new(0);
 
+    fn cell(idx: u8) -> &'static AtomicU8 {
+        match idx {
+            CMOS_MAGIC_OFF => &MAGIC_BYTE,
+            CMOS_MILESTONE_OFF => &MILESTONE_BYTE,
+            CMOS_NARR_OFF => &NARR_BYTE,
+            other => panic!("the breadcrumb does not live at {:#04x}", other),
+        }
+    }
+
+    /// What the previous boot or the firmware left in the bytes. This is test
+    /// setup, not the kernel's write path: the kernel cannot put anything here
+    /// at all, which is what [`write`] models.
     pub fn stamp(magic: u8, milestone: u8, narr: u8) {
         MAGIC_BYTE.store(magic, Ordering::SeqCst);
         MILESTONE_BYTE.store(milestone, Ordering::SeqCst);
         NARR_BYTE.store(narr, Ordering::SeqCst);
     }
 
+    pub fn read(idx: u8) -> u8 {
+        cell(idx).load(Ordering::SeqCst)
+    }
+
+    /// A no-op, exactly like `cmos_write` on hardware: writing 0x40-0x42 broke
+    /// the firmware's NVRAM checksum on the bring-up box, so the GPU bring-up
+    /// must never put anything in these bytes. Modelling it here is what makes
+    /// the tests of the clear path describe the shipped kernel.
+    pub fn write(idx: u8, _value: u8) {
+        let _ = cell(idx);
+    }
+
     pub fn bytes() -> (u8, u8, u8) {
         (
-            MAGIC_BYTE.load(Ordering::SeqCst),
-            MILESTONE_BYTE.load(Ordering::SeqCst),
-            NARR_BYTE.load(Ordering::SeqCst),
+            read(CMOS_MAGIC_OFF),
+            read(CMOS_MILESTONE_OFF),
+            read(CMOS_NARR_OFF),
         )
     }
-}
-
-#[cfg(test)]
-fn read_breadcrumb() -> (u8, u8, u8) {
-    test_cmos::bytes()
-}
-
-#[cfg(test)]
-fn clear_breadcrumb() {
-    test_cmos::stamp(0, milestone::NONE, 0);
 }
 
 /// Read back the breadcrumb the previous attempt left, format a one-block
@@ -578,14 +612,14 @@ mod survival_tests {
         checkpoint(milestone::COMPLETE);
     }
 
-    /// `read_report_and_clear` end to end, through the test stand-in for the
-    /// battery-backed bytes. One test for the whole function because `REPORTED`
-    /// is a one-shot process-global: a second test flipping it would depend on
-    /// which ran first.
+    /// `read_report_and_clear` end to end, over the same bytes the kernel
+    /// reads and with the same disabled write underneath it. One test for the
+    /// whole function because `REPORTED` is a one-shot process-global: a
+    /// second test flipping it would depend on which ran first.
     #[test]
-    fn the_report_reads_the_breadcrumb_once_and_leaves_the_bytes_empty() {
-        // Bytes that are not ours: no stage is reported and nothing is cleared
-        // (there is nothing of ours there to clear).
+    fn the_report_reads_the_breadcrumb_and_marks_the_re_read() {
+        // Bytes that are not ours: no stage is reported, and nothing is
+        // touched -- there is nothing of ours there to clear.
         test_cmos::stamp(0x00, milestone::CE_MOVE, 9);
         let report = read_report_and_clear();
         assert!(
@@ -600,30 +634,34 @@ mod survival_tests {
             "a foreign breadcrumb must be left alone, not clobbered"
         );
 
-        // Our own breadcrumb: the stage comes back, and the bytes are left
-        // empty so the next attempt starts from a known slate.
+        // Our own breadcrumb: the stage comes back, and the first read says
+        // nothing about having been read before.
         test_cmos::stamp(MAGIC, milestone::STARTCPU_PRE, 41);
         let report = read_report_and_clear();
         assert!(report.contains("STARTCPU_PRE"), "{}", report);
         assert!(report.contains("41"), "{}", report);
         assert!(!report.contains("already read once"), "{}", report);
-        assert_eq!(test_cmos::bytes(), (0, milestone::NONE, 0));
 
-        // Read again with the bytes as they were left: now it is the
-        // no-breadcrumb path, because the first read cleared the magic.
+        // And the bytes still hold it afterwards, because the clear is the
+        // same no-op the kernel ships: writing 0x40-0x42 broke the firmware's
+        // NVRAM checksum, so nothing may be put there.
+        assert_eq!(
+            test_cmos::bytes(),
+            (MAGIC, milestone::STARTCPU_PRE, 41),
+            "the clear must not have written the bytes"
+        );
+
+        // Which is why the note matters: a second read this boot finds the
+        // same breadcrumb and has to say it is the same one, or the one
+        // attempt reads as two.
         let report = read_report_and_clear();
+        assert!(report.contains("STARTCPU_PRE"), "{}", report);
         assert!(
-            report.contains("no console-GPU breadcrumb recorded"),
-            "{}",
+            report.contains("already read once"),
+            "a re-read of the same breadcrumb must say so: {}",
             report
         );
 
-        // And a second *stamped* read this boot says so, so nobody reads one
-        // boot's breadcrumb as two attempts.
-        test_cmos::stamp(MAGIC, milestone::COMPLETE, 7);
-        let report = read_report_and_clear();
-        assert!(report.contains("COMPLETE"), "{}", report);
-        assert!(report.contains("already read once"), "{}", report);
-        assert_eq!(test_cmos::bytes(), (0, milestone::NONE, 0));
+        test_cmos::stamp(0, milestone::NONE, 0);
     }
 }

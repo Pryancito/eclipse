@@ -133,7 +133,9 @@ pub extern "C" fn osGetSystemTime(sec: *mut NvU32, usec: *mut NvU32) -> NV_STATU
 #[cfg(test)]
 mod os_services_tests {
     use super::*;
-    use crate::hooks::{swap_hooks, test_turnstile, KernelHooks, TICK_RESOLUTION_NS};
+    use crate::hooks::{
+        swap_hooks, test_swap_fallback_ns, test_turnstile, KernelHooks, TICK_RESOLUTION_NS,
+    };
     use core::sync::atomic::{AtomicU64, Ordering};
     extern crate std;
     use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
@@ -172,12 +174,22 @@ mod os_services_tests {
     /// The hook slot is a process-global and `cargo test` runs in parallel, so
     /// one test at a time through the module's own turnstile, and put back
     /// whatever was installed.
-    fn with_kernel<R>(now_ns: u64, body: impl FnOnce() -> R) -> R {
+    /// Both globals behind the turnstile, saved and put back: the hook slot
+    /// AND the fallback clock, which the no-kernel tests below advance. A
+    /// harness that restored only the slot would leak the clock into whichever
+    /// test ran next.
+    fn with_globals<R>(
+        installed: Option<&'static dyn KernelHooks>,
+        now_ns: u64,
+        body: impl FnOnce() -> R,
+    ) -> R {
         let _guard = test_turnstile();
-        let previous = swap_hooks(Some(&FAKE));
+        let previous = swap_hooks(installed);
+        let saved_fallback = test_swap_fallback_ns(0);
         NOW_NS.store(now_ns, Ordering::SeqCst);
         DELAYED_US.store(0, Ordering::SeqCst);
         let out = catch_unwind(AssertUnwindSafe(body));
+        test_swap_fallback_ns(saved_fallback);
         swap_hooks(previous);
         match out {
             Ok(v) => v,
@@ -185,15 +197,12 @@ mod os_services_tests {
         }
     }
 
+    fn with_kernel<R>(now_ns: u64, body: impl FnOnce() -> R) -> R {
+        with_globals(Some(&FAKE), now_ns, body)
+    }
+
     fn with_no_kernel<R>(body: impl FnOnce() -> R) -> R {
-        let _guard = test_turnstile();
-        let previous = swap_hooks(None);
-        let out = catch_unwind(AssertUnwindSafe(body));
-        swap_hooks(previous);
-        match out {
-            Ok(v) => v,
-            Err(p) => resume_unwind(p),
-        }
+        with_globals(None, 0, body)
     }
 
     // -----------------------------------------------------------------
