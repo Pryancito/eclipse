@@ -2672,6 +2672,25 @@ pub fn fb_owned_by_caller(fb: &DrmFramebuffer) -> bool {
     owned_by(fb.owner, current_pid())
 }
 
+/// The framebuffer ids `GETRESOURCES` lists for `pid`: the ones it may
+/// touch, by the same rule `RMFB` and `GETFB`'s handle use ([`owned_by`]).
+///
+/// Linux walks `file_priv->fbs`, the framebuffers THIS file created, and
+/// nothing else: a client never learns another client's fb ids from the
+/// card. Here the whole table was listed to everyone, so any process could
+/// read the compositor's scanout fb id (and then `SETCRTC` its own frame
+/// over it, or `GETFB` its geometry). The kernel's own framebuffers (owner
+/// 0) stay listed, as they stay removable, for every caller.
+pub fn framebuffer_ids_for(pid: u64) -> Vec<u32> {
+    DRM_STATE
+        .lock()
+        .framebuffers
+        .iter()
+        .filter(|f| owned_by(f.owner, pid))
+        .map(|f| f.id)
+        .collect()
+}
+
 /// Look up a framebuffer object by id (`DRM_IOCTL_MODE_GETFB`/`GETFB2`).
 pub fn get_fb(fb_id: u32) -> Option<DrmFramebuffer> {
     DRM_STATE
@@ -8964,6 +8983,34 @@ mod gem_ownership_tests {
         assert!(owned_by(fb.owner, 0), "kernel-internal callers still do");
 
         forget(0, 9803);
+    }
+
+    /// `GETRESOURCES` lists a client's own framebuffers, as Linux lists
+    /// `file_priv->fbs`, plus the kernel's; never another client's. The
+    /// whole table used to be listed to everyone, so any process could read
+    /// the compositor's scanout fb id off the card.
+    #[test]
+    fn the_resource_list_carries_only_the_callers_framebuffers() {
+        let _serialised = super::test_globals::lock();
+        plant_fb(9804, A);
+        plant_fb(9805, B);
+        plant_fb(9806, 0);
+
+        let a = framebuffer_ids_for(A);
+        assert!(a.contains(&9804), "A sees its own");
+        assert!(!a.contains(&9805), "A must not see B's");
+        assert!(a.contains(&9806), "the kernel's is everyone's");
+        let b = framebuffer_ids_for(B);
+        assert!(b.contains(&9805) && !b.contains(&9804) && b.contains(&9806));
+        let kernel = framebuffer_ids_for(0);
+        assert!(
+            kernel.contains(&9804) && kernel.contains(&9805) && kernel.contains(&9806),
+            "kernel-internal callers see everything"
+        );
+
+        forget(0, 9804);
+        forget(0, 9805);
+        forget(0, 9806);
     }
 }
 

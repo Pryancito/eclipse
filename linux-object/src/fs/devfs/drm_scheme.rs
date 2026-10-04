@@ -1937,7 +1937,10 @@ impl DrmDev {
                     res.count_encoders = 0;
                     return Ok(0);
                 }
-                let (fbs, crtcs, connectors) = drm::get_resources();
+                let (_, crtcs, connectors) = drm::get_resources();
+                // The caller's framebuffers, as `drm_mode_getresources` walks
+                // `file_priv->fbs`; the whole table went to everyone.
+                let fbs = drm::framebuffer_ids_for(drm::current_pid());
 
                 if res.fb_id_ptr != 0 && res.count_fbs >= fbs.len() as u32 {
                     ucheck_n::<u32>(res.fb_id_ptr as usize, fbs.len())?;
