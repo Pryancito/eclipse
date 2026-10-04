@@ -1216,9 +1216,8 @@ impl Socket for TcpSocketState {
             let mut tv = [0u8; 16];
             tv.copy_from_slice(&data[..16]);
             // `tv_usec` must be in 0..1_000_000 (Linux `sock_set_timeout`).
-            let usec = i64::from_ne_bytes([
-                tv[8], tv[9], tv[10], tv[11], tv[12], tv[13], tv[14], tv[15],
-            ]);
+            let usec =
+                i64::from_ne_bytes([tv[8], tv[9], tv[10], tv[11], tv[12], tv[13], tv[14], tv[15]]);
             if !(0..1_000_000).contains(&usec) {
                 return Err(LxError::EINVAL);
             }
@@ -1557,7 +1556,7 @@ mod is_tcp_tests {
         assert_eq!(Socket::so_protocol(&tcp), Some(6)); // IPPROTO_TCP
         let tcp6 = TcpSocketState::new(true).unwrap();
         assert_eq!(Socket::so_domain(&tcp6), Some(10)); // AF_INET6
-        // SO_DOMAIN / SO_PROTOCOL are read-only.
+                                                        // SO_DOMAIN / SO_PROTOCOL are read-only.
         assert_eq!(
             Socket::setsockopt(&tcp, 1, 38, &0u32.to_ne_bytes()),
             Err(LxError::ENOPROTOOPT)

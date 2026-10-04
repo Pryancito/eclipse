@@ -1987,7 +1987,10 @@ mod peercred_tests {
         // Fabricating pid 1 made seatd treat an unconnected socket as init.
         assert_eq!(words(peercred_bytes(None)), [0, 0, 0]);
         // A known-but-gone pid still reports overflowuid, not zeros.
-        assert_eq!(words(peercred_bytes(Some(43_102))), [43_102, u32::MAX, u32::MAX]);
+        assert_eq!(
+            words(peercred_bytes(Some(43_102))),
+            [43_102, u32::MAX, u32::MAX]
+        );
     }
 }
 
