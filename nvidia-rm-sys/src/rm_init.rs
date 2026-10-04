@@ -2167,3 +2167,111 @@ pub fn gem_fbmem_offset(device_instance: u32, h_memory: u32) -> Result<u64, NV_S
         Err(status)
     }
 }
+
+#[cfg(test)]
+mod rm_gate_tests {
+    use super::*;
+    extern crate std;
+    use core::sync::atomic::Ordering;
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    /// Everything here reads and writes one process-global flag, and `cargo
+    /// test` runs test functions in parallel: a second test taking the gate
+    /// while this one holds it would be a race, not a test. So the gate gets
+    /// exactly one test, and it hands the flag back free.
+    ///
+    /// What it is guarding is the freeze this gate was added for: the RM's own
+    /// contended lock path has never run in this port, so two ioctls entering
+    /// the RM at once drove it into untested blocking code and the machine
+    /// froze at boot with a dead console.
+    #[test]
+    fn the_rm_gate_lets_exactly_one_caller_in_and_always_hands_it_back() {
+        assert!(
+            !RM_CALL_GATE.load(Ordering::SeqCst),
+            "the gate was already held before this test: something leaked it"
+        );
+
+        // Taking it marks it held, and dropping it hands it back. A gate that
+        // is not released leaves every later RM entry spinning forever.
+        {
+            let _gate = RmGate::lock();
+            assert!(
+                RM_CALL_GATE.load(Ordering::SeqCst),
+                "the gate was not taken"
+            );
+        }
+        assert!(
+            !RM_CALL_GATE.load(Ordering::SeqCst),
+            "dropping the guard must hand the gate back"
+        );
+
+        // A path that returns early from the middle of the critical section
+        // still releases it: the release is a `Drop`, not a line at the end.
+        fn returns_early() -> u32 {
+            let _gate = RmGate::lock();
+            if RM_CALL_GATE.load(Ordering::SeqCst) {
+                return 1;
+            }
+            0
+        }
+        assert_eq!(returns_early(), 1);
+        assert!(
+            !RM_CALL_GATE.load(Ordering::SeqCst),
+            "an early return left the RM gated"
+        );
+
+        // And so does a panic inside it. In the kernel this is the page fault
+        // or assertion that fires inside a critical section: without the
+        // release on the way out, the panic stops being a panic and becomes a
+        // deadlock, with every other thread spinning on a gate nobody holds.
+        let panicked = catch_unwind(AssertUnwindSafe(|| {
+            let _gate = RmGate::lock();
+            panic!("an assertion inside the RM");
+        }));
+        assert!(panicked.is_err());
+        assert!(
+            !RM_CALL_GATE.load(Ordering::SeqCst),
+            "a panic inside the critical section left the RM gated for good"
+        );
+
+        // The exclusion itself: a second caller waits for the first to leave,
+        // which is the whole purpose -- it must wait HERE, in our spin, and
+        // not be let into the RM alongside it.
+        let (reached_tx, reached_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let (got_tx, got_rx) = mpsc::channel();
+        let holder = thread::spawn(move || {
+            let _gate = RmGate::lock();
+            reached_tx.send(()).unwrap();
+            // Hold it until the main thread says it has been waiting.
+            release_rx.recv().unwrap();
+        });
+        reached_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+
+        let waiter = thread::spawn(move || {
+            let _gate = RmGate::lock();
+            got_tx.send(Instant::now()).unwrap();
+        });
+        // While the first holds it, the second must not get in.
+        assert!(
+            got_rx.recv_timeout(Duration::from_millis(200)).is_err(),
+            "two callers were inside the RM at once"
+        );
+        release_tx.send(()).unwrap();
+        holder.join().unwrap();
+        // And once it is free, the waiter gets in without being woken by
+        // anything: the spin is its own progress.
+        got_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the waiter never got the gate after it was released");
+        waiter.join().unwrap();
+
+        assert!(
+            !RM_CALL_GATE.load(Ordering::SeqCst),
+            "the gate was left held at the end of the test"
+        );
+    }
+}

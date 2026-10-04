@@ -172,6 +172,18 @@ pub(crate) fn test_turnstile() -> std::sync::MutexGuard<'static, ()> {
     TURNSTILE.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Test-only: swap the fallback clock, returning what it held.
+///
+/// `FALLBACK_NS` is the second process-global behind [`test_turnstile`], and it
+/// is private to this module, so a test harness in another module had no way to
+/// put it back -- any test that let the fallback clock advance leaked that into
+/// whichever test ran next. This is how such a harness saves, zeroes and
+/// restores it, the same way `hook_tests`'s own does.
+#[cfg(test)]
+pub(crate) fn test_swap_fallback_ns(value: u64) -> u64 {
+    FALLBACK_NS.swap(value, Ordering::SeqCst)
+}
+
 /// Busy-wait `us` microseconds, pumping TLB shootdowns.
 ///
 /// Prefer this (via `osDelayUs` / `osDelayNs`) over `osDelay(1)` for
