@@ -1471,7 +1471,10 @@ mod tests {
         assert!(!ev.poll(PollEvents::empty()).unwrap().write);
         // Not seekable: pread/pwrite are ESPIPE (write stays EINVAL).
         let mut buf = [0u8; 8];
-        assert_eq!(ev.read_at(4096, &mut buf).await.unwrap_err(), LxError::ESPIPE);
+        assert_eq!(
+            ev.read_at(4096, &mut buf).await.unwrap_err(),
+            LxError::ESPIPE
+        );
         assert_eq!(ev.write_at(0, b"x").unwrap_err(), LxError::ESPIPE);
     }
 }
