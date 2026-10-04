@@ -5950,6 +5950,14 @@ enum PendingDrmTimer {
         due_seq: u32,
         file: Weak<DrmFileState>,
     },
+    /// A `CRTC_QUEUE_SEQUENCE` event: paced exactly like a vblank wait,
+    /// delivered as a `DRM_EVENT_CRTC_SEQUENCE` (`user_data`, `time_ns`
+    /// and a 64-bit `sequence`; not the vblank event's layout).
+    Sequence {
+        user_data: u64,
+        due_seq: u32,
+        file: Weak<DrmFileState>,
+    },
 }
 
 lazy_static::lazy_static! {
@@ -6025,6 +6033,24 @@ fn deliver_pending_drm_timer() {
                         });
                 } else if let Some(file) = file.upgrade() {
                     queue_vblank_event(&file, now_seq, signal);
+                }
+            }
+            PendingDrmTimer::Sequence {
+                user_data,
+                due_seq,
+                file,
+            } => {
+                // Paced like a vblank wait: not due yet, back in the queue.
+                if (due_seq.wrapping_sub(now_seq) as i32) > 0 {
+                    PENDING_DRM_TIMERS
+                        .lock()
+                        .push_back(PendingDrmTimer::Sequence {
+                            user_data,
+                            due_seq,
+                            file,
+                        });
+                } else if let Some(file) = file.upgrade() {
+                    queue_crtc_sequence_event(&file, now_seq, user_data);
                 }
             }
         }
@@ -6257,6 +6283,18 @@ pub fn schedule_vblank_event(signal: u64, due_seq: u32, file: &Arc<DrmFileState>
     });
 }
 
+/// Deliver a `DRM_EVENT_CRTC_SEQUENCE` (from `CRTC_QUEUE_SEQUENCE`) once the
+/// counter reaches `due_seq`, paced like [`schedule_vblank_event`]: Linux
+/// sends a passed target's event at once (`drm_crtc_queue_sequence_ioctl`),
+/// which here would turn Xorg's sequence-paced loop into a spin.
+pub fn schedule_crtc_sequence_event(user_data: u64, due_seq: u32, file: &Arc<DrmFileState>) {
+    arm_coalesced_drm_timer(PendingDrmTimer::Sequence {
+        user_data,
+        due_seq,
+        file: Arc::downgrade(file),
+    });
+}
+
 /// Drop not-yet-posted flip/vblank timer jobs (device-wide).
 ///
 /// Readable event bytes live on each [`DrmFileState`] and are cleared when that
@@ -6293,6 +6331,7 @@ fn cancel_pending_timers_for_file(file_ptr: *const DrmFileState) {
             let job_ptr = match job {
                 PendingDrmTimer::Flip { file, .. } => file.as_ptr(),
                 PendingDrmTimer::Vblank { file, .. } => file.as_ptr(),
+                PendingDrmTimer::Sequence { file, .. } => file.as_ptr(),
             };
             if core::ptr::eq(job_ptr, file_ptr) {
                 if let PendingDrmTimer::Flip { out_fence, .. } = job {
@@ -6653,6 +6692,23 @@ pub fn queue_vblank_event(file: &DrmFileState, seq: u32, user_data: u64) {
     push_drm_event(file, DRM_EVENT_VBLANK, SYNTH_CRTC_ID, seq, user_data);
 }
 
+/// Enqueue a `DRM_EVENT_CRTC_SEQUENCE` for a `CRTC_QUEUE_SEQUENCE` request:
+/// `struct drm_event_crtc_sequence { base; u64 user_data; s64 time_ns;
+/// u64 sequence }`, 32 bytes like the vblank event but stamped in
+/// nanoseconds with the time of the vblank it names (`send_vblank_event`
+/// fills `e->event.seq` from `drm_vblank_count_and_time`).
+fn queue_crtc_sequence_event(file: &DrmFileState, seq: u32, user_data: u64) {
+    const DRM_EVENT_CRTC_SEQUENCE: u32 = 3;
+    let (_, time_ns) = vblank_seq_and_time_now();
+    let mut buf = [0u8; 32];
+    buf[0..4].copy_from_slice(&DRM_EVENT_CRTC_SEQUENCE.to_ne_bytes());
+    buf[4..8].copy_from_slice(&32u32.to_ne_bytes());
+    buf[8..16].copy_from_slice(&user_data.to_ne_bytes());
+    buf[16..24].copy_from_slice(&(time_ns as i64).to_ne_bytes());
+    buf[24..32].copy_from_slice(&(seq as u64).to_ne_bytes());
+    file.push_event(buf.to_vec());
+}
+
 /// Synthetic vertical-blank counter derived from the monotonic clock and the
 /// active CRTC mode's refresh ([`vblank_period_ns`]).
 ///
@@ -6668,6 +6724,18 @@ pub fn vblank_seq_now() -> u32 {
 fn vblank_seq_full() -> u64 {
     let now_ns = monotonic_ns();
     VBLANK_LATTICE.lock().seq_full(now_ns)
+}
+
+/// The counter and the time of the vblank it counts, from one clock sample
+/// (`drm_vblank_count_and_time`): the counter is the lattice's at `now` and
+/// the stamp is that boundary, both read under the one lock so a modeset
+/// cannot slip between them, and a client deriving the refresh period from
+/// two readings (`ms_get_crtc_ust_msc`) gets exactly the period.
+pub fn vblank_seq_and_time_now() -> (u32, u64) {
+    let now_ns = monotonic_ns();
+    let lattice = VBLANK_LATTICE.lock();
+    let seq = lattice.seq_full(now_ns);
+    (seq as u32, lattice.boundary_ns(seq))
 }
 
 /// Monotonic deadline at which the synthetic vblank counter reaches `target`,
@@ -8352,6 +8420,9 @@ mod image_pitch_tests;
 /// reported.
 #[cfg(test)]
 mod present_cost_tests;
+
+#[cfg(test)]
+mod crtc_sequence_event_tests;
 
 #[cfg(test)]
 mod damage_against_the_panel_tests;

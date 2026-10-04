@@ -103,6 +103,7 @@ Leyenda: ✅ implementado · 🟡 parcial / no-op deliberado · ❌ no implement
 | `DRM_IOCTL_GET_CAP` | ✅ | ver tabla de *caps* |
 | `DRM_IOCTL_SET_CLIENT_CAP` | ✅ | `ATOMIC` según `drm.atomic` (ver sección atómico); `WRITEBACK` solo para clientes atómicos (EINVAL como Linux); resto aceptado |
 | `DRM_IOCTL_WAIT_VBLANK` | 🟡 | vblank sintético ~60 Hz. Modo evento: respeta `RELATIVE`/`ABSOLUTE`/`NEXTONMISS` y entrega `DRM_EVENT_VBLANK` cuando el contador alcanza la secuencia pedida (nunca antes del siguiente vblank). Modo bloqueante: espera de verdad, hasta el tope de 3 s de Linux (`sys_ioctl` duerme antes del arm síncrono; ver `README-async-ioctl-vblank.md`) |
+| `DRM_IOCTL_CRTC_GET_SEQUENCE` / `CRTC_QUEUE_SEQUENCE` | ✅ | `GET_SEQUENCE`: CRTC desconocido ENOENT; `active` es el `mode_valid` de GETCRTC (`crtc_state->enable`), `sequence` el mismo contador que `WAIT_VBLANK` y `sequence_ns` el instante del vblank que cuenta (`drm_vblank_count_and_time`). `QUEUE_SEQUENCE`: CRTC (ENOENT) antes que los flags (fuera de `RELATIVE \| NEXT_ON_MISS`, EINVAL); el objetivo se resuelve como el modo evento de `WAIT_VBLANK` y la respuesta es la secuencia a la que se encoló (la actual si ya pasó); el `DRM_EVENT_CRTC_SEQUENCE` (`user_data`, `time_ns`, `sequence` de 64 bits) llega con ese vblank y nunca antes del siguiente (Linux lo manda al instante si ya pasó). Xorg (`ms_get_crtc_ust_msc`, `ms_queue_vblank`) los sondea al arrancar; sin ellos caía a `drmWaitVBlank` |
 
 ### GEM / *dumb buffers* / PRIME
 
@@ -352,7 +353,7 @@ esto no:
 | `GET_CLIENT` no existe | libva da la inicialización por fallida: sin VA-API |
 | Sin `GAMMA_LUT`/`CTM` | gammastep, luz nocturna y la gamma de RandR no hacen nada |
 | Sin `IN_FORMATS` en el plano | Inocuo mientras `DRM_CAP_ADDFB2_MODIFIERS` sea 0; obligatorio el día que se ponga a 1 |
-| `CRTC_GET_SEQUENCE`/`QUEUE_SEQUENCE` no existen | Pero `DRM_CAP_CRTC_IN_VBLANK_EVENT` dice 1: Xorg sondea, falla y cae a `drmWaitVBlank` |
+| ~~`CRTC_GET_SEQUENCE`/`QUEUE_SEQUENCE` no existen~~ | **Corregido:** los dos existen sobre el contador sintético (fila de la tabla de ioctls); Xorg ya no sondea en vano ni cae a `drmWaitVBlank` |
 | ~~El filtro del nodo de render solo observa~~ | Corregido: `renderD128` rechaza modeset/dumb/master con EACCES |
 | Sin `fdinfo` (`drm-usage-stats.rst`) | `nvtop` y similares no ven nada |
 

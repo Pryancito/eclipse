@@ -1990,6 +1990,60 @@ impl DrmDev {
                 }
                 Ok(0)
             }
+            DRM_IOCTL_CRTC_GET_SEQUENCE => {
+                // `drm_crtc_get_sequence_ioctl`: the CRTC by id (ENOENT),
+                // then `active` (`crtc_state->enable`, what GETCRTC's
+                // `mode_valid` reads), the vblank counter and the time of
+                // the vblank it counts, in nanoseconds. Xorg's modesetting
+                // driver asks this first (`ms_get_crtc_ust_msc`) and, told
+                // ENOTTY, fell back to WAIT_VBLANK for every MSC query:
+                // neither this nor QUEUE_SEQUENCE existed.
+                let req = unsafe { &mut *(data as *mut DrmCrtcGetSequence) };
+                if drm::get_crtc(req.crtc_id).is_none() {
+                    return Err(FsError::EntryNotFound);
+                }
+                let (seq, ns) = drm::vblank_seq_and_time_now();
+                req.active = drm::crtc_enabled() as u32;
+                req.sequence = seq as u64;
+                req.sequence_ns = ns as i64;
+                Ok(0)
+            }
+            DRM_IOCTL_CRTC_QUEUE_SEQUENCE => {
+                // `drm_crtc_queue_sequence_ioctl`: the CRTC (ENOENT), then
+                // the flags (RELATIVE and NEXT_ON_MISS only, EINVAL), then
+                // the target resolved as WAIT_VBLANK resolves its event
+                // form, and the reply is the sequence the event was queued
+                // for (the current one when the target had passed). The
+                // event is a `DRM_EVENT_CRTC_SEQUENCE` on this fd, paced
+                // like the vblank event: never before the next synthetic
+                // vblank (Linux sends a passed target's at once; see
+                // `schedule_flip_event` for why that spins here). The
+                // counter is 32-bit here, so the 64-bit target is taken
+                // modulo 2^32, wrap-safe like the vblank one.
+                const DRM_CRTC_SEQUENCE_RELATIVE: u32 = 0x1;
+                const DRM_CRTC_SEQUENCE_NEXT_ON_MISS: u32 = 0x2;
+                let req = unsafe { &mut *(data as *mut DrmCrtcQueueSequence) };
+                if drm::get_crtc(req.crtc_id).is_none() {
+                    return Err(FsError::EntryNotFound);
+                }
+                if req.flags & !(DRM_CRTC_SEQUENCE_RELATIVE | DRM_CRTC_SEQUENCE_NEXT_ON_MISS) != 0 {
+                    return Err(FsError::InvalidParam);
+                }
+                let now_seq = drm::vblank_seq_now();
+                let mut target = if req.flags & DRM_CRTC_SEQUENCE_RELATIVE != 0 {
+                    now_seq.wrapping_add(req.sequence as u32)
+                } else {
+                    req.sequence as u32
+                };
+                let passed = (target.wrapping_sub(now_seq) as i32) <= 0;
+                if passed && req.flags & DRM_CRTC_SEQUENCE_NEXT_ON_MISS != 0 {
+                    target = now_seq.wrapping_add(1);
+                }
+                drm::schedule_crtc_sequence_event(req.user_data, target, &self.file);
+                let still_passed = (target.wrapping_sub(now_seq) as i32) <= 0;
+                req.sequence = if still_passed { now_seq } else { target } as u64;
+                Ok(0)
+            }
             DRM_IOCTL_MODE_SETPLANE => {
                 // Primary-plane update: present immediately on the target CRTC.
                 // fb_id == 0 disables the plane, which we treat as a no-op.
@@ -3937,6 +3991,9 @@ const DRM_IOCTL_MODE_CURSOR2: u32 = 0xC02464BB;
 
 // Core (non-MODE) vblank wait.
 const DRM_IOCTL_WAIT_VBLANK: u32 = 0xC018643A;
+// The CRTC's vblank counter by id, and an event at a sequence of it.
+const DRM_IOCTL_CRTC_GET_SEQUENCE: u32 = 0xC018643B;
+const DRM_IOCTL_CRTC_QUEUE_SEQUENCE: u32 = 0xC018643C;
 // Query an existing framebuffer object.
 const DRM_IOCTL_MODE_GETFB: u32 = 0xC01C64AD;
 const DRM_IOCTL_MODE_GETFB2: u32 = 0xC06864CE;
@@ -5115,6 +5172,28 @@ struct DrmWaitVblank {
     val2: u64,
 }
 
+/// `struct drm_crtc_get_sequence` (24 bytes): `crtc_id` in; `active`,
+/// `sequence` and `sequence_ns` out.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+struct DrmCrtcGetSequence {
+    crtc_id: u32,
+    active: u32,
+    sequence: u64,
+    sequence_ns: i64,
+}
+
+/// `struct drm_crtc_queue_sequence` (24 bytes): `sequence` is the target
+/// going in and the sequence the event was queued for coming out.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+struct DrmCrtcQueueSequence {
+    crtc_id: u32,
+    flags: u32,
+    sequence: u64,
+    user_data: u64,
+}
+
 /// `struct drm_mode_set_plane` (48 bytes).
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
@@ -5241,6 +5320,8 @@ const _: () = {
     assert!(size_of::<DrmModePropertyEnum>() == 40);
     assert!(size_of::<DrmModeGetPlane>() == 32); // DRM_IOCTL_MODE_GETPLANE 0x..20..
     assert!(size_of::<DrmWaitVblank>() == 24); // DRM_IOCTL_WAIT_VBLANK   0x..18..
+    assert!(size_of::<DrmCrtcGetSequence>() == 24); // CRTC_GET_SEQUENCE   0x..18..
+    assert!(size_of::<DrmCrtcQueueSequence>() == 24); // CRTC_QUEUE_SEQUENCE 0x..18..
     assert!(size_of::<DrmModeSetPlane>() == 48); // DRM_IOCTL_MODE_SETPLANE 0x..30..
     assert!(size_of::<DrmModeObjSetProperty>() == 24); // OBJ_SETPROPERTY  0x..18..
     assert!(size_of::<DrmModeFbDirtyCmd>() == 24); // DRM_IOCTL_MODE_DIRTYFB 0x..18..
@@ -6622,6 +6703,9 @@ mod legacy_state_readback_tests;
 
 #[cfg(test)]
 mod dpms_commit_tests;
+
+#[cfg(test)]
+mod crtc_sequence_tests;
 
 #[cfg(test)]
 mod trail_tests;

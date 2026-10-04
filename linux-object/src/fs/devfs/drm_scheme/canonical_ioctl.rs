@@ -46,6 +46,8 @@ pub(super) fn canonical_drm_ioctl(nr: u32) -> Option<u32> {
         0x28 => DRM_IOCTL_RM_DRAW,
         0x2C => DRM_IOCTL_FINISH,
         0x3A => DRM_IOCTL_WAIT_VBLANK,
+        0x3B => DRM_IOCTL_CRTC_GET_SEQUENCE,
+        0x3C => DRM_IOCTL_CRTC_QUEUE_SEQUENCE,
         0x3F => DRM_IOCTL_UPDATE_DRAW,
         0xA0 => DRM_IOCTL_MODE_GETRESOURCES,
         0xA1 => DRM_IOCTL_MODE_GETCRTC,
