@@ -50,12 +50,16 @@ fn revoke(c: &Client, lessee_id: u32) -> Result<usize> {
 /// without a plane once the lessor has universal planes (EINVAL), and
 /// an id that lands in the set twice, which is what naming the primary
 /// plane beside its CRTC does without universal planes (ENOSPC). Lessee
-/// ids are the lowest free from 1; `LIST_LESSEES` refuses `pad`, lists
+/// ids are the lowest free from 1; an object a live lessee of this
+/// master still holds is EBUSY (`drm_lease_create`), once the list has
+/// been looked up and validated, and a revoked lessee holds nothing, so
+/// its objects can be leased again. `LIST_LESSEES` refuses `pad`, lists
 /// only the lessees still holding objects, as many as fit, and answers
 /// the total; `REVOKE_LEASE` empties a lessee (ENOENT for none) and
 /// keeps it. Every caller, master or not, got an unrestricted fd as
 /// lessee 1 for any request at all; `LIST_LESSEES` was a constant zero
-/// and `REVOKE_LEASE` an unknown number.
+/// and `REVOKE_LEASE` an unknown number; and the same CRTC went to as
+/// many lessees as asked for it.
 #[test]
 fn a_lease_holds_what_drm_lease_lets_it_and_the_lessor_lists_and_revokes_it() {
     let _screen = kms_emu::attach(64, 16);
@@ -120,6 +124,14 @@ fn a_lease_holds_what_drm_lease_lets_it_and_the_lessor_lists_and_revokes_it() {
         "none of those made a lease"
     );
 
+    // Leases are per master (per node here): the same CRTC leased on
+    // another node is not this one's business.
+    let other = Client::open(83);
+    assert!(
+        create(&other, &[crtc, conn], 0).is_ok(),
+        "the other node's master leases its own view of the CRTC"
+    );
+
     assert_eq!(
         create(&master, &[], O_CLOEXEC | O_NONBLOCK),
         Ok(1),
@@ -156,15 +168,26 @@ fn a_lease_holds_what_drm_lease_lets_it_and_the_lessor_lists_and_revokes_it() {
     assert_eq!(
         create(&master, &[crtc, conn], 0),
         einval,
-        "with universal planes the lease needs a plane"
+        "with universal planes the lease needs a plane: validated before the busy check"
     );
+    // `drm_lease_create`: what lessee 2 still holds cannot be leased
+    // again, after the list has been looked up and validated.
+    let ebusy = Err(FsError::Busy);
     assert_eq!(
         create(&master, &[crtc, conn, plane], 0),
-        Ok(3),
-        "named, not brought along"
+        ebusy,
+        "lessee 2 still holds the CRTC and the connector"
     );
-    assert_eq!(list(&master, 4, 0), Ok((2, alloc::vec![2, 3])));
-    assert_eq!(list(&master, 1, 0), Ok((2, alloc::vec![2])), "room for one");
+    assert_eq!(
+        create(&master, &[plane, conn, crtc, 4242], 0),
+        Err(FsError::EntryNotFound),
+        "the list is looked up before the busy check"
+    );
+    assert_eq!(
+        list(&master, 4, 0),
+        Ok((1, alloc::vec![2])),
+        "a refused lease is not recorded"
+    );
 
     assert_eq!(
         revoke(&master, 42),
@@ -174,11 +197,24 @@ fn a_lease_holds_what_drm_lease_lets_it_and_the_lessor_lists_and_revokes_it() {
     assert_eq!(revoke(&master, 2), Ok(0));
     assert_eq!(
         list(&master, 4, 0),
-        Ok((1, alloc::vec![3])),
+        Ok((0, alloc::vec![])),
         "revoked: empty, so not listed"
     );
+    assert_eq!(
+        create(&master, &[crtc, conn, plane], 0),
+        Ok(3),
+        "named, not brought along; revoked, the objects are free again"
+    );
+    assert_eq!(list(&master, 4, 0), Ok((1, alloc::vec![3])));
+    assert_eq!(list(&master, 0, 0), Ok((1, alloc::vec![])), "no room");
     assert_eq!(revoke(&master, 2), Ok(0), "the lessee is still there");
     assert_eq!(revoke(&master, 1), Ok(0), "so is the empty one");
+    assert_eq!(
+        create(&master, &[plane, conn, crtc], 0),
+        ebusy,
+        "lessee 3 holds them now, in whatever order they are named"
+    );
+    assert_eq!(revoke(&master, 3), Ok(0));
     assert_eq!(
         create(&master, &[crtc, conn, plane], 0),
         Ok(4),

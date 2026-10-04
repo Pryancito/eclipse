@@ -2395,7 +2395,13 @@ impl DrmDev {
                         unsafe { core::slice::from_raw_parts(req.object_ids as *const u32, count) };
                     lease_objects(ids, self.file.universal_planes())?
                 };
-                let lessee_id = drm::lease_create(self.minor, objects);
+                // `drm_lease_create`: an object a live lessee of this master
+                // still holds is EBUSY (`_drm_has_leased`), checked after the
+                // list is validated and, in Linux, after the fd is taken
+                // (the fd is the syscall layer's here, so a full fd table
+                // answers EMFILE one step later than Linux would). The same
+                // CRTC was leased to as many lessees as asked for it.
+                let lessee_id = drm::lease_create(self.minor, objects).ok_or(FsError::Busy)?;
                 unsafe {
                     (*(data as *mut DrmModeCreateLease)).lessee_id = lessee_id;
                 }
