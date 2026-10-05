@@ -183,7 +183,7 @@ impl DrmDev {
         prop_id: u32,
         value: u64,
     ) -> Result<usize> {
-        let Some((kind, props)) = find_mode_object(obj_id, obj_type) else {
+        let Some((kind, props)) = find_mode_object(obj_id, obj_type, true) else {
             return Err(FsError::EntryNotFound);
         };
         // `drm_mode_obj_find_prop_id`.
@@ -2146,36 +2146,12 @@ impl DrmDev {
                 // `file_priv->fbs`; the whole table went to everyone.
                 let fbs = drm::framebuffer_ids_for(drm::current_pid());
 
-                if res.fb_id_ptr != 0 && res.count_fbs >= fbs.len() as u32 {
-                    ucheck_n::<u32>(res.fb_id_ptr as usize, fbs.len())?;
-                    unsafe {
-                        core::ptr::copy_nonoverlapping(
-                            fbs.as_ptr(),
-                            res.fb_id_ptr as *mut u32,
-                            fbs.len(),
-                        );
-                    }
-                }
-                if res.crtc_id_ptr != 0 && res.count_crtcs >= crtcs.len() as u32 {
-                    ucheck_n::<u32>(res.crtc_id_ptr as usize, crtcs.len())?;
-                    unsafe {
-                        core::ptr::copy_nonoverlapping(
-                            crtcs.as_ptr(),
-                            res.crtc_id_ptr as *mut u32,
-                            crtcs.len(),
-                        );
-                    }
-                }
-                if res.connector_id_ptr != 0 && res.count_connectors >= connectors.len() as u32 {
-                    ucheck_n::<u32>(res.connector_id_ptr as usize, connectors.len())?;
-                    unsafe {
-                        core::ptr::copy_nonoverlapping(
-                            connectors.as_ptr(),
-                            res.connector_id_ptr as *mut u32,
-                            connectors.len(),
-                        );
-                    }
-                }
+                // Each list is filled as far as the caller made room and
+                // reported at its full length (see `fill_id_list`); this arm
+                // copied each one whole or not at all.
+                fill_id_list(res.fb_id_ptr, res.count_fbs, &fbs)?;
+                fill_id_list(res.crtc_id_ptr, res.count_crtcs, &crtcs)?;
+                fill_id_list(res.connector_id_ptr, res.count_connectors, &connectors)?;
 
                 res.count_fbs = fbs.len() as u32;
                 res.count_crtcs = crtcs.len() as u32;
@@ -2189,12 +2165,11 @@ impl DrmDev {
                 // of the CRTC list, which is SYNTH_CRTC_ID on the software path
                 // and the hardware CRTC on the hardware path.
                 if !connectors.is_empty() {
-                    if res.encoder_id_ptr != 0 && res.count_encoders >= 1 {
-                        ucheck_n::<u32>(res.encoder_id_ptr as usize, 1)?;
-                        unsafe {
-                            *(res.encoder_id_ptr as *mut u32) = drm::SYNTH_ENCODER_ID;
-                        }
-                    }
+                    fill_id_list(
+                        res.encoder_id_ptr,
+                        res.count_encoders,
+                        &[drm::SYNTH_ENCODER_ID],
+                    )?;
                     res.count_encoders = 1;
                 } else {
                     res.count_encoders = 0;
@@ -2273,23 +2248,18 @@ impl DrmDev {
                         conn_res.count_modes = 0;
                     }
                     // Standard connector properties (DPMS, link-status,
-                    // non-desktop, EDID, and CRTC_ID for atomic clients), via
-                    // the usual two-call count/fill pattern.
+                    // non-desktop, EDID, and CRTC_ID for atomic clients),
+                    // filled as far as the caller made room, as
+                    // `drm_mode_object_get_properties` does for this ioctl
+                    // too (the modes and encoders above are all-or-nothing
+                    // in Linux as well). This list was copied all or nothing.
                     let props = connector_props(conn_res.connector_id, self.file.atomic_client());
-                    if !props.is_empty()
-                        && conn_res.props_ptr != 0
-                        && conn_res.prop_values_ptr != 0
-                        && conn_res.count_props >= props.len() as u32
-                    {
-                        ucheck_n::<u32>(conn_res.props_ptr as usize, props.len())?;
-                        ucheck_n::<u64>(conn_res.prop_values_ptr as usize, props.len())?;
-                        for (i, (pid, val)) in props.iter().enumerate() {
-                            unsafe {
-                                *(conn_res.props_ptr as *mut u32).add(i) = *pid;
-                                *(conn_res.prop_values_ptr as *mut u64).add(i) = *val;
-                            }
-                        }
-                    }
+                    fill_prop_list(
+                        conn_res.props_ptr,
+                        conn_res.prop_values_ptr,
+                        conn_res.count_props,
+                        &props,
+                    )?;
                     conn_res.count_props = props.len() as u32;
                     // klog (budget-shared with the wsi trace) so a black-screen
                     // bring-up shows, under LOG=error, whether the compositor
@@ -2399,17 +2369,7 @@ impl DrmDev {
                     .collect();
                 // Linux fills as many ids as the caller made room for and
                 // reports the full count; this arm filled all or nothing.
-                let fill = planes.len().min(res.count_planes as usize);
-                if res.plane_id_ptr != 0 && fill > 0 {
-                    ucheck_n::<u32>(res.plane_id_ptr as usize, fill)?;
-                    unsafe {
-                        core::ptr::copy_nonoverlapping(
-                            planes.as_ptr(),
-                            res.plane_id_ptr as *mut u32,
-                            fill,
-                        );
-                    }
-                }
+                fill_id_list(res.plane_id_ptr, res.count_planes, &planes)?;
                 res.count_planes = planes.len() as u32;
                 Ok(0)
             }
@@ -2447,58 +2407,32 @@ impl DrmDev {
             }
             DRM_IOCTL_MODE_OBJ_GETPROPERTIES => {
                 let res = unsafe { &mut *(data as *mut DrmModeObjGetProperties) };
-                // Identify the object by id (libdrm often passes obj_type=ANY).
-                // Look up any registered plane — not only SYNTH_PLANE_ID — so
-                // hardware planes (e.g. NVIDIA 3001, VirtIO 3000) are also
-                // classified as PRIMARY/OVERLAY/CURSOR by wlroots. Atomic
+                // `drm_mode_obj_get_properties_ioctl`: the object is found
+                // by id AND type (`drm_mode_object_find`; libdrm passes
+                // obj_type=ANY, wlroots and Mutter the real type), ENOENT
+                // otherwise; then the list is filled as far as the caller
+                // made room and reported at its full length. Atomic
                 // properties (FB_ID, CRTC_ID, ACTIVE, MODE_ID, rects) only
                 // appear for atomic clients, like Linux's atomic filtering;
-                // legacy clients keep seeing exactly the pre-atomic set.
+                // legacy clients keep seeing exactly the pre-atomic set. The
+                // one encoder exists but carries no properties (Linux would
+                // say EINVAL for an object without a property list; the
+                // empty list stays because GETRESOURCES names this id and
+                // some clients probe every id it returns). This arm ignored
+                // obj_type -- a CRTC id asked about as a plane answered with
+                // the CRTC's properties -- and copied the list all or
+                // nothing.
                 let atomic = self.file.atomic_client();
-                let props: alloc::vec::Vec<(u32, u64)> = if let Some(p) = drm::get_plane(res.obj_id)
-                {
-                    plane_props(&p, atomic)
-                } else if drm::get_crtc(res.obj_id).is_some() {
-                    crtc_props(atomic)
-                } else if drm::get_connector(res.obj_id).is_some() {
-                    connector_props(res.obj_id, atomic)
-                } else if res.obj_id == drm::SYNTH_ENCODER_ID {
-                    // The encoder exists but carries no properties. Linux
-                    // answers EINVAL for an object without a property list;
-                    // keep the historical empty list, since GETRESOURCES
-                    // names this id and some clients probe every id it
-                    // returns.
-                    alloc::vec::Vec::new()
-                } else {
-                    // Anything else is no object at all: ENOENT, as
-                    // `drm_mode_obj_get_properties_ioctl`'s lookup answers.
-                    // This used to be the same empty list as the encoder's.
+                let Some((_, props)) = find_mode_object(res.obj_id, res.obj_type, atomic) else {
                     return Err(FsError::EntryNotFound);
                 };
-                let n = props.len();
-                // Both output arrays are written below, so both pointers must be
-                // non-null: a client passing props_ptr set but prop_values_ptr=0
-                // would otherwise trigger a kernel write to address 0.
-                if n > 0
-                    && res.props_ptr != 0
-                    && res.prop_values_ptr != 0
-                    && (res.count_props as usize) >= n
-                {
-                    ucheck_n::<u32>(res.props_ptr as usize, n)?;
-                    ucheck_n::<u64>(res.prop_values_ptr as usize, n)?;
-                    for (i, (pid, val)) in props.iter().enumerate() {
-                        unsafe {
-                            *(res.props_ptr as *mut u32).add(i) = *pid;
-                            *(res.prop_values_ptr as *mut u64).add(i) = *val;
-                        }
-                    }
-                }
-                res.count_props = n as u32;
+                fill_prop_list(res.props_ptr, res.prop_values_ptr, res.count_props, &props)?;
+                res.count_props = props.len() as u32;
                 log::debug!(
                     "[drm] OBJ_GETPROPERTIES obj_id={} obj_type={:#x} -> {} props",
                     res.obj_id,
                     res.obj_type,
-                    n
+                    props.len()
                 );
                 Ok(0)
             }
@@ -5037,13 +4971,17 @@ struct PropSpec {
 /// as OBJ_GETPROPERTIES lists them to an atomic client; an encoder has
 /// none). `DRM_MODE_OBJECT_ANY` matches any type; any other type has to be
 /// the object's own.
-fn find_mode_object(obj_id: u32, obj_type: u32) -> Option<(u32, alloc::vec::Vec<(u32, u64)>)> {
+fn find_mode_object(
+    obj_id: u32,
+    obj_type: u32,
+    atomic: bool,
+) -> Option<(u32, alloc::vec::Vec<(u32, u64)>)> {
     let (kind, props) = if let Some(plane) = drm::get_plane(obj_id) {
-        (DRM_MODE_OBJECT_PLANE, plane_props(&plane, true))
+        (DRM_MODE_OBJECT_PLANE, plane_props(&plane, atomic))
     } else if drm::get_crtc(obj_id).is_some() {
-        (DRM_MODE_OBJECT_CRTC, crtc_props(true))
+        (DRM_MODE_OBJECT_CRTC, crtc_props(atomic))
     } else if drm::get_connector(obj_id).is_some() {
-        (DRM_MODE_OBJECT_CONNECTOR, connector_props(obj_id, true))
+        (DRM_MODE_OBJECT_CONNECTOR, connector_props(obj_id, atomic))
     } else if obj_id == drm::SYNTH_ENCODER_ID {
         (DRM_MODE_OBJECT_ENCODER, alloc::vec::Vec::new())
     } else {
@@ -5053,6 +4991,41 @@ fn find_mode_object(obj_id: u32, obj_type: u32) -> Option<(u32, alloc::vec::Vec<
         return None;
     }
     Some((kind, props))
+}
+
+/// An id list the way `drm_mode_getresources` and `drm_mode_getplane_res`
+/// answer one: as many entries as the caller made room for (`count <
+/// card_res->count_x`), so a short array gets a prefix, and the caller
+/// reads the full length from the count written back. A null pointer
+/// writes nothing (Linux would fault on it).
+fn fill_id_list(ptr: u64, room: u32, ids: &[u32]) -> Result<()> {
+    let fill = ids.len().min(room as usize);
+    if ptr != 0 && fill > 0 {
+        ucheck_n::<u32>(ptr as usize, fill)?;
+        unsafe {
+            core::ptr::copy_nonoverlapping(ids.as_ptr(), ptr as *mut u32, fill);
+        }
+    }
+    Ok(())
+}
+
+/// A property list the way `drm_mode_object_get_properties` answers one
+/// (`*arg_count_props > count` per entry): the ids and values of the first
+/// `room` properties, and the caller reads the full length from the count
+/// written back. Both arrays are written, so both pointers must be non-null.
+fn fill_prop_list(props_ptr: u64, values_ptr: u64, room: u32, props: &[(u32, u64)]) -> Result<()> {
+    let fill = props.len().min(room as usize);
+    if fill > 0 && props_ptr != 0 && values_ptr != 0 {
+        ucheck_n::<u32>(props_ptr as usize, fill)?;
+        ucheck_n::<u64>(values_ptr as usize, fill)?;
+        for (i, (pid, val)) in props.iter().take(fill).enumerate() {
+            unsafe {
+                *(props_ptr as *mut u32).add(i) = *pid;
+                *(values_ptr as *mut u64).add(i) = *val;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// `drm_property_change_valid_get`: whether `value` may be written to a
@@ -13255,6 +13228,112 @@ mod hw_kms_tests {
         assert_eq!(cursor(0, 0, 0), Ok(0));
 
         c.destroy_dumb(small.handle).expect("DESTROY_DUMB");
+    }
+
+    /// `drm_mode_getresources` and `drm_mode_object_get_properties` (which
+    /// GETCONNECTOR uses for its property list too) write as many entries
+    /// as the caller made room for and report the full length, so a short
+    /// array gets a prefix and the count to allocate; and
+    /// `drm_mode_obj_get_properties_ioctl` finds the object by id and type,
+    /// so a connector asked about as a plane is ENOENT. Here the lists
+    /// were copied all or nothing, and any type matched any id.
+    #[test]
+    fn lists_are_filled_as_far_as_the_caller_made_room_and_objects_match_their_type() {
+        let screen = kms_emu::attach(32, 8);
+        let _gpu = screen.attach_gpu(EmuGpu::hardware_kms("emu-gpu").with_ids(60, 61, 62));
+        let c = Client::open(0);
+        const SENTINEL: u32 = 0xfeed_beef;
+        let enoent = Err(FsError::EntryNotFound);
+
+        // GETRESOURCES: two framebuffers, room for one.
+        let a = c.create_dumb(32, 8);
+        let b = c.create_dumb(32, 8);
+        let fb_a = c.addfb2(&a);
+        let fb_b = c.addfb2(&b);
+        let mut probe = blank_card_res();
+        assert_eq!(c.ioctl(DRM_IOCTL_MODE_GETRESOURCES, &mut probe), Ok(0));
+        let total = probe.count_fbs;
+        assert!(total >= 2, "both framebuffers are listed");
+        let mut all = alloc::vec![SENTINEL; total as usize];
+        let mut full = blank_card_res();
+        full.fb_id_ptr = all.as_mut_ptr() as u64;
+        full.count_fbs = total;
+        assert_eq!(c.ioctl(DRM_IOCTL_MODE_GETRESOURCES, &mut full), Ok(0));
+        assert!(all.contains(&fb_a) && all.contains(&fb_b));
+        let mut one = [SENTINEL; 2];
+        let mut short = blank_card_res();
+        short.fb_id_ptr = one.as_mut_ptr() as u64;
+        short.count_fbs = 1;
+        assert_eq!(c.ioctl(DRM_IOCTL_MODE_GETRESOURCES, &mut short), Ok(0));
+        assert_eq!(
+            short.count_fbs, total,
+            "the full length comes back with a short array"
+        );
+        assert_eq!(
+            one[0], all[0],
+            "the first entry is written into the room there is"
+        );
+        assert_eq!(one[1], SENTINEL, "nothing is written past the room");
+
+        // OBJ_GETPROPERTIES on the connector: room for one of its properties.
+        let mut count: DrmModeObjGetProperties = zeroed();
+        count.obj_id = 61;
+        count.obj_type = DRM_MODE_OBJECT_CONNECTOR;
+        assert_eq!(c.ioctl(DRM_IOCTL_MODE_OBJ_GETPROPERTIES, &mut count), Ok(0));
+        let n = count.count_props;
+        assert!(n >= 2, "the connector carries several properties");
+        let mut ids = alloc::vec![SENTINEL; n as usize];
+        let mut vals = alloc::vec![u64::MAX; n as usize];
+        let mut full = count;
+        full.props_ptr = ids.as_mut_ptr() as u64;
+        full.prop_values_ptr = vals.as_mut_ptr() as u64;
+        assert_eq!(c.ioctl(DRM_IOCTL_MODE_OBJ_GETPROPERTIES, &mut full), Ok(0));
+        assert!(!ids.contains(&SENTINEL));
+        let mut one_id = [SENTINEL; 2];
+        let mut one_val = [u64::MAX; 2];
+        let mut short = count;
+        short.props_ptr = one_id.as_mut_ptr() as u64;
+        short.prop_values_ptr = one_val.as_mut_ptr() as u64;
+        short.count_props = 1;
+        assert_eq!(c.ioctl(DRM_IOCTL_MODE_OBJ_GETPROPERTIES, &mut short), Ok(0));
+        assert_eq!(short.count_props, n);
+        assert_eq!((one_id[0], one_val[0]), (ids[0], vals[0]));
+        assert_eq!((one_id[1], one_val[1]), (SENTINEL, u64::MAX));
+
+        // GETCONNECTOR's property list, the same way.
+        let mut conn: DrmModeGetConnector = zeroed();
+        conn.connector_id = 61;
+        let mut conn_id = [SENTINEL; 2];
+        let mut conn_val = [u64::MAX; 2];
+        conn.props_ptr = conn_id.as_mut_ptr() as u64;
+        conn.prop_values_ptr = conn_val.as_mut_ptr() as u64;
+        conn.count_props = 1;
+        assert_eq!(c.ioctl(DRM_IOCTL_MODE_GETCONNECTOR, &mut conn), Ok(0));
+        assert_eq!(conn.count_props, n);
+        assert_eq!((conn_id[0], conn_val[0]), (ids[0], vals[0]));
+        assert_eq!((conn_id[1], conn_val[1]), (SENTINEL, u64::MAX));
+
+        // The object must be of the type asked for; ANY matches every type.
+        universal_planes(&c, true);
+        let plane = planes(&c)[0];
+        let by_type = |id: u32, ty: u32| {
+            let mut req: DrmModeObjGetProperties = zeroed();
+            req.obj_id = id;
+            req.obj_type = ty;
+            c.ioctl(DRM_IOCTL_MODE_OBJ_GETPROPERTIES, &mut req)
+        };
+        assert_eq!(by_type(61, DRM_MODE_OBJECT_PLANE), enoent);
+        assert_eq!(by_type(61, DRM_MODE_OBJECT_CONNECTOR), Ok(0));
+        assert_eq!(by_type(plane, DRM_MODE_OBJECT_CRTC), enoent);
+        assert_eq!(by_type(plane, DRM_MODE_OBJECT_PLANE), Ok(0));
+        assert_eq!(by_type(60, DRM_MODE_OBJECT_CONNECTOR), enoent);
+        assert_eq!(by_type(60, DRM_MODE_OBJECT_CRTC), Ok(0));
+        assert_eq!(by_type(drm::SYNTH_ENCODER_ID, DRM_MODE_OBJECT_CRTC), enoent);
+        assert_eq!(
+            by_type(drm::SYNTH_ENCODER_ID, DRM_MODE_OBJECT_ENCODER),
+            Ok(0)
+        );
+        assert_eq!(by_type(60, DRM_MODE_OBJECT_ANY), Ok(0));
     }
 }
 
