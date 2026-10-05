@@ -626,4 +626,62 @@ mod tests {
         assert!(out.status.success());
         let _ = fs::remove_dir_all(&base);
     }
+
+    /// Todo programa que la tabla de servicios arranca tiene que **llegar a la
+    /// raiz instalada**: `/usr/local/bin` solo lo escribe el instalador, asi
+    /// que un envoltorio que se pierde entre el rootfs y la imagen deja a
+    /// `eclipse-init` reintentando un `execve` que nunca va a funcionar. En
+    /// hardware real eso fue `dbus-system`:
+    /// `/usr/local/bin/eclipse-dbus-system does not exist`, una y otra vez,
+    /// durante todo el arranque.
+    ///
+    /// La ida y vuelta completa: se escriben los servicios y los envoltorios
+    /// como lo hace `install_eclipse_init`, se construye la imagen btrfs y se
+    /// busca cada `exec =` **dentro de la imagen**, con el driver del propio
+    /// arbol.
+    #[test]
+    fn todo_exec_de_la_tabla_de_servicios_llega_a_la_imagen() {
+        use crate::linux::LinuxRootfs;
+
+        let base = escenario("envoltorios");
+        let src = base.join("rootfs");
+        let svc_dir = src.join("etc/eclipse/services");
+        let localbin = src.join("usr/local/bin");
+        fs::create_dir_all(&svc_dir).unwrap();
+        fs::create_dir_all(&localbin).unwrap();
+        LinuxRootfs::write_init_services(&svc_dir);
+        LinuxRootfs::write_ntp(&src);
+        LinuxRootfs::write_init_wrappers(&localbin, &svc_dir);
+        // Los tres que escribe `desktop.rs` (labwc, gtk-caches, xkbmap) no los
+        // pone este camino: aqui solo se comprueba que lo que SI se escribe
+        // llega entero.
+        let escritos: Vec<String> = fs::read_dir(&localbin)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            escritos.iter().any(|n| n == "eclipse-dbus-system"),
+            "el envoltorio del bus de sistema ni siquiera se escribio: {escritos:?}"
+        );
+
+        let img = base.join("rootfs.btrfs");
+        make_btrfs_image(&img, 96 * 1024 * 1024, "ECLIPSE", Some(&src));
+
+        let mut fs2 = montar(&img);
+        let root = fs2.root_ino();
+        let usr = fs2.lookup(root, "usr").expect("falta /usr");
+        let local = fs2.lookup(usr, "local").expect("falta /usr/local");
+        let bin = fs2.lookup(local, "bin").expect("falta /usr/local/bin");
+        let mut faltan: Vec<&String> = escritos
+            .iter()
+            .filter(|n| fs2.lookup(bin, n).is_err())
+            .collect();
+        faltan.sort();
+        assert!(
+            faltan.is_empty(),
+            "estos envoltorios no estan en la imagen instalada: {faltan:?}"
+        );
+        let _ = fs::remove_dir_all(&base);
+    }
 }
