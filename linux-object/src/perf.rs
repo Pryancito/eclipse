@@ -898,7 +898,7 @@ pub fn kernel_report() -> String {
     // slice (up to 20 ms) — invisible to single-threaded benchmarks, very
     // visible when using the machine.
     {
-        let (req, taken) = kernel_hal::kstats::wakeup_preempt_stats();
+        let (req, taken, suppressed) = kernel_hal::kstats::wakeup_preempt_stats();
         let pct = if req > 0 {
             taken as f64 * 100.0 / req as f64
         } else {
@@ -906,11 +906,13 @@ pub fn kernel_report() -> String {
         };
         let _ = writeln!(
             out,
-            "wakeup preempt: {} requests ({:.0}/s), {} honoured ({:.1}%)",
+            "wakeup preempt: {} requests ({:.0}/s), {} honoured ({:.1}%), \
+             {} kicks coalesced onto a request already pending",
             req,
             rate(req),
             taken,
-            pct
+            pct,
+            suppressed
         );
     }
     // Coroutine-stack hand-out guard health. Non-zero means the live-stack
