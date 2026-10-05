@@ -1273,8 +1273,15 @@ async fn handle_user_trap(thread: &CurrentThread, mut ctx: Box<UserContext>) -> 
                 let wake_resched = kernel_hal::thread::need_resched_pending()
                     && (slice_expired || thread.sched_may_preempt_on_wake())
                     && kernel_hal::thread::take_need_resched();
+                // `preempt_now`, not `yield_now`: neither of these is the
+                // task volunteering. `yield_now` files the self-wake in the
+                // voluntary-yield lane, which the run queue drains only once no
+                // urgent notify is left -- so a CPU-bound thread preempted at
+                // the end of its slice did not run again for as long as any
+                // peer on the CPU kept waking, and the slice length stopped
+                // mattering at all. See `kernel_hal::thread::preempt_now`.
                 if slice_expired || wake_resched {
-                    kernel_hal::thread::yield_now().await;
+                    kernel_hal::thread::preempt_now().await;
                 }
             }
             Ok(())

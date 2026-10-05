@@ -523,7 +523,11 @@ async fn handler_user_trap(
         TrapReason::Interrupt(vector) => {
             EXCEPTIONS_IRQ.add(1); // FIXME
             kernel_hal::interrupt::handle_irq(vector);
-            kernel_hal::thread::yield_now().await;
+            // Involuntary, like the Linux personality's trap path: the thread
+            // asked for nothing, an interrupt landed on it. `yield_now` would
+            // file it in the voluntary-yield lane, which only drains once no
+            // urgent notify is left on the CPU's queue.
+            kernel_hal::thread::preempt_now().await;
             Ok(())
         }
         TrapReason::PageFault(vaddr, flags) => {

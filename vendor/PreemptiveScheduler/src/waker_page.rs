@@ -678,6 +678,59 @@ mod waker_page_tests {
     }
 
     #[test]
+    fn a_thread_the_scheduler_preempted_keeps_its_place_in_the_urgent_lane() {
+        let _g = wake_lock();
+        let p = page();
+        let w = waker_for(&p, 30);
+        p.take_notified();
+        p.mark_borrowed(30, true);
+
+        // The trap path's end-of-slice preemption self-wakes exactly like
+        // `sched_yield(2)` does -- same future, same `wake_by_ref` from inside
+        // its own poll -- and the ONLY thing that told the two apart was the
+        // voluntary marker. Without it (`preempt_now`), the wake must take the
+        // urgent lane: the thread asked for nothing, so it must not wait behind
+        // every notify. Filed in the yielded lane it did not run again for as
+        // long as any peer on the CPU kept waking, which made the slice length
+        // irrelevant -- a spinner sharing a CPU with a thread waking every
+        // 200 us kept a few percent of its throughput.
+        w.wake_by_ref();
+
+        p.mark_borrowed(30, false);
+        assert_eq!(
+            p.take_notified(),
+            1 << 30,
+            "an involuntary preemption was filed as a voluntary yield"
+        );
+        assert_eq!(p.take_yielded(), 0);
+    }
+
+    #[test]
+    fn only_the_volunteer_waits_behind_the_other_when_both_give_up_the_cpu() {
+        let _g = wake_lock();
+        let p = page();
+        let volunteer = waker_for(&p, 31);
+        let preempted = waker_for(&p, 32);
+        p.take_notified();
+        p.mark_borrowed(31, true);
+        p.mark_borrowed(32, true);
+
+        crate::runtime::begin_voluntary_yield(Arc::as_ptr(&volunteer) as usize);
+        volunteer.wake_by_ref();
+        crate::runtime::end_voluntary_yield();
+        preempted.wake_by_ref();
+
+        p.mark_borrowed(31, false);
+        p.mark_borrowed(32, false);
+        // Pass 1 of the generator's scan drains `notified`, and pass 2 runs
+        // only when pass 1 came up empty. So this is the whole ordering: the
+        // thread that chose to give up the CPU goes second, the one it was
+        // taken from goes first.
+        assert_eq!(p.take_notified(), 1 << 32);
+        assert_eq!(p.take_yielded(), 1 << 31);
+    }
+
+    #[test]
     fn an_interrupt_inside_the_yield_window_does_not_demote_someone_elses_wake() {
         let _g = wake_lock();
         let p = page();

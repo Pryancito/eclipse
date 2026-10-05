@@ -7,10 +7,98 @@ use zcore_drivers::scheme::DisplayScheme;
 use crate::timer;
 use crate::timer_waker::{self, TimerWakerSlot};
 
+/// The voluntary-yield marker, as the two builds see it.
+///
+/// On bare metal this is the scheduler's own per-CPU marker. The hosted
+/// `libos` build has no run queue and no lanes, so there is nothing to mark —
+/// but the *decision* is shared code, and before this seam existed it lived
+/// inside a `cfg(target_os = "none")` block where no test on this side could
+/// reach it. Wiring `preempt_now` to the voluntary marker would put the
+/// starvation straight back, and nothing would have failed. So the libos stub
+/// counts instead of doing nothing, and
+/// `sched_yield_marks_the_yield_lane_and_a_preemption_does_not` reads it.
+mod mark {
+    #[cfg(target_os = "none")]
+    pub(super) fn begin_voluntary_yield(waker_id: usize) {
+        executor::begin_voluntary_yield(waker_id);
+    }
+
+    #[cfg(target_os = "none")]
+    pub(super) fn end_voluntary_yield() {
+        executor::end_voluntary_yield();
+    }
+
+    #[cfg(not(target_os = "none"))]
+    pub(super) use host::{begin_voluntary_yield, end_voluntary_yield};
+
+    #[cfg(not(target_os = "none"))]
+    mod host {
+        use core::sync::atomic::{AtomicUsize, Ordering};
+
+        /// How many voluntary-yield markers this build has raised, and how
+        /// many it has taken back down. Only a test reads them; `libos` has no
+        /// lanes for them to steer. Both are counted because a marker left up
+        /// is worse than one never raised: on bare metal that CPU then answers
+        /// "voluntary" to every external wake it raises, forever.
+        pub(super) static MARKED: AtomicUsize = AtomicUsize::new(0);
+        pub(super) static CLEARED: AtomicUsize = AtomicUsize::new(0);
+
+        pub(crate) fn begin_voluntary_yield(_waker_id: usize) {
+            MARKED.fetch_add(1, Ordering::Relaxed);
+        }
+
+        pub(crate) fn end_voluntary_yield() {
+            CLEARED.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[cfg(all(test, not(target_os = "none")))]
+    pub(super) fn marks_raised() -> usize {
+        host::MARKED.load(core::sync::atomic::Ordering::Relaxed)
+    }
+
+    #[cfg(all(test, not(target_os = "none")))]
+    pub(super) fn marks_cleared() -> usize {
+        host::CLEARED.load(core::sync::atomic::Ordering::Relaxed)
+    }
+}
+
 #[must_use = "`yield_now()` does nothing unless polled/`await`-ed"]
 #[derive(Default)]
 pub(super) struct YieldFuture {
     flag: bool,
+    /// Whether the task is *choosing* to give up the CPU.
+    ///
+    /// The two callers of this future are not the same event, and filing them
+    /// in the same lane starved the second one. `sched_yield(2)` is a task
+    /// saying "someone else first", and the yielded lane is exactly right for
+    /// it. The trap path's end-of-timeslice preemption is the scheduler taking
+    /// the CPU away from a task that asked for nothing — and the yielded lane
+    /// is drained only once no urgent notify is left anywhere on the CPU's
+    /// queue, so a CPU-bound task filed there did not run again for as long as
+    /// any peer kept waking. One peer waking every 200 us is enough to hold it
+    /// off indefinitely, which makes the slice length irrelevant: losing the
+    /// CPU at the end of a slice has to be survivable.
+    voluntary: bool,
+}
+
+impl YieldFuture {
+    /// The task is giving up the CPU of its own accord (`sched_yield(2)`).
+    pub(super) fn voluntary() -> Self {
+        Self {
+            flag: false,
+            voluntary: true,
+        }
+    }
+
+    /// The scheduler is taking the CPU away (timeslice expiry, wake-up
+    /// preemption). The task competes for it again on equal terms.
+    pub(super) fn involuntary() -> Self {
+        Self {
+            flag: false,
+            voluntary: false,
+        }
+    }
 }
 
 impl Future for YieldFuture {
@@ -25,11 +113,19 @@ impl Future for YieldFuture {
             // external notify) so wake-up preemption actually hands the CPU to
             // the woken task instead of re-electing this one. See
             // `executor::begin_voluntary_yield` / `WakerPage::mark_yielded`.
-            #[cfg(target_os = "none")]
-            executor::begin_voluntary_yield(cx.waker().data() as usize);
+            //
+            // Only for a *voluntary* yield: without the marker the wake takes
+            // the ordinary notified path, which for an already-borrowed task
+            // (which this is — the self-wake runs inside its own poll) is the
+            // same `maybe_send_resched_ipi` and the same deferral, differing
+            // only in the lane it waits in.
+            if self.voluntary {
+                mark::begin_voluntary_yield(cx.waker().data() as usize);
+            }
             cx.waker().wake_by_ref();
-            #[cfg(target_os = "none")]
-            executor::end_voluntary_yield();
+            if self.voluntary {
+                mark::end_voluntary_yield();
+            }
             Poll::Pending
         }
     }
@@ -285,6 +381,67 @@ mod tests {
     use zcore_drivers::scheme::{EventScheme, Scheme, UartScheme};
     use zcore_drivers::utils::EventHandler;
     use zcore_drivers::{Device, DeviceResult};
+
+    // ── which of the two ways of giving up the CPU this is ────────────────
+
+    /// Poll a future to completion, counting the voluntary-yield markers it
+    /// raises on the way.
+    fn marks_while_polling(fut: impl Future<Output = ()>) -> usize {
+        let (raised, cleared) = (mark::marks_raised(), mark::marks_cleared());
+        let probe = Probe::new();
+        let waker = waker_of(&probe);
+        let mut cx = Context::from_waker(&waker);
+        let mut fut = Box::pin(fut);
+        assert!(
+            fut.as_mut().poll(&mut cx).is_pending(),
+            "did not yield once"
+        );
+        assert_eq!(fut.as_mut().poll(&mut cx), Poll::Ready(()));
+        let n = mark::marks_raised() - raised;
+        // Every marker raised comes back down before the poll returns. One left
+        // up outlives the task it names: see the `VOLUNTARY_YIELD` comment in
+        // `PreemptiveScheduler`, where a flag kept up made its CPU file every
+        // external wake it raised in the low-priority lane.
+        assert_eq!(
+            mark::marks_cleared() - cleared,
+            n,
+            "a voluntary-yield marker was left up"
+        );
+        n
+    }
+
+    #[test]
+    fn sched_yield_marks_the_yield_lane_and_a_preemption_does_not() {
+        // This is the whole fix, read through the two public entry points
+        // rather than through the struct: wiring `preempt_now` to the
+        // voluntary marker puts the starvation straight back, and wiring
+        // `yield_now` away from it inverts it. Driven through
+        // `crate::thread::*` on purpose — the mutants that matter are in those
+        // two one-line bodies.
+        //
+        // What the marker then does to the lane is `PreemptiveScheduler`'s
+        // `waker_page`: see
+        // `a_thread_the_scheduler_preempted_keeps_its_place_in_the_urgent_lane`.
+        assert_eq!(
+            marks_while_polling(crate::thread::yield_now()),
+            1,
+            "sched_yield(2) stopped asking to go behind the urgent lane"
+        );
+        assert_eq!(
+            marks_while_polling(crate::thread::preempt_now()),
+            0,
+            "an end-of-slice preemption is being filed as a voluntary yield"
+        );
+    }
+
+    #[test]
+    fn the_old_single_constructor_is_the_involuntary_one() {
+        // `Default` is what the one constructor used to be. Nothing should be
+        // reaching for it now that the two events are told apart, and if
+        // something does, the safe reading is "the scheduler took the CPU".
+        assert!(!YieldFuture::default().voluntary);
+        assert_eq!(marks_while_polling(YieldFuture::default()), 0);
+    }
 
     /// A uart whose bytes a test hands it, counting its subscriptions.
     ///
