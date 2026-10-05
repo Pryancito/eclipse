@@ -907,7 +907,7 @@ pub fn kernel_report() -> String {
         let _ = writeln!(
             out,
             "wakeup preempt: {} requests ({:.0}/s), {} honoured ({:.1}%), \
-             {} IPIs coalesced onto a pending request",
+             {} kicks coalesced onto a request already pending",
             req,
             rate(req),
             taken,

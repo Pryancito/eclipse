@@ -206,19 +206,26 @@ pub fn wakeup_preempt_enabled() -> bool {
 static RESCHED_REQUESTED: AtomicU64 = AtomicU64::new(0);
 static RESCHED_TAKEN: AtomicU64 = AtomicU64::new(0);
 
-/// Wakes that sent no IPI because a request was already pending on the target.
+/// Cross-CPU kicks not sent because a request was already pending on the target.
 ///
 /// That coalescing is the point of [`NEED_RESCHED`] when the outstanding
 /// request is about to be consumed: a burst of wakes for one CPU costs one
 /// IPI instead of N. It turns into a *latch* when nothing consumes it, because
 /// every later wake for that CPU then takes the same early return and the woken
 /// task waits for whatever interrupt comes next. So this counter is read next
-/// to `taken`/`requests`: a suppressed count that climbs while the honoured
-/// ratio stays flat is that latch, not coalescing.
+/// to `taken`/`requests`: a count that climbs while the honoured ratio stays
+/// flat is that latch, not coalescing.
+///
+/// Counted only for a target that is neither halted nor ourselves, so that
+/// every increment is an IPI that a cleared bit would really have sent. A
+/// halted target is kicked anyway a few lines up, and a wake for our own CPU
+/// never sends one: we are already executing here and reach the trap path
+/// without an interrupt. Folding either case in would make the number read as
+/// a latch on a machine that has none.
 static RESCHED_SUPPRESSED: AtomicU64 = AtomicU64::new(0);
 
-/// `(wake-up preemption requests, requests honoured, IPIs suppressed)` since
-/// boot.
+/// `(wake-up preemption requests, requests honoured, cross-CPU kicks coalesced
+/// onto a request that was already pending)` since boot.
 pub fn wakeup_preempt_stats() -> (u64, u64, u64) {
     (
         RESCHED_REQUESTED.load(Ordering::Relaxed),
@@ -686,7 +693,7 @@ pub(crate) fn request_resched(owner: u8) {
         // be kicked out of `hlt`, or the wake waits for its next tick.
         if sleeping {
             send_resched_ipi(owner);
-        } else {
+        } else if owner != crate::arch::cpu_id() as usize {
             RESCHED_SUPPRESSED.fetch_add(1, Ordering::Relaxed);
         }
         return;
@@ -3668,6 +3675,24 @@ mod resched_tests {
             wakeup_preempt_stats().2,
             suppressed,
             "a wake that did kick was counted as suppressed"
+        );
+    }
+
+    /// A wake for our own CPU never sends an IPI even with the bit clear — we
+    /// are already executing here — so it is not a kick that the latch cost us,
+    /// and counting it would make the number read as a latch on a machine that
+    /// has none.
+    #[test]
+    fn a_wake_for_our_own_cpu_is_not_a_kick_the_latch_swallowed() {
+        let _g = fresh();
+        request_resched(0);
+        assert_eq!(kicks(), 0, "we sent ourselves an interrupt");
+        let suppressed = wakeup_preempt_stats().2;
+        request_resched(0);
+        assert_eq!(
+            wakeup_preempt_stats().2,
+            suppressed,
+            "a kick that was never going to be sent was counted as swallowed"
         );
     }
 
