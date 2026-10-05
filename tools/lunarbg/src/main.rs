@@ -182,6 +182,10 @@ struct Background {
 fn pool_geometry(w: usize, h: usize) -> Option<(usize, usize)> {
     let frame = w.checked_mul(4)?.checked_mul(h)?;
     let total = frame.checked_mul(BUFFERS)?;
+    // `<` would do as well, and mutation is right: the total is four bytes a
+    // pixel times two buffers, so it is always a multiple of eight and can
+    // never land on an odd `i32::MAX`. `<=` is written because the limit is
+    // what `wl_shm.create_pool` accepts, and that bound is inclusive.
     (total <= i32::MAX as usize).then_some((frame, total))
 }
 
@@ -1411,6 +1415,9 @@ fn parse_dump_spec(spec: &str) -> (String, usize, usize) {
     let Some((path, dims)) = spec.rsplit_once(':') else {
         return (spec.to_string(), DEFAULT.0, DEFAULT.1);
     };
+    // First or last `x` makes no difference, as mutation reports: with two of
+    // them one half keeps one and fails the digits-only test whichever end you
+    // cut at, and the whole spec falls back to being the path.
     let Some((w, h)) = dims.split_once('x') else {
         return (spec.to_string(), DEFAULT.0, DEFAULT.1);
     };
