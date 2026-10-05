@@ -1138,8 +1138,10 @@ impl DrmDev {
                         if value > 2 {
                             return Err(FsError::InvalidParam);
                         }
-                        // Setting atomic also implies universal planes.
+                        // Setting atomic also implies universal planes:
+                        // `drm_setclientcap` stores the value in both fields.
                         self.file.set_atomic_client(value != 0);
+                        self.file.set_universal_planes(value != 0);
                         log::debug!("[drm] SET_CLIENT_CAP ATOMIC={} -> accepted", value);
                         Ok(0)
                     }
@@ -1152,13 +1154,26 @@ impl DrmDev {
                         }
                         Ok(0)
                     }
-                    // STEREO_3D, UNIVERSAL_PLANES, ASPECT_RATIO: a boolean
-                    // each in Linux (`drm_setclientcap`: `value > 1` is
-                    // EINVAL); nothing here changes with them, so accept the
-                    // two legal values and refuse the rest.
-                    DRM_CLIENT_CAP_STEREO_3D
-                    | DRM_CLIENT_CAP_UNIVERSAL_PLANES
-                    | DRM_CLIENT_CAP_ASPECT_RATIO => {
+                    // UNIVERSAL_PLANES: a boolean (`value > 1` is EINVAL)
+                    // that `drm_mode_getplane_res` reads. It was accepted and
+                    // forgotten, so a legacy client that never set it was
+                    // handed the primary plane as if it were an overlay.
+                    DRM_CLIENT_CAP_UNIVERSAL_PLANES => {
+                        if value > 1 {
+                            return Err(FsError::InvalidParam);
+                        }
+                        self.file.set_universal_planes(value != 0);
+                        log::debug!(
+                            "[drm] SET_CLIENT_CAP UNIVERSAL_PLANES={} -> accepted",
+                            value
+                        );
+                        Ok(0)
+                    }
+                    // STEREO_3D, ASPECT_RATIO: a boolean each in Linux
+                    // (`drm_setclientcap`: `value > 1` is EINVAL); nothing
+                    // here changes with them, so accept the two legal values
+                    // and refuse the rest.
+                    DRM_CLIENT_CAP_STEREO_3D | DRM_CLIENT_CAP_ASPECT_RATIO => {
                         if value > 1 {
                             return Err(FsError::InvalidParam);
                         }
@@ -2224,14 +2239,32 @@ impl DrmDev {
             }
             DRM_IOCTL_MODE_GETPLANERESOURCES => {
                 let res = unsafe { &mut *(data as *mut DrmModeGetPlaneRes) };
-                let planes = drm::get_planes();
-                if res.plane_id_ptr != 0 && res.count_planes >= planes.len() as u32 {
-                    ucheck_n::<u32>(res.plane_id_ptr as usize, planes.len())?;
+                // `drm_mode_getplane_res`: "unless userspace set the
+                // 'universal planes' capability bit, only advertise
+                // overlays". Every plane here is a primary, so a client that
+                // never set the cap -- one written when the primary and the
+                // cursor were not planes -- gets an empty list, not the
+                // scanout plane to drive as an overlay. The cap was accepted
+                // and ignored, and the list was the same for everyone.
+                let universal = self.file.universal_planes();
+                let planes: alloc::vec::Vec<u32> = drm::get_planes()
+                    .into_iter()
+                    .filter(|&id| {
+                        universal
+                            || drm::get_plane(id)
+                                .is_some_and(|p| p.plane_type == DRM_PLANE_TYPE_OVERLAY)
+                    })
+                    .collect();
+                // Linux fills as many ids as the caller made room for and
+                // reports the full count; this arm filled all or nothing.
+                let fill = planes.len().min(res.count_planes as usize);
+                if res.plane_id_ptr != 0 && fill > 0 {
+                    ucheck_n::<u32>(res.plane_id_ptr as usize, fill)?;
                     unsafe {
                         core::ptr::copy_nonoverlapping(
                             planes.as_ptr(),
                             res.plane_id_ptr as *mut u32,
-                            planes.len(),
+                            fill,
                         );
                     }
                 }
@@ -3745,6 +3778,9 @@ const DRM_MODE_OBJECT_FB: u32 = 0xfbfb_fbfb;
 // DRM client capabilities (DRM_IOCTL_SET_CLIENT_CAP).
 const DRM_CLIENT_CAP_STEREO_3D: u64 = 1;
 const DRM_CLIENT_CAP_UNIVERSAL_PLANES: u64 = 2;
+/// `DRM_PLANE_TYPE_OVERLAY`: the only plane type `drm_mode_getplane_res` lists
+/// to a client without `DRM_CLIENT_CAP_UNIVERSAL_PLANES`.
+const DRM_PLANE_TYPE_OVERLAY: u32 = 0;
 const DRM_CLIENT_CAP_ATOMIC: u64 = 3;
 const DRM_CLIENT_CAP_ASPECT_RATIO: u64 = 4;
 const DRM_CLIENT_CAP_WRITEBACK_CONNECTORS: u64 = 5;
@@ -7615,7 +7651,11 @@ mod kms_scanout_tests {
             "a physical size of 0 is an infinite DPI to every client that divides by it"
         );
 
-        // One primary plane on that CRTC.
+        // One primary plane on that CRTC -- to a client that asked for
+        // universal planes, as every compositor does.
+        let mut cap: [u64; 2] = [DRM_CLIENT_CAP_UNIVERSAL_PLANES, 1];
+        c.ioctl(DRM_IOCTL_SET_CLIENT_CAP, &mut cap)
+            .expect("SET_CLIENT_CAP UNIVERSAL_PLANES");
         let mut planes = [0u32; 1];
         let mut plane_res = DrmModeGetPlaneRes {
             plane_id_ptr: planes.as_mut_ptr() as u64,
@@ -11245,6 +11285,13 @@ mod hw_kms_tests {
         (crtcs, conns)
     }
 
+    /// `DRM_CLIENT_CAP_UNIVERSAL_PLANES` on or off for this client.
+    fn universal_planes(c: &Client, on: bool) {
+        let mut cap: [u64; 2] = [DRM_CLIENT_CAP_UNIVERSAL_PLANES, on as u64];
+        c.ioctl(DRM_IOCTL_SET_CLIENT_CAP, &mut cap)
+            .expect("SET_CLIENT_CAP UNIVERSAL_PLANES");
+    }
+
     fn planes(c: &Client) -> Vec<u32> {
         let mut probe = DrmModeGetPlaneRes {
             plane_id_ptr: 0,
@@ -11413,11 +11460,75 @@ mod hw_kms_tests {
         let _virtio = screen.attach_gpu(EmuGpu::new("emu-virtio").with_ids(50, 51, 52));
         let _nvidia = screen.attach_gpu(EmuGpu::hardware_kms("emu-gpu").with_ids(60, 61, 62));
         let c = Client::open(0);
+        universal_planes(&c, true);
 
         let (crtcs, conns) = topology(&c);
         assert_eq!(crtcs, alloc::vec![60], "the non-KMS CRTC was exposed too");
         assert_eq!(conns, alloc::vec![61]);
         assert_eq!(planes(&c), alloc::vec![62]);
+    }
+
+    /// `drm_mode_getplane_res` lists only overlay planes until the client
+    /// sets `DRM_CLIENT_CAP_UNIVERSAL_PLANES` (or ATOMIC, which implies it):
+    /// a legacy client was written when the primary and the cursor were not
+    /// planes, and would drive the scanout plane as an overlay. The cap was
+    /// accepted and forgotten, and the list was the same for everyone. The
+    /// flag is per open file, and the list is filled as far as the caller's
+    /// buffer goes, with the full count reported.
+    #[test]
+    fn only_a_client_that_asked_for_universal_planes_is_told_about_the_primaries() {
+        let screen = kms_emu::attach(64, 16);
+        let _first = screen.attach_gpu(EmuGpu::hardware_kms("emu-gpu-0").with_ids(60, 61, 62));
+        let _second = screen.attach_gpu(EmuGpu::hardware_kms("emu-gpu-1").with_ids(70, 71, 72));
+        let c = Client::open(0);
+
+        assert_eq!(
+            planes(&c),
+            Vec::<u32>::new(),
+            "a legacy client was handed a primary plane"
+        );
+        universal_planes(&c, true);
+        let mut all = planes(&c);
+        all.sort_unstable();
+        assert_eq!(all, alloc::vec![62, 72]);
+        universal_planes(&c, false);
+        assert_eq!(planes(&c), Vec::<u32>::new(), "the cap can be taken back");
+
+        // Per file: what one client asked for does not change another's list.
+        universal_planes(&c, true);
+        let legacy = Client::open(0);
+        assert_eq!(planes(&legacy), Vec::<u32>::new());
+
+        // Room for one of the two: that one is filled, and the count says two.
+        let mut one = [0u32; 1];
+        let mut fill = DrmModeGetPlaneRes {
+            plane_id_ptr: one.as_mut_ptr() as u64,
+            count_planes: 1,
+        };
+        c.ioctl(DRM_IOCTL_MODE_GETPLANERESOURCES, &mut fill)
+            .expect("GETPLANERESOURCES with room for one");
+        assert_eq!(fill.count_planes, 2);
+        assert!(
+            all.contains(&one[0]),
+            "the slot the caller had was left empty"
+        );
+    }
+
+    /// `drm_setclientcap` stores the ATOMIC value in `universal_planes` too:
+    /// an atomic client sees the primary plane without asking for universal
+    /// planes by name, and giving atomic back takes the planes with it.
+    #[test]
+    fn atomic_carries_universal_planes_with_it() {
+        let (_screen, c) = super::out_fence_tests::atomic_client(64, 16);
+        assert_eq!(planes(&c), alloc::vec![drm::SYNTH_PLANE_ID]);
+        let mut cap: [u64; 2] = [DRM_CLIENT_CAP_ATOMIC, 0];
+        c.ioctl(DRM_IOCTL_SET_CLIENT_CAP, &mut cap)
+            .expect("SET_CLIENT_CAP ATOMIC off");
+        assert_eq!(
+            planes(&c),
+            Vec::<u32>::new(),
+            "atomic off, planes still listed"
+        );
     }
 
     /// Two GPUs of the same model return the SAME synthetic ids, and a topology
@@ -16338,8 +16449,15 @@ mod wsi_display_probe_tests {
         }
     }
 
-    /// `drmModeGetPlaneResources`, both passes.
+    /// `drmModeGetPlaneResources`, both passes, after the one call every
+    /// plane-aware client makes first: `drm_mode_getplane_res` lists only
+    /// overlays to a file without `DRM_CLIENT_CAP_UNIVERSAL_PLANES`, and every
+    /// plane here is a primary, so without the cap the list is empty for
+    /// everyone, as on Linux.
     fn drm_mode_get_plane_resources(c: &Client) -> Vec<u32> {
+        let mut cap: [u64; 2] = [DRM_CLIENT_CAP_UNIVERSAL_PLANES, 1];
+        c.ioctl(DRM_IOCTL_SET_CLIENT_CAP, &mut cap)
+            .expect("SET_CLIENT_CAP UNIVERSAL_PLANES");
         let mut probe = DrmModeGetPlaneRes {
             plane_id_ptr: 0,
             count_planes: 0,
