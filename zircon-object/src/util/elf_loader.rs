@@ -1266,9 +1266,9 @@ mod tests {
     const SHT_STRTAB: u32 = 3;
     const SHT_NOBITS_U32: u32 = 8;
 
-    /// Room for every image built here; the largest is a header, two program
-    /// headers, three sections and a short interpreter path.
-    const IMAGE_CAP: usize = 512;
+    /// Room for every image built here; the largest is a header, five
+    /// section headers and the three tables the dynamic-linking tests read.
+    const IMAGE_CAP: usize = 1024;
 
     /// The backing store of a synthetic image.
     ///
@@ -1418,6 +1418,25 @@ mod tests {
             self.put32(at + 4, ty);
             self.put64(at + 24, offset);
             self.put64(at + 32, size);
+        }
+
+        /// One 64-bit `Elf64_Sym` at file offset `at`: a name's offset into a
+        /// string table, the section the symbol belongs to, and its value.
+        /// Section zero is an undefined symbol.
+        fn symbol(&mut self, at: usize, name: u32, shndx: u16, value: u64) {
+            self.put32(at, name);
+            self.put8(at + 4, 0x12); // STB_GLOBAL | STT_FUNC
+            self.put16(at + 6, shndx);
+            self.put64(at + 8, value);
+        }
+
+        /// One 64-bit `Elf64_Rela` at file offset `at`. `r_info` carries the
+        /// symbol index in its upper half and the relocation type in its
+        /// lower one.
+        fn relocation(&mut self, at: usize, offset: u64, sym: u32, ty: u32, addend: i64) {
+            self.put64(at, offset);
+            self.put64(at + 8, (u64::from(sym) << 32) | u64::from(ty));
+            self.put64(at + 16, addend as u64);
         }
 
         /// How many bytes of the image the loader is shown.
@@ -2201,5 +2220,499 @@ mod tests {
         let elf = parse_checked_elf(img.bytes()).unwrap();
         let vmar = VmAddressRegion::new_root();
         assert!(vmar.load_from_elf(&elf).is_err());
+    }
+
+    // ---- the dynamic-linking half ------------------------------------------
+    //
+    // Everything above is about the bounds of an image. These are about what
+    // `relocate` and its helpers do with one that passed them: the path every
+    // dynamically linked program takes, because the loader relocates the ELF
+    // interpreter itself.
+
+    /// `SHT_SYMTAB`, `SHT_RELA` and `SHT_DYNSYM`: the three section types the
+    /// relocation half asks the parser for by name.
+    const SHT_SYMTAB: u32 = 2;
+    const SHT_RELA: u32 = 4;
+    const SHT_DYNSYM: u32 = 11;
+
+    /// Relocation types, as `relocate` spells them. The first three write
+    /// `S + A`, the fourth `B + A`, and the last is one no arm names.
+    const R_X86_64_64: u32 = 1;
+    const R_X86_64_GLOB_DAT: u32 = 6;
+    const R_X86_64_JUMP_SLOT: u32 = 7;
+    const R_X86_64_RELATIVE: u32 = 8;
+    const R_X86_64_TPOFF64: u32 = 18;
+
+    /// One entry of a 64-bit symbol or relocation table.
+    const ENTRY: usize = 24;
+
+    /// Where the pieces of a relocation image sit. Every one is a multiple of
+    /// eight, because `section_data` refuses a symbol or relocation table the
+    /// file put at an odd address -- and [`Buffer`] is aligned to eight so
+    /// that these offsets are the only thing deciding it.
+    const SH_TABLE: usize = 64;
+    const NAMES_AT: usize = 384;
+    const STRINGS_AT: usize = 456;
+    const SYMBOLS_AT: usize = 472;
+
+    /// The section-name table of every image built here: one entry per name
+    /// the loader looks for, so one table serves every test.
+    const NAMES: &[u8] = b"\0.shstrtab\0.dynstr\0.dynsym\0.rela.dyn\0.rela.plt\0.strtab\0.symtab\0";
+    /// The string table the symbols below are named out of. Both names are
+    /// terminated: `str_at` has no name for a table that does not terminate,
+    /// which is the panicking read it stands in for.
+    const STRINGS: &[u8] = b"\0one\0two\0";
+    const N_SHSTRTAB: u32 = 1;
+    const N_DYNSTR: u32 = 11;
+    const N_DYNSYM: u32 = 19;
+    const N_RELA_DYN: u32 = 27;
+    const N_RELA_PLT: u32 = 37;
+    const N_STRTAB: u32 = 47;
+    const N_SYMTAB: u32 = 55;
+
+    /// One symbol: its name's offset in the string table, its section index,
+    /// its value. A section index of zero is an undefined symbol.
+    type Sym = (u32, u16, u64);
+    /// One relocation: where it writes, which symbol it names, its type, its
+    /// addend.
+    type Rela = (u64, u32, u32, i64);
+
+    /// An image carrying a string table, a symbol table and one relocation
+    /// section: all `relocate` reads.
+    ///
+    /// `sym_name` and `rela_name` pick which names the two tables go under, so
+    /// one builder makes a `.dynsym`/`.rela.dyn` image, a `.rela.plt` one, and
+    /// the `.strtab`/`.symtab` pair `get_symbol_address` reads instead. The
+    /// two `*_type` arguments are the `sh_type` the file claims, which is what
+    /// `section_data` checks its answer against.
+    #[allow(clippy::too_many_arguments)]
+    fn tables_image(
+        str_name: u32,
+        sym_name: u32,
+        sym_type: u32,
+        syms: &[Sym],
+        rela_name: u32,
+        rela_type: u32,
+        relas: &[Rela],
+    ) -> Image {
+        let mut img = Image::elf64();
+        img.shoff(SH_TABLE as u64);
+        img.shnum(5);
+        img.shstrndx(1);
+        let rela_at = SYMBOLS_AT + syms.len() * ENTRY;
+        img.section_header(SH_TABLE, 0, 0, 0, 0); // SHT_NULL
+        img.section_header(
+            SH_TABLE + 64,
+            N_SHSTRTAB,
+            SHT_STRTAB,
+            NAMES_AT as u64,
+            NAMES.len() as u64,
+        );
+        img.section_header(
+            SH_TABLE + 128,
+            str_name,
+            SHT_STRTAB,
+            STRINGS_AT as u64,
+            STRINGS.len() as u64,
+        );
+        img.section_header(
+            SH_TABLE + 192,
+            sym_name,
+            sym_type,
+            SYMBOLS_AT as u64,
+            (syms.len() * ENTRY) as u64,
+        );
+        img.section_header(
+            SH_TABLE + 256,
+            rela_name,
+            rela_type,
+            rela_at as u64,
+            (relas.len() * ENTRY) as u64,
+        );
+        img.put(NAMES_AT, NAMES);
+        img.put(STRINGS_AT, STRINGS);
+        for (i, &(name, shndx, value)) in syms.iter().enumerate() {
+            img.symbol(SYMBOLS_AT + i * ENTRY, name, shndx, value);
+        }
+        for (i, &(offset, sym, ty, addend)) in relas.iter().enumerate() {
+            img.relocation(rela_at + i * ENTRY, offset, sym, ty, addend);
+        }
+        img.shown(rela_at + relas.len() * ENTRY);
+        img
+    }
+
+    /// The common case: a `.dynsym` and a `.rela.dyn`, both of the type they
+    /// claim to be.
+    fn reloc_image(syms: &[Sym], relas: &[Rela]) -> Image {
+        tables_image(
+            N_DYNSTR, N_DYNSYM, SHT_DYNSYM, syms, N_RELA_DYN, SHT_RELA, relas,
+        )
+    }
+
+    /// A root address space with one writable page at its own start, which is
+    /// where the relocations below write: every `r_offset` here is an offset
+    /// into that page.
+    fn vmar_with_a_page() -> Arc<VmAddressRegion> {
+        let vmar = VmAddressRegion::new_root();
+        vmar.map_at(
+            0,
+            VmObject::new_paged(1),
+            0,
+            PAGE_SIZE,
+            MMUFlags::READ | MMUFlags::WRITE | MMUFlags::USER,
+        )
+        .expect("the page the relocations write to could not be mapped");
+        vmar
+    }
+
+    /// The word at `offset` into that page.
+    fn word_at(vmar: &Arc<VmAddressRegion>, offset: usize) -> usize {
+        let mut bytes = [0u8; core::mem::size_of::<usize>()];
+        vmar.read_memory(vmar.addr() + offset, &mut bytes)
+            .expect("the page the relocation wrote to could not be read");
+        usize::from_ne_bytes(bytes)
+    }
+
+    #[test]
+    fn a_symbol_relocation_writes_the_symbol_s_address_plus_its_addend() {
+        // `S + A`: three symbols, so the index is read rather than assumed,
+        // and an odd number of them -- a table of 24-byte entries divides by
+        // 16 as well whenever the count is even.
+        let img = reloc_image(
+            &[(1, 1, 0x10), (1, 1, 0x40), (5, 1, 0x80)],
+            &[(0x18, 1, R_X86_64_GLOB_DAT, 0x08)],
+        );
+        let elf = parse_checked_elf(img.bytes()).unwrap();
+        let vmar = vmar_with_a_page();
+
+        elf.relocate(vmar.clone(), &vmar).unwrap();
+
+        assert_eq!(word_at(&vmar, 0x18), vmar.addr() + 0x40 + 0x08);
+    }
+
+    #[test]
+    fn a_base_relative_relocation_writes_the_base_plus_the_addend() {
+        // `B + A`, which names no symbol: a `.dynsym` need not even be there.
+        let img = reloc_image(&[], &[(0x20, 0, R_X86_64_RELATIVE, 0x100)]);
+        let elf = parse_checked_elf(img.bytes()).unwrap();
+        let vmar = vmar_with_a_page();
+
+        elf.relocate(vmar.clone(), &vmar).unwrap();
+
+        assert_eq!(word_at(&vmar, 0x20), vmar.addr() + 0x100);
+    }
+
+    #[test]
+    fn a_relocation_writes_a_whole_word_and_not_half_of_one() {
+        // The value is an address in the process's own address space, so its
+        // upper half is the half that says which process. A four-byte write
+        // leaves the other four as they were.
+        let img = reloc_image(&[], &[(0x28, 0, R_X86_64_RELATIVE, 0)]);
+        let elf = parse_checked_elf(img.bytes()).unwrap();
+        let vmar = vmar_with_a_page();
+        assert!(
+            vmar.addr() >> 32 != 0,
+            "this test needs a base whose upper half is not zero: {:#x}",
+            vmar.addr()
+        );
+
+        elf.relocate(vmar.clone(), &vmar).unwrap();
+
+        assert_eq!(word_at(&vmar, 0x28), vmar.addr());
+    }
+
+    #[test]
+    fn the_relocations_of_the_procedure_linkage_table_are_applied_too() {
+        // `.rela.plt` holds the JUMP_SLOT entries that back the PLT. Reading
+        // only `.rela.dyn` leaves every call going through an unrelocated
+        // stub, which lands on a low address and faults with Invalid Opcode.
+        let img = tables_image(
+            N_DYNSTR,
+            N_DYNSYM,
+            SHT_DYNSYM,
+            &[(1, 1, 0x60)],
+            N_RELA_PLT,
+            SHT_RELA,
+            &[(0x30, 0, R_X86_64_JUMP_SLOT, 0)],
+        );
+        let elf = parse_checked_elf(img.bytes()).unwrap();
+        let vmar = vmar_with_a_page();
+
+        elf.relocate(vmar.clone(), &vmar).unwrap();
+
+        assert_eq!(word_at(&vmar, 0x30), vmar.addr() + 0x60);
+    }
+
+    #[test]
+    fn a_symbol_index_outside_the_symbol_table_is_skipped() {
+        // The index is a `u32` the file chose, and indexing the slice with it
+        // panicked the kernel on any entry naming a symbol past the end.
+        let img = reloc_image(&[(1, 1, 0x40)], &[(0x18, 7, R_X86_64_JUMP_SLOT, 0)]);
+        let elf = parse_checked_elf(img.bytes()).unwrap();
+        let vmar = vmar_with_a_page();
+
+        elf.relocate(vmar.clone(), &vmar).unwrap();
+
+        assert_eq!(
+            word_at(&vmar, 0x18),
+            0,
+            "a relocation naming a symbol that is not there still wrote"
+        );
+    }
+
+    #[test]
+    fn an_undefined_symbol_is_left_to_the_dynamic_linker_in_user_space() {
+        // `shndx == 0` is a symbol this loader has no address for. Writing
+        // one would put the image's own base where a real address belongs.
+        let img = reloc_image(&[(1, 0, 0x40)], &[(0x18, 0, R_X86_64_64, 0x08)]);
+        let elf = parse_checked_elf(img.bytes()).unwrap();
+        let vmar = vmar_with_a_page();
+
+        elf.relocate(vmar.clone(), &vmar).unwrap();
+
+        assert_eq!(word_at(&vmar, 0x18), 0, "an undefined symbol was resolved");
+    }
+
+    #[test]
+    fn a_relocation_type_no_arm_names_is_skipped_rather_than_unimplemented() {
+        // A TLS relocation, which this loader does not apply. It used to be
+        // an `unimplemented!()`, so one user program took the kernel down.
+        let img = reloc_image(&[(1, 1, 0x40)], &[(0x18, 0, R_X86_64_TPOFF64, 0)]);
+        let elf = parse_checked_elf(img.bytes()).unwrap();
+        let vmar = vmar_with_a_page();
+
+        elf.relocate(vmar.clone(), &vmar).unwrap();
+
+        assert_eq!(word_at(&vmar, 0x18), 0);
+    }
+
+    #[test]
+    fn a_relocation_whose_target_is_outside_the_address_space_is_refused() {
+        // `base + r_offset` was an unchecked add reached once per entry. In
+        // debug that panicked from `execve`; in release it wrapped, and the
+        // wrapped address could land inside another mapping of the same
+        // process, so the relocation wrote a word where it was never meant to.
+        let img = reloc_image(&[], &[(u64::MAX - 0x10, 0, R_X86_64_RELATIVE, 0)]);
+        let elf = parse_checked_elf(img.bytes()).unwrap();
+        let vmar = vmar_with_a_page();
+
+        assert_eq!(
+            elf.relocate(vmar.clone(), &vmar),
+            Err("relocation target outside the address space")
+        );
+    }
+
+    #[test]
+    fn a_relocation_that_straddles_the_end_of_its_mapping_writes_what_fits() {
+        // The one-entry mapping cache answers "not mine" for a write that
+        // starts inside a mapping and ends outside it, and the clamped write
+        // through the whole address space is what is left to do it.
+        let img = reloc_image(&[], &[((PAGE_SIZE - 4) as u64, 0, R_X86_64_RELATIVE, 0x11)]);
+        let elf = parse_checked_elf(img.bytes()).unwrap();
+        let vmar = vmar_with_a_page();
+
+        elf.relocate(vmar.clone(), &vmar).unwrap();
+
+        let mut tail = [0u8; 4];
+        vmar.read_memory(vmar.addr() + PAGE_SIZE - 4, &mut tail)
+            .unwrap();
+        let want = (vmar.addr() + 0x11).to_ne_bytes();
+        assert_eq!(&tail, &want[..4], "the part that fits was not written");
+    }
+
+    #[test]
+    fn an_image_with_no_relocation_section_is_refused() {
+        // Both names, not just the first: the caller takes an error here as
+        // "nothing to relocate".
+        let img = three_sections();
+        let elf = parse_checked_elf(img.bytes()).unwrap();
+        let vmar = vmar_with_a_page();
+
+        assert_eq!(
+            elf.relocate(vmar.clone(), &vmar),
+            Err(".rela.dyn not found")
+        );
+    }
+
+    #[test]
+    fn a_relocation_section_whose_bytes_do_not_divide_into_entries_is_refused() {
+        // 24 bytes per entry. `zero::read_array` ASSERTS that the section
+        // divides exactly, so a section one entry short of whole panicked the
+        // kernel -- and 32 bytes divides by eight, which is the alignment,
+        // and by nothing else that matters.
+        let mut img = reloc_image(&[], &[(0x20, 0, R_X86_64_RELATIVE, 0x100)]);
+        img.section_header(SH_TABLE + 256, N_RELA_DYN, SHT_RELA, SYMBOLS_AT as u64, 32);
+        img.shown(SYMBOLS_AT + 32);
+        let elf = parse_checked_elf(img.bytes()).unwrap();
+        let vmar = vmar_with_a_page();
+
+        assert_eq!(
+            elf.relocate(vmar.clone(), &vmar),
+            Err("corrupted relocation section")
+        );
+    }
+
+    #[test]
+    fn a_relocation_section_the_file_put_at_an_odd_address_is_refused() {
+        // `slice::from_raw_parts` on a misaligned address is undefined
+        // behaviour however whole the entries are, and the debug build's
+        // check for it does not unwind: the machine aborts where a kernel
+        // cannot even say what happened.
+        let mut img = reloc_image(&[], &[(0x20, 0, R_X86_64_RELATIVE, 0x100)]);
+        img.section_header(
+            SH_TABLE + 256,
+            N_RELA_DYN,
+            SHT_RELA,
+            (SYMBOLS_AT + 4) as u64,
+            ENTRY as u64,
+        );
+        img.shown(SYMBOLS_AT + 4 + ENTRY);
+        let elf = parse_checked_elf(img.bytes()).unwrap();
+        let vmar = vmar_with_a_page();
+
+        assert_eq!(
+            elf.relocate(vmar.clone(), &vmar),
+            Err("corrupted relocation section")
+        );
+    }
+
+    #[test]
+    fn an_image_with_no_dynamic_symbol_table_has_none() {
+        let img = three_sections();
+        let elf = parse_checked_elf(img.bytes()).unwrap();
+
+        assert_eq!(elf.dynsym().err(), Some(".dynsym not found"));
+    }
+
+    #[test]
+    fn the_dynamic_symbol_table_is_the_section_of_that_name_read_as_symbols() {
+        let img = reloc_image(&[(1, 1, 0x10), (5, 1, 0x40), (1, 2, 0x80)], &[]);
+        let elf = parse_checked_elf(img.bytes()).unwrap();
+
+        let syms = elf.dynsym().expect("the .dynsym of this image is whole");
+
+        assert_eq!(syms.len(), 3);
+        assert_eq!(syms[1].value(), 0x40);
+        assert_eq!(syms[2].shndx(), 2);
+    }
+
+    #[test]
+    fn a_dynamic_symbol_table_of_the_wrong_type_is_corrupted_rather_than_read() {
+        // `sh_type` is what the parser dispatches on, so a `.dynsym` the file
+        // calls a string table is handed back as one -- and asking for it by
+        // name is what keeps the parser from being asked at all.
+        let img = tables_image(
+            N_DYNSTR,
+            N_DYNSYM,
+            SHT_STRTAB,
+            &[(1, 1, 0x40)],
+            N_RELA_DYN,
+            SHT_RELA,
+            &[],
+        );
+        let elf = parse_checked_elf(img.bytes()).unwrap();
+
+        assert_eq!(elf.dynsym().err(), Some("corrupted .dynsym"));
+    }
+
+    #[test]
+    fn a_symbol_is_found_by_its_name_in_the_static_symbol_table() {
+        let img = tables_image(
+            N_STRTAB,
+            N_SYMTAB,
+            SHT_SYMTAB,
+            &[(1, 1, 0x10), (5, 1, 0x40)],
+            N_RELA_DYN,
+            SHT_RELA,
+            &[],
+        );
+        let elf = parse_checked_elf(img.bytes()).unwrap();
+
+        assert_eq!(elf.get_symbol_address("two"), Some(0x40));
+        assert_eq!(elf.get_symbol_address("one"), Some(0x10));
+        assert_eq!(elf.get_symbol_address("three"), None);
+    }
+
+    #[test]
+    fn the_dynamic_symbol_table_is_not_where_a_static_symbol_is_looked_up() {
+        // `.dynsym` and `.symtab` are different sections with the same shape,
+        // and the names they index live in different string tables.
+        let img = reloc_image(&[(1, 1, 0x10)], &[]);
+        let elf = parse_checked_elf(img.bytes()).unwrap();
+
+        assert_eq!(elf.get_symbol_address("one"), None);
+    }
+
+    /// The `p_flags` of the one segment of an image, as page flags.
+    fn segment_flags(pf: u32) -> MMUFlags {
+        let mut img = Image::elf64();
+        img.phoff(64);
+        img.phnum(1);
+        img.program_header(64, PT_LOAD, 0x80, 0x20_0000, (16, 16));
+        img.put32(64 + 4, pf);
+        img.put(0x80, b"0123456789abcdef");
+        img.shown(0x90);
+        let elf = parse_checked_elf(img.bytes()).unwrap();
+        elf.program_iter()
+            .next()
+            .expect("the image has one segment")
+            .flags()
+            .to_mmu_flags()
+    }
+
+    #[test]
+    fn each_segment_permission_becomes_the_page_permission_of_its_own_name() {
+        // `PF_R`, `PF_W` and `PF_X` are bits 2, 1 and 0 of `p_flags`. Giving
+        // a read-only segment execute permission is the difference between a
+        // page fault and running whatever the file put there.
+        assert_eq!(segment_flags(4), MMUFlags::USER | MMUFlags::READ);
+        assert_eq!(segment_flags(2), MMUFlags::USER | MMUFlags::WRITE);
+        assert_eq!(segment_flags(1), MMUFlags::USER | MMUFlags::EXECUTE);
+        assert_eq!(
+            segment_flags(4 | 2),
+            MMUFlags::USER | MMUFlags::READ | MMUFlags::WRITE
+        );
+    }
+
+    #[test]
+    fn every_segment_of_an_image_is_mapped_for_the_process_and_not_the_kernel() {
+        // A segment that asks for nothing still belongs to the process: a
+        // mapping without `USER` is one the program it was loaded for cannot
+        // touch.
+        assert_eq!(segment_flags(0), MMUFlags::USER);
+    }
+
+    #[test]
+    fn an_image_with_no_load_segment_has_no_size() {
+        // The size is what the caller carves the image's VMAR out of, so a
+        // page for an image that maps nothing is address space nothing can
+        // use -- and this is the sum that used to wrap before `pages()`.
+        let img = Image::elf64();
+        let elf = parse_checked_elf(img.bytes()).unwrap();
+
+        assert_eq!(elf.load_segment_size(), 0);
+    }
+
+    #[test]
+    fn a_second_relocation_into_the_same_mapping_goes_through_the_cache() {
+        // `Vmar::write_memory` re-resolves the mapping with a linear scan of
+        // the VMAR on every call, and a PIE binary carries thousands of
+        // entries into one or two mappings, so the first write keeps its
+        // mapping and every later one asks that mapping first. Two entries in
+        // one page is the smallest image that takes the cached path at all.
+        let img = reloc_image(
+            &[],
+            &[
+                (0x40, 0, R_X86_64_RELATIVE, 0x11),
+                (0x48, 0, R_X86_64_RELATIVE, 0x22),
+            ],
+        );
+        let elf = parse_checked_elf(img.bytes()).unwrap();
+        let vmar = vmar_with_a_page();
+
+        elf.relocate(vmar.clone(), &vmar).unwrap();
+
+        assert_eq!(word_at(&vmar, 0x40), vmar.addr() + 0x11);
+        assert_eq!(word_at(&vmar, 0x48), vmar.addr() + 0x22);
     }
 }
