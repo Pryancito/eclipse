@@ -284,7 +284,78 @@ fn report_missing_generator(cpu_id: u8) {
     );
 }
 
+/// A collection whose `future_collections` is no longer the vector `new` built.
+///
+/// `new` pushes exactly `MAX_PRIORITY` entries before the `Arc` is published,
+/// and nothing in the crate ever pushes, pops, truncates or replaces that
+/// vector again -- `no_key_can_name_a_priority_the_collection_does_not_have`
+/// pins the other half, that no key can name an index outside it. So a length
+/// that is not `MAX_PRIORITY` is not a logic error here: the `Vec` header has
+/// been written over, exactly as [`report_missing_generator`] describes for the
+/// generator field beside it.
+///
+/// Indexing it anyway produced
+///
+///   index out of bounds: the len is 0 but the index is 4
+///
+/// on one CPU and `the len is 4 but the index is 4` on another in the same
+/// photograph, which names neither the structure nor the CPU and reads as a
+/// scheduler bug rather than as memory corruption. Say what it is.
+/// The same verdict, for the callers that cannot carry a `None`.
+#[cold]
+#[inline(never)]
+fn overwritten_collection(cpu_id: u8, len: usize, priority: usize) -> ! {
+    if len != MAX_PRIORITY {
+        panic!(
+            "[sched] CORRUPTED TaskCollection on cpu {}: future_collections has \
+             len {} where new() built {} and nothing ever resizes it -- the Vec \
+             header has been overwritten (asked for priority {}). The cpu_id \
+             above is read from the same wrecked struct.",
+            cpu_id, len, MAX_PRIORITY, priority,
+        );
+    }
+    panic!(
+        "[sched] TaskCollection on cpu {}: priority {} is outside the {} queues \
+         the collection has -- a key named a priority this module cannot pack.",
+        cpu_id, priority, MAX_PRIORITY,
+    );
+}
+
+#[cold]
+#[inline(never)]
+fn report_overwritten_collection(cpu_id: u8, len: usize) {
+    static REPORTED: AtomicBool = AtomicBool::new(false);
+    if REPORTED.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    error!(
+        "[sched] CORRUPTED TaskCollection: future_collections has len {} where \
+         new() built {} and nothing ever resizes it -- the Vec header has been \
+         overwritten. The cpu_id field of the same struct reads {}, which is \
+         part of the same wreckage and not to be trusted.",
+        len, MAX_PRIORITY, cpu_id,
+    );
+}
+
 impl TaskCollection {
+    /// The queue for `priority`, or `None` when this collection has been
+    /// overwritten.
+    ///
+    /// Every caller already has to cope with "no queue right now" -- the
+    /// takers park, the load figures are `Option` -- so a corrupted collection
+    /// is reported once by name and then behaves like an empty one, instead of
+    /// taking the machine down from inside the scheduler with locks held, where
+    /// `oops` can never contain it. That is the same trade [`TaskCollection`]
+    /// already makes for a missing generator.
+    fn queue(&self, priority: usize) -> Option<&Mutex<FutureCollection>> {
+        let len = self.future_collections.len();
+        if len != MAX_PRIORITY {
+            report_overwritten_collection(self.cpu_id, len);
+            return None;
+        }
+        self.future_collections.get(priority)
+    }
+
     pub fn new(cpu_id: u8) -> Arc<Self> {
         let mut task_collection = Arc::new(TaskCollection {
             cpu_id,
@@ -326,15 +397,27 @@ impl TaskCollection {
         affinity: Option<Arc<AtomicU64>>,
     ) -> Key {
         debug_assert!(priority == DEFAULT_PRIORITY);
-        let key =
-            crate::diag::diag_lock(&self.future_collections[priority]).insert(future, affinity);
+        let key = self.lock_queue(priority).insert(future, affinity);
         debug_assert!(key < TASK_NUM_PER_PRIORITY);
         self.task_num.fetch_add(1, Ordering::Relaxed);
         key | (priority << PRIORITY_SHIFT)
     }
 
     fn get_mut_inner(&self, priority: usize) -> MutexGuard<'_, FutureCollection> {
-        crate::diag::diag_lock(&self.future_collections[priority])
+        self.lock_queue(priority)
+    }
+
+    /// `queue`, locked, for the paths that have nowhere to put a `None`.
+    ///
+    /// They still get a sentence instead of `index out of bounds: the len is 0
+    /// but the index is 4`, which names neither this structure nor the CPU and
+    /// reads as an off-by-one in the scheduler rather than as the memory
+    /// corruption it is.
+    fn lock_queue(&self, priority: usize) -> MutexGuard<'_, FutureCollection> {
+        match self.queue(priority) {
+            Some(q) => crate::diag::diag_lock(q),
+            None => overwritten_collection(self.cpu_id, self.future_collections.len(), priority),
+        }
     }
 
     pub fn task_num(&self) -> usize {
@@ -439,7 +522,7 @@ impl TaskCollection {
     ///
     /// [`task_num`]: Self::task_num
     pub fn ready_num(&self) -> Option<usize> {
-        let inner = self.future_collections[DEFAULT_PRIORITY].try_lock()?;
+        let inner = self.queue(DEFAULT_PRIORITY)?.try_lock()?;
         Some(
             inner
                 .pages
@@ -467,7 +550,7 @@ impl TaskCollection {
     /// a busy CPU advertise load >= 1, so hogs spread ~evenly. Reads the same
     /// page bits, adds no lock, and touches only the (cold) placement path.
     pub fn placement_load(&self) -> Option<usize> {
-        let inner = self.future_collections[DEFAULT_PRIORITY].try_lock()?;
+        let inner = self.queue(DEFAULT_PRIORITY)?.try_lock()?;
         Some(
             inner
                 .pages
@@ -843,6 +926,55 @@ mod collection_tests {
             waker.mark_borrowed(false);
         }
         keys
+    }
+
+    // ── a collection whose Vec header was written over ─────────────────────
+
+    /// A healthy collection answers for every priority it was built with, and
+    /// for none above them.
+    #[test]
+    fn a_healthy_collection_has_a_queue_for_every_priority_and_no_more() {
+        let tc = TaskCollection::new(0);
+        assert_eq!(tc.future_collections.len(), MAX_PRIORITY);
+        assert!(tc.queue(0).is_some());
+        assert!(tc.queue(DEFAULT_PRIORITY).is_some());
+        assert!(tc.queue(MAX_PRIORITY - 1).is_some());
+        assert!(tc.queue(MAX_PRIORITY).is_none());
+    }
+
+    /// The shape the photograph of 2026-10-04 showed: `future_collections` with
+    /// a length `new` never built, on two CPUs with two different lengths in
+    /// the same crash. Nothing in this crate resizes that vector, so the only
+    /// way to get here is a `Vec` header written over -- and the queue has to
+    /// read as empty rather than as an index panic inside the scheduler, which
+    /// `oops` can never contain because the CPU is holding scheduler locks.
+    #[test]
+    fn a_collection_whose_vec_header_was_overwritten_reads_as_empty() {
+        let mut tc = TaskCollection::new(0);
+        // SAFETY: this `Arc` has no other strong or weak holder in the test.
+        let inner = unsafe { Arc::get_mut_unchecked(&mut tc) };
+        inner.future_collections.truncate(4);
+        assert!(inner.queue(DEFAULT_PRIORITY).is_none());
+        // And the load figures, which the placement and steal paths read off a
+        // peer's collection, skip it instead of taking the machine down.
+        assert_eq!(inner.ready_num(), None);
+        assert_eq!(inner.placement_load(), None);
+        inner.future_collections.clear();
+        assert!(inner.queue(DEFAULT_PRIORITY).is_none());
+        assert_eq!(inner.ready_num(), None);
+    }
+
+    /// The paths with nowhere to put a `None` still say what happened instead
+    /// of `index out of bounds: the len is 0 but the index is 4`, which names
+    /// neither the structure nor the CPU.
+    #[test]
+    #[should_panic(expected = "CORRUPTED TaskCollection on cpu 7")]
+    fn the_panic_that_is_left_names_the_corruption_and_not_an_index() {
+        let mut tc = TaskCollection::new(7);
+        // SAFETY: this `Arc` has no other strong or weak holder in the test.
+        let inner = unsafe { Arc::get_mut_unchecked(&mut tc) };
+        inner.future_collections.clear();
+        let _ = inner.get_mut_inner(DEFAULT_PRIORITY);
     }
 
     // ── what the queue hands out ───────────────────────────────────────────
