@@ -17,6 +17,7 @@ use super::*;
 use alloc::sync::Arc;
 use lock::Mutex;
 use zircon_object::object::*;
+use zircon_object::vm::{page_aligned, roundup_pages};
 
 /// A dma-buf file object.
 pub struct DmaBuf {
@@ -260,9 +261,55 @@ impl FileLike for DmaBuf {
     }
 
     /// mmap of the dma-buf maps the same backing frames (CPU access for the
-    /// software renderer / scanout).
-    fn get_vmo(&self, _offset: usize, _len: usize) -> LxResult<Arc<VmObject>> {
-        Ok(self.vmo.clone())
+    /// software renderer / scanout), from `offset` on and only inside the
+    /// buffer; see [`Self::mmap_window`].
+    ///
+    /// The offset used to be ignored: `mmap(fd, len, offset = 1 page)`
+    /// handed back page 0, so a client mapping the second half of an
+    /// imported buffer read and wrote its first half.
+    fn get_vmo(&self, offset: usize, len: usize) -> LxResult<Arc<VmObject>> {
+        self.mmap_window(offset, len)?;
+        if offset == 0 {
+            return Ok(self.vmo.clone());
+        }
+        // A slice keeps the frames shared and bakes the offset in, which is
+        // what the MAP_PRIVATE path expects (it maps its VMO from 0).
+        self.vmo
+            .create_slice(offset, roundup_pages(len))
+            .map_err(|_| LxError::EINVAL)
+    }
+
+    /// `MAP_SHARED`: every mapper gets the one backing VMO, at `offset`.
+    /// The default of this method dropped the offset on the floor.
+    fn get_vmo_shared(&self, offset: usize, len: usize) -> LxResult<(Arc<VmObject>, usize)> {
+        self.mmap_window(offset, len)?;
+        Ok((self.vmo.clone(), offset))
+    }
+}
+
+impl DmaBuf {
+    /// `dma_buf_mmap_internal`: the window `[offset, offset + len)` has to lie
+    /// inside the buffer, counted in pages (`vm_pgoff + vma_pages(vma) >
+    /// dmabuf->size >> PAGE_SHIFT` is `EINVAL`), and `offset` is a page
+    /// offset. The buffer's size is rounded UP to pages here, where Linux's
+    /// is already page-aligned by the GEM exporter: a dumb buffer's `size` is
+    /// `pitch * height`, and its last partial page is backed and mappable.
+    ///
+    /// Without this a window past the end was silently accepted: `mmap` then
+    /// backed the tail with anonymous zero pages, so a client that mapped too
+    /// much (or at the wrong offset) wrote into memory no other importer
+    /// could see, and never learned it.
+    fn mmap_window(&self, offset: usize, len: usize) -> LxResult<()> {
+        if !page_aligned(offset) {
+            return Err(LxError::EINVAL);
+        }
+        let end = offset
+            .checked_add(roundup_pages(len))
+            .ok_or(LxError::EINVAL)?;
+        if end > roundup_pages(self.size) {
+            return Err(LxError::EINVAL);
+        }
+        Ok(())
     }
 }
 
@@ -398,6 +445,117 @@ mod fops_tests {
         assert_eq!(d.seek(SeekFrom::End(8)), Err(LxError::EINVAL));
         assert_eq!(d.seek(SeekFrom::Start(8)), Err(LxError::EINVAL));
         assert_eq!(d.seek(SeekFrom::Current(8)), Err(LxError::EINVAL));
+    }
+
+    /// `dma_buf_mmap_internal`: the window has to lie inside the buffer, in
+    /// pages, from a page-aligned offset; the exact fit is allowed. A
+    /// dumb buffer's `size` is `pitch * height`, so its last partial page
+    /// counts as mappable. Every window was accepted.
+    #[test]
+    fn a_mapping_window_must_lie_inside_the_buffer() {
+        const PAGE: usize = 4096;
+        let d = DmaBuf::from_prime(1, 0, 3 * PAGE, VmObject::new_paged(3), DRM_RDWR);
+        let shared = |offset, len| d.get_vmo_shared(offset, len).map(|(_, off)| off);
+        assert_eq!(shared(0, 3 * PAGE), Ok(0), "the whole buffer");
+        assert_eq!(
+            shared(2 * PAGE, PAGE),
+            Ok(2 * PAGE),
+            "the last page, exactly"
+        );
+        assert_eq!(shared(PAGE, 1), Ok(PAGE), "a byte of the second page");
+        assert_eq!(
+            shared(0, 3 * PAGE + 1),
+            Err(LxError::EINVAL),
+            "one byte past"
+        );
+        assert_eq!(
+            shared(2 * PAGE, PAGE + 1),
+            Err(LxError::EINVAL),
+            "past from the end"
+        );
+        assert_eq!(
+            shared(3 * PAGE, PAGE),
+            Err(LxError::EINVAL),
+            "starting at the end"
+        );
+        assert_eq!(
+            shared(PAGE + 1, PAGE),
+            Err(LxError::EINVAL),
+            "unaligned offset"
+        );
+        assert_eq!(
+            shared(usize::MAX - PAGE + 1, PAGE),
+            Err(LxError::EINVAL),
+            "an offset whose window wraps around"
+        );
+        for (offset, len) in [(0, 3 * PAGE), (2 * PAGE, PAGE), (PAGE, 1)] {
+            assert!(
+                d.get_vmo(offset, len).is_ok(),
+                "private {:#x}+{:#x}",
+                offset,
+                len
+            );
+        }
+        for (offset, len) in [
+            (0, 3 * PAGE + 1),
+            (2 * PAGE, PAGE + 1),
+            (3 * PAGE, PAGE),
+            (PAGE + 1, PAGE),
+            (usize::MAX - PAGE + 1, PAGE),
+        ] {
+            assert_eq!(
+                d.get_vmo(offset, len).map(|_| ()),
+                Err(LxError::EINVAL),
+                "private {:#x}+{:#x}",
+                offset,
+                len
+            );
+        }
+
+        // pitch * height that is not a page multiple: the partial page maps.
+        let odd = DmaBuf::from_prime(1, 0, PAGE + 1, VmObject::new_paged(2), DRM_RDWR);
+        assert_eq!(odd.get_vmo_shared(PAGE, PAGE).map(|(_, off)| off), Ok(PAGE));
+        assert_eq!(
+            odd.get_vmo_shared(2 * PAGE, PAGE).map(|(_, off)| off),
+            Err(LxError::EINVAL)
+        );
+    }
+
+    /// The offset is honoured: a `MAP_SHARED` window is the one backing VMO
+    /// at that offset, and a `MAP_PRIVATE` one is a slice that starts there,
+    /// so both see the byte the exporter wrote at `offset`. Both used to hand
+    /// back page 0 whatever the offset.
+    #[test]
+    fn the_mapping_starts_at_the_offset_the_client_asked_for() {
+        const PAGE: usize = 4096;
+        let backing = VmObject::new_paged(3);
+        backing.write(PAGE + 8, b"page one").unwrap();
+        let d = DmaBuf::from_prime(1, 0, 3 * PAGE, backing.clone(), DRM_RDWR);
+
+        let (vmo, off) = d.get_vmo_shared(PAGE, PAGE).unwrap();
+        assert!(
+            Arc::ptr_eq(&vmo, &backing),
+            "shared mappers get the one VMO"
+        );
+        let mut got = [0u8; 8];
+        vmo.read(off + 8, &mut got).unwrap();
+        assert_eq!(&got, b"page one");
+
+        // The middle page: a slice of the window, not of the rest of the buffer.
+        let slice = d.get_vmo(PAGE, PAGE).unwrap();
+        assert_eq!(slice.len(), PAGE, "the slice is the window, not the buffer");
+        slice.read(8, &mut got).unwrap();
+        assert_eq!(&got, b"page one");
+        // And it is a view, not a copy: a store through it lands in the buffer.
+        slice.write(0, b"via slice").unwrap();
+        let mut back = [0u8; 9];
+        backing.read(PAGE, &mut back).unwrap();
+        assert_eq!(&back, b"via slice");
+
+        assert!(
+            Arc::ptr_eq(&d.get_vmo(0, PAGE).unwrap(), &backing),
+            "offset 0 is still the buffer itself"
+        );
     }
 
     /// `dma_buf_fops` has no write (nor read): EINVAL, as `vfs_write` answers
