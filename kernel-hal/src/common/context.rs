@@ -190,14 +190,25 @@ pub fn ascii_word(a: u64) -> Option<[u8; 8]> {
 }
 
 /// Every general-purpose register of a faulting frame, read as "which of these
-/// is no longer an address".
+/// could no longer be an address".
 ///
-/// Printed under a `#GP` whose error code names no descriptor. The trap frame
-/// is already dumped above it, and that dump is exactly where this reading gets
-/// lost: sixteen hex numbers in a column, one of which is the whole diagnosis.
-/// Naming the register, saying that it cannot be an address at all, and
-/// decoding its bytes when they are text turns the photograph of a stopped
-/// machine into a bug report.
+/// Printed under a `#GP(0)`, whose error code names no descriptor at all. The
+/// trap frame is already dumped above it, and that dump is exactly where this
+/// reading gets lost: sixteen hex numbers in a column, one of which may be the
+/// whole diagnosis.
+///
+/// What this can and cannot establish is worth being exact about, because a
+/// confident wrong verdict on a crash photograph is worse than none. A register
+/// is untyped: non-canonical bits make it a **candidate** for the faulting
+/// operand, not the proof of one -- a packed counter, a mask or eight bytes of
+/// text match the same test and may never have been dereferenced. The converse
+/// fails too: `base + index*scale + disp` can leave the canonical half from
+/// parts that are each canonical, so an all-canonical frame does not rule a bad
+/// address out. Naming the effective address would mean decoding the faulting
+/// instruction; until something does, these are candidates and are worded as
+/// such. Decoding the bytes when they are text is the part that does carry
+/// weight: a pointer-sized field holding *text* was written over, whether or
+/// not it is the one the CPU rejected.
 pub struct X86NonCanonical<'a> {
     /// `(name, value)` for each register, in the order they should be read.
     pub regs: &'a [(&'static str, u64)],
@@ -213,16 +224,16 @@ impl fmt::Display for X86NonCanonical<'_> {
             found = true;
             write!(
                 f,
-                "[#GP] {name} = {v:#x} is not a canonical address: a memory \
-                 operand through it raises #GP(0) on its own, with no \
-                 descriptor involved",
+                "[#GP] candidate: {name} = {v:#x} is not a canonical address, so \
+                 a memory operand through it would raise #GP(0) on its own",
             )?;
             match ascii_word(*v) {
                 Some(bytes) => writeln!(
                     f,
-                    ", and its bytes are the text {:?} -- so it was not \
-                     computed, it was overwritten by a string copy or read \
-                     from the wrong offset next to one",
+                    ", and its bytes are the text {:?} -- that one is not \
+                     arithmetic gone wrong: a pointer-sized field was written \
+                     over by a string copy, or read from the wrong offset next \
+                     to one",
                     core::str::from_utf8(&bytes).unwrap_or(""),
                 )?,
                 None => f.write_str("\n")?,
@@ -230,9 +241,11 @@ impl fmt::Display for X86NonCanonical<'_> {
         }
         if !found {
             f.write_str(
-                "[#GP] every general-purpose register is still a canonical \
-                 address, so the fault is not a wild pointer: look at an \
-                 unaligned SSE access (movaps/movdqa), a reserved MSR, or the \
+                "[#GP] no general-purpose register is non-canonical on its own. \
+                 That does not rule out a bad address -- base + index*scale + \
+                 disp can leave the canonical half from canonical parts -- but \
+                 it does put the other #GP(0) causes in front: an unaligned SSE \
+                 access (movaps/movdqa), RDMSR/WRMSR of a reserved MSR, or the \
                  selectors a return reloads\n",
             )?;
         }
@@ -240,24 +253,29 @@ impl fmt::Display for X86NonCanonical<'_> {
     }
 }
 
-/// Does `name` belong to one of the byte-moving routines, whose faults are
-/// always about their arguments rather than about themselves?
+/// The System V argument registers of the byte-moving routines, as a hint for
+/// reading the frame above.
 ///
-/// `memcpy` never has a bug; a `#GP` inside it is a caller handing it a source
-/// or destination that stopped being a pointer. Saying which register carries
-/// which argument is the difference between "the crash is in memcpy" -- which
-/// is never true and sends the reader into compiler-builtins -- and "the caller
-/// passed this as the source".
+/// A `#GP` at a RIP inside `memcpy` is usually the caller's source or
+/// destination rather than anything `memcpy` decides, so the useful thing to
+/// print is which register carried which argument -- otherwise the reader goes
+/// looking for a bug in compiler-builtins, where there is not one.
+///
+/// A hint, and worded as one. The symbol alone proves nothing: `#GP(0)` inside
+/// such a routine can also come from an alignment-sensitive instruction of its
+/// own (`movaps` on a 16-byte path), and by the faulting instruction the
+/// argument registers may long since have been reused for something else. It
+/// says where to look first, not what happened.
 pub fn mem_routine_operands(name: &str) -> Option<&'static str> {
     // `compiler_builtins` names them plainly, and the kernel's own copies are
     // `__memcpy`/`copy_user` and friends; match on the stem so a prefix or a
     // suffix does not lose the reading.
     if name.contains("memcpy") || name.contains("memmove") || name.contains("copy_user") {
-        Some("rdi = destination, rsi = source, rdx = length")
+        Some("rdi = destination, rsi = source, rdx = length at entry")
     } else if name.contains("memset") || name.contains("set_bytes") {
-        Some("rdi = destination, rsi = byte, rdx = length")
+        Some("rdi = destination, rsi = byte, rdx = length at entry")
     } else if name.contains("memcmp") || name.contains("bcmp") {
-        Some("rdi and rsi = the two buffers, rdx = length")
+        Some("rdi and rsi = the two buffers, rdx = length at entry")
     } else {
         None
     }
@@ -1032,6 +1050,7 @@ mod tests {
             ("rsi", 0x7464_6977_202c_7874),
         ]);
         assert!(s.contains("rsi"), "{}", s);
+        assert!(s.contains("candidate"), "{}", s);
         assert!(s.contains("not a canonical address"), "{}", s);
         assert!(s.contains("tx, widt"), "{}", s);
         // The destination was a perfectly good stack address: naming it too
@@ -1058,7 +1077,10 @@ mod tests {
         let s = verdict(&[("rdi", 0xffff_ff00_0000_0000), ("rsi", 0x1000)]);
         assert!(s.contains("movaps"), "{}", s);
         assert!(s.contains("MSR"), "{}", s);
-        assert!(!s.contains("not a canonical address"), "{}", s);
+        assert!(!s.contains("candidate"), "{}", s);
+        // And it must not claim the fault was no bad address: a canonical base
+        // and index can still add up to one.
+        assert!(s.contains("does not rule out"), "{}", s);
     }
 
     /// A #GP inside `memcpy` is never `memcpy`'s bug. Naming the operands is

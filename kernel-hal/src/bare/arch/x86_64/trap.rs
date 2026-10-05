@@ -1061,20 +1061,25 @@ pub extern "C" fn trap_handler(tf: &mut TrapFrame) {
             // with it. This arms the same summary for the handler to print
             // once more *after* the backtrace, where nothing follows it.
             crate::kstats::note_exception(vec, tf.error_code, tf.rip as u64);
+            // Only for a #GP whose error code is zero: a non-zero one names the
+            // descriptor the CPU refused, which `X86TrapErrorCode` reads out
+            // below, and such a fault need not involve a memory address at all.
+            // Running a pointer verdict over it would print a confident reading
+            // of registers the fault never touched.
+            //
             // A #GP(0) names no descriptor, so the trap frame above is the only
-            // evidence there is -- and the one thing in it that matters is
-            // which register stopped being an address. Reading sixteen hex
-            // columns off a photograph is what this cost last time, so the
-            // verdict is written out next to the frame instead. Also names the
-            // operands when the faulting RIP is inside a byte-moving routine:
-            // a #GP in `memcpy` is never memcpy's bug, it is the caller's
-            // source or destination, and saying so stops the next reader
-            // walking into compiler-builtins.
+            // evidence there is -- and the register that may have stopped being
+            // an address is the one thing in it worth a sentence. Reading
+            // sixteen hex columns off a photograph is what this cost last time.
+            // Candidates, not a verdict: see `X86NonCanonical`. Also names the
+            // argument registers when the faulting RIP is inside a byte-moving
+            // routine, so the next reader does not go looking for a bug in
+            // compiler-builtins.
             //
             // Built before the `panic!` rather than inside it so it is on the
             // serial log even if formatting the (much longer) panic message is
             // what faults next.
-            if vec == 13 {
+            if vec == 13 && tf.error_code == 0 {
                 let regs = [
                     ("rdi", tf.rdi as u64),
                     ("rsi", tf.rsi as u64),
@@ -1099,8 +1104,9 @@ pub extern "C" fn trap_handler(tf: &mut TrapFrame) {
                 if let Some((sym, _)) = crate::ksyms::lookup(tf.rip as u64) {
                     if let Some(operands) = crate::context::mem_routine_operands(sym) {
                         let line = format_args!(
-                            "[#GP] rip is inside {}, which never faults on its own \
-                             account: the bad pointer came from its caller ({})\n",
+                            "[#GP] hint: rip is inside {}, where the pointers are \
+                             usually the caller's rather than the routine's own \
+                             ({}) -- look there before compiler-builtins\n",
                             sym, operands,
                         );
                         crate::console::serial_write_fmt_spin(line);

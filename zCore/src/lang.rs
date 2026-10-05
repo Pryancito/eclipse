@@ -667,11 +667,28 @@ pub(crate) fn panic_entry(depth: usize, same_cpu: bool) -> PanicEntry {
     }
 }
 
+/// Which CPU is reporting, for the bitmap only.
+///
+/// Resolved from the Local APIC id rather than through `cpu::cpu_id()`, which
+/// reads the GS-backed per-CPU region. A GS that is lying -- a corrupted
+/// publisher, or the `syscall_return` window where the USER gsbase is already
+/// swapped in while CS is still ring 0 -- yields a perfectly valid-looking
+/// logical id belonging to somebody else, which would set a peer's bit and make
+/// this CPU's own re-entry read as a peer panic: the one classification this
+/// guard exists to get right. `kstats::fault_slot` keys its per-CPU fault slots
+/// off the same resolver, for the same reason.
+///
+/// [`lock::NO_CPU`] (255) -- a hardware id that resolves to no registered CPU --
+/// deliberately falls outside the bitmap rather than folding onto the boot CPU.
+fn panicking_cpu() -> usize {
+    lock::current_cpu_id_via_apic() as usize
+}
+
 /// Mark this CPU as reporting and say whether it already was.
 ///
 /// A cpu id the bitmap cannot hold is never treated as "already panicking":
-/// `cpu_id()` reads GS, and a GS that is lying is exactly the fault some of
-/// these panics are about. Answering "no" there costs at most one extra line.
+/// answering "no" there costs at most one extra line, while answering "yes"
+/// would silence a report.
 #[cfg(not(test))]
 fn mark_panicking(cpu: usize) -> bool {
     use core::sync::atomic::Ordering;
@@ -680,6 +697,32 @@ fn mark_panicking(cpu: usize) -> bool {
     }
     let bit = 1u64 << cpu;
     PANICKING_CPUS.fetch_or(bit, Ordering::SeqCst) & bit != 0
+}
+
+/// Release the guard, for the one caller that may legitimately leave the
+/// handler running: [`crate::oops::try_contain`], at the point where it has
+/// committed to abandoning the coroutine and will not return.
+///
+/// The reset cannot happen *before* that handoff. Clearing the depth while this
+/// CPU's bit is still set makes the next `fetch_add` answer 0, so a fault
+/// inside containment reads as `Report` and runs the whole banner and backtrace
+/// again, over the report the guard exists to keep. Clearing both, at the point
+/// after which nothing of this panic runs, is the only moment that is neither
+/// too early nor never.
+///
+/// A containment that *declines* returns into the halt below and needs no
+/// reset: that CPU is not coming back.
+pub(crate) fn release_panic_guard() {
+    use core::sync::atomic::Ordering;
+    // Resolved the same way `mark_panicking` set it. Taking the caller's own
+    // notion of which CPU it is would risk clearing a peer's bit: `try_contain`
+    // keys its own guard off `cpu::cpu_id()`, and the whole reason this bitmap
+    // uses the APIC resolver is that the two can disagree.
+    let cpu = panicking_cpu();
+    if cpu < 64 {
+        PANICKING_CPUS.fetch_and(!(1u64 << cpu), Ordering::SeqCst);
+    }
+    PANIC_DEPTH.store(0, Ordering::SeqCst);
 }
 
 /// Stop this CPU for good. The halt tail of the panic handler, shared with the
@@ -706,7 +749,8 @@ fn panic(info: &PanicInfo) -> ! {
 
     // Before anything that could fault: is somebody already reporting, and is
     // it this CPU? See [`PANIC_DEPTH`].
-    let same_cpu = mark_panicking(kernel_hal::cpu::cpu_id() as usize);
+    let reporting_cpu = panicking_cpu();
+    let same_cpu = mark_panicking(reporting_cpu);
     let entry = panic_entry(
         PANIC_DEPTH.fetch_add(1, core::sync::atomic::Ordering::SeqCst),
         same_cpu,
@@ -947,10 +991,10 @@ fn panic(info: &PanicInfo) -> ! {
     // if it succeeds; if it returns it has already said why it could not, and
     // we halt as always. Not attempted under `baremetal-test`, where a panic
     // *must* end the machine so the test fails.
-    // The report is out, so nothing below it is worth suppressing a later
-    // panic for -- and containment does not return when it works. See
-    // [`PANIC_DEPTH`].
-    PANIC_DEPTH.store(0, core::sync::atomic::Ordering::SeqCst);
+    // No reset here: see [`release_panic_guard`]. `try_contain` clears the
+    // guard itself, at the point where it has committed to abandoning the
+    // coroutine and will not return, so a fault *inside* containment is still
+    // caught as the re-entry it is.
     if !cfg!(feature = "baremetal-test") {
         crate::oops::try_contain("kernel panic", Some(prev_kd));
     }
@@ -1081,28 +1125,46 @@ mod tests {
         assert!(PANIC_REPORT_LIMIT >= 20, "{}", PANIC_REPORT_LIMIT);
     }
 
-    /// Containment does not return when it works, so the counter has to be
-    /// cleared before it: a fault the kernel survived must not reduce the next
-    /// genuine panic -- about something else entirely -- to one line.
+    /// Why the depth may not be cleared on its own, which is the trap the
+    /// first version of this guard fell into: with this CPU's bit still set, a
+    /// cleared depth makes the very next entry read `Report`. A fault inside
+    /// containment would then run the whole banner and backtrace again, over
+    /// the report the guard exists to keep.
     #[test]
-    fn a_contained_fault_leaves_the_counter_disarmed() {
-        use core::sync::atomic::Ordering;
-        let saved = PANIC_DEPTH.load(Ordering::SeqCst);
-        PANIC_DEPTH.store(3, Ordering::SeqCst);
-        PANIC_DEPTH.store(0, Ordering::SeqCst);
-        assert_eq!(
-            panic_entry(PANIC_DEPTH.fetch_add(1, Ordering::SeqCst), false),
-            PanicEntry::Report
-        );
-        PANIC_DEPTH.store(saved, Ordering::SeqCst);
+    fn clearing_the_depth_alone_would_hand_a_re_entry_the_full_report() {
+        assert_eq!(panic_entry(0, true), PanicEntry::Report);
     }
 
-    /// The bitmap is what tells a loop from a pile-up, so it has to hold every
-    /// CPU the kernel will index it with.
+    /// So both are cleared together, and only at the point after which nothing
+    /// of the contained panic runs. A fault the kernel survived must not reduce
+    /// the next genuine panic -- about something else entirely -- to one line.
     #[test]
-    fn the_panicking_bitmap_is_not_written_by_anything_but_the_handler() {
+    fn releasing_the_guard_disarms_the_depth_and_the_bitmap_together() {
         use core::sync::atomic::Ordering;
-        assert_eq!(PANICKING_CPUS.load(Ordering::SeqCst), 0);
+        let (saved_d, saved_c) = (
+            PANIC_DEPTH.load(Ordering::SeqCst),
+            PANICKING_CPUS.load(Ordering::SeqCst),
+        );
+        PANIC_DEPTH.store(3, Ordering::SeqCst);
+        PANICKING_CPUS.store(1 << panicking_cpu(), Ordering::SeqCst);
+        release_panic_guard();
+        assert_eq!(PANIC_DEPTH.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            PANICKING_CPUS.load(Ordering::SeqCst) & (1 << panicking_cpu()),
+            0,
+            "the bit outlived the depth, which is the trap above"
+        );
+        PANIC_DEPTH.store(saved_d, Ordering::SeqCst);
+        PANICKING_CPUS.store(saved_c, Ordering::SeqCst);
+    }
+
+    /// The bitmap is keyed off the APIC-backed resolver, not GS, so that a
+    /// publisher that is lying about which CPU this is cannot set a peer's bit
+    /// and turn a same-CPU re-entry into a "peer panic". It must land inside
+    /// the bitmap for a CPU the kernel actually runs on.
+    #[test]
+    fn the_reporting_cpu_is_one_the_bitmap_can_hold() {
+        assert!(panicking_cpu() < 64 || panicking_cpu() == lock::cpuid::NO_CPU as usize);
     }
 
     // ── The banner buffer ───────────────────────────────────────────────────
