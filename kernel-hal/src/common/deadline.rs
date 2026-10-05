@@ -199,6 +199,42 @@ pub fn counts_per_tick(hz: u64, ticks_per_sec: u64) -> u32 {
     (hz / ticks_per_sec).clamp(1, u32::MAX as u64) as u32
 }
 
+/// Which *other* CPU's timer heap, if any, has fallen so far behind that the
+/// CPU taking its own tick should drain it on the owner's behalf.
+///
+/// Timer heaps are per-CPU — the CPU that armed a timer is the one whose
+/// LAPIC is programmed for it and the one that runs its callback, which is
+/// what keeps one program's timers from waking every core (Linux keeps a
+/// `timer_base` per CPU for the same reason). The cost of that split is that
+/// a heap whose owner stops taking ticks would hold its callbacks for ever:
+/// an AP that never came online but whose id was briefly current, a core
+/// parked in a long interrupts-off stretch, an architecture that only arms
+/// the boot CPU's timer.
+///
+/// So every ticking CPU adopts a deadline that is overdue by more than
+/// `lag_ns`. `next` is the published earliest deadline per CPU, indexed by
+/// dense logical id, with [`NO_DEADLINE`] where nothing is pending; `me` is
+/// the caller, which drains its own heap through the normal path and is
+/// skipped here. The answer is the *most* overdue one, so a run of late heaps
+/// is cleared oldest-first, one per tick.
+///
+/// `lag_ns` has to be more than one scheduler tick or a CPU would steal
+/// timers its owner was about to serve itself, turning the per-CPU split back
+/// into the all-CPUs-wake-for-every-timer it exists to undo.
+pub fn stray_deadline_cpu(now_ns: u64, me: usize, next: &[u64], lag_ns: u64) -> Option<usize> {
+    let cutoff = now_ns.checked_sub(lag_ns)?;
+    let mut worst: Option<(usize, u64)> = None;
+    for (cpu, &next_ns) in next.iter().enumerate() {
+        if cpu == me || next_ns == NO_DEADLINE || !is_due(cutoff, next_ns) {
+            continue;
+        }
+        if worst.is_none_or(|(_, w)| next_ns < w) {
+            worst = Some((cpu, next_ns));
+        }
+    }
+    worst.map(|(cpu, _)| cpu)
+}
+
 /// A pending timer: its absolute deadline and the callback to run.
 ///
 /// Ordered so the [`BinaryHeap`] (a max-heap) yields the *earliest* deadline
@@ -860,5 +896,74 @@ mod tests {
         assert!(h.drain_expired(Duration::from_millis(9)).is_empty());
         assert_eq!(h.len(), 1);
         assert_eq!(bits.load(Ordering::Relaxed), 0);
+    }
+
+    // ── per-CPU heaps: who adopts a heap whose owner stopped ticking ────────
+
+    /// Two ticks' worth of lag, the spacing the caller uses.
+    const LAG: u64 = 2 * TICK;
+
+    /// The whole point of the per-CPU split: a CPU that keeps its own timers
+    /// on time never looks at anyone else's, so no core is woken for another
+    /// core's deadline.
+    #[test]
+    fn a_machine_whose_cpus_all_keep_up_adopts_nothing() {
+        // CPU 1 is a hair late and CPU 2 is early; neither is past the lag.
+        let next = [NOW + TICK, NOW - TICK, NOW + 10 * MS, NO_DEADLINE];
+        for me in 0..next.len() {
+            assert_eq!(stray_deadline_cpu(NOW, me, &next, LAG), None, "me={me}");
+        }
+    }
+
+    /// A deadline exactly `lag_ns` old is adopted and one nanosecond younger
+    /// is not: the boundary is where an owner stops being given the benefit of
+    /// the doubt.
+    #[test]
+    fn the_lag_is_the_boundary_and_not_an_approximation() {
+        let next = [NO_DEADLINE, NOW - LAG];
+        assert_eq!(stray_deadline_cpu(NOW, 0, &next, LAG), Some(1));
+        let next = [NO_DEADLINE, NOW - LAG + 1];
+        assert_eq!(stray_deadline_cpu(NOW, 0, &next, LAG), None);
+    }
+
+    /// An empty heap is not a late one, however long the machine has been up.
+    #[test]
+    fn a_cpu_with_no_timers_at_all_is_never_adopted() {
+        let next = [NO_DEADLINE; 4];
+        assert_eq!(stray_deadline_cpu(NOW, 0, &next, LAG), None);
+    }
+
+    /// The caller drains its own heap through the normal path, so claiming it
+    /// here would drain it twice -- and on a single-CPU machine every overdue
+    /// timer is its own.
+    #[test]
+    fn a_cpu_never_adopts_its_own_heap() {
+        let next = [NOW - 10 * LAG];
+        assert_eq!(stray_deadline_cpu(NOW, 0, &next, LAG), None);
+        let next = [NOW - 10 * LAG, NOW - LAG];
+        assert_eq!(stray_deadline_cpu(NOW, 0, &next, LAG), Some(1));
+        assert_eq!(stray_deadline_cpu(NOW, 1, &next, LAG), Some(0));
+    }
+
+    /// One per tick, oldest first: a run of stalled heaps drains in the order
+    /// their owners stopped, so the longest-waiting callback is not the last
+    /// one served.
+    #[test]
+    fn the_most_overdue_heap_is_the_one_adopted() {
+        let next = [
+            NO_DEADLINE,
+            NOW - LAG - MS,
+            NOW - 50 * MS,
+            NOW - LAG - 2 * MS,
+        ];
+        assert_eq!(stray_deadline_cpu(NOW, 0, &next, LAG), Some(2));
+    }
+
+    /// Early in the boot `now` is smaller than the lag, and subtracting it
+    /// used to be where a `u64` wrapped into "everything is overdue".
+    #[test]
+    fn the_first_milliseconds_of_a_boot_adopt_nothing() {
+        let next = [NO_DEADLINE, 0];
+        assert_eq!(stray_deadline_cpu(MS, 0, &next, LAG), None);
     }
 }

@@ -818,6 +818,18 @@ pub fn kernel_report() -> String {
             per_tick
         );
     }
+    // Timer heaps are per-CPU, so a core's interrupt rate follows its own
+    // timers instead of the whole machine's -- which is what the `per tick`
+    // figure above says. `adopted` is the safety net for that split and stays
+    // 0 on a healthy machine; anything else names a CPU that stopped ticking.
+    {
+        let (pending, strays) = kernel_hal::kstats::timer_heap_stats();
+        let _ = writeln!(
+            out,
+            "timer heaps:  {} pending across all CPUs, {} adopted",
+            pending, strays
+        );
+    }
     // Tick gaps: the time between consecutive ticks on one busy CPU, which
     // should never exceed the 4 ms period by much. A gap of tens of ms is a
     // CPU that did not run -- under KVM a vCPU the host descheduled, on
