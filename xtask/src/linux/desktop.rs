@@ -944,6 +944,15 @@ fn write_x11_prepare(rootfs: &Path) {
           # Eclipse OS: regenerate the package caches `apk --no-scripts` skipped.\n\
           # Cheap when already present; see write_x11_prepare in xtask.\n\
           LOG=/var/log/eclipse-x11-prepare.log\n\
+          # `ip route | grep -q default` killed `ip` with SIGPIPE on every\n\
+          # probe: `grep -q` exits on the first match and `ip` is still\n\
+          # writing the rest of the table, so the kernel logs a\n\
+          # `[exit] ... killed by signal SIGPIPE` for a check that worked.\n\
+          # Via a file the writer always reaches EOF.\n\
+          have_default_route() {\n\
+          \x20 ip route >/tmp/eclipse-routes 2>/dev/null || return 1\n\
+          \x20 grep -q default /tmp/eclipse-routes\n\
+          }\n\
           {\n\
           echo \"[prepare] start\"\n\
           # D-Bus machine id (dbus refuses to start without one).\n\
@@ -973,12 +982,12 @@ fn write_x11_prepare(rootfs: &Path) {
           # below then correctly reports as \"no network to fetch one\". A\n\
           # desktop wants the network anyway. Bounded retries so an isolated\n\
           # machine costs a few seconds, not a stall.\n\
-          if ! ip route 2>/dev/null | grep -q default; then\n\
+          if ! have_default_route; then\n\
           \x20 if command -v udhcpc >/dev/null 2>&1; then\n\
           \x20   echo '[prepare] no default route; running udhcpc'\n\
           \x20   for i in $(ip -o link show 2>/dev/null | sed 's/^[0-9]*: //; s/[@:].*//' | grep -v '^lo'); do\n\
           \x20     udhcpc -i \"$i\" -n -q -t 3 -T 3 2>&1 | tail -2\n\
-          \x20     ip route 2>/dev/null | grep -q default && break\n\
+          \x20     have_default_route && break\n\
           \x20   done\n\
           \x20 fi\n\
           fi\n\
@@ -991,7 +1000,7 @@ fn write_x11_prepare(rootfs: &Path) {
           if ! ls /usr/lib/gdk-pixbuf-2.0/*/loaders/*svg*.so >/dev/null 2>&1 \\\n\
           \x20  && ! ls -d /usr/libexec/glycin-loaders/*/*svg* >/dev/null 2>&1 \\\n\
           \x20  && ! ls -d /usr/lib/glycin-loaders/*/*svg* >/dev/null 2>&1; then\n\
-          \x20 if command -v apk >/dev/null 2>&1 && ip route 2>/dev/null | grep -q default; then\n\
+          \x20 if command -v apk >/dev/null 2>&1 && have_default_route; then\n\
           \x20   echo '[prepare] no SVG pixbuf loader; fetching librsvg'\n\
           \x20   apk add librsvg adwaita-icon-theme shared-mime-info > /tmp/apk-librsvg.out 2>&1\n\
           \x20   rc=$?\n\
@@ -1004,7 +1013,7 @@ fn write_x11_prepare(rootfs: &Path) {
           \x20   echo \"[eclipse-x11] apk add librsvg rc=$rc: $(tail -1 /tmp/apk-librsvg.out)\" > /dev/console 2>/dev/null\n\
           \x20 else\n\
           \x20   echo '[prepare] no SVG pixbuf loader and no network to fetch one'\n\
-          \x20   echo \"[eclipse-x11] SVG loader missing; apk=$(command -v apk >/dev/null 2>&1 && echo yes || echo no) default-route=$(ip route 2>/dev/null | grep -q default && echo yes || echo no)\" > /dev/console 2>/dev/null\n\
+          \x20   echo \"[eclipse-x11] SVG loader missing; apk=$(command -v apk >/dev/null 2>&1 && echo yes || echo no) default-route=$(have_default_route && echo yes || echo no)\" > /dev/console 2>/dev/null\n\
           \x20 fi\n\
           fi\n\
           # gdk-pixbuf loader cache: every GTK icon/image decode needs it.\n\
@@ -1341,8 +1350,10 @@ fn write_firefox_wrapper(rootfs: &Path) {
           \x20\x20 ! grep -q 'nvidia\\.wlr_pixman' /proc/cmdline 2>/dev/null && \\\n\
           \x20\x20 [ ! -e /run/labwc-renderer-fallback ] && [ -n \"$NVK_ICD\" ] && \\\n\
           \x20\x20 { ! command -v vulkaninfo >/dev/null 2>&1 || \\\n\
-          \x20\x20\x20 VK_DRIVER_FILES=\"$NVK_ICD\" VK_ICD_FILENAMES=\"$NVK_ICD\" \\\n\
-          \x20\x20\x20 vulkaninfo --summary 2>/dev/null | grep -q 'PHYSICAL_DEVICE_TYPE_DISCRETE_GPU\\|PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU'; }; then\n\
+          \x20\x20\x20 { VK_DRIVER_FILES=\"$NVK_ICD\" VK_ICD_FILENAMES=\"$NVK_ICD\" \\\n\
+          \x20\x20\x20\x20 vulkaninfo --summary >/tmp/vulkaninfo.summary 2>/dev/null; \\\n\
+          \x20\x20\x20\x20 grep -q 'PHYSICAL_DEVICE_TYPE_DISCRETE_GPU\\|PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU' \\\n\
+          \x20\x20\x20\x20\x20 /tmp/vulkaninfo.summary; }; }; then\n\
           \x20 export VK_DRIVER_FILES=\"$NVK_ICD\" VK_ICD_FILENAMES=\"$NVK_ICD\"\n\
           \x20 export GALLIUM_DRIVER=\"${GALLIUM_DRIVER:-zink}\"\n\
           \x20 export MESA_LOADER_DRIVER_OVERRIDE=\"${MESA_LOADER_DRIVER_OVERRIDE:-zink}\"\n\
@@ -3008,6 +3019,41 @@ fn write_labwc_wrapper(rootfs: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The desktop's connectivity probe was `ip route | grep -q default`,
+    /// which kills `ip` with `SIGPIPE` the moment grep matches — one
+    /// `[exit] ... killed by signal SIGPIPE` in the dmesg ring per probe, for
+    /// a check that worked. `have_default_route` dumps the table to a file
+    /// first, so `ip` reaches EOF.
+    #[test]
+    fn the_x11_prepare_probes_never_pipe_into_a_reader_that_exits_early() {
+        let dir = std::env::temp_dir().join(format!(
+            "eclipse-x11-prepare-sigpipe-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        write_x11_prepare(&dir);
+        let script = fs::read_to_string(dir.join("usr/local/bin/eclipse-x11-prepare")).unwrap();
+
+        for line in script.lines() {
+            if line.trim_start().starts_with('#') {
+                continue;
+            }
+            assert!(
+                !line.contains('|') || !line.contains("grep -q"),
+                "`{}` pipes into `grep -q`: the writer gets SIGPIPE as soon as \
+                 grep matches, which the kernel logs as a process killed by a \
+                 signal. Redirect to a file and grep the file.",
+                line.trim()
+            );
+        }
+        assert!(
+            script.contains("have_default_route() {"),
+            "the route probe helper is gone from eclipse-x11-prepare:\n{script}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
 
     /// The prefs every profile reads (`defaults/pref/eclipse-os.js`), for
     /// both install dirs. The media and HTTP/3 lines are what make YouTube
