@@ -89,18 +89,44 @@ fn timer_cpu() -> usize {
     }
 }
 
+/// The owned callback [`crate::hal_fn::timer::timer_set`] takes, as the heap
+/// hands it back on expiry.
+type DueCallbacks = alloc::vec::Vec<Box<dyn FnOnce(Duration) + Send + Sync>>;
+
 /// Pop `cpu`'s due callbacks and republish its earliest remaining deadline.
 ///
 /// The lock is dropped before the caller runs anything: a callback that
 /// re-arms a periodic timer calls `timer_set`, which re-locks this very heap.
-fn drain_cpu_heap(
-    cpu: usize,
-    now: Duration,
-) -> alloc::vec::Vec<Box<dyn FnOnce(Duration) + Send + Sync>> {
+///
+/// Only ever called for the caller's **own** heap, which is why the blocking
+/// lock is fine here: the only other CPU that can hold it is an adopter, and
+/// that one holds it for a drain and nothing else (see
+/// [`try_drain_cpu_heap`]).
+fn drain_cpu_heap(cpu: usize, now: Duration) -> DueCallbacks {
     let mut t = TIMER_HEAPS[cpu].lock();
     let expired = t.drain_expired(now);
     NEXT_DEADLINE_NS[cpu].store(t.next_ns(), Ordering::Release);
     expired
+}
+
+/// Adopt `cpu`'s due callbacks, or `None` when its heap is busy right now.
+///
+/// **Never a blocking lock**, and that is the whole point: this runs on
+/// another CPU's behalf, from interrupt context, with interrupts off. The
+/// owner can publish its deadline and then stop running while still holding
+/// this mutex -- a vCPU the host descheduled, a long interrupts-off stretch:
+/// exactly the state the sweep exists to recover from. Every ticking CPU
+/// picks the same most-overdue heap, so a `lock()` here would put all of them
+/// in a spin that only the stalled owner can end, turning the recovery path
+/// into a machine-wide stall. A busy heap is simply left for a later tick,
+/// which costs one more tick of latency on a callback that is already late by
+/// at least `STRAY_LAG_NS`. `steal_task_from_other_cpu` avoids the same
+/// lock storm in the executor the same way.
+fn try_drain_cpu_heap(cpu: usize, now: Duration) -> Option<DueCallbacks> {
+    let mut t = TIMER_HEAPS[cpu].try_lock()?;
+    let expired = t.drain_expired(now);
+    NEXT_DEADLINE_NS[cpu].store(t.next_ns(), Ordering::Release);
+    Some(expired)
 }
 
 /// How overdue another CPU's earliest deadline has to be before a ticking CPU
@@ -699,10 +725,10 @@ hal_fn_impl! {
             let mut expired = if mine_due {
                 drain_cpu_heap(me, now)
             } else {
-                alloc::vec::Vec::new()
+                DueCallbacks::new()
             };
-            if let Some(other) = stray {
-                let adopted = drain_cpu_heap(other, now);
+            // `try_drain_cpu_heap`, never a blocking lock: see its comment.
+            if let Some(adopted) = stray.and_then(|other| try_drain_cpu_heap(other, now)) {
                 TIMER_STRAYS.fetch_add(adopted.len() as u64, Ordering::Relaxed);
                 expired.extend(adopted);
             }
