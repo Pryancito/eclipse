@@ -301,13 +301,23 @@ impl KernelHandler for ZcoreKernelHandler {
 
         if let Some(thread) = kernel_hal::thread::get_current_thread() {
             if let Ok(thread) = thread.downcast::<Thread>() {
-                let vmar = thread.proc().vmar();
-                if vmar.handle_page_fault(fault_vaddr, access_flags).is_ok() {
-                    // Demand paging resolved it — the overwhelmingly common
-                    // case. Return WITHOUT touching the diagnosis latch, so
-                    // concurrent legitimate faults on other CPUs are never
-                    // serialized behind it or turned into false halts.
-                    return;
+                // Ring-0 EXECUTE at a RIP that is not kernel `.text` is
+                // corrupt control flow. Demand-paging the userspace address
+                // would map a page and then run it in kernel mode.
+                let kernel_exec_smash = access_flags.contains(MMUFlags::EXECUTE)
+                    && kernel_hal::kstats::last_fault_from_kernel()
+                    && kernel_hal::kaddr::kernel_exec_is_corrupt_control_flow(
+                        kernel_hal::kstats::last_fault_rip(),
+                    );
+                if !kernel_exec_smash {
+                    let vmar = thread.proc().vmar();
+                    if vmar.handle_page_fault(fault_vaddr, access_flags).is_ok() {
+                        // Demand paging resolved it — the overwhelmingly common
+                        // case. Return WITHOUT touching the diagnosis latch, so
+                        // concurrent legitimate faults on other CPUs are never
+                        // serialized behind it or turned into false halts.
+                        return;
+                    }
                 }
                 // Unresolved by the user vmar: a kernel-side bug — a driver
                 // dereferencing an unmapped/mismapped pointer (e.g. the vendored
@@ -668,17 +678,11 @@ fn print_fault_backtrace(access_flags: MMUFlags) {
                         soft,
                     ));
                     report_soft_smash_stack_attr(rsp0 as usize, rbp0 as usize);
-                    // Only halt early inside timer — hard-guard-only halt used to
-                    // fire on the RFLAGS false-positive and mask the real null call.
+                    // Do not halt inside the timer: the skip-repair already
+                    // tried to resume, and isolation (without killing the
+                    // interrupted pid) is strictly better than freezing.
                     if kernel_hal::timer::in_timer_callback() {
                         kernel_hal::timer::note_timer_callback_skipped();
-                        kernel_hal::console::serial_write_str(
-                            "\n[soft-smash] truncated return while in_timer_callback — \
-                             sticky set; serial halt\n",
-                        );
-                        loop {
-                            core::hint::spin_loop();
-                        }
                     }
                 }
                 #[cfg(feature = "libos")]

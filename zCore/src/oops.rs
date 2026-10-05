@@ -45,11 +45,11 @@
 //! Two conditions that USED to halt no longer do — they are now clues in the
 //! report, not verdicts. A fault *in a timer callback* is isolated (the timer
 //! EOI is sent before the callback runs, so abandoning it does not wedge this
-//! CPU's timer); the interrupted process is killed as a best-effort culprit and
-//! the firing callback is printed for when the true origin is whoever armed it.
-//! A *suspected heap smash* is likewise isolated rather than halted — that is
-//! exactly when staying up to name the culprit is most valuable, and the leak
-//! is bounded by [`MAX_CONTAINED`].
+//! CPU's timer); the interrupted process is **not** killed — it is coincidental
+//! — and the firing callback is printed for when the true origin is whoever
+//! armed it. A *suspected heap smash* is likewise isolated rather than halted —
+//! that is exactly when staying up to name the culprit is most valuable, and
+//! the leak is bounded by [`MAX_CONTAINED`].
 //!
 //! The `lock_depth` gate is necessary, not sufficient: a handful of scheduler
 //! and console locks are external `spin::Mutex`es that do not count towards it.
@@ -86,6 +86,13 @@ use zircon_object::task::Thread;
 /// systematically, and what helps then is a halt with its dump, not more
 /// running.
 const MAX_CONTAINED: u32 = 16;
+
+/// Whether isolation should `kill -9` the thread that was current at the
+/// fault. A timer callback runs on whoever the IRQ interrupted; that pid
+/// is coincidental (`timer_cb={0,0}` in the capture that killed pid 1036).
+fn should_kill_interrupted_pid(in_timer: bool) -> bool {
+    !in_timer
+}
 
 /// Exit code for the victim: killed by SIGKILL, in the form the process
 /// object carries a death by signal (`-signo`, see
@@ -322,6 +329,23 @@ pub fn try_contain(what: &str, restore_kd: Option<u32>) {
     };
 
     match &victim {
+        Some(thread) if !should_kill_interrupted_pid(in_timer) => {
+            // The timer interrupted whoever was on this CPU. Killing them
+            // treats a coincidental pid as the author of a smash inside
+            // `timer_tick` (`timer_cb={0,0}` in the live capture).
+            let report = format_args!(
+                "[isolate] {} contained ({}/{}): not killing pid={} tid={} \
+                 (fault in a timer callback; the interrupted pid is \
+                 coincidental) — the kernel stays up\n",
+                what,
+                n,
+                MAX_CONTAINED,
+                thread.proc().id(),
+                thread.id(),
+            );
+            serial_write_fmt_spin(report);
+            kernel_hal::oops_log::record(report);
+        }
         Some(thread) => {
             let report = format_args!(
                 "[isolate] {} contained ({}/{}): killing pid={} tid={} — \
@@ -517,6 +541,15 @@ mod tests {
     fn the_victims_exit_code_is_a_signal_death_and_not_an_exit_status() {
         assert_eq!(KILLED_BY_KERNEL, -9);
         assert_ne!(KILLED_BY_KERNEL, 128 + 9);
+    }
+
+    /// Isolation must not treat the interrupted pid as the author of a timer
+    /// callback smash. The live capture killed pid=1036 while
+    /// `in_timer_callback=true` and `timer_cb={0,0}`.
+    #[test]
+    fn a_timer_fault_does_not_blame_the_interrupted_pid() {
+        assert!(!should_kill_interrupted_pid(true));
+        assert!(should_kill_interrupted_pid(false));
     }
 
     /// `CONTAINING` is a bit per CPU in a `u64`, and `try_contain` refuses a cpu

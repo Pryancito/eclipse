@@ -169,6 +169,14 @@ pub fn is_kernel_text(a: u64) -> bool {
     in_text(kernel_text(), a)
 }
 
+/// Ring-0 `RIP` that is not kernel `.text`: a `ret`/`call` landed on
+/// userspace, a null, or other garbage. The CPU then takes an EXECUTE #PF
+/// (or a `#UD`) at that address. Demand-paging it would map a user page and
+/// run it in kernel mode.
+pub fn kernel_exec_is_corrupt_control_flow(rip: u64) -> bool {
+    !is_kernel_text(rip)
+}
+
 /// Whether `a` points anywhere into the kernel half — the image, the physmap,
 /// or a coroutine stack carved out of it.
 pub fn is_kernel_addr(a: u64) -> bool {
@@ -355,6 +363,20 @@ mod tests {
         assert!(is_kernel_addr(lo));
         assert!(is_kernel_text(lo));
         assert!(!is_kernel_text(hi));
+    }
+
+    /// The live capture: kernel #PF EXECUTE at `rip=vaddr=0x1045f0000`
+    /// (`[rsp]` also userspace-shaped). That RIP is not `.text`, so the
+    /// skip-repair must run and the user VMAR must not demand-page it.
+    #[test]
+    fn executing_a_userspace_rip_from_the_kernel_is_corrupt_control_flow() {
+        assert!(kernel_exec_is_corrupt_control_flow(0x1045f0000));
+        assert!(kernel_exec_is_corrupt_control_flow(0x107e990f68));
+        assert!(kernel_exec_is_corrupt_control_flow(0));
+        assert!(kernel_exec_is_corrupt_control_flow(0x7fff_ffff_f000));
+        let (lo, _) = kernel_text();
+        assert!(!kernel_exec_is_corrupt_control_flow(lo));
+        assert!(!kernel_exec_is_corrupt_control_flow(lo + 0xaa150));
     }
 
     // ── the window the hook slots are judged against ────────────────────────

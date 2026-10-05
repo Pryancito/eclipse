@@ -332,25 +332,6 @@ fn verify_idle_seal(cpu: usize, resume: u64, rip: usize, vector: usize, at_unsea
     }
 }
 
-/// Usable executor stack with only a shallow nest from `stack_top` (IRQ-sized),
-/// not a deep smash into the low-water zone.
-fn fault_stack_shallow_usable(rsp: usize) -> bool {
-    use executor::{StackPtrRegion, STACK_SIZE};
-    let attr = ::executor::attribute_fault_stack_ptrs(rsp, 0);
-    let Some(h) = attr.rsp else {
-        // Outside every executor stack but still a plausible kernel SP —
-        // allow idle/IRQ recover (boot / runtime context).
-        return true;
-    };
-    if h.region != StackPtrRegion::Usable {
-        return false;
-    }
-    let stack_top = h.stack_base + STACK_SIZE;
-    let used = stack_top.saturating_sub(rsp);
-    // ~1.2 KiB below top is the observed null-EXECUTE case; allow up to 16 KiB.
-    (8..16 * 1024).contains(&used)
-}
-
 /// One-shot: trap vector + error + first 4 stack qwords (CALL vs RET-of-null).
 fn dump_null_execute_stack_once(tf: &TrapFrame, sp: u64, slot0: u64) {
     use core::sync::atomic::{AtomicBool, Ordering};
@@ -525,112 +506,15 @@ fn report_dma_uaf_if_recycled(sp: u64) {
     }
 }
 
-/// `[rsp]==0` null-EXECUTE on a shallow/usable stack: scan upward for a kernel
-/// `.text` return and RET there. Never "pop-null recover" — a sea of zeros
-/// (fresh BSS stack / RSP past live frames) turns that into an 8× #PF storm
-/// (`fault_rsp` advancing 0x80) before halt.
-fn try_recover_null_return_slot(tf: &mut TrapFrame, fault_vaddr: usize, sp: u64) -> bool {
-    if !fault_stack_shallow_usable(tf.rsp) {
-        return false;
-    }
-
-    // If the next slot is also 0, this is a zero-chain (not a single bad CALL
-    // return). Popping one null only RETs into the next — abort that path.
-    // SAFETY: sp+8 is still in the kernel stack window when sp is.
-    let next = unsafe { core::ptr::read_volatile((sp + 8) as *const u64) };
-    if next == 0 {
-        use core::sync::atomic::{AtomicBool, Ordering};
-        static LOGGED: AtomicBool = AtomicBool::new(false);
-        if !LOGGED.swap(true, Ordering::SeqCst) {
-            crate::console::serial_write_fmt_spin(format_args!(
-                "\n[null-exec] zero-chain at fault_rsp={:#x} ([0]=[1]=0) — refusing \
-                 pop-null recover (would #PF-loop); vaddr={:#x}\n",
-                sp, fault_vaddr,
-            ));
-            // [diag] Name the timer callback in flight, if any: the reproduced
-            // crash has in_timer_callback=true, and this pair — published by
-            // timer_tick around each dispatch — turns "somewhere in the tick"
-            // into one closure. Symbolize the vtable against the kernel ELF.
-            let (cb_data, cb_vtable) = crate::kstats::current_timer_cb();
-            crate::console::serial_write_fmt_spin(format_args!(
-                "[null-exec] timer callback in flight: data={:#x} vtable={:#x} \
-                 (0,0 = fault is outside any timer callback dispatch)\n",
-                cb_data, cb_vtable,
-            ));
-            // [diag] Full window dump, EVERY qword — the pointer-only scan
-            // that follows hides the zero-span's exact boundaries, and those
-            // boundaries are the writer's fingerprint (buffer-sized? page-
-            // aligned? where does it start relative to the ret slot?).
-            let lo = sp.saturating_sub(0x40) & !0x7;
-            let hi = sp + 0x1c0;
-            crate::console::serial_write_fmt_spin(format_args!(
-                "[null-exec] window [{:#x}..{:#x}]:\n",
-                lo, hi,
-            ));
-            let mut a = lo;
-            while a < hi {
-                if crate::kaddr::is_kernel_stack_qword(a) {
-                    // SAFETY: 8-aligned address on this executor's mapped stack
-                    // window (same bound as the scan below).
-                    let w = unsafe { core::ptr::read_volatile(a as *const u64) };
-                    crate::console::serial_write_fmt_spin(format_args!(
-                        "[null-exec]   @{:#x} = {:#018x}{}\n",
-                        a,
-                        w,
-                        if a == sp { "  <-- fault rsp" } else { "" },
-                    ));
-                }
-                a += 8;
-            }
-        }
-        return false;
-    }
-
-    // Scan toward stack_top for a plausible CALL return (0xffff_ff00_00xxxxxx).
-    const SCAN_QWORDS: u64 = 32;
-    for i in 1..=SCAN_QWORDS {
-        let addr = sp + i * 8;
-        if !crate::kaddr::is_kernel_stack_qword(addr) {
-            break;
-        }
-        // SAFETY: addr stays in the same kernel stack window as `sp`.
-        let cand = unsafe { core::ptr::read_volatile(addr as *const u64) };
-        if looks_like_kernel_text_ret(cand) && preceded_by_call(cand) {
-            // `trap_return` ignores software tf.rsp — plant the return at [sp]
-            // so `timer_cb_fault_recover`'s `ret` resumes there.
-            // SAFETY: sp is the faulting RSP slot we already validated.
-            unsafe { core::ptr::write_volatile(sp as *mut u64, cand) };
-            use core::sync::atomic::{AtomicUsize, Ordering};
-            static RECOVERS: AtomicUsize = AtomicUsize::new(0);
-            let n = RECOVERS.fetch_add(1, Ordering::Relaxed);
-            if n < 32 {
-                crate::console::serial_write_fmt_spin(format_args!(
-                    "\n[null-exec] recovered null-[rsp] EXECUTE vaddr={:#x}: \
-                     planted ret={:#x} from +{} (scan); rip -> recover\n",
-                    fault_vaddr,
-                    cand,
-                    i * 8,
-                ));
-            }
-            if crate::timer::in_timer_callback() {
-                crate::timer::note_timer_callback_skipped();
-            }
-            tf.rip = timer_cb_fault_recover as *const () as usize;
-            return true;
-        }
-    }
-
-    false
-}
-
 /// Try to contain a null-range EXECUTE #PF from a bad `call` (corrupt fn-ptr /
 /// vtable). Returns `true` if the trap frame was rewritten to skip the call
 /// (caller must `return` from `trap_handler` without panicking).
 ///
 /// Safe when `[tf.rsp]` still holds a full kernel `.text` return address
-/// (the qword the CALL pushed). Also recovers a **null** return slot on a
-/// shallow/usable stack by scanning upward or popping the null (idle IRQ).
-/// Truncated residues like a real smash return false.
+/// (the qword the CALL pushed). A smashed `[rsp]` is not repaired by
+/// scanning for some other CALL return — that longjmp resumed
+/// `TicketMutex::lock` with dead registers (READ #PF at `lock+0x9f`).
+/// Truncated residues return false and isolation contains the fault.
 ///
 /// `tf.rsp` must be the **faulting RSP value** (see trap.S `__from_kernel`);
 /// historically it was `&rflags`, which made RFLAGS|RF (e.g. `0x13446`) look
@@ -646,14 +530,13 @@ fn try_skip_null_execute_call(tf: &mut TrapFrame, fault_vaddr: usize) -> bool {
     // 8-aligned and in the kernel heap/stack range.
     let ret = unsafe { core::ptr::read_volatile(sp as *const u64) };
 
-    // Null return slot: not truncated smash residue — try shallow-stack recover
-    // before sticky-flagging heap smash (that would kill all idle dyn dispatch).
+    // Null return slot: the CALL's return was overwritten. Scanning up the
+    // stack for some other `.text` CALL return and `ret`'ing there is a
+    // longjmp (capture: planted `ItimerSlot` TicketMutex::lock+0x98 from
+    // +216, then #PF READ at lock+0x9f). Isolate without killing the
+    // interrupted pid; do not skip.
     if ret == 0 {
         dump_null_execute_stack_once(tf, sp, ret);
-        if try_recover_null_return_slot(tf, fault_vaddr, sp) {
-            return true;
-        }
-        // Unrecoverable null slot — treat like soft-smash for skip_dyn.
         ::executor::note_heap_smash_suspected();
         use core::sync::atomic::{AtomicBool, Ordering};
         static LOGGED_NULL: AtomicBool = AtomicBool::new(false);
@@ -681,9 +564,11 @@ fn try_skip_null_execute_call(tf: &mut TrapFrame, fault_vaddr: usize) -> bool {
         return false;
     }
 
-    // Accept only a return into kernel .text (same bound the #GP-repair path
-    // uses for low32). A non-kernel / truncated ret means the stack is too
-    // far gone to skip safely — fall through to the panic diagnostics.
+    // `[rsp]` is a kernel `.text` CALL return: skip the bad target and RET
+    // there. Anything else — userspace, truncated `.text`, a heap pointer —
+    // is a `ret` that already popped garbage. A distant stack scan used to
+    // plant one of those and longjmp into `TicketMutex::lock` with smashed
+    // registers; refuse and let isolation contain the fault.
     if !looks_like_kernel_text_ret(ret) {
         let truncated_text = crate::kaddr::looks_truncated_text(ret);
         if truncated_text || ret < 0x1000 {
@@ -723,19 +608,6 @@ fn try_skip_null_execute_call(tf: &mut TrapFrame, fault_vaddr: usize) -> bool {
                     };
                 report("rsp", tf.rsp, attr.rsp);
                 report("rbp", tf.rbp, attr.rbp);
-            }
-            // Only halt early on *confirmed* truncated residue (not RFLAGS).
-            // Null fn-ptr with a valid return still falls through to skip below
-            // when high_ok; when residue is real, sticky + optional timer halt.
-            if truncated_text && crate::timer::in_timer_callback() {
-                crate::timer::note_timer_callback_skipped();
-                crate::console::serial_write_str(
-                    "\n[soft-smash] truncated return while in_timer_callback — \
-                     sticky set; serial halt\n",
-                );
-                loop {
-                    core::hint::spin_loop();
-                }
             }
         }
         return false;
@@ -897,14 +769,20 @@ pub extern "C" fn trap_handler(tf: &mut TrapFrame) {
             // Capture rbp/rsp too so the handler can walk the faulting call
             // chain (e.g. name the caller of a wild `memset`, tf.rip resolving
             // into compiler_builtins set_bytes).
-            crate::kstats::note_fault_regs(tf.rip as u64, tf.rbp as u64, tf.rsp as u64);
-            // Containment: null-range EXECUTE #PF is a corrupt fn-ptr / vtable
-            // call. Skip when the pushed return address is still a valid
-            // kernel `.text` pointer (timer callbacks AND other IRQ/kernel
-            // indirect calls). Truncated [rsp]=0x13446 means smash — do not
-            // skip. Real user VMAR faults are untouched (vaddr >= 0x1000).
-            if vaddr < 0x1000
+            crate::kstats::note_fault_regs(
+                tf.rip as u64,
+                tf.rbp as u64,
+                tf.rsp as u64,
+                tf.cs as u64,
+            );
+            // Containment: ring-0 EXECUTE #PF at a RIP that is not kernel
+            // `.text` is a `call`/`ret` through garbage (null, userspace
+            // `0x1045f0000`, truncated residue). Skip when a CALL return is
+            // still on the stack — at `[rsp]` or within a short scan. User
+            // EXECUTE faults (CS.RPL == 3) still go to the VMAR.
+            if (tf.cs & 0b11) == 0
                 && flags.contains(crate::MMUFlags::EXECUTE)
+                && crate::kaddr::kernel_exec_is_corrupt_control_flow(tf.rip as u64)
                 && try_skip_null_execute_call(tf, vaddr)
             {
                 return;
@@ -1049,7 +927,12 @@ pub extern "C" fn trap_handler(tf: &mut TrapFrame) {
                     fault_sp = tf.rax;
                 }
             }
-            crate::kstats::note_fault_regs(tf.rip as u64, tf.rbp as u64, fault_sp as u64);
+            crate::kstats::note_fault_regs(
+                tf.rip as u64,
+                tf.rbp as u64,
+                fault_sp as u64,
+                tf.cs as u64,
+            );
             // The two lines after the frame are deliberately last *in the
             // message*: the header above scrolls off a 25-line console long
             // before anyone can photograph it, and the frame alone carries
@@ -1141,6 +1024,15 @@ pub extern "C" fn trap_handler(tf: &mut TrapFrame) {
             );
         }
         TrapReason::UndefinedInstruction => {
+            // Same family as the non-text EXECUTE #PF: ring 0 decoding
+            // userspace/null as instructions. Skip if a CALL return is still
+            // on the stack; otherwise the panic below is the record.
+            if (tf.cs & 0b11) == 0
+                && crate::kaddr::kernel_exec_is_corrupt_control_flow(tf.rip as u64)
+                && try_skip_null_execute_call(tf, tf.rip)
+            {
+                return;
+            }
             report_ud_shape(tf.rip as u64);
             // Symbol repeated after the frame, and armed for after the
             // backtrace, for the same reasons as the GernelFault arm above.

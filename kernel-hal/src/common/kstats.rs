@@ -565,6 +565,7 @@ pub fn note_nmi_rip(rip: u64) {
 static FAULT_RIP: [AtomicU64; MAX_CORE_NUM] = [const { AtomicU64::new(0) }; MAX_CORE_NUM];
 static FAULT_RBP: [AtomicU64; MAX_CORE_NUM] = [const { AtomicU64::new(0) }; MAX_CORE_NUM];
 static FAULT_RSP: [AtomicU64; MAX_CORE_NUM] = [const { AtomicU64::new(0) }; MAX_CORE_NUM];
+static FAULT_CS: [AtomicU64; MAX_CORE_NUM] = [const { AtomicU64::new(0) }; MAX_CORE_NUM];
 
 /// Index for the per-CPU fault slots; `None` past `MAX_CORE_NUM`, where storing
 /// would be out of bounds and reading would be another cpu's data.
@@ -590,12 +591,15 @@ pub fn note_fault_rip(rip: u64) {
 
 /// [diag] Record the frame/stack pointers at the faulting instruction so the
 /// page-fault handler can walk the call chain (e.g. name the caller of a wild
-/// `memset`). Stored alongside the RIP by the arch trap entry.
-pub fn note_fault_regs(rip: u64, rbp: u64, rsp: u64) {
+/// `memset`). Stored alongside the RIP by the arch trap entry. `cs` is the
+/// hardware CS at the fault: ring 0 vs ring 3 is how a kernel EXECUTE to a
+/// userspace RIP is told apart from a real user #PF.
+pub fn note_fault_regs(rip: u64, rbp: u64, rsp: u64, cs: u64) {
     if let Some(cpu) = fault_slot() {
         FAULT_RIP[cpu].store(rip, Relaxed);
         FAULT_RBP[cpu].store(rbp, Relaxed);
         FAULT_RSP[cpu].store(rsp, Relaxed);
+        FAULT_CS[cpu].store(cs, Relaxed);
     }
 }
 
@@ -664,6 +668,15 @@ pub fn last_fault_rbp() -> u64 {
 /// [diag] Read back the stack pointer at the last page fault.
 pub fn last_fault_rsp() -> u64 {
     fault_slot().map_or(0, |cpu| FAULT_RSP[cpu].load(Relaxed))
+}
+
+/// Whether the last stashed fault was taken in ring 0.
+///
+/// `cs == 0` means nothing was stored (the arrays start at zero): treat that
+/// as *not* kernel, so a libos path that never notes CS still demand-pages.
+pub fn last_fault_from_kernel() -> bool {
+    let cs = fault_slot().map_or(0, |cpu| FAULT_CS[cpu].load(Relaxed));
+    cs != 0 && (cs & 0b11) == 0
 }
 
 /// [diag] Broadcast an NMI to all other CPUs and busy-wait briefly so their NMI
