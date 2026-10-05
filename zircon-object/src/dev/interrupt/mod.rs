@@ -145,6 +145,14 @@ impl Interrupt {
         inner.key = key;
         if inner.state == InterruptState::Triggered {
             inner.packet_id = port.as_ref().push_interrupt(inner.timestamp, inner.key);
+            // Spent: the latched timestamp belonged to this delivery. Leaving
+            // it set made the next `ack` queue the very same timestamp a
+            // second time -- `ack` queues whatever is latched -- and the
+            // trigger that had arrived in between was dropped on the way in,
+            // because a trigger only latches when nothing is latched already.
+            // The other two places that deliver a latched timestamp
+            // (`trigger` itself, and the interrupt handler) both clear it.
+            inner.timestamp = 0;
             inner.state = InterruptState::NeedAck;
         }
         Ok(())
@@ -681,5 +689,205 @@ mod tests {
         let port = Port::new(1).unwrap();
         interrupt.bind(&port, 9).unwrap();
         assert_eq!(drain(&port).await, vec![(9, 555)]);
+    }
+
+    #[test]
+    /// The numbers the ABI carries: the bits of `zx_interrupt_create`'s
+    /// options word, and the object's own flags. The gap at bit 3 of the
+    /// flags is deliberate -- the post-wait mask is 0x10 in `object.h` -- and
+    /// filling it would make two flags share a bit.
+    fn the_flag_and_option_bits_are_the_numbers_the_abi_names() {
+        assert_eq!(InterruptFlags::VIRTUAL.bits(), 0x1);
+        assert_eq!(InterruptFlags::UNMASK_PREWAIT.bits(), 0x2);
+        assert_eq!(InterruptFlags::UNMASK_PREWAIT_UNLOCKED.bits(), 0x4);
+        assert_eq!(InterruptFlags::MASK_POSTWAIT.bits(), 0x10);
+        assert_eq!(InterruptOptions::REMAP_IRQ.bits(), 0x1);
+        for (mode, value) in [
+            (InterruptOptions::MODE_DEFAULT, 0x0),
+            (InterruptOptions::MODE_EDGE_LOW, 0x2),
+            (InterruptOptions::MODE_EDGE_HIGH, 0x4),
+            (InterruptOptions::MODE_LEVEL_LOW, 0x6),
+            (InterruptOptions::MODE_LEVEL_HIGH, 0x8),
+            (InterruptOptions::MODE_EDGE_BOTH, 0xa),
+        ] {
+            assert_eq!(mode.bits(), value, "{:?}", mode);
+            // Every mode fits in the three bits `to_mode` reads.
+            assert_eq!(mode.to_mode(), mode, "{:?} is not all mode", mode);
+        }
+        // And asking for a virtual interrupt is not asking for a mode: its
+        // bit is outside the ones the mode lives in.
+        assert_eq!(InterruptOptions::VIRTUAL.bits(), 0x10);
+        assert_eq!(
+            InterruptOptions::VIRTUAL.to_mode(),
+            InterruptOptions::MODE_DEFAULT
+        );
+    }
+
+    #[async_std::test]
+    /// A line that fires twice before anybody reads it reports when it first
+    /// fired, not when it last did: the first timestamp is latched and the
+    /// second trigger finds it there. Reading it spends it, so the one after
+    /// that is its own again.
+    async fn a_second_trigger_before_the_first_was_read_keeps_the_first_timestamp() {
+        let interrupt = Interrupt::new_virtual();
+        interrupt.trigger(1000).unwrap();
+        interrupt.trigger(2000).unwrap();
+        assert_eq!(
+            answers("wait after two triggers", interrupt.wait()).await,
+            Ok(1000),
+        );
+
+        interrupt.trigger(3000).unwrap();
+        assert_eq!(
+            answers("wait after the read", interrupt.wait()).await,
+            Ok(3000),
+            "the read did not spend the timestamp it handed back",
+        );
+    }
+
+    #[async_std::test]
+    /// Acknowledging an interrupt with a trigger waiting behind it queues
+    /// that trigger and leaves the interrupt still needing an ack: the packet
+    /// it has just queued has not been read yet, so the next one to arrive is
+    /// latched rather than queued behind it.
+    async fn an_ack_that_queues_a_packet_still_needs_its_own_ack() {
+        let (interrupt, port) = bound();
+        interrupt.trigger(1000).unwrap();
+        assert_eq!(drain(&port).await, vec![(42, 1000)]);
+
+        interrupt.trigger(2000).unwrap();
+        interrupt.ack().unwrap();
+        assert_eq!(drain(&port).await, vec![(42, 2000)]);
+
+        interrupt.trigger(3000).unwrap();
+        assert_eq!(
+            drain(&port).await,
+            vec![],
+            "the ack re-armed the interrupt before its own packet was read",
+        );
+        interrupt.ack().unwrap();
+        assert_eq!(drain(&port).await, vec![(42, 3000)]);
+        // Nothing pending now, so this ack is the one that re-arms it.
+        interrupt.ack().unwrap();
+        assert_eq!(drain(&port).await, vec![]);
+    }
+
+    #[async_std::test]
+    /// Unbinding takes the interrupt's queued packet out of the port with it,
+    /// as closing the handle does. A packet left behind would be handed to
+    /// the program as an interrupt from an object that is no longer bound to
+    /// the port it arrived on.
+    async fn unbinding_takes_its_pending_packet_with_it() {
+        let port = Port::new(1).unwrap();
+        let going = Interrupt::new_virtual();
+        let staying = Interrupt::new_virtual();
+        going.bind(&port, 1).unwrap();
+        staying.bind(&port, 2).unwrap();
+        going.trigger(1000).unwrap();
+        staying.trigger(2000).unwrap();
+
+        going.unbind(&port).unwrap();
+        assert_eq!(drain(&port).await, vec![(2, 2000)]);
+    }
+
+    #[async_std::test]
+    /// `zx_interrupt_destroy` on an interrupt whose packet is still in the
+    /// port cancels it like any other: the packet goes, and the object
+    /// answers CANCELED from then on rather than queueing another.
+    async fn destroying_an_interrupt_with_a_packet_still_queued_cancels_it() {
+        let (interrupt, port) = bound();
+        interrupt.trigger(1000).unwrap();
+
+        assert_eq!(interrupt.destroy(), Ok(()));
+        assert_eq!(drain(&port).await, vec![]);
+        assert_eq!(interrupt.trigger(2000), Err(ZxError::CANCELED));
+        assert_eq!(interrupt.ack(), Err(ZxError::CANCELED));
+        // And destroying it again is not an error: there is nothing left to
+        // do, which is also what the destroy on drop finds.
+        assert_eq!(interrupt.destroy(), Ok(()));
+    }
+
+    #[async_std::test]
+    /// Destroying an interrupt somebody is already waiting on wakes them with
+    /// CANCELED. It is the only way out of a wait on a line that never fires,
+    /// so the signal the destroy raises is what the waiter is parked on.
+    async fn destroying_an_interrupt_wakes_the_waiter() {
+        let interrupt = Interrupt::new_virtual();
+        let waiting = interrupt.clone();
+        let waiter = async_std::task::spawn(async move { waiting.wait().await });
+        // Long enough for the wait to park on the signal; destroying it
+        // before that is the easy case, which the test above covers.
+        async_std::task::sleep(core::time::Duration::from_millis(10)).await;
+
+        interrupt.destroy().unwrap();
+
+        assert_eq!(
+            answers("the parked waiter", waiter).await,
+            Err(ZxError::CANCELED),
+        );
+    }
+
+    #[async_std::test]
+    /// A trigger that arrives before the port is bound is delivered by the
+    /// bind, and that spends its timestamp like any other delivery. It used
+    /// to stay latched: the next ack queued the same timestamp a second time,
+    /// and the trigger that had arrived behind it was lost.
+    async fn the_bind_that_delivers_a_pending_trigger_spends_its_timestamp() {
+        let interrupt = Interrupt::new_virtual();
+        interrupt.trigger(555).unwrap();
+        let port = Port::new(1).unwrap();
+        interrupt.bind(&port, 9).unwrap();
+        assert_eq!(drain(&port).await, vec![(9, 555)]);
+
+        // It is waiting for an ack now, so the next trigger is latched.
+        interrupt.trigger(666).unwrap();
+        assert_eq!(drain(&port).await, vec![]);
+        // And what the ack hands over is that trigger, not the delivered one
+        // over again.
+        interrupt.ack().unwrap();
+        assert_eq!(drain(&port).await, vec![(9, 666)]);
+        interrupt.ack().unwrap();
+        assert_eq!(drain(&port).await, vec![]);
+    }
+
+    #[async_std::test]
+    /// Waiting is one at a time: the second caller of `zx_interrupt_wait` on
+    /// the same interrupt is told BAD_STATE rather than parked beside the
+    /// first, because only one of them could be handed the timestamp and the
+    /// other would be left parked on a signal that has already been cleared.
+    async fn a_second_waiter_on_the_same_interrupt_is_refused() {
+        let interrupt = Interrupt::new_virtual();
+        let waiting = interrupt.clone();
+        let first = async_std::task::spawn(async move { waiting.wait().await });
+
+        // Wait for the precondition itself rather than for a length of time:
+        // `bind` is refused with BAD_STATE exactly when the interrupt is in the
+        // waiting state, so this says "the first waiter has parked" instead of
+        // guessing how long parking takes. Until it has, the interrupt is still
+        // idle and a second wait would park beside it, which is what the
+        // assertion below has to be able to tell apart.
+        let port = Port::new(1).unwrap();
+        let mut parked = false;
+        for _ in 0..1000 {
+            if interrupt.bind(&port, 1) == Err(ZxError::BAD_STATE) {
+                parked = true;
+                break;
+            }
+            // It bound, so the waiter was not there yet. Put it back as it was
+            // -- the waiter is parked on the signal, which binding does not
+            // touch -- and look again.
+            interrupt.unbind(&port).unwrap();
+            async_std::task::sleep(core::time::Duration::from_millis(1)).await;
+        }
+        assert!(parked, "the spawned waiter never parked");
+
+        assert_eq!(
+            answers("the second waiter", interrupt.wait()).await,
+            Err(ZxError::BAD_STATE),
+        );
+
+        // And the first one is still there, and still gets its interrupt.
+        interrupt.trigger(4242).unwrap();
+        assert_eq!(answers("the first waiter", first).await, Ok(4242));
     }
 }
