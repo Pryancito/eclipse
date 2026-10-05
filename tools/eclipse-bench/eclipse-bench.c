@@ -2217,12 +2217,18 @@ struct ys_lane {
     volatile uint64_t count;
     const volatile int *stop;
     volatile int pin_failed;
+    // Set after the gate and before the first sched_yield(). Without it a
+    // count of zero cannot distinguish a thread that never ran at all from
+    // one that ran and then did not come back out of the call, and those are
+    // different bugs.
+    volatile int started;
 };
 
 struct ys_ctl {
     volatile int stop;
     volatile uint64_t notifies;
     struct ys_lane a, b;
+    volatile int notify_started;
     int nnotify;
 };
 static struct ys_ctl g_ys;
@@ -2231,6 +2237,7 @@ static void *ys_yielder(void *arg) {
     struct ys_lane *l = arg;
     if (smpk_pin_self(0) != 0)
         l->pin_failed = 1;
+    l->started = 1;
     while (!*l->stop) {
         sched_yield();
         // Bumped AFTER the call returns, so a count that stops advancing means
@@ -2247,6 +2254,7 @@ static void *ys_notifier(void *arg) {
     // Short sleeps, on the same CPU as the yielders: each one ends in a timer
     // wake, which is a NOTIFY arriving at that CPU. The notified lane is what
     // the yielded lane has to wait behind.
+    c->notify_started++;
     struct timespec ts = {0, 200 * 1000}; // 200 us
     while (!c->stop) {
         nanosleep(&ts, NULL);
@@ -3218,7 +3226,7 @@ int main(int argc, char **argv) {
         printf("yieldstall: a yields/s of 0 while notifies keep arriving IS "
                "the bug\n");
         uint64_t pa = 0, pb = 0, pn = 0;
-        uint64_t stall_a = 0, stall_b = 0;
+        uint64_t stall_a = 0, stall_b = 0, stall_n = 0;
         uint64_t t0 = now_ns();
         for (int s = 0; s < secs; s++) {
             struct timespec one = {1, 0};
@@ -3232,32 +3240,64 @@ int main(int argc, char **argv) {
             // First second in which a yielder made no progress at all while
             // the notifier did: that is the lane being starved, not the thread
             // merely running slowly.
-            if (da == 0 && dn > 0 && !stall_a) stall_a = (uint64_t)(at * 1000);
-            if (db == 0 && dn > 0 && !stall_b) stall_b = (uint64_t)(at * 1000);
+            // A participant is starved when it made no progress in a whole
+            // second while at least one OTHER participant on the same CPU
+            // did. That phrasing is deliberate: it catches a starved notifier
+            // just as well as a starved yielder, and it does not fire when
+            // the whole CPU simply stopped.
+            int others_ran = (da > 0) + (db > 0) + (dn > 0);
+            if (da == 0 && others_ran > 0 && !stall_a)
+                stall_a = (uint64_t)(at * 1000);
+            if (db == 0 && others_ran > 0 && !stall_b)
+                stall_b = (uint64_t)(at * 1000);
+            if (made_n > 0 && dn == 0 && others_ran > 0 && !stall_n)
+                stall_n = (uint64_t)(at * 1000);
             pa = ca; pb = cb; pn = cn;
         }
         g_ys.stop = 1;
+        int participants = 2 + made_n;
+        int starved = (stall_a != 0) + (stall_b != 0) + (stall_n != 0);
         printf("yieldstall: verdict:\n");
-        if (stall_a || stall_b) {
-            printf("  STALLED. A first made no progress at %llu ms, B at "
-                   "%llu ms (0 = never stalled),\n"
-                   "  while notifies kept arriving at the same CPU. A yielder "
-                   "that stops\n  advancing under a notify stream is the "
-                   "yielded lane being starved.\n",
-                   (unsigned long long)stall_a, (unsigned long long)stall_b);
-        } else {
-            printf("  no stall: both yielders kept advancing for the whole "
-                   "run.\n");
-        }
-        printf("  totals: A %llu yields, B %llu yields, %llu notifies\n",
-               (unsigned long long)g_ys.a.count,
-               (unsigned long long)g_ys.b.count,
-               (unsigned long long)g_ys.notifies);
-        // Do NOT join: if sched_yield() really does not return, the yielder
-        // threads are stuck inside it and a join would hang the very
-        // diagnostic that just proved it. Say so and exit.
-        if (stall_a || stall_b)
-            printf("  (not joining the yielders: they are inside the call "
+        printf("  %d threads on CPU 0; %d of them were starved at least one "
+               "whole second\n  while another was running.\n",
+               participants, starved == 0 ? 0 : starved);
+        if (stall_a)
+            printf("    yielder A: no progress from %llu ms%s\n",
+                   (unsigned long long)stall_a,
+                   g_ys.a.started ? "" : " (and never reached its first yield)");
+        if (stall_b)
+            printf("    yielder B: no progress from %llu ms%s\n",
+                   (unsigned long long)stall_b,
+                   g_ys.b.started ? "" : " (and never reached its first yield)");
+        if (stall_n)
+            printf("    notifier(s): no progress from %llu ms%s\n",
+                   (unsigned long long)stall_n,
+                   g_ys.notify_started >= made_n
+                       ? ""
+                       : " (and not all of them started)");
+        if (starved == 0)
+            printf("    none: every thread kept advancing for the whole run.\n");
+        printf("  totals: A %llu yields (started %d), B %llu yields "
+               "(started %d), %llu notifies (%d of %d notifiers started)\n",
+               (unsigned long long)g_ys.a.count, g_ys.a.started,
+               (unsigned long long)g_ys.b.count, g_ys.b.started,
+               (unsigned long long)g_ys.notifies, g_ys.notify_started, made_n);
+        // What this does and does not establish. A starved YIELDER is
+        // consistent with the voluntary lane being passed over; a starved
+        // NOTIFIER is not, because a sleeper's timer wake is the notified
+        // lane, and a run where the notifiers are the starved ones rules the
+        // lane ordering out as the whole story. So the tool reports which
+        // threads starved and leaves the mechanism to whoever reads it.
+        if (starved > 0)
+            printf("  note: a starved notifier is a sleeper whose timer wake "
+                   "went unserved,\n  which the lane ordering alone does not "
+                   "explain. Read the rows above for\n  WHICH threads "
+                   "progressed, not just how many.\n");
+        // Do NOT join a starved thread: it may be inside the call that did
+        // not return, and the join would hang the diagnostic that just
+        // proved it.
+        if (starved > 0)
+            printf("  (not joining: a starved thread may be inside the call "
                    "that did not return)\n");
         fflush(stdout);
         _exit(0);
