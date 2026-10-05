@@ -721,6 +721,16 @@ pub fn kernel_report() -> String {
              away from its owner)",
             scans, probed, ok, aff_empty, rebalance, skipped, rescue
         );
+        let (fx_ops, fx_probes, fx_hits, fx_walks) = kernel_hal::kstats::futex_stats();
+        let _ = writeln!(
+            out,
+            "futex:        {} ops, {} shared-word searches ({} really shared),              {} VMAR walks ({} per op)",
+            fx_ops,
+            fx_probes,
+            fx_hits,
+            fx_walks,
+            fx_walks.checked_div(fx_ops).unwrap_or(0),
+        );
         let (created, peak, cap_hits) = kernel_hal::kstats::sched_weak_stats();
         let (pool, overflow) = kernel_hal::kstats::stack_pool_stats();
         let _ = writeln!(

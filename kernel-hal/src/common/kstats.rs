@@ -1368,3 +1368,87 @@ mod tests {
         assert!(ns_all(&after) <= after.idle_ns);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Futex path
+// ---------------------------------------------------------------------------
+//
+// One cross-CPU wake costs 47-60 us here against Linux's 26 us under the same
+// emulator (`eclipse-bench --only psched`, the `emision de 1 despertar` row),
+// and a burst is *cheaper* per wake than a single one, so the cost is not in
+// the scheduler's hand-off -- it is in what one `FUTEX_WAKE` syscall does
+// before it reaches the queue. Reading the code gives candidates and no
+// weights, and the only machine that can weigh them is Moebius's, so the
+// candidates are counted rather than guessed at.
+//
+// The one that reading points at: a futex without `FUTEX_PRIVATE_FLAG` makes
+// `sys_futex` go looking for a word two processes share, and that search walks
+// the VMAR -- a second descent after the one the bounds check already did, and
+// a third lock to read the mapping's VMO -- only to give up on a private
+// mapping, which is what almost every futex word is. musl's own pthreads do
+// set the private flag, so the bench's raw `op = 1` pays a cost most real
+// programs do not: these counters are what will say whether that is the whole
+// gap, part of it, or none of it.
+//
+// Per-CPU and summed on read, like the idle and tick counters above: a shared
+// counter on a path this hot is itself a cache line bouncing between cores on
+// every `pthread_mutex_unlock`.
+
+/// Every `sys_futex` whose operation was understood.
+static FUTEX_OPS: [AtomicU64; MAX_CORE_NUM] = [const { AtomicU64::new(0) }; MAX_CORE_NUM];
+/// …of those, the ones that went looking for a cross-process word.
+static FUTEX_SHARED_PROBES: [AtomicU64; MAX_CORE_NUM] = [const { AtomicU64::new(0) }; MAX_CORE_NUM];
+/// …of those probes, the ones where the word really was shared.
+static FUTEX_SHARED_HITS: [AtomicU64; MAX_CORE_NUM] = [const { AtomicU64::new(0) }; MAX_CORE_NUM];
+/// VMAR descents the futex path performed, bounds check included.
+static FUTEX_VMAR_WALKS: [AtomicU64; MAX_CORE_NUM] = [const { AtomicU64::new(0) }; MAX_CORE_NUM];
+
+/// Add `n` to this CPU's slot of a per-CPU counter, or drop it if the CPU id is
+/// outside the array.
+///
+/// Dropping rather than folding into slot 0 is deliberate: slot 0 is a real
+/// CPU's slot, and a CPU the array cannot hold is a machine wider than
+/// `MAX_CORE_NUM`, where a counter that quietly attributes its work to CPU 0
+/// would be worse than one that is short by it.
+#[inline]
+fn bump_percpu(c: &[AtomicU64; MAX_CORE_NUM], n: u64) {
+    let cpu = crate::cpu::cpu_id() as usize;
+    if cpu < MAX_CORE_NUM {
+        c[cpu].fetch_add(n, Relaxed);
+    }
+}
+
+/// Sum a per-CPU counter.
+fn sum_percpu(c: &[AtomicU64; MAX_CORE_NUM]) -> u64 {
+    c.iter().map(|v| v.load(Relaxed)).sum()
+}
+
+/// Account one `sys_futex` whose operation was understood.
+pub fn note_futex_op() {
+    bump_percpu(&FUTEX_OPS, 1);
+}
+
+/// Account one search for a cross-process futex word, and how many VMAR
+/// descents it cost, and whether the word really was shared.
+pub fn note_futex_shared_probe(walks: u64, hit: bool) {
+    bump_percpu(&FUTEX_SHARED_PROBES, 1);
+    bump_percpu(&FUTEX_VMAR_WALKS, walks);
+    if hit {
+        bump_percpu(&FUTEX_SHARED_HITS, 1);
+    }
+}
+
+/// Account VMAR descents the futex path performed outside a shared-word search.
+pub fn note_futex_vmar_walks(walks: u64) {
+    bump_percpu(&FUTEX_VMAR_WALKS, walks);
+}
+
+/// `(ops, shared probes, shared hits, VMAR descents)` across all CPUs.
+pub fn futex_stats() -> (u64, u64, u64, u64) {
+    (
+        sum_percpu(&FUTEX_OPS),
+        sum_percpu(&FUTEX_SHARED_PROBES),
+        sum_percpu(&FUTEX_SHARED_HITS),
+        sum_percpu(&FUTEX_VMAR_WALKS),
+    )
+}

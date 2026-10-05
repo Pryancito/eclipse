@@ -474,14 +474,25 @@ impl Syscall<'_> {
             return None;
         }
         let vmar = self.zircon_process().vmar();
-        let mapping = vmar.find_mapping(uaddr)?;
-        let (vmo, offset) = mapping.vmo_and_offset(uaddr)?;
+        // A second descent for the address the bounds check just walked to, and
+        // a third lock to read the mapping's VMO -- all so the common answer can
+        // be "no". Counted so the next bench run says what that costs.
+        let found = vmar
+            .find_mapping(uaddr)
+            .and_then(|mapping| mapping.vmo_and_offset(uaddr).map(|vo| (mapping, vo)));
+        let Some((mapping, (vmo, offset))) = found else {
+            kernel_hal::kstats::note_futex_shared_probe(1, false);
+            return None;
+        };
+        let _ = &mapping;
         // A PRIVATE mapping keeps the per-process table even without the
         // private flag: nobody else can observe that word, and sharing a queue
         // across a copy-on-write split would be wrong.
         if !vmo.is_shared_object() {
+            kernel_hal::kstats::note_futex_shared_probe(1, false);
             return None;
         }
+        kernel_hal::kstats::note_futex_shared_probe(1, true);
         // Force the page resident before translating: a lazily mapped word has
         // no page-table entry yet, and `query_vaddr` would simply fail.
         let _ = vmar.handle_page_fault(uaddr, MMUFlags::READ);
@@ -540,8 +551,13 @@ impl Syscall<'_> {
         //         (unresolved by the user vmar)
         //
         // reproducible to the byte across boots, from PulseAudio.
+        kernel_hal::kstats::note_futex_op();
         let word: UserInPtr<i32> = uaddr.into();
         word.check()?;
+        // The bounds check above descended the VMAR once. Counted here rather
+        // than inside `check`, which every syscall uses: the question is what
+        // the *futex* path costs.
+        kernel_hal::kstats::note_futex_vmar_walks(1);
         // A futex without FUTEX_PRIVATE_FLAG may name a word two DIFFERENT
         // processes share, so it cannot be served from the per-process table.
         // See `linux_object::sync::shared_futex` for why this is what every GL
