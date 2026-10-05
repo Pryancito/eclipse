@@ -1628,15 +1628,43 @@ impl DrmDev {
                 // and answers ENOENT for one that does not exist. The id was
                 // not read at all, so a stale or invented plane id presented
                 // the fb on the CRTC as if it named the primary plane.
-                if drm::get_plane(req.plane_id).is_none() {
+                let Some(plane) = drm::get_plane(req.plane_id) else {
                     return Err(FsError::EntryNotFound);
-                }
+                };
                 if req.fb_id != 0 {
                     // With an fb to show, `drm_mode_setplane` looks the fb up
                     // and then the CRTC, both ENOENT. The CRTC id was not
                     // read either.
-                    if drm::get_fb(req.fb_id).is_none() || drm::get_crtc(req.crtc_id).is_none() {
+                    let Some(fb) = drm::get_fb(req.fb_id) else {
                         return Err(FsError::EntryNotFound);
+                    };
+                    if drm::get_crtc(req.crtc_id).is_none() {
+                        return Err(FsError::EntryNotFound);
+                    }
+                    // `__setplane_check`: the plane has to be usable on this
+                    // CRTC (`possible_crtcs & drm_crtc_mask(crtc)`, EINVAL;
+                    // the mask bit is the CRTC's index in the resource list,
+                    // which is what GETPLANE advertises), and the source
+                    // rectangle, in 16.16, has to lie inside the fb
+                    // (`drm_framebuffer_check_src_coords`, ENOSPC). Neither
+                    // was read: a plane was put on a CRTC it does not reach,
+                    // and a source rectangle past the fb's edge was accepted
+                    // and then ignored, so the client believed it was showing
+                    // a crop the scanout never made.
+                    let index = drm::get_resources()
+                        .1
+                        .iter()
+                        .position(|&id| id == req.crtc_id)
+                        .unwrap_or(usize::MAX);
+                    if index >= 32 || plane.possible_crtcs & (1 << index) == 0 {
+                        return Err(FsError::InvalidParam);
+                    }
+                    let (fb_w, fb_h) = ((fb.width as u64) << 16, (fb.height as u64) << 16);
+                    let (src_x, src_y) = (req.src_x as u64, req.src_y as u64);
+                    let (src_w, src_h) = (req.src_w as u64, req.src_h as u64);
+                    if src_w > fb_w || src_x > fb_w - src_w || src_h > fb_h || src_y > fb_h - src_h
+                    {
+                        return Err(FsError::NoDeviceSpace);
                     }
                     if let Err(e) = drm::present_now_checked(req.fb_id, req.crtc_id, None) {
                         present_failed("SETPLANE", req.fb_id, req.crtc_id, e)?;
@@ -12425,6 +12453,97 @@ mod hw_kms_tests {
         assert_eq!(c.ioctl(DRM_IOCTL_MODE_SETPLANE, &mut set_plane), enoent);
         set_plane.crtc_id = 60;
         assert_eq!(c.ioctl(DRM_IOCTL_MODE_SETPLANE, &mut set_plane), Ok(0));
+
+        c.rmfb(fb).expect("RMFB");
+        c.destroy_dumb(buf.handle).expect("DESTROY_DUMB");
+    }
+
+    /// `__setplane_check`: the plane has to be usable on the CRTC named
+    /// (`possible_crtcs`, EINVAL) and the source rectangle, in 16.16, has to
+    /// lie inside the fb (ENOSPC). Neither was read: a plane went onto a CRTC
+    /// it does not reach, and a crop past the fb's edge was accepted, so a
+    /// client believed it was showing a crop the scanout never made.
+    #[test]
+    fn setplane_wants_a_crtc_the_plane_reaches_and_a_source_inside_the_fb() {
+        let screen = kms_emu::attach(32, 8);
+        let _first = screen.attach_gpu(EmuGpu::hardware_kms("emu-gpu-0").with_ids(60, 61, 62));
+        let _second = screen.attach_gpu(EmuGpu::hardware_kms("emu-gpu-1").with_ids(70, 71, 72));
+        let c = Client::open(0);
+        let buf = c.create_dumb(32, 8);
+        paint(&buf, 0x0000_7777);
+        let fb = c.addfb2(&buf);
+        // The resource list decides the CRTC indices; the plane of each
+        // card is its CRTC id plus two.
+        let (crtcs, _) = topology(&c);
+        assert_eq!(crtcs.len(), 2);
+        let (front, back) = (crtcs[0], crtcs[1]);
+        let plane_of = |crtc: u32| crtc + 2;
+
+        let set_plane = |plane_id: u32, crtc_id: u32, src: [u32; 4]| {
+            let mut req: DrmModeSetPlane = zeroed();
+            req.plane_id = plane_id;
+            req.crtc_id = crtc_id;
+            req.fb_id = fb;
+            req.crtc_w = 32;
+            req.crtc_h = 8;
+            req.src_x = src[0] << 16;
+            req.src_y = src[1] << 16;
+            req.src_w = src[2] << 16;
+            req.src_h = src[3] << 16;
+            c.ioctl(DRM_IOCTL_MODE_SETPLANE, &mut req)
+        };
+        let enospc = Err(FsError::NoDeviceSpace);
+
+        // Every plane advertises `possible_crtcs = 1`, CRTC index 0: the
+        // plane of the card listed second is not usable on its own CRTC, by
+        // what the client was told, and the first's is.
+        assert_eq!(
+            set_plane(plane_of(back), back, [0, 0, 32, 8]),
+            Err(FsError::InvalidParam),
+            "a CRTC the plane's mask does not reach"
+        );
+        assert_eq!(set_plane(plane_of(front), front, [0, 0, 32, 8]), Ok(0));
+
+        assert_eq!(
+            set_plane(plane_of(front), front, [0, 0, 33, 8]),
+            enospc,
+            "wider than the fb"
+        );
+        assert_eq!(
+            set_plane(plane_of(front), front, [0, 0, 32, 9]),
+            enospc,
+            "taller than the fb"
+        );
+        assert_eq!(
+            set_plane(plane_of(front), front, [1, 0, 32, 8]),
+            enospc,
+            "x pushes it past the edge"
+        );
+        assert_eq!(
+            set_plane(plane_of(front), front, [0, 1, 32, 8]),
+            enospc,
+            "y pushes it past the bottom"
+        );
+        assert_eq!(
+            set_plane(plane_of(front), front, [16, 4, 16, 4]),
+            Ok(0),
+            "a crop that fits"
+        );
+        assert_eq!(
+            set_plane(plane_of(front), front, [0, 0, 0, 0]),
+            Ok(0),
+            "no source rectangle at all"
+        );
+
+        // A fractional source edge counts: 31.5 wide from x = 0.75 is past 32.
+        let mut req: DrmModeSetPlane = zeroed();
+        req.plane_id = plane_of(front);
+        req.crtc_id = front;
+        req.fb_id = fb;
+        req.src_x = 3 << 14;
+        req.src_w = (31 << 16) | (1 << 15);
+        req.src_h = 8 << 16;
+        assert_eq!(c.ioctl(DRM_IOCTL_MODE_SETPLANE, &mut req), enospc);
 
         c.rmfb(fb).expect("RMFB");
         c.destroy_dumb(buf.handle).expect("DESTROY_DUMB");
