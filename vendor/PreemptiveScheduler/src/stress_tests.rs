@@ -132,7 +132,7 @@ fn stress_waker_page_never_loses_a_wake_nor_hands_out_a_borrowed_slot() {
         let owed = owed.clone();
         let done = done.clone();
         thread::spawn(move || {
-            let mut rng = Rng::new(0xC0FF_EE);
+            let mut rng = Rng::new(0x00C0_FFEE);
             let mut borrowed: u64 = 0;
             loop {
                 // Check a few slots in or out, as polls starting and ending.
@@ -694,12 +694,15 @@ fn stress_steal_across_collections_keeps_handouts_exclusive() {
         })
         .collect();
 
+    let published = Arc::new(AtomicUsize::new(0));
     let producers: Vec<_> = (0..VICTIMS)
         .map(|v| {
             let wakers = wakers.clone();
+            let published = published.clone();
             thread::spawn(move || {
                 let mut rng = Rng::new(0xA11CE + v as u64);
                 for _ in 0..WAKES_EACH {
+                    published.fetch_add(1, Ordering::SeqCst);
                     let victim = rng.below(VICTIMS);
                     wakers[victim][rng.below(TASKS_EACH)].wake_by_ref();
                 }
@@ -726,6 +729,17 @@ fn stress_steal_across_collections_keeps_handouts_exclusive() {
     // here; the deterministic steal below is what covers the path when they
     // all lose.
     assert!(probes > 0, "no thief ever probed a victim");
+    // And there was something to steal: a run in which nothing was woken
+    // satisfies every exclusivity check on its own.
+    assert_eq!(
+        published.load(Ordering::SeqCst),
+        VICTIMS * WAKES_EACH,
+        "a producer never published its wakes"
+    );
+    assert!(
+        total_handouts.load(Ordering::SeqCst) > 0,
+        "nobody was ever handed a task during the concurrent phase"
+    );
     // Quiescent, so this part is not a race: a woken task is handed to a thief
     // on another thread by `try_take_task`, which is the path the concurrent
     // phase above exercises when it wins. Without it a run in which every
