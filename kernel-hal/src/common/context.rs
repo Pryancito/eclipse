@@ -120,7 +120,7 @@ impl fmt::Display for X86TrapErrorCode {
             } else {
                 "GDT"
             };
-            return write!(
+            write!(
                 f,
                 "error_code {:#x} names a descriptor: {} index {}{}",
                 ec,
@@ -131,7 +131,25 @@ impl fmt::Display for X86TrapErrorCode {
                 } else {
                     ""
                 },
-            );
+            )?;
+            // An LDT selector is not a thing this kernel can produce. Nothing
+            // in the tree executes `lldt` and there is no `modify_ldt(2)`, so
+            // LDTR is null on every CPU from boot: every selector this kernel
+            // or its userspace ABI ever loads has TI clear and comes out of
+            // the GDT, which `init_ap` extends per CPU for exactly that
+            // reason. So TI set does not mean "a bad LDT entry" -- it means
+            // the sixteen bits the CPU took as a selector were not a selector,
+            // and the verdict belongs next to the decode rather than in
+            // whoever reads it later. Seen on hardware as `error_code 0x4c`
+            // (LDT index 9) on a #GP in kernel code, alongside heap deadlock
+            // reports -- i.e. the same wild writes, reaching a segment
+            // register this time.
+            if ec & 0b110 == 0b100 {
+                return f.write_str(
+                    " -- but this kernel never loads an LDT (no `lldt`, no                      `modify_ldt(2)`, so LDTR is null on every CPU and every                      selector it uses is a GDT one), so the error code itself                      is the evidence: the value the faulting instruction took                      as a segment selector was not one. Look for what wrote a                      segment register, or the stack slot a return reloads it                      from, rather than for a descriptor table entry",
+                );
+            }
+            return Ok(());
         }
         match self.vec {
             13 => f.write_str(
@@ -1124,6 +1142,29 @@ mod tests {
         let s = hint(12, 0b1101);
         assert!(s.contains("LDT index 1"), "{}", s);
         assert!(s.contains("external event"), "{}", s);
+    }
+
+    /// `error_code 0x4c` on a #GP, off a hardware stop screen: index 9, TI
+    /// set. The index is not the finding -- the table is. This kernel loads no
+    /// LDT at all, so a selector that names one cannot have come from any code
+    /// path in it, and the error code is itself evidence that the sixteen bits
+    /// the CPU read as a selector were something else.
+    #[test]
+    fn an_ldt_selector_is_reported_as_impossible_in_this_kernel() {
+        let s = hint(13, 0x4c);
+        assert!(s.contains("LDT index 9"), "{}", s);
+        assert!(s.contains("never loads an LDT"), "{}", s);
+        assert!(s.contains("was not one"), "{}", s);
+    }
+
+    /// The verdict belongs to the LDT case alone: a GDT selector is ordinary,
+    /// and an IDT one is a gate, so neither may carry it.
+    #[test]
+    fn a_gdt_or_idt_selector_keeps_its_plain_decode() {
+        for ec in [0x58, 0b110, 0b1011] {
+            let s = hint(13, ec);
+            assert!(!s.contains("never loads an LDT"), "{:#x}: {}", ec, s);
+        }
     }
 
     /// Only #TS, #NP, #SS and #GP carry a selector. Reading one out of #DF's

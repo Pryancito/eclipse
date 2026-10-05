@@ -247,6 +247,72 @@ fn run_process_exit_hooks(pid: KoID) {
     }
 }
 
+/// The `ext` fat pointer's DATA word has been overwritten, and a
+/// `downcast_ref` just handed out a reference built on it.
+///
+/// This is the half of the `ext` corruption that the report inside
+/// [`ProcessExt::linux`] enumerates (`DATA ONLY: one 8-byte store over the
+/// data word, vtable untouched`) and could never actually print. A downcast
+/// checks the `TypeId`, which lives in the VTABLE word; with the vtable
+/// untouched the downcast SUCCEEDS, so the failure arm never runs. The
+/// reference it returns points at whatever was written over the field, and the
+/// first field access through it faults there plus an offset -- seen on
+/// hardware as
+///
+/// ```text
+/// KERNEL NULL-RANGE PAGE FAULT cpu=6 vaddr=0x10 flags=WRITE
+/// rip=... (<lock::ticket::TicketMutex<[linux_object::time::ItimerSlot; 3]>>::lock+0x67)
+/// ```
+///
+/// i.e. a data word of 0 and the `itimers` mutex at offset 0x10 of a
+/// `LinuxProcess` that is not there. That fault halts the machine from inside
+/// a lock acquisition, naming the mutex and nothing about the process, the
+/// writer or the field. Comparing against the birth snapshot before the
+/// reference escapes turns it into a report that names all three.
+///
+/// Nothing here dereferences the ext: every value read belongs to the
+/// `Process` itself.
+#[cold]
+#[inline(never)]
+fn ext_data_word_overwritten(whose: &str, proc: &Process) -> ! {
+    let (data, vtable) = proc.ext_fat();
+    let (born_data, born_vtable) = proc.ext_born();
+    panic!(
+        "{}: pid={} name={:?} status={:?} -- the ext DATA word was overwritten and the \
+         downcast could not see it (the TypeId lives in the vtable word, which is \
+         {}). fat data={:#x} vtable={:#x}, at birth data={:#x} vtable={:#x} -> {}; \
+         canaries lo={:#x} hi={:#x} -> {}. Refusing to hand out &LinuxProcess at {:#x}: \
+         the first field access through it would fault at {:#x}+offset inside whatever \
+         lock it touches first, which is a halt that names the lock and not this process. \
+         ext is written once in the constructor and never again, so this is a wild write \
+         that landed on the field, not a construction path installing the wrong type",
+        whose,
+        proc.id(),
+        trace_name(proc),
+        proc.status(),
+        if vtable == born_vtable {
+            "intact"
+        } else {
+            "also moved"
+        },
+        data,
+        vtable,
+        born_data,
+        born_vtable,
+        proc.ext_drift().describe(),
+        proc.ext_canary_values().0,
+        proc.ext_canary_values().1,
+        match proc.ext_canaries() {
+            (true, true) => "both INTACT: a precise write to ext alone",
+            (false, true) => "LOW broken: overrun growing upward from below",
+            (true, false) => "HIGH broken: overrun growing downward from above",
+            (false, false) => "BOTH broken: wide overrun across the field",
+        },
+        data,
+        data,
+    )
+}
+
 impl ProcessExt for Process {
     fn create_linux(
         job: &Arc<Job>,
@@ -323,7 +389,8 @@ impl ProcessExt for Process {
         // it ever fires it means either a kernel-internal Zircon process leaked
         // into a Linux-only path, or the ext Box was corrupted. Name the
         // process so the report is actionable instead of a bare unwrap panic.
-        self.ext()
+        let lp = self
+            .ext()
             .downcast_ref::<LinuxProcess>()
             .unwrap_or_else(|| {
                 // Enumeration says this is UNREACHABLE by construction in a
@@ -475,11 +542,26 @@ impl ProcessExt for Process {
                             "BOTH words replaced: a whole fat pointer was assigned over ext",
                     },
                 )
-            })
+            });
+        // The downcast vouches for the VTABLE word only -- see
+        // `ext_data_word_overwritten`. Ask about the data word too, before the
+        // reference escapes and something dereferences it.
+        if self.ext_drift().data_moved() {
+            ext_data_word_overwritten("Process::linux()", self);
+        }
+        lp
     }
 
     fn try_linux(&self) -> Option<&LinuxProcess> {
-        self.ext().downcast_ref::<LinuxProcess>()
+        let lp = self.ext().downcast_ref::<LinuxProcess>()?;
+        // A `try_` that answers "not a Linux process" would be wrong here: the
+        // ext IS a LinuxProcess, its address is what moved. Returning `None`
+        // would make every caller skip quietly -- the itimer wheel among them,
+        // where this was first seen -- and leave the wild write unreported.
+        if self.ext_drift().data_moved() {
+            ext_data_word_overwritten("Process::try_linux()", self);
+        }
+        Some(lp)
     }
 
     /// [Fork] the process.

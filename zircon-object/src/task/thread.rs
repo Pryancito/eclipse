@@ -17,7 +17,7 @@ use kernel_hal::context::UserContext;
 use kernel_hal::sync::Mutex;
 
 use self::thread_state::ContextAccessState;
-use super::process::EXT_CANARY;
+use super::process::{ext_drift, ExtDrift, EXT_CANARY};
 use super::{exception::*, Process, Task};
 use crate::object::{KObjectBase, KoID, Signal};
 use crate::{define_count_helper, impl_kobject, ZxError, ZxResult};
@@ -506,6 +506,13 @@ impl Thread {
             self.ext_born[0].load(Ordering::Relaxed),
             self.ext_born[1].load(Ordering::Relaxed),
         )
+    }
+
+    /// How the `ext` fat pointer now compares with the snapshot taken at
+    /// construction. [`ExtDrift::data_moved`] is the question a caller must ask
+    /// BEFORE dereferencing a reference a successful `downcast_ref` gave it.
+    pub fn ext_drift(&self) -> ExtDrift {
+        ext_drift(self.ext_fat(), self.ext_born())
     }
 
     /// Returns a copy of saved context of current thread, or `Err(ZxError::BAD_STATE)`
