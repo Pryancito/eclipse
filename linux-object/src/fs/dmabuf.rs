@@ -125,6 +125,23 @@ impl Drop for DmaBuf {
     }
 }
 
+/// `DMA_BUF_IOCTL_SYNC`: `_IOW('b', 0, struct dma_buf_sync)`, one `__u64` of
+/// flags.
+const DMA_BUF_IOCTL_SYNC: usize = 0x4008_6200;
+/// `DMA_BUF_SET_NAME` as the header first spelt it (`_IOW('b', 1, __u32)`)
+/// and as it spells it now (`_IOW('b', 1, const char *)`); the kernel takes
+/// both.
+const DMA_BUF_SET_NAME_A: usize = 0x4004_6201;
+const DMA_BUF_SET_NAME_B: usize = 0x4008_6201;
+/// `DMA_BUF_SYNC_READ | DMA_BUF_SYNC_WRITE`.
+const DMA_BUF_SYNC_RW: u64 = 1 | 2;
+/// `DMA_BUF_SYNC_END`.
+const DMA_BUF_SYNC_END: u64 = 4;
+/// `DMA_BUF_SYNC_VALID_FLAGS_MASK`.
+const DMA_BUF_SYNC_VALID_FLAGS_MASK: u64 = DMA_BUF_SYNC_RW | DMA_BUF_SYNC_END;
+/// `DMA_BUF_NAME_LEN`.
+const DMA_BUF_NAME_LEN: usize = 32;
+
 #[async_trait]
 impl FileLike for DmaBuf {
     fn flags(&self) -> OpenFlags {
@@ -139,8 +156,8 @@ impl FileLike for DmaBuf {
         Ok(())
     }
 
-    // Linux `dma_buf_fops` can have read/write for CPU access; without that
-    // path here, vfs-style "unsupported on this fd" is `-EINVAL`, not `-ENOSYS`.
+    // `dma_buf_fops` has no read or write: `vfs_read`/`vfs_write` answer
+    // EINVAL for a file without them, not ENOSYS.
     async fn read(&self, _buf: &mut [u8]) -> LxResult<usize> {
         Err(LxError::EINVAL)
     }
@@ -162,17 +179,66 @@ impl FileLike for DmaBuf {
     /// backing size so the import succeeds; without this lseek failed (EBADF on
     /// a non-`File` fd) and eglCreateImageKHR returned EGL_BAD_ALLOC.
     fn seek(&self, pos: SeekFrom) -> LxResult<u64> {
-        let offset = match pos {
-            SeekFrom::Start(off) => off as i64,
-            SeekFrom::End(off) => self.size as i64 + off,
-            // dma-bufs are stateless here (no kept cursor); treat relative seeks
-            // from a zero base, which is all Mesa needs.
-            SeekFrom::Current(off) => off,
+        // `dma_buf_llseek`: "only support discovering the end of the buffer,
+        // but also allow SEEK_SET to maintain the idiomatic SEEK_END(0),
+        // SEEK_CUR(0) pattern" -- SEEK_END and SEEK_SET, offset 0, and
+        // EINVAL for the rest. This took any whence and any offset and
+        // answered with arithmetic on a file that has no position, so a
+        // client probing the size the Linux way got the right answer and
+        // one probing it any other way got a number that meant nothing.
+        let (base, offset) = match pos {
+            SeekFrom::End(off) => (self.size as u64, off),
+            SeekFrom::Start(off) => (0, off as i64),
+            SeekFrom::Current(_) => return Err(LxError::EINVAL),
         };
-        if offset < 0 {
+        if offset != 0 {
             return Err(LxError::EINVAL);
         }
-        Ok(offset as u64)
+        Ok(base)
+    }
+
+    /// `dma_buf_ioctl`: `DMA_BUF_IOCTL_SYNC` with its flags validated,
+    /// `DMA_BUF_SET_NAME` with its string validated, ENOTTY for the rest.
+    /// None of it existed: every ioctl on a dma-buf fd was ENOSYS, and a
+    /// client bracketing its CPU access with `SYNC` (Firefox's and
+    /// Chromium's dma-buf surfaces do) took that as the fd not being a
+    /// dma-buf at all.
+    fn ioctl(&self, request: usize, arg1: usize, _arg2: usize, _arg3: usize) -> LxResult<usize> {
+        match request {
+            DMA_BUF_IOCTL_SYNC => {
+                if !kernel_hal::user::user_range_ok(arg1, core::mem::size_of::<u64>()) {
+                    return Err(LxError::EFAULT);
+                }
+                let flags = unsafe { *(arg1 as *const u64) };
+                if flags & !DMA_BUF_SYNC_VALID_FLAGS_MASK != 0 {
+                    return Err(LxError::EINVAL);
+                }
+                // The direction has to be READ, WRITE or both; "neither" is
+                // the `default:` arm of the kernel's switch.
+                if flags & DMA_BUF_SYNC_RW == 0 {
+                    return Err(LxError::EINVAL);
+                }
+                // `begin_cpu_access`/`end_cpu_access`: the backing here is
+                // coherent with the CPU (system memory or a BAR mapping),
+                // so there is no cache to flush or invalidate.
+                Ok(0)
+            }
+            DMA_BUF_SET_NAME_A | DMA_BUF_SET_NAME_B => {
+                // `strndup_user(buf, DMA_BUF_NAME_LEN)`: the name has to end
+                // within 32 bytes (EINVAL otherwise). Nothing here shows it
+                // (Linux puts it in fdinfo), so it is checked and dropped.
+                if !kernel_hal::user::user_range_ok(arg1, DMA_BUF_NAME_LEN) {
+                    return Err(LxError::EFAULT);
+                }
+                let name =
+                    unsafe { core::slice::from_raw_parts(arg1 as *const u8, DMA_BUF_NAME_LEN) };
+                if !name.contains(&0) {
+                    return Err(LxError::EINVAL);
+                }
+                Ok(0)
+            }
+            _ => Err(LxError::ENOTTY),
+        }
     }
 
     fn poll(&self, _events: PollEvents) -> LxResult<PollStatus> {
@@ -303,5 +369,96 @@ mod prime_flags_tests {
     fn a_generic_dma_buf_is_read_write_and_close_on_exec() {
         let generic = DmaBuf::new(0, 4096, VmObject::new_paged(1));
         assert_eq!(generic.flags(), OpenFlags::RDWR | OpenFlags::CLOEXEC);
+    }
+}
+
+#[cfg(test)]
+mod fops_tests {
+    //! The dma-buf fd's own file operations, against `dma_buf_fops`.
+
+    use super::super::devfs::drm_scheme::DRM_RDWR;
+    use super::*;
+    use zircon_object::vm::VmObject;
+
+    fn dmabuf() -> Arc<DmaBuf> {
+        DmaBuf::from_prime(1, 0, 4096, VmObject::new_paged(1), DRM_RDWR)
+    }
+
+    /// `dma_buf_llseek`: SEEK_END(0) is how userspace learns the size, and
+    /// SEEK_SET(0) is allowed for the idiom; any other whence or offset is
+    /// EINVAL. Any whence and any offset were accepted and answered with
+    /// arithmetic on a file that has no position.
+    #[test]
+    fn lseek_discovers_the_size_and_refuses_everything_else() {
+        let d = dmabuf();
+        assert_eq!(d.seek(SeekFrom::End(0)), Ok(4096));
+        assert_eq!(d.seek(SeekFrom::Start(0)), Ok(0));
+        assert_eq!(d.seek(SeekFrom::Current(0)), Err(LxError::EINVAL));
+        assert_eq!(d.seek(SeekFrom::End(-8)), Err(LxError::EINVAL));
+        assert_eq!(d.seek(SeekFrom::End(8)), Err(LxError::EINVAL));
+        assert_eq!(d.seek(SeekFrom::Start(8)), Err(LxError::EINVAL));
+        assert_eq!(d.seek(SeekFrom::Current(8)), Err(LxError::EINVAL));
+    }
+
+    /// `dma_buf_fops` has no write (nor read): EINVAL, as `vfs_write` answers
+    /// for such a file, not ENOSYS.
+    #[test]
+    fn a_dma_buf_cannot_be_written_through_the_fd() {
+        assert_eq!(dmabuf().write(&[0u8; 4]), Err(LxError::EINVAL));
+    }
+
+    /// `dma_buf_ioctl`: SYNC takes READ, WRITE or both, with or without END,
+    /// and nothing else (EINVAL); SET_NAME wants a string that ends within
+    /// 32 bytes (EINVAL); anything else is ENOTTY. Every ioctl was ENOSYS.
+    #[test]
+    fn sync_and_set_name_are_validated_and_the_rest_is_enotty() {
+        let d = dmabuf();
+        let sync = |flags: u64| d.ioctl(DMA_BUF_IOCTL_SYNC, &flags as *const u64 as usize, 0, 0);
+        for ok in [1u64, 2, 3, 1 | 4, 2 | 4, 3 | 4] {
+            assert_eq!(sync(ok), Ok(0), "flags {:#x}", ok);
+        }
+        assert_eq!(sync(0), Err(LxError::EINVAL), "no direction");
+        assert_eq!(sync(4), Err(LxError::EINVAL), "END with no direction");
+        assert_eq!(
+            sync(8),
+            Err(LxError::EINVAL),
+            "a flag the kernel does not define"
+        );
+        assert_eq!(sync(1 << 32), Err(LxError::EINVAL), "in the high word too");
+        assert_eq!(
+            sync(8 | 1),
+            Err(LxError::EINVAL),
+            "an undefined flag is refused even next to a direction"
+        );
+        assert_eq!(
+            sync((1 << 32) | 1),
+            Err(LxError::EINVAL),
+            "and so is one in the high word"
+        );
+
+        let name = *b"scanout\0";
+        for request in [DMA_BUF_SET_NAME_A, DMA_BUF_SET_NAME_B] {
+            assert_eq!(d.ioctl(request, name.as_ptr() as usize, 0, 0), Ok(0));
+        }
+        let unterminated = [b'x'; DMA_BUF_NAME_LEN];
+        assert_eq!(
+            d.ioctl(DMA_BUF_SET_NAME_B, unterminated.as_ptr() as usize, 0, 0),
+            Err(LxError::EINVAL),
+            "a name that does not end within DMA_BUF_NAME_LEN"
+        );
+        let mut terminated = [b'x'; DMA_BUF_NAME_LEN];
+        terminated[DMA_BUF_NAME_LEN - 1] = 0;
+        assert_eq!(
+            d.ioctl(DMA_BUF_SET_NAME_B, terminated.as_ptr() as usize, 0, 0),
+            Ok(0),
+            "one that ends on the last byte"
+        );
+
+        let flags = 1u64;
+        assert_eq!(
+            d.ioctl(0x4008_6209, &flags as *const u64 as usize, 0, 0),
+            Err(LxError::ENOTTY),
+            "an ioctl the dma-buf does not have"
+        );
     }
 }
