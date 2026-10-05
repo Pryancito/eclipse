@@ -1810,3 +1810,318 @@ mod tests {
         }
     }
 }
+
+/// The machinery that reports a corrupted `ext`, and the parts of the process
+/// the handle-table and lifecycle tests above do not reach.
+///
+/// The `ext` diagnostics came out of a live corruption on real hardware, and
+/// the report they produce is the only evidence that reaches us from the
+/// machine it happens on. Nothing tested that the report says the right thing:
+/// of the nine deliberate mutations aimed at this code, all nine survived.
+#[cfg(test)]
+mod ext_and_lifecycle_tests {
+    use super::*;
+    use crate::object::KernelObject;
+    use crate::signal::Event;
+    use crate::task::*;
+
+    fn proc() -> Arc<Process> {
+        Process::create(&Job::root(), "proc").expect("failed to create process")
+    }
+
+    // ------------------------------------------------------- the ext guards
+
+    /// The guard is an 8-byte pattern a human reads out of a crash dump, so
+    /// what it has to be is legible: `EXTCANRY` in ASCII. A guard that is just
+    /// "some constant" cannot be recognised in a hex window, which is the only
+    /// place it is ever seen.
+    #[test]
+    fn the_guard_pattern_is_the_word_a_dump_can_be_read_for() {
+        assert_eq!(&EXT_CANARY.to_be_bytes(), b"EXTCANRY");
+    }
+
+    /// Both guards come up intact, and both are the pattern. This is the
+    /// baseline every sighting has been measured against: the guards have
+    /// always come back whole, which is what says the writer addresses `ext`
+    /// exactly rather than overrunning into it.
+    #[test]
+    fn a_fresh_process_has_both_guards_whole() {
+        let proc = proc();
+        assert_eq!(proc.ext_canaries(), (true, true));
+        assert_eq!(proc.ext_canary_values(), (EXT_CANARY, EXT_CANARY));
+    }
+
+    /// The snapshot is taken at construction and nothing has run since, so the
+    /// field must still read exactly as it was recorded. A verdict of anything
+    /// but `Intact` here would mean the snapshot and the reader disagree about
+    /// the field, and every later report would be measured against a lie.
+    #[test]
+    fn a_fresh_process_has_not_drifted() {
+        let proc = proc();
+        assert_eq!(proc.ext_fat(), proc.ext_born());
+        assert_eq!(proc.ext_drift(), ExtDrift::Intact);
+        assert!(!proc.ext_drift().moved());
+    }
+
+    /// Which word is which. `ext_fat` answers `(data, vtable)` in that order,
+    /// and the whole diagnostic turns on it: the data word is the one a
+    /// successful `downcast_ref` hands back and nothing checks, so asking
+    /// about the wrong half would clear exactly the case that must be caught.
+    /// The data pointer is taken the other way round here -- casting the fat
+    /// pointer to a thin one -- so this does not merely repeat the line it
+    /// pins.
+    #[test]
+    fn the_first_word_of_the_pair_is_the_data_pointer() {
+        let proc = proc();
+        let data = &*proc.ext as *const (dyn Any + Send + Sync) as *const u8 as usize;
+        let (fat_data, fat_vtable) = proc.ext_fat();
+        assert_eq!(fat_data, data, "the first word is not the data pointer");
+        assert_ne!(
+            fat_vtable, data,
+            "the second word is the vtable, not the data again"
+        );
+        assert_eq!(proc.ext_born().0, data, "and the snapshot keeps that order");
+    }
+
+    /// Each process's `ext` has storage of its own, which is what makes a
+    /// comparison of data words mean anything: the word is an address nobody
+    /// else was given, so finding another one there is a write that happened.
+    ///
+    /// It takes a real payload to see that. `Process::create` installs `()`,
+    /// and a zero-sized `Box` allocates nothing: every such process carries
+    /// the same data word, so the only `ext` whose address says anything is
+    /// one a `create_with_ext` actually put something in -- which is what the
+    /// kernel does, with a `LinuxProcess`.
+    #[test]
+    fn each_process_has_its_ext_at_an_address_of_its_own() {
+        let job = Job::root();
+        let one = Process::create_with_ext(&job, "one", 0x1111_2222_3333_4444u64).unwrap();
+        let two = Process::create_with_ext(&job, "two", 0x5555_6666_7777_8888u64).unwrap();
+
+        assert_ne!(
+            one.ext_fat().0,
+            two.ext_fat().0,
+            "two processes were handed the same ext address"
+        );
+        assert_eq!(one.ext_drift(), ExtDrift::Intact);
+        assert_eq!(two.ext_drift(), ExtDrift::Intact);
+        // And the snapshot is per process, not a static.
+        assert_ne!(one.ext_born().0, two.ext_born().0);
+    }
+
+    /// `vtable_info` dereferences what it is given, so the two guards in front
+    /// of it are the whole safety of the function: it runs on a panic path,
+    /// where a second fault means the report is never printed. Everything that
+    /// could not be a kernel vtable has to be refused BEFORE the read -- a
+    /// null, a small integer, a userspace address, and anything not
+    /// word-aligned.
+    #[test]
+    fn a_pointer_that_could_not_be_a_vtable_is_refused_before_it_is_read() {
+        for bogus in [0usize, 8, 0x1000, 0x7fff_ffff_ffff_fff8] {
+            assert_eq!(vtable_info(bogus), None, "{:#x} was not refused", bogus);
+        }
+        // Kernel-half but misaligned: the other guard, on its own.
+        for odd in [1usize, 2, 4, 7] {
+            let addr = 0xffff_8000_0000_0000usize + odd;
+            assert_eq!(vtable_info(addr), None, "{:#x} was not refused", addr);
+        }
+    }
+
+    // --------------------------------------------------------- the lifecycle
+
+    /// A process that has exited is never set running again. `exit` on a
+    /// process with no threads runs the whole teardown at once -- address
+    /// space cleared, termination latched, out of its job -- and a forked
+    /// child is published to its job BEFORE it has a thread, so a concurrent
+    /// kill can land exactly there. Stamping `Running` over that gave a
+    /// process both running and terminated: in no job, invisible to the
+    /// reaper, with its address space already gone.
+    #[test]
+    fn a_process_that_has_exited_is_never_set_running_again() {
+        let proc = proc();
+        assert!(proc.set_status_running(), "a fresh process starts");
+        proc.exit(5);
+
+        assert!(
+            !proc.set_status_running(),
+            "the caller was not told the child is already dead"
+        );
+        let info = proc.get_info();
+        assert!(info.has_exited, "{:?}", proc.status());
+        assert_eq!(info.return_code, 5, "the exit code was overwritten");
+        assert_eq!(proc.exit_code(), Some(5));
+    }
+
+    /// The first exit code is the one on file. A second `exit` -- the
+    /// teardown racing a kill, or a kill that arrives after the program has
+    /// said what it was exiting with -- must not replace it, or the parent's
+    /// `wait4` reads a status the child never asked for.
+    #[test]
+    fn the_first_exit_code_is_the_one_the_parent_reads() {
+        let proc = proc();
+        proc.exit(5);
+        proc.exit(7);
+        assert_eq!(proc.exit_code(), Some(5));
+        assert_eq!(proc.get_info().return_code, 5);
+    }
+
+    /// Termination is published when the status is, not when the last thread
+    /// finally dies: a thread parked in a blocking syscall never observes
+    /// `Dying`, and with the signal deferred the parent slept for ever on a
+    /// child whose status was already on file.
+    #[test]
+    fn exiting_publishes_termination_at_once() {
+        let proc = proc();
+        assert!(!proc.signal().contains(Signal::PROCESS_TERMINATED));
+        proc.exit(0);
+        assert!(
+            proc.signal().contains(Signal::PROCESS_TERMINATED),
+            "the parent's wait4 has nothing to wake on"
+        );
+    }
+
+    // ------------------------------------------------------- the handle table
+
+    /// Every id the mask admits still fits in a handle value. The value is the
+    /// id shifted up two with the low bits set, so a mask one bit wider would
+    /// shift its top bit off the end of the `u32` and hand out a value that
+    /// belongs to another id -- which is the wrap bug all over again, with no
+    /// counter to blame.
+    #[test]
+    fn every_id_the_mask_admits_still_fits_in_a_handle_value() {
+        assert!(
+            HANDLE_ID_MASK <= u32::MAX >> 2,
+            "an id of {:#x} loses its top bits in the shift",
+            HANDLE_ID_MASK
+        );
+        assert_eq!(
+            (HANDLE_ID_MASK << 2) | 0x3,
+            u32::MAX,
+            "and the widest id is the widest value"
+        );
+    }
+
+    /// Closing a handle wakes whoever was waiting on it. `zx_object_wait_one`
+    /// parks with a cancel token taken from the table, and the send on the way
+    /// out is what turns a closed handle into a cancelled wait instead of a
+    /// wait that never ends.
+    #[test]
+    fn closing_a_handle_fires_the_cancel_token_taken_from_it() {
+        let proc = proc();
+        let value = proc.add_handle(Handle::new(Event::new(), Rights::DEFAULT_EVENT));
+        let mut token = proc.get_cancel_token(value).unwrap();
+        assert_eq!(token.try_recv(), Ok(None), "nothing has happened yet");
+
+        proc.remove_handle(value).unwrap();
+
+        assert_eq!(
+            token.try_recv(),
+            Ok(Some(())),
+            "the wait parked on that handle was never told"
+        );
+    }
+
+    /// A value that names nothing answers `BAD_HANDLE`, like every other way
+    /// of asking the table about a value. `zx_object_wait_one` takes its cancel
+    /// token before it parks, so this is the error a program gets for waiting
+    /// on a handle it already closed, and it has to be the same one
+    /// `zx_object_get_info` would have given it.
+    #[test]
+    fn a_cancel_token_for_a_value_that_names_nothing_is_a_bad_handle() {
+        let proc = proc();
+        let value = proc.add_handle(Handle::new(Event::new(), Rights::DEFAULT_EVENT));
+        assert_eq!(
+            proc.get_cancel_token(value + 4).err(),
+            Some(ZxError::BAD_HANDLE)
+        );
+        proc.remove_handle(value).unwrap();
+        assert_eq!(
+            proc.get_cancel_token(value).err(),
+            Some(ZxError::BAD_HANDLE)
+        );
+    }
+
+    /// `ZX_INFO_HANDLE_COUNT` counts the handles to ONE object, and the table
+    /// holds handles to others.
+    #[test]
+    fn the_handle_count_is_the_handles_to_that_object_and_no_others() {
+        let proc = proc();
+        let counted = Event::new();
+        let other = Event::new();
+        assert_eq!(proc.count_handles_to(counted.id()), 0);
+        proc.add_handle(Handle::new(counted.clone(), Rights::DEFAULT_EVENT));
+        proc.add_handle(Handle::new(other, Rights::DEFAULT_EVENT));
+        let second = proc.add_handle(Handle::new(counted.clone(), Rights::DEFAULT_EVENT));
+
+        assert_eq!(proc.count_handles_to(counted.id()), 2);
+
+        proc.remove_handle(second).unwrap();
+        assert_eq!(proc.count_handles_to(counted.id()), 1);
+    }
+
+    // --------------------------------------------------------- the informers
+
+    /// `debugger_attached` is about the DEBUG exceptionate. A process's own
+    /// exception channel is what a crash handler takes; the debugger's is the
+    /// one `zx_object_get_info` reports, and a debugger seen where there is
+    /// none sends a tool looking for a channel nobody is holding.
+    #[test]
+    fn the_debugger_flag_reads_the_debug_channel_and_not_the_other_one() {
+        let proc = proc();
+        assert!(!proc.get_info().debugger_attached);
+
+        let _ordinary = proc
+            .exceptionate()
+            .create_channel(Rights::DEFAULT_CHANNEL)
+            .unwrap();
+        assert!(
+            !proc.get_info().debugger_attached,
+            "an exception channel is not a debugger"
+        );
+
+        let _debug = proc
+            .debug_exceptionate()
+            .create_channel(Rights::DEFAULT_CHANNEL)
+            .unwrap();
+        assert!(proc.get_info().debugger_attached);
+    }
+
+    /// The CPU time of the threads that have already gone ADDS UP. It is
+    /// credited one thread at a time as each exits, so a store rather than an
+    /// add would leave the process reporting only its last dead thread --
+    /// and the figure is what `ZX_INFO_TASK_RUNTIME` and `times()` are built
+    /// out of.
+    #[test]
+    fn the_time_of_dead_threads_adds_up_instead_of_replacing() {
+        let proc = proc();
+        assert_eq!(
+            (proc.dead_threads_time(), proc.dead_threads_sys_time()),
+            (0, 0)
+        );
+
+        proc.dead_threads_time_add(100);
+        proc.dead_threads_time_add(40);
+        proc.dead_threads_sys_time_add(7);
+        proc.dead_threads_sys_time_add(3);
+
+        assert_eq!(
+            proc.dead_threads_time(),
+            140,
+            "a thread's time went missing"
+        );
+        assert_eq!(proc.dead_threads_sys_time(), 10);
+    }
+
+    /// And the two counters are not the same counter: kernel time is a part of
+    /// the total, reported separately, so one reading the other would make
+    /// every process look like it spent all its time in the kernel.
+    #[test]
+    fn user_and_kernel_time_are_two_counters() {
+        let proc = proc();
+        proc.dead_threads_time_add(100);
+        assert_eq!(proc.dead_threads_sys_time(), 0, "they are the same counter");
+        proc.dead_threads_sys_time_add(7);
+        assert_eq!(proc.dead_threads_time(), 100);
+        assert_eq!(proc.dead_threads_sys_time(), 7);
+    }
+}
