@@ -3802,9 +3802,21 @@ int main(int argc, char **argv) {
         double shared = parity_run(0, 200, g_short_ns, &w_hz, &w_mean, &w_max);
         row("[kernel]", "spinner + 200us waker", shared < 0 ? NA : shared / 1e3,
             "kunit/s", "");
-        if (solo > 0 && shared > 0)
-            row("[kernel]", "throughput retained", shared / solo * 100.0, "%",
-                "low = preempted on every wake");
+        // A spinner cannot do MORE work with a waker stealing its CPU than it
+        // does alone, so a retention above 100% does not mean "no cost": it
+        // means the SOLO leg was itself disturbed and the two legs are not
+        // comparable. Printing the ratio anyway reports a 264% that reads like
+        // a spectacular result and is nothing of the sort -- a measuring tool
+        // must refuse the number rather than dress up a broken baseline.
+        int legs_comparable = solo > 0 && shared > 0 && shared / solo <= 1.05;
+        row("[kernel]", "throughput retained",
+            legs_comparable ? shared / solo * 100.0 : NA, "%",
+            "low = preempted on every wake");
+        if (solo > 0 && shared > 0 && !legs_comparable)
+            printf("           ^ the solo leg did LESS work than the loaded one,"
+                   " so it was\n             itself starved: compare the two"
+                   " kunit/s rows above, not\n             their ratio. Nothing"
+                   " here is a measurement of the floor.\n");
         row("[kernel]", "  waker rate achieved", w_hz, "wake/s", "");
         row("[kernel]", "  waker late (mean)", w_mean, "us", "");
         row("[kernel]", "  waker late (worst)", w_max, "us", "");
