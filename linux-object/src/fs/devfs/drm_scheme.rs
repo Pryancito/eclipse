@@ -1896,15 +1896,30 @@ impl DrmDev {
                     } else {
                         [0; 4]
                     };
+                    // `fb.pitch` is the uAPI number ADDFB2 was handed, not a
+                    // byte count: `create_fb_with_layout` derives its byte
+                    // pitch for the size check and stores the request
+                    // verbatim. So a tiled framebuffer reads back in 64-byte
+                    // blocks, exactly as it was created, and
+                    // `a_tiled_framebuffer_reads_back_the_pitch_it_was_made_with`
+                    // is what notices if that stops being true.
                     cmd.pitches = [fb.pitch, 0, 0, 0];
                     cmd.offsets = [0; 4];
-                    // `drm_mode_getfb2_ioctl` reports the modifier and sets
-                    // DRM_MODE_FB_MODIFIERS whenever the driver has them, so
-                    // a client can re-create the framebuffer from what it
+                    // `drm_mode_getfb2_ioctl` reports the modifier so a
+                    // client can re-create the framebuffer from what it
                     // reads back. Answering 0 for a tiled framebuffer hands
                     // it a description of a DIFFERENT surface -- same
                     // handle, same pitch number, linear -- which is the
                     // recipe for the garbage this layout is gated against.
+                    //
+                    // The flag goes up exactly when the modifier word is one
+                    // worth honouring, i.e. for a non-linear layout. Linux
+                    // sets it whenever the driver supports modifiers at all,
+                    // because there it round-trips the per-fb flag the
+                    // client created the framebuffer with; there is no such
+                    // stored flag here, and a linear framebuffer's modifier
+                    // is 0 either way, so the two spellings describe the
+                    // same surface.
                     cmd.modifier = [scanout_layout_modifier(fb.layout), 0, 0, 0];
                     if fb.layout != drm::ScanoutLayout::Linear {
                         cmd.flags |= DRM_MODE_FB_MODIFIERS;
@@ -18616,6 +18631,41 @@ mod addfb2_validation_tests {
         let back = getfb2(&client, plain);
         assert_eq!(back.modifier[0], 0);
         assert_eq!(back.flags & DRM_MODE_FB_MODIFIERS, 0);
+
+        drm::set_scanout_modifiers_enabled(false);
+    }
+
+    /// `GETFB2` answers the pitch in the units `ADDFB2` took it, which for a
+    /// tiled framebuffer is 64-byte blocks.
+    ///
+    /// The framebuffer stores bytes, so reporting the stored number straight
+    /// describes a surface 64 times wider than the one that exists -- and a
+    /// client that re-creates the framebuffer from its own readback gets
+    /// EINVAL at best and the wrong surface at worst. Round-tripping it is
+    /// the whole point of answering the modifier in the first place.
+    #[test]
+    fn a_tiled_framebuffer_reads_back_the_pitch_it_was_made_with() {
+        let _serialised = drm::test_globals::lock();
+        drm::set_scanout_modifiers_enabled(true);
+        let client = Client::open(0);
+        let buf = client.create_dumb(64, 64);
+        let turing = nvidia_block_linear_2d(0, 1, 2, 0x06, 0);
+
+        // 64 pixels x 4 bytes = 256 bytes = 4 blocks of 64.
+        let mut c = cmd(&buf);
+        c.flags = DRM_MODE_FB_MODIFIERS;
+        c.modifier[0] = turing;
+        c.pitches[0] = 4;
+        let fb = accepted(&client, c, "a Turing block-linear modifier");
+        assert_eq!(
+            getfb2(&client, fb).pitches[0],
+            4,
+            "the readback has to be in blocks, like the request was"
+        );
+
+        // A linear framebuffer keeps speaking bytes.
+        let plain = accepted(&client, cmd(&buf), "a plain linear framebuffer");
+        assert_eq!(getfb2(&client, plain).pitches[0], cmd(&buf).pitches[0]);
 
         drm::set_scanout_modifiers_enabled(false);
     }
