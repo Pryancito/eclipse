@@ -987,21 +987,25 @@ impl DrmDev {
                     0x6 => cap.value = 1,  // DRM_CAP_TIMESTAMP_MONOTONIC
                     0x8 => cap.value = 64, // DRM_CAP_CURSOR_WIDTH
                     0x9 => cap.value = 64, // DRM_CAP_CURSOR_HEIGHT
-                    // DRM_CAP_ADDFB2_MODIFIERS: report NO modifier support.
-                    // Our scanout is a CPU blit that reads the framebuffer
-                    // LINEARLY, so the only layout it can present is
-                    // DRM_FORMAT_MOD_LINEAR. Advertising modifier support (1)
-                    // let wlroots negotiate a BLOCK-LINEAR swapchain with NVK
-                    // (PTE kind 0x06), and binding it hit VM_BIND's refusal of
-                    // non-zero PTE kinds ("PTE kind 0x06 requested (tiled) ...
-                    // refusing"), so `vkBindImageMemory` failed and the
-                    // swapchain never allocated (`gbm_bo_create failed`,
-                    // "Swapchain for output 'HDMI-A-1' failed test"). With 0,
-                    // wlroots restricts scanout to implicit/linear buffers,
-                    // which bind with PTE kind 0 and blit correctly. (The
-                    // Vulkan renderer's VK_EXT_image_drm_format_modifier is a
-                    // separate device extension, unaffected by this KMS cap.)
-                    0x10 => cap.value = 0, // DRM_CAP_ADDFB2_MODIFIERS
+                    // DRM_CAP_ADDFB2_MODIFIERS: no modifier support by
+                    // default. The reason recorded here used to be VM_BIND's
+                    // refusal of non-zero PTE kinds, and that is no longer
+                    // true -- VM_BIND programs the Turing kinds (0x00..0x06)
+                    // verbatim and hands the compressible ones to the RM's
+                    // HAL. What still stands is the simpler half: the present
+                    // is a copy that reads the framebuffer LINEARLY, so
+                    // DRM_FORMAT_MOD_LINEAR is the only layout it can put on
+                    // the panel, and advertising more is a promise it cannot
+                    // keep -- wlroots would negotiate a block-linear
+                    // swapchain with NVK and the desktop would come up as
+                    // garbage. (The Vulkan renderer's
+                    // VK_EXT_image_drm_format_modifier is a separate device
+                    // extension, unaffected by this KMS cap.)
+                    // DRM_CAP_ADDFB2_MODIFIERS, and it has to agree with
+                    // what `addfb2_check` accepts: see
+                    // `drm::scanout_modifiers_enabled` for why this is 0
+                    // until the copy engine can do the block-linear swizzle.
+                    0x10 => cap.value = u64::from(drm::scanout_modifiers_enabled()),
                     // DRM_CAP_CRTC_IN_VBLANK_EVENT: our page-flip event carries
                     // the crtc_id, so report support (wlroots requires it).
                     0x12 => cap.value = 1,
@@ -1422,7 +1426,8 @@ impl DrmDev {
                     offsets: [0; 4],
                     modifier: [0; 4],
                 };
-                addfb2_check(&as_fb2)?;
+                // ADDFB has no modifier word at all, so this is always linear.
+                let _ = addfb2_check(&as_fb2)?;
                 // Linux: unknown GEM handle → ENOENT; bad geometry → EINVAL.
                 // Both used to collapse to DeviceError (EIO).
                 if drm::resolve_gem_backing_for(cmd.handle, drm::current_pid()).is_none() {
@@ -1450,17 +1455,18 @@ impl DrmDev {
             }
             DRM_IOCTL_MODE_ADDFB2 => {
                 let cmd = unsafe { &mut *(data as *mut DrmModeFbCmd2) };
-                addfb2_check(cmd)?;
+                let layout = addfb2_check(cmd)?;
                 // Linux: unknown GEM handle → ENOENT; bad geometry → EINVAL.
                 if drm::resolve_gem_backing_for(cmd.handles[0], drm::current_pid()).is_none() {
                     return Err(FsError::EntryNotFound);
                 }
-                if let Some(fb_id) = drm::create_fb_with_format(
+                if let Some(fb_id) = drm::create_fb_with_layout(
                     cmd.handles[0],
                     cmd.width,
                     cmd.height,
                     cmd.pitches[0],
                     cmd.pixel_format,
+                    layout,
                 ) {
                     cmd.fb_id = fb_id;
                     Ok(0)
@@ -1892,7 +1898,17 @@ impl DrmDev {
                     };
                     cmd.pitches = [fb.pitch, 0, 0, 0];
                     cmd.offsets = [0; 4];
-                    cmd.modifier = [0; 4];
+                    // `drm_mode_getfb2_ioctl` reports the modifier and sets
+                    // DRM_MODE_FB_MODIFIERS whenever the driver has them, so
+                    // a client can re-create the framebuffer from what it
+                    // reads back. Answering 0 for a tiled framebuffer hands
+                    // it a description of a DIFFERENT surface -- same
+                    // handle, same pitch number, linear -- which is the
+                    // recipe for the garbage this layout is gated against.
+                    cmd.modifier = [scanout_layout_modifier(fb.layout), 0, 0, 0];
+                    if fb.layout != drm::ScanoutLayout::Linear {
+                        cmd.flags |= DRM_MODE_FB_MODIFIERS;
+                    }
                     Ok(0)
                 } else {
                     // ENOENT, like `drm_mode_getfb2_ioctl`. Same reasoning as
@@ -3568,6 +3584,12 @@ fn present_failed(
     }
     match err {
         drm::PresentError::NoSuchFb => Err(FsError::EntryNotFound),
+        // EINVAL, as `drm_mode_setcrtc` answers for a framebuffer no plane
+        // can scan out ("Invalid pixel format" / failed atomic check). The
+        // CRTC is deliberately NOT bound to it: unlike the two below, this
+        // framebuffer will never become presentable, so leaving `crtc_fb`
+        // naming it would make every later repaint try it again.
+        drm::PresentError::UnsupportedLayout => Err(FsError::InvalidParam),
         drm::PresentError::NoDisplay | drm::PresentError::NoBacking => {
             // We are about to answer 0, so the CRTC really is configured with
             // this fb and `GETCRTC` has to say so. `present_now_checked` binds
@@ -4503,6 +4525,159 @@ fn legacy_fb_format(bpp: u32, depth: u32) -> Option<u32> {
 const DRM_MODE_FB_INTERLACED: u32 = 1 << 0;
 const DRM_MODE_FB_MODIFIERS: u32 = 1 << 1;
 
+// ===================== DRM format modifiers for scanout =====================
+
+/// `DRM_FORMAT_MOD_VENDOR_NVIDIA`, the top byte of every modifier below.
+const DRM_FORMAT_MOD_VENDOR_NVIDIA: u64 = 0x03;
+/// `DRM_FORMAT_MOD_LINEAR`, which is also the zero a pre-modifier client
+/// leaves in the field.
+const DRM_FORMAT_MOD_LINEAR: u64 = 0;
+/// `DRM_FORMAT_MOD_INVALID`: `fourcc_mod_code(NONE, ((1ULL << 56) - 1))`.
+const DRM_FORMAT_MOD_INVALID: u64 = 0x00ff_ffff_ffff_ffff;
+
+/// `drm_fourcc_canonicalize_nvidia_format_mod`, copied from `drm_fourcc.h`
+/// rather than approximated.
+///
+/// Page kind 0 means "pitch/linear", which a block-linear surface cannot be,
+/// so the kernel grandfathers the older `DRM_FORMAT_MOD_NVIDIA_16BX2_BLOCK(v)`
+/// modifiers -- which leave `k` at 0 -- onto kind `0xfe`, the generic
+/// uncompressed colour kind. Comparing a client's modifier against an
+/// advertised list WITHOUT this step silently rejects every client still
+/// sending the old spelling.
+fn canonicalize_nvidia_modifier(modifier: u64) -> u64 {
+    if modifier & 0x10 == 0 || modifier & (0xff << 12) != 0 {
+        modifier
+    } else {
+        modifier | (0xfe << 12)
+    }
+}
+
+/// The `g` field (bits 21:20) this GPU family speaks: **2**, "Gob Height 8,
+/// Turing+ Page Kind mapping". Not 1 -- that is G80..GT2XX, whose GOBs are
+/// four rows high -- and not 0, which is Fermi..Volta.
+const NVIDIA_MOD_GEN_TURING: u64 = 2;
+/// The `s` field (bit 22, plus 27:26 for values above 1): **1**,
+/// "Pre-GB20x ... Tegra Xavier-Orin Layout", which covers every Turing and
+/// Ampere desktop part.
+const NVIDIA_MOD_SECTOR_DESKTOP: u64 = 1;
+/// The largest `h` the hardware defines (`SET_SRC_BLOCK_SIZE_HEIGHT` tops out
+/// at `_THIRTYTWO_GOBS`).
+const NVIDIA_MOD_MAX_LOG2_GOBS_Y: u64 = 5;
+
+/// The page kinds a block-linear scanout buffer may carry: just
+/// `NV_MMU_VER2_PTE_KIND_GENERIC_MEMORY` (0x06), which is what NVK's layout
+/// library picks for every uncompressed tiled surface on Turing and what
+/// `VM_BIND` programs into the page tables verbatim. The page table and the
+/// copy engine have to agree on one kind, and this is it.
+///
+/// `0xfe`, which the canonicalization above can produce, is the generic kind
+/// of the **Fermi..Volta** mapping, so it only ever arrives alongside a `g`
+/// this decoder has already refused. It is not listed here, because listing
+/// it would mean accepting a Turing-generation modifier whose kind came from
+/// another generation's table.
+///
+/// A COMPRESSED kind is refused rather than downgraded: the comptags that
+/// give it meaning are allocated nowhere in this tree, and scanning out
+/// compressed bytes as if they were uncompressed is the one way this path
+/// paints garbage.
+const NVIDIA_SCANOUT_PAGE_KINDS: [u8; 1] = [0x06];
+
+/// What layout `modifier` asks for, or `None` if this scanout cannot present
+/// it.
+///
+/// Mirrors `nv_drm_framebuffer_init`'s checks (the lossless-compression field
+/// must be zero) and adds the two this tree needs: the GOB generation has to
+/// be the one the copy engine's `SET_SRC_BLOCK_SIZE` assumes, and the page
+/// kind has to be one `VM_BIND` maps verbatim.
+pub(super) fn decode_scanout_modifier(modifier: u64) -> Option<drm::ScanoutLayout> {
+    if modifier == DRM_FORMAT_MOD_LINEAR {
+        return Some(drm::ScanoutLayout::Linear);
+    }
+    if modifier == DRM_FORMAT_MOD_INVALID {
+        return None;
+    }
+    if modifier >> 56 != DRM_FORMAT_MOD_VENDOR_NVIDIA {
+        return None;
+    }
+    let m = canonicalize_nvidia_modifier(modifier & 0x00ff_ffff_ffff_ffff);
+    // Bit 4 must be 1: without it the value is one of the older
+    // non-block-linear NVIDIA modifiers, not a 2D block-linear one.
+    if m & 0x10 == 0 {
+        return None;
+    }
+    // Bits 8:5 and 11:9 are reserved and "must be zero"; so is everything
+    // from 28 up. Refusing them keeps a future 3D-surface or array-stride
+    // modifier from being silently presented as a 2D one.
+    if m & 0x00ff_ffff_f000_0fe0 != 0 {
+        return None;
+    }
+    let h = m & 0xf;
+    let k = (m >> 12) & 0xff;
+    let g = (m >> 20) & 0x3;
+    // `s` is bit 22 plus bits 27:26; the high half is already covered by the
+    // reserved-bits check above, so only bit 22 is left to read.
+    let s = (m >> 22) & 0x1;
+    let c = (m >> 23) & 0x7;
+    if c != 0 || g != NVIDIA_MOD_GEN_TURING || s != NVIDIA_MOD_SECTOR_DESKTOP {
+        return None;
+    }
+    if h > NVIDIA_MOD_MAX_LOG2_GOBS_Y {
+        return None;
+    }
+    if !NVIDIA_SCANOUT_PAGE_KINDS.contains(&(k as u8)) {
+        return None;
+    }
+    Some(drm::ScanoutLayout::BlockLinear {
+        log2_gobs_per_block_y: h as u8,
+        page_kind: k as u8,
+    })
+}
+
+/// The modifier word a layout came from, for `GETFB2` to report back.
+///
+/// Exact rather than approximate: [`decode_scanout_modifier`] accepts one
+/// combination of the compression, sector and generation fields, so the
+/// layout plus its two stored fields determine the original word. If that
+/// ever stops being true -- a second accepted `g`, say -- this has to store
+/// the word instead of rebuilding it, and
+/// [`a_tiled_framebuffer_reads_back_as_the_modifier_it_was_made_with`] is
+/// what notices.
+fn scanout_layout_modifier(layout: drm::ScanoutLayout) -> u64 {
+    match layout {
+        drm::ScanoutLayout::Linear => 0,
+        drm::ScanoutLayout::BlockLinear {
+            log2_gobs_per_block_y,
+            page_kind,
+        } => {
+            (DRM_FORMAT_MOD_VENDOR_NVIDIA << 56)
+                | 0x10
+                | u64::from(log2_gobs_per_block_y)
+                | (u64::from(page_kind) << 12)
+                | (NVIDIA_MOD_GEN_TURING << 20)
+                | (NVIDIA_MOD_SECTOR_DESKTOP << 22)
+        }
+    }
+}
+
+/// `DRM_FORMAT_MOD_NVIDIA_BLOCK_LINEAR_2D(c, s, g, k, h)` from `drm_fourcc.h`.
+///
+/// The tests build their modifiers with the macro's own arithmetic rather
+/// than with hand-written hex, so a field that moves is caught by them
+/// disagreeing with [`decode_scanout_modifier`] rather than by both being
+/// wrong in the same way. The plane's `IN_FORMATS` list will be built from
+/// it too once there is a present path worth advertising.
+#[cfg(test)]
+pub(super) const fn nvidia_block_linear_2d(c: u64, s: u64, g: u64, k: u64, h: u64) -> u64 {
+    (DRM_FORMAT_MOD_VENDOR_NVIDIA << 56)
+        | (0x10
+            | (h & 0xf)
+            | ((k & 0xff) << 12)
+            | ((g & 0x3) << 20)
+            | ((s & 0x1) << 22)
+            | ((s & 0x6) << 25)
+            | ((c & 0x7) << 23))
+}
+
 /// What `drm_internal_framebuffer_create` and `framebuffer_check` refuse
 /// before a driver ever sees an `ADDFB2`, for the one plane layout here: a
 /// single 32-bit plane, no modifiers (`DRM_CAP_ADDFB2_MODIFIERS` is 0).
@@ -4518,12 +4693,16 @@ const DRM_MODE_FB_MODIFIERS: u32 = 1 << 1;
 /// base (`phys_addr`, and the driver's own fb takes the handle alone), so
 /// a non-zero offset would silently scan out from the wrong place. No
 /// client of this tree sends one (GBM and dumb buffers start at 0).
-fn addfb2_check(cmd: &DrmModeFbCmd2) -> Result<()> {
+fn addfb2_check(cmd: &DrmModeFbCmd2) -> Result<drm::ScanoutLayout> {
     if cmd.flags & !(DRM_MODE_FB_INTERLACED | DRM_MODE_FB_MODIFIERS) != 0 {
         return Err(FsError::InvalidParam);
     }
-    if cmd.flags & DRM_MODE_FB_MODIFIERS != 0 {
-        // "driver does not support fb modifiers"
+    let have_modifier = cmd.flags & DRM_MODE_FB_MODIFIERS != 0;
+    if have_modifier && !drm::scanout_modifiers_enabled() {
+        // "driver does not support fb modifiers" -- which is the honest
+        // answer while `DRM_CAP_ADDFB2_MODIFIERS` reads 0, and the two have
+        // to agree: a client that asked the cap first and was told no must
+        // not find the flag accepted here.
         return Err(FsError::InvalidParam);
     }
     if !drm::SCANOUT_FORMATS.contains(&cmd.pixel_format) {
@@ -4537,17 +4716,33 @@ fn addfb2_check(cmd: &DrmModeFbCmd2) -> Result<()> {
         // "no buffer object handle for plane 0"
         return Err(FsError::InvalidParam);
     }
-    // "bad pitch": less than a row of 4-byte pixels. (`create_fb` checks
-    // it against the buffer as well.)
-    if u64::from(cmd.pitches[0]) < u64::from(cmd.width) * 4 {
+    let layout = if have_modifier {
+        // An explicit modifier, which may name a layout the present path
+        // cannot read; `decode_scanout_modifier` is the one judge of that.
+        match decode_scanout_modifier(cmd.modifier[0]) {
+            Some(l) => l,
+            None => return Err(FsError::InvalidParam),
+        }
+    } else {
+        // "bad fb modifier" -- Linux refuses a non-zero modifier word
+        // whenever the flag is absent, whatever the driver supports.
+        if cmd.modifier[0] != 0 {
+            return Err(FsError::InvalidParam);
+        }
+        drm::ScanoutLayout::Linear
+    };
+    // "bad pitch": less than a row of pixels. (`create_fb` checks it against
+    // the buffer as well.) For a block-linear surface the pitch is counted
+    // in 64-byte BLOCKS, not bytes -- comparing it against a byte width
+    // would reject every legitimate tiled framebuffer by a factor of 64.
+    let pitch_bytes = match layout {
+        drm::ScanoutLayout::Linear => u64::from(cmd.pitches[0]),
+        drm::ScanoutLayout::BlockLinear { .. } => u64::from(cmd.pitches[0]) * drm::GOB_WIDTH_BYTES,
+    };
+    if pitch_bytes < u64::from(cmd.width) * 4 {
         return Err(FsError::InvalidParam);
     }
     if cmd.offsets[0] != 0 {
-        return Err(FsError::InvalidParam);
-    }
-    // "bad fb modifier" without DRM_MODE_FB_MODIFIERS, and nothing on the
-    // planes the format does not have.
-    if cmd.modifier[0] != 0 {
         return Err(FsError::InvalidParam);
     }
     for i in 1..4 {
@@ -4556,7 +4751,7 @@ fn addfb2_check(cmd: &DrmModeFbCmd2) -> Result<()> {
             return Err(FsError::InvalidParam);
         }
     }
-    Ok(())
+    Ok(layout)
 }
 
 /// `drm_crtc.gamma_size` of every CRTC here: no legacy gamma store, which is
@@ -18307,6 +18502,161 @@ mod addfb2_validation_tests {
         assert_eq!(client.destroy_dumb(buf.handle), Ok(0));
     }
 
+    /// `DRM_CAP_ADDFB2_MODIFIERS` as a client reads it.
+    fn addfb2_modifiers_cap(c: &Client) -> u64 {
+        let mut req = DrmGetCap {
+            capability: 0x10,
+            value: 0xdead_beef,
+        };
+        c.ioctl(DRM_IOCTL_GET_CAP, &mut req).expect("GET_CAP");
+        req.value
+    }
+
+    /// With modifiers off -- the default -- the cap and `ADDFB2` have to
+    /// give the same answer: a client that asked `DRM_CAP_ADDFB2_MODIFIERS`
+    /// and was told 0 must not then find `DRM_MODE_FB_MODIFIERS` accepted,
+    /// and the other way round.
+    ///
+    /// With them on, a framebuffer whose modifier names a layout this GPU
+    /// really produces is accepted, and the present declines it, which is
+    /// how a DRM driver says "not scanout-able". Accepting it and copying it
+    /// as if it were pitched is the desktop full of garbage this gate
+    /// exists to prevent.
+    #[test]
+    fn the_modifier_cap_and_what_addfb2_takes_are_the_same_switch() {
+        let _serialised = drm::test_globals::lock();
+        let client = Client::open(0);
+        let buf = client.create_dumb(64, 64);
+
+        // DRM_FORMAT_MOD_NVIDIA_BLOCK_LINEAR_2D(0, 1, 2, 0x06, 0): one GOB
+        // per block, so the surface is its own 64x8 block and a 64x64 dumb
+        // buffer is big enough. The pitch counts BLOCKS: 64 pixels of 4
+        // bytes is 256 bytes, which is 4 blocks.
+        let turing = nvidia_block_linear_2d(0, 1, 2, 0x06, 0);
+        let tiled = |b: &DrmModeCreateDumb| {
+            let mut c = cmd(b);
+            c.flags = DRM_MODE_FB_MODIFIERS;
+            c.modifier[0] = turing;
+            c.pitches[0] = 4;
+            c
+        };
+
+        // Off (the default).
+        assert!(!drm::scanout_modifiers_enabled());
+        assert_eq!(addfb2_modifiers_cap(&client), 0, "DRM_CAP_ADDFB2_MODIFIERS");
+        refused(&client, tiled(&buf), "a modifier while the cap says 0");
+        let mut linear_flagged = cmd(&buf);
+        linear_flagged.flags = DRM_MODE_FB_MODIFIERS;
+        refused(
+            &client,
+            linear_flagged,
+            "even DRM_FORMAT_MOD_LINEAR behind the flag, while the cap says 0",
+        );
+
+        // On.
+        drm::set_scanout_modifiers_enabled(true);
+        assert_eq!(addfb2_modifiers_cap(&client), 1, "DRM_CAP_ADDFB2_MODIFIERS");
+        let fb = accepted(&client, tiled(&buf), "a Turing block-linear modifier");
+
+        // ...and the present declines it rather than painting it.
+        assert_eq!(
+            drm::present_now_checked(fb, drm::SYNTH_CRTC_ID, None),
+            Err(drm::PresentError::UnsupportedLayout),
+            "a tiled framebuffer must not be copied as if it were pitched"
+        );
+        // A linear one alongside it is NOT refused for its layout, so the
+        // decline is about the tiling and not about the flag being on. (It
+        // still fails for want of an emulated display in this test, which is
+        // a different error and the point: the layout check comes first,
+        // because an unreadable layout is the framebuffer's own defect and
+        // holds whether or not anything is plugged in.)
+        let mut linear = cmd(&buf);
+        linear.flags = DRM_MODE_FB_MODIFIERS;
+        let plain = accepted(&client, linear, "DRM_FORMAT_MOD_LINEAR with the flag");
+        assert_ne!(
+            drm::present_now_checked(plain, drm::SYNTH_CRTC_ID, None),
+            Err(drm::PresentError::UnsupportedLayout),
+            "a linear framebuffer is readable whatever the flag says"
+        );
+
+        drm::set_scanout_modifiers_enabled(false);
+    }
+
+    /// `GETFB2` has to describe the framebuffer that exists, modifier and
+    /// all. Reporting 0 for a tiled one describes a DIFFERENT surface --
+    /// same handle, same pitch number, linear -- and a client that
+    /// re-creates it from the readback gets the garbage this layout is
+    /// gated against.
+    #[test]
+    fn a_tiled_framebuffer_reads_back_as_the_modifier_it_was_made_with() {
+        let _serialised = drm::test_globals::lock();
+        drm::set_scanout_modifiers_enabled(true);
+        let client = Client::open(0);
+        let buf = client.create_dumb(64, 64);
+
+        for h in 0..=2u64 {
+            let turing = nvidia_block_linear_2d(0, 1, 2, 0x06, h);
+            let mut c = cmd(&buf);
+            c.flags = DRM_MODE_FB_MODIFIERS;
+            c.modifier[0] = turing;
+            c.pitches[0] = 4;
+            let fb = accepted(&client, c, "a Turing block-linear modifier");
+            let back = getfb2(&client, fb);
+            assert_eq!(back.modifier[0], turing, "h={} did not round-trip", h);
+            assert_ne!(
+                back.flags & DRM_MODE_FB_MODIFIERS,
+                0,
+                "h={}: the modifier is only meaningful with the flag",
+                h
+            );
+        }
+
+        // And a linear framebuffer still reads back as one, with no flag.
+        let plain = accepted(&client, cmd(&buf), "a plain linear framebuffer");
+        let back = getfb2(&client, plain);
+        assert_eq!(back.modifier[0], 0);
+        assert_eq!(back.flags & DRM_MODE_FB_MODIFIERS, 0);
+
+        drm::set_scanout_modifiers_enabled(false);
+    }
+
+    /// The pitch of a block-linear framebuffer counts 64-byte blocks, so the
+    /// "shorter than a row" check has to multiply before it compares.
+    /// Reading it as bytes rejects every real tiled framebuffer by a factor
+    /// of 64; not reading it at all accepts one 64 times too small and lets
+    /// the present walk off the buffer.
+    #[test]
+    fn a_block_linear_pitch_is_counted_in_blocks() {
+        let _serialised = drm::test_globals::lock();
+        drm::set_scanout_modifiers_enabled(true);
+        let client = Client::open(0);
+        let buf = client.create_dumb(64, 64);
+        let turing = nvidia_block_linear_2d(0, 1, 2, 0x06, 0);
+        let with_pitch = |blocks: u32| {
+            let mut c = cmd(&buf);
+            c.flags = DRM_MODE_FB_MODIFIERS;
+            c.modifier[0] = turing;
+            c.pitches[0] = blocks;
+            c
+        };
+
+        // 64 pixels x 4 bytes = 256 bytes = 4 blocks. Four is exactly a row.
+        let fb = accepted(&client, with_pitch(4), "a pitch of exactly one row");
+        assert_ne!(fb, 0);
+        // Three blocks is 192 bytes, short of the 256 a row needs.
+        refused(&client, with_pitch(3), "a pitch shorter than a row");
+        // And the byte count that would be right for a LINEAR fb is 256
+        // blocks, i.e. 16 KiB per row -- far past this 16 KiB buffer once
+        // the eight rows of the block are counted.
+        refused(
+            &client,
+            with_pitch(256),
+            "a pitch given in bytes by mistake",
+        );
+
+        drm::set_scanout_modifiers_enabled(false);
+    }
+
     /// A modifier without the flag, and anything at all on planes 1 to 3 of
     /// a one-plane format, are `framebuffer_check`'s "bad fb modifier" and
     /// "buffer object handle for plane N" refusals.
@@ -19207,5 +19557,206 @@ mod wsi_refusal_trace_tests {
             !wsi_fail_take_in(&fresh, &fresh_full, 0, 0),
             "nr 0 / id 0 must be remembered like any other key"
         );
+    }
+}
+
+/// What `ADDFB2`'s modifier word is allowed to mean.
+///
+/// Every value here is built with [`nvidia_block_linear_2d`], the macro's own
+/// arithmetic from `drm_fourcc.h`, so a field that moves shows up as the
+/// builder and the decoder disagreeing rather than as both being wrong the
+/// same way.
+#[cfg(test)]
+mod scanout_modifier_tests {
+    use super::*;
+
+    /// The fields a Turing framebuffer carries: no compression, the desktop
+    /// sector layout, the Turing+ page-kind generation, and the generic
+    /// uncompressed colour kind.
+    const C_NONE: u64 = 0;
+    const S_DESKTOP: u64 = 1;
+    const G_TURING: u64 = 2;
+    const K_GENERIC_TURING: u64 = 0x06;
+
+    fn block_linear(h: u64) -> u64 {
+        nvidia_block_linear_2d(C_NONE, S_DESKTOP, G_TURING, K_GENERIC_TURING, h)
+    }
+
+    /// The one modifier the present path can actually read, and the zero a
+    /// client leaves behind when it sends no modifier at all.
+    #[test]
+    fn linear_is_the_zero_modifier() {
+        assert_eq!(decode_scanout_modifier(0), Some(drm::ScanoutLayout::Linear));
+    }
+
+    /// Every block height the hardware defines, and nothing above it:
+    /// `SET_SRC_BLOCK_SIZE_HEIGHT` stops at `_THIRTYTWO_GOBS` (h = 5), so a
+    /// larger one would be programmed as a masked-off value and the copy
+    /// engine would walk the surface with the wrong stride.
+    #[test]
+    fn the_six_block_heights_decode_and_the_seventh_does_not() {
+        for h in 0..=5u64 {
+            assert_eq!(
+                decode_scanout_modifier(block_linear(h)),
+                Some(drm::ScanoutLayout::BlockLinear {
+                    log2_gobs_per_block_y: h as u8,
+                    page_kind: K_GENERIC_TURING as u8,
+                }),
+                "h={} is a defined block height",
+                h
+            );
+        }
+        for h in 6..=15u64 {
+            assert_eq!(
+                decode_scanout_modifier(block_linear(h)),
+                None,
+                "h={} is past _THIRTYTWO_GOBS",
+                h
+            );
+        }
+    }
+
+    /// The older `DRM_FORMAT_MOD_NVIDIA_16BX2_BLOCK(v)` spelling is
+    /// `(0, 0, 0, 0, v)`: GOB generation 0 and sector layout 0, which is the
+    /// Fermi..Volta / Tegra arrangement, NOT Turing's. It names a different
+    /// bit layout in memory, so presenting it as if it were ours would paint
+    /// garbage, and it is refused on that ground rather than on its page
+    /// kind.
+    ///
+    /// What the canonicalization is for is the other case: a client that
+    /// sends Turing's generation but leaves `k` at 0. Kind 0 means
+    /// "pitch/linear", which a block-linear surface cannot be, so
+    /// `drm_fourcc_canonicalize_nvidia_format_mod` remaps it to 0xfe -- a
+    /// Fermi..Volta kind, which this decoder then refuses rather than
+    /// quietly presenting under a Turing modifier.
+    #[test]
+    fn the_old_16bx2_spelling_and_a_zero_page_kind_are_both_refused() {
+        assert_eq!(
+            decode_scanout_modifier(nvidia_block_linear_2d(0, 0, 0, 0, 2)),
+            None,
+            "16BX2_BLOCK names the Fermi..Volta layout, not Turing's"
+        );
+        assert_eq!(
+            decode_scanout_modifier(nvidia_block_linear_2d(C_NONE, S_DESKTOP, G_TURING, 0, 2)),
+            None,
+            "kind 0 canonicalizes to 0xfe, which is not Turing's generic kind"
+        );
+    }
+
+    /// The three fields that describe a layout we would read wrong, each
+    /// refused on its own so a later edit cannot drop one silently.
+    #[test]
+    fn compression_the_wrong_gob_generation_and_the_wrong_sector_layout_are_refused() {
+        // c != 0: lossless compression, whose comptags nothing in this tree
+        // allocates. Scanning the bytes out uncompressed is garbage, which
+        // is why nv_drm_framebuffer_init refuses it too.
+        for c in 1..=7u64 {
+            assert_eq!(
+                decode_scanout_modifier(nvidia_block_linear_2d(
+                    c,
+                    S_DESKTOP,
+                    G_TURING,
+                    K_GENERIC_TURING,
+                    0
+                )),
+                None,
+                "compression type {} must not be presented",
+                c
+            );
+        }
+        // g = 1 is "Gob Height 4, G80 - GT2XX": a different GOB shape
+        // entirely. g = 0 is Fermi..Volta, whose page-kind mapping differs
+        // from the one VM_BIND programs.
+        for g in [0u64, 1, 3] {
+            assert_eq!(
+                decode_scanout_modifier(nvidia_block_linear_2d(
+                    C_NONE,
+                    S_DESKTOP,
+                    g,
+                    K_GENERIC_TURING,
+                    0
+                )),
+                None,
+                "GOB generation {} is not Turing's",
+                g
+            );
+        }
+        // s = 0 is the Tegra sector layout; the bits below the page kind are
+        // arranged differently and the surface cannot be shared.
+        assert_eq!(
+            decode_scanout_modifier(nvidia_block_linear_2d(
+                C_NONE,
+                0,
+                G_TURING,
+                K_GENERIC_TURING,
+                0
+            )),
+            None
+        );
+    }
+
+    /// A page kind VM_BIND does not program verbatim is refused rather than
+    /// downgraded: the page tables and the copy engine have to agree on the
+    /// same kind, and a depth or compressible surface is not something this
+    /// scanout should be putting on a panel at all.
+    #[test]
+    fn only_turings_generic_uncompressed_colour_kind_is_accepted() {
+        for k in 0x01..=0xffu64 {
+            let want = k == 0x06;
+            assert_eq!(
+                decode_scanout_modifier(nvidia_block_linear_2d(C_NONE, S_DESKTOP, G_TURING, k, 0))
+                    .is_some(),
+                want,
+                "page kind {:#04x}",
+                k
+            );
+        }
+    }
+
+    /// Anything that is not an NVIDIA block-linear modifier at all.
+    #[test]
+    fn foreign_reserved_and_invalid_modifiers_are_refused() {
+        // DRM_FORMAT_MOD_INVALID.
+        assert_eq!(decode_scanout_modifier(0x00ff_ffff_ffff_ffff), None);
+        // Another vendor's (Intel's Y-tiling is vendor 1).
+        assert_eq!(decode_scanout_modifier((1u64 << 56) | 2), None);
+        // NVIDIA vendor, but bit 4 clear: not a 2D block-linear modifier.
+        assert_eq!(decode_scanout_modifier(3u64 << 56), None);
+        // The reserved fields "must be zero": 8:5, 11:9 and everything from
+        // 28 up. A future 3D-surface modifier sets one of these and must not
+        // be presented as if it were 2D.
+        for bit in [5u64, 8, 9, 11, 28, 40, 55] {
+            let m = block_linear(0) | (1u64 << bit);
+            assert_eq!(
+                decode_scanout_modifier(m),
+                None,
+                "reserved bit {} must refuse the modifier",
+                bit
+            );
+        }
+    }
+
+    /// The size arithmetic a block-linear framebuffer needs, which differs
+    /// from `pitch * height` in both terms: the pitch counts 64-byte blocks,
+    /// and the height is padded up to a whole block.
+    #[test]
+    fn a_block_linear_surface_is_measured_in_blocks_and_padded_to_one() {
+        // 1920 pixels of 4 bytes is 7680 bytes, which is 120 blocks.
+        // h = 4 means blocks are 8 << 4 = 128 rows tall, so 1080 rows pad up
+        // to 1152.
+        assert_eq!(
+            drm::block_linear_size(120, 1080, 4),
+            Some(120 * 64 * 1152),
+            "the last block row is addressed whole; a size from 1080 would \
+             let a present read past the buffer"
+        );
+        // Exactly one block tall: no padding to add.
+        assert_eq!(drm::block_linear_size(1, 8, 0), Some(64 * 8));
+        // One row past it: a second whole block.
+        assert_eq!(drm::block_linear_size(1, 9, 0), Some(2 * 64 * 8));
+        // The arithmetic must not wrap: a pitch and height a client is free
+        // to send have to come back as None, not as a small size that would
+        // pass the buffer check.
+        assert_eq!(drm::block_linear_size(u32::MAX, u32::MAX, 5), None);
     }
 }
