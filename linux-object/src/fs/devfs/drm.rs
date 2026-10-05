@@ -5836,6 +5836,12 @@ lazy_static::lazy_static! {
 }
 
 /// Current synthetic vblank period in nanoseconds (at least 1).
+///
+/// Only the tests ask for the period on its own. Every production reader wants
+/// the period AND something else off the lattice -- the counter, a boundary --
+/// and takes them under one lock, because two reads could straddle a modeset
+/// and disagree about which refresh they were describing.
+#[cfg(test)]
 #[inline]
 fn vblank_period_ns() -> u64 {
     VBLANK_LATTICE.lock().period_ns
