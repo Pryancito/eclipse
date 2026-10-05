@@ -275,6 +275,17 @@ hal_fn_def! {
         /// builds run on the host scheduler and always return `false`.
         pub fn take_need_resched() -> bool { false }
 
+        /// Whether this CPU has a wake-up preemption request pending, without
+        /// consuming it.
+        ///
+        /// The trap path has to know *that* a request exists before it can ask
+        /// the running thread whether it may be preempted yet (see
+        /// `Thread::sched_may_preempt_on_wake`): taking the request and then
+        /// declining to yield would drop it, and the woken task would wait out
+        /// the whole remaining timeslice -- exactly what the request exists to
+        /// prevent. Hosted (libos) builds always return `false`.
+        pub fn need_resched_pending() -> bool { false }
+
         /// Instantaneous run-queue length across every CPU: tasks queued ready
         /// to run plus the task each CPU is polling right now (Linux's
         /// `nr_running`). The caller, if it is itself an executor task, is

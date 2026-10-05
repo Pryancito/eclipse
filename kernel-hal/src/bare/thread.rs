@@ -34,6 +34,10 @@ hal_fn_impl! {
             executor::take_need_resched()
         }
 
+        fn need_resched_pending() -> bool {
+            executor::need_resched_pending()
+        }
+
         fn runnable_task_count() -> usize {
             executor::runnable_task_count()
         }
