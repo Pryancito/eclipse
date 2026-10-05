@@ -833,3 +833,89 @@ mod tests {
         clock::reset_for_test();
     }
 }
+
+#[cfg(test)]
+mod shim_and_shape_tests {
+    //! The back-compat helper and the two numbers nobody had pinned: what
+    //! `log_event` turns a bare action into, how wide each ring is, and what
+    //! one line of `/proc/hunter` actually looks like.
+
+    use super::*;
+
+    fn fresh() -> impl Drop {
+        let g = crate::test_globals::lock();
+        reset_for_test();
+        clock::reset_for_test();
+        g
+    }
+
+    #[test]
+    fn the_two_rings_are_the_sizes_the_split_depends_on() {
+        let _g = fresh();
+        let general = GENERAL_LOG.lock().max_size;
+        let reserve = PRIORITY_LOG.lock().max_size;
+        // The flood tests above drive these two numbers as literals, so moving
+        // a ring size moves them with it and they still pass. The split only
+        // works while the evictable ring is the bigger one: a flood has to run
+        // out of its own ring long before the reserve could matter.
+        assert_eq!(general, 512, "the evictable ring moved");
+        assert_eq!(reserve, 256, "the reserve moved");
+        assert!(
+            general > reserve,
+            "the reserve is the smaller ring on purpose: only evidence lands in it"
+        );
+    }
+
+    #[test]
+    fn the_back_compat_helper_gives_each_action_its_own_severity() {
+        let _g = fresh();
+        // Nothing tested this shim at all: all four of its arms could be
+        // rewritten with the whole suite green. It is the one entry point left
+        // that takes an action and nothing else, so the action string is all
+        // it has to decide from.
+        log_event(11, "BLOCKED", String::from("a"));
+        log_event(12, "ELF_BLOCKED", String::from("b"));
+        log_event(13, "WARNING", String::from("c"));
+        log_event(14, "ALLOWED", String::from("d"));
+
+        let s = stats();
+        assert_eq!(s.total, 4);
+        assert_eq!(s.criticals, 1, "a block is the only critical of the four");
+        assert_eq!(
+            s.warnings, 2,
+            "a reported violation and a refused ELF are both warnings"
+        );
+        // Severity and verdict are two different questions, and this is the
+        // event where they disagree: an `ELF_BLOCKED` sounds like a warning
+        // and *is* a block, so it is evidence and it moves `blocked`.
+        assert_eq!(
+            s.blocked, 2,
+            "BLOCKED and ELF_BLOCKED both stopped something"
+        );
+        assert_eq!(s.warnings_allowed, 1);
+        assert_eq!(s.dropped + s.critical_dropped, 0);
+    }
+
+    #[test]
+    fn one_line_of_the_report_is_the_shape_userspace_reads() {
+        let _g = fresh();
+        log_event(11, "BLOCKED", String::from("a"));
+        log_event(14, "ALLOWED", String::from("d"));
+        let report = render();
+        // Columns in this order and no other: a helper script reading
+        // /proc/hunter cuts the line by its fields, so the severity tag and
+        // the category are not interchangeable even though both are strings
+        // of the same type. The back-compat helper files everything under
+        // SYSCALL, which is the other half of what it decides.
+        assert!(
+            report.contains("pid=11    CRIT   SYSCALL   BLOCKED: a\n"),
+            "got {}",
+            report
+        );
+        assert!(
+            report.contains("pid=14    INFO   SYSCALL   ALLOWED: d\n"),
+            "got {}",
+            report
+        );
+    }
+}
