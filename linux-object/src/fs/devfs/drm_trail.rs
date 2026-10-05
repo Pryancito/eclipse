@@ -274,6 +274,8 @@ fn ioctl_name(nr: u32) -> String {
         0xC5 => "SYNCOBJ_SIGNAL",
         0xC6 => "MODE_CREATE_LEASE",
         0xC7 => "MODE_LIST_LESSEES",
+        0xC8 => "MODE_GET_LEASE",
+        0xC9 => "MODE_REVOKE_LEASE",
         0xCA => "SYNCOBJ_TIMELINE_WAIT",
         0xCB => "SYNCOBJ_QUERY",
         0xCC => "SYNCOBJ_TRANSFER",
@@ -281,8 +283,16 @@ fn ioctl_name(nr: u32) -> String {
         0xCE => "MODE_GETFB2",
         0xCF => "SYNCOBJ_EVENTFD",
         0xD0 => "MODE_CLOSEFB",
-        0xD1 => "SYNCOBJ_WAIT_DEADLINE",
-        0xD2 => "SYNCOBJ_TIMELINE_WAIT_DEADLINE",
+        // 0xD1/0xD2 are SET_CLIENT_NAME and GEM_CHANGE_HANDLE in `drm.h`.
+        // They were named SYNCOBJ_WAIT_DEADLINE / SYNCOBJ_TIMELINE_WAIT_DEADLINE
+        // here, which no kernel has ever numbered: the deadline waits are the
+        // SIZE-EXTENDED forms of 0xC3 and 0xCA (`drm_syncobj_wait` grew
+        // `deadline_nsec`), which `drm_scheme.rs` matches correctly. So a
+        // hardware trace of Mesa's `drmSetClientName()` -- which it calls at
+        // device init -- read as a syncobj wait, in the one log we use to tell
+        // the submission path apart from the display path.
+        0xD1 => "SET_CLIENT_NAME",
+        0xD2 => "GEM_CHANGE_HANDLE",
         _ => "",
     };
     if !core.is_empty() {
@@ -475,6 +485,29 @@ mod tests {
         assert_eq!(ioctl_name(0xC3), "SYNCOBJ_WAIT");
         assert_eq!(ioctl_name(0x2D), "PRIME_HANDLE_TO_FD");
         assert_eq!(ioctl_name(0xFE), "nr(0xfe)");
+    }
+
+    /// The numbers above 0xD0, checked against `drm.h` rather than against
+    /// what this table used to say. 0xD1/0xD2 were named for a pair of
+    /// "deadline wait" ioctls that no kernel has ever numbered -- the deadline
+    /// waits are the size-extended forms of 0xC3 and 0xCA -- so Mesa's
+    /// `drmSetClientName()` at device init was logged as a syncobj wait.
+    #[test]
+    fn the_numbers_above_the_syncobj_block_are_the_ones_drm_h_defines() {
+        assert_eq!(ioctl_name(0xCF), "SYNCOBJ_EVENTFD");
+        assert_eq!(ioctl_name(0xD0), "MODE_CLOSEFB");
+        assert_eq!(ioctl_name(0xD1), "SET_CLIENT_NAME");
+        assert_eq!(ioctl_name(0xD2), "GEM_CHANGE_HANDLE");
+    }
+
+    /// The whole lease block, not just the one number that was listed: a
+    /// `VK_EXT_acquire_drm_display` client walks all four.
+    #[test]
+    fn the_lease_ioctls_are_named() {
+        assert_eq!(ioctl_name(0xC6), "MODE_CREATE_LEASE");
+        assert_eq!(ioctl_name(0xC7), "MODE_LIST_LESSEES");
+        assert_eq!(ioctl_name(0xC8), "MODE_GET_LEASE");
+        assert_eq!(ioctl_name(0xC9), "MODE_REVOKE_LEASE");
     }
 
     /// A successful call carries a count, not an errno, and must not be
