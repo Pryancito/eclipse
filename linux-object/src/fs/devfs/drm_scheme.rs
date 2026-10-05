@@ -5835,15 +5835,19 @@ impl INode for DrmDev {
         match self.file.read_events(buf) {
             drm::EventRead::Read(n) => Ok(n),
             drm::EventRead::Empty => Err(FsError::Again),
-            // EINVAL, like `drm_read()` with nothing read yet. EAGAIN here was
-            // a livelock: the queue is non-empty, so READABLE stays set and a
-            // blocking reader's wait resolves instantly, over and over.
-            drm::EventRead::TooSmall => Err(FsError::InvalidParam),
+            // A buffer the first event does not fit in: `drm_read()` puts
+            // the event back and returns what it has read so far, which is
+            // 0 -- not EAGAIN (a livelock: the queue is non-empty, so
+            // READABLE stays set and a blocking reader's wait resolves
+            // instantly, over and over) and not EINVAL, which this answered
+            // and `drmHandleEvent` reports as a failed read.
+            drm::EventRead::TooSmall => Ok(0),
         }
     }
 
     fn write_at(&self, _offset: usize, _buf: &[u8]) -> Result<usize> {
-        // DRM chardev has no write sink; Linux answers EINVAL.
+        // The DRM file operations have no `.write`, so `vfs_write` refuses
+        // with EINVAL. This swallowed the bytes and reported them written.
         Err(FsError::InvalidParam)
     }
 
@@ -6970,6 +6974,11 @@ mod gl_client_sequence_tests {
         /// `read(fd, buf, len)` --- how a compositor collects flip completions.
         pub(super) fn read_events(&self, buf: &mut [u8]) -> Result<usize> {
             self.dev.read_at(0, buf)
+        }
+
+        /// `write(fd, buf, len)`, which no DRM client has a reason to do.
+        pub(super) fn write(&self, buf: &[u8]) -> Result<usize> {
+            self.dev.write_at(0, buf)
         }
 
         /// `poll(fd, POLLIN)` --- the other half of how a compositor waits.
@@ -15355,19 +15364,26 @@ mod event_queue_tests {
         assert!(buf.iter().all(|&b| b == 0));
     }
 
-    /// A buffer too small for one event is `EINVAL`, and the event STAYS
-    /// queued. `EAGAIN` here is a livelock (the queue is non-empty, so the file
-    /// is still readable and the wait resolves instantly, over and over), and
-    /// dropping the event instead would lose the flip completion wlroots is
-    /// waiting on -- a desktop frozen on its current frame.
+    /// A buffer too small for one event reads 0 bytes, as `drm_read()` puts
+    /// the event back and returns what it had read so far, and the event
+    /// STAYS queued. `EAGAIN` here is a livelock (the queue is non-empty, so
+    /// the file is still readable and the wait resolves instantly, over and
+    /// over), dropping the event instead would lose the flip completion
+    /// wlroots is waiting on -- a desktop frozen on its current frame -- and
+    /// `EINVAL`, which this answered, is a failed read to `drmHandleEvent`
+    /// where Linux hands it "nothing this time". And a write to the card fd
+    /// is EINVAL (the DRM file operations have no `.write`); this took the
+    /// bytes and said they were written.
     #[test]
-    fn a_buffer_too_small_for_one_event_is_einval_and_keeps_the_event() {
+    fn a_buffer_too_small_for_one_event_reads_nothing_and_keeps_the_event() {
         let _screen = kms_emu::attach(32, 8);
         let c = Client::open(0);
         let (fb, handle) = queue_one_flip(&c, 0xABCD);
 
+        assert_eq!(c.write(b"not a DRM event"), Err(FsError::InvalidParam));
+
         let mut small = [0u8; 16];
-        assert_eq!(c.read_events(&mut small), Err(FsError::InvalidParam));
+        assert_eq!(c.read_events(&mut small), Ok(0));
         assert!(
             small.iter().all(|&b| b == 0),
             "a partial event was delivered"
@@ -15432,9 +15448,9 @@ mod event_queue_tests {
             "not readable with an event queued"
         );
 
-        // A refused short read must not clear it either.
+        // A short read, which takes nothing, must not clear it either.
         let mut small = [0u8; 8];
-        assert_eq!(c.read_events(&mut small), Err(FsError::InvalidParam));
+        assert_eq!(c.read_events(&mut small), Ok(0));
         assert!(
             c.poll().expect("poll").read,
             "a short read consumed the event"
