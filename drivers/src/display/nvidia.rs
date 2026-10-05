@@ -926,6 +926,13 @@ pub struct NvidiaGpu {
     /// Active `VM_BIND` GPU-VA mappings, so `UNMAP` can find the RM handle
     /// to tear down.
     nouveau_vm_mappings: Mutex<Vec<super::nouveau_uapi::NouveauVmMapping>>,
+    /// Pids that ran `VM_INIT`: Linux's `cli->uvmm.ptr`, the VA space
+    /// `VM_BIND` and `EXEC` work in. Without it both answer ENOSYS
+    /// (`nouveau_uvmm_ioctl_vm_bind`, `nouveau_exec_ioctl_exec`), before
+    /// anything else is looked at. Per pid rather than per drm file because
+    /// every other nouveau-uAPI state here is keyed by pid too
+    /// (`nouveau_pid_ctx`); cleared in `nouveau_release_process`.
+    nouveau_uvmm: Mutex<Vec<u64>>,
     /// Per-process GPU context assignment: `(owner_pid, ctx_idx, h_vas,
     /// h_notifier)`. The compositor (context 0) is NOT tracked here. A GL
     /// client's context is built on its FIRST GPU touch -- `VM_BIND` or
@@ -1383,6 +1390,7 @@ impl NvidiaGpu {
             nouveau_gem_next_handle: AtomicU32::new(gem_handle_slice.base()),
             nouveau_gem_handle_end: gem_handle_slice.end(),
             nouveau_vm_mappings: Mutex::new(Vec::new()),
+            nouveau_uvmm: Mutex::new(Vec::new()),
             nouveau_pid_ctx: Mutex::new(Vec::new()),
             nouveau_fast: Mutex::new(
                 (0..super::nouveau_uapi::MAX_CTX)
@@ -8490,6 +8498,9 @@ impl DrmScheme for NvidiaGpu {
         if pid == 0 {
             return;
         }
+        // Its uvmm goes with it (`nouveau_uvmm_fini` from the file's
+        // postclose): a recycled pid starts over at `VM_INIT`.
+        self.nouveau_uvmm.lock().retain(|&p| p != pid);
         // A process going away is one event sure to follow every zombie
         // context (below): the ones that are due get their teardown first,
         // and one still wearing this very pid (recycled) is re-keyed, so
@@ -9414,6 +9425,11 @@ impl NvidiaGpu {
     /// and binding into it would be binding into nothing.
     fn nouveau_rm_vas_ready(&self) -> bool {
         self.nouveau_channels.lock().iter().any(|c| c.rm_backed)
+    }
+
+    /// Whether this process ran `VM_INIT` (Linux: `nouveau_cli_uvmm(cli)`).
+    fn nouveau_has_uvmm(&self, pid: u64) -> bool {
+        self.nouveau_uvmm.lock().contains(&pid)
     }
 
     /// Whether THIS process owns the RM-backed channel.
@@ -12731,19 +12747,51 @@ impl NvidiaGpu {
                 // It is DRM_IOW (client -> kernel): the client passes the VA
                 // sub-range it wants the KERNEL to manage (the rest it manages
                 // itself). Real per-mapping VA carving happens in VM_BIND against
-                // the RM; VM_INIT only has to acknowledge the reservation, so read
-                // the requested range for the log and return success. Do NOT
+                // the RM; VM_INIT only has to check that the range fits the VA
+                // space (`nouveau_uvmm_ioctl_vm_init`: an overflowing or
+                // out-of-space range is EINVAL) and record that this client now
+                // HAS a uvmm, which is what VM_BIND and EXEC require. Do NOT
                 // write the struct back (write-only ioctl).
+                //
+                // Linux also disables the uvmm for good once the file used a
+                // legacy ioctl (`GEM_NEW`, `CHANNEL_ALLOC` before `VM_INIT`),
+                // so a later VM_INIT is ENOSYS. Not applied here: that state
+                // is per drm FILE there and per PID here, and one process
+                // holding a legacy GL fd and an NVK fd at once would lose the
+                // NVK one. A repeated VM_INIT is idempotent (Linux does not
+                // check for an existing uvmm either).
                 let req = unsafe { &*(arg as *const nv::DrmNouveauVmInit) };
+                let fits = matches!(
+                    req.kernel_managed_addr.checked_add(req.kernel_managed_size),
+                    Some(end) if end <= nv::NOUVEAU_VA_SPACE_END
+                );
+                if !fits {
+                    log::warn!(
+                        "[nouveau-uapi] VM_INIT kernel_managed_addr={:#x} size={:#x} -> EINVAL (past the {:#x} VA space)",
+                        req.kernel_managed_addr,
+                        req.kernel_managed_size,
+                        nv::NOUVEAU_VA_SPACE_END
+                    );
+                    return Err(nv::EINVAL);
+                }
                 log::warn!(
                     "[nouveau-uapi] VM_INIT kernel_managed_addr={:#x} size={:#x} -> accepted (standalone, no channel required)",
                     req.kernel_managed_addr,
                     req.kernel_managed_size
                 );
+                let mut uvmm = self.nouveau_uvmm.lock();
+                if !uvmm.contains(&owner_pid) {
+                    uvmm.push(owner_pid);
+                }
                 Ok(0)
             }
 
             nv::NR_VM_BIND => {
+                if !self.nouveau_has_uvmm(owner_pid) {
+                    // `nouveau_uvmm_ioctl_vm_bind`: no uvmm, no VM_BIND --
+                    // checked before the request is even read.
+                    return Err(nv::ENOSYS);
+                }
                 if !self.nouveau_rm_vas_ready() {
                     crate::klog_warn!(
                         "[nouveau-uapi] VM_BIND: no RM-backed channel exists on this GPU, so no \
@@ -12951,6 +12999,11 @@ impl NvidiaGpu {
             }
 
             nv::NR_EXEC => {
+                if !self.nouveau_has_uvmm(owner_pid) {
+                    // `nouveau_exec_ioctl_exec`: ENOSYS without a uvmm,
+                    // before the channel is looked up.
+                    return Err(nv::ENOSYS);
+                }
                 if !self.nouveau_owns_rm_channel(owner_pid) {
                     crate::klog_warn!(
                         "[nouveau-uapi] EXEC: this client does not own the RM-backed channel (no GR \
@@ -14986,6 +15039,7 @@ impl NvidiaGpu {
             nouveau_gem_next_handle: AtomicU32::new(gem_handle_slice.base()),
             nouveau_gem_handle_end: gem_handle_slice.end(),
             nouveau_vm_mappings: Mutex::new(Vec::new()),
+            nouveau_uvmm: Mutex::new(Vec::new()),
             nouveau_pid_ctx: Mutex::new(Vec::new()),
             nouveau_fast: Mutex::new(
                 (0..super::nouveau_uapi::MAX_CTX)
@@ -15156,7 +15210,25 @@ mod nouveau_bookkeeping_tests {
         )
     }
 
+    /// `VM_INIT` as NVK issues it first thing (`nouveau_ws_device_alloc`):
+    /// the kernel-managed range is the low 4 GiB there.
+    fn vm_init(gpu: &NvidiaGpu, pid: u64) -> Result<usize, i32> {
+        let mut r = nv::DrmNouveauVmInit {
+            kernel_managed_addr: 0,
+            kernel_managed_size: 1 << 32,
+        };
+        call(gpu, wr::<nv::DrmNouveauVmInit>(nv::NR_VM_INIT), &mut r, pid)
+    }
+
+    /// The VM_BIND/EXEC helpers below run `VM_INIT` for the client first,
+    /// as every real client has by then; the tests that look at a client
+    /// WITHOUT one call the ioctls directly.
+    fn with_uvmm(gpu: &NvidiaGpu, pid: u64) {
+        assert_eq!(vm_init(gpu, pid), Ok(0));
+    }
+
     fn vm_bind(gpu: &NvidiaGpu, pid: u64) -> Result<usize, i32> {
+        with_uvmm(gpu, pid);
         let mut r = nv::DrmNouveauVmBind {
             op_count: 1,
             flags: 0,
@@ -16284,6 +16356,7 @@ mod nouveau_bookkeeping_tests {
                 ops.as_mut_ptr() as u64
             },
         };
+        with_uvmm(gpu, pid);
         call(gpu, wr::<nv::DrmNouveauVmBind>(nv::NR_VM_BIND), &mut r, pid)
     }
 
@@ -17168,6 +17241,7 @@ mod nouveau_bookkeeping_tests {
     }
 
     fn exec_raw(gpu: &NvidiaGpu, pid: u64, r: &mut nv::DrmNouveauExec) -> Result<usize, i32> {
+        with_uvmm(gpu, pid);
         call(gpu, wr::<nv::DrmNouveauExec>(nv::NR_EXEC), r, pid)
     }
 
@@ -17184,6 +17258,102 @@ mod nouveau_bookkeeping_tests {
 
     fn rm_calls_since(before: usize) -> Vec<&'static str> {
         FAKE_RM.lock().calls[before..].to_vec()
+    }
+
+    /// `nouveau_uvmm_ioctl_vm_init` checks the kernel-managed range against
+    /// the VA space (EINVAL past it), and `nouveau_uvmm_ioctl_vm_bind` and
+    /// `nouveau_exec_ioctl_exec` answer ENOSYS to a client that never ran
+    /// it, before looking at anything else. This driver accepted any range,
+    /// kept no record of it, and sent such a client on to its own gates.
+    #[test]
+    fn vm_bind_and_exec_answer_enosys_until_the_client_ran_vm_init() {
+        let _g = LOCK.lock();
+        let _live = LiveBytes::hold();
+        let gpu = gpu_rm();
+        let init = |pid: u64, addr: u64, size: u64| {
+            let mut r = nv::DrmNouveauVmInit {
+                kernel_managed_addr: addr,
+                kernel_managed_size: size,
+            };
+            call(
+                &gpu,
+                wr::<nv::DrmNouveauVmInit>(nv::NR_VM_INIT),
+                &mut r,
+                pid,
+            )
+        };
+        // An empty synchronous request: EINVAL once past the gates, so a
+        // gate that lets it through shows as EINVAL rather than as a bind.
+        let bind = |pid: u64| {
+            let mut r = nv::DrmNouveauVmBind {
+                op_count: 0,
+                flags: 0,
+                wait_count: 0,
+                sig_count: 0,
+                wait_ptr: 0,
+                sig_ptr: 0,
+                op_ptr: 0,
+            };
+            call(
+                &gpu,
+                wr::<nv::DrmNouveauVmBind>(nv::NR_VM_BIND),
+                &mut r,
+                pid,
+            )
+        };
+        let submit = |pid: u64| {
+            let p = [push(PUSH_VA, 16)];
+            let mut r = nv::DrmNouveauExec {
+                channel: 0,
+                push_count: 1,
+                wait_count: 0,
+                sig_count: 0,
+                wait_ptr: 0,
+                sig_ptr: 0,
+                push_ptr: ptr_of(&p),
+            };
+            call(&gpu, wr::<nv::DrmNouveauExec>(nv::NR_EXEC), &mut r, pid)
+        };
+        // Before VM_INIT: ENOSYS, ahead of the "no RM channel" ENODEV.
+        assert_eq!(bind(A), Err(nv::ENOSYS));
+        assert_eq!(submit(A), Err(nv::ENOSYS));
+        // A range past the VA space is EINVAL, and does not count.
+        const END: u64 = nv::NOUVEAU_VA_SPACE_END;
+        assert_eq!(init(A, u64::MAX - 4095, 8192), Err(nv::EINVAL), "overflow");
+        assert_eq!(init(A, END - 4096, 8192), Err(nv::EINVAL), "a page past");
+        assert_eq!(init(A, 0, END + 1), Err(nv::EINVAL));
+        assert_eq!(bind(A), Err(nv::ENOSYS), "a refused VM_INIT made no uvmm");
+        assert_eq!(submit(A), Err(nv::ENOSYS));
+        // One ending exactly at the end fits: on to the next gates.
+        assert_eq!(init(A, END - 4096, 4096), Ok(0));
+        assert_eq!(bind(A), Err(nv::ENODEV));
+        assert_eq!(submit(A), Err(nv::ENODEV));
+        // Again is fine.
+        assert_eq!(init(A, 0, 1 << 32), Ok(0));
+        assert_eq!(bind(A), Err(nv::ENODEV));
+        // It is this client's, not the GPU's.
+        assert_eq!(bind(B), Err(nv::ENOSYS));
+        assert_eq!(submit(B), Err(nv::ENOSYS));
+        // The client's exit takes its uvmm with it, and nobody else's.
+        assert_eq!(init(B, 0, 1 << 32), Ok(0));
+        gpu.nouveau_release_process(A);
+        assert_eq!(bind(A), Err(nv::ENOSYS));
+        assert_eq!(bind(B), Err(nv::ENODEV));
+        // The normal order for a fresh client: VM_INIT, channel, object,
+        // bind (`client_with_pushbuf` asserts the bind went through).
+        with_uvmm(&gpu, STRANGER);
+        let _ch = client_with_pushbuf(&gpu, STRANGER);
+        // The GPU's VA space being up changes nothing for a client without
+        // a uvmm, and a channel is not one: a legacy client (CHANNEL_ALLOC,
+        // no VM_INIT) gets ENOSYS from the new-uAPI ioctls, as in Linux.
+        assert_eq!(bind(A), Err(nv::ENOSYS));
+        assert_eq!(submit(A), Err(nv::ENOSYS));
+        gpu.nouveau_release_process(B);
+        channel_alloc(&gpu, B).unwrap();
+        assert_eq!(bind(B), Err(nv::ENOSYS));
+        assert_eq!(submit(B), Err(nv::ENOSYS));
+        gpu.nouveau_release_process(B);
+        gpu.nouveau_release_process(STRANGER);
     }
 
     #[test]
