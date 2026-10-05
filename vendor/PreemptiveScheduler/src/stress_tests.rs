@@ -431,6 +431,11 @@ fn stress_task_collection_hands_each_task_out_exactly_once_at_a_time() {
             let thieves_left = thieves_left.clone();
             let index_of = index_of.clone();
             thread::spawn(move || {
+                // Set once the owner has read "no thief is holding anything":
+                // the *next* empty pass is then conclusive. Routing that pass
+                // through the loop, rather than taking a task on the side,
+                // keeps every hand-out booked and every borrow released.
+                let mut settling = false;
                 loop {
                     let got = if d == 0 {
                         tc.take_task()
@@ -439,6 +444,7 @@ fn stress_task_collection_hands_each_task_out_exactly_once_at_a_time() {
                     };
                     match got {
                         Some((key, task, waker)) => {
+                            settling = false;
                             let idx = index_of(key);
                             assert!(
                                 task.allowed_on(0),
@@ -475,9 +481,10 @@ fn stress_task_collection_hands_each_task_out_exactly_once_at_a_time() {
                             }
                             // No thief can hold a task any more, so one more
                             // empty pass *after* that read settles it.
-                            if tc.take_task().is_none() {
+                            if settling {
                                 break;
                             }
+                            settling = true;
                         }
                     }
                 }
