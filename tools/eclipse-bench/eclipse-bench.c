@@ -20,7 +20,7 @@
 // MEM_MB  size of the memory working set in MiB (default 32).
 //
 // Options (before the positional arguments):
-//     --only SECTION   run one section: cpu, mem, syscall, vm, sched, smp,
+//     --only SECTION   run one section: cpu, mem, syscall, vm, sched, psched, smp,
 //                      disk, proc, gfx
 //     --drm PATH       DRM device for the gfx section (default /dev/dri/card0)
 //     --quick          shorter time budgets (rough numbers, ~3x faster)
@@ -127,6 +127,14 @@ static uint64_t g_max_ns = 20000000000ull; // 20 s per measurement
 
 #define NA (-1.0)
 
+// How many operations the last `timed_ns_per_op` / `pingpong_drive` call
+// actually performed. A derived per-operation figure (a kernel counter divided
+// by the work that caused it) needs the real count: those loops keep going past
+// the wall-clock budget until MIN_SAMPLES is met, so dividing by
+// budget/cost_per_op would silently understate a slow path by whatever factor
+// the floor added.
+static uint64_t g_last_ops;
+
 // Run `fn(n)` with a growing `n` until one call lasts >= `budget_ns`, then
 // return the achieved rate in operations/second. `fn` must return a value
 // derived from its work (fed into g_sink) so it isn't optimized away.
@@ -179,6 +187,7 @@ static double timed_ns_per_op(int (*fn)(void), uint64_t budget_ns) {
         if (batch < 64 && ops > 0 && elapsed / ops < 100000)
             batch = 64;
     }
+    g_last_ops = ops;
     return ops ? (double)elapsed / (double)ops : NA;
 }
 
@@ -641,6 +650,7 @@ static double pingpong_drive(struct pingpong *pp, uint64_t budget_ns) {
         if (batch < 32 && ops > 0 && elapsed / ops < 100000)
             batch = 32;
     }
+    g_last_ops = ops;
     return ops ? (double)elapsed / (double)ops : NA;
 }
 
@@ -1287,6 +1297,892 @@ static double smpk_fairness_maxmin(int nhogs, uint64_t budget_ns) {
     if (made != nhogs || mn == 0)
         return NA;
     return (double)mx / (double)mn;
+}
+
+// ---------------------------------------------------------------------------
+// PreemptiveScheduler internals  [kernel]
+// ---------------------------------------------------------------------------
+//
+// The SCHEDULER / IPC section above measures what a *user* feels: how long a
+// woken task waits for a CPU. It does not say which of the scheduler's
+// mechanisms produced that number, so a change to one of them cannot be
+// attributed, only observed.
+//
+// Eclipse's scheduler is not a Linux runqueue: `vendor/PreemptiveScheduler` is
+// a per-CPU async executor, and the policy in `zircon-object`'s thread code
+// decides only the *length* of a timeslice, never which task runs next. That
+// shape has its own distinct mechanisms, each of which can be wrong on its own
+// while every row above still looks reasonable:
+//
+//   * the timeslice floor (RUN_TO_PARITY) that stops a high-frequency waker
+//     from preempting the running thread every few microseconds;
+//   * the slice remainder (EEVDF's lag) that stops a thread which parks just
+//     short of its slice from renewing it forever and never being preempted;
+//   * work stealing, and the hint that lets an idle CPU decide there is
+//     nothing to steal without taking a single lock;
+//   * per-task affinity, and the cross-CPU kick that has to find the right
+//     CPU when a task cannot run where it was woken;
+//   * the weak executors and 32 KiB stacks left behind by a task that yields
+//     in the middle of a poll;
+//   * the timer rearm the deadline path does per sleep.
+//
+// Each probe below isolates one of them from userspace and, where the kernel
+// publishes the matching counter, prints the kernel's own view of the same
+// event next to it. Every probe runs on both kernels; the counter rows need
+// `/proc/perf/kernel` and are reported `n/a` where it does not exist, which on
+// Linux is every one of them.
+
+// --- kernel counters -------------------------------------------------------
+//
+// `/proc/perf/kernel` is a text report, not a stable ABI, so the numbers are
+// located by the label that introduces the line and then by position within
+// it. A line that is renamed or reordered makes the row read `n/a`; it never
+// makes it read a wrong number from a neighbouring field, because a label that
+// does not match is not found at all.
+
+#define KSTAT_BUF 131072
+static char g_kstat_a[KSTAT_BUF], g_kstat_b[KSTAT_BUF];
+// Set once the first read succeeds, so the section can say "this kernel has no
+// counters" rather than printing a wall of n/a with no explanation.
+static int g_kstat_ok = -1;
+
+static int kstat_snapshot(char *buf, size_t n) {
+    int fd = open("/proc/perf/kernel", O_RDONLY);
+    if (fd < 0) {
+        buf[0] = 0;
+        return 0;
+    }
+    size_t got = 0;
+    for (;;) {
+        ssize_t r = read(fd, buf + got, n - 1 - got);
+        if (r <= 0)
+            break;
+        got += (size_t)r;
+        if (got >= n - 1)
+            break;
+    }
+    close(fd);
+    buf[got] = 0;
+    return got > 0;
+}
+
+// The `idx`-th number (0-based) on the first line whose first non-blank
+// characters are `label`. Returns NA when the label or the field is absent.
+static double kstat_field(const char *buf, const char *label, int idx) {
+    size_t llen = strlen(label);
+    const char *p = buf;
+    while (*p) {
+        const char *bol = p;
+        while (*p == ' ' || *p == '\t')
+            p++;
+        if (strncmp(p, label, llen) == 0) {
+            // Found the line. Walk its fields to `idx`.
+            const char *q = p + llen;
+            int seen = 0;
+            while (*q && *q != '\n') {
+                if ((*q >= '0' && *q <= '9')) {
+                    const char *num = q;
+                    double v = strtod(num, (char **)&q);
+                    if (seen == idx)
+                        return v;
+                    seen++;
+                    continue;
+                }
+                q++;
+            }
+            return NA;
+        }
+        // Not this line: advance past it.
+        p = bol;
+        while (*p && *p != '\n')
+            p++;
+        if (*p == '\n')
+            p++;
+    }
+    return NA;
+}
+
+// after - before for one field, or NA if either end is missing. Counters in
+// this report are monotonic since boot, so a negative delta means the field
+// moved and the subtraction is meaningless; it is reported as n/a.
+static double kstat_delta(const char *label, int idx) {
+    double a = kstat_field(g_kstat_a, label, idx);
+    double b = kstat_field(g_kstat_b, label, idx);
+    if (a < 0 || b < 0 || b < a)
+        return NA;
+    return b - a;
+}
+
+// A counter delta divided by the number of userspace operations that caused
+// it: the unit that makes two machines comparable. `ops <= 0` is n/a.
+static double kstat_per_op(const char *label, int idx, double ops) {
+    double d = kstat_delta(label, idx);
+    if (d < 0 || ops <= 0)
+        return NA;
+    return d / ops;
+}
+
+// Wait for a start gate without using sched_yield().
+//
+// Every gate in this section used to yield, and the yield hand-off probe above
+// shows why that is unsafe here: a kernel can leave a voluntary yielder parked
+// indefinitely, which releases the gated thread late and makes its rate read
+// low for reasons that have nothing to do with the mechanism under test. A
+// short sleep parks the waiter just as effectively without depending on how
+// yield is implemented, and is bounded so a gate that never opens cannot hang
+// the suite.
+static void gate_wait(const volatile int *go, const volatile int *stop) {
+    struct timespec tick = {0, 50 * 1000}; // 50 us
+    uint64_t rounds = 0;
+    while (!*go) {
+        if (stop && *stop)
+            return;
+        nanosleep(&tick, NULL);
+        // ~30 s at 50 us: a gate that never opens costs this probe its number,
+        // never the run.
+        if (++rounds > 600000)
+            return;
+    }
+}
+
+// --- timeslice floor (RUN_TO_PARITY) ---------------------------------------
+//
+// A CPU-bound thread and a thread that wakes thousands of times a second,
+// deliberately pinned to the SAME CPU. Without a floor on the timeslice the
+// waker preempts the spinner on every single wake-up, and the spinner's
+// throughput collapses to whatever is left between the interruptions; with a
+// floor the first N microseconds of a slice belong to whoever is running.
+//
+// The two numbers are reported together on purpose. The floor does not create
+// throughput out of nothing: it buys the spinner's progress with the waker's
+// latency, so a run that showed only the retained throughput would be
+// advertising half of a trade. A kernel can be wrong in either direction here,
+// and only the pair says which.
+
+struct parity_ctl {
+    volatile int go;
+    volatile int stop;
+    volatile uint64_t spins;   // spinner's completed work units
+    volatile uint64_t wakes;   // waker's completed sleep/wake cycles
+    volatile uint64_t late_sum_ns;
+    volatile uint64_t late_max_ns;
+    int cpu;
+    unsigned period_us;
+    volatile int pin_failed;
+};
+
+static void *parity_spinner(void *arg) {
+    struct parity_ctl *c = arg;
+    if (smpk_pin_self(c->cpu) != 0)
+        c->pin_failed = 1;
+    gate_wait(&c->go, &c->stop);
+    uint64_t x = 0x9e3779b97f4a7c15ull, n = 0;
+    while (!c->stop) {
+        // No syscall in the loop: the only way this thread loses the CPU is
+        // the kernel taking it away, which is the event under test.
+        for (int k = 0; k < 1024; k++)
+            x = x * 6364136223846793005ull + 1442695040888963407ull;
+        n++;
+    }
+    g_sink += x;
+    c->spins = n;
+    return NULL;
+}
+
+static void *parity_waker(void *arg) {
+    struct parity_ctl *c = arg;
+    if (smpk_pin_self(c->cpu) != 0)
+        c->pin_failed = 1;
+    struct timespec ts = {0, (long)c->period_us * 1000};
+    gate_wait(&c->go, &c->stop);
+    uint64_t n = 0, sum = 0, mx = 0;
+    while (!c->stop) {
+        uint64_t t0 = now_ns();
+        nanosleep(&ts, NULL);
+        uint64_t late = now_ns() - t0;
+        // Overshoot beyond the requested period: the part the kernel added.
+        late = late > (uint64_t)c->period_us * 1000
+                   ? late - (uint64_t)c->period_us * 1000
+                   : 0;
+        sum += late;
+        if (late > mx)
+            mx = late;
+        n++;
+    }
+    c->wakes = n;
+    c->late_sum_ns = sum;
+    c->late_max_ns = mx;
+    return NULL;
+}
+
+// Run the spinner on `cpu` for `budget_ns`, with `period_us > 0` adding a
+// co-pinned waker at that period. Returns the spinner's work units per second,
+// and fills the waker figures when asked for.
+static double parity_run(int cpu, unsigned period_us, uint64_t budget_ns,
+                         double *wake_hz, double *late_mean_us,
+                         double *late_max_us) {
+    struct parity_ctl c;
+    memset(&c, 0, sizeof c);
+    c.cpu = cpu;
+    c.period_us = period_us;
+    pthread_t sp, wk;
+    if (pthread_create(&sp, NULL, parity_spinner, &c) != 0)
+        return NA;
+    int have_waker = 0;
+    if (period_us > 0) {
+        if (pthread_create(&wk, NULL, parity_waker, &c) == 0)
+            have_waker = 1;
+    }
+    // Let both threads reach their gate and be placed before timing starts.
+    struct timespec settle = {0, 30 * 1000 * 1000};
+    nanosleep(&settle, NULL);
+    uint64_t t0 = now_ns();
+    c.go = 1;
+    uint64_t ns = budget_ns < g_max_ns ? budget_ns : g_max_ns;
+    struct timespec run = {(time_t)(ns / 1000000000ull),
+                           (long)(ns % 1000000000ull)};
+    nanosleep(&run, NULL);
+    c.stop = 1;
+    pthread_join(sp, NULL);
+    if (have_waker)
+        pthread_join(wk, NULL);
+    uint64_t dt = now_ns() - t0;
+    if (c.pin_failed || dt == 0 || c.spins == 0)
+        return NA;
+    if (wake_hz)
+        *wake_hz = have_waker ? (double)c.wakes * 1e9 / (double)dt : NA;
+    if (late_mean_us)
+        *late_mean_us = (have_waker && c.wakes)
+                            ? (double)c.late_sum_ns / (double)c.wakes / 1000.0
+                            : NA;
+    if (late_max_us)
+        *late_max_us = have_waker ? (double)c.late_max_ns / 1000.0 : NA;
+    return (double)c.spins * 1e9 / (double)dt;
+}
+
+// --- slice remainder (EEVDF lag) -------------------------------------------
+//
+// Two threads on ONE CPU. One is a plain spinner. The other spins for most of
+// a timeslice and then parks very briefly — the shape of a thread that does a
+// short sleep, or reads a descriptor whose data has already arrived, just
+// before its slice would have expired.
+//
+// If a resumed thread is handed a whole new timeslice, that second thread is
+// never preempted: it renews its slice indefinitely and the plain spinner gets
+// only the scraps between the parks. If a resumption instead returns the
+// remainder of the slice it already had, both threads are preempted on the
+// same schedule and the split is even.
+//
+// The result is a share, so it has no units and no hardware in it: 1.00 means
+// the plain spinner got exactly its half, and a figure near 0 means the parking
+// thread is starving it. The park is a real sleep rather than a ready `read`
+// because a sleep is guaranteed to park on both kernels, while a ready read may
+// legitimately complete without ever yielding.
+
+struct lag_ctl {
+    volatile int go;
+    volatile int stop;
+    volatile uint64_t plain;
+    volatile uint64_t parker;
+    int cpu;
+    uint64_t spin_ns;   // how long the parking thread runs between parks
+    unsigned park_us;
+    volatile int pin_failed;
+};
+
+// Spin for `ns` of wall clock. Time-based, not iteration-based, so the shape
+// of the test is the same on a 4 GHz core and inside an emulator — an
+// iteration count calibrated for one would be a whole slice on the other.
+static uint64_t spin_for_ns(uint64_t ns) {
+    uint64_t x = 0x9e3779b97f4a7c15ull, units = 0;
+    uint64_t end = now_ns() + ns;
+    do {
+        for (int k = 0; k < 1024; k++)
+            x = x * 6364136223846793005ull + 1442695040888963407ull;
+        units++;
+    } while (now_ns() < end);
+    g_sink += x;
+    return units;
+}
+
+static void *lag_plain(void *arg) {
+    struct lag_ctl *c = arg;
+    if (smpk_pin_self(c->cpu) != 0)
+        c->pin_failed = 1;
+    gate_wait(&c->go, &c->stop);
+    uint64_t x = 0x9e3779b97f4a7c15ull, n = 0;
+    while (!c->stop) {
+        for (int k = 0; k < 1024; k++)
+            x = x * 6364136223846793005ull + 1442695040888963407ull;
+        n++;
+    }
+    g_sink += x;
+    c->plain = n;
+    return NULL;
+}
+
+static void *lag_parker(void *arg) {
+    struct lag_ctl *c = arg;
+    if (smpk_pin_self(c->cpu) != 0)
+        c->pin_failed = 1;
+    struct timespec ts = {0, (long)c->park_us * 1000};
+    gate_wait(&c->go, &c->stop);
+    uint64_t n = 0;
+    while (!c->stop) {
+        n += spin_for_ns(c->spin_ns);
+        nanosleep(&ts, NULL);
+    }
+    c->parker = n;
+    return NULL;
+}
+
+// Share of the work done by the plain spinner, normalised so 1.00 is an even
+// split. NA if either thread could not be pinned or did no work.
+static double lag_share(int cpu, uint64_t spin_ns, unsigned park_us,
+                        uint64_t budget_ns, double *parker_share) {
+    if (parker_share)
+        *parker_share = NA;
+    struct lag_ctl c;
+    memset(&c, 0, sizeof c);
+    c.cpu = cpu;
+    c.spin_ns = spin_ns;
+    c.park_us = park_us;
+    pthread_t a, b;
+    if (pthread_create(&a, NULL, lag_plain, &c) != 0)
+        return NA;
+    if (pthread_create(&b, NULL, lag_parker, &c) != 0) {
+        c.go = c.stop = 1;
+        pthread_join(a, NULL);
+        return NA;
+    }
+    struct timespec settle = {0, 30 * 1000 * 1000};
+    nanosleep(&settle, NULL);
+    c.go = 1;
+    uint64_t ns = budget_ns < g_max_ns ? budget_ns : g_max_ns;
+    struct timespec run = {(time_t)(ns / 1000000000ull),
+                           (long)(ns % 1000000000ull)};
+    nanosleep(&run, NULL);
+    c.stop = 1;
+    pthread_join(a, NULL);
+    pthread_join(b, NULL);
+    if (c.pin_failed)
+        return NA;
+    uint64_t total = c.plain + c.parker;
+    if (total == 0)
+        return NA;
+    // x2 so an even split reads 1.00 rather than 0.50.
+    if (parker_share)
+        *parker_share = (double)c.parker / (double)total * 2.0;
+    return (double)c.plain / (double)total * 2.0;
+}
+
+// --- work stealing ---------------------------------------------------------
+//
+// Every worker is created by a parent confined to CPU 0, so every one of them
+// is woken for the first time on that CPU. None is pinned, and all are
+// CPU-bound: on a machine with N CPUs the right outcome is one worker per CPU,
+// and the only thing that can produce it is the kernel either placing them
+// elsewhere at creation or other CPUs noticing the backlog and taking work.
+//
+// The figure is the time until all N CPUs are occupied, which treats both of
+// those routes as the success they are, and the occupancy actually reached,
+// which is the row that says a kernel never spread the work at all rather than
+// merely being slow about it.
+//
+// A worker has to widen its own mask first: a new thread inherits its
+// creator's affinity, so without that it is confined to CPU 0 for life and
+// this probe would measure nothing while reporting a number.
+
+#define STEAL_MAX 64
+struct steal_ctl {
+    volatile int go;
+    volatile int stop;
+    // Bit per CPU any worker has been seen on. Updated with an atomic OR:
+    // `mask |= bit` is a read-modify-write, and with one worker per CPU racing
+    // on it the lost updates made a kernel that spread the work perfectly
+    // report half the machine idle.
+    uint64_t seen_mask;
+    int ncpu;
+};
+static struct steal_ctl g_steal;
+
+static void *steal_worker(void *arg) {
+    struct steal_ctl *c = arg;
+    cpu_set_t all;
+    CPU_ZERO(&all);
+    for (int i = 0; i < c->ncpu && i < CPU_SETSIZE; i++)
+        CPU_SET(i, &all);
+    pthread_setaffinity_np(pthread_self(), sizeof all, &all);
+    gate_wait(&c->go, &c->stop);
+    uint64_t x = 0x9e3779b97f4a7c15ull;
+    while (!c->stop) {
+        // Enough work between samples to be unambiguously CPU-bound, little
+        // enough that the sampling interval does not dominate the latency.
+        for (int k = 0; k < 4096; k++)
+            x = x * 6364136223846793005ull + 1442695040888963407ull;
+        int cpu = sched_getcpu();
+        if (cpu >= 0 && cpu < 64)
+            __atomic_fetch_or(&c->seen_mask, 1ull << cpu, __ATOMIC_RELAXED);
+    }
+    g_sink += x;
+    return NULL;
+}
+
+static int popcount64(uint64_t v) {
+    int n = 0;
+    while (v) { v &= v - 1; n++; }
+    return n;
+}
+
+// Microseconds until all `n` CPUs have been observed running a worker, and the
+// occupancy reached. Returns -1 when the probe could not be set up at all.
+static int steal_spread_us(int n, int spawn_cpu, uint64_t budget_ns,
+                           double *full_us, int *occupied) {
+    if (n < 2 || n > STEAL_MAX)
+        return -1;
+    if (sched_getcpu() < 0)
+        return -1;
+    pthread_t th[STEAL_MAX];
+    memset(&g_steal, 0, sizeof g_steal);
+    g_steal.ncpu = n;
+    int made = 0;
+    // Confine the parent first, so every worker is created from that one CPU.
+    if (smpk_pin_self(spawn_cpu) != 0)
+        return -1;
+    for (int i = 0; i < n; i++) {
+        if (pthread_create(&th[i], NULL, steal_worker, &g_steal) != 0)
+            break;
+        made++;
+    }
+    // Release the parent before the workers run: a parent still holding the
+    // spawn CPU is one more runnable task on it, and what is under test is how
+    // fast the OTHER CPUs come looking.
+    cpu_set_t all;
+    CPU_ZERO(&all);
+    for (int i = 0; i < n && i < CPU_SETSIZE; i++)
+        CPU_SET(i, &all);
+    pthread_setaffinity_np(pthread_self(), sizeof all, &all);
+    if (made < 2) {
+        g_steal.go = g_steal.stop = 1;
+        for (int i = 0; i < made; i++)
+            pthread_join(th[i], NULL);
+        return -1;
+    }
+    uint64_t ns = budget_ns < g_max_ns ? budget_ns : g_max_ns;
+    uint64_t start = now_ns();
+    g_steal.go = 1;
+    uint64_t when_full = 0;
+    // Poll from here rather than having a worker notice: the observer must not
+    // be one of the threads competing for the CPUs it is counting.
+    while (now_ns() - start < ns) {
+        if (!when_full &&
+            popcount64(__atomic_load_n(&g_steal.seen_mask, __ATOMIC_RELAXED)) >=
+                made)
+            when_full = now_ns();
+        struct timespec tick = {0, 1000000}; // 1 ms
+        nanosleep(&tick, NULL);
+    }
+    g_steal.stop = 1;
+    for (int i = 0; i < made; i++)
+        pthread_join(th[i], NULL);
+    if (occupied)
+        *occupied =
+            popcount64(__atomic_load_n(&g_steal.seen_mask, __ATOMIC_RELAXED));
+    if (full_us)
+        *full_us = when_full ? (double)(when_full - start) / 1000.0 : NA;
+    return 0;
+}
+
+// --- affinity --------------------------------------------------------------
+//
+// Narrowing a task's affinity has to do more than store a mask: if the task is
+// runnable where it no longer belongs, some CPU in the new mask must be told to
+// come and get it. That kick walks the other CPUs' runtimes, so its cost is
+// the cost of a scheduler operation and not of a store, and it is paid by
+// anything that pins threads — a thread pool sizing itself to the machine, a
+// compositor putting its render thread somewhere specific.
+
+static int g_aff_ncpu = 1;
+static int g_aff_flip;
+
+static int sc_setaffinity(void) {
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    if (g_aff_flip) {
+        // Single CPU: the narrow mask, which is the case that can require a
+        // cross-CPU kick.
+        CPU_SET(0, &set);
+    } else {
+        for (int i = 0; i < g_aff_ncpu && i < CPU_SETSIZE; i++)
+            CPU_SET(i, &set);
+    }
+    g_aff_flip = !g_aff_flip;
+    return sched_setaffinity(0, sizeof set, &set) == 0 ? 0 : -1;
+}
+
+static int sc_getaffinity(void) {
+    cpu_set_t set;
+    return sched_getaffinity(0, sizeof set, &set) == 0 ? 0 : -1;
+}
+
+static int sc_getcpu(void) { return sched_getcpu() >= 0 ? 0 : -1; }
+
+// --- keeping a probe from hanging the suite --------------------------------
+//
+// This section pins threads together and then waits for one of them to be
+// given the CPU, which is exactly the shape that stops dead on a kernel whose
+// scheduler has a lost wake-up. A benchmark that runs unattended against a
+// kernel under development must not be able to lose thirty working rows
+// because the thirty-first probe never returned, so every wait here is bounded
+// three independent ways:
+//
+//   * the wall clock, which is the normal case;
+//   * a yield count, because if the CLOCK is the thing that is broken a
+//     wall-clock deadline never arrives and the suite stops with no output at
+//     all -- which is indistinguishable from a hung kernel;
+//   * SIGALRM, because neither of the first two is ever evaluated if the
+//     blocking call itself does not return. The handler does nothing: its only
+//     job is to make a blocked syscall fail with EINTR so the loop around it
+//     gets to look at its own deadlines again. It is installed WITHOUT
+//     SA_RESTART for that reason -- with the flag the kernel would restart the
+//     call and the signal would change nothing.
+//
+// Hitting the second or third bound is reported as what it is rather than
+// folded into a plain "n/a", because "this operation is unsupported" and "this
+// operation never came back" are different findings.
+
+#define YIELD_CAP 20000000ull
+
+static volatile sig_atomic_t g_watchdog_fired;
+
+static void bench_watchdog(int sig) {
+    (void)sig;
+    g_watchdog_fired = 1;
+}
+
+// Arm (secs > 0) or disarm (secs == 0) the watchdog. Returns 0 if a watchdog
+// could not be installed, in which case the clock and the yield count are the
+// only bounds left and the caller carries on with them.
+static int watchdog_set(unsigned secs) {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_handler = bench_watchdog;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0; // deliberately NOT SA_RESTART
+    if (sigaction(SIGALRM, &sa, NULL) != 0)
+        return 0;
+    if (secs == 0)
+        g_watchdog_fired = 0;
+    alarm(secs);
+    return 1;
+}
+
+// --- yield hand-off --------------------------------------------------------
+//
+// Two threads on one CPU, each giving the CPU straight back. No timer, no
+// descriptor, no wake-up: just the executor being asked to pick the next task
+// and switch to it. It is the floor under every other number in this section —
+// whatever a pipe round trip costs, this is the part of it that is pure
+// dispatch, and the difference is the pipe and the wake.
+
+struct yield_ctl {
+    volatile int go;
+    volatile int stop;
+    volatile uint64_t turn;   // whose turn it is: 0 = a, 1 = b
+    volatile uint64_t ops;
+    int cpu;
+    volatile int pin_failed;
+};
+
+static void *yield_peer(void *arg) {
+    struct yield_ctl *c = arg;
+    if (smpk_pin_self(c->cpu) != 0)
+        c->pin_failed = 1;
+    gate_wait(&c->go, &c->stop);
+    uint64_t spins;
+    while (!c->stop) {
+        spins = 0;
+        while (c->turn != 1 && !c->stop) {
+            sched_yield();
+            if (++spins > YIELD_CAP)
+                return NULL;
+        }
+        if (c->stop)
+            break;
+        c->turn = 0;
+    }
+    return NULL;
+}
+
+// Nanoseconds per hand-off (one full there-and-back is counted as two).
+//
+// `*why` is set to NULL on success and otherwise to the reason there is no
+// number, because "n/a" alone cannot distinguish a kernel that refuses the
+// affinity call from one where a co-pinned peer is never given the CPU at all
+// — and those are a missing feature and a starvation bug respectively.
+static double yield_handoff_ns(int cpu, uint64_t budget_ns, const char **why) {
+    if (why)
+        *why = NULL;
+    struct yield_ctl c;
+    memset(&c, 0, sizeof c);
+    c.cpu = cpu;
+    if (smpk_pin_self(cpu) != 0) {
+        if (why) *why = "this kernel would not pin a thread to one CPU";
+        return NA;
+    }
+    pthread_t t;
+    if (pthread_create(&t, NULL, yield_peer, &c) != 0) {
+        if (why) *why = "could not create the peer thread";
+        return NA;
+    }
+    struct timespec settle = {0, 20 * 1000 * 1000};
+    nanosleep(&settle, NULL);
+    c.go = 1;
+    uint64_t t0 = now_ns(), elapsed = 0, ops = 0;
+    uint64_t ns = budget_ns < g_max_ns ? budget_ns : g_max_ns;
+    // Armed ONCE, around the whole loop, and generously: the alarm is a
+    // backstop against a call that never returns, not a per-round budget.
+    // Arming it per round puts a sigaction and an alarm between every
+    // hand-off, which measurably inflates the figure being measured.
+    g_watchdog_fired = 0;
+    watchdog_set((unsigned)(ns / 1000000000ull) + 30);
+    while (elapsed < ns || ops < MIN_SAMPLES) {
+        c.turn = 1;
+        uint64_t guard = now_ns() + 2000000000ull;
+        uint64_t spins = 0;
+        const char *bound = NULL;
+        while (c.turn != 0) {
+            sched_yield();
+            if (++spins > YIELD_CAP) {
+                // The yield count ran out while the clock said there was time
+                // left. Either the clock is not advancing or yielding is not
+                // getting the peer onto this CPU; the next row's timings say
+                // which, and both are worth knowing.
+                bound = "20M yields without the co-pinned peer running";
+                break;
+            }
+            if (g_watchdog_fired) {
+                // The yield itself did not come back until a signal made it.
+                bound = "sched_yield() blocked until a signal interrupted it";
+                break;
+            }
+            if (now_ns() > guard) {
+                bound = "the co-pinned peer never took the CPU in 2 s";
+                break;
+            }
+        }
+        if (bound) {
+            if (why)
+                *why = bound;
+            watchdog_set(0);
+            c.stop = 1;
+            c.turn = 0;
+            pthread_join(t, NULL);
+            return NA;
+        }
+        ops += 2;
+        elapsed = now_ns() - t0;
+        if (elapsed >= g_max_ns)
+            break;
+    }
+    watchdog_set(0);
+    c.stop = 1;
+    c.turn = 1;
+    pthread_join(t, NULL);
+    cpu_set_t all;
+    CPU_ZERO(&all);
+    for (int i = 0; i < g_aff_ncpu && i < CPU_SETSIZE; i++)
+        CPU_SET(i, &all);
+    pthread_setaffinity_np(pthread_self(), sizeof all, &all);
+    if (c.pin_failed) {
+        if (why) *why = "this kernel would not pin a thread to one CPU";
+        return NA;
+    }
+    if (ops == 0)
+        return NA;
+    return (double)elapsed / (double)ops;
+}
+
+// --- cross-CPU wake coalescing ---------------------------------------------
+//
+// Making a task runnable on another CPU ends in a request for that CPU to
+// reschedule, and those requests are coalesced per CPU: waking eight tasks on
+// one CPU should not cost eight times what waking one costs, because after the
+// first the CPU has already been told.
+//
+// One waker, M sleepers all confined to a different single CPU, woken in a
+// burst and then waited for. The cost per sleeper at M=1 against M=many is the
+// coalescing, and a ratio near 1 means each wake is paying full price.
+
+#define WAKE_MAX 32
+struct wake_slot {
+    volatile int word;      // futex: 0 = sleep, 1 = go
+    volatile int done;
+    int cpu;
+    volatile int stop;
+    volatile int pin_failed;
+};
+static struct wake_slot g_wake[WAKE_MAX];
+
+static void *wake_sleeper(void *arg) {
+    struct wake_slot *s = arg;
+    if (smpk_pin_self(s->cpu) != 0)
+        s->pin_failed = 1;
+    for (;;) {
+        while (s->word == 0 && !s->stop)
+            futex_op(&s->word, ECL_FUTEX_WAIT, 0);
+        if (s->stop)
+            break;
+        s->word = 0;
+        s->done = 1;
+    }
+    return NULL;
+}
+
+// Nanoseconds the waker spends ISSUING one of a burst of `m` cross-CPU wakes.
+//
+// Only the issuing loop is inside the clock. Waiting for the targets to run
+// and park again is done outside it, because M targets confined to one CPU
+// necessarily serialize there, and timing that would report the CPU's width as
+// though it were the cost of a wake.
+static double wake_burst_ns(int m, int waker_cpu, int target_cpu,
+                            uint64_t budget_ns) {
+    if (m < 1 || m > WAKE_MAX)
+        return NA;
+    pthread_t th[WAKE_MAX];
+    int made = 0;
+    for (int i = 0; i < m; i++) {
+        memset(&g_wake[i], 0, sizeof g_wake[i]);
+        g_wake[i].cpu = target_cpu;
+    }
+    for (int i = 0; i < m; i++) {
+        if (pthread_create(&th[i], NULL, wake_sleeper, &g_wake[i]) != 0)
+            break;
+        made++;
+    }
+    double out = NA;
+    if (made == m && smpk_pin_self(waker_cpu) == 0) {
+        struct timespec settle = {0, 30 * 1000 * 1000};
+        nanosleep(&settle, NULL);
+        uint64_t t_start = now_ns(), issue_ns = 0, rounds = 0;
+        uint64_t ns = budget_ns < g_max_ns ? budget_ns : g_max_ns;
+        int bad = 0;
+        g_watchdog_fired = 0;
+        watchdog_set((unsigned)(ns / 1000000000ull) + 30);
+        while ((now_ns() - t_start < ns || rounds < MIN_SAMPLES) && !bad) {
+            for (int i = 0; i < m; i++)
+                g_wake[i].done = 0;
+            uint64_t t0 = now_ns();
+            for (int i = 0; i < m; i++) {
+                g_wake[i].word = 1;
+                futex_op(&g_wake[i].word, ECL_FUTEX_WAKE, 1);
+            }
+            issue_ns += now_ns() - t0;
+            // Untimed: let every target wake, run and park again, so the next
+            // round issues into sleepers rather than into already-running
+            // threads (which would cost nothing and flatter the burst).
+            uint64_t guard = now_ns() + 2000000000ull;
+            uint64_t spins = 0;
+            for (int i = 0; i < m; i++) {
+                while (!g_wake[i].done) {
+                    sched_yield();
+                    // Same three bounds as the hand-off probe: a sleeper that
+                    // is never woken must cost this probe its number, not the
+                    // whole run.
+                    if (++spins > YIELD_CAP || g_watchdog_fired ||
+                        now_ns() > guard) {
+                        bad = 1;
+                        break;
+                    }
+                }
+                if (bad)
+                    break;
+            }
+            rounds++;
+            if (now_ns() - t_start >= g_max_ns)
+                break;
+        }
+        watchdog_set(0);
+        if (!bad && rounds)
+            out = (double)issue_ns / (double)rounds / (double)m;
+        for (int i = 0; i < made; i++)
+            if (g_wake[i].pin_failed)
+                out = NA;
+    }
+    for (int i = 0; i < made; i++) {
+        g_wake[i].stop = 1;
+        g_wake[i].word = 1;
+        futex_op(&g_wake[i].word, ECL_FUTEX_WAKE, 1);
+    }
+    for (int i = 0; i < made; i++)
+        pthread_join(th[i], NULL);
+    cpu_set_t all;
+    CPU_ZERO(&all);
+    for (int i = 0; i < g_aff_ncpu && i < CPU_SETSIZE; i++)
+        CPU_SET(i, &all);
+    pthread_setaffinity_np(pthread_self(), sizeof all, &all);
+    return out;
+}
+
+// --- sleep storm -----------------------------------------------------------
+//
+// Short sleeps, back to back, so the timer path is the whole workload. Each one
+// arms a deadline and takes it back again, and the kernel counter says how many
+// rearms that actually cost — a number that should be close to one per sleep
+// and, when it is not, says the timer is being reprogrammed by something other
+// than the sleep that needed it.
+
+static unsigned g_sleep_us = 200;
+
+static int sc_short_sleep(void) {
+    struct timespec ts = {0, (long)g_sleep_us * 1000};
+    return nanosleep(&ts, NULL) == 0 ? 0 : 0; // EINTR is still a completed arm
+}
+
+// --- a deterministic reproducer for a sched_yield() that does not return ---
+//
+// See the `--yieldstall` block in main() for what this builds and why.
+
+struct ys_lane {
+    volatile uint64_t count;
+    const volatile int *stop;
+    volatile int pin_failed;
+};
+
+struct ys_ctl {
+    volatile int stop;
+    volatile uint64_t notifies;
+    struct ys_lane a, b;
+    int nnotify;
+};
+static struct ys_ctl g_ys;
+
+static void *ys_yielder(void *arg) {
+    struct ys_lane *l = arg;
+    if (smpk_pin_self(0) != 0)
+        l->pin_failed = 1;
+    while (!*l->stop) {
+        sched_yield();
+        // Bumped AFTER the call returns, so a count that stops advancing means
+        // the call did not come back -- not that the loop was merely slow.
+        l->count++;
+    }
+    return NULL;
+}
+
+static void *ys_notifier(void *arg) {
+    struct ys_ctl *c = arg;
+    if (smpk_pin_self(0) != 0)
+        return NULL;
+    // Short sleeps, on the same CPU as the yielders: each one ends in a timer
+    // wake, which is a NOTIFY arriving at that CPU. The notified lane is what
+    // the yielded lane has to wait behind.
+    struct timespec ts = {0, 200 * 1000}; // 200 us
+    while (!c->stop) {
+        nanosleep(&ts, NULL);
+        c->notifies++;
+    }
+    return NULL;
 }
 
 // ---------------------------------------------------------------------------
@@ -2181,6 +3077,122 @@ int main(int argc, char **argv) {
         return 0;
     }
 
+    // `--yieldstall [SECONDS] [NOTIFIERS]`: a deterministic reproducer for a
+    // sched_yield() that never returns.
+    //
+    // Not a benchmark — a diagnostic, like `--forkloop`. The `psched` section
+    // reports that Eclipse's `sched_yield()` can block indefinitely, but it
+    // finds it as a side effect of measuring something else and only
+    // sometimes, which is no use to anyone trying to fix it. This builds the
+    // condition on purpose instead of waiting for it.
+    //
+    // The recipe follows the shape of the executor. A voluntary yield parks
+    // its self-wake in a *yielded* lane, and that lane is drained only once
+    // nothing is notified on the CPU. So: confine everything to ONE CPU, put
+    // two threads in a tight `sched_yield()` loop, and keep a steady stream of
+    // notifies arriving at that same CPU from a third thread doing short
+    // sleeps. If the yielded lane is strictly lower priority than the notified
+    // one, the two yielders are starved for as long as the notifier keeps
+    // going, and neither `sched_yield()` call ever comes back.
+    //
+    // The observer is pinned OFF that CPU: a reporter sharing the CPU under
+    // test would be one more runnable task on it and would change the thing
+    // being observed. One line per second, so a stall is visible as it happens
+    // rather than inferred from a silent console, and the verdict at the end
+    // names which thread stopped and when.
+    if (argc > 1 && strcmp(argv[1], "--yieldstall") == 0) {
+        setvbuf(stdout, NULL, _IOLBF, 0);
+        int secs = argc > 2 ? (int)strtol(argv[2], NULL, 10) : 20;
+        int nnotify = argc > 3 ? (int)strtol(argv[3], NULL, 10) : 1;
+        if (secs < 1) secs = 1;
+        if (nnotify < 0) nnotify = 0;
+        if (nnotify > 8) nnotify = 8;
+        long nc = sysconf(_SC_NPROCESSORS_ONLN);
+        int ncpus = (nc > 0 && nc < 4096) ? (int)nc : 1;
+        if (ncpus < 2) {
+            printf("yieldstall: needs at least 2 CPUs (the observer must not "
+                   "share the CPU under test)\n");
+            return 2;
+        }
+        memset(&g_ys, 0, sizeof g_ys);
+        g_ys.nnotify = nnotify;
+        g_ys.a.stop = &g_ys.stop;
+        g_ys.b.stop = &g_ys.stop;
+        // Confine this thread to CPU 0 FIRST, so every thread created below
+        // inherits that mask and starts life on the CPU under test.
+        if (smpk_pin_self(0) != 0) {
+            printf("yieldstall: could not pin to CPU 0 — nothing to test\n");
+            return 2;
+        }
+        pthread_t ya, yb, nt[8];
+        int made_n = 0;
+        if (pthread_create(&ya, NULL, ys_yielder, &g_ys.a) != 0 ||
+            pthread_create(&yb, NULL, ys_yielder, &g_ys.b) != 0) {
+            printf("yieldstall: could not create the yielder threads\n");
+            return 2;
+        }
+        for (int i = 0; i < nnotify; i++) {
+            if (pthread_create(&nt[i], NULL, ys_notifier, &g_ys) != 0)
+                break;
+            made_n++;
+        }
+        // Move the observer off CPU 0 so it is not competing with what it
+        // watches.
+        cpu_set_t obs;
+        CPU_ZERO(&obs);
+        for (int i = 1; i < ncpus && i < CPU_SETSIZE; i++)
+            CPU_SET(i, &obs);
+        pthread_setaffinity_np(pthread_self(), sizeof obs, &obs);
+        printf("yieldstall: 2 yielders + %d notifier(s), all on CPU 0; "
+               "observer on CPU 1..%d; %d s\n", made_n, ncpus - 1, secs);
+        printf("yieldstall: a yields/s of 0 while notifies keep arriving IS "
+               "the bug\n");
+        uint64_t pa = 0, pb = 0, pn = 0;
+        uint64_t stall_a = 0, stall_b = 0;
+        uint64_t t0 = now_ns();
+        for (int s = 0; s < secs; s++) {
+            struct timespec one = {1, 0};
+            nanosleep(&one, NULL);
+            uint64_t ca = g_ys.a.count, cb = g_ys.b.count, cn = g_ys.notifies;
+            uint64_t da = ca - pa, db = cb - pb, dn = cn - pn;
+            double at = (double)(now_ns() - t0) / 1e9;
+            printf("yieldstall %5.1fs: A %10llu/s  B %10llu/s  notifies %8llu/s\n",
+                   at, (unsigned long long)da, (unsigned long long)db,
+                   (unsigned long long)dn);
+            // First second in which a yielder made no progress at all while
+            // the notifier did: that is the lane being starved, not the thread
+            // merely running slowly.
+            if (da == 0 && dn > 0 && !stall_a) stall_a = (uint64_t)(at * 1000);
+            if (db == 0 && dn > 0 && !stall_b) stall_b = (uint64_t)(at * 1000);
+            pa = ca; pb = cb; pn = cn;
+        }
+        g_ys.stop = 1;
+        printf("yieldstall: verdict:\n");
+        if (stall_a || stall_b) {
+            printf("  STALLED. A first made no progress at %llu ms, B at "
+                   "%llu ms (0 = never stalled),\n"
+                   "  while notifies kept arriving at the same CPU. A yielder "
+                   "that stops\n  advancing under a notify stream is the "
+                   "yielded lane being starved.\n",
+                   (unsigned long long)stall_a, (unsigned long long)stall_b);
+        } else {
+            printf("  no stall: both yielders kept advancing for the whole "
+                   "run.\n");
+        }
+        printf("  totals: A %llu yields, B %llu yields, %llu notifies\n",
+               (unsigned long long)g_ys.a.count,
+               (unsigned long long)g_ys.b.count,
+               (unsigned long long)g_ys.notifies);
+        // Do NOT join: if sched_yield() really does not return, the yielder
+        // threads are stuck inside it and a join would hang the very
+        // diagnostic that just proved it. Say so and exit.
+        if (stall_a || stall_b)
+            printf("  (not joining the yielders: they are inside the call "
+                   "that did not return)\n");
+        fflush(stdout);
+        _exit(0);
+    }
+
     const char *only = NULL;
     int argi = 1;
     while (argi < argc && argv[argi][0] == '-' && argv[argi][1] == '-') {
@@ -2211,7 +3223,10 @@ int main(int argc, char **argv) {
                     " [DIR] [DISK_MB] [MEM_MB]\n",
                     argv[0]);
             fprintf(stderr,
-                    "sections: cpu mem syscall vm sched smp disk proc gfx\n");
+                    "sections: cpu mem syscall vm sched psched smp disk proc gfx\n");
+            fprintf(stderr,
+                    "diagnostics: --forkloop N MIB [MAPS], "
+                    "--yieldstall [SECONDS] [NOTIFIERS]\n");
             return 2;
         }
         argi++;
@@ -2449,6 +3464,237 @@ int main(int argc, char **argv) {
         printf("  that only reschedules at timeslice expiry shows a large jump\n");
         printf("  between the idle and loaded rows; one that preempts on wake-up\n");
         printf("  (Linux does) shows almost none.\n");
+    }
+
+    // ---- PreemptiveScheduler internals ----
+    if (want(only, "psched")) {
+        line();
+        printf("PREEMPTIVE SCHEDULER INTERNALS   <-- one mechanism per row\n");
+        g_aff_ncpu = ncpu;
+        g_kstat_ok = kstat_snapshot(g_kstat_a, sizeof g_kstat_a);
+        if (!g_kstat_ok)
+            printf("  (no /proc/perf/kernel: the kernel-side counter rows are n/a.\n");
+        if (!g_kstat_ok)
+            printf("   Expected on Linux — every userspace row below still runs.)\n");
+        else {
+            // The boot's own description of which scheduler switches are on,
+            // so a captured report cannot be compared against another whose
+            // policy differed.
+            const char *m = strstr(g_kstat_a, "sched mode:");
+            if (m) {
+                const char *e = strchr(m, '\n');
+                printf("  %.*s\n", (int)(e ? (size_t)(e - m) : strlen(m)), m);
+            }
+        }
+
+        // --- dispatch floor ---
+        const char *yh_why = NULL;
+        double yh = yield_handoff_ns(0, g_short_ns, &yh_why);
+        row("[kernel]", "yield hand-off (1 CPU)", yh, "ns", "linux: ~600");
+        if (yh < 0 && yh_why)
+            printf("           ^ %s\n", yh_why);
+        if (yh > 0 && pipe_proc_ns > 0)
+            row("[kernel]", "pipe RT / yield hand-off", pipe_proc_ns / yh, "x",
+                "how much of a round trip is not dispatch");
+
+        // --- timeslice floor (RUN_TO_PARITY) ---
+        printf("  -- timeslice floor: a spinner and a kHz waker on ONE CPU --\n");
+        fflush(stdout);
+        double solo = parity_run(0, 0, g_short_ns, NULL, NULL, NULL);
+        row("[kernel]", "spinner alone, 1 CPU", solo < 0 ? NA : solo / 1e3,
+            "kunit/s", "");
+        double w_hz = NA, w_mean = NA, w_max = NA;
+        double shared = parity_run(0, 200, g_short_ns, &w_hz, &w_mean, &w_max);
+        row("[kernel]", "spinner + 200us waker", shared < 0 ? NA : shared / 1e3,
+            "kunit/s", "");
+        if (solo > 0 && shared > 0)
+            row("[kernel]", "throughput retained", shared / solo * 100.0, "%",
+                "low = preempted on every wake");
+        row("[kernel]", "  waker rate achieved", w_hz, "wake/s", "");
+        row("[kernel]", "  waker late (mean)", w_mean, "us", "");
+        row("[kernel]", "  waker late (worst)", w_max, "us", "");
+        printf("  the floor buys the spinner's throughput with the waker's\n");
+        printf("  latency, so these rows are one result, not two. High retention\n");
+        printf("  WITH low waker latency is the only unambiguously good outcome.\n");
+
+        // --- slice remainder (EEVDF lag) ---
+        printf("  -- slice remainder: a plain spinner against one that parks --\n");
+        fflush(stdout);
+        // 600 us of work then a 50 us park: just under a default slice, which
+        // is the case a resumption that renews the whole slice never preempts.
+        double parker_share = NA;
+        double share = lag_share(0, 600000ull, 50, g_short_ns, &parker_share);
+        row("[kernel]", "plain spinner fair share", share, "x",
+            "1.00 = even; 0 = starved by the parker");
+        row("[kernel]", "parking thread fair share", parker_share, "x",
+            "the two sum to 2.00 by construction");
+        if (share >= 1.99 || parker_share >= 1.99)
+            printf("           ^ one of the two did NO work: the pair was not\n"
+                   "             sharing the CPU at all, which is a different\n"
+                   "             finding from an uneven split.\n");
+        printf("  a thread that parks just short of its slice must come back\n");
+        printf("  with the REMAINDER, not a fresh slice, or it is never\n");
+        printf("  preempted and its neighbour on that CPU gets the scraps.\n");
+
+        // --- work stealing ---
+        if (ncpu > 1) {
+            printf("  -- work stealing: %d workers all created on CPU 0 --\n", ncpu);
+            fflush(stdout);
+            double full_us = NA;
+            int occupied = 0;
+            // The long budget, not the short one: this probe is a latency
+            // with a tail, and a window shorter than the kernel's balancing
+            // period reports "never spread" for a kernel that merely took one
+            // more period to do it.
+            if (steal_spread_us(ncpu, 0, g_budget_ns, &full_us, &occupied) == 0) {
+                char lbl[64];
+                row("[kernel]", "time to occupy all CPUs", full_us, "us",
+                    "linux: ~0-200");
+                snprintf(lbl, sizeof lbl, "CPUs occupied of %d", ncpu);
+                row("[kernel]", lbl, (double)occupied, "",
+                    occupied < ncpu ? "<-- work never spread this wide" : "");
+                printf("  n/a on the first row with full occupancy on the second\n");
+                printf("  means the spread took longer than this probe's budget.\n");
+            } else {
+                printf("  (no per-CPU id from this kernel — spread not measurable)\n");
+            }
+        }
+
+        // --- idle steal scans: the no-peer-stealable hint ---
+        if (g_kstat_ok) {
+            printf("  -- idle second: what the steal path does with nothing to do --\n");
+            fflush(stdout);
+            kstat_snapshot(g_kstat_a, sizeof g_kstat_a);
+            struct timespec idle = {1, 0};
+            nanosleep(&idle, NULL);
+            kstat_snapshot(g_kstat_b, sizeof g_kstat_b);
+            double scans = kstat_delta("sched steal:", 0);
+            double probed = kstat_delta("sched steal:", 1);
+            double skipped = kstat_delta("sched steal:", 5);
+            // The two counters are DISJOINT. The hint's early return bumps
+            // `skipped` and returns before `scans` is touched, so `skipped` is
+            // the number of scans avoided, not a subset of those performed:
+            // the denominator is their sum, and dividing by `scans` alone
+            // yields shares above 100%.
+            double attempts = (scans >= 0 && skipped >= 0) ? scans + skipped : NA;
+            row("[kernel]", "steal attempts, idle", attempts, "/s", "");
+            row("[kernel]", "  scans actually walked", scans, "/s", "");
+            if (attempts > 0 && skipped >= 0)
+                row("[kernel]", "  avoided by the hint", skipped / attempts * 100.0,
+                    "%", "answered without taking a lock");
+            if (scans > 0 && probed >= 0)
+                row("[kernel]", "  victims probed per scan", probed / scans, "x",
+                    "each probe is a lock on a peer");
+            printf("  an idle CPU leaves halt on every interrupt. Walking every\n");
+            printf("  peer's runtime before concluding there is nothing to steal\n");
+            printf("  costs a lock per peer per wake-up, and those lines are\n");
+            printf("  written by the CPUs that own them.\n");
+        }
+
+        // --- affinity ---
+        printf("  -- affinity: the mask, and the kick it implies --\n");
+        fflush(stdout);
+        row("[kernel]", "sched_getcpu()",
+            timed_ns_per_op(sc_getcpu, g_short_ns), "ns", "linux: ~25 (vDSO)");
+        row("[kernel]", "sched_getaffinity()",
+            timed_ns_per_op(sc_getaffinity, g_short_ns), "ns", "linux: ~250");
+        if (g_kstat_ok)
+            kstat_snapshot(g_kstat_a, sizeof g_kstat_a);
+        double aff_ns = timed_ns_per_op(sc_setaffinity, g_short_ns);
+        row("[kernel]", "sched_setaffinity() flip", aff_ns, "ns", "linux: ~700");
+        if (g_kstat_ok && aff_ns > 0) {
+            kstat_snapshot(g_kstat_b, sizeof g_kstat_b);
+            double ops = (double)g_last_ops;
+            row("[kernel]", "  affinity-empty scans",
+                kstat_per_op("sched steal:", 3, ops), "/flip",
+                "a peer whose queue has no task this CPU may run");
+        }
+        printf("  narrowing a mask has to kick a CPU in the new mask when the\n");
+        printf("  task is runnable outside it, and that kick walks the other\n");
+        printf("  CPUs' runtimes — a scheduler operation, not a store.\n");
+
+        // --- cross-CPU wake coalescing ---
+        if (ncpu > 1) {
+            printf("  -- cross-CPU wake: one at a time against a burst --\n");
+            fflush(stdout);
+            int burst = ncpu * 2 > WAKE_MAX ? WAKE_MAX : ncpu * 2;
+            if (burst < 2)
+                burst = 2;
+            double one = wake_burst_ns(1, 0, 1, g_short_ns);
+            double many = wake_burst_ns(burst, 0, 1, g_short_ns);
+            char lbl[64];
+            row("[kernel]", "wake issue, 1 target",
+                one < 0 ? NA : one / 1000.0, "us", "");
+            snprintf(lbl, sizeof lbl, "wake issue, %d in a burst", burst);
+            row("[kernel]", lbl, many < 0 ? NA : many / 1000.0, "us",
+                "per target");
+            if (one > 0 && many > 0)
+                row("[kernel]", "burst / single, per wake", many / one, "x",
+                    "<1 = later wakes are cheaper");
+            printf("  Eclipse folds the reschedule request per CPU, so wakes 2..N\n");
+            printf("  into one CPU can be much cheaper than the first. Linux does\n");
+            printf("  not fold distinct futex wakes and reports ABOVE 1 here, so\n");
+            printf("  this row is the two kernels against each other, not a score:\n");
+            printf("  read it next to the single-target row, which carries the\n");
+            printf("  absolute cost.\n");
+        }
+
+        // --- timer rearms and executor polls, per operation ---
+        printf("  -- per-operation kernel work --\n");
+        fflush(stdout);
+        if (g_kstat_ok)
+            kstat_snapshot(g_kstat_a, sizeof g_kstat_a);
+        g_sleep_us = 200;
+        double sl_ns = timed_ns_per_op(sc_short_sleep, g_short_ns);
+        row("[kernel]", "nanosleep(200us) cost", sl_ns < 0 ? NA : sl_ns / 1000.0,
+            "us", "linux: ~260");
+        if (g_kstat_ok && sl_ns > 0) {
+            kstat_snapshot(g_kstat_b, sizeof g_kstat_b);
+            double sleeps = (double)g_last_ops;
+            row("[kernel]", "  timer rearms per sleep",
+                kstat_per_op("timer rearms:", 0, sleeps), "/sleep",
+                "~1 is right; more means extra reprogramming");
+            row("[kernel]", "  task polls per sleep",
+                kstat_per_op("sched:", 0, sleeps), "/sleep", "");
+        }
+
+        if (g_kstat_ok) {
+            // A blocking round trip is the operation that can leave a weak
+            // executor behind: the task yields in the middle of a poll, and
+            // what it was using has to be kept somewhere until it resumes.
+            kstat_snapshot(g_kstat_a, sizeof g_kstat_a);
+            double rt = sched_pipe_rt_thread(g_short_ns);
+            kstat_snapshot(g_kstat_b, sizeof g_kstat_b);
+            if (rt > 0 && g_last_ops > 0) {
+                double ops = (double)g_last_ops; // round trips actually driven
+                row("[kernel]", "task polls per pipe RT",
+                    kstat_per_op("sched:", 0, ops), "/RT", "");
+                row("[kernel]", "weak-exec yields per RT",
+                    kstat_per_op("sched:", 2, ops), "/RT", "");
+                row("[kernel]", "weak execs created per RT",
+                    kstat_per_op("sched weak:", 0, ops), "/RT",
+                    "each one holds a 32 KiB stack");
+            }
+            // Absolute high-water marks: these say whether the churn above is
+            // being absorbed by the pool or is growing without bound.
+            row("[kernel]", "weak execs live, peak",
+                kstat_field(g_kstat_b, "sched weak:", 1), "", "");
+            row("[kernel]", "weak soft-cap hits",
+                kstat_field(g_kstat_b, "sched weak:", 2), "",
+                "non-zero = the cap is being reached");
+            row("[kernel]", "stack-pool overflows",
+                kstat_field(g_kstat_b, "sched weak:", 4), "",
+                "a stack the pool could not supply");
+            row("[kernel]", "stack high-water",
+                kstat_field(g_kstat_b, "sched stack:", 2), "%",
+                "of the per-executor stack");
+            row("[kernel]", "wakeup preempt honoured",
+                kstat_field(g_kstat_b, "wakeup preempt:", 3), "%",
+                "kernel-side twin of wake late loaded/idle");
+        }
+        printf("  these counters are the kernel's own view of the same events.\n");
+        printf("  They need /proc/perf/kernel, so on Linux they are n/a and the\n");
+        printf("  userspace rows above are the whole comparison.\n");
     }
 
     // ---- SMP ----
