@@ -2383,4 +2383,139 @@ mod tests {
             "an unbounded toplevels.push() is back"
         );
     }
+
+    // ── the palettes ─────────────────────────────────────────────────────────
+
+    /// Every look there is. The match below is exhaustive on purpose: a
+    /// fourth variant stops this compiling, which is the point, because the
+    /// palette tests walk this list and a look missing from it would go
+    /// unchecked in exactly the silent way a palette bug already is.
+    fn every_look() -> [Look; 3] {
+        let all = [Look::Win11, Look::Kde, Look::Eclipse];
+        for look in all {
+            match look {
+                Look::Win11 | Look::Kde | Look::Eclipse => {}
+            }
+        }
+        all
+    }
+
+    /// How light a colour is, nought to seven hundred and sixty-five. Rough
+    /// on purpose: these palettes are shades of one hue each, so the sum of
+    /// the channels orders them the way a weighted luminance would.
+    fn light((r, g, b): Rgb) -> u32 {
+        r as u32 + g as u32 + b as u32
+    }
+
+    /// How much colour there is in it: nought for any grey, and the spread
+    /// of the channels for anything else. This is what tells an accent from
+    /// a hairline, since the two can be the same lightness.
+    fn colourful((r, g, b): Rgb) -> u8 {
+        r.max(g).max(b) - r.min(g).min(b)
+    }
+
+    /// Each look gets its OWN palette. A mis-wired row here dresses the
+    /// launcher as another desktop, which reads as a setting that did not
+    /// stick rather than as a bug, so nobody would ever report it.
+    #[test]
+    fn every_look_gets_its_own_palette() {
+        for (i, a) in every_look().into_iter().enumerate() {
+            for b in every_look().into_iter().skip(i + 1) {
+                assert!(
+                    !std::ptr::eq(palette(a), palette(b)),
+                    "{a:?} and {b:?} share a palette"
+                );
+                assert_ne!(
+                    palette(a).panel,
+                    palette(b).panel,
+                    "{a:?} and {b:?} paint the same panel"
+                );
+            }
+        }
+    }
+
+    /// Each palette has to match the desktop it imitates, because that is
+    /// its whole job, and the colours below are the ones its own doc comment
+    /// cites from Breeze Dark and from Windows 11 dark. The roles cross over
+    /// easily -- panel and field are both greys, text and dim are both near
+    /// whites -- and crossed over they still LOOK like a palette, so nothing
+    /// short of naming them catches it.
+    #[test]
+    fn each_palette_matches_the_desktop_it_imitates() {
+        // KDE Breeze Dark: window, view, text, inactive text, selection.
+        let kde = palette(Look::Kde);
+        assert_eq!(kde.panel, (0x2a, 0x2e, 0x32), "Breeze Dark's window grey");
+        assert_eq!(kde.field, (0x1b, 0x1e, 0x20), "Breeze Dark's view grey");
+        assert_eq!(kde.text, (0xfc, 0xfc, 0xfc), "Breeze Dark's text");
+        assert_eq!(kde.dim, (0x7f, 0x8c, 0x8d), "Breeze Dark's inactive text");
+        assert_eq!(kde.sel, (0x3d, 0xae, 0xe9), "Breeze Dark's selection blue");
+        assert_eq!(kde.accent, kde.sel, "and KDE accents with its selection");
+
+        // Windows 11 dark: flyout grey, secondary text, accent.
+        let win = palette(Look::Win11);
+        assert_eq!(win.panel, (0x2b, 0x2b, 0x2b), "the Windows 11 flyout grey");
+        assert_eq!(win.dim, (0xc5, 0xc5, 0xc5), "its secondary text");
+        assert_eq!(win.accent, (0x00, 0x78, 0xd4), "its accent");
+        assert_eq!(win.sel, win.accent, "and it selects with the accent");
+        assert!(
+            light(win.field) < light(win.panel),
+            "its well sinks into the flyout"
+        );
+
+        // Eclipse's own. Note that it is the one look whose field is LIGHTER
+        // than its panel, against what the field's doc comment says: the
+        // panel is blue-black and the well is the lighter blue above it.
+        let ecl = palette(Look::Eclipse);
+        assert_eq!(ecl.panel, (0x0b, 0x12, 0x20), "Eclipse's blue-black panel");
+        assert_eq!(ecl.accent, (0x6e, 0xa8, 0xff), "Eclipse's own blue");
+        assert!(
+            light(ecl.field) > light(ecl.panel),
+            "and its well is the lighter blue, not a darker one"
+        );
+        assert_ne!(ecl.sel, ecl.accent, "and it selects darker than it accents");
+    }
+
+    /// What every look has to agree on, whatever its colours are. Each of
+    /// these is a pair of roles that reads as the other role when the two
+    /// are crossed over, and all three palettes keep all of them.
+    #[test]
+    fn every_palette_keeps_the_roles_its_colours_are_for() {
+        for look in every_look() {
+            let p = palette(look);
+            // Live text is brighter than inactive text. Crossed over, the
+            // greyed-out half of a row is the half that stands out.
+            assert!(
+                light(p.text) > light(p.dim),
+                "{look:?}: text {:?} is not brighter than dim {:?}",
+                p.text,
+                p.dim
+            );
+            // The accent is a colour and the border is a hairline. In two of
+            // the three looks they are the same lightness, so lightness is
+            // no help: what separates them is that one has a hue.
+            assert!(
+                colourful(p.accent) > colourful(p.border),
+                "{look:?}: accent {:?} is no more coloured than border {:?}",
+                p.accent,
+                p.border
+            );
+            // The scrim DIMS the desktop, it does not hide it. Half opaque
+            // and up, the wallpaper is gone and this is a different window.
+            assert!(
+                p.scrim_a > 0.0 && p.scrim_a < 0.5,
+                "{look:?}: a scrim at {} is not a dim",
+                p.scrim_a
+            );
+            // And the scrim is the darkest thing in the palette, being the
+            // ground that the panel and its wells float on.
+            assert!(
+                light(p.scrim) < light(p.panel) && light(p.scrim) < light(p.field),
+                "{look:?}: the scrim is not the darkest of the three"
+            );
+            assert_ne!(
+                p.panel, p.field,
+                "{look:?}: the well does not read as a well"
+            );
+        }
+    }
 }
