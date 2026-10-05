@@ -695,6 +695,22 @@ fn primary_main(config: kernel_hal::KernelConfig) {
                      moviendose deja las baldosas rancias en el panel"
                 );
             }
+            // DRM format modifiers: `DRM_CAP_ADDFB2_MODIFIERS` and an
+            // `ADDFB2` that carries `DRM_MODE_FB_MODIFIERS`. OFF by default
+            // because advertising them is a promise about what the present
+            // can put on the panel, and the present is a LINEAR copy: a
+            // block-linear framebuffer is declined at the flip, so a
+            // compositor that negotiates one falls back rather than showing
+            // garbage, but the fallback costs a swapchain test. Turn it on to
+            // exercise the negotiation.
+            if kernel_hal::cmdline::flag(&options.cmdline, "drm.scanout_modifiers") {
+                linux_object::fs::devfs::drm::set_scanout_modifiers_enabled(true);
+                klog_info!(
+                    "Eclipse: drm.scanout_modifiers=on -- se anuncian modificadores; \
+                     un framebuffer block-linear se declina en el flip hasta que el \
+                     copy engine sepa destejerlo"
+                );
+            }
             // Nouveau-compatible driver-specific ioctl surface on the NVIDIA
             // DRM node (GETPARAM, CHANNEL_ALLOC, GEM_NEW/INFO, VM_INIT --
             // see drivers/src/display/nouveau_uapi.rs and

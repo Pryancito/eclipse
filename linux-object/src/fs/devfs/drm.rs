@@ -47,6 +47,11 @@ pub const BLOB_ID_BASE: u32 = 30_000;
 /// One-shot guard so the first scanout logs (every-frame logging would spam).
 static SCANOUT_LOGGED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 /// One-shot latch for the "framebuffer has no backing" scanout warning.
+/// One line per boot for a declined tiled present; the compositor retries,
+/// and a line per retry would be a console storm.
+static SCANOUT_TILED_LOGGED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
 static SCANOUT_NULL_LOGGED: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 /// One-shot latch for "CE present enabled but every GPU declined the copy".
@@ -708,6 +713,89 @@ pub fn present_probe_enabled() -> bool {
 /// two settled checksums (the repair loop never runs). Opt out with
 /// `drm.present_repair=off` if the checksum cost shows up on a tight frame budget.
 static PRESENT_REPAIR: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(true);
+
+/// Whether this scanout advertises DRM format modifiers
+/// (`DRM_CAP_ADDFB2_MODIFIERS`, the plane's `IN_FORMATS`) and accepts an
+/// `ADDFB2` that carries `DRM_MODE_FB_MODIFIERS`.
+///
+/// **OFF by default, and deliberately so.** Advertising modifiers is a
+/// promise about what the present path can put on the panel, and the present
+/// here is a LINEAR copy: the moment the cap reads 1, wlroots negotiates a
+/// block-linear swapchain with NVK, and a block-linear surface copied as if
+/// it were pitched is the desktop full of garbage this tree has already spent
+/// a month closing. The copy engine can do the swizzle in hardware
+/// (`LAUNCH_DMA SRC_MEMORY_LAYOUT=_BLOCKLINEAR` with `SET_SRC_BLOCK_SIZE`),
+/// but until that path exists a block-linear framebuffer is declined at the
+/// flip, which is how a DRM driver says "not scanout-able" and what makes a
+/// compositor fall back to linear by itself.
+///
+/// Turn it on for a boot with `drm.scanout_modifiers` to exercise the
+/// negotiation.
+static SCANOUT_MODIFIERS: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Turn modifier advertising on (or back off) for this boot.
+pub fn set_scanout_modifiers_enabled(on: bool) {
+    SCANOUT_MODIFIERS.store(on, Ordering::Relaxed);
+}
+
+/// Whether modifier advertising is armed for this boot.
+pub fn scanout_modifiers_enabled() -> bool {
+    SCANOUT_MODIFIERS.load(Ordering::Relaxed)
+}
+
+/// The memory layout of a framebuffer's pixels, as its `ADDFB2` modifier
+/// asked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScanoutLayout {
+    /// `DRM_FORMAT_MOD_LINEAR`: `pitch` bytes per row, which is what the
+    /// present blit reads. Also what every framebuffer created without
+    /// `DRM_MODE_FB_MODIFIERS` is.
+    Linear,
+    /// `DRM_FORMAT_MOD_NVIDIA_BLOCK_LINEAR_2D`: 64-byte by 8-row GOBs stacked
+    /// `1 << log2_gobs_per_block_y` high into blocks, blocks laid out left to
+    /// right then top to bottom.
+    ///
+    /// Two things differ from `Linear` and both have bitten this layout
+    /// elsewhere: **`pitch` is counted in 64-byte blocks, not bytes**
+    /// (`nvkms-surface.c` does `planePitch <<= LOG_GOB_WIDTH` on the way in),
+    /// and the allocation is padded up to a whole number of blocks
+    /// vertically. [`block_linear_size`] is the one place that arithmetic
+    /// lives.
+    BlockLinear {
+        /// `h`, bits 3:0 of the modifier; `SET_SRC_BLOCK_SIZE_HEIGHT` takes
+        /// it verbatim.
+        log2_gobs_per_block_y: u8,
+        /// `k`, bits 19:12, canonicalized.
+        page_kind: u8,
+    },
+}
+
+/// A GOB is 64 bytes wide and 8 rows tall on every GPU this driver claims
+/// (`NVKMS_BLOCK_LINEAR_GOB_WIDTH` / `_GOB_HEIGHT`).
+pub const GOB_WIDTH_BYTES: u64 = 64;
+/// ditto.
+pub const GOB_HEIGHT_ROWS: u64 = 8;
+
+/// The bytes a block-linear surface of this pitch and height occupies.
+///
+/// `pitch_in_blocks` is the `ADDFB2` pitch verbatim (blocks, not bytes) and
+/// the height is rounded UP to a whole block, because the hardware addresses
+/// the padding rows and a size computed from the unpadded height would let a
+/// present read past the buffer on the last block row.
+pub fn block_linear_size(
+    pitch_in_blocks: u32,
+    height: u32,
+    log2_gobs_per_block_y: u8,
+) -> Option<usize> {
+    let block_rows = GOB_HEIGHT_ROWS.checked_shl(log2_gobs_per_block_y as u32)?;
+    let padded = (height as u64)
+        .checked_add(block_rows - 1)?
+        .checked_div(block_rows)?
+        .checked_mul(block_rows)?;
+    let row_bytes = (pitch_in_blocks as u64).checked_mul(GOB_WIDTH_BYTES)?;
+    usize::try_from(row_bytes.checked_mul(padded)?).ok()
+}
 
 /// Turn the present repair pass on (or back off) for this boot.
 pub fn set_present_repair_enabled(on: bool) {
@@ -1886,6 +1974,14 @@ pub struct DrmFramebuffer {
     pub pitch: u32,
     pub phys_addr: u64,
     pub size: usize,
+    /// What the `ADDFB2` modifier asked for; [`ScanoutLayout::Linear`] for
+    /// every framebuffer created without `DRM_MODE_FB_MODIFIERS` and for
+    /// every one the kernel makes itself.
+    ///
+    /// The present path reads this: a layout it cannot put on the panel is
+    /// declined at the flip, which is how a DRM driver says "not
+    /// scanout-able" and what makes a compositor fall back by itself.
+    pub layout: ScanoutLayout,
     /// The pid that created this framebuffer, or 0 for one the kernel made.
     ///
     /// Linux keeps framebuffers on a per-`drm_file` list and `drm_mode_rmfb`
@@ -2987,6 +3083,33 @@ pub fn create_fb_with_format(
     pitch: u32,
     pixel_format: u32,
 ) -> Option<u32> {
+    create_fb_with_layout(
+        handle_id,
+        width,
+        height,
+        pitch,
+        pixel_format,
+        ScanoutLayout::Linear,
+    )
+}
+
+/// [`create_fb_with_format`] for a framebuffer whose `ADDFB2` carried an
+/// explicit modifier.
+///
+/// `layout` changes what `pitch` MEANS and how big the surface is, so every
+/// bound check below has to read it: a block-linear pitch counts 64-byte
+/// blocks, and the surface is padded up to a whole block vertically. Taking
+/// the linear arithmetic for a tiled framebuffer under-measures it by a
+/// factor of 64 and then lets the present read past the buffer on the last
+/// block row.
+pub fn create_fb_with_layout(
+    handle_id: u32,
+    width: u32,
+    height: u32,
+    pitch: u32,
+    pixel_format: u32,
+    layout: ScanoutLayout,
+) -> Option<u32> {
     // Resolve the backing buffer from EITHER source:
     //  - a DRM dumb buffer in our own handle table (CREATE_DUMB / pixman), or
     //  - a nouveau-uAPI GEM object (GEM_NEW), whose high-range handle lives in
@@ -3015,8 +3138,20 @@ pub fn create_fb_with_format(
     // fb larger than its buffer would read past the VMO into adjacent physical
     // RAM (info leak / fault). Compute in usize with a checked multiply and
     // reject ADDFB whose dimensions overflow or exceed the buffer.
-    let size = (pitch as usize).checked_mul(height as usize)?;
-    if size == 0 || size > buf_size || (pitch as usize) < (width as usize).saturating_mul(4) {
+    let (size, pitch_bytes) = match layout {
+        ScanoutLayout::Linear => (
+            (pitch as usize).checked_mul(height as usize)?,
+            pitch as usize,
+        ),
+        ScanoutLayout::BlockLinear {
+            log2_gobs_per_block_y,
+            ..
+        } => (
+            block_linear_size(pitch, height, log2_gobs_per_block_y)?,
+            (pitch as usize).checked_mul(GOB_WIDTH_BYTES as usize)?,
+        ),
+    };
+    if size == 0 || size > buf_size || pitch_bytes < (width as usize).saturating_mul(4) {
         return None;
     }
 
@@ -3029,7 +3164,10 @@ pub fn create_fb_with_format(
     // so the two present paths would also disagree about the same image.
     // Linux rejects this in `drm_mode_addfb2` through the format's cpp
     // alignment; here the format is always 4 bytes per pixel.
-    if !pitch.is_multiple_of(4) {
+    // (A block-linear pitch is counted in 64-byte blocks, so it is a whole
+    // number of pixels by construction and the copy engine never divides it
+    // the way the CPU path does.)
+    if layout == ScanoutLayout::Linear && !pitch.is_multiple_of(4) {
         warn!(
             "[drm] create_fb (ADDFB2): pitch={} is not a multiple of 4 bytes              (XRGB8888) -- rejecting rather than scanning out a sheared image",
             pitch
@@ -3067,6 +3205,7 @@ pub fn create_fb_with_format(
         pitch,
         phys_addr,
         size,
+        layout,
         owner: current_pid(),
     };
 
@@ -3806,6 +3945,16 @@ pub enum PresentError {
     /// The fb exists but describes no memory (`phys_addr`/`size` of 0), so
     /// there is nothing to copy from.
     NoBacking,
+    /// The fb's pixels are in a layout the present cannot read -- today, any
+    /// [`ScanoutLayout::BlockLinear`] one, because the copy is linear and the
+    /// copy engine cannot yet do the block-linear swizzle.
+    ///
+    /// This is the DRM-correct answer to "can you scan this out", and the
+    /// reason it is an error rather than a best-effort copy: a block-linear
+    /// surface read as if it were pitched is a screen of garbage, while a
+    /// refusal makes a compositor's test commit fail and the compositor
+    /// negotiate a linear buffer instead, by itself.
+    UnsupportedLayout,
 }
 
 impl PresentError {
@@ -3815,6 +3964,7 @@ impl PresentError {
             PresentError::NoSuchFb => "no such fb id",
             PresentError::NoDisplay => "no display to blit into",
             PresentError::NoBacking => "fb has no backing memory",
+            PresentError::UnsupportedLayout => "fb layout is not scanout-able",
         }
     }
 }
@@ -3939,6 +4089,22 @@ pub fn scanout_region_checked(
             );
         }
         return Err(PresentError::NoBacking);
+    }
+    // A tiled framebuffer, with nothing here that can untile it. Refusing is
+    // the whole point: `ADDFB2` accepted it (the modifier names a layout this
+    // GPU really produces), but the copy below walks rows of `pitch` bytes,
+    // and walking a block-linear surface that way paints the desktop with
+    // garbage rather than failing. See `scanout_modifiers_enabled`.
+    if fb.layout != ScanoutLayout::Linear {
+        if !SCANOUT_TILED_LOGGED.swap(true, Ordering::Relaxed) {
+            kernel_hal::klog_warn!(
+                "[drm] scanout: fb={} is {:?} -- declining the present so the client \
+                 falls back to linear (no block-linear copy path yet)",
+                fb_id,
+                fb.layout
+            );
+        }
+        return Err(PresentError::UnsupportedLayout);
     }
     let display = match primary_display() {
         Some(d) => d,
@@ -7917,6 +8083,7 @@ mod release_tests {
                 pitch: 4,
                 phys_addr: 0,
                 size: 4096,
+                layout: ScanoutLayout::Linear,
                 owner: 77_003,
             });
             state.crtc_fb = 9299;
@@ -7950,6 +8117,7 @@ mod release_tests {
                 pitch: 4,
                 phys_addr: 0,
                 size: 4096,
+                layout: ScanoutLayout::Linear,
                 owner: 77_004,
             });
             state.fb_backing.push((9399, vmo.clone()));
@@ -8680,6 +8848,7 @@ mod nouveau_fb_lifetime_tests {
             pitch: 4,
             phys_addr: 0x1_0000,
             size: 4096,
+            layout: ScanoutLayout::Linear,
             owner: pid,
         });
         state.crtc_fb = fb_id;
@@ -8781,6 +8950,7 @@ mod nouveau_fb_lifetime_tests {
             pitch: 4,
             phys_addr: 0,
             size: 4096,
+            layout: ScanoutLayout::Linear,
             owner: 0,
         });
         drop(state);
@@ -8854,6 +9024,7 @@ mod nouveau_fb_lifetime_tests {
                 pitch: 4,
                 phys_addr: 0x2_0000,
                 size: 4096,
+                layout: ScanoutLayout::Linear,
                 owner: COMPOSITOR,
             });
             state.crtc_fb = 9505;
@@ -8912,6 +9083,7 @@ mod present_error_tests {
             pitch: 4,
             phys_addr,
             size,
+            layout: ScanoutLayout::Linear,
             owner: 0,
         });
     }
@@ -8999,6 +9171,7 @@ mod present_error_tests {
                 pitch: 4,
                 phys_addr: 0x2_0000,
                 size: 4096,
+                layout: ScanoutLayout::Linear,
                 owner: 0,
             });
         }
@@ -9286,6 +9459,7 @@ mod gem_ownership_tests {
             pitch: 4,
             phys_addr: 0x5_0000,
             size: 4096,
+            layout: ScanoutLayout::Linear,
             owner,
         });
     }
@@ -10552,6 +10726,7 @@ mod present_lifetime_tests {
                 pitch: 4,
                 phys_addr: 0,
                 size: 4096,
+                layout: ScanoutLayout::Linear,
                 owner: current_pid(),
             });
             state.fb_backing.push((9601, vmo.clone()));
@@ -10603,6 +10778,7 @@ mod present_lifetime_tests {
                 pitch: 4,
                 phys_addr: 0x2_0000,
                 size: 4096,
+                layout: ScanoutLayout::Linear,
                 owner: current_pid(),
             });
         }
