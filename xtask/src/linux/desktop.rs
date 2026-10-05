@@ -2457,6 +2457,9 @@ fn assert_xml_comments_parse(xml: &[u8], what: &str) {
             "{what}: `--` inside an XML comment (libxml2 rejects the whole file): {:?}",
             &body[..end.min(120)]
         );
+        // Past the `-->`. Stopping AT it would behave the same, since `-->`
+        // holds no `<!--` for the next search to find; past it is simply what
+        // the walk means.
         rest = &body[end + 3..];
     }
 }
@@ -4168,6 +4171,603 @@ mod tests {
         // SDL_Init hangs, which is what GZDoom needed and no other entry gives.
         assert!(menu.contains("/bin/eclipse-sdl-probe --steps"));
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A scratch rootfs with everything the desktop's look is written into.
+    /// Separate per tag so the suite can run its tests in parallel.
+    fn look_rootfs(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "eclipse-look-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        write_eclipse_look(&dir);
+        write_theme(&dir);
+        write_foot_config(&dir);
+        write_labwc_rc(&dir);
+        write_labwc_menu(&dir);
+        write_kde_helpers(&dir);
+        write_gtk_settings(&dir);
+        dir
+    }
+
+    /// `(look, labwc theme, the background its terminal palette uses)`. The
+    /// three names are the ones `eclipse-look` accepts; everything the look
+    /// touches has to agree on them, which is what the tests below check.
+    const LOOKS: &[(&str, &str, &str)] = &[
+        ("win11", "Win11-Dark", "background=0c0c0c"),
+        ("kde", "Breeze-Dark", "background=232629"),
+        ("eclipse", "Eclipse-Dark", "background=120f1c"),
+    ];
+
+    /// `xml` with its comments taken out. rc.xml's comments name the very
+    /// tags they explain (`<default/>`, `<mouse>`), so a check run over the
+    /// raw text passes on a file the tag itself was deleted from.
+    fn without_comments(xml: &str) -> String {
+        let mut out = String::with_capacity(xml.len());
+        let mut rest = xml;
+        while let Some(i) = rest.find("<!--") {
+            out.push_str(&rest[..i]);
+            rest = match rest[i..].find("-->") {
+                Some(j) => &rest[i + j + 3..],
+                None => "",
+            };
+        }
+        out.push_str(rest);
+        out
+    }
+
+    fn themerc(rootfs: &Path, theme: &str) -> String {
+        let p = rootfs
+            .join("usr/share/themes")
+            .join(theme)
+            .join("openbox-3/themerc");
+        fs::read_to_string(&p).unwrap_or_else(|e| panic!("{}: {e}", p.display()))
+    }
+
+    /// The value of an openbox themerc key, e.g. `window.active.border.color`.
+    fn themerc_key(rc: &str, key: &str) -> Option<String> {
+        rc.lines()
+            .filter(|l| !l.trim_start().starts_with('#'))
+            .find_map(|l| l.split_once(':').filter(|(k, _)| k.trim() == key))
+            .map(|(_, v)| v.trim().to_string())
+    }
+
+    /// Every piece that names a look has to name the same three, and each
+    /// one's theme and terminal palette have to be its own. A look that is
+    /// accepted but has no theme leaves labwc on its built-in appearance;
+    /// one whose palette is another look's gives a terminal that does not
+    /// match the session it was started from.
+    #[test]
+    fn every_look_has_a_theme_and_a_palette_of_its_own() {
+        let dir = look_rootfs("table");
+        let script =
+            fs::read_to_string(dir.join("usr/local/bin/eclipse-look")).expect("eclipse-look");
+
+        // `look_ok` accepts exactly these three and nothing else: a look it
+        // accepts without a theme leaves labwc on its built-in appearance.
+        let accepted = script
+            .split_once("case \"$1\" in ")
+            .expect("look_ok is gone from eclipse-look")
+            .1
+            .split_once(')')
+            .unwrap()
+            .0;
+        assert_eq!(
+            accepted.split('|').collect::<Vec<_>>(),
+            LOOKS.iter().map(|(l, _, _)| *l).collect::<Vec<_>>(),
+            "eclipse-look accepts {accepted:?}"
+        );
+
+        for (look, theme, background) in LOOKS {
+            // Each look maps to its own theme, which really is installed.
+            assert!(
+                script.contains(&format!("{look}) echo {theme} ;;"))
+                    || (*look == "eclipse" && script.contains(&format!("*) echo {theme} ;;"))),
+                "{look} does not map to {theme} in eclipse-look:\n{script}"
+            );
+            let rc = themerc(&dir, theme);
+            assert!(
+                rc.contains("window.active.title.bg.color:"),
+                "{theme}'s themerc has no titlebar colour"
+            );
+            // ... and to its own terminal palette.
+            let ini = fs::read_to_string(
+                dir.join("root/.config/foot")
+                    .join(format!("foot.{look}.ini")),
+            )
+            .unwrap_or_else(|e| panic!("foot.{look}.ini: {e}"));
+            assert!(
+                ini.contains(background),
+                "foot.{look}.ini is not {look}'s palette ({background}):\n{ini}"
+            );
+        }
+
+        // And no two looks share a theme or a palette.
+        for (i, a) in LOOKS.iter().enumerate() {
+            for b in &LOOKS[i + 1..] {
+                assert_ne!(a.1, b.1, "two looks share a theme");
+                assert_ne!(a.2, b.2, "two looks share a palette");
+                assert_ne!(
+                    themerc(&dir, a.1),
+                    themerc(&dir, b.1),
+                    "{} and {} ship the same themerc",
+                    a.1,
+                    b.1
+                );
+            }
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The look a fresh image comes up in is written in four places, and a
+    /// disagreement between them shows as a session that half-changes: the
+    /// panel in one look, the window frames in another.
+    #[test]
+    fn the_default_look_is_the_same_everywhere_it_is_written() {
+        let dir = look_rootfs("default");
+        const DEFAULT: &str = "eclipse";
+        let (_, theme, _) = LOOKS
+            .iter()
+            .find(|(l, _, _)| *l == DEFAULT)
+            .expect("the default look is not one of the looks");
+
+        assert_eq!(
+            fs::read_to_string(dir.join("etc/eclipse/look")).unwrap(),
+            format!("look={DEFAULT}\n")
+        );
+        let rc = fs::read_to_string(dir.join("root/.config/labwc/rc.xml")).unwrap();
+        assert!(
+            rc.contains(&format!("<name>{theme}</name>")),
+            "rc.xml does not start on {theme}, so `eclipse-look` has nothing to rewrite"
+        );
+        let foot = dir.join("root/.config/foot");
+        assert_eq!(
+            fs::read_to_string(foot.join("foot.ini")).unwrap(),
+            fs::read_to_string(foot.join(format!("foot.{DEFAULT}.ini"))).unwrap(),
+            "the terminal comes up in a palette the session is not in"
+        );
+        // The menu's default language is Spanish, as `eclipse-locale` says.
+        let menu = dir.join("root/.config/labwc");
+        assert_eq!(
+            fs::read(menu.join("menu.xml")).unwrap(),
+            fs::read(menu.join("menu.es.xml")).unwrap()
+        );
+        assert_ne!(
+            fs::read(menu.join("menu.es.xml")).unwrap(),
+            fs::read(menu.join("menu.en.xml")).unwrap(),
+            "the two languages ship the same menu"
+        );
+        // The two differ in their LABELS and in nothing else: a command or an
+        // action that drifted in one language is an entry that does something
+        // else, or nothing, depending on the language the session came up in.
+        let es = fs::read_to_string(menu.join("menu.es.xml")).unwrap();
+        let en = fs::read_to_string(menu.join("menu.en.xml")).unwrap();
+        let shape = |xml: &str| -> Vec<String> {
+            xml.split("<action name=\"")
+                .skip(1)
+                .map(|a| {
+                    let name = a.split_once('"').unwrap().0;
+                    let cmd = a
+                        .split_once("<command>")
+                        .and_then(|(_, c)| c.split_once("</command>"))
+                        .map(|(c, _)| c)
+                        .unwrap_or("");
+                    format!("{name}:{cmd}")
+                })
+                .collect()
+        };
+        assert_eq!(
+            shape(&es),
+            shape(&en),
+            "the menu entries do different things in Spanish and in English"
+        );
+        assert_eq!(
+            es.matches("<separator/>").count(),
+            en.matches("<separator/>").count(),
+            "the two menus are grouped differently"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// With no window shadows on this stack a grey-on-grey border left the
+    /// focused window unidentifiable (why Breeze's active border carries the
+    /// accent instead of Breeze's own near-invisible grey). Every theme has
+    /// to tell the two states apart on more than one cue.
+    #[test]
+    fn a_focused_window_is_told_apart_from_an_unfocused_one_in_every_theme() {
+        let dir = look_rootfs("focus");
+        for (look, theme, _) in LOOKS {
+            let rc = themerc(&dir, theme);
+            for key in [
+                "window.active.border.color",
+                "window.active.title.bg.color",
+                "window.active.label.text.color",
+            ] {
+                let inactive = key.replace("active", "inactive");
+                let a = themerc_key(&rc, key).unwrap_or_else(|| panic!("{theme} has no {key}"));
+                let b = themerc_key(&rc, &inactive)
+                    .unwrap_or_else(|| panic!("{theme} has no {inactive}"));
+                assert_ne!(a, b, "{look}: {key} and {inactive} are the same colour");
+            }
+            // And the focused border is not the unfocused titlebar either,
+            // which is the grey-on-grey case the comment above describes.
+            assert_ne!(
+                themerc_key(&rc, "window.active.border.color"),
+                themerc_key(&rc, "window.inactive.title.bg.color"),
+                "{look}: the focused border melts into an unfocused titlebar"
+            );
+            // Selection in the menu has to be visible over the menu itself.
+            assert_ne!(
+                themerc_key(&rc, "menu.items.active.bg.color"),
+                themerc_key(&rc, "menu.items.bg.color"),
+                "{look}: the selected menu entry is the colour of the menu"
+            );
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Each look imitates a desktop that aligns window titles its own way:
+    /// Windows to the left, Breeze centred. Eclipse's own leaves the key out
+    /// and takes openbox's default.
+    #[test]
+    fn each_theme_keeps_the_title_alignment_of_the_desktop_it_imitates() {
+        let dir = look_rootfs("justify");
+        let want = [
+            ("Win11-Dark", Some("Left")),
+            ("Breeze-Dark", Some("Center")),
+            ("Eclipse-Dark", None),
+        ];
+        for (theme, justify) in want {
+            let rc = themerc(&dir, theme);
+            assert_eq!(
+                themerc_key(&rc, "window.label.text.justify").as_deref(),
+                justify,
+                "{theme} aligns its window titles the wrong way"
+            );
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// `eclipse-look` is the only thing that changes the look of a running
+    /// session, and each of these lines is a way for it to half-work.
+    #[test]
+    fn the_look_script_rewrites_every_place_the_old_look_is_named() {
+        let dir = look_rootfs("script");
+        let script = fs::read_to_string(dir.join("usr/local/bin/eclipse-look")).unwrap();
+
+        // The chosen look REPLACES the file: appending leaves the old line
+        // first, and `file_look` prints the first match and exits.
+        assert!(
+            script.contains("echo \"look=$look\" > \"$CONF\""),
+            "the look file is not rewritten in place:\n{script}"
+        );
+        // Every theme name rc.xml could be holding is rewritten, or changing
+        // away from a look and back again would stick on the middle one.
+        for (_, theme, _) in LOOKS {
+            assert!(
+                script.contains(&format!("s|<name>{theme}</name>|<name>$theme</name>|")),
+                "rc.xml keeps {theme} when the look changes:\n{script}"
+            );
+        }
+        // The palette is copied FROM the look's file over foot.ini.
+        assert!(
+            script.contains("src=\"$CFG/foot/foot.$look.ini\"")
+                && script.contains("cp -f \"$src\" \"$CFG/foot/foot.ini\""),
+            "the terminal palette is not copied from the look's own file:\n{script}"
+        );
+        // At boot nothing is restarted (the session is not up yet); on a
+        // later change labwc is reconfigured and the panel respawned.
+        assert!(
+            script.contains("if [ \"$boot\" != boot ]; then"),
+            "the boot path is not told apart from a live change:\n{script}"
+        );
+        for live in ["labwc --reconfigure", "pkill -x lunarbar"] {
+            assert!(
+                script.contains(live),
+                "a live look change does not {live}:\n{script}"
+            );
+        }
+        // The command line wins over the file, so `look=` on the kernel line
+        // can bring a machine up in another look without editing the image.
+        let boot = script
+            .split_once("resolve_boot() {")
+            .expect("resolve_boot is gone")
+            .1;
+        let boot = boot.split_once("\n}").unwrap().0;
+        assert!(
+            boot.contains("cmdline_look") && boot.contains("look_ok"),
+            "resolve_boot ignores the command line:\n{boot}"
+        );
+        // And an unreadable or unknown look falls back to the default.
+        let current = script
+            .split_once("current() {")
+            .expect("current is gone")
+            .1
+            .split_once("\n}")
+            .unwrap()
+            .0;
+        assert!(
+            current.contains("echo eclipse"),
+            "an unknown look does not fall back to the default:\n{current}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// `<desktops number>` and the keys that move between them have to agree:
+    /// a key for a desktop that does not exist does nothing, and a desktop
+    /// with no key cannot be reached without a mouse.
+    #[test]
+    fn every_desktop_can_be_reached_and_sent_to_from_the_keyboard() {
+        let dir = look_rootfs("desktops");
+        let rc = fs::read_to_string(dir.join("root/.config/labwc/rc.xml")).unwrap();
+        let count: usize = rc
+            .split_once("<desktops number=\"")
+            .expect("no <desktops>")
+            .1
+            .split_once('"')
+            .unwrap()
+            .0
+            .parse()
+            .expect("the desktop count is not a number");
+        assert!((2..=9).contains(&count), "{count} desktops");
+
+        for n in 1..=count {
+            for action in ["GoToDesktop", "SendToDesktop"] {
+                assert!(
+                    rc.contains(&format!("<action name=\"{action}\"><to>{n}</to></action>")),
+                    "no key {action} for desktop {n} of {count}"
+                );
+            }
+        }
+        for action in ["GoToDesktop", "SendToDesktop"] {
+            assert!(
+                !rc.contains(&format!("<action name=\"{action}\"><to>{}</to>", count + 1)),
+                "a key {action} for desktop {} of {count}",
+                count + 1
+            );
+            // And every desktop is named by the SAME number of keys. Without
+            // this a key pointing at the wrong desktop still satisfies the
+            // loop above, through another key that happens to agree with it,
+            // and its own desktop is left reachable only by mouse.
+            let per: Vec<usize> = (1..=count)
+                .map(|n| {
+                    rc.matches(&format!("<action name=\"{action}\"><to>{n}</to></action>"))
+                        .count()
+                })
+                .collect();
+            assert!(
+                per.iter().all(|c| *c == per[0]),
+                "the {action} keys are shared out {per:?} among {count} desktops"
+            );
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Two settings in rc.xml that cost a whole session when they go: without
+    /// `<default/>` a custom `<mouse>` section REPLACES labwc's built-in
+    /// bindings, so windows cannot be moved and the titlebar buttons do
+    /// nothing; without `xwaylandPersistence` the lazy Xwayland spawn never
+    /// finishes and the first X11 client hangs for ever.
+    #[test]
+    fn the_compositor_keeps_its_builtin_mouse_bindings_and_its_xwayland() {
+        let dir = look_rootfs("rcxml");
+        let rc =
+            without_comments(&fs::read_to_string(dir.join("root/.config/labwc/rc.xml")).unwrap());
+        let mouse = rc
+            .split_once("<mouse>")
+            .expect("no <mouse> section")
+            .1
+            .split_once("</mouse>")
+            .unwrap()
+            .0;
+        assert!(
+            mouse.contains("<default />") || mouse.contains("<default/>"),
+            "<mouse> replaces labwc's own bindings instead of adding to them:\n{mouse}"
+        );
+        assert!(
+            rc.contains("<xwaylandPersistence>yes</xwaylandPersistence>"),
+            "Xwayland is back to the lazy spawn that hangs the first X11 client"
+        );
+        let radius: u32 = rc
+            .split_once("<cornerRadius>")
+            .expect("no <cornerRadius>")
+            .1
+            .split_once('<')
+            .unwrap()
+            .0
+            .parse()
+            .unwrap();
+        assert!(radius > 0, "the rounded corners are gone");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The keys a KDE user presses without thinking, and the launcher behind
+    /// each. None of these has a KDE binary behind it here, so a wrong
+    /// command is a key that silently does nothing.
+    #[test]
+    fn the_keys_a_kde_user_presses_reach_the_launcher_each_one_is_for() {
+        let dir = look_rootfs("keys");
+        let rc = fs::read_to_string(dir.join("root/.config/labwc/rc.xml")).unwrap();
+        let want: &[(&str, &[&str])] = &[
+            ("eclipse-run", &["A-space", "A-F2", "C-A-Delete"]),
+            ("eclipse-files", &["W-E"]),
+            ("eclipse-showdesktop", &["W-D"]),
+            ("eclipse-terminal", &["W-Return", "A-Return", "C-A-T"]),
+        ];
+        for (prog, keys) in want {
+            for key in *keys {
+                assert!(
+                    rc.contains(&format!(
+                        "<keybind key=\"{key}\"><action name=\"Execute\"><command>/usr/local/bin/{prog}"
+                    )),
+                    "{key} does not run {prog}"
+                );
+            }
+            // And the launcher the key names is really shipped, executable.
+            let p = dir.join("usr/local/bin").join(prog);
+            if *prog != "eclipse-terminal" {
+                use std::os::unix::fs::PermissionsExt;
+                let mode = fs::metadata(&p)
+                    .unwrap_or_else(|e| panic!("{prog}: {e}"))
+                    .permissions()
+                    .mode();
+                assert_ne!(mode & 0o111, 0, "{prog} is not executable ({mode:o})");
+            }
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// What the three KDE stand-ins have to do, none of which has a KDE
+    /// binary behind it: the launcher toggles instead of stacking overlays,
+    /// Super+D minimises through wlr-foreign-toplevel-management, and the
+    /// file manager key opens whichever manager IS installed.
+    #[test]
+    fn the_kde_standins_toggle_and_fall_back_to_what_is_installed() {
+        let dir = look_rootfs("standins");
+        let bin = dir.join("usr/local/bin");
+
+        let run = fs::read_to_string(bin.join("eclipse-run")).unwrap();
+        assert!(
+            run.contains("pkill -x lunarrun") && run.contains("exit 0"),
+            "a second press stacks another launcher instead of closing it:\n{run}"
+        );
+        let show = fs::read_to_string(bin.join("eclipse-showdesktop")).unwrap();
+        assert!(
+            show.contains("lunarrun --toggle-desktop"),
+            "Super+D does not toggle the desktop, it opens the launcher:\n{show}"
+        );
+        let files = fs::read_to_string(bin.join("eclipse-files")).unwrap();
+        let list = files
+            .split_once("for fm in ")
+            .expect("the file manager list is gone")
+            .1
+            .split_once(';')
+            .unwrap()
+            .0;
+        assert!(
+            list.split_whitespace().count() >= 3,
+            "the file manager list is down to {list:?}"
+        );
+        assert!(
+            list.split_whitespace().next() == Some("mc"),
+            "the manager actually in the image is no longer tried first: {list:?}"
+        );
+        // And with none of them installed the key still opens something.
+        let last = files.lines().last().unwrap();
+        assert!(
+            last.contains("eclipse-terminal") && last.contains("exec sh"),
+            "with no file manager installed the key does nothing: {last:?}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Both GTK major versions read their own settings file, so a toolkit
+    /// left out comes up in the light theme next to a dark session.
+    #[test]
+    fn both_gtk_versions_are_asked_for_the_dark_theme() {
+        let dir = look_rootfs("gtk");
+        for ver in ["gtk-3.0", "gtk-4.0"] {
+            let ini = fs::read_to_string(dir.join("root/.config").join(ver).join("settings.ini"))
+                .unwrap_or_else(|e| panic!("{ver}: {e}"));
+            assert!(
+                ini.contains("gtk-application-prefer-dark-theme=1"),
+                "{ver} does not prefer the dark theme:\n{ini}"
+            );
+            assert!(
+                ini.contains("gtk-theme-name=Adwaita-dark"),
+                "{ver} is not on a dark theme:\n{ini}"
+            );
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// foot defaults to one render thread per CPU, which SEGFAULTs it on
+    /// Eclipse's young SMP, and the bare `monospace` alias can resolve to a
+    /// non-mono font on a minimal fontconfig. Both are in every palette's
+    /// file, so every one of them has to carry the cure.
+    #[test]
+    fn the_terminal_starts_on_one_worker_and_a_real_mono_font() {
+        let dir = look_rootfs("foot");
+        let foot = dir.join("root/.config/foot");
+        let mut seen = 0;
+        for entry in fs::read_dir(&foot).unwrap().flatten() {
+            let ini = fs::read_to_string(entry.path()).unwrap();
+            let name = entry.file_name();
+            assert!(
+                ini.contains("\nworkers=1\n"),
+                "{name:?} lets foot start one render thread per CPU:\n{ini}"
+            );
+            assert!(
+                ini.contains("font=DejaVu Sans Mono:"),
+                "{name:?} names no real monospace family before the alias:\n{ini}"
+            );
+            assert!(
+                ini.contains("\npad=6x6\n"),
+                "{name:?} lost its padding:\n{ini}"
+            );
+            // The palette is under the section foot reads for a dark theme.
+            let colors = ini
+                .split_once("[colors-dark]\n")
+                .unwrap_or_else(|| panic!("{name:?} has no [colors-dark] section:\n{ini}"))
+                .1;
+            assert!(
+                colors.contains("background=") && colors.contains("foreground="),
+                "{name:?}'s palette is empty"
+            );
+            seen += 1;
+        }
+        assert_eq!(seen, LOOKS.len() + 1, "a palette file is missing");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// One em-dash written as a double hyphen inside a comment made libxml2
+    /// discard the WHOLE rc.xml on real hardware, so labwc ran on built-in
+    /// defaults with no theme and no keybind. The guard that catches it is
+    /// itself worth a test: it runs at build time and only ever has to fire
+    /// once.
+    #[test]
+    fn a_double_hyphen_in_a_comment_fails_the_build_not_the_desktop() {
+        // What ships has to pass, comments and all.
+        let dir = look_rootfs("xml");
+        let rc = fs::read(dir.join("root/.config/labwc/rc.xml")).unwrap();
+        assert_xml_comments_parse(&rc, "the rc.xml that ships");
+        assert!(
+            rc.windows(4).any(|w| w == b"<!--"),
+            "rc.xml has no comments left, so the guard proves nothing"
+        );
+        for menu in ["menu.es.xml", "menu.en.xml"] {
+            assert_xml_comments_parse(
+                &fs::read(dir.join("root/.config/labwc").join(menu)).unwrap(),
+                menu,
+            );
+        }
+        let _ = fs::remove_dir_all(&dir);
+
+        // And what would be rejected really is.
+        for bad in [
+            &b"<!-- an em -- dash -->"[..],
+            &b"<ok/><!-- fine --><!-- and then -- this -->"[..],
+            &b"<!-- never closed"[..],
+            &b"<!-- trailing --"[..],
+        ] {
+            let text = String::from_utf8_lossy(bad).into_owned();
+            let caught = std::panic::catch_unwind(move || {
+                assert_xml_comments_parse(text.as_bytes(), "a comment libxml2 rejects")
+            });
+            assert!(
+                caught.is_err(),
+                "{:?} would have shipped",
+                String::from_utf8_lossy(bad)
+            );
+        }
+        // A `--` outside a comment is XML's business, not this guard's.
+        assert_xml_comments_parse(
+            b"<item label=\"a -- b\"/>",
+            "a double hyphen in an attribute",
+        );
     }
 }
 /// Build-time wallpaper renderer. Draws the Eclipse OS night scene (gradient

@@ -87,6 +87,29 @@ fn shutdown_requested() -> bool {
     WANT_HALT.load(Ordering::SeqCst) || WANT_REBOOT.load(Ordering::SeqCst)
 }
 
+/// What a signal asks PID 1 to do.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Request {
+    /// Come back up: busybox `reboot` (SIGTERM) and Ctrl-Alt-Del (SIGINT).
+    Reboot,
+    /// Stay down: busybox `halt` (SIGUSR1) and `poweroff` (SIGUSR2).
+    Halt,
+}
+
+/// Every signal PID 1 answers, its handler, and what that handler asks for.
+///
+/// A table rather than four `install_handler` calls, because the mapping is
+/// the whole policy and a swapped row is invisible from anywhere else: this
+/// used to have SIGTERM asking for a HALT, so `/bin/reboot`, `busybox reboot`
+/// and every script using the absolute path powered the machine off instead of
+/// rebooting it. See busybox's halt.c for the sending side.
+const SIGNAL_HANDLERS: &[(libc::c_int, extern "C" fn(libc::c_int), Request)] = &[
+    (libc::SIGTERM, on_sigterm, Request::Reboot),
+    (libc::SIGINT, on_sigint, Request::Reboot),
+    (libc::SIGUSR1, on_sigusr1, Request::Halt),
+    (libc::SIGUSR2, on_sigusr2, Request::Halt),
+];
+
 /// Set by the SIGUSR1/SIGUSR2 handlers: bring the system down (halt/power off).
 static WANT_HALT: AtomicBool = AtomicBool::new(false);
 /// Set by the SIGTERM/SIGINT handlers: reboot. busybox `reboot` (without
@@ -352,6 +375,20 @@ fn main() {
     supervise(&mut services);
 }
 
+/// How many text consoles the kernel opens. The session has to land past them.
+const TEXT_VTS: libc::c_int = 6;
+
+/// The VT the session runs on: tty7, the first one clear of the text consoles
+/// (tty7 == the kernel's own GRAPHICS_VT + 1). Written as the derivation
+/// rather than as a 7, and at module scope because [`activate_graphics_vt`]
+/// opens `/dev/tty0`, which a test has not got.
+const GRAPHICS_VT: libc::c_int = TEXT_VTS + 1;
+
+/// Checked here rather than in a test because it is decidable at compile time:
+/// a session sharing a VT with a text console puts a getty's output on top of
+/// the compositor.
+const _: () = assert!(GRAPHICS_VT > TEXT_VTS);
+
 /// Make tty7 (the reserved graphics VT) the active display via the VT ioctls on
 /// `/dev/tty0` (the "current VT" control node): `VT_ACTIVATE` makes tty7 active
 /// and `VT_WAITACTIVE` blocks until the switch lands, so the graphical session's
@@ -362,7 +399,6 @@ fn main() {
 fn activate_graphics_vt() -> bool {
     const VT_ACTIVATE: libc::c_ulong = 0x5606;
     const VT_WAITACTIVE: libc::c_ulong = 0x5607;
-    const GRAPHICS_VT: libc::c_int = 7; // tty7 == kernel GRAPHICS_VT + 1
     let Ok(path) = CString::new("/dev/tty0") else {
         return false;
     };
@@ -393,46 +429,70 @@ fn switch_to_graphics_vt() {
 /// missing program, an interior NUL, or `execvp` erroring). Used by the
 /// `--exec-on-graphics-vt` helper mode.
 fn exec_argv(argv: &[String]) {
-    let Some(prog) = argv.first() else {
+    let Some(c_args) = argv_for_exec(argv) else {
         return;
     };
-    let Ok(c_prog) = CString::new(prog.as_str()) else {
-        return;
-    };
+    let ptrs = exec_ptrs(&c_args);
+    // SAFETY: `c_args[0]` is a valid C string and `ptrs` is a NULL-terminated
+    // argv of pointers into `c_args`, which outlives the call.
+    unsafe {
+        libc::execvp(c_args[0].as_ptr(), ptrs.as_ptr());
+    }
+}
+
+/// `argv` as C strings, or `None` if it cannot be passed to `execvp` whole.
+///
+/// An argument holding an interior NUL is refused rather than dropped: a
+/// truncated argv is a DIFFERENT command, and running it would be worse than
+/// running nothing. Split out because [`exec_argv`] only returns when it has
+/// failed, so no test can call it and come back.
+fn argv_for_exec(argv: &[String]) -> Option<Vec<CString>> {
+    if argv.is_empty() {
+        return None;
+    }
     let c_args: Vec<CString> = argv
         .iter()
         .filter_map(|a| CString::new(a.as_str()).ok())
         .collect();
-    if c_args.len() != argv.len() {
-        return; // an argument held an interior NUL -- refuse a truncated argv
-    }
-    let mut ptrs: Vec<*const libc::c_char> = c_args.iter().map(|c| c.as_ptr()).collect();
+    (c_args.len() == argv.len()).then_some(c_args)
+}
+
+/// The NULL-terminated pointer array `execvp` reads. The terminator is the
+/// whole point: without it `execvp` walks off the end of the allocation.
+fn exec_ptrs(args: &[CString]) -> Vec<*const libc::c_char> {
+    let mut ptrs: Vec<*const libc::c_char> = args.iter().map(|c| c.as_ptr()).collect();
     ptrs.push(core::ptr::null());
-    // SAFETY: `c_prog` is a valid C string and `ptrs` is a NULL-terminated argv
-    // of pointers into `c_args`, which outlive the call.
-    unsafe {
-        libc::execvp(c_prog.as_ptr(), ptrs.as_ptr());
-    }
+    ptrs
 }
 
 // ---------------------------------------------------------------------------
 // Pseudo-filesystems
 // ---------------------------------------------------------------------------
 
+/// The pseudo-filesystems PID 1 mounts, as `(source, target, fstype)`. A
+/// const rather than a local, because [`mount_pseudo_filesystems`] MOUNTS: no
+/// test can call it, so the table is the only part of it a test can hold.
+const PSEUDO_MOUNTS: &[(&str, &str, &str)] = &[
+    ("proc", "/proc", "proc"),
+    ("sysfs", "/sys", "sysfs"),
+    ("devtmpfs", "/dev", "devtmpfs"),
+    ("tmpfs", "/run", "tmpfs"),
+    ("tmpfs", "/tmp", "tmpfs"),
+];
+
+/// The trees wiped before any service starts, for the reason below.
+const RUNTIME_DIRS: &[&str] = &["/run", "/tmp"];
+
+/// `XDG_RUNTIME_DIR`'s mode. The specification requires it be reachable by
+/// its owner and nobody else, so no group or other bit may be set here.
+const XDG_RUNTIME_MODE: u32 = 0o700;
+
 /// Mount the standard pseudo-filesystems if they are not already present. The
 /// Eclipse kernel already provides procfs/sysfs/devfs and treats these mounts
 /// as successful no-ops, so this is cheap and idempotent; it is here so the
 /// system is correct even on a kernel build where a mount point is empty.
 fn mount_pseudo_filesystems() {
-    // (source, target, fstype)
-    let mounts = [
-        ("proc", "/proc", "proc"),
-        ("sysfs", "/sys", "sysfs"),
-        ("devtmpfs", "/dev", "devtmpfs"),
-        ("tmpfs", "/run", "tmpfs"),
-        ("tmpfs", "/tmp", "tmpfs"),
-    ];
-    for (src, target, fstype) in mounts {
+    for (src, target, fstype) in PSEUDO_MOUNTS.iter().copied() {
         if !Path::new(target).exists() {
             let _ = fs::create_dir_all(target);
         }
@@ -463,8 +523,9 @@ fn mount_pseudo_filesystems() {
     // and burn respawn backoffs; seatd/wlroots may also refuse to bind over a
     // pre-existing path. Clear both trees before any service starts. On a real
     // tmpfs (or the live RAM image) they are already empty and this is a no-op.
-    clean_runtime_dir(Path::new("/run"));
-    clean_runtime_dir(Path::new("/tmp"));
+    for d in RUNTIME_DIRS {
+        clean_runtime_dir(Path::new(d));
+    }
 
     // Wayland compositor socket dir (matches CHILD_ENV XDG_RUNTIME_DIR).
     let xdg_run = Path::new("/run/user/0");
@@ -473,7 +534,7 @@ fn mount_pseudo_filesystems() {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let _ = fs::set_permissions(xdg_run, fs::Permissions::from_mode(0o700));
+            let _ = fs::set_permissions(xdg_run, fs::Permissions::from_mode(XDG_RUNTIME_MODE));
         }
     }
     // PulseAudio system-instance socket dir (PULSE_SERVER=unix:/run/pulse/native).
@@ -497,19 +558,41 @@ fn mount_pseudo_filesystems() {
 /// mouse stayed dead for the whole session (VT input kept working because the
 /// console bypasses udev).
 fn clean_runtime_dir(dir: &Path) {
+    clean_runtime_dir_keeping(dir, keep_under(dir));
+}
+
+/// The one entry of `/run` that must survive the wipe. Named here rather than
+/// inside the loop so the rule is a value a test can hold: the decision used
+/// to be tied to the literal `/run`, which no test can clean.
+const KEEP_UNDER_RUN: Option<&str> = Some("udev");
+
+/// What [`clean_runtime_dir`] keeps when sweeping `dir`. A function rather
+/// than a line inside the sweep, because the sweep REMOVES: a test that
+/// checked this rule in place would have to wipe the real `/run`.
+fn keep_under(dir: &Path) -> Option<&'static str> {
+    KEEP_UNDER_RUN.filter(|_| dir == Path::new("/run"))
+}
+
+/// [`clean_runtime_dir`] with the entry to keep given rather than derived, so
+/// the sweep can be pointed at a scratch directory.
+fn clean_runtime_dir_keeping(dir: &Path, keep: Option<&str>) {
     let entries = match fs::read_dir(dir) {
         Ok(e) => e,
         Err(_) => return,
     };
-    let preserve_udev = dir == Path::new("/run");
     let mut removed = 0u32;
     let mut kept_udev = false;
     for entry in entries.flatten() {
         let path = entry.path();
-        if preserve_udev && entry.file_name() == *"udev" {
+        if keep.is_some_and(|k| entry.file_name() == *k) {
             kept_udev = true;
             continue;
         }
+        // The `false` fallback is unreachable in practice (`file_type` reads
+        // the `d_type` readdir already returned, and falls back to an `lstat`
+        // of an entry that was just listed), so `true` here behaves the same;
+        // it is the safe side anyway, since a plain `remove_file` leaves a
+        // directory in place instead of taking a tree with it.
         let is_real_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
         let ok = if is_real_dir {
             fs::remove_dir_all(&path).is_ok()
@@ -522,6 +605,8 @@ fn clean_runtime_dir(dir: &Path) {
     }
     if removed > 0 || kept_udev {
         log(&format!(
+            // Plural only: swapping the two arms changes the log line and
+            // nothing else.
             "cleared {removed} stale entr{} under {}{}",
             if removed == 1 { "y" } else { "ies" },
             dir.display(),
@@ -539,10 +624,9 @@ fn clean_runtime_dir(dir: &Path) {
 // ---------------------------------------------------------------------------
 
 fn install_signal_handlers() {
-    install_handler(libc::SIGTERM, on_sigterm as *const () as usize);
-    install_handler(libc::SIGINT, on_sigint as *const () as usize);
-    install_handler(libc::SIGUSR1, on_sigusr1 as *const () as usize);
-    install_handler(libc::SIGUSR2, on_sigusr2 as *const () as usize);
+    for (sig, handler, _) in SIGNAL_HANDLERS {
+        install_handler(*sig, *handler as *const () as usize);
+    }
     // SIGCHLD is left at its default: the blocking `waitpid` in the supervision
     // loop reaps children directly, so no handler is needed for reaping.
 }
@@ -656,6 +740,8 @@ fn ui_lang_from(cmdline: &str, file: Option<&str>) -> &'static str {
     }
     for line in file.unwrap_or_default().lines() {
         let line = line.trim();
+        // As in `parse_service`, the `#` arm is belt and braces: `#lang=en`
+        // does not start with `lang=` either.
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
@@ -854,6 +940,9 @@ fn parse_service(name: &str, text: &str) -> Option<Service> {
 
     for line in text.lines() {
         let line = line.trim();
+        // The `#` arm is belt and braces: a commented-out setting still has
+        // its `#` glued to the key (`#exec`, `# exec`), so it falls through the
+        // match below as an unknown key either way.
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
@@ -942,7 +1031,10 @@ fn ordered_names(services: &BTreeMap<String, Service>) -> Vec<String> {
             break;
         }
         if !progressed {
-            // Cycle or unsatisfiable deps: emit the rest in name order.
+            // Cycle or unsatisfiable deps: emit the rest in name order. The
+            // sort is already satisfied by construction -- `pending` starts as
+            // a `BTreeMap`'s keys and only ever has entries removed -- and is
+            // kept so the guarantee does not rest on the map's type.
             pending.sort();
             order.extend(pending);
             break;
@@ -1125,6 +1217,8 @@ enum Wait {
 /// left a Ctrl-Alt-Del during boot unanswered for as long as every wait took.
 fn wait_until(timeout: Duration, mut ready: impl FnMut() -> bool, stop: impl Fn() -> bool) -> Wait {
     let start = Instant::now();
+    // `<` rather than `<=`: the one instant it excludes is covered by the last
+    // look below, so the two spellings cannot be told apart from the outside.
     while start.elapsed() < timeout {
         if ready() {
             return Wait::Ready;
@@ -1164,6 +1258,17 @@ fn poll_step(elapsed: Duration) -> Duration {
 /// labwc start between the keyboard (event0) and a slower-enumerating mouse,
 /// which then stayed invisible for the whole session.
 fn wait_for_dir_settled(dir: &str, timeout: Duration, settle: Duration) {
+    wait_for_dir_settled_until(dir, timeout, settle, shutdown_requested)
+}
+
+/// [`wait_for_dir_settled`] with the give-up test given rather than read from
+/// the global flags, exactly as [`wait_until`] already takes its `stop`.
+fn wait_for_dir_settled_until(
+    dir: &str,
+    timeout: Duration,
+    settle: Duration,
+    stop: impl Fn() -> bool,
+) {
     let list = |d: &str| -> Vec<String> {
         let mut names: Vec<String> = fs::read_dir(d)
             .map(|entries| {
@@ -1173,6 +1278,10 @@ fn wait_for_dir_settled(dir: &str, timeout: Duration, settle: Duration) {
                     .collect()
             })
             .unwrap_or_default();
+        // Sorted so that two listings of the same set of names compare
+        // equal: `read_dir` gives no order, and an unsorted listing would read
+        // as a change and restart the settle window. Not reachable from a
+        // test, which cannot make the kernel hand the names back shuffled.
         names.sort_unstable();
         names
     };
@@ -1180,7 +1289,7 @@ fn wait_for_dir_settled(dir: &str, timeout: Duration, settle: Duration) {
     let mut last = list(dir);
     let mut stable_since = Instant::now();
     while start.elapsed() < timeout {
-        if shutdown_requested() {
+        if stop() {
             log(&format!(
                 "shutdown requested while waiting for {dir} to settle"
             ));
@@ -1197,6 +1306,7 @@ fn wait_for_dir_settled(dir: &str, timeout: Duration, settle: Duration) {
             log(&format!(
                 "{dir} settled with {} entr{}",
                 last.len(),
+                // Plural only, like the sweep's: the line, nothing else.
                 if last.len() == 1 { "y" } else { "ies" }
             ));
             return;
@@ -1227,6 +1337,10 @@ fn is_unix_socket(path: &str) -> bool {
         if libc::stat(c_path.as_ptr(), &mut st) != 0 {
             return false;
         }
+        // `& S_IFMT` is the correct mask, though `& S_IFSOCK` would answer
+        // the same: S_IFSOCK is 0o140000 and no other file type sets both
+        // 0o100000 and 0o040000 (a symlink is 0o120000, a regular file
+        // 0o100000, a block device 0o060000).
         (st.st_mode & libc::S_IFMT) == libc::S_IFSOCK
     }
 }
@@ -1705,12 +1819,13 @@ fn supervise(services: &mut BTreeMap<String, Service>) {
             // minutes (the desktop works until a client wedges the GPU channel)
             // and the respawns on the dead channel may also linger before dying,
             // so an uptime-gated "crash" count would never trip.
-            if svc.name == "labwc"
-                && !COMPOSITOR_DEGRADED.load(Ordering::Relaxed)
-                && gpu_compositor_requested()
-            {
-                let n = COMPOSITOR_EXITS.fetch_add(1, Ordering::Relaxed) + 1;
-                if n >= COMPOSITOR_DEGRADE_AFTER {
+            if let Some((n, out_of_tries)) = compositor_exit(
+                &svc.name,
+                COMPOSITOR_DEGRADED.load(Ordering::Relaxed),
+                gpu_compositor_requested(),
+                || COMPOSITOR_EXITS.fetch_add(1, Ordering::Relaxed),
+            ) {
+                if out_of_tries {
                     COMPOSITOR_DEGRADED.store(true, Ordering::Relaxed);
                     // Same marker the labwc wrapper writes when it falls back
                     // itself: the GL wrappers (eclipse-firefox) read it and stay
@@ -1729,18 +1844,15 @@ fn supervise(services: &mut BTreeMap<String, Service>) {
                     ));
                 }
             }
-            if uptime >= HEALTHY_UPTIME {
-                // Up long enough to be healthy: restart now, reset the backoff.
-                svc.backoff = MIN_BACKOFF;
+            let (wait, next) = restart_delay(uptime, svc.backoff);
+            svc.backoff = next;
+            delay = wait;
+            if wait.is_zero() {
                 log(&format!(
                     "respawn: {} exited after {:?} ({}), restarting",
                     svc.name, uptime, how
                 ));
             } else {
-                // Exited almost immediately: back off so a broken or
-                // not-yet-ready service cannot pin a CPU.
-                delay = svc.backoff;
-                svc.backoff = (svc.backoff * 2).min(MAX_BACKOFF);
                 log(&format!(
                     "respawn: {} exited after {:?} ({}, crash), retry in {:?}",
                     svc.name, uptime, how, delay
@@ -1773,6 +1885,50 @@ fn supervise(services: &mut BTreeMap<String, Service>) {
             }
         }
     }
+}
+
+/// How long to wait before restarting a respawn service that just exited, and
+/// what its backoff becomes: `(wait now, next backoff)`.
+///
+/// A service that stayed up past [`HEALTHY_UPTIME`] did a unit of work and is
+/// restarted at once with its backoff reset. One that died almost immediately
+/// is a crash loop, and waits its current backoff, which then doubles up to
+/// [`MAX_BACKOFF`] -- without that, a service whose binary is missing forks
+/// and execs at full speed forever and pins a CPU.
+///
+/// Split out of [`supervise`], which blocks in `waitpid` for the life of the
+/// machine: the policy was unreachable from a test while it lived in there.
+fn restart_delay(uptime: Duration, backoff: Duration) -> (Duration, Duration) {
+    if uptime >= HEALTHY_UPTIME {
+        (Duration::ZERO, MIN_BACKOFF)
+    } else {
+        (backoff, (backoff * 2).min(MAX_BACKOFF))
+    }
+}
+
+/// Whether a child's exit counts against the compositor's GPU-renderer
+/// tolerance, and if so what the count becomes and whether it has run out.
+///
+/// Counted on EVERY exit of the GPU-rendered compositor, not only fast ones:
+/// the first labwc instance can live for minutes and the respawns on a dead
+/// GPU channel may also linger, so an uptime-gated "crash" count would never
+/// trip. Returns `None` when the exit is not the compositor's, when it is
+/// already degraded, or when no GPU renderer was asked for.
+///
+/// `bump` yields the count BEFORE this exit and is called only when the exit
+/// counts, so a service other than the compositor dying does not consume the
+/// compositor's tolerance.
+fn compositor_exit(
+    name: &str,
+    degraded: bool,
+    gpu: bool,
+    bump: impl FnOnce() -> u32,
+) -> Option<(u32, bool)> {
+    if name != "labwc" || degraded || !gpu {
+        return None;
+    }
+    let n = bump() + 1;
+    Some((n, n >= COMPOSITOR_DEGRADE_AFTER))
 }
 
 /// Ask the kernel to reboot (`reboot == true`) or power off.
@@ -1996,6 +2152,17 @@ mod tests {
         assert_eq!(tz_from("country=US:tz=Asia/Tokyo", None), "Asia/Tokyo");
         assert_eq!(tz_from("", Some("tz=Europe/Berlin\n")), "Europe/Berlin");
         assert_eq!(tz_from("", Some("country=US\n")), "America/New_York");
+        // And in the FILE too, whichever line comes first: `country=` is the
+        // fallback for a machine that was never told its zone, so a file that
+        // carries both is a machine that WAS told.
+        assert_eq!(
+            tz_from("", Some("country=US\ntz=Europe/Berlin\n")),
+            "Europe/Berlin"
+        );
+        assert_eq!(
+            tz_from("", Some("tz=Europe/Berlin\ncountry=US\n")),
+            "Europe/Berlin"
+        );
         assert_eq!(tz_from("", None), "Europe/Madrid");
     }
 
@@ -2813,6 +2980,688 @@ mod tests {
                 env.iter().any(|v| v == "MOZ_ENABLE_WAYLAND=1"),
                 "{cmdline}: {env:?}"
             );
+        }
+    }
+    // ── signals: what each one asks PID 1 for ────────────────────────────────
+
+    /// A scratch directory of this test's own, cleared first.
+    fn scratch(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("eclipse-init-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Every signal PID 1 answers asks for what busybox means by it, and the
+    /// handler wired to it sets the matching flag.
+    ///
+    /// Nothing else in the system can tell: a swapped row shows up as the
+    /// machine powering off when the user asked it to reboot, and it DID --
+    /// SIGTERM used to request a HALT, so `/bin/reboot`, `busybox reboot` and
+    /// every script using the absolute path powered the box off instead.
+    #[test]
+    fn every_signal_asks_for_what_busybox_sends_it_for() {
+        // busybox halt.c sends halt/poweroff/reboot as SIGUSR1/SIGUSR2/
+        // SIGTERM; the kernel delivers Ctrl-Alt-Del as SIGINT. The table is
+        // hard-coded here on purpose: this is the other side of it.
+        let want: &[(libc::c_int, Request, &str)] = &[
+            (libc::SIGTERM, Request::Reboot, "busybox reboot"),
+            (libc::SIGINT, Request::Reboot, "Ctrl-Alt-Del"),
+            (libc::SIGUSR1, Request::Halt, "busybox halt"),
+            (libc::SIGUSR2, Request::Halt, "busybox poweroff"),
+        ];
+        assert_eq!(
+            SIGNAL_HANDLERS.len(),
+            want.len(),
+            "the table no longer covers the four signals PID 1 must answer"
+        );
+
+        let held = (
+            WANT_HALT.load(Ordering::SeqCst),
+            WANT_REBOOT.load(Ordering::SeqCst),
+        );
+        for (sig, req, sender) in want {
+            let row = SIGNAL_HANDLERS
+                .iter()
+                .find(|(s, _, _)| s == sig)
+                .unwrap_or_else(|| panic!("no row for the signal {sender} sends"));
+            assert_eq!(row.2, *req, "{sender} asks for the wrong thing");
+            // And the handler on that row really does what the row promises.
+            WANT_HALT.store(false, Ordering::SeqCst);
+            WANT_REBOOT.store(false, Ordering::SeqCst);
+            (row.1)(*sig);
+            let got = match (
+                WANT_HALT.load(Ordering::SeqCst),
+                WANT_REBOOT.load(Ordering::SeqCst),
+            ) {
+                (true, false) => Some(Request::Halt),
+                (false, true) => Some(Request::Reboot),
+                _ => None,
+            };
+            assert_eq!(
+                got,
+                Some(*req),
+                "the handler for {sender} set the wrong flag, or both, or neither"
+            );
+        }
+        WANT_HALT.store(held.0, Ordering::SeqCst);
+        WANT_REBOOT.store(held.1, Ordering::SeqCst);
+    }
+
+    /// Either flag alone ends a bounded wait. Both are needed together only
+    /// to decide WHICH way the machine goes down, never whether it does.
+    #[test]
+    fn either_flag_alone_stops_a_bounded_wait() {
+        let held = (
+            WANT_HALT.load(Ordering::SeqCst),
+            WANT_REBOOT.load(Ordering::SeqCst),
+        );
+        for (halt, reboot, want) in [
+            (false, false, false),
+            (true, false, true),
+            (false, true, true),
+            (true, true, true),
+        ] {
+            WANT_HALT.store(halt, Ordering::SeqCst);
+            WANT_REBOOT.store(reboot, Ordering::SeqCst);
+            assert_eq!(
+                shutdown_requested(),
+                want,
+                "halt={halt} reboot={reboot} read as {}",
+                shutdown_requested()
+            );
+        }
+        WANT_HALT.store(held.0, Ordering::SeqCst);
+        WANT_REBOOT.store(held.1, Ordering::SeqCst);
+    }
+
+    // ── the stale-runtime sweep ──────────────────────────────────────────────
+
+    /// The sweep of `/run` and `/tmp` removes what the previous boot left and
+    /// keeps the ONE entry it is told to keep.
+    ///
+    /// Both halves matter and neither had a test. The removal is what stops a
+    /// stale `wayland-0` or `seatd.sock` passing a readiness check before the
+    /// daemon is listening. What it keeps is `/run/udev`: the kernel writes a
+    /// synthetic udev database there so libinput treats `/dev/input/event*` as
+    /// initialized without a udevd, and wiping it left the compositor running
+    /// with no keyboard and no mouse for the whole session.
+    #[test]
+    fn the_runtime_sweep_keeps_the_one_entry_it_is_told_to_keep() {
+        let dir = scratch("sweep");
+        fs::write(dir.join("wayland-0"), b"stale").unwrap();
+        fs::create_dir_all(dir.join("udev/data")).unwrap();
+        fs::write(dir.join("udev/data/c13:64"), b"E:ID_INPUT=1").unwrap();
+        fs::create_dir_all(dir.join("pulse")).unwrap();
+        fs::write(dir.join("pulse/pid"), b"123").unwrap();
+        std::os::unix::fs::symlink("/nonexistent", dir.join("dangling")).unwrap();
+
+        clean_runtime_dir_keeping(&dir, Some("udev"));
+
+        let left: Vec<String> = {
+            let mut n: Vec<String> = fs::read_dir(&dir)
+                .unwrap()
+                .flatten()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect();
+            n.sort();
+            n
+        };
+        assert_eq!(left, vec!["udev".to_string()], "left behind: {left:?}");
+        // Kept whole, not emptied: the database inside it is the point.
+        assert!(
+            dir.join("udev/data/c13:64").exists(),
+            "the udev database was emptied"
+        );
+
+        // With nothing to keep, nothing is kept -- which is what `/tmp` gets.
+        clean_runtime_dir_keeping(&dir, None);
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 0, "udev survived /tmp");
+        let _ = fs::remove_dir_all(&dir);
+
+        // And the rule that picks between the two. `/run/udev` holds the
+        // device database libinput reads: wiping it once left the session with
+        // no keyboard and no mouse until the next boot, so the one tree that
+        // keeps something is `/run`, and `/tmp` keeps nothing.
+        assert_eq!(keep_under(Path::new("/run")), Some("udev"));
+        assert_eq!(keep_under(Path::new("/tmp")), None);
+        assert_eq!(keep_under(Path::new("/run/user/0")), None);
+        for d in RUNTIME_DIRS {
+            let swept = Path::new(d);
+            assert_eq!(
+                keep_under(swept) == Some("udev"),
+                swept == Path::new("/run"),
+                "{d} keeps the wrong thing"
+            );
+        }
+    }
+
+    /// A dangling symlink is removed as an entry and never followed: the
+    /// sweep must not reach outside the tree it was pointed at.
+    #[test]
+    fn the_sweep_removes_a_symlink_without_following_it() {
+        let dir = scratch("link");
+        let outside = scratch("link-target");
+        fs::write(outside.join("keep-me"), b"not yours").unwrap();
+        std::os::unix::fs::symlink(&outside, dir.join("elsewhere")).unwrap();
+
+        clean_runtime_dir_keeping(&dir, None);
+
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 0, "the link stayed");
+        assert!(
+            outside.join("keep-me").exists(),
+            "the sweep followed the link and emptied the target"
+        );
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&outside);
+    }
+
+    // ── the socket gate ──────────────────────────────────────────────────────
+
+    /// `wait_socket =` is the gate that stops labwc racing seatd, and it asks
+    /// exactly one question: is there a UNIX SOCKET at that path? A regular
+    /// file, a directory or nothing at all are all "not yet" -- a stale
+    /// regular file passing for a socket is how a client connects to a
+    /// daemon that is not listening.
+    #[test]
+    fn only_a_unix_socket_satisfies_the_socket_gate() {
+        let dir = scratch("sock");
+        let sock = dir.join("seatd.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        fs::write(dir.join("plain"), b"not a socket").unwrap();
+        fs::create_dir_all(dir.join("adir")).unwrap();
+
+        assert!(is_unix_socket(&sock.display().to_string()), "the socket");
+        assert!(
+            !is_unix_socket(&dir.join("plain").display().to_string()),
+            "a regular file passed for a socket"
+        );
+        assert!(
+            !is_unix_socket(&dir.join("adir").display().to_string()),
+            "a directory passed for a socket"
+        );
+        assert!(
+            !is_unix_socket(&dir.join("absent").display().to_string()),
+            "a path that is not there passed for a socket"
+        );
+        // A path with an interior NUL cannot be asked about, so it is not one.
+        assert!(!is_unix_socket("/run/se\0atd.sock"), "a NUL in the path");
+
+        drop(listener);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // ── the tables PID 1 boots from ──────────────────────────────────────────
+
+    /// The pseudo-filesystems, each mounted where its own name says. The
+    /// function that uses this MOUNTS, so no test can call it: the table is
+    /// the only part of the decision a test can reach, and a missing row is a
+    /// kernel interface the whole session then does without.
+    #[test]
+    fn the_pseudo_filesystems_cover_the_four_the_session_needs() {
+        let at = |target: &str| {
+            PSEUDO_MOUNTS
+                .iter()
+                .find(|(_, t, _)| *t == target)
+                .unwrap_or_else(|| panic!("nothing is mounted on {target}"))
+        };
+        assert_eq!(at("/proc").2, "proc", "/proc is not procfs");
+        assert_eq!(at("/sys").2, "sysfs", "/sys is not sysfs");
+        assert_eq!(at("/dev").2, "devtmpfs", "/dev is not devtmpfs");
+        assert_eq!(at("/run").2, "tmpfs", "/run is not a tmpfs");
+        assert_eq!(at("/tmp").2, "tmpfs", "/tmp is not a tmpfs");
+        // No target twice: the second mount of a path shadows the first.
+        for (i, (_, t, _)) in PSEUDO_MOUNTS.iter().enumerate() {
+            assert!(
+                !PSEUDO_MOUNTS[i + 1..].iter().any(|(_, u, _)| u == t),
+                "{t} is mounted twice"
+            );
+        }
+    }
+
+    /// Both runtime trees are swept, and the session directory is the owner's
+    /// alone. `/run` AND `/tmp`: on an installed root the kernel treats the
+    /// tmpfs mounts as no-ops, so both are btrfs directories that SURVIVE a
+    /// reboot, and a stale socket in either passes a readiness check.
+    #[test]
+    fn both_runtime_trees_are_swept_and_the_session_dir_is_private() {
+        assert!(
+            RUNTIME_DIRS.contains(&"/run") && RUNTIME_DIRS.contains(&"/tmp"),
+            "a tree that survives a reboot is not swept: {RUNTIME_DIRS:?}"
+        );
+        // XDG_RUNTIME_DIR: reachable by its owner and by nobody else, which is
+        // what the specification requires of it and what the Wayland socket
+        // inside it relies on.
+        assert_eq!(
+            XDG_RUNTIME_MODE & 0o077,
+            0,
+            "the session directory is readable off-owner: {XDG_RUNTIME_MODE:04o}"
+        );
+        assert_eq!(
+            XDG_RUNTIME_MODE & 0o700,
+            0o700,
+            "its owner cannot reach it: {XDG_RUNTIME_MODE:04o}"
+        );
+    }
+
+    /// The session lands on a VT clear of the text consoles. On one of them
+    /// the compositor and a getty fight over the same screen, and the boot
+    /// messages scroll over the desktop.
+    #[test]
+    fn the_session_lands_on_a_vt_clear_of_the_text_consoles() {
+        // The relation is a `const` assertion in production (it is decidable
+        // at compile time); what is left for a test is the two numbers, which
+        // have to agree with the kernel's own VT layout.
+        assert_eq!(TEXT_VTS, 6, "the kernel no longer opens six text consoles");
+        assert_eq!(GRAPHICS_VT, 7, "the session is not on tty7");
+    }
+
+    /// The marker lives under a tree a boot wipes, so it lasts exactly one
+    /// boot. `/tmp` would not do: on an installed root it is a btrfs
+    /// directory that survives, so a machine that degraded once would come
+    /// up on software rendering for ever after.
+    #[test]
+    fn the_renderer_fallback_marker_lasts_exactly_one_boot() {
+        assert!(
+            RUNTIME_DIRS
+                .iter()
+                .any(|d| RENDERER_FALLBACK_MARKER.starts_with(&format!("{d}/"))),
+            "{RENDERER_FALLBACK_MARKER} is not under a tree the boot sweeps"
+        );
+        assert!(
+            RENDERER_FALLBACK_MARKER.starts_with("/run/"),
+            "a marker outside /run can outlive its boot: {RENDERER_FALLBACK_MARKER}"
+        );
+    }
+
+    // ── the respawn policy ───────────────────────────────────────────────────
+
+    /// A service that did a unit of work restarts at once with its backoff
+    /// reset; one that died on start waits, and the wait doubles to a ceiling.
+    ///
+    /// This policy lived inside `supervise`, which blocks in `waitpid` for the
+    /// life of the machine, so none of it was reachable from a test -- and it
+    /// is the difference between a missing binary costing one log line every
+    /// eight seconds and it pinning a CPU for the whole boot.
+    #[test]
+    fn a_crashing_service_backs_off_and_a_working_one_does_not() {
+        // Healthy: no wait, and the next crash starts from the minimum again.
+        let (wait, next) = restart_delay(HEALTHY_UPTIME, MAX_BACKOFF);
+        assert_eq!(wait, Duration::ZERO, "a healthy exit waited");
+        assert_eq!(next, MIN_BACKOFF, "a healthy exit kept its backoff");
+
+        // A crash: wait what we had, then double.
+        let (wait, next) = restart_delay(Duration::ZERO, MIN_BACKOFF);
+        assert_eq!(wait, MIN_BACKOFF, "the first retry did not wait");
+        assert_eq!(next, MIN_BACKOFF * 2, "the backoff did not grow");
+
+        // Doubling stops at the ceiling, and the walk up to it is short
+        // enough that a service which starts working comes back quickly.
+        let mut b = MIN_BACKOFF;
+        let mut steps = 0;
+        while b < MAX_BACKOFF {
+            let (wait, next) = restart_delay(Duration::ZERO, b);
+            assert_eq!(wait, b, "the retry waited something other than its backoff");
+            assert!(next > b, "the backoff stopped growing at {b:?}");
+            b = next;
+            steps += 1;
+            assert!(
+                steps < 20,
+                "the backoff takes {steps} crashes to reach its ceiling"
+            );
+        }
+        assert_eq!(b, MAX_BACKOFF, "the ceiling is not a power of two away");
+        assert_eq!(
+            restart_delay(Duration::ZERO, MAX_BACKOFF),
+            (MAX_BACKOFF, MAX_BACKOFF),
+            "the backoff grew past its ceiling"
+        );
+        // And the ceiling is a wait a person would sit through.
+        assert!(MAX_BACKOFF <= Duration::from_secs(30), "{MAX_BACKOFF:?}");
+        assert!(
+            MIN_BACKOFF < HEALTHY_UPTIME,
+            "the first retry outlasts health"
+        );
+        // The floor is long enough that a service failing to exec cannot spin
+        // PID 1: at a millisecond it would be retried a thousand times a
+        // second, with a log line each time.
+        assert!(
+            MIN_BACKOFF >= Duration::from_millis(100),
+            "a crash loop would spin PID 1 at {MIN_BACKOFF:?}"
+        );
+        // And the health window sits between the two: longer than the first
+        // retry (or every retry would look healthy) and shorter than the
+        // ceiling (or a service could never be asked to run long enough to
+        // clear a backoff it is already being held back by).
+        assert!(
+            HEALTHY_UPTIME < MAX_BACKOFF,
+            "a service must run {HEALTHY_UPTIME:?} to clear a {MAX_BACKOFF:?} wait"
+        );
+
+        // A freshly parsed service starts at the minimum, so its FIRST crash
+        // is retried promptly rather than after the ceiling.
+        let svc = parse_service("labwc", "exec = /usr/local/bin/labwc\ntype = respawn\n").unwrap();
+        assert_eq!(
+            restart_delay(Duration::ZERO, svc.backoff).0,
+            MIN_BACKOFF,
+            "a service's first crash waited {:?}",
+            svc.backoff
+        );
+    }
+
+    /// The compositor is dropped to software rendering only after its
+    /// tolerance runs out, and only when it is the compositor, only while a
+    /// GPU renderer was asked for, and only once.
+    #[test]
+    fn the_compositor_degrades_only_when_its_tolerance_runs_out() {
+        // Counted from the first exit, and the tolerance is reached, not
+        // passed, before degrading.
+        for n in 0..COMPOSITOR_DEGRADE_AFTER - 1 {
+            let (count, out) = compositor_exit("labwc", false, true, || n).unwrap();
+            assert_eq!(count, n + 1, "the exit was not counted");
+            assert!(
+                !out,
+                "degraded on exit {count} of {COMPOSITOR_DEGRADE_AFTER}"
+            );
+        }
+        let (count, out) = compositor_exit("labwc", false, true, || COMPOSITOR_DEGRADE_AFTER - 1)
+            .expect("the last exit of the tolerance was not counted");
+        assert_eq!(count, COMPOSITOR_DEGRADE_AFTER);
+        assert!(out, "the tolerance ran out and it did not degrade");
+
+        // Not counted at all when it is not the compositor, when no GPU
+        // renderer was asked for, or when it has already degraded -- the last
+        // one is what stops the count climbing for the rest of the boot.
+        // The counter must not even be READ in those cases: it is a global
+        // `fetch_add`, so consulting it is what spends the tolerance.
+        let asked = std::cell::Cell::new(0u32);
+        let count = || {
+            asked.set(asked.get() + 1);
+            9
+        };
+        assert_eq!(
+            compositor_exit("seatd", false, true, count),
+            None,
+            "seatd counted"
+        );
+        assert_eq!(
+            compositor_exit("labwc", false, false, count),
+            None,
+            "pixman counted"
+        );
+        assert_eq!(
+            compositor_exit("labwc", true, true, count),
+            None,
+            "counted twice"
+        );
+        assert_eq!(
+            asked.get(),
+            0,
+            "an exit that does not count spent the tolerance"
+        );
+
+        // And a tolerance nobody would wait out is not a tolerance.
+        assert!(
+            (1..=3).contains(&COMPOSITOR_DEGRADE_AFTER),
+            "the desktop dies {COMPOSITOR_DEGRADE_AFTER} times before it recovers"
+        );
+    }
+
+    // ── exec ─────────────────────────────────────────────────────────────────
+
+    /// An argv with an interior NUL is refused WHOLE, and what does go to
+    /// `execvp` is NULL-terminated.
+    ///
+    /// Both are the kind of thing only a test sees: a truncated argv is a
+    /// different command, run with no sign that anything was dropped, and a
+    /// pointer array with no terminator sends `execvp` off the end of the
+    /// allocation.
+    #[test]
+    fn an_argv_is_passed_whole_and_null_terminated_or_not_at_all() {
+        let argv: Vec<String> = ["/usr/local/bin/labwc", "-C", "/root/.config/labwc"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let c_args = argv_for_exec(&argv).expect("a clean argv was refused");
+        assert_eq!(c_args.len(), argv.len(), "an argument was dropped");
+        for (c, s) in c_args.iter().zip(&argv) {
+            assert_eq!(c.to_str().unwrap(), s, "an argument changed");
+        }
+
+        let ptrs = exec_ptrs(&c_args);
+        assert_eq!(ptrs.len(), c_args.len() + 1, "no room for the terminator");
+        assert!(ptrs[ptrs.len() - 1].is_null(), "execvp gets no terminator");
+        assert!(
+            ptrs[..c_args.len()].iter().all(|p| !p.is_null()),
+            "an argument came through as NULL, which ends the argv early"
+        );
+
+        // A NUL anywhere in it, and nothing is run.
+        let dirty: Vec<String> = vec!["/bin/sh".into(), "-c".into(), "echo\0rm -rf /".into()];
+        assert!(
+            argv_for_exec(&dirty).is_none(),
+            "an argv with an interior NUL was accepted, truncated"
+        );
+        assert!(argv_for_exec(&[]).is_none(), "an empty argv was accepted");
+    }
+
+    // ── the renderer environment ─────────────────────────────────────────────
+
+    /// SDL's renderer follows the compositor's one-to-one, and the two modes
+    /// are different environments. The same three copies of this policy live
+    /// in the labwc wrapper and /etc/profile, so a swap here means a
+    /// shell-launched SDL app and an init-launched one render differently.
+    #[test]
+    fn the_sdl_render_path_follows_the_compositor_renderer() {
+        let env_for = |mode| {
+            let mut env: Vec<CString> = Vec::new();
+            push_sdl_render_env(&mut env, mode);
+            env.iter()
+                .map(|e| e.to_str().unwrap().to_string())
+                .collect::<Vec<_>>()
+        };
+        let soft = env_for(SdlRender::Software);
+        let gl = env_for(SdlRender::Gles2);
+        assert_ne!(soft, gl, "both SDL modes set the same environment");
+        // A CPU session must not advertise an accelerated framebuffer: SDL
+        // would hand the app a surface with no GL behind it.
+        assert!(
+            soft.contains(&"SDL_RENDER_DRIVER=software".to_string())
+                && soft.contains(&"SDL_FRAMEBUFFER_ACCELERATION=0".to_string()),
+            "the pixman session does not pin SDL to the CPU: {soft:?}"
+        );
+        assert!(
+            gl.contains(&"SDL_RENDER_DRIVER=opengles2".to_string())
+                && gl.contains(&"SDL_FRAMEBUFFER_ACCELERATION=opengles2".to_string()),
+            "the GL session does not pin SDL to GLES2: {gl:?}"
+        );
+    }
+
+    /// A pixman session says so, and says software is allowed. wlroots
+    /// REFUSES a software renderer without that second variable, so a
+    /// compositor told to use pixman and not told it may would not start.
+    #[test]
+    fn a_pixman_session_names_pixman_and_allows_software() {
+        let env = child_env_for(Renderer::Pixman, None, "", false);
+        let have: Vec<String> = env
+            .iter()
+            .map(|e| e.to_str().unwrap().to_string())
+            .collect();
+        assert!(
+            have.contains(&"WLR_RENDERER=pixman".to_string()),
+            "a pixman session does not name pixman: {have:?}"
+        );
+        assert!(
+            have.contains(&"WLR_RENDERER_ALLOW_SOFTWARE=1".to_string()),
+            "wlroots will refuse the software renderer it was given"
+        );
+    }
+
+    // ── the settle wait ──────────────────────────────────────────────────────
+
+    /// A shutdown ends the settle wait instead of serving out its timeout.
+    /// This is the longest wait on the boot path, so a Ctrl-Alt-Del during it
+    /// is the one most likely to look ignored.
+    #[test]
+    fn a_shutdown_ends_the_settle_wait_instead_of_serving_it_out() {
+        let dir = scratch("settle-stop");
+        let start = Instant::now();
+        wait_for_dir_settled_until(
+            &dir.display().to_string(),
+            Duration::from_secs(30),
+            Duration::from_secs(10),
+            || true,
+        );
+        let waited = start.elapsed();
+        assert!(
+            waited < Duration::from_secs(1),
+            "it served out {waited:?} of a thirty second wait"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Something that is already there, on a wait that is also being stopped,
+    /// is reported as HAVING ARRIVED. The other way round the caller logs a
+    /// warning about a socket that is sitting right there, and sends the
+    /// service into its backoff for nothing.
+    #[test]
+    fn a_wait_both_satisfied_and_stopped_reports_what_arrived() {
+        assert_eq!(
+            wait_until(Duration::from_secs(5), || true, || true),
+            Wait::Ready,
+            "a wait reported a shutdown for something that had arrived"
+        );
+        assert_eq!(
+            wait_until(Duration::from_secs(5), || false, || true),
+            Wait::Stopped
+        );
+    }
+
+    // ── the rest of the service file, and the chmod ──────────────────────────
+
+    /// Every key a service file may carry lands in its own field, and a key
+    /// that is not one of them changes nothing. A misspelling is a gate that
+    /// does not exist: `wait_sockt = /run/seatd.sock` was accepted in silence,
+    /// and labwc then raced seatd on every boot.
+    #[test]
+    fn every_key_a_service_file_carries_lands_in_its_own_field() {
+        let text = "\
+exec = /usr/local/bin/labwc -C /root/.config/labwc
+type = respawn
+after = seatd dbus
+desktop = labwc
+cmdline = dbus.selftest
+log = /tmp/labwc.log
+wait_socket = /run/seatd.sock
+wait_path = /dev/input/event0
+";
+        let svc = parse_service("labwc", text).expect("the service was refused");
+        assert_eq!(svc.name, "labwc");
+        assert_eq!(
+            svc.exec,
+            ["/usr/local/bin/labwc", "-C", "/root/.config/labwc"]
+        );
+        assert_eq!(svc.kind, Kind::Respawn);
+        assert_eq!(svc.after, ["seatd", "dbus"]);
+        assert_eq!(svc.desktop.as_deref(), Some("labwc"));
+        assert_eq!(
+            svc.cmdline.as_deref(),
+            Some("dbus.selftest"),
+            "the cmdline gate"
+        );
+        assert_eq!(svc.log.as_deref(), Some("/tmp/labwc.log"));
+        assert_eq!(svc.wait_socket.as_deref(), Some("/run/seatd.sock"));
+        assert_eq!(svc.wait_path.as_deref(), Some("/dev/input/event0"));
+
+        // A misspelled key sets nothing at all -- not the field it nearly
+        // names, and not any other.
+        let typo = parse_service("labwc", "exec = /bin/true\nwait_sockt = /run/seatd.sock\n")
+            .expect("the service was refused");
+        assert_eq!(typo.wait_socket, None, "a misspelled key set the real one");
+        assert_eq!(typo.wait_path, None);
+        assert_eq!(typo.cmdline, None);
+        assert_eq!(typo.desktop, None);
+        assert_eq!(typo.log, None);
+    }
+
+    /// A file with no read bit at all still gets its owner's x bit. The
+    /// `chmod +x` this mirrors adds x wherever the file is readable, which
+    /// for a 0644 wrapper means 0755 -- but for a 0200 one it would mean
+    /// adding nothing, and the service would still not start.
+    #[test]
+    fn an_exec_with_no_read_bit_still_gets_its_owner_x_bit() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch("chmod");
+        for (before, after) in [(0o644u32, 0o755u32), (0o600, 0o700), (0o200, 0o300)] {
+            let prog = dir.join(format!("w{before:04o}"));
+            fs::write(&prog, b"#!/bin/sh\n").unwrap();
+            fs::set_permissions(&prog, fs::Permissions::from_mode(before)).unwrap();
+            let said = repair_exec_mode(&prog.display().to_string());
+            assert!(said.is_some(), "{before:04o} was left alone");
+            let now = fs::metadata(&prog).unwrap().permissions().mode() & 0o7777;
+            assert_eq!(now, after, "{before:04o} became {now:04o}");
+            assert_ne!(now & 0o111, 0, "{before:04o} is still not executable");
+            // And a second pass leaves it be: it is already executable.
+            assert_eq!(
+                repair_exec_mode(&prog.display().to_string()),
+                None,
+                "an executable file was chmoded again"
+            );
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A symlinked `exec =` is repaired through the link. The wrappers under
+    /// /usr/local/bin can be links, and it is the file at the end of one that
+    /// `execve` checks the mode of.
+    #[test]
+    fn a_symlinked_exec_is_repaired_through_the_link() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch("chmod-link");
+        let real = dir.join("eclipse-oopslog");
+        fs::write(&real, b"#!/bin/sh\n").unwrap();
+        fs::set_permissions(&real, fs::Permissions::from_mode(0o644)).unwrap();
+        let link = dir.join("oopslog");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        assert!(
+            repair_exec_mode(&link.display().to_string()).is_some(),
+            "a link to a non-executable file was left alone"
+        );
+        let mode = fs::metadata(&real).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(mode, 0o755, "the target is {mode:04o}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Every spelling of the two languages this image ships. The locale file
+    /// is written by `eclipse-locale` and by hand, so `es_ES` and `ES` reach
+    /// here as readily as `es` does -- and a spelling that falls through
+    /// silently leaves a user who asked for English with a Spanish desktop.
+    #[test]
+    fn every_spelling_of_the_two_languages_is_accepted() {
+        for (spelt, want) in [
+            ("en", "en"),
+            ("EN", "en"),
+            ("en_US", "en"),
+            ("es", "es"),
+            ("ES", "es"),
+            ("es_ES", "es"),
+        ] {
+            assert_eq!(ui_lang_token(spelt), Some(want), "lang={spelt}");
+            assert_eq!(
+                ui_lang_from(&format!("LOG=warn:lang={spelt}"), None),
+                want,
+                "lang={spelt} on the cmdline"
+            );
+            assert_eq!(
+                ui_lang_from("", Some(&format!("lang={spelt}\n"))),
+                want,
+                "lang={spelt} in the file"
+            );
+        }
+        // And nothing else is a language, at either source.
+        for other in ["fr", "en_GB", "espanol", "e", ""] {
+            assert_eq!(ui_lang_token(other), None, "lang={other} was accepted");
         }
     }
 }
