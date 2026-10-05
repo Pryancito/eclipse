@@ -578,7 +578,7 @@ impl ProcessExt for Process {
         // its first mallocs). Taken BEFORE `inner` — that is the global order
         // (see the `aspace_lock` field doc).
         let _aspace = linux_parent.aspace_lock().lock();
-        let mut linux_parent_inner = linux_parent.inner.lock();
+        let linux_parent_inner = linux_parent.inner.lock();
         // Child joins the parent's process group: copy the parent's *effective*
         // pgid so the inherited value is concrete even if the parent never
         // called setpgid (raw 0 → own pid). This is what makes a Ctrl-C reach a
@@ -609,6 +609,39 @@ impl ProcessExt for Process {
                 monotonic_now_ns(),
             )),
         };
+        // `inner` goes here, and not at the end of the function. Everything
+        // above needed the parent's big lock -- the pgid/sid resolution and
+        // the `forked_child` snapshot -- and nothing below it does until the
+        // child is inserted into the parent's child list, which takes it again
+        // for the three stores that need it.
+        //
+        // Held to the end of the function, as it used to be, it covered the
+        // whole address-space copy. `VmAddressRegion::fork_from` is the one
+        // part of this kernel whose own documentation calls itself slow: "the
+        // copy of a big process takes tens of ms and the inner locks are
+        // IRQ-off spinlocks". `inner` is the parent's big lock, taken by every
+        // descriptor lookup -- so every `read`, `write` and `ioctl` of every
+        // other thread of the parent queued behind the copy, with interrupts
+        // off, for as long as the copy ran. That is the shape of the capture
+        // this came from:
+        //
+        // ```text
+        // DEADLOCK: spinlock(s) stuck >8s
+        // cpu=11 at linux-object/src/process.rs:2483   (get_file_like)
+        // HOLDER cpu=4 at linux-object/src/process.rs:581   (this lock)
+        // cpu=0 at linux-object/src/process.rs:2483
+        // cpu=2 at linux-object/src/process.rs:2483
+        // cpu=6 at linux-object/src/process.rs:2483
+        // ```
+        //
+        // four CPUs stacked on the descriptor lookup behind one fork. And a
+        // long hold is only the mild failure: a page fault or a panic taken
+        // anywhere inside the copy never releases the lock at all, which turns
+        // the fault into a freeze of the whole parent process.
+        //
+        // The parent's address-space LAYOUT stays frozen across the copy
+        // regardless: that is `aspace_lock`'s job, and it is still held.
+        drop(linux_parent_inner);
         let new_proc = Process::create_with_ext(&parent.job(), "", new_linux_proc)?;
         // Batch the fork's cross-CPU TLB shootdowns into one, but only when
         // the parent has a single thread. That is the condition under which no
@@ -630,9 +663,21 @@ impl ProcessExt for Process {
         if !new_proc.set_status_running() {
             return Err(ZxError::BAD_STATE);
         }
-        linux_parent_inner
-            .children
-            .insert(new_proc.id(), new_proc.clone());
+        {
+            let mut linux_parent_inner = linux_parent.inner.lock();
+            // The parent could have exited while the copy ran. Its death
+            // already drained `children` (`reparent_live_children_to_init`),
+            // so inserting now would strand the child in a dead process's map
+            // where no `wait` will ever look. Skipping the insert is the
+            // correct outcome and not a loss: the child's own termination
+            // callback resolves its reaper with `reaper_for`, which walks past
+            // a dead parent to the nearest subreaper, or to init.
+            if !matches!(parent.status(), Status::Exited(_)) {
+                linux_parent_inner
+                    .children
+                    .insert(new_proc.id(), new_proc.clone());
+            }
+        }
 
         // On termination: reparent this process's own still-live children to
         // INIT, then notify whoever reaps *this* process — its real parent
@@ -11419,6 +11464,23 @@ mod reparenting_tests {
             .lock()
             .reaped_children
             .contains_key(&child)
+    }
+
+    /// `fork_from` releases the parent's big lock for the address-space copy
+    /// and takes it again to insert the child, so the parent can die in
+    /// between. Its death already drained `children`, and an insert after it
+    /// would hide the child in a corpse's map: nothing walks a dead process's
+    /// children again, so no `wait` would ever reach it and its exit status
+    /// would be collected by nobody.
+    #[test]
+    fn a_child_forked_from_a_parent_that_just_died_is_not_stranded_on_it() {
+        let dying = a_process(46_301);
+        dying.exit(0);
+        let child = Process::fork_from(&dying).unwrap();
+        assert!(
+            !holds_child(&dying, child.id()),
+            "the child was filed under a dead parent, where no wait can find it"
+        );
     }
 
     #[test]
