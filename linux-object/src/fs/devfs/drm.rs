@@ -16,7 +16,9 @@ use lock::Mutex;
 use crate::sync::{Event, EventBus};
 use kernel_hal::drivers;
 use kernel_hal::mem::phys_to_virt;
-pub use zcore_drivers::scheme::drm::{DrmCaps, DrmConnector, DrmCrtc, DrmPlane, GemHandle};
+pub use zcore_drivers::scheme::drm::{
+    DrmCaps, DrmConnector, DrmCrtc, DrmPlane, GemAperture, GemHandle,
+};
 use zcore_drivers::scheme::{DisplayScheme, DrmScheme};
 use zircon_object::vm::{pages, MMUFlags, VmObject};
 
@@ -3054,6 +3056,34 @@ pub fn resolve_gem_backing_for(handle_id: u32, pid: u64) -> Option<(u64, usize)>
     zcore_drivers::scheme::gem_mmap::lookup_for(handle_id, pid).map(|(pa, sz)| (pa, sz as usize))
 }
 
+/// Why [`resolve_gem_backing_for`] came back empty, for the line that says so.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnresolvedBacking {
+    /// The GEM exists and is device memory. No host address by design.
+    Vram,
+    /// No such handle, or none this process holds.
+    Unknown,
+}
+
+/// Ask the driver which it was.
+fn unresolved_backing_reason(handle_id: u32) -> UnresolvedBacking {
+    unresolved_backing_from(get_primary_driver().map(|d| d.gem_aperture(handle_id)))
+}
+
+/// The judgement itself, under the driver lookup so a test can make one.
+///
+/// `Sysmem` lands on the generic line on purpose: the driver saying there IS
+/// a host address while the resolver found none is not an aperture problem at
+/// all, it is the ownership check in [`resolve_gem_backing_for`] refusing a
+/// handle this process does not hold -- which is exactly the lifetime bug the
+/// old wording describes.
+fn unresolved_backing_from(aperture: Option<GemAperture>) -> UnresolvedBacking {
+    match aperture {
+        Some(GemAperture::Vram) => UnresolvedBacking::Vram,
+        _ => UnresolvedBacking::Unknown,
+    }
+}
+
 /// Create a framebuffer from a GEM handle
 /// `DRM_FORMAT_XRGB8888` ("XR24"): the format every GL and Vulkan swapchain
 /// on this tree presents, and the one the software scanout consumes.
@@ -3124,11 +3154,31 @@ pub fn create_fb_with_layout(
             // Loud, not a silent `?`: an unresolvable ADDFB2 handle is exactly
             // "the swapchain buffer has no backing the present path can read",
             // and it used to fail with no kernel-side line at all.
-            warn!(
-                "[drm] create_fb (ADDFB2): handle={:#x} not in dumb table nor nouveau GEM \
-                 -- cannot back a framebuffer (the output's present will fail)",
-                handle_id
-            );
+            //
+            // And it has to say WHICH of the two it is. The resolver answers
+            // `None` both for a handle nobody has ever heard of and for a
+            // VRAM-only GEM, and those send whoever reads this line in
+            // opposite directions: the first is a lifetime or ownership bug,
+            // the second is a buffer that exists, is perfectly valid, and
+            // simply has no host address for a CPU present to read. Saying
+            // "not in dumb table nor nouveau GEM" about a VRAM GEM is a lie,
+            // and it is the lie a Vulkan swapchain gets, because NVK renders
+            // into device memory.
+            match unresolved_backing_reason(handle_id) {
+                UnresolvedBacking::Vram => warn!(
+                    "[drm] create_fb (ADDFB2): handle={:#x} is a VRAM-only GEM -- it exists, but \
+                     it has no host physical address (the RM refuses gem_map_cpu for ADDR_FBMEM: \
+                     memdescGetPhysAddr(AT_CPU) of such an object is a VRAM offset, not BAR1), \
+                     so no CPU present can read it. Only the display engine can scan it out, \
+                     which is `nvidia.surfaceflip`",
+                    handle_id
+                ),
+                UnresolvedBacking::Unknown => warn!(
+                    "[drm] create_fb (ADDFB2): handle={:#x} not in dumb table nor nouveau GEM \
+                     -- cannot back a framebuffer (the output's present will fail)",
+                    handle_id
+                ),
+            }
             return None;
         }
     };
@@ -12344,6 +12394,50 @@ mod edid_gate_tests {
 /// the screen itself when the image does not. Getting that backwards is either a
 /// write-combining buffer flushed half-full (a fraction of one blit) or the
 /// framebuffer's row padding painted onto the desktop (pixels a person sees).
+/// An `ADDFB2` that cannot be backed has to say which of the two it is.
+///
+/// `resolve_gem_backing_for` answers `None` for a handle nobody has heard of
+/// and for a VRAM-only GEM alike, and the person reading dmesg needs opposite
+/// things from the two. A Vulkan swapchain gets the second, because NVK
+/// renders into device memory, and the old line told them to go looking for a
+/// handle that was there all along.
+#[cfg(test)]
+mod unresolved_backing_tests {
+    use super::*;
+
+    #[test]
+    fn a_vram_gem_is_not_a_missing_handle() {
+        assert_eq!(
+            unresolved_backing_from(Some(GemAperture::Vram)),
+            UnresolvedBacking::Vram
+        );
+    }
+
+    #[test]
+    fn an_unknown_handle_and_a_driverless_boot_both_read_as_missing() {
+        assert_eq!(
+            unresolved_backing_from(Some(GemAperture::Unknown)),
+            UnresolvedBacking::Unknown
+        );
+        // No primary driver to ask: the generic line, not a VRAM claim we
+        // have nothing to back.
+        assert_eq!(unresolved_backing_from(None), UnresolvedBacking::Unknown);
+    }
+
+    /// The driver claiming a host address while the resolver found none is
+    /// the OWNERSHIP check refusing a handle this process does not hold --
+    /// a lifetime bug, which is what the generic wording describes. Calling
+    /// that one "VRAM-only" would send the reader to the wrong half of the
+    /// kernel.
+    #[test]
+    fn sysmem_that_would_not_resolve_is_an_ownership_bug_not_an_aperture_one() {
+        assert_eq!(
+            unresolved_backing_from(Some(GemAperture::Sysmem)),
+            UnresolvedBacking::Unknown
+        );
+    }
+}
+
 #[cfg(test)]
 mod image_pitch_tests {
     use super::*;

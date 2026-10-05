@@ -57,6 +57,25 @@ pub struct GemHandle {
     pub phys_addr: u64,
 }
 
+/// Where a GEM object's pages live, from the point of view of a caller
+/// deciding whether a CPU present can read them.
+///
+/// `GEM_NEW` allocates either sysmem/GART or VRAM, and the difference is not
+/// cosmetic: a VRAM-only object has no host physical address at all. The RM
+/// refuses `gem_map_cpu` for it, because `memdescGetPhysAddr(AT_CPU)` of an
+/// `ADDR_FBMEM` object is a VRAM offset and not a BAR1 address, so there is
+/// nothing for the CPU present path to read. Only the display engine, which
+/// scans that offset out itself, can serve such a buffer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GemAperture {
+    /// Host RAM (GART). Has a host physical address; every present path works.
+    Sysmem,
+    /// Device memory. No host physical address; only a hardware flip serves it.
+    Vram,
+    /// The driver does not know this handle, or does not track apertures.
+    Unknown,
+}
+
 /// DRM Connector (output)
 #[derive(Debug, Clone, Copy)]
 pub struct DrmConnector {
@@ -593,6 +612,18 @@ pub trait DrmScheme: Scheme {
 
     /// Free a buffer
     fn free_buffer(&self, _handle: GemHandle) {}
+
+    /// Where `handle_id`'s pages live, for a caller that has already failed
+    /// to resolve a host physical address for it.
+    ///
+    /// This exists so that failure can be told apart from a handle that does
+    /// not exist. The two produce the same `None` out of the resolver and
+    /// want opposite things from whoever is debugging: an unknown handle is a
+    /// lifetime or ownership bug, a VRAM handle is a buffer the CPU present
+    /// simply cannot read. Default: nothing tracked.
+    fn gem_aperture(&self, _handle_id: u32) -> GemAperture {
+        GemAperture::Unknown
+    }
 
     /// Create a framebuffer from a GEM handle
     fn create_fb(&self, handle_id: u32, width: u32, height: u32, pitch: u32) -> Option<u32>;
