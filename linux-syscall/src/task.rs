@@ -379,6 +379,29 @@ pub(crate) fn waitid_options(options: u32) -> Result<WaitOptions, LxError> {
     })
 }
 
+/// Whether a thread that just changed its affinity has to leave the CPU it
+/// is running on before `sched_setaffinity` returns.
+///
+/// Linux promises that much: "If the thread is not currently running on one
+/// of the CPUs in `mask`, then that thread is migrated to one of those
+/// CPUs." We can only say it of the *calling* thread, because that is the
+/// one whose CPU we know and the only one we can take off it from here; a
+/// third party's migration stays with the scheduler's own machinery.
+///
+/// A `cpu` the mask cannot even name (>= `MAX_CORE_NUM`) is by definition
+/// not in the mask, so it counts as a CPU to leave. That is also the safe
+/// direction: the worst a needless yield costs is one trip through the
+/// queue, while staying on a forbidden CPU is the bug.
+fn must_leave_this_cpu(is_self: bool, eff: u64, cpu: usize) -> bool {
+    if !is_self {
+        return false;
+    }
+    if cpu >= kernel_hal::config::MAX_CORE_NUM {
+        return true;
+    }
+    eff & (1u64 << cpu) == 0
+}
+
 /// Syscalls for process.
 ///
 /// # Menu
@@ -1477,7 +1500,14 @@ impl Syscall<'_> {
     /// The mask is masked down to the set of online CPUs; an empty effective
     /// mask is rejected with `EINVAL`. See
     /// [linux man sched_setaffinity(2)](https://www.man7.org/linux/man-pages/man2/sched_setaffinity.2.html).
-    pub fn sys_sched_setaffinity(
+    ///
+    /// A caller that pins *itself* away from the CPU it is running on is taken
+    /// off that CPU before the call returns, which is what the man page
+    /// promises. Until now it kept running there until it next blocked: the
+    /// running task is in no queue, so neither the affinity kick nor the
+    /// stranded-task rescue could see it. The yield is what puts it in a queue
+    /// where they can.
+    pub async fn sys_sched_setaffinity(
         &self,
         pid: usize,
         cpusetsize: usize,
@@ -1511,7 +1541,14 @@ impl Syscall<'_> {
         ) {
             return Err(LxError::EPERM);
         }
+        let is_self = thread.id() == self.thread.id();
         thread.set_affinity(eff).map_err(|_| LxError::EINVAL)?;
+        if must_leave_this_cpu(is_self, eff, kernel_hal::cpu::cpu_id() as usize) {
+            // Involuntary: the thread did not ask to cede, it is being moved.
+            // `yield_now` would file it in the voluntary lane, which drains
+            // only once the urgent one is empty.
+            kernel_hal::thread::preempt_now().await;
+        }
         Ok(0)
     }
 
@@ -3909,5 +3946,60 @@ mod nanosleep_rem_tests {
             "rem {:?}",
             slot
         );
+    }
+}
+
+#[cfg(test)]
+mod setaffinity_migration_tests {
+    //! `sched_setaffinity(2)` promises the caller is off a forbidden CPU by the
+    //! time it returns; [`must_leave_this_cpu`] is the decision.
+
+    use super::*;
+
+    /// Pinning yourself to the CPU you are already on moves nobody.
+    #[test]
+    fn a_mask_that_still_allows_this_cpu_moves_nobody() {
+        assert!(!must_leave_this_cpu(true, 0b0001, 0));
+        assert!(!must_leave_this_cpu(true, 0b0110, 1));
+        assert!(!must_leave_this_cpu(true, 0b0110, 2));
+        assert!(!must_leave_this_cpu(true, u64::MAX, 63));
+    }
+
+    /// Pinning yourself away from it is the case the man page names, and the
+    /// case that used to keep running on a CPU the mask forbids.
+    #[test]
+    fn pinning_yourself_off_this_cpu_takes_you_off_it() {
+        assert!(must_leave_this_cpu(true, 0b0010, 0));
+        assert!(must_leave_this_cpu(true, 0b0110, 0));
+        assert!(must_leave_this_cpu(true, 1 << 63, 0));
+        assert!(must_leave_this_cpu(true, 0b0001, 1));
+    }
+
+    /// Re-pinning somebody else never yields *here*: it is not this thread's
+    /// CPU that the mask talks about, and this thread did nothing wrong.
+    #[test]
+    fn re_pinning_a_third_party_never_yields_on_this_cpu() {
+        assert!(!must_leave_this_cpu(false, 0b0010, 0));
+        assert!(!must_leave_this_cpu(false, 0, 0));
+        assert!(!must_leave_this_cpu(false, 0b0001, 1));
+        // Not even the unrepresentable CPU, which for ourselves does yield.
+        assert!(!must_leave_this_cpu(
+            false,
+            u64::MAX,
+            kernel_hal::config::MAX_CORE_NUM
+        ));
+    }
+
+    /// A CPU the mask cannot name is not in the mask, so it is one to leave.
+    /// The range guard must not turn that into "stay".
+    #[test]
+    fn a_cpu_no_mask_can_name_is_a_cpu_to_leave() {
+        let over = kernel_hal::config::MAX_CORE_NUM;
+        assert!(must_leave_this_cpu(true, u64::MAX, over));
+        assert!(must_leave_this_cpu(true, u64::MAX, over + 7));
+        // And the last representable one is still decided by the mask, not by
+        // the guard: an off-by-one in it would show up right here.
+        assert!(!must_leave_this_cpu(true, 1 << (over - 1), over - 1));
+        assert!(must_leave_this_cpu(true, 1 << (over - 2), over - 1));
     }
 }

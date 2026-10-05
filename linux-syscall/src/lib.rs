@@ -499,7 +499,7 @@ impl Syscall<'_> {
                 Ok(0)
             }
             Sys::SCHED_GETAFFINITY => self.sys_sched_getaffinity(a0, a1, a2.into()),
-            Sys::SCHED_SETAFFINITY => self.sys_sched_setaffinity(a0, a1, a2.into()),
+            Sys::SCHED_SETAFFINITY => self.sys_sched_setaffinity(a0, a1, a2.into()).await,
             Sys::SCHED_SETSCHEDULER => self.sys_sched_setscheduler(a0, a1, a2.into()),
             Sys::SCHED_GETSCHEDULER => self.sys_sched_getscheduler(a0),
             Sys::SCHED_SETPARAM => self.sys_sched_setparam(a0, a1.into()),
