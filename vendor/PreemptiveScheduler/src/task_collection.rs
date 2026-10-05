@@ -1085,6 +1085,97 @@ mod collection_tests {
         waker.mark_borrowed(false);
     }
 
+    /// Two threads that do nothing but `sched_yield(2)` on one CPU share it
+    /// evenly, which is what the lane is supposed to do and what the bench said
+    /// it was not doing (547.763 turns against **0 in twenty seconds**).
+    ///
+    /// Here they get 20 and 20. So the lane rotates, and the starvation the
+    /// bench measured is not the lane order -- it is the next test.
+    #[test]
+    fn two_threads_that_only_yield_share_the_cpu_evenly() {
+        let _g = crate::runtime::resched_test_lock();
+        let tc = TaskCollection::new(0);
+        let (a, b) = (tc.add_task(pending(), None), tc.add_task(pending(), None));
+        let (mut n_a, mut n_b) = (0, 0);
+        for _ in 0..40 {
+            let Some((key, _t, waker)) = tc.take_task() else {
+                break;
+            };
+            if key == a {
+                n_a += 1;
+            } else if key == b {
+                n_b += 1;
+            }
+            cede(&waker);
+        }
+        assert_eq!((n_a, n_b), (20, 20), "el carril de cesion no rota");
+    }
+
+    /// **A cession made from a poll that never returns is lost for good.**
+    ///
+    /// This is the `sched_yield()` that does not come back, and it is a property
+    /// of the queue, not of placement: `take_yielded` defers a yielded bit whose
+    /// slot is still *borrowed* -- correctly, because the task already owns a CPU
+    /// -- and re-publishes it. Nothing ever looks at it again until the borrow is
+    /// released. A borrow is released when the poll returns, and a poll parked by
+    /// a mid-poll preemption lives on in a weak executor, which used to be
+    /// resumed only when the run queue drained. A twin in a tight yield loop
+    /// guarantees it never drains.
+    ///
+    /// Measured here: the stuck task is handed out **once** and then never
+    /// again, while its twin takes 39 of the 40 turns; release the borrow and it
+    /// comes straight back. That last part is what says the fix belongs in who
+    /// resumes the frame, not in the lane: the lane never lost the bit.
+    #[test]
+    fn a_cession_from_a_poll_that_never_returns_waits_for_the_borrow() {
+        let _g = crate::runtime::resched_test_lock();
+        let tc = TaskCollection::new(0);
+        let (a, _b) = (tc.add_task(pending(), None), tc.add_task(pending(), None));
+        let mut stuck = None;
+        let (mut n_a, mut n_b) = (0, 0);
+        for round in 0..40 {
+            let Some((key, _t, waker)) = tc.take_task() else {
+                break;
+            };
+            if key == a {
+                n_a += 1;
+            } else {
+                n_b += 1;
+            }
+            if key == a && round == 0 {
+                // Cede from inside the poll, exactly as `YieldFuture` does, and
+                // then never return from it: the borrow stays.
+                crate::runtime::begin_voluntary_yield(Arc::as_ptr(&waker) as usize);
+                waker.wake_by_ref();
+                crate::runtime::end_voluntary_yield();
+                stuck = Some(waker);
+                continue;
+            }
+            cede(&waker);
+        }
+        assert_eq!(
+            (n_a, n_b),
+            (1, 39),
+            "el que cedio desde un poll vivo tendria que quedarse fuera"
+        );
+
+        // Release the borrow -- which is what resuming the weak executor does --
+        // and the task is served again at once.
+        let waker = stuck.expect("la tarea atascada");
+        waker.mark_borrowed(false);
+        let mut back = 0;
+        for _ in 0..10 {
+            let Some((key, _t, waker)) = tc.take_task() else {
+                break;
+            };
+            if key == a {
+                back += 1;
+            }
+            cede(&waker);
+        }
+        assert_eq!(back, 5, "soltar el prestamo la devuelve a la rotacion");
+    }
+
     /// The `--yieldstall` shape of `eclipse-bench` #1690, as the queue sees it:
     /// two threads in a tight `sched_yield(2)` loop and a third waking every
     /// 200 us, all on one CPU. On Linux that sustains ~1M yields/s.

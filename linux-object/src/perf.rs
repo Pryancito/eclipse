@@ -417,7 +417,7 @@ impl Busy {
 /// Render `/proc/perf/kernel`: idle vs busy, timer ticks and per-vector IRQs.
 pub fn kernel_report() -> String {
     let ks = kernel_hal::kstats::snapshot();
-    let (sched_polled, sched_weak) = kernel_hal::kstats::sched_stats();
+    let (sched_polled, sched_weak, sched_weak_turns) = kernel_hal::kstats::sched_stats();
     let uptime_ns = kernel_hal::timer::timer_now().as_nanos() as u64;
     let uptime_s = uptime_ns as f64 / 1e9;
     let total_cpus = kernel_hal::cpu::cpu_count().max(1) as u64;
@@ -708,8 +708,9 @@ pub fn kernel_report() -> String {
     // `sched_polled`/`sched_weak` were sampled above for the attribution summary.
     let _ = writeln!(
         out,
-        "sched: {} task polls ({:.0}/s), {} weak-exec yields ({:.0}/s)",
-        sched_polled, polls_per_s, sched_weak, weak_per_s
+        "sched: {} task polls ({:.0}/s), {} weak-exec yields ({:.0}/s), \
+         {} weak turns with work still queued",
+        sched_polled, polls_per_s, sched_weak, weak_per_s, sched_weak_turns
     );
     {
         let (scans, probed, ok, aff_empty, rebalance, skipped, rescue) =
@@ -720,6 +721,16 @@ pub fn kernel_report() -> String {
              {} rebalance, {} skipped (no peer stealable), {} rescued (pinned \
              away from its owner)",
             scans, probed, ok, aff_empty, rebalance, skipped, rescue
+        );
+        let (fx_ops, fx_probes, fx_hits, fx_walks) = kernel_hal::kstats::futex_stats();
+        let _ = writeln!(
+            out,
+            "futex:        {} ops, {} shared-word searches ({} really shared),              {} VMAR walks ({} per op)",
+            fx_ops,
+            fx_probes,
+            fx_hits,
+            fx_walks,
+            fx_walks.checked_div(fx_ops).unwrap_or(0),
         );
         let (created, peak, cap_hits) = kernel_hal::kstats::sched_weak_stats();
         let (pool, overflow) = kernel_hal::kstats::stack_pool_stats();

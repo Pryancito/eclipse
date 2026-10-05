@@ -511,6 +511,57 @@ pub fn sched_weak_stats() -> (u64, u64, u64) {
     )
 }
 
+/// How many parked weak executors each CPU has waiting for a turn.
+///
+/// A weak executor is a task's poll frozen mid-poll. The frozen frame still
+/// holds that task's **borrow**, and the queue defers a borrowed slot's wakes
+/// (`WakerPage::take_yielded`), so until the frame is resumed the task cannot
+/// run again -- not stolen, not woken, not anything. Resuming them only when the
+/// strong executor runs out of work therefore starves exactly the case where it
+/// never does: two threads doing nothing but `sched_yield(2)` on one CPU
+/// measured 547.763 turns for one and **0 in twenty seconds** for the other,
+/// which is the `sched_yield()` that never returns.
+///
+/// Read at the head of `Executor::run`, so it has to be cheap: one relaxed load
+/// of this CPU's own slot, on a line no other core writes.
+static WEAK_WAITING: [CacheAligned; MAX_CORE_NUM] = [const { CacheAligned::new() }; MAX_CORE_NUM];
+
+/// Publish this CPU's count of parked weak executors.
+fn publish_weak_waiting(live: usize) {
+    let cpu = crate::arch::cpu_id() as usize;
+    if cpu < MAX_CORE_NUM {
+        WEAK_WAITING[cpu].0.store(live as u64, Ordering::Relaxed);
+    }
+}
+
+/// How many parked weak executors this CPU has waiting.
+#[inline]
+pub(crate) fn weak_waiting_here() -> u64 {
+    let cpu = crate::arch::cpu_id() as usize;
+    if cpu >= MAX_CORE_NUM {
+        return 0;
+    }
+    WEAK_WAITING[cpu].0.load(Ordering::Relaxed)
+}
+
+/// Polls the strong executor may take before a parked weak executor gets a turn.
+///
+/// Small, because what is waiting is a task that cannot run at all until the
+/// frame is resumed; large enough that a weak executor which parks again
+/// immediately cannot take the queue over. Eight is one slice's worth of a
+/// yield-heavy loop and a rounding error on anything else.
+pub(crate) const WEAK_TURN_EVERY: u64 = 8;
+
+/// Whether the strong executor should hand the CPU to a parked weak executor
+/// before taking another task.
+///
+/// Pure, so the policy can be tested without an executor: the condition lives
+/// in the hottest loop in the kernel and the two ways to get it wrong -- never
+/// yielding, and yielding every pass -- are a starved task and a starved queue.
+pub(crate) fn weak_turn_due(waiting: u64, polls_since: u64, every: u64) -> bool {
+    waiting != 0 && polls_since >= every
+}
+
 fn note_weak_live(live: usize) {
     let live = live as u64;
     let mut cur = WEAK_PEAK.load(Ordering::Relaxed);
@@ -982,6 +1033,7 @@ impl ExecutorRuntime {
 
     fn add_weak_executor(&mut self, weak_executor: Arc<Pin<Box<Executor>>>) {
         self.weak_executors.push(Some(weak_executor));
+        publish_weak_waiting(self.weak_executors.len());
     }
 
     /// Drop finished weaks so their stacks return to the pool before we allocate
@@ -991,6 +1043,7 @@ impl ExecutorRuntime {
     fn reclaim_finished_weaks(&mut self) {
         self.weak_executors
             .retain(|executor| executor.is_some() && !executor.as_ref().unwrap().killed());
+        publish_weak_waiting(self.weak_executors.len());
     }
 
     fn downgrade_strong_executor(&mut self) {
@@ -1677,6 +1730,7 @@ pub fn run_until_idle() -> bool {
         runtime
             .weak_executors
             .retain(|executor| executor.is_some() && !executor.as_ref().unwrap().killed());
+        publish_weak_waiting(runtime.weak_executors.len());
         for idx in 0..runtime.weak_executors.len() {
             // `.get`, not `[idx]`: the bound above was read under a guard this
             // loop drops and retakes around every `switch`, and an index panic
@@ -3032,6 +3086,54 @@ mod per_cpu_counter_tests {
 
 /// The `STEALABLE` overload hint: what the gate lets through, and the
 /// asymmetry (set by anybody, cleared only by the owner) that makes it safe.
+#[cfg(test)]
+mod weak_turn_tests {
+    //! [`weak_turn_due`], the condition that decides whether a parked weak
+    //! executor gets the CPU while the run queue still has work.
+
+    use super::{weak_turn_due, WEAK_TURN_EVERY};
+
+    /// Nothing parked, nothing to hand the CPU to -- whatever the count of polls
+    /// says. This is the overwhelming majority of passes and it must cost one
+    /// comparison.
+    #[test]
+    fn with_nothing_parked_the_queue_keeps_the_cpu() {
+        assert!(!weak_turn_due(0, 0, WEAK_TURN_EVERY));
+        assert!(!weak_turn_due(0, WEAK_TURN_EVERY, WEAK_TURN_EVERY));
+        assert!(!weak_turn_due(0, u64::MAX, WEAK_TURN_EVERY));
+    }
+
+    /// With something parked, the turn comes at the cadence and not before: a
+    /// weak frame that parks again at once must not be able to take the queue
+    /// over.
+    #[test]
+    fn a_parked_frame_waits_its_cadence_and_then_gets_the_cpu() {
+        for polls in 0..WEAK_TURN_EVERY {
+            assert!(
+                !weak_turn_due(1, polls, WEAK_TURN_EVERY),
+                "cedio a los {} polls, antes de la cadencia",
+                polls
+            );
+        }
+        assert!(weak_turn_due(1, WEAK_TURN_EVERY, WEAK_TURN_EVERY));
+        assert!(weak_turn_due(1, WEAK_TURN_EVERY + 1, WEAK_TURN_EVERY));
+        assert!(weak_turn_due(7, u64::MAX, WEAK_TURN_EVERY));
+    }
+
+    /// The cadence is bounded in both directions, which is the whole point: a
+    /// cadence of zero would hand the CPU over on every pass and starve the
+    /// queue instead.
+    #[test]
+    fn the_cadence_is_what_bounds_it_in_both_directions() {
+        assert!(weak_turn_due(1, 0, 0), "con cadencia cero se cede siempre");
+        assert!(!weak_turn_due(1, 0, 1), "y con uno, no en el primer paso");
+        assert!(weak_turn_due(1, 1, 1));
+        // The real one is small but not zero: a frozen poll holds a task
+        // hostage, so waiting a whole slice for it is the bug being fixed.
+        assert!(WEAK_TURN_EVERY > 0 && WEAK_TURN_EVERY <= 64);
+    }
+}
+
 #[cfg(test)]
 mod stranded_tests {
     use super::*;
