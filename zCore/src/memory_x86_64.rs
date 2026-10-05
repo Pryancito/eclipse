@@ -428,6 +428,32 @@ cfg_if! {
             }
         }
 
+        /// Whether THIS cpu is already inside the kernel heap's critical
+        /// section.
+        ///
+        /// The single most important fact about a kernel fault, and nothing
+        /// printed it. The heap lock is an IRQ-off ticket mutex, so a fault
+        /// taken while holding it cannot be recovered from on this CPU and
+        /// cannot be reported through anything that allocates: every other CPU
+        /// that reaches the allocator then spins until the deadlock detector
+        /// gives up eight seconds later, which is what
+        ///
+        /// ```text
+        /// DEADLOCK: spinlock(s) stuck >8s  cpu=7 at zCore/src/memory_x86_64.rs:1507
+        /// HOLDER cpu=11 at zCore/src/memory_x86_64.rs:1507, now at
+        ///   ZcoreKernelHandler::handle_page_fault+0x1002
+        /// ```
+        ///
+        /// is: line 1507 is `self.0.lock()` in `dealloc`, so cpu 11 took the
+        /// buddy's lock to free a block, faulted inside the buddy -- its free
+        /// lists are intrusive, a wild write into them is a fault on the next
+        /// walk -- and went into the fault handler still holding it. Reading
+        /// that off three reports and a line number took a build with matching
+        /// sources; the fault path can just say so.
+        pub fn heap_held_by_current_cpu() -> bool {
+            HEAP_ALLOCATOR.0.held_by_current_cpu()
+        }
+
         /// The heap lock was found held **by this very CPU** at the moment we
         /// were about to block on it.
         ///
@@ -1519,6 +1545,15 @@ cfg_if! {
 
         pub fn heap_total() -> usize {
             0
+        }
+
+        /// No kernel heap of our own under `libos`: the host allocator is not
+        /// a lock this kernel can be inside. Unused there -- the fault paths
+        /// that ask are bare-metal only -- and kept so the two arms of the
+        /// `cfg_if` expose the same surface.
+        #[allow(dead_code)]
+        pub fn heap_held_by_current_cpu() -> bool {
+            false
         }
     }
 }

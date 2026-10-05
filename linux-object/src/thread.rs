@@ -52,6 +52,52 @@ pub trait CurrentThreadExt {
     fn exit_linux(&self, exit_code: i32);
 }
 
+/// The `Thread::ext` fat pointer's DATA word has been overwritten, and the
+/// `downcast_ref` just handed out a `&Mutex<LinuxThread>` built on it.
+///
+/// Same blind spot as [`ext_data_word_overwritten`][crate::process] on the
+/// process side: the `TypeId` a downcast checks lives in the vtable word, so a
+/// data word replaced on its own leaves the downcast succeeding and the
+/// reference pointing at an address nobody built the object at. Here the very
+/// next thing is `.lock()`, which writes -- so the symptom is a page fault at
+/// that address plus the mutex's own offset, inside `TicketMutex::lock`, with
+/// nothing on screen about the thread or the field.
+///
+/// Nothing here dereferences the ext.
+#[cold]
+#[inline(never)]
+fn thread_ext_data_word_overwritten(thread: &Thread) -> ! {
+    let (data, vtable) = thread.ext_fat();
+    let (born_data, born_vtable) = thread.ext_born();
+    panic!(
+        "Thread::lock_linux(): tid={} pid={} -- the ext DATA word was overwritten and the \
+         downcast could not see it (the TypeId lives in the vtable word, which is {}). \
+         fat data={:#x} vtable={:#x}, at birth data={:#x} vtable={:#x} -> {}; canaries {}. \
+         Refusing to lock a Mutex<LinuxThread> at {:#x}: acquiring it would fault at \
+         {:#x}+offset and halt the machine naming the mutex instead of this thread",
+        thread.id(),
+        thread.proc().id(),
+        if vtable == born_vtable {
+            "intact"
+        } else {
+            "also moved"
+        },
+        data,
+        vtable,
+        born_data,
+        born_vtable,
+        thread.ext_drift().describe(),
+        match thread.ext_canaries() {
+            (true, true) => "both INTACT: a precise write to ext alone",
+            (false, true) => "LOW broken: overrun growing upward from below",
+            (true, false) => "HIGH broken: overrun growing downward from above",
+            (false, false) => "BOTH broken: wide overrun across the field",
+        },
+        data,
+        data,
+    )
+}
+
 impl ThreadExt for Thread {
     fn create_linux(proc: &Arc<Process>) -> ZxResult<Arc<Self>> {
         Self::create_linux_with(proc, LinuxThread::initial())
@@ -80,7 +126,8 @@ impl ThreadExt for Thread {
         // See Process::linux(): a failed downcast means a non-Linux thread
         // leaked into a Linux-only path or the ext Box was corrupted. Identify
         // the thread/process so the panic names the culprit.
-        self.ext()
+        let m = self
+            .ext()
             .downcast_ref::<Mutex<LinuxThread>>()
             .unwrap_or_else(|| {
                 // Same evidence as Process::linux(): the fat pointer now, the
@@ -139,12 +186,24 @@ impl ThreadExt for Thread {
                         (false, false) => "BOTH broken: wide overrun across the field",
                     },
                 )
-            })
-            .lock()
+            });
+        // The downcast vouches for the vtable word only -- see
+        // `thread_ext_data_word_overwritten`. Ask about the data word BEFORE
+        // `.lock()` writes through it.
+        if self.ext_drift().data_moved() {
+            thread_ext_data_word_overwritten(self);
+        }
+        m.lock()
     }
 
     fn try_lock_linux(&self) -> Option<MutexGuard<'_, LinuxThread>> {
-        Some(self.ext().downcast_ref::<Mutex<LinuxThread>>()?.lock())
+        let m = self.ext().downcast_ref::<Mutex<LinuxThread>>()?;
+        // Not a `None` case: the ext IS a Mutex<LinuxThread>, its address is
+        // what moved, and answering "no Linux thread" would hide the write.
+        if self.ext_drift().data_moved() {
+            thread_ext_data_word_overwritten(self);
+        }
+        Some(m.lock())
     }
 
     /// Set pointer to thread ID.

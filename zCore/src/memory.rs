@@ -359,6 +359,14 @@ pub fn heap_available() -> bool {
     }
 }
 
+/// Whether THIS cpu is already inside the heap's critical section (mirrors
+/// `memory_x86_64::heap_held_by_current_cpu`).
+#[allow(dead_code)]
+pub fn heap_held_by_current_cpu() -> bool {
+    use lock::HeldByCurrentCpu;
+    HEAP.0.held_by_current_cpu()
+}
+
 /// Total bytes managed by the heap (mirrors `memory_x86_64::heap_total`).
 #[allow(dead_code)]
 pub fn heap_total() -> usize {

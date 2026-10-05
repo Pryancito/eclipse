@@ -367,20 +367,20 @@ pub enum FsError {
     /// from `NoDeviceSpace` (ENOSPC): DRM GEM/`CREATE_DUMB` and oversized
     /// syncobj arrays are ENOMEM on Linux, not "disk full".
     NoMemory,
-    DirRemoved,    // E_NOENT, when the current dir was remove by a previous unlink
-    DirNotEmpty,   // E_NOTEMPTY
-    WrongFs,       // E_INVAL, when we find the content on disk is wrong when opening the device
+    DirRemoved,  // E_NOENT, when the current dir was remove by a previous unlink
+    DirNotEmpty, // E_NOTEMPTY
+    WrongFs,     // E_INVAL, when we find the content on disk is wrong when opening the device
     DeviceError,
     IOCTLError,
     NoDevice,
-    Again,          // E_AGAIN, when no data is available, never happens in fs
-    TimedOut,       // E_TIME (62), a wait reached its deadline -- e.g. DRM_IOCTL_SYNCOBJ_WAIT
-    SymLoop,        // E_LOOP
-    NameTooLong,    // E_NAMETOOLONG, e.g. a symlink target past `SYMLINK_MAX`
-    Busy,           // E_BUSY
-    ReadOnly,       // E_ROFS
-    Interrupted,    // E_INTR
-    NoPermission,   // E_ACCES, e.g. modeset ioctls on a DRM render node
+    Again,        // E_AGAIN, when no data is available, never happens in fs
+    TimedOut,     // E_TIME (62), a wait reached its deadline -- e.g. DRM_IOCTL_SYNCOBJ_WAIT
+    SymLoop,      // E_LOOP
+    NameTooLong,  // E_NAMETOOLONG, e.g. a symlink target past `SYMLINK_MAX`
+    Busy,         // E_BUSY
+    ReadOnly,     // E_ROFS
+    Interrupted,  // E_INTR
+    NoPermission, // E_ACCES, e.g. modeset ioctls on a DRM render node
     /// E_PERM (1): the operation is forbidden for this object, not merely
     /// for this caller's credentials. Distinct from `NoPermission` (EACCES):
     /// Linux's `DESTROYPROPBLOB` on a kernel-owned blob is EPERM, while a
