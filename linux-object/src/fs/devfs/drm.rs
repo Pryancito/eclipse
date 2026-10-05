@@ -6002,6 +6002,12 @@ lazy_static::lazy_static! {
 }
 
 /// Current synthetic vblank period in nanoseconds (at least 1).
+///
+/// Only the tests ask for the period on its own. Every production reader wants
+/// the period AND something else off the lattice -- the counter, a boundary --
+/// and takes them under one lock, because two reads could straddle a modeset
+/// and disagree about which refresh they were describing.
+#[cfg(test)]
 #[inline]
 fn vblank_period_ns() -> u64 {
     VBLANK_LATTICE.lock().period_ns
@@ -7858,32 +7864,41 @@ pub fn get_plane(id: u32) -> Option<DrmPlane> {
     // for why asking `software_kms_active()` here made advertised ids come
     // back EINVAL mid-probe. The synthetic id is still served without
     // touching a driver.
-    if id != SYNTH_PLANE_ID {
+    let mut plane = if id != SYNTH_PLANE_ID {
         // Driver calls run with DRM_STATE released — see `snapshot_drivers`.
-        for driver in snapshot_drivers() {
-            if let Some(mut plane) = driver.get_plane(id) {
-                let crtc_fb = DRM_STATE.lock().crtc_fb;
-                if crtc_fb != 0 {
-                    plane.fb_id = crtc_fb;
-                }
-                return Some(plane);
-            }
+        snapshot_drivers()
+            .into_iter()
+            .find_map(|driver| driver.get_plane(id))?
+    } else {
+        // No framebuffer display, no synthetic plane -- `get_connector` and
+        // `get_crtc` gate their synthetic objects on `display_mode()` for the
+        // same reason. Without it a headless primary node would report zero
+        // planes from GETPLANERESOURCES and still answer GETPLANE(4), which
+        // is a topology no client can reconcile.
+        display_mode()?;
+        DrmPlane {
+            id: SYNTH_PLANE_ID,
+            crtc_id: SYNTH_CRTC_ID,
+            fb_id: 0,
+            possible_crtcs: 1, // bitmask: CRTC index 0
+            plane_type: 1,     // DRM_PLANE_TYPE_PRIMARY
         }
-        return None;
+    };
+    // `drm_mode_getplane` reports `plane->state->crtc` and `->fb`, both NULL
+    // once the pipe is disabled (a `SETCRTC` without a mode, an `RMFB` of the
+    // scanout) and both kept under DPMS off. The core's `crtc_fb` is the
+    // framebuffer on the one primary plane, in the DRM id namespace: the
+    // driver's own fb id (its own namespace) must not reach userspace, and
+    // the synthetic plane used to report no framebuffer at all and a CRTC
+    // even with nothing on it.
+    if plane.plane_type == 1 {
+        let crtc_fb = DRM_STATE.lock().crtc_fb;
+        plane.fb_id = crtc_fb;
+        if crtc_fb == 0 {
+            plane.crtc_id = 0;
+        }
     }
-    // No framebuffer display, no synthetic plane -- `get_connector` and
-    // `get_crtc` gate their synthetic objects on `display_mode()` for the same
-    // reason. Without it a headless primary node would report zero planes from
-    // GETPLANERESOURCES and still answer GETPLANE(4), which is a topology no
-    // client can reconcile.
-    display_mode()?;
-    Some(DrmPlane {
-        id: SYNTH_PLANE_ID,
-        crtc_id: SYNTH_CRTC_ID,
-        fb_id: 0,
-        possible_crtcs: 1, // bitmask: CRTC index 0
-        plane_type: 1,     // DRM_PLANE_TYPE_PRIMARY
-    })
+    Some(plane)
 }
 
 /// Put the process-wide output state a present depends on back to its defaults.
