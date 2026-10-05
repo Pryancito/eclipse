@@ -1674,6 +1674,9 @@ impl Drop for DrmFileState {
         // hold only a Weak to us; drain any that still name this file so a
         // later tick does not clear FLIP_EVENT_PENDING for a stranger's flip.
         cancel_pending_timers_for_file(self as *const DrmFileState);
+        // And frees the property blobs the file created
+        // (`drm_property_destroy_user_blobs`); they were kept for ever.
+        destroy_blobs_of(self as *const DrmFileState as usize);
     }
 }
 
@@ -1808,9 +1811,14 @@ struct DrmBlob {
     /// Whether userspace created it (`CREATEPROPBLOB`). Kernel-created blobs
     /// (current mode, EDID) refuse `DESTROYPROPBLOB` with EPERM like Linux.
     user_created: bool,
-    /// Pid that created a user blob; 0 for kernel-owned. Only this pid may
-    /// `DESTROYPROPBLOB` it (Linux: `blob->file_priv` ownership).
-    owner_pid: u64,
+    /// The open file that created it (its [`DrmFileState`] address; 0 for
+    /// the kernel's own): Linux's `file_priv->blobs`, the list
+    /// `drm_mode_destroyblob_ioctl` checks before freeing ("ensure the
+    /// property was actually created by this user", EPERM otherwise) and
+    /// `drm_release` frees. Without it any client could free any other's:
+    /// the compositor's `MODE_ID` blob going away under it makes its next
+    /// commit fail with ENOENT.
+    owner: usize,
     data: Vec<u8>,
 }
 
@@ -6364,16 +6372,30 @@ pub fn vblank_deadline_for_seq(target: u32) -> Option<Duration> {
 /// creator) from kernel-owned ones (current mode), mirroring Linux's
 /// ownership rule.
 pub fn create_blob(data: Vec<u8>, user_created: bool) -> u32 {
+    create_blob_owned(data, user_created, 0)
+}
+
+/// [`create_blob`] on behalf of the open file `owner` (see [`DrmBlob::owner`]).
+pub fn create_blob_owned(data: Vec<u8>, user_created: bool, owner: usize) -> u32 {
     let mut state = DRM_STATE.lock();
     let id = state.next_blob_id;
     state.next_blob_id += 1;
     state.blobs.push(DrmBlob {
         id,
         user_created,
-        owner_pid: if user_created { current_pid() } else { 0 },
+        owner,
         data,
     });
     id
+}
+
+/// `drm_release`'s `drm_property_destroy_user_blobs`: the blobs the open file
+/// `owner` created go with it.
+pub fn destroy_blobs_of(owner: usize) {
+    DRM_STATE
+        .lock()
+        .blobs
+        .retain(|b| !(b.user_created && b.owner == owner));
 }
 
 /// Look up a blob's contents (`DRM_IOCTL_MODE_GETPROPBLOB`).
@@ -6394,18 +6416,17 @@ pub enum BlobDestroy {
     NotFound,
     /// Kernel-created blob (current mode, …): only the creator may destroy.
     KernelOwned,
-    /// User blob owned by another process.
+    /// Another open file's blob (EPERM, like the kernel's).
     NotOwner,
 }
 
-/// Destroy a user-created blob owned by the calling process.
-pub fn destroy_blob(id: u32) -> BlobDestroy {
-    let pid = current_pid();
+/// Destroy a user-created blob, on behalf of the open file `owner`.
+pub fn destroy_blob(id: u32, owner: usize) -> BlobDestroy {
     let mut state = DRM_STATE.lock();
     match state.blobs.iter().position(|b| b.id == id) {
         None => BlobDestroy::NotFound,
         Some(pos) if !state.blobs[pos].user_created => BlobDestroy::KernelOwned,
-        Some(pos) if state.blobs[pos].owner_pid != pid => BlobDestroy::NotOwner,
+        Some(pos) if state.blobs[pos].owner != owner => BlobDestroy::NotOwner,
         Some(pos) => {
             state.blobs.remove(pos);
             BlobDestroy::Destroyed
@@ -6769,7 +6790,7 @@ pub fn atomic_commit(
                     state.blobs.push(DrmBlob {
                         id,
                         user_created: false,
-                        owner_pid: 0,
+                        owner: 0,
                         data,
                     });
                     state.atomic.mode_blob_id = id;

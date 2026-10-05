@@ -147,6 +147,13 @@ impl DrmDev {
         &self.file
     }
 
+    /// This open's identity for what the DRM core keeps per `drm_file`
+    /// (property blobs): the address of its state, which lives exactly as
+    /// long as the open does.
+    fn file_owner(&self) -> usize {
+        Arc::as_ptr(&self.file) as usize
+    }
+
     /// Sleep until the vblank a blocking `DRM_IOCTL_WAIT_VBLANK` asked for.
     ///
     /// Called from `sys_ioctl` (async) *before* the request reaches
@@ -2547,7 +2554,10 @@ impl DrmDev {
                 let src = unsafe {
                     core::slice::from_raw_parts(req.data as *const u8, req.length as usize)
                 };
-                req.blob_id = drm::create_blob(src.to_vec(), true);
+                // On this file's list, as `drm_mode_createblob_ioctl` puts
+                // it on `file_priv->blobs`: only this open may destroy it,
+                // and it goes when the open does.
+                req.blob_id = drm::create_blob_owned(src.to_vec(), true, self.file_owner());
                 log::debug!(
                     "[drm] CREATEPROPBLOB len={} -> blob={}",
                     req.length,
@@ -2558,10 +2568,14 @@ impl DrmDev {
             DRM_IOCTL_MODE_DESTROYPROPBLOB => {
                 // struct drm_mode_destroy_blob { __u32 blob_id; }
                 let blob_id = unsafe { *(data as *const u32) };
-                match drm::destroy_blob(blob_id) {
+                match drm::destroy_blob(blob_id, self.file_owner()) {
                     drm::BlobDestroy::Destroyed => Ok(0),
                     drm::BlobDestroy::NotFound => Err(FsError::EntryNotFound),
-                    // Linux: kernel-owned or another client's blob → EPERM.
+                    // EPERM: "ensure the property was actually created by
+                    // this user" (another open file's blob), and the kernel's
+                    // own, which is on no file's list. Any client could free
+                    // any other's, and the compositor's MODE_ID blob going
+                    // away under it makes its next commit fail with ENOENT.
                     drm::BlobDestroy::KernelOwned | drm::BlobDestroy::NotOwner => {
                         Err(FsError::NotPermitted)
                     }
@@ -13904,6 +13918,7 @@ mod blob_id_space_tests {
     //! files. Now the bases are named, the encoding is one pair of functions,
     //! and the gap between them is a compile-time assertion.
 
+    use super::gl_client_sequence_tests::Client;
     use super::*;
 
     #[test]
@@ -13976,13 +13991,22 @@ mod blob_id_space_tests {
         assert!(b > a, "ids must not repeat");
         assert_eq!(drm::get_blob(a).as_deref(), Some(&[1u8, 2, 3][..]));
 
-        assert!(matches!(drm::destroy_blob(a), drm::BlobDestroy::Destroyed));
+        assert!(matches!(
+            drm::destroy_blob(a, 0),
+            drm::BlobDestroy::Destroyed
+        ));
         assert_eq!(drm::get_blob(a), None);
         let c = drm::create_blob(alloc::vec![5u8], true);
         assert!(c > b, "a freed id came back: {} after {}", c, b);
 
-        assert!(matches!(drm::destroy_blob(b), drm::BlobDestroy::Destroyed));
-        assert!(matches!(drm::destroy_blob(c), drm::BlobDestroy::Destroyed));
+        assert!(matches!(
+            drm::destroy_blob(b, 0),
+            drm::BlobDestroy::Destroyed
+        ));
+        assert!(matches!(
+            drm::destroy_blob(c, 0),
+            drm::BlobDestroy::Destroyed
+        ));
     }
 
     /// Linux splits `DESTROYPROPBLOB`'s refusals: ENOENT for an id that names
@@ -13994,7 +14018,7 @@ mod blob_id_space_tests {
         let _serialised = drm::test_globals::lock();
         let kernel = drm::create_blob(alloc::vec![0u8; 68], false);
         assert!(
-            matches!(drm::destroy_blob(kernel), drm::BlobDestroy::KernelOwned),
+            matches!(drm::destroy_blob(kernel, 0), drm::BlobDestroy::KernelOwned),
             "a kernel-owned blob must answer EPERM, not vanish",
         );
         assert!(
@@ -14003,13 +14027,78 @@ mod blob_id_space_tests {
         );
 
         assert!(matches!(
-            drm::destroy_blob(drm::BLOB_ID_BASE - 1),
+            drm::destroy_blob(drm::BLOB_ID_BASE - 1, 0),
             drm::BlobDestroy::NotFound
         ));
         assert!(matches!(
-            drm::destroy_blob(edid_blob_id(2)),
+            drm::destroy_blob(edid_blob_id(2), 0),
             drm::BlobDestroy::NotFound
         ));
+    }
+    /// `drm_mode_destroyblob_ioctl` frees a blob only for the file that
+    /// created it ("ensure the property was actually created by this user",
+    /// EPERM otherwise), and `drm_release` frees what a file leaves behind.
+    /// Any client could destroy any other's -- the compositor's MODE_ID blob
+    /// going away under it makes its next commit fail with ENOENT -- and a
+    /// closed client's blobs were kept for ever.
+    #[test]
+    fn a_blob_belongs_to_the_file_that_created_it_and_dies_with_it() {
+        let _serialised = drm::test_globals::lock();
+        let owner = Client::open(0);
+        let other = Client::open(0);
+        let create = |c: &Client| {
+            let bytes = [7u8; 68];
+            let mut blob = DrmModeCreateBlob {
+                data: bytes.as_ptr() as u64,
+                length: bytes.len() as u32,
+                blob_id: 0,
+            };
+            c.ioctl(DRM_IOCTL_MODE_CREATEPROPBLOB, &mut blob)
+                .expect("CREATEPROPBLOB");
+            blob.blob_id
+        };
+        let destroy = |c: &Client, id: u32| {
+            let mut id = id;
+            c.ioctl(DRM_IOCTL_MODE_DESTROYPROPBLOB, &mut id)
+        };
+
+        let id = create(&owner);
+        assert_eq!(
+            destroy(&other, id),
+            Err(FsError::NotPermitted),
+            "another file's blob"
+        );
+        // Readable by anyone: the lookup has no owner check.
+        let mut get = DrmModeGetBlob {
+            blob_id: id,
+            length: 0,
+            data: 0,
+        };
+        assert_eq!(other.ioctl(DRM_IOCTL_MODE_GETPROPBLOB, &mut get), Ok(0));
+        assert_eq!(get.length, 68);
+        assert_eq!(destroy(&owner, id), Ok(0));
+        assert_eq!(destroy(&owner, id), Err(FsError::EntryNotFound), "twice");
+
+        let kernel = drm::create_blob(alloc::vec![0u8; 68], false);
+        assert_eq!(
+            destroy(&owner, kernel),
+            Err(FsError::NotPermitted),
+            "the kernel's own"
+        );
+
+        let left_behind = create(&owner);
+        let kept = create(&other);
+        drop(owner);
+        assert!(
+            drm::get_blob(left_behind).is_none(),
+            "a closed file's blob outlived it"
+        );
+        assert!(
+            drm::get_blob(kept).is_some(),
+            "and took a stranger's with it"
+        );
+        assert_eq!(destroy(&other, left_behind), Err(FsError::EntryNotFound));
+        assert_eq!(destroy(&other, kept), Ok(0));
     }
 }
 
