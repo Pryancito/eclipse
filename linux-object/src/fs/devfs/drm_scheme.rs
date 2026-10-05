@@ -1437,17 +1437,27 @@ impl DrmDev {
                 // compositor's scanout framebuffer, after which every SETCRTC
                 // and PAGE_FLIP on it fails and wlroots retries the modeset
                 // forever.
-                if drm::rmfb_for(fb_id, drm::current_pid()) {
+                //
+                // And the CRTC showing this framebuffer goes off with it, as
+                // `drm_framebuffer_remove` disables it (the blank of a VT
+                // switch under Xorg's modesetting, which RMFBs its scanout
+                // buffer on leaving). This arm only dropped the object, so
+                // the panel kept showing a frame the client had freed and
+                // GETCRTC said the CRTC was on. The process-exit sweep
+                // keeps the last frame for the console restore, as before.
+                if drm::rmfb_disabling_for(fb_id, drm::current_pid()) {
                     Ok(0)
                 } else {
                     Err(FsError::EntryNotFound)
                 }
             }
             DRM_IOCTL_MODE_CLOSEFB => {
-                // Our software-KMS `rmfb` already only drops the fb object —
-                // scanout keeps showing the last blitted frame until the next
-                // present — which is exactly CLOSEFB's "close without
-                // disabling" contract. An id that is not the caller's is
+                // `drm_mode_closefb_ioctl` drops the file's reference and
+                // nothing else: the CRTC keeps scanning the buffer out
+                // ("close without disabling", what RMFB above is not). The
+                // object goes from the table here, so GETCRTC reports fb 0
+                // where Linux would keep naming it. An id that is not the
+                // caller's is
                 // ENOENT, as in `drm_mode_closefb_ioctl` (the lookup and the
                 // "is it in this file's list" check both answer that) and as
                 // RMFB above already did; this arm said EINVAL.
@@ -10343,26 +10353,24 @@ mod kms_scanout_tests {
         c.destroy_dumb(buf.handle).expect("DESTROY_DUMB");
     }
 
-    /// Destroying the framebuffer that is ON THE SCREEN must not stop the pointer
-    /// being drawn, or leave the one already drawn behind as a ghost.
+    /// Destroying the framebuffer that is ON THE SCREEN turns the pipe off, and
+    /// the next whole frame brings the pointer back with nothing left behind.
     ///
-    /// `RMFB` of the framebuffer bound to the CRTC sets `crtc_fb` to 0 (see
-    /// `rmfb_for`), and a client does that on every surface resize -- wlroots
-    /// whenever a buffer leaves its pool. `repaint_for_cursor` used to give up on
-    /// a zero `crtc_fb` because the OLD pointer path read the client's buffer, and
-    /// the panel path that replaced it does not. So the move drew nothing, while
-    /// the snapshot it had already taken moved `cursor.drawn` to where the pointer
-    /// was going: the image at the old place was never erased, and the next move
-    /// erased a window that had nothing in it. A pointer-shaped ghost on the
-    /// desktop until something presented a whole frame.
-    ///
-    /// The panel still holds a perfectly good frame through all of this -- our
-    /// present copied it -- so there is nothing to bail out for.
-    ///
-    /// Found by the soak, one step after it learned to destroy and remake the
-    /// framebuffer the panel is holding.
+    /// `drm_mode_rmfb` goes through `drm_framebuffer_remove`, and on an atomic
+    /// driver `atomic_remove_fb` disables the CRTC whose primary plane showed
+    /// the fb (mode NULL, `active = false`): the output goes dark, which is why
+    /// no compositor removes the framebuffer it is scanning out (wlroots keeps
+    /// the buffer locked until the next flip has landed). This test used to
+    /// expect the panel to keep the freed frame, which is what the kernel did
+    /// before it followed Linux here. What it guards is the pointer across that
+    /// state: a move while the pipe is off draws nothing, because there is no
+    /// scanout to draw on, and when a client puts a whole frame up again the
+    /// pointer arrives at its latest position with no ghost of the old one --
+    /// the fault this was written for was a move with `crtc_fb == 0` that moved
+    /// the bookkeeping (`cursor.drawn`) without moving the image.
     #[test]
-    fn a_pointer_still_draws_after_the_framebuffer_on_screen_is_destroyed() {
+    fn destroying_the_framebuffer_on_screen_turns_the_pipe_off_and_the_pointer_comes_back_with_the_next_frame(
+    ) {
         const W: u32 = 120;
         const H: u32 = 96;
         const CUR: u32 = 16;
@@ -10387,28 +10395,62 @@ mod kms_scanout_tests {
         panel.cursor = Some((20, 20, CUR, CUR));
         panel.check(&screen, "the pointer is on the frame");
 
-        // The client drops the framebuffer it presented. Its pixels are still on
-        // the panel, because the present copied them; what is gone is the id.
+        // The client drops the framebuffer it presented: the CRTC that showed
+        // it is disabled, so the panel goes dark, pointer included.
         c.rmfb(fb).expect("RMFB the framebuffer on the CRTC");
         assert_eq!(
             drm::crtc_fb(),
             0,
-            "this test is pointless unless RMFB really unbinds the CRTC's framebuffer"
+            "RMFB really unbinds the CRTC's framebuffer"
         );
+        assert!(
+            drm::crtc_blanked(),
+            "RMFB of the framebuffer on the CRTC disables it (atomic_remove_fb)"
+        );
+        let dark = |what: &str| {
+            for y in 0..H {
+                for x in 0..W {
+                    assert_eq!(
+                        screen.pixel(x, y),
+                        0,
+                        "{}: pixel ({}, {}) is lit",
+                        what,
+                        x,
+                        y
+                    );
+                }
+            }
+        };
+        dark("the pipe went dark");
 
-        // A move, with no framebuffer bound. The pointer has to arrive at the new
-        // place AND leave the old one as it was before it got there.
+        // A move with the pipe off: nothing to draw on, so nothing is drawn --
+        // and nothing of the old image is left to find later.
         move_cursor(&c, drm::SYNTH_CRTC_ID, 60, 40);
+        dark("a pointer move on a dark pipe");
+
+        // The client puts a whole frame up again. The pointer is where it was
+        // last moved to, and nowhere else.
+        let buf2 = c.create_dumb(W, H);
+        paint(&buf2, |x, y| desktop_px(2, x, y));
+        let fb2 = c.addfb2(&buf2);
+        set_crtc(&c, drm::SYNTH_CRTC_ID, fb2, W, H);
+        drain_completions(&c);
+        let mut panel = Panel::new(W, H, 2, bmp.clone(), CUR);
         panel.cursor = Some((60, 40, CUR, CUR));
-        panel.check(&screen, "the pointer moved with no framebuffer bound");
+        panel.check(
+            &screen,
+            "the frame came back with the pointer at its new place",
+        );
 
         // And it still comes off entirely.
         set_cursor(&c, drm::SYNTH_CRTC_ID, 0, 0, 0, 0, 0);
         panel.cursor = None;
-        panel.check(&screen, "the pointer was hidden with no framebuffer bound");
+        panel.check(&screen, "the pointer was hidden");
 
+        c.rmfb(fb2).expect("RMFB");
         c.destroy_dumb(cur.handle).expect("DESTROY_DUMB cursor");
         c.destroy_dumb(buf.handle).expect("DESTROY_DUMB");
+        c.destroy_dumb(buf2.handle).expect("DESTROY_DUMB 2");
     }
 
     /// A pointer straddling the right edge of a framebuffer SMALLER than the mode
@@ -10993,22 +11035,43 @@ mod kms_scanout_tests {
                 }
                 17 => {
                     // The client DESTROYS the framebuffer the panel is scanning
-                    // out and makes another one from the same buffer, which is
-                    // what a client does when it resizes or drops a surface. The
-                    // panel keeps the pixels -- our present copied them -- so
-                    // nothing on the screen may change, and the pointer still has
-                    // to work afterwards even though the fb id it came from is
-                    // gone.
+                    // out and makes another one from the same buffer. In Linux
+                    // `drm_framebuffer_remove` disables the CRTC that showed it
+                    // (`atomic_remove_fb`), so the panel goes dark, pointer and
+                    // all, until a whole frame goes up again -- which is what a
+                    // client that remade its framebuffer does next, and what
+                    // keeps a compositor from ever removing the fb on screen.
+                    // (Only when it IS the fb on the CRTC: after a narrow present
+                    // or a damage flush into the other buffer the CRTC holds a
+                    // different one, and removing this one touches nothing.)
+                    let on_crtc = drm::crtc_fb() == fbs[slot];
                     c.rmfb(fbs[slot])
                         .expect("RMFB the framebuffer on the panel");
+                    if on_crtc {
+                        assert_eq!(
+                            screen.pixel(0, 0),
+                            0,
+                            "step {}: RMFB of the fb on the CRTC left the pipe lit",
+                            step
+                        );
+                    }
                     fbs[slot] = c.addfb2(&bufs[slot]);
-                    // The panel holds the pixels of a framebuffer that does not
-                    // exist any more, so no damage box may be honoured on its own
-                    // until something presents a whole frame again.
-                    panel_fb = 0;
+                    let f = frame;
+                    paint(&bufs[slot], |x, y| desktop_px(f, x, y));
+                    set_crtc(&c, drm::SYNTH_CRTC_ID, fbs[slot], W, H);
+                    drain_completions(&c);
+                    model.present(frame);
+                    panel_fb = fbs[slot];
+                    model.cursor = if shown {
+                        Some((pos.0, pos.1, cur_sz, cur_sz))
+                    } else {
+                        None
+                    };
                     what = alloc::format!(
-                        "step {}: the framebuffer on the panel was destroyed and remade",
-                        step
+                        "step {}: the framebuffer on the panel was destroyed, the pipe \
+                         went dark, and frame {} went up on the remade one",
+                        step,
+                        frame
                     );
                 }
                 _ => {
@@ -11511,6 +11574,60 @@ mod kms_scanout_tests {
         c.rmfb(fb).expect("RMFB");
         c.destroy_dumb(cur.handle).expect("DESTROY_DUMB cursor");
         c.destroy_dumb(buf.handle).expect("DESTROY_DUMB");
+    }
+
+    /// `drm_mode_rmfb` removes the framebuffer and, through
+    /// `drm_framebuffer_remove`, disables the CRTC that was showing it; a
+    /// framebuffer that is not on the CRTC goes without touching it; and
+    /// `CLOSEFB` only drops the object, the scanout stays. Here RMFB never
+    /// turned anything off: the panel kept a frame the client had freed and
+    /// the CRTC read as on.
+    #[test]
+    fn removing_the_framebuffer_on_the_crtc_turns_it_off_and_closing_it_does_not() {
+        let screen = kms_emu::attach(64, 16);
+        let c = Client::open(0);
+        let fb_of = |base: u32| {
+            let buf = c.create_dumb(64, 16);
+            paint(&buf, |x, y| tag(base, x, y));
+            c.addfb2(&buf)
+        };
+        let fb_a = fb_of(0x0077_0000);
+        let fb_b = fb_of(0x0088_0000);
+        let fb_c = fb_of(0x0099_0000);
+
+        c.page_flip(drm::SYNTH_CRTC_ID, fb_a, 0xF00D).expect("flip");
+        assert_eq!(screen.pixel(3, 2), tag(0x0077_0000, 3, 2));
+
+        // A framebuffer that is not on the CRTC: nothing changes on screen.
+        let mut id = fb_b;
+        assert_eq!(c.ioctl(DRM_IOCTL_MODE_RMFB, &mut id), Ok(0));
+        assert!(
+            !drm::crtc_blanked(),
+            "removing another fb turned the CRTC off"
+        );
+        assert_eq!(screen.pixel(3, 2), tag(0x0077_0000, 3, 2));
+        assert_eq!(drm::crtc_fb(), fb_a);
+
+        // The one being scanned out: the CRTC goes off with it.
+        let mut id = fb_a;
+        assert_eq!(c.ioctl(DRM_IOCTL_MODE_RMFB, &mut id), Ok(0));
+        assert!(drm::crtc_blanked(), "the CRTC stayed on without its fb");
+        assert_eq!(screen.pixel(3, 2), 0, "the panel kept the freed frame");
+        assert_eq!(drm::crtc_fb(), 0);
+
+        // CLOSEFB: the object goes, the scanout stays.
+        c.page_flip(drm::SYNTH_CRTC_ID, fb_c, 0xF00E).expect("flip");
+        assert!(!drm::crtc_blanked());
+        let mut id = fb_c;
+        assert_eq!(c.ioctl(DRM_IOCTL_MODE_CLOSEFB, &mut id), Ok(0));
+        assert!(!drm::crtc_blanked(), "CLOSEFB turned the CRTC off");
+        assert_eq!(screen.pixel(3, 2), tag(0x0099_0000, 3, 2));
+        let mut id = fb_c;
+        assert_eq!(
+            c.ioctl(DRM_IOCTL_MODE_RMFB, &mut id),
+            Err(FsError::EntryNotFound),
+            "a closed fb is gone"
+        );
     }
 }
 

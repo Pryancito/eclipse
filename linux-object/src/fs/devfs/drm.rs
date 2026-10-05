@@ -3162,22 +3162,45 @@ pub fn retire_framebuffers_for_handle(handle_id: u32) -> usize {
 /// that is not on the calling file's list, and it does not tell a prober
 /// whether someone else's framebuffer exists.
 pub fn rmfb_for(fb_id: u32, pid: u64) -> bool {
-    let handle_id = {
+    remove_fb(fb_id, pid).is_some()
+}
+
+/// `drm_mode_rmfb`: the framebuffer goes, and when it was the one on the
+/// CRTC the CRTC goes off with it -- `drm_framebuffer_remove` runs
+/// `atomic_remove_fb`, which disables every plane and CRTC still showing
+/// the framebuffer, which is why a VT switch under Xorg blanks and why
+/// `CLOSEFB` (see [`rmfb_for`], which is all CLOSEFB does) was added. This
+/// tree's RMFB only dropped the object: the panel kept showing a frame
+/// the client had just freed, and `GETCRTC` said the CRTC was on.
+pub fn rmfb_disabling_for(fb_id: u32, pid: u64) -> bool {
+    match remove_fb(fb_id, pid) {
+        Some(on_crtc) => {
+            if on_crtc {
+                set_crtc_blanked(true);
+            }
+            true
+        }
+        None => false,
+    }
+}
+
+/// The removal itself: `None` when `fb_id` is not a framebuffer of `pid`,
+/// else whether it was the CRTC's framebuffer at the time.
+fn remove_fb(fb_id: u32, pid: u64) -> Option<bool> {
+    let (handle_id, on_crtc) = {
         let mut state = DRM_STATE.lock();
-        let Some(pos) = state
+        let pos = state
             .framebuffers
             .iter()
-            .position(|f| f.id == fb_id && owned_by(f.owner, pid))
-        else {
-            return false;
-        };
+            .position(|f| f.id == fb_id && owned_by(f.owner, pid))?;
         let fb = state.framebuffers.remove(pos);
         state.fb_backing.retain(|(id, _)| *id != fb_id);
-        if state.crtc_fb == fb_id {
+        let on_crtc = state.crtc_fb == fb_id;
+        if on_crtc {
             state.crtc_fb = 0;
         }
         note_fb_retired(&mut state, fb_id, FbRetired::Removed);
-        fb.gem_handle_id
+        (fb.gem_handle_id, on_crtc)
     };
     // Outside the lock, and only once the fb is really gone: this is the fb's
     // half of the GEM object's lifetime. For a dumb buffer the `fb_backing`
@@ -3185,7 +3208,7 @@ pub fn rmfb_for(fb_id: u32, pid: u64) -> bool {
     // has already closed its own handle then dropping it here is what finally
     // returns the memory to the RM -- the `RMFB` that Linux frees on too.
     fb_drop_gem_ref(handle_id);
-    true
+    Some(on_crtc)
 }
 
 /// [`rmfb_for`] for the kernel's own teardown paths, which own everything.

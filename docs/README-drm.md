@@ -120,7 +120,7 @@ Leyenda: ✅ implementado · 🟡 parcial / no-op deliberado · ❌ no implement
 |---|---|---|
 | `DRM_IOCTL_MODE_ADDFB` | ✅ | |
 | `DRM_IOCTL_MODE_ADDFB2` | ✅ | usa `handles[0]`/`pitches[0]` |
-| `DRM_IOCTL_MODE_RMFB` | ✅ | |
+| `DRM_IOCTL_MODE_RMFB` | ✅ | apaga el CRTC que mostraba el fb, como `drm_framebuffer_remove` (la salida de proceso conserva la última imagen para la restauración de consola) |
 | `DRM_IOCTL_MODE_CLOSEFB` | ✅ | Linux 6.6+: suelta la referencia sin apagar el plano |
 | `DRM_IOCTL_MODE_GETFB` | ✅ | devuelve geometría + handle (cliente master único) |
 | `DRM_IOCTL_MODE_GETFB2` | ✅ | formato `XR24`, plano 0 |
