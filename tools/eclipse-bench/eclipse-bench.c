@@ -713,8 +713,18 @@ static double sched_thread_spawn_ns(uint64_t budget_ns) {
 // futex all the way down -- so its round trip bounds how fast two threads can
 // hand work to each other. Distinct from the pipe row: no file descriptors, no
 // data copy, just sleep/wake through the kernel.
-#define ECL_FUTEX_WAIT 0
-#define ECL_FUTEX_WAKE 1
+// FUTEX_PRIVATE_FLAG. Without it every call below takes the INTER-PROCESS
+// path, which has to resolve the word through the address space -- on Eclipse
+// that walks the VMAR twice per operation. musl's pthread_mutex, pthread_cond
+// and sem_t all set the private flag, so a bench that leaves it off reports a
+// cost almost no real program pays, in the row people read as "a futex wake".
+// Private is therefore the default here; the shared variants are kept so the
+// difference can be measured and shown rather than silently chosen.
+#define ECL_FUTEX_PRIVATE 128
+#define ECL_FUTEX_WAIT (0 | ECL_FUTEX_PRIVATE)
+#define ECL_FUTEX_WAKE (1 | ECL_FUTEX_PRIVATE)
+#define ECL_FUTEX_WAIT_SHARED 0
+#define ECL_FUTEX_WAKE_SHARED 1
 
 static volatile int g_fx_ping, g_fx_pong;
 static volatile int g_fx_stop;
@@ -2179,6 +2189,8 @@ struct wake_slot {
     volatile int stop;
     volatile int pin_failed;
     volatile int done_exit;
+    int wait_op;            // private or shared: see ECL_FUTEX_PRIVATE
+    int wake_op;
 };
 static struct wake_slot g_wake[WAKE_MAX];
 
@@ -2188,7 +2200,7 @@ static void *wake_sleeper(void *arg) {
         s->pin_failed = 1;
     for (;;) {
         while (s->word == 0 && !s->stop)
-            futex_op(&s->word, ECL_FUTEX_WAIT, 0);
+            futex_op(&s->word, s->wait_op, 0);
         if (s->stop)
             break;
         s->word = 0;
@@ -2205,7 +2217,7 @@ static void *wake_sleeper(void *arg) {
 // necessarily serialize there, and timing that would report the CPU's width as
 // though it were the cost of a wake.
 static double wake_burst_ns(int m, int waker_cpu, int target_cpu,
-                            uint64_t budget_ns) {
+                            uint64_t budget_ns, int private_word) {
     if (m < 1 || m > WAKE_MAX)
         return NA;
     pthread_t th[WAKE_MAX];
@@ -2213,6 +2225,10 @@ static double wake_burst_ns(int m, int waker_cpu, int target_cpu,
     for (int i = 0; i < m; i++) {
         memset(&g_wake[i], 0, sizeof g_wake[i]);
         g_wake[i].cpu = target_cpu;
+        g_wake[i].wait_op =
+            private_word ? ECL_FUTEX_WAIT : ECL_FUTEX_WAIT_SHARED;
+        g_wake[i].wake_op =
+            private_word ? ECL_FUTEX_WAKE : ECL_FUTEX_WAKE_SHARED;
     }
     for (int i = 0; i < m; i++) {
         if (pthread_create(&th[i], NULL, wake_sleeper, &g_wake[i]) != 0)
@@ -2234,7 +2250,7 @@ static double wake_burst_ns(int m, int waker_cpu, int target_cpu,
             uint64_t t0 = now_ns();
             for (int i = 0; i < m; i++) {
                 g_wake[i].word = 1;
-                futex_op(&g_wake[i].word, ECL_FUTEX_WAKE, 1);
+                futex_op(&g_wake[i].word, g_wake[i].wake_op, 1);
             }
             issue_ns += now_ns() - t0;
             // Untimed: let every target wake, run and park again, so the next
@@ -2244,11 +2260,17 @@ static double wake_burst_ns(int m, int waker_cpu, int target_cpu,
             uint64_t spins = 0;
             for (int i = 0; i < m; i++) {
                 while (!g_wake[i].done) {
-                    sched_yield();
+                    // A short sleep, NOT sched_yield(): this wait is outside
+                    // the clock, so parking costs the measurement nothing, and
+                    // yielding here made the whole row read n/a on exactly the
+                    // kernels whose yield starves its caller -- losing the
+                    // coalescing figure on the one machine it mattered for.
+                    struct timespec tick = {0, 50 * 1000};
+                    nanosleep(&tick, NULL);
                     // Same three bounds as the hand-off probe: a sleeper that
                     // is never woken must cost this probe its number, not the
                     // whole run.
-                    if (++spins > YIELD_CAP || g_watchdog_fired ||
+                    if (++spins > 600000 || g_watchdog_fired ||
                         now_ns() > guard) {
                         bad = 1;
                         break;
@@ -2271,7 +2293,7 @@ static double wake_burst_ns(int m, int waker_cpu, int target_cpu,
     for (int i = 0; i < made; i++) {
         g_wake[i].stop = 1;
         g_wake[i].word = 1;
-        futex_op(&g_wake[i].word, ECL_FUTEX_WAKE, 1);
+        futex_op(&g_wake[i].word, g_wake[i].wake_op, 1);
     }
     for (int i = 0; i < made; i++)
         join_or_abandon(th[i], &g_wake[i].done_exit, 5);
@@ -3893,11 +3915,24 @@ int main(int argc, char **argv) {
             int burst = ncpu * 2 > WAKE_MAX ? WAKE_MAX : ncpu * 2;
             if (burst < 2)
                 burst = 2;
-            double one = wake_burst_ns(1, 0, 1, g_short_ns);
-            double many = wake_burst_ns(burst, 0, 1, g_short_ns);
+            // Private word: what musl's pthread primitives actually use, so
+            // this is the cost a real program pays.
+            double one = wake_burst_ns(1, 0, 1, g_short_ns, 1);
+            double many = wake_burst_ns(burst, 0, 1, g_short_ns, 1);
+            // Shared word: the inter-process path, which has to resolve the
+            // address through the VMAR. Reported next to it because the gap is
+            // the resolution cost, and because the bench used to measure ONLY
+            // this one while labelling it "a futex wake".
+            double one_sh = wake_burst_ns(1, 0, 1, g_short_ns, 0);
             char lbl[64];
             row("[kernel]", "wake issue, 1 target",
-                one < 0 ? NA : one / 1000.0, "us", "");
+                one < 0 ? NA : one / 1000.0, "us", "private word (what musl uses)");
+            row("[kernel]", "wake issue, 1 target, shared word",
+                one_sh < 0 ? NA : one_sh / 1000.0, "us",
+                "inter-process path: resolves through the VMAR");
+            if (one > 0 && one_sh > 0)
+                row("[kernel]", "  shared / private", one_sh / one, "x",
+                    ">1 = the address resolution is the cost");
             snprintf(lbl, sizeof lbl, "wake issue, %d in a burst", burst);
             row("[kernel]", lbl, many < 0 ? NA : many / 1000.0, "us",
                 "per target");
