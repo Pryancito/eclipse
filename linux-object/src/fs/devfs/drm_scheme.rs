@@ -743,6 +743,52 @@ impl DrmDev {
     /// `drm_ioctl()` does.
     #[allow(unsafe_code)]
     fn drm_ioctl_dispatch(&self, cmd: u32, data: usize) -> Result<usize> {
+        let r = self.drm_ioctl_dispatch_inner(cmd, data);
+        // Every REFUSAL of a KMS query, on its own klog channel.
+        //
+        // Mesa's `wsi_get_connectors()` is the first thing all three
+        // `VK_KHR_display` entry points call, and it turns ANY failure of
+        // `drmModeGetResources` / `drmModeGetConnector` into
+        // `VK_ERROR_OUT_OF_HOST_MEMORY` -- which is the error `vulkaninfo`
+        // dies with on real RTX hardware. So "which query refused, on which
+        // object, with which errno" is the whole diagnosis, and it has to
+        // survive a boot: the per-arm traces logged it on the SAME 48-line
+        // budget as the success trace above, and a two-GPU probe (three entry
+        // points, each a count pass and a fill pass, every connector id in
+        // each) spends that budget on successes long before it reaches the
+        // call that fails. The line that explains the error never printed.
+        //
+        // This channel is therefore separate, and deduped by (nr, object id)
+        // rather than merely counted, so libdrm's `goto retry` loop cannot
+        // storm the console with one repeated refusal either. It also covers
+        // the two paths that had NO trace at all: `GETRESOURCES` /
+        // `GETPLANERESOURCES` (no object id to key an arm on), and the
+        // render-node `DRM_RENDER_ALLOW` rejection above -- a client whose
+        // display fd landed on `renderD128` gets EACCES from GETRESOURCES
+        // and the identical OUT_OF_HOST_MEMORY, with nothing in dmesg.
+        if let Err(e) = &r {
+            if let Some(name) = wsi_query_name(cmd) {
+                let id = wsi_query_object_id(cmd, data);
+                if wsi_fail_take(cmd & 0xff, id) {
+                    kernel_hal::klog_info!(
+                        "[drm-wsi] REFUSED {} id={} pid={} minor={} -> {:?} \
+                         (Mesa turns this into VK_ERROR_OUT_OF_HOST_MEMORY)",
+                        name,
+                        id,
+                        drm::current_pid(),
+                        self.minor,
+                        e
+                    );
+                }
+            }
+        }
+        r
+    }
+
+    /// The body of [`DrmDev::drm_ioctl_dispatch`]; see its wrapper for the
+    /// refusal trace that wraps it.
+    #[allow(unsafe_code)]
+    fn drm_ioctl_dispatch_inner(&self, cmd: u32, data: usize) -> Result<usize> {
         // NOTE `data` is NOT necessarily a user address here: [`drm_ioctl`] hands
         // this a kernel bounce buffer whenever it had to reconcile a struct size,
         // exactly as `drm_ioctl_kernel()` hands the handler `kdata`. The
@@ -770,16 +816,7 @@ impl DrmDev {
         // sequence and which one refused. Bounded noise: these six only fire
         // at client startup / probe time, never per frame.
         {
-            let wsi_name = match cmd {
-                DRM_IOCTL_MODE_GETRESOURCES => Some("GETRESOURCES"),
-                DRM_IOCTL_MODE_GETCONNECTOR => Some("GETCONNECTOR"),
-                DRM_IOCTL_MODE_GETENCODER => Some("GETENCODER"),
-                DRM_IOCTL_MODE_GETCRTC => Some("GETCRTC"),
-                DRM_IOCTL_MODE_GETPLANERESOURCES => Some("GETPLANERESOURCES"),
-                DRM_IOCTL_MODE_GETPLANE => Some("GETPLANE"),
-                _ => None,
-            };
-            if let Some(name) = wsi_name {
+            if let Some(name) = wsi_query_name(cmd) {
                 if wsi_trace_take() {
                     kernel_hal::klog_info!(
                         "[drm-wsi] pid={} {} (minor={})",
@@ -2286,16 +2323,10 @@ impl DrmDev {
                     }
                     Ok(0)
                 } else {
-                    // klog: this refusal makes Mesa's wsi_display bail the whole
-                    // VK_KHR_display query with OUT_OF_HOST_MEMORY -- it must be
-                    // visible under LOG=error. Same per-boot budget as the call
-                    // trace: a retry loop on a refused id must not storm klog.
-                    if wsi_trace_take() {
-                        kernel_hal::klog_info!(
-                            "[drm-wsi] GETCONNECTOR id={} -> NOT FOUND (ENOENT)",
-                            conn_res.connector_id
-                        );
-                    }
+                    // The refusal itself is traced by the dispatch wrapper, on
+                    // the channel a success storm cannot silence: this is the
+                    // one that makes Mesa's wsi_display bail the whole
+                    // VK_KHR_display query with OUT_OF_HOST_MEMORY.
                     // ENOENT, as `drm_mode_getconnector`'s lookup answers.
                     Err(FsError::EntryNotFound)
                 }
@@ -2349,12 +2380,6 @@ impl DrmDev {
                     }
                     Ok(0)
                 } else {
-                    if wsi_trace_take() {
-                        kernel_hal::klog_info!(
-                            "[drm-wsi] GETCRTC id={} -> NOT FOUND (ENOENT)",
-                            crtc_res.crtc_id
-                        );
-                    }
                     // ENOENT, as `drm_mode_getcrtc`'s lookup answers.
                     Err(FsError::EntryNotFound)
                 }
@@ -2405,12 +2430,6 @@ impl DrmDev {
                     res.count_format_types = FORMATS.len() as u32;
                     Ok(0)
                 } else {
-                    if wsi_trace_take() {
-                        kernel_hal::klog_info!(
-                            "[drm-wsi] GETPLANE id={} -> NOT FOUND (ENOENT)",
-                            res.plane_id
-                        );
-                    }
                     // ENOENT, as `drm_mode_getplane`'s lookup answers.
                     Err(FsError::EntryNotFound)
                 }
@@ -5578,6 +5597,97 @@ fn write_out_fence_ptr(ptr: u64, test_only: bool) -> Result<()> {
 /// ~48 lines cover a full vulkaninfo VK_KHR_display probe sequence with room
 /// to spare; after that the tracer goes silent for the rest of the boot and
 /// says so once.
+/// The six KMS query ioctls Mesa's `wsi_display` issues, by the name a
+/// dmesg reader recognises. `None` for anything else.
+fn wsi_query_name(cmd: u32) -> Option<&'static str> {
+    match cmd {
+        DRM_IOCTL_MODE_GETRESOURCES => Some("GETRESOURCES"),
+        DRM_IOCTL_MODE_GETCONNECTOR => Some("GETCONNECTOR"),
+        DRM_IOCTL_MODE_GETENCODER => Some("GETENCODER"),
+        DRM_IOCTL_MODE_GETCRTC => Some("GETCRTC"),
+        DRM_IOCTL_MODE_GETPLANERESOURCES => Some("GETPLANERESOURCES"),
+        DRM_IOCTL_MODE_GETPLANE => Some("GETPLANE"),
+        _ => None,
+    }
+}
+
+/// The DRM object a KMS query asks about, for the refusal trace: `0` for the
+/// two that enumerate rather than name one (`GETRESOURCES`,
+/// `GETPLANERESOURCES`), since those carry no id at all.
+///
+/// The id is a different field in each struct -- `drm_mode_get_connector`
+/// puts `connector_id` after four pointers and three counts, `drm_mode_crtc`
+/// puts `crtc_id` second -- so this reads each one by name rather than
+/// assuming a common prefix, which would print a pointer as an id.
+#[allow(unsafe_code)]
+fn wsi_query_object_id(cmd: u32, data: usize) -> u32 {
+    unsafe {
+        match cmd {
+            DRM_IOCTL_MODE_GETCONNECTOR => (*(data as *const DrmModeGetConnector)).connector_id,
+            DRM_IOCTL_MODE_GETENCODER => (*(data as *const DrmModeGetEncoder)).encoder_id,
+            DRM_IOCTL_MODE_GETCRTC => (*(data as *const DrmModeGetCrtc)).crtc_id,
+            DRM_IOCTL_MODE_GETPLANE => (*(data as *const DrmModeGetPlane)).plane_id,
+            _ => 0,
+        }
+    }
+}
+
+/// Whether to klog this refusal of a KMS query. Separate from
+/// [`wsi_trace_take`] on purpose: a refusal is the one line worth a boot, and
+/// it must not be spent by the successes that precede it.
+///
+/// Deduped by `(nr, object id)` rather than merely counted, because libdrm
+/// retries (`drmModeGetConnector`'s `goto retry`) and a client that polls the
+/// KMS queries would otherwise repeat one refusal until the budget is gone.
+/// Each distinct refusal prints once; the table is small and fixed, so a
+/// client inventing ids cannot grow it -- past the last slot the channel
+/// simply stops, after saying so.
+fn wsi_fail_take(nr: u32, id: u32) -> bool {
+    use core::sync::atomic::{AtomicBool, AtomicU64};
+    static SEEN: [AtomicU64; WSI_FAIL_SLOTS] = [const { AtomicU64::new(0) }; WSI_FAIL_SLOTS];
+    static FULL_SAID: AtomicBool = AtomicBool::new(false);
+    wsi_fail_take_in(&SEEN, &FULL_SAID, nr, id)
+}
+
+/// How many distinct refusals one boot reports.
+const WSI_FAIL_SLOTS: usize = 16;
+
+/// [`wsi_fail_take`] over a caller-supplied table.
+///
+/// The seam is here, BELOW the global, rather than around the whole function:
+/// the kernel and a test run the identical claim-a-slot code, and a test gets
+/// its own table instead of competing for the one every other test in this
+/// binary is also filling through the dispatch wrapper.
+fn wsi_fail_take_in(
+    seen: &[core::sync::atomic::AtomicU64],
+    full_said: &core::sync::atomic::AtomicBool,
+    nr: u32,
+    id: u32,
+) -> bool {
+    use core::sync::atomic::Ordering;
+    // `(nr << 32) | id`, +1 so a zeroed slot reads as "empty" rather than as
+    // "GETRESOURCES on object 0" -- which is exactly the entry GETRESOURCES
+    // would claim, and the one refusal that needs no id to be worth printing.
+    let key = (((nr as u64) << 32) | id as u64) + 1;
+    for slot in seen.iter() {
+        match slot.compare_exchange(0, key, Ordering::Relaxed, Ordering::Relaxed) {
+            // Claimed an empty slot: first sight of this refusal.
+            Ok(_) => return true,
+            // Occupied. By this same refusal? Then it has been reported.
+            Err(prev) if prev == key => return false,
+            Err(_) => continue,
+        }
+    }
+    if !full_said.swap(true, Ordering::Relaxed) {
+        kernel_hal::klog_info!(
+            "[drm-wsi] {} distinct KMS-query refusals reported -- silencing the rest \
+             for this boot",
+            seen.len()
+        );
+    }
+    false
+}
+
 fn wsi_trace_take() -> bool {
     use core::sync::atomic::{AtomicU32, Ordering};
     static BUDGET: AtomicU32 = AtomicU32::new(0);
@@ -18525,5 +18635,167 @@ mod wsi_display_probe_tests {
         let (crtcs, conns, _) = drm_mode_get_resources(&c).expect("GETRESOURCES");
         assert_eq!(crtcs, alloc::vec![2001]);
         assert_eq!(conns, alloc::vec![1001]);
+    }
+}
+
+/// The refusal channel of the `VK_KHR_display` probe.
+///
+/// Mesa turns any failing KMS query into `VK_ERROR_OUT_OF_HOST_MEMORY`, so the
+/// one thing a boot has to produce is *which* query refused *which* object.
+/// These cover the two ways that line used to be lost: it shared its budget
+/// with the successes, and it was keyed on nothing, so a retry loop repeated
+/// it instead of other refusals being reported.
+#[cfg(test)]
+mod wsi_refusal_trace_tests {
+    use super::*;
+
+    /// The id a refusal names comes from a different field in each struct, so
+    /// a common-prefix read would print a pointer. The two enumerating
+    /// queries name no object at all and must say `0`, not whatever word
+    /// happens to sit at their front (`fb_id_ptr`, `plane_id_ptr`).
+    #[test]
+    fn each_query_reports_the_object_it_actually_asked_about() {
+        let conn = DrmModeGetConnector {
+            encoders_ptr: 0xdead_0001,
+            modes_ptr: 0xdead_0002,
+            props_ptr: 0xdead_0003,
+            prop_values_ptr: 0xdead_0004,
+            count_modes: 1,
+            count_props: 5,
+            count_encoders: 1,
+            encoder_id: 77,
+            connector_id: 1001,
+            connector_type: 11,
+            connector_type_id: 1,
+            connection: 1,
+            mm_width: 0,
+            mm_height: 0,
+            subpixel: 0,
+            pad: 0,
+        };
+        assert_eq!(
+            wsi_query_object_id(DRM_IOCTL_MODE_GETCONNECTOR, &conn as *const _ as usize),
+            1001,
+            "GETCONNECTOR must report connector_id, not the encoder before it"
+        );
+
+        let crtc = DrmModeGetCrtc {
+            set_connectors_ptr: 0xdead_0005,
+            count_connectors: 0,
+            crtc_id: 2001,
+            fb_id: 0,
+            x: 0,
+            y: 0,
+            gamma_size: 0,
+            mode_valid: 0,
+            mode: [0; 68],
+        };
+        assert_eq!(
+            wsi_query_object_id(DRM_IOCTL_MODE_GETCRTC, &crtc as *const _ as usize),
+            2001
+        );
+
+        let plane = DrmModeGetPlane {
+            plane_id: 3001,
+            crtc_id: 0,
+            fb_id: 0,
+            possible_crtcs: 1,
+            gamma_size: 0,
+            count_format_types: 0,
+            format_type_ptr: 0,
+        };
+        assert_eq!(
+            wsi_query_object_id(DRM_IOCTL_MODE_GETPLANE, &plane as *const _ as usize),
+            3001
+        );
+
+        let enc = DrmModeGetEncoder {
+            encoder_id: 4001,
+            encoder_type: 6,
+            crtc_id: 0,
+            possible_crtcs: 1,
+            possible_clones: 0,
+        };
+        assert_eq!(
+            wsi_query_object_id(DRM_IOCTL_MODE_GETENCODER, &enc as *const _ as usize),
+            4001
+        );
+
+        // The enumerating pair: no object, and their first word is a pointer.
+        let res = DrmModeGetPlaneRes {
+            plane_id_ptr: 0x7fff_dead_beef,
+            count_planes: 2,
+        };
+        assert_eq!(
+            wsi_query_object_id(DRM_IOCTL_MODE_GETPLANERESOURCES, &res as *const _ as usize),
+            0,
+            "GETPLANERESOURCES names no object; it must not print its pointer"
+        );
+        // And an ioctl that is not a KMS query is not on this channel at all.
+        assert!(wsi_query_name(DRM_IOCTL_SYNCOBJ_CREATE).is_none());
+        assert_eq!(
+            wsi_query_name(DRM_IOCTL_MODE_GETRESOURCES),
+            Some("GETRESOURCES")
+        );
+    }
+
+    /// The claim-a-slot rule, over a table of this test's own: the kernel's
+    /// is global and every other test in this binary fills it through the
+    /// dispatch wrapper, so capacity there is nobody's to assert.
+    ///
+    /// What has to hold: a repeated refusal prints once (libdrm's
+    /// `drmModeGetConnector` retries, and a client that polls the KMS queries
+    /// must not storm the console), a *different* refusal still gets through
+    /// after it (the bug that hid the failing connector behind everything
+    /// logged before it), and the table stops rather than grows when a client
+    /// invents ids.
+    #[test]
+    fn a_repeated_refusal_prints_once_and_never_crowds_out_a_new_one() {
+        use core::sync::atomic::{AtomicBool, AtomicU64};
+        const GETCONNECTOR_NR: u32 = 0xA7;
+        const GETRESOURCES_NR: u32 = 0xA0;
+        const SLOTS: usize = 4;
+        let seen: [AtomicU64; SLOTS] = [const { AtomicU64::new(0) }; SLOTS];
+        let full = AtomicBool::new(false);
+        let take = |nr, id| wsi_fail_take_in(&seen, &full, nr, id);
+
+        assert!(take(GETCONNECTOR_NR, 1001), "first sight prints");
+        assert!(
+            !take(GETCONNECTOR_NR, 1001),
+            "the same refusal, repeated, is silent"
+        );
+        assert!(
+            take(GETCONNECTOR_NR, 1002),
+            "a different connector is a different refusal"
+        );
+        assert!(
+            take(GETRESOURCES_NR, 0),
+            "object 0 on another query is its own entry, not an empty slot"
+        );
+        assert!(
+            !take(GETRESOURCES_NR, 0),
+            "...and it is remembered like any other"
+        );
+
+        // Three slots spent on three distinct refusals; one left.
+        assert!(take(GETCONNECTOR_NR, 1003));
+        assert!(
+            !take(GETCONNECTOR_NR, 1004),
+            "past the last slot the channel goes quiet"
+        );
+        // A refusal already in the table is still recognised as a repeat
+        // rather than re-reported now that the table is full.
+        assert!(!take(GETCONNECTOR_NR, 1001));
+
+        // The one pair that collides with the empty-slot sentinel: without
+        // the +1 the key for `(0, 0)` IS zero, so claiming the slot leaves it
+        // reading as empty and the same refusal prints for ever.
+        let fresh: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+        let fresh_full = AtomicBool::new(false);
+        assert!(wsi_fail_take_in(&fresh, &fresh_full, 0, 0));
+        assert!(
+            !wsi_fail_take_in(&fresh, &fresh_full, 0, 0),
+            "nr 0 / id 0 must be remembered like any other key"
+        );
     }
 }
