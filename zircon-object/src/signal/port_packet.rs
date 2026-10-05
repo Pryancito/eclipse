@@ -654,4 +654,108 @@ mod wire_tests {
             Some(ZxError::NOT_SUPPORTED)
         );
     }
+
+    /// One vcpu packet carrying a startup payload.
+    fn startup(id: u64, entry: u64) -> PacketGuestVcpu {
+        PacketGuestVcpu {
+            data: PacketGuestVcpuData {
+                startup: PacketGuestVcpuStartup { id, entry },
+            },
+            type_: PacketGuestVcpuType::VcpuStartup as u8,
+            _padding1: Default::default(),
+            _reserved: 0,
+        }
+    }
+
+    /// The number each payload goes out under, read from
+    /// `zircon/system/public/zircon/syscalls/port.h` and not from `decode`.
+    ///
+    /// Encoding and decoding are each other's inverse whatever table they
+    /// share, so a round trip cannot see the two of them moved together: a
+    /// signal payload sent as `ZX_PKT_TYPE_SIGNAL_REP` decodes as a signal
+    /// just the same, and the test above even asserts that it does. What
+    /// reads the byte is `sys_port_wait`, which hands it to the waiter as
+    /// `zx_port_packet_t::type` -- where the repeating kind means a packet
+    /// the port keeps queued and the one-shot kind means one it does not.
+    #[test]
+    fn every_payload_goes_out_under_the_number_the_wire_gives_it() {
+        let signal = PacketSignal {
+            trigger: Signal::READABLE,
+            observed: Signal::WRITABLE,
+            count: 1,
+            timestamp: 0,
+            _reserved1: 0,
+        };
+        let interrupt = PacketInterrupt {
+            timestamp: 1,
+            _reserved0: 0,
+            _reserved1: 0,
+            _reserved2: 0,
+        };
+        let cases: [(PayloadRepr, u32); 7] = [
+            (PayloadRepr::User(PacketUser::default()), 0),
+            (PayloadRepr::Signal(signal), 1),
+            (PayloadRepr::GuestBell(PacketGuestBell::default()), 3),
+            (PayloadRepr::GuestMem(PacketGuestMem::default()), 4),
+            (PayloadRepr::GuestIo(PacketGuestIo::default()), 5),
+            (PayloadRepr::GuestVcpu(startup(0, 0)), 6),
+            (PayloadRepr::Interrupt(interrupt), 7),
+        ];
+        for (data, raw) in cases {
+            let repr = PortPacketRepr {
+                key: 9,
+                status: 0,
+                data: data.clone(),
+            };
+            assert_eq!(
+                PortPacket::from(repr).type_,
+                raw,
+                "{:?} went out under the wrong number",
+                data
+            );
+        }
+    }
+
+    /// `_padding1` and `_reserved` are ten of the thirty-two payload bytes a
+    /// process writes, and a packet is compared as the bytes it is: the
+    /// equality here backs `assert_eq!` on decoded packets, so a field it
+    /// skips is a field no test of a vcpu packet can ever see.
+    #[test]
+    fn two_vcpu_packets_that_differ_only_in_their_spare_bytes_are_still_two() {
+        let one = startup(1, 2);
+
+        assert!(
+            !one.eq(&PacketGuestVcpu {
+                _reserved: 1,
+                ..one
+            }),
+            "the reserved word is not compared"
+        );
+        assert!(
+            !one.eq(&PacketGuestVcpu {
+                _padding1: [1, 0, 0, 0, 0, 0, 0],
+                ..one
+            }),
+            "the padding is not compared"
+        );
+    }
+
+    /// The discriminant inside the payload says which member of the union the
+    /// packet has, and comparing the other one reads bytes whoever wrote this
+    /// packet never set.
+    #[test]
+    fn a_startup_vcpu_packet_is_compared_by_the_member_its_own_type_names() {
+        // `entry` is eight bytes and the interrupt member's `vector` is the
+        // first of them, so two startup packets whose entry points differ
+        // anywhere above that byte are one interrupt packet and two startup
+        // ones.
+        assert!(
+            !startup(0, 0x100).eq(&startup(0, 0x200)),
+            "two entry points were compared as one"
+        );
+        assert!(
+            !startup(0x100, 0).eq(&startup(0x200, 0)),
+            "two startup ids were compared as one"
+        );
+    }
 }

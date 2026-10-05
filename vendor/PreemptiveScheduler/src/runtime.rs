@@ -206,11 +206,31 @@ pub fn wakeup_preempt_enabled() -> bool {
 static RESCHED_REQUESTED: AtomicU64 = AtomicU64::new(0);
 static RESCHED_TAKEN: AtomicU64 = AtomicU64::new(0);
 
-/// `(wake-up preemption requests, requests honoured)` since boot.
-pub fn wakeup_preempt_stats() -> (u64, u64) {
+/// Cross-CPU kicks not sent because a request was already pending on the target.
+///
+/// That coalescing is the point of [`NEED_RESCHED`] when the outstanding
+/// request is about to be consumed: a burst of wakes for one CPU costs one
+/// IPI instead of N. It turns into a *latch* when nothing consumes it, because
+/// every later wake for that CPU then takes the same early return and the woken
+/// task waits for whatever interrupt comes next. So this counter is read next
+/// to `taken`/`requests`: a count that climbs while the honoured ratio stays
+/// flat is that latch, not coalescing.
+///
+/// Counted only for a target that is neither halted nor ourselves, so that
+/// every increment is an IPI that a cleared bit would really have sent. A
+/// halted target is kicked anyway a few lines up, and a wake for our own CPU
+/// never sends one: we are already executing here and reach the trap path
+/// without an interrupt. Folding either case in would make the number read as
+/// a latch on a machine that has none.
+static RESCHED_SUPPRESSED: AtomicU64 = AtomicU64::new(0);
+
+/// `(wake-up preemption requests, requests honoured, cross-CPU kicks coalesced
+/// onto a request that was already pending)` since boot.
+pub fn wakeup_preempt_stats() -> (u64, u64, u64) {
     (
         RESCHED_REQUESTED.load(Ordering::Relaxed),
         RESCHED_TAKEN.load(Ordering::Relaxed),
+        RESCHED_SUPPRESSED.load(Ordering::Relaxed),
     )
 }
 
@@ -673,6 +693,8 @@ pub(crate) fn request_resched(owner: u8) {
         // be kicked out of `hlt`, or the wake waits for its next tick.
         if sleeping {
             send_resched_ipi(owner);
+        } else if owner != crate::arch::cpu_id() as usize {
+            RESCHED_SUPPRESSED.fetch_add(1, Ordering::Relaxed);
         }
         return;
     }
@@ -952,9 +974,26 @@ pub fn need_resched_pending() -> bool {
 
 /// Executor-side: drop any pending request for this CPU.
 ///
-/// Called when the run queue is found empty — there is by definition nothing
-/// left to preempt *for*, and leaving the bit set would suppress the coalesced
-/// IPI for the next genuine wake.
+/// Called on every pass of the executor loop, before the run queue is scanned,
+/// and again when that scan comes up empty. The request means "look at your run
+/// queue soon"; an executor about to do exactly that has satisfied it, so the
+/// bit has no reason to outlive the scan.
+///
+/// It matters which side of the scan this is on. The wake publishes its task
+/// (a SeqCst RMW on the waker page) *before* it publishes the request, so a bit
+/// we observe set here is a task our scan is guaranteed to see, and a wake that
+/// lands after the clear finds the bit at 0 and sends a fresh IPI. Clearing
+/// *after* the scan would have neither property.
+///
+/// Leaving it set is what the trap path does deliberately inside the
+/// RUN_TO_PARITY floor, where the request is still owed to a user thread that
+/// may not be preempted yet. Everywhere else a bit nobody consumes is a latch:
+/// `request_resched` takes its already-pending early return for every later
+/// wake to this CPU, so no IPI is sent and each wake waits for the next
+/// interrupt — the 4 ms tick, for a CPU that is not in user mode. The honoured
+/// ratio measured 34-51%, and the comment on [`RESCHED_REQUESTED`] named the
+/// cause before it was looked for: requests raised on CPUs the trap path never
+/// reaches.
 #[inline]
 pub(crate) fn clear_need_resched(cpu: usize) {
     if cpu >= MAX_CORE_NUM {
@@ -3591,12 +3630,88 @@ mod resched_tests {
     #[test]
     fn the_counters_count_requests_and_the_yields_they_caused() {
         let _g = fresh();
-        let (req0, taken0) = wakeup_preempt_stats();
+        let (req0, taken0, _) = wakeup_preempt_stats();
         request_resched(0);
         request_resched(0); // coalesced: not a second request
         assert_eq!(wakeup_preempt_stats().0, req0 + 1);
         assert!(take_need_resched());
         assert_eq!(wakeup_preempt_stats().1, taken0 + 1);
+    }
+
+    /// The latch, stated as a test so it cannot come back unnoticed: while a
+    /// request for a busy CPU goes unconsumed, every later wake for that CPU
+    /// sends no IPI at all, and the woken task waits for whatever interrupt the
+    /// target takes next. Coalescing is only free when something consumes the
+    /// request; this is why the executor clears it before each queue scan.
+    #[test]
+    fn a_request_nobody_consumes_swallows_every_later_wake() {
+        let _g = fresh();
+        let before = wakeup_preempt_stats().2;
+        request_resched(1);
+        assert_eq!(kicks(), 1, "the first wake did not kick at all");
+        request_resched(1);
+        request_resched(1);
+        assert_eq!(kicks(), 1, "a second IPI went out with one request pending");
+        assert_eq!(
+            wakeup_preempt_stats().2 - before,
+            2,
+            "the swallowed wakes were not counted, so the latch stays invisible"
+        );
+    }
+
+    /// …and clearing the bit, which the executor now does before every scan
+    /// rather than only when its queue drains, puts the IPI back.
+    #[test]
+    fn clearing_the_request_puts_the_next_wakes_ipi_back() {
+        let _g = fresh();
+        request_resched(1);
+        request_resched(1);
+        assert_eq!(kicks(), 1);
+        clear_need_resched(1);
+        let suppressed = wakeup_preempt_stats().2;
+        request_resched(1);
+        assert_eq!(kicks(), 2, "the wake after the clear was still swallowed");
+        assert_eq!(
+            wakeup_preempt_stats().2,
+            suppressed,
+            "a wake that did kick was counted as suppressed"
+        );
+    }
+
+    /// A wake for our own CPU never sends an IPI even with the bit clear — we
+    /// are already executing here — so it is not a kick that the latch cost us,
+    /// and counting it would make the number read as a latch on a machine that
+    /// has none.
+    #[test]
+    fn a_wake_for_our_own_cpu_is_not_a_kick_the_latch_swallowed() {
+        let _g = fresh();
+        request_resched(0);
+        assert_eq!(kicks(), 0, "we sent ourselves an interrupt");
+        let suppressed = wakeup_preempt_stats().2;
+        request_resched(0);
+        assert_eq!(
+            wakeup_preempt_stats().2,
+            suppressed,
+            "a kick that was never going to be sent was counted as swallowed"
+        );
+    }
+
+    /// A halted target is the one case the early return still kicks: it has to
+    /// leave `hlt` or the wake waits for its tick. That is a delivered IPI, not
+    /// a suppressed one.
+    #[test]
+    fn a_pending_request_still_kicks_a_target_that_went_to_sleep() {
+        let _g = fresh();
+        request_resched(1);
+        let suppressed = wakeup_preempt_stats().2;
+        set_cpu_sleeping(1, true);
+        request_resched(1);
+        assert_eq!(kicks(), 2, "the halted target was left asleep");
+        assert_eq!(
+            wakeup_preempt_stats().2,
+            suppressed,
+            "a kick that was sent was counted as suppressed"
+        );
     }
 
     #[test]

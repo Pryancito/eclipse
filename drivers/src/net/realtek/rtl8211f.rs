@@ -32,6 +32,16 @@ const BUDGET: usize = DMA_DESC_RX / 4;
 const TX_THRESH: usize = DMA_DESC_TX / 4;
 
 const MAX_BUF_SZ: u32 = 2048 - 1;
+// The descriptor's buffer-size field is 11 bits wide and every writer masks with
+// it (`desc_buf_set`, and `new` inline), so a size that does not fit is not
+// clamped -- it is truncated. 2048 masks to **zero**, and a receive descriptor
+// with a zero-length buffer is one the DMA has nowhere to put a frame in: the
+// receive path would go silent with every register reading healthy. Checked here
+// rather than in a test because neither value changes at run time.
+const _: () = assert!(MAX_BUF_SZ & ((1 << 11) - 1) == MAX_BUF_SZ);
+// And it has to hold a whole Ethernet frame plus the FCS the MAC leaves on,
+// since `geth_send` refuses anything longer outright.
+const _: () = assert!(MAX_BUF_SZ >= 1514 + 4);
 
 const TX_DELAY: u32 = 3;
 const RX_DELAY: u32 = 0;
@@ -1476,6 +1486,18 @@ where
     }
 
     pub fn set_umac(&self, addr: &[u8; 6], index: u32) {
+        // The GMAC has eight unicast address slots, each a pair of registers
+        // eight bytes apart, and `GMAC_MAX_UNICAST_ADDRESSES` is the bound that
+        // says so -- declared and never read, so nothing stopped an index past
+        // the eighth from walking out of the address block and into the DMA
+        // status registers above it (slot 12 lands on `GETH_TX_DMA_STA`). Only
+        // slot 0 is used today; this is here so that adding a second address
+        // cannot change that quietly.
+        assert!(
+            index < GMAC_MAX_UNICAST_ADDRESSES,
+            "unicast slot {index} is past the {max} slots the GMAC has",
+            max = GMAC_MAX_UNICAST_ADDRESSES
+        );
         info!(
             "Read mac addr high0 and low0: {:#x} {:#x}",
             read_volatile((self.base + GETH_ADDR_HI) as *mut u32),
@@ -1946,6 +1968,16 @@ pub(crate) mod fake {
         unsafe { slice::from_raw_parts(nic.send_buffers[slot] as *const u8, len) }.to_vec()
     }
 
+    /// The length the transmit descriptor in `slot` announces, which is what
+    /// goes on the wire -- not the size of the buffer behind it, and not the
+    /// size of whatever scratch the frame was assembled in.
+    pub fn tx_frame_len(nic: &RTL8211F<ProviderImpl>, slot: usize) -> u32 {
+        // By copy: `DmaDesc` is `#[repr(C, packed)]`, so a reference to a
+        // field of it is not necessarily aligned.
+        let desc1 = nic.send_ring[slot].desc1;
+        desc1 & ((1 << 11) - 1)
+    }
+
     static PHY: spin::Mutex<Option<Phy>> = spin::Mutex::new(None);
     /// The PHY's `BMCR_RESET` never clears: a PHY with no clock behind it.
     static PHY_RESET_STICKS: core::sync::atomic::AtomicBool =
@@ -1953,6 +1985,25 @@ pub(crate) mod fake {
     /// The MAC's `SOFT_RST` never clears: EMAC clock or power not up yet.
     static MAC_RESET_STICKS: core::sync::atomic::AtomicBool =
         core::sync::atomic::AtomicBool::new(false);
+    /// Which interrupt bits the last acknowledgement named.
+    static LAST_INT_ACK: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+    /// Which interrupt bits the handler's last acknowledgement named.
+    ///
+    /// The status register is write-1-to-clear and [`posted`] empties it on the
+    /// store, so afterwards nothing is left to say *which* bits were named.
+    /// This remembers them, which is the only way to ask whether an interrupt
+    /// the GMAC can raise is one the handler actually clears.
+    ///
+    /// Named, not cleared: it is the mask the driver wrote, read back out of
+    /// the window after the store landed (`intr_status & 0x3FFF`, so a seeded
+    /// status of all ones comes back as `0x3FFF` and not as `u32::MAX`). The
+    /// two differ only for a bit the driver names that was not set, and a test
+    /// that seeds the whole status register before the handler runs has
+    /// none.
+    pub fn last_interrupt_ack() -> u32 {
+        LAST_INT_ACK.load(core::sync::atomic::Ordering::SeqCst)
+    }
 
     /// A driver with its rings allocated out of host memory. `new` touches no
     /// registers, only DMA, so it needs nothing from the fake device.
@@ -1992,7 +2043,9 @@ pub(crate) mod fake {
     /// last-segment bit set, no error bits.
     pub fn complete_tx(nic: &mut RTL8211F<ProviderImpl>, slot: usize) {
         nic.send_ring[slot].desc0 = 0;
-        // LS (bit 29 of desc1) is what `desc_get_tx_ls` reads.
+        // Bit 30 of desc1 is the last-segment bit `desc_get_tx_ls` reads and
+        // bit 31 is interrupt-on-completion; `desc_tx_close` sets the pair.
+        // (This comment used to name bit 29, which is FIRST segment.)
         nic.send_ring[slot].desc1 |= 0b11 << 30;
     }
 
@@ -2019,6 +2072,7 @@ pub(crate) mod fake {
             // bit it did not just read, nothing is left pending. (Bits above
             // `0x3FFF` are outside the mask the driver writes, and it never looks
             // at them either.)
+            LAST_INT_ACK.store(read(GMAC_BASE + GETH_INT_STA), Ordering::SeqCst);
             write(GMAC_BASE + GETH_INT_STA, 0);
             return;
         }
@@ -2072,6 +2126,7 @@ pub(crate) mod fake {
         *PHY.lock() = Some(phy);
         PHY_RESET_STICKS.store(false, Ordering::SeqCst);
         MAC_RESET_STICKS.store(false, Ordering::SeqCst);
+        LAST_INT_ACK.store(0, Ordering::SeqCst);
         Guard {
             _turnstile: turnstile,
         }
@@ -2518,6 +2573,606 @@ mod tests {
             fake::read(GMAC_BASE + GETH_ADDR_HI),
             0x5544,
             "and writing slot 1 must not have landed on slot 0"
+        );
+    }
+
+    // ------------------------------------------------------------- the MAC core
+
+    /// Store and forward is what the bring-up asks for, and it means the DMA
+    /// waits for a whole frame before it starts moving it. The threshold bits
+    /// only mean anything in cut-through mode, which is why this arm sets the
+    /// mode bit and leaves them alone.
+    #[test]
+    fn store_and_forward_sets_the_mode_bit_and_asks_for_no_threshold() {
+        let _dev = fake::with_phy(Phy::gigabit_partner());
+        let mut nic = driver();
+
+        nic.mac_init(SF_DMA_MODE, SF_DMA_MODE);
+
+        let tx = fake::read(GMAC_BASE + GETH_TX_CTL1);
+        assert_eq!(tx & TX_MD, TX_MD, "transmit store and forward");
+        assert_eq!(
+            tx & TX_NEXT_FRM,
+            TX_NEXT_FRM,
+            "take the next frame while the one before it is still draining"
+        );
+        assert_eq!(tx & TX_TH, 0, "no cut-through threshold to set");
+
+        let rx = fake::read(GMAC_BASE + GETH_RX_CTL1);
+        assert_eq!(rx & RX_MD, RX_MD, "receive store and forward");
+        assert_eq!(rx & RX_TH, 0, "no cut-through threshold to set");
+    }
+
+    /// The four receive thresholds the GMAC can encode, and the one that looks
+    /// like a missing case.
+    ///
+    /// 64 bytes is encoded as `0x00` and 32 bytes as `0x10`, so read in order
+    /// the first two arms look swapped. They are not: the field's four values
+    /// are 64, 32, 96 and 128 in that order, which is the reference driver's
+    /// table. Pinned so nobody straightens it out.
+    #[test]
+    fn the_four_receive_thresholds_are_the_ones_the_gmac_encodes() {
+        let _dev = fake::with_phy(Phy::gigabit_partner());
+        let mut nic = driver();
+
+        for (bytes, want) in [
+            (0usize, 0x10u32),
+            (32, 0x10),
+            (33, 0x00),
+            (64, 0x00),
+            (65, 0x20),
+            (96, 0x20),
+            (97, 0x30),
+            (4096, 0x30),
+        ] {
+            nic.mac_init(SF_DMA_MODE, bytes);
+            assert_eq!(
+                fake::read(GMAC_BASE + GETH_RX_CTL1) & RX_TH,
+                want,
+                "a {bytes}-byte receive threshold"
+            );
+        }
+    }
+
+    /// The transmit thresholds climb with the bytes asked for, and unlike the
+    /// receive side they are in order.
+    #[test]
+    fn the_transmit_thresholds_climb_with_the_bytes_asked_for() {
+        let _dev = fake::with_phy(Phy::gigabit_partner());
+        let mut nic = driver();
+
+        for (bytes, want) in [
+            (0usize, 0x000u32),
+            (64, 0x000),
+            (65, 0x100),
+            (128, 0x100),
+            (129, 0x200),
+            (192, 0x200),
+            (193, 0x300),
+            (4096, 0x300),
+        ] {
+            nic.mac_init(bytes, SF_DMA_MODE);
+            let tx = fake::read(GMAC_BASE + GETH_TX_CTL1);
+            assert_eq!(tx & TX_TH, want, "a {bytes}-byte transmit threshold");
+            assert_eq!(tx & TX_MD, 0, "cut-through, not store and forward");
+        }
+    }
+
+    /// The MAC passes runts and errored frames up instead of dropping them,
+    /// because the driver's receive path is what decides: `geth_recv` reads the
+    /// error bits out of the descriptor and wipes the buffer itself. Dropping
+    /// them in the MAC would hide them from it -- and from the statistics.
+    #[test]
+    fn the_mac_forwards_runts_and_errored_frames_to_the_driver() {
+        let _dev = fake::with_phy(Phy::gigabit_partner());
+        let mut nic = driver();
+
+        nic.mac_init(SF_DMA_MODE, SF_DMA_MODE);
+
+        let rx = fake::read(GMAC_BASE + GETH_RX_CTL1);
+        assert_eq!(rx & RX_ERR_FRM, RX_ERR_FRM, "forward frames with an error");
+        assert_eq!(
+            rx & RX_RUNT_FRM,
+            RX_RUNT_FRM,
+            "forward undersized good frames"
+        );
+    }
+
+    /// The hardware keeps the CRC the driver strips itself.
+    ///
+    /// `geth_recv` subtracts the four FCS bytes from every length it hands
+    /// back, so the frame has to still carry them: a MAC that stripped the pad
+    /// and CRC would have the driver cut four good bytes off every packet.
+    #[test]
+    fn the_hardware_keeps_the_crc_the_driver_strips_itself() {
+        let _dev = fake::with_phy(Phy::gigabit_partner());
+        let mut nic = driver();
+
+        nic.mac_init(SF_DMA_MODE, SF_DMA_MODE);
+
+        let rx = fake::read(GMAC_BASE + GETH_RX_CTL0);
+        assert_eq!(rx & (1 << 27), 0, "no checksum offload");
+        assert_eq!(rx & (1 << 28), 0, "keep the pad and the CRC");
+        assert_eq!(rx & (1 << 29), 1 << 29, "accept jumbo frames");
+    }
+
+    /// Bringing the GMAC up leaves both DMAs in store and forward. The
+    /// transmit side waiting for a whole frame is what keeps a FIFO underrun
+    /// from putting half a frame on the wire.
+    #[test]
+    fn the_bring_up_leaves_both_dmas_in_store_and_forward() {
+        let _dev = fake::with_phy(Phy::gigabit_partner());
+        let mut nic = driver();
+
+        nic.open().expect("a healthy GMAC must come up");
+
+        assert_eq!(
+            fake::read(GMAC_BASE + GETH_TX_CTL1) & TX_MD,
+            TX_MD,
+            "transmit store and forward"
+        );
+        assert_eq!(
+            fake::read(GMAC_BASE + GETH_RX_CTL1) & RX_MD,
+            RX_MD,
+            "receive store and forward"
+        );
+    }
+
+    // -------------------------------------------------------- the interrupt line
+
+    /// Every interrupt the GMAC is armed to raise has to be one the handler
+    /// clears, or the line stays asserted and the handler is re-entered for
+    /// ever.
+    ///
+    /// Two numbers decide that and nothing ties them together: `int_enable`
+    /// picks what is armed, and `interrupt_status` acknowledges with a mask of
+    /// its own. The comment on that mask says `CSR5[15-0]`, which is `0xFFFF`,
+    /// while the code writes `0x3FFF`; today the gap costs nothing because the
+    /// only interrupts armed are `RX_INT` (bit 8) and `TX_UNF_INT` (bit 4).
+    /// `LINK_STA_INT` is bit 16. Which of the two numbers is the right one
+    /// cannot be settled from here -- sunxi-gmac is not in Linux mainline --
+    /// so this pins the relation between them rather than either number.
+    #[test]
+    fn every_interrupt_the_gmac_is_armed_to_raise_is_one_the_handler_clears() {
+        let _dev = fake::with_phy(Phy::gigabit_partner());
+        let mut nic = driver();
+
+        nic.int_enable();
+        let armed = fake::interrupts_armed();
+        assert_eq!(
+            armed,
+            RX_INT | TX_UNF_INT,
+            "the armed set changed; it has to stay inside the mask acked below"
+        );
+
+        // Raise the lot, so what comes back is the whole set the handler is
+        // willing to clear and not just the bits this test thought to try.
+        fake::write(GMAC_BASE + GETH_INT_STA, u32::MAX);
+        let _ = nic.interrupt_status();
+
+        let unacked = armed & !fake::last_interrupt_ack();
+        assert_eq!(
+            unacked, 0,
+            "{unacked:#x} can be raised and is never cleared: the line would \
+             stay up and the handler would be re-entered for ever"
+        );
+    }
+
+    /// Each interrupt gets its own verdict, because what has to happen next
+    /// differs: normal work polls the rings, a transmit underflow has to bump
+    /// the FIFO threshold, and a stopped transmit DMA needs restarting.
+    ///
+    /// Each case on its own. When an error interrupt arrives in the same read
+    /// as a normal one the last `if` wins and the error is lost; that is known
+    /// and is not something a test can close, because the function returns a
+    /// single `i32` that cannot carry both.
+    #[test]
+    fn each_interrupt_the_gmac_can_raise_gets_its_own_verdict() {
+        let _dev = fake::with_phy(Phy::gigabit_partner());
+        let mut nic = driver();
+
+        for (raised, want, what) in [
+            (RX_INT, TxDmaIrqStatus::HandleTxRx as i32, "a frame arrived"),
+            (
+                TX_INT,
+                TxDmaIrqStatus::HandleTxRx as i32,
+                "a frame went out",
+            ),
+            (
+                TX_UNF_INT,
+                TxDmaIrqStatus::TxHardErrorBumpTc as i32,
+                "the transmit FIFO underran",
+            ),
+            (
+                TX_STOP_INT,
+                TxDmaIrqStatus::TxHardError as i32,
+                "the transmit DMA stopped",
+            ),
+            (0, 0, "nothing was pending"),
+        ] {
+            fake::write(GMAC_BASE + GETH_INT_STA, raised);
+            assert_eq!(nic.interrupt_status(), want, "{what}");
+            assert_eq!(
+                fake::last_interrupt_ack() & raised,
+                raised,
+                "{what}: it was left pending"
+            );
+        }
+    }
+
+    // ---------------------------------------------------------------- the link
+
+    /// The speed and duplex the negotiation settled on land in the three bits
+    /// of `BASIC_CTL0` the GMAC reads them from: duplex in bit 0, speed in bits
+    /// 2 and 3 with gigabit encoded as both clear.
+    ///
+    /// The gigabit and 100M rows are already covered through `adjust_link`; the
+    /// two that are not are 10M and the default arm, which is where
+    /// `SPEED_UNKNOWN` lands.
+    #[test]
+    fn each_link_speed_and_duplex_lands_in_the_bits_the_gmac_reads_them_from() {
+        let _dev = fake::with_phy(Phy::gigabit_partner());
+        let mut nic = driver();
+
+        for (speed, want) in [
+            (SPEED_1000, 0x00u32),
+            (SPEED_100, 0x0C),
+            (SPEED_10, 0x08),
+            // Nothing negotiated is programmed as 10M: the slowest the link
+            // could be, and so the only guess that cannot overrun it.
+            (SPEED_UNKNOWN, 0x08),
+        ] {
+            nic.set_link_mode(DUPLEX_FULL, speed);
+            let ctl = fake::read(GMAC_BASE + GETH_BASIC_CTL0);
+            assert_eq!(ctl & 0x0C, want, "{speed} Mb/s");
+            assert_eq!(ctl & CTL0_DM, CTL0_DM, "{speed} Mb/s full duplex");
+
+            nic.set_link_mode(DUPLEX_HALF, speed);
+            let ctl = fake::read(GMAC_BASE + GETH_BASIC_CTL0);
+            assert_eq!(ctl & 0x0C, want, "{speed} Mb/s, half duplex");
+            assert_eq!(ctl & CTL0_DM, 0, "{speed} Mb/s half duplex");
+        }
+    }
+
+    /// A half-duplex link gets no pause time, because it has no pause: 802.3x
+    /// is a full-duplex mechanism and a shared segment uses collisions instead.
+    #[test]
+    fn a_half_duplex_link_gets_no_pause_time_because_it_has_no_pause() {
+        let _dev = fake::with_phy(Phy::gigabit_partner());
+        let mut nic = driver();
+
+        nic.flow_ctrl(DUPLEX_HALF, FLOW_AUTO, PAUSE_TIME);
+
+        assert_eq!(
+            fake::read(GMAC_BASE + GETH_TX_FLOW_CTL) >> 4,
+            0,
+            "a pause time on a half-duplex link is a quantum nobody honours"
+        );
+    }
+
+    // --------------------------------------------------------- what we accept
+
+    /// The four receive-filter modes the driver uses, and the register contents
+    /// each one produces.
+    ///
+    /// `set_filter` takes a Linux-style flags word and shuffles its bits into
+    /// the register's own layout with eight shifts and masks, which no compiler
+    /// checks against anything. These are the four values `set_rx_mode` passes.
+    #[test]
+    fn the_four_receive_filter_modes_the_driver_uses_land_each_on_its_own_bit() {
+        let _dev = fake::with_phy(Phy::gigabit_partner());
+        let mut nic = driver();
+
+        for (flags, want, what) in [
+            (0x0u64, 0x0000_0000u32, "nothing but our own address"),
+            (0x4, 0x0000_0200, "hash the multicast addresses"),
+            (0x10, 0x0001_0000, "pass every multicast"),
+            (0x1, 0x8000_0000, "promiscuous"),
+        ] {
+            nic.set_filter(flags);
+            assert_eq!(
+                fake::read(GMAC_BASE + GETH_RX_FRM_FLT),
+                want,
+                "filter flags {flags:#x}: {what}"
+            );
+        }
+    }
+
+    /// The two halves of the multicast hash go to their registers crossed over:
+    /// `high` into `GETH_RX_HASH0` and `low` into `GETH_RX_HASH1`. It reads
+    /// like a swap and it is not one -- the sunxi register names run the
+    /// opposite way round from the arguments, and the reference driver writes
+    /// them this way.
+    #[test]
+    fn the_two_halves_of_the_multicast_hash_go_to_their_registers_crossed_over() {
+        let _dev = fake::with_phy(Phy::gigabit_partner());
+        let mut nic = driver();
+
+        nic.hash_filter(0x0000_ffff, 0xffff_0000);
+
+        assert_eq!(
+            fake::read(GMAC_BASE + GETH_RX_HASH0),
+            0xffff_0000,
+            "hash0 takes the high half"
+        );
+        assert_eq!(
+            fake::read(GMAC_BASE + GETH_RX_HASH1),
+            0x0000_ffff,
+            "hash1 takes the low half"
+        );
+    }
+
+    /// Setting the receive mode leaves the card promiscuous, and only the last
+    /// of its four `set_filter` calls leaves anything behind.
+    ///
+    /// `set_filter` stores the register rather than reading, modifying and
+    /// writing it, so each call overwrites the one before; the last one's own
+    /// comment says "Promiscuous Mode", so that is what it means to do. Pinned
+    /// here because a later read-modify-write would change what the card
+    /// accepts without touching a line of this function.
+    #[test]
+    fn setting_the_receive_mode_leaves_the_card_promiscuous() {
+        let _dev = fake::with_phy(Phy::gigabit_partner());
+        let mut nic = driver();
+
+        nic.set_rx_mode();
+
+        assert_eq!(
+            fake::read(GMAC_BASE + GETH_RX_FRM_FLT),
+            0x8000_0000,
+            "the last write wins, and it asks for promiscuous"
+        );
+        assert_eq!(
+            (
+                fake::read(GMAC_BASE + GETH_RX_HASH0),
+                fake::read(GMAC_BASE + GETH_RX_HASH1)
+            ),
+            (0xffff_ffff, 0xffff_ffff),
+            "and the second `hash_filter` call wins over the first, for the \
+             same reason"
+        );
+    }
+
+    /// All four bits the GMAC uses to condemn a received frame are looked at,
+    /// not just the error summary. A length error arrives on its own, with no
+    /// summary bit, on a frame whose length field disagrees with what came off
+    /// the wire -- and that is a frame whose bytes are not the bytes it claims.
+    #[test]
+    fn a_frame_marked_only_with_a_length_error_is_still_dropped() {
+        let _dev = fake::with_phy(Phy::gigabit_partner());
+        let mut nic = driver();
+
+        stage_rx_frame(&mut nic, 0, &[0xa5u8; 64]);
+        nic.recv_ring[0].desc0 |= 1 << 3; // length error, on its own
+
+        let (frame, count) = nic.geth_recv(1);
+        assert_eq!(count, 1, "the descriptor was taken out of the ring");
+        assert!(
+            frame.is_empty(),
+            "and nothing was handed up: got {} bytes",
+            frame.len()
+        );
+    }
+
+    // --------------------------------------------------------------- the rings
+
+    /// A published frame is marked first segment, last segment and
+    /// interrupt-on-completion, each in the bit that means it.
+    ///
+    /// `desc_get_tx_ls` reads the last-segment bit and `tx_complete` uses it to
+    /// tell a finished frame from a descriptor that was never filled, so losing
+    /// that bit would stop the ring being reclaimed at all.
+    #[test]
+    fn a_published_frame_is_marked_first_last_and_interrupt_on_completion() {
+        let _dev = fake::with_phy(Phy::gigabit_partner());
+        let mut nic = driver();
+
+        nic.desc_tx_close(1, 3, 0);
+
+        let first = nic.send_ring[1].desc1;
+        let last = nic.send_ring[3].desc1;
+        assert_eq!(first & (1 << 29), 1 << 29, "first segment");
+        assert_eq!(last & (1 << 30), 1 << 30, "last segment");
+        assert_eq!(last & (1 << 31), 1 << 31, "interrupt on completion");
+        assert_eq!(
+            desc_get_tx_ls(&nic.send_ring[3]),
+            1 << 30,
+            "and that is the bit `tx_complete` reclaims on"
+        );
+    }
+
+    /// The checksum walk goes round the ring instead of off the end of it.
+    ///
+    /// Unreachable today -- `geth_send` passes `csum_insert = 0` -- but the old
+    /// version advanced a raw pointer with `.add(1)`, so a segment that wrapped
+    /// walked past the end of `send_ring` and wrote into whatever followed it.
+    /// This is what stops that coming back.
+    #[test]
+    fn the_checksum_walk_wraps_round_the_ring_instead_of_off_the_end() {
+        let _dev = fake::with_phy(Phy::gigabit_partner());
+        let mut nic = driver();
+
+        // A segment that starts two slots from the end and finishes after the
+        // wrap, which is the shape the pointer walk could not survive.
+        nic.desc_tx_close(DMA_DESC_TX - 2, 1, 1);
+
+        for slot in [DMA_DESC_TX - 2, DMA_DESC_TX - 1, 0, 1] {
+            let desc1 = nic.send_ring[slot].desc1;
+            assert_eq!(
+                desc1 & (0b11 << 27),
+                0b11 << 27,
+                "slot {slot} is inside the segment"
+            );
+        }
+        let desc1 = nic.send_ring[2].desc1;
+        assert_eq!(desc1 & (0b11 << 27), 0, "and the walk stopped at the end");
+    }
+
+    /// Refilling hands the receive DMA every descriptor but the one the read
+    /// cursor is sitting on, each carrying the full buffer size.
+    ///
+    /// One slot is always held back: the two cursors meeting is how the ring
+    /// says "empty", so filling the last one would make a full ring look empty.
+    #[test]
+    fn refilling_hands_the_dma_every_descriptor_but_the_one_it_sits_on() {
+        let _dev = fake::with_phy(Phy::gigabit_partner());
+        let mut nic = driver();
+
+        // `new` leaves every descriptor already owned; take them all back so
+        // the refill has something to do.
+        for desc in nic.recv_ring.iter_mut() {
+            desc.desc0 = 0;
+            desc.desc1 = 0;
+        }
+
+        nic.rx_refill();
+
+        let owned = nic
+            .recv_ring
+            .iter()
+            .filter(|&desc| desc_get_own(desc) != 0)
+            .count();
+        assert_eq!(
+            owned,
+            DMA_DESC_RX - 1,
+            "every slot but the one the read cursor is on"
+        );
+        assert_eq!(
+            (nic.rx_dirty, nic.rx_clean),
+            (0, DMA_DESC_RX - 1),
+            "and the write cursor stopped one short of the read cursor"
+        );
+        for (i, desc) in nic.recv_ring.iter().take(DMA_DESC_RX - 1).enumerate() {
+            let size = desc.desc1 & ((1 << 11) - 1);
+            assert_eq!(size, MAX_BUF_SZ, "slot {i} carries the whole buffer");
+        }
+    }
+
+    /// Reclaiming the transmit ring walks it a slot at a time until the two
+    /// cursors meet, and leaves the ring able to take a frame again.
+    #[test]
+    fn reclaiming_the_transmit_ring_empties_it_one_slot_at_a_time() {
+        let _dev = fake::with_phy(Phy::gigabit_partner());
+        let mut nic = driver();
+
+        fake::fill_tx_ring(&mut nic);
+        fake::complete_whole_tx_ring(&mut nic);
+
+        nic.tx_complete();
+
+        assert_eq!(
+            fake::tx_cursors(&nic),
+            (DMA_DESC_TX - 1, DMA_DESC_TX - 1),
+            "both cursors together is an empty ring"
+        );
+        assert!(nic.can_send(), "and an empty ring takes a frame");
+    }
+
+    /// A descriptor the DMA still owns stops the reclaim where it stands.
+    /// Everything behind it is still in flight, so walking past it would hand a
+    /// slot back to the driver while the NIC is reading it.
+    #[test]
+    fn a_descriptor_the_dma_still_owns_stops_the_reclaim() {
+        let _dev = fake::with_phy(Phy::gigabit_partner());
+        let mut nic = driver();
+
+        fake::fill_tx_ring(&mut nic);
+        fake::complete_whole_tx_ring(&mut nic);
+        desc_set_own(&mut nic.send_ring[3]);
+
+        nic.tx_complete();
+
+        assert_eq!(
+            nic.tx_clean, 3,
+            "the reclaim stopped on the descriptor still owned by the DMA"
+        );
+    }
+
+    /// The last free transmit slot is usable, and the one after it is not.
+    ///
+    /// `can_send` counts the slots between the two cursors and holds back only
+    /// the one the ring needs to tell full from empty; claiming otherwise loses
+    /// the ring a slot it has, and claiming the opposite overwrites a
+    /// descriptor the NIC owns.
+    #[test]
+    fn the_last_free_transmit_slot_is_usable_and_the_one_after_it_is_not() {
+        let _dev = fake::with_phy(Phy::gigabit_partner());
+        let mut nic = driver();
+
+        for desc in nic.send_ring.iter_mut() {
+            desc.desc0 = 0;
+        }
+
+        nic.tx_dirty = 0;
+        nic.tx_clean = 2;
+        assert!(nic.can_send(), "one free slot is still a slot");
+
+        nic.tx_clean = 1;
+        assert!(
+            !nic.can_send(),
+            "the cursors one apart is how a full ring looks"
+        );
+    }
+
+    /// A unicast slot past the eight the GMAC has is refused.
+    ///
+    /// The slots are register pairs eight bytes apart, so the ninth would land
+    /// outside the address block -- the twelfth lands on `GETH_TX_DMA_STA` --
+    /// and `GMAC_MAX_UNICAST_ADDRESSES` is the bound that says so. Only slot 0
+    /// is used today, which is why this could not fire; it is here so that
+    /// adding a second address cannot make it fire either.
+    #[test]
+    #[should_panic(expected = "past the 8 slots the GMAC has")]
+    fn a_unicast_slot_past_the_eight_the_gmac_has_is_refused() {
+        let _dev = fake::with_phy(Phy::gigabit_partner());
+        let nic = driver();
+
+        nic.set_umac(&nic.get_umac(), GMAC_MAX_UNICAST_ADDRESSES);
+    }
+
+    // ------------------------------------------------------------ the MDIO bus
+
+    /// A bit the mask names and the value leaves out is a bit being
+    /// **cleared**, and a bit outside the mask is left exactly as it was.
+    ///
+    /// That is the whole contract of `phy_modify`, and it is the one the pause
+    /// advertisement got wrong: `ADVERTISE_PAUSE_CAP` and
+    /// `ADVERTISE_PAUSE_ASYM` were in the mask and missing from the value, so
+    /// the driver told the link partner it could not do 802.3x pause -- and
+    /// then asked the partner's reply whether pause had been agreed. Every
+    /// other test here starts from a register that reads zero, where keeping
+    /// and clearing look the same; this one starts from a register with
+    /// something already in it.
+    #[test]
+    fn a_bit_the_mask_names_and_the_value_leaves_out_is_a_bit_cleared() {
+        let _dev = fake::with_phy(Phy::gigabit_partner());
+        let mut nic = driver();
+
+        // One bit in each of the three positions: outside the mask, named by it
+        // and left out of the value, and in the value.
+        nic.mdio_write(0, MII_ADVERTISE, ADVERTISE_100FULL | ADVERTISE_10FULL);
+        nic.phy_modify(
+            MII_ADVERTISE,
+            ADVERTISE_10FULL | ADVERTISE_PAUSE_CAP,
+            ADVERTISE_PAUSE_CAP,
+        )
+        .expect("the PHY answers");
+
+        let adv = nic.mdio_read(0, MII_ADVERTISE);
+        assert_eq!(
+            adv & ADVERTISE_100FULL,
+            ADVERTISE_100FULL,
+            "outside the mask: left as it was"
+        );
+        assert_eq!(
+            adv & ADVERTISE_10FULL,
+            0,
+            "named by the mask and left out of the value: cleared"
+        );
+        assert_eq!(
+            adv & ADVERTISE_PAUSE_CAP,
+            ADVERTISE_PAUSE_CAP,
+            "in the value: set"
         );
     }
 }

@@ -1436,13 +1436,13 @@ mod collection_tests {
         // A request left pending for CPU 1 by an earlier test would coalesce
         // ours away and make the count below read 0 for the wrong reason.
         crate::runtime::clear_need_resched(1);
-        let (req0, _) = crate::runtime::wakeup_preempt_stats();
+        let (req0, _, _) = crate::runtime::wakeup_preempt_stats();
         let tc = TaskCollection::new(0);
         for _ in 0..8 {
             tc.add_task(pending(), pinned_elsewhere());
         }
         assert!(tc.take_task().is_none());
-        let (req1, _) = crate::runtime::wakeup_preempt_stats();
+        let (req1, _, _) = crate::runtime::wakeup_preempt_stats();
         crate::runtime::clear_need_resched(1);
         crate::runtime::set_executor_ready_mask_for_test(saved);
         assert_eq!(

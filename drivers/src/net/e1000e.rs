@@ -146,6 +146,7 @@ use core::mem::{size_of, MaybeUninit};
 use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{compiler_fence, fence, AtomicBool, AtomicU32, AtomicU64, Ordering};
 
+use managed::ManagedSlice;
 use smoltcp::iface::*;
 use smoltcp::phy::{self, DeviceCapabilities};
 use smoltcp::time::Instant;
@@ -3594,7 +3595,14 @@ impl NetScheme for E1000eInterface {
                     return;
                 }
             }
-            if let Some(slot) = addrs.iter_mut().last() {
+            // Every slot is taken. Growing the list is the only way to keep
+            // the addresses that are already there; overwriting the newest one
+            // silently takes an address the interface still answers on.
+            if let ManagedSlice::Owned(addrs) = addrs {
+                addrs.push(cidr);
+            } else if let Some(slot) = addrs.iter_mut().last() {
+                // Borrowed storage cannot grow, so the newest slot is the best
+                // there is.
                 *slot = cidr;
             }
         });
@@ -3711,30 +3719,44 @@ impl NetScheme for E1000eInterface {
         let mut iface = self.iface.lock();
         match gateway {
             Some(IpAddress::Ipv4(gw)) => {
+                let mut routes = self.routes.lock();
                 if cidr.prefix_len() == 0 {
                     let _ = iface.routes_mut().remove_default_ipv4_route();
                     iface
                         .routes_mut()
                         .add_default_ipv4_route(gw)
                         .map_err(|_| DeviceError::IoError)?;
+                    // Only one default route can be in force, so a new one
+                    // replaces the one already there. A route to a named
+                    // network replaces nothing -- and this purge used to run
+                    // for every gatewayed route, so the static route in a DHCP
+                    // lease took 0.0.0.0/0 out of the table the kernel reports
+                    // while smoltcp went on routing through it.
+                    routes
+                        .retain(|r| !(matches!(r.dst, IpCidr::Ipv4(_)) && r.dst.prefix_len() == 0));
                 }
-                let mut routes = self.routes.lock();
-                routes.retain(|r| !(matches!(r.dst, IpCidr::Ipv4(_)) && r.dst.prefix_len() == 0));
                 routes.push(RouteInfo {
                     dst: cidr,
                     gateway: Some(IpAddress::Ipv4(gw)),
                 });
             }
             Some(IpAddress::Ipv6(gw)) => {
+                let mut routes = self.routes.lock();
                 if cidr.prefix_len() == 0 {
                     let _ = iface.routes_mut().remove_default_ipv6_route();
                     iface
                         .routes_mut()
                         .add_default_ipv6_route(gw)
                         .map_err(|_| DeviceError::IoError)?;
+                    // Only one default route can be in force, so a new one
+                    // replaces the one already there. A route to a named
+                    // network replaces nothing -- and this purge used to run
+                    // for every gatewayed route, so the static route in a DHCP
+                    // lease took ::/0 out of the table the kernel reports
+                    // while smoltcp went on routing through it.
+                    routes
+                        .retain(|r| !(matches!(r.dst, IpCidr::Ipv6(_)) && r.dst.prefix_len() == 0));
                 }
-                let mut routes = self.routes.lock();
-                routes.retain(|r| !(matches!(r.dst, IpCidr::Ipv6(_)) && r.dst.prefix_len() == 0));
                 routes.push(RouteInfo {
                     dst: cidr,
                     gateway: Some(IpAddress::Ipv6(gw)),
@@ -4364,7 +4386,7 @@ mod rx_ring_tests {
     }
 
     /// Play the hardware: DMA `data` into slot `slot`, mark it DD|EOP, advance RDH.
-    fn hw_deliver(hw: &E1000eHw, slot: usize, data: &[u8]) {
+    pub(super) fn hw_deliver(hw: &E1000eHw, slot: usize, data: &[u8]) {
         assert!(data.len() <= BUF_SIZE);
         unsafe {
             core::ptr::copy_nonoverlapping(
@@ -4439,7 +4461,7 @@ mod rx_ring_tests {
     }
 
     /// Ethernet + IPv4 + UDP frame with a correct UDP and IP header checksum.
-    fn ipv4_udp_frame(payload: &[u8]) -> Vec<u8> {
+    pub(super) fn ipv4_udp_frame(payload: &[u8]) -> Vec<u8> {
         let mut f = vec![0u8; 14 + 20 + 8 + payload.len()];
         f[0..6].copy_from_slice(&[0x52, 0x54, 0, 0, 0, 1]);
         f[6..12].copy_from_slice(&[0x52, 0x54, 0, 0, 0, 2]);
@@ -4480,7 +4502,7 @@ mod rx_ring_tests {
     }
 
     /// Ethernet + IPv6 + TCP frame (no options) with a correct TCP checksum.
-    fn ipv6_tcp_frame(payload: &[u8]) -> Vec<u8> {
+    pub(super) fn ipv6_tcp_frame(payload: &[u8]) -> Vec<u8> {
         let mut f = vec![0u8; 14 + 40 + 20 + payload.len()];
         f[0..6].copy_from_slice(&[0x52, 0x54, 0, 0, 0, 1]);
         f[6..12].copy_from_slice(&[0x52, 0x54, 0, 0, 0, 2]);
@@ -5914,5 +5936,1353 @@ mod flow_control_tests {
         assert_eq!(mode, FcMode::None);
         assert_eq!(reg_read(hw.base, E1000E_CTRL) & (CTRL_RFCE | CTRL_TFCE), 0);
         let _ = FD;
+    }
+}
+
+#[cfg(test)]
+mod csum_tests {
+    //! The software checksum fallback, called directly.
+    //!
+    //! `rx_csum_needs_sw_check` decides whether the NIC validated a frame, and
+    //! when it did not, `rx_sw_csum_bad` has to verify it instead -- because the
+    //! driver tells smoltcp, statically through `Checksum::Tx`, not to. So a
+    //! hole here is not a missed drop: it is corrupt data handed to userspace as
+    //! good, or a good frame thrown away. `rx_ring_tests` reaches these through
+    //! one frame shape each; these go at the parsing, the bounds and the
+    //! pseudo-header, which is where the frame decides what gets summed.
+
+    use super::rx_ring_tests::{ipv4_udp_frame, ipv6_tcp_frame};
+    use super::*;
+    use alloc::vec;
+    use alloc::vec::Vec;
+    extern crate std;
+
+    /// The one's-complement sum of `data`, folded, as a checksum *field* carries
+    /// it: the value that makes the whole sum come out 0xffff.
+    fn folded_complement(data: &[u8]) -> u16 {
+        let mut sum = csum_add(0, data);
+        while sum >> 16 != 0 {
+            sum = (sum & 0xffff) + (sum >> 16);
+        }
+        !(sum as u16)
+    }
+
+    /// Recompute the IPv4 header checksum of `frame` in place, over the IHL the
+    /// header itself declares.
+    fn fix_ipv4_header_csum(frame: &mut [u8]) {
+        // Not spelled like the production line it mirrors, so a mutant of that
+        // line cannot land in here as well.
+        let header_len = usize::from(frame[14] & 0x0f) * 4;
+        frame[14 + 10] = 0;
+        frame[14 + 11] = 0;
+        let c = folded_complement(&frame[14..14 + header_len]);
+        frame[14 + 10..14 + 12].copy_from_slice(&c.to_be_bytes());
+    }
+
+    /// Ethernet + IPv4 + TCP with `option_words` 32-bit words of IP options, so
+    /// the header checksum covers more than the first 20 bytes and the L4
+    /// segment does not start at a fixed offset.
+    fn ipv4_tcp_frame(option_words: usize, payload: &[u8]) -> Vec<u8> {
+        let ihl = 20 + option_words * 4;
+        let mut f = vec![0u8; 14 + ihl + 20 + payload.len()];
+        f[0..6].copy_from_slice(&[0x52, 0x54, 0, 0, 0, 1]);
+        f[6..12].copy_from_slice(&[0x52, 0x54, 0, 0, 0, 2]);
+        f[12..14].copy_from_slice(&[0x08, 0x00]);
+        let ip = &mut f[14..];
+        ip[0] = 0x40 | ((ihl / 4) as u8);
+        let total = (ihl + 20 + payload.len()) as u16;
+        ip[2..4].copy_from_slice(&total.to_be_bytes());
+        ip[8] = 64;
+        ip[9] = 6;
+        ip[12..16].copy_from_slice(&[10, 0, 2, 2]);
+        ip[16..20].copy_from_slice(&[10, 0, 2, 15]);
+        for w in 0..option_words {
+            // Router-alert option, four bytes, repeated: a real option body, so
+            // the bytes past the first twenty are not all zero.
+            ip[20 + w * 4] = 0x94;
+            ip[21 + w * 4] = 0x04;
+            ip[22 + w * 4] = 0x00;
+            ip[23 + w * 4] = 0x00;
+        }
+        let tcp = &mut ip[ihl..];
+        tcp[0..2].copy_from_slice(&443u16.to_be_bytes());
+        tcp[2..4].copy_from_slice(&40000u16.to_be_bytes());
+        tcp[12] = 0x50; // data offset 5
+        tcp[13] = 0x18; // PSH|ACK
+        tcp[14..16].copy_from_slice(&1024u16.to_be_bytes());
+        tcp[20..].copy_from_slice(payload);
+        let seg_len = (20 + payload.len()) as u32;
+        let mut sum = csum_add(0, &ip[12..20]);
+        sum += 6 + seg_len;
+        sum = csum_add(sum, &ip[ihl..]);
+        while sum >> 16 != 0 {
+            sum = (sum & 0xffff) + (sum >> 16);
+        }
+        let c = !(sum as u16);
+        ip[ihl + 16..ihl + 18].copy_from_slice(&c.to_be_bytes());
+        fix_ipv4_header_csum(&mut f);
+        f
+    }
+
+    /// Ethernet + IPv6 + UDP. `csum` is written into the checksum field as is,
+    /// so a caller can build the zero-checksum frame IPv6 forbids.
+    fn ipv6_udp_frame(payload: &[u8], csum: Option<u16>) -> Vec<u8> {
+        let mut f = vec![0u8; 14 + 40 + 8 + payload.len()];
+        f[0..6].copy_from_slice(&[0x52, 0x54, 0, 0, 0, 1]);
+        f[6..12].copy_from_slice(&[0x52, 0x54, 0, 0, 0, 2]);
+        f[12..14].copy_from_slice(&[0x86, 0xdd]);
+        let ip = &mut f[14..];
+        ip[0] = 0x60;
+        let plen = (8 + payload.len()) as u16;
+        ip[4..6].copy_from_slice(&plen.to_be_bytes());
+        ip[6] = 17;
+        ip[7] = 64;
+        ip[8] = 0xfe;
+        ip[9] = 0x80;
+        ip[23] = 1;
+        ip[24] = 0xfe;
+        ip[25] = 0x80;
+        ip[39] = 2;
+        let udp = &mut ip[40..];
+        udp[0..2].copy_from_slice(&1234u16.to_be_bytes());
+        udp[2..4].copy_from_slice(&5678u16.to_be_bytes());
+        udp[4..6].copy_from_slice(&plen.to_be_bytes());
+        udp[8..].copy_from_slice(payload);
+        let c = match csum {
+            Some(c) => c,
+            None => {
+                let mut sum = csum_add(0, &ip[8..40]);
+                sum += 17 + plen as u32;
+                sum = csum_add(sum, &ip[40..]);
+                while sum >> 16 != 0 {
+                    sum = (sum & 0xffff) + (sum >> 16);
+                }
+                !(sum as u16)
+            }
+        };
+        ip[46..48].copy_from_slice(&c.to_be_bytes());
+        f
+    }
+
+    /// The same IPv6 TCP frame behind one destination-options extension header
+    /// (type 60) of `ext_blocks + 1` eight-octet blocks, which the walk has to
+    /// step over to find the TCP segment.
+    fn ipv6_tcp_behind_dstopts(ext_blocks: usize, payload: &[u8]) -> Vec<u8> {
+        let base = ipv6_tcp_frame(payload);
+        let ext_len = (ext_blocks + 1) * 8;
+        let mut f = vec![0u8; base.len() + ext_len];
+        f[..14 + 40].copy_from_slice(&base[..14 + 40]);
+        let plen = (base.len() - 14 - 40 + ext_len) as u16;
+        f[14 + 4..14 + 6].copy_from_slice(&plen.to_be_bytes());
+        f[14 + 6] = 60; // next header: destination options
+        f[14 + 40] = 6; // the extension's own next header: TCP
+        f[14 + 41] = ext_blocks as u8; // length in 8-octet units beyond the first
+        f[14 + 40 + ext_len..].copy_from_slice(&base[14 + 40..]);
+        f
+    }
+
+    /// `frame` with `n` bytes of Ethernet padding appended. The IP header still
+    /// says how long the packet is, so a checksum that sums to the end of the
+    /// frame instead of to the end of the packet sums the padding too.
+    fn padded(frame: &[u8], n: usize) -> Vec<u8> {
+        let mut f = frame.to_vec();
+        f.resize(frame.len() + n, 0);
+        f
+    }
+
+    // ----------------------------------------------- rx_ipv4_hdr_csum_bad
+
+    /// Both EtherType bytes decide. `0x0835` is not IPv4, and a half-check that
+    /// only looks at the high byte would sum an IPX frame's bytes as an IP
+    /// header and call the frame corrupt.
+    #[test]
+    fn both_ethertype_bytes_decide_whether_this_is_ipv4_at_all() {
+        let mut not_ip = ipv4_udp_frame(b"x");
+        not_ip[13] = 0x35; // 0x0835: same high byte as IPv4, different protocol
+        not_ip[14 + 10] ^= 0xff; // and a header that would not check out
+        assert!(
+            !rx_ipv4_hdr_csum_bad(&not_ip),
+            "a non-IPv4 EtherType must not be summed as an IP header"
+        );
+        let mut arp = ipv4_udp_frame(b"x");
+        arp[12..14].copy_from_slice(&[0x08, 0x06]);
+        arp[14 + 10] ^= 0xff;
+        assert!(!rx_ipv4_hdr_csum_bad(&arp));
+        assert!(!rx_ipv4_hdr_csum_bad(&ipv6_tcp_frame(b"x")));
+    }
+
+    /// A frame too short to hold the header it is about to sum.
+    #[test]
+    fn a_frame_shorter_than_an_ipv4_header_is_not_summed() {
+        let frame = ipv4_udp_frame(b"x");
+        for len in 0..14 + 20 {
+            assert!(
+                !rx_ipv4_hdr_csum_bad(&frame[..len]),
+                "{} bytes must be refused, not summed",
+                len
+            );
+        }
+    }
+
+    /// `IHL` is attacker-chosen, so a header that claims more than the frame
+    /// carries has to be refused before the sum walks off the end.
+    #[test]
+    fn an_ihl_longer_than_the_frame_is_refused_before_the_sum_runs_off() {
+        let mut frame = ipv4_udp_frame(b"x");
+        frame[14] = 0x4f; // IHL 15 words = 60 bytes, more than this frame holds
+        assert!(!rx_ipv4_hdr_csum_bad(&frame));
+    }
+
+    /// And an IHL below the 20-byte minimum is refused too: a 16-byte "header"
+    /// is not a header, and summing it reports a perfectly good frame corrupt.
+    #[test]
+    fn an_ihl_below_the_twenty_byte_minimum_is_refused() {
+        let mut frame = ipv4_udp_frame(b"x");
+        frame[14] = 0x44; // IHL 4 words = 16 bytes
+        assert!(!rx_ipv4_hdr_csum_bad(&frame));
+    }
+
+    /// The length comes from the low nibble and the version from the high one.
+    /// Read the whole byte and a frame whose version nibble carries a stray bit
+    /// gets a 84-byte header, which is refused -- so a corrupt header passes.
+    #[test]
+    fn the_header_length_is_the_low_nibble_and_nothing_else() {
+        let mut frame = ipv4_udp_frame(b"hello");
+        frame[14] = 0x55; // low nibble still 5; the high nibble is not the length
+        frame[14 + 10] ^= 0x01; // and the header checksum is wrong
+        assert!(
+            rx_ipv4_hdr_csum_bad(&frame),
+            "the header length must come from the low nibble alone"
+        );
+    }
+
+    /// The sum covers the options too, so a flipped option byte is a corrupt
+    /// header. Summing only the first twenty bytes misses it.
+    #[test]
+    fn the_header_sum_covers_the_options_and_not_just_the_first_twenty_bytes() {
+        let frame = ipv4_tcp_frame(2, b"payload");
+        assert!(
+            !rx_ipv4_hdr_csum_bad(&frame),
+            "a header with options and a correct checksum must pass"
+        );
+        let mut bad = frame.clone();
+        bad[14 + 22] ^= 0x10; // inside the options, past byte twenty
+        assert!(
+            rx_ipv4_hdr_csum_bad(&bad),
+            "a flipped option byte must break the header checksum"
+        );
+    }
+
+    /// Both bytes of every 16-bit word count: drop the low halves and a header
+    /// that differs only there sums the same.
+    ///
+    /// One fold is enough here and that is not a gap: a header is at most 15
+    /// words, so the first fold of a *valid* header can never carry again (it
+    /// would need `m + k == 0x1fffe` with `m <= 0xffff` and `k <= 14`).
+    #[test]
+    fn every_byte_of_the_header_counts_not_just_the_high_half_of_each_word() {
+        let frame = ipv4_udp_frame(b"x");
+        assert!(!rx_ipv4_hdr_csum_bad(&frame));
+        let mut odd = frame.clone();
+        odd[14 + 13] ^= 0x01; // the LOW byte of a word, inside the header
+        assert!(
+            rx_ipv4_hdr_csum_bad(&odd),
+            "a flipped low byte must break the header checksum"
+        );
+    }
+
+    // ------------------------------------------------------------- csum_add
+
+    /// RFC 1071: an odd trailing byte is the *high* half of its word, padded on
+    /// the right. Dropping it, or padding it on the left, gives another sum.
+    #[test]
+    fn an_odd_trailing_byte_is_the_high_half_of_its_word() {
+        assert_eq!(csum_add(0, &[0x12]), 0x1200);
+        assert_eq!(csum_add(0, &[0x12, 0x34, 0x56]), 0x1234 + 0x5600);
+        assert_eq!(csum_add(0, &[0x00, 0x01, 0x00, 0x02]), 3);
+        assert_eq!(csum_add(7, &[]), 7);
+    }
+
+    // ----------------------------------------------- rx_csum_needs_sw_check
+
+    /// IXSM means "ignore my indication", so it alone sends the frame to the
+    /// software path however many other bits are set.
+    #[test]
+    fn ixsm_alone_sends_the_frame_to_the_software_check() {
+        let all = RXD_STAT_IPCS | RXD_STAT_TCPCS | RXD_STAT_UDPCS;
+        assert!(!rx_csum_needs_sw_check(all));
+        assert!(rx_csum_needs_sw_check(all | RXD_STAT_IXSM));
+    }
+
+    /// Each of the three reasons stands on its own, and the L4 half is an
+    /// either: TCPCS or UDPCS, not both.
+    #[test]
+    fn each_missing_indication_is_a_reason_of_its_own() {
+        let all = RXD_STAT_IPCS | RXD_STAT_TCPCS | RXD_STAT_UDPCS;
+        assert!(
+            rx_csum_needs_sw_check(all & !RXD_STAT_IPCS),
+            "no IPCS: the header was not validated"
+        );
+        assert!(
+            rx_csum_needs_sw_check(RXD_STAT_IPCS),
+            "neither TCPCS nor UDPCS: the payload was not validated"
+        );
+        assert!(!rx_csum_needs_sw_check(RXD_STAT_IPCS | RXD_STAT_UDPCS));
+        assert!(!rx_csum_needs_sw_check(RXD_STAT_IPCS | RXD_STAT_TCPCS));
+        assert!(rx_csum_needs_sw_check(0));
+    }
+
+    // --------------------------------------------------------- rx_sw_csum_bad
+
+    /// A frame too short to even hold an Ethernet header is refused before the
+    /// EtherType is read -- 12 and 13 bytes are the two that would read past it.
+    #[test]
+    fn a_frame_with_no_room_for_an_ethertype_is_refused() {
+        let frame = ipv4_udp_frame(b"x");
+        for len in 0..14 {
+            assert!(
+                !rx_sw_csum_bad(&frame[..len], 0),
+                "{} bytes must be refused before the EtherType is read",
+                len
+            );
+        }
+    }
+
+    /// A version nibble that is not 4 is not an IPv4 packet, whatever the
+    /// EtherType says, and summing it as one reports a corrupt header.
+    #[test]
+    fn an_ipv4_ethertype_with_the_wrong_version_nibble_is_refused() {
+        let mut frame = ipv4_udp_frame(b"hello");
+        frame[14] = 0x65; // version 6 behind EtherType 0x0800
+        assert!(
+            !rx_sw_csum_bad(&frame, 0),
+            "the version nibble has to agree before anything is summed"
+        );
+    }
+
+    /// IXSM overrides a set IPCS for the *header* check too: the NIC says to
+    /// ignore its own indication, so the header has to be verified again.
+    #[test]
+    fn ixsm_sends_the_header_back_to_the_software_check_even_with_ipcs_set() {
+        let mut frame = ipv4_udp_frame(b"hello");
+        frame[14 + 8] = 1; // TTL: breaks the header checksum and nothing else
+        assert!(
+            rx_sw_csum_bad(&frame, RXD_STAT_IPCS | RXD_STAT_IXSM),
+            "IXSM must override IPCS on the header"
+        );
+        assert!(
+            !rx_sw_csum_bad(&frame, RXD_STAT_IPCS | RXD_STAT_UDPCS),
+            "IPCS without IXSM: the NIC validated the header"
+        );
+    }
+
+    /// A packet whose total length claims more than the frame carries is
+    /// refused: the L4 segment is sliced with that length.
+    #[test]
+    fn a_total_length_past_the_end_of_the_frame_is_refused() {
+        let mut frame = ipv4_udp_frame(b"hello");
+        let past = (frame.len() - 14 + 8) as u16;
+        frame[14 + 2..14 + 4].copy_from_slice(&past.to_be_bytes());
+        fix_ipv4_header_csum(&mut frame);
+        assert!(!rx_sw_csum_bad(&frame, 0));
+    }
+
+    /// A fragment carries no verifiable L4 checksum, and that is true of the
+    /// first fragment too -- the one with offset zero and MF set, which is the
+    /// half a mask of the offset bits alone would miss.
+    #[test]
+    fn the_first_fragment_of_a_chain_is_exempt_like_the_rest() {
+        let mut frame = ipv4_udp_frame(b"hello");
+        frame[14 + 26] ^= 0x01; // break the UDP checksum
+        let mut later = frame.clone();
+        // Offset 185, no MF: a middle or last fragment.
+        later[14 + 6..14 + 8].copy_from_slice(&0x0017u16.to_be_bytes());
+        fix_ipv4_header_csum(&mut later);
+        assert!(!rx_sw_csum_bad(&later, 0), "a later fragment is exempt");
+        // MF set, offset zero: the FIRST fragment, and just as unverifiable.
+        frame[14 + 6..14 + 8].copy_from_slice(&0x2000u16.to_be_bytes());
+        fix_ipv4_header_csum(&mut frame);
+        assert!(
+            !rx_sw_csum_bad(&frame, 0),
+            "the first fragment of a chain must be exempt too"
+        );
+    }
+
+    /// Ethernet padding is not part of the packet. Summing to the end of the
+    /// frame instead of to the end of the IP packet turns every short TCP
+    /// segment on the wire -- an ACK, a window update -- into a corrupt frame.
+    #[test]
+    fn ethernet_padding_is_not_summed_in_an_ipv4_segment() {
+        let frame = ipv4_tcp_frame(0, b"hi");
+        assert!(!rx_sw_csum_bad(&frame, 0));
+        let with_padding = padded(&frame, 64 - frame.len());
+        assert!(
+            !rx_sw_csum_bad(&with_padding, 0),
+            "the padding of a short TCP segment was summed"
+        );
+    }
+
+    /// The same on the IPv6 side, where the bound is the payload-length field.
+    #[test]
+    fn ethernet_padding_is_not_summed_in_an_ipv6_segment() {
+        let frame = ipv6_tcp_frame(b"hi");
+        assert!(!rx_sw_csum_bad(&frame, 0));
+        let with_padding = padded(&frame, 20);
+        assert!(
+            !rx_sw_csum_bad(&with_padding, 0),
+            "the padding past the IPv6 payload length was summed"
+        );
+    }
+
+    /// An IPv6 extension header is `(len + 1) * 8` bytes long -- the field
+    /// counts the blocks *after* the first. Step eight bytes short and the sum
+    /// starts inside the extension instead of at the TCP header.
+    #[test]
+    fn an_extension_header_is_stepped_over_by_its_whole_length() {
+        for blocks in [0usize, 1, 3] {
+            let frame = ipv6_tcp_behind_dstopts(blocks, b"behind an extension");
+            assert!(
+                !rx_sw_csum_bad(&frame, 0),
+                "a good segment behind a {}-block extension header was called corrupt",
+                blocks
+            );
+        }
+        let mut bad = ipv6_tcp_behind_dstopts(1, b"behind an extension");
+        let len = bad.len();
+        bad[len - 3] ^= 0x08; // in the payload, past the extension
+        assert!(
+            rx_sw_csum_bad(&bad, 0),
+            "a corrupt segment behind an extension must fail"
+        );
+    }
+
+    /// An extension header that runs past the end of the packet is refused
+    /// rather than walked.
+    #[test]
+    fn an_extension_header_that_runs_past_the_packet_is_refused() {
+        let mut frame = ipv6_tcp_behind_dstopts(1, b"payload");
+        frame[14 + 41] = 0xff; // 0x100 * 8 bytes of extension header
+        assert!(!rx_sw_csum_bad(&frame, 0));
+        // And a next-header the function cannot verify is refused, not guessed.
+        let mut esp = ipv6_tcp_frame(b"payload");
+        esp[14 + 6] = 50; // ESP
+        assert!(!rx_sw_csum_bad(&esp, 0));
+    }
+
+    // ----------------------------------------------------------- l4_csum_bad
+
+    /// IPv4 UDP may legitimately carry no checksum; IPv6 UDP may not, and the
+    /// pseudo-header is the only thing that tells the two apart here.
+    #[test]
+    fn a_zero_udp_checksum_is_legal_over_ipv4_and_not_over_ipv6() {
+        let mut v4 = ipv4_udp_frame(b"no checksum");
+        v4[14 + 26] = 0;
+        v4[14 + 27] = 0;
+        assert!(
+            !rx_sw_csum_bad(&v4, 0),
+            "a zero UDP checksum over IPv4 means not computed, not wrong"
+        );
+        let v6 = ipv6_udp_frame(b"no checksum", Some(0));
+        assert!(
+            rx_sw_csum_bad(&v6, 0),
+            "a zero UDP checksum over IPv6 is forbidden and has to be caught"
+        );
+        // And a good IPv6 UDP frame still passes.
+        assert!(!rx_sw_csum_bad(&ipv6_udp_frame(b"no checksum", None), 0));
+    }
+
+    /// A TCP segment shorter than its own 20-byte header cannot be verified, so
+    /// it is left to smoltcp rather than summed as if it were whole.
+    #[test]
+    fn a_tcp_segment_shorter_than_its_header_is_left_alone() {
+        for len in 0..20usize {
+            assert!(
+                !l4_csum_bad(6, &[10, 0, 2, 2], &[10, 0, 2, 15], &vec![0u8; len], false),
+                "a {}-byte TCP segment must not be summed",
+                len
+            );
+        }
+        // Twenty is enough, and a segment of zeroes does not sum to 0xffff.
+        assert!(l4_csum_bad(
+            6,
+            &[10, 0, 2, 2],
+            &[10, 0, 2, 15],
+            &vec![0u8; 20],
+            false
+        ));
+    }
+
+    /// A UDP length field longer than the segment is refused rather than used
+    /// to slice it.
+    #[test]
+    fn a_udp_length_past_the_end_of_the_segment_is_refused() {
+        let mut seg = vec![0u8; 12];
+        seg[0..2].copy_from_slice(&1234u16.to_be_bytes());
+        seg[2..4].copy_from_slice(&5678u16.to_be_bytes());
+        seg[4..6].copy_from_slice(&64u16.to_be_bytes()); // claims 64 of 12 bytes
+        seg[6..8].copy_from_slice(&0x1234u16.to_be_bytes());
+        assert!(!l4_csum_bad(
+            17,
+            &[10, 0, 2, 2],
+            &[10, 0, 2, 15],
+            &seg,
+            false
+        ));
+        // And one below the 8-byte header is refused too.
+        seg[4..6].copy_from_slice(&7u16.to_be_bytes());
+        assert!(!l4_csum_bad(
+            17,
+            &[10, 0, 2, 2],
+            &[10, 0, 2, 15],
+            &seg,
+            false
+        ));
+    }
+
+    /// A UDP datagram shorter than the IP packet that carries it: the sum stops
+    /// at the UDP length, not at the end of the packet.
+    #[test]
+    fn the_udp_sum_stops_at_the_udp_length_not_at_the_end_of_the_packet() {
+        let frame = ipv4_udp_frame(b"short datagram");
+        assert!(!rx_sw_csum_bad(&frame, 0));
+        // Grow the IP packet by four bytes without touching the UDP length: the
+        // extra bytes are inside the packet and outside the datagram.
+        let mut grown = frame.clone();
+        grown.resize(frame.len() + 4, 0xa5);
+        let total = (grown.len() - 14) as u16;
+        grown[14 + 2..14 + 4].copy_from_slice(&total.to_be_bytes());
+        fix_ipv4_header_csum(&mut grown);
+        assert!(
+            !rx_sw_csum_bad(&grown, 0),
+            "bytes past the UDP length were summed into the datagram"
+        );
+    }
+
+    /// The pseudo-header puts the addresses into the sum, so a segment that
+    /// checks out for one pair does not check out for another. (Swapping the
+    /// pair is not a case: a sum does not care about the order.)
+    #[test]
+    fn the_pseudo_header_puts_the_addresses_into_the_sum() {
+        let frame = ipv4_tcp_frame(0, b"pseudo header");
+        let ip = &frame[14..];
+        let seg = &ip[20..];
+        assert!(!l4_csum_bad(6, &ip[12..16], &ip[16..20], seg, false));
+        assert!(
+            l4_csum_bad(6, &[10, 0, 2, 3], &ip[16..20], seg, false),
+            "a segment relayed from another source still checked out"
+        );
+        assert!(l4_csum_bad(6, &ip[12..16], &[10, 0, 2, 3], seg, false));
+    }
+}
+
+#[cfg(test)]
+mod scheme_tests {
+    //! The `NetScheme` surface of the e1000e: the addresses, the routes and the
+    //! numbers the kernel reports back. None of it touches the ring -- that is
+    //! `rx_ring_tests` -- and all of it is what `ip addr`, `ip route`, netlink
+    //! and a DHCP lease walk through. It had no test at all.
+
+    use super::rx_ring_tests::make_hw;
+    use super::*;
+    use alloc::vec;
+    use smoltcp::phy::Device as _;
+    extern crate std;
+
+    /// An `E1000eInterface` over the host-memory NIC, with the address and
+    /// route storage [`init`] gives it: a blank, the IPv6 link-local, and two
+    /// more blanks, over four route slots and no gateway.
+    pub(super) fn interface() -> E1000eInterface {
+        interface_with(vec![
+            IpCidr::new(IpAddress::v4(0, 0, 0, 0), 0),
+            IpCidr::Ipv6(Ipv6Cidr::new(link_local(), 64)),
+            IpCidr::new(IpAddress::v4(0, 0, 0, 0), 0),
+            IpCidr::new(IpAddress::v4(0, 0, 0, 0), 0),
+        ])
+    }
+
+    fn link_local() -> Ipv6Address {
+        Ipv6Address::new(0xfe80, 0, 0, 0, 0x5054, 0x00ff, 0xfe00, 0x0001)
+    }
+
+    /// The same interface over an address list of the caller's choosing.
+    fn interface_with(ip_addrs: alloc::vec::Vec<IpCidr>) -> E1000eInterface {
+        let hw = make_hw();
+        let base = hw.base;
+        let driver = E1000eDriver {
+            hw: Arc::new(Mutex::new(hw)),
+        };
+        let routes_storage: &'static mut [Option<(IpCidr, Route)>] =
+            Box::leak(vec![None; 4].into_boxed_slice());
+        let iface = InterfaceBuilder::new(driver.clone())
+            .ethernet_addr(EthernetAddress([0x52, 0x54, 0, 0, 0, 1]))
+            .neighbor_cache(NeighborCache::new(BTreeMap::new()))
+            .ip_addrs(ip_addrs.clone())
+            .routes(Routes::new(routes_storage))
+            .finalize();
+        E1000eInterface {
+            iface: Arc::new(Mutex::new(iface)),
+            driver,
+            name: String::from("eth0"),
+            irq: 11,
+            base,
+            poll_pending: Arc::new(AtomicBool::new(false)),
+            poll_pending_set_us: Arc::new(AtomicU64::new(0)),
+            link_up_seen: Arc::new(AtomicBool::new(true)),
+            pending_icr: Arc::new(AtomicU32::new(0)),
+            watchdog_job_scheduled: Arc::new(AtomicBool::new(false)),
+            routes: Arc::new(Mutex::new(vec![])),
+            ip_addrs: Arc::new(Mutex::new(ip_addrs)),
+        }
+    }
+
+    fn v4(a: u8, b: u8, c: u8, d: u8, prefix: u8) -> IpCidr {
+        IpCidr::new(IpAddress::v4(a, b, c, d), prefix)
+    }
+
+    /// What the stack itself would route a packet for `dst` through, read out of
+    /// smoltcp's own table rather than out of the mirror the kernel reports.
+    fn gateway_in_the_stack(iface: &E1000eInterface, dst: IpCidr) -> Option<IpAddress> {
+        let mut found = None;
+        iface
+            .iface
+            .lock()
+            .routes_mut()
+            .update(|routes| found = routes.get(&dst).map(|route| route.via_router));
+        found
+    }
+
+    // ------------------------------------------------------------- addresses
+
+    /// `set_ipv4_address` is the DHCP path: one address in force, and the other
+    /// IPv4 slots blanked so a stale lease does not keep answering. The IPv6
+    /// link-local is not its business and has to survive.
+    #[test]
+    fn setting_the_address_leaves_one_ipv4_slot_in_force_and_the_link_local_alone() {
+        let iface = interface();
+        iface
+            .set_ipv4_address(Ipv4Cidr::new(Ipv4Address::new(10, 0, 2, 15), 24))
+            .unwrap();
+        let addrs = iface.get_ip_address();
+        let want = v4(10, 0, 2, 15, 24);
+        assert_eq!(
+            addrs.iter().filter(|a| **a == want).count(),
+            1,
+            "the address must be in force exactly once: {:?}",
+            addrs
+        );
+        assert_eq!(
+            addrs
+                .iter()
+                .filter(|a| matches!(a, IpCidr::Ipv6(_)))
+                .count(),
+            1,
+            "the link-local went missing: {:?}",
+            addrs
+        );
+        // Every other IPv4 slot is a blank, not a second live address.
+        for a in addrs.iter() {
+            if let IpCidr::Ipv4(c) = a {
+                assert!(
+                    *c == Ipv4Cidr::new(Ipv4Address::new(10, 0, 2, 15), 24) || c.prefix_len() == 0,
+                    "a second live IPv4 address: {:?}",
+                    addrs
+                );
+            }
+        }
+    }
+
+    /// A second lease replaces the first one. Latching on the first IPv4 slot
+    /// and blanking the rest is what makes that true however many slots there
+    /// are; blanking with a prefix would leave a direct route behind.
+    #[test]
+    fn a_second_lease_replaces_the_first_and_leaves_no_direct_route_to_it() {
+        let iface = interface();
+        iface
+            .set_ipv4_address(Ipv4Cidr::new(Ipv4Address::new(10, 0, 2, 15), 24))
+            .unwrap();
+        iface
+            .set_ipv4_address(Ipv4Cidr::new(Ipv4Address::new(192, 168, 1, 50), 24))
+            .unwrap();
+        let addrs = iface.get_ip_address();
+        assert!(
+            !addrs.contains(&v4(10, 0, 2, 15, 24)),
+            "the old lease still answers: {:?}",
+            addrs
+        );
+        assert!(addrs.contains(&v4(192, 168, 1, 50, 24)), "{:?}", addrs);
+        let routes = iface.get_routes();
+        assert!(
+            !routes.iter().any(|r| r.dst == v4(10, 0, 2, 0, 24)),
+            "the old lease left its network behind: {:?}",
+            routes
+        );
+    }
+
+    /// An address added by hand lands in a blank slot, and the one already in
+    /// force stays.
+    #[test]
+    fn an_added_address_takes_a_blank_slot_and_keeps_the_one_in_force() {
+        let iface = interface();
+        iface
+            .set_ipv4_address(Ipv4Cidr::new(Ipv4Address::new(10, 0, 2, 15), 24))
+            .unwrap();
+        let before = iface.get_ip_address().len();
+        iface.add_ip_address(v4(172, 16, 0, 1, 16)).unwrap();
+        let addrs = iface.get_ip_address();
+        assert_eq!(addrs.len(), before, "a blank slot was free: {:?}", addrs);
+        assert!(addrs.contains(&v4(172, 16, 0, 1, 16)), "{:?}", addrs);
+        assert!(addrs.contains(&v4(10, 0, 2, 15, 24)), "{:?}", addrs);
+    }
+
+    /// Adding the same address twice leaves one, not two: the kernel's own
+    /// `ip addr add` is idempotent and a duplicate would be reported twice in
+    /// `get_routes` as well.
+    #[test]
+    fn adding_the_same_address_twice_does_not_duplicate_it() {
+        let iface = interface();
+        let addr = v4(172, 16, 0, 1, 16);
+        iface.add_ip_address(addr).unwrap();
+        iface.add_ip_address(addr).unwrap();
+        let addrs = iface.get_ip_address();
+        assert_eq!(
+            addrs.iter().filter(|a| **a == addr).count(),
+            1,
+            "{:?}",
+            addrs
+        );
+    }
+
+    /// With every slot taken the list grows, and the four addresses already
+    /// there -- the link-local among them -- all stay.
+    #[test]
+    fn an_address_added_with_every_slot_taken_grows_the_list() {
+        let iface = interface();
+        let added = [
+            v4(172, 16, 0, 1, 16),
+            v4(172, 16, 1, 1, 16),
+            v4(172, 16, 2, 1, 16),
+        ];
+        for a in added.iter() {
+            iface.add_ip_address(*a).unwrap();
+        }
+        assert_eq!(
+            iface.get_ip_address().len(),
+            4,
+            "the three blanks were free"
+        );
+        let extra = v4(172, 16, 3, 1, 16);
+        iface.add_ip_address(extra).unwrap();
+        let addrs = iface.get_ip_address();
+        assert_eq!(addrs.len(), 5, "the list did not grow: {:?}", addrs);
+        for a in added.iter().chain(core::iter::once(&extra)) {
+            assert!(addrs.contains(a), "{} went missing: {:?}", a, addrs);
+        }
+        assert_eq!(
+            addrs
+                .iter()
+                .filter(|a| matches!(a, IpCidr::Ipv6(_)))
+                .count(),
+            1,
+            "the link-local was overwritten: {:?}",
+            addrs
+        );
+    }
+
+    /// A removed address stops answering, and the slot it leaves is a blank with
+    /// no prefix -- so it is reusable and reports no route.
+    #[test]
+    fn a_removed_address_leaves_a_reusable_blank_and_no_route() {
+        let iface = interface();
+        let addr = v4(172, 16, 0, 1, 16);
+        iface.add_ip_address(addr).unwrap();
+        iface.remove_ip_address(addr).unwrap();
+        let addrs = iface.get_ip_address();
+        assert!(!addrs.contains(&addr), "{:?}", addrs);
+        assert!(
+            !iface
+                .get_routes()
+                .iter()
+                .any(|r| r.dst == v4(172, 16, 0, 0, 16)),
+            "the removed address left its network behind"
+        );
+        // The blank has to be exactly `0.0.0.0/0`, prefix included. That pair is
+        // what `add_ip_address` reads as a free slot and what netlink drops from
+        // an address dump: an unspecified address with any other prefix is
+        // reported as a real one, and `ip addr flush` then loops forever
+        // deleting a slot that deleting cannot remove.
+        assert!(
+            !addrs
+                .iter()
+                .any(|a| a.address().is_unspecified() && a.prefix_len() != 0),
+            "the blank left behind is not the free-slot sentinel: {:?}",
+            addrs
+        );
+        // Reusable: adding another address takes that slot instead of growing.
+        let len = addrs.len();
+        iface.add_ip_address(v4(10, 1, 1, 1, 24)).unwrap();
+        assert_eq!(iface.get_ip_address().len(), len);
+    }
+
+    /// The test above can pass on one of the spare blanks `interface` starts
+    /// with. Here the slot the removal frees is the only free one there is, so
+    /// a list that stays two long is the slot itself being reused.
+    #[test]
+    fn the_slot_a_removal_frees_is_the_one_reused() {
+        let addr = v4(172, 16, 0, 1, 16);
+        let iface = interface_with(vec![addr, IpCidr::Ipv6(Ipv6Cidr::new(link_local(), 64))]);
+        iface.remove_ip_address(addr).unwrap();
+        let added = v4(10, 1, 1, 1, 24);
+
+        iface.add_ip_address(added).unwrap();
+
+        let addrs = iface.get_ip_address();
+        assert_eq!(addrs.len(), 2, "the freed slot was not reused: {:?}", addrs);
+        assert!(addrs.contains(&added), "{:?}", addrs);
+    }
+
+    // ---------------------------------------------------------------- routes
+
+    /// A route to a named network does not touch the default route. This is the
+    /// shape of a DHCP lease that carries a static route, and the purge used to
+    /// run for it: `0.0.0.0/0` disappeared from the table the kernel reports
+    /// while smoltcp went on routing through it.
+    #[test]
+    fn a_route_to_a_network_does_not_delete_the_default_route() {
+        let iface = interface();
+        let gw = IpAddress::v4(10, 0, 2, 2);
+        iface.add_route(v4(0, 0, 0, 0, 0), Some(gw)).unwrap();
+        iface.add_route(v4(10, 20, 0, 0, 16), Some(gw)).unwrap();
+        let routes = iface.get_routes();
+        assert!(
+            routes.iter().any(|r| r.dst == v4(0, 0, 0, 0, 0)),
+            "the default route went with the static one: {:?}",
+            routes
+        );
+        assert!(
+            routes.iter().any(|r| r.dst == v4(10, 20, 0, 0, 16)),
+            "{:?}",
+            routes
+        );
+        assert_eq!(
+            gateway_in_the_stack(&iface, v4(0, 0, 0, 0, 0)),
+            Some(gw),
+            "the stack lost the default route too"
+        );
+    }
+
+    /// A new default route replaces the old one in both tables, and it is the
+    /// one the stack actually routes through.
+    #[test]
+    fn a_new_default_route_replaces_the_old_one_in_both_tables() {
+        let iface = interface();
+        let first = IpAddress::v4(10, 0, 2, 2);
+        let second = IpAddress::v4(10, 0, 2, 3);
+        iface.add_route(v4(0, 0, 0, 0, 0), Some(first)).unwrap();
+        iface.add_route(v4(0, 0, 0, 0, 0), Some(second)).unwrap();
+        let routes = iface.get_routes();
+        assert_eq!(
+            routes.iter().filter(|r| r.dst == v4(0, 0, 0, 0, 0)).count(),
+            1,
+            "two default routes reported: {:?}",
+            routes
+        );
+        assert_eq!(
+            routes
+                .iter()
+                .find(|r| r.dst == v4(0, 0, 0, 0, 0))
+                .and_then(|r| r.gateway),
+            Some(second)
+        );
+        assert_eq!(
+            gateway_in_the_stack(&iface, v4(0, 0, 0, 0, 0)),
+            Some(second)
+        );
+    }
+
+    /// The IPv6 side is its own table: an IPv6 prefix route must not take the
+    /// IPv6 default route, and the IPv4 default route is not an IPv6 one.
+    #[test]
+    fn an_ipv6_route_to_a_prefix_does_not_delete_the_ipv6_default_route() {
+        let iface = interface();
+        let gw4 = IpAddress::v4(10, 0, 2, 2);
+        let gw6 = IpAddress::v6(0xfe80, 0, 0, 0, 0, 0, 0, 1);
+        let any6 = IpCidr::Ipv6(Ipv6Cidr::new(Ipv6Address::UNSPECIFIED, 0));
+        let prefix6 = IpCidr::Ipv6(Ipv6Cidr::new(
+            Ipv6Address::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0),
+            32,
+        ));
+        iface.add_route(v4(0, 0, 0, 0, 0), Some(gw4)).unwrap();
+        iface.add_route(any6, Some(gw6)).unwrap();
+        iface.add_route(prefix6, Some(gw6)).unwrap();
+        let routes = iface.get_routes();
+        assert!(
+            routes.iter().any(|r| r.dst == any6),
+            "the IPv6 default route went with the prefix: {:?}",
+            routes
+        );
+        assert!(
+            routes.iter().any(|r| r.dst == v4(0, 0, 0, 0, 0)),
+            "the IPv4 default route was taken by an IPv6 route: {:?}",
+            routes
+        );
+    }
+
+    /// A route with no gateway is on-link and still reported.
+    #[test]
+    fn a_route_with_no_gateway_is_reported_too() {
+        let iface = interface();
+        iface.add_route(v4(10, 20, 0, 0, 16), None).unwrap();
+        let routes = iface.get_routes();
+        let r = routes
+            .iter()
+            .find(|r| r.dst == v4(10, 20, 0, 0, 16))
+            .expect("an on-link route must be reported");
+        assert_eq!(r.gateway, None);
+    }
+
+    /// Deleting a route takes that one and only that one, and deleting the
+    /// default route takes it out of the stack's own table as well -- otherwise
+    /// smoltcp keeps sending through a gateway the kernel no longer reports.
+    #[test]
+    fn a_deleted_route_is_the_only_one_that_goes() {
+        let iface = interface();
+        let gw = IpAddress::v4(10, 0, 2, 2);
+        iface.add_route(v4(0, 0, 0, 0, 0), Some(gw)).unwrap();
+        iface.add_route(v4(10, 20, 0, 0, 16), Some(gw)).unwrap();
+        iface.del_route(v4(10, 20, 0, 0, 16), None).unwrap();
+        let routes = iface.get_routes();
+        assert!(
+            !routes.iter().any(|r| r.dst == v4(10, 20, 0, 0, 16)),
+            "{:?}",
+            routes
+        );
+        assert!(
+            routes.iter().any(|r| r.dst == v4(0, 0, 0, 0, 0)),
+            "{:?}",
+            routes
+        );
+
+        iface.del_route(v4(0, 0, 0, 0, 0), None).unwrap();
+        assert!(
+            !iface
+                .get_routes()
+                .iter()
+                .any(|r| r.dst == v4(0, 0, 0, 0, 0)),
+            "the default route is still reported"
+        );
+        assert_eq!(
+            gateway_in_the_stack(&iface, v4(0, 0, 0, 0, 0)),
+            None,
+            "the stack still routes through the deleted default route"
+        );
+    }
+
+    /// Each configured address reports a direct route to its own network, not to
+    /// the address: `/proc/net/route` is read as "this prefix is on-link".
+    #[test]
+    fn a_configured_address_reports_a_direct_route_to_its_network() {
+        let iface = interface();
+        iface
+            .set_ipv4_address(Ipv4Cidr::new(Ipv4Address::new(10, 0, 2, 15), 24))
+            .unwrap();
+        let routes = iface.get_routes();
+        assert!(
+            routes
+                .iter()
+                .any(|r| r.dst == v4(10, 0, 2, 0, 24) && r.gateway.is_none()),
+            "no direct route to the network: {:?}",
+            routes
+        );
+        assert!(
+            !routes.iter().any(|r| r.dst == v4(10, 0, 2, 15, 24)),
+            "the address itself was reported as a route: {:?}",
+            routes
+        );
+        // The blanks are not networks, so they report nothing.
+        assert!(
+            !routes.iter().any(|r| r.dst.prefix_len() == 0),
+            "a blank address slot was reported as a route: {:?}",
+            routes
+        );
+        // And the link-local does: it is a real /64 the interface is on.
+        assert!(
+            routes
+                .iter()
+                .any(|r| matches!(r.dst, IpCidr::Ipv6(_)) && r.gateway.is_none()),
+            "no direct route for the link-local: {:?}",
+            routes
+        );
+    }
+
+    // ------------------------------------------------------- what it reports
+
+    /// The MTU the kernel reports is the payload, 1500; smoltcp's cap is the
+    /// whole frame, 1514. Reporting the frame size as the MTU makes every
+    /// userspace sizing calculation 14 bytes too generous.
+    #[test]
+    fn the_mtu_the_kernel_reports_is_the_payload_and_the_cap_is_the_frame() {
+        let iface = interface();
+        assert_eq!(iface.get_mtu(), 1500);
+        let caps = iface.driver.capabilities();
+        assert_eq!(caps.max_transmission_unit, 1514);
+        assert_eq!(
+            caps.max_transmission_unit - iface.get_mtu(),
+            14,
+            "the two have to differ by exactly the Ethernet header"
+        );
+    }
+
+    /// `max_burst_size` must stay unset: smoltcp clamps the advertised TCP
+    /// window to `burst * MSS` and stores it in a `u16`, so any burst at all
+    /// wraps the window down to a few KiB.
+    #[test]
+    fn the_burst_size_is_left_unset_so_the_tcp_window_is_not_clamped() {
+        let iface = interface();
+        assert_eq!(iface.driver.capabilities().max_burst_size, None);
+    }
+
+    /// An interface with no IPv4 slot at all still takes a lease: the fallback
+    /// writes it into the first slot there is. Without it the machine simply
+    /// never gets an IPv4 address, and nothing says so.
+    #[test]
+    fn a_lease_lands_even_on_an_interface_with_no_ipv4_slot() {
+        let iface = interface_with(vec![IpCidr::Ipv6(Ipv6Cidr::new(link_local(), 64))]);
+        iface
+            .set_ipv4_address(Ipv4Cidr::new(Ipv4Address::new(10, 0, 2, 15), 24))
+            .unwrap();
+        assert!(
+            iface.get_ip_address().contains(&v4(10, 0, 2, 15, 24)),
+            "the lease was dropped on the floor: {:?}",
+            iface.get_ip_address()
+        );
+    }
+
+    /// `240.0.0.0/32` is the second sentinel the free-slot test knows. Nothing
+    /// in the tree writes it, so only a configured address puts it there -- and
+    /// once there it is a free slot, exactly like a blank.
+    #[test]
+    fn the_other_free_slot_sentinel_is_reused_too() {
+        let iface = interface();
+        let sentinel = v4(240, 0, 0, 0, 32);
+        // Fill the blanks, then put the sentinel in the last one.
+        iface.add_ip_address(v4(172, 16, 0, 1, 16)).unwrap();
+        iface.add_ip_address(v4(172, 16, 1, 1, 16)).unwrap();
+        iface.add_ip_address(sentinel).unwrap();
+        let len = iface.get_ip_address().len();
+        assert_eq!(len, 4, "the sentinel should have taken the last blank");
+
+        iface.add_ip_address(v4(10, 1, 1, 1, 24)).unwrap();
+        let addrs = iface.get_ip_address();
+        assert_eq!(
+            addrs.len(),
+            len,
+            "the sentinel slot was not reused: {:?}",
+            addrs
+        );
+        assert!(!addrs.contains(&sentinel), "{:?}", addrs);
+    }
+
+    /// `recv` copies as much as the caller's buffer holds and says how much.
+    /// Copying the whole frame into a shorter buffer is a panic in the kernel.
+    #[test]
+    fn recv_copies_no_more_than_the_buffer_holds() {
+        let iface = interface();
+        let frame = [0xa5u8; 300];
+        {
+            let hw = iface.driver.hw.lock();
+            super::rx_ring_tests::hw_deliver(&hw, 0, &frame);
+        }
+        let mut buf = [0u8; 64];
+        let n = iface.recv(&mut buf).expect("a frame was delivered");
+        assert_eq!(n, 64, "recv must stop at the buffer");
+        assert!(buf.iter().all(|b| *b == 0xa5));
+    }
+
+    /// Nothing queued is "not ready", not "not supported": a caller that polls
+    /// has to be able to tell "come back later" from "this never works".
+    #[test]
+    fn recv_with_nothing_queued_says_not_ready() {
+        let iface = interface();
+        let mut buf = [0u8; 64];
+        assert_eq!(iface.recv(&mut buf), Err(DeviceError::NotReady));
+    }
+
+    /// The carrier is up if the driver saw it up OR the status register says so
+    /// right now. Each half alone is enough: the register is the truth after a
+    /// link change nobody has polled yet, and the flag is the truth while the
+    /// register is being reset.
+    #[test]
+    fn the_carrier_is_up_if_either_the_driver_or_the_register_says_so() {
+        let iface = interface();
+        unsafe {
+            core::ptr::write_volatile((iface.base + E1000E_STATUS * 4) as *mut u32, 0);
+        }
+        iface.driver.hw.lock().link_up = false;
+        assert!(!iface.link_carrier_up(), "neither half says up");
+
+        iface.driver.hw.lock().link_up = true;
+        assert!(iface.link_carrier_up(), "the driver's own flag was ignored");
+
+        iface.driver.hw.lock().link_up = false;
+        unsafe {
+            core::ptr::write_volatile((iface.base + E1000E_STATUS * 4) as *mut u32, STATUS_LU);
+        }
+        assert!(
+            iface.link_carrier_up(),
+            "the status register was ignored, so a link that came up since the \
+             last poll reads as down"
+        );
+    }
+
+    /// A default route added after a named one replaces only the default: the
+    /// purge is of default routes, not of everything with a gateway.
+    #[test]
+    fn a_default_route_added_last_does_not_take_the_named_routes_with_it() {
+        let iface = interface();
+        let gw = IpAddress::v4(10, 0, 2, 2);
+        iface.add_route(v4(10, 20, 0, 0, 16), Some(gw)).unwrap();
+        iface.add_route(v4(10, 30, 0, 0, 16), Some(gw)).unwrap();
+        iface.add_route(v4(0, 0, 0, 0, 0), Some(gw)).unwrap();
+        let routes = iface.get_routes();
+        for want in [
+            v4(10, 20, 0, 0, 16),
+            v4(10, 30, 0, 0, 16),
+            v4(0, 0, 0, 0, 0),
+        ] {
+            assert!(
+                routes.iter().any(|r| r.dst == want),
+                "{} went with the default route: {:?}",
+                want,
+                routes
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod itr_and_health_tests {
+    //! The interrupt-throttling state machine and the two self-healing bits
+    //! around it, driven through the real `E1000eHw` over host memory.
+    //!
+    //! `choose_itr` is pure and already tested; what was not is the half that
+    //! decides *when* to ask it, writes the answer to the NIC, and keeps the
+    //! packet window from being reset on every poll -- which is exactly the bug
+    //! the comment above `tune_itr` describes.
+
+    use super::rx_ring_tests::make_hw;
+    use super::*;
+    extern crate std;
+
+    fn itr_register(hw: &E1000eHw) -> u32 {
+        unsafe { core::ptr::read_volatile((hw.base + E1000E_ITR * 4) as *const u32) }
+    }
+
+    /// A heavy single-poll burst goes to THROUGHPUT at once, without waiting for
+    /// the tune period -- and it reaches the NIC, not only the shadow copy.
+    #[test]
+    fn a_burst_upgrades_to_throughput_immediately_and_reaches_the_register() {
+        let mut hw = make_hw();
+        hw.itr_setting = E1000E_ITR_LOW_LATENCY;
+        hw.itr_tune_next_us = 1_000_000; // far away: only the burst can act
+        hw.tune_itr(0, E1000E_ITR_BURST_THROUGHPUT);
+        assert_eq!(hw.itr_setting, E1000E_ITR_THROUGHPUT);
+        assert_eq!(
+            itr_register(&hw),
+            E1000E_ITR_THROUGHPUT,
+            "the setting was remembered but never programmed"
+        );
+    }
+
+    /// One packet short of a burst is not a burst, and with the window still
+    /// open nothing is programmed at all.
+    #[test]
+    fn one_packet_short_of_a_burst_changes_nothing() {
+        let mut hw = make_hw();
+        hw.itr_setting = E1000E_ITR_LOW_LATENCY;
+        hw.itr_tune_next_us = 1_000_000;
+        hw.tune_itr(0, E1000E_ITR_BURST_THROUGHPUT - 1);
+        assert_eq!(hw.itr_setting, E1000E_ITR_LOW_LATENCY);
+        assert_eq!(itr_register(&hw), 0, "nothing should have been programmed");
+    }
+
+    /// A burst stretches the next window instead of sampling now: resetting the
+    /// window on every poll is what kept a steady download on LOW_LATENCY.
+    #[test]
+    fn a_burst_pushes_the_next_window_out_instead_of_sampling_now() {
+        let mut hw = make_hw();
+        hw.itr_tune_next_us = 0;
+        hw.stats.rx_packets = 9_999;
+        hw.itr_last_rx_packets = 0;
+        hw.tune_itr(1_000, E1000E_ITR_BURST_THROUGHPUT);
+        assert_eq!(
+            hw.itr_tune_next_us,
+            1_000 + E1000E_ITR_TUNE_PERIOD_US,
+            "the window was not stretched"
+        );
+        assert_eq!(
+            hw.itr_last_rx_packets, 0,
+            "the burst path must not consume the window sample"
+        );
+    }
+
+    /// Before the tune period is up, a quiet poll does nothing: no sample, no
+    /// write, no window move.
+    #[test]
+    fn nothing_happens_before_the_tune_period_is_up() {
+        let mut hw = make_hw();
+        hw.itr_setting = E1000E_ITR_THROUGHPUT;
+        hw.itr_tune_next_us = 500;
+        hw.stats.rx_packets = 1_000;
+        hw.itr_last_rx_packets = 0;
+        hw.tune_itr(499, 0);
+        assert_eq!(hw.itr_setting, E1000E_ITR_THROUGHPUT);
+        assert_eq!(hw.itr_tune_next_us, 500, "the window moved early");
+        assert_eq!(hw.itr_last_rx_packets, 0, "the window was sampled early");
+    }
+
+    /// On the period, the window delta decides, the sample is consumed so the
+    /// next window measures only new packets, and the window moves on.
+    #[test]
+    fn on_the_period_the_window_delta_decides_and_the_sample_is_consumed() {
+        let mut hw = make_hw();
+        hw.itr_setting = E1000E_ITR_LOW_LATENCY;
+        hw.itr_tune_next_us = 100;
+        hw.stats.rx_packets = E1000E_ITR_WINDOW_THROUGHPUT;
+        hw.itr_last_rx_packets = 0;
+        hw.tune_itr(100, 0);
+        assert_eq!(hw.itr_setting, E1000E_ITR_THROUGHPUT);
+        assert_eq!(itr_register(&hw), E1000E_ITR_THROUGHPUT);
+        assert_eq!(
+            hw.itr_last_rx_packets, E1000E_ITR_WINDOW_THROUGHPUT,
+            "the sample was not consumed, so the next window counts these again"
+        );
+        assert_eq!(hw.itr_tune_next_us, 100 + E1000E_ITR_TUNE_PERIOD_US);
+
+        // A second period with nothing new drops to LOW_LATENCY, which is the
+        // whole point of consuming the sample.
+        hw.tune_itr(100 + E1000E_ITR_TUNE_PERIOD_US, 0);
+        assert_eq!(hw.itr_setting, E1000E_ITR_LOW_LATENCY);
+    }
+
+    /// A setting that does not change is not rewritten: the register write is a
+    /// posted MMIO store on the hot path.
+    #[test]
+    fn a_setting_that_does_not_change_is_not_rewritten() {
+        let mut hw = make_hw();
+        hw.itr_setting = E1000E_ITR_THROUGHPUT;
+        hw.itr_tune_next_us = 0;
+        hw.stats.rx_packets = E1000E_ITR_WINDOW_THROUGHPUT;
+        hw.itr_last_rx_packets = 0;
+        hw.tune_itr(0, 0);
+        assert_eq!(hw.itr_setting, E1000E_ITR_THROUGHPUT);
+        assert_eq!(
+            itr_register(&hw),
+            0,
+            "the register was written for a setting that had not changed"
+        );
+    }
+
+    /// How many descriptors the hardware has filled, counted the way the ring
+    /// wraps: head behind the cursor means the ring went round.
+    #[test]
+    fn the_descriptors_the_hardware_filled_are_counted_across_the_wrap() {
+        let mut hw = make_hw();
+        hw.rx_next_to_clean = 0;
+        assert_eq!(hw.rx_avail_to_rdh(0), 0);
+        assert_eq!(hw.rx_avail_to_rdh(5), 5);
+        assert_eq!(hw.rx_avail_to_rdh(NUM_RX - 1), NUM_RX - 1);
+        // Head has wrapped past the cursor.
+        hw.rx_next_to_clean = NUM_RX - 2;
+        assert_eq!(hw.rx_avail_to_rdh(1), 3, "the wrap was not counted");
+        assert_eq!(hw.rx_avail_to_rdh(NUM_RX - 2), 0);
+    }
+
+    /// The stats the kernel reads are the driver's own, not a fresh zero: a
+    /// `merged_stats` that invented them would make every counter in
+    /// `/proc/net/dev` read zero forever.
+    #[test]
+    fn the_stats_reported_are_the_ones_the_driver_kept() {
+        let mut hw = make_hw();
+        hw.stats.rx_packets = 17;
+        hw.stats.tx_packets = 5;
+        hw.stats.rx_bytes = 2048;
+        let s = hw.merged_stats();
+        assert_eq!(s.rx_packets, 17);
+        assert_eq!(s.tx_packets, 5);
+        assert_eq!(s.rx_bytes, 2048);
+    }
+}
+
+#[cfg(test)]
+mod poll_pending_health_tests {
+    //! `heal_stuck_poll_pending`: the escape hatch for an IRQ bottom-half that
+    //! was evicted from the shared deferred-job queue and will never run.
+    //!
+    //! Both halves of it matter and in opposite directions. Clearing the flag
+    //! too eagerly lets a second bottom-half run while the first still owns the
+    //! IMS mask; never clearing it leaves the NIC interrupt-deaf for good.
+
+    use super::scheme_tests::interface;
+    use super::*;
+    use crate::nvme::nvme_queue::test_clock;
+    extern crate std;
+
+    fn with_pending(set_at_us: u64) -> E1000eInterface {
+        let iface = interface();
+        iface.poll_pending.store(true, Ordering::SeqCst);
+        iface
+            .poll_pending_set_us
+            .store(set_at_us, Ordering::Relaxed);
+        iface
+    }
+
+    /// A bottom-half that is merely awaiting its turn is not evicted, so the
+    /// flag stays: healing it would let a second one in under the same mask.
+    #[test]
+    fn a_pending_bottom_half_inside_the_deadline_is_left_alone() {
+        test_clock::set(POLL_PENDING_STUCK_US);
+        let iface = with_pending(1);
+        iface.heal_stuck_poll_pending();
+        assert!(iface.poll_pending.load(Ordering::SeqCst));
+    }
+
+    /// Exactly on the deadline is still inside it: the flag goes only once the
+    /// deadline is passed.
+    #[test]
+    fn exactly_on_the_deadline_is_still_inside_it() {
+        test_clock::set(POLL_PENDING_STUCK_US + 1);
+        let iface = with_pending(1);
+        iface.heal_stuck_poll_pending();
+        assert!(
+            iface.poll_pending.load(Ordering::SeqCst),
+            "healed at exactly the deadline instead of past it"
+        );
+    }
+
+    /// Past the deadline the flag is cleared, which is what lets the next IRQ
+    /// queue a fresh bottom-half instead of taking the "already pending" path.
+    #[test]
+    fn a_bottom_half_stuck_past_the_deadline_is_cleared() {
+        test_clock::set(POLL_PENDING_STUCK_US + 2);
+        let iface = with_pending(1);
+        iface.heal_stuck_poll_pending();
+        assert!(
+            !iface.poll_pending.load(Ordering::SeqCst),
+            "a bottom-half past the deadline was not healed"
+        );
+    }
+
+    /// A flag with no timestamp behind it is not evidence of anything, however
+    /// late the clock is: the stamp is written after the flag, so zero means
+    /// "set just now, between the two stores".
+    #[test]
+    fn a_flag_with_no_timestamp_is_not_healed_however_late_the_clock() {
+        test_clock::set(POLL_PENDING_STUCK_US * 100);
+        let iface = with_pending(0);
+        iface.heal_stuck_poll_pending();
+        assert!(
+            iface.poll_pending.load(Ordering::SeqCst),
+            "a flag set between the two stores was healed out from under its owner"
+        );
     }
 }

@@ -1412,6 +1412,16 @@ impl Executor {
                 crate::runtime::sched_yield();
                 continue;
             }
+            // A reschedule request for this CPU means "look at your run queue
+            // soon". We are about to, so it is satisfied here, before the scan
+            // rather than only when the scan comes up empty: with work in the
+            // queue the empty branch below is never reached, so the bit stayed
+            // set for the rest of the run and `request_resched` took its
+            // already-pending early return for every later wake — no IPI, each
+            // wake waiting for the next interrupt. See
+            // `runtime::clear_need_resched` for why this must be on this side
+            // of the scan.
+            crate::runtime::clear_need_resched(crate::arch::cpu_id() as usize);
             let mut task_info = None;
             if crate::runtime::rebalance_due() {
                 // Rescue first, and with no condition on our own load: a peer
@@ -1544,10 +1554,9 @@ impl Executor {
                     return;
                 }
             } else {
-                // Our run queue is drained (and stealing found nothing), so any
-                // pending wake-up preemption request for this CPU has already
-                // been satisfied by simply running out of work. Drop it: a stale
-                // bit would suppress the coalesced IPI for the next real wake.
+                // Our run queue is drained (and stealing found nothing), so a
+                // request raised *during* the scan above has also been satisfied
+                // by simply running out of work.
                 crate::runtime::clear_need_resched(crate::arch::cpu_id() as usize);
                 let runtime = crate::runtime::get_current_runtime();
                 let task_num = runtime.task_num();
