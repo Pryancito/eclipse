@@ -33,12 +33,12 @@ pub const OS_TYPE: &str = "Eclipse";
 /// 6.6 is the LTS whose ABI subset this tree implements: above every glibc
 /// minimum in circulation, and consistent with the interfaces already here
 /// that postdate 5.15 (`MFD_NOEXEC_SEAL` is 6.3).
-pub const ECLIPSE_VERSION: &str = "0.5.9";
+pub const ECLIPSE_VERSION: &str = "0.5.10";
 #[cfg(target_os = "none")]
-pub const OS_RELEASE: &str = "0.5.9";
+pub const OS_RELEASE: &str = "0.5.10";
 /// LibOS builds keep their distinguishing suffix, still in parseable form.
 #[cfg(not(target_os = "none"))]
-pub const OS_RELEASE: &str = "0.5.9-libos";
+pub const OS_RELEASE: &str = "0.5.10-libos";
 
 /// Maximum length of a host or domain name, per POSIX HOST_NAME_MAX on Linux
 /// (`sethostname(2)` answers EINVAL above this).

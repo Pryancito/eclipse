@@ -1534,6 +1534,13 @@ pub fn cpu_prep_fences(gem_handle: u32, owner_pid: u64) -> Vec<(usize, u32)> {
 /// [`DrmFileState`] via [`super::drm_scheme::DrmDev::open_client`].
 pub struct DrmFileState {
     atomic_client: AtomicBool,
+    /// `drm_file.universal_planes`: set by `DRM_CLIENT_CAP_UNIVERSAL_PLANES`,
+    /// and by `DRM_CLIENT_CAP_ATOMIC` together with `atomic_client`. Until a
+    /// client sets it, `GETPLANERESOURCES` lists only overlay planes, as
+    /// `drm_mode_getplane_res` does: a legacy client was written when the
+    /// primary and the cursor were not planes, and would drive them as
+    /// overlays.
+    universal_planes: AtomicBool,
     events: Mutex<VecDeque<Vec<u8>>>,
     eventbus: Arc<Mutex<EventBus>>,
     /// The nouveau GEM handles this open imported through `PRIME_FD_TO_HANDLE`
@@ -1547,6 +1554,7 @@ impl DrmFileState {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
             atomic_client: AtomicBool::new(false),
+            universal_planes: AtomicBool::new(false),
             events: Mutex::new(VecDeque::new()),
             eventbus: EventBus::new(),
             prime_imports: Mutex::new(Vec::new()),
@@ -1587,6 +1595,14 @@ impl DrmFileState {
 
     pub fn atomic_client(&self) -> bool {
         self.atomic_client.load(Ordering::Relaxed)
+    }
+
+    pub fn set_universal_planes(&self, on: bool) {
+        self.universal_planes.store(on, Ordering::Relaxed);
+    }
+
+    pub fn universal_planes(&self) -> bool {
+        self.universal_planes.load(Ordering::Relaxed)
     }
 
     pub fn eventbus(&self) -> Arc<Mutex<EventBus>> {
@@ -1792,6 +1808,9 @@ struct DrmBlob {
     /// Whether userspace created it (`CREATEPROPBLOB`). Kernel-created blobs
     /// (current mode, EDID) refuse `DESTROYPROPBLOB` with EPERM like Linux.
     user_created: bool,
+    /// Pid that created a user blob; 0 for kernel-owned. Only this pid may
+    /// `DESTROYPROPBLOB` it (Linux: `blob->file_priv` ownership).
+    owner_pid: u64,
     data: Vec<u8>,
 }
 
@@ -2332,7 +2351,9 @@ pub fn get_compute_driver() -> Option<Arc<dyn DrmScheme>> {
 /// window-resize / redraw storm the compositor can CREATE_DUMB faster than
 /// it DESTROYs; without a cap, frame-allocator pressure eventually smashes
 /// heap metadata and shows up as a null fn-ptr #PF after tens of minutes.
-const MAX_LIVE_GEMS: usize = 64;
+/// 64 was too tight for a multi-output compositor (a few buffers per plane
+/// per output plus PRIME imports); 256 still bounds the storm.
+const MAX_LIVE_GEMS: usize = 256;
 
 /// Allocate a buffer (GEM object).
 ///
@@ -6339,8 +6360,9 @@ pub fn vblank_deadline_for_seq(target: u32) -> Option<Duration> {
 }
 
 /// Create a KMS property blob (`DRM_IOCTL_MODE_CREATEPROPBLOB`) and return its
-/// id. `user_created` distinguishes client blobs (destroyable) from
-/// kernel-owned ones (current mode), mirroring Linux's ownership rule.
+/// id. `user_created` distinguishes client blobs (destroyable by their
+/// creator) from kernel-owned ones (current mode), mirroring Linux's
+/// ownership rule.
 pub fn create_blob(data: Vec<u8>, user_created: bool) -> u32 {
     let mut state = DRM_STATE.lock();
     let id = state.next_blob_id;
@@ -6348,6 +6370,7 @@ pub fn create_blob(data: Vec<u8>, user_created: bool) -> u32 {
     state.blobs.push(DrmBlob {
         id,
         user_created,
+        owner_pid: if user_created { current_pid() } else { 0 },
         data,
     });
     id
@@ -6371,14 +6394,18 @@ pub enum BlobDestroy {
     NotFound,
     /// Kernel-created blob (current mode, …): only the creator may destroy.
     KernelOwned,
+    /// User blob owned by another process.
+    NotOwner,
 }
 
-/// Destroy a user-created blob.
+/// Destroy a user-created blob owned by the calling process.
 pub fn destroy_blob(id: u32) -> BlobDestroy {
+    let pid = current_pid();
     let mut state = DRM_STATE.lock();
     match state.blobs.iter().position(|b| b.id == id) {
         None => BlobDestroy::NotFound,
         Some(pos) if !state.blobs[pos].user_created => BlobDestroy::KernelOwned,
+        Some(pos) if state.blobs[pos].owner_pid != pid => BlobDestroy::NotOwner,
         Some(pos) => {
             state.blobs.remove(pos);
             BlobDestroy::Destroyed
@@ -6742,6 +6769,7 @@ pub fn atomic_commit(
                     state.blobs.push(DrmBlob {
                         id,
                         user_created: false,
+                        owner_pid: 0,
                         data,
                     });
                     state.atomic.mode_blob_id = id;

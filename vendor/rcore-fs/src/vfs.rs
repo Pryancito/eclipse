@@ -363,6 +363,10 @@ pub enum FsError {
     NotSameFs,     // E_XDEV
     InvalidParam,  // E_INVAL
     NoDeviceSpace, // E_NOSPC, but is defined and not used in the original ucore, which uses E_NO_MEM
+    /// E_NOMEM (12): out of memory / resource allocation refused. Distinct
+    /// from `NoDeviceSpace` (ENOSPC): DRM GEM/`CREATE_DUMB` and oversized
+    /// syncobj arrays are ENOMEM on Linux, not "disk full".
+    NoMemory,
     DirRemoved,    // E_NOENT, when the current dir was remove by a previous unlink
     DirNotEmpty,   // E_NOTEMPTY
     WrongFs,       // E_INVAL, when we find the content on disk is wrong when opening the device
@@ -377,6 +381,11 @@ pub enum FsError {
     ReadOnly,       // E_ROFS
     Interrupted,    // E_INTR
     NoPermission,   // E_ACCES, e.g. modeset ioctls on a DRM render node
+    /// E_PERM (1): the operation is forbidden for this object, not merely
+    /// for this caller's credentials. Distinct from `NoPermission` (EACCES):
+    /// Linux's `DESTROYPROPBLOB` on a kernel-owned blob is EPERM, while a
+    /// modeset ioctl on a render node is EACCES.
+    NotPermitted,
     OpNotSupported, // E_OPNOTSUPP, e.g. an ioctl the device genuinely lacks
     BadAddress,     // E_FAULT, a user pointer outside the user address range
     /// E_BADFD (77): the file descriptor is valid but the object behind it is

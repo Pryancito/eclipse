@@ -293,6 +293,7 @@ impl From<&FsError> for LxError {
             // memory and, worse, retry -- musl's stdio, package managers and
             // sqlite all branch on ENOSPC specifically and on nothing else.
             FsError::NoDeviceSpace => LxError::ENOSPC,
+            FsError::NoMemory => LxError::ENOMEM,
             FsError::DirRemoved => LxError::ENOENT,
             FsError::DirNotEmpty => LxError::ENOTEMPTY,
             FsError::WrongFs => LxError::EINVAL,
@@ -312,6 +313,7 @@ impl From<&FsError> for LxError {
             FsError::ReadOnly => LxError::EROFS,
             FsError::Interrupted => LxError::EINTR,
             FsError::NoPermission => LxError::EACCES,
+            FsError::NotPermitted => LxError::EPERM,
             FsError::OpNotSupported => LxError::EOPNOTSUPP,
             FsError::BadAddress => LxError::EFAULT,
             FsError::BadState => LxError::EBADFD,
@@ -415,6 +417,7 @@ mod errno_tests {
             (FsError::NotSameFs, LxError::EXDEV),
             (FsError::InvalidParam, LxError::EINVAL),
             (FsError::NoDeviceSpace, LxError::ENOSPC),
+            (FsError::NoMemory, LxError::ENOMEM),
             (FsError::DirRemoved, LxError::ENOENT),
             (FsError::DirNotEmpty, LxError::ENOTEMPTY),
             (FsError::WrongFs, LxError::EINVAL),
@@ -428,6 +431,7 @@ mod errno_tests {
             (FsError::ReadOnly, LxError::EROFS),
             (FsError::Interrupted, LxError::EINTR),
             (FsError::NoPermission, LxError::EACCES),
+            (FsError::NotPermitted, LxError::EPERM),
             (FsError::OpNotSupported, LxError::EOPNOTSUPP),
             (FsError::BadAddress, LxError::EFAULT),
             (FsError::BadState, LxError::EBADFD),

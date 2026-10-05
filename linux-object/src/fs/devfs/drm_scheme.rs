@@ -684,41 +684,11 @@ impl DrmDev {
         // Render nodes only accept DRM_RENDER_ALLOW ioctls (drm-uapi.rst
         // "Render nodes"): modeset, dumb-buffer and master/auth commands get
         // EACCES exactly like Linux, so a client probing `renderD128` sees a
-        // render node, not a second KMS device.
+        // render node, not a second KMS device. The desktop pins KMS to
+        // `card0` via `WLR_DRM_DEVICES`, so enforcing here no longer takes
+        // the software-GL path down with a second open KMS node.
         if self.minor >= 128 && !render_allowed(cmd) {
-            // OBSERVE, DO NOT ENFORCE (yet).
-            //
-            // `render_allowed` used to extract the NR as `(cmd >> 8) & 0xff`,
-            // which is the ioctl TYPE byte -- 'd' (0x64) for every DRM ioctl,
-            // and 0x64 sits inside the driver-private `0x40..=0x9F` arm. The
-            // filter has therefore ACCEPTED EVERYTHING since it was written,
-            // and renderD128 has behaved as a fully-open second KMS node.
-            //
-            // Fixing the extraction (correct, and it now matches Linux's
-            // DRM_RENDER_ALLOW set exactly) would in the same step start
-            // refusing every dumb-buffer and modeset ioctl on the render node
-            // -- CREATE_DUMB/MAP_DUMB/ADDFB2/PAGE_FLIP/... -- on a software-GL
-            // desktop that currently boots and that this change cannot be
-            // tested against. Turning a silent no-op into an enforcing gate
-            // blind is exactly the kind of regression worth avoiding, so log
-            // the would-be refusal and let the call through. Flip this to
-            // `return Err(FsError::NoPermission)` once a boot log shows the
-            // line never appears on the software path.
-            //
-            // De-duped per NR: the caller controls the rate, and `klog_info!`
-            // has no level filter, no rate limit and goes straight out the
-            // UART -- an unthrottled line here would let a client that retries
-            // in a loop flood the serial console and stall the boot.
-            static REFUSAL_LOGGED: [AtomicBool; 256] = [const { AtomicBool::new(false) }; 256];
-            let nr = (cmd & 0xff) as usize;
-            if !REFUSAL_LOGGED[nr].swap(true, Ordering::Relaxed) {
-                kernel_hal::klog_info!(
-                    "[drm] render node: ioctl {:#010x} (drm nr={:#04x}) is NOT in Linux's \
-                     DRM_RENDER_ALLOW set -- allowed anyway for now, see render_allowed()",
-                    cmd,
-                    cmd & 0xff
-                );
-            }
+            return Err(FsError::NoPermission);
         }
         // KMS-query trace for Vulkan's VK_KHR_display probe (wsi_display).
         // `vulkaninfo` dies with ERROR_OUT_OF_HOST_MEMORY inside
@@ -1025,6 +995,20 @@ impl DrmDev {
                 unsafe { *(data as *mut u32) = 1 };
                 Ok(0)
             }
+            DRM_IOCTL_GET_CLIENT => {
+                // `struct drm_client`: libva enumerates clients at init.
+                // Single-client stub: idx 0 is this open; anything else ENOENT.
+                let c = unsafe { &mut *(data as *mut DrmClient) };
+                if c.idx != 0 {
+                    return Err(FsError::EntryNotFound);
+                }
+                c.auth = 1;
+                c.pid = drm::current_pid() as usize;
+                c.uid = 0;
+                c.magic = 1;
+                c.iocs = 0;
+                Ok(0)
+            }
             DRM_IOCTL_AUTH_MAGIC => Ok(0),
             DRM_IOCTL_SET_MASTER => {
                 // Become DRM master, but do NOT switch the console to graphics
@@ -1138,8 +1122,10 @@ impl DrmDev {
                         if value > 2 {
                             return Err(FsError::InvalidParam);
                         }
-                        // Setting atomic also implies universal planes.
+                        // Setting atomic also implies universal planes:
+                        // `drm_setclientcap` stores the value in both fields.
                         self.file.set_atomic_client(value != 0);
+                        self.file.set_universal_planes(value != 0);
                         log::debug!("[drm] SET_CLIENT_CAP ATOMIC={} -> accepted", value);
                         Ok(0)
                     }
@@ -1152,13 +1138,26 @@ impl DrmDev {
                         }
                         Ok(0)
                     }
-                    // STEREO_3D, UNIVERSAL_PLANES, ASPECT_RATIO: a boolean
-                    // each in Linux (`drm_setclientcap`: `value > 1` is
-                    // EINVAL); nothing here changes with them, so accept the
-                    // two legal values and refuse the rest.
-                    DRM_CLIENT_CAP_STEREO_3D
-                    | DRM_CLIENT_CAP_UNIVERSAL_PLANES
-                    | DRM_CLIENT_CAP_ASPECT_RATIO => {
+                    // UNIVERSAL_PLANES: a boolean (`value > 1` is EINVAL)
+                    // that `drm_mode_getplane_res` reads. It was accepted and
+                    // forgotten, so a legacy client that never set it was
+                    // handed the primary plane as if it were an overlay.
+                    DRM_CLIENT_CAP_UNIVERSAL_PLANES => {
+                        if value > 1 {
+                            return Err(FsError::InvalidParam);
+                        }
+                        self.file.set_universal_planes(value != 0);
+                        log::debug!(
+                            "[drm] SET_CLIENT_CAP UNIVERSAL_PLANES={} -> accepted",
+                            value
+                        );
+                        Ok(0)
+                    }
+                    // STEREO_3D, ASPECT_RATIO: a boolean each in Linux
+                    // (`drm_setclientcap`: `value > 1` is EINVAL); nothing
+                    // here changes with them, so accept the two legal values
+                    // and refuse the rest.
+                    DRM_CLIENT_CAP_STEREO_3D | DRM_CLIENT_CAP_ASPECT_RATIO => {
                         if value > 1 {
                             return Err(FsError::InvalidParam);
                         }
@@ -1182,7 +1181,13 @@ impl DrmDev {
             }
             DRM_IOCTL_MODE_CREATE_DUMB => {
                 let info = unsafe { &mut *(data as *mut DrmModeCreateDumb) };
-                let bpp = info.bpp.max(32);
+                // Linux: bpp==0 is EINVAL. `.max(32)` used to turn 0 into a
+                // successful 32-bpp alloc and to inflate bpp=16 into 32, so
+                // pitch/size lied about the format the client asked for.
+                if info.bpp == 0 {
+                    return Err(FsError::InvalidParam);
+                }
+                let bpp = info.bpp;
                 // width/height/bpp are userspace-controlled: compute pitch/size
                 // in 64-bit. A 32-bit `width*bpp` or `pitch*height` would wrap
                 // (e.g. 50000x50000x32) and under-allocate the buffer while
@@ -1240,7 +1245,8 @@ impl DrmDev {
                         bpp,
                         size
                     );
-                    Err(FsError::NoDeviceSpace)
+                    // Linux: GEM alloc failure is ENOMEM, not ENOSPC.
+                    Err(FsError::NoMemory)
                 }
             }
             DRM_IOCTL_MODE_ADDFB => {
@@ -1273,6 +1279,11 @@ impl DrmDev {
                     modifier: [0; 4],
                 };
                 addfb2_check(&as_fb2)?;
+                // Linux: unknown GEM handle → ENOENT; bad geometry → EINVAL.
+                // Both used to collapse to DeviceError (EIO).
+                if drm::resolve_gem_backing_for(cmd.handle, drm::current_pid()).is_none() {
+                    return Err(FsError::EntryNotFound);
+                }
                 if let Some(fb_id) = drm::create_fb_with_format(
                     cmd.handle,
                     cmd.width,
@@ -1283,22 +1294,23 @@ impl DrmDev {
                     cmd.fb_id = fb_id;
                     Ok(0)
                 } else {
-                    // [swapchain-diag] error!-visible at LOG=error: a failed FB
-                    // creation makes wlroots' swapchain test fail before any
-                    // atomic commit is even attempted.
                     log::error!(
-                        "[drm] ADDFB failed: {}x{} handle={:#x} pitch={} (create_fb returned None)",
+                        "[drm] ADDFB failed: {}x{} handle={:#x} pitch={} (geometry/format)",
                         cmd.width,
                         cmd.height,
                         cmd.handle,
                         cmd.pitch
                     );
-                    Err(FsError::DeviceError)
+                    Err(FsError::InvalidParam)
                 }
             }
             DRM_IOCTL_MODE_ADDFB2 => {
                 let cmd = unsafe { &mut *(data as *mut DrmModeFbCmd2) };
                 addfb2_check(cmd)?;
+                // Linux: unknown GEM handle → ENOENT; bad geometry → EINVAL.
+                if drm::resolve_gem_backing_for(cmd.handles[0], drm::current_pid()).is_none() {
+                    return Err(FsError::EntryNotFound);
+                }
                 if let Some(fb_id) = drm::create_fb_with_format(
                     cmd.handles[0],
                     cmd.width,
@@ -1309,16 +1321,12 @@ impl DrmDev {
                     cmd.fb_id = fb_id;
                     Ok(0)
                 } else {
-                    // [swapchain-diag] error!-visible at LOG=error: the scanout
-                    // buffer wlroots hands us is rejected HERE, before the atomic
-                    // TEST_ONLY commit — so an empty "ATOMIC reject" grep with
-                    // this line present localises the failure to FB creation.
                     log::error!(
                         "[drm] ADDFB2 failed: {}x{} handle={:#x} pitch={} fmt={:#x} modifier={:#x} \
-                         (create_fb returned None)",
+                         (geometry/format)",
                         cmd.width, cmd.height, cmd.handles[0], cmd.pitches[0], cmd.pixel_format, cmd.modifier[0]
                     );
-                    Err(FsError::DeviceError)
+                    Err(FsError::InvalidParam)
                 }
             }
             DRM_IOCTL_MODE_RMFB => {
@@ -1671,6 +1679,9 @@ impl DrmDev {
                 //
                 // An oversized, zero, or unreadable clip list means "the whole
                 // frame is dirty" (true DIRTYFB semantics for num_clips == 0).
+                // Linux accepts up to 256 clips (`DRM_MODE_FB_DIRTY_MAX_CLIPS`);
+                // 64 made dense-damage frames fall back to a full-screen blit.
+                const MAX_DIRTY_CLIPS: u32 = 256;
                 const MAX_DIRTY_SPANS: usize = 8;
                 let cmd = unsafe { *(data as *const DrmModeFbDirtyCmd) };
                 // `drm_mode_dirtyfb_ioctl`, in its order: a flag it does not
@@ -1705,7 +1716,7 @@ impl DrmDev {
                 let mut n = 0usize;
                 let mut area = 0u64;
                 let mut too_many = false;
-                let rect = if cmd.num_clips > 0 && cmd.num_clips <= 64 && cmd.clips_ptr != 0 {
+                let rect = if cmd.num_clips > 0 && cmd.num_clips <= MAX_DIRTY_CLIPS && cmd.clips_ptr != 0 {
                     ucheck_n::<DrmClipRect>(cmd.clips_ptr as usize, cmd.num_clips as usize)?;
                     let mut union: Option<(u32, u32, u32, u32)> = None;
                     for i in 0..cmd.num_clips as usize {
@@ -2224,14 +2235,32 @@ impl DrmDev {
             }
             DRM_IOCTL_MODE_GETPLANERESOURCES => {
                 let res = unsafe { &mut *(data as *mut DrmModeGetPlaneRes) };
-                let planes = drm::get_planes();
-                if res.plane_id_ptr != 0 && res.count_planes >= planes.len() as u32 {
-                    ucheck_n::<u32>(res.plane_id_ptr as usize, planes.len())?;
+                // `drm_mode_getplane_res`: "unless userspace set the
+                // 'universal planes' capability bit, only advertise
+                // overlays". Every plane here is a primary, so a client that
+                // never set the cap -- one written when the primary and the
+                // cursor were not planes -- gets an empty list, not the
+                // scanout plane to drive as an overlay. The cap was accepted
+                // and ignored, and the list was the same for everyone.
+                let universal = self.file.universal_planes();
+                let planes: alloc::vec::Vec<u32> = drm::get_planes()
+                    .into_iter()
+                    .filter(|&id| {
+                        universal
+                            || drm::get_plane(id)
+                                .is_some_and(|p| p.plane_type == DRM_PLANE_TYPE_OVERLAY)
+                    })
+                    .collect();
+                // Linux fills as many ids as the caller made room for and
+                // reports the full count; this arm filled all or nothing.
+                let fill = planes.len().min(res.count_planes as usize);
+                if res.plane_id_ptr != 0 && fill > 0 {
+                    ucheck_n::<u32>(res.plane_id_ptr as usize, fill)?;
                     unsafe {
                         core::ptr::copy_nonoverlapping(
                             planes.as_ptr(),
                             res.plane_id_ptr as *mut u32,
-                            planes.len(),
+                            fill,
                         );
                     }
                 }
@@ -2449,8 +2478,10 @@ impl DrmDev {
                 match drm::destroy_blob(blob_id) {
                     drm::BlobDestroy::Destroyed => Ok(0),
                     drm::BlobDestroy::NotFound => Err(FsError::EntryNotFound),
-                    // Linux: only the creator may destroy a blob -> EPERM-ish.
-                    drm::BlobDestroy::KernelOwned => Err(FsError::NoPermission),
+                    // Linux: kernel-owned or another client's blob → EPERM.
+                    drm::BlobDestroy::KernelOwned | drm::BlobDestroy::NotOwner => {
+                        Err(FsError::NotPermitted)
+                    }
                 }
             }
             DRM_IOCTL_MODE_ATOMIC => {
@@ -2897,7 +2928,7 @@ impl DrmDev {
                         // makes every one of those messages a lie.
                         .map_err(|e| match e {
                             2 => FsError::EntryNotFound,  // ENOENT
-                            12 => FsError::NoDeviceSpace, // ENOMEM
+                            12 => FsError::NoMemory, // ENOMEM
                             16 => FsError::Busy,          // EBUSY
                             19 => FsError::NoDevice,      // ENODEV
                             22 => FsError::InvalidParam,  // EINVAL
@@ -3414,6 +3445,8 @@ const DRM_IOCTL_AUTH_MAGIC: u32 = 0x40046411;
 const DRM_IOCTL_GET_CAP: u32 = 0xC010640C;
 const DRM_IOCTL_SET_CLIENT_CAP: u32 = 0x4010640D;
 const DRM_IOCTL_GEM_CLOSE: u32 = 0x40086409;
+/// `struct drm_client` is 40 bytes on LP64 (`_IOWR('d', 0x0A, …)`).
+const DRM_IOCTL_GET_CLIENT: u32 = 0xC028640A;
 const DRM_IOCTL_SET_MASTER: u32 = 0x0000641E;
 const DRM_IOCTL_DROP_MASTER: u32 = 0x0000641F;
 
@@ -3745,6 +3778,9 @@ const DRM_MODE_OBJECT_FB: u32 = 0xfbfb_fbfb;
 // DRM client capabilities (DRM_IOCTL_SET_CLIENT_CAP).
 const DRM_CLIENT_CAP_STEREO_3D: u64 = 1;
 const DRM_CLIENT_CAP_UNIVERSAL_PLANES: u64 = 2;
+/// `DRM_PLANE_TYPE_OVERLAY`: the only plane type `drm_mode_getplane_res` lists
+/// to a client without `DRM_CLIENT_CAP_UNIVERSAL_PLANES`.
+const DRM_PLANE_TYPE_OVERLAY: u32 = 0;
 const DRM_CLIENT_CAP_ATOMIC: u64 = 3;
 const DRM_CLIENT_CAP_ASPECT_RATIO: u64 = 4;
 const DRM_CLIENT_CAP_WRITEBACK_CONNECTORS: u64 = 5;
@@ -3937,7 +3973,7 @@ const SYNCOBJ_ARRAY_MAX: u32 = 1 << 20;
 /// ENOMEM past [`SYNCOBJ_ARRAY_MAX`], as the kernel's allocation would be.
 fn syncobj_array_bound(count_handles: u32) -> Result<()> {
     if count_handles > SYNCOBJ_ARRAY_MAX {
-        Err(FsError::NoDeviceSpace)
+        Err(FsError::NoMemory)
     } else {
         Ok(())
     }
@@ -4484,6 +4520,18 @@ struct DrmModeCreateBlob {
     blob_id: u32,
 }
 
+/// `struct drm_client` (40 bytes on LP64).
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+struct DrmClient {
+    idx: i32,
+    auth: i32,
+    pid: usize,
+    uid: usize,
+    magic: usize,
+    iocs: usize,
+}
+
 // Compile-time guards: each DRM ioctl number encodes `sizeof(struct)` in its
 // _IOC size field, so a wrong struct layout silently mismatches the ioctl and
 // the handler never fires. Assert the sizes that the constants above depend on.
@@ -4507,6 +4555,7 @@ const _: () = {
     assert!(size_of::<DrmSetVersion>() == 16); // DRM_IOCTL_SET_VERSION   0x..10..
     assert!(size_of::<DrmModeAtomic>() == 56); // DRM_IOCTL_MODE_ATOMIC   0x..38..
     assert!(size_of::<DrmModeCreateBlob>() == 16); // CREATEPROPBLOB      0x..10..
+    assert!(size_of::<DrmClient>() == 40); // DRM_IOCTL_GET_CLIENT     0x..28..
     assert!(size_of::<DrmSyncobjCreate>() == 8); // DRM_IOCTL_SYNCOBJ_CREATE   0x..08..
     assert!(size_of::<DrmSyncobjDestroy>() == 8); // DRM_IOCTL_SYNCOBJ_DESTROY  0x..08..
     assert!(size_of::<DrmSyncobjWait>() == 32); // DRM_IOCTL_SYNCOBJ_WAIT     0x..20..
@@ -5223,6 +5272,7 @@ fn canonical_drm_ioctl(nr: u32) -> Option<u32> {
         0x02 => DRM_IOCTL_GET_MAGIC,
         0x07 => DRM_IOCTL_SET_VERSION,
         0x09 => DRM_IOCTL_GEM_CLOSE,
+        0x0A => DRM_IOCTL_GET_CLIENT,
         0x0C => DRM_IOCTL_GET_CAP,
         0x0D => DRM_IOCTL_SET_CLIENT_CAP,
         0x11 => DRM_IOCTL_AUTH_MAGIC,
@@ -5502,18 +5552,16 @@ impl INode for DrmDev {
     }
 
     fn write_at(&self, _offset: usize, _buf: &[u8]) -> Result<usize> {
-        Ok(_buf.len())
+        // DRM chardev has no write sink; Linux answers EINVAL.
+        Err(FsError::InvalidParam)
     }
 
     fn poll(&self) -> Result<PollStatus> {
         Ok(PollStatus {
+            // Linux `drm_poll`: POLLIN when the event queue is non-empty;
+            // never POLLOUT (the chardev is not writable).
             read: self.file.has_events(),
-            // Keep write=true for now: reporting write=false made labwc's
-            // DRM epoll actually park and exposed a #DF at session start
-            // (heap corruption while the card fd stopped looking always-
-            // ready). Linux semantics are "readable for events"; revisit
-            // once the UserContext/#DF path at labwc bring-up is solid.
-            write: true,
+            write: false,
             error: false,
             hangup: false,
         })
@@ -6183,6 +6231,40 @@ mod render_node_and_mode_tests {
     }
 
     #[test]
+    fn a_render_node_refuses_modeset_and_dumb_with_eacces() {
+        // Enforcement used to be observe-only: renderD128 accepted CREATE_DUMB
+        // and SETCRTC. Linux answers EACCES; the helper already knew, the
+        // ioctl path did not.
+        use super::gl_client_sequence_tests::Client;
+        use crate::error::LxError;
+        let render = Client::open(128);
+        let mut dumb = DrmModeCreateDumb {
+            height: 16,
+            width: 16,
+            bpp: 32,
+            flags: 0,
+            handle: 0,
+            pitch: 0,
+            size: 0,
+        };
+        assert_eq!(
+            render.ioctl(DRM_IOCTL_MODE_CREATE_DUMB, &mut dumb),
+            Err(FsError::NoPermission)
+        );
+        assert_eq!(
+            LxError::from(FsError::NoPermission),
+            LxError::EACCES,
+            "userspace must see EACCES on a render-node modeset/dumb"
+        );
+        // GET_CAP stays allowed on a render node.
+        let mut cap = DrmGetCap {
+            capability: 0x1, // DRM_CAP_DUMB_BUFFER
+            value: 0,
+        };
+        assert!(render.ioctl(DRM_IOCTL_GET_CAP, &mut cap).is_ok());
+    }
+
+    #[test]
     fn the_interception_filter_checks_type_number_and_a_size_floor() {
         // `is_drm_ioctl_nr` gates what `sys_ioctl` grabs before the inode
         // dispatch. Matching on the number alone would steal another
@@ -6232,6 +6314,7 @@ mod ioctl_size_reconciliation_tests {
             DRM_IOCTL_GET_MAGIC,
             DRM_IOCTL_SET_VERSION,
             DRM_IOCTL_GEM_CLOSE,
+            DRM_IOCTL_GET_CLIENT,
             DRM_IOCTL_GET_CAP,
             DRM_IOCTL_SET_CLIENT_CAP,
             DRM_IOCTL_AUTH_MAGIC,
@@ -7615,7 +7698,11 @@ mod kms_scanout_tests {
             "a physical size of 0 is an infinite DPI to every client that divides by it"
         );
 
-        // One primary plane on that CRTC.
+        // One primary plane on that CRTC -- to a client that asked for
+        // universal planes, as every compositor does.
+        let mut cap: [u64; 2] = [DRM_CLIENT_CAP_UNIVERSAL_PLANES, 1];
+        c.ioctl(DRM_IOCTL_SET_CLIENT_CAP, &mut cap)
+            .expect("SET_CLIENT_CAP UNIVERSAL_PLANES");
         let mut planes = [0u32; 1];
         let mut plane_res = DrmModeGetPlaneRes {
             plane_id_ptr: planes.as_mut_ptr() as u64,
@@ -11245,6 +11332,13 @@ mod hw_kms_tests {
         (crtcs, conns)
     }
 
+    /// `DRM_CLIENT_CAP_UNIVERSAL_PLANES` on or off for this client.
+    fn universal_planes(c: &Client, on: bool) {
+        let mut cap: [u64; 2] = [DRM_CLIENT_CAP_UNIVERSAL_PLANES, on as u64];
+        c.ioctl(DRM_IOCTL_SET_CLIENT_CAP, &mut cap)
+            .expect("SET_CLIENT_CAP UNIVERSAL_PLANES");
+    }
+
     fn planes(c: &Client) -> Vec<u32> {
         let mut probe = DrmModeGetPlaneRes {
             plane_id_ptr: 0,
@@ -11413,11 +11507,75 @@ mod hw_kms_tests {
         let _virtio = screen.attach_gpu(EmuGpu::new("emu-virtio").with_ids(50, 51, 52));
         let _nvidia = screen.attach_gpu(EmuGpu::hardware_kms("emu-gpu").with_ids(60, 61, 62));
         let c = Client::open(0);
+        universal_planes(&c, true);
 
         let (crtcs, conns) = topology(&c);
         assert_eq!(crtcs, alloc::vec![60], "the non-KMS CRTC was exposed too");
         assert_eq!(conns, alloc::vec![61]);
         assert_eq!(planes(&c), alloc::vec![62]);
+    }
+
+    /// `drm_mode_getplane_res` lists only overlay planes until the client
+    /// sets `DRM_CLIENT_CAP_UNIVERSAL_PLANES` (or ATOMIC, which implies it):
+    /// a legacy client was written when the primary and the cursor were not
+    /// planes, and would drive the scanout plane as an overlay. The cap was
+    /// accepted and forgotten, and the list was the same for everyone. The
+    /// flag is per open file, and the list is filled as far as the caller's
+    /// buffer goes, with the full count reported.
+    #[test]
+    fn only_a_client_that_asked_for_universal_planes_is_told_about_the_primaries() {
+        let screen = kms_emu::attach(64, 16);
+        let _first = screen.attach_gpu(EmuGpu::hardware_kms("emu-gpu-0").with_ids(60, 61, 62));
+        let _second = screen.attach_gpu(EmuGpu::hardware_kms("emu-gpu-1").with_ids(70, 71, 72));
+        let c = Client::open(0);
+
+        assert_eq!(
+            planes(&c),
+            Vec::<u32>::new(),
+            "a legacy client was handed a primary plane"
+        );
+        universal_planes(&c, true);
+        let mut all = planes(&c);
+        all.sort_unstable();
+        assert_eq!(all, alloc::vec![62, 72]);
+        universal_planes(&c, false);
+        assert_eq!(planes(&c), Vec::<u32>::new(), "the cap can be taken back");
+
+        // Per file: what one client asked for does not change another's list.
+        universal_planes(&c, true);
+        let legacy = Client::open(0);
+        assert_eq!(planes(&legacy), Vec::<u32>::new());
+
+        // Room for one of the two: that one is filled, and the count says two.
+        let mut one = [0u32; 1];
+        let mut fill = DrmModeGetPlaneRes {
+            plane_id_ptr: one.as_mut_ptr() as u64,
+            count_planes: 1,
+        };
+        c.ioctl(DRM_IOCTL_MODE_GETPLANERESOURCES, &mut fill)
+            .expect("GETPLANERESOURCES with room for one");
+        assert_eq!(fill.count_planes, 2);
+        assert!(
+            all.contains(&one[0]),
+            "the slot the caller had was left empty"
+        );
+    }
+
+    /// `drm_setclientcap` stores the ATOMIC value in `universal_planes` too:
+    /// an atomic client sees the primary plane without asking for universal
+    /// planes by name, and giving atomic back takes the planes with it.
+    #[test]
+    fn atomic_carries_universal_planes_with_it() {
+        let (_screen, c) = super::out_fence_tests::atomic_client(64, 16);
+        assert_eq!(planes(&c), alloc::vec![drm::SYNTH_PLANE_ID]);
+        let mut cap: [u64; 2] = [DRM_CLIENT_CAP_ATOMIC, 0];
+        c.ioctl(DRM_IOCTL_SET_CLIENT_CAP, &mut cap)
+            .expect("SET_CLIENT_CAP ATOMIC off");
+        assert_eq!(
+            planes(&c),
+            Vec::<u32>::new(),
+            "atomic off, planes still listed"
+        );
     }
 
     /// Two GPUs of the same model return the SAME synthetic ids, and a topology
@@ -13384,6 +13542,142 @@ mod blob_id_space_tests {
             drm::BlobDestroy::NotFound
         ));
     }
+
+}
+
+/// CREATE_DUMB bpp, chardev write, ADDFB errno, and DESTROYPROPBLOB EPERM —
+/// small contracts that used to lie to clients.
+#[cfg(test)]
+mod dumb_write_and_addfb_errno_tests {
+    use super::gl_client_sequence_tests::Client;
+    use super::*;
+    use crate::error::LxError;
+
+    #[test]
+    fn destroypropblob_of_a_kernel_blob_is_eperm_to_userspace() {
+        let _serialised = drm::test_globals::lock();
+        let client = Client::open(0);
+        let kernel = drm::create_blob(alloc::vec![0u8; 68], false);
+        let mut id = kernel;
+        assert_eq!(
+            client.ioctl(DRM_IOCTL_MODE_DESTROYPROPBLOB, &mut id),
+            Err(FsError::NotPermitted)
+        );
+        assert_eq!(LxError::from(FsError::NotPermitted), LxError::EPERM);
+        assert!(drm::get_blob(kernel).is_some());
+    }
+
+    #[test]
+    fn get_client_zero_is_self_and_one_is_enoent() {
+        let c = Client::open(0);
+        let mut client = DrmClient {
+            idx: 0,
+            auth: 0,
+            pid: 0,
+            uid: 0,
+            magic: 0,
+            iocs: 0,
+        };
+        assert_eq!(c.ioctl(DRM_IOCTL_GET_CLIENT, &mut client), Ok(0));
+        assert_eq!(client.auth, 1);
+        assert_eq!(client.magic, 1);
+        client.idx = 1;
+        assert_eq!(
+            c.ioctl(DRM_IOCTL_GET_CLIENT, &mut client),
+            Err(FsError::EntryNotFound)
+        );
+    }
+
+    #[test]
+    fn dirtyfb_rejects_unknown_flags() {
+        let _serialised = drm::test_globals::lock();
+        let c = Client::open(0);
+        let buf = c.create_dumb(16, 16);
+        let fb = c.addfb2(&buf);
+        let mut cmd = DrmModeFbDirtyCmd {
+            fb_id: fb,
+            flags: 1 << 3,
+            color: 0,
+            num_clips: 0,
+            clips_ptr: 0,
+        };
+        assert_eq!(
+            c.ioctl(DRM_IOCTL_MODE_DIRTYFB, &mut cmd),
+            Err(FsError::InvalidParam)
+        );
+        assert_eq!(c.rmfb(fb), Ok(0));
+        assert_eq!(c.destroy_dumb(buf.handle), Ok(0));
+    }
+
+    #[test]
+    fn create_dumb_oom_is_enomem_not_enospc() {
+        assert_eq!(LxError::from(FsError::NoMemory), LxError::ENOMEM);
+        assert_ne!(LxError::from(FsError::NoMemory), LxError::ENOSPC);
+    }
+
+    #[test]
+    fn create_dumb_refuses_bpp_zero_and_honours_bpp_sixteen() {
+        let _serialised = drm::test_globals::lock();
+        let c = Client::open(0);
+        let mut zero = DrmModeCreateDumb {
+            height: 16,
+            width: 16,
+            bpp: 0,
+            flags: 0,
+            handle: 0,
+            pitch: 0,
+            size: 0,
+        };
+        assert_eq!(
+            c.ioctl(DRM_IOCTL_MODE_CREATE_DUMB, &mut zero),
+            Err(FsError::InvalidParam)
+        );
+        let mut bpp16 = DrmModeCreateDumb {
+            height: 16,
+            width: 16,
+            bpp: 16,
+            flags: 0,
+            handle: 0,
+            pitch: 0,
+            size: 0,
+        };
+        c.ioctl(DRM_IOCTL_MODE_CREATE_DUMB, &mut bpp16)
+            .expect("CREATE_DUMB bpp=16");
+        // pitch = round_up(width * bpp/8, 64) = round_up(32, 64) = 64
+        assert_eq!(bpp16.pitch, 64, "bpp=16 must not be inflated to 32");
+        assert_eq!(bpp16.size, 64 * 16);
+        assert_eq!(c.destroy_dumb(bpp16.handle), Ok(0));
+    }
+
+    #[test]
+    fn a_drm_chardev_write_is_einval() {
+        let dev = DrmDev::new(0);
+        assert_eq!(dev.write_at(0, b"x"), Err(FsError::InvalidParam));
+        assert_eq!(LxError::from(FsError::InvalidParam), LxError::EINVAL);
+    }
+
+    #[test]
+    fn addfb2_of_an_unknown_handle_is_enoent() {
+        let _serialised = drm::test_globals::lock();
+        let c = Client::open(0);
+        let mut cmd = DrmModeFbCmd2 {
+            fb_id: 0,
+            width: 16,
+            height: 16,
+            pixel_format: drm::DRM_FORMAT_XRGB8888,
+            flags: 0,
+            handles: [0xDEAD_u32, 0, 0, 0],
+            pitches: [64, 0, 0, 0],
+            offsets: [0; 4],
+            modifier: [0; 4],
+        };
+        assert_eq!(
+            c.ioctl(DRM_IOCTL_MODE_ADDFB2, &mut cmd),
+            Err(FsError::EntryNotFound)
+        );
+        assert_eq!(LxError::from(FsError::EntryNotFound), LxError::ENOENT);
+        assert_eq!(cmd.fb_id, 0);
+    }
 }
 
 /// The compute node's own ioctl (`DRM_ECLIPSE_COMPUTE_NR`), which has no tests
@@ -13677,9 +13971,8 @@ mod event_queue_tests {
         let mut full = [0u8; 32];
         assert_eq!(c.read_events(&mut full).expect("drain"), 32);
         assert!(!c.poll().expect("poll").read, "readable after the drain");
-        // Writable throughout, on purpose: reporting write=false made labwc's
-        // DRM epoll park and exposed a #DF at session start.
-        assert!(c.poll().expect("poll").write);
+        // Linux drm_poll never reports POLLOUT on the chardev.
+        assert!(!c.poll().expect("poll").write);
 
         c.rmfb(fb).expect("RMFB");
         c.destroy_dumb(handle).expect("DESTROY_DUMB");
@@ -15307,7 +15600,7 @@ mod syncobj_array_tests {
         };
         assert_eq!(
             c.ioctl(DRM_IOCTL_SYNCOBJ_WAIT, &mut req),
-            Err(FsError::NoDeviceSpace)
+            Err(FsError::NoMemory)
         );
         let mut req = DrmSyncobjTimelineWait {
             handles: 0,
@@ -15320,7 +15613,7 @@ mod syncobj_array_tests {
         };
         assert_eq!(
             c.ioctl(DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT, &mut req),
-            Err(FsError::NoDeviceSpace)
+            Err(FsError::NoMemory)
         );
         for cmd in [DRM_IOCTL_SYNCOBJ_RESET, DRM_IOCTL_SYNCOBJ_SIGNAL] {
             let mut req = DrmSyncobjArray {
@@ -15330,7 +15623,7 @@ mod syncobj_array_tests {
             };
             assert_eq!(
                 c.ioctl(cmd, &mut req),
-                Err(FsError::NoDeviceSpace),
+                Err(FsError::NoMemory),
                 "{:#x}",
                 cmd
             );
@@ -15344,7 +15637,7 @@ mod syncobj_array_tests {
             };
             assert_eq!(
                 c.ioctl(cmd, &mut req),
-                Err(FsError::NoDeviceSpace),
+                Err(FsError::NoMemory),
                 "{:#x}",
                 cmd
             );
@@ -16338,8 +16631,15 @@ mod wsi_display_probe_tests {
         }
     }
 
-    /// `drmModeGetPlaneResources`, both passes.
+    /// `drmModeGetPlaneResources`, both passes, after the one call every
+    /// plane-aware client makes first: `drm_mode_getplane_res` lists only
+    /// overlays to a file without `DRM_CLIENT_CAP_UNIVERSAL_PLANES`, and every
+    /// plane here is a primary, so without the cap the list is empty for
+    /// everyone, as on Linux.
     fn drm_mode_get_plane_resources(c: &Client) -> Vec<u32> {
+        let mut cap: [u64; 2] = [DRM_CLIENT_CAP_UNIVERSAL_PLANES, 1];
+        c.ioctl(DRM_IOCTL_SET_CLIENT_CAP, &mut cap)
+            .expect("SET_CLIENT_CAP UNIVERSAL_PLANES");
         let mut probe = DrmModeGetPlaneRes {
             plane_id_ptr: 0,
             count_planes: 0,
