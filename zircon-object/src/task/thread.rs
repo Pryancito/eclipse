@@ -196,6 +196,88 @@ const MIN_TIMESLICE_NS: u64 = 4_000_000;
 /// Cap a fair task's slice so a very negative nice can't monopolise a CPU.
 const MAX_TIMESLICE_NS: u64 = 120_000_000;
 
+/// How long a thread must have run before a *wake-up* may preempt it: Linux
+/// 6.6's `sysctl_sched_base_slice_ns`, 0.75 ms.
+///
+/// This is EEVDF's RUN_TO_PARITY, the half of Linux 6.6's scheduler rewrite
+/// that needs no ordered runqueue. Wake-up preemption (see the trap path in
+/// `loader/src/linux.rs`) exists so a woken task does not wait out the running
+/// thread's whole 20 ms slice, and it is worth having -- but with no floor at
+/// all it fires on *every* wake, and a single wake-heavy neighbour
+/// (`epoll_pwait` at kHz rates is the shape Firefox has here) takes the CPU
+/// away from whatever is running after microseconds, over and over. Each of
+/// those yields is not free on this executor: a thread preempted mid-poll
+/// leaves a weak executor and a 32 KiB stack behind
+/// (`MAX_WEAK_PER_CPU` exists to count exactly this churn).
+///
+/// So the first 0.75 ms of a thread's slice is its own: a wake inside that
+/// window leaves the request pending and takes effect at the next interrupt
+/// past the floor, which is at worst the next scheduler tick. Latency the
+/// woken task can lose is bounded by one tick instead of by a whole slice.
+const BASE_SLICE_NS: u64 = 750_000;
+
+/// Sentinel in [`SchedAttr::slice_left_ns`]: no remainder was recorded at the
+/// last park, so a resumption gets a fresh slice (the pre-lag behaviour).
+const NO_SLICE_REMAINDER: u64 = u64::MAX;
+
+/// Where a resumed thread's slice deadline lands: EEVDF's *lag*, applied to
+/// the slice remainder instead of to a virtual runtime.
+///
+/// `left` is how much of the slice was still unspent when the thread parked,
+/// `slept` how long it was off the CPU, `slice` its current slice length.
+/// Returns the new deadline, or 0 for "start a fresh slice".
+///
+/// The problem this solves is a slice that renews itself. Handing a fresh full
+/// slice to every resumption -- which is what this did, and had to, to fix the
+/// thread that lost the CPU on its first tick after a blocking `read` (#1588)
+/// -- also hands one to a thread that burns 19 ms of a 20 ms slice, parks on a
+/// `read` whose data is already there, and is polled again microseconds later.
+/// Repeat and that thread is *never* preempted, no matter its nice value,
+/// while the CPU-bound thread beside it waits.
+///
+/// EEVDF's answer is lag: service already taken is owed back before a task is
+/// eligible again. Without a vruntime-ordered runqueue the same rule still
+/// reads locally -- a thread that was off the CPU for at least as long as the
+/// part of the slice it consumed has given back what it took, and gets a fresh
+/// slice; one that was not resumes on the remainder it had left. The #1588
+/// case keeps working either way: a thread that ran 15 ms and waited 8 ms
+/// comes back with its 5 ms, which is not a preemption on the first tick.
+fn resume_slice_end(now: u64, left: u64, slept: u64, slice: u64) -> u64 {
+    if left == NO_SLICE_REMAINDER {
+        return 0;
+    }
+    // A `set_sched` while parked can have shrunk the slice under the
+    // remainder; never resume with more than one slice in hand.
+    let left = left.min(slice);
+    let consumed = slice - left;
+    if slept >= consumed {
+        // Paid back in full. Covers every long sleep, and every park by a
+        // thread that had consumed nothing.
+        return 0;
+    }
+    // `max(1)` because 0 is the "no slice running" sentinel: a remainder of
+    // nothing at time zero must still read as a slice that is spent.
+    now.saturating_add(left).max(1)
+}
+
+/// Whether a *wake-up* preemption request may take the CPU from a thread whose
+/// slice ends at `end`, given [`BASE_SLICE_NS`] as the floor.
+///
+/// Answers `true` whenever the run length cannot be read off the deadline (no
+/// slice on record, an untimesliced policy, an expired deadline, or the
+/// backwards-clock case [`slice_verdict`] describes), so an unknown is never
+/// turned into extra latency for the woken task.
+fn wake_preempt_allowed(now: u64, end: u64, slice: u64, base: u64) -> bool {
+    if end == 0 || slice == u64::MAX {
+        return true;
+    }
+    if end <= now || end > now.saturating_add(slice) {
+        return true;
+    }
+    let ran = slice - (end - now);
+    ran >= base
+}
+
 /// Per-thread Linux-compatible scheduling attributes.
 ///
 /// The kernel core is an async per-CPU executor, not a Linux runqueue, so these
@@ -230,6 +312,16 @@ struct SchedAttr {
     /// past, which is indistinguishable from a late tick -- and a media thread
     /// whose audio callback fires every 10 ms is exactly that shape.
     parked: AtomicBool,
+    /// Slice remaining (ns) when this thread last parked, or
+    /// [`NO_SLICE_REMAINDER`] if the park found no slice on record.
+    ///
+    /// Half of the lag [`resume_slice_end`] charges. Recorded at the park
+    /// rather than recomputed at the resumption because only the park knows
+    /// where the deadline stood while the thread was still the one running.
+    slice_left_ns: AtomicU64,
+    /// Monotonic time (ns) at which this thread last parked; the other half of
+    /// the lag, and what makes "slept at least as long as it ran" answerable.
+    parked_at_ns: AtomicU64,
 }
 
 impl Default for SchedAttr {
@@ -240,6 +332,8 @@ impl Default for SchedAttr {
             rt_priority: AtomicU8::new(0),
             slice_end_ns: AtomicU64::new(0),
             parked: AtomicBool::new(false),
+            slice_left_ns: AtomicU64::new(NO_SLICE_REMAINDER),
+            parked_at_ns: AtomicU64::new(0),
         }
     }
 }
@@ -618,8 +712,14 @@ impl Thread {
         self.sched.nice.store(nice, Ordering::Relaxed);
         self.sched.rt_priority.store(rt_priority, Ordering::Relaxed);
         // Drop the remainder of the old slice; the next tick starts a fresh one
-        // from the new policy/nice (see `tick_should_preempt`).
+        // from the new policy/nice (see `tick_should_preempt`). The remainder
+        // carried across a park goes with it: it was measured against the slice
+        // the old nice gave, and charging it under the new one would let a
+        // `renice` hand out -- or take away -- a slice nobody asked for.
         self.sched.slice_end_ns.store(0, Ordering::Relaxed);
+        self.sched
+            .slice_left_ns
+            .store(NO_SLICE_REMAINDER, Ordering::Relaxed);
     }
 
     /// Note that the executor has parked this thread: its future answered
@@ -628,6 +728,22 @@ impl Thread {
     /// Paired with [`Thread::sched_note_resumed`], which is what makes the
     /// timeslice measure time spent running instead of time on the wall clock.
     pub fn sched_note_parked(&self) {
+        // Record where the slice stood while this thread is still the one that
+        // was running, so the resumption can charge it the lag it owes (see
+        // [`resume_slice_end`]). The clock read is the cost of the lag rule:
+        // "slept at least as long as it ran" is not answerable without it, and
+        // the park is the only side that knows the deadline was still live.
+        let end = self.sched.slice_end_ns.load(Ordering::Relaxed);
+        let now = kernel_hal::timer::timer_now().as_nanos() as u64;
+        let left = if end == 0 {
+            // No slice on record: nothing to carry, so the resumption keeps the
+            // pre-lag behaviour of a fresh slice.
+            NO_SLICE_REMAINDER
+        } else {
+            end.saturating_sub(now)
+        };
+        self.sched.slice_left_ns.store(left, Ordering::Relaxed);
+        self.sched.parked_at_ns.store(now, Ordering::Relaxed);
         self.sched.parked.store(true, Ordering::Relaxed);
     }
 
@@ -646,10 +762,49 @@ impl Thread {
     /// set only by a poll that really answered `Pending`, so a future that was
     /// ready straight away never looks like a wake and cannot help itself to a
     /// free slice.
+    /// A resumption no longer gets a *fresh* slice unconditionally: it gets
+    /// back the remainder it parked with unless it slept long enough to have
+    /// paid for the part it had already spent. See [`resume_slice_end`] for why
+    /// -- a thread that parks on an already-ready `read` every 19 ms of a 20 ms
+    /// slice renewed itself forever under the unconditional rule.
     pub fn sched_note_resumed(&self) {
         if self.sched.parked.swap(false, Ordering::Relaxed) {
-            self.sched.slice_end_ns.store(0, Ordering::Relaxed);
+            let left = self
+                .sched
+                .slice_left_ns
+                .swap(NO_SLICE_REMAINDER, Ordering::Relaxed);
+            let end = if left == NO_SLICE_REMAINDER {
+                // Nothing recorded: a fresh slice, and no clock read for it.
+                0
+            } else {
+                let now = kernel_hal::timer::timer_now().as_nanos() as u64;
+                let slept = now.saturating_sub(self.sched.parked_at_ns.load(Ordering::Relaxed));
+                resume_slice_end(now, left, slept, self.timeslice_ns())
+            };
+            self.sched.slice_end_ns.store(end, Ordering::Relaxed);
         }
+    }
+
+    /// Whether a pending *wake-up* preemption request may take the CPU from
+    /// this thread yet.
+    ///
+    /// `false` only inside the first [`BASE_SLICE_NS`] of the thread's slice,
+    /// which is EEVDF's RUN_TO_PARITY. `SCHED_IDLE` is exempt: as in Linux, an
+    /// idle-policy thread yields to anything that becomes runnable.
+    ///
+    /// The caller must *peek* at the request before asking this and consume it
+    /// only on a `true` -- see `kernel_hal::thread::need_resched_pending`.
+    pub fn sched_may_preempt_on_wake(&self) -> bool {
+        if self.sched_policy() == SCHED_IDLE {
+            return true;
+        }
+        let slice = self.timeslice_ns();
+        if slice == u64::MAX {
+            return true;
+        }
+        let now = kernel_hal::timer::timer_now().as_nanos() as u64;
+        let end = self.sched.slice_end_ns.load(Ordering::Relaxed);
+        wake_preempt_allowed(now, end, slice, BASE_SLICE_NS)
     }
 
     /// Whether the executor has this thread parked: its last poll answered
@@ -2178,34 +2333,236 @@ mod sched_tests {
 
     /// The fix the clock cannot do on its own: a wait SHORTER than a slice.
     ///
-    /// A media thread runs 15 ms, waits 8 ms for its audio callback and wakes.
-    /// Its deadline is 3 ms in the past, which is exactly what a late tick looks
-    /// like, so `slice_verdict` preempts it -- correctly, on the evidence it
-    /// has. The park flag is the evidence it does not have.
+    /// A media thread runs 15 ms of its 20 ms slice, waits 8 ms for its audio
+    /// callback and wakes. Its deadline is 3 ms in the past, which is exactly
+    /// what a late tick looks like, so `slice_verdict` preempts it --
+    /// correctly, on the evidence it has. The park is the evidence it does not
+    /// have.
+    ///
+    /// In the real order the park happens while the thread is still the one
+    /// running, with 5 ms of slice still in hand, and that is the remainder the
+    /// resumption gets back (see [`resume_slice_end`]). What #1588 is about is
+    /// the assertion at the end: the first tick after waking does not preempt.
     #[test]
-    fn a_wait_shorter_than_a_slice_still_gets_a_fresh_slice_when_the_thread_says_it_parked() {
+    fn a_wait_shorter_than_a_slice_does_not_cost_the_thread_its_first_tick() {
         let t = a_thread();
         let slice = t.timeslice_ns();
         let now = kernel_hal::timer::timer_now().as_nanos() as u64;
-        // Corrio 15 ms, esperó 8 ms: la fecha limite quedo 3 ms atras.
-        let end = now.saturating_sub(3_000_000);
-        t.sched.slice_end_ns.store(end, Ordering::Relaxed);
-        // Sin el flag, el reloj no puede saberlo y lo desaloja.
+        // Sin la marca, una fecha limite 3 ms atras es un slice agotado y es lo
+        // unico que el reloj puede ver.
         assert!(
-            slice_verdict(now, end, slice).0,
-            "el reloj deberia ver esto como un slice agotado; es lo unico que puede ver"
+            slice_verdict(now, now.saturating_sub(3_000_000), slice).0,
+            "el reloj deberia ver esto como un slice agotado"
         );
-        // Con el flag, el hilo lo dice.
+        // El orden de produccion: aparca con 5 ms de slice por gastar.
+        t.sched
+            .slice_end_ns
+            .store(now.saturating_add(5_000_000), Ordering::Relaxed);
         t.sched_note_parked();
+        assert!(
+            t.sched.slice_left_ns.load(Ordering::Relaxed) > 4_000_000,
+            "el aparcado no se quedo con el resto del slice"
+        );
         t.sched_note_resumed();
-        assert_eq!(
-            t.sched.slice_end_ns.load(Ordering::Relaxed),
-            0,
-            "despertar de una espera corta no da slice nuevo"
+        let end = t.sched.slice_end_ns.load(Ordering::Relaxed);
+        assert!(
+            end > kernel_hal::timer::timer_now().as_nanos() as u64,
+            "despertar de una espera corta no devuelve el resto que le quedaba"
         );
         assert!(
             !t.tick_should_preempt(),
             "y el primer tick tras despertar sigue quitandole la CPU"
+        );
+    }
+
+    /// The renewal this closes: parking with the slice already spent does NOT
+    /// hand out a new one. A thread that burns 20 ms, parks on a `read` whose
+    /// data is already there and is polled again microseconds later used to
+    /// come back with a full fresh slice, and could repeat that forever.
+    #[test]
+    fn a_thread_that_spent_its_slice_cannot_renew_it_with_a_zero_length_park() {
+        let t = a_thread();
+        let now = kernel_hal::timer::timer_now().as_nanos() as u64;
+        // Aparca con el slice recien agotado: no le queda nada.
+        t.sched.slice_end_ns.store(now, Ordering::Relaxed);
+        t.sched_note_parked();
+        t.sched_note_resumed();
+        assert!(
+            t.tick_should_preempt(),
+            "un park de duracion cero le renovo el slice: se queda la CPU para siempre"
+        );
+    }
+
+    /// `set_sched` drops the carried remainder too: it was measured against the
+    /// slice the old nice gave.
+    #[test]
+    fn a_renice_while_parked_does_not_carry_the_old_slices_remainder() {
+        let t = a_thread();
+        let now = kernel_hal::timer::timer_now().as_nanos() as u64;
+        t.sched
+            .slice_end_ns
+            .store(now.saturating_add(5_000_000), Ordering::Relaxed);
+        t.sched_note_parked();
+        t.set_sched(SCHED_NORMAL, 19, 0);
+        assert_eq!(
+            t.sched.slice_left_ns.load(Ordering::Relaxed),
+            NO_SLICE_REMAINDER,
+            "el resto del slice viejo sobrevivio al renice"
+        );
+        t.sched_note_resumed();
+        assert_eq!(
+            t.sched.slice_end_ns.load(Ordering::Relaxed),
+            0,
+            "tras un renice el despertar tiene que empezar slice nuevo"
+        );
+    }
+
+    const LAG_SLICE: u64 = 20_000_000;
+
+    #[test]
+    fn a_park_with_nothing_recorded_still_gets_a_fresh_slice() {
+        assert_eq!(
+            resume_slice_end(1_000, NO_SLICE_REMAINDER, 0, LAG_SLICE),
+            0,
+            "sin resto apuntado el despertar no puede cobrar nada"
+        );
+    }
+
+    #[test]
+    fn a_sleep_as_long_as_the_part_it_ran_pays_the_lag_off() {
+        // Gasto 15 ms de 20, durmio 15 ms: a la par.
+        let left = 5_000_000;
+        assert_eq!(
+            resume_slice_end(1_000_000_000, left, 15_000_000, LAG_SLICE),
+            0,
+            "dormir lo que corrio tiene que dar slice nuevo"
+        );
+        // Un nanosegundo menos y todavia debe.
+        assert_ne!(
+            resume_slice_end(1_000_000_000, left, 15_000_000 - 1, LAG_SLICE),
+            0,
+            "la frontera del lag esta en el nanosegundo equivocado"
+        );
+    }
+
+    #[test]
+    fn a_sleep_shorter_than_the_part_it_ran_only_gets_the_remainder_back() {
+        let now = 1_000_000_000;
+        let left = 5_000_000;
+        assert_eq!(
+            resume_slice_end(now, left, 1_000, LAG_SLICE),
+            now + left,
+            "un park corto tiene que devolver el resto, no un slice entero"
+        );
+    }
+
+    #[test]
+    fn a_park_that_consumed_nothing_is_free() {
+        assert_eq!(
+            resume_slice_end(1_000_000_000, LAG_SLICE, 0, LAG_SLICE),
+            0,
+            "un hilo que no gasto nada no debe nada"
+        );
+    }
+
+    /// A remainder longer than the slice can only come from a slice that shrank
+    /// under it; it is clamped rather than handed out.
+    #[test]
+    fn a_remainder_longer_than_the_slice_is_clamped() {
+        assert_eq!(
+            resume_slice_end(1_000_000_000, LAG_SLICE * 4, 0, LAG_SLICE),
+            0,
+            "un resto mayor que el slice tendria que recortarse, no regalarse"
+        );
+    }
+
+    /// Time zero with nothing left: 0 is the "no slice running" sentinel, so
+    /// the deadline has to come out as something else or the thread is handed a
+    /// fresh slice by accident.
+    #[test]
+    fn a_spent_slice_at_time_zero_is_not_read_as_a_fresh_one() {
+        assert_ne!(
+            resume_slice_end(0, 0, 0, LAG_SLICE),
+            0,
+            "un slice agotado en el instante 0 se confunde con no tener slice"
+        );
+    }
+
+    #[test]
+    fn a_wake_inside_the_base_slice_does_not_take_the_cpu() {
+        let now = 1_000_000_000;
+        // Corrio 100 us de 20 ms: dentro del suelo.
+        let end = now + LAG_SLICE - 100_000;
+        assert!(
+            !wake_preempt_allowed(now, end, LAG_SLICE, BASE_SLICE_NS),
+            "un despertar a los 100 us le quita la CPU al que corre"
+        );
+    }
+
+    #[test]
+    fn a_wake_past_the_base_slice_takes_the_cpu() {
+        let now = 1_000_000_000;
+        let end = now + LAG_SLICE - BASE_SLICE_NS;
+        assert!(
+            wake_preempt_allowed(now, end, LAG_SLICE, BASE_SLICE_NS),
+            "justo en el suelo el despertar ya tiene que pasar"
+        );
+        assert!(
+            !wake_preempt_allowed(now, end + 1, LAG_SLICE, BASE_SLICE_NS),
+            "el suelo esta un nanosegundo torcido"
+        );
+    }
+
+    /// Every case where the run length cannot be read off the deadline answers
+    /// `true`: an unknown must never become latency for the woken task.
+    #[test]
+    fn a_run_length_that_cannot_be_read_lets_the_wake_through() {
+        let now = 1_000_000_000;
+        assert!(
+            wake_preempt_allowed(now, 0, LAG_SLICE, BASE_SLICE_NS),
+            "sin slice apuntado el despertar tiene que pasar"
+        );
+        assert!(
+            wake_preempt_allowed(now, now + 1, u64::MAX, BASE_SLICE_NS),
+            "SCHED_FIFO no se mide con este suelo"
+        );
+        assert!(
+            wake_preempt_allowed(now, now, LAG_SLICE, BASE_SLICE_NS),
+            "un slice ya vencido no protege a nadie"
+        );
+        assert!(
+            wake_preempt_allowed(now, now + LAG_SLICE + 1, LAG_SLICE, BASE_SLICE_NS),
+            "una fecha limite mas lejos que un slice entero no es creible"
+        );
+    }
+
+    /// `SCHED_IDLE` yields to anything that wakes, as in Linux: the floor is
+    /// for threads whose CPU share is worth defending.
+    #[test]
+    fn an_idle_policy_thread_yields_to_any_wake() {
+        let t = a_thread();
+        let now = kernel_hal::timer::timer_now().as_nanos() as u64;
+        t.set_sched(SCHED_IDLE, 0, 0);
+        t.sched
+            .slice_end_ns
+            .store(now.saturating_add(t.timeslice_ns()), Ordering::Relaxed);
+        assert!(
+            t.sched_may_preempt_on_wake(),
+            "un hilo SCHED_IDLE se queda la CPU ante un despertar"
+        );
+    }
+
+    /// And a fair thread that has just started its slice keeps it.
+    #[test]
+    fn a_fair_thread_that_just_started_its_slice_keeps_it_through_a_wake() {
+        let t = a_thread();
+        let now = kernel_hal::timer::timer_now().as_nanos() as u64;
+        t.sched
+            .slice_end_ns
+            .store(now.saturating_add(t.timeslice_ns()), Ordering::Relaxed);
+        assert!(
+            !t.sched_may_preempt_on_wake(),
+            "el primer BASE_SLICE_NS del slice no es suyo"
         );
     }
 

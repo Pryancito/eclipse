@@ -650,6 +650,23 @@ pub fn take_need_resched() -> bool {
     taken
 }
 
+/// Trap-path side: is a wake-up preemption request pending for this CPU?
+///
+/// A plain relaxed load, with none of [`take_need_resched`]'s RMW: the trap
+/// path needs to know *that* a request exists before it asks the running
+/// thread whether it may be preempted yet (EEVDF's RUN_TO_PARITY, see
+/// `Thread::sched_may_preempt_on_wake`). Taking the request and then declining
+/// to yield would drop it, and the woken task would wait out the whole
+/// remaining slice -- which is what the request exists to prevent. So the
+/// order is peek, ask the thread, and only then take.
+pub fn need_resched_pending() -> bool {
+    let cpu = crate::arch::cpu_id() as usize;
+    if cpu >= MAX_CORE_NUM {
+        return false;
+    }
+    NEED_RESCHED.load(Ordering::Relaxed) & (1u64 << cpu) != 0
+}
+
 /// Executor-side: drop any pending request for this CPU.
 ///
 /// Called when the run queue is found empty — there is by definition nothing
