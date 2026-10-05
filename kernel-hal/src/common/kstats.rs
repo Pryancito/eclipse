@@ -201,13 +201,13 @@ pub fn timer_heap_stats() -> (usize, u64) {
 /// latency knob. A large shortfall means the requests are landing on CPUs that
 /// stay in kernel mode, where the trap path never sees them.
 #[cfg(target_os = "none")]
-pub fn wakeup_preempt_stats() -> (u64, u64) {
+pub fn wakeup_preempt_stats() -> (u64, u64, u64) {
     executor::wakeup_preempt_stats()
 }
 
 #[cfg(not(target_os = "none"))]
-pub fn wakeup_preempt_stats() -> (u64, u64) {
-    (0, 0)
+pub fn wakeup_preempt_stats() -> (u64, u64, u64) {
+    (0, 0, 0)
 }
 
 /// `(steal scans, victims probed, steals ok, affinity-empty victims skipped,
