@@ -220,6 +220,63 @@ const BASE_SLICE_NS: u64 = 750_000;
 /// last park, so a resumption gets a fresh slice (the pre-lag behaviour).
 const NO_SLICE_REMAINDER: u64 = u64::MAX;
 
+/// The full-rate scheduler tick, 4 ms at 250 Hz: the longest a thread can go
+/// between two of its own tick observations while it was on the CPU the whole
+/// time.
+///
+/// Named here rather than imported because the number this wants is the *upper
+/// bound* on that gap, not whatever period a particular timer happens to be
+/// programmed for: the timer is pulled in ahead of the tick for nearer
+/// deadlines (see `kernel_hal::common::deadline`), never pushed out past it.
+const SCHED_TICK_NS: u64 = 4_000_000;
+
+/// The slice deadline with the time this thread spent *off* the CPU since its
+/// last tick observation given back to it.
+///
+/// `slice_end_ns` is an absolute deadline, and it is only ever *read* while the
+/// thread is running -- `tick_should_preempt` runs from the timer interrupt of
+/// the thread that is executing. So every nanosecond between two of those reads
+/// is charged against the slice, whether the thread was on a CPU for it or not.
+/// Two of the three ways a thread leaves the CPU already pay that back: a
+/// blocking park and a voluntary preemption both unwind through `MarkBlocked`,
+/// which records the park and settles up at the resumption (see
+/// [`resume_slice_end`]). The third does not. A timer that preempts a poll
+/// *mid-poll* -- a thread doing kernel work inside a syscall -- freezes the
+/// frame as a weak executor; the poll never returns, so no park is recorded,
+/// and the frame is resumed rather than re-polled, so no resumption is either.
+/// The thread is off the CPU for however long the frame stays parked, and the
+/// clock charges it the lot.
+///
+/// What that costs is not a late thread but a *short* one: a thread that ran
+/// 2 ms of a 20 ms slice and was frozen for 15 comes back owning 3 ms, is
+/// preempted at its first tick, and leaves another frozen frame behind doing
+/// it. The busier the machine, the longer frames stay frozen, the shorter
+/// everyone's real slice, the more preemptions -- and each preemption is a
+/// stack switch and a 32 KiB stack. It also costs the RUN_TO_PARITY floor:
+/// [`wake_preempt_allowed`] reads an expired deadline as "no floor", so a
+/// thread that was frozen is preemptible by the very next wake.
+///
+/// So credit the gap. `last_seen` is where the clock stood at this thread's
+/// previous tick observation, 0 if there is none to compare against (a fresh
+/// slice, or a resumption, which has already settled up and must not be paid
+/// twice). Anything up to one tick is time the thread may well have been
+/// running, so it is charged as before; only the excess is given back, which
+/// under-credits by at most one tick and never over-credits a thread that was
+/// really running. The result is capped at one whole slice in hand, which is
+/// also what keeps a credit on a core with no periodic tick at all (aarch64
+/// without a timer PPI) from handing out a deadline [`slice_verdict`] would
+/// read as a backwards clock.
+fn credited_slice_end(now: u64, end: u64, last_seen: u64, slice: u64, tick: u64) -> u64 {
+    if end == 0 || last_seen == 0 || last_seen >= now {
+        return end;
+    }
+    let off_cpu = (now - last_seen).saturating_sub(tick);
+    if off_cpu == 0 {
+        return end;
+    }
+    end.saturating_add(off_cpu).min(now.saturating_add(slice))
+}
+
 /// Where a resumed thread's slice deadline lands: EEVDF's *lag*, applied to
 /// the slice remainder instead of to a virtual runtime.
 ///
@@ -346,6 +403,14 @@ struct SchedAttr {
     /// Monotonic time (ns) at which this thread last parked; the other half of
     /// the lag, and what makes "slept at least as long as it ran" answerable.
     parked_at_ns: AtomicU64,
+    /// Monotonic time (ns) of this thread's last tick observation, or 0 for
+    /// "nothing to compare against".
+    ///
+    /// The gap between two of these is what [`credited_slice_end`] reads to
+    /// tell time this thread spent running from time it spent frozen. Reset to
+    /// 0 wherever the deadline is settled up by other means, so a credit is
+    /// never paid twice for the same absence.
+    last_tick_ns: AtomicU64,
 }
 
 impl Default for SchedAttr {
@@ -358,6 +423,7 @@ impl Default for SchedAttr {
             parked: AtomicBool::new(false),
             slice_left_ns: AtomicU64::new(NO_SLICE_REMAINDER),
             parked_at_ns: AtomicU64::new(0),
+            last_tick_ns: AtomicU64::new(0),
         }
     }
 }
@@ -744,6 +810,9 @@ impl Thread {
         self.sched
             .slice_left_ns
             .store(NO_SLICE_REMAINDER, Ordering::Relaxed);
+        // And the tick observation the credit compares against: it belongs to a
+        // slice that no longer exists.
+        self.sched.last_tick_ns.store(0, Ordering::Relaxed);
     }
 
     /// Note that the executor has parked this thread: its future answered
@@ -806,6 +875,10 @@ impl Thread {
                 resume_slice_end(now, left, slept, self.timeslice_ns())
             };
             self.sched.slice_end_ns.store(end, Ordering::Relaxed);
+            // The absence is paid for, by the lag rule or by a fresh slice.
+            // Clearing the observation is what stops `credited_slice_end`
+            // paying for it a second time at the next tick.
+            self.sched.last_tick_ns.store(0, Ordering::Relaxed);
         }
     }
 
@@ -827,7 +900,7 @@ impl Thread {
             return true;
         }
         let now = kernel_hal::timer::timer_now().as_nanos() as u64;
-        let end = self.sched.slice_end_ns.load(Ordering::Relaxed);
+        let end = self.credited_slice_end(now, slice);
         wake_preempt_allowed(now, end, slice, BASE_SLICE_NS)
     }
 
@@ -847,7 +920,7 @@ impl Thread {
             return None;
         }
         let now = kernel_hal::timer::timer_now().as_nanos() as u64;
-        let end = self.sched.slice_end_ns.load(Ordering::Relaxed);
+        let end = self.credited_slice_end(now, slice);
         wake_preempt_floor_end(now, end, slice, BASE_SLICE_NS).map(Duration::from_nanos)
     }
 
@@ -899,10 +972,27 @@ impl Thread {
             return false;
         }
         let now = kernel_hal::timer::timer_now().as_nanos() as u64;
-        let end = self.sched.slice_end_ns.load(Ordering::Relaxed);
+        let end = self.credited_slice_end(now, slice);
         let (preempt, next) = slice_verdict(now, end, slice);
         self.sched.slice_end_ns.store(next, Ordering::Relaxed);
+        // This is the one reader that is also the observation: record where the
+        // clock stood so the next tick can tell running from frozen.
+        self.sched.last_tick_ns.store(now, Ordering::Relaxed);
         preempt
+    }
+
+    /// This thread's slice deadline, with time it spent frozen off the CPU
+    /// credited back. See [`credited_slice_end`]; every reader of the deadline
+    /// goes through here, because a deadline that reads as expired is not only
+    /// a preemption but also a lost RUN_TO_PARITY floor.
+    fn credited_slice_end(&self, now: u64, slice: u64) -> u64 {
+        credited_slice_end(
+            now,
+            self.sched.slice_end_ns.load(Ordering::Relaxed),
+            self.sched.last_tick_ns.load(Ordering::Relaxed),
+            slice,
+            SCHED_TICK_NS,
+        )
     }
 
     /// Setup the instruction and stack pointer, then tart execution on the thread
@@ -2752,6 +2842,142 @@ mod sched_tests {
         assert!(
             t.tick_should_preempt(),
             "un hilo que agoto su slice no lo suelta"
+        );
+    }
+
+    const CRED_SLICE: u64 = 20_000_000;
+
+    /// A gap no longer than a tick is time the thread may have been running, so
+    /// it stays charged. This is the common case -- every tick of a thread that
+    /// holds its CPU -- and it must cost nothing.
+    #[test]
+    fn a_gap_within_one_tick_is_charged_as_time_on_the_cpu() {
+        let now = 100_000_000;
+        let end = now + 18_000_000;
+        for gap in [1, 100_000, SCHED_TICK_NS - 1, SCHED_TICK_NS] {
+            assert_eq!(
+                credited_slice_end(now, end, now - gap, CRED_SLICE, SCHED_TICK_NS),
+                end,
+                "un hueco de {} ns no es tiempo fuera de la CPU",
+                gap
+            );
+        }
+    }
+
+    /// The frozen frame: the excess over a tick is time the thread was not on
+    /// the CPU, and it goes back on the deadline.
+    #[test]
+    fn the_part_of_the_gap_past_one_tick_goes_back_on_the_deadline() {
+        // Un hilo que corrio 2 ms de sus 20 y se quedo congelado 19.
+        let started = 100_000_000;
+        let ran = 2_000_000;
+        let frozen = 19_000_000;
+        let end = started + CRED_SLICE;
+        let last_seen = started + ran;
+        let now = last_seen + frozen;
+        assert_eq!(
+            credited_slice_end(now, end, last_seen, CRED_SLICE, SCHED_TICK_NS),
+            end + (frozen - SCHED_TICK_NS),
+            "el tiempo congelado no se le devuelve"
+        );
+        // Sin el credito el plazo esta vencido y el tick lo expulsa tras haber
+        // corrido 2 ms de 20, que es el fallo. Con el, sigue dentro del slice.
+        assert!(
+            slice_verdict(now, end, CRED_SLICE).0,
+            "sin el credito el tick no lo expulsaba y el caso no es el que creo"
+        );
+        let credited = credited_slice_end(now, end, last_seen, CRED_SLICE, SCHED_TICK_NS);
+        assert!(
+            !slice_verdict(now, credited, CRED_SLICE).0,
+            "con el credito todavia lo expulsa"
+        );
+    }
+
+    /// The credit is capped at one whole slice in hand, whatever the gap. A core
+    /// with no periodic tick could otherwise hand out a deadline
+    /// `slice_verdict` reads as a backwards clock, and a long freeze must not
+    /// buy more CPU than the slice is worth.
+    #[test]
+    fn the_credit_never_leaves_more_than_one_slice_in_hand() {
+        let now = 1_000_000_000;
+        let end = now + 1;
+        for frozen in [CRED_SLICE, 10 * CRED_SLICE, now] {
+            let credited = credited_slice_end(now, end, now - frozen, CRED_SLICE, SCHED_TICK_NS);
+            assert!(
+                credited <= now + CRED_SLICE,
+                "un congelado de {} ns deja mas de un slice en mano",
+                frozen
+            );
+            assert!(
+                !slice_verdict(now, credited, CRED_SLICE).0,
+                "y el plazo acreditado tiene que seguir siendo uno que este reloj pudo poner"
+            );
+        }
+    }
+
+    /// Nothing to compare against means no credit: a fresh slice (`end == 0`), a
+    /// resumption that already settled up (`last_seen == 0`), or a clock that
+    /// went backwards across a migration.
+    #[test]
+    fn with_nothing_to_compare_against_there_is_no_credit() {
+        let now = 100_000_000;
+        assert_eq!(
+            credited_slice_end(now, 0, now - 50_000_000, CRED_SLICE, SCHED_TICK_NS),
+            0,
+            "un slice sin empezar no se acredita"
+        );
+        let end = now + 1_000_000;
+        assert_eq!(
+            credited_slice_end(now, end, 0, CRED_SLICE, SCHED_TICK_NS),
+            end,
+            "una reanudacion ya liquido la ausencia; pagarla otra vez es pagarla dos veces"
+        );
+        assert_eq!(
+            credited_slice_end(now, end, now, CRED_SLICE, SCHED_TICK_NS),
+            end,
+            "sin hueco no hay credito"
+        );
+        assert_eq!(
+            credited_slice_end(now, end, now + 1, CRED_SLICE, SCHED_TICK_NS),
+            end,
+            "una observacion en el futuro es un reloj que fue hacia atras, no un credito"
+        );
+    }
+
+    /// A resumption clears the observation, so the sleep the lag rule just paid
+    /// for is not credited a second time at the next tick.
+    #[test]
+    fn a_resumption_clears_the_observation_it_already_paid_for() {
+        let t = a_thread();
+        t.sched.last_tick_ns.store(1, Ordering::Relaxed);
+        t.sched.parked.store(true, Ordering::Relaxed);
+        t.sched
+            .slice_left_ns
+            .store(NO_SLICE_REMAINDER, Ordering::Relaxed);
+        t.sched_note_resumed();
+        assert_eq!(
+            t.sched.last_tick_ns.load(Ordering::Relaxed),
+            0,
+            "la reanudacion deja la observacion vieja en pie y el credito se paga dos veces"
+        );
+        // And a `set_sched` drops it with the slice it belonged to.
+        t.sched.last_tick_ns.store(1, Ordering::Relaxed);
+        t.set_sched(SCHED_NORMAL, 5, 0);
+        assert_eq!(t.sched.last_tick_ns.load(Ordering::Relaxed), 0);
+    }
+
+    /// The whole thing through the thread: a tick records where the clock
+    /// stood, so the next one can tell running from frozen.
+    #[test]
+    fn a_tick_records_the_observation_the_next_one_compares_against() {
+        let t = a_thread();
+        t.sched.last_tick_ns.store(0, Ordering::Relaxed);
+        let before = kernel_hal::timer::timer_now().as_nanos() as u64;
+        t.tick_should_preempt();
+        let seen = t.sched.last_tick_ns.load(Ordering::Relaxed);
+        assert!(
+            seen >= before,
+            "el tick no apunta el reloj y el siguiente no puede distinguir congelado de corriendo"
         );
     }
 }
