@@ -2139,6 +2139,52 @@ static int sc_short_sleep(void) {
     return nanosleep(&ts, NULL) == 0 ? 0 : 0; // EINTR is still a completed arm
 }
 
+// --- a deterministic reproducer for a sched_yield() that does not return ---
+//
+// See the `--yieldstall` block in main() for what this builds and why.
+
+struct ys_lane {
+    volatile uint64_t count;
+    const volatile int *stop;
+    volatile int pin_failed;
+};
+
+struct ys_ctl {
+    volatile int stop;
+    volatile uint64_t notifies;
+    struct ys_lane a, b;
+    int nnotify;
+};
+static struct ys_ctl g_ys;
+
+static void *ys_yielder(void *arg) {
+    struct ys_lane *l = arg;
+    if (smpk_pin_self(0) != 0)
+        l->pin_failed = 1;
+    while (!*l->stop) {
+        sched_yield();
+        // Bumped AFTER the call returns, so a count that stops advancing means
+        // the call did not come back -- not that the loop was merely slow.
+        l->count++;
+    }
+    return NULL;
+}
+
+static void *ys_notifier(void *arg) {
+    struct ys_ctl *c = arg;
+    if (smpk_pin_self(0) != 0)
+        return NULL;
+    // Short sleeps, on the same CPU as the yielders: each one ends in a timer
+    // wake, which is a NOTIFY arriving at that CPU. The notified lane is what
+    // the yielded lane has to wait behind.
+    struct timespec ts = {0, 200 * 1000}; // 200 us
+    while (!c->stop) {
+        nanosleep(&ts, NULL);
+        c->notifies++;
+    }
+    return NULL;
+}
+
 // ---------------------------------------------------------------------------
 // Disk  [kernel]
 // ---------------------------------------------------------------------------
@@ -3031,6 +3077,122 @@ int main(int argc, char **argv) {
         return 0;
     }
 
+    // `--yieldstall [SECONDS] [NOTIFIERS]`: a deterministic reproducer for a
+    // sched_yield() that never returns.
+    //
+    // Not a benchmark — a diagnostic, like `--forkloop`. The `psched` section
+    // reports that Eclipse's `sched_yield()` can block indefinitely, but it
+    // finds it as a side effect of measuring something else and only
+    // sometimes, which is no use to anyone trying to fix it. This builds the
+    // condition on purpose instead of waiting for it.
+    //
+    // The recipe follows the shape of the executor. A voluntary yield parks
+    // its self-wake in a *yielded* lane, and that lane is drained only once
+    // nothing is notified on the CPU. So: confine everything to ONE CPU, put
+    // two threads in a tight `sched_yield()` loop, and keep a steady stream of
+    // notifies arriving at that same CPU from a third thread doing short
+    // sleeps. If the yielded lane is strictly lower priority than the notified
+    // one, the two yielders are starved for as long as the notifier keeps
+    // going, and neither `sched_yield()` call ever comes back.
+    //
+    // The observer is pinned OFF that CPU: a reporter sharing the CPU under
+    // test would be one more runnable task on it and would change the thing
+    // being observed. One line per second, so a stall is visible as it happens
+    // rather than inferred from a silent console, and the verdict at the end
+    // names which thread stopped and when.
+    if (argc > 1 && strcmp(argv[1], "--yieldstall") == 0) {
+        setvbuf(stdout, NULL, _IOLBF, 0);
+        int secs = argc > 2 ? (int)strtol(argv[2], NULL, 10) : 20;
+        int nnotify = argc > 3 ? (int)strtol(argv[3], NULL, 10) : 1;
+        if (secs < 1) secs = 1;
+        if (nnotify < 0) nnotify = 0;
+        if (nnotify > 8) nnotify = 8;
+        long nc = sysconf(_SC_NPROCESSORS_ONLN);
+        int ncpus = (nc > 0 && nc < 4096) ? (int)nc : 1;
+        if (ncpus < 2) {
+            printf("yieldstall: needs at least 2 CPUs (the observer must not "
+                   "share the CPU under test)\n");
+            return 2;
+        }
+        memset(&g_ys, 0, sizeof g_ys);
+        g_ys.nnotify = nnotify;
+        g_ys.a.stop = &g_ys.stop;
+        g_ys.b.stop = &g_ys.stop;
+        // Confine this thread to CPU 0 FIRST, so every thread created below
+        // inherits that mask and starts life on the CPU under test.
+        if (smpk_pin_self(0) != 0) {
+            printf("yieldstall: could not pin to CPU 0 — nothing to test\n");
+            return 2;
+        }
+        pthread_t ya, yb, nt[8];
+        int made_n = 0;
+        if (pthread_create(&ya, NULL, ys_yielder, &g_ys.a) != 0 ||
+            pthread_create(&yb, NULL, ys_yielder, &g_ys.b) != 0) {
+            printf("yieldstall: could not create the yielder threads\n");
+            return 2;
+        }
+        for (int i = 0; i < nnotify; i++) {
+            if (pthread_create(&nt[i], NULL, ys_notifier, &g_ys) != 0)
+                break;
+            made_n++;
+        }
+        // Move the observer off CPU 0 so it is not competing with what it
+        // watches.
+        cpu_set_t obs;
+        CPU_ZERO(&obs);
+        for (int i = 1; i < ncpus && i < CPU_SETSIZE; i++)
+            CPU_SET(i, &obs);
+        pthread_setaffinity_np(pthread_self(), sizeof obs, &obs);
+        printf("yieldstall: 2 yielders + %d notifier(s), all on CPU 0; "
+               "observer on CPU 1..%d; %d s\n", made_n, ncpus - 1, secs);
+        printf("yieldstall: a yields/s of 0 while notifies keep arriving IS "
+               "the bug\n");
+        uint64_t pa = 0, pb = 0, pn = 0;
+        uint64_t stall_a = 0, stall_b = 0;
+        uint64_t t0 = now_ns();
+        for (int s = 0; s < secs; s++) {
+            struct timespec one = {1, 0};
+            nanosleep(&one, NULL);
+            uint64_t ca = g_ys.a.count, cb = g_ys.b.count, cn = g_ys.notifies;
+            uint64_t da = ca - pa, db = cb - pb, dn = cn - pn;
+            double at = (double)(now_ns() - t0) / 1e9;
+            printf("yieldstall %5.1fs: A %10llu/s  B %10llu/s  notifies %8llu/s\n",
+                   at, (unsigned long long)da, (unsigned long long)db,
+                   (unsigned long long)dn);
+            // First second in which a yielder made no progress at all while
+            // the notifier did: that is the lane being starved, not the thread
+            // merely running slowly.
+            if (da == 0 && dn > 0 && !stall_a) stall_a = (uint64_t)(at * 1000);
+            if (db == 0 && dn > 0 && !stall_b) stall_b = (uint64_t)(at * 1000);
+            pa = ca; pb = cb; pn = cn;
+        }
+        g_ys.stop = 1;
+        printf("yieldstall: verdict:\n");
+        if (stall_a || stall_b) {
+            printf("  STALLED. A first made no progress at %llu ms, B at "
+                   "%llu ms (0 = never stalled),\n"
+                   "  while notifies kept arriving at the same CPU. A yielder "
+                   "that stops\n  advancing under a notify stream is the "
+                   "yielded lane being starved.\n",
+                   (unsigned long long)stall_a, (unsigned long long)stall_b);
+        } else {
+            printf("  no stall: both yielders kept advancing for the whole "
+                   "run.\n");
+        }
+        printf("  totals: A %llu yields, B %llu yields, %llu notifies\n",
+               (unsigned long long)g_ys.a.count,
+               (unsigned long long)g_ys.b.count,
+               (unsigned long long)g_ys.notifies);
+        // Do NOT join: if sched_yield() really does not return, the yielder
+        // threads are stuck inside it and a join would hang the very
+        // diagnostic that just proved it. Say so and exit.
+        if (stall_a || stall_b)
+            printf("  (not joining the yielders: they are inside the call "
+                   "that did not return)\n");
+        fflush(stdout);
+        _exit(0);
+    }
+
     const char *only = NULL;
     int argi = 1;
     while (argi < argc && argv[argi][0] == '-' && argv[argi][1] == '-') {
@@ -3062,6 +3224,9 @@ int main(int argc, char **argv) {
                     argv[0]);
             fprintf(stderr,
                     "sections: cpu mem syscall vm sched psched smp disk proc gfx\n");
+            fprintf(stderr,
+                    "diagnostics: --forkloop N MIB [MAPS], "
+                    "--yieldstall [SECONDS] [NOTIFIERS]\n");
             return 2;
         }
         argi++;
