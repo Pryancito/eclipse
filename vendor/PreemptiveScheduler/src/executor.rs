@@ -33,6 +33,10 @@ pub struct Executor {
     #[cfg(any(target_arch = "riscv64", target_arch = "aarch64"))]
     context_data: ContextData,
     task_id: usize,
+    /// Polls taken since this executor last handed the CPU to a parked weak
+    /// executor. Plain, not atomic: an executor is only ever run by one CPU,
+    /// and this is the hottest loop there is.
+    polls_since_weak: u64,
     state: ExecutorState,
     /// The task checked out for the poll currently in flight, with its waker.
     /// The panic-containment path needs to name — and retire — the future that
@@ -151,12 +155,20 @@ static IDLE_STREAK: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU6
 static SCHED_POLLED: [crate::runtime::CacheAligned; lock::MAX_CORE_NUM] =
     [const { crate::runtime::CacheAligned::new() }; lock::MAX_CORE_NUM];
 static SCHED_WEAK_YIELD: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Turns the strong executor handed to parked weak executors while its own run
+/// queue still had work -- the thing that used not to happen at all.
+static SCHED_WEAK_TURN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
-/// `(tasks polled, weak-executor yields)` since boot.
-pub fn sched_stats() -> (u64, u64) {
+/// `(tasks polled, weak-executor yields, weak turns taken with work still
+/// queued)` since boot.
+pub fn sched_stats() -> (u64, u64, u64) {
     use core::sync::atomic::Ordering::Relaxed;
     let polled = SCHED_POLLED.iter().map(|c| c.0.load(Relaxed)).sum();
-    (polled, SCHED_WEAK_YIELD.load(Relaxed))
+    (
+        polled,
+        SCHED_WEAK_YIELD.load(Relaxed),
+        SCHED_WEAK_TURN.load(Relaxed),
+    )
 }
 
 /// `(stack-pool occupied slots, overflow-list length)` — how many freed
@@ -1259,6 +1271,7 @@ impl Executor {
             #[cfg(any(target_arch = "riscv64", target_arch = "aarch64"))]
             context_data: ContextData::default(),
             task_id: 0,
+            polls_since_weak: 0,
             state: ExecutorState::UNUSED,
             current_task: core::ptr::null(),
             current_waker: core::ptr::null(),
@@ -1377,6 +1390,28 @@ impl Executor {
             // overloaded. Every 32 polls, if we have one runnable task and a
             // peer has at least three we may poll, pull one first. Ownership
             // of the waker page stays with the victim (same as idle steal).
+            // A parked weak executor is a task's poll frozen mid-poll, and the
+            // frozen frame still holds that task's borrow -- so the queue defers
+            // its wakes and the task cannot run again, by any route, until the
+            // frame is resumed. Resuming them only when this queue drains
+            // starves exactly the case where it never drains: two threads doing
+            // nothing but `sched_yield(2)` on one CPU measured 547.763 turns for
+            // one and 0 in twenty seconds for the other. So give the frames a
+            // turn on a bounded cadence. Only the strong executor does this: a
+            // weak one doing it would resume weak frames from inside a weak
+            // frame.
+            if !matches!(self.state, ExecutorState::WEAK | ExecutorState::KILLED)
+                && crate::runtime::weak_turn_due(
+                    crate::runtime::weak_waiting_here(),
+                    self.polls_since_weak,
+                    crate::runtime::WEAK_TURN_EVERY,
+                )
+            {
+                self.polls_since_weak = 0;
+                SCHED_WEAK_TURN.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                crate::runtime::sched_yield();
+                continue;
+            }
             let mut task_info = None;
             if crate::runtime::rebalance_due() {
                 // Rescue first, and with no condition on our own load: a peer
@@ -1497,6 +1532,7 @@ impl Executor {
                         waker_ref.mark_borrowed(false);
                     }
                 };
+                self.polls_since_weak = self.polls_since_weak.saturating_add(1);
                 if let ExecutorState::WEAK = self.state {
                     self.state = ExecutorState::KILLED;
                     // Past this return, `run_executor`'s post-run calls
@@ -2452,7 +2488,7 @@ mod stack_registry_tests {
         SCHED_POLLED[lock::MAX_CORE_NUM - 1]
             .0
             .store(11, Ordering::SeqCst);
-        let (polled, _) = sched_stats();
+        let (polled, _, _) = sched_stats();
         for (c, v) in SCHED_POLLED.iter().zip(saved) {
             c.0.store(v, Ordering::SeqCst);
         }

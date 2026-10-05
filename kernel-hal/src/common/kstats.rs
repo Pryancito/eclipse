@@ -144,13 +144,13 @@ pub fn cpu_times_jiffies(cpu: usize) -> (u64, u64, u64) {
 /// high `weak_yield` rate means the CPUs spin on an outstanding weak executor.
 /// (The scheduler only exists on bare metal; libos reports zeros.)
 #[cfg(target_os = "none")]
-pub fn sched_stats() -> (u64, u64) {
+pub fn sched_stats() -> (u64, u64, u64) {
     executor::sched_stats()
 }
 
 #[cfg(not(target_os = "none"))]
-pub fn sched_stats() -> (u64, u64) {
-    (0, 0)
+pub fn sched_stats() -> (u64, u64, u64) {
+    (0, 0, 0)
 }
 
 /// `(deadline timer enabled, wake-up preemption enabled)`.
