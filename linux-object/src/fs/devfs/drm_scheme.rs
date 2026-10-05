@@ -160,6 +160,63 @@ impl DrmDev {
         Arc::as_ptr(&self.file) as usize
     }
 
+    /// `drm_mode_obj_set_property_ioctl`, which `SETPROPERTY` also goes
+    /// through: the object, of the type the caller named (ENOENT); a
+    /// property that object carries (EINVAL, and an encoder carries none);
+    /// then `drm_property_change_valid_get`, which refuses an immutable
+    /// property and a value outside what the property's type admits
+    /// (EINVAL). Only then is the write applied.
+    ///
+    /// None of it was read once the object and the property each existed
+    /// somewhere: `DPMS` on a CRTC, a plane's immutable `type`, `DPMS = 7`,
+    /// `ACTIVE = 2`, an `FB_ID` naming a CRTC, a `MODE_ID` naming no blob,
+    /// were all "set", so a client probing what it may change was told
+    /// everything, and one reading the value back saw it unchanged.
+    ///
+    /// The write itself is still the DPMS switch or a no-op: the scanout
+    /// has no per-object state behind the other properties, and an atomic
+    /// property set this way does not commit (Linux commits it).
+    fn set_object_property(
+        &self,
+        obj_id: u32,
+        obj_type: u32,
+        prop_id: u32,
+        value: u64,
+    ) -> Result<usize> {
+        let Some((kind, props)) = find_mode_object(obj_id, obj_type) else {
+            return Err(FsError::EntryNotFound);
+        };
+        // `drm_mode_obj_find_prop_id`.
+        if !props.iter().any(|&(id, _)| id == prop_id) {
+            return Err(FsError::InvalidParam);
+        }
+        let Some(spec) = prop_spec(prop_id) else {
+            return Err(FsError::InvalidParam);
+        };
+        if !property_change_valid(&spec, value) {
+            return Err(FsError::InvalidParam);
+        }
+        if prop_id == PROP_DPMS && kind == DRM_MODE_OBJECT_CONNECTOR {
+            let off = value != DRM_MODE_DPMS_ON;
+            log::debug!(
+                "[drm] SETPROPERTY connector={} DPMS={} -> CRTC {}",
+                obj_id,
+                value,
+                if off { "off" } else { "on" }
+            );
+            drm::set_crtc_blanked(off);
+            return Ok(0);
+        }
+        log::debug!(
+            "[drm] OBJ_SETPROPERTY obj={} type={:#x} prop={} val={} (accepted, no-op)",
+            obj_id,
+            kind,
+            prop_id,
+            value
+        );
+        Ok(0)
+    }
+
     /// Sleep until the vblank a blocking `DRM_IOCTL_WAIT_VBLANK` asked for.
     ///
     /// Called from `sys_ioctl` (async) *before* the request reaches
@@ -1954,40 +2011,13 @@ impl DrmDev {
                 Ok(0)
             }
             DRM_IOCTL_MODE_OBJ_SETPROPERTY => {
-                // Legacy property writes (connector DPMS, plane rotation, …).
-                // The software scanout has no programmable object state, so
-                // accept and ignore rather than failing the client's modeset.
                 let req = unsafe { *(data as *const DrmModeObjSetProperty) };
-                // `drm_mode_obj_set_property_ioctl`: an object that does not
-                // exist is ENOENT, and so is a property id that does not. This
-                // arm accepted both, so a write to an object the client never
-                // got from GETRESOURCES, or with a property id it made up, was
-                // reported as done.
-                if !mode_object_exists(req.obj_id) || prop_spec(req.prop_id).is_none() {
-                    return Err(FsError::EntryNotFound);
-                }
-                // Same DPMS handling as the connector-specific setter above:
-                // `drm_mode_obj_set_property_ioctl` funnels into the very same
-                // `drm_mode_connector_set_obj_prop`.
-                if req.prop_id == PROP_DPMS && drm::get_connector(req.obj_id).is_some() {
-                    drm::set_crtc_blanked(req.value != DRM_MODE_DPMS_ON);
-                    return Ok(0);
-                }
-                log::debug!(
-                    "[drm] OBJ_SETPROPERTY obj={} type={:#x} prop={} val={} (accepted, no-op)",
-                    req.obj_id,
-                    req.obj_type,
-                    req.prop_id,
-                    req.value
-                );
-                Ok(0)
+                self.set_object_property(req.obj_id, req.obj_type, req.prop_id, req.value)
             }
             DRM_IOCTL_MODE_SETPROPERTY => {
-                // Legacy connector property write — wlroots sets the DPMS
-                // property to "on" as part of committing a modeset. Software
-                // scanout is always powered, so accept and ignore rather than
-                // failing the commit (which left the screen blank with
-                // "Failed to set DPMS property").
+                // `struct drm_mode_connector_set_property { u64 value; u32
+                // prop_id; u32 connector_id; }`: `drm_connector_property_set_ioctl`
+                // is `drm_mode_obj_set_property_ioctl` with the connector type.
                 let value = unsafe { *(data as *const u64) };
                 let (prop_id, connector_id) = unsafe {
                     (
@@ -1995,35 +2025,7 @@ impl DrmDev {
                         *(data.wrapping_add(12) as *const u32),
                     )
                 };
-                // `drm_connector_property_set_ioctl` is the OBJ_SETPROPERTY
-                // above with the type fixed to connector: an unknown
-                // connector or property id is ENOENT.
-                if drm::get_connector(connector_id).is_none() || prop_spec(prop_id).is_none() {
-                    return Err(FsError::EntryNotFound);
-                }
-                // DPMS is the one legacy connector property with an effect
-                // here. Linux routes it through `connector->funcs->dpms`,
-                // which disables the CRTC for anything but "On"; the other
-                // three levels (Standby, Suspend, Off) all mean "stop lighting
-                // the panel" on a pipe with no power states of its own.
-                if prop_id == PROP_DPMS {
-                    let off = value != DRM_MODE_DPMS_ON;
-                    log::debug!(
-                        "[drm] SETPROPERTY connector={} DPMS={} -> CRTC {}",
-                        connector_id,
-                        value,
-                        if off { "off" } else { "on" }
-                    );
-                    drm::set_crtc_blanked(off);
-                    return Ok(0);
-                }
-                log::debug!(
-                    "[drm] SETPROPERTY connector={} prop={} val={} (accepted, no-op)",
-                    connector_id,
-                    prop_id,
-                    value
-                );
-                Ok(0)
+                self.set_object_property(connector_id, DRM_MODE_OBJECT_CONNECTOR, prop_id, value)
             }
             DRM_IOCTL_MODE_CURSOR | DRM_IOCTL_MODE_CURSOR2 => {
                 // Kernel-composited hardware cursor. wlroots is forced onto the
@@ -3924,7 +3926,12 @@ const DRM_MODE_PROP_ATOMIC: u32 = 0x8000_0000;
 
 // KMS object types (`drm_mode.h`).
 const DRM_MODE_OBJECT_CRTC: u32 = 0xcccc_cccc;
+const DRM_MODE_OBJECT_CONNECTOR: u32 = 0xc0c0_c0c0;
+const DRM_MODE_OBJECT_ENCODER: u32 = 0xe0e0_e0e0;
 const DRM_MODE_OBJECT_FB: u32 = 0xfbfb_fbfb;
+const DRM_MODE_OBJECT_PLANE: u32 = 0xeeee_eeee;
+/// `DRM_MODE_OBJECT_ANY`: a lookup that does not care about the type.
+const DRM_MODE_OBJECT_ANY: u32 = 0;
 
 // DRM client capabilities (DRM_IOCTL_SET_CLIENT_CAP).
 const DRM_CLIENT_CAP_STEREO_3D: u64 = 1;
@@ -4996,19 +5003,73 @@ struct PropSpec {
     enums: &'static [(u64, &'static str)],
 }
 
+/// `drm_mode_object_find(dev, file, id, type)` for the objects that carry
+/// properties: the object's type and its properties (`obj->properties`,
+/// as OBJ_GETPROPERTIES lists them to an atomic client; an encoder has
+/// none). `DRM_MODE_OBJECT_ANY` matches any type; any other type has to be
+/// the object's own.
+fn find_mode_object(obj_id: u32, obj_type: u32) -> Option<(u32, alloc::vec::Vec<(u32, u64)>)> {
+    let (kind, props) = if let Some(plane) = drm::get_plane(obj_id) {
+        (DRM_MODE_OBJECT_PLANE, plane_props(&plane, true))
+    } else if drm::get_crtc(obj_id).is_some() {
+        (DRM_MODE_OBJECT_CRTC, crtc_props(true))
+    } else if drm::get_connector(obj_id).is_some() {
+        (DRM_MODE_OBJECT_CONNECTOR, connector_props(obj_id, true))
+    } else if obj_id == drm::SYNTH_ENCODER_ID {
+        (DRM_MODE_OBJECT_ENCODER, alloc::vec::Vec::new())
+    } else {
+        return None;
+    };
+    if obj_type != DRM_MODE_OBJECT_ANY && obj_type != kind {
+        return None;
+    }
+    Some((kind, props))
+}
+
+/// `drm_property_change_valid_get`: whether `value` may be written to a
+/// property of this spec. Immutable never; a range and a signed range by
+/// their bounds; an object property takes 0 or an existing object of the
+/// type in `values[0]`; a blob property 0 or an existing blob; an enum one
+/// of its listed values.
+fn property_change_valid(spec: &PropSpec, value: u64) -> bool {
+    if spec.flags & DRM_MODE_PROP_IMMUTABLE != 0 {
+        return false;
+    }
+    // `DRM_MODE_PROP_EXTENDED_TYPE` carries the object and signed-range
+    // types; the legacy bits carry the rest.
+    const EXTENDED_TYPE: u32 = 0x0000_ffc0;
+    match spec.flags & EXTENDED_TYPE {
+        DRM_MODE_PROP_OBJECT => {
+            if value == 0 {
+                return true;
+            }
+            if value > u32::MAX as u64 {
+                return false;
+            }
+            let id = value as u32;
+            match spec.values.first().copied() {
+                Some(t) if t == DRM_MODE_OBJECT_FB as u64 => drm::get_fb(id).is_some(),
+                Some(t) if t == DRM_MODE_OBJECT_CRTC as u64 => drm::get_crtc(id).is_some(),
+                _ => false,
+            }
+        }
+        DRM_MODE_PROP_SIGNED_RANGE => {
+            let v = value as i64;
+            v >= spec.values[0] as i64 && v <= spec.values[1] as i64
+        }
+        _ if spec.flags & DRM_MODE_PROP_RANGE != 0 => {
+            value >= spec.values[0] && value <= spec.values[1]
+        }
+        _ if spec.flags & DRM_MODE_PROP_BLOB != 0 => {
+            value == 0 || (value <= u32::MAX as u64 && drm::get_blob(value as u32).is_some())
+        }
+        _ => spec.values.contains(&value),
+    }
+}
+
 /// The property table of the synthetic pipeline. Names, types and ranges
 /// match Linux's standard properties (`drm_mode_create_standard_properties`,
 /// `drm_plane_create_*`, `drm_connector_create_standard_properties`).
-/// Whether `id` names a mode object a client can set a property on: a plane,
-/// a CRTC, a connector or the one encoder. What `drm_mode_object_get` with
-/// `DRM_MODE_OBJECT_ANY` finds.
-fn mode_object_exists(id: u32) -> bool {
-    id == drm::SYNTH_ENCODER_ID
-        || drm::get_plane(id).is_some()
-        || drm::get_crtc(id).is_some()
-        || drm::get_connector(id).is_some()
-}
-
 fn prop_spec(prop_id: u32) -> Option<PropSpec> {
     Some(match prop_id {
         PROP_TYPE => PropSpec {
@@ -12423,7 +12484,12 @@ mod hw_kms_tests {
         assert_eq!(c.ioctl(DRM_IOCTL_MODE_OBJ_SETPROPERTY, &mut set), enoent);
         set.obj_id = 61;
         set.prop_id = BOGUS;
-        assert_eq!(c.ioctl(DRM_IOCTL_MODE_OBJ_SETPROPERTY, &mut set), enoent);
+        // A property the object does not carry: `drm_mode_obj_find_prop_id`
+        // misses and the ioctl's EINVAL stands (it was ENOENT here).
+        assert_eq!(
+            c.ioctl(DRM_IOCTL_MODE_OBJ_SETPROPERTY, &mut set),
+            Err(FsError::InvalidParam)
+        );
         set.prop_id = PROP_DPMS;
         assert_eq!(c.ioctl(DRM_IOCTL_MODE_OBJ_SETPROPERTY, &mut set), Ok(0));
 
@@ -12443,7 +12509,10 @@ mod hw_kms_tests {
         assert_eq!(c.ioctl(DRM_IOCTL_MODE_SETPROPERTY, &mut cset), enoent);
         cset.connector_id = 61;
         cset.prop_id = BOGUS;
-        assert_eq!(c.ioctl(DRM_IOCTL_MODE_SETPROPERTY, &mut cset), enoent);
+        assert_eq!(
+            c.ioctl(DRM_IOCTL_MODE_SETPROPERTY, &mut cset),
+            Err(FsError::InvalidParam)
+        );
         cset.prop_id = PROP_DPMS;
         assert_eq!(c.ioctl(DRM_IOCTL_MODE_SETPROPERTY, &mut cset), Ok(0));
     }
@@ -12725,6 +12794,193 @@ mod hw_kms_tests {
         for buf in [&xr24, &narrow, &short, &ar24, &ar24_too] {
             c.destroy_dumb(buf.handle).expect("DESTROY_DUMB");
         }
+    }
+
+    /// `drm_mode_obj_set_property_ioctl`, and SETPROPERTY through it: the
+    /// object of the type named (ENOENT), a property the object carries
+    /// (EINVAL; an encoder carries none), then `drm_property_change_valid_get`:
+    /// not immutable, and a value the property's type admits (EINVAL). Any
+    /// value for any known property on any existing object was "set".
+    #[test]
+    fn a_property_write_is_checked_against_the_object_and_the_property() {
+        let _screen = kms_emu::attach(32, 8);
+        let c = Client::open(0);
+        let (crtcs, conns) = topology(&c);
+        let (crtc, conn) = (crtcs[0], conns[0]);
+        universal_planes(&c, true);
+        let plane = planes(&c)[0];
+        let buf = c.create_dumb(32, 8);
+        let fb = c.addfb2(&buf);
+        let einval = Err(FsError::InvalidParam);
+        let enoent = Err(FsError::EntryNotFound);
+        let set = |obj_id: u32, obj_type: u32, prop_id: u32, value: u64| {
+            let mut req = DrmModeObjSetProperty {
+                value,
+                prop_id,
+                obj_id,
+                obj_type,
+            };
+            c.ioctl(DRM_IOCTL_MODE_OBJ_SETPROPERTY, &mut req)
+        };
+        // The object, of the type asked for.
+        assert_eq!(
+            set(crtc, DRM_MODE_OBJECT_CONNECTOR, PROP_ACTIVE, 1),
+            enoent,
+            "a CRTC is not a connector"
+        );
+        assert_eq!(set(crtc, DRM_MODE_OBJECT_CRTC, PROP_ACTIVE, 1), Ok(0));
+        assert_eq!(set(crtc, DRM_MODE_OBJECT_ANY, PROP_ACTIVE, 1), Ok(0));
+        // A property the object carries.
+        assert_eq!(
+            set(crtc, DRM_MODE_OBJECT_CRTC, PROP_DPMS, DRM_MODE_DPMS_ON),
+            einval,
+            "DPMS is the connector's"
+        );
+        assert_eq!(
+            set(conn, DRM_MODE_OBJECT_CONNECTOR, PROP_TYPE, 1),
+            einval,
+            "type is the plane's"
+        );
+        assert_eq!(
+            set(drm::SYNTH_ENCODER_ID, DRM_MODE_OBJECT_ENCODER, PROP_DPMS, 0),
+            einval,
+            "an encoder carries none"
+        );
+        assert_eq!(
+            set(conn, DRM_MODE_OBJECT_CONNECTOR, 0xdead, 0),
+            einval,
+            "no such property"
+        );
+        // Immutable.
+        assert_eq!(set(plane, DRM_MODE_OBJECT_PLANE, PROP_TYPE, 1), einval);
+        assert_eq!(
+            set(conn, DRM_MODE_OBJECT_CONNECTOR, PROP_NON_DESKTOP, 0),
+            einval
+        );
+        // An enum takes one of its listed values.
+        assert_eq!(set(conn, DRM_MODE_OBJECT_CONNECTOR, PROP_DPMS, 7), einval);
+        assert_eq!(
+            set(conn, DRM_MODE_OBJECT_CONNECTOR, PROP_LINK_STATUS, 1),
+            Ok(0)
+        );
+        // A range and a signed range, by their bounds.
+        assert_eq!(set(crtc, DRM_MODE_OBJECT_CRTC, PROP_ACTIVE, 2), einval);
+        assert_eq!(
+            set(
+                plane,
+                DRM_MODE_OBJECT_PLANE,
+                PROP_CRTC_X,
+                i32::MIN as i64 as u64
+            ),
+            Ok(0)
+        );
+        assert_eq!(
+            set(
+                plane,
+                DRM_MODE_OBJECT_PLANE,
+                PROP_CRTC_X,
+                i32::MAX as u64 + 1
+            ),
+            einval
+        );
+        assert_eq!(
+            set(
+                plane,
+                DRM_MODE_OBJECT_PLANE,
+                PROP_CRTC_W,
+                i32::MAX as u64 + 1
+            ),
+            einval
+        );
+        assert_eq!(
+            set(plane, DRM_MODE_OBJECT_PLANE, PROP_SRC_W, u32::MAX as u64),
+            Ok(0)
+        );
+        // An object property: 0, or an object of the property's type.
+        assert_eq!(set(plane, DRM_MODE_OBJECT_PLANE, PROP_FB_ID, 0), Ok(0));
+        assert_eq!(
+            set(plane, DRM_MODE_OBJECT_PLANE, PROP_FB_ID, fb as u64),
+            Ok(0)
+        );
+        // (Not "the CRTC's id": framebuffer ids and mode-object ids are
+        // separate namespaces here, so fb 1 and CRTC 1 can both exist.)
+        assert_eq!(
+            set(plane, DRM_MODE_OBJECT_PLANE, PROP_FB_ID, 0xdead_0000),
+            einval,
+            "no such fb"
+        );
+        assert_eq!(
+            set(plane, DRM_MODE_OBJECT_PLANE, PROP_CRTC_ID, crtc as u64),
+            Ok(0)
+        );
+        assert_eq!(
+            set(plane, DRM_MODE_OBJECT_PLANE, PROP_CRTC_ID, conn as u64),
+            einval
+        );
+        assert_eq!(
+            set(
+                plane,
+                DRM_MODE_OBJECT_PLANE,
+                PROP_CRTC_ID,
+                (1 << 32) | crtc as u64
+            ),
+            einval,
+            "not a 32-bit id, whatever its low word names"
+        );
+        // A blob property: 0, or an existing blob.
+        let bytes = [7u8; 68];
+        let mut blob = DrmModeCreateBlob {
+            data: bytes.as_ptr() as u64,
+            length: bytes.len() as u32,
+            blob_id: 0,
+        };
+        c.ioctl(DRM_IOCTL_MODE_CREATEPROPBLOB, &mut blob)
+            .expect("CREATEPROPBLOB");
+        assert_eq!(set(crtc, DRM_MODE_OBJECT_CRTC, PROP_MODE_ID, 0), Ok(0));
+        assert_eq!(
+            set(
+                crtc,
+                DRM_MODE_OBJECT_CRTC,
+                PROP_MODE_ID,
+                blob.blob_id as u64
+            ),
+            Ok(0)
+        );
+        assert_eq!(
+            set(crtc, DRM_MODE_OBJECT_CRTC, PROP_MODE_ID, 0xdead_beef),
+            einval
+        );
+        let mut blob_id = blob.blob_id;
+        c.ioctl(DRM_IOCTL_MODE_DESTROYPROPBLOB, &mut blob_id)
+            .expect("DESTROYPROPBLOB");
+
+        // SETPROPERTY is the same call with the connector type.
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        struct ConnectorSetProperty {
+            value: u64,
+            prop_id: u32,
+            connector_id: u32,
+        }
+        let cset = |connector_id: u32, prop_id: u32, value: u64| {
+            let mut req = ConnectorSetProperty {
+                value,
+                prop_id,
+                connector_id,
+            };
+            c.ioctl(DRM_IOCTL_MODE_SETPROPERTY, &mut req)
+        };
+        assert_eq!(
+            cset(crtc, PROP_DPMS, DRM_MODE_DPMS_ON),
+            enoent,
+            "a CRTC is not a connector"
+        );
+        assert_eq!(cset(conn, PROP_TYPE, 1), einval);
+        assert_eq!(cset(conn, PROP_DPMS, 9), einval);
+        assert_eq!(cset(conn, PROP_DPMS, 3), Ok(0), "Off");
+        assert!(drm::crtc_blanked(), "and the DPMS write still lands");
+        assert_eq!(cset(conn, PROP_DPMS, DRM_MODE_DPMS_ON), Ok(0));
+        assert!(!drm::crtc_blanked());
     }
 
     /// `drm_mode_gamma_{get,set}_ioctl` on a CRTC whose `gamma_size` is 0,
