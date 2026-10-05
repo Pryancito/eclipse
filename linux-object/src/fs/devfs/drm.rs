@@ -1587,11 +1587,24 @@ impl DrmFileState {
             return current;
         }
         let mut state = DRM_STATE.lock();
+        // Two GET_MAGIC on the same file can both see 0 before either stores.
+        // Re-check under the lock so we mint once; the second caller must
+        // return the same value Linux's `file_priv->magic` would.
+        let current = self.magic.load(Ordering::Acquire);
+        if current != 0 {
+            return current;
+        }
         let magic = state.next_magic;
-        state.next_magic += 1;
-        state
-            .magics
-            .push((self.minor, magic, self as *const DrmFileState as usize));
+        state.next_magic = state.next_magic.saturating_add(1);
+        if state.next_magic == 0 {
+            // 0 is libdrm's `drmIsMaster()` probe, never a minted magic.
+            state.next_magic = 1;
+        }
+        state.magics.push((
+            magic_device(self.minor),
+            magic,
+            self as *const DrmFileState as usize,
+        ));
         self.magic.store(magic, Ordering::Release);
         magic
     }
@@ -1778,15 +1791,28 @@ pub fn drop_master(minor: u32, file: usize) -> bool {
     state.masters.len() != before
 }
 
+/// Linux's `drm_device` identity for a `/dev/dri` minor: `card{n}` and
+/// `renderD{128+n}` share one device, and magics live on that device's
+/// `drm_master`, not on the node. A GET_MAGIC on the render node (or a
+/// mint from its `drm_file`) must be spendable by AUTH_MAGIC on `card{n}`.
+fn magic_device(minor: u32) -> u32 {
+    if minor >= RENDER_MINOR_BASE {
+        minor - RENDER_MINOR_BASE
+    } else {
+        minor
+    }
+}
+
 /// `drm_authmagic`: the master authenticates a magic minted on its device;
 /// `true` if one was, and it is spent (a second `AUTH_MAGIC` of the same
 /// magic is EINVAL, as `idr_replace(.., NULL, ..)` makes it).
 pub fn auth_magic(minor: u32, magic: u32) -> bool {
     let mut state = DRM_STATE.lock();
+    let device = magic_device(minor);
     let before = state.magics.len();
     state
         .magics
-        .retain(|&(m, g, _)| !(m == minor && g == magic));
+        .retain(|&(d, g, _)| !(d == device && g == magic));
     state.magics.len() != before
 }
 
@@ -1920,8 +1946,10 @@ struct DrmState {
     next_blob_id: u32,
     /// `drm_device.master` per node: `(minor, file)`. One holder per minor.
     masters: Vec<(u32, usize)>,
-    /// `drm_master.magic_map`: `(minor, magic, file)`, each spent by the one
-    /// `AUTH_MAGIC` that names it or dropped with its file.
+    /// `drm_master.magic_map`: `(device, magic, file)`, keyed by
+    /// [`magic_device`] so `card{n}` and `renderD{128+n}` share the map.
+    /// Each entry is spent by the one `AUTH_MAGIC` that names it or dropped
+    /// with its file.
     magics: Vec<(u32, u32, usize)>,
     /// `drm_getmagic`'s idr: magics start at 1.
     next_magic: u32,

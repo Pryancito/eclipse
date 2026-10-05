@@ -997,21 +997,20 @@ impl DrmDev {
                 log::debug!("[drm] GET_CAP cap={:#x} -> {}", cap.capability, cap.value);
                 Ok(0)
             }
-            // A single DRM client on the primary node is implicitly master;
-            // accept (drop-)master so seatd/wlroots session activation succeeds.
-            // Magic/auth: `drmIsMaster()` authenticates magic 0 and treats
-            // success as "this fd is DRM master". wlroots' dumb-buffer allocator
-            // (pixman path) requires master, so always succeed — the single
-            // client on the primary node is implicitly master here.
             DRM_IOCTL_GET_MAGIC => {
                 // struct drm_auth { __u32 magic; }: `drm_getmagic` mints one
-                // per file, once. Every file was told 1.
+                // per file, once, starting at 1. 0 is reserved for
+                // libdrm's `drmIsMaster()` AUTH_MAGIC probe.
                 unsafe { *(data as *mut u32) = self.file.magic() };
                 Ok(0)
             }
             DRM_IOCTL_GET_CLIENT => {
                 // `struct drm_client`: libva enumerates clients at init.
                 // Single-client stub: idx 0 is this open; anything else ENOENT.
+                // Linux's `drm_getclient` always reports `magic = 0` ("do not
+                // return authenticating magic index"). Returning 1 made a
+                // client AUTH_MAGIC a number nobody had minted — or, worse,
+                // spend the first real GET_MAGIC on this boot.
                 let c = unsafe { &mut *(data as *mut DrmClient) };
                 if c.idx != 0 {
                     return Err(FsError::EntryNotFound);
@@ -1019,15 +1018,16 @@ impl DrmDev {
                 c.auth = 1;
                 c.pid = drm::current_pid() as usize;
                 c.uid = 0;
-                c.magic = 1;
+                c.magic = 0;
                 c.iocs = 0;
                 Ok(0)
             }
             DRM_IOCTL_AUTH_MAGIC => {
                 // `DRM_MASTER` ioctl: only the master authenticates
                 // (EACCES), and only a magic a file of this device holds
-                // (`drm_authmagic`: EINVAL), once. Any magic from anyone
-                // was answered "authenticated".
+                // (`drm_authmagic`: EINVAL), once. Magic 0 is never minted:
+                // libdrm's `drmIsMaster()` AUTH_MAGIC(0) relies on EINVAL
+                // from the master (EACCES from everyone else).
                 if !drm::is_master(self.minor, self.file_owner()) {
                     return Err(FsError::NoPermission);
                 }
@@ -1035,6 +1035,13 @@ impl DrmDev {
                 if drm::auth_magic(self.minor, magic) {
                     Ok(0)
                 } else {
+                    if magic != 0 {
+                        log::debug!(
+                            "[drm] AUTH_MAGIC minor={} magic={:#x} -> EINVAL",
+                            self.minor,
+                            magic
+                        );
+                    }
                     Err(FsError::InvalidParam)
                 }
             }
@@ -6365,6 +6372,8 @@ mod render_node_and_mode_tests {
             (0xB7, "MODE_ADDFB2"),
             (0xBC, "MODE_ATOMIC"),
             (0x3A, "WAIT_VBLANK"),
+            (0x02, "GET_MAGIC"),
+            (0x11, "AUTH_MAGIC"),
             (0x07, "SET_MASTER"),
             (0x08, "DROP_MASTER"),
         ] {
@@ -14104,6 +14113,7 @@ mod master_tests {
     /// every AUTH_MAGIC from anyone, of anything, was "authenticated".
     #[test]
     fn a_magic_is_minted_per_file_and_only_the_master_spends_it() {
+        let _serialised = drm::test_globals::lock();
         let master = Client::open(78);
         let client = Client::open(78);
         let m_client = magic(&client);
@@ -14138,6 +14148,41 @@ mod master_tests {
             Err(FsError::InvalidParam),
             "died with its file"
         );
+    }
+
+    /// libdrm `drmIsMaster()`: AUTH_MAGIC(0). Linux answers EINVAL when the
+    /// caller is master and EACCES otherwise. Success would also pass the
+    /// probe, but EINVAL is the ABI, and it is what the einval-hunt was
+    /// reporting as a fault at compositor start.
+    #[test]
+    fn auth_magic_zero_is_einval_from_the_master_and_eacces_from_anyone_else() {
+        let _serialised = drm::test_globals::lock();
+        let master = Client::open(80);
+        let client = Client::open(80);
+        assert_eq!(auth(&master, 0), Err(FsError::InvalidParam));
+        assert_eq!(auth(&client, 0), Err(FsError::NoPermission));
+    }
+
+    /// Linux keeps magics on `drm_device`, so `card{n}` and `renderD{128+n}`
+    /// share the map. GET_MAGIC on the render node is EACCES (not
+    /// DRM_RENDER_ALLOW); a mint on that file must still be spendable from
+    /// the card, which is how a DRI2 client that opened the render node
+    /// gets authenticated by the compositor on `card0`.
+    #[test]
+    fn a_magic_minted_on_the_render_node_authenticates_on_the_card() {
+        let _serialised = drm::test_globals::lock();
+        let card = Client::open(81);
+        let render = Client::open(drm::RENDER_MINOR_BASE + 81);
+        let mut probe = 0u32;
+        assert_eq!(
+            render.ioctl(DRM_IOCTL_GET_MAGIC, &mut probe),
+            Err(FsError::NoPermission),
+            "GET_MAGIC is not DRM_RENDER_ALLOW"
+        );
+        let minted = render.file_state().magic();
+        assert_ne!(minted, 0);
+        assert_eq!(auth(&card, minted), Ok(0));
+        assert_eq!(auth(&card, minted), Err(FsError::InvalidParam), "spent");
     }
 }
 
@@ -14374,7 +14419,7 @@ mod dumb_write_and_addfb_errno_tests {
         };
         assert_eq!(c.ioctl(DRM_IOCTL_GET_CLIENT, &mut client), Ok(0));
         assert_eq!(client.auth, 1);
-        assert_eq!(client.magic, 1);
+        assert_eq!(client.magic, 0);
         client.idx = 1;
         assert_eq!(
             c.ioctl(DRM_IOCTL_GET_CLIENT, &mut client),
