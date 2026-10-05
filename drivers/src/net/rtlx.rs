@@ -193,28 +193,42 @@ impl NetScheme for RTLxInterface {
         let mut iface = self.iface.lock();
         match gateway {
             Some(IpAddress::Ipv4(gw)) => {
+                let mut routes = self.routes.lock();
                 if cidr.prefix_len() == 0 {
                     iface
                         .routes_mut()
                         .add_default_ipv4_route(gw)
                         .map_err(|_| DeviceError::IoError)?;
+                    // Only one default route can be in force, so a new one
+                    // replaces the one already there. A route to a named
+                    // network replaces nothing -- and this purge used to run
+                    // for every gatewayed route, so the static route in a DHCP
+                    // lease took 0.0.0.0/0 out of the table the kernel reports
+                    // while smoltcp went on routing through it.
+                    routes
+                        .retain(|r| !(matches!(r.dst, IpCidr::Ipv4(_)) && r.dst.prefix_len() == 0));
                 }
-                let mut routes = self.routes.lock();
-                routes.retain(|r| !(matches!(r.dst, IpCidr::Ipv4(_)) && r.dst.prefix_len() == 0));
                 routes.push(RouteInfo {
                     dst: cidr,
                     gateway: Some(IpAddress::Ipv4(gw)),
                 });
             }
             Some(IpAddress::Ipv6(gw)) => {
+                let mut routes = self.routes.lock();
                 if cidr.prefix_len() == 0 {
                     iface
                         .routes_mut()
                         .add_default_ipv6_route(gw)
                         .map_err(|_| DeviceError::IoError)?;
+                    // Only one default route can be in force, so a new one
+                    // replaces the one already there. A route to a named
+                    // network replaces nothing -- and this purge used to run
+                    // for every gatewayed route, so the static route in a DHCP
+                    // lease took ::/0 out of the table the kernel reports
+                    // while smoltcp went on routing through it.
+                    routes
+                        .retain(|r| !(matches!(r.dst, IpCidr::Ipv6(_)) && r.dst.prefix_len() == 0));
                 }
-                let mut routes = self.routes.lock();
-                routes.retain(|r| !(matches!(r.dst, IpCidr::Ipv6(_)) && r.dst.prefix_len() == 0));
                 routes.push(RouteInfo {
                     dst: cidr,
                     gateway: Some(IpAddress::Ipv6(gw)),
@@ -1122,5 +1136,474 @@ mod tests {
         stall_tx_ring(&iface);
 
         assert_eq!(iface.send(&[0x11u8; 64]), Err(DeviceError::NotReady));
+    }
+
+    // --------------------------------------------------------- the addresses
+
+    /// What smoltcp's own routing table has for `dst`, which is a different
+    /// thing from the list `get_routes` reports: the scheme keeps its own copy
+    /// for `/proc/net/route`, and the stack routes by this one.
+    fn gateway_in_the_stack(iface: &RTLxInterface, dst: IpCidr) -> Option<IpAddress> {
+        let mut found = None;
+        iface
+            .iface
+            .lock()
+            .routes_mut()
+            .update(|routes| found = routes.get(&dst).map(|route| route.via_router));
+        found
+    }
+
+    /// The address lands in the first IPv4 slot and nowhere else. The walk has
+    /// to tell the slot it is setting from the ones it is blanking, and if it
+    /// cannot, every spare slot ends up holding the same address -- so the NIC
+    /// answers ARP for it three times over and `ip addr` shows it three times.
+    #[test]
+    fn setting_the_address_fills_one_slot_and_leaves_the_link_local_alone() {
+        let _dev = fake::with_phy(Phy::gigabit_partner());
+        let iface = interface(7);
+        let cidr = Ipv4Cidr::new(Ipv4Address::new(10, 0, 0, 5), 24);
+        iface.set_ipv4_address(cidr).unwrap();
+
+        let addrs = iface.get_ip_address();
+        assert_eq!(
+            addrs.iter().filter(|a| **a == IpCidr::Ipv4(cidr)).count(),
+            1,
+            "the address is configured more than once: {:?}",
+            addrs
+        );
+        assert!(
+            addrs.iter().any(|a| matches!(a, IpCidr::Ipv6(_))),
+            "the link-local address was blanked with the spare slots: {:?}",
+            addrs
+        );
+    }
+
+    /// Two addresses added one after the other take two slots. The free-slot
+    /// test is a pair of forms -- an unspecified address with a zero prefix, or
+    /// the `240.0.0.0/32` placeholder -- and a slot is free if it matches
+    /// EITHER. Ask for both and no slot is ever free, so every address goes to
+    /// the fallback and overwrites the one added before it.
+    #[test]
+    fn two_addresses_added_in_a_row_take_two_slots() {
+        let _dev = fake::with_phy(Phy::gigabit_partner());
+        let iface = interface(7);
+        let first = IpCidr::new(IpAddress::v4(10, 0, 0, 1), 24);
+        let second = IpCidr::new(IpAddress::v4(10, 0, 1, 1), 24);
+        iface.add_ip_address(first).unwrap();
+        iface.add_ip_address(second).unwrap();
+
+        let addrs = iface.get_ip_address();
+        assert!(
+            addrs.contains(&first),
+            "the second address overwrote the first: {:?}",
+            addrs
+        );
+        assert!(addrs.contains(&second), "{:?}", addrs);
+    }
+
+    /// A zero prefix on its own does not make a slot free. `0.0.0.0/0` is the
+    /// empty slot the interface boots with; `10.0.0.1/0` is an address somebody
+    /// configured, and the next `add_ip_address` must not write over it.
+    #[test]
+    fn an_address_with_a_zero_prefix_is_still_an_address() {
+        let _dev = fake::with_phy(Phy::gigabit_partner());
+        let iface = interface(7);
+        let wide = IpCidr::new(IpAddress::v4(10, 0, 0, 1), 0);
+        iface.add_ip_address(wide).unwrap();
+        iface
+            .add_ip_address(IpCidr::new(IpAddress::v4(10, 0, 1, 1), 24))
+            .unwrap();
+
+        let addrs = iface.get_ip_address();
+        assert!(
+            addrs.contains(&wide),
+            "an address with a zero prefix was taken for an empty slot: {:?}",
+            addrs
+        );
+    }
+
+    #[test]
+    fn adding_the_same_address_twice_does_not_duplicate_it() {
+        let _dev = fake::with_phy(Phy::gigabit_partner());
+        let iface = interface(7);
+        let cidr = IpCidr::new(IpAddress::v4(10, 0, 0, 1), 24);
+        iface.add_ip_address(cidr).unwrap();
+        iface.add_ip_address(cidr).unwrap();
+
+        let addrs = iface.get_ip_address();
+        assert_eq!(
+            addrs.iter().filter(|a| **a == cidr).count(),
+            1,
+            "{:?}",
+            addrs
+        );
+    }
+
+    /// With every slot taken, a new address replaces the last one -- the most
+    /// recently added -- and not the first, which is the address the board is
+    /// actually reachable at.
+    #[test]
+    fn an_address_added_with_every_slot_taken_replaces_the_newest() {
+        let _dev = fake::with_phy(Phy::gigabit_partner());
+        let iface = interface(7);
+        let primary = IpCidr::new(IpAddress::v4(192, 168, 0, 123), 24);
+        iface
+            .add_ip_address(IpCidr::new(IpAddress::v4(10, 0, 0, 1), 24))
+            .unwrap();
+        iface
+            .add_ip_address(IpCidr::new(IpAddress::v4(10, 0, 1, 1), 24))
+            .unwrap();
+        // Four slots, and all four are taken now.
+        let third = IpCidr::new(IpAddress::v4(10, 0, 2, 1), 24);
+        iface.add_ip_address(third).unwrap();
+
+        let addrs = iface.get_ip_address();
+        assert!(
+            addrs.contains(&primary),
+            "the address the board boots at was overwritten: {:?}",
+            addrs
+        );
+        assert!(addrs.contains(&third), "{:?}", addrs);
+    }
+
+    /// A removed address leaves no route behind. The slot is blanked to
+    /// `0.0.0.0/0`, which `get_routes` skips because its prefix is zero; blank
+    /// it to anything carrying a prefix and the interface claims a direct route
+    /// to a network nobody configured.
+    #[test]
+    fn removing_an_address_takes_its_direct_route_with_it() {
+        let _dev = fake::with_phy(Phy::gigabit_partner());
+        let iface = interface(7);
+        iface
+            .remove_ip_address(IpCidr::new(IpAddress::v4(192, 168, 0, 123), 24))
+            .unwrap();
+
+        let direct: Vec<_> = iface
+            .get_routes()
+            .into_iter()
+            .filter(|r| r.gateway.is_none())
+            .map(|r| r.dst)
+            .collect();
+        assert!(
+            !direct.iter().any(|dst| matches!(dst, IpCidr::Ipv4(_))),
+            "the removed address still has a direct route: {:?}",
+            direct
+        );
+    }
+
+    /// A direct route is to the NETWORK, not to the address: the board answers
+    /// at `192.168.0.123/24`, and what it can reach without a gateway is
+    /// `192.168.0.0/24`. Report the address and every other host on the wire is
+    /// off-link.
+    #[test]
+    fn the_direct_route_of_an_address_is_its_network() {
+        let _dev = fake::with_phy(Phy::gigabit_partner());
+        let iface = interface(7);
+        let networks: Vec<_> = iface
+            .get_routes()
+            .into_iter()
+            .filter(|r| r.gateway.is_none() && matches!(r.dst, IpCidr::Ipv4(_)))
+            .map(|r| r.dst)
+            .collect();
+        assert_eq!(
+            networks,
+            alloc::vec![IpCidr::new(IpAddress::v4(192, 168, 0, 0), 24)],
+            "the two spare 0.0.0.0/0 slots are not networks, and the boot \
+             address is reachable as its network"
+        );
+    }
+
+    // ------------------------------------------------------------ the routes
+
+    /// A route to a named network is not a default route, and adding one must
+    /// leave the default route where it is. Only one default route can be in
+    /// force, so a new one replaces the old -- but that purge ran for every
+    /// gatewayed route, so the static route in a DHCP lease took `0.0.0.0/0`
+    /// out of the table the kernel reports while smoltcp went on routing
+    /// through it.
+    #[test]
+    fn a_route_to_a_network_does_not_delete_the_default_route() {
+        let _dev = fake::with_phy(Phy::gigabit_partner());
+        let iface = interface(7);
+        iface
+            .add_route(
+                IpCidr::new(IpAddress::v4(10, 0, 0, 0), 8),
+                Some(IpAddress::Ipv4(Ipv4Address::new(10, 0, 2, 2))),
+            )
+            .unwrap();
+
+        let defaults: Vec<_> = iface
+            .get_routes()
+            .into_iter()
+            .filter(|r| matches!(r.dst, IpCidr::Ipv4(_)) && r.dst.prefix_len() == 0)
+            .collect();
+        assert_eq!(
+            defaults.len(),
+            1,
+            "a route to 10.0.0.0/8 took the default route with it"
+        );
+        assert_eq!(
+            defaults[0].gateway,
+            Some(IpAddress::Ipv4(Ipv4Address::new(192, 168, 0, 1))),
+            "and it is still the gateway the board booted with"
+        );
+    }
+
+    /// Deleting a route takes that route out and leaves the rest alone.
+    #[test]
+    fn a_deleted_route_is_the_only_one_that_goes() {
+        let _dev = fake::with_phy(Phy::gigabit_partner());
+        let iface = interface(7);
+        let on_link = IpCidr::new(IpAddress::v4(10, 0, 0, 0), 8);
+        iface.add_route(on_link, None).unwrap();
+        iface.del_route(on_link, None).unwrap();
+
+        let dsts: Vec<_> = iface.get_routes().into_iter().map(|r| r.dst).collect();
+        assert!(
+            !dsts.contains(&on_link),
+            "the deleted route is still reported: {:?}",
+            dsts
+        );
+        assert!(
+            dsts.contains(&IpCidr::new(IpAddress::v4(0, 0, 0, 0), 0)),
+            "deleting one route took the default route with it: {:?}",
+            dsts
+        );
+    }
+
+    /// Deleting the default route takes it out of smoltcp's own table too, not
+    /// only out of the list the scheme reports. Leave it in and the kernel says
+    /// there is no gateway while the stack keeps sending through the old one.
+    #[test]
+    fn deleting_the_default_route_takes_it_out_of_the_stacks_own_table() {
+        let _dev = fake::with_phy(Phy::gigabit_partner());
+        let iface = interface(7);
+        let default = IpCidr::new(IpAddress::v4(0, 0, 0, 0), 0);
+        assert_eq!(
+            gateway_in_the_stack(&iface, default),
+            Some(IpAddress::Ipv4(Ipv4Address::new(192, 168, 0, 1))),
+            "the board boots with a default route in the stack"
+        );
+
+        iface.del_route(default, None).unwrap();
+        assert_eq!(
+            gateway_in_the_stack(&iface, default),
+            None,
+            "the stack still routes through the gateway the kernel deleted"
+        );
+    }
+
+    // ------------------------------------------------------- the poll and tap
+
+    /// The frames the AF_PACKET tap was handed, in the order it got them.
+    static TAPPED: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
+
+    fn tap(frame: &[u8]) {
+        TAPPED.lock().push(frame.to_vec());
+    }
+
+    /// A received frame reaches an AF_PACKET tap, and no reader is woken for a
+    /// frame no socket wanted.
+    ///
+    /// `RTLxRxToken::consume` queues every frame while smoltcp holds `SOCKETS`,
+    /// and nothing on this driver ever emptied that queue: the DHCP client on
+    /// the D1 saw no frames at all, and blocked readers only woke on the
+    /// fallback park timer.
+    #[test]
+    fn a_received_frame_reaches_an_af_packet_tap() {
+        let _dev = fake::with_phy(Phy::gigabit_partner());
+        crate::net::tests::alone_with_the_statics(|| {
+            TAPPED.lock().clear();
+            crate::utils::host_hooks::reset();
+            let iface = interface(7);
+            let payload = [0xdeu8, 0xad, 0xbe, 0xef];
+            stage(&iface, &payload);
+            crate::net::set_packet_callback(tap);
+
+            iface.poll().expect("a malformed frame is not a poll error");
+
+            assert_eq!(
+                TAPPED.lock().clone(),
+                alloc::vec![payload.to_vec()],
+                "the frame never left the deferred queue"
+            );
+            assert_eq!(
+                crate::utils::host_hooks::WAKE_CALLS.load(core::sync::atomic::Ordering::SeqCst),
+                0,
+                "nothing a socket is waiting for happened, so nobody is woken"
+            );
+        })
+    }
+
+    // ------------------------------------------------------------ transmitting
+
+    /// A ring with no free slot offers no transmit token. Hand one out anyway
+    /// and smoltcp writes a frame into a closure whose `geth_send` then refuses
+    /// it, which is a frame the stack believes it sent.
+    #[test]
+    fn a_stalled_ring_offers_no_transmit_token() {
+        let _dev = fake::with_phy(Phy::gigabit_partner());
+        let iface = interface(7);
+        stall_tx_ring(&iface);
+        let mut driver = iface.driver.clone();
+        assert!(
+            driver.transmit().is_none(),
+            "a full ring handed out a token"
+        );
+    }
+
+    /// A new default route reaches smoltcp's own table, not only the list the
+    /// kernel reports. Nothing tied the two together, so they could disagree:
+    /// `/proc/net/route` naming one gateway and every packet going to another.
+    #[test]
+    fn a_new_default_route_is_the_one_the_stack_routes_through() {
+        let _dev = fake::with_phy(Phy::gigabit_partner());
+        let iface = interface(7);
+        let default = IpCidr::new(IpAddress::v4(0, 0, 0, 0), 0);
+        let gateway = Ipv4Address::new(10, 0, 0, 1);
+        iface
+            .add_route(default, Some(IpAddress::Ipv4(gateway)))
+            .unwrap();
+
+        assert_eq!(
+            gateway_in_the_stack(&iface, default),
+            Some(IpAddress::Ipv4(gateway)),
+            "the stack still routes through the gateway the board booted with"
+        );
+    }
+
+    /// The same for IPv6: a route to a named prefix is not a default route and
+    /// must leave the default route alone.
+    #[test]
+    fn an_ipv6_route_to_a_prefix_does_not_delete_the_ipv6_default_route() {
+        let _dev = fake::with_phy(Phy::gigabit_partner());
+        let iface = interface(7);
+        let gateway = IpAddress::Ipv6(Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 1));
+        iface
+            .add_route(
+                IpCidr::Ipv6(Ipv6Cidr::new(Ipv6Address::UNSPECIFIED, 0)),
+                Some(gateway),
+            )
+            .unwrap();
+        iface
+            .add_route(
+                IpCidr::Ipv6(Ipv6Cidr::new(
+                    Ipv6Address::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0),
+                    32,
+                )),
+                Some(gateway),
+            )
+            .unwrap();
+
+        let defaults: Vec<_> = iface
+            .get_routes()
+            .into_iter()
+            .filter(|r| matches!(r.dst, IpCidr::Ipv6(_)) && r.dst.prefix_len() == 0)
+            .collect();
+        assert_eq!(
+            defaults.len(),
+            1,
+            "a route to 2001:db8::/32 took the default route with it"
+        );
+        assert_eq!(defaults[0].gateway, Some(gateway));
+    }
+
+    /// And the same for a frame the interrupt handler took: `handle_irq` polls
+    /// with `SOCKETS` held too, so it has its own call to the flush. That is
+    /// the one the board's DHCP client depended on, since on riscv64 nothing
+    /// else ever polls before the lease has to be asked for.
+    #[test]
+    fn a_frame_the_interrupt_handler_took_reaches_the_tap_too() {
+        let _dev = fake::with_phy(Phy::gigabit_partner());
+        crate::net::tests::alone_with_the_statics(|| {
+            TAPPED.lock().clear();
+            let iface = interface(7);
+            let payload = [0x11u8, 0x22, 0x33, 0x44];
+            stage(&iface, &payload);
+            crate::net::set_packet_callback(tap);
+
+            fake::raise_rx_interrupt();
+            iface.handle_irq(7);
+
+            assert_eq!(
+                TAPPED.lock().clone(),
+                alloc::vec![payload.to_vec()],
+                "the frame never left the deferred queue"
+            );
+        })
+    }
+
+    /// A prefix of one is still a network and gets its direct route. Only a
+    /// prefix of ZERO means an address with no network of its own, which is
+    /// what the two spare slots the interface boots with are.
+    #[test]
+    fn the_widest_prefix_that_is_still_a_network_gets_a_direct_route() {
+        let _dev = fake::with_phy(Phy::gigabit_partner());
+        let iface = interface(7);
+        iface
+            .add_ip_address(IpCidr::new(IpAddress::v4(128, 0, 0, 1), 1))
+            .unwrap();
+
+        let networks: Vec<_> = iface
+            .get_routes()
+            .into_iter()
+            .filter(|r| r.gateway.is_none())
+            .map(|r| r.dst)
+            .collect();
+        assert!(
+            networks.contains(&IpCidr::new(IpAddress::v4(128, 0, 0, 0), 1)),
+            "a /1 address has a network like any other: {:?}",
+            networks
+        );
+    }
+
+    /// A frame of exactly `TX_SCRATCH_LEN` bytes fits in the scratch, so the
+    /// closure gets to write it. Refuse at the limit rather than above it and
+    /// the largest frame the token has room for never reaches the closure at
+    /// all -- and the caller is told `Exhausted`, which means "try again
+    /// later" for a frame that will never fit.
+    #[test]
+    fn a_frame_that_exactly_fills_the_scratch_reaches_the_closure() {
+        let _dev = fake::with_phy(Phy::gigabit_partner());
+        let iface = interface(7);
+        let mut driver = iface.driver.clone();
+        let token = driver.transmit().expect("an empty ring has room");
+
+        let mut asked = 0usize;
+        let out = token.consume(at(0), TX_SCRATCH_LEN, |buf| {
+            asked = buf.len();
+            buf.fill(0x5a);
+            Ok(())
+        });
+
+        assert_eq!(asked, TX_SCRATCH_LEN, "the closure was never called");
+        // And the GMAC takes it: its own per-buffer limit is wider than the
+        // scratch, so the scratch is the only thing deciding here.
+        assert!(out.is_ok(), "{:?}", out.err());
+    }
+
+    /// The frame posted is as long as the frame the closure wrote. The
+    /// descriptor carries the length in its low eleven bits and the scratch is
+    /// `TX_SCRATCH_LEN` bytes whatever the frame is, so posting the whole
+    /// scratch puts a 60-byte ARP on the wire as a 1536-byte frame -- which
+    /// every peer on it drops, while the ring and the counters say it was sent.
+    #[test]
+    fn the_frame_posted_is_as_long_as_the_frame_the_closure_wrote() {
+        let _dev = fake::with_phy(Phy::gigabit_partner());
+        let iface = interface(7);
+        let mut driver = iface.driver.clone();
+        let token = driver.transmit().expect("an empty ring has room");
+        token
+            .consume(at(0), 60, |buf| {
+                buf.fill(0xa5);
+                Ok(())
+            })
+            .unwrap();
+
+        assert_eq!(
+            fake::tx_frame_len(&iface.driver.0.lock(), 0),
+            60,
+            "the descriptor announces a length the closure never wrote"
+        );
     }
 }

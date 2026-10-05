@@ -1968,6 +1968,16 @@ pub(crate) mod fake {
         unsafe { slice::from_raw_parts(nic.send_buffers[slot] as *const u8, len) }.to_vec()
     }
 
+    /// The length the transmit descriptor in `slot` announces, which is what
+    /// goes on the wire -- not the size of the buffer behind it, and not the
+    /// size of whatever scratch the frame was assembled in.
+    pub fn tx_frame_len(nic: &RTL8211F<ProviderImpl>, slot: usize) -> u32 {
+        // By copy: `DmaDesc` is `#[repr(C, packed)]`, so a reference to a
+        // field of it is not necessarily aligned.
+        let desc1 = nic.send_ring[slot].desc1;
+        desc1 & ((1 << 11) - 1)
+    }
+
     static PHY: spin::Mutex<Option<Phy>> = spin::Mutex::new(None);
     /// The PHY's `BMCR_RESET` never clears: a PHY with no clock behind it.
     static PHY_RESET_STICKS: core::sync::atomic::AtomicBool =
@@ -1978,12 +1988,19 @@ pub(crate) mod fake {
     /// Which interrupt bits the last acknowledgement named.
     static LAST_INT_ACK: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
-    /// Which interrupts the handler's last acknowledgement cleared.
+    /// Which interrupt bits the handler's last acknowledgement named.
     ///
     /// The status register is write-1-to-clear and [`posted`] empties it on the
     /// store, so afterwards nothing is left to say *which* bits were named.
     /// This remembers them, which is the only way to ask whether an interrupt
     /// the GMAC can raise is one the handler actually clears.
+    ///
+    /// Named, not cleared: it is the mask the driver wrote, read back out of
+    /// the window after the store landed (`intr_status & 0x3FFF`, so a seeded
+    /// status of all ones comes back as `0x3FFF` and not as `u32::MAX`). The
+    /// two differ only for a bit the driver names that was not set, and a test
+    /// that seeds the whole status register before the handler runs has
+    /// none.
     pub fn last_interrupt_ack() -> u32 {
         LAST_INT_ACK.load(core::sync::atomic::Ordering::SeqCst)
     }

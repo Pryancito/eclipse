@@ -743,30 +743,44 @@ impl NetScheme for E1000Interface {
         let mut iface = self.iface.lock();
         match gateway {
             Some(IpAddress::Ipv4(gw)) => {
+                let mut routes = self.routes.lock();
                 if cidr.prefix_len() == 0 {
                     let _ = iface.routes_mut().remove_default_ipv4_route();
                     iface
                         .routes_mut()
                         .add_default_ipv4_route(gw)
                         .map_err(|_| DeviceError::IoError)?;
+                    // Only one default route can be in force, so a new one
+                    // replaces the one already there. A route to a named
+                    // network replaces nothing -- and this purge used to run
+                    // for every gatewayed route, so the static route in a DHCP
+                    // lease took 0.0.0.0/0 out of the table the kernel reports
+                    // while smoltcp went on routing through it.
+                    routes
+                        .retain(|r| !(matches!(r.dst, IpCidr::Ipv4(_)) && r.dst.prefix_len() == 0));
                 }
-                let mut routes = self.routes.lock();
-                routes.retain(|r| !(matches!(r.dst, IpCidr::Ipv4(_)) && r.dst.prefix_len() == 0));
                 routes.push(RouteInfo {
                     dst: cidr,
                     gateway: Some(IpAddress::Ipv4(gw)),
                 });
             }
             Some(IpAddress::Ipv6(gw)) => {
+                let mut routes = self.routes.lock();
                 if cidr.prefix_len() == 0 {
                     let _ = iface.routes_mut().remove_default_ipv6_route();
                     iface
                         .routes_mut()
                         .add_default_ipv6_route(gw)
                         .map_err(|_| DeviceError::IoError)?;
+                    // Only one default route can be in force, so a new one
+                    // replaces the one already there. A route to a named
+                    // network replaces nothing -- and this purge used to run
+                    // for every gatewayed route, so the static route in a DHCP
+                    // lease took ::/0 out of the table the kernel reports
+                    // while smoltcp went on routing through it.
+                    routes
+                        .retain(|r| !(matches!(r.dst, IpCidr::Ipv6(_)) && r.dst.prefix_len() == 0));
                 }
-                let mut routes = self.routes.lock();
-                routes.retain(|r| !(matches!(r.dst, IpCidr::Ipv6(_)) && r.dst.prefix_len() == 0));
                 routes.push(RouteInfo {
                     dst: cidr,
                     gateway: Some(IpAddress::Ipv6(gw)),

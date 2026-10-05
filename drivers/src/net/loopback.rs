@@ -532,7 +532,10 @@ mod tests {
     fn the_raw_receive_path_refuses_instead_of_panicking() {
         let iface = interface(stats());
         let mut buf = [0u8; 64];
-        assert!(iface.recv(&mut buf).is_err());
+        // `NotSupported`, not `NotReady`: there is no receive ring here and
+        // never will be, so a caller that retries on "not ready yet" would
+        // spin instead of moving on.
+        assert_eq!(iface.recv(&mut buf), Err(DeviceError::NotSupported));
     }
 
     /// The MTU the kernel advertises and the one the device reports have to be
@@ -644,5 +647,74 @@ mod tests {
         let iface = interface(stats());
         assert_eq!(iface.get_ifname(), "loopback");
         assert_eq!(Scheme::name(&iface), "loopback");
+    }
+
+    /// The device answers with the medium it was built for. `kernel-hal` builds
+    /// the loopback `Medium::Ip`, and smoltcp parses every frame according to
+    /// this: answer `Ethernet` and each loopback packet arrives with fourteen
+    /// bytes of IP header read as a MAC address.
+    #[test]
+    fn the_device_advertises_the_medium_it_was_built_for() {
+        for medium in [Medium::Ip, Medium::Ethernet] {
+            let dev = LoopbackDevice::new(medium, stats());
+            assert_eq!(dev.capabilities().medium, medium);
+        }
+    }
+
+    /// The frames the registered callback was handed.
+    ///
+    /// `LOOPBACK_TX_CALLBACK` is a process-wide `static mut` with no way to ask
+    /// what is in it, so a test that registers one shares it with whatever else
+    /// is transmitting on a loopback at the time. This keeps every frame it
+    /// sees, and the test looks for its own.
+    static HANDED_TO_THE_CALLBACK: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
+
+    fn record(frame: &[u8]) {
+        HANDED_TO_THE_CALLBACK.lock().push(frame.to_vec());
+    }
+
+    /// The callback is handed the whole frame. `linux-object` registers the
+    /// AF_PACKET handler here, and this buffer is the only thing a capture on
+    /// `lo` ever gets -- a shorter slice is a frame the tap never saw.
+    #[test]
+    fn the_registered_callback_is_handed_the_whole_frame() {
+        let stats = stats();
+        let mut dev = LoopbackDevice::new(Medium::Ip, stats);
+        register_loopback_tx_callback(record);
+        let sent = transmit(&mut dev, 37, 0x5a);
+        // Registered for the rest of the binary otherwise, and the next
+        // loopback frame of any other test would land in the vector above.
+        unsafe {
+            LOOPBACK_TX_CALLBACK = None;
+        }
+        sent.unwrap();
+
+        let mine = alloc::vec![0x5au8; 37];
+        assert!(
+            HANDED_TO_THE_CALLBACK.lock().contains(&mine),
+            "the callback never got the 37 bytes that went out"
+        );
+    }
+
+    /// A prefix of one is still a network and gets its direct route. Only a
+    /// prefix of ZERO means an address with no network of its own.
+    #[test]
+    fn the_widest_prefix_that_is_still_a_network_gets_a_direct_route() {
+        let iface = interface(stats());
+        iface
+            .add_ip_address(IpCidr::new(IpAddress::v4(128, 0, 0, 1), 1))
+            .unwrap();
+
+        let networks: alloc::vec::Vec<_> = iface
+            .get_routes()
+            .into_iter()
+            .filter(|r| r.gateway.is_none())
+            .map(|r| r.dst)
+            .collect();
+        assert!(
+            networks.contains(&IpCidr::new(IpAddress::v4(128, 0, 0, 0), 1)),
+            "a /1 address has a network like any other: {:?}",
+            networks
+        );
     }
 }
