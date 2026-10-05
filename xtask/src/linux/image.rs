@@ -961,4 +961,248 @@ mod image_size_tests {
             );
         }
     }
+
+    /// The number `key` is defined as, in the project file at `rel`. Crude on
+    /// purpose: the first line that starts with the key, and every digit after
+    /// it. Enough for a `?=` in a Makefile and a `#define … 1024ULL` in C, and
+    /// it fails loudly rather than quietly when either moves.
+    fn defined_number(rel: &str, key: &str) -> u64 {
+        let text = fs::read_to_string(PROJECT_DIR.join(rel))
+            .unwrap_or_else(|e| panic!("cannot read {rel}: {e}"));
+        let line = text
+            .lines()
+            .map(str::trim)
+            .find(|l| l.starts_with(key))
+            .unwrap_or_else(|| panic!("{rel} no longer defines {key}"))
+            .to_string();
+        let digits: String = line[key.len()..]
+            .chars()
+            .take_while(|c| !c.is_ascii_alphabetic() || c.is_ascii_digit())
+            .filter(char::is_ascii_digit)
+            .collect();
+        digits
+            .parse()
+            .unwrap_or_else(|_| panic!("{rel}: no number in {line:?}"))
+    }
+
+    /// One size written down in three places by hand, which the comment on
+    /// `EFI_PARTITION_BYTES` asks the reader to keep in step and nothing
+    /// checked: here, `ESP_IMG_SIZE_MB` in the Makefile, and `PART1_SIZE_MIB`
+    /// in `install-eclipse.c`. Diverge, and the build writes an `efi.img` of
+    /// one size while the installer lays down a partition of another; the
+    /// installer catches it at the worst possible moment, mid-install, with
+    /// "excede la particion EFI" and a suggestion to rebuild the live image.
+    #[test]
+    fn the_esp_is_the_same_size_everywhere_it_is_written_down() {
+        let mib = EFI_PARTITION_BYTES as u64 / MIB;
+        assert_eq!(
+            defined_number("Makefile", "ESP_IMG_SIZE_MB"),
+            mib,
+            "the Makefile builds the efi.img that has to fit this partition"
+        );
+        assert_eq!(
+            defined_number(
+                "tools/install-eclipse/install-eclipse.c",
+                "#define PART1_SIZE_MIB"
+            ),
+            mib,
+            "the installer is what actually creates the partition"
+        );
+    }
+
+    /// The installer opens these three by name in its own `/boot`, so the list
+    /// the build stages and the paths the installer resolves are one fact in
+    /// two files. Rename one here and the install stops with "no encuentro la
+    /// imagen" on a medium that carries it.
+    #[test]
+    fn every_payload_the_build_stages_is_one_the_installer_opens() {
+        let installer =
+            fs::read_to_string(PROJECT_DIR.join("tools/install-eclipse/install-eclipse.c"))
+                .unwrap();
+        for name in BOOT_PAYLOADS {
+            assert!(
+                installer.contains(&format!("/boot/{name}")),
+                "the installer does not open /boot/{name}"
+            );
+        }
+    }
+
+    /// The THIRD payload is weighed like the other two. The sibling test above
+    /// exercises the first and the second; this one is the `/boot` staging,
+    /// which is the biggest of the three (the gz images the installer streams
+    /// to disk) and the only one no test ever handed a number to. A payload the
+    /// assert does not count is a payload that gets to overflow in silence,
+    /// and the overflow is found mid-install, after the partition table is
+    /// already on the disk.
+    #[test]
+    fn the_third_payload_is_weighed_like_the_other_two() {
+        let max = EFI_PARTITION_BYTES as u64 - 4 * MIB;
+        assert_eq!(efi_fat_size_for(0, 0, max), EFI_PARTITION_BYTES);
+        assert!(
+            std::panic::catch_unwind(|| efi_fat_size_for(0, 0, max + 1)).is_err(),
+            "the boot payload alone has to be able to overflow the ESP"
+        );
+        assert!(
+            std::panic::catch_unwind(|| efi_fat_size_for(max / 2, max / 2, max / 2)).is_err(),
+            "and it is summed with the other two, not weighed against them"
+        );
+    }
+
+    /// Image sizes come from BYTES, not from how many files those bytes are in.
+    /// `dir_size` is the input to every size below it, and counting entries
+    /// instead would make a tree of a few huge files size to nothing.
+    #[test]
+    fn the_byte_count_is_of_the_bytes_and_not_of_the_files() {
+        let d = scratch("bytes-not-files");
+        fs::create_dir_all(d.join("one")).unwrap();
+        fs::create_dir_all(d.join("many")).unwrap();
+        fs::write(d.join("one/big"), vec![0u8; 5000]).unwrap();
+        for i in 0..5 {
+            fs::write(d.join("many").join(format!("f{i}")), vec![0u8; 1000]).unwrap();
+        }
+        assert_eq!(dir_size(&d.join("one")), 5000);
+        assert_eq!(
+            dir_size(&d.join("many")),
+            5000,
+            "five files of a thousand bytes weigh what one of five thousand does"
+        );
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    /// A tree that cannot be enumerated is worth no bytes -- it used to be
+    /// worth zero silently, and every size here is computed from that number,
+    /// so the image came out too small and `fuse` panicked with
+    /// `NoDeviceSpace`, a message naming neither the directory nor the size.
+    /// In BLOCKS it is not zero, though: whatever is there still has an inode,
+    /// and under-counting an image is the failure this file exists to avoid.
+    #[test]
+    fn something_that_cannot_be_enumerated_still_costs_its_own_inode() {
+        let d = scratch("unreadable");
+        let not_a_dir = d.join("regular-file");
+        fs::write(&not_a_dir, b"read_dir answers ENOTDIR here").unwrap();
+        assert_eq!(dir_size(&not_a_dir), 0, "no bytes can be counted");
+        assert_eq!(
+            sfs_payload_blocks(&not_a_dir),
+            1,
+            "but SFS still spends a block, so the image must hold one"
+        );
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    /// A link whose target does not resolve HERE is the normal case, not an
+    /// edge one: these trees are staged rootfs directories, not chroots, so
+    /// every absolute link in them points at a path on the build host. SFS
+    /// charges it an inode and a block for the target string either way, and
+    /// asking about what it points at instead charges nothing -- the
+    /// under-count that ends in `NoDeviceSpace`.
+    #[test]
+    fn a_link_that_resolves_nowhere_is_charged_like_any_other() {
+        let d = scratch("dangling");
+        std::os::unix::fs::symlink("/usr/bin/busybox.real", d.join("ls")).unwrap();
+        assert!(!d.join("ls").exists(), "the fixture needs the link broken");
+        assert_eq!(
+            sfs_payload_blocks(&d),
+            3,
+            "one block for the directory, one for the link's inode, one for its target"
+        );
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    /// Sixteen MiB, because this image is loaded WHOLE into RAM at boot: the
+    /// cap is not about disk, it is about how much of the guest's memory one
+    /// stray file may take before it ever runs. Every installer essential
+    /// (busybox, apk, e2fsprogs, musl, install-eclipse, the CA bundle) is
+    /// comfortably under it, and a `libLLVM.so` is not.
+    #[test]
+    fn the_cap_is_sixteen_mib_of_someone_elses_memory() {
+        assert_eq!(LIVE_FILE_CAP, 16 * MIB);
+    }
+
+    /// The nine paths are the live/installer system. Each line is a thing that
+    /// stops working when the path is not copied, and `sbin` is the sharpest:
+    /// `/sbin/init` is the symlink the kernel execs, so without it the live
+    /// root boots to nothing at all. Everything NOT here is deliberately
+    /// omitted and ships in `rootfs.btrfs.gz` instead.
+    #[test]
+    fn the_live_root_carries_every_path_the_installer_needs_to_run() {
+        for (rel, what) in [
+            (
+                "bin",
+                "busybox and its applets, install-eclipse, e2fsprogs, the net tools",
+            ),
+            (
+                "sbin",
+                "openrc-init and /sbin/init, which is what the kernel execs",
+            ),
+            (
+                "lib",
+                "ld-musl, without which not one of those binaries starts",
+            ),
+            (
+                "etc",
+                "fstab, the ssl certs, the apk repositories, the OpenRC runlevels",
+            ),
+            ("var", "the apk databases"),
+            ("root", "root's home and its rc files"),
+            ("usr/sbin", "the ssl_client wrapper openssl is symlinked to"),
+            (
+                "usr/share/udhcpc",
+                "the DHCP dispatcher scripts that apply a lease",
+            ),
+            (
+                "usr/local/bin",
+                "Eclipse's own wrappers: every desktop launcher goes through one",
+            ),
+        ] {
+            assert!(
+                LIVE_KEEP.contains(&rel),
+                "the live root would have no {rel}, so no {what}"
+            );
+        }
+    }
+
+    /// The live root is built from scratch every time. Built on top of the last
+    /// one, a path dropped from `LIVE_KEEP` -- or a file deleted from the full
+    /// rootfs -- stays in the image for as long as that directory survives, and
+    /// `make image` stops being a function of the tree it is given.
+    #[test]
+    fn a_rebuilt_live_root_keeps_nothing_of_the_last_one() {
+        let full = scratch("rebuild-full");
+        let out = scratch("rebuild-out");
+        fs::create_dir_all(full.join("bin")).unwrap();
+        fs::write(full.join("bin/busybox"), b"busybox").unwrap();
+        fs::create_dir_all(out.join("usr/lib")).unwrap();
+        fs::write(out.join("usr/lib/libLLVM.so"), b"last time's heavy file").unwrap();
+
+        build_live_rootfs(&full, &out);
+
+        assert!(out.join("bin/busybox").is_file());
+        assert!(
+            !out.join("usr/lib/libLLVM.so").exists(),
+            "the previous build's file is still in the image"
+        );
+        let _ = fs::remove_dir_all(&full);
+        let _ = fs::remove_dir_all(&out);
+    }
+
+    /// A link has to be able to land where a file already is. `symlink` onto an
+    /// existing path is EEXIST and this one unwraps, so the copy would not
+    /// quietly keep the stale file -- it would abort the build. The caller
+    /// clears the whole tree first, which is why nothing has hit it; the
+    /// function's own contract is this one.
+    #[test]
+    fn a_link_lands_where_a_file_already_is() {
+        let d = scratch("link-over");
+        let src = d.join("src");
+        let dst = d.join("dst");
+        fs::create_dir_all(&src).unwrap();
+        fs::create_dir_all(&dst).unwrap();
+        std::os::unix::fs::symlink("busybox", src.join("ls")).unwrap();
+        fs::write(dst.join("ls"), b"something else was here").unwrap();
+
+        copy_tree_capped(&src, &dst);
+
+        assert_eq!(fs::read_link(dst.join("ls")).unwrap(), Path::new("busybox"));
+        let _ = fs::remove_dir_all(&d);
+    }
 }

@@ -331,7 +331,14 @@ fn clear_stale_socket(path: &str) -> Result<(), String> {
         if connectable(path) {
             return Err(format!("another bus is already listening on {path}"));
         }
-        let _ = fs::remove_file(path);
+        // Report a removal that fails instead of walking into `bind()`, which
+        // answers EADDRINUSE and names neither the file nor the reason -- the
+        // same message a live bus gives, which is the one case this function
+        // exists to tell apart. A read-only /run, a socket owned by another
+        // uid, or something that is not a file at all all land here.
+        if let Err(e) = fs::remove_file(path) {
+            return Err(format!("cannot clear the stale socket {path}: {e}"));
+        }
     }
     Ok(())
 }
@@ -559,6 +566,14 @@ thread_local! {
 
 /// The most descriptors one message may carry. The specification's default,
 /// and what `read_into`'s control buffer is sized for.
+/// Longest the unterminated head of the auth handshake may get before the
+/// connection is dropped. An `AUTH EXTERNAL <hex uid>` line is tens of bytes;
+/// anything approaching this is a client that never sent `BEGIN` or one
+/// feeding the daemon a buffer to grow. Named because the test that exercises
+/// the limit used to repeat the number, so moving it here moved the limit for
+/// production only and the test went on passing.
+const MAX_AUTH_LINE: usize = 16384;
+
 const MAX_MESSAGE_FDS: usize = 16;
 
 /// The most descriptors the daemon will hold for one peer before dropping it.
@@ -736,7 +751,7 @@ fn sendmsg_with_fds(fd: RawFd, data: &[u8], fds: &[RawFd]) -> isize {
         iov_base: data.as_ptr() as *mut libc::c_void,
         iov_len: data.len(),
     };
-    let space = unsafe { libc::CMSG_SPACE((fds.len() * std::mem::size_of::<RawFd>()) as u32) };
+    let space = unsafe { libc::CMSG_SPACE(std::mem::size_of_val(fds) as u32) };
     let mut cbuf = vec![0u8; space as usize];
     let mut hdr: libc::msghdr = unsafe { std::mem::zeroed() };
     hdr.msg_iov = &mut iov;
@@ -747,11 +762,11 @@ fn sendmsg_with_fds(fd: RawFd, data: &[u8], fds: &[RawFd]) -> isize {
         let c = libc::CMSG_FIRSTHDR(&hdr);
         (*c).cmsg_level = libc::SOL_SOCKET;
         (*c).cmsg_type = libc::SCM_RIGHTS;
-        (*c).cmsg_len = libc::CMSG_LEN((fds.len() * std::mem::size_of::<RawFd>()) as u32) as _;
+        (*c).cmsg_len = libc::CMSG_LEN(std::mem::size_of_val(fds) as u32) as _;
         std::ptr::copy_nonoverlapping(
             fds.as_ptr() as *const u8,
             libc::CMSG_DATA(c),
-            fds.len() * std::mem::size_of::<RawFd>(),
+            std::mem::size_of_val(fds),
         );
         libc::sendmsg(fd, &hdr, libc::MSG_NOSIGNAL)
     }
@@ -778,7 +793,7 @@ fn consume(id: u64, peer: &mut Peer, b: &mut Bus, guid: &str) -> Result<(), Stri
                     None => {
                         // An auth line is short; anything long is an attack or
                         // a client that never sent BEGIN.
-                        if peer.inbuf.len() > 16384 {
+                        if peer.inbuf.len() > MAX_AUTH_LINE {
                             return Err("auth line too long".into());
                         }
                         return Ok(());
@@ -1473,7 +1488,7 @@ mod tests {
             iov_base: bytes.as_ptr() as *mut libc::c_void,
             iov_len: bytes.len(),
         };
-        let space = unsafe { libc::CMSG_SPACE((fds.len() * 4) as u32) } as usize;
+        let space = unsafe { libc::CMSG_SPACE(std::mem::size_of_val(fds) as u32) } as usize;
         let mut cmsg = vec![0u8; space];
         let mut hdr: libc::msghdr = unsafe { std::mem::zeroed() };
         hdr.msg_iov = &mut iov;
@@ -1484,7 +1499,7 @@ mod tests {
             let c = libc::CMSG_FIRSTHDR(&hdr);
             (*c).cmsg_level = libc::SOL_SOCKET;
             (*c).cmsg_type = libc::SCM_RIGHTS;
-            (*c).cmsg_len = libc::CMSG_LEN((fds.len() * 4) as u32) as _;
+            (*c).cmsg_len = libc::CMSG_LEN(std::mem::size_of_val(fds) as u32) as _;
             let data = libc::CMSG_DATA(c) as *mut RawFd;
             for (k, fd) in fds.iter().enumerate() {
                 *data.add(k) = *fd;
@@ -1591,7 +1606,7 @@ mod tests {
         let mut b = Bus::new("G".into(), "0".repeat(32));
         let mut p = Peer::detached();
         p.auth = Auth::Lines;
-        p.inbuf = vec![b'A'; 16384];
+        p.inbuf = vec![b'A'; MAX_AUTH_LINE];
         // Still inside the ceiling: nothing to do yet, and no error.
         assert!(consume(1, &mut p, &mut b, "G").is_ok());
         p.inbuf = vec![b'A'; 16385];
@@ -2021,6 +2036,29 @@ mod tests {
         assert!(e.contains("already listening"), "{e}");
         assert!(live.exists(), "a live bus's socket is left alone");
         drop(listener);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A removal that fails has to be reported rather than swallowed. Letting
+    /// it through means walking straight into `bind()`, whose EADDRINUSE names
+    /// neither the path nor the reason -- and is the same answer a live bus
+    /// gives, which is the one thing this function exists to tell apart. A
+    /// read-only /run and a socket owned by another uid both land here; a
+    /// directory is how a test reaches it without changing who it is.
+    #[test]
+    fn a_stale_socket_that_cannot_be_removed_says_so_instead_of_failing_at_bind() {
+        let dir = std::env::temp_dir().join(format!("dbusd-unremovable-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let blocked = dir.join("bus");
+        fs::create_dir_all(&blocked).unwrap();
+
+        let e = clear_stale_socket(&blocked.to_string_lossy()).unwrap_err();
+        assert!(e.contains("stale socket"), "{e}");
+        assert!(
+            e.contains(&blocked.to_string_lossy().to_string()),
+            "the message has to name the path someone has to go and look at: {e}"
+        );
+        assert!(blocked.exists(), "and nothing was removed");
         let _ = fs::remove_dir_all(&dir);
     }
 
