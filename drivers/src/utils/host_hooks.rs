@@ -85,6 +85,7 @@ std::thread_local! {
     static DEALLOC_PAGES_CELL: Cell<usize> = const { Cell::new(0) };
     static MARK_CALLS_CELL: Cell<usize> = const { Cell::new(0) };
     static VERIFY_CALLS_CELL: Cell<usize> = const { Cell::new(0) };
+    static WAKE_CALLS_CELL: Cell<usize> = const { Cell::new(0) };
 }
 
 /// `drivers_dma_alloc` answers 0 (out of memory).
@@ -114,6 +115,11 @@ pub static DEALLOC_CALLS: ThreadCount = ThreadCount(&DEALLOC_CALLS_CELL);
 pub static DEALLOC_PAGES: ThreadCount = ThreadCount(&DEALLOC_PAGES_CELL);
 pub static MARK_CALLS: ThreadCount = ThreadCount(&MARK_CALLS_CELL);
 pub static VERIFY_CALLS: ThreadCount = ThreadCount(&VERIFY_CALLS_CELL);
+/// How many times the kernel was asked to wake the tasks waiting for RX
+/// data. A driver that polls and does not wake leaves a blocked reader on
+/// the fallback park timer, which is the slowest way for a frame to arrive
+/// and looks exactly like a network that is merely slow.
+pub static WAKE_CALLS: ThreadCount = ThreadCount(&WAKE_CALLS_CELL);
 
 /// Run `body` with every switch and counter of *this thread* reset on both
 /// sides of it.
@@ -153,6 +159,7 @@ pub fn reset() {
         &DEALLOC_PAGES,
         &MARK_CALLS,
         &VERIFY_CALLS,
+        &WAKE_CALLS,
     ] {
         counter.store(0, Ordering::SeqCst);
     }
@@ -244,7 +251,9 @@ extern "C" fn drivers_intr_get() -> bool {
 }
 
 #[no_mangle]
-extern "C" fn drivers_wake_net_rx_waiters() {}
+extern "C" fn drivers_wake_net_rx_waiters() {
+    WAKE_CALLS.fetch_add(1, Ordering::SeqCst);
+}
 
 #[no_mangle]
 extern "C" fn drivers_net_drain() {}

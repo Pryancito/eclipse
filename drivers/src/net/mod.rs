@@ -341,7 +341,7 @@ mod tests {
     /// Everything here lives in process-wide statics -- the tap callback, the
     /// deferred queue, the drop counter, the MSI queue -- so the tests take
     /// turns, and each leaves them as it found them.
-    fn alone_with_the_statics<R>(body: impl FnOnce() -> R) -> R {
+    pub(crate) fn alone_with_the_statics<R>(body: impl FnOnce() -> R) -> R {
         static TURNSTILE: Mutex<()> = Mutex::new(());
         let _guard = TURNSTILE.lock();
         clear_the_statics();
@@ -518,6 +518,11 @@ mod tests {
         unmask_refuse: Vec<usize>,
         registered: Mutex<Vec<usize>>,
         unmasked: Mutex<Vec<usize>>,
+        /// The vectors a handler was registered for by hand, through
+        /// `msi_register_and_unmask` rather than the deferred walk.
+        handlers: Mutex<Vec<usize>>,
+        masked: Mutex<Vec<usize>>,
+        unregistered: Mutex<Vec<usize>>,
     }
 
     impl PickyIntc {
@@ -527,6 +532,9 @@ mod tests {
                 unmask_refuse: Vec::new(),
                 registered: Mutex::new(Vec::new()),
                 unmasked: Mutex::new(Vec::new()),
+                handlers: Mutex::new(Vec::new()),
+                masked: Mutex::new(Vec::new()),
+                unregistered: Mutex::new(Vec::new()),
             })
         }
     }
@@ -541,7 +549,8 @@ mod tests {
         fn is_valid_irq(&self, _irq: usize) -> bool {
             true
         }
-        fn mask(&self, _irq: usize) -> DeviceResult {
+        fn mask(&self, irq: usize) -> DeviceResult {
+            self.masked.lock().push(irq);
             Ok(())
         }
         fn unmask(&self, irq: usize) -> DeviceResult {
@@ -551,7 +560,8 @@ mod tests {
             self.unmasked.lock().push(irq);
             Ok(())
         }
-        fn register_handler(&self, _irq: usize, _h: crate::scheme::IrqHandler) -> DeviceResult {
+        fn register_handler(&self, irq: usize, _h: crate::scheme::IrqHandler) -> DeviceResult {
+            self.handlers.lock().push(irq);
             Ok(())
         }
         fn register_device(&self, irq: usize, _dev: Arc<dyn Scheme>) -> DeviceResult {
@@ -561,7 +571,8 @@ mod tests {
             self.registered.lock().push(irq);
             Ok(())
         }
-        fn unregister(&self, _irq: usize) -> DeviceResult {
+        fn unregister(&self, irq: usize) -> DeviceResult {
+            self.unregistered.lock().push(irq);
             Ok(())
         }
     }
@@ -675,6 +686,132 @@ mod tests {
             let q = MSI_PENDING.lock();
             assert_eq!(q.len(), MAX_MSI_PENDING);
             assert_eq!(q[0].0, 5, "the oldest entries were not the ones dropped");
+        })
+    }
+
+    /// A vector brought online by hand is registered and unmasked, in that
+    /// order. This is the path the NVIDIA console GPU takes to get its MSI
+    /// delivery up for the SEC2-resume window, rather than the deferred walk
+    /// the NICs use.
+    #[test]
+    fn a_vector_brought_online_by_hand_is_registered_and_unmasked() {
+        alone_with_the_statics(|| {
+            let intc = PickyIntc::refusing(&[]);
+            pci_set_irq_host(intc.clone());
+
+            assert!(msi_register_and_unmask(42, Arc::new(|| {})));
+            assert_eq!(intc.handlers.lock().clone(), std::vec![42]);
+            assert_eq!(
+                intc.unmasked.lock().clone(),
+                std::vec![42],
+                "a handler nobody unmasked is a handler that never runs"
+            );
+        })
+    }
+
+    /// With no interrupt controller there is nothing to register with, and the
+    /// caller is told so rather than being left to believe the vector is live.
+    #[test]
+    fn a_vector_cannot_be_brought_online_without_a_controller() {
+        alone_with_the_statics(|| {
+            assert!(!msi_register_and_unmask(42, Arc::new(|| {})));
+        })
+    }
+
+    /// Taking a vector offline masks it and gives it back. `msi_mask` on its
+    /// own is what the storm self-limiter calls from inside the ISR, and it
+    /// must NOT unregister: the handler has to still be there when the vector
+    /// is unmasked again.
+    #[test]
+    fn taking_a_vector_offline_masks_it_and_only_then_gives_it_back() {
+        alone_with_the_statics(|| {
+            let intc = PickyIntc::refusing(&[]);
+            pci_set_irq_host(intc.clone());
+
+            msi_mask(7);
+            assert_eq!(intc.masked.lock().clone(), std::vec![7]);
+            assert!(
+                intc.unregistered.lock().is_empty(),
+                "masking from inside the ISR unregistered the handler"
+            );
+
+            msi_mask_and_unregister(9);
+            assert_eq!(intc.masked.lock().clone(), std::vec![7, 9]);
+            assert_eq!(intc.unregistered.lock().clone(), std::vec![9]);
+        })
+    }
+
+    // ------------------------------------------------------------------- DMA
+
+    /// A request that is not a whole number of pages still gets whole pages.
+    /// Truncating division backs a 2048-byte request with ZERO pages -- the
+    /// caller then writes into memory nobody owns -- and a 5000-byte request
+    /// with one 4096-byte page.
+    #[test]
+    fn a_dma_request_is_rounded_up_to_whole_pages() {
+        use crate::utils::host_hooks::{alone_with_the_allocator, ALLOC_PAGES, DEALLOC_PAGES};
+
+        for (bytes, pages) in [
+            (1usize, 1usize),
+            (PAGE_SIZE / 2, 1),
+            (PAGE_SIZE, 1),
+            (PAGE_SIZE + 1, 2),
+            (PAGE_SIZE * 2 - 1, 2),
+        ] {
+            alone_with_the_allocator(|| {
+                let (vaddr, _paddr) = ProviderImpl::alloc_dma(bytes);
+                assert_eq!(
+                    ALLOC_PAGES.load(Ordering::SeqCst),
+                    pages,
+                    "{} bytes asked for {} pages",
+                    bytes,
+                    ALLOC_PAGES.load(Ordering::SeqCst)
+                );
+                ProviderImpl::dealloc_dma(vaddr, bytes);
+                assert_eq!(
+                    DEALLOC_PAGES.load(Ordering::SeqCst),
+                    pages,
+                    "{} bytes gave back a different number of pages than it took",
+                    bytes
+                );
+            })
+        }
+    }
+
+    /// The pages come back zeroed however dirty they were. The ixgbe HAL
+    /// requires it, and a recycled frame is what the kernel allocator actually
+    /// hands out -- all of it, not just the first page.
+    #[test]
+    fn dma_pages_come_back_zeroed_even_when_they_were_recycled() {
+        use crate::utils::host_hooks::{alone_with_the_allocator, POISON_ALLOC};
+
+        alone_with_the_allocator(|| {
+            POISON_ALLOC.store(true, Ordering::SeqCst);
+            let size = PAGE_SIZE * 3;
+            let (vaddr, paddr) = ProviderImpl::alloc_dma(size);
+            assert_ne!(paddr, 0);
+            let region = unsafe { core::slice::from_raw_parts(vaddr as *const u8, size) };
+            assert!(
+                region.iter().all(|b| *b == 0),
+                "{} of {} bytes came back dirty",
+                region.iter().filter(|b| **b != 0).count(),
+                size
+            );
+        })
+    }
+
+    /// An allocation that failed answers zero, and nothing is written through
+    /// it. The zeroing walks `pages * PAGE_SIZE` bytes from the virtual address
+    /// of whatever came back, so doing it unconditionally writes three pages of
+    /// zeroes starting at the null pointer.
+    #[test]
+    fn a_dma_allocation_that_failed_is_not_zeroed_through_its_null_pointer() {
+        use crate::utils::host_hooks::{alone_with_the_allocator, FAIL_ALLOC};
+
+        alone_with_the_allocator(|| {
+            FAIL_ALLOC.store(true, Ordering::SeqCst);
+            let (_vaddr, paddr) = ProviderImpl::alloc_dma(PAGE_SIZE * 3);
+            assert_eq!(paddr, 0, "the allocator was told to fail");
         })
     }
 }
