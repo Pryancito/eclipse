@@ -189,6 +189,18 @@ pub struct FutureCollection {
     /// Logical CPU that owns this collection; stamped into every `WakerPage`
     /// so a cross-CPU wake knows which CPU to kick with a reschedule IPI.
     pub cpu_id: u8,
+    /// How many tasks in `slab` carry a CPU affinity mask.
+    ///
+    /// Zero is the answer on most machines -- only `spawn_with_affinity` /
+    /// `sched_setaffinity` ever sets one -- and it is what lets
+    /// [`TaskCollection::ready_num_for`] and [`TaskCollection::has_ready`]
+    /// answer from the page bitmaps alone. Without it both walk the runnable
+    /// bits one at a time and do a `PinSlab` lookup per bit just to ask
+    /// `allowed_on`, on the idle-steal scan (every victim, every pass) and on
+    /// the pre-halt recheck (every trip into `hlt`). With no affine task on
+    /// the queue the answer cannot differ from the popcount, because
+    /// `allowed_on` is unconditionally `true` for a task with no mask.
+    pub affine: usize,
 }
 
 impl FutureCollection {
@@ -199,6 +211,7 @@ impl FutureCollection {
             pages: vec![],
             priority,
             cpu_id,
+            affine: 0,
         }
     }
     /// Our pages hold 64 contiguous future wakers, so we can do simple arithmetic to access the
@@ -217,9 +230,13 @@ impl FutureCollection {
         future: F,
         affinity: Option<Arc<AtomicU64>>,
     ) -> Key {
+        let affine = affinity.is_some();
         let key = self
             .slab
             .insert(Arc::new(Task::new(future, self.priority, affinity)));
+        if affine {
+            self.affine += 1;
+        }
         // Add a new page to hold this future's status if the current page is filled.
         while key >= self.pages.len() * WAKER_PAGE_SIZE {
             self.pages.push(WakerPage::new(self.cpu_id));
@@ -240,7 +257,19 @@ impl FutureCollection {
     pub fn remove(&mut self, key: Key) {
         let (page, subpage_idx) = self.page(key);
         page.clear(subpage_idx);
-        self.slab.remove(unmask_priority(key));
+        let slab_key = unmask_priority(key);
+        // Asked before the slot goes away, and only for a slot that is really
+        // there: `remove` is reachable twice for one key (the generator's
+        // dropped branch and `remove_task`), and a counter that went negative
+        // would make the fast path in `ready_num_for` disappear for good.
+        if self
+            .slab
+            .get(slab_key)
+            .is_some_and(|task| task.affinity.is_some())
+        {
+            self.affine = self.affine.saturating_sub(1);
+        }
+        self.slab.remove(slab_key);
     }
 }
 
@@ -385,7 +414,15 @@ impl TaskCollection {
 
     /// remove the task correponding to the key.
     pub fn remove_task(&self, key: Key) {
-        let mut inner = self.get_mut_inner(key >> PRIORITY_SHIFT);
+        // `unpack_key`, not a bare `key >> PRIORITY_SHIFT`: the priority field
+        // is five bits and the shift leaves six, so bit 63 of a key would
+        // name a priority up to 63 -- outside the `MAX_PRIORITY` queues the
+        // collection has, which `lock_queue` can only answer with the
+        // "overwritten collection" panic, inside the scheduler. Every other
+        // reader of a key in this file goes through `unpack_key`; this was the
+        // one that wrote the field width out by hand, and got it wrong.
+        let (priority, _page_idx, _subpage_idx) = unpack_key(key);
+        let mut inner = self.get_mut_inner(priority);
         inner.remove(unmask_priority(key));
         self.task_num.fetch_sub(1, Ordering::Relaxed);
     }
@@ -484,6 +521,16 @@ impl TaskCollection {
         };
         match fc.try_lock() {
             Some(mut inner) => {
+                // No task on this queue has an affinity mask, so `allowed_on`
+                // is `true` for every one of them and the bitmaps are the
+                // whole answer -- no `PinSlab` lookup per runnable bit on the
+                // way into `hlt`. See `FutureCollection::affine`.
+                if inner.affine == 0 {
+                    return inner.pages.iter().any(|page| {
+                        let (notified, dropped, borrowed) = page.peek();
+                        notified & !dropped & !borrowed != 0
+                    });
+                }
                 for page_idx in 0..inner.pages.len() {
                     let page = &inner.pages[page_idx];
                     let (notified, dropped, borrowed) = page.peek();
@@ -550,6 +597,23 @@ impl TaskCollection {
     /// Same `try_lock` discipline as [`ready_num`]: `None` means skip this pass.
     pub fn ready_num_for(&self, cpu: usize) -> Option<usize> {
         let mut inner = self.queue(DEFAULT_PRIORITY)?.try_lock()?;
+        // Nothing here is pinned anywhere, so every runnable task is one the
+        // thief may take and the popcount is exact -- the steal scan ranks
+        // every victim on every idle pass, and walking the bits to ask
+        // `allowed_on` of a task that has no mask is a `PinSlab` lookup for a
+        // `true` nobody can change. See `FutureCollection::affine`.
+        if inner.affine == 0 {
+            return Some(
+                inner
+                    .pages
+                    .iter()
+                    .map(|p| {
+                        let (notified, dropped, borrowed) = p.peek();
+                        (notified & !dropped & !borrowed).count_ones() as usize
+                    })
+                    .sum(),
+            );
+        }
         let mut n = 0usize;
         for page_idx in 0..inner.pages.len() {
             let (notified, dropped, borrowed) = inner.pages[page_idx].peek();
@@ -680,11 +744,16 @@ impl TaskCollection {
                                 let subpage_idx = pending.trailing_zeros() as usize;
                                 pending &= pending - 1;
                                 let key = pack_key(priority, page_idx, subpage_idx);
-                                let allowed = inner
-                                    .slab
-                                    .get(unmask_priority(key))
-                                    .map(|task| task.allowed_on(cpu))
-                                    .unwrap_or(true);
+                                // `affine == 0` short-circuits the slab lookup
+                                // on the hot hand-out path: with no mask on
+                                // the queue `allowed_on` is `true` for every
+                                // task. See `FutureCollection::affine`.
+                                let allowed = inner.affine == 0
+                                    || inner
+                                        .slab
+                                        .get(unmask_priority(key))
+                                        .map(|task| task.allowed_on(cpu))
+                                        .unwrap_or(true);
                                 if !allowed {
                                     inner.pages[page_idx].notify(subpage_idx);
                                     let mask = inner
@@ -728,11 +797,16 @@ impl TaskCollection {
                                 let subpage_idx = pending.trailing_zeros() as usize;
                                 pending &= pending - 1;
                                 let key = pack_key(priority, page_idx, subpage_idx);
-                                let allowed = inner
-                                    .slab
-                                    .get(unmask_priority(key))
-                                    .map(|task| task.allowed_on(cpu))
-                                    .unwrap_or(true);
+                                // `affine == 0` short-circuits the slab lookup
+                                // on the hot hand-out path: with no mask on
+                                // the queue `allowed_on` is `true` for every
+                                // task. See `FutureCollection::affine`.
+                                let allowed = inner.affine == 0
+                                    || inner
+                                        .slab
+                                        .get(unmask_priority(key))
+                                        .map(|task| task.allowed_on(cpu))
+                                        .unwrap_or(true);
                                 if !allowed {
                                     inner.pages[page_idx].mark_yielded(subpage_idx);
                                     let mask = inner
@@ -1144,7 +1218,12 @@ mod collection_tests {
         let (req1, _) = crate::runtime::wakeup_preempt_stats();
         crate::runtime::clear_need_resched(1);
         crate::runtime::set_executor_ready_mask_for_test(saved);
-        assert_eq!(req1 - req0, 1, "eight pinned tasks raised {} kicks", req1 - req0);
+        assert_eq!(
+            req1 - req0,
+            1,
+            "eight pinned tasks raised {} kicks",
+            req1 - req0
+        );
         // All eight are still there for CPU 1.
         assert_eq!(tc.ready_num_for(1), Some(8));
     }
@@ -1158,8 +1237,82 @@ mod collection_tests {
         tc.add_task(pending(), pinned_elsewhere());
         tc.add_task(pending(), None);
         assert_eq!(tc.ready_num(), Some(2));
-        assert_eq!(tc.ready_num_for(0), Some(1), "CPU 0 saw a pinned-elsewhere task");
+        assert_eq!(
+            tc.ready_num_for(0),
+            Some(1),
+            "CPU 0 saw a pinned-elsewhere task"
+        );
         assert_eq!(tc.ready_num_for(1), Some(2), "CPU 1 can run both");
+    }
+
+    /// The counter that decides whether the affinity-free fast path runs.
+    ///
+    /// `ready_num_for` and `has_ready` answer straight from the page bitmaps
+    /// when no task on the queue carries a mask, and the generator skips its
+    /// per-bit slab lookup on the same condition. If the count ever disagreed
+    /// with the slab, the fast path would be *wrong* rather than slow: a queue
+    /// holding a pinned task would advertise it to a CPU the mask forbids, and
+    /// the thief would take it and poll it there. So the count has to follow
+    /// every insert and every removal, including the removals the generator
+    /// does under its own lock.
+    #[test]
+    fn the_affinity_free_fast_path_only_runs_when_the_queue_really_is_free_of_masks() {
+        let tc = TaskCollection::new(0);
+        let plain = tc.add_task(pending(), None);
+        assert_eq!(tc.get_mut_inner(DEFAULT_PRIORITY).affine, 0);
+        // The two agree with the slow walk while nothing is pinned.
+        assert_eq!(tc.ready_num_for(0), tc.ready_num());
+        assert!(tc.has_ready());
+
+        let pinned = tc.add_task(pending(), pinned_elsewhere());
+        assert_eq!(tc.get_mut_inner(DEFAULT_PRIORITY).affine, 1);
+        // With a mask on the queue the fast path must NOT run: CPU 0 can see
+        // one of the two tasks, not both.
+        assert_eq!(tc.ready_num(), Some(2));
+        assert_eq!(tc.ready_num_for(0), Some(1));
+
+        // Retiring the pinned one puts the queue back in the state the fast
+        // path is allowed in -- and `remove` is reached through the
+        // generator's dropped branch, which is the removal that matters.
+        let (_, p, sub) = unpack_key(pinned);
+        tc.get_mut_inner(DEFAULT_PRIORITY).pages[p].mark_dropped(sub);
+        while tc.take_task().is_some() {}
+        assert_eq!(tc.get_mut_inner(DEFAULT_PRIORITY).affine, 0);
+        assert_eq!(tc.task_num(), 1);
+        assert_eq!(tc.ready_num_for(0), tc.ready_num());
+
+        // And a queue whose only task is pinned elsewhere still reads as empty
+        // for us with the counter back in play.
+        tc.remove_task(plain);
+        tc.add_task(pending(), pinned_elsewhere());
+        assert_eq!(tc.get_mut_inner(DEFAULT_PRIORITY).affine, 1);
+        assert_eq!(tc.ready_num_for(0), Some(0));
+        assert!(!tc.has_ready(), "a pinned-elsewhere task kept CPU 0 awake");
+    }
+
+    /// `remove_task` reads the priority field, not six bits off the top of the
+    /// word.
+    ///
+    /// The field is five bits wide (`PRIORITY_MASK`); a bare
+    /// `key >> PRIORITY_SHIFT` leaves six, so bit 63 of a key would name a
+    /// priority up to 63 -- outside the `MAX_PRIORITY` queues the collection
+    /// has, and `lock_queue` can only answer that with the "overwritten
+    /// collection" panic, raised inside the scheduler with locks held.
+    #[test]
+    fn removing_a_task_names_the_same_priority_the_key_was_packed_with() {
+        let tc = TaskCollection::new(0);
+        let key = tc.add_task(pending(), None);
+        assert_eq!(tc.task_num(), 1);
+        tc.remove_task(key);
+        assert_eq!(tc.task_num(), 0);
+        assert!(!tc.has_ready());
+        // Every priority the field can hold unpacks to a queue that exists,
+        // whatever the highest bit of the word is doing.
+        for priority in 0..MAX_PRIORITY {
+            let key = pack_key(priority, 7, 3);
+            assert_eq!(unpack_key(key).0, priority);
+            assert!(tc.queue(unpack_key(key).0).is_some());
+        }
     }
 
     #[test]
