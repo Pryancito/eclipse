@@ -2971,6 +2971,7 @@ dependencies = [
  "lazy_static",
  "lock",
  "log",
+ "managed",
  "numeric-enum-macro",
  "nvidia-rm-sys",
  "pci",

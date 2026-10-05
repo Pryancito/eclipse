@@ -55,6 +55,10 @@ smoltcp = { git = "https://github.com/smoltcp-rs/smoltcp", rev = "35e833e3", def
     "socket-icmp",
     "async",
 ] }
+# The address list of a smoltcp interface is a `ManagedSlice`, and telling
+# the owned case from the borrowed one is what lets `add_ip_address` grow
+# the list instead of overwriting an address already there.
+managed = { version = "0.8", default-features = false, features = ["alloc"] }
 d1-pac = { version = "0.0.27", optional = true }
 volatile = "0.3"
 ixgbe-driver = "0.1"

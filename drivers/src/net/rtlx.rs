@@ -23,6 +23,7 @@ const TX_SCRATCH_LEN: usize = 1536;
 use crate::net::get_sockets;
 use crate::scheme::{NetScheme, RouteInfo, Scheme};
 use crate::{DeviceError, DeviceResult};
+use managed::ManagedSlice;
 
 #[derive(Clone)]
 pub struct RTLxDriver(Arc<Mutex<RTL8211F<ProviderImpl>>>);
@@ -169,7 +170,14 @@ impl NetScheme for RTLxInterface {
                     return;
                 }
             }
-            if let Some(slot) = addrs.iter_mut().last() {
+            // Every slot is taken. Growing the list is the only way to keep
+            // the addresses that are already there; overwriting the newest one
+            // silently takes an address the interface still answers on.
+            if let ManagedSlice::Owned(addrs) = addrs {
+                addrs.push(cidr);
+            } else if let Some(slot) = addrs.iter_mut().last() {
+                // Borrowed storage cannot grow, so the newest slot is the best
+                // there is.
                 *slot = cidr;
             }
         });
@@ -1239,31 +1247,35 @@ mod tests {
         );
     }
 
-    /// With every slot taken, a new address replaces the last one -- the most
-    /// recently added -- and not the first, which is the address the board is
-    /// actually reachable at.
+    /// With every slot taken, a new address makes the list longer and costs
+    /// nothing: not the address the board boots at, not the IPv6 link-local it
+    /// needs for neighbour discovery, and not the two added before it.
     #[test]
-    fn an_address_added_with_every_slot_taken_replaces_the_newest() {
+    fn an_address_added_with_every_slot_taken_grows_the_list() {
         let _dev = fake::with_phy(Phy::gigabit_partner());
         let iface = interface(7);
         let primary = IpCidr::new(IpAddress::v4(192, 168, 0, 123), 24);
-        iface
-            .add_ip_address(IpCidr::new(IpAddress::v4(10, 0, 0, 1), 24))
-            .unwrap();
-        iface
-            .add_ip_address(IpCidr::new(IpAddress::v4(10, 0, 1, 1), 24))
-            .unwrap();
-        // Four slots, and all four are taken now.
+        let link_local = iface
+            .get_ip_address()
+            .into_iter()
+            .find(|a| matches!(a, IpCidr::Ipv6(_)))
+            .expect("the GMAC comes up with a link-local address");
+        let first = IpCidr::new(IpAddress::v4(10, 0, 0, 1), 24);
+        let second = IpCidr::new(IpAddress::v4(10, 0, 1, 1), 24);
+        iface.add_ip_address(first).unwrap();
+        iface.add_ip_address(second).unwrap();
+        // Four slots, and all four are taken now: the two the init configures
+        // plus the two blanks these filled.
+        assert_eq!(iface.get_ip_address().len(), 4);
         let third = IpCidr::new(IpAddress::v4(10, 0, 2, 1), 24);
+
         iface.add_ip_address(third).unwrap();
 
         let addrs = iface.get_ip_address();
-        assert!(
-            addrs.contains(&primary),
-            "the address the board boots at was overwritten: {:?}",
-            addrs
-        );
-        assert!(addrs.contains(&third), "{:?}", addrs);
+        assert_eq!(addrs.len(), 5, "the list did not grow: {:?}", addrs);
+        for want in [primary, link_local, first, second, third] {
+            assert!(addrs.contains(&want), "{} went missing: {:?}", want, addrs);
+        }
     }
 
     /// A removed address leaves no route behind. The slot is blanked to

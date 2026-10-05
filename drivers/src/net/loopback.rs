@@ -15,6 +15,7 @@ use alloc::string::String;
 
 use crate::scheme::{NetScheme, NetStats, RouteInfo, Scheme};
 use crate::{DeviceError, DeviceResult};
+use managed::ManagedSlice;
 
 use alloc::vec::Vec;
 use smoltcp::wire::EthernetAddress;
@@ -252,7 +253,17 @@ impl NetScheme for LoopbackInterface {
                     return;
                 }
             }
-            if let Some(slot) = addrs.iter_mut().last() {
+            // Every slot is taken. Growing the list is the only way to keep
+            // the addresses that are already there, and here it is not an edge
+            // case: the loopback is built with exactly `127.0.0.1/8` and
+            // `::1/128` and no spare slot, so overwriting the newest one left
+            // the machine without an IPv6 loopback on the first
+            // `ip addr add ... dev lo`.
+            if let ManagedSlice::Owned(addrs) = addrs {
+                addrs.push(cidr);
+            } else if let Some(slot) = addrs.iter_mut().last() {
+                // Borrowed storage cannot grow, so the newest slot is the best
+                // there is.
                 *slot = cidr;
             }
         });
@@ -559,23 +570,84 @@ mod tests {
         );
     }
 
+    /// The loopback is built with both of its slots taken, so this is the path
+    /// that grows the list. The two addresses already there are what a machine
+    /// needs to talk to itself at all, in either family.
     #[test]
-    fn a_new_address_lands_in_a_free_slot_and_the_old_ones_stay() {
+    fn a_new_address_grows_the_list_and_the_old_ones_stay() {
         let iface = interface(stats());
-        let before = iface.get_ip_address();
-        iface
-            .add_ip_address(IpCidr::new(IpAddress::v4(10, 0, 0, 1), 24))
-            .unwrap();
+        let v4 = IpCidr::new(IpAddress::v4(127, 0, 0, 1), 8);
+        let v6 = IpCidr::new(IpAddress::v6(0, 0, 0, 0, 0, 0, 0, 1), 128);
+        assert_eq!(iface.get_ip_address(), alloc::vec![v4, v6]);
+        let added = IpCidr::new(IpAddress::v4(10, 0, 0, 1), 24);
+
+        iface.add_ip_address(added).unwrap();
+
         let after = iface.get_ip_address();
         assert!(
-            after.contains(&IpCidr::new(IpAddress::v4(10, 0, 0, 1), 24)),
-            "the address was not added"
+            after.contains(&added),
+            "the address was not added: {:?}",
+            after
         );
         assert!(
-            after.contains(&IpCidr::new(IpAddress::v4(127, 0, 0, 1), 8)),
-            "adding an address must not cost you 127.0.0.1"
+            after.contains(&v4),
+            "adding an address must not cost you 127.0.0.1: {:?}",
+            after
         );
-        assert!(after.len() >= before.len());
+        // The one that used to go: with no free slot the fallback overwrote the
+        // newest, and the newest is `::1/128`, so a single `ip addr add ... dev
+        // lo` left the machine with no IPv6 loopback at all.
+        assert!(
+            after.contains(&v6),
+            "adding an address must not cost you ::1 either: {:?}",
+            after
+        );
+        assert_eq!(after.len(), 3, "{:?}", after);
+    }
+
+    /// Growing the list is the last resort and not the first: a slot freed by
+    /// `remove_ip_address` is reused, so adding and removing in a loop does not
+    /// leave the interface with a list that only ever gets longer.
+    #[test]
+    fn a_freed_slot_is_reused_before_the_list_grows() {
+        let iface = interface(stats());
+        let blank = IpCidr::new(IpAddress::v4(0, 0, 0, 0), 0);
+        iface
+            .remove_ip_address(IpCidr::new(IpAddress::v4(127, 0, 0, 1), 8))
+            .unwrap();
+        assert!(iface.get_ip_address().contains(&blank));
+        let added = IpCidr::new(IpAddress::v4(10, 0, 0, 1), 24);
+
+        iface.add_ip_address(added).unwrap();
+
+        let after = iface.get_ip_address();
+        assert_eq!(after.len(), 2, "the freed slot was not reused: {:?}", after);
+        assert!(after.contains(&added), "{:?}", after);
+        assert!(!after.contains(&blank), "{:?}", after);
+    }
+
+    /// `240.0.0.0/32` is the other sentinel the free-slot test knows. Nothing in
+    /// the tree writes it, so only a configured address puts it there -- and
+    /// once there it is reusable, exactly like a blank.
+    #[test]
+    fn the_other_free_slot_sentinel_is_reused_too() {
+        let iface = interface(stats());
+        let sentinel = IpCidr::new(IpAddress::v4(240, 0, 0, 0), 32);
+        iface.add_ip_address(sentinel).unwrap();
+        assert_eq!(iface.get_ip_address().len(), 3);
+        let added = IpCidr::new(IpAddress::v4(10, 0, 0, 1), 24);
+
+        iface.add_ip_address(added).unwrap();
+
+        let after = iface.get_ip_address();
+        assert_eq!(
+            after.len(),
+            3,
+            "the sentinel slot was not reused: {:?}",
+            after
+        );
+        assert!(after.contains(&added), "{:?}", after);
+        assert!(!after.contains(&sentinel), "{:?}", after);
     }
 
     #[test]
@@ -594,9 +666,9 @@ mod tests {
     }
 
     /// A removed address is blanked to `0.0.0.0/0`, which is the sentinel
-    /// `add_ip_address` reuses. That is deliberate -- smoltcp's address storage
-    /// is a fixed array -- so what has to hold is that the address itself is
-    /// gone and that the blank slot is not mistaken for a route.
+    /// `add_ip_address` reuses before it grows the list. So what has to hold is
+    /// that the address itself is gone and that the blank slot is not mistaken
+    /// for a route.
     #[test]
     fn a_removed_address_stops_being_reachable_and_leaves_no_route() {
         let iface = interface(stats());

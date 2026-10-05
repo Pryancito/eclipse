@@ -9,6 +9,7 @@ use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 
+use managed::ManagedSlice;
 use smoltcp::iface::*;
 use smoltcp::phy::{self, Checksum, DeviceCapabilities};
 use smoltcp::time::Instant;
@@ -717,7 +718,14 @@ impl NetScheme for E1000Interface {
                     return;
                 }
             }
-            if let Some(slot) = addrs.iter_mut().last() {
+            // Every slot is taken. Growing the list is the only way to keep
+            // the addresses that are already there; overwriting the newest one
+            // silently takes an address the interface still answers on.
+            if let ManagedSlice::Owned(addrs) = addrs {
+                addrs.push(cidr);
+            } else if let Some(slot) = addrs.iter_mut().last() {
+                // Borrowed storage cannot grow, so the newest slot is the best
+                // there is.
                 *slot = cidr;
             }
         });
