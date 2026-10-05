@@ -1279,13 +1279,19 @@ impl DrmDev {
             }
             DRM_IOCTL_MODE_CREATE_DUMB => {
                 let info = unsafe { &mut *(data as *mut DrmModeCreateDumb) };
-                // Linux: bpp==0 is EINVAL. `.max(32)` used to turn 0 into a
-                // successful 32-bpp alloc and to inflate bpp=16 into 32, so
-                // pitch/size lied about the format the client asked for.
+                // `drm_mode_create_dumb`: a row is `DIV_ROUND_UP(bpp, 8) *
+                // width` bytes, and a width, height or bpp of 0, or a bpp
+                // past `U32_MAX - 8`, is EINVAL -- the bpp of 0 is refused
+                // here, and the pitch and size checks below answer for the
+                // rest (a zero pitch or size, or one past the ceiling). This
+                // promoted every bpp below 32 to 32, so a bpp of 0 got a
+                // 32-bit buffer and a 16-bit request was sized (and its
+                // pitch reported) as if it were 32-bit.
                 if info.bpp == 0 {
                     return Err(FsError::InvalidParam);
                 }
                 let bpp = info.bpp;
+                let cpp = (bpp as u64).div_ceil(8);
                 // width/height/bpp are userspace-controlled: compute pitch/size
                 // in 64-bit. A 32-bit `width*bpp` or `pitch*height` would wrap
                 // (e.g. 50000x50000x32) and under-allocate the buffer while
@@ -1293,7 +1299,7 @@ impl DrmDev {
                 // Bound the result to a sane ceiling (64 MiB — a 4K XRGB frame
                 // is ~33 MiB) and require pitch to fit the u32 written back.
                 const MAX_DUMB_SIZE: u64 = 64 * 1024 * 1024;
-                let mut pitch64 = (info.width as u64 * bpp as u64 / 8 + 63) & !63;
+                let mut pitch64 = (info.width as u64 * cpp + 63) & !63;
                 let mut size64 = pitch64.saturating_mul(info.height as u64);
                 // When the compositor requests a full-screen dumb buffer, align
                 // its pitch with the display scanout pitch so the CE-offload
@@ -1302,7 +1308,10 @@ impl DrmDev {
                 // GOP framebuffer pitch and every frame falls back to the slow
                 // CPU blit (~7-10 FPS on dual RTX).
                 if let Some((dw, dh, dp)) = drm::display_mode() {
-                    if info.width == dw && info.height == dh && dp as u64 >= pitch64 {
+                    // Only for a 32-bit buffer: the scanout pitch is a 32-bit
+                    // pitch, and a narrower buffer keeps the pitch of its own
+                    // bpp.
+                    if cpp == 4 && info.width == dw && info.height == dh && dp as u64 >= pitch64 {
                         pitch64 = dp as u64;
                         size64 = pitch64.saturating_mul(info.height as u64);
                     }
@@ -11637,6 +11646,47 @@ mod kms_scanout_tests {
             Err(FsError::EntryNotFound),
             "a closed fb is gone"
         );
+    }
+
+    /// `drm_mode_create_dumb` refuses a width, height or bpp of 0 and a bpp
+    /// past `U32_MAX - 8` (EINVAL), and sizes the buffer from the bpp asked
+    /// for: `DIV_ROUND_UP(bpp, 8)` bytes per pixel. Here every bpp below 32
+    /// became 32 -- a bpp of 0 got a 32-bit buffer, and a 16-bit request
+    /// was sized and reported as 32-bit.
+    #[test]
+    fn a_dumb_buffer_is_sized_by_the_bpp_asked_for_and_a_zero_is_refused() {
+        let _serialised = drm::test_globals::lock();
+        let c = Client::open(0);
+        let einval = Err(FsError::InvalidParam);
+        let create = |width: u32, height: u32, bpp: u32| {
+            let mut req = DrmModeCreateDumb {
+                height,
+                width,
+                bpp,
+                flags: 0,
+                handle: 0,
+                pitch: 0,
+                size: 0,
+            };
+            c.ioctl(DRM_IOCTL_MODE_CREATE_DUMB, &mut req)
+                .map(|_| (req.pitch, req.size, req.handle))
+        };
+        assert_eq!(create(64, 4, 0), einval, "a bpp of 0 got a buffer");
+        assert_eq!(create(0, 4, 32), einval);
+        assert_eq!(create(64, 0, 32), einval);
+        assert_eq!(create(64, 4, u32::MAX - 7), einval);
+
+        let mut handles = alloc::vec::Vec::new();
+        for (bpp, pitch) in [(32, 256), (16, 128), (8, 64), (24, 192), (12, 128), (1, 64)] {
+            let (p, size, handle) = create(64, 4, bpp).expect("CREATE_DUMB");
+            assert_eq!(p, pitch, "pitch for bpp {}", bpp);
+            assert_eq!(size, pitch as u64 * 4, "size for bpp {}", bpp);
+            handles.push(handle);
+        }
+        for mut handle in handles {
+            c.ioctl(DRM_IOCTL_MODE_DESTROY_DUMB, &mut handle)
+                .expect("DESTROY_DUMB");
+        }
     }
 }
 
