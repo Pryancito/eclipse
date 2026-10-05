@@ -278,6 +278,30 @@ fn wake_preempt_allowed(now: u64, end: u64, slice: u64, base: u64) -> bool {
     ran >= base
 }
 
+/// When the RUN_TO_PARITY floor ends for a thread whose slice ends at `end`, or
+/// `None` when [`wake_preempt_allowed`] already lets the wake through.
+///
+/// This exists because a denied request is not re-examined until the next
+/// *interrupt*, and a thread in a userspace compute loop takes no interrupt but
+/// the 4 ms scheduler tick. So the floor the comment calls 0.75 ms was in
+/// practice 4 ms, five times what it claims, and a thread that parks briefly
+/// every few hundred microseconds -- a media callback, an `epoll` loop, the
+/// `lag_share` probe in `eclipse-bench` -- got served once per tick instead of
+/// once per park. The answer is to arm the timer for the floor, so the floor is
+/// the floor.
+///
+/// The slice started at `end - slice`, so the floor ends `base` after that;
+/// never later than the slice itself ends, which also keeps a `base` wider than
+/// the whole slice from pushing the floor past the preemption that is coming
+/// anyway.
+fn wake_preempt_floor_end(now: u64, end: u64, slice: u64, base: u64) -> Option<u64> {
+    if wake_preempt_allowed(now, end, slice, base) {
+        return None;
+    }
+    let started = end.saturating_sub(slice);
+    Some(started.saturating_add(base).min(end))
+}
+
 /// Per-thread Linux-compatible scheduling attributes.
 ///
 /// The kernel core is an async per-CPU executor, not a Linux runqueue, so these
@@ -805,6 +829,26 @@ impl Thread {
         let now = kernel_hal::timer::timer_now().as_nanos() as u64;
         let end = self.sched.slice_end_ns.load(Ordering::Relaxed);
         wake_preempt_allowed(now, end, slice, BASE_SLICE_NS)
+    }
+
+    /// When this thread's RUN_TO_PARITY floor ends, for a wake-up preemption
+    /// request that [`Thread::sched_may_preempt_on_wake`] has just denied.
+    ///
+    /// `None` when nothing was denied, or when the thread is one the floor does
+    /// not apply to. The trap path turns a `Some` into a timer, because without
+    /// one the denied request waits for the next interrupt, and a thread in a
+    /// userspace loop takes none before the 4 ms tick.
+    pub fn sched_wake_preempt_floor_end(&self) -> Option<Duration> {
+        if self.sched_policy() == SCHED_IDLE {
+            return None;
+        }
+        let slice = self.timeslice_ns();
+        if slice == u64::MAX {
+            return None;
+        }
+        let now = kernel_hal::timer::timer_now().as_nanos() as u64;
+        let end = self.sched.slice_end_ns.load(Ordering::Relaxed);
+        wake_preempt_floor_end(now, end, slice, BASE_SLICE_NS).map(Duration::from_nanos)
     }
 
     /// Whether the executor has this thread parked: its last poll answered
@@ -2534,6 +2578,85 @@ mod sched_tests {
             wake_preempt_allowed(now, now + LAG_SLICE + 1, LAG_SLICE, BASE_SLICE_NS),
             "una fecha limite mas lejos que un slice entero no es creible"
         );
+    }
+
+    /// A wake the floor lets through needs no timer: it is honoured on this
+    /// very trap, so there is nothing to come back for.
+    #[test]
+    fn a_wake_that_is_allowed_asks_for_no_timer() {
+        let now = 1_000_000_000;
+        let end = now + LAG_SLICE - BASE_SLICE_NS;
+        assert_eq!(
+            wake_preempt_floor_end(now, end, LAG_SLICE, BASE_SLICE_NS),
+            None,
+            "justo en el suelo el despertar pasa, no hay nada que armar"
+        );
+        assert_eq!(
+            wake_preempt_floor_end(now, 0, LAG_SLICE, BASE_SLICE_NS),
+            None
+        );
+        assert_eq!(
+            wake_preempt_floor_end(now, now + 1, u64::MAX, BASE_SLICE_NS),
+            None
+        );
+        assert_eq!(
+            wake_preempt_floor_end(now, now, LAG_SLICE, BASE_SLICE_NS),
+            None
+        );
+    }
+
+    /// A wake the floor denies asks for a timer at the floor, which is
+    /// `BASE_SLICE_NS` after the slice started -- not at the next tick, which
+    /// is what a thread in a userspace loop used to wait for.
+    #[test]
+    fn a_wake_the_floor_denies_asks_for_a_timer_at_the_floor() {
+        let now = 1_000_000_000;
+        // Corrio 100 us de 20 ms: dentro del suelo, asi que el suelo acaba
+        // 650 us mas adelante.
+        let end = now + LAG_SLICE - 100_000;
+        let started = end - LAG_SLICE;
+        assert_eq!(
+            wake_preempt_floor_end(now, end, LAG_SLICE, BASE_SLICE_NS),
+            Some(started + BASE_SLICE_NS),
+            "el temporizador tiene que caer en el suelo"
+        );
+        let floor = wake_preempt_floor_end(now, end, LAG_SLICE, BASE_SLICE_NS).unwrap();
+        assert_eq!(
+            floor - now,
+            BASE_SLICE_NS - 100_000,
+            "650 us desde ahora, no los 4 ms del tick"
+        );
+        assert!(floor > now, "un suelo detras del reloj no arma nada");
+        assert!(floor < end, "el suelo no puede pasarse del fin del slice");
+    }
+
+    /// A thread that has consumed nothing yet asks for the whole floor, and
+    /// one a nanosecond short of it asks for that nanosecond.
+    #[test]
+    fn the_floor_is_measured_from_where_the_slice_started() {
+        let now = 1_000_000_000;
+        assert_eq!(
+            wake_preempt_floor_end(now, now + LAG_SLICE, LAG_SLICE, BASE_SLICE_NS),
+            Some(now + BASE_SLICE_NS),
+            "sin consumir nada, el suelo entero"
+        );
+        let end = now + LAG_SLICE - BASE_SLICE_NS + 1;
+        assert_eq!(
+            wake_preempt_floor_end(now, end, LAG_SLICE, BASE_SLICE_NS),
+            Some(now + 1),
+            "a un nanosegundo del suelo, un nanosegundo"
+        );
+    }
+
+    /// A floor wider than the whole slice must not be armed past the
+    /// preemption that is coming anyway.
+    #[test]
+    fn the_floor_never_lands_past_the_end_of_the_slice() {
+        let now = 1_000_000_000;
+        let slice = 500_000;
+        let end = now + slice - 1;
+        let floor = wake_preempt_floor_end(now, end, slice, BASE_SLICE_NS).unwrap();
+        assert_eq!(floor, end, "un suelo mas ancho que el slice se recorta");
     }
 
     /// `SCHED_IDLE` yields to anything that wakes, as in Linux: the floor is
