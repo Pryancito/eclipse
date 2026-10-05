@@ -2222,6 +2222,9 @@ struct ys_lane {
     // one that ran and then did not come back out of the call, and those are
     // different bugs.
     volatile int started;
+    volatile int pin_rc;       // what sched_setaffinity returned for this thread
+    volatile int cpu_seen;     // sched_getcpu() right after pinning
+    volatile int cpu_last;     // and the last one it observed
 };
 
 struct ys_ctl {
@@ -2229,20 +2232,33 @@ struct ys_ctl {
     volatile uint64_t notifies;
     struct ys_lane a, b;
     volatile int notify_started;
+    volatile int notify_cpu;
     int nnotify;
 };
 static struct ys_ctl g_ys;
 
 static void *ys_yielder(void *arg) {
     struct ys_lane *l = arg;
-    if (smpk_pin_self(0) != 0)
+    // The reproducer confines the PARENT to CPU 0 before creating anything, so
+    // a child reporting a different CPU here means the affinity mask was not
+    // inherited across thread creation -- and a child reporting CPU 0 while
+    // making no progress means something else entirely. The number settles it;
+    // guessing from the outside does not.
+    l->pin_rc = smpk_pin_self(0);
+    if (l->pin_rc != 0)
         l->pin_failed = 1;
+    l->cpu_seen = sched_getcpu();
+    l->cpu_last = l->cpu_seen;
     l->started = 1;
     while (!*l->stop) {
         sched_yield();
         // Bumped AFTER the call returns, so a count that stops advancing means
         // the call did not come back -- not that the loop was merely slow.
         l->count++;
+        // Cheap next to a syscall, and it says whether a thread that stopped
+        // progressing was sitting on the CPU it was pinned to.
+        if ((l->count & 0xfff) == 0)
+            l->cpu_last = sched_getcpu();
     }
     return NULL;
 }
@@ -2252,8 +2268,8 @@ static void *ys_notifier(void *arg) {
     if (smpk_pin_self(0) != 0)
         return NULL;
     // Short sleeps, on the same CPU as the yielders: each one ends in a timer
-    // wake, which is a NOTIFY arriving at that CPU. The notified lane is what
-    // the yielded lane has to wait behind.
+    // wake, which is a NOTIFY arriving at that CPU.
+    c->notify_cpu = sched_getcpu();
     c->notify_started++;
     struct timespec ts = {0, 200 * 1000}; // 200 us
     while (!c->stop) {
@@ -3225,6 +3241,7 @@ int main(int argc, char **argv) {
                "observer on CPU 1..%d; %d s\n", made_n, ncpus - 1, secs);
         printf("yieldstall: a yields/s of 0 while notifies keep arriving IS "
                "the bug\n");
+        int have_kstat = kstat_snapshot(g_kstat_a, sizeof g_kstat_a);
         uint64_t pa = 0, pb = 0, pn = 0;
         uint64_t stall_a = 0, stall_b = 0, stall_n = 0;
         uint64_t t0 = now_ns();
@@ -3254,6 +3271,8 @@ int main(int argc, char **argv) {
                 stall_n = (uint64_t)(at * 1000);
             pa = ca; pb = cb; pn = cn;
         }
+        if (have_kstat)
+            have_kstat = kstat_snapshot(g_kstat_b, sizeof g_kstat_b);
         g_ys.stop = 1;
         int participants = 2 + made_n;
         int starved = (stall_a != 0) + (stall_b != 0) + (stall_n != 0);
@@ -3277,6 +3296,37 @@ int main(int argc, char **argv) {
                        : " (and not all of them started)");
         if (starved == 0)
             printf("    none: every thread kept advancing for the whole run.\n");
+        // Where each thread actually sat. All of them were pinned to CPU 0 by
+        // a parent that was already confined to CPU 0, so anything other than
+        // 0 here is the answer on its own.
+        printf("  placement: A pin=%d cpu=%d->%d   B pin=%d cpu=%d->%d   "
+               "notifier cpu=%d\n",
+               g_ys.a.pin_rc, g_ys.a.cpu_seen, g_ys.a.cpu_last,
+               g_ys.b.pin_rc, g_ys.b.cpu_seen, g_ys.b.cpu_last,
+               made_n > 0 ? g_ys.notify_cpu : -1);
+        if (g_ys.a.cpu_seen != 0 || g_ys.b.cpu_seen != 0 ||
+            (made_n > 0 && g_ys.notify_cpu != 0))
+            printf("    ^ every thread was pinned to CPU 0 by an already-"
+                   "confined parent, so a\n      thread reporting another CPU "
+                   "means the mask did not take effect\n      where it ran: it "
+                   "is stranded, not merely descheduled.\n");
+        if (have_kstat) {
+            // Disjoint counters: `skipped` is bumped on an early return that
+            // happens before `scans`. See the psched section.
+            double scans = kstat_delta("sched steal:", 0);
+            double probed = kstat_delta("sched steal:", 1);
+            double ok = kstat_delta("sched steal:", 2);
+            double aff = kstat_delta("sched steal:", 3);
+            double skip = kstat_delta("sched steal:", 5);
+            printf("  steal over the run: %.0f scans, %.0f probed, %.0f ok, "
+                   "%.0f affinity-empty, %.0f skipped\n",
+                   scans, probed, ok, aff, skip);
+            printf("    ^ scans near zero, or affinity-empty climbing, is a "
+                   "CPU that never came\n      looking or looked and found "
+                   "nothing it was allowed to take. `ok` rising\n      "
+                   "instead means work WAS being moved and the stall is "
+                   "elsewhere.\n");
+        }
         printf("  totals: A %llu yields (started %d), B %llu yields "
                "(started %d), %llu notifies (%d of %d notifiers started)\n",
                (unsigned long long)g_ys.a.count, g_ys.a.started,
