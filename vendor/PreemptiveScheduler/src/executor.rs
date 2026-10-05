@@ -140,13 +140,23 @@ static IDLE_STREAK: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU6
 // `/proc/perf/kernel` so a busy-spin can be attributed: `polled` = a task was
 // available to run, `weak_yield` = no task but a weak executor outstanding so we
 // spun via `sched_yield` instead of halting.
-static SCHED_POLLED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+///
+/// `polled` is per-CPU with a cache line each, and summed on read. It is bumped
+/// on **every task poll**, so as one shared word it was a read-modify-write
+/// that every CPU in the machine performed on one line, tens of thousands of
+/// times a second, for a number nothing reads but `/proc`. A statistic must not
+/// be the most contended line in the scheduler; `weak_yield` stays shared
+/// because it is bumped only when a CPU finds no task but a weak executor
+/// outstanding, which is rare by construction.
+static SCHED_POLLED: [crate::runtime::CacheAligned; lock::MAX_CORE_NUM] =
+    [const { crate::runtime::CacheAligned::new() }; lock::MAX_CORE_NUM];
 static SCHED_WEAK_YIELD: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// `(tasks polled, weak-executor yields)` since boot.
 pub fn sched_stats() -> (u64, u64) {
     use core::sync::atomic::Ordering::Relaxed;
-    (SCHED_POLLED.load(Relaxed), SCHED_WEAK_YIELD.load(Relaxed))
+    let polled = SCHED_POLLED.iter().map(|c| c.0.load(Relaxed)).sum();
+    (polled, SCHED_WEAK_YIELD.load(Relaxed))
 }
 
 /// `(stack-pool occupied slots, overflow-list length)` — how many freed
@@ -214,6 +224,40 @@ const STACK_REG_SLOTS: usize = 512;
 static STACK_REG_BASE: [core::sync::atomic::AtomicUsize; STACK_REG_SLOTS] =
     [const { core::sync::atomic::AtomicUsize::new(0) }; STACK_REG_SLOTS];
 
+/// Occupancy summary for [`STACK_REG_BASE`]: bit `s` of word `s / 64` is set
+/// while slot `s` may hold a live base.
+///
+/// The table is 512 `AtomicUsize`, and all three operations on it used to walk
+/// every one of them: 4 KiB, **64 cache lines, per call**. For the lookup that
+/// matters more than for the other two, because
+/// [`alloc_overlaps_live_stack`] is called by the kernel's global allocator on
+/// **every block it hands out** — so every `Box`, every `Vec` growth, every
+/// frame of kernel bookkeeping anywhere in the system walked 4 KiB of atomics
+/// to answer a question whose answer is "no" essentially always: it is a
+/// tripwire for a bug, not a lookup anything depends on. A handful of stacks
+/// are live at a time, so this is 512 loads to read maybe eight useful ones,
+/// on lines that `Executor::new` and the retire path write from other cores.
+///
+/// Eight words summarise all of it. The lookup reads those eight and then only
+/// the slots a set bit names: 8 loads with nothing live, 8 + k with k stacks
+/// live, instead of 512 either way. Insert finds a free slot from the inverted
+/// word and remove skips the empties, so both get the same reduction.
+///
+/// **The invariant is that a set bit is a *superset* of a set base**, never a
+/// subset: insert claims the bit *before* it CASes the base in, and remove
+/// zeroes the base *before* it drops the bit. So a reader can visit a slot that
+/// holds nothing -- it loads a 0 and skips, which it already did -- but it can
+/// never skip a slot that holds a live stack, which would turn this tripwire
+/// into a silent false negative. The order is the whole correctness argument;
+/// a spurious bit is only ever one wasted load.
+const STACK_REG_WORDS: usize = STACK_REG_SLOTS / 64;
+const _: () = assert!(
+    STACK_REG_SLOTS % 64 == 0,
+    "STACK_REG_OCC indexes STACK_REG_BASE 64 slots per word: the count must divide"
+);
+static STACK_REG_OCC: [core::sync::atomic::AtomicU64; STACK_REG_WORDS] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; STACK_REG_WORDS];
+
 /// Stacks [`stack_reg_insert`] could not record because the table was full.
 ///
 /// Monotonic on purpose: a dropped insert may later be balanced by that stack
@@ -230,19 +274,51 @@ static STACK_REG_BASE_OVERFLOW: core::sync::atomic::AtomicUsize =
 /// "no aliasing".
 fn stack_reg_insert(alloc_base: usize) {
     use core::sync::atomic::Ordering::{AcqRel, Relaxed};
-    for slot in STACK_REG_BASE.iter() {
+    for (i, slot) in STACK_REG_BASE.iter().enumerate() {
         // Load first (see the note on `stack_reg_remove`).
         if slot.load(Relaxed) != 0 {
             continue;
         }
+        // Deliberately NOT driven off `STACK_REG_OCC`: the summary is a
+        // superset, so a bit that outlived its base would make a free slot
+        // unreachable and shrink the table for good. Finding a slot stays a
+        // scan of the bases, which is the authority. This runs once per
+        // executor stack, not per allocation -- it is the lookup that was
+        // costing the kernel 512 loads on every block, and only the lookup
+        // reads the summary.
+        //
+        // The bit is claimed BEFORE the base goes in, so a set bit is always a
+        // superset of a set base and `alloc_overlaps_live_stack` can never skip
+        // a slot holding a live stack.
+        stack_reg_occ_set(i);
         if slot
             .compare_exchange(0, alloc_base, AcqRel, Relaxed)
             .is_ok()
         {
             return;
         }
+        // Lost the slot to somebody else. If it is theirs, the bit is theirs
+        // and stays; a slot that is genuinely free gives the bit back, and a
+        // spurious one would only ever cost a reader one load of a zero it
+        // already skips.
+        if slot.load(Relaxed) == 0 {
+            stack_reg_occ_clear(i);
+        }
     }
     STACK_REG_BASE_OVERFLOW.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// Mark slot `i` as possibly occupied. See [`STACK_REG_OCC`].
+#[inline]
+fn stack_reg_occ_set(i: usize) {
+    STACK_REG_OCC[i / 64].fetch_or(1u64 << (i % 64), core::sync::atomic::Ordering::AcqRel);
+}
+
+/// Mark slot `i` as free. Only ever called once the base reads 0, so the
+/// summary stays a superset.
+#[inline]
+fn stack_reg_occ_clear(i: usize) {
+    STACK_REG_OCC[i / 64].fetch_and(!(1u64 << (i % 64)), core::sync::atomic::Ordering::Release);
 }
 
 /// [diag] Live stacks missing from the hand-out registry; non-zero means
@@ -266,7 +342,7 @@ pub fn untracked_alloc_stacks() -> usize {
 /// moves on, exactly as before.
 fn stack_reg_remove(alloc_base: usize) {
     use core::sync::atomic::Ordering::{AcqRel, Relaxed};
-    for slot in STACK_REG_BASE.iter() {
+    for (i, slot) in STACK_REG_BASE.iter().enumerate() {
         if slot.load(Relaxed) != alloc_base {
             continue;
         }
@@ -274,6 +350,10 @@ fn stack_reg_remove(alloc_base: usize) {
             .compare_exchange(alloc_base, 0, AcqRel, Relaxed)
             .is_ok()
         {
+            // Base zeroed first, bit dropped after: a reader in between visits
+            // the slot and loads the 0 it already skips. The other order would
+            // hide a live stack for that window.
+            stack_reg_occ_clear(i);
             return;
         }
     }
@@ -299,14 +379,23 @@ fn stack_reg_remove(alloc_base: usize) {
 pub fn alloc_overlaps_live_stack(ptr: usize, len: usize) -> Option<usize> {
     use core::sync::atomic::Ordering::Acquire;
     let a_end = ptr.saturating_add(len);
-    for slot in STACK_REG_BASE.iter() {
-        let base = slot.load(Acquire);
-        if base == 0 {
-            continue;
-        }
-        let b_end = base.saturating_add(ALLOC_SIZE);
-        if ptr < b_end && base < a_end {
-            return Some(base);
+    // Eight words instead of 512 slots, and then only the slots a set bit
+    // names. This runs inside the global allocator on every block it hands
+    // out, so the walk it used to do was charged to every allocation in the
+    // kernel; see `STACK_REG_OCC` for why a set bit can never be missing.
+    for (w, word) in STACK_REG_OCC.iter().enumerate() {
+        let mut bits = word.load(Acquire);
+        while bits != 0 {
+            let b = bits.trailing_zeros() as usize;
+            bits &= bits - 1;
+            let base = STACK_REG_BASE[w * 64 + b].load(Acquire);
+            if base == 0 {
+                continue;
+            }
+            let b_end = base.saturating_add(ALLOC_SIZE);
+            if ptr < b_end && base < a_end {
+                return Some(base);
+            }
         }
     }
     None
@@ -1311,8 +1400,20 @@ impl Executor {
                 // streak. If the machine then spins the idle loop many times with
                 // tasks still present but nothing polled, a wake was lost (see the
                 // else-branch dump below).
-                IDLE_STREAK.store(0, core::sync::atomic::Ordering::Relaxed);
-                SCHED_POLLED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                // Read before the write. `IDLE_STREAK` is only ever non-zero
+                // while the machine is making no progress at all, so on a busy
+                // machine this stored a 0 over a 0 on every poll from every
+                // CPU -- a write to a shared line, and therefore an
+                // invalidation on every other core, to change nothing.
+                if IDLE_STREAK.load(core::sync::atomic::Ordering::Relaxed) != 0 {
+                    IDLE_STREAK.store(0, core::sync::atomic::Ordering::Relaxed);
+                }
+                let cpu = crate::arch::cpu_id() as usize;
+                if cpu < lock::MAX_CORE_NUM {
+                    SCHED_POLLED[cpu]
+                        .0
+                        .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                }
                 // Publish who is running before entering the future: if the
                 // poll faults, the panic-containment path reads these to retire
                 // exactly this task (see `runtime::abandon_current_task`). Both
@@ -2293,6 +2394,9 @@ mod stack_registry_tests {
             for slot in STACK_REG_BASE.iter() {
                 slot.store(0, Ordering::SeqCst);
             }
+            for word in STACK_REG_OCC.iter() {
+                word.store(0, Ordering::SeqCst);
+            }
             STACK_REG_OVERFLOW.store(0, Ordering::SeqCst);
             STACK_REG_BASE_OVERFLOW.store(0, Ordering::SeqCst);
         }
@@ -2306,6 +2410,9 @@ mod stack_registry_tests {
         for slot in STACK_REG_BASE.iter() {
             slot.store(0, Ordering::SeqCst);
         }
+        for word in STACK_REG_OCC.iter() {
+            word.store(0, Ordering::SeqCst);
+        }
         STACK_REG_OVERFLOW.store(0, Ordering::SeqCst);
         STACK_REG_BASE_OVERFLOW.store(0, Ordering::SeqCst);
         Clean(g)
@@ -2314,6 +2421,144 @@ mod stack_registry_tests {
     /// A plausible stack allocation base: page-aligned and far from both ends
     /// of the address space, so a test that means to overflow has to say so.
     const BASE: usize = 0x1000_0000;
+
+    /// `polled` went from one shared word to one per CPU, so the reader has to
+    /// add them up: a sum that only read CPU 0 would report a fraction of the
+    /// polls and make `/proc/perf/kernel` quietly wrong.
+    #[test]
+    fn the_poll_count_is_the_sum_over_every_cpu() {
+        let _g = test_lock();
+        let saved: std::vec::Vec<u64> = SCHED_POLLED
+            .iter()
+            .map(|c| c.0.swap(0, Ordering::SeqCst))
+            .collect();
+        // Tres CPUs distintas, incluida la ultima de la tabla.
+        SCHED_POLLED[0].0.store(5, Ordering::SeqCst);
+        SCHED_POLLED[1].0.store(7, Ordering::SeqCst);
+        SCHED_POLLED[lock::MAX_CORE_NUM - 1]
+            .0
+            .store(11, Ordering::SeqCst);
+        let (polled, _) = sched_stats();
+        for (c, v) in SCHED_POLLED.iter().zip(saved) {
+            c.0.store(v, Ordering::SeqCst);
+        }
+        assert_eq!(
+            polled, 23,
+            "el conteo de polls no suma todas las CPUs: /proc miente"
+        );
+    }
+
+    /// `STACK_REG_OCC` is what the per-allocation lookup walks instead of all
+    /// 512 slots, so these cover its one invariant: a set bit is a SUPERSET of
+    /// a set base. A subset would make the tripwire silently miss a live stack.
+    mod occupancy {
+        use super::*;
+
+        fn bit_of(i: usize) -> bool {
+            STACK_REG_OCC[i / 64].load(Ordering::SeqCst) & (1u64 << (i % 64)) != 0
+        }
+
+        fn slot_of(base: usize) -> Option<usize> {
+            STACK_REG_BASE
+                .iter()
+                .position(|s| s.load(Ordering::SeqCst) == base)
+        }
+
+        #[test]
+        fn publishing_a_stack_sets_its_slots_bit_and_retracting_clears_it() {
+            let _c = clean();
+            stack_reg_insert(BASE);
+            let i = slot_of(BASE).expect("la base no entro en la tabla");
+            assert!(
+                bit_of(i),
+                "la base esta puesta y su bit no: el lookup la salta"
+            );
+            stack_reg_remove(BASE);
+            assert!(!bit_of(i), "el bit sobrevivio a su base");
+        }
+
+        /// The safe direction: a bit with no base behind it costs one load of a
+        /// zero, and must never be reported as an overlap.
+        #[test]
+        fn a_bit_with_no_base_behind_it_is_not_an_overlap() {
+            let _c = clean();
+            stack_reg_occ_set(7);
+            assert_eq!(
+                alloc_overlaps_live_stack(BASE, ALLOC_SIZE),
+                None,
+                "un bit sin base detras se conto como solape"
+            );
+            // Y el caso que de verdad muerde: una direccion BAJA. Sin saltar la
+            // base cero, el slot vacio se lee como el rango [0, ALLOC_SIZE) y
+            // cualquier bloque de ahi abajo sale como solape -- un `panic!`
+            // dentro del allocator global por un bit de mas.
+            assert_eq!(
+                alloc_overlaps_live_stack(0x1000, 0x1000),
+                None,
+                "un slot vacio se leyo como el rango [0, ALLOC_SIZE)"
+            );
+        }
+
+        /// The summary must not become the table's capacity: a bit left set
+        /// over a free slot would make that slot unreachable for good, and the
+        /// table would silently shrink one stack at a time.
+        #[test]
+        fn a_stale_bit_does_not_cost_the_table_a_slot() {
+            let _c = clean();
+            // Todos los bits puestos, ninguna base: la tabla esta vacia.
+            for word in STACK_REG_OCC.iter() {
+                word.store(u64::MAX, Ordering::SeqCst);
+            }
+            let before = untracked_alloc_stacks();
+            stack_reg_insert(BASE);
+            assert_eq!(
+                untracked_alloc_stacks(),
+                before,
+                "con los bits sucios la tabla se declaro llena estando vacia"
+            );
+            assert_eq!(
+                alloc_overlaps_live_stack(BASE, ALLOC_SIZE),
+                Some(BASE),
+                "y la base que si entro no se encuentra"
+            );
+        }
+
+        /// Every slot the table has stays usable and findable, so the summary
+        /// covers the last word as well as the first.
+        #[test]
+        fn the_whole_table_is_still_reachable_through_the_summary() {
+            let _c = clean();
+            for i in 0..STACK_REG_SLOTS {
+                stack_reg_insert(BASE + i * ALLOC_SIZE);
+            }
+            assert_eq!(
+                untracked_alloc_stacks(),
+                0,
+                "la tabla no acepto sus propias 512 entradas"
+            );
+            // La primera, una del medio y la ultima.
+            for i in [0, STACK_REG_SLOTS / 2, STACK_REG_SLOTS - 1] {
+                let base = BASE + i * ALLOC_SIZE;
+                assert_eq!(
+                    alloc_overlaps_live_stack(base, 1),
+                    Some(base),
+                    "la entrada {} no se encuentra por el resumen",
+                    i
+                );
+            }
+            for i in 0..STACK_REG_SLOTS {
+                stack_reg_remove(BASE + i * ALLOC_SIZE);
+            }
+            assert_eq!(
+                STACK_REG_OCC
+                    .iter()
+                    .map(|w| w.load(Ordering::SeqCst))
+                    .fold(0u64, |a, b| a | b),
+                0,
+                "al vaciar la tabla quedaron bits puestos"
+            );
+        }
+    }
 
     use super::{publish_live_stack as publish, retract_live_stack as retract};
 
