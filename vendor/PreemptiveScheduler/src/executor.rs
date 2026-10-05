@@ -1494,6 +1494,14 @@ impl Executor {
                     let intr_was_on = crate::arch::intr_get();
                     crate::arch::intr_off();
                     crate::runtime::set_cpu_sleeping(cpu, true);
+                    // Stop advertising this CPU to thieves: its queue is empty
+                    // and its steal scan found nothing, so every peer that
+                    // probes it from here pays two compare-exchanges on lines
+                    // this CPU owns, for nothing. Only the owner clears the bit,
+                    // and this is the only place it does -- see
+                    // `runtime::STEALABLE`. BEFORE the recheck below, so a wake
+                    // that races either sets the bit again or is seen there.
+                    crate::runtime::note_not_stealable(cpu);
                     if !self.task_collection.has_ready() {
                         crate::arch::wait_for_interrupt();
                     }
