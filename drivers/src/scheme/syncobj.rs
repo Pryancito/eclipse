@@ -39,7 +39,7 @@
 //! `SYNCOBJ_WAIT`/`TIMELINE_WAIT` the same way it does for `WAIT_VBLANK`.
 
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use lock::Mutex;
 
 struct Syncobj {
@@ -434,6 +434,35 @@ lazy_static::lazy_static! {
 /// Number of pending hardware fences, mirrored outside the lock so the
 /// eventfd poller (and [`poll_pending`]'s fast exit) can check it for free.
 static PENDING_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+/// Whether any object in the table carries a chain link right now.
+///
+/// [`resolve_links_locked`] is the one half of a resolve with no cheap exit of
+/// its own: it asks every object whether its lowest link is ready, so a resolve
+/// walks the whole object list even when the table holds no links at all. That
+/// walk is free with the handful of syncobjs `glxgears` keeps alive and is not
+/// free for a real Vulkan client, which holds hundreds and runs a resolve per
+/// signal of an `EXEC` that may carry 256 of them: the same O(objects) walk,
+/// hundreds of times, inside one ioctl, under the lock the signalling side
+/// needs. Nothing in Mesa's ordinary path creates a link -- they come from
+/// `SYNCOBJ_TRANSFER` and sync_file import -- so the common table has none.
+///
+/// Deliberately STICKY, and that is what makes it safe: every site that adds a
+/// link sets it, and only [`resolve_links_locked`] clears it, after a full walk
+/// has confirmed no object holds one. So it can be true with no links left --
+/// which costs exactly the walk this kernel already did -- and it can never be
+/// false while a link exists, which is the only way it could change an answer.
+/// An object dropped by `collect_orphans` while still holding links therefore
+/// needs no bookkeeping here.
+static ANY_LINKS: AtomicBool = AtomicBool::new(false);
+
+/// Times [`resolve_links_locked`] got PAST [`ANY_LINKS`] and walked the object
+/// list. The seam sits below what the tests check -- the walk still happens,
+/// it is only counted -- so a test can tell "the fast path held" from "the
+/// answer happened to be the same", which is the half of this that a wrong
+/// answer would not show.
+#[cfg(test)]
+static LINK_WALKS: AtomicUsize = AtomicUsize::new(0);
 
 /// A pending fence older than this is a hung ring. Same bound the driver's
 /// old synchronous poll used, so the behaviour on a GPU hang is unchanged:
@@ -899,6 +928,31 @@ fn resolve_hw_locked(
 /// Runs to a fixed point so a chain (an import of a transfer of an import)
 /// collapses in one call, and collects the orphans it stops naming.
 fn resolve_links_locked(table: &mut SyncobjTable, out: &mut Deferred) -> bool {
+    // No link anywhere in the table: there is nothing for the walk below to
+    // find, and saying so costs one relaxed load instead of one pass over
+    // every object. See [`ANY_LINKS`] for why a stale `true` is harmless.
+    if !ANY_LINKS.load(Ordering::Relaxed) {
+        // The whole safety of the fast path is one direction of the invariant:
+        // a link may exist with the flag stale-true (which only costs the walk
+        // this kernel already did), but never with it false. Asserting it here
+        // makes every test in the tree that creates a link and then resolves a
+        // check of it, which is the only way a future link-creating path that
+        // forgets the store gets caught -- the four that exist today were
+        // found by hand.
+        //
+        // `cfg(test)` and NOT `debug_assert!`: this runs holding `TABLE`, and a
+        // panic inside a critical section of this kernel turns into a deadlock
+        // rather than a message, so it must not exist in any build that boots.
+        // The host suite is where the invariant is checked.
+        #[cfg(test)]
+        assert!(
+            !table.objects.iter().any(|o| !o.links.is_empty()),
+            "ANY_LINKS is false while the table still holds a link"
+        );
+        return false;
+    }
+    #[cfg(test)]
+    LINK_WALKS.fetch_add(1, Ordering::Relaxed);
     let mut any = false;
     // The lowest link of an object is the only one that can resolve: a
     // higher one waits for it however ready its own sources are.
@@ -929,6 +983,11 @@ fn resolve_links_locked(table: &mut SyncobjTable, out: &mut Deferred) -> bool {
     }
     if any {
         collect_orphans(table);
+    }
+    // The walk has just looked at every object, so this is the one place that
+    // can retire the flag without paying for a pass of its own.
+    if !table.objects.iter().any(|o| !o.links.is_empty()) {
+        ANY_LINKS.store(false, Ordering::Relaxed);
     }
     any
 }
@@ -1355,9 +1414,25 @@ pub fn usable_by(pid: u64, handle: u32) -> bool {
 /// array lookup Linux does first (`drm_syncobj_array_find`), so an ioctl
 /// over `[good, bad]` touches neither.
 pub fn all_usable_by(pid: u64, handles: &[u32]) -> bool {
+    first_unusable_by(pid, handles.iter().copied()).is_none()
+}
+
+/// [`all_usable_by`], but naming the handle that failed, in ONE take of the
+/// lock.
+///
+/// The driver's submit paths want both halves: the whole-list check Linux does
+/// before a job is armed, and the offending handle for the line it logs. Doing
+/// that with a `find` over per-handle [`usable_by`] -- which is what `EXEC` and
+/// `VM_BIND` did -- takes the global table lock once per handle and scans the
+/// object list once per handle. An `EXEC` may carry 256 waits and 256 signals
+/// (`NVKMD_NOUVEAU_MAX_SYNCS`), and `VM_BIND` coalesces up to 4096 ops with
+/// syncs of its own, so a real Vulkan client paid 512 round-trips through the
+/// lock the signalling side is waiting for, per submit, before anything was
+/// submitted at all. `glxgears` carries one or two and never showed it.
+pub fn first_unusable_by(pid: u64, handles: impl IntoIterator<Item = u32>) -> Option<u32> {
     let table = TABLE.lock();
-    handles.iter().all(|&h| {
-        table.objects.iter().any(|o| {
+    handles.into_iter().find(|&h| {
+        !table.objects.iter().any(|o| {
             o.handle == h
                 && o.refs > 0
                 && (pid == 0 || o.holders.is_empty() || o.holders.contains(&pid))
@@ -1586,6 +1661,7 @@ pub fn import_snapshot(dst: u32, src: u32, target: u64) -> bool {
                 deps: alloc::vec![(src, target)],
                 dst_point: 1,
             });
+            ANY_LINKS.store(true, Ordering::Relaxed);
             None
         };
         if had_link {
@@ -1700,6 +1776,7 @@ pub fn transfer(dst: u32, dst_point: u64, src: u32, src_point: u64) -> bool {
                     deps: Vec::new(),
                     dst_point: point,
                 });
+                ANY_LINKS.store(true, Ordering::Relaxed);
                 if tainted {
                     mark_errored(&mut table, dst, before, point);
                 }
@@ -1739,6 +1816,7 @@ pub fn transfer(dst: u32, dst_point: u64, src: u32, src_point: u64) -> bool {
                 deps: alloc::vec![(src, need)],
                 dst_point: point,
             });
+            ANY_LINKS.store(true, Ordering::Relaxed);
             None
         };
         if had_link {
@@ -1790,6 +1868,7 @@ pub fn merge_fences(fences: &[(u32, u64)]) -> u32 {
             links: if deps.is_empty() {
                 Vec::new()
             } else {
+                ANY_LINKS.store(true, Ordering::Relaxed);
                 alloc::vec![Link { deps, dst_point: 1 }]
             },
         });
@@ -4911,5 +4990,134 @@ mod tests {
         assert!(!exists(k2));
         assert!(destroy(kernel));
         assert_eq!(live(), before, "nothing of this test is left in the table");
+    }
+
+    /// A resolve over a table with no chain link must not walk the object
+    /// list, and the walk it skips is the one a real Vulkan client pays
+    /// hundreds of times per submit.
+    ///
+    /// Nothing in Mesa's ordinary path makes a link: they come from
+    /// `SYNCOBJ_TRANSFER` and sync_file import. So the table a client
+    /// actually signals against has none, and every `attach_hw_fence` of an
+    /// `EXEC` carrying 256 signals used to ask all of its objects whether
+    /// their lowest link was ready.
+    #[test]
+    fn a_table_with_no_links_is_resolved_without_walking_its_objects() {
+        let _g = test_lock();
+        // Retire any link an earlier test left behind: the flag is sticky, so
+        // one full walk is what clears it.
+        poll_pending();
+        let handles: Vec<u32> = (0..8).map(|_| create(false)).collect();
+        let before = LINK_WALKS.load(Ordering::Relaxed);
+        for _ in 0..16 {
+            let mut t = TABLE.lock();
+            let d = resolve_locked(&mut t);
+            drop(t);
+            d.run();
+        }
+        assert_eq!(
+            LINK_WALKS.load(Ordering::Relaxed),
+            before,
+            "a link-free table should be resolved without a pass over its objects"
+        );
+        for h in handles {
+            assert!(destroy(h));
+        }
+    }
+
+    /// ...and the moment a link DOES exist the walk comes back, so the fast
+    /// path cannot be hiding a link from the fixed point. A link created by
+    /// any of the four paths that make one has to set the flag; this covers
+    /// `transfer`, which is the one wlroots' `linux-drm-syncobj-v1` drives.
+    #[test]
+    fn a_link_brings_the_walk_back_and_still_resolves() {
+        let _g = test_lock();
+        poll_pending();
+        let (src, dst) = (create(false), create(false));
+        // `src` has not reached 5, so the transfer is recorded as a link that
+        // waits for it rather than a point already delivered.
+        assert!(transfer(dst, 7, src, 5));
+        let before = LINK_WALKS.load(Ordering::Relaxed);
+        {
+            let mut t = TABLE.lock();
+            let d = resolve_locked(&mut t);
+            drop(t);
+            d.run();
+        }
+        assert!(
+            LINK_WALKS.load(Ordering::Relaxed) > before,
+            "a table that holds a link must be walked"
+        );
+        assert_eq!(query(dst), Some(0), "the link has not been satisfied yet");
+        // Satisfy it the ordinary way and the link must still resolve.
+        assert!(timeline_signal(src, 5));
+        assert_eq!(
+            query(dst),
+            Some(7),
+            "the transfer should have landed dst at the point it asked for"
+        );
+        assert!(destroy(src));
+        assert!(destroy(dst));
+    }
+
+    /// A merge is the other path that creates a link, and it is the one on
+    /// Mesa's swapchain acquire (`merge_fences`): the acquire semaphore is the
+    /// compositor's release AND the previous present, merged. Its link has to
+    /// resolve too, so the flag has to be set where the merged object is
+    /// pushed -- a missed store there would leave a window waiting forever on
+    /// an acquire whose sources have both signaled.
+    #[test]
+    fn a_merge_created_before_its_sources_signal_still_resolves() {
+        let _g = test_lock();
+        poll_pending();
+        let (a, b) = (create(false), create(false));
+        let m = merge_fences(&[(a, 1), (b, 1)]);
+        assert_eq!(query(m), Some(0), "nothing has signaled yet");
+        assert!(signal(a));
+        assert_eq!(query(m), Some(0), "one source is still in flight");
+        assert!(signal(b));
+        assert_eq!(
+            query(m),
+            Some(1),
+            "the merge should be signaled once every source is"
+        );
+        assert!(destroy(a));
+        assert!(destroy(b));
+        assert!(destroy(m));
+    }
+
+    /// The batched check answers exactly what the per-handle one did, and
+    /// names the SAME handle -- the first bad one in the order given -- so the
+    /// line `EXEC`/`VM_BIND` logs is unchanged.
+    #[test]
+    fn the_batched_handle_check_names_the_first_bad_handle() {
+        let _g = test_lock();
+        let mine = create_for(4242, false);
+        let theirs = create_for(4343, false);
+        let good = [mine];
+        assert_eq!(first_unusable_by(4242, good.iter().copied()), None);
+        assert!(all_usable_by(4242, &good));
+        // Another process's handle, and one that never existed: whichever
+        // comes first is the one named.
+        assert_eq!(
+            first_unusable_by(4242, [mine, theirs, 0].iter().copied()),
+            Some(theirs)
+        );
+        assert_eq!(
+            first_unusable_by(4242, [mine, 0, theirs].iter().copied()),
+            Some(0)
+        );
+        assert!(!all_usable_by(4242, &[mine, theirs]));
+        // Agreement with the per-handle predicate it replaced, handle by
+        // handle, which is the property the submit paths rely on.
+        for h in [mine, theirs, 0, u32::MAX] {
+            assert_eq!(
+                usable_by(4242, h),
+                first_unusable_by(4242, [h].iter().copied()).is_none(),
+                "handle {h} disagrees between the batched and per-handle check"
+            );
+        }
+        assert!(destroy_for(4242, mine));
+        assert!(destroy_for(4343, theirs));
     }
 }
