@@ -228,15 +228,99 @@ static STEAL_OK: AtomicU64 = AtomicU64::new(0);
 static STEAL_AFFINITY_EMPTY: AtomicU64 = AtomicU64::new(0);
 
 static STEAL_REBALANCE: AtomicU64 = AtomicU64::new(0);
+/// Scans that answered "nothing anywhere" from [`STEALABLE`] alone, taking no
+/// lock at all. The win this hint exists for, as a number.
+static STEAL_SKIPPED: AtomicU64 = AtomicU64::new(0);
 
-/// `(steal scans, victims probed, steals ok, affinity-empty victims skipped, rebalance pulls)`.
-pub fn sched_steal_stats() -> (u64, u64, u64, u64, u64) {
+/// CPUs that may have a runnable task a thief could take: Linux's `overload`
+/// hint (`rq->rd->overload` plus `nohz.idle_cpus_mask`), which is what keeps
+/// idle balancing from costing more than it saves.
+///
+/// Why this is the hot path it is. An idle CPU leaves `hlt` on **every**
+/// interrupt, falls straight back into the loop and runs the whole steal scan
+/// before deciding there is nothing to do. The scan takes, per peer and per
+/// pass, that peer's runtime `try_lock` and then its collection `try_lock`
+/// inside `ready_num_for` -- two compare-exchanges on two cache lines the peer
+/// uses in its own hot path. **A `try_lock` that fails is still an RMW**, so it
+/// invalidates those lines on the owning core either way; the same lens retired
+/// the blind CAS in the four stack registries. The rate is the interrupt rate
+/// times the number of peers, and with several programs awake the interrupt
+/// rate is thousands per second per core, so this is cache-line ping-pong
+/// between cores that does no work at all -- heat, not throughput.
+///
+/// So: one word, read with a plain load. Bit `i` means "CPU `i` might have
+/// something runnable". A thief whose peers are all clear returns without
+/// touching a single lock.
+///
+/// The asymmetry is what makes it safe. The bit is **set generously** by every
+/// path that makes a task runnable on a CPU (it already has the owner's id in
+/// hand), and **cleared only by the owning CPU itself**, at the one point that
+/// has just established its own queue is empty: the pre-halt recheck. So a
+/// false *positive* costs one scan that finds nothing -- exactly what happens
+/// today -- and a false *negative* needs the owner to clear while a wake is
+/// landing, which the halt protocol already covers: either the owner's recheck
+/// sees the ready bit and runs the task itself, or it halts and the waker's
+/// reschedule IPI brings it back. Nothing is stolen in that window; nothing is
+/// lost either.
+static STEALABLE: AtomicU64 = AtomicU64::new(0);
+
+/// A task just became runnable on `cpu`: mark it worth probing.
+///
+/// Read before the RMW. On a busy CPU the bit is already set, so the steady
+/// state is a plain load on a line nobody else writes -- this sits on every
+/// wake, and a blind `fetch_or` would have made every wake in the system an
+/// RMW on one shared word, which is the very traffic this is here to remove.
+#[inline]
+pub(crate) fn note_stealable(cpu: usize) {
+    if cpu >= MAX_CORE_NUM {
+        return;
+    }
+    let bit = 1u64 << cpu;
+    if STEALABLE.load(Ordering::Relaxed) & bit == 0 {
+        STEALABLE.fetch_or(bit, Ordering::Release);
+    }
+}
+
+/// `cpu` has just found its own queue empty and is about to halt.
+///
+/// Only the owner calls this, and only there. Ordered **before** the caller's
+/// pre-halt `has_ready` recheck, so a wake that races either lands after this
+/// clear and sets the bit again, or is seen by that recheck.
+#[inline]
+pub(crate) fn note_not_stealable(cpu: usize) {
+    if cpu >= MAX_CORE_NUM {
+        return;
+    }
+    let bit = 1u64 << cpu;
+    if STEALABLE.load(Ordering::Relaxed) & bit != 0 {
+        STEALABLE.fetch_and(!bit, Ordering::AcqRel);
+    }
+}
+
+/// The peers a thief on `current` should consider: marked stealable, in their
+/// executor loop, and not the thief itself.
+///
+/// A pure function so the gating can be tested without a second CPU, which is
+/// the only way to test it here at all.
+pub(crate) fn stealable_peers(stealable: u64, current: usize, ready: u64) -> u64 {
+    let mine = if current < MAX_CORE_NUM {
+        1u64 << current
+    } else {
+        0
+    };
+    stealable & ready & !mine
+}
+
+/// `(steal scans, victims probed, steals ok, affinity-empty victims skipped,
+/// rebalance pulls, scans skipped by the `STEALABLE` hint)`.
+pub fn sched_steal_stats() -> (u64, u64, u64, u64, u64, u64) {
     (
         STEAL_SCANS.load(Ordering::Relaxed),
         STEAL_PROBED.load(Ordering::Relaxed),
         STEAL_OK.load(Ordering::Relaxed),
         STEAL_AFFINITY_EMPTY.load(Ordering::Relaxed),
         STEAL_REBALANCE.load(Ordering::Relaxed),
+        STEAL_SKIPPED.load(Ordering::Relaxed),
     )
 }
 
@@ -338,6 +422,9 @@ fn send_resched_ipi(owner: usize) {
 #[inline]
 pub(crate) fn maybe_send_resched_ipi(owner: u8) {
     let owner = owner as usize;
+    // A task just became runnable on `owner`, whether or not it is halted:
+    // mark it worth probing (see [`STEALABLE`]).
+    note_stealable(owner);
     if owner >= MAX_CORE_NUM || SLEEPING_CPUS.load(Ordering::SeqCst) & (1 << owner) == 0 {
         return;
     }
@@ -369,6 +456,8 @@ pub(crate) fn request_resched(owner: u8) {
         return;
     }
     let bit = 1u64 << owner;
+    // Same as the plain kick: something is runnable on this CPU now.
+    note_stealable(owner);
     if !WAKEUP_PREEMPT.load(Ordering::Relaxed) {
         // Disabled: fall back to the pre-change behaviour — kick a CPU that is
         // halted so it leaves `hlt`, and leave a busy one to finish its slice.
@@ -1057,11 +1146,25 @@ fn steal_task_inner(min_count: usize, rebalance: bool) -> Option<(Key, Arc<Task>
     // this element concurrently.
     let candidates: &mut [(usize, usize); MAX_CORE_NUM] =
         unsafe { &mut *STEAL_CANDIDATES[current_cpu].0.get() };
+    // The whole scan, gated on one plain load. Every peer is either empty or
+    // not in its executor loop, so there is nothing to probe and no reason to
+    // compare-exchange anybody's locks to find that out. See [`STEALABLE`]:
+    // this is the pass an idle CPU used to pay for on every single interrupt.
+    let peers = stealable_peers(
+        STEALABLE.load(Ordering::Acquire),
+        current_cpu,
+        executor_ready_mask(),
+    );
+    if peers == 0 {
+        STEAL_SKIPPED.fetch_add(1, Ordering::Relaxed);
+        return None;
+    }
     let mut n = 0;
     STEAL_SCANS.fetch_add(1, Ordering::Relaxed);
     for i in 0..num_online_cpus() {
-        if i == current_cpu || !is_executor_ready(i) {
-            // Never steal from ourselves; skip CPUs that never entered the executor.
+        // `peers` already excludes this CPU and everyone not in their executor
+        // loop; the bit test is what replaces two `try_lock`s per empty peer.
+        if peers & (1u64 << i) == 0 {
             continue;
         }
         // Non-forcing: a hole (a CPU id that never came up) has no runtime
@@ -2746,6 +2849,159 @@ mod affinity_tests {
 /// These share the module's globals, so they take a lock and install a
 /// recording IPI sender. CI runs the suite with `--test-threads=1` and would
 /// therefore never notice if they did not.
+/// The `STEALABLE` overload hint: what the gate lets through, and the
+/// asymmetry (set by anybody, cleared only by the owner) that makes it safe.
+#[cfg(test)]
+mod stealable_tests {
+    use super::*;
+
+    fn with_stealable<T>(bits: u64, f: impl FnOnce() -> T) -> T {
+        let saved = STEALABLE.load(Ordering::SeqCst);
+        STEALABLE.store(bits, Ordering::SeqCst);
+        let out = f();
+        STEALABLE.store(saved, Ordering::SeqCst);
+        out
+    }
+
+    #[test]
+    fn a_thief_never_considers_itself() {
+        // CPU 2 marked stealable, and CPU 2 is the one asking.
+        assert_eq!(
+            stealable_peers(0b100, 2, u64::MAX),
+            0,
+            "un ladron se roba a si mismo"
+        );
+    }
+
+    #[test]
+    fn only_a_cpu_in_its_executor_loop_is_a_candidate() {
+        // CPUs 1 and 3 say they have work; only 1 has entered its executor.
+        assert_eq!(
+            stealable_peers(0b1010, 0, 0b0010),
+            0b0010,
+            "el barrido iria a por una CPU que no esta en su bucle"
+        );
+    }
+
+    #[test]
+    fn nothing_marked_means_no_peer_to_probe() {
+        assert_eq!(
+            stealable_peers(0, 0, u64::MAX),
+            0,
+            "con la pista vacia el barrido tendria que saltarse entero"
+        );
+    }
+
+    /// The gate is what skips the scan, so this is the whole point: with no
+    /// peer marked, the scan must take **no lock at all** and say so.
+    #[test]
+    fn a_scan_with_no_peer_marked_takes_no_lock_and_is_counted() {
+        let _g = super::resched_test_lock();
+        let before_skipped = STEAL_SKIPPED.load(Ordering::SeqCst);
+        let before_scans = STEAL_SCANS.load(Ordering::SeqCst);
+        let out = with_stealable(0, || steal_task_inner(1, false));
+        assert!(out.is_none(), "no habia nada y aun asi robo algo");
+        assert_eq!(
+            STEAL_SKIPPED.load(Ordering::SeqCst),
+            before_skipped + 1,
+            "el barrido saltado no se conto"
+        );
+        assert_eq!(
+            STEAL_SCANS.load(Ordering::SeqCst),
+            before_scans,
+            "se conto un barrido que no llego a mirar a nadie"
+        );
+    }
+
+    /// The other half of the gate, and the one whose absence would strand work:
+    /// a peer that **is** marked has to reach the scan. Without this, "skip
+    /// always" passes every test in the crate while no task is ever stolen.
+    #[test]
+    fn a_peer_that_is_marked_reaches_the_scan() {
+        let _g = super::resched_test_lock();
+        // CPU 1 says it has work and is in its executor loop; we ask from CPU 0
+        // (`cpu_id()` is 0 under test).
+        let saved_ready = set_executor_ready_mask_for_test(0b11);
+        let before_skipped = STEAL_SKIPPED.load(Ordering::SeqCst);
+        let before_scans = STEAL_SCANS.load(Ordering::SeqCst);
+        with_stealable(0b10, || {
+            let _ = steal_task_inner(1, false);
+        });
+        set_executor_ready_mask_for_test(saved_ready);
+        assert_eq!(
+            STEAL_SCANS.load(Ordering::SeqCst),
+            before_scans + 1,
+            "una CPU marcada no llego al barrido: el trabajo se queda sin robar"
+        );
+        assert_eq!(
+            STEAL_SKIPPED.load(Ordering::SeqCst),
+            before_skipped,
+            "se salto un barrido que tenia a quien mirar"
+        );
+    }
+
+    #[test]
+    fn a_wake_marks_its_owner_and_the_owner_is_the_only_one_who_clears_it() {
+        let _g = super::resched_test_lock();
+        with_stealable(0, || {
+            note_stealable(3);
+            assert_eq!(
+                STEALABLE.load(Ordering::SeqCst) & (1 << 3),
+                1 << 3,
+                "un despertar no marco a su dueño"
+            );
+            // Idempotente: el camino rapido es una lectura, no un RMW.
+            note_stealable(3);
+            assert_eq!(STEALABLE.load(Ordering::SeqCst), 1 << 3);
+            note_not_stealable(3);
+            assert_eq!(
+                STEALABLE.load(Ordering::SeqCst) & (1 << 3),
+                0,
+                "el dueño no pudo borrar su marca"
+            );
+            // Y borrar dos veces tampoco molesta.
+            note_not_stealable(3);
+            assert_eq!(STEALABLE.load(Ordering::SeqCst), 0);
+        });
+    }
+
+    /// A clear must touch nobody else's bit: two CPUs halting in turn used to
+    /// be where a whole-word store would have lost the other's work.
+    #[test]
+    fn clearing_one_cpu_leaves_every_other_mark_alone() {
+        let _g = super::resched_test_lock();
+        with_stealable(0, || {
+            note_stealable(1);
+            note_stealable(5);
+            note_not_stealable(1);
+            assert_eq!(
+                STEALABLE.load(Ordering::SeqCst),
+                1 << 5,
+                "al borrar una CPU se perdio la marca de otra"
+            );
+        });
+    }
+
+    /// A cpu id the mask cannot name is dropped rather than shifting out of
+    /// range, which in release would have marked CPU `id % 64`.
+    #[test]
+    fn a_cpu_id_the_mask_cannot_name_is_ignored() {
+        let _g = super::resched_test_lock();
+        with_stealable(0, || {
+            note_stealable(MAX_CORE_NUM);
+            note_stealable(usize::MAX);
+            note_not_stealable(MAX_CORE_NUM);
+            note_not_stealable(usize::MAX);
+            assert_eq!(
+                STEALABLE.load(Ordering::SeqCst),
+                0,
+                "una id fuera de rango marco a alguien"
+            );
+            assert_eq!(stealable_peers(u64::MAX, usize::MAX, u64::MAX), u64::MAX);
+        });
+    }
+}
+
 #[cfg(test)]
 mod resched_tests {
     use super::*;
