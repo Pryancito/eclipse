@@ -863,6 +863,20 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
     /// `-u` never existed), so the service died in ~10 ms and init respawned
     /// it every 8 s forever, spamming the console. The `_ntp` account it
     /// requires is created by `ensure_pulse_accounts`.
+    ///
+    /// Not a single pipeline here ends in a reader that stops early. This
+    /// script was the source of the two `SIGPIPE` deaths every boot logged
+    /// (`[exit] pid=... (ip) killed by signal SIGPIPE` at ~2.7 s and
+    /// `... (busybox)` at ~4.1 s): the route probe was
+    /// `ip route | grep -q '^default'` and the applet probe was
+    /// `busybox --list | grep -qx ntpd`. `grep -q` exits the instant it
+    /// matches, so the writer's NEXT `write(2)` — musl buffers stdout in
+    /// 1 KiB chunks, and `busybox --list` is ~2.5 KiB of applet names —
+    /// lands on a pipe with no reader and gets `EPIPE` + `SIGPIPE`. The
+    /// checks still worked (the pipeline's status is `grep`'s), but each one
+    /// cost an `error!` line in the dmesg ring, which is where a real crash
+    /// is supposed to stand out. Reading from a file instead means the
+    /// writer always reaches EOF.
     fn write_ntp(rootfs: &Path) {
         let etc = rootfs.join("etc");
         let _ = fs::create_dir_all(&etc);
@@ -878,16 +892,20 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
             localbin.join("eclipse-ntpd"),
             b"#!/bin/sh\n\
               # Eclipse OS: wait for a default route, then NTP in foreground.\n\
+              # Every probe reads from a file: `cmd | grep -q` kills `cmd`\n\
+              # with SIGPIPE, and the kernel logs that death as an error.\n\
               LOG=/tmp/ntpd.log\n\
               exec >>\"$LOG\" 2>&1\n\
               i=0\n\
               while [ \"$i\" -lt 45 ]; do\n\
-              \x20 if ip -4 route show default 2>/dev/null | grep -q .; then break; fi\n\
-              \x20 if ip route 2>/dev/null | grep -q '^default'; then break; fi\n\
+              \x20 if [ -n \"$(ip -4 route show default 2>/dev/null)\" ]; then break; fi\n\
+              \x20 if ip route >/tmp/ntpd-routes 2>/dev/null \\\n\
+              \x20\x20\x20 && grep -q \x27^default\x27 /tmp/ntpd-routes; then break; fi\n\
               \x20 sleep 2\n\
               \x20 i=$((i+1))\n\
               done\n\
-              if /bin/busybox --list 2>/dev/null | grep -qx ntpd; then\n\
+              if /bin/busybox --list 2>/dev/null >/tmp/ntpd-applets \\\n\
+              \x20\x20 && grep -qx ntpd /tmp/ntpd-applets; then\n\
               \x20 echo \"[eclipse-ntpd] busybox ntpd\"\n\
               \x20 exec /bin/busybox ntpd -n -N -p pool.ntp.org\n\
               fi\n\
@@ -2557,8 +2575,8 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
               # that failure is invisible --- the daemon's stderr goes to the\n\
               # service log --- and init just respawns it for ever, which is\n\
               # the loop this check exists to name out loud.\n\
-              WANT=$(sed -n \x27s|.*<user>\\([^<]*\\)</user>.*|\\1|p\x27 \\\n\
-              \x20 /usr/share/dbus-1/system.conf 2>/dev/null | head -n 1)\n\
+              WANT=$(awk -F\x27[<>]\x27 \x27{for(i=1;i<NF;i++) if($i==\"user\"){print $(i+1); exit}}\x27 \\\n\
+              \x20 /usr/share/dbus-1/system.conf 2>/dev/null)\n\
               USE_DAEMON=yes\n\
               if [ -n \"$WANT\" ] && ! grep -q \"^$WANT:\" /etc/passwd 2>/dev/null; then\n\
               \x20 # Create it here rather than only complaining. The image\n\
@@ -4395,6 +4413,48 @@ mod rootfs_plumbing_tests {
             );
         }
         let _ = fs::remove_dir_all(etc.parent().unwrap());
+    }
+
+    /// Two processes died of `SIGPIPE` on every boot — `ip` at ~2.7 s and
+    /// `busybox` at ~4.1 s — and both came out of this one script: a probe
+    /// written `writer | grep -q PATTERN` kills the writer the moment `grep`
+    /// matches, and the kernel records every default-disposition death in the
+    /// dmesg ring at `error!`. Each probe now reads a file, so the writer
+    /// reaches EOF and exits 0.
+    ///
+    /// The assertion is on the shape, not on the two commands: any new
+    /// `| grep -q` in here brings the error lines straight back.
+    #[test]
+    fn the_ntpd_probes_never_pipe_into_a_reader_that_exits_early() {
+        let dir = scratch("ntpd");
+        fs::create_dir_all(&dir).unwrap();
+        LinuxRootfs::write_ntp(&dir);
+        let script = fs::read_to_string(dir.join("usr/local/bin/eclipse-ntpd")).unwrap();
+
+        for line in script.lines() {
+            // A comment may quote the old form; only real commands matter.
+            if line.trim_start().starts_with('#') {
+                continue;
+            }
+            assert!(
+                !line.contains('|') || !line.contains("grep -q"),
+                "`{}` pipes into `grep -q`: the writer gets SIGPIPE as soon as \
+                 grep matches, which the kernel logs as a process killed by a \
+                 signal. Redirect to a file and grep the file.",
+                line.trim()
+            );
+        }
+        // And the two probes really are still there, so the test above is not
+        // passing because the script lost them.
+        assert!(
+            script.contains("grep -qx ntpd /tmp/ntpd-applets"),
+            "the busybox-applet probe is gone from eclipse-ntpd:\n{script}"
+        );
+        assert!(
+            script.contains("grep -q '^default' /tmp/ntpd-routes"),
+            "the default-route probe is gone from eclipse-ntpd:\n{script}"
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 
     /// Every applet link has to be RELATIVE and name `busybox`: the rootfs is
