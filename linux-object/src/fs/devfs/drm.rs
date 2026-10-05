@@ -9,7 +9,7 @@ use alloc::sync::{Arc, Weak};
 use alloc::vec;
 use alloc::vec::Vec;
 use core::convert::TryFrom;
-use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use core::time::Duration;
 use lock::Mutex;
 
@@ -1548,17 +1548,65 @@ pub struct DrmFileState {
     /// table that makes a second import of the same dma-buf by the same file
     /// answer the handle it already has instead of taking another reference.
     prime_imports: Mutex<Vec<u32>>,
+    /// The node this file was opened on: what its DRM master and its auth
+    /// magic are scoped to. [`NO_MINOR`] for a registry placeholder that
+    /// never issues an ioctl.
+    minor: u32,
+    /// `drm_file.magic`: minted by the first `GET_MAGIC`, 0 until then.
+    magic: AtomicU32,
 }
 
 impl DrmFileState {
     pub fn new() -> Arc<Self> {
-        Arc::new(Self {
+        Self::for_minor(NO_MINOR)
+    }
+
+    /// `drm_open_helper`: a fresh `drm_file` on `minor`, and, as
+    /// `drm_master_open` does, the device's master when no open holds it.
+    pub fn for_minor(minor: u32) -> Arc<Self> {
+        let file = Arc::new(Self {
             atomic_client: AtomicBool::new(false),
             universal_planes: AtomicBool::new(false),
             events: Mutex::new(VecDeque::new()),
             eventbus: EventBus::new(),
             prime_imports: Mutex::new(Vec::new()),
-        })
+            minor,
+            magic: AtomicU32::new(0),
+        });
+        if minor != NO_MINOR {
+            master_open(minor, Arc::as_ptr(&file) as usize);
+        }
+        file
+    }
+
+    /// `drm_getmagic`: this file's magic, minted on first use and registered
+    /// with its device so the master can `AUTH_MAGIC` it.
+    pub fn magic(&self) -> u32 {
+        let current = self.magic.load(Ordering::Acquire);
+        if current != 0 {
+            return current;
+        }
+        let mut state = DRM_STATE.lock();
+        // Two GET_MAGIC on the same file can both see 0 before either stores.
+        // Re-check under the lock so we mint once; the second caller must
+        // return the same value Linux's `file_priv->magic` would.
+        let current = self.magic.load(Ordering::Acquire);
+        if current != 0 {
+            return current;
+        }
+        let magic = state.next_magic;
+        state.next_magic = state.next_magic.saturating_add(1);
+        if state.next_magic == 0 {
+            // 0 is libdrm's `drmIsMaster()` probe, never a minted magic.
+            state.next_magic = 1;
+        }
+        state.magics.push((
+            magic_device(self.minor),
+            magic,
+            self as *const DrmFileState as usize,
+        ));
+        self.magic.store(magic, Ordering::Release);
+        magic
     }
 
     /// Record that this open imported `handle`. `true` when it is new to this
@@ -1677,7 +1725,103 @@ impl Drop for DrmFileState {
         // And frees the property blobs the file created
         // (`drm_property_destroy_user_blobs`); they were kept for ever.
         destroy_blobs_of(self as *const DrmFileState as usize);
+        // `drm_master_release`: the master goes with the file that held it,
+        // and so does the magic it minted.
+        master_release(self.minor, self as *const DrmFileState as usize);
     }
+}
+
+/// The minor of a `DrmFileState` that is not an open: the devfs registry
+/// entry. It never takes the master.
+pub const NO_MINOR: u32 = u32::MAX;
+
+/// Why `SET_MASTER` was refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MasterError {
+    /// Another open holds the device's master (`drm_setmaster_ioctl`: EBUSY).
+    Busy,
+}
+
+/// `drm_master_open`: an open of `minor` while no open holds its master
+/// becomes the master.
+///
+/// There was no master state at all: `SET_MASTER` registered nothing, so
+/// two compositors on one card both believed they owned it, `drm-probe
+/// --scanout` and `eclipse-bench`, which stand down on EBUSY from a live
+/// compositor, stole the display instead, and `DROP_MASTER` from a client
+/// that never was master (Xwayland probing its backend) ran the console
+/// restore of the compositor that was.
+pub fn master_open(minor: u32, file: usize) {
+    let mut state = DRM_STATE.lock();
+    if !state.masters.iter().any(|(m, _)| *m == minor) {
+        state.masters.push((minor, file));
+    }
+}
+
+/// Whether `file` is the current master of `minor`
+/// (`drm_is_current_master`).
+pub fn is_master(minor: u32, file: usize) -> bool {
+    DRM_STATE
+        .lock()
+        .masters
+        .iter()
+        .any(|&(m, f)| m == minor && f == file)
+}
+
+/// `drm_setmaster_ioctl`: already the master is a no-op, someone else's
+/// master is EBUSY, and a free device is taken.
+pub fn set_master(minor: u32, file: usize) -> Result<(), MasterError> {
+    let mut state = DRM_STATE.lock();
+    match state.masters.iter().find(|(m, _)| *m == minor) {
+        Some(&(_, holder)) if holder == file => Ok(()),
+        Some(_) => Err(MasterError::Busy),
+        None => {
+            state.masters.push((minor, file));
+            Ok(())
+        }
+    }
+}
+
+/// `drm_dropmaster_ioctl`: `true` if `file` was the master of `minor` and
+/// gave it up; a file that is not the master has nothing to drop (EINVAL).
+pub fn drop_master(minor: u32, file: usize) -> bool {
+    let mut state = DRM_STATE.lock();
+    let before = state.masters.len();
+    state.masters.retain(|&(m, f)| !(m == minor && f == file));
+    state.masters.len() != before
+}
+
+/// Linux's `drm_device` identity for a `/dev/dri` minor: `card{n}` and
+/// `renderD{128+n}` share one device, and magics live on that device's
+/// `drm_master`, not on the node. A GET_MAGIC on the render node (or a
+/// mint from its `drm_file`) must be spendable by AUTH_MAGIC on `card{n}`.
+fn magic_device(minor: u32) -> u32 {
+    if minor >= RENDER_MINOR_BASE {
+        minor - RENDER_MINOR_BASE
+    } else {
+        minor
+    }
+}
+
+/// `drm_authmagic`: the master authenticates a magic minted on its device;
+/// `true` if one was, and it is spent (a second `AUTH_MAGIC` of the same
+/// magic is EINVAL, as `idr_replace(.., NULL, ..)` makes it).
+pub fn auth_magic(minor: u32, magic: u32) -> bool {
+    let mut state = DRM_STATE.lock();
+    let device = magic_device(minor);
+    let before = state.magics.len();
+    state
+        .magics
+        .retain(|&(d, g, _)| !(d == device && g == magic));
+    state.magics.len() != before
+}
+
+/// `drm_master_release` + the file's magic: everything the device kept
+/// about a closed open.
+fn master_release(minor: u32, file: usize) {
+    let mut state = DRM_STATE.lock();
+    state.masters.retain(|&(m, f)| !(m == minor && f == file));
+    state.magics.retain(|&(_, _, f)| f != file);
 }
 
 /// Return the primary framebuffer display, if any.
@@ -1800,6 +1944,15 @@ struct DrmState {
     /// the fb ids and the EDID blob ids, so the object-id namespaces never
     /// collide — libdrm identifies blobs purely by id.
     next_blob_id: u32,
+    /// `drm_device.master` per node: `(minor, file)`. One holder per minor.
+    masters: Vec<(u32, usize)>,
+    /// `drm_master.magic_map`: `(device, magic, file)`, keyed by
+    /// [`magic_device`] so `card{n}` and `renderD{128+n}` share the map.
+    /// Each entry is spent by the one `AUTH_MAGIC` that names it or dropped
+    /// with its file.
+    magics: Vec<(u32, u32, usize)>,
+    /// `drm_getmagic`'s idr: magics start at 1.
+    next_magic: u32,
     /// Software-KMS state mirrored back to atomic clients (see
     /// [`AtomicKmsState`]).
     atomic: AtomicKmsState,
@@ -1958,6 +2111,9 @@ lazy_static::lazy_static! {
         },
         blobs: Vec::new(),
         next_blob_id: BLOB_ID_BASE,
+        masters: Vec::new(),
+        magics: Vec::new(),
+        next_magic: 1,
         atomic: AtomicKmsState::default(),
     });
     /// Shared CPU-mmap VMOs for nouveau-uAPI GEM handles. Without this,

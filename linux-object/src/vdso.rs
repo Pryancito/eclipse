@@ -250,6 +250,26 @@ pub fn init() {
     }
     static REGISTERED: Once<()> = Once::new();
     REGISTERED.call_once(|| kernel_hal::timer::set_clock_observer(publish));
+    publish_getcpu();
+}
+
+/// Publish whether userspace may answer `getcpu` from the CPU itself.
+///
+/// Once, from [`init`], and not from the clock observer: this says nothing about
+/// the clock and never changes after the APs are up. The CPUs have all written
+/// their own id into the register the reader reads by the time `init` runs --
+/// `secondary_init` does it before signalling online -- so there is no window
+/// in which the flag is on and some CPU would report a stale id.
+fn publish_getcpu() {
+    let Some(vdso) = vdso() else { return };
+    let usable = kernel_hal::cpu::getcpu_usable();
+    // SAFETY: see `publish`; same pointer, same lifetime argument.
+    unsafe {
+        core::ptr::write_volatile(
+            core::ptr::addr_of_mut!((*vdso.data).getcpu_enabled),
+            u32::from(usable),
+        );
+    }
 }
 
 /// One line describing why userspace is, or is not, reading the clock without
@@ -282,11 +302,18 @@ pub fn status() -> alloc::string::String {
                 eso es inevitable y se fuerza con VDSOFORCE=1)"
             .into();
     }
+    let getcpu =
+        unsafe { core::ptr::read_volatile(core::ptr::addr_of!((*vdso.data).getcpu_enabled)) };
     format!(
-        "activa, tsc_mult={} ({}.{:03} ns/tick)",
+        "activa, tsc_mult={} ({}.{:03} ns/tick), getcpu {}",
         mult,
         mult >> 32,
         ((mult & 0xffff_ffff) * 1000) >> 32,
+        if getcpu != 0 {
+            "sin syscall"
+        } else {
+            "por syscall (la CPU no declara RDTSCP)"
+        },
     )
 }
 
@@ -377,7 +404,7 @@ mod tests {
     fn scratch_data() -> VdsoData {
         VdsoData {
             enabled: 0xdead_beef,
-            _pad: 0xdead_beef,
+            getcpu_enabled: 0xdead_beef,
             tsc_mult: 0xdead_beef_dead_beef,
             wall_off_ns: 0xdead_beef_dead_beef,
             tsc_base: 0xdead_beef_dead_beef,
@@ -437,18 +464,20 @@ mod tests {
         assert_eq!(d.tsc_base, 0, "a stale base must not survive either");
     }
 
-    /// The padding exists only to keep the 64-bit fields aligned, which is what
-    /// lets the reader run without a seqlock. Writing it would be writing a
-    /// field `vdso.c` does not know about.
+    /// The clock's publisher must not touch the `getcpu` flag, in either
+    /// direction. The two say nothing about each other -- a machine whose TSC is
+    /// no use as a *time source* can still report which CPU it is on -- and the
+    /// clock republishes on every recalibration and every `settimeofday`, so a
+    /// stray write here would turn the fast path off at the first clock change.
     #[test]
-    fn publishing_never_touches_the_padding() {
+    fn publishing_the_clock_never_touches_the_getcpu_flag() {
         let mut d = scratch_data();
         // SAFETY: as above.
         unsafe { publish_into(&mut d, Some(1), 1, 1) };
-        assert_eq!(d._pad, 0xdead_beef);
+        assert_eq!(d.getcpu_enabled, 0xdead_beef);
         // SAFETY: as above.
         unsafe { publish_into(&mut d, None, 1, 1) };
-        assert_eq!(d._pad, 0xdead_beef);
+        assert_eq!(d.getcpu_enabled, 0xdead_beef);
     }
 
     /// Republishing is the ordinary case -- `settimeofday`, a recalibration --

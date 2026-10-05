@@ -136,11 +136,17 @@ impl DrmDev {
     /// `open(2)` on `/dev/dri/card*` / `renderD*`: a fresh per-fd DRM file
     /// state (ATOMIC_CLIENT + event queue), like Linux's `drm_open_helper`.
     pub fn open_client(&self) -> Arc<dyn INode> {
-        Arc::new(DrmDev {
+        Arc::new(self.open_client_dev())
+    }
+
+    /// The open itself: the state is scoped to this node, and takes the
+    /// node's master when no open holds it (`drm_master_open`).
+    fn open_client_dev(&self) -> DrmDev {
+        DrmDev {
             inode_id: self.inode_id,
             minor: self.minor,
-            file: drm::DrmFileState::new(),
-        })
+            file: drm::DrmFileState::for_minor(self.minor),
+        }
     }
 
     pub fn file_state(&self) -> &Arc<drm::DrmFileState> {
@@ -991,20 +997,20 @@ impl DrmDev {
                 log::debug!("[drm] GET_CAP cap={:#x} -> {}", cap.capability, cap.value);
                 Ok(0)
             }
-            // A single DRM client on the primary node is implicitly master;
-            // accept (drop-)master so seatd/wlroots session activation succeeds.
-            // Magic/auth: `drmIsMaster()` authenticates magic 0 and treats
-            // success as "this fd is DRM master". wlroots' dumb-buffer allocator
-            // (pixman path) requires master, so always succeed — the single
-            // client on the primary node is implicitly master here.
             DRM_IOCTL_GET_MAGIC => {
-                // struct drm_auth { __u32 magic; }
-                unsafe { *(data as *mut u32) = 1 };
+                // struct drm_auth { __u32 magic; }: `drm_getmagic` mints one
+                // per file, once, starting at 1. 0 is reserved for
+                // libdrm's `drmIsMaster()` AUTH_MAGIC probe.
+                unsafe { *(data as *mut u32) = self.file.magic() };
                 Ok(0)
             }
             DRM_IOCTL_GET_CLIENT => {
                 // `struct drm_client`: libva enumerates clients at init.
                 // Single-client stub: idx 0 is this open; anything else ENOENT.
+                // Linux's `drm_getclient` always reports `magic = 0` ("do not
+                // return authenticating magic index"). Returning 1 made a
+                // client AUTH_MAGIC a number nobody had minted — or, worse,
+                // spend the first real GET_MAGIC on this boot.
                 let c = unsafe { &mut *(data as *mut DrmClient) };
                 if c.idx != 0 {
                     return Err(FsError::EntryNotFound);
@@ -1012,12 +1018,43 @@ impl DrmDev {
                 c.auth = 1;
                 c.pid = drm::current_pid() as usize;
                 c.uid = 0;
-                c.magic = 1;
+                c.magic = 0;
                 c.iocs = 0;
                 Ok(0)
             }
-            DRM_IOCTL_AUTH_MAGIC => Ok(0),
+            DRM_IOCTL_AUTH_MAGIC => {
+                // `DRM_MASTER` ioctl: only the master authenticates
+                // (EACCES), and only a magic a file of this device holds
+                // (`drm_authmagic`: EINVAL), once. Magic 0 is never minted:
+                // libdrm's `drmIsMaster()` AUTH_MAGIC(0) relies on EINVAL
+                // from the master (EACCES from everyone else).
+                if !drm::is_master(self.minor, self.file_owner()) {
+                    return Err(FsError::NoPermission);
+                }
+                let magic = unsafe { *(data as *const u32) };
+                if drm::auth_magic(self.minor, magic) {
+                    Ok(0)
+                } else {
+                    if magic != 0 {
+                        log::debug!(
+                            "[drm] AUTH_MAGIC minor={} magic={:#x} -> EINVAL",
+                            self.minor,
+                            magic
+                        );
+                    }
+                    Err(FsError::InvalidParam)
+                }
+            }
             DRM_IOCTL_SET_MASTER => {
+                // `drm_setmaster_ioctl`: the master again is a no-op, another
+                // open's master is EBUSY, a free device is taken. Nothing was
+                // recorded: every caller was told it was master, and
+                // `drm-probe --scanout` or `eclipse-bench`, which stand down
+                // on EBUSY, took the display from the running compositor.
+                if let Err(drm::MasterError::Busy) = drm::set_master(self.minor, self.file_owner())
+                {
+                    return Err(FsError::Busy);
+                }
                 // Become DRM master, but do NOT switch the console to graphics
                 // yet: defer that to the first real scanout (`drm::scanout`). If
                 // the client stalls before presenting a frame (e.g. its renderer
@@ -1037,6 +1074,12 @@ impl DrmDev {
                 Ok(0)
             }
             DRM_IOCTL_DROP_MASTER => {
+                // `drm_dropmaster_ioctl`: a file that is not the master has
+                // nothing to drop (EINVAL), and in particular does not run
+                // the console restore below on the compositor's behalf.
+                if !drm::drop_master(self.minor, self.file_owner()) {
+                    return Err(FsError::InvalidParam);
+                }
                 // In a seat-managed session (seatd owns tty7 via VT_PROCESS) the
                 // SEAT -- not DRM master -- drives the console KD mode: seatd
                 // already put tty7 into KD_GRAPHICS and will restore text via
@@ -1878,17 +1921,28 @@ impl DrmDev {
                 Ok(0)
             }
             DRM_IOCTL_MODE_GETGAMMA | DRM_IOCTL_MODE_SETGAMMA => {
-                // `struct drm_mode_crtc_lut` starts with `crtc_id`; both
-                // `drm_mode_gamma_{get,set}_ioctl` look it up first and answer
-                // ENOENT for a CRTC that does not exist.
-                let crtc_id = unsafe { *(data as *const u32) };
-                if drm::get_crtc(crtc_id).is_none() {
+                // Both `drm_mode_gamma_{get,set}_ioctl` look the CRTC up
+                // first and answer ENOENT for one that does not exist.
+                let lut = unsafe { &*(data as *const DrmModeCrtcLut) };
+                if drm::get_crtc(lut.crtc_id).is_none() {
                     return Err(FsError::EntryNotFound);
                 }
-                // No programmable gamma on the software scanout: accept and
-                // ignore. (Get leaves the caller's ramp buffers untouched, which
-                // Xorg treats as the identity it will "restore" on exit — a
-                // no-op against our no-op Set.)
+                // The CRTC has no gamma store (GETCRTC reports `gamma_size`
+                // 0: no programmable gamma on this scanout), and Linux says
+                // so: `drm_crtc_supports_legacy_gamma` is false, so SETGAMMA
+                // is ENOSYS, and GETGAMMA wants the caller's `gamma_size` to
+                // be the CRTC's (EINVAL) and then copies that many entries,
+                // none. Both answered "done" whatever was asked, so `xrandr
+                // --gamma`, gammastep and Xorg's own gamma restore were told
+                // the ramp was set, and a GETGAMMA of 256 entries returned
+                // without writing one, leaving the caller to read its own
+                // uninitialised buffers as the current ramp.
+                if cmd == DRM_IOCTL_MODE_SETGAMMA {
+                    return Err(FsError::NotSupported);
+                }
+                if lut.gamma_size != CRTC_GAMMA_SIZE {
+                    return Err(FsError::InvalidParam);
+                }
                 Ok(0)
             }
             DRM_IOCTL_MODE_LIST_LESSEES => {
@@ -2300,7 +2354,7 @@ impl DrmDev {
                     crtc_res.fb_id = crtc.fb_id;
                     crtc_res.x = crtc.x;
                     crtc_res.y = crtc.y;
-                    crtc_res.gamma_size = 0;
+                    crtc_res.gamma_size = CRTC_GAMMA_SIZE;
                     // Report the current mode: the display's native timings
                     // (the only mode the pipeline has). Linux fills this from
                     // crtc->state; compositors read it back to seed their
@@ -4438,6 +4492,21 @@ fn addfb2_check(cmd: &DrmModeFbCmd2) -> Result<()> {
     Ok(())
 }
 
+/// `drm_crtc.gamma_size` of every CRTC here: no legacy gamma store, which is
+/// what GETCRTC reports and what GETGAMMA/SETGAMMA hold the caller to.
+const CRTC_GAMMA_SIZE: u32 = 0;
+
+/// `struct drm_mode_crtc_lut`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+struct DrmModeCrtcLut {
+    crtc_id: u32,
+    gamma_size: u32,
+    red: u64,
+    green: u64,
+    blue: u64,
+}
+
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 struct DrmModeGetCrtc {
@@ -6303,6 +6372,8 @@ mod render_node_and_mode_tests {
             (0xB7, "MODE_ADDFB2"),
             (0xBC, "MODE_ATOMIC"),
             (0x3A, "WAIT_VBLANK"),
+            (0x02, "GET_MAGIC"),
+            (0x11, "AUTH_MAGIC"),
             (0x07, "SET_MASTER"),
             (0x08, "DROP_MASTER"),
         ] {
@@ -6772,7 +6843,7 @@ mod gl_client_sequence_tests {
         /// `open("/dev/dri/card0")`.
         pub(super) fn open(minor: u32) -> Client {
             Client {
-                dev: DrmDev::new(minor),
+                dev: DrmDev::new(minor).open_client_dev(),
             }
         }
 
@@ -12336,7 +12407,11 @@ mod hw_kms_tests {
         assert_eq!(c.ioctl(DRM_IOCTL_MODE_SETGAMMA, &mut lut), enoent);
         lut.crtc_id = 60;
         assert_eq!(c.ioctl(DRM_IOCTL_MODE_GETGAMMA, &mut lut), Ok(0));
-        assert_eq!(c.ioctl(DRM_IOCTL_MODE_SETGAMMA, &mut lut), Ok(0));
+        // A CRTC with no gamma store: `drm_crtc_supports_legacy_gamma`.
+        assert_eq!(
+            c.ioctl(DRM_IOCTL_MODE_SETGAMMA, &mut lut),
+            Err(FsError::NotSupported)
+        );
 
         // OBJ_SETPROPERTY: the object and the property must both exist.
         let mut set = DrmModeObjSetProperty {
@@ -12650,6 +12725,67 @@ mod hw_kms_tests {
         for buf in [&xr24, &narrow, &short, &ar24, &ar24_too] {
             c.destroy_dumb(buf.handle).expect("DESTROY_DUMB");
         }
+    }
+
+    /// `drm_mode_gamma_{get,set}_ioctl` on a CRTC whose `gamma_size` is 0,
+    /// which is what GETCRTC reports here: SETGAMMA is ENOSYS
+    /// (`drm_crtc_supports_legacy_gamma`), GETGAMMA wants the caller's
+    /// `gamma_size` to be the CRTC's (EINVAL) and then copies that many
+    /// entries, none. Both answered "done": a 256-entry ramp was "set", and
+    /// a 256-entry GETGAMMA returned without writing one.
+    #[test]
+    fn gamma_ioctls_hold_the_caller_to_a_crtc_with_no_gamma_store() {
+        let _screen = kms_emu::attach(32, 8);
+        let c = Client::open(0);
+        let (crtcs, _) = topology(&c);
+        let crtc = crtcs[0];
+        let mut info: DrmModeGetCrtc = zeroed();
+        info.crtc_id = crtc;
+        c.ioctl(DRM_IOCTL_MODE_GETCRTC, &mut info).expect("GETCRTC");
+        assert_eq!(info.gamma_size, 0, "no gamma store, as GETCRTC says");
+
+        let mut red = [0x1111u16; 256];
+        let mut green = [0x2222u16; 256];
+        let mut blue = [0x3333u16; 256];
+        let (r, g, b) = (
+            red.as_mut_ptr() as u64,
+            green.as_mut_ptr() as u64,
+            blue.as_mut_ptr() as u64,
+        );
+        let gamma = |cmd: u32, crtc_id: u32, gamma_size: u32| {
+            let mut lut = DrmModeCrtcLut {
+                crtc_id,
+                gamma_size,
+                red: r,
+                green: g,
+                blue: b,
+            };
+            c.ioctl(cmd, &mut lut)
+        };
+        for size in [0u32, 256] {
+            assert_eq!(
+                gamma(DRM_IOCTL_MODE_SETGAMMA, crtc, size),
+                Err(FsError::NotSupported),
+                "SETGAMMA with {} entries",
+                size
+            );
+        }
+        assert_eq!(
+            gamma(DRM_IOCTL_MODE_GETGAMMA, crtc, 256),
+            Err(FsError::InvalidParam),
+            "not the CRTC's gamma_size"
+        );
+        assert_eq!(gamma(DRM_IOCTL_MODE_GETGAMMA, crtc, 0), Ok(0));
+        assert!(
+            red.iter().all(|&v| v == 0x1111)
+                && green.iter().all(|&v| v == 0x2222)
+                && blue.iter().all(|&v| v == 0x3333),
+            "zero entries copied"
+        );
+        assert_eq!(
+            gamma(DRM_IOCTL_MODE_GETGAMMA, 0xdead_0000, 0),
+            Err(FsError::EntryNotFound)
+        );
     }
 
     /// With a mode, `drm_mode_setcrtc` looks the fb up (ENOENT; -1 is the
@@ -13905,6 +14041,152 @@ mod syncobj_wait_routing_tests {
 }
 
 #[cfg(test)]
+mod master_tests {
+    //! `drm_auth.c`: one master per node, and the magic handshake.
+
+    use super::gl_client_sequence_tests::Client;
+    use super::*;
+
+    fn set_master(c: &Client) -> Result<usize> {
+        c.ioctl(DRM_IOCTL_SET_MASTER, &mut 0u8)
+    }
+    fn drop_master(c: &Client) -> Result<usize> {
+        c.ioctl(DRM_IOCTL_DROP_MASTER, &mut 0u8)
+    }
+    fn magic(c: &Client) -> u32 {
+        let mut magic = 0u32;
+        c.ioctl(DRM_IOCTL_GET_MAGIC, &mut magic).expect("GET_MAGIC");
+        magic
+    }
+    fn auth(c: &Client, magic: u32) -> Result<usize> {
+        let mut magic = magic;
+        c.ioctl(DRM_IOCTL_AUTH_MAGIC, &mut magic)
+    }
+
+    /// `drm_master_open` / `drm_setmaster_ioctl` / `drm_dropmaster_ioctl`:
+    /// the first open of a node is its master; a second open's SET_MASTER is
+    /// EBUSY while the first holds it and its DROP_MASTER is EINVAL; the
+    /// master's own SET_MASTER is a no-op; once dropped, or once the holding
+    /// file closes, the next SET_MASTER takes it. Nothing was recorded, so
+    /// every SET_MASTER and every DROP_MASTER succeeded for everyone.
+    #[test]
+    fn one_open_holds_the_master_until_it_drops_it_or_closes() {
+        let _serialised = drm::test_globals::lock();
+        // A node of its own: minor 0's master is whichever test opened it.
+        let first = Client::open(77);
+        let second = Client::open(77);
+        assert_eq!(
+            set_master(&second),
+            Err(FsError::Busy),
+            "held by the first open"
+        );
+        assert_eq!(set_master(&first), Ok(0), "the master again: a no-op");
+        assert_eq!(
+            drop_master(&second),
+            Err(FsError::InvalidParam),
+            "not the master"
+        );
+        assert_eq!(drop_master(&first), Ok(0));
+        assert_eq!(
+            drop_master(&first),
+            Err(FsError::InvalidParam),
+            "already dropped"
+        );
+        assert_eq!(set_master(&second), Ok(0), "free, so taken");
+        assert_eq!(
+            set_master(&first),
+            Err(FsError::Busy),
+            "and now held by the second"
+        );
+        drop(second);
+        assert_eq!(
+            set_master(&first),
+            Ok(0),
+            "released with the file that held it"
+        );
+    }
+
+    /// `drm_getmagic` / `drm_authmagic`: a magic is minted per file, once;
+    /// only the master authenticates (EACCES), only a magic a file of this
+    /// node holds (EINVAL), and a magic is spent by the AUTH_MAGIC that
+    /// names it or by its file closing. Every file was told magic 1 and
+    /// every AUTH_MAGIC from anyone, of anything, was "authenticated".
+    #[test]
+    fn a_magic_is_minted_per_file_and_only_the_master_spends_it() {
+        let _serialised = drm::test_globals::lock();
+        let master = Client::open(78);
+        let client = Client::open(78);
+        let m_client = magic(&client);
+        assert_ne!(m_client, 0);
+        assert_eq!(magic(&client), m_client, "the same file, the same magic");
+        assert_ne!(magic(&master), m_client, "another file, another magic");
+
+        assert_eq!(
+            auth(&client, m_client),
+            Err(FsError::NoPermission),
+            "not the master"
+        );
+        assert_eq!(
+            auth(&master, m_client + 1000),
+            Err(FsError::InvalidParam),
+            "never minted"
+        );
+        assert_eq!(auth(&master, m_client), Ok(0));
+        assert_eq!(auth(&master, m_client), Err(FsError::InvalidParam), "spent");
+
+        let elsewhere = Client::open(79);
+        assert_eq!(
+            auth(&master, magic(&elsewhere)),
+            Err(FsError::InvalidParam),
+            "minted on another node"
+        );
+        let closing = Client::open(78);
+        let m_closing = magic(&closing);
+        drop(closing);
+        assert_eq!(
+            auth(&master, m_closing),
+            Err(FsError::InvalidParam),
+            "died with its file"
+        );
+    }
+
+    /// libdrm `drmIsMaster()`: AUTH_MAGIC(0). Linux answers EINVAL when the
+    /// caller is master and EACCES otherwise. Success would also pass the
+    /// probe, but EINVAL is the ABI, and it is what the einval-hunt was
+    /// reporting as a fault at compositor start.
+    #[test]
+    fn auth_magic_zero_is_einval_from_the_master_and_eacces_from_anyone_else() {
+        let _serialised = drm::test_globals::lock();
+        let master = Client::open(80);
+        let client = Client::open(80);
+        assert_eq!(auth(&master, 0), Err(FsError::InvalidParam));
+        assert_eq!(auth(&client, 0), Err(FsError::NoPermission));
+    }
+
+    /// Linux keeps magics on `drm_device`, so `card{n}` and `renderD{128+n}`
+    /// share the map. GET_MAGIC on the render node is EACCES (not
+    /// DRM_RENDER_ALLOW); a mint on that file must still be spendable from
+    /// the card, which is how a DRI2 client that opened the render node
+    /// gets authenticated by the compositor on `card0`.
+    #[test]
+    fn a_magic_minted_on_the_render_node_authenticates_on_the_card() {
+        let _serialised = drm::test_globals::lock();
+        let card = Client::open(81);
+        let render = Client::open(drm::RENDER_MINOR_BASE + 81);
+        let mut probe = 0u32;
+        assert_eq!(
+            render.ioctl(DRM_IOCTL_GET_MAGIC, &mut probe),
+            Err(FsError::NoPermission),
+            "GET_MAGIC is not DRM_RENDER_ALLOW"
+        );
+        let minted = render.file_state().magic();
+        assert_ne!(minted, 0);
+        assert_eq!(auth(&card, minted), Ok(0));
+        assert_eq!(auth(&card, minted), Err(FsError::InvalidParam), "spent");
+    }
+}
+
+#[cfg(test)]
 mod blob_id_space_tests {
     //! The property-blob id space, which has three tenants and no referee.
     //!
@@ -14137,7 +14419,7 @@ mod dumb_write_and_addfb_errno_tests {
         };
         assert_eq!(c.ioctl(DRM_IOCTL_GET_CLIENT, &mut client), Ok(0));
         assert_eq!(client.auth, 1);
-        assert_eq!(client.magic, 1);
+        assert_eq!(client.magic, 0);
         client.idx = 1;
         assert_eq!(
             c.ioctl(DRM_IOCTL_GET_CLIENT, &mut client),

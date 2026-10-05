@@ -134,6 +134,10 @@ pub fn primary_init() {
     // console never pushes a frame through uncached stores. See `pat.rs`.
     pat::init_this_cpu();
     pat::enable_framebuffer_wc();
+    // Per-CPU: `IA32_TSC_AUX` is what lets userspace answer `getcpu` from
+    // `RDTSCP` instead of trapping. Every AP does the same from
+    // `secondary_init`.
+    cpu::init_tsc_aux();
     // Before drivers init so the first scanout can use CLFLUSHOPT / MOVNTDQA.
     zcore_drivers::utils::dma_sync::probe_cpu_features();
     drivers::init().unwrap();
@@ -182,6 +186,9 @@ pub fn secondary_init() {
     // the id here, where it is authoritative, and publish it — everything
     // before this point could only see the provisional 8-bit xAPIC id.
     smp::ap_confirm_apic_id(crate::cpu::cpu_id());
+    // Only after that: `IA32_TSC_AUX` carries the id userspace will read, and
+    // before this point `cpu_id()` could only see the provisional xAPIC one.
+    cpu::init_tsc_aux();
     // The LAPIC timer's mode/divide/initial-count registers are per-CPU and are
     // only programmed on the BSP (in `drivers.rs`). Replicate that here so this
     // AP actually receives the 250 Hz scheduler tick; without it the AP's timer
