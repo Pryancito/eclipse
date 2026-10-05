@@ -31,7 +31,7 @@ use zircon_object::vm::{pages, MMUFlags, VmObject};
 /// reusing one id for CRTC/connector/plane makes them indistinguishable.
 /// Synthetic CRTC id exposed to userspace for the synthetic output.
 pub const SYNTH_CRTC_ID: u32 = 1;
-const SYNTH_CONNECTOR_ID: u32 = 2;
+pub const SYNTH_CONNECTOR_ID: u32 = 2;
 /// Encoder id exposed to userspace for the synthetic output.
 pub const SYNTH_ENCODER_ID: u32 = 3;
 /// Primary plane id exposed to userspace for the synthetic output.
@@ -146,6 +146,17 @@ static SCANOUT_PAUSED: core::sync::atomic::AtomicBool = core::sync::atomic::Atom
 /// `drm_mode_setcrtc` with a null fb calls `set_config` with `.fb = NULL`, and
 /// DPMS off goes through `drm_atomic_helper_connector_dpms`.
 static CRTC_BLANKED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Whether the CRTC has a mode set: Linux's `crtc_state->enable`, as opposed
+/// to `crtc_state->active`, which is what [`CRTC_BLANKED`] tracks the
+/// inverse of. A `SETCRTC` without a mode and an `RMFB` of the scanout
+/// framebuffer clear it (`__drm_atomic_helper_set_config` and
+/// `atomic_remove_fb` set the mode to NULL and detach the connectors); DPMS
+/// off does not (`drm_atomic_helper_connector_dpms` only clears `active`).
+/// `GETCRTC`'s `mode_valid`, `GETENCODER`'s `crtc_id` and `GETCONNECTOR`'s
+/// `encoder_id` read it. The console's own mode is set at boot, so it starts
+/// on.
+static CRTC_ENABLED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(true);
 
 /// Nanoseconds-since-boot after which a pause set by [`set_scanout_paused_for`]
 /// expires by itself. `0` means "no watchdog" (a plain [`set_scanout_paused`]).
@@ -394,6 +405,21 @@ pub fn set_crtc_blanked(on: bool) {
 /// DPMS property, and gates the kernel's own repaints.
 pub fn crtc_blanked() -> bool {
     CRTC_BLANKED.load(Ordering::SeqCst)
+}
+
+/// Set or clear the CRTC's mode (see [`CRTC_ENABLED`]). A present turns it
+/// on along with the un-blank, for the same reason: the frame is on the
+/// panel, so the pipe is what shows it.
+pub fn set_crtc_enabled(on: bool) {
+    CRTC_ENABLED.store(on, Ordering::SeqCst);
+}
+
+/// Whether the CRTC has a mode set: `GETCRTC` answers `mode_valid = 0`, and
+/// the encoder and connector report no CRTC and no encoder, while it has
+/// none, the way `drm_mode_getcrtc`, `drm_mode_getencoder` and
+/// `drm_mode_getconnector` read the state of a pipe that was disabled.
+pub fn crtc_enabled() -> bool {
+    CRTC_ENABLED.load(Ordering::SeqCst)
 }
 
 /// Enable/disable the per-frame CE-offloaded present. Set at boot from the
@@ -3177,6 +3203,7 @@ pub fn rmfb_disabling_for(fb_id: u32, pid: u64) -> bool {
         Some(on_crtc) => {
             if on_crtc {
                 set_crtc_blanked(true);
+                set_crtc_enabled(false);
             }
             true
         }
@@ -6427,8 +6454,10 @@ pub fn present_now_checked(
     }
     // An explicit present is a client putting pixels on this CRTC, so it is on
     // again. See `set_crtc_blanked` for why this un-blanks rather than failing
-    // the flip the way Linux does for a disabled CRTC.
+    // the flip the way Linux does for a disabled CRTC; and a pipe showing a
+    // frame has a mode, so a `SETCRTC` that disabled it is undone too.
     set_crtc_blanked(false);
+    set_crtc_enabled(true);
     if !PRESENT_LOGGED.swap(true, Ordering::Relaxed) {
         // Read `graphics_vt` into a local FIRST: `DRM_STATE.lock()` as a direct
         // argument to `warn!` keeps the MutexGuard temporary alive for the
@@ -7120,6 +7149,13 @@ pub fn atomic_commit(
     if upd.active == Some(false) {
         set_crtc_blanked(true);
     }
+    // MODE_ID is `crtc_state->enable`: a blob sets the mode, 0 unsets it
+    // (`drm_atomic_set_mode_prop_for_crtc`). Put back with the rest if the
+    // present below fails.
+    let enabled_before = crtc_enabled();
+    if let Some(blob_id) = upd.mode_blob {
+        set_crtc_enabled(blob_id != 0);
+    }
 
     match upd.plane_fb_id {
         Some(0) => set_crtc_fb(SYNTH_CRTC_ID, 0),
@@ -7133,6 +7169,7 @@ pub fn atomic_commit(
             });
             if !present_now_region(fb_id, SYNTH_CRTC_ID, rect) {
                 restore_atomic_state(rollback);
+                set_crtc_enabled(enabled_before);
                 return Err(AtomicError::Device);
             }
         }
@@ -7693,6 +7730,7 @@ pub fn get_plane(id: u32) -> Option<DrmPlane> {
 #[cfg(test)]
 pub(crate) fn reset_output_state_for_test() {
     set_crtc_blanked(false);
+    set_crtc_enabled(true);
     // A pause is the one latch that makes a present SUCCEED while touching
     // nothing: `present_now_checked` acknowledges the flip and returns Ok. One
     // leaked by an earlier test would make every later present test pass for no

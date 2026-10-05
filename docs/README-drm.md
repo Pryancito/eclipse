@@ -131,9 +131,9 @@ Leyenda: ✅ implementado · 🟡 parcial / no-op deliberado · ❌ no implement
 | ioctl | Estado | Notas |
 |---|---|---|
 | `DRM_IOCTL_MODE_GETRESOURCES` | ✅ | 1 CRTC + 1 connector + 1 encoder sintéticos |
-| `DRM_IOCTL_MODE_GETCRTC` / `SETCRTC` | ✅ | `SETCRTC` con fb hace *scanout*; `GETCRTC` devuelve el modo actual (`mode_valid=1`) |
-| `DRM_IOCTL_MODE_GETENCODER` | ✅ | encoder `VIRTUAL`, `possible_crtcs=1` |
-| `DRM_IOCTL_MODE_GETCONNECTOR` | ✅ | 1 modo = resolución nativa (preferido); propiedades estándar (ver abajo) |
+| `DRM_IOCTL_MODE_GETCRTC` / `SETCRTC` | ✅ | `SETCRTC` con modo hace *scanout* del fb; sin modo apaga el CRTC y quita el modo (el fb que nombre se ignora, como `drm_mode_setcrtc`); `GETCRTC` devuelve el modo actual (`mode_valid=1`) solo mientras el CRTC tiene modo (`crtc_state->enable`): tras un `SETCRTC` sin modo o un `RMFB` del fb en pantalla responde `mode_valid=0` y `fb_id=0` hasta el siguiente modeset; DPMS off no lo quita |
+| `DRM_IOCTL_MODE_GETENCODER` | ✅ | encoder `VIRTUAL`, `possible_crtcs=1`; `crtc_id=0` mientras el CRTC no tiene modo |
+| `DRM_IOCTL_MODE_GETCONNECTOR` | ✅ | 1 modo = resolución nativa (preferido); propiedades estándar (ver abajo); `encoder_id=0` mientras el CRTC no tiene modo |
 | `DRM_IOCTL_MODE_GETPLANERESOURCES` | ✅ | 1 plano primario |
 | `DRM_IOCTL_MODE_GETPLANE` | ✅ | formatos `XR24`/`AR24` |
 | `DRM_IOCTL_MODE_SETPLANE` | ✅ | equivale a *scanout* del fb (ruta primaria SW) |
