@@ -3264,6 +3264,50 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
         // boot services: DHCP, the seat manager and the labwc session.
         let svc_dir = rootfs.join("etc").join("eclipse").join("services");
         let _ = fs::create_dir_all(&svc_dir);
+        Self::write_init_services(&svc_dir);
+
+        // The startup chime's asset, which a oneshot below plays.
+        let share = rootfs.join("usr").join("share").join("eclipse");
+        let _ = fs::create_dir_all(&share);
+        let mp3_src = PROJECT_DIR
+            .join("assets")
+            .join("audio")
+            .join("Eclipse_Awakening.mp3");
+        if mp3_src.is_file() {
+            let _ = fs::copy(&mp3_src, share.join("Eclipse_Awakening.mp3"));
+        } else {
+            eprintln!("warning: assets/audio/Eclipse_Awakening.mp3 missing; boot sound disabled");
+        }
+
+        // The two init wrappers (the labwc one is written by desktop.rs).
+        let localbin = rootfs.join("usr").join("local").join("bin");
+        let _ = fs::create_dir_all(&localbin);
+        Self::write_init_wrappers(&localbin, &svc_dir);
+
+        // Default desktop selector: labwc, the hardware default. A boot with
+        // `desktop=xorg` on the kernel cmdline (see `make qemu`) overrides this;
+        // editing this file changes the default persistently. See
+        // eclipse-init's `selected_desktop`.
+        let eclipse_etc = rootfs.join("etc").join("eclipse");
+        let _ = fs::create_dir_all(&eclipse_etc);
+        fs::write(eclipse_etc.join("desktop"), b"labwc\n").unwrap();
+
+        println!("Installed eclipse-init as PID 1 with udhcpc, dbus, seatd, labwc, xorg, pulseaudio and boot-sound services.");
+        true
+    }
+
+    /// The service files `install_eclipse_init` lays down in
+    /// `/etc/eclipse/services`.
+    ///
+    /// Its own function because the caller cross-compiles a musl binary before
+    /// it gets this far and returns early when that build did not land, so
+    /// nothing can ask the table anything through it. And a table is exactly
+    /// what it is: every `after =` has to name a service that exists, a
+    /// `wait_socket =` has to be ordered after whatever binds that socket,
+    /// every key has to be one `tools/eclipse-init` parses -- an unknown key is
+    /// a gate that silently does not exist -- and the `desktop =` column is
+    /// what decides which of the two sessions each service belongs to.
+    fn write_init_services(svc_dir: &Path) {
         fs::write(
             svc_dir.join("example.service.txt"),
             b"# Eclipse init service file. Copy to '<name>.service' to enable.\n\
@@ -3274,6 +3318,11 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
               # cmdline = dbus.selftest                     (optional; start only when\n\
               #                                              this token is on the\n\
               #                                              kernel command line)\n\
+              # desktop = labwc                             (optional; start only under\n\
+              #                                             this session: labwc | xorg)\n\
+              # log = /tmp/mysvc.log                        (optional; where the service's\n\
+              #                                             output goes, instead of\n\
+              #                                             /dev/null)\n\
               # wait_socket = /run/other.sock              (optional; block each start,\n\
               #                                             bounded, until this unix\n\
               #                                             socket exists)\n\
@@ -3517,10 +3566,19 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
               log = /tmp/boot-sound.log\n",
         )
         .unwrap();
+    }
 
-        // The two init wrappers (the labwc one is written by desktop.rs).
-        let localbin = rootfs.join("usr").join("local").join("bin");
-        let _ = fs::create_dir_all(&localbin);
+    /// The wrapper scripts `install_eclipse_init` lays down in
+    /// `/usr/local/bin`, plus the pass that makes every one of them
+    /// executable.
+    ///
+    /// Its own function for the same reason as [`Self::write_init_services`],
+    /// and what there is to ask of it is the other half of that table: every
+    /// `exec =` in it names a script something really writes, and no wrapper
+    /// ends up without its x bit -- `eclipse-oopslog` shipped 0644 once,
+    /// `execve` answered EACCES, and init respawned it for the whole boot.
+    /// Takes `svc_dir` because `write_oopslog` adds a service of its own.
+    fn write_init_wrappers(localbin: &Path, svc_dir: &Path) {
         fs::write(
             localbin.join("eclipse-boot-sound"),
             b"#!/bin/sh\n\
@@ -3640,17 +3698,7 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
               exec pulseaudio --system --disallow-exit --exit-idle-time=-1 --daemonize=no --use-pid-file=no --realtime=false --log-target=stderr --log-level=info $PA_SCRIPT\n",
         )
         .unwrap();
-        let share = rootfs.join("usr").join("share").join("eclipse");
-        let _ = fs::create_dir_all(&share);
-        let mp3_src = PROJECT_DIR
-            .join("assets")
-            .join("audio")
-            .join("Eclipse_Awakening.mp3");
-        if mp3_src.is_file() {
-            let _ = fs::copy(&mp3_src, share.join("Eclipse_Awakening.mp3"));
-        } else {
-            eprintln!("warning: assets/audio/Eclipse_Awakening.mp3 missing; boot sound disabled");
-        }
+
         fs::write(
             localbin.join("eclipse-udhcpc"),
             b"#!/bin/sh\n\
@@ -3676,9 +3724,9 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
               exec udhcpc -i eth0 -f -R -s \"$SCRIPTv4\"\n",
         )
         .unwrap();
-        Self::write_oopslog(&localbin, &svc_dir);
+        Self::write_oopslog(localbin, svc_dir);
 
-        Self::write_dbus_wrapper(&localbin);
+        Self::write_dbus_wrapper(localbin);
 
         fs::write(
             localbin.join("eclipse-seatd"),
@@ -3865,7 +3913,7 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
             // the list, which shipped it 0644; `execve` then failed with EACCES
             // and eclipse-init respawned the service for the whole boot. This
             // pass makes the next omission harmless instead of a respawn storm.
-            if let Ok(entries) = fs::read_dir(&localbin) {
+            if let Ok(entries) = fs::read_dir(localbin) {
                 for entry in entries.flatten() {
                     // `is_file()` on the entry's own type, not the path's:
                     // following a symlink here would chmod whatever it points
@@ -3877,17 +3925,6 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
                 }
             }
         }
-
-        // Default desktop selector: labwc, the hardware default. A boot with
-        // `desktop=xorg` on the kernel cmdline (see `make qemu`) overrides this;
-        // editing this file changes the default persistently. See
-        // eclipse-init's `selected_desktop`.
-        let eclipse_etc = rootfs.join("etc").join("eclipse");
-        let _ = fs::create_dir_all(&eclipse_etc);
-        fs::write(eclipse_etc.join("desktop"), b"labwc\n").unwrap();
-
-        println!("Installed eclipse-init as PID 1 with udhcpc, dbus, seatd, labwc, xorg, pulseaudio and boot-sound services.");
-        true
     }
 
     /// 从安装目录拷贝所有 so 和 so 链接到 rootfs
@@ -4721,5 +4758,758 @@ mod rootfs_plumbing_tests {
         let dir = scratch("check-so-missing");
         assert!(!check_so(dir.join("libghost.so.1")));
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    // ---- what eclipse-init actually boots ------------------------------
+
+    /// A rootfs with the service table and the wrappers in it, the way
+    /// `install_eclipse_init` leaves them. Both writers run: `write_oopslog`
+    /// is called by the wrapper pass and adds a service of its own, so the
+    /// service directory is only complete once both have.
+    fn init_rootfs(tag: &str) -> PathBuf {
+        let rootfs = scratch(tag);
+        let svc = rootfs.join("etc/eclipse/services");
+        let localbin = rootfs.join("usr/local/bin");
+        fs::create_dir_all(&svc).unwrap();
+        fs::create_dir_all(&localbin).unwrap();
+        LinuxRootfs::write_init_services(&svc);
+        // `eclipse-ntpd` is one of the programs the table execs and the only
+        // one of them `write_ntp` writes, so the same rootfs needs it here for
+        // the same reason `make` writes it there.
+        LinuxRootfs::write_ntp(&rootfs);
+        LinuxRootfs::write_init_wrappers(&localbin, &svc);
+        rootfs
+    }
+
+    /// Every `*.service` of a rootfs as (name without the extension, body),
+    /// sorted by name.
+    fn services(rootfs: &Path) -> Vec<(String, String)> {
+        let mut out: Vec<(String, String)> = fs::read_dir(rootfs.join("etc/eclipse/services"))
+            .unwrap()
+            .flatten()
+            .filter_map(|e| {
+                let name = e.file_name().to_string_lossy().into_owned();
+                let stem = name.strip_suffix(".service")?.to_string();
+                Some((stem, fs::read_to_string(e.path()).unwrap()))
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// The `key = value` pairs of a service file, read the way
+    /// `tools/eclipse-init` reads them: comments and blank lines out, both
+    /// sides trimmed.
+    fn fields(body: &str) -> Vec<(&str, &str)> {
+        body.lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && !l.starts_with('#'))
+            .filter_map(|l| l.split_once('='))
+            .map(|(k, v)| (k.trim(), v.trim()))
+            .collect()
+    }
+
+    fn field<'a>(body: &'a str, key: &str) -> Option<&'a str> {
+        fields(body)
+            .into_iter()
+            .find(|(k, _)| *k == key)
+            .map(|(_, v)| v)
+    }
+
+    fn wrapper(rootfs: &Path, name: &str) -> String {
+        let path = rootfs.join("usr/local/bin").join(name);
+        fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+    }
+
+    /// The `exec`s of the table that are written somewhere else, and by whom.
+    const WRITTEN_BY_DESKTOP_RS: &[&str] = &["labwc", "eclipse-gtk-caches", "eclipse-xkbmap"];
+
+    /// Every service the image boots with: the program it runs, whether init
+    /// supervises it or waits for it to finish, and what it starts after.
+    ///
+    /// Both columns go wrong quietly. A `type` that is neither word is
+    /// treated as `oneshot` (the parser says so itself), so a misspelling
+    /// turns the compositor into something started once and never again. And
+    /// the set itself is the boot: a service file whose name does not end in
+    /// `.service` is not read at all, which is how a whole service can
+    /// disappear with nothing to see.
+    #[test]
+    fn every_boot_service_names_its_program_and_how_it_is_supervised() {
+        // name, type, exec, after
+        const BOOT: &[(&str, &str, &str, &str)] = &[
+            (
+                "boot-sound",
+                "oneshot",
+                "/usr/local/bin/eclipse-boot-sound",
+                "pulseaudio lunarbar",
+            ),
+            (
+                "boot-sound-xorg",
+                "oneshot",
+                "/usr/local/bin/eclipse-boot-sound",
+                "pulseaudio xorg",
+            ),
+            ("dbus", "respawn", "/usr/local/bin/eclipse-dbus", ""),
+            (
+                "dbus-selftest",
+                "oneshot",
+                "/bin/eclipse-dbusd --selftest",
+                "dbus",
+            ),
+            (
+                "dbus-system",
+                "respawn",
+                "/usr/local/bin/eclipse-dbus-system",
+                "",
+            ),
+            (
+                "gtk-caches",
+                "oneshot",
+                "/usr/local/bin/eclipse-gtk-caches",
+                "",
+            ),
+            (
+                "labwc",
+                "respawn",
+                "/usr/local/bin/labwc",
+                "seatd gtk-caches dbus",
+            ),
+            (
+                "lunarbar",
+                "respawn",
+                "/usr/local/bin/eclipse-lunarbar",
+                "labwc",
+            ),
+            (
+                "lunarbg",
+                "respawn",
+                "/usr/local/bin/eclipse-lunarbg",
+                "labwc",
+            ),
+            ("ntpd", "respawn", "/usr/local/bin/eclipse-ntpd", "udhcpc"),
+            ("oopslog", "respawn", "/usr/local/bin/eclipse-oopslog", ""),
+            (
+                "pulseaudio",
+                "respawn",
+                "/usr/local/bin/eclipse-pulseaudio",
+                "dbus-system",
+            ),
+            ("seatd", "respawn", "/usr/local/bin/eclipse-seatd", ""),
+            ("udhcpc", "respawn", "/usr/local/bin/eclipse-udhcpc", ""),
+            (
+                "xkbmap",
+                "oneshot",
+                "/usr/local/bin/eclipse-xkbmap",
+                "labwc",
+            ),
+            ("xorg", "respawn", "/usr/local/bin/eclipse-xorg", "dbus"),
+        ];
+        let rootfs = init_rootfs("services");
+        let got = services(&rootfs);
+        assert_eq!(
+            got.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(),
+            BOOT.iter().map(|(n, _, _, _)| *n).collect::<Vec<_>>(),
+            "the set of services the image boots with changed"
+        );
+        for ((name, body), (_, kind, exec, after)) in got.iter().zip(BOOT) {
+            assert_eq!(field(body, "type"), Some(*kind), "{name}: supervision");
+            assert_eq!(field(body, "exec"), Some(*exec), "{name}: program");
+            assert_eq!(
+                field(body, "after").unwrap_or_default(),
+                *after,
+                "{name}: what it starts after"
+            );
+        }
+        // The example is documentation, not a service: init reads `*.service`
+        // only, so this one has to keep its `.txt`.
+        assert!(
+            rootfs
+                .join("etc/eclipse/services/example.service.txt")
+                .is_file(),
+            "the documented example is gone, or is now a service init would try to start"
+        );
+    }
+
+    /// An `exec` naming a wrapper nothing writes is an `execve` that fails for
+    /// the whole boot, once per backoff, with the reason only in the log --
+    /// which is how `eclipse-oopslog` shipped unexecutable for a release.
+    /// Three of the programs are written by `desktop.rs` instead of here, so
+    /// the test checks that that is still where they come from.
+    #[test]
+    fn every_service_execs_a_wrapper_that_something_really_writes() {
+        const DESKTOP_RS: &str = include_str!("desktop.rs");
+        let rootfs = init_rootfs("execs");
+        for name in WRITTEN_BY_DESKTOP_RS {
+            assert!(
+                DESKTOP_RS.contains(&format!("localbin.join(\"{name}\")")),
+                "the service table execs {name}, and desktop.rs no longer writes it"
+            );
+        }
+        for (name, body) in services(&rootfs) {
+            let exec = field(&body, "exec").unwrap();
+            let program = exec.split(' ').next().unwrap();
+            let Some(stem) = program.strip_prefix("/usr/local/bin/") else {
+                assert_eq!(
+                    program, "/bin/eclipse-dbusd",
+                    "{name} execs {program}, which is neither a wrapper nor the bus binary"
+                );
+                continue;
+            };
+            if WRITTEN_BY_DESKTOP_RS.contains(&stem) {
+                continue;
+            }
+            assert!(
+                rootfs.join("usr/local/bin").join(stem).is_file(),
+                "{name} execs {program}, which nothing writes"
+            );
+        }
+    }
+
+    /// `after =` is resolved by name, and a name nothing provides is simply
+    /// dropped: the service then starts straight away instead of after what
+    /// it needs, and the only sign is one line in the boot log.
+    #[test]
+    fn every_order_names_a_service_that_exists() {
+        let rootfs = init_rootfs("after");
+        let all = services(&rootfs);
+        let names: Vec<&str> = all.iter().map(|(n, _)| n.as_str()).collect();
+        for (name, body) in &all {
+            for dep in field(body, "after").unwrap_or_default().split_whitespace() {
+                assert!(
+                    names.contains(&dep),
+                    "{name} is ordered after `{dep}`, which is not a service"
+                );
+            }
+        }
+    }
+
+    /// `after` only orders the fork; `wait_socket` is what actually blocks the
+    /// start. Waiting on a socket without being ordered after whatever binds
+    /// it is a race that costs a backoff retry at best, so the two have to
+    /// name the same service -- `wait_sockt` (sic) once let labwc race seatd
+    /// on every boot, which is why the parser now logs an unknown key. The
+    /// ordering may be transitive: init sorts `after` topologically.
+    #[test]
+    fn a_service_that_waits_for_a_socket_is_ordered_after_whatever_binds_it() {
+        const BOUND_BY: &[(&str, &str)] = &[
+            ("/run/seatd.sock", "seatd"),
+            ("/run/user/0/wayland-0", "labwc"),
+            ("/run/user/0/bus", "dbus"),
+        ];
+        /// Everything a service is ordered after, directly or through another:
+        /// init's start order is a topological sort of `after`, so the chime
+        /// being after the panel puts it after the compositor too.
+        fn ordered_after(all: &[(String, String)], name: &str) -> Vec<String> {
+            let mut out: Vec<String> = Vec::new();
+            let mut todo = vec![name.to_string()];
+            while let Some(n) = todo.pop() {
+                let Some((_, body)) = all.iter().find(|(s, _)| *s == n) else {
+                    continue;
+                };
+                for dep in field(body, "after").unwrap_or_default().split_whitespace() {
+                    if !out.iter().any(|d| d == dep) {
+                        out.push(dep.to_string());
+                        todo.push(dep.to_string());
+                    }
+                }
+            }
+            out
+        }
+        let rootfs = init_rootfs("waits");
+        let all = services(&rootfs);
+        for (name, body) in &all {
+            let Some(socket) = field(body, "wait_socket") else {
+                continue;
+            };
+            let (_, binder) = BOUND_BY
+                .iter()
+                .find(|(s, _)| *s == socket)
+                .unwrap_or_else(|| {
+                    panic!("{name} waits for {socket}, which nothing in the image binds")
+                });
+            assert!(
+                ordered_after(&all, name).iter().any(|d| d == *binder),
+                "{name} waits for {socket} but nothing orders it after {binder}, so it can start first"
+            );
+        }
+    }
+
+    /// What the compositor needs before it forks, in one place. `gtk-caches`
+    /// has to be the oneshot kind for the ordering to mean anything: a
+    /// oneshot has COMPLETED before whatever follows it starts, and that is
+    /// the only reason labwc's clients find the pixbuf loader registry.
+    #[test]
+    fn the_compositor_waits_for_the_seat_and_the_caches_before_it_forks() {
+        let rootfs = init_rootfs("labwc");
+        let all = services(&rootfs);
+        let labwc = &all.iter().find(|(n, _)| n == "labwc").unwrap().1;
+        let after: Vec<&str> = field(labwc, "after").unwrap().split_whitespace().collect();
+        for dep in ["seatd", "gtk-caches", "dbus"] {
+            assert!(
+                after.contains(&dep),
+                "the compositor no longer waits for {dep}"
+            );
+        }
+        let caches = &all.iter().find(|(n, _)| n == "gtk-caches").unwrap().1;
+        assert_eq!(
+            field(caches, "type"),
+            Some("oneshot"),
+            "a respawning gtk-caches is not finished when labwc forks"
+        );
+        assert_eq!(field(labwc, "wait_socket"), Some("/run/seatd.sock"));
+        assert_eq!(
+            field(labwc, "wait_path"),
+            Some("/dev/input"),
+            "without a settled /dev/input, libinput's single scan can miss a device for the whole session"
+        );
+    }
+
+    /// `cmdline =` keeps a service out of a normal boot entirely, so it is the
+    /// one key that can disable something by accident. Only the bus probe has
+    /// it, and its token is the one the menu and the docs tell you to boot
+    /// with.
+    #[test]
+    fn only_the_bus_probe_is_gated_on_the_kernel_cmdline() {
+        let rootfs = init_rootfs("cmdline");
+        let gated: Vec<(String, String)> = services(&rootfs)
+            .into_iter()
+            .filter(|(_, b)| field(b, "cmdline").is_some())
+            .collect();
+        assert_eq!(
+            gated.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(),
+            ["dbus-selftest"],
+            "a boot service gated on a cmdline token does not run on an ordinary boot"
+        );
+        let body = &gated[0].1;
+        assert_eq!(field(body, "cmdline"), Some("dbus.selftest"));
+        assert_eq!(
+            field(body, "type"),
+            Some("oneshot"),
+            "a probe that respawns never stops probing"
+        );
+    }
+
+    /// The one `wait_path` in the table is the compositor's `/dev/input`.
+    /// `wait_path = /dev/snd/pcmC0D0p` was in here once: starts are ordered
+    /// alphabetically, so it sat ahead of seatd and labwc and spent the full
+    /// bounded wait on every machine whose sound card this kernel has no
+    /// driver for -- a silent 8 s added to the boot, before the desktop.
+    #[test]
+    fn nothing_on_the_boot_path_waits_for_a_sound_card() {
+        let rootfs = init_rootfs("waitpath");
+        let waits: Vec<(String, String)> = services(&rootfs)
+            .into_iter()
+            .filter_map(|(n, b)| field(&b, "wait_path").map(|p| (n, p.to_string())))
+            .collect();
+        assert_eq!(
+            waits,
+            [("labwc".to_string(), "/dev/input".to_string())],
+            "a service waits for a path that is not the compositor's input directory"
+        );
+    }
+
+    /// Every key in the table has to be a key the parser knows: an unknown one
+    /// is logged and skipped, so a misspelled gate is a gate that does not
+    /// exist. The example file is the only documentation of that set, which
+    /// makes it part of the same invariant.
+    #[test]
+    fn every_key_a_service_uses_is_parsed_by_the_init_and_documented_in_the_example() {
+        const INIT: &str = include_str!("../../../tools/eclipse-init/src/main.rs");
+        let rootfs = init_rootfs("keys");
+        let example =
+            fs::read_to_string(rootfs.join("etc/eclipse/services/example.service.txt")).unwrap();
+        let documented: Vec<&str> = example
+            .lines()
+            .filter_map(|l| l.trim_start().strip_prefix("# "))
+            .filter_map(|l| l.split_once('='))
+            .map(|(k, _)| k.trim())
+            .collect();
+        for (name, body) in services(&rootfs) {
+            for (key, _) in fields(&body) {
+                assert!(
+                    INIT.contains(&format!("\"{key}\" =>")),
+                    "{name}: `{key}` is not a key tools/eclipse-init parses"
+                );
+                assert!(
+                    documented.contains(&key),
+                    "{name}: `{key}` is used by a service and documented nowhere"
+                );
+            }
+        }
+        for key in &documented {
+            assert!(
+                INIT.contains(&format!("\"{key}\" =>")),
+                "the example documents `{key}`, which the init does not parse"
+            );
+        }
+    }
+
+    /// `desktop =` is what keeps the two sessions apart, and the interesting
+    /// column is the empty one: a `desktop` on the bus would deny an Xorg
+    /// session the thing `SDL_Init` looks for first and `GtkApplication`
+    /// exits without.
+    #[test]
+    fn the_two_sessions_never_start_each_others_clients() {
+        const LABWC: &[&str] = &[
+            "boot-sound",
+            "gtk-caches",
+            "labwc",
+            "lunarbar",
+            "lunarbg",
+            "seatd",
+            "xkbmap",
+        ];
+        const XORG: &[&str] = &["boot-sound-xorg", "xorg"];
+        const EITHER: &[&str] = &[
+            "dbus",
+            "dbus-selftest",
+            "dbus-system",
+            "ntpd",
+            "oopslog",
+            "pulseaudio",
+            "udhcpc",
+        ];
+        let rootfs = init_rootfs("desktops");
+        for (name, body) in services(&rootfs) {
+            let want = if LABWC.contains(&name.as_str()) {
+                Some("labwc")
+            } else if XORG.contains(&name.as_str()) {
+                Some("xorg")
+            } else {
+                assert!(
+                    EITHER.contains(&name.as_str()),
+                    "{name} belongs to no session list"
+                );
+                None
+            };
+            assert_eq!(
+                field(&body, "desktop"),
+                want,
+                "{name} is in the wrong session"
+            );
+        }
+    }
+
+    // ---- the wrappers the services exec -------------------------------
+
+    /// Every wrapper has to be executable and has to start with a shebang:
+    /// without the x bit `execve` answers EACCES, without the shebang it
+    /// answers ENOEXEC, and either way init respawns the service for the
+    /// whole boot with the reason only in a log.
+    #[test]
+    fn every_wrapper_is_executable_and_starts_with_a_shebang() {
+        use std::os::unix::fs::PermissionsExt;
+        let rootfs = init_rootfs("modes");
+        let localbin = rootfs.join("usr/local/bin");
+        let mut seen = 0;
+        for entry in fs::read_dir(&localbin).unwrap().flatten() {
+            if !entry.file_type().unwrap().is_file() {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let mode = fs::metadata(entry.path()).unwrap().permissions().mode() & 0o777;
+            assert_eq!(
+                mode & 0o111,
+                0o111,
+                "{name} is {mode:o}, so execve answers EACCES"
+            );
+            let body = fs::read_to_string(entry.path()).unwrap();
+            assert!(
+                body.starts_with("#!/bin/sh\n"),
+                "{name} has no shebang, so execve answers ENOEXEC"
+            );
+            seen += 1;
+        }
+        assert!(seen >= 15, "only {seen} wrappers landed in /usr/local/bin");
+    }
+
+    /// The pass that makes the wrappers executable walks the directory, and it
+    /// asks the DIRECTORY ENTRY what it is rather than the path: following a
+    /// symlink would chmod whatever it points at, somewhere else entirely.
+    #[test]
+    fn the_chmod_pass_does_not_follow_a_symlink_out_of_the_directory() {
+        use std::os::unix::fs::PermissionsExt;
+        let rootfs = scratch("stray");
+        let outside = rootfs.join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        let secret = outside.join("not-a-wrapper");
+        fs::write(&secret, b"private\n").unwrap();
+        fs::set_permissions(&secret, fs::Permissions::from_mode(0o600)).unwrap();
+        let svc = rootfs.join("etc/eclipse/services");
+        let localbin = rootfs.join("usr/local/bin");
+        fs::create_dir_all(&svc).unwrap();
+        fs::create_dir_all(&localbin).unwrap();
+        unix::fs::symlink(&secret, localbin.join("stray")).unwrap();
+        LinuxRootfs::write_init_wrappers(&localbin, &svc);
+        let mode = fs::metadata(&secret).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "the chmod pass followed a symlink and changed a file outside /usr/local/bin"
+        );
+    }
+
+    /// `reboot`, `poweroff` and `halt` each have to force their OWN verb.
+    /// `-f` is sync + the syscall, which is the path that works on this
+    /// kernel; signalling PID 1 instead ran eclipse-init's kill-all and hung
+    /// the GPU session. And a copy-paste between the three is a machine that
+    /// powers off when it was told to halt.
+    #[test]
+    fn each_of_the_three_halt_wrappers_forces_its_own_verb() {
+        let rootfs = init_rootfs("halts");
+        for verb in ["reboot", "poweroff", "halt"] {
+            let body = wrapper(&rootfs, verb);
+            assert!(
+                body.contains(&format!("exec /bin/busybox {verb} -f")),
+                "{verb} does not force busybox's own {verb}:\n{body}"
+            );
+        }
+    }
+
+    /// `-s` is not optional: busybox udhcpc's compiled-in script path is not
+    /// where Eclipse stages the script, so without it the lease is obtained
+    /// and never applied -- no address, no resolv.conf, no route. Both execs
+    /// need it, including the eth0 fallback for when the netlink dump raced
+    /// the NIC probe and `ip link` listed nothing.
+    #[test]
+    fn the_dhcp_wrapper_always_passes_the_script_that_applies_the_lease() {
+        let rootfs = init_rootfs("dhcp");
+        let body = wrapper(&rootfs, "eclipse-udhcpc");
+        let execs: Vec<&str> = body
+            .lines()
+            .map(str::trim)
+            .filter(|l| l.contains("exec udhcpc"))
+            .collect();
+        assert_eq!(
+            execs.len(),
+            2,
+            "expected the listed interface and the eth0 fallback"
+        );
+        for line in &execs {
+            assert!(
+                line.contains(" -s \"$SCRIPTv4\""),
+                "a lease nothing applies: {line}"
+            );
+            assert!(
+                line.contains(" -f"),
+                "a backgrounded client init cannot supervise: {line}"
+            );
+        }
+        assert!(
+            execs[1].contains(" -i eth0"),
+            "no fallback interface: {}",
+            execs[1]
+        );
+        assert!(
+            body.contains("SCRIPTv4=/usr/share/udhcpc/default.script")
+                && body.contains("SCRIPTv4=/etc/udhcpc/default.script"),
+            "the script path has no second candidate"
+        );
+    }
+
+    /// A missing seatd is the most confusing thing this image can do: the
+    /// whole Wayland session fails and init's `/dev/null` stdio swallows the
+    /// reason. So the message goes to three places, and the back-off is long
+    /// -- a package is not going to appear on its own, and the tight loop it
+    /// used to cause was seatd 100x and labwc 67x per run.
+    #[test]
+    fn a_missing_seat_manager_says_so_where_it_can_be_read_and_backs_off_hard() {
+        let rootfs = init_rootfs("seatd");
+        let body = wrapper(&rootfs, "eclipse-seatd");
+        for where_ in [">>\"$LOG\"", "> /dev/console", ">&2"] {
+            assert!(
+                body.contains(&format!("echo \"$MSG\" {where_}")),
+                "the reason never reaches {where_}"
+            );
+        }
+        assert!(
+            body.contains("\nsleep 60\nexit 127\n"),
+            "the respawn storm is back"
+        );
+        assert!(
+            body.contains("[ -x \"$d/seatd\" ] && exec \"$d/seatd\" -l info"),
+            "seatd no longer runs in the foreground with its log turned on"
+        );
+    }
+
+    /// The wallpaper and the panel share one preamble, and they have to: it is
+    /// what finds the compositor's socket. On the boot path init has already
+    /// waited (`wait_socket`), so the loop hits on its first pass; it exists
+    /// for a manual launch that races a just-started compositor, and it polls
+    /// once a SECOND because every iteration forks a busybox.
+    #[test]
+    fn both_wayland_clients_share_one_wait_and_poll_once_a_second() {
+        fn wait_block(script: &str) -> &str {
+            let (_, rest) = script.split_once("exec >>\"$LOG\" 2>&1\n").unwrap();
+            rest.split_once("command -v").unwrap().0
+        }
+        let rootfs = init_rootfs("clients");
+        let bg = wrapper(&rootfs, "eclipse-lunarbg");
+        let bar = wrapper(&rootfs, "eclipse-lunarbar");
+        let block = wait_block(&bg);
+        assert_eq!(
+            block,
+            wait_block(&bar),
+            "the two clients wait differently now"
+        );
+        assert!(
+            block.lines().any(|l| l.trim() == "sleep 1"),
+            "one fork per 0.1 s is back:\n{block}"
+        );
+        assert!(
+            block.contains("chmod 0700 \"$XDG_RUNTIME_DIR\""),
+            "the Wayland socket's directory is not private"
+        );
+        assert!(
+            block.contains("WAYLAND_DISPLAY=$(basename \"$s\")"),
+            "the client no longer names the socket it found"
+        );
+    }
+
+    /// A client whose compositor is not installed is healthy -- there is just
+    /// nothing to connect to, and no amount of respawning will change that.
+    /// It backs off for a minute instead of every fifteen seconds.
+    #[test]
+    fn a_client_with_no_compositor_installed_backs_off_for_a_minute() {
+        let rootfs = init_rootfs("backoff");
+        for name in ["eclipse-lunarbg", "eclipse-lunarbar"] {
+            let body = wrapper(&rootfs, name);
+            assert!(
+                body.contains("[ -x \"$d/labwc\" ] && { sleep 2; exit 1; }"),
+                "{name}: an installed compositor that is simply not up yet should retry soon"
+            );
+            assert!(
+                body.contains("sleep 60; exit 1"),
+                "{name}: respawning against a missing package is pure fork churn"
+            );
+        }
+    }
+
+    /// The wallpaper is started by init, not as a child of labwc, so it never
+    /// sees the environment file labwc writes: the defaults it falls back to
+    /// are the ones a panel with no EDID millimetres gets.
+    #[test]
+    fn the_wallpaper_keeps_the_aspect_and_the_frame_rate_it_defaults_to() {
+        let rootfs = init_rootfs("aspect");
+        let body = wrapper(&rootfs, "eclipse-lunarbg");
+        assert!(
+            body.contains("${LUNARBG_ASPECT:-16:9}"),
+            "the default aspect changed"
+        );
+        assert!(
+            body.contains("--fps \"${LUNARBG_FPS:-8}\""),
+            "the default frame rate changed"
+        );
+    }
+
+    /// There is no udev or logind seat here, so X takes a VT directly, and
+    /// `startx` reads the session out of `$HOME` -- which init does not set
+    /// for it.
+    #[test]
+    fn the_x_session_takes_the_first_vt_with_root_as_its_home() {
+        let rootfs = init_rootfs("xorg");
+        let body = wrapper(&rootfs, "eclipse-xorg");
+        assert!(
+            body.contains("export HOME=/root\n"),
+            "startx would look for .xinitrc elsewhere"
+        );
+        assert!(
+            body.contains("exec startx -- vt1\n"),
+            "X no longer takes the first VT"
+        );
+    }
+
+    /// A `oneshot` holds up everything ordered after it until it exits, so the
+    /// one that plays the startup track detaches and returns at once: the
+    /// track is ~20 s and the panel is behind it.
+    #[test]
+    fn a_oneshot_that_plays_a_track_detaches_instead_of_holding_the_boot() {
+        let rootfs = init_rootfs("chime");
+        let body = wrapper(&rootfs, "eclipse-boot-sound");
+        assert!(
+            body.contains("setsid /usr/local/bin/eclipse-boot-sound-play"),
+            "the oneshot now waits for the whole track:\n{body}"
+        );
+        assert!(
+            body.trim_end().ends_with("exit 0"),
+            "the oneshot does not return success"
+        );
+    }
+
+    // ---- the renderer policy a login shell inherits -------------------
+
+    fn export<'a>(block: &'a str, key: &str) -> Option<&'a str> {
+        block
+            .lines()
+            .map(str::trim)
+            .filter_map(|l| l.strip_prefix("export "))
+            .filter_map(|l| l.split_once('='))
+            .find(|(k, _)| *k == key)
+            .map(|(_, v)| v)
+    }
+
+    fn profile_text(tag: &str) -> String {
+        let etc = scratch(tag).join("etc");
+        fs::create_dir_all(&etc).unwrap();
+        LinuxRootfs::write_profile(&etc);
+        fs::read_to_string(etc.join("profile")).unwrap()
+    }
+
+    /// Only the two branches that really have a GPU go through zink, and the
+    /// llvmpipe override at the end of the file stays COMMENTED: it is kept
+    /// for a machine where even llvmpipe autodetect misbehaves, and active it
+    /// would put the hardware path on a software rasteriser.
+    #[test]
+    fn only_the_two_hardware_branches_ask_for_a_gallium_driver() {
+        let profile = profile_text("gallium");
+        let active: Vec<&str> = profile
+            .lines()
+            .map(str::trim)
+            .filter_map(|l| l.strip_prefix("export GALLIUM_DRIVER="))
+            .collect();
+        assert_eq!(
+            active,
+            ["zink", "zink"],
+            "the GPU path no longer goes through zink+NVK"
+        );
+        assert!(
+            profile.contains("#export GALLIUM_DRIVER=llvmpipe"),
+            "the commented software-GL override is gone"
+        );
+        let overrides: Vec<&str> = profile
+            .lines()
+            .map(str::trim)
+            .filter_map(|l| l.strip_prefix("export MESA_LOADER_DRIVER_OVERRIDE="))
+            .collect();
+        assert_eq!(
+            overrides,
+            ["zink", "zink"],
+            "the Mesa loader override lost its pair"
+        );
+    }
+
+    /// Two pins that are easy to lose and expensive to lose. There are two
+    /// NVIDIA DRM cards on the hardware (console and compute), so without
+    /// `WLR_DRM_DEVICES` wlroots can bind a phantom connector on the compute
+    /// GPU. And `WLR_NO_HARDWARE_CURSORS` must NOT be set: the DRM scheme
+    /// composites the cursor now, and without the hardware path every pointer
+    /// move re-renders the whole scene.
+    #[test]
+    fn the_compositor_gets_the_console_card_and_keeps_its_hardware_cursor() {
+        let profile = profile_text("pins");
+        assert_eq!(
+            export(&profile, "WLR_DRM_DEVICES"),
+            Some("/dev/dri/card0"),
+            "the compositor is no longer pinned to the console GPU"
+        );
+        assert_eq!(
+            export(&profile, "WLR_LIBINPUT_NO_DEVICES"),
+            Some("1"),
+            "with no udevd to tag devices, libinput can find none and abort the compositor"
+        );
+        assert_eq!(
+            export(&profile, "WLR_NO_HARDWARE_CURSORS"),
+            None,
+            "the kernel composites the cursor; turning the hardware path off re-renders the scene on every pointer move"
+        );
     }
 }
