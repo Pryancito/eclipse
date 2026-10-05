@@ -162,14 +162,51 @@ fn stress_waker_page_never_loses_a_wake_nor_hands_out_a_borrowed_slot() {
                     }
                 }
                 if done.load(Ordering::SeqCst) {
-                    // Producers finished. Release every borrow and drain
-                    // whatever was deferred behind them.
+                    // Producers finished, so from here nothing races this
+                    // thread. Borrow a fixed set of slots, wake each one while
+                    // it is borrowed, and only then release: the wake has to
+                    // be held and come back. During the concurrent phase above
+                    // a swallowed wake can be covered up by the next of the
+                    // ~1250 wakes that slot gets, which is why this window
+                    // exists and is quiet.
+                    for slot in 0..8 {
+                        if borrowed & (1u64 << slot) == 0 {
+                            page.mark_borrowed(slot, true);
+                            borrowed |= 1u64 << slot;
+                        }
+                        owed[slot].fetch_add(1, Ordering::SeqCst);
+                        page.notify(slot);
+                    }
+                    let quiet = page.take_notified();
+                    assert_eq!(
+                        quiet & 0xff,
+                        0,
+                        "a borrowed slot was handed out in the quiet window"
+                    );
+                    // Whatever else came out here is a hand-out like any
+                    // other; not booking it would leave its slot owed a wake
+                    // that was in fact delivered.
+                    for slot in 0..64 {
+                        if quiet & (1u64 << slot) != 0 {
+                            takes[slot].fetch_add(1, Ordering::SeqCst);
+                            owed[slot].store(0, Ordering::SeqCst);
+                        }
+                    }
+                    // Release every borrow and drain whatever was deferred
+                    // behind them.
                     for slot in 0..64 {
                         if borrowed & (1u64 << slot) != 0 {
                             page.mark_borrowed(slot, false);
                         }
                     }
                     let tail = page.take_notified();
+                    assert_eq!(
+                        tail & 0xff,
+                        0xff,
+                        "the wakes published behind a borrow did not come back \
+                         once it was released: tail={:#x}",
+                        tail
+                    );
                     for slot in 0..64 {
                         if tail & (1u64 << slot) != 0 {
                             takes[slot].fetch_add(1, Ordering::SeqCst);
