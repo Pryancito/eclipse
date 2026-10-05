@@ -5512,4 +5512,544 @@ mod rootfs_plumbing_tests {
             "the kernel composites the cursor; turning the hardware path off re-renders the scene on every pointer move"
         );
     }
+
+    // ---- the /etc the image publishes --------------------------------
+
+    /// Does `/etc/profile` export `key` anywhere outside a comment?
+    ///
+    /// Not [`export`]: a line can be an export AND part of a `case` arm
+    /// (`*) export LANG=...`), and the two "never export this" rules below are
+    /// written as comments that name the very variable they forbid.
+    fn exports_anywhere(profile: &str, key: &str) -> bool {
+        profile
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.starts_with('#'))
+            .any(|l| l.contains(&format!("export {key}=")))
+    }
+
+    /// Two things `/etc/profile` must NOT export, both written in it as a
+    /// comment that names the variable -- which is why a check on the raw text
+    /// has to skip comments.
+    ///
+    /// `LC_ALL` would freeze the language for gettext and GTK whatever
+    /// `/etc/eclipse/locale` says. And `/lib/libeclipse_dns.so` is
+    /// deliberately not preloaded: musl dropped it silently for years (every
+    /// process ran in secure mode for want of AT_SECURE in the auxv), and the
+    /// moment the auxv was fixed and the shim really loaded everywhere, labwc
+    /// froze within seconds of starting.
+    #[test]
+    fn the_login_shell_exports_neither_lc_all_nor_the_dns_shim() {
+        let profile = profile_text("forbidden");
+        assert!(
+            !exports_anywhere(&profile, "LC_ALL"),
+            "LC_ALL would freeze LANG for gettext and GTK"
+        );
+        assert!(
+            !exports_anywhere(&profile, "LD_PRELOAD"),
+            "the DNS shim froze labwc within seconds of really being loaded"
+        );
+        assert!(
+            profile.contains("#   LD_PRELOAD=/lib/libeclipse_dns.so some-command"),
+            "the opt-in-per-command note is what stops the next reader re-adding the preload"
+        );
+    }
+
+    /// The language and the timezone are Spanish by default and come out of
+    /// `/etc/eclipse`, which the desktop's own `eclipse-locale` and
+    /// `eclipse-tz` scripts write. `LANGUAGE` carries a fallback chain
+    /// (`es:en`) so a message with no Spanish translation still appears in
+    /// English instead of as an untranslated key.
+    #[test]
+    fn spain_is_the_default_language_and_timezone_and_etc_eclipse_overrides_it() {
+        let profile = profile_text("locale");
+        assert!(
+            profile.contains("_ecl_lang=es\n"),
+            "the default language changed"
+        );
+        assert!(
+            profile.contains("_ecl_tz=Europe/Madrid"),
+            "the default timezone changed"
+        );
+        assert!(
+            profile.contains("/etc/eclipse/locale") && profile.contains("/etc/eclipse/timezone"),
+            "the profile no longer reads what the desktop scripts write"
+        );
+        assert!(
+            profile.contains("en|EN|en_US) export LANG=en_US.UTF-8 LANGUAGE=en ;;"),
+            "the English case is gone"
+        );
+        assert!(
+            profile.contains("*) export LANG=es_ES.UTF-8 LANGUAGE=es:en ;;"),
+            "the default case is gone, or lost its fallback chain"
+        );
+    }
+
+    /// The serial terminal-size probe, which is three rules in one place.
+    ///
+    /// It runs only on VT 0 (or an unset `ECLIPSE_VT`, e.g. a pty): the kernel
+    /// deliberately never answers a cursor-position query on a VT, and serial
+    /// mirrors only the active VT, so probing on VTs 1-5 blocked each of those
+    /// five shells 0.3 s at boot for an answer that could not come. It rejects
+    /// a tiny answer and an absurd one -- a bogus `\e[1;1R` or an unanswered
+    /// `\e[999;999H` echo used to leave nano unusable. And it marks
+    /// `ECLIPSE_TTY_SIZED` only AFTER `stty` succeeds, so a failed probe can
+    /// retry.
+    #[test]
+    fn the_tty_size_probe_runs_only_on_the_console_vt_and_rejects_absurd_answers() {
+        let profile = profile_text("ttysize");
+        assert!(
+            profile.contains("[ \"${ECLIPSE_VT:-0}\" = \"0\" ]"),
+            "the probe now runs on VTs that can never answer it"
+        );
+        assert!(
+            profile.contains("[ \"$__rows\" -gt 1 ] && [ \"$__cols\" -gt 1 ]"),
+            "a 1x1 answer is a bogus answer"
+        );
+        assert!(
+            profile.contains("[ \"$__rows\" -le 512 ] && [ \"$__cols\" -le 512 ]"),
+            "an absurd size is as bad as a tiny one"
+        );
+        let marked = profile
+            .lines()
+            .map(str::trim)
+            .find(|l| l.contains("export ECLIPSE_TTY_SIZED=1"))
+            .expect("the probe no longer marks that it ran");
+        assert!(
+            marked.starts_with("&& export"),
+            "ECLIPSE_TTY_SIZED must be chained after stty, or a failed probe never retries: {marked}"
+        );
+    }
+
+    /// What a login shell gets before anything else. `/usr/local/bin` comes
+    /// FIRST so the wrappers win over the busybox applets of the same name --
+    /// `reboot` is the one that matters, since busybox's own applet signals
+    /// PID 1 and the wrapper forces the path that works. The three certificate
+    /// variables are three names for one bundle because wget, curl and
+    /// everything OpenSSL-based each look for a different one.
+    #[test]
+    fn the_login_shell_gets_the_path_the_home_and_the_certificate_bundle() {
+        let profile = profile_text("env");
+        assert_eq!(
+            export(&profile, "PATH"),
+            Some("/usr/local/bin:/bin:/sbin:/usr/bin:/usr/sbin"),
+            "the wrappers only win over the busybox applets while /usr/local/bin is first"
+        );
+        assert_eq!(export(&profile, "HOME"), Some("/root"));
+        assert_eq!(export(&profile, "TERM"), Some("xterm-256color"));
+        for key in ["SSL_CERT_FILE", "CURL_CA_BUNDLE"] {
+            assert_eq!(
+                export(&profile, key),
+                Some("/etc/ssl/certs/ca-certificates.crt"),
+                "{key} no longer names the installed bundle"
+            );
+        }
+        assert_eq!(export(&profile, "SSL_CERT_DIR"), Some("/etc/ssl/certs"));
+    }
+
+    /// The Wayland socket's directory is made on demand and made PRIVATE: the
+    /// socket is the whole session's input and output, and libwayland refuses
+    /// a runtime dir other users can reach.
+    #[test]
+    fn the_wayland_runtime_directory_is_created_private() {
+        let profile = profile_text("runtimedir");
+        assert_eq!(export(&profile, "XDG_RUNTIME_DIR"), Some("/run/user/0"));
+        assert!(
+            profile.contains("chmod 0700 \"$XDG_RUNTIME_DIR\""),
+            "the runtime directory is no longer private"
+        );
+    }
+
+    /// `/etc/passwd` and `/etc/group` are only written when ABSENT, so an
+    /// account added by a package -- or by `eclipse-useradd` on a running
+    /// machine -- survives the next incremental rebuild.
+    #[test]
+    fn the_base_accounts_are_written_only_when_they_are_absent() {
+        let rootfs = scratch("accounts-keep");
+        let etc = rootfs.join("etc");
+        fs::create_dir_all(&etc).unwrap();
+        fs::write(
+            etc.join("passwd"),
+            "moebius:x:1000:1000::/home/moebius:/bin/sh\n",
+        )
+        .unwrap();
+        LinuxRootfs::install_base_accounts(&rootfs);
+        let passwd = fs::read_to_string(etc.join("passwd")).unwrap();
+        assert!(
+            passwd.contains("moebius:x:1000:"),
+            "an account that was already there was clobbered:\n{passwd}"
+        );
+    }
+
+    /// `/etc/group`, unlike `/etc/passwd`, is amended rather than left alone:
+    /// an existing file just gains the `uucp` line it lacks. Twice has to mean
+    /// the same as once (an incremental rebuild runs this every time), and the
+    /// amendment has to start on a line of its own -- a group file whose last
+    /// line had no newline used to come out with the two glued together, which
+    /// loses both names.
+    #[test]
+    fn an_existing_group_file_only_gains_the_uucp_line_and_keeps_its_own() {
+        let rootfs = scratch("accounts-amend");
+        let etc = rootfs.join("etc");
+        fs::create_dir_all(&etc).unwrap();
+        fs::write(etc.join("group"), "games:x:35:moebius").unwrap();
+        LinuxRootfs::install_base_accounts(&rootfs);
+        let once = fs::read_to_string(etc.join("group")).unwrap();
+        assert!(
+            once.lines().any(|l| l == "games:x:35:moebius"),
+            "the last line lost its own identity:\n{once}"
+        );
+        assert!(
+            once.lines().any(|l| l == "uucp:x:14:root"),
+            "the uucp group is what a serial/modem device needs:\n{once}"
+        );
+        LinuxRootfs::install_base_accounts(&rootfs);
+        let twice = fs::read_to_string(etc.join("group")).unwrap();
+        assert_eq!(
+            once, twice,
+            "a second rebuild appended the same lines again"
+        );
+    }
+
+    /// The groups a console and a desktop need, and what `root` has to be a
+    /// member of. `wheel` with no members is a machine where nothing can
+    /// `su`, and `tty` is what a terminal device belongs to.
+    #[test]
+    fn the_base_groups_carry_the_memberships_the_console_needs() {
+        let rootfs = scratch("accounts-groups");
+        LinuxRootfs::install_base_accounts(&rootfs);
+        let group = fs::read_to_string(rootfs.join("etc/group")).unwrap();
+        for line in [
+            "root:x:0:root",
+            "wheel:x:10:root",
+            "uucp:x:14:root",
+            "tty:x:5:",
+        ] {
+            assert!(
+                group.lines().any(|l| l == line),
+                "`{line}` is not in /etc/group:\n{group}"
+            );
+        }
+    }
+
+    /// Neither writer may give `nobody` a shell. It is the account every
+    /// unprivileged daemon falls back to, and a login shell on it is a login.
+    #[test]
+    fn nobody_has_no_shell_to_log_in_with() {
+        let base = scratch("nobody-base");
+        LinuxRootfs::install_base_accounts(&base);
+        let other = scratch("nobody-passwd");
+        let etc = other.join("etc");
+        fs::create_dir_all(&etc).unwrap();
+        LinuxRootfs::write_passwd(&etc, &other);
+        for rootfs in [&base, &other] {
+            let passwd = fs::read_to_string(rootfs.join("etc/passwd")).unwrap();
+            let nobody = passwd
+                .lines()
+                .find(|l| l.starts_with("nobody:"))
+                .expect("no nobody account");
+            let shell = nobody.rsplit(':').next().unwrap();
+            assert!(
+                shell == "/bin/false" || shell == "/sbin/nologin",
+                "nobody can log in with {shell}"
+            );
+        }
+    }
+
+    /// bash resolves `~` through `getpwuid(geteuid())`, i.e. `/etc/passwd`, and
+    /// greets "I can't find my home directory!" when the entry names a
+    /// directory that is not there. So the entry and the directory are written
+    /// together.
+    #[test]
+    fn root_gets_a_home_directory_that_exists() {
+        let rootfs = scratch("root-home");
+        let etc = rootfs.join("etc");
+        fs::create_dir_all(&etc).unwrap();
+        LinuxRootfs::write_passwd(&etc, &rootfs);
+        let passwd = fs::read_to_string(etc.join("passwd")).unwrap();
+        let root = passwd
+            .lines()
+            .find(|l| l.starts_with("root:"))
+            .expect("no root account");
+        let home = root.split(':').nth(5).unwrap();
+        assert_eq!(home, "/root");
+        assert!(
+            rootfs.join("root").is_dir(),
+            "root's home is in /etc/passwd and not on disk"
+        );
+    }
+
+    /// `/etc/group` has TWO writers with DIFFERENT content, each writing only
+    /// when the file is absent -- so whichever runs first wins, and which one
+    /// that is depends on the build path. `make` on an existing rootfs (the
+    /// common case, since a rootfs is checked in) runs `install_base_accounts`
+    /// first and the `video` group never appears; a from-scratch build runs
+    /// `write_passwd` first and it does. Everything here runs as root, so
+    /// nothing has needed `video` yet; this test is here to say the divergence
+    /// is known rather than to bless it.
+    #[test]
+    fn the_two_writers_of_etc_group_disagree_about_the_video_group() {
+        let clean = scratch("group-clean");
+        let etc = clean.join("etc");
+        fs::create_dir_all(&etc).unwrap();
+        LinuxRootfs::write_passwd(&etc, &clean);
+        assert!(
+            fs::read_to_string(etc.join("group"))
+                .unwrap()
+                .lines()
+                .any(|l| l == "video:x:28:"),
+            "the from-scratch path is the only one that creates the video group"
+        );
+        let incremental = scratch("group-incremental");
+        LinuxRootfs::install_base_accounts(&incremental);
+        assert!(
+            !fs::read_to_string(incremental.join("etc/group"))
+                .unwrap()
+                .lines()
+                .any(|l| l.starts_with("video:")),
+            "if the base set grew a video group the two writers finally agree, and this test can go"
+        );
+    }
+
+    /// The kernel spawns the per-VT shells itself, so busybox init must NOT:
+    /// a `getty` or an `askfirst` line here means two programs reading the
+    /// same terminal. What is left is the sysinit hook and the three actions
+    /// init exists for.
+    #[test]
+    fn the_kernel_owns_the_vts_so_the_inittab_has_no_getty() {
+        let rootfs = scratch("inittab");
+        LinuxRootfs::new(Arch::X86_64).install_busybox_init(&rootfs);
+        let raw = fs::read_to_string(rootfs.join("etc/inittab")).unwrap();
+        // The file's own comment says "there are NO getty lines here", so a
+        // check over the raw text answers about the comment, not the file.
+        let inittab: String = raw
+            .lines()
+            .filter(|l| !l.trim_start().starts_with('#'))
+            .map(|l| format!("{l}\n"))
+            .collect();
+        for line in [
+            "::sysinit:/etc/init.d/rcS",
+            "::ctrlaltdel:/bin/busybox reboot",
+            "::shutdown:/bin/busybox swapoff -a",
+            "::restart:/bin/busybox init",
+        ] {
+            assert!(
+                inittab.lines().any(|l| l == line),
+                "`{line}` is gone from the inittab:\n{raw}"
+            );
+        }
+        for word in ["getty", "askfirst", "respawn"] {
+            assert!(
+                !inittab.contains(word),
+                "`{word}` in the inittab fights the kernel for the VTs:\n{raw}"
+            );
+        }
+    }
+
+    /// `/sbin/init` is a symlink to busybox, and busybox picks its applet from
+    /// `basename(argv[0])` -- so the link's NAME is what makes it run `init`,
+    /// and its target has to be busybox and nothing else. The kernel boots
+    /// `INIT=/sbin/init`.
+    #[test]
+    fn sbin_init_is_a_symlink_to_busybox_which_picks_its_applet_from_argv0() {
+        let rootfs = scratch("init-link");
+        LinuxRootfs::new(Arch::X86_64).install_busybox_init(&rootfs);
+        let link = rootfs.join("sbin/init");
+        assert_eq!(
+            fs::read_link(&link).unwrap(),
+            Path::new("/bin/busybox"),
+            "/sbin/init no longer resolves to busybox"
+        );
+    }
+
+    /// The sysinit hook is a no-op by design, but it has to be an EXECUTABLE
+    /// no-op that succeeds: busybox init runs it before anything else, and a
+    /// hook that cannot be executed or that fails is the first thing a boot
+    /// reports.
+    #[test]
+    fn the_sysinit_hook_is_executable_and_succeeds() {
+        use std::os::unix::fs::PermissionsExt;
+        let rootfs = scratch("rcs");
+        LinuxRootfs::new(Arch::X86_64).install_busybox_init(&rootfs);
+        let rcs = rootfs.join("etc/init.d/rcS");
+        let mode = fs::metadata(&rcs).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode & 0o111, 0o111, "the sysinit hook is {mode:o}");
+        let body = fs::read_to_string(&rcs).unwrap();
+        assert!(body.starts_with("#!/bin/sh\n"), "the hook has no shebang");
+        assert!(
+            body.trim_end().ends_with("exit 0"),
+            "the hook must succeed; it is the first thing init runs:\n{body}"
+        );
+    }
+
+    /// bash does NOT read `/etc/profile` for a non-login interactive shell, so
+    /// `.bashrc` sources it: without that line a bash opened on a VT has no
+    /// PATH, no certificate bundle and no session variables. And `/etc/nanorc`
+    /// is option-only on purpose -- an `include` of the syntax files trips
+    /// "Mistakes in '/etc/nanorc'" on some nano builds, and nano then refuses
+    /// to start.
+    #[test]
+    fn bash_sources_the_profile_and_nano_loads_with_no_includes() {
+        let rootfs = scratch("console");
+        let etc = rootfs.join("etc");
+        fs::create_dir_all(&etc).unwrap();
+        LinuxRootfs::write_console_configs(&etc, &rootfs);
+        let bashrc = fs::read_to_string(rootfs.join("root/.bashrc")).unwrap();
+        assert!(
+            bashrc.contains("[ -r /etc/profile ] && . /etc/profile"),
+            "a non-login bash would start with no environment at all:\n{bashrc}"
+        );
+        assert!(bashrc.contains("export PS1="), "the prompt is gone");
+        assert!(
+            bashrc.contains("alias ll='ls -la'"),
+            "the one alias the shipped shell has is gone"
+        );
+        let nanorc = fs::read_to_string(etc.join("nanorc")).unwrap();
+        for line in nanorc.lines().filter(|l| !l.trim_start().starts_with('#')) {
+            assert!(
+                !line.contains("include"),
+                "an `include` here makes nano refuse to start on some builds: {line}"
+            );
+        }
+        assert!(
+            nanorc.contains("set tabsize 4"),
+            "the nano options are gone"
+        );
+    }
+
+    /// `/etc/hosts` has to resolve `localhost` on BOTH families and give the
+    /// machine a name. A missing `::1` line is an IPv6-first resolver timing
+    /// out on every lookup of its own hostname, and the `127.0.1.1` line is
+    /// what makes `hostname` resolvable at all -- the Debian convention, and
+    /// what X and D-Bus clients look up at startup.
+    #[test]
+    fn localhost_resolves_on_both_families_and_the_machine_has_its_name() {
+        let etc = scratch("hosts").join("etc");
+        fs::create_dir_all(&etc).unwrap();
+        LinuxRootfs::write_hosts(&etc);
+        let hosts = fs::read_to_string(etc.join("hosts")).unwrap();
+        let names = |addr: &str| -> Vec<String> {
+            hosts
+                .lines()
+                .filter(|l| l.split_whitespace().next() == Some(addr))
+                .flat_map(|l| l.split_whitespace().skip(1).map(String::from))
+                .collect()
+        };
+        assert!(
+            names("127.0.0.1").contains(&"localhost".to_string()),
+            "localhost has no IPv4 address:\n{hosts}"
+        );
+        assert!(
+            names("::1").contains(&"localhost".to_string()),
+            "localhost has no IPv6 address, so an IPv6-first resolver waits for a timeout:\n{hosts}"
+        );
+        assert!(
+            names("127.0.1.1").contains(&"Eclipse".to_string()),
+            "the machine's own name does not resolve:\n{hosts}"
+        );
+    }
+
+    /// The NTP wrapper, which is the whole reason the service stays up. busybox
+    /// `ntpd` first (it needs no privilege-separation user and no `chroot(2)`,
+    /// neither of which this kernel has), OpenNTPD second -- with the ONLY
+    /// flags OpenNTPD 6 still accepts. The old `ntpd -d -s -u root` line was a
+    /// usage error (`-s` went in 6.0, `-u` never existed), so the service died
+    /// in ~10 ms and init respawned it every 8 s forever, spamming the console.
+    /// Both run in the FOREGROUND: a client that daemonises exits, and init
+    /// restarts what it supervises.
+    #[test]
+    fn the_ntp_client_runs_in_the_foreground_with_the_flags_openntpd_still_accepts() {
+        let rootfs = scratch("ntp");
+        LinuxRootfs::write_ntp(&rootfs);
+        let conf = fs::read_to_string(rootfs.join("etc/ntpd.conf")).unwrap();
+        assert!(
+            conf.contains("servers pool.ntp.org"),
+            "no server to ask:\n{conf}"
+        );
+        let wrapper = fs::read_to_string(rootfs.join("usr/local/bin/eclipse-ntpd")).unwrap();
+        assert!(
+            wrapper.contains("exec /bin/busybox ntpd -n -N -p pool.ntp.org"),
+            "busybox ntpd is no longer run in the foreground:\n{wrapper}"
+        );
+        let openntpd = wrapper
+            .lines()
+            .map(str::trim)
+            .find(|l| l.contains("exec /usr/sbin/ntpd"))
+            .expect("the OpenNTPD fallback is gone");
+        assert_eq!(
+            openntpd, "exec /usr/sbin/ntpd -d",
+            "OpenNTPD 6 accepts neither -s nor -u, and a usage error respawns forever"
+        );
+    }
+
+    /// The wrapper waits for a default route before it starts: `pool.ntp.org`
+    /// cannot resolve before DHCP. The wait is bounded (45 tries, 2 s apart) so
+    /// a machine with no network does not hold the service down forever, and
+    /// the wrapper is executable -- it is what the service `exec`s.
+    #[test]
+    fn the_ntp_wrapper_waits_for_dhcp_within_a_bound_and_is_executable() {
+        use std::os::unix::fs::PermissionsExt;
+        let rootfs = scratch("ntp-wait");
+        LinuxRootfs::write_ntp(&rootfs);
+        let path = rootfs.join("usr/local/bin/eclipse-ntpd");
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode & 0o111,
+            0o111,
+            "the wrapper is {mode:o}, so execve answers EACCES"
+        );
+        let wrapper = fs::read_to_string(&path).unwrap();
+        assert!(
+            wrapper.contains("while [ \"$i\" -lt 45 ]; do"),
+            "the wait for a default route is gone or unbounded:\n{wrapper}"
+        );
+        assert!(
+            wrapper.contains("ip -4 route show default"),
+            "nothing checks for a default route"
+        );
+    }
+
+    /// The Rust target triple of each architecture, which is NOT the
+    /// architecture's own name: rustc knows `riscv64gc`, not `riscv64`, and a
+    /// triple it does not know is a cross build that fails with eclipse-init
+    /// missing -- best-effort, so the image silently keeps busybox as PID 1.
+    #[test]
+    fn each_architecture_names_the_musl_triple_rustc_knows() {
+        for (arch, triple) in [
+            (Arch::X86_64, "x86_64-unknown-linux-musl"),
+            (Arch::Aarch64, "aarch64-unknown-linux-musl"),
+            (Arch::Riscv64, "riscv64gc-unknown-linux-musl"),
+        ] {
+            assert_eq!(LinuxRootfs::new(arch).musl_rust_triple(), triple);
+        }
+        assert_ne!(
+            LinuxRootfs::new(Arch::Riscv64).musl_rust_triple(),
+            format!("{}-unknown-linux-musl", Arch::Riscv64.name()),
+            "riscv64 is the one architecture whose triple is not its own name"
+        );
+    }
+
+    /// What `install_apk_keys` returns is what apk will actually trust: the
+    /// caller warns and falls back to `--allow-untrusted` on zero. So the count
+    /// has to be the number of `.pub` files that really landed, and nothing
+    /// else in the directory may inflate it.
+    #[test]
+    fn the_key_count_is_the_number_of_public_keys_that_landed() {
+        let dst = scratch("apk-keys").join("keys");
+        fs::create_dir_all(&dst).unwrap();
+        fs::write(dst.join("alpine-one.rsa.pub"), b"key\n").unwrap();
+        fs::write(dst.join("alpine-two.rsa.pub"), b"key\n").unwrap();
+        fs::write(dst.join("README.txt"), b"not a key\n").unwrap();
+        let n = LinuxRootfs::install_apk_keys(&dst);
+        let pubs = fs::read_dir(&dst)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("pub"))
+            .count();
+        assert_eq!(n, pubs, "the count is not what apk will trust");
+        assert!(
+            n >= 2,
+            "the keys that were already there stopped being counted"
+        );
+    }
 }
