@@ -40,6 +40,11 @@ const HEALTHY_UPTIME: Duration = Duration::from_secs(2);
 const MIN_BACKOFF: Duration = Duration::from_millis(250);
 const MAX_BACKOFF: Duration = Duration::from_secs(8);
 
+/// Where a respawn service's output goes when its file names no `log =`.
+/// `/tmp`, like every `log =` the images ship: a tmpfs, so it costs no disk
+/// and is empty again on the next boot.
+const DEFAULT_LOG_DIR: &str = "/tmp";
+
 /// Compositor GPU-renderer fallback. With `nvidia.nouveau_uapi` on an NVIDIA
 /// GPU the session defaults to GLES2/zink (real GPU). That path can die when a
 /// client's EXEC wedges the GPU channel: the compositor is context 0, a
@@ -1006,6 +1011,21 @@ fn parse_service(name: &str, text: &str) -> Option<Service> {
     if exec.is_empty() {
         return None;
     }
+    // A supervised service with nowhere to write keeps its reason to itself.
+    // Its stdout/stderr go to /dev/null (see `silence_stdio`), so when it dies
+    // the only thing anybody has is the number on the console -- and the
+    // wrapper scripts' own diagnostics go to `/dev/console`, which the forked
+    // child may not be able to open at all. `oopslog.service` shipped with no
+    // `log =` and that is exactly how it went: `exit 127` on repeat with
+    // nothing anywhere saying which command was not found. Default one rather
+    // than leave the hole open for the next service file too; an explicit
+    // `log =` still wins, and a `log = /dev/null` still opts out.
+    //
+    // Respawn only: a oneshot runs once and its failure is reported by the
+    // boot step that waited for it.
+    if kind == Kind::Respawn && log_path.is_none() {
+        log_path = Some(format!("{DEFAULT_LOG_DIR}/{name}.log"));
+    }
     Some(Service {
         name: name.to_string(),
         exec,
@@ -1875,7 +1895,17 @@ fn supervise(services: &mut BTreeMap<String, Service>) {
             // box. Uses libc's status decoding so a signal death is named.
             let how = if libc::WIFEXITED(status) {
                 let code = libc::WEXITSTATUS(status);
-                format!("exit {code}{}", exit_note(code))
+                let mut how = format!("exit {code}{}", exit_note(code));
+                // Those two codes are the ones a reader can actually chase, and
+                // the service's own output is where the name of the missing
+                // command is. Say where it landed, on the line that reports the
+                // death, or the reader has to know that `log =` exists at all.
+                if !exit_note(code).is_empty() {
+                    if let Some(path) = &svc.log {
+                        how.push_str(&format!("; see {path}"));
+                    }
+                }
+                how
             } else if libc::WIFSIGNALED(status) {
                 format!("signal {}", libc::WTERMSIG(status))
             } else {
@@ -2476,6 +2506,44 @@ mod tests {
         for code in [0, 1, 2, 125, 128, 255] {
             assert_eq!(exit_note(code), "", "exit {code} no necesita nota");
         }
+    }
+
+    /// A supervised service with no `log =` used to write its output into
+    /// `/dev/null`, so when it died the number on the console was everything
+    /// anybody had. `oopslog.service` shipped exactly like that and spent a
+    /// whole boot repeating `exit 127` with the name of the missing command
+    /// nowhere on the machine.
+    #[test]
+    fn a_respawn_service_without_a_log_gets_one_rather_than_dev_null() {
+        let defaulted = parse_service(
+            "oopslog",
+            "exec = /usr/local/bin/eclipse-oopslog\ntype = respawn\n",
+        )
+        .expect("parsea");
+        assert_eq!(
+            defaulted.log.as_deref(),
+            Some("/tmp/oopslog.log"),
+            "un servicio respawn sin `log =` sigue escribiendo a /dev/null"
+        );
+
+        // An explicit one still wins, including the opt-out.
+        let explicit = parse_service(
+            "dbus-system",
+            "exec = /usr/local/bin/eclipse-dbus-system\ntype = respawn\nlog = /tmp/dbus-system.log\n",
+        )
+        .expect("parsea");
+        assert_eq!(explicit.log.as_deref(), Some("/tmp/dbus-system.log"));
+        let opted_out = parse_service(
+            "quiet",
+            "exec = /bin/true\ntype = respawn\nlog = /dev/null\n",
+        )
+        .expect("parsea");
+        assert_eq!(opted_out.log.as_deref(), Some("/dev/null"));
+
+        // A oneshot keeps none: it runs once and the boot step that waited for
+        // it is what reports its failure.
+        let once = parse_service("once", "exec = /bin/true\n").expect("parsea");
+        assert_eq!(once.log, None, "un oneshot no necesita fichero propio");
     }
 
     fn order_of(defs: &[(&str, &[&str])]) -> Vec<String> {
