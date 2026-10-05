@@ -1051,6 +1051,81 @@ mod collection_tests {
         keys
     }
 
+    // ── can a task that ceded the CPU be held off forever? ────────────────
+
+    /// Hand a task back as a voluntary `sched_yield(2)` does: self-wake from
+    /// inside its own poll, with the voluntary marker up.
+    fn cede(waker: &Arc<WakerRef>) {
+        crate::runtime::begin_voluntary_yield(Arc::as_ptr(waker) as usize);
+        waker.wake_by_ref();
+        crate::runtime::end_voluntary_yield();
+        waker.mark_borrowed(false);
+    }
+
+    /// Hand a task back having been woken from outside, as a sleeper's timer
+    /// does.
+    fn notified_back(waker: &Arc<WakerRef>) {
+        waker.wake_by_ref();
+        waker.mark_borrowed(false);
+    }
+
+    /// The `--yieldstall` shape of `eclipse-bench` #1690, as the queue sees it:
+    /// two threads in a tight `sched_yield(2)` loop and a third waking every
+    /// 200 us, all on one CPU. On Linux that sustains ~1M yields/s.
+    ///
+    /// The answer this pins down is that **the two yielders do get the CPU**.
+    /// Pass 2 is skipped only in an iteration whose pass-1 snapshot was
+    /// non-empty, and `found_key` is reset at the top of each iteration — so a
+    /// sleeper that is actually asleep between its wakes leaves iterations in
+    /// which pass 1 comes up empty, and those are pass 2's. The strict priority
+    /// between the lanes is not by itself unbounded starvation.
+    ///
+    /// This matters because it is the hypothesis for the `sched_yield()` that
+    /// did not return for 40 minutes, and it says the lane order alone does not
+    /// explain it. Worth keeping as the thing a future change must not break:
+    /// it is the ONLY bound the yielded lane has, and it rests entirely on the
+    /// notified lane going empty.
+    #[test]
+    fn two_tight_yielders_still_get_the_cpu_between_a_sleepers_wakes() {
+        let _g = crate::runtime::resched_test_lock();
+        let tc = TaskCollection::new(0);
+        let (y1, y2, sleeper) = (
+            tc.add_task(pending(), None),
+            tc.add_task(pending(), None),
+            tc.add_task(pending(), None),
+        );
+        assert_ne!(y1, y2);
+
+        let mut handed = Vec::new();
+        // The sleeper is awake for one hand-out, then asleep: it publishes no
+        // wake until the next 200 us tick. Everything else on the CPU is a
+        // yielder re-ceding immediately.
+        for round in 0..30 {
+            let Some((key, _t, waker)) = tc.take_task() else {
+                break;
+            };
+            handed.push(key);
+            if key == sleeper {
+                // Asleep now; nothing re-publishes it until its timer. Model
+                // the tick landing every tenth round.
+                waker.mark_borrowed(false);
+                if round % 10 == 9 {
+                    notified_back(&waker);
+                }
+            } else {
+                cede(&waker);
+            }
+        }
+
+        let yields = handed.iter().filter(|k| **k == y1 || **k == y2).count();
+        assert!(
+            yields >= 20,
+            "the tight yielders were starved by one sleeper: {:?}",
+            handed
+        );
+        assert!(handed.contains(&y1) && handed.contains(&y2));
+    }
+
     // ── a collection whose Vec header was written over ─────────────────────
 
     /// A healthy collection answers for every priority it was built with, and
