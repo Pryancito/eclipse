@@ -89,7 +89,11 @@ build_live_vdi() {
   command -v mmd >/dev/null || { echo "falta mmd (paquete: mtools)"; exit 1; }
 
   local esp_mb disk_mb
-  esp_mb=$(du -sm "$esp/EFI" | cut -f1)
+  # Apparent size, not allocated blocks: see the note in
+  # scripts/qemu-bench.sh and zCore/Makefile. A sparse initramfs sized from
+  # plain `du` yields an ESP image it does not fit in.
+  esp_mb=$(du -sm --apparent-size "$esp/EFI" 2>/dev/null | cut -f1 \
+    || du -sm "$esp/EFI" | cut -f1)
   esp_mb=$((esp_mb + 128))
   disk_mb=$((esp_mb + 8))
   echo "ESP live: ${esp_mb} MiB (disco ${disk_mb} MiB, GPT + partición EFI)"

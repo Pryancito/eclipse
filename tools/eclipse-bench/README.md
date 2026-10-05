@@ -48,7 +48,7 @@ it to the rootfs build the same way the other `tools/` binaries are added.
 ./eclipse-bench [--only SECTION] [--quick] [DIR] [DISK_MB] [MEM_MB]
 ```
 
-- `--only SECTION` — run one of `cpu mem syscall vm sched smp disk proc gfx`.
+- `--only SECTION` — run one of `cpu mem syscall vm sched psched smp disk proc gfx`.
   Useful for before/after on a single change.
 - `--quick` — shorter budgets, roughly 3x faster, noisier.
 - `--drm PATH` — DRM device for the `gfx` section (default `/dev/dri/card0`).
@@ -96,6 +96,70 @@ The `sleep 1ms late` rows are measured twice: on an idle machine, then with one
 CPU-bound process per CPU. The gap between those two is the interactive latency
 you feel. The `(worst)` rows matter more than the means — one 20 ms stall in
 forty prompt wakes is experienced as stuttering and averages away to nothing.
+
+**PREEMPTIVE SCHEDULER INTERNALS** `[kernel]` — the section above says how
+long a woken task waited; this one says which mechanism made it wait.
+
+Eclipse's scheduler is not a Linux runqueue. `vendor/PreemptiveScheduler` is a
+per-CPU async executor, and the policy in `zircon-object`'s thread code decides
+only the *length* of a timeslice, never which task runs next. That shape has
+mechanisms of its own, and each can be wrong on its own while every row in
+`SCHEDULER / IPC` still looks reasonable. One probe per mechanism:
+
+- **`yield hand-off`** — two threads on one CPU handing the CPU straight back.
+  No timer, no descriptor, no wake-up: the executor picking the next task and
+  switching to it, and nothing else. It is the floor under every other figure
+  here, so `pipe RT / yield hand-off` says how much of a round trip is *not*
+  dispatch.
+- **the timeslice floor** — a spinner and a thread waking every 200 µs, pinned
+  to the *same* CPU. Without a floor the waker preempts the spinner on every
+  wake and `throughput retained` collapses; with one, the first stretch of a
+  slice belongs to whoever is running. The waker's own latency is printed
+  directly underneath because the floor *buys* that throughput with it: high
+  retention together with low waker latency is the only unambiguously good
+  outcome, and a run showing only the retention would be advertising half of a
+  trade.
+- **the slice remainder** — a plain spinner against one that spins for most of a
+  slice and then parks briefly, both on one CPU. A thread handed a whole new
+  slice on every resumption is never preempted and starves its neighbour; one
+  that comes back with the remainder it already had is preempted on schedule.
+  `plain spinner fair share` is normalised so 1.00 is an even split, so it has
+  no hardware in it at all.
+- **work stealing** — every worker created by a parent confined to CPU 0, none
+  pinned, all CPU-bound. The right outcome is one worker per CPU, whether the
+  kernel placed them there at creation or other CPUs noticed the backlog and
+  took work; `time to occupy all CPUs` treats both as the success they are and
+  `CPUs occupied` is the row that catches work never spreading at all.
+- **the idle steal scan** — one second of a deliberately idle machine, read
+  from the kernel's own counters. An idle CPU leaves halt on every interrupt,
+  and walking every peer's runtime to conclude there is nothing to steal costs
+  a lock per peer per wake-up on lines those peers own. `skipped share` is how
+  often that question was answered without taking one.
+- **affinity** — `sched_setaffinity` is a scheduler operation, not a store:
+  narrowing a mask has to kick a CPU in the new mask when the task is runnable
+  outside it, and that kick walks the other CPUs' runtimes.
+- **cross-CPU wake coalescing** — one waker, N sleepers confined to one *other*
+  CPU, woken in a burst. Only the issuing is timed; getting the sleepers parked
+  again happens outside the clock, because N targets sharing one CPU
+  necessarily serialize there and timing that would report the CPU's width as
+  the cost of a wake. Eclipse folds the reschedule request per CPU and Linux
+  does not fold distinct futex wakes, so `burst / single` is the two kernels
+  against each other rather than a score.
+- **per-operation kernel work** — `timer rearms per sleep` should be about one,
+  and says the timer is being reprogrammed by something other than the sleep
+  that needed it when it is not. `task polls` and `weak execs created per RT`
+  are the executor's own accounting: a task that yields in the middle of a poll
+  leaves a weak executor holding a 32 KiB stack behind it, and that churn is
+  invisible from userspace.
+
+The kernel-side rows read `/proc/perf/kernel`, which Linux does not have, so
+there they are `n/a` and the userspace rows are the whole comparison. Every
+userspace row runs on both. The section also echoes the boot's `sched mode:`
+line, so a captured report cannot be compared against one whose policy
+switches differed — `scripts/qemu-bench.sh -c 'WAKEPREEMPT=0'` and
+`-c 'TIMERDEADLINE=0'` turn those off on one build, which is the only honest
+way to A/B them (rebuilding between A and B changes the binary and its layout,
+and TCG run-to-run variance is large enough to hide the effect either way).
 
 **SMP SCALING** `[kernel]` — N threads running the same pure-userspace ALU loop
 that one thread ran. The work has no kernel component, so anything short of
@@ -176,6 +240,16 @@ different task; it is *honoured* when that CPU cuts the running thread's
 timeslice short in response. That percentage is the kernel-side twin of the
 `wake late loaded/idle` ratio above.
 
+The `psched` section reads this file before and after each probe and prints the
+*delta* divided by the operations that caused it, which is the form that
+compares across machines. The lines it uses are `sched:` (task polls,
+weak-executor yields), `sched steal:` (scans, probes, affinity-empty, skipped),
+`sched weak:` (executors created, peak live, soft-cap hits, stack-pool
+overflow), `sched stack:` (high-water), `timer rearms:` and `wakeup preempt:`.
+They are located by the label that introduces the line and then by position
+within it, so a line that is renamed or reordered makes those rows read `n/a`
+rather than report a number from a neighbouring field.
+
 ## Suggested comparisons
 
 - **Eclipse vs Linux, same machine** — the only comparison that settles an
@@ -192,6 +266,7 @@ timeslice short in response. That percentage is the kernel-side twin of the
   frequency scaling; a gap mostly on `DISK` points at I/O.
 - **Before vs after a kernel change** — capture the output, rebuild, capture
   again. `--only sched` is usually the fastest way to see whether a scheduler
-  change did anything.
+  change did anything, and `--only psched` the fastest way to see *which*
+  mechanism it moved.
 
 Paste the output somewhere you can diff it; the labels and units are stable.
