@@ -194,7 +194,11 @@ en los tres objetos, blobs de modo (`CREATEPROPBLOB`/`MODE_ID`) y
   ("requires full modeset").
 - `PAGE_FLIP_EVENT` encola un `DRM_EVENT_FLIP_COMPLETE` por CRTC del commit.
 - `PAGE_FLIP_ASYNC` se rechaza (las *caps* async son 0).
-- Objeto/propiedad desconocidos → ENOENT; valores fuera de rango → EINVAL.
+- Objeto/propiedad desconocidos → ENOENT; un valor que la propiedad no
+  admite → EINVAL **en la propiedad**, antes del commit, como
+  `drm_property_change_valid_get`: un `FB_ID`/`CRTC_ID` que no nombra nada o
+  supera 32 bits, un `MODE_ID`/`FB_DAMAGE_CLIPS` sin blob, un rango o enum
+  fuera de lo anunciado (`IN_FENCE_FD` es `[-1, INT_MAX]`).
 - El commit de un `FB_ID` hace el *scanout* (mismo blit que la ruta legacy).
 
 **Cómo activarlo**: es estrictamente **opt-in** mientras la ruta legacy siga

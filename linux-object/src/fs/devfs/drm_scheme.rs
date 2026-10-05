@@ -4991,6 +4991,7 @@ fn make_modeinfo_with(w: u32, h: u32, panel: Option<&edid::DetailedTiming>) -> [
 }
 
 const I32_MIN_U64: u64 = i32::MIN as i64 as u64;
+const MINUS_ONE_U64: u64 = -1i64 as u64;
 const I32_MAX_U64: u64 = i32::MAX as u64;
 const U32_MAX_U64: u64 = u32::MAX as u64;
 
@@ -5218,7 +5219,9 @@ fn prop_spec(prop_id: u32) -> Option<PropSpec> {
         PROP_IN_FENCE_FD => PropSpec {
             name: "IN_FENCE_FD",
             flags: DRM_MODE_PROP_SIGNED_RANGE | DRM_MODE_PROP_ATOMIC,
-            values: &[I32_MIN_U64, I32_MAX_U64],
+            // `[-1, INT_MAX]` (`drm_mode_create_standard_properties`): -1 is
+            // the "no fence" sentinel and there is no fd below it.
+            values: &[MINUS_ONE_U64, I32_MAX_U64],
             enums: &[],
         },
         PROP_OUT_FENCE_PTR => PropSpec {
@@ -5405,13 +5408,66 @@ fn atomic_stage(upd: &mut drm::AtomicUpdate, obj_id: u32, prop_id: u32, value: u
     atomic_stage_on(upd, obj, prop_id, value)
 }
 
+/// Whether `obj` carries property `prop_id` at all: the per-object
+/// property lists of `plane_props` / `crtc_props` / `connector_props`, as an
+/// atomic client sees them. `drm_mode_atomic_ioctl` resolves the property on
+/// the object (`drm_mode_obj_find_prop_id`) before it looks at the value, so
+/// a property some other object owns is ENOENT whatever value comes with it.
+fn atomic_object_has(obj: AtomicObject, prop_id: u32) -> bool {
+    match obj {
+        AtomicObject::Plane => matches!(
+            prop_id,
+            PROP_TYPE
+                | PROP_FB_ID
+                | PROP_CRTC_ID
+                | PROP_CRTC_X
+                | PROP_CRTC_Y
+                | PROP_CRTC_W
+                | PROP_CRTC_H
+                | PROP_SRC_X
+                | PROP_SRC_Y
+                | PROP_SRC_W
+                | PROP_SRC_H
+                | PROP_IN_FENCE_FD
+                | PROP_FB_DAMAGE_CLIPS
+        ),
+        AtomicObject::Crtc => matches!(prop_id, PROP_ACTIVE | PROP_MODE_ID | PROP_OUT_FENCE_PTR),
+        AtomicObject::Connector => matches!(
+            prop_id,
+            PROP_CRTC_ID | PROP_DPMS | PROP_EDID | PROP_LINK_STATUS | PROP_NON_DESKTOP
+        ),
+    }
+}
+
 /// [`atomic_stage`] once the object kind is known.
+///
+/// The value is checked against the property's own spec before any arm
+/// looks at it, the way `drm_atomic_set_property` runs
+/// `drm_property_change_valid_get` first: an immutable property, a range or
+/// enum value the property does not advertise, an object id above 32 bits
+/// or naming no framebuffer / CRTC, and a blob id naming no blob are all
+/// EINVAL *at the property*, before the commit's check phase. Without it
+/// `FB_ID = real_fb | 1 << 32` was truncated to the real framebuffer and
+/// presented, `IN_FENCE_FD = 1 << 32` became a wait on fd 0, a CRTC_W of
+/// `1 << 31` wrapped negative, and a framebuffer or mode blob that did not
+/// exist was staged and answered ENOENT by the commit, which a compositor
+/// reads as "the object vanished" rather than "the value is bad".
 fn atomic_stage_on(
     upd: &mut drm::AtomicUpdate,
     obj: AtomicObject,
     prop_id: u32,
     value: u64,
 ) -> Result<()> {
+    if !atomic_object_has(obj, prop_id) {
+        return Err(FsError::EntryNotFound);
+    }
+    let spec = prop_spec(prop_id).ok_or(FsError::EntryNotFound)?;
+    if !property_change_valid(&spec, value) {
+        return Err(FsError::InvalidParam);
+    }
+    // Every cast below is exact: the range check above bounded the value to
+    // the field's type (an object or blob id to 32 bits, a signed range to
+    // i32, the unsigned ones to u32).
     match obj {
         AtomicObject::Plane => match prop_id {
             PROP_FB_ID => upd.plane_fb_id = Some(value as u32),
@@ -5424,31 +5480,25 @@ fn atomic_stage_on(
             PROP_SRC_Y => upd.src_y = Some(value as u32),
             PROP_SRC_W => upd.src_w = Some(value as u32),
             PROP_SRC_H => upd.src_h = Some(value as u32),
-            // IN_FENCE_FD: -1 = none (ignore). A real fd is waited for before
-            // the commit presents -- see `DrmDev::atomic_in_fence_sleep`, which
-            // runs in the async syscall path ahead of this sync arm. Staging it
-            // here is still what makes the commit accept the property.
+            // IN_FENCE_FD: -1 = none (ignore); the range is `[-1, INT_MAX]`,
+            // so anything else is a real fd. It is waited for before the
+            // commit presents -- see `DrmDev::atomic_in_fence_sleep`, which
+            // runs in the async syscall path ahead of this sync arm. Staging
+            // it here is still what makes the commit accept the property.
             PROP_IN_FENCE_FD => {
                 let fd = value as i32;
-                if fd < -1 {
-                    return Err(FsError::InvalidParam);
-                }
                 if fd >= 0 {
                     upd.in_fence_fd = Some(fd);
                 }
             }
             PROP_FB_DAMAGE_CLIPS => upd.damage_clips = Some(value as u32),
-            // "type" is immutable.
-            PROP_TYPE => return Err(FsError::InvalidParam),
-            _ => return Err(FsError::EntryNotFound),
+            // "type" is immutable and was refused above; nothing else of the
+            // plane's reaches here.
+            _ => return Err(FsError::InvalidParam),
         },
         AtomicObject::Crtc => match prop_id {
-            PROP_ACTIVE => {
-                if value > 1 {
-                    return Err(FsError::InvalidParam);
-                }
-                upd.active = Some(value != 0);
-            }
+            // ACTIVE is advertised as `[0, 1]`, which the range check held.
+            PROP_ACTIVE => upd.active = Some(value != 0),
             PROP_MODE_ID => upd.mode_blob = Some(value as u32),
             // OUT_FENCE_PTR: userspace pointer that must receive an i32 fd.
             // NULL is ignored; non-null is staged for writeback after commit.
@@ -5463,15 +5513,13 @@ fn atomic_stage_on(
         AtomicObject::Connector => match prop_id {
             PROP_CRTC_ID => upd.connector_crtc_id = Some(value as u32),
             // Properties the connector really has but that an atomic commit
-            // cannot set: DPMS is legacy-only, and EDID / link-status /
-            // non-desktop are immutable. Linux answers all four EINVAL --
-            // `drm_mode_atomic_ioctl` looks the property up first and only
-            // then refuses it -- and ENOENT here would tell a compositor that
-            // enumerated the property that it has since vanished.
-            PROP_DPMS | PROP_EDID | PROP_LINK_STATUS | PROP_NON_DESKTOP => {
-                return Err(FsError::InvalidParam)
-            }
-            _ => return Err(FsError::EntryNotFound),
+            // cannot set: EDID / link-status / non-desktop are immutable and
+            // were refused above; DPMS is legacy-only. Linux answers all
+            // four EINVAL -- `drm_mode_atomic_ioctl` looks the property up
+            // first and only then refuses it -- and ENOENT here would tell a
+            // compositor that enumerated the property that it has since
+            // vanished.
+            _ => return Err(FsError::InvalidParam),
         },
     }
     Ok(())
@@ -15671,21 +15719,190 @@ mod out_fence_tests {
     fn a_failed_commit_still_writes_minus_one_into_the_out_fence_slot() {
         let (_screen, c) = atomic_client(32, 8);
         let mut slot: i32 = UNWRITTEN;
-        // A plane pointed at a CRTC that does not exist: staged fine, refused by
-        // the commit's check phase.
+        // A plane given a framebuffer but no CRTC: every value is legal for
+        // its property, so it stages fine and is refused by the commit's
+        // check phase (`drm_atomic_plane_check`: "FB set but no CRTC").
+        let buf = c.create_dumb(32, 8);
+        let fb = c.addfb2(&buf);
         let req = Request::new(
             &[drm::SYNTH_CRTC_ID, drm::SYNTH_PLANE_ID],
-            &[1, 1],
-            &[PROP_OUT_FENCE_PTR, PROP_CRTC_ID],
-            &[&mut slot as *mut i32 as u64, 0x999],
+            &[1, 2],
+            &[PROP_OUT_FENCE_PTR, PROP_FB_ID, PROP_CRTC_ID],
+            &[&mut slot as *mut i32 as u64, fb as u64, 0],
         );
 
         assert_eq!(
             commit(&c, &req, 0),
-            Err(FsError::EntryNotFound),
-            "the bogus CRTC reference was accepted"
+            Err(FsError::InvalidParam),
+            "a framebuffer on a plane with no CRTC was accepted"
         );
         assert_eq!(slot, -1, "the client's fence slot was left uninitialised");
+        c.rmfb(fb).expect("RMFB");
+        c.destroy_dumb(buf.handle).expect("DESTROY_DUMB");
+    }
+
+    /// `drm_atomic_set_property` runs `drm_property_change_valid_get` on every
+    /// value before anything is staged: an object id that names no
+    /// framebuffer or CRTC, a blob id that names no blob, and a value outside
+    /// the property's range are EINVAL at the property, and the out-fence
+    /// slot is never touched because the commit never ran. Here a
+    /// non-existent FB_ID, CRTC_ID and MODE_ID were staged and answered
+    /// ENOENT by the commit, with `-1` written into the slot; and the values
+    /// were truncated to the field's width instead of checked, so
+    /// `FB_ID = fb | 1 << 32` presented `fb`, `IN_FENCE_FD = 1 << 32` waited
+    /// on fd 0, `CRTC_W = 1 << 31` wrapped negative and `SRC_X = 1 << 32`
+    /// became 0. A compositor that reads ENOENT retires the object; one whose
+    /// bad value is accepted never learns it sent one.
+    #[test]
+    fn a_value_the_property_cannot_take_is_refused_at_the_property_not_by_the_commit() {
+        let (_screen, c) = atomic_client(32, 8);
+        let buf = c.create_dumb(32, 8);
+        let fb = c.addfb2(&buf);
+        const NO_SUCH: u64 = 0x999;
+        let plane = drm::SYNTH_PLANE_ID;
+        let crtc = drm::SYNTH_CRTC_ID;
+
+        for (obj, prop, value, what) in [
+            (
+                plane,
+                PROP_FB_ID,
+                NO_SUCH,
+                "a framebuffer that does not exist",
+            ),
+            (plane, PROP_CRTC_ID, NO_SUCH, "a CRTC that does not exist"),
+            (
+                crtc,
+                PROP_MODE_ID,
+                NO_SUCH,
+                "a mode blob that does not exist",
+            ),
+            (
+                plane,
+                PROP_FB_DAMAGE_CLIPS,
+                NO_SUCH,
+                "a damage blob that does not exist",
+            ),
+            (
+                plane,
+                PROP_FB_ID,
+                fb as u64 | 1 << 32,
+                "a framebuffer id above 32 bits",
+            ),
+            (
+                plane,
+                PROP_CRTC_ID,
+                crtc as u64 | 1 << 32,
+                "a CRTC id above 32 bits",
+            ),
+            (
+                plane,
+                PROP_IN_FENCE_FD,
+                1 << 32,
+                "an in-fence fd above INT_MAX",
+            ),
+            (
+                plane,
+                PROP_IN_FENCE_FD,
+                -2i64 as u64,
+                "an in-fence fd below -1",
+            ),
+            (plane, PROP_CRTC_W, 1 << 31, "a CRTC_W above INT_MAX"),
+            (plane, PROP_CRTC_H, u64::MAX, "a CRTC_H above INT_MAX"),
+            (plane, PROP_SRC_X, 1 << 32, "a SRC_X above UINT_MAX"),
+            (plane, PROP_SRC_W, 1 << 32, "a SRC_W above UINT_MAX"),
+            (plane, PROP_CRTC_X, 1 << 31, "a CRTC_X above INT_MAX"),
+            (crtc, PROP_ACTIVE, 2, "an ACTIVE that is neither 0 nor 1"),
+        ] {
+            let mut slot: i32 = UNWRITTEN;
+            let req = Request::new(
+                &[crtc, obj],
+                &[1, 1],
+                &[PROP_OUT_FENCE_PTR, prop],
+                &[&mut slot as *mut i32 as u64, value],
+            );
+            assert_eq!(
+                commit(&c, &req, DRM_MODE_ATOMIC_TEST_ONLY),
+                Err(FsError::InvalidParam),
+                "{} was not refused as an invalid value",
+                what,
+            );
+            assert_eq!(
+                slot, UNWRITTEN,
+                "{}: the commit never ran, so the fence slot must be left alone",
+                what,
+            );
+        }
+
+        // A property some other object owns is ENOENT even with a value it
+        // could never take, and so is one nobody has: `drm_mode_atomic_ioctl`
+        // looks the property up on the object before anything is checked.
+        for (obj, prop, value, what) in [
+            (crtc, PROP_FB_ID, NO_SUCH, "FB_ID on the CRTC"),
+            (plane, PROP_ACTIVE, 2, "ACTIVE on the plane"),
+            (plane, 0xDEAD, NO_SUCH, "a property nobody has"),
+        ] {
+            let mut slot: i32 = UNWRITTEN;
+            let req = Request::new(
+                &[crtc, obj],
+                &[1, 1],
+                &[PROP_OUT_FENCE_PTR, prop],
+                &[&mut slot as *mut i32 as u64, value],
+            );
+            assert_eq!(
+                commit(&c, &req, DRM_MODE_ATOMIC_TEST_ONLY),
+                Err(FsError::EntryNotFound),
+                "{} was not refused as a property the object does not have",
+                what,
+            );
+            assert_eq!(
+                slot, UNWRITTEN,
+                "{}: the fence slot must be left alone",
+                what
+            );
+        }
+
+        // The same properties with values they do take are staged: the
+        // refusals above are the values, not the properties. FB_ID names the
+        // real framebuffer and CRTC_ID the real CRTC, so the check phase
+        // accepts the plane too.
+        let mut slot: i32 = UNWRITTEN;
+        let req = Request::new(
+            &[crtc, plane],
+            &[1, 11],
+            &[
+                PROP_OUT_FENCE_PTR,
+                PROP_FB_ID,
+                PROP_CRTC_ID,
+                PROP_IN_FENCE_FD,
+                PROP_CRTC_W,
+                PROP_CRTC_H,
+                PROP_SRC_X,
+                PROP_SRC_W,
+                PROP_CRTC_X,
+                PROP_FB_DAMAGE_CLIPS,
+                PROP_SRC_Y,
+                PROP_SRC_H,
+            ],
+            &[
+                &mut slot as *mut i32 as u64,
+                fb as u64,
+                crtc as u64,
+                -1i64 as u64,
+                32,
+                8,
+                0,
+                32 << 16,
+                0,
+                0,
+                0,
+                8 << 16,
+            ],
+        );
+        assert_eq!(commit(&c, &req, DRM_MODE_ATOMIC_TEST_ONLY), Ok(0));
+        assert_eq!(slot, -1, "TEST_ONLY writes -1 into the slot");
+
+        c.rmfb(fb).expect("RMFB");
+        c.destroy_dumb(buf.handle).expect("DESTROY_DUMB");
     }
 
     /// `TEST_ONLY` writes `-1` too: nothing was committed, so there is nothing
