@@ -2177,4 +2177,659 @@ mod tests {
              libxul.so in a RAM-backed image, and two menu entries"
         );
     }
+
+    /// Every argument of one `apk add`, in order, as strings.
+    fn apk_args(cmd: &Command) -> Vec<String> {
+        cmd.get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    /// One `apk add` against `keys`, with everything else fixed.
+    fn apk_add(keys: &Path, initdb: bool, update_cache: bool) -> Vec<String> {
+        apk_args(&mk_apk_add(
+            Path::new("/apk"),
+            Path::new("/stage"),
+            "x86_64",
+            Path::new("/stage/etc/apk/repositories"),
+            Path::new("/cache"),
+            keys,
+            initdb,
+            update_cache,
+        ))
+    }
+
+    /// The flags that say where apk installs and from what, each of them a
+    /// reason a build broke once: no `--root` and the packages land on the
+    /// build host, no `--arch` and apk resolves for the builder's own
+    /// architecture, no `--repositories-file` and it reads the host's
+    /// `/etc/apk/repositories`, no `--cache-dir` and an offline rebuild has
+    /// nothing to reuse. They are checked as flag-and-value pairs because a
+    /// misspelled flag is not a flag apk ignores -- it is an argument it takes
+    /// for a package name.
+    #[test]
+    fn every_apk_add_says_where_to_install_for_what_and_from_where() {
+        let args = apk_add(Path::new("/no/such/keys"), true, true);
+        for (flag, value) in [
+            ("--root", "/stage"),
+            ("--arch", "x86_64"),
+            ("--repositories-file", "/stage/etc/apk/repositories"),
+            ("--cache-dir", "/cache"),
+        ] {
+            let i = args
+                .iter()
+                .position(|a| a == flag)
+                .unwrap_or_else(|| panic!("apk add must pass {flag}: {args:?}"));
+            assert_eq!(args.get(i + 1).map(String::as_str), Some(value), "{flag}");
+        }
+        assert_eq!(
+            args.first().map(String::as_str),
+            Some("add"),
+            "the subcommand is `add`, not one that could remove something"
+        );
+        assert!(
+            args.iter().any(|a| a == "--no-scripts"),
+            "a post-install script would need to chroot into the target: {args:?}"
+        );
+    }
+
+    /// apk-tools 3.x creates its database only when asked with `--initdb`, and
+    /// only the first add into the empty staging root may ask: a later one into
+    /// the now-populated root that re-inits throws away everything installed so
+    /// far.
+    #[test]
+    fn the_package_database_is_created_once_and_never_re_initialised() {
+        let keys = Path::new("/no/such/keys");
+        assert!(apk_add(keys, true, true).iter().any(|a| a == "--initdb"));
+        assert!(!apk_add(keys, false, true).iter().any(|a| a == "--initdb"));
+    }
+
+    /// A cached index goes stale, and a stale one is worse than none: it still
+    /// lists every package name, so resolution succeeds and the FETCH is what
+    /// 404s. That is how `freedoom` shipped absent from build after build on a
+    /// perfectly good network. So the caller asks for a refresh first and falls
+    /// back to the cached index only when that fails -- the offline build, and
+    /// the only run that must not force a refresh.
+    #[test]
+    fn a_refreshed_index_is_asked_for_only_when_the_caller_wants_one() {
+        let keys = Path::new("/no/such/keys");
+        assert!(apk_add(keys, true, true)
+            .iter()
+            .any(|a| a == "--update-cache"));
+        assert!(!apk_add(keys, true, false)
+            .iter()
+            .any(|a| a == "--update-cache"));
+    }
+
+    /// apk 3.x refuses to create a database as a non-root user without
+    /// `--usermode`, and refuses `--usermode` AS root ("--usermode not allowed
+    /// as root"). One command serves both, so the flag has to follow who is
+    /// running the build: `make` on a developer's box, root under sudo or in
+    /// CI.
+    #[test]
+    fn the_usermode_flag_follows_who_is_running_the_build() {
+        let args = apk_add(Path::new("/no/such/keys"), true, true);
+        assert_eq!(
+            args.iter().any(|a| a == "--usermode"),
+            !running_as_root(),
+            "apk refuses the flag as root and refuses its absence as a user"
+        );
+    }
+
+    /// What signing keys buy and what their absence costs. The trap is an
+    /// EMPTY keys directory: apk takes `--keys-dir`, finds no key, calls every
+    /// APKINDEX untrusted and commits nothing of a sixty-package install. So a
+    /// keys directory with no `.pub` in it has to be treated exactly like no
+    /// keys directory at all.
+    ///
+    /// Worth saying out loud: `tools/apk/keys`, which the comment on
+    /// `mk_apk_add` points at, does not exist in this tree and nothing in it
+    /// ships an Alpine `.rsa.pub`, so every `apk add` of a build today takes
+    /// the third branch below. This test is what will notice the day keys land.
+    #[test]
+    fn a_keys_directory_with_no_public_key_buys_nothing_over_having_none() {
+        let d = scratch("apk-keys");
+
+        let empty = d.join("empty");
+        fs::create_dir_all(&empty).unwrap();
+        let args = apk_add(&empty, true, true);
+        assert!(args.iter().any(|a| a == "--keys-dir"));
+        assert!(
+            args.iter().any(|a| a == "--allow-untrusted"),
+            "an empty keys-dir leaves every index untrusted and installs nothing"
+        );
+
+        let keyed = d.join("keyed");
+        fs::create_dir_all(&keyed).unwrap();
+        fs::write(keyed.join("alpine-devel@example-4a6a0840.rsa.pub"), b"k").unwrap();
+        let args = apk_add(&keyed, true, true);
+        assert!(args.iter().any(|a| a == "--keys-dir"));
+        assert!(
+            !args.iter().any(|a| a == "--allow-untrusted"),
+            "with a key present the signatures are what gets checked"
+        );
+
+        let args = apk_add(&d.join("absent"), true, true);
+        assert!(
+            !args.iter().any(|a| a == "--keys-dir"),
+            "there is no directory to point apk at"
+        );
+        assert!(args.iter().any(|a| a == "--allow-untrusted"));
+
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    /// A name that is a prefix of another is still its own package. The set
+    /// ships `mesa-gl` next to `mesa-gles` and `sdl2` next to `sdl2_image`, so
+    /// a comparison that matched prefixes would report `sdl2` installed off the
+    /// back of `sdl2_image`: the audit would go quiet, `world` would gain an
+    /// entry for a package that is not there, and `apk fix` would read it. All
+    /// three comparisons answer the same question and are checked together.
+    #[test]
+    fn a_name_that_is_a_prefix_of_another_is_still_its_own_package() {
+        let requested = ["sdl2".to_string(), "mesa-gl".to_string()];
+        let installed = ["sdl2_image".to_string(), "mesa-gles".to_string()];
+        assert_eq!(
+            not_installed(&requested, &installed),
+            [&requested[0], &requested[1]],
+            "neither request resolved; the longer names are other packages"
+        );
+        // The other direction of the same comparison: a name ending in a digit
+        // is that name, not that name with the digit shaved off. Half this set
+        // ends in one (`sdl2`, `sdl3`, `mpg123`, `xfwm4`), so getting it wrong
+        // would report the whole lot missing while they sit there installed.
+        assert!(
+            not_installed(&requested[..1], &requested[..1]).is_empty(),
+            "sdl2 installed is sdl2 asked for"
+        );
+
+        let d = scratch("prefix");
+        let w = d.join("world");
+        fs::write(&w, "sdl2_image\n").unwrap();
+        merge_apk_world(&w, &requested, &installed);
+        assert_eq!(
+            world_of(&w),
+            ["sdl2_image"],
+            "nothing installed, so nothing is recorded"
+        );
+
+        let src = d.join("src-world");
+        fs::write(&src, "sdl2\nmesa-gl\n").unwrap();
+        union_apk_world(&src, &w);
+        assert_eq!(
+            world_of(&w),
+            ["sdl2_image", "sdl2", "mesa-gl"],
+            "and the union adds them rather than seeing them already there"
+        );
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    /// A blank line in an existing `world` is not a package. Carrying one
+    /// through puts an empty entry in the file apk reads to decide what to
+    /// keep, and makes the count in the log line wrong besides.
+    #[test]
+    fn a_blank_line_in_world_is_not_a_package() {
+        let d = scratch("world-blanks");
+        let w = d.join("world");
+        fs::write(&w, "busybox\n\n  \nmusl\n").unwrap();
+        merge_apk_world(&w, &["labwc".into()], &["labwc".into()]);
+        assert_eq!(
+            fs::read_to_string(&w).unwrap(),
+            "busybox\nmusl\nlabwc\n",
+            "the blank lines go, the order stays, and the file ends on a newline"
+        );
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    /// A symlink crosses AS a symlink, and has to be able to land where
+    /// something already is: the live root is not empty when this runs -- the
+    /// base rootfs is already fused into it -- so a package whose `usr/bin/X`
+    /// is a link to `Xorg` arrives on top of whatever the base left there.
+    /// `symlink` onto an existing path is EEXIST, so without clearing the
+    /// destination the link is silently not made and the live root keeps the
+    /// stale file.
+    #[test]
+    fn a_link_crosses_as_a_link_and_takes_the_place_of_what_was_there() {
+        let d = scratch("copy-symlink");
+        let src = d.join("src");
+        let dst = d.join("dst");
+        fs::create_dir_all(&src).unwrap();
+        fs::create_dir_all(&dst).unwrap();
+        std::os::unix::fs::symlink("/usr/bin/Xorg", src.join("X")).unwrap();
+        fs::write(dst.join("X"), b"the base rootfs got here first").unwrap();
+
+        copy_uncapped(&src, &dst, &d.join("matches-nothing"));
+
+        assert_eq!(
+            fs::read_link(dst.join("X")).unwrap(),
+            Path::new("/usr/bin/Xorg"),
+            "the link must replace the stale file, not fail on it"
+        );
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    /// A tree arrives with the shape it had, every file under the relative path
+    /// it came from. Flattening it would put `usr/lib/dri/*.so` straight into
+    /// `usr/lib`, where Mesa's loader does not look. A single file is the same
+    /// question with nothing to recurse through: its parent has to be created
+    /// too, since `fs::copy` into a directory that is not there just fails.
+    #[test]
+    fn a_tree_arrives_with_the_shape_it_had() {
+        let d = scratch("copy-shape");
+        let src = d.join("src");
+        let dst = d.join("dst");
+        fs::create_dir_all(src.join("dri")).unwrap();
+        fs::create_dir_all(src.join("xorg/modules/drivers")).unwrap();
+        fs::write(src.join("dri/nouveau_dri.so"), b"so").unwrap();
+        fs::write(src.join("xorg/modules/drivers/fbdev_drv.so"), b"so").unwrap();
+
+        copy_uncapped(&src, &dst, &d.join("matches-nothing"));
+
+        assert!(dst.join("dri/nouveau_dri.so").is_file());
+        assert!(dst.join("xorg/modules/drivers/fbdev_drv.so").is_file());
+
+        let lone = d.join("deeper/still/alsa.conf");
+        copy_uncapped(&src.join("dri/nouveau_dri.so"), &lone, &d.join("no"));
+        assert!(lone.is_file(), "a file makes its own parent on the way");
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    /// `skip` is the one path that does not cross, and it prunes what is under
+    /// it rather than only the entry itself.
+    #[test]
+    fn the_skipped_subtree_is_the_only_thing_left_behind() {
+        let d = scratch("copy-skip");
+        let src = d.join("src");
+        let dst = d.join("dst");
+        fs::create_dir_all(src.join("dri")).unwrap();
+        fs::write(src.join("dri/swrast_dri.so"), b"so").unwrap();
+        fs::write(src.join("libEGL.so.1"), b"so").unwrap();
+
+        copy_uncapped(&src, &dst, &src.join("dri"));
+
+        assert!(dst.join("libEGL.so.1").is_file(), "everything else crosses");
+        assert!(
+            !dst.join("dri").exists(),
+            "the skipped directory takes its contents with it"
+        );
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    /// Mesa 26's DRI drivers are symlinks into the megadriver that `usr/lib`
+    /// already carries, so they cost nothing -- and their absence is what broke
+    /// GL: labwc logged "virtio_gpu: driver missing" / "DRI2: failed to create
+    /// screen" and fell back to a kms_swrast that does not work. The skip is
+    /// pointed at a sentinel name for exactly that reason, so a skip naming a
+    /// real directory would take `usr/lib/dri` back out of the live root.
+    #[test]
+    fn the_dri_drivers_cross_with_the_rest_of_the_libraries() {
+        let d = scratch("live-dri");
+        let full = d.join("full");
+        let live = d.join("live");
+        fs::create_dir_all(full.join("usr/lib/dri")).unwrap();
+        fs::create_dir_all(full.join("usr/bin")).unwrap();
+        fs::create_dir_all(&live).unwrap();
+        fs::write(full.join("usr/bin/labwc"), b"#!/bin/sh\n").unwrap();
+        fs::write(full.join("usr/lib/dri/virtio_gpu_dri.so"), b"so").unwrap();
+        fs::write(full.join("usr/lib/libgallium-26.so"), b"so").unwrap();
+
+        copy_into_live(&full, &live);
+
+        assert!(
+            live.join("usr/lib/dri/virtio_gpu_dri.so").is_file(),
+            "excluding dri/ saved nothing and left GL with no driver"
+        );
+        assert!(live.join("usr/lib/libgallium-26.so").is_file());
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    /// The size notice is the only thing in the log that says how big the RAM
+    /// root got, so it has to be the whole tree: files summed, a symlink
+    /// counted as the nothing it is -- what it points at is already counted
+    /// where it lives, and an absolute one resolves against the build host
+    /// anyway -- and a path that is not there answered with 0 rather than a
+    /// panic in the middle of a build.
+    #[test]
+    fn the_size_of_a_tree_is_its_files_summed_and_a_link_weighs_nothing() {
+        let d = scratch("tree-size");
+        let root = d.join("usr");
+        fs::create_dir_all(root.join("lib/dri")).unwrap();
+        fs::write(root.join("lib/libGL.so"), vec![0u8; 1000]).unwrap();
+        fs::write(root.join("lib/dri/swrast_dri.so"), vec![0u8; 24]).unwrap();
+        std::os::unix::fs::symlink("/usr/lib/libGL.so", root.join("lib/dri/alias.so")).unwrap();
+
+        assert_eq!(tree_size(&root), 1024, "every file once, and no link");
+        assert_eq!(tree_size(&root.join("lib/libGL.so")), 1000);
+        assert_eq!(tree_size(&d.join("not-here")), 0);
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    /// ICU ships its data one of two ways and the build does not get to pick:
+    /// `--with-data-packaging=archive` writes a blob under
+    /// `usr/share/icu/<ver>/`, the default links it into
+    /// `libicudata.so.<maj>`. Both have to be recognised, because the warning
+    /// that fires when neither is reachable is all there is between a working
+    /// Firefox and an unhandled write to address 0 -- SpiderMonkey's `u_init()`
+    /// failing inside `JS_Init`, whose caller answers with a deliberate store
+    /// through a null pointer.
+    #[test]
+    fn both_ways_icu_can_ship_its_data_are_recognised() {
+        let d = scratch("icu-layout");
+
+        let archive = d.join("archive");
+        fs::create_dir_all(archive.join("usr/share/icu/76.1")).unwrap();
+        fs::write(archive.join("usr/share/icu/76.1/icudt76l.dat"), b"blob").unwrap();
+        assert_eq!(
+            icu_data_layout(&archive).as_deref(),
+            Some("usr/share/icu/76.1/icudt76l.dat"),
+            "the archive layout is named by the blob itself, version and all"
+        );
+
+        let lib = d.join("lib");
+        fs::create_dir_all(lib.join("usr/lib")).unwrap();
+        fs::write(lib.join("usr/lib/libicudata.so.76.1"), b"so").unwrap();
+        assert_eq!(
+            icu_data_layout(&lib).as_deref(),
+            Some("usr/lib/libicudata.so.76.1")
+        );
+
+        assert_eq!(
+            icu_data_layout(&d.join("neither")),
+            None,
+            "nothing anywhere is the case the warning exists for"
+        );
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    /// `libicudata.so` with no version behind it is the -dev symlink: it
+    /// carries no data of its own and is absent from the package that ships the
+    /// library. Answering with it would be worse than answering nothing,
+    /// because it is the answer that silences the warning.
+    #[test]
+    fn the_bare_development_symlink_is_not_an_icu_data_blob() {
+        let d = scratch("icu-dev");
+        fs::create_dir_all(d.join("usr/lib")).unwrap();
+        std::os::unix::fs::symlink("libicudata.so.76", d.join("usr/lib/libicudata.so")).unwrap();
+        assert_eq!(icu_data_layout(&d), None);
+
+        // Nor is a `.dat` outside `usr/share/icu`: that path is where ICU's
+        // own data loader looks, and a blob anywhere else is not reachable.
+        fs::create_dir_all(d.join("usr/share/icu-data/76.1")).unwrap();
+        fs::write(d.join("usr/share/icu-data/76.1/icudt76l.dat"), b"blob").unwrap();
+        assert_eq!(icu_data_layout(&d), None);
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    /// The failure this file has hit five times over: the package installs, its
+    /// binary and its `.so` reach the live root through `usr/bin` and
+    /// `usr/lib`, and the DATA it opens at runtime does not, because
+    /// `LIVE_KEEP` omits `usr/share` wholesale and `LIVE_TREES` is the only way
+    /// in. It then fails exactly like a missing package, with the build saying
+    /// nothing: `alsa.conf` absent and `aplay -l` answering "Invalid CTL hw:0",
+    /// the Vulkan ICD manifests absent and the loader enumerating zero devices,
+    /// the Freedoom wads absent and the launcher finding no IWAD, glycin's
+    /// conf.d absent and every image decode failing with the loader sitting
+    /// right there. So for each of these: both halves, or neither.
+    #[test]
+    fn the_data_each_shipped_program_opens_at_runtime_has_a_tree_of_its_own() {
+        for (pkg, tree, opens) in [
+            (
+                "alsa-lib",
+                "usr/share/alsa",
+                "alsa.conf, which defines the `hw` plugin",
+            ),
+            (
+                "pulseaudio",
+                "usr/share/pulseaudio",
+                "the mixer paths and the profile sets",
+            ),
+            (
+                "vulkan-loader",
+                "usr/share/vulkan",
+                "the ICD manifests, the only way a driver is found",
+            ),
+            (
+                "tzdata",
+                "usr/share/zoneinfo",
+                "the zone files musl's localtime_r reads",
+            ),
+            (
+                "xkeyboard-config",
+                "usr/share/X11",
+                "the xkb database xkbcomp compiles",
+            ),
+            (
+                "font-misc-misc",
+                "usr/share/fonts",
+                "the `fixed` font X refuses to start without",
+            ),
+            (
+                "glycin-svg",
+                "usr/share/glycin-loaders",
+                "the conf.d that maps a mime type to a loader",
+            ),
+            ("freedoom", "usr/share/games", "the IWADs"),
+            ("adwaita-icon-theme", "usr/share/icons", "the icon theme"),
+            ("shared-mime-info", "usr/share/mime", "the mime database"),
+            ("xfce4-session", "usr/share/xfce4", "the session's own data"),
+            ("dbus", "usr/share/dbus-1", "the service activation files"),
+            (
+                "dbus",
+                "etc/dbus-1",
+                "the bus configuration, without which dbus-daemon will not start",
+            ),
+            (
+                "firefox",
+                "usr/share/icu",
+                "ICU's data blob, when the build packages it as an archive",
+            ),
+        ] {
+            assert!(
+                DEFAULT_PACKAGES.contains(&pkg),
+                "{pkg} is part of the shipped stack"
+            );
+            assert!(
+                LIVE_TREES.contains(&tree),
+                "{pkg} is installed but the live root would not carry {tree} -- \
+                 {opens}. The program reaches QEMU and fails there as if absent"
+            );
+        }
+    }
+
+    /// Where the programs and the libraries themselves come from. `lib64` and
+    /// `lib/x86_64-linux-gnu` are empty on a pure-musl build and are what makes
+    /// a glibc-built desktop stack runnable at all: its loader lives there, and
+    /// without it every one of those binaries is unrunnable in QEMU.
+    #[test]
+    fn every_program_the_live_root_runs_comes_from_a_tree_it_copies() {
+        for tree in [
+            "usr/bin",
+            "usr/sbin",
+            "usr/lib",
+            "usr/libexec",
+            "lib64",
+            "lib/x86_64-linux-gnu",
+        ] {
+            assert!(
+                LIVE_TREES.contains(&tree),
+                "{tree} holds programs, libraries or the loader behind them"
+            );
+        }
+    }
+
+    /// Every tree is a relative path -- `Path::join` with an absolute one drops
+    /// the live root entirely and reads the build host's own `/usr` -- and no
+    /// tree is listed twice or sits inside another, either of which copies it
+    /// twice.
+    #[test]
+    fn no_tree_is_absolute_nor_listed_twice_nor_inside_another() {
+        for (i, a) in LIVE_TREES.iter().enumerate() {
+            assert!(
+                !a.starts_with('/'),
+                "{a} is absolute, so joining it onto the live root gives the host's own path"
+            );
+            for b in &LIVE_TREES[i + 1..] {
+                assert_ne!(a, b, "{a} is listed twice");
+                assert!(
+                    !Path::new(b).starts_with(a) && !Path::new(a).starts_with(b),
+                    "{a} and {b} are nested, so one of them is copied twice"
+                );
+            }
+        }
+    }
+
+    /// What the real-hardware run found missing. X with no input driver comes
+    /// up with no keyboard and no mouse, which from the outside is a hung
+    /// machine; Eclipse drives X through the framebuffer rather than DRM, so
+    /// fbdev has to be installed explicitly or the server falls back to
+    /// `modesetting`; `startx` itself comes from `xinit`; and the server
+    /// refuses to start at all without its base bitmap fonts and the cursor
+    /// font.
+    #[test]
+    fn the_x_server_its_two_drivers_and_the_fonts_it_needs_ship_together() {
+        for pkg in [
+            "xorg-server",
+            "xf86-video-fbdev",
+            "xf86-input-libinput",
+            "xinit",
+            "font-misc-misc",
+            "font-cursor-misc",
+            "encodings",
+        ] {
+            assert!(
+                DEFAULT_PACKAGES.contains(&pkg),
+                "{pkg} is one of the pieces a usable X session needs"
+            );
+        }
+    }
+
+    /// Since Mesa 25.1 the default GL path on NVIDIA is Zink (GL on Vulkan)
+    /// over NVK, so GL now needs a Vulkan driver and a loader underneath it:
+    /// absent, every renderer failed with "DRI2: failed to load driver" and not
+    /// one nouveau ioctl was ever issued. And under the hardware path there has
+    /// to be a SOFTWARE floor -- with only NVK present and NVK broken the
+    /// loader enumerates zero devices, Zink fails, glamor fails, and Xwayland
+    /// exits with "no GL providers". lavapipe always works, so the session
+    /// survives a broken NVK.
+    #[test]
+    fn the_gl_stack_has_a_software_floor_under_every_hardware_path() {
+        for pkg in [
+            "mesa-dri-gallium",
+            "vulkan-loader",
+            "mesa-vulkan-nouveau",
+            "mesa-vulkan-swrast",
+        ] {
+            assert!(
+                DEFAULT_PACKAGES.contains(&pkg),
+                "{pkg} is part of the GL path"
+            );
+        }
+        // wlroots' gles2 renderer dlopens libEGL.so.1 and libGLESv2.so.2,
+        // which in Alpine live in these two packages and NOT in `mesa-gl`.
+        // They arrive transitively through labwc today; if that chain changes,
+        // EGL init fails and wlroots falls back to the pixman software renderer
+        // with no error at all -- single-digit FPS that looks exactly like the
+        // GPU having stopped working.
+        for pkg in ["mesa-egl", "mesa-gles"] {
+            assert!(
+                DEFAULT_PACKAGES.contains(&pkg),
+                "{pkg} is declared explicitly rather than relied on transitively"
+            );
+        }
+    }
+
+    /// The compositor, the seat manager it waits for and the X bridge it starts
+    /// clients under. Each is the real binary behind a wrapper that
+    /// `write_init_wrappers` lays down in `/usr/local/bin`, and a wrapper whose
+    /// binary never installed prints "real binary not found (apk add …)", exits
+    /// 127, and gets respawned by the init for the whole boot -- a black screen
+    /// that looks nothing like a missing package.
+    #[test]
+    fn the_wayland_session_ships_the_binaries_its_wrappers_exec() {
+        for pkg in ["labwc", "seatd", "xwayland"] {
+            assert!(
+                DEFAULT_PACKAGES.contains(&pkg),
+                "an init wrapper execs {pkg}, so it has to be installed"
+            );
+        }
+    }
+
+    /// No package is asked for twice, counting the spellings apk collapses:
+    /// `firefox` and `firefox>102` are one name to it, and a set holding both
+    /// resolves the same package twice and leaves two `world` entries for it.
+    #[test]
+    fn no_package_is_asked_for_twice_under_any_spelling() {
+        let mut seen: Vec<&str> = Vec::new();
+        for atom in DEFAULT_PACKAGES {
+            let name = apk_atom_name(atom);
+            assert!(
+                !seen.contains(&name),
+                "{name} is in the default set twice (as {atom:?})"
+            );
+            seen.push(name);
+        }
+        assert_eq!(seen.len(), DEFAULT_PACKAGES.len());
+    }
+
+    /// Either desktop on its own is enough to stage, and all three spellings of
+    /// an installed server count -- including the module directory, since
+    /// `usr/bin/X` is a symlink the staging step may not have made yet. labwc
+    /// used to reach the live root only as a side effect of the Xorg copy
+    /// sweeping all of `usr/bin`, so a labwc-only build, or one whose Xorg apk
+    /// failed, booted with the compositor absent: the wrapper is kept, finds no
+    /// `/usr/bin/labwc`, exits 127, and the init respawns it forever.
+    #[test]
+    fn either_desktop_on_its_own_is_enough_to_stage_the_live_root() {
+        for (tag, installed) in [
+            ("xorg-bin", "usr/bin/Xorg"),
+            ("xorg-x", "usr/bin/X"),
+            ("xorg-modules", "usr/lib/xorg/modules/libfb.so"),
+            ("labwc-only", "usr/bin/labwc"),
+        ] {
+            let d = scratch(tag);
+            let full = d.join("full");
+            let live = d.join("live");
+            let one = full.join(installed);
+            fs::create_dir_all(one.parent().unwrap()).unwrap();
+            fs::create_dir_all(full.join("usr/share/games/doom")).unwrap();
+            fs::create_dir_all(&live).unwrap();
+            fs::write(&one, b"#!/bin/sh\n").unwrap();
+            fs::write(full.join("usr/share/games/doom/freedoom1.wad"), b"IWAD").unwrap();
+
+            copy_into_live(&full, &live);
+
+            assert!(
+                live.join("usr/share/games/doom/freedoom1.wad").is_file(),
+                "{installed} on its own has to stage the desktop"
+            );
+            let _ = fs::remove_dir_all(&d);
+        }
+    }
+
+    /// The union goes INTO the live root's world, which is the one the QEMU
+    /// boot reads; the full rootfs's own world is the source and comes out of
+    /// this untouched. Backwards, the live boot lists nothing it has and the
+    /// installed image gains entries for packages that only ever lived in RAM.
+    #[test]
+    fn the_desktop_packages_are_recorded_in_the_live_world_not_the_other_way() {
+        let d = scratch("live-world");
+        let full = d.join("full");
+        let live = d.join("live");
+        fs::create_dir_all(full.join("usr/bin")).unwrap();
+        fs::create_dir_all(full.join("etc/apk")).unwrap();
+        fs::create_dir_all(live.join("etc/apk")).unwrap();
+        fs::write(full.join("usr/bin/labwc"), b"#!/bin/sh\n").unwrap();
+        fs::write(full.join("etc/apk/world"), "busybox\nlabwc\n").unwrap();
+        fs::write(live.join("etc/apk/world"), "busybox\n").unwrap();
+
+        copy_into_live(&full, &live);
+
+        assert_eq!(world_of(&live.join("etc/apk/world")), ["busybox", "labwc"]);
+        assert_eq!(
+            world_of(&full.join("etc/apk/world")),
+            ["busybox", "labwc"],
+            "the full rootfs's world is the source here, not the destination"
+        );
+        let _ = fs::remove_dir_all(&d);
+    }
 }
