@@ -712,13 +712,14 @@ pub fn kernel_report() -> String {
         sched_polled, polls_per_s, sched_weak, weak_per_s
     );
     {
-        let (scans, probed, ok, aff_empty, rebalance, skipped) =
+        let (scans, probed, ok, aff_empty, rebalance, skipped, rescue) =
             kernel_hal::kstats::sched_steal_stats();
         let _ = writeln!(
             out,
             "sched steal:  {} scans, {} probed, {} ok, {} affinity-empty, \
-             {} rebalance, {} skipped (no peer stealable)",
-            scans, probed, ok, aff_empty, rebalance, skipped
+             {} rebalance, {} skipped (no peer stealable), {} rescued (pinned \
+             away from its owner)",
+            scans, probed, ok, aff_empty, rebalance, skipped, rescue
         );
         let (created, peak, cap_hits) = kernel_hal::kstats::sched_weak_stats();
         let (pool, overflow) = kernel_hal::kstats::stack_pool_stats();

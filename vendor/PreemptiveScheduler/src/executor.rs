@@ -1378,8 +1378,22 @@ impl Executor {
             // peer has at least three we may poll, pull one first. Ownership
             // of the waker page stays with the victim (same as idle steal).
             let mut task_info = None;
-            if crate::runtime::rebalance_due() && self.task_collection.ready_num() == Some(1) {
-                task_info = crate::runtime::steal_for_balance();
+            if crate::runtime::rebalance_due() {
+                // Rescue first, and with no condition on our own load: a peer
+                // holding a task its mask forbids there is holding something
+                // NOBODY comes for. Its owner refuses it every pass and kicks
+                // us, but the kick is only read by `steal_task_from_other_cpu`,
+                // which this loop reaches only when our own queue came up
+                // empty. A CPU with work of its own never does -- so the task
+                // never runs again, rather than running late. See
+                // `runtime::STRANDED`.
+                if crate::runtime::stranded_peer_exists() {
+                    task_info = crate::runtime::rescue_stranded_task();
+                }
+                // Balance pull, unchanged: only when we have exactly one task.
+                if task_info.is_none() && self.task_collection.ready_num() == Some(1) {
+                    task_info = crate::runtime::steal_for_balance();
+                }
             }
             if task_info.is_none() {
                 task_info = self.task_collection.take_task();

@@ -50,6 +50,14 @@ hal_fn_def! {
         /// P-state control is active (non-HWP/CPPC parts, or under a hypervisor).
         pub fn pstate_governor_summary() -> Option<(u32, u8, u8)> { None }
 
+        /// Whether userspace may answer `getcpu` without a trap: the CPU has
+        /// the instruction that reports it (`RDTSCP` on x86_64) and the kernel
+        /// has written every CPU's own id where that instruction reads it.
+        ///
+        /// `false` everywhere else, and on hosted (libos) builds, so the vDSO
+        /// declines and the C library falls back to the syscall.
+        pub fn getcpu_usable() -> bool { false }
+
         /// Warm-reset the machine (reboot).
         pub fn reset() -> !;
 

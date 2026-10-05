@@ -1,6 +1,7 @@
 //! CPU information.
 
 use raw_cpuid::CpuId;
+use x86_64::registers::model_specific::Msr;
 
 // What the three calibrators below decide, as opposed to what they read, is
 // in `common::tsc_cal`, where a host test can drive it: the reference
@@ -362,6 +363,10 @@ hal_fn_impl! {
             super::power::governor_summary()
         }
 
+        fn getcpu_usable() -> bool {
+            getcpu_fastpath_ok()
+        }
+
         fn reset() -> ! {
             info!("resetting...");
             quiesce_devices();
@@ -395,4 +400,55 @@ hal_fn_impl! {
             }
         }
     }
+}
+
+// ── getcpu without a trap ───────────────────────────────────────────────────
+
+/// `IA32_TSC_AUX`: the 32-bit word `RDTSCP` and `RDPID` return in `ECX`.
+const IA32_TSC_AUX: u32 = 0xC000_0103;
+
+/// Whether this CPU implements `RDTSCP` (`CPUID.80000001H:EDX[27]`).
+///
+/// `RDPID` would do as well and is one instruction shorter, but it arrived with
+/// Ice Lake while `RDTSCP` has been there since Nehalem and Bulldozer, and the
+/// machines this runs on (Turing-era desktops, QEMU) all have it. Both read the
+/// same MSR, so a later `RDPID` path needs nothing new from the kernel.
+pub fn rdtscp_supported() -> bool {
+    CpuId::new()
+        .get_extended_function_info()
+        .is_some_and(|f| f.has_rdtscp())
+}
+
+/// Publish this CPU's logical id into `IA32_TSC_AUX`, so userspace can read it
+/// with `RDTSCP` instead of trapping into `getcpu`.
+///
+/// Per-CPU, so every AP runs it from `secondary_init` as well as the BSP. The
+/// MSR is written even when the id does not fit the encoding -- it is written
+/// as zero then -- because what decides whether userspace trusts the value is
+/// [`getcpu_fastpath_ok`], published once into the vDSO page, and a CPU that cannot
+/// be encoded makes the whole mechanism unusable rather than that one CPU
+/// wrong.
+pub fn init_tsc_aux() {
+    if !rdtscp_supported() {
+        return;
+    }
+    let cpu = crate::cpu::cpu_id() as u32;
+    let word = crate::getcpu::tsc_aux_word(cpu, 0).unwrap_or(0);
+    // SAFETY: `IA32_TSC_AUX` holds a value of the kernel's own choosing and is
+    // read by nothing but `RDTSCP`/`RDPID`. Writing it affects this CPU only.
+    unsafe { Msr::new(IA32_TSC_AUX).write(word as u64) };
+    if crate::getcpu::tsc_aux_word(cpu, 0).is_none() {
+        GETCPU_UNENCODABLE.store(true, core::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Set by any CPU whose logical id the `getcpu` encoding cannot hold, which
+/// disables the userspace fast path for everyone: a reader cannot know which
+/// CPU it is on, so it must not believe any of them.
+static GETCPU_UNENCODABLE: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Whether userspace may answer `getcpu` from `RDTSCP` on this machine.
+pub fn getcpu_fastpath_ok() -> bool {
+    rdtscp_supported() && !GETCPU_UNENCODABLE.load(core::sync::atomic::Ordering::Relaxed)
 }

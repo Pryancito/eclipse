@@ -1282,6 +1282,16 @@ async fn handle_user_trap(thread: &CurrentThread, mut ctx: Box<UserContext>) -> 
                 // mattering at all. See `kernel_hal::thread::preempt_now`.
                 if slice_expired || wake_resched {
                     kernel_hal::thread::preempt_now().await;
+                } else if kernel_hal::thread::need_resched_pending() {
+                    // Denied inside the floor. Left to the next interrupt, that
+                    // is the 4 ms tick for a thread in a userspace loop, which
+                    // takes none -- so the floor the comment above calls
+                    // 0.75 ms was five times that, and a neighbour that parks
+                    // briefly and often got served once per tick. Arm the timer
+                    // for the floor so the floor is the floor.
+                    if let Some(floor) = thread.sched_wake_preempt_floor_end() {
+                        kernel_hal::thread::arm_wake_preempt_floor(floor);
+                    }
                 }
             }
             Ok(())
