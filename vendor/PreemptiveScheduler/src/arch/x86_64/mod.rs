@@ -7,7 +7,7 @@ pub use context::*;
 global_asm!(include_str!("switch.S"));
 global_asm!(include_str!("executor_entry.S"));
 
-extern "C" {
+unsafe extern "C" {
     pub fn switch(old: *const ContextData, new: *const ContextData);
     pub fn executor_entry();
 }
@@ -19,9 +19,9 @@ extern "C" {
 /// corruption (or double consumption) happened inside the validation->ret
 /// window, which no earlier probe could see. Read via
 /// [`switch_bounce_snapshot`].
-#[no_mangle]
+#[unsafe(no_mangle)]
 static SWITCH_BOUNCE_COUNT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-#[no_mangle]
+#[unsafe(no_mangle)]
 static SWITCH_BOUNCE_SP: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// (bounce_count, last dead frame sp). Cross-CPU racy by design — diagnostics.
@@ -78,9 +78,10 @@ pub(crate) fn pg_base_register() -> usize {
     cr3
 }
 
+#[cfg(not(test))]
 use x86_64::instructions::interrupts;
 
-extern "C" {
+unsafe extern "C" {
     /// Provided by `kernel-hal`: park the CPU until the next interrupt using the
     /// coolest available C-state (C1E via MONITOR/MWAIT, falling back to `hlt`)
     /// and account the idle time for `/proc/perf/kernel`. A bare `sti; hlt` here
@@ -111,14 +112,30 @@ pub(crate) fn wait_for_interrupt() {
     unsafe { hal_cpu_idle() }
 }
 
+// Host stand-ins, same reason as `hal_cpu_idle_host_shim`: `cli`/`sti` are
+// privileged and SIGSEGV a user-mode test process. Nothing on the host has
+// interrupts to mask; report "enabled" so `run_with_intr_saved_off!` keeps
+// its save/restore shape without touching RFLAGS.IF.
+#[cfg(test)]
+pub(crate) fn intr_on() {}
+#[cfg(test)]
+pub(crate) fn intr_off() {}
+#[cfg(test)]
+pub(crate) fn intr_get() -> bool {
+    true
+}
+
+#[cfg(not(test))]
 pub(crate) fn intr_on() {
     interrupts::enable();
 }
 
+#[cfg(not(test))]
 pub(crate) fn intr_off() {
     interrupts::disable();
 }
 
+#[cfg(not(test))]
 pub(crate) fn intr_get() -> bool {
     interrupts::are_enabled()
 }

@@ -210,6 +210,51 @@ pub fn wakeup_preempt_stats() -> (u64, u64) {
     (0, 0)
 }
 
+/// `(steal scans, victims probed, steals ok, affinity-empty victims skipped, rebalance pulls)`.
+#[cfg(target_os = "none")]
+pub fn sched_steal_stats() -> (u64, u64, u64, u64, u64) {
+    executor::sched_steal_stats()
+}
+
+#[cfg(not(target_os = "none"))]
+pub fn sched_steal_stats() -> (u64, u64, u64, u64, u64) {
+    (0, 0, 0, 0, 0)
+}
+
+/// `(weak executors created, peak live weaks on any CPU, soft-cap hits)`.
+#[cfg(target_os = "none")]
+pub fn sched_weak_stats() -> (u64, u64, u64) {
+    executor::sched_weak_stats()
+}
+
+#[cfg(not(target_os = "none"))]
+pub fn sched_weak_stats() -> (u64, u64, u64) {
+    (0, 0, 0)
+}
+
+/// `(stack-pool occupied slots, overflow-list length)`.
+#[cfg(target_os = "none")]
+pub fn stack_pool_stats() -> (usize, usize) {
+    executor::stack_pool_stats()
+}
+
+#[cfg(not(target_os = "none"))]
+pub fn stack_pool_stats() -> (usize, usize) {
+    (0, 0)
+}
+
+/// `(deepest coroutine-stack use observed at a park, STACK_SIZE)` in bytes.
+/// The evidence for (or against) shrinking executor stacks.
+#[cfg(target_os = "none")]
+pub fn stack_high_water() -> (usize, usize) {
+    executor::stack_high_water()
+}
+
+#[cfg(not(target_os = "none"))]
+pub fn stack_high_water() -> (usize, usize) {
+    (0, 0)
+}
+
 /// `(alloc-registry drops, live-registry drops)` for the coroutine-stack
 /// hand-out guard.
 ///

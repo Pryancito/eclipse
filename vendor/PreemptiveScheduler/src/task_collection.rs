@@ -403,7 +403,7 @@ impl TaskCollection {
         key | (priority << PRIORITY_SHIFT)
     }
 
-    fn get_mut_inner(&self, priority: usize) -> MutexGuard<'_, FutureCollection> {
+    pub(crate) fn get_mut_inner(&self, priority: usize) -> MutexGuard<'_, FutureCollection> {
         self.lock_queue(priority)
     }
 
@@ -471,40 +471,47 @@ impl TaskCollection {
     /// recheck for the executor: `try_lock` so a peer mid-insert makes us
     /// conservatively report "ready" instead of spinning — the caller simply
     /// skips the halt and re-runs `take_task`.
+    ///
+    /// Only [`DEFAULT_PRIORITY`] is consulted. Every insert goes through
+    /// `add_task`, which always lands there; the other 31 queues stay empty
+    /// and `try_lock`ing them on the way into `hlt` was pure cache traffic.
     pub fn has_ready(&self) -> bool {
         let cpu = crate::arch::cpu_id() as usize;
-        self.future_collections.iter().any(|fc| {
-            match fc.try_lock() {
-                Some(mut inner) => {
-                    for page_idx in 0..inner.pages.len() {
-                        let page = &inner.pages[page_idx];
-                        let (notified, dropped, borrowed) = page.peek();
-                        let runnable = notified & !dropped & !borrowed;
-                        if runnable != 0 {
-                            for subpage_idx in BitIter::from(runnable) {
-                                let key = pack_key(DEFAULT_PRIORITY, page_idx, subpage_idx);
-                                let allowed = inner
-                                    .slab
-                                    .get(unmask_priority(key))
-                                    .map(|task| task.allowed_on(cpu))
-                                    .unwrap_or(true);
-                                if allowed {
-                                    return true;
-                                }
+        // A smashed header means we can no longer see the queue. Don't halt:
+        // a wake may be sitting where we can no longer name it.
+        let Some(fc) = self.queue(DEFAULT_PRIORITY) else {
+            return true;
+        };
+        match fc.try_lock() {
+            Some(mut inner) => {
+                for page_idx in 0..inner.pages.len() {
+                    let page = &inner.pages[page_idx];
+                    let (notified, dropped, borrowed) = page.peek();
+                    let runnable = notified & !dropped & !borrowed;
+                    if runnable != 0 {
+                        for subpage_idx in BitIter::from(runnable) {
+                            let key = pack_key(DEFAULT_PRIORITY, page_idx, subpage_idx);
+                            let allowed = inner
+                                .slab
+                                .get(unmask_priority(key))
+                                .map(|task| task.allowed_on(cpu))
+                                .unwrap_or(true);
+                            if allowed {
+                                return true;
                             }
                         }
                     }
-                    false
                 }
-                // Keep this `true`: a peer mid-insert/mid-drain holds the lock, and
-                // reporting `false` here would let a CPU halt through a wake it could
-                // not yet observe, with no timer backstop in the executor's idle path.
-                // (master's 1b1d289b/bbddbb56 shipped this as `false` and reintroduced
-                // exactly that lost-wake class of bug; reverted there by PR #759 -- do
-                // not let a future merge from master bring it back here either.)
-                None => true,
+                false
             }
-        })
+            // Keep this `true`: a peer mid-insert/mid-drain holds the lock, and
+            // reporting `false` here would let a CPU halt through a wake it could
+            // not yet observe, with no timer backstop in the executor's idle path.
+            // (master's 1b1d289b/bbddbb56 shipped this as `false` and reintroduced
+            // exactly that lost-wake class of bug; reverted there by PR #759 -- do
+            // not let a future merge from master bring it back here either.)
+            None => true,
+        }
     }
 
     /// Number of tasks on this queue that are *runnable right now* (a wake is
@@ -533,6 +540,36 @@ impl TaskCollection {
                 })
                 .sum(),
         )
+    }
+
+    /// Runnable tasks on this queue that [`Task::allowed_on`] permits for `cpu`.
+    ///
+    /// Used by work-stealing to rank victims: a collection full of tasks pinned
+    /// elsewhere looks "rich" to [`ready_num`] but has nothing the thief can
+    /// take — probing it first just burns `try_lock`s and fires affinity kicks.
+    /// Same `try_lock` discipline as [`ready_num`]: `None` means skip this pass.
+    pub fn ready_num_for(&self, cpu: usize) -> Option<usize> {
+        let mut inner = self.queue(DEFAULT_PRIORITY)?.try_lock()?;
+        let mut n = 0usize;
+        for page_idx in 0..inner.pages.len() {
+            let (notified, dropped, borrowed) = inner.pages[page_idx].peek();
+            let runnable = notified & !dropped & !borrowed;
+            if runnable == 0 {
+                continue;
+            }
+            for subpage_idx in BitIter::from(runnable) {
+                let key = pack_key(DEFAULT_PRIORITY, page_idx, subpage_idx);
+                let allowed = inner
+                    .slab
+                    .get(unmask_priority(key))
+                    .map(|task| task.allowed_on(cpu))
+                    .unwrap_or(true);
+                if allowed {
+                    n += 1;
+                }
+            }
+        }
+        Some(n)
     }
 
     /// Load figure for spawn PLACEMENT — includes the task being polled right
@@ -625,6 +662,11 @@ impl TaskCollection {
                     // just preempted for a sleeper can re-steal the CPU from a
                     // lower-index page while the sleeper sits notified on a
                     // higher one.
+                    // One kick per distinct affinity mask per pass. Twenty
+                    // tasks pinned to the same CPU used to cost twenty
+                    // `kick_for_affinity` calls — each a `try_lock` walk over
+                    // the allowed runtimes — for one coalesced IPI at the end.
+                    let mut kicked_mask: u64 = 0;
                     for page_idx in 0..inner.pages.len() {
                         let page = &inner.pages[page_idx];
                         // `pending` is this page's snapshot, minus whatever has
@@ -650,7 +692,10 @@ impl TaskCollection {
                                         .get(unmask_priority(key))
                                         .and_then(|task| task.affinity_mask())
                                         .unwrap_or(u64::MAX);
-                                    crate::runtime::kick_for_affinity(mask, cpu);
+                                    if mask != kicked_mask {
+                                        crate::runtime::kick_for_affinity(mask, cpu);
+                                        kicked_mask = mask;
+                                    }
                                     continue;
                                 }
                                 found_key = Some(key);
@@ -672,6 +717,7 @@ impl TaskCollection {
                     }
                     // Pass 2 — voluntary yields, only when nothing urgent remains.
                     if found_key.is_none() {
+                        let mut kicked_mask: u64 = 0;
                         for page_idx in 0..inner.pages.len() {
                             let mut pending = inner.pages[page_idx].take_yielded();
                             if pending == 0 {
@@ -694,7 +740,10 @@ impl TaskCollection {
                                         .get(unmask_priority(key))
                                         .and_then(|task| task.affinity_mask())
                                         .unwrap_or(u64::MAX);
-                                    crate::runtime::kick_for_affinity(mask, cpu);
+                                    if mask != kicked_mask {
+                                        crate::runtime::kick_for_affinity(mask, cpu);
+                                        kicked_mask = mask;
+                                    }
                                     continue;
                                 }
                                 found_key = Some(key);
@@ -1074,6 +1123,43 @@ mod collection_tests {
         let tc = TaskCollection::new(0);
         tc.add_task(pending(), pinned_elsewhere());
         assert!(!tc.has_ready());
+    }
+
+    #[test]
+    fn many_tasks_pinned_to_the_same_cpu_cost_one_kick_per_pass() {
+        // Each refused task used to call `kick_for_affinity` on its own; with
+        // the kick ranking runtimes by load, that is a `try_lock` walk per
+        // task for an IPI that `request_resched` coalesces anyway.
+        let _g = crate::runtime::resched_test_lock();
+        let saved = crate::runtime::set_executor_ready_mask_for_test(0b11);
+        // A request left pending for CPU 1 by an earlier test would coalesce
+        // ours away and make the count below read 0 for the wrong reason.
+        crate::runtime::clear_need_resched(1);
+        let (req0, _) = crate::runtime::wakeup_preempt_stats();
+        let tc = TaskCollection::new(0);
+        for _ in 0..8 {
+            tc.add_task(pending(), pinned_elsewhere());
+        }
+        assert!(tc.take_task().is_none());
+        let (req1, _) = crate::runtime::wakeup_preempt_stats();
+        crate::runtime::clear_need_resched(1);
+        crate::runtime::set_executor_ready_mask_for_test(saved);
+        assert_eq!(req1 - req0, 1, "eight pinned tasks raised {} kicks", req1 - req0);
+        // All eight are still there for CPU 1.
+        assert_eq!(tc.ready_num_for(1), Some(8));
+    }
+
+    #[test]
+    fn ready_num_for_hides_tasks_the_thief_cannot_run() {
+        // Steal ranks victims by load. A queue of foreign-affinity tasks must
+        // not look stealable to a CPU that cannot poll them, or every idle
+        // core piles onto the same useless victim.
+        let tc = TaskCollection::new(0);
+        tc.add_task(pending(), pinned_elsewhere());
+        tc.add_task(pending(), None);
+        assert_eq!(tc.ready_num(), Some(2));
+        assert_eq!(tc.ready_num_for(0), Some(1), "CPU 0 saw a pinned-elsewhere task");
+        assert_eq!(tc.ready_num_for(1), Some(2), "CPU 1 can run both");
     }
 
     #[test]

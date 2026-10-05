@@ -6,7 +6,7 @@ use crate::context::Context;
 use crate::context::ContextData as Context;
 
 use alloc::{boxed::Box, sync::Arc, vec, vec::Vec};
-use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use core::{future::Future, pin::Pin};
 use spin::{Mutex, MutexGuard, Once};
 
@@ -214,6 +214,88 @@ pub fn wakeup_preempt_stats() -> (u64, u64) {
     )
 }
 
+/// Work-stealing accounting: `(scans, victims probed, steals ok, affinity-empty skips)`.
+///
+/// * `scans` — passes that entered the steal scan (idle or rebalance).
+/// * `probed` — victim CPUs we `try_take_task`'d.
+/// * `ok` — tasks successfully stolen.
+/// * `affinity_empty` — victims with runnable tasks that none of were allowed
+///   on the thief (ranked out by [`TaskCollection::ready_num_for`]).
+/// * `rebalance` — pulls taken while this CPU still had one local task.
+static STEAL_SCANS: AtomicU64 = AtomicU64::new(0);
+static STEAL_PROBED: AtomicU64 = AtomicU64::new(0);
+static STEAL_OK: AtomicU64 = AtomicU64::new(0);
+static STEAL_AFFINITY_EMPTY: AtomicU64 = AtomicU64::new(0);
+
+static STEAL_REBALANCE: AtomicU64 = AtomicU64::new(0);
+
+/// `(steal scans, victims probed, steals ok, affinity-empty victims skipped, rebalance pulls)`.
+pub fn sched_steal_stats() -> (u64, u64, u64, u64, u64) {
+    (
+        STEAL_SCANS.load(Ordering::Relaxed),
+        STEAL_PROBED.load(Ordering::Relaxed),
+        STEAL_OK.load(Ordering::Relaxed),
+        STEAL_AFFINITY_EMPTY.load(Ordering::Relaxed),
+        STEAL_REBALANCE.load(Ordering::Relaxed),
+    )
+}
+
+/// How often a non-idle CPU may scan for a balance pull. Idle steal (empty
+/// local queue) is unchanged and not gated by this.
+const REBALANCE_EVERY: u32 = 32;
+/// A peer must be ahead by this many runnable tasks before a CPU that still
+/// has local work pulls one. Stops two lightly loaded CPUs from ping-ponging.
+pub(crate) const REBALANCE_MARGIN: usize = 2;
+
+static REBALANCE_TICK: [AtomicU32; MAX_CORE_NUM] =
+    [const { AtomicU32::new(0) }; MAX_CORE_NUM];
+
+/// True once every [`REBALANCE_EVERY`] polls on this CPU.
+pub(crate) fn rebalance_due() -> bool {
+    let cpu = crate::arch::cpu_id() as usize;
+    if cpu >= MAX_CORE_NUM {
+        return false;
+    }
+    REBALANCE_TICK[cpu].fetch_add(1, Ordering::Relaxed) % REBALANCE_EVERY == 0
+}
+
+/// Pull while we still have local work only when that work is a single task
+/// and some peer is clearly ahead. `local_ready == 0` is the idle-steal path.
+pub(crate) fn should_pull_for_balance(local_ready: usize, richest_victim: usize) -> bool {
+    local_ready == 1 && richest_victim >= local_ready + REBALANCE_MARGIN
+}
+
+/// Weak-executor accounting: `(created, peak live per CPU, soft-cap hits)`.
+static WEAK_CREATED: AtomicU64 = AtomicU64::new(0);
+static WEAK_PEAK: AtomicU64 = AtomicU64::new(0);
+static WEAK_CAP_HITS: AtomicU64 = AtomicU64::new(0);
+
+/// Soft ceiling on outstanding weak executors per CPU. Past this we still
+/// create (a mid-poll future cannot be dropped), but the counter tells us the
+/// preempt churn is outrunning weak drain — the signal to look at timeslices
+/// / wakeup-preempt before touching `STACK_SIZE`.
+const MAX_WEAK_PER_CPU: usize = 16;
+
+/// `(weak executors created, peak live weaks on any CPU, soft-cap hits)`.
+pub fn sched_weak_stats() -> (u64, u64, u64) {
+    (
+        WEAK_CREATED.load(Ordering::Relaxed),
+        WEAK_PEAK.load(Ordering::Relaxed),
+        WEAK_CAP_HITS.load(Ordering::Relaxed),
+    )
+}
+
+fn note_weak_live(live: usize) {
+    let live = live as u64;
+    let mut cur = WEAK_PEAK.load(Ordering::Relaxed);
+    while live > cur {
+        match WEAK_PEAK.compare_exchange_weak(cur, live, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => break,
+            Err(v) => cur = v,
+        }
+    }
+}
+
 /// HAL-registered function that sends a wake IPI to a logical CPU.
 static RESCHED_IPI_SENDER: AtomicUsize = AtomicUsize::new(0);
 
@@ -358,11 +440,27 @@ pub(crate) fn reachable_affinity_cpus(mask: u64, ready: u64) -> u64 {
 /// `None` is a real answer, not a failure: the allowed CPUs are not in their
 /// executor loops yet, so there is nobody to tell. Each of them runs
 /// `take_task` as soon as it gets there and finds the task waiting.
+///
+/// When `loads` is `None`, ties break to the lowest CPU id (historical
+/// behaviour). When provided, the least-loaded candidate wins (still preferring
+/// a sleeping CPU), with lowest id as the tie-break — so equal loads keep the
+/// old answer and tests that do not pass loads stay stable.
 pub(crate) fn pick_affinity_kick_target(
     mask: u64,
     skip: usize,
     ready: u64,
     sleeping: u64,
+) -> Option<u8> {
+    pick_affinity_kick_target_with_loads(mask, skip, ready, sleeping, None)
+}
+
+/// Same as [`pick_affinity_kick_target`], optionally ranking by per-CPU load.
+pub(crate) fn pick_affinity_kick_target_with_loads(
+    mask: u64,
+    skip: usize,
+    ready: u64,
+    sleeping: u64,
+    loads: Option<&[usize; MAX_CORE_NUM]>,
 ) -> Option<u8> {
     let mask = if skip < MAX_CORE_NUM {
         mask & !(1u64 << skip)
@@ -373,13 +471,56 @@ pub(crate) fn pick_affinity_kick_target(
     if candidates == 0 {
         return None;
     }
-    let sleeping = sleeping & candidates;
-    let target = if sleeping != 0 {
-        sleeping.trailing_zeros()
-    } else {
-        candidates.trailing_zeros()
+    let pick = |set: u64| -> Option<u8> {
+        if set == 0 {
+            return None;
+        }
+        match loads {
+            None => Some(set.trailing_zeros() as u8),
+            Some(loads) => {
+                let mut best_cpu: Option<u8> = None;
+                let mut best_load = usize::MAX;
+                let mut bits = set;
+                while bits != 0 {
+                    let cpu = bits.trailing_zeros() as usize;
+                    bits &= bits - 1;
+                    let load = loads[cpu];
+                    if best_cpu.is_none()
+                        || load < best_load
+                        || (load == best_load && cpu < best_cpu.unwrap() as usize)
+                    {
+                        best_load = load;
+                        best_cpu = Some(cpu as u8);
+                    }
+                }
+                best_cpu
+            }
+        }
     };
-    Some(target as u8)
+    let sleeping = sleeping & candidates;
+    if let Some(t) = pick(sleeping) {
+        return Some(t);
+    }
+    pick(candidates)
+}
+
+/// Don't build `chosen`'s runtime from the spawner when that CPU has not
+/// entered [`run_until_idle`].
+///
+/// `Executor::new` poisons ~2.6 MiB and `spawn_task` holds interrupts off the
+/// whole time. Parking on a CPU that is already in its executor loop leaves
+/// the task where a generator can see it: if the mask forbids that CPU, the
+/// generator skips and kicks, and the cold CPU steals the task once it
+/// arrives. When nobody is ready yet, `chosen` is kept — there is nowhere
+/// else to put the task.
+pub(crate) fn park_cpu_if_cold(chosen: usize, ready: u64) -> usize {
+    if chosen < MAX_CORE_NUM && ready & (1u64 << chosen) != 0 {
+        return chosen;
+    }
+    if ready != 0 {
+        return ready.trailing_zeros() as usize;
+    }
+    chosen
 }
 
 /// Where a task whose affinity is `mask` should be born, or `None` when the
@@ -390,13 +531,9 @@ pub(crate) fn pick_affinity_kick_target(
 ///
 /// The second half is the part that used to be missing: placement fell back to
 /// **CPU 0** when no allowed CPU was executor-ready, and CPU 0 is in general a
-/// CPU the mask forbids. The task then sits in a queue whose own executor skips
-/// it on every pass (`Task::allowed_on` is checked inside the generator), so
-/// nothing on that CPU will ever run it; it only escapes if some allowed CPU
-/// later goes idle and happens to steal it. Landing it in the queue of a CPU
-/// that is allowed to run it means the wait ends the moment that CPU enters its
-/// loop — `GLOBAL_RUNTIME.force` builds the queue for a CPU that has not got
-/// there yet, which is what `force` is for.
+/// CPU the mask forbids. [`park_cpu_if_cold`] still uses a live CPU as the
+/// queue that *holds* the task in that window — without `force`-building the
+/// cold runtime under interrupts-off — and the cold CPU steals on entry.
 pub(crate) fn affinity_home(mask: u64, ready: u64) -> Option<usize> {
     let reachable = reachable_affinity_cpus(mask, ready);
     if reachable != 0 {
@@ -410,18 +547,58 @@ pub(crate) fn affinity_home(mask: u64, ready: u64) -> Option<usize> {
 
 /// Waker-forwarding: a notified task cannot run on `skip` (affinity), so make
 /// one of its ALLOWED CPUs look for it. Sleeping CPUs first — they answer in
-/// IPI time and cost nothing to wake — else the lowest allowed, whose
-/// `request_resched` publication coalesces with any outstanding request.
+/// IPI time and cost nothing to wake — else the least-loaded allowed (tie-break
+/// lowest id), whose `request_resched` publication coalesces with any
+/// outstanding request.
 pub(crate) fn kick_for_affinity(mask: u64, skip: usize) {
-    let Some(target) = pick_affinity_kick_target(
-        mask,
-        skip,
-        executor_ready_mask(),
-        SLEEPING_CPUS.load(Ordering::SeqCst),
-    ) else {
+    let ready = executor_ready_mask();
+    let sleeping = SLEEPING_CPUS.load(Ordering::SeqCst);
+    let candidates = {
+        let m = if skip < MAX_CORE_NUM {
+            mask & !(1u64 << skip)
+        } else {
+            mask
+        };
+        reachable_affinity_cpus(m, ready)
+    };
+    let mut loads = [usize::MAX; MAX_CORE_NUM];
+    let mut bits = candidates;
+    while bits != 0 {
+        let cpu = bits.trailing_zeros() as usize;
+        bits &= bits - 1;
+        if let Some(rt) = GLOBAL_RUNTIME.try_lock_cpu(cpu) {
+            loads[cpu] = rt.placement_load().unwrap_or(usize::MAX / 2);
+        }
+    }
+    let Some(target) =
+        pick_affinity_kick_target_with_loads(mask, skip, ready, sleeping, Some(&loads))
+    else {
         return;
     };
     request_resched(target);
+}
+
+/// Kernel-side: a thread's affinity mask was just narrowed or moved.
+///
+/// Without this the change is only noticed when the owning CPU's generator
+/// next refuses the task — up to a tick later if that CPU is halted (its
+/// pre-halt `has_ready` filters the task out, so it halts past it). Kick a
+/// CPU the new mask allows now; its next idle pass finds the task by
+/// `ready_num_for` and steals it. The current CPU is skipped: if the mask
+/// still allows it, nothing has to move.
+///
+/// Interrupts off around the `try_lock` walk, as `spawn_task` does: a timer
+/// IRQ landing while a peer's runtime guard is held is harmless, but a
+/// `sched_yield` from that IRQ would spin on *this* CPU's runtime, and the
+/// walk must never hold it. Skipping `self` keeps that true; the IRQ-off is
+/// belt and braces.
+pub fn affinity_changed(mask: u64) {
+    if mask == 0 {
+        return;
+    }
+    super::run_with_intr_saved_off! {
+        kick_for_affinity(mask, crate::arch::cpu_id() as usize)
+    }
 }
 
 /// Trap-path side: consume this CPU's pending wake-up preemption request.
@@ -519,6 +696,10 @@ impl ExecutorRuntime {
         self.task_collection.ready_num()
     }
 
+    pub(crate) fn ready_num_for(&self, cpu: usize) -> Option<usize> {
+        self.task_collection.ready_num_for(cpu)
+    }
+
     pub(crate) fn placement_load(&self) -> Option<usize> {
         self.task_collection.placement_load()
     }
@@ -527,13 +708,28 @@ impl ExecutorRuntime {
         self.weak_executors.push(Some(weak_executor));
     }
 
+    /// Drop finished weaks so their stacks return to the pool before we allocate
+    /// the next strong. Without this, a burst of mid-poll preempts piles killed
+    /// weaks in the Vec until the strong finally yields without a task — by
+    /// then peak live stacks have already ballooned.
+    fn reclaim_finished_weaks(&mut self) {
+        self.weak_executors
+            .retain(|executor| executor.is_some() && !executor.as_ref().unwrap().killed());
+    }
+
     fn downgrade_strong_executor(&mut self) {
         // SAFETY: 只会在一个 core 上运行，不需要考虑同步问题
         let mut old = self.strong_executor.clone();
         unsafe {
             Arc::get_mut_unchecked(&mut old).mark_weak();
         }
+        self.reclaim_finished_weaks();
+        if self.weak_executors.len() >= MAX_WEAK_PER_CPU {
+            WEAK_CAP_HITS.fetch_add(1, Ordering::Relaxed);
+        }
         self.add_weak_executor(old);
+        WEAK_CREATED.fetch_add(1, Ordering::Relaxed);
+        note_weak_live(self.weak_executors.len());
         self.strong_executor = Arc::new(Executor::new(self.task_collection.clone()));
     }
 
@@ -736,6 +932,24 @@ static STEAL_CANDIDATES: [StealScratch; MAX_CORE_NUM] = [const {
 
 // obtain a task from other cpu.
 pub(crate) fn steal_task_from_other_cpu() -> Option<(Key, Arc<Task>, Arc<WakerRef>)> {
+    steal_task_min(1, false)
+}
+
+/// One pull from a clearly richer peer. Caller has already checked
+/// [`rebalance_due`] and that the local queue has exactly one runnable task.
+/// Does not migrate the waker page — same ownership rules as idle steal.
+pub(crate) fn steal_for_balance() -> Option<(Key, Arc<Task>, Arc<WakerRef>)> {
+    let task = steal_task_min(1 + REBALANCE_MARGIN, true);
+    if task.is_some() {
+        STEAL_REBALANCE.fetch_add(1, Ordering::Relaxed);
+    }
+    task
+}
+
+fn steal_task_min(
+    min_count: usize,
+    rebalance: bool,
+) -> Option<(Key, Arc<Task>, Arc<WakerRef>)> {
     // [null-exec] Run the whole scan non-preemptibly. This is now defense in
     // depth rather than the sole barrier: `candidates` no longer lives on this
     // stack (see `STEAL_CANDIDATES`), so a mid-scan park can no longer leave a
@@ -746,12 +960,12 @@ pub(crate) fn steal_task_from_other_cpu() -> Option<(Key, Arc<Task>, Arc<WakerRe
     // non-blocking window is still serviced by the NMI-ack path.
     let result;
     super::run_with_intr_saved_off! {
-        result = steal_task_inner()
+        result = steal_task_inner(min_count, rebalance)
     }
     result
 }
 
-fn steal_task_inner() -> Option<(Key, Arc<Task>, Arc<WakerRef>)> {
+fn steal_task_inner(min_count: usize, rebalance: bool) -> Option<(Key, Arc<Task>, Arc<WakerRef>)> {
     let current_cpu = crate::arch::cpu_id() as usize;
     // Index guard for the per-CPU `STEAL_CANDIDATES` slot below. `cpu_id` is a
     // scheduler invariant (< MAX_CORE_NUM, asserted in `get_current_runtime`),
@@ -789,6 +1003,7 @@ fn steal_task_inner() -> Option<(Key, Arc<Task>, Arc<WakerRef>)> {
     let candidates: &mut [(usize, usize); MAX_CORE_NUM] =
         unsafe { &mut *STEAL_CANDIDATES[current_cpu].0.get() };
     let mut n = 0;
+    STEAL_SCANS.fetch_add(1, Ordering::Relaxed);
     for i in 0..num_online_cpus() {
         if i == current_cpu || !is_executor_ready(i) {
             // Never steal from ourselves; skip CPUs that never entered the executor.
@@ -800,18 +1015,37 @@ fn steal_task_inner() -> Option<(Key, Arc<Task>, Arc<WakerRef>)> {
             continue;
         };
         if let Some(runtime) = runtime_mutex.try_lock() {
-            // `ready_num() == None` means the collection was locked; skip it
-            // this pass rather than spin (see the deadlock discipline below).
-            if let Some(count) = runtime.ready_num() {
-                if count > 0 {
+            // Rank by tasks *this* CPU may poll. A victim full of foreign-
+            // affinity work used to look richest under plain `ready_num` and
+            // burned every idle core's scan on affinity kicks.
+            // `None` means the collection was locked; skip this pass rather
+            // than spin (see the deadlock discipline below).
+            match runtime.ready_num_for(current_cpu) {
+                Some(0) => {
+                    // Distinguish "empty" from "full of work we cannot run"
+                    // so /proc/perf can show whether affinity is starving steal.
+                    // Rebalance scans are rare and gated; don't mix them in.
+                    if !rebalance && matches!(runtime.ready_num(), Some(c) if c > 0) {
+                        STEAL_AFFINITY_EMPTY.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                Some(count) if count >= min_count => {
                     candidates[n] = (i, count);
                     n += 1;
                 }
+                Some(_) | None => {}
             }
         }
     }
-    // Most-loaded victims first to spread work off the busiest cores.
-    candidates[..n].sort_unstable_by(|a, b| b.1.cmp(&a.1));
+    // Most-loaded (for us) victims first to spread work off the busiest cores.
+    // Ties break on distance from the thief, not on cpu id: with a plain sort
+    // every idle core probes the same lowest-id victim first and the rest of
+    // them lose the `try_lock` and walk away empty.
+    let online = num_online_cpus().max(1);
+    let distance = |cpu: usize| (cpu + online - current_cpu) % online;
+    candidates[..n].sort_unstable_by(|a, b| {
+        b.1.cmp(&a.1).then_with(|| distance(a.0).cmp(&distance(b.0)))
+    });
     for &(cpu, _) in &candidates[..n] {
         // Deadlock discipline: the thief may hold the victim's runtime lock
         // while stealing (that serialization keeps the victim's executor
@@ -829,7 +1063,9 @@ fn steal_task_inner() -> Option<(Key, Arc<Task>, Arc<WakerRef>)> {
             continue;
         };
         if runtime.task_num() > 0 {
+            STEAL_PROBED.fetch_add(1, Ordering::Relaxed);
             if let Some(task) = runtime.task_collection.try_take_task() {
+                STEAL_OK.fetch_add(1, Ordering::Relaxed);
                 return Some(task);
             }
         }
@@ -1264,8 +1500,11 @@ pub fn spawn_task(
                 }
             }
         }
-        // `best` is executor-ready (slot built) in every normal boot; forcing
-        // covers the degenerate fallback of an empty ready set.
+        // A mask whose CPUs are all still offline used to `force` that cold
+        // CPU here and poison a 2.6 MiB stack with interrupts off. Park on a
+        // CPU that is already looping; affinity keeps the task from running
+        // there, and the target steals it on the way in.
+        best = park_cpu_if_cold(best, executor_ready_mask());
         (GLOBAL_RUNTIME.force(best), best)
     };
     crate::diag::diag_lock(runtime).add_task(priority, future, affinity);
@@ -1289,7 +1528,7 @@ pub fn handle_timeout() {
 }
 
 /// 运行executor.run()
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub(crate) fn run_executor(executor_addr: usize) {
     let mut p = unsafe { Box::from_raw(executor_addr as *mut Executor) };
     p.run();
@@ -1769,6 +2008,33 @@ pub fn check_current_executor_canary() {
     }
 }
 
+/// Deepest coroutine-stack use ever observed at a park, in bytes from the
+/// top of the usable stack. Sampled in [`sched_yield`] — the IRQ frame of a
+/// timer preempt is on the executor stack too, so this is a realistic high
+/// water mark for the kernel call chains under a poll. The number that
+/// decides whether `STACK_SIZE` can come down.
+static STACK_HIGH_WATER: AtomicUsize = AtomicUsize::new(0);
+
+/// `(bytes used at the deepest observed park, STACK_SIZE)`.
+pub fn stack_high_water() -> (usize, usize) {
+    (
+        STACK_HIGH_WATER.load(Ordering::Relaxed),
+        crate::executor::STACK_SIZE,
+    )
+}
+
+#[inline]
+pub(crate) fn note_stack_depth(used: usize) {
+    let mut cur = STACK_HIGH_WATER.load(Ordering::Relaxed);
+    while used > cur {
+        match STACK_HIGH_WATER.compare_exchange_weak(cur, used, Ordering::Relaxed, Ordering::Relaxed)
+        {
+            Ok(_) => break,
+            Err(v) => cur = v,
+        }
+    }
+}
+
 /// switch to runtime, which would select an appropriate executor to run.
 pub fn sched_yield() {
     let runtime = get_current_runtime();
@@ -1800,6 +2066,8 @@ pub fn sched_yield() {
             }
             return;
         }
+        // `stack_contains` passed above, so the subtraction cannot wrap.
+        note_stack_depth(executor.stack_base() + crate::executor::STACK_SIZE - current_sp());
         let executor_cx = executor.context.get_context();
         debug!("switch {} -> idle", executor.id());
         let runtime_cx = runtime.get_context();
@@ -2062,13 +2330,12 @@ pub fn get_current_executor_id() -> (usize, usize) {
     }
 }
 
-/// The cross-CPU half of the scheduler had no tests, and the job that looks
-/// like it tests this crate was testing a different one: `test.yml` ran
-/// `cargo test --manifest-path vendor/preemptive-scheduler/Cargo.toml`, the
-/// pristine upstream copy, while the kernel links `vendor/PreemptiveScheduler`
-/// through the `[patch]` in the workspace manifest. Both crates are named
-/// `executor`; this is the fork the machine actually runs, and it is four times
-/// the size of the one that was being tested.
+/// The cross-CPU half of the scheduler had no tests for a long time: CI used
+/// to exercise a sibling pristine upstream tree
+/// (`vendor/preemptive-scheduler`) while the kernel linked this fork through
+/// the workspace `[patch]`. That duplicate is gone; this is the only
+/// `executor` crate, and these tests cover the placement / affinity decisions
+/// the machine actually runs.
 ///
 /// What is testable here is the *deciding*, which is where the bugs were: who
 /// gets woken when a task cannot run where it landed, and where a task with an
@@ -2108,6 +2375,98 @@ mod affinity_tests {
         // woken straight out of `hlt` instead of waiting for 1 to take a trap.
         assert_eq!(
             pick_affinity_kick_target(cpus(&[1, 2]), 0, cpus(&[0, 1, 2]), cpus(&[2])),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn the_high_water_mark_only_ever_rises() {
+        let _g = resched_test_lock();
+        let before = STACK_HIGH_WATER.load(Ordering::SeqCst);
+        note_stack_depth(before + 4096);
+        assert_eq!(stack_high_water().0, before + 4096);
+        note_stack_depth(before + 1);
+        assert_eq!(stack_high_water().0, before + 4096, "a shallower park lowered it");
+        assert_eq!(stack_high_water().1, crate::executor::STACK_SIZE);
+    }
+
+    #[test]
+    fn equally_loaded_victims_are_probed_in_a_different_order_per_thief() {
+        // The scan's tie-break. With four CPUs each holding two tasks, every
+        // idle thief used to sort to [0,1,2,3] and pile onto CPU 0's lock.
+        let online = 4;
+        let order = |thief: usize| {
+            let distance = |cpu: usize| (cpu + online - thief) % online;
+            let mut c: alloc::vec::Vec<(usize, usize)> =
+                (0..online).filter(|&c| c != thief).map(|c| (c, 2)).collect();
+            c.sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| distance(a.0).cmp(&distance(b.0))));
+            c.into_iter().map(|(c, _)| c).collect::<alloc::vec::Vec<_>>()
+        };
+        assert_eq!(order(0), alloc::vec![1, 2, 3]);
+        assert_eq!(order(1), alloc::vec![2, 3, 0]);
+        assert_eq!(order(3), alloc::vec![0, 1, 2]);
+        // Load still comes first: a richer victim beats a nearer one.
+        let thief = 0;
+        let distance = |cpu: usize| (cpu + online - thief) % online;
+        let mut c = alloc::vec![(1usize, 1usize), (3, 5), (2, 1)];
+        c.sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| distance(a.0).cmp(&distance(b.0))));
+        assert_eq!(c[0].0, 3);
+    }
+
+    #[test]
+    fn a_cold_cpu_is_not_where_the_spawner_builds_a_runtime() {
+        // CPU 2 is the affinity home but has not entered its executor. Building
+        // its stack from the spawner holds interrupts off across a 2.6 MiB
+        // poison. The boot CPU is already looping and can hold the task.
+        assert_eq!(park_cpu_if_cold(2, cpus(&[0])), 0);
+        // Already in the loop: keep it. `force` is then idempotent.
+        assert_eq!(park_cpu_if_cold(2, cpus(&[0, 2])), 2);
+        // Nobody is ready. There is no other queue to borrow.
+        assert_eq!(park_cpu_if_cold(2, 0), 2);
+        assert_eq!(park_cpu_if_cold(0, cpus(&[0])), 0);
+    }
+
+    #[test]
+    fn balance_pull_only_when_a_peer_is_clearly_ahead() {
+        // Idle steal is a different path: an empty CPU always scans, so this
+        // predicate must stay false there.
+        assert!(!should_pull_for_balance(0, 10));
+        // One local task and a peer only one ahead would ping-pong.
+        assert!(!should_pull_for_balance(1, 1));
+        assert!(!should_pull_for_balance(1, 2));
+        assert!(should_pull_for_balance(1, 1 + REBALANCE_MARGIN));
+        // A CPU with its own backlog keeps running it.
+        assert!(!should_pull_for_balance(2, 100));
+    }
+
+    #[test]
+    fn among_busy_cpus_the_least_loaded_is_kicked() {
+        // Neither is sleeping; CPU 1 is pegged and CPU 2 is light. Lowest-bit
+        // would pile every affinity kick onto 1.
+        let mut loads = [0usize; MAX_CORE_NUM];
+        loads[1] = 8;
+        loads[2] = 1;
+        assert_eq!(
+            pick_affinity_kick_target_with_loads(
+                cpus(&[1, 2]),
+                0,
+                cpus(&[0, 1, 2]),
+                NOBODY,
+                Some(&loads),
+            ),
+            Some(2)
+        );
+        // Sleeping still wins even when heavier — IPI out of hlt is cheaper
+        // than waiting for a busy core's trap.
+        loads[2] = 20;
+        assert_eq!(
+            pick_affinity_kick_target_with_loads(
+                cpus(&[1, 2]),
+                0,
+                cpus(&[0, 1, 2]),
+                cpus(&[2]),
+                Some(&loads),
+            ),
             Some(2)
         );
     }
@@ -2385,6 +2744,94 @@ mod resched_tests {
         set_cpu_sleeping(3, true);
         request_resched(3);
         assert_eq!(kicks(), 2, "a halted CPU slept through the wake");
+    }
+
+    /// The halt protocol end to end, the way `Executor::run` performs it:
+    /// publish sleeping, recheck the queue, halt — against a remote wake that
+    /// lands in each of the three windows. Every piece had a test; the
+    /// sequence did not.
+    #[test]
+    fn the_halt_protocol_never_sleeps_through_a_remote_wake() {
+        let _g = fresh();
+        let tc = TaskCollection::new(0);
+        let key = tc.add_task(core::future::pending::<()>(), None);
+        let (_k, _t, waker) = tc.take_task().unwrap();
+        waker.mark_borrowed(false);
+        assert!(!tc.has_ready(), "a drained queue still looked ready");
+        let (_, p, s) = unpack_key(key);
+
+        // Window 1: wake arrives BEFORE we publish sleeping. The recheck
+        // must see it; no IPI is needed and none is owed.
+        tc.get_mut_inner(DEFAULT_PRIORITY).pages[p].notify(s);
+        set_cpu_sleeping(0, true);
+        assert!(tc.has_ready(), "halted through a wake that was already published");
+        set_cpu_sleeping(0, false);
+        drain_one(&tc);
+
+        // Window 2: wake arrives AFTER sleeping is published but BEFORE the
+        // recheck. The waker reads the sleeping mask and kicks; the recheck
+        // also sees the bit. Either path alone suffices; both must agree.
+        set_cpu_sleeping(0, true);
+        waker.wake_by_ref();
+        assert!(tc.has_ready());
+        assert_eq!(kicked() & 1, 1, "a CPU in the halt window was not kicked");
+        set_cpu_sleeping(0, false);
+        drain_one(&tc);
+
+        // Window 3: wake arrives after the recheck said "nothing", with the
+        // CPU already committed to `wait_for_interrupt`. Only the IPI can
+        // save it, and the sleeping bit is what makes the waker send one.
+        KICKED.store(0, Ordering::SeqCst);
+        set_cpu_sleeping(0, true);
+        assert!(!tc.has_ready());
+        waker.wake_by_ref();
+        assert_eq!(kicked() & 1, 1, "the wake fell into the check-then-halt window");
+        set_cpu_sleeping(0, false);
+
+        // And once awake, nobody is kicked for a wake we will see on our own
+        // next pass — but the request bit is still published so a busy CPU
+        // preempts for it.
+        drain_one(&tc);
+        KICKED.store(0, Ordering::SeqCst);
+        NEED_RESCHED.store(0, Ordering::SeqCst);
+        waker.wake_by_ref();
+        assert_eq!(kicked(), 0, "an awake CPU sent itself an IPI");
+        assert!(pending(0));
+    }
+
+    fn drain_one(tc: &TaskCollection) {
+        let (_k, _t, w) = tc.take_task().expect("the published wake was not handed out");
+        w.mark_borrowed(false);
+    }
+
+    #[test]
+    fn narrowing_an_affinity_mask_kicks_a_cpu_the_new_mask_allows() {
+        let _g = fresh();
+        let saved = set_executor_ready_mask_for_test(0b111);
+        // We are CPU 0 (host `cpu_id`). The thread moves itself to {2}:
+        // CPU 2 must be told now, not when CPU 0's generator next refuses it.
+        affinity_changed(1 << 2);
+        assert_eq!(kicked(), 1 << 2, "the new home was not told");
+        assert!(pending(2));
+
+        // A mask that still allows us is not a move: nobody is kicked for a
+        // task that keeps running right here.
+        KICKED.store(0, Ordering::SeqCst);
+        affinity_changed(0b1);
+        assert_eq!(kicked(), 0, "a CPU was kicked for a task that did not move");
+
+        // Several allowed CPUs: exactly one is kicked (steal is the fan-out).
+        KICKED.store(0, Ordering::SeqCst);
+        KICK_COUNT.store(0, Ordering::SeqCst);
+        NEED_RESCHED.store(0, Ordering::SeqCst);
+        affinity_changed(0b110);
+        assert_eq!(kicks(), 1, "a mask of two CPUs raised {} IPIs", kicks());
+
+        // An empty mask is rejected upstream; defensively a no-op here.
+        KICKED.store(0, Ordering::SeqCst);
+        affinity_changed(0);
+        assert_eq!(kicked(), 0);
+        set_executor_ready_mask_for_test(saved);
     }
 
     #[test]

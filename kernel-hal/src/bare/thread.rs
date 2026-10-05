@@ -18,6 +18,10 @@ hal_fn_impl! {
             executor::spawn_with_affinity(future, affinity);
         }
 
+        fn affinity_changed(mask: u64) {
+            executor::affinity_changed(mask);
+        }
+
         fn set_current_thread(thread: Option<Arc<dyn Any + Send + Sync>>) {
             *percpu::current().current_thread.get_mut() = thread;
         }

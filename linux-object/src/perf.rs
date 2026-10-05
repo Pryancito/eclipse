@@ -711,6 +711,31 @@ pub fn kernel_report() -> String {
         "sched: {} task polls ({:.0}/s), {} weak-exec yields ({:.0}/s)",
         sched_polled, polls_per_s, sched_weak, weak_per_s
     );
+    {
+        let (scans, probed, ok, aff_empty, rebalance) = kernel_hal::kstats::sched_steal_stats();
+        let _ = writeln!(
+            out,
+            "sched steal:  {} scans, {} probed, {} ok, {} affinity-empty, {} rebalance",
+            scans, probed, ok, aff_empty, rebalance
+        );
+        let (created, peak, cap_hits) = kernel_hal::kstats::sched_weak_stats();
+        let (pool, overflow) = kernel_hal::kstats::stack_pool_stats();
+        let _ = writeln!(
+            out,
+            "sched weak:   {} created, peak live {}, soft-cap hits {}; stack-pool {}/overflow {}",
+            created, peak, cap_hits, pool, overflow
+        );
+        let (hw, size) = kernel_hal::kstats::stack_high_water();
+        if size > 0 {
+            let _ = writeln!(
+                out,
+                "sched stack:  high-water {} KiB of {} KiB ({:.0}%)",
+                hw / 1024,
+                size / 1024,
+                hw as f64 * 100.0 / size as f64
+            );
+        }
+    }
     // Which scheduler/timer mode this boot is running in, so a captured report
     // is self-describing when compared against another.
     {

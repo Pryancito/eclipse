@@ -149,6 +149,18 @@ pub fn sched_stats() -> (u64, u64) {
     (SCHED_POLLED.load(Relaxed), SCHED_WEAK_YIELD.load(Relaxed))
 }
 
+/// `(stack-pool occupied slots, overflow-list length)` — how many freed
+/// executor stacks are retained out of the buddy heap right now.
+pub fn stack_pool_stats() -> (usize, usize) {
+    use core::sync::atomic::Ordering::Relaxed;
+    let pool = STACK_POOL
+        .iter()
+        .filter(|s| s.load(Relaxed) != 0)
+        .count();
+    let overflow = STACK_OVERFLOW.lock().len();
+    (pool, overflow)
+}
+
 const PAGE_SIZE: usize = 4096;
 /// Soft / hard guard **below** the usable stack. Soft path fills canary words;
 /// hard path (when hooks are registered) unmaps these pages so overflow #PFs
@@ -1238,7 +1250,18 @@ impl Executor {
         // no longer loaded on this CPU.
         let mut _cr3_pin: Option<Arc<Task>> = None;
         loop {
-            let mut task_info = self.task_collection.take_task();
+            // Balance pull: a CPU that always has exactly one local task never
+            // hits the idle steal below, so a peer sitting on a backlog stays
+            // overloaded. Every 32 polls, if we have one runnable task and a
+            // peer has at least three we may poll, pull one first. Ownership
+            // of the waker page stays with the victim (same as idle steal).
+            let mut task_info = None;
+            if crate::runtime::rebalance_due() && self.task_collection.ready_num() == Some(1) {
+                task_info = crate::runtime::steal_for_balance();
+            }
+            if task_info.is_none() {
+                task_info = self.task_collection.take_task();
+            }
             if task_info.is_none() {
                 task_info = crate::runtime::steal_task_from_other_cpu();
             }

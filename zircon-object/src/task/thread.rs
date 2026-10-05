@@ -571,12 +571,18 @@ impl Thread {
     /// `mask` must have at least one bit set; an all-zero mask is rejected
     /// because it would make the thread unschedulable. The change is observed
     /// by the scheduler on the thread's next placement or work-stealing
-    /// decision (it will migrate off a now-disallowed CPU once it next yields).
+    /// decision (it will migrate off a now-disallowed CPU once it next yields);
+    /// a CPU the new mask allows is kicked at once so that steal happens on
+    /// its next pass rather than its next tick.
     pub fn set_affinity(&self, mask: u64) -> ZxResult {
         if mask == 0 {
             return Err(ZxError::INVALID_ARGS);
         }
-        self.affinity.store(mask, Ordering::Relaxed);
+        let old = self.affinity.swap(mask, Ordering::Relaxed);
+        if old & mask != old {
+            // Narrowed or moved: some CPU that could run us no longer can.
+            kernel_hal::thread::affinity_changed(mask);
+        }
         Ok(())
     }
 

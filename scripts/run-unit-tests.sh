@@ -21,11 +21,8 @@ cargo test --no-fail-fast
 # `elf` too: util::elf_loader is behind that feature (same as CI).
 cargo test -p zircon-object --lib --features libos,aspace-separate,elf
 cargo test -p zircon-syscall --features libos,zircon-object/aspace-separate
-# The kernel links vendor/PreemptiveScheduler ([patch] → executor). The
-# lowercase tree is pristine upstream that nothing depends on — test both,
-# fork first (CI order).
+# The kernel links vendor/PreemptiveScheduler ([patch] → executor).
 cargo test --manifest-path vendor/PreemptiveScheduler/Cargo.toml --lib -- --test-threads=1
-cargo test --manifest-path vendor/preemptive-scheduler/Cargo.toml --lib
 cargo test -p lock --lib -- --test-threads=1
 cargo test --manifest-path vendor/trapframe/Cargo.toml
 # Single-threaded: process-wide driver state (DRM_STATE, CE staging, …).

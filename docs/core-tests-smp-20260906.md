@@ -107,7 +107,7 @@ python3 scripts/zircon_core_test.py --arch riscv64 --group ipc-port
 python3 scripts/zircon_core_test.py --arch x86_64 --libos --group ipc-port
 
 cargo test -p zircon-object --lib --features libos,aspace-separate
-cargo test --manifest-path vendor/preemptive-scheduler/Cargo.toml --lib
+cargo test --manifest-path vendor/PreemptiveScheduler/Cargo.toml --lib -- --test-threads=1
 make -C zCore ARCH=x86_64 TEST=1 ZBI=core-tests clippy
 ```
 

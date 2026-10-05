@@ -253,6 +253,13 @@ hal_fn_def! {
         /// mask is ignored.
         pub fn spawn_with_affinity(future: impl Future<Output = ()> + Send + 'static, affinity: Arc<core::sync::atomic::AtomicU64>);
 
+        /// A thread's affinity mask was just rewritten (`sched_setaffinity`).
+        ///
+        /// Lets the scheduler kick a CPU the new mask allows right away,
+        /// instead of waiting for the owning CPU's next run-queue pass to
+        /// refuse the task. No-op on hosted (libos) builds.
+        pub fn affinity_changed(_mask: u64) {}
+
         /// Set tid and pid of current task.
         pub fn set_current_thread(thread: Option<Arc<dyn Any + Send + Sync>>) {}
 
