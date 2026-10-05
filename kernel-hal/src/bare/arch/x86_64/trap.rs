@@ -1,4 +1,5 @@
 use crate::context::TrapReason;
+use core::fmt::Write as _;
 use trapframe::TrapFrame;
 
 pub(super) const X86_INT_LOCAL_APIC_BASE: usize = 0xf0;
@@ -1098,21 +1099,29 @@ pub extern "C" fn trap_handler(tf: &mut TrapFrame) {
                     ("rbp", tf.rbp as u64),
                     ("rsp", tf.rsp as u64),
                 ];
+                // Rendered whole before anything is written. Writing the
+                // `Display` straight at the console took the UART's ticket
+                // mutex once per `write!` inside it -- see `SpinBuf`, and the
+                // stop screen that died with this very report one line in.
+                // 2 KiB on the #GP handler's own 16 KiB IST stack.
+                let mut buf = crate::context::SpinBuf::<2048>::new();
                 let diag = crate::context::X86NonCanonical { regs: &regs };
-                crate::console::serial_write_fmt_spin(format_args!("\n{}", diag));
-                crate::console::graphic_console_write_fmt_spin(format_args!("\n{}", diag));
+                let _ = write!(buf, "\n{}", diag);
                 if let Some((sym, _)) = crate::ksyms::lookup(tf.rip as u64) {
                     if let Some(operands) = crate::context::mem_routine_operands(sym) {
-                        let line = format_args!(
+                        let _ = writeln!(
+                            buf,
                             "[#GP] hint: rip is inside {}, where the pointers are \
                              usually the caller's rather than the routine's own \
-                             ({}) -- look there before compiler-builtins\n",
+                             ({}) -- look there before compiler-builtins",
                             sym, operands,
                         );
-                        crate::console::serial_write_fmt_spin(line);
-                        crate::console::graphic_console_write_fmt_spin(line);
                     }
                 }
+                // One `write_str` per console: `Display for str` is a single
+                // fragment, so this is one lock acquire each.
+                crate::console::serial_write_fmt_spin(format_args!("{}", buf.as_str()));
+                crate::console::graphic_console_write_fmt_spin(format_args!("{}", buf.as_str()));
             }
             panic!(
                 "\nCPU EXCEPTION on CPU{}: {} (vec={:#x})\n\

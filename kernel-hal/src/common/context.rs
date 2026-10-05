@@ -284,6 +284,80 @@ impl fmt::Display for X86NonCanonical<'_> {
 /// own (`movaps` on a 16-byte path), and by the faulting instruction the
 /// argument registers may long since have been reused for something else. It
 /// says where to look first, not what happened.
+/// A fixed stack buffer that renders a whole diagnostic before any of it
+/// reaches a device.
+///
+/// A `Display` impl that calls `write!` five times is five writes to the
+/// console, and on this kernel each one takes the UART's own ticket mutex
+/// inside `Uart16550Pmio::write_str`. In a fault handler, with interrupts off,
+/// that is five chances to spin on a lock a wedged CPU holds, five entries
+/// into the spin pump's indirect call, and five windows for a second fault to
+/// land in the middle of the first fault's report. A hardware stop screen
+/// caught one: a `#PF` with `rip=0x0` taken with this diagnostic's first line
+/// printed and no more, and with `X86NonCanonical::fmt`, `core::fmt::write`
+/// and `Uart16550Pmio::write_str` all still on the exception stack.
+///
+/// Rendering first and writing once does not make the fault survivable, but it
+/// takes the lock once instead of once per fragment, and what the buffer holds
+/// is complete before anything can interrupt it.
+///
+/// Overflow truncates and is counted rather than reported through `Err`: a
+/// diagnostic that gives up because it did not fit is worse than a short one,
+/// and the one caller is a fault path with nowhere to send an error.
+pub struct SpinBuf<const N: usize> {
+    buf: [u8; N],
+    len: usize,
+    dropped: usize,
+}
+
+impl<const N: usize> Default for SpinBuf<N> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<const N: usize> SpinBuf<N> {
+    pub const fn new() -> Self {
+        Self {
+            buf: [0; N],
+            len: 0,
+            dropped: 0,
+        }
+    }
+
+    /// What was rendered, always valid UTF-8: only whole `char`s are copied in,
+    /// so a buffer that filled mid-character keeps the bytes before it rather
+    /// than half an encoding.
+    pub fn as_str(&self) -> &str {
+        // SAFETY: `write_str` only ever appends whole `char`s from a `&str`.
+        unsafe { core::str::from_utf8_unchecked(&self.buf[..self.len]) }
+    }
+
+    /// Bytes that did not fit. Non-zero means the report is short.
+    pub fn dropped(&self) -> usize {
+        self.dropped
+    }
+}
+
+impl<const N: usize> fmt::Write for SpinBuf<N> {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        for c in s.chars() {
+            let mut enc = [0u8; 4];
+            let bytes = c.encode_utf8(&mut enc).as_bytes();
+            // Once anything has been dropped, everything after it is dropped
+            // too. Letting a later short character slip into the gap a long one
+            // left would reorder the report, which is worse than ending it.
+            if self.dropped > 0 || self.len + bytes.len() > N {
+                self.dropped += bytes.len();
+                continue;
+            }
+            self.buf[self.len..self.len + bytes.len()].copy_from_slice(bytes);
+            self.len += bytes.len();
+        }
+        Ok(())
+    }
+}
+
 pub fn mem_routine_operands(name: &str) -> Option<&'static str> {
     // `compiler_builtins` names them plainly, and the kernel's own copies are
     // `__memcpy`/`copy_user` and friends; match on the stem so a prefix or a
@@ -1142,6 +1216,74 @@ mod tests {
         let s = hint(12, 0b1101);
         assert!(s.contains("LDT index 1"), "{}", s);
         assert!(s.contains("external event"), "{}", s);
+    }
+
+    /// What the buffer exists for: one `Display` that calls `write!` several
+    /// times comes out as ONE fragment, so the console lock is taken once.
+    #[test]
+    fn a_display_that_writes_in_pieces_comes_out_as_one_string() {
+        use core::fmt::Write;
+        let regs = [
+            ("rsi", 0x7464_6977_202c_7874u64),
+            ("rdi", 0xffff_ff00_0000_1000),
+        ];
+        let mut buf = SpinBuf::<2048>::new();
+        write!(buf, "\n{}", X86NonCanonical { regs: &regs }).unwrap();
+        assert_eq!(buf.dropped(), 0);
+        let whole = buf.as_str();
+        assert!(whole.starts_with('\n'), "{}", whole);
+        assert!(whole.contains("rsi"), "{}", whole);
+        assert!(whole.contains("tx, widt"), "{}", whole);
+        assert!(
+            !whole.contains("rdi = 0xffffff0000001000 is not a canonical"),
+            "a canonical register is not a candidate: {}",
+            whole
+        );
+    }
+
+    /// A report that does not fit is cut short and says so, rather than
+    /// failing: the one caller is a fault path with nowhere to send an `Err`.
+    #[test]
+    fn a_buffer_that_fills_up_truncates_and_counts_what_it_lost() {
+        use core::fmt::Write;
+        let mut buf = SpinBuf::<8>::new();
+        write!(buf, "12345678").unwrap();
+        assert_eq!(buf.as_str(), "12345678");
+        assert_eq!(buf.dropped(), 0);
+        write!(buf, "9").unwrap();
+        assert_eq!(buf.as_str(), "12345678", "nothing after the cut is kept");
+        assert_eq!(buf.dropped(), 1);
+    }
+
+    /// Once anything is dropped everything after it is, so a later short
+    /// fragment cannot slip into the gap a longer one left and reorder the
+    /// report.
+    #[test]
+    fn a_short_fragment_does_not_jump_the_queue_after_a_cut() {
+        use core::fmt::Write;
+        let mut buf = SpinBuf::<4>::new();
+        write!(buf, "ab").unwrap();
+        // Three bytes with two left: dropped, and the two bytes stay unused.
+        write!(buf, "\u{20ac}").unwrap();
+        assert_eq!(buf.dropped(), 3);
+        // One byte, and there is room for it -- but taking it would put it
+        // where the euro sign should have been.
+        write!(buf, "f").unwrap();
+        assert_eq!(buf.as_str(), "ab");
+        assert_eq!(buf.dropped(), 4);
+    }
+
+    /// Only whole characters are copied in, so a buffer that fills in the
+    /// middle of a multi-byte character holds the bytes before it rather than
+    /// half an encoding -- `as_str` is unchecked and must never see one.
+    #[test]
+    fn a_buffer_that_fills_mid_character_stays_valid_utf8() {
+        use core::fmt::Write;
+        let mut buf = SpinBuf::<4>::new();
+        write!(buf, "ab\u{20ac}").unwrap();
+        assert_eq!(buf.as_str(), "ab", "the three-byte euro sign did not fit");
+        assert_eq!(buf.dropped(), 3);
+        assert!(core::str::from_utf8(buf.as_str().as_bytes()).is_ok());
     }
 
     /// `error_code 0x4c` on a #GP, off a hardware stop screen: index 9, TI

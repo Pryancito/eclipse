@@ -147,6 +147,13 @@ impl DrmDev {
         &self.file
     }
 
+    /// This open's identity for what the DRM core keeps per `drm_file`
+    /// (property blobs): the address of its state, which lives exactly as
+    /// long as the open does.
+    fn file_owner(&self) -> usize {
+        Arc::as_ptr(&self.file) as usize
+    }
+
     /// Sleep until the vblank a blocking `DRM_IOCTL_WAIT_VBLANK` asked for.
     ///
     /// Called from `sys_ioctl` (async) *before* the request reaches
@@ -1628,15 +1635,43 @@ impl DrmDev {
                 // and answers ENOENT for one that does not exist. The id was
                 // not read at all, so a stale or invented plane id presented
                 // the fb on the CRTC as if it named the primary plane.
-                if drm::get_plane(req.plane_id).is_none() {
+                let Some(plane) = drm::get_plane(req.plane_id) else {
                     return Err(FsError::EntryNotFound);
-                }
+                };
                 if req.fb_id != 0 {
                     // With an fb to show, `drm_mode_setplane` looks the fb up
                     // and then the CRTC, both ENOENT. The CRTC id was not
                     // read either.
-                    if drm::get_fb(req.fb_id).is_none() || drm::get_crtc(req.crtc_id).is_none() {
+                    let Some(fb) = drm::get_fb(req.fb_id) else {
                         return Err(FsError::EntryNotFound);
+                    };
+                    if drm::get_crtc(req.crtc_id).is_none() {
+                        return Err(FsError::EntryNotFound);
+                    }
+                    // `__setplane_check`: the plane has to be usable on this
+                    // CRTC (`possible_crtcs & drm_crtc_mask(crtc)`, EINVAL;
+                    // the mask bit is the CRTC's index in the resource list,
+                    // which is what GETPLANE advertises), and the source
+                    // rectangle, in 16.16, has to lie inside the fb
+                    // (`drm_framebuffer_check_src_coords`, ENOSPC). Neither
+                    // was read: a plane was put on a CRTC it does not reach,
+                    // and a source rectangle past the fb's edge was accepted
+                    // and then ignored, so the client believed it was showing
+                    // a crop the scanout never made.
+                    let index = drm::get_resources()
+                        .1
+                        .iter()
+                        .position(|&id| id == req.crtc_id)
+                        .unwrap_or(usize::MAX);
+                    if index >= 32 || plane.possible_crtcs & (1 << index) == 0 {
+                        return Err(FsError::InvalidParam);
+                    }
+                    let (fb_w, fb_h) = ((fb.width as u64) << 16, (fb.height as u64) << 16);
+                    let (src_x, src_y) = (req.src_x as u64, req.src_y as u64);
+                    let (src_w, src_h) = (req.src_w as u64, req.src_h as u64);
+                    if src_w > fb_w || src_x > fb_w - src_w || src_h > fb_h || src_y > fb_h - src_h
+                    {
+                        return Err(FsError::NoDeviceSpace);
                     }
                     if let Err(e) = drm::present_now_checked(req.fb_id, req.crtc_id, None) {
                         present_failed("SETPLANE", req.fb_id, req.crtc_id, e)?;
@@ -2519,7 +2554,10 @@ impl DrmDev {
                 let src = unsafe {
                     core::slice::from_raw_parts(req.data as *const u8, req.length as usize)
                 };
-                req.blob_id = drm::create_blob(src.to_vec(), true);
+                // On this file's list, as `drm_mode_createblob_ioctl` puts
+                // it on `file_priv->blobs`: only this open may destroy it,
+                // and it goes when the open does.
+                req.blob_id = drm::create_blob_owned(src.to_vec(), true, self.file_owner());
                 log::debug!(
                     "[drm] CREATEPROPBLOB len={} -> blob={}",
                     req.length,
@@ -2530,10 +2568,14 @@ impl DrmDev {
             DRM_IOCTL_MODE_DESTROYPROPBLOB => {
                 // struct drm_mode_destroy_blob { __u32 blob_id; }
                 let blob_id = unsafe { *(data as *const u32) };
-                match drm::destroy_blob(blob_id) {
+                match drm::destroy_blob(blob_id, self.file_owner()) {
                     drm::BlobDestroy::Destroyed => Ok(0),
                     drm::BlobDestroy::NotFound => Err(FsError::EntryNotFound),
-                    // Linux: kernel-owned or another client's blob → EPERM.
+                    // EPERM: "ensure the property was actually created by
+                    // this user" (another open file's blob), and the kernel's
+                    // own, which is on no file's list. Any client could free
+                    // any other's, and the compositor's MODE_ID blob going
+                    // away under it makes its next commit fail with ENOENT.
                     drm::BlobDestroy::KernelOwned | drm::BlobDestroy::NotOwner => {
                         Err(FsError::NotPermitted)
                     }
@@ -12430,6 +12472,97 @@ mod hw_kms_tests {
         c.destroy_dumb(buf.handle).expect("DESTROY_DUMB");
     }
 
+    /// `__setplane_check`: the plane has to be usable on the CRTC named
+    /// (`possible_crtcs`, EINVAL) and the source rectangle, in 16.16, has to
+    /// lie inside the fb (ENOSPC). Neither was read: a plane went onto a CRTC
+    /// it does not reach, and a crop past the fb's edge was accepted, so a
+    /// client believed it was showing a crop the scanout never made.
+    #[test]
+    fn setplane_wants_a_crtc_the_plane_reaches_and_a_source_inside_the_fb() {
+        let screen = kms_emu::attach(32, 8);
+        let _first = screen.attach_gpu(EmuGpu::hardware_kms("emu-gpu-0").with_ids(60, 61, 62));
+        let _second = screen.attach_gpu(EmuGpu::hardware_kms("emu-gpu-1").with_ids(70, 71, 72));
+        let c = Client::open(0);
+        let buf = c.create_dumb(32, 8);
+        paint(&buf, 0x0000_7777);
+        let fb = c.addfb2(&buf);
+        // The resource list decides the CRTC indices; the plane of each
+        // card is its CRTC id plus two.
+        let (crtcs, _) = topology(&c);
+        assert_eq!(crtcs.len(), 2);
+        let (front, back) = (crtcs[0], crtcs[1]);
+        let plane_of = |crtc: u32| crtc + 2;
+
+        let set_plane = |plane_id: u32, crtc_id: u32, src: [u32; 4]| {
+            let mut req: DrmModeSetPlane = zeroed();
+            req.plane_id = plane_id;
+            req.crtc_id = crtc_id;
+            req.fb_id = fb;
+            req.crtc_w = 32;
+            req.crtc_h = 8;
+            req.src_x = src[0] << 16;
+            req.src_y = src[1] << 16;
+            req.src_w = src[2] << 16;
+            req.src_h = src[3] << 16;
+            c.ioctl(DRM_IOCTL_MODE_SETPLANE, &mut req)
+        };
+        let enospc = Err(FsError::NoDeviceSpace);
+
+        // Every plane advertises `possible_crtcs = 1`, CRTC index 0: the
+        // plane of the card listed second is not usable on its own CRTC, by
+        // what the client was told, and the first's is.
+        assert_eq!(
+            set_plane(plane_of(back), back, [0, 0, 32, 8]),
+            Err(FsError::InvalidParam),
+            "a CRTC the plane's mask does not reach"
+        );
+        assert_eq!(set_plane(plane_of(front), front, [0, 0, 32, 8]), Ok(0));
+
+        assert_eq!(
+            set_plane(plane_of(front), front, [0, 0, 33, 8]),
+            enospc,
+            "wider than the fb"
+        );
+        assert_eq!(
+            set_plane(plane_of(front), front, [0, 0, 32, 9]),
+            enospc,
+            "taller than the fb"
+        );
+        assert_eq!(
+            set_plane(plane_of(front), front, [1, 0, 32, 8]),
+            enospc,
+            "x pushes it past the edge"
+        );
+        assert_eq!(
+            set_plane(plane_of(front), front, [0, 1, 32, 8]),
+            enospc,
+            "y pushes it past the bottom"
+        );
+        assert_eq!(
+            set_plane(plane_of(front), front, [16, 4, 16, 4]),
+            Ok(0),
+            "a crop that fits"
+        );
+        assert_eq!(
+            set_plane(plane_of(front), front, [0, 0, 0, 0]),
+            Ok(0),
+            "no source rectangle at all"
+        );
+
+        // A fractional source edge counts: 31.5 wide from x = 0.75 is past 32.
+        let mut req: DrmModeSetPlane = zeroed();
+        req.plane_id = plane_of(front);
+        req.crtc_id = front;
+        req.fb_id = fb;
+        req.src_x = 3 << 14;
+        req.src_w = (31 << 16) | (1 << 15);
+        req.src_h = 8 << 16;
+        assert_eq!(c.ioctl(DRM_IOCTL_MODE_SETPLANE, &mut req), enospc);
+
+        c.rmfb(fb).expect("RMFB");
+        c.destroy_dumb(buf.handle).expect("DESTROY_DUMB");
+    }
+
     /// `drm_mode_page_flip_ioctl`, once the CRTC and the fb are found: the
     /// CRTC's mode has to fit in the new fb (`drm_crtc_check_viewport`,
     /// ENOSPC), and "page flip is not allowed to change frame buffer format"
@@ -13785,6 +13918,7 @@ mod blob_id_space_tests {
     //! files. Now the bases are named, the encoding is one pair of functions,
     //! and the gap between them is a compile-time assertion.
 
+    use super::gl_client_sequence_tests::Client;
     use super::*;
 
     #[test]
@@ -13857,13 +13991,22 @@ mod blob_id_space_tests {
         assert!(b > a, "ids must not repeat");
         assert_eq!(drm::get_blob(a).as_deref(), Some(&[1u8, 2, 3][..]));
 
-        assert!(matches!(drm::destroy_blob(a), drm::BlobDestroy::Destroyed));
+        assert!(matches!(
+            drm::destroy_blob(a, 0),
+            drm::BlobDestroy::Destroyed
+        ));
         assert_eq!(drm::get_blob(a), None);
         let c = drm::create_blob(alloc::vec![5u8], true);
         assert!(c > b, "a freed id came back: {} after {}", c, b);
 
-        assert!(matches!(drm::destroy_blob(b), drm::BlobDestroy::Destroyed));
-        assert!(matches!(drm::destroy_blob(c), drm::BlobDestroy::Destroyed));
+        assert!(matches!(
+            drm::destroy_blob(b, 0),
+            drm::BlobDestroy::Destroyed
+        ));
+        assert!(matches!(
+            drm::destroy_blob(c, 0),
+            drm::BlobDestroy::Destroyed
+        ));
     }
 
     /// Linux splits `DESTROYPROPBLOB`'s refusals: ENOENT for an id that names
@@ -13875,7 +14018,7 @@ mod blob_id_space_tests {
         let _serialised = drm::test_globals::lock();
         let kernel = drm::create_blob(alloc::vec![0u8; 68], false);
         assert!(
-            matches!(drm::destroy_blob(kernel), drm::BlobDestroy::KernelOwned),
+            matches!(drm::destroy_blob(kernel, 0), drm::BlobDestroy::KernelOwned),
             "a kernel-owned blob must answer EPERM, not vanish",
         );
         assert!(
@@ -13884,13 +14027,78 @@ mod blob_id_space_tests {
         );
 
         assert!(matches!(
-            drm::destroy_blob(drm::BLOB_ID_BASE - 1),
+            drm::destroy_blob(drm::BLOB_ID_BASE - 1, 0),
             drm::BlobDestroy::NotFound
         ));
         assert!(matches!(
-            drm::destroy_blob(edid_blob_id(2)),
+            drm::destroy_blob(edid_blob_id(2), 0),
             drm::BlobDestroy::NotFound
         ));
+    }
+    /// `drm_mode_destroyblob_ioctl` frees a blob only for the file that
+    /// created it ("ensure the property was actually created by this user",
+    /// EPERM otherwise), and `drm_release` frees what a file leaves behind.
+    /// Any client could destroy any other's -- the compositor's MODE_ID blob
+    /// going away under it makes its next commit fail with ENOENT -- and a
+    /// closed client's blobs were kept for ever.
+    #[test]
+    fn a_blob_belongs_to_the_file_that_created_it_and_dies_with_it() {
+        let _serialised = drm::test_globals::lock();
+        let owner = Client::open(0);
+        let other = Client::open(0);
+        let create = |c: &Client| {
+            let bytes = [7u8; 68];
+            let mut blob = DrmModeCreateBlob {
+                data: bytes.as_ptr() as u64,
+                length: bytes.len() as u32,
+                blob_id: 0,
+            };
+            c.ioctl(DRM_IOCTL_MODE_CREATEPROPBLOB, &mut blob)
+                .expect("CREATEPROPBLOB");
+            blob.blob_id
+        };
+        let destroy = |c: &Client, id: u32| {
+            let mut id = id;
+            c.ioctl(DRM_IOCTL_MODE_DESTROYPROPBLOB, &mut id)
+        };
+
+        let id = create(&owner);
+        assert_eq!(
+            destroy(&other, id),
+            Err(FsError::NotPermitted),
+            "another file's blob"
+        );
+        // Readable by anyone: the lookup has no owner check.
+        let mut get = DrmModeGetBlob {
+            blob_id: id,
+            length: 0,
+            data: 0,
+        };
+        assert_eq!(other.ioctl(DRM_IOCTL_MODE_GETPROPBLOB, &mut get), Ok(0));
+        assert_eq!(get.length, 68);
+        assert_eq!(destroy(&owner, id), Ok(0));
+        assert_eq!(destroy(&owner, id), Err(FsError::EntryNotFound), "twice");
+
+        let kernel = drm::create_blob(alloc::vec![0u8; 68], false);
+        assert_eq!(
+            destroy(&owner, kernel),
+            Err(FsError::NotPermitted),
+            "the kernel's own"
+        );
+
+        let left_behind = create(&owner);
+        let kept = create(&other);
+        drop(owner);
+        assert!(
+            drm::get_blob(left_behind).is_none(),
+            "a closed file's blob outlived it"
+        );
+        assert!(
+            drm::get_blob(kept).is_some(),
+            "and took a stranger's with it"
+        );
+        assert_eq!(destroy(&other, left_behind), Err(FsError::EntryNotFound));
+        assert_eq!(destroy(&other, kept), Ok(0));
     }
 }
 

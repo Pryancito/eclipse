@@ -7,6 +7,9 @@
 //! full real-vs-ours breakdown and the one known gap (REGISTER_ALL_HALS).
 use crate::types::*;
 
+#[cfg(test)]
+extern crate std;
+
 // ---------------------------------------------------------------------
 // RM call gate: serialize EVERY entry into the RM from ioctl-time paths.
 //
@@ -36,6 +39,23 @@ use crate::types::*;
 // waiting thread, which the scheduler already handles.
 // ---------------------------------------------------------------------
 static RM_CALL_GATE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Test-only: the one turnstile for anything that *asserts* about
+/// [`RM_CALL_GATE`].
+///
+/// The gate is a process-global and `cargo test` runs test functions in
+/// parallel, so a test reading "was the gate held during this call" would
+/// otherwise see whatever another test was doing. Every test that looks at the
+/// gate -- directly, or through the `gate_held` the CE double records -- holds
+/// THIS lock. Tests that merely *take* the gate need nothing: that is what it
+/// is for.
+#[cfg(test)]
+pub(crate) fn gate_test_turnstile() -> std::sync::MutexGuard<'static, ()> {
+    static TURNSTILE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    // A test that panicked while holding it poisoned it; the gate itself is put
+    // back by `RmGate`'s own `Drop`, so the next test can still proceed.
+    TURNSTILE.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 struct RmGate;
 
@@ -1344,51 +1364,289 @@ extern "C" {
         console_size: NvU64,
         console_at_bar1_base: u8,
     ) -> NV_STATUS;
+}
 
-    fn eclipse_rm_ce_blit(
-        gpu_instance: NvU32,
-        dst_fb_vram_offset: NvU64,
-        src_sysmem_pa: NvU64,
-        size: NvU64,
-        work_id: *mut NvU64,
-    ) -> NV_STATUS;
+// ---------------------------------------------------------------------
+// The CE entry points of the vendored RM, behind one seam.
+//
+// Everything else in this file calls `eclipse_rm_*` directly, which is why
+// none of it had ever run outside a real GPU: those symbols only exist once
+// `build.rs` compiles NVIDIA's C, and what is behind them talks to hardware.
+// The CE family is the one that runs every single frame -- it is the present
+// path -- and the Rust around it carries two rules that cost real debugging to
+// find: the gate is held across the SUBMIT and dropped BEFORE the wait (holding
+// it across a 100 ms CE wait starved TLB shootdowns and blocked NVK
+// `GEM_NEW`), and `ce_finish` decides which of three statuses the caller sees.
+//
+// So the calls go through this module instead of straight through the FFI. On
+// the kernel side it is the same `unsafe` call it always was, inlined to
+// nothing; under `cfg(test)` it is a double that records what was called, in
+// what order, and -- the point -- whether the gate was held at the time.
+//
+// The double is deliberately NOT a set of `#[no_mangle] extern "C"` stand-ins:
+// those collide with the vendored C in the same rlib the moment the submodule
+// is checked out (`duplicate symbol: eclipse_rm_*`), which is exactly how
+// `drivers` ended up impossible to link. A plain module boundary cannot
+// collide with anything.
+// ---------------------------------------------------------------------
+#[cfg(not(test))]
+mod ce_rm {
+    use super::*;
 
-    fn eclipse_rm_ce_fill_fb(
-        gpu_instance: NvU32,
-        fb_vram_offset: NvU64,
-        size: NvU64,
-        pattern: NvU32,
-    ) -> NV_STATUS;
+    extern "C" {
+        fn eclipse_rm_ce_blit(
+            gpu_instance: NvU32,
+            dst_fb_vram_offset: NvU64,
+            src_sysmem_pa: NvU64,
+            size: NvU64,
+            work_id: *mut NvU64,
+        ) -> NV_STATUS;
 
-    fn eclipse_rm_ce_fill_fb_p2p(
-        gpu_instance: NvU32,
-        dst_host_pa: NvU64,
-        size: NvU64,
-        pattern: NvU32,
-    ) -> NV_STATUS;
+        fn eclipse_rm_ce_fill_fb(
+            gpu_instance: NvU32,
+            fb_vram_offset: NvU64,
+            size: NvU64,
+            pattern: NvU32,
+        ) -> NV_STATUS;
 
-    fn eclipse_rm_ce_blit_p2p(
-        gpu_instance: NvU32,
-        dst_host_pa: NvU64,
-        src_sysmem_pa: NvU64,
-        size: NvU64,
-        work_id: *mut NvU64,
-    ) -> NV_STATUS;
+        fn eclipse_rm_ce_fill_fb_p2p(
+            gpu_instance: NvU32,
+            dst_host_pa: NvU64,
+            size: NvU64,
+            pattern: NvU32,
+        ) -> NV_STATUS;
 
-    fn eclipse_rm_ce_blit_p2p_2d(
-        gpu_instance: NvU32,
-        dst_host_pa: NvU64,
-        dst_pitch: NvU32,
-        src_sysmem_pa: NvU64,
-        src_pitch: NvU32,
-        row_bytes: NvU32,
-        line_count: NvU32,
-        work_id: *mut NvU64,
-    ) -> NV_STATUS;
+        fn eclipse_rm_ce_blit_p2p(
+            gpu_instance: NvU32,
+            dst_host_pa: NvU64,
+            src_sysmem_pa: NvU64,
+            size: NvU64,
+            work_id: *mut NvU64,
+        ) -> NV_STATUS;
 
-    fn eclipse_rm_ce_wait(gpu_instance: NvU32, submitted_work_id: NvU64) -> NV_STATUS;
+        fn eclipse_rm_ce_blit_p2p_2d(
+            gpu_instance: NvU32,
+            dst_host_pa: NvU64,
+            dst_pitch: NvU32,
+            src_sysmem_pa: NvU64,
+            src_pitch: NvU32,
+            row_bytes: NvU32,
+            line_count: NvU32,
+            work_id: *mut NvU64,
+        ) -> NV_STATUS;
 
-    fn eclipse_rm_ce_release_inflight() -> NV_STATUS;
+        fn eclipse_rm_ce_wait(gpu_instance: NvU32, submitted_work_id: NvU64) -> NV_STATUS;
+
+        fn eclipse_rm_ce_release_inflight() -> NV_STATUS;
+    }
+
+    #[inline]
+    pub fn blit(
+        gpu: u32,
+        dst_fb_vram_offset: u64,
+        src_sysmem_pa: u64,
+        size: u64,
+    ) -> (NV_STATUS, u64) {
+        let mut work_id = 0u64;
+        let status = unsafe {
+            eclipse_rm_ce_blit(gpu, dst_fb_vram_offset, src_sysmem_pa, size, &mut work_id)
+        };
+        (status, work_id)
+    }
+
+    #[inline]
+    pub fn fill_fb(gpu: u32, fb_vram_offset: u64, size: u64, pattern: u32) -> NV_STATUS {
+        unsafe { eclipse_rm_ce_fill_fb(gpu, fb_vram_offset, size, pattern) }
+    }
+
+    #[inline]
+    pub fn fill_fb_p2p(gpu: u32, dst_host_pa: u64, size: u64, pattern: u32) -> NV_STATUS {
+        unsafe { eclipse_rm_ce_fill_fb_p2p(gpu, dst_host_pa, size, pattern) }
+    }
+
+    #[inline]
+    pub fn blit_p2p(gpu: u32, dst_host_pa: u64, src_sysmem_pa: u64, size: u64) -> (NV_STATUS, u64) {
+        let mut work_id = 0u64;
+        let status =
+            unsafe { eclipse_rm_ce_blit_p2p(gpu, dst_host_pa, src_sysmem_pa, size, &mut work_id) };
+        (status, work_id)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[inline]
+    pub fn blit_p2p_2d(
+        gpu: u32,
+        dst_host_pa: u64,
+        dst_pitch: u32,
+        src_sysmem_pa: u64,
+        src_pitch: u32,
+        row_bytes: u32,
+        line_count: u32,
+    ) -> (NV_STATUS, u64) {
+        let mut work_id = 0u64;
+        let status = unsafe {
+            eclipse_rm_ce_blit_p2p_2d(
+                gpu,
+                dst_host_pa,
+                dst_pitch,
+                src_sysmem_pa,
+                src_pitch,
+                row_bytes,
+                line_count,
+                &mut work_id,
+            )
+        };
+        (status, work_id)
+    }
+
+    #[inline]
+    pub fn wait(gpu: u32, work_id: u64) -> NV_STATUS {
+        unsafe { eclipse_rm_ce_wait(gpu, work_id) }
+    }
+
+    #[inline]
+    pub fn release_inflight() -> NV_STATUS {
+        unsafe { eclipse_rm_ce_release_inflight() }
+    }
+}
+
+/// The test double for [`ce_rm`]. It answers whatever the test programmed and
+/// records every call with **whether [`RM_CALL_GATE`] was held at the time**,
+/// which is the only way to check from outside that submit runs under the gate
+/// and the wait does not.
+///
+/// The recording is thread-local, so two tests running at once never see each
+/// other's calls; the gate itself is a process-global, so anything *asserting*
+/// about it takes [`gate_test_turnstile`].
+#[cfg(test)]
+mod ce_rm {
+    extern crate std;
+    use super::*;
+    use alloc::vec::Vec;
+    use core::cell::{Cell, RefCell};
+    use core::sync::atomic::Ordering;
+
+    /// One recorded call: what, whether the gate was held, and the arguments
+    /// that reached the RM (so a test can tell a dropped or swapped argument
+    /// from a correct one).
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct Call {
+        pub what: &'static str,
+        pub gate_held: bool,
+        pub args: Vec<u64>,
+    }
+
+    std::thread_local! {
+        static CALLS: RefCell<Vec<Call>> = const { RefCell::new(Vec::new()) };
+        static SUBMIT_STATUS: Cell<NV_STATUS> = const { Cell::new(NV_OK) };
+        static WAIT_STATUS: Cell<NV_STATUS> = const { Cell::new(NV_OK) };
+        static RELEASE_STATUS: Cell<NV_STATUS> = const { Cell::new(NV_OK) };
+        static WORK_ID: Cell<u64> = const { Cell::new(0) };
+    }
+
+    fn record(what: &'static str, args: Vec<u64>) {
+        let gate_held = RM_CALL_GATE.load(Ordering::SeqCst);
+        CALLS.with(|c| {
+            c.borrow_mut().push(Call {
+                what,
+                gate_held,
+                args,
+            })
+        });
+    }
+
+    /// Start a fresh recording, with the three statuses the CE path can return
+    /// and the work id a submit hands back.
+    pub fn arm(submit: NV_STATUS, wait: NV_STATUS, release: NV_STATUS, work_id: u64) {
+        CALLS.with(|c| c.borrow_mut().clear());
+        SUBMIT_STATUS.with(|c| c.set(submit));
+        WAIT_STATUS.with(|c| c.set(wait));
+        RELEASE_STATUS.with(|c| c.set(release));
+        WORK_ID.with(|c| c.set(work_id));
+    }
+
+    pub fn calls() -> Vec<Call> {
+        CALLS.with(|c| c.borrow().clone())
+    }
+
+    /// The names in order, which is what most assertions are about.
+    pub fn sequence() -> Vec<&'static str> {
+        calls().iter().map(|c| c.what).collect()
+    }
+
+    fn submit(what: &'static str, args: Vec<u64>) -> (NV_STATUS, u64) {
+        record(what, args);
+        (SUBMIT_STATUS.with(|c| c.get()), WORK_ID.with(|c| c.get()))
+    }
+
+    pub fn blit(
+        gpu: u32,
+        dst_fb_vram_offset: u64,
+        src_sysmem_pa: u64,
+        size: u64,
+    ) -> (NV_STATUS, u64) {
+        submit(
+            "blit",
+            alloc::vec![gpu as u64, dst_fb_vram_offset, src_sysmem_pa, size],
+        )
+    }
+
+    pub fn fill_fb(gpu: u32, fb_vram_offset: u64, size: u64, pattern: u32) -> NV_STATUS {
+        record(
+            "fill_fb",
+            alloc::vec![gpu as u64, fb_vram_offset, size, pattern as u64],
+        );
+        SUBMIT_STATUS.with(|c| c.get())
+    }
+
+    pub fn fill_fb_p2p(gpu: u32, dst_host_pa: u64, size: u64, pattern: u32) -> NV_STATUS {
+        record(
+            "fill_fb_p2p",
+            alloc::vec![gpu as u64, dst_host_pa, size, pattern as u64],
+        );
+        SUBMIT_STATUS.with(|c| c.get())
+    }
+
+    pub fn blit_p2p(gpu: u32, dst_host_pa: u64, src_sysmem_pa: u64, size: u64) -> (NV_STATUS, u64) {
+        submit(
+            "blit_p2p",
+            alloc::vec![gpu as u64, dst_host_pa, src_sysmem_pa, size],
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn blit_p2p_2d(
+        gpu: u32,
+        dst_host_pa: u64,
+        dst_pitch: u32,
+        src_sysmem_pa: u64,
+        src_pitch: u32,
+        row_bytes: u32,
+        line_count: u32,
+    ) -> (NV_STATUS, u64) {
+        submit(
+            "blit_p2p_2d",
+            alloc::vec![
+                gpu as u64,
+                dst_host_pa,
+                dst_pitch as u64,
+                src_sysmem_pa,
+                src_pitch as u64,
+                row_bytes as u64,
+                line_count as u64
+            ],
+        )
+    }
+
+    pub fn wait(gpu: u32, work_id: u64) -> NV_STATUS {
+        record("wait", alloc::vec![gpu as u64, work_id]);
+        WAIT_STATUS.with(|c| c.get())
+    }
+
+    pub fn release_inflight() -> NV_STATUS {
+        record("release", alloc::vec![]);
+        RELEASE_STATUS.with(|c| c.get())
+    }
 }
 
 /// Declares a GPU as the primary/console device to RM, NVIDIA's own way
@@ -1462,23 +1720,14 @@ pub fn ce_blit(
     src_sysmem_pa: u64,
     size: u64,
 ) -> NV_STATUS {
-    let mut work_id = 0u64;
-    let submit = {
+    let (submit, work_id) = {
         // [rpc-lock] Serialize submit with every other RM entry. A CE present
         // runs from scanout WHILE NVK allocates on another thread; without this
         // gate the two enter the RM concurrently and trip its API-lock
         // invariant (`Assertion failed: RPC locking violation @ rpc.c:9834`).
         // Wait happens AFTER this gate drops -- see `ce_finish`.
         let _gate = RmGate::lock();
-        unsafe {
-            eclipse_rm_ce_blit(
-                gpu_instance,
-                dst_fb_vram_offset,
-                src_sysmem_pa,
-                size,
-                &mut work_id,
-            )
-        }
+        ce_rm::blit(gpu_instance, dst_fb_vram_offset, src_sysmem_pa, size)
     };
     ce_finish(gpu_instance, submit, work_id)
 }
@@ -1490,10 +1739,10 @@ fn ce_finish(gpu_instance: u32, submit: NV_STATUS, work_id: u64) -> NV_STATUS {
     if submit != NV_OK {
         return submit;
     }
-    let wait = unsafe { eclipse_rm_ce_wait(gpu_instance, work_id) };
+    let wait = ce_rm::wait(gpu_instance, work_id);
     let release = {
         let _gate = RmGate::lock();
-        unsafe { eclipse_rm_ce_release_inflight() }
+        ce_rm::release_inflight()
     };
     if wait != NV_OK {
         wait
@@ -1515,7 +1764,7 @@ pub fn ce_fill_fb(gpu_instance: u32, fb_vram_offset: u64, size: u64, pattern: u3
     // [rpc-lock] See `ce_blit`: gate this RM entry so a CE op never races a
     // concurrent NVK allocation into the RM (rpc.c:9834 API-lock violation).
     let _gate = RmGate::lock();
-    unsafe { eclipse_rm_ce_fill_fb(gpu_instance, fb_vram_offset, size, pattern) }
+    ce_rm::fill_fb(gpu_instance, fb_vram_offset, size, pattern)
 }
 
 /// P2P variant of [`ce_fill_fb`]: CE-memset a raw HOST physical address
@@ -1527,7 +1776,7 @@ pub fn ce_fill_fb(gpu_instance: u32, fb_vram_offset: u64, size: u64, pattern: u3
 pub fn ce_fill_fb_p2p(gpu_instance: u32, dst_host_pa: u64, size: u64, pattern: u32) -> NV_STATUS {
     // [rpc-lock] See `ce_blit`: gate this RM entry (rpc.c:9834 API-lock).
     let _gate = RmGate::lock();
-    unsafe { eclipse_rm_ce_fill_fb_p2p(gpu_instance, dst_host_pa, size, pattern) }
+    ce_rm::fill_fb_p2p(gpu_instance, dst_host_pa, size, pattern)
 }
 
 /// P2P variant of [`ce_blit`]: CE-copy `src_sysmem_pa` (dumb buffer, RAM) to a
@@ -1541,12 +1790,9 @@ pub fn ce_blit_p2p(
     size: u64,
 ) -> NV_STATUS {
     // [rpc-lock] Gate submit only; wait is outside -- see `ce_finish`.
-    let mut work_id = 0u64;
-    let submit = {
+    let (submit, work_id) = {
         let _gate = RmGate::lock();
-        unsafe {
-            eclipse_rm_ce_blit_p2p(gpu_instance, dst_host_pa, src_sysmem_pa, size, &mut work_id)
-        }
+        ce_rm::blit_p2p(gpu_instance, dst_host_pa, src_sysmem_pa, size)
     };
     ce_finish(gpu_instance, submit, work_id)
 }
@@ -1570,21 +1816,17 @@ pub fn ce_blit_p2p_2d(
     line_count: u32,
 ) -> NV_STATUS {
     // [rpc-lock] Gate submit only; wait is outside -- see `ce_finish`.
-    let mut work_id = 0u64;
-    let submit = {
+    let (submit, work_id) = {
         let _gate = RmGate::lock();
-        unsafe {
-            eclipse_rm_ce_blit_p2p_2d(
-                gpu_instance,
-                dst_host_pa,
-                dst_pitch,
-                src_sysmem_pa,
-                src_pitch,
-                row_bytes,
-                line_count,
-                &mut work_id,
-            )
-        }
+        ce_rm::blit_p2p_2d(
+            gpu_instance,
+            dst_host_pa,
+            dst_pitch,
+            src_sysmem_pa,
+            src_pitch,
+            row_bytes,
+            line_count,
+        )
     };
     ce_finish(gpu_instance, submit, work_id)
 }
@@ -2189,6 +2431,7 @@ mod rm_gate_tests {
     /// froze at boot with a dead console.
     #[test]
     fn the_rm_gate_lets_exactly_one_caller_in_and_always_hands_it_back() {
+        let _turnstile = gate_test_turnstile();
         assert!(
             !RM_CALL_GATE.load(Ordering::SeqCst),
             "the gate was already held before this test: something leaked it"
@@ -2272,6 +2515,219 @@ mod rm_gate_tests {
         assert!(
             !RM_CALL_GATE.load(Ordering::SeqCst),
             "the gate was left held at the end of the test"
+        );
+    }
+}
+
+#[cfg(test)]
+mod ce_path_tests {
+    use super::*;
+    use core::sync::atomic::Ordering;
+
+    /// The present path as the compositor drives it: submit under the gate,
+    /// wait with the gate DROPPED, then free the stashed memdescs under it
+    /// again.
+    ///
+    /// The middle one is the whole point. Holding the gate across a CE wait --
+    /// up to 100 ms -- starved TLB shootdowns and blocked NVK's `GEM_NEW` on
+    /// another thread, which on real hardware is a frozen desktop while the
+    /// GPU has nothing to do. Nothing but this check stands between that bug
+    /// and a one-line edit that moves the wait back inside the bracket.
+    #[test]
+    fn the_present_path_submits_under_the_gate_and_waits_outside_it() {
+        let _turnstile = gate_test_turnstile();
+        ce_rm::arm(NV_OK, NV_OK, NV_OK, 0x1234);
+
+        assert_eq!(ce_blit(0, 0x10_0000, 0xBEEF_0000, 0x4000), NV_OK);
+
+        let calls = ce_rm::calls();
+        assert_eq!(
+            calls.iter().map(|c| c.what).collect::<alloc::vec::Vec<_>>(),
+            alloc::vec!["blit", "wait", "release"]
+        );
+        assert!(calls[0].gate_held, "the submit must run under the gate");
+        assert!(
+            !calls[1].gate_held,
+            "the wait must NOT hold the gate: a 100 ms CE wait under it starves \
+             TLB shootdowns and blocks NVK allocation on other threads"
+        );
+        assert!(
+            calls[2].gate_held,
+            "freeing the in-flight memdescs is an RM entry and belongs under the gate"
+        );
+        assert!(
+            !RM_CALL_GATE.load(Ordering::SeqCst),
+            "the present path left the RM gated"
+        );
+    }
+
+    /// Every asynchronous entry point has that same shape, not just the one
+    /// the test above happens to call.
+    #[test]
+    fn every_async_ce_entry_point_has_the_same_gate_discipline() {
+        let _turnstile = gate_test_turnstile();
+        let cases: alloc::vec::Vec<(&str, &dyn Fn() -> NV_STATUS)> = alloc::vec![
+            (
+                "ce_blit",
+                &(|| ce_blit(0, 0x1000, 0x2000, 0x40)) as &dyn Fn() -> NV_STATUS
+            ),
+            ("ce_blit_p2p", &(|| ce_blit_p2p(0, 0x1000, 0x2000, 0x40))),
+            (
+                "ce_blit_p2p_2d",
+                &(|| ce_blit_p2p_2d(0, 0x1000, 256, 0x2000, 256, 256, 4)),
+            ),
+        ];
+        for (name, call) in cases {
+            ce_rm::arm(NV_OK, NV_OK, NV_OK, 7);
+            assert_eq!(call(), NV_OK, "{}", name);
+            let calls = ce_rm::calls();
+            assert_eq!(calls.len(), 3, "{} did not submit, wait and release", name);
+            assert!(calls[0].gate_held, "{}: submit outside the gate", name);
+            assert_eq!(calls[1].what, "wait", "{}", name);
+            assert!(!calls[1].gate_held, "{}: waited holding the gate", name);
+            assert!(calls[2].gate_held, "{}: released outside the gate", name);
+        }
+    }
+
+    /// The synchronous memsets have no wait to leave outside: they are one RM
+    /// entry, entirely under the gate, and must not invent a wait or a release
+    /// for work that was never submitted asynchronously.
+    #[test]
+    fn the_memset_entry_points_are_one_gated_call_and_never_wait() {
+        let _turnstile = gate_test_turnstile();
+        let cases: alloc::vec::Vec<(&str, &dyn Fn() -> NV_STATUS)> = alloc::vec![
+            (
+                "fill_fb",
+                &(|| ce_fill_fb(0, 0x10_0000, 0x4000, 0xFF)) as &dyn Fn() -> NV_STATUS
+            ),
+            (
+                "fill_fb_p2p",
+                &(|| ce_fill_fb_p2p(0, 0xC000_0000, 0x4000, 0x00)),
+            ),
+        ];
+        for (name, call) in cases {
+            ce_rm::arm(NV_OK, NV_OK, NV_OK, 0);
+            assert_eq!(call(), NV_OK, "{}", name);
+            let calls = ce_rm::calls();
+            assert_eq!(
+                calls.len(),
+                1,
+                "{} made {} calls into the RM, not one",
+                name,
+                calls.len()
+            );
+            assert_eq!(calls[0].what, name);
+            assert!(calls[0].gate_held, "{} ran outside the gate", name);
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Which of the three statuses the caller sees. `CE_PRESENT_WEDGED` in the
+    // display driver latches off on any non-NV_OK return, so a status that
+    // gets lost here is a present path that stays wedged -- or one that keeps
+    // presenting over a GPU that never finished the copy.
+    // -----------------------------------------------------------------
+
+    /// A submit that failed has no work in flight: waiting on it would block
+    /// on a work id the RM never issued, and releasing would free memdescs
+    /// that were never stashed.
+    #[test]
+    fn a_failed_submit_is_returned_without_waiting_or_releasing() {
+        let _turnstile = gate_test_turnstile();
+        ce_rm::arm(NV_ERR_INSUFFICIENT_RESOURCES, NV_OK, NV_OK, 99);
+
+        assert_eq!(
+            ce_blit(0, 0x1000, 0x2000, 0x40),
+            NV_ERR_INSUFFICIENT_RESOURCES
+        );
+        assert_eq!(ce_rm::sequence(), alloc::vec!["blit"]);
+    }
+
+    /// A wait that timed out is what the caller has to see -- that is the
+    /// wedged GPU -- but the stashed memdescs still have to be freed, or every
+    /// timed-out present leaks them.
+    #[test]
+    fn a_failed_wait_is_returned_and_the_release_still_runs() {
+        let _turnstile = gate_test_turnstile();
+        ce_rm::arm(NV_OK, NV_ERR_TIMEOUT, NV_OK, 5);
+
+        assert_eq!(ce_blit(0, 0x1000, 0x2000, 0x40), NV_ERR_TIMEOUT);
+        assert_eq!(ce_rm::sequence(), alloc::vec!["blit", "wait", "release"]);
+    }
+
+    /// With a clean wait, a failing release is the only bad news there is, so
+    /// it must not be swallowed.
+    #[test]
+    fn a_failed_release_surfaces_when_the_wait_was_clean() {
+        let _turnstile = gate_test_turnstile();
+        ce_rm::arm(NV_OK, NV_OK, NV_ERR_INVALID_STATE, 5);
+
+        assert_eq!(ce_blit(0, 0x1000, 0x2000, 0x40), NV_ERR_INVALID_STATE);
+    }
+
+    /// And when both fail, the wait wins: it names what actually went wrong
+    /// with the copy, while the release failure is downstream of it.
+    #[test]
+    fn the_wait_outranks_the_release_when_both_fail() {
+        let _turnstile = gate_test_turnstile();
+        ce_rm::arm(NV_OK, NV_ERR_TIMEOUT, NV_ERR_INVALID_STATE, 5);
+
+        assert_eq!(ce_blit(0, 0x1000, 0x2000, 0x40), NV_ERR_TIMEOUT);
+    }
+
+    // -----------------------------------------------------------------
+    // What reaches the RM.
+    // -----------------------------------------------------------------
+
+    /// The wait has to be about the work the submit just handed back. A
+    /// dropped work id waits on 0 -- some other, older copy -- and reports
+    /// success for a present that never landed.
+    #[test]
+    fn the_wait_asks_about_the_work_id_the_submit_handed_back() {
+        let _turnstile = gate_test_turnstile();
+        ce_rm::arm(NV_OK, NV_OK, NV_OK, 0xDEAD_BEEF);
+
+        assert_eq!(ce_blit(3, 0x1000, 0x2000, 0x40), NV_OK);
+        let calls = ce_rm::calls();
+        assert_eq!(
+            calls[1].args,
+            alloc::vec![3, 0xDEAD_BEEF],
+            "the wait must name this GPU and this work id"
+        );
+    }
+
+    /// The 2D P2P blit takes seven numbers, four of them interchangeable at
+    /// the type level (`dst_pitch`, `src_pitch`, `row_bytes`, `line_count` are
+    /// all `u32`), so a swapped pair compiles and silently tears the image.
+    /// This pins the order they reach the RM in.
+    #[test]
+    fn the_2d_p2p_blit_passes_its_seven_numbers_in_order() {
+        let _turnstile = gate_test_turnstile();
+        ce_rm::arm(NV_OK, NV_OK, NV_OK, 1);
+
+        assert_eq!(
+            ce_blit_p2p_2d(2, 0xC000_0000, 0x1D00, 0x8000_0000, 0x1E00, 0x1C00, 0x438),
+            NV_OK
+        );
+        let calls = ce_rm::calls();
+        assert_eq!(
+            calls[0].args,
+            alloc::vec![2, 0xC000_0000, 0x1D00, 0x8000_0000, 0x1E00, 0x1C00, 0x438]
+        );
+    }
+
+    /// The plain blit's four, same reason: destination offset and source
+    /// address are both `u64`, and swapping them writes the framebuffer's
+    /// contents into the compositor's buffer instead of the other way round.
+    #[test]
+    fn the_plain_blit_passes_its_four_numbers_in_order() {
+        let _turnstile = gate_test_turnstile();
+        ce_rm::arm(NV_OK, NV_OK, NV_OK, 1);
+
+        assert_eq!(ce_blit(1, 0x10_0000, 0xBEEF_0000, 0x3F_C000), NV_OK);
+        assert_eq!(
+            ce_rm::calls()[0].args,
+            alloc::vec![1, 0x10_0000, 0xBEEF_0000, 0x3F_C000]
         );
     }
 }
