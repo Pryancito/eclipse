@@ -572,6 +572,22 @@ pub(crate) fn weak_waiting_here() -> u64 {
 /// yield-heavy loop and a rounding error on anything else.
 pub(crate) const WEAK_TURN_EVERY: u64 = 8;
 
+/// How far the cadence may be doubled when the turns free nothing.
+///
+/// 8 polls is the right cadence for the case the turn exists for: a frozen
+/// frame holding a borrow that the next resume releases. It is the wrong
+/// cadence for a frame that *cannot* finish yet, because then every turn is a
+/// stack switch -- plus one per live frame inside the weak loop -- that buys
+/// nothing, forever, on a CPU that never drains its queue. Six doublings put
+/// the worst case at one turn per 512 polls and keep the good case at 8.
+pub(crate) const WEAK_TURN_MAX_BACKOFF: u32 = 6;
+
+/// The poll cadence for the weak turn, given how many turns in a row have come
+/// back with the same number of frames still parked.
+pub(crate) fn weak_turn_interval(barren_turns: u32, every: u64) -> u64 {
+    every << barren_turns.min(WEAK_TURN_MAX_BACKOFF)
+}
+
 /// Whether the strong executor should hand the CPU to a parked weak executor
 /// before taking another task.
 ///
@@ -3130,7 +3146,37 @@ mod weak_turn_tests {
     //! [`weak_turn_due`], the condition that decides whether a parked weak
     //! executor gets the CPU while the run queue still has work.
 
-    use super::{weak_turn_due, WEAK_TURN_EVERY};
+    use super::{weak_turn_due, weak_turn_interval, WEAK_TURN_EVERY, WEAK_TURN_MAX_BACKOFF};
+
+    /// A turn that frees a frame keeps the fast cadence; one that frees nothing
+    /// doubles it, and the doubling stops rather than running away.
+    #[test]
+    fn the_cadence_backs_off_only_while_the_turns_free_nothing() {
+        assert_eq!(weak_turn_interval(0, WEAK_TURN_EVERY), WEAK_TURN_EVERY);
+        assert_eq!(weak_turn_interval(1, WEAK_TURN_EVERY), WEAK_TURN_EVERY * 2);
+        assert_eq!(weak_turn_interval(3, WEAK_TURN_EVERY), WEAK_TURN_EVERY * 8);
+        let capped = weak_turn_interval(WEAK_TURN_MAX_BACKOFF, WEAK_TURN_EVERY);
+        assert_eq!(capped, WEAK_TURN_EVERY << WEAK_TURN_MAX_BACKOFF);
+        assert_eq!(
+            weak_turn_interval(u32::MAX, WEAK_TURN_EVERY),
+            capped,
+            "la cadencia se fue por las nubes o desbordo el desplazamiento"
+        );
+    }
+
+    /// The point of the backoff: the cost of a frame that cannot finish is
+    /// bounded, and it is still not zero, because that frame holds a borrow
+    /// nothing else can release.
+    #[test]
+    fn a_frame_that_never_frees_still_gets_its_turn_eventually() {
+        let interval = weak_turn_interval(u32::MAX, WEAK_TURN_EVERY);
+        assert!(
+            interval <= 512,
+            "una cesion cada {} polls es no cederla",
+            interval
+        );
+        assert!(weak_turn_due(1, interval, interval));
+    }
 
     /// Nothing parked, nothing to hand the CPU to -- whatever the count of polls
     /// says. This is the overwhelming majority of passes and it must cost one

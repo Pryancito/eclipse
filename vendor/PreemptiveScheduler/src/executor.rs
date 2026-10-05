@@ -37,6 +37,10 @@ pub struct Executor {
     /// executor. Plain, not atomic: an executor is only ever run by one CPU,
     /// and this is the hottest loop there is.
     polls_since_weak: u64,
+
+    /// Weak turns in a row that came back with no fewer frames parked. Scales
+    /// the turn's cadence -- see the comment at the turn in `run`.
+    barren_weak_turns: u32,
     state: ExecutorState,
     /// The task checked out for the poll currently in flight, with its waker.
     /// The panic-containment path needs to name — and retire — the future that
@@ -1272,6 +1276,7 @@ impl Executor {
             context_data: ContextData::default(),
             task_id: 0,
             polls_since_weak: 0,
+            barren_weak_turns: 0,
             state: ExecutorState::UNUSED,
             current_task: core::ptr::null(),
             current_waker: core::ptr::null(),
@@ -1400,16 +1405,38 @@ impl Executor {
             // turn on a bounded cadence. Only the strong executor does this: a
             // weak one doing it would resume weak frames from inside a weak
             // frame.
+            //
+            // The cadence backs off while the turns free nothing. A frame whose
+            // borrow the resume releases is gone after one turn, and 8 polls is
+            // the cadence that case wants. A frame that cannot finish yet stays,
+            // and then every turn is a stack switch -- plus one per live frame
+            // inside the weak loop -- buying nothing, on a CPU that by
+            // definition never drains its queue. So count the turns that came
+            // back with no fewer frames parked and double the interval, to a
+            // cap: bounded cost when the frames are stuck, unchanged response
+            // when they are not.
+            let waiting = crate::runtime::weak_waiting_here();
             if !matches!(self.state, ExecutorState::WEAK | ExecutorState::KILLED)
                 && crate::runtime::weak_turn_due(
-                    crate::runtime::weak_waiting_here(),
+                    waiting,
                     self.polls_since_weak,
-                    crate::runtime::WEAK_TURN_EVERY,
+                    crate::runtime::weak_turn_interval(
+                        self.barren_weak_turns,
+                        crate::runtime::WEAK_TURN_EVERY,
+                    ),
                 )
             {
                 self.polls_since_weak = 0;
                 SCHED_WEAK_TURN.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                 crate::runtime::sched_yield();
+                // Read back on the far side of the switch: fewer frames parked
+                // than before means the turn did its job, so go back to the
+                // fast cadence.
+                if crate::runtime::weak_waiting_here() < waiting {
+                    self.barren_weak_turns = 0;
+                } else {
+                    self.barren_weak_turns = self.barren_weak_turns.saturating_add(1);
+                }
                 continue;
             }
             // A reschedule request for this CPU means "look at your run queue
