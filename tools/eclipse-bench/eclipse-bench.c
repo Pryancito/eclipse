@@ -1422,6 +1422,29 @@ static double kstat_per_op(const char *label, int idx, double ops) {
     return d / ops;
 }
 
+// Wait for a start gate without using sched_yield().
+//
+// Every gate in this section used to yield, and the yield hand-off probe above
+// shows why that is unsafe here: a kernel can leave a voluntary yielder parked
+// indefinitely, which releases the gated thread late and makes its rate read
+// low for reasons that have nothing to do with the mechanism under test. A
+// short sleep parks the waiter just as effectively without depending on how
+// yield is implemented, and is bounded so a gate that never opens cannot hang
+// the suite.
+static void gate_wait(const volatile int *go, const volatile int *stop) {
+    struct timespec tick = {0, 50 * 1000}; // 50 us
+    uint64_t rounds = 0;
+    while (!*go) {
+        if (stop && *stop)
+            return;
+        nanosleep(&tick, NULL);
+        // ~30 s at 50 us: a gate that never opens costs this probe its number,
+        // never the run.
+        if (++rounds > 600000)
+            return;
+    }
+}
+
 // --- timeslice floor (RUN_TO_PARITY) ---------------------------------------
 //
 // A CPU-bound thread and a thread that wakes thousands of times a second,
@@ -1452,8 +1475,7 @@ static void *parity_spinner(void *arg) {
     struct parity_ctl *c = arg;
     if (smpk_pin_self(c->cpu) != 0)
         c->pin_failed = 1;
-    while (!c->go)
-        sched_yield();
+    gate_wait(&c->go, &c->stop);
     uint64_t x = 0x9e3779b97f4a7c15ull, n = 0;
     while (!c->stop) {
         // No syscall in the loop: the only way this thread loses the CPU is
@@ -1472,8 +1494,7 @@ static void *parity_waker(void *arg) {
     if (smpk_pin_self(c->cpu) != 0)
         c->pin_failed = 1;
     struct timespec ts = {0, (long)c->period_us * 1000};
-    while (!c->go)
-        sched_yield();
+    gate_wait(&c->go, &c->stop);
     uint64_t n = 0, sum = 0, mx = 0;
     while (!c->stop) {
         uint64_t t0 = now_ns();
@@ -1588,8 +1609,7 @@ static void *lag_plain(void *arg) {
     struct lag_ctl *c = arg;
     if (smpk_pin_self(c->cpu) != 0)
         c->pin_failed = 1;
-    while (!c->go)
-        sched_yield();
+    gate_wait(&c->go, &c->stop);
     uint64_t x = 0x9e3779b97f4a7c15ull, n = 0;
     while (!c->stop) {
         for (int k = 0; k < 1024; k++)
@@ -1606,8 +1626,7 @@ static void *lag_parker(void *arg) {
     if (smpk_pin_self(c->cpu) != 0)
         c->pin_failed = 1;
     struct timespec ts = {0, (long)c->park_us * 1000};
-    while (!c->go)
-        sched_yield();
+    gate_wait(&c->go, &c->stop);
     uint64_t n = 0;
     while (!c->stop) {
         n += spin_for_ns(c->spin_ns);
@@ -1694,8 +1713,7 @@ static void *steal_worker(void *arg) {
     for (int i = 0; i < c->ncpu && i < CPU_SETSIZE; i++)
         CPU_SET(i, &all);
     pthread_setaffinity_np(pthread_self(), sizeof all, &all);
-    while (!c->go)
-        sched_yield();
+    gate_wait(&c->go, &c->stop);
     uint64_t x = 0x9e3779b97f4a7c15ull;
     while (!c->stop) {
         // Enough work between samples to be unambiguously CPU-bound, little
@@ -1809,6 +1827,56 @@ static int sc_getaffinity(void) {
 
 static int sc_getcpu(void) { return sched_getcpu() >= 0 ? 0 : -1; }
 
+// --- keeping a probe from hanging the suite --------------------------------
+//
+// This section pins threads together and then waits for one of them to be
+// given the CPU, which is exactly the shape that stops dead on a kernel whose
+// scheduler has a lost wake-up. A benchmark that runs unattended against a
+// kernel under development must not be able to lose thirty working rows
+// because the thirty-first probe never returned, so every wait here is bounded
+// three independent ways:
+//
+//   * the wall clock, which is the normal case;
+//   * a yield count, because if the CLOCK is the thing that is broken a
+//     wall-clock deadline never arrives and the suite stops with no output at
+//     all -- which is indistinguishable from a hung kernel;
+//   * SIGALRM, because neither of the first two is ever evaluated if the
+//     blocking call itself does not return. The handler does nothing: its only
+//     job is to make a blocked syscall fail with EINTR so the loop around it
+//     gets to look at its own deadlines again. It is installed WITHOUT
+//     SA_RESTART for that reason -- with the flag the kernel would restart the
+//     call and the signal would change nothing.
+//
+// Hitting the second or third bound is reported as what it is rather than
+// folded into a plain "n/a", because "this operation is unsupported" and "this
+// operation never came back" are different findings.
+
+#define YIELD_CAP 20000000ull
+
+static volatile sig_atomic_t g_watchdog_fired;
+
+static void bench_watchdog(int sig) {
+    (void)sig;
+    g_watchdog_fired = 1;
+}
+
+// Arm (secs > 0) or disarm (secs == 0) the watchdog. Returns 0 if a watchdog
+// could not be installed, in which case the clock and the yield count are the
+// only bounds left and the caller carries on with them.
+static int watchdog_set(unsigned secs) {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_handler = bench_watchdog;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0; // deliberately NOT SA_RESTART
+    if (sigaction(SIGALRM, &sa, NULL) != 0)
+        return 0;
+    if (secs == 0)
+        g_watchdog_fired = 0;
+    alarm(secs);
+    return 1;
+}
+
 // --- yield hand-off --------------------------------------------------------
 //
 // Two threads on one CPU, each giving the CPU straight back. No timer, no
@@ -1830,11 +1898,15 @@ static void *yield_peer(void *arg) {
     struct yield_ctl *c = arg;
     if (smpk_pin_self(c->cpu) != 0)
         c->pin_failed = 1;
-    while (!c->go)
-        sched_yield();
+    gate_wait(&c->go, &c->stop);
+    uint64_t spins;
     while (!c->stop) {
-        while (c->turn != 1 && !c->stop)
+        spins = 0;
+        while (c->turn != 1 && !c->stop) {
             sched_yield();
+            if (++spins > YIELD_CAP)
+                return NULL;
+        }
         if (c->stop)
             break;
         c->turn = 0;
@@ -1868,32 +1940,52 @@ static double yield_handoff_ns(int cpu, uint64_t budget_ns, const char **why) {
     c.go = 1;
     uint64_t t0 = now_ns(), elapsed = 0, ops = 0;
     uint64_t ns = budget_ns < g_max_ns ? budget_ns : g_max_ns;
+    // Armed ONCE, around the whole loop, and generously: the alarm is a
+    // backstop against a call that never returns, not a per-round budget.
+    // Arming it per round puts a sigaction and an alarm between every
+    // hand-off, which measurably inflates the figure being measured.
+    g_watchdog_fired = 0;
+    watchdog_set((unsigned)(ns / 1000000000ull) + 30);
     while (elapsed < ns || ops < MIN_SAMPLES) {
         c.turn = 1;
-        // Bounded wait: if the peer was never scheduled (a kernel that will
-        // not run two threads on one CPU without a timer) the probe gives up
-        // and reports n/a instead of hanging the suite.
         uint64_t guard = now_ns() + 2000000000ull;
+        uint64_t spins = 0;
+        const char *bound = NULL;
         while (c.turn != 0) {
             sched_yield();
-            if (now_ns() > guard) {
-                // Two seconds of yielding and the peer still has not run:
-                // the peer is pinned to this same CPU and is runnable, so
-                // either yield does not re-dispatch and nothing else
-                // preempted us, or a co-pinned peer is being starved.
-                if (why)
-                    *why = "the co-pinned peer never took the CPU in 2 s";
-                c.stop = 1;
-                c.turn = 0;
-                pthread_join(t, NULL);
-                return NA;
+            if (++spins > YIELD_CAP) {
+                // The yield count ran out while the clock said there was time
+                // left. Either the clock is not advancing or yielding is not
+                // getting the peer onto this CPU; the next row's timings say
+                // which, and both are worth knowing.
+                bound = "20M yields without the co-pinned peer running";
+                break;
             }
+            if (g_watchdog_fired) {
+                // The yield itself did not come back until a signal made it.
+                bound = "sched_yield() blocked until a signal interrupted it";
+                break;
+            }
+            if (now_ns() > guard) {
+                bound = "the co-pinned peer never took the CPU in 2 s";
+                break;
+            }
+        }
+        if (bound) {
+            if (why)
+                *why = bound;
+            watchdog_set(0);
+            c.stop = 1;
+            c.turn = 0;
+            pthread_join(t, NULL);
+            return NA;
         }
         ops += 2;
         elapsed = now_ns() - t0;
         if (elapsed >= g_max_ns)
             break;
     }
+    watchdog_set(0);
     c.stop = 1;
     c.turn = 1;
     pthread_join(t, NULL);
@@ -1975,6 +2067,8 @@ static double wake_burst_ns(int m, int waker_cpu, int target_cpu,
         uint64_t t_start = now_ns(), issue_ns = 0, rounds = 0;
         uint64_t ns = budget_ns < g_max_ns ? budget_ns : g_max_ns;
         int bad = 0;
+        g_watchdog_fired = 0;
+        watchdog_set((unsigned)(ns / 1000000000ull) + 30);
         while ((now_ns() - t_start < ns || rounds < MIN_SAMPLES) && !bad) {
             for (int i = 0; i < m; i++)
                 g_wake[i].done = 0;
@@ -1988,10 +2082,18 @@ static double wake_burst_ns(int m, int waker_cpu, int target_cpu,
             // round issues into sleepers rather than into already-running
             // threads (which would cost nothing and flatter the burst).
             uint64_t guard = now_ns() + 2000000000ull;
+            uint64_t spins = 0;
             for (int i = 0; i < m; i++) {
                 while (!g_wake[i].done) {
                     sched_yield();
-                    if (now_ns() > guard) { bad = 1; break; }
+                    // Same three bounds as the hand-off probe: a sleeper that
+                    // is never woken must cost this probe its number, not the
+                    // whole run.
+                    if (++spins > YIELD_CAP || g_watchdog_fired ||
+                        now_ns() > guard) {
+                        bad = 1;
+                        break;
+                    }
                 }
                 if (bad)
                     break;
@@ -2000,6 +2102,7 @@ static double wake_burst_ns(int m, int waker_cpu, int target_cpu,
             if (now_ns() - t_start >= g_max_ns)
                 break;
         }
+        watchdog_set(0);
         if (!bad && rounds)
             out = (double)issue_ns / (double)rounds / (double)m;
         for (int i = 0; i < made; i++)
