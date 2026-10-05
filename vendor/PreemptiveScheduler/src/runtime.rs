@@ -311,9 +311,115 @@ pub(crate) fn stealable_peers(stealable: u64, current: usize, ready: u64) -> u64
     stealable & ready & !mine
 }
 
+/// CPUs whose queue holds at least one task **they are not allowed to poll**.
+///
+/// A task whose owner CPU is forbidden by its affinity mask is refused on every
+/// pass of that CPU's generator, which re-publishes it and kicks an allowed CPU
+/// with `request_resched`. But the kicked CPU only looks for it where its
+/// executor loop looks: `steal_task_from_other_cpu`, which runs **only when its
+/// own `take_task` came up empty**. An allowed CPU that never goes idle
+/// therefore never comes, and the task does not run again at all -- not late,
+/// never. Two threads in a tight `sched_yield` loop pinned to one CPU are
+/// enough to guarantee that, which is how this was found: a third thread pinned
+/// to the same CPU, born on another one, got **one** timeslice in twenty
+/// seconds while its peer got 544.590.
+///
+/// So the owner says so here, and an allowed CPU comes for it on its rebalance
+/// tick instead of waiting to be idle. `STEALABLE` answers "is there anything
+/// worth taking"; this answers the narrower "is there anything nobody else will
+/// ever come for".
+static STRANDED: AtomicU64 = AtomicU64::new(0);
+
+/// Rescue pulls: tasks taken off a peer that was not allowed to poll them.
+static STEAL_RESCUE: AtomicU64 = AtomicU64::new(0);
+
+/// `cpu`'s generator just refused a task its affinity mask forbids here.
+///
+/// Read before the RMW, like [`note_stealable`]: on a CPU that is already
+/// marked this is a plain load, and the refusal sits on a hand-out pass.
+#[inline]
+pub(crate) fn note_stranded(cpu: usize) {
+    if cpu >= MAX_CORE_NUM {
+        return;
+    }
+    let bit = 1u64 << cpu;
+    if STRANDED.load(Ordering::Relaxed) & bit == 0 {
+        STRANDED.fetch_or(bit, Ordering::Release);
+    }
+}
+
+/// `cpu` completed a hand-out pass over every page refusing nothing.
+///
+/// Only the owner calls this, and only from there. A stranded task sits in the
+/// **notified** lane -- pass 1 re-publishes it when it refuses it -- so a full
+/// pass with no refusal means there is nothing stranded here to come for.
+#[inline]
+pub(crate) fn note_not_stranded(cpu: usize) {
+    if cpu >= MAX_CORE_NUM {
+        return;
+    }
+    let bit = 1u64 << cpu;
+    if STRANDED.load(Ordering::Relaxed) & bit != 0 {
+        STRANDED.fetch_and(!bit, Ordering::AcqRel);
+    }
+}
+
+/// The peers a CPU on `current` should go rescue from: holding a task they may
+/// not poll, in their executor loop, and not itself.
+///
+/// A pure function for the same reason [`stealable_peers`] is one: it is the
+/// only way to test the gating without a second CPU.
+pub(crate) fn stranded_peers(stranded: u64, current: usize, ready: u64) -> u64 {
+    let mine = if current < MAX_CORE_NUM {
+        1u64 << current
+    } else {
+        0
+    };
+    stranded & ready & !mine
+}
+
+/// The raw `STRANDED` bitmap. Lets `task_collection`'s tests check that a
+/// refusal in the hand-out pass actually reaches the hint -- without that link
+/// the bit would simply never be set and the rescue never run.
+#[cfg(test)]
+pub(crate) fn stranded_mask_for_test() -> u64 {
+    STRANDED.load(Ordering::SeqCst)
+}
+
+/// Clear the whole bitmap, for a test that wants a known starting point.
+#[cfg(test)]
+pub(crate) fn clear_stranded_for_test() {
+    STRANDED.store(0, Ordering::SeqCst);
+}
+
+/// Whether this CPU has a peer worth a rescue scan right now.
+#[inline]
+pub(crate) fn stranded_peer_exists() -> bool {
+    stranded_peers(
+        STRANDED.load(Ordering::Acquire),
+        crate::arch::cpu_id() as usize,
+        executor_ready_mask(),
+    ) != 0
+}
+
+/// Go take a task off a peer that is not allowed to poll it.
+///
+/// Deliberately the same scan as the idle steal -- it already ranks victims by
+/// how many tasks they hold **that this CPU may run** (`ready_num_for`), which
+/// is exactly the question here -- and the only thing that changes is who is
+/// allowed to call it: a CPU with work of its own, on its rebalance tick,
+/// rather than only an idle one.
+pub(crate) fn rescue_stranded_task() -> Option<(Key, Arc<Task>, Arc<WakerRef>)> {
+    let task = steal_task_min(1, false);
+    if task.is_some() {
+        STEAL_RESCUE.fetch_add(1, Ordering::Relaxed);
+    }
+    task
+}
+
 /// `(steal scans, victims probed, steals ok, affinity-empty victims skipped,
-/// rebalance pulls, scans skipped by the `STEALABLE` hint)`.
-pub fn sched_steal_stats() -> (u64, u64, u64, u64, u64, u64) {
+/// rebalance pulls, scans skipped by the `STEALABLE` hint, rescue pulls)`.
+pub fn sched_steal_stats() -> (u64, u64, u64, u64, u64, u64, u64) {
     (
         STEAL_SCANS.load(Ordering::Relaxed),
         STEAL_PROBED.load(Ordering::Relaxed),
@@ -321,6 +427,7 @@ pub fn sched_steal_stats() -> (u64, u64, u64, u64, u64, u64) {
         STEAL_AFFINITY_EMPTY.load(Ordering::Relaxed),
         STEAL_REBALANCE.load(Ordering::Relaxed),
         STEAL_SKIPPED.load(Ordering::Relaxed),
+        STEAL_RESCUE.load(Ordering::Relaxed),
     )
 }
 
@@ -2925,6 +3032,86 @@ mod per_cpu_counter_tests {
 
 /// The `STEALABLE` overload hint: what the gate lets through, and the
 /// asymmetry (set by anybody, cleared only by the owner) that makes it safe.
+#[cfg(test)]
+mod stranded_tests {
+    use super::*;
+
+    fn with_stranded<T>(bits: u64, f: impl FnOnce() -> T) -> T {
+        let saved = STRANDED.load(Ordering::SeqCst);
+        STRANDED.store(bits, Ordering::SeqCst);
+        let out = f();
+        STRANDED.store(saved, Ordering::SeqCst);
+        out
+    }
+
+    #[test]
+    fn a_cpu_does_not_go_rescue_from_itself() {
+        // The owner is the one CPU that cannot run it. If it could, it would
+        // not have refused it in the first place.
+        assert_eq!(stranded_peers(0b100, 2, u64::MAX), 0);
+    }
+
+    #[test]
+    fn only_a_cpu_in_its_executor_loop_is_worth_rescuing_from() {
+        // A CPU that has not entered its executor holds no hand-out pass, so
+        // nothing there has been refused yet and its bit is stale.
+        assert_eq!(stranded_peers(0b1010, 0, 0b0010), 0b0010);
+    }
+
+    #[test]
+    fn with_nothing_stranded_anywhere_there_is_no_rescue_scan() {
+        // This is the whole cost argument: the rescue runs on the rebalance
+        // tick of every busy CPU, so on a machine with no affine task the gate
+        // has to answer from one load and stop.
+        assert_eq!(stranded_peers(0, 0, u64::MAX), 0);
+    }
+
+    #[test]
+    fn marking_and_clearing_name_one_cpu_each() {
+        let _g = super::resched_test_lock();
+        with_stranded(0, || {
+            note_stranded(3);
+            assert_eq!(STRANDED.load(Ordering::SeqCst), 1 << 3);
+            note_stranded(5);
+            assert_eq!(STRANDED.load(Ordering::SeqCst), (1 << 3) | (1 << 5));
+            note_not_stranded(3);
+            assert_eq!(
+                STRANDED.load(Ordering::SeqCst),
+                1 << 5,
+                "clearing one CPU took its neighbour with it"
+            );
+        });
+    }
+
+    #[test]
+    fn a_cpu_id_the_word_cannot_hold_is_ignored_rather_than_shifted() {
+        // `1u64 << 64` is undefined; a bogus id must not reach the shift. The
+        // ids come from `cpu_id()`, which has been seen to publish garbage --
+        // see `current_cpu_id`'s bogus-id fallback.
+        let _g = super::resched_test_lock();
+        with_stranded(0, || {
+            note_stranded(MAX_CORE_NUM);
+            note_stranded(usize::MAX);
+            note_not_stranded(MAX_CORE_NUM);
+            assert_eq!(STRANDED.load(Ordering::SeqCst), 0);
+        });
+        // And on the read side, a bogus `current` must not mask out a real bit
+        // by shifting; it simply names no CPU of its own.
+        assert_eq!(stranded_peers(0b10, MAX_CORE_NUM, u64::MAX), 0b10);
+    }
+
+    #[test]
+    fn a_rescue_that_finds_nothing_leaves_the_counter_alone() {
+        let _g = super::resched_test_lock();
+        let before = STEAL_RESCUE.load(Ordering::SeqCst);
+        // No peer is in its executor loop in a unit test, so the scan finds
+        // nothing: the counter must count rescues, not attempts, or the perf
+        // line reads as if tasks were being saved when none were.
+        assert!(rescue_stranded_task().is_none());
+        assert_eq!(STEAL_RESCUE.load(Ordering::SeqCst), before);
+    }
+}
+
 #[cfg(test)]
 mod stealable_tests {
     use super::*;

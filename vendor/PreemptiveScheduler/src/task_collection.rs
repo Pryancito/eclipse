@@ -731,6 +731,12 @@ impl TaskCollection {
                     // `kick_for_affinity` calls — each a `try_lock` walk over
                     // the allowed runtimes — for one coalesced IPI at the end.
                     let mut kicked_mask: u64 = 0;
+                    // Whether this pass refused a task its mask forbids here.
+                    // Published to `STRANDED` below: a refused task is
+                    // re-notified and then only an ALLOWED CPU can run it, and
+                    // nothing in that CPU's loop goes looking unless it is idle.
+                    let mut refused = false;
+                    let own_cpu = crate::arch::cpu_id() as usize;
                     for page_idx in 0..inner.pages.len() {
                         let page = &inner.pages[page_idx];
                         // `pending` is this page's snapshot, minus whatever has
@@ -755,6 +761,7 @@ impl TaskCollection {
                                         .map(|task| task.allowed_on(cpu))
                                         .unwrap_or(true);
                                 if !allowed {
+                                    refused = true;
                                     inner.pages[page_idx].notify(subpage_idx);
                                     let mask = inner
                                         .slab
@@ -783,6 +790,15 @@ impl TaskCollection {
                                 inner.remove(key);
                             }
                         }
+                    }
+                    // A refusal anywhere in the pass means this CPU is
+                    // holding something only a peer may run; a whole pass with
+                    // none means it is not. Set eagerly (a spare bit costs one
+                    // scan), cleared only by a clean pass.
+                    if refused {
+                        crate::runtime::note_stranded(own_cpu);
+                    } else {
+                        crate::runtime::note_not_stranded(own_cpu);
                     }
                     // Pass 2 — voluntary yields, only when nothing urgent remains.
                     if found_key.is_none() {
@@ -1262,6 +1278,51 @@ mod collection_tests {
         assert_eq!(tc.ready_num(), Some(1), "the wake was swallowed");
         assert!(tc.take_task().is_none());
         assert_eq!(tc.ready_num(), Some(1), "a second pass swallowed it");
+    }
+
+    /// A refusal in the hand-out pass has to reach `runtime::STRANDED`, or the
+    /// rescue never runs and the task never runs either.
+    ///
+    /// The owner refuses it on every pass and kicks an allowed CPU, but the
+    /// kick is only read by the idle steal -- so an allowed CPU with work of
+    /// its own never comes. Measured: a thread pinned to a CPU it was not born
+    /// on got **one** timeslice in twenty seconds while its peer got 544.590.
+    #[test]
+    fn refusing_a_task_pinned_elsewhere_says_so_where_a_rescuer_reads_it() {
+        let _g = crate::runtime::resched_test_lock();
+        crate::runtime::clear_stranded_for_test();
+        let tc = TaskCollection::new(0);
+        tc.add_task(pending(), pinned_elsewhere());
+
+        // The pass refuses it (CPU 0 is not in the mask) and hands out nothing.
+        assert!(tc.take_task().is_none());
+        assert_eq!(
+            crate::runtime::stranded_mask_for_test() & 1,
+            1,
+            "nobody will ever come for this task"
+        );
+    }
+
+    /// And the bit comes back down, or every CPU that once held an affine task
+    /// keeps paying for a rescue scan on every rebalance tick forever.
+    #[test]
+    fn a_pass_that_refuses_nothing_takes_the_mark_back_off() {
+        let _g = crate::runtime::resched_test_lock();
+        crate::runtime::clear_stranded_for_test();
+        let tc = TaskCollection::new(0);
+        let pinned = tc.add_task(pending(), pinned_elsewhere());
+        assert!(tc.take_task().is_none());
+        assert_eq!(crate::runtime::stranded_mask_for_test() & 1, 1);
+
+        // The task goes away (it migrated, or it exited). The next clean pass
+        // has nothing to refuse.
+        tc.remove_task(pinned);
+        let _ = tc.take_task();
+        assert_eq!(
+            crate::runtime::stranded_mask_for_test() & 1,
+            0,
+            "the mark outlived the task that earned it"
+        );
     }
 
     #[test]
