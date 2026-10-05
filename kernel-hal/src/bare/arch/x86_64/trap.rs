@@ -570,18 +570,31 @@ fn try_skip_null_execute_call(tf: &mut TrapFrame, fault_vaddr: usize) -> bool {
     // plant one of those and longjmp into `TicketMutex::lock` with smashed
     // registers; refuse and let isolation contain the fault.
     if !looks_like_kernel_text_ret(ret) {
-        let truncated_text = crate::kaddr::looks_truncated_text(ret);
+        let shape = crate::kaddr::word_shape(ret);
+        let truncated_text = shape == crate::kaddr::WordShape::TruncatedText;
+        // Every shape gets the report, not only the two this used to know.
+        // A capture came back with `[rsp0]=0x1cb0a4fb0e` -- a user-half word
+        // in a kernel code slot -- and this path returned in silence, so the
+        // one qword that names the writer class had no line at all. The
+        // sticky flag still belongs to the two shapes that prove a smash:
+        // latching on a user-half word would stop every IRQ and timer dyn
+        // dispatch in the system over a pointer that may simply have been
+        // mis-stored.
         if truncated_text || ret < 0x1000 {
             ::executor::note_heap_smash_suspected();
+        }
+        {
             use core::sync::atomic::{AtomicBool, Ordering};
             static LOGGED: AtomicBool = AtomicBool::new(false);
             if !LOGGED.swap(true, Ordering::SeqCst) {
                 let (hard, soft) = ::executor::hard_guard_executor_counts();
                 crate::console::serial_write_fmt_spin(format_args!(
-                    "\n[soft-smash] [fault_rsp]={:#x} value={:#x} — hooks_registered={} \
+                    "\n[soft-smash] [fault_rsp]={:#x} value={:#x} is {} — \
+                     hooks_registered={} \
                      hard_guard_executors={} soft_guard_executors={}\n",
                     sp,
                     ret,
+                    shape.as_str(),
                     ::executor::stack_guard_hooks_registered(),
                     hard,
                     soft,

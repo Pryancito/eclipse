@@ -87,6 +87,95 @@ fn panicking() -> bool {
     PANICKING.load(core::sync::atomic::Ordering::Relaxed)
 }
 
+/// Presents refused because the `dyn DisplayScheme` fat pointer could not be
+/// live. Stays 0 on a healthy machine; see [`dead_display_skips`].
+static DEAD_DISPLAY_SKIPS: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
+/// How many presents were refused because the display's fat pointer was dead.
+///
+/// Diagnostic only, but the one that matters: a cursor that stops blinking is
+/// the *symptom* of the corruption this gate contains, and without a counter
+/// there would be nothing to tell it apart from a console that is simply idle.
+pub fn dead_display_skips() -> usize {
+    DEAD_DISPLAY_SKIPS.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// Whether the `Arc<dyn DisplayScheme>` behind the console can still be
+/// dispatched through.
+///
+/// `LinearScrollbackBuffer::present` is reached from the timer tick
+/// (`cursor_blink_tick` -> `GraphicConsole::set_cursor_blink`), i.e. from a
+/// hard IRQ with no current thread, and `present_with_cursor` dispatches
+/// through this fat pointer -- `info()`, `flush()`, the blit. Every other
+/// `dyn` the kernel calls from an interrupt already asks
+/// [`crate::utils::fat_ptr::dyn_fat_ptr_live`] first: the timer's own
+/// `Box<dyn FnOnce>` callbacks, `EventListener`'s handlers, the deferred jobs,
+/// the IRQ handlers. This one did not, and `timer_tick`'s own comment names it
+/// as a source of exactly this fault ("cursor blink -> DisplayScheme vtable"):
+/// a half-torn-down or compositor-owned display here is a `call` through a
+/// smashed vtable word, i.e. a kernel EXECUTE `#PF` at a non-`.text` address
+/// taken in IRQ context. `present_allowed` keeps the console off a framebuffer
+/// userspace owns, which is a different question and does not cover this one.
+///
+/// Skipping costs one blink. The pointer is only *read*, never dropped --
+/// dropping a trait object dispatches through the same vtable.
+fn display_dispatchable(display: &Arc<dyn DisplayScheme>) -> bool {
+    #[cfg(test)]
+    if let Some(forced) = test_gate_override() {
+        return forced;
+    }
+    let live = crate::utils::fat_ptr::dyn_fat_ptr_live(display);
+    if !live {
+        DEAD_DISPLAY_SKIPS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    }
+    live
+}
+
+/// Forces [`display_dispatchable`]'s answer so a host test can ask what
+/// `present` does with a display the gate has condemned, without forging an
+/// invalid `Arc` (constructing one, let alone dropping it, is the undefined
+/// behaviour the gate exists to avoid).
+///
+/// The seam sits **below** the gate, not around `present`: the function under
+/// test keeps running its real code, and what is substituted is only the
+/// liveness answer the hardware would have given. `0` = ask the gate,
+/// `1` = live, `2` = dead.
+#[cfg(test)]
+static DISPLAY_GATE_OVERRIDE: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+#[cfg(test)]
+fn test_gate_override() -> Option<bool> {
+    match DISPLAY_GATE_OVERRIDE.load(core::sync::atomic::Ordering::SeqCst) {
+        1 => Some(true),
+        2 => Some(false),
+        _ => None,
+    }
+}
+
+/// Hold [`display_dispatchable`]'s answer at `forced` for as long as the guard
+/// lives.
+#[cfg(test)]
+struct ForcedDisplayGate;
+
+#[cfg(test)]
+impl ForcedDisplayGate {
+    fn new(forced: bool) -> Self {
+        DISPLAY_GATE_OVERRIDE.store(
+            if forced { 1 } else { 2 },
+            core::sync::atomic::Ordering::SeqCst,
+        );
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for ForcedDisplayGate {
+    fn drop(&mut self) {
+        DISPLAY_GATE_OVERRIDE.store(0, core::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 pub struct LinearScrollbackBuffer {
     buf: Vec<Vec<Cell>>,
     history: VecDeque<Vec<Cell>>,
@@ -131,6 +220,14 @@ impl LinearScrollbackBuffer {
     /// line of output becomes a single bulk transfer to the GPU. The cursor is
     /// hidden while viewing scrollback history.
     pub fn present(&self, visible: bool) {
+        // The only `dyn` dispatch on this path, and the timer tick reaches it
+        // at ~2 Hz through `cursor_blink_tick` with no current thread. Gate it
+        // like every other `dyn` the kernel calls from an interrupt: a dead
+        // fat pointer is skipped, never jumped through. See
+        // [`display_dispatchable`].
+        if !display_dispatchable(&self.display) {
+            return;
+        }
         let cursor = if visible && self.scrollback_offset.is_none() {
             Some((self.cursor_col, self.cursor_row))
         } else {
@@ -773,6 +870,65 @@ mod scrollback_tests {
         let bottom = lsb.height() - 1;
         paint_row(lsb, bottom, tag);
         lsb.new_line(Cell::default());
+    }
+
+    // ------------------------------------------------- the dyn display gate
+
+    /// The catastrophic direction. `fat_ptr`'s own docs spell it out: a gate
+    /// that refuses a *live* pointer does not degrade the console, it stops it,
+    /// and there is no fault left to point at. `present` is the path the timer
+    /// tick takes at ~2 Hz, so an inverted gate here is a console that goes
+    /// quiet with the machine otherwise fine.
+    #[test]
+    fn a_live_display_still_gets_presented() {
+        let (mut lsb, d) = console(4, 3);
+        paint_row(&mut lsb, 1, 20);
+        lsb.present(false);
+        assert_eq!(on_screen(&d, 1), tag_argb(20));
+        assert_eq!(dead_display_skips(), 0, "a live Arc was counted as dead");
+    }
+
+    /// The fault this gate exists for: a `dyn DisplayScheme` whose fat pointer
+    /// cannot be live must be skipped, not dispatched through. Nothing reaches
+    /// the display -- `present_with_cursor` would be the `call` through the
+    /// smashed vtable word.
+    #[test]
+    fn a_condemned_display_is_skipped_and_nothing_is_dispatched() {
+        let (mut lsb, d) = console(4, 3);
+        paint_row(&mut lsb, 1, 20);
+        {
+            let _gate = ForcedDisplayGate::new(false);
+            lsb.present(false);
+        }
+        assert_eq!(
+            on_screen(&d, 1),
+            blank_argb(),
+            "the pixels moved, so the vtable was dispatched through anyway"
+        );
+        // ...and the content is still in the cache, so the present was skipped
+        // rather than lost: the next live present paints it.
+        assert_eq!(cached(&lsb, 1), tag_argb(20));
+        lsb.present(false);
+        assert_eq!(on_screen(&d, 1), tag_argb(20));
+    }
+
+    /// A skipped present must not leave the shadow's dirty region cleared, or
+    /// the row would never be repainted once the display is live again -- the
+    /// cursor comes back but the text under it does not.
+    #[test]
+    fn a_skipped_present_keeps_the_dirty_region_for_the_next_one() {
+        let (mut lsb, d) = console(4, 3);
+        paint_row(&mut lsb, 0, 21);
+        {
+            let _gate = ForcedDisplayGate::new(false);
+            // Several refused presents in a row: the tick runs at 2 Hz and the
+            // corruption does not heal, so this is the real shape of it.
+            for _ in 0..4 {
+                lsb.present(true);
+            }
+        }
+        lsb.present(true);
+        assert_eq!(on_screen(&d, 0), tag_argb(21));
     }
 
     // ---------------------------------------------------------------- write

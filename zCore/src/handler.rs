@@ -531,12 +531,24 @@ fn report_unresolved_kernel_fault(
             let _ = take_fault_diag_latch();
         }
     }
+    // An EXECUTE fault's `vaddr` IS the branch target, so saying what shape of
+    // word it is answers the first question anyone reading the report asks.
+    // Without it a capture like `vaddr=0x1076f0000 flags=EXECUTE` is just a
+    // number: it is a *user-half* address reached from ring 0, which is a
+    // different bug from a null and from `.text` residue.
+    let target_shape = if access_flags.contains(kernel_hal::MMUFlags::EXECUTE) {
+        kernel_hal::kaddr::word_shape(fault_vaddr as u64).as_str()
+    } else {
+        ""
+    };
     kernel_hal::console::serial_write_fmt_spin(format_args!(
-        "\n[KERNEL PAGE FAULT] vaddr={:#x} flags={:?} rip={} have_thread={} \
+        "\n[KERNEL PAGE FAULT] vaddr={:#x}{}{} flags={:?} rip={} have_thread={} \
          (unresolved by the user vmar — a kernel-side bug, not a userspace \
          SIGSEGV; the text console is skipped so a torn graphic console cannot \
          re-fault us)\n",
         fault_vaddr,
+        if target_shape.is_empty() { "" } else { " is " },
+        target_shape,
         access_flags,
         kernel_hal::ksyms::Addr(rip),
         have_thread,

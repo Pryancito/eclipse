@@ -215,6 +215,101 @@ pub fn looks_truncated_text(a: u64) -> bool {
     truncated_text(kernel_text(), a)
 }
 
+/// What a machine word found where a kernel code pointer belongs looks like.
+///
+/// `try_skip_null_execute_call` reads the qword at the faulting `RSP` and has
+/// to decide whether it is a return address a `CALL` pushed. It reported that
+/// word only in the two shapes it already recognised -- a zero, and a `.text`
+/// address that had lost its top half -- and returned **in silence** for every
+/// other one. A real capture then came back with
+/// `[rsp0]=0x1cb0a4fb0e` and no classification at all: the one word that
+/// names the writer class got no line in the report, so the fault was
+/// contained with nothing to go on but the `vaddr`.
+///
+/// The shapes are what this kernel's residue actually looks like, and each
+/// points somewhere different: a kernel-half word that is not `.text` is
+/// physmap or stack residue (the soft smash this tree is hunting); a user-half
+/// word is a userspace pointer that reached a kernel code slot; an `RFLAGS`
+/// value is a trap frame read at the wrong offset; a small value is a length
+/// or a count written one slot over.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WordShape {
+    /// All zero: the slot was cleared.
+    Zero,
+    /// Has the shape of an `RFLAGS` value (see [`looks_like_rflags`]).
+    Rflags,
+    /// Non-zero but below the first page: a length, a count, an index.
+    Small,
+    /// A `.text` address with its top half gone (see [`truncated_text`]).
+    TruncatedText,
+    /// A genuine address inside the kernel image's `.text`.
+    KernelText,
+    /// In the kernel half but not `.text`: physmap, heap or stack residue.
+    KernelNonText,
+    /// Not canonical: no address at all, and no amount of it is.
+    NonCanonical,
+    /// A canonical user-half address.
+    UserHalf,
+}
+
+impl WordShape {
+    /// A phrase for the fault report, in the terms whoever reads it is
+    /// debugging in.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            WordShape::Zero => "zero (the slot was cleared)",
+            WordShape::Rflags => "an RFLAGS value (a trap frame read at the wrong offset)",
+            WordShape::Small => "below the first page (a length, count or index)",
+            WordShape::TruncatedText => ".text with its top half gone (soft smash)",
+            WordShape::KernelText => "kernel .text",
+            WordShape::KernelNonText => {
+                "kernel-half but not .text (physmap, heap or stack residue)"
+            }
+            WordShape::NonCanonical => "not a canonical address",
+            WordShape::UserHalf => "a user-half address in a kernel code slot",
+        }
+    }
+}
+
+/// Name the shape of `a`, measured against the `.text` window `text`.
+///
+/// Pure, and ordered from the most specific claim to the least: a word that
+/// could be read two ways is reported as the reading that says the most about
+/// where it came from.
+pub fn classify_word(text: (u64, u64), a: u64) -> WordShape {
+    if a == 0 {
+        return WordShape::Zero;
+    }
+    if truncated_text(text, a) {
+        return WordShape::TruncatedText;
+    }
+    if looks_like_rflags(a) {
+        return WordShape::Rflags;
+    }
+    if a < 0x1000 {
+        return WordShape::Small;
+    }
+    if in_text(text, a) {
+        return WordShape::KernelText;
+    }
+    if is_kernel_addr(a) {
+        return WordShape::KernelNonText;
+    }
+    // Canonical: the top seventeen bits all agree. A kernel-half address that
+    // is outside this kernel's own window has already been answered above, so
+    // what is left here is either nonsense or userspace.
+    let top = a >> 47;
+    if top != 0 && top != 0x1_ffff {
+        return WordShape::NonCanonical;
+    }
+    WordShape::UserHalf
+}
+
+/// [`classify_word`] against the installed window.
+pub fn word_shape(a: u64) -> WordShape {
+    classify_word(kernel_text(), a)
+}
+
 /// A kernel code pointer whose *top byte* was overwritten, and what it was.
 ///
 /// The `ret` corruption this kernel is hunted for lands a saved
@@ -666,6 +761,125 @@ mod tests {
                 truncated_text((lo, hi), hi - 1 - KERNEL_LO),
                 !looks_like_rflags(hi - 1 - KERNEL_LO)
             );
+        }
+    }
+
+    // ── the shape of a word where a code pointer belongs ────────────────────
+
+    #[test]
+    fn every_shape_of_residue_this_kernel_has_actually_seen_is_named() {
+        for (word, shape, what) in [
+            (0u64, WordShape::Zero, "a cleared slot"),
+            // The capture that prompted this: reported with no classification
+            // at all, because it is none of the two shapes the old report knew.
+            (
+                0x1c_b0a4_fb0e,
+                WordShape::UserHalf,
+                "the [rsp0] of the timer-callback #PF",
+            ),
+            // ...and the fault target of that same capture.
+            (
+                0x1_076f_0000,
+                WordShape::UserHalf,
+                "a user-half fn-ptr target",
+            ),
+            (
+                TEXT.0,
+                WordShape::KernelText,
+                "the first function of the image",
+            ),
+            (TEXT.1 - 1, WordShape::KernelText, "the last byte of .text"),
+            (
+                TEXT.0 + 0xa_0000 - KERNEL_LO,
+                WordShape::TruncatedText,
+                "a .text address that lost its top half",
+            ),
+            (
+                KERNEL_HI - 8,
+                WordShape::KernelNonText,
+                "physmap or a coroutine stack",
+            ),
+            (0x10282, WordShape::Rflags, "a live RFLAGS"),
+            (
+                0x0001_0000_0000_0000,
+                WordShape::NonCanonical,
+                "no address at all",
+            ),
+        ] {
+            assert_eq!(classify_word(TEXT, word), shape, "{}", what);
+        }
+    }
+
+    #[test]
+    fn a_truncated_text_word_in_the_first_page_is_not_reported_as_merely_small() {
+        // `truncated_text` is the more specific claim and has to win: the first
+        // functions of the image lose their top half into the same low window a
+        // length or an index lives in, and calling one a length loses the whole
+        // finding.
+        let low = TEXT.0 + 0x40 - KERNEL_LO;
+        assert!(
+            low < 0x1000,
+            "pick an offset that makes this a real question"
+        );
+        assert_eq!(classify_word(TEXT, low), WordShape::TruncatedText);
+    }
+
+    #[test]
+    fn a_small_word_is_only_small_where_text_does_not_start_at_the_kernel_base() {
+        // With `stext` AT `KERNEL_LO` -- which is what the linker script does
+        // -- every low word that is not RFLAGS-shaped raises into `.text`, so
+        // the louder reading wins and nothing is "just an index". It becomes a
+        // question of its own only under a window that leaves the first pages
+        // out, like the literal one the x86_64 probes carried before the
+        // linker's symbols were read.
+        assert_eq!(classify_word(TEXT, 0x20), WordShape::TruncatedText);
+        assert_eq!(classify_word(FALLBACK_TEXT, 0x20), WordShape::Small);
+    }
+
+    #[test]
+    fn an_rflags_shaped_low_word_is_rflags_and_not_truncated_text() {
+        // `truncated_text` already refuses an `RFLAGS` shape, and the order
+        // here has to agree with it: a trap frame read at the wrong offset is
+        // not a smashed code pointer, and reporting it as one sends the reader
+        // hunting a writer that does not exist.
+        let flags = 0x1_0282u64;
+        assert!(looks_like_rflags(flags));
+        assert!(
+            in_text(TEXT, KERNEL_LO + flags),
+            "a real question only here"
+        );
+        assert_eq!(classify_word(TEXT, flags), WordShape::Rflags);
+    }
+
+    #[test]
+    fn the_shape_of_a_word_moves_with_the_installed_window() {
+        // The property every hand-written literal in this kernel broke: the
+        // answer is a function of the window, not of a constant.
+        let a = KERNEL_LO + 0x200_0000;
+        assert_eq!(classify_word(TEXT, a), WordShape::KernelNonText);
+        assert_eq!(
+            classify_word((KERNEL_LO, KERNEL_LO + 0x400_0000), a),
+            WordShape::KernelText
+        );
+    }
+
+    #[test]
+    fn every_shape_has_a_phrase_of_its_own() {
+        let all = [
+            WordShape::Zero,
+            WordShape::Rflags,
+            WordShape::Small,
+            WordShape::TruncatedText,
+            WordShape::KernelText,
+            WordShape::KernelNonText,
+            WordShape::NonCanonical,
+            WordShape::UserHalf,
+        ];
+        for (i, a) in all.iter().enumerate() {
+            assert!(!a.as_str().is_empty());
+            for b in all.iter().skip(i + 1) {
+                assert_ne!(a.as_str(), b.as_str(), "two shapes read the same");
+            }
         }
     }
 
