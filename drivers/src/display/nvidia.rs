@@ -4,7 +4,7 @@ use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering
 
 use crate::bus::pci_drivers::PciDriver;
 use crate::prelude::{AccelCaps, ColorFormat, DisplayInfo, FrameBuffer};
-use crate::scheme::drm::{DrmCaps, DrmConnector, DrmCrtc, DrmPlane, GemHandle};
+use crate::scheme::drm::{DrmCaps, DrmConnector, DrmCrtc, DrmPlane, GemAperture, GemHandle};
 use crate::scheme::{DisplayScheme, DrmScheme, Scheme};
 use crate::utils::dma::DmaRegion;
 use crate::{builder::IoMapper, Device, DeviceError, DeviceResult};
@@ -7974,6 +7974,29 @@ impl DrmScheme for NvidiaGpu {
         }
     }
 
+    fn gem_aperture(&self, handle_id: u32) -> GemAperture {
+        // `phys_addr` is the one that decides, not `domain`: GEM_NEW only
+        // resolves a host PA for a sysmem/GART object, and that PA is exactly
+        // what the CPU present path needs. A VRAM object carries a
+        // `vram_offset` instead -- an AT_GPU offset the display engine can
+        // scan out and the CPU cannot touch.
+        // The two locks are taken one after the other and never nested, the
+        // way `create_fb` does it: `imported_handle` takes its own.
+        let found = {
+            let gem = self.nouveau_gem.lock();
+            gem.iter()
+                .find(|o| o.handle == handle_id)
+                .map(|o| o.phys_addr.is_some())
+        };
+        match found {
+            Some(true) => GemAperture::Sysmem,
+            Some(false) => GemAperture::Vram,
+            // Not a nouveau GEM. A PRIME import always has a host PA.
+            None if self.imported_handle(handle_id).is_some() => GemAperture::Sysmem,
+            None => GemAperture::Unknown,
+        }
+    }
+
     fn create_fb(&self, handle_id: u32, width: u32, height: u32, pitch: u32) -> Option<u32> {
         if width == 0 || height == 0 || pitch == 0 {
             return None;
@@ -15291,6 +15314,40 @@ mod nouveau_bookkeeping_tests {
         obj.domain = nv::NOUVEAU_GEM_DOMAIN_VRAM;
         obj.vram_offset = Some(0x100_0000 * u64::from(handle & 0xff));
         handle
+    }
+
+    /// `gem_aperture` is the only thing that tells a VRAM GEM apart from a
+    /// handle nobody has heard of, once `resolve_gem_backing_for` has
+    /// answered `None` for both. The DRM layer prints opposite advice on the
+    /// strength of it, so it has to read `phys_addr` and not `domain`:
+    /// whether the CPU can reach the pages is what the caller is asking.
+    #[test]
+    fn a_vram_gem_reads_as_vram_and_a_gart_one_as_sysmem() {
+        let _g = LOCK.lock();
+        let _live = LiveBytes::hold();
+        let gpu = gpu();
+
+        let gart = object(&gpu, A, MIB, Some(0x8000_0000));
+        let vram = vram_object(&gpu, A, MIB);
+
+        assert_eq!(gpu.gem_aperture(gart), GemAperture::Sysmem);
+        assert_eq!(gpu.gem_aperture(vram), GemAperture::Vram);
+    }
+
+    /// A handle the driver has never seen is `Unknown`, not `Vram`. Reading
+    /// a miss as device memory would print the VRAM advice for an ordinary
+    /// use-after-close and send the reader to the wrong half of the kernel.
+    #[test]
+    fn a_handle_the_driver_never_made_is_unknown() {
+        let _g = LOCK.lock();
+        let _live = LiveBytes::hold();
+        let gpu = gpu();
+        let real = object(&gpu, A, MIB, Some(0x8000_0000));
+
+        assert_eq!(
+            gpu.gem_aperture(real.wrapping_add(0x1_0000)),
+            GemAperture::Unknown
+        );
     }
 
     fn mapping(gpu: &NvidiaGpu, owner: u64, gem_handle: u32, va: u64, size: u64) {
