@@ -126,12 +126,24 @@ pub fn is_ever_writable(pid: u64, addr: usize, len: usize) -> bool {
 
 /// Drops tracked writable intervals overlapping `[addr, addr+len)` (on munmap).
 pub fn clear_region(pid: u64, addr: usize, len: usize) {
-    // Not `len.max(1)`, which is what the query below it does. Widening a
+    // An unmap of nothing subtracts nothing, the way `record_writable` adds
+    // nothing. Returning here is not a shortcut: `ranges_overlap` reads the
+    // empty query `(addr, addr)` as overlapping any interval that STRICTLY
+    // contains `addr`, so the subtraction below used to put back two slivers
+    // meeting at `addr` -- the same bytes, and no byte lost, but one interval
+    // where there had been none to split. That broke the list this module
+    // documents as coalesced (its own `assert_tidy` demands `a.1 < b.0`), and
+    // nothing capped the growth: `check_munmap` hands the syscall's length
+    // straight to this hook, so `munmap(addr, 0)` in a loop over interior
+    // addresses was a free way to grow kernel memory from userspace.
+    //
+    // Not `len.max(1)` either, which is what the query above does. Widening a
     // zero-length *query* to one byte is conservative; widening a zero-length
     // *unmap* subtracts a byte from the record instead -- the one direction
-    // this module promises never to take. `check_munmap` passes the syscall's
-    // length straight through, so an `munmap(addr, 0)` reaching the hook used
-    // to drop the first byte of whatever interval started there.
+    // this module promises never to take.
+    if len == 0 {
+        return;
+    }
     let q = (addr, end_of(addr, len));
     let mut map = REGIONS.lock();
     if let Some(pr) = map.get_mut(&pid) {
@@ -154,6 +166,14 @@ pub fn clear_region(pid: u64, addr: usize, len: usize) {
             }
         }
         pr.intervals = out;
+        if pr.intervals.len() > MAX_REGIONS {
+            // The same cliff `record_writable` has, for the same reason:
+            // subtracting can grow this list too, because an unmap through the
+            // middle of an interval leaves a sliver on each side. Give up on
+            // precise tracking and fail closed.
+            pr.saturated = true;
+            pr.intervals = Vec::new();
+        }
     }
 }
 
@@ -515,6 +535,60 @@ mod region_bookkeeping_tests {
         // One byte, though, really is one byte.
         clear_region(pid, 0x1000, 1);
         assert_eq!(intervals_of(pid).unwrap(), alloc::vec![(0x1001, 0x3000)]);
+    }
+
+    /// An `munmap(addr, 0)` whose address falls INSIDE a tracked interval.
+    /// The sibling test above lands on an interval's first byte, where the
+    /// empty query `(addr, addr)` does not overlap anything and the record
+    /// comes out untouched by luck. One byte further in it does overlap, and
+    /// the subtraction put back two slivers meeting at `addr`: the same bytes,
+    /// so nothing was forgotten, but one interval became two adjacent ones --
+    /// not the coalesced list `assert_tidy` describes -- and `clear_region`
+    /// had no cap of its own. `check_munmap` passes the syscall's length
+    /// straight through, so a loop of them was a way to grow kernel memory
+    /// from a userspace process, one entry per call.
+    #[test]
+    fn a_zero_length_unmap_inside_an_interval_does_not_split_it() {
+        let _g = test_globals::lock();
+        reset();
+        let pid = 2_013;
+        record_writable(pid, 0x1000, 0x3000);
+        for addr in [0x1001, 0x2000, 0x3fff] {
+            clear_region(pid, addr, 0);
+        }
+        assert_eq!(
+            intervals_of(pid).expect("must not be saturated"),
+            alloc::vec![(0x1000, 0x4000)],
+            "an unmap of nothing must neither forget a byte nor split a record"
+        );
+    }
+
+    /// Subtracting can grow the list, so subtracting needs the same cliff
+    /// adding has: an unmap through the MIDDLE of an interval is a legitimate
+    /// syscall that leaves a sliver on each side, one entry more than before.
+    /// Past the cap the answer is the conservative one -- assume every address
+    /// was writable -- and not an interval list that keeps growing.
+    #[test]
+    fn splitting_past_the_cap_fails_closed_the_way_recording_past_it_does() {
+        let _g = test_globals::lock();
+        reset();
+        let pid = 2_014;
+        // One big writable mapping, then a page unmapped out of the middle of
+        // every other page pair: each one splits an interval in two.
+        let base = 0x10_000;
+        record_writable(pid, base, (MAX_REGIONS + 8) * 2 * 0x1000);
+        for k in 0..=MAX_REGIONS {
+            clear_region(pid, base + (k * 2 + 1) * 0x1000, 0x1000);
+        }
+        assert!(
+            intervals_of(pid).is_none(),
+            "past {MAX_REGIONS} intervals the tracking has to give up, not grow",
+            MAX_REGIONS = MAX_REGIONS
+        );
+        assert!(
+            is_ever_writable(pid, base, 0x1000),
+            "and a saturated set answers for every address it can no longer name"
+        );
     }
 
     #[test]
