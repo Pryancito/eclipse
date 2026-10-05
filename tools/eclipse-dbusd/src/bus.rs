@@ -227,6 +227,14 @@ impl Bus {
             .unwrap_or_default()
     }
 
+    /// The connection a name belongs to, or `None` for a name no connection
+    /// holds.
+    ///
+    /// Both of the first two lines are there to say what is meant rather than
+    /// to change the answer. No connection can hold the bus's own name
+    /// (`validate_well_known_name` refuses it) and none can hold anything
+    /// starting with a colon (same), so the fall-through would answer `None`
+    /// for the first and the full prefix is only as precise as `":"` would be.
     fn id_of_name(&self, name: &str) -> Option<u64> {
         if name == DBUS_NAME {
             return None; // handled by the bus, never routed to a connection
@@ -336,6 +344,9 @@ impl Bus {
             .filter(|(cid, c)| {
                 **cid != from
                     && Some(**cid) != already
+                    // Redundant today and kept for what it says: a connection
+                    // that has not said Hello cannot have called AddMatch, so
+                    // its rule list is empty and the test below fails anyway.
                     && c.hello
                     && c.rules
                         .iter()
@@ -867,6 +878,9 @@ fn validate_well_known_name(name: &str) -> Result<(), String> {
     if name == DBUS_NAME {
         return Err("Cannot acquire the bus's own name".to_string());
     }
+    // The empty name is refused by the dot rule below as well -- `"".split('.')`
+    // is one empty element -- so this half only changes the wording of the
+    // error. The length is the half that matters.
     if name.is_empty() || name.len() > 255 {
         return Err(format!("Invalid bus name '{name}'"));
     }
@@ -1591,5 +1605,913 @@ mod tests {
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].0, 1);
         assert_eq!(out[0].1.sender.as_deref(), Some(":1.2"));
+    }
+
+    /// Call `member` on `iface` (empty string for the bus's own interface) and
+    /// give back the one message the bus sends to the caller.
+    fn call(b: &mut Bus, id: u64, serial: u32, iface: &str, member: &str, args: &[Arg]) -> Message {
+        let mut m = Message::method_call(DBUS_NAME, DBUS_PATH, iface, member);
+        m.serial = serial;
+        if !args.is_empty() {
+            m.set_body(args);
+        }
+        b.dispatch(id, m);
+        let mut mine: Vec<Message> = take(b)
+            .into_iter()
+            .filter(|(to, _)| *to == id)
+            .map(|(_, m)| m)
+            .collect();
+        assert_eq!(mine.len(), 1, "{member} answered {} times", mine.len());
+        mine.remove(0)
+    }
+
+    fn err_name(m: &Message) -> &str {
+        assert_eq!(m.kind, MSG_ERROR, "expected an error, got kind {}", m.kind);
+        m.error_name.as_deref().unwrap_or("")
+    }
+
+    /// Every row of the bus's own method table answers what that row
+    /// promises. Two thirds of the table had no test at all: a reply wired to
+    /// the wrong field, or an arm that quietly answered "no such method",
+    /// looked exactly like a client bug from the outside.
+    #[test]
+    fn every_bus_method_answers_with_what_its_own_row_promises() {
+        let mut b = bus();
+        hello(&mut b, 1);
+        hello(&mut b, 2);
+        bus_call(&mut b, 2, 10, "RequestName", "org.example.Owner");
+        take(&mut b);
+
+        // The bus GUID and the machine id are two different strings, and a
+        // client that only ever asks for one cannot tell them apart.
+        let r = call(&mut b, 1, 20, "", "GetId", &[]);
+        assert_eq!(r.args(), vec![Arg::Str("abc".into())]);
+        let r = call(
+            &mut b,
+            1,
+            21,
+            "org.freedesktop.DBus.Peer",
+            "GetMachineId",
+            &[],
+        );
+        assert_eq!(
+            r.args(),
+            vec![Arg::Str("0123456789abcdef0123456789abcdef".into())]
+        );
+
+        // Introspection answers with the document, not with an empty string:
+        // a client that gets "" believes the bus has no methods.
+        let r = call(
+            &mut b,
+            1,
+            22,
+            "org.freedesktop.DBus.Introspectable",
+            "Introspect",
+            &[],
+        );
+        match r.args().first() {
+            Some(Arg::Str(xml)) => {
+                assert!(xml.contains("<node>"), "introspection is a document");
+                assert!(xml.contains("name=\"Hello\""));
+            }
+            other => panic!("Introspect answered {other:?}"),
+        }
+
+        // `Properties.Get` takes (interface, property): the PROPERTY is the
+        // second argument, so reading the first one answers about the
+        // interface name and refuses every real property.
+        for prop in ["Features", "Interfaces"] {
+            let r = call(
+                &mut b,
+                1,
+                30,
+                "org.freedesktop.DBus.Properties",
+                "Get",
+                &[Arg::Str(DBUS_NAME.into()), Arg::Str(prop.into())],
+            );
+            assert_eq!(r.kind, MSG_METHOD_RETURN, "Get {prop}");
+            assert_eq!(
+                r.args(),
+                vec![Arg::Variant(Box::new(Arg::StrArray(Vec::new())))],
+                "Get {prop}"
+            );
+        }
+        let r = call(
+            &mut b,
+            1,
+            31,
+            "org.freedesktop.DBus.Properties",
+            "Get",
+            &[Arg::Str(DBUS_NAME.into()), Arg::Str("Nope".into())],
+        );
+        assert_eq!(err_name(&r), "org.freedesktop.DBus.Error.UnknownProperty");
+        // Nothing on the bus is writable, and saying so is not the same as
+        // saying "not supported".
+        let r = call(
+            &mut b,
+            1,
+            32,
+            "org.freedesktop.DBus.Properties",
+            "Set",
+            &[Arg::Str(DBUS_NAME.into()), Arg::Str("Features".into())],
+        );
+        assert_eq!(err_name(&r), "org.freedesktop.DBus.Error.PropertyReadOnly");
+
+        // Activation is not implemented, so the only always-available name is
+        // the bus itself -- and the list is not empty, which is what a client
+        // reads as "this bus activates nothing, not even itself".
+        let r = call(&mut b, 1, 40, "", "ListActivatableNames", &[]);
+        assert_eq!(r.args(), vec![Arg::StrArray(vec![DBUS_NAME.to_string()])]);
+
+        // `NameHasOwner` has to say yes to the bus's own name as well as to a
+        // name a client owns: the bus is not in `names`, so the two halves of
+        // that answer come from different places.
+        for (name, has) in [
+            (DBUS_NAME, true),
+            ("org.example.Owner", true),
+            (":1.2", true),
+            ("org.example.Nobody", false),
+        ] {
+            let r = call(&mut b, 1, 41, "", "NameHasOwner", &[Arg::Str(name.into())]);
+            assert_eq!(r.args(), vec![Arg::Bool(has)], "NameHasOwner {name}");
+        }
+
+        // The owner of a name is the connection that owns it, not the one
+        // that asked.
+        let r = call(
+            &mut b,
+            1,
+            42,
+            "",
+            "GetNameOwner",
+            &[Arg::Str("org.example.Owner".into())],
+        );
+        assert_eq!(r.args(), vec![Arg::Str(":1.2".into())]);
+        let r = call(
+            &mut b,
+            1,
+            43,
+            "",
+            "GetNameOwner",
+            &[Arg::Str(DBUS_NAME.into())],
+        );
+        assert_eq!(r.args(), vec![Arg::Str(DBUS_NAME.into())]);
+        let r = call(
+            &mut b,
+            1,
+            44,
+            "",
+            "GetNameOwner",
+            &[Arg::Str("org.example.Nobody".into())],
+        );
+        assert_eq!(err_name(&r), ERR_NAME_HAS_NO_OWNER);
+
+        // The credentials of the owner of a name. The uid and the pid are two
+        // different numbers here on purpose: a test with both at zero cannot
+        // tell the two replies apart.
+        let r = call(
+            &mut b,
+            1,
+            50,
+            "",
+            "GetConnectionUnixUser",
+            &[Arg::Str("org.example.Owner".into())],
+        );
+        assert_eq!(r.args(), vec![Arg::U32(0)]);
+        let r = call(
+            &mut b,
+            1,
+            51,
+            "",
+            "GetConnectionUnixProcessID",
+            &[Arg::Str("org.example.Owner".into())],
+        );
+        assert_eq!(r.args(), vec![Arg::U32(102)]);
+        let r = call(
+            &mut b,
+            1,
+            52,
+            "",
+            "GetConnectionUnixUser",
+            &[Arg::Str("org.example.Nobody".into())],
+        );
+        assert_eq!(err_name(&r), ERR_NAME_HAS_NO_OWNER);
+
+        // A name that is already there is "already running"; one that is not
+        // cannot be started, because nothing here starts services.
+        let r = call(
+            &mut b,
+            1,
+            60,
+            "",
+            "StartServiceByName",
+            &[Arg::Str("org.example.Owner".into())],
+        );
+        assert_eq!(
+            r.args(),
+            vec![Arg::U32(2)],
+            "DBUS_START_REPLY_ALREADY_RUNNING"
+        );
+        let r = call(
+            &mut b,
+            1,
+            61,
+            "",
+            "StartServiceByName",
+            &[Arg::Str("org.example.Nobody".into())],
+        );
+        assert_eq!(err_name(&r), ERR_SERVICE_UNKNOWN);
+
+        // Accepted and ignored: a client that gets an error here gives up.
+        for member in ["UpdateActivationEnvironment", "ReloadConfig"] {
+            let r = call(&mut b, 1, 70, "", member, &[]);
+            assert_eq!(r.kind, MSG_METHOD_RETURN, "{member}");
+            assert!(r.args().is_empty(), "{member}");
+        }
+        // Refused, and both of them: an arm that answers only one leaves the
+        // other on the "no such method" path, which is a different error.
+        for member in [
+            "GetAdtAuditSessionData",
+            "GetConnectionSELinuxSecurityContext",
+        ] {
+            let r = call(&mut b, 1, 71, "", member, &[Arg::Str(":1.2".into())]);
+            assert_eq!(err_name(&r), ERR_NOT_SUPPORTED, "{member}");
+        }
+    }
+
+    /// The introspection document and the method table have to say the same
+    /// thing. They are two hand-written lists of the same set, so nothing but
+    /// a test holds them together: a method dropped from the document is a
+    /// method a client never tries, and one advertised but not answered is a
+    /// client that gets "no such method" after introspecting for it.
+    #[test]
+    fn the_introspection_document_and_the_method_table_agree() {
+        let xml = introspection_xml();
+        for m in [
+            "Hello",
+            "RequestName",
+            "ReleaseName",
+            "ListNames",
+            "ListActivatableNames",
+            "NameHasOwner",
+            "GetNameOwner",
+            "ListQueuedOwners",
+            "GetConnectionUnixUser",
+            "GetConnectionUnixProcessID",
+            "AddMatch",
+            "RemoveMatch",
+            "GetId",
+            "StartServiceByName",
+            "Ping",
+            "GetMachineId",
+            "Introspect",
+        ] {
+            assert!(
+                xml.contains(&format!("name=\"{m}\"")),
+                "{m} is answered but not advertised"
+            );
+        }
+
+        let mut b = bus();
+        hello(&mut b, 1);
+        let mut serial = 100;
+        let mut seen = 0;
+        for line in xml.lines() {
+            let line = line.trim();
+            let rest = match line.strip_prefix("<method name=\"") {
+                Some(r) => r,
+                None => continue,
+            };
+            let member = rest.split('"').next().unwrap();
+            let iface = match member {
+                "Ping" | "GetMachineId" => "org.freedesktop.DBus.Peer",
+                "Introspect" => "org.freedesktop.DBus.Introspectable",
+                _ => "",
+            };
+            serial += 1;
+            let mut m = Message::method_call(DBUS_NAME, DBUS_PATH, iface, member);
+            m.serial = serial;
+            b.dispatch(1, m);
+            for (_, out) in take(&mut b) {
+                assert_ne!(
+                    out.error_name.as_deref(),
+                    Some(ERR_UNKNOWN_METHOD),
+                    "{member} is advertised but not answered"
+                );
+            }
+            seen += 1;
+        }
+        assert_eq!(
+            seen, 17,
+            "the document advertises exactly the seventeen methods listed above"
+        );
+    }
+
+    /// A well-known name is checked against every rule the specification
+    /// gives, and the two refusals a client can act on say which it was. The
+    /// test before this one tried one bad name; the rules are six.
+    #[test]
+    fn a_well_known_name_is_checked_against_every_rule_the_specification_has() {
+        for (name, ok) in [
+            ("org.example.Foo", true),
+            // Both of the extra characters a name may use.
+            ("org.example.Foo-Bar_2", true),
+            ("a.b", true),
+            ("", false),
+            ("nodot", false),
+            (".leading", false),
+            ("trailing.", false),
+            ("org..double", false),
+            // A digit may appear, but not first in an element.
+            ("org.9nine", false),
+            ("9nine.org", false),
+            ("org.n9ine", true),
+            ("org.has space", false),
+            ("org.has/slash", false),
+            ("org.has.dollar$", false),
+        ] {
+            assert_eq!(
+                validate_well_known_name(name).is_ok(),
+                ok,
+                "validating {name:?}"
+            );
+        }
+
+        // 255 bytes is a ceiling, so 256 is over it.
+        let at = format!("a.{}", "b".repeat(253));
+        assert_eq!(at.len(), 255);
+        assert!(validate_well_known_name(&at).is_ok());
+        let over = format!("a.{}", "b".repeat(254));
+        assert_eq!(over.len(), 256);
+        assert!(validate_well_known_name(&over).is_err());
+
+        // Asking for something only the bus hands out is a different mistake
+        // from asking for a malformed name, and the client is told which.
+        let e = validate_well_known_name(":1.5").unwrap_err();
+        assert!(e.contains("unique name"), "{e}");
+        let e = validate_well_known_name(DBUS_NAME).unwrap_err();
+        assert!(e.contains("the bus's own name"), "{e}");
+    }
+
+    /// A connection that has not said `Hello` has no identity yet, so it is
+    /// not in `ListNames` -- and the well-known names are, which is the other
+    /// half of the list.
+    #[test]
+    fn the_name_list_holds_the_bus_the_registered_and_the_well_known() {
+        let mut b = bus();
+        let u1 = hello(&mut b, 1);
+        bus_call(&mut b, 1, 5, "RequestName", "org.example.Listed");
+        // Connected, never said Hello: it has a `:1.N` but nobody may use it.
+        b.add_connection(9, 109, 0);
+        take(&mut b);
+
+        let r = call(&mut b, 1, 6, "", "ListNames", &[]);
+        let names = match r.args().first() {
+            Some(Arg::StrArray(v)) => v.clone(),
+            other => panic!("ListNames answered {other:?}"),
+        };
+        assert!(names.contains(&DBUS_NAME.to_string()), "{names:?}");
+        assert!(names.contains(&u1), "{names:?}");
+        assert!(
+            names.contains(&"org.example.Listed".to_string()),
+            "the well-known names belong in the list: {names:?}"
+        );
+        let silent = b.conn(9).unwrap().unique.clone();
+        assert!(
+            !names.contains(&silent),
+            "a connection that never said Hello is not in the list: {names:?}"
+        );
+    }
+
+    /// `ListQueuedOwners` is the primary owner first and then the queue in
+    /// the order it was joined. An answer that drops either half is an
+    /// answer, so nothing fails -- the client just cannot see who is waiting.
+    #[test]
+    fn the_queued_owners_are_the_owner_and_then_the_queue_in_order() {
+        let mut b = bus();
+        hello(&mut b, 1);
+        hello(&mut b, 2);
+        hello(&mut b, 3);
+        for id in [1u64, 2, 3] {
+            bus_call(&mut b, id, 10, "RequestName", "org.example.Q");
+        }
+        // Asking again from the back of the queue must not buy a second
+        // place: a connection listed twice is handed the name twice, the
+        // second time after it had already given it up.
+        bus_call(&mut b, 2, 11, "RequestName", "org.example.Q");
+        take(&mut b);
+
+        let r = call(
+            &mut b,
+            1,
+            11,
+            "",
+            "ListQueuedOwners",
+            &[Arg::Str("org.example.Q".into())],
+        );
+        assert_eq!(
+            r.args(),
+            vec![Arg::StrArray(vec![
+                ":1.1".into(),
+                ":1.2".into(),
+                ":1.3".into()
+            ])]
+        );
+        let r = call(
+            &mut b,
+            1,
+            12,
+            "",
+            "ListQueuedOwners",
+            &[Arg::Str("org.example.Nobody".into())],
+        );
+        assert_eq!(err_name(&r), ERR_NAME_HAS_NO_OWNER);
+    }
+
+    /// The waiting queue is a queue: the name goes to the connection that has
+    /// been waiting longest, and a connection that asks twice while waiting
+    /// does not get two places in it.
+    #[test]
+    fn the_name_queue_hands_over_in_the_order_it_was_joined() {
+        let mut b = bus();
+        for id in [1u64, 2, 3] {
+            hello(&mut b, id);
+        }
+        bus_call(&mut b, 1, 10, "RequestName", "org.example.Q");
+        bus_call(&mut b, 2, 10, "RequestName", "org.example.Q");
+        bus_call(&mut b, 3, 10, "RequestName", "org.example.Q");
+        // Asking again from the back of the queue must not buy a second place.
+        bus_call(&mut b, 2, 11, "RequestName", "org.example.Q");
+        take(&mut b);
+
+        bus_call(&mut b, 1, 12, "ReleaseName", "org.example.Q");
+        take(&mut b);
+        let r = call(
+            &mut b,
+            1,
+            13,
+            "",
+            "GetNameOwner",
+            &[Arg::Str("org.example.Q".into())],
+        );
+        assert_eq!(
+            r.args(),
+            vec![Arg::Str(":1.2".into())],
+            "the oldest waiter takes the name"
+        );
+        // And exactly one place each, so the next release reaches :1.3.
+        bus_call(&mut b, 2, 14, "ReleaseName", "org.example.Q");
+        take(&mut b);
+        let r = call(
+            &mut b,
+            1,
+            15,
+            "",
+            "GetNameOwner",
+            &[Arg::Str("org.example.Q".into())],
+        );
+        assert_eq!(r.args(), vec![Arg::Str(":1.3".into())]);
+    }
+
+    /// A displaced owner goes to the FRONT of the queue, so it gets its name
+    /// back before anybody who was already waiting. dbus-daemon does the
+    /// same, and a service restarted under a client that takes the name over
+    /// depends on it.
+    #[test]
+    fn a_displaced_owner_is_first_in_line_for_its_name_again() {
+        let mut b = bus();
+        for id in [1u64, 2, 3] {
+            hello(&mut b, id);
+        }
+        // :1.1 owns it and allows replacement; :1.2 queues behind it.
+        request(&mut b, 1, "org.example.R", NAME_FLAG_ALLOW_REPLACEMENT);
+        request(&mut b, 2, "org.example.R", 0);
+        // :1.3 takes it over, which puts :1.1 at the head of the queue.
+        assert_eq!(
+            request(&mut b, 3, "org.example.R", NAME_FLAG_REPLACE_EXISTING),
+            REQUEST_NAME_PRIMARY_OWNER
+        );
+        take(&mut b);
+
+        bus_call(&mut b, 3, 20, "ReleaseName", "org.example.R");
+        take(&mut b);
+        let r = call(
+            &mut b,
+            1,
+            21,
+            "",
+            "GetNameOwner",
+            &[Arg::Str("org.example.R".into())],
+        );
+        assert_eq!(
+            r.args(),
+            vec![Arg::Str(":1.1".into())],
+            "the displaced owner comes before the waiter"
+        );
+    }
+
+    /// `RequestName` with `flags`, giving back the code the bus answers with.
+    fn request(b: &mut Bus, id: u64, name: &str, flags: u32) -> u32 {
+        let mut m = Message::method_call(DBUS_NAME, DBUS_PATH, DBUS_NAME, "RequestName");
+        m.serial = 99;
+        m.set_body(&[Arg::Str(name.to_string()), Arg::U32(flags)]);
+        b.dispatch(id, m);
+        let out = take(b);
+        let reply = out
+            .iter()
+            .find(|(to, m)| *to == id && m.kind == MSG_METHOD_RETURN)
+            .map(|(_, m)| m.clone())
+            .expect("RequestName was answered");
+        match reply.args().first() {
+            Some(Arg::U32(c)) => *c,
+            other => panic!("RequestName answered {other:?}"),
+        }
+    }
+
+    /// Taking a name over needs BOTH sides to agree: the owner must have said
+    /// its name may be replaced AND the challenger must ask to replace it.
+    /// Either half alone leaves the owner where it is.
+    #[test]
+    fn a_name_is_taken_over_only_when_both_sides_agree() {
+        for (owner_flags, taker_flags, taken) in [
+            (
+                NAME_FLAG_ALLOW_REPLACEMENT,
+                NAME_FLAG_REPLACE_EXISTING,
+                true,
+            ),
+            // The owner allows it but nobody asked.
+            (NAME_FLAG_ALLOW_REPLACEMENT, 0, false),
+            // Asked for, but the owner never allowed it.
+            (0, NAME_FLAG_REPLACE_EXISTING, false),
+            (0, 0, false),
+        ] {
+            let mut b = bus();
+            hello(&mut b, 1);
+            hello(&mut b, 2);
+            assert_eq!(
+                request(&mut b, 1, "org.example.T", owner_flags),
+                REQUEST_NAME_PRIMARY_OWNER
+            );
+            let code = request(&mut b, 2, "org.example.T", taker_flags);
+            if taken {
+                assert_eq!(
+                    code, REQUEST_NAME_PRIMARY_OWNER,
+                    "{owner_flags}/{taker_flags}"
+                );
+            } else {
+                assert_eq!(code, REQUEST_NAME_IN_QUEUE, "{owner_flags}/{taker_flags}");
+            }
+        }
+    }
+
+    /// `ReleaseName` has three outcomes and a client acts on each: the name
+    /// was yours and is gone, the name is not yours, or there is no such
+    /// name. Only the first had a test.
+    #[test]
+    fn release_name_tells_its_three_outcomes_apart() {
+        let mut b = bus();
+        hello(&mut b, 1);
+        hello(&mut b, 2);
+        request(&mut b, 1, "org.example.Held", 0);
+        // :1.2 waits for it, so it may release its PLACE IN THE QUEUE.
+        assert_eq!(
+            request(&mut b, 2, "org.example.Held", 0),
+            REQUEST_NAME_IN_QUEUE
+        );
+        take(&mut b);
+
+        assert_eq!(
+            release(&mut b, 1, "org.example.Nothing"),
+            RELEASE_NAME_NON_EXISTENT
+        );
+        assert_eq!(
+            release(&mut b, 2, "org.example.Held"),
+            RELEASE_NAME_RELEASED,
+            "a waiter releases its place in the queue"
+        );
+        // And having left the queue, it is no longer anything to the name.
+        assert_eq!(
+            release(&mut b, 2, "org.example.Held"),
+            RELEASE_NAME_NOT_OWNER
+        );
+        assert_eq!(
+            release(&mut b, 1, "org.example.Held"),
+            RELEASE_NAME_RELEASED
+        );
+        assert_eq!(
+            release(&mut b, 1, "org.example.Held"),
+            RELEASE_NAME_NON_EXISTENT,
+            "the last owner leaving takes the name with it"
+        );
+    }
+
+    fn release(b: &mut Bus, id: u64, name: &str) -> u32 {
+        let mut m = Message::method_call(DBUS_NAME, DBUS_PATH, DBUS_NAME, "ReleaseName");
+        m.serial = 98;
+        m.set_body(&[Arg::Str(name.to_string())]);
+        b.dispatch(id, m);
+        let out = take(b);
+        let reply = out
+            .iter()
+            .find(|(to, m)| *to == id && m.kind == MSG_METHOD_RETURN)
+            .map(|(_, m)| m.clone())
+            .expect("ReleaseName was answered");
+        match reply.args().first() {
+            Some(Arg::U32(c)) => *c,
+            other => panic!("ReleaseName answered {other:?}"),
+        }
+    }
+
+    /// A connection that goes away comes out of the queues it was merely
+    /// waiting in, not only off the names it owned. Left behind, it is handed
+    /// the name when the owner releases it -- a name owned by a connection
+    /// that no longer exists, which nothing can take back.
+    #[test]
+    fn a_connection_that_leaves_comes_out_of_every_queue() {
+        let mut b = bus();
+        hello(&mut b, 1);
+        hello(&mut b, 2);
+        request(&mut b, 1, "org.example.G", 0);
+        request(&mut b, 2, "org.example.G", 0);
+        take(&mut b);
+
+        b.remove_connection(2);
+        take(&mut b);
+        assert_eq!(release(&mut b, 1, "org.example.G"), RELEASE_NAME_RELEASED);
+        let r = call(
+            &mut b,
+            1,
+            30,
+            "",
+            "GetNameOwner",
+            &[Arg::Str("org.example.G".into())],
+        );
+        assert_eq!(
+            err_name(&r),
+            ERR_NAME_HAS_NO_OWNER,
+            "the name is free, not owned by a connection that left"
+        );
+    }
+
+    /// A connection that never said `Hello` has no identity on the bus, so
+    /// nothing is announced when it goes: `NameOwnerChanged` for a `:1.N` no
+    /// client was ever told about is a name appearing and vanishing out of
+    /// nowhere.
+    #[test]
+    fn a_connection_that_never_said_hello_leaves_without_a_word() {
+        let mut b = bus();
+        hello(&mut b, 1);
+        bus_call(
+            &mut b,
+            1,
+            5,
+            "AddMatch",
+            "type='signal',member='NameOwnerChanged'",
+        );
+        take(&mut b);
+
+        b.add_connection(9, 109, 0);
+        b.remove_connection(9);
+        assert!(
+            take(&mut b).is_empty(),
+            "a connection nobody was told about leaves silently"
+        );
+
+        // Whereas one that did say Hello is announced as gone.
+        hello(&mut b, 8);
+        take(&mut b);
+        b.remove_connection(8);
+        let out = take(&mut b);
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert_eq!(out[0].0, 1);
+        assert_eq!(out[0].1.member.as_deref(), Some("NameOwnerChanged"));
+    }
+
+    /// The bus's serial counter skips zero when it wraps: serial 0 is
+    /// reserved by the specification and a client that receives it treats the
+    /// message as corrupt.
+    #[test]
+    fn the_bus_serial_never_lands_on_zero() {
+        let mut b = bus();
+        b.serial = u32::MAX;
+        assert_eq!(b.next_serial(), 1, "it wraps past zero, not onto it");
+        assert_eq!(b.next_serial(), 2);
+    }
+
+    /// Only a `Hello` that is a METHOD CALL addressed to the BUS gets a
+    /// connection past the handshake. A signal called Hello, or a call sent
+    /// to somebody else, is an unregistered client's traffic and the bus
+    /// refuses it -- otherwise a client could register without the bus ever
+    /// answering, and then route with an identity nobody announced.
+    #[test]
+    fn only_a_method_call_to_the_bus_counts_as_the_hello() {
+        // A signal named Hello.
+        let mut b = bus();
+        b.add_connection(1, 101, 0);
+        let mut sig = Message::signal(DBUS_PATH, DBUS_NAME, "Hello");
+        sig.serial = 1;
+        sig.destination = Some(DBUS_NAME.to_string());
+        b.dispatch(1, sig);
+        let out = take(&mut b);
+        assert_eq!(out.len(), 1);
+        assert_eq!(err_name(&out[0].1), ERR_ACCESS_DENIED);
+        assert!(!b.conn(1).unwrap().hello);
+
+        // A Hello call addressed to another name.
+        let mut b = bus();
+        b.add_connection(1, 101, 0);
+        let mut m = Message::method_call("org.example.Other", DBUS_PATH, DBUS_NAME, "Hello");
+        m.serial = 1;
+        b.dispatch(1, m);
+        let out = take(&mut b);
+        assert_eq!(out.len(), 1);
+        assert_eq!(err_name(&out[0].1), ERR_ACCESS_DENIED);
+        assert!(!b.conn(1).unwrap().hello);
+    }
+
+    /// A monitor's rule may name a sender by a WELL-KNOWN name, so the copy
+    /// has to be matched against the names the sender owns and not only
+    /// against its `:1.N`. The sender's identity reaches `monitor_copy` as an
+    /// argument; drop it and every such rule silently matches nothing.
+    #[test]
+    fn a_monitor_rule_that_names_a_well_known_sender_sees_its_traffic() {
+        let mut b = bus();
+        hello(&mut b, 1);
+        hello(&mut b, 2);
+        request(&mut b, 2, "org.example.Speaker", 0);
+        let mut m = Message::method_call(DBUS_NAME, DBUS_PATH, DBUS_NAME, "BecomeMonitor");
+        m.serial = 5;
+        m.set_body(&[Arg::StrArray(vec![
+            "sender='org.example.Speaker'".to_string()
+        ])]);
+        b.dispatch(1, m);
+        take(&mut b);
+
+        example_signal(&mut b, 2, 6);
+        let out = take(&mut b);
+        assert_eq!(
+            out.len(),
+            1,
+            "the monitor sees the owner's signal through its well-known name: {out:?}"
+        );
+        assert_eq!(out[0].0, 1);
+    }
+
+    /// Becoming a monitor gives up everything the connection was: the names
+    /// it owned go to whoever was waiting, and its ordinary subscriptions are
+    /// dropped so it does not receive a message twice -- once as the monitor
+    /// copy and once as a subscriber.
+    #[test]
+    fn a_monitor_gives_up_its_names_and_its_subscriptions() {
+        let mut b = bus();
+        hello(&mut b, 1);
+        hello(&mut b, 2);
+        hello(&mut b, 3);
+        request(&mut b, 1, "org.example.Was", 0);
+        request(&mut b, 3, "org.example.Was", 0);
+        bus_call(
+            &mut b,
+            1,
+            5,
+            "AddMatch",
+            "type='signal',interface='org.example'",
+        );
+        take(&mut b);
+
+        let mut m = Message::method_call(DBUS_NAME, DBUS_PATH, DBUS_NAME, "BecomeMonitor");
+        m.serial = 6;
+        b.dispatch(1, m);
+        take(&mut b);
+
+        // The waiter has the name now.
+        let r = call(
+            &mut b,
+            2,
+            7,
+            "",
+            "GetNameOwner",
+            &[Arg::Str("org.example.Was".into())],
+        );
+        assert_eq!(
+            r.args(),
+            vec![Arg::Str(":1.3".into())],
+            "a monitor owns nothing"
+        );
+
+        // And one copy of a matching signal, not two.
+        example_signal(&mut b, 2, 8);
+        let out = take(&mut b);
+        assert_eq!(
+            out.len(),
+            1,
+            "exactly one copy reaches the monitor: {out:?}"
+        );
+        assert_eq!(out[0].0, 1);
+    }
+
+    /// Giving a name up takes it off the connection that had it. The list a
+    /// connection carries is what a `sender=` rule is matched against, so a
+    /// stale entry has a watcher receiving traffic from a connection that
+    /// gave the name away -- under a name it no longer owns.
+    #[test]
+    fn giving_a_name_up_takes_it_off_the_connection_that_had_it() {
+        let mut b = bus();
+        hello(&mut b, 1);
+        hello(&mut b, 2);
+        hello(&mut b, 3);
+        request(&mut b, 2, "org.example.Mover", 0);
+        request(&mut b, 3, "org.example.Mover", 0);
+        bus_call(&mut b, 1, 5, "AddMatch", "sender='org.example.Mover'");
+        take(&mut b);
+
+        assert_eq!(
+            release(&mut b, 2, "org.example.Mover"),
+            RELEASE_NAME_RELEASED
+        );
+        assert_eq!(
+            b.conn(2).unwrap().names,
+            Vec::<String>::new(),
+            "the name is off the old owner's list"
+        );
+
+        // :1.2 no longer owns it, so its traffic no longer matches.
+        example_signal(&mut b, 2, 6);
+        assert!(
+            take(&mut b).is_empty(),
+            "the watcher follows the name, not the connection that had it"
+        );
+        // And the new owner's traffic does.
+        example_signal(&mut b, 3, 7);
+        let out = take(&mut b);
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert_eq!(out[0].0, 1);
+    }
+
+    /// A unicast call reaches its destination once, even when the
+    /// destination's own rules also match it: the broadcast skips the
+    /// connection that is about to receive the message directly.
+    #[test]
+    fn the_addressee_of_a_call_receives_it_exactly_once() {
+        let mut b = bus();
+        hello(&mut b, 1);
+        hello(&mut b, 2);
+        request(&mut b, 2, "org.example.Dest", 0);
+        bus_call(&mut b, 2, 5, "AddMatch", "type='method_call'");
+        take(&mut b);
+
+        let mut m = Message::method_call("org.example.Dest", "/org/a", "org.example", "Do");
+        m.serial = 6;
+        b.dispatch(1, m);
+        let out = take(&mut b);
+        assert_eq!(out.len(), 1, "one copy, not two: {out:?}");
+        assert_eq!(out[0].0, 2);
+    }
+
+    /// `RemoveMatch` removes the rule the client named, not whichever rule is
+    /// first. A connection usually holds several, and taking the wrong one
+    /// away leaves the client subscribed to traffic it asked to stop and
+    /// deaf to traffic it still wants.
+    #[test]
+    fn remove_match_takes_away_the_rule_it_was_given() {
+        let mut b = bus();
+        hello(&mut b, 1);
+        hello(&mut b, 2);
+        bus_call(
+            &mut b,
+            1,
+            5,
+            "AddMatch",
+            "type='signal',interface='org.example'",
+        );
+        bus_call(
+            &mut b,
+            1,
+            6,
+            "AddMatch",
+            "type='signal',interface='org.other'",
+        );
+        take(&mut b);
+
+        bus_call(
+            &mut b,
+            1,
+            7,
+            "RemoveMatch",
+            "type='signal',interface='org.other'",
+        );
+        let out = take(&mut b);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].1.kind, MSG_METHOD_RETURN, "the rule was there");
+
+        // The rule that was not named is still in force.
+        example_signal(&mut b, 2, 8);
+        let out = take(&mut b);
+        assert_eq!(out.len(), 1, "the other rule survived: {out:?}");
+        assert_eq!(out[0].0, 1);
+        // And the one that was named is gone.
+        let mut sig = Message::signal("/org/a", "org.other", "Ping");
+        sig.serial = 9;
+        b.dispatch(2, sig);
+        assert!(take(&mut b).is_empty(), "the named rule is gone");
     }
 }
