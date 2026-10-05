@@ -1400,19 +1400,27 @@ extern "C" {
 //
 // # Safety
 //
-// For every function here:
+// The C side already rejects, with `NV_ERR_INVALID_ARGUMENT` and without
+// touching memory, every argument it can actually check: a zero `size`, a
+// zero `row_bytes` or `line_count`, a `row_bytes` larger than either pitch,
+// a pitch above 0x7FFF_FFFF, and a GPU that is absent or not yet stateful.
+// Those are ordinary error returns, not undefined behaviour, so they are NOT
+// what these functions are unsafe about.
 //
-// * `gpu` must be an attached GPU instance -- one `rm_attach_gpu` returned
-//   NV_OK for and that has not been detached.
+// What it cannot check, and what the caller therefore has to guarantee, is
+// that the addresses mean what they say -- nothing in the RM or the MMU can
+// tell a legitimate physical address from a plausible one:
+//
 // * `src_sysmem_pa` must be the physical base of a mapped host range of at
-//   least the requested length, and must stay mapped until the work the
-//   submit returns has completed (the engine reads it asynchronously).
+//   least `size` bytes, and must stay mapped until the work the submit
+//   returns has completed, because the engine reads it asynchronously.
 // * `dst_fb_vram_offset` must be a VRAM offset, and `dst_host_pa` a host
-//   physical address, each addressing at least the requested length of
-//   memory this GPU is allowed to write.
-// * For the pitched 2D form, `src_sysmem_pa + (line_count - 1) * src_pitch +
-//   row_bytes` and the same expression for the destination must both stay
-//   inside their respective ranges.
+//   physical address, each addressing at least `size` bytes this GPU is
+//   allowed to WRITE.
+// * For the pitched 2D form, with `line_count >= 1` and `row_bytes >= 1`
+//   (the callee having rejected zero already), the last byte each side
+//   touches is `base + (line_count - 1) * pitch + row_bytes`, and both must
+//   stay inside their range and must not wrap the address width.
 // ---------------------------------------------------------------------
 #[cfg(not(test))]
 mod ce_rm {
@@ -1763,9 +1771,14 @@ pub fn ce_blit(
         // invariant (`Assertion failed: RPC locking violation @ rpc.c:9834`).
         // Wait happens AFTER this gate drops -- see `ce_finish`.
         let _gate = RmGate::lock();
-        // Safety: the ranges are the caller's to vouch for -- see `ce_rm`'s
-        // safety contract. This function is itself the place that contract is
-        // forwarded to its own caller.
+        // Safety: NOT discharged here, and this `unsafe` block is where that
+        // shows. `ce_blit` is a safe `pub fn` taking raw `u64` addresses it
+        // does not and cannot validate, so it is only as sound as its
+        // callers in `drivers` -- which get `src_sysmem_pa` from a pinned
+        // dumb buffer and `dst_fb_vram_offset` from the BAR1 window. That
+        // predates this seam; the seam only stopped hiding it. Tightening
+        // these entry points to `unsafe fn` is a change across `drivers`,
+        // not a comment. See `ce_rm`'s contract for what has to hold.
         unsafe { ce_rm::blit(gpu_instance, dst_fb_vram_offset, src_sysmem_pa, size) }
     };
     ce_finish(gpu_instance, submit, work_id)
@@ -1778,8 +1791,9 @@ fn ce_finish(gpu_instance: u32, submit: NV_STATUS, work_id: u64) -> NV_STATUS {
     if submit != NV_OK {
         return submit;
     }
-    // Safety: `work_id` came from a submit on this same `gpu_instance` that
-    // returned NV_OK, which is all the wait and the release need.
+    // Safety: discharged here, unlike the submits above: `work_id` came from
+    // a submit on this same `gpu_instance` that returned NV_OK, and that is
+    // all the wait and the release need -- no caller address is involved.
     let wait = unsafe { ce_rm::wait(gpu_instance, work_id) };
     let release = {
         let _gate = RmGate::lock();
@@ -1805,7 +1819,7 @@ pub fn ce_fill_fb(gpu_instance: u32, fb_vram_offset: u64, size: u64, pattern: u3
     // [rpc-lock] See `ce_blit`: gate this RM entry so a CE op never races a
     // concurrent NVK allocation into the RM (rpc.c:9834 API-lock violation).
     let _gate = RmGate::lock();
-    // Safety: forwarded to this function's caller -- see `ce_rm`.
+    // Safety: as in `ce_blit` -- a safe `pub fn` over unvalidated addresses.
     unsafe { ce_rm::fill_fb(gpu_instance, fb_vram_offset, size, pattern) }
 }
 
@@ -1818,7 +1832,7 @@ pub fn ce_fill_fb(gpu_instance: u32, fb_vram_offset: u64, size: u64, pattern: u3
 pub fn ce_fill_fb_p2p(gpu_instance: u32, dst_host_pa: u64, size: u64, pattern: u32) -> NV_STATUS {
     // [rpc-lock] See `ce_blit`: gate this RM entry (rpc.c:9834 API-lock).
     let _gate = RmGate::lock();
-    // Safety: forwarded to this function's caller -- see `ce_rm`.
+    // Safety: as in `ce_blit` -- a safe `pub fn` over unvalidated addresses.
     unsafe { ce_rm::fill_fb_p2p(gpu_instance, dst_host_pa, size, pattern) }
 }
 
@@ -1835,7 +1849,7 @@ pub fn ce_blit_p2p(
     // [rpc-lock] Gate submit only; wait is outside -- see `ce_finish`.
     let (submit, work_id) = {
         let _gate = RmGate::lock();
-        // Safety: forwarded to this function's caller -- see `ce_rm`.
+        // Safety: as in `ce_blit` -- a safe `pub fn` over unvalidated addresses.
         unsafe { ce_rm::blit_p2p(gpu_instance, dst_host_pa, src_sysmem_pa, size) }
     };
     ce_finish(gpu_instance, submit, work_id)
@@ -1862,8 +1876,9 @@ pub fn ce_blit_p2p_2d(
     // [rpc-lock] Gate submit only; wait is outside -- see `ce_finish`.
     let (submit, work_id) = {
         let _gate = RmGate::lock();
-        // Safety: forwarded to this function's caller -- see `ce_rm`, whose
-        // contract spells out the pitched bound both ranges have to satisfy.
+        // Safety: as in `ce_blit` -- a safe `pub fn` over unvalidated
+        // addresses. `ce_rm`'s contract spells out the pitched bound both
+        // ranges have to satisfy.
         unsafe {
             ce_rm::blit_p2p_2d(
                 gpu_instance,
