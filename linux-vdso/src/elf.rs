@@ -599,6 +599,7 @@ mod tests {
             &b"__vdso_clock_gettime"[..],
             &b"__vdso_gettimeofday"[..],
             &b"__vdso_time"[..],
+            &b"__vdso_getcpu"[..],
         ] {
             assert!(
                 vdsosym(crate::IMAGE, name).is_some(),

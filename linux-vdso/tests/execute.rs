@@ -171,7 +171,7 @@ const ONE_GHZ_MULT: u64 = 1u64 << 32;
 fn enabled(wall_off_ns: u64) -> linux_vdso::VdsoData {
     linux_vdso::VdsoData {
         enabled: 1,
-        _pad: 0,
+        getcpu_enabled: 0,
         tsc_mult: ONE_GHZ_MULT,
         wall_off_ns,
         // Time zero at TSC zero: the tests below bracket the answer against raw
@@ -254,7 +254,7 @@ fn conversion_survives_an_overflowing_product() {
 
     let m = Mapping::new(linux_vdso::VdsoData {
         enabled: 1,
-        _pad: 0,
+        getcpu_enabled: 0,
         tsc_mult: mult,
         wall_off_ns: 0,
         tsc_base: 0,
@@ -314,7 +314,7 @@ fn the_base_is_subtracted_so_the_clock_starts_at_zero() {
 
     let m = Mapping::new(linux_vdso::VdsoData {
         enabled: 1,
-        _pad: 0,
+        getcpu_enabled: 0,
         tsc_mult: ONE_GHZ_MULT,
         wall_off_ns: 0,
         tsc_base: base,
@@ -343,7 +343,7 @@ fn the_base_is_subtracted_so_the_clock_starts_at_zero() {
 fn a_reading_below_the_base_reads_as_zero_not_as_a_wrapped_span() {
     let m = Mapping::new(linux_vdso::VdsoData {
         enabled: 1,
-        _pad: 0,
+        getcpu_enabled: 0,
         tsc_mult: ONE_GHZ_MULT,
         wall_off_ns: 0,
         tsc_base: u64::MAX,
@@ -480,4 +480,159 @@ fn works_from_several_load_addresses() {
         assert_eq!(unsafe { clock_gettime(CLOCK_MONOTONIC, &mut ts) }, 0);
         assert!(ts.as_ns() > 0);
     }
+}
+
+// ── getcpu ──────────────────────────────────────────────────────────────────
+
+type Getcpu = unsafe extern "C" fn(*mut u32, *mut u32, *mut u8) -> i32;
+
+/// The host kernel also keeps `IA32_TSC_AUX` set to the running CPU's id, with
+/// the same layout, so the image's `rdtscp` path can be executed and checked
+/// against the host's own `getcpu` syscall rather than only inspected.
+fn host_getcpu() -> (u32, u32) {
+    let mut cpu = u32::MAX;
+    let mut node = u32::MAX;
+    let r: isize;
+    unsafe {
+        std::arch::asm!(
+            "syscall",
+            inlateout("rax") 309isize => r,   // SYS_getcpu
+            in("rdi") &mut cpu as *mut u32,
+            in("rsi") &mut node as *mut u32,
+            in("rdx") 0usize,
+            lateout("rcx") _, lateout("r11") _,
+            options(nostack)
+        );
+    }
+    assert_eq!(r, 0, "el getcpu del host deberia responder");
+    (cpu, node)
+}
+
+/// With the flag off the image declines, and musl's contract turns that into the
+/// syscall. This is the whole safety net: a machine without `rdtscp`, or a
+/// kernel that could not encode some CPU's id, must never get a guess.
+#[test]
+fn getcpu_declines_until_the_kernel_says_the_register_is_set() {
+    let m = Mapping::new(enabled(0));
+    let getcpu: Getcpu = m.sym("__vdso_getcpu");
+    let mut cpu = 0xdead_beefu32;
+    let mut node = 0xdead_beefu32;
+    let r = unsafe { getcpu(&mut cpu, &mut node, core::ptr::null_mut()) };
+    assert_eq!(r, -38, "sin el flag tiene que devolver -ENOSYS");
+    assert_eq!(cpu, 0xdead_beef, "y no tocar lo que le pasaron");
+    assert_eq!(node, 0xdead_beef);
+}
+
+/// With the flag on it answers in userspace, and the answer is the one the
+/// kernel would have given. This is what pins the C against
+/// `kernel_hal::getcpu`: packing the node into the low bits, or splitting at the
+/// wrong bit, shows up right here.
+#[test]
+fn getcpu_answers_what_the_kernel_would_have_said() {
+    let mut data = enabled(0);
+    data.getcpu_enabled = 1;
+    let m = Mapping::new(data);
+    let getcpu: Getcpu = m.sym("__vdso_getcpu");
+
+    // Both on one CPU: pinned to the first one the process is allowed on, so
+    // the two answers cannot come from two different cores.
+    let pinned = pin_to_one_cpu();
+    let (want_cpu, want_node) = host_getcpu();
+    let mut cpu = u32::MAX;
+    let mut node = u32::MAX;
+    let r = unsafe { getcpu(&mut cpu, &mut node, core::ptr::null_mut()) };
+    assert_eq!(r, 0, "con el flag puesto se responde en espacio de usuario");
+    assert_eq!(cpu, want_cpu, "la CPU no es la que dice el kernel");
+    assert_eq!(node, want_node, "el nodo no es el que dice el kernel");
+    // And it is the CPU we pinned to, which on a machine with more than one is
+    // not zero -- so the two halves of the word are not interchangeable here.
+    assert_eq!(cpu as usize, pinned);
+    assert_eq!(
+        kernel_hal_getcpu_split(want_cpu, want_node),
+        (cpu, node),
+        "la C y la codificacion del kernel discrepan"
+    );
+}
+
+/// The kernel's own split, written out here rather than imported: `linux-vdso`
+/// does not depend on `kernel-hal`, and the point is that two independent
+/// spellings of the layout agree.
+fn kernel_hal_getcpu_split(cpu: u32, node: u32) -> (u32, u32) {
+    let word = (node << 12) | (cpu & 0xfff);
+    (word & 0xfff, word >> 12)
+}
+
+/// A null pointer for either output is legal (`sched_getcpu` passes null for the
+/// node) and must not fault.
+#[test]
+fn getcpu_takes_a_null_for_either_output() {
+    let mut data = enabled(0);
+    data.getcpu_enabled = 1;
+    let m = Mapping::new(data);
+    let getcpu: Getcpu = m.sym("__vdso_getcpu");
+    let _ = pin_to_one_cpu();
+    let (want_cpu, _) = host_getcpu();
+
+    let mut cpu = u32::MAX;
+    assert_eq!(
+        unsafe { getcpu(&mut cpu, core::ptr::null_mut(), core::ptr::null_mut()) },
+        0
+    );
+    assert_eq!(cpu, want_cpu);
+    assert_eq!(
+        unsafe {
+            getcpu(
+                core::ptr::null_mut(),
+                core::ptr::null_mut(),
+                core::ptr::null_mut(),
+            )
+        },
+        0,
+        "sin salidas no hay nada que escribir, y tampoco un fallo"
+    );
+}
+
+/// Pin this thread to the **highest** CPU it is allowed on, and say which.
+///
+/// One CPU so the vDSO's answer and the syscall's cannot differ merely by being
+/// taken on two cores. The highest rather than the lowest because a non-zero id
+/// is what makes the word the image splits non-zero: on CPU 0 every way of
+/// splitting it agrees, so a test taken there proves nothing about the split.
+fn pin_to_one_cpu() -> usize {
+    let mut mask = [0u64; 16];
+    let r: isize;
+    unsafe {
+        std::arch::asm!(
+            "syscall",
+            inlateout("rax") 204isize => r,   // SYS_sched_getaffinity
+            in("rdi") 0usize,
+            in("rsi") core::mem::size_of_val(&mask),
+            in("rdx") mask.as_mut_ptr(),
+            lateout("rcx") _, lateout("r11") _,
+            options(nostack)
+        );
+    }
+    assert!(r > 0, "sched_getaffinity deberia responder");
+    let highest = mask
+        .iter()
+        .enumerate()
+        .rev()
+        .find_map(|(w, v)| (*v != 0).then(|| w * 64 + 63 - v.leading_zeros() as usize))
+        .expect("alguna CPU permitida");
+    let mut one = [0u64; 16];
+    one[highest / 64] = 1u64 << (highest % 64);
+    let r: isize;
+    unsafe {
+        std::arch::asm!(
+            "syscall",
+            inlateout("rax") 203isize => r,   // SYS_sched_setaffinity
+            in("rdi") 0usize,
+            in("rsi") core::mem::size_of_val(&one),
+            in("rdx") one.as_ptr(),
+            lateout("rcx") _, lateout("r11") _,
+            options(nostack)
+        );
+    }
+    assert_eq!(r, 0, "sched_setaffinity deberia aceptar una sola CPU");
+    highest
 }

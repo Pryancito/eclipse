@@ -62,7 +62,9 @@ struct vdso_data {
     // frequency was never calibrated), and this file then declines every
     // request so the caller falls back to the syscall.
     volatile uint32_t enabled;
-    volatile uint32_t _pad;
+    // Non-zero when `__vdso_getcpu` may read IA32_TSC_AUX. Independent of
+    // `enabled`, which vouches only for the clock.
+    volatile uint32_t getcpu_enabled;
     // Monotonic nanoseconds = ((rdtsc() - tsc_base) * tsc_mult) >> 32. Same
     // fixed-point multiplier the kernel's own `timer_now` uses.
     volatile uint64_t tsc_mult;
@@ -157,6 +159,32 @@ VDSO_EXPORT int __vdso_clock_gettime(int clk, struct vdso_timespec *ts) {
         return err;
     ts->tv_sec = (long)(ns / 1000000000ull);
     ts->tv_nsec = (long)(ns % 1000000000ull);
+    return 0;
+}
+
+// `sched_getcpu()` cost a full trap here -- 13 us against Linux's 83 ns under
+// the same emulator -- and its callers are allocators and thread pools sharding
+// per CPU, so every one of those traps sits on a hot path. Linux answers it in
+// userspace: the kernel writes each CPU's id into IA32_TSC_AUX and `rdtscp`
+// hands that word back in ECX without leaving ring 3. The CPU is the low 12
+// bits, the NUMA node above them (`kernel_hal::getcpu`).
+//
+// musl's `sched_getcpu` looks this symbol up and, exactly like the clock, falls
+// through to the syscall on -ENOSYS, so a machine without `rdtscp` -- or a
+// kernel that could not encode some CPU's id -- simply keeps the trap.
+VDSO_EXPORT int __vdso_getcpu(unsigned *cpu, unsigned *node, void *unused) {
+    (void)unused;
+    if (!_vdso_data.getcpu_enabled)
+        return VDSO_ENOSYS;
+    uint32_t aux;
+    uint32_t lo, hi;
+    __asm__ __volatile__("rdtscp" : "=a"(lo), "=d"(hi), "=c"(aux));
+    (void)lo;
+    (void)hi;
+    if (cpu)
+        *cpu = aux & 0xfffu;
+    if (node)
+        *node = aux >> 12;
     return 0;
 }
 

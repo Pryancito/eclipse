@@ -46,10 +46,16 @@ pub struct VdsoData {
     /// never calibrated — in which case userspace declines to answer and the
     /// caller falls back to the `clock_gettime` syscall.
     pub enabled: u32,
-    /// Padding, so the 64-bit fields below stay naturally aligned. Aligned
-    /// 64-bit loads cannot tear on x86_64, which is what lets the reader run
-    /// without a seqlock.
-    pub _pad: u32,
+    /// Non-zero when userspace may answer `getcpu` from `RDTSCP` instead of
+    /// trapping: the CPU implements it and the kernel has written every CPU's
+    /// own id into `IA32_TSC_AUX`.
+    ///
+    /// Independent of [`enabled`](Self::enabled), which vouches only for the
+    /// clock: a machine with an unusable TSC as a *time source* can still
+    /// report which CPU it is on, and the reverse. It also sits exactly where
+    /// the padding used to, so the 64-bit fields below stay naturally aligned
+    /// and the struct's size does not move.
+    pub getcpu_enabled: u32,
     /// Fixed-point multiplier: monotonic ns =
     /// `((rdtsc() - tsc_base) * tsc_mult) >> 32`.
     ///
