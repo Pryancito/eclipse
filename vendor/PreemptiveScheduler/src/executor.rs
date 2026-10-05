@@ -140,13 +140,23 @@ static IDLE_STREAK: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU6
 // `/proc/perf/kernel` so a busy-spin can be attributed: `polled` = a task was
 // available to run, `weak_yield` = no task but a weak executor outstanding so we
 // spun via `sched_yield` instead of halting.
-static SCHED_POLLED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+///
+/// `polled` is per-CPU with a cache line each, and summed on read. It is bumped
+/// on **every task poll**, so as one shared word it was a read-modify-write
+/// that every CPU in the machine performed on one line, tens of thousands of
+/// times a second, for a number nothing reads but `/proc`. A statistic must not
+/// be the most contended line in the scheduler; `weak_yield` stays shared
+/// because it is bumped only when a CPU finds no task but a weak executor
+/// outstanding, which is rare by construction.
+static SCHED_POLLED: [crate::runtime::CacheAligned; lock::MAX_CORE_NUM] =
+    [const { crate::runtime::CacheAligned::new() }; lock::MAX_CORE_NUM];
 static SCHED_WEAK_YIELD: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// `(tasks polled, weak-executor yields)` since boot.
 pub fn sched_stats() -> (u64, u64) {
     use core::sync::atomic::Ordering::Relaxed;
-    (SCHED_POLLED.load(Relaxed), SCHED_WEAK_YIELD.load(Relaxed))
+    let polled = SCHED_POLLED.iter().map(|c| c.0.load(Relaxed)).sum();
+    (polled, SCHED_WEAK_YIELD.load(Relaxed))
 }
 
 /// `(stack-pool occupied slots, overflow-list length)` — how many freed
@@ -1390,8 +1400,20 @@ impl Executor {
                 // streak. If the machine then spins the idle loop many times with
                 // tasks still present but nothing polled, a wake was lost (see the
                 // else-branch dump below).
-                IDLE_STREAK.store(0, core::sync::atomic::Ordering::Relaxed);
-                SCHED_POLLED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                // Read before the write. `IDLE_STREAK` is only ever non-zero
+                // while the machine is making no progress at all, so on a busy
+                // machine this stored a 0 over a 0 on every poll from every
+                // CPU -- a write to a shared line, and therefore an
+                // invalidation on every other core, to change nothing.
+                if IDLE_STREAK.load(core::sync::atomic::Ordering::Relaxed) != 0 {
+                    IDLE_STREAK.store(0, core::sync::atomic::Ordering::Relaxed);
+                }
+                let cpu = crate::arch::cpu_id() as usize;
+                if cpu < lock::MAX_CORE_NUM {
+                    SCHED_POLLED[cpu]
+                        .0
+                        .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                }
                 // Publish who is running before entering the future: if the
                 // poll faults, the panic-containment path reads these to retire
                 // exactly this task (see `runtime::abandon_current_task`). Both
@@ -2399,6 +2421,32 @@ mod stack_registry_tests {
     /// A plausible stack allocation base: page-aligned and far from both ends
     /// of the address space, so a test that means to overflow has to say so.
     const BASE: usize = 0x1000_0000;
+
+    /// `polled` went from one shared word to one per CPU, so the reader has to
+    /// add them up: a sum that only read CPU 0 would report a fraction of the
+    /// polls and make `/proc/perf/kernel` quietly wrong.
+    #[test]
+    fn the_poll_count_is_the_sum_over_every_cpu() {
+        let _g = test_lock();
+        let saved: std::vec::Vec<u64> = SCHED_POLLED
+            .iter()
+            .map(|c| c.0.swap(0, Ordering::SeqCst))
+            .collect();
+        // Tres CPUs distintas, incluida la ultima de la tabla.
+        SCHED_POLLED[0].0.store(5, Ordering::SeqCst);
+        SCHED_POLLED[1].0.store(7, Ordering::SeqCst);
+        SCHED_POLLED[lock::MAX_CORE_NUM - 1]
+            .0
+            .store(11, Ordering::SeqCst);
+        let (polled, _) = sched_stats();
+        for (c, v) in SCHED_POLLED.iter().zip(saved) {
+            c.0.store(v, Ordering::SeqCst);
+        }
+        assert_eq!(
+            polled, 23,
+            "el conteo de polls no suma todas las CPUs: /proc miente"
+        );
+    }
 
     /// `STACK_REG_OCC` is what the per-allocation lookup walks instead of all
     /// 512 slots, so these cover its one invariant: a set bit is a SUPERSET of

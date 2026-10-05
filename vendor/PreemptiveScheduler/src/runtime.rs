@@ -331,7 +331,43 @@ const REBALANCE_EVERY: u32 = 32;
 /// has local work pulls one. Stops two lightly loaded CPUs from ping-ponging.
 pub(crate) const REBALANCE_MARGIN: usize = 2;
 
-static REBALANCE_TICK: [AtomicU32; MAX_CORE_NUM] = [const { AtomicU32::new(0) }; MAX_CORE_NUM];
+/// One counter with a cache line to itself.
+///
+/// A per-CPU array of bare atomics is per-CPU in *name* only: sixteen
+/// `AtomicU32` fit in a 64-byte line, so CPUs 0..15 were writing the same line
+/// and each one's RMW invalidated the other fifteen's copy. On a path that runs
+/// once in a while that is invisible; on a path that runs on **every task
+/// poll** it is the most contended line in the kernel, and it is paying for
+/// nothing -- no CPU ever reads another's counter.
+#[repr(align(64))]
+pub(crate) struct CacheAligned(pub(crate) AtomicU64);
+
+impl CacheAligned {
+    pub(crate) const fn new() -> Self {
+        Self(AtomicU64::new(0))
+    }
+}
+
+// The whole point is that two CPUs' counters cannot land on one line, so it is
+// checked at compile time rather than hoped for: an `align` that a future field
+// or a different target quietly widened past would put the padding back to
+// work, and a size BELOW the line is what lets two of them share one.
+const _: () = assert!(
+    core::mem::align_of::<CacheAligned>() == 64 && core::mem::size_of::<CacheAligned>() == 64,
+    "CacheAligned must be exactly one 64-byte line, or per-CPU counters share one"
+);
+// 64 cores x 64 bytes = 4 KiB of BSS per array. Paid once, statically, against
+// a line that was being invalidated tens of thousands of times a second.
+const _: () = assert!(
+    MAX_CORE_NUM == 64,
+    "the 4 KiB-per-array figure above is for 64 cores: re-check it if this moves"
+);
+
+/// Per-CPU poll counter for [`rebalance_due`], one cache line each.
+///
+/// `u64` rather than `u32` only because the padding makes the width free, and
+/// `REBALANCE_EVERY` divides both wrap points so the cadence is unchanged.
+static REBALANCE_TICK: [CacheAligned; MAX_CORE_NUM] = [const { CacheAligned::new() }; MAX_CORE_NUM];
 
 /// True once every [`REBALANCE_EVERY`] polls on this CPU.
 pub(crate) fn rebalance_due() -> bool {
@@ -339,7 +375,7 @@ pub(crate) fn rebalance_due() -> bool {
     if cpu >= MAX_CORE_NUM {
         return false;
     }
-    REBALANCE_TICK[cpu].fetch_add(1, Ordering::Relaxed) % REBALANCE_EVERY == 0
+    REBALANCE_TICK[cpu].0.fetch_add(1, Ordering::Relaxed) % REBALANCE_EVERY as u64 == 0
 }
 
 /// Pull while we still have local work only when that work is a single task
@@ -2849,6 +2885,44 @@ mod affinity_tests {
 /// These share the module's globals, so they take a lock and install a
 /// recording IPI sender. CI runs the suite with `--test-threads=1` and would
 /// therefore never notice if they did not.
+/// The per-CPU counters on the per-poll path: that they really are per-CPU
+/// (one cache line each) and that making them so did not change what they count.
+#[cfg(test)]
+mod per_cpu_counter_tests {
+    use super::*;
+
+    /// Two neighbours must not share a line. The `const` asserts beside
+    /// `CacheAligned` already fail the build if they do; this states it as a
+    /// test too, because the reason is not obvious from the type.
+    #[test]
+    fn two_neighbouring_counters_are_on_different_cache_lines() {
+        let a = &REBALANCE_TICK[0] as *const _ as usize;
+        let b = &REBALANCE_TICK[1] as *const _ as usize;
+        assert_eq!(a % 64, 0, "el contador de la CPU 0 no empieza en linea");
+        assert_eq!(
+            b - a,
+            64,
+            "dos CPUs vecinas comparten linea: el padding no esta haciendo nada"
+        );
+    }
+
+    /// The cadence `rebalance_due` promises, which the `u32` -> `u64` widening
+    /// had to leave alone: one pass in `REBALANCE_EVERY`, starting with the
+    /// first.
+    #[test]
+    fn the_rebalance_cadence_is_one_pass_in_every_thirty_two() {
+        let _g = super::resched_test_lock();
+        let cpu = crate::arch::cpu_id() as usize;
+        let saved = REBALANCE_TICK[cpu].0.swap(0, Ordering::SeqCst);
+        let hits = (0..REBALANCE_EVERY * 4).filter(|_| rebalance_due()).count();
+        REBALANCE_TICK[cpu].0.store(saved, Ordering::SeqCst);
+        assert_eq!(
+            hits, 4,
+            "la cadencia del rebalanceo cambio al ensanchar el contador"
+        );
+    }
+}
+
 /// The `STEALABLE` overload hint: what the gate lets through, and the
 /// asymmetry (set by anybody, cleared only by the owner) that makes it safe.
 #[cfg(test)]
