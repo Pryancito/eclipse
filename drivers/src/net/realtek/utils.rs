@@ -196,3 +196,88 @@ mod timer {
 #[cfg(target_arch = "riscv64")]
 #[allow(unused)]
 pub use timer::{get_cycle, msdelay, usdelay};
+
+/// The host arm of the cache maintenance, which is the instrument every
+/// ordering assertion in this driver reads. These check the instrument.
+#[cfg(test)]
+mod tests {
+    extern crate std;
+
+    use super::super::rtl8211f::fake::{self, Phy};
+    use super::host::CacheOp;
+    use super::*;
+
+    /// What the log reports is the address and the **size** the driver asked
+    /// for, not the end address it was turned into on the way down.
+    ///
+    /// `flush_cache` takes a size, the arch arms take a range, and the host arm
+    /// turns the range back into a size. Nothing checks that round trip, and if
+    /// it were off the ordering tests in `rtl8211f` would keep passing while
+    /// reporting flushes of the wrong length -- which is the one thing they are
+    /// there to read.
+    #[test]
+    fn the_log_reports_the_address_and_size_the_driver_asked_for() {
+        let dev = fake::with_phy(Phy::gigabit_partner());
+        dev.record_cache();
+
+        flush_cache(0x8000_1000, 64);
+        invalidate_dcache(0x8000_2040, 16);
+        fence_w();
+        // A zero-length operation still has to come back as zero rather than as
+        // whatever the subtraction made of it.
+        flush_cache(0x8000_3000, 0);
+
+        assert_eq!(
+            dev.cache_ops(),
+            alloc::vec![
+                CacheOp::Flush(0x8000_1000, 64),
+                CacheOp::Invalidate(0x8000_2040, 16),
+                CacheOp::Fence,
+                CacheOp::Flush(0x8000_3000, 0),
+            ],
+            "the log has to read back exactly what was asked for, in order"
+        );
+    }
+
+    /// The two range forms agree with the two size forms, since the driver uses
+    /// both and the ordering tests cannot tell them apart.
+    #[test]
+    fn asking_by_range_and_asking_by_size_reach_the_same_place() {
+        let dev = fake::with_phy(Phy::gigabit_partner());
+        dev.record_cache();
+
+        flush_cache(0x9000_0000, 128);
+        flush_dcache_range(0x9000_0000, 0x9000_0080);
+        invalidate_dcache(0x9000_1000, 256);
+        invalidate_dcache_range(0x9000_1000, 0x9000_1100);
+
+        let ops = dev.cache_ops();
+        assert_eq!(ops[0], ops[1], "a flush by size is a flush by range");
+        assert_eq!(ops[2], ops[3], "and so is an invalidate");
+    }
+
+    /// Nothing is recorded until a test asks for it.
+    ///
+    /// This arm is not only the test harness: it is what an **x86_64 kernel**
+    /// build of this driver compiles to, because the arm is chosen on the
+    /// target architecture and not on `cfg(test)`. The log is a process-global
+    /// `Vec` and every cache operation would push onto it, so the flag that
+    /// keeps it empty is the only thing between a flush on the transmit path
+    /// and a leak that grows for as long as the machine is up.
+    #[test]
+    fn nothing_is_recorded_until_a_test_asks_for_it() {
+        let dev = fake::with_phy(Phy::gigabit_partner());
+
+        // No `record_cache()`: this is what a kernel build does all day.
+        flush_cache(0xa000_0000, 4096);
+        invalidate_dcache(0xa000_1000, 4096);
+        fence_w();
+
+        dev.record_cache();
+        assert!(
+            dev.cache_ops().is_empty(),
+            "a cache operation outside a recording window has to leave nothing \
+             behind: on a host kernel build they are all of them"
+        );
+    }
+}
