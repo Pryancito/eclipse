@@ -40,6 +40,11 @@ const HEALTHY_UPTIME: Duration = Duration::from_secs(2);
 const MIN_BACKOFF: Duration = Duration::from_millis(250);
 const MAX_BACKOFF: Duration = Duration::from_secs(8);
 
+/// Where a respawn service's output goes when its file names no `log =`.
+/// `/tmp`, like every `log =` the images ship: a tmpfs, so it costs no disk
+/// and is empty again on the next boot.
+const DEFAULT_LOG_DIR: &str = "/tmp";
+
 /// Compositor GPU-renderer fallback. With `nvidia.nouveau_uapi` on an NVIDIA
 /// GPU the session defaults to GLES2/zink (real GPU). That path can die when a
 /// client's EXEC wedges the GPU channel: the compositor is context 0, a
@@ -187,6 +192,27 @@ struct Service {
     /// Current restart delay for a crashing respawn service; grows on repeated
     /// fast exits, resets once the service stays up past [`HEALTHY_UPTIME`].
     backoff: Duration,
+    /// Earliest instant this service may be started again, set when it exits.
+    ///
+    /// A DEADLINE and not a sleep: the backoff used to be served by blocking
+    /// PID 1 in `nanosleep` right after reaping the crasher, which stopped it
+    /// reaping anything else for the length of the backoff. The uptime of
+    /// every other service that died during that window was then measured to
+    /// the moment it was finally REAPED, so a service that failed `execve` and
+    /// `_exit(127)`ed in a millisecond was credited with the whole backoff,
+    /// read as "stayed up past HEALTHY_UPTIME", restarted at once and had its
+    /// own backoff reset -- for ever. Seen on hardware as a console filling
+    /// with, over and over:
+    ///
+    /// ```text
+    /// respawn: dbus-system exited after 46.334126ms (exit 127, crash), retry in 8s
+    /// respawn: oopslog exited after 8.049671271s (exit 127), restarting
+    /// ```
+    ///
+    /// where `oopslog` is an infinite `while :; do ... sleep 10; done` loop
+    /// that cannot run for 8 s and exit 127: the 8.049 s is `dbus-system`'s
+    /// 8 s backoff plus the 49 ms `oopslog` actually lived.
+    restart_at: Option<Instant>,
 }
 
 /// Default environment handed to every service (and inherited by their
@@ -985,6 +1011,21 @@ fn parse_service(name: &str, text: &str) -> Option<Service> {
     if exec.is_empty() {
         return None;
     }
+    // A supervised service with nowhere to write keeps its reason to itself.
+    // Its stdout/stderr go to /dev/null (see `silence_stdio`), so when it dies
+    // the only thing anybody has is the number on the console -- and the
+    // wrapper scripts' own diagnostics go to `/dev/console`, which the forked
+    // child may not be able to open at all. `oopslog.service` shipped with no
+    // `log =` and that is exactly how it went: `exit 127` on repeat with
+    // nothing anywhere saying which command was not found. Default one rather
+    // than leave the hole open for the next service file too; an explicit
+    // `log =` still wins, and a `log = /dev/null` still opts out.
+    //
+    // Respawn only: a oneshot runs once and its failure is reported by the
+    // boot step that waited for it.
+    if kind == Kind::Respawn && log_path.is_none() {
+        log_path = Some(format!("{DEFAULT_LOG_DIR}/{name}.log"));
+    }
     Some(Service {
         name: name.to_string(),
         exec,
@@ -998,6 +1039,7 @@ fn parse_service(name: &str, text: &str) -> Option<Service> {
         pid: None,
         started_at: None,
         backoff: MIN_BACKOFF,
+        restart_at: None,
     })
 }
 
@@ -1181,6 +1223,7 @@ fn start_service(svc: &mut Service) {
             log(&format!("respawn: {} (starting)", svc.name));
             svc.pid = spawn(&svc.exec, svc.log.as_deref());
             svc.started_at = Some(Instant::now());
+            svc.restart_at = None;
         }
     }
 }
@@ -1762,9 +1805,14 @@ unsafe fn silence_stdio(log_path: Option<&str>) {
     }
 }
 
-/// The PID 1 main loop: block in `waitpid`, reaping every child. A reaped
-/// `respawn` service is restarted; orphans reparented to init are simply
-/// reaped. A pending shutdown/reboot signal breaks out to `shutdown`.
+/// The PID 1 main loop: reap every child, restarting the `respawn` services;
+/// orphans reparented to init are simply reaped. A pending shutdown/reboot
+/// signal breaks out to `shutdown`.
+///
+/// Blocks in `waitpid` while nothing is backing off, and polls only while a
+/// crashed service is waiting out its [`Service::restart_at`] deadline — the
+/// loop must stay able to reap during a backoff, or every other service's
+/// uptime is measured to the end of that backoff instead of to its own death.
 fn supervise(services: &mut BTreeMap<String, Service>) {
     loop {
         if WANT_HALT.load(Ordering::SeqCst) {
@@ -1774,9 +1822,40 @@ fn supervise(services: &mut BTreeMap<String, Service>) {
             return shutdown(true, services);
         }
 
+        // The nearest backoff deadline still in the future, if any. It decides
+        // whether this iteration may block: with one pending, a blocking
+        // `waitpid` would sit there until some OTHER child happened to die and
+        // the crashed service would never be restarted at all.
+        let now = Instant::now();
+        let next_due = services
+            .values()
+            .filter(|s| s.kind == Kind::Respawn && s.pid.is_none())
+            .filter_map(|s| s.restart_at)
+            .filter(|t| *t > now)
+            .min();
+
         let mut status = 0;
-        // SAFETY: blocking wait for any child.
-        let pid = unsafe { libc::waitpid(-1, &mut status, 0) };
+        // SAFETY: wait for any child; non-blocking while a backoff is pending.
+        let pid = unsafe {
+            libc::waitpid(
+                -1,
+                &mut status,
+                if next_due.is_some() { libc::WNOHANG } else { 0 },
+            )
+        };
+        if pid == 0 {
+            // WNOHANG: nothing has exited yet. Sleep at most to the nearest
+            // deadline, capped so a shutdown signal is still answered promptly,
+            // then run the restart pass.
+            if let Some(due) = next_due {
+                sleep_interruptible(
+                    due.saturating_duration_since(Instant::now())
+                        .min(POLL_SLICE),
+                );
+            }
+            restart_due(services);
+            continue;
+        }
         if pid < 0 {
             let err = errno();
             if err == libc::EINTR {
@@ -1784,9 +1863,19 @@ fn supervise(services: &mut BTreeMap<String, Service>) {
                 continue;
             }
             if err == libc::ECHILD {
-                // No children to wait on: pause until the next signal so we are
-                // not a busy loop. Returns on EINTR (a delivered signal).
-                unsafe { libc::pause() };
+                // No children to wait on. With a backoff pending that is the
+                // normal state (the crasher was the last child), so wait it out
+                // and restart; otherwise pause until the next signal so we are
+                // not a busy loop. `pause` returns on EINTR.
+                if let Some(due) = next_due {
+                    sleep_interruptible(
+                        due.saturating_duration_since(Instant::now())
+                            .min(POLL_SLICE),
+                    );
+                    restart_due(services);
+                } else {
+                    unsafe { libc::pause() };
+                }
                 continue;
             }
             // Unexpected: avoid spinning.
@@ -1794,10 +1883,9 @@ fn supervise(services: &mut BTreeMap<String, Service>) {
             continue;
         }
 
-        // Did a supervised respawn service just exit? Decide its restart delay,
-        // then clear its pid; a single restart pass below respawns it. Splitting
-        // "decide" from "restart" keeps the mutable borrow off the sleep.
-        let mut delay = Duration::ZERO;
+        // Did a supervised respawn service just exit? Decide its restart
+        // deadline and clear its pid; the restart pass below respawns it once
+        // the deadline has passed.
         if let Some(svc) = services.values_mut().find(|s| s.pid == Some(pid)) {
             let uptime = svc.started_at.map(|t| t.elapsed()).unwrap_or_default();
             svc.pid = None;
@@ -1806,7 +1894,18 @@ fn supervise(services: &mut BTreeMap<String, Service>) {
             // `signal 9`, and this line is the only record on a console-only
             // box. Uses libc's status decoding so a signal death is named.
             let how = if libc::WIFEXITED(status) {
-                format!("exit {}", libc::WEXITSTATUS(status))
+                let code = libc::WEXITSTATUS(status);
+                let mut how = format!("exit {code}{}", exit_note(code));
+                // Those two codes are the ones a reader can actually chase, and
+                // the service's own output is where the name of the missing
+                // command is. Say where it landed, on the line that reports the
+                // death, or the reader has to know that `log =` exists at all.
+                if !exit_note(code).is_empty() {
+                    if let Some(path) = &svc.log {
+                        how.push_str(&format!("; see {path}"));
+                    }
+                }
+                how
             } else if libc::WIFSIGNALED(status) {
                 format!("signal {}", libc::WTERMSIG(status))
             } else {
@@ -1846,7 +1945,7 @@ fn supervise(services: &mut BTreeMap<String, Service>) {
             }
             let (wait, next) = restart_delay(uptime, svc.backoff);
             svc.backoff = next;
-            delay = wait;
+            svc.restart_at = Some(Instant::now() + wait);
             if wait.is_zero() {
                 log(&format!(
                     "respawn: {} exited after {:?} ({}), restarting",
@@ -1855,36 +1954,76 @@ fn supervise(services: &mut BTreeMap<String, Service>) {
             } else {
                 log(&format!(
                     "respawn: {} exited after {:?} ({}, crash), retry in {:?}",
-                    svc.name, uptime, how, delay
+                    svc.name, uptime, how, wait
                 ));
             }
         }
         // Otherwise it was a oneshot's leftover or a reparented orphan: reaped.
-        if !delay.is_zero() {
-            // Interruptible by a shutdown signal; if one arrived, honour it
-            // instead of respawning. Otherwise fall through to the restart pass
-            // (NOT `continue`: with no other children the next waitpid would
-            // ECHILD-pause and the backed-off service would never come back).
-            sleep_interruptible(delay);
-            if WANT_HALT.load(Ordering::SeqCst) || WANT_REBOOT.load(Ordering::SeqCst) {
-                continue;
-            }
-        }
-        // Restart pass: any respawn service now without a live pid is restarted
-        // through the normal launcher so crash-restarts re-apply wait_socket /
-        // wait_path gates exactly like the first boot start.
-        // Walk in dependency order (`after =`), not BTreeMap alphabetical
-        // order: "labwc" < "seatd", so a crash of both restarted labwc first,
-        // which then parked ~10 s on the seatd socket gate (or launched
-        // against a dead seatd and crashed again) before seatd was retried.
-        for name in ordered_names(services) {
-            if let Some(svc) = services.get_mut(&name) {
-                if svc.kind == Kind::Respawn && svc.pid.is_none() {
-                    start_service(svc);
-                }
-            }
+        restart_due(services);
+    }
+}
+
+/// What a bare exit code means when it is one of the two the shell reserves,
+/// as a suffix for the supervisor's line (empty for every other code).
+///
+/// A respawn service's stdio is `/dev/null` unless its file sets `log =`, so
+/// for most of them the number on the console is ALL there is -- and 126/127
+/// are the two numbers that are not the program's own opinion but a report
+/// that it never ran. Spelling them out is the difference between "it keeps
+/// exiting 127" and a reader who knows to go looking for a missing command
+/// inside the wrapper script.
+fn exit_note(code: i32) -> &'static str {
+    match code {
+        // `execve` failed for the program itself, or a command the wrapper
+        // script ran was not found. `exec_problem` names the first case at
+        // start time; nothing can name the second from out here.
+        127 => " -- command not found, or execve failed",
+        // Found but not runnable: no x bit, or a bad interpreter line.
+        126 => " -- found but not executable",
+        _ => "",
+    }
+}
+
+/// How long the loop may sleep in one go while waiting out a backoff. Short
+/// enough that a shutdown signal and a child that dies meanwhile are both
+/// noticed promptly; long enough that PID 1 costs nothing while it waits.
+const POLL_SLICE: Duration = Duration::from_millis(50);
+
+/// Restart every respawn service that has no live child and whose backoff
+/// deadline has passed.
+///
+/// Through the normal launcher, so crash-restarts re-apply the wait_socket /
+/// wait_path gates exactly like the first boot start. Walks in dependency
+/// order (`after =`), not BTreeMap alphabetical order: "labwc" < "seatd", so a
+/// crash of both restarted labwc first, which then parked ~10 s on the seatd
+/// socket gate (or launched against a dead seatd and crashed again) before
+/// seatd was retried.
+fn restart_due(services: &mut BTreeMap<String, Service>) {
+    if WANT_HALT.load(Ordering::SeqCst) || WANT_REBOOT.load(Ordering::SeqCst) {
+        return;
+    }
+    for name in due_names(services, Instant::now()) {
+        if let Some(svc) = services.get_mut(&name) {
+            start_service(svc);
         }
     }
+}
+
+/// Which respawn services are due to be (re)started at `now`, in dependency
+/// order: those with no live child whose backoff deadline has passed.
+///
+/// Split out of [`restart_due`], which forks, so the policy can be tested.
+fn due_names(services: &BTreeMap<String, Service>, now: Instant) -> Vec<String> {
+    ordered_names(services)
+        .into_iter()
+        .filter(|name| {
+            services.get(name).is_some_and(|svc| {
+                svc.kind == Kind::Respawn
+                    && svc.pid.is_none()
+                    && svc.restart_at.is_none_or(|t| t <= now)
+            })
+        })
+        .collect()
 }
 
 /// How long to wait before restarting a respawn service that just exited, and
@@ -2304,6 +2443,107 @@ mod tests {
             text.push_str(&format!("after = {}\n", after.join(" ")));
         }
         parse_service(name, &text).expect("parsea")
+    }
+
+    /// The backoff is a deadline per service, not a sleep in PID 1, so a
+    /// service that is waiting one out does not hold back the loop -- and,
+    /// above all, does not stop it reaping anyone else.
+    ///
+    /// The bug: the loop used to `nanosleep` the backoff right after reaping
+    /// the crasher. Every other child that died during that window was reaped
+    /// only afterwards, and `uptime` is measured at the reap, so a service
+    /// that failed `execve` and `_exit(127)`ed in a millisecond was credited
+    /// with the whole backoff, judged healthy, restarted at once and had its
+    /// own backoff reset -- for ever. On hardware that was
+    /// `oopslog exited after 8.049671271s (exit 127), restarting`, over and
+    /// over, for a script that is an infinite loop and cannot exit at all.
+    #[test]
+    fn a_service_waiting_out_its_backoff_does_not_hold_back_the_others() {
+        let mut map = BTreeMap::new();
+        for name in ["crasher", "other"] {
+            map.insert(
+                name.to_string(),
+                parse_service(name, "exec = /bin/true\ntype = respawn\n").expect("parsea"),
+            );
+        }
+        let now = Instant::now();
+        map.get_mut("crasher").unwrap().restart_at = Some(now + Duration::from_secs(8));
+
+        let due = due_names(&map, now);
+        assert!(
+            !due.contains(&"crasher".to_string()),
+            "un servicio en su backoff se reinicio antes de tiempo: {due:?}"
+        );
+        assert!(
+            due.contains(&"other".to_string()),
+            "el backoff de otro servicio retuvo a este: {due:?}"
+        );
+
+        // And once the deadline has passed it comes back by itself.
+        let due = due_names(&map, now + Duration::from_secs(8));
+        assert!(
+            due.contains(&"crasher".to_string()),
+            "el servicio no volvio nunca tras su backoff: {due:?}"
+        );
+    }
+
+    /// 126 and 127 are the only exit codes that are not the program's opinion
+    /// but a report that it never ran, and a respawn service's stdio is
+    /// `/dev/null` unless its file sets `log =` -- so the number on the
+    /// console is all a reader gets.
+    #[test]
+    fn the_two_codes_that_mean_the_program_never_ran_are_spelled_out() {
+        assert!(
+            exit_note(127).contains("command not found"),
+            "127 no dice que el programa no llego a correr: {:?}",
+            exit_note(127)
+        );
+        assert!(
+            exit_note(126).contains("not executable"),
+            "126 no dice que no se pudo ejecutar: {:?}",
+            exit_note(126)
+        );
+        for code in [0, 1, 2, 125, 128, 255] {
+            assert_eq!(exit_note(code), "", "exit {code} no necesita nota");
+        }
+    }
+
+    /// A supervised service with no `log =` used to write its output into
+    /// `/dev/null`, so when it died the number on the console was everything
+    /// anybody had. `oopslog.service` shipped exactly like that and spent a
+    /// whole boot repeating `exit 127` with the name of the missing command
+    /// nowhere on the machine.
+    #[test]
+    fn a_respawn_service_without_a_log_gets_one_rather_than_dev_null() {
+        let defaulted = parse_service(
+            "oopslog",
+            "exec = /usr/local/bin/eclipse-oopslog\ntype = respawn\n",
+        )
+        .expect("parsea");
+        assert_eq!(
+            defaulted.log.as_deref(),
+            Some("/tmp/oopslog.log"),
+            "un servicio respawn sin `log =` sigue escribiendo a /dev/null"
+        );
+
+        // An explicit one still wins, including the opt-out.
+        let explicit = parse_service(
+            "dbus-system",
+            "exec = /usr/local/bin/eclipse-dbus-system\ntype = respawn\nlog = /tmp/dbus-system.log\n",
+        )
+        .expect("parsea");
+        assert_eq!(explicit.log.as_deref(), Some("/tmp/dbus-system.log"));
+        let opted_out = parse_service(
+            "quiet",
+            "exec = /bin/true\ntype = respawn\nlog = /dev/null\n",
+        )
+        .expect("parsea");
+        assert_eq!(opted_out.log.as_deref(), Some("/dev/null"));
+
+        // A oneshot keeps none: it runs once and the boot step that waited for
+        // it is what reports its failure.
+        let once = parse_service("once", "exec = /bin/true\n").expect("parsea");
+        assert_eq!(once.log, None, "un oneshot no necesita fichero propio");
     }
 
     fn order_of(defs: &[(&str, &[&str])]) -> Vec<String> {
