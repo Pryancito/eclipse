@@ -1422,6 +1422,59 @@ static double kstat_per_op(const char *label, int idx, double ops) {
     return d / ops;
 }
 
+// Join `t`, but only once it has actually finished; otherwise abandon it.
+//
+// Every wait in this section is bounded three ways, and then the probes
+// joined unconditionally -- which is just another unbounded wait on a
+// scheduler that may never run the thread again. On a kernel where a starved
+// thread never observes `stop`, `pthread_join` blocks and the suite sits on
+// one row with every later row unmeasured. Detaching instead lets the thread
+// be reclaimed if it ever does finish, costs this probe its number, and lets
+// the run continue. Returns 0 when the thread was abandoned.
+static int join_or_abandon(pthread_t t, const volatile int *done,
+                           unsigned secs) {
+    // Timed off the clock, not off a count of sleeps. The watchdog in this
+    // section installs SIGALRM deliberately WITHOUT SA_RESTART, so a
+    // nanosleep() here can come back early with EINTR -- and counting sleeps
+    // would then abandon a thread that still had most of its grace period
+    // left, turning a slow kernel into a missing row.
+    uint64_t deadline = now_ns() + (uint64_t)secs * 1000000000ull;
+    for (;;) {
+        if (__atomic_load_n(done, __ATOMIC_ACQUIRE)) {
+            pthread_join(t, NULL);
+            return 1;
+        }
+        if (now_ns() >= deadline)
+            break;
+        struct timespec tick = {0, 10 * 1000 * 1000}; // 10 ms
+        nanosleep(&tick, NULL);
+    }
+    pthread_detach(t);
+    return 0;
+}
+
+// A control block a probe shares with threads it may have to abandon.
+//
+// `join_or_abandon` can return while a worker is still running, so the block
+// that worker writes through must NOT be the caller's stack frame: the suite
+// puts the next probe's locals there, and a stray store would poison every
+// later row while reporting a number -- the exact failure mode this section
+// exists to detect, arriving silently from the measuring tool instead. So the
+// block goes on the heap and is reference-counted: every thread handed it
+// drops one reference when it exits, the probe drops its own once it has
+// copied the figures out, and whoever drops the last one frees it.
+//
+// Each such struct carries `int refs`, set to 1 by the probe that allocates it.
+// Taken BEFORE pthread_create, so a thread that exits at once cannot drop the
+// count to zero before its reference has been accounted for; given back when
+// the create fails.
+#define CTL_LEND(c) __atomic_fetch_add(&(c)->refs, 1, __ATOMIC_RELAXED)
+#define CTL_DROP(c)                                                           \
+    do {                                                                      \
+        if (__atomic_sub_fetch(&(c)->refs, 1, __ATOMIC_ACQ_REL) == 0)          \
+            free(c);                                                          \
+    } while (0)
+
 // Wait for a start gate without using sched_yield().
 //
 // Every gate in this section used to yield, and the yield hand-off probe above
@@ -1434,7 +1487,7 @@ static double kstat_per_op(const char *label, int idx, double ops) {
 static void gate_wait(const volatile int *go, const volatile int *stop) {
     struct timespec tick = {0, 50 * 1000}; // 50 us
     uint64_t rounds = 0;
-    while (!*go) {
+    while (!__atomic_load_n(go, __ATOMIC_ACQUIRE)) {
         if (stop && *stop)
             return;
         nanosleep(&tick, NULL);
@@ -1460,6 +1513,7 @@ static void gate_wait(const volatile int *go, const volatile int *stop) {
 // and only the pair says which.
 
 struct parity_ctl {
+    int refs;
     volatile int go;
     volatile int stop;
     volatile uint64_t spins;   // spinner's completed work units
@@ -1469,6 +1523,8 @@ struct parity_ctl {
     int cpu;
     unsigned period_us;
     volatile int pin_failed;
+    volatile int spinner_done;
+    volatile int waker_done;
 };
 
 static void *parity_spinner(void *arg) {
@@ -1486,6 +1542,8 @@ static void *parity_spinner(void *arg) {
     }
     g_sink += x;
     c->spins = n;
+    __atomic_store_n(&c->spinner_done, 1, __ATOMIC_RELEASE);
+    CTL_DROP(c);
     return NULL;
 }
 
@@ -1512,6 +1570,8 @@ static void *parity_waker(void *arg) {
     c->wakes = n;
     c->late_sum_ns = sum;
     c->late_max_ns = mx;
+    __atomic_store_n(&c->waker_done, 1, __ATOMIC_RELEASE);
+    CTL_DROP(c);
     return NULL;
 }
 
@@ -1521,43 +1581,64 @@ static void *parity_waker(void *arg) {
 static double parity_run(int cpu, unsigned period_us, uint64_t budget_ns,
                          double *wake_hz, double *late_mean_us,
                          double *late_max_us) {
-    struct parity_ctl c;
-    memset(&c, 0, sizeof c);
-    c.cpu = cpu;
-    c.period_us = period_us;
-    pthread_t sp, wk;
-    if (pthread_create(&sp, NULL, parity_spinner, &c) != 0)
+    struct parity_ctl *c = calloc(1, sizeof *c);
+    if (!c)
         return NA;
+    c->refs = 1;
+    c->cpu = cpu;
+    c->period_us = period_us;
+    pthread_t sp, wk;
+    CTL_LEND(c);
+    if (pthread_create(&sp, NULL, parity_spinner, c) != 0) {
+        CTL_DROP(c); // the spinner's reference back
+        CTL_DROP(c); // and ours
+        return NA;
+    }
     int have_waker = 0;
     if (period_us > 0) {
-        if (pthread_create(&wk, NULL, parity_waker, &c) == 0)
+        CTL_LEND(c);
+        if (pthread_create(&wk, NULL, parity_waker, c) == 0)
             have_waker = 1;
+        else
+            CTL_DROP(c);
     }
     // Let both threads reach their gate and be placed before timing starts.
     struct timespec settle = {0, 30 * 1000 * 1000};
     nanosleep(&settle, NULL);
     uint64_t t0 = now_ns();
-    c.go = 1;
+    __atomic_store_n(&c->go, 1, __ATOMIC_RELEASE);
     uint64_t ns = budget_ns < g_max_ns ? budget_ns : g_max_ns;
     struct timespec run = {(time_t)(ns / 1000000000ull),
                            (long)(ns % 1000000000ull)};
     nanosleep(&run, NULL);
-    c.stop = 1;
-    pthread_join(sp, NULL);
-    if (have_waker)
-        pthread_join(wk, NULL);
+    c->stop = 1;
+    // A spinner that is still inside its loop has already published its count
+    // (it is bumped as it goes), and a waker that never gets the CPU again
+    // must not take the run with it.
+    int sp_ok = join_or_abandon(sp, &c->spinner_done, 10);
+    int wk_ok = have_waker ? join_or_abandon(wk, &c->waker_done, 10) : 1;
     uint64_t dt = now_ns() - t0;
-    if (c.pin_failed || dt == 0 || c.spins == 0)
-        return NA;
-    if (wake_hz)
-        *wake_hz = have_waker ? (double)c.wakes * 1e9 / (double)dt : NA;
-    if (late_mean_us)
-        *late_mean_us = (have_waker && c.wakes)
-                            ? (double)c.late_sum_ns / (double)c.wakes / 1000.0
-                            : NA;
-    if (late_max_us)
-        *late_max_us = have_waker ? (double)c.late_max_ns / 1000.0 : NA;
-    return (double)c.spins * 1e9 / (double)dt;
+    double out = NA;
+    if (!c->pin_failed && dt != 0 && c->spins != 0 && sp_ok) {
+        out = (double)c->spins * 1e9 / (double)dt;
+        // The spinner's figure stands -- it is what the probe is for -- but an
+        // abandoned waker never published its own numbers, so they stay n/a
+        // rather than being read out from under a thread still writing them.
+        int wk_num = have_waker && wk_ok;
+        if (wake_hz)
+            *wake_hz = wk_num ? (double)c->wakes * 1e9 / (double)dt : NA;
+        if (late_mean_us)
+            *late_mean_us = (wk_num && c->wakes)
+                                ? (double)c->late_sum_ns / (double)c->wakes /
+                                      1000.0
+                                : NA;
+        if (late_max_us)
+            *late_max_us = wk_num ? (double)c->late_max_ns / 1000.0 : NA;
+    }
+    // Every figure is now a local, so the block can go the moment the last
+    // thread still holding it exits.
+    CTL_DROP(c);
+    return out;
 }
 
 // --- slice remainder (EEVDF lag) -------------------------------------------
@@ -1580,6 +1661,7 @@ static double parity_run(int cpu, unsigned period_us, uint64_t budget_ns,
 // legitimately complete without ever yielding.
 
 struct lag_ctl {
+    int refs;
     volatile int go;
     volatile int stop;
     volatile uint64_t plain;
@@ -1588,6 +1670,8 @@ struct lag_ctl {
     uint64_t spin_ns;   // how long the parking thread runs between parks
     unsigned park_us;
     volatile int pin_failed;
+    volatile int plain_done;
+    volatile int parker_done;
 };
 
 // Spin for `ns` of wall clock. Time-based, not iteration-based, so the shape
@@ -1618,6 +1702,8 @@ static void *lag_plain(void *arg) {
     }
     g_sink += x;
     c->plain = n;
+    __atomic_store_n(&c->plain_done, 1, __ATOMIC_RELEASE);
+    CTL_DROP(c);
     return NULL;
 }
 
@@ -1633,6 +1719,8 @@ static void *lag_parker(void *arg) {
         nanosleep(&ts, NULL);
     }
     c->parker = n;
+    __atomic_store_n(&c->parker_done, 1, __ATOMIC_RELEASE);
+    CTL_DROP(c);
     return NULL;
 }
 
@@ -1642,38 +1730,53 @@ static double lag_share(int cpu, uint64_t spin_ns, unsigned park_us,
                         uint64_t budget_ns, double *parker_share) {
     if (parker_share)
         *parker_share = NA;
-    struct lag_ctl c;
-    memset(&c, 0, sizeof c);
-    c.cpu = cpu;
-    c.spin_ns = spin_ns;
-    c.park_us = park_us;
-    pthread_t a, b;
-    if (pthread_create(&a, NULL, lag_plain, &c) != 0)
+    struct lag_ctl *c = calloc(1, sizeof *c);
+    if (!c)
         return NA;
-    if (pthread_create(&b, NULL, lag_parker, &c) != 0) {
-        c.go = c.stop = 1;
-        pthread_join(a, NULL);
+    c->refs = 1;
+    c->cpu = cpu;
+    c->spin_ns = spin_ns;
+    c->park_us = park_us;
+    pthread_t a, b;
+    CTL_LEND(c);
+    if (pthread_create(&a, NULL, lag_plain, c) != 0) {
+        CTL_DROP(c);
+        CTL_DROP(c);
+        return NA;
+    }
+    CTL_LEND(c);
+    if (pthread_create(&b, NULL, lag_parker, c) != 0) {
+        CTL_DROP(c); // the parker's reference back
+        __atomic_store_n(&c->stop, 1, __ATOMIC_RELEASE);
+        __atomic_store_n(&c->go, 1, __ATOMIC_RELEASE);
+        join_or_abandon(a, &c->plain_done, 10);
+        CTL_DROP(c);
         return NA;
     }
     struct timespec settle = {0, 30 * 1000 * 1000};
     nanosleep(&settle, NULL);
-    c.go = 1;
+    __atomic_store_n(&c->go, 1, __ATOMIC_RELEASE);
     uint64_t ns = budget_ns < g_max_ns ? budget_ns : g_max_ns;
     struct timespec run = {(time_t)(ns / 1000000000ull),
                            (long)(ns % 1000000000ull)};
     nanosleep(&run, NULL);
-    c.stop = 1;
-    pthread_join(a, NULL);
-    pthread_join(b, NULL);
-    if (c.pin_failed)
-        return NA;
-    uint64_t total = c.plain + c.parker;
-    if (total == 0)
-        return NA;
-    // x2 so an even split reads 1.00 rather than 0.50.
-    if (parker_share)
-        *parker_share = (double)c.parker / (double)total * 2.0;
-    return (double)c.plain / (double)total * 2.0;
+    c->stop = 1;
+    int a_ok = join_or_abandon(a, &c->plain_done, 10);
+    int b_ok = join_or_abandon(b, &c->parker_done, 10);
+    double out = NA;
+    // Both halves are needed: a share computed from one published count and
+    // one still being written is not a share of anything.
+    if (a_ok && b_ok && !c->pin_failed) {
+        uint64_t total = c->plain + c->parker;
+        if (total) {
+            // x2 so an even split reads 1.00 rather than 0.50.
+            if (parker_share)
+                *parker_share = (double)c->parker / (double)total * 2.0;
+            out = (double)c->plain / (double)total * 2.0;
+        }
+    }
+    CTL_DROP(c);
+    return out;
 }
 
 // --- work stealing ---------------------------------------------------------
@@ -1703,6 +1806,7 @@ struct steal_ctl {
     // report half the machine idle.
     uint64_t seen_mask;
     int ncpu;
+    volatile int live;   // workers still running
 };
 static struct steal_ctl g_steal;
 
@@ -1725,6 +1829,7 @@ static void *steal_worker(void *arg) {
             __atomic_fetch_or(&c->seen_mask, 1ull << cpu, __ATOMIC_RELAXED);
     }
     g_sink += x;
+    __atomic_sub_fetch(&c->live, 1, __ATOMIC_RELAXED);
     return NULL;
 }
 
@@ -1750,8 +1855,13 @@ static int steal_spread_us(int n, int spawn_cpu, uint64_t budget_ns,
     if (smpk_pin_self(spawn_cpu) != 0)
         return -1;
     for (int i = 0; i < n; i++) {
-        if (pthread_create(&th[i], NULL, steal_worker, &g_steal) != 0)
+        // Counted up BEFORE the thread exists: a worker that decrements on
+        // exit must never be able to drive the count negative early.
+        __atomic_add_fetch(&g_steal.live, 1, __ATOMIC_RELAXED);
+        if (pthread_create(&th[i], NULL, steal_worker, &g_steal) != 0) {
+            __atomic_sub_fetch(&g_steal.live, 1, __ATOMIC_RELAXED);
             break;
+        }
         made++;
     }
     // Release the parent before the workers run: a parent still holding the
@@ -1763,9 +1873,24 @@ static int steal_spread_us(int n, int spawn_cpu, uint64_t budget_ns,
         CPU_SET(i, &all);
     pthread_setaffinity_np(pthread_self(), sizeof all, &all);
     if (made < 2) {
-        g_steal.go = g_steal.stop = 1;
-        for (int i = 0; i < made; i++)
-            pthread_join(th[i], NULL);
+        g_steal.stop = 1;
+        __atomic_store_n(&g_steal.go, 1, __ATOMIC_RELEASE);
+        // Give the one worker a bounded chance to observe `stop` and exit
+        // before the suite moves on. A worker still spinning here is one more
+        // runnable CPU-bound task competing with whatever row comes next, and
+        // that row would read low for a reason that has nothing to do with it.
+        for (unsigned k = 0; k < 1000u; k++) {
+            if (__atomic_load_n(&g_steal.live, __ATOMIC_RELAXED) <= 0)
+                break;
+            struct timespec tick = {0, 10 * 1000 * 1000};
+            nanosleep(&tick, NULL);
+        }
+        for (int i = 0; i < made; i++) {
+            if (__atomic_load_n(&g_steal.live, __ATOMIC_RELAXED) <= 0)
+                pthread_join(th[i], NULL);
+            else
+                pthread_detach(th[i]);
+        }
         return -1;
     }
     uint64_t ns = budget_ns < g_max_ns ? budget_ns : g_max_ns;
@@ -1783,8 +1908,20 @@ static int steal_spread_us(int n, int spawn_cpu, uint64_t budget_ns,
         nanosleep(&tick, NULL);
     }
     g_steal.stop = 1;
-    for (int i = 0; i < made; i++)
-        pthread_join(th[i], NULL);
+    // The mask is already published; a worker the kernel will not run again
+    // must not hold the suite.
+    for (unsigned k = 0; k < 1000u; k++) {
+        if (__atomic_load_n(&g_steal.live, __ATOMIC_RELAXED) <= 0)
+            break;
+        struct timespec tick = {0, 10 * 1000 * 1000};
+        nanosleep(&tick, NULL);
+    }
+    for (int i = 0; i < made; i++) {
+        if (__atomic_load_n(&g_steal.live, __ATOMIC_RELAXED) <= 0)
+            pthread_join(th[i], NULL);
+        else
+            pthread_detach(th[i]);
+    }
     if (occupied)
         *occupied =
             popcount64(__atomic_load_n(&g_steal.seen_mask, __ATOMIC_RELAXED));
@@ -1886,12 +2023,14 @@ static int watchdog_set(unsigned secs) {
 // dispatch, and the difference is the pipe and the wake.
 
 struct yield_ctl {
+    int refs;
     volatile int go;
     volatile int stop;
     volatile uint64_t turn;   // whose turn it is: 0 = a, 1 = b
     volatile uint64_t ops;
     int cpu;
     volatile int pin_failed;
+    volatile int peer_done;
 };
 
 static void *yield_peer(void *arg) {
@@ -1904,13 +2043,20 @@ static void *yield_peer(void *arg) {
         spins = 0;
         while (c->turn != 1 && !c->stop) {
             sched_yield();
-            if (++spins > YIELD_CAP)
+            if (++spins > YIELD_CAP) {
+                // Give up without claiming to be done -- the probe reads
+                // `peer_done` to decide whether it may trust the block -- but
+                // hand the reference back, or nothing ever frees it.
+                CTL_DROP(c);
                 return NULL;
+            }
         }
         if (c->stop)
             break;
         c->turn = 0;
     }
+    __atomic_store_n(&c->peer_done, 1, __ATOMIC_RELEASE);
+    CTL_DROP(c);
     return NULL;
 }
 
@@ -1923,21 +2069,27 @@ static void *yield_peer(void *arg) {
 static double yield_handoff_ns(int cpu, uint64_t budget_ns, const char **why) {
     if (why)
         *why = NULL;
-    struct yield_ctl c;
-    memset(&c, 0, sizeof c);
-    c.cpu = cpu;
+    struct yield_ctl *c = calloc(1, sizeof *c);
+    if (!c)
+        return NA;
+    c->refs = 1;
+    c->cpu = cpu;
     if (smpk_pin_self(cpu) != 0) {
         if (why) *why = "this kernel would not pin a thread to one CPU";
+        CTL_DROP(c);
         return NA;
     }
     pthread_t t;
-    if (pthread_create(&t, NULL, yield_peer, &c) != 0) {
+    CTL_LEND(c);
+    if (pthread_create(&t, NULL, yield_peer, c) != 0) {
         if (why) *why = "could not create the peer thread";
+        CTL_DROP(c);
+        CTL_DROP(c);
         return NA;
     }
     struct timespec settle = {0, 20 * 1000 * 1000};
     nanosleep(&settle, NULL);
-    c.go = 1;
+    __atomic_store_n(&c->go, 1, __ATOMIC_RELEASE);
     uint64_t t0 = now_ns(), elapsed = 0, ops = 0;
     uint64_t ns = budget_ns < g_max_ns ? budget_ns : g_max_ns;
     // Armed ONCE, around the whole loop, and generously: the alarm is a
@@ -1947,11 +2099,11 @@ static double yield_handoff_ns(int cpu, uint64_t budget_ns, const char **why) {
     g_watchdog_fired = 0;
     watchdog_set((unsigned)(ns / 1000000000ull) + 30);
     while (elapsed < ns || ops < MIN_SAMPLES) {
-        c.turn = 1;
+        c->turn = 1;
         uint64_t guard = now_ns() + 2000000000ull;
         uint64_t spins = 0;
         const char *bound = NULL;
-        while (c.turn != 0) {
+        while (c->turn != 0) {
             sched_yield();
             if (++spins > YIELD_CAP) {
                 // The yield count ran out while the clock said there was time
@@ -1975,9 +2127,12 @@ static double yield_handoff_ns(int cpu, uint64_t budget_ns, const char **why) {
             if (why)
                 *why = bound;
             watchdog_set(0);
-            c.stop = 1;
-            c.turn = 0;
-            pthread_join(t, NULL);
+            c->stop = 1;
+            c->turn = 0;
+            // The peer may be the thread the kernel is not running; do not
+            // wait on it indefinitely to confirm that.
+            join_or_abandon(t, &c->peer_done, 5);
+            CTL_DROP(c);
             return NA;
         }
         ops += 2;
@@ -1986,15 +2141,17 @@ static double yield_handoff_ns(int cpu, uint64_t budget_ns, const char **why) {
             break;
     }
     watchdog_set(0);
-    c.stop = 1;
-    c.turn = 1;
-    pthread_join(t, NULL);
+    c->stop = 1;
+    c->turn = 1;
+    join_or_abandon(t, &c->peer_done, 5);
     cpu_set_t all;
     CPU_ZERO(&all);
     for (int i = 0; i < g_aff_ncpu && i < CPU_SETSIZE; i++)
         CPU_SET(i, &all);
     pthread_setaffinity_np(pthread_self(), sizeof all, &all);
-    if (c.pin_failed) {
+    int pin_failed = c->pin_failed;
+    CTL_DROP(c);
+    if (pin_failed) {
         if (why) *why = "this kernel would not pin a thread to one CPU";
         return NA;
     }
@@ -2021,6 +2178,7 @@ struct wake_slot {
     int cpu;
     volatile int stop;
     volatile int pin_failed;
+    volatile int done_exit;
 };
 static struct wake_slot g_wake[WAKE_MAX];
 
@@ -2036,6 +2194,7 @@ static void *wake_sleeper(void *arg) {
         s->word = 0;
         s->done = 1;
     }
+    s->done_exit = 1;
     return NULL;
 }
 
@@ -2115,7 +2274,7 @@ static double wake_burst_ns(int m, int waker_cpu, int target_cpu,
         futex_op(&g_wake[i].word, ECL_FUTEX_WAKE, 1);
     }
     for (int i = 0; i < made; i++)
-        pthread_join(th[i], NULL);
+        join_or_abandon(th[i], &g_wake[i].done_exit, 5);
     cpu_set_t all;
     CPU_ZERO(&all);
     for (int i = 0; i < g_aff_ncpu && i < CPU_SETSIZE; i++)
@@ -2147,25 +2306,53 @@ struct ys_lane {
     volatile uint64_t count;
     const volatile int *stop;
     volatile int pin_failed;
+    // Set after the gate and before the first sched_yield(). Without it a
+    // count of zero cannot distinguish a thread that never ran at all from
+    // one that ran and then did not come back out of the call, and those are
+    // different bugs.
+    volatile int started;
+    volatile int pin_rc;       // what sched_setaffinity returned for this thread
+    volatile int cpu_seen;     // sched_getcpu() right after pinning
+    volatile int cpu_last;     // and the last one it observed
 };
 
+#define YS_MAX_NOTIFY 8
 struct ys_ctl {
     volatile int stop;
     volatile uint64_t notifies;
     struct ys_lane a, b;
+    volatile int notify_started;
+    // One slot per notifier rather than one shared field. Several notifier
+    // threads wrote the single `notify_cpu` concurrently, which is both a data
+    // race and a misleading row: it reported one placement for a group that
+    // may not share one.
+    volatile int notify_cpu[YS_MAX_NOTIFY];
     int nnotify;
 };
 static struct ys_ctl g_ys;
 
 static void *ys_yielder(void *arg) {
     struct ys_lane *l = arg;
-    if (smpk_pin_self(0) != 0)
+    // The reproducer confines the PARENT to CPU 0 before creating anything, so
+    // a child reporting a different CPU here means the affinity mask was not
+    // inherited across thread creation -- and a child reporting CPU 0 while
+    // making no progress means something else entirely. The number settles it;
+    // guessing from the outside does not.
+    l->pin_rc = smpk_pin_self(0);
+    if (l->pin_rc != 0)
         l->pin_failed = 1;
+    l->cpu_seen = sched_getcpu();
+    l->cpu_last = l->cpu_seen;
+    l->started = 1;
     while (!*l->stop) {
         sched_yield();
         // Bumped AFTER the call returns, so a count that stops advancing means
         // the call did not come back -- not that the loop was merely slow.
         l->count++;
+        // Cheap next to a syscall, and it says whether a thread that stopped
+        // progressing was sitting on the CPU it was pinned to.
+        if ((l->count & 0xfff) == 0)
+            l->cpu_last = sched_getcpu();
     }
     return NULL;
 }
@@ -2175,12 +2362,19 @@ static void *ys_notifier(void *arg) {
     if (smpk_pin_self(0) != 0)
         return NULL;
     // Short sleeps, on the same CPU as the yielders: each one ends in a timer
-    // wake, which is a NOTIFY arriving at that CPU. The notified lane is what
-    // the yielded lane has to wait behind.
+    // wake, which is a NOTIFY arriving at that CPU.
+    //
+    // Every counter here is shared with the other notifiers, so each is
+    // incremented atomically. A plain `++` from several threads loses
+    // increments, and this diagnostic decides whether a participant made
+    // progress -- a lost increment is a wrong verdict, not a rounding error.
+    int slot = __atomic_fetch_add(&c->notify_started, 1, __ATOMIC_RELAXED);
+    if (slot >= 0 && slot < YS_MAX_NOTIFY)
+        c->notify_cpu[slot] = sched_getcpu();
     struct timespec ts = {0, 200 * 1000}; // 200 us
     while (!c->stop) {
         nanosleep(&ts, NULL);
-        c->notifies++;
+        __atomic_fetch_add(&c->notifies, 1, __ATOMIC_RELAXED);
     }
     return NULL;
 }
@@ -3106,7 +3300,7 @@ int main(int argc, char **argv) {
         int nnotify = argc > 3 ? (int)strtol(argv[3], NULL, 10) : 1;
         if (secs < 1) secs = 1;
         if (nnotify < 0) nnotify = 0;
-        if (nnotify > 8) nnotify = 8;
+        if (nnotify > YS_MAX_NOTIFY) nnotify = YS_MAX_NOTIFY;
         long nc = sysconf(_SC_NPROCESSORS_ONLN);
         int ncpus = (nc > 0 && nc < 4096) ? (int)nc : 1;
         if (ncpus < 2) {
@@ -3147,13 +3341,15 @@ int main(int argc, char **argv) {
                "observer on CPU 1..%d; %d s\n", made_n, ncpus - 1, secs);
         printf("yieldstall: a yields/s of 0 while notifies keep arriving IS "
                "the bug\n");
+        int have_kstat = kstat_snapshot(g_kstat_a, sizeof g_kstat_a);
         uint64_t pa = 0, pb = 0, pn = 0;
-        uint64_t stall_a = 0, stall_b = 0;
+        uint64_t stall_a = 0, stall_b = 0, stall_n = 0;
         uint64_t t0 = now_ns();
         for (int s = 0; s < secs; s++) {
             struct timespec one = {1, 0};
             nanosleep(&one, NULL);
-            uint64_t ca = g_ys.a.count, cb = g_ys.b.count, cn = g_ys.notifies;
+            uint64_t ca = g_ys.a.count, cb = g_ys.b.count,
+                     cn = __atomic_load_n(&g_ys.notifies, __ATOMIC_RELAXED);
             uint64_t da = ca - pa, db = cb - pb, dn = cn - pn;
             double at = (double)(now_ns() - t0) / 1e9;
             printf("yieldstall %5.1fs: A %10llu/s  B %10llu/s  notifies %8llu/s\n",
@@ -3162,32 +3358,109 @@ int main(int argc, char **argv) {
             // First second in which a yielder made no progress at all while
             // the notifier did: that is the lane being starved, not the thread
             // merely running slowly.
-            if (da == 0 && dn > 0 && !stall_a) stall_a = (uint64_t)(at * 1000);
-            if (db == 0 && dn > 0 && !stall_b) stall_b = (uint64_t)(at * 1000);
+            // A participant is starved when it made no progress in a whole
+            // second while at least one OTHER participant on the same CPU
+            // did. That phrasing is deliberate: it catches a starved notifier
+            // just as well as a starved yielder, and it does not fire when
+            // the whole CPU simply stopped.
+            int others_ran = (da > 0) + (db > 0) + (dn > 0);
+            if (da == 0 && others_ran > 0 && !stall_a)
+                stall_a = (uint64_t)(at * 1000);
+            if (db == 0 && others_ran > 0 && !stall_b)
+                stall_b = (uint64_t)(at * 1000);
+            if (made_n > 0 && dn == 0 && others_ran > 0 && !stall_n)
+                stall_n = (uint64_t)(at * 1000);
             pa = ca; pb = cb; pn = cn;
         }
+        if (have_kstat)
+            have_kstat = kstat_snapshot(g_kstat_b, sizeof g_kstat_b);
         g_ys.stop = 1;
+        int participants = 2 + made_n;
+        int starved = (stall_a != 0) + (stall_b != 0) + (stall_n != 0);
         printf("yieldstall: verdict:\n");
-        if (stall_a || stall_b) {
-            printf("  STALLED. A first made no progress at %llu ms, B at "
-                   "%llu ms (0 = never stalled),\n"
-                   "  while notifies kept arriving at the same CPU. A yielder "
-                   "that stops\n  advancing under a notify stream is the "
-                   "yielded lane being starved.\n",
-                   (unsigned long long)stall_a, (unsigned long long)stall_b);
-        } else {
-            printf("  no stall: both yielders kept advancing for the whole "
-                   "run.\n");
+        printf("  %d threads on CPU 0; %d of them were starved at least one "
+               "whole second\n  while another was running.\n",
+               participants, starved == 0 ? 0 : starved);
+        if (stall_a)
+            printf("    yielder A: no progress from %llu ms%s\n",
+                   (unsigned long long)stall_a,
+                   g_ys.a.started ? "" : " (and never reached its first yield)");
+        if (stall_b)
+            printf("    yielder B: no progress from %llu ms%s\n",
+                   (unsigned long long)stall_b,
+                   g_ys.b.started ? "" : " (and never reached its first yield)");
+        if (stall_n)
+            printf("    notifier(s): no progress from %llu ms%s\n",
+                   (unsigned long long)stall_n,
+                   __atomic_load_n(&g_ys.notify_started, __ATOMIC_RELAXED) >=
+                           made_n
+                       ? ""
+                       : " (and not all of them started)");
+        if (starved == 0)
+            printf("    none: every thread kept advancing for the whole run.\n");
+        // Where each thread actually sat. All of them were pinned to CPU 0 by
+        // a parent that was already confined to CPU 0, so anything other than
+        // 0 here is the answer on its own.
+        printf("  placement: A pin=%d cpu=%d->%d   B pin=%d cpu=%d->%d\n",
+               g_ys.a.pin_rc, g_ys.a.cpu_seen, g_ys.a.cpu_last,
+               g_ys.b.pin_rc, g_ys.b.cpu_seen, g_ys.b.cpu_last);
+        int notify_elsewhere = 0;
+        if (made_n > 0) {
+            printf("             notifier cpu=");
+            for (int i = 0; i < made_n && i < YS_MAX_NOTIFY; i++) {
+                int cp = g_ys.notify_cpu[i];
+                printf("%s%d", i ? "," : "", cp);
+                if (cp != 0)
+                    notify_elsewhere = 1;
+            }
+            printf("\n");
         }
-        printf("  totals: A %llu yields, B %llu yields, %llu notifies\n",
-               (unsigned long long)g_ys.a.count,
-               (unsigned long long)g_ys.b.count,
-               (unsigned long long)g_ys.notifies);
-        // Do NOT join: if sched_yield() really does not return, the yielder
-        // threads are stuck inside it and a join would hang the very
-        // diagnostic that just proved it. Say so and exit.
-        if (stall_a || stall_b)
-            printf("  (not joining the yielders: they are inside the call "
+        if (g_ys.a.cpu_seen != 0 || g_ys.b.cpu_seen != 0 || notify_elsewhere)
+            printf("    ^ every thread was pinned to CPU 0 by an already-"
+                   "confined parent, so a\n      thread reporting another CPU "
+                   "means the mask did not take effect\n      where it ran: it "
+                   "is stranded, not merely descheduled.\n");
+        if (have_kstat) {
+            // Disjoint counters: `skipped` is bumped on an early return that
+            // happens before `scans`. See the psched section.
+            double scans = kstat_delta("sched steal:", 0);
+            double probed = kstat_delta("sched steal:", 1);
+            double ok = kstat_delta("sched steal:", 2);
+            double aff = kstat_delta("sched steal:", 3);
+            double skip = kstat_delta("sched steal:", 5);
+            printf("  steal over the run: %.0f scans, %.0f probed, %.0f ok, "
+                   "%.0f affinity-empty, %.0f skipped\n",
+                   scans, probed, ok, aff, skip);
+            printf("    ^ scans near zero, or affinity-empty climbing, is a "
+                   "CPU that never came\n      looking or looked and found "
+                   "nothing it was allowed to take. `ok` rising\n      "
+                   "instead means work WAS being moved and the stall is "
+                   "elsewhere.\n");
+        }
+        printf("  totals: A %llu yields (started %d), B %llu yields "
+               "(started %d), %llu notifies (%d of %d notifiers started)\n",
+               (unsigned long long)g_ys.a.count, g_ys.a.started,
+               (unsigned long long)g_ys.b.count, g_ys.b.started,
+               (unsigned long long)__atomic_load_n(&g_ys.notifies,
+                                                  __ATOMIC_RELAXED),
+               __atomic_load_n(&g_ys.notify_started, __ATOMIC_RELAXED),
+               made_n);
+        // What this does and does not establish. A starved YIELDER is
+        // consistent with the voluntary lane being passed over; a starved
+        // NOTIFIER is not, because a sleeper's timer wake is the notified
+        // lane, and a run where the notifiers are the starved ones rules the
+        // lane ordering out as the whole story. So the tool reports which
+        // threads starved and leaves the mechanism to whoever reads it.
+        if (starved > 0)
+            printf("  note: a starved notifier is a sleeper whose timer wake "
+                   "went unserved,\n  which the lane ordering alone does not "
+                   "explain. Read the rows above for\n  WHICH threads "
+                   "progressed, not just how many.\n");
+        // Do NOT join a starved thread: it may be inside the call that did
+        // not return, and the join would hang the diagnostic that just
+        // proved it.
+        if (starved > 0)
+            printf("  (not joining: a starved thread may be inside the call "
                    "that did not return)\n");
         fflush(stdout);
         _exit(0);
