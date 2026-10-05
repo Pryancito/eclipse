@@ -247,8 +247,7 @@ const REBALANCE_EVERY: u32 = 32;
 /// has local work pulls one. Stops two lightly loaded CPUs from ping-ponging.
 pub(crate) const REBALANCE_MARGIN: usize = 2;
 
-static REBALANCE_TICK: [AtomicU32; MAX_CORE_NUM] =
-    [const { AtomicU32::new(0) }; MAX_CORE_NUM];
+static REBALANCE_TICK: [AtomicU32; MAX_CORE_NUM] = [const { AtomicU32::new(0) }; MAX_CORE_NUM];
 
 /// True once every [`REBALANCE_EVERY`] polls on this CPU.
 pub(crate) fn rebalance_due() -> bool {
@@ -451,16 +450,30 @@ pub(crate) fn pick_affinity_kick_target(
     ready: u64,
     sleeping: u64,
 ) -> Option<u8> {
-    pick_affinity_kick_target_with_loads(mask, skip, ready, sleeping, None)
+    pick_affinity_kick_target_by(mask, skip, ready, sleeping, None::<fn(usize) -> usize>)
 }
 
 /// Same as [`pick_affinity_kick_target`], optionally ranking by per-CPU load.
-pub(crate) fn pick_affinity_kick_target_with_loads(
+///
+/// The loads arrive through a closure rather than an array on purpose. The
+/// production caller is [`kick_for_affinity`], which runs on an executor's
+/// coroutine stack -- from inside the generator, under the collection lock,
+/// interrupts off -- and a `[usize; MAX_CORE_NUM]` built there is 512 bytes of
+/// stack frame initialised on exactly the kind of stack whose frames the
+/// `[null-exec]` hunt spent six captures on. The steal scan already had to
+/// retire its own 1 KiB stack array for that reason (see `STEAL_CANDIDATES`);
+/// there is no need to reintroduce the shape here when the only thing the
+/// picker wants is one number per candidate, asked for as it goes.
+///
+/// The closure is called at most once per candidate CPU, in ascending id
+/// order, and only for CPUs the mask and `ready` both allow -- so the
+/// production one does not `try_lock` a runtime it was never going to rank.
+pub(crate) fn pick_affinity_kick_target_by(
     mask: u64,
     skip: usize,
     ready: u64,
     sleeping: u64,
-    loads: Option<&[usize; MAX_CORE_NUM]>,
+    mut load_of: Option<impl FnMut(usize) -> usize>,
 ) -> Option<u8> {
     let mask = if skip < MAX_CORE_NUM {
         mask & !(1u64 << skip)
@@ -471,37 +484,53 @@ pub(crate) fn pick_affinity_kick_target_with_loads(
     if candidates == 0 {
         return None;
     }
-    let pick = |set: u64| -> Option<u8> {
-        if set == 0 {
-            return None;
-        }
-        match loads {
-            None => Some(set.trailing_zeros() as u8),
-            Some(loads) => {
-                let mut best_cpu: Option<u8> = None;
-                let mut best_load = usize::MAX;
-                let mut bits = set;
-                while bits != 0 {
-                    let cpu = bits.trailing_zeros() as usize;
-                    bits &= bits - 1;
-                    let load = loads[cpu];
-                    if best_cpu.is_none()
-                        || load < best_load
-                        || (load == best_load && cpu < best_cpu.unwrap() as usize)
-                    {
-                        best_load = load;
-                        best_cpu = Some(cpu as u8);
-                    }
-                }
-                best_cpu
-            }
-        }
+    let Some(load_of) = load_of.as_mut() else {
+        // No load information: a sleeping candidate first, else the lowest id
+        // (the historical answer, and what the tests without loads pin).
+        let s = sleeping & candidates;
+        let set = if s != 0 { s } else { candidates };
+        return Some(set.trailing_zeros() as u8);
     };
-    let sleeping = sleeping & candidates;
-    if let Some(t) = pick(sleeping) {
-        return Some(t);
+    // One ascending pass over the candidates, keeping the best sleeping and
+    // the best busy one as we go: sleeping still wins outright, least load
+    // decides within each group, and the strict `<` leaves the lowest id
+    // standing on a tie.
+    let mut best_sleeping: Option<(usize, u8)> = None;
+    let mut best_busy: Option<(usize, u8)> = None;
+    let mut bits = candidates;
+    while bits != 0 {
+        let cpu = bits.trailing_zeros() as usize;
+        bits &= bits - 1;
+        let load = load_of(cpu);
+        let best = if sleeping & (1u64 << cpu) != 0 {
+            &mut best_sleeping
+        } else {
+            &mut best_busy
+        };
+        if best.is_none_or(|(best_load, _)| load < best_load) {
+            *best = Some((load, cpu as u8));
+        }
     }
-    pick(candidates)
+    best_sleeping.or(best_busy).map(|(_, cpu)| cpu)
+}
+
+/// [`pick_affinity_kick_target_by`] with the loads in an array, for the tests
+/// that describe a machine by writing one down.
+#[cfg(test)]
+pub(crate) fn pick_affinity_kick_target_with_loads(
+    mask: u64,
+    skip: usize,
+    ready: u64,
+    sleeping: u64,
+    loads: Option<&[usize; MAX_CORE_NUM]>,
+) -> Option<u8> {
+    pick_affinity_kick_target_by(
+        mask,
+        skip,
+        ready,
+        sleeping,
+        loads.map(|l| move |cpu| l[cpu]),
+    )
 }
 
 /// Don't build `chosen`'s runtime from the spawner when that CPU has not
@@ -553,26 +582,24 @@ pub(crate) fn affinity_home(mask: u64, ready: u64) -> Option<usize> {
 pub(crate) fn kick_for_affinity(mask: u64, skip: usize) {
     let ready = executor_ready_mask();
     let sleeping = SLEEPING_CPUS.load(Ordering::SeqCst);
-    let candidates = {
-        let m = if skip < MAX_CORE_NUM {
-            mask & !(1u64 << skip)
-        } else {
-            mask
-        };
-        reachable_affinity_cpus(m, ready)
-    };
-    let mut loads = [usize::MAX; MAX_CORE_NUM];
-    let mut bits = candidates;
-    while bits != 0 {
-        let cpu = bits.trailing_zeros() as usize;
-        bits &= bits - 1;
-        if let Some(rt) = GLOBAL_RUNTIME.try_lock_cpu(cpu) {
-            loads[cpu] = rt.placement_load().unwrap_or(usize::MAX / 2);
-        }
-    }
-    let Some(target) =
-        pick_affinity_kick_target_with_loads(mask, skip, ready, sleeping, Some(&loads))
-    else {
+    // Each candidate's load is read as the picker reaches it (ascending id),
+    // so there is no scratch array on this stack and no runtime is `try_lock`ed
+    // for a CPU the masks had already ruled out. A momentarily locked runtime
+    // is by definition in use, so it sorts behind every CPU whose load we
+    // could read -- the same stand-in the old array used for that case.
+    let target = pick_affinity_kick_target_by(
+        mask,
+        skip,
+        ready,
+        sleeping,
+        Some(|cpu: usize| {
+            GLOBAL_RUNTIME
+                .try_lock_cpu(cpu)
+                .and_then(|rt| rt.placement_load())
+                .unwrap_or(usize::MAX / 2)
+        }),
+    );
+    let Some(target) = target else {
         return;
     };
     request_resched(target);
@@ -734,13 +761,23 @@ impl ExecutorRuntime {
     }
 
     // 添加一个task，它的初始状态是 notified，也就是说它可以被执行.
+    //
+    // `priority` is checked and then NOT used: `TaskCollection::add_task` puts
+    // every task on `DEFAULT_PRIORITY`, which is also the only queue the
+    // generator scans and the only one `has_ready` / `ready_num` look at. So a
+    // task born anywhere else would never be polled, and the argument's real
+    // contract is "it must be the default one" -- `priority < MAX_PRIORITY`
+    // accepted 31 values that would have been silently rewritten to 4.
     fn add_task<F: Future<Output = ()> + 'static + Send>(
         &self,
         priority: usize,
         future: F,
         affinity: Option<Arc<AtomicU64>>,
     ) -> Key {
-        debug_assert!(priority < MAX_PRIORITY);
+        debug_assert_eq!(
+            priority, DEFAULT_PRIORITY,
+            "only DEFAULT_PRIORITY is scanned by the generator"
+        );
         self.task_collection.add_task(future, affinity)
     }
 
@@ -884,7 +921,11 @@ fn report_cpu_without_slot(cpu: usize, site: &str) {
 /// low sample, and this must stay safe from any context.
 pub fn runnable_task_count() -> usize {
     let mut total = 0;
-    for cpu in 0..MAX_CORE_NUM {
+    // Every CPU past the highest ready one has no runtime slot at all, so
+    // `try_lock_cpu` can only answer `None` for it. `MAX_CORE_NUM` is 64 and a
+    // desktop has four to twenty: the rest were pure `Once::get` misses on 64
+    // cold cachelines, per sample, on a path the load average calls.
+    for cpu in 0..num_online_cpus() {
         if let Some(rt) = GLOBAL_RUNTIME.try_lock_cpu(cpu) {
             total += rt.placement_load().unwrap_or(0);
         }
@@ -946,10 +987,7 @@ pub(crate) fn steal_for_balance() -> Option<(Key, Arc<Task>, Arc<WakerRef>)> {
     task
 }
 
-fn steal_task_min(
-    min_count: usize,
-    rebalance: bool,
-) -> Option<(Key, Arc<Task>, Arc<WakerRef>)> {
+fn steal_task_min(min_count: usize, rebalance: bool) -> Option<(Key, Arc<Task>, Arc<WakerRef>)> {
     // [null-exec] Run the whole scan non-preemptibly. This is now defense in
     // depth rather than the sole barrier: `candidates` no longer lives on this
     // stack (see `STEAL_CANDIDATES`), so a mid-scan park can no longer leave a
@@ -1044,7 +1082,8 @@ fn steal_task_inner(min_count: usize, rebalance: bool) -> Option<(Key, Arc<Task>
     let online = num_online_cpus().max(1);
     let distance = |cpu: usize| (cpu + online - current_cpu) % online;
     candidates[..n].sort_unstable_by(|a, b| {
-        b.1.cmp(&a.1).then_with(|| distance(a.0).cmp(&distance(b.0)))
+        b.1.cmp(&a.1)
+            .then_with(|| distance(a.0).cmp(&distance(b.0)))
     });
     for &(cpu, _) in &candidates[..n] {
         // Deadlock discipline: the thief may hold the victim's runtime lock
@@ -1376,7 +1415,14 @@ pub fn run_until_idle() -> bool {
             .weak_executors
             .retain(|executor| executor.is_some() && !executor.as_ref().unwrap().killed());
         for idx in 0..runtime.weak_executors.len() {
-            if let Some(executor) = &runtime.weak_executors[idx] {
+            // `.get`, not `[idx]`: the bound above was read under a guard this
+            // loop drops and retakes around every `switch`, and an index panic
+            // raised here is raised inside the scheduler, which `oops` cannot
+            // contain. A vector that shrank simply ends the pass.
+            let Some(slot) = runtime.weak_executors.get(idx) else {
+                break;
+            };
+            if let Some(executor) = slot {
                 if executor.killed() {
                     continue;
                 }
@@ -2027,8 +2073,12 @@ pub fn stack_high_water() -> (usize, usize) {
 pub(crate) fn note_stack_depth(used: usize) {
     let mut cur = STACK_HIGH_WATER.load(Ordering::Relaxed);
     while used > cur {
-        match STACK_HIGH_WATER.compare_exchange_weak(cur, used, Ordering::Relaxed, Ordering::Relaxed)
-        {
+        match STACK_HIGH_WATER.compare_exchange_weak(
+            cur,
+            used,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
             Ok(_) => break,
             Err(v) => cur = v,
         }
@@ -2386,7 +2436,11 @@ mod affinity_tests {
         note_stack_depth(before + 4096);
         assert_eq!(stack_high_water().0, before + 4096);
         note_stack_depth(before + 1);
-        assert_eq!(stack_high_water().0, before + 4096, "a shallower park lowered it");
+        assert_eq!(
+            stack_high_water().0,
+            before + 4096,
+            "a shallower park lowered it"
+        );
         assert_eq!(stack_high_water().1, crate::executor::STACK_SIZE);
     }
 
@@ -2397,10 +2451,17 @@ mod affinity_tests {
         let online = 4;
         let order = |thief: usize| {
             let distance = |cpu: usize| (cpu + online - thief) % online;
-            let mut c: alloc::vec::Vec<(usize, usize)> =
-                (0..online).filter(|&c| c != thief).map(|c| (c, 2)).collect();
-            c.sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| distance(a.0).cmp(&distance(b.0))));
-            c.into_iter().map(|(c, _)| c).collect::<alloc::vec::Vec<_>>()
+            let mut c: alloc::vec::Vec<(usize, usize)> = (0..online)
+                .filter(|&c| c != thief)
+                .map(|c| (c, 2))
+                .collect();
+            c.sort_unstable_by(|a, b| {
+                b.1.cmp(&a.1)
+                    .then_with(|| distance(a.0).cmp(&distance(b.0)))
+            });
+            c.into_iter()
+                .map(|(c, _)| c)
+                .collect::<alloc::vec::Vec<_>>()
         };
         assert_eq!(order(0), alloc::vec![1, 2, 3]);
         assert_eq!(order(1), alloc::vec![2, 3, 0]);
@@ -2409,7 +2470,10 @@ mod affinity_tests {
         let thief = 0;
         let distance = |cpu: usize| (cpu + online - thief) % online;
         let mut c = alloc::vec![(1usize, 1usize), (3, 5), (2, 1)];
-        c.sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| distance(a.0).cmp(&distance(b.0))));
+        c.sort_unstable_by(|a, b| {
+            b.1.cmp(&a.1)
+                .then_with(|| distance(a.0).cmp(&distance(b.0)))
+        });
         assert_eq!(c[0].0, 3);
     }
 
@@ -2764,7 +2828,10 @@ mod resched_tests {
         // must see it; no IPI is needed and none is owed.
         tc.get_mut_inner(DEFAULT_PRIORITY).pages[p].notify(s);
         set_cpu_sleeping(0, true);
-        assert!(tc.has_ready(), "halted through a wake that was already published");
+        assert!(
+            tc.has_ready(),
+            "halted through a wake that was already published"
+        );
         set_cpu_sleeping(0, false);
         drain_one(&tc);
 
@@ -2785,7 +2852,11 @@ mod resched_tests {
         set_cpu_sleeping(0, true);
         assert!(!tc.has_ready());
         waker.wake_by_ref();
-        assert_eq!(kicked() & 1, 1, "the wake fell into the check-then-halt window");
+        assert_eq!(
+            kicked() & 1,
+            1,
+            "the wake fell into the check-then-halt window"
+        );
         set_cpu_sleeping(0, false);
 
         // And once awake, nobody is kicked for a wake we will see on our own
@@ -2800,7 +2871,9 @@ mod resched_tests {
     }
 
     fn drain_one(tc: &TaskCollection) {
-        let (_k, _t, w) = tc.take_task().expect("the published wake was not handed out");
+        let (_k, _t, w) = tc
+            .take_task()
+            .expect("the published wake was not handed out");
         w.mark_borrowed(false);
     }
 
