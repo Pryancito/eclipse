@@ -23,11 +23,12 @@
 //! dependency ordering); implementation is our own so every syscall is under
 //! our control on the still-maturing kernel. No shell is involved.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::CString;
 use std::fs;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 /// A respawn service that exits sooner than this after starting is treated as
@@ -39,6 +40,19 @@ const HEALTHY_UPTIME: Duration = Duration::from_secs(2);
 /// would fork/exec at full speed forever, pinning a CPU.
 const MIN_BACKOFF: Duration = Duration::from_millis(250);
 const MAX_BACKOFF: Duration = Duration::from_secs(8);
+
+/// How many starts a respawn service gets while its `exec =` DOES NOT EXIST
+/// before init gives up on it for the rest of the boot.
+///
+/// A missing x bit init repairs ([`repair_exec_mode`]); a missing *file* no
+/// amount of retrying can fix, because nothing creates it between two
+/// `execve`s. Retrying it anyway is what filled a real console with the same
+/// four lines every 8 s for a whole boot, hiding everything else that was
+/// printed -- and `/usr/local/bin` is on the installed btrfs root, which a
+/// kernel upgrade never rewrites, so "for ever" means exactly that. Three
+/// tries, because a path on a filesystem a dependency is still mounting is
+/// conceivable and costs about a second to rule out.
+const MISSING_EXEC_TRIES: u32 = 3;
 
 /// Where a respawn service's output goes when its file names no `log =`.
 /// `/tmp`, like every `log =` the images ship: a tmpfs, so it costs no disk
@@ -213,6 +227,14 @@ struct Service {
     /// that cannot run for 8 s and exit 127: the 8.049 s is `dbus-system`'s
     /// 8 s backoff plus the 49 ms `oopslog` actually lived.
     restart_at: Option<Instant>,
+    /// How many times this service has been started while its `exec =` did not
+    /// exist. Counted in [`start_service`]; at [`MISSING_EXEC_TRIES`] the
+    /// service is given up on (`given_up`).
+    missing_starts: u32,
+    /// Given up on for the rest of this boot: never started again, and left
+    /// out of the restart pass. Set only for an `exec =` that does not exist,
+    /// which is the one failure no retry can change.
+    given_up: bool,
 }
 
 /// Default environment handed to every service (and inherited by their
@@ -320,6 +342,30 @@ const CHILD_ENV: &[&str] = &[
 fn log(msg: &str) {
     // PID 1 has stdout/stderr wired to the console by the kernel.
     println!("[eclipse-init] {msg}");
+}
+
+/// Lines about the renderer policy already printed this boot.
+static RENDERER_SAID: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
+
+/// Log a renderer-policy line the FIRST time it is decided, and never again.
+///
+/// The policy is computed per `execve` ([`build_child_env`] runs inside
+/// [`spawn`]), so these lines used to be reprinted for every service start --
+/// and a service stuck in a respawn loop reprinted the whole renderer block
+/// every backoff, which is what buried the one line that said what was
+/// actually wrong. The decision itself is what is worth reading, so each
+/// distinct line is printed once: a decision that CHANGES (the compositor
+/// degrading to pixman) is a different line and still gets said.
+fn log_renderer(msg: &str) -> bool {
+    let fresh = RENDERER_SAID
+        .lock()
+        .map(|mut seen| seen.insert(msg.to_string()))
+        // A poisoned mutex must not cost the line: say it.
+        .unwrap_or(true);
+    if fresh {
+        log(msg);
+    }
+    fresh
 }
 
 fn main() {
@@ -1040,6 +1086,8 @@ fn parse_service(name: &str, text: &str) -> Option<Service> {
         started_at: None,
         backoff: MIN_BACKOFF,
         restart_at: None,
+        missing_starts: 0,
+        given_up: false,
     })
 }
 
@@ -1127,6 +1175,51 @@ fn exec_problem(prog: &str) -> Option<String> {
     None
 }
 
+/// Count a start of a service whose `exec =` does not exist, and say whether
+/// init has given up on it.
+///
+/// The counting lives here, out of [`start_service`], because that one forks:
+/// the policy was untestable inside it. Returns `true` when the service must
+/// not be started -- this try and every later one -- having said once what
+/// would fix it. A service whose program IS there resets the count, so a path
+/// that appears late (a filesystem mounted by an earlier service) costs
+/// nothing.
+fn note_missing_exec(svc: &mut Service) -> bool {
+    let Some(prog) = svc.exec.first().cloned() else {
+        return false;
+    };
+    if !exec_is_missing(&prog) {
+        svc.missing_starts = 0;
+        return false;
+    }
+    svc.missing_starts += 1;
+    if svc.missing_starts < MISSING_EXEC_TRIES {
+        return false;
+    }
+    svc.given_up = true;
+    svc.pid = None;
+    svc.restart_at = None;
+    log(&format!(
+        "{}: giving up after {} tries -- {} is still not there. Nothing on this \
+         machine creates it: /usr/local/bin is on the installed root, which a kernel \
+         upgrade does not rewrite. Reinstall the image (install-eclipse, mode `new`), \
+         or write the wrapper by hand, to get this service back.",
+        svc.name, svc.missing_starts, prog
+    ));
+    true
+}
+
+/// Is this `exec =` an absolute path with no file behind it?
+///
+/// The one failure [`exec_problem`] reports that no retry and no repair can
+/// change, so the one that [`start_service`] stops retrying. Deliberately
+/// narrow: a bare `exec = seatd` goes through `execvp`'s PATH search, which
+/// this cannot replicate, and a wrong answer here would disable a service that
+/// works.
+fn exec_is_missing(prog: &str) -> bool {
+    prog.starts_with('/') && fs::metadata(Path::new(prog)).is_err()
+}
+
 /// Add the missing x bits to a service's own `exec =` and say whether it worked.
 ///
 /// Reporting is not enough for this one failure, because of where the file
@@ -1207,6 +1300,13 @@ fn start_service(svc: &mut Service) {
             if let Some(repair) = repair_exec_mode(prog) {
                 log(&format!("{}: {}", svc.name, repair));
             }
+        }
+        // A file that is not there cannot become there between two `execve`s,
+        // so retrying it is a console that scrolls for the whole boot and a
+        // service that is no closer to running. Count the tries and stop,
+        // saying once what would actually fix it.
+        if note_missing_exec(svc) {
+            return;
         }
     }
     match svc.kind {
@@ -1485,14 +1585,14 @@ fn detect_renderer_from(vendor: Option<&str>, cmdline: &str) -> Renderer {
             // gets asked -- but keying on the flag keeps a hand-written
             // `renderer=auto:nvidia.nouveau_uapi` cmdline honest too.
             if cmdline_has_in(cmdline, "nvidia.nouveau_uapi") {
-                log(&format!(
+                let _ = log_renderer(&format!(
                     "renderer=auto: NVIDIA GPU {} + nvidia.nouveau_uapi -> gl \
                      (GLES2/zink by default; nvidia.wlr_pixman for software)",
                     v.trim()
                 ));
                 Renderer::Gl
             } else {
-                log(&format!(
+                let _ = log_renderer(&format!(
                     "renderer=auto: NVIDIA GPU {} but nvidia.nouveau_uapi is OFF (kernel uAPI \
                      disabled; DRM node is \"zcore\") -> pixman. Boot with GL=1 (or add \
                      nvidia.nouveau_uapi + renderer=gl to the cmdline) for hardware GL",
@@ -1502,7 +1602,7 @@ fn detect_renderer_from(vendor: Option<&str>, cmdline: &str) -> Renderer {
             }
         }
         Some(v) if !v.trim().is_empty() => {
-            log(&format!(
+            let _ = log_renderer(&format!(
                 "renderer=auto: GPU vendor {} -> pixman (pass renderer=gl-sw for GLES2/llvmpipe, \
                  renderer=gl for virgl)",
                 v.trim()
@@ -1510,7 +1610,7 @@ fn detect_renderer_from(vendor: Option<&str>, cmdline: &str) -> Renderer {
             Renderer::Pixman
         }
         _ => {
-            log("renderer=auto: no GPU visible -> pixman");
+            let _ = log_renderer("renderer=auto: no GPU visible -> pixman");
             Renderer::Pixman
         }
     }
@@ -1616,7 +1716,7 @@ fn child_env_for(
                     let wlr = if want_vulkan { "vulkan" } else { "gles2" };
                     env.push(CString::new(format!("WLR_RENDERER={wlr}")).unwrap());
                     env.push(CString::new("WLR_DRM_NO_MODIFIERS=1").unwrap());
-                    log(&format!(
+                    let _ = log_renderer(&format!(
                         "renderer=gl: NVIDIA GPU -> WLR_RENDERER={wlr} (zink+NVK{}; degrade with nvidia.wlr_pixman)",
                         if want_vulkan {
                             ", nvidia.wlr_vulkan"
@@ -1631,18 +1731,19 @@ fn child_env_for(
                     env.push(CString::new("GALLIUM_DRIVER=zink").unwrap());
                     env.push(CString::new("MESA_LOADER_DRIVER_OVERRIDE=zink").unwrap());
                     push_sdl_render_env(&mut env, SdlRender::Gles2);
-                    log("renderer=gl: NVIDIA GPU -> pinning GL clients to zink+NVK");
+                    let _ =
+                        log_renderer("renderer=gl: NVIDIA GPU -> pinning GL clients to zink+NVK");
                 } else {
                     env.push(CString::new("WLR_RENDERER=pixman").unwrap());
                     env.push(CString::new("WLR_RENDERER_ALLOW_SOFTWARE=1").unwrap());
                     env.push(CString::new("LIBGL_ALWAYS_SOFTWARE=1").unwrap());
                     push_sdl_render_env(&mut env, SdlRender::Software);
                     if degraded {
-                        log(
+                        let _ = log_renderer(
                             "renderer=gl: NVIDIA GPU -> compositor DEGRADED to pixman for the rest of this boot (labwc kept dying on the GPU renderer; the GPU channel is likely wedged -- see `dmesg | grep nouveau-uapi` and /tmp/labwc.log)",
                         );
                     } else {
-                        log(
+                        let _ = log_renderer(
                             "renderer=gl: NVIDIA GPU -> pixman (nvidia.wlr_pixman); remove that flag for GLES2/zink",
                         );
                     }
@@ -1667,7 +1768,7 @@ fn child_env_for(
                 env.push(CString::new("WLR_RENDERER_ALLOW_SOFTWARE=1").unwrap());
                 env.push(CString::new("LIBGL_ALWAYS_SOFTWARE=1").unwrap());
                 push_sdl_render_env(&mut env, SdlRender::Gles2);
-                log("renderer=gl: no NVIDIA GPU (QEMU/virtio) -> degrading to software GL (gl-sw stack: labwc GLES2 + llvmpipe clients)");
+                let _ = log_renderer("renderer=gl: no NVIDIA GPU (QEMU/virtio) -> degrading to software GL (gl-sw stack: labwc GLES2 + llvmpipe clients)");
             }
         }
         Renderer::GlSw => {
@@ -1682,7 +1783,7 @@ fn child_env_for(
             env.push(CString::new("WLR_RENDERER_ALLOW_SOFTWARE=1").unwrap());
             env.push(CString::new("LIBGL_ALWAYS_SOFTWARE=1").unwrap());
             push_sdl_render_env(&mut env, SdlRender::Gles2);
-            log("renderer=gl-sw: wlroots GLES2 over Mesa llvmpipe (software GL)");
+            let _ = log_renderer("renderer=gl-sw: wlroots GLES2 over Mesa llvmpipe (software GL)");
         }
     }
     env
@@ -2019,6 +2120,7 @@ fn due_names(services: &BTreeMap<String, Service>, now: Instant) -> Vec<String> 
         .filter(|name| {
             services.get(name).is_some_and(|svc| {
                 svc.kind == Kind::Respawn
+                    && !svc.given_up
                     && svc.pid.is_none()
                     && svc.restart_at.is_none_or(|t| t <= now)
             })
@@ -3903,5 +4005,87 @@ wait_path = /dev/input/event0
         for other in ["fr", "en_GB", "espanol", "e", ""] {
             assert_eq!(ui_lang_token(other), None, "lang={other} was accepted");
         }
+    }
+
+    // -- an `exec =` that is not there -------------------------------------
+
+    /// A service file naming a program that does not exist is not a crash
+    /// loop: it is a thing that cannot start, ever. Init tries it
+    /// [`MISSING_EXEC_TRIES`] times and then stops, because nothing creates
+    /// that file between two `execve`s.
+    ///
+    /// The console this came from was `dbus-system` on real hardware:
+    /// `/usr/local/bin/eclipse-dbus-system does not exist`, four lines every
+    /// 8 s, for the whole boot, with everything else scrolled off the screen.
+    #[test]
+    fn a_service_whose_program_is_missing_is_given_up_on_instead_of_retried_for_ever() {
+        let mut svc = parse_service(
+            "dbus-system",
+            "exec = /usr/local/bin/eclipse-dbus-system-that-is-not-there\ntype = respawn\n",
+        )
+        .expect("parsea");
+        for try_n in 1..MISSING_EXEC_TRIES {
+            assert!(
+                !note_missing_exec(&mut svc),
+                "given up on try {try_n}, before the tries ran out"
+            );
+            assert!(!svc.given_up);
+        }
+        assert!(note_missing_exec(&mut svc), "it is still being retried");
+        assert!(svc.given_up);
+    }
+
+    /// Given up means out of the restart pass as well: leaving it `due` would
+    /// put the same storm back through a different door.
+    #[test]
+    fn a_service_given_up_on_is_not_due_to_restart() {
+        let ghost = || {
+            parse_service("ghost", "exec = /bin/no-such-program\ntype = respawn\n").expect("parsea")
+        };
+        let mut map = BTreeMap::new();
+        map.insert(String::from("ghost"), ghost());
+        assert_eq!(due_names(&map, Instant::now()), vec![String::from("ghost")]);
+        let mut svc = ghost();
+        svc.given_up = true;
+        map.insert(String::from("ghost"), svc);
+        assert!(due_names(&map, Instant::now()).is_empty());
+    }
+
+    /// Only an ABSOLUTE path with nothing behind it counts: a bare `exec =
+    /// seatd` is resolved by `execvp` against PATH, which this cannot
+    /// replicate, and calling that one missing would disable a service that
+    /// works.
+    #[test]
+    fn only_an_absolute_path_with_no_file_behind_it_counts_as_missing() {
+        assert!(exec_is_missing("/usr/local/bin/eclipse-no-such-wrapper"));
+        assert!(!exec_is_missing("/bin"));
+        assert!(!exec_is_missing("seatd"));
+        assert!(!exec_is_missing("eclipse-no-such-wrapper"));
+    }
+
+    /// A program that turns up resets the count: a path that only appears once
+    /// an earlier service has mounted its filesystem must not spend its tries.
+    #[test]
+    fn a_program_that_turns_up_resets_the_count() {
+        let mut svc = parse_service("late", "exec = /bin/sh\ntype = respawn\n").expect("parsea");
+        svc.missing_starts = MISSING_EXEC_TRIES - 1;
+        assert!(!note_missing_exec(&mut svc));
+        assert_eq!(svc.missing_starts, 0);
+        assert!(!svc.given_up);
+    }
+
+    /// The renderer policy is recomputed for every `execve`, so its lines used
+    /// to be reprinted once per service start -- and a service respawning
+    /// every 8 s reprinted the whole block every 8 s, which is what buried the
+    /// line that said what was wrong. Each distinct line is said once.
+    #[test]
+    fn a_renderer_line_is_said_once_and_a_different_one_is_still_said() {
+        let line = "renderer=test: first time only";
+        assert!(log_renderer(line), "the first time has to be said");
+        assert!(!log_renderer(line), "the same line was said twice");
+        assert!(
+            log_renderer("renderer=test: a different decision"),
+            "a decision that changed was swallowed"
+        );
     }
 }
