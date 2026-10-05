@@ -876,7 +876,7 @@ mod classification_tests {
     }
 
     #[test]
-    fn writing_into_another_processs_memory_is_watched() {
+    fn writing_into_the_memory_of_another_process_is_watched() {
         assert_eq!(
             classify(nr::PROCESS_VM_WRITEV),
             Some(("PRIVILEGE", Severity::Notice, "cross-process write"))
@@ -926,10 +926,24 @@ mod classification_tests {
     }
 
     #[test]
-    fn all_three_spellings_of_fork_count_as_forking() {
-        assert!(is_fork(nr::CLONE));
-        assert!(is_fork(nr::FORK));
-        assert!(is_fork(nr::VFORK));
+    fn every_spelling_of_fork_the_target_has_counts_as_forking() {
+        // The table is per-architecture and the absent entries are the
+        // sentinel, which never matches anything on purpose (the first test in
+        // this module is that contract). asm-generic -- aarch64 and riscv64 --
+        // has no `fork` and no `vfork` at all, so demanding all three
+        // unconditionally is demanding that the sentinel does match. The
+        // `Unit Test` job runs on x86_64 only, which is why that passed.
+        for (name, num) in [
+            ("clone", nr::CLONE),
+            ("fork", nr::FORK),
+            ("vfork", nr::VFORK),
+        ] {
+            if num == nr::ABSENT {
+                assert!(!is_fork(num), "{} is absent on this target", name);
+            } else {
+                assert!(is_fork(num), "{} is a way of forking", name);
+            }
+        }
         assert!(!is_fork(nr::PTRACE));
     }
 }

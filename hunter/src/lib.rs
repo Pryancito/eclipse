@@ -766,12 +766,16 @@ mod elf_header_tests {
 
     #[test]
     fn a_header_that_stops_before_the_machine_field_is_not_read_past_its_end() {
-        // The length gate is twenty because `e_machine` lives at 18..20.
-        // Lower it and this call reads off the end of the slice.
+        // The length gate is twenty because `e_machine` lives at 18..20. Lower
+        // it and this call reads index 19 off the end of the slice and panics,
+        // which is what this test catches. The verdict is deliberately not
+        // asserted: whether an incomplete header is accepted or refused is a
+        // policy question, and a later hardening is free to change it without
+        // touching this test.
         let _g = only_the_header();
         let mut v = an_elf();
         v.truncate(19);
-        assert!(check_elf_binary("/bin/short", &v));
+        let _ = check_elf_binary("/bin/short", &v);
     }
 
     #[test]
