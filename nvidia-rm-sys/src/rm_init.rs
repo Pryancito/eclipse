@@ -1388,6 +1388,31 @@ extern "C" {
 // is checked out (`duplicate symbol: eclipse_rm_*`), which is exactly how
 // `drivers` ended up impossible to link. A plain module boundary cannot
 // collide with anything.
+//
+// The wrappers are `unsafe fn`, not safe ones. They take raw physical
+// addresses and hand them to a DMA engine, so the preconditions below are
+// real and unchecked: a wrong `src_sysmem_pa` makes the CE read arbitrary
+// RAM, and a wrong `dst_host_pa` makes it WRITE arbitrary RAM, from a
+// bus master the MMU does not constrain. Before this seam existed every one
+// of these calls sat in an `unsafe` block at the call site; keeping them
+// `unsafe fn` keeps that same keyword in that same place instead of hiding
+// the boundary one module deeper.
+//
+// # Safety
+//
+// For every function here:
+//
+// * `gpu` must be an attached GPU instance -- one `rm_attach_gpu` returned
+//   NV_OK for and that has not been detached.
+// * `src_sysmem_pa` must be the physical base of a mapped host range of at
+//   least the requested length, and must stay mapped until the work the
+//   submit returns has completed (the engine reads it asynchronously).
+// * `dst_fb_vram_offset` must be a VRAM offset, and `dst_host_pa` a host
+//   physical address, each addressing at least the requested length of
+//   memory this GPU is allowed to write.
+// * For the pitched 2D form, `src_sysmem_pa + (line_count - 1) * src_pitch +
+//   row_bytes` and the same expression for the destination must both stay
+//   inside their respective ranges.
 // ---------------------------------------------------------------------
 #[cfg(not(test))]
 mod ce_rm {
@@ -1441,7 +1466,7 @@ mod ce_rm {
     }
 
     #[inline]
-    pub fn blit(
+    pub unsafe fn blit(
         gpu: u32,
         dst_fb_vram_offset: u64,
         src_sysmem_pa: u64,
@@ -1455,17 +1480,22 @@ mod ce_rm {
     }
 
     #[inline]
-    pub fn fill_fb(gpu: u32, fb_vram_offset: u64, size: u64, pattern: u32) -> NV_STATUS {
+    pub unsafe fn fill_fb(gpu: u32, fb_vram_offset: u64, size: u64, pattern: u32) -> NV_STATUS {
         unsafe { eclipse_rm_ce_fill_fb(gpu, fb_vram_offset, size, pattern) }
     }
 
     #[inline]
-    pub fn fill_fb_p2p(gpu: u32, dst_host_pa: u64, size: u64, pattern: u32) -> NV_STATUS {
+    pub unsafe fn fill_fb_p2p(gpu: u32, dst_host_pa: u64, size: u64, pattern: u32) -> NV_STATUS {
         unsafe { eclipse_rm_ce_fill_fb_p2p(gpu, dst_host_pa, size, pattern) }
     }
 
     #[inline]
-    pub fn blit_p2p(gpu: u32, dst_host_pa: u64, src_sysmem_pa: u64, size: u64) -> (NV_STATUS, u64) {
+    pub unsafe fn blit_p2p(
+        gpu: u32,
+        dst_host_pa: u64,
+        src_sysmem_pa: u64,
+        size: u64,
+    ) -> (NV_STATUS, u64) {
         let mut work_id = 0u64;
         let status =
             unsafe { eclipse_rm_ce_blit_p2p(gpu, dst_host_pa, src_sysmem_pa, size, &mut work_id) };
@@ -1474,7 +1504,7 @@ mod ce_rm {
 
     #[allow(clippy::too_many_arguments)]
     #[inline]
-    pub fn blit_p2p_2d(
+    pub unsafe fn blit_p2p_2d(
         gpu: u32,
         dst_host_pa: u64,
         dst_pitch: u32,
@@ -1500,12 +1530,12 @@ mod ce_rm {
     }
 
     #[inline]
-    pub fn wait(gpu: u32, work_id: u64) -> NV_STATUS {
+    pub unsafe fn wait(gpu: u32, work_id: u64) -> NV_STATUS {
         unsafe { eclipse_rm_ce_wait(gpu, work_id) }
     }
 
     #[inline]
-    pub fn release_inflight() -> NV_STATUS {
+    pub unsafe fn release_inflight() -> NV_STATUS {
         unsafe { eclipse_rm_ce_release_inflight() }
     }
 }
@@ -1520,7 +1550,6 @@ mod ce_rm {
 /// about it takes [`gate_test_turnstile`].
 #[cfg(test)]
 mod ce_rm {
-    extern crate std;
     use super::*;
     use alloc::vec::Vec;
     use core::cell::{Cell, RefCell};
@@ -1569,9 +1598,11 @@ mod ce_rm {
         CALLS.with(|c| c.borrow().clone())
     }
 
-    /// The names in order, which is what most assertions are about.
+    /// The names in order, which is what most assertions are about. Reads the
+    /// log in place: `calls()` would clone every `Call`, arguments included,
+    /// to then throw all but the name away.
     pub fn sequence() -> Vec<&'static str> {
-        calls().iter().map(|c| c.what).collect()
+        CALLS.with(|c| c.borrow().iter().map(|call| call.what).collect())
     }
 
     fn submit(what: &'static str, args: Vec<u64>) -> (NV_STATUS, u64) {
@@ -1579,7 +1610,7 @@ mod ce_rm {
         (SUBMIT_STATUS.with(|c| c.get()), WORK_ID.with(|c| c.get()))
     }
 
-    pub fn blit(
+    pub unsafe fn blit(
         gpu: u32,
         dst_fb_vram_offset: u64,
         src_sysmem_pa: u64,
@@ -1591,7 +1622,7 @@ mod ce_rm {
         )
     }
 
-    pub fn fill_fb(gpu: u32, fb_vram_offset: u64, size: u64, pattern: u32) -> NV_STATUS {
+    pub unsafe fn fill_fb(gpu: u32, fb_vram_offset: u64, size: u64, pattern: u32) -> NV_STATUS {
         record(
             "fill_fb",
             alloc::vec![gpu as u64, fb_vram_offset, size, pattern as u64],
@@ -1599,7 +1630,7 @@ mod ce_rm {
         SUBMIT_STATUS.with(|c| c.get())
     }
 
-    pub fn fill_fb_p2p(gpu: u32, dst_host_pa: u64, size: u64, pattern: u32) -> NV_STATUS {
+    pub unsafe fn fill_fb_p2p(gpu: u32, dst_host_pa: u64, size: u64, pattern: u32) -> NV_STATUS {
         record(
             "fill_fb_p2p",
             alloc::vec![gpu as u64, dst_host_pa, size, pattern as u64],
@@ -1607,7 +1638,12 @@ mod ce_rm {
         SUBMIT_STATUS.with(|c| c.get())
     }
 
-    pub fn blit_p2p(gpu: u32, dst_host_pa: u64, src_sysmem_pa: u64, size: u64) -> (NV_STATUS, u64) {
+    pub unsafe fn blit_p2p(
+        gpu: u32,
+        dst_host_pa: u64,
+        src_sysmem_pa: u64,
+        size: u64,
+    ) -> (NV_STATUS, u64) {
         submit(
             "blit_p2p",
             alloc::vec![gpu as u64, dst_host_pa, src_sysmem_pa, size],
@@ -1615,7 +1651,7 @@ mod ce_rm {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn blit_p2p_2d(
+    pub unsafe fn blit_p2p_2d(
         gpu: u32,
         dst_host_pa: u64,
         dst_pitch: u32,
@@ -1638,12 +1674,12 @@ mod ce_rm {
         )
     }
 
-    pub fn wait(gpu: u32, work_id: u64) -> NV_STATUS {
+    pub unsafe fn wait(gpu: u32, work_id: u64) -> NV_STATUS {
         record("wait", alloc::vec![gpu as u64, work_id]);
         WAIT_STATUS.with(|c| c.get())
     }
 
-    pub fn release_inflight() -> NV_STATUS {
+    pub unsafe fn release_inflight() -> NV_STATUS {
         record("release", alloc::vec![]);
         RELEASE_STATUS.with(|c| c.get())
     }
@@ -1727,7 +1763,10 @@ pub fn ce_blit(
         // invariant (`Assertion failed: RPC locking violation @ rpc.c:9834`).
         // Wait happens AFTER this gate drops -- see `ce_finish`.
         let _gate = RmGate::lock();
-        ce_rm::blit(gpu_instance, dst_fb_vram_offset, src_sysmem_pa, size)
+        // Safety: the ranges are the caller's to vouch for -- see `ce_rm`'s
+        // safety contract. This function is itself the place that contract is
+        // forwarded to its own caller.
+        unsafe { ce_rm::blit(gpu_instance, dst_fb_vram_offset, src_sysmem_pa, size) }
     };
     ce_finish(gpu_instance, submit, work_id)
 }
@@ -1739,10 +1778,12 @@ fn ce_finish(gpu_instance: u32, submit: NV_STATUS, work_id: u64) -> NV_STATUS {
     if submit != NV_OK {
         return submit;
     }
-    let wait = ce_rm::wait(gpu_instance, work_id);
+    // Safety: `work_id` came from a submit on this same `gpu_instance` that
+    // returned NV_OK, which is all the wait and the release need.
+    let wait = unsafe { ce_rm::wait(gpu_instance, work_id) };
     let release = {
         let _gate = RmGate::lock();
-        ce_rm::release_inflight()
+        unsafe { ce_rm::release_inflight() }
     };
     if wait != NV_OK {
         wait
@@ -1764,7 +1805,8 @@ pub fn ce_fill_fb(gpu_instance: u32, fb_vram_offset: u64, size: u64, pattern: u3
     // [rpc-lock] See `ce_blit`: gate this RM entry so a CE op never races a
     // concurrent NVK allocation into the RM (rpc.c:9834 API-lock violation).
     let _gate = RmGate::lock();
-    ce_rm::fill_fb(gpu_instance, fb_vram_offset, size, pattern)
+    // Safety: forwarded to this function's caller -- see `ce_rm`.
+    unsafe { ce_rm::fill_fb(gpu_instance, fb_vram_offset, size, pattern) }
 }
 
 /// P2P variant of [`ce_fill_fb`]: CE-memset a raw HOST physical address
@@ -1776,7 +1818,8 @@ pub fn ce_fill_fb(gpu_instance: u32, fb_vram_offset: u64, size: u64, pattern: u3
 pub fn ce_fill_fb_p2p(gpu_instance: u32, dst_host_pa: u64, size: u64, pattern: u32) -> NV_STATUS {
     // [rpc-lock] See `ce_blit`: gate this RM entry (rpc.c:9834 API-lock).
     let _gate = RmGate::lock();
-    ce_rm::fill_fb_p2p(gpu_instance, dst_host_pa, size, pattern)
+    // Safety: forwarded to this function's caller -- see `ce_rm`.
+    unsafe { ce_rm::fill_fb_p2p(gpu_instance, dst_host_pa, size, pattern) }
 }
 
 /// P2P variant of [`ce_blit`]: CE-copy `src_sysmem_pa` (dumb buffer, RAM) to a
@@ -1792,7 +1835,8 @@ pub fn ce_blit_p2p(
     // [rpc-lock] Gate submit only; wait is outside -- see `ce_finish`.
     let (submit, work_id) = {
         let _gate = RmGate::lock();
-        ce_rm::blit_p2p(gpu_instance, dst_host_pa, src_sysmem_pa, size)
+        // Safety: forwarded to this function's caller -- see `ce_rm`.
+        unsafe { ce_rm::blit_p2p(gpu_instance, dst_host_pa, src_sysmem_pa, size) }
     };
     ce_finish(gpu_instance, submit, work_id)
 }
@@ -1818,15 +1862,19 @@ pub fn ce_blit_p2p_2d(
     // [rpc-lock] Gate submit only; wait is outside -- see `ce_finish`.
     let (submit, work_id) = {
         let _gate = RmGate::lock();
-        ce_rm::blit_p2p_2d(
-            gpu_instance,
-            dst_host_pa,
-            dst_pitch,
-            src_sysmem_pa,
-            src_pitch,
-            row_bytes,
-            line_count,
-        )
+        // Safety: forwarded to this function's caller -- see `ce_rm`, whose
+        // contract spells out the pitched bound both ranges have to satisfy.
+        unsafe {
+            ce_rm::blit_p2p_2d(
+                gpu_instance,
+                dst_host_pa,
+                dst_pitch,
+                src_sysmem_pa,
+                src_pitch,
+                row_bytes,
+                line_count,
+            )
+        }
     };
     ce_finish(gpu_instance, submit, work_id)
 }
