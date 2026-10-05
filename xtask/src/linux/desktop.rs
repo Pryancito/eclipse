@@ -3245,7 +3245,10 @@ mod tests {
         fs::create_dir_all(dir.join("usr/lib/firefox-esr")).unwrap();
         write_firefox_desktop_override(&dir);
         assert!(entry("firefox-esr").is_file());
-        assert!(!entry("firefox").exists(), "stale rapid-release entry must go");
+        assert!(
+            !entry("firefox").exists(),
+            "stale rapid-release entry must go"
+        );
         let esr = fs::read_to_string(entry("firefox-esr")).unwrap();
         assert!(esr.contains("\nIcon=firefox-esr\n"), "{esr}");
 

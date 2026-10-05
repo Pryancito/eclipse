@@ -1750,7 +1750,10 @@ impl DrmDev {
                 let mut n = 0usize;
                 let mut area = 0u64;
                 let mut too_many = false;
-                let rect = if cmd.num_clips > 0 && cmd.num_clips <= MAX_DIRTY_CLIPS && cmd.clips_ptr != 0 {
+                let rect = if cmd.num_clips > 0
+                    && cmd.num_clips <= MAX_DIRTY_CLIPS
+                    && cmd.clips_ptr != 0
+                {
                     ucheck_n::<DrmClipRect>(cmd.clips_ptr as usize, cmd.num_clips as usize)?;
                     let mut union: Option<(u32, u32, u32, u32)> = None;
                     for i in 0..cmd.num_clips as usize {
@@ -2961,13 +2964,13 @@ impl DrmDev {
                         // ENODEV/EINVAL/EBUSY only for userspace to see EIO
                         // makes every one of those messages a lie.
                         .map_err(|e| match e {
-                            2 => FsError::EntryNotFound,  // ENOENT
-                            12 => FsError::NoMemory, // ENOMEM
-                            16 => FsError::Busy,          // EBUSY
-                            19 => FsError::NoDevice,      // ENODEV
-                            22 => FsError::InvalidParam,  // EINVAL
-                            38 => FsError::NotSupported,  // ENOSYS
-                            95 => FsError::NotSupported,  // EOPNOTSUPP
+                            2 => FsError::EntryNotFound, // ENOENT
+                            12 => FsError::NoMemory,     // ENOMEM
+                            16 => FsError::Busy,         // EBUSY
+                            19 => FsError::NoDevice,     // ENODEV
+                            22 => FsError::InvalidParam, // EINVAL
+                            38 => FsError::NotSupported, // ENOSYS
+                            95 => FsError::NotSupported, // EOPNOTSUPP
                             _ => FsError::DeviceError,
                         })
                 } else if is_core_drm_nr(nr) {
@@ -13774,7 +13777,6 @@ mod blob_id_space_tests {
             drm::BlobDestroy::NotFound
         ));
     }
-
 }
 
 /// CREATE_DUMB bpp, chardev write, ADDFB errno, and DESTROYPROPBLOB EPERM —
@@ -15853,12 +15855,7 @@ mod syncobj_array_tests {
                 count_handles: too_many,
                 pad: 0,
             };
-            assert_eq!(
-                c.ioctl(cmd, &mut req),
-                Err(FsError::NoMemory),
-                "{:#x}",
-                cmd
-            );
+            assert_eq!(c.ioctl(cmd, &mut req), Err(FsError::NoMemory), "{:#x}", cmd);
         }
         for cmd in [DRM_IOCTL_SYNCOBJ_TIMELINE_SIGNAL, DRM_IOCTL_SYNCOBJ_QUERY] {
             let mut req = DrmSyncobjTimelineArray {
@@ -15867,12 +15864,7 @@ mod syncobj_array_tests {
                 count_handles: too_many,
                 flags: 0,
             };
-            assert_eq!(
-                c.ioctl(cmd, &mut req),
-                Err(FsError::NoMemory),
-                "{:#x}",
-                cmd
-            );
+            assert_eq!(c.ioctl(cmd, &mut req), Err(FsError::NoMemory), "{:#x}", cmd);
         }
         // The bound itself is fine, and a null array under it is EINVAL as
         // before (Linux: EFAULT from the copy).
