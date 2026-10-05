@@ -63,6 +63,11 @@ where
     /// matching the rest of the renderer.
     #[inline]
     fn fill(&mut self, x: i32, y: i32, w: i32, h: i32, color: Rgb888) {
+        // Pure defence, and mutation is right that it is unobservable from
+        // here: every caller below works out a positive extent from the glyph
+        // cell, and a zero-sized `Rectangle` draws nothing anyway. It stays
+        // because `w` and `h` are signed and a wrong subtraction above would
+        // otherwise reach the backend as a rectangle of nonsense size.
         if w <= 0 || h <= 0 {
             return;
         }
@@ -109,6 +114,12 @@ where
         };
         if let Some((l, r, t, b)) = line {
             self.fill(x, y, cw, ch, bg);
+            // The `+ 1` on each half arm takes it *to* the middle column
+            // rather than up to it. Mutation reports both as removable and
+            // cannot be killed: a glyph with one horizontal arm always has a
+            // vertical one too -- there is no "left half line" in the set --
+            // and that arm paints the centre pixel regardless. The `+ 1` stays
+            // because it is what makes each arm half a cell wide on its own.
             if l && r {
                 self.fill(x, cy, cw, 1, fg);
             } else if l {
@@ -116,6 +127,10 @@ where
             } else if r {
                 self.fill(cx, cy, cw - cw / 2, 1, fg);
             }
+            // Same as above, and one more: `ch - ch / 2` and `ch / 2` are the
+            // same number because the glyph cell is eighteen pixels tall. They
+            // are written as the complement so the two halves still cover the
+            // cell exactly if the font is ever swapped for one of odd height.
             if t && b {
                 self.fill(cx, y, 1, ch, fg);
             } else if t {
@@ -135,6 +150,9 @@ where
             }
             '\u{2584}' => {
                 self.fill(x, y, cw, ch, bg);
+                // `ch - ch / 2`, not `ch / 2`: the same number for this font,
+                // and the complement is what keeps the two halves meeting
+                // exactly if the glyph cell ever has an odd height.
                 self.fill(x, y + ch / 2, cw, ch - ch / 2, fg); // lower half
             }
             '\u{258C}' => {
