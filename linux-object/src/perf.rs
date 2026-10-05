@@ -915,6 +915,28 @@ pub fn kernel_report() -> String {
             suppressed
         );
     }
+    // The slice credit: time threads spent frozen off the CPU as a weak-executor
+    // frame, which the absolute slice deadline used to charge against their
+    // timeslice. A thread that comes back with its deadline already spent is
+    // preempted at its first tick after running for a fraction of its slice,
+    // and leaves another frozen frame behind doing it. Zero credits means
+    // frames are not staying frozen here and this path is not the cost.
+    {
+        let (ticks, credits, ns, max) = zircon_object::task::slice_credit_stats();
+        if ticks > 0 {
+            let pct = credits as f64 * 100.0 / ticks as f64;
+            let _ = writeln!(
+                out,
+                "slice credit: {} ticks, {} credited ({:.1}%), {} ms given back, \
+                 worst freeze {} us",
+                ticks,
+                credits,
+                pct,
+                ns / 1_000_000,
+                max / 1_000
+            );
+        }
+    }
     // Coroutine-stack hand-out guard health. Non-zero means the live-stack
     // registry filled and dropped an insert, so the buddy allocator can hand a
     // live executor stack to a Vec/Box/VMO frame — the [double-alloc] that

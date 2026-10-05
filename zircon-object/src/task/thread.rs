@@ -266,6 +266,34 @@ const SCHED_TICK_NS: u64 = 4_000_000;
 /// also what keeps a credit on a core with no periodic tick at all (aarch64
 /// without a timer PPI) from handing out a deadline [`slice_verdict`] would
 /// read as a backwards clock.
+/// Tick observations, credits applied, nanoseconds credited, and the largest
+/// single credit, since boot.
+///
+/// The point of counting is that the fix above is a *hypothesis* about a busy
+/// machine: if frames do not stay frozen, the credit never fires and the cost
+/// it describes is not there. Zero credits over a slow stretch rules this path
+/// out and sends the search elsewhere, which is worth more than the counters
+/// cost. And they cost almost nothing: `tick_should_preempt` runs once per
+/// scheduler tick per CPU, so the one unconditional increment is ~250/s/CPU --
+/// four orders of magnitude under the per-poll counters that had to be made
+/// per-CPU.
+static SLICE_TICKS: AtomicU64 = AtomicU64::new(0);
+static SLICE_CREDITS: AtomicU64 = AtomicU64::new(0);
+static SLICE_CREDIT_NS: AtomicU64 = AtomicU64::new(0);
+static SLICE_CREDIT_MAX_NS: AtomicU64 = AtomicU64::new(0);
+
+/// `(tick observations, credits applied, nanoseconds credited, largest single
+/// credit)` since boot -- the time threads spent frozen off the CPU that the
+/// slice deadline used to charge them for. See [`credited_slice_end`].
+pub fn slice_credit_stats() -> (u64, u64, u64, u64) {
+    (
+        SLICE_TICKS.load(Ordering::Relaxed),
+        SLICE_CREDITS.load(Ordering::Relaxed),
+        SLICE_CREDIT_NS.load(Ordering::Relaxed),
+        SLICE_CREDIT_MAX_NS.load(Ordering::Relaxed),
+    )
+}
+
 fn credited_slice_end(now: u64, end: u64, last_seen: u64, slice: u64, tick: u64) -> u64 {
     if end == 0 || last_seen == 0 || last_seen >= now {
         return end;
@@ -275,6 +303,36 @@ fn credited_slice_end(now: u64, end: u64, last_seen: u64, slice: u64, tick: u64)
         return end;
     }
     end.saturating_add(off_cpu).min(now.saturating_add(slice))
+}
+
+/// Record a credit for `/proc/perf/kernel`. Kept out of [`credited_slice_end`]
+/// so that stays a pure function a test can drive.
+/// How much [`credited_slice_end`] gave back, or `None` when it gave nothing.
+///
+/// Split out from the counting so the decision is a pure function. A `None`
+/// counted as a credit is the one mutation that would matter here: what these
+/// counters exist for is the *zero* reading that rules this path out, and a
+/// count that ticks up on every tick cannot produce one.
+fn credit_given(end: u64, credited: u64) -> Option<u64> {
+    if credited <= end {
+        return None;
+    }
+    Some(credited - end)
+}
+
+/// Record a credit for `/proc/perf/kernel`.
+fn note_slice_credit(end: u64, credited: u64) {
+    let Some(given) = credit_given(end, credited) else {
+        return;
+    };
+    SLICE_CREDITS.fetch_add(1, Ordering::Relaxed);
+    SLICE_CREDIT_NS.fetch_add(given, Ordering::Relaxed);
+    // Read before the write: the maximum settles within the first seconds and
+    // then every later tick would be an RMW on a shared line to store the same
+    // value.
+    if SLICE_CREDIT_MAX_NS.load(Ordering::Relaxed) < given {
+        SLICE_CREDIT_MAX_NS.fetch_max(given, Ordering::Relaxed);
+    }
 }
 
 /// Where a resumed thread's slice deadline lands: EEVDF's *lag*, applied to
@@ -978,6 +1036,8 @@ impl Thread {
         // This is the one reader that is also the observation: record where the
         // clock stood so the next tick can tell running from frozen.
         self.sched.last_tick_ns.store(now, Ordering::Relaxed);
+        // The denominator the credit count is read against.
+        SLICE_TICKS.fetch_add(1, Ordering::Relaxed);
         preempt
     }
 
@@ -986,13 +1046,16 @@ impl Thread {
     /// goes through here, because a deadline that reads as expired is not only
     /// a preemption but also a lost RUN_TO_PARITY floor.
     fn credited_slice_end(&self, now: u64, slice: u64) -> u64 {
-        credited_slice_end(
+        let end = self.sched.slice_end_ns.load(Ordering::Relaxed);
+        let credited = credited_slice_end(
             now,
-            self.sched.slice_end_ns.load(Ordering::Relaxed),
+            end,
             self.sched.last_tick_ns.load(Ordering::Relaxed),
             slice,
             SCHED_TICK_NS,
-        )
+        );
+        note_slice_credit(end, credited);
+        credited
     }
 
     /// Setup the instruction and stack pointer, then tart execution on the thread
@@ -2964,6 +3027,33 @@ mod sched_tests {
         t.sched.last_tick_ns.store(1, Ordering::Relaxed);
         t.set_sched(SCHED_NORMAL, 5, 0);
         assert_eq!(t.sched.last_tick_ns.load(Ordering::Relaxed), 0);
+    }
+
+    /// What gets counted is the credit actually given, and nothing is counted
+    /// when none was. A zero here over a slow stretch is what rules this whole
+    /// path out, so it had better not count ticks that were never credited.
+    #[test]
+    fn only_a_credit_that_was_given_is_counted() {
+        assert_eq!(credit_given(1_000, 1_007), Some(7));
+        assert_eq!(
+            credit_given(1_000, 1_000),
+            None,
+            "un tick sin credito no es un credito, y contarlo deja sin cero que leer"
+        );
+        assert_eq!(credit_given(1_000, 999), None, "un plazo recortado tampoco");
+        // Y lo que se suma son los nanosegundos dados, no una cuenta de
+        // llamadas. Por diferencia, porque las cifras son globales del binario.
+        let (_, credits_before, ns_before, _) = slice_credit_stats();
+        let given = 1_234_567;
+        note_slice_credit(1_000, 1_000 + given);
+        note_slice_credit(1_000, 1_000);
+        let (_, credits, ns, max) = slice_credit_stats();
+        assert!(
+            ns - ns_before >= given,
+            "los nanosegundos acreditados no son los que se dieron"
+        );
+        assert!(credits > credits_before);
+        assert!(max >= given, "el peor congelado no se queda con el mayor");
     }
 
     /// The whole thing through the thread: a tick records where the clock
