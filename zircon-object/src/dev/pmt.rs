@@ -49,6 +49,19 @@ impl PinnedMemoryToken {
         offset: usize,
         size: usize,
     ) -> ZxResult<Arc<Self>> {
+        // A pin starts and ends on a page. `map_into_iommu` does not check
+        // that, it *asserts* it -- a size that is not a whole number of the
+        // runs of contiguity the IOMMU guarantees -- and an assert in a kernel
+        // object reached from a syscall is a kernel panic. The only guard for
+        // it lived in `sys_bti_pin`, two crates away, which is where the
+        // alignment guard for `zx_vmo_create_contiguous` lived too until an
+        // unguarded path turned out to reach the panic. `vmo.pin` answers
+        // `BAD_STATE` for an unaligned range whose last page is not committed,
+        // which hides this most of the time; a buffer that is already
+        // committed walks past it and into the assert.
+        if !page_aligned(offset) || !page_aligned(size) {
+            return Err(ZxError::INVALID_ARGS);
+        }
         if vmo.is_paged() {
             vmo.commit(offset, size)?;
             vmo.pin(offset, size)?;
@@ -333,6 +346,234 @@ mod tests {
         assert_eq!(vmo.decommit(0, PAGE_SIZE), Err(ZxError::BAD_STATE));
         second.unpin();
         drop(second);
+        vmo.decommit(0, PAGE_SIZE).unwrap();
+    }
+
+    /// A scattered buffer of `n` pages and an initiator to pin it with.
+    fn pinned_pages(n: usize) -> (Arc<VmObject>, Arc<BusTransactionInitiator>) {
+        let vmo = VmObject::new_paged_with_resizable(true, n);
+        vmo.commit(0, n * PAGE_SIZE).unwrap();
+        let bti = BusTransactionInitiator::create(Iommu::create(), 0);
+        (vmo, bti)
+    }
+
+    /// Every address of the pin, in order, as it comes out of
+    /// `pin_and_encode`. A token released on the way out so the pages go back
+    /// in play.
+    fn addrs_of(
+        bti: &Arc<BusTransactionInitiator>,
+        vmo: &Arc<VmObject>,
+        offset: usize,
+        size: usize,
+        compress: bool,
+        contiguous: bool,
+        asked: usize,
+    ) -> Vec<DevVAddr> {
+        let (pmt, addrs) = bti
+            .pin_and_encode(
+                vmo.clone(),
+                offset,
+                size,
+                IommuPerms::PERM_READ,
+                compress,
+                contiguous,
+                asked,
+            )
+            .unwrap();
+        pmt.unpin();
+        addrs
+    }
+
+    #[test]
+    /// What the device is handed for a scattered buffer is the frame of each
+    /// pinned page, in the order the pages come. The walk that collects them
+    /// asks the IOMMU for one page at a time and has to move along as it
+    /// goes: reading the offset from the request instead of from the cursor
+    /// hands over the first page's frame again and again, and the device then
+    /// does the whole transfer into one page.
+    fn the_addresses_handed_over_are_the_pinned_pages_in_order() {
+        let (vmo, bti) = pinned_pages(3);
+        let addrs = addrs_of(&bti, &vmo, 0, 3 * PAGE_SIZE, false, false, 3);
+        assert_eq!(
+            addrs,
+            vec![
+                vmo.committed_paddr(0).unwrap(),
+                vmo.committed_paddr(1).unwrap(),
+                vmo.committed_paddr(2).unwrap(),
+            ],
+        );
+        vmo.decommit(0, 3 * PAGE_SIZE).unwrap();
+    }
+
+    #[test]
+    /// A pin that does not start at the buffer's first page hands over the
+    /// page it pinned, not the first one. The pin itself and the addresses
+    /// come from two different walks of the same range, and only this says
+    /// they agree about where the range starts.
+    fn a_pin_at_an_offset_hands_over_the_page_it_pinned() {
+        let (vmo, bti) = pinned_pages(3);
+        let addrs = addrs_of(&bti, &vmo, PAGE_SIZE, 2 * PAGE_SIZE, false, false, 2);
+        assert_eq!(
+            addrs,
+            vec![
+                vmo.committed_paddr(1).unwrap(),
+                vmo.committed_paddr(2).unwrap(),
+            ],
+        );
+        vmo.decommit(0, 3 * PAGE_SIZE).unwrap();
+    }
+
+    #[test]
+    /// A contiguous buffer is one range to the IOMMU: one call, one base
+    /// address, and the device addresses are that base walked a page at a
+    /// time. The stride is the whole pinned length for a contiguous buffer
+    /// and one page for a scattered one, and reading it from the wrong side
+    /// of that choice gives a contiguous pin exactly one address -- which
+    /// then does not match the count the caller has room for, so the pin is
+    /// refused rather than wrong.
+    fn a_contiguous_buffer_is_mapped_once_and_walked_from_its_base() {
+        let vmo = VmObject::new_contiguous(4, PAGE_SIZE_LOG2).unwrap();
+        let bti = BusTransactionInitiator::create(Iommu::create(), 0);
+        let walked = addrs_of(&bti, &vmo, PAGE_SIZE, 2 * PAGE_SIZE, false, false, 2);
+        // Read after the pin: the pin is what commits the range.
+        let base = vmo.committed_paddr(1).unwrap();
+        assert_eq!(walked, vec![base, base + PAGE_SIZE]);
+        assert_eq!(Some(base + PAGE_SIZE), vmo.committed_paddr(2));
+        // And `ZX_BTI_CONTIGUOUS` asks for that base and nothing else.
+        assert_eq!(
+            addrs_of(&bti, &vmo, PAGE_SIZE, 2 * PAGE_SIZE, false, true, 1),
+            vec![base],
+        );
+    }
+
+    #[test]
+    /// `ZX_BTI_COMPRESS` asks for one address per run of guaranteed
+    /// contiguity. This IOMMU guarantees a page, so the compressed form is
+    /// the same list as the plain one -- and that is the point: a buffer the
+    /// device sees as one range still has to be described page by page, or
+    /// the caller is handed fewer addresses than it has room for.
+    fn a_compressed_encoding_is_one_address_per_run_of_contiguity() {
+        let contiguous = VmObject::new_contiguous(4, PAGE_SIZE_LOG2).unwrap();
+        let bti = BusTransactionInitiator::create(Iommu::create(), 0);
+        let compressed = addrs_of(&bti, &contiguous, 0, 3 * PAGE_SIZE, true, false, 3);
+        let base = contiguous.committed_paddr(0).unwrap();
+        assert_eq!(
+            compressed,
+            vec![base, base + PAGE_SIZE, base + 2 * PAGE_SIZE],
+        );
+
+        // A scattered buffer is already one address per page, so compressing
+        // it hands the list over as it stands.
+        let (scattered, bti) = pinned_pages(3);
+        let plain = addrs_of(&bti, &scattered, 0, 3 * PAGE_SIZE, false, false, 3);
+        assert_eq!(
+            addrs_of(&bti, &scattered, 0, 3 * PAGE_SIZE, true, false, 3),
+            plain,
+        );
+        scattered.decommit(0, 3 * PAGE_SIZE).unwrap();
+    }
+
+    #[test]
+    /// The pin commits the range it is about to pin, and that is the range it
+    /// was asked for. `zx_bti_pin` works on a buffer nobody has touched yet --
+    /// the pages are demand-allocated by the commit on the way in -- so
+    /// committing the wrong range leaves `vmo.pin` looking for a frame that is
+    /// not there. Every other test here commits the whole buffer first, which
+    /// hides it, and it also hides the commit spilling outside the pin.
+    fn a_pin_commits_the_range_it_pins_even_when_nothing_touched_it() {
+        let vmo = VmObject::new_paged_with_resizable(true, 3);
+        let bti = BusTransactionInitiator::create(Iommu::create(), 0);
+        assert_eq!(
+            vmo.committed_pages_in_range(0, 3),
+            0,
+            "nothing is committed yet",
+        );
+
+        let (pmt, addrs) = bti
+            .pin_and_encode(
+                vmo.clone(),
+                PAGE_SIZE,
+                2 * PAGE_SIZE,
+                IommuPerms::PERM_READ,
+                false,
+                false,
+                2,
+            )
+            .unwrap();
+        assert_eq!(
+            addrs,
+            vec![
+                vmo.committed_paddr(1).unwrap(),
+                vmo.committed_paddr(2).unwrap(),
+            ],
+        );
+        assert_eq!(
+            vmo.committed_pages_in_range(0, 1),
+            0,
+            "the page outside the pin was left alone",
+        );
+
+        pmt.unpin();
+        drop(pmt);
+        vmo.decommit(PAGE_SIZE, 2 * PAGE_SIZE).unwrap();
+    }
+
+    #[test]
+    /// A pin has to start and end on a page. `map_into_iommu` does not check
+    /// that, it *asserts* it, and an assert in a kernel object reached from a
+    /// syscall is a kernel panic. `zx_bti_pin` checks the alignment itself,
+    /// two crates away, and `vmo.pin` answers `BAD_STATE` for an unaligned
+    /// range whose last page is not committed -- but a buffer that is already
+    /// committed, which is every buffer a driver pins twice, walks past both
+    /// and into the assert.
+    fn a_pin_that_does_not_start_and_end_on_a_page_is_invalid_args() {
+        let (vmo, bti) = pinned_page();
+        for (offset, size) in [
+            (0, PAGE_SIZE + 1),
+            (0, PAGE_SIZE - 1),
+            (1, PAGE_SIZE),
+            (PAGE_SIZE - 1, PAGE_SIZE),
+        ] {
+            assert_eq!(
+                bti.pin(vmo.clone(), offset, size, IommuPerms::PERM_READ)
+                    .err(),
+                Some(ZxError::INVALID_ARGS),
+                "pin(offset={:#x}, size={:#x})",
+                offset,
+                size,
+            );
+        }
+        // And nothing of a refused pin is left behind.
+        vmo.decommit(0, 2 * PAGE_SIZE).unwrap();
+        vmo.set_len(PAGE_SIZE).unwrap();
+    }
+
+    #[test]
+    /// A page can be pinned thirty-one times and no more, and the pin that
+    /// does not fit is refused outright rather than half-taken. The count
+    /// lives in the frame, so what saturates it is tokens over the same page,
+    /// and the error `vmo.pin` answers is the only thing standing between a
+    /// saturated count and a token that believes it holds a pin it does not.
+    fn the_pin_that_does_not_fit_is_refused_and_leaves_the_count_alone() {
+        let (vmo, bti) = pinned_page();
+        let mut held = Vec::new();
+        for n in 0..31 {
+            held.push(
+                bti.pin(vmo.clone(), 0, PAGE_SIZE, IommuPerms::PERM_READ)
+                    .unwrap_or_else(|err| panic!("pin number {} answered {:?}", n + 1, err)),
+            );
+        }
+        assert_eq!(
+            bti.pin(vmo.clone(), 0, PAGE_SIZE, IommuPerms::PERM_READ)
+                .err(),
+            Some(ZxError::UNAVAILABLE),
+        );
+
+        // And the page comes back once the thirty-one that did fit let go,
+        // which it would not if the refused one had left a count behind.
+        for pmt in held.drain(..) {
+            pmt.unpin();
+        }
         vmo.decommit(0, PAGE_SIZE).unwrap();
     }
 }
