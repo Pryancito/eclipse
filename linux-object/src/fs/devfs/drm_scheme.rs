@@ -1914,17 +1914,28 @@ impl DrmDev {
                 Ok(0)
             }
             DRM_IOCTL_MODE_GETGAMMA | DRM_IOCTL_MODE_SETGAMMA => {
-                // `struct drm_mode_crtc_lut` starts with `crtc_id`; both
-                // `drm_mode_gamma_{get,set}_ioctl` look it up first and answer
-                // ENOENT for a CRTC that does not exist.
-                let crtc_id = unsafe { *(data as *const u32) };
-                if drm::get_crtc(crtc_id).is_none() {
+                // Both `drm_mode_gamma_{get,set}_ioctl` look the CRTC up
+                // first and answer ENOENT for one that does not exist.
+                let lut = unsafe { &*(data as *const DrmModeCrtcLut) };
+                if drm::get_crtc(lut.crtc_id).is_none() {
                     return Err(FsError::EntryNotFound);
                 }
-                // No programmable gamma on the software scanout: accept and
-                // ignore. (Get leaves the caller's ramp buffers untouched, which
-                // Xorg treats as the identity it will "restore" on exit — a
-                // no-op against our no-op Set.)
+                // The CRTC has no gamma store (GETCRTC reports `gamma_size`
+                // 0: no programmable gamma on this scanout), and Linux says
+                // so: `drm_crtc_supports_legacy_gamma` is false, so SETGAMMA
+                // is ENOSYS, and GETGAMMA wants the caller's `gamma_size` to
+                // be the CRTC's (EINVAL) and then copies that many entries,
+                // none. Both answered "done" whatever was asked, so `xrandr
+                // --gamma`, gammastep and Xorg's own gamma restore were told
+                // the ramp was set, and a GETGAMMA of 256 entries returned
+                // without writing one, leaving the caller to read its own
+                // uninitialised buffers as the current ramp.
+                if cmd == DRM_IOCTL_MODE_SETGAMMA {
+                    return Err(FsError::NotSupported);
+                }
+                if lut.gamma_size != CRTC_GAMMA_SIZE {
+                    return Err(FsError::InvalidParam);
+                }
                 Ok(0)
             }
             DRM_IOCTL_MODE_LIST_LESSEES => {
@@ -2336,7 +2347,7 @@ impl DrmDev {
                     crtc_res.fb_id = crtc.fb_id;
                     crtc_res.x = crtc.x;
                     crtc_res.y = crtc.y;
-                    crtc_res.gamma_size = 0;
+                    crtc_res.gamma_size = CRTC_GAMMA_SIZE;
                     // Report the current mode: the display's native timings
                     // (the only mode the pipeline has). Linux fills this from
                     // crtc->state; compositors read it back to seed their
@@ -4472,6 +4483,21 @@ fn addfb2_check(cmd: &DrmModeFbCmd2) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// `drm_crtc.gamma_size` of every CRTC here: no legacy gamma store, which is
+/// what GETCRTC reports and what GETGAMMA/SETGAMMA hold the caller to.
+const CRTC_GAMMA_SIZE: u32 = 0;
+
+/// `struct drm_mode_crtc_lut`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+struct DrmModeCrtcLut {
+    crtc_id: u32,
+    gamma_size: u32,
+    red: u64,
+    green: u64,
+    blue: u64,
 }
 
 #[repr(C)]
@@ -12372,7 +12398,11 @@ mod hw_kms_tests {
         assert_eq!(c.ioctl(DRM_IOCTL_MODE_SETGAMMA, &mut lut), enoent);
         lut.crtc_id = 60;
         assert_eq!(c.ioctl(DRM_IOCTL_MODE_GETGAMMA, &mut lut), Ok(0));
-        assert_eq!(c.ioctl(DRM_IOCTL_MODE_SETGAMMA, &mut lut), Ok(0));
+        // A CRTC with no gamma store: `drm_crtc_supports_legacy_gamma`.
+        assert_eq!(
+            c.ioctl(DRM_IOCTL_MODE_SETGAMMA, &mut lut),
+            Err(FsError::NotSupported)
+        );
 
         // OBJ_SETPROPERTY: the object and the property must both exist.
         let mut set = DrmModeObjSetProperty {
@@ -12686,6 +12716,67 @@ mod hw_kms_tests {
         for buf in [&xr24, &narrow, &short, &ar24, &ar24_too] {
             c.destroy_dumb(buf.handle).expect("DESTROY_DUMB");
         }
+    }
+
+    /// `drm_mode_gamma_{get,set}_ioctl` on a CRTC whose `gamma_size` is 0,
+    /// which is what GETCRTC reports here: SETGAMMA is ENOSYS
+    /// (`drm_crtc_supports_legacy_gamma`), GETGAMMA wants the caller's
+    /// `gamma_size` to be the CRTC's (EINVAL) and then copies that many
+    /// entries, none. Both answered "done": a 256-entry ramp was "set", and
+    /// a 256-entry GETGAMMA returned without writing one.
+    #[test]
+    fn gamma_ioctls_hold_the_caller_to_a_crtc_with_no_gamma_store() {
+        let _screen = kms_emu::attach(32, 8);
+        let c = Client::open(0);
+        let (crtcs, _) = topology(&c);
+        let crtc = crtcs[0];
+        let mut info: DrmModeGetCrtc = zeroed();
+        info.crtc_id = crtc;
+        c.ioctl(DRM_IOCTL_MODE_GETCRTC, &mut info).expect("GETCRTC");
+        assert_eq!(info.gamma_size, 0, "no gamma store, as GETCRTC says");
+
+        let mut red = [0x1111u16; 256];
+        let mut green = [0x2222u16; 256];
+        let mut blue = [0x3333u16; 256];
+        let (r, g, b) = (
+            red.as_mut_ptr() as u64,
+            green.as_mut_ptr() as u64,
+            blue.as_mut_ptr() as u64,
+        );
+        let gamma = |cmd: u32, crtc_id: u32, gamma_size: u32| {
+            let mut lut = DrmModeCrtcLut {
+                crtc_id,
+                gamma_size,
+                red: r,
+                green: g,
+                blue: b,
+            };
+            c.ioctl(cmd, &mut lut)
+        };
+        for size in [0u32, 256] {
+            assert_eq!(
+                gamma(DRM_IOCTL_MODE_SETGAMMA, crtc, size),
+                Err(FsError::NotSupported),
+                "SETGAMMA with {} entries",
+                size
+            );
+        }
+        assert_eq!(
+            gamma(DRM_IOCTL_MODE_GETGAMMA, crtc, 256),
+            Err(FsError::InvalidParam),
+            "not the CRTC's gamma_size"
+        );
+        assert_eq!(gamma(DRM_IOCTL_MODE_GETGAMMA, crtc, 0), Ok(0));
+        assert!(
+            red.iter().all(|&v| v == 0x1111)
+                && green.iter().all(|&v| v == 0x2222)
+                && blue.iter().all(|&v| v == 0x3333),
+            "zero entries copied"
+        );
+        assert_eq!(
+            gamma(DRM_IOCTL_MODE_GETGAMMA, 0xdead_0000, 0),
+            Err(FsError::EntryNotFound)
+        );
     }
 
     /// With a mode, `drm_mode_setcrtc` looks the fb up (ENOENT; -1 is the
