@@ -1683,7 +1683,6 @@ impl DrmDev {
                 // 64 made dense-damage frames fall back to a full-screen blit.
                 const MAX_DIRTY_CLIPS: u32 = 256;
                 const MAX_DIRTY_SPANS: usize = 8;
-                const DRM_MODE_FB_DIRTY_FLAGS: u32 = 0x03; // ANNOTATE_COPY|FILL
                 let cmd = unsafe { *(data as *const DrmModeFbDirtyCmd) };
                 // `drm_mode_dirtyfb_ioctl`, in its order: a flag it does not
                 // define is EINVAL; the fb is looked up (ENOENT); a clip count
