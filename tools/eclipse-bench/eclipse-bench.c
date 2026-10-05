@@ -1422,6 +1422,29 @@ static double kstat_per_op(const char *label, int idx, double ops) {
     return d / ops;
 }
 
+// Join `t`, but only once it has actually finished; otherwise abandon it.
+//
+// Every wait in this section is bounded three ways, and then the probes
+// joined unconditionally -- which is just another unbounded wait on a
+// scheduler that may never run the thread again. On a kernel where a starved
+// thread never observes `stop`, `pthread_join` blocks and the suite sits on
+// one row with every later row unmeasured. Detaching instead lets the thread
+// be reclaimed if it ever does finish, costs this probe its number, and lets
+// the run continue. Returns 0 when the thread was abandoned.
+static int join_or_abandon(pthread_t t, const volatile int *done,
+                           unsigned secs) {
+    for (unsigned i = 0; i < secs * 100u; i++) {
+        if (*done) {
+            pthread_join(t, NULL);
+            return 1;
+        }
+        struct timespec tick = {0, 10 * 1000 * 1000}; // 10 ms
+        nanosleep(&tick, NULL);
+    }
+    pthread_detach(t);
+    return 0;
+}
+
 // Wait for a start gate without using sched_yield().
 //
 // Every gate in this section used to yield, and the yield hand-off probe above
@@ -1469,6 +1492,8 @@ struct parity_ctl {
     int cpu;
     unsigned period_us;
     volatile int pin_failed;
+    volatile int spinner_done;
+    volatile int waker_done;
 };
 
 static void *parity_spinner(void *arg) {
@@ -1486,6 +1511,7 @@ static void *parity_spinner(void *arg) {
     }
     g_sink += x;
     c->spins = n;
+    c->spinner_done = 1;
     return NULL;
 }
 
@@ -1512,6 +1538,7 @@ static void *parity_waker(void *arg) {
     c->wakes = n;
     c->late_sum_ns = sum;
     c->late_max_ns = mx;
+    c->waker_done = 1;
     return NULL;
 }
 
@@ -1543,12 +1570,25 @@ static double parity_run(int cpu, unsigned period_us, uint64_t budget_ns,
                            (long)(ns % 1000000000ull)};
     nanosleep(&run, NULL);
     c.stop = 1;
-    pthread_join(sp, NULL);
-    if (have_waker)
-        pthread_join(wk, NULL);
+    // A spinner that is still inside its loop has already published its count
+    // (it is bumped as it goes), and a waker that never gets the CPU again
+    // must not take the run with it.
+    int sp_ok = join_or_abandon(sp, &c.spinner_done, 10);
+    int wk_ok = have_waker ? join_or_abandon(wk, &c.waker_done, 10) : 1;
     uint64_t dt = now_ns() - t0;
     if (c.pin_failed || dt == 0 || c.spins == 0)
         return NA;
+    if (!sp_ok)
+        return NA; // the count may be mid-update; do not report a half number
+    if (have_waker && !wk_ok) {
+        // The spinner's figure stands -- it is what the probe is for -- but
+        // the waker's own numbers were never published, so they stay n/a
+        // rather than being read out of a struct its thread still owns.
+        if (wake_hz) *wake_hz = NA;
+        if (late_mean_us) *late_mean_us = NA;
+        if (late_max_us) *late_max_us = NA;
+        return (double)c.spins * 1e9 / (double)dt;
+    }
     if (wake_hz)
         *wake_hz = have_waker ? (double)c.wakes * 1e9 / (double)dt : NA;
     if (late_mean_us)
@@ -1588,6 +1628,8 @@ struct lag_ctl {
     uint64_t spin_ns;   // how long the parking thread runs between parks
     unsigned park_us;
     volatile int pin_failed;
+    volatile int plain_done;
+    volatile int parker_done;
 };
 
 // Spin for `ns` of wall clock. Time-based, not iteration-based, so the shape
@@ -1618,6 +1660,7 @@ static void *lag_plain(void *arg) {
     }
     g_sink += x;
     c->plain = n;
+    c->plain_done = 1;
     return NULL;
 }
 
@@ -1633,6 +1676,7 @@ static void *lag_parker(void *arg) {
         nanosleep(&ts, NULL);
     }
     c->parker = n;
+    c->parker_done = 1;
     return NULL;
 }
 
@@ -1663,8 +1707,9 @@ static double lag_share(int cpu, uint64_t spin_ns, unsigned park_us,
                            (long)(ns % 1000000000ull)};
     nanosleep(&run, NULL);
     c.stop = 1;
-    pthread_join(a, NULL);
-    pthread_join(b, NULL);
+    if (!join_or_abandon(a, &c.plain_done, 10) ||
+        !join_or_abandon(b, &c.parker_done, 10))
+        return NA; // one of the two never finished: there is no share to report
     if (c.pin_failed)
         return NA;
     uint64_t total = c.plain + c.parker;
@@ -1703,6 +1748,7 @@ struct steal_ctl {
     // report half the machine idle.
     uint64_t seen_mask;
     int ncpu;
+    volatile int live;   // workers still running
 };
 static struct steal_ctl g_steal;
 
@@ -1725,6 +1771,7 @@ static void *steal_worker(void *arg) {
             __atomic_fetch_or(&c->seen_mask, 1ull << cpu, __ATOMIC_RELAXED);
     }
     g_sink += x;
+    __atomic_sub_fetch(&c->live, 1, __ATOMIC_RELAXED);
     return NULL;
 }
 
@@ -1750,8 +1797,13 @@ static int steal_spread_us(int n, int spawn_cpu, uint64_t budget_ns,
     if (smpk_pin_self(spawn_cpu) != 0)
         return -1;
     for (int i = 0; i < n; i++) {
-        if (pthread_create(&th[i], NULL, steal_worker, &g_steal) != 0)
+        // Counted up BEFORE the thread exists: a worker that decrements on
+        // exit must never be able to drive the count negative early.
+        __atomic_add_fetch(&g_steal.live, 1, __ATOMIC_RELAXED);
+        if (pthread_create(&th[i], NULL, steal_worker, &g_steal) != 0) {
+            __atomic_sub_fetch(&g_steal.live, 1, __ATOMIC_RELAXED);
             break;
+        }
         made++;
     }
     // Release the parent before the workers run: a parent still holding the
@@ -1765,7 +1817,7 @@ static int steal_spread_us(int n, int spawn_cpu, uint64_t budget_ns,
     if (made < 2) {
         g_steal.go = g_steal.stop = 1;
         for (int i = 0; i < made; i++)
-            pthread_join(th[i], NULL);
+            pthread_detach(th[i]);
         return -1;
     }
     uint64_t ns = budget_ns < g_max_ns ? budget_ns : g_max_ns;
@@ -1783,8 +1835,20 @@ static int steal_spread_us(int n, int spawn_cpu, uint64_t budget_ns,
         nanosleep(&tick, NULL);
     }
     g_steal.stop = 1;
-    for (int i = 0; i < made; i++)
-        pthread_join(th[i], NULL);
+    // The mask is already published; a worker the kernel will not run again
+    // must not hold the suite.
+    for (unsigned k = 0; k < 1000u; k++) {
+        if (__atomic_load_n(&g_steal.live, __ATOMIC_RELAXED) <= 0)
+            break;
+        struct timespec tick = {0, 10 * 1000 * 1000};
+        nanosleep(&tick, NULL);
+    }
+    for (int i = 0; i < made; i++) {
+        if (__atomic_load_n(&g_steal.live, __ATOMIC_RELAXED) <= 0)
+            pthread_join(th[i], NULL);
+        else
+            pthread_detach(th[i]);
+    }
     if (occupied)
         *occupied =
             popcount64(__atomic_load_n(&g_steal.seen_mask, __ATOMIC_RELAXED));
@@ -1892,6 +1956,7 @@ struct yield_ctl {
     volatile uint64_t ops;
     int cpu;
     volatile int pin_failed;
+    volatile int peer_done;
 };
 
 static void *yield_peer(void *arg) {
@@ -1911,6 +1976,7 @@ static void *yield_peer(void *arg) {
             break;
         c->turn = 0;
     }
+    c->peer_done = 1;
     return NULL;
 }
 
@@ -1977,7 +2043,9 @@ static double yield_handoff_ns(int cpu, uint64_t budget_ns, const char **why) {
             watchdog_set(0);
             c.stop = 1;
             c.turn = 0;
-            pthread_join(t, NULL);
+            // The peer may be the thread the kernel is not running; do not
+            // wait on it indefinitely to confirm that.
+            join_or_abandon(t, &c.peer_done, 5);
             return NA;
         }
         ops += 2;
@@ -1988,7 +2056,7 @@ static double yield_handoff_ns(int cpu, uint64_t budget_ns, const char **why) {
     watchdog_set(0);
     c.stop = 1;
     c.turn = 1;
-    pthread_join(t, NULL);
+    join_or_abandon(t, &c.peer_done, 5);
     cpu_set_t all;
     CPU_ZERO(&all);
     for (int i = 0; i < g_aff_ncpu && i < CPU_SETSIZE; i++)
@@ -2021,6 +2089,7 @@ struct wake_slot {
     int cpu;
     volatile int stop;
     volatile int pin_failed;
+    volatile int done_exit;
 };
 static struct wake_slot g_wake[WAKE_MAX];
 
@@ -2036,6 +2105,7 @@ static void *wake_sleeper(void *arg) {
         s->word = 0;
         s->done = 1;
     }
+    s->done_exit = 1;
     return NULL;
 }
 
@@ -2115,7 +2185,7 @@ static double wake_burst_ns(int m, int waker_cpu, int target_cpu,
         futex_op(&g_wake[i].word, ECL_FUTEX_WAKE, 1);
     }
     for (int i = 0; i < made; i++)
-        pthread_join(th[i], NULL);
+        join_or_abandon(th[i], &g_wake[i].done_exit, 5);
     cpu_set_t all;
     CPU_ZERO(&all);
     for (int i = 0; i < g_aff_ncpu && i < CPU_SETSIZE; i++)
