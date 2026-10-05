@@ -227,7 +227,7 @@ const CHILD_ENV: &[&str] = &[
     // GTK from init-started children (a foot from the dock, and everything
     // typed into it): the gdk-pixbuf loader registry the gtk-caches oneshot
     // writes at boot, and no dconf. Only labwc's environment file carried
-    // these, so a `firefox-esr` typed into a dock terminal decoded no image
+    // these, so a `firefox` typed into a dock terminal decoded no image
     // ("Could not load a pixbuf from icon theme": `apk --no-scripts` never
     // wrote the system loaders.cache). /etc/profile and the wrapper carry
     // the same two.
@@ -2668,7 +2668,7 @@ mod tests {
     /// `build_child_env` on every renderer.
     /// GTK from a dock terminal: the pixbuf loader registry and the
     /// GSettings backend that labwc's environment file already names, in the
-    /// static base too, so a `firefox-esr` typed into foot decodes images.
+    /// static base too, so a `firefox` typed into foot decodes images.
     #[test]
     fn gtk_finds_its_pixbuf_loaders_from_init_started_children() {
         for var in [

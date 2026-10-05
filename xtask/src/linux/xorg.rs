@@ -355,23 +355,19 @@ const DEFAULT_PACKAGES: &[&str] = &[
     // installed, so the wrapper's own "firefox not found" branch was the only
     // thing that ever ran.
     //
-    // The ESR line, not rapid release: same engine, a feature set that stands
-    // still for a year, and lighter on RAM -- Firefox is the hungriest thing
-    // in the image, and on real hardware it was slow enough to drag labwc
-    // down. Alpine's `firefox-esr` installs to /usr/lib/firefox-esr/ with the
-    // binary `/usr/bin/firefox-esr`, `firefox-esr.desktop` and icons named
-    // `firefox-esr` (the wrapper and the .desktop override in desktop.rs
-    // follow those names). libxul.so alone is ~150 MiB; it reaches the QEMU
-    // live image intact because `usr/lib` is one of LIVE_TREES, which
+    // Rapid-release Firefox. Alpine's `firefox` installs to /usr/lib/firefox/
+    // with the binary `/usr/bin/firefox`, `firefox.desktop` and icons named
+    // `firefox` (the wrapper and the .desktop override in desktop.rs follow
+    // those names). libxul.so alone is ~150 MiB; it reaches the QEMU live
+    // image intact because `usr/lib` is one of LIVE_TREES, which
     // `copy_into_live` copies UNCAPPED, so the 16 MiB LIVE_FILE_CAP that
     // governs the rest of the live root does not apply. The live initramfs is
     // a RAM disk, so it does grow by roughly that much.
     //
-    // `firefox` (rapid release) is the fallback the wrapper also accepts; it
-    // is a separate package with a separate binary name and does NOT
-    // `provides` this one, so a mirror carrying only rapid release needs
-    // ECLIPSE_XORG_PACKAGES.
-    "firefox-esr",
+    // `firefox-esr` remains the fallback the wrapper also accepts; it is a
+    // separate package with a separate binary name and does NOT `provides`
+    // this one, so a mirror carrying only ESR needs ECLIPSE_XORG_PACKAGES.
+    "firefox",
     // What Firefox's GPU probe (`glxtest`, run before the first window) uses
     // to read the graphics card's PCI vendor and device id: it sees
     // `/sys/bus/pci/` and then `dlopen`s `libpci.so.3`, and without the
@@ -2170,14 +2166,14 @@ mod tests {
     }
 
     #[test]
-    fn the_shipped_browser_is_firefox_esr_not_rapid_release() {
+    fn the_shipped_browser_is_firefox_not_esr() {
         assert!(
-            DEFAULT_PACKAGES.contains(&"firefox-esr"),
-            "firefox-esr must be in the default package set"
+            DEFAULT_PACKAGES.contains(&"firefox"),
+            "firefox must be in the default package set"
         );
         assert!(
-            !DEFAULT_PACKAGES.contains(&"firefox"),
-            "rapid-release firefox must not be installed next to ESR: two 150 MiB \
+            !DEFAULT_PACKAGES.contains(&"firefox-esr"),
+            "ESR must not be installed next to rapid-release: two 150 MiB \
              libxul.so in a RAM-backed image, and two menu entries"
         );
     }

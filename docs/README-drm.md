@@ -32,7 +32,7 @@ para Xorg con el driver `fbdev`.
 | Nodo | major:minor | Estado |
 |---|---|---|
 | `/dev/dri/card0` | 226:0 | ✅ nodo primario (KMS + dumb buffers) |
-| `/dev/dri/renderD128` | 226:128 | 🟡 nodo de render; el filtro `DRM_RENDER_ALLOW` está escrito pero **solo observa** (ver abajo) |
+| `/dev/dri/renderD128` | 226:128 | ✅ nodo de render; solo `DRM_RENDER_ALLOW` (modeset/dumb/master → EACCES) |
 | `/dev/fb0` | 29:0 | ✅ framebuffer legacy (`fbdev`) |
 | `/sys/class/drm/card0` | — | ✅ entradas mínimas en sysfs |
 
@@ -42,11 +42,9 @@ Linux hace que `renderD128` **solo** acepte los ioctls marcados
 `DRM_RENDER_ALLOW` en `drm_ioctl.c` (`VERSION`, `GET_CAP`, `GEM_CLOSE`,
 `PRIME_*`, `SYNCOBJ_*`, `SET_CLIENT_NAME` y el rango de comandos del driver) y
 devuelva **EACCES** a cualquier ioctl de modeset, *dumb buffers* o master/auth.
-Eclipse tiene el filtro escrito (`render_allowed`) pero **todavía solo
-observa**: registra en el klog el ioctl que Linux habría rechazado y lo deja
-pasar, porque activarlo a ciegas rompería el escritorio software-GL que hoy
-arranca por ese nodo. Hasta que se active, `renderD128` se comporta como un
-segundo nodo KMS completo (ver `drm_scheme.rs`, `io_control`).
+Eclipse aplica el mismo filtro (`render_allowed` en `drm_scheme.rs`): el
+escritorio pincha KMS en `card0` con `WLR_DRM_DEVICES=/dev/dri/card0`, así
+que el nodo de render ya no es un segundo KMS abierto.
 
 ### Punteros de usuario
 
@@ -312,7 +310,7 @@ esto no:
 | ~~Los fd de `sync_file` no se pueden sondear~~ | **Corregido:** `SyncobjHandle::poll` reporta `POLLIN` cuando la fence alcanzó el punto; `subscribe_readiness` + el poller de fences HW despiertan `sys_poll` al aterrizar (sin eso `sync_wait()` de Mesa en GLX/DRI3 mataba el swapchain: `zink: swapchain killed`) |
 | `OUT_FENCE_PTR` devuelve una fence ya señalada | Quien marque el ritmo de frames con ella suelta buffers aún en escaneo |
 | El arm síncrono de `SYNCOBJ_WAIT` puede girar sin ceder la CPU | Una corrutina del kernel atascada; la máquina parece congelada |
-| Sin caché de dma-buf por objeto ni de handles PRIME por fichero | wlroots agota el tope global de 64 objetos GEM a los 64 frames |
+| Sin caché de dma-buf por objeto ni de handles PRIME por fichero | Tope GEM subido a 256; sigue sin dedup PRIME por fichero |
 | `ADDFB2` no valida formato, flags ni modifiers | Un modifier con tiling se acepta y se escanea como lineal: basura |
 | El límite de clips de `DIRTYFB` es 64 donde Linux usa 256, y `ANNOTATE_COPY` no está | Cada frame con más daño cae al blit de pantalla completa por CPU |
 | Sin estado de master | Todo ioctl `DRM_MASTER` lo puede emitir cualquiera |
@@ -320,7 +318,7 @@ esto no:
 | Sin `GAMMA_LUT`/`CTM` | gammastep, luz nocturna y la gamma de RandR no hacen nada |
 | Sin `IN_FORMATS` en el plano | Inocuo mientras `DRM_CAP_ADDFB2_MODIFIERS` sea 0; obligatorio el día que se ponga a 1 |
 | `CRTC_GET_SEQUENCE`/`QUEUE_SEQUENCE` no existen | Pero `DRM_CAP_CRTC_IN_VBLANK_EVENT` dice 1: Xorg sondea, falla y cae a `drmWaitVBlank` |
-| El filtro del nodo de render solo observa | `renderD128` es un segundo nodo KMS completo, con dumb buffers incluidos |
+| ~~El filtro del nodo de render solo observa~~ | Corregido: `renderD128` rechaza modeset/dumb/master con EACCES |
 | Sin `fdinfo` (`drm-usage-stats.rst`) | `nvtop` y similares no ven nada |
 
 ## Cómo lanzar labwc
@@ -388,10 +386,9 @@ Con `drm.atomic` y la ruta atómica activa se ve además:
 ```
 
 - Si se detiene en `VERSION` (o `minor=128`, el render node) y no aparece
-  `GETRESOURCES`, es la inicialización del renderer GL: usa `WLR_RENDERER=pixman`.
-- `[drm] render node: ioctl ... is NOT in Linux's DRM_RENDER_ALLOW set --
-  allowed anyway for now` es lo que de verdad se imprime: el filtro observa y
-  deja pasar. Nada devuelve EACCES todavía.
+  `GETRESOURCES`, es la inicialización del renderer GL: usa `WLR_RENDERER=pixman`
+  y asegúrate de `WLR_DRM_DEVICES=/dev/dri/card0` (el render node ahora
+  rechaza modeset/dumb con EACCES).
 - Si llega a `SETCRTC`/`scanout` pero no se ve nada, el problema está en el
   *blit* al framebuffer (ver [`drm.rs`](../linux-object/src/fs/devfs/drm.rs)).
 - `[drm] UNHANDLED ioctl …` indica un ioctl que labwc pide y aún no manejamos
