@@ -502,6 +502,12 @@ impl<'a, H: Handler> Perform for Performer<'a, H> {
             // ncurses callers that emit it after a carriage return).
             (b'D', []) => self.handler.linefeed(),
             // NEL (Next Line): CR + LF.
+            //
+            // The carriage return changes nothing today, and mutation is right
+            // that dropping it is invisible: `linefeed` resets the column
+            // itself, first thing. It stays because NEL is defined as CR then
+            // LF, and without it a linefeed that ever stopped resetting the
+            // column would quietly take NEL with it.
             (b'E', []) => {
                 self.handler.carriage_return();
                 self.handler.linefeed();

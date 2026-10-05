@@ -1105,3 +1105,643 @@ fn a_console_straight_on_the_frame_buffer_survives_a_scroll() {
     send(&mut c, "aaaa\r\nbbbb\r\ncccc");
     assert_eq!(c.cursor(), (1, 4));
 }
+
+// ---------------------------------------------------------------------------
+// The mode numbers
+// ---------------------------------------------------------------------------
+
+#[test]
+fn every_mode_the_parser_knows_is_reached_by_its_own_number() {
+    use crate::ansi::Mode;
+    // `\e[?7h` and `\e[7h` are different sequences: the `?` makes the number
+    // private, and the two sets of numbers do not overlap at all. Nothing held
+    // the table to that, so a mode could answer to the wrong number, or to
+    // both, and the only symptom would be an app whose cursor stops blinking
+    // when it asked for something else entirely.
+    for (num, mode) in [
+        (1, Mode::CursorKeys),
+        (3, Mode::ColumnMode),
+        (6, Mode::Origin),
+        (7, Mode::LineWrap),
+        (12, Mode::BlinkingCursor),
+        (25, Mode::ShowCursor),
+        (47, Mode::SwapScreenOld),
+        (1000, Mode::ReportMouseClicks),
+        (1002, Mode::ReportCellMouseMotion),
+        (1003, Mode::ReportAllMouseMotion),
+        (1004, Mode::ReportFocusInOut),
+        (1005, Mode::Utf8Mouse),
+        (1006, Mode::SgrMouse),
+        (1007, Mode::AlternateScroll),
+        (1042, Mode::UrgencyHints),
+        (1047, Mode::SwapScreenBuffer),
+        (1049, Mode::SwapScreenAndSetRestoreCursor),
+        (2004, Mode::BracketedPaste),
+    ] {
+        assert_eq!(
+            Mode::from_primitive(Some(&b'?'), num),
+            Some(mode),
+            "?{} is not the mode it should be",
+            num
+        );
+        assert_eq!(
+            Mode::from_primitive(None, num),
+            None,
+            "{} is a private mode and was accepted without the ?",
+            num
+        );
+    }
+    // The two public ones, and the same check the other way round.
+    for (num, mode) in [(4, Mode::Insert), (20, Mode::LineFeedNewLine)] {
+        assert_eq!(
+            Mode::from_primitive(None, num),
+            Some(mode),
+            "{} is not the mode it should be",
+            num
+        );
+        assert_eq!(
+            Mode::from_primitive(Some(&b'?'), num),
+            None,
+            "?{} is not a private mode and was accepted as one",
+            num
+        );
+    }
+    // Any other intermediate byte is refused outright, private or not.
+    assert_eq!(Mode::from_primitive(Some(&b'>'), 7), None);
+    assert_eq!(Mode::from_primitive(Some(&b'>'), 4), None);
+    // And a number in neither set stays unknown rather than falling through to
+    // whichever arm the match happens to end on.
+    assert_eq!(Mode::from_primitive(None, 7), None);
+    assert_eq!(Mode::from_primitive(Some(&b'?'), 4), None);
+    assert_eq!(Mode::from_primitive(Some(&b'?'), 9999), None);
+}
+
+// ---------------------------------------------------------------------------
+// The control characters and the escapes with no bracket
+// ---------------------------------------------------------------------------
+
+#[test]
+fn the_control_characters_each_mean_their_own_motion() {
+    let mut c = uncached(8, 3);
+    // Backspace steps one column left; carriage return goes all the way to the
+    // first one. Either standing in for the other is invisible in anything but
+    // a line that was already written to.
+    send(&mut c, "abc\x08X");
+    assert_eq!(
+        row(&mut c, 0),
+        "abX     ",
+        "backspace did not step one column"
+    );
+    send(&mut c, "\rZ");
+    assert_eq!(
+        row(&mut c, 0),
+        "ZbX     ",
+        "carriage return did not reach column one"
+    );
+
+    // Vertical tab and form feed are linefeeds too -- `cat` of a text file with
+    // page breaks in it emits both -- and this console's linefeed returns to
+    // the first column on the way down.
+    let mut c = uncached(8, 3);
+    send(&mut c, "abc\x0bd\x0ce");
+    assert_eq!(
+        screen(&mut c),
+        "abc     |d       |e       ",
+        "vertical tab and form feed did not move down and back"
+    );
+}
+
+#[test]
+fn the_escapes_with_no_bracket_do_what_their_letter_says() {
+    // IND moves down a line. Its neighbour RI moves up, and they are one
+    // letter apart in a match arm.
+    let mut c = uncached(4, 3);
+    send(&mut c, "aa\x1bDb");
+    assert_eq!(screen(&mut c), "aa  |b   |    ", "ESC D did not move down");
+
+    // `ESC ) 0` loads the *second* charset, G1, which this console accepts and
+    // then ignores: only G0 draws boxes, so a `q` after it is still a `q`.
+    let mut c = uncached(4, 1);
+    send(&mut c, "\x1b)0q");
+    assert_eq!(row(&mut c, 0), "q   ", "ESC ) 0 turned on line drawing");
+    let mut c = uncached(4, 1);
+    send(&mut c, "\x1b)Bq");
+    assert_eq!(row(&mut c, 0), "q   ");
+}
+
+// ---------------------------------------------------------------------------
+// The CSI table: the aliases, the off-by-one and the defaults
+// ---------------------------------------------------------------------------
+
+#[test]
+fn the_second_spelling_of_a_motion_moves_the_same_way() {
+    // `e`, `a` and the backtick are the older spellings of CUD, CUF and CHA.
+    // Which one a terminal sees is up to whoever wrote the terminfo entry, so
+    // dropping an alias breaks exactly the apps that use that entry.
+    for (seq, want) in [
+        ("\x1b[2B", (2, 0)),
+        ("\x1b[2e", (2, 0)),
+        ("\x1b[3C", (0, 3)),
+        ("\x1b[3a", (0, 3)),
+        ("\x1b[4G", (0, 3)),
+        ("\x1b[4`", (0, 3)),
+    ] {
+        let mut c = uncached(8, 4);
+        send(&mut c, seq);
+        assert_eq!(c.cursor(), want, "{:?} did not move the cursor", seq);
+    }
+}
+
+#[test]
+fn a_position_given_to_the_console_counts_from_one_and_keeps_the_other_axis() {
+    // CHA (`G`) names a column and VPA (`d`) names a row. Both count from one,
+    // and neither is allowed to touch the axis it does not name -- which is
+    // the whole difference between them and `H`, that names both.
+    let mut c = uncached(8, 6);
+    send(&mut c, "\x1b[3;5H");
+    assert_eq!(c.cursor(), (2, 4));
+    send(&mut c, "\x1b[2G");
+    assert_eq!(
+        c.cursor(),
+        (2, 1),
+        "CHA moved the row, or counted from zero"
+    );
+    send(&mut c, "\x1b[4d");
+    assert_eq!(
+        c.cursor(),
+        (3, 1),
+        "VPA moved the column, or counted from zero"
+    );
+}
+
+#[test]
+fn moving_up_with_a_carriage_return_lands_on_the_first_column() {
+    // CPL (`F`) is CUU plus a carriage return, and the pair of them differ by
+    // one argument at the call.
+    let mut c = uncached(8, 6);
+    send(&mut c, "\x1b[4;5H\x1b[2F");
+    assert_eq!(c.cursor(), (1, 0), "CPL did not return to the first column");
+}
+
+#[test]
+fn a_csi_with_more_than_one_intermediate_is_refused() {
+    // `\e[?25$h` is a DECRQM-shaped sequence, not DECSET: it carries a second
+    // intermediate byte, and the mode arms match *any* intermediates, so
+    // without the guard above them the `?` alone is enough to act on it.
+    let mut c = uncached(4, 2);
+    send(&mut c, "\x1b[?25l");
+    send(&mut c, "\x1b[?25$h");
+    assert!(
+        !c.cursor_visible(),
+        "a sequence with two intermediates was taken as DECSET"
+    );
+
+    // The other half of the guard is the parser's own "there was more here
+    // than I can hold" flag, which it raises on more parameters than it has
+    // room for -- with no intermediates at all, so the count cannot catch it.
+    let mut c = uncached(4, 2);
+    let mut flood = String::from("\x1b[");
+    for _ in 0..32 {
+        flood.push_str("1;");
+    }
+    flood.push_str("1m");
+    send(&mut c, &flood);
+    send(&mut c, "X");
+    assert_eq!(
+        cell(&mut c, 0, 0).flags,
+        Flags::empty(),
+        "an overflowing CSI was acted on anyway"
+    );
+}
+
+#[test]
+fn a_status_query_with_no_number_is_not_a_cursor_report() {
+    // DSR's parameter has no default: `\e[n` asks nothing. Answering it with a
+    // cursor report puts bytes in the input stream that the program on the
+    // other end never asked for, and a shell reads them as typing.
+    let mut c = uncached(8, 4);
+    send(&mut c, "\x1b[n");
+    assert_eq!(c.pop_report(), None, "an empty DSR was answered");
+}
+
+#[test]
+fn the_scroll_region_defaults_are_the_whole_screen() {
+    // DECSTBM is how a full-screen app gives the screen back: `\e[r` with no
+    // parameters means "no region". A top that defaults to anything but the
+    // first row leaves a band frozen under every app that resets this way.
+    for seq in ["\x1b[r", "\x1b[0;0r"] {
+        let mut c = uncached(4, 3);
+        send(&mut c, "\x1b[2;3r");
+        send(&mut c, seq);
+        send(&mut c, "aaaa\r\nbbbb\r\ncccc\r\n");
+        assert_eq!(
+            screen(&mut c),
+            "bbbb|cccc|    ",
+            "{:?} left a region behind",
+            seq
+        );
+    }
+
+    // A bottom left out, or given as a zero, is the *last* row and not row one
+    // -- a region of one line is no region at all, so getting this wrong is
+    // again the whole screen.
+    for seq in ["\x1b[2r", "\x1b[2;0r"] {
+        let mut c = uncached(4, 3);
+        send(&mut c, seq);
+        send(&mut c, "aaaa\r\nbbbb\r\ncccc\r\n");
+        assert_eq!(
+            screen(&mut c),
+            "aaaa|cccc|    ",
+            "{:?} is not the rows from two to the bottom",
+            seq
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The SGR table
+// ---------------------------------------------------------------------------
+
+#[test]
+fn every_colour_parameter_names_its_own_colour() {
+    // Sixty-four lines of table, each a number and a colour, and nothing read
+    // more than six of them. The two halves are the same sixteen colours with
+    // a different offset, which is exactly how a copy-paste slip survives.
+    let mut c = uncached(16, 2);
+    for (i, (fg_param, bg_param, want)) in [
+        (30, 40, NamedColor::Black),
+        (31, 41, NamedColor::Red),
+        (32, 42, NamedColor::Green),
+        (33, 43, NamedColor::Yellow),
+        (34, 44, NamedColor::Blue),
+        (35, 45, NamedColor::Magenta),
+        (36, 46, NamedColor::Cyan),
+        (37, 47, NamedColor::White),
+        (90, 100, NamedColor::BrightBlack),
+        (91, 101, NamedColor::BrightRed),
+        (92, 102, NamedColor::BrightGreen),
+        (93, 103, NamedColor::BrightYellow),
+        (94, 104, NamedColor::BrightBlue),
+        (95, 105, NamedColor::BrightMagenta),
+        (96, 106, NamedColor::BrightCyan),
+        (97, 107, NamedColor::BrightWhite),
+    ]
+    .iter()
+    .copied()
+    .enumerate()
+    {
+        send(&mut c, &alloc::format!("\x1b[{};{}mX", fg_param, bg_param));
+        let x = cell(&mut c, 0, i);
+        assert_eq!(
+            x.fg,
+            Color::Named(want),
+            "SGR {} is the wrong foreground",
+            fg_param
+        );
+        assert_eq!(
+            x.bg,
+            Color::Named(want),
+            "SGR {} is the wrong background",
+            bg_param
+        );
+    }
+}
+
+#[test]
+fn the_two_parameters_that_mean_default_read_their_own_half_of_the_template() {
+    // 39 and 49 each go back to a fresh cell's colour, and the two are *not*
+    // the same colour, so reading the wrong field of the template is a visible
+    // wrong colour rather than a no-op.
+    assert_ne!(
+        Cell::default().fg,
+        Cell::default().bg,
+        "the two defaults are one colour, so this test proves nothing"
+    );
+    let mut c = uncached(8, 2);
+    send(&mut c, "\x1b[31;41m\x1b[39;49mX");
+    let x = cell(&mut c, 0, 0);
+    assert_eq!(x.fg, Cell::default().fg, "39 is not the default foreground");
+    assert_eq!(x.bg, Cell::default().bg, "49 is not the default background");
+}
+
+#[test]
+fn every_flag_attribute_is_set_and_cleared_by_its_own_parameter() {
+    // Each row is the parameter that turns a flag on, the one that turns it
+    // off, and the flag. The cancels are the half that matters: a cancel that
+    // clears the wrong flag leaves an app bold forever, and the suite only
+    // ever turned the whole lot on and off together.
+    for (on, off, flag) in [
+        (1, 21, Flags::BOLD),
+        (1, 22, Flags::BOLD),
+        (2, 22, Flags::DIM),
+        (3, 23, Flags::ITALIC),
+        (4, 24, Flags::UNDERLINE),
+        (7, 27, Flags::INVERSE),
+        (8, 28, Flags::HIDDEN),
+        (9, 29, Flags::STRIKEOUT),
+    ] {
+        let mut c = uncached(8, 2);
+        send(&mut c, &alloc::format!("\x1b[{}mX", on));
+        assert!(
+            cell(&mut c, 0, 0).flags.contains(flag),
+            "SGR {} did not set {:?}",
+            on,
+            flag
+        );
+        send(&mut c, &alloc::format!("\x1b[{}mY", off));
+        assert!(
+            !cell(&mut c, 0, 1).flags.contains(flag),
+            "SGR {} did not clear {:?}",
+            off,
+            flag
+        );
+    }
+
+    // `4:0` and `4:2` are the subparameter spellings of "no underline" and
+    // "double underline". The second one this console does not draw, so it
+    // must not quietly draw a single one instead.
+    let mut c = uncached(8, 2);
+    send(&mut c, "\x1b[4m\x1b[4:0mX");
+    assert!(
+        !cell(&mut c, 0, 0).flags.contains(Flags::UNDERLINE),
+        "4:0 did not clear the underline"
+    );
+    let mut c = uncached(8, 2);
+    send(&mut c, "\x1b[4:2mX");
+    assert!(
+        !cell(&mut c, 0, 0).flags.contains(Flags::UNDERLINE),
+        "4:2 drew a single underline"
+    );
+}
+
+#[test]
+fn the_three_spellings_of_a_truecolour_mean_the_same_colour() {
+    // The semicolon form is one parameter and the components after it; the two
+    // colon forms are one parameter with subparameters, and the longer of them
+    // carries an empty colour-space id that has to be stepped over. All three
+    // are in use -- the colon forms are what a modern `ls --color` emits -- and
+    // the arm that reads them is written twice, once per half of the cell.
+    for spec in ["38;2;1;2;3", "38:2:1:2:3", "38:2::1:2:3"] {
+        let mut c = uncached(8, 2);
+        send(&mut c, &alloc::format!("\x1b[{}mX", spec));
+        assert_eq!(
+            cell(&mut c, 0, 0).fg,
+            Color::Spec(Rgb888::new(1, 2, 3)),
+            "{} is not rgb(1,2,3) in the foreground",
+            spec
+        );
+    }
+    for spec in ["48;2;1;2;3", "48:2:1:2:3", "48:2::1:2:3"] {
+        let mut c = uncached(8, 2);
+        send(&mut c, &alloc::format!("\x1b[{}mX", spec));
+        assert_eq!(
+            cell(&mut c, 0, 0).bg,
+            Color::Spec(Rgb888::new(1, 2, 3)),
+            "{} is not rgb(1,2,3) in the background",
+            spec
+        );
+    }
+}
+
+#[test]
+fn a_colour_number_that_does_not_fit_a_byte_is_refused() {
+    // An index is one byte wide. Truncating 300 instead of refusing it paints
+    // colour 44, which is a colour, so nothing downstream ever complains.
+    let mut c = uncached(8, 2);
+    send(&mut c, "\x1b[31m\x1b[38;5;300mX");
+    assert_eq!(
+        cell(&mut c, 0, 0).fg,
+        Color::Named(NamedColor::Red),
+        "an index wider than a byte was taken anyway"
+    );
+}
+
+#[test]
+fn a_colour_specifier_nobody_knows_leaves_the_colour_alone() {
+    // 2 is an rgb triple and 5 is an index; everything else is reported and
+    // dropped. Falling through to an index of zero would paint the cell black.
+    let mut c = uncached(8, 2);
+    send(&mut c, "\x1b[31m\x1b[38;9;1mX");
+    assert_eq!(
+        cell(&mut c, 0, 0).fg,
+        Color::Named(NamedColor::Red),
+        "an unknown colour specifier changed the colour"
+    );
+}
+
+#[test]
+fn an_unknown_sgr_parameter_changes_nothing() {
+    // The table ends in a report-and-drop. Ending it in a reset instead would
+    // wipe the colours an app set three sequences ago, from a parameter it
+    // sent for a terminal that has it.
+    let mut c = uncached(8, 2);
+    send(&mut c, "\x1b[1;31m\x1b[99mX");
+    let x = cell(&mut c, 0, 0);
+    assert_eq!(
+        x.fg,
+        Color::Named(NamedColor::Red),
+        "an unknown SGR reset the colour"
+    );
+    assert!(
+        x.flags.contains(Flags::BOLD),
+        "an unknown SGR reset the flags"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The line-drawing table
+// ---------------------------------------------------------------------------
+
+#[test]
+fn every_line_drawing_letter_has_its_own_box_character() {
+    // Seventeen letters, and two of them were read. Five of the seventeen all
+    // mean the same horizontal line, which is what makes the table look
+    // arbitrary enough to mistype: the one next to them means a vertical one.
+    let mut c = uncached(1, 1);
+    send(&mut c, "\x1b(0");
+    for (letter, glyph) in [
+        ('j', '┘'),
+        ('k', '┐'),
+        ('l', '┌'),
+        ('m', '└'),
+        ('n', '┼'),
+        ('q', '─'),
+        ('o', '─'),
+        ('p', '─'),
+        ('r', '─'),
+        ('s', '─'),
+        ('t', '├'),
+        ('u', '┤'),
+        ('v', '┴'),
+        ('w', '┬'),
+        ('x', '│'),
+        ('a', '▒'),
+        ('0', '█'),
+    ] {
+        send(&mut c, &alloc::format!("\r{}", letter));
+        assert_eq!(
+            cell(&mut c, 0, 0).c,
+            glyph,
+            "{} does not draw what it should",
+            letter
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Scrolling, regions and the alternate screen: the rest
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_linefeed_below_the_region_scrolls_nothing_and_stays_on_screen() {
+    // A region does not pin the cursor into it, and `\e[r` leaves one behind
+    // whose bottom is above the cursor. The row the cursor is on is then the
+    // last of the screen but not the last of the region: scrolling the region
+    // there would move text the app never asked to move, and walking down
+    // would put the cursor on a row the buffer does not have.
+    let mut c = uncached(4, 5);
+    send(&mut c, "aaaa\r\nbbbb\r\ncccc\r\ndddd\r\neeee");
+    send(&mut c, "\x1b[2;4r\x1b[5;1H\nX");
+    assert_eq!(
+        screen(&mut c),
+        "aaaa|bbbb|cccc|dddd|Xeee",
+        "a linefeed below the region moved something"
+    );
+    assert_eq!(
+        c.buf_mut().rejected,
+        0,
+        "the cursor walked off the bottom of the buffer"
+    );
+}
+
+#[test]
+fn scrolling_the_screen_down_moves_the_text_down() {
+    // SU and SD are one letter apart and the suite only ever scrolled a region
+    // by more than it holds, which clears it whichever way it went.
+    let mut c = uncached(4, 4);
+    send(&mut c, "aaaa\r\nbbbb\r\ncccc\r\ndddd");
+    send(&mut c, "\x1b[2T");
+    assert_eq!(
+        screen(&mut c),
+        "    |    |aaaa|bbbb",
+        "SD scrolled the wrong way"
+    );
+    send(&mut c, "\x1b[1S");
+    assert_eq!(
+        screen(&mut c),
+        "    |aaaa|bbbb|    ",
+        "SU scrolled the wrong way"
+    );
+}
+
+#[test]
+fn a_screen_of_one_row_still_scrolls() {
+    // With one row the top of the region and its bottom are the same number,
+    // and the guard that rules out an upside-down region is one character away
+    // from ruling out that one too -- which is a console that never scrolls at
+    // all on a frame buffer shorter than two character cells.
+    let mut c = uncached(4, 1);
+    send(&mut c, "abcd\ncd");
+    assert_eq!(row(&mut c, 0), "cd  ", "the only row was never blanked");
+}
+
+#[test]
+fn a_full_screen_scroll_leaves_the_current_attributes_behind_it() {
+    // There are two ways down: a region that is the whole screen goes through
+    // the buffer's own `new_line`, which is what feeds the scrollback, and a
+    // partial one goes through `scroll_region_up`. They fill the vacated row
+    // from different cells -- the attribute template against its background
+    // alone -- so which path ran is visible in the colour of the new row.
+    let mut c = uncached(4, 2);
+    send(&mut c, "\x1b[31maaaa\r\nbbbb\x1b[1S");
+    assert_eq!(screen(&mut c), "bbbb|    ");
+    assert_eq!(
+        cell(&mut c, 1, 0).fg,
+        Color::Named(NamedColor::Red),
+        "the whole-screen scroll did not go through new_line"
+    );
+}
+
+#[test]
+fn scrolling_the_whole_screen_by_three_moves_three_rows() {
+    // The whole-screen path scrolls one line at a time, in a loop over the
+    // count, so the count is the one thing in it that can be dropped.
+    let mut c = uncached(4, 4);
+    send(&mut c, "aaaa\r\nbbbb\r\ncccc\r\ndddd");
+    send(&mut c, "\x1b[3S");
+    assert_eq!(screen(&mut c), "dddd|    |    |    ");
+}
+
+#[test]
+fn the_buffer_shrinking_under_the_alternate_screen_is_not_a_panic() {
+    // The alternate screen saves every cell of the main one and writes them
+    // back on the way out. If the display mode changed in between -- which is
+    // the whole reason the console asks the buffer for its size every time --
+    // the saved screen is bigger than the one it is being written into, and
+    // both of its dimensions have to be clamped, not just the rows.
+    let mut c = uncached(4, 4);
+    send(&mut c, "aaaa\r\nbbbb\r\ncccc\r\ndddd");
+    send(&mut c, "\x1b[?1049h");
+    c.buf_mut().resize(2, 2);
+    send(&mut c, "\x1b[?1049l");
+    assert_eq!(
+        c.buf_mut().rejected,
+        0,
+        "the restore wrote outside the buffer"
+    );
+    assert_eq!(screen(&mut c), "aa|bb");
+}
+
+#[test]
+fn opening_or_closing_lines_above_the_region_does_nothing() {
+    // IL and DL are defined only inside the region. The row above it is the
+    // case that gets through a guard written with the wrong connective: the
+    // row below it is caught one layer down, by the buffer refusing an
+    // upside-down range, but above it the range is merely *wider* than the
+    // region, so the whole screen moves instead of nothing.
+    let mut c = uncached(4, 4);
+    send(&mut c, "aaaa\r\nbbbb\r\ncccc\r\ndddd");
+    send(&mut c, "\x1b[3;4r\x1b[1;1H\x1b[L");
+    assert_eq!(
+        screen(&mut c),
+        "aaaa|bbbb|cccc|dddd",
+        "IL above the region opened a line anyway"
+    );
+    send(&mut c, "\x1b[M");
+    assert_eq!(
+        screen(&mut c),
+        "aaaa|bbbb|cccc|dddd",
+        "DL above the region closed a line anyway"
+    );
+}
+
+#[test]
+fn reverse_index_inside_the_region_just_moves_up() {
+    // RI scrolls only at the top of the region; anywhere else it is a plain
+    // step up, and the row right under the top is where the guard for "there
+    // is a row above me" and the one for "I am at the top" overlap.
+    let mut c = uncached(4, 3);
+    send(&mut c, "aaaa\r\nbbbb\r\ncccc");
+    send(&mut c, "\x1b[2;1H\x1bM");
+    assert_eq!(c.cursor(), (0, 0), "RI did not step up");
+    assert_eq!(screen(&mut c), "aaaa|bbbb|cccc", "RI scrolled from inside");
+}
+
+#[test]
+fn line_wrap_can_be_turned_back_on() {
+    // An app that turns wrapping off for its own drawing turns it back on when
+    // it leaves. Only the off switch was ever read, so the on switch could set
+    // the same flag and the symptom would be a shell that stops wrapping after
+    // the first full-screen program exits.
+    let mut c = uncached(4, 3);
+    send(&mut c, "\x1b[?7l");
+    send(&mut c, "aaaaX");
+    assert_eq!(screen(&mut c), "aaaa|    |    ", "the X was not swallowed");
+    send(&mut c, "\x1b[?7h");
+    send(&mut c, "Y");
+    assert_eq!(
+        screen(&mut c),
+        "aaaa|Y   |    ",
+        "the wrap never came back on"
+    );
+}
