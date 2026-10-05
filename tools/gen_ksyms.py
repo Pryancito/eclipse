@@ -188,6 +188,58 @@ def shorten(name):
     return name[:keep_head] + ".." + name[-keep_tail:]
 
 
+def common_prefix(names):
+    """The longest string every name in `names` starts with."""
+    first = names[0]
+    for i, ch in enumerate(first):
+        for other in names[1:]:
+            if i >= len(other) or other[i] != ch:
+                return first[:i]
+    return first
+
+
+def fold_name(names):
+    """One name for an address that several symbols share.
+
+    Several do. In the x86_64 image this is committed against there are 63 such
+    addresses, and the worst holds 35 names: the NVIDIA RM shim's stubs, where
+    one address is `osAllocatedRmClient` and also thirty-four other things.
+    Keeping whichever name `nm` listed first printed one of them as if it were
+    the only one, with no hedge -- and a concrete name on a stop screen is
+    exactly what gets believed. The cases that produce a shared address are
+    aliases of one function under several names, and sibling instantiations of
+    a generic whose body never touches its type parameter, which the linker is
+    free to fold into one body.
+
+    So when the names agree except in the middle -- which is what sibling
+    monomorphizations look like -- the differing part becomes `?` and the count
+    is carried along: `lock::ticket::TicketMutex<?>::lock +7`. A reader then
+    knows not to build a theory on the type. Names that share no shape are not
+    siblings but genuine aliases (`memcpy` / `__memcpy`); the first still wins,
+    because `?memcpy` says less than either name does. Either way the count is
+    what tells the reader to doubt the name.
+    """
+    uniq = list(dict.fromkeys(names))
+    if len(uniq) == 1:
+        return uniq[0]
+    extra = f" +{len(uniq) - 1}"
+    prefix = common_prefix(uniq)
+    # The suffix may not reach back into the prefix on the shortest name, or a
+    # pair like ("ab", "aXb") would report more shared text than exists.
+    room = min(len(n) for n in uniq) - len(prefix)
+    suffix = common_prefix([n[::-1] for n in uniq])[::-1]
+    if room > 0:
+        suffix = suffix[len(suffix) - min(len(suffix), room) :]
+    else:
+        suffix = ""
+    # Siblings share a head AND a tail and differ in the middle, which is what
+    # makes the `?` mean something. One end alone says only "there is more
+    # before this" or "after this", and the concrete first name is more use
+    # than that -- the count is what tells the reader to doubt it.
+    if not prefix or not suffix or len(prefix) + len(suffix) < 4:
+        return uniq[0] + extra
+    return f"{prefix}?{suffix}" + extra
+
 def collect(nm, elf):
     """`[(addr, name)]` for every function symbol, address-sorted and deduped."""
     out = subprocess.run(
@@ -214,15 +266,26 @@ def collect(nm, elf):
         name = name.strip()
         if addr == 0 or not name or name in MARKERS or is_noise(name):
             continue
-        syms.append((addr, size, shorten(name)))
+        syms.append((addr, size, name))
     # Address first, then sized symbols before sizeless ones: at a shared
     # address the real function wins over an alias or a stray label.
     syms.sort(key=lambda s: (s[0], 0 if s[1] else 1))
+    # One entry per address. Where several symbols share one, the names are
+    # folded rather than one of them picked -- see `fold_name`. Sizeless
+    # symbols are left out of the fold whenever a sized one is present: a
+    # stray label next to a real function is not a sibling of it.
     deduped = []
-    for addr, _size, name in syms:
-        if deduped and deduped[-1][0] == addr:
-            continue
-        deduped.append((addr, name))
+    i = 0
+    while i < len(syms):
+        addr = syms[i][0]
+        j = i
+        while j < len(syms) and syms[j][0] == addr:
+            j += 1
+        group = syms[i:j]
+        sized = [name for _a, size, name in group if size]
+        names = sized or [name for _a, _s, name in group]
+        deduped.append((addr, shorten(fold_name(names))))
+        i = j
     return deduped
 
 
