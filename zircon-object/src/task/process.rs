@@ -158,6 +158,74 @@ pub fn vtable_info(vtable: usize) -> Option<(usize, usize, usize)> {
     unsafe { Some((*words, *words.add(1), *words.add(2))) }
 }
 
+/// Which word of an `ext` fat pointer has moved since the snapshot the
+/// constructor took ([`Process::ext_born`]).
+///
+/// The verdict exists on its own because the two words fail in different ways,
+/// and only one of them is visible to a `downcast_ref`. The type identity a
+/// downcast checks lives in the VTABLE word, so a vtable that moved makes the
+/// downcast fail and lands in the corruption report. A DATA word that moved
+/// leaves the vtable -- and therefore the `TypeId` -- correct: the downcast
+/// SUCCEEDS and hands back a `&LinuxProcess` built on whatever address was
+/// written over the field. Nothing then checks it, and the first field access
+/// through it faults at that address plus an offset, which is how a
+/// `TicketMutex::lock` was seen writing to `0x10`. So the data word has to be
+/// asked about separately, before the reference is handed out.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum ExtDrift {
+    /// Both words still read as they did at construction.
+    Intact,
+    /// The data word moved and the vtable did not: one 8-byte store. The
+    /// downcast still succeeds, so this is the case that must be caught here.
+    DataOnly,
+    /// The vtable word moved and the data did not: one 8-byte store, caught by
+    /// the failing downcast.
+    VtableOnly,
+    /// Both words moved: a whole fat pointer was assigned over the field.
+    Both,
+}
+
+impl ExtDrift {
+    /// Whether anything moved at all.
+    pub fn moved(self) -> bool {
+        self != ExtDrift::Intact
+    }
+
+    /// Whether the data word is the one that moved, i.e. whether a successful
+    /// downcast would hand back a reference to an address nobody wrote the
+    /// object at.
+    pub fn data_moved(self) -> bool {
+        matches!(self, ExtDrift::DataOnly | ExtDrift::Both)
+    }
+
+    /// The sentence a crash report prints for this verdict.
+    pub fn describe(self) -> &'static str {
+        match self {
+            ExtDrift::Intact => {
+                "UNCHANGED: the ext was never the expected type -- not corruption, \
+                 a construction path installs the wrong type"
+            }
+            ExtDrift::VtableOnly => {
+                "VTABLE ONLY: one 8-byte store over the vtable word, data untouched"
+            }
+            ExtDrift::DataOnly => {
+                "DATA ONLY: one 8-byte store over the data word, vtable untouched"
+            }
+            ExtDrift::Both => "BOTH words replaced: a whole fat pointer was assigned over ext",
+        }
+    }
+}
+
+/// Compare an `ext` fat pointer against the one recorded at construction.
+pub fn ext_drift(now: (usize, usize), born: (usize, usize)) -> ExtDrift {
+    match (now.0 == born.0, now.1 == born.1) {
+        (true, true) => ExtDrift::Intact,
+        (false, true) => ExtDrift::DataOnly,
+        (true, false) => ExtDrift::VtableOnly,
+        (false, false) => ExtDrift::Both,
+    }
+}
+
 impl Process {
     /// State of the guards around `ext`, as `(lo_ok, hi_ok)`.
     pub fn ext_canaries(&self) -> (bool, bool) {
@@ -204,6 +272,13 @@ impl Process {
             self.ext_born[0].load(Ordering::Relaxed),
             self.ext_born[1].load(Ordering::Relaxed),
         )
+    }
+
+    /// How the `ext` fat pointer now compares with the snapshot taken at
+    /// construction. [`ExtDrift::data_moved`] is the question a caller must ask
+    /// BEFORE dereferencing a reference a successful `downcast_ref` gave it.
+    pub fn ext_drift(&self) -> ExtDrift {
+        ext_drift(self.ext_fat(), self.ext_born())
     }
 }
 
@@ -1119,6 +1194,54 @@ mod tests {
     use crate::signal::Event;
     use crate::task::*;
     use alloc::sync::Weak;
+
+    /// The four verdicts, and which of them a `downcast_ref` can see.
+    ///
+    /// Only the vtable word carries the type identity, so a downcast reports
+    /// exactly the two cases that moved it. `DataOnly` is invisible to it --
+    /// that is why the data word has to be asked about separately.
+    #[test]
+    fn a_downcast_can_only_see_the_two_verdicts_that_moved_the_vtable() {
+        let born = (0x1000, 0x2000);
+        assert_eq!(ext_drift(born, born), ExtDrift::Intact);
+        assert_eq!(ext_drift((0, 0x2000), born), ExtDrift::DataOnly);
+        assert_eq!(ext_drift((0x1000, 0x9999), born), ExtDrift::VtableOnly);
+        assert_eq!(ext_drift((0, 0x9999), born), ExtDrift::Both);
+
+        for seen_by_downcast in [ExtDrift::VtableOnly, ExtDrift::Both] {
+            assert!(seen_by_downcast.moved());
+        }
+        assert!(
+            ExtDrift::DataOnly.moved(),
+            "the field did move; nothing about the downcast says otherwise"
+        );
+    }
+
+    /// The question the guard actually asks: would a SUCCESSFUL downcast hand
+    /// back a reference to an address nobody built the object at?
+    #[test]
+    fn the_data_word_is_what_decides_whether_a_reference_may_escape() {
+        assert!(!ExtDrift::Intact.data_moved());
+        assert!(!ExtDrift::VtableOnly.data_moved());
+        assert!(ExtDrift::DataOnly.data_moved());
+        assert!(ExtDrift::Both.data_moved());
+    }
+
+    /// A data word of zero is the shape seen on hardware: the fault address
+    /// was the overwritten pointer plus the offset of the first field touched.
+    #[test]
+    fn a_zeroed_data_word_reads_as_the_overwrite_it_is() {
+        let born = (0xffff_ff00_1234_5000, 0xffff_ff00_00a6_55e8);
+        let now = (0, born.1);
+        let drift = ext_drift(now, born);
+        assert_eq!(drift, ExtDrift::DataOnly);
+        assert!(drift.data_moved());
+        assert!(
+            drift.describe().contains("DATA ONLY"),
+            "{}",
+            drift.describe()
+        );
+    }
 
     /// An object whose `Drop` closes another handle of the same process, which
     /// is what any number of real `Drop`s amount to: code that reaches back

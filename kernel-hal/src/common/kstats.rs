@@ -172,6 +172,26 @@ pub fn sched_switches() -> (bool, bool) {
     (false, false)
 }
 
+/// `(timers pending across every CPU's heap, timers adopted from a CPU that
+/// had stopped taking ticks)`.
+///
+/// Timer heaps are per-CPU, so no core is woken for another core's deadline.
+/// The second number is the safety net for that split and should stay 0: it
+/// only moves when some CPU went so long without a tick that another had to
+/// serve its callbacks.
+#[cfg(target_os = "none")]
+pub fn timer_heap_stats() -> (usize, u64) {
+    (
+        crate::timer::timer_pending_count(),
+        crate::timer::timer_stray_count(),
+    )
+}
+
+#[cfg(not(target_os = "none"))]
+pub fn timer_heap_stats() -> (usize, u64) {
+    (0, 0)
+}
+
 /// `(wake-up preemption requests, requests honoured)`.
 ///
 /// A request is raised when a task becomes runnable on a CPU that is busy with
@@ -187,6 +207,51 @@ pub fn wakeup_preempt_stats() -> (u64, u64) {
 
 #[cfg(not(target_os = "none"))]
 pub fn wakeup_preempt_stats() -> (u64, u64) {
+    (0, 0)
+}
+
+/// `(steal scans, victims probed, steals ok, affinity-empty victims skipped, rebalance pulls)`.
+#[cfg(target_os = "none")]
+pub fn sched_steal_stats() -> (u64, u64, u64, u64, u64) {
+    executor::sched_steal_stats()
+}
+
+#[cfg(not(target_os = "none"))]
+pub fn sched_steal_stats() -> (u64, u64, u64, u64, u64) {
+    (0, 0, 0, 0, 0)
+}
+
+/// `(weak executors created, peak live weaks on any CPU, soft-cap hits)`.
+#[cfg(target_os = "none")]
+pub fn sched_weak_stats() -> (u64, u64, u64) {
+    executor::sched_weak_stats()
+}
+
+#[cfg(not(target_os = "none"))]
+pub fn sched_weak_stats() -> (u64, u64, u64) {
+    (0, 0, 0)
+}
+
+/// `(stack-pool occupied slots, overflow-list length)`.
+#[cfg(target_os = "none")]
+pub fn stack_pool_stats() -> (usize, usize) {
+    executor::stack_pool_stats()
+}
+
+#[cfg(not(target_os = "none"))]
+pub fn stack_pool_stats() -> (usize, usize) {
+    (0, 0)
+}
+
+/// `(deepest coroutine-stack use observed at a park, STACK_SIZE)` in bytes.
+/// The evidence for (or against) shrinking executor stacks.
+#[cfg(target_os = "none")]
+pub fn stack_high_water() -> (usize, usize) {
+    executor::stack_high_water()
+}
+
+#[cfg(not(target_os = "none"))]
+pub fn stack_high_water() -> (usize, usize) {
     (0, 0)
 }
 

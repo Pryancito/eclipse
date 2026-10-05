@@ -378,6 +378,16 @@ pub fn try_contain(what: &str, restore_kd: Option<u32>) {
     // chance to be contained.
     CONTAINING.fetch_and(!bit, Ordering::SeqCst);
 
+    // And the panic reporter's own guard, for the same reason and at the same
+    // moment: nothing of the panic being contained runs after the call below,
+    // so a later panic -- minutes on, about something else -- must get the full
+    // report rather than the one line a report still in flight would earn it.
+    // This is the only place it may be released, and it has to be *here*: a
+    // release any earlier leaves a fault inside containment reading as a first
+    // panic, and the handler would repaint over the very report it is about to
+    // contain. See `crate::lang::release_panic_guard`.
+    crate::lang::release_panic_guard();
+
     // SAFETY: we are on the fault path, standing on the coroutine's own stack
     // (proven just above), with interrupts disabled and no kernel lock held
     // (checked above). Nothing from the abandoned call chain is touched again.

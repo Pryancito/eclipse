@@ -442,6 +442,10 @@ fn read_one(r: &mut Reader, sig: &[u8], i: &mut usize) -> Option<Arg> {
             // The element type's alignment applies to the FIRST element, after
             // the length word — padding that is not counted in `n`.
             r.align(alignment_of(elem));
+            // `n` is a `u32` out of the client's bytes and the position is
+            // small, so on a 64-bit target this can never overflow and a plain
+            // `+` would answer the same; it is checked for the 32-bit build,
+            // where `n` alone can be most of the address space.
             let end = r.pos().checked_add(n)?;
             if end > r.buf.len() {
                 return None;
@@ -502,7 +506,8 @@ fn skip_type(sig: &[u8], i: &mut usize) {
 /// only caller aligns right after the array's length word, which is itself
 /// 4-aligned and four bytes long, so the position is always a multiple of 4 and
 /// rounding it to 2 or to 4 lands in the same place. It is written as 2 because
-/// that is what the specification says, not because a test could see it.
+/// that is what the specification says; no message can tell, so the test that
+/// holds it walks this table directly instead of going through a body.
 fn alignment_of(t: u8) -> usize {
     match t {
         b'y' | b'g' | b'v' => 1,
@@ -1323,5 +1328,279 @@ mod tests {
     fn match_rule_escaped_quote() {
         let r = MatchRule::parse(r"member='it'\''s'");
         assert_eq!(r.member.as_deref(), Some("it's"));
+    }
+
+    /// Every type code the reader knows reads back as its OWN kind. The
+    /// roundtrips above all go through `Arg::write`, which can emit five of
+    /// the thirteen codes `read_one` accepts, so the other eight were only
+    /// ever read from a client's bytes -- never from a test's.
+    #[test]
+    fn every_type_code_the_reader_knows_reads_back_as_its_own_kind() {
+        fn str_bytes(v: &str) -> Vec<u8> {
+            let mut w = Writer::new(b'l');
+            w.put_string(v);
+            w.into_bytes()
+        }
+        fn sig_bytes(v: &str) -> Vec<u8> {
+            let mut w = Writer::new(b'l');
+            w.put_signature(v);
+            w.into_bytes()
+        }
+        fn one(sig: &str, body: &[u8]) -> Option<Arg> {
+            let mut r = Reader::new(body, b'l');
+            let mut i = 0;
+            read_one(&mut r, sig.as_bytes(), &mut i)
+        }
+        let eight = vec![0u8; 8];
+        let cases: Vec<(&str, Vec<u8>, Option<Arg>)> = vec![
+            ("y", vec![0x2a], Some(Arg::Byte(0x2a))),
+            ("b", 1u32.to_le_bytes().to_vec(), Some(Arg::Bool(true))),
+            ("b", 0u32.to_le_bytes().to_vec(), Some(Arg::Bool(false))),
+            ("b", 2u32.to_le_bytes().to_vec(), Some(Arg::Bool(true))),
+            ("u", 7u32.to_le_bytes().to_vec(), Some(Arg::U32(7))),
+            ("i", 9u32.to_le_bytes().to_vec(), Some(Arg::U32(9))),
+            ("h", 3u32.to_le_bytes().to_vec(), Some(Arg::U32(3))),
+            ("s", str_bytes("hi"), Some(Arg::Str("hi".into()))),
+            // An object path is its own kind: a rule that names `path=` and a
+            // body that carries one are matched against different fields.
+            ("o", str_bytes("/org/p"), Some(Arg::Path("/org/p".into()))),
+            ("g", sig_bytes("su"), Some(Arg::Sig("su".into()))),
+            ("n", vec![0u8; 2], Some(Arg::Other("q".into()))),
+            ("q", vec![0u8; 2], Some(Arg::Other("q".into()))),
+            ("x", eight.clone(), Some(Arg::Other("t".into()))),
+            ("t", eight.clone(), Some(Arg::Other("t".into()))),
+            ("d", eight.clone(), Some(Arg::Other("t".into()))),
+            // Unknown codes are refused rather than guessed at.
+            ("Z", vec![0u8; 8], None),
+            ("", vec![], None),
+        ];
+        for (sig, body, want) in cases {
+            assert_eq!(one(sig, &body), want, "reading '{sig}'");
+        }
+        // A variant carries its own signature and then one value of it.
+        let mut w = Writer::new(b'l');
+        w.put_signature("s");
+        w.put_string("inner");
+        assert_eq!(
+            one("v", &w.into_bytes()),
+            Some(Arg::Variant(Box::new(Arg::Str("inner".into()))))
+        );
+    }
+
+    /// The alignment of every type code, as the specification gives it.
+    ///
+    /// This is a table, and the only way to hold a table is to walk it:
+    /// `read_one` asks about an array's element type and nothing else, so one
+    /// wrong row shifts the first element of exactly one shape of array and
+    /// every other message decodes the same.
+    #[test]
+    fn every_type_code_has_the_alignment_the_specification_gives_it() {
+        for (t, want) in [
+            (b'y', 1usize),
+            (b'g', 1),
+            (b'v', 1),
+            (b'n', 2),
+            (b'q', 2),
+            (b'b', 4),
+            (b'i', 4),
+            (b'u', 4),
+            (b's', 4),
+            (b'o', 4),
+            (b'a', 4),
+            (b'h', 4),
+            (b'x', 8),
+            (b't', 8),
+            (b'd', 8),
+            (b'(', 8),
+            (b'{', 8),
+        ] {
+            assert_eq!(alignment_of(t), want, "alignment of '{}'", t as char);
+        }
+    }
+
+    /// `skip_type` steps over one COMPLETE type however deeply nested,
+    /// because the index it leaves behind is where the next argument's type
+    /// is read from. Nothing walked it before: its only caller is the array
+    /// arm that is NOT a string array, and every array in the tests above is
+    /// an `as`, which takes the other branch.
+    #[test]
+    fn one_whole_type_is_skipped_and_no_more() {
+        for (sig, want) in [
+            ("s", 1usize),
+            ("as", 2),
+            ("aas", 3),
+            ("(ii)", 4),
+            ("(ii)s", 4),
+            ("(i(ii))", 7),
+            ("{sv}", 4),
+            ("a{sv}", 5),
+            ("a{sv}u", 5),
+            ("a(ii)u", 5),
+            // Unterminated or empty: stop at the end rather than run past it.
+            ("(", 1),
+            ("", 0),
+        ] {
+            let mut i = 0;
+            skip_type(sig.as_bytes(), &mut i);
+            assert_eq!(i, want, "skipping the first type of \"{sig}\"");
+        }
+    }
+
+    /// A STRUCT is padded to eight bytes before its first member, so the
+    /// `u` of `y(u)` is read from byte 8 and not from byte 4. The reader
+    /// cannot be asked for the member's value -- a struct comes back as a
+    /// placeholder -- so the proof is where the cursor and the signature
+    /// index land.
+    #[test]
+    fn a_struct_starts_on_its_eight_byte_boundary() {
+        let mut w = Writer::new(b'l');
+        w.put_u8(1);
+        w.align(8);
+        w.put_u32(0xdead_beef);
+        let body = w.into_bytes();
+        assert_eq!(body.len(), 12, "a byte, seven of padding and a word");
+
+        let mut r = Reader::new(&body, b'l');
+        let mut i = 0;
+        assert_eq!(read_one(&mut r, b"y(u)", &mut i), Some(Arg::Byte(1)));
+        assert_eq!(r.pos(), 1);
+        assert_eq!(
+            read_one(&mut r, b"y(u)", &mut i),
+            Some(Arg::Other("(...)".into()))
+        );
+        assert_eq!(r.pos(), 12, "the struct's word was read from byte 8");
+        assert_eq!(i, 4, "the index is past the closing paren");
+    }
+
+    /// An array has to leave the signature index past its ELEMENT type, or
+    /// the next argument is read with the array's own type: `asu` would take
+    /// the `s` for the second argument and hand back a string where a number
+    /// belongs.
+    #[test]
+    fn an_array_leaves_the_signature_index_past_its_element_type() {
+        let mut m = Message::signal("/", "org.example", "Pair");
+        m.serial = 1;
+        m.set_body(&[
+            Arg::StrArray(vec!["one".into(), "two".into()]),
+            Arg::U32(0x5a5a),
+        ]);
+        assert_eq!(m.signature.as_deref(), Some("asu"));
+        let got = roundtrip(&m);
+        assert_eq!(
+            got.args(),
+            vec![
+                Arg::StrArray(vec!["one".into(), "two".into()]),
+                Arg::U32(0x5a5a),
+            ]
+        );
+    }
+
+    /// Every key a client may send goes to its OWN field. The parser is a
+    /// table of ten keys and the tests above read three rows of it, so a key
+    /// wired to the wrong field -- or to nothing at all -- changed which
+    /// traffic a subscription received and no test moved.
+    #[test]
+    fn every_key_of_a_match_rule_lands_in_its_own_field() {
+        let r = MatchRule::parse(
+            "type='signal',sender=':1.5',interface='org.a',member='M',\
+             path='/p',destination=':1.9',arg0='x',arg0namespace='org.b',\
+             eavesdrop='true'",
+        );
+        assert_eq!(r.kind, Some(MSG_SIGNAL));
+        assert_eq!(r.sender.as_deref(), Some(":1.5"));
+        assert_eq!(r.interface.as_deref(), Some("org.a"));
+        assert_eq!(r.member.as_deref(), Some("M"));
+        assert_eq!(r.path.as_deref(), Some("/p"));
+        assert_eq!(r.destination.as_deref(), Some(":1.9"));
+        assert_eq!(r.arg0.as_deref(), Some("x"));
+        assert_eq!(r.arg0namespace.as_deref(), Some("org.b"));
+        assert!(r.path_namespace.is_none(), "nothing names it");
+        // `eavesdrop` needs no behaviour of its own, but poisoning the rule
+        // is what dbus-monitor's fallback path would fall foul of.
+        assert!(!r.unsupported, "eavesdrop is accepted, not refused");
+
+        let ns = MatchRule::parse("path_namespace='/org/a'");
+        assert_eq!(ns.path_namespace.as_deref(), Some("/org/a"));
+        assert!(ns.path.is_none());
+    }
+
+    /// The four message types by name, and anything else poisons the rule: a
+    /// client that asked for a type this daemon cannot express gets no
+    /// traffic instead of all of it.
+    #[test]
+    fn a_rule_names_its_message_type_or_matches_nothing() {
+        for (text, want) in [
+            ("type='method_call'", MSG_METHOD_CALL),
+            ("type='method_return'", MSG_METHOD_RETURN),
+            ("type='error'", MSG_ERROR),
+            ("type='signal'", MSG_SIGNAL),
+        ] {
+            let r = MatchRule::parse(text);
+            assert_eq!(r.kind, Some(want), "{text}");
+            assert!(!r.unsupported, "{text}");
+        }
+        let m = Message::signal("/", "org.a", "M");
+        for text in ["type='whatever'", "nosuchkey='v'"] {
+            let r = MatchRule::parse(text);
+            assert!(r.unsupported, "{text} is not a rule that takes everything");
+            assert!(!r.matches(&m, ":1.1", &[]), "{text}");
+        }
+        assert_eq!(MatchRule::parse("type='whatever'").kind, None);
+    }
+
+    /// libdbus writes `key='value',key='value'` with no spaces, but a
+    /// hand-written rule has them anywhere. Key and value are both trimmed
+    /// and a run of commas and spaces separates one pair from the next, so
+    /// the same rule spelt loosely is the same rule -- which is what
+    /// `RemoveMatch` leans on.
+    #[test]
+    fn a_rule_spelt_with_spaces_is_the_same_rule() {
+        let tight = MatchRule::parse("type='signal',member='M',path=/p");
+        assert_eq!(tight.path.as_deref(), Some("/p"));
+        for text in [
+            "type='signal', member='M', path= /p ",
+            " type='signal' ,  member='M' , path=/p",
+            "type='signal',,member='M',,path=/p",
+            // A space BEHIND the key, which the run of separators in front
+            // of it cannot eat.
+            "type ='signal',member ='M',path =/p",
+        ] {
+            let loose = MatchRule::parse(text);
+            assert_eq!(loose.kind, tight.kind, "{text}");
+            assert_eq!(loose.member, tight.member, "{text}");
+            assert_eq!(loose.path, tight.path, "{text}");
+        }
+    }
+
+    /// A rule reads the field it names and no other. Each `false` row below
+    /// holds a value that IS in the message, just under a different field, so
+    /// a check wired to the wrong one would let the message through on a
+    /// field the client never mentioned.
+    #[test]
+    fn a_rule_reads_the_field_it_names_and_no_other() {
+        let mut m = Message::signal("/org/p", "org.iface", "Member");
+        m.serial = 1;
+        m.destination = Some(":1.9".into());
+        m.set_body(&[Arg::Str("org.b.x".into())]);
+
+        for (text, want) in [
+            ("path='/org/p'", true),
+            ("path='org.iface'", false),
+            ("interface='org.iface'", true),
+            ("interface='Member'", false),
+            ("member='Member'", true),
+            ("member='org.iface'", false),
+            ("destination=':1.9'", true),
+            ("destination='/org/p'", false),
+            ("arg0='org.b.x'", true),
+            ("arg0='org.b'", false),
+            ("arg0namespace='org.b'", true),
+            ("arg0namespace='org.c'", false),
+            ("path_namespace='/org'", true),
+            ("path_namespace='/or'", false),
+        ] {
+            let r = MatchRule::parse(text);
+            assert_eq!(r.matches(&m, ":1.1", &[]), want, "{text}");
+        }
     }
 }

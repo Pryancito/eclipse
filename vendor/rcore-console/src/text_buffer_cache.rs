@@ -59,6 +59,11 @@ impl<T: TextBuffer> TextBufferCache<T> {
     /// `buf`'s own length, never `inner`'s: this is the array being indexed.
     fn real_row(&self, row: usize) -> Option<usize> {
         let rows = self.buf.len();
+        // The `rows == 0` half is what mutation reports as redundant, and it
+        // is: with no rows at all, `row >= rows` is true for every `row`, so
+        // the modulo is already unreachable. It is spelled out because the
+        // division by zero is the whole reason this function exists, and a
+        // later bound that is not `>= rows` would lose the cover silently.
         if rows == 0 || row >= rows {
             return None;
         }
@@ -67,6 +72,11 @@ impl<T: TextBuffer> TextBufferCache<T> {
     /// Clear line at `row`. `row` is a physical row of `buf`, already
     /// translated, so it is not passed through [`Self::real_row`] again.
     fn clear_line(&mut self, row: usize, cell: Cell) {
+        // Unreachable from the only caller, which passes `row_offset`, always
+        // taken modulo the row count -- so mutation is right that the bound
+        // cannot be crossed. It stays because the alternative is an index out
+        // of bounds on the console's own print path, and this function takes a
+        // physical row from whoever calls it next.
         if row >= self.buf.len() {
             return;
         }

@@ -27,6 +27,10 @@ extern crate alloc;
 /// What the three `switch.S` files take for granted; see the module docs.
 #[cfg(test)]
 mod switch_contract;
+
+/// Concurrency stress across the shared scheduler state; see the module docs.
+#[cfg(test)]
+mod stress_tests;
 #[macro_use]
 extern crate log;
 
@@ -48,19 +52,20 @@ pub use executor::sched_stats;
 pub use executor::{
     alloc_overlaps_live_stack, hard_guard_executor_counts, overlapping_live_stack,
     set_stack_guard_hooks, set_stack_quarantine_enabled, set_stack_quarantine_hooks, spine_gen,
-    spine_owner_of, spine_snapshot, spine_verify, stack_guard_hooks_registered,
+    spine_owner_of, spine_snapshot, spine_verify, stack_guard_hooks_registered, stack_pool_stats,
     untracked_alloc_stacks, untracked_live_stacks, unwatched_spine_slots, SpineSmash, GUARD_SIZE,
     STACK_SIZE, TOP_GUARD_SIZE,
 };
 pub use runtime::{
-    abandon_current_executor, abandon_current_task, abandon_executor_for_sp,
+    abandon_current_executor, abandon_current_task, abandon_executor_for_sp, affinity_changed,
     attribute_fault_stack_ptrs, begin_voluntary_yield, check_current_executor_canary,
     check_current_executor_stack_proximity, current_executor_abandonable,
     current_stack_top_looks_null, current_task_abandonable, end_voluntary_yield,
     fault_sp_abandonable, handle_timeout, heap_smash_suspected, irq_on_idle_executor,
-    irq_should_skip_dyn_dispatch, irq_should_skip_heavy_work, note_heap_smash_suspected,
-    run_until_idle, runnable_task_count, sched_yield, set_idle_callback, set_resched_ipi_sender,
-    set_wakeup_preempt, spawn, spawn_with_affinity, take_need_resched, wakeup_preempt_enabled,
+    irq_should_skip_dyn_dispatch, irq_should_skip_heavy_work, need_resched_pending,
+    note_heap_smash_suspected, run_until_idle, runnable_task_count, sched_steal_stats,
+    sched_weak_stats, sched_yield, set_idle_callback, set_resched_ipi_sender, set_wakeup_preempt,
+    spawn, spawn_with_affinity, stack_high_water, take_need_resched, wakeup_preempt_enabled,
     wakeup_preempt_stats, warm_runtimes, FaultStackAttr, StackAttrHit, StackPtrRegion,
 };
 

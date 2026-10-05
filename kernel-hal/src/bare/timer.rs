@@ -41,9 +41,119 @@ const TICKLESS_IDLE: bool = false;
 const IDLE_TICK_CAP_NS: u64 = 50_000_000;
 
 lazy_static::lazy_static! {
-    /// The heap itself lives in `crate::deadline`, where every build compiles
-    /// it — this file only ever compiled on bare x86_64.
-    static ref NAIVE_TIMER: Mutex<TimerHeap> = Mutex::new(TimerHeap::default());
+    /// One timer heap **per CPU**, indexed by dense logical id. The heap type
+    /// itself lives in `crate::deadline`, where every build compiles it — this
+    /// file only ever compiled on bare metal.
+    ///
+    /// It used to be a single global heap, and that is what made a desktop
+    /// run hot. Every CPU's tick armed its own LAPIC for the *globally*
+    /// earliest deadline (`rearm_after_tick` below), so **every** pending
+    /// timer in the machine woke **every** core: with a few programs open,
+    /// each with threads parked in `poll`/`epoll` re-arming a 4 ms backstop,
+    /// the aggregate deadline rate is thousands per second and each core was
+    /// taking all of them — up to the `MIN_ARM_NS` floor of ~5 kHz per core,
+    /// twenty times the 250 Hz tick, on every core at once. Interrupts a core
+    /// takes are the one thing that stops it from being halted, and the heat
+    /// followed the number of programs exactly as reported.
+    ///
+    /// Per-CPU heaps are what Linux does (`timer_base` per CPU): the CPU that
+    /// arms a timer owns it, programs its own LAPIC for it and runs its
+    /// callback, so a core's interrupt rate follows *its own* timers instead
+    /// of the whole machine's. The global mutex that all CPUs took 250 times
+    /// a second goes away with it.
+    ///
+    /// A heap whose owner stops ticking is covered by the stray-adoption
+    /// sweep in `timer_tick` (`crate::deadline::stray_deadline_cpu`).
+    static ref TIMER_HEAPS: alloc::vec::Vec<Mutex<TimerHeap>> =
+        (0..crate::config::MAX_CORE_NUM)
+            .map(|_| Mutex::new(TimerHeap::default()))
+            .collect();
+}
+
+/// The timer heap this CPU owns.
+///
+/// A CPU whose id is outside the table (it should not happen: every guard in
+/// this crate is written `< MAX_CORE_NUM`) falls back to heap 0 rather than
+/// dropping the timer, which the stray sweep then serves.
+///
+/// Kernel code here is not preemptible — the executor only switches at a poll
+/// boundary — so the id a caller reads stays its id until it takes the heap
+/// lock. The same assumption `arm_deadline` already documents for its own
+/// `cpu_id`-then-write-that-LAPIC pair.
+fn timer_cpu() -> usize {
+    let cpu = crate::cpu::cpu_id() as usize;
+    if cpu < crate::config::MAX_CORE_NUM {
+        cpu
+    } else {
+        0
+    }
+}
+
+/// The owned callback [`crate::hal_fn::timer::timer_set`] takes, as the heap
+/// hands it back on expiry.
+type DueCallbacks = alloc::vec::Vec<Box<dyn FnOnce(Duration) + Send + Sync>>;
+
+/// Pop `cpu`'s due callbacks and republish its earliest remaining deadline.
+///
+/// The lock is dropped before the caller runs anything: a callback that
+/// re-arms a periodic timer calls `timer_set`, which re-locks this very heap.
+///
+/// Only ever called for the caller's **own** heap, which is why the blocking
+/// lock is fine here: the only other CPU that can hold it is an adopter, and
+/// that one holds it for a drain and nothing else (see
+/// [`try_drain_cpu_heap`]).
+fn drain_cpu_heap(cpu: usize, now: Duration) -> DueCallbacks {
+    let mut t = TIMER_HEAPS[cpu].lock();
+    let expired = t.drain_expired(now);
+    NEXT_DEADLINE_NS[cpu].store(t.next_ns(), Ordering::Release);
+    expired
+}
+
+/// Adopt `cpu`'s due callbacks, or `None` when its heap is busy right now.
+///
+/// **Never a blocking lock**, and that is the whole point: this runs on
+/// another CPU's behalf, from interrupt context, with interrupts off. The
+/// owner can publish its deadline and then stop running while still holding
+/// this mutex -- a vCPU the host descheduled, a long interrupts-off stretch:
+/// exactly the state the sweep exists to recover from. Every ticking CPU
+/// picks the same most-overdue heap, so a `lock()` here would put all of them
+/// in a spin that only the stalled owner can end, turning the recovery path
+/// into a machine-wide stall. A busy heap is simply left for a later tick,
+/// which costs one more tick of latency on a callback that is already late by
+/// at least `STRAY_LAG_NS`. `steal_task_from_other_cpu` avoids the same
+/// lock storm in the executor the same way.
+fn try_drain_cpu_heap(cpu: usize, now: Duration) -> Option<DueCallbacks> {
+    let mut t = TIMER_HEAPS[cpu].try_lock()?;
+    let expired = t.drain_expired(now);
+    NEXT_DEADLINE_NS[cpu].store(t.next_ns(), Ordering::Release);
+    Some(expired)
+}
+
+/// How overdue another CPU's earliest deadline has to be before a ticking CPU
+/// adopts it. More than one scheduler tick, so an owner that is simply about
+/// to serve its own timer is never raced for it.
+const STRAY_LAG_NS: u64 = 8_000_000;
+
+/// Timers adopted from another CPU's heap by the stray sweep. Stays 0 on a
+/// healthy machine; a climbing count means some core is not taking its ticks.
+static TIMER_STRAYS: AtomicU64 = AtomicU64::new(0);
+
+/// How many timers have been adopted from a CPU that stopped taking ticks.
+pub fn timer_stray_count() -> u64 {
+    TIMER_STRAYS.load(Ordering::Relaxed)
+}
+
+/// Total timers pending across every CPU's heap. Diagnostic only, and it takes
+/// every heap lock, so not for a hot path.
+pub fn timer_pending_count() -> usize {
+    (0..crate::config::MAX_CORE_NUM)
+        .map(|cpu| TIMER_HEAPS[cpu].lock().len())
+        .sum()
+}
+
+/// The earliest deadline published per CPU, snapshotted for the stray sweep.
+fn next_deadlines() -> [u64; crate::config::MAX_CORE_NUM] {
+    core::array::from_fn(|cpu| NEXT_DEADLINE_NS[cpu].load(Ordering::Acquire))
 }
 
 /// Offset (in nanoseconds) added to monotonic boot time for
@@ -54,13 +164,13 @@ lazy_static::lazy_static! {
 /// enough for any wall-clock we care about.
 static WALL_CLOCK_OFFSET_NS: AtomicU64 = AtomicU64::new(0);
 
-/// Earliest pending timer deadline (in monotonic nanoseconds), or `u64::MAX`
-/// when no timer is registered. Maintained alongside the heap inside the
-/// `NAIVE_TIMER` lock, but readable lock-free. Lets every CPU's per-tick
-/// `timer_tick` skip the spinlock when there is nothing to expire — the
-/// common case under multi-CPU where all CPUs would otherwise contend on
-/// the timer mutex 250 times a second.
-static NEXT_DEADLINE_NS: AtomicU64 = AtomicU64::new(NO_DEADLINE);
+/// Earliest pending deadline (in monotonic nanoseconds) of **each CPU's own**
+/// heap, or [`NO_DEADLINE`] when that heap is empty. Maintained inside the
+/// owning heap's lock but readable lock-free, so a CPU's tick decides whether
+/// it has anything to expire without taking any lock at all — and so the
+/// stray sweep can see another CPU's state without touching its heap.
+static NEXT_DEADLINE_NS: [AtomicU64; crate::config::MAX_CORE_NUM] =
+    [const { AtomicU64::new(NO_DEADLINE) }; crate::config::MAX_CORE_NUM];
 
 /// How many corrupt timer callbacks were skipped after a null-range EXECUTE
 /// #PF during dispatch (see `try_skip_timer_callback_fault` in the x86_64
@@ -204,7 +314,10 @@ fn rearm_after_tick(now_ns: u64) {
     // Reset the armed marker first so the arm below is free to shorten again.
     ARMED_NS[cpu].store(tick_due, Ordering::Relaxed);
     super::arch::timer::set_tick_count(super::arch::timer::fast_tick_count());
-    let next = NEXT_DEADLINE_NS.load(Ordering::Acquire);
+    // This CPU's own earliest deadline, not the machine's: arming every core
+    // for every timer anywhere is what used to pull the whole machine up to
+    // the `MIN_ARM_NS` interrupt floor (see `TIMER_HEAPS`).
+    let next = NEXT_DEADLINE_NS[cpu].load(Ordering::Acquire);
     let Some(span) = crate::deadline::rearm_span(now_ns, next, tick_due, tick_ns, MIN_ARM_NS)
     else {
         return;
@@ -367,13 +480,18 @@ hal_fn_impl! {
             // Mutex::lock() uses push_off/pop_off which already handles interrupt
             // disabling. Manual intr_off/on here would bypass the noff accounting
             // and cause "RefCell already borrowed" panics under SMP.
-            let mut t = NAIVE_TIMER.lock();
+            // This CPU's own heap: it is the one whose LAPIC is armed below
+            // and the one whose tick will run the callback, so no other core
+            // is woken for it.
+            let cpu = timer_cpu();
+            let mut t = TIMER_HEAPS[cpu].lock();
             t.add(deadline, callback);
-            // Republish the new earliest deadline so other CPUs' fast-path
-            // ticks observe it. Done under the lock so concurrent updates
-            // can't race with `timer_tick`'s post-expire publish.
+            // Republish this CPU's earliest deadline so its own fast-path tick
+            // (and the stray sweep) observe it. Done under the lock so
+            // concurrent updates can't race with `timer_tick`'s post-expire
+            // publish.
             let next = t.next_ns();
-            NEXT_DEADLINE_NS.store(next, Ordering::Release);
+            NEXT_DEADLINE_NS[cpu].store(next, Ordering::Release);
             // Bring this CPU's timer forward to the new deadline if it is
             // nearer than the pending fire. Without this the timer would only
             // be noticed on the next 4 ms tick, which is the whole of the
@@ -578,25 +696,42 @@ hal_fn_impl! {
             // arrived yet, skip the mutex entirely. Saves a spinlock acquire
             // per CPU per tick (250 Hz × N CPUs), which is the dominant
             // contention on the timer mutex under SMP.
-            if skip_dyn || !is_due(duration_to_ns(now), NEXT_DEADLINE_NS.load(Ordering::Acquire)) {
+            let now_ns = duration_to_ns(now);
+            let me = timer_cpu();
+            let mine_due = is_due(now_ns, NEXT_DEADLINE_NS[me].load(Ordering::Acquire));
+            // Stray adoption: a heap whose owner stopped taking ticks would
+            // hold its callbacks for ever, so any ticking CPU serves one that
+            // has fallen more than `STRAY_LAG_NS` behind. `MAX_CORE_NUM`
+            // relaxed loads per tick, and no other heap is ever locked unless
+            // something is genuinely late.
+            let stray = if skip_dyn {
+                None
+            } else {
+                crate::deadline::stray_deadline_cpu(now_ns, me, &next_deadlines(), STRAY_LAG_NS)
+            };
+            if skip_dyn || (!mine_due && stray.is_none()) {
                 // On skip_dyn leave the heap untouched so live one-shots
                 // (DRM flip, poll wakers) still fire on a later safer tick.
                 super::percpu::end_timer_callback();
                 return;
             }
             // Drain the due callbacks and republish the next deadline while
-            // holding the lock, then RELEASE it before invoking them. Running a
-            // callback under the lock would deadlock: periodic timers (POSIX
-            // timers, timerfd) re-arm themselves by calling `timer_set`, which
-            // re-locks `NAIVE_TIMER` on this same CPU. Dropping the guard first
+            // holding the heap lock, then RELEASE it before invoking them.
+            // Running a callback under the lock would deadlock: periodic
+            // timers (POSIX timers, timerfd) re-arm themselves by calling
+            // `timer_set`, which re-locks this same heap on this same CPU.
+            // `drain_cpu_heap` drops the guard before returning, which is what
             // makes that re-entrancy safe.
-            let expired = {
-                let mut t = NAIVE_TIMER.lock();
-                let expired = t.drain_expired(now);
-                let next = t.next_ns();
-                NEXT_DEADLINE_NS.store(next, Ordering::Release);
-                expired
+            let mut expired = if mine_due {
+                drain_cpu_heap(me, now)
+            } else {
+                DueCallbacks::new()
             };
+            // `try_drain_cpu_heap`, never a blocking lock: see its comment.
+            if let Some(adopted) = stray.and_then(|other| try_drain_cpu_heap(other, now)) {
+                TIMER_STRAYS.fetch_add(adopted.len() as u64, Ordering::Relaxed);
+                expired.extend(adopted);
+            }
             // Fat-ptr gate (null / non-kernel vtable e.g. `0x13446`): same as
             // EventListener / x86_apic. High-bits rejects smash residue without
             // the PR #759 false-positive null-only sniff. Also abort the rest
@@ -640,7 +775,7 @@ hal_fn_impl! {
             // this tick rather than waiting for the next one.
             #[cfg(target_arch = "x86_64")]
             {
-                let next = NEXT_DEADLINE_NS.load(Ordering::Acquire);
+                let next = NEXT_DEADLINE_NS[timer_cpu()].load(Ordering::Acquire);
                 if next != NO_DEADLINE {
                     arm_deadline(duration_to_ns(timer_now()), next);
                 }
@@ -656,7 +791,7 @@ hal_fn_impl! {
                 // periodic timer keeps firing at the stretched period; on the
                 // next wake `timer_idle_exit` restores the fast tick.
                 let now = duration_to_ns(timer_now());
-                let next = NEXT_DEADLINE_NS.load(Ordering::Acquire);
+                let next = NEXT_DEADLINE_NS[timer_cpu()].load(Ordering::Acquire);
                 let span = next.saturating_sub(now).min(IDLE_TICK_CAP_NS);
                 super::arch::timer::set_tick_count(super::arch::timer::ns_to_tick_count(span));
                 super::percpu::set_timer_idle_armed(true);

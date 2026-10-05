@@ -778,3 +778,756 @@ mod window_tests {
         reset();
     }
 }
+
+#[cfg(test)]
+mod classification_tests {
+    //! The sensitive-syscall table: constant-time, lock-free, and the half of
+    //! the IDS that runs even with the rate counters switched off. None of it
+    //! touches global state, so none of it needs the test lock.
+    //!
+    //! Every operation named below was in the table with nothing asserting
+    //! it. Dropping a line, or demoting its severity, changed nothing any
+    //! test could see -- and this table is the whole of what hunter watches
+    //! for on the syscall path.
+
+    use super::*;
+
+    #[test]
+    fn the_sentinel_for_an_absent_operation_never_matches_anything() {
+        // An architecture without an operation spells it `ABSENT`
+        // (`u32::MAX`). A syscall number of `u32::MAX` must not read as
+        // "every absent operation at once", which is what dropping either
+        // half of `is` does.
+        assert!(!is(nr::ABSENT, nr::ABSENT));
+        assert!(!is(0, nr::ABSENT));
+        assert!(classify(nr::ABSENT).is_none());
+        assert!(!is_privileged(nr::ABSENT));
+        assert!(!is_fork(nr::ABSENT));
+    }
+
+    #[test]
+    fn an_ordinary_syscall_is_not_watched_at_all() {
+        // `read` on x86_64, and on none of the lists here.
+        assert!(classify(0).is_none());
+        assert!(!is_privileged(0));
+        assert!(!is_fork(0));
+    }
+
+    #[test]
+    fn loading_a_kernel_module_is_a_warning_whichever_call_does_it() {
+        let expected = Some(("MODULE", Severity::Warning, "kernel module load"));
+        assert_eq!(classify(nr::INIT_MODULE), expected);
+        assert_eq!(classify(nr::FINIT_MODULE), expected);
+    }
+
+    #[test]
+    fn unloading_a_kernel_module_is_watched_like_loading_one() {
+        assert_eq!(
+            classify(nr::DELETE_MODULE),
+            Some(("MODULE", Severity::Warning, "kernel module unload"))
+        );
+    }
+
+    #[test]
+    fn both_ways_of_loading_a_new_kernel_are_watched() {
+        let expected = Some(("MODULE", Severity::Warning, "kexec load"));
+        assert_eq!(classify(nr::KEXEC_LOAD), expected);
+        assert_eq!(classify(nr::KEXEC_FILE_LOAD), expected);
+    }
+
+    #[test]
+    fn loading_bpf_is_watched() {
+        assert_eq!(
+            classify(nr::BPF),
+            Some(("PRIVILEGE", Severity::Notice, "bpf"))
+        );
+    }
+
+    #[test]
+    fn attaching_to_another_process_is_watched() {
+        assert_eq!(
+            classify(nr::PTRACE),
+            Some(("PRIVILEGE", Severity::Notice, "ptrace"))
+        );
+    }
+
+    #[test]
+    fn every_way_of_changing_credentials_is_one_category() {
+        let expected = Some(("PRIVILEGE", Severity::Notice, "credential change"));
+        assert_eq!(classify(nr::SETUID), expected);
+        assert_eq!(classify(nr::SETGID), expected);
+        assert_eq!(classify(nr::SETREUID), expected);
+        assert_eq!(classify(nr::SETRESUID), expected);
+    }
+
+    #[test]
+    fn every_way_of_moving_the_filesystem_root_is_watched() {
+        let expected = Some(("PRIVILEGE", Severity::Notice, "fs namespace"));
+        assert_eq!(classify(nr::MOUNT), expected);
+        assert_eq!(classify(nr::PIVOT_ROOT), expected);
+        assert_eq!(classify(nr::CHROOT), expected);
+    }
+
+    #[test]
+    fn both_ways_of_changing_namespace_are_watched() {
+        let expected = Some(("PRIVILEGE", Severity::Notice, "namespace change"));
+        assert_eq!(classify(nr::UNSHARE), expected);
+        assert_eq!(classify(nr::SETNS), expected);
+    }
+
+    #[test]
+    fn writing_into_the_memory_of_another_process_is_watched() {
+        assert_eq!(
+            classify(nr::PROCESS_VM_WRITEV),
+            Some(("PRIVILEGE", Severity::Notice, "cross-process write"))
+        );
+    }
+
+    #[test]
+    fn reaching_the_keyring_is_watched() {
+        assert_eq!(
+            classify(nr::KEYCTL),
+            Some(("PRIVILEGE", Severity::Notice, "keyring"))
+        );
+    }
+
+    #[test]
+    fn asking_the_machine_to_reboot_is_watched() {
+        assert_eq!(
+            classify(nr::REBOOT),
+            Some(("PRIVILEGE", Severity::Notice, "reboot"))
+        );
+    }
+
+    #[test]
+    fn the_deny_latch_covers_the_calls_that_hand_over_the_kernel() {
+        // Everything that loads code into the kernel, reads or writes another
+        // process, or moves the filesystem root under it.
+        for num in [
+            nr::INIT_MODULE,
+            nr::FINIT_MODULE,
+            nr::DELETE_MODULE,
+            nr::KEXEC_LOAD,
+            nr::KEXEC_FILE_LOAD,
+            nr::BPF,
+            nr::PTRACE,
+            nr::MOUNT,
+            nr::PIVOT_ROOT,
+            nr::SETNS,
+        ] {
+            assert!(is_privileged(num), "syscall #{} left the deny class", num);
+        }
+        // Watched, but not something the latch may block: denying these
+        // outright breaks ordinary programs, which is why the latch is a
+        // narrower list than `classify`.
+        assert!(!is_privileged(nr::SETUID));
+        assert!(!is_privileged(nr::REBOOT));
+        assert!(!is_privileged(nr::KEYCTL));
+    }
+
+    #[test]
+    fn every_spelling_of_fork_the_target_has_counts_as_forking() {
+        // The table is per-architecture and the absent entries are the
+        // sentinel, which never matches anything on purpose (the first test in
+        // this module is that contract). asm-generic -- aarch64 and riscv64 --
+        // has no `fork` and no `vfork` at all, so demanding all three
+        // unconditionally is demanding that the sentinel does match. The
+        // `Unit Test` job runs on x86_64 only, which is why that passed.
+        for (name, num) in [
+            ("clone", nr::CLONE),
+            ("fork", nr::FORK),
+            ("vfork", nr::VFORK),
+        ] {
+            if num == nr::ABSENT {
+                assert!(!is_fork(num), "{} is absent on this target", name);
+            } else {
+                assert!(is_fork(num), "{} is a way of forking", name);
+            }
+        }
+        assert!(!is_fork(nr::PTRACE));
+    }
+}
+
+#[cfg(test)]
+mod window_roll_tests {
+    //! `ProcStat::roll` and `adaptive_flood` on their own, with synthetic
+    //! timestamps: no clock, no locks, no log. What the existing `tests`
+    //! module above covers is the baseline learning; this covers when a
+    //! window ends, what it carries into the next one, and where each
+    //! threshold actually sits.
+
+    use super::*;
+
+    #[test]
+    fn a_window_that_only_ran_out_of_time_still_rolls() {
+        let mut st = ProcStat::new(0);
+        st.syscall_count = 5;
+        st.fork_count = 2;
+        st.roll(WINDOW_NS);
+        assert_eq!(st.syscall_count, 0);
+        assert_eq!(st.fork_count, 0);
+    }
+
+    #[test]
+    fn a_window_that_only_ran_out_of_room_still_rolls() {
+        // The count backstop is the half that survives a frozen clock, so it
+        // has to roll the window on its own.
+        let mut st = ProcStat::new(0);
+        st.syscall_count = WINDOW_EVENTS_BACKSTOP;
+        st.roll(0);
+        assert_eq!(st.syscall_count, 0);
+    }
+
+    #[test]
+    fn a_backstop_window_does_not_train_the_baseline() {
+        // Only a completed *time* window is a sample of the process's
+        // ordinary rate; one cut short by the count backstop is the middle of
+        // a flood, and folding it in would teach the baseline the flood.
+        let mut st = ProcStat::new(0);
+        st.syscall_count = WINDOW_EVENTS_BACKSTOP;
+        st.roll(0);
+        assert_eq!(st.windows_observed, 0);
+        assert_eq!(st.ewma_syscalls, 0);
+    }
+
+    #[test]
+    fn a_window_flagged_by_the_absolute_flood_does_not_train_the_baseline() {
+        // The sibling of `flagged_window_does_not_poison_baseline`, which
+        // only ever set `adaptive_alerted`: the same has to hold for a window
+        // the absolute threshold flagged, or a flood trains the baseline that
+        // is supposed to detect the next one.
+        let mut st = ProcStat::new(0);
+        let mut t = 0u64;
+        for _ in 0..4 {
+            st.syscall_count = 100;
+            t += WINDOW_NS;
+            st.roll(t);
+        }
+        let before = st.ewma_syscalls;
+        st.syscall_count = 1_000_000;
+        st.flood_alerted = true;
+        t += WINDOW_NS;
+        st.roll(t);
+        assert_eq!(st.ewma_syscalls, before);
+    }
+
+    #[test]
+    fn the_baseline_moves_one_eighth_of_the_way_towards_each_sample() {
+        let mut st = ProcStat::new(0);
+        st.syscall_count = 800;
+        st.roll(WINDOW_NS);
+        assert_eq!(st.ewma_syscalls, 100, "0 + (800 - 0) >> 3");
+        st.syscall_count = 800;
+        st.roll(WINDOW_NS * 2);
+        assert_eq!(st.ewma_syscalls, 100 + ((800 - 100) >> 3));
+    }
+
+    #[test]
+    fn a_quieter_window_brings_the_baseline_down() {
+        let mut st = ProcStat::new(0);
+        st.ewma_syscalls = 800;
+        st.syscall_count = 0;
+        st.roll(WINDOW_NS);
+        assert_eq!(st.ewma_syscalls, 800 - (800 >> 3));
+    }
+
+    #[test]
+    fn a_rolled_window_starts_where_the_clock_is_now() {
+        // Left at zero, every later call looks like a finished window and the
+        // live one is rolled out from under the process -- which resets the
+        // very counters that were about to trip.
+        let mut st = ProcStat::new(0);
+        st.roll(WINDOW_NS * 4);
+        st.syscall_count = 9;
+        st.roll(WINDOW_NS * 4 + WINDOW_NS / 2);
+        assert_eq!(
+            st.syscall_count, 9,
+            "half a second later is the same window"
+        );
+    }
+
+    #[test]
+    fn a_rolled_window_rearms_every_alarm_it_carried() {
+        let mut st = ProcStat::new(0);
+        st.flood_alerted = true;
+        st.fork_alerted = true;
+        st.adaptive_alerted = true;
+        st.roll(WINDOW_NS);
+        assert!(!st.flood_alerted);
+        assert!(!st.fork_alerted);
+        assert!(!st.adaptive_alerted);
+    }
+
+    #[test]
+    fn the_warm_up_gate_is_satisfied_by_exactly_its_own_number_of_windows() {
+        let mut st = ProcStat::new(0);
+        st.ewma_syscalls = 10;
+        st.syscall_count = ADAPTIVE_MIN_COUNT + 1;
+        st.windows_observed = ADAPTIVE_MIN_WINDOWS - 1;
+        assert!(!st.adaptive_flood(), "one window short is still warming up");
+        st.windows_observed = ADAPTIVE_MIN_WINDOWS;
+        assert!(st.adaptive_flood());
+    }
+
+    #[test]
+    fn the_quiet_floor_is_a_number_to_pass_not_to_reach() {
+        let mut st = ProcStat::new(0);
+        st.windows_observed = ADAPTIVE_MIN_WINDOWS;
+        st.ewma_syscalls = 1;
+        st.syscall_count = ADAPTIVE_MIN_COUNT;
+        assert!(!st.adaptive_flood());
+        st.syscall_count = ADAPTIVE_MIN_COUNT + 1;
+        assert!(st.adaptive_flood());
+    }
+
+    #[test]
+    fn the_spike_is_a_multiple_of_the_baseline_not_a_distance_from_it() {
+        let mut st = ProcStat::new(0);
+        st.windows_observed = ADAPTIVE_MIN_WINDOWS;
+        st.ewma_syscalls = 200;
+        st.syscall_count = 3_000;
+        assert!(
+            st.syscall_count > ADAPTIVE_MIN_COUNT,
+            "past the quiet floor"
+        );
+        assert!(
+            !st.adaptive_flood(),
+            "fifteen times the baseline is not twenty"
+        );
+        st.syscall_count = ADAPTIVE_MULT * 200;
+        assert!(!st.adaptive_flood(), "exactly the multiple is not above it");
+        st.syscall_count = ADAPTIVE_MULT * 200 + 1;
+        assert!(st.adaptive_flood());
+    }
+}
+
+#[cfg(test)]
+mod tracking_tests {
+    //! Which shard a process lands on, what happens when a shard fills up,
+    //! and what the process lifecycle hooks do to all of it. The bound on
+    //! tracked processes is what stops a spawn flood turning the detector
+    //! into the memory leak it was watching for.
+
+    use super::*;
+
+    /// A clock far from zero, so "the window starts now" and "the window
+    /// starts at boot" cannot be confused for one another.
+    const T_EXEC: u64 = 9 * WINDOW_NS;
+    fn exec_clock() -> u64 {
+        T_EXEC
+    }
+
+    fn a_shard_full_of_processes() -> BTreeMap<u64, ProcStat> {
+        let mut map = BTreeMap::new();
+        for i in 0..(MAX_TRACKED_PIDS / STAT_SHARDS) as u64 {
+            // Ascending `window_start`: pid 0 is the least recently active.
+            map.insert(i, ProcStat::new(1_000 + i));
+        }
+        map
+    }
+
+    #[test]
+    fn a_process_always_lands_on_the_same_shard_and_every_shard_is_reachable() {
+        for pid in 0..STAT_SHARDS as u64 {
+            assert!(
+                core::ptr::eq(stats_shard(pid), stats_shard(pid + STAT_SHARDS as u64)),
+                "pid {} moved shard between windows",
+                pid
+            );
+        }
+        for a in 0..STAT_SHARDS as u64 {
+            for b in (a + 1)..STAT_SHARDS as u64 {
+                assert!(
+                    !core::ptr::eq(stats_shard(a), stats_shard(b)),
+                    "pids {} and {} share a shard, so one shard is never used",
+                    a,
+                    b
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_full_shard_evicts_the_least_recently_active_process() {
+        let cap = MAX_TRACKED_PIDS / STAT_SHARDS;
+        let mut map = a_shard_full_of_processes();
+        assert_eq!(map.len(), cap);
+        evict_if_needed(&mut map, 9_999);
+        assert_eq!(map.len(), cap - 1);
+        assert!(!map.contains_key(&0), "the oldest window is the one to go");
+        assert!(map.contains_key(&((cap - 1) as u64)));
+    }
+
+    #[test]
+    fn a_shard_below_its_share_of_the_cap_evicts_nobody() {
+        let mut map = a_shard_full_of_processes();
+        map.remove(&0);
+        let before = map.len();
+        evict_if_needed(&mut map, 9_999);
+        assert_eq!(map.len(), before);
+    }
+
+    #[test]
+    fn a_process_already_tracked_evicts_nobody() {
+        // Its own entry is the one being updated, so nothing has to make room.
+        let mut map = a_shard_full_of_processes();
+        let before = map.len();
+        evict_if_needed(&mut map, 0);
+        assert_eq!(map.len(), before);
+        assert!(map.contains_key(&0));
+    }
+
+    #[test]
+    fn an_exec_starts_the_new_image_on_a_window_of_its_own() {
+        let _g = crate::test_globals::lock();
+        crate::clock::reset_for_test();
+        crate::clock::set_time_source(exec_clock);
+        let pid = 7_101;
+        {
+            let mut m = stats_shard(pid).lock();
+            let mut st = ProcStat::new(0);
+            st.syscall_count = 4_000;
+            st.fork_count = 40;
+            m.insert(pid, st);
+        }
+        on_exec(pid);
+        {
+            let m = stats_shard(pid).lock();
+            let st = m.get(&pid).expect("on_exec keeps tracking the process");
+            assert_eq!(st.syscall_count, 0, "a new image cannot inherit counters");
+            assert_eq!(st.fork_count, 0);
+            assert_eq!(
+                st.window_start, T_EXEC,
+                "the new window starts now, not at boot"
+            );
+        }
+        forget(pid);
+        crate::clock::reset_for_test();
+    }
+
+    #[test]
+    fn a_process_that_exits_is_forgotten() {
+        let _g = crate::test_globals::lock();
+        let pid = 7_102;
+        stats_shard(pid).lock().insert(pid, ProcStat::new(0));
+        forget(pid);
+        assert!(!stats_shard(pid).lock().contains_key(&pid));
+    }
+
+    #[test]
+    fn a_fork_reseeds_the_child_and_leaves_the_parent_counting() {
+        // The hook lives in the crate root; what it must do is here, because
+        // only this module can see the counters it is supposed to reset.
+        let _g = crate::test_globals::lock();
+        crate::clock::reset_for_test();
+        crate::clock::set_time_source(exec_clock);
+        let (parent, child) = (7_201u64, 7_202u64);
+        for pid in [parent, child] {
+            let mut st = ProcStat::new(0);
+            st.syscall_count = 900;
+            stats_shard(pid).lock().insert(pid, st);
+        }
+        crate::task_fork(parent, child);
+        assert_eq!(
+            stats_shard(child).lock().get(&child).unwrap().syscall_count,
+            0,
+            "the child starts its own window"
+        );
+        assert_eq!(
+            stats_shard(parent)
+                .lock()
+                .get(&parent)
+                .unwrap()
+                .syscall_count,
+            900,
+            "and the parent keeps counting where it was"
+        );
+        forget(parent);
+        forget(child);
+        crate::clock::reset_for_test();
+    }
+
+    #[test]
+    fn an_execve_resets_the_anomaly_window_of_the_process_that_did_it() {
+        // Otherwise a benign program can run up to just under a threshold and
+        // then exec the payload, which arrives with the counters laundered.
+        let _g = crate::test_globals::lock();
+        crate::policy::reset_for_test();
+        let pid = 7_203;
+        let mut st = ProcStat::new(0);
+        st.syscall_count = 900;
+        stats_shard(pid).lock().insert(pid, st);
+        crate::task_exec(pid, "/bin/payload");
+        assert_eq!(stats_shard(pid).lock().get(&pid).unwrap().syscall_count, 0);
+        forget(pid);
+    }
+
+    #[test]
+    fn a_process_that_exits_leaves_no_anomaly_state_for_the_next_one() {
+        // Pids are recycled, so state left behind is state the next process
+        // to get this number inherits.
+        let _g = crate::test_globals::lock();
+        crate::policy::reset_for_test();
+        let pid = 7_204;
+        let mut st = ProcStat::new(0);
+        st.syscall_count = 900;
+        stats_shard(pid).lock().insert(pid, st);
+        crate::task_exit(pid);
+        assert!(!stats_shard(pid).lock().contains_key(&pid));
+    }
+}
+
+#[cfg(test)]
+mod syscall_path_tests {
+    //! `on_syscall` end to end: what reaches the log, what is throttled, what
+    //! is denied, and where each alarm's threshold sits. Everything it
+    //! touches is process-wide -- the clock, the log, the control plane, the
+    //! shards, the system-wide fork window -- so every test takes
+    //! [`crate::test_globals::lock`] and resets what it uses.
+
+    use super::*;
+    use crate::event_log;
+    use crate::test_globals;
+
+    /// A syscall on none of the lists here (`read` on x86_64).
+    const ORDINARY: u32 = 0;
+    /// Frozen mid-uptime, so a seeded window neither rolls nor looks like boot.
+    const NOW: u64 = 5 * WINDOW_NS;
+    fn frozen_clock() -> u64 {
+        NOW
+    }
+
+    fn fresh() {
+        crate::policy::reset_for_test();
+        crate::clock::reset_for_test();
+        crate::clock::set_time_source(frozen_clock);
+        set_anomaly_detection(false);
+        set_privileged_deny(false);
+        SYS_FORK_WINDOW_START.store(NOW, Ordering::Relaxed);
+        SYS_FORK_COUNT.store(0, Ordering::Relaxed);
+        SYS_FORK_ALERTED.store(false, Ordering::Relaxed);
+        event_log::reset_for_test();
+    }
+
+    fn done(pid: u64) {
+        forget(pid);
+        set_anomaly_detection(false);
+        set_privileged_deny(false);
+        crate::clock::reset_for_test();
+    }
+
+    /// Puts `pid` in its shard with a window that is already open at [`NOW`].
+    fn seed(pid: u64, f: impl FnOnce(&mut ProcStat)) {
+        let mut st = ProcStat::new(NOW);
+        f(&mut st);
+        stats_shard(pid).lock().insert(pid, st);
+    }
+
+    fn counted(pid: u64) -> u32 {
+        stats_shard(pid).lock().get(&pid).unwrap().syscall_count
+    }
+
+    fn lines_with(needle: &str) -> usize {
+        event_log::render()
+            .lines()
+            .filter(|l| l.contains(needle))
+            .count()
+    }
+
+    #[test]
+    fn a_sensitive_syscall_is_watched_even_with_the_rate_counters_off() {
+        // The watch is the always-on half: the rate heuristics are opt-in
+        // (`HUNTERANOMALY=1`) because they cost a clock read and a lock per
+        // syscall, and the default build must still see a ptrace.
+        let _g = test_globals::lock();
+        fresh();
+        let pid = 7_301;
+        assert!(!ANOMALY_ENABLED.load(Ordering::Relaxed));
+        assert!(on_syscall(pid, nr::PTRACE));
+        assert_eq!(lines_with("sensitive syscall"), 1);
+        done(pid);
+    }
+
+    #[test]
+    fn the_deny_latch_only_bites_the_privileged_class() {
+        let _g = test_globals::lock();
+        fresh();
+        crate::policy::set_anomaly_mode(Mode::Enforce);
+        set_privileged_deny(true);
+        let pid = 7_302;
+        assert!(!on_syscall(pid, nr::PTRACE), "ptrace is in the class");
+        assert!(
+            on_syscall(pid, nr::REBOOT),
+            "a reboot is watched, not in the deny class"
+        );
+        done(pid);
+    }
+
+    #[test]
+    fn the_deny_latch_does_nothing_while_the_domain_only_reports() {
+        // Enforcement is a property of the domain; the latch only says which
+        // calls it may reach.
+        let _g = test_globals::lock();
+        fresh();
+        crate::policy::set_anomaly_mode(Mode::Report);
+        set_privileged_deny(true);
+        let pid = 7_303;
+        assert!(on_syscall(pid, nr::PTRACE));
+        done(pid);
+    }
+
+    #[test]
+    fn the_watch_events_of_one_window_are_capped_and_the_calls_still_count() {
+        // The throttle is there so an attacker cannot use hunter's own
+        // WATCH events as cheap filler to push a real one out of the ring --
+        // but what it drops is the log line, never the count.
+        let _g = test_globals::lock();
+        fresh();
+        set_anomaly_detection(true);
+        let pid = 7_304;
+        seed(pid, |_| {});
+        let calls = WATCH_BUDGET + 4;
+        for _ in 0..calls {
+            assert!(on_syscall(pid, nr::PTRACE));
+        }
+        assert_eq!(lines_with("sensitive syscall"), WATCH_BUDGET as usize);
+        assert_eq!(counted(pid), calls);
+        done(pid);
+    }
+
+    #[test]
+    fn the_flood_alarm_fires_once_past_its_threshold_and_not_at_it() {
+        let _g = test_globals::lock();
+        fresh();
+        set_anomaly_detection(true);
+        let pid = 7_305;
+        seed(pid, |st| st.syscall_count = FLOOD_THRESHOLD - 1);
+        assert!(on_syscall(pid, ORDINARY));
+        assert_eq!(counted(pid), FLOOD_THRESHOLD);
+        assert_eq!(
+            lines_with("ANOMALY"),
+            0,
+            "exactly at the threshold is not a flood"
+        );
+        assert!(on_syscall(pid, ORDINARY));
+        assert_eq!(lines_with("syscall flood"), 1);
+        assert!(on_syscall(pid, ORDINARY));
+        assert_eq!(
+            lines_with("ANOMALY"),
+            1,
+            "one flood is one event, not one per syscall"
+        );
+        done(pid);
+    }
+
+    #[test]
+    fn a_flood_is_not_also_reported_as_a_spike_over_its_own_baseline() {
+        // Both detectors see the same burst; the absolute one describes it
+        // more precisely, so the adaptive one stands down for that window.
+        let _g = test_globals::lock();
+        fresh();
+        set_anomaly_detection(true);
+        let pid = 7_306;
+        seed(pid, |st| {
+            st.syscall_count = FLOOD_THRESHOLD;
+            st.ewma_syscalls = 1;
+            st.windows_observed = ADAPTIVE_MIN_WINDOWS;
+        });
+        assert!(on_syscall(pid, ORDINARY));
+        assert_eq!(lines_with("syscall flood"), 1);
+        assert_eq!(lines_with("adaptive syscall spike"), 0);
+        assert_eq!(lines_with("ANOMALY"), 1);
+        done(pid);
+    }
+
+    #[test]
+    fn the_fork_bomb_alarm_fires_once_past_its_threshold_and_not_at_it() {
+        let _g = test_globals::lock();
+        fresh();
+        set_anomaly_detection(true);
+        let pid = 7_307;
+        seed(pid, |st| st.fork_count = FORKBOMB_THRESHOLD - 1);
+        assert!(on_syscall(pid, nr::CLONE));
+        assert_eq!(lines_with("ANOMALY"), 0);
+        assert!(on_syscall(pid, nr::CLONE));
+        assert_eq!(lines_with("possible fork bomb"), 1);
+        assert!(on_syscall(pid, nr::CLONE));
+        assert_eq!(lines_with("ANOMALY"), 1);
+        done(pid);
+    }
+
+    #[test]
+    fn the_system_wide_storm_counts_the_fork_that_asks_about_it() {
+        // The count is read back after this fork is added, so the machine's
+        // 2001st fork is the one that trips the alarm, not its 2002nd.
+        let _g = test_globals::lock();
+        fresh();
+        set_anomaly_detection(true);
+        let pid = 7_308;
+        seed(pid, |_| {});
+        SYS_FORK_COUNT.store(SYS_FORKBOMB_THRESHOLD - 1, Ordering::Relaxed);
+        assert!(on_syscall(pid, nr::FORK));
+        assert_eq!(
+            lines_with("system-wide fork storm"),
+            0,
+            "exactly at the threshold is not a storm"
+        );
+        assert!(on_syscall(pid, nr::FORK));
+        assert_eq!(lines_with("system-wide fork storm"), 1);
+        done(pid);
+    }
+
+    #[test]
+    fn the_system_wide_storm_is_reported_once_per_window() {
+        // Every fork of the storm passes the threshold; only the first of
+        // them may take the alarm.
+        let _g = test_globals::lock();
+        fresh();
+        set_anomaly_detection(true);
+        let pid = 7_309;
+        seed(pid, |_| {});
+        SYS_FORK_COUNT.store(SYS_FORKBOMB_THRESHOLD, Ordering::Relaxed);
+        for _ in 0..3 {
+            assert!(on_syscall(pid, nr::FORK));
+        }
+        assert_eq!(lines_with("system-wide fork storm"), 1);
+        done(pid);
+    }
+
+    #[test]
+    fn an_anomaly_the_kernel_blocks_is_logged_as_critical_and_denies_the_call() {
+        // Under `Report` the same burst is a warning that lets the call
+        // through; the severity is how an operator tells the two apart.
+        let _g = test_globals::lock();
+        fresh();
+        set_anomaly_detection(true);
+        crate::policy::set_anomaly_mode(Mode::Enforce);
+        let pid = 7_310;
+        seed(pid, |st| st.syscall_count = FLOOD_THRESHOLD);
+        let before = event_log::stats().criticals;
+        assert!(
+            !on_syscall(pid, ORDINARY),
+            "Enforce denies the call that trips it"
+        );
+        assert_eq!(event_log::stats().criticals, before + 1);
+        done(pid);
+    }
+
+    #[test]
+    fn a_syscall_the_detector_denies_is_denied_by_the_hook_too() {
+        // `check_syscall` is the kernel's entry point: an IDS verdict that
+        // never reaches it is a verdict nobody acts on.
+        let _g = test_globals::lock();
+        fresh();
+        crate::policy::set_syscall_mode(Mode::Off);
+        crate::policy::set_anomaly_mode(Mode::Enforce);
+        set_privileged_deny(true);
+        let pid = 7_311;
+        assert_eq!(
+            crate::check_syscall(pid, nr::PTRACE, &[0; 6]),
+            Err(crate::SecurityViolation::SyscallBlocked)
+        );
+        assert_eq!(crate::check_syscall(pid, ORDINARY, &[0; 6]), Ok(()));
+        done(pid);
+    }
+}

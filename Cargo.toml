@@ -47,7 +47,6 @@ default-members = ["xtask"]
 exclude = [
     "zircon-user",
     "rboot",
-    "vendor/preemptive-scheduler",
     "vendor/PreemptiveScheduler",
     # Path-patched vendor crates (see the `[patch]` tables below) that carry no
     # `[workspace]` table of their own. Without listing them here `cargo fmt

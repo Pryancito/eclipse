@@ -684,41 +684,11 @@ impl DrmDev {
         // Render nodes only accept DRM_RENDER_ALLOW ioctls (drm-uapi.rst
         // "Render nodes"): modeset, dumb-buffer and master/auth commands get
         // EACCES exactly like Linux, so a client probing `renderD128` sees a
-        // render node, not a second KMS device.
+        // render node, not a second KMS device. The desktop pins KMS to
+        // `card0` via `WLR_DRM_DEVICES`, so enforcing here no longer takes
+        // the software-GL path down with a second open KMS node.
         if self.minor >= 128 && !render_allowed(cmd) {
-            // OBSERVE, DO NOT ENFORCE (yet).
-            //
-            // `render_allowed` used to extract the NR as `(cmd >> 8) & 0xff`,
-            // which is the ioctl TYPE byte -- 'd' (0x64) for every DRM ioctl,
-            // and 0x64 sits inside the driver-private `0x40..=0x9F` arm. The
-            // filter has therefore ACCEPTED EVERYTHING since it was written,
-            // and renderD128 has behaved as a fully-open second KMS node.
-            //
-            // Fixing the extraction (correct, and it now matches Linux's
-            // DRM_RENDER_ALLOW set exactly) would in the same step start
-            // refusing every dumb-buffer and modeset ioctl on the render node
-            // -- CREATE_DUMB/MAP_DUMB/ADDFB2/PAGE_FLIP/... -- on a software-GL
-            // desktop that currently boots and that this change cannot be
-            // tested against. Turning a silent no-op into an enforcing gate
-            // blind is exactly the kind of regression worth avoiding, so log
-            // the would-be refusal and let the call through. Flip this to
-            // `return Err(FsError::NoPermission)` once a boot log shows the
-            // line never appears on the software path.
-            //
-            // De-duped per NR: the caller controls the rate, and `klog_info!`
-            // has no level filter, no rate limit and goes straight out the
-            // UART -- an unthrottled line here would let a client that retries
-            // in a loop flood the serial console and stall the boot.
-            static REFUSAL_LOGGED: [AtomicBool; 256] = [const { AtomicBool::new(false) }; 256];
-            let nr = (cmd & 0xff) as usize;
-            if !REFUSAL_LOGGED[nr].swap(true, Ordering::Relaxed) {
-                kernel_hal::klog_info!(
-                    "[drm] render node: ioctl {:#010x} (drm nr={:#04x}) is NOT in Linux's \
-                     DRM_RENDER_ALLOW set -- allowed anyway for now, see render_allowed()",
-                    cmd,
-                    cmd & 0xff
-                );
-            }
+            return Err(FsError::NoPermission);
         }
         // KMS-query trace for Vulkan's VK_KHR_display probe (wsi_display).
         // `vulkaninfo` dies with ERROR_OUT_OF_HOST_MEMORY inside
@@ -1025,6 +995,20 @@ impl DrmDev {
                 unsafe { *(data as *mut u32) = 1 };
                 Ok(0)
             }
+            DRM_IOCTL_GET_CLIENT => {
+                // `struct drm_client`: libva enumerates clients at init.
+                // Single-client stub: idx 0 is this open; anything else ENOENT.
+                let c = unsafe { &mut *(data as *mut DrmClient) };
+                if c.idx != 0 {
+                    return Err(FsError::EntryNotFound);
+                }
+                c.auth = 1;
+                c.pid = drm::current_pid() as usize;
+                c.uid = 0;
+                c.magic = 1;
+                c.iocs = 0;
+                Ok(0)
+            }
             DRM_IOCTL_AUTH_MAGIC => Ok(0),
             DRM_IOCTL_SET_MASTER => {
                 // Become DRM master, but do NOT switch the console to graphics
@@ -1138,8 +1122,10 @@ impl DrmDev {
                         if value > 2 {
                             return Err(FsError::InvalidParam);
                         }
-                        // Setting atomic also implies universal planes.
+                        // Setting atomic also implies universal planes:
+                        // `drm_setclientcap` stores the value in both fields.
                         self.file.set_atomic_client(value != 0);
+                        self.file.set_universal_planes(value != 0);
                         log::debug!("[drm] SET_CLIENT_CAP ATOMIC={} -> accepted", value);
                         Ok(0)
                     }
@@ -1152,13 +1138,26 @@ impl DrmDev {
                         }
                         Ok(0)
                     }
-                    // STEREO_3D, UNIVERSAL_PLANES, ASPECT_RATIO: a boolean
-                    // each in Linux (`drm_setclientcap`: `value > 1` is
-                    // EINVAL); nothing here changes with them, so accept the
-                    // two legal values and refuse the rest.
-                    DRM_CLIENT_CAP_STEREO_3D
-                    | DRM_CLIENT_CAP_UNIVERSAL_PLANES
-                    | DRM_CLIENT_CAP_ASPECT_RATIO => {
+                    // UNIVERSAL_PLANES: a boolean (`value > 1` is EINVAL)
+                    // that `drm_mode_getplane_res` reads. It was accepted and
+                    // forgotten, so a legacy client that never set it was
+                    // handed the primary plane as if it were an overlay.
+                    DRM_CLIENT_CAP_UNIVERSAL_PLANES => {
+                        if value > 1 {
+                            return Err(FsError::InvalidParam);
+                        }
+                        self.file.set_universal_planes(value != 0);
+                        log::debug!(
+                            "[drm] SET_CLIENT_CAP UNIVERSAL_PLANES={} -> accepted",
+                            value
+                        );
+                        Ok(0)
+                    }
+                    // STEREO_3D, ASPECT_RATIO: a boolean each in Linux
+                    // (`drm_setclientcap`: `value > 1` is EINVAL); nothing
+                    // here changes with them, so accept the two legal values
+                    // and refuse the rest.
+                    DRM_CLIENT_CAP_STEREO_3D | DRM_CLIENT_CAP_ASPECT_RATIO => {
                         if value > 1 {
                             return Err(FsError::InvalidParam);
                         }
@@ -1182,7 +1181,13 @@ impl DrmDev {
             }
             DRM_IOCTL_MODE_CREATE_DUMB => {
                 let info = unsafe { &mut *(data as *mut DrmModeCreateDumb) };
-                let bpp = info.bpp.max(32);
+                // Linux: bpp==0 is EINVAL. `.max(32)` used to turn 0 into a
+                // successful 32-bpp alloc and to inflate bpp=16 into 32, so
+                // pitch/size lied about the format the client asked for.
+                if info.bpp == 0 {
+                    return Err(FsError::InvalidParam);
+                }
+                let bpp = info.bpp;
                 // width/height/bpp are userspace-controlled: compute pitch/size
                 // in 64-bit. A 32-bit `width*bpp` or `pitch*height` would wrap
                 // (e.g. 50000x50000x32) and under-allocate the buffer while
@@ -1240,7 +1245,8 @@ impl DrmDev {
                         bpp,
                         size
                     );
-                    Err(FsError::NoDeviceSpace)
+                    // Linux: GEM alloc failure is ENOMEM, not ENOSPC.
+                    Err(FsError::NoMemory)
                 }
             }
             DRM_IOCTL_MODE_ADDFB => {
@@ -1273,6 +1279,11 @@ impl DrmDev {
                     modifier: [0; 4],
                 };
                 addfb2_check(&as_fb2)?;
+                // Linux: unknown GEM handle → ENOENT; bad geometry → EINVAL.
+                // Both used to collapse to DeviceError (EIO).
+                if drm::resolve_gem_backing_for(cmd.handle, drm::current_pid()).is_none() {
+                    return Err(FsError::EntryNotFound);
+                }
                 if let Some(fb_id) = drm::create_fb_with_format(
                     cmd.handle,
                     cmd.width,
@@ -1283,22 +1294,23 @@ impl DrmDev {
                     cmd.fb_id = fb_id;
                     Ok(0)
                 } else {
-                    // [swapchain-diag] error!-visible at LOG=error: a failed FB
-                    // creation makes wlroots' swapchain test fail before any
-                    // atomic commit is even attempted.
                     log::error!(
-                        "[drm] ADDFB failed: {}x{} handle={:#x} pitch={} (create_fb returned None)",
+                        "[drm] ADDFB failed: {}x{} handle={:#x} pitch={} (geometry/format)",
                         cmd.width,
                         cmd.height,
                         cmd.handle,
                         cmd.pitch
                     );
-                    Err(FsError::DeviceError)
+                    Err(FsError::InvalidParam)
                 }
             }
             DRM_IOCTL_MODE_ADDFB2 => {
                 let cmd = unsafe { &mut *(data as *mut DrmModeFbCmd2) };
                 addfb2_check(cmd)?;
+                // Linux: unknown GEM handle → ENOENT; bad geometry → EINVAL.
+                if drm::resolve_gem_backing_for(cmd.handles[0], drm::current_pid()).is_none() {
+                    return Err(FsError::EntryNotFound);
+                }
                 if let Some(fb_id) = drm::create_fb_with_format(
                     cmd.handles[0],
                     cmd.width,
@@ -1309,16 +1321,12 @@ impl DrmDev {
                     cmd.fb_id = fb_id;
                     Ok(0)
                 } else {
-                    // [swapchain-diag] error!-visible at LOG=error: the scanout
-                    // buffer wlroots hands us is rejected HERE, before the atomic
-                    // TEST_ONLY commit — so an empty "ATOMIC reject" grep with
-                    // this line present localises the failure to FB creation.
                     log::error!(
                         "[drm] ADDFB2 failed: {}x{} handle={:#x} pitch={} fmt={:#x} modifier={:#x} \
-                         (create_fb returned None)",
+                         (geometry/format)",
                         cmd.width, cmd.height, cmd.handles[0], cmd.pitches[0], cmd.pixel_format, cmd.modifier[0]
                     );
-                    Err(FsError::DeviceError)
+                    Err(FsError::InvalidParam)
                 }
             }
             DRM_IOCTL_MODE_RMFB => {
@@ -1402,8 +1410,41 @@ impl DrmDev {
                 if drm::get_crtc(req.crtc_id).is_none() {
                     return Err(FsError::EntryNotFound);
                 }
+                // With a mode, `drm_mode_setcrtc` then looks the fb up
+                // (ENOENT; -1 names the fb already on the CRTC, EINVAL when
+                // there is none), runs the mode through
+                // `drm_mode_convert_umode` (EINVAL for a zero clock, a zero
+                // active area, sync timings out of order or an aspect-ratio
+                // code it does not define) and wants the active area at
+                // (x, y) inside the fb (`drm_crtc_check_viewport`, ENOSPC).
+                // None of it was read: a mode wider or taller than its fb
+                // was scanned out as if the fb fit it, a mode with no clock
+                // set the vblank pacing to a fallback and answered done, and
+                // -1 was looked up as an fb id.
+                let mut fb_id = req.fb_id;
+                if req.mode_valid != 0 {
+                    if fb_id == u32::MAX {
+                        fb_id = drm::get_crtc(req.crtc_id).map_or(0, |c| c.fb_id);
+                        if fb_id == 0 {
+                            return Err(FsError::InvalidParam);
+                        }
+                    }
+                    let Some(fb) = drm::get_fb(fb_id) else {
+                        return Err(FsError::EntryNotFound);
+                    };
+                    let Some((w, h)) = modeinfo_active_area(&req.mode) else {
+                        return Err(FsError::InvalidParam);
+                    };
+                    if w > fb.width
+                        || req.x > fb.width - w
+                        || h > fb.height
+                        || req.y > fb.height - h
+                    {
+                        return Err(FsError::NoDeviceSpace);
+                    }
+                }
                 if req.count_connectors > 0 {
-                    if req.mode_valid == 0 || req.fb_id == 0 {
+                    if req.mode_valid == 0 || fb_id == 0 {
                         return Err(FsError::InvalidParam);
                     }
                     let connectors = drm::get_resources().2;
@@ -1422,9 +1463,9 @@ impl DrmDev {
                 if req.mode_valid != 0 {
                     drm::set_vblank_period_from_modeinfo(&req.mode);
                 }
-                if req.fb_id != 0 {
-                    if let Err(e) = drm::present_now_checked(req.fb_id, req.crtc_id, None) {
-                        present_failed("SETCRTC", req.fb_id, req.crtc_id, e)?;
+                if fb_id != 0 {
+                    if let Err(e) = drm::present_now_checked(fb_id, req.crtc_id, None) {
+                        present_failed("SETCRTC", fb_id, req.crtc_id, e)?;
                     }
                 } else {
                     // `drm_mode_setcrtc` with a null fb turns the pipe off
@@ -1459,11 +1500,30 @@ impl DrmDev {
                 // and `drm_framebuffer_lookup` in that order. The CRTC id was
                 // never read, so a flip aimed at a CRTC the card does not have
                 // landed on the one it has.
-                if drm::get_crtc(flip.crtc_id).is_none() {
+                let Some(crtc) = drm::get_crtc(flip.crtc_id) else {
                     return Err(FsError::EntryNotFound);
+                };
+                let Some(fb) = drm::get_fb(flip.fb_id) else {
+                    return Err(FsError::EntryNotFound);
+                };
+                // Then `drm_crtc_check_viewport(crtc, crtc->x, crtc->y,
+                // &crtc->mode, fb)`: the CRTC's mode has to fit in the new
+                // fb (ENOSPC), and "page flip is not allowed to change frame
+                // buffer format" (EINVAL). Neither was read: a flip onto an
+                // fb smaller than the mode, or of another format, went to
+                // the scanout as if it were the frame the CRTC was set up
+                // with. (Linux also refuses a flip on a CRTC with no fb,
+                // EBUSY; this tree's flip is also its present, so a client
+                // is allowed to start with one, as the GL sequence does.)
+                if let Some((w, h, _)) = drm::display_mode() {
+                    if fb.width < w || fb.height < h {
+                        return Err(FsError::NoDeviceSpace);
+                    }
                 }
-                if drm::get_fb(flip.fb_id).is_none() {
-                    return Err(FsError::EntryNotFound);
+                if let Some(old) = drm::get_fb(crtc.fb_id) {
+                    if old.pixel_format != fb.pixel_format {
+                        return Err(FsError::InvalidParam);
+                    }
                 }
                 let want_event = flip.flags & DRM_MODE_PAGE_FLIP_EVENT != 0;
                 match drm::page_flip(
@@ -1568,15 +1628,43 @@ impl DrmDev {
                 // and answers ENOENT for one that does not exist. The id was
                 // not read at all, so a stale or invented plane id presented
                 // the fb on the CRTC as if it named the primary plane.
-                if drm::get_plane(req.plane_id).is_none() {
+                let Some(plane) = drm::get_plane(req.plane_id) else {
                     return Err(FsError::EntryNotFound);
-                }
+                };
                 if req.fb_id != 0 {
                     // With an fb to show, `drm_mode_setplane` looks the fb up
                     // and then the CRTC, both ENOENT. The CRTC id was not
                     // read either.
-                    if drm::get_fb(req.fb_id).is_none() || drm::get_crtc(req.crtc_id).is_none() {
+                    let Some(fb) = drm::get_fb(req.fb_id) else {
                         return Err(FsError::EntryNotFound);
+                    };
+                    if drm::get_crtc(req.crtc_id).is_none() {
+                        return Err(FsError::EntryNotFound);
+                    }
+                    // `__setplane_check`: the plane has to be usable on this
+                    // CRTC (`possible_crtcs & drm_crtc_mask(crtc)`, EINVAL;
+                    // the mask bit is the CRTC's index in the resource list,
+                    // which is what GETPLANE advertises), and the source
+                    // rectangle, in 16.16, has to lie inside the fb
+                    // (`drm_framebuffer_check_src_coords`, ENOSPC). Neither
+                    // was read: a plane was put on a CRTC it does not reach,
+                    // and a source rectangle past the fb's edge was accepted
+                    // and then ignored, so the client believed it was showing
+                    // a crop the scanout never made.
+                    let index = drm::get_resources()
+                        .1
+                        .iter()
+                        .position(|&id| id == req.crtc_id)
+                        .unwrap_or(usize::MAX);
+                    if index >= 32 || plane.possible_crtcs & (1 << index) == 0 {
+                        return Err(FsError::InvalidParam);
+                    }
+                    let (fb_w, fb_h) = ((fb.width as u64) << 16, (fb.height as u64) << 16);
+                    let (src_x, src_y) = (req.src_x as u64, req.src_y as u64);
+                    let (src_w, src_h) = (req.src_w as u64, req.src_h as u64);
+                    if src_w > fb_w || src_x > fb_w - src_w || src_h > fb_h || src_y > fb_h - src_h
+                    {
+                        return Err(FsError::NoDeviceSpace);
                     }
                     if let Err(e) = drm::present_now_checked(req.fb_id, req.crtc_id, None) {
                         present_failed("SETPLANE", req.fb_id, req.crtc_id, e)?;
@@ -1671,13 +1759,47 @@ impl DrmDev {
                 //
                 // An oversized, zero, or unreadable clip list means "the whole
                 // frame is dirty" (true DIRTYFB semantics for num_clips == 0).
+                // Linux accepts up to 256 clips (`DRM_MODE_FB_DIRTY_MAX_CLIPS`);
+                // 64 made dense-damage frames fall back to a full-screen blit.
+                const MAX_DIRTY_CLIPS: u32 = 256;
                 const MAX_DIRTY_SPANS: usize = 8;
                 let cmd = unsafe { *(data as *const DrmModeFbDirtyCmd) };
+                // `drm_mode_dirtyfb_ioctl`, in its order: a flag it does not
+                // define is EINVAL; the fb is looked up (ENOENT); a clip count
+                // without a pointer, or a pointer without a count, is EINVAL;
+                // ANNOTATE_COPY clips come in (src, dst) pairs, so an odd
+                // count is EINVAL; more than DRM_MODE_FB_DIRTY_MAX_CLIPS is
+                // EINVAL. None of it was read: a flush of a framebuffer that
+                // does not exist, or with a clip list the kernel could not
+                // have read, was reported as done.
+                const DRM_MODE_FB_DIRTY_ANNOTATE_COPY: u32 = 0x01;
+                const DRM_MODE_FB_DIRTY_ANNOTATE_FILL: u32 = 0x02;
+                const DRM_MODE_FB_DIRTY_MAX_CLIPS: u32 = 256;
+                if cmd.flags & !(DRM_MODE_FB_DIRTY_ANNOTATE_COPY | DRM_MODE_FB_DIRTY_ANNOTATE_FILL)
+                    != 0
+                {
+                    return Err(FsError::InvalidParam);
+                }
+                if drm::get_fb(cmd.fb_id).is_none() {
+                    return Err(FsError::EntryNotFound);
+                }
+                if (cmd.num_clips == 0) != (cmd.clips_ptr == 0) {
+                    return Err(FsError::InvalidParam);
+                }
+                if cmd.flags & DRM_MODE_FB_DIRTY_ANNOTATE_COPY != 0 && cmd.num_clips % 2 != 0 {
+                    return Err(FsError::InvalidParam);
+                }
+                if cmd.num_clips > DRM_MODE_FB_DIRTY_MAX_CLIPS {
+                    return Err(FsError::InvalidParam);
+                }
                 let mut spans = [(0u32, 0u32, 0u32, 0u32); MAX_DIRTY_SPANS];
                 let mut n = 0usize;
                 let mut area = 0u64;
                 let mut too_many = false;
-                let rect = if cmd.num_clips > 0 && cmd.num_clips <= 64 && cmd.clips_ptr != 0 {
+                let rect = if cmd.num_clips > 0
+                    && cmd.num_clips <= MAX_DIRTY_CLIPS
+                    && cmd.clips_ptr != 0
+                {
                     ucheck_n::<DrmClipRect>(cmd.clips_ptr as usize, cmd.num_clips as usize)?;
                     let mut union: Option<(u32, u32, u32, u32)> = None;
                     for i in 0..cmd.num_clips as usize {
@@ -1880,6 +2002,25 @@ impl DrmDev {
                         && (cur.width > drm::MAX_CURSOR_DIM || cur.height > drm::MAX_CURSOR_DIM)
                     {
                         return Err(FsError::InvalidParam);
+                    }
+                    // Linux builds a framebuffer over the handle
+                    // (`drm_mode_cursor_universal`): a handle this file does
+                    // not hold is ENOENT (`drm_gem_object_lookup`), and a
+                    // buffer too small for `width x height` 32-bit pixels is
+                    // EINVAL (`drm_gem_fb_size_check`). Both were reported as
+                    // success with the cursor quietly hidden, and the lookup
+                    // was the unchecked one: another process's buffer could
+                    // be shown as the pointer.
+                    if cur.handle != 0 {
+                        let Some((_, size)) =
+                            drm::resolve_gem_backing_for(cur.handle, drm::current_pid())
+                        else {
+                            return Err(FsError::EntryNotFound);
+                        };
+                        let bytes = (cur.width as usize) * (cur.height as usize) * 4;
+                        if size < bytes {
+                            return Err(FsError::InvalidParam);
+                        }
                     }
                     changed |= drm::set_cursor_bo(cur.handle, cur.width, cur.height);
                 }
@@ -2177,14 +2318,32 @@ impl DrmDev {
             }
             DRM_IOCTL_MODE_GETPLANERESOURCES => {
                 let res = unsafe { &mut *(data as *mut DrmModeGetPlaneRes) };
-                let planes = drm::get_planes();
-                if res.plane_id_ptr != 0 && res.count_planes >= planes.len() as u32 {
-                    ucheck_n::<u32>(res.plane_id_ptr as usize, planes.len())?;
+                // `drm_mode_getplane_res`: "unless userspace set the
+                // 'universal planes' capability bit, only advertise
+                // overlays". Every plane here is a primary, so a client that
+                // never set the cap -- one written when the primary and the
+                // cursor were not planes -- gets an empty list, not the
+                // scanout plane to drive as an overlay. The cap was accepted
+                // and ignored, and the list was the same for everyone.
+                let universal = self.file.universal_planes();
+                let planes: alloc::vec::Vec<u32> = drm::get_planes()
+                    .into_iter()
+                    .filter(|&id| {
+                        universal
+                            || drm::get_plane(id)
+                                .is_some_and(|p| p.plane_type == DRM_PLANE_TYPE_OVERLAY)
+                    })
+                    .collect();
+                // Linux fills as many ids as the caller made room for and
+                // reports the full count; this arm filled all or nothing.
+                let fill = planes.len().min(res.count_planes as usize);
+                if res.plane_id_ptr != 0 && fill > 0 {
+                    ucheck_n::<u32>(res.plane_id_ptr as usize, fill)?;
                     unsafe {
                         core::ptr::copy_nonoverlapping(
                             planes.as_ptr(),
                             res.plane_id_ptr as *mut u32,
-                            planes.len(),
+                            fill,
                         );
                     }
                 }
@@ -2402,8 +2561,10 @@ impl DrmDev {
                 match drm::destroy_blob(blob_id) {
                     drm::BlobDestroy::Destroyed => Ok(0),
                     drm::BlobDestroy::NotFound => Err(FsError::EntryNotFound),
-                    // Linux: only the creator may destroy a blob -> EPERM-ish.
-                    drm::BlobDestroy::KernelOwned => Err(FsError::NoPermission),
+                    // Linux: kernel-owned or another client's blob → EPERM.
+                    drm::BlobDestroy::KernelOwned | drm::BlobDestroy::NotOwner => {
+                        Err(FsError::NotPermitted)
+                    }
                 }
             }
             DRM_IOCTL_MODE_ATOMIC => {
@@ -2849,13 +3010,13 @@ impl DrmDev {
                         // ENODEV/EINVAL/EBUSY only for userspace to see EIO
                         // makes every one of those messages a lie.
                         .map_err(|e| match e {
-                            2 => FsError::EntryNotFound,  // ENOENT
-                            12 => FsError::NoDeviceSpace, // ENOMEM
-                            16 => FsError::Busy,          // EBUSY
-                            19 => FsError::NoDevice,      // ENODEV
-                            22 => FsError::InvalidParam,  // EINVAL
-                            38 => FsError::NotSupported,  // ENOSYS
-                            95 => FsError::NotSupported,  // EOPNOTSUPP
+                            2 => FsError::EntryNotFound, // ENOENT
+                            12 => FsError::NoMemory,     // ENOMEM
+                            16 => FsError::Busy,         // EBUSY
+                            19 => FsError::NoDevice,     // ENODEV
+                            22 => FsError::InvalidParam, // EINVAL
+                            38 => FsError::NotSupported, // ENOSYS
+                            95 => FsError::NotSupported, // EOPNOTSUPP
                             _ => FsError::DeviceError,
                         })
                 } else if is_core_drm_nr(nr) {
@@ -3367,6 +3528,8 @@ const DRM_IOCTL_AUTH_MAGIC: u32 = 0x40046411;
 const DRM_IOCTL_GET_CAP: u32 = 0xC010640C;
 const DRM_IOCTL_SET_CLIENT_CAP: u32 = 0x4010640D;
 const DRM_IOCTL_GEM_CLOSE: u32 = 0x40086409;
+/// `struct drm_client` is 40 bytes on LP64 (`_IOWR('d', 0x0A, …)`).
+const DRM_IOCTL_GET_CLIENT: u32 = 0xC028640A;
 const DRM_IOCTL_SET_MASTER: u32 = 0x0000641E;
 const DRM_IOCTL_DROP_MASTER: u32 = 0x0000641F;
 
@@ -3698,6 +3861,9 @@ const DRM_MODE_OBJECT_FB: u32 = 0xfbfb_fbfb;
 // DRM client capabilities (DRM_IOCTL_SET_CLIENT_CAP).
 const DRM_CLIENT_CAP_STEREO_3D: u64 = 1;
 const DRM_CLIENT_CAP_UNIVERSAL_PLANES: u64 = 2;
+/// `DRM_PLANE_TYPE_OVERLAY`: the only plane type `drm_mode_getplane_res` lists
+/// to a client without `DRM_CLIENT_CAP_UNIVERSAL_PLANES`.
+const DRM_PLANE_TYPE_OVERLAY: u32 = 0;
 const DRM_CLIENT_CAP_ATOMIC: u64 = 3;
 const DRM_CLIENT_CAP_ASPECT_RATIO: u64 = 4;
 const DRM_CLIENT_CAP_WRITEBACK_CONNECTORS: u64 = 5;
@@ -3890,7 +4056,7 @@ const SYNCOBJ_ARRAY_MAX: u32 = 1 << 20;
 /// ENOMEM past [`SYNCOBJ_ARRAY_MAX`], as the kernel's allocation would be.
 fn syncobj_array_bound(count_handles: u32) -> Result<()> {
     if count_handles > SYNCOBJ_ARRAY_MAX {
-        Err(FsError::NoDeviceSpace)
+        Err(FsError::NoMemory)
     } else {
         Ok(())
     }
@@ -4437,6 +4603,18 @@ struct DrmModeCreateBlob {
     blob_id: u32,
 }
 
+/// `struct drm_client` (40 bytes on LP64).
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+struct DrmClient {
+    idx: i32,
+    auth: i32,
+    pid: usize,
+    uid: usize,
+    magic: usize,
+    iocs: usize,
+}
+
 // Compile-time guards: each DRM ioctl number encodes `sizeof(struct)` in its
 // _IOC size field, so a wrong struct layout silently mismatches the ioctl and
 // the handler never fires. Assert the sizes that the constants above depend on.
@@ -4460,6 +4638,7 @@ const _: () = {
     assert!(size_of::<DrmSetVersion>() == 16); // DRM_IOCTL_SET_VERSION   0x..10..
     assert!(size_of::<DrmModeAtomic>() == 56); // DRM_IOCTL_MODE_ATOMIC   0x..38..
     assert!(size_of::<DrmModeCreateBlob>() == 16); // CREATEPROPBLOB      0x..10..
+    assert!(size_of::<DrmClient>() == 40); // DRM_IOCTL_GET_CLIENT     0x..28..
     assert!(size_of::<DrmSyncobjCreate>() == 8); // DRM_IOCTL_SYNCOBJ_CREATE   0x..08..
     assert!(size_of::<DrmSyncobjDestroy>() == 8); // DRM_IOCTL_SYNCOBJ_DESTROY  0x..08..
     assert!(size_of::<DrmSyncobjWait>() == 32); // DRM_IOCTL_SYNCOBJ_WAIT     0x..20..
@@ -4620,6 +4799,38 @@ fn panel_timing_in(block: &[u8], len: u32) -> Option<edid::DetailedTiming> {
 /// turns into the synthetic vblank period every `WAIT_VBLANK` and every flip
 /// completion is timed against. Saying 60 to a 144 Hz panel throws away more
 /// than half of its scanouts.
+/// `DRM_MODE_FLAG_PIC_AR_MASK` is bits 19..=23 of `drm_mode_modeinfo.flags`;
+/// `drm_mode_convert_umode` knows the codes 0 (none) to 4 (256:135) and
+/// refuses the rest.
+const DRM_MODE_FLAG_PIC_AR_SHIFT: u32 = 19;
+const DRM_MODE_FLAG_PIC_AR_MAX: u32 = 4;
+
+/// `drm_mode_validate_basic`, on a `struct drm_mode_modeinfo` as the ioctl
+/// carries it, plus the aspect-ratio code check of `drm_mode_convert_umode`:
+/// the modes the kernel refuses with EINVAL before any driver sees them. For a
+/// mode that passes, its active area `(hdisplay, vdisplay)`.
+fn modeinfo_active_area(m: &[u8; 68]) -> Option<(u32, u32)> {
+    let u16_at = |i: usize| u16::from_ne_bytes([m[i], m[i + 1]]);
+    let clock = u32::from_ne_bytes([m[0], m[1], m[2], m[3]]);
+    let (hdisplay, hsync_start, hsync_end, htotal) = (u16_at(4), u16_at(6), u16_at(8), u16_at(10));
+    let (vdisplay, vsync_start, vsync_end, vtotal) =
+        (u16_at(14), u16_at(16), u16_at(18), u16_at(20));
+    let flags = u32::from_ne_bytes([m[28], m[29], m[30], m[31]]);
+    if (flags >> DRM_MODE_FLAG_PIC_AR_SHIFT) & 0x1f > DRM_MODE_FLAG_PIC_AR_MAX {
+        return None;
+    }
+    if clock == 0 {
+        return None;
+    }
+    if hdisplay == 0 || hsync_start < hdisplay || hsync_end < hsync_start || htotal < hsync_end {
+        return None;
+    }
+    if vdisplay == 0 || vsync_start < vdisplay || vsync_end < vsync_start || vtotal < vsync_end {
+        return None;
+    }
+    Some((hdisplay as u32, vdisplay as u32))
+}
+
 fn make_modeinfo(w: u32, h: u32) -> [u8; 68] {
     make_modeinfo_with(w, h, panel_timing().as_ref())
 }
@@ -5176,6 +5387,7 @@ fn canonical_drm_ioctl(nr: u32) -> Option<u32> {
         0x02 => DRM_IOCTL_GET_MAGIC,
         0x07 => DRM_IOCTL_SET_VERSION,
         0x09 => DRM_IOCTL_GEM_CLOSE,
+        0x0A => DRM_IOCTL_GET_CLIENT,
         0x0C => DRM_IOCTL_GET_CAP,
         0x0D => DRM_IOCTL_SET_CLIENT_CAP,
         0x11 => DRM_IOCTL_AUTH_MAGIC,
@@ -5455,18 +5667,16 @@ impl INode for DrmDev {
     }
 
     fn write_at(&self, _offset: usize, _buf: &[u8]) -> Result<usize> {
-        Ok(_buf.len())
+        // DRM chardev has no write sink; Linux answers EINVAL.
+        Err(FsError::InvalidParam)
     }
 
     fn poll(&self) -> Result<PollStatus> {
         Ok(PollStatus {
+            // Linux `drm_poll`: POLLIN when the event queue is non-empty;
+            // never POLLOUT (the chardev is not writable).
             read: self.file.has_events(),
-            // Keep write=true for now: reporting write=false made labwc's
-            // DRM epoll actually park and exposed a #DF at session start
-            // (heap corruption while the card fd stopped looking always-
-            // ready). Linux semantics are "readable for events"; revisit
-            // once the UserContext/#DF path at labwc bring-up is solid.
-            write: true,
+            write: false,
             error: false,
             hangup: false,
         })
@@ -6136,6 +6346,40 @@ mod render_node_and_mode_tests {
     }
 
     #[test]
+    fn a_render_node_refuses_modeset_and_dumb_with_eacces() {
+        // Enforcement used to be observe-only: renderD128 accepted CREATE_DUMB
+        // and SETCRTC. Linux answers EACCES; the helper already knew, the
+        // ioctl path did not.
+        use super::gl_client_sequence_tests::Client;
+        use crate::error::LxError;
+        let render = Client::open(128);
+        let mut dumb = DrmModeCreateDumb {
+            height: 16,
+            width: 16,
+            bpp: 32,
+            flags: 0,
+            handle: 0,
+            pitch: 0,
+            size: 0,
+        };
+        assert_eq!(
+            render.ioctl(DRM_IOCTL_MODE_CREATE_DUMB, &mut dumb),
+            Err(FsError::NoPermission)
+        );
+        assert_eq!(
+            LxError::from(FsError::NoPermission),
+            LxError::EACCES,
+            "userspace must see EACCES on a render-node modeset/dumb"
+        );
+        // GET_CAP stays allowed on a render node.
+        let mut cap = DrmGetCap {
+            capability: 0x1, // DRM_CAP_DUMB_BUFFER
+            value: 0,
+        };
+        assert!(render.ioctl(DRM_IOCTL_GET_CAP, &mut cap).is_ok());
+    }
+
+    #[test]
     fn the_interception_filter_checks_type_number_and_a_size_floor() {
         // `is_drm_ioctl_nr` gates what `sys_ioctl` grabs before the inode
         // dispatch. Matching on the number alone would steal another
@@ -6185,6 +6429,7 @@ mod ioctl_size_reconciliation_tests {
             DRM_IOCTL_GET_MAGIC,
             DRM_IOCTL_SET_VERSION,
             DRM_IOCTL_GEM_CLOSE,
+            DRM_IOCTL_GET_CLIENT,
             DRM_IOCTL_GET_CAP,
             DRM_IOCTL_SET_CLIENT_CAP,
             DRM_IOCTL_AUTH_MAGIC,
@@ -7065,6 +7310,67 @@ mod kms_scanout_tests {
         DrmClipRect { x1, y1, x2, y2 }
     }
 
+    /// What `drm_mode_dirtyfb_ioctl` refuses before any driver sees the
+    /// flush: an unknown flag (EINVAL), a framebuffer that does not exist
+    /// (ENOENT), a clip count and a clip pointer that disagree about whether
+    /// there are clips (EINVAL), an odd count with ANNOTATE_COPY, whose clips
+    /// come in pairs (EINVAL), and more than 256 clips (EINVAL). None of it
+    /// was read: every one of these came back as a flush done. The shapes
+    /// Xorg's modesetting shadow sends keep going through.
+    #[test]
+    fn dirtyfb_refuses_what_linux_refuses() {
+        let _screen = kms_emu::attach(64, 16);
+        let c = Client::open(0);
+        let buf = c.create_dumb(64, 16);
+        paint(&buf, |x, y| tag(0x0066_0000, x, y));
+        let fb = c.addfb2(&buf);
+        set_crtc(&c, drm::SYNTH_CRTC_ID, fb, 64, 16);
+
+        let clips = [clip(0, 0, 16, 8), clip(16, 8, 32, 16)];
+        let ptr = clips.as_ptr() as u64;
+        let dirty = |fb_id: u32, flags: u32, num_clips: u32, clips_ptr: u64| {
+            let mut cmd = DrmModeFbDirtyCmd {
+                fb_id,
+                flags,
+                color: 0,
+                num_clips,
+                clips_ptr,
+            };
+            c.ioctl(DRM_IOCTL_MODE_DIRTYFB, &mut cmd)
+        };
+        const ANNOTATE_COPY: u32 = 0x01;
+        const ANNOTATE_FILL: u32 = 0x02;
+        let einval = Err(FsError::InvalidParam);
+
+        assert_eq!(dirty(4242, 0, 1, ptr), Err(FsError::EntryNotFound));
+        assert_eq!(
+            dirty(fb, 0x4, 1, ptr),
+            einval,
+            "a flag Linux does not define"
+        );
+        assert_eq!(dirty(fb, 0, 1, 0), einval, "clips without a pointer");
+        assert_eq!(dirty(fb, 0, 0, ptr), einval, "a pointer without clips");
+        assert_eq!(
+            dirty(fb, ANNOTATE_COPY, 1, ptr),
+            einval,
+            "copy clips come in pairs"
+        );
+        assert_eq!(
+            dirty(fb, 0, 257, ptr),
+            einval,
+            "more clips than the kernel reads"
+        );
+
+        assert_eq!(dirty(fb, 0, 256, ptr), Ok(0), "exactly the kernel's limit");
+        assert_eq!(dirty(fb, ANNOTATE_COPY, 2, ptr), Ok(0));
+        assert_eq!(dirty(fb, ANNOTATE_FILL, 1, ptr), Ok(0));
+        assert_eq!(dirty(fb, 0, 2, ptr), Ok(0));
+        assert_eq!(dirty(fb, 0, 0, 0), Ok(0), "no clips: the whole frame");
+
+        assert_eq!(c.rmfb(fb), Ok(0));
+        assert_eq!(c.destroy_dumb(buf.handle), Ok(0));
+    }
+
     /// `struct drm_mode_cursor`, 28 bytes -- the layout the ioctl number
     /// encodes, so a wrong one here would not even reach the arm.
     #[repr(C)]
@@ -7189,7 +7495,9 @@ mod kms_scanout_tests {
     /// A framebuffer smaller than the mode leaves the rest of the screen alone.
     /// Writing past it would be an out-of-bounds store into the scanout aperture
     /// on real hardware, and the pixels it would land on belong to whatever was
-    /// there before -- the text console, usually.
+    /// there before -- the text console, usually. `SETCRTC` refuses such a
+    /// modeset outright (ENOSPC, `drm_crtc_check_viewport`), so the scanout
+    /// is reached the way the kernel's own callers reach it.
     #[test]
     fn a_framebuffer_smaller_than_the_mode_leaves_the_rest_of_the_screen_alone() {
         let screen = kms_emu::attach(64, 16);
@@ -7198,7 +7506,23 @@ mod kms_scanout_tests {
         paint(&buf, |x, y| tag(0x0033_0000, x, y));
         let fb = c.addfb2(&buf);
 
-        set_crtc(&c, drm::SYNTH_CRTC_ID, fb, 64, 16);
+        let mut req = DrmModeGetCrtc {
+            set_connectors_ptr: 0,
+            count_connectors: 0,
+            crtc_id: drm::SYNTH_CRTC_ID,
+            fb_id: fb,
+            x: 0,
+            y: 0,
+            gamma_size: 0,
+            mode_valid: 1,
+            mode: make_modeinfo(64, 16),
+        };
+        assert_eq!(
+            c.ioctl(DRM_IOCTL_MODE_SETCRTC, &mut req),
+            Err(FsError::NoDeviceSpace),
+            "a mode the fb cannot hold"
+        );
+        drm::present_now_checked(fb, drm::SYNTH_CRTC_ID, None).expect("present");
 
         for y in 0..16 {
             for x in 0..64 {
@@ -7507,7 +7831,11 @@ mod kms_scanout_tests {
             "a physical size of 0 is an infinite DPI to every client that divides by it"
         );
 
-        // One primary plane on that CRTC.
+        // One primary plane on that CRTC -- to a client that asked for
+        // universal planes, as every compositor does.
+        let mut cap: [u64; 2] = [DRM_CLIENT_CAP_UNIVERSAL_PLANES, 1];
+        c.ioctl(DRM_IOCTL_SET_CLIENT_CAP, &mut cap)
+            .expect("SET_CLIENT_CAP UNIVERSAL_PLANES");
         let mut planes = [0u32; 1];
         let mut plane_res = DrmModeGetPlaneRes {
             plane_id_ptr: planes.as_mut_ptr() as u64,
@@ -9973,9 +10301,14 @@ mod kms_scanout_tests {
         // The narrow present composites the pointer again, and this is where the
         // window used to shrink.
         paint(&small, |x, y| desktop_px(2, x, y));
-        c.page_flip(drm::SYNTH_CRTC_ID, fb_small, 1)
-            .expect("flip the narrow framebuffer");
-        drain_completions(&c);
+        // A flip onto a framebuffer the mode does not fit in is ENOSPC
+        // (`drm_mode_page_flip_ioctl`, like `SETCRTC` in
+        // `a_framebuffer_smaller_than_the_mode_leaves_the_rest_of_the_screen_alone`),
+        // so the narrow scanout is reached the way the kernel's own callers
+        // reach it, and the CRTC is left holding the fb as the flip did.
+        drm::present_now_checked(fb_small, drm::SYNTH_CRTC_ID, None)
+            .expect("present the narrow framebuffer");
+        drm::set_crtc_fb(drm::SYNTH_CRTC_ID, fb_small);
         panel.present_box(2, 0, 0, SMALL_W, SMALL_H);
         panel.check(&screen, "frame 2 from the narrow framebuffer");
         assert!(
@@ -10307,9 +10640,12 @@ mod kms_scanout_tests {
                     frame += 1;
                     let f = frame;
                     paint(&small, |x, y| desktop_px(f, x, y));
-                    c.page_flip(drm::SYNTH_CRTC_ID, fb_small, step as u64)
-                        .expect("flip");
-                    drain_completions(&c);
+                    // A flip onto it is ENOSPC (the mode does not fit), so the
+                    // present is made the way the kernel's own callers make it
+                    // and the CRTC is left holding the fb as the flip did.
+                    drm::present_now_checked(fb_small, drm::SYNTH_CRTC_ID, None)
+                        .expect("present the narrow framebuffer");
+                    drm::set_crtc_fb(drm::SYNTH_CRTC_ID, fb_small);
                     model.present_box(frame, 0, 0, SMALL_W, SMALL_H);
                     // The panel does not hold this framebuffer entirely -- only
                     // its top-left corner -- so no damage box on it may be
@@ -11137,6 +11473,13 @@ mod hw_kms_tests {
         (crtcs, conns)
     }
 
+    /// `DRM_CLIENT_CAP_UNIVERSAL_PLANES` on or off for this client.
+    fn universal_planes(c: &Client, on: bool) {
+        let mut cap: [u64; 2] = [DRM_CLIENT_CAP_UNIVERSAL_PLANES, on as u64];
+        c.ioctl(DRM_IOCTL_SET_CLIENT_CAP, &mut cap)
+            .expect("SET_CLIENT_CAP UNIVERSAL_PLANES");
+    }
+
     fn planes(c: &Client) -> Vec<u32> {
         let mut probe = DrmModeGetPlaneRes {
             plane_id_ptr: 0,
@@ -11305,11 +11648,75 @@ mod hw_kms_tests {
         let _virtio = screen.attach_gpu(EmuGpu::new("emu-virtio").with_ids(50, 51, 52));
         let _nvidia = screen.attach_gpu(EmuGpu::hardware_kms("emu-gpu").with_ids(60, 61, 62));
         let c = Client::open(0);
+        universal_planes(&c, true);
 
         let (crtcs, conns) = topology(&c);
         assert_eq!(crtcs, alloc::vec![60], "the non-KMS CRTC was exposed too");
         assert_eq!(conns, alloc::vec![61]);
         assert_eq!(planes(&c), alloc::vec![62]);
+    }
+
+    /// `drm_mode_getplane_res` lists only overlay planes until the client
+    /// sets `DRM_CLIENT_CAP_UNIVERSAL_PLANES` (or ATOMIC, which implies it):
+    /// a legacy client was written when the primary and the cursor were not
+    /// planes, and would drive the scanout plane as an overlay. The cap was
+    /// accepted and forgotten, and the list was the same for everyone. The
+    /// flag is per open file, and the list is filled as far as the caller's
+    /// buffer goes, with the full count reported.
+    #[test]
+    fn only_a_client_that_asked_for_universal_planes_is_told_about_the_primaries() {
+        let screen = kms_emu::attach(64, 16);
+        let _first = screen.attach_gpu(EmuGpu::hardware_kms("emu-gpu-0").with_ids(60, 61, 62));
+        let _second = screen.attach_gpu(EmuGpu::hardware_kms("emu-gpu-1").with_ids(70, 71, 72));
+        let c = Client::open(0);
+
+        assert_eq!(
+            planes(&c),
+            Vec::<u32>::new(),
+            "a legacy client was handed a primary plane"
+        );
+        universal_planes(&c, true);
+        let mut all = planes(&c);
+        all.sort_unstable();
+        assert_eq!(all, alloc::vec![62, 72]);
+        universal_planes(&c, false);
+        assert_eq!(planes(&c), Vec::<u32>::new(), "the cap can be taken back");
+
+        // Per file: what one client asked for does not change another's list.
+        universal_planes(&c, true);
+        let legacy = Client::open(0);
+        assert_eq!(planes(&legacy), Vec::<u32>::new());
+
+        // Room for one of the two: that one is filled, and the count says two.
+        let mut one = [0u32; 1];
+        let mut fill = DrmModeGetPlaneRes {
+            plane_id_ptr: one.as_mut_ptr() as u64,
+            count_planes: 1,
+        };
+        c.ioctl(DRM_IOCTL_MODE_GETPLANERESOURCES, &mut fill)
+            .expect("GETPLANERESOURCES with room for one");
+        assert_eq!(fill.count_planes, 2);
+        assert!(
+            all.contains(&one[0]),
+            "the slot the caller had was left empty"
+        );
+    }
+
+    /// `drm_setclientcap` stores the ATOMIC value in `universal_planes` too:
+    /// an atomic client sees the primary plane without asking for universal
+    /// planes by name, and giving atomic back takes the planes with it.
+    #[test]
+    fn atomic_carries_universal_planes_with_it() {
+        let (_screen, c) = super::out_fence_tests::atomic_client(64, 16);
+        assert_eq!(planes(&c), alloc::vec![drm::SYNTH_PLANE_ID]);
+        let mut cap: [u64; 2] = [DRM_CLIENT_CAP_ATOMIC, 0];
+        c.ioctl(DRM_IOCTL_SET_CLIENT_CAP, &mut cap)
+            .expect("SET_CLIENT_CAP ATOMIC off");
+        assert_eq!(
+            planes(&c),
+            Vec::<u32>::new(),
+            "atomic off, planes still listed"
+        );
     }
 
     /// Two GPUs of the same model return the SAME synthetic ids, and a topology
@@ -12010,8 +12417,8 @@ mod hw_kms_tests {
         );
         assert_eq!(
             setcrtc(60, &[61], 1, 0),
-            Err(FsError::InvalidParam),
-            "connectors but no fb"
+            enoent,
+            "a mode with fb 0: the fb lookup comes before the connector rules"
         );
         assert_eq!(
             get_crtc_fb(&c, 60),
@@ -12049,6 +12456,370 @@ mod hw_kms_tests {
 
         c.rmfb(fb).expect("RMFB");
         c.destroy_dumb(buf.handle).expect("DESTROY_DUMB");
+    }
+
+    /// `__setplane_check`: the plane has to be usable on the CRTC named
+    /// (`possible_crtcs`, EINVAL) and the source rectangle, in 16.16, has to
+    /// lie inside the fb (ENOSPC). Neither was read: a plane went onto a CRTC
+    /// it does not reach, and a crop past the fb's edge was accepted, so a
+    /// client believed it was showing a crop the scanout never made.
+    #[test]
+    fn setplane_wants_a_crtc_the_plane_reaches_and_a_source_inside_the_fb() {
+        let screen = kms_emu::attach(32, 8);
+        let _first = screen.attach_gpu(EmuGpu::hardware_kms("emu-gpu-0").with_ids(60, 61, 62));
+        let _second = screen.attach_gpu(EmuGpu::hardware_kms("emu-gpu-1").with_ids(70, 71, 72));
+        let c = Client::open(0);
+        let buf = c.create_dumb(32, 8);
+        paint(&buf, 0x0000_7777);
+        let fb = c.addfb2(&buf);
+        // The resource list decides the CRTC indices; the plane of each
+        // card is its CRTC id plus two.
+        let (crtcs, _) = topology(&c);
+        assert_eq!(crtcs.len(), 2);
+        let (front, back) = (crtcs[0], crtcs[1]);
+        let plane_of = |crtc: u32| crtc + 2;
+
+        let set_plane = |plane_id: u32, crtc_id: u32, src: [u32; 4]| {
+            let mut req: DrmModeSetPlane = zeroed();
+            req.plane_id = plane_id;
+            req.crtc_id = crtc_id;
+            req.fb_id = fb;
+            req.crtc_w = 32;
+            req.crtc_h = 8;
+            req.src_x = src[0] << 16;
+            req.src_y = src[1] << 16;
+            req.src_w = src[2] << 16;
+            req.src_h = src[3] << 16;
+            c.ioctl(DRM_IOCTL_MODE_SETPLANE, &mut req)
+        };
+        let enospc = Err(FsError::NoDeviceSpace);
+
+        // Every plane advertises `possible_crtcs = 1`, CRTC index 0: the
+        // plane of the card listed second is not usable on its own CRTC, by
+        // what the client was told, and the first's is.
+        assert_eq!(
+            set_plane(plane_of(back), back, [0, 0, 32, 8]),
+            Err(FsError::InvalidParam),
+            "a CRTC the plane's mask does not reach"
+        );
+        assert_eq!(set_plane(plane_of(front), front, [0, 0, 32, 8]), Ok(0));
+
+        assert_eq!(
+            set_plane(plane_of(front), front, [0, 0, 33, 8]),
+            enospc,
+            "wider than the fb"
+        );
+        assert_eq!(
+            set_plane(plane_of(front), front, [0, 0, 32, 9]),
+            enospc,
+            "taller than the fb"
+        );
+        assert_eq!(
+            set_plane(plane_of(front), front, [1, 0, 32, 8]),
+            enospc,
+            "x pushes it past the edge"
+        );
+        assert_eq!(
+            set_plane(plane_of(front), front, [0, 1, 32, 8]),
+            enospc,
+            "y pushes it past the bottom"
+        );
+        assert_eq!(
+            set_plane(plane_of(front), front, [16, 4, 16, 4]),
+            Ok(0),
+            "a crop that fits"
+        );
+        assert_eq!(
+            set_plane(plane_of(front), front, [0, 0, 0, 0]),
+            Ok(0),
+            "no source rectangle at all"
+        );
+
+        // A fractional source edge counts: 31.5 wide from x = 0.75 is past 32.
+        let mut req: DrmModeSetPlane = zeroed();
+        req.plane_id = plane_of(front);
+        req.crtc_id = front;
+        req.fb_id = fb;
+        req.src_x = 3 << 14;
+        req.src_w = (31 << 16) | (1 << 15);
+        req.src_h = 8 << 16;
+        assert_eq!(c.ioctl(DRM_IOCTL_MODE_SETPLANE, &mut req), enospc);
+
+        c.rmfb(fb).expect("RMFB");
+        c.destroy_dumb(buf.handle).expect("DESTROY_DUMB");
+    }
+
+    /// `drm_mode_page_flip_ioctl`, once the CRTC and the fb are found: the
+    /// CRTC's mode has to fit in the new fb (`drm_crtc_check_viewport`,
+    /// ENOSPC), and "page flip is not allowed to change frame buffer format"
+    /// (EINVAL). Neither was read: a flip onto an fb narrower than the mode,
+    /// or of another format, was scanned out as the frame the CRTC was set
+    /// up with, and the client was told it had flipped.
+    #[test]
+    fn page_flip_wants_an_fb_that_holds_the_mode_and_keeps_the_format() {
+        let _screen = kms_emu::attach(32, 8);
+        let c = Client::open(0);
+        let (crtcs, _) = topology(&c);
+        let crtc = crtcs[0];
+        let xr24 = c.create_dumb(32, 8);
+        paint(&xr24, 0x0000_5555);
+        let fb_xr24 = c.addfb2(&xr24);
+        set_crtc(&c, crtc, fb_xr24, 32, 8);
+        assert_eq!(get_crtc_fb(&c, crtc), fb_xr24);
+
+        let addfb2 = |buf: &DrmModeCreateDumb, pixel_format: u32| {
+            let mut cmd = DrmModeFbCmd2 {
+                fb_id: 0,
+                width: buf.width,
+                height: buf.height,
+                pixel_format,
+                flags: 0,
+                handles: [buf.handle, 0, 0, 0],
+                pitches: [buf.pitch, 0, 0, 0],
+                offsets: [0; 4],
+                modifier: [0; 4],
+            };
+            c.ioctl(DRM_IOCTL_MODE_ADDFB2, &mut cmd).expect("ADDFB2");
+            cmd.fb_id
+        };
+        let narrow = c.create_dumb(16, 8);
+        let fb_narrow = addfb2(&narrow, drm::DRM_FORMAT_XRGB8888);
+        let short = c.create_dumb(32, 4);
+        let fb_short = addfb2(&short, drm::DRM_FORMAT_XRGB8888);
+        let ar24 = c.create_dumb(32, 8);
+        paint(&ar24, 0xff00_6666);
+        let fb_ar24 = addfb2(&ar24, drm::DRM_FORMAT_ARGB8888);
+        let ar24_too = c.create_dumb(32, 8);
+        let fb_ar24_too = addfb2(&ar24_too, drm::DRM_FORMAT_ARGB8888);
+
+        assert_eq!(
+            c.page_flip(crtc, fb_narrow, 1),
+            Err(FsError::NoDeviceSpace),
+            "narrower than the mode"
+        );
+        assert_eq!(
+            c.page_flip(crtc, fb_short, 2),
+            Err(FsError::NoDeviceSpace),
+            "shorter than the mode"
+        );
+        assert_eq!(
+            c.page_flip(crtc, fb_ar24, 3),
+            Err(FsError::InvalidParam),
+            "XRGB8888 on the CRTC, ARGB8888 flipped"
+        );
+        assert_eq!(
+            get_crtc_fb(&c, crtc),
+            fb_xr24,
+            "a refused flip presented anyway"
+        );
+        let mut events = [0u8; 256];
+        assert!(
+            matches!(c.read_events(&mut events), Err(_) | Ok(0)),
+            "a refused flip queued a completion"
+        );
+
+        // A modeset may change the format; a flip may then keep the new one.
+        set_crtc(&c, crtc, fb_ar24, 32, 8);
+        assert_eq!(
+            c.page_flip(crtc, fb_xr24, 4),
+            Err(FsError::InvalidParam),
+            "ARGB8888 on the CRTC, XRGB8888 flipped"
+        );
+        assert_eq!(c.page_flip(crtc, fb_ar24_too, 5), Ok(0));
+        drm::flush_pending_flip_completions();
+        assert_eq!(get_crtc_fb(&c, crtc), fb_ar24_too);
+        let _ = c.read_events(&mut events);
+
+        for fb in [fb_xr24, fb_narrow, fb_short, fb_ar24, fb_ar24_too] {
+            c.rmfb(fb).expect("RMFB");
+        }
+        for buf in [&xr24, &narrow, &short, &ar24, &ar24_too] {
+            c.destroy_dumb(buf.handle).expect("DESTROY_DUMB");
+        }
+    }
+
+    /// With a mode, `drm_mode_setcrtc` looks the fb up (ENOENT; -1 is the
+    /// fb already on the CRTC, EINVAL when there is none), refuses a mode
+    /// `drm_mode_validate_basic` would not have (a zero clock, a zero active
+    /// area, sync timings out of order) or an aspect-ratio code it does not
+    /// define (EINVAL), and wants the active area at (x, y) inside the fb
+    /// (ENOSPC). None of it was read: a 64-wide mode on a 32-wide fb was
+    /// scanned out, and a clockless mode was paced from a fallback.
+    #[test]
+    fn setcrtc_wants_a_mode_that_is_one_and_an_fb_that_holds_it() {
+        // The synthetic pipe: its CRTC reports exactly the fb the core has on
+        // it, so "nothing on the CRTC" is a state this test can reach.
+        let _screen = kms_emu::attach(32, 8);
+        let c = Client::open(0);
+        let (crtcs, conns) = topology(&c);
+        let (crtc, conn) = (crtcs[0], conns[0]);
+        let buf = c.create_dumb(32, 8);
+        paint(&buf, 0x0000_4444);
+        let fb = c.addfb2(&buf);
+        let einval = Err(FsError::InvalidParam);
+        let enospc = Err(FsError::NoDeviceSpace);
+
+        let setcrtc = |fb_id: u32, x: u32, y: u32, mode: [u8; 68]| {
+            let connectors = [conn];
+            let mut req = DrmModeGetCrtc {
+                set_connectors_ptr: connectors.as_ptr() as u64,
+                count_connectors: 1,
+                crtc_id: crtc,
+                fb_id,
+                x,
+                y,
+                gamma_size: 0,
+                mode_valid: 1,
+                mode,
+            };
+            c.ioctl(DRM_IOCTL_MODE_SETCRTC, &mut req)
+        };
+        let good = make_modeinfo(32, 8);
+        let put_u16 =
+            |m: &mut [u8; 68], at: usize, v: u16| m[at..at + 2].copy_from_slice(&v.to_ne_bytes());
+
+        // The fb: -1 with nothing on the CRTC, and an id that is not one.
+        let mut off = DrmModeGetCrtc {
+            set_connectors_ptr: 0,
+            count_connectors: 0,
+            crtc_id: crtc,
+            fb_id: 0,
+            x: 0,
+            y: 0,
+            gamma_size: 0,
+            mode_valid: 0,
+            mode: [0; 68],
+        };
+        c.ioctl(DRM_IOCTL_MODE_SETCRTC, &mut off)
+            .expect("SETCRTC off");
+        assert_eq!(get_crtc_fb(&c, crtc), 0);
+        assert_eq!(
+            setcrtc(u32::MAX, 0, 0, good),
+            einval,
+            "-1 with no fb on the CRTC"
+        );
+        assert_eq!(
+            setcrtc(4242, 0, 0, good),
+            Err(FsError::EntryNotFound),
+            "an fb that does not exist"
+        );
+
+        // The viewport: the active area at (x, y) has to lie inside the fb.
+        assert_eq!(
+            setcrtc(fb, 0, 0, make_modeinfo(64, 8)),
+            enospc,
+            "wider than the fb"
+        );
+        assert_eq!(
+            setcrtc(fb, 0, 0, make_modeinfo(32, 16)),
+            enospc,
+            "taller than the fb"
+        );
+        assert_eq!(
+            setcrtc(fb, 1, 0, good),
+            enospc,
+            "x pushes it past the right edge"
+        );
+        assert_eq!(
+            setcrtc(fb, 0, 1, good),
+            enospc,
+            "y pushes it past the bottom"
+        );
+        assert_eq!(
+            setcrtc(fb, 0x1_0000, 0, good),
+            enospc,
+            "an x with high bits set is outside any fb"
+        );
+
+        // The mode: what `drm_mode_validate_basic` refuses.
+        let mut m = good;
+        m[0..4].copy_from_slice(&0u32.to_ne_bytes());
+        assert_eq!(setcrtc(fb, 0, 0, m), einval, "clock 0");
+        let mut m = good;
+        put_u16(&mut m, 4, 0);
+        assert_eq!(setcrtc(fb, 0, 0, m), einval, "hdisplay 0");
+        let mut m = good;
+        put_u16(&mut m, 6, 31);
+        assert_eq!(setcrtc(fb, 0, 0, m), einval, "hsync_start before hdisplay");
+        let mut m = good;
+        put_u16(&mut m, 8, u16::from_ne_bytes([good[6], good[7]]) - 1);
+        assert_eq!(setcrtc(fb, 0, 0, m), einval, "hsync_end before hsync_start");
+        let mut m = good;
+        put_u16(&mut m, 10, u16::from_ne_bytes([good[8], good[9]]) - 1);
+        assert_eq!(setcrtc(fb, 0, 0, m), einval, "htotal before hsync_end");
+        let mut m = good;
+        put_u16(&mut m, 14, 0);
+        assert_eq!(setcrtc(fb, 0, 0, m), einval, "vdisplay 0");
+        let mut m = good;
+        put_u16(&mut m, 16, 7);
+        assert_eq!(setcrtc(fb, 0, 0, m), einval, "vsync_start before vdisplay");
+        let mut m = good;
+        put_u16(&mut m, 18, u16::from_ne_bytes([good[16], good[17]]) - 1);
+        assert_eq!(setcrtc(fb, 0, 0, m), einval, "vsync_end before vsync_start");
+        let mut m = good;
+        put_u16(&mut m, 20, u16::from_ne_bytes([good[18], good[19]]) - 1);
+        assert_eq!(setcrtc(fb, 0, 0, m), einval, "vtotal before vsync_end");
+        let mut m = good;
+        let flags = u32::from_ne_bytes([good[28], good[29], good[30], good[31]]);
+        m[28..32].copy_from_slice(&(flags | (5 << 19)).to_ne_bytes());
+        assert_eq!(setcrtc(fb, 0, 0, m), einval, "aspect-ratio code 5");
+        assert_eq!(
+            get_crtc_fb(&c, crtc),
+            0,
+            "a refused modeset presented anyway"
+        );
+
+        // What passes: the fb that fits, with the last aspect-ratio code the
+        // kernel defines, and then -1 for the same fb again.
+        let mut m = good;
+        m[28..32].copy_from_slice(&(flags | (4 << 19)).to_ne_bytes());
+        assert_eq!(setcrtc(fb, 0, 0, m), Ok(0));
+        assert_eq!(get_crtc_fb(&c, crtc), fb);
+        assert_eq!(
+            setcrtc(u32::MAX, 0, 0, good),
+            Ok(0),
+            "-1 is the fb on the CRTC"
+        );
+        assert_eq!(get_crtc_fb(&c, crtc), fb);
+
+        c.rmfb(fb).expect("RMFB");
+        c.destroy_dumb(buf.handle).expect("DESTROY_DUMB");
+    }
+
+    /// `CURSOR` with a buffer: Linux wraps the handle in a framebuffer, so a
+    /// handle the file does not hold is ENOENT and a buffer too small for
+    /// `width x height` pixels is EINVAL. Both came back as success with the
+    /// pointer quietly hidden, so a compositor whose cursor upload went
+    /// wrong was never told. A buffer that fits keeps working.
+    #[test]
+    fn a_cursor_needs_a_handle_of_its_own_that_fits_the_image() {
+        let screen = kms_emu::attach(32, 8);
+        let _gpu = screen.attach_gpu(EmuGpu::hardware_kms("emu-gpu").with_ids(60, 61, 62));
+        let c = Client::open(0);
+        const BOGUS: u32 = 4242;
+        let cursor = |handle: u32, w: u32, h: u32| {
+            let mut cur = ModeCursor {
+                flags: 0x01, // BO
+                crtc_id: 60,
+                x: 0,
+                y: 0,
+                width: w,
+                height: h,
+                handle,
+            };
+            c.ioctl(DRM_IOCTL_MODE_CURSOR, &mut cur)
+        };
+        assert_eq!(cursor(BOGUS, 16, 16), Err(FsError::EntryNotFound));
+
+        // 16 rows of a 64-byte pitch: 1 KiB, room for 16x16 and not 64x64.
+        let small = c.create_dumb(16, 16);
+        assert_eq!(cursor(small.handle, 64, 64), Err(FsError::InvalidParam));
+        assert_eq!(cursor(small.handle, 16, 17), Err(FsError::InvalidParam));
+        assert_eq!(cursor(small.handle, 16, 16), Ok(0));
+        // Hiding the cursor names no buffer and needs none.
+        assert_eq!(cursor(0, 0, 0), Ok(0));
+
+        c.destroy_dumb(small.handle).expect("DESTROY_DUMB");
     }
 }
 
@@ -13242,6 +14013,141 @@ mod blob_id_space_tests {
     }
 }
 
+/// CREATE_DUMB bpp, chardev write, ADDFB errno, and DESTROYPROPBLOB EPERM —
+/// small contracts that used to lie to clients.
+#[cfg(test)]
+mod dumb_write_and_addfb_errno_tests {
+    use super::gl_client_sequence_tests::Client;
+    use super::*;
+    use crate::error::LxError;
+
+    #[test]
+    fn destroypropblob_of_a_kernel_blob_is_eperm_to_userspace() {
+        let _serialised = drm::test_globals::lock();
+        let client = Client::open(0);
+        let kernel = drm::create_blob(alloc::vec![0u8; 68], false);
+        let mut id = kernel;
+        assert_eq!(
+            client.ioctl(DRM_IOCTL_MODE_DESTROYPROPBLOB, &mut id),
+            Err(FsError::NotPermitted)
+        );
+        assert_eq!(LxError::from(FsError::NotPermitted), LxError::EPERM);
+        assert!(drm::get_blob(kernel).is_some());
+    }
+
+    #[test]
+    fn get_client_zero_is_self_and_one_is_enoent() {
+        let c = Client::open(0);
+        let mut client = DrmClient {
+            idx: 0,
+            auth: 0,
+            pid: 0,
+            uid: 0,
+            magic: 0,
+            iocs: 0,
+        };
+        assert_eq!(c.ioctl(DRM_IOCTL_GET_CLIENT, &mut client), Ok(0));
+        assert_eq!(client.auth, 1);
+        assert_eq!(client.magic, 1);
+        client.idx = 1;
+        assert_eq!(
+            c.ioctl(DRM_IOCTL_GET_CLIENT, &mut client),
+            Err(FsError::EntryNotFound)
+        );
+    }
+
+    #[test]
+    fn dirtyfb_rejects_unknown_flags() {
+        let _serialised = drm::test_globals::lock();
+        let c = Client::open(0);
+        let buf = c.create_dumb(16, 16);
+        let fb = c.addfb2(&buf);
+        let mut cmd = DrmModeFbDirtyCmd {
+            fb_id: fb,
+            flags: 1 << 3,
+            color: 0,
+            num_clips: 0,
+            clips_ptr: 0,
+        };
+        assert_eq!(
+            c.ioctl(DRM_IOCTL_MODE_DIRTYFB, &mut cmd),
+            Err(FsError::InvalidParam)
+        );
+        assert_eq!(c.rmfb(fb), Ok(0));
+        assert_eq!(c.destroy_dumb(buf.handle), Ok(0));
+    }
+
+    #[test]
+    fn create_dumb_oom_is_enomem_not_enospc() {
+        assert_eq!(LxError::from(FsError::NoMemory), LxError::ENOMEM);
+        assert_ne!(LxError::from(FsError::NoMemory), LxError::ENOSPC);
+    }
+
+    #[test]
+    fn create_dumb_refuses_bpp_zero_and_honours_bpp_sixteen() {
+        let _serialised = drm::test_globals::lock();
+        let c = Client::open(0);
+        let mut zero = DrmModeCreateDumb {
+            height: 16,
+            width: 16,
+            bpp: 0,
+            flags: 0,
+            handle: 0,
+            pitch: 0,
+            size: 0,
+        };
+        assert_eq!(
+            c.ioctl(DRM_IOCTL_MODE_CREATE_DUMB, &mut zero),
+            Err(FsError::InvalidParam)
+        );
+        let mut bpp16 = DrmModeCreateDumb {
+            height: 16,
+            width: 16,
+            bpp: 16,
+            flags: 0,
+            handle: 0,
+            pitch: 0,
+            size: 0,
+        };
+        c.ioctl(DRM_IOCTL_MODE_CREATE_DUMB, &mut bpp16)
+            .expect("CREATE_DUMB bpp=16");
+        // pitch = round_up(width * bpp/8, 64) = round_up(32, 64) = 64
+        assert_eq!(bpp16.pitch, 64, "bpp=16 must not be inflated to 32");
+        assert_eq!(bpp16.size, 64 * 16);
+        assert_eq!(c.destroy_dumb(bpp16.handle), Ok(0));
+    }
+
+    #[test]
+    fn a_drm_chardev_write_is_einval() {
+        let dev = DrmDev::new(0);
+        assert_eq!(dev.write_at(0, b"x"), Err(FsError::InvalidParam));
+        assert_eq!(LxError::from(FsError::InvalidParam), LxError::EINVAL);
+    }
+
+    #[test]
+    fn addfb2_of_an_unknown_handle_is_enoent() {
+        let _serialised = drm::test_globals::lock();
+        let c = Client::open(0);
+        let mut cmd = DrmModeFbCmd2 {
+            fb_id: 0,
+            width: 16,
+            height: 16,
+            pixel_format: drm::DRM_FORMAT_XRGB8888,
+            flags: 0,
+            handles: [0xDEAD_u32, 0, 0, 0],
+            pitches: [64, 0, 0, 0],
+            offsets: [0; 4],
+            modifier: [0; 4],
+        };
+        assert_eq!(
+            c.ioctl(DRM_IOCTL_MODE_ADDFB2, &mut cmd),
+            Err(FsError::EntryNotFound)
+        );
+        assert_eq!(LxError::from(FsError::EntryNotFound), LxError::ENOENT);
+        assert_eq!(cmd.fb_id, 0);
+    }
+}
+
 /// The compute node's own ioctl (`DRM_ECLIPSE_COMPUTE_NR`), which has no tests
 /// at all and is the one place in this file where a client's own size encoding
 /// decides how much memory the kernel writes.
@@ -13533,9 +14439,8 @@ mod event_queue_tests {
         let mut full = [0u8; 32];
         assert_eq!(c.read_events(&mut full).expect("drain"), 32);
         assert!(!c.poll().expect("poll").read, "readable after the drain");
-        // Writable throughout, on purpose: reporting write=false made labwc's
-        // DRM epoll park and exposed a #DF at session start.
-        assert!(c.poll().expect("poll").write);
+        // Linux drm_poll never reports POLLOUT on the chardev.
+        assert!(!c.poll().expect("poll").write);
 
         c.rmfb(fb).expect("RMFB");
         c.destroy_dumb(handle).expect("DESTROY_DUMB");
@@ -15163,7 +16068,7 @@ mod syncobj_array_tests {
         };
         assert_eq!(
             c.ioctl(DRM_IOCTL_SYNCOBJ_WAIT, &mut req),
-            Err(FsError::NoDeviceSpace)
+            Err(FsError::NoMemory)
         );
         let mut req = DrmSyncobjTimelineWait {
             handles: 0,
@@ -15176,7 +16081,7 @@ mod syncobj_array_tests {
         };
         assert_eq!(
             c.ioctl(DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT, &mut req),
-            Err(FsError::NoDeviceSpace)
+            Err(FsError::NoMemory)
         );
         for cmd in [DRM_IOCTL_SYNCOBJ_RESET, DRM_IOCTL_SYNCOBJ_SIGNAL] {
             let mut req = DrmSyncobjArray {
@@ -15184,12 +16089,7 @@ mod syncobj_array_tests {
                 count_handles: too_many,
                 pad: 0,
             };
-            assert_eq!(
-                c.ioctl(cmd, &mut req),
-                Err(FsError::NoDeviceSpace),
-                "{:#x}",
-                cmd
-            );
+            assert_eq!(c.ioctl(cmd, &mut req), Err(FsError::NoMemory), "{:#x}", cmd);
         }
         for cmd in [DRM_IOCTL_SYNCOBJ_TIMELINE_SIGNAL, DRM_IOCTL_SYNCOBJ_QUERY] {
             let mut req = DrmSyncobjTimelineArray {
@@ -15198,12 +16098,7 @@ mod syncobj_array_tests {
                 count_handles: too_many,
                 flags: 0,
             };
-            assert_eq!(
-                c.ioctl(cmd, &mut req),
-                Err(FsError::NoDeviceSpace),
-                "{:#x}",
-                cmd
-            );
+            assert_eq!(c.ioctl(cmd, &mut req), Err(FsError::NoMemory), "{:#x}", cmd);
         }
         // The bound itself is fine, and a null array under it is EINVAL as
         // before (Linux: EFAULT from the copy).
@@ -16194,8 +17089,15 @@ mod wsi_display_probe_tests {
         }
     }
 
-    /// `drmModeGetPlaneResources`, both passes.
+    /// `drmModeGetPlaneResources`, both passes, after the one call every
+    /// plane-aware client makes first: `drm_mode_getplane_res` lists only
+    /// overlays to a file without `DRM_CLIENT_CAP_UNIVERSAL_PLANES`, and every
+    /// plane here is a primary, so without the cap the list is empty for
+    /// everyone, as on Linux.
     fn drm_mode_get_plane_resources(c: &Client) -> Vec<u32> {
+        let mut cap: [u64; 2] = [DRM_CLIENT_CAP_UNIVERSAL_PLANES, 1];
+        c.ioctl(DRM_IOCTL_SET_CLIENT_CAP, &mut cap)
+            .expect("SET_CLIENT_CAP UNIVERSAL_PLANES");
         let mut probe = DrmModeGetPlaneRes {
             plane_id_ptr: 0,
             count_planes: 0,

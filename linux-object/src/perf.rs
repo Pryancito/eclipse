@@ -711,6 +711,31 @@ pub fn kernel_report() -> String {
         "sched: {} task polls ({:.0}/s), {} weak-exec yields ({:.0}/s)",
         sched_polled, polls_per_s, sched_weak, weak_per_s
     );
+    {
+        let (scans, probed, ok, aff_empty, rebalance) = kernel_hal::kstats::sched_steal_stats();
+        let _ = writeln!(
+            out,
+            "sched steal:  {} scans, {} probed, {} ok, {} affinity-empty, {} rebalance",
+            scans, probed, ok, aff_empty, rebalance
+        );
+        let (created, peak, cap_hits) = kernel_hal::kstats::sched_weak_stats();
+        let (pool, overflow) = kernel_hal::kstats::stack_pool_stats();
+        let _ = writeln!(
+            out,
+            "sched weak:   {} created, peak live {}, soft-cap hits {}; stack-pool {}/overflow {}",
+            created, peak, cap_hits, pool, overflow
+        );
+        let (hw, size) = kernel_hal::kstats::stack_high_water();
+        if size > 0 {
+            let _ = writeln!(
+                out,
+                "sched stack:  high-water {} KiB of {} KiB ({:.0}%)",
+                hw / 1024,
+                size / 1024,
+                hw as f64 * 100.0 / size as f64
+            );
+        }
+    }
     // Which scheduler/timer mode this boot is running in, so a captured report
     // is self-describing when compared against another.
     {
@@ -816,6 +841,18 @@ pub fn kernel_report() -> String {
             ks.timer_rearms,
             rate(ks.timer_rearms),
             per_tick
+        );
+    }
+    // Timer heaps are per-CPU, so a core's interrupt rate follows its own
+    // timers instead of the whole machine's -- which is what the `per tick`
+    // figure above says. `adopted` is the safety net for that split and stays
+    // 0 on a healthy machine; anything else names a CPU that stopped ticking.
+    {
+        let (pending, strays) = kernel_hal::kstats::timer_heap_stats();
+        let _ = writeln!(
+            out,
+            "timer heaps:  {} pending across all CPUs, {} adopted",
+            pending, strays
         );
     }
     // Tick gaps: the time between consecutive ticks on one busy CPU, which

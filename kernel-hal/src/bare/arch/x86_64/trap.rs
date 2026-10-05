@@ -1061,6 +1061,59 @@ pub extern "C" fn trap_handler(tf: &mut TrapFrame) {
             // with it. This arms the same summary for the handler to print
             // once more *after* the backtrace, where nothing follows it.
             crate::kstats::note_exception(vec, tf.error_code, tf.rip as u64);
+            // Only for a #GP whose error code is zero: a non-zero one names the
+            // descriptor the CPU refused, which `X86TrapErrorCode` reads out
+            // below, and such a fault need not involve a memory address at all.
+            // Running a pointer verdict over it would print a confident reading
+            // of registers the fault never touched.
+            //
+            // A #GP(0) names no descriptor, so the trap frame above is the only
+            // evidence there is -- and the register that may have stopped being
+            // an address is the one thing in it worth a sentence. Reading
+            // sixteen hex columns off a photograph is what this cost last time.
+            // Candidates, not a verdict: see `X86NonCanonical`. Also names the
+            // argument registers when the faulting RIP is inside a byte-moving
+            // routine, so the next reader does not go looking for a bug in
+            // compiler-builtins.
+            //
+            // Built before the `panic!` rather than inside it so it is on the
+            // serial log even if formatting the (much longer) panic message is
+            // what faults next.
+            if vec == 13 && tf.error_code == 0 {
+                let regs = [
+                    ("rdi", tf.rdi as u64),
+                    ("rsi", tf.rsi as u64),
+                    ("rdx", tf.rdx as u64),
+                    ("rax", tf.rax as u64),
+                    ("rbx", tf.rbx as u64),
+                    ("rcx", tf.rcx as u64),
+                    ("r8", tf.r8 as u64),
+                    ("r9", tf.r9 as u64),
+                    ("r10", tf.r10 as u64),
+                    ("r11", tf.r11 as u64),
+                    ("r12", tf.r12 as u64),
+                    ("r13", tf.r13 as u64),
+                    ("r14", tf.r14 as u64),
+                    ("r15", tf.r15 as u64),
+                    ("rbp", tf.rbp as u64),
+                    ("rsp", tf.rsp as u64),
+                ];
+                let diag = crate::context::X86NonCanonical { regs: &regs };
+                crate::console::serial_write_fmt_spin(format_args!("\n{}", diag));
+                crate::console::graphic_console_write_fmt_spin(format_args!("\n{}", diag));
+                if let Some((sym, _)) = crate::ksyms::lookup(tf.rip as u64) {
+                    if let Some(operands) = crate::context::mem_routine_operands(sym) {
+                        let line = format_args!(
+                            "[#GP] hint: rip is inside {}, where the pointers are \
+                             usually the caller's rather than the routine's own \
+                             ({}) -- look there before compiler-builtins\n",
+                            sym, operands,
+                        );
+                        crate::console::serial_write_fmt_spin(line);
+                        crate::console::graphic_console_write_fmt_spin(line);
+                    }
+                }
+            }
             panic!(
                 "\nCPU EXCEPTION on CPU{}: {} (vec={:#x})\n\
                  error_code={:#x}\n{:#x?}\n\

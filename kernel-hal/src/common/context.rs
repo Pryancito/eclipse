@@ -120,7 +120,7 @@ impl fmt::Display for X86TrapErrorCode {
             } else {
                 "GDT"
             };
-            return write!(
+            write!(
                 f,
                 "error_code {:#x} names a descriptor: {} index {}{}",
                 ec,
@@ -131,7 +131,25 @@ impl fmt::Display for X86TrapErrorCode {
                 } else {
                     ""
                 },
-            );
+            )?;
+            // An LDT selector is not a thing this kernel can produce. Nothing
+            // in the tree executes `lldt` and there is no `modify_ldt(2)`, so
+            // LDTR is null on every CPU from boot: every selector this kernel
+            // or its userspace ABI ever loads has TI clear and comes out of
+            // the GDT, which `init_ap` extends per CPU for exactly that
+            // reason. So TI set does not mean "a bad LDT entry" -- it means
+            // the sixteen bits the CPU took as a selector were not a selector,
+            // and the verdict belongs next to the decode rather than in
+            // whoever reads it later. Seen on hardware as `error_code 0x4c`
+            // (LDT index 9) on a #GP in kernel code, alongside heap deadlock
+            // reports -- i.e. the same wild writes, reaching a segment
+            // register this time.
+            if ec & 0b110 == 0b100 {
+                return f.write_str(
+                    " -- but this kernel never loads an LDT (no `lldt`, no                      `modify_ldt(2)`, so LDTR is null on every CPU and every                      selector it uses is a GDT one), so the error code itself                      is the evidence: the value the faulting instruction took                      as a segment selector was not one. Look for what wrote a                      segment register, or the stack slot a return reloads it                      from, rather than for a descriptor table entry",
+                );
+            }
+            return Ok(());
         }
         match self.vec {
             13 => f.write_str(
@@ -155,6 +173,129 @@ impl fmt::Display for X86TrapErrorCode {
                  the entry stub pushed in its place",
             ),
         }
+    }
+}
+
+/// Is `a` a canonical 64-bit virtual address on x86-64 (48-bit, sign-extended)?
+///
+/// A load or store through a register that is not canonical raises `#GP(0)`,
+/// which is the one #GP cause that names nothing at all: no descriptor, no
+/// selector, just a register that stopped being an address. Five-level paging
+/// would widen this to 57 bits; this kernel does not enable it, and a 57-bit
+/// address would be rejected here as the corruption it would be on a 4-level
+/// machine.
+pub fn is_canonical(a: u64) -> bool {
+    let top = a >> 47;
+    top == 0 || top == 0x1_ffff
+}
+
+/// The eight bytes of `a`, in memory order, when every one of them is printable
+/// ASCII.
+///
+/// A pointer-sized field that holds *text* did not drift: it was overwritten by
+/// a string copy that ran past its buffer, or it was read from the wrong offset
+/// inside a struct whose neighbour is a string. That is a completely different
+/// bug from an arithmetic overflow, and the eight characters usually name the
+/// message -- and so the writer -- outright. `0x74646977202c7874` says nothing;
+/// `"tx, widt"` says a format string landed on a `&str`'s pointer.
+pub fn ascii_word(a: u64) -> Option<[u8; 8]> {
+    let b = a.to_le_bytes();
+    if b.iter().all(|c| (0x20..0x7f).contains(c)) {
+        Some(b)
+    } else {
+        None
+    }
+}
+
+/// Every general-purpose register of a faulting frame, read as "which of these
+/// could no longer be an address".
+///
+/// Printed under a `#GP(0)`, whose error code names no descriptor at all. The
+/// trap frame is already dumped above it, and that dump is exactly where this
+/// reading gets lost: sixteen hex numbers in a column, one of which may be the
+/// whole diagnosis.
+///
+/// What this can and cannot establish is worth being exact about, because a
+/// confident wrong verdict on a crash photograph is worse than none. A register
+/// is untyped: non-canonical bits make it a **candidate** for the faulting
+/// operand, not the proof of one -- a packed counter, a mask or eight bytes of
+/// text match the same test and may never have been dereferenced. The converse
+/// fails too: `base + index*scale + disp` can leave the canonical half from
+/// parts that are each canonical, so an all-canonical frame does not rule a bad
+/// address out. Naming the effective address would mean decoding the faulting
+/// instruction; until something does, these are candidates and are worded as
+/// such. Decoding the bytes when they are text is the part that does carry
+/// weight: a pointer-sized field holding *text* was written over, whether or
+/// not it is the one the CPU rejected.
+pub struct X86NonCanonical<'a> {
+    /// `(name, value)` for each register, in the order they should be read.
+    pub regs: &'a [(&'static str, u64)],
+}
+
+impl fmt::Display for X86NonCanonical<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut found = false;
+        for (name, v) in self.regs {
+            if is_canonical(*v) {
+                continue;
+            }
+            found = true;
+            write!(
+                f,
+                "[#GP] candidate: {name} = {v:#x} is not a canonical address, so \
+                 a memory operand through it would raise #GP(0) on its own",
+            )?;
+            match ascii_word(*v) {
+                Some(bytes) => writeln!(
+                    f,
+                    ", and its bytes are the text {:?} -- that one is not \
+                     arithmetic gone wrong: a pointer-sized field was written \
+                     over by a string copy, or read from the wrong offset next \
+                     to one",
+                    core::str::from_utf8(&bytes).unwrap_or(""),
+                )?,
+                None => f.write_str("\n")?,
+            }
+        }
+        if !found {
+            f.write_str(
+                "[#GP] no general-purpose register is non-canonical on its own. \
+                 That does not rule out a bad address -- base + index*scale + \
+                 disp can leave the canonical half from canonical parts -- but \
+                 it does put the other #GP(0) causes in front: an unaligned SSE \
+                 access (movaps/movdqa), RDMSR/WRMSR of a reserved MSR, or the \
+                 selectors a return reloads\n",
+            )?;
+        }
+        Ok(())
+    }
+}
+
+/// The System V argument registers of the byte-moving routines, as a hint for
+/// reading the frame above.
+///
+/// A `#GP` at a RIP inside `memcpy` is usually the caller's source or
+/// destination rather than anything `memcpy` decides, so the useful thing to
+/// print is which register carried which argument -- otherwise the reader goes
+/// looking for a bug in compiler-builtins, where there is not one.
+///
+/// A hint, and worded as one. The symbol alone proves nothing: `#GP(0)` inside
+/// such a routine can also come from an alignment-sensitive instruction of its
+/// own (`movaps` on a 16-byte path), and by the faulting instruction the
+/// argument registers may long since have been reused for something else. It
+/// says where to look first, not what happened.
+pub fn mem_routine_operands(name: &str) -> Option<&'static str> {
+    // `compiler_builtins` names them plainly, and the kernel's own copies are
+    // `__memcpy`/`copy_user` and friends; match on the stem so a prefix or a
+    // suffix does not lose the reading.
+    if name.contains("memcpy") || name.contains("memmove") || name.contains("copy_user") {
+        Some("rdi = destination, rsi = source, rdx = length at entry")
+    } else if name.contains("memset") || name.contains("set_bytes") {
+        Some("rdi = destination, rsi = byte, rdx = length at entry")
+    } else if name.contains("memcmp") || name.contains("bcmp") {
+        Some("rdi and rsi = the two buffers, rdx = length at entry")
+    } else {
+        None
     }
 }
 
@@ -891,6 +1032,90 @@ mod tests {
         assert!(s.contains("not ruled out"), "{}", s);
     }
 
+    // ---- which register stopped being an address ---------------------------
+
+    fn verdict(regs: &[(&'static str, u64)]) -> alloc::string::String {
+        alloc::format!("{}", X86NonCanonical { regs })
+    }
+
+    /// The 48-bit boundary, from both sides. Anything with bits 63:48 that are
+    /// not a copy of bit 47 raises #GP(0) the moment it is dereferenced.
+    #[test]
+    fn canonical_is_the_sign_extension_of_bit_47() {
+        assert!(is_canonical(0));
+        assert!(is_canonical(0x0000_7fff_ffff_ffff));
+        assert!(!is_canonical(0x0000_8000_0000_0000));
+        assert!(!is_canonical(0xffff_7fff_ffff_ffff));
+        assert!(is_canonical(0xffff_8000_0000_0000));
+        assert!(is_canonical(u64::MAX));
+        // A kernel pointer out of this tree, and the same pointer with its top
+        // byte scribbled -- the mangling `unmangle_kernel_text` repairs.
+        assert!(is_canonical(0xffff_ff00_0007_024a));
+        assert!(!is_canonical(0x0aff_ff00_0007_024a));
+    }
+
+    /// The #GP photographed on 2026-10-04: `rsi` held `0x74646977202c7874`,
+    /// which is not an address at all -- it is the eight characters
+    /// `"tx, widt"`. A register that holds *text* was overwritten by a string
+    /// copy or read from the wrong offset beside one, and that reading is the
+    /// entire lead. The trap frame printed the number and nothing else, and it
+    /// cost a round trip to a machine that is not here.
+    #[test]
+    fn a_register_holding_text_is_reported_as_text() {
+        assert_eq!(&ascii_word(0x7464_6977_202c_7874).unwrap(), b"tx, widt");
+        let s = verdict(&[
+            ("rdi", 0xffff_ff00_09e7_d76b),
+            ("rsi", 0x7464_6977_202c_7874),
+        ]);
+        assert!(s.contains("rsi"), "{}", s);
+        assert!(s.contains("candidate"), "{}", s);
+        assert!(s.contains("not a canonical address"), "{}", s);
+        assert!(s.contains("tx, widt"), "{}", s);
+        // The destination was a perfectly good stack address: naming it too
+        // would point the reader at the wrong operand.
+        assert!(!s.contains("rdi"), "{}", s);
+    }
+
+    /// Not every non-canonical value is text, and claiming one is would be
+    /// worse than saying nothing.
+    #[test]
+    fn a_register_that_is_merely_garbage_is_not_decoded_as_text() {
+        assert!(ascii_word(0x7464_6977_202c_7800).is_none());
+        assert!(ascii_word(0).is_none());
+        let s = verdict(&[("r11", 0x4242_4242_4242_0001)]);
+        assert!(s.contains("r11"), "{}", s);
+        assert!(!s.contains("its bytes are the text"), "{}", s);
+    }
+
+    /// When every register is still an address the fault is one of the #GP
+    /// causes that are not pointers at all, and the report has to say so --
+    /// otherwise it reads as "no verdict" and the reader goes back to the hex.
+    #[test]
+    fn all_canonical_sends_the_reader_at_the_other_gp_causes() {
+        let s = verdict(&[("rdi", 0xffff_ff00_0000_0000), ("rsi", 0x1000)]);
+        assert!(s.contains("movaps"), "{}", s);
+        assert!(s.contains("MSR"), "{}", s);
+        assert!(!s.contains("candidate"), "{}", s);
+        // And it must not claim the fault was no bad address: a canonical base
+        // and index can still add up to one.
+        assert!(s.contains("does not rule out"), "{}", s);
+    }
+
+    /// A #GP inside `memcpy` is never `memcpy`'s bug. Naming the operands is
+    /// what turns "the crash is in compiler-builtins" into "the caller passed
+    /// this as the source".
+    #[test]
+    fn the_byte_movers_say_which_register_is_which_argument() {
+        let s = mem_routine_operands("memcpy").unwrap();
+        assert!(s.contains("rsi = source"), "{}", s);
+        assert!(mem_routine_operands("compiler_builtins::mem::memmove").is_some());
+        assert!(mem_routine_operands("__memset").unwrap().contains("byte"));
+        assert!(mem_routine_operands("set_bytes").is_some());
+        assert!(mem_routine_operands("copy_user_generic").is_some());
+        // An ordinary kernel function gets no operand legend invented for it.
+        assert!(mem_routine_operands("zcore::memory::init").is_none());
+    }
+
     /// The panic handler builds its post-backtrace line from the vector alone,
     /// so a vector that lost its name there would print "Unknown CPU
     /// exception" over a fault the trap frame named perfectly well.
@@ -917,6 +1142,29 @@ mod tests {
         let s = hint(12, 0b1101);
         assert!(s.contains("LDT index 1"), "{}", s);
         assert!(s.contains("external event"), "{}", s);
+    }
+
+    /// `error_code 0x4c` on a #GP, off a hardware stop screen: index 9, TI
+    /// set. The index is not the finding -- the table is. This kernel loads no
+    /// LDT at all, so a selector that names one cannot have come from any code
+    /// path in it, and the error code is itself evidence that the sixteen bits
+    /// the CPU read as a selector were something else.
+    #[test]
+    fn an_ldt_selector_is_reported_as_impossible_in_this_kernel() {
+        let s = hint(13, 0x4c);
+        assert!(s.contains("LDT index 9"), "{}", s);
+        assert!(s.contains("never loads an LDT"), "{}", s);
+        assert!(s.contains("was not one"), "{}", s);
+    }
+
+    /// The verdict belongs to the LDT case alone: a GDT selector is ordinary,
+    /// and an IDT one is a gate, so neither may carry it.
+    #[test]
+    fn a_gdt_or_idt_selector_keeps_its_plain_decode() {
+        for ec in [0x58, 0b110, 0b1011] {
+            let s = hint(13, ec);
+            assert!(!s.contains("never loads an LDT"), "{:#x}: {}", ec, s);
+        }
     }
 
     /// Only #TS, #NP, #SS and #GP carry a selector. Reading one out of #DF's

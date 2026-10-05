@@ -414,6 +414,12 @@ impl<T: TextBuffer> Handler for ConsoleInner<T> {
         let width = self.buf.width();
         let row = self.cursor.row;
         let col = self.cursor.col;
+        // The `=` is what mutation reports as redundant, and only because of
+        // the clamp below: at `col == width` -- the cursor parked past an
+        // exactly-full line, which happens on every line that fills -- the
+        // count clamps to zero and the loop is empty. It stays because it is
+        // what makes `width - col` safe to write at all, the same way the
+        // guard in `delete_chars` does.
         if col >= width {
             return;
         }

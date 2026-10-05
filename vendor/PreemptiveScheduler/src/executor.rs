@@ -149,6 +149,15 @@ pub fn sched_stats() -> (u64, u64) {
     (SCHED_POLLED.load(Relaxed), SCHED_WEAK_YIELD.load(Relaxed))
 }
 
+/// `(stack-pool occupied slots, overflow-list length)` — how many freed
+/// executor stacks are retained out of the buddy heap right now.
+pub fn stack_pool_stats() -> (usize, usize) {
+    use core::sync::atomic::Ordering::Relaxed;
+    let pool = STACK_POOL.iter().filter(|s| s.load(Relaxed) != 0).count();
+    let overflow = STACK_OVERFLOW.lock().len();
+    (pool, overflow)
+}
+
 const PAGE_SIZE: usize = 4096;
 /// Soft / hard guard **below** the usable stack. Soft path fills canary words;
 /// hard path (when hooks are registered) unmaps these pages so overflow #PFs
@@ -220,10 +229,14 @@ static STACK_REG_BASE_OVERFLOW: core::sync::atomic::AtomicUsize =
 /// negatives, and a caller that cannot see that would read "no overlap" as
 /// "no aliasing".
 fn stack_reg_insert(alloc_base: usize) {
-    use core::sync::atomic::Ordering::AcqRel;
+    use core::sync::atomic::Ordering::{AcqRel, Relaxed};
     for slot in STACK_REG_BASE.iter() {
+        // Load first (see the note on `stack_reg_remove`).
+        if slot.load(Relaxed) != 0 {
+            continue;
+        }
         if slot
-            .compare_exchange(0, alloc_base, AcqRel, core::sync::atomic::Ordering::Relaxed)
+            .compare_exchange(0, alloc_base, AcqRel, Relaxed)
             .is_ok()
         {
             return;
@@ -239,11 +252,26 @@ pub fn untracked_alloc_stacks() -> usize {
 }
 
 /// Remove a stack recorded by [`stack_reg_insert`].
+///
+/// All four tables below are fixed arrays of `AtomicUsize` scanned from slot 0
+/// for the first free (or matching) entry, and a `compare_exchange` that FAILS
+/// is still a read-modify-write: it takes the cacheline exclusively and
+/// invalidates every other CPU's copy. So a scan that CASes its way past 300
+/// occupied slots sent 300 invalidations for 300 answers it could have had from
+/// a shared load -- and `alloc_overlaps_live_stack`, which the kernel's global
+/// allocator calls on EVERY block it hands out, is reading those same lines.
+/// A relaxed load first, and the CAS only where the load says it can succeed,
+/// keeps the traffic on the one line that changes. The CAS still decides: a
+/// slot that another CPU took between the load and it simply fails and the scan
+/// moves on, exactly as before.
 fn stack_reg_remove(alloc_base: usize) {
-    use core::sync::atomic::Ordering::AcqRel;
+    use core::sync::atomic::Ordering::{AcqRel, Relaxed};
     for slot in STACK_REG_BASE.iter() {
+        if slot.load(Relaxed) != alloc_base {
+            continue;
+        }
         if slot
-            .compare_exchange(alloc_base, 0, AcqRel, core::sync::atomic::Ordering::Relaxed)
+            .compare_exchange(alloc_base, 0, AcqRel, Relaxed)
             .is_ok()
         {
             return;
@@ -584,14 +612,15 @@ static STACK_REG_OVERFLOW: core::sync::atomic::AtomicUsize =
 
 /// Publish `[alloc_base, alloc_base + ALLOC_SIZE)` as a live stack.
 fn register_stack(alloc_base: usize) {
+    use core::sync::atomic::Ordering::{AcqRel, Relaxed};
     for slot in STACK_REG.iter() {
+        // Load first: see the note on `stack_reg_remove`. This table is the one
+        // `overlapping_live_stack` reads from the frame allocator.
+        if slot.load(Relaxed) != 0 {
+            continue;
+        }
         if slot
-            .compare_exchange(
-                0,
-                alloc_base,
-                core::sync::atomic::Ordering::AcqRel,
-                core::sync::atomic::Ordering::Relaxed,
-            )
+            .compare_exchange(0, alloc_base, AcqRel, Relaxed)
             .is_ok()
         {
             return;
@@ -602,14 +631,13 @@ fn register_stack(alloc_base: usize) {
 
 /// Retract a stack registered by [`register_stack`].
 fn unregister_stack(alloc_base: usize) {
+    use core::sync::atomic::Ordering::{AcqRel, Relaxed};
     for slot in STACK_REG.iter() {
+        if slot.load(Relaxed) != alloc_base {
+            continue;
+        }
         if slot
-            .compare_exchange(
-                alloc_base,
-                0,
-                core::sync::atomic::Ordering::AcqRel,
-                core::sync::atomic::Ordering::Relaxed,
-            )
+            .compare_exchange(alloc_base, 0, AcqRel, Relaxed)
             .is_ok()
         {
             return;
@@ -738,6 +766,11 @@ static SPINE_OVERFLOW: core::sync::atomic::AtomicUsize = core::sync::atomic::Ato
 fn spine_register(slot: usize, val: u64, exec_id: usize, stack_base: usize) {
     use core::sync::atomic::Ordering::{AcqRel, Relaxed, Release};
     for i in 0..SPINE_SLOTS {
+        // Load first: see the note on `stack_reg_remove`. `spine_verify` sweeps
+        // this same array from the timer tick on every CPU.
+        if SPINE_ADDR[i].load(Relaxed) != 0 {
+            continue;
+        }
         if SPINE_ADDR[i]
             .compare_exchange(0, usize::MAX, AcqRel, Relaxed)
             .is_ok()
@@ -998,8 +1031,17 @@ static STACK_OVERFLOW: spin::Mutex<alloc::vec::Vec<usize>> =
 /// or `None` if the pool is empty. The fixed array is scanned lock-free (one
 /// atomic swap per slot); the overflow retention list is checked last.
 fn stack_pool_pop() -> Option<usize> {
-    use core::sync::atomic::Ordering::AcqRel;
+    use core::sync::atomic::Ordering::{AcqRel, Relaxed};
     for slot in STACK_POOL.iter() {
+        // A relaxed load before the swap. In steady state the pool is
+        // near-empty (creates and frees balance), so the old unconditional
+        // `swap` wrote all `STACK_POOL_CAP` slots to learn there was nothing
+        // there -- 128 read-modify-writes, taking 128 cachelines exclusively,
+        // on every `Executor::new`, which is once per mid-poll preemption on
+        // every CPU. See the note on `stack_reg_remove`.
+        if slot.load(Relaxed) == 0 {
+            continue;
+        }
         let base = slot.swap(0, AcqRel);
         if base != 0 {
             return Some(base);
@@ -1013,6 +1055,9 @@ fn stack_pool_pop() -> Option<usize> {
 fn stack_pool_push(alloc_base: usize) -> bool {
     use core::sync::atomic::Ordering::{AcqRel, Relaxed};
     for slot in STACK_POOL.iter() {
+        if slot.load(Relaxed) != 0 {
+            continue;
+        }
         if slot
             .compare_exchange(0, alloc_base, AcqRel, Relaxed)
             .is_ok()
@@ -1238,7 +1283,18 @@ impl Executor {
         // no longer loaded on this CPU.
         let mut _cr3_pin: Option<Arc<Task>> = None;
         loop {
-            let mut task_info = self.task_collection.take_task();
+            // Balance pull: a CPU that always has exactly one local task never
+            // hits the idle steal below, so a peer sitting on a backlog stays
+            // overloaded. Every 32 polls, if we have one runnable task and a
+            // peer has at least three we may poll, pull one first. Ownership
+            // of the waker page stays with the victim (same as idle steal).
+            let mut task_info = None;
+            if crate::runtime::rebalance_due() && self.task_collection.ready_num() == Some(1) {
+                task_info = crate::runtime::steal_for_balance();
+            }
+            if task_info.is_none() {
+                task_info = self.task_collection.take_task();
+            }
             if task_info.is_none() {
                 task_info = crate::runtime::steal_task_from_other_cpu();
             }

@@ -84,6 +84,11 @@ pub struct Layout {
 /// Parse an aspect spec: `"16:9"`, `"16:10"` or a decimal like `"1.778"`.
 pub fn parse_aspect(v: &str) -> Option<f32> {
     let v = v.trim();
+    // Either side of the colon is parsed as a whole, so splitting at the
+    // first or the last one makes no difference: with two colons one half
+    // keeps one and fails to parse whichever end you cut at. Mutation reports
+    // the choice as free and it is -- it is the first colon because that is
+    // where a ratio's separator is.
     let aspect = if let Some((a, b)) = v.split_once(':') {
         a.trim().parse::<f32>().ok()? / b.trim().parse::<f32>().ok()?
     } else {
@@ -806,6 +811,11 @@ fn span(c: f32, r: f32, limit: usize) -> (usize, usize) {
 
 /// Stamp a star as a `scu` x `scu` block (a single pixel at scale 1).
 fn star_block(buf: &mut [f32], w: usize, h: usize, x: i32, y: i32, scu: usize, c: Rgb) {
+    // The block is square, so the set of pixels it stamps is its own
+    // transpose and mutation is right that swapping the two offsets changes
+    // nothing -- including at an edge, where the clip applies to the
+    // coordinate and not to the loop. The order is x-inner so the writes walk
+    // the buffer forwards.
     for dy in 0..scu as i32 {
         for dx in 0..scu as i32 {
             add_px_f(buf, w, h, x + dx, y + dy, c);
@@ -814,6 +824,11 @@ fn star_block(buf: &mut [f32], w: usize, h: usize, x: i32, y: i32, scu: usize, c
 }
 
 fn add_px_f(buf: &mut [f32], w: usize, h: usize, x: i32, y: i32, c: Rgb) {
+    // The two sign tests are what mutation reports as redundant, and they are:
+    // a negative `i32` cast to `usize` becomes a huge number, which the two
+    // upper bounds already refuse. They stay because that is a property of the
+    // cast and not of this function, and a buffer the size of the address
+    // space is not the thing keeping a negative star coordinate out.
     if x < 0 || y < 0 || x as usize >= w || y as usize >= h {
         return;
     }
@@ -1373,5 +1388,210 @@ mod tests {
         render_frame(&mut a, w, &base, &lay, far);
         render_frame(&mut b, w, &base, &lay, far + 42);
         assert_ne!(a, b, "the animation has stopped moving after 40 days");
+    }
+
+    /// An aspect spec is read after trimming, in both of its shapes, and the
+    /// floor is a real floor: packaging writes `LUNARBG_ASPECT` by hand, so
+    /// the value can arrive with the newline or the spaces of a config line.
+    #[test]
+    fn an_aspect_is_trimmed_and_has_a_floor_it_must_clear() {
+        assert_eq!(parse_aspect(" 16:9 "), Some(16.0 / 9.0));
+        assert_eq!(parse_aspect("\t1.778\n"), Some(1.778));
+        // The floor is exclusive: an aspect AT it is refused, which is what
+        // keeps a squeeze of 10x out of the layout.
+        assert_eq!(parse_aspect("0.1"), None);
+        assert!(parse_aspect("0.11").is_some());
+        assert_eq!(parse_aspect("1:10"), None);
+        assert!(parse_aspect("1:9").is_some());
+    }
+
+    /// The logo radius: half the SHORT side less a margin, held between 120
+    /// and 280 design pixels, and the scale is that radius over the 280 px
+    /// design. Both ends of the clamp matter -- a tiny panel must still get a
+    /// readable logo, and a huge one must not grow past the design.
+    #[test]
+    fn the_logo_is_sized_from_the_short_side_and_clamped_at_both_ends() {
+        let near = |a: f32, b: f32| (a - b).abs() < 1e-5;
+        // 1024x768: the short side decides, and neither clamp binds.
+        let lay = layout(1024, 768, None, 1);
+        assert!(near(lay.s, 264.0 / 280.0), "s={}", lay.s);
+        // Square and large: the upper clamp binds, so the logo stops growing.
+        assert!(near(layout(1024, 1024, None, 1).s, 1.0));
+        assert!(near(layout(4096, 4096, None, 1).s, 1.0));
+        // Small: the lower clamp binds, so the logo stops shrinking.
+        assert!(near(layout(400, 400, None, 1).s, 120.0 / 280.0));
+        // A very wide panel is sized by its height, not by its width.
+        assert!(near(layout(3840, 768, None, 1).s, 264.0 / 280.0));
+        // The centre is halfway across and slightly above halfway down.
+        assert!(near(lay.cx, 512.0) && near(lay.cy, 768.0 * 0.46));
+    }
+
+    /// The animated region is rounded OUTWARDS on all four edges: it has to
+    /// contain every pixel the animation can touch, because the frame loop
+    /// repaints nothing outside it and the compositor is told to damage
+    /// exactly this rect. One pixel short on any edge is a sliver of the first
+    /// frame that never updates again.
+    #[test]
+    fn the_animated_region_rounds_outwards_and_no_further() {
+        for (w, h, scale) in [
+            (1024usize, 768usize, 1u32),
+            (1920, 1080, 1),
+            (3840, 2160, 2),
+            (800, 600, 1),
+            (640, 480, 3),
+        ] {
+            let lay = layout(w, h, None, scale);
+            // The reach the layout itself declares, from its own fields.
+            let reach = (300.0 * lay.s).max(215.0 * lay.s + 40.0 * lay.px) + 8.0 * lay.px;
+            let (x0, y0, rw, rh) = lay.region;
+            let (lo_x, hi_x) = (lay.cx - reach * lay.sx, lay.cx + reach * lay.sx);
+            let (lo_y, hi_y) = (lay.cy - reach, lay.cy + reach);
+            let (x1, y1) = (x0 + rw, y0 + rh);
+
+            // Contains the reach box, clipped to the buffer.
+            assert!(
+                x0 as f32 <= lo_x.max(0.0),
+                "{w}x{h}@{scale}: x0 {x0} past {lo_x}"
+            );
+            assert!(
+                y0 as f32 <= lo_y.max(0.0),
+                "{w}x{h}@{scale}: y0 {y0} past {lo_y}"
+            );
+            assert!(
+                x1 as f32 >= hi_x.min(w as f32),
+                "{w}x{h}@{scale}: x1 {x1} short of {hi_x}"
+            );
+            assert!(
+                y1 as f32 >= hi_y.min(h as f32),
+                "{w}x{h}@{scale}: y1 {y1} short of {hi_y}"
+            );
+            // And no more than a pixel wider than it has to be on each edge.
+            assert!(
+                x0 as f32 + 1.0 > lo_x.max(0.0),
+                "{w}x{h}@{scale}: x0 {x0} too wide"
+            );
+            assert!(
+                y0 as f32 + 1.0 > lo_y.max(0.0),
+                "{w}x{h}@{scale}: y0 {y0} too wide"
+            );
+            assert!(
+                x1 == w || (x1 as f32) < hi_x + 1.0,
+                "{w}x{h}@{scale}: x1 {x1} too wide"
+            );
+            assert!(
+                y1 == h || (y1 as f32) < hi_y + 1.0,
+                "{w}x{h}@{scale}: y1 {y1} too wide"
+            );
+        }
+    }
+
+    /// A span has to COVER the circle it was asked for, not merely stay in
+    /// the buffer: a span short on either end clips the glow of a star or the
+    /// edge of the ring, and one too long costs a pass over pixels that
+    /// cannot change.
+    #[test]
+    fn a_span_covers_its_radius_and_barely_more() {
+        for &(c, r) in &[
+            (10.0f32, 3.0f32),
+            (10.5, 3.25),
+            (0.4, 0.4),
+            (99.9, 0.1),
+            (50.0, 7.5),
+        ] {
+            let (lo, hi) = span(c, r, 1000);
+            assert!(lo as f32 <= c - r, "lo {lo} past {}", c - r);
+            assert!(hi as f32 >= c + r + 1.0, "hi {hi} short of {}", c + r + 1.0);
+            // Tight: one pixel of slack each way, no more.
+            assert!(lo as f32 + 1.0 > c - r, "lo {lo} too low");
+            assert!(hi as f32 <= c + r + 2.0, "hi {hi} too high");
+        }
+        // Clipped at the limit, and never backwards.
+        assert_eq!(span(995.0, 20.0, 1000).1, 1000);
+        assert_eq!(span(-50.0, 1.0, 1000).0, 0);
+    }
+
+    /// Stars ADD light, they do not replace it: two stars whose glow lands on
+    /// the same pixel have to come out brighter than either, which is what
+    /// makes the dense part of the field read as dense.
+    #[test]
+    fn two_stars_on_one_pixel_add_up() {
+        let mut buf = vec![0.0f32; 4 * 3];
+        add_px_f(&mut buf, 4, 1, 1, 0, (0.25, 0.0, 0.0));
+        add_px_f(&mut buf, 4, 1, 1, 0, (0.5, 0.125, 0.0));
+        assert_eq!(&buf[3..6], &[0.75, 0.125, 0.0]);
+        // And a coordinate outside the buffer touches nothing at all.
+        let before = buf.clone();
+        for (x, y) in [(-1, 0), (0, -1), (4, 0), (0, 1), (i32::MIN, i32::MIN)] {
+            add_px_f(&mut buf, 4, 1, x, y, (1.0, 1.0, 1.0));
+        }
+        assert_eq!(buf, before);
+    }
+
+    /// The star field has to be the SAME field every run: the wallpaper is
+    /// regenerated on every output configure, and a hash that drifts moves
+    /// every star when a monitor is plugged in. These are the values the
+    /// scene was designed against.
+    #[test]
+    fn the_star_hash_is_the_same_hash_it_has_always_been() {
+        assert_eq!(hash2(0, 0), 0);
+        assert_eq!(hash2(1, 0), 520_022_130);
+        assert_eq!(hash2(0, 1), 1_641_512_162);
+        assert_eq!(hash2(1, 1), 2_772_236_498);
+        assert_eq!(hash2(7, 13), 553_458_987);
+        assert_eq!(hash2(1920, 1080), 2_592_556_348);
+        // The two arguments are not interchangeable: a square grid of stars
+        // would otherwise be mirrored about its diagonal.
+        assert_ne!(hash2(3, 5), hash2(5, 3));
+    }
+
+    /// The whole 5x7 font, row by row. Every glyph is drawn around the ring
+    /// or under the logo, and nothing in the scene reads a glyph back, so a
+    /// row in the wrong place is only visible to someone looking at the
+    /// screen -- which is the one thing that cannot happen here.
+    #[test]
+    fn every_glyph_is_the_shape_its_letter_has() {
+        #[rustfmt::skip]
+        const FONT: [(char, [u8; 7]); 20] = [
+            ('A', [0b01110, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001]),
+            ('B', [0b11110, 0b10001, 0b10001, 0b11110, 0b10001, 0b10001, 0b11110]),
+            ('C', [0b01111, 0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b01111]),
+            ('E', [0b11111, 0b10000, 0b10000, 0b11110, 0b10000, 0b10000, 0b11111]),
+            ('I', [0b01110, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110]),
+            ('K', [0b10001, 0b10010, 0b10100, 0b11000, 0b10100, 0b10010, 0b10001]),
+            ('L', [0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b11111]),
+            ('M', [0b10001, 0b11011, 0b10101, 0b10101, 0b10001, 0b10001, 0b10001]),
+            ('N', [0b10001, 0b11001, 0b10101, 0b10011, 0b10001, 0b10001, 0b10001]),
+            ('O', [0b01110, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110]),
+            ('P', [0b11110, 0b10001, 0b10001, 0b11110, 0b10000, 0b10000, 0b10000]),
+            ('R', [0b11110, 0b10001, 0b10001, 0b11110, 0b10100, 0b10010, 0b10001]),
+            ('S', [0b01111, 0b10000, 0b10000, 0b01110, 0b00001, 0b00001, 0b11110]),
+            ('T', [0b11111, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100]),
+            ('V', [0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01010, 0b00100]),
+            ('X', [0b10001, 0b10001, 0b01010, 0b00100, 0b01010, 0b10001, 0b10001]),
+            ('Y', [0b10001, 0b10001, 0b01010, 0b00100, 0b00100, 0b00100, 0b00100]),
+            ('6', [0b00110, 0b01000, 0b10000, 0b11110, 0b10001, 0b10001, 0b01110]),
+            ('.', [0b00000, 0b00000, 0b00000, 0b00000, 0b00000, 0b01100, 0b01100]),
+            ('-', [0b00000, 0b00000, 0b00000, 0b11111, 0b00000, 0b00000, 0b00000]),
+        ];
+        for (c, rows) in FONT {
+            assert_eq!(glyph5x7(c), rows, "glyph {c}");
+        }
+        // No two letters share a shape: a glyph copied from its neighbour
+        // reads as the wrong letter and nothing else would catch it.
+        for (i, (a, ra)) in FONT.iter().enumerate() {
+            for (b, rb) in FONT.iter().skip(i + 1) {
+                assert_ne!(ra, rb, "{a} and {b} are the same glyph");
+            }
+        }
+    }
+
+    /// The ring text ends in its own separator, because it is drawn repeated
+    /// around a full circle: without the trailing dash the last word runs
+    /// into the first one where the ring closes.
+    #[test]
+    fn the_ring_text_closes_on_its_separator() {
+        assert!(TEXT_RING.ends_with('-'), "{TEXT_RING}");
+        assert!(!TEXT_RING.starts_with('-'));
+        assert!(!TEXT_RING.contains("--"), "a gap twice as wide as the rest");
     }
 }

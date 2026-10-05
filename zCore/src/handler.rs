@@ -201,6 +201,8 @@ impl KernelHandler for ZcoreKernelHandler {
             // re-entrant acquires this fault is the tail end of. Printed here
             // because a crash log is the only place anyone will look for it.
             report_bogus_cpu_id_events();
+            #[cfg(not(feature = "libos"))]
+            report_heap_lock_held();
             // Name the interrupted thread via serial only (never graphic fmt).
             //
             // `name()` returns a String, i.e. it ALLOCATES -- and this fault may
@@ -456,6 +458,29 @@ impl KernelHandler for ZcoreKernelHandler {
     }
 }
 
+/// One line saying whether this CPU was inside the kernel heap's critical
+/// section when it faulted -- printed on every kernel-side fault report,
+/// because it changes what the report means and nothing said it.
+///
+/// Holding that lock makes the fault unrecoverable here and unreportable
+/// through anything that allocates, and it wedges every other CPU that
+/// reaches the allocator: the eight-second deadlock reports with a HOLDER
+/// "now at handle_page_fault" are this fault, seen from the CPUs it stranded.
+/// See `memory::heap_held_by_current_cpu`.
+#[cfg(not(feature = "libos"))]
+fn report_heap_lock_held() {
+    if crate::memory::heap_held_by_current_cpu() {
+        kernel_hal::console::serial_write_str(
+            "[diag] THIS CPU WAS HOLDING THE KERNEL HEAP LOCK when it faulted. The fault \
+             is therefore inside the allocator (its free lists are intrusive, so a wild \
+             write into them faults on the next walk), it cannot be contained on this CPU, \
+             and every other CPU that reaches the heap from here on spins until the \
+             deadlock detector reports it eight seconds later with this CPU as HOLDER. \
+             Treat any such report as a consequence of THIS fault, not a second bug.\n",
+        );
+    }
+}
+
 /// Report a kernel page fault the faulting thread's user vmar could not
 /// resolve, then contain it (retire just the faulting coroutine) or halt
 /// cleanly. Never returns.
@@ -506,6 +531,7 @@ fn report_unresolved_kernel_fault(
         kernel_hal::ksyms::Addr(rip),
         have_thread,
     ));
+    report_heap_lock_held();
     print_fault_backtrace(access_flags);
     // Release the latch before containment: a successful `try_contain` retires
     // just this coroutine and resumes scheduling, so a LATER fault must be free

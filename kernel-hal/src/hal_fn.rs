@@ -253,6 +253,13 @@ hal_fn_def! {
         /// mask is ignored.
         pub fn spawn_with_affinity(future: impl Future<Output = ()> + Send + 'static, affinity: Arc<core::sync::atomic::AtomicU64>);
 
+        /// A thread's affinity mask was just rewritten (`sched_setaffinity`).
+        ///
+        /// Lets the scheduler kick a CPU the new mask allows right away,
+        /// instead of waiting for the owning CPU's next run-queue pass to
+        /// refuse the task. No-op on hosted (libos) builds.
+        pub fn affinity_changed(_mask: u64) {}
+
         /// Set tid and pid of current task.
         pub fn set_current_thread(thread: Option<Arc<dyn Any + Send + Sync>>) {}
 
@@ -267,6 +274,17 @@ hal_fn_def! {
         /// timeslice. Returns `true` exactly once per request. Hosted (libos)
         /// builds run on the host scheduler and always return `false`.
         pub fn take_need_resched() -> bool { false }
+
+        /// Whether this CPU has a wake-up preemption request pending, without
+        /// consuming it.
+        ///
+        /// The trap path has to know *that* a request exists before it can ask
+        /// the running thread whether it may be preempted yet (see
+        /// `Thread::sched_may_preempt_on_wake`): taking the request and then
+        /// declining to yield would drop it, and the woken task would wait out
+        /// the whole remaining timeslice -- exactly what the request exists to
+        /// prevent. Hosted (libos) builds always return `false`.
+        pub fn need_resched_pending() -> bool { false }
 
         /// Instantaneous run-queue length across every CPU: tasks queued ready
         /// to run plus the task each CPU is polling right now (Linux's

@@ -12837,14 +12837,15 @@ impl NvidiaGpu {
                 // looks the whole list up in the caller's file,
                 // `nouveau_job_fence_attach_prepare` / `nouveau_job_add_deps`,
                 // before the job runs; another process's handle is ENOENT).
-                if let Some(s) = sigs
-                    .iter()
-                    .chain(waits.iter())
-                    .find(|s| !crate::scheme::syncobj::usable_by(owner_pid, s.handle))
-                {
+                // ONE take of the syncobj table lock for the whole list, not
+                // one per handle: see `syncobj::first_unusable_by`.
+                if let Some(bad) = crate::scheme::syncobj::first_unusable_by(
+                    owner_pid,
+                    sigs.iter().chain(waits.iter()).map(|s| s.handle),
+                ) {
                     crate::klog_warn!(
                         "[nouveau-uapi] VM_BIND: syncobj handle={} is unknown or not this process's -- nothing bound (ENOENT) pid={}",
-                        s.handle,
+                        bad,
                         owner_pid
                     );
                     return Err(nv::ENOENT);
@@ -13035,14 +13036,17 @@ impl NvidiaGpu {
                     } else {
                         &[]
                     };
-                    if let Some(s) = sigs
-                        .iter()
-                        .chain(waits.iter())
-                        .find(|s| !crate::scheme::syncobj::usable_by(owner_pid, s.handle))
-                    {
+                    // ONE take of the syncobj table lock for the whole list,
+                    // not one per handle: see
+                    // `syncobj::first_unusable_by`. NVK batches up to 256
+                    // waits and 256 signals into one EXEC.
+                    if let Some(bad) = crate::scheme::syncobj::first_unusable_by(
+                        owner_pid,
+                        sigs.iter().chain(waits.iter()).map(|s| s.handle),
+                    ) {
                         crate::klog_warn!(
                             "[nouveau-uapi] EXEC: syncobj handle={} is unknown or not this process's -- nothing submitted (ENOENT) pid={}",
-                            s.handle,
+                            bad,
                             owner_pid
                         );
                         return Err(nv::ENOENT);

@@ -1254,9 +1254,26 @@ async fn handle_user_trap(thread: &CurrentThread, mut ctx: Box<UserContext>) -> 
                 //    is checked on *every* interrupt vector, not just the timer,
                 //    so the reschedule IPI the waker sends turns into a yield
                 //    immediately instead of at the next 4 ms tick.
+                //    But not in the first `BASE_SLICE_NS` of the running
+                //    thread's slice: that is EEVDF's RUN_TO_PARITY (Linux 6.6),
+                //    and without it a single wake-heavy neighbour preempts
+                //    whatever is running after microseconds, over and over, each
+                //    yield leaving a weak executor and a stack behind. See
+                //    `Thread::sched_may_preempt_on_wake`.
+                //
+                //    The order matters: PEEK at the request, ask the thread, and
+                //    only then consume it. Taking it and declining to yield
+                //    would drop a coalesced request, and the woken task would
+                //    wait out the whole remaining slice -- the regression the
+                //    request exists to prevent. Left pending, it is honoured at
+                //    the next interrupt past the floor, so the latency a woken
+                //    task can lose is bounded by one scheduler tick.
                 let slice_expired = vector == kernel_hal::context::TIMER_INTERRUPT_VEC
                     && thread.tick_should_preempt();
-                if slice_expired || kernel_hal::thread::take_need_resched() {
+                let wake_resched = kernel_hal::thread::need_resched_pending()
+                    && (slice_expired || thread.sched_may_preempt_on_wake())
+                    && kernel_hal::thread::take_need_resched();
+                if slice_expired || wake_resched {
                     kernel_hal::thread::yield_now().await;
                 }
             }

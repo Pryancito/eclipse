@@ -1031,7 +1031,7 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
               export PULSE_SERVER=unix:/run/pulse/native\n\
               # Firefox: the native Wayland backend on every launch path. The\n\
               # eclipse-firefox wrapper (menu, .desktop) pins it too; this line\n\
-              # covers a `firefox-esr` typed in a terminal. The labwc environment\n\
+              # covers a `firefox` typed in a terminal. The labwc environment\n\
               # file and eclipse-init's CHILD_ENV carry the same pin.\n\
               export MOZ_ENABLE_WAYLAND=1\n\
               # GTK from a terminal: the gdk-pixbuf loader registry the\n\
