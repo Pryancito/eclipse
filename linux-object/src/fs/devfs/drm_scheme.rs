@@ -2095,21 +2095,36 @@ impl DrmDev {
                 }
                 const DRM_MODE_CURSOR_BO: u32 = 0x01;
                 const DRM_MODE_CURSOR_MOVE: u32 = 0x02;
+                const DRM_MODE_CURSOR_FLAGS: u32 = DRM_MODE_CURSOR_BO | DRM_MODE_CURSOR_MOVE;
                 let cur = unsafe { &*(data as *const DrmModeCursor) };
-                // `drm_mode_cursor_common` finds the CRTC before it reads the
-                // flags: "Unknown CRTC ID" is ENOENT. The id was not looked
-                // at, so a cursor aimed at a CRTC that does not exist moved the
-                // one that does.
+                // `drm_mode_cursor_common` reads the flags first: no flag at
+                // all, or one it does not know, is EINVAL. This arm answered
+                // success having done nothing, so a client whose request
+                // named no operation was never told.
+                if cur.flags == 0 || cur.flags & !DRM_MODE_CURSOR_FLAGS != 0 {
+                    return Err(FsError::InvalidParam);
+                }
+                // Then it finds the CRTC: "Unknown CRTC ID" is ENOENT. The
+                // id was not looked at, so a cursor aimed at a CRTC that does
+                // not exist moved the one that does.
                 if drm::get_crtc(cur.crtc_id).is_none() {
                     return Err(FsError::EntryNotFound);
                 }
                 let mut changed = false;
                 if cur.flags & DRM_MODE_CURSOR_BO != 0 {
-                    // Linux: a cursor larger than DRM_CAP_CURSOR_WIDTH/HEIGHT
-                    // is EINVAL. Nothing else bounds the bitmap the kernel
-                    // copies and composites on every frame.
+                    // Linux wraps the handle in a framebuffer of `width x
+                    // height` (`drm_internal_framebuffer_create`): a zero
+                    // width or height is "bad framebuffer" EINVAL there, and
+                    // a cursor larger than DRM_CAP_CURSOR_WIDTH/HEIGHT is
+                    // EINVAL too. Nothing else bounds the bitmap the kernel
+                    // copies and composites on every frame. This arm read a
+                    // zero as "hide the pointer", which only a handle of 0
+                    // means.
                     if cur.handle != 0
-                        && (cur.width > drm::MAX_CURSOR_DIM || cur.height > drm::MAX_CURSOR_DIM)
+                        && (cur.width == 0
+                            || cur.height == 0
+                            || cur.width > drm::MAX_CURSOR_DIM
+                            || cur.height > drm::MAX_CURSOR_DIM)
                     {
                         return Err(FsError::InvalidParam);
                     }
@@ -8107,6 +8122,121 @@ mod kms_scanout_tests {
 
         // Leave no pointer behind for the tests that follow.
         set_cursor(&c, drm::SYNTH_CRTC_ID, 0, 0, 0, 0, 0);
+        c.rmfb(fb).expect("RMFB");
+        c.destroy_dumb(cur.handle).expect("DESTROY_DUMB cursor");
+        c.destroy_dumb(buf.handle).expect("DESTROY_DUMB");
+    }
+
+    /// `drm_mode_cursor_common` reads the flags before it looks the CRTC up:
+    /// no flag at all, or one it does not know, is EINVAL, ahead of the
+    /// ENOENT of a CRTC that does not exist. And a handle is wrapped in a
+    /// framebuffer of `width x height`, so a zero width or height is EINVAL
+    /// (`drm_internal_framebuffer_create`), where only a handle of 0 hides
+    /// the pointer. Here a request with no flag or an unknown one answered
+    /// success having done nothing, and a zero-sized image hid the pointer
+    /// with success; both refusals leave the pointer where it was.
+    #[test]
+    fn the_cursor_ioctl_reads_its_flags_first_and_refuses_an_empty_image() {
+        let screen = kms_emu::attach(64, 16);
+        let c = Client::open(0);
+        let buf = c.create_dumb(64, 16);
+        paint(&buf, |_, _| 0x0000_1111);
+        let fb = c.addfb2(&buf);
+        set_crtc(&c, drm::SYNTH_CRTC_ID, fb, 64, 16);
+        let cur = c.create_dumb(8, 8);
+        {
+            let px = map_dumb(&cur);
+            for p in px.iter_mut().take(64) {
+                *p = 0xFF00_00FF;
+            }
+        }
+        set_cursor(&c, drm::SYNTH_CRTC_ID, cur.handle, 8, 8, 4, 2);
+        let pointer_at = |x0: i32, y0: i32, what: &str| {
+            for y in 0..16 {
+                for x in 0..64 {
+                    let inside =
+                        (x0..x0 + 8).contains(&(x as i32)) && (y0..y0 + 8).contains(&(y as i32));
+                    let want = if inside { 0xFF00_00FF } else { 0x0000_1111 };
+                    assert_eq!(screen.pixel(x, y), want, "{}: ({}, {})", what, x, y);
+                }
+            }
+        };
+        pointer_at(4, 2, "before");
+
+        let cursor = |flags: u32, crtc_id: u32, handle: u32, w: u32, h: u32| {
+            let mut req = ModeCursor {
+                flags,
+                crtc_id,
+                x: 40,
+                y: 6,
+                width: w,
+                height: h,
+                handle,
+            };
+            c.ioctl(DRM_IOCTL_MODE_CURSOR, &mut req)
+        };
+        const NO_SUCH_CRTC: u32 = 4242;
+        const UNKNOWN: u32 = 0x04;
+        let einval = Err(FsError::InvalidParam);
+        assert_eq!(
+            cursor(0, drm::SYNTH_CRTC_ID, cur.handle, 8, 8),
+            einval,
+            "no flag"
+        );
+        assert_eq!(
+            cursor(UNKNOWN, drm::SYNTH_CRTC_ID, cur.handle, 8, 8),
+            einval,
+            "unknown flag"
+        );
+        assert_eq!(
+            cursor(CURSOR_MOVE | UNKNOWN, drm::SYNTH_CRTC_ID, 0, 0, 0),
+            einval,
+            "an unknown flag next to a known one"
+        );
+        assert_eq!(
+            cursor(0, NO_SUCH_CRTC, cur.handle, 8, 8),
+            einval,
+            "the flags are read before the CRTC"
+        );
+        assert_eq!(
+            cursor(CURSOR_MOVE, NO_SUCH_CRTC, 0, 0, 0),
+            Err(FsError::EntryNotFound),
+            "a CRTC that does not exist"
+        );
+        assert_eq!(
+            cursor(CURSOR_BO, drm::SYNTH_CRTC_ID, cur.handle, 0, 8),
+            einval,
+            "zero width"
+        );
+        assert_eq!(
+            cursor(CURSOR_BO, drm::SYNTH_CRTC_ID, cur.handle, 8, 0),
+            einval,
+            "zero height"
+        );
+        pointer_at(4, 2, "after the refusals");
+
+        // The operations themselves are still there: a move, a new image
+        // with a move, and a hide with handle 0, whatever the size says.
+        assert_eq!(cursor(CURSOR_MOVE, drm::SYNTH_CRTC_ID, 0, 0, 0), Ok(0));
+        pointer_at(40, 6, "after the move");
+        assert_eq!(
+            cursor(
+                CURSOR_BO | CURSOR_MOVE,
+                drm::SYNTH_CRTC_ID,
+                cur.handle,
+                8,
+                8
+            ),
+            Ok(0)
+        );
+        pointer_at(40, 6, "after the image and move");
+        assert_eq!(
+            cursor(CURSOR_BO, drm::SYNTH_CRTC_ID, 0, 0, 0),
+            Ok(0),
+            "hide"
+        );
+        pointer_at(-8, -8, "hidden");
+
         c.rmfb(fb).expect("RMFB");
         c.destroy_dumb(cur.handle).expect("DESTROY_DUMB cursor");
         c.destroy_dumb(buf.handle).expect("DESTROY_DUMB");
