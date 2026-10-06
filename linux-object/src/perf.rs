@@ -901,10 +901,14 @@ pub fn kernel_report() -> String {
     {
         let rip = kernel_hal::kstats::tick_gap_max_rip();
         if rip != 0 {
+            // `ksyms::Addr` resolves it here, in the kernel, against the
+            // symbol table baked into the image: whoever is reading this is at
+            // the slow machine, not at a build tree with the matching ELF, and
+            // a bare address makes them go and find one.
             let _ = writeln!(
                 out,
-                "  worst gap ended at rip {:#x} ({}) -- symbolize with addr2line",
-                rip,
+                "  worst gap ended in {} ({})",
+                kernel_hal::ksyms::Addr(rip),
                 if rip >= 0xffff_8000_0000_0000 {
                     "kernel"
                 } else {
