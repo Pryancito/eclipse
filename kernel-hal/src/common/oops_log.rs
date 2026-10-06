@@ -118,7 +118,44 @@ impl Write for Sink {
 /// touches a device. Failure to format is ignored — losing a log line must
 /// never be able to escalate into a second fault.
 pub fn record(args: fmt::Arguments) {
+    boot_banner_once();
     let _ = Sink.write_fmt(args);
+}
+
+/// Whether the boot banner has been written. See [`boot_banner_once`].
+static BANNER_DONE: AtomicBool = AtomicBool::new(false);
+
+/// Open the record with a line naming this boot, once.
+///
+/// `/var/log/oops.log` is appended to and outlives reboots, and `/proc/oops`
+/// hands back the whole record rather than the new part, so the file ends up
+/// holding several boots' faults with nothing between them that says so. Two
+/// captures of one bug came back carrying a `[null-exec]` block identical down
+/// to `r14=0x3b` -- the same record, re-read after a reboot -- beside a
+/// `[KERNEL PAGE FAULT]` from the new boot that had nothing to do with it, and
+/// they were read as one fault. Twice.
+///
+/// The drain is fixed to append only what is new, but a disk already carries
+/// the old one and the file already carries the old entries, so the boundary
+/// has to be in the record itself. The wall clock is what tells two boots
+/// apart: uptime restarts, and the monotonic clock cannot say which boot it is
+/// counting. Zero means the RTC was not up yet, which the line says rather than
+/// printing a time that is not one.
+fn boot_banner_once() {
+    if BANNER_DONE.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let wall = crate::timer::wall_clock_now();
+    let up = crate::timer::timer_now();
+    let _ = Sink.write_fmt(format_args!(
+        "\n=== eclipse boot: wall {} ns, first contained fault at uptime {} ns ===\n",
+        if wall.as_nanos() == 0 {
+            0
+        } else {
+            wall.as_nanos()
+        },
+        up.as_nanos(),
+    ));
 }
 
 /// Print to the serial console AND append to the record `/proc/oops` exposes.
@@ -171,6 +208,7 @@ pub fn snapshot() -> alloc::vec::Vec<u8> {
 /// report survives.
 #[cfg(test)]
 fn reset_for_tests() {
+    BANNER_DONE.store(false, Ordering::SeqCst);
     EVENTS.store(0, Ordering::SeqCst);
     LEN.store(0, Ordering::SeqCst);
     OVERFLOWED.store(false, Ordering::SeqCst);
@@ -215,6 +253,26 @@ mod tests {
     }
 
     #[test]
+    fn the_record_opens_with_a_boot_line_and_only_one() {
+        let _exclusive = exclusive();
+        reset_for_tests();
+        record(format_args!("[isolate] first fault\n"));
+        record(format_args!("[isolate] second fault\n"));
+        let t = text();
+        assert_eq!(
+            t.matches("=== eclipse boot").count(),
+            1,
+            "one boundary per boot, not one per fault:\n{t}"
+        );
+        assert!(
+            t.find("=== eclipse boot") < t.find("[isolate] first fault"),
+            "the boundary has to come before the faults it bounds:\n{}",
+            t
+        );
+        assert!(t.contains("[isolate] second fault"));
+    }
+
+    #[test]
     fn a_recorded_line_comes_back_out() {
         let _exclusive = exclusive();
         reset_for_tests();
@@ -254,7 +312,17 @@ mod tests {
             record(format_args!("xxxxxxx\n"));
         }
         let out = text();
-        assert!(out.starts_with("FIRST\n"), "the beginning was eaten");
+        // The boot banner opens the record; `FIRST` is the first thing after
+        // it, and what must not be eaten is everything from there down.
+        let body = out
+            .split_once("===\n")
+            .map(|(_, rest)| rest)
+            .unwrap_or(out.as_str());
+        assert!(
+            body.starts_with("FIRST\n"),
+            "the beginning was eaten: {}",
+            out
+        );
         assert!(
             out.contains("record full; later events were dropped"),
             "a truncated record did not say so"
