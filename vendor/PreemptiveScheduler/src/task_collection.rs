@@ -110,7 +110,7 @@ impl Task {
     }
     pub fn poll(&self, cx: &mut Context) -> Poll<()> {
         // Never poll a task whose future already completed. `finish` is set by
-        // `drop_by_ref` the instant a poll returns Ready, BEFORE the generator
+        // `drop_by_ref` the instant a poll returns Ready, BEFORE the cursor
         // removes the slab slot and frees the future Box. A stale waker (a
         // net-RX / IoMultiplexWait timer still holding a clone) that re-notifies
         // in that window could otherwise get the slot handed out and re-polled,
@@ -138,7 +138,7 @@ impl Task {
     /// must never be entered again.
     ///
     /// Used by the kernel's panic-containment path (`zcore::oops`): a poll that
-    /// panicked left its coroutine stack half-unwound, so the generator's saved
+    /// panicked left its coroutine stack half-unwound, so the future's saved
     /// state no longer describes the values it holds — resuming it could
     /// re-run the faulting code, and *dropping* it could double-drop whatever
     /// the aborted poll had already moved out. Neither is acceptable, so the
@@ -149,7 +149,7 @@ impl Task {
     /// `finish` is left clear. It is the same `AtomicBool` as
     /// [`WakerRef::dropped`](crate::waker_page::WakerRef), and `drop_by_ref`
     /// only calls `mark_dropped` on the false→true edge. Storing it here made
-    /// that edge a no-op: the page bit stayed clear, the generator never
+    /// that edge a no-op: the page bit stayed clear, the scheduler never
     /// reaped the slab slot, and `borrowed` stuck at 1. The caller publishes
     /// both by calling `drop_by_ref` after this returns. The borrow bit is
     /// still set, so the task cannot be handed out in between, and once
@@ -681,52 +681,69 @@ impl TaskCollection {
             }
         }
 
-        let cpu = crate::arch::cpu_id() as usize;
-        let mut urgent = None;
-        let mut yielded = None;
-        let mut stranded = false;
-        let mut kicked_masks = Vec::new();
-        for page_idx in 0..inner.pages.len() {
-            let (notified, voluntary, dropped, borrowed) = inner.pages[page_idx].peek_lanes();
-            let runnable = (notified | voluntary) & !dropped & !borrowed;
-            for subpage_idx in BitIter::from(runnable) {
-                let slot = page_idx * WAKER_PAGE_SIZE + subpage_idx;
-                let Some(task) = inner.slab.get(slot) else {
-                    inner.pages[page_idx].clear(subpage_idx);
-                    continue;
-                };
-                if !task.allowed_on(self.cpu_id as usize) {
-                    stranded = true;
-                    if let Some(mask) = task.affinity_mask() {
-                        if !kicked_masks.contains(&mask) {
-                            kicked_masks.push(mask);
-                        }
+        let (slot, serve_yielded) = if inner.affine == 0 {
+            crate::runtime::note_not_stranded(self.cpu_id as usize);
+            if cursor.urgent_turns >= URGENT_QUOTA {
+                Self::bitmap_candidate(inner, cursor.yielded_next, true)
+                    .map(|slot| (slot, true))
+                    .or_else(|| {
+                        Self::bitmap_candidate(inner, cursor.urgent_next, false)
+                            .map(|slot| (slot, false))
+                    })
+            } else {
+                Self::bitmap_candidate(inner, cursor.urgent_next, false)
+                    .map(|slot| (slot, false))
+                    .or_else(|| {
+                        Self::bitmap_candidate(inner, cursor.yielded_next, true)
+                            .map(|slot| (slot, true))
+                    })
+            }?
+        } else {
+            let cpu = crate::arch::cpu_id() as usize;
+            let mut urgent = None;
+            let mut yielded = None;
+            let mut stranded = false;
+            let mut kick_mask = 0u64;
+            for page_idx in 0..inner.pages.len() {
+                let (notified, voluntary, dropped, borrowed) = inner.pages[page_idx].peek_lanes();
+                let runnable = (notified | voluntary) & !dropped & !borrowed;
+                for subpage_idx in BitIter::from(runnable) {
+                    let slot = page_idx * WAKER_PAGE_SIZE + subpage_idx;
+                    let Some(task) = inner.slab.get(slot) else {
+                        inner.pages[page_idx].clear(subpage_idx);
+                        continue;
+                    };
+                    let mask = task.affinity_mask().unwrap_or(u64::MAX);
+                    if self.cpu_id < 64 && mask & (1u64 << self.cpu_id) == 0 {
+                        stranded = true;
+                        kick_mask |= mask;
+                    }
+                    if cpu < 64 && mask & (1u64 << cpu) == 0 {
+                        continue;
+                    }
+                    let bit = 1u64 << subpage_idx;
+                    if notified & bit != 0 {
+                        Self::consider_slot(&mut urgent, slot, cursor.urgent_next);
+                    } else if voluntary & bit != 0 {
+                        Self::consider_slot(&mut yielded, slot, cursor.yielded_next);
                     }
                 }
-                if !task.allowed_on(cpu) {
-                    continue;
-                }
-                let bit = 1u64 << subpage_idx;
-                if notified & bit != 0 {
-                    Self::consider_slot(&mut urgent, slot, cursor.urgent_next);
-                } else if voluntary & bit != 0 {
-                    Self::consider_slot(&mut yielded, slot, cursor.yielded_next);
-                }
             }
-        }
-        // The destination must see the victim hint before it consumes the IPI.
-        if stranded {
-            crate::runtime::note_stranded(self.cpu_id as usize);
-        } else {
-            crate::runtime::note_not_stranded(self.cpu_id as usize);
-        }
-        for mask in kicked_masks {
-            crate::runtime::kick_for_affinity(mask, cpu);
-        }
-
-        let serve_yielded =
-            yielded.is_some() && (urgent.is_none() || cursor.urgent_turns >= URGENT_QUOTA);
-        let slot = if serve_yielded { yielded } else { urgent }?;
+            // Publish before forwarding. One destination is enough: it can take
+            // an allowed task, and its victim scan forwards remaining masks to
+            // another CPU (the kick picker excludes the current taker).
+            if stranded {
+                crate::runtime::note_stranded(self.cpu_id as usize);
+            } else {
+                crate::runtime::note_not_stranded(self.cpu_id as usize);
+            }
+            if kick_mask != 0 {
+                crate::runtime::kick_for_affinity(kick_mask, cpu);
+            }
+            let serve_yielded =
+                yielded.is_some() && (urgent.is_none() || cursor.urgent_turns >= URGENT_QUOTA);
+            ((if serve_yielded { yielded } else { urgent })?, serve_yielded)
+        };
         let page_idx = slot / WAKER_PAGE_SIZE;
         let subpage_idx = slot % WAKER_PAGE_SIZE;
         let bit = 1u64 << subpage_idx;
@@ -759,6 +776,44 @@ impl TaskCollection {
     fn consider_slot(best: &mut Option<usize>, slot: usize, next: usize) {
         if best.is_none_or(|previous| (slot < next, slot) < (previous < next, previous)) {
             *best = Some(slot);
+        }
+
+        fn bitmap_candidate(inner: &FutureCollection, next: usize, yielded: bool) -> Option<usize> {
+            let page_count = inner.pages.len();
+            if page_count == 0 {
+                return None;
+            }
+            let first_page = (next / WAKER_PAGE_SIZE) % page_count;
+            let first_bit = next % WAKER_PAGE_SIZE;
+            for step in 0..=page_count {
+                if step == page_count && first_bit == 0 {
+                    break;
+                }
+                let page_idx = (first_page + step) % page_count;
+                let page = &inner.pages[page_idx];
+                let (notified, voluntary, dropped, borrowed) = page.peek_lanes();
+                let mut bits = if yielded {
+                    voluntary & !notified
+                } else {
+                    notified
+                } & !dropped
+                    & !borrowed;
+                if step == 0 {
+                    bits &= u64::MAX << first_bit;
+                } else if step == page_count {
+                    bits &= (1u64 << first_bit) - 1;
+                }
+                while bits != 0 {
+                    let subpage_idx = bits.trailing_zeros() as usize;
+                    let slot = page_idx * WAKER_PAGE_SIZE + subpage_idx;
+                    if inner.slab.get(slot).is_some() {
+                        return Some(slot);
+                    }
+                    page.clear(subpage_idx);
+                    bits &= bits - 1;
+                }
+            }
+            None
         }
     }
 }
@@ -941,13 +996,12 @@ mod key_tests {
 /// One CPU's run queue: what it will hand its executor, and what it refuses to.
 ///
 /// This is the cross-CPU half of the scheduler. A collection belongs to one
-/// logical CPU, its generator is resumed both by that CPU's own executor
+/// logical CPU, its cursor is used both by that CPU's own executor
 /// (`take_task`) and by thieves from other CPUs (`try_take_task`), and the
 /// three load figures it publishes are what placement and work stealing steer
 /// by. 799 lines of it, and the only tests were of the key packing.
 ///
-/// The host `cpu_id()` is hardwired to 0, so "this CPU" is always CPU 0 here
-/// and a mask that excludes it is how a task pinned elsewhere is spelled.
+/// Host CPU identity defaults to 0; migration tests override it per host thread.
 #[cfg(test)]
 mod collection_tests {
     use super::*;
@@ -964,6 +1018,23 @@ mod collection_tests {
         let weak = Arc::downgrade(&tc);
         drop(tc);
         assert!(weak.upgrade().is_none());
+    }
+
+    #[test]
+    fn bitmap_cursor_rotates_across_sparse_pages_and_wraps_within_a_page() {
+        let _g = crate::runtime::resched_test_lock();
+        let tc = TaskCollection::new(0);
+        let keys: Vec<_> = (0..130).map(|_| tc.add_task(pending(), None)).collect();
+        for (slot, &key) in keys.iter().enumerate() {
+            if ![2, 64, 129].contains(&slot) {
+                tc.remove_task(key);
+            }
+        }
+        for slot in [2, 64, 129, 2, 64, 129, 2] {
+            let (key, _, waker) = tc.take_task().unwrap();
+            assert_eq!(key, keys[slot]);
+            cede(&waker);
+        }
     }
 
     #[test]
@@ -1118,6 +1189,47 @@ mod collection_tests {
         crate::arch::set_cpu_id_for_test(previous);
     }
 
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn disjoint_affinity_masks_forward_once_per_scan_and_chain_to_the_other_cpu() {
+        static KICKS: AtomicUsize = AtomicUsize::new(0);
+        static DESTINATIONS: AtomicU64 = AtomicU64::new(0);
+        fn record(cpu: usize) {
+            KICKS.fetch_add(1, Ordering::SeqCst);
+            DESTINATIONS.fetch_or(1u64 << cpu, Ordering::SeqCst);
+        }
+        let _g = crate::runtime::resched_test_lock();
+        let previous = crate::arch::set_cpu_id_for_test(0);
+        let ready = crate::runtime::set_executor_ready_mask_for_test(0b111);
+        for cpu in [1, 2] {
+            crate::runtime::clear_need_resched(cpu);
+            crate::runtime::set_cpu_sleeping(cpu, false);
+        }
+        crate::runtime::set_resched_ipi_sender(record);
+        KICKS.store(0, Ordering::SeqCst);
+        DESTINATIONS.store(0, Ordering::SeqCst);
+        let tc = TaskCollection::new(0);
+        for _ in 0..16 {
+            tc.add_task(pending(), Some(Arc::new(AtomicU64::new(1 << 1))));
+            tc.add_task(pending(), Some(Arc::new(AtomicU64::new(1 << 2))));
+        }
+        assert!(tc.take_task().is_none());
+        assert_eq!(KICKS.load(Ordering::SeqCst), 1);
+        assert_eq!(DESTINATIONS.load(Ordering::SeqCst), 1 << 1);
+        crate::arch::set_cpu_id_for_test(1);
+        let (_, task, waker) = tc.try_take_task().unwrap();
+        assert!(task.allowed_on(1));
+        assert_eq!(KICKS.load(Ordering::SeqCst), 2);
+        assert_eq!(DESTINATIONS.load(Ordering::SeqCst), 0b110);
+        waker.mark_borrowed(false);
+        for cpu in [1, 2] {
+            crate::runtime::clear_need_resched(cpu);
+        }
+        crate::runtime::set_resched_ipi_sender(|_| {});
+        crate::runtime::set_executor_ready_mask_for_test(ready);
+        crate::arch::set_cpu_id_for_test(previous);
+    }
+
     /// A mask that allows CPU 1 and not CPU 0, i.e. not us.
     fn pinned_elsewhere() -> Option<Arc<AtomicU64>> {
         Some(Arc::new(AtomicU64::new(1 << 1)))
@@ -1247,18 +1359,9 @@ mod collection_tests {
     /// two threads in a tight `sched_yield(2)` loop and a third waking every
     /// 200 us, all on one CPU. On Linux that sustains ~1M yields/s.
     ///
-    /// The answer this pins down is that **the two yielders do get the CPU**.
-    /// Pass 2 is skipped only in an iteration whose pass-1 snapshot was
-    /// non-empty, and `found_key` is reset at the top of each iteration — so a
-    /// sleeper that is actually asleep between its wakes leaves iterations in
-    /// which pass 1 comes up empty, and those are pass 2's. The strict priority
-    /// between the lanes is not by itself unbounded starvation.
-    ///
-    /// This matters because it is the hypothesis for the `sched_yield()` that
-    /// did not return for 40 minutes, and it says the lane order alone does not
-    /// explain it. Worth keeping as the thing a future change must not break:
-    /// it is the ONLY bound the yielded lane has, and it rests entirely on the
-    /// notified lane going empty.
+    /// The two yielders get service both between the sleeper's wakes and under
+    /// continuously urgent work. The cursor's urgent quota bounds voluntary
+    /// service without relying on the urgent lane ever becoming empty.
     #[test]
     fn two_tight_yielders_still_get_the_cpu_between_a_sleepers_wakes() {
         let _g = crate::runtime::resched_test_lock();
@@ -1800,9 +1903,9 @@ mod collection_tests {
 
     #[test]
     fn a_cpu_with_a_backlog_does_not_advertise_itself_as_empty_while_it_polls() {
-        // The generator empties a page's whole lane in one swap and hands out
-        // one task per resume, so the rest used to live only in a local of a
-        // suspended coroutine. Every figure a peer reads — which tasks can be
+        // The old generator emptied a lane into a suspended coroutine snapshot.
+        // The cursor now leaves every unselected bit published. Every figure
+        // a peer reads — which tasks can be
         // stolen, how loaded this CPU is, whether it may halt — reads the
         // page. A CPU with nine tasks queued therefore told every thief it had
         // nothing, and told spawn placement it was the emptiest CPU on the
@@ -1919,7 +2022,7 @@ mod collection_tests {
     #[test]
     fn a_thief_gives_up_rather_than_spinning_on_a_busy_generator() {
         // The AB-BA this avoids: the thief holds the victim's runtime lock and
-        // spins on its generator; the victim's executor holds that generator
+        // spins on its scheduling cursor; the victim holds that cursor
         // and is interrupted by a timer whose `sched_yield` spins on the
         // runtime lock with interrupts off. Neither can move.
         let tc = TaskCollection::new(0);

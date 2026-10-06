@@ -189,8 +189,8 @@ impl WakerPage {
         raw & !dropped & !borrowed
     }
 
-    /// Return voluntarily-yielded futures, only after urgent notifies are drained
-    /// across the collection (see the generator's two-pass scan).
+    /// Drain the voluntary lane. Collection scheduling instead claims one bit
+    /// at a time, preferring urgent work with a bounded voluntary-service quota.
     pub fn take_yielded(&self) -> u64 {
         let raw = self.yielded.swap(0);
         let dropped = self.dropped.load();
@@ -205,19 +205,11 @@ impl WakerPage {
     /// Put back wakes this CPU has taken out of the lane but not handed to an
     /// executor yet.
     ///
-    /// [`take_notified`] empties the whole lane in one swap, and the generator
-    /// hands out one task per resume — so between the two, every wake it took
-    /// and has not yet yielded lives only in a local of a suspended coroutine.
-    /// The page, which is what `ready_num`, `placement_load`, `has_ready` and
-    /// `debug_pending` all read, says there is nothing there. A CPU with a
-    /// backlog therefore reported **zero** runnable tasks to every thief, for
-    /// as long as it was polling the one task it handed out, and advertised
-    /// itself to spawn placement as the emptiest CPU on the machine. Both
-    /// answers are the exact opposite of the truth, and they are the two
-    /// decisions those figures exist to make.
-    ///
-    /// So park them where everyone can see them, and take them back with
-    /// [`reclaim_notified`] on the way in.
+    /// Compatibility helper for callers that drain a whole lane with
+    /// [`take_notified`]. Detached snapshots must be republished before polling
+    /// so load accounting and thieves can still observe the backlog. The
+    /// collection cursor does not detach snapshots: it uses `peek_lanes` and
+    /// [`reclaim_notified`] to claim only the selected task.
     ///
     /// [`take_notified`]: Self::take_notified
     /// [`reclaim_notified`]: Self::reclaim_notified
@@ -237,10 +229,9 @@ impl WakerPage {
     /// Take back exactly the wakes [`park_notified`] parked, leaving anything
     /// that arrived meanwhile in the lane for the next pass.
     ///
-    /// Masked rather than a second `take_notified`, so parking and reclaiming
-    /// do not change the order tasks come out in: the generator gets back the
-    /// snapshot it was working through and nothing else. It applies the same
-    /// rule [`take_notified`] does to what it takes — a slot that was dropped
+    /// Collection scheduling passes just one freshly selected bit, leaving all
+    /// other work published. Legacy parked snapshots can pass their mask without
+    /// consuming later unrelated wakes. A slot that was dropped
     /// while we were away is gone, and one that was borrowed stays published
     /// so the wake survives the poll in flight.
     ///
@@ -565,7 +556,7 @@ mod waker_page_tests {
         assert_eq!(p.take_notified(), 1 << 7);
         // And nothing in the other lane: `peek` sums the two, so a leftover
         // yielded bit hides there and would hand the slot out a second time
-        // on the generator's second pass.
+        // when the scheduler next considers the voluntary lane.
         assert_eq!(p.take_yielded(), 0);
         assert!(!p.is_borrowed(7));
     }
@@ -788,10 +779,9 @@ mod waker_page_tests {
 
         p.mark_borrowed(31, false);
         p.mark_borrowed(32, false);
-        // Pass 1 of the generator's scan drains `notified`, and pass 2 runs
-        // only when pass 1 came up empty. So this is the whole ordering: the
-        // thread that chose to give up the CPU goes second, the one it was
-        // taken from goes first.
+        // The lanes distinguish voluntary and involuntary wakes. Collection
+        // scheduling normally prefers the urgent one, but also bounds service
+        // of voluntary tasks when urgent work remains continuously runnable.
         assert_eq!(p.take_notified(), 1 << 32);
         assert_eq!(p.take_yielded(), 1 << 31);
     }

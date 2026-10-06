@@ -76,8 +76,8 @@ impl Rng {
 
 /// A transparent wrapper for the shared structures used by the stress tests.
 /// The collection's scheduling cursor and queues are independently locked, so
-/// its cross-thread safety now follows from the field types rather than an
-/// unchecked promise about its suspended coroutine.
+/// its cross-thread safety follows from the field types. This wrapper does not
+/// supply unchecked Send/Sync implementations.
 struct Shared<T>(T);
 
 impl<T> core::ops::Deref for Shared<T> {
@@ -124,9 +124,9 @@ impl OutFlags {
 /// A lane swap hands a bit to exactly one taker, and a wake published *during*
 /// a poll is handed out again once the borrow is released.
 ///
-/// The takers serialize, because that is the contract: `take_notified` is only
-/// ever called from the generator, which holds the collection lock across the
-/// swap *and* the `mark_borrowed` that follows it. The wakers do not
+/// The takers serialize, matching the collection's lock across bitmap claim and
+/// borrow publication. This lower-level test drains a lane with `take_notified`;
+/// the production cursor claims one bit with `reclaim_notified`. The wakers do not
 /// synchronize with anything, because real wakers do not: they are IRQ
 /// handlers and peer CPUs.
 ///
@@ -147,7 +147,7 @@ fn no_wake_is_lost_when_wakers_race_the_poll_they_interrupt() {
         page.initialize(idx);
     }
     let page = StdArc::new(page);
-    // Stands in for the collection lock the generator holds.
+    // Stands in for the collection lock the cursor holds.
     let queue_lock = StdArc::new(Mutex::new(()));
     let flags = StdArc::new(OutFlags::new(SLOTS));
     // Per slot: wakes published and not yet acknowledged by a hand-out. A
@@ -352,10 +352,10 @@ fn a_waker_shared_by_every_cpu_publishes_each_wake_exactly_into_a_lane() {
 /// One owner, two thieves and a reaper on one collection.
 ///
 /// This is the shape the >8s DEADLOCK banner came out of: the owner's
-/// `take_task` blocks on the generator lock, the thieves' `try_take_task` does
-/// not, and the reaper retires tasks underneath both — so a key the generator
-/// published from the page bitmap can be dead by the time its holder looks it
-/// up in the slab. The invariants are that no task is ever checked out twice
+/// `take_task` blocks on the cursor lock, the thieves' `try_take_task` does
+/// not, and the reaper races both. Selection and task cloning now share the
+/// queue lock, so a retired key cannot be looked up as a replacement task.
+/// The invariants are that no task is ever checked out twice
 /// at once, and that `task_num` ends up agreeing with the retirements.
 #[test]
 fn a_task_is_never_checked_out_to_two_executors_at_once() {
@@ -399,7 +399,7 @@ fn a_task_is_never_checked_out_to_two_executors_at_once() {
                 flags.check_in(slot);
                 // One poll in sixteen completes. On `Ready` the borrow bit is
                 // deliberately left SET and `dropped` published first; the
-                // generator's own dropped branch is what frees the slot.
+                // cursor's dropped-entry reap is what frees the slot.
                 if rng.next() & 15 == 0 {
                     retired.fetch_add(1, Ordering::SeqCst);
                     waker.drop_by_ref();
@@ -426,7 +426,7 @@ fn a_task_is_never_checked_out_to_two_executors_at_once() {
         "a task was handed to two executors at once"
     );
 
-    // Let the generator finish retiring whatever is still marked dropped, the
+    // Let the cursor finish retiring whatever is still marked dropped, the
     // way the owning CPU's next pass does.
     while let Some((_key, _task, waker)) = tc.take_task() {
         waker.mark_borrowed(false);
@@ -445,7 +445,7 @@ fn a_task_is_never_checked_out_to_two_executors_at_once() {
 /// A task pinned away from a CPU is never handed to that CPU, however many
 /// thieves are asking.
 ///
-/// Affinity is enforced inside the generator, which runs under the collection
+/// Affinity is enforced by cursor selection, which runs under the collection
 /// lock on whichever CPU resumed it — so the check and the hand-out are one
 /// step. On the host every thread reports `cpu_id() == 0`, so a mask that
 /// excludes CPU 0 must make the queue refuse every single caller.
