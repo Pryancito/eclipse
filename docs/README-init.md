@@ -64,8 +64,10 @@ Dos casillas vacías son decisiones tomadas, no huecos:
 ## Cola, por orden de riesgo
 
 1. **El fallo de una dependencia no se propaga.** Si se da por perdido a
-   `seatd`, labwc arranca igual y cae para siempre contra un socket que nadie
-   va a crear. Un `after =` debería poder ser también un `requires`.
+   `seatd`, labwc arranca igual contra un socket que nadie va a crear: se gasta
+   sus veinte intentos, con la espera acotada de 10 s en cada uno, y acaba
+   también descartado, cuando se sabía desde el primero que no podía funcionar.
+   Un `after =` debería poder ser también un `requires`.
 2. **Los logs de `/tmp` no tienen techo.** Son tmpfs, o sea RAM: un servicio que
    cae en lazo y escribe en cada vuelta se come la memoria de la máquina. Hace
    falta un tope por fichero (lo que hacen `svlogd`, `s6-log` y journald).

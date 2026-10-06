@@ -1426,6 +1426,33 @@ fn overrun_action(waited: Duration, limit: Duration, grace: Duration) -> Overrun
     }
 }
 
+/// Whether [`await_oneshot`] is finished once its own child has been reaped.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Watch {
+    /// Nothing left to do: the child ran to completion on its own.
+    Done,
+    /// The child was reaped while init was terminating it, so keep watching
+    /// its process GROUP: the thing the SIGTERM was for may be a grandchild.
+    Group,
+}
+
+/// What is left to do once the oneshot's own child has been reaped.
+///
+/// A oneshot wrapper that exits leaving a grandchild running is NORMAL here
+/// and deliberately not interfered with -- `eclipse-boot-sound` forks `mpg123`
+/// and exits exactly so init is not held for the length of the track. But once
+/// init has decided the service overran and has SIGTERMed its whole group,
+/// that is no longer the case: a shell that dies on the SIGTERM while a
+/// grandchild ignores it would, if init returned here, leave running precisely
+/// the workload the timeout exists to stop, and skip the promised SIGKILL.
+fn after_child_exit(terminating: bool) -> Watch {
+    if terminating {
+        Watch::Group
+    } else {
+        Watch::Done
+    }
+}
+
 /// Wait for a oneshot's child, bounded by `limit`, and say nothing unless
 /// something is wrong.
 ///
@@ -1439,31 +1466,46 @@ fn await_oneshot(name: &str, pid: i32, limit: Option<Duration>) {
     let start = Instant::now();
     let mut termed = false;
     let mut killed = false;
+    // Set once the child itself has been reaped while init was terminating it:
+    // from then on what is watched is the process group (see
+    // [`after_child_exit`]), because the escalation is not finished.
+    let mut reaped = false;
     loop {
-        let mut status = 0;
-        // SAFETY: pid is a child of ours; WNOHANG so the loop keeps looking.
-        let done = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
-        if done == pid {
-            if libc::WIFEXITED(status) && libc::WEXITSTATUS(status) != 0 {
-                let code = libc::WEXITSTATUS(status);
-                // A oneshot that failed used to be completely silent: nothing
-                // waited on its result and its stdio is its `log =` at best.
-                log(&format!(
-                    "oneshot: {name} failed (exit {code}{})",
-                    exit_note(code)
-                ));
-            } else if libc::WIFSIGNALED(status) && !termed {
-                log(&format!(
-                    "oneshot: {name} was killed by signal {}",
-                    libc::WTERMSIG(status)
-                ));
+        if reaped {
+            // SAFETY: signal 0 only tests whether the group still has members.
+            if unsafe { libc::kill(-pid, 0) } != 0 {
+                // ESRCH: the group is empty, so the escalation worked.
+                return;
             }
-            return;
-        }
-        if done < 0 && errno() != libc::EINTR {
-            // ECHILD: already reaped elsewhere. Anything else is not something
-            // more waiting can fix.
-            return;
+        } else {
+            let mut status = 0;
+            // SAFETY: pid is a child of ours; WNOHANG so the loop keeps looking.
+            let done = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+            if done == pid {
+                if libc::WIFEXITED(status) && libc::WEXITSTATUS(status) != 0 {
+                    let code = libc::WEXITSTATUS(status);
+                    // A oneshot that failed used to be completely silent:
+                    // nothing waited on its result and its stdio is its
+                    // `log =` at best.
+                    log(&format!(
+                        "oneshot: {name} failed (exit {code}{})",
+                        exit_note(code)
+                    ));
+                } else if libc::WIFSIGNALED(status) && !termed {
+                    log(&format!(
+                        "oneshot: {name} was killed by signal {}",
+                        libc::WTERMSIG(status)
+                    ));
+                }
+                match after_child_exit(termed) {
+                    Watch::Done => return,
+                    Watch::Group => reaped = true,
+                }
+            } else if done < 0 && errno() != libc::EINTR {
+                // ECHILD: already reaped elsewhere. Anything else is not
+                // something more waiting can fix.
+                return;
+            }
         }
         if shutdown_requested() {
             return;
@@ -1493,8 +1535,9 @@ fn await_oneshot(name: &str, pid: i32, limit: Option<Duration>) {
             Overrun::Term | Overrun::Kill => {}
             Overrun::Abandon => {
                 log(&format!(
-                    "oneshot: {name} did not die even on SIGKILL (stuck in the kernel?); \
-                     booting on without it"
+                    "oneshot: {name} survived SIGKILL (a process stuck in the kernel, one \
+                     that left its process group, or a zombie in it nobody has reaped \
+                     yet); booting on without it"
                 ));
                 return;
             }
@@ -2917,6 +2960,18 @@ mod tests {
         assert_eq!(at(93), Overrun::Kill);
         assert_eq!(at(94), Overrun::Abandon);
         assert_eq!(at(600), Overrun::Abandon);
+    }
+
+    /// A oneshot wrapper that exits leaving a grandchild running is normal and
+    /// not interfered with (`eclipse-boot-sound` forks `mpg123` and exits on
+    /// purpose). But once init has SIGTERMed the whole group because the
+    /// service overran, a shell that dies on that signal while its grandchild
+    /// ignores it must NOT end the wait: that would leave running exactly the
+    /// workload the timeout exists to stop, and skip the promised SIGKILL.
+    #[test]
+    fn a_reaped_shell_does_not_end_the_wait_once_the_group_is_being_killed() {
+        assert_eq!(after_child_exit(false), Watch::Done);
+        assert_eq!(after_child_exit(true), Watch::Group);
     }
 
     // -- A respawn service that can never work ------------------------------
