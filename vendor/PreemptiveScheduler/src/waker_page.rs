@@ -189,8 +189,8 @@ impl WakerPage {
         raw & !dropped & !borrowed
     }
 
-    /// Return voluntarily-yielded futures, only after urgent notifies are drained
-    /// across the collection (see the generator's two-pass scan).
+    /// Drain the voluntary lane. Collection scheduling instead claims one bit
+    /// at a time, preferring urgent work with a bounded voluntary-service quota.
     pub fn take_yielded(&self) -> u64 {
         let raw = self.yielded.swap(0);
         let dropped = self.dropped.load();
@@ -205,19 +205,11 @@ impl WakerPage {
     /// Put back wakes this CPU has taken out of the lane but not handed to an
     /// executor yet.
     ///
-    /// [`take_notified`] empties the whole lane in one swap, and the generator
-    /// hands out one task per resume — so between the two, every wake it took
-    /// and has not yet yielded lives only in a local of a suspended coroutine.
-    /// The page, which is what `ready_num`, `placement_load`, `has_ready` and
-    /// `debug_pending` all read, says there is nothing there. A CPU with a
-    /// backlog therefore reported **zero** runnable tasks to every thief, for
-    /// as long as it was polling the one task it handed out, and advertised
-    /// itself to spawn placement as the emptiest CPU on the machine. Both
-    /// answers are the exact opposite of the truth, and they are the two
-    /// decisions those figures exist to make.
-    ///
-    /// So park them where everyone can see them, and take them back with
-    /// [`reclaim_notified`] on the way in.
+    /// Compatibility helper for callers that drain a whole lane with
+    /// [`take_notified`]. Detached snapshots must be republished before polling
+    /// so load accounting and thieves can still observe the backlog. The
+    /// collection cursor does not detach snapshots: it uses `peek_lanes` and
+    /// [`reclaim_notified`] to claim only the selected task.
     ///
     /// [`take_notified`]: Self::take_notified
     /// [`reclaim_notified`]: Self::reclaim_notified
@@ -237,10 +229,9 @@ impl WakerPage {
     /// Take back exactly the wakes [`park_notified`] parked, leaving anything
     /// that arrived meanwhile in the lane for the next pass.
     ///
-    /// Masked rather than a second `take_notified`, so parking and reclaiming
-    /// do not change the order tasks come out in: the generator gets back the
-    /// snapshot it was working through and nothing else. It applies the same
-    /// rule [`take_notified`] does to what it takes — a slot that was dropped
+    /// Collection scheduling passes just one freshly selected bit, leaving all
+    /// other work published. Legacy parked snapshots can pass their mask without
+    /// consuming later unrelated wakes. A slot that was dropped
     /// while we were away is gone, and one that was borrowed stays published
     /// so the wake survives the poll in flight.
     ///
@@ -327,6 +318,15 @@ impl WakerPage {
         )
     }
 
+    pub(crate) fn peek_lanes(&self) -> (u64, u64, u64, u64) {
+        (
+            self.notified.load(),
+            self.yielded.load(),
+            self.dropped.load(),
+            self.borrowed.load(),
+        )
+    }
+
     pub fn clear(&self, idx: usize) {
         debug_assert!(idx < 64);
         let mask = !(1 << idx);
@@ -342,6 +342,7 @@ impl WakerPage {
             page: self.clone(),
             idx,
             dropped: dropped.clone(),
+            lifecycle: Arc::new(spin::Mutex::new(())),
         }
     }
 }
@@ -352,6 +353,7 @@ pub struct WakerRef {
     page: Arc<WakerPage>,
     idx: usize,
     dropped: Arc<AtomicBool>,
+    lifecycle: Arc<spin::Mutex<()>>,
 }
 
 impl WakerRef {
@@ -392,6 +394,10 @@ impl WakerRef {
     /// CPU to wake. It also makes the owner's own release free — a CPU that is
     /// executing is never in the sleeping mask.
     pub fn mark_borrowed(&self, borrowed: bool) {
+        let _lifecycle = self.lifecycle.lock();
+        if self.dropped.load(Ordering::SeqCst) {
+            return;
+        }
         self.page.mark_borrowed(self.idx, borrowed);
         if !borrowed && self.page.has_pending_wake(self.idx) {
             crate::runtime::maybe_send_resched_ipi(self.page.owner_cpu);
@@ -440,9 +446,18 @@ impl WakerRef {
     }
 
     pub fn drop_by_ref(&self) {
+        let _lifecycle = self.lifecycle.lock();
         if !self.dropped.swap(true, Ordering::SeqCst) {
             self.page.mark_dropped(self.idx);
         }
+    }
+
+    /// Serializes final page cleanup against old checkout handles. A late
+    /// release/drop must not modify the bitmap after the slot has been reused.
+    pub(crate) fn retire_slot(&self) {
+        let _lifecycle = self.lifecycle.lock();
+        self.dropped.store(true, Ordering::SeqCst);
+        self.page.clear(self.idx);
     }
 }
 
@@ -458,6 +473,7 @@ impl Clone for WakerRef {
             page: self.page.clone(),
             idx: self.idx,
             dropped: self.dropped.clone(),
+            lifecycle: self.lifecycle.clone(),
         }
     }
 }
@@ -479,6 +495,47 @@ impl Clone for WakerRef {
 mod waker_page_tests {
     use super::*;
 
+    #[test]
+    fn retirement_waits_for_old_checkout_writes_before_a_slot_is_reused() {
+        let page = WakerPage::new(0);
+        page.initialize(3);
+        page.mark_borrowed(3, true);
+        let finished = Arc::new(AtomicBool::new(false));
+        let old = Arc::new(page.make_waker(3, &finished));
+        let entered = Arc::new(std::sync::Barrier::new(2));
+        let resume = Arc::new(std::sync::Barrier::new(2));
+        let release_old = old.clone();
+        let release_entered = entered.clone();
+        let release_resume = resume.clone();
+        let release = std::thread::spawn(move || {
+            let _lifecycle = release_old.lifecycle.lock();
+            release_entered.wait();
+            release_resume.wait();
+            release_old.page.mark_borrowed(3, false);
+        });
+        entered.wait();
+        let retire_entered = Arc::new(std::sync::Barrier::new(2));
+        let retired = Arc::new(AtomicBool::new(false));
+        let retire_old = old.clone();
+        let retire_barrier = retire_entered.clone();
+        let retire_done = retired.clone();
+        let retire = std::thread::spawn(move || {
+            retire_barrier.wait();
+            retire_old.retire_slot();
+            retire_done.store(true, Ordering::Release);
+        });
+        retire_entered.wait();
+        assert!(!retired.load(Ordering::Acquire));
+        resume.wait();
+        release.join().unwrap();
+        retire.join().unwrap();
+        page.initialize(3);
+        page.mark_borrowed(3, true);
+        old.mark_borrowed(false);
+        old.drop_by_ref();
+        assert_eq!(page.peek(), (1 << 3, 0, 1 << 3));
+    }
+
     fn page() -> Arc<WakerPage> {
         WakerPage::new(0)
     }
@@ -499,7 +556,7 @@ mod waker_page_tests {
         assert_eq!(p.take_notified(), 1 << 7);
         // And nothing in the other lane: `peek` sums the two, so a leftover
         // yielded bit hides there and would hand the slot out a second time
-        // on the generator's second pass.
+        // when the scheduler next considers the voluntary lane.
         assert_eq!(p.take_yielded(), 0);
         assert!(!p.is_borrowed(7));
     }
@@ -722,10 +779,9 @@ mod waker_page_tests {
 
         p.mark_borrowed(31, false);
         p.mark_borrowed(32, false);
-        // Pass 1 of the generator's scan drains `notified`, and pass 2 runs
-        // only when pass 1 came up empty. So this is the whole ordering: the
-        // thread that chose to give up the CPU goes second, the one it was
-        // taken from goes first.
+        // The lanes distinguish voluntary and involuntary wakes. Collection
+        // scheduling normally prefers the urgent one, but also bounds service
+        // of voluntary tasks when urgent work remains continuously runnable.
         assert_eq!(p.take_notified(), 1 << 32);
         assert_eq!(p.take_yielded(), 1 << 31);
     }

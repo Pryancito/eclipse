@@ -157,6 +157,21 @@ pub fn end_timer_callback() {
     *cell.get_mut() = cell.get().saturating_sub(1);
 }
 
+/// Discard every nested timer callback when abandoning its entire call chain.
+///
+/// # Safety
+/// Interrupts must be disabled; no abandoned callback may return afterwards.
+pub unsafe fn abandon_timer_callbacks() {
+    // Faults can arrive with user GS active. Never use its block publisher here.
+    #[cfg(test)]
+    let cpu = this_cpu_id();
+    #[cfg(not(test))]
+    let cpu = lock::current_cpu_id_via_apic() as usize;
+    if cpu < MAX_CORE_NUM {
+        *PERCPU[cpu].timer_callback_depth.get_mut() = 0;
+    }
+}
+
 /// Backing storage for every CPU's block, indexed by dense logical CPU id.
 ///
 /// Used both as cross-CPU storage and as the fallback for [`current`] before the
@@ -546,6 +561,46 @@ mod tests {
             "the depth wrapped to u32::MAX, so this CPU reports itself inside a \
              timer callback for the rest of the boot"
         );
+    }
+
+    #[test]
+    fn abandoning_a_chain_clears_all_timer_nesting_only_on_its_cpu() {
+        as_cpu(17);
+        begin_timer_callback();
+        begin_timer_callback();
+        as_cpu(18);
+        begin_timer_callback();
+        as_cpu(17);
+        unsafe { abandon_timer_callbacks() };
+        assert!(!in_timer_callback());
+        begin_timer_callback();
+        end_timer_callback();
+        assert!(
+            !in_timer_callback(),
+            "the abandoned depth survived the next tick"
+        );
+        as_cpu(18);
+        assert!(
+            in_timer_callback(),
+            "another CPU's callback depth was cleared"
+        );
+        end_timer_callback();
+    }
+
+    #[test]
+    fn abandoning_timer_callbacks_does_not_trust_the_published_gs_block() {
+        as_cpu(19);
+        begin_timer_callback();
+        // Simulate a user/corrupted GS publisher naming a valid *other* block.
+        as_cpu(20);
+        begin_timer_callback();
+        host::set_cpu_id(19);
+        host::publish_ptr(&PERCPU[20] as *const PercpuBlock);
+        unsafe { abandon_timer_callbacks() };
+        assert_eq!(*PERCPU[19].timer_callback_depth.get(), 0);
+        assert_eq!(*PERCPU[20].timer_callback_depth.get(), 1);
+        as_cpu(20);
+        end_timer_callback();
     }
 
     #[test]

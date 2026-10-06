@@ -424,6 +424,14 @@ pub fn note_timer_cb(data: u64, vtable: u64) {
     }
 }
 
+/// Clear the abandoned callback's diagnostic record without consulting GS.
+pub fn clear_timer_cb_after_abandon() {
+    if let Some(cpu) = fault_slot() {
+        TIMER_CB_DATA[cpu].store(0, Relaxed);
+        TIMER_CB_VTABLE[cpu].store(0, Relaxed);
+    }
+}
+
 /// `(data, vtable)` of the timer callback the calling CPU is inside, or (0,0).
 pub fn current_timer_cb() -> (u64, u64) {
     let cpu = crate::cpu::cpu_id() as usize;
@@ -635,7 +643,7 @@ pub fn note_nmi_rip(rip: u64) {
 /// which is false with more than one core: EVERY page fault on EVERY cpu stores
 /// here, so an ordinary fault elsewhere overwrites the slot between a panicking
 /// cpu's store and `oops`'s read. That is not only a wrong diagnostic line --
-/// `oops` feeds `last_fault_rsp()` to `fault_sp_abandonable` to decide whether
+/// `oops` feeds `current_fault_rsp()` to `fault_sp_abandonable` to decide whether
 /// a fault can be isolated, so a clobbered value turns a containable panic into
 /// "cannot isolate -- halting". Observed exactly that: a #DF stored
 /// 0xffffff002127fa30 and `oops` read back 0xffffff0020e7f1f0, a stack
@@ -644,6 +652,56 @@ static FAULT_RIP: [AtomicU64; MAX_CORE_NUM] = [const { AtomicU64::new(0) }; MAX_
 static FAULT_RBP: [AtomicU64; MAX_CORE_NUM] = [const { AtomicU64::new(0) }; MAX_CORE_NUM];
 static FAULT_RSP: [AtomicU64; MAX_CORE_NUM] = [const { AtomicU64::new(0) }; MAX_CORE_NUM];
 static FAULT_CS: [AtomicU64; MAX_CORE_NUM] = [const { AtomicU64::new(0) }; MAX_CORE_NUM];
+static ACTIVE_FAULT_RSP: [AtomicU64; MAX_CORE_NUM] = [const { AtomicU64::new(0) }; MAX_CORE_NUM];
+
+/// Keeps fault-stack provenance valid only while its trap handler is active.
+#[must_use]
+pub struct FaultScope {
+    cpu: Option<usize>,
+    previous_rsp: u64,
+    _not_send: core::marker::PhantomData<*mut ()>,
+}
+
+impl FaultScope {
+    fn enter(cpu: Option<usize>, rsp: u64, cs: u64) -> Self {
+        let kernel_rsp = if cs != 0 && cs & 3 == 0 { rsp } else { 0 };
+        let previous_rsp = cpu.map_or(0, |cpu| ACTIVE_FAULT_RSP[cpu].swap(kernel_rsp, Relaxed));
+        Self {
+            cpu,
+            previous_rsp,
+            _not_send: core::marker::PhantomData,
+        }
+    }
+}
+
+impl Drop for FaultScope {
+    fn drop(&mut self) {
+        if let Some(cpu) = self.cpu {
+            ACTIVE_FAULT_RSP[cpu].store(self.previous_rsp, Relaxed);
+        }
+    }
+}
+
+/// The kernel stack pointer of the currently active fault, never historic regs.
+///
+/// Independent of the diagnostic exception summary, which the panic reporter
+/// consumes before attempting containment. Nested handled faults restore the
+/// outer fault's provenance when their scope ends.
+pub fn current_fault_rsp() -> Option<u64> {
+    let rsp = ACTIVE_FAULT_RSP[fault_slot()?].load(Relaxed);
+    (rsp != 0).then_some(rsp)
+}
+
+/// Forget all fault scopes when their entire call chain is being abandoned.
+///
+/// # Safety
+/// Interrupts must be disabled and none of this CPU's active fault scopes may
+/// subsequently return or run their destructors.
+pub unsafe fn abandon_fault_scopes() {
+    if let Some(cpu) = fault_slot() {
+        ACTIVE_FAULT_RSP[cpu].store(0, Relaxed);
+    }
+}
 
 /// Index for the per-CPU fault slots; `None` past `MAX_CORE_NUM`, where storing
 /// would be out of bounds and reading would be another cpu's data.
@@ -672,13 +730,18 @@ pub fn note_fault_rip(rip: u64) {
 /// `memset`). Stored alongside the RIP by the arch trap entry. `cs` is the
 /// hardware CS at the fault: ring 0 vs ring 3 is how a kernel EXECUTE to a
 /// userspace RIP is told apart from a real user #PF.
-pub fn note_fault_regs(rip: u64, rbp: u64, rsp: u64, cs: u64) {
-    if let Some(cpu) = fault_slot() {
+///
+/// Keep the returned scope alive until the trap handler returns. Diagnostic
+/// registers persist, but containment provenance expires with this scope.
+pub fn note_fault_regs(rip: u64, rbp: u64, rsp: u64, cs: u64) -> FaultScope {
+    let cpu = fault_slot();
+    if let Some(cpu) = cpu {
         FAULT_RIP[cpu].store(rip, Relaxed);
         FAULT_RBP[cpu].store(rbp, Relaxed);
         FAULT_RSP[cpu].store(rsp, Relaxed);
         FAULT_CS[cpu].store(cs, Relaxed);
     }
+    FaultScope::enter(cpu, rsp, cs)
 }
 
 /// [diag] The CPU exception a panic is about to report, so the panic handler
@@ -929,6 +992,62 @@ mod tests {
     use spin::Mutex;
 
     static SERIAL: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn handled_fault_registers_are_not_current_fault_provenance() {
+        let _guard = SERIAL.lock();
+        assert_eq!(current_fault_rsp(), None);
+        {
+            let _fault = note_fault_regs(0x1000, 0x2000, 0x3000, 8);
+            assert_eq!(current_fault_rsp(), Some(0x3000));
+        }
+        assert_eq!(last_fault_rsp(), 0x3000);
+        assert_eq!(current_fault_rsp(), None);
+    }
+
+    #[test]
+    fn nested_faults_restore_provenance_and_user_faults_do_not_authorize_it() {
+        let _guard = SERIAL.lock();
+        let outer = note_fault_regs(0x1000, 0x2000, 0x3000, 8);
+        {
+            let _inner = note_fault_regs(0x4000, 0x5000, 0x6000, 8);
+            assert_eq!(current_fault_rsp(), Some(0x6000));
+        }
+        assert_eq!(current_fault_rsp(), Some(0x3000));
+        {
+            let _user = note_fault_regs(0x4000, 0x5000, 0x6000, 0x23);
+            assert_eq!(current_fault_rsp(), None);
+        }
+        assert_eq!(current_fault_rsp(), Some(0x3000));
+        drop(outer);
+        assert_eq!(current_fault_rsp(), None);
+    }
+
+    #[test]
+    fn consuming_exception_summary_does_not_consume_active_trap_provenance() {
+        let _guard = SERIAL.lock();
+        let _fault = note_fault_regs(0x1000, 0x2000, 0x3000, 8);
+        note_exception(13, 0, 0x1000);
+        assert_eq!(take_exception(), Some((13, 0, 0x1000)));
+        assert_eq!(take_exception(), None);
+        assert_eq!(current_fault_rsp(), Some(0x3000));
+    }
+
+    #[test]
+    fn abandoning_the_chain_discards_all_fault_provenance() {
+        let _guard = SERIAL.lock();
+        let outer = note_fault_regs(0x1000, 0x2000, 0x3000, 8);
+        let inner = note_fault_regs(0x4000, 0x5000, 0x6000, 8);
+        // Model the nonreturning switch: neither scope's destructor will run.
+        core::mem::forget(inner);
+        core::mem::forget(outer);
+        unsafe { abandon_fault_scopes() };
+        assert_eq!(current_fault_rsp(), None);
+        let subsequent = note_fault_regs(0x7000, 0x8000, 0x9000, 8);
+        assert_eq!(current_fault_rsp(), Some(0x9000));
+        drop(subsequent);
+        assert_eq!(current_fault_rsp(), None);
+    }
 
     /// The per-CPU slot the calling thread's `note_*` calls land in, or `None`
     /// when this host's id is past the table (the `note_*` helpers check the

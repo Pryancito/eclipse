@@ -1305,7 +1305,7 @@ SIGNALS:
     SIGUSR1               Pause/resume the animation
     SIGTERM, SIGINT       Exit cleanly";
 
-#[derive(Default)]
+#[derive(Default, Debug, PartialEq)]
 struct Cli {
     fps: Option<u32>,
     static_: bool,
@@ -1322,58 +1322,81 @@ fn cli_die(msg: &str) -> ! {
     std::process::exit(2);
 }
 
+/// What the command line asked for: a run, or one of the two flags that print
+/// and stop.
+#[derive(Debug, PartialEq)]
+enum Parsed {
+    Run(Cli),
+    Help,
+    Version,
+}
+
 fn parse_args() -> Cli {
+    match parse_args_from(std::env::args().skip(1)) {
+        Ok(Parsed::Run(cli)) => cli,
+        Ok(Parsed::Help) => {
+            println!("{USAGE}");
+            std::process::exit(0);
+        }
+        Ok(Parsed::Version) => {
+            println!("lunarbg {}", env!("CARGO_PKG_VERSION"));
+            std::process::exit(0);
+        }
+        Err(why) => cli_die(&why),
+    }
+}
+
+/// The whole grammar, with the arguments handed in and the exits lifted out.
+///
+/// Its own function because [`parse_args`] reads `std::env::args()` and ends in
+/// `process::exit` on every error and on `--help`: from a test there is no way
+/// to hand it a line, and no way to see what it rejected. The printing and the
+/// exiting stay in the wrapper; everything that decides anything is here.
+fn parse_args_from<I: Iterator<Item = String>>(args: I) -> Result<Parsed, String> {
     let mut cli = Cli::default();
-    let mut args = std::env::args().skip(1).peekable();
+    let mut args = args.peekable();
     while let Some(arg) = args.next() {
         // Accept both "--opt value" and "--opt=value".
         let (flag, inline) = match arg.split_once('=') {
             Some((f, v)) => (f.to_string(), Some(v.to_string())),
             None => (arg, None),
         };
-        let value = |args: &mut std::iter::Peekable<_>| -> String {
+        let value = |args: &mut std::iter::Peekable<I>| -> Result<String, String> {
             inline
                 .clone()
                 .or_else(|| args.next())
-                .unwrap_or_else(|| cli_die(&format!("option {flag} needs a value")))
+                .ok_or_else(|| format!("option {flag} needs a value"))
         };
         match flag.as_str() {
             "-f" | "--fps" => {
-                let v = value(&mut args);
+                let v = value(&mut args)?;
                 cli.fps = match v.parse() {
                     Ok(f) if (1..=60).contains(&f) => Some(f),
-                    _ => cli_die(&format!("invalid --fps '{v}' (expected 1..=60)")),
+                    _ => return Err(format!("invalid --fps '{v}' (expected 1..=60)")),
                 };
             }
             "-s" | "--static" | "-q" | "--quiet" | "-h" | "--help" | "-V" | "--version"
                 if inline.is_some() =>
             {
-                cli_die(&format!("option {flag} takes no value"))
+                return Err(format!("option {flag} takes no value"))
             }
             "-s" | "--static" => cli.static_ = true,
             "-a" | "--aspect" => {
-                let v = value(&mut args);
-                cli.aspect = Some(
-                    scene::parse_aspect(&v)
-                        .unwrap_or_else(|| cli_die(&format!("invalid --aspect '{v}'"))),
-                );
+                let v = value(&mut args)?;
+                cli.aspect =
+                    Some(scene::parse_aspect(&v).ok_or_else(|| format!("invalid --aspect '{v}'"))?);
             }
-            "-o" | "--output" => cli.outputs.push(value(&mut args)),
+            "-o" | "--output" => cli.outputs.push(value(&mut args)?),
             "-q" | "--quiet" => cli.quiet = true,
-            "--dump" => cli.dump = Some(value(&mut args)),
+            "--dump" => cli.dump = Some(value(&mut args)?),
             "--dump-ms" => {
-                let v = value(&mut args);
-                cli.dump_ms = Some(
-                    v.parse()
-                        .unwrap_or_else(|_| cli_die(&format!("invalid --dump-ms '{v}'"))),
-                );
+                let v = value(&mut args)?;
+                cli.dump_ms = Some(v.parse().map_err(|_| format!("invalid --dump-ms '{v}'"))?);
             }
             "--bench" => {
                 // Optional count: "--bench 500", "--bench=500" or bare.
                 cli.bench = Some(match inline.clone() {
-                    Some(v) => v
-                        .parse()
-                        .unwrap_or_else(|_| cli_die(&format!("invalid --bench '{v}'"))),
+                    Some(v) => v.parse().map_err(|_| format!("invalid --bench '{v}'"))?,
                     None => match args.peek().and_then(|n| n.parse().ok()) {
                         Some(n) => {
                             args.next();
@@ -1383,18 +1406,12 @@ fn parse_args() -> Cli {
                     },
                 });
             }
-            "-h" | "--help" => {
-                println!("{USAGE}");
-                std::process::exit(0);
-            }
-            "-V" | "--version" => {
-                println!("lunarbg {}", env!("CARGO_PKG_VERSION"));
-                std::process::exit(0);
-            }
-            other => cli_die(&format!("unknown option '{other}'")),
+            "-h" | "--help" => return Ok(Parsed::Help),
+            "-V" | "--version" => return Ok(Parsed::Version),
+            other => return Err(format!("unknown option '{other}'")),
         }
     }
-    cli
+    Ok(Parsed::Run(cli))
 }
 
 /// `--dump`: render one animation frame offscreen to a raw XRGB8888 file.
@@ -2037,6 +2054,331 @@ mod tests {
                 "a buffer ceiling is compared by hand again ({spelled}); \
                  use fill_guard::check_buffer"
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+
+    /// The command line as a shell would split it.
+    fn parse(line: &[&str]) -> Result<Parsed, String> {
+        parse_args_from(line.iter().map(|s| s.to_string()))
+    }
+
+    /// The `Cli` a line asks for, or the error it was rejected with.
+    fn run(line: &[&str]) -> Cli {
+        match parse(line) {
+            Ok(Parsed::Run(cli)) => cli,
+            other => panic!("{line:?} did not ask for a run: {other:?}"),
+        }
+    }
+
+    fn err(line: &[&str]) -> String {
+        match parse(line) {
+            Err(why) => why,
+            other => panic!("{line:?} was accepted: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_empty_line_is_the_default_wallpaper() {
+        // What eclipse-init starts: no flags at all. Everything unset, so the
+        // defaults live where they are documented (24 fps, every output,
+        // animated) and not in this parser.
+        assert_eq!(run(&[]), Cli::default());
+        let cli = Cli::default();
+        assert_eq!(cli.fps, None);
+        assert!(!cli.static_);
+        assert!(!cli.quiet);
+        assert_eq!(cli.aspect, None);
+        assert!(cli.outputs.is_empty(), "no -o paints every output");
+        assert_eq!(cli.dump, None);
+        assert_eq!(cli.dump_ms, None);
+        assert_eq!(cli.bench, None);
+    }
+
+    #[test]
+    fn every_option_is_reached_by_both_of_its_spellings() {
+        // The table nobody walks: twelve arms, each with a short and a long
+        // form, and a missing one is a flag that is silently an "unknown
+        // option" -- which on this client means the wallpaper never starts and
+        // the desktop comes up black.
+        assert_eq!(run(&["-f", "30"]).fps, Some(30));
+        assert_eq!(run(&["--fps", "30"]).fps, Some(30));
+        assert!(run(&["-s"]).static_);
+        assert!(run(&["--static"]).static_);
+        assert!(run(&["-q"]).quiet);
+        assert!(run(&["--quiet"]).quiet);
+        assert_eq!(run(&["-a", "16:9"]).aspect, Some(16.0 / 9.0));
+        assert_eq!(run(&["--aspect", "16:9"]).aspect, Some(16.0 / 9.0));
+        assert_eq!(run(&["-o", "HDMI-A-1"]).outputs, ["HDMI-A-1"]);
+        assert_eq!(run(&["--output", "HDMI-A-1"]).outputs, ["HDMI-A-1"]);
+        assert_eq!(
+            run(&["--dump", "/tmp/f.raw"]).dump.as_deref(),
+            Some("/tmp/f.raw")
+        );
+        assert_eq!(run(&["--dump-ms", "1500"]).dump_ms, Some(1500));
+        assert_eq!(run(&["--bench", "50"]).bench, Some(50));
+        assert_eq!(parse(&["-h"]), Ok(Parsed::Help));
+        assert_eq!(parse(&["--help"]), Ok(Parsed::Help));
+        assert_eq!(parse(&["-V"]), Ok(Parsed::Version));
+        assert_eq!(parse(&["--version"]), Ok(Parsed::Version));
+    }
+
+    #[test]
+    fn a_value_can_be_attached_with_an_equals_or_be_the_next_word() {
+        // Both forms, for every option that takes a value: the `=` form is
+        // what a `.desktop` Exec line and a script tend to carry, the spaced
+        // one is what a person types.
+        assert_eq!(run(&["--fps=30"]).fps, run(&["--fps", "30"]).fps);
+        assert_eq!(run(&["-f=30"]).fps, Some(30));
+        assert_eq!(run(&["--aspect=4:3"]).aspect, Some(4.0 / 3.0));
+        assert_eq!(run(&["--output=DP-1"]).outputs, ["DP-1"]);
+        assert_eq!(
+            run(&["--dump=/tmp/a.raw"]).dump.as_deref(),
+            Some("/tmp/a.raw")
+        );
+        assert_eq!(run(&["--dump-ms=7"]).dump_ms, Some(7));
+        assert_eq!(run(&["--bench=12"]).bench, Some(12));
+        // A value that itself contains an `=` keeps all of it: only the FIRST
+        // `=` splits, so a path or a name with one in it survives.
+        assert_eq!(
+            run(&["--dump=/tmp/a=b.raw"]).dump.as_deref(),
+            Some("/tmp/a=b.raw")
+        );
+        assert_eq!(run(&["--output=odd=name"]).outputs, ["odd=name"]);
+    }
+
+    #[test]
+    fn a_flag_that_takes_no_value_refuses_one() {
+        // `--static=1` is the shape someone reaches for coming from another
+        // wallpaper client. Taken silently it would set `static_` and swallow
+        // the "1", which is not wrong by itself -- but `--quiet=0` would then
+        // mean quiet, the opposite of what was typed.
+        for line in [
+            &["-s=1"][..],
+            &["--static=1"],
+            &["--static=0"],
+            &["-q=1"],
+            &["--quiet=0"],
+            &["-h=1"],
+            &["--help=1"],
+            &["-V=1"],
+            &["--version=x"],
+        ] {
+            let why = err(line);
+            assert!(why.contains("takes no value"), "{line:?}: {why}");
+        }
+    }
+
+    #[test]
+    fn an_option_whose_value_is_missing_is_an_error_and_not_a_default() {
+        // The last word on the line, with nothing after it. Reading one off
+        // the end used to be the same `unwrap_or_else`, and what it must not
+        // become is a silent default: `--dump` with no path would write a
+        // frame somewhere nobody asked for.
+        for line in [
+            &["--fps"][..],
+            &["-f"],
+            &["--aspect"],
+            &["-a"],
+            &["--output"],
+            &["-o"],
+            &["--dump"],
+            &["--dump-ms"],
+        ] {
+            let why = err(line);
+            assert!(why.contains("needs a value"), "{line:?}: {why}");
+            assert!(why.contains(line[0]), "{line:?} is not named in: {why}");
+        }
+        // `--bench` is the exception, and deliberately: its count is optional.
+        assert_eq!(run(&["--bench"]).bench, Some(300));
+    }
+
+    #[test]
+    fn the_frame_rate_is_held_inside_the_range_the_usage_promises() {
+        // 1..=60 inclusive at both ends. Zero would divide by zero in the
+        // frame timer, and a rate above the refresh just burns a CPU the
+        // compositor's frame callbacks already cap.
+        assert_eq!(run(&["--fps", "1"]).fps, Some(1));
+        assert_eq!(run(&["--fps", "60"]).fps, Some(60));
+        for v in ["0", "61", "-1", "1000", "", "24.5", "24fps", "abc", " 24"] {
+            let why = err(&["--fps", v]);
+            assert!(why.contains("invalid --fps"), "--fps {v:?}: {why}");
+            assert!(why.contains("1..=60"), "the range is not named: {why}");
+        }
+    }
+
+    #[test]
+    fn an_aspect_is_only_taken_in_the_forms_the_scene_understands() {
+        // Shares `scene::parse_aspect` with `$LUNARBG_ASPECT`, so the two
+        // cannot drift. What matters here is that a rejected ratio is an
+        // error: taken as a default it would letterbox the wallpaper with no
+        // word about why.
+        assert_eq!(run(&["-a", "1.778"]).aspect, Some(1.778));
+        for v in ["", "16:", ":9", "16:0", "wide", "16/9", "0"] {
+            let why = err(&["-a", v]);
+            assert!(why.contains("invalid --aspect"), "-a {v:?}: {why}");
+        }
+    }
+
+    #[test]
+    fn the_output_flag_adds_to_a_list_instead_of_replacing_it() {
+        // "repeat the flag for several", as the usage says: a second `-o`
+        // overwriting the first would paint one of two screens and leave the
+        // other black, which is exactly the bug the flag exists to avoid.
+        let cli = run(&["-o", "HDMI-A-1", "--output", "DP-1", "-o=DP-2"]);
+        assert_eq!(cli.outputs, ["HDMI-A-1", "DP-1", "DP-2"]);
+        // In the order given, because that is the order the frames are built
+        // in, and the same name twice is kept: a caller's mistake, not ours to
+        // silently swallow.
+        assert_eq!(run(&["-o", "DP-1", "-o", "DP-1"]).outputs, ["DP-1", "DP-1"]);
+    }
+
+    #[test]
+    fn the_bench_count_is_optional_without_eating_the_next_flag() {
+        // The one arm that peeks ahead. It must take a count that follows and
+        // leave anything else alone: eating a following `--quiet` would run
+        // the bench and drop the flag, and eating a `--dump` path would run a
+        // bench instead of writing the frame that was asked for.
+        assert_eq!(run(&["--bench"]).bench, Some(300), "the documented default");
+        assert_eq!(run(&["--bench", "500"]).bench, Some(500));
+        assert_eq!(run(&["--bench=500"]).bench, Some(500));
+        let cli = run(&["--bench", "--quiet"]);
+        assert_eq!(cli.bench, Some(300), "the flag was eaten as a count");
+        assert!(cli.quiet, "--quiet was swallowed by --bench");
+        let cli = run(&["--bench", "--dump", "/tmp/f.raw"]);
+        assert_eq!(cli.bench, Some(300));
+        assert_eq!(cli.dump.as_deref(), Some("/tmp/f.raw"));
+        // A count that is not a number, attached, is an error rather than a
+        // silent 300: `--bench=5OO` would otherwise time a different run from
+        // the one that was asked for.
+        assert!(err(&["--bench=5OO"]).contains("invalid --bench"));
+        // Spaced, it is not a count at all, so it falls through to being the
+        // next argument -- and an unknown one.
+        assert!(err(&["--bench", "5OO"]).contains("unknown option"));
+    }
+
+    #[test]
+    fn an_unknown_option_stops_the_client_and_says_which_one() {
+        // eclipse-init respawns lunarbg, so a flag it does not know has to
+        // fail loudly and once: accepted and ignored, a typo in the respawn
+        // line would mean a wallpaper that is quietly not what was configured.
+        for v in ["--fsp", "-x", "--outputs", "--Static", "-F", "--dump_ms"] {
+            let why = err(&[v]);
+            assert!(why.contains("unknown option"), "{v}: {why}");
+            assert!(why.contains(v), "{v} is not named in: {why}");
+        }
+        // A bare word is not a positional argument either: this client takes
+        // none, and a path left over from another wallpaper client's line
+        // would otherwise be silently ignored.
+        assert!(err(&["/usr/share/wallpaper.png"]).contains("unknown option"));
+        // And the error is raised where it is met, so the flags before it do
+        // not half-apply on their way to an exit.
+        assert!(err(&["--quiet", "--nope"]).contains("'--nope'"));
+    }
+
+    #[test]
+    fn a_whole_line_is_read_in_one_pass() {
+        // Every arm at once, in the order a script would write them, because
+        // the parser threads one iterator through all of them: a flag that
+        // consumed one word too many would shift everything after it.
+        let cli = run(&[
+            "--fps=30",
+            "-s",
+            "-a",
+            "16:10",
+            "-o",
+            "HDMI-A-1",
+            "-o",
+            "DP-1",
+            "-q",
+            "--dump",
+            "/tmp/f.raw",
+            "--dump-ms=2000",
+            "--bench",
+            "7",
+        ]);
+        assert_eq!(cli.fps, Some(30));
+        assert!(cli.static_);
+        assert_eq!(cli.aspect, Some(1.6));
+        assert_eq!(cli.outputs, ["HDMI-A-1", "DP-1"]);
+        assert!(cli.quiet);
+        assert_eq!(cli.dump.as_deref(), Some("/tmp/f.raw"));
+        assert_eq!(cli.dump_ms, Some(2000));
+        assert_eq!(cli.bench, Some(7));
+        // The last of two of the same single-valued flag wins, which is what a
+        // wrapper script appending an override relies on.
+        assert_eq!(run(&["--fps=30", "--fps=45"]).fps, Some(45));
+        assert_eq!(run(&["--dump=/a", "--dump=/b"]).dump.as_deref(), Some("/b"));
+    }
+
+    #[test]
+    fn help_and_version_win_wherever_they_appear_on_the_line() {
+        // They print and exit, so nothing after them runs: a `--help` behind a
+        // bad flag must still print the usage rather than the error that would
+        // send someone looking for a problem they do not have. And a `--help`
+        // in front of one must not be overridden by it.
+        assert_eq!(parse(&["--quiet", "--help"]), Ok(Parsed::Help));
+        assert_eq!(parse(&["--help", "--nope"]), Ok(Parsed::Help));
+        assert_eq!(parse(&["--version", "--nope"]), Ok(Parsed::Version));
+        assert_eq!(parse(&["-s", "-V", "--help"]), Ok(Parsed::Version));
+        // But a flag BEFORE them that is itself broken still loses: it is met
+        // first, and silently running with a bad --fps is worse than saying so.
+        assert!(parse(&["--fps=0", "--help"]).is_err());
+    }
+
+    #[test]
+    fn the_usage_text_names_every_flag_the_parser_accepts() {
+        // The usage is the only documentation this client has, and it is a
+        // separate string from the match arms: a flag added to one and not the
+        // other is either undocumented or a promise the parser breaks.
+        for flag in [
+            "-f",
+            "--fps",
+            "-s",
+            "--static",
+            "-a",
+            "--aspect",
+            "-o",
+            "--output",
+            "-q",
+            "--quiet",
+            "--dump",
+            "--dump-ms",
+            "--bench",
+            "-h",
+            "--help",
+            "-V",
+            "--version",
+        ] {
+            assert!(USAGE.contains(flag), "{flag} is not in the usage text");
+            // And each of them is a flag the parser knows: a value is given
+            // after it so the ones that need one get it, and what is checked
+            // is only that the FLAG itself was not the thing rejected (the
+            // spare "1" after a `-s` is reported as unknown, and rightly).
+            let got = parse(&[flag, "1"]);
+            assert!(
+                !matches!(&got, Err(why) if why.contains(&format!("unknown option '{flag}'"))),
+                "{flag} is documented but not accepted: {got:?}"
+            );
+        }
+        // The signals it reacts to are documented too: they are the only way
+        // to pause the animation or stop it cleanly.
+        assert!(USAGE.contains("SIGUSR1"));
+        assert!(USAGE.contains("SIGTERM"));
+        // And the environment variables, which are the other half of the
+        // interface: every flag with one has it named beside it.
+        for env in [
+            "LUNARBG_FPS",
+            "LUNARBG_STATIC",
+            "LUNARBG_ASPECT",
+            "LUNARBG_DUMP",
+            "LUNARBG_DUMP_MS",
+        ] {
+            assert!(USAGE.contains(env), "{env} is not in the usage text");
         }
     }
 }

@@ -10,7 +10,6 @@
 	.balign 4
 executor_entry:
 	ld a0, 0(sp)
-	addi sp, sp, 8
+	addi sp, sp, 16
 	j run_executor
-
 

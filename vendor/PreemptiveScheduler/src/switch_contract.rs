@@ -24,6 +24,15 @@
 //! must contain and why, so a rewrite that still honours it passes and one
 //! that quietly drops the invalidation does not.
 
+#[path = "arch/aarch64/context.rs"]
+mod aarch64_context;
+#[path = "arch/riscv64/context.rs"]
+mod riscv64_context;
+#[path = "arch/x86_64/context.rs"]
+mod x86_64_context;
+
+use core::mem::{offset_of, size_of, size_of_val};
+
 /// Where each architecture's `ContextData` keeps its page-base register, and
 /// how big the struct is -- the two numbers its `switch.S` spells out.
 struct Layout {
@@ -43,23 +52,23 @@ const LAYOUTS: [Layout; 3] = [
         // two slots the last-instant dead-frame check reads.
         arch: "x86_64",
         source: include_str!("arch/x86_64/switch.S"),
-        pgbr_offset: 0,
-        size: 64,
+        pgbr_offset: offset_of!(x86_64_context::ContextData, cr3),
+        size: size_of::<x86_64_context::ContextData>(),
     },
     Layout {
         // `{ra, sp, s[12], satp}`.
         arch: "riscv64",
         source: include_str!("arch/riscv64/switch.S"),
-        pgbr_offset: 112,
-        size: 120,
+        pgbr_offset: offset_of!(riscv64_context::ContextData, satp),
+        size: size_of::<riscv64_context::ContextData>(),
     },
     Layout {
-        // `{s[11], lr, sp, ttbr0}`. The save side walks backwards from the end
+        // `{s[11], lr, sp, ttbr0, d[8]}`. The save side walks backwards from the end
         // of the struct, which is why the size appears in the file at all.
         arch: "aarch64",
         source: include_str!("arch/aarch64/switch.S"),
-        pgbr_offset: 104,
-        size: 112,
+        pgbr_offset: offset_of!(aarch64_context::ContextData, ttbr0),
+        size: size_of::<aarch64_context::ContextData>(),
     },
 ];
 
@@ -74,8 +83,14 @@ fn instructions(source: &str) -> alloc::string::String {
             None => line,
         };
         let code = match code.find('#') {
-            // `#112` is an immediate, `# Context switch` is a comment.
-            Some(i) if !code[i + 1..].starts_with(|c: char| c.is_ascii_digit()) => &code[..i],
+            // `#112` and `#-16` are immediates, `# Context switch` is a comment.
+            Some(i)
+                if !code[i + 1..]
+                    .trim_start_matches('-')
+                    .starts_with(|c: char| c.is_ascii_digit()) =>
+            {
+                &code[..i]
+            }
             _ => code,
         };
         out.push_str(code);
@@ -257,7 +272,8 @@ mod tests {
         let code = instructions(
             "        // tlbi    vaae1is, x10 is what this used to be\n\
              # Context switch\n\
-             \x20       add     x0, x0, #112\n",
+             \x20       add     x0, x0, #112\n\
+             \x20       stp     x19, x20, [x0, #-16]!\n",
         );
         assert!(!code.contains("vaae1is"), "a `//` comment survived");
         assert!(!code.contains("Context switch"), "a `#` comment survived");
@@ -265,14 +281,11 @@ mod tests {
             code.contains("#112"),
             "an immediate was taken for a comment"
         );
+        assert!(code.contains("#-16"), "a signed immediate was stripped");
     }
 
     #[test]
-    fn aarch64_executor_entry_realigns_sp_before_the_call() {
-        // `init_stack_and_context` pushes one usize under a 16-byte-aligned
-        // top. AAPCS64 faults a `run_executor` entry whose SP is 8 (mod 16)
-        // when stack-alignment checking is on. x86_64 pops the word; riscv64
-        // adds 8. Adding 16 on aarch64 would put SP in the top guard.
+    fn aarch64_executor_entry_consumes_the_aligned_startup_slot() {
         let code = instructions(include_str!("arch/aarch64/executor_entry.S"));
         let lines: Vec<&str> = code
             .lines()
@@ -280,14 +293,128 @@ mod tests {
             .filter(|s| !s.is_empty())
             .collect();
         let load = lines.iter().position(|s| *s == "ldr x0, [sp]");
-        let adjust = lines.iter().position(|s| *s == "add x9, sp, #8");
-        let mov = lines.iter().position(|s| *s == "mov sp, x9");
+        let adjust = lines.iter().position(|s| *s == "add sp, sp, #16");
         let branch = lines.iter().position(|s| *s == "b run_executor");
-        match (load, adjust, mov, branch) {
-            (Some(load), Some(adjust), Some(mov), Some(branch)) => {
-                assert!(load < adjust && adjust < mov && mov < branch);
+        match (load, adjust, branch) {
+            (Some(load), Some(adjust), Some(branch)) => {
+                assert!(load < adjust && adjust < branch);
             }
-            _ => panic!("aarch64 executor_entry does not realign SP: {:?}", lines),
+            _ => panic!(
+                "aarch64 executor_entry does not consume its slot: {:?}",
+                lines
+            ),
         }
+    }
+
+    #[test]
+    fn riscv64_executor_entry_consumes_the_aligned_startup_slot() {
+        let code = instructions(include_str!("arch/riscv64/executor_entry.S"));
+        let load = code.find("ld a0, 0(sp)").unwrap();
+        let adjust = code.find("addi sp, sp, 16").unwrap();
+        let branch = code.find("j run_executor").unwrap();
+        assert!(load < adjust && adjust < branch);
+    }
+
+    #[test]
+    fn startup_slot_keeps_sp_aligned_and_its_argument_below_the_top() {
+        let mut stack = [0u128; 4];
+        let top = stack.as_mut_ptr() as usize + size_of_val(&stack);
+        let arg = 0x1234usize;
+        let sp = unsafe { crate::executor::push_stack(top, [arg, 0usize]) };
+        assert_eq!(sp % 16, 0);
+        assert_eq!(sp + 16, top);
+        assert_eq!(unsafe { *(sp as *const usize) }, arg);
+        let source = include_str!("executor.rs");
+        let init = source.split("fn init_stack_and_context").nth(1).unwrap();
+        let init = init.split("#[inline(never)]").next().unwrap();
+        assert!(init.contains("push_stack(stack_top, [self_addr, 0usize])"));
+    }
+
+    #[test]
+    fn all_integer_register_slots_match_the_rust_fields() {
+        let x86 = [
+            offset_of!(x86_64_context::ContextData, cr3),
+            offset_of!(x86_64_context::ContextData, r15),
+            offset_of!(x86_64_context::ContextData, r14),
+            offset_of!(x86_64_context::ContextData, r13),
+            offset_of!(x86_64_context::ContextData, r12),
+            offset_of!(x86_64_context::ContextData, rbp),
+            offset_of!(x86_64_context::ContextData, rbx),
+            offset_of!(x86_64_context::ContextData, rip),
+        ];
+        for (i, offset) in x86.iter().enumerate() {
+            assert_eq!(*offset, i * 8);
+        }
+        let code = instructions(LAYOUTS[0].source);
+        let pushes: Vec<&str> = code
+            .lines()
+            .map(str::trim)
+            .filter(|s| s.starts_with("push "))
+            .collect();
+        assert_eq!(
+            pushes,
+            ["push rbx", "push rbp", "push r12", "push r13", "push r14", "push r15", "push r15"]
+        );
+
+        let rv = instructions(LAYOUTS[1].source);
+        let mut slots = alloc::vec![
+            ("ra".into(), offset_of!(riscv64_context::ContextData, ra)),
+            ("sp".into(), offset_of!(riscv64_context::ContextData, sp)),
+        ];
+        for i in 0..12 {
+            slots.push((
+                format!("s{}", i),
+                offset_of!(riscv64_context::ContextData, s) + i * 8,
+            ));
+        }
+        for (reg, offset) in slots {
+            assert!(rv.contains(&format!("sd {}, {}(a0)", reg, offset)));
+            assert!(rv.contains(&format!("ld {}, {}(a1)", reg, offset)));
+        }
+
+        let arm = instructions(LAYOUTS[2].source);
+        let saves: Vec<&str> = arm
+            .lines()
+            .map(str::trim)
+            .filter(|s| s.starts_with("stp "))
+            .collect();
+        assert_eq!(saves.len() * 16, LAYOUTS[2].size);
+        for i in 0..5 {
+            let save = format!("stp     x{}, x{}, [x0, #-16]!", 19 + i * 2, 20 + i * 2);
+            assert_eq!(saves[saves.len() - i - 1], save);
+        }
+        assert_eq!(offset_of!(aarch64_context::ContextData, s), 0);
+        assert_eq!(offset_of!(aarch64_context::ContextData, lr), 88);
+        assert_eq!(offset_of!(aarch64_context::ContextData, sp), 96);
+        assert_eq!(saves[4], "stp     x3, x2, [x0, #-16]!");
+        assert_eq!(saves[5], "stp     x29, x30, [x0, #-16]!");
+    }
+
+    #[test]
+    fn aarch64_preserves_every_abi_saved_fp_register_at_its_real_offset() {
+        let code = instructions(LAYOUTS[2].source);
+        let saves: Vec<&str> = code
+            .lines()
+            .map(str::trim)
+            .filter(|s| s.starts_with("stp "))
+            .collect();
+        let base = offset_of!(aarch64_context::ContextData, d);
+        for i in 0..4 {
+            let offset = base + i * 16;
+            let first = 8 + i * 2;
+            assert_eq!(LAYOUTS[2].size - (4 - i) * 16, offset);
+            assert_eq!(
+                saves[3 - i],
+                format!("stp     d{}, d{}, [x0, #-16]!", first, first + 1)
+            );
+            assert!(code.contains(&format!(
+                "ldp     d{}, d{}, [x1, #{}]",
+                first,
+                first + 1,
+                offset
+            )));
+        }
+        let context = aarch64_context::ContextData::new(1, 2, 3);
+        assert_eq!(context.d, [0; 8]);
     }
 }
