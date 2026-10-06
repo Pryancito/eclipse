@@ -98,6 +98,15 @@ jobs:
           # adds a module: this run covers everything the bare one did, and
           # every other job in the file builds the crate without it.
           cargo test -p linux-object --lib --features mock-disk -- --test-threads=1
+          # The reference benchmarks (`benches/`). COMPILED, not run: a
+          # benchmark takes tens of seconds per row and its figures are
+          # meaningless on a shared runner, but a bench target that nothing
+          # builds rots silently and is then a day's archaeology on the
+          # morning somebody needs a before/after. `--no-run` costs seconds
+          # and keeps them honest. Run them for real with
+          # `cargo bench -p <crate> --bench <name> --features <...>`.
+          cargo bench -p linux-object --bench vfs --features mock-disk --no-run
+          cargo bench -p zircon-object --bench vm --features libos,aspace-separate --no-run
           # Three more crates whose unit tests `default-members` hid the same
           # way: the syscall entry points, the HAL (user-pointer copies, CPU
           # stats) and the anomaly detector.
