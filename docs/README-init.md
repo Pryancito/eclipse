@@ -10,7 +10,9 @@ montar los pseudo-sistemas que falten, arrancar lo declarado en
 señales de busybox.
 
 Las claves de un `.service` son `exec`, `type` (`oneshot` | `respawn`),
-`after`, `wait_socket`, `wait_path`, `desktop`, `cmdline`, `log` y `timeout`.
+`after`, `requires`, `wait_socket`, `wait_path`, `desktop`, `cmdline`, `log` y
+`timeout`. Están documentadas en el propio `example.service.txt` que la imagen
+publica en `/etc/eclipse/services/`.
 
 ## Comparación honesta
 
@@ -22,7 +24,7 @@ Las claves de un `.service` son `exec`, `type` (`oneshot` | `respawn`),
 | **Límite de tiempo al arrancar** | `TimeoutStartSec` 90 s | no | `timeout-up` | sí | `ExitTimeOut` | obligatorio | **sí (90 s, `timeout =`)** |
 | Orden por dependencias | sí | no | sí | sí | no | sí | sí (`after =`, topológico) |
 | Espera de *readiness* | `Type=notify` | no | *fd* de notificación | no | *socket activation* | no | sondeo de socket/ruta acotado |
-| Propagación del fallo de una dependencia | sí | — | sí | sí | no | sí | **no** |
+| Propagación del fallo de una dependencia | `Requires=` | — | sí | sí | no | sí | **sí (`requires =`)** |
 | Límite del tamaño de los logs | journald | `svlogd` | `s6-log` | logrotate | sí | sí | **no** (tmpfs = RAM) |
 | Matar lo que quede al parar un servicio | cgroup | grupo de procesos | grupo de procesos | sí | sí | contrato | solo en el `timeout` de un `oneshot` |
 | Apagado ordenado | sí | sí | sí | sí | sí | sí | **no, a propósito** (ver abajo) |
@@ -61,22 +63,44 @@ Dos casillas vacías son decisiones tomadas, no huecos:
    en encontrar su dependencia se descarta. Una sola vuelta sana reinicia la
    cuenta.
 
+## Lo que se cerró en la segunda tanda
+
+**El fallo de una dependencia se propaga.** `after =` solo ordenaba; ahora hay
+`requires =`, el `Requires=` de systemd. Cuando init da por perdido un servicio
+para el resto del arranque (su `exec =` no existe, o se ha pasado del límite de
+caídas), todo lo que lo requiere se descarta también, en cadena y diciéndolo una
+vez por servicio. Antes, con `seatd` descartado, labwc gastaba sus veinte
+intentos pagando la puerta de 10 s en cada uno contra un socket que nadie iba a
+crear, y detrás lunarbar y lunarbg hacían lo mismo: tres servicios llenando la
+consola con sus muertes en vez del único fallo que importaba.
+
+Dos cosas por las que no es el `Requires=` de systemd tal cual:
+
+- **`requires =` implica `after =`.** En systemd son independientes, y la trampa
+  que deja es una unidad que requiere a otra sin estar ordenada detrás, así que
+  arranca a su lado. Aquí no se puede escribir.
+- **Un requisito que no es un servicio de este arranque se ignora**, igual que
+  lo ignora el orden topológico. Una sesión que no trae esa dependencia no
+  pierde por eso todo lo que va detrás.
+
+Lo llevan los ocho pares en los que no es una opinión: el servicio espera en
+`wait_socket` justamente el socket que crea el otro (labwc → seatd, lunarbar /
+lunarbg / xkbmap → labwc, dbus-selftest → dbus) o no tiene sentido sin él
+(boot-sound → pulseaudio). Un test de `xtask` fija esa lista y otro comprueba
+que ningún `requires =` nombra un servicio que la imagen no escriba, porque un
+nombre mal escrito ahí sería silencioso.
+
 ## Cola, por orden de riesgo
 
-1. **El fallo de una dependencia no se propaga.** Si se da por perdido a
-   `seatd`, labwc arranca igual contra un socket que nadie va a crear: se gasta
-   sus veinte intentos, con la espera acotada de 10 s en cada uno, y acaba
-   también descartado, cuando se sabía desde el primero que no podía funcionar.
-   Un `after =` debería poder ser también un `requires`.
-2. **Los logs de `/tmp` no tienen techo.** Son tmpfs, o sea RAM: un servicio que
+1. **Los logs de `/tmp` no tienen techo.** Son tmpfs, o sea RAM: un servicio que
    cae en lazo y escribe en cada vuelta se come la memoria de la máquina. Hace
    falta un tope por fichero (lo que hacen `svlogd`, `s6-log` y journald).
-3. **PID 1 puede morir de un `panic!`.** El perfil de release es
+2. **PID 1 puede morir de un `panic!`.** El perfil de release es
    `panic = "abort"`, así que cualquier `panic` en init es un kernel panic
    («Attempted to kill init»). Hay que elegir: quitar los `unwrap`/`expect` de
    las rutas vivas, o compilar con `unwind` y envolver el lazo de supervisión en
    un `catch_unwind` que lo registre y siga.
-4. **Durante las esperas acotadas del arranque no se cosecha a nadie.** Los hijos
+3. **Durante las esperas acotadas del arranque no se cosecha a nadie.** Los hijos
    que mueran en esos segundos se quedan zombis hasta que se llega al lazo. Es
    cosmético, pero hay que arreglarlo con cuidado: un `waitpid(-1)` suelto ahí
    dentro le robaría al lazo la muerte de un `respawn` y ese servicio no se
