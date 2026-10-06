@@ -4478,16 +4478,14 @@ static int heap_anon_cycle_op(void) {
                             -1, 0);
     if (p == MAP_FAILED)
         return 1;
-    if (!g_anon_populate) {
-        for (size_t off = 0; off < g_anon_bytes; off += 4096)
-            p[off] = 1;
-    } else {
-        // MAP_POPULATE promises the pages are already there. Touch one so the
-        // row is not measuring a mapping nobody ever used -- and so a kernel
-        // that accepted the flag and ignored it still shows its faults here
-        // rather than silently reporting a cheaper number.
-        p[0] = 1;
-    }
+    // BOTH variants touch every page, and that is the whole point of the
+    // pair. Touching only one page under MAP_POPULATE would let a kernel that
+    // accepted the flag and ignored it report the throughput of a 1 MiB
+    // mapping while having faulted 4 KiB -- the missing work would look like
+    // speed. With both loops identical, the only difference left is WHERE the
+    // population happened: inside `mmap` or on the accesses.
+    for (size_t off = 0; off < g_anon_bytes; off += 4096)
+        p[off] = 1;
     munmap(p, g_anon_bytes);
     return 0;
 }
@@ -4642,13 +4640,22 @@ static int sig_pending_release_op(void) {
     if (sigprocmask(SIG_BLOCK, &block, &old) != 0)
         return 1;
     sig_atomic_t before = g_sig_count;
-    if (kill(getpid(), SIGUSR1) != 0)
+    // Every failure below has to put the mask back before returning. A probe
+    // that gives up with SIGUSR1 still blocked leaves the whole process that
+    // way, and `fork` copies the mask: the signal peer started later would
+    // then never run its handler, so the parent would wait for an answer that
+    // cannot come. A lost sample is cheap; a wedged suite is not.
+    if (kill(getpid(), SIGUSR1) != 0) {
+        sigprocmask(SIG_SETMASK, &old, NULL);
         return 1;
+    }
     // Still blocked: the handler must NOT have run yet. If it did, the mask is
     // not being honoured and the row would otherwise report a plausible number
     // for a broken mechanism.
-    if (g_sig_count != before)
+    if (g_sig_count != before) {
+        sigprocmask(SIG_SETMASK, &old, NULL);
         return 1;
+    }
     if (sigprocmask(SIG_SETMASK, &old, NULL) != 0)
         return 1;
     return g_sig_count != before ? 0 : 1;
@@ -4672,6 +4679,34 @@ static void sig_child_handler(int sig) {
     char c = 'a';
     ssize_t w = write(g_sigpeer.from_child[1], &c, 1);
     (void)w;
+}
+
+// A read bounded by a deadline. Every wait on the signal peer goes through
+// this: the suite's outer time limit is checked between samples and cannot
+// interrupt a blocking read, so an answer that never arrives would hang the
+// whole run rather than cost one row its number.
+static int sig_read_bounded(int fd, char *out, int ms) {
+    struct pollfd pfd;
+    pfd.fd = fd;
+    pfd.events = POLLIN;
+    for (;;) {
+        int r = poll(&pfd, 1, ms);
+        if (r == 0)
+            return 0; // timed out: no answer
+        if (r < 0) {
+            if (errno == EINTR)
+                continue; // our own probe's signals land here
+            return -1;
+        }
+        ssize_t n = read(fd, out, 1);
+        if (n == 1)
+            return 1;
+        if (n == 0)
+            return -1; // peer gone
+        if (errno == EINTR || errno == EAGAIN)
+            continue;
+        return -1;
+    }
 }
 
 static int sig_peer_start(struct sig_peer *p) {
@@ -4700,6 +4735,16 @@ static int sig_peer_start(struct sig_peer *p) {
         // straight back to sleep and the loop below would answer once and
         // then stop, which reads as a hang rather than as a measurement.
         sigaction(SIGUSR1, &sa, NULL);
+        // Announce readiness only once the handler is installed. The child
+        // inherits the parent's SIGUSR1 handler across `fork`, and that one
+        // answers nothing: a signal arriving before this point would be
+        // swallowed and the parent would wait for a reply that never comes.
+        // A fixed sleep in the parent cannot rule that out on a loaded box.
+        {
+            char ready = 'r';
+            ssize_t w = write(p->from_child[1], &ready, 1);
+            (void)w;
+        }
         char c2;
         // Park until the parent closes the pipe. Every signal interrupts this
         // read, runs the handler (which answers), and the loop goes round.
@@ -4720,6 +4765,18 @@ static int sig_peer_start(struct sig_peer *p) {
 static void sig_peer_stop(struct sig_peer *p) {
     close(p->to_child[1]);
     close(p->from_child[0]);
+    // Closing the pipe is the child's cue to exit, but a child wedged
+    // anywhere else would make this `waitpid` the hang the bounded reads
+    // above were there to prevent. Give it a moment, then make sure.
+    for (int i = 0; i < 20; i++) {
+        int st;
+        pid_t r = waitpid(p->pid, &st, WNOHANG);
+        if (r == p->pid || (r < 0 && errno != EINTR))
+            return;
+        struct timespec tick = {0, 5 * 1000 * 1000};
+        nanosleep(&tick, NULL);
+    }
+    kill(p->pid, SIGKILL);
     int st;
     waitpid(p->pid, &st, 0);
 }
@@ -4729,21 +4786,37 @@ static double sig_cross_process_ns(uint64_t budget_ns) {
     memset(&p, 0, sizeof p);
     if (sig_peer_start(&p) != 0)
         return NA;
-    // Give the child time to reach its `read` before the clock starts.
-    struct timespec settle = {0, 20 * 1000 * 1000};
-    nanosleep(&settle, NULL);
+    // Wait for the child's readiness byte rather than for a fixed interval:
+    // the clock must not start, and no signal must be sent, until its handler
+    // is installed. A short settle after that lets it reach the `read` it
+    // parks in, which is a property of the row (a signal to a SLEEPING task)
+    // and not of the handshake.
     char ack;
+    if (sig_read_bounded(p.from_child[0], &ack, 2000) != 1) {
+        sig_peer_stop(&p);
+        return NA;
+    }
+    struct timespec settle = {0, 5 * 1000 * 1000};
+    nanosleep(&settle, NULL);
     uint64_t t0 = now_ns(), elapsed = 0, ops = 0;
+    int lost = 0;
     while ((elapsed < budget_ns || ops < MIN_SAMPLES) && elapsed < g_max_ns) {
         if (kill(p.pid, SIGUSR1) != 0)
             break;
-        if (read(p.from_child[0], &ack, 1) != 1)
+        // One second is four orders of magnitude above the figure this row
+        // reports, so a timeout means the answer is not coming -- a lost
+        // signal, a handler that did not run -- and the row says n/a.
+        if (sig_read_bounded(p.from_child[0], &ack, 1000) != 1) {
+            lost = 1;
             break;
+        }
         ops++;
         elapsed = now_ns() - t0;
     }
     sig_peer_stop(&p);
     g_last_ops = ops;
+    if (lost)
+        return NA;
     return ops >= MIN_SAMPLES ? (double)elapsed / (double)ops : NA;
 }
 
@@ -4900,18 +4973,20 @@ static int sig_altstack_verdict(void) {
 // `wait for a child` and every "pause until told" loop is built on it, and
 // unlike the rows above the process really has to be put to sleep and woken,
 // so this is the signal path's wake-up latency rather than its delivery cost.
+//
+// The timer is armed ONE SHOT per sample, and each return is measured against
+// its own expiry. An interval timer would not do: it keeps its original
+// schedule rather than waiting another period after each handler returns, so
+// N wakes each late by L take about N periods plus L in total, and dividing by
+// N would report L/N. That figure shrinks as more samples are taken and moves
+// with `--budget`, which is the signature of a number that is not a latency.
 static double sig_suspend_ns(uint64_t budget_ns) {
-    struct sig_peer p;
-    memset(&p, 0, sizeof p);
-    sigset_t block, old, waitmask;
+    static const uint64_t period_ns = 1000000ull; // 1 ms per sample
+    sigset_t block, old, waitmask, pending_only;
     sigemptyset(&block);
-    sigaddset(&block, SIGUSR1);
+    sigaddset(&block, SIGALRM);
     if (sigprocmask(SIG_BLOCK, &block, &old) != 0)
         return NA;
-    sigemptyset(&waitmask);
-    // A child that signals us on a timer would need a schedule of its own; the
-    // simpler construction is to arm our own interval timer and suspend until
-    // it fires, which measures the same sleep and wake.
     struct sigaction sa, old_sa;
     memset(&sa, 0, sizeof sa);
     sa.sa_handler = sig_count_handler;
@@ -4919,36 +4994,56 @@ static double sig_suspend_ns(uint64_t budget_ns) {
         sigprocmask(SIG_SETMASK, &old, NULL);
         return NA;
     }
-    sigset_t ablock;
-    sigemptyset(&ablock);
-    sigaddset(&ablock, SIGALRM);
-    sigprocmask(SIG_BLOCK, &ablock, NULL);
     sigemptyset(&waitmask); // suspend with everything unblocked
-    struct itimerval it;
-    memset(&it, 0, sizeof it);
-    it.it_value.tv_usec = 1000;
-    it.it_interval.tv_usec = 1000; // 1 ms: short enough to collect samples
-    uint64_t t0 = now_ns(), elapsed = 0, ops = 0;
-    if (setitimer(ITIMER_REAL, &it, NULL) == 0) {
-        while ((elapsed < budget_ns || ops < MIN_SAMPLES) &&
-               elapsed < g_max_ns) {
-            sigsuspend(&waitmask); // always returns -1/EINTR after delivery
-            ops++;
-            elapsed = now_ns() - t0;
-        }
+    sigemptyset(&pending_only);
+    sigaddset(&pending_only, SIGALRM);
+
+    uint64_t t0 = now_ns(), elapsed = 0, ops = 0, acc = 0;
+    int broken = 0;
+    while ((elapsed < budget_ns || ops < MIN_SAMPLES) && elapsed < g_max_ns) {
+        struct itimerval it;
         memset(&it, 0, sizeof it);
-        setitimer(ITIMER_REAL, &it, NULL);
+        it.it_value.tv_usec = (suseconds_t)(period_ns / 1000);
+        // it_interval stays zero: one shot, re-armed below for the next
+        // sample, so each measurement has an expiry of its own.
+        uint64_t armed = now_ns();
+        if (setitimer(ITIMER_REAL, &it, NULL) != 0) {
+            broken = 1;
+            break;
+        }
+        sigsuspend(&waitmask); // returns -1/EINTR once the handler has run
+        uint64_t back = now_ns();
+        uint64_t took = back - armed;
+        if (took < period_ns) {
+            // Woken before the timer could have fired: something else was
+            // delivered, or the timer did not wait. Either way this is not a
+            // sample of what the row claims to measure.
+            broken = 1;
+            break;
+        }
+        acc += took - period_ns;
+        ops++;
+        elapsed = now_ns() - t0;
+    }
+
+    // Disarm, then consume a SIGALRM that fired between the last return and
+    // the disarm. It is still blocked here; restoring the old disposition with
+    // one pending would deliver it to that handler, which for `--only sig` is
+    // SIG_DFL -- and the default action for SIGALRM terminates the process.
+    struct itimerval off;
+    memset(&off, 0, sizeof off);
+    setitimer(ITIMER_REAL, &off, NULL);
+    for (;;) {
+        struct timespec zero = {0, 0};
+        if (sigtimedwait(&pending_only, NULL, &zero) < 0)
+            break; // EAGAIN: nothing left pending
     }
     sigaction(SIGALRM, &old_sa, NULL);
     sigprocmask(SIG_SETMASK, &old, NULL);
-    (void)p;
-    if (!ops)
+    if (broken || ops < MIN_SAMPLES)
         return NA;
     g_last_ops = ops;
-    // Each iteration is one 1 ms timer period plus the wake; reporting the
-    // overshoot rather than the period is what isolates the kernel's part.
-    double per = (double)elapsed / (double)ops;
-    return per - 1000000.0 > 0 ? per - 1000000.0 : per;
+    return (double)acc / (double)ops;
 }
 
 // ---------------------------------------------------------------------------
@@ -5002,6 +5097,8 @@ struct fx_herd {
     volatile int stop;
     volatile int started;   // waiters that reached their first wait
     volatile int parked;    // waiters currently inside FUTEX_WAIT
+    volatile int eagain;    // waits that never blocked (the word had changed)
+    volatile int unsupported; // the kernel refused FUTEX_WAIT outright
     int nwaiters;
     int broadcast;          // wake all rather than one
     volatile int done;
@@ -5020,13 +5117,29 @@ static void *fx_waiter(void *arg) {
         // not got back yet. Without that the driver cannot know how long the
         // queue it is about to wake really is.
         __atomic_fetch_add(&h->parked, 1, __ATOMIC_ACQ_REL);
-        futex_op(&h->word, ECL_FUTEX_WAIT, 0);
+        long rc = futex_op(&h->word, ECL_FUTEX_WAIT, 0);
+        int err = rc < 0 ? errno : 0;
         __atomic_fetch_sub(&h->parked, 1, __ATOMIC_ACQ_REL);
         if (__atomic_load_n(&h->stop, __ATOMIC_ACQUIRE))
             break;
-        // Whoever woke bumps the token so the driver can see progress. Several
-        // may do it on a broadcast; the driver only needs one.
-        __atomic_fetch_add(&h->token, 1, __ATOMIC_ACQ_REL);
+        if (rc == 0) {
+            // Woken by a FUTEX_WAKE: this is the one case worth telling the
+            // driver about, so it bumps the token. Several may do it on a
+            // broadcast; the driver only needs the count it asked for.
+            __atomic_fetch_add(&h->token, 1, __ATOMIC_ACQ_REL);
+        } else if (err == EAGAIN) {
+            // The word had already changed when the kernel looked, so this
+            // thread was NEVER in the queue and no wake reached it.
+            // Acknowledging here would credit a FUTEX_WAKE that woke nobody,
+            // and the row would report a wake it never measured. The driver
+            // reads this counter to tell that race apart from a lost wake-up.
+            __atomic_fetch_add(&h->eagain, 1, __ATOMIC_ACQ_REL);
+        } else if (err == ENOSYS || err == EINVAL || err == EOPNOTSUPP) {
+            // Not a sample and not a race: the operation does not exist here.
+            __atomic_store_n(&h->unsupported, 1, __ATOMIC_RELEASE);
+            break;
+        }
+        // EINTR and anything else: retry without acknowledging.
         // Then SLEEP until the driver clears the word, instead of diving back
         // into FUTEX_WAIT. While the word is set, FUTEX_WAIT returns EAGAIN
         // without blocking, so a loop here would spin hot on a CPU -- and with
@@ -5084,7 +5197,20 @@ static double futex_wake_of_n(int n, int broadcast, int issue_only,
         }
         made++;
     }
-    if (made == 0) {
+    // A partial herd would be measured and then labelled with the number of
+    // waiters the CALLER asked for, so a row reading `64 parked` could be a
+    // queue of three and the queue-length ratio would be meaningless. The
+    // threads already created are released by the teardown below.
+    if (made != n) {
+        __atomic_store_n(&h->stop, 1, __ATOMIC_RELEASE);
+        __atomic_store_n(&h->word, 1, __ATOMIC_RELEASE);
+        for (int round = 0; round < 8; round++) {
+            futex_op(&h->word, ECL_FUTEX_WAKE, made > 0 ? made : 1);
+            struct timespec tick = {0, 5 * 1000 * 1000};
+            nanosleep(&tick, NULL);
+        }
+        for (int i = 0; i < made; i++)
+            pthread_detach(th[i]);
         CTL_DROP(h);
         return NA;
     }
@@ -5102,8 +5228,9 @@ static double futex_wake_of_n(int n, int broadcast, int issue_only,
     nanosleep(&settle, NULL);
 
     uint64_t t0 = now_ns(), elapsed = 0, ops = 0, acc = 0;
-    int stalled = 0;
+    int stalled = 0, retries = 0;
     while ((elapsed < budget_ns || ops < MIN_SAMPLES) && elapsed < g_max_ns) {
+        int eagain_before = __atomic_load_n(&h->eagain, __ATOMIC_ACQUIRE);
         // Put the queue back to `made` before starting the clock. The sleep
         // matters: with more waiters than CPUs, a driver spinning on this
         // barrier is one of the threads the re-parking waiter is waiting for.
@@ -5142,13 +5269,31 @@ static double futex_wake_of_n(int n, int broadcast, int issue_only,
         }
         uint64_t observed = now_ns();
         __atomic_store_n(&h->word, 0, __ATOMIC_RELEASE);
-        if (stalled)
+        if (__atomic_load_n(&h->unsupported, __ATOMIC_ACQUIRE)) {
+            stalled = 1;
             break;
+        }
+        if (stalled) {
+            // Nobody answered. If a waiter reported EAGAIN during this
+            // iteration it was our own race -- it had left the queue before
+            // the wake -- so drop the sample and try again, up to a few
+            // times. With no EAGAIN the wake really did go missing, which is
+            // a result and not a retry: the row says n/a.
+            int now_eagain = __atomic_load_n(&h->eagain, __ATOMIC_ACQUIRE);
+            if (now_eagain != eagain_before && retries < 8) {
+                retries++;
+                stalled = 0;
+                elapsed = now_ns() - t0;
+                continue;
+            }
+            break;
+        }
         acc += issue_only ? (issued - a) : (observed - a);
         ops++;
         elapsed = now_ns() - t0;
     }
-    double ns = (ops && !stalled) ? (double)acc / (double)ops : NA;
+    double ns = (ops >= MIN_SAMPLES && !stalled) ? (double)acc / (double)ops
+                                                 : NA;
 
     // Release the herd: set stop, then wake everyone with the word non-zero so
     // nobody parks again, and abandon any thread that does not come back.
@@ -5280,7 +5425,20 @@ static double futex_cond_wake_of_n(int n, int broadcast, uint64_t budget_ns) {
         }
         made++;
     }
-    if (made == 0) {
+    // As with the futex herd: a group smaller than the label is a row that
+    // reports the wrong queue length, and the signal and broadcast runs could
+    // even end up with different-sized groups, which would make their ratio
+    // a comparison of two different experiments.
+    if (made != n) {
+        pthread_mutex_lock(&c->m);
+        c->stop = 1;
+        c->seq++;
+        pthread_cond_broadcast(&c->cv);
+        pthread_mutex_unlock(&c->m);
+        struct timespec drain = {0, 50 * 1000 * 1000};
+        nanosleep(&drain, NULL);
+        for (int i = 0; i < made; i++)
+            pthread_detach(th[i]);
         CTL_DROP(c);
         return NA;
     }
@@ -5293,9 +5451,16 @@ static double futex_cond_wake_of_n(int n, int broadcast, uint64_t budget_ns) {
     struct timespec settle = {0, 20 * 1000 * 1000};
     nanosleep(&settle, NULL);
 
-    // One signal (or broadcast) per iteration, waiting until at least one
-    // waiter has acknowledged, so the figure includes the handover and not
-    // just the syscall.
+    // One signal (or broadcast) per iteration, waiting for as many
+    // acknowledgements as the wake was supposed to produce: all of them on a
+    // broadcast, one on a signal. Breaking out after the first ack on a
+    // broadcast would start the next iteration while the other waiters were
+    // still handling the previous one, so later broadcasts would face shorter
+    // queues and their acks would be credited to the wrong iteration -- which
+    // is the whole quantity the `broadcast / signal` ratio is about. Each
+    // waiter acks exactly once per sequence number, holding the mutex, so the
+    // counter is enough to enforce it.
+    uint64_t want_acks = broadcast ? (uint64_t)made : 1;
     uint64_t t0 = now_ns(), elapsed = 0, ops = 0;
     int stalled = 0;
     while ((elapsed < budget_ns || ops < MIN_SAMPLES) && elapsed < g_max_ns) {
@@ -5312,7 +5477,7 @@ static double futex_cond_wake_of_n(int n, int broadcast, uint64_t budget_ns) {
             pthread_mutex_lock(&c->m);
             uint64_t now = c->acks;
             pthread_mutex_unlock(&c->m);
-            if (now != before)
+            if (now - before >= want_acks)
                 break;
             if (now_ns() > wd) {
                 stalled = 1;
@@ -5324,7 +5489,8 @@ static double futex_cond_wake_of_n(int n, int broadcast, uint64_t budget_ns) {
         ops++;
         elapsed = now_ns() - t0;
     }
-    double ns = (ops && !stalled) ? (double)elapsed / (double)ops : NA;
+    double ns = (ops >= MIN_SAMPLES && !stalled) ? (double)elapsed / (double)ops
+                                                 : NA;
 
     pthread_mutex_lock(&c->m);
     c->stop = 1;
@@ -5397,19 +5563,53 @@ static double futex_sem_rt_ns(uint64_t budget_ns) {
     struct timespec settle = {0, 20 * 1000 * 1000};
     nanosleep(&settle, NULL);
     uint64_t t0 = now_ns(), elapsed = 0, ops = 0;
+    int lost = 0;
     while ((elapsed < budget_ns || ops < MIN_SAMPLES) && elapsed < g_max_ns) {
         sem_post(&g_fx_sem_a);
-        if (sem_wait(&g_fx_sem_b) != 0 && errno != EINTR)
+        // A bounded wait, for two reasons. A plain `sem_wait` cannot be cut
+        // short by the suite's outer time limit, so a peer that died or a wake
+        // that went missing would hang the whole run instead of costing this
+        // one row its number. And EINTR must be RETRIED rather than counted:
+        // treating it as a completed round trip without consuming a reply
+        // leaves one unanswered, and from there every later iteration is
+        // answered by the previous one's reply -- requests and replies out of
+        // step, with a number that still looks reasonable.
+        struct timespec until;
+        clock_gettime(CLOCK_REALTIME, &until); // sem_timedwait's own clock
+        until.tv_sec += 2;
+        int got = 0;
+        for (;;) {
+            if (sem_timedwait(&g_fx_sem_b, &until) == 0) {
+                got = 1;
+                break;
+            }
+            if (errno == EINTR)
+                continue; // the sig section's timers land here
+            break;        // ETIMEDOUT or worse: no answer is coming
+        }
+        if (!got) {
+            lost = 1;
             break;
+        }
         ops++;
         elapsed = now_ns() - t0;
     }
-    double ns = ops ? (double)elapsed / (double)ops : NA;
+    double ns = (!lost && ops >= MIN_SAMPLES) ? (double)elapsed / (double)ops
+                                              : NA;
     __atomic_store_n(&g_fx_sem_stop, 1, __ATOMIC_RELEASE);
     sem_post(&g_fx_sem_a);
-    join_or_abandon(th, &g_fx_sem_done, 5);
-    sem_destroy(&g_fx_sem_a);
-    sem_destroy(&g_fx_sem_b);
+    // Destroy the semaphores ONLY if the peer really came back. After an
+    // abandoned join the thread is detached and may still be blocked in
+    // `sem_wait` or about to `sem_post`, and destroying a semaphore under it
+    // is undefined behaviour -- a crash in the measuring tool, blamed on
+    // whatever row ran next. They are static storage, so leaving them intact
+    // costs nothing but the two of them.
+    if (join_or_abandon(th, &g_fx_sem_done, 5)) {
+        sem_destroy(&g_fx_sem_a);
+        sem_destroy(&g_fx_sem_b);
+    } else {
+        ns = NA; // a peer still running means the figure is not trustworthy
+    }
     return ns;
 }
 
@@ -6924,8 +7124,19 @@ int main(int argc, char **argv) {
             if (g_pstat_ok)
                 pstat_calibrate();
             g_sig_count = 0;
+            // The pairing has to bracket THIS probe. Taking the `a` snapshot
+            // at section start (or leaving the calibration's own snapshots in
+            // place) and reading it rows later would report the calibration's
+            // syscalls, and `g_last_ops` would by then belong to whichever
+            // probe ran last.
+            if (g_pstat_ok)
+                pstat_snapshot(g_pstat_a, sizeof g_pstat_a);
             double self = timed_ns_per_op(sig_kill_self_op, g_short_ns);
+            double self_ops = self < 0 ? 0 : (double)g_last_ops;
+            if (g_pstat_ok)
+                pstat_snapshot(g_pstat_b, sizeof g_pstat_b);
             row("[kernel]", "kill(self)+handler", self, "ns", "linux: ~1500");
+            pstat_pair("kill", "kill", self_ops, self);
             row("[kernel]", "block+pending+unblock",
                 timed_ns_per_op(sig_pending_release_op, g_short_ns), "ns",
                 "linux: ~2500");
@@ -7008,11 +7219,15 @@ int main(int argc, char **argv) {
                 else
                     printf("  sigaltstack: not available on this kernel.\n");
             }
-            row("[kernel]", "sigsuspend wake, over 1ms",
+            row("[kernel]", "sigsuspend wake lateness",
                 (r = sig_suspend_ns(g_short_ns)) < 0 ? NA : r / 1000.0, "us",
-                "linux: ~0.5");
-            pstat_pair("kill", "kill", self > 0 ? (double)g_last_ops : 0, NA);
+                "linux: ~60");
             sigaction(SIGUSR1, &old_usr1, NULL);
+            printf("  `wake lateness` is how late each 1 ms timer was, each\n");
+            printf("  sample against its own one-shot expiry. Linux applies a\n");
+            printf("  default timer slack of 50 us to a non-realtime task, so\n");
+            printf("  tens of microseconds there is the slack and not the\n");
+            printf("  signal path; a figure in milliseconds is not.\n");
             printf("  the `over 2x20ms` row is ONE sample, not an average:\n");
             printf("  the probe can only be run once per interrupted read, so\n");
             printf("  it carries the timer's own granularity and swings by a\n");
@@ -7104,7 +7319,7 @@ int main(int argc, char **argv) {
             row("[kernel]", "condvar signal, 16 waiting",
                 s16 < 0 ? NA : s16 / 1000.0, "us", "linux: ~12");
             row("[kernel]", "condvar broadcast, 16",
-                b16 < 0 ? NA : b16 / 1000.0, "us", "linux: ~40");
+                b16 < 0 ? NA : b16 / 1000.0, "us", "linux: ~100");
             if (s16 > 0 && b16 > 0)
                 row("[kernel]", "  broadcast / signal", b16 / s16, "x",
                     "the thundering herd");
