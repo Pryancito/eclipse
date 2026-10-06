@@ -47,6 +47,30 @@ static TICK_GAPS_LATE: AtomicU64 = AtomicU64::new(0);
 static TICK_GAPS_LATE_IDLE: AtomicU64 = AtomicU64::new(0);
 static TICK_GAP_LAST_LATE_NS: AtomicU64 = AtomicU64::new(0);
 static TICK_GAP_LAST_LATE_AT_NS: AtomicU64 = AtomicU64::new(0);
+/// [diag] The last gap on each CPU, counted only when that CPU was *busy*.
+///
+/// Read by the slice accounting, which has to tell "this thread was off the
+/// CPU" from "the tick that measures it did not fire". Both look identical from
+/// the thread: a long gap between two of its own tick observations. Only the
+/// busy case is recorded, and a halt stores 0, because a CPU that was halted
+/// was running nobody -- a thread whose deadline burned across that really was
+/// off the CPU and is owed the time.
+static TICK_GAP_LAST_BUSY_NS_PERCPU: [AtomicU64; MAX_CORE_NUM] =
+    [const { AtomicU64::new(0) }; MAX_CORE_NUM];
+
+/// [diag] How long this CPU went without a tick, last time it took one while
+/// busy; 0 when the last tick interrupted a halt or there is nothing recorded.
+///
+/// See [`TICK_GAP_LAST_BUSY_NS_PERCPU`]. Called from the slice accounting in
+/// the user-trap handler, which runs after `handle_irq` has already accounted
+/// this tick, so the value is this tick's own gap.
+pub fn last_busy_tick_gap_ns() -> u64 {
+    let cpu = crate::cpu::cpu_id() as usize;
+    if cpu >= MAX_CORE_NUM {
+        return 0;
+    }
+    TICK_GAP_LAST_BUSY_NS_PERCPU[cpu].load(Relaxed)
+}
 
 /// [diag] Account the gap since this CPU's previous tick. `nominal_ns` is
 /// the tick period the timer was programmed for. Called from the tick
@@ -66,8 +90,12 @@ pub fn note_tick_gap(now_ns: u64, nominal_ns: u64) {
         if late {
             TICK_GAPS_LATE_IDLE.fetch_add(1, Relaxed);
         }
+        // A halted CPU was running nobody, so this gap explains no thread's
+        // missing time: leave the slice accounting nothing to subtract.
+        TICK_GAP_LAST_BUSY_NS_PERCPU[cpu].store(0, Relaxed);
         return;
     }
+    TICK_GAP_LAST_BUSY_NS_PERCPU[cpu].store(gap, Relaxed);
     TICK_GAP_MAX_NS.fetch_max(gap, Relaxed);
     if late {
         TICK_GAPS_LATE.fetch_add(1, Relaxed);
@@ -1077,9 +1105,46 @@ mod tests {
             l.store(last, Relaxed);
             c.store(idle, Relaxed);
         }
+        for g in TICK_GAP_LAST_BUSY_NS_PERCPU.iter() {
+            g.store(u64::MAX, Relaxed);
+        }
         TICK_GAP_MAX_NS.store(0, Relaxed);
         TICK_GAP_LAST_LATE_NS.store(0, Relaxed);
         TICK_GAP_LAST_LATE_AT_NS.store(0, Relaxed);
+    }
+
+    /// What `last_busy_tick_gap_ns` reports after one `note_tick_gap`, read
+    /// from every slot so a thread that migrated cannot change the answer.
+    /// `prime` seeds `u64::MAX`, which no gap here produces, so an untouched
+    /// slot is distinguishable from one that was written with 0.
+    fn busy_gap_written() -> u64 {
+        let seen: alloc::vec::Vec<u64> = TICK_GAP_LAST_BUSY_NS_PERCPU
+            .iter()
+            .map(|g| g.load(Relaxed))
+            .filter(|g| *g != u64::MAX)
+            .collect();
+        assert_eq!(seen.len(), 1, "exactamente un slot tuvo que escribirse");
+        seen[0]
+    }
+
+    /// A busy CPU records the gap, so the slice accounting can tell a tick that
+    /// did not fire from a thread that did not run. Without this it credits a
+    /// thread that held the CPU the whole time, which is the opposite of the
+    /// preemption its slice had earned.
+    #[test]
+    fn a_busy_cpu_records_its_gap_and_a_halted_one_records_none() {
+        let _g = SERIAL.lock();
+        let gap = 15 * NOMINAL;
+        tick_gap(1_000_000, 1_000_000 + gap, NOMINAL, false);
+        assert_eq!(busy_gap_written(), gap, "una CPU ocupada apunta su hueco");
+        // Una CPU parada no corria a nadie, asi que su hueco no explica la
+        // ausencia de ningun hilo: no hay nada que restar.
+        tick_gap(1_000_000, 1_000_000 + gap, NOMINAL, true);
+        assert_eq!(
+            busy_gap_written(),
+            0,
+            "una CPU parada no puede explicar el tiempo que un hilo no corrio"
+        );
     }
 
     /// Drive `note_tick_gap` once from a known state and report what it wrote.
