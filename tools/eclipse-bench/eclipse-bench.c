@@ -4633,12 +4633,34 @@ static int sig_kill_self_op(void) {
 // hold it, notice on the mask change, and deliver before `sigprocmask`
 // returns. Every library that protects a critical section with a mask pays
 // this whenever a signal lands inside one.
+// Which of the five ways this probe can fail actually happened. Without this
+// the row reads n/a under a sentence blaming the signal mask, and a reader has
+// no way to tell that from a `sigprocmask` that failed or a signal left
+// blocked by an earlier section -- the row would be accusing the kernel of a
+// bug it does not have.
+static volatile sig_atomic_t g_pend_fail_block, g_pend_fail_kill,
+    g_pend_fail_early, g_pend_fail_restore, g_pend_fail_undelivered,
+    g_pend_fail_prearmed;
+
 static int sig_pending_release_op(void) {
     sigset_t block, old;
     sigemptyset(&block);
     sigaddset(&block, SIGUSR1);
-    if (sigprocmask(SIG_BLOCK, &block, &old) != 0)
+    if (sigprocmask(SIG_BLOCK, &block, &old) != 0) {
+        g_pend_fail_block++;
         return 1;
+    }
+    // If SIGUSR1 was ALREADY blocked when we got here, restoring `old` at the
+    // end leaves it blocked, the handler never runs, and the probe would
+    // report "not delivered" -- blaming the kernel for a mask an earlier
+    // section left behind. Say so instead, and unblock it for the rest of the
+    // run so the row works on the next iteration.
+    if (sigismember(&old, SIGUSR1)) {
+        g_pend_fail_prearmed++;
+        sigdelset(&old, SIGUSR1);
+        sigprocmask(SIG_SETMASK, &old, NULL);
+        return 1;
+    }
     sig_atomic_t before = g_sig_count;
     // Every failure below has to put the mask back before returning. A probe
     // that gives up with SIGUSR1 still blocked leaves the whole process that
@@ -4646,6 +4668,7 @@ static int sig_pending_release_op(void) {
     // then never run its handler, so the parent would wait for an answer that
     // cannot come. A lost sample is cheap; a wedged suite is not.
     if (kill(getpid(), SIGUSR1) != 0) {
+        g_pend_fail_kill++;
         sigprocmask(SIG_SETMASK, &old, NULL);
         return 1;
     }
@@ -4653,12 +4676,18 @@ static int sig_pending_release_op(void) {
     // not being honoured and the row would otherwise report a plausible number
     // for a broken mechanism.
     if (g_sig_count != before) {
+        g_pend_fail_early++;
         sigprocmask(SIG_SETMASK, &old, NULL);
         return 1;
     }
-    if (sigprocmask(SIG_SETMASK, &old, NULL) != 0)
+    if (sigprocmask(SIG_SETMASK, &old, NULL) != 0) {
+        g_pend_fail_restore++;
         return 1;
-    return g_sig_count != before ? 0 : 1;
+    }
+    if (g_sig_count != before)
+        return 0;
+    g_pend_fail_undelivered++;
+    return 1;
 }
 
 // Delivery to ANOTHER process: the signal has to reach a task that is asleep,
@@ -7137,13 +7166,37 @@ int main(int argc, char **argv) {
                 pstat_snapshot(g_pstat_b, sizeof g_pstat_b);
             row("[kernel]", "kill(self)+handler", self, "ns", "linux: ~1500");
             pstat_pair("kill", "kill", self_ops, self);
-            row("[kernel]", "block+pending+unblock",
-                timed_ns_per_op(sig_pending_release_op, g_short_ns), "ns",
+            double pend = timed_ns_per_op(sig_pending_release_op, g_short_ns);
+            row("[kernel]", "block+pending+unblock", pend, "ns",
                 "linux: ~2500");
             printf("  (the second row sends the signal while it is blocked and\n");
             printf("   requires the handler NOT to have run until the mask is\n");
             printf("   lifted; a kernel that delivers anyway reports n/a here\n");
             printf("   rather than a plausible number.)\n");
+            if (pend < 0) {
+                // n/a can mean five different things and only one of them is
+                // the kernel's fault, so say which rather than leaving the
+                // sentence above to be read as the verdict.
+                printf("   n/a because:");
+                if (g_pend_fail_prearmed)
+                    printf(" SIGUSR1 was already blocked on entry (%d)",
+                           (int)g_pend_fail_prearmed);
+                if (g_pend_fail_early)
+                    printf(" handler ran while blocked (%d)",
+                           (int)g_pend_fail_early);
+                if (g_pend_fail_undelivered)
+                    printf(" never delivered after unblocking (%d)",
+                           (int)g_pend_fail_undelivered);
+                if (g_pend_fail_block)
+                    printf(" sigprocmask BLOCK failed (%d)",
+                           (int)g_pend_fail_block);
+                if (g_pend_fail_restore)
+                    printf(" sigprocmask restore failed (%d)",
+                           (int)g_pend_fail_restore);
+                if (g_pend_fail_kill)
+                    printf(" kill failed (%d)", (int)g_pend_fail_kill);
+                printf("\n");
+            }
 
             double cross = sig_cross_process_ns(g_short_ns);
             row("[kernel]", "kill(child)+handler+pipe",
