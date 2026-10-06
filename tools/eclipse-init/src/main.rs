@@ -427,6 +427,43 @@ fn log(msg: &str) {
     println!("[eclipse-init] {msg}");
 }
 
+/// How long init waits before re-entering a supervision loop that panicked, so
+/// a panic on the very first statement cannot become a hot loop printing
+/// itself.
+const PANIC_PAUSE: Duration = Duration::from_secs(1);
+
+/// Run `f`; if it panics, say so on the console and answer `None` instead of
+/// taking the machine down.
+///
+/// A panic in PID 1 is the worst outcome in the system: the kernel answers a
+/// dead init with "Attempted to kill init" and the whole machine stops, for a
+/// bug in one decision -- an index, an arithmetic edge, an `unwrap` on
+/// something the disk said. Every other supervisor is a process the kernel can
+/// afford to lose; this one is not, which is why the release profile is
+/// `panic = "unwind"` and not `abort` (see Cargo.toml) and why the two places
+/// that can run arbitrary decision code -- starting a service, and the
+/// supervision loop itself -- run inside this.
+///
+/// `AssertUnwindSafe` because the state that crosses it is init's own service
+/// map, with no invariant a half-applied field can break: a service whose
+/// `pid` was set but whose `started_at` was not is read as "started just now",
+/// which is what the next reap would have concluded anyway. The one shared
+/// thing that unwinding really can poison is `RENDERER_SAID`, and
+/// [`log_renderer`] already treats a poisoned lock as "say the line".
+fn guard<T>(what: &str, f: impl FnOnce() -> T) -> Option<T> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+        Ok(value) => Some(value),
+        Err(_) => {
+            // The payload is already on the console: the hook installed in
+            // `main` printed the message and the location before unwinding.
+            log(&format!(
+                "BUG: panicked while {what}; init is still running -- please report this"
+            ));
+            None
+        }
+    }
+}
+
 /// Lines about the renderer policy already printed this boot.
 static RENDERER_SAID: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
 
@@ -469,6 +506,18 @@ fn main() {
     }
 
     log("starting");
+
+    // Name the panic on the console before it unwinds: the default hook writes
+    // to stderr, which for PID 1 is the console too, but without saying who
+    // panicked -- and on a console-only machine that line is the whole bug
+    // report. `guard` catches it right after this runs.
+    std::panic::set_hook(Box::new(|info| {
+        let where_ = info
+            .location()
+            .map(|l| format!("{}:{}", l.file(), l.line()))
+            .unwrap_or_else(|| String::from("unknown location"));
+        log(&format!("BUG: panic at {where_}: {info}"));
+    }));
 
     // Handlers first: `mount_pseudo_filesystems` wipes /run and /tmp and can
     // take a while, and a SIGTERM/SIGINT/SIGUSRx arriving before the handlers
@@ -530,11 +579,26 @@ fn main() {
         if services.get(name).is_some_and(|s| s.given_up) {
             continue;
         }
-        start_service(services.get_mut(name).expect("known service"));
+        // Guarded: a bug in one service's start must cost that service, not the
+        // boot. `get_mut` rather than an `expect`, so a name that somehow is
+        // not in the map is a line on the console and not a dead machine.
+        let Some(svc) = services.get_mut(name) else {
+            log(&format!(
+                "BUG: {name} vanished from the service table; skipped"
+            ));
+            continue;
+        };
+        guard(&format!("starting {name}"), || start_service(svc));
     }
 
     log("entering supervision loop");
-    supervise(&mut services);
+    // PID 1 may not return and may not die, so a panic in here is caught and
+    // the loop re-entered. The pause is what keeps a panic on the first
+    // statement from becoming a console-filling hot loop.
+    while guard("supervising", || supervise(&mut services)).is_none() {
+        log("re-entering the supervision loop after a panic");
+        sleep_interruptible(PANIC_PAUSE);
+    }
 }
 
 /// How many text consoles the kernel opens. The session has to land past them.
@@ -3200,6 +3264,52 @@ mod tests {
         let mut map = BTreeMap::new();
         map.insert("crasher".to_string(), svc);
         assert!(due_names(&map, Instant::now()).is_empty());
+    }
+
+    // -- PID 1 may not die --------------------------------------------------
+
+    /// The worst outcome in the system is a dead PID 1: the kernel answers it
+    /// with "Attempted to kill init" and the whole machine stops, for a bug in
+    /// one decision. So the two places that run decision code -- a service
+    /// start and the supervision loop -- run inside `guard`, and the release
+    /// profile unwinds instead of aborting (a test cannot read Cargo.toml's
+    /// profile, but `catch_unwind` returning here at all is the half that
+    /// would be impossible under `abort`).
+    #[test]
+    fn a_panic_is_caught_instead_of_taking_pid_1_down() {
+        // The hook would print the panic; silence it for the test so the
+        // suite's output stays readable, then put the default back.
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+
+        assert_eq!(guard("doing something fine", || 7), Some(7));
+        let after = std::cell::Cell::new(false);
+        assert_eq!(
+            guard("doing something broken", || -> i32 { panic!("boom") }),
+            None,
+            "un panic no se contuvo: PID 1 se moriria y con el la maquina"
+        );
+        // And init goes on to do the next thing.
+        guard("carrying on", || after.set(true));
+        assert!(after.get());
+
+        // An index out of range is the realistic shape of it, not a `panic!`.
+        let empty: Vec<u32> = Vec::new();
+        assert_eq!(guard("indexing", || empty[1]), None);
+
+        std::panic::set_hook(previous);
+    }
+
+    /// The loop in `main` re-enters `supervise` for as long as it keeps
+    /// panicking, because PID 1 may not return either. What stops that being a
+    /// console-filling hot loop is the pause, so it has to be a real one.
+    #[test]
+    fn the_pause_before_re_entering_the_loop_is_long_enough_to_not_be_a_hot_loop() {
+        assert!(PANIC_PAUSE >= Duration::from_millis(500), "{PANIC_PAUSE:?}");
+        // And short enough that a machine whose supervision loop is panicking
+        // still answers a shutdown promptly: the pause is interruptible, and
+        // POLL_SLICE is the loop's own idea of prompt.
+        assert!(PANIC_PAUSE <= Duration::from_secs(5), "{PANIC_PAUSE:?}");
     }
 
     // -- Logs that live in RAM ----------------------------------------------

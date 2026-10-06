@@ -3338,10 +3338,6 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
               # wait_path = /dev/input/event0              (optional; block each start,\n\
               #                                             bounded, until this path\n\
               #                                             exists -- any file type)\n\
-              # timeout = 15                                (optional, oneshot only:\n\
-              #                                             seconds the boot waits for it\n\
-              #                                             before killing it and carrying\n\
-              #                                             on; zero waits for ever)\n\
               #\n\
               # 'oneshot' runs to completion in order during boot; 'respawn' is\n\
               # supervised and restarted if it exits. No shell is involved.\n",

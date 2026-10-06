@@ -20,5 +20,10 @@ libc = "0.2"
 opt-level = "z"
 lto = true
 codegen-units = 1
-panic = "abort"
+# `unwind`, NOT `abort`: a panic in PID 1 compiled with `abort` is
+# instantly "Attempted to kill init" -- a kernel panic, the whole machine,
+# for a bug in one decision. With unwinding, `guard` in main.rs catches it,
+# says so on the console and keeps supervising. The landing pads cost a few
+# KiB of a binary that is already stripped and built for size.
+panic = "unwind"
 strip = true
