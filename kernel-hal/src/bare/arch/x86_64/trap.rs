@@ -930,6 +930,31 @@ pub extern "C" fn trap_handler(tf: &mut TrapFrame) {
                 tf.rsp as u64,
                 tf.cs as u64,
             );
+            // ...and the rest of the register file. The kernel #PF report used
+            // to know where the fault was and never with what: three captures
+            // of a WRITE from `BTreeMap<usize, PageState>::insert` to a clock
+            // reading named the victim and not one operand. The registers say
+            // which one carried the bad address, and the others still point at
+            // the objects the faulting call had in hand. In `kstats::GPR_NAMES`
+            // order, which is also the trap frame's.
+            crate::kstats::note_fault_gprs(&[
+                tf.rax as u64,
+                tf.rbx as u64,
+                tf.rcx as u64,
+                tf.rdx as u64,
+                tf.rsi as u64,
+                tf.rdi as u64,
+                tf.rbp as u64,
+                tf.rsp as u64,
+                tf.r8 as u64,
+                tf.r9 as u64,
+                tf.r10 as u64,
+                tf.r11 as u64,
+                tf.r12 as u64,
+                tf.r13 as u64,
+                tf.r14 as u64,
+                tf.r15 as u64,
+            ]);
             // Containment: ring-0 EXECUTE #PF at a RIP that is not kernel
             // `.text` is a `call`/`ret` through garbage (null, userspace
             // `0x1045f0000`, truncated residue). Skip when a CALL return is

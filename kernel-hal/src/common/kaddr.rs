@@ -312,6 +312,58 @@ pub fn clock_shape(word: u64, now_ns: u64) -> ClockShape {
     ClockShape::NotAClock
 }
 
+/// How far from the faulting address a register may sit and still be read as
+/// the base the access was computed from.
+///
+/// An x86 displacement can reach +-2 GiB, but the accesses this exists to
+/// explain are field and element stores: `BTreeMap<usize, PageState>::insert`
+/// writing through a node pointer reaches a few hundred bytes past it at most.
+/// A page is a generous ceiling, and still close enough that a register inside
+/// it is worth a line of its own.
+pub const MAX_PLAUSIBLE_DISPLACEMENT: i64 = 0x1000;
+
+/// What a general-purpose register at a fault says about the faulting address.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RegRole {
+    /// The register held the faulting address itself: the pointer the
+    /// instruction dereferenced, or a copy of it.
+    IsTarget,
+    /// The register is the faulting address minus a plausible displacement, so
+    /// the access could have been `[reg + disp]`. A candidate, not a finding:
+    /// two registers near the target both qualify, and only the instruction's
+    /// encoding says which one it used. The value is the displacement, i.e.
+    /// `fault_vaddr - reg`, the offset of the field being touched.
+    BaseOf(i64),
+    /// Nothing ties this register to the faulting address.
+    Unrelated,
+}
+
+/// Decide what a register value says about the address that faulted.
+///
+/// Why this is worth a function with tests rather than eyeballing the hex: the
+/// recurring fault this serves arrives as a WRITE through
+/// `BTreeMap<usize, PageState>::insert` to an address that is a value of this
+/// boot's nanosecond clock. Every capture so far named the victim and
+/// nothing about the pointer it used, because the kernel `#PF` report never
+/// printed the register file. With it printed, the first question of every
+/// capture is which register carried the bad value and at what offset into the
+/// object -- and that is arithmetic nobody should be doing by hand in the
+/// middle of reading a photograph of a screen.
+pub fn register_role(value: u64, fault_vaddr: u64) -> RegRole {
+    if value == fault_vaddr {
+        return RegRole::IsTarget;
+    }
+    // Wrapping, the way the CPU forms an effective address, then read as
+    // signed: a displacement can be negative, and a kernel-half register
+    // against a user-half target has to come out far apart rather than
+    // overflow.
+    let delta = fault_vaddr.wrapping_sub(value) as i64;
+    if delta != 0 && delta.unsigned_abs() <= MAX_PLAUSIBLE_DISPLACEMENT as u64 {
+        return RegRole::BaseOf(delta);
+    }
+    RegRole::Unrelated
+}
+
 /// What a machine word found where a kernel code pointer belongs looks like.
 ///
 /// `try_skip_null_execute_call` reads the qword at the faulting `RSP` and has
@@ -1279,5 +1331,62 @@ mod tests {
         for modrm in [0x14u8, 0x54, 0x94] {
             assert!(!ends_with_call(&[0xff, modrm]), "modrm {:#04x}", modrm);
         }
+    }
+
+    /// The seventh capture's faulting address: a WRITE from
+    /// `BTreeMap<usize, PageState>::insert+0x1b4` to a deadline of this boot.
+    const SEVENTH_TARGET: u64 = 0x31_adb1_e428;
+
+    #[test]
+    fn the_register_that_held_the_faulting_address_is_its_target() {
+        assert_eq!(
+            register_role(SEVENTH_TARGET, SEVENTH_TARGET),
+            RegRole::IsTarget
+        );
+    }
+
+    #[test]
+    fn a_register_a_field_below_the_target_is_its_base_and_names_the_offset() {
+        // `mov [reg + 0x18], ...` through a clock value.
+        assert_eq!(
+            register_role(SEVENTH_TARGET - 0x18, SEVENTH_TARGET),
+            RegRole::BaseOf(0x18)
+        );
+        // A `push` writes eight below `rsp`, so `rsp` is a base at -8.
+        let rsp = 0xffff_ff00_218b_f000u64;
+        assert_eq!(register_role(rsp, rsp - 8), RegRole::BaseOf(-8));
+    }
+
+    #[test]
+    fn a_kernel_pointer_says_nothing_about_a_user_half_target() {
+        // Heap words from the same capture's stack scan. Across the middle of
+        // the address space the distance is enormous both ways round, and must
+        // not come out as a small offset by overflowing.
+        for heap in [0xffff_ff00_06be_0d00u64, 0xffff_ff00_026e_cc60] {
+            assert_eq!(register_role(heap, SEVENTH_TARGET), RegRole::Unrelated);
+            assert_eq!(register_role(SEVENTH_TARGET, heap), RegRole::Unrelated);
+        }
+        // The two halves of the signed range: no panic, no false match.
+        assert_eq!(register_role(0, 1 << 63), RegRole::Unrelated);
+        assert_eq!(register_role(1 << 63, 0), RegRole::Unrelated);
+    }
+
+    #[test]
+    fn the_displacement_ceiling_is_one_page_either_way() {
+        let page = MAX_PLAUSIBLE_DISPLACEMENT as u64;
+        let t = SEVENTH_TARGET;
+        assert_eq!(register_role(t - page, t), RegRole::BaseOf(0x1000));
+        assert_eq!(register_role(t + page, t), RegRole::BaseOf(-0x1000));
+        assert_eq!(register_role(t - page - 1, t), RegRole::Unrelated);
+        assert_eq!(register_role(t + page + 1, t), RegRole::Unrelated);
+    }
+
+    #[test]
+    fn a_null_base_explains_a_near_null_fault() {
+        // `[null + 0x10]`: a zero register is the base of a fault at 0x10,
+        // which is exactly what a field read through a null pointer looks like.
+        assert_eq!(register_role(0, 0x10), RegRole::BaseOf(0x10));
+        // And the effective address wraps like the CPU's: -8 plus 0x10 is 8.
+        assert_eq!(register_role(u64::MAX - 7, 8), RegRole::BaseOf(0x10));
     }
 }

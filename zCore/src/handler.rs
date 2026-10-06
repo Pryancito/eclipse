@@ -11,8 +11,13 @@ use super::memory;
 /// tick's published deadlines, which is already what the reader assumes of a
 /// faulting address; saying "no match" would invite them to think a match was
 /// on the table for every pointer that faults.
+///
+/// Only the unresolved-fault report uses it, and that report does not exist
+/// under `libos`; ungated, the libos build failed on dead code.
+#[cfg(not(feature = "libos"))]
 struct LiveDeadline(Option<usize>);
 
+#[cfg(not(feature = "libos"))]
 impl core::fmt::Display for LiveDeadline {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self.0 {
@@ -24,6 +29,123 @@ impl core::fmt::Display for LiveDeadline {
             ),
             None => Ok(()),
         }
+    }
+}
+
+/// The registers in `mask` (bit `i` is `GPR_NAMES[i]`), as `rax/rcx/r8`.
+///
+/// Several registers often hold the same value -- a zero, or one pointer copied
+/// into an argument register -- and one line per value says that at a glance
+/// where one line per register would only repeat it.
+struct RegNames(u16);
+
+impl core::fmt::Display for RegNames {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let mut sep = "";
+        for (i, name) in kernel_hal::kstats::GPR_NAMES.iter().enumerate() {
+            if self.0 & (1 << i) != 0 {
+                write!(f, "{}{}", sep, name)?;
+                sep = "/";
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The registers in `mask` with their values, as `rbx=0x.. r12=0x..`: for a
+/// list of registers that hold *different* values, where [`RegNames`]'s
+/// `rax/rcx` would read as one value held twice.
+struct RegValues<'a> {
+    mask: u16,
+    gprs: &'a [u64; 16],
+}
+
+impl core::fmt::Display for RegValues<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let mut sep = "";
+        for (i, name) in kernel_hal::kstats::GPR_NAMES.iter().enumerate() {
+            if self.mask & (1 << i) != 0 {
+                write!(f, "{}{}={:#x}", sep, name, self.gprs[i])?;
+                sep = " ";
+            }
+        }
+        Ok(())
+    }
+}
+
+/// What one register value says about the fault, as the clauses after its
+/// names on a `[kfault-regs]` line. See [`print_fault_registers`].
+struct RegSays {
+    value: u64,
+    fault_vaddr: u64,
+    now_ns: u64,
+}
+
+impl RegSays {
+    fn role(&self) -> kernel_hal::kaddr::RegRole {
+        kernel_hal::kaddr::register_role(self.value, self.fault_vaddr)
+    }
+
+    fn clock(&self) -> kernel_hal::kaddr::ClockShape {
+        kernel_hal::kaddr::clock_shape(self.value, self.now_ns)
+    }
+
+    /// Whether any clause below applies. A register that is none of these
+    /// gets no line of its own: its value is on the raw lines already.
+    fn worth_a_line(&self) -> bool {
+        self.role() != kernel_hal::kaddr::RegRole::Unrelated
+            || self.clock() != kernel_hal::kaddr::ClockShape::NotAClock
+            || kernel_hal::kaddr::is_kernel_text(self.value)
+    }
+}
+
+impl core::fmt::Display for RegSays {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        use kernel_hal::kaddr::{ClockShape, RegRole};
+        let mut sep = "";
+        match self.role() {
+            RegRole::IsTarget => {
+                write!(f, "the faulting address itself")?;
+                sep = "; ";
+            }
+            RegRole::BaseOf(d) if d > 0 => {
+                write!(
+                    f,
+                    "the faulting address - {:#x} (a candidate base: [this + {:#x}])",
+                    d, d
+                )?;
+                sep = "; ";
+            }
+            RegRole::BaseOf(d) => {
+                let d = d.unsigned_abs();
+                write!(
+                    f,
+                    "the faulting address + {:#x} (a candidate base: [this - {:#x}])",
+                    d, d
+                )?;
+                sep = "; ";
+            }
+            RegRole::Unrelated => {}
+        }
+        let clock = self.clock();
+        if clock != ClockShape::NotAClock {
+            write!(f, "{}{}", sep, clock.as_str())?;
+            // A register is not a stack slot, so a match here is not the
+            // stray-sweep residue `LiveDeadline` names: it says the value is
+            // one this kernel published, which is a lead on where it came from.
+            if let Some(cpu) = kernel_hal::timer::deadline_cpu_matching(self.value) {
+                write!(
+                    f,
+                    ", equal to the deadline CPU{} has published right now",
+                    cpu
+                )?;
+            }
+            sep = "; ";
+        }
+        if kernel_hal::kaddr::is_kernel_text(self.value) {
+            write!(f, "{}{}", sep, kernel_hal::ksyms::Addr(self.value))?;
+        }
+        Ok(())
     }
 }
 
@@ -262,6 +384,7 @@ impl KernelHandler for ZcoreKernelHandler {
             // RFLAGS|RF misread as a return address (trap.S stored &rflags in
             // tf.rsp). After the fix, rsp0 is the real faulting RSP; truncated
             // .text residue here is genuine smash — do not walk that chain.
+            print_fault_registers(fault_vaddr);
             print_fault_backtrace(access_flags);
             // Prefer a literal halt over `panic!` here: `panic!` formats through
             // the global panic handler and can #PF again on a smashed heap,
@@ -601,6 +724,7 @@ fn report_unresolved_kernel_fault(
         have_thread,
     ));
     report_heap_lock_held();
+    print_fault_registers(fault_vaddr);
     print_fault_backtrace(access_flags);
     // Release the latch before containment: a successful `try_contain` retires
     // just this coroutine and resumes scheduling, so a LATER fault must be free
@@ -646,6 +770,152 @@ fn report_unresolved_kernel_fault(
     serial_literal_spin("\n[KERNEL BUG] halting (diag rev 11)\n");
     loop {
         core::hint::spin_loop();
+    }
+}
+
+/// [diag] The register file at the faulting instruction, and what each value
+/// says about the address that faulted.
+///
+/// The header names where the fault was; this names with what. It exists for
+/// the recurring WRITE from `BTreeMap<usize, PageState>::insert` to a reading
+/// of this boot's clock: three captures of it named the victim and not one
+/// operand, so nobody could say which register carried the bad value, at what
+/// offset into the object, or which register still pointed at the map itself
+/// -- the heap cell a write-watch would need.
+///
+/// Values only, never what they point at: a kernel-half register can just as
+/// well be a device BAR in the physmap, and reading a read-to-clear status
+/// register from here would be a diagnosis that changes what it diagnoses. The
+/// bytes at `rip` are the one exception, because the CPU was executing them.
+fn print_fault_registers(fault_vaddr: usize) {
+    let gprs = kernel_hal::kstats::last_fault_gprs();
+    if gprs.iter().all(|&r| r == 0) {
+        kernel_hal::oops_log::report(format_args!(
+            "[kfault-regs] no register file was recorded for this fault\n"
+        ));
+        return;
+    }
+    // Raw values first, in the layout of the `[null-exec] regs:` block so the
+    // two can be read side by side.
+    kernel_hal::oops_log::report(format_args!(
+        "[kfault-regs] rax={:#x} rbx={:#x} rcx={:#x} rdx={:#x} rsi={:#x} rdi={:#x}\n\
+         [kfault-regs] rbp={:#x} rsp={:#x} r8={:#x} r9={:#x} r10={:#x} r11={:#x}\n\
+         [kfault-regs] r12={:#x} r13={:#x} r14={:#x} r15={:#x}\n",
+        gprs[0],
+        gprs[1],
+        gprs[2],
+        gprs[3],
+        gprs[4],
+        gprs[5],
+        gprs[6],
+        gprs[7],
+        gprs[8],
+        gprs[9],
+        gprs[10],
+        gprs[11],
+        gprs[12],
+        gprs[13],
+        gprs[14],
+        gprs[15],
+    ));
+    let now_ns = kernel_hal::deadline::duration_to_ns(kernel_hal::timer::timer_now());
+    // Then one line per distinct value that says something: which register the
+    // address came from and at what offset, which ones hold clock values, and
+    // which ones are code.
+    let mut seen: u16 = 0;
+    let mut explained = false;
+    for (i, &value) in gprs.iter().enumerate() {
+        if seen & (1 << i) != 0 {
+            continue;
+        }
+        let mut mask: u16 = 0;
+        for (j, &v) in gprs.iter().enumerate().skip(i) {
+            if v == value {
+                mask |= 1 << j;
+            }
+        }
+        seen |= mask;
+        let says = RegSays {
+            value,
+            fault_vaddr: fault_vaddr as u64,
+            now_ns,
+        };
+        if !says.worth_a_line() {
+            continue;
+        }
+        explained |= says.role() != kernel_hal::kaddr::RegRole::Unrelated;
+        kernel_hal::oops_log::report(format_args!(
+            "[kfault-regs]   {} = {:#x}: {}\n",
+            RegNames(mask),
+            value,
+            says,
+        ));
+    }
+    if !explained {
+        kernel_hal::oops_log::report(format_args!(
+            "[kfault-regs]   no register holds the faulting address or a base within \
+             {:#x} of it: it was formed with an index register or a larger \
+             displacement, or loaded from memory by a ret or an indirect branch; \
+             the bytes at rip tell which\n",
+            kernel_hal::kaddr::MAX_PLAUSIBLE_DISPLACEMENT,
+        ));
+    }
+    // The pointers the faulting code had in hand: kernel-half, not `.text`, and
+    // not the stack or frame pointer. One of them is the object the bad value
+    // was loaded from.
+    let mut objects: u16 = 0;
+    for (i, &v) in gprs.iter().enumerate() {
+        let stack_or_frame =
+            kernel_hal::kstats::GPR_NAMES[i] == "rsp" || kernel_hal::kstats::GPR_NAMES[i] == "rbp";
+        if !stack_or_frame
+            && kernel_hal::kaddr::word_shape(v) == kernel_hal::kaddr::WordShape::KernelNonText
+        {
+            objects |= 1 << i;
+        }
+    }
+    if objects != 0 {
+        kernel_hal::oops_log::report(format_args!(
+            "[kfault-regs]   kernel data pointers in hand: {}\n",
+            RegValues {
+                mask: objects,
+                gprs: &gprs,
+            },
+        ));
+    }
+    // The instruction itself, so the operands above can be matched to its
+    // encoding exactly instead of guessed from `insert+0x1b4`. Only from inside
+    // `.text`, where the CPU was just fetching.
+    #[cfg(not(feature = "libos"))]
+    {
+        let rip = kernel_hal::kstats::last_fault_rip();
+        if kernel_hal::kaddr::is_kernel_text(rip)
+            && kernel_hal::kaddr::is_kernel_text(rip.wrapping_add(15))
+        {
+            let mut b = [0u8; 16];
+            for (k, byte) in b.iter_mut().enumerate() {
+                *byte = unsafe { core::ptr::read_volatile((rip + k as u64) as *const u8) };
+            }
+            kernel_hal::oops_log::report(format_args!(
+                "[kfault-regs]   bytes at rip: {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} \
+                 {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}\n",
+                b[0],
+                b[1],
+                b[2],
+                b[3],
+                b[4],
+                b[5],
+                b[6],
+                b[7],
+                b[8],
+                b[9],
+                b[10],
+                b[11],
+                b[12],
+                b[13],
+                b[14],
+                b[15],
+            ));
+        }
     }
 }
 

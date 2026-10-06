@@ -654,6 +654,30 @@ static FAULT_RSP: [AtomicU64; MAX_CORE_NUM] = [const { AtomicU64::new(0) }; MAX_
 static FAULT_CS: [AtomicU64; MAX_CORE_NUM] = [const { AtomicU64::new(0) }; MAX_CORE_NUM];
 static ACTIVE_FAULT_RSP: [AtomicU64; MAX_CORE_NUM] = [const { AtomicU64::new(0) }; MAX_CORE_NUM];
 
+/// [diag] The general-purpose registers at the faulting instruction.
+///
+/// `rip`/`rbp`/`rsp` alone answer "where", and the recurring fault this exists
+/// for needs "with what". It arrives as a WRITE to a nanosecond reading of this
+/// boot's clock from inside
+/// `BTreeMap<usize, PageState>::insert+0x1b4` -- so some operand's base was a
+/// clock value where a node pointer belongs, and the register file says which
+/// operand, and what the *other* registers held. One of them points at the
+/// `BTreeMap` itself, which is the heap cell a write-watch would want.
+///
+/// The `[null-exec]` containment has printed its registers all along; the
+/// kernel `#PF` report never had them to print, so three captures of the same
+/// fault came back naming the victim and nothing about the pointer it used.
+///
+/// Order is [`GPR_NAMES`].
+static FAULT_GPRS: [[AtomicU64; 16]; MAX_CORE_NUM] =
+    [const { [const { AtomicU64::new(0) }; 16] }; MAX_CORE_NUM];
+
+/// The register names, in the order `FAULT_GPRS` stores them.
+pub const GPR_NAMES: [&str; 16] = [
+    "rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rbp", "rsp", "r8", "r9", "r10", "r11", "r12", "r13",
+    "r14", "r15",
+];
+
 /// Keeps fault-stack provenance valid only while its trap handler is active.
 #[must_use]
 pub struct FaultScope {
@@ -742,6 +766,29 @@ pub fn note_fault_regs(rip: u64, rbp: u64, rsp: u64, cs: u64) -> FaultScope {
         FAULT_CS[cpu].store(cs, Relaxed);
     }
     FaultScope::enter(cpu, rsp, cs)
+}
+
+/// [diag] Record the general-purpose registers at the faulting instruction.
+///
+/// `gprs` is in [`GPR_NAMES`] order. Sixteen relaxed stores on the fault path,
+/// which is already doing far more than that, and they are what turns "a write
+/// to a bad address" into "this register held it and that one held the object".
+/// See `FAULT_GPRS`.
+pub fn note_fault_gprs(gprs: &[u64; 16]) {
+    if let Some(cpu) = fault_slot() {
+        for (slot, value) in FAULT_GPRS[cpu].iter().zip(gprs.iter()) {
+            slot.store(*value, Relaxed);
+        }
+    }
+}
+
+/// [diag] The general-purpose registers of the last fault on this CPU, in
+/// [`GPR_NAMES`] order. All zero when nothing has faulted here.
+pub fn last_fault_gprs() -> [u64; 16] {
+    match fault_slot() {
+        Some(cpu) => core::array::from_fn(|i| FAULT_GPRS[cpu][i].load(Relaxed)),
+        None => [0; 16],
+    }
 }
 
 /// [diag] The CPU exception a panic is about to report, so the panic handler
@@ -1685,6 +1732,20 @@ mod tests {
             "la siesta no sumo al tiempo de su cpu"
         );
         assert!(ns_all(&after) <= after.idle_ns);
+    }
+
+    #[test]
+    fn a_faults_register_file_reads_back_whole_and_the_next_one_replaces_it() {
+        let _guard = SERIAL.lock();
+        // Every slot distinct, so a swapped pair or a short copy cannot pass.
+        let regs: [u64; 16] = core::array::from_fn(|i| 0xffff_ff00_0000_1000 + 8 * i as u64);
+        note_fault_gprs(&regs);
+        assert_eq!(last_fault_gprs(), regs);
+        // Replaced whole by the next fault on this CPU: a register left over
+        // from an earlier fault would be read as this one's operand.
+        let next: [u64; 16] = core::array::from_fn(|i| i as u64 + 1);
+        note_fault_gprs(&next);
+        assert_eq!(last_fault_gprs(), next);
     }
 }
 
