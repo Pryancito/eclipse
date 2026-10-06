@@ -106,7 +106,9 @@ jobs:
           # and keeps them honest. Run them for real with
           # `cargo bench -p <crate> --bench <name> --features <...>`.
           cargo bench -p linux-object --bench vfs --features mock-disk --no-run
+          cargo bench -p linux-object --bench signal --features mock-disk --no-run
           cargo bench -p zircon-object --bench vm --features libos,aspace-separate --no-run
+          cargo bench -p zircon-object --bench futex --features libos,aspace-separate --no-run
           # Three more crates whose unit tests `default-members` hid the same
           # way: the syscall entry points, the HAL (user-pointer copies, CPU
           # stats) and the anomaly detector.

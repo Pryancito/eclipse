@@ -20,8 +20,10 @@ syscall path or the scheduler; a gap in both is the subsystem.
 ## Running them
 
 ```sh
-cargo bench -p linux-object  --bench vfs --features mock-disk
-cargo bench -p zircon-object --bench vm  --features libos,aspace-separate
+cargo bench -p linux-object  --bench vfs    --features mock-disk
+cargo bench -p linux-object  --bench signal --features mock-disk
+cargo bench -p zircon-object --bench vm     --features libos,aspace-separate
+cargo bench -p zircon-object --bench futex  --features libos,aspace-separate
 cargo bench --manifest-path smoltcp/Cargo.toml          # wire parsing, upstream's
 ```
 
@@ -87,14 +89,35 @@ two agree the measurement is standing on something.
 | descriptor table | `fs` section, `dup`, `fcntl` | `linux-object` `fd_*` |
 | procfs report formatting | `fs` section, `/proc/self/*` | `linux-object` `perf_*_report` |
 | TCP/UDP wire parsing | `net` section round trips | `smoltcp` `benches/bench.rs` |
+| the futex table every wait and wake looks a word up in | — | `zircon-object` `futex_table_*` |
+| `FUTEX_WAKE` with nobody waiting | `futex` section | `zircon-object` `futex_wake_*` |
+| the pending-set scan and the handler's mask | `sig` section | `linux-object` `sigset_*`, `signal_action_*` |
+| `siginfo` and `sigaltstack` bookkeeping | `sig` section verdicts | `linux-object` `siginfo_*`, `signal_stack_*` |
 | allocator and anonymous mappings | `heap` section | `zircon-object` `vmar_map_unmap_*` (the mapping half only) |
-| signal delivery and faults | `sig` section | — |
-| futex wake, contention, condvars | `futex` section | — |
 
-The two empty cells are not an oversight: signal delivery and the futex code
-both need a task to deliver to, and `libos` has no scheduler of its own to
-provide one. Their in-kernel halves have to be measured on the machine, which
-the `psched` section of the C suite does from userspace.
+The one empty cell is not an oversight. What the futex table costs, what a
+wake with no waiters costs, and every signal decision are all benched above;
+what cannot be is the moment of DELIVERY — a signal reaching a task, a waiter
+being woken and run. Those need a task and a scheduler, and `libos` has
+neither, so `Futex::wait` returns a future nothing can complete. The C suite's
+`psched` section measures that half from userspace instead.
+
+Two brackets worth reading, because they are the reason both instruments
+exist:
+
+- `FUTEX_WAKE` with nobody waiting is **~330 ns** from userspace and **11 ns**
+  in-kernel. Ninety-seven per cent of what a `pthread_mutex_unlock` pays for
+  that call is the syscall, not the futex code — so a change to the futex code
+  cannot move it, and the syscall path is where to look.
+- `kill(self)+handler` is **~2 us** from userspace, while every piece of signal
+  bookkeeping it runs through is **1 to 12 ns**. The cost is the frame and the
+  return through it, not the decisions.
+
+And one slope: `futex_table_hit_of_1` / `_of_64` / `_of_512` is flat at ~20 ns,
+so a process that has used many futex words does not pay for them on every
+later call. Building a 512-entry table costs ~134 ns per insert against ~87 ns
+for an insert that triggers no sweep, which is the sweep staying amortized the
+way its threshold doubling intends.
 
 A caveat that applies to every in-kernel row: they run under `libos`, the only
 configuration that builds for the host. Object bookkeeping (VMO and VMAR
