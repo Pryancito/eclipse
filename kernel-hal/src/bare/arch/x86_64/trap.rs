@@ -506,6 +506,29 @@ fn report_dma_uaf_if_recycled(sp: u64) {
     }
 }
 
+/// Prints the result of the live-deadline probe as a clause, or nothing.
+///
+/// A `Display` rather than an `if`/`else` pair in the call because the clause
+/// has three outcomes (a hit, a miss, and "the word is not a clock value so
+/// the question does not arise") and only the third one must print nothing at
+/// all -- a report that says "no match" about a pointer invites the reader to
+/// believe a match was possible.
+struct MatchedDeadline(Option<usize>);
+
+impl core::fmt::Display for MatchedDeadline {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self.0 {
+            Some(cpu) => write!(
+                f,
+                " AND is the deadline CPU{} has published right now, \
+                 so this is the tick's own stray-sweep residue and not a writer",
+                cpu
+            ),
+            None => Ok(()),
+        }
+    }
+}
+
 /// Try to contain a null-range EXECUTE #PF from a bad `call` (corrupt fn-ptr /
 /// vtable). Returns `true` if the trap frame was rewritten to skip the call
 /// (caller must `return` from `trap_handler` without panicking).
@@ -542,9 +565,11 @@ fn try_skip_null_execute_call(tf: &mut TrapFrame, fault_vaddr: usize) -> bool {
         static LOGGED_NULL: AtomicBool = AtomicBool::new(false);
         if !LOGGED_NULL.swap(true, Ordering::SeqCst) {
             let (hard, soft) = ::executor::hard_guard_executor_counts();
+            let event = crate::oops_log::next_event();
             crate::oops_log::report(format_args!(
-                "\n[soft-smash] null return slot [fault_rsp]={:#x} — \
+                "\n[soft-smash #{}] null return slot [fault_rsp]={:#x} — \
                  hooks_registered={} hard_guard_executors={} soft_guard_executors={}\n",
+                event,
                 sp,
                 ::executor::stack_guard_hooks_registered(),
                 hard,
@@ -553,7 +578,8 @@ fn try_skip_null_execute_call(tf: &mut TrapFrame, fault_vaddr: usize) -> bool {
             let attr = ::executor::attribute_fault_stack_ptrs(tf.rsp, tf.rbp);
             if let Some(h) = attr.rsp {
                 crate::oops_log::report(format_args!(
-                    "[soft-smash] rsp={:#x} -> CPU{} exec={} region={}\n",
+                    "[soft-smash #{}] rsp={:#x} -> CPU{} exec={} region={}\n",
+                    event,
                     tf.rsp,
                     h.cpu,
                     h.executor_id,
@@ -578,13 +604,37 @@ fn try_skip_null_execute_call(tf: &mut TrapFrame, fault_vaddr: usize) -> bool {
             shape,
             crate::kaddr::WordShape::TruncatedText | crate::kaddr::WordShape::NearNull
         );
-        // Is this word the clock, read a moment ago? Two captures put a
-        // user-half word of the right order of magnitude for a nanosecond
-        // uptime in this slot, which is a guess until something measures it --
-        // and the kernel holds the one number that can. One clock read, once,
-        // on a path that is already printing.
+        // Is this word the clock? Three captures put a user-half word of the
+        // right order of magnitude for a nanosecond uptime in this slot, which
+        // is a guess until something measures it -- and the kernel holds the
+        // one number that can. One clock read, once, on a path that is already
+        // printing.
+        //
+        // The third capture is why this asks `clock_shape` and not
+        // `plausible_uptime_ns`: its word sat 28 ms **above** the reading
+        // printed beside it, so the reading test said "not a clock" about a
+        // word that is a clock value computed as `now + interval`. That is a
+        // deadline, and saying so names the timer and poll paths instead of
+        // sending the reader back to a pointer hunt.
         let now_ns = crate::deadline::duration_to_ns(crate::timer::timer_now());
-        let clockish = crate::kaddr::plausible_uptime_ns(ret, now_ns);
+        let clock = crate::kaddr::clock_shape(ret, now_ns);
+        // The gap goes in the report whatever the answer is: it is what makes
+        // the claim checkable by hand from the two numbers printed.
+        let (gap_ns, gap_dir) = if ret >= now_ns {
+            (ret - now_ns, "ahead of")
+        } else {
+            (now_ns - ret, "behind")
+        };
+        // And if it is a deadline, is it one this kernel published? `timer_tick`
+        // materialises the per-CPU deadline table on its own stack every tick
+        // for the stray sweep, so a deadline-shaped word in a stack slot on the
+        // timer path can be that array's residue rather than a smashed code
+        // pointer. A hit names the CPU and closes the question; a miss leaves
+        // the writer worth hunting, which is the whole difference.
+        let residue_cpu = match clock {
+            crate::kaddr::ClockShape::NotAClock => None,
+            _ => crate::timer::deadline_cpu_matching(ret),
+        };
         // Every shape gets the report, not only the two this used to know.
         // A capture came back with `[rsp0]=0x1cb0a4fb0e` -- a user-half word
         // in a kernel code slot -- and this path returned in silence, so the
@@ -596,23 +646,37 @@ fn try_skip_null_execute_call(tf: &mut TrapFrame, fault_vaddr: usize) -> bool {
             ::executor::note_heap_smash_suspected();
         }
         {
-            use core::sync::atomic::{AtomicBool, Ordering};
-            static LOGGED: AtomicBool = AtomicBool::new(false);
-            if !LOGGED.swap(true, Ordering::SeqCst) {
+            use core::sync::atomic::{AtomicU32, Ordering};
+            // One report per *shape*, not one per boot.
+            //
+            // A capture came back carrying a `[soft-smash]` group and a
+            // `[null-exec]` group with different `fault_rsp` values, and they
+            // read as one fault because each group fires once ever: the first
+            // soft smash of the boot was still the only one on record minutes
+            // later, so its `value=` got attributed to a later, different
+            // fault. A bit per shape keeps the record bounded -- eight shapes,
+            // so at most eight reports -- while letting a second fault of a
+            // *different* shape say so, and the serial says which fault each
+            // group belongs to.
+            static LOGGED_SHAPES: AtomicU32 = AtomicU32::new(0);
+            let bit = 1u32 << (shape as u32 & 31);
+            if LOGGED_SHAPES.fetch_or(bit, Ordering::SeqCst) & bit == 0 {
+                let event = crate::oops_log::next_event();
                 let (hard, soft) = ::executor::hard_guard_executor_counts();
                 crate::oops_log::report(format_args!(
-                    "\n[soft-smash] [fault_rsp]={:#x} value={:#x} is {}{} \
-                     (uptime now {} ns) — hooks_registered={} \
+                    "\n[soft-smash #{}] [fault_rsp]={:#x} value={:#x} is {} and is {} \
+                     (uptime now {} ns; the word is {} ns {} it){} — \
+                     hooks_registered={} \
                      hard_guard_executors={} soft_guard_executors={}\n",
+                    event,
                     sp,
                     ret,
                     shape.as_str(),
-                    if clockish {
-                        " AND is a monotonic-clock reading from this boot"
-                    } else {
-                        " and is NOT a clock reading from this boot"
-                    },
+                    clock.as_str(),
                     now_ns,
+                    gap_ns,
+                    gap_dir,
+                    MatchedDeadline(residue_cpu),
                     ::executor::stack_guard_hooks_registered(),
                     hard,
                     soft,
@@ -621,8 +685,9 @@ fn try_skip_null_execute_call(tf: &mut TrapFrame, fault_vaddr: usize) -> bool {
                 let report =
                     |label: &str, addr: usize, hit: Option<::executor::StackAttrHit>| match hit {
                         Some(h) => crate::oops_log::report(format_args!(
-                            "[soft-smash] {}={:#x} -> CPU{} exec={} task={} \
+                            "[soft-smash #{}] {}={:#x} -> CPU{} exec={} task={} \
                              stack_base={:#x} region={}\n",
+                            event,
                             label,
                             addr,
                             h.cpu,
@@ -632,9 +697,14 @@ fn try_skip_null_execute_call(tf: &mut TrapFrame, fault_vaddr: usize) -> bool {
                             h.region.as_str(),
                         )),
                         None => crate::oops_log::report(format_args!(
-                            "[soft-smash] {}={:#x} -> OUTSIDE all executor stacks \
+                            "[soft-smash #{}] {}={:#x} -> OUTSIDE all executor stacks \
                              (walked {} CPUs, skipped {}, {} executors)\n",
-                            label, addr, attr.cpus_walked, attr.cpus_skipped, attr.executors_seen,
+                            event,
+                            label,
+                            addr,
+                            attr.cpus_walked,
+                            attr.cpus_skipped,
+                            attr.executors_seen,
                         )),
                     };
                 report("rsp", tf.rsp, attr.rsp);

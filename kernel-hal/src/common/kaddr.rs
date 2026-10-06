@@ -233,12 +233,83 @@ pub const MIN_PLAUSIBLE_CODE: u64 = 0x1_0000;
 /// that can: its own clock. A word inside the last eighth of uptime is a
 /// reading taken during this boot; anything else is not, and says so.
 ///
-/// Deliberately one-sided. A word *above* `now_ns` is not a clock read at all
-/// (nothing has read it yet), and the window is a fraction of uptime rather
-/// than a fixed span so it means the same thing at ten seconds and at ten
-/// hours.
+/// Deliberately one-sided: this answers *reading*, not *instant*. A word above
+/// `now_ns` has not been read by anybody yet, so it is not a reading -- but it
+/// can still be a clock value, computed as `now + interval`. That is a
+/// deadline, and [`clock_shape`] is what tells the two apart. The window is a
+/// fraction of uptime rather than a fixed span so it means the same thing at
+/// ten seconds and at ten hours.
 pub fn plausible_uptime_ns(word: u64, now_ns: u64) -> bool {
     word != 0 && word <= now_ns && word >= now_ns - now_ns / 8
+}
+
+/// How far ahead of the current reading a word may sit and still be an
+/// absolute deadline this kernel could have computed.
+///
+/// A minute. Every absolute instant this kernel builds comes from
+/// `now + interval` with the interval taken from a syscall argument -- a
+/// `poll`/`select` timeout, an `itimer`, a sleep -- and a minute is far past
+/// anything on the timer path that a fault interrupts. Wider than this and the
+/// test stops excluding anything; narrower and a long `poll` timeout stops
+/// being named.
+pub const MAX_DEADLINE_AHEAD_NS: u64 = 60 * 1_000_000_000;
+
+/// Whether a word in a code slot could have come from the monotonic clock, and
+/// if so which end of it.
+///
+/// Three captures of the same fault put `0x1cb0a4fb0e`, `0x52152b153` and
+/// `0x49640addc` in the slot where a return address belongs: three different
+/// words, all user-half, all the right order of magnitude for a nanosecond
+/// uptime. [`plausible_uptime_ns`] was asked first and said no to the third
+/// one -- correctly, on the question it answers, and uselessly, because that
+/// word sits **28 ms above** the reading the same report printed. Being ahead
+/// of the clock is not evidence against a clock value; it is evidence for a
+/// particular kind of clock value, the only kind this kernel computes rather
+/// than reads: an absolute deadline.
+///
+/// So there are three answers, and the distinction is the whole point. A
+/// reading implicates whoever stores a timestamp. A deadline implicates the
+/// timer and poll paths, which are also the paths the fault is taken on. And
+/// neither sends the reader hunting a clock when the word is simply a pointer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClockShape {
+    /// Inside the last eighth of uptime: the clock as somebody read it.
+    Reading,
+    /// Above the current reading by at most [`MAX_DEADLINE_AHEAD_NS`]: an
+    /// absolute instant computed as `now + interval` and not yet reached.
+    Deadline,
+    /// Not a value this boot's clock could have produced.
+    NotAClock,
+}
+
+impl ClockShape {
+    /// The phrase for a report, written to follow the word it describes.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ClockShape::Reading => "a monotonic-clock reading from this boot",
+            ClockShape::Deadline => {
+                "an absolute deadline from this boot's clock, shortly in the future"
+            }
+            ClockShape::NotAClock => "not a clock value from this boot",
+        }
+    }
+}
+
+/// Classify `word` against the current monotonic reading `now_ns`.
+///
+/// See [`ClockShape`] for why a word *ahead* of the clock is the interesting
+/// answer rather than a rejection.
+pub fn clock_shape(word: u64, now_ns: u64) -> ClockShape {
+    if word == 0 || now_ns == 0 {
+        return ClockShape::NotAClock;
+    }
+    if plausible_uptime_ns(word, now_ns) {
+        return ClockShape::Reading;
+    }
+    if word > now_ns && word - now_ns <= MAX_DEADLINE_AHEAD_NS {
+        return ClockShape::Deadline;
+    }
+    ClockShape::NotAClock
 }
 
 /// What a machine word found where a kernel code pointer belongs looks like.
@@ -905,6 +976,83 @@ mod tests {
         // taken it yet.
         assert!(!plausible_uptime_ns(1_000, 999));
         assert!(!plausible_uptime_ns(0, 0), "a zero is a cleared slot");
+    }
+
+    #[test]
+    fn the_third_captures_word_is_a_deadline_and_not_a_rejection() {
+        // The capture, verbatim: the kernel printed its own reading next to
+        // the word, which is the only reason this can be checked at all.
+        let word = 0x4_9640_addcu64;
+        let now = 19_672_718_584u64;
+        assert!(word > now, "the word is ahead of the clock");
+        assert!(
+            word - now < 30_000_000,
+            "and by 28 ms, not by an order of magnitude"
+        );
+
+        // The reading test says no, and is right to: nobody has read this
+        // instant yet. Reporting that as `not a clock value` was the defect.
+        assert!(!plausible_uptime_ns(word, now));
+        assert_eq!(clock_shape(word, now), ClockShape::Deadline);
+    }
+
+    #[test]
+    fn every_captured_word_gets_the_clock_answer_its_own_report_supports() {
+        // The first two captures printed no reading, so they are checked
+        // against the uptime that makes each one current -- which is what
+        // made the hypothesis worth measuring in the first place.
+        for word in [0x1c_b0a4_fb0eu64, 0x5_2152_b153] {
+            assert_eq!(clock_shape(word, word), ClockShape::Reading);
+        }
+        assert_eq!(
+            clock_shape(0x4_9640_addc, 19_672_718_584),
+            ClockShape::Deadline
+        );
+    }
+
+    #[test]
+    fn a_deadline_further_out_than_this_kernel_computes_is_not_a_clock_value() {
+        let now = 19_672_718_584u64;
+        assert_eq!(
+            clock_shape(now + MAX_DEADLINE_AHEAD_NS, now),
+            ClockShape::Deadline,
+            "the edge of the window is still inside it"
+        );
+        assert_eq!(
+            clock_shape(now + MAX_DEADLINE_AHEAD_NS + 1, now),
+            ClockShape::NotAClock
+        );
+        // A pointer that happens to be bigger than the uptime must not be
+        // dressed up as a deadline.
+        assert_eq!(
+            clock_shape(0xffff_ff00_0000_0000, now),
+            ClockShape::NotAClock
+        );
+    }
+
+    #[test]
+    fn before_the_clock_runs_nothing_can_be_a_clock_value() {
+        // `now_ns == 0` is a real state: the reading is taken in the fault
+        // path, and a fault before the timer is up reads zero. Without this
+        // guard every word within a minute of zero would be called a
+        // deadline, which is every small word in the kernel.
+        assert_eq!(clock_shape(0x1000, 0), ClockShape::NotAClock);
+        assert_eq!(clock_shape(0, 19_672_718_584), ClockShape::NotAClock);
+    }
+
+    #[test]
+    fn each_clock_answer_has_a_phrase_of_its_own() {
+        let phrases = [
+            ClockShape::Reading.as_str(),
+            ClockShape::Deadline.as_str(),
+            ClockShape::NotAClock.as_str(),
+        ];
+        for (i, a) in phrases.iter().enumerate() {
+            assert!(!a.is_empty());
+            for b in &phrases[i + 1..] {
+                assert_ne!(a, b, "two answers reading the same way is a bug");
+            }
+        }
     }
 
     #[test]

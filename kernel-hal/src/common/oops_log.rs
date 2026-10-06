@@ -53,6 +53,34 @@ static LEN: AtomicUsize = AtomicUsize::new(0);
 /// Set once the buffer fills, so readers know the tail is missing.
 static OVERFLOWED: AtomicBool = AtomicBool::new(false);
 
+/// How many fault reports have been opened, so the lines of one can be told
+/// from the lines of another.
+///
+/// Every group of lines on the fault path is latched -- a `[soft-smash]`
+/// report fires once, a `[null-exec]` dump fires once -- because the fault can
+/// repeat and the record is bounded. The cost only showed up when a capture
+/// came back carrying both groups: a `[soft-smash]` whose `[fault_rsp]` was
+/// `…1e7eb00` and a `[null-exec]` whose `fault_rsp` was `…1e7d690`. Two
+/// different stack addresses, read as one fault, and the `value=` of the first
+/// was attributed to the second. They were two faults, minutes apart, and
+/// nothing printed said so.
+///
+/// A serial on each group is what makes that visible: same number, same fault.
+static EVENTS: AtomicUsize = AtomicUsize::new(0);
+
+/// Open a new fault report and return its serial, counting from 1.
+///
+/// Called once per latched group of lines. `fetch_add` so two CPUs containing
+/// at once get different numbers rather than claiming the same fault.
+pub fn next_event() -> usize {
+    EVENTS.fetch_add(1, Ordering::Relaxed) + 1
+}
+
+/// How many fault reports have been opened so far.
+pub fn events() -> usize {
+    EVENTS.load(Ordering::Relaxed)
+}
+
 /// A `fmt::Write` sink that appends into [`BUF`].
 struct Sink;
 
@@ -143,6 +171,7 @@ pub fn snapshot() -> alloc::vec::Vec<u8> {
 /// report survives.
 #[cfg(test)]
 fn reset_for_tests() {
+    EVENTS.store(0, Ordering::SeqCst);
     LEN.store(0, Ordering::SeqCst);
     OVERFLOWED.store(false, Ordering::SeqCst);
     for b in BUF.iter() {
@@ -158,8 +187,36 @@ mod tests {
         alloc::string::String::from_utf8_lossy(&snapshot()).into_owned()
     }
 
+    /// One test at a time through the record.
+    ///
+    /// [`BUF`], [`LEN`] and [`OVERFLOWED`] are one process-wide `static` --
+    /// that is the point of the module, a fixed buffer the fault path can
+    /// append to with no allocation. `cargo test` runs these in parallel, so
+    /// without this they reset each other's buffer mid-assertion: all four
+    /// passed when run alone and three failed together. The lock is held for
+    /// the whole test, and `reset_for_tests` is called under it.
+    fn exclusive() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        // A test that panicked while holding it poisoned it; the buffer is
+        // reset on entry anyway, so the state it left behind does not matter.
+        LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    #[test]
+    fn two_reports_get_two_serials_so_their_lines_can_be_separated() {
+        // Relative to whatever this process has already counted: the serial is
+        // a process-wide static and these tests run in parallel.
+        let before = events();
+        let first = next_event();
+        let second = next_event();
+        assert_eq!(first, before + 1, "serials count from 1, not from 0");
+        assert!(second > first, "two reports never claim the same number");
+        assert!(events() >= second);
+    }
+
     #[test]
     fn a_recorded_line_comes_back_out() {
+        let _exclusive = exclusive();
         reset_for_tests();
         assert!(is_empty());
         record(format_args!("[isolate] contained {}/{}\n", 1, 16));
@@ -175,6 +232,7 @@ mod tests {
     /// the durable side of the split this module documents.
     #[test]
     fn a_reported_line_is_on_the_durable_side_and_not_only_the_console() {
+        let _exclusive = exclusive();
         reset_for_tests();
         report(format_args!(
             "[KERNEL PAGE FAULT] vaddr={:#x} flags=EXECUTE\n",
@@ -188,6 +246,7 @@ mod tests {
 
     #[test]
     fn a_full_record_stops_rather_than_eating_its_own_beginning() {
+        let _exclusive = exclusive();
         reset_for_tests();
         // The first line has to survive: it is the one that names the fault.
         record(format_args!("FIRST\n"));
@@ -209,6 +268,7 @@ mod tests {
     /// to roughly a kilobyte, and the fault budget is `MAX_CONTAINED` = 16.
     #[test]
     fn the_capacity_holds_a_full_report_for_every_fault_the_budget_allows() {
+        let _exclusive = exclusive();
         const PER_EVENT: usize = 1024;
         const MAX_CONTAINED: usize = 16;
         assert!(
