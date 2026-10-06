@@ -97,6 +97,37 @@ const CRASH_START_LIMIT: u32 = 20;
 /// and is empty again on the next boot.
 const DEFAULT_LOG_DIR: &str = "/tmp";
 
+/// How big a service's `log =` may get before init rotates it.
+///
+/// Every log the images ship lives in `/tmp`, which is a **tmpfs**: its bytes
+/// are RAM. Nothing bounded them, so a service that writes on every turn of a
+/// crash loop -- or a chatty daemon left running for a day -- ate the
+/// machine's memory, and the hole was worst exactly where it hurts most,
+/// because the service that cannot stop crashing is the one logging hardest.
+/// Every other supervisor caps this: `svlogd` and `s6-log` rotate by size,
+/// journald has `SystemMaxUse`.
+///
+/// 1 MiB, with one old generation kept, so a service costs at most ~2 MiB of
+/// RAM however long the machine is up -- and 1 MiB is still tens of thousands
+/// of lines, far more than anyone reads.
+const MAX_LOG_BYTES: u64 = 1024 * 1024;
+
+/// How often init looks at the sizes. A minute: a service would have to write
+/// a megabyte within it to overshoot, and the sweep is one `stat` per distinct
+/// log file.
+const LOG_SWEEP_SECS: libc::c_uint = 60;
+
+/// Set by the SIGALRM handler: it is time to look at the log sizes. The
+/// supervision loop blocks in `waitpid` for as long as nothing is pending, so
+/// the alarm is what gets it to look at all -- and `install_handler` installs
+/// no `SA_RESTART`, so the signal interrupts that block instead of being
+/// swallowed by it.
+static WANT_LOG_SWEEP: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn on_sigalrm(_sig: libc::c_int) {
+    WANT_LOG_SWEEP.store(true, Ordering::SeqCst);
+}
+
 /// Compositor GPU-renderer fallback. With `nvidia.nouveau_uapi` on an NVIDIA
 /// GPU the session defaults to GLES2/zink (real GPU). That path can die when a
 /// client's EXEC wedges the GPU channel: the compositor is context 0, a
@@ -758,8 +789,20 @@ fn install_signal_handlers() {
     for (sig, handler, _) in SIGNAL_HANDLERS {
         install_handler(*sig, *handler as *const () as usize);
     }
+    // SIGALRM: the only clock PID 1 has. It is what wakes the supervision loop
+    // to rotate the logs (see MAX_LOG_BYTES); the handler does nothing but set
+    // the flag, and the loop re-arms it.
+    install_handler(libc::SIGALRM, on_sigalrm as *const () as usize);
+    arm_log_sweep();
     // SIGCHLD is left at its default: the blocking `waitpid` in the supervision
     // loop reaps children directly, so no handler is needed for reaping.
+}
+
+/// Ask for the next log sweep. One-shot, so the loop re-arms it after each one:
+/// an interval timer would keep firing while init is mid-shutdown.
+fn arm_log_sweep() {
+    // SAFETY: `alarm` only schedules a SIGALRM for this process.
+    unsafe { libc::alarm(LOG_SWEEP_SECS) };
 }
 
 fn install_handler(sig: libc::c_int, handler: usize) {
@@ -2238,6 +2281,61 @@ fn spawn(argv: &[String], log_path: Option<&str>) -> Option<i32> {
     Some(pid)
 }
 
+/// Whether a log file of this size has to be rotated.
+fn log_overflow(size: u64) -> bool {
+    size >= MAX_LOG_BYTES
+}
+
+/// Rotate `path` if it has outgrown [`MAX_LOG_BYTES`], and say so if it did.
+///
+/// Copy-then-truncate, the way logrotate's `copytruncate` works, and for the
+/// same reason: the service writing here holds an open fd, so renaming the file
+/// would leave it writing to the renamed inode for ever and the new file empty.
+/// Copying the contents to `<path>.1` and truncating the original keeps the
+/// writer's fd valid -- it was opened `O_APPEND`, so its next write lands at
+/// the new end of file rather than a megabyte into a sparse hole.
+///
+/// What this loses is a line written between the copy and the truncate, which
+/// is the same race `copytruncate` has had for twenty years and the price of
+/// not having to reopen another process's fd. Returns `None` when there is
+/// nothing to do, including every error: a log that cannot be rotated must not
+/// stop a boot.
+fn rotate_log(path: &str) -> Option<String> {
+    let size = fs::metadata(path).ok()?.len();
+    if !log_overflow(size) {
+        return None;
+    }
+    let old = format!("{path}.1");
+    let contents = fs::read(path).ok()?;
+    fs::write(&old, &contents).ok()?;
+    // `truncate`, not a remove and recreate: the service's fd must keep
+    // pointing at this very inode.
+    fs::File::options()
+        .write(true)
+        .open(path)
+        .ok()?
+        .set_len(0)
+        .ok()?;
+    Some(format!(
+        "log: {path} reached {size} bytes; moved it to {old} and started it again \
+         (tmpfs is RAM, so an unbounded log is a machine that runs out of memory)"
+    ))
+}
+
+/// Rotate every log the service table names that has outgrown the cap.
+///
+/// By distinct path, because two services can share one `log =`
+/// (`boot-sound` and `boot-sound-xorg` both write `/tmp/boot-sound.log`) and
+/// rotating it twice would throw away the generation just kept.
+fn sweep_logs(services: &BTreeMap<String, Service>) {
+    let paths: BTreeSet<&str> = services.values().filter_map(|s| s.log.as_deref()).collect();
+    for path in paths {
+        if let Some(line) = rotate_log(path) {
+            log(&line);
+        }
+    }
+}
+
 /// Redirect fds 0/1/2. stdin always `/dev/null`; stdout/stderr go to `log_path`
 /// (append, create) when set, otherwise `/dev/null`. Async-signal-safe
 /// (`open`/`dup2`/`close`); failures are ignored.
@@ -2288,6 +2386,12 @@ unsafe fn silence_stdio(log_path: Option<&str>) {
 /// uptime is measured to the end of that backoff instead of to its own death.
 fn supervise(services: &mut BTreeMap<String, Service>) {
     loop {
+        // The alarm is PID 1's only clock, and this is all it is for: keep the
+        // services' logs from eating the tmpfs they live in.
+        if WANT_LOG_SWEEP.swap(false, Ordering::SeqCst) {
+            sweep_logs(services);
+            arm_log_sweep();
+        }
         if WANT_HALT.load(Ordering::SeqCst) {
             return shutdown(false, services);
         }
@@ -3096,6 +3200,97 @@ mod tests {
         let mut map = BTreeMap::new();
         map.insert("crasher".to_string(), svc);
         assert!(due_names(&map, Instant::now()).is_empty());
+    }
+
+    // -- Logs that live in RAM ----------------------------------------------
+
+    /// Every `log =` the images ship is under `/tmp`, a tmpfs, so its bytes are
+    /// the machine's memory. The cap is what stops a service that writes on
+    /// every turn of a crash loop -- the one logging hardest is the one that
+    /// cannot stop crashing -- from eating it.
+    #[test]
+    fn a_log_is_rotated_once_it_outgrows_the_cap_and_the_writers_fd_survives() {
+        assert!(!log_overflow(0));
+        assert!(!log_overflow(MAX_LOG_BYTES - 1));
+        assert!(log_overflow(MAX_LOG_BYTES));
+
+        let dir = scratch("log-cap");
+        let path = dir.join("chatty.log");
+        let name = path.to_str().unwrap();
+
+        // Under the cap: untouched, and no stale generation left behind.
+        fs::write(&path, b"corto\n").unwrap();
+        assert!(rotate_log(name).is_none());
+        assert!(!dir.join("chatty.log.1").exists());
+
+        // Over it: the contents move aside and the file starts again.
+        fs::write(&path, vec![b'x'; MAX_LOG_BYTES as usize]).unwrap();
+        // The writer holds an O_APPEND fd on this inode, exactly as a service
+        // does, and must still be writing to the SAME file afterwards -- which
+        // is why this is a copy and a truncate and not a rename.
+        use std::io::Write;
+        let mut writer = fs::File::options().append(true).open(&path).unwrap();
+
+        let line = rotate_log(name).expect("deberia rotar");
+        assert!(line.contains("chatty.log.1"), "{line}");
+        assert_eq!(fs::metadata(&path).unwrap().len(), 0);
+        assert_eq!(
+            fs::metadata(dir.join("chatty.log.1")).unwrap().len(),
+            MAX_LOG_BYTES,
+            "la generacion anterior no se guardo entera"
+        );
+
+        writer.write_all(b"despues\n").unwrap();
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "despues\n",
+            "el servicio siguio escribiendo en otro sitio: su fd ya no apunta al log"
+        );
+
+        // And now it is under the cap again, so the next sweep leaves it be.
+        assert!(rotate_log(name).is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Two services can name the same `log =` -- `boot-sound` and
+    /// `boot-sound-xorg` both write `/tmp/boot-sound.log` -- and rotating it
+    /// twice in one sweep would throw away the generation just kept.
+    #[test]
+    fn a_log_two_services_share_is_rotated_once_per_sweep() {
+        let dir = scratch("log-shared");
+        let path = dir.join("shared.log");
+        fs::write(&path, vec![b'y'; MAX_LOG_BYTES as usize]).unwrap();
+
+        let mut map = BTreeMap::new();
+        for name in ["boot-sound", "boot-sound-xorg"] {
+            map.insert(
+                name.to_string(),
+                parse_service(
+                    name,
+                    &format!("exec = /bin/foo\nlog = {}\n", path.to_str().unwrap()),
+                )
+                .expect("parsea"),
+            );
+        }
+        sweep_logs(&map);
+        assert_eq!(
+            fs::metadata(dir.join("shared.log.1")).unwrap().len(),
+            MAX_LOG_BYTES,
+            "la segunda rotacion de la misma pasada se llevo la generacion guardada"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A log that cannot be rotated must not stop anything: init reports
+    /// nothing and carries on.
+    #[test]
+    fn a_log_that_is_not_there_is_not_a_failure() {
+        let dir = scratch("log-missing");
+        assert!(rotate_log(dir.join("ghost.log").to_str().unwrap()).is_none());
+        // A `log = /dev/null` (the documented way to opt out) is not a file
+        // with a length to outgrow either.
+        assert!(rotate_log("/dev/null").is_none());
+        let _ = fs::remove_dir_all(&dir);
     }
 
     // -- A requirement that was given up on ---------------------------------

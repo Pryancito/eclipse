@@ -25,7 +25,7 @@ publica en `/etc/eclipse/services/`.
 | Orden por dependencias | sí | no | sí | sí | no | sí | sí (`after =`, topológico) |
 | Espera de *readiness* | `Type=notify` | no | *fd* de notificación | no | *socket activation* | no | sondeo de socket/ruta acotado |
 | Propagación del fallo de una dependencia | `Requires=` | — | sí | sí | no | sí | **sí (`requires =`)** |
-| Límite del tamaño de los logs | journald | `svlogd` | `s6-log` | logrotate | sí | sí | **no** (tmpfs = RAM) |
+| Límite del tamaño de los logs | journald | `svlogd` | `s6-log` | logrotate | sí | sí | **sí (1 MiB + 1 generación)** |
 | Matar lo que quede al parar un servicio | cgroup | grupo de procesos | grupo de procesos | sí | sí | contrato | solo en el `timeout` de un `oneshot` |
 | Apagado ordenado | sí | sí | sí | sí | sí | sí | **no, a propósito** (ver abajo) |
 
@@ -90,17 +90,46 @@ lunarbg / xkbmap → labwc, dbus-selftest → dbus) o no tiene sentido sin él
 que ningún `requires =` nombra un servicio que la imagen no escriba, porque un
 nombre mal escrito ahí sería silencioso.
 
+## Lo que se cerró en la tercera tanda
+
+**Los logs ya no se comen la RAM.** Todos los `log =` que publica la imagen están
+en `/tmp`, que es un **tmpfs**: sus bytes son memoria de la máquina, y nada los
+acotaba. El agujero era peor justo donde más duele, porque el servicio que no
+consigue dejar de caerse es el que más escribe. Ahora init mira los tamaños una
+vez por minuto y, al pasar de 1 MiB, mueve el contenido a `<log>.1` y deja el
+fichero a cero: cada servicio cuesta como mucho unos 2 MiB de RAM por mucho que
+la máquina lleve encendida, y 1 MiB siguen siendo decenas de miles de líneas.
+
+Tres detalles del cómo:
+
+- **Copiar y truncar, no renombrar** (el `copytruncate` de logrotate). El
+  servicio tiene el fichero abierto, así que un `rename` lo dejaría escribiendo
+  en el inodo renombrado para siempre y el fichero nuevo vacío. Lo que se pierde
+  es una línea escrita entre la copia y el truncado, la misma carrera que
+  logrotate lleva veinte años teniendo, y es el precio de no tener que reabrir
+  el fd de otro proceso. El `O_APPEND` del hijo es lo que hace que su siguiente
+  escritura caiga al principio del fichero nuevo y no a un megabyte de agujero.
+- **SIGALRM es el único reloj que tiene PID 1.** El lazo de supervisión se
+  bloquea en `waitpid` mientras no haya nada pendiente, así que sin una alarma no
+  miraría nunca; el manejador solo levanta la bandera y el lazo rearma. Es una
+  alarma de un disparo, no un temporizador de intervalo, para que no siga
+  saltando durante el apagado.
+- **Por ruta distinta**: dos servicios pueden compartir un `log =`
+  (`boot-sound` y `boot-sound-xorg` escriben los dos en `/tmp/boot-sound.log`) y
+  rotarlo dos veces en la misma pasada se llevaría la generación recién
+  guardada.
+
+Lo que **no** cubre: un fichero que escriba un envoltorio por su cuenta y que no
+sea el `log =` de ningún servicio. Init solo conoce la tabla.
+
 ## Cola, por orden de riesgo
 
-1. **Los logs de `/tmp` no tienen techo.** Son tmpfs, o sea RAM: un servicio que
-   cae en lazo y escribe en cada vuelta se come la memoria de la máquina. Hace
-   falta un tope por fichero (lo que hacen `svlogd`, `s6-log` y journald).
-2. **PID 1 puede morir de un `panic!`.** El perfil de release es
+1. **PID 1 puede morir de un `panic!`.** El perfil de release es
    `panic = "abort"`, así que cualquier `panic` en init es un kernel panic
    («Attempted to kill init»). Hay que elegir: quitar los `unwrap`/`expect` de
    las rutas vivas, o compilar con `unwind` y envolver el lazo de supervisión en
    un `catch_unwind` que lo registre y siga.
-3. **Durante las esperas acotadas del arranque no se cosecha a nadie.** Los hijos
+2. **Durante las esperas acotadas del arranque no se cosecha a nadie.** Los hijos
    que mueran en esos segundos se quedan zombis hasta que se llega al lazo. Es
    cosmético, pero hay que arreglarlo con cuidado: un `waitpid(-1)` suelto ahí
    dentro le robaría al lazo la muerte de un `respawn` y ese servicio no se
