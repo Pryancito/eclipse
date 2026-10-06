@@ -3329,6 +3329,10 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
               # wait_path = /dev/input/event0              (optional; block each start,\n\
               #                                             bounded, until this path\n\
               #                                             exists -- any file type)\n\
+              # timeout = 15                                (optional, oneshot only:\n\
+              #                                             seconds the boot waits for it\n\
+              #                                             before killing it and carrying\n\
+              #                                             on; zero waits for ever)\n\
               #\n\
               # 'oneshot' runs to completion in order during boot; 'respawn' is\n\
               # supervised and restarted if it exits. No shell is involved.\n",
@@ -3553,7 +3557,8 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
               after = pulseaudio lunarbar\n\
               wait_socket = /run/user/0/wayland-0\n\
               desktop = labwc\n\
-              log = /tmp/boot-sound.log\n",
+              log = /tmp/boot-sound.log\n\
+              timeout = 15\n",
         )
         .unwrap();
         fs::write(
@@ -3563,7 +3568,8 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
               type = oneshot\n\
               after = pulseaudio xorg\n\
               desktop = xorg\n\
-              log = /tmp/boot-sound.log\n",
+              log = /tmp/boot-sound.log\n\
+              timeout = 15\n",
         )
         .unwrap();
     }
@@ -5487,6 +5493,31 @@ mod rootfs_plumbing_tests {
             body.contains("play -q -o alsa ") && body.contains("play -q -o alsa,oss "),
             "a playback path stopped going through the watchdog:\n{body}"
         );
+    }
+
+    /// Every oneshot has a bound now (`DEFAULT_ONESHOT_TIMEOUT`, 90 s), but the
+    /// one that hands an MP3 to mpg123 is the one that froze a machine, and it
+    /// has nothing to do but fork a detached player: it carries a bound of its
+    /// own, in seconds rather than the minute and a half everything else gets.
+    #[test]
+    fn the_chime_oneshots_carry_a_short_timeout_of_their_own() {
+        let rootfs = init_rootfs("chime-timeout");
+        for name in ["boot-sound", "boot-sound-xorg"] {
+            let body =
+                fs::read_to_string(rootfs.join(format!("etc/eclipse/services/{name}.service")))
+                    .unwrap();
+            let secs: u64 = fields(&body)
+                .into_iter()
+                .find(|(k, _)| *k == "timeout")
+                .unwrap_or_else(|| panic!("{name} sin timeout propio:\n{body}"))
+                .1
+                .parse()
+                .unwrap_or_else(|e| panic!("{name}: timeout no numerico: {e}"));
+            assert!(
+                secs > 0 && secs <= 30,
+                "{name}: timeout = {secs} no acota el chime"
+            );
+        }
     }
 
     /// The watchdog, RUN rather than read: the structural test above cannot
