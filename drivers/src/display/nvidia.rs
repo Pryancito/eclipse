@@ -9596,37 +9596,36 @@ impl NvidiaGpu {
         let gr_subchan = (gr_trap_addr >> 16) & 0x1f;
         let gr_method = gr_trap_addr & 0x1fff;
 
-        // Diagnosis hint: one word that names the most likely
-        // root cause, to guide which fix the maintainer applies.
-        let hint = if mmu_valid != 0 {
-            "MMU-FAULT: GPU touched an unmapped VA -- check VM_BIND mappings"
-        } else if gr_status != 0 && gr_method != 0 {
-            "GR-STALL: GR engine stuck on a method -- golden-ctx/GR-init incomplete?"
-        } else if pbdma_idx.is_none() {
-            "NO-PBDMA: no NV_PFIFO_PBDMA_MAP entry routes this channel's runlist, so there are no ring pointers to judge -- the PBDMA lines below are NOT this channel's. Check the runlist_id the submit token carries."
-        } else if !drained && pb_intr != 0 {
-            "PBDMA-STALL (fetched, then BLOCKED): a PBDMA interrupt is pending -- the host fetched the push and stalled inside it, i.e. a semaphore-acquire NVK baked in never released (explicit-sync), or a PB error. Decode INTR_0/STATUS."
-        } else if !drained {
-            "PBDMA-STALL (never fetched): GP_GET frozen with no PBDMA interrupt -- the channel is not runlist-resident, so the doorbell/runlist scheduling never ran this push (NOT a semaphore block)."
-        } else if fecs_status != 0 || gpccs_status != 0 {
-            "FECS/GPCCS: ctx-switch hang -- GR context-image incomplete or global ctx buffers not mapped; check ctx_prime outcome and grctx init for this client channel's class object"
-        } else {
-            "GR-IDLE-NOFENCE: GR finished but fence-semaphore write never arrived -- WFI/coherency?"
-        };
+        // Diagnosis: a short code that names the failure mode, and the
+        // sentence that explains it. They are separate because
+        // `klog_emit` formats into a 256-byte buffer and drops the rest:
+        // four of the seven sentences are long enough that, glued into one
+        // line with the registers and the pointer to /proc/gpudbg, the cut
+        // landed BEFORE both -- so the line added to end this probe's
+        // silence arrived without the two things worth reading.
+        // `hang_verdict` has the table and the test that measures the line.
+        let verdict = nv::hang_verdict(
+            mmu_valid != 0,
+            gr_status != 0 && gr_method != 0,
+            pbdma_idx.is_some(),
+            drained,
+            pb_intr != 0,
+            fecs_status != 0 || gpccs_status != 0,
+        );
+        let hint = verdict.detail;
 
-        // The hint is the one line of the probe worth reading first, and
-        // until now only two of its six outcomes reached dmesg (the
+        // Until #1729 only two of the seven outcomes reached dmesg (the
         // doorbell re-ring and the FECS hang): an MMU fault, a GR stall or
         // a fence that never landed left the console silent, with the
         // whole record only in /proc/gpudbg -- which nobody reads unless
-        // something already pointed them at it. klog it unconditionally;
-        // it is one line per timeout, and the ring stays wedged after the
-        // first.
+        // something already pointed them at it. Two lines per timeout, and
+        // the ring stays wedged after the first: the facts first, so they
+        // survive even if the sentence after them is cut.
         crate::klog_warn!(
             "[nouveau-uapi] EXEC: ctx={} fence TIMEOUT after {}ms -- {} (pbdma={} runlist={} ch={} GP_PUT={:#x} GP_GET={:#x} INTR_0={:#x}) -- full record in /proc/gpudbg",
             ctx_idx,
             timeout_ms,
-            hint,
+            verdict.code,
             match pbdma_idx {
                 Some(i) => alloc::format!("{}", i),
                 None => alloc::string::String::from("none"),
@@ -9637,6 +9636,7 @@ impl NvidiaGpu {
             pb_get,
             pb_intr
         );
+        crate::klog_warn!("[nouveau-uapi] EXEC: {}: {}", verdict.code, verdict.detail);
 
         // Recovery attempt for the "never fetched, no PBDMA
         // interrupt" case: re-ring the doorbell with the exact
@@ -11095,10 +11095,27 @@ impl NvidiaGpu {
             unsafe { core::ptr::write_volatile(fence_va as *mut u32, payload) };
             store_fence();
         }
+        // Two lines, facts first: `klog_emit` cuts at 256 bytes, and as
+        // one line this ran to ~340 -- so the syncobj handle and point,
+        // and whether the context was latched WEDGED, fell off the end.
+        // That is exactly how much of it a photographed dmesg showed.
         crate::klog_warn!(
-            "[nouveau-uapi] fence TIMEOUT (direct submit): ctx{} payload={} never landed in {}s (landing zone={}, now written so the ACQUIREs queued on it pass); syncobj handle={} point={} released so its waiter can fail; {}",
-            ctx_idx, payload, crate::scheme::syncobj::FENCE_TIMEOUT_US / 1_000_000, current, handle, point,
-            if ctx_idx >= 1 { "context latched WEDGED (next submit EIO -> device-lost)" } else { "ctx 0 (compositor) is never latched" }
+            "[nouveau-uapi] fence TIMEOUT (direct submit): ctx{} payload={} never landed in {}s (landing zone={}) syncobj handle={} point={}",
+            ctx_idx,
+            payload,
+            crate::scheme::syncobj::FENCE_TIMEOUT_US / 1_000_000,
+            current,
+            handle,
+            point
+        );
+        crate::klog_warn!(
+            "[nouveau-uapi] fence TIMEOUT: ctx{}: landing zone written so the queued ACQUIREs pass, syncobj point released so its waiter can fail; {}",
+            ctx_idx,
+            if ctx_idx >= 1 {
+                "context latched WEDGED (next submit EIO -> device-lost)"
+            } else {
+                "ctx 0 (compositor) is never latched"
+            }
         );
         self.gr_hang_probe(ctx_idx, 0, token, runlist, 1000);
         if ctx_idx >= 1 {
@@ -13924,12 +13941,37 @@ impl NvidiaGpu {
                         }
                         if nv::exec_failure_changed(sig) {
                             replay_rm(rm_narration);
+                            // Three lines because one ran to ~350 bytes
+                            // and `klog_emit` cuts at 256, taking the
+                            // statuses with it. `stage` -- the one word
+                            // that names WHICH step refused -- reached
+                            // only `record_client_exec`, and that only
+                            // for ctx >= 1, so a compositor losing its
+                            // device left no stage in dmesg at all.
                             crate::klog_warn!(
-                                "[nouveau-uapi] EXEC (signaled) failed: pid={} ctx={} pushes={} waits={} sigs={} | lookup={:#x} map={:#x} token={:#x} submit={:#x} fenceSubmit={:#x} fenceWait={:#x} (fence value={:#x} expected={:#x}; work_token={:#010x} runlist={}; identical repeats suppressed)",
-                                owner_pid, ctx_idx, req.push_count, req.wait_count, req.sig_count,
-                                r.lookup_status, r.map_status, r.token_status, r.submit_status,
-                                r.fence_submit_status, r.fence_wait_status, r.fence_value, fence_payload,
-                                r.work_token, r.runlist_id
+                                "[nouveau-uapi] EXEC (signaled) failed at {}: pid={} ctx={} work_token={:#010x} runlist={} (identical repeats suppressed)",
+                                stage,
+                                owner_pid,
+                                ctx_idx,
+                                r.work_token,
+                                r.runlist_id
+                            );
+                            crate::klog_warn!(
+                                "[nouveau-uapi] EXEC (signaled) failed: pushes={} waits={} sigs={} fence value={:#x} expected={:#x}",
+                                req.push_count,
+                                req.wait_count,
+                                req.sig_count,
+                                r.fence_value,
+                                fence_payload
+                            );
+                            crate::klog_warn!(
+                                "[nouveau-uapi] EXEC (signaled) failed: lookup={:#x} map={:#x} token={:#x} submit={:#x} fenceSubmit={:#x} fenceWait={:#x}",
+                                r.lookup_status,
+                                r.map_status,
+                                r.token_status,
+                                r.submit_status,
+                                r.fence_submit_status,
+                                r.fence_wait_status
                             );
                             crate::klog_warn!(
                                 "[nouveau-uapi] ctx registry: {}",

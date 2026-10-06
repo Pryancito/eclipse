@@ -1489,6 +1489,178 @@ pub(super) fn pbdma_for_runlist(maps: &[u16], runlist_id: u32) -> Option<u32> {
         .map(|i| i as u32)
 }
 
+/// The verdict of [`gr_hang_probe`](super::nvidia), split into a short code
+/// and the sentence that explains it.
+///
+/// They are separate because `klog_emit` formats into a **256-byte** buffer
+/// and drops whatever does not fit. Four of the seven sentences below are
+/// long enough that, glued into one line with the registers and the pointer
+/// to `/proc/gpudbg`, the cut landed BEFORE them -- so the line added to end
+/// the probe's silence arrived without the two things worth reading. The
+/// code and the registers go in one line that always fits; the sentence goes
+/// in its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct HangVerdict {
+    pub code: &'static str,
+    pub detail: &'static str,
+}
+
+/// The longest `code` that still leaves room for the registers and the
+/// `/proc/gpudbg` pointer inside one 256-byte dmesg line.
+#[cfg(test)]
+pub(super) const HANG_CODE_MAX: usize = 24;
+
+/// Name the failure mode from the registers the probe read.
+///
+/// The order is the order of certainty: a latched MMU fault and a trapped GR
+/// method say what happened outright, an unknown PBDMA means the ring
+/// pointers belong to another engine and cannot be read as this channel's,
+/// and only then do the ring pointers get to speak.
+pub(super) fn hang_verdict(
+    mmu_valid: bool,
+    gr_stalled: bool,
+    pbdma_known: bool,
+    drained: bool,
+    pbdma_intr: bool,
+    ctxsw_busy: bool,
+) -> HangVerdict {
+    let (code, detail) = if mmu_valid {
+        (
+            "MMU-FAULT",
+            "the GPU touched an unmapped VA -- check the VM_BIND mappings",
+        )
+    } else if gr_stalled {
+        (
+            "GR-STALL",
+            "GR is stuck on a method -- golden-ctx/GR-init incomplete?",
+        )
+    } else if !pbdma_known {
+        (
+            "NO-PBDMA",
+            "no NV_PFIFO_PBDMA_MAP entry routes this channel's runlist, so the ring pointers above are NOT this channel's and nothing can be read from them. Check the runlist_id the submit token carries.",
+        )
+    } else if !drained && pbdma_intr {
+        (
+            "PBDMA-BLOCKED",
+            "a PBDMA interrupt is pending: the host DID fetch the push and stalled inside it -- a semaphore-acquire NVK baked in that never released (explicit-sync), or a PB error. Decode INTR_0/STATUS.",
+        )
+    } else if !drained {
+        (
+            "PBDMA-NEVER-FETCHED",
+            "GP_GET is frozen with no PBDMA interrupt: the channel is not runlist-resident, so the doorbell/runlist scheduling never ran this push. NOT a semaphore block.",
+        )
+    } else if ctxsw_busy {
+        (
+            "FECS-CTXSW-HANG",
+            "the GR context-image is incomplete or the global ctx buffers are not mapped -- check the ctx_prime outcome and grctx init for this channel's class object.",
+        )
+    } else {
+        (
+            "GR-IDLE-NOFENCE",
+            "GR finished but the fence-semaphore write never arrived -- WFI/coherency?",
+        )
+    };
+    HangVerdict { code, detail }
+}
+
+#[cfg(test)]
+mod hang_verdict_tests {
+    use super::*;
+
+    fn code(
+        mmu: bool,
+        gr: bool,
+        known: bool,
+        drained: bool,
+        intr: bool,
+        ctxsw: bool,
+    ) -> &'static str {
+        hang_verdict(mmu, gr, known, drained, intr, ctxsw).code
+    }
+
+    #[test]
+    fn every_mode_has_its_own_code() {
+        assert_eq!(code(true, false, true, false, false, false), "MMU-FAULT");
+        assert_eq!(code(false, true, true, false, false, false), "GR-STALL");
+        assert_eq!(code(false, false, false, false, false, false), "NO-PBDMA");
+        assert_eq!(
+            code(false, false, true, false, true, false),
+            "PBDMA-BLOCKED"
+        );
+        assert_eq!(
+            code(false, false, true, false, false, false),
+            "PBDMA-NEVER-FETCHED"
+        );
+        assert_eq!(
+            code(false, false, true, true, false, true),
+            "FECS-CTXSW-HANG"
+        );
+        assert_eq!(
+            code(false, false, true, true, false, false),
+            "GR-IDLE-NOFENCE"
+        );
+    }
+
+    #[test]
+    fn a_latched_mmu_fault_outranks_a_ring_that_also_looks_stuck() {
+        // Every "worse" flag set at once: the fault is still the answer,
+        // because it is the one the hardware latched.
+        assert_eq!(code(true, true, false, false, true, true), "MMU-FAULT");
+    }
+
+    #[test]
+    fn an_unknown_pbdma_is_never_read_as_a_stalled_one() {
+        // `drained = false` with no PBDMA is the shape that used to send the
+        // probe down the "never fetched" arm -- and re-ring the doorbell on
+        // another engine's registers.
+        assert_eq!(code(false, false, false, false, false, false), "NO-PBDMA");
+        assert_eq!(code(false, false, false, false, true, false), "NO-PBDMA");
+    }
+
+    #[test]
+    fn the_line_the_probe_klogs_fits_in_one_dmesg_record() {
+        // `klog_emit` formats into 256 bytes and drops the rest, and the
+        // registers and the /proc/gpudbg pointer are at the END of the line.
+        // This is what notices if a code grows until they fall off it.
+        for v in [
+            hang_verdict(true, false, true, false, false, false),
+            hang_verdict(false, true, true, false, false, false),
+            hang_verdict(false, false, false, false, false, false),
+            hang_verdict(false, false, true, false, true, false),
+            hang_verdict(false, false, true, false, false, false),
+            hang_verdict(false, false, true, true, false, true),
+            hang_verdict(false, false, true, true, false, false),
+        ] {
+            assert!(
+                v.code.len() <= HANG_CODE_MAX,
+                "code {:?} is {} bytes, over HANG_CODE_MAX",
+                v.code,
+                v.code.len()
+            );
+            let line = alloc::format!(
+                "[nouveau-uapi] EXEC: ctx={} fence TIMEOUT after {}ms -- {} \
+                 (pbdma={} runlist={} ch={} GP_PUT={:#x} GP_GET={:#x} INTR_0={:#x}) \
+                 -- full record in /proc/gpudbg",
+                31,
+                10_000,
+                v.code,
+                "11",
+                15,
+                0xfff,
+                0xffff_ffffu32,
+                0xffff_ffffu32,
+                0xffff_ffffu32
+            );
+            assert!(
+                line.len() < 256,
+                "the facts line is {} bytes, so klog would cut it: {}",
+                line.len(),
+                line
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod pbdma_map_tests {
     use super::*;
