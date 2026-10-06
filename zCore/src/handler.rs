@@ -78,12 +78,15 @@ impl core::fmt::Display for RegValues<'_> {
 struct RegSays {
     value: u64,
     fault_vaddr: u64,
+    /// Whether the fault was an instruction fetch, whose address is a branch
+    /// target rather than something computed from a base.
+    execute: bool,
     now_ns: u64,
 }
 
 impl RegSays {
     fn role(&self) -> kernel_hal::kaddr::RegRole {
-        kernel_hal::kaddr::register_role(self.value, self.fault_vaddr)
+        kernel_hal::kaddr::register_role(self.value, self.fault_vaddr, self.execute)
     }
 
     fn clock(&self) -> kernel_hal::kaddr::ClockShape {
@@ -384,7 +387,7 @@ impl KernelHandler for ZcoreKernelHandler {
             // RFLAGS|RF misread as a return address (trap.S stored &rflags in
             // tf.rsp). After the fix, rsp0 is the real faulting RSP; truncated
             // .text residue here is genuine smash — do not walk that chain.
-            print_fault_registers(fault_vaddr);
+            print_fault_registers(fault_vaddr, access_flags);
             print_fault_backtrace(access_flags);
             // Prefer a literal halt over `panic!` here: `panic!` formats through
             // the global panic handler and can #PF again on a smashed heap,
@@ -724,7 +727,7 @@ fn report_unresolved_kernel_fault(
         have_thread,
     ));
     report_heap_lock_held();
-    print_fault_registers(fault_vaddr);
+    print_fault_registers(fault_vaddr, access_flags);
     print_fault_backtrace(access_flags);
     // Release the latch before containment: a successful `try_contain` retires
     // just this coroutine and resumes scheduling, so a LATER fault must be free
@@ -787,7 +790,8 @@ fn report_unresolved_kernel_fault(
 /// well be a device BAR in the physmap, and reading a read-to-clear status
 /// register from here would be a diagnosis that changes what it diagnoses. The
 /// bytes at `rip` are the one exception, because the CPU was executing them.
-fn print_fault_registers(fault_vaddr: usize) {
+fn print_fault_registers(fault_vaddr: usize, access_flags: MMUFlags) {
+    let execute = access_flags.contains(MMUFlags::EXECUTE);
     let gprs = kernel_hal::kstats::last_fault_gprs();
     if gprs.iter().all(|&r| r == 0) {
         kernel_hal::oops_log::report(format_args!(
@@ -818,6 +822,22 @@ fn print_fault_registers(fault_vaddr: usize) {
         gprs[14],
         gprs[15],
     ));
+    // RFLAGS, and the one bit of it that has turned out to matter most. Every
+    // RFLAGS the long hunt printed had DF set, in a raw hex value nobody
+    // decoded, while the kernel's memcpy/memset were running backwards.
+    let rflags = kernel_hal::kstats::last_fault_rflags();
+    if rflags & kernel_hal::kaddr::RFLAGS_DF != 0 {
+        kernel_hal::oops_log::report(format_args!(
+            "[kfault-regs] rflags={:#x}: {}\n",
+            rflags,
+            kernel_hal::kaddr::DF_SET_NOTE,
+        ));
+    } else if rflags != 0 {
+        kernel_hal::oops_log::report(format_args!(
+            "[kfault-regs] rflags={:#x} (DF clear)\n",
+            rflags
+        ));
+    }
     let now_ns = kernel_hal::deadline::duration_to_ns(kernel_hal::timer::timer_now());
     // Then one line per distinct value that says something: which register the
     // address came from and at what offset, which ones hold clock values, and
@@ -838,6 +858,7 @@ fn print_fault_registers(fault_vaddr: usize) {
         let says = RegSays {
             value,
             fault_vaddr: fault_vaddr as u64,
+            execute,
             now_ns,
         };
         if !says.worth_a_line() {
@@ -851,12 +872,16 @@ fn print_fault_registers(fault_vaddr: usize) {
             says,
         ));
     }
-    if !explained {
+    if !explained && execute {
+        kernel_hal::oops_log::report(format_args!(
+            "[kfault-regs]   no register holds the branch target, so it came from \
+             memory: a ret, or a call/jmp through a pointer in memory\n"
+        ));
+    } else if !explained {
         kernel_hal::oops_log::report(format_args!(
             "[kfault-regs]   no register holds the faulting address or a base within \
              {:#x} of it: it was formed with an index register or a larger \
-             displacement, or loaded from memory by a ret or an indirect branch; \
-             the bytes at rip tell which\n",
+             displacement; the bytes at rip tell which\n",
             kernel_hal::kaddr::MAX_PLAUSIBLE_DISPLACEMENT,
         ));
     }
