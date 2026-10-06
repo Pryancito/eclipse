@@ -3338,6 +3338,10 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
               # wait_path = /dev/input/event0              (optional; block each start,\n\
               #                                             bounded, until this path\n\
               #                                             exists -- any file type)\n\
+              # timeout = 15                                (optional, oneshot only:\n\
+              #                                             seconds the boot waits for it\n\
+              #                                             before killing it and carrying\n\
+              #                                             on; zero waits for ever)\n\
               #\n\
               # 'oneshot' runs to completion in order during boot; 'respawn' is\n\
               # supervised and restarted if it exits. No shell is involved.\n",
@@ -3568,7 +3572,8 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
               requires = pulseaudio lunarbar\n\
               wait_socket = /run/user/0/wayland-0\n\
               desktop = labwc\n\
-              log = /tmp/boot-sound.log\n",
+              log = /tmp/boot-sound.log\n\
+              timeout = 15\n",
         )
         .unwrap();
         fs::write(
@@ -3579,7 +3584,8 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
               after = pulseaudio xorg\n\
               requires = pulseaudio xorg\n\
               desktop = xorg\n\
-              log = /tmp/boot-sound.log\n",
+              log = /tmp/boot-sound.log\n\
+              timeout = 15\n",
         )
         .unwrap();
     }
@@ -5575,6 +5581,154 @@ mod rootfs_plumbing_tests {
             body.contains("play -q -o alsa ") && body.contains("play -q -o alsa,oss "),
             "a playback path stopped going through the watchdog:\n{body}"
         );
+    }
+
+    /// Every oneshot has a bound now (`DEFAULT_ONESHOT_TIMEOUT`, 90 s), but the
+    /// one that hands an MP3 to mpg123 is the one that froze a machine, and it
+    /// has nothing to do but fork a detached player: it carries a bound of its
+    /// own, in seconds rather than the minute and a half everything else gets.
+    #[test]
+    fn the_chime_oneshots_carry_a_short_timeout_of_their_own() {
+        let rootfs = init_rootfs("chime-timeout");
+        for name in ["boot-sound", "boot-sound-xorg"] {
+            let body =
+                fs::read_to_string(rootfs.join(format!("etc/eclipse/services/{name}.service")))
+                    .unwrap();
+            let secs: u64 = fields(&body)
+                .into_iter()
+                .find(|(k, _)| *k == "timeout")
+                .unwrap_or_else(|| panic!("{name} sin timeout propio:\n{body}"))
+                .1
+                .parse()
+                .unwrap_or_else(|e| panic!("{name}: timeout no numerico: {e}"));
+            assert!(
+                secs > 0 && secs <= 30,
+                "{name}: timeout = {secs} no acota el chime"
+            );
+        }
+    }
+
+    /// The watchdog, RUN rather than read: the structural test above cannot
+    /// tell a working timeout loop from a broken one. Lifts `play()` out of the
+    /// generated script, points it at a fake mpg123 and shortens the limit to a
+    /// second, then asks the three questions that matter -- a player that never
+    /// exits is killed promptly and leaves nothing behind, a clean run still
+    /// returns 0, and a failing one still returns its own code (the `||`
+    /// fallback chain in the script depends on that last one).
+    #[test]
+    fn the_chime_watchdog_really_kills_a_player_that_hangs() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let rootfs = init_rootfs("chime-run");
+        let script = rootfs.join("usr/local/bin/eclipse-boot-sound-play");
+        let st = std::process::Command::new("sh")
+            .arg("-n")
+            .arg(&script)
+            .status()
+            .unwrap();
+        assert!(st.success(), "sh -n rejected eclipse-boot-sound-play");
+
+        // The helper on its own: from `MAXPLAY=` to the `}` that closes
+        // `play()`. Running the whole script would wait on a PCM that is not
+        // here and then play a track that is not either.
+        let body = fs::read_to_string(&script).unwrap();
+        let from = body.find("MAXPLAY=").expect("the helper lost its limit");
+        let to = from + body[from..].find("\n}\n").expect("play() is not closed") + 3;
+        let helper = &body[from..to];
+
+        let dir = scratch("chime-run-sh");
+        let bin = dir.join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        let pidfile = dir.join("hang.pid");
+        // A player that answers to its argument: `hang` never returns (and
+        // leaves its pid behind so the test can look for a survivor), `fail`
+        // exits 3, anything else succeeds.
+        fs::write(
+            bin.join("mpg123"),
+            format!(
+                "#!/bin/sh\n\
+                 case \"$1\" in\n\
+                 \x20 hang) echo $$ > \"{pid}\"; while :; do sleep 1; done ;;\n\
+                 \x20 fail) exit 3 ;;\n\
+                 \x20 *) exit 0 ;;\n\
+                 esac\n",
+                pid = pidfile.display()
+            ),
+        )
+        .unwrap();
+        let mut perms = fs::metadata(bin.join("mpg123")).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(bin.join("mpg123"), perms).unwrap();
+
+        let driver = dir.join("drive.sh");
+        fs::write(
+            &driver,
+            format!(
+                "PATH=\"{bin}\":$PATH\n\
+                 {helper}\n\
+                 MAXPLAY=1\n\
+                 play hang; echo \"hang=$?\"\n\
+                 sleep 2\n\
+                 if kill -0 \"$(cat '{pid}')\" 2>/dev/null; then echo alive=yes; \
+                 else echo alive=no; fi\n\
+                 play ok; echo \"ok=$?\"\n\
+                 play fail; echo \"fail=$?\"\n",
+                bin = bin.display(),
+                pid = pidfile.display()
+            ),
+        )
+        .unwrap();
+
+        // Bounded from out here too: a broken watchdog would leave the driver
+        // waiting on the hanging player for ever, and a test that HANGS says
+        // much less on a CI runner than one that fails.
+        let log = dir.join("drive.log");
+        let started = std::time::Instant::now();
+        let mut child = std::process::Command::new("sh")
+            .arg(&driver)
+            .stdout(fs::File::create(&log).unwrap())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let limit = std::time::Duration::from_secs(30);
+        loop {
+            match child.try_wait().unwrap() {
+                Some(_) => break,
+                None if started.elapsed() >= limit => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    let said = fs::read_to_string(&log).unwrap_or_default();
+                    panic!(
+                        "the watchdog never bounded the player: still running after \
+                         {limit:?}\n{said}"
+                    );
+                }
+                None => std::thread::sleep(std::time::Duration::from_millis(100)),
+            }
+        }
+        let took = started.elapsed();
+        let said = fs::read_to_string(&log).unwrap();
+
+        assert!(
+            said.contains("alive=no"),
+            "a player that never exits survived the watchdog (took {took:?}):\n{said}"
+        );
+        // Killed, so not a success -- the script's `||` then tries the next
+        // output module, which is what it did before this change too.
+        assert!(
+            said.contains("hang=") && !said.contains("hang=0"),
+            "a killed player reported success:\n{said}"
+        );
+        assert!(
+            said.contains("ok=0"),
+            "a clean play no longer returns 0:\n{said}"
+        );
+        assert!(
+            said.contains("fail=3"),
+            "the player's own exit code is lost, so the fallback path breaks:\n{said}"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     // ---- the renderer policy a login shell inherits -------------------
