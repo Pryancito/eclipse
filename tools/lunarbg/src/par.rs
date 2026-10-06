@@ -24,3 +24,60 @@ where
     let _ = (h, row_stride); // parameters reserved for future multi-band use
     f(0, data);
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_row_of_the_buffer_is_handed_out_exactly_once() {
+        // The invariant that outlives the current serial body, and the reason
+        // this is worth a test at all: the base scene is painted through here,
+        // so a row handed out twice is blended twice (a visibly darker band)
+        // and one handed out never keeps the previous frame's pixels. Written
+        // against `y0` so it still checks that if the bands come back.
+        for (h, row_stride) in [(1, 1), (1, 4), (4, 1), (7, 13), (1080, 16)] {
+            let mut data: Vec<usize> = vec![0; h * row_stride];
+            par_rows(&mut data, h, row_stride, |y0, band| {
+                for (i, px) in band.iter_mut().enumerate() {
+                    // The absolute row the element was reached as, +1 so a 0
+                    // left behind means "never written".
+                    *px = y0 + i / row_stride + 1;
+                }
+            });
+            for (i, v) in data.iter().enumerate() {
+                assert_eq!(*v, i / row_stride + 1, "element {i} of {h}x{row_stride}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_band_starts_at_row_zero_and_is_the_whole_buffer() {
+        // What the callers may assume TODAY, spelled out so that re-enabling
+        // the banding is a deliberate change with a failing test beside it
+        // rather than a silent one. Through a `Sync` counter because the bound
+        // is `Fn + Sync`: a test that only worked with a plain `FnMut` would
+        // stop compiling the day the threads come back.
+        let mut data = vec![7u8; 5 * 3];
+        let seen = std::sync::Mutex::new(Vec::new());
+        par_rows(&mut data, 5, 3, |y0, band| {
+            seen.lock().unwrap().push((y0, band.len()));
+        });
+        assert_eq!(seen.into_inner().unwrap(), [(0, 15)]);
+    }
+
+    #[test]
+    fn an_empty_buffer_runs_the_pass_once_over_nothing() {
+        // A wl_output whose mode has not settled gives a 0-sized surface, and
+        // this crate aborts on panic: a panic here is a desktop with no
+        // wallpaper at all. The pass still runs, so a caller that counts its
+        // own passes is not thrown off either.
+        let mut none: Vec<u8> = Vec::new();
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        par_rows(&mut none, 0, 0, |y0, band| {
+            assert_eq!((y0, band.len()), (0, 0));
+            calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        });
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+    }
+}
