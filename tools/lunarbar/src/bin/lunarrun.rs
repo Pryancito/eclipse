@@ -145,7 +145,7 @@ const TOPLEVEL_STATE_MINIMIZED: u32 = 1;
 
 // ── items ────────────────────────────────────────────────────────────────────
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Kind {
     /// A `.desktop` entry, or one of the builtin rows.
     App,
@@ -187,8 +187,25 @@ impl Item {
 
 /// Applications, plus the handful of rows KRunner has that are not programs.
 fn build_items(terminal: &str) -> Vec<Item> {
-    let lang = Lang::current();
-    let mut items = vec![
+    let mut items = builtin_items(terminal, Lang::current());
+    for AppEntry { name, exec, icon } in scan_apps(terminal) {
+        items.push(Item::new(name, exec, icon, Kind::App));
+    }
+    items
+}
+
+/// The rows that are not `.desktop` entries: the terminal, the compositor
+/// reload and the three power actions, in the order they appear above the
+/// applications.
+///
+/// Its own function because [`build_items`] goes on to call `scan_apps`, which
+/// walks `/usr/share/applications` and `$XDG_DATA_*`: from a test there is no
+/// way to see this table without whatever the machine happens to have
+/// installed. Each of these rows but the first runs a command that ends the
+/// session or powers the box off, so one wired to the wrong action is not a
+/// cosmetic mistake.
+fn builtin_items(terminal: &str, lang: Lang) -> Vec<Item> {
+    vec![
         Item::new(
             "Terminal".into(),
             terminal.to_string(),
@@ -219,11 +236,7 @@ fn build_items(terminal: &str) -> Vec<Item> {
             Some("system-shutdown".into()),
             Kind::App,
         ),
-    ];
-    for AppEntry { name, exec, icon } in scan_apps(terminal) {
-        items.push(Item::new(name, exec, icon, Kind::App));
-    }
-    items
+    ]
 }
 
 /// Indices of the items matching `filter`, prefix matches first, then
@@ -2516,6 +2529,246 @@ mod tests {
                 p.panel, p.field,
                 "{look:?}: the well does not read as a well"
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod builtin_row_tests {
+    use super::*;
+
+    const LANGS: [Lang; 2] = [Lang::Es, Lang::En];
+
+    /// The row named by its icon, which is the one field that does not change
+    /// with the language.
+    fn by_icon<'a>(items: &'a [Item], icon: &str) -> &'a Item {
+        items
+            .iter()
+            .find(|it| it.icon.as_deref() == Some(icon))
+            .unwrap_or_else(|| panic!("no row with the icon {icon}"))
+    }
+
+    #[test]
+    fn the_builtin_rows_are_the_five_the_launcher_promises() {
+        // The table nobody walked: five rows, each with a name, a command and
+        // an icon, and the only thing above them in the list is nothing. A row
+        // dropped here is an action the launcher silently stops offering.
+        for lang in LANGS {
+            let items = builtin_items("xterm", lang);
+            assert_eq!(items.len(), 5, "{lang:?}");
+            // In this order, because the list is shown in it and the first row
+            // is the one Enter runs on an empty filter: the terminal, never a
+            // power action.
+            let icons: Vec<&str> = items
+                .iter()
+                .map(|it| it.icon.as_deref().expect("every builtin row has an icon"))
+                .collect();
+            assert_eq!(
+                icons,
+                [
+                    "utilities-terminal",
+                    "view-refresh",
+                    "system-log-out",
+                    "system-reboot",
+                    "system-shutdown",
+                ],
+                "{lang:?}"
+            );
+            // All of them are applications and none is the synthesised
+            // "run what was typed" row, which `matches` skips: a builtin
+            // marked `Command` would never show up in any result list.
+            for it in &items {
+                assert_eq!(it.kind, Kind::App, "{:?} is not an App row", it.name);
+                assert!(!it.name.is_empty(), "a builtin row has no name");
+                assert!(!it.exec.is_empty(), "{:?} runs nothing", it.name);
+            }
+        }
+    }
+
+    #[test]
+    fn no_two_builtin_rows_share_a_name_an_icon_or_a_command() {
+        // What a copy-pasted row leaves behind, and the only thing that catches
+        // it: two rows reading the same are two rows where one of the actions
+        // has silently become the other. Checked per field, because a duplicate
+        // command with its own name is the dangerous one -- "log out" that
+        // reboots.
+        for lang in LANGS {
+            let items = builtin_items("xterm", lang);
+            for (i, a) in items.iter().enumerate() {
+                for b in &items[i + 1..] {
+                    assert_ne!(a.name, b.name, "{lang:?}: two rows named {:?}", a.name);
+                    assert_ne!(a.icon, b.icon, "{lang:?}: two rows with one icon");
+                    assert_ne!(
+                        a.exec, b.exec,
+                        "{lang:?}: {:?} and {:?} run the same command",
+                        a.name, b.name
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn each_power_row_runs_the_action_it_is_named_after() {
+        // The one mistake here that costs the user their session: a row wired
+        // to another row's command. Anchored on the icon, which is the row's
+        // identity in both languages, and asserted against the word the
+        // command has to contain -- a `reboot` under "log out" would end the
+        // session AND take the machine down with it.
+        let items = builtin_items("xterm", Lang::En);
+        let logout = &by_icon(&items, "system-log-out").exec;
+        assert!(logout.contains("labwc --exit"), "log out: {logout}");
+        assert!(
+            !logout.contains("reboot") && !logout.contains("poweroff"),
+            "log out takes the machine down: {logout}"
+        );
+        let reboot = &by_icon(&items, "system-reboot").exec;
+        assert!(reboot.contains("reboot"), "reboot: {reboot}");
+        assert!(
+            !reboot.contains("poweroff"),
+            "reboot powers off instead: {reboot}"
+        );
+        // The reload row only talks to the compositor: it must not be able to
+        // end the session, which is the row right under it.
+        let reload = &by_icon(&items, "view-refresh").exec;
+        assert!(reload.contains("--reconfigure"), "reload: {reload}");
+        for bad in ["--exit", "killall", "pkill", "reboot", "poweroff"] {
+            assert!(!reload.contains(bad), "the reload row can {bad}: {reload}");
+        }
+    }
+
+    #[test]
+    fn a_power_row_falls_back_rather_than_doing_nothing() {
+        // Each command is a `||` chain because the image does not guarantee
+        // which of the tools is there: a single `poweroff` that is missing
+        // leaves the row doing nothing at all, with the launcher already
+        // closed and no word on screen. What has to hold is that every chain
+        // has somewhere to fall to.
+        let items = builtin_items("xterm", Lang::En);
+        for icon in ["system-log-out", "system-reboot", "system-shutdown"] {
+            let exec = &by_icon(&items, icon).exec;
+            assert!(
+                exec.contains("||"),
+                "{icon} has a single command and no fallback: {exec}"
+            );
+            // Every branch of the chain is a real command and not an empty
+            // one, which a stray `||` would leave: `a || || b` runs a shell
+            // syntax error instead of the action.
+            for branch in exec.split("||") {
+                assert!(
+                    !branch.trim().is_empty(),
+                    "{icon} has an empty branch: {exec}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_terminal_row_runs_the_terminal_it_was_handed() {
+        // Whatever `$TERMINAL` or the probe settled on, verbatim: the row
+        // hard-coding one would launch a terminal that is not the image's, or
+        // none at all. And its name is the only builtin that is NOT
+        // translated, because "Terminal" is the same word in both.
+        for cmd in ["xterm", "eclipse-terminal", "/usr/bin/foot -a x"] {
+            for lang in LANGS {
+                let items = builtin_items(cmd, lang);
+                let term = by_icon(&items, "utilities-terminal");
+                assert_eq!(term.exec, cmd, "{lang:?}");
+                assert_eq!(term.name, "Terminal", "{lang:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_builtin_row_is_named_in_the_language_the_session_is_in() {
+        // The names come from `i18n`, so they differ per language, and the
+        // only thing that can go wrong invisibly is a row that forgot to ask:
+        // a hard-coded English name in a Spanish session. The three that are
+        // translated must actually differ between the two.
+        let es = builtin_items("xterm", Lang::Es);
+        let en = builtin_items("xterm", Lang::En);
+        for icon in [
+            "view-refresh",
+            "system-log-out",
+            "system-reboot",
+            "system-shutdown",
+        ] {
+            assert_ne!(
+                by_icon(&es, icon).name,
+                by_icon(&en, icon).name,
+                "{icon} reads the same in both languages"
+            );
+        }
+        // And each name is the one `i18n` holds for that action, so the rows
+        // cannot be shuffled against their labels.
+        for lang in LANGS {
+            let items = builtin_items("xterm", lang);
+            assert_eq!(by_icon(&items, "view-refresh").name, lang.run_reload());
+            assert_eq!(by_icon(&items, "system-log-out").name, lang.power_logout());
+            assert_eq!(by_icon(&items, "system-reboot").name, lang.power_reboot());
+            assert_eq!(
+                by_icon(&items, "system-shutdown").name,
+                lang.power_shutdown()
+            );
+        }
+    }
+
+    #[test]
+    fn a_builtin_row_is_findable_by_typing_its_name() {
+        // The rows are only reachable through `matches`, which tests the
+        // normalised name and the normalised name-plus-command. A row whose
+        // keys were not built from its own name and exec is a row the filter
+        // can never bring up -- it is in the list and unreachable.
+        for lang in LANGS {
+            let items = builtin_items("xterm", lang);
+            for (i, it) in items.iter().enumerate() {
+                // Its whole name brings up that row, and as a prefix match: it
+                // has to be in the first group, not behind every application
+                // whose command happens to contain the same letters.
+                let hits = matches(&items, &it.name);
+                assert_eq!(
+                    hits.first(),
+                    Some(&i),
+                    "{lang:?}: typing {:?} does not bring up its own row first",
+                    it.name
+                );
+                // And its command does too, through the substring test.
+                let word = it.exec.split_whitespace().next().unwrap();
+                assert!(
+                    matches(&items, word).contains(&i),
+                    "{lang:?}: {:?} is not findable by its command {word:?}",
+                    it.name
+                );
+            }
+            // An empty filter shows every one of them, in order: that is the
+            // list the launcher opens with.
+            assert_eq!(matches(&items, ""), (0..items.len()).collect::<Vec<_>>());
+        }
+        // Accents are folded, which is what makes the Spanish rows typeable on
+        // a layout the search field cannot produce them on: "cerrar sesion"
+        // with no accent has to find "cerrar sesión".
+        let es = builtin_items("xterm", Lang::Es);
+        let sesion = es
+            .iter()
+            .position(|it| it.icon.as_deref() == Some("system-log-out"))
+            .expect("the log-out row");
+        assert!(matches(&es, "cerrar sesion").contains(&sesion));
+    }
+
+    #[test]
+    fn the_builtin_rows_come_before_the_applications() {
+        // `build_items` appends `scan_apps` after them, and `matches` keeps
+        // discovery order within each group: the builtins being first is what
+        // puts "shut down" above whatever `.desktop` file also matches "shut".
+        // Checked through the real `build_items` so the order of the two halves
+        // is what is tested, not the table again.
+        let all = build_items("xterm");
+        let builtins = builtin_items("xterm", Lang::current());
+        assert!(all.len() >= builtins.len());
+        for (i, it) in builtins.iter().enumerate() {
+            assert_eq!(all[i].name, it.name, "row {i} is not the builtin one");
+            assert_eq!(all[i].exec, it.exec, "row {i} runs something else");
+            assert_eq!(all[i].icon, it.icon, "row {i} wears another icon");
         }
     }
 }
