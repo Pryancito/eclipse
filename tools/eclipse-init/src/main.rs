@@ -2703,27 +2703,53 @@ fn reap_pending() {
         let mut status = 0;
         // SAFETY: non-blocking wait for any child.
         let pid = unsafe { libc::waitpid(-1, &mut status, libc::WNOHANG) };
-        if pid <= 0 {
-            // 0: children exist but none has exited. <0: ECHILD, or nothing
-            // more to collect.
+        if pid == 0 {
+            // Children exist, none has exited.
             return;
         }
-        if let Ok(mut queue) = PENDING_EXITS.lock() {
-            queue.push(Exit {
-                pid,
-                status,
-                at: Instant::now(),
-            });
+        if pid < 0 {
+            // Our handlers are installed WITHOUT `SA_RESTART` on purpose (see
+            // `install_handlers`), so a signal delivered right here comes back
+            // as EINTR having reaped nothing. Giving up on it would leave the
+            // death to be collected after the gate, with the late `at` this
+            // whole queue exists to avoid -- so retry instead.
+            if errno() == libc::EINTR {
+                continue;
+            }
+            // ECHILD, or nothing more to collect.
+            return;
         }
+        queue_exit(Exit {
+            pid,
+            status,
+            at: Instant::now(),
+        });
     }
+}
+
+/// Push onto the queue, through a poisoned lock if it comes to that.
+///
+/// `PENDING_EXITS` is only ever held for a `push` or a `take`, so a poisoning
+/// means some *other* code panicked while this lock happened to be held -- and
+/// since #1748 a panic in PID 1 unwinds and is caught instead of killing the
+/// machine, which makes poisoning reachable rather than theoretical. Dropping
+/// an exit on it would strand a respawn service with `pid = Some(..)` for ever,
+/// exactly the failure this queue is here to prevent, so take the data back out
+/// of the poisoned guard and carry on.
+fn queue_exit(exit: Exit) {
+    let mut queue = PENDING_EXITS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    queue.push(exit);
 }
 
 /// Everything [`reap_pending`] has collected since the last call.
 fn take_pending() -> Vec<Exit> {
-    PENDING_EXITS
+    // Through a poisoned lock as well, for the reason in `queue_exit`.
+    let mut queue = PENDING_EXITS
         .lock()
-        .map(|mut queue| std::mem::take(&mut *queue))
-        .unwrap_or_default()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    std::mem::take(&mut *queue)
 }
 
 /// Reap, then sleep: the one poll step of every bounded wait.
@@ -3433,15 +3459,29 @@ mod tests {
         assert!(map["worker"].restart_at.is_none());
     }
 
+    /// Serializes the tests that touch the global `PENDING_EXITS`. Poisoning
+    /// is stepped over here too: one failing test must not take the rest of
+    /// them down with it.
+    fn queue_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        static QUEUE_TESTS: Mutex<()> = Mutex::new(());
+        QUEUE_TESTS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     /// The queue is what makes reaping inside a gate safe: a bare
     /// `waitpid(-1)` in there would swallow a respawn service's death, the
     /// loop would never see that pid, and nothing would ever restart it.
     #[test]
     fn what_a_gate_reaps_is_handed_to_the_loop_and_handed_over_once() {
+        // `PENDING_EXITS` is global and the suite runs in parallel, so any
+        // test that touches the queue has to hold this first or the counts
+        // below belong to whoever else was pushing.
+        let _exclusive = queue_test_lock();
         // Start from empty: another test in this binary may have run a gate.
         let _ = take_pending();
         let at = Instant::now();
-        PENDING_EXITS.lock().unwrap().push(Exit {
+        queue_exit(Exit {
             pid: 11,
             status: 0,
             at,
@@ -3455,6 +3495,34 @@ mod tests {
             take_pending().is_empty(),
             "la misma muerte se entrego dos veces"
         );
+    }
+
+    /// Poisoning is reachable since #1748 (a panic in PID 1 unwinds now), and
+    /// a dropped exit is a respawn service stranded with `pid = Some(..)` for
+    /// ever -- so the queue has to survive it.
+    #[test]
+    fn a_poisoned_queue_still_hands_the_death_over() {
+        let _exclusive = queue_test_lock();
+        let _ = take_pending();
+
+        // Poison it the only way it can be poisoned: panic while holding it.
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let _ = std::panic::catch_unwind(|| {
+            let _held = PENDING_EXITS.lock().unwrap();
+            panic!("boom");
+        });
+        std::panic::set_hook(previous);
+        assert!(PENDING_EXITS.is_poisoned(), "no se llego a envenenar");
+
+        queue_exit(Exit {
+            pid: 12,
+            status: 0,
+            at: Instant::now(),
+        });
+        let taken = take_pending();
+        assert_eq!(taken.len(), 1, "la muerte se perdio con el envenenamiento");
+        assert_eq!(taken[0].pid, 12);
     }
 
     // -- PID 1 may not die --------------------------------------------------
