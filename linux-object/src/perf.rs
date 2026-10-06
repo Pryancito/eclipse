@@ -892,6 +892,27 @@ pub fn kernel_report() -> String {
         },
         ks.tick_gaps_late_idle
     );
+    // Where the longest of those gaps ended. The lock that protects almost
+    // everything in this kernel disables interrupts for its whole critical
+    // section, so a multi-second gap on a busy CPU IS a multi-second critical
+    // section; the address is the only thing missing to name it. A high address
+    // is kernel code, a low one a user thread that was running with the tick
+    // simply late.
+    {
+        let rip = kernel_hal::kstats::tick_gap_max_rip();
+        if rip != 0 {
+            let _ = writeln!(
+                out,
+                "  worst gap ended at rip {:#x} ({}) -- symbolize with addr2line",
+                rip,
+                if rip >= 0xffff_8000_0000_0000 {
+                    "kernel"
+                } else {
+                    "user"
+                }
+            );
+        }
+    }
     // Wake-up preemption: how often a task became runnable on a CPU that was
     // busy with someone else, and how often that actually cut the running
     // thread's timeslice short. Without this the woken task waits out the full

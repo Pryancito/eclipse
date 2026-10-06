@@ -58,6 +58,20 @@ static TICK_GAP_LAST_LATE_AT_NS: AtomicU64 = AtomicU64::new(0);
 static TICK_GAP_LAST_BUSY_NS_PERCPU: [AtomicU64; MAX_CORE_NUM] =
     [const { AtomicU64::new(0) }; MAX_CORE_NUM];
 
+/// [diag] The interrupted RIP of the tick that set [`TICK_GAP_MAX_NS`].
+///
+/// The gap says a busy CPU went that long without a tick; this says *where it
+/// was* when the tick finally landed. On this kernel the lock that protects
+/// almost everything disables interrupts for its whole critical section
+/// (`kernel-sync`'s `push_off`), so a multi-second gap on a busy CPU is a
+/// multi-second critical section, and the only thing missing to name it is an
+/// address. Symbolize with addr2line.
+///
+/// Written only by the tick that *won* the maximum -- `fetch_max` returns the
+/// previous value, so the winner is exactly the one it was smaller than -- which
+/// is what keeps the address and the gap describing the same tick.
+static TICK_GAP_MAX_RIP: AtomicU64 = AtomicU64::new(0);
+
 /// [diag] How long this CPU went without a tick, last time it took one while
 /// busy; 0 when the last tick interrupted a halt or there is nothing recorded.
 ///
@@ -70,6 +84,12 @@ pub fn last_busy_tick_gap_ns() -> u64 {
         return 0;
     }
     TICK_GAP_LAST_BUSY_NS_PERCPU[cpu].load(Relaxed)
+}
+
+/// [diag] Where the CPU was when the longest busy tick gap finally ended.
+/// 0 when no busy gap has been recorded. See [`TICK_GAP_MAX_RIP`].
+pub fn tick_gap_max_rip() -> u64 {
+    TICK_GAP_MAX_RIP.load(Relaxed)
 }
 
 /// [diag] Account the gap since this CPU's previous tick. `nominal_ns` is
@@ -96,7 +116,12 @@ pub fn note_tick_gap(now_ns: u64, nominal_ns: u64) {
         return;
     }
     TICK_GAP_LAST_BUSY_NS_PERCPU[cpu].store(gap, Relaxed);
-    TICK_GAP_MAX_NS.fetch_max(gap, Relaxed);
+    if TICK_GAP_MAX_NS.fetch_max(gap, Relaxed) < gap {
+        // We set the new maximum, so this tick's RIP is the one that belongs
+        // with it. `note_tick_context` ran earlier in the same trap (see
+        // `trap_handler`), so the slot already holds this tick's address.
+        TICK_GAP_MAX_RIP.store(TICK_LAST_RIP_PERCPU[cpu].load(Relaxed), Relaxed);
+    }
     if late {
         TICK_GAPS_LATE.fetch_add(1, Relaxed);
         TICK_GAP_LAST_LATE_NS.store(gap, Relaxed);
@@ -1111,6 +1136,7 @@ mod tests {
         TICK_GAP_MAX_NS.store(0, Relaxed);
         TICK_GAP_LAST_LATE_NS.store(0, Relaxed);
         TICK_GAP_LAST_LATE_AT_NS.store(0, Relaxed);
+        TICK_GAP_MAX_RIP.store(0, Relaxed);
     }
 
     /// What `last_busy_tick_gap_ns` reports after one `note_tick_gap`, read
@@ -1125,6 +1151,37 @@ mod tests {
             .collect();
         assert_eq!(seen.len(), 1, "exactamente un slot tuvo que escribirse");
         seen[0]
+    }
+
+    /// The address travels with the maximum, not with the latest tick. A gap
+    /// that did not win the maximum must not overwrite the address of the one
+    /// that did, or the number and the place stop describing the same event --
+    /// and the place is the whole point: on this kernel a multi-second gap on a
+    /// busy CPU is a multi-second interrupts-off critical section.
+    #[test]
+    fn the_address_belongs_to_the_worst_gap_not_the_last_one() {
+        let _g = SERIAL.lock();
+        prime(1_000_000, false);
+        let slot = current_slot().expect("este host tiene slot");
+
+        // El hueco gordo, con su direccion.
+        TICK_LAST_RIP_PERCPU[slot].store(0xffff_8000_dead_beef, Relaxed);
+        note_tick_gap(1_000_000 + 50 * NOMINAL, NOMINAL);
+        assert_eq!(tick_gap_max_rip(), 0xffff_8000_dead_beef);
+
+        // Uno mas corto despues: ni toca el maximo ni toca la direccion.
+        TICK_LAST_RIP_PERCPU[slot].store(0xffff_8000_0000_0001, Relaxed);
+        note_tick_gap(1_000_000 + 50 * NOMINAL + 10 * NOMINAL, NOMINAL);
+        assert_eq!(
+            tick_gap_max_rip(),
+            0xffff_8000_dead_beef,
+            "un hueco menor se llevo la direccion del mayor"
+        );
+
+        prime(1_000_000, false);
+        for r in TICK_LAST_RIP_PERCPU.iter() {
+            r.store(0, Relaxed);
+        }
     }
 
     /// A busy CPU records the gap, so the slice accounting can tell a tick that
