@@ -1415,6 +1415,50 @@ pub(super) fn min_payload_for_nr(nr: u32) -> Option<usize> {
     })
 }
 
+/// Whether the errno reporter should print a line for `nr` answering
+/// `errno`.
+///
+/// The reporter skips ENOSYS because the unhandled-NR arm already names
+/// those with more detail -- but that reasoning only covers ENOSYS coming
+/// OUT of that arm. A HANDLED arm can answer ENOSYS too, and then the skip
+/// turns a real refusal into silence: `EXEC` and `VM_BIND` both answer
+/// ENOSYS to a client with no uvmm (`nouveau_exec_ioctl_exec`), and in NVK
+/// any `EXEC` error becomes `VK_ERROR_DEVICE_LOST` on the spot, so that
+/// silence is a compositor dying with nothing on the console to say why --
+/// the exact symptom this reporter was added to end.
+pub(super) fn errno_worth_reporting(nr: u32, errno: i32) -> bool {
+    errno != ENOSYS || nr_has_arm(nr)
+}
+
+/// Whether `nouveau_ioctl_dispatch` has an arm for `nr`, as opposed to
+/// falling through to the unhandled-NR arm.
+///
+/// `GET_ZCULL_INFO` is in here and answers ENOSYS by design: one
+/// deduplicated line for it is a fair price for not losing `EXEC`'s.
+///
+/// Must track the `match` in `nouveau_ioctl_dispatch`. A new arm missing
+/// from here is not a correctness bug -- it only loses an ENOSYS line --
+/// and [`errno_reporter_tests`] pins the list so the omission is a visible
+/// edit rather than a quiet drift.
+pub(super) fn nr_has_arm(nr: u32) -> bool {
+    matches!(
+        nr,
+        NR_GETPARAM
+            | NR_CHANNEL_ALLOC
+            | NR_CHANNEL_FREE
+            | NR_NVIF
+            | NR_VM_INIT
+            | NR_VM_BIND
+            | NR_EXEC
+            | NR_GET_ZCULL_INFO
+            | NR_GEM_NEW
+            | NR_GEM_PUSHBUF
+            | NR_GEM_CPU_PREP
+            | NR_GEM_CPU_FINI
+            | NR_GEM_INFO
+    )
+}
+
 // --- Driver-private ioctl NRs (dispatch keys) -------------------------------
 //
 // Linux dispatches driver-private ioctls by NR alone:
@@ -2379,6 +2423,86 @@ mod direct_submit_tests {
                 "slot {} prints as the wrong ioctl",
                 slot(a)
             );
+        }
+    }
+}
+
+/// The errno reporter is the only thing standing between an ioctl refusal
+/// and a compositor that dies saying nothing. Its one exclusion has to be
+/// exactly as wide as its justification.
+#[cfg(test)]
+mod errno_reporter_tests {
+    use super::*;
+
+    /// The case that cost a boot: `EXEC` answers ENOSYS to a client with no
+    /// uvmm, NVK turns ANY `EXEC` error into `VK_ERROR_DEVICE_LOST`, and
+    /// skipping it by errno alone leaves the console blank while labwc dies.
+    #[test]
+    fn an_exec_that_answers_enosys_is_reported() {
+        assert!(errno_worth_reporting(NR_EXEC, ENOSYS));
+        assert!(errno_worth_reporting(NR_VM_BIND, ENOSYS));
+    }
+
+    /// The exclusion's own reason: an NR with no arm. There the
+    /// unhandled-NR arm prints its own, better line, so a second one is
+    /// noise.
+    #[test]
+    fn an_unhandled_nr_answering_enosys_is_left_to_its_own_arm() {
+        // 0x3f is past every NR the dispatcher names.
+        let reserved = DRM_COMMAND_BASE + 0x3f;
+        assert!(!nr_has_arm(reserved));
+        assert!(!errno_worth_reporting(reserved, ENOSYS));
+        // Any OTHER errno from it is still reported: the exclusion is about
+        // ENOSYS, not about unknown NRs.
+        assert!(errno_worth_reporting(reserved, EINVAL));
+    }
+
+    /// Every other errno is reported whatever the NR -- that is the whole
+    /// point of a catch-all.
+    #[test]
+    fn every_other_errno_is_reported() {
+        for e in [EINVAL, ENODEV, ENOENT, EFAULT, EIO, ENOMEM, EOPNOTSUPP] {
+            assert!(errno_worth_reporting(NR_EXEC, e), "errno {}", e);
+        }
+    }
+
+    /// The list pinned, so adding a dispatcher arm without telling the
+    /// reporter is an edit someone has to make on purpose rather than a
+    /// silent drift. Keep it in step with the `match` in
+    /// `nouveau_ioctl_dispatch`.
+    #[test]
+    fn the_handled_arms_are_the_ones_the_dispatcher_matches() {
+        let handled = [
+            NR_GETPARAM,
+            NR_CHANNEL_ALLOC,
+            NR_CHANNEL_FREE,
+            NR_NVIF,
+            NR_VM_INIT,
+            NR_VM_BIND,
+            NR_EXEC,
+            NR_GET_ZCULL_INFO,
+            NR_GEM_NEW,
+            NR_GEM_PUSHBUF,
+            NR_GEM_CPU_PREP,
+            NR_GEM_CPU_FINI,
+            NR_GEM_INFO,
+        ];
+        for nr in handled {
+            assert!(nr_has_arm(nr), "{} has an arm", nouveau_ioctl_name(nr));
+        }
+        // And nothing else in the driver-private range does. The deprecated
+        // numbers (SETPARAM, GROBJ_ALLOC, ...) and the SVM pair are named by
+        // the trail but have no arm.
+        for off in 0u32..0x40 {
+            let nr = DRM_COMMAND_BASE + off;
+            if !handled.contains(&nr) {
+                assert!(
+                    !nr_has_arm(nr),
+                    "{} (nr={:#04x}) claims an arm it does not have",
+                    nouveau_ioctl_name(nr),
+                    nr
+                );
+            }
         }
     }
 }

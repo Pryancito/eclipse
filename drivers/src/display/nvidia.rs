@@ -12292,13 +12292,18 @@ impl NvidiaGpu {
         // ONE [nouveau-uapi] failure line: several arms return errors without
         // their own klog, so "which ioctl failed?" was unanswerable from a
         // photo. One line per DISTINCT (nr, errno) pair -- repeats collapse,
-        // an ioctl storm cannot own the UART. ENOSYS stays out: the
-        // unhandled-NR arm already names those with more detail.
+        // an ioctl storm cannot own the UART. ENOSYS stays out ONLY for an
+        // NR with no arm: that one the unhandled-NR arm already names with
+        // more detail. A HANDLED arm answering ENOSYS is a real refusal and
+        // gets its line -- `EXEC` and `VM_BIND` do it to a client with no
+        // uvmm, and in NVK an `EXEC` error is `VK_ERROR_DEVICE_LOST` right
+        // there, so skipping it is a compositor dying with a silent console,
+        // which is the exact symptom this reporter exists to end.
         let res = self.nouveau_ioctl_dispatch(request, arg, owner_pid);
         if let Err(e) = res {
             use super::nouveau_uapi as nv;
-            if e != nv::ENOSYS && (request >> 8) & 0xff == 0x64 {
-                let (_dir, nr, _size) = nv::decode_ioc(request);
+            let (_dir, nr, _size) = nv::decode_ioc(request);
+            if nv::errno_worth_reporting(nr, e) && (request >> 8) & 0xff == 0x64 {
                 let sig = ((nr as u64) << 32) ^ (e as u32 as u64);
                 static LAST_ERR_SIG: core::sync::atomic::AtomicU64 =
                     core::sync::atomic::AtomicU64::new(u64::MAX);
