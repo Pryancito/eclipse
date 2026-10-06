@@ -4686,7 +4686,45 @@ static int sig_pending_release_op(void) {
     }
     if (g_sig_count != before)
         return 0;
+    // Not delivered on the mask change. Count it, then try again a few times
+    // before giving the row up.
+    //
+    // `timed_ns_per_op` voids a whole row the first time its operation returns
+    // non-zero, warm-up call included, and that is right for a probe whose
+    // failure means the mechanism is broken. It is too brittle for this one:
+    // a single miss anywhere in a full run -- and there is exactly one, where
+    // the section run alone has none -- took the row to n/a under a sentence
+    // blaming the signal mask. A mechanism that is really broken fails every
+    // attempt, so retrying a handful of times tells a rare miss from a kernel
+    // that does not honour the mask, and the count is printed either way.
     g_pend_fail_undelivered++;
+    for (int retry = 0; retry < 4; retry++) {
+        sigset_t again;
+        sigemptyset(&again);
+        sigaddset(&again, SIGUSR1);
+        if (sigprocmask(SIG_BLOCK, &again, &old) != 0) {
+            g_pend_fail_block++;
+            return 1;
+        }
+        before = g_sig_count;
+        if (kill(getpid(), SIGUSR1) != 0) {
+            g_pend_fail_kill++;
+            sigprocmask(SIG_SETMASK, &old, NULL);
+            return 1;
+        }
+        if (g_sig_count != before) {
+            g_pend_fail_early++;
+            sigprocmask(SIG_SETMASK, &old, NULL);
+            return 1;
+        }
+        if (sigprocmask(SIG_SETMASK, &old, NULL) != 0) {
+            g_pend_fail_restore++;
+            return 1;
+        }
+        if (g_sig_count != before)
+            return 0; // a miss, not a broken mask
+        g_pend_fail_undelivered++;
+    }
     return 1;
 }
 
@@ -7173,11 +7211,16 @@ int main(int argc, char **argv) {
             printf("   requires the handler NOT to have run until the mask is\n");
             printf("   lifted; a kernel that delivers anyway reports n/a here\n");
             printf("   rather than a plausible number.)\n");
-            if (pend < 0) {
-                // n/a can mean five different things and only one of them is
+            if (pend < 0 || g_pend_fail_prearmed || g_pend_fail_early ||
+                g_pend_fail_undelivered || g_pend_fail_block ||
+                g_pend_fail_restore || g_pend_fail_kill) {
+                // n/a can mean six different things and only one of them is
                 // the kernel's fault, so say which rather than leaving the
-                // sentence above to be read as the verdict.
-                printf("   n/a because:");
+                // sentence above to be read as the verdict. The counts are
+                // printed next to a successful figure too: a row that got its
+                // number after retrying is not the same as one that never
+                // missed, and only the counts distinguish them.
+                printf(pend < 0 ? "   n/a because:" : "   retried after:");
                 if (g_pend_fail_prearmed)
                     printf(" SIGUSR1 was already blocked on entry (%d)",
                            (int)g_pend_fail_prearmed);
