@@ -816,6 +816,22 @@ fn try_skip_null_execute_call(tf: &mut TrapFrame, fault_vaddr: usize) -> bool {
 /// Reads only mapped kernel `.text` (the faulting RIP is by definition in it),
 /// prints through the spin writer and allocates nothing.
 fn report_ud_shape(rip: u64) {
+    // Say each RIP once. A `#UD` at a corrupt pointer panics, and a panic whose
+    // own reporting path faults comes straight back here with the same RIP: a
+    // capture from hardware carries `[#UD] RIP 0xa0002` fifteen times, one per
+    // turn of that loop, with the report those lines exist to explain scrolled
+    // off the top. The loop itself is fixed where it starts, in the panic
+    // handler, but a diagnostic that repeats verbatim is noise whatever drives
+    // it, and the one case worth hearing twice -- a *different* RIP -- still is
+    // heard. One slot, because the interesting value is the one that is
+    // repeating right now.
+    {
+        use core::sync::atomic::{AtomicU64, Ordering};
+        static LAST_RIP: AtomicU64 = AtomicU64::new(u64::MAX);
+        if LAST_RIP.swap(rip, Ordering::Relaxed) == rip {
+            return;
+        }
+    }
     // A RIP outside kernel .text is the loudest case of all and used to print
     // nothing: `#UD at RIP=0x21` means execution branched through a null or
     // scribbled function pointer and the CPU decoded whatever lives at address
