@@ -60,3 +60,12 @@ smoltcp = { git = "https://github.com/smoltcp-rs/smoltcp", rev = "35e833e3", def
 async-std = { version = "1.10", features = ["attributes"] }
 kernel-hal = { path = "../kernel-hal", features = ["libos"] }
 zcore-drivers = { path = "../drivers", features = ["mock"] }
+
+# Reference benchmarks (`benches/vfs.rs`); see the note in
+# `zircon-object/Cargo.toml`.
+#
+#   cargo bench -p linux-object --bench vfs --features mock-disk
+[[bench]]
+name = "vfs"
+harness = true
+required-features = ["mock-disk"]
