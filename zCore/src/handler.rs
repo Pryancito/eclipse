@@ -480,7 +480,7 @@ impl KernelHandler for ZcoreKernelHandler {
 #[cfg(not(feature = "libos"))]
 fn report_heap_lock_held() {
     if crate::memory::heap_held_by_current_cpu() {
-        kernel_hal::console::serial_write_str(
+        kernel_hal::oops_log::report_str(
             "[diag] THIS CPU WAS HOLDING THE KERNEL HEAP LOCK when it faulted. The fault \
              is therefore inside the allocator (its free lists are intrusive, so a wild \
              write into them faults on the next walk), it cannot be contained on this CPU, \
@@ -541,7 +541,7 @@ fn report_unresolved_kernel_fault(
     } else {
         ""
     };
-    kernel_hal::console::serial_write_fmt_spin(format_args!(
+    kernel_hal::oops_log::report(format_args!(
         "\n[KERNEL PAGE FAULT] vaddr={:#x}{}{} flags={:?} rip={} have_thread={} \
          (unresolved by the user vmar — a kernel-side bug, not a userspace \
          SIGSEGV; the text console is skipped so a torn graphic console cannot \
@@ -667,14 +667,14 @@ fn print_fault_backtrace(access_flags: MMUFlags) {
                     executor::note_heap_smash_suspected();
                     let (hard, soft) = executor::hard_guard_executor_counts();
                     if hard > 0 {
-                        kernel_hal::console::serial_write_fmt_spin(format_args!(
+                        kernel_hal::oops_log::report(format_args!(
                             "[diag] truncated return residue (rsp0={:#x} [rsp0]={:#x}); \
                              hard guards not hit — likely in-stack buffer smash or \
                              heap fn-ptr corruption (NOT coroutine stack overflow)\n",
                             sp0, top,
                         ));
                     } else {
-                        kernel_hal::console::serial_write_fmt_spin(format_args!(
+                        kernel_hal::oops_log::report(format_args!(
                             "[diag] likely coroutine stack overflow — return address high \
                              word was zeroed (rsp0={:#x} [rsp0]={:#x}); the growing stack \
                              overwrote its own return-address slot with the low half of a \
@@ -682,7 +682,7 @@ fn print_fault_backtrace(access_flags: MMUFlags) {
                             sp0, top,
                         ));
                     }
-                    kernel_hal::console::serial_write_fmt_spin(format_args!(
+                    kernel_hal::oops_log::report(format_args!(
                         "[soft-smash] hooks_registered={} hard_guard_executors={} \
                          soft_guard_executors={}\n",
                         executor::stack_guard_hooks_registered(),
@@ -699,7 +699,7 @@ fn print_fault_backtrace(access_flags: MMUFlags) {
                 }
                 #[cfg(feature = "libos")]
                 {
-                    kernel_hal::console::serial_write_fmt_spin(format_args!(
+                    kernel_hal::oops_log::report(format_args!(
                         "[diag] truncated return residue (rsp0={:#x} [rsp0]={:#x})\n",
                         sp0, top,
                     ));
@@ -715,14 +715,14 @@ fn print_fault_backtrace(access_flags: MMUFlags) {
         use core::sync::atomic::{AtomicBool, Ordering as O};
         static NOTED: AtomicBool = AtomicBool::new(false);
         if !NOTED.swap(true, O::Relaxed) {
-            kernel_hal::console::serial_write_str(
+            kernel_hal::oops_log::report_str(
                 "[kfault-bt] (no in-kernel symbol table in this build — addresses \
                  are bare; symbolize with `make sym ADDRS=\"...\"` where this \
                  kernel was built)\n",
             );
         }
     }
-    kernel_hal::console::serial_write_fmt_spin(format_args!(
+    kernel_hal::oops_log::report(format_args!(
         "[kfault-bt] rbp={:#x} rsp={:#x} walking frames:\n",
         rbp0, rsp0,
     ));
@@ -759,7 +759,7 @@ fn print_fault_backtrace(access_flags: MMUFlags) {
         let saved_rbp = unsafe { core::ptr::read_volatile(rbp as *const u64) };
         let ret = unsafe { core::ptr::read_volatile((rbp + 8) as *const u64) };
         if ret < 0x1000 {
-            kernel_hal::console::serial_write_fmt_spin(format_args!(
+            kernel_hal::oops_log::report(format_args!(
                 "[kfault-bt]   #{:02} ret={} (rbp={:#x}) — abort walk (corrupt frame)\n",
                 i,
                 kernel_hal::ksyms::Addr(ret),
@@ -767,7 +767,7 @@ fn print_fault_backtrace(access_flags: MMUFlags) {
             ));
             break;
         }
-        kernel_hal::console::serial_write_fmt_spin(format_args!(
+        kernel_hal::oops_log::report(format_args!(
             "[kfault-bt]   #{:02} ret={} (rbp={:#x})\n",
             i,
             kernel_hal::ksyms::Addr(ret),
@@ -781,9 +781,7 @@ fn print_fault_backtrace(access_flags: MMUFlags) {
     }
     // Also raw-scan the stack for kernel code pointers as a fallback when the
     // frame chain is broken (memset is a leaf that may omit rbp).
-    kernel_hal::console::serial_write_fmt_spin(format_args!(
-        "[kfault-bt] raw stack scan from rsp:\n",
-    ));
+    kernel_hal::oops_log::report(format_args!("[kfault-bt] raw stack scan from rsp:\n",));
     let mut sp = rsp0 & !0x7u64;
     // Wider bound for everything below: `sp` only ever advances by 8 bytes at
     // a time from `rsp0` (at most 4 KiB total across the whole scan loop), so
@@ -819,12 +817,12 @@ fn print_fault_backtrace(access_flags: MMUFlags) {
         } else {
             "return address of the faulting function (non-kernel value = stack corruption)"
         };
-        kernel_hal::console::serial_write_fmt_spin(format_args!(
+        kernel_hal::oops_log::report(format_args!(
             "[kfault-bt]   [rsp0]={:#x} <- {}\n",
             top, label,
         ));
     } else {
-        kernel_hal::console::serial_write_fmt_spin(format_args!(
+        kernel_hal::oops_log::report(format_args!(
             "[kfault-bt]   rsp0={:#x} is itself out of the plausible kernel range -- \
              not dereferencing it (avoids a #PF-during-#PF -> double fault)\n",
             sp,
@@ -835,10 +833,7 @@ fn print_fault_backtrace(access_flags: MMUFlags) {
     while found < 20 && scanned < 512 && plausible_sp(sp) && mapped(sp) {
         let w = unsafe { core::ptr::read_volatile(sp as *const u64) };
         if plausible_sp(w) {
-            kernel_hal::console::serial_write_fmt_spin(format_args!(
-                "[kfault-bt]   @{:#x} = {:#x}\n",
-                sp, w,
-            ));
+            kernel_hal::oops_log::report(format_args!("[kfault-bt]   @{:#x} = {:#x}\n", sp, w,));
             found += 1;
         }
         sp += 8;
@@ -852,7 +847,7 @@ fn print_fault_backtrace(access_flags: MMUFlags) {
 fn report_soft_smash_stack_attr(rsp: usize, rbp: usize) {
     let attr = executor::attribute_fault_stack_ptrs(rsp, rbp);
     let fmt_hit = |label: &str, hit: Option<executor::StackAttrHit>| match hit {
-        Some(h) => kernel_hal::console::serial_write_fmt_spin(format_args!(
+        Some(h) => kernel_hal::oops_log::report(format_args!(
             "[soft-smash] {}={:#x} -> CPU{} exec={} task={} stack_base={:#x} region={}\n",
             label,
             if label == "rsp" { rsp } else { rbp },
@@ -862,7 +857,7 @@ fn report_soft_smash_stack_attr(rsp: usize, rbp: usize) {
             h.stack_base,
             h.region.as_str(),
         )),
-        None => kernel_hal::console::serial_write_fmt_spin(format_args!(
+        None => kernel_hal::oops_log::report(format_args!(
             "[soft-smash] {}={:#x} -> OUTSIDE all executor stacks \
                  (walked {} CPUs, skipped {}, {} executors)\n",
             label,
@@ -899,7 +894,7 @@ fn report_soft_smash_stack_attr(rsp: usize, rbp: usize) {
                 .map(|(_, f, _)| !f.is_empty())
                 .unwrap_or(false)
         };
-        kernel_hal::console::serial_write_str(
+        kernel_hal::oops_log::report_str(
             "[kchain] .text return-address chain up the victim stack \
              (symbolize: llvm-addr2line -e zcore -fCi <ret ...>):\n",
         );
@@ -910,7 +905,7 @@ fn report_soft_smash_stack_attr(rsp: usize, rbp: usize) {
             if mapped(a) {
                 let v = unsafe { core::ptr::read_volatile(a as *const u64) };
                 if kernel_hal::kaddr::is_kernel_text(v) {
-                    kernel_hal::console::serial_write_fmt_spin(format_args!(
+                    kernel_hal::oops_log::report(format_args!(
                         "[kchain]   @{:#x} ret={}\n",
                         a,
                         kernel_hal::ksyms::Addr(v),
@@ -921,7 +916,7 @@ fn report_soft_smash_stack_attr(rsp: usize, rbp: usize) {
             a = a.saturating_add(8);
         }
         core::mem::forget(pt); // from_current() must not free the live CR3 table
-        kernel_hal::console::serial_write_fmt_spin(format_args!(
+        kernel_hal::oops_log::report(format_args!(
             "[kchain] end — {} .text words in [{:#x},{:#x})\n",
             printed, base, end,
         ));
