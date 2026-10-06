@@ -27,6 +27,7 @@ publica en `/etc/eclipse/services/`.
 | Propagación del fallo de una dependencia | `Requires=` | — | sí | sí | no | sí | **sí (`requires =`)** |
 | Límite del tamaño de los logs | journald | `svlogd` | `s6-log` | logrotate | sí | sí | **sí (1 MiB + 1 generación)** |
 | Matar lo que quede al parar un servicio | cgroup | grupo de procesos | grupo de procesos | sí | sí | contrato | solo en el `timeout` de un `oneshot` |
+| Sobrevive a un fallo propio | — | — | — | — | — | — | **sí (`unwind` + `catch_unwind`)** |
 | Apagado ordenado | sí | sí | sí | sí | sí | sí | **no, a propósito** (ver abajo) |
 
 Dos casillas vacías son decisiones tomadas, no huecos:
@@ -122,14 +123,34 @@ Tres detalles del cómo:
 Lo que **no** cubre: un fichero que escriba un envoltorio por su cuenta y que no
 sea el `log =` de ningún servicio. Init solo conoce la tabla.
 
+## Lo que se cerró en la cuarta tanda
+
+**Un fallo de init ya no es un fallo de la máquina.** El perfil de release era
+`panic = "abort"`, así que cualquier `panic` en PID 1 —un índice, un borde
+aritmético, un `unwrap` sobre algo que dijo el disco— era al instante
+«Attempted to kill init»: la máquina entera parada por un error en una decisión.
+Ningún otro init de la tabla tiene que resolver esto, porque todos son procesos
+que el kernel puede permitirse perder; este no.
+
+Ahora el perfil es `panic = "unwind"` y los dos sitios que ejecutan código de
+decisión van dentro de un `guard`: arrancar un servicio (un fallo cuesta ese
+servicio, no el arranque) y el lazo de supervisión (se vuelve a entrar, con una
+pausa de 1 s para que un `panic` en la primera sentencia no sea un lazo caliente
+llenando la consola). Un gancho de `panic` nombra el fichero y la línea en la
+consola antes de desenrollar, porque en una máquina sin más diagnóstico que esa
+consola, esa línea es el informe del fallo entero.
+
+Dos detalles: `AssertUnwindSafe` vale aquí porque lo único que cruza el límite
+es la tabla de servicios de init, y no hay invariante que un campo a medio
+escribir pueda romper —un servicio con `pid` puesto y `started_at` sin poner se
+lee como «arrancado ahora mismo», que es lo que habría concluido la siguiente
+cosecha—; y lo único que el desenrollado puede envenenar de verdad es el
+`Mutex` de `RENDERER_SAID`, que ya trataba un cerrojo envenenado como «dilo».
+El desenrollado cuesta unos 17 KiB de binario, un 4%.
+
 ## Cola, por orden de riesgo
 
-1. **PID 1 puede morir de un `panic!`.** El perfil de release es
-   `panic = "abort"`, así que cualquier `panic` en init es un kernel panic
-   («Attempted to kill init»). Hay que elegir: quitar los `unwrap`/`expect` de
-   las rutas vivas, o compilar con `unwind` y envolver el lazo de supervisión en
-   un `catch_unwind` que lo registre y siga.
-2. **Durante las esperas acotadas del arranque no se cosecha a nadie.** Los hijos
+1. **Durante las esperas acotadas del arranque no se cosecha a nadie.** Los hijos
    que mueran en esos segundos se quedan zombis hasta que se llega al lazo. Es
    cosmético, pero hay que arreglarlo con cuidado: un `waitpid(-1)` suelto ahí
    dentro le robaría al lazo la muerte de un `respawn` y ese servicio no se
