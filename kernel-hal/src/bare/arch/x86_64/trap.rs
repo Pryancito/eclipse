@@ -347,7 +347,7 @@ fn dump_null_execute_stack_once(tf: &TrapFrame, sp: u64, slot0: u64) {
             *slot = unsafe { core::ptr::read_volatile(a as *const u64) };
         }
     }
-    crate::console::serial_write_fmt_spin(format_args!(
+    crate::oops_log::report(format_args!(
         "\n[null-exec] trap_num={:#x} error_code={:#x} fault_rsp={:#x} \
          [0]={:#x} [1]={:#x} [2]={:#x} [3]={:#x} \
          (CALL→null keeps return at [0]; RET-of-0 already popped → [0] is next)\n",
@@ -358,7 +358,7 @@ fn dump_null_execute_stack_once(tf: &TrapFrame, sp: u64, slot0: u64) {
     // slot; rbx/r12-r15 restored to 0 extend the wipe's known reach one
     // callee-saved pop each. The arg/scratch registers still point at the
     // objects the dying call chain was touching — the victim's identity.
-    crate::console::serial_write_fmt_spin(format_args!(
+    crate::oops_log::report(format_args!(
         "[null-exec] regs: rax={:#x} rbx={:#x} rcx={:#x} rdx={:#x} rsi={:#x} rdi={:#x}\n\
          [null-exec]       rbp={:#x} r8={:#x} r9={:#x} r10={:#x} r11={:#x}\n\
          [null-exec]       r12={:#x} r13={:#x} r14={:#x} r15={:#x} rflags={:#x}\n",
@@ -419,7 +419,7 @@ fn dump_null_execute_stack_once(tf: &TrapFrame, sp: u64, slot0: u64) {
             }
         }
         let run_len = hi + 8 - lo;
-        crate::console::serial_write_fmt_spin(format_args!(
+        crate::oops_log::report(format_args!(
             "[null-exec] zero-run [{:#x}..{:#x}] len={:#x} ({} B) \
              start_align={:#x} (4K-aligned start={}); the bracketing non-zero \
              words below name the buffer edges\n",
@@ -434,14 +434,14 @@ fn dump_null_execute_stack_once(tf: &TrapFrame, sp: u64, slot0: u64) {
         // the survivors the writer did NOT touch — their values often identify
         // the neighbouring live frame (a return address, an Arc, poison).
         if let Some(below) = read8(lo.wrapping_sub(8)) {
-            crate::console::serial_write_fmt_spin(format_args!(
+            crate::oops_log::report(format_args!(
                 "[null-exec]   below @{:#x} = {:#018x}\n",
                 lo - 8,
                 below
             ));
         }
         if let Some(above) = read8(hi + 8) {
-            crate::console::serial_write_fmt_spin(format_args!(
+            crate::oops_log::report(format_args!(
                 "[null-exec]   above @{:#x} = {:#018x}\n",
                 hi + 8,
                 above
@@ -459,7 +459,7 @@ fn dump_null_execute_stack_once(tf: &TrapFrame, sp: u64, slot0: u64) {
         // never storm even if the chosen word turns out to be legitimately
         // written. Costs nothing until it fires.
         if crate::watchpoint::watch_write(lo as usize, 8) {
-            crate::console::serial_write_fmt_spin(format_args!(
+            crate::oops_log::report(format_args!(
                 "[null-exec] ARMED write-watch on 8B at {:#x} (deep in the zero \
                  run); the writer's NEXT strike traps with its rip — \
                  symbolize [watchpoint] rip with llvm-addr2line -e zcore\n",
@@ -496,7 +496,7 @@ fn report_dma_uaf_if_recycled(sp: u64) {
     };
     core::mem::forget(pt);
     if let Some(frees_ago) = crate::stack_guard::paddr_recently_freed_dma(paddr) {
-        crate::console::serial_write_fmt_spin(format_args!(
+        crate::oops_log::report(format_args!(
             "[dma-uaf] the corrupted stack frame pa={:#x} was a DMA buffer freed \
              {} DMA-free(s) ago — a device descriptor or a userspace \
              VmObject::new_physical mapping wrote it AFTER free: THIS is the \
@@ -542,7 +542,7 @@ fn try_skip_null_execute_call(tf: &mut TrapFrame, fault_vaddr: usize) -> bool {
         static LOGGED_NULL: AtomicBool = AtomicBool::new(false);
         if !LOGGED_NULL.swap(true, Ordering::SeqCst) {
             let (hard, soft) = ::executor::hard_guard_executor_counts();
-            crate::console::serial_write_fmt_spin(format_args!(
+            crate::oops_log::report(format_args!(
                 "\n[soft-smash] null return slot [fault_rsp]={:#x} — \
                  hooks_registered={} hard_guard_executors={} soft_guard_executors={}\n",
                 sp,
@@ -552,7 +552,7 @@ fn try_skip_null_execute_call(tf: &mut TrapFrame, fault_vaddr: usize) -> bool {
             ));
             let attr = ::executor::attribute_fault_stack_ptrs(tf.rsp, tf.rbp);
             if let Some(h) = attr.rsp {
-                crate::console::serial_write_fmt_spin(format_args!(
+                crate::oops_log::report(format_args!(
                     "[soft-smash] rsp={:#x} -> CPU{} exec={} region={}\n",
                     tf.rsp,
                     h.cpu,
@@ -571,16 +571,28 @@ fn try_skip_null_execute_call(tf: &mut TrapFrame, fault_vaddr: usize) -> bool {
     // registers; refuse and let isolation contain the fault.
     if !looks_like_kernel_text_ret(ret) {
         let shape = crate::kaddr::word_shape(ret);
-        let truncated_text = shape == crate::kaddr::WordShape::TruncatedText;
+        // The shapes that PROVE a smash rather than merely look wrong: a word
+        // in the first 64 KiB, and a `.text` address missing its top half.
+        // Nothing stores either in a code slot on purpose.
+        let proves_smash = matches!(
+            shape,
+            crate::kaddr::WordShape::TruncatedText | crate::kaddr::WordShape::NearNull
+        );
+        // Is this word the clock, read a moment ago? Two captures put a
+        // user-half word of the right order of magnitude for a nanosecond
+        // uptime in this slot, which is a guess until something measures it --
+        // and the kernel holds the one number that can. One clock read, once,
+        // on a path that is already printing.
+        let now_ns = crate::deadline::duration_to_ns(crate::timer::timer_now());
+        let clockish = crate::kaddr::plausible_uptime_ns(ret, now_ns);
         // Every shape gets the report, not only the two this used to know.
         // A capture came back with `[rsp0]=0x1cb0a4fb0e` -- a user-half word
         // in a kernel code slot -- and this path returned in silence, so the
         // one qword that names the writer class had no line at all. The
-        // sticky flag still belongs to the two shapes that prove a smash:
-        // latching on a user-half word would stop every IRQ and timer dyn
-        // dispatch in the system over a pointer that may simply have been
-        // mis-stored.
-        if truncated_text || ret < 0x1000 {
+        // sticky flag stays with the shapes that prove a smash: latching on a
+        // user-half word would stop every IRQ and timer dyn dispatch in the
+        // system over a pointer that may simply have been mis-stored.
+        if proves_smash {
             ::executor::note_heap_smash_suspected();
         }
         {
@@ -588,13 +600,19 @@ fn try_skip_null_execute_call(tf: &mut TrapFrame, fault_vaddr: usize) -> bool {
             static LOGGED: AtomicBool = AtomicBool::new(false);
             if !LOGGED.swap(true, Ordering::SeqCst) {
                 let (hard, soft) = ::executor::hard_guard_executor_counts();
-                crate::console::serial_write_fmt_spin(format_args!(
-                    "\n[soft-smash] [fault_rsp]={:#x} value={:#x} is {} — \
-                     hooks_registered={} \
+                crate::oops_log::report(format_args!(
+                    "\n[soft-smash] [fault_rsp]={:#x} value={:#x} is {}{} \
+                     (uptime now {} ns) — hooks_registered={} \
                      hard_guard_executors={} soft_guard_executors={}\n",
                     sp,
                     ret,
                     shape.as_str(),
+                    if clockish {
+                        " AND is a monotonic-clock reading from this boot"
+                    } else {
+                        " and is NOT a clock reading from this boot"
+                    },
+                    now_ns,
                     ::executor::stack_guard_hooks_registered(),
                     hard,
                     soft,
@@ -602,7 +620,7 @@ fn try_skip_null_execute_call(tf: &mut TrapFrame, fault_vaddr: usize) -> bool {
                 let attr = ::executor::attribute_fault_stack_ptrs(tf.rsp, tf.rbp);
                 let report =
                     |label: &str, addr: usize, hit: Option<::executor::StackAttrHit>| match hit {
-                        Some(h) => crate::console::serial_write_fmt_spin(format_args!(
+                        Some(h) => crate::oops_log::report(format_args!(
                             "[soft-smash] {}={:#x} -> CPU{} exec={} task={} \
                              stack_base={:#x} region={}\n",
                             label,
@@ -613,7 +631,7 @@ fn try_skip_null_execute_call(tf: &mut TrapFrame, fault_vaddr: usize) -> bool {
                             h.stack_base,
                             h.region.as_str(),
                         )),
-                        None => crate::console::serial_write_fmt_spin(format_args!(
+                        None => crate::oops_log::report(format_args!(
                             "[soft-smash] {}={:#x} -> OUTSIDE all executor stacks \
                              (walked {} CPUs, skipped {}, {} executors)\n",
                             label, addr, attr.cpus_walked, attr.cpus_skipped, attr.executors_seen,
@@ -639,7 +657,7 @@ fn try_skip_null_execute_call(tf: &mut TrapFrame, fault_vaddr: usize) -> bool {
         ::executor::note_heap_smash_suspected();
         static LOGGED_RESIDUE: AtomicBool = AtomicBool::new(false);
         if !LOGGED_RESIDUE.swap(true, Ordering::SeqCst) {
-            crate::console::serial_write_fmt_spin(format_args!(
+            crate::oops_log::report(format_args!(
                 "\n[null-exec] [fault_rsp]={:#x} ranges like .text but is NOT \
                  preceded by a CALL — a RET went through a corrupted stack slot \
                  (RSP desync / stack overwrite), not a bad fn-ptr call. \
@@ -654,7 +672,7 @@ fn try_skip_null_execute_call(tf: &mut TrapFrame, fault_vaddr: usize) -> bool {
     static REPORTS: AtomicUsize = AtomicUsize::new(0);
     let n = REPORTS.fetch_add(1, Ordering::Relaxed);
     if n < 64 {
-        crate::console::serial_write_fmt_spin(format_args!(
+        crate::oops_log::report(format_args!(
             "\n[KERNEL BUG] null-range EXECUTE #PF (vaddr={:#x} rip={:#x}); \
              skipping bad call -> ret={:#x} (in_timer_callback={}). \
              Interrupted userspace thread name is coincidental — NOT a \

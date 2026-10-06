@@ -215,6 +215,32 @@ pub fn looks_truncated_text(a: u64) -> bool {
     truncated_text(kernel_text(), a)
 }
 
+/// Below this, a word in a code slot is read as a near-null transfer rather
+/// than as an address.
+///
+/// Sixty-four kilobytes: Linux's default `mmap_min_addr`, and -- not a
+/// coincidence -- exactly the low bound of this tree's own [`FALLBACK_TEXT`].
+/// Nothing in this kernel branches that low on purpose.
+pub const MIN_PLAUSIBLE_CODE: u64 = 0x1_0000;
+
+/// Whether `word` could be the monotonic clock read a moment ago, given the
+/// current reading `now_ns`.
+///
+/// Two captures of the same fault landed `0x1cb0a4fb0e` and `0x52152b153` in
+/// the slot where a return address belongs -- both user-half, both different,
+/// and both the right order of magnitude for a nanosecond uptime. That is a
+/// guess until something measures it, and the kernel is holding the one number
+/// that can: its own clock. A word inside the last eighth of uptime is a
+/// reading taken during this boot; anything else is not, and says so.
+///
+/// Deliberately one-sided. A word *above* `now_ns` is not a clock read at all
+/// (nothing has read it yet), and the window is a fraction of uptime rather
+/// than a fixed span so it means the same thing at ten seconds and at ten
+/// hours.
+pub fn plausible_uptime_ns(word: u64, now_ns: u64) -> bool {
+    word != 0 && word <= now_ns && word >= now_ns - now_ns / 8
+}
+
 /// What a machine word found where a kernel code pointer belongs looks like.
 ///
 /// `try_skip_null_execute_call` reads the qword at the faulting `RSP` and has
@@ -238,8 +264,8 @@ pub enum WordShape {
     Zero,
     /// Has the shape of an `RFLAGS` value (see [`looks_like_rflags`]).
     Rflags,
-    /// Non-zero but below the first page: a length, a count, an index.
-    Small,
+    /// Non-zero but inside the first 64 KiB. See [`MIN_PLAUSIBLE_CODE`].
+    NearNull,
     /// A `.text` address with its top half gone (see [`truncated_text`]).
     TruncatedText,
     /// A genuine address inside the kernel image's `.text`.
@@ -259,7 +285,10 @@ impl WordShape {
         match self {
             WordShape::Zero => "zero (the slot was cleared)",
             WordShape::Rflags => "an RFLAGS value (a trap frame read at the wrong offset)",
-            WordShape::Small => "below the first page (a length, count or index)",
+            WordShape::NearNull => {
+                "inside the first 64 KiB (a near-null jump, or an offset from a \
+                 null base; a truncated .text word cannot be told apart here)"
+            }
             WordShape::TruncatedText => ".text with its top half gone (soft smash)",
             WordShape::KernelText => "kernel .text",
             WordShape::KernelNonText => {
@@ -280,14 +309,22 @@ pub fn classify_word(text: (u64, u64), a: u64) -> WordShape {
     if a == 0 {
         return WordShape::Zero;
     }
-    if truncated_text(text, a) {
-        return WordShape::TruncatedText;
-    }
     if looks_like_rflags(a) {
         return WordShape::Rflags;
     }
-    if a < 0x1000 {
-        return WordShape::Small;
+    // Before the truncation test, and that order is the whole point. The
+    // linker script opens `.text` with `. = KERNEL_BEGIN; stext = .;`, so
+    // `KERNEL_LO + a` lands inside `.text` for *every* small `a` -- which made
+    // the first real capture report `vaddr=0x1000` as ".text with its top half
+    // gone", a claim that carries no information at all under that window and
+    // sends the reader hunting a half-overwrite that may never have happened.
+    // A word this low in a code slot is a near-null transfer whatever else it
+    // may also be, and saying so is the honest reading.
+    if a < MIN_PLAUSIBLE_CODE {
+        return WordShape::NearNull;
+    }
+    if truncated_text(text, a) {
+        return WordShape::TruncatedText;
     }
     if in_text(text, a) {
         return WordShape::KernelText;
@@ -811,29 +848,63 @@ mod tests {
     }
 
     #[test]
-    fn a_truncated_text_word_in_the_first_page_is_not_reported_as_merely_small() {
-        // `truncated_text` is the more specific claim and has to win: the first
-        // functions of the image lose their top half into the same low window a
-        // length or an index lives in, and calling one a length loses the whole
-        // finding.
-        let low = TEXT.0 + 0x40 - KERNEL_LO;
-        assert!(
-            low < 0x1000,
-            "pick an offset that makes this a real question"
+    fn the_truncation_claim_only_starts_where_it_can_be_wrong() {
+        // `truncated_text` is true of every low word under a window that
+        // opens at `KERNEL_LO`, so the claim is only worth making above
+        // `MIN_PLAUSIBLE_CODE`, where a word that is NOT a truncated `.text`
+        // address exists to be told apart from one that is.
+        let above = MIN_PLAUSIBLE_CODE + 0x3bf0;
+        assert!(in_text(TEXT, KERNEL_LO + above));
+        assert_eq!(classify_word(TEXT, above), WordShape::TruncatedText);
+        // ...and under a window that does not reach it, the same word is not
+        // claimed as `.text` at all: nothing is left to read it as but a low
+        // canonical address.
+        assert_eq!(
+            classify_word((KERNEL_LO + 0x100_0000, KERNEL_LO + 0x200_0000), above),
+            WordShape::UserHalf
         );
-        assert_eq!(classify_word(TEXT, low), WordShape::TruncatedText);
     }
 
     #[test]
-    fn a_small_word_is_only_small_where_text_does_not_start_at_the_kernel_base() {
-        // With `stext` AT `KERNEL_LO` -- which is what the linker script does
-        // -- every low word that is not RFLAGS-shaped raises into `.text`, so
-        // the louder reading wins and nothing is "just an index". It becomes a
-        // question of its own only under a window that leaves the first pages
-        // out, like the literal one the x86_64 probes carried before the
-        // linker's symbols were read.
-        assert_eq!(classify_word(TEXT, 0x20), WordShape::TruncatedText);
-        assert_eq!(classify_word(FALLBACK_TEXT, 0x20), WordShape::Small);
+    fn a_near_null_target_is_not_reported_as_a_truncated_text_pointer() {
+        // The second real capture: `vaddr=rip=0x1000`. With `stext` AT
+        // `KERNEL_LO` -- which is what the linker script does -- `KERNEL_LO +
+        // a` is inside `.text` for every small `a`, so "truncated .text" is
+        // true of all of them and therefore says nothing about any of them.
+        // It was reported that way once; it is a near-null transfer.
+        assert!(
+            truncated_text(TEXT, 0x1000),
+            "the vacuous claim still holds"
+        );
+        assert_eq!(classify_word(TEXT, 0x1000), WordShape::NearNull);
+        assert_eq!(classify_word(TEXT, 0x20), WordShape::NearNull);
+        // Above the threshold the truncation claim means something again.
+        assert_eq!(
+            classify_word(TEXT, MIN_PLAUSIBLE_CODE),
+            WordShape::TruncatedText
+        );
+    }
+
+    #[test]
+    fn a_word_that_could_be_this_boots_clock_is_told_from_one_that_could_not() {
+        // The two captures' `[rsp0]` values, against an uptime that makes each
+        // one a live reading.
+        for word in [0x1c_b0a4_fb0eu64, 0x5_2152_b153] {
+            assert!(plausible_uptime_ns(word, word), "read a moment ago");
+            assert!(plausible_uptime_ns(word, word + word / 16), "a tick later");
+            assert!(
+                !plausible_uptime_ns(word, word / 2),
+                "older than the boot that would have read it"
+            );
+            assert!(
+                !plausible_uptime_ns(word, word * 4),
+                "eight times the uptime ago: not this boot's clock"
+            );
+        }
+        // A word above the current reading cannot be a reading: nothing has
+        // taken it yet.
+        assert!(!plausible_uptime_ns(1_000, 999));
+        assert!(!plausible_uptime_ns(0, 0), "a zero is a cleared slot");
     }
 
     #[test]
@@ -868,7 +939,7 @@ mod tests {
         let all = [
             WordShape::Zero,
             WordShape::Rflags,
-            WordShape::Small,
+            WordShape::NearNull,
             WordShape::TruncatedText,
             WordShape::KernelText,
             WordShape::KernelNonText,

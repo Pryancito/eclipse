@@ -30,8 +30,16 @@
 use core::fmt::{self, Write};
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-/// Room for well past `MAX_CONTAINED` events at a few hundred bytes each.
-const CAP: usize = 16 * 1024;
+/// Room for well past `MAX_CONTAINED` events.
+///
+/// Sixty-four kilobytes of `.bss`, not sixteen, because the record now carries
+/// the *diagnosis* and not only the `[isolate]` verdict: the fault header, the
+/// stack attribution and the `[kfault-bt]` stack scan come to about a kilobyte
+/// an event, and `MAX_CONTAINED` is sixteen of them. At the old size a machine
+/// that contained its budget filled the buffer and dropped the tail -- and
+/// this module exists precisely so that the box with no serial cable keeps the
+/// report.
+const CAP: usize = 64 * 1024;
 
 /// The record itself. `AtomicU8` per byte so appends from a faulting CPU need
 /// no lock — the one thing the fault path cannot take.
@@ -85,6 +93,26 @@ pub fn record(args: fmt::Arguments) {
     let _ = Sink.write_fmt(args);
 }
 
+/// Print to the serial console AND append to the record `/proc/oops` exposes.
+///
+/// The fault path used to call [`crate::console::serial_write_fmt_spin`]
+/// directly for everything but the `[isolate]` verdict, so a real
+/// `/var/log/oops.log` read back as two lines: "a fault was contained" and the
+/// culprit heuristic -- no faulting address, no stack attribution, no
+/// backtrace. Every one of those lines had been written; they went to a
+/// console nobody was capturing. The split this module documents is only worth
+/// having if the diagnosis is on the durable side of it.
+pub fn report(args: fmt::Arguments<'_>) {
+    crate::console::serial_write_fmt_spin(args);
+    record(args);
+}
+
+/// [`report`] for a plain string.
+pub fn report_str(s: &str) {
+    crate::console::serial_write_str(s);
+    record(format_args!("{}", s));
+}
+
 /// Whether anything has been recorded since boot.
 pub fn is_empty() -> bool {
     LEN.load(Ordering::Acquire) == 0
@@ -105,4 +133,103 @@ pub fn snapshot() -> alloc::vec::Vec<u8> {
         );
     }
     out
+}
+
+/// Empty the record so one test's lines are not another's.
+///
+/// `LEN` only ever grows in the shipped kernel -- deliberately: the buffer
+/// fills and stops rather than eating its own beginning. That is also why this
+/// module had no tests at all while being the one place a contained fault's
+/// report survives.
+#[cfg(test)]
+fn reset_for_tests() {
+    LEN.store(0, Ordering::SeqCst);
+    OVERFLOWED.store(false, Ordering::SeqCst);
+    for b in BUF.iter() {
+        b.store(0, Ordering::Relaxed);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn text() -> alloc::string::String {
+        alloc::string::String::from_utf8_lossy(&snapshot()).into_owned()
+    }
+
+    #[test]
+    fn a_recorded_line_comes_back_out() {
+        reset_for_tests();
+        assert!(is_empty());
+        record(format_args!("[isolate] contained {}/{}\n", 1, 16));
+        assert!(!is_empty());
+        assert!(text().contains("[isolate] contained 1/16"));
+    }
+
+    /// The regression this module was failing silently: a diagnosis line that
+    /// went to the console only. A real `/var/log/oops.log` came back as the
+    /// `[isolate]` verdict and nothing else -- no faulting address, no stack
+    /// attribution, no backtrace -- because every one of those lines was
+    /// written straight to the serial writer. `report` is the sink that is on
+    /// the durable side of the split this module documents.
+    #[test]
+    fn a_reported_line_is_on_the_durable_side_and_not_only_the_console() {
+        reset_for_tests();
+        report(format_args!(
+            "[KERNEL PAGE FAULT] vaddr={:#x} flags=EXECUTE\n",
+            0x1000
+        ));
+        report_str("[kfault-bt] raw stack scan from rsp:\n");
+        let out = text();
+        assert!(out.contains("vaddr=0x1000"), "the header was lost: {}", out);
+        assert!(out.contains("[kfault-bt] raw stack scan"), "{}", out);
+    }
+
+    #[test]
+    fn a_full_record_stops_rather_than_eating_its_own_beginning() {
+        reset_for_tests();
+        // The first line has to survive: it is the one that names the fault.
+        record(format_args!("FIRST\n"));
+        for _ in 0..(CAP / 8 + 64) {
+            record(format_args!("xxxxxxx\n"));
+        }
+        let out = text();
+        assert!(out.starts_with("FIRST\n"), "the beginning was eaten");
+        assert!(
+            out.contains("record full; later events were dropped"),
+            "a truncated record did not say so"
+        );
+        // `LEN` is clamped to something a reader can use, not left runaway.
+        assert!(LEN.load(Ordering::Acquire) <= CAP);
+    }
+
+    /// A whole contained-fault report has to fit, which is what the capacity
+    /// is for: the header, the stack attribution and a `[kfault-bt]` scan come
+    /// to roughly a kilobyte, and the fault budget is `MAX_CONTAINED` = 16.
+    #[test]
+    fn the_capacity_holds_a_full_report_for_every_fault_the_budget_allows() {
+        const PER_EVENT: usize = 1024;
+        const MAX_CONTAINED: usize = 16;
+        assert!(
+            CAP >= PER_EVENT * MAX_CONTAINED,
+            "{} B cannot hold {} reports of {} B",
+            CAP,
+            MAX_CONTAINED,
+            PER_EVENT
+        );
+        reset_for_tests();
+        for n in 0..MAX_CONTAINED {
+            for _ in 0..(PER_EVENT / 8) {
+                record(format_args!("ev{:05}\n", n));
+            }
+        }
+        assert!(
+            !OVERFLOWED.load(Ordering::Acquire),
+            "the budget's worth of reports did not fit"
+        );
+        let out = text();
+        assert!(out.contains("ev00000"), "the first event was lost");
+        assert!(out.contains("ev00015"), "the last event was lost");
+    }
 }
