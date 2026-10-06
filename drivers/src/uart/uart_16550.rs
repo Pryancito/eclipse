@@ -1,7 +1,8 @@
 use core::convert::TryInto;
 use core::ops::{BitAnd, BitOr, Not};
+use core::sync::atomic::{AtomicU32, Ordering};
 
-use crate::sync::Mutex;
+use crate::sync::{HeldByCurrentCpu, Mutex};
 use bitflags::bitflags;
 
 use crate::io::{Io, Mmio, ReadOnly};
@@ -117,12 +118,26 @@ where
     }
 }
 
+/// How many console writes have been served without taking the port's lock
+/// because **this CPU already held it**. See [`Uart16550Mmio::with_regs`];
+/// non-zero means a fault or panic was taken inside the driver's own critical
+/// section and the machine printed its way out instead of wedging.
+static REENTRANT_WRITES: AtomicU32 = AtomicU32::new(0);
+
+/// Read [`REENTRANT_WRITES`].
+pub fn reentrant_console_writes() -> u32 {
+    REENTRANT_WRITES.load(Ordering::Relaxed)
+}
+
 /// MMIO driver for UART 16550
 pub struct Uart16550Mmio<V: 'static>
 where
     V: Copy + BitAnd<Output = V> + BitOr<Output = V> + Not<Output = V>,
 {
     inner: Mutex<&'static mut Uart16550Inner<Mmio<V>>>,
+    /// The register block's address, kept so [`Self::with_regs`] can reach the
+    /// ports again on the one path that may not take `inner`.
+    base: usize,
     listener: EventListener,
 }
 
@@ -161,15 +176,21 @@ where
         + Send,
 {
     fn try_recv(&self) -> DeviceResult<Option<u8>> {
+        // Not `with_regs`: a re-entrant read would consume a byte the
+        // interrupted reader is in the middle of taking, and nothing on a
+        // fault path needs to receive. Declining is the whole answer.
+        if self.inner.held_by_current_cpu() {
+            return Ok(None);
+        }
         self.inner.lock().try_recv()
     }
 
     fn send(&self, ch: u8) -> DeviceResult {
-        self.inner.lock().send(ch)
+        self.with_regs(|regs| regs.send(ch))
     }
 
     fn write_str(&self, s: &str) -> DeviceResult {
-        self.inner.lock().write_str(s)
+        self.with_regs(|regs| regs.write_str(s))
     }
 }
 
@@ -183,12 +204,56 @@ where
         + TryInto<u8>
         + Send,
 {
+    /// Run `f` on the register block, through the lock when this CPU does not
+    /// already hold it and **straight over the registers when it does**.
+    ///
+    /// The lock is an IRQ-disabling ticket mutex, so no interrupt can re-enter
+    /// it -- but a fault or a panic taken mid-write can, and on the bring-up
+    /// box it did:
+    ///
+    /// ```text
+    /// cpu=18 at drivers/src/uart/uart_16550.rs:249
+    /// HOLDER cpu=18 at drivers/src/uart/uart_16550.rs:249
+    /// ```
+    ///
+    /// one CPU, both ends of the same acquire. A ticket mutex is not
+    /// re-entrant, so that second acquire waits -- with interrupts off -- for a
+    /// release only this CPU could perform, and this CPU is inside the panic
+    /// handler trying to print. The machine halted with the report half out.
+    ///
+    /// `kernel-hal`'s `ConsoleLock` already survives exactly this ("a nested
+    /// write from the CPU that already holds the lock goes straight through"),
+    /// and then calls down into here, where the escape ran out one layer short
+    /// of the hardware.
+    ///
+    /// Taking the registers again is sound in a way a second guard would not
+    /// be: [`Uart16550Inner`] holds no state of its own -- its seven fields are
+    /// register handles, addresses computed from `base` -- so the duplicate
+    /// view aliases no data, only the device, which was already shared. The
+    /// cost is interleaved bytes on a console that is already printing a crash;
+    /// the alternative is the crash report and the machine with it. The same
+    /// trade [`crate::utils::shadow_fb`] makes for the framebuffer.
+    #[inline]
+    fn with_regs<R>(&self, f: impl FnOnce(&mut Uart16550Inner<Mmio<V>>) -> R) -> R {
+        if self.inner.held_by_current_cpu() {
+            REENTRANT_WRITES.fetch_add(1, Ordering::Relaxed);
+            // SAFETY: `self.base` is the address `new_common` built `inner`
+            // from, so this is the same register block, and it is `'static`
+            // device memory. No `&mut` to any *data* is aliased: the struct is
+            // nothing but register addresses (see the doc above).
+            let regs: &mut Uart16550Inner<Mmio<V>> = unsafe { Mmio::<V>::from_base_as(self.base) };
+            return f(regs);
+        }
+        f(&mut self.inner.lock())
+    }
+
     unsafe fn new_common(base: usize) -> Self {
         unsafe {
             let uart: &mut Uart16550Inner<Mmio<V>> = Mmio::<V>::from_base_as(base);
             uart.init();
             Self {
                 inner: Mutex::new(uart),
+                base,
                 listener: EventListener::new(),
             }
         }
@@ -221,6 +286,9 @@ mod pmio {
     /// Pmio driver for UART 16550
     pub struct Uart16550Pmio {
         inner: Mutex<Uart16550Inner<Pmio<u8>>>,
+        /// The first of the seven ports, kept so [`Uart16550Pmio::with_regs`]
+        /// can rebuild the map on the one path that may not take `inner`.
+        base: u16,
         listener: EventListener,
     }
 
@@ -238,15 +306,20 @@ mod pmio {
 
     impl UartScheme for Uart16550Pmio {
         fn try_recv(&self) -> DeviceResult<Option<u8>> {
+            // See the MMIO twin: a re-entrant read would eat a byte out from
+            // under the interrupted reader, and no fault path receives.
+            if self.inner.held_by_current_cpu() {
+                return Ok(None);
+            }
             self.inner.lock().try_recv()
         }
 
         fn send(&self, ch: u8) -> DeviceResult {
-            self.inner.lock().send(ch)
+            self.with_regs(|regs| regs.send(ch))
         }
 
         fn write_str(&self, s: &str) -> DeviceResult {
-            self.inner.lock().write_str(s)
+            self.with_regs(|regs| regs.write_str(s))
         }
     }
 
@@ -278,8 +351,27 @@ mod pmio {
             uart.init();
             Self {
                 inner: Mutex::new(uart),
+                base,
                 listener: EventListener::new(),
             }
+        }
+
+        /// Run `f` on the seven ports, through the lock unless **this CPU
+        /// already holds it** -- see [`Uart16550Mmio::with_regs`] for the
+        /// capture that this exists for. This is the x86_64 console: the port
+        /// every panic banner leaves by, and the one the photograph named.
+        ///
+        /// `ports(base)` rebuilds the map rather than reusing the guarded one.
+        /// It does not call `init`: re-initialising the FIFO mid-crash would
+        /// throw away bytes of the report already queued in it.
+        #[inline]
+        fn with_regs<R>(&self, f: impl FnOnce(&mut Uart16550Inner<Pmio<u8>>) -> R) -> R {
+            if self.inner.held_by_current_cpu() {
+                super::REENTRANT_WRITES.fetch_add(1, super::Ordering::Relaxed);
+                let mut regs = ports(self.base);
+                return f(&mut regs);
+            }
+            f(&mut self.inner.lock())
         }
     }
 
@@ -463,6 +555,80 @@ mod tests {
     const READY: u8 = 1 << 5;
     /// ...and with a byte waiting to be read.
     const HAS_INPUT: u8 = 1;
+
+    // --- the re-entrant console escape ------------------------------------
+
+    /// What `with_regs` does when this CPU already holds the port's lock: it
+    /// builds a SECOND map over the same registers and writes through that.
+    /// The capture it exists for had holder and waiter on one CPU and one line
+    /// (`uart_16550.rs:249`), i.e. a panic taken inside the driver's own
+    /// critical section asking for a release only itself could perform.
+    ///
+    /// What has to hold for that escape to be worth taking: the duplicate view
+    /// must reach the same wire, and the interrupted write must still be intact
+    /// when it resumes. Bytes interleave -- that is the accepted cost -- but
+    /// none is lost or rerouted.
+    #[test]
+    fn a_second_map_over_the_same_ports_reaches_the_same_wire_and_loses_nothing() {
+        let wire = Wire::new(READY);
+        let mut outer = uart(wire);
+        outer.write_str("ab").unwrap();
+        // The fault lands mid-write. `with_regs` hands the panic handler a
+        // fresh map instead of a guard it would wait forever for.
+        let mut nested = uart(wire);
+        nested.write_str("PANIC").unwrap();
+        // ...and the interrupted writer carries on through its own map.
+        outer.write_str("cd").unwrap();
+        assert_eq!(
+            wire.sent.borrow().as_slice(),
+            b"abPANICcd",
+            "the nested map rerouted or dropped bytes"
+        );
+    }
+
+    /// The nested map must NOT re-initialise the port. `init` writes `0xC7` to
+    /// the FIFO control register, which clears the transmit queue -- doing that
+    /// mid-crash throws away the bytes of the report already sitting in it. So
+    /// the escape rebuilds the map and nothing else.
+    #[test]
+    fn the_nested_map_does_not_clear_the_fifo_the_report_is_queued_in() {
+        let wire = Wire::new(READY);
+        let mut nested = uart(wire);
+        nested.write_str("report").unwrap();
+        assert!(
+            !wire
+                .control
+                .borrow()
+                .iter()
+                .any(|(reg, _)| *reg == Reg::FifoCtrl),
+            "the nested write touched FIFO control: {:?}",
+            wire.control.borrow()
+        );
+    }
+
+    /// The one way the MMIO escape can be worse than the deadlock: a wrong
+    /// base. `with_regs` rebuilds the register block from the `base` stored at
+    /// construction, so that address has to land on the very same registers the
+    /// locked view uses -- otherwise the panic banner goes out over some other
+    /// device's MMIO.
+    #[test]
+    fn the_rebuilt_mmio_map_sits_exactly_on_the_base_it_was_built_from() {
+        let mut block = [0u64; 2];
+        let base = block.as_mut_ptr() as usize;
+        // SAFETY: `block` is 8-byte aligned and larger than the seven u8
+        // registers; nothing here reads an uninitialised byte.
+        let regs: &mut Uart16550Inner<Mmio<u8>> = unsafe { Mmio::<u8>::from_base_as(base) };
+        assert_eq!(
+            core::ptr::addr_of!(regs.data) as usize,
+            base,
+            "the rebuilt map does not start at its base"
+        );
+        assert_eq!(
+            core::ptr::addr_of!(regs.modem_sts) as usize - base,
+            6,
+            "the rebuilt map is not the 16550 map"
+        );
+    }
 
     // --- the register map -------------------------------------------------
 
