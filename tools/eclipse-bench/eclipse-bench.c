@@ -4662,12 +4662,26 @@ static int sig_pending_release_op(void) {
         return 1;
     }
     sig_atomic_t before = g_sig_count;
-    // Every failure below has to put the mask back before returning. A probe
-    // that gives up with SIGUSR1 still blocked leaves the whole process that
-    // way, and `fork` copies the mask: the signal peer started later would
-    // then never run its handler, so the parent would wait for an answer that
-    // cannot come. A lost sample is cheap; a wedged suite is not.
-    if (kill(getpid(), SIGUSR1) != 0) {
+    // THREAD-directed, not process-directed, and that distinction is the whole
+    // reason this row used to read n/a in a full run while reading 2600 ns
+    // when the section ran alone.
+    //
+    // `sigprocmask` masks the CALLING THREAD. A process-directed `kill` is
+    // delivered to any thread that does not block the signal -- and by the
+    // time this section runs, earlier ones (SMP scaling, the scheduler probes,
+    // the futex herd) have abandoned detached threads that are still alive and
+    // have nothing blocked. One of them took the signal, ran the handler, and
+    // the counter moved while THIS thread had it blocked, so the probe
+    // concluded the mask was not being honoured and voided the row -- blaming
+    // the kernel for correct behaviour. `pthread_kill` to ourselves is the
+    // primitive that matches the assertion.
+    //
+    // Every failure below also has to put the mask back before returning. A
+    // probe that gives up with SIGUSR1 still blocked leaves the whole process
+    // that way, and `fork` copies the mask: the signal peer started later
+    // would then never run its handler, so the parent would wait for an answer
+    // that cannot come. A lost sample is cheap; a wedged suite is not.
+    if (pthread_kill(pthread_self(), SIGUSR1) != 0) {
         g_pend_fail_kill++;
         sigprocmask(SIG_SETMASK, &old, NULL);
         return 1;
@@ -4707,7 +4721,7 @@ static int sig_pending_release_op(void) {
             return 1;
         }
         before = g_sig_count;
-        if (kill(getpid(), SIGUSR1) != 0) {
+        if (pthread_kill(pthread_self(), SIGUSR1) != 0) {
             g_pend_fail_kill++;
             sigprocmask(SIG_SETMASK, &old, NULL);
             return 1;
