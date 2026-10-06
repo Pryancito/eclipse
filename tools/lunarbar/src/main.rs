@@ -678,6 +678,10 @@ struct State {
     /// granted against a serial the compositor can tie to a real click, so the
     /// Enter serial above will not do.
     ptr_btn_serial: u32,
+    /// Outputs whose bars the compositor closed. Without this the panel
+    /// recreates the surface on the very next iteration of the event loop and
+    /// spins there forever; see [`fill_guard::RefusedOutputs`].
+    refused: fill_guard::RefusedOutputs,
     ptr_bar: Option<u32>,  // layer id the pointer is over
     ptr_on_popup: bool,    // pointer is over the popup overlay
     scroll_acc: f64,       // accumulated wheel distance until one notch
@@ -715,7 +719,9 @@ impl State {
         let pending: Vec<(u32, wl_output::WlOutput, u32)> = self
             .outputs
             .iter()
-            .filter(|o| !claimed.contains(&o.global_name))
+            // An output whose bar the compositor closed is skipped: creating
+            // it again here is what turned one `Closed` into a live loop.
+            .filter(|o| !claimed.contains(&o.global_name) && !self.refused.contains(o.global_name))
             .map(|o| {
                 (
                     o.global_name,
@@ -3346,6 +3352,9 @@ impl Dispatch<wl_registry::WlRegistry, ()> for State {
                 if let Some(pos) = state.outputs.iter().position(|o| o.global_name == name) {
                     let oi = state.outputs.remove(pos);
                     state.bars.retain(|b| b.output_global != name);
+                    // The output is gone, so its refusal goes with it: plug the
+                    // monitor back in and it gets its bars again.
+                    state.refused.forget(name);
                     if oi.output.version() >= 3 {
                         oi.output.release();
                     }
@@ -3377,7 +3386,22 @@ impl Dispatch<ZwlrLayerSurfaceV1, ()> for State {
             zwlr_layer_surface_v1::Event::Closed => {
                 let id = layer.id().protocol_id();
                 if let Some(pos) = state.bar_index(id) {
+                    // Remember the output BEFORE the bar goes: `ensure_surfaces`
+                    // creates a bar for every output it has not claimed, so
+                    // dropping this one and nothing else makes the next loop
+                    // iteration create it again -- and the compositor close it
+                    // again. That loop spins at request rate, never repaints
+                    // (the panel reads as hung), and leaks a surface pair plus,
+                    // once a round reaches a configure, an mmap/munmap of a
+                    // full bar pool per round.
+                    let global = state.bars[pos].output_global;
                     state.bars.remove(pos);
+                    if state.refused.mark(global) {
+                        eprintln!(
+                            "lunarbar: the compositor closed the bar on output {global}; \
+                             not recreating it until that output comes back"
+                        );
+                    }
                 }
             }
             _ => {}
