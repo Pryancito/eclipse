@@ -571,16 +571,28 @@ fn try_skip_null_execute_call(tf: &mut TrapFrame, fault_vaddr: usize) -> bool {
     // registers; refuse and let isolation contain the fault.
     if !looks_like_kernel_text_ret(ret) {
         let shape = crate::kaddr::word_shape(ret);
-        let truncated_text = shape == crate::kaddr::WordShape::TruncatedText;
+        // The shapes that PROVE a smash rather than merely look wrong: a word
+        // in the first 64 KiB, and a `.text` address missing its top half.
+        // Nothing stores either in a code slot on purpose.
+        let proves_smash = matches!(
+            shape,
+            crate::kaddr::WordShape::TruncatedText | crate::kaddr::WordShape::NearNull
+        );
+        // Is this word the clock, read a moment ago? Two captures put a
+        // user-half word of the right order of magnitude for a nanosecond
+        // uptime in this slot, which is a guess until something measures it --
+        // and the kernel holds the one number that can. One clock read, once,
+        // on a path that is already printing.
+        let now_ns = crate::deadline::duration_to_ns(crate::timer::timer_now());
+        let clockish = crate::kaddr::plausible_uptime_ns(ret, now_ns);
         // Every shape gets the report, not only the two this used to know.
         // A capture came back with `[rsp0]=0x1cb0a4fb0e` -- a user-half word
         // in a kernel code slot -- and this path returned in silence, so the
         // one qword that names the writer class had no line at all. The
-        // sticky flag still belongs to the two shapes that prove a smash:
-        // latching on a user-half word would stop every IRQ and timer dyn
-        // dispatch in the system over a pointer that may simply have been
-        // mis-stored.
-        if truncated_text || ret < 0x1000 {
+        // sticky flag stays with the shapes that prove a smash: latching on a
+        // user-half word would stop every IRQ and timer dyn dispatch in the
+        // system over a pointer that may simply have been mis-stored.
+        if proves_smash {
             ::executor::note_heap_smash_suspected();
         }
         {
@@ -589,12 +601,18 @@ fn try_skip_null_execute_call(tf: &mut TrapFrame, fault_vaddr: usize) -> bool {
             if !LOGGED.swap(true, Ordering::SeqCst) {
                 let (hard, soft) = ::executor::hard_guard_executor_counts();
                 crate::console::serial_write_fmt_spin(format_args!(
-                    "\n[soft-smash] [fault_rsp]={:#x} value={:#x} is {} — \
-                     hooks_registered={} \
+                    "\n[soft-smash] [fault_rsp]={:#x} value={:#x} is {}{} \
+                     (uptime now {} ns) — hooks_registered={} \
                      hard_guard_executors={} soft_guard_executors={}\n",
                     sp,
                     ret,
                     shape.as_str(),
+                    if clockish {
+                        " AND is a monotonic-clock reading from this boot"
+                    } else {
+                        " and is NOT a clock reading from this boot"
+                    },
+                    now_ns,
                     ::executor::stack_guard_hooks_registered(),
                     hard,
                     soft,
