@@ -48,7 +48,8 @@ it to the rootfs build the same way the other `tools/` binaries are added.
 ./eclipse-bench [--only SECTION] [--quick] [DIR] [DISK_MB] [MEM_MB]
 ```
 
-- `--only SECTION` — run one of `cpu mem syscall vm sched psched smp disk proc gfx`.
+- `--only SECTION` — run one of `cpu mem syscall vm sched psched net fs smp disk
+  proc gfx`.
   Useful for before/after on a single change.
 - `--quick` — shorter budgets, roughly 3x faster, noisier.
 - `--drm PATH` — DRM device for the `gfx` section (default `/dev/dri/card0`).
@@ -161,6 +162,72 @@ switches differed — `scripts/qemu-bench.sh -c 'WAKEPREEMPT=0'` and
 way to A/B them (rebuilding between A and B changes the binary and its layout,
 and TCG run-to-run variance is large enough to hide the effect either way).
 
+**SOCKETS / IPC** `[kernel]` — everything above the bare socketpair the
+`SCHEDULER` section already measures. That row is the shortest possible path
+through the stack: no address, no listener, no protocol. These are the paths
+real programs use.
+
+- `socket()+close()` is the floor for the family, the way `getpid` is the floor
+  for the syscall section: subtract it from any other row here.
+- `TCP loopback round trip` is the same one-byte exchange as the pipe row with
+  the whole IP stack in it, so the gap against the socketpair row is protocol
+  processing rather than the wake-up.
+- `TCP connect+accept+close` is what a server pays per connection. A kernel can
+  answer requests quickly and accept them slowly; that is a common shape and
+  one row cannot show both.
+- `UNIX stream RT (bound)` reaches the socket by **name** — bind, listen,
+  connect through the filesystem — which is what every desktop bus and
+  compositor does. Against the socketpair row, the difference is the name and
+  the listener.
+- `sendmsg / send` is the iovec and control-message plumbing, same byte and
+  same socket, so the ratio is that plumbing and nothing else.
+- `SCM_RIGHTS fd pass` is passing a descriptor over a UNIX socket and getting a
+  byte back: what a browser's zygote and every sandboxed helper live on. An
+  `n/a` here is a correctness result, not a slow one — the descriptor did not
+  arrive.
+- `recv on empty (EAGAIN)` is the non-blocking read every event loop issues per
+  spurious readiness notification: kernel entry plus a queue check, with no
+  wake-up in it.
+- The **readiness rows** are an event loop's floor. One fd is ready and it is
+  the *last* one in the array, which is the worst case for an implementation
+  that walks the set and the best case for one that keeps a ready list — so the
+  `per extra fd` slope between the 1-fd and 64-fd rows is the answer, not either
+  row alone. A hundred-connection event loop pays that slope on every wake-up.
+  `epoll / poll` above 1 means `epoll` is walking the same set `poll` does and
+  buys nothing.
+
+**FILESYSTEM / VFS** `[kernel]` — deliberately *not* the `DISK` section. This
+one touches almost no data and measures the layer above the device: resolving a
+path, opening a descriptor, answering `stat`, reading a directory, serving a
+warm page out of the cache, and formatting the procfs files every tool reads.
+All of it runs against files written moments earlier, so the data is in cache
+and the device is out of the picture. A kernel can be fast at streaming and slow
+at every one of these — and these are what a shell, a build and `ps` spend their
+time in.
+
+- `open+close, 1 component` and `open+close, 9 components` differ in exactly one
+  thing, how many components the kernel had to resolve, so their difference is
+  the `path cost per component`. No single row can show that.
+- `openat(dirfd, name)` is what build tools and `find` do; the gap against the
+  full-path row is what the resolution they skip was costing.
+- `open+close (O_PATH)` gets a row of its own rather than being assumed equal to
+  a normal open: `ps` uses it, and Eclipse has had it wrong twice.
+- `(lseek+read) / pread` is what maintaining the file position costs — `pread`
+  carries the offset, the `read` row pays an explicit `lseek` first, and the
+  `lseek` row gives the other half of the arithmetic.
+- `mmap+touch 1 MiB file` touches one byte per page rather than copying the
+  file, so it is the fault path and not memory bandwidth. Whether faulting
+  beats copying is a property of the kernel, not a given.
+- `getdents` is charged **per entry**, because that is what scales with a big
+  directory while a per-call figure hides it. `entries per getdents call` is the
+  batch size: a kernel that returns one entry per syscall costs a directory walk
+  a syscall per file, and the per-entry row alone would just read "slow".
+- The **procfs rows** are reports the kernel formats on demand. `ps aux` reads
+  several of them per process on the machine, which is why a slow one is felt
+  and not merely measured. `/proc/self/task listing` reporting `n/a` is the
+  directory that used to be missing altogether, which is what killed chromium's
+  zygote.
+
 **SMP SCALING** `[kernel]` — N threads running the same pure-userspace ALU loop
 that one thread ran. The work has no kernel component, so anything short of
 linear scaling is the kernel: placement, lock contention, or CPUs that never
@@ -250,6 +317,28 @@ They are located by the label that introduces the line and then by position
 within it, so a line that is renamed or reordered makes those rows read `n/a`
 rather than report a number from a neighbouring field.
 
+### Per-process syscall accounting
+
+The `net` and `fs` sections pair their rows with `/proc/self/perf` instead,
+Eclipse's **per-process** syscall table: one row per syscall the process has
+issued, with the call count and the time the kernel spent inside it. For these
+sections that is the better pairing, for two reasons.
+
+It is *our* process, so an idle shell or a daemon waking up cannot move the
+numbers — the system-wide table cannot promise that. And it splits a measured
+figure into two different bugs: `calls/op` is how many syscalls libc really
+issued (a value that is not the expected integer means the row is not measuring
+what its label says — a retry loop, a short read), and `in-kernel` is what share
+of the measured wall clock was spent inside them. A low in-kernel share with a
+high ns/op puts the cost in entry/exit or in being rescheduled, not in the
+subsystem. A single ns/op figure cannot tell those apart.
+
+The reader's own `openat`/`read`/`close` land in the very rows an open or read
+probe wants to read back, so its cost is **measured** once — two back-to-back
+snapshots with no work between them — and subtracted, rather than assumed.
+Linux has no such file, so these rows read `n/a` there, the same convention the
+`/proc/perf/kernel` rows follow.
+
 ## Suggested comparisons
 
 - **Eclipse vs Linux, same machine** — the only comparison that settles an
@@ -268,5 +357,8 @@ rather than report a number from a neighbouring field.
   again. `--only sched` is usually the fastest way to see whether a scheduler
   change did anything, and `--only psched` the fastest way to see *which*
   mechanism it moved.
+- **After touching sockets, the VFS or procfs** — `--only net` and `--only fs`
+  are the matching fast paths. Both sections are userspace-only probes, so they
+  run unchanged on the Linux control and the whole output is comparable.
 
 Paste the output somewhere you can diff it; the labels and units are stable.
