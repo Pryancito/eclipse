@@ -824,6 +824,22 @@ fn panic(info: &PanicInfo) -> ! {
         // Deliberately the least machinery that can still say something: no
         // framebuffer rasterizer, no backtrace walk, no console mode change, no
         // allocation, no containment.
+        //
+        // **Serial only.** Both arms below used to write the graphic console
+        // too, which is a framebuffer rasterizer -- the first thing this
+        // comment rules out -- reached through a `dyn DisplayScheme` fat
+        // pointer, and these arms run *before* `note_panicking()` tells that
+        // console to stop trusting its cell cache. A capture from hardware
+        // shows what that costs: `[#UD] RIP 0xa0002` and `[panic-nested]
+        // trap.rs:1179` alternating fifteen times, because the nested arm's own
+        // graphic write faulted, which panicked, which re-entered here. An
+        // exception is not masked by the `intr_off()` above, so nothing stopped
+        // it but `PANIC_REPORT_LIMIT` -- a backstop doing a fix's job, 24 deep,
+        // with the real report buried above the noise.
+        //
+        // Nothing is lost on a screen-only machine: the full report that ran
+        // first already painted the stop screen, and these arms exist to say
+        // that *it* is the one to read.
         let (file, line) = match info.location() {
             Some(l) => (l.file(), l.line()),
             None => ("<unknown>", 0),
@@ -839,7 +855,6 @@ fn panic(info: &PanicInfo) -> ! {
                     info.message(),
                 );
                 kernel_hal::console::serial_write_fmt_spin(args);
-                kernel_hal::console::graphic_console_write_fmt_spin(args);
             }
             PanicEntry::Nested => {
                 let args = format_args!(
@@ -851,7 +866,6 @@ fn panic(info: &PanicInfo) -> ! {
                     line,
                 );
                 kernel_hal::console::serial_write_fmt_spin(args);
-                kernel_hal::console::graphic_console_write_fmt_spin(args);
             }
             PanicEntry::Silent | PanicEntry::Report => {}
         }
