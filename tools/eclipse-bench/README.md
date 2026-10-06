@@ -48,8 +48,8 @@ it to the rootfs build the same way the other `tools/` binaries are added.
 ./eclipse-bench [--only SECTION] [--quick] [DIR] [DISK_MB] [MEM_MB]
 ```
 
-- `--only SECTION` — run one of `cpu mem syscall vm sched psched net fs smp disk
-  proc gfx`.
+- `--only SECTION` — run one of `cpu mem syscall vm sched psched net fs heap sig
+  futex smp disk proc gfx`.
   Useful for before/after on a single change.
 - `--quick` — shorter budgets, roughly 3x faster, noisier.
 - `--drm PATH` — DRM device for the `gfx` section (default `/dev/dri/card0`).
@@ -228,6 +228,97 @@ time in.
   directory that used to be missing altogether, which is what killed chromium's
   zygote.
 
+**HEAP / ANONYMOUS MEMORY** — how a program gets memory, from the allocator call
+down to the mapping. The split between `[user]` and `[kernel]` here is not fixed
+by the row: it is decided by the libc's mmap threshold, and that is the trap this
+section exists to expose.
+
+- The `malloc+free` family at 64 B, 4 KiB and 256 KiB is almost always `[user]`:
+  the allocator hands back a block it already owns and the kernel is never
+  entered. **glibc raises its mmap threshold whenever a large mmap'd block is
+  freed**, up to 32 MiB, so a loop that allocates and frees 256 KiB teaches it to
+  keep that size on the heap after the first iteration — which is exactly what
+  the loop does, and why that row reads tens of nanoseconds rather than the
+  thousands an `mmap`/`munmap` pair costs. Its `mmap calls/op` row is the proof:
+  a value near 0 is the allocator, a value near 1 is the kernel. The
+  `malloc+free 64 MiB` row sits above the threshold's ceiling, so it is a real
+  mapping pair on glibc and on musl alike. musl has no adaptive threshold at
+  all, which is one more reason a figure from one libc says nothing about the
+  other.
+- `malloc churn, 512 live` replaces one of 512 live blocks of mixed sizes at a
+  scattered index. The plain rows measure the allocator's happiest case, where
+  the block it just freed is the one it hands back; a long-running program is
+  never in that case.
+- `mmap+touch+munmap` and its `MAP_POPULATE` variant are the demand-fault path
+  against the up-front one. **A `MAP_POPULATE` figure equal to the plain row
+  means the flag was accepted and ignored**, so the faults were still taken one
+  page at a time — silently, since the call succeeded.
+- `MADV_DONTNEED+refault` is what a heap that shrinks and grows again pays, and
+  what every garbage collector and arena allocator does continuously.
+- The two `munmap N MiB resident` rows are the teardown a process pays for its
+  whole address space on exit. **A per-MiB rate that falls as the mapping grows
+  is a teardown that walks something per page rather than per range** — that
+  cost is inside the `PROCESS` section's `fork + exit` row, where it cannot be
+  separated out.
+
+**SIGNALS** `[kernel]` — delivery, faults, and two correctness verdicts printed
+as sentences rather than numbers, because a figure for a mechanism that does not
+work is worse than no figure.
+
+- `block+pending+unblock` requires the handler **not** to have run until the mask
+  is lifted. A kernel that delivers a blocked signal anyway reports `n/a` here
+  instead of a plausible number.
+- `SIGSEGV fault+handler+retry` installs a handler that makes the faulting page
+  writable and lets the store retry. That is how a JIT, a copy-on-write arena
+  and every stack guard work, so it is a path, not a pathology.
+- **`SA_RESTART`** is the verdict that matters most. musl's `__synccall`, every
+  shell `read` and most library code assume a handler can interrupt a blocking
+  syscall without the caller seeing `EINTR`. The `interrupted read, over 2x20ms`
+  row is the excess over the two 20 ms timer periods the probe schedules itself;
+  the raw elapsed time would be ~40 ms on any kernel and would say nothing. It
+  is **one sample** — the probe cannot be repeated inside one interrupted read —
+  so it carries the timer's own granularity and swings by a factor of two
+  between runs.
+- **`sigaltstack`** says whether a handler really ran on the alternate stack. If
+  it did not, a fault caused by running out of stack has nowhere to be delivered
+  and the process dies instead of handling it.
+- `sigsuspend wake, over 1ms` is the signal path's wake-up latency: the process
+  really is put to sleep and woken, and the 1 ms timer period is subtracted so
+  what is left is the kernel's part.
+
+**FUTEX / LOCKS UNDER CONTENTION** — a lock costs nothing until it is contended,
+and the `SCHEDULER` section only measures one uncontended round trip. This
+section measures the regime that matters.
+
+- `mutex lock+unlock, alone` is `[user]`: an uncontended `pthread_mutex` is two
+  atomic operations and never enters the kernel. The `contended / alone` ratio
+  against the two-thread row is what a lock costs when it is actually a lock.
+- `FUTEX_WAKE, nobody waiting` is issued by every unlock of a mutex that *might*
+  have waiters, so on a mostly-uncontended lock it is the whole kernel cost.
+- The wake families come in two flavours at 1, 16 and 64 parked waiters, and
+  they answer different questions. **`FUTEX_WAKE issue` times the syscall
+  alone**: the kernel picks a waiter off the queue, makes it runnable and
+  returns. That is the row that says whether the pick *scans* the queue, because
+  nothing in it depends on the machine having a spare CPU. **`wake+observe` adds
+  the woken thread reporting back**, which is what a program feels — but on a
+  box with fewer CPUs than waiters most of it is that thread queueing for a CPU.
+  A flat issue ratio with a growing round-trip ratio means the futex code is
+  O(1) and what grows is the wait for a CPU; a growing *issue* ratio is the
+  queue being scanned, and that one is the kernel's to fix.
+- The `condvar signal` / `broadcast` pair is the thundering herd every
+  `notify_all` creates: everyone wakes, and then they all contend for one mutex.
+- `FUTEX_WAIT 200us timeout` should read a little over 200 us. Far more is a
+  timer that fires late; **far less is a wait that did not wait**, and every
+  bounded queue built on it then spins instead of sleeping.
+
+Every row in this section that wakes a thread also has to get a CPU running
+again. Under a hypervisor that is a VM exit and an IPI — tens of microseconds on
+a vCPU that had halted — so the **absolute** figures belong to the machine and
+only the ratios travel. Measured on a 4-vCPU microVM, `FUTEX_WAKE issue` reads
+~16 us against the ~1.5 us of bare metal, and the `wake+observe` rows swing by a
+factor of two between runs on the same binary. Compare against a Linux control
+under the *same* hypervisor or not at all.
+
 **SMP SCALING** `[kernel]` — N threads running the same pure-userspace ALU loop
 that one thread ran. The work has no kernel component, so anything short of
 linear scaling is the kernel: placement, lock contention, or CPUs that never
@@ -360,5 +451,12 @@ Linux has no such file, so these rows read `n/a` there, the same convention the
 - **After touching sockets, the VFS or procfs** — `--only net` and `--only fs`
   are the matching fast paths. Both sections are userspace-only probes, so they
   run unchanged on the Linux control and the whole output is comparable.
+- **After touching the allocator, signal delivery or the futex code** —
+  `--only heap`, `--only sig` and `--only futex`. These are userspace-only too,
+  so the Linux control runs them unchanged. For `heap`, remember that the
+  control's libc decides which rows are `[user]`, so compare the `mmap calls/op`
+  rows before comparing the nanoseconds. For `futex`, compare the ratios: the
+  absolute wake figures are a property of the host, not of the kernel under
+  test.
 
 Paste the output somewhere you can diff it; the labels and units are stable.

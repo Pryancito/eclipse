@@ -62,6 +62,16 @@ A single row is almost never the answer. The benches come in families whose
 - `vmar_map_unmap_one_page` / `_with_512_mappings` — whether maintaining the
   mapping list costs more as an address space fills up.
 
+The C suite's `futex` section is the sharpest case of this and worth reading
+before adding a family of your own. `FUTEX_WAKE issue` at 1, 16 and 64 parked
+waiters times the syscall alone; `wake+observe` adds the woken thread reporting
+back. Only the first answers "does the pick scan the queue", because the second
+is dominated by that thread waiting for a CPU on any machine with fewer CPUs
+than waiters. The first version of those rows measured the round trip only, read
+50x at 64 waiters, and was wrong: the waiters were spinning on `EAGAIN` and
+preempting the process doing the timing. Both mistakes are the same mistake —
+a figure that includes something other than what its label names.
+
 Two families reading the same quantity are worth more than either: the cold
 lookup pair and the miss pair each give a per-component path cost, and when the
 two agree the measurement is standing on something.
@@ -77,6 +87,14 @@ two agree the measurement is standing on something.
 | descriptor table | `fs` section, `dup`, `fcntl` | `linux-object` `fd_*` |
 | procfs report formatting | `fs` section, `/proc/self/*` | `linux-object` `perf_*_report` |
 | TCP/UDP wire parsing | `net` section round trips | `smoltcp` `benches/bench.rs` |
+| allocator and anonymous mappings | `heap` section | `zircon-object` `vmar_map_unmap_*` (the mapping half only) |
+| signal delivery and faults | `sig` section | — |
+| futex wake, contention, condvars | `futex` section | — |
+
+The two empty cells are not an oversight: signal delivery and the futex code
+both need a task to deliver to, and `libos` has no scheduler of its own to
+provide one. Their in-kernel halves have to be measured on the machine, which
+the `psched` section of the C suite does from userspace.
 
 A caveat that applies to every in-kernel row: they run under `libos`, the only
 configuration that builds for the host. Object bookkeeping (VMO and VMAR
