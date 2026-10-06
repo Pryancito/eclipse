@@ -777,44 +777,44 @@ impl TaskCollection {
         if best.is_none_or(|previous| (slot < next, slot) < (previous < next, previous)) {
             *best = Some(slot);
         }
+    }
 
-        fn bitmap_candidate(inner: &FutureCollection, next: usize, yielded: bool) -> Option<usize> {
-            let page_count = inner.pages.len();
-            if page_count == 0 {
-                return None;
-            }
-            let first_page = (next / WAKER_PAGE_SIZE) % page_count;
-            let first_bit = next % WAKER_PAGE_SIZE;
-            for step in 0..=page_count {
-                if step == page_count && first_bit == 0 {
-                    break;
-                }
-                let page_idx = (first_page + step) % page_count;
-                let page = &inner.pages[page_idx];
-                let (notified, voluntary, dropped, borrowed) = page.peek_lanes();
-                let mut bits = if yielded {
-                    voluntary & !notified
-                } else {
-                    notified
-                } & !dropped
-                    & !borrowed;
-                if step == 0 {
-                    bits &= u64::MAX << first_bit;
-                } else if step == page_count {
-                    bits &= (1u64 << first_bit) - 1;
-                }
-                while bits != 0 {
-                    let subpage_idx = bits.trailing_zeros() as usize;
-                    let slot = page_idx * WAKER_PAGE_SIZE + subpage_idx;
-                    if inner.slab.get(slot).is_some() {
-                        return Some(slot);
-                    }
-                    page.clear(subpage_idx);
-                    bits &= bits - 1;
-                }
-            }
-            None
+    fn bitmap_candidate(inner: &mut FutureCollection, next: usize, yielded: bool) -> Option<usize> {
+        let page_count = inner.pages.len();
+        if page_count == 0 {
+            return None;
         }
+        let first_page = (next / WAKER_PAGE_SIZE) % page_count;
+        let first_bit = next % WAKER_PAGE_SIZE;
+        for step in 0..=page_count {
+            if step == page_count && first_bit == 0 {
+                break;
+            }
+            let page_idx = (first_page + step) % page_count;
+            let page = &inner.pages[page_idx];
+            let (notified, voluntary, dropped, borrowed) = page.peek_lanes();
+            let mut bits = if yielded {
+                voluntary & !notified
+            } else {
+                notified
+            } & !dropped
+                & !borrowed;
+            if step == 0 {
+                bits &= u64::MAX << first_bit;
+            } else if step == page_count {
+                bits &= (1u64 << first_bit) - 1;
+            }
+            while bits != 0 {
+                let subpage_idx = bits.trailing_zeros() as usize;
+                let slot = page_idx * WAKER_PAGE_SIZE + subpage_idx;
+                if inner.slab.get(slot).is_some() {
+                    return Some(slot);
+                }
+                page.clear(subpage_idx);
+                bits &= bits - 1;
+            }
+        }
+        None
     }
 }
 
