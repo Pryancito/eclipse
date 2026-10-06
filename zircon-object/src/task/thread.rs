@@ -338,11 +338,24 @@ pub fn slice_credit_stats() -> (u64, u64, u64, u64) {
     SLICE_CREDIT.read()
 }
 
-fn credited_slice_end(now: u64, end: u64, last_seen: u64, slice: u64, tick: u64) -> u64 {
+fn credited_slice_end(
+    now: u64,
+    end: u64,
+    last_seen: u64,
+    slice: u64,
+    tick: u64,
+    cpu_gap: u64,
+) -> u64 {
     if end == 0 || last_seen == 0 || last_seen >= now {
         return end;
     }
-    let off_cpu = (now - last_seen).saturating_sub(tick);
+    // Subtract the part of the gap that something else already explains, and
+    // credit only what is left. A gap up to one tick is the normal cadence;
+    // beyond that, `cpu_gap` is how long this CPU went without a tick while it
+    // was busy, and that much of the gap is a tick that did not fire rather
+    // than a thread that did not run.
+    let explained = tick.max(cpu_gap);
+    let off_cpu = (now - last_seen).saturating_sub(explained);
     if off_cpu == 0 {
         return end;
     }
@@ -1081,6 +1094,7 @@ impl Thread {
             self.sched.last_tick_ns.load(Ordering::Relaxed),
             slice,
             SCHED_TICK_NS,
+            kernel_hal::kstats::last_busy_tick_gap_ns(),
         );
         SLICE_CREDIT.note(end, credited);
         credited
@@ -2947,7 +2961,7 @@ mod sched_tests {
         let end = now + 18_000_000;
         for gap in [1, 100_000, SCHED_TICK_NS - 1, SCHED_TICK_NS] {
             assert_eq!(
-                credited_slice_end(now, end, now - gap, CRED_SLICE, SCHED_TICK_NS),
+                credited_slice_end(now, end, now - gap, CRED_SLICE, SCHED_TICK_NS, 0),
                 end,
                 "un hueco de {} ns no es tiempo fuera de la CPU",
                 gap
@@ -2967,7 +2981,7 @@ mod sched_tests {
         let last_seen = started + ran;
         let now = last_seen + frozen;
         assert_eq!(
-            credited_slice_end(now, end, last_seen, CRED_SLICE, SCHED_TICK_NS),
+            credited_slice_end(now, end, last_seen, CRED_SLICE, SCHED_TICK_NS, 0),
             end + (frozen - SCHED_TICK_NS),
             "el tiempo congelado no se le devuelve"
         );
@@ -2977,7 +2991,7 @@ mod sched_tests {
             slice_verdict(now, end, CRED_SLICE).0,
             "sin el credito el tick no lo expulsaba y el caso no es el que creo"
         );
-        let credited = credited_slice_end(now, end, last_seen, CRED_SLICE, SCHED_TICK_NS);
+        let credited = credited_slice_end(now, end, last_seen, CRED_SLICE, SCHED_TICK_NS, 0);
         assert!(
             !slice_verdict(now, credited, CRED_SLICE).0,
             "con el credito todavia lo expulsa"
@@ -2993,7 +3007,7 @@ mod sched_tests {
         let now = 1_000_000_000;
         let end = now + 1;
         for frozen in [CRED_SLICE, 10 * CRED_SLICE, now] {
-            let credited = credited_slice_end(now, end, now - frozen, CRED_SLICE, SCHED_TICK_NS);
+            let credited = credited_slice_end(now, end, now - frozen, CRED_SLICE, SCHED_TICK_NS, 0);
             assert!(
                 credited <= now + CRED_SLICE,
                 "un congelado de {} ns deja mas de un slice en mano",
@@ -3013,23 +3027,23 @@ mod sched_tests {
     fn with_nothing_to_compare_against_there_is_no_credit() {
         let now = 100_000_000;
         assert_eq!(
-            credited_slice_end(now, 0, now - 50_000_000, CRED_SLICE, SCHED_TICK_NS),
+            credited_slice_end(now, 0, now - 50_000_000, CRED_SLICE, SCHED_TICK_NS, 0),
             0,
             "un slice sin empezar no se acredita"
         );
         let end = now + 1_000_000;
         assert_eq!(
-            credited_slice_end(now, end, 0, CRED_SLICE, SCHED_TICK_NS),
+            credited_slice_end(now, end, 0, CRED_SLICE, SCHED_TICK_NS, 0),
             end,
             "una reanudacion ya liquido la ausencia; pagarla otra vez es pagarla dos veces"
         );
         assert_eq!(
-            credited_slice_end(now, end, now, CRED_SLICE, SCHED_TICK_NS),
+            credited_slice_end(now, end, now, CRED_SLICE, SCHED_TICK_NS, 0),
             end,
             "sin hueco no hay credito"
         );
         assert_eq!(
-            credited_slice_end(now, end, now + 1, CRED_SLICE, SCHED_TICK_NS),
+            credited_slice_end(now, end, now + 1, CRED_SLICE, SCHED_TICK_NS, 0),
             end,
             "una observacion en el futuro es un reloj que fue hacia atras, no un credito"
         );
@@ -3055,6 +3069,56 @@ mod sched_tests {
         t.sched.last_tick_ns.store(1, Ordering::Relaxed);
         t.set_sched(SCHED_NORMAL, 5, 0);
         assert_eq!(t.sched.last_tick_ns.load(Ordering::Relaxed), 0);
+    }
+
+    /// The tick that did not fire is not a thread that did not run. A busy CPU
+    /// whose tick is late makes every gap on it look like an absence, and
+    /// crediting that hands a thread that was running the whole time an extra
+    /// slice -- the opposite of a preemption, on a machine that is already slow.
+    #[test]
+    fn a_tick_that_did_not_fire_is_not_time_off_the_cpu() {
+        // Un hilo que corrio 10 ms de sus 20 y entonces esta CPU, ocupada, se
+        // quedo 15 ms sin tick. El hilo estuvo corriendo todo ese rato: la
+        // rodaja se agoto y le toca soltar la CPU.
+        let started = 100_000_000;
+        let end = started + CRED_SLICE;
+        let last_seen = started + 10_000_000;
+        let cpu_gap = 15_000_000;
+        let now = last_seen + cpu_gap;
+        assert_eq!(
+            credited_slice_end(now, end, last_seen, CRED_SLICE, SCHED_TICK_NS, cpu_gap),
+            end,
+            "el hueco lo explica el tick que falto, no una ausencia del hilo"
+        );
+        assert!(
+            slice_verdict(now, end, CRED_SLICE).0,
+            "y por tanto el tick si lo expulsa"
+        );
+        // Sin el dato de la CPU el plazo se iba por delante del reloj y el hilo
+        // seguia corriendo: lo contrario de una expulsion, en una maquina que ya
+        // va lenta. Es el regalo que este test existe para quitar, y cae en la
+        // banda de 12 a 20 ms, que es donde la red de seguridad de
+        // `slice_verdict` (pasarse de una rodaja entera) todavia no llega.
+        let sin_dato = credited_slice_end(now, end, last_seen, CRED_SLICE, SCHED_TICK_NS, 0);
+        assert!(
+            !slice_verdict(now, sin_dato, CRED_SLICE).0,
+            "sin el dato de la CPU el tick no lo expulsaba"
+        );
+        // Y lo que el hueco de la CPU NO explica se sigue devolviendo: eso es
+        // una ausencia de verdad.
+        let mas_tarde = now + 6_000_000;
+        assert_eq!(
+            credited_slice_end(
+                mas_tarde,
+                end,
+                last_seen,
+                CRED_SLICE,
+                SCHED_TICK_NS,
+                cpu_gap
+            ),
+            end + 6_000_000,
+            "la parte del hueco que el tick no explica si es ausencia"
+        );
     }
 
     /// What gets counted is the credit actually given, and nothing is counted
