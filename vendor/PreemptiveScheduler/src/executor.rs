@@ -11,9 +11,10 @@ use {
 use crate::arch::executor_entry;
 use crate::task_collection::{Task, TaskCollection};
 use crate::waker_page::WakerRef;
-use core::sync::atomic::AtomicBool;
+use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, AtomicUsize, Ordering};
 
 #[derive(Debug, PartialEq, Eq)]
+#[repr(u8)]
 enum ExecutorState {
     STRONG,
     WEAK, // 执行完一次future后就需要被drop
@@ -31,17 +32,10 @@ pub struct Executor {
     hard_guard_top: bool,
     pub context: ExecuterContext,
     #[cfg(any(target_arch = "riscv64", target_arch = "aarch64"))]
-    context_data: ContextData,
-    task_id: usize,
-    /// Polls taken since this executor last handed the CPU to a parked weak
-    /// executor. Plain, not atomic: an executor is only ever run by one CPU,
-    /// and this is the hottest loop there is.
-    polls_since_weak: u64,
-
-    /// Weak turns in a row that came back with no fewer frames parked. Scales
-    /// the turn's cadence -- see the comment at the turn in `run`.
-    barren_weak_turns: u32,
-    state: ExecutorState,
+    context_data: core::cell::UnsafeCell<ContextData>,
+    /// Read by fault attribution on peer CPUs while this executor is polling.
+    task_id: AtomicUsize,
+    state: AtomicU8,
     /// The task checked out for the poll currently in flight, with its waker.
     /// The panic-containment path needs to name — and retire — the future that
     /// was running when a fault hit this executor's stack, and `task_id` alone
@@ -52,11 +46,19 @@ pub struct Executor {
     /// round-trips (see `Task::waker`'s doc). Both are set immediately before
     /// `Task::poll` and cleared immediately after, and the `Arc`s they borrow
     /// from are live locals of `run` across that whole window — including while
-    /// the poll is parked by preemption. The only reader is
-    /// [`Executor::abandon_current_task`], reached from a fault taken *inside*
-    /// that poll on this same CPU, which is exactly when they are valid.
-    current_task: *const Task,
-    current_waker: *const WakerRef,
+    /// the poll is parked by preemption. Observers may test whether a poll is
+    /// active, but only [`Executor::abandon_current_task`] dereferences them,
+    /// from a fault inside that poll on this same CPU. Publishing the task
+    /// pointer last makes its acquire load also publish the matching waker.
+    current_task: AtomicPtr<Task>,
+    current_waker: AtomicPtr<WakerRef>,
+    /// A shared-reference entry point still permits only one polling loop.
+    /// Context switches resume that loop rather than entering `run` again.
+    run_started: AtomicBool,
+    scheduler_critical: AtomicBool,
+    /// A weak loop can return under a user root. Keep its owner alive until the
+    /// runtime releases this executor after switching back to its kernel root.
+    return_cr3_pin: spin::Mutex<Option<(Arc<Task>, usize)>>,
     /// Set when this executor's coroutine stack was abandoned mid-poll (see
     /// [`Executor::abandon_current_task`]). Separate from `state` because it is
     /// written through a shared `&Executor` while the runtime still holds its
@@ -73,6 +75,184 @@ pub struct Executor {
     force_replace: AtomicBool,
     /// [null-exec guard] Resume-ownership latch. See [`ResumeClaim`].
     resume_claim: ResumeClaim,
+}
+
+#[cfg(test)]
+mod executor_observer_tests {
+    use super::*;
+    use core::mem::ManuallyDrop;
+
+    fn metadata_only_executor() -> ManuallyDrop<Executor> {
+        // No stack is allocated: these tests exercise shared metadata only,
+        // and must not run the stack-retirement destructor.
+        ManuallyDrop::new(Executor {
+            id: 0,
+            task_collection: TaskCollection::new(0),
+            stack_base: 0,
+            hard_guard_bottom: false,
+            hard_guard_top: false,
+            context: ExecuterContext::default(),
+            #[cfg(any(target_arch = "riscv64", target_arch = "aarch64"))]
+            context_data: core::cell::UnsafeCell::new(ContextData::default()),
+            task_id: AtomicUsize::new(0),
+            state: AtomicU8::new(ExecutorState::UNUSED as u8),
+            current_task: AtomicPtr::new(core::ptr::null_mut()),
+            current_waker: AtomicPtr::new(core::ptr::null_mut()),
+            run_started: AtomicBool::new(false),
+            scheduler_critical: AtomicBool::new(false),
+            return_cr3_pin: spin::Mutex::new(None),
+            abandoned: AtomicBool::new(false),
+            force_replace: AtomicBool::new(false),
+            resume_claim: ResumeClaim::new(),
+        })
+    }
+
+    #[test]
+    fn runtime_transitions_do_not_require_an_exclusive_executor_borrow() {
+        let _: fn(&Executor) = Executor::run;
+        let _: fn(&Executor) = Executor::mark_weak;
+        let executor = metadata_only_executor();
+        let shared: &Executor = &executor;
+        assert!(!shared.killed());
+        shared.mark_weak();
+        assert_eq!(
+            shared.state.load(Ordering::Acquire),
+            ExecutorState::WEAK as u8
+        );
+        shared
+            .state
+            .store(ExecutorState::KILLED as u8, Ordering::Release);
+        assert!(shared.killed());
+    }
+
+    #[test]
+    fn peer_fault_attribution_can_observe_task_transitions_without_a_runtime_lock() {
+        let executor = Arc::new(metadata_only_executor());
+        let writer = executor.clone();
+        let thread = std::thread::spawn(move || {
+            for _ in 0..2_000 {
+                writer.task_id.store(7, Ordering::Relaxed);
+                writer.task_id.store(0, Ordering::Relaxed);
+            }
+        });
+        for _ in 0..2_000 {
+            assert!(matches!(executor.task_id(), 0 | 7));
+            let _ = executor.is_running_future();
+        }
+        thread.join().unwrap();
+        assert_eq!(executor.task_id(), 0);
+    }
+
+    #[test]
+    fn shared_run_entry_rejects_a_second_polling_loop_before_touching_the_stack() {
+        let executor = metadata_only_executor();
+        assert!(!executor.run_started.swap(true, Ordering::AcqRel));
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| executor.run())).is_err());
+    }
+
+    #[test]
+    fn scheduler_critical_guard_distinguishes_bookkeeping_from_poll_and_quiescence() {
+        let executor = metadata_only_executor();
+        assert!(!executor.is_scheduler_critical());
+        {
+            let critical = SchedulerCritical::new(&executor.scheduler_critical);
+            assert!(executor.is_scheduler_critical());
+            critical.set(false);
+            assert!(!executor.is_scheduler_critical());
+            critical.set(true);
+            assert!(executor.is_scheduler_critical());
+        }
+        assert!(!executor.is_scheduler_critical());
+    }
+
+    #[test]
+    fn lazy_address_space_pin_retains_the_original_owner_until_the_root_changes() {
+        struct OwnerFuture(Arc<()>);
+        impl core::future::Future for OwnerFuture {
+            type Output = ();
+            fn poll(
+                self: core::pin::Pin<&mut Self>,
+                _: &mut core::task::Context<'_>,
+            ) -> core::task::Poll<()> {
+                let _ = &self.0;
+                core::task::Poll::Ready(())
+            }
+        }
+
+        let owner = Arc::new(());
+        let weak_owner = Arc::downgrade(&owner);
+        let task = Arc::new(Task::new(OwnerFuture(owner.clone()), 0, None));
+        let mut cx = core::task::Context::from_waker(core::task::Waker::noop());
+        assert!(task.poll(&mut cx).is_ready());
+        let mut pin = None;
+        retain_address_space_owner(&mut pin, &task, 0x1000);
+        drop(task);
+        drop(owner);
+
+        let generic = Arc::new(Task::new(core::future::pending::<()>(), 0, None));
+        let weak_generic = Arc::downgrade(&generic);
+        retain_address_space_owner(&mut pin, &generic, 0x1000);
+        drop(generic);
+        assert!(weak_generic.upgrade().is_none());
+        assert!(weak_owner.upgrade().is_some());
+
+        let same_process = Arc::new(Task::new(
+            OwnerFuture(weak_owner.upgrade().unwrap()),
+            0,
+            None,
+        ));
+        let weak_same_process = Arc::downgrade(&same_process);
+        retain_address_space_owner(&mut pin, &same_process, 0x1000);
+        drop(same_process);
+        assert!(weak_same_process.upgrade().is_none());
+        assert!(weak_owner.upgrade().is_some());
+
+        let next_owner = Arc::new(());
+        let weak_next_owner = Arc::downgrade(&next_owner);
+        let next = Arc::new(Task::new(OwnerFuture(next_owner.clone()), 0, None));
+        retain_address_space_owner(&mut pin, &next, 0x2000);
+        drop(next);
+        drop(next_owner);
+        assert!(weak_owner.upgrade().is_none());
+        assert!(weak_next_owner.upgrade().is_some());
+        let executor = metadata_only_executor();
+        executor.retain_root_until_runtime(&mut pin);
+        drop(pin);
+        assert!(weak_next_owner.upgrade().is_some());
+        // Simulate runtime-side destruction only after switching away from the
+        // weak loop's root; metadata-only executors do not run a real Drop.
+        drop(executor.return_cr3_pin.lock().take());
+        assert!(weak_next_owner.upgrade().is_none());
+    }
+}
+
+struct SchedulerCritical<'a>(&'a AtomicBool);
+
+impl<'a> SchedulerCritical<'a> {
+    fn new(flag: &'a AtomicBool) -> Self {
+        let guard = Self(flag);
+        guard.set(true);
+        guard
+    }
+
+    fn set(&self, critical: bool) {
+        self.0.store(critical, Ordering::Release);
+    }
+}
+
+impl Drop for SchedulerCritical<'_> {
+    fn drop(&mut self) {
+        self.set(false);
+    }
+}
+
+fn retain_address_space_owner(pin: &mut Option<(Arc<Task>, usize)>, task: &Arc<Task>, root: usize) {
+    if pin
+        .as_ref()
+        .is_none_or(|(_, pinned_root)| *pinned_root != root)
+    {
+        *pin = Some((task.clone(), root));
+    }
 }
 
 /// [null-exec guard] The exclusive right to stand on one executor's stack.
@@ -240,37 +420,16 @@ const STACK_REG_SLOTS: usize = 512;
 static STACK_REG_BASE: [core::sync::atomic::AtomicUsize; STACK_REG_SLOTS] =
     [const { core::sync::atomic::AtomicUsize::new(0) }; STACK_REG_SLOTS];
 
-/// Occupancy summary for [`STACK_REG_BASE`]: bit `s` of word `s / 64` is set
-/// while slot `s` may hold a live base.
-///
-/// The table is 512 `AtomicUsize`, and all three operations on it used to walk
-/// every one of them: 4 KiB, **64 cache lines, per call**. For the lookup that
-/// matters more than for the other two, because
-/// [`alloc_overlaps_live_stack`] is called by the kernel's global allocator on
-/// **every block it hands out** — so every `Box`, every `Vec` growth, every
-/// frame of kernel bookkeeping anywhere in the system walked 4 KiB of atomics
-/// to answer a question whose answer is "no" essentially always: it is a
-/// tripwire for a bug, not a lookup anything depends on. A handful of stacks
-/// are live at a time, so this is 512 loads to read maybe eight useful ones,
-/// on lines that `Executor::new` and the retire path write from other cores.
-///
-/// Eight words summarise all of it. The lookup reads those eight and then only
-/// the slots a set bit names: 8 loads with nothing live, 8 + k with k stacks
-/// live, instead of 512 either way. Insert finds a free slot from the inverted
-/// word and remove skips the empties, so both get the same reduction.
-///
-/// **The invariant is that a set bit is a *superset* of a set base**, never a
-/// subset: insert claims the bit *before* it CASes the base in, and remove
-/// zeroes the base *before* it drops the bit. So a reader can visit a slot that
-/// holds nothing -- it loads a 0 and skips, which it already did -- but it can
-/// never skip a slot that holds a live stack, which would turn this tripwire
-/// into a silent false negative. The order is the whole correctness argument;
-/// a spurious bit is only ever one wasted load.
+// Retain the former summary only in tests. Clearing it after removing a base
+// can erase the bit of a replacement inserted in between, so production
+// lookups must use the authoritative base array.
+#[cfg(test)]
 const STACK_REG_WORDS: usize = STACK_REG_SLOTS / 64;
 const _: () = assert!(
     STACK_REG_SLOTS % 64 == 0,
     "STACK_REG_OCC indexes STACK_REG_BASE 64 slots per word: the count must divide"
 );
+#[cfg(test)]
 static STACK_REG_OCC: [core::sync::atomic::AtomicU64; STACK_REG_WORDS] =
     [const { core::sync::atomic::AtomicU64::new(0) }; STACK_REG_WORDS];
 
@@ -290,22 +449,17 @@ static STACK_REG_BASE_OVERFLOW: core::sync::atomic::AtomicUsize =
 /// "no aliasing".
 fn stack_reg_insert(alloc_base: usize) {
     use core::sync::atomic::Ordering::{AcqRel, Relaxed};
-    for (i, slot) in STACK_REG_BASE.iter().enumerate() {
+    for slot in STACK_REG_BASE.iter() {
         // Load first (see the note on `stack_reg_remove`).
         if slot.load(Relaxed) != 0 {
             continue;
         }
-        // Deliberately NOT driven off `STACK_REG_OCC`: the summary is a
-        // superset, so a bit that outlived its base would make a free slot
-        // unreachable and shrink the table for good. Finding a slot stays a
-        // scan of the bases, which is the authority. This runs once per
-        // executor stack, not per allocation -- it is the lookup that was
-        // costing the kernel 512 loads on every block, and only the lookup
-        // reads the summary.
-        //
-        // The bit is claimed BEFORE the base goes in, so a set bit is always a
-        // superset of a set base and `alloc_overlaps_live_stack` can never skip
-        // a slot holding a live stack.
+        #[cfg(test)]
+        let i = STACK_REG_BASE
+            .iter()
+            .position(|candidate| core::ptr::eq(candidate, slot))
+            .unwrap();
+        #[cfg(test)]
         stack_reg_occ_set(i);
         if slot
             .compare_exchange(0, alloc_base, AcqRel, Relaxed)
@@ -313,10 +467,8 @@ fn stack_reg_insert(alloc_base: usize) {
         {
             return;
         }
-        // Lost the slot to somebody else. If it is theirs, the bit is theirs
-        // and stays; a slot that is genuinely free gives the bit back, and a
-        // spurious one would only ever cost a reader one load of a zero it
-        // already skips.
+        // Replay the removed summary algorithm only for its regression model.
+        #[cfg(test)]
         if slot.load(Relaxed) == 0 {
             stack_reg_occ_clear(i);
         }
@@ -326,13 +478,14 @@ fn stack_reg_insert(alloc_base: usize) {
 
 /// Mark slot `i` as possibly occupied. See [`STACK_REG_OCC`].
 #[inline]
+#[cfg(test)]
 fn stack_reg_occ_set(i: usize) {
     STACK_REG_OCC[i / 64].fetch_or(1u64 << (i % 64), core::sync::atomic::Ordering::AcqRel);
 }
 
-/// Mark slot `i` as free. Only ever called once the base reads 0, so the
-/// summary stays a superset.
+/// Model the old, racy clear performed after a base was removed.
 #[inline]
+#[cfg(test)]
 fn stack_reg_occ_clear(i: usize) {
     STACK_REG_OCC[i / 64].fetch_and(!(1u64 << (i % 64)), core::sync::atomic::Ordering::Release);
 }
@@ -358,17 +511,22 @@ pub fn untracked_alloc_stacks() -> usize {
 /// moves on, exactly as before.
 fn stack_reg_remove(alloc_base: usize) {
     use core::sync::atomic::Ordering::{AcqRel, Relaxed};
-    for (i, slot) in STACK_REG_BASE.iter().enumerate() {
+    for slot in STACK_REG_BASE.iter() {
         if slot.load(Relaxed) != alloc_base {
             continue;
         }
+        #[cfg(test)]
+        let i = STACK_REG_BASE
+            .iter()
+            .position(|candidate| core::ptr::eq(candidate, slot))
+            .unwrap();
         if slot
             .compare_exchange(alloc_base, 0, AcqRel, Relaxed)
             .is_ok()
         {
-            // Base zeroed first, bit dropped after: a reader in between visits
-            // the slot and loads the 0 it already skips. The other order would
-            // hide a live stack for that window.
+            // The test model can now hide a concurrently inserted replacement;
+            // the production lookup reads the base directly.
+            #[cfg(test)]
             stack_reg_occ_clear(i);
             return;
         }
@@ -395,23 +553,14 @@ fn stack_reg_remove(alloc_base: usize) {
 pub fn alloc_overlaps_live_stack(ptr: usize, len: usize) -> Option<usize> {
     use core::sync::atomic::Ordering::Acquire;
     let a_end = ptr.saturating_add(len);
-    // Eight words instead of 512 slots, and then only the slots a set bit
-    // names. This runs inside the global allocator on every block it hands
-    // out, so the walk it used to do was charged to every allocation in the
-    // kernel; see `STACK_REG_OCC` for why a set bit can never be missing.
-    for (w, word) in STACK_REG_OCC.iter().enumerate() {
-        let mut bits = word.load(Acquire);
-        while bits != 0 {
-            let b = bits.trailing_zeros() as usize;
-            bits &= bits - 1;
-            let base = STACK_REG_BASE[w * 64 + b].load(Acquire);
-            if base == 0 {
-                continue;
-            }
-            let b_end = base.saturating_add(ALLOC_SIZE);
-            if ptr < b_end && base < a_end {
-                return Some(base);
-            }
+    for slot in STACK_REG_BASE.iter() {
+        let base = slot.load(Acquire);
+        if base == 0 {
+            continue;
+        }
+        let b_end = base.saturating_add(ALLOC_SIZE);
+        if ptr < b_end && base < a_end {
+            return Some(base);
         }
     }
     None
@@ -856,7 +1005,8 @@ static SPINE_EXEC: [core::sync::atomic::AtomicUsize; SPINE_SLOTS] =
     [const { core::sync::atomic::AtomicUsize::new(0) }; SPINE_SLOTS];
 static SPINE_BASE: [core::sync::atomic::AtomicUsize; SPINE_SLOTS] =
     [const { core::sync::atomic::AtomicUsize::new(0) }; SPINE_SLOTS];
-/// Bumped on every register/unregister: watchpoint re-sync + sweep seqlock.
+static SPINE_ACCESS: spin::Mutex<()> = spin::Mutex::new(());
+/// Bumped on every register/unregister for watchpoint re-sync.
 static SPINE_GEN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 /// One full smash report is enough; later mismatches only bump this.
 static SPINE_SMASHES: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
@@ -870,6 +1020,8 @@ static SPINE_OVERFLOW: core::sync::atomic::AtomicUsize = core::sync::atomic::Ato
 
 fn spine_register(slot: usize, val: u64, exec_id: usize, stack_base: usize) {
     use core::sync::atomic::Ordering::{AcqRel, Relaxed, Release};
+    let _interrupts = crate::InterruptGuard::new(false);
+    let _access = SPINE_ACCESS.lock();
     for i in 0..SPINE_SLOTS {
         // Load first: see the note on `stack_reg_remove`. `spine_verify` sweeps
         // this same array from the timer tick on every CPU.
@@ -890,6 +1042,8 @@ fn spine_register(slot: usize, val: u64, exec_id: usize, stack_base: usize) {
             return;
         }
     }
+    drop(_access);
+    drop(_interrupts);
     // Full: this executor's slot goes unwatched. Best-effort as a diagnostic,
     // but not silent — 16 slots cover "CPUs + parked weaks" and the sibling
     // pool's cap of 32 was already found too small by a GL=1 burst, so say so
@@ -914,6 +1068,8 @@ pub fn unwatched_spine_slots() -> usize {
 
 fn spine_unregister(slot: usize) {
     use core::sync::atomic::Ordering::{AcqRel, Relaxed, Release};
+    let _interrupts = crate::InterruptGuard::new(false);
+    let _access = SPINE_ACCESS.lock();
     for i in 0..SPINE_SLOTS {
         if SPINE_ADDR[i]
             .compare_exchange(slot, 0, AcqRel, Relaxed)
@@ -930,6 +1086,8 @@ fn spine_unregister(slot: usize) {
 /// pooled/freed — the pool re-poison must not fire the watch.
 fn spine_unregister_by_stack(stack_base: usize) {
     use core::sync::atomic::Ordering::{Acquire, Relaxed, Release, SeqCst};
+    let _interrupts = crate::InterruptGuard::new(false);
+    let _access = SPINE_ACCESS.lock();
     let lo = stack_base;
     let hi = stack_base + STACK_SIZE;
     for i in 0..SPINE_SLOTS {
@@ -994,6 +1152,26 @@ pub fn spine_owner_of(addr: usize) -> Option<usize> {
     None
 }
 
+/// Copy a registered return slot while retirement and reuse are excluded.
+/// IRQ/debug handlers skip a busy registry instead of waiting on it.
+pub fn spine_sample(addr: usize) -> Option<(usize, u64)> {
+    crate::run_with_intr_saved_off! {
+        let _access = SPINE_ACCESS.try_lock()?;
+        for i in 0..SPINE_SLOTS {
+            let registered = SPINE_ADDR[i].load(Ordering::Acquire);
+            if registered == 0 || registered == usize::MAX || registered != addr {
+                continue;
+            }
+            let exec_id = SPINE_EXEC[i].load(Ordering::Relaxed);
+            // SAFETY: registration publishes an initialized, aligned return
+            // slot; the registry guard keeps its stack alive until this read.
+            let value = unsafe { core::ptr::read_volatile(addr as *const u64) };
+            return Some((exec_id, value));
+        }
+        return None;
+    }
+}
+
 /// One detected spine smash, for the caller (kernel-hal's timer tick) to
 /// print with its IRQ-safe spin serial writer — no logging happens here, so
 /// this is callable from IRQ context without touching the console lock.
@@ -1012,8 +1190,8 @@ pub struct SpineSmash {
     /// The victim stack's usable range.
     pub stack_base: usize,
     pub stack_top: usize,
-    /// Extent of the contiguous foreign blob around the slot (values equal to
-    /// `found` or zero), bounded to ±4 KiB.
+    /// The inspected range: only the registered immutable return word.
+    /// These addresses are diagnostic numbers, not a lease to read stack memory.
     pub blob_lo: usize,
     pub blob_hi: usize,
 }
@@ -1025,8 +1203,13 @@ pub struct SpineSmash {
 /// nothing is wrong.
 pub fn spine_verify() -> Option<SpineSmash> {
     use core::sync::atomic::Ordering::{Acquire, Relaxed};
+    // Do not allow local preemption while holding the registry lifetime lock.
+    // IRQ callers never spin; unregister/reuse waits until the protected read
+    // finishes. Registered return words are immutable until unregister, unlike
+    // arbitrary surrounding frame words, which must not be scanned.
+    let _interrupts = crate::InterruptGuard::new(false);
+    let _access = SPINE_ACCESS.try_lock()?;
     for i in 0..SPINE_SLOTS {
-        let gen0 = SPINE_GEN.load(Acquire);
         let a = SPINE_ADDR[i].load(Acquire);
         if a == 0 || a == usize::MAX {
             continue;
@@ -1034,23 +1217,11 @@ pub fn spine_verify() -> Option<SpineSmash> {
         let expect = SPINE_VAL[i].load(Relaxed);
         let exec_id = SPINE_EXEC[i].load(Relaxed);
         let base = SPINE_BASE[i].load(Relaxed);
-        // SAFETY: a registered slot lies on a live (or at worst pooled — the
-        // memory stays mapped) executor stack; 8-aligned by construction.
+        // SAFETY: registration pins this aligned return word's stack lifetime,
+        // and its normal writer cannot return/reuse it until unregister obtains
+        // the same lock. Only an independently invalid smash can modify it.
         let now = unsafe { core::ptr::read_volatile(a as *const u64) };
         if now == expect {
-            continue;
-        }
-        // Seqlock-ish: if a register/unregister raced this read, skip — the
-        // mismatch may pair a new slot with an old value or a poisoned stack.
-        //
-        // The one rule here no test pins, and it cannot be: what it suppresses
-        // is a false report in a race, and a false report is byte-for-byte the
-        // same as a true one. A single thread cannot move the generation under
-        // its own read, and a second thread that moves it cannot tell the
-        // suppressed report from the report the sweep is supposed to make.
-        // Removing these three lines leaves the sweep correct on a quiet table
-        // and wrong only in the window it exists for.
-        if SPINE_GEN.load(Acquire) != gen0 || SPINE_ADDR[i].load(Acquire) != a {
             continue;
         }
         let ordinal = SPINE_SMASHES.fetch_add(1, Relaxed);
@@ -1058,27 +1229,7 @@ pub fn spine_verify() -> Option<SpineSmash> {
         // once, not at tick rate forever — while a FUTURE write to it (or to
         // any other slot) still re-triggers detection.
         SPINE_VAL[i].store(now, Relaxed);
-        // Walk the contiguous foreign blob around the slot (bounded ±4 KiB).
         let top = base + STACK_SIZE;
-        let lo_lim = a.saturating_sub(0x1000).max(base);
-        let hi_lim = (a + 0x1000).min(top);
-        let matches_blob = |v: u64| v == now || v == 0;
-        let mut lo = a;
-        while lo >= lo_lim + 8 {
-            let v = unsafe { core::ptr::read_volatile((lo - 8) as *const u64) };
-            if !matches_blob(v) {
-                break;
-            }
-            lo -= 8;
-        }
-        let mut hi = a + 8;
-        while hi + 8 <= hi_lim {
-            let v = unsafe { core::ptr::read_volatile(hi as *const u64) };
-            if !matches_blob(v) {
-                break;
-            }
-            hi += 8;
-        }
         return Some(SpineSmash {
             ordinal,
             exec_id,
@@ -1087,8 +1238,8 @@ pub fn spine_verify() -> Option<SpineSmash> {
             found: now,
             stack_base: base,
             stack_top: top,
-            blob_lo: lo,
-            blob_hi: hi,
+            blob_lo: a,
+            blob_hi: a + 8,
         });
     }
     None
@@ -1273,13 +1424,14 @@ impl Executor {
             hard_guard_top,
             context: ExecuterContext::default(),
             #[cfg(any(target_arch = "riscv64", target_arch = "aarch64"))]
-            context_data: ContextData::default(),
-            task_id: 0,
-            polls_since_weak: 0,
-            barren_weak_turns: 0,
-            state: ExecutorState::UNUSED,
-            current_task: core::ptr::null(),
-            current_waker: core::ptr::null(),
+            context_data: core::cell::UnsafeCell::new(ContextData::default()),
+            task_id: AtomicUsize::new(0),
+            state: AtomicU8::new(ExecutorState::UNUSED as u8),
+            current_task: AtomicPtr::new(core::ptr::null_mut()),
+            current_waker: AtomicPtr::new(core::ptr::null_mut()),
+            run_started: AtomicBool::new(false),
+            scheduler_critical: AtomicBool::new(false),
+            return_cr3_pin: spin::Mutex::new(None),
             abandoned: AtomicBool::new(false),
             force_replace: AtomicBool::new(false),
             resume_claim: ResumeClaim::new(),
@@ -1300,19 +1452,19 @@ impl Executor {
     fn init_stack_and_context(&mut self) {
         let mut stack_top = self.stack_base + STACK_SIZE;
         let self_addr = self as *const Self as usize;
-        stack_top = unsafe { push_stack(stack_top, self_addr) };
         #[cfg(any(target_arch = "riscv64", target_arch = "aarch64"))]
         {
-            self.context_data = ContextData::new(
+            stack_top = unsafe { push_stack(stack_top, [self_addr, 0usize]) };
+            *self.context_data.get_mut() = ContextData::new(
                 executor_entry as *const () as usize,
                 stack_top,
                 crate::arch::pg_base_register(),
             );
-            self.context
-                .set_context(&self.context_data as *const _ as usize);
+            self.context.set_context(self.context_data.get() as usize);
         }
         #[cfg(target_arch = "x86_64")]
         {
+            stack_top = unsafe { push_stack(stack_top, self_addr) };
             let context_data = ContextData::new(
                 executor_entry as *const () as usize,
                 stack_top,
@@ -1324,7 +1476,12 @@ impl Executor {
     }
 
     #[inline(never)]
-    pub fn run(&mut self) {
+    pub fn run(&self) {
+        assert!(
+            !self.run_started.swap(true, Ordering::AcqRel),
+            "executor polling loop entered twice"
+        );
+        let critical = SchedulerCritical::new(&self.scheduler_critical);
         // Spine-slot capture (see the registry above): at this point our
         // caller `run_executor`'s `call` has just written the
         // return-into-`run_executor` qword at `stack_top - 0x508`, and it must
@@ -1347,7 +1504,7 @@ impl Executor {
             if slot >= top - 0x800 && slot + 8 <= top && slot & 7 == 0 {
                 // SAFETY: within this executor's own live stack.
                 let val = unsafe { core::ptr::read_volatile(slot as *const u64) };
-                if (0xffff_ff00_0000_0000..0xffff_ff00_0100_0000).contains(&val) {
+                if crate::runtime::kernel_resume_address(val) {
                     spine_register(slot, val, self.id, self.stack_base);
                     slot
                 } else {
@@ -1380,15 +1537,14 @@ impl Executor {
         // saved `UserContext` is valid; it is the physical memory behind it that
         // changes under the stale CR3.
         //
-        // Hold an `Arc` to the most-recently-polled task across the next
-        // `take_task`/`steal` step. That keeps its `Thread` -> `Process` ->
-        // `vmar` -> page table alive, so a concurrent exit cannot free the page
-        // table while its CR3 is still loaded here. The pin is replaced only
-        // after the *next* poll has switched CR3 to another address space (or to
-        // the kernel CR3, which `CurrentThread::drop` restores when a thread
-        // finishes), so the previous page table is released only once its CR3 is
-        // no longer loaded on this CPU.
-        let mut _cr3_pin: Option<Arc<Task>> = None;
+        // Pin the task that established the current hardware root. Its retained
+        // ThreadSwitchFuture owns Thread -> Process -> vmar -> page table even
+        // after completion. A generic kernel future need not switch roots or own
+        // that process, so an unchanged root must retain the ORIGINAL task.
+        // Release that owner only after a poll leaves a different root active.
+        let mut _cr3_pin: Option<(Arc<Task>, usize)> = None;
+        let mut polls_since_weak = 0u64;
+        let mut barren_weak_turns = 0u32;
         loop {
             // Balance pull: a CPU that always has exactly one local task never
             // hits the idle steal below, so a peer sitting on a backlog stays
@@ -1416,26 +1572,30 @@ impl Executor {
             // cap: bounded cost when the frames are stuck, unchanged response
             // when they are not.
             let waiting = crate::runtime::weak_waiting_here();
-            if !matches!(self.state, ExecutorState::WEAK | ExecutorState::KILLED)
+            let state = self.state.load(Ordering::Acquire);
+            if state != ExecutorState::WEAK as u8
+                && state != ExecutorState::KILLED as u8
                 && crate::runtime::weak_turn_due(
                     waiting,
-                    self.polls_since_weak,
+                    polls_since_weak,
                     crate::runtime::weak_turn_interval(
-                        self.barren_weak_turns,
+                        barren_weak_turns,
                         crate::runtime::WEAK_TURN_EVERY,
                     ),
                 )
             {
-                self.polls_since_weak = 0;
+                polls_since_weak = 0;
                 SCHED_WEAK_TURN.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                critical.set(false);
                 crate::runtime::sched_yield();
+                critical.set(true);
                 // Read back on the far side of the switch: fewer frames parked
                 // than before means the turn did its job, so go back to the
                 // fast cadence.
                 if crate::runtime::weak_waiting_here() < waiting {
-                    self.barren_weak_turns = 0;
+                    barren_weak_turns = 0;
                 } else {
-                    self.barren_weak_turns = self.barren_weak_turns.saturating_add(1);
+                    barren_weak_turns = barren_weak_turns.saturating_add(1);
                 }
                 continue;
             }
@@ -1480,7 +1640,7 @@ impl Executor {
                 // setting it again here was redundant.
                 let waker = woke::waker_ref(&waker_ref);
                 let mut cx = Context::from_waker(&waker);
-                self.task_id = task.id();
+                self.task_id.store(task.id(), Ordering::Relaxed);
                 debug!("running future {}:{}", self.id(), task.id());
                 // Hang detector: a task is being polled, so clear the idle-loop
                 // streak. If the machine then spins the idle loop many times with
@@ -1505,11 +1665,17 @@ impl Executor {
                 // exactly this task (see `runtime::abandon_current_task`). Both
                 // are cleared right after the poll returns, so a fault outside
                 // a poll finds no victim and the kernel halts as before.
-                self.current_task = Arc::as_ptr(&task);
-                self.current_waker = Arc::as_ptr(&waker_ref);
+                self.current_waker
+                    .store(Arc::as_ptr(&waker_ref).cast_mut(), Ordering::Relaxed);
+                self.current_task
+                    .store(Arc::as_ptr(&task).cast_mut(), Ordering::Release);
+                critical.set(false);
                 let ret = task.poll(&mut cx);
-                self.current_task = core::ptr::null();
-                self.current_waker = core::ptr::null();
+                critical.set(true);
+                self.current_task
+                    .store(core::ptr::null_mut(), Ordering::Release);
+                self.current_waker
+                    .store(core::ptr::null_mut(), Ordering::Relaxed);
                 // Did this future overflow the coroutine stack?  The stack is a
                 // guard-page-less heap allocation: an overflow silently corrupts
                 // the adjacent heap object.  Detect it immediately and panic so
@@ -1527,15 +1693,8 @@ impl Executor {
                     );
                 }
                 debug!("back from future {}:{}", self.id(), task.id());
-                self.task_id = 0;
-                // Pin this task's address space for the upcoming take_task/steal
-                // (which run under the CR3 this poll just (re)loaded). Replacing
-                // the previous pin here is safe: CR3 now points at *this* task's
-                // page table (or at the kernel CR3 if the thread just finished —
-                // `CurrentThread::drop` restored it), so the page table we drop
-                // is no longer the active one. See the comment at the top of
-                // `run`.
-                _cr3_pin = Some(task.clone());
+                self.task_id.store(0, Ordering::Relaxed);
+                retain_address_space_owner(&mut _cr3_pin, &task, crate::arch::pg_base_register());
                 // Borrow-release ordering — this is load-bearing for SMP.
                 //
                 // The OLD order (mark_borrowed(false), then drop_by_ref on
@@ -1569,15 +1728,17 @@ impl Executor {
                         waker_ref.mark_borrowed(false);
                     }
                 };
-                self.polls_since_weak = self.polls_since_weak.saturating_add(1);
-                if let ExecutorState::WEAK = self.state {
-                    self.state = ExecutorState::KILLED;
+                polls_since_weak = polls_since_weak.saturating_add(1);
+                if self.state.load(Ordering::Acquire) == ExecutorState::WEAK as u8 {
+                    self.state
+                        .store(ExecutorState::KILLED as u8, Ordering::Release);
                     // Past this return, `run_executor`'s post-run calls
                     // legitimately re-push over the spine slot — stop
                     // watching it first.
                     if spine_slot != 0 {
                         spine_unregister(spine_slot);
                     }
+                    self.retain_root_until_runtime(&mut _cr3_pin);
                     return;
                 }
             } else {
@@ -1592,11 +1753,15 @@ impl Executor {
                 // TODO: some cores may exit by mistake when we have multi-cores
                 if cfg!(feature = "baremetal-test") && task_num == 0 {
                     debug!("all done! exit and reboot");
+                    critical.set(false);
                     crate::runtime::sched_yield();
+                    critical.set(true);
                 } else if weak_executor != 0 {
                     debug!("return to runtime and run weak executor");
                     SCHED_WEAK_YIELD.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                    critical.set(false);
                     crate::runtime::sched_yield();
+                    critical.set(true);
                 } else if crate::runtime::run_idle_callback() {
                     // The idle callback made progress (e.g. drained deferred
                     // driver jobs that may have woken tasks): re-check the run
@@ -1690,7 +1855,9 @@ impl Executor {
                     // that races either sets the bit again or is seen there.
                     crate::runtime::note_not_stealable(cpu);
                     if !self.task_collection.has_ready() {
+                        critical.set(false);
                         crate::arch::wait_for_interrupt();
+                        critical.set(true);
                     }
                     crate::runtime::set_cpu_sleeping(cpu, false);
                     if intr_was_on {
@@ -1705,14 +1872,14 @@ impl Executor {
     // 发生supervisor时钟中断时, 若executor在运行future, 则
     // 说明该future超时, 需要切换到另一个executor来执行其他future.
     pub fn is_running_future(&self) -> bool {
-        self.task_id != 0
+        self.task_id.load(Ordering::Relaxed) != 0
             || self
                 .force_replace
                 .load(core::sync::atomic::Ordering::Acquire)
     }
 
     pub fn killed(&self) -> bool {
-        self.state == ExecutorState::KILLED
+        self.state.load(Ordering::Acquire) == ExecutorState::KILLED as u8
             || self.abandoned.load(core::sync::atomic::Ordering::SeqCst)
     }
 
@@ -1724,7 +1891,17 @@ impl Executor {
     /// what the panic-containment path tests: a fault in the scheduler's own
     /// code between polls has no task to blame and must not kill one.
     pub fn is_polling(&self) -> bool {
-        !self.current_task.is_null()
+        !self.current_task.load(Ordering::Acquire).is_null()
+    }
+
+    /// Abandoning scheduler bookkeeping could strand queue locks or a checkout
+    /// that has not yet been published as the current poll. Fail closed there.
+    pub(crate) fn is_scheduler_critical(&self) -> bool {
+        self.scheduler_critical.load(Ordering::Acquire)
+    }
+
+    fn retain_root_until_runtime(&self, pin: &mut Option<(Arc<Task>, usize)>) {
+        *self.return_cr3_pin.lock() = pin.take();
     }
 
     /// Whether `sp` points into this executor's *usable* coroutine stack
@@ -1800,7 +1977,7 @@ impl Executor {
     pub unsafe fn abandon_current_task(&self) -> bool {
         // SAFETY: non-null means `run` is inside `Task::poll`, so the `Arc`s
         // these borrow from are live in that (current, faulted) frame.
-        let Some(task) = self.current_task.as_ref() else {
+        let Some(task) = self.current_task.load(Ordering::Acquire).as_ref() else {
             return false;
         };
         if !task.abandon() {
@@ -1817,7 +1994,7 @@ impl Executor {
         // first, the edge never happened, and the slot stayed in the slab
         // with `borrowed` stuck at 1 — invisible to the hang detector, which
         // treats a borrowed task as a poll in progress.
-        if let Some(waker) = self.current_waker.as_ref() {
+        if let Some(waker) = self.current_waker.load(Ordering::Relaxed).as_ref() {
             waker.drop_by_ref();
         } else {
             task.waker().drop_by_ref();
@@ -1859,7 +2036,7 @@ impl Executor {
     }
 
     pub unsafe fn abandon_idle_executor(&self) -> bool {
-        if !self.current_task.is_null() {
+        if !self.current_task.load(Ordering::Acquire).is_null() {
             return false;
         }
         self.force_replace
@@ -1869,8 +2046,9 @@ impl Executor {
         true
     }
 
-    pub fn mark_weak(&mut self) {
-        self.state = ExecutorState::WEAK;
+    pub fn mark_weak(&self) {
+        self.state
+            .store(ExecutorState::WEAK as u8, Ordering::Release);
     }
 
     pub fn id(&self) -> usize {
@@ -1878,7 +2056,7 @@ impl Executor {
     }
 
     pub fn task_id(&self) -> usize {
-        self.task_id
+        self.task_id.load(Ordering::Relaxed)
     }
 
     /// Base address of this executor's coroutine stack (lowest address).
@@ -2543,11 +2721,40 @@ mod stack_registry_tests {
         );
     }
 
-    /// `STACK_REG_OCC` is what the per-allocation lookup walks instead of all
-    /// 512 slots, so these cover its one invariant: a set bit is a SUPERSET of
-    /// a set base. A subset would make the tripwire silently miss a live stack.
+    /// Model the removed summary and reproduce its failing reuse interleaving.
+    /// The production lookup must still find the base when this model loses
+    /// the replacement's occupancy bit.
     mod occupancy {
         use super::*;
+
+        #[test]
+        fn a_reused_slot_remains_visible_when_the_old_remover_clears_its_summary() {
+            let _c = clean();
+            let old = BASE;
+            let replacement = BASE + ALLOC_SIZE * 2;
+            stack_reg_insert(old);
+            let cleared = std::sync::Arc::new(std::sync::Barrier::new(2));
+            let resume = std::sync::Arc::new(std::sync::Barrier::new(2));
+            let peer_cleared = cleared.clone();
+            let peer_resume = resume.clone();
+            let remover = std::thread::spawn(move || {
+                assert!(STACK_REG_BASE[0]
+                    .compare_exchange(old, 0, Ordering::AcqRel, Ordering::Relaxed)
+                    .is_ok());
+                peer_cleared.wait();
+                peer_resume.wait();
+                stack_reg_occ_clear(0);
+            });
+            cleared.wait();
+            stack_reg_insert(replacement);
+            resume.wait();
+            remover.join().unwrap();
+            assert!(!bit_of(0));
+            assert_eq!(
+                alloc_overlaps_live_stack(replacement + 4096, 8),
+                Some(replacement)
+            );
+        }
 
         fn bit_of(i: usize) -> bool {
             STACK_REG_OCC[i / 64].load(Ordering::SeqCst) & (1u64 << (i % 64)) != 0
@@ -2937,6 +3144,80 @@ mod spine_tests {
     }
 
     #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn a_tick_can_check_a_peers_immutable_registered_return_slot() {
+        let _c = clean();
+        let fake = Fake::new(64, 0, UNTOUCHED);
+        let slot = fake.at(8 * 8);
+        spine_register(slot, RETURN_INTO_RUN_EXECUTOR, 7, fake.base());
+        let previous = crate::arch::set_cpu_id_for_test(1);
+        assert!(spine_verify().is_some());
+        crate::arch::set_cpu_id_for_test(previous);
+        assert!(spine_verify().is_none());
+    }
+
+    #[test]
+    fn retirement_cannot_pass_a_reader_and_an_interrupted_writer_does_not_block_the_irq() {
+        let _c = clean();
+        let fake = Fake::new(64, 0, UNTOUCHED);
+        let slot = fake.at(8 * 8);
+        spine_register(slot, RETURN_INTO_RUN_EXECUTOR, 7, fake.base());
+        let access = SPINE_ACCESS.lock();
+        assert!(spine_verify().is_none());
+        let entered = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let completed = std::sync::Arc::new(AtomicBool::new(false));
+        let peer_entered = entered.clone();
+        let peer_completed = completed.clone();
+        let retire = std::thread::spawn(move || {
+            peer_entered.wait();
+            spine_unregister(slot);
+            peer_completed.store(true, Ordering::Release);
+        });
+        entered.wait();
+        assert!(!completed.load(Ordering::Acquire));
+        assert_eq!(watched(), alloc::vec![slot]);
+        drop(access);
+        retire.join().unwrap();
+        assert!(completed.load(Ordering::Acquire));
+        assert!(watched().is_empty());
+    }
+
+    #[test]
+    fn the_sweep_requires_backing_memory_only_for_the_registered_word() {
+        let _c = clean();
+        let fake = Fake::new(1, 0, 0);
+        spine_register(fake.base(), RETURN_INTO_RUN_EXECUTOR, 7, fake.base());
+        let smash = spine_verify().unwrap();
+        assert_eq!(smash.found, 0);
+        assert_eq!(smash.blob_lo, fake.base());
+        assert_eq!(smash.blob_hi, fake.base() + 8);
+    }
+
+    #[test]
+    fn registry_lock_operations_restore_enabled_and_disabled_interrupt_states() {
+        let _c = clean();
+        let _restore = crate::InterruptGuard::new(crate::arch::intr_get());
+        let fake = Fake::new(1, 0, RETURN_INTO_RUN_EXECUTOR);
+        for enabled in [false, true] {
+            if enabled {
+                crate::arch::intr_on();
+            } else {
+                crate::arch::intr_off();
+            }
+            spine_register(fake.base(), RETURN_INTO_RUN_EXECUTOR, 7, fake.base());
+            assert_eq!(crate::arch::intr_get(), enabled);
+            assert!(spine_verify().is_none());
+            assert_eq!(crate::arch::intr_get(), enabled);
+            let busy = SPINE_ACCESS.lock();
+            assert!(spine_verify().is_none());
+            assert_eq!(crate::arch::intr_get(), enabled);
+            drop(busy);
+            spine_unregister(fake.base());
+            assert_eq!(crate::arch::intr_get(), enabled);
+        }
+    }
+
+    #[test]
     fn a_registered_slot_is_handed_to_the_watchpoints_and_names_its_owner() {
         // The snapshot is what every CPU loads into DR0-DR3, and the owner is
         // what the #DB handler prints as the victim. A registration that
@@ -3132,10 +3413,7 @@ mod spine_tests {
     }
 
     #[test]
-    fn the_report_measures_the_foreign_blob_around_the_slot() {
-        // Every capture shows the slot inside a ~0x400-byte foreign blob, and
-        // its extent is what says whether the writer was aiming at a buffer
-        // (wide) or at this one word (narrow). The end is exclusive.
+    fn the_report_only_inspects_the_registered_word_despite_a_surrounding_blob() {
         let _c = clean();
         let mut fake = Fake::new(64, 0, UNTOUCHED);
         let slot = fake.at(8 * 8);
@@ -3145,16 +3423,12 @@ mod spine_tests {
             fake.set(fake.at(w * 8), 0);
         }
         let smash = spine_verify().expect("smash");
-        assert_eq!(smash.blob_lo, fake.at(5 * 8));
-        assert_eq!(smash.blob_hi, fake.at(13 * 8));
+        assert_eq!(smash.blob_lo, slot);
+        assert_eq!(smash.blob_hi, slot + 8);
     }
 
     #[test]
-    fn zeros_inside_the_blob_do_not_cut_it_short() {
-        // The blob is the corruptor's value *or* zero: the captures show both
-        // mixed, because the store that lands on a saved pointer leaves the
-        // high half zero. Stopping at the first zero measured a blob three
-        // words wide where it was thirty.
+    fn surrounding_zero_and_foreign_words_are_not_part_of_the_registered_snapshot() {
         let _c = clean();
         let mut fake = Fake::new(64, 0, UNTOUCHED);
         let slot = fake.at(8 * 8);
@@ -3168,19 +3442,14 @@ mod spine_tests {
         fake.set(fake.at(10 * 8), foreign);
         let smash = spine_verify().expect("smash");
         assert_eq!(smash.found, foreign);
-        assert_eq!(smash.blob_lo, fake.at(6 * 8));
-        assert_eq!(smash.blob_hi, fake.at(11 * 8));
+        assert_eq!(smash.blob_lo, slot);
+        assert_eq!(smash.blob_hi, slot + 8);
     }
 
     #[test]
-    fn the_sweep_never_reads_more_than_four_kilobytes_either_side() {
-        // The walk runs in the timer tick with a blob that may cover the whole
-        // stack; unbounded it would read 2 MiB per tick per victim, and the
-        // report would be a number nobody can use.
+    fn the_sweep_does_not_walk_a_zero_filled_stack() {
         let _c = clean();
-        // Zero-filled: every word matches the blob, so only the bound stops
-        // the walk. The words just outside it are what a missing bound would
-        // reach.
+        // Surrounding zero-filled words must not expand the inspected range.
         let mut fake = Fake::new(0x800, 0, 0);
         let slot = fake.at(0x2000);
         fake.set(slot, RETURN_INTO_RUN_EXECUTOR);
@@ -3189,8 +3458,8 @@ mod spine_tests {
         fake.set(slot - 0x1010, UNTOUCHED);
         fake.set(slot + 0x1010, UNTOUCHED);
         let smash = spine_verify().expect("smash");
-        assert_eq!(smash.blob_lo, slot - 0x1000);
-        assert_eq!(smash.blob_hi, slot + 0x1000);
+        assert_eq!(smash.blob_lo, slot);
+        assert_eq!(smash.blob_hi, slot + 8);
     }
 
     #[test]
@@ -3206,7 +3475,7 @@ mod spine_tests {
         spine_register(slot, RETURN_INTO_RUN_EXECUTOR, 8, fake.base());
         fake.set(slot, 0);
         let smash = spine_verify().expect("smash");
-        assert_eq!(smash.blob_lo, fake.base());
+        assert_eq!(smash.blob_lo, slot);
     }
 
     #[test]
@@ -3222,7 +3491,7 @@ mod spine_tests {
         spine_register(slot, RETURN_INTO_RUN_EXECUTOR, 8, fake.base());
         fake.set(slot, 0);
         let smash = spine_verify().expect("smash");
-        assert_eq!(smash.blob_hi, top);
+        assert_eq!(smash.blob_hi, slot + 8);
     }
 
     #[test]

@@ -8,7 +8,11 @@
     .globl switch
     .balign 4
 switch:
-        add     x0, x0, #112
+        add     x0, x0, #176
+        stp     d14, d15, [x0, #-16]!
+        stp     d12, d13, [x0, #-16]!
+        stp     d10, d11, [x0, #-16]!
+        stp     d8, d9, [x0, #-16]!
         mrs     x2, ttbr0_el1
         mov     x3, sp
         stp     x3, x2, [x0, #-16]!
@@ -40,6 +44,10 @@ switch:
         dsb     nsh
         isb
 
+        ldp     d8, d9, [x1, #112]
+        ldp     d10, d11, [x1, #128]
+        ldp     d12, d13, [x1, #144]
+        ldp     d14, d15, [x1, #160]
         ldp     x19, x20, [x1], #16
         ldp     x21, x22, [x1], #16
         ldp     x23, x24, [x1], #16

@@ -870,7 +870,7 @@ pub extern "C" fn trap_handler(tf: &mut TrapFrame) {
             // Capture rbp/rsp too so the handler can walk the faulting call
             // chain (e.g. name the caller of a wild `memset`, tf.rip resolving
             // into compiler_builtins set_bytes).
-            crate::kstats::note_fault_regs(
+            let _fault_scope = crate::kstats::note_fault_regs(
                 tf.rip as u64,
                 tf.rbp as u64,
                 tf.rsp as u64,
@@ -1028,7 +1028,7 @@ pub extern "C" fn trap_handler(tf: &mut TrapFrame) {
                     fault_sp = tf.rax;
                 }
             }
-            crate::kstats::note_fault_regs(
+            let _fault_scope = crate::kstats::note_fault_regs(
                 tf.rip as u64,
                 tf.rbp as u64,
                 fault_sp as u64,
