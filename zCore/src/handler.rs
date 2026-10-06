@@ -781,7 +781,7 @@ fn print_fault_backtrace(access_flags: MMUFlags) {
     }
     // Also raw-scan the stack for kernel code pointers as a fallback when the
     // frame chain is broken (memset is a leaf that may omit rbp).
-    kernel_hal::oops_log::report(format_args!("[kfault-bt] raw stack scan from rsp:\n",));
+    kernel_hal::oops_log::report_str("[kfault-bt] raw stack scan from rsp:\n");
     let mut sp = rsp0 & !0x7u64;
     // Wider bound for everything below: `sp` only ever advances by 8 bytes at
     // a time from `rsp0` (at most 4 KiB total across the whole scan loop), so

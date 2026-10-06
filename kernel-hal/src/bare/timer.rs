@@ -156,6 +156,29 @@ fn next_deadlines() -> [u64; crate::config::MAX_CORE_NUM] {
     core::array::from_fn(|cpu| NEXT_DEADLINE_NS[cpu].load(Ordering::Acquire))
 }
 
+/// Which CPU, if any, has `word` published as its next deadline right now.
+///
+/// A fault report that finds a nanosecond-looking word where a return address
+/// belongs has a hypothesis to test, and this is the test. `timer_tick` builds
+/// [`next_deadlines`] -- a `[u64; MAX_CORE_NUM]` of absolute nanosecond
+/// deadlines -- **on its own stack**, every tick, for the stray sweep. So a
+/// deadline-shaped word in a stack slot on the timer path may be nothing but
+/// that array's residue from an earlier frame, and chasing it as a smashed
+/// code pointer is chasing the kernel's own bookkeeping.
+///
+/// Answering it turns a guess into a measurement: a hit says the word is a
+/// live deadline this kernel published, which is residue; a miss says it is
+/// not, which leaves the writer worth hunting. Neither takes a lock -- the
+/// table is readable lock-free precisely so the tick can consult it -- so this
+/// is safe from the fault path.
+pub fn deadline_cpu_matching(word: u64) -> Option<usize> {
+    if word == 0 || word == NO_DEADLINE {
+        return None;
+    }
+    (0..crate::config::MAX_CORE_NUM)
+        .find(|&cpu| NEXT_DEADLINE_NS[cpu].load(Ordering::Acquire) == word)
+}
+
 /// Offset (in nanoseconds) added to monotonic boot time for
 /// `CLOCK_REALTIME` / `gettimeofday`. Stored as a raw `u64` so the read path
 /// (`clock_gettime` is on libc's critical path for almost every interactive
