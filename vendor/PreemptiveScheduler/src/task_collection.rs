@@ -742,7 +742,10 @@ impl TaskCollection {
             }
             let serve_yielded =
                 yielded.is_some() && (urgent.is_none() || cursor.urgent_turns >= URGENT_QUOTA);
-            ((if serve_yielded { yielded } else { urgent })?, serve_yielded)
+            (
+                (if serve_yielded { yielded } else { urgent })?,
+                serve_yielded,
+            )
         };
         let page_idx = slot / WAKER_PAGE_SIZE;
         let subpage_idx = slot % WAKER_PAGE_SIZE;
