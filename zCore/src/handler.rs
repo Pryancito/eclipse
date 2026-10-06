@@ -5,6 +5,28 @@ use zircon_object::task::Thread;
 
 use super::memory;
 
+/// Prints which CPU has this address published as a live deadline, or nothing.
+///
+/// Only the hit is worth a clause. A miss means the word is not one of the
+/// tick's published deadlines, which is already what the reader assumes of a
+/// faulting address; saying "no match" would invite them to think a match was
+/// on the table for every pointer that faults.
+struct LiveDeadline(Option<usize>);
+
+impl core::fmt::Display for LiveDeadline {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self.0 {
+            Some(cpu) => write!(
+                f,
+                ", AND the deadline CPU{} has published right now, so this is \
+                 the tick's own stray-sweep residue and not a writer",
+                cpu
+            ),
+            None => Ok(()),
+        }
+    }
+}
+
 pub struct ZcoreKernelHandler;
 
 /// One line naming any logical cpu id that GS reported and SMP bring-up never
@@ -551,8 +573,21 @@ fn report_unresolved_kernel_fault(
         fault_vaddr as u64,
         kernel_hal::deadline::duration_to_ns(kernel_hal::timer::timer_now()),
     );
+    // "An absolute deadline" on its own is half an answer, and this is the half
+    // that decides. `timer_tick` builds the per-CPU deadline table on its own
+    // stack every tick for the stray sweep, so a deadline-shaped word can be
+    // that table's residue rather than anything a writer put there. On the
+    // soft-smash path, where this probe already runs, a capture settled exactly
+    // that way: "AND is the deadline CPU0 has published right now, so this is
+    // the tick's own stray-sweep residue and not a writer". The next capture
+    // came back through *this* line instead, which named the shape and never
+    // asked the question, so the same word had to be argued about again.
+    let live_deadline = match clock {
+        kernel_hal::kaddr::ClockShape::NotAClock => None,
+        _ => kernel_hal::timer::deadline_cpu_matching(fault_vaddr as u64),
+    };
     kernel_hal::oops_log::report(format_args!(
-        "\n[KERNEL PAGE FAULT] vaddr={:#x}{}{} ({}) flags={:?} rip={} have_thread={} \
+        "\n[KERNEL PAGE FAULT] vaddr={:#x}{}{} ({}{}) flags={:?} rip={} have_thread={} \
          (unresolved by the user vmar — a kernel-side bug, not a userspace \
          SIGSEGV; the text console is skipped so a torn graphic console cannot \
          re-fault us)\n",
@@ -560,6 +595,7 @@ fn report_unresolved_kernel_fault(
         if target_shape.is_empty() { "" } else { " is " },
         target_shape,
         clock.as_str(),
+        LiveDeadline(live_deadline),
         access_flags,
         kernel_hal::ksyms::Addr(rip),
         have_thread,

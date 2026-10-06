@@ -106,3 +106,8 @@ pub unsafe fn abandon_timer_callbacks() {}
 pub fn tick_frames_abandoned() -> usize {
     0
 }
+
+/// Which CPU has `word` published as its next deadline (libos: no tick table).
+pub fn deadline_cpu_matching(_word: u64) -> Option<usize> {
+    None
+}

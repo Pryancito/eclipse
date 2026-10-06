@@ -2453,15 +2453,27 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
               # Drain /proc/oops into /var/log/oops.log.\n\
               # Contained faults leave the machine RUNNING, so this can take its\n\
               # time; it only needs to beat the next reboot.\n\
+              #\n\
+              # /proc/oops is the WHOLE record since boot, not the new part, and\n\
+              # this file is appended to across reboots. Writing the snapshot\n\
+              # each time it changed meant a boot with three faults wrote the\n\
+              # first one three times, and a reboot wrote the lot again under a\n\
+              # fresh date header. Two captures of one bug came back with a\n\
+              # [null-exec] block identical down to r14, from different boots,\n\
+              # read as one fault. So: remember how many bytes have been\n\
+              # written and append only what is past them.\n\
               OUT=/var/log/oops.log\n\
               mkdir -p /var/log 2>/dev/null\n\
-              last=\n\
+              done_bytes=0\n\
               while :; do\n\
               \x20 cur=$(cat /proc/oops 2>/dev/null)\n\
               \x20 case \"$cur\" in ''|'# no contained kernel faults since boot') : ;; *)\n\
-              \x20 \x20 if [ \"$cur\" != \"$last\" ]; then\n\
-              \x20 \x20 \x20 { echo \"=== $(date 2>/dev/null || echo 'boot+?') ===\"; echo \"$cur\"; } >> \"$OUT\"\n\
-              \x20 \x20 \x20 last=$cur\n\
+              \x20 \x20 now_bytes=$(printf '%s' \"$cur\" | wc -c)\n\
+              \x20 \x20 if [ \"$now_bytes\" -lt \"$done_bytes\" ]; then done_bytes=0; fi\n\
+              \x20 \x20 if [ \"$now_bytes\" -gt \"$done_bytes\" ]; then\n\
+              \x20 \x20 \x20 { echo \"=== $(date 2>/dev/null || echo 'boot+?') ===\"; \\\n\
+              \x20 \x20 \x20 \x20 printf '%s\\n' \"$cur\" | tail -c +$((done_bytes + 1)); } >> \"$OUT\"\n\
+              \x20 \x20 \x20 done_bytes=$now_bytes\n\
               \x20 \x20 \x20 echo 'eclipse-oopslog: a kernel fault was contained; see /var/log/oops.log' > /dev/console 2>/dev/null\n\
               \x20 \x20 fi\n\
               \x20 esac\n\
@@ -4223,6 +4235,85 @@ mod var_run_tests {
             "the service must point at the script this chmods: {unit}"
         );
         assert!(unit.contains("type = respawn"), "{unit}");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The drain must write each contained fault ONCE, however many times
+    /// `/proc/oops` is read and however many reboots the file outlives.
+    ///
+    /// `/proc/oops` hands back the whole record since boot, not the part that
+    /// is new, and `/var/log/oops.log` is appended to across reboots. Writing
+    /// the snapshot whenever it changed therefore wrote fault #1 again when
+    /// fault #2 arrived, and wrote the lot again after a reboot under a fresh
+    /// `=== date ===` header. That is not a tidiness problem: two captures of
+    /// one bug came back carrying a `[null-exec]` block identical down to
+    /// `r14=0x3b`, from different boots, and were read as one fault beside a
+    /// `[KERNEL PAGE FAULT]` that had nothing to do with it.
+    ///
+    /// This drives the shipped script's own loop body over a `/proc/oops` that
+    /// grows the way a real one does.
+    #[test]
+    fn the_drain_never_writes_the_same_fault_twice() {
+        let dir = std::env::temp_dir().join(format!("eclipse-oops-dedup-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let localbin = dir.join("usr/local/bin");
+        let svc_dir = dir.join("etc/eclipse/services");
+        fs::create_dir_all(&localbin).unwrap();
+        fs::create_dir_all(&svc_dir).unwrap();
+        LinuxRootfs::write_oopslog(&localbin, &svc_dir);
+
+        // The record as the kernel grows it: one fault, then two.
+        let first = "[isolate] fault one contained\n";
+        let second = "[isolate] fault one contained\n[isolate] fault two contained\n";
+        let proc_oops = dir.join("proc_oops");
+        let stage2 = dir.join("stage2");
+        fs::write(&proc_oops, first).unwrap();
+        fs::write(&stage2, second).unwrap();
+        let out = dir.join("oops.log");
+
+        // The shipped text, with the three things a test cannot have: the real
+        // /proc path, the real /var/log path, and a loop that never ends.
+        let src = fs::read_to_string(localbin.join("eclipse-oopslog")).unwrap();
+        let driver = src
+            .replace("OUT=/var/log/oops.log", &format!("OUT={}", out.display()))
+            .replace("mkdir -p /var/log 2>/dev/null", "ITER=0")
+            .replace(
+                "cat /proc/oops 2>/dev/null",
+                &format!("cat {}", proc_oops.display()),
+            )
+            .replace(
+                " sleep 10",
+                &format!(
+                    " ITER=$((ITER+1)); [ $ITER -ge 2 ] && break; cp {} {}",
+                    stage2.display(),
+                    proc_oops.display()
+                ),
+            );
+        assert!(
+            driver.contains("break"),
+            "the sleep was not where this expected it; the driver would loop forever"
+        );
+        let script = dir.join("driver.sh");
+        fs::write(&script, &driver).unwrap();
+
+        let st = std::process::Command::new("sh")
+            .arg(&script)
+            .status()
+            .unwrap();
+        assert!(st.success(), "the drain exited non-zero");
+
+        let log = fs::read_to_string(&out).unwrap();
+        assert_eq!(
+            log.matches("fault one contained").count(),
+            1,
+            "fault one was written again when fault two arrived:\n{log}"
+        );
+        assert_eq!(
+            log.matches("fault two contained").count(),
+            1,
+            "fault two is missing or doubled:\n{log}"
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }
