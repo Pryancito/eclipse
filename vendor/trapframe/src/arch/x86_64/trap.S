@@ -1,6 +1,32 @@
 .text
 .global __alltraps
 __alltraps:
+    # Clear the direction flag before anything else, on every interrupt and
+    # exception, from either ring. The CPU does not: delivering an event clears
+    # TF, NT, RF and (for an interrupt gate) IF, and leaves DF as the
+    # interrupted code had it. `syscall` gets DF cleared by SFMASK
+    # (`SYSCALL_RFLAGS_MASK`), but nothing did it for this path.
+    #
+    # And user code does run with DF set: musl's x86_64 `memmove` copies an
+    # overlapping buffer backwards as `std; rep movsb; cld`, and a `rep movsb`
+    # is interruptible between iterations. A timer tick or a page fault landing
+    # in that window entered the kernel with DF=1, `trap_syscall_entry` went
+    # back to Rust with it, and from then on every `memcpy`/`memset` in the
+    # kernel (`rep movs`/`rep stos` from compiler-builtins, which assume DF=0)
+    # ran BACKWARDS -- filling and copying the bytes *below* their destination
+    # -- in that handler and in every kernel task the executor ran after it,
+    # until the CPU went back to user mode or some backward `memmove` happened
+    # to execute its own `cld`. The kernel faults of the long hunt (zeroed
+    # return slots, clock values in return slots, `BTreeMap<usize,
+    # PageState>::insert` writing through a clock value) printed RFLAGS with
+    # DF set every time it was printed: 0x13446, 0x13402. IOPL=3 in those same
+    # values says where they came from: a user context, not a `syscall`, whose
+    # mask would have cleared both.
+    #
+    # The interrupted context's own DF is in the RFLAGS the CPU saved, and
+    # `iretq`/`sysretq` restore it, so a backward copy that was interrupted
+    # resumes backwards as it should.
+    cld
     push rax
 
     /*

@@ -379,6 +379,13 @@ fn dump_null_execute_stack_once(tf: &TrapFrame, sp: u64, slot0: u64) {
         tf.r15,
         tf.rflags,
     ));
+    if tf.rflags as u64 & crate::kaddr::RFLAGS_DF != 0 {
+        crate::oops_log::report(format_args!(
+            "[null-exec] rflags={:#x}: {}\n",
+            tf.rflags,
+            crate::kaddr::DF_SET_NOTE,
+        ));
+    }
     // The writer's fingerprint is the SHAPE of the zero run, not just the slot
     // that faulted: where it starts and ends, how long it is, and how it is
     // aligned. A page-aligned 0x1000 run is a zeroed frame (a device DMA / a
@@ -394,13 +401,19 @@ fn dump_null_execute_stack_once(tf: &TrapFrame, sp: u64, slot0: u64) {
         // pages are outside the kernel-half window, and this is diagnostic-only).
         readable(a).then(|| unsafe { core::ptr::read_volatile(a as *const u64) })
     };
+    // Nothing under this boundary is evidence: the CPU wrote it delivering this
+    // very fault (see `kaddr::exception_frame_top`). Walking down into it used
+    // to count the SS slot -- always zero in kernel mode -- as part of the run,
+    // and to report the saved RSP under it as the writer's "fingerprint".
+    let frame_top = crate::kaddr::exception_frame_top(sp);
     if read8(sp) == Some(0) {
-        // Walk down (toward stack_base) and up (toward stack_top) over zeros.
+        // Walk down (toward stack_base, as far as the exception frame) and up
+        // (toward stack_top) over zeros.
         let mut lo = sp;
         let mut steps = 0u64;
         while steps < 1024 {
             let prev = lo.wrapping_sub(8);
-            if read8(prev) == Some(0) {
+            if prev >= frame_top && read8(prev) == Some(0) {
                 lo = prev;
                 steps += 1;
             } else {
@@ -432,26 +445,27 @@ fn dump_null_execute_stack_once(tf: &TrapFrame, sp: u64, slot0: u64) {
         ));
         // The two words that BRACKET the run (first non-zero on each side) are
         // the survivors the writer did NOT touch — their values often identify
-        // the neighbouring live frame (a return address, an Arc, poison).
-        if let Some(below) = read8(lo.wrapping_sub(8)) {
-            let at = lo - 8;
-            // Say it when that word points at itself-plus-something, because
-            // that is a fingerprint and reading it off the hex is how it gets
-            // missed. Two captures of this fault, on different boots and
-            // different stacks, both had the word below holding **its own
-            // address + 0x10** with the run starting at +0x8 -- the same
-            // 32-byte object twice, which is not what random corruption looks
-            // like. Nobody spotted it from the raw values.
-            let selfish = below >= at && below - at <= 0x1000;
+        // the neighbouring live frame (a return address, an Arc, poison). Below
+        // the run, only when the run stopped above the exception frame: when it
+        // reaches it, the word under it is the CPU's, and where the run really
+        // started was overwritten by this fault's own delivery.
+        if lo == frame_top {
             crate::oops_log::report(format_args!(
-                "[null-exec]   below @{:#x} = {:#018x}{}\n",
-                at,
-                below,
-                SelfRelative {
-                    at,
-                    word: below,
-                    applies: selfish,
+                "[null-exec]   below: the run reaches the frame the CPU pushed for \
+                 this fault at {:#x} (SS=0, then the faulting RSP); where it \
+                 started is not recoverable{}\n",
+                frame_top,
+                if slot0 == 0 && tf.rip == 0 {
+                    ", and the slot the ret popped held 0 (that is where rip=0 came from)"
+                } else {
+                    ""
                 },
+            ));
+        } else if let Some(below) = read8(lo.wrapping_sub(8)) {
+            crate::oops_log::report(format_args!(
+                "[null-exec]   below @{:#x} = {:#018x}\n",
+                lo - 8,
+                below,
             ));
         }
         if let Some(above) = read8(hi + 8) {
@@ -461,9 +475,12 @@ fn dump_null_execute_stack_once(tf: &TrapFrame, sp: u64, slot0: u64) {
                 above
             ));
         }
-        // Auto-arm a hardware write-watch DEEP in the zero run (its low, most
-        // stack-baseward word — least likely to be rewritten by normal stack use
-        // before the writer strikes again). The machine now survives this fault
+        // Auto-arm a hardware write-watch on the run's HIGHEST word: the one
+        // furthest up the stack, in the oldest frame, which normal stack use
+        // rewrites least often. (It used to take the lowest, which was the SS
+        // slot of this fault's own exception frame: the stack's most recently
+        // written word, and rewritten by the next event delivered at this
+        // depth.) The machine now survives this fault
         // (contained; the single-core TLB wedge is fixed), the desktop respawns
         // and re-triggers the same deterministic corruption, and the write-watch
         // then traps at the writer's EXACT rip — the datum this whole hunt has
@@ -472,12 +489,12 @@ fn dump_null_execute_stack_once(tf: &TrapFrame, sp: u64, slot0: u64) {
         // self-disarms after a few hits (see watchpoint::handle_debug) so it can
         // never storm even if the chosen word turns out to be legitimately
         // written. Costs nothing until it fires.
-        if crate::watchpoint::watch_write(lo as usize, 8) {
+        if crate::watchpoint::watch_write(hi as usize, 8) {
             crate::oops_log::report(format_args!(
-                "[null-exec] ARMED write-watch on 8B at {:#x} (deep in the zero \
+                "[null-exec] ARMED write-watch on 8B at {:#x} (top of the zero \
                  run); the writer's NEXT strike traps with its rip — \
                  symbolize [watchpoint] rip with llvm-addr2line -e zcore\n",
-                lo,
+                hi,
             ));
         }
     }
@@ -522,28 +539,6 @@ fn report_dma_uaf_if_recycled(sp: u64) {
 
 /// Prints "= this address + N" when a word points just past its own slot.
 ///
-/// A pointer whose value is its own address plus a small constant names a
-/// structure: an intrusive list head linking to its first element, a field
-/// holding the address of a later field of the same object. The raw hex hides
-/// it -- `@0xffffff0021abeff0 = 0xffffff0021abf000` and
-/// `@0xffffff0001e7d680 = 0xffffff0001e7d690` are the same fact twice, and it
-/// took two captures and a calculator to notice. Doing the subtraction in the
-/// report is the whole point.
-struct SelfRelative {
-    at: u64,
-    word: u64,
-    applies: bool,
-}
-
-impl core::fmt::Display for SelfRelative {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        if !self.applies {
-            return Ok(());
-        }
-        write!(f, " = this slot + {:#x}", self.word - self.at)
-    }
-}
-
 /// Prints the result of the live-deadline probe as a clause, or nothing.
 ///
 /// A `Display` rather than an `if`/`else` pair in the call because the clause
@@ -955,6 +950,7 @@ pub extern "C" fn trap_handler(tf: &mut TrapFrame) {
                 tf.r14 as u64,
                 tf.r15 as u64,
             ]);
+            crate::kstats::note_fault_rflags(tf.rflags as u64);
             // Containment: ring-0 EXECUTE #PF at a RIP that is not kernel
             // `.text` is a `call`/`ret` through garbage (null, userspace
             // `0x1045f0000`, truncated residue). Skip when a CALL return is

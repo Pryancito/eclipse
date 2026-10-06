@@ -672,6 +672,9 @@ static ACTIVE_FAULT_RSP: [AtomicU64; MAX_CORE_NUM] = [const { AtomicU64::new(0) 
 static FAULT_GPRS: [[AtomicU64; 16]; MAX_CORE_NUM] =
     [const { [const { AtomicU64::new(0) }; 16] }; MAX_CORE_NUM];
 
+/// [diag] RFLAGS at the faulting instruction, beside `FAULT_GPRS`.
+static FAULT_RFLAGS: [AtomicU64; MAX_CORE_NUM] = [const { AtomicU64::new(0) }; MAX_CORE_NUM];
+
 /// The register names, in the order `FAULT_GPRS` stores them.
 pub const GPR_NAMES: [&str; 16] = [
     "rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rbp", "rsp", "r8", "r9", "r10", "r11", "r12", "r13",
@@ -779,6 +782,24 @@ pub fn note_fault_gprs(gprs: &[u64; 16]) {
         for (slot, value) in FAULT_GPRS[cpu].iter().zip(gprs.iter()) {
             slot.store(*value, Relaxed);
         }
+    }
+}
+
+/// [diag] Record RFLAGS at the faulting instruction. Its direction flag is
+/// what says whether the faulting context's string operations ran backwards
+/// (`kaddr::DF_SET_NOTE`).
+pub fn note_fault_rflags(rflags: u64) {
+    if let Some(cpu) = fault_slot() {
+        FAULT_RFLAGS[cpu].store(rflags, Relaxed);
+    }
+}
+
+/// [diag] RFLAGS of the last fault on this CPU; zero when nothing has faulted
+/// here (a real RFLAGS always has bit 1 set, so zero is never one).
+pub fn last_fault_rflags() -> u64 {
+    match fault_slot() {
+        Some(cpu) => FAULT_RFLAGS[cpu].load(Relaxed),
+        None => 0,
     }
 }
 
@@ -1746,6 +1767,19 @@ mod tests {
         let next: [u64; 16] = core::array::from_fn(|i| i as u64 + 1);
         note_fault_gprs(&next);
         assert_eq!(last_fault_gprs(), next);
+    }
+
+    #[test]
+    fn a_faults_rflags_reads_back_with_its_direction_flag() {
+        let _guard = SERIAL.lock();
+        // The eighth capture's RFLAGS, and the one before it.
+        for rflags in [0x13446u64, 0x13402] {
+            note_fault_rflags(rflags);
+            assert_eq!(last_fault_rflags(), rflags);
+            assert_ne!(last_fault_rflags() & crate::kaddr::RFLAGS_DF, 0);
+        }
+        note_fault_rflags(0x202);
+        assert_eq!(last_fault_rflags() & crate::kaddr::RFLAGS_DF, 0);
     }
 }
 

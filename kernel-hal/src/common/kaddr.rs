@@ -349,9 +349,30 @@ pub enum RegRole {
 /// capture is which register carried the bad value and at what offset into the
 /// object -- and that is arithmetic nobody should be doing by hand in the
 /// middle of reading a photograph of a screen.
-pub fn register_role(value: u64, fault_vaddr: u64) -> RegRole {
+///
+/// `execute` is whether the fault was an instruction fetch. Its address is then
+/// the branch target, which a register can only have supplied whole (`call
+/// rax`), never as a base; and the first report to come back was an EXECUTE at
+/// 0 that named three small counters as "candidate bases" of a null jump.
+pub fn register_role(value: u64, fault_vaddr: u64, execute: bool) -> RegRole {
+    if execute {
+        // A zero register matching a null target says nothing: zero is the
+        // value registers hold most often, and a `ret` popping a cleared slot
+        // reaches 0 without any register holding it.
+        return if value == fault_vaddr && value != 0 {
+            RegRole::IsTarget
+        } else {
+            RegRole::Unrelated
+        };
+    }
     if value == fault_vaddr {
         return RegRole::IsTarget;
+    }
+    // A base is a null pointer or an address. A non-zero value in the first
+    // 64 KiB is a count, a length or a flag word, and lines it up against a
+    // near-null fault address only by coincidence.
+    if value != 0 && value < MIN_PLAUSIBLE_CODE {
+        return RegRole::Unrelated;
     }
     // Wrapping, the way the CPU forms an effective address, then read as
     // signed: a displacement can be negative, and a kernel-half register
@@ -363,6 +384,41 @@ pub fn register_role(value: u64, fault_vaddr: u64) -> RegRole {
     }
     RegRole::Unrelated
 }
+
+/// Where the CPU's own exception frame begins for a fault taken at `sp`: every
+/// stack slot below the returned address was written by the fault's delivery,
+/// not by the code that faulted.
+///
+/// A kernel-mode `#PF` does not switch stacks (only `#DF` and `#GP` have IST
+/// stacks here), and in 64-bit mode the CPU aligns RSP down to 16 before it
+/// pushes SS, RSP, RFLAGS, CS, RIP and the error code -- then the trap entry
+/// pushes the general registers below that. So one slot under this boundary
+/// holds SS, which in kernel mode is the null selector, and the next one holds
+/// the faulting RSP itself.
+///
+/// That pair was read as the corruption's fingerprint for four captures: "the
+/// word below the zero run holds its own address + 0x10, and the run starts
+/// at +8" -- the same 32-byte object on two boots and two stacks, which is not
+/// what random corruption looks like. It is what the CPU looks like: SS=0 at
+/// +8, and at +0 the RSP the fault was taken at, sixteen bytes up.
+pub fn exception_frame_top(sp: u64) -> u64 {
+    sp & !0xf
+}
+
+/// The direction flag in RFLAGS.
+pub const RFLAGS_DF: u64 = 1 << 10;
+
+/// What a fault report says when the faulting kernel context had DF set.
+///
+/// The ABI wants DF clear at every call boundary, and this kernel's
+/// `memcpy`/`memset` are `rep movs`/`rep stos` that rely on it. With it set
+/// they run backwards: they fill and copy the bytes *below* their destination,
+/// which on a stack is the callee frames and their return slots. Every RFLAGS
+/// the long hunt printed had it set, and nobody read the bit. The one place it
+/// is legitimately set in kernel code is `memmove`'s own backward copy.
+pub const DF_SET_NOTE: &str = "DF (the direction flag) is SET: every memcpy/memset this \
+     kernel context ran went BACKWARDS, writing below its destination, unless rip is \
+     inside memmove's own backward copy, which sets it on purpose";
 
 /// What a machine word found where a kernel code pointer belongs looks like.
 ///
@@ -1340,7 +1396,7 @@ mod tests {
     #[test]
     fn the_register_that_held_the_faulting_address_is_its_target() {
         assert_eq!(
-            register_role(SEVENTH_TARGET, SEVENTH_TARGET),
+            register_role(SEVENTH_TARGET, SEVENTH_TARGET, false),
             RegRole::IsTarget
         );
     }
@@ -1349,12 +1405,12 @@ mod tests {
     fn a_register_a_field_below_the_target_is_its_base_and_names_the_offset() {
         // `mov [reg + 0x18], ...` through a clock value.
         assert_eq!(
-            register_role(SEVENTH_TARGET - 0x18, SEVENTH_TARGET),
+            register_role(SEVENTH_TARGET - 0x18, SEVENTH_TARGET, false),
             RegRole::BaseOf(0x18)
         );
         // A `push` writes eight below `rsp`, so `rsp` is a base at -8.
         let rsp = 0xffff_ff00_218b_f000u64;
-        assert_eq!(register_role(rsp, rsp - 8), RegRole::BaseOf(-8));
+        assert_eq!(register_role(rsp, rsp - 8, false), RegRole::BaseOf(-8));
     }
 
     #[test]
@@ -1363,30 +1419,123 @@ mod tests {
         // the address space the distance is enormous both ways round, and must
         // not come out as a small offset by overflowing.
         for heap in [0xffff_ff00_06be_0d00u64, 0xffff_ff00_026e_cc60] {
-            assert_eq!(register_role(heap, SEVENTH_TARGET), RegRole::Unrelated);
-            assert_eq!(register_role(SEVENTH_TARGET, heap), RegRole::Unrelated);
+            assert_eq!(
+                register_role(heap, SEVENTH_TARGET, false),
+                RegRole::Unrelated
+            );
+            assert_eq!(
+                register_role(SEVENTH_TARGET, heap, false),
+                RegRole::Unrelated
+            );
         }
         // The two halves of the signed range: no panic, no false match.
-        assert_eq!(register_role(0, 1 << 63), RegRole::Unrelated);
-        assert_eq!(register_role(1 << 63, 0), RegRole::Unrelated);
+        assert_eq!(register_role(0, 1 << 63, false), RegRole::Unrelated);
+        assert_eq!(register_role(1 << 63, 0, false), RegRole::Unrelated);
     }
 
     #[test]
     fn the_displacement_ceiling_is_one_page_either_way() {
         let page = MAX_PLAUSIBLE_DISPLACEMENT as u64;
         let t = SEVENTH_TARGET;
-        assert_eq!(register_role(t - page, t), RegRole::BaseOf(0x1000));
-        assert_eq!(register_role(t + page, t), RegRole::BaseOf(-0x1000));
-        assert_eq!(register_role(t - page - 1, t), RegRole::Unrelated);
-        assert_eq!(register_role(t + page + 1, t), RegRole::Unrelated);
+        assert_eq!(register_role(t - page, t, false), RegRole::BaseOf(0x1000));
+        assert_eq!(register_role(t + page, t, false), RegRole::BaseOf(-0x1000));
+        assert_eq!(register_role(t - page - 1, t, false), RegRole::Unrelated);
+        assert_eq!(register_role(t + page + 1, t, false), RegRole::Unrelated);
     }
 
     #[test]
     fn a_null_base_explains_a_near_null_fault() {
         // `[null + 0x10]`: a zero register is the base of a fault at 0x10,
         // which is exactly what a field read through a null pointer looks like.
-        assert_eq!(register_role(0, 0x10), RegRole::BaseOf(0x10));
+        assert_eq!(register_role(0, 0x10, false), RegRole::BaseOf(0x10));
         // And the effective address wraps like the CPU's: -8 plus 0x10 is 8.
-        assert_eq!(register_role(u64::MAX - 7, 8), RegRole::BaseOf(0x10));
+        assert_eq!(register_role(u64::MAX - 7, 8, false), RegRole::BaseOf(0x10));
+    }
+
+    #[test]
+    fn a_small_count_is_not_a_base_of_a_near_null_address() {
+        // The eighth capture: `rsi=0x103 r9=0x10 r10=0x1` against a fault at
+        // 0, all three reported as "candidate bases". They are a length, a
+        // size and a flag, and a fault 8 bytes past one does not make it a
+        // pointer the access was based on.
+        for small in [0x103u64, 0x10, 0x1] {
+            assert_eq!(register_role(small, 0, false), RegRole::Unrelated);
+            assert_eq!(register_role(small, small + 8, false), RegRole::Unrelated);
+            // Holding the faulting address itself is still worth saying: a
+            // data access through a register that holds 0x10 faults at 0x10.
+            assert_eq!(register_role(small, small, false), RegRole::IsTarget);
+        }
+        // The first address a base can hold still counts.
+        assert_eq!(
+            register_role(MIN_PLAUSIBLE_CODE, MIN_PLAUSIBLE_CODE + 8, false),
+            RegRole::BaseOf(8)
+        );
+    }
+
+    #[test]
+    fn an_instruction_fetch_has_a_target_and_never_a_base() {
+        // Same capture, same registers: an EXECUTE at 0 reached by a `ret`.
+        // None of them supplied it, and the five zero registers did not
+        // either.
+        for v in [0x103u64, 0x10, 0x1, 0] {
+            assert_eq!(register_role(v, 0, true), RegRole::Unrelated, "{:#x}", v);
+        }
+        // A register near a non-null branch target is not a base of it...
+        let target = 0xffff_ff00_061e_2e09u64;
+        assert_eq!(register_role(target - 9, target, true), RegRole::Unrelated);
+        // ...and one holding it whole is `call reg`.
+        assert_eq!(register_role(target, target, true), RegRole::IsTarget);
+    }
+
+    #[test]
+    fn the_word_below_every_captured_zero_run_was_the_cpus_own_saved_rsp() {
+        // (fault_rsp, address of the "word below", its value) from three
+        // captures on different boots and different stacks.
+        let captures = [
+            (
+                0xffff_ff00_01e7_d690u64,
+                0xffff_ff00_01e7_d680u64,
+                0xffff_ff00_01e7_d690u64,
+            ),
+            (
+                0xffff_ff00_21ab_f000,
+                0xffff_ff00_21ab_eff0,
+                0xffff_ff00_21ab_f000,
+            ),
+            (
+                0xffff_ff00_01e7_d5f0,
+                0xffff_ff00_01e7_d5e0,
+                0xffff_ff00_01e7_d5f0,
+            ),
+        ];
+        for (sp, at, word) in captures {
+            let top = exception_frame_top(sp);
+            // The CPU pushed SS one slot under the boundary, and the faulting
+            // RSP the slot under that: exactly where the "fingerprint" sat,
+            // holding exactly the fault's own RSP.
+            assert_eq!(at, top - 16, "sp {:#x}", sp);
+            assert_eq!(word, sp, "sp {:#x}", sp);
+        }
+    }
+
+    #[test]
+    fn the_exception_frame_starts_at_the_sixteen_byte_boundary_under_rsp() {
+        assert_eq!(exception_frame_top(0x1000), 0x1000);
+        // An RSP eight past a boundary leaves one slot the CPU skips: it is
+        // still the faulting code's, and the boundary is under it.
+        assert_eq!(exception_frame_top(0x1008), 0x1000);
+    }
+
+    #[test]
+    fn the_captured_rflags_all_had_the_direction_flag_set() {
+        // The eighth capture and the fourth/sixth: kernel code, DF up, and
+        // IOPL 3 -- a user context's flags, which `syscall` would have masked.
+        for rflags in [0x13446u64, 0x13402] {
+            assert_ne!(rflags & RFLAGS_DF, 0, "{:#x}", rflags);
+            assert_eq!(rflags & 0x3000, 0x3000, "{:#x}", rflags);
+        }
+        // What user mode is entered with here (`0x3000 | 0x200 | 0x2`) has it
+        // clear: DF=1 is something a user program did, not the kernel.
+        assert_eq!(0x3202 & RFLAGS_DF, 0);
     }
 }
