@@ -69,3 +69,8 @@ zcore-drivers = { path = "../drivers", features = ["mock"] }
 name = "vfs"
 harness = true
 required-features = ["mock-disk"]
+
+[[bench]]
+name = "signal"
+harness = true
+required-features = ["mock-disk"]
