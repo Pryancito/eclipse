@@ -1,5 +1,5 @@
-// eclipse-bench — CPU / memory / syscall / VM / scheduler / disk / process
-// benchmark for Eclipse OS.
+// eclipse-bench — CPU / memory / syscall / VM / scheduler / sockets /
+// filesystem / disk / process benchmark for Eclipse OS.
 //
 // It is deliberately dependency-free (POSIX + libc only) and statically linked,
 // so it can be dropped straight into the rootfs and run from the shell. Every
@@ -20,8 +20,8 @@
 // MEM_MB  size of the memory working set in MiB (default 32).
 //
 // Options (before the positional arguments):
-//     --only SECTION   run one section: cpu, mem, syscall, vm, sched, psched, smp,
-//                      disk, proc, gfx
+//     --only SECTION   run one section: cpu, mem, syscall, vm, sched, psched,
+//                      net, fs, smp, disk, proc, gfx
 //     --drm PATH       DRM device for the gfx section (default /dev/dri/card0)
 //     --quick          shorter time budgets (rough numbers, ~3x faster)
 //     --budget MS      per-measurement wall-clock budget (default 200 ms for the
@@ -84,6 +84,12 @@
 #include <sys/auxv.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
+#include <sys/un.h>
+#include <sys/select.h>
+#include <sys/epoll.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <poll.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
@@ -3209,6 +3215,1104 @@ static int gfx_vblank_stats(int n, double *mean_ms, double *jitter_ms,
 }
 
 // ---------------------------------------------------------------------------
+// Per-process syscall accounting  [kernel]
+// ---------------------------------------------------------------------------
+//
+// `/proc/<pid>/perf` is Eclipse's per-process syscall table: one row per
+// syscall the process has issued, with the call count and the time the kernel
+// spent inside it. For the sections below that is a better pairing than the
+// system-wide counters the `psched` section uses, for two reasons:
+//
+//   * it is OUR process, so an idle shell or a daemon waking up cannot move
+//     the numbers. The system-wide table cannot promise that.
+//   * it splits a measured round trip into "how many syscalls did libc really
+//     issue" and "how much of my wall clock was inside the kernel". Those are
+//     different bugs: the first is a wrapper doing more work than the row
+//     claims to measure (a retry loop, a short read), the second is the kernel
+//     path itself being slow. A single ns/op figure cannot tell them apart,
+//     and this file's own history says that is exactly where a benchmark
+//     starts lying.
+//
+// Linux has no such file, so every derived row reads `n/a` there — the same
+// convention the kernel-counter rows already follow.
+
+#define PSTAT_BUF 65536
+static char g_pstat_a[PSTAT_BUF], g_pstat_b[PSTAT_BUF];
+static int g_pstat_ok = -1;
+
+static int pstat_snapshot(char *buf, size_t n) {
+    int fd = open("/proc/self/perf", O_RDONLY);
+    if (fd < 0) {
+        buf[0] = 0;
+        return 0;
+    }
+    size_t got = 0;
+    for (;;) {
+        ssize_t r = read(fd, buf + got, n - 1 - got);
+        if (r <= 0)
+            break;
+        got += (size_t)r;
+        if (got >= n - 1)
+            break;
+    }
+    close(fd);
+    buf[got] = 0;
+    return got > 0;
+}
+
+// The `idx`-th number on the row for syscall `name` (0 = calls, 1 = total ms,
+// 2 = mean us), or NA when the process has never issued it.
+//
+// The name must be followed by a separator. Without that check `dup` would
+// match the `dup3` row and report a number for a syscall that was never
+// called — the whole class of bug the label-matched kernel-counter reader
+// above was written to avoid.
+static double pstat_field(const char *buf, const char *name, int idx) {
+    size_t nlen = strlen(name);
+    const char *p = buf;
+    while (*p) {
+        const char *bol = p;
+        while (*p == ' ' || *p == '\t')
+            p++;
+        if (strncmp(p, name, nlen) == 0 &&
+            (p[nlen] == ' ' || p[nlen] == '\t')) {
+            const char *q = p + nlen;
+            int seen = 0;
+            while (*q && *q != '\n') {
+                if (*q >= '0' && *q <= '9') {
+                    double v = strtod(q, (char **)&q);
+                    if (seen == idx)
+                        return v;
+                    seen++;
+                    continue;
+                }
+                q++;
+            }
+            return NA;
+        }
+        p = bol;
+        while (*p && *p != '\n')
+            p++;
+        if (*p == '\n')
+            p++;
+    }
+    return NA;
+}
+
+// What one snapshot costs in the syscalls it reports on.
+//
+// Reading the table is itself `openat` + `read` + `close`, and those land in
+// the very rows a `read` or `open` probe wants to read back — so a delta taken
+// around 24 opens would charge two of them to the measurement and report 1.08
+// opens per open. Measured once, from two back-to-back snapshots with no work
+// between them, and subtracted. Measured rather than assumed: it depends on
+// how many `read` calls it takes to reach EOF, which depends on how long the
+// table has grown.
+static double g_pstat_ovh_open, g_pstat_ovh_read, g_pstat_ovh_close;
+
+static void pstat_calibrate(void) {
+    g_pstat_ovh_open = g_pstat_ovh_read = g_pstat_ovh_close = 0;
+    if (!pstat_snapshot(g_pstat_a, sizeof g_pstat_a))
+        return;
+    if (!pstat_snapshot(g_pstat_b, sizeof g_pstat_b))
+        return;
+    double o = pstat_field(g_pstat_b, "openat", 0) -
+               pstat_field(g_pstat_a, "openat", 0);
+    double r = pstat_field(g_pstat_b, "read", 0) -
+               pstat_field(g_pstat_a, "read", 0);
+    double c = pstat_field(g_pstat_b, "close", 0) -
+               pstat_field(g_pstat_a, "close", 0);
+    if (o > 0) g_pstat_ovh_open = o;
+    if (r > 0) g_pstat_ovh_read = r;
+    if (c > 0) g_pstat_ovh_close = c;
+}
+
+static double pstat_overhead(const char *name) {
+    if (strcmp(name, "openat") == 0) return g_pstat_ovh_open;
+    if (strcmp(name, "read") == 0) return g_pstat_ovh_read;
+    if (strcmp(name, "close") == 0) return g_pstat_ovh_close;
+    return 0;
+}
+
+// Calls of `name` between the two snapshots, with the reader's own calls taken
+// back out. Never returns a negative count: a measurement smaller than the
+// calibration is reported as zero, not as a negative rate.
+static double pstat_calls(const char *name) {
+    double a = pstat_field(g_pstat_a, name, 0);
+    double b = pstat_field(g_pstat_b, name, 0);
+    // A syscall issued for the first time *inside* the window has no row in
+    // the first snapshot; that is a zero, not a missing measurement.
+    if (a < 0 && b >= 0) a = 0;
+    if (a < 0 || b < 0 || b < a)
+        return NA;
+    double d = b - a - pstat_overhead(name);
+    return d > 0 ? d : 0;
+}
+
+// Nanoseconds the kernel spent inside `name` between the snapshots. The file
+// reports milliseconds; the overhead correction is deliberately NOT applied
+// here (the reader's own time is a few microseconds against measurements of
+// hundreds of milliseconds, and subtracting an unmeasured constant from a
+// time is how a benchmark invents precision it does not have).
+static double pstat_kernel_ns(const char *name) {
+    double a = pstat_field(g_pstat_a, name, 1);
+    double b = pstat_field(g_pstat_b, name, 1);
+    if (a < 0 && b >= 0) a = 0;
+    if (a < 0 || b < 0 || b < a)
+        return NA;
+    return (b - a) * 1e6;
+}
+
+// Pair the row just printed with the kernel's own account of the syscall that
+// was supposed to dominate it: how many of them userspace really issued per
+// operation, and what share of the measured time was spent inside them.
+//
+// A calls/op that is not the expected integer means the row is not measuring
+// what its label says. A low in-kernel share with a high ns/op means the cost
+// is in entry/exit or in being rescheduled, not in the subsystem — and that
+// distinction is the whole reason this pairing exists.
+static void pstat_pair(const char *name, const char *label, double ops,
+                       double measured_ns) {
+    if (g_pstat_ok <= 0)
+        return;
+    double calls = pstat_calls(name);
+    double kns = pstat_kernel_ns(name);
+    char lbl[64];
+    snprintf(lbl, sizeof lbl, "  %s calls/op", label);
+    row("[kernel]", lbl, (ops > 0 && calls >= 0) ? calls / ops : NA, "x", "");
+    if (measured_ns > 0 && kns >= 0 && ops > 0) {
+        snprintf(lbl, sizeof lbl, "  %s in-kernel", label);
+        row("[kernel]", lbl, kns / ops / measured_ns * 100.0, "%",
+            "rest is entry/exit + resched");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Sockets / IPC  [kernel]
+// ---------------------------------------------------------------------------
+//
+// The SCHEDULER section has one socket row: a round trip over an AF_UNIX
+// socketpair. That measures the wake-up, not the socket — a socketpair is the
+// shortest possible path through the stack, with no address, no listener, no
+// protocol. Everything a real program uses on top of that is unmeasured: the
+// loopback TCP path, a bound UNIX socket reached by name, datagrams, the
+// accept path a server pays per connection, `sendmsg` with control data (the
+// fd passing a browser's zygote lives on), and the readiness syscalls every
+// event loop sits in.
+//
+// Each row is paired with the kernel's own account of the syscall that should
+// dominate it, so a slow row says WHICH mechanism was slow.
+
+// A peer thread that echoes single bytes back, used by every round-trip row.
+// Stopped by closing the measuring end: the echo loop then sees EOF (stream)
+// or an error (datagram) and returns, which is how the pipe rows already do
+// it. `done` lets the probe use `join_or_abandon` instead of an unbounded
+// join, because a lost wake-up on the peer's side must cost this row its
+// number and nothing else.
+struct echo_ctl {
+    int fd;
+    volatile int done;
+    int refs;
+};
+
+static void *sock_echo_thread(void *arg) {
+    struct echo_ctl *c = arg;
+    char b;
+    for (;;) {
+        ssize_t r = recv(c->fd, &b, 1, 0);
+        if (r != 1)
+            break;
+        if (send(c->fd, &b, 1, 0) != 1)
+            break;
+    }
+    __atomic_store_n(&c->done, 1, __ATOMIC_RELEASE);
+    CTL_DROP(c);
+    return NULL;
+}
+
+// Drain everything the peer sends and count it, for the bandwidth rows.
+struct drain_ctl {
+    int fd;
+    size_t buflen;
+    volatile int done;
+    int refs;
+};
+
+static void *sock_drain_thread(void *arg) {
+    struct drain_ctl *c = arg;
+    unsigned char *buf = malloc(c->buflen);
+    if (buf) {
+        for (;;) {
+            ssize_t r = recv(c->fd, buf, c->buflen, 0);
+            if (r <= 0)
+                break;
+        }
+        free(buf);
+    }
+    __atomic_store_n(&c->done, 1, __ATOMIC_RELEASE);
+    CTL_DROP(c);
+    return NULL;
+}
+
+// Bound the measured side's receive so a lost wake-up cannot park the suite
+// on one row. Best-effort: a kernel that does not implement SO_RCVTIMEO for
+// this socket family simply leaves the row exposed to the blocking recv, so
+// the budget-bounded loops are still the outer guard.
+static void sock_set_timeout(int fd, int secs) {
+    struct timeval tv = {secs, 0};
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+}
+
+// One byte each way over an already-connected socket, mirroring
+// `pingpong_drive` so the figures are directly comparable with the pipe rows.
+static double sock_rt_drive(int fd, uint64_t budget_ns) {
+    char c = 'x';
+    // One untimed exchange, so the peer is parked in recv before the clock
+    // starts and the first iteration does not measure thread startup.
+    if (send(fd, &c, 1, 0) != 1 || recv(fd, &c, 1, 0) != 1)
+        return NA;
+    uint64_t t0 = now_ns(), elapsed = 0, ops = 0;
+    int batch = 1;
+    while ((elapsed < budget_ns || ops < MIN_SAMPLES) && elapsed < g_max_ns) {
+        for (int k = 0; k < batch; k++) {
+            if (send(fd, &c, 1, 0) != 1)
+                return NA;
+            if (recv(fd, &c, 1, 0) != 1)
+                return NA;
+            ops++;
+        }
+        elapsed = now_ns() - t0;
+        if (batch < 32 && ops > 0 && elapsed / ops < 100000)
+            batch = 32;
+    }
+    g_last_ops = ops;
+    return ops ? (double)elapsed / (double)ops : NA;
+}
+
+// Connect a stream socket to a listener without needing a second thread.
+//
+// A blocking `connect` on a loopback listener is only safe if the stack
+// completes the handshake without an `accept` — true of Linux, not something
+// to assume of a stack that may hand the connection straight to the acceptor.
+// Connecting non-blocking and then polling for writability works on either,
+// and turns "the handshake never completed" into a bounded `n/a` rather than
+// a hang. The poll on the LISTENER before accepting does the same for the
+// other half.
+static int net_stream_connect(int ls, int domain, const struct sockaddr *sa,
+                             socklen_t salen, int *cfd, int *sfd) {
+    int c = socket(domain, SOCK_STREAM, 0);
+    if (c < 0)
+        return -1;
+    int fl = fcntl(c, F_GETFL, 0);
+    int nonblock = (fl >= 0 && fcntl(c, F_SETFL, fl | O_NONBLOCK) == 0);
+    int rc = connect(c, sa, salen);
+    if (rc != 0 && !(nonblock && (errno == EINPROGRESS || errno == EAGAIN))) {
+        close(c);
+        return -1;
+    }
+    struct pollfd lp = {ls, POLLIN, 0};
+    if (poll(&lp, 1, 5000) != 1) {
+        close(c);
+        return -1;
+    }
+    int s = accept(ls, NULL, NULL);
+    if (s < 0) {
+        close(c);
+        return -1;
+    }
+    if (rc != 0) {
+        struct pollfd cp = {c, POLLOUT, 0};
+        int err = 0;
+        socklen_t elen = sizeof err;
+        if (poll(&cp, 1, 5000) != 1 ||
+            getsockopt(c, SOL_SOCKET, SO_ERROR, &err, &elen) != 0 || err != 0) {
+            close(c);
+            close(s);
+            return -1;
+        }
+    }
+    if (nonblock && fl >= 0)
+        fcntl(c, F_SETFL, fl);
+    *cfd = c;
+    *sfd = s;
+    return 0;
+}
+
+// A connected loopback TCP pair, on a kernel-chosen port so two runs (or a
+// run against a machine that already has a server up) cannot collide.
+static int net_tcp_pair(int *cfd, int *sfd) {
+    int ls = socket(AF_INET, SOCK_STREAM, 0);
+    if (ls < 0)
+        return -1;
+    int one = 1;
+    setsockopt(ls, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+    struct sockaddr_in sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sin_family = AF_INET;
+    sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    sa.sin_port = 0;
+    socklen_t salen = sizeof sa;
+    if (bind(ls, (struct sockaddr *)&sa, salen) != 0 || listen(ls, 8) != 0 ||
+        getsockname(ls, (struct sockaddr *)&sa, &salen) != 0) {
+        close(ls);
+        return -1;
+    }
+    int rc = net_stream_connect(ls, AF_INET, (struct sockaddr *)&sa,
+                                sizeof sa, cfd, sfd);
+    close(ls);
+    return rc;
+}
+
+// Where the AF_UNIX rows put their sockets. Under the benchmark directory, not
+// /tmp: the caller already chose a filesystem it wants measured, and a hidden
+// hop onto a tmpfs is exactly the mistake the DIR argument warns about.
+static char g_net_dir[512];
+
+static int net_unix_addr(struct sockaddr_un *sa, const char *tag) {
+    memset(sa, 0, sizeof *sa);
+    sa->sun_family = AF_UNIX;
+    int n = snprintf(sa->sun_path, sizeof sa->sun_path, "%s/bench-%s.sock",
+                     g_net_dir, tag);
+    if (n < 0 || (size_t)n >= sizeof sa->sun_path)
+        return -1;
+    unlink(sa->sun_path);
+    return 0;
+}
+
+static int net_unix_pair(int *cfd, int *sfd, char *path, size_t pathn) {
+    struct sockaddr_un sa;
+    if (net_unix_addr(&sa, "stream") != 0)
+        return -1;
+    int ls = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (ls < 0)
+        return -1;
+    if (bind(ls, (struct sockaddr *)&sa, sizeof sa) != 0 ||
+        listen(ls, 8) != 0) {
+        close(ls);
+        return -1;
+    }
+    int rc = net_stream_connect(ls, AF_UNIX, (struct sockaddr *)&sa,
+                                sizeof sa, cfd, sfd);
+    close(ls);
+    snprintf(path, pathn, "%s", sa.sun_path);
+    if (rc != 0)
+        unlink(sa.sun_path);
+    return rc;
+}
+
+// Two datagram sockets connected to each other, so the round-trip driver can
+// use plain send/recv on both ends and the row stays comparable with the
+// stream ones.
+static int net_dgram_pair(int domain, int *a, int *b, char *pa, char *pb,
+                          size_t pn) {
+    int x = socket(domain, SOCK_DGRAM, 0), y = socket(domain, SOCK_DGRAM, 0);
+    if (x < 0 || y < 0) {
+        if (x >= 0) close(x);
+        if (y >= 0) close(y);
+        return -1;
+    }
+    if (pa) pa[0] = 0;
+    if (pb) pb[0] = 0;
+    if (domain == AF_UNIX) {
+        struct sockaddr_un sx, sy;
+        if (net_unix_addr(&sx, "dgram-a") != 0 ||
+            net_unix_addr(&sy, "dgram-b") != 0)
+            goto fail;
+        if (bind(x, (struct sockaddr *)&sx, sizeof sx) != 0 ||
+            bind(y, (struct sockaddr *)&sy, sizeof sy) != 0)
+            goto fail;
+        if (pa) snprintf(pa, pn, "%s", sx.sun_path);
+        if (pb) snprintf(pb, pn, "%s", sy.sun_path);
+        if (connect(x, (struct sockaddr *)&sy, sizeof sy) != 0 ||
+            connect(y, (struct sockaddr *)&sx, sizeof sx) != 0)
+            goto fail;
+    } else {
+        struct sockaddr_in sx, sy;
+        socklen_t lx = sizeof sx, ly = sizeof sy;
+        memset(&sx, 0, sizeof sx);
+        memset(&sy, 0, sizeof sy);
+        sx.sin_family = sy.sin_family = AF_INET;
+        sx.sin_addr.s_addr = sy.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        if (bind(x, (struct sockaddr *)&sx, sizeof sx) != 0 ||
+            bind(y, (struct sockaddr *)&sy, sizeof sy) != 0 ||
+            getsockname(x, (struct sockaddr *)&sx, &lx) != 0 ||
+            getsockname(y, (struct sockaddr *)&sy, &ly) != 0)
+            goto fail;
+        if (connect(x, (struct sockaddr *)&sy, sizeof sy) != 0 ||
+            connect(y, (struct sockaddr *)&sx, sizeof sx) != 0)
+            goto fail;
+    }
+    *a = x;
+    *b = y;
+    return 0;
+fail:
+    close(x);
+    close(y);
+    if (pa && pa[0]) unlink(pa);
+    if (pb && pb[0]) unlink(pb);
+    return -1;
+}
+
+// Round trip over a connected pair, with the far end echoed by a thread.
+// `ops_out` carries the achieved count so a caller can pair the row with the
+// kernel's own per-syscall account of it.
+static double net_pair_rt(int mine, int theirs, uint64_t budget_ns,
+                          double *ops_out) {
+    struct echo_ctl *c = calloc(1, sizeof *c);
+    if (!c) {
+        close(mine);
+        close(theirs);
+        return NA;
+    }
+    c->fd = theirs;
+    c->refs = 1;
+    sock_set_timeout(mine, 5);
+    pthread_t th;
+    CTL_LEND(c);
+    if (pthread_create(&th, NULL, sock_echo_thread, c) != 0) {
+        CTL_DROP(c);
+        CTL_DROP(c);
+        // This probe owns both ends from here on, so a failure closes them:
+        // the suite runs a dozen socket probes and a leaked pair per failure
+        // would eventually meet the descriptor limit in a later row, which
+        // would then report a number for the wrong reason.
+        close(mine);
+        close(theirs);
+        return NA;
+    }
+    double ns = sock_rt_drive(mine, budget_ns);
+    if (ops_out)
+        *ops_out = ns < 0 ? 0 : (double)g_last_ops;
+    // Closing our end ends the echo loop. The peer's fd is closed by whoever
+    // outlives the other: if the thread is abandoned it owns `theirs`, so the
+    // caller must not touch it — see the return value.
+    shutdown(mine, SHUT_RDWR);
+    close(mine);
+    int joined = join_or_abandon(th, &c->done, 5);
+    if (joined)
+        close(theirs);
+    CTL_DROP(c);
+    return ns;
+}
+
+// socket() + close() with nothing attached: the floor every socket row sits
+// on, the same role `getpid()` plays for the syscall section.
+static int g_sock_floor_domain, g_sock_floor_type;
+
+static int net_socket_floor_op(void) {
+    int fd = socket(g_sock_floor_domain, g_sock_floor_type, 0);
+    if (fd < 0)
+        return 1;
+    close(fd);
+    return 0;
+}
+
+static double net_socket_floor_ns(int domain, int type, uint64_t budget_ns) {
+    g_sock_floor_domain = domain;
+    g_sock_floor_type = type;
+    return timed_ns_per_op(net_socket_floor_op, budget_ns);
+}
+
+// What a server pays per connection: connect, accept, and tear both ends down
+// again, against a listener that stays up for the whole measurement. Kept
+// apart from the round-trip rows because a server that answers fast and
+// accepts slowly is a real and common shape, and one row cannot show both.
+static double net_accept_cycle_ns(uint64_t budget_ns) {
+    int ls = socket(AF_INET, SOCK_STREAM, 0);
+    if (ls < 0)
+        return NA;
+    int one = 1;
+    setsockopt(ls, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+    struct sockaddr_in sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sin_family = AF_INET;
+    sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    socklen_t salen = sizeof sa;
+    if (bind(ls, (struct sockaddr *)&sa, salen) != 0 || listen(ls, 16) != 0 ||
+        getsockname(ls, (struct sockaddr *)&sa, &salen) != 0) {
+        close(ls);
+        return NA;
+    }
+    uint64_t t0 = now_ns(), elapsed = 0, ops = 0;
+    while ((elapsed < budget_ns || ops < MIN_SAMPLES) && elapsed < g_max_ns) {
+        int c, s;
+        if (net_stream_connect(ls, AF_INET, (struct sockaddr *)&sa, sizeof sa,
+                               &c, &s) != 0) {
+            close(ls);
+            return ops >= MIN_SAMPLES ? (double)elapsed / (double)ops : NA;
+        }
+        close(c);
+        close(s);
+        ops++;
+        elapsed = now_ns() - t0;
+    }
+    close(ls);
+    g_last_ops = ops;
+    return ops ? (double)elapsed / (double)ops : NA;
+}
+
+// Streaming throughput over a connected pair, with a thread draining the far
+// end. A round trip measures latency; this measures how much the copy path
+// and the buffer handover cost when nobody is waiting for an answer.
+static double net_pair_bw_mbs(int mine, int theirs, size_t chunk,
+                              uint64_t budget_ns) {
+    struct drain_ctl *c = calloc(1, sizeof *c);
+    unsigned char *buf = malloc(chunk);
+    if (!c || !buf) {
+        free(c);
+        free(buf);
+        close(mine);
+        close(theirs);
+        return NA;
+    }
+    memset(buf, 0x5a, chunk);
+    c->fd = theirs;
+    c->buflen = chunk;
+    c->refs = 1;
+    pthread_t th;
+    CTL_LEND(c);
+    if (pthread_create(&th, NULL, sock_drain_thread, c) != 0) {
+        CTL_DROP(c);
+        CTL_DROP(c);
+        free(buf);
+        close(mine);
+        close(theirs);
+        return NA;
+    }
+    uint64_t t0 = now_ns(), elapsed = 0, bytes = 0, ops = 0;
+    while ((elapsed < budget_ns || ops < MIN_SAMPLES) && elapsed < g_max_ns) {
+        ssize_t w = send(mine, buf, chunk, 0);
+        if (w <= 0)
+            break;
+        bytes += (uint64_t)w;
+        ops++;
+        elapsed = now_ns() - t0;
+    }
+    elapsed = now_ns() - t0;
+    shutdown(mine, SHUT_RDWR);
+    close(mine);
+    int joined = join_or_abandon(th, &c->done, 5);
+    if (joined)
+        close(theirs);
+    CTL_DROP(c);
+    free(buf);
+    if (!bytes || !elapsed)
+        return NA;
+    return (double)bytes / ((double)elapsed / 1e9) / 1e6;
+}
+
+// `sendmsg`/`recvmsg` carrying the same single byte as the plain row. The
+// difference between the two is what the iovec and control-message plumbing
+// costs — and every library that passes an fd, or that wants the sender's
+// address back, is on this path rather than the plain one.
+static int g_msg_fd;
+
+static int net_sendmsg_rt_op(void) {
+    char b = 'x';
+    struct iovec iov = {&b, 1};
+    struct msghdr mh;
+    memset(&mh, 0, sizeof mh);
+    mh.msg_iov = &iov;
+    mh.msg_iovlen = 1;
+    if (sendmsg(g_msg_fd, &mh, 0) != 1)
+        return 1;
+    memset(&mh, 0, sizeof mh);
+    mh.msg_iov = &iov;
+    mh.msg_iovlen = 1;
+    if (recvmsg(g_msg_fd, &mh, 0) != 1)
+        return 1;
+    return 0;
+}
+
+// Passing an fd over a UNIX socket, which is how a browser's zygote and every
+// seccomp-sandboxed helper hand each other work. Measured as a full round
+// trip — send the fd, get a byte back — because the interesting cost is the
+// kernel installing a descriptor in the receiver, not the write.
+static int g_scm_tx, g_scm_rx, g_scm_payload;
+
+static int net_scm_rights_op(void) {
+    char b = 'x';
+    struct iovec iov = {&b, 1};
+    union {
+        struct cmsghdr align;
+        char buf[CMSG_SPACE(sizeof(int))];
+    } cm;
+    struct msghdr mh;
+    memset(&mh, 0, sizeof mh);
+    memset(&cm, 0, sizeof cm);
+    mh.msg_iov = &iov;
+    mh.msg_iovlen = 1;
+    mh.msg_control = cm.buf;
+    mh.msg_controllen = sizeof cm.buf;
+    struct cmsghdr *h = CMSG_FIRSTHDR(&mh);
+    h->cmsg_level = SOL_SOCKET;
+    h->cmsg_type = SCM_RIGHTS;
+    h->cmsg_len = CMSG_LEN(sizeof(int));
+    memcpy(CMSG_DATA(h), &g_scm_payload, sizeof(int));
+    if (sendmsg(g_scm_tx, &mh, 0) != 1)
+        return 1;
+    // Receive it back out, and close the descriptor the kernel installed —
+    // otherwise this probe leaks one fd per iteration and dies on EMFILE
+    // partway through, reporting a number from however many it managed.
+    char rb;
+    struct iovec riov = {&rb, 1};
+    memset(&mh, 0, sizeof mh);
+    memset(&cm, 0, sizeof cm);
+    mh.msg_iov = &riov;
+    mh.msg_iovlen = 1;
+    mh.msg_control = cm.buf;
+    mh.msg_controllen = sizeof cm.buf;
+    if (recvmsg(g_scm_rx, &mh, 0) != 1)
+        return 1;
+    int got = -1;
+    for (struct cmsghdr *r = CMSG_FIRSTHDR(&mh); r; r = CMSG_NXTHDR(&mh, r)) {
+        if (r->cmsg_level == SOL_SOCKET && r->cmsg_type == SCM_RIGHTS &&
+            r->cmsg_len == CMSG_LEN(sizeof(int)))
+            memcpy(&got, CMSG_DATA(r), sizeof(int));
+    }
+    if (got < 0)
+        return 1; // the fd did not arrive: unsupported, not slow
+    close(got);
+    return 0;
+}
+
+// The non-blocking empty-socket read. Every event loop issues one of these per
+// readiness notification that turns out to be spurious, and it is pure kernel
+// entry plus a queue check, so it isolates the socket layer's own overhead
+// from the wake-up the round-trip rows are dominated by.
+static int g_eagain_fd;
+
+static int net_eagain_op(void) {
+    char b;
+    ssize_t r = recv(g_eagain_fd, &b, 1, MSG_DONTWAIT);
+    if (r >= 0)
+        return 1; // somebody wrote to it: the probe is not measuring EAGAIN
+    return (errno == EAGAIN || errno == EWOULDBLOCK) ? 0 : 1;
+}
+
+// ---- readiness syscalls ---------------------------------------------------
+//
+// An event loop's floor. One fd is ready and it is the LAST one in the array,
+// which is the worst case for an implementation that walks the set and the
+// best case for one that keeps a ready list — so the per-fd slope between the
+// 1-fd and N-fd rows is the answer, not either row alone.
+
+#define RDY_MAX 64
+static struct pollfd g_rdy_pfd[RDY_MAX];
+static int g_rdy_n;
+static int g_rdy_epfd = -1;
+
+static int net_poll_op(void) {
+    for (int i = 0; i < g_rdy_n; i++)
+        g_rdy_pfd[i].revents = 0;
+    int r = poll(g_rdy_pfd, (unsigned)g_rdy_n, 0);
+    return r == 1 ? 0 : 1;
+}
+
+static int net_select_op(void) {
+    fd_set rs;
+    FD_ZERO(&rs);
+    int max = -1;
+    for (int i = 0; i < g_rdy_n; i++) {
+        if (g_rdy_pfd[i].fd >= FD_SETSIZE)
+            return 1;
+        FD_SET(g_rdy_pfd[i].fd, &rs);
+        if (g_rdy_pfd[i].fd > max)
+            max = g_rdy_pfd[i].fd;
+    }
+    struct timeval tv = {0, 0};
+    int r = select(max + 1, &rs, NULL, NULL, &tv);
+    return r == 1 ? 0 : 1;
+}
+
+static int net_epoll_wait_op(void) {
+    struct epoll_event ev[4];
+    int r = epoll_wait(g_rdy_epfd, ev, 4, 0);
+    return r == 1 ? 0 : 1;
+}
+
+static int net_epoll_ctl_op(void) {
+    struct epoll_event ev;
+    memset(&ev, 0, sizeof ev);
+    ev.events = EPOLLIN;
+    ev.data.fd = g_rdy_pfd[0].fd;
+    if (epoll_ctl(g_rdy_epfd, EPOLL_CTL_ADD, g_rdy_pfd[0].fd, &ev) != 0)
+        return 1;
+    if (epoll_ctl(g_rdy_epfd, EPOLL_CTL_DEL, g_rdy_pfd[0].fd, NULL) != 0)
+        return 1;
+    return 0;
+}
+
+// Build `n` pipes, leave a byte sitting in the LAST one, and fill the poll
+// array with the read ends. Returns how many were made.
+static int net_rdy_setup(int n, int rfd[], int wfd[]) {
+    if (n > RDY_MAX)
+        n = RDY_MAX;
+    int made = 0;
+    for (int i = 0; i < n; i++) {
+        int p[2];
+        if (pipe(p) != 0)
+            break;
+        rfd[i] = p[0];
+        wfd[i] = p[1];
+        made++;
+    }
+    if (made == 0)
+        return 0;
+    char b = 'r';
+    if (write(wfd[made - 1], &b, 1) != 1) {
+        for (int i = 0; i < made; i++) { close(rfd[i]); close(wfd[i]); }
+        return 0;
+    }
+    g_rdy_n = made;
+    for (int i = 0; i < made; i++) {
+        g_rdy_pfd[i].fd = rfd[i];
+        g_rdy_pfd[i].events = POLLIN;
+        g_rdy_pfd[i].revents = 0;
+    }
+    return made;
+}
+
+static void net_rdy_teardown(int made, int rfd[], int wfd[]) {
+    for (int i = 0; i < made; i++) {
+        close(rfd[i]);
+        close(wfd[i]);
+    }
+    g_rdy_n = 0;
+}
+
+// ---------------------------------------------------------------------------
+// Filesystem / VFS  [kernel]
+// ---------------------------------------------------------------------------
+//
+// Deliberately NOT the DISK section. That one streams megabytes and measures
+// the block device; this one touches almost no data and measures the layer
+// above it: resolving a path, opening a descriptor, answering `stat`, reading
+// a directory, serving a warm page out of the cache, and answering the procfs
+// files every tool on the system reads. Those are the operations a shell, a
+// build and a process lister spend their time in, and a kernel can be fast at
+// streaming and slow at every one of them.
+//
+// Every row here runs against files that were just written, so the data is in
+// cache and the device is out of the picture. Where the distinction matters
+// the row says so.
+
+// Sized above the caller's DIR plus the longest name appended to it, so the
+// compiler can see that none of these can be truncated: a silently shortened
+// path would make a probe measure a file that is not the one it built.
+static char g_fs_dir[512];      // our own subdirectory, removed at the end
+static char g_fs_deep[576];     // a file eight components down
+static char g_fs_shallow[576];  // the same file, one component down
+static char g_fs_link[576];     // a symlink to it
+static char g_fs_list[576];     // a directory with many entries
+static int g_fs_dirfd = -1;     // open handle on g_fs_dir, for the *at rows
+static int g_fs_filefd = -1;    // open handle on the data file
+static int g_fs_listed;         // entries actually created in g_fs_list
+static size_t g_fs_bytes;       // size of the data file
+
+// Build the tree. Returns 0 on success; on failure the section is skipped
+// rather than reporting numbers from a half-built tree.
+static int fs_setup(const char *dir, size_t bytes) {
+    snprintf(g_fs_dir, sizeof g_fs_dir, "%s/eclipse-bench-fs", dir);
+    mkdir(g_fs_dir, 0755);
+    snprintf(g_fs_shallow, sizeof g_fs_shallow, "%s/data", g_fs_dir);
+    int fd = open(g_fs_shallow, O_CREAT | O_TRUNC | O_WRONLY, 0644);
+    if (fd < 0)
+        return -1;
+    unsigned char *buf = malloc(65536);
+    if (!buf) {
+        close(fd);
+        return -1;
+    }
+    memset(buf, 0x3c, 65536);
+    size_t left = bytes;
+    while (left) {
+        size_t n = left > 65536 ? 65536 : left;
+        ssize_t w = write(fd, buf, n);
+        if (w <= 0)
+            break;
+        left -= (size_t)w;
+    }
+    free(buf);
+    close(fd);
+    g_fs_bytes = bytes - left;
+    if (g_fs_bytes < 65536)
+        return -1;
+
+    // Eight nested components with the same file at the bottom. The pair of
+    // open rows then differs in exactly one thing — how many components the
+    // kernel had to resolve — so their difference is the per-component cost
+    // of a lookup, which no single row can show.
+    char path[512];
+    size_t n = (size_t)snprintf(path, sizeof path, "%s", g_fs_dir);
+    for (int i = 0; i < 8 && n < sizeof path - 4; i++) {
+        n += (size_t)snprintf(path + n, sizeof path - n, "/d%d", i);
+        mkdir(path, 0755);
+    }
+    snprintf(g_fs_deep, sizeof g_fs_deep, "%s/data", path);
+    fd = open(g_fs_deep, O_CREAT | O_TRUNC | O_WRONLY, 0644);
+    if (fd < 0)
+        return -1;
+    ssize_t w = write(fd, "x", 1);
+    (void)w;
+    close(fd);
+
+    snprintf(g_fs_link, sizeof g_fs_link, "%s/data.link", g_fs_dir);
+    unlink(g_fs_link);
+    if (symlink("data", g_fs_link) != 0)
+        g_fs_link[0] = 0; // no symlink support: that row reports n/a
+
+    snprintf(g_fs_list, sizeof g_fs_list, "%s/many", g_fs_dir);
+    mkdir(g_fs_list, 0755);
+    g_fs_listed = 0;
+    for (int i = 0; i < 256; i++) {
+        char e[640];
+        snprintf(e, sizeof e, "%s/e%03d", g_fs_list, i);
+        int efd = open(e, O_CREAT | O_WRONLY, 0644);
+        if (efd < 0)
+            break;
+        close(efd);
+        g_fs_listed++;
+    }
+
+    g_fs_dirfd = open(g_fs_dir, O_RDONLY | O_DIRECTORY);
+    g_fs_filefd = open(g_fs_shallow, O_RDONLY);
+    return g_fs_filefd >= 0 ? 0 : -1;
+}
+
+static void fs_teardown(void) {
+    if (g_fs_dirfd >= 0) { close(g_fs_dirfd); g_fs_dirfd = -1; }
+    if (g_fs_filefd >= 0) { close(g_fs_filefd); g_fs_filefd = -1; }
+    for (int i = 0; i < g_fs_listed; i++) {
+        char e[640];
+        snprintf(e, sizeof e, "%s/e%03d", g_fs_list, i);
+        unlink(e);
+    }
+    rmdir(g_fs_list);
+    unlink(g_fs_deep);
+    // Unwind the chain from the bottom up: rmdir only removes empty ones.
+    for (int depth = 8; depth >= 1; depth--) {
+        char path[512];
+        size_t n = (size_t)snprintf(path, sizeof path, "%s", g_fs_dir);
+        for (int i = 0; i < depth && n < sizeof path - 4; i++)
+            n += (size_t)snprintf(path + n, sizeof path - n, "/d%d", i);
+        rmdir(path);
+    }
+    if (g_fs_link[0])
+        unlink(g_fs_link);
+    unlink(g_fs_shallow);
+    rmdir(g_fs_dir);
+}
+
+static const char *g_fs_open_path;
+static int g_fs_open_flags;
+
+static int fs_open_op(void) {
+    int fd = open(g_fs_open_path, g_fs_open_flags);
+    if (fd < 0)
+        return 1;
+    close(fd);
+    return 0;
+}
+
+static double fs_open_ns(const char *path, int flags, uint64_t budget_ns) {
+    g_fs_open_path = path;
+    g_fs_open_flags = flags;
+    return timed_ns_per_op(fs_open_op, budget_ns);
+}
+
+// The same open, reached through a directory descriptor instead of a path.
+// Every build tool and every `find` does this; the gap against the full-path
+// row is what the resolution it skips was costing.
+static int fs_openat_op(void) {
+    int fd = openat(g_fs_dirfd, "data", O_RDONLY);
+    if (fd < 0)
+        return 1;
+    close(fd);
+    return 0;
+}
+
+static int fs_stat_op(void) {
+    struct stat st;
+    return stat(g_fs_shallow, &st) == 0 ? 0 : 1;
+}
+
+static int fs_lstat_op(void) {
+    struct stat st;
+    return lstat(g_fs_shallow, &st) == 0 ? 0 : 1;
+}
+
+static int fs_fstatat_op(void) {
+    struct stat st;
+    return fstatat(g_fs_dirfd, "data", &st, 0) == 0 ? 0 : 1;
+}
+
+static int fs_fstat_op(void) {
+    struct stat st;
+    return fstat(g_fs_filefd, &st) == 0 ? 0 : 1;
+}
+
+static int fs_access_op(void) {
+    return access(g_fs_shallow, F_OK) == 0 ? 0 : 1;
+}
+
+static int fs_readlink_op(void) {
+    char b[64];
+    ssize_t r = readlinkat(g_fs_dirfd, "data.link", b, sizeof b);
+    return r > 0 ? 0 : 1;
+}
+
+static int fs_lseek_op(void) {
+    return lseek(g_fs_filefd, 0, SEEK_SET) == 0 ? 0 : 1;
+}
+
+static int fs_dup_op(void) {
+    int fd = dup(g_fs_filefd);
+    if (fd < 0)
+        return 1;
+    close(fd);
+    return 0;
+}
+
+static int fs_fcntl_op(void) {
+    return fcntl(g_fs_filefd, F_GETFL, 0) >= 0 ? 0 : 1;
+}
+
+static int fs_pipe_op(void) {
+    int p[2];
+    if (pipe(p) != 0)
+        return 1;
+    close(p[0]);
+    close(p[1]);
+    return 0;
+}
+
+// Warm reads. The file was written moments ago and is read from offset 0 every
+// time, so this is the cache path: no device, no readahead decision, just the
+// cost of getting bytes from the page cache into a userspace buffer. `pread`
+// is the same work without the implicit seek, so the pair isolates what
+// maintaining the file position costs.
+static unsigned char *g_fs_rbuf;
+static size_t g_fs_rlen;
+
+static int fs_read_op(void) {
+    if (lseek(g_fs_filefd, 0, SEEK_SET) != 0)
+        return 1;
+    ssize_t r = read(g_fs_filefd, g_fs_rbuf, g_fs_rlen);
+    return r == (ssize_t)g_fs_rlen ? 0 : 1;
+}
+
+static int fs_pread_op(void) {
+    ssize_t r = pread(g_fs_filefd, g_fs_rbuf, g_fs_rlen, 0);
+    return r == (ssize_t)g_fs_rlen ? 0 : 1;
+}
+
+// The whole file through one mapping versus the same bytes through `read`.
+// A program that mmaps a file pays faults instead of copies; which is cheaper
+// is a property of this kernel, not a given, and the ratio row says which.
+static double fs_mmap_read_mibs(uint64_t budget_ns) {
+    uint64_t t0 = now_ns(), elapsed = 0, bytes = 0, ops = 0;
+    while ((elapsed < budget_ns || ops < 4) && elapsed < g_max_ns) {
+        void *m = mmap(NULL, g_fs_bytes, PROT_READ, MAP_PRIVATE, g_fs_filefd, 0);
+        if (m == MAP_FAILED)
+            return NA;
+        // Touch one byte per page rather than memcpy the lot: the subject is
+        // the fault path, and a copy would bury it under memory bandwidth.
+        volatile unsigned char sink = 0;
+        for (size_t off = 0; off < g_fs_bytes; off += 4096)
+            sink ^= ((unsigned char *)m)[off];
+        g_sink += sink;
+        munmap(m, g_fs_bytes);
+        bytes += g_fs_bytes;
+        ops++;
+        elapsed = now_ns() - t0;
+    }
+    if (!bytes || !elapsed)
+        return NA;
+    g_last_ops = ops;
+    return (double)bytes / ((double)elapsed / 1e9) / (1024.0 * 1024.0);
+}
+
+// Directory reads, charged per entry. `ps`, a shell glob and every `ls` live
+// here, and the per-entry figure is what scales with a big directory while the
+// per-call one hides it.
+static double fs_getdents_per_entry_ns(const char *path, uint64_t budget_ns,
+                                       double *entries_out, double *calls_out) {
+    char *buf = malloc(32768);
+    if (!buf)
+        return NA;
+    uint64_t t0 = now_ns(), elapsed = 0, ops = 0, entries = 0, calls = 0;
+    while ((elapsed < budget_ns || ops < MIN_SAMPLES) && elapsed < g_max_ns) {
+        int fd = open(path, O_RDONLY | O_DIRECTORY);
+        if (fd < 0) {
+            free(buf);
+            return NA;
+        }
+        for (;;) {
+            long n = syscall(SYS_getdents64, fd, buf, (size_t)32768);
+            if (n <= 0)
+                break;
+            // Only calls that returned entries, so the derived row below is a
+            // batch size and not a batch size diluted by the one call every
+            // walk makes to learn it has reached the end.
+            calls++;
+            // Walk the records to count them: the byte count is not an entry
+            // count, and a kernel returning one entry per call would otherwise
+            // look identical to one returning sixty.
+            for (long off = 0; off < n;) {
+                // struct linux_dirent64: ino(8) off(8) reclen(2) type(1) name
+                unsigned short reclen;
+                memcpy(&reclen, buf + off + 16, sizeof reclen);
+                if (reclen == 0)
+                    break;
+                entries++;
+                off += reclen;
+            }
+        }
+        close(fd);
+        ops++;
+        elapsed = now_ns() - t0;
+    }
+    free(buf);
+    if (entries_out)
+        *entries_out = (double)entries;
+    if (calls_out)
+        *calls_out = (double)calls;
+    if (!entries || !elapsed)
+        return NA;
+    g_last_ops = ops;
+    return (double)elapsed / (double)entries;
+}
+
+// procfs, read the way real tools read it: open, read to EOF, close. Each of
+// these files is generated on demand, so the cost is the kernel formatting a
+// report, not a filesystem lookup — and a tool like `ps` pays it once per
+// process on the machine, which is why a slow one is felt and not just
+// measured.
+static const char *g_fs_proc_path;
+
+static int fs_proc_read_op(void) {
+    int fd = open(g_fs_proc_path, O_RDONLY);
+    if (fd < 0)
+        return 1;
+    char buf[4096];
+    ssize_t total = 0;
+    for (;;) {
+        ssize_t r = read(fd, buf, sizeof buf);
+        if (r <= 0)
+            break;
+        total += r;
+    }
+    close(fd);
+    return total > 0 ? 0 : 1;
+}
+
+static double fs_proc_read_ns(const char *path, uint64_t budget_ns) {
+    g_fs_proc_path = path;
+    return timed_ns_per_op(fs_proc_read_op, budget_ns);
+}
+
+// ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
 
@@ -3518,7 +4622,8 @@ int main(int argc, char **argv) {
                     " [DIR] [DISK_MB] [MEM_MB]\n",
                     argv[0]);
             fprintf(stderr,
-                    "sections: cpu mem syscall vm sched psched smp disk proc gfx\n");
+                    "sections: cpu mem syscall vm sched psched net fs smp disk\n"
+                    "          proc gfx\n");
             fprintf(stderr,
                     "diagnostics: --forkloop N MIB [MAPS], "
                     "--yieldstall [SECONDS] [NOTIFIERS]\n");
@@ -3541,7 +4646,8 @@ int main(int argc, char **argv) {
     long ncpu_l = sysconf(_SC_NPROCESSORS_ONLN);
     int ncpu = (ncpu_l > 0 && ncpu_l < 4096) ? (int)ncpu_l : 2;
 
-    printf("eclipse-bench — CPU / memory / syscall / VM / scheduler / disk / process\n");
+    printf("eclipse-bench — CPU / memory / syscall / VM / scheduler / sockets /\n");
+    printf("                filesystem / disk / process\n");
     printf("dir=%s  disk=%zu MiB  mem=%zu MiB  cpus=%d\n", dir, disk_mb, mem_mb, ncpu);
     printf("self=%s\n", self);
     printf("\n");
@@ -4017,6 +5123,240 @@ int main(int argc, char **argv) {
         printf("  userspace rows above are the whole comparison.\n");
     }
 
+
+    // ---- Sockets / IPC ----
+    if (want(only, "net")) {
+        line();
+        printf("SOCKETS / IPC   <-- everything above a bare socketpair\n");
+        snprintf(g_net_dir, sizeof g_net_dir, "%s", dir);
+        g_pstat_ok = pstat_snapshot(g_pstat_a, sizeof g_pstat_a);
+        if (!g_pstat_ok)
+            printf("  (no /proc/self/perf: the calls/op and in-kernel rows are\n"
+                   "   Eclipse-only and read n/a here)\n");
+        else
+            pstat_calibrate();
+
+        double sock_ns = net_socket_floor_ns(AF_INET, SOCK_STREAM, g_short_ns);
+        row("[kernel]", "socket()+close() TCP", sock_ns, "ns", "linux: ~1500");
+        row("[kernel]", "socket()+close() UNIX",
+            net_socket_floor_ns(AF_UNIX, SOCK_STREAM, g_short_ns), "ns",
+            "linux: ~1200");
+
+        // Loopback TCP. The same one-byte exchange as the pipe row, with the
+        // whole IP stack in the path: a gap against the socketpair row is the
+        // protocol processing, not the wake-up.
+        {
+            int c = -1, s = -1;
+            double tcp_ops = 0, tcp_ns = NA;
+            if (net_tcp_pair(&c, &s) == 0) {
+                if (g_pstat_ok)
+                    pstat_snapshot(g_pstat_a, sizeof g_pstat_a);
+                tcp_ns = net_pair_rt(c, s, g_short_ns, &tcp_ops);
+                if (g_pstat_ok)
+                    pstat_snapshot(g_pstat_b, sizeof g_pstat_b);
+                row("[kernel]", "TCP loopback round trip",
+                    tcp_ns < 0 ? NA : tcp_ns / 1000.0, "us", "linux: ~12");
+                pstat_pair("sendto", "sendto", tcp_ops, tcp_ns);
+            } else {
+                row("[kernel]", "TCP loopback round trip", NA, "us",
+                    "(no loopback TCP)");
+            }
+        }
+        {
+            int c = -1, s = -1;
+            if (net_tcp_pair(&c, &s) == 0)
+                row("[kernel]", "TCP loopback bandwidth",
+                    net_pair_bw_mbs(c, s, 64 * 1024, g_short_ns), "MB/s",
+                    "linux: >2000");
+            else
+                row("[kernel]", "TCP loopback bandwidth", NA, "MB/s", "");
+        }
+        row("[kernel]", "TCP connect+accept+close",
+            (r = net_accept_cycle_ns(g_short_ns)) < 0 ? NA : r / 1000.0, "us",
+            "linux: ~30");
+
+        // A UNIX socket reached by NAME, not a socketpair: bind, listen,
+        // connect through the filesystem. The difference against the
+        // socketpair row in the SCHEDULER section is what the name and the
+        // listener cost, which every desktop bus and compositor pays.
+        {
+            int c = -1, s = -1;
+            char path[512] = {0};
+            if (net_unix_pair(&c, &s, path, sizeof path) == 0) {
+                double ops = 0;
+                double ns = net_pair_rt(c, s, g_short_ns, &ops);
+                row("[kernel]", "UNIX stream RT (bound)",
+                    ns < 0 ? NA : ns / 1000.0, "us", "linux: ~9");
+                if (path[0])
+                    unlink(path);
+            } else {
+                row("[kernel]", "UNIX stream RT (bound)", NA, "us", "");
+            }
+        }
+        {
+            int a = -1, b = -1;
+            char pa[512] = {0}, pb[512] = {0};
+            if (net_dgram_pair(AF_UNIX, &a, &b, pa, pb, sizeof pa) == 0) {
+                double ops = 0;
+                double ns = net_pair_rt(a, b, g_short_ns, &ops);
+                row("[kernel]", "UNIX datagram round trip",
+                    ns < 0 ? NA : ns / 1000.0, "us", "linux: ~8");
+                if (pa[0]) unlink(pa);
+                if (pb[0]) unlink(pb);
+            } else {
+                row("[kernel]", "UNIX datagram round trip", NA, "us", "");
+            }
+        }
+        {
+            int a = -1, b = -1;
+            if (net_dgram_pair(AF_INET, &a, &b, NULL, NULL, 0) == 0) {
+                double ops = 0;
+                double ns = net_pair_rt(a, b, g_short_ns, &ops);
+                row("[kernel]", "UDP loopback round trip",
+                    ns < 0 ? NA : ns / 1000.0, "us", "linux: ~10");
+            } else {
+                row("[kernel]", "UDP loopback round trip", NA, "us",
+                    "(no loopback UDP)");
+            }
+        }
+
+        // sendmsg/recvmsg against plain send/recv, same byte, same socket
+        // family, so the ratio is the iovec and control plumbing and nothing
+        // else. Then the fd pass, which is the same path carrying an actual
+        // descriptor.
+        {
+            int sv[2];
+            double plain = NA, msgv = NA;
+            if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0) {
+                struct echo_ctl *c = calloc(1, sizeof *c);
+                pthread_t th;
+                if (c) {
+                    c->fd = sv[1];
+                    c->refs = 1;
+                    CTL_LEND(c);
+                    if (pthread_create(&th, NULL, sock_echo_thread, c) == 0) {
+                        sock_set_timeout(sv[0], 5);
+                        plain = sock_rt_drive(sv[0], g_short_ns);
+                        g_msg_fd = sv[0];
+                        msgv = timed_ns_per_op(net_sendmsg_rt_op, g_short_ns);
+                        shutdown(sv[0], SHUT_RDWR);
+                        close(sv[0]);
+                        if (join_or_abandon(th, &c->done, 5))
+                            close(sv[1]);
+                    } else {
+                        CTL_DROP(c);
+                        close(sv[0]);
+                        close(sv[1]);
+                    }
+                    CTL_DROP(c);
+                }
+            }
+            row("[kernel]", "socketpair RT (send/recv)",
+                plain < 0 ? NA : plain / 1000.0, "us", "");
+            row("[kernel]", "socketpair RT (sendmsg)",
+                msgv < 0 ? NA : msgv / 1000.0, "us", "");
+            if (plain > 0 && msgv > 0)
+                row("[kernel]", "  sendmsg / send", msgv / plain, "x",
+                    "linux: ~1.1");
+        }
+        {
+            int sv[2];
+            double ns = NA;
+            if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0) {
+                g_scm_tx = sv[0];
+                g_scm_rx = sv[1];
+                g_scm_payload = sv[0]; // any valid descriptor will do
+                sock_set_timeout(sv[1], 5);
+                if (g_pstat_ok)
+                    pstat_snapshot(g_pstat_a, sizeof g_pstat_a);
+                ns = timed_ns_per_op(net_scm_rights_op, g_short_ns);
+                double ops = ns < 0 ? 0 : (double)g_last_ops;
+                if (g_pstat_ok)
+                    pstat_snapshot(g_pstat_b, sizeof g_pstat_b);
+                row("[kernel]", "SCM_RIGHTS fd pass", ns < 0 ? NA : ns / 1000.0,
+                    "us", "linux: ~7");
+                pstat_pair("recvmsg", "recvmsg", ops, ns);
+                close(sv[0]);
+                close(sv[1]);
+            } else {
+                row("[kernel]", "SCM_RIGHTS fd pass", NA, "us", "");
+            }
+            if (ns < 0)
+                printf("  (the fd did not arrive — SCM_RIGHTS unsupported here,\n"
+                       "   which is a correctness result, not a slow one)\n");
+        }
+        {
+            int sv[2];
+            if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0) {
+                g_eagain_fd = sv[0];
+                row("[kernel]", "recv on empty (EAGAIN)",
+                    timed_ns_per_op(net_eagain_op, g_short_ns), "ns",
+                    "linux: ~400");
+                close(sv[0]);
+                close(sv[1]);
+            }
+        }
+
+        // Readiness. One ready fd, placed LAST, measured over 1 and 64 fds so
+        // the slope says whether the implementation walks the set.
+        {
+            int rfd[RDY_MAX], wfd[RDY_MAX];
+            double p1 = NA, p64 = NA, s64 = NA, e64 = NA, ectl = NA;
+            int made = net_rdy_setup(1, rfd, wfd);
+            if (made == 1) {
+                p1 = timed_ns_per_op(net_poll_op, g_short_ns);
+                net_rdy_teardown(made, rfd, wfd);
+            }
+            made = net_rdy_setup(RDY_MAX, rfd, wfd);
+            if (made > 1) {
+                p64 = timed_ns_per_op(net_poll_op, g_short_ns);
+                s64 = timed_ns_per_op(net_select_op, g_short_ns);
+                g_rdy_epfd = epoll_create1(0);
+                if (g_rdy_epfd >= 0) {
+                    int added = 0;
+                    for (int i = 0; i < made; i++) {
+                        struct epoll_event ev;
+                        memset(&ev, 0, sizeof ev);
+                        ev.events = EPOLLIN;
+                        ev.data.fd = rfd[i];
+                        if (epoll_ctl(g_rdy_epfd, EPOLL_CTL_ADD, rfd[i], &ev) == 0)
+                            added++;
+                    }
+                    if (added == made)
+                        e64 = timed_ns_per_op(net_epoll_wait_op, g_short_ns);
+                    // Measure ADD+DEL with the set already populated, which is
+                    // what an event loop does on every new connection.
+                    epoll_ctl(g_rdy_epfd, EPOLL_CTL_DEL, g_rdy_pfd[0].fd, NULL);
+                    ectl = timed_ns_per_op(net_epoll_ctl_op, g_short_ns);
+                    close(g_rdy_epfd);
+                    g_rdy_epfd = -1;
+                }
+            }
+            row("[kernel]", "poll(1 fd, ready)", p1, "ns", "linux: ~700");
+            char lbl[48];
+            snprintf(lbl, sizeof lbl, "poll(%d fds, last ready)", made > 1 ? made : RDY_MAX);
+            row("[kernel]", lbl, p64, "ns", "linux: ~2500");
+            if (p1 > 0 && p64 > 0 && made > 1)
+                row("[kernel]", "  per extra fd", (p64 - p1) / (made - 1), "ns",
+                    "linux: ~30");
+            snprintf(lbl, sizeof lbl, "select(%d fds)", made > 1 ? made : RDY_MAX);
+            row("[kernel]", lbl, s64, "ns", "linux: ~2500");
+            snprintf(lbl, sizeof lbl, "epoll_wait(%d fds)", made > 1 ? made : RDY_MAX);
+            row("[kernel]", lbl, e64, "ns", "linux: ~800");
+            if (p64 > 0 && e64 > 0)
+                row("[kernel]", "  epoll / poll", e64 / p64, "x",
+                    "<1 means epoll pays off");
+            row("[kernel]", "epoll_ctl ADD+DEL", ectl, "ns", "linux: ~1200");
+            if (made > 1)
+                net_rdy_teardown(made, rfd, wfd);
+        }
+        printf("  the slope between the 1-fd and %d-fd poll rows is the one that\n",
+               RDY_MAX);
+        printf("  scales: an event loop with a hundred connections pays it on\n");
+        printf("  every single wake-up. `epoll / poll` above 1 means epoll is\n");
+        printf("  walking the same set the poll call does, and buys nothing.\n");
+    }
+
     // ---- SMP ----
     if (want(only, "smp")) {
         line();
@@ -4203,6 +5543,163 @@ int main(int argc, char **argv) {
                 printf("  meta ops: skipped (low free space)\n");
             }
             free(io);
+        }
+    }
+
+
+    // ---- Filesystem / VFS ----
+    if (want(only, "fs")) {
+        line();
+        printf("FILESYSTEM / VFS (warm, in %s)   <-- paths, not megabytes\n", dir);
+        g_pstat_ok = pstat_snapshot(g_pstat_a, sizeof g_pstat_a);
+        if (!g_pstat_ok)
+            printf("  (no /proc/self/perf: the calls/op and in-kernel rows are\n"
+                   "   Eclipse-only and read n/a here)\n");
+        else
+            pstat_calibrate();
+        if (fs_setup(dir, 1024 * 1024) != 0) {
+            printf("  (could not build the test tree under %s — skipped. Point\n"
+                   "   DIR at a writable directory with a few MiB free.)\n", dir);
+            fs_teardown();
+        } else {
+            double shallow = NA, deep = NA;
+            if (g_pstat_ok)
+                pstat_snapshot(g_pstat_a, sizeof g_pstat_a);
+            shallow = fs_open_ns(g_fs_shallow, O_RDONLY, g_short_ns);
+            double open_ops = shallow < 0 ? 0 : (double)g_last_ops;
+            if (g_pstat_ok)
+                pstat_snapshot(g_pstat_b, sizeof g_pstat_b);
+            row("[kernel]", "open+close, 1 component", shallow, "ns",
+                "linux: ~1400");
+            pstat_pair("openat", "openat", open_ops, shallow);
+            deep = fs_open_ns(g_fs_deep, O_RDONLY, g_short_ns);
+            row("[kernel]", "open+close, 9 components", deep, "ns",
+                "linux: ~2200");
+            if (shallow > 0 && deep > 0)
+                row("[kernel]", "  path cost per component",
+                    (deep - shallow) / 8.0, "ns", "linux: ~60");
+            double at = timed_ns_per_op(fs_openat_op, g_short_ns);
+            row("[kernel]", "openat(dirfd, name)", at, "ns", "linux: ~1300");
+            if (shallow > 0 && at > 0)
+                row("[kernel]", "  openat / open", at / shallow, "x", "");
+            // O_PATH resolves the path and hands back a handle that cannot be
+            // read. `ps` uses it, and Eclipse has had it wrong twice, so it
+            // gets a row of its own rather than being assumed equal to a
+            // normal open.
+            row("[kernel]", "open+close (O_PATH)",
+                fs_open_ns(g_fs_shallow, O_PATH, g_short_ns), "ns",
+                "linux: ~1100");
+
+            row("[kernel]", "stat(path)",
+                timed_ns_per_op(fs_stat_op, g_short_ns), "ns", "linux: ~800");
+            row("[kernel]", "lstat(path)",
+                timed_ns_per_op(fs_lstat_op, g_short_ns), "ns", "linux: ~850");
+            row("[kernel]", "fstatat(dirfd, name)",
+                timed_ns_per_op(fs_fstatat_op, g_short_ns), "ns", "linux: ~700");
+            row("[kernel]", "fstat(fd)",
+                timed_ns_per_op(fs_fstat_op, g_short_ns), "ns", "linux: ~400");
+            row("[kernel]", "access(F_OK)",
+                timed_ns_per_op(fs_access_op, g_short_ns), "ns", "linux: ~750");
+            if (g_fs_link[0])
+                row("[kernel]", "readlinkat(symlink)",
+                    timed_ns_per_op(fs_readlink_op, g_short_ns), "ns",
+                    "linux: ~700");
+            else
+                row("[kernel]", "readlinkat(symlink)", NA, "ns",
+                    "(no symlink support)");
+            row("[kernel]", "lseek(SEEK_SET)",
+                timed_ns_per_op(fs_lseek_op, g_short_ns), "ns", "linux: ~250");
+            row("[kernel]", "dup+close",
+                timed_ns_per_op(fs_dup_op, g_short_ns), "ns", "linux: ~700");
+            row("[kernel]", "fcntl(F_GETFL)",
+                timed_ns_per_op(fs_fcntl_op, g_short_ns), "ns", "linux: ~250");
+            row("[kernel]", "pipe()+close x2",
+                timed_ns_per_op(fs_pipe_op, g_short_ns), "ns", "linux: ~3000");
+
+            // Warm data path.
+            g_fs_rbuf = malloc(64 * 1024);
+            if (g_fs_rbuf) {
+                g_fs_rlen = 4096;
+                if (g_pstat_ok)
+                    pstat_snapshot(g_pstat_a, sizeof g_pstat_a);
+                double r4 = timed_ns_per_op(fs_read_op, g_short_ns);
+                double r4ops = r4 < 0 ? 0 : (double)g_last_ops;
+                if (g_pstat_ok)
+                    pstat_snapshot(g_pstat_b, sizeof g_pstat_b);
+                row("[kernel]", "lseek+read 4 KiB (cache)", r4, "ns",
+                    "linux: ~800");
+                pstat_pair("read", "read", r4ops, r4);
+                double p4 = timed_ns_per_op(fs_pread_op, g_short_ns);
+                row("[kernel]", "pread 4 KiB (cache)", p4, "ns",
+                    "linux: ~500");
+                // Two syscalls against one: `pread` carries the offset, so
+                // the gap is what rewinding the file position costs. The
+                // `lseek` row above gives the other half of the arithmetic.
+                if (r4 > 0 && p4 > 0)
+                    row("[kernel]", "  (lseek+read) / pread", r4 / p4, "x",
+                        "the file position");
+                g_fs_rlen = 64 * 1024;
+                double r64 = timed_ns_per_op(fs_read_op, g_short_ns);
+                row("[kernel]", "lseek+read 64 KiB (cache)",
+                    r64 < 0 ? NA : 65536.0 / r64 * 1e9 / (1024.0 * 1024.0),
+                    "MiB/s", "linux: >5000");
+                free(g_fs_rbuf);
+                g_fs_rbuf = NULL;
+            }
+            row("[kernel]", "mmap+touch 1 MiB file", fs_mmap_read_mibs(g_short_ns),
+                "MiB/s", "linux: >1500");
+
+            if (g_fs_listed > 0) {
+                double entries = 0, calls = 0;
+                double per = fs_getdents_per_entry_ns(g_fs_list, g_short_ns,
+                                                      &entries, &calls);
+                char lbl[48];
+                snprintf(lbl, sizeof lbl, "getdents, %d entries", g_fs_listed);
+                row("[kernel]", lbl, per, "ns/entry", "linux: ~100");
+                // How many entries one getdents call returned. A kernel that
+                // hands back one entry per syscall costs a directory walk a
+                // syscall per file, and the per-entry row above cannot show
+                // that on its own — it would just read "slow".
+                if (per > 0 && calls > 0)
+                    row("[kernel]", "  entries per getdents call",
+                        entries / calls, "x", "linux: all of them in one call");
+            }
+
+            // procfs. Every one of these is a report the kernel formats on
+            // demand, and `ps aux` reads several per process on the machine.
+            printf("  -- procfs (generated on read; what `ps` and `top` pay) --\n");
+            row("[kernel]", "/proc/self/stat",
+                fs_proc_read_ns("/proc/self/stat", g_short_ns), "ns",
+                "linux: ~5000");
+            row("[kernel]", "/proc/self/status",
+                fs_proc_read_ns("/proc/self/status", g_short_ns), "ns",
+                "linux: ~9000");
+            row("[kernel]", "/proc/self/maps",
+                fs_proc_read_ns("/proc/self/maps", g_short_ns), "ns",
+                "linux: ~15000");
+            row("[kernel]", "/proc/uptime",
+                fs_proc_read_ns("/proc/uptime", g_short_ns), "ns",
+                "linux: ~4000");
+            row("[kernel]", "/proc/meminfo",
+                fs_proc_read_ns("/proc/meminfo", g_short_ns), "ns",
+                "linux: ~8000");
+            {
+                double entries = 0, calls = 0;
+                double per = fs_getdents_per_entry_ns("/proc/self/task",
+                                                      g_short_ns, &entries,
+                                                      &calls);
+                row("[kernel]", "/proc/self/task listing", per, "ns/entry",
+                    "linux: ~2000");
+                if (per < 0)
+                    printf("  (/proc/<pid>/task would not list — that directory\n"
+                           "   missing is what used to kill chromium's zygote)\n");
+            }
+            fs_teardown();
+            printf("  these rows are the cache and the VFS, not the device: the\n");
+            printf("  data was written moments earlier and every read starts at\n");
+            printf("  offset 0. A gap against Linux here is path resolution,\n");
+            printf("  descriptor handling or procfs formatting — the DISK section\n");
+            printf("  is where the block device answers for itself.\n");
         }
     }
 
