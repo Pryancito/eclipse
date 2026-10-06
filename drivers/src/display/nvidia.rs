@@ -9506,28 +9506,39 @@ impl NvidiaGpu {
         let gr_trap_lo = rd(0x0040_0708);
         let gr_trap_hi = rd(0x0040_070c);
 
-        // PBDMA0 ring pointers (GR runlist is usually PBDMA0).
-        // GP_GET == GP_PUT means the PBDMA finished fetching;
-        // GP_GET < GP_PUT means it never fetched the push at all.
-        let pb0_put = rd(0x0004_0000);
-        let pb0_get = rd(0x0004_0014);
+        // The PBDMA that serves THIS channel's runlist, not PBDMA0.
+        // `NV_PFIFO_PBDMA_MAP(i)` (0x2390 + i*4) is a bitmask of the
+        // runlists PBDMA i serves, and the /proc/gpudbg dump below already
+        // records that the CE's runlist came out on PBDMA9 on real
+        // hardware. Reading 0x40000 for a channel on another runlist
+        // reports a DIFFERENT engine's ring pointers, and `drained` is
+        // what the hint -- and the doorbell re-ring -- then turn on.
+        let maps: Vec<u16> = (0..nv::PBDMA_COUNT)
+            .map(|i| (rd(0x0000_2390 + (i as usize) * 4) & 0xffff) as u16)
+            .collect();
+        let pbdma_idx = nv::pbdma_for_runlist(&maps, runlist_id);
+        let pb = nv::PBDMA_BASE + (pbdma_idx.unwrap_or(0) as usize) * nv::PBDMA_STRIDE;
+        // Ring pointers. GP_GET == GP_PUT means the PBDMA finished
+        // fetching; GP_GET < GP_PUT means it never fetched the push.
+        let pb_put = rd(pb);
+        let pb_get = rd(pb + 0x14);
         // PBDMA execution state — decodes WHY GP_GET is stuck,
         // the one thing GP_PUT/GP_GET alone cannot tell apart:
-        //   STATUS(0x40100): the PBDMA channel/exec state machine.
-        //   GET(0x40018): pushbuffer-level get. If it advanced
+        //   STATUS(+0x100): the PBDMA channel/exec state machine.
+        //   GET(+0x18): pushbuffer-level get. If it advanced
         //     into the pending segment the host DID fetch the
         //     entry and is executing/blocked inside the push
         //     (a semaphore-acquire NVK baked in -> explicit-sync).
-        //   INTR_0(0x40108): pending PBDMA interrupts. A blocked
+        //   INTR_0(+0x108): pending PBDMA interrupts. A blocked
         //     semaphore-acquire that exceeds its timeout raises
         //     one here; a channel that was simply never scheduled
         //     onto the runlist raises none. So INTR_0!=0 => the
         //     push was fetched and blocked (semaphore/PB error);
         //     INTR_0==0 with GP_GET frozen => never scheduled
         //     (runlist/doorbell), NOT a semaphore block.
-        let pb0_status = rd(0x0004_0100);
-        let pb0_pbget = rd(0x0004_0018);
-        let pb0_intr = rd(0x0004_0108);
+        let pb_status = rd(pb + 0x100);
+        let pb_pbget = rd(pb + 0x18);
+        let pb_intr = rd(pb + 0x108);
 
         // NV_PFIFO_CHRAM_CHANNEL(ch_id): per-channel PCCSR register.
         // Stride is 8 bytes.  The FIRST word (+0x0) is the instance
@@ -9575,7 +9586,11 @@ impl NvidiaGpu {
         // NV_PGRAPH_PRI_GPC0_GPCCS_CTXSW_STATUS_GPC_0: GPCCS state.
         let gpccs_status = rd(0x0041_a000);
 
-        let drained = pb0_get == pb0_put;
+        // With no PBDMA for this runlist there are no ring pointers to
+        // read, so `drained` would be `0 == 0` -- "the PBDMA drained the
+        // push", the one conclusion the registers cannot support. Treat
+        // the unknown as unknown and let the hint say so.
+        let drained = pbdma_idx.is_some() && pb_get == pb_put;
         let mmu_valid = (f_info1 >> 31) & 1;
         let mmu_reason = f_info1 & 0x1f;
         let gr_subchan = (gr_trap_addr >> 16) & 0x1f;
@@ -9587,7 +9602,9 @@ impl NvidiaGpu {
             "MMU-FAULT: GPU touched an unmapped VA -- check VM_BIND mappings"
         } else if gr_status != 0 && gr_method != 0 {
             "GR-STALL: GR engine stuck on a method -- golden-ctx/GR-init incomplete?"
-        } else if !drained && pb0_intr != 0 {
+        } else if pbdma_idx.is_none() {
+            "NO-PBDMA: no NV_PFIFO_PBDMA_MAP entry routes this channel's runlist, so there are no ring pointers to judge -- the PBDMA lines below are NOT this channel's. Check the runlist_id the submit token carries."
+        } else if !drained && pb_intr != 0 {
             "PBDMA-STALL (fetched, then BLOCKED): a PBDMA interrupt is pending -- the host fetched the push and stalled inside it, i.e. a semaphore-acquire NVK baked in never released (explicit-sync), or a PB error. Decode INTR_0/STATUS."
         } else if !drained {
             "PBDMA-STALL (never fetched): GP_GET frozen with no PBDMA interrupt -- the channel is not runlist-resident, so the doorbell/runlist scheduling never ran this push (NOT a semaphore block)."
@@ -9596,6 +9613,30 @@ impl NvidiaGpu {
         } else {
             "GR-IDLE-NOFENCE: GR finished but fence-semaphore write never arrived -- WFI/coherency?"
         };
+
+        // The hint is the one line of the probe worth reading first, and
+        // until now only two of its six outcomes reached dmesg (the
+        // doorbell re-ring and the FECS hang): an MMU fault, a GR stall or
+        // a fence that never landed left the console silent, with the
+        // whole record only in /proc/gpudbg -- which nobody reads unless
+        // something already pointed them at it. klog it unconditionally;
+        // it is one line per timeout, and the ring stays wedged after the
+        // first.
+        crate::klog_warn!(
+            "[nouveau-uapi] EXEC: ctx={} fence TIMEOUT after {}ms -- {} (pbdma={} runlist={} ch={} GP_PUT={:#x} GP_GET={:#x} INTR_0={:#x}) -- full record in /proc/gpudbg",
+            ctx_idx,
+            timeout_ms,
+            hint,
+            match pbdma_idx {
+                Some(i) => alloc::format!("{}", i),
+                None => alloc::string::String::from("none"),
+            },
+            runlist_id,
+            ch_id,
+            pb_put,
+            pb_get,
+            pb_intr
+        );
 
         // Recovery attempt for the "never fetched, no PBDMA
         // interrupt" case: re-ring the doorbell with the exact
@@ -9608,7 +9649,7 @@ impl NvidiaGpu {
         // the doorbell was lost. Pure BAR0 write; no RM call.
         // Only attempted when GP_GET is frozen AND INTR_0 == 0
         // (i.e., the push never made it to the PBDMA at all).
-        if !drained && pb0_intr == 0 && work_token != 0 {
+        if pbdma_idx.is_some() && !drained && pb_intr == 0 && work_token != 0 {
             wr(0x00bb_0090, work_token);
             crate::klog_warn!(
                 "[nouveau-uapi] EXEC: ctx={} PBDMA-stall recovery: re-rang doorbell token={:#010x} runlist={} ch={}",
@@ -9661,8 +9702,8 @@ impl NvidiaGpu {
              GR_STATUS(0x400700)={gr_status:#010x} (0=idle)\n\
              TRAPPED_ADDR(0x400704)={gr_trap_addr:#010x} subchan={gr_subchan} method={gr_method:#06x}\n\
              TRAPPED_DATA lo={gr_trap_lo:#010x} hi={gr_trap_hi:#010x}\n\
-             PBDMA0 GP_PUT(0x40000)={pb0_put:#010x} GP_GET(0x40014)={pb0_get:#010x} drained={drained}\n\
-             PBDMA0 STATUS(0x40100)={pb0_status:#010x} GET(0x40018)={pb0_pbget:#010x} INTR_0(0x40108)={pb0_intr:#010x}\n\
+             PBDMA{pbdma_name}(serves runl{runlist_id}, base={pb:#x}) GP_PUT={pb_put:#010x} GP_GET={pb_get:#010x} drained={drained}\n\
+             PBDMA{pbdma_name} STATUS={pb_status:#010x} GET={pb_pbget:#010x} INTR_0={pb_intr:#010x}\n\
              PCCSR ch{ch_id}(0x{pccsr_off:x})={pccsr_val:#010x} enable={pccsr_enable} busy={pccsr_busy} status={pccsr_status} (0=IDLE,1=PENDING,3=ACTIVE)\n\
              MMU FAULT_INFO1(0xb83090)={f_info1:#010x} valid={mmu_valid} reason={mmu_reason:#04x}\n\
                FAULT_ADDR={f_addr_hi:#010x}_{f_addr_lo:#010x} engine_id={engine_id:#04x}\n\
@@ -9682,11 +9723,16 @@ impl NvidiaGpu {
             gr_method = gr_method,
             gr_trap_lo = gr_trap_lo,
             gr_trap_hi = gr_trap_hi,
-            pb0_put = pb0_put,
-            pb0_get = pb0_get,
-            pb0_status = pb0_status,
-            pb0_pbget = pb0_pbget,
-            pb0_intr = pb0_intr,
+            pbdma_name = match pbdma_idx {
+                Some(i) => alloc::format!("{}", i),
+                None => alloc::string::String::from("?(none routes it)"),
+            },
+            pb = pb,
+            pb_put = pb_put,
+            pb_get = pb_get,
+            pb_status = pb_status,
+            pb_pbget = pb_pbget,
+            pb_intr = pb_intr,
             drained = drained,
             pccsr_off = pccsr_off,
             pccsr_val = pccsr_val,

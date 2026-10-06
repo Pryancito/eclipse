@@ -1459,6 +1459,73 @@ pub(super) fn nr_has_arm(nr: u32) -> bool {
     )
 }
 
+/// How many PBDMAs this driver looks at, and the stride between their
+/// register blocks (`NV_PPBDMA(i)` = `0x40000 + i * 0x2000` on Turing).
+pub(super) const PBDMA_COUNT: u32 = 12;
+pub(super) const PBDMA_STRIDE: usize = 0x2000;
+pub(super) const PBDMA_BASE: usize = 0x0004_0000;
+
+/// The first PBDMA whose `NV_PFIFO_PBDMA_MAP` entry serves `runlist_id`.
+///
+/// `maps[i]` is the raw low 16 bits of `NV_PFIFO_PBDMA_MAP(i)` (BAR0
+/// `0x2390 + i * 4`): a bitmask of the runlists that PBDMA serves. PBDMA0
+/// is NOT the answer by default -- the `/proc/gpudbg` dump next to this
+/// one already says so in as many words ("discovered as PBDMA9 on the last
+/// real-hardware run"), which is why reading `0x40000` for a channel on
+/// another runlist reports another engine's GP_GET as if it were this
+/// channel's.
+///
+/// `None` when nothing routes that runlist (or the id is out of the
+/// mask's 16 bits): the caller then has no PBDMA to read, and saying so is
+/// worth more than a number from the wrong one.
+pub(super) fn pbdma_for_runlist(maps: &[u16], runlist_id: u32) -> Option<u32> {
+    if runlist_id >= 16 {
+        return None;
+    }
+    let bit = 1u16 << runlist_id;
+    maps.iter()
+        .take(PBDMA_COUNT as usize)
+        .position(|m| m & bit != 0)
+        .map(|i| i as u32)
+}
+
+#[cfg(test)]
+mod pbdma_map_tests {
+    use super::*;
+
+    #[test]
+    fn the_pbdma_that_serves_the_runlist_is_the_one_whose_bit_is_set() {
+        // Runlist 0 on PBDMA0, runlist 2 on PBDMA9: the real shape of the
+        // hardware run that prompted this.
+        let mut maps = [0u16; PBDMA_COUNT as usize];
+        maps[0] = 0b0001;
+        maps[9] = 0b0100;
+        assert_eq!(pbdma_for_runlist(&maps, 0), Some(0));
+        assert_eq!(pbdma_for_runlist(&maps, 2), Some(9));
+    }
+
+    #[test]
+    fn a_runlist_nothing_routes_has_no_pbdma() {
+        let maps = [0u16; PBDMA_COUNT as usize];
+        assert_eq!(pbdma_for_runlist(&maps, 0), None);
+    }
+
+    #[test]
+    fn a_runlist_id_past_the_mask_has_no_pbdma() {
+        // The mask is 16 bits wide, so `1 << 16` is not a shift to make.
+        let maps = [0xffffu16; PBDMA_COUNT as usize];
+        assert_eq!(pbdma_for_runlist(&maps, 16), None);
+        assert_eq!(pbdma_for_runlist(&maps, 15), Some(0));
+    }
+
+    #[test]
+    fn a_pbdma_past_the_count_is_not_looked_at() {
+        let mut maps = [0u16; PBDMA_COUNT as usize + 4];
+        maps[PBDMA_COUNT as usize + 1] = 0b0001;
+        assert_eq!(pbdma_for_runlist(&maps, 0), None);
+    }
+}
+
 // --- Driver-private ioctl NRs (dispatch keys) -------------------------------
 //
 // Linux dispatches driver-private ioctls by NR alone:
