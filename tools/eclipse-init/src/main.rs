@@ -54,6 +54,44 @@ const MAX_BACKOFF: Duration = Duration::from_secs(8);
 /// conceivable and costs about a second to rule out.
 const MISSING_EXEC_TRIES: u32 = 3;
 
+/// How long a `oneshot` may run before init stops waiting for it and carries
+/// on with the boot. The one limit nothing else in here provides: every
+/// bounded wait in this file (`wait_socket`, `wait_path`) has a timeout, but
+/// the `waitpid` on a oneshot's child used to have none, so a single wrapper
+/// that never exits hung the WHOLE boot -- no later service started, the
+/// supervision loop was never reached, and because the shutdown flags are only
+/// read in there, Ctrl-Alt-Del did nothing either. The machine was wedged by
+/// one hanging script.
+///
+/// 90 s, the same default as systemd's `TimeoutStartSec`. SMF makes a method
+/// timeout mandatory, OpenRC and launchd have start/exit timeouts; of the
+/// supervisors this init borrows from, only runit leaves a stuck one-shot
+/// alone. Per service with `timeout = <seconds>`, and `timeout = 0` (or
+/// `none`) waits for ever, for the one that genuinely needs to.
+const DEFAULT_ONESHOT_TIMEOUT: Duration = Duration::from_secs(90);
+
+/// How long an overrun oneshot gets between SIGTERM and SIGKILL, and then
+/// between SIGKILL and init giving up on reaping it. Short: by the time this
+/// runs the service has already had its whole timeout.
+const STOP_GRACE: Duration = Duration::from_secs(2);
+
+/// How many times a respawn service may exit WITHOUT ever staying up
+/// [`HEALTHY_UPTIME`] before init stops restarting it for the rest of the
+/// boot.
+///
+/// The backoff ([`MAX_BACKOFF`]) stops a crash loop pinning a CPU, but on its
+/// own it never ends: a service that cannot work prints its death every 8 s
+/// for as long as the machine is on, and that console is the only diagnostic
+/// output the box has -- the storm is what hid everything else on a real boot.
+/// Every other supervisor stops: systemd fails the unit past
+/// `StartLimitBurst`, SMF moves it to `maintenance` when it is "restarting too
+/// quickly", launchd throttles it. Deliberately far more patient than any of
+/// them (systemd gives 5 tries in 10 s): with the backoff doubling to 8 s,
+/// twenty crashes is about two and a half minutes of trying, so nothing that
+/// is merely slow to find its dependency gets written off. The counter resets
+/// the moment the service stays up past [`HEALTHY_UPTIME`].
+const CRASH_START_LIMIT: u32 = 20;
+
 /// Where a respawn service's output goes when its file names no `log =`.
 /// `/tmp`, like every `log =` the images ship: a tmpfs, so it costs no disk
 /// and is empty again on the next boot.
@@ -199,6 +237,10 @@ struct Service {
     cmdline: Option<String>,
     /// If set, child stdout/stderr append here instead of `/dev/null`.
     log: Option<String>,
+    /// `timeout = <seconds>` from the service file: how long a `oneshot` may
+    /// run before init stops waiting for it (see [`start_timeout`]). `None`
+    /// means the file said nothing and the default applies.
+    timeout: Option<Limit>,
     /// Live child pid for a running `respawn` service.
     pid: Option<i32>,
     /// When the current child was last started (for crash-loop backoff).
@@ -232,9 +274,13 @@ struct Service {
     /// service is given up on (`given_up`).
     missing_starts: u32,
     /// Given up on for the rest of this boot: never started again, and left
-    /// out of the restart pass. Set only for an `exec =` that does not exist,
-    /// which is the one failure no retry can change.
+    /// out of the restart pass. Set for an `exec =` that does not exist, and
+    /// for a service that has hit [`CRASH_START_LIMIT`].
     given_up: bool,
+    /// How many times in a row this service has exited without ever staying
+    /// up [`HEALTHY_UPTIME`]. Reset by the first healthy run; at
+    /// [`CRASH_START_LIMIT`] the service is given up on (see [`note_crash`]).
+    crash_starts: u32,
 }
 
 /// Default environment handed to every service (and inherited by their
@@ -1009,6 +1055,7 @@ fn parse_service(name: &str, text: &str) -> Option<Service> {
     let mut log_path: Option<String> = None;
     let mut wait_socket: Option<String> = None;
     let mut wait_path: Option<String> = None;
+    let mut timeout: Option<Limit> = None;
 
     for line in text.lines() {
         let line = line.trim();
@@ -1045,6 +1092,16 @@ fn parse_service(name: &str, text: &str) -> Option<Service> {
             "desktop" => desktop = Some(value.to_string()),
             "cmdline" => cmdline = Some(value.to_string()),
             "log" => log_path = Some(value.to_string()),
+            "timeout" => match parse_limit(value) {
+                Some(limit) => timeout = Some(limit),
+                // Keep the default rather than guess: a typo here would
+                // otherwise silently remove the only limit on a oneshot that
+                // hangs, which is the whole point of the key.
+                None => log(&format!(
+                    "warning: {name}: 'timeout = {value}' is not a number of seconds \
+                     (or 0/none for no limit); using the default"
+                )),
+            },
             "wait_socket" => wait_socket = Some(value.to_string()),
             "wait_path" => wait_path = Some(value.to_string()),
             // Same reason: a misspelled key is a gate that does not exist.
@@ -1080,6 +1137,7 @@ fn parse_service(name: &str, text: &str) -> Option<Service> {
         desktop,
         cmdline,
         log: log_path,
+        timeout,
         wait_socket,
         wait_path,
         pid: None,
@@ -1088,6 +1146,7 @@ fn parse_service(name: &str, text: &str) -> Option<Service> {
         restart_at: None,
         missing_starts: 0,
         given_up: false,
+        crash_starts: 0,
     })
 }
 
@@ -1209,6 +1268,34 @@ fn note_missing_exec(svc: &mut Service) -> bool {
     true
 }
 
+/// Count a respawn service's exit and say whether init has just given up on
+/// it for the rest of the boot.
+///
+/// The missing piece next to the backoff: the backoff makes a crash loop cheap
+/// but never ends it, so a service that cannot work keeps printing its death
+/// every [`MAX_BACKOFF`] for as long as the machine is on -- see
+/// [`CRASH_START_LIMIT`] for why that matters on a console-only box and what
+/// the other supervisors do. A single healthy run (past [`HEALTHY_UPTIME`])
+/// clears the count, so this only ever fires on a service that has never once
+/// come up.
+///
+/// Its own function, out of [`supervise`], because that one blocks in
+/// `waitpid` for the life of the machine.
+fn note_crash(svc: &mut Service, uptime: Duration) -> bool {
+    if uptime >= HEALTHY_UPTIME {
+        svc.crash_starts = 0;
+        return false;
+    }
+    svc.crash_starts += 1;
+    if svc.crash_starts < CRASH_START_LIMIT {
+        return false;
+    }
+    svc.given_up = true;
+    svc.pid = None;
+    svc.restart_at = None;
+    true
+}
+
 /// Is this `exec =` an absolute path with no file behind it?
 ///
 /// The one failure [`exec_problem`] reports that no retry and no repair can
@@ -1262,8 +1349,163 @@ fn repair_exec_mode(prog: &str) -> Option<String> {
     }
 }
 
-/// Start a service. `oneshot` runs to completion (blocking) before returning;
-/// `respawn` is forked and its pid recorded for the supervision loop.
+/// A `timeout =` as written in a service file.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Limit {
+    /// Give up waiting after this long.
+    After(Duration),
+    /// Wait as long as it takes (`timeout = 0`, `timeout = none`).
+    Never,
+}
+
+/// Parse a `timeout =` value: whole seconds, or `0`/`none`/`never`/`infinity`
+/// for no limit. `None` for anything else, so a typo keeps the default instead
+/// of removing the limit.
+fn parse_limit(value: &str) -> Option<Limit> {
+    match value {
+        "none" | "never" | "infinity" => return Some(Limit::Never),
+        _ => {}
+    }
+    let secs: u64 = value.parse().ok()?;
+    if secs == 0 {
+        Some(Limit::Never)
+    } else {
+        Some(Limit::After(Duration::from_secs(secs)))
+    }
+}
+
+/// How long init waits for a service's child, given what its file asked for.
+///
+/// A `respawn` service is never waited for (the supervision loop owns it), so
+/// it has no start timeout however its file is written -- answering `None`
+/// here rather than letting a `timeout =` on a respawn service look like it
+/// does something. A `oneshot` gets what it asked for, or
+/// [`DEFAULT_ONESHOT_TIMEOUT`].
+fn start_timeout(kind: Kind, asked: Option<Limit>) -> Option<Duration> {
+    if kind != Kind::Oneshot {
+        return None;
+    }
+    match asked {
+        Some(Limit::Never) => None,
+        Some(Limit::After(d)) => Some(d),
+        None => Some(DEFAULT_ONESHOT_TIMEOUT),
+    }
+}
+
+/// What init does about a oneshot still running after `waited`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Overrun {
+    /// Still inside its timeout: keep waiting.
+    Wait,
+    /// Over it: ask it to go (SIGTERM to its process group).
+    Term,
+    /// It ignored SIGTERM: SIGKILL the group.
+    Kill,
+    /// Even SIGKILL has not been reaped (a child stuck in the kernel): stop
+    /// waiting and boot on. The supervision loop reaps it if it ever dies.
+    Abandon,
+}
+
+/// The escalation for an overrun oneshot, as a function of how long it has
+/// been running. Signals its process GROUP, not just the child: every child is
+/// a session leader (`setsid` in [`spawn`]), and the hanging one-shots here are
+/// shell wrappers whose real work is a grandchild, which a kill of the shell
+/// alone would leave running.
+///
+/// Split out of the wait loop, which blocks on a real child, so the policy can
+/// be tested.
+fn overrun_action(waited: Duration, limit: Duration, grace: Duration) -> Overrun {
+    if waited < limit {
+        Overrun::Wait
+    } else if waited < limit + grace {
+        Overrun::Term
+    } else if waited < limit + grace * 2 {
+        Overrun::Kill
+    } else {
+        Overrun::Abandon
+    }
+}
+
+/// Wait for a oneshot's child, bounded by `limit`, and say nothing unless
+/// something is wrong.
+///
+/// The bounded version of the plain blocking `waitpid` this used to be. Why it
+/// has to be bounded at all: see [`DEFAULT_ONESHOT_TIMEOUT`]. Polls rather
+/// than arming a timer because the pacing is already written
+/// ([`poll_step`]) and because a poll is also where a shutdown request gets
+/// noticed -- a Ctrl-Alt-Del during a long oneshot used to wait the oneshot
+/// out, which for a hanging one meant for ever.
+fn await_oneshot(name: &str, pid: i32, limit: Option<Duration>) {
+    let start = Instant::now();
+    let mut termed = false;
+    let mut killed = false;
+    loop {
+        let mut status = 0;
+        // SAFETY: pid is a child of ours; WNOHANG so the loop keeps looking.
+        let done = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+        if done == pid {
+            if libc::WIFEXITED(status) && libc::WEXITSTATUS(status) != 0 {
+                let code = libc::WEXITSTATUS(status);
+                // A oneshot that failed used to be completely silent: nothing
+                // waited on its result and its stdio is its `log =` at best.
+                log(&format!(
+                    "oneshot: {name} failed (exit {code}{})",
+                    exit_note(code)
+                ));
+            } else if libc::WIFSIGNALED(status) && !termed {
+                log(&format!(
+                    "oneshot: {name} was killed by signal {}",
+                    libc::WTERMSIG(status)
+                ));
+            }
+            return;
+        }
+        if done < 0 && errno() != libc::EINTR {
+            // ECHILD: already reaped elsewhere. Anything else is not something
+            // more waiting can fix.
+            return;
+        }
+        if shutdown_requested() {
+            return;
+        }
+        let Some(limit) = limit else {
+            sleep_interruptible(poll_step(start.elapsed()));
+            continue;
+        };
+        match overrun_action(start.elapsed(), limit, STOP_GRACE) {
+            Overrun::Wait => {}
+            Overrun::Term if !termed => {
+                termed = true;
+                log(&format!(
+                    "oneshot: {name} is still running after {limit:?}; terminating it and \
+                     carrying on with the boot (raise or remove the limit with \
+                     'timeout = <seconds>' / 'timeout = 0' in its .service file)"
+                ));
+                // SAFETY: signalling the child's own process group.
+                unsafe { libc::kill(-pid, libc::SIGTERM) };
+            }
+            Overrun::Kill if !killed => {
+                killed = true;
+                log(&format!("oneshot: {name} ignored SIGTERM; killing it"));
+                // SAFETY: as above.
+                unsafe { libc::kill(-pid, libc::SIGKILL) };
+            }
+            Overrun::Term | Overrun::Kill => {}
+            Overrun::Abandon => {
+                log(&format!(
+                    "oneshot: {name} did not die even on SIGKILL (stuck in the kernel?); \
+                     booting on without it"
+                ));
+                return;
+            }
+        }
+        sleep_interruptible(poll_step(start.elapsed()));
+    }
+}
+
+/// Start a service. `oneshot` runs to completion (bounded, see
+/// [`await_oneshot`]) before returning; `respawn` is forked and its pid
+/// recorded for the supervision loop.
 fn start_service(svc: &mut Service) {
     // `after =` only orders the dependency's FORK; its socket may lag. Wait
     // natively here (both first start and crash-restarts pass through) so the
@@ -1313,10 +1555,9 @@ fn start_service(svc: &mut Service) {
         Kind::Oneshot => {
             log(&format!("oneshot: {}", svc.name));
             if let Some(pid) = spawn(&svc.exec, svc.log.as_deref()) {
-                // Wait specifically for this child to finish.
-                let mut status = 0;
-                // SAFETY: pid is a child of ours.
-                unsafe { libc::waitpid(pid, &mut status, 0) };
+                // Wait for this child specifically -- but not for ever: a
+                // oneshot that never exits used to hang the whole boot.
+                await_oneshot(&svc.name, pid, start_timeout(svc.kind, svc.timeout));
             }
         }
         Kind::Respawn => {
@@ -2044,19 +2285,40 @@ fn supervise(services: &mut BTreeMap<String, Service>) {
                     ));
                 }
             }
-            let (wait, next) = restart_delay(uptime, svc.backoff);
-            svc.backoff = next;
-            svc.restart_at = Some(Instant::now() + wait);
-            if wait.is_zero() {
+            // Has it now crashed so many times in a row that retrying it is
+            // only costing the console? Checked before the restart is even
+            // scheduled, so a service given up on here never gets a deadline.
+            if note_crash(svc, uptime) {
                 log(&format!(
-                    "respawn: {} exited after {:?} ({}), restarting",
-                    svc.name, uptime, how
+                    "respawn: {} exited after {:?} ({}) and has now failed {} times in a \
+                     row without ever staying up {:?}; giving up on it for the rest of \
+                     this boot, so the console stays readable for everything else.{} \
+                     Fix the cause and reboot.",
+                    svc.name,
+                    uptime,
+                    how,
+                    svc.crash_starts,
+                    HEALTHY_UPTIME,
+                    svc.log
+                        .as_deref()
+                        .map(|p| format!(" Its own output is in {p}."))
+                        .unwrap_or_default(),
                 ));
             } else {
-                log(&format!(
-                    "respawn: {} exited after {:?} ({}, crash), retry in {:?}",
-                    svc.name, uptime, how, wait
-                ));
+                let (wait, next) = restart_delay(uptime, svc.backoff);
+                svc.backoff = next;
+                svc.restart_at = Some(Instant::now() + wait);
+                if wait.is_zero() {
+                    log(&format!(
+                        "respawn: {} exited after {:?} ({}), restarting",
+                        svc.name, uptime, how
+                    ));
+                } else {
+                    log(&format!(
+                        "respawn: {} exited after {:?} ({}, crash), retry in {:?}",
+                        svc.name, uptime, how, wait
+                    ));
+                }
             }
         }
         // Otherwise it was a oneshot's leftover or a reparented orphan: reaped.
@@ -2587,6 +2849,123 @@ mod tests {
             due.contains(&"crasher".to_string()),
             "el servicio no volvio nunca tras su backoff: {due:?}"
         );
+    }
+
+    // -- A oneshot that never exits -----------------------------------------
+
+    /// The hole this closes: every bounded wait in this file has a timeout,
+    /// but the `waitpid` on a oneshot's child had none, so ONE wrapper that
+    /// never exited hung the whole boot -- no later service was started, the
+    /// supervision loop was never reached, and the shutdown flags are only
+    /// read in there, so Ctrl-Alt-Del did nothing either.
+    #[test]
+    fn a_oneshot_gets_a_start_timeout_and_a_respawn_service_does_not() {
+        let oneshot =
+            parse_service("boot-sound", "exec = /bin/foo\ntype = oneshot\n").expect("parsea");
+        assert_eq!(
+            start_timeout(oneshot.kind, oneshot.timeout),
+            Some(DEFAULT_ONESHOT_TIMEOUT),
+            "un oneshot sin 'timeout =' se quedo sin limite: un script colgado cuelga el arranque"
+        );
+
+        // A respawn service is never waited for -- the supervision loop owns
+        // it -- so it has no start timeout however its file is written.
+        let respawn = parse_service("labwc", "exec = /bin/foo\ntype = respawn\ntimeout = 5\n")
+            .expect("parsea");
+        assert_eq!(start_timeout(respawn.kind, respawn.timeout), None);
+    }
+
+    #[test]
+    fn the_timeout_key_takes_seconds_and_zero_means_wait_for_ever() {
+        assert_eq!(parse_limit("5"), Some(Limit::After(Duration::from_secs(5))));
+        assert_eq!(parse_limit("0"), Some(Limit::Never));
+        assert_eq!(parse_limit("none"), Some(Limit::Never));
+        assert_eq!(parse_limit("never"), Some(Limit::Never));
+        // Not a number of seconds: `None`, so `parse_service` keeps the
+        // default. Accepting a typo as "no limit" would silently restore the
+        // hang this key exists to stop.
+        assert_eq!(parse_limit("30s"), None);
+        assert_eq!(parse_limit(""), None);
+        assert_eq!(parse_limit("-1"), None);
+
+        let svc =
+            parse_service("x", "exec = /bin/foo\ntype = oneshot\ntimeout = 30s\n").expect("parsea");
+        assert_eq!(
+            start_timeout(svc.kind, svc.timeout),
+            Some(DEFAULT_ONESHOT_TIMEOUT),
+            "un 'timeout =' mal escrito dejo al oneshot sin limite"
+        );
+
+        let forever =
+            parse_service("x", "exec = /bin/foo\ntype = oneshot\ntimeout = 0\n").expect("parsea");
+        assert_eq!(start_timeout(forever.kind, forever.timeout), None);
+    }
+
+    /// SIGTERM, then SIGKILL, then boot on regardless: the last step matters
+    /// as much as the first, because a child wedged inside the kernel never
+    /// gets reaped and waiting on it is the hang all over again.
+    #[test]
+    fn an_overrun_oneshot_is_asked_then_killed_then_left_behind() {
+        let limit = Duration::from_secs(90);
+        let grace = Duration::from_secs(2);
+        let at = |secs| overrun_action(Duration::from_secs(secs), limit, grace);
+        assert_eq!(at(0), Overrun::Wait);
+        assert_eq!(at(89), Overrun::Wait);
+        assert_eq!(at(90), Overrun::Term);
+        assert_eq!(at(91), Overrun::Term);
+        assert_eq!(at(92), Overrun::Kill);
+        assert_eq!(at(93), Overrun::Kill);
+        assert_eq!(at(94), Overrun::Abandon);
+        assert_eq!(at(600), Overrun::Abandon);
+    }
+
+    // -- A respawn service that can never work ------------------------------
+
+    /// The backoff makes a crash loop cheap but never ends it: before this, a
+    /// service that could not work printed its death every `MAX_BACKOFF` for
+    /// as long as the machine was on, and that console is the only diagnostic
+    /// output the box has.
+    #[test]
+    fn a_service_that_never_comes_up_is_given_up_on_instead_of_retried_for_ever() {
+        let mut svc =
+            parse_service("crasher", "exec = /bin/foo\ntype = respawn\n").expect("parsea");
+        let crash = Duration::from_millis(40);
+        for n in 1..CRASH_START_LIMIT {
+            assert!(
+                !note_crash(&mut svc, crash),
+                "se rindio en el intento {n}, antes del limite"
+            );
+            assert!(!svc.given_up);
+        }
+        assert!(
+            note_crash(&mut svc, crash),
+            "nunca se rindio: la consola sigue llenandose cada {MAX_BACKOFF:?} para siempre"
+        );
+        assert!(svc.given_up);
+        assert!(svc.restart_at.is_none());
+
+        // And the restart pass leaves it alone from then on.
+        let mut map = BTreeMap::new();
+        map.insert("crasher".to_string(), svc);
+        assert!(due_names(&map, Instant::now()).is_empty());
+    }
+
+    /// One healthy run clears the count, so a service that is merely slow to
+    /// find its dependency is never written off: this only ever fires on a
+    /// service that has not once come up since boot.
+    #[test]
+    fn one_healthy_run_clears_the_crash_count() {
+        let mut svc = parse_service("slow", "exec = /bin/foo\ntype = respawn\n").expect("parsea");
+        for _ in 0..CRASH_START_LIMIT - 1 {
+            note_crash(&mut svc, Duration::from_millis(40));
+        }
+        assert_eq!(svc.crash_starts, CRASH_START_LIMIT - 1);
+        assert!(!note_crash(&mut svc, HEALTHY_UPTIME));
+        assert_eq!(svc.crash_starts, 0, "una vuelta sana no reinicio la cuenta");
+        assert!(!svc.given_up);
+        // Exactly HEALTHY_UPTIME counts as healthy, the same boundary
+        // `restart_delay` uses, or the two would disagree about one instant.
+        assert_eq!(restart_delay(HEALTHY_UPTIME, MAX_BACKOFF).0, Duration::ZERO);
     }
 
     /// 126 and 127 are the only exit codes that are not the program's opinion
