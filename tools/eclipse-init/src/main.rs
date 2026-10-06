@@ -211,6 +211,12 @@ struct Service {
     kind: Kind,
     /// Names of services that must be started before this one.
     after: Vec<String>,
+    /// Names of services this one CANNOT work without: systemd's `Requires=`
+    /// to `after =`'s `After=`. When a requirement is given up on for the boot
+    /// (a missing `exec =`, or [`CRASH_START_LIMIT`] crashes), so is this
+    /// service -- see [`blocked_by_requirements`]. Every name here is also an
+    /// `after =`, so a requirement is always ordered first.
+    requires: Vec<String>,
     /// Unix socket path to wait for (bounded) before every start of this
     /// service — `after =` only orders the FORK of the dependency, not its
     /// readiness. Waiting natively here (a 10 ms stat poll) replaced the
@@ -485,6 +491,13 @@ fn main() {
         // Re-check shutdown between starts so a SIGTERM during boot is honoured.
         if WANT_HALT.load(Ordering::SeqCst) || WANT_REBOOT.load(Ordering::SeqCst) {
             break;
+        }
+        // A requirement given up on during this very loop (a missing `exec =`
+        // is noticed at its first start) writes off what is behind it before
+        // the boot gets there.
+        report_given_up(&mut services);
+        if services.get(name).is_some_and(|s| s.given_up) {
+            continue;
         }
         start_service(services.get_mut(name).expect("known service"));
     }
@@ -1050,6 +1063,7 @@ fn parse_service(name: &str, text: &str) -> Option<Service> {
     let mut exec: Vec<String> = Vec::new();
     let mut kind = Kind::Oneshot;
     let mut after: Vec<String> = Vec::new();
+    let mut requires: Vec<String> = Vec::new();
     let mut desktop: Option<String> = None;
     let mut cmdline: Option<String> = None;
     let mut log_path: Option<String> = None;
@@ -1089,6 +1103,7 @@ fn parse_service(name: &str, text: &str) -> Option<Service> {
                 }
             }
             "after" => after = value.split_whitespace().map(String::from).collect(),
+            "requires" => requires = value.split_whitespace().map(String::from).collect(),
             "desktop" => desktop = Some(value.to_string()),
             "cmdline" => cmdline = Some(value.to_string()),
             "log" => log_path = Some(value.to_string()),
@@ -1114,6 +1129,15 @@ fn parse_service(name: &str, text: &str) -> Option<Service> {
     if exec.is_empty() {
         return None;
     }
+    // A requirement is an ordering too, so `requires =` alone is enough and
+    // cannot be written in a way that starts the dependent first. systemd keeps
+    // `Requires=` and `After=` independent and this is the trap it leaves: a
+    // unit that requires another but is not ordered after it starts beside it.
+    for name in &requires {
+        if !after.iter().any(|a| a == name) {
+            after.push(name.clone());
+        }
+    }
     // A supervised service with nowhere to write keeps its reason to itself.
     // Its stdout/stderr go to /dev/null (see `silence_stdio`), so when it dies
     // the only thing anybody has is the number on the console -- and the
@@ -1134,6 +1158,7 @@ fn parse_service(name: &str, text: &str) -> Option<Service> {
         exec,
         kind,
         after,
+        requires,
         desktop,
         cmdline,
         log: log_path,
@@ -1266,6 +1291,69 @@ fn note_missing_exec(svc: &mut Service) -> bool {
         svc.name, svc.missing_starts, prog
     ));
     true
+}
+
+/// Which services can never work for the rest of this boot because something
+/// they `requires =` has been given up on, and which requirement it is.
+///
+/// Transitive, so a chain goes with it: with `seatd` given up, `labwc` is
+/// hopeless, and so are `lunarbar` and `lunarbg` behind it. Without this,
+/// every one of them burned [`CRASH_START_LIMIT`] starts -- each paying its
+/// bounded `wait_socket` gate, 10 s of it for labwc -- against a socket
+/// nothing was ever going to create, and the console carried their deaths
+/// instead of the one failure that mattered.
+///
+/// A name that is not a service in this boot's set is ignored, exactly as
+/// [`ordered_names`] ignores it: a requirement that does not exist cannot be
+/// reported as failed, and treating it as failure would disable services on
+/// an image whose session dropped the dependency.
+fn blocked_by_requirements(services: &BTreeMap<String, Service>) -> BTreeMap<String, String> {
+    let mut blocked: BTreeMap<String, String> = BTreeMap::new();
+    loop {
+        let mut added = false;
+        for (name, svc) in services {
+            if svc.given_up || blocked.contains_key(name) {
+                continue;
+            }
+            let failed = svc.requires.iter().find(|dep| {
+                services
+                    .get(*dep)
+                    .is_some_and(|d| d.given_up || blocked.contains_key(*dep))
+            });
+            if let Some(dep) = failed {
+                blocked.insert(name.clone(), dep.clone());
+                added = true;
+            }
+        }
+        if !added {
+            return blocked;
+        }
+    }
+}
+
+/// Give up on every service whose requirement has been given up on, and return
+/// what to log: `(service, the requirement that failed)` for each one newly
+/// written off. Idempotent -- a service already given up on is not reported
+/// twice.
+fn propagate_given_up(services: &mut BTreeMap<String, Service>) -> Vec<(String, String)> {
+    let blocked = blocked_by_requirements(services);
+    for name in blocked.keys() {
+        if let Some(svc) = services.get_mut(name) {
+            svc.given_up = true;
+            svc.restart_at = None;
+        }
+    }
+    blocked.into_iter().collect()
+}
+
+/// Log, once each, the services [`propagate_given_up`] has just written off.
+fn report_given_up(services: &mut BTreeMap<String, Service>) {
+    for (name, dep) in propagate_given_up(services) {
+        log(&format!(
+            "{name}: not starting it -- it requires {dep}, which init has given up on for \
+             this boot. Fix {dep} and reboot."
+        ));
+    }
 }
 
 /// Count a respawn service's exit and say whether init has just given up on
@@ -2408,6 +2496,11 @@ fn restart_due(services: &mut BTreeMap<String, Service>) {
     if WANT_HALT.load(Ordering::SeqCst) || WANT_REBOOT.load(Ordering::SeqCst) {
         return;
     }
+    // A service whose requirement has just been given up on is hopeless too:
+    // write it off here rather than let it burn its own CRASH_START_LIMIT
+    // starts, each paying its bounded wait gate, against something that will
+    // never arrive.
+    report_given_up(services);
     for name in due_names(services, Instant::now()) {
         if let Some(svc) = services.get_mut(&name) {
             start_service(svc);
@@ -3003,6 +3096,98 @@ mod tests {
         let mut map = BTreeMap::new();
         map.insert("crasher".to_string(), svc);
         assert!(due_names(&map, Instant::now()).is_empty());
+    }
+
+    // -- A requirement that was given up on ---------------------------------
+
+    fn respawn_svc(name: &str, extra: &str) -> Service {
+        parse_service(name, &format!("exec = /bin/foo\ntype = respawn\n{extra}")).expect("parsea")
+    }
+
+    /// With `seatd` written off, labwc is hopeless and so is everything behind
+    /// it. Before this, each of them burned its own CRASH_START_LIMIT starts --
+    /// labwc paying a 10 s `wait_socket` gate every time -- against a socket
+    /// nothing was ever going to create, and the console carried their deaths
+    /// instead of the one failure that mattered.
+    #[test]
+    fn giving_up_on_a_requirement_gives_up_on_the_chain_behind_it() {
+        let mut map = BTreeMap::new();
+        map.insert("seatd".to_string(), respawn_svc("seatd", ""));
+        map.insert(
+            "labwc".to_string(),
+            respawn_svc("labwc", "requires = seatd\n"),
+        );
+        map.insert(
+            "lunarbar".to_string(),
+            respawn_svc("lunarbar", "requires = labwc\n"),
+        );
+        // Ordered after labwc but not requiring it: unaffected.
+        map.insert(
+            "oopslog".to_string(),
+            respawn_svc("oopslog", "after = labwc\n"),
+        );
+
+        // Nothing has failed yet, so nothing is blocked.
+        assert!(propagate_given_up(&mut map).is_empty());
+
+        map.get_mut("seatd").unwrap().given_up = true;
+        let blocked = propagate_given_up(&mut map);
+        assert_eq!(
+            blocked,
+            vec![
+                ("labwc".to_string(), "seatd".to_string()),
+                ("lunarbar".to_string(), "labwc".to_string()),
+            ],
+            "la cadena detras de un requisito perdido no se propago: {blocked:?}"
+        );
+        assert!(map["labwc"].given_up && map["lunarbar"].given_up);
+        assert!(
+            !map["oopslog"].given_up,
+            "un 'after =' que no es requisito no debe arrastrar a nadie"
+        );
+
+        // Reported once: the second pass has nothing to say.
+        assert!(propagate_given_up(&mut map).is_empty());
+        // And the restart pass leaves the written-off ones alone.
+        let due = due_names(&map, Instant::now());
+        assert_eq!(due, vec!["oopslog".to_string()], "{due:?}");
+    }
+
+    /// A `requires =` is an ordering too, so the trap systemd leaves -- a unit
+    /// that requires another without being ordered after it, and so starts
+    /// beside it -- cannot be written here.
+    #[test]
+    fn a_requirement_is_ordered_first_even_with_no_after_line() {
+        let svc = respawn_svc("labwc", "requires = seatd\n");
+        assert!(svc.after.contains(&"seatd".to_string()));
+
+        let mut map = BTreeMap::new();
+        map.insert("labwc".to_string(), svc);
+        map.insert("seatd".to_string(), respawn_svc("seatd", ""));
+        let order = ordered_names(&map);
+        assert_eq!(
+            order,
+            vec!["seatd".to_string(), "labwc".to_string()],
+            "{order:?}"
+        );
+
+        // Named twice, it is still one entry.
+        let both = respawn_svc("labwc", "after = seatd dbus\nrequires = seatd\n");
+        assert_eq!(both.after, vec!["seatd".to_string(), "dbus".to_string()]);
+    }
+
+    /// A requirement that is not a service of this boot is ignored, exactly as
+    /// `ordered_names` ignores it: the session that dropped it would otherwise
+    /// lose every service behind it.
+    #[test]
+    fn a_requirement_that_does_not_exist_blocks_nobody() {
+        let mut map = BTreeMap::new();
+        map.insert(
+            "lunarbar".to_string(),
+            respawn_svc("lunarbar", "requires = labwc\n"),
+        );
+        assert!(propagate_given_up(&mut map).is_empty());
+        assert!(!map["lunarbar"].given_up);
     }
 
     /// One healthy run clears the count, so a service that is merely slow to

@@ -3315,6 +3315,15 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
               # exec  = /usr/sbin/mydaemon --foreground   (required; argv, space-split)\n\
               # type  = respawn                            (respawn | oneshot; default oneshot)\n\
               # after = othersvc                           (optional; space-separated deps)\n\
+              # requires = othersvc                        (optional; deps this service\n\
+              #                                             CANNOT work without -- if one\n\
+              #                                             is given up on for the boot, so\n\
+              #                                             is this service. Implies after)\n\
+              # timeout = 90                               (optional; seconds a 'oneshot'\n\
+              #                                             may run before init stops\n\
+              #                                             waiting and kills it. 0 or\n\
+              #                                             'none' waits for ever;\n\
+              #                                             default 90)\n\
               # cmdline = dbus.selftest                     (optional; start only when\n\
               #                                              this token is on the\n\
               #                                              kernel command line)\n\
@@ -3422,6 +3431,7 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
               exec = /bin/eclipse-dbusd --selftest\n\
               type = oneshot\n\
               after = dbus\n\
+              requires = dbus\n\
               cmdline = dbus.selftest\n\
               wait_socket = /run/user/0/bus\n\
               log = /dev/console\n",
@@ -3456,6 +3466,7 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
               exec = /usr/local/bin/labwc\n\
               type = respawn\n\
               after = seatd gtk-caches dbus\n\
+              requires = seatd\n\
               wait_socket = /run/seatd.sock\n\
               wait_path = /dev/input\n\
               desktop = labwc\n\
@@ -3478,6 +3489,7 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
               exec = /usr/local/bin/eclipse-lunarbg\n\
               type = respawn\n\
               after = labwc\n\
+              requires = labwc\n\
               wait_socket = /run/user/0/wayland-0\n\
               desktop = labwc\n",
         )
@@ -3488,6 +3500,7 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
               exec = /usr/local/bin/eclipse-lunarbar\n\
               type = respawn\n\
               after = labwc\n\
+              requires = labwc\n\
               wait_socket = /run/user/0/wayland-0\n\
               desktop = labwc\n",
         )
@@ -3505,6 +3518,7 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
               exec = /usr/local/bin/eclipse-xkbmap\n\
               type = oneshot\n\
               after = labwc\n\
+              requires = labwc\n\
               wait_socket = /run/user/0/wayland-0\n\
               desktop = labwc\n",
         )
@@ -3551,6 +3565,7 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
               exec = /usr/local/bin/eclipse-boot-sound\n\
               type = oneshot\n\
               after = pulseaudio lunarbar\n\
+              requires = pulseaudio lunarbar\n\
               wait_socket = /run/user/0/wayland-0\n\
               desktop = labwc\n\
               log = /tmp/boot-sound.log\n",
@@ -3562,6 +3577,7 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
               exec = /usr/local/bin/eclipse-boot-sound\n\
               type = oneshot\n\
               after = pulseaudio xorg\n\
+              requires = pulseaudio xorg\n\
               desktop = xorg\n\
               log = /tmp/boot-sound.log\n",
         )
@@ -4849,6 +4865,78 @@ mod rootfs_plumbing_tests {
 
     /// The `exec`s of the table that are written somewhere else, and by whom.
     const WRITTEN_BY_DESKTOP_RS: &[&str] = &["labwc", "eclipse-gtk-caches", "eclipse-xkbmap"];
+
+    /// `requires =` is the key that lets init stop a service whose dependency
+    /// it has written off for the boot, instead of letting it burn its own
+    /// twenty crash-restarts -- each paying its bounded `wait_socket` gate --
+    /// against something that will never arrive. Two things have to hold of
+    /// every one of them, and neither is visible from the service file alone:
+    ///
+    ///  * the name is a service this image really writes, because init ignores
+    ///    a requirement that is not in the boot's set (a typo would therefore
+    ///    be silent, which is how `wait_sockt =` raced labwc against seatd for
+    ///    months),
+    ///  * and nothing requires itself, which would write the service off the
+    ///    moment anything behind it failed.
+    ///
+    /// The ordering half (`requires =` implies `after =`) is init's own job
+    /// and tested there.
+    #[test]
+    fn every_requirement_names_a_service_this_image_writes() {
+        let rootfs = init_rootfs("init-requires");
+        let all = services(&rootfs);
+        let names: Vec<&str> = all.iter().map(|(n, _)| n.as_str()).collect();
+        let mut seen = 0;
+        for (name, body) in &all {
+            for dep in field(body, "requires")
+                .unwrap_or_default()
+                .split_whitespace()
+            {
+                seen += 1;
+                assert!(
+                    names.contains(&dep),
+                    "{name}.service requiere '{dep}', que no es ningun servicio de la imagen: {names:?}"
+                );
+                assert_ne!(dep, name.as_str(), "{name}.service se requiere a si mismo");
+            }
+        }
+        assert!(seen >= 8, "solo {seen} requisitos: alguno se ha perdido");
+        let _ = fs::remove_dir_all(&rootfs);
+    }
+
+    /// The requirements that are not a judgement call: a service whose
+    /// `wait_socket =` is the socket ANOTHER service creates cannot work
+    /// without it, so when that one is given up on this one is hopeless too.
+    /// Spelled out because the opposite -- a service missing its `requires =`
+    /// -- is invisible: it just goes back to crash-looping for two and a half
+    /// minutes against a socket nobody will bind.
+    #[test]
+    fn a_service_gated_on_another_services_socket_requires_it() {
+        let rootfs = init_rootfs("init-requires-sockets");
+        for (name, dep) in [
+            ("labwc", "seatd"),           // /run/seatd.sock
+            ("lunarbar", "labwc"),        // /run/user/0/wayland-0
+            ("lunarbg", "labwc"),         //      ""
+            ("xkbmap", "labwc"),          //      ""
+            ("dbus-selftest", "dbus"),    // /run/user/0/bus
+            ("boot-sound", "pulseaudio"), // no sound server, no chime
+            ("boot-sound-xorg", "pulseaudio"),
+        ] {
+            let body = fs::read_to_string(
+                rootfs
+                    .join("etc/eclipse/services")
+                    .join(format!("{name}.service")),
+            )
+            .unwrap();
+            let requires = field(&body, "requires").unwrap_or_default();
+            assert!(
+                requires.split_whitespace().any(|d| d == dep),
+                "{name}.service no requiere '{dep}' (requires = {requires:?}): volvera a \
+                 reintentar veinte veces contra algo que nadie va a crear"
+            );
+        }
+        let _ = fs::remove_dir_all(&rootfs);
+    }
 
     /// Every service the image boots with: the program it runs, whether init
     /// supervises it or waits for it to finish, and what it starts after.
