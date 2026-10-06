@@ -3593,6 +3593,32 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
               # Wait for PulseAudio (or a raw PCM), unmute, play the startup MP3 once.\n\
               MP3=/usr/share/eclipse/Eclipse_Awakening.mp3\n\
               [ -f \"$MP3\" ] || { echo \"eclipse-boot-sound: missing $MP3\" >&2; exit 0; }\n\
+              # Every mpg123 here runs under a watchdog. A player wedged in the\n\
+              # audio path never comes back on its own, and it holds the PCM for\n\
+              # the whole session (the device is exclusive: every later open\n\
+              # answers EBUSY), so the chime would cost all later sound. The\n\
+              # track is a few seconds long; anything past MAXPLAY is stuck.\n\
+              MAXPLAY=20\n\
+              play() {\n\
+              \x20 mpg123 \"$@\" &\n\
+              \x20 p=$!\n\
+              \x20 ( i=0\n\
+              \x20\x20 while [ \"$i\" -lt \"$MAXPLAY\" ]; do\n\
+              \x20\x20\x20 kill -0 \"$p\" 2>/dev/null || exit 0\n\
+              \x20\x20\x20 i=$((i + 1))\n\
+              \x20\x20\x20 sleep 1\n\
+              \x20\x20 done\n\
+              \x20\x20 echo \"eclipse-boot-sound: mpg123 stuck after ${MAXPLAY}s; killing it\" >&2\n\
+              \x20\x20 kill -TERM \"$p\" 2>/dev/null\n\
+              \x20\x20 sleep 1\n\
+              \x20\x20 kill -KILL \"$p\" 2>/dev/null ) &\n\
+              \x20 w=$!\n\
+              \x20 wait \"$p\"\n\
+              \x20 r=$?\n\
+              \x20 kill \"$w\" 2>/dev/null\n\
+              \x20 wait \"$w\" 2>/dev/null\n\
+              \x20 return \"$r\"\n\
+              }\n\
               i=0\n\
               while [ \"$i\" -lt 20 ]; do\n\
               \x20 if [ -S /run/pulse/native ] || [ -e /dev/snd/pcmC0D0p ] || [ -e /dev/dsp ]; then\n\
@@ -3628,8 +3654,8 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
               \x20\x20 # Both invocations name their modules. With no -o at all,\n\
               \x20\x20 # libout123 walks its built-in list and takes the first\n\
               \x20\x20 # driver that opens, which is not necessarily this one.\n\
-              \x20\x20 mpg123 -q -o alsa --encoding s16 --no-gapless \"$MP3\" \\\n\
-              \x20\x20\x20 || mpg123 -q -o pulse,alsa,oss --encoding s16 --no-gapless \"$MP3\"\n\
+              \x20\x20 play -q -o alsa --encoding s16 --no-gapless \"$MP3\" \\\n\
+              \x20\x20\x20 || play -q -o pulse,alsa,oss --encoding s16 --no-gapless \"$MP3\"\n\
               \x20\x20 pactl drain 2>/dev/null || true\n\
               \x20\x20 # Do NOT suspend the sink here: suspending it (this line used\n\
               \x20\x20 # to `suspend-sink 1`) left the whole session on the broken\n\
@@ -3640,7 +3666,7 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
               \x20 else\n\
               \x20\x20 # No daemon socket: the pulse plugin cannot answer, so try\n\
               \x20\x20 # a direct card and then the OSS shim.\n\
-              \x20\x20 mpg123 -q -o alsa,oss --encoding s16 --no-gapless \"$MP3\"\n\
+              \x20\x20 play -q -o alsa,oss --encoding s16 --no-gapless \"$MP3\"\n\
               \x20 fi\n\
               \x20 exit 0\n\
               fi\n\
@@ -5432,6 +5458,34 @@ mod rootfs_plumbing_tests {
         assert!(
             body.trim_end().ends_with("exit 0"),
             "the oneshot does not return success"
+        );
+    }
+
+    /// A wedged mpg123 never comes back on its own, and it holds the PCM for
+    /// the whole session (the device is exclusive), so the chime runs every
+    /// player under a watchdog that kills it. No bare `mpg123` is left.
+    #[test]
+    fn every_player_the_chime_starts_is_killed_if_it_wedges() {
+        let rootfs = init_rootfs("chime-watchdog");
+        let body = wrapper(&rootfs, "eclipse-boot-sound-play");
+        assert!(
+            body.contains("play() {") && body.contains("MAXPLAY="),
+            "the chime lost its bounded player:\n{body}"
+        );
+        assert!(
+            body.contains("kill -KILL \"$p\""),
+            "nothing kills a player that ignores SIGTERM:\n{body}"
+        );
+        for line in body.lines().map(str::trim) {
+            // Inside the helper, and the "not installed" probe, are the only
+            // places the name may appear bare.
+            if line.starts_with("mpg123 ") && !line.starts_with("mpg123 \"$@\"") {
+                panic!("a player outside the watchdog: {line}");
+            }
+        }
+        assert!(
+            body.contains("play -q -o alsa ") && body.contains("play -q -o alsa,oss "),
+            "a playback path stopped going through the watchdog:\n{body}"
         );
     }
 
