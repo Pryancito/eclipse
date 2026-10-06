@@ -58,19 +58,27 @@ static TICK_GAP_LAST_LATE_AT_NS: AtomicU64 = AtomicU64::new(0);
 static TICK_GAP_LAST_BUSY_NS_PERCPU: [AtomicU64; MAX_CORE_NUM] =
     [const { AtomicU64::new(0) }; MAX_CORE_NUM];
 
-/// [diag] The interrupted RIP of the tick that set [`TICK_GAP_MAX_NS`].
+/// [diag] Each CPU's own longest busy gap, and the RIP the tick that set it
+/// interrupted.
 ///
-/// The gap says a busy CPU went that long without a tick; this says *where it
-/// was* when the tick finally landed. On this kernel the lock that protects
+/// The gap says a busy CPU went that long without a tick; the RIP says *where
+/// it was* when the tick finally landed. On this kernel the lock that protects
 /// almost everything disables interrupts for its whole critical section
 /// (`kernel-sync`'s `push_off`), so a multi-second gap on a busy CPU is a
 /// multi-second critical section, and the only thing missing to name it is an
-/// address. Symbolize with addr2line.
+/// address.
 ///
-/// Written only by the tick that *won* the maximum -- `fetch_max` returns the
-/// previous value, so the winner is exactly the one it was smaller than -- which
-/// is what keeps the address and the gap describing the same tick.
-static TICK_GAP_MAX_RIP: AtomicU64 = AtomicU64::new(0);
+/// Per-CPU, and the maximum taken at *read* time, because the pair has to
+/// describe one tick. Two globals updated separately cannot: a CPU that wins
+/// `fetch_max`, is overtaken by a bigger gap on another CPU, and only then
+/// stores its RIP leaves the number and the address describing different
+/// events -- and the address is the whole point. Each slot here is written
+/// only by its owning CPU, from the tick interrupt with interrupts already
+/// off, so the two halves of a slot cannot disagree.
+static TICK_GAP_MAX_NS_PERCPU: [AtomicU64; MAX_CORE_NUM] =
+    [const { AtomicU64::new(0) }; MAX_CORE_NUM];
+static TICK_GAP_MAX_RIP_PERCPU: [AtomicU64; MAX_CORE_NUM] =
+    [const { AtomicU64::new(0) }; MAX_CORE_NUM];
 
 /// [diag] How long this CPU went without a tick, last time it took one while
 /// busy; 0 when the last tick interrupted a halt or there is nothing recorded.
@@ -86,10 +94,25 @@ pub fn last_busy_tick_gap_ns() -> u64 {
     TICK_GAP_LAST_BUSY_NS_PERCPU[cpu].load(Relaxed)
 }
 
-/// [diag] Where the CPU was when the longest busy tick gap finally ended.
-/// 0 when no busy gap has been recorded. See [`TICK_GAP_MAX_RIP`].
-pub fn tick_gap_max_rip() -> u64 {
-    TICK_GAP_MAX_RIP.load(Relaxed)
+/// [diag] Where the CPU was when the longest busy tick gap finally ended, and
+/// how long that gap was. `(0, 0)` when no busy gap has been recorded.
+///
+/// The maximum is taken here, over the per-CPU slots, so the gap and the
+/// address always come from the same tick. See [`TICK_GAP_MAX_NS_PERCPU`].
+pub fn tick_gap_max_rip() -> (u64, u64) {
+    let mut best = 0;
+    let mut rip = 0;
+    for (g, r) in TICK_GAP_MAX_NS_PERCPU
+        .iter()
+        .zip(TICK_GAP_MAX_RIP_PERCPU.iter())
+    {
+        let gap = g.load(Relaxed);
+        if gap > best {
+            best = gap;
+            rip = r.load(Relaxed);
+        }
+    }
+    (best, rip)
 }
 
 /// [diag] Account the gap since this CPU's previous tick. `nominal_ns` is
@@ -116,11 +139,13 @@ pub fn note_tick_gap(now_ns: u64, nominal_ns: u64) {
         return;
     }
     TICK_GAP_LAST_BUSY_NS_PERCPU[cpu].store(gap, Relaxed);
-    if TICK_GAP_MAX_NS.fetch_max(gap, Relaxed) < gap {
-        // We set the new maximum, so this tick's RIP is the one that belongs
-        // with it. `note_tick_context` ran earlier in the same trap (see
-        // `trap_handler`), so the slot already holds this tick's address.
-        TICK_GAP_MAX_RIP.store(TICK_LAST_RIP_PERCPU[cpu].load(Relaxed), Relaxed);
+    TICK_GAP_MAX_NS.fetch_max(gap, Relaxed);
+    if TICK_GAP_MAX_NS_PERCPU[cpu].load(Relaxed) < gap {
+        // Our own slot, so nobody else is writing it and the pair stays
+        // together. `note_tick_context` ran earlier in the same trap (see
+        // `trap_handler`), so the RIP slot already holds this tick's address.
+        TICK_GAP_MAX_NS_PERCPU[cpu].store(gap, Relaxed);
+        TICK_GAP_MAX_RIP_PERCPU[cpu].store(TICK_LAST_RIP_PERCPU[cpu].load(Relaxed), Relaxed);
     }
     if late {
         TICK_GAPS_LATE.fetch_add(1, Relaxed);
@@ -1136,7 +1161,13 @@ mod tests {
         TICK_GAP_MAX_NS.store(0, Relaxed);
         TICK_GAP_LAST_LATE_NS.store(0, Relaxed);
         TICK_GAP_LAST_LATE_AT_NS.store(0, Relaxed);
-        TICK_GAP_MAX_RIP.store(0, Relaxed);
+        for (g, r) in TICK_GAP_MAX_NS_PERCPU
+            .iter()
+            .zip(TICK_GAP_MAX_RIP_PERCPU.iter())
+        {
+            g.store(0, Relaxed);
+            r.store(0, Relaxed);
+        }
     }
 
     /// What `last_busy_tick_gap_ns` reports after one `note_tick_gap`, read
@@ -1167,19 +1198,53 @@ mod tests {
         // El hueco gordo, con su direccion.
         TICK_LAST_RIP_PERCPU[slot].store(0xffff_8000_dead_beef, Relaxed);
         note_tick_gap(1_000_000 + 50 * NOMINAL, NOMINAL);
-        assert_eq!(tick_gap_max_rip(), 0xffff_8000_dead_beef);
+        assert_eq!(tick_gap_max_rip().1, 0xffff_8000_dead_beef);
 
         // Uno mas corto despues: ni toca el maximo ni toca la direccion.
         TICK_LAST_RIP_PERCPU[slot].store(0xffff_8000_0000_0001, Relaxed);
         note_tick_gap(1_000_000 + 50 * NOMINAL + 10 * NOMINAL, NOMINAL);
         assert_eq!(
-            tick_gap_max_rip(),
+            tick_gap_max_rip().1,
             0xffff_8000_dead_beef,
             "un hueco menor se llevo la direccion del mayor"
+        );
+        // Y el par sale junto: el hueco devuelto es el del mismo tick.
+        assert_eq!(
+            tick_gap_max_rip().0,
+            50 * NOMINAL,
+            "el hueco y la direccion tienen que ser del mismo tick"
+        );
+
+        // Entre CPUs: el par sale de la ranura del maximo, no de la ultima que
+        // tenga algo escrito. El señuelo va DESPUES del ganador a proposito --
+        // con el ganador el ultimo, cualquier lectura que arrastre la direccion
+        // por su cuenta daria la respuesta correcta por casualidad.
+        for (g, r) in TICK_GAP_MAX_NS_PERCPU
+            .iter()
+            .zip(TICK_GAP_MAX_RIP_PERCPU.iter())
+        {
+            g.store(0, Relaxed);
+            r.store(0, Relaxed);
+        }
+        TICK_GAP_MAX_NS_PERCPU[1].store(900 * NOMINAL, Relaxed);
+        TICK_GAP_MAX_RIP_PERCPU[1].store(0xffff_8000_cafe_0000, Relaxed);
+        TICK_GAP_MAX_NS_PERCPU[2].store(5 * NOMINAL, Relaxed);
+        TICK_GAP_MAX_RIP_PERCPU[2].store(0xffff_8000_0bad_0bad, Relaxed);
+        assert_eq!(
+            tick_gap_max_rip(),
+            (900 * NOMINAL, 0xffff_8000_cafe_0000),
+            "la direccion tiene que venir de la ranura del maximo"
         );
 
         prime(1_000_000, false);
         for r in TICK_LAST_RIP_PERCPU.iter() {
+            r.store(0, Relaxed);
+        }
+        for (g, r) in TICK_GAP_MAX_NS_PERCPU
+            .iter()
+            .zip(TICK_GAP_MAX_RIP_PERCPU.iter())
+        {
+            g.store(0, Relaxed);
             r.store(0, Relaxed);
         }
     }

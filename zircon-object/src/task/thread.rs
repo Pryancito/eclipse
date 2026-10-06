@@ -349,11 +349,13 @@ fn credited_slice_end(
     if end == 0 || last_seen == 0 || last_seen >= now {
         return end;
     }
-    // Only the part of the gap that nothing else explains. `cpu_gap` is how
-    // long this CPU went without a tick while it was busy, so that much of the
-    // gap is a tick that did not fire rather than a thread that did not run.
-    let unexplained = tick.max(cpu_gap);
-    let off_cpu = (now - last_seen).saturating_sub(unexplained);
+    // Subtract the part of the gap that something else already explains, and
+    // credit only what is left. A gap up to one tick is the normal cadence;
+    // beyond that, `cpu_gap` is how long this CPU went without a tick while it
+    // was busy, and that much of the gap is a tick that did not fire rather
+    // than a thread that did not run.
+    let explained = tick.max(cpu_gap);
+    let off_cpu = (now - last_seen).saturating_sub(explained);
     if off_cpu == 0 {
         return end;
     }

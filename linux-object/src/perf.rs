@@ -899,20 +899,28 @@ pub fn kernel_report() -> String {
     // is kernel code, a low one a user thread that was running with the tick
     // simply late.
     {
-        let rip = kernel_hal::kstats::tick_gap_max_rip();
+        let (gap, rip) = kernel_hal::kstats::tick_gap_max_rip();
         if rip != 0 {
-            // `ksyms::Addr` resolves it here, in the kernel, against the
-            // symbol table baked into the image: whoever is reading this is at
-            // the slow machine, not at a build tree with the matching ELF, and
-            // a bare address makes them go and find one.
+            // `ksyms::Addr` resolves it here, in the kernel, against the symbol
+            // table baked into the image: whoever is reading this is at the slow
+            // machine, not at a build tree with the matching ELF, and a bare
+            // address makes them go and find one.
+            //
+            // The symbol table is also what answers kernel-vs-user, instead of a
+            // canonical-half threshold: that constant is x86_64's, and this line
+            // is printed on four architectures. A RIP the table resolves is
+            // kernel code on any of them; one it does not is a user thread that
+            // was simply running when the tick came late, which is a different
+            // answer and an equally useful one.
             let _ = writeln!(
                 out,
-                "  worst gap ended in {} ({})",
+                "  worst gap ({:.1} ms) ended in {}{}",
+                gap as f64 / 1e6,
                 kernel_hal::ksyms::Addr(rip),
-                if rip >= 0xffff_8000_0000_0000 {
-                    "kernel"
+                if kernel_hal::ksyms::lookup(rip).is_some() {
+                    " -- kernel, so that is the interrupts-off section"
                 } else {
-                    "user"
+                    " -- no kernel symbol: a user thread was running"
                 }
             );
         }
