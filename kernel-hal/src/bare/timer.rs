@@ -211,8 +211,25 @@ pub fn in_timer_callback() -> bool {
 /// # Safety
 /// Interrupts must be disabled and the abandoned callbacks must never return.
 pub unsafe fn abandon_timer_callbacks() {
-    super::percpu::abandon_timer_callbacks();
+    if super::percpu::abandon_timer_callbacks() > 0 {
+        TICK_FRAMES_ABANDONED.fetch_add(1, Ordering::Relaxed);
+    }
     crate::kstats::clear_timer_cb_after_abandon();
+}
+
+/// How many `timer_tick` frames containment has cut short without unwinding.
+///
+/// Every contained fault abandons a call chain, but only some of those chains
+/// were inside the tick. The ones that were leave that CPU having skipped the
+/// rest of its housekeeping for that tick -- the deferred drain, the deadline
+/// re-arm -- and nothing else in the report says so, since the nesting depth is
+/// handed back by the same call that makes it unobservable.
+static TICK_FRAMES_ABANDONED: AtomicUsize = AtomicUsize::new(0);
+
+/// See [`TICK_FRAMES_ABANDONED`].
+#[inline]
+pub fn tick_frames_abandoned() -> usize {
+    TICK_FRAMES_ABANDONED.load(Ordering::Relaxed)
 }
 
 /// Note that a timer-path indirect call was skipped after a contained

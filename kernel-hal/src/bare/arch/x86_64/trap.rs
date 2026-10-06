@@ -434,10 +434,24 @@ fn dump_null_execute_stack_once(tf: &TrapFrame, sp: u64, slot0: u64) {
         // the survivors the writer did NOT touch — their values often identify
         // the neighbouring live frame (a return address, an Arc, poison).
         if let Some(below) = read8(lo.wrapping_sub(8)) {
+            let at = lo - 8;
+            // Say it when that word points at itself-plus-something, because
+            // that is a fingerprint and reading it off the hex is how it gets
+            // missed. Two captures of this fault, on different boots and
+            // different stacks, both had the word below holding **its own
+            // address + 0x10** with the run starting at +0x8 -- the same
+            // 32-byte object twice, which is not what random corruption looks
+            // like. Nobody spotted it from the raw values.
+            let selfish = below >= at && below - at <= 0x1000;
             crate::oops_log::report(format_args!(
-                "[null-exec]   below @{:#x} = {:#018x}\n",
-                lo - 8,
-                below
+                "[null-exec]   below @{:#x} = {:#018x}{}\n",
+                at,
+                below,
+                SelfRelative {
+                    at,
+                    word: below,
+                    applies: selfish,
+                },
             ));
         }
         if let Some(above) = read8(hi + 8) {
@@ -503,6 +517,30 @@ fn report_dma_uaf_if_recycled(sp: u64) {
              zero-writer (a freed GEM/ring recycled into a live coroutine stack)\n",
             paddr, frees_ago,
         ));
+    }
+}
+
+/// Prints "= this address + N" when a word points just past its own slot.
+///
+/// A pointer whose value is its own address plus a small constant names a
+/// structure: an intrusive list head linking to its first element, a field
+/// holding the address of a later field of the same object. The raw hex hides
+/// it -- `@0xffffff0021abeff0 = 0xffffff0021abf000` and
+/// `@0xffffff0001e7d680 = 0xffffff0001e7d690` are the same fact twice, and it
+/// took two captures and a calculator to notice. Doing the subtraction in the
+/// report is the whole point.
+struct SelfRelative {
+    at: u64,
+    word: u64,
+    applies: bool,
+}
+
+impl core::fmt::Display for SelfRelative {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        if !self.applies {
+            return Ok(());
+        }
+        write!(f, " = this slot + {:#x}", self.word - self.at)
     }
 }
 
