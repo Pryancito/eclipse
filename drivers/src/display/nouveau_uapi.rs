@@ -1489,8 +1489,8 @@ pub(super) fn pbdma_for_runlist(maps: &[u16], runlist_id: u32) -> Option<u32> {
         .map(|i| i as u32)
 }
 
-/// The verdict of [`gr_hang_probe`](super::nvidia), split into a short code
-/// and the sentence that explains it.
+/// The verdict of `NvidiaGpu::gr_hang_probe` (in `super::nvidia`), split
+/// into a short code and the sentence that explains it.
 ///
 /// They are separate because `klog_emit` formats into a **256-byte** buffer
 /// and drops whatever does not fit. Four of the seven sentences below are
@@ -1510,26 +1510,50 @@ pub(super) struct HangVerdict {
 #[cfg(test)]
 pub(super) const HANG_CODE_MAX: usize = 24;
 
+/// What the probe read, as named flags.
+///
+/// Six positional booleans at a call site are six chances to swap two of
+/// them, and nothing downstream would notice: the verdict would simply be
+/// the wrong one, which is worse than no verdict at all in a diagnostic
+/// whose whole job is to be believed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct HangSignals {
+    /// The HUB MMU fault latch is valid: the GPU named an unmapped VA.
+    pub mmu_fault_latched: bool,
+    /// GR is busy AND has a trapped method: it is stuck on one.
+    pub gr_method_trapped: bool,
+    /// `NV_PFIFO_PBDMA_MAP` routes this channel's runlist, so the ring
+    /// pointers below are this channel's and can be read as such.
+    pub pbdma_known: bool,
+    /// `GP_GET == GP_PUT`: the PBDMA finished fetching the push.
+    pub ring_drained: bool,
+    /// A PBDMA interrupt is pending.
+    pub pbdma_intr_pending: bool,
+    /// FECS or GPCCS is mid context-switch.
+    pub ctxsw_busy: bool,
+}
+
 /// Name the failure mode from the registers the probe read.
 ///
 /// The order is the order of certainty: a latched MMU fault and a trapped GR
 /// method say what happened outright, an unknown PBDMA means the ring
 /// pointers belong to another engine and cannot be read as this channel's,
 /// and only then do the ring pointers get to speak.
-pub(super) fn hang_verdict(
-    mmu_valid: bool,
-    gr_stalled: bool,
-    pbdma_known: bool,
-    drained: bool,
-    pbdma_intr: bool,
-    ctxsw_busy: bool,
-) -> HangVerdict {
-    let (code, detail) = if mmu_valid {
+pub(super) fn hang_verdict(s: HangSignals) -> HangVerdict {
+    let HangSignals {
+        mmu_fault_latched,
+        gr_method_trapped,
+        pbdma_known,
+        ring_drained,
+        pbdma_intr_pending,
+        ctxsw_busy,
+    } = s;
+    let (code, detail) = if mmu_fault_latched {
         (
             "MMU-FAULT",
             "the GPU touched an unmapped VA -- check the VM_BIND mappings",
         )
-    } else if gr_stalled {
+    } else if gr_method_trapped {
         (
             "GR-STALL",
             "GR is stuck on a method -- golden-ctx/GR-init incomplete?",
@@ -1539,12 +1563,12 @@ pub(super) fn hang_verdict(
             "NO-PBDMA",
             "no NV_PFIFO_PBDMA_MAP entry routes this channel's runlist, so the ring pointers above are NOT this channel's and nothing can be read from them. Check the runlist_id the submit token carries.",
         )
-    } else if !drained && pbdma_intr {
+    } else if !ring_drained && pbdma_intr_pending {
         (
             "PBDMA-BLOCKED",
             "a PBDMA interrupt is pending: the host DID fetch the push and stalled inside it -- a semaphore-acquire NVK baked in that never released (explicit-sync), or a PB error. Decode INTR_0/STATUS.",
         )
-    } else if !drained {
+    } else if !ring_drained {
         (
             "PBDMA-NEVER-FETCHED",
             "GP_GET is frozen with no PBDMA interrupt: the channel is not runlist-resident, so the doorbell/runlist scheduling never ran this push. NOT a semaphore block.",
@@ -1567,6 +1591,24 @@ pub(super) fn hang_verdict(
 mod hang_verdict_tests {
     use super::*;
 
+    fn signals(
+        mmu: bool,
+        gr: bool,
+        known: bool,
+        drained: bool,
+        intr: bool,
+        ctxsw: bool,
+    ) -> HangSignals {
+        HangSignals {
+            mmu_fault_latched: mmu,
+            gr_method_trapped: gr,
+            pbdma_known: known,
+            ring_drained: drained,
+            pbdma_intr_pending: intr,
+            ctxsw_busy: ctxsw,
+        }
+    }
+
     fn code(
         mmu: bool,
         gr: bool,
@@ -1575,7 +1617,7 @@ mod hang_verdict_tests {
         intr: bool,
         ctxsw: bool,
     ) -> &'static str {
-        hang_verdict(mmu, gr, known, drained, intr, ctxsw).code
+        hang_verdict(signals(mmu, gr, known, drained, intr, ctxsw)).code
     }
 
     #[test]
@@ -1610,9 +1652,9 @@ mod hang_verdict_tests {
 
     #[test]
     fn an_unknown_pbdma_is_never_read_as_a_stalled_one() {
-        // `drained = false` with no PBDMA is the shape that used to send the
-        // probe down the "never fetched" arm -- and re-ring the doorbell on
-        // another engine's registers.
+        // `ring_drained = false` with no PBDMA is the shape that used to
+        // send the probe down the "never fetched" arm -- and re-ring the
+        // doorbell on another engine's registers.
         assert_eq!(code(false, false, false, false, false, false), "NO-PBDMA");
         assert_eq!(code(false, false, false, false, true, false), "NO-PBDMA");
     }
@@ -1620,16 +1662,20 @@ mod hang_verdict_tests {
     #[test]
     fn the_line_the_probe_klogs_fits_in_one_dmesg_record() {
         // `klog_emit` formats into 256 bytes and drops the rest, and the
-        // registers and the /proc/gpudbg pointer are at the END of the line.
-        // This is what notices if a code grows until they fall off it.
+        // registers and the /proc/gpudbg pointer are at the END of the
+        // line. This is what notices if a code grows until they fall off
+        // it, so every field is rendered at the widest it can ever print:
+        // `pbdma` is "none" (4) rather than an index (at most 2), the two
+        // u32 counters are `u32::MAX` (10 digits), `ch_id` is masked to
+        // 12 bits by the probe, and the three registers are 32-bit.
         for v in [
-            hang_verdict(true, false, true, false, false, false),
-            hang_verdict(false, true, true, false, false, false),
-            hang_verdict(false, false, false, false, false, false),
-            hang_verdict(false, false, true, false, true, false),
-            hang_verdict(false, false, true, false, false, false),
-            hang_verdict(false, false, true, true, false, true),
-            hang_verdict(false, false, true, true, false, false),
+            hang_verdict(signals(true, false, true, false, false, false)),
+            hang_verdict(signals(false, true, true, false, false, false)),
+            hang_verdict(signals(false, false, false, false, false, false)),
+            hang_verdict(signals(false, false, true, false, true, false)),
+            hang_verdict(signals(false, false, true, false, false, false)),
+            hang_verdict(signals(false, false, true, true, false, true)),
+            hang_verdict(signals(false, false, true, true, false, false)),
         ] {
             assert!(
                 v.code.len() <= HANG_CODE_MAX,
@@ -1641,15 +1687,15 @@ mod hang_verdict_tests {
                 "[nouveau-uapi] EXEC: ctx={} fence TIMEOUT after {}ms -- {} \
                  (pbdma={} runlist={} ch={} GP_PUT={:#x} GP_GET={:#x} INTR_0={:#x}) \
                  -- full record in /proc/gpudbg",
-                31,
-                10_000,
+                u32::MAX,
+                u32::MAX,
                 v.code,
-                "11",
-                15,
+                "none",
+                u32::MAX,
                 0xfff,
-                0xffff_ffffu32,
-                0xffff_ffffu32,
-                0xffff_ffffu32
+                u32::MAX,
+                u32::MAX,
+                u32::MAX
             );
             assert!(
                 line.len() < 256,

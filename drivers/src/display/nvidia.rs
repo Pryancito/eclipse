@@ -9604,14 +9604,14 @@ impl NvidiaGpu {
         // landed BEFORE both -- so the line added to end this probe's
         // silence arrived without the two things worth reading.
         // `hang_verdict` has the table and the test that measures the line.
-        let verdict = nv::hang_verdict(
-            mmu_valid != 0,
-            gr_status != 0 && gr_method != 0,
-            pbdma_idx.is_some(),
-            drained,
-            pb_intr != 0,
-            fecs_status != 0 || gpccs_status != 0,
-        );
+        let verdict = nv::hang_verdict(nv::HangSignals {
+            mmu_fault_latched: mmu_valid != 0,
+            gr_method_trapped: gr_status != 0 && gr_method != 0,
+            pbdma_known: pbdma_idx.is_some(),
+            ring_drained: drained,
+            pbdma_intr_pending: pb_intr != 0,
+            ctxsw_busy: fecs_status != 0 || gpccs_status != 0,
+        });
         let hint = verdict.detail;
 
         // Until #1729 only two of the seven outcomes reached dmesg (the
