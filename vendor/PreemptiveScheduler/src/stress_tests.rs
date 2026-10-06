@@ -21,8 +21,9 @@
 //! one cannot pass by accident of timing — which is the whole difficulty with
 //! a stress test, and the reason none of them assert on how far a thread got.
 //!
-//! The randomness is a seeded xorshift, never the system clock: a failure here
-//! is reproducible by rerunning the same binary.
+//! The randomness is a seeded xorshift, never the system clock. This reproduces
+//! worker choices, not OS thread schedules; barrier-driven regressions in the
+//! collection, page and executor modules pin the known failing interleavings.
 //!
 //! These share this crate's globals (the reschedule masks, the recorded IPI
 //! sender), so each one takes [`crate::runtime::resched_test_lock`] — the same
@@ -73,20 +74,11 @@ impl Rng {
     }
 }
 
-/// `TaskCollection` is deliberately neither `Send` nor `Sync`: its generator is
-/// a bare `dyn Coroutine` and the kernel reaches it through
-/// `ExecutorRuntime`'s own `unsafe impl`s, one runtime per CPU. The thieves
-/// here are exactly what those `unsafe impl`s exist for — `try_take_task` is
-/// called on a *peer's* collection on every idle pass — so the tests carry the
-/// same promise the scheduler does, in one place.
+/// A transparent wrapper for the shared structures used by the stress tests.
+/// The collection's scheduling cursor and queues are independently locked, so
+/// its cross-thread safety now follows from the field types rather than an
+/// unchecked promise about its suspended coroutine.
 struct Shared<T>(T);
-
-// SAFETY: the same contract `ExecutorRuntime` states. Everything these threads
-// touch through the wrapper goes through the collection's own `spin::Mutex`es
-// (the generator lock, the per-priority queue locks) or through atomics on the
-// waker pages.
-unsafe impl<T> Send for Shared<T> {}
-unsafe impl<T> Sync for Shared<T> {}
 
 impl<T> core::ops::Deref for Shared<T> {
     type Target = T;

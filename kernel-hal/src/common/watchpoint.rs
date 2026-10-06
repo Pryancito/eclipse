@@ -428,14 +428,11 @@ mod imp {
             // A hit whose slot is no longer registered is pool-retire noise
             // (the stack was dropped and re-poisoned between our last tick
             // sync and this store): drop it silently.
-            let Some(exec_id) = ::executor::spine_owner_of(addr as usize) else {
+            let Some((exec_id, new_val)) = ::executor::spine_sample(addr as usize) else {
                 continue;
             };
             // The trap is delivered AFTER the store retires, so the slot now
-            // holds the corruptor's value.
-            // SAFETY: registered slots stay mapped (executor stacks are
-            // pooled, never unmapped).
-            let new_val = unsafe { core::ptr::read_volatile(addr as *const u64) };
+            // holds the corruptor's value, copied under the registry guard.
             let n = SPINE_TRAP_HITS.fetch_add(1, Relaxed) + 1;
             crate::console::serial_write_fmt_spin(format_args!(
                 "\n[spine-writer] HIT #{n}: executor id={exec_id} spine slot {addr:#x} \
@@ -444,20 +441,6 @@ mod imp {
                 crate::ksyms::Addr(rip),
             ));
             report_writer_chain("spine-writer", rbp);
-            // The writer's locals name its buffer: dump a window around its
-            // stack pointer (bounded, kernel-range guarded).
-            let lo = rsp & !0x7;
-            for k in 0..24u64 {
-                let a = lo + k * 8;
-                if !(0xffff_ff00_0000_0000..0xffff_ff01_0000_0000).contains(&a) {
-                    break;
-                }
-                let v = unsafe { core::ptr::read_volatile(a as *const u64) };
-                crate::console::serial_write_fmt_spin(format_args!(
-                    "[spine-writer]   wrsp+{:#04x} @{a:#x} = {v:#018x}\n",
-                    k * 8,
-                ));
-            }
             ::executor::note_heap_smash_suspected();
             // A few catches are enough; stop arming spine slots afterwards so
             // an unexpected legitimate writer cannot storm the console.

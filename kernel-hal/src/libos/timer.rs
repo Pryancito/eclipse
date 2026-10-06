@@ -95,3 +95,9 @@ pub fn set_force_tsc_invariant(_force: bool) {}
 pub fn in_timer_callback() -> bool {
     false
 }
+
+/// Hosted twin: libos does not abandon bare-metal timer callback chains.
+///
+/// # Safety
+/// The caller must never resume the abandoned callback chain.
+pub unsafe fn abandon_timer_callbacks() {}

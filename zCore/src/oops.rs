@@ -38,6 +38,8 @@
 //!   is literally nothing to switch off of, so isolation is impossible. A fault
 //!   *between* polls, on an executor's own stack, IS isolated — the executor is
 //!   discarded and rebuilt even though no task can be blamed;
+//! - the executor's soft stack canary is damaged: replacing its stack cannot
+//!   make the neighbouring heap safe again, even on the idle or IST path;
 //! - this same CPU was already containing another fault: if the recovery
 //!   machinery is what broke, there is nothing left to rescue;
 //! - the fault budget is exhausted.
@@ -177,7 +179,7 @@ pub fn try_contain(what: &str, restore_kd: Option<u32>) {
         return;
     }
 
-    let cpu = kernel_hal::cpu::cpu_id() as usize;
+    let cpu = lock::current_cpu_id_via_apic() as usize;
     if cpu >= 64 {
         serial_write_str("\n[oops] cpu id out of range — halting\n");
         return;
@@ -307,10 +309,10 @@ pub fn try_contain(what: &str, restore_kd: Option<u32>) {
     // Third shape: the fault was delivered on a DIFFERENT stack than the one
     // that died — a #DF or #GP arrives on its own IST stack, so the current SP
     // says nothing about which coroutine failed. The arch trap entry stashed
-    // the faulting frame, so ask which executor owns THAT stack. Without this a
+    // the active faulting frame, so ask which executor owns THAT stack. Without this a
     // double fault always halted the machine, which is exactly how the last
     // surviving crash ended.
-    let fault_sp = kernel_hal::kstats::last_fault_rsp() as usize;
+    let fault_sp = kernel_hal::kstats::current_fault_rsp().unwrap_or(0) as usize;
     let ist_path =
         !task_path && !executor_path && fault_sp != 0 && executor::fault_sp_abandonable(fault_sp);
     if !task_path && !executor_path && !ist_path {
@@ -413,15 +415,17 @@ pub fn try_contain(what: &str, restore_kd: Option<u32>) {
     crate::lang::release_panic_guard();
 
     // SAFETY: we are on the fault path, standing on the coroutine's own stack
-    // (proven just above), with interrupts disabled and no kernel lock held
+    // (proven just above, or on an IST with current trap provenance), with
+    // interrupts disabled and no kernel lock held
     // (checked above). Nothing from the abandoned call chain is touched again.
-    // Neither call returns on success.
-    if task_path {
-        unsafe { executor::abandon_current_task() };
-    } else if executor_path {
-        unsafe { executor::abandon_current_executor() };
-    } else {
-        unsafe { executor::abandon_executor_for_sp(fault_sp) };
+    // Cleanup runs only after retirement succeeds. A skipped indirect timer
+    // call returns normally and must keep its nesting depth; abandoning this
+    // complete chain, including nested IRQs, will never run any of those exits.
+    unsafe {
+        executor::abandon_executor_chain(ist_path.then_some(fault_sp), || {
+            kernel_hal::timer::abandon_timer_callbacks();
+            kernel_hal::kstats::abandon_fault_scopes();
+        });
     }
     serial_write_str("\n[oops] could not abandon the coroutine — halting\n");
 }

@@ -8,6 +8,8 @@ pub struct ContextData {
     pub sp: usize,
     // pg base register
     pub ttbr0: usize,
+    // AAPCS64 preserves the low 64 bits of v8-v15.
+    pub d: [u64; 8],
 }
 
 impl ContextData {
@@ -17,6 +19,7 @@ impl ContextData {
             lr,
             sp,
             ttbr0,
+            d: [0; 8],
         }
     }
 }

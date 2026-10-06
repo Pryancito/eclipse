@@ -206,6 +206,15 @@ pub fn in_timer_callback() -> bool {
     super::percpu::in_timer_callback()
 }
 
+/// Clear timer state only when discarding the complete interrupted call chain.
+///
+/// # Safety
+/// Interrupts must be disabled and the abandoned callbacks must never return.
+pub unsafe fn abandon_timer_callbacks() {
+    super::percpu::abandon_timer_callbacks();
+    crate::kstats::clear_timer_cb_after_abandon();
+}
+
 /// Note that a timer-path indirect call was skipped after a contained
 /// null-range #PF. Does **not** adjust nesting depth: recovery resumes at the
 /// return site of the bad `call`, so the normal `end_timer_callback` in
@@ -554,7 +563,7 @@ hal_fn_impl! {
             // so the corruptor traps with its rip — see `watchpoint.rs`.)
             crate::watchpoint::sync_this_cpu();
 
-            // Spine-slot sweep (null-exec hunt): verify every live executor's
+            // Spine-slot sweep (null-exec hunt): verify this CPU's live executors'
             // write-once `[stack_top-0x508]` return slot each tick. This names
             // the smash within ~one tick of the write — usually while the
             // victim coroutine is still deep, BEFORE its fatal `ret`-to-0 —
@@ -581,33 +590,13 @@ hal_fn_impl! {
                 if s.ordinal == 0 {
                     crate::console::serial_write_fmt_spin(format_args!(
                         "[spine-smash] blob [{:#x}..{:#x}) = {} bytes \
-                         (top-relative [-{:#x}..-{:#x})); edge fingerprint:\n",
+                         (top-relative [-{:#x}..-{:#x}))\n",
                         s.blob_lo,
                         s.blob_hi,
                         s.blob_hi - s.blob_lo,
                         s.stack_top.saturating_sub(s.blob_lo),
                         s.stack_top.saturating_sub(s.blob_hi),
                     ));
-                    // The qwords bracketing each blob edge fingerprint the
-                    // foreign object (its nonzero header/tail fields).
-                    for k in 0..6usize {
-                        let a = s.blob_lo.saturating_sub(8 * (6 - k));
-                        if a >= s.stack_base {
-                            let v = unsafe { core::ptr::read_volatile(a as *const u64) };
-                            crate::console::serial_write_fmt_spin(format_args!(
-                                "[spine-smash]   below @{a:#x} = {v:#018x}\n"
-                            ));
-                        }
-                    }
-                    for k in 0..6usize {
-                        let a = s.blob_hi + 8 * k;
-                        if a + 8 <= s.stack_top {
-                            let v = unsafe { core::ptr::read_volatile(a as *const u64) };
-                            crate::console::serial_write_fmt_spin(format_args!(
-                                "[spine-smash]   above @{a:#x} = {v:#018x}\n"
-                            ));
-                        }
-                    }
                     // Cross-CPU context: what every core was doing at its last
                     // tick — the writer is at most one tick away on one of
                     // them.

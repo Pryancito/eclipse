@@ -327,6 +327,15 @@ impl WakerPage {
         )
     }
 
+    pub(crate) fn peek_lanes(&self) -> (u64, u64, u64, u64) {
+        (
+            self.notified.load(),
+            self.yielded.load(),
+            self.dropped.load(),
+            self.borrowed.load(),
+        )
+    }
+
     pub fn clear(&self, idx: usize) {
         debug_assert!(idx < 64);
         let mask = !(1 << idx);
@@ -342,6 +351,7 @@ impl WakerPage {
             page: self.clone(),
             idx,
             dropped: dropped.clone(),
+            lifecycle: Arc::new(spin::Mutex::new(())),
         }
     }
 }
@@ -352,6 +362,7 @@ pub struct WakerRef {
     page: Arc<WakerPage>,
     idx: usize,
     dropped: Arc<AtomicBool>,
+    lifecycle: Arc<spin::Mutex<()>>,
 }
 
 impl WakerRef {
@@ -392,6 +403,10 @@ impl WakerRef {
     /// CPU to wake. It also makes the owner's own release free — a CPU that is
     /// executing is never in the sleeping mask.
     pub fn mark_borrowed(&self, borrowed: bool) {
+        let _lifecycle = self.lifecycle.lock();
+        if self.dropped.load(Ordering::SeqCst) {
+            return;
+        }
         self.page.mark_borrowed(self.idx, borrowed);
         if !borrowed && self.page.has_pending_wake(self.idx) {
             crate::runtime::maybe_send_resched_ipi(self.page.owner_cpu);
@@ -440,9 +455,18 @@ impl WakerRef {
     }
 
     pub fn drop_by_ref(&self) {
+        let _lifecycle = self.lifecycle.lock();
         if !self.dropped.swap(true, Ordering::SeqCst) {
             self.page.mark_dropped(self.idx);
         }
+    }
+
+    /// Serializes final page cleanup against old checkout handles. A late
+    /// release/drop must not modify the bitmap after the slot has been reused.
+    pub(crate) fn retire_slot(&self) {
+        let _lifecycle = self.lifecycle.lock();
+        self.dropped.store(true, Ordering::SeqCst);
+        self.page.clear(self.idx);
     }
 }
 
@@ -458,6 +482,7 @@ impl Clone for WakerRef {
             page: self.page.clone(),
             idx: self.idx,
             dropped: self.dropped.clone(),
+            lifecycle: self.lifecycle.clone(),
         }
     }
 }
@@ -478,6 +503,47 @@ impl Clone for WakerRef {
 #[cfg(test)]
 mod waker_page_tests {
     use super::*;
+
+    #[test]
+    fn retirement_waits_for_old_checkout_writes_before_a_slot_is_reused() {
+        let page = WakerPage::new(0);
+        page.initialize(3);
+        page.mark_borrowed(3, true);
+        let finished = Arc::new(AtomicBool::new(false));
+        let old = Arc::new(page.make_waker(3, &finished));
+        let entered = Arc::new(std::sync::Barrier::new(2));
+        let resume = Arc::new(std::sync::Barrier::new(2));
+        let release_old = old.clone();
+        let release_entered = entered.clone();
+        let release_resume = resume.clone();
+        let release = std::thread::spawn(move || {
+            let _lifecycle = release_old.lifecycle.lock();
+            release_entered.wait();
+            release_resume.wait();
+            release_old.page.mark_borrowed(3, false);
+        });
+        entered.wait();
+        let retire_entered = Arc::new(std::sync::Barrier::new(2));
+        let retired = Arc::new(AtomicBool::new(false));
+        let retire_old = old.clone();
+        let retire_barrier = retire_entered.clone();
+        let retire_done = retired.clone();
+        let retire = std::thread::spawn(move || {
+            retire_barrier.wait();
+            retire_old.retire_slot();
+            retire_done.store(true, Ordering::Release);
+        });
+        retire_entered.wait();
+        assert!(!retired.load(Ordering::Acquire));
+        resume.wait();
+        release.join().unwrap();
+        retire.join().unwrap();
+        page.initialize(3);
+        page.mark_borrowed(3, true);
+        old.mark_borrowed(false);
+        old.drop_by_ref();
+        assert_eq!(page.peek(), (1 << 3, 0, 1 << 3));
+    }
 
     fn page() -> Arc<WakerPage> {
         WakerPage::new(0)

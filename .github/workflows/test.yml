@@ -44,7 +44,7 @@ jobs:
           # was merged away; this is the only tree. Single-threaded because
           # the cross-CPU tests drive process-wide masks (EXECUTOR_READY,
           # SLEEPING_CPUS, NEED_RESCHED).
-          cargo test --manifest-path vendor/PreemptiveScheduler/Cargo.toml --lib -- --test-threads=1
+          cargo test --manifest-path vendor/PreemptiveScheduler/Cargo.toml --tests -- --test-threads=1
           # `vendor/kernel-sync` is the `lock` crate: every mutex, rwlock and
           # per-CPU interrupt-disable counter the kernel has. It had no line
           # here and no tests, and it could not have had any -- the whole

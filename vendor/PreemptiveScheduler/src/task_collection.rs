@@ -3,7 +3,6 @@ use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 use bit_iter::BitIter;
-use core::ops::{Coroutine, CoroutineState};
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use spin::{Mutex, MutexGuard};
 use unicycle::pin_slab::PinSlab;
@@ -258,30 +257,34 @@ impl FutureCollection {
         key
     }
 
-    pub fn remove(&mut self, key: Key) {
-        let (page, subpage_idx) = self.page(key);
-        page.clear(subpage_idx);
+    pub fn remove(&mut self, key: Key) -> bool {
         let slab_key = unmask_priority(key);
-        // Asked before the slot goes away, and only for a slot that is really
-        // there: `remove` is reachable twice for one key (the generator's
-        // dropped branch and `remove_task`), and a counter that went negative
-        // would make the fast path in `ready_num_for` disappear for good.
-        if self
-            .slab
-            .get(slab_key)
-            .is_some_and(|task| task.affinity.is_some())
-        {
+        let Some(task) = self.slab.get(slab_key) else {
+            return false;
+        };
+        task.waker().retire_slot();
+        if task.affinity.is_some() {
             self.affine = self.affine.saturating_sub(1);
         }
         self.slab.remove(slab_key);
+        true
     }
 }
 
 pub struct TaskCollection {
-    cpu_id: u8, // Just for debug, not used
+    cpu_id: u8,
     future_collections: Vec<Mutex<FutureCollection>>,
     pub task_num: AtomicUsize,
-    generator: Option<Mutex<Pin<Box<dyn Coroutine<Yield = Option<Key>, Return = ()>>>>>,
+    generator: Option<Mutex<SchedulingCursor>>,
+}
+
+const URGENT_QUOTA: usize = 8;
+
+#[derive(Default)]
+struct SchedulingCursor {
+    urgent_next: usize,
+    yielded_next: usize,
+    urgent_turns: usize,
 }
 
 /// One line naming a collection whose generator field is gone.
@@ -319,7 +322,7 @@ fn report_missing_generator(cpu_id: u8) {
 
 /// A collection whose `future_collections` is no longer the vector `new` built.
 ///
-/// `new` pushes exactly `MAX_PRIORITY` entries before the `Arc` is published,
+/// `new` creates exactly `MAX_PRIORITY` entries before the `Arc` is published,
 /// and nothing in the crate ever pushes, pops, truncates or replaces that
 /// vector again -- `no_key_can_name_a_priority_the_collection_does_not_have`
 /// pins the other half, that no key can name an index outside it. So a length
@@ -390,21 +393,14 @@ impl TaskCollection {
     }
 
     pub fn new(cpu_id: u8) -> Arc<Self> {
-        let mut task_collection = Arc::new(TaskCollection {
+        Arc::new(TaskCollection {
             cpu_id,
-            future_collections: Vec::with_capacity(MAX_PRIORITY),
+            future_collections: (0..MAX_PRIORITY)
+                .map(|priority| Mutex::new(FutureCollection::new(priority, cpu_id)))
+                .collect(),
             task_num: AtomicUsize::new(0),
-            generator: None,
-        });
-        // SAFETY: no other Arc or Weak pointers
-        let tc_clone = task_collection.clone();
-        let tc = unsafe { Arc::get_mut_unchecked(&mut task_collection) };
-        for priority in 0..MAX_PRIORITY {
-            tc.future_collections
-                .push(Mutex::new(FutureCollection::new(priority, cpu_id)));
-        }
-        tc.generator = Some(Mutex::new(Box::pin(TaskCollection::generator(tc_clone))));
-        task_collection
+            generator: Some(Mutex::new(SchedulingCursor::default())),
+        })
     }
 
     /// 插入一个Future, 其优先级为 DEFAULT_PRIORITY
@@ -427,8 +423,9 @@ impl TaskCollection {
         // one that wrote the field width out by hand, and got it wrong.
         let (priority, _page_idx, _subpage_idx) = unpack_key(key);
         let mut inner = self.get_mut_inner(priority);
-        inner.remove(unmask_priority(key));
-        self.task_num.fetch_sub(1, Ordering::Relaxed);
+        if inner.remove(unmask_priority(key)) {
+            self.task_num.fetch_sub(1, Ordering::Relaxed);
+        }
     }
 
     fn priority_add_task<F: Future<Output = ()> + 'static + Send>(
@@ -438,7 +435,8 @@ impl TaskCollection {
         affinity: Option<Arc<AtomicU64>>,
     ) -> Key {
         debug_assert!(priority == DEFAULT_PRIORITY);
-        let key = self.lock_queue(priority).insert(future, affinity);
+        let mut inner = self.lock_queue(priority);
+        let key = inner.insert(future, affinity);
         debug_assert!(key < TASK_NUM_PER_PRIORITY);
         self.task_num.fetch_add(1, Ordering::Relaxed);
         key | (priority << PRIORITY_SHIFT)
@@ -483,11 +481,8 @@ impl TaskCollection {
         (self.task_num(), n, d, b)
     }
 
-    /// Non-blocking take for the work-stealing path: if the generator is busy
-    /// (the owning CPU is inside its own `take_task`, possibly parked there by
-    /// a timer preemption), give up instead of spinning. A thief that spins
-    /// here while holding the victim's runtime lock deadlocks against the
-    /// victim's timer IRQ (see `steal_task_from_other_cpu`).
+    /// Non-blocking take for work stealing. Neither the scheduling cursor nor
+    /// the queue may be waited on while holding a victim's runtime lock.
     pub fn try_take_task(&self) -> Option<(Key, Arc<Task>, Arc<WakerRef>)> {
         // See `report_missing_generator`: never `unwrap` here.
         let Some(generator) = self.generator.as_ref() else {
@@ -495,7 +490,8 @@ impl TaskCollection {
             return None;
         };
         let mut generator = generator.try_lock()?;
-        self.resume_generator(&mut generator)
+        let mut inner = self.queue(DEFAULT_PRIORITY)?.try_lock()?;
+        self.schedule(&mut generator, &mut inner)
     }
 
     pub fn take_task(&self) -> Option<(Key, Arc<Task>, Arc<WakerRef>)> {
@@ -505,7 +501,8 @@ impl TaskCollection {
             return None;
         };
         let mut generator = crate::diag::diag_lock(generator);
-        self.resume_generator(&mut generator)
+        let mut inner = self.lock_queue(DEFAULT_PRIORITY);
+        self.schedule(&mut generator, &mut inner)
     }
 
     /// Whether any task on this queue has a published (pending) wake. Pre-halt
@@ -668,210 +665,100 @@ impl TaskCollection {
         )
     }
 
-    #[allow(clippy::type_complexity)]
-    fn resume_generator(
+    /// Hand out one task under both locks; no keys, CPU identities, retirement
+    /// snapshots, or owning references survive between calls.
+    fn schedule(
         &self,
-        generator: &mut Pin<Box<dyn Coroutine<Yield = Option<Key>, Return = ()>>>,
+        cursor: &mut SchedulingCursor,
+        inner: &mut FutureCollection,
     ) -> Option<(Key, Arc<Task>, Arc<WakerRef>)> {
-        // A yielded key can already be dead by the time we look it up: the
-        // generator publishes it from the page bitmap, and only THEN do we take
-        // the collection lock, so a concurrent `remove_task` on another CPU fits
-        // in between. That is not a rare race -- it is exactly what oops
-        // containment does ("kernel coroutine retired") -- and the `unwrap()`
-        // that used to be here turned every one of those into
-        //
-        //   panic at task_collection.rs:450: called `Option::unwrap()` on a
-        //   `None` value
-        //
-        // inside the executor, on a CPU already holding scheduler locks. So a
-        // fault the kernel had just successfully CONTAINED took the machine
-        // down anyway, one line after it reported "contained ... the rest of
-        // the system carries on".
-        //
-        // A dead key means "this slot is gone", so skip it and ask the
-        // generator for the next one. `remove` clears the page bit before
-        // dropping the slab entry, so a removed key is not yielded again and
-        // the retry terminates; the bound is belt-and-braces against a bitmap
-        // that disagrees with the slab.
-        const MAX_STALE_KEYS: usize = 64;
-        for _ in 0..MAX_STALE_KEYS {
-            match generator.as_mut().resume(()) {
-                CoroutineState::Yielded(Some(key)) => {
-                    let (priority, _page_idx, _subpage_idx) = unpack_key(key);
-                    let mut inner = self.get_mut_inner(priority);
-                    let Some(task) = inner.slab.get(unmask_priority(key)) else {
-                        drop(inner);
-                        continue;
-                    };
-                    let task = task.clone();
-                    // The task's shared waker doubles as the borrow/drop handle,
-                    // so the hot path no longer builds fresh `WakerRef`s (and an
-                    // `Arc::new`) on every single poll.
-                    let waker = task.waker().clone();
-                    return Some((key, task, waker));
+        for page_idx in 0..inner.pages.len() {
+            let dropped = inner.pages[page_idx].take_dropped();
+            for subpage_idx in BitIter::from(dropped) {
+                if inner.remove(pack_key(DEFAULT_PRIORITY, page_idx, subpage_idx)) {
+                    self.task_num.fetch_sub(1, Ordering::Relaxed);
                 }
-                CoroutineState::Yielded(None) => return None,
-                _ => panic!("unexpected value from resume"),
             }
         }
-        None
-    }
 
-    pub fn generator(self: Arc<Self>) -> impl Coroutine<Yield = Option<Key>, Return = ()> {
-        #[coroutine]
-        static move || {
-            loop {
-                let priority = DEFAULT_PRIORITY;
-                loop {
-                    let mut found_key: Option<Key> = None;
-                    let mut inner = self.get_mut_inner(priority);
-                    // Pass 1 — urgent external wakes. Must finish before any
-                    // voluntary yield on *any* page is promoted, or a hog that
-                    // just preempted for a sleeper can re-steal the CPU from a
-                    // lower-index page while the sleeper sits notified on a
-                    // higher one.
-                    // One kick per distinct affinity mask per pass. Twenty
-                    // tasks pinned to the same CPU used to cost twenty
-                    // `kick_for_affinity` calls — each a `try_lock` walk over
-                    // the allowed runtimes — for one coalesced IPI at the end.
-                    let mut kicked_mask: u64 = 0;
-                    // Whether this pass refused a task its mask forbids here.
-                    // Published to `STRANDED` below: a refused task is
-                    // re-notified and then only an ALLOWED CPU can run it, and
-                    // nothing in that CPU's loop goes looking unless it is idle.
-                    let mut refused = false;
-                    let own_cpu = crate::arch::cpu_id() as usize;
-                    for page_idx in 0..inner.pages.len() {
-                        let page = &inner.pages[page_idx];
-                        // `pending` is this page's snapshot, minus whatever has
-                        // already been handed out. It must go back into the
-                        // page across every yield: see `park_notified`.
-                        let mut pending = page.take_notified();
-                        let dropped = page.take_dropped();
-                        if pending != 0 {
-                            let cpu = crate::arch::cpu_id() as usize;
-                            while pending != 0 {
-                                let subpage_idx = pending.trailing_zeros() as usize;
-                                pending &= pending - 1;
-                                let key = pack_key(priority, page_idx, subpage_idx);
-                                // `affine == 0` short-circuits the slab lookup
-                                // on the hot hand-out path: with no mask on
-                                // the queue `allowed_on` is `true` for every
-                                // task. See `FutureCollection::affine`.
-                                let allowed = inner.affine == 0
-                                    || inner
-                                        .slab
-                                        .get(unmask_priority(key))
-                                        .map(|task| task.allowed_on(cpu))
-                                        .unwrap_or(true);
-                                if !allowed {
-                                    refused = true;
-                                    inner.pages[page_idx].notify(subpage_idx);
-                                    let mask = inner
-                                        .slab
-                                        .get(unmask_priority(key))
-                                        .and_then(|task| task.affinity_mask())
-                                        .unwrap_or(u64::MAX);
-                                    if mask != kicked_mask {
-                                        crate::runtime::kick_for_affinity(mask, cpu);
-                                        kicked_mask = mask;
-                                    }
-                                    continue;
-                                }
-                                found_key = Some(key);
-                                inner.pages[page_idx].mark_borrowed(subpage_idx, true);
-                                inner.pages[page_idx].park_notified(pending);
-                                drop(inner);
-                                yield found_key;
-                                inner = self.get_mut_inner(priority);
-                                pending = inner.pages[page_idx].reclaim_notified(pending);
-                            }
+        let cpu = crate::arch::cpu_id() as usize;
+        let mut urgent = None;
+        let mut yielded = None;
+        let mut stranded = false;
+        let mut kicked_masks = Vec::new();
+        for page_idx in 0..inner.pages.len() {
+            let (notified, voluntary, dropped, borrowed) = inner.pages[page_idx].peek_lanes();
+            let runnable = (notified | voluntary) & !dropped & !borrowed;
+            for subpage_idx in BitIter::from(runnable) {
+                let slot = page_idx * WAKER_PAGE_SIZE + subpage_idx;
+                let Some(task) = inner.slab.get(slot) else {
+                    inner.pages[page_idx].clear(subpage_idx);
+                    continue;
+                };
+                if !task.allowed_on(self.cpu_id as usize) {
+                    stranded = true;
+                    if let Some(mask) = task.affinity_mask() {
+                        if !kicked_masks.contains(&mask) {
+                            kicked_masks.push(mask);
                         }
-                        if dropped != 0 {
-                            for subpage_idx in BitIter::from(dropped) {
-                                let key = pack_key(priority, page_idx, subpage_idx);
-                                self.task_num.fetch_sub(1, Ordering::Relaxed);
-                                inner.remove(key);
-                            }
-                        }
-                    }
-                    // A refusal means this CPU is holding something only a
-                    // peer may run. Publish it before pass 2 so a rescuer does
-                    // not wait out the yielded scan, but do not clear it yet:
-                    // pass 2 can refuse a task that lives only in the yielded
-                    // lane (`sched_yield`, then `sched_setaffinity`). Clearing
-                    // here dropped that mark, the owner then halted and wiped
-                    // `STEALABLE`, and neither idle steal nor the rescue scan
-                    // looked at this CPU again.
-                    if refused {
-                        crate::runtime::note_stranded(own_cpu);
-                    } else if found_key.is_some() {
-                        // Pass 2 will not run. The notified lane had nothing
-                        // this CPU must refuse.
-                        crate::runtime::note_not_stranded(own_cpu);
-                    }
-                    // Pass 2 — voluntary yields, only when nothing urgent remains.
-                    if found_key.is_none() {
-                        let mut kicked_mask: u64 = 0;
-                        for page_idx in 0..inner.pages.len() {
-                            let mut pending = inner.pages[page_idx].take_yielded();
-                            if pending == 0 {
-                                continue;
-                            }
-                            let cpu = crate::arch::cpu_id() as usize;
-                            while pending != 0 {
-                                let subpage_idx = pending.trailing_zeros() as usize;
-                                pending &= pending - 1;
-                                let key = pack_key(priority, page_idx, subpage_idx);
-                                // `affine == 0` short-circuits the slab lookup
-                                // on the hot hand-out path: with no mask on
-                                // the queue `allowed_on` is `true` for every
-                                // task. See `FutureCollection::affine`.
-                                let allowed = inner.affine == 0
-                                    || inner
-                                        .slab
-                                        .get(unmask_priority(key))
-                                        .map(|task| task.allowed_on(cpu))
-                                        .unwrap_or(true);
-                                if !allowed {
-                                    refused = true;
-                                    inner.pages[page_idx].mark_yielded(subpage_idx);
-                                    let mask = inner
-                                        .slab
-                                        .get(unmask_priority(key))
-                                        .and_then(|task| task.affinity_mask())
-                                        .unwrap_or(u64::MAX);
-                                    if mask != kicked_mask {
-                                        crate::runtime::kick_for_affinity(mask, cpu);
-                                        kicked_mask = mask;
-                                    }
-                                    continue;
-                                }
-                                found_key = Some(key);
-                                inner.pages[page_idx].mark_borrowed(subpage_idx, true);
-                                inner.pages[page_idx].park_yielded(pending);
-                                drop(inner);
-                                yield found_key;
-                                inner = self.get_mut_inner(priority);
-                                pending = inner.pages[page_idx].reclaim_yielded(pending);
-                            }
-                        }
-                        // Both lanes have been scanned. A yielded-lane refusal
-                        // is the only mark a rescuer will see once this CPU
-                        // halts; a pass that refused nothing in either lane
-                        // takes the mark back off.
-                        if refused {
-                            crate::runtime::note_stranded(own_cpu);
-                        } else {
-                            crate::runtime::note_not_stranded(own_cpu);
-                        }
-                    }
-                    if found_key.is_none() {
-                        break;
                     }
                 }
-                yield None;
+                if !task.allowed_on(cpu) {
+                    continue;
+                }
+                let bit = 1u64 << subpage_idx;
+                if notified & bit != 0 {
+                    Self::consider_slot(&mut urgent, slot, cursor.urgent_next);
+                } else if voluntary & bit != 0 {
+                    Self::consider_slot(&mut yielded, slot, cursor.yielded_next);
+                }
             }
+        }
+        // The destination must see the victim hint before it consumes the IPI.
+        if stranded {
+            crate::runtime::note_stranded(self.cpu_id as usize);
+        } else {
+            crate::runtime::note_not_stranded(self.cpu_id as usize);
+        }
+        for mask in kicked_masks {
+            crate::runtime::kick_for_affinity(mask, cpu);
+        }
+
+        let serve_yielded =
+            yielded.is_some() && (urgent.is_none() || cursor.urgent_turns >= URGENT_QUOTA);
+        let slot = if serve_yielded { yielded } else { urgent }?;
+        let page_idx = slot / WAKER_PAGE_SIZE;
+        let subpage_idx = slot % WAKER_PAGE_SIZE;
+        let bit = 1u64 << subpage_idx;
+        let page = &inner.pages[page_idx];
+        let claimed = if serve_yielded {
+            page.reclaim_yielded(bit)
+        } else {
+            page.reclaim_notified(bit)
+        };
+        if claimed == 0 {
+            return None;
+        }
+        page.mark_borrowed(subpage_idx, true);
+        if serve_yielded {
+            cursor.yielded_next = slot + 1;
+            cursor.urgent_turns = 0;
+        } else {
+            cursor.urgent_next = slot + 1;
+            cursor.urgent_turns = cursor.urgent_turns.saturating_add(1).min(URGENT_QUOTA);
+        }
+        let task = inner.slab.get(slot)?.clone();
+        let waker = task.waker().clone();
+        Some((
+            pack_key(DEFAULT_PRIORITY, page_idx, subpage_idx),
+            task,
+            waker,
+        ))
+    }
+
+    fn consider_slot(best: &mut Option<usize>, slot: usize, next: usize) {
+        if best.is_none_or(|previous| (slot < next, slot) < (previous < next, previous)) {
+            *best = Some(slot);
         }
     }
 }
@@ -1069,6 +956,166 @@ mod collection_tests {
 
     fn pending() -> impl Future<Output = ()> + Send + 'static {
         core::future::pending::<()>()
+    }
+
+    #[test]
+    fn the_last_external_owner_releases_the_collection() {
+        let tc = TaskCollection::new(0);
+        let weak = Arc::downgrade(&tc);
+        drop(tc);
+        assert!(weak.upgrade().is_none());
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn a_peer_handout_uses_the_peers_cpu_not_the_previous_taker() {
+        let _g = crate::runtime::resched_test_lock();
+        let tc = TaskCollection::new(0);
+        let first = tc.add_task(pending(), None);
+        tc.add_task(pending(), Some(Arc::new(AtomicU64::new(1))));
+        let shared = tc.add_task(pending(), None);
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let peer_tc = tc.clone();
+        let peer_barrier = barrier.clone();
+        let peer = std::thread::spawn(move || {
+            let old = crate::arch::set_cpu_id_for_test(1);
+            peer_barrier.wait();
+            assert_eq!(peer_tc.ready_num_for(1), Some(1));
+            let (key, task, waker) = peer_tc.try_take_task().unwrap();
+            assert_eq!(key, shared);
+            assert!(task.allowed_on(1));
+            waker.mark_borrowed(false);
+            crate::arch::set_cpu_id_for_test(old);
+        });
+        let (key, _, waker) = tc.take_task().unwrap();
+        assert_eq!(key, first);
+        waker.mark_borrowed(false);
+        barrier.wait();
+        peer.join().unwrap();
+    }
+
+    #[test]
+    fn continuous_urgent_work_gives_each_voluntary_yielder_bounded_service() {
+        let _g = crate::runtime::resched_test_lock();
+        let tc = TaskCollection::new(0);
+        let hog = tc.add_task(pending(), None);
+        let a = tc.add_task(pending(), None);
+        let b = tc.add_task(pending(), None);
+        drain(&tc);
+        let page = tc.get_mut_inner(DEFAULT_PRIORITY).pages[0].clone();
+        page.notify(unpack_key(hog).2);
+        page.mark_yielded(unpack_key(a).2);
+        page.mark_yielded(unpack_key(b).2);
+        let mut seen = [false; 2];
+        for _ in 0..2 * (URGENT_QUOTA + 1) {
+            let (key, _, waker) = tc.take_task().unwrap();
+            if key == hog {
+                waker.wake_by_ref();
+                waker.mark_borrowed(false);
+            } else {
+                seen[usize::from(key == b)] = true;
+                cede(&waker);
+            }
+        }
+        assert_eq!(seen, [true, true]);
+    }
+
+    #[test]
+    fn a_new_urgent_wake_precedes_the_remaining_voluntary_backlog() {
+        let tc = TaskCollection::new(0);
+        let a = tc.add_task(pending(), None);
+        let b = tc.add_task(pending(), None);
+        let urgent = tc.add_task(pending(), None);
+        drain(&tc);
+        let page = tc.get_mut_inner(DEFAULT_PRIORITY).pages[0].clone();
+        page.mark_yielded(unpack_key(a).2);
+        page.mark_yielded(unpack_key(b).2);
+        let (key, _, waker) = tc.take_task().unwrap();
+        assert_eq!(key, a);
+        waker.mark_borrowed(false);
+        page.notify(unpack_key(urgent).2);
+        assert_eq!(tc.take_task().unwrap().0, urgent);
+    }
+
+    #[test]
+    fn retirement_is_immediate_and_duplicate_removal_does_not_remove_a_replacement() {
+        let tc = TaskCollection::new(0);
+        let dying = tc.add_task(pending(), None);
+        tc.add_task(pending(), None);
+        tc.add_task(pending(), None);
+        let (key, _, waker) = tc.take_task().unwrap();
+        assert_eq!(key, dying);
+        waker.drop_by_ref();
+        let (_, _, neighbor) = tc.take_task().unwrap();
+        neighbor.mark_borrowed(false);
+        assert_eq!(tc.task_num(), 2);
+        tc.remove_task(dying);
+        assert_eq!(tc.task_num(), 2);
+        let replacement = tc.add_task(pending(), None);
+        assert_eq!(replacement, dying);
+        assert!(drain(&tc).contains(&replacement));
+        assert_eq!(tc.task_num(), 3);
+    }
+
+    #[test]
+    fn removing_the_same_slot_twice_never_underflows_the_count() {
+        let tc = TaskCollection::new(0);
+        let key = tc.add_task(pending(), None);
+        tc.remove_task(key);
+        tc.remove_task(key);
+        assert_eq!(tc.task_num(), 0);
+        assert_eq!(tc.debug_pending(), (0, 0, 0, 0));
+    }
+
+    #[test]
+    fn old_checkout_handles_cannot_release_or_retire_a_reused_slot() {
+        let _g = crate::runtime::resched_test_lock();
+        let tc = TaskCollection::new(0);
+        let old_key = tc.add_task(pending(), None);
+        let (_, _, old) = tc.take_task().unwrap();
+        tc.remove_task(old_key);
+        let new_key = tc.add_task(pending(), None);
+        assert_eq!(old_key, new_key);
+        let (_, _, new) = tc.take_task().unwrap();
+        old.mark_borrowed(false);
+        old.drop_by_ref();
+        assert_eq!(tc.debug_pending(), (1, 0, 0, 1));
+        assert!(tc.take_task().is_none());
+        new.mark_borrowed(false);
+        new.wake_by_ref();
+        assert_eq!(tc.take_task().unwrap().0, new_key);
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn an_affinity_forward_publishes_the_victim_hint_before_kicking_the_destination() {
+        static PUBLISHED_BEFORE_KICK: AtomicBool = AtomicBool::new(false);
+        fn record(cpu: usize) {
+            if cpu == 2 {
+                PUBLISHED_BEFORE_KICK.store(
+                    crate::runtime::stranded_mask_for_test() & 1 != 0,
+                    Ordering::SeqCst,
+                );
+            }
+        }
+        let _g = crate::runtime::resched_test_lock();
+        let previous = crate::arch::set_cpu_id_for_test(1);
+        let ready = crate::runtime::set_executor_ready_mask_for_test(0b111);
+        crate::runtime::clear_stranded_for_test();
+        crate::runtime::clear_need_resched(2);
+        crate::runtime::set_cpu_sleeping(2, false);
+        crate::runtime::set_resched_ipi_sender(record);
+        PUBLISHED_BEFORE_KICK.store(false, Ordering::SeqCst);
+        let tc = TaskCollection::new(0);
+        tc.add_task(pending(), Some(Arc::new(AtomicU64::new(1 << 2))));
+        tc.add_task(pending(), None);
+        let (_, _, waker) = tc.try_take_task().unwrap();
+        assert_eq!(crate::runtime::stranded_mask_for_test() & 0b11, 1);
+        assert!(PUBLISHED_BEFORE_KICK.load(Ordering::SeqCst));
+        waker.mark_borrowed(false);
+        crate::runtime::clear_need_resched(2);
+        crate::runtime::set_executor_ready_mask_for_test(ready);
+        crate::arch::set_cpu_id_for_test(previous);
     }
 
     /// A mask that allows CPU 1 and not CPU 0, i.e. not us.
@@ -1277,7 +1324,7 @@ mod collection_tests {
     fn a_collection_whose_vec_header_was_overwritten_reads_as_empty() {
         let mut tc = TaskCollection::new(0);
         // SAFETY: this `Arc` has no other strong or weak holder in the test.
-        let inner = unsafe { Arc::get_mut_unchecked(&mut tc) };
+        let inner = Arc::get_mut(&mut tc).unwrap();
         inner.future_collections.truncate(4);
         assert!(inner.queue(DEFAULT_PRIORITY).is_none());
         // And the load figures, which the placement and steal paths read off a
@@ -1297,7 +1344,7 @@ mod collection_tests {
     fn the_panic_that_is_left_names_the_corruption_and_not_an_index() {
         let mut tc = TaskCollection::new(7);
         // SAFETY: this `Arc` has no other strong or weak holder in the test.
-        let inner = unsafe { Arc::get_mut_unchecked(&mut tc) };
+        let inner = Arc::get_mut(&mut tc).unwrap();
         inner.future_collections.clear();
         let _ = inner.get_mut_inner(DEFAULT_PRIORITY);
     }
@@ -1884,6 +1931,16 @@ mod collection_tests {
     }
 
     #[test]
+    fn a_thief_also_skips_a_busy_queue_when_the_scheduling_cursor_is_free() {
+        let tc = TaskCollection::new(0);
+        tc.add_task(pending(), None);
+        let busy = tc.get_mut_inner(DEFAULT_PRIORITY);
+        assert!(tc.try_take_task().is_none());
+        drop(busy);
+        assert!(tc.try_take_task().is_some());
+    }
+
+    #[test]
     fn a_collection_with_no_generator_parks_instead_of_panicking() {
         // A `None` here cannot be a logic error — `new` fills the field before
         // the Arc is published and nothing clears it — so it means the
@@ -1893,7 +1950,7 @@ mod collection_tests {
         // machine down and buried the corruption that caused it.
         let mut tc = TaskCollection::new(0);
         {
-            let tc = unsafe { Arc::get_mut_unchecked(&mut tc) };
+            let tc = Arc::get_mut(&mut tc).unwrap();
             tc.generator = None;
         }
         assert!(tc.take_task().is_none());

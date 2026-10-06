@@ -722,21 +722,13 @@ pub(crate) fn request_resched(owner: u8) {
     // pre-halt `has_ready()` recheck. `NEED_RESCHED` is a pure optimisation
     // hint layered on top, so its ordering does not enter that argument.
     let sleeping = SLEEPING_CPUS.load(Ordering::SeqCst) & bit != 0;
-    // Relaxed pre-check keeps a burst of wakes off this shared cacheline: with
-    // a request already outstanding there is nothing new to publish.
-    if NEED_RESCHED.load(Ordering::Relaxed) & bit != 0 {
-        // …but a target that parked *after* that earlier request still has to
-        // be kicked out of `hlt`, or the wake waits for its next tick.
-        if sleeping {
-            send_resched_ipi(owner);
-        } else if owner != crate::arch::cpu_id() as usize {
-            RESCHED_SUPPRESSED.fetch_add(1, Ordering::Relaxed);
-        }
-        return;
-    }
+    // Coalesce atomically with the target's clear: a separate load/return can
+    // suppress this request after the target already consumed the previous one.
     let already_pending = NEED_RESCHED.fetch_or(bit, Ordering::SeqCst) & bit != 0;
     if !already_pending {
         RESCHED_REQUESTED.fetch_add(1, Ordering::Relaxed);
+    } else if !sleeping && owner != crate::arch::cpu_id() as usize {
+        RESCHED_SUPPRESSED.fetch_add(1, Ordering::Relaxed);
     }
     if sleeping || (!already_pending && owner != crate::arch::cpu_id() as usize) {
         send_resched_ipi(owner);
@@ -1061,7 +1053,10 @@ pub struct ExecutorRuntime {
     current_executor: Option<Arc<Pin<Box<Executor>>>>,
 
     // runtime context, WARN: riscv and x86_64 use different struct
+    #[cfg(target_arch = "x86_64")]
     context: Context,
+    #[cfg(any(target_arch = "riscv64", target_arch = "aarch64"))]
+    context: core::cell::UnsafeCell<Context>,
 }
 
 impl ExecutorRuntime {
@@ -1074,7 +1069,7 @@ impl ExecutorRuntime {
             strong_executor: Arc::new(Executor::new(tc_clone)),
             weak_executors: vec![],
             current_executor: None,
-            context: Context::default(),
+            context: Default::default(),
         }
     }
 
@@ -1122,11 +1117,8 @@ impl ExecutorRuntime {
     }
 
     fn downgrade_strong_executor(&mut self) {
-        // SAFETY: 只会在一个 core 上运行，不需要考虑同步问题
-        let mut old = self.strong_executor.clone();
-        unsafe {
-            Arc::get_mut_unchecked(&mut old).mark_weak();
-        }
+        let old = self.strong_executor.clone();
+        old.mark_weak();
         self.reclaim_finished_weaks();
         if self.weak_executors.len() >= MAX_WEAK_PER_CPU {
             WEAK_CAP_HITS.fetch_add(1, Ordering::Relaxed);
@@ -1164,7 +1156,7 @@ impl ExecutorRuntime {
 
     #[cfg(target_arch = "riscv64")]
     fn get_context(&self) -> usize {
-        &self.context as *const Context as usize
+        self.context.get() as usize
     }
 
     #[cfg(target_arch = "x86_64")]
@@ -1174,7 +1166,7 @@ impl ExecutorRuntime {
 
     #[cfg(target_arch = "aarch64")]
     fn get_context(&self) -> usize {
-        &self.context as *const Context as usize
+        self.context.get() as usize
     }
 }
 
@@ -1536,11 +1528,23 @@ const FRAME_SIZE: usize = 0x40;
 /// Byte offset of the saved resume `rip` inside that frame (`[rsp + 0x38]`).
 #[cfg(target_arch = "x86_64")]
 const FRAME_RIP_OFFSET: usize = 0x38;
-/// The kernel image's virtual range. A resume address outside it is a `ret` to
-/// nowhere. The spine registry applies the same range to the same kind of
-/// value (`executor::spine_register`'s `val`), and the two have to agree.
+/// Early-boot fallback until the HAL publishes the linker's actual text range.
 #[cfg(target_arch = "x86_64")]
 const KERNEL_TEXT: core::ops::Range<u64> = 0xffff_ff00_0000_0000..0xffff_ff00_0100_0000;
+
+#[cfg(target_arch = "x86_64")]
+fn resume_address_in_text(rip: u64, (lo, hi): (usize, usize)) -> bool {
+    if lo != 0 && hi > lo {
+        (lo as u64..hi as u64).contains(&rip)
+    } else {
+        KERNEL_TEXT.contains(&rip)
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn kernel_resume_address(rip: u64) -> bool {
+    resume_address_in_text(rip, lock::fn_slot::text_range())
+}
 
 /// [null-exec guard] What a parked switch-out frame looks like from outside.
 ///
@@ -1611,7 +1615,7 @@ pub(crate) unsafe fn classify_parked_frame(sp: usize, base: usize, top: usize) -
     }
     // SAFETY: as above; the frame's last word is at `sp + FRAME_SIZE - 8`.
     let rip = unsafe { core::ptr::read_volatile((sp + FRAME_RIP_OFFSET) as *const u64) };
-    if !KERNEL_TEXT.contains(&rip) {
+    if !kernel_resume_address(rip) {
         return FrameVerdict::RipNotInText { rip };
     }
     FrameVerdict::Resumable
@@ -1969,9 +1973,15 @@ pub fn handle_timeout() {
 }
 
 /// 运行executor.run()
+///
+/// # Safety
+///
+/// `executor_addr` must name the pinned executor owned by this CPU's runtime,
+/// with an exclusive resume claim. The runtime keeps its owner alive until
+/// execution has switched off this stack.
 #[unsafe(no_mangle)]
-pub(crate) fn run_executor(executor_addr: usize) {
-    let mut p = unsafe { Box::from_raw(executor_addr as *mut Executor) };
+pub(crate) unsafe extern "C" fn run_executor(executor_addr: usize) -> ! {
+    let p = unsafe { &*(executor_addr as *const Executor) };
     p.run();
     // Weak executor may return
     let runtime = get_current_runtime();
@@ -2290,78 +2300,19 @@ pub fn irq_on_idle_executor() -> bool {
     rt.current_executor.is_none()
 }
 
-/// IRQ nest on an executor stack whose current `[RSP]` qword is null.
+/// Compatibility entry point for the retired stack-top heuristic.
 ///
-/// Historically `executor_entry` did `push 0; jmp run_executor`, leaving a
-/// null return pad; RET through it was null-EXECUTE. Entry now uses `call`
-/// (real return). A smashed / still-zero slot matches too.
+/// A Rust function's current RSP can point at locals or alignment padding, not
+/// a return address. A zero there is not evidence of corruption and must not
+/// suppress timer callbacks. Known return slots are checked by `spine_verify`.
 #[inline]
 pub fn current_stack_top_looks_null() -> bool {
-    #[cfg(not(target_arch = "x86_64"))]
-    {
-        return false;
-    }
-    #[cfg(target_arch = "x86_64")]
-    {
-        let rsp: usize = {
-            let mut rsp: usize;
-            // SAFETY: reading RSP only.
-            unsafe {
-                core::arch::asm!(
-                    "mov {}, rsp",
-                    out(reg) rsp,
-                    options(nostack, nomem, preserves_flags)
-                );
-            }
-            rsp
-        };
-        if (rsp & 7) != 0 {
-            return false;
-        }
-        if !(rsp >= 0xffff_ff00_0000_0000 && rsp < 0xffff_ff01_0000_0000) {
-            return false;
-        }
-        // SAFETY: rsp 8-aligned in kernel stack window.
-        let top = unsafe { core::ptr::read_volatile(rsp as *const u64) };
-        if top != 0 {
-            return false;
-        }
-        // Confirm we are on this CPU's executor usable (or guard) region so a
-        // null qword on an unrelated kernel stack does not trip the skip.
-        let cpu = crate::arch::cpu_id() as usize;
-        if cpu >= MAX_CORE_NUM {
-            return true;
-        }
-        let Some(rt) = GLOBAL_RUNTIME.try_lock_cpu(cpu) else {
-            // Lock held + [rsp]==0: be conservative.
-            return true;
-        };
-        use crate::STACK_SIZE;
-        let on_stack = |base: usize| -> bool {
-            classify_stack_ptr(rsp, base).is_some() || (rsp > base && rsp < base + STACK_SIZE)
-        };
-        if on_stack(rt.strong_executor.stack_base()) {
-            return true;
-        }
-        for slot in rt.weak_executors.iter() {
-            if let Some(ex) = slot {
-                if on_stack(ex.stack_base()) {
-                    return true;
-                }
-            }
-        }
-        // Idle runtime context with [rsp]==0 — still dangerous for dyn.
-        // (Do not call irq_on_idle_executor(): we already hold `rt`.)
-        rt.current_executor.is_none()
-    }
+    false
 }
 
 /// Skip *all* heap-backed dyn dispatch from `timer_tick` / idle IRQ:
 /// near-overflow on the current coroutine, OR soft-smash / fat-ptr smash
 /// already sticky-noted (do not keep calling through a half-smashed heap).
-///
-/// Idle path also skips when `[RSP]==0` on the current stack (null return /
-/// alignment zero that would RET to rip=0).
 #[inline]
 pub fn irq_should_skip_dyn_dispatch() -> bool {
     if irq_should_skip_heavy_work() {
@@ -2371,12 +2322,6 @@ pub fn irq_should_skip_dyn_dispatch() -> bool {
     // timer `Box<dyn Fn>` work after `[rsp]=0x13446` is how a second #PF
     // cascades inside the same callback pass.
     if heap_smash_suspected() {
-        return true;
-    }
-    // Idle IRQ: null stack top → skip ALL dyn (cursor / HID / Box callbacks).
-    // `heap_smash_suspected` already covered above; drivers' sticky is OR'd by
-    // the timer caller. Here we catch the pre-smash `[rsp]==0` pattern.
-    if irq_on_idle_executor() && current_stack_top_looks_null() {
         return true;
     }
     false
@@ -2540,6 +2485,30 @@ fn current_sp() -> usize {
     sp
 }
 
+fn fault_cpu_id() -> usize {
+    // An exception can interrupt the kernel while GS still belongs to userspace.
+    lock::current_cpu_id_via_apic() as usize
+}
+
+fn stack_abandonable(
+    sp: usize,
+    base: usize,
+    canary_intact: bool,
+    scheduler_critical: bool,
+) -> bool {
+    !scheduler_critical && (base..base + crate::STACK_SIZE).contains(&sp) && canary_intact
+}
+
+fn executor_stack_abandonable(executor: &Executor, sp: usize) -> bool {
+    let critical = executor.is_scheduler_critical();
+    stack_abandonable(
+        sp,
+        executor.stack_base(),
+        !critical && executor.canary_intact(),
+        critical,
+    )
+}
+
 /// Whether the coroutine running on this CPU can be abandoned right now.
 ///
 /// True only when this CPU is inside `Executor::run`'s `task.poll`, standing on
@@ -2547,12 +2516,14 @@ fn current_sp() -> usize {
 /// The last condition matters: a canary that is already clobbered means the
 /// neighbouring heap has been overwritten, and no amount of task-level recovery
 /// makes such a kernel safe to keep running.
+/// Checkout and post-poll bookkeeping are also excluded: abandoning them can
+/// orphan a borrowed task or permanently leak an untracked queue/cursor lock.
 ///
 /// Answers `false` rather than blocking if this CPU's runtime is locked — the
 /// callers are panic paths, where spinning on a lock is how a diagnosable fault
 /// turns into a silent freeze.
 pub fn current_task_abandonable() -> bool {
-    let cpu = crate::arch::cpu_id() as usize;
+    let cpu = fault_cpu_id();
     if cpu >= MAX_CORE_NUM {
         return false;
     }
@@ -2562,7 +2533,7 @@ pub fn current_task_abandonable() -> bool {
     let Some(executor) = runtime.current_executor.as_ref() else {
         return false;
     };
-    executor.is_polling() && executor.stack_contains(current_sp()) && executor.canary_intact()
+    executor.is_polling() && executor_stack_abandonable(executor, current_sp())
 }
 
 /// Abandon the coroutine running on this CPU and hand the core back to the
@@ -2590,13 +2561,10 @@ pub fn current_task_abandonable() -> bool {
 /// executor (the idle/scheduler case, where there is no task to blame).
 ///
 /// True when the faulting frames really are on the current executor's own
-/// stack and it is NOT inside a poll. The canary is deliberately NOT required
-/// here: this path exists for a stack corrupted from OUTSIDE (the recurring SMP
-/// smash), and demanding an intact canary would decline exactly the case it is
-/// meant to rescue. Nothing on the stack is trusted — it is discarded, not
-/// resumed.
+/// stack and it is NOT inside a poll. A damaged soft canary disqualifies this
+/// path too: discarding a stack cannot repair neighbouring heap corruption.
 pub fn current_executor_abandonable() -> bool {
-    let cpu = crate::arch::cpu_id() as usize;
+    let cpu = fault_cpu_id();
     if cpu >= MAX_CORE_NUM {
         return false;
     }
@@ -2606,7 +2574,7 @@ pub fn current_executor_abandonable() -> bool {
     let Some(executor) = runtime.current_executor.as_ref() else {
         return false;
     };
-    !executor.is_polling() && executor.stack_contains(current_sp())
+    !executor.is_polling() && executor_stack_abandonable(executor, current_sp())
 }
 
 /// Discard the executor running on this CPU and hand the core back to the
@@ -2629,9 +2597,10 @@ pub fn current_executor_abandonable() -> bool {
 /// For faults taken on a **different** stack than the one that failed: a `#DF`
 /// or `#GP` is delivered on its own IST stack, so `current_sp()` says nothing
 /// about which coroutine died. The arch trap entry stashes the faulting frame
-/// (`kstats::note_fault_regs`) and this answers from that instead.
+/// (`kstats::current_fault_rsp`) and this answers from that instead. The caller
+/// must supply CURRENT trap provenance, not historical diagnostic registers.
 pub fn fault_sp_abandonable(fault_sp: usize) -> bool {
-    let cpu = crate::arch::cpu_id() as usize;
+    let cpu = fault_cpu_id();
     if cpu >= MAX_CORE_NUM {
         return false;
     }
@@ -2641,7 +2610,7 @@ pub fn fault_sp_abandonable(fault_sp: usize) -> bool {
     let Some(executor) = runtime.current_executor.as_ref() else {
         return false;
     };
-    executor.stack_contains(fault_sp)
+    executor_stack_abandonable(executor, fault_sp)
 }
 
 /// Discard the executor that owns `fault_sp` and hand the core back to the
@@ -2657,63 +2626,52 @@ pub fn fault_sp_abandonable(fault_sp: usize) -> bool {
 /// # Safety
 ///
 /// Fault path, interrupts off, no kernel lock held. `fault_sp` must be the SP
-/// captured from the faulting frame.
+/// captured from the currently active faulting frame, not an earlier trap.
 pub unsafe fn abandon_executor_for_sp(fault_sp: usize) -> bool {
-    let cpu = crate::arch::cpu_id() as usize;
-    if cpu >= MAX_CORE_NUM {
-        return false;
-    }
-    let Some(runtime) = GLOBAL_RUNTIME.try_lock_cpu(cpu) else {
-        return false;
-    };
-    let Some(executor) = runtime.current_executor.clone() else {
-        return false;
-    };
-    if !executor.stack_contains(fault_sp) {
-        return false;
-    }
-    // Retire whatever it was doing: a task if one was in flight, else the
-    // executor itself. Either way it must never be resumed.
-    if !executor.abandon_current_task() && !executor.abandon_idle_executor() {
-        // Already polling but the task could not be retired: still force the
-        // runtime to replace this executor rather than resume a dead stack.
-        executor.force_replace_executor();
-    }
-    let executor_cx = executor.context.get_context();
-    let runtime_cx = runtime.get_context();
-    drop(runtime);
-    drop(executor);
-    switch(executor_cx, runtime_cx);
-    unreachable!("abandoned executor (fault_sp) was resumed");
+    abandon_executor_stack(Some(fault_sp), None, || {})
 }
 
+/// Discard an idle executor on its own stack, only with an intact canary.
+///
+/// # Safety
+/// Interrupts must be disabled, no kernel lock held, and the abandoned chain
+/// must never be accessed again.
 pub unsafe fn abandon_current_executor() -> bool {
-    let cpu = crate::arch::cpu_id() as usize;
-    if cpu >= MAX_CORE_NUM {
-        return false;
-    }
-    let Some(runtime) = GLOBAL_RUNTIME.try_lock_cpu(cpu) else {
-        return false;
-    };
-    let Some(executor) = runtime.current_executor.clone() else {
-        return false;
-    };
-    if executor.is_polling() || !executor.stack_contains(current_sp()) {
-        return false;
-    }
-    if !executor.abandon_idle_executor() {
-        return false;
-    }
-    let executor_cx = executor.context.get_context();
-    let runtime_cx = runtime.get_context();
-    drop(runtime);
-    drop(executor);
-    switch(executor_cx, runtime_cx);
-    unreachable!("abandoned idle executor was resumed");
+    abandon_executor_stack(None, Some(false), || {})
 }
 
+/// Retire the currently polled task and leave its executor stack permanently.
+///
+/// # Safety
+/// Interrupts must be disabled, no kernel lock held, and the abandoned chain
+/// must never be accessed again.
 pub unsafe fn abandon_current_task() -> bool {
-    let cpu = crate::arch::cpu_id() as usize;
+    abandon_executor_stack(None, Some(true), || {})
+}
+
+/// Abandon the whole executor call chain, cleaning up CPU-local trap state only
+/// after retirement succeeds and immediately before the nonreturning switch.
+///
+/// `None` requires standing on the executor stack. `Some(sp)` permits an IST
+/// caller, but only with stack provenance from its currently active trap.
+///
+/// # Safety
+/// Interrupts must be disabled and no kernel lock held. `before_switch` must
+/// return normally without changing executor ownership or enabling interrupts.
+/// No state owned by the abandoned chain may subsequently be accessed.
+pub unsafe fn abandon_executor_chain(
+    fault_sp: Option<usize>,
+    before_switch: impl FnOnce(),
+) -> bool {
+    abandon_executor_stack(fault_sp, None, before_switch)
+}
+
+unsafe fn abandon_executor_stack(
+    fault_sp: Option<usize>,
+    polling: Option<bool>,
+    before_switch: impl FnOnce(),
+) -> bool {
+    let cpu = fault_cpu_id();
     if cpu >= MAX_CORE_NUM {
         return false;
     }
@@ -2723,11 +2681,17 @@ pub unsafe fn abandon_current_task() -> bool {
     let Some(executor) = runtime.current_executor.clone() else {
         return false;
     };
-    if !executor.is_polling() || !executor.stack_contains(current_sp()) || !executor.canary_intact()
+    if polling.is_some_and(|required| executor.is_polling() != required)
+        || !executor_stack_abandonable(&executor, fault_sp.unwrap_or_else(current_sp))
     {
         return false;
     }
-    if !executor.abandon_current_task() {
+    let retired = if executor.is_polling() {
+        executor.abandon_current_task()
+    } else {
+        executor.abandon_idle_executor()
+    };
+    if !retired {
         return false;
     }
     // `is_running_future()` is deliberately left true: on the far side of the
@@ -2740,6 +2704,7 @@ pub unsafe fn abandon_current_task() -> bool {
     let runtime_cx = runtime.get_context();
     drop(runtime);
     drop(executor);
+    before_switch();
     switch(executor_cx, runtime_cx);
     unreachable!("abandoned executor was resumed");
 }
@@ -2762,6 +2727,50 @@ pub(crate) fn get_current_runtime() -> MutexGuard<'static, ExecutorRuntime> {
     // Forcing is correct: this CPU owns its slot, and the first entry into
     // the scheduler loop is exactly where the runtime should come to exist.
     crate::diag::diag_lock(GLOBAL_RUNTIME.force(id))
+}
+
+#[cfg(test)]
+mod containment_tests {
+    use super::*;
+
+    #[test]
+    fn every_containment_path_requires_an_intact_canary_and_its_own_stack() {
+        const BASE: usize = 0x1000_0000;
+        for sp in [BASE, BASE + 8, BASE + crate::STACK_SIZE - 1] {
+            assert!(stack_abandonable(sp, BASE, true, false));
+            assert!(
+                !stack_abandonable(sp, BASE, false, false),
+                "idle and fault-SP paths must not bypass the soft-canary gate"
+            );
+        }
+        for sp in [0, BASE - 1, BASE + crate::STACK_SIZE] {
+            assert!(!stack_abandonable(sp, BASE, true, false));
+            assert!(!stack_abandonable(sp, BASE, false, false));
+        }
+    }
+
+    #[test]
+    fn scheduler_critical_metadata_excludes_all_containment_paths() {
+        const BASE: usize = 0x1000_0000;
+        let sp = BASE + crate::STACK_SIZE / 2;
+        assert!(stack_abandonable(sp, BASE, true, false));
+        assert!(
+            !stack_abandonable(sp, BASE, true, true),
+            "an intact stack does not make checkout/bookkeeping safe to abandon"
+        );
+        assert!(!stack_abandonable(sp, BASE, false, true));
+        assert!(!stack_abandonable(BASE - 1, BASE, true, true));
+    }
+
+    #[test]
+    fn refused_abandonment_does_not_run_chain_cleanup() {
+        let _guard = resched_test_lock();
+        let cleaned = core::cell::Cell::new(false);
+        // Host tests never enter an executor; this must decline before cleanup
+        // rather than clearing a timer nesting depth whose caller will return.
+        assert!(!unsafe { abandon_executor_chain(None, || cleaned.set(true)) });
+        assert!(!cleaned.get());
+    }
 }
 
 #[allow(dead_code)]
@@ -4155,6 +4164,22 @@ mod stack_danger_tests {
 #[cfg(all(test, target_arch = "x86_64"))]
 mod parked_frame_tests {
     use super::*;
+
+    #[test]
+    fn resume_addresses_use_the_published_text_range_not_a_fixed_image_size() {
+        let lo = KERNEL_TEXT.start as usize + 0x1000;
+        let hi = KERNEL_TEXT.start as usize + 0x200_0000;
+        assert!(resume_address_in_text(KERNEL_TEXT.end, (lo, hi)));
+        assert!(!resume_address_in_text(KERNEL_TEXT.start, (lo, hi)));
+        assert!(resume_address_in_text(lo as u64, (lo, hi)));
+        assert!(!resume_address_in_text(hi as u64, (lo, hi)));
+    }
+
+    #[test]
+    fn resume_addresses_keep_the_early_boot_fallback_until_text_is_published() {
+        assert!(resume_address_in_text(KERNEL_TEXT.start, (0, 0)));
+        assert!(!resume_address_in_text(KERNEL_TEXT.end, (0, 0)));
+    }
 
     /// A resume address inside the kernel image: what `switch.S` pops into
     /// `rip` when the frame is sound.

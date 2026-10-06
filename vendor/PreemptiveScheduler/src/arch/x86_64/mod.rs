@@ -8,7 +8,7 @@ global_asm!(include_str!("switch.S"));
 global_asm!(include_str!("executor_entry.S"));
 
 unsafe extern "C" {
-    pub fn switch(old: *const ContextData, new: *const ContextData);
+    pub fn switch(old: *mut usize, new: *const usize);
     pub fn executor_entry();
 }
 
@@ -50,6 +50,17 @@ pub(crate) fn stack_pointer() -> usize {
     sp
 }
 
+#[cfg(test)]
+pub(crate) fn cpu_id() -> u8 {
+    HOST_CPU_ID.with(core::cell::Cell::get)
+}
+
+#[cfg(test)]
+pub(crate) fn set_cpu_id_for_test(cpu: u8) -> u8 {
+    HOST_CPU_ID.with(|id| id.replace(cpu))
+}
+
+#[cfg(not(test))]
 pub(crate) fn cpu_id() -> u8 {
     // Dense logical id (0..NCPU), not the sparse Local APIC id — see `lock`.
     #[cfg(target_os = "none")]
@@ -114,15 +125,24 @@ pub(crate) fn wait_for_interrupt() {
 
 // Host stand-ins, same reason as `hal_cpu_idle_host_shim`: `cli`/`sti` are
 // privileged and SIGSEGV a user-mode test process. Nothing on the host has
-// interrupts to mask; report "enabled" so `run_with_intr_saved_off!` keeps
-// its save/restore shape without touching RFLAGS.IF.
+// interrupts to mask; model IF per host thread to exercise save/restore without
+// touching privileged RFLAGS.IF.
 #[cfg(test)]
-pub(crate) fn intr_on() {}
+std::thread_local! {
+    static HOST_INTR_ENABLED: core::cell::Cell<bool> = const { core::cell::Cell::new(true) };
+    static HOST_CPU_ID: core::cell::Cell<u8> = const { core::cell::Cell::new(0) };
+}
 #[cfg(test)]
-pub(crate) fn intr_off() {}
+pub(crate) fn intr_on() {
+    HOST_INTR_ENABLED.with(|enabled| enabled.set(true));
+}
+#[cfg(test)]
+pub(crate) fn intr_off() {
+    HOST_INTR_ENABLED.with(|enabled| enabled.set(false));
+}
 #[cfg(test)]
 pub(crate) fn intr_get() -> bool {
-    true
+    HOST_INTR_ENABLED.with(core::cell::Cell::get)
 }
 
 #[cfg(not(test))]
@@ -138,4 +158,23 @@ pub(crate) fn intr_off() {
 #[cfg(not(test))]
 pub(crate) fn intr_get() -> bool {
     interrupts::are_enabled()
+}
+
+#[cfg(test)]
+mod host_state_tests {
+    #[test]
+    fn cpu_identity_override_is_thread_local_and_restorable() {
+        let previous = super::set_cpu_id_for_test(9);
+        assert_eq!(super::cpu_id(), 9);
+        std::thread::spawn(|| {
+            assert_eq!(super::cpu_id(), 0);
+            assert_eq!(super::set_cpu_id_for_test(3), 0);
+            assert_eq!(super::cpu_id(), 3);
+        })
+        .join()
+        .unwrap();
+        assert_eq!(super::cpu_id(), 9);
+        assert_eq!(super::set_cpu_id_for_test(previous), 9);
+        assert_eq!(super::cpu_id(), previous);
+    }
 }

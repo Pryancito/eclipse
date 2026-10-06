@@ -8,7 +8,7 @@ global_asm!(include_str!("switch.S"));
 global_asm!(include_str!("executor_entry.S"));
 
 unsafe extern "C" {
-    pub fn switch(old: *const ContextData, new: *const ContextData);
+    pub fn switch(old: *mut ContextData, new: *const ContextData);
     pub fn executor_entry();
 }
 
