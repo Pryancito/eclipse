@@ -161,15 +161,23 @@ pub fn end_timer_callback() {
 ///
 /// # Safety
 /// Interrupts must be disabled; no abandoned callback may return afterwards.
-pub unsafe fn abandon_timer_callbacks() {
+pub unsafe fn abandon_timer_callbacks() -> u32 {
     // Faults can arrive with user GS active. Never use its block publisher here.
     #[cfg(test)]
     let cpu = this_cpu_id();
     #[cfg(not(test))]
     let cpu = lock::current_cpu_id_via_apic() as usize;
-    if cpu < MAX_CORE_NUM {
-        *PERCPU[cpu].timer_callback_depth.get_mut() = 0;
+    if cpu >= MAX_CORE_NUM {
+        return 0;
     }
+    // Answer the depth that was thrown away, so the caller can tell a
+    // containment that cut a live `timer_tick` short from one that did not.
+    // Both are contained faults; only the first one means a CPU skipped the
+    // rest of its housekeeping, and nothing else in the report says so.
+    let cell = &PERCPU[cpu].timer_callback_depth;
+    let was = *cell.get();
+    *cell.get_mut() = 0;
+    was
 }
 
 /// Backing storage for every CPU's block, indexed by dense logical CPU id.
@@ -571,7 +579,12 @@ mod tests {
         as_cpu(18);
         begin_timer_callback();
         as_cpu(17);
-        unsafe { abandon_timer_callbacks() };
+        assert_eq!(
+            unsafe { abandon_timer_callbacks() },
+            2,
+            "it answers the depth it threw away, which is what says a live \
+             timer_tick was cut short rather than some other call chain"
+        );
         assert!(!in_timer_callback());
         begin_timer_callback();
         end_timer_callback();

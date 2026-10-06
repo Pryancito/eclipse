@@ -536,19 +536,30 @@ fn report_unresolved_kernel_fault(
     // Without it a capture like `vaddr=0x1076f0000 flags=EXECUTE` is just a
     // number: it is a *user-half* address reached from ring 0, which is a
     // different bug from a null and from `.text` residue.
-    let target_shape = if access_flags.contains(kernel_hal::MMUFlags::EXECUTE) {
-        kernel_hal::kaddr::word_shape(fault_vaddr as u64).as_str()
-    } else {
-        ""
-    };
+    //
+    // For every access kind, not only EXECUTE. A capture came back as
+    // `vaddr=0xb3ae09dd67 flags=WRITE rip=<BTreeMap<usize, PageState>::insert>`
+    // with no shape named at all, and that address is a nanosecond reading of
+    // this boot's monotonic clock -- a BTreeMap storing into a timestamp, which
+    // is the same writer class as the EXECUTE captures and said nothing about
+    // itself. A faulting address is worth classifying whichever way the access
+    // went.
+    let target_shape = kernel_hal::kaddr::word_shape(fault_vaddr as u64).as_str();
+    // And the clock question on the faulting address too, since that is what
+    // turned the EXECUTE captures from "a user-half word" into "an instant".
+    let clock = kernel_hal::kaddr::clock_shape(
+        fault_vaddr as u64,
+        kernel_hal::deadline::duration_to_ns(kernel_hal::timer::timer_now()),
+    );
     kernel_hal::oops_log::report(format_args!(
-        "\n[KERNEL PAGE FAULT] vaddr={:#x}{}{} flags={:?} rip={} have_thread={} \
+        "\n[KERNEL PAGE FAULT] vaddr={:#x}{}{} ({}) flags={:?} rip={} have_thread={} \
          (unresolved by the user vmar — a kernel-side bug, not a userspace \
          SIGSEGV; the text console is skipped so a torn graphic console cannot \
          re-fault us)\n",
         fault_vaddr,
         if target_shape.is_empty() { "" } else { " is " },
         target_shape,
+        clock.as_str(),
         access_flags,
         kernel_hal::ksyms::Addr(rip),
         have_thread,
