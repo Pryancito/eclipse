@@ -21,7 +21,7 @@
 //
 // Options (before the positional arguments):
 //     --only SECTION   run one section: cpu, mem, syscall, vm, sched, psched,
-//                      net, fs, smp, disk, proc, gfx
+//                      net, fs, heap, sig, futex, smp, disk, proc, gfx
 //     --drm PATH       DRM device for the gfx section (default /dev/dri/card0)
 //     --quick          shorter time budgets (rough numbers, ~3x faster)
 //     --budget MS      per-measurement wall-clock budget (default 200 ms for the
@@ -90,6 +90,7 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <poll.h>
+#include <semaphore.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
@@ -737,6 +738,15 @@ static volatile int g_fx_stop;
 
 static long futex_op(volatile int *uaddr, int op, int val) {
     return syscall(SYS_futex, uaddr, op, val, NULL, NULL, 0);
+}
+
+// The same call with a timeout, for the wait-that-expires row. Kept separate
+// so no existing probe can grow a timeout by accident: a wait that was meant
+// to be indefinite and quietly acquires one stops measuring a wake-up and
+// starts measuring a timer.
+static long futex_op_ts(volatile int *uaddr, int op, int val,
+                        const struct timespec *ts) {
+    return syscall(SYS_futex, uaddr, op, val, ts, NULL, 0);
 }
 
 static void *futex_echo_thread(void *arg) {
@@ -4313,6 +4323,1097 @@ static double fs_proc_read_ns(const char *path, uint64_t budget_ns) {
 }
 
 // ---------------------------------------------------------------------------
+// Heap and anonymous memory  [kernel]
+// ---------------------------------------------------------------------------
+//
+// The MEMORY section is `[user]`: it copies and chases pointers over memory
+// that is already faulted in, which is a property of the CPU. The VM section
+// measures one page at a time. Neither covers what a program actually does to
+// get memory: ask the allocator for a block, hand it back, grow the heap, map
+// a megabyte, give part of it back to the kernel and touch it again.
+//
+// Those are two layers and the rows keep them apart. Below the allocator's
+// mmap threshold (128 KiB in musl, 128 KiB in glibc by default) a
+// malloc/free pair never enters the kernel at all and the row is the
+// allocator's own bookkeeping; above it, every pair is an `mmap` and an
+// `munmap` and the row is the kernel's. The pair of rows either side of that
+// threshold is therefore the most informative thing here: a program whose
+// working allocations straddle it pays wildly different prices for what looks
+// like the same call.
+
+static size_t g_heap_sz;
+
+static int heap_malloc_free_op(void) {
+    void *p = malloc(g_heap_sz);
+    if (!p)
+        return 1;
+    // Touch the first and last byte so the block is really the program's: an
+    // allocator may hand back an address whose pages arrive only on use, and
+    // a benchmark that never writes would miss the fault entirely.
+    ((volatile unsigned char *)p)[0] = 1;
+    ((volatile unsigned char *)p)[g_heap_sz - 1] = 2;
+    free(p);
+    return 0;
+}
+
+static double heap_malloc_free_ns(size_t sz, uint64_t budget_ns) {
+    g_heap_sz = sz;
+    return timed_ns_per_op(heap_malloc_free_op, budget_ns);
+}
+
+static int heap_calloc_op(void) {
+    void *p = calloc(1, g_heap_sz);
+    if (!p)
+        return 1;
+    ((volatile unsigned char *)p)[g_heap_sz - 1] = 2;
+    free(p);
+    return 0;
+}
+
+// Churn: keep `HEAP_LIVE` blocks of mixed sizes alive and replace one at a
+// time in a scattered order. A fresh malloc/free pair of one size measures the
+// allocator's happiest path -- the block it just freed is the block it hands
+// back. Nothing a real program does looks like that, and the difference
+// between this row and the plain one is what a fragmented heap costs.
+#define HEAP_LIVE 512
+static void *g_heap_live[HEAP_LIVE];
+static size_t g_heap_cursor;
+static uint64_t g_heap_rng;
+
+static size_t heap_next_size(void) {
+    // 16 B to ~8 KiB, the range an ordinary program lives in, with the shape
+    // of a real mix rather than a uniform one: most allocations are small.
+    g_heap_rng = g_heap_rng * 6364136223846793005ull + 1442695040888963407ull;
+    unsigned bucket = (unsigned)(g_heap_rng >> 59) & 7;
+    static const size_t sizes[8] = {16, 24, 32, 48, 64, 256, 1024, 8192};
+    return sizes[bucket];
+}
+
+static int heap_churn_op(void) {
+    // Scatter the replacement index rather than walking in order: a linear
+    // walk frees and reallocates neighbours, which is the one pattern a
+    // size-bucketed allocator handles best.
+    g_heap_rng = g_heap_rng * 6364136223846793005ull + 1442695040888963407ull;
+    size_t i = (size_t)((g_heap_rng >> 33) % HEAP_LIVE);
+    free(g_heap_live[i]);
+    size_t sz = heap_next_size();
+    g_heap_live[i] = malloc(sz);
+    if (!g_heap_live[i])
+        return 1;
+    ((volatile unsigned char *)g_heap_live[i])[sz - 1] = 3;
+    g_heap_cursor++;
+    return 0;
+}
+
+static double heap_churn_ns(uint64_t budget_ns) {
+    g_heap_rng = 0x2545f4914f6cdd1dull;
+    for (int i = 0; i < HEAP_LIVE; i++) {
+        size_t sz = heap_next_size();
+        g_heap_live[i] = malloc(sz);
+        if (!g_heap_live[i]) {
+            for (int j = 0; j < i; j++)
+                free(g_heap_live[j]);
+            return NA;
+        }
+        ((volatile unsigned char *)g_heap_live[i])[sz - 1] = 3;
+    }
+    double ns = timed_ns_per_op(heap_churn_op, budget_ns);
+    for (int i = 0; i < HEAP_LIVE; i++)
+        free(g_heap_live[i]);
+    return ns;
+}
+
+// Growing a block the way a vector does. `realloc` can either extend in place
+// or copy, and which one it picks decides whether appending to a buffer is
+// linear or quadratic in practice. Starting small and doubling to 256 KiB
+// crosses the allocator's mmap threshold on the way, so the row covers both
+// regimes in the proportion a growing buffer meets them.
+static int heap_realloc_grow_op(void) {
+    size_t sz = 1024;
+    void *p = malloc(sz);
+    if (!p)
+        return 1;
+    while (sz < 256 * 1024) {
+        sz *= 2;
+        void *q = realloc(p, sz);
+        if (!q) {
+            free(p);
+            return 1;
+        }
+        p = q;
+        ((volatile unsigned char *)p)[sz - 1] = 4;
+    }
+    free(p);
+    return 0;
+}
+
+// The heap's own syscall: move the program break. Nothing in the suite touched
+// it, and an allocator that cannot grow the break falls back to `mmap` for
+// everything, which is a different cost and a different failure mode.
+static int heap_brk_op(void) {
+    void *before = sbrk(0);
+    if (before == (void *)-1)
+        return 1;
+    if (sbrk(64 * 1024) == (void *)-1)
+        return 1;
+    if (sbrk(-(intptr_t)(64 * 1024)) == (void *)-1)
+        return 1;
+    return 0;
+}
+
+// A megabyte of anonymous memory, touched and returned. The VM section's
+// `minor fault` row is one page; this is the whole cycle at the size a
+// program asks for, so it includes the mapping, 256 faults and the teardown,
+// and the per-MiB figure is what a process pays to grow by a megabyte.
+static size_t g_anon_bytes;
+static int g_anon_populate;
+
+static int heap_anon_cycle_op(void) {
+    int flags = MAP_PRIVATE | MAP_ANONYMOUS;
+#ifdef MAP_POPULATE
+    if (g_anon_populate)
+        flags |= MAP_POPULATE;
+#endif
+    unsigned char *p = mmap(NULL, g_anon_bytes, PROT_READ | PROT_WRITE, flags,
+                            -1, 0);
+    if (p == MAP_FAILED)
+        return 1;
+    if (!g_anon_populate) {
+        for (size_t off = 0; off < g_anon_bytes; off += 4096)
+            p[off] = 1;
+    } else {
+        // MAP_POPULATE promises the pages are already there. Touch one so the
+        // row is not measuring a mapping nobody ever used -- and so a kernel
+        // that accepted the flag and ignored it still shows its faults here
+        // rather than silently reporting a cheaper number.
+        p[0] = 1;
+    }
+    munmap(p, g_anon_bytes);
+    return 0;
+}
+
+static double heap_anon_cycle_mibs(size_t bytes, int populate,
+                                   uint64_t budget_ns) {
+    g_anon_bytes = bytes;
+    g_anon_populate = populate;
+    double ns = timed_ns_per_op(heap_anon_cycle_op, budget_ns);
+    if (ns < 0)
+        return NA;
+    return (double)bytes / (ns / 1e9) / (1024.0 * 1024.0);
+}
+
+// Give pages back without unmapping, then touch them again. This is what
+// every allocator does when a large free block is returned to the system
+// (musl's `free` on an mmap'd block unmaps; jemalloc and glibc's arenas use
+// `MADV_DONTNEED`), and what a garbage collector does after a sweep. The cost
+// is in two halves -- discarding, then re-faulting -- and the row reports the
+// pair, because an implementation that makes discarding free by deferring the
+// work only moves it into the refault.
+static unsigned char *g_madv_base;
+static size_t g_madv_bytes;
+
+static int heap_madvise_cycle_op(void) {
+    if (madvise(g_madv_base, g_madv_bytes, MADV_DONTNEED) != 0)
+        return 1;
+    for (size_t off = 0; off < g_madv_bytes; off += 4096)
+        g_madv_base[off] = 1;
+    return 0;
+}
+
+static double heap_madvise_cycle_mibs(size_t bytes, uint64_t budget_ns) {
+    g_madv_base = mmap(NULL, bytes, PROT_READ | PROT_WRITE,
+                       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (g_madv_base == MAP_FAILED)
+        return NA;
+    g_madv_bytes = bytes;
+    for (size_t off = 0; off < bytes; off += 4096)
+        g_madv_base[off] = 1;
+    double ns = timed_ns_per_op(heap_madvise_cycle_op, budget_ns);
+    munmap(g_madv_base, bytes);
+    g_madv_base = NULL;
+    if (ns < 0)
+        return NA;
+    return (double)bytes / (ns / 1e9) / (1024.0 * 1024.0);
+}
+
+// Tearing down a large mapping that is fully resident. A process exiting pays
+// this for its whole address space, and `fork`'s child pays it on `exit`, so
+// it is inside the `fork + exit` row of the PROCESS section without being
+// separable there. Measured on its own here: map, touch every page, and time
+// only the `munmap`.
+static double heap_munmap_resident_mibs(size_t bytes, uint64_t budget_ns) {
+    uint64_t elapsed_unmap = 0, ops = 0;
+    uint64_t t0 = now_ns();
+    while ((now_ns() - t0 < budget_ns || ops < 8) &&
+           now_ns() - t0 < g_max_ns) {
+        unsigned char *p = mmap(NULL, bytes, PROT_READ | PROT_WRITE,
+                                MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (p == MAP_FAILED)
+            return NA;
+        for (size_t off = 0; off < bytes; off += 4096)
+            p[off] = 1;
+        // Only the unmap is on the clock; the mapping and the faults are the
+        // setup this row exists to exclude.
+        uint64_t u0 = now_ns();
+        munmap(p, bytes);
+        elapsed_unmap += now_ns() - u0;
+        ops++;
+    }
+    if (!ops || !elapsed_unmap)
+        return NA;
+    g_last_ops = ops;
+    return (double)bytes * (double)ops / ((double)elapsed_unmap / 1e9) /
+           (1024.0 * 1024.0);
+}
+
+// Changing protection on a large region: what a JIT does when it finishes
+// writing code and flips a page to executable, and what a GC does to arm a
+// write barrier. The VM section measures one page; this is the same call over
+// a megabyte, where the cost of walking and shooting down the range shows.
+static unsigned char *g_mprot_base;
+static size_t g_mprot_bytes;
+
+static int heap_mprotect_range_op(void) {
+    if (mprotect(g_mprot_base, g_mprot_bytes, PROT_READ) != 0)
+        return 1;
+    if (mprotect(g_mprot_base, g_mprot_bytes, PROT_READ | PROT_WRITE) != 0)
+        return 1;
+    return 0;
+}
+
+static double heap_mprotect_range_ns(size_t bytes, uint64_t budget_ns) {
+    g_mprot_base = mmap(NULL, bytes, PROT_READ | PROT_WRITE,
+                        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (g_mprot_base == MAP_FAILED)
+        return NA;
+    g_mprot_bytes = bytes;
+    for (size_t off = 0; off < bytes; off += 4096)
+        g_mprot_base[off] = 1;
+    double ns = timed_ns_per_op(heap_mprotect_range_op, budget_ns);
+    munmap(g_mprot_base, bytes);
+    g_mprot_base = NULL;
+    return ns;
+}
+
+// ---------------------------------------------------------------------------
+// Signals  [kernel]
+// ---------------------------------------------------------------------------
+//
+// The SYSCALL section has one signal row, `raise(SIGUSR1)+handler`, which is
+// the cheapest possible case: the process signals itself, and delivery happens
+// before `raise` returns without anything being scheduled. Everything that
+// makes signals hard is elsewhere -- a signal arriving at another process, a
+// signal arriving while the target is blocked in a syscall, a fault turned
+// into a signal, a signal held back by a mask and released later.
+//
+// Two of these rows are correctness probes that happen to be timed. They print
+// a verdict as well as a number because a figure for a mechanism that does not
+// work is worse than no figure: the `interrupted read` row says whether a
+// syscall interrupted by a handler installed with `SA_RESTART` restarts or
+// comes back `EINTR`, and the `SIGSEGV` row says whether a fault in a handler's
+// own stack is deliverable at all.
+
+static volatile sig_atomic_t g_sig_count;
+static volatile sig_atomic_t g_sig_last;
+
+static void sig_count_handler(int sig) {
+    g_sig_last = sig;
+    g_sig_count++;
+}
+
+// `kill(getpid())` rather than `raise()`: `raise` may be a library call that
+// targets the thread, `kill` always goes through the kernel's process-directed
+// path, which is the one another process uses.
+static int sig_kill_self_op(void) {
+    sig_atomic_t before = g_sig_count;
+    if (kill(getpid(), SIGUSR1) != 0)
+        return 1;
+    return g_sig_count != before ? 0 : 1;
+}
+
+// Blocking and unblocking a signal that is already pending: the kernel has to
+// hold it, notice on the mask change, and deliver before `sigprocmask`
+// returns. Every library that protects a critical section with a mask pays
+// this whenever a signal lands inside one.
+static int sig_pending_release_op(void) {
+    sigset_t block, old;
+    sigemptyset(&block);
+    sigaddset(&block, SIGUSR1);
+    if (sigprocmask(SIG_BLOCK, &block, &old) != 0)
+        return 1;
+    sig_atomic_t before = g_sig_count;
+    if (kill(getpid(), SIGUSR1) != 0)
+        return 1;
+    // Still blocked: the handler must NOT have run yet. If it did, the mask is
+    // not being honoured and the row would otherwise report a plausible number
+    // for a broken mechanism.
+    if (g_sig_count != before)
+        return 1;
+    if (sigprocmask(SIG_SETMASK, &old, NULL) != 0)
+        return 1;
+    return g_sig_count != before ? 0 : 1;
+}
+
+// Delivery to ANOTHER process: the signal has to reach a task that is asleep,
+// wake it and run its handler. The child reports back through a pipe, so the
+// figure is a full round trip and comparable with the `pipe round trip` row --
+// the difference between the two is what the signal path adds over a plain
+// wake-up.
+struct sig_peer {
+    pid_t pid;
+    int to_child[2];   // the child blocks reading this
+    int from_child[2]; // the child answers here, from the handler
+};
+
+static struct sig_peer g_sigpeer;
+
+static void sig_child_handler(int sig) {
+    (void)sig;
+    char c = 'a';
+    ssize_t w = write(g_sigpeer.from_child[1], &c, 1);
+    (void)w;
+}
+
+static int sig_peer_start(struct sig_peer *p) {
+    if (pipe(p->to_child) != 0)
+        return -1;
+    if (pipe(p->from_child) != 0) {
+        close(p->to_child[0]);
+        close(p->to_child[1]);
+        return -1;
+    }
+    pid_t c = fork();
+    if (c < 0) {
+        close(p->to_child[0]); close(p->to_child[1]);
+        close(p->from_child[0]); close(p->from_child[1]);
+        return -1;
+    }
+    if (c == 0) {
+        close(p->to_child[1]);
+        close(p->from_child[0]);
+        g_sigpeer = *p;
+        struct sigaction sa;
+        memset(&sa, 0, sizeof sa);
+        sa.sa_handler = sig_child_handler;
+        // Deliberately WITHOUT SA_RESTART: the child sits in `read` and must
+        // come back out of it on every signal. With SA_RESTART it would go
+        // straight back to sleep and the loop below would answer once and
+        // then stop, which reads as a hang rather than as a measurement.
+        sigaction(SIGUSR1, &sa, NULL);
+        char c2;
+        // Park until the parent closes the pipe. Every signal interrupts this
+        // read, runs the handler (which answers), and the loop goes round.
+        for (;;) {
+            ssize_t r = read(p->to_child[0], &c2, 1);
+            if (r == 0)
+                _exit(0); // parent closed: we are done
+            if (r < 0 && errno != EINTR)
+                _exit(0);
+        }
+    }
+    close(p->to_child[0]);
+    close(p->from_child[1]);
+    p->pid = c;
+    return 0;
+}
+
+static void sig_peer_stop(struct sig_peer *p) {
+    close(p->to_child[1]);
+    close(p->from_child[0]);
+    int st;
+    waitpid(p->pid, &st, 0);
+}
+
+static double sig_cross_process_ns(uint64_t budget_ns) {
+    struct sig_peer p;
+    memset(&p, 0, sizeof p);
+    if (sig_peer_start(&p) != 0)
+        return NA;
+    // Give the child time to reach its `read` before the clock starts.
+    struct timespec settle = {0, 20 * 1000 * 1000};
+    nanosleep(&settle, NULL);
+    char ack;
+    uint64_t t0 = now_ns(), elapsed = 0, ops = 0;
+    while ((elapsed < budget_ns || ops < MIN_SAMPLES) && elapsed < g_max_ns) {
+        if (kill(p.pid, SIGUSR1) != 0)
+            break;
+        if (read(p.from_child[0], &ack, 1) != 1)
+            break;
+        ops++;
+        elapsed = now_ns() - t0;
+    }
+    sig_peer_stop(&p);
+    g_last_ops = ops;
+    return ops >= MIN_SAMPLES ? (double)elapsed / (double)ops : NA;
+}
+
+// A fault turned into a signal, and the handler putting the program back on
+// its feet. This is the engine under a JIT's lazy compilation, a GC's write
+// barrier, and every `mmap`-backed guard page, and it exercises a path --
+// fault, signal frame, handler, `mprotect`, return through the frame -- that
+// nothing else in the suite touches.
+static unsigned char *g_segv_page;
+static volatile sig_atomic_t g_segv_hits;
+
+static void sig_segv_handler(int sig) {
+    (void)sig;
+    g_segv_hits++;
+    // Make the page writable so the faulting instruction can be retried. A
+    // handler that returns without this would fault again forever.
+    mprotect(g_segv_page, 4096, PROT_READ | PROT_WRITE);
+}
+
+static int sig_segv_op(void) {
+    if (mprotect(g_segv_page, 4096, PROT_READ) != 0)
+        return 1;
+    sig_atomic_t before = g_segv_hits;
+    // The write faults, the handler reopens the page, the instruction retries.
+    *(volatile unsigned char *)g_segv_page = 7;
+    return g_segv_hits != before ? 0 : 1;
+}
+
+// Whether a syscall interrupted by a handler installed with `SA_RESTART` is
+// restarted by the kernel or handed back to userspace as `EINTR`.
+//
+// This is a correctness question with a cost attached, and it is the one the
+// project has been carrying as a risk: musl's `__synccall`, every `read` in a
+// shell, and anything that does not check for `EINTR` behave differently on a
+// kernel that does not restart. The probe arms a timer that fires while the
+// process is blocked reading an empty pipe, and reports which of the two
+// happened as a verdict -- plus the cost, because the restart itself is work.
+//
+// Returns 1 when the read restarted, 0 when it returned EINTR, -1 when the
+// probe could not be set up. `*ns` receives the mean cost of one
+// interrupt-and-resume.
+static volatile sig_atomic_t g_restart_ticks;
+static int g_restart_pipe[2];
+
+static void sig_restart_handler(int sig) {
+    (void)sig;
+    g_restart_ticks++;
+    // Unblock the reader on the LAST tick only, so the measured read is a
+    // genuine blocking read that was interrupted, not one with data waiting.
+    if (g_restart_ticks >= 2) {
+        char c = 'z';
+        ssize_t w = write(g_restart_pipe[1], &c, 1);
+        (void)w;
+    }
+}
+
+static int sig_restart_probe(double *ns) {
+    *ns = NA;
+    if (pipe(g_restart_pipe) != 0)
+        return -1;
+    struct sigaction sa, old;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_handler = sig_restart_handler;
+    sa.sa_flags = SA_RESTART;
+    if (sigaction(SIGALRM, &sa, &old) != 0) {
+        close(g_restart_pipe[0]);
+        close(g_restart_pipe[1]);
+        return -1;
+    }
+    struct itimerval it;
+    memset(&it, 0, sizeof it);
+    it.it_value.tv_usec = 20000;    // first tick: interrupts the read
+    it.it_interval.tv_usec = 20000; // second tick: writes the byte
+    int restarted = -1;
+    uint64_t t0 = now_ns();
+    if (setitimer(ITIMER_REAL, &it, NULL) == 0) {
+        g_restart_ticks = 0;
+        char c;
+        ssize_t r = read(g_restart_pipe[0], &c, 1);
+        uint64_t dt = now_ns() - t0;
+        // What is worth reporting is NOT `dt`: almost all of it is the timer
+        // schedule we chose ourselves (20 ms per tick), so the raw figure
+        // would be ~40 ms on any kernel and would say nothing. Subtracting
+        // the ticks that actually had to fire leaves the delivery, the
+        // handler and the restart -- the part that is the kernel's.
+        if (r == 1) {
+            // The read came back with the byte the SECOND tick wrote, so it
+            // survived the first interruption: the kernel restarted it. Two
+            // ticks fired, so two periods are ours and not the kernel's.
+            restarted = 1;
+            *ns = (double)dt - 40000000.0;
+        } else if (r < 0 && errno == EINTR) {
+            // Handed back to userspace after the first tick instead: one
+            // period, so a different baseline comes off.
+            restarted = 0;
+            *ns = (double)dt - 20000000.0;
+        }
+        if (restarted >= 0 && *ns < 0)
+            *ns = NA; // the clock came back before the timer could have fired
+        memset(&it, 0, sizeof it);
+        setitimer(ITIMER_REAL, &it, NULL);
+    }
+    sigaction(SIGALRM, &old, NULL);
+    close(g_restart_pipe[0]);
+    close(g_restart_pipe[1]);
+    return restarted;
+}
+
+// A handler running on its own stack. `sigaltstack` is what lets a process
+// survive a stack overflow -- the fault arrives with no usable stack, so the
+// handler has to be given one -- and this tree has already shipped a bug where
+// the advertised stack limit and the mapped stack disagreed. The row times the
+// install/restore pair; the verdict says whether a handler actually ran on the
+// alternate stack.
+static volatile sig_atomic_t g_altstack_ran;
+static volatile sig_atomic_t g_altstack_onstack;
+
+static void sig_altstack_handler(int sig) {
+    (void)sig;
+    g_altstack_ran = 1;
+    stack_t cur;
+    if (sigaltstack(NULL, &cur) == 0)
+        g_altstack_onstack = (cur.ss_flags & SS_ONSTACK) ? 1 : 0;
+}
+
+static int sig_altstack_verdict(void) {
+    stack_t ss, old_ss;
+    struct sigaction sa, old_sa;
+    ss.ss_sp = malloc(SIGSTKSZ < 32768 ? 32768 : (size_t)SIGSTKSZ);
+    if (!ss.ss_sp)
+        return -1;
+    ss.ss_size = SIGSTKSZ < 32768 ? 32768 : (size_t)SIGSTKSZ;
+    ss.ss_flags = 0;
+    if (sigaltstack(&ss, &old_ss) != 0) {
+        free(ss.ss_sp);
+        return -1;
+    }
+    memset(&sa, 0, sizeof sa);
+    sa.sa_handler = sig_altstack_handler;
+    sa.sa_flags = SA_ONSTACK;
+    int ok = -1;
+    if (sigaction(SIGUSR2, &sa, &old_sa) == 0) {
+        g_altstack_ran = g_altstack_onstack = 0;
+        if (raise(SIGUSR2) == 0 && g_altstack_ran)
+            ok = g_altstack_onstack ? 1 : 0;
+        sigaction(SIGUSR2, &old_sa, NULL);
+    }
+    sigaltstack(&old_ss, NULL);
+    free(ss.ss_sp);
+    return ok;
+}
+
+// `sigsuspend`: swap the mask and sleep until something arrives. Every
+// `wait for a child` and every "pause until told" loop is built on it, and
+// unlike the rows above the process really has to be put to sleep and woken,
+// so this is the signal path's wake-up latency rather than its delivery cost.
+static double sig_suspend_ns(uint64_t budget_ns) {
+    struct sig_peer p;
+    memset(&p, 0, sizeof p);
+    sigset_t block, old, waitmask;
+    sigemptyset(&block);
+    sigaddset(&block, SIGUSR1);
+    if (sigprocmask(SIG_BLOCK, &block, &old) != 0)
+        return NA;
+    sigemptyset(&waitmask);
+    // A child that signals us on a timer would need a schedule of its own; the
+    // simpler construction is to arm our own interval timer and suspend until
+    // it fires, which measures the same sleep and wake.
+    struct sigaction sa, old_sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_handler = sig_count_handler;
+    if (sigaction(SIGALRM, &sa, &old_sa) != 0) {
+        sigprocmask(SIG_SETMASK, &old, NULL);
+        return NA;
+    }
+    sigset_t ablock;
+    sigemptyset(&ablock);
+    sigaddset(&ablock, SIGALRM);
+    sigprocmask(SIG_BLOCK, &ablock, NULL);
+    sigemptyset(&waitmask); // suspend with everything unblocked
+    struct itimerval it;
+    memset(&it, 0, sizeof it);
+    it.it_value.tv_usec = 1000;
+    it.it_interval.tv_usec = 1000; // 1 ms: short enough to collect samples
+    uint64_t t0 = now_ns(), elapsed = 0, ops = 0;
+    if (setitimer(ITIMER_REAL, &it, NULL) == 0) {
+        while ((elapsed < budget_ns || ops < MIN_SAMPLES) &&
+               elapsed < g_max_ns) {
+            sigsuspend(&waitmask); // always returns -1/EINTR after delivery
+            ops++;
+            elapsed = now_ns() - t0;
+        }
+        memset(&it, 0, sizeof it);
+        setitimer(ITIMER_REAL, &it, NULL);
+    }
+    sigaction(SIGALRM, &old_sa, NULL);
+    sigprocmask(SIG_SETMASK, &old, NULL);
+    (void)p;
+    if (!ops)
+        return NA;
+    g_last_ops = ops;
+    // Each iteration is one 1 ms timer period plus the wake; reporting the
+    // overshoot rather than the period is what isolates the kernel's part.
+    double per = (double)elapsed / (double)ops;
+    return per - 1000000.0 > 0 ? per - 1000000.0 : per;
+}
+
+// ---------------------------------------------------------------------------
+// Futex and the locks built on it  [kernel]
+// ---------------------------------------------------------------------------
+//
+// The SCHEDULER section measures one futex round trip and the `psched` section
+// measures the wake issue and the shared-versus-private difference. What is
+// missing is everything about CONTENTION, which is the only regime in which a
+// lock costs anything: how much an uncontended lock costs when the kernel is
+// never entered, what the wake nobody is waiting for costs (every unlock of an
+// uncontended mutex considers one), and what happens when a wake has to pick
+// one waiter out of many or wake all of them.
+//
+// The `_of_1` / `_of_16` / `_of_64` families are the point. A wake that costs
+// the same whatever the queue length is O(1); one that grows with it makes
+// every condition variable in the system quadratic under load, and no single
+// row can tell those apart.
+
+// A mutex nobody else wants: the lock and unlock are compare-and-swap in
+// userspace and the kernel is never entered. It is the `[user]` floor the
+// contended rows are measured against -- if this row and the contended one are
+// close, the kernel is being entered when it should not be.
+static pthread_mutex_t g_fx_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static int futex_uncontended_op(void) {
+    if (pthread_mutex_lock(&g_fx_mutex) != 0)
+        return 1;
+    g_sink++;
+    return pthread_mutex_unlock(&g_fx_mutex) == 0 ? 0 : 1;
+}
+
+// The wake with nobody to wake. Every unlock of a mutex that *might* have
+// waiters issues one, so on a lock that is mostly uncontended this is pure
+// overhead paid on every release, and it is the cheapest possible futex
+// syscall: look the word up, find an empty queue, return 0.
+static volatile int g_fx_empty_word;
+
+static int futex_wake_empty_op(void) {
+    long r = futex_op(&g_fx_empty_word, ECL_FUTEX_WAKE, 1);
+    return r == 0 ? 0 : 1;
+}
+
+// Wake one waiter out of N. The waiters park on the SAME word, so the kernel
+// has a queue of N to pick from, and the probe hands the baton to exactly one
+// of them and waits for it to hand it back. What varies between the rows is
+// only the length of that queue.
+struct fx_herd {
+    volatile int word;      // what the waiters sleep on
+    volatile int token;     // bumped by the woken waiter
+    volatile int stop;
+    volatile int started;   // waiters that reached their first wait
+    volatile int parked;    // waiters currently inside FUTEX_WAIT
+    int nwaiters;
+    int broadcast;          // wake all rather than one
+    volatile int done;
+    int refs;
+};
+
+static void *fx_waiter(void *arg) {
+    struct fx_herd *h = arg;
+    __atomic_fetch_add(&h->started, 1, __ATOMIC_ACQ_REL);
+    while (!__atomic_load_n(&h->stop, __ATOMIC_ACQUIRE)) {
+        // Wait while the word is 0. A spurious return is fine: the loop
+        // re-reads and parks again, which is exactly what a real waiter does.
+        //
+        // `parked` is maintained around the call so the driver can tell a
+        // thread that is IN the queue from one that has been woken and has
+        // not got back yet. Without that the driver cannot know how long the
+        // queue it is about to wake really is.
+        __atomic_fetch_add(&h->parked, 1, __ATOMIC_ACQ_REL);
+        futex_op(&h->word, ECL_FUTEX_WAIT, 0);
+        __atomic_fetch_sub(&h->parked, 1, __ATOMIC_ACQ_REL);
+        if (__atomic_load_n(&h->stop, __ATOMIC_ACQUIRE))
+            break;
+        // Whoever woke bumps the token so the driver can see progress. Several
+        // may do it on a broadcast; the driver only needs one.
+        __atomic_fetch_add(&h->token, 1, __ATOMIC_ACQ_REL);
+        // Then SLEEP until the driver clears the word, instead of diving back
+        // into FUTEX_WAIT. While the word is set, FUTEX_WAIT returns EAGAIN
+        // without blocking, so a loop here would spin hot on a CPU -- and with
+        // more waiters than CPUs those spinners preempt the driver, which then
+        // charges their CPU time to the wake it is timing. That is what made
+        // the `of 64` rows read fifty times the `of 1` ones on Linux, where
+        // the futex queue is not scanned at all.
+        while (__atomic_load_n(&h->word, __ATOMIC_ACQUIRE) != 0 &&
+               !__atomic_load_n(&h->stop, __ATOMIC_ACQUIRE)) {
+            struct timespec tick = {0, 50 * 1000};
+            nanosleep(&tick, NULL);
+        }
+    }
+    CTL_DROP(h);
+    return NULL;
+}
+
+// One wake, measured against a queue of `n`, in one of two regimes.
+//
+// `issue_only` times the FUTEX_WAKE syscall and nothing else: the kernel picks
+// a waiter off the queue, makes it runnable and returns. THAT is the row that
+// answers whether the pick scans the queue, because nothing else in it depends
+// on the machine having a spare CPU.
+//
+// Otherwise the clock runs from the wake to the woken thread reporting back --
+// the figure a program actually feels, but on a box with more waiters than CPUs
+// most of it is the woken thread queueing for a CPU rather than anything the
+// futex code did. The two rows together separate those.
+//
+// Either way the per-iteration cost is ACCUMULATED rather than taken from the
+// total wall clock, so the barrier that puts the queue back to `n` waiters can
+// sit outside the measurement. It has to: without it the queue drains after the
+// first wake and a row labelled `of 64` reports a queue of one.
+//
+// The driver does NOT join the waiters per iteration -- that would measure
+// thread teardown -- and it clears the word again afterwards so the next
+// iteration starts from the same state.
+static double futex_wake_of_n(int n, int broadcast, int issue_only,
+                              uint64_t budget_ns) {
+    struct fx_herd *h = calloc(1, sizeof *h);
+    if (!h)
+        return NA;
+    h->nwaiters = n;
+    h->broadcast = broadcast;
+    h->refs = 1;
+    pthread_t th[64];
+    if (n > 64)
+        n = 64;
+    int made = 0;
+    for (int i = 0; i < n; i++) {
+        CTL_LEND(h);
+        if (pthread_create(&th[i], NULL, fx_waiter, h) != 0) {
+            CTL_DROP(h);
+            break;
+        }
+        made++;
+    }
+    if (made == 0) {
+        CTL_DROP(h);
+        return NA;
+    }
+    // Wait for every waiter to have reached its first `wait` before measuring:
+    // a thread still starting up is not in the queue, and the row would then
+    // report the cost of a shorter queue than its label claims.
+    uint64_t deadline = now_ns() + 5000000000ull;
+    while (__atomic_load_n(&h->started, __ATOMIC_ACQUIRE) < made &&
+           now_ns() < deadline) {
+        struct timespec tick = {0, 200 * 1000};
+        nanosleep(&tick, NULL);
+    }
+    // One more settle so the last starter is parked rather than running.
+    struct timespec settle = {0, 20 * 1000 * 1000};
+    nanosleep(&settle, NULL);
+
+    uint64_t t0 = now_ns(), elapsed = 0, ops = 0, acc = 0;
+    int stalled = 0;
+    while ((elapsed < budget_ns || ops < MIN_SAMPLES) && elapsed < g_max_ns) {
+        // Put the queue back to `made` before starting the clock. The sleep
+        // matters: with more waiters than CPUs, a driver spinning on this
+        // barrier is one of the threads the re-parking waiter is waiting for.
+        uint64_t pd = now_ns() + 2000000000ull;
+        while (__atomic_load_n(&h->parked, __ATOMIC_ACQUIRE) < made) {
+            if (now_ns() > pd) {
+                stalled = 1;
+                break;
+            }
+            struct timespec tick = {0, 50 * 1000};
+            nanosleep(&tick, NULL);
+        }
+        if (stalled)
+            break;
+        // `parked` is incremented just BEFORE the syscall, so reaching `made`
+        // means everyone is on their way in, not that everyone is in. A
+        // straggler woken by the next line gets EAGAIN rather than blocking,
+        // and the settle below is what keeps it out of the figure. It is
+        // outside the clock, so it costs the run time and not the number.
+        struct timespec settle = {0, 300 * 1000};
+        nanosleep(&settle, NULL);
+
+        int before = __atomic_load_n(&h->token, __ATOMIC_ACQUIRE);
+        uint64_t a = now_ns();
+        __atomic_store_n(&h->word, 1, __ATOMIC_RELEASE);
+        futex_op(&h->word, ECL_FUTEX_WAKE, broadcast ? made : 1);
+        uint64_t issued = now_ns();
+        // Bounded wait for the woken waiter to report. A lost wake-up must
+        // cost this row its number, not the suite its run.
+        uint64_t wd = now_ns() + 2000000000ull;
+        while (__atomic_load_n(&h->token, __ATOMIC_ACQUIRE) == before) {
+            if (now_ns() > wd) {
+                stalled = 1;
+                break;
+            }
+        }
+        uint64_t observed = now_ns();
+        __atomic_store_n(&h->word, 0, __ATOMIC_RELEASE);
+        if (stalled)
+            break;
+        acc += issue_only ? (issued - a) : (observed - a);
+        ops++;
+        elapsed = now_ns() - t0;
+    }
+    double ns = (ops && !stalled) ? (double)acc / (double)ops : NA;
+
+    // Release the herd: set stop, then wake everyone with the word non-zero so
+    // nobody parks again, and abandon any thread that does not come back.
+    __atomic_store_n(&h->stop, 1, __ATOMIC_RELEASE);
+    __atomic_store_n(&h->word, 1, __ATOMIC_RELEASE);
+    for (int round = 0; round < 8; round++) {
+        futex_op(&h->word, ECL_FUTEX_WAKE, made);
+        struct timespec tick = {0, 5 * 1000 * 1000};
+        nanosleep(&tick, NULL);
+    }
+    for (int i = 0; i < made; i++)
+        pthread_detach(th[i]);
+    CTL_DROP(h);
+    g_last_ops = ops;
+    return ns;
+}
+
+// A mutex two threads really fight over. The contended path is the one that
+// enters the kernel, and the ratio against the uncontended row is what a lock
+// costs when it is actually a lock. Both threads do a tiny amount of work
+// inside the critical section so the handover is real rather than a single
+// thread reacquiring a lock it never let go of.
+struct fx_fight {
+    pthread_mutex_t m;
+    volatile uint64_t counter;
+    volatile int stop;
+    volatile int done;
+    int refs;
+};
+
+static void *fx_fighter(void *arg) {
+    struct fx_fight *f = arg;
+    while (!__atomic_load_n(&f->stop, __ATOMIC_ACQUIRE)) {
+        if (pthread_mutex_lock(&f->m) == 0) {
+            f->counter++;
+            pthread_mutex_unlock(&f->m);
+        }
+    }
+    __atomic_store_n(&f->done, 1, __ATOMIC_RELEASE);
+    CTL_DROP(f);
+    return NULL;
+}
+
+static double futex_contended_mutex_ns(uint64_t budget_ns) {
+    struct fx_fight *f = calloc(1, sizeof *f);
+    if (!f)
+        return NA;
+    pthread_mutex_init(&f->m, NULL);
+    f->refs = 1;
+    pthread_t th;
+    CTL_LEND(f);
+    if (pthread_create(&th, NULL, fx_fighter, f) != 0) {
+        CTL_DROP(f);
+        CTL_DROP(f);
+        return NA;
+    }
+    // Let the peer get into its loop, so the measured section is contended
+    // from its first iteration.
+    struct timespec settle = {0, 20 * 1000 * 1000};
+    nanosleep(&settle, NULL);
+    uint64_t t0 = now_ns(), elapsed = 0, ops = 0;
+    while ((elapsed < budget_ns || ops < MIN_SAMPLES) && elapsed < g_max_ns) {
+        for (int k = 0; k < 64; k++) {
+            if (pthread_mutex_lock(&f->m) != 0)
+                break;
+            f->counter++;
+            pthread_mutex_unlock(&f->m);
+            ops++;
+        }
+        elapsed = now_ns() - t0;
+    }
+    double ns = ops ? (double)elapsed / (double)ops : NA;
+    __atomic_store_n(&f->stop, 1, __ATOMIC_RELEASE);
+    if (join_or_abandon(th, &f->done, 5))
+        pthread_mutex_destroy(&f->m);
+    CTL_DROP(f);
+    return ns;
+}
+
+// A condition variable woken `n` times, with `n` threads waiting on it. The
+// kernel-side shape is the same question as the futex rows -- pick one out of
+// a queue, or hand the whole queue a wake-up -- but through the interface that
+// every threaded program actually uses, where the mutex handover is part of
+// the cost and a broadcast means n threads immediately contend for one lock.
+struct fx_cond {
+    pthread_mutex_t m;
+    pthread_cond_t cv;
+    volatile uint64_t seq;      // bumped by the signaller
+    volatile uint64_t acks;     // bumped by each waiter that wakes
+    volatile int stop;
+    volatile int started;
+    int refs;
+};
+
+static void *fx_cond_waiter(void *arg) {
+    struct fx_cond *c = arg;
+    pthread_mutex_lock(&c->m);
+    __atomic_fetch_add(&c->started, 1, __ATOMIC_ACQ_REL);
+    uint64_t seen = c->seq;
+    while (!c->stop) {
+        while (c->seq == seen && !c->stop)
+            pthread_cond_wait(&c->cv, &c->m);
+        if (c->stop)
+            break;
+        seen = c->seq;
+        c->acks++;
+    }
+    pthread_mutex_unlock(&c->m);
+    CTL_DROP(c);
+    return NULL;
+}
+
+static double futex_cond_wake_of_n(int n, int broadcast, uint64_t budget_ns) {
+    struct fx_cond *c = calloc(1, sizeof *c);
+    if (!c)
+        return NA;
+    pthread_mutex_init(&c->m, NULL);
+    pthread_cond_init(&c->cv, NULL);
+    c->refs = 1;
+    pthread_t th[64];
+    if (n > 64)
+        n = 64;
+    int made = 0;
+    for (int i = 0; i < n; i++) {
+        CTL_LEND(c);
+        if (pthread_create(&th[i], NULL, fx_cond_waiter, c) != 0) {
+            CTL_DROP(c);
+            break;
+        }
+        made++;
+    }
+    if (made == 0) {
+        CTL_DROP(c);
+        return NA;
+    }
+    uint64_t deadline = now_ns() + 5000000000ull;
+    while (__atomic_load_n(&c->started, __ATOMIC_ACQUIRE) < made &&
+           now_ns() < deadline) {
+        struct timespec tick = {0, 200 * 1000};
+        nanosleep(&tick, NULL);
+    }
+    struct timespec settle = {0, 20 * 1000 * 1000};
+    nanosleep(&settle, NULL);
+
+    // One signal (or broadcast) per iteration, waiting until at least one
+    // waiter has acknowledged, so the figure includes the handover and not
+    // just the syscall.
+    uint64_t t0 = now_ns(), elapsed = 0, ops = 0;
+    int stalled = 0;
+    while ((elapsed < budget_ns || ops < MIN_SAMPLES) && elapsed < g_max_ns) {
+        pthread_mutex_lock(&c->m);
+        uint64_t before = c->acks;
+        c->seq++;
+        if (broadcast)
+            pthread_cond_broadcast(&c->cv);
+        else
+            pthread_cond_signal(&c->cv);
+        pthread_mutex_unlock(&c->m);
+        uint64_t wd = now_ns() + 2000000000ull;
+        for (;;) {
+            pthread_mutex_lock(&c->m);
+            uint64_t now = c->acks;
+            pthread_mutex_unlock(&c->m);
+            if (now != before)
+                break;
+            if (now_ns() > wd) {
+                stalled = 1;
+                break;
+            }
+        }
+        if (stalled)
+            break;
+        ops++;
+        elapsed = now_ns() - t0;
+    }
+    double ns = (ops && !stalled) ? (double)elapsed / (double)ops : NA;
+
+    pthread_mutex_lock(&c->m);
+    c->stop = 1;
+    c->seq++;
+    pthread_cond_broadcast(&c->cv);
+    pthread_mutex_unlock(&c->m);
+    struct timespec drain = {0, 50 * 1000 * 1000};
+    nanosleep(&drain, NULL);
+    for (int i = 0; i < made; i++)
+        pthread_detach(th[i]);
+    CTL_DROP(c);
+    g_last_ops = ops;
+    return ns;
+}
+
+// A futex wait that times out rather than being woken. Every lock with a
+// deadline, every `pthread_cond_timedwait` and every bounded queue takes this
+// path when nothing arrives, and it is a different mechanism from a wake: the
+// timer has to be armed, fire, and find the waiter.
+static volatile int g_fx_timeout_word;
+
+static int futex_wait_timeout_op(void) {
+    struct timespec ts = {0, 200 * 1000}; // 200 us
+    long r = futex_op_ts(&g_fx_timeout_word, ECL_FUTEX_WAIT, 0, &ts);
+    // Expected: -1/ETIMEDOUT. Anything else means the wait did not wait.
+    if (r == 0)
+        return 1;
+    return (errno == ETIMEDOUT) ? 0 : 1;
+}
+
+// A semaphore round trip, which is the other primitive musl builds on futexes
+// and the one a producer/consumer queue uses. Kept next to the mutex rows
+// because the same handover through a different primitive can cost very
+// different amounts.
+static sem_t g_fx_sem_a, g_fx_sem_b;
+static volatile int g_fx_sem_stop;
+static volatile int g_fx_sem_done;
+
+static void *fx_sem_peer(void *arg) {
+    (void)arg;
+    for (;;) {
+        if (sem_wait(&g_fx_sem_a) != 0) {
+            if (errno == EINTR)
+                continue;
+            break;
+        }
+        if (__atomic_load_n(&g_fx_sem_stop, __ATOMIC_ACQUIRE))
+            break;
+        sem_post(&g_fx_sem_b);
+    }
+    __atomic_store_n(&g_fx_sem_done, 1, __ATOMIC_RELEASE);
+    return NULL;
+}
+
+static double futex_sem_rt_ns(uint64_t budget_ns) {
+    if (sem_init(&g_fx_sem_a, 0, 0) != 0)
+        return NA;
+    if (sem_init(&g_fx_sem_b, 0, 0) != 0) {
+        sem_destroy(&g_fx_sem_a);
+        return NA;
+    }
+    g_fx_sem_stop = 0;
+    g_fx_sem_done = 0;
+    pthread_t th;
+    if (pthread_create(&th, NULL, fx_sem_peer, NULL) != 0) {
+        sem_destroy(&g_fx_sem_a);
+        sem_destroy(&g_fx_sem_b);
+        return NA;
+    }
+    struct timespec settle = {0, 20 * 1000 * 1000};
+    nanosleep(&settle, NULL);
+    uint64_t t0 = now_ns(), elapsed = 0, ops = 0;
+    while ((elapsed < budget_ns || ops < MIN_SAMPLES) && elapsed < g_max_ns) {
+        sem_post(&g_fx_sem_a);
+        if (sem_wait(&g_fx_sem_b) != 0 && errno != EINTR)
+            break;
+        ops++;
+        elapsed = now_ns() - t0;
+    }
+    double ns = ops ? (double)elapsed / (double)ops : NA;
+    __atomic_store_n(&g_fx_sem_stop, 1, __ATOMIC_RELEASE);
+    sem_post(&g_fx_sem_a);
+    join_or_abandon(th, &g_fx_sem_done, 5);
+    sem_destroy(&g_fx_sem_a);
+    sem_destroy(&g_fx_sem_b);
+    return ns;
+}
+
+// ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
 
@@ -4622,8 +5723,8 @@ int main(int argc, char **argv) {
                     " [DIR] [DISK_MB] [MEM_MB]\n",
                     argv[0]);
             fprintf(stderr,
-                    "sections: cpu mem syscall vm sched psched net fs smp disk\n"
-                    "          proc gfx\n");
+                    "sections: cpu mem syscall vm sched psched net fs heap sig\n"
+                    "          futex smp disk proc gfx\n");
             fprintf(stderr,
                     "diagnostics: --forkloop N MIB [MAPS], "
                     "--yieldstall [SECONDS] [NOTIFIERS]\n");
@@ -5701,6 +6802,333 @@ int main(int argc, char **argv) {
             printf("  descriptor handling or procfs formatting — the DISK section\n");
             printf("  is where the block device answers for itself.\n");
         }
+    }
+
+
+    // ---- Heap / anonymous memory ----
+    if (want(only, "heap")) {
+        line();
+        printf("HEAP / ANONYMOUS MEMORY   <-- how a program gets its memory\n");
+        g_pstat_ok = pstat_snapshot(g_pstat_a, sizeof g_pstat_a);
+        if (!g_pstat_ok)
+            printf("  (no /proc/self/perf: the calls/op and in-kernel rows are\n"
+                   "   Eclipse-only and read n/a here)\n");
+        else
+            pstat_calibrate();
+
+        // Allocation sizes across the allocator's mmap threshold. The small
+        // rows never enter the kernel on any libc, so they are `[user]`: they
+        // measure the allocator, which is part of the C library and not of
+        // Eclipse, and they are here as the floor the kernel rows sit on.
+        row("[user]", "malloc+free 64 B",
+            heap_malloc_free_ns(64, g_short_ns), "ns", "linux: ~20");
+        row("[user]", "malloc+free 4 KiB",
+            heap_malloc_free_ns(4096, g_short_ns), "ns", "linux: ~45");
+        {
+            // 256 KiB is PAST musl's fixed mmap threshold and past glibc's
+            // initial one, but glibc raises its threshold whenever a large
+            // mmap'd block is freed -- which this loop does every iteration --
+            // so after the first few it serves them from the arena and never
+            // calls the kernel again. Measured on both anyway, and tagged
+            // `[user]` because the suite must not claim a kernel figure it
+            // might not have: the `mmap calls/op` row below says which side
+            // of the threshold this size really landed on (1 means the
+            // allocator went to the kernel, 0 means it did not).
+            if (g_pstat_ok)
+                pstat_snapshot(g_pstat_a, sizeof g_pstat_a);
+            double big = heap_malloc_free_ns(256 * 1024, g_short_ns);
+            double big_ops = big < 0 ? 0 : (double)g_last_ops;
+            if (g_pstat_ok)
+                pstat_snapshot(g_pstat_b, sizeof g_pstat_b);
+            row("[user]", "malloc+free 256 KiB", big, "ns", "linux: ~60");
+            pstat_pair("mmap", "mmap", big_ops, big);
+        }
+        {
+            // 64 MiB is above the ceiling glibc will ever raise its threshold
+            // to (32 MiB), and musl has no adaptive threshold at all, so this
+            // size is an `mmap` and an `munmap` on every libc. That is what
+            // makes it a kernel row rather than an allocator one.
+            if (g_pstat_ok)
+                pstat_snapshot(g_pstat_a, sizeof g_pstat_a);
+            double huge = heap_malloc_free_ns(64 * 1024 * 1024, g_short_ns);
+            double huge_ops = huge < 0 ? 0 : (double)g_last_ops;
+            if (g_pstat_ok)
+                pstat_snapshot(g_pstat_b, sizeof g_pstat_b);
+            row("[kernel]", "malloc+free 64 MiB", huge, "ns", "linux: ~12000");
+            pstat_pair("mmap", "mmap", huge_ops, huge);
+            printf("  (64 MiB is above every libc's mmap threshold, so that row\n");
+            printf("   is a real mmap/munmap pair. The 256 KiB row above may or\n");
+            printf("   may not be, which is why its calls/op row is there.)\n");
+        }
+        row("[user]", "calloc 4 KiB (zeroed)",
+            (g_heap_sz = 4096, timed_ns_per_op(heap_calloc_op, g_short_ns)),
+            "ns", "linux: ~70");
+        row("[user]", "malloc churn, 512 live",
+            heap_churn_ns(g_short_ns), "ns", "linux: ~40");
+        printf("  (churn replaces one of 512 live blocks of mixed sizes at a\n");
+        printf("   scattered index: the plain rows above measure the allocator's\n");
+        printf("   happiest case, where the block it just freed is the one it\n");
+        printf("   hands back.)\n");
+        row("[user]", "realloc 1K->256K doubling",
+            timed_ns_per_op(heap_realloc_grow_op, g_short_ns), "ns",
+            "linux: ~8500");
+        row("[kernel]", "sbrk +64K/-64K",
+            timed_ns_per_op(heap_brk_op, g_short_ns), "ns", "linux: ~1500");
+
+        // Anonymous memory at the size a program grows by, including its
+        // faults. The VM section's `minor fault` row is one page of this.
+        row("[kernel]", "mmap+touch+munmap 1 MiB",
+            heap_anon_cycle_mibs(1024 * 1024, 0, g_short_ns), "MiB/s",
+            "linux: ~2400");
+#ifdef MAP_POPULATE
+        {
+            double pop = heap_anon_cycle_mibs(1024 * 1024, 1, g_short_ns);
+            row("[kernel]", "  same, MAP_POPULATE", pop, "MiB/s",
+                "linux: ~4000");
+            printf("  (MAP_POPULATE asks for the pages up front. A figure equal\n");
+            printf("   to the row above means the flag was accepted and ignored,\n");
+            printf("   so the faults were still taken one at a time.)\n");
+        }
+#endif
+        row("[kernel]", "MADV_DONTNEED+refault 1 MiB",
+            heap_madvise_cycle_mibs(1024 * 1024, g_short_ns), "MiB/s",
+            "linux: ~2400");
+        row("[kernel]", "munmap 1 MiB resident",
+            heap_munmap_resident_mibs(1024 * 1024, g_short_ns), "MiB/s",
+            "linux: ~25000");
+        row("[kernel]", "munmap 16 MiB resident",
+            heap_munmap_resident_mibs(16 * 1024 * 1024, g_short_ns), "MiB/s",
+            "linux: ~14000");
+        row("[kernel]", "mprotect 1 MiB, both ways",
+            heap_mprotect_range_ns(1024 * 1024, g_short_ns), "ns",
+            "linux: ~20000");
+        printf("  the two munmap rows are the teardown a process pays for its\n");
+        printf("  whole address space on exit, which is inside the PROCESS\n");
+        printf("  section's `fork + exit` row and not separable there. A per-MiB\n");
+        printf("  rate that falls as the mapping grows is a teardown that walks\n");
+        printf("  something per page rather than per range.\n");
+    }
+
+    // ---- Signals ----
+    if (want(only, "sig")) {
+        line();
+        printf("SIGNALS   <-- delivery, faults, and whether syscalls restart\n");
+        struct sigaction sa, old_usr1;
+        memset(&sa, 0, sizeof sa);
+        sa.sa_handler = sig_count_handler;
+        int have_usr1 = sigaction(SIGUSR1, &sa, &old_usr1) == 0;
+        if (!have_usr1)
+            printf("  (could not install a SIGUSR1 handler — section skipped)\n");
+        else {
+            g_pstat_ok = pstat_snapshot(g_pstat_a, sizeof g_pstat_a);
+            if (g_pstat_ok)
+                pstat_calibrate();
+            g_sig_count = 0;
+            double self = timed_ns_per_op(sig_kill_self_op, g_short_ns);
+            row("[kernel]", "kill(self)+handler", self, "ns", "linux: ~1500");
+            row("[kernel]", "block+pending+unblock",
+                timed_ns_per_op(sig_pending_release_op, g_short_ns), "ns",
+                "linux: ~2500");
+            printf("  (the second row sends the signal while it is blocked and\n");
+            printf("   requires the handler NOT to have run until the mask is\n");
+            printf("   lifted; a kernel that delivers anyway reports n/a here\n");
+            printf("   rather than a plausible number.)\n");
+
+            double cross = sig_cross_process_ns(g_short_ns);
+            row("[kernel]", "kill(child)+handler+pipe",
+                cross < 0 ? NA : cross / 1000.0, "us", "linux: ~25");
+            if (cross > 0 && pipe_proc_ns > 0)
+                row("[kernel]", "  vs pipe round trip", cross / pipe_proc_ns,
+                    "x", "what the signal path adds");
+
+            // Fault -> signal -> handler -> retry. A JIT, a GC write barrier
+            // and every guard page live on this path.
+            g_segv_page = mmap(NULL, 4096, PROT_READ | PROT_WRITE,
+                               MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            if (g_segv_page == MAP_FAILED) {
+                row("[kernel]", "SIGSEGV fault+handler+retry", NA, "ns", "");
+                g_segv_page = NULL;
+            } else {
+                struct sigaction sv, old_sv;
+                memset(&sv, 0, sizeof sv);
+                sv.sa_handler = sig_segv_handler;
+                if (sigaction(SIGSEGV, &sv, &old_sv) == 0) {
+                    *(volatile unsigned char *)g_segv_page = 0; // fault it in
+                    g_segv_hits = 0;
+                    double segv = timed_ns_per_op(sig_segv_op, g_short_ns);
+                    row("[kernel]", "SIGSEGV fault+handler+retry", segv, "ns",
+                        "linux: ~7000");
+                    if (segv < 0)
+                        printf("  (the handler never ran, or the faulting write "
+                               "was not retried:\n   a write-protect fault is "
+                               "not being turned into a deliverable\n   signal "
+                               "here, which is a correctness result.)\n");
+                    sigaction(SIGSEGV, &old_sv, NULL);
+                } else {
+                    row("[kernel]", "SIGSEGV fault+handler+retry", NA, "ns",
+                        "(no SIGSEGV handler)");
+                }
+                munmap(g_segv_page, 4096);
+                g_segv_page = NULL;
+            }
+
+            // The verdict rows.
+            {
+                double rns = NA;
+                int restarted = sig_restart_probe(&rns);
+                row("[kernel]", "interrupted read, over 2x20ms",
+                    rns < 0 ? NA : rns / 1000.0, "us", "linux: ~150");
+                if (restarted == 1)
+                    printf("  SA_RESTART: the read RESTARTED. A handler can "
+                           "interrupt a blocking\n  syscall without the caller "
+                           "seeing EINTR, which is what musl's\n  "
+                           "`__synccall`, every shell read and most library "
+                           "code assumes.\n");
+                else if (restarted == 0)
+                    printf("  SA_RESTART: the read returned EINTR DESPITE "
+                           "SA_RESTART. Every caller\n  that does not retry on "
+                           "EINTR is wrong on this kernel, and most do not\n  "
+                           "retry. This is a correctness result, not a slow "
+                           "one.\n");
+                else
+                    printf("  SA_RESTART: could not be determined (no timer or "
+                           "no pipe).\n");
+            }
+            {
+                int alt = sig_altstack_verdict();
+                if (alt == 1)
+                    printf("  sigaltstack: a handler ran ON the alternate "
+                           "stack (SS_ONSTACK), so a\n  stack-overflow fault "
+                           "is deliverable.\n");
+                else if (alt == 0)
+                    printf("  sigaltstack: the handler ran but NOT on the "
+                           "alternate stack. A fault\n  caused by running out "
+                           "of stack has nowhere to deliver, and the\n  "
+                           "process dies instead of handling it.\n");
+                else
+                    printf("  sigaltstack: not available on this kernel.\n");
+            }
+            row("[kernel]", "sigsuspend wake, over 1ms",
+                (r = sig_suspend_ns(g_short_ns)) < 0 ? NA : r / 1000.0, "us",
+                "linux: ~0.5");
+            pstat_pair("kill", "kill", self > 0 ? (double)g_last_ops : 0, NA);
+            sigaction(SIGUSR1, &old_usr1, NULL);
+            printf("  the `over 2x20ms` row is ONE sample, not an average:\n");
+            printf("  the probe can only be run once per interrupted read, so\n");
+            printf("  it carries the timer's own granularity and swings by a\n");
+            printf("  factor of two between runs. The two verdict lines are\n");
+            printf("  correctness, not speed:\n");
+            printf("  a number for a mechanism that does not work is worse than\n");
+            printf("  no number, so they are printed as sentences.\n");
+        }
+    }
+
+    // ---- Futex and the locks on it ----
+    if (want(only, "futex")) {
+        line();
+        printf("FUTEX / LOCKS UNDER CONTENTION   <-- what a lock really costs\n");
+        g_pstat_ok = pstat_snapshot(g_pstat_a, sizeof g_pstat_a);
+        if (!g_pstat_ok)
+            printf("  (no /proc/self/perf: the calls/op and in-kernel rows are\n"
+                   "   Eclipse-only and read n/a here)\n");
+        else
+            pstat_calibrate();
+
+        double unc = timed_ns_per_op(futex_uncontended_op, g_short_ns);
+        row("[user]", "mutex lock+unlock, alone", unc, "ns", "linux: ~20");
+        {
+            if (g_pstat_ok)
+                pstat_snapshot(g_pstat_a, sizeof g_pstat_a);
+            double empty = timed_ns_per_op(futex_wake_empty_op, g_short_ns);
+            double empty_ops = empty < 0 ? 0 : (double)g_last_ops;
+            if (g_pstat_ok)
+                pstat_snapshot(g_pstat_b, sizeof g_pstat_b);
+            row("[kernel]", "FUTEX_WAKE, nobody waiting", empty, "ns",
+                "linux: ~500");
+            pstat_pair("futex", "futex", empty_ops, empty);
+            printf("  (every unlock of a mutex that might have waiters issues\n");
+            printf("   one of these, so on a mostly-uncontended lock it is the\n");
+            printf("   whole kernel cost.)\n");
+        }
+        double cont = futex_contended_mutex_ns(g_short_ns);
+        row("[kernel]", "mutex lock+unlock, 2 threads",
+            cont < 0 ? NA : cont, "ns", "linux: ~1500");
+        if (unc > 0 && cont > 0)
+            row("[kernel]", "  contended / alone", cont / unc, "x",
+                "linux: ~50");
+
+        // Wake one out of a queue of N, twice over: the syscall alone, then
+        // the whole round trip. The ISSUE family is the one that answers
+        // whether the pick scans the queue; the round-trip family is what a
+        // program feels, and on a box with fewer CPUs than waiters most of it
+        // is the woken thread queueing for a CPU.
+        {
+            double i1 = futex_wake_of_n(1, 0, 1, g_short_ns);
+            double i16 = futex_wake_of_n(16, 0, 1, g_short_ns);
+            double i64 = futex_wake_of_n(64, 0, 1, g_short_ns);
+            row("[kernel]", "FUTEX_WAKE issue, 1 parked",
+                i1 < 0 ? NA : i1, "ns", "linux: ~1500");
+            row("[kernel]", "FUTEX_WAKE issue, 16 parked",
+                i16 < 0 ? NA : i16, "ns", "linux: ~1600");
+            row("[kernel]", "FUTEX_WAKE issue, 64 parked",
+                i64 < 0 ? NA : i64, "ns", "linux: ~1600");
+            if (i1 > 0 && i64 > 0)
+                row("[kernel]", "  64-queue / 1-queue issue", i64 / i1, "x",
+                    ">1 means the pick scans");
+            double w1 = futex_wake_of_n(1, 0, 0, g_short_ns);
+            double w16 = futex_wake_of_n(16, 0, 0, g_short_ns);
+            double w64 = futex_wake_of_n(64, 0, 0, g_short_ns);
+            row("[kernel]", "wake+observe, 1 parked",
+                w1 < 0 ? NA : w1 / 1000.0, "us", "linux: ~3");
+            row("[kernel]", "wake+observe, 16 parked",
+                w16 < 0 ? NA : w16 / 1000.0, "us", "linux: ~4");
+            row("[kernel]", "wake+observe, 64 parked",
+                w64 < 0 ? NA : w64 / 1000.0, "us", "linux: ~6");
+            if (w1 > 0 && w64 > 0)
+                row("[kernel]", "  64-queue / 1-queue trip", w64 / w1, "x",
+                    "cpus and the host, not the queue");
+            printf("  (the two families answer different questions. If the\n");
+            printf("   issue ratio is flat and the round-trip ratio is not,\n");
+            printf("   the futex code is O(1) and what grows is the wait for a\n");
+            printf("   CPU -- this machine has %ld of them against 64 waiters.\n",
+                   (long)sysconf(_SC_NPROCESSORS_ONLN));
+            printf("   An issue ratio that grows is the queue being scanned,\n");
+            printf("   and that one is the kernel's to fix.)\n");
+        }
+        // Broadcast: everyone wakes, and on a condvar they then all contend
+        // for one mutex. This is the thundering herd, and it is the shape
+        // every `notify_all` has.
+        {
+            double b16 = futex_cond_wake_of_n(16, 1, g_short_ns);
+            double s16 = futex_cond_wake_of_n(16, 0, g_short_ns);
+            row("[kernel]", "condvar signal, 16 waiting",
+                s16 < 0 ? NA : s16 / 1000.0, "us", "linux: ~12");
+            row("[kernel]", "condvar broadcast, 16",
+                b16 < 0 ? NA : b16 / 1000.0, "us", "linux: ~40");
+            if (s16 > 0 && b16 > 0)
+                row("[kernel]", "  broadcast / signal", b16 / s16, "x",
+                    "the thundering herd");
+        }
+        row("[kernel]", "FUTEX_WAIT 200us timeout",
+            (r = timed_ns_per_op(futex_wait_timeout_op, g_short_ns)) < 0
+                ? NA : r / 1000.0,
+            "us", "linux: ~250");
+        printf("  (that row should read a little over 200 us. Far more is a\n");
+        printf("   timer that fires late; far less is a wait that did not\n");
+        printf("   wait, and every bounded queue built on it then spins.)\n");
+        row("[kernel]", "sem_post/sem_wait round trip",
+            (r = futex_sem_rt_ns(g_short_ns)) < 0 ? NA : r / 1000.0, "us",
+            "linux: ~8");
+        printf("  the `1 / 16 / 64 parked` families are the ones that scale:\n");
+        printf("  a wake whose cost grows with the queue makes every condition\n");
+        printf("  variable in the system quadratic under load, and no single\n");
+        printf("  row can tell that from a slow wake.\n");
+        printf("  every row here that wakes a thread also has to get a CPU\n");
+        printf("  running again. Under a hypervisor that is an exit and an\n");
+        printf("  IPI, tens of microseconds on a vCPU that had halted, so the\n");
+        printf("  ABSOLUTE figures belong to the machine and only the ratios\n");
+        printf("  travel. The `linux:` hints are bare metal; to compare, run\n");
+        printf("  this binary on Linux under the SAME hypervisor.\n");
     }
 
     // ---- Process ----
