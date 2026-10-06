@@ -276,22 +276,66 @@ const SCHED_TICK_NS: u64 = 4_000_000;
 /// cost. And they cost almost nothing: `tick_should_preempt` runs once per
 /// scheduler tick per CPU, so the one unconditional increment is ~250/s/CPU --
 /// four orders of magnitude under the per-poll counters that had to be made
-/// per-CPU.
-static SLICE_TICKS: AtomicU64 = AtomicU64::new(0);
-static SLICE_CREDITS: AtomicU64 = AtomicU64::new(0);
-static SLICE_CREDIT_NS: AtomicU64 = AtomicU64::new(0);
-static SLICE_CREDIT_MAX_NS: AtomicU64 = AtomicU64::new(0);
+/// per-CPU. That rate is also why `max_ns` is a plain `fetch_max` and not a
+/// read-before-write: at a few hundred a second the shared-line RMW costs
+/// nothing worth a second load, and a `Relaxed` load cannot promise to skip it
+/// anyway.
+///
+/// A struct and not four statics so a test can own one. Asserting on globals
+/// that every other test in the binary also writes lets a mutation hide behind
+/// somebody else's increment -- `credits > before` passes whoever did the
+/// incrementing.
+#[derive(Default)]
+struct SliceCredit {
+    ticks: AtomicU64,
+    credits: AtomicU64,
+    ns: AtomicU64,
+    max_ns: AtomicU64,
+}
+
+impl SliceCredit {
+    const fn new() -> Self {
+        Self {
+            ticks: AtomicU64::new(0),
+            credits: AtomicU64::new(0),
+            ns: AtomicU64::new(0),
+            max_ns: AtomicU64::new(0),
+        }
+    }
+
+    /// One tick observation: the denominator the credits are read against.
+    fn note_tick(&self) {
+        self.ticks.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record whatever [`credited_slice_end`] gave back, and nothing when it
+    /// gave nothing.
+    fn note(&self, end: u64, credited: u64) {
+        let Some(given) = credit_given(end, credited) else {
+            return;
+        };
+        self.credits.fetch_add(1, Ordering::Relaxed);
+        self.ns.fetch_add(given, Ordering::Relaxed);
+        self.max_ns.fetch_max(given, Ordering::Relaxed);
+    }
+
+    fn read(&self) -> (u64, u64, u64, u64) {
+        (
+            self.ticks.load(Ordering::Relaxed),
+            self.credits.load(Ordering::Relaxed),
+            self.ns.load(Ordering::Relaxed),
+            self.max_ns.load(Ordering::Relaxed),
+        )
+    }
+}
+
+static SLICE_CREDIT: SliceCredit = SliceCredit::new();
 
 /// `(tick observations, credits applied, nanoseconds credited, largest single
 /// credit)` since boot -- the time threads spent frozen off the CPU that the
 /// slice deadline used to charge them for. See [`credited_slice_end`].
 pub fn slice_credit_stats() -> (u64, u64, u64, u64) {
-    (
-        SLICE_TICKS.load(Ordering::Relaxed),
-        SLICE_CREDITS.load(Ordering::Relaxed),
-        SLICE_CREDIT_NS.load(Ordering::Relaxed),
-        SLICE_CREDIT_MAX_NS.load(Ordering::Relaxed),
-    )
+    SLICE_CREDIT.read()
 }
 
 fn credited_slice_end(now: u64, end: u64, last_seen: u64, slice: u64, tick: u64) -> u64 {
@@ -318,21 +362,6 @@ fn credit_given(end: u64, credited: u64) -> Option<u64> {
         return None;
     }
     Some(credited - end)
-}
-
-/// Record a credit for `/proc/perf/kernel`.
-fn note_slice_credit(end: u64, credited: u64) {
-    let Some(given) = credit_given(end, credited) else {
-        return;
-    };
-    SLICE_CREDITS.fetch_add(1, Ordering::Relaxed);
-    SLICE_CREDIT_NS.fetch_add(given, Ordering::Relaxed);
-    // Read before the write: the maximum settles within the first seconds and
-    // then every later tick would be an RMW on a shared line to store the same
-    // value.
-    if SLICE_CREDIT_MAX_NS.load(Ordering::Relaxed) < given {
-        SLICE_CREDIT_MAX_NS.fetch_max(given, Ordering::Relaxed);
-    }
 }
 
 /// Where a resumed thread's slice deadline lands: EEVDF's *lag*, applied to
@@ -1036,8 +1065,7 @@ impl Thread {
         // This is the one reader that is also the observation: record where the
         // clock stood so the next tick can tell running from frozen.
         self.sched.last_tick_ns.store(now, Ordering::Relaxed);
-        // The denominator the credit count is read against.
-        SLICE_TICKS.fetch_add(1, Ordering::Relaxed);
+        SLICE_CREDIT.note_tick();
         preempt
     }
 
@@ -1054,7 +1082,7 @@ impl Thread {
             slice,
             SCHED_TICK_NS,
         );
-        note_slice_credit(end, credited);
+        SLICE_CREDIT.note(end, credited);
         credited
     }
 
@@ -3041,19 +3069,21 @@ mod sched_tests {
             "un tick sin credito no es un credito, y contarlo deja sin cero que leer"
         );
         assert_eq!(credit_given(1_000, 999), None, "un plazo recortado tampoco");
-        // Y lo que se suma son los nanosegundos dados, no una cuenta de
-        // llamadas. Por diferencia, porque las cifras son globales del binario.
-        let (_, credits_before, ns_before, _) = slice_credit_stats();
-        let given = 1_234_567;
-        note_slice_credit(1_000, 1_000 + given);
-        note_slice_credit(1_000, 1_000);
-        let (_, credits, ns, max) = slice_credit_stats();
-        assert!(
-            ns - ns_before >= given,
-            "los nanosegundos acreditados no son los que se dieron"
+        // Cifras propias, no las globales del binario: si fueran las globales,
+        // el incremento de otro test valdria por el que esta mutacion quita.
+        let c = SliceCredit::new();
+        c.note(1_000, 1_000 + 1_234_567);
+        // Despues del mayor, a proposito: el peor congelado se queda, no se
+        // sobreescribe con el ultimo.
+        c.note(1_000, 1_000 + 7);
+        c.note(1_000, 1_000);
+        c.note(1_000, 999);
+        c.note_tick();
+        assert_eq!(
+            c.read(),
+            (1, 2, 1_234_567 + 7, 1_234_567),
+            "ticks, creditos, nanosegundos dados y el peor congelado"
         );
-        assert!(credits > credits_before);
-        assert!(max >= given, "el peor congelado no se queda con el mayor");
     }
 
     /// The whole thing through the thread: a tick records where the clock
