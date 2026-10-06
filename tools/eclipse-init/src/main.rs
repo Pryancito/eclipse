@@ -1848,7 +1848,7 @@ fn wait_until(timeout: Duration, mut ready: impl FnMut() -> bool, stop: impl Fn(
         if stop() {
             return Wait::Stopped;
         }
-        sleep_interruptible(poll_step(start.elapsed()));
+        poll_sleep(poll_step(start.elapsed()));
     }
     // One last look: `ready` may have become true during the final sleep, and
     // reporting a timeout for something that IS there would send a service into
@@ -1917,7 +1917,7 @@ fn wait_for_dir_settled_until(
             ));
             return;
         }
-        sleep_interruptible(Duration::from_millis(100));
+        poll_sleep(Duration::from_millis(100));
         let now = list(dir);
         if now != last {
             last = now;
@@ -2450,6 +2450,11 @@ unsafe fn silence_stdio(log_path: Option<&str>) {
 /// uptime is measured to the end of that backoff instead of to its own death.
 fn supervise(services: &mut BTreeMap<String, Service>) {
     loop {
+        // Children reaped during a bounded gate (see `reap_pending`): account
+        // for them here, each with the instant it was really reaped.
+        for exit in take_pending() {
+            note_exit(services, exit.pid, exit.status, exit.at);
+        }
         // The alarm is PID 1's only clock, and this is all it is for: keep the
         // services' logs from eating the tmpfs they live in.
         if WANT_LOG_SWEEP.swap(false, Ordering::SeqCst) {
@@ -2524,104 +2529,124 @@ fn supervise(services: &mut BTreeMap<String, Service>) {
             continue;
         }
 
-        // Did a supervised respawn service just exit? Decide its restart
-        // deadline and clear its pid; the restart pass below respawns it once
-        // the deadline has passed.
-        if let Some(svc) = services.values_mut().find(|s| s.pid == Some(pid)) {
-            let uptime = svc.started_at.map(|t| t.elapsed()).unwrap_or_default();
-            svc.pid = None;
-            // HOW it ended, not just when: a service that keeps "exiting after
-            // 8 s" reads completely differently as `exit 0`, `exit 1` or
-            // `signal 9`, and this line is the only record on a console-only
-            // box. Uses libc's status decoding so a signal death is named.
-            let how = if libc::WIFEXITED(status) {
-                let code = libc::WEXITSTATUS(status);
-                let mut how = format!("exit {code}{}", exit_note(code));
-                // Those two codes are the ones a reader can actually chase, and
-                // the service's own output is where the name of the missing
-                // command is. Say where it landed, on the line that reports the
-                // death, or the reader has to know that `log =` exists at all.
-                if !exit_note(code).is_empty() {
-                    if let Some(path) = &svc.log {
-                        how.push_str(&format!("; see {path}"));
-                    }
-                }
-                how
-            } else if libc::WIFSIGNALED(status) {
-                format!("signal {}", libc::WTERMSIG(status))
-            } else {
-                format!("status {:#x}", status)
-            };
-            // GPU-renderer fallback for the compositor (see COMPOSITOR_DEGRADED):
-            // count labwc's exits while nvidia.wlr_gles2/vulkan is requested and,
-            // past the tolerance, flip later respawns to pixman. Counted on EVERY
-            // exit, not only fast ones: the first labwc instance can live for
-            // minutes (the desktop works until a client wedges the GPU channel)
-            // and the respawns on the dead channel may also linger before dying,
-            // so an uptime-gated "crash" count would never trip.
-            if let Some((n, out_of_tries)) = compositor_exit(
-                &svc.name,
-                COMPOSITOR_DEGRADED.load(Ordering::Relaxed),
-                gpu_compositor_requested(),
-                || COMPOSITOR_EXITS.fetch_add(1, Ordering::Relaxed),
-            ) {
-                if out_of_tries {
-                    COMPOSITOR_DEGRADED.store(true, Ordering::Relaxed);
-                    // Same marker the labwc wrapper writes when it falls back
-                    // itself: the GL wrappers (eclipse-firefox) read it and stay
-                    // off zink, which with no GPU path lands on lavapipe.
-                    let _ = std::fs::write(RENDERER_FALLBACK_MARKER, "init-degraded\n");
-                    log(&format!(
-                        "respawn: labwc died {n}x this boot on the GPU renderer ({how}); \
-                         degrading the compositor to pixman for the rest of this boot -- \
-                         the GPU channel is likely wedged (a client's EXEC hung it and \
-                         ctx 0 is never rebuilt); see `dmesg | grep nouveau-uapi` and /tmp/labwc.log"
-                    ));
-                } else {
-                    log(&format!(
-                        "respawn: labwc died ({how}) on the GPU renderer; retrying it \
-                         ({n}/{COMPOSITOR_DEGRADE_AFTER} exits before degrading to pixman)"
-                    ));
+        note_exit(services, pid, status, Instant::now());
+        restart_due(services);
+    }
+}
+
+/// Account for one child that has been reaped: if it was a supervised respawn
+/// service, clear its pid, say how it ended and decide when (or whether) it is
+/// started again. `at` is when it was reaped.
+///
+/// Split out of [`supervise`] because the exits no longer all arrive there: the
+/// boot's bounded gates reap too (see [`reap_pending`]), and an exit collected
+/// in one of them is handed over with the instant it happened, which is the
+/// whole point -- the uptime has to be measured to that instant and not to
+/// whenever the loop gets round to it.
+///
+/// A pid that belongs to no service was a oneshot's leftover or an orphan
+/// reparented to init: reaping it was the whole job.
+fn note_exit(services: &mut BTreeMap<String, Service>, pid: i32, status: i32, at: Instant) {
+    if let Some(svc) = services.values_mut().find(|s| s.pid == Some(pid)) {
+        // Measured to `at`, the instant the child was REAPED, not to now: an
+        // exit collected during one of the boot's bounded gates is handed over
+        // with its own timestamp, and crediting it with the gate as well would
+        // read a 40 ms crash as a healthy ten-second run. That is the same
+        // mistake the backoff made when it slept inside this loop.
+        let uptime = svc
+            .started_at
+            .map(|t| at.saturating_duration_since(t))
+            .unwrap_or_default();
+        svc.pid = None;
+        // HOW it ended, not just when: a service that keeps "exiting after
+        // 8 s" reads completely differently as `exit 0`, `exit 1` or
+        // `signal 9`, and this line is the only record on a console-only
+        // box. Uses libc's status decoding so a signal death is named.
+        let how = if libc::WIFEXITED(status) {
+            let code = libc::WEXITSTATUS(status);
+            let mut how = format!("exit {code}{}", exit_note(code));
+            // Those two codes are the ones a reader can actually chase, and
+            // the service's own output is where the name of the missing
+            // command is. Say where it landed, on the line that reports the
+            // death, or the reader has to know that `log =` exists at all.
+            if !exit_note(code).is_empty() {
+                if let Some(path) = &svc.log {
+                    how.push_str(&format!("; see {path}"));
                 }
             }
-            // Has it now crashed so many times in a row that retrying it is
-            // only costing the console? Checked before the restart is even
-            // scheduled, so a service given up on here never gets a deadline.
-            if note_crash(svc, uptime) {
+            how
+        } else if libc::WIFSIGNALED(status) {
+            format!("signal {}", libc::WTERMSIG(status))
+        } else {
+            format!("status {:#x}", status)
+        };
+        // GPU-renderer fallback for the compositor (see COMPOSITOR_DEGRADED):
+        // count labwc's exits while nvidia.wlr_gles2/vulkan is requested and,
+        // past the tolerance, flip later respawns to pixman. Counted on EVERY
+        // exit, not only fast ones: the first labwc instance can live for
+        // minutes (the desktop works until a client wedges the GPU channel)
+        // and the respawns on the dead channel may also linger before dying,
+        // so an uptime-gated "crash" count would never trip.
+        if let Some((n, out_of_tries)) = compositor_exit(
+            &svc.name,
+            COMPOSITOR_DEGRADED.load(Ordering::Relaxed),
+            gpu_compositor_requested(),
+            || COMPOSITOR_EXITS.fetch_add(1, Ordering::Relaxed),
+        ) {
+            if out_of_tries {
+                COMPOSITOR_DEGRADED.store(true, Ordering::Relaxed);
+                // Same marker the labwc wrapper writes when it falls back
+                // itself: the GL wrappers (eclipse-firefox) read it and stay
+                // off zink, which with no GPU path lands on lavapipe.
+                let _ = std::fs::write(RENDERER_FALLBACK_MARKER, "init-degraded\n");
                 log(&format!(
-                    "respawn: {} exited after {:?} ({}) and has now failed {} times in a \
-                     row without ever staying up {:?}; giving up on it for the rest of \
-                     this boot, so the console stays readable for everything else.{} \
-                     Fix the cause and reboot.",
-                    svc.name,
-                    uptime,
-                    how,
-                    svc.crash_starts,
-                    HEALTHY_UPTIME,
-                    svc.log
-                        .as_deref()
-                        .map(|p| format!(" Its own output is in {p}."))
-                        .unwrap_or_default(),
+                    "respawn: labwc died {n}x this boot on the GPU renderer ({how}); \
+                     degrading the compositor to pixman for the rest of this boot -- \
+                     the GPU channel is likely wedged (a client's EXEC hung it and \
+                     ctx 0 is never rebuilt); see `dmesg | grep nouveau-uapi` and /tmp/labwc.log"
                 ));
             } else {
-                let (wait, next) = restart_delay(uptime, svc.backoff);
-                svc.backoff = next;
-                svc.restart_at = Some(Instant::now() + wait);
-                if wait.is_zero() {
-                    log(&format!(
-                        "respawn: {} exited after {:?} ({}), restarting",
-                        svc.name, uptime, how
-                    ));
-                } else {
-                    log(&format!(
-                        "respawn: {} exited after {:?} ({}, crash), retry in {:?}",
-                        svc.name, uptime, how, wait
-                    ));
-                }
+                log(&format!(
+                    "respawn: labwc died ({how}) on the GPU renderer; retrying it \
+                     ({n}/{COMPOSITOR_DEGRADE_AFTER} exits before degrading to pixman)"
+                ));
             }
         }
-        // Otherwise it was a oneshot's leftover or a reparented orphan: reaped.
-        restart_due(services);
+        // Has it now crashed so many times in a row that retrying it is
+        // only costing the console? Checked before the restart is even
+        // scheduled, so a service given up on here never gets a deadline.
+        if note_crash(svc, uptime) {
+            log(&format!(
+                "respawn: {} exited after {:?} ({}) and has now failed {} times in a \
+                 row without ever staying up {:?}; giving up on it for the rest of \
+                 this boot, so the console stays readable for everything else.{} \
+                 Fix the cause and reboot.",
+                svc.name,
+                uptime,
+                how,
+                svc.crash_starts,
+                HEALTHY_UPTIME,
+                svc.log
+                    .as_deref()
+                    .map(|p| format!(" Its own output is in {p}."))
+                    .unwrap_or_default(),
+            ));
+        } else {
+            let (wait, next) = restart_delay(uptime, svc.backoff);
+            svc.backoff = next;
+            svc.restart_at = Some(at + wait);
+            if wait.is_zero() {
+                log(&format!(
+                    "respawn: {} exited after {:?} ({}), restarting",
+                    svc.name, uptime, how
+                ));
+            } else {
+                log(&format!(
+                    "respawn: {} exited after {:?} ({}, crash), retry in {:?}",
+                    svc.name, uptime, how, wait
+                ));
+            }
+        }
     }
 }
 
@@ -2644,6 +2669,97 @@ fn exit_note(code: i32) -> &'static str {
         126 => " -- found but not executable",
         _ => "",
     }
+}
+
+/// A child reaped somewhere other than the supervision loop, with the instant
+/// it was reaped.
+struct Exit {
+    pid: i32,
+    status: i32,
+    at: Instant,
+}
+
+/// Children reaped by [`reap_pending`] during one of the boot's bounded gates,
+/// waiting to be accounted for by the supervision loop.
+///
+/// A `Mutex` for the type's sake, not for contention: init is single-threaded.
+static PENDING_EXITS: Mutex<Vec<Exit>> = Mutex::new(Vec::new());
+
+/// Reap every child that has exited, without blocking, and queue what was
+/// reaped for the supervision loop.
+///
+/// Called from the bounded waits ([`poll_sleep`]), where init used to reap
+/// nothing at all: a `wait_socket` gate is 10 s of a boot in which any child
+/// that died stayed a zombie, and -- worse -- its uptime was then measured to
+/// the end of the gate instead of to its own death, so a service that failed
+/// `execve` in a millisecond could be read as having stayed up past
+/// [`HEALTHY_UPTIME`], judged healthy and restarted with its backoff reset.
+///
+/// The queue is what makes this safe. A bare `waitpid(-1)` in here would
+/// swallow a respawn service's death: the loop would never see that pid, the
+/// service's `pid` would stay `Some` for ever and nothing would restart it.
+fn reap_pending() {
+    loop {
+        let mut status = 0;
+        // SAFETY: non-blocking wait for any child.
+        let pid = unsafe { libc::waitpid(-1, &mut status, libc::WNOHANG) };
+        if pid == 0 {
+            // Children exist, none has exited.
+            return;
+        }
+        if pid < 0 {
+            // Our handlers are installed WITHOUT `SA_RESTART` on purpose (see
+            // `install_handlers`), so a signal delivered right here comes back
+            // as EINTR having reaped nothing. Giving up on it would leave the
+            // death to be collected after the gate, with the late `at` this
+            // whole queue exists to avoid -- so retry instead.
+            if errno() == libc::EINTR {
+                continue;
+            }
+            // ECHILD, or nothing more to collect.
+            return;
+        }
+        queue_exit(Exit {
+            pid,
+            status,
+            at: Instant::now(),
+        });
+    }
+}
+
+/// Push onto the queue, through a poisoned lock if it comes to that.
+///
+/// `PENDING_EXITS` is only ever held for a `push` or a `take`, so a poisoning
+/// means some *other* code panicked while this lock happened to be held -- and
+/// since #1748 a panic in PID 1 unwinds and is caught instead of killing the
+/// machine, which makes poisoning reachable rather than theoretical. Dropping
+/// an exit on it would strand a respawn service with `pid = Some(..)` for ever,
+/// exactly the failure this queue is here to prevent, so take the data back out
+/// of the poisoned guard and carry on.
+fn queue_exit(exit: Exit) {
+    let mut queue = PENDING_EXITS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    queue.push(exit);
+}
+
+/// Everything [`reap_pending`] has collected since the last call.
+fn take_pending() -> Vec<Exit> {
+    // Through a poisoned lock as well, for the reason in `queue_exit`.
+    let mut queue = PENDING_EXITS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    std::mem::take(&mut *queue)
+}
+
+/// Reap, then sleep: the one poll step of every bounded wait.
+///
+/// Not [`await_oneshot`]'s, deliberately -- that one is waiting for a specific
+/// child of its own, and a reap of "any child" in there would take it out from
+/// under the `waitpid` that is watching for it.
+fn poll_sleep(d: Duration) {
+    reap_pending();
+    sleep_interruptible(d);
 }
 
 /// How long the loop may sleep in one go while waiting out a backoff. Short
@@ -3264,6 +3380,149 @@ mod tests {
         let mut map = BTreeMap::new();
         map.insert("crasher".to_string(), svc);
         assert!(due_names(&map, Instant::now()).is_empty());
+    }
+
+    // -- Reaping during the boot's bounded gates -----------------------------
+
+    /// A respawn service that dies during a `wait_socket` gate must be
+    /// credited with the time IT lived, not with the gate as well.
+    ///
+    /// This is the same mistake the backoff made when it slept inside the
+    /// supervision loop (the `oopslog exited after 8.049671271s` storm): the
+    /// uptime used to be measured when the loop got round to reaping, so a
+    /// service that failed `execve` in a millisecond during labwc's 10 s gate
+    /// was read as having stayed up, judged healthy, restarted at once and had
+    /// its backoff reset -- for ever.
+    #[test]
+    fn an_exit_collected_during_a_gate_keeps_the_uptime_it_really_had() {
+        let mut map = BTreeMap::new();
+        let mut svc = respawn_svc("crasher", "");
+        let started = Instant::now();
+        svc.pid = Some(4242);
+        svc.started_at = Some(started);
+        map.insert("crasher".to_string(), svc);
+
+        // Reaped 40 ms after it started, handed over much later (the gate).
+        let reaped = started + Duration::from_millis(40);
+        note_exit(&mut map, 4242, 0, reaped);
+
+        let svc = &map["crasher"];
+        assert_eq!(svc.pid, None, "el pid no se limpio: nadie lo reiniciaria");
+        assert_eq!(
+            svc.crash_starts, 1,
+            "la caida de 40 ms se conto como una vuelta sana porque se midio \
+             hasta el final de la puerta"
+        );
+        assert!(
+            svc.backoff > MIN_BACKOFF,
+            "el backoff se quedo en el minimo: la caida paso por sana"
+        );
+        assert_eq!(
+            svc.restart_at,
+            Some(reaped + MIN_BACKOFF),
+            "el plazo se calculo desde ahora y no desde la muerte"
+        );
+    }
+
+    /// A healthy run still is one: the same instant arithmetic has to say yes
+    /// when the service really did stay up.
+    #[test]
+    fn a_service_that_really_stayed_up_is_restarted_at_once() {
+        let mut map = BTreeMap::new();
+        let mut svc = respawn_svc("worker", "");
+        let started = Instant::now();
+        svc.pid = Some(77);
+        svc.started_at = Some(started);
+        svc.backoff = MAX_BACKOFF;
+        map.insert("worker".to_string(), svc);
+
+        note_exit(&mut map, 77, 0, started + HEALTHY_UPTIME);
+        assert_eq!(map["worker"].crash_starts, 0);
+        assert_eq!(
+            map["worker"].backoff, MIN_BACKOFF,
+            "no se reinicio el backoff"
+        );
+        assert_eq!(map["worker"].restart_at, Some(started + HEALTHY_UPTIME));
+    }
+
+    /// A pid that belongs to no service was a oneshot's leftover or an orphan
+    /// reparented to init: reaping it was the whole job, and it must not
+    /// disturb anybody.
+    #[test]
+    fn reaping_an_orphan_changes_nothing() {
+        let mut map = BTreeMap::new();
+        let mut svc = respawn_svc("worker", "");
+        svc.pid = Some(5);
+        map.insert("worker".to_string(), svc);
+        note_exit(&mut map, 99999, 0, Instant::now());
+        assert_eq!(map["worker"].pid, Some(5));
+        assert!(map["worker"].restart_at.is_none());
+    }
+
+    /// Serializes the tests that touch the global `PENDING_EXITS`. Poisoning
+    /// is stepped over here too: one failing test must not take the rest of
+    /// them down with it.
+    fn queue_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        static QUEUE_TESTS: Mutex<()> = Mutex::new(());
+        QUEUE_TESTS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// The queue is what makes reaping inside a gate safe: a bare
+    /// `waitpid(-1)` in there would swallow a respawn service's death, the
+    /// loop would never see that pid, and nothing would ever restart it.
+    #[test]
+    fn what_a_gate_reaps_is_handed_to_the_loop_and_handed_over_once() {
+        // `PENDING_EXITS` is global and the suite runs in parallel, so any
+        // test that touches the queue has to hold this first or the counts
+        // below belong to whoever else was pushing.
+        let _exclusive = queue_test_lock();
+        // Start from empty: another test in this binary may have run a gate.
+        let _ = take_pending();
+        let at = Instant::now();
+        queue_exit(Exit {
+            pid: 11,
+            status: 0,
+            at,
+        });
+
+        let taken = take_pending();
+        assert_eq!(taken.len(), 1);
+        assert_eq!(taken[0].pid, 11);
+        assert_eq!(taken[0].at, at, "se perdio el instante de la muerte");
+        assert!(
+            take_pending().is_empty(),
+            "la misma muerte se entrego dos veces"
+        );
+    }
+
+    /// Poisoning is reachable since #1748 (a panic in PID 1 unwinds now), and
+    /// a dropped exit is a respawn service stranded with `pid = Some(..)` for
+    /// ever -- so the queue has to survive it.
+    #[test]
+    fn a_poisoned_queue_still_hands_the_death_over() {
+        let _exclusive = queue_test_lock();
+        let _ = take_pending();
+
+        // Poison it the only way it can be poisoned: panic while holding it.
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let _ = std::panic::catch_unwind(|| {
+            let _held = PENDING_EXITS.lock().unwrap();
+            panic!("boom");
+        });
+        std::panic::set_hook(previous);
+        assert!(PENDING_EXITS.is_poisoned(), "no se llego a envenenar");
+
+        queue_exit(Exit {
+            pid: 12,
+            status: 0,
+            at: Instant::now(),
+        });
+        let taken = take_pending();
+        assert_eq!(taken.len(), 1, "la muerte se perdio con el envenenamiento");
+        assert_eq!(taken[0].pid, 12);
     }
 
     // -- PID 1 may not die --------------------------------------------------

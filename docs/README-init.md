@@ -148,10 +148,34 @@ cosecha—; y lo único que el desenrollado puede envenenar de verdad es el
 `Mutex` de `RENDERER_SAID`, que ya trataba un cerrojo envenenado como «dilo».
 El desenrollado cuesta unos 17 KiB de binario, un 4%.
 
-## Cola, por orden de riesgo
+## Lo que se cerró en la quinta tanda
 
-1. **Durante las esperas acotadas del arranque no se cosecha a nadie.** Los hijos
-   que mueran en esos segundos se quedan zombis hasta que se llega al lazo. Es
-   cosmético, pero hay que arreglarlo con cuidado: un `waitpid(-1)` suelto ahí
-   dentro le robaría al lazo la muerte de un `respawn` y ese servicio no se
-   reiniciaría nunca.
+**Las esperas acotadas del arranque ya cosechan, y no era cosmético.** Durante
+una puerta `wait_socket` —10 s en el caso de labwc— init no cosechaba a nadie, y
+el problema no eran los zombis: la vida de un servicio se medía **al
+cosecharlo**, así que un hijo que muriera en esa ventana se apuntaba la puerta
+entera como tiempo vivido, pasaba de `HEALTHY_UPTIME`, se daba por sano y se
+reiniciaba al instante con su backoff a cero. Es exactamente el fallo que tenía
+el backoff cuando dormía dentro del lazo de supervisión, en otra ventana.
+
+Ahora las esperas cosechan sin bloquear y **encolan** lo cosechado con el
+instante de la muerte; el lazo vacía esa cola al principio de cada vuelta y
+contabiliza cada salida con su propio instante. La cola es lo que lo hace
+seguro: un `waitpid(-1)` suelto en una espera **se tragaría** la muerte de un
+`respawn`, el lazo no vería nunca ese pid, el `pid` del servicio se quedaría
+puesto para siempre y nadie lo reiniciaría.
+
+La espera del `oneshot` es la única que no cosecha, a propósito: está vigilando
+un hijo concreto y una cosecha de «cualquier hijo» se lo quitaría de debajo del
+`waitpid` que lo espera.
+
+La contabilidad salió del lazo a `note_exit`, que ya se puede probar: cuatro
+tests, y el que importa fija que una caída de 40 ms durante una puerta de 10 s
+sigue siendo una caída.
+
+## Cola
+
+Nada pendiente de esta revisión. Lo que queda son decisiones tomadas (el
+apagado forzado, la ausencia de protocolo de *readiness*) y lo que no cubre el
+techo de logs: un fichero que escriba un envoltorio por su cuenta y que no sea
+el `log =` de ningún servicio.
