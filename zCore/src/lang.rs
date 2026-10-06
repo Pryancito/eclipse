@@ -299,11 +299,16 @@ const fn nonacker_lines(total: usize) -> (usize, usize) {
 
 /// The cpu that holds a lock it is itself waiting for, if any.
 ///
-/// A ticket mutex is not re-entrant and every guard disables interrupts, so no
-/// *interrupt* can put one cpu on both lists. A fault or a panic taken inside
-/// the critical section can, and that is the whole finding: the handler came
-/// back into a lock its own cpu holds and waits, with interrupts off, for a
-/// release only it could perform.
+/// Keys are `(file ptr, packed line|cpu)` -- the whole recorded site, not just
+/// the cpu. **Matching on the cpu alone would call every AB-BA a
+/// self-deadlock**: in a two-lock cycle each cpu is legitimately a holder of
+/// one lock and a waiter for the other, so both appear on both lists. What
+/// cannot happen without re-entry is one cpu recorded as holder AND waiter at
+/// the *same acquire site*: a ticket mutex is not re-entrant and every guard
+/// disables interrupts, so no *interrupt* can produce it. A fault or a panic
+/// taken inside the critical section can, and that is the whole finding -- the
+/// handler came back into a lock its own cpu holds, and waits with interrupts
+/// off for a release only it could perform.
 ///
 /// It is also the one shape the old verdict could not be: "either a
 /// lock-ordering cycle (AB-BA) or a HOLDER stuck inside its own critical
@@ -312,11 +317,11 @@ const fn nonacker_lines(total: usize) -> (usize, usize) {
 /// banner before they grew a re-entrancy escape; the serial console produced
 /// it on the bring-up box, from `uart_16550.rs:249`, with `cpu=18` on both
 /// lines.
-fn self_deadlock_cpu(holders: &[usize], waiters: &[usize]) -> Option<usize> {
+fn self_deadlock_cpu(holders: &[(usize, usize)], waiters: &[(usize, usize)]) -> Option<usize> {
     holders
         .iter()
-        .copied()
-        .find(|h| *h != usize::MAX && waiters.contains(h))
+        .find(|key| waiters.contains(key))
+        .map(|(_, lc)| dl_cpu(*lc))
 }
 
 /// How many slots hold a recorded site. Monotone (slots are claimed and never
@@ -361,10 +366,13 @@ fn dl_paint() {
     // the only real question -- why is the holder not releasing it? -- unasked.
     let mut holder_cpus = [usize::MAX; DL_SLOTS];
     let mut holder_n = 0usize;
-    // Every cpu seen WAITING, for the same reason. A cpu that appears on both
-    // lists holds the lock it is waiting for: see `self_deadlock_cpu`.
-    let mut waiter_cpus = [usize::MAX; DL_SLOTS];
-    let mut waiter_n = 0usize;
+    // The full recorded site of every holder and of every waiter -- not just
+    // the cpu, which an AB-BA cycle puts on both lists too. See
+    // `self_deadlock_cpu`.
+    let mut holder_keys = [(0usize, 0usize); DL_SLOTS];
+    let mut holder_keys_n = 0usize;
+    let mut waiter_keys = [(0usize, 0usize); DL_SLOTS];
+    let mut waiter_keys_n = 0usize;
     for i in 0..DL_SLOTS {
         let p = DL_FILE_PTR[i].load(Ordering::SeqCst);
         if p == 0 {
@@ -378,10 +386,12 @@ fn dl_paint() {
         if is_holder && holder_n < DL_SLOTS {
             holder_cpus[holder_n] = cpu;
             holder_n += 1;
+            holder_keys[holder_keys_n] = (p, lc);
+            holder_keys_n += 1;
         }
-        if !is_holder && waiter_n < DL_SLOTS {
-            waiter_cpus[waiter_n] = cpu;
-            waiter_n += 1;
+        if !is_holder && waiter_keys_n < DL_SLOTS {
+            waiter_keys[waiter_keys_n] = (p, lc);
+            waiter_keys_n += 1;
         }
         // SAFETY: (p, l) were stored from a live &'static str (either the
         // reporter's own #[track_caller] file, or the holder's, snapshotted by
@@ -545,7 +555,9 @@ fn dl_paint() {
     // is the line a reader acts on, so it gets the bytes held back for it.
     b.release_reserve();
     // One-line verdict so the on-screen (no-serial) capture is self-diagnosing.
-    if let Some(cpu) = self_deadlock_cpu(&holder_cpus[..holder_n], &waiter_cpus[..waiter_n]) {
+    if let Some(cpu) =
+        self_deadlock_cpu(&holder_keys[..holder_keys_n], &waiter_keys[..waiter_keys_n])
+    {
         let _ = write!(
             b,
             "\nDIAG: self-deadlock on cpu{} -- it HOLDS the lock it is waiting \
@@ -1302,37 +1314,53 @@ mod tests {
         assert!(cut > 0);
     }
 
-    /// The shape the bring-up box produced: one cpu on both lists, from one
-    /// line (`uart_16550.rs:249`). The old verdict named "AB-BA or a HOLDER
-    /// stuck inside its own critical section" and pointed at an "is now at"
-    /// line that was a stale idle RIP, so the hunt went looking for a second
-    /// lock and for a cpu that had parked itself holding one. There was
-    /// neither.
+    /// Two files, as two distinct `&'static str` pointers would be.
+    const F: usize = 0x1000;
+    const G: usize = 0x2000;
+
+    /// The shape the bring-up box produced: one cpu, one line
+    /// (`uart_16550.rs:249`), recorded as holder AND as waiter. The old verdict
+    /// named "AB-BA or a HOLDER stuck inside its own critical section" and
+    /// pointed at an "is now at" line that was a stale idle RIP, so the hunt
+    /// went looking for a second lock and for a cpu that had parked itself
+    /// holding one. There was neither.
     #[test]
-    fn a_cpu_on_both_lists_is_named_as_waiting_on_itself() {
-        assert_eq!(self_deadlock_cpu(&[18], &[18]), Some(18));
+    fn a_cpu_recorded_at_one_site_as_both_holder_and_waiter_is_waiting_on_itself() {
+        let site = (F, dl_pack(249, 18));
+        assert_eq!(self_deadlock_cpu(&[site], &[site]), Some(18));
     }
 
-    /// A real AB-BA still reads as one: two cpus, each holding what the other
-    /// waits for, and no cpu on both lists.
+    /// The false positive this predicate is keyed on the whole site to avoid.
+    /// In a two-lock cycle each cpu is a holder of one lock and a waiter for
+    /// the other, so **matching on the cpu alone calls every AB-BA a
+    /// self-deadlock** -- and silences the verdict that was right about it.
+    /// The two roles are recorded at different acquire sites, which is what
+    /// tells them apart.
     #[test]
     fn two_cpus_holding_what_the_other_waits_for_is_not_a_self_deadlock() {
-        assert_eq!(self_deadlock_cpu(&[1, 2], &[2, 1]), Some(1));
+        let holders = [(F, dl_pack(10, 1)), (G, dl_pack(20, 2))];
+        let waiters = [(G, dl_pack(20, 1)), (F, dl_pack(10, 2))];
+        assert_eq!(self_deadlock_cpu(&holders, &waiters), None);
+    }
+
+    /// One cpu taking two different locks in two files is the same story in
+    /// miniature: both roles, one cpu, and still not a re-entry.
+    #[test]
+    fn one_cpu_holding_one_lock_and_waiting_for_another_is_not_a_self_deadlock() {
+        let holders = [(F, dl_pack(10, 4))];
+        let waiters = [(G, dl_pack(10, 4))];
+        assert_eq!(self_deadlock_cpu(&holders, &waiters), None);
     }
 
     /// The ordinary convoy: a holder that is simply slow, with other cpus
-    /// queued behind it.
+    /// queued behind it -- at the same line, which is what a lock with one
+    /// acquire site produces.
     #[test]
-    fn a_holder_nobody_shares_a_cpu_with_is_not_a_self_deadlock() {
-        assert_eq!(self_deadlock_cpu(&[3], &[0, 1, 2]), None);
-        assert_eq!(self_deadlock_cpu(&[], &[0, 1]), None);
-    }
-
-    /// Empty slots are `usize::MAX`, and two of them are not a cpu that holds
-    /// and waits.
-    #[test]
-    fn the_empty_slot_marker_is_not_mistaken_for_a_cpu() {
-        assert_eq!(self_deadlock_cpu(&[usize::MAX], &[usize::MAX]), None);
+    fn cpus_queued_behind_a_holder_at_the_same_line_are_not_a_self_deadlock() {
+        let holders = [(F, dl_pack(249, 3))];
+        let waiters = [(F, dl_pack(249, 0)), (F, dl_pack(249, 1))];
+        assert_eq!(self_deadlock_cpu(&holders, &waiters), None);
+        assert_eq!(self_deadlock_cpu(&[], &waiters), None);
     }
 
     /// The verdict is written after `release_reserve`, out of a fixed budget.
