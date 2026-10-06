@@ -979,6 +979,29 @@ mod tests {
     }
 
     #[test]
+    fn the_write_fault_target_and_its_return_slot_are_both_clock_values() {
+        // The fourth capture: `vaddr=0xb3ae09dd67 flags=WRITE` inside
+        // `BTreeMap<usize, PageState>::insert`, with `[rsp0]=0xb24cc4e47c`. Two
+        // slots in two unrelated structures, both holding a reading of this
+        // boot's clock, 5,93 s apart -- and the report named neither, because
+        // the shape was only printed for EXECUTE faults.
+        let target = 0xb3_ae09_dd67u64;
+        let ret_slot = 0xb2_4cc4_e47cu64;
+        assert!(target > ret_slot);
+        assert_eq!(
+            (target - ret_slot) / 1_000_000,
+            5_926,
+            "about six seconds apart, in nanoseconds"
+        );
+        // Taken at an uptime that makes the later of the two current.
+        assert_eq!(clock_shape(target, target), ClockShape::Reading);
+        assert_eq!(clock_shape(ret_slot, target), ClockShape::Reading);
+        // And the write target is a user-half address, which is the other half
+        // of what the header should have said about it.
+        assert_eq!(word_shape(target), WordShape::UserHalf);
+    }
+
+    #[test]
     fn the_third_captures_word_is_a_deadline_and_not_a_rejection() {
         // The capture, verbatim: the kernel printed its own reading next to
         // the word, which is the only reason this can be checked at all.

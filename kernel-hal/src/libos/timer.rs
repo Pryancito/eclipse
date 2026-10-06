@@ -101,3 +101,8 @@ pub fn in_timer_callback() -> bool {
 /// # Safety
 /// The caller must never resume the abandoned callback chain.
 pub unsafe fn abandon_timer_callbacks() {}
+
+/// How many tick frames containment has cut short (libos: there is no tick).
+pub fn tick_frames_abandoned() -> usize {
+    0
+}
