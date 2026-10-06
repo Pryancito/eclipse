@@ -87,6 +87,60 @@ pub fn truncate_chars(s: &str, max_chars: usize) -> String {
 pub const MAX_TITLE_CHARS: usize = 512;
 pub const MAX_APP_ID_CHARS: usize = 256;
 
+/// Outputs whose bar the compositor closed itself. One entry per `wl_output`
+/// global, so this can never outgrow [`MAX_OUTPUTS`].
+pub const MAX_REFUSED_OUTPUTS: usize = MAX_OUTPUTS;
+
+/// Which outputs answered a bar with `zwlr_layer_surface_v1.Closed`.
+///
+/// **Why this exists**: the panel creates a bar for every output it has not
+/// claimed yet, once per event-loop iteration, and `Closed` drops the bar from
+/// that list. Those two together are a live loop: the compositor closes the
+/// layer surface, the next iteration creates it again, and the panel spins at
+/// request rate -- a bar that never repaints (so, to the user, a hung panel),
+/// a `wl_surface` + `zwlr_layer_surface_v1` pair per round, and, as soon as one
+/// of those rounds reaches a configure, an `mmap`/`munmap` of a full bar pool
+/// per round. A compositor that declines a surface must be taken at its word
+/// until the output itself comes back.
+#[derive(Default, Debug)]
+pub struct RefusedOutputs {
+    globals: Vec<u32>,
+}
+
+impl RefusedOutputs {
+    /// Remember that `global`'s bars were closed. Returns true the first time,
+    /// so the caller can log once instead of once per event, and false when the
+    /// global is already known -- or when the list is full, which cannot happen
+    /// with one entry per bound output but keeps the ceiling honest.
+    pub fn mark(&mut self, global: u32) -> bool {
+        if self.globals.contains(&global) {
+            return false;
+        }
+        try_push_bounded(&mut self.globals, global, MAX_REFUSED_OUTPUTS)
+    }
+
+    /// Is this output's bar one the compositor closed?
+    pub fn contains(&self, global: u32) -> bool {
+        self.globals.contains(&global)
+    }
+
+    /// Forget the output: called when the `wl_output` global goes away, so a
+    /// monitor that is unplugged and plugged back in gets its bars again
+    /// instead of staying bare for the rest of the session.
+    pub fn forget(&mut self, global: u32) {
+        self.globals.retain(|g| *g != global);
+    }
+
+    /// How many outputs are currently refused (for tests and diagnostics).
+    pub fn len(&self) -> usize {
+        self.globals.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.globals.is_empty()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -177,5 +231,54 @@ mod tests {
         let s = "áéíóú".repeat(200);
         let t = truncate_chars(&s, 10);
         assert_eq!(t.chars().count(), 10);
+    }
+
+    /// The whole point of the type: a compositor that closes the same bar over
+    /// and over leaves ONE entry, and `contains` keeps saying yes -- that is
+    /// what stops `ensure_surfaces` from creating the surface again on the next
+    /// iteration of the event loop.
+    #[test]
+    fn a_closed_output_is_remembered_once_however_often_it_closes() {
+        let mut r = RefusedOutputs::default();
+        assert!(r.is_empty());
+        assert!(r.mark(7), "the first Closed is news");
+        for _ in 0..1000 {
+            assert!(!r.mark(7), "every later Closed for the same output is not");
+        }
+        assert_eq!(r.len(), 1);
+        assert!(r.contains(7));
+        assert!(!r.contains(8), "only the output that closed is refused");
+    }
+
+    /// A monitor unplugged and plugged back in must get its bars again: the
+    /// registry's `global_remove` is the one event that clears the refusal.
+    #[test]
+    fn forgetting_an_output_lets_its_bars_come_back() {
+        let mut r = RefusedOutputs::default();
+        r.mark(3);
+        r.mark(4);
+        r.forget(3);
+        assert!(!r.contains(3), "the unplugged output is bar-eligible again");
+        assert!(r.contains(4), "its neighbour is untouched");
+        r.forget(99); // not present: a no-op, not a panic
+        assert_eq!(r.len(), 1);
+        // And it can be refused again after coming back.
+        assert!(r.mark(3));
+        assert_eq!(r.len(), 2);
+    }
+
+    /// The ceiling cannot bite with one entry per bound output, so it is pinned
+    /// here rather than left to be discovered: past the cap `mark` reports
+    /// false (nothing stored) instead of growing the list.
+    #[test]
+    fn the_refusal_list_stops_at_its_ceiling() {
+        let mut r = RefusedOutputs::default();
+        for g in 0..MAX_REFUSED_OUTPUTS as u32 {
+            assert!(r.mark(g));
+        }
+        assert_eq!(r.len(), MAX_REFUSED_OUTPUTS);
+        assert!(!r.mark(9999), "the push past the cap is refused");
+        assert_eq!(r.len(), MAX_REFUSED_OUTPUTS);
+        assert!(!r.contains(9999));
     }
 }
