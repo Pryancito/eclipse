@@ -1810,8 +1810,17 @@ impl Executor {
         // slab slot. The borrow bit is deliberately left set (as on the normal
         // `Ready` path) so nothing can hand this task out in the window before
         // the removal lands.
+        //
+        // This has to be the store that flips `finish`. That flag and
+        // `WakerRef::dropped` are one `AtomicBool`, and `drop_by_ref` calls
+        // `mark_dropped` only on the false→true edge. `abandon` used to set it
+        // first, the edge never happened, and the slot stayed in the slab
+        // with `borrowed` stuck at 1 — invisible to the hang detector, which
+        // treats a borrowed task as a poll in progress.
         if let Some(waker) = self.current_waker.as_ref() {
             waker.drop_by_ref();
+        } else {
+            task.waker().drop_by_ref();
         }
         self.abandoned
             .store(true, core::sync::atomic::Ordering::SeqCst);

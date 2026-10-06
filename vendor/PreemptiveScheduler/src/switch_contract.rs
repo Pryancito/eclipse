@@ -266,4 +266,28 @@ mod tests {
             "an immediate was taken for a comment"
         );
     }
+
+    #[test]
+    fn aarch64_executor_entry_realigns_sp_before_the_call() {
+        // `init_stack_and_context` pushes one usize under a 16-byte-aligned
+        // top. AAPCS64 faults a `run_executor` entry whose SP is 8 (mod 16)
+        // when stack-alignment checking is on. x86_64 pops the word; riscv64
+        // adds 8. Adding 16 on aarch64 would put SP in the top guard.
+        let code = instructions(include_str!("arch/aarch64/executor_entry.S"));
+        let lines: Vec<&str> = code
+            .lines()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .collect();
+        let load = lines.iter().position(|s| *s == "ldr x0, [sp]");
+        let adjust = lines.iter().position(|s| *s == "add x9, sp, #8");
+        let mov = lines.iter().position(|s| *s == "mov sp, x9");
+        let branch = lines.iter().position(|s| *s == "b run_executor");
+        match (load, adjust, mov, branch) {
+            (Some(load), Some(adjust), Some(mov), Some(branch)) => {
+                assert!(load < adjust && adjust < mov && mov < branch);
+            }
+            _ => panic!("aarch64 executor_entry does not realign SP: {:?}", lines),
+        }
+    }
 }

@@ -331,6 +331,22 @@ pub(crate) fn stealable_peers(stealable: u64, current: usize, ready: u64) -> u64
     stealable & ready & !mine
 }
 
+/// Victims a thief should actually probe.
+///
+/// `STEALABLE` alone is not enough. The owner of a task its mask forbids
+/// clears that bit on the way into `hlt`: `has_ready` is false, because it
+/// cannot run the task itself. The task is still on its queue. `STRANDED` is
+/// the bit that says so, and a scan that does not include it never locks the
+/// only CPU that holds the task — idle steal and the rebalance rescue both
+/// come through here.
+///
+/// `stealable` must be loaded before `stranded`. The owner's clear of
+/// `STEALABLE` is sequenced after `note_stranded`, so an Acquire load that
+/// observes the clear also observes the mark.
+pub(crate) fn steal_victim_peers(stealable: u64, stranded: u64, current: usize, ready: u64) -> u64 {
+    stealable_peers(stealable | stranded, current, ready)
+}
+
 /// CPUs whose queue holds at least one task **they are not allowed to poll**.
 ///
 /// A task whose owner CPU is forbidden by its affinity mask is refused on every
@@ -347,7 +363,9 @@ pub(crate) fn stealable_peers(stealable: u64, current: usize, ready: u64) -> u64
 /// So the owner says so here, and an allowed CPU comes for it on its rebalance
 /// tick instead of waiting to be idle. `STEALABLE` answers "is there anything
 /// worth taking"; this answers the narrower "is there anything nobody else will
-/// ever come for".
+/// ever come for". The steal scan unions the two: the owner clears `STEALABLE`
+/// on the way into `hlt`, and without this bit the task's CPU drops out of
+/// every probe.
 static STRANDED: AtomicU64 = AtomicU64::new(0);
 
 /// Rescue pulls: tasks taken off a peer that was not allowed to poll them.
@@ -370,9 +388,11 @@ pub(crate) fn note_stranded(cpu: usize) {
 
 /// `cpu` completed a hand-out pass over every page refusing nothing.
 ///
-/// Only the owner calls this, and only from there. A stranded task sits in the
-/// **notified** lane -- pass 1 re-publishes it when it refuses it -- so a full
-/// pass with no refusal means there is nothing stranded here to come for.
+/// Only the owner calls this, and only from there, and only once both lanes
+/// have been looked at. A stranded task sits in the **notified** lane (pass 1
+/// re-publishes it) or the **yielded** lane (a `sched_yield` whose affinity
+/// then moved). A full pass with no refusal in either means there is nothing
+/// stranded here to come for.
 #[inline]
 pub(crate) fn note_not_stranded(cpu: usize) {
     if cpu >= MAX_CORE_NUM {
@@ -1397,15 +1417,18 @@ fn steal_task_inner(min_count: usize, rebalance: bool) -> Option<(Key, Arc<Task>
     // this element concurrently.
     let candidates: &mut [(usize, usize); MAX_CORE_NUM] =
         unsafe { &mut *STEAL_CANDIDATES[current_cpu].0.get() };
-    // The whole scan, gated on one plain load. Every peer is either empty or
+    // The whole scan, gated on two plain loads. Every peer is either empty or
     // not in its executor loop, so there is nothing to probe and no reason to
     // compare-exchange anybody's locks to find that out. See [`STEALABLE`]:
     // this is the pass an idle CPU used to pay for on every single interrupt.
-    let peers = stealable_peers(
-        STEALABLE.load(Ordering::Acquire),
-        current_cpu,
-        executor_ready_mask(),
-    );
+    //
+    // `STRANDED` is unioned in because a halted owner has just cleared its
+    // `STEALABLE` bit while still holding a task it must not poll. Load
+    // `STEALABLE` first: observing that clear synchronizes with the earlier
+    // `note_stranded` (see [`steal_victim_peers`]).
+    let stealable = STEALABLE.load(Ordering::Acquire);
+    let stranded = STRANDED.load(Ordering::Acquire);
+    let peers = steal_victim_peers(stealable, stranded, current_cpu, executor_ready_mask());
     if peers == 0 {
         STEAL_SKIPPED.fetch_add(1, Ordering::Relaxed);
         return None;
@@ -3251,6 +3274,18 @@ mod stranded_tests {
         // tick of every busy CPU, so on a machine with no affine task the gate
         // has to answer from one load and stop.
         assert_eq!(stranded_peers(0, 0, u64::MAX), 0);
+    }
+
+    #[test]
+    fn a_halted_owner_stays_a_victim_after_it_clears_stealable() {
+        // The owner clears STEALABLE because has_ready is false for a task it
+        // is not allowed to run. The task is still on that queue. A scan that
+        // only reads STEALABLE never locks the CPU that holds it.
+        assert_eq!(steal_victim_peers(0, 0b0001, 1, u64::MAX), 0b0001);
+        // And a machine with neither bit set still costs no probe.
+        assert_eq!(steal_victim_peers(0, 0, 1, u64::MAX), 0);
+        // The owner does not rescue from itself.
+        assert_eq!(steal_victim_peers(0, 0b0001, 0, u64::MAX), 0);
     }
 
     #[test]

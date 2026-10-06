@@ -147,9 +147,14 @@ impl Task {
     /// deliberately leaked. One dead future's worth of memory, per contained
     /// fault, is the price of not halting the machine.
     ///
-    /// Setting `finish` first means a late waker that gets this task handed out
-    /// again finds `poll` returning `Ready` immediately, so the swapped-in
-    /// `Pending` is never actually polled either.
+    /// `finish` is left clear. It is the same `AtomicBool` as
+    /// [`WakerRef::dropped`](crate::waker_page::WakerRef), and `drop_by_ref`
+    /// only calls `mark_dropped` on the false→true edge. Storing it here made
+    /// that edge a no-op: the page bit stayed clear, the generator never
+    /// reaped the slab slot, and `borrowed` stuck at 1. The caller publishes
+    /// both by calling `drop_by_ref` after this returns. The borrow bit is
+    /// still set, so the task cannot be handed out in between, and once
+    /// `drop_by_ref` has run a late waker finds `poll` returning `Ready`.
     ///
     /// Returns `false` if the future lock could not be reclaimed, which leaves
     /// the task exactly as it was — the caller must then fall back to halting.
@@ -167,7 +172,6 @@ impl Task {
             // a future another CPU may be polling.
             return false;
         };
-        self.finish.store(true, Ordering::SeqCst);
         let dead = core::mem::replace(
             &mut *slot,
             Box::pin(core::future::pending::<()>()) as Pin<Box<dyn Future<Output = ()> + Send>>,
@@ -791,13 +795,19 @@ impl TaskCollection {
                             }
                         }
                     }
-                    // A refusal anywhere in the pass means this CPU is
-                    // holding something only a peer may run; a whole pass with
-                    // none means it is not. Set eagerly (a spare bit costs one
-                    // scan), cleared only by a clean pass.
+                    // A refusal means this CPU is holding something only a
+                    // peer may run. Publish it before pass 2 so a rescuer does
+                    // not wait out the yielded scan, but do not clear it yet:
+                    // pass 2 can refuse a task that lives only in the yielded
+                    // lane (`sched_yield`, then `sched_setaffinity`). Clearing
+                    // here dropped that mark, the owner then halted and wiped
+                    // `STEALABLE`, and neither idle steal nor the rescue scan
+                    // looked at this CPU again.
                     if refused {
                         crate::runtime::note_stranded(own_cpu);
-                    } else {
+                    } else if found_key.is_some() {
+                        // Pass 2 will not run. The notified lane had nothing
+                        // this CPU must refuse.
                         crate::runtime::note_not_stranded(own_cpu);
                     }
                     // Pass 2 — voluntary yields, only when nothing urgent remains.
@@ -824,6 +834,7 @@ impl TaskCollection {
                                         .map(|task| task.allowed_on(cpu))
                                         .unwrap_or(true);
                                 if !allowed {
+                                    refused = true;
                                     inner.pages[page_idx].mark_yielded(subpage_idx);
                                     let mask = inner
                                         .slab
@@ -844,6 +855,15 @@ impl TaskCollection {
                                 inner = self.get_mut_inner(priority);
                                 pending = inner.pages[page_idx].reclaim_yielded(pending);
                             }
+                        }
+                        // Both lanes have been scanned. A yielded-lane refusal
+                        // is the only mark a rescuer will see once this CPU
+                        // halts; a pass that refused nothing in either lane
+                        // takes the mark back off.
+                        if refused {
+                            crate::runtime::note_stranded(own_cpu);
+                        } else {
+                            crate::runtime::note_not_stranded(own_cpu);
                         }
                     }
                     if found_key.is_none() {
@@ -1392,6 +1412,57 @@ mod collection_tests {
             1,
             "nobody will ever come for this task"
         );
+    }
+
+    /// `sched_yield` parks the task in the yielded lane. Moving its affinity
+    /// off this CPU then has to set the same mark: pass 1 sees nothing to
+    /// refuse and used to clear `STRANDED` before pass 2 ran.
+    #[test]
+    fn refusing_a_yielded_task_pinned_elsewhere_still_says_so() {
+        let _g = crate::runtime::resched_test_lock();
+        crate::runtime::clear_stranded_for_test();
+        let tc = TaskCollection::new(0);
+        let key = tc.add_task(pending(), pinned_elsewhere());
+        assert!(tc.take_task().is_none());
+        crate::runtime::clear_stranded_for_test();
+        {
+            let inner = tc.get_mut_inner(DEFAULT_PRIORITY);
+            let (_, page_idx, subpage_idx) = unpack_key(key);
+            // The notified refusal re-published the bit. A yield leaves it
+            // only in the other lane.
+            let _ = inner.pages[page_idx].take_notified();
+            inner.pages[page_idx].mark_yielded(subpage_idx);
+        }
+        assert!(tc.take_task().is_none(), "ran a task pinned elsewhere");
+        assert_eq!(
+            crate::runtime::stranded_mask_for_test() & 1,
+            1,
+            "a yielded-lane refusal cleared the mark a rescuer reads"
+        );
+    }
+
+    /// Panic containment retires the future without storing `finish` first.
+    /// That flag is the waker's `dropped` bit; storing it first made
+    /// `drop_by_ref` skip `mark_dropped`, and the slot never left the slab.
+    #[test]
+    fn abandoning_a_poll_still_reaps_the_slab_slot() {
+        let tc = TaskCollection::new(0);
+        tc.add_task(pending(), None);
+        let (_key, task, waker) = tc.take_task().expect("a new task is runnable");
+        assert_eq!(tc.task_num(), 1);
+        // `abandon` force-unlocks the future lock the in-flight poll still
+        // holds. Nothing has polled here, so take the lock and leak the
+        // guard: that is the state a panic inside `Task::poll` leaves behind.
+        let guard = task.future.try_lock().expect("future lock");
+        core::mem::forget(guard);
+        assert!(unsafe { task.abandon() });
+        waker.drop_by_ref();
+        assert!(
+            tc.take_task().is_none(),
+            "a retired task was handed out again"
+        );
+        assert_eq!(tc.task_num(), 0, "the slab slot was not reaped");
+        assert_eq!(tc.ready_num(), Some(0));
     }
 
     /// And the bit comes back down, or every CPU that once held an affine task
