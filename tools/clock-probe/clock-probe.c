@@ -714,10 +714,17 @@ static void sec_epoch(void) {
         // The vDSO serves clock_gettime, gettimeofday and time from one data
         // page with three different pieces of arithmetic on top. They can, and
         // once did, disagree.
+        // Y la ventana se imprime al lado del desvio, porque sin ella el
+        // numero no decide nada: un `gettimeofday` 4,6 ms por delante de la
+        // lectura anterior es el fallo que esta seccion busca si las dos
+        // lecturas fueron seguidas, y no es nada si entre ellas pasaron 4,6 ms
+        // de verdad (un syscall de TCG, una preempcion). Con las dos cifras se
+        // lee de un golpe cual de las dos cosas paso.
         check(!denorm && gtod >= wall - 1000000 && gtod <= after + 1000000,
               "gettimeofday coincide con clock_gettime",
-              "%s%lld us de diferencia", denorm ? "tv_usec denormal, " : "",
-              (long long)((gtod - wall) / 1000));
+              "%s%+lld us respecto a la lectura anterior, en una ventana de %lld us",
+              denorm ? "tv_usec denormal, " : "", (long long)((gtod - wall) / 1000),
+              (long long)((after - wall) / 1000));
     }
 
     t = time(NULL);
