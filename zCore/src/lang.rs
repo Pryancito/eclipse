@@ -55,6 +55,17 @@ fn alloc_error(layout: Layout) -> ! {
             wild,
         ));
     }
+    // Free blocks caught written after their free, or freed twice. The front
+    // cache leaks each one together with the rest of its list, so a non-zero
+    // count also explains up to 4 MiB per report missing from this heap.
+    let uaf = crate::memory::heap_written_after_free();
+    if uaf > 0 {
+        emit(format_args!(
+            "heap has caught {} free block(s) written after their free, or freed twice, \
+             and leaked them with their lists; see [heap-uaf] above\n",
+            uaf,
+        ));
+    }
     // Attribution: live allocations per size class, so the OOM report says
     // WHICH class holds the heap (each line: class upper bound, live count,
     // total bytes if every allocation were at the bound).
