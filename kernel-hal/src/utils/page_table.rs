@@ -287,6 +287,18 @@ impl<L: PageTableLevel, PTE: GenericPTE> PageTableImpl<L, PTE> {
         unsafe { Self::from_root(crate::vm::current_vmtoken()) }
     }
 
+    /// Whether `vaddr` is on a present page, asked without
+    /// [`GenericPageTable::query`]'s `trace!`.
+    ///
+    /// For a crash path deciding whether a read is safe: under `LOG=trace`
+    /// the logger writes every query to the graphic console, so a stop screen
+    /// that scanned a stack with `query` wrote that console a thousand times
+    /// before it could draw. And present, not "has flags": a PROT_NONE leaf
+    /// or a stack guard page is a mapping the CPU still faults on.
+    pub fn is_present(&self, vaddr: VirtAddr) -> bool {
+        matches!(self.get_entry_mut(vaddr), Ok((entry, _)) if entry.is_present())
+    }
+
     pub fn clone_kernel(&self) -> Self {
         let pt = Self::new();
         crate::vm::pt_clone_kernel_space(pt.table_phys(), self.table_phys());
@@ -870,6 +882,40 @@ mod walker_tests {
             Err(PagingError::AlreadyMapped)
         ));
         assert_eq!(pt.unmap(vaddr).unwrap().0, 0x1000);
+    }
+
+    /// `is_present` answers "would a read fault", which is not "is something
+    /// mapped": a page with no access is in the table and still faults.
+    #[test]
+    fn only_a_page_the_cpu_can_read_is_present() {
+        let mut pt = a_table::<PageTableLevel4>();
+        let small = 0x2a00_0000_0000;
+        let none = small + K;
+        let huge = 0x2a00_4000_0000;
+        pt.map(Page::new_aligned(small, PageSize::Size4K), 0x1000, rw())
+            .unwrap();
+        pt.map(
+            Page::new_aligned(none, PageSize::Size4K),
+            0x2000,
+            MMUFlags::empty(),
+        )
+        .unwrap();
+        pt.map(Page::new_aligned(huge, PageSize::Size2M), 4 * M, rw())
+            .unwrap();
+
+        assert!(pt.is_present(small) && pt.is_present(small + K - 8));
+        assert!(pt.is_present(huge + M - 8));
+        assert!(!pt.is_present(huge + M), "the next 2 MiB is not mapped");
+        assert!(pt.query(none).is_ok(), "the no-access page is mapped");
+        assert!(!pt.is_present(none), "and a read of it still faults");
+        // Under a table that exists, and under no table at all.
+        assert!(!pt.is_present(small + 2 * K));
+        assert!(!pt.is_present(0x2b00_0000_0000));
+
+        pt.unmap(small).unwrap();
+        assert!(!pt.is_present(small));
+        pt.unmap(none).unwrap();
+        pt.unmap(huge).unwrap();
     }
 
     // ── huge pages ─────────────────────────────────────────────────────────

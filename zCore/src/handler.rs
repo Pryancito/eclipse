@@ -439,6 +439,8 @@ impl KernelHandler for ZcoreKernelHandler {
                     kernel_hal::ksyms::Addr(kernel_hal::kstats::last_fault_rip()),
                     in_timer,
                 );
+                #[cfg(target_arch = "x86_64")]
+                write_stop_screen_callers(&mut b);
                 kernel_hal::console::panic_banner(b.valid_str());
             }
             serial_literal_spin("\n[KERNEL BUG] halting (diag rev 10)\n");
@@ -768,11 +770,112 @@ fn report_unresolved_kernel_fault(
             kernel_hal::ksyms::Addr(rip),
             have_thread,
         );
+        #[cfg(target_arch = "x86_64")]
+        write_stop_screen_callers(&mut b);
         kernel_hal::console::panic_banner(b.valid_str());
     }
     serial_literal_spin("\n[KERNEL BUG] halting (diag rev 11)\n");
     loop {
         core::hint::spin_loop();
+    }
+}
+
+/// Callers the stop screen names.
+#[cfg(all(target_arch = "x86_64", not(feature = "libos")))]
+const STOP_SCREEN_CALLERS: usize = 6;
+
+/// The words of a stack that a `CALL` pushed, in the order given.
+///
+/// `tail(w)` is the eight bytes before `w` when `w` is in `.text`, and `None`
+/// when it is not. A return address is a `.text` word whose bytes before it
+/// end in a `CALL`; a function pointer or vtable entry left in a local is not,
+/// and the stop screen has no room for those. The bytes are not decoded from
+/// an instruction boundary, so an `E8` inside an immediate passes too: one
+/// more reason the screen calls them possible callers.
+#[cfg(any(test, all(target_arch = "x86_64", not(feature = "libos"))))]
+fn pick_return_addresses(
+    words: impl IntoIterator<Item = u64>,
+    tail: impl Fn(u64) -> Option<[u8; 8]>,
+    out: &mut [u64],
+) -> usize {
+    let mut n = 0;
+    for w in words {
+        if n == out.len() {
+            break;
+        }
+        if tail(w).is_some_and(|t| kernel_hal::kaddr::ends_with_call(&t)) {
+            out[n] = w;
+            n += 1;
+        }
+    }
+    n
+}
+
+/// Return addresses on the faulting stack, nearest first.
+///
+/// Not the frame-pointer walk: that stops at the first frame built without
+/// one, and the NVIDIA RM's C is built without them -- `_mapInsertBase` does
+/// not even set one up -- so a fault inside the driver walked off into
+/// whatever its caller kept in `rbp`. The words above the faulting `rsp` hold
+/// the return addresses of every live frame whoever built it -- and, between
+/// them, return addresses an earlier call left in a frame's dead slots, which
+/// can come before the live one. So these are possible callers, not a chain,
+/// and the screen says so. Each read is gated on the page table, asked
+/// without logging (`PageTable::is_present`), and the scan stops at the
+/// first word off a present page: the stack does not go on past it.
+#[cfg(all(target_arch = "x86_64", not(feature = "libos")))]
+fn faulting_stack_callers(out: &mut [u64]) -> usize {
+    use kernel_hal::vm::PageTable;
+    const WORDS: u64 = 1024;
+    let pt = PageTable::from_current();
+    let mapped = |a: u64| pt.is_present(a as usize);
+    let (text_lo, _) = kernel_hal::kaddr::kernel_text();
+    let start = kernel_hal::kstats::last_fault_rsp() & !0x7;
+    let words = (0..WORDS)
+        .map(|i| start.wrapping_add(i * 8))
+        .take_while(|&a| kernel_hal::kaddr::is_kernel_addr(a) && mapped(a))
+        // SAFETY: on a present page of the kernel half, just asked.
+        .map(|a| unsafe { core::ptr::read_volatile(a as *const u64) });
+    let tail = |w: u64| {
+        if w < text_lo + 8 || !kernel_hal::kaddr::is_kernel_text(w) {
+            return None;
+        }
+        let mut t = [0u8; 8];
+        for (i, b) in t.iter_mut().enumerate() {
+            // SAFETY: `[w - 8, w)` is inside kernel `.text`, which is mapped
+            // and never unmapped.
+            *b = unsafe { core::ptr::read_volatile((w - 8 + i as u64) as *const u8) };
+        }
+        Some(t)
+    };
+    let n = pick_return_addresses(words, tail, out);
+    core::mem::forget(pt); // from_current() must not free the live CR3 table
+    n
+}
+
+/// The possible callers of the faulting function, for a stop screen.
+///
+/// A halt prints the whole backtrace to the serial port and the oops buffer,
+/// and both are gone on a machine with only a monitor: the buffer does not
+/// survive the reboot. A capture of `_mapInsertBase+0x2c` reading `0x1` came
+/// back as three lines, and the function that owned the map -- the one thing
+/// that says which of the RM's maps holds a `1` where a node belongs -- was on
+/// the serial port only.
+#[cfg(all(target_arch = "x86_64", not(feature = "libos")))]
+fn write_stop_screen_callers(b: &mut impl core::fmt::Write) {
+    let mut rets = [0u64; STOP_SCREEN_CALLERS];
+    let n = faulting_stack_callers(&mut rets);
+    if n == 0 {
+        let _ = write!(b, "\nno return address found on the faulting stack");
+        return;
+    }
+    let _ = write!(
+        b,
+        "\npossible callers, nearest first (return addresses read off the \
+         stack, not a verified chain: any line may be a stale one):"
+    );
+    for r in &rets[..n] {
+        let _ = write!(b, "\n  {}", kernel_hal::ksyms::Addr(*r));
     }
 }
 
@@ -1377,5 +1480,64 @@ mod check_user_range_tests {
             let (_vmar, base) = a_process_with_a_hole_in_its_address_space();
             assert!(ZcoreKernelHandler.check_user_range(base + 0x1000, 0));
         });
+    }
+}
+
+/// The stop screen names the callers of a faulting function by reading the
+/// stack, because the frame-pointer walk cannot cross the NVIDIA RM's C.
+#[cfg(test)]
+mod stop_screen_caller_tests {
+    use super::pick_return_addresses;
+
+    /// `call rel32`, then the return address.
+    const AFTER_DIRECT_CALL: [u8; 8] = [0x48, 0x89, 0xc7, 0xe8, 0x10, 0x20, 0x30, 0x40];
+    /// `call *%rax` (`ff d0`).
+    const AFTER_INDIRECT_CALL: [u8; 8] = [0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0xff, 0xd0];
+    /// The end of a `mov` -- a function's address taken, not a call.
+    const AFTER_A_MOV: [u8; 8] = [0x90, 0x90, 0x90, 0x48, 0x8b, 0x45, 0xf8, 0x90];
+
+    const TEXT: u64 = 0xffff_ff00_0010_0000;
+
+    fn tail(w: u64) -> Option<[u8; 8]> {
+        match w {
+            w if w == TEXT + 0x10 => Some(AFTER_DIRECT_CALL),
+            w if w == TEXT + 0x20 => Some(AFTER_A_MOV),
+            w if w == TEXT + 0x30 => Some(AFTER_INDIRECT_CALL),
+            _ => None,
+        }
+    }
+
+    /// Only the words a CALL pushed, in stack order: not the `1`, not a heap
+    /// pointer, and not a `.text` word that is a function pointer in a local.
+    #[test]
+    fn only_words_a_call_pushed_are_named() {
+        let stack = [
+            0x1,
+            TEXT + 0x10,
+            0xffff_ff00_2193_0380,
+            TEXT + 0x20,
+            TEXT + 0x30,
+        ];
+        let mut out = [0; 6];
+        let n = pick_return_addresses(stack, tail, &mut out);
+        assert_eq!(&out[..n], &[TEXT + 0x10, TEXT + 0x30]);
+    }
+
+    /// The screen has room for so many; the nearest callers are the ones kept.
+    #[test]
+    fn the_nearest_callers_are_kept_when_there_are_more() {
+        let stack = [TEXT + 0x30, TEXT + 0x10, TEXT + 0x30, TEXT + 0x10];
+        let mut out = [0; 2];
+        assert_eq!(pick_return_addresses(stack, tail, &mut out), 2);
+        assert_eq!(out, [TEXT + 0x30, TEXT + 0x10]);
+    }
+
+    #[test]
+    fn a_stack_without_return_addresses_names_nobody() {
+        let mut out = [0; 6];
+        assert_eq!(
+            pick_return_addresses([0, 0x1, TEXT + 0x20], tail, &mut out),
+            0
+        );
     }
 }
