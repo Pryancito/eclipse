@@ -2431,6 +2431,85 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
         }
     }
 
+    /// True when the musl userspace tools have to be linked by a CROSS
+    /// toolchain instead of the host's `cc`.
+    fn needs_cross_linker(&self) -> bool {
+        self.0.name() != std::env::consts::ARCH
+    }
+
+    /// The environment every one of the Rust musl userspace tools
+    /// (`eclipse-init`, `eclipse-dbusd`, `wavplay`, `lunarbg`, `lunarbar`)
+    /// is cross-built with. One place, because the five build functions had
+    /// the same line copied five times and a sixth tool would have copied it
+    /// again.
+    ///
+    /// `-C relocation-model=static` is the long-standing part: static,
+    /// non-PIE, like the busybox/apk base in the rootfs.
+    ///
+    /// The LINKER is what was missing, and it only ever bit arm64. rustc
+    /// drives the final link through `cc`, which on an x86_64 host is the
+    /// host gcc and the host `/usr/bin/ld`. For
+    /// `x86_64-unknown-linux-musl` that works by accident -- rust ships the
+    /// crt objects and `libc.a` itself, and the host ld understands every
+    /// flag -- so nobody noticed. For `aarch64-unknown-linux-musl` rustc
+    /// adds `-Wl,--fix-cortex-a53-843419` (an AArch64-only erratum
+    /// workaround) and the x86_64 ld rejects the option outright:
+    ///
+    /// ```text
+    /// /usr/bin/ld: unrecognized option '--fix-cortex-a53-843419'
+    /// ```
+    ///
+    /// Every tool here is best-effort, so each failure only printed a
+    /// warning: `make image ARCH=aarch64` built a rootfs with NO
+    /// eclipse-init (busybox stayed PID 1), no eclipse-dbusd, no wavplay and
+    /// no lunarbar/lunarbg/lunarrun, and said so in warnings buried in a few
+    /// thousand lines of `make release` output.
+    ///
+    /// So link with the toolchain that matches the target: the
+    /// `<arch>-linux-musl-cross` gcc that [`Arch::linux_musl_cross`] already
+    /// downloads for the rest of the rootfs. ONLY when the target arch
+    /// differs from the host's, so a host-native build keeps the exact
+    /// command line it has been building with all along.
+    ///
+    /// `CC_<triple>` comes along for cc-rs: a dependency with a build script
+    /// that compiles C would otherwise reach for the host compiler too. It is
+    /// the per-target spelling on purpose -- a bare `CC` would also be picked
+    /// up by build scripts compiling for the HOST, which must keep using the
+    /// host compiler.
+    fn cross_build_env(&self) -> Vec<(String, String)> {
+        let cc = self.needs_cross_linker().then(|| {
+            // Downloads on first use, like every other consumer of it; by the
+            // time a tool is built the rootfs has already asked for it.
+            self.0
+                .linux_musl_cross()
+                .join("bin")
+                .join(format!("{}-linux-musl-gcc", self.0.name()))
+                .display()
+                .to_string()
+        });
+        self.cross_build_env_with(cc.as_deref())
+    }
+
+    /// The pure half of [`Self::cross_build_env`], so the shape of the
+    /// environment can be tested without a 100 MiB toolchain download.
+    fn cross_build_env_with(&self, cc: Option<&str>) -> Vec<(String, String)> {
+        let mut rustflags = String::from("-C relocation-model=static");
+        let mut env = Vec::new();
+        if let Some(cc) = cc {
+            rustflags.push_str(" -C linker=");
+            rustflags.push_str(cc);
+            // cc-rs looks up `CC_<triple>` with the dashes turned into
+            // underscores. With the dashes left in, the variable is simply
+            // never read and a C build script quietly uses the host compiler.
+            env.push((
+                format!("CC_{}", self.musl_rust_triple().replace('-', "_")),
+                cc.to_string(),
+            ));
+        }
+        env.push(("RUSTFLAGS".to_string(), rustflags));
+        env
+    }
+
     /// Cross-compile the Eclipse-native init (`tools/eclipse-init`, Rust) as a
     /// static, non-PIE musl binary and return its path. Best-effort: on failure
     /// the path may not exist and the caller keeps busybox init as PID 1.
@@ -2465,15 +2544,19 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
             .arg(triple)
             .status();
 
-        let status = Ext::new("cargo")
+        let mut cargo = Ext::new("cargo");
+        cargo
             .current_dir(&dir)
             .arg("build")
             .arg("--release")
             .arg("--target")
-            .arg(triple)
-            // Static non-PIE, like busybox/apk in the rootfs.
-            .env("RUSTFLAGS", "-C relocation-model=static")
-            .status();
+            .arg(triple);
+        // Static non-PIE, plus the cross linker when the host's `cc` cannot
+        // link this target at all: see `cross_build_env`.
+        for (k, v) in self.cross_build_env() {
+            cargo.env(k, v);
+        }
+        let status = cargo.status();
         if !status.success() {
             eprintln!("warning: eclipse-init build failed; busybox init remains PID 1");
         }
@@ -2510,14 +2593,19 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
             .arg("add")
             .arg(triple)
             .status();
-        let status = Ext::new("cargo")
+        let mut cargo = Ext::new("cargo");
+        cargo
             .current_dir(&dir)
             .arg("build")
             .arg("--release")
             .arg("--target")
-            .arg(triple)
-            .env("RUSTFLAGS", "-C relocation-model=static")
-            .status();
+            .arg(triple);
+        // Static non-PIE, plus the cross linker when the host's `cc` cannot
+        // link this target at all: see `cross_build_env`.
+        for (k, v) in self.cross_build_env() {
+            cargo.env(k, v);
+        }
+        let status = cargo.status();
         if !status.success() {
             eprintln!("warning: lunarbg build failed; swaybg fallback remains");
         }
@@ -2806,14 +2894,19 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
             .arg("add")
             .arg(triple)
             .status();
-        let status = Ext::new("cargo")
+        let mut cargo = Ext::new("cargo");
+        cargo
             .current_dir(&dir)
             .arg("build")
             .arg("--release")
             .arg("--target")
-            .arg(triple)
-            .env("RUSTFLAGS", "-C relocation-model=static")
-            .status();
+            .arg(triple);
+        // Static non-PIE, plus the cross linker when the host's `cc` cannot
+        // link this target at all: see `cross_build_env`.
+        for (k, v) in self.cross_build_env() {
+            cargo.env(k, v);
+        }
+        let status = cargo.status();
         if !status.success() {
             eprintln!("warning: eclipse-dbusd build failed; only dbus-daemon can serve the bus");
         }
@@ -2872,14 +2965,19 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
             .arg("add")
             .arg(triple)
             .status();
-        let status = Ext::new("cargo")
+        let mut cargo = Ext::new("cargo");
+        cargo
             .current_dir(&dir)
             .arg("build")
             .arg("--release")
             .arg("--target")
-            .arg(triple)
-            .env("RUSTFLAGS", "-C relocation-model=static")
-            .status();
+            .arg(triple);
+        // Static non-PIE, plus the cross linker when the host's `cc` cannot
+        // link this target at all: see `cross_build_env`.
+        for (k, v) in self.cross_build_env() {
+            cargo.env(k, v);
+        }
+        let status = cargo.status();
         if !status.success() {
             eprintln!("warning: lunarbar/lunarrun build failed; waybar fallback remains");
         }
@@ -3326,14 +3424,19 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
             .arg("add")
             .arg(triple)
             .status();
-        let status = Ext::new("cargo")
+        let mut cargo = Ext::new("cargo");
+        cargo
             .current_dir(&dir)
             .arg("build")
             .arg("--release")
             .arg("--target")
-            .arg(triple)
-            .env("RUSTFLAGS", "-C relocation-model=static")
-            .status();
+            .arg(triple);
+        // Static non-PIE, plus the cross linker when the host's `cc` cannot
+        // link this target at all: see `cross_build_env`.
+        for (k, v) in self.cross_build_env() {
+            cargo.env(k, v);
+        }
+        let status = cargo.status();
         if !status.success() {
             eprintln!("warning: wavplay build failed; /dev/dsp has no test client");
         }
@@ -4778,6 +4881,132 @@ mod variant_layout_tests {
         LinuxRootfs::write_desktop_session(&dir, "none");
         assert!(dir.join("etc/eclipse/desktop").is_file());
         let _ = fs::remove_dir_all(&dir);
+    }
+}
+
+/// How the Rust musl userspace tools get linked. The whole batch exists
+/// because `make release` on aarch64 printed five linker errors and carried
+/// on: the tools are best-effort, so an arm64 image shipped without
+/// eclipse-init, eclipse-dbusd, wavplay and lunarbar/lunarbg/lunarrun and
+/// said so only in warnings. See `LinuxRootfs::cross_build_env`.
+#[cfg(test)]
+mod cross_linker_tests {
+    use super::*;
+
+    /// The host-native build must keep the exact command line it has always
+    /// used. x86_64-on-x86_64 has been working for the whole life of the tree;
+    /// pointing it at a downloaded cross gcc to fix arm64 would be trading one
+    /// broken arch for another.
+    #[test]
+    fn el_host_nativo_no_toca_el_enlazador() {
+        // A host Eclipse does not target at all (an ARMv7 builder, say) has no
+        // native case to check; it must not fail the suite either.
+        let Ok(host) = std::env::consts::ARCH.parse::<Arch>() else {
+            return;
+        };
+        let rootfs = LinuxRootfs::new(host);
+        assert!(
+            !rootfs.needs_cross_linker(),
+            "{} es el arch del host y no debería necesitar cross",
+            host.name()
+        );
+        let env = rootfs.cross_build_env();
+        assert_eq!(
+            env,
+            vec![(
+                "RUSTFLAGS".to_string(),
+                "-C relocation-model=static".to_string()
+            )],
+            "el caso nativo ha dejado de ser el de siempre"
+        );
+    }
+
+    /// And every OTHER arch does need one, which is the actual bug: on this
+    /// x86_64 host `aarch64-unknown-linux-musl` was linked by `/usr/bin/ld`,
+    /// which rejects rustc's `--fix-cortex-a53-843419` outright.
+    #[test]
+    fn los_demas_arcos_si_necesitan_cross() {
+        let host = std::env::consts::ARCH;
+        for arch in [Arch::X86_64, Arch::Aarch64, Arch::Riscv64] {
+            assert_eq!(
+                LinuxRootfs::new(arch).needs_cross_linker(),
+                arch.name() != host,
+                "{} contra un host {host}",
+                arch.name()
+            );
+        }
+    }
+
+    /// The cross case has to ADD the linker, not replace the flags: a tool
+    /// linked PIE would not be the static non-PIE ET_EXEC the Eclipse loader
+    /// and the busybox/apk base expect.
+    #[test]
+    fn el_enlazador_cruzado_no_pisa_el_relocation_model() {
+        let rootfs = LinuxRootfs::new(Arch::Aarch64);
+        let env = rootfs.cross_build_env_with(Some("/toolchain/bin/aarch64-linux-musl-gcc"));
+        let rustflags = env
+            .iter()
+            .find(|(k, _)| k == "RUSTFLAGS")
+            .map(|(_, v)| v.as_str())
+            .expect("RUSTFLAGS");
+        assert!(
+            rustflags.contains("-C relocation-model=static"),
+            "{rustflags:?} ha perdido el relocation-model"
+        );
+        assert!(
+            rustflags.contains("-C linker=/toolchain/bin/aarch64-linux-musl-gcc"),
+            "{rustflags:?} no lleva el enlazador cruzado"
+        );
+    }
+
+    /// cc-rs reads `CC_<triple>` with the dashes turned into UNDERSCORES. With
+    /// the dashes left in, the variable is never read at all and a dependency
+    /// with a C build script goes back to the host compiler -- silently, which
+    /// is exactly the failure mode this batch is about.
+    #[test]
+    fn la_variable_de_cc_va_con_guiones_bajos() {
+        let env = LinuxRootfs::new(Arch::Aarch64).cross_build_env_with(Some("/cc"));
+        assert!(
+            env.iter()
+                .any(|(k, v)| k == "CC_aarch64_unknown_linux_musl" && v == "/cc"),
+            "no está CC_aarch64_unknown_linux_musl: {env:?}"
+        );
+        assert!(
+            !env.iter().any(|(k, _)| k.contains('-')),
+            "una variable de entorno con guiones no la lee nadie: {env:?}"
+        );
+    }
+
+    /// No `CC_…` at all in the native case: it would point host build scripts
+    /// at a compiler they must not use.
+    #[test]
+    fn sin_cross_no_se_fija_ningun_compilador() {
+        let env = LinuxRootfs::new(Arch::X86_64).cross_build_env_with(None);
+        assert!(
+            !env.iter().any(|(k, _)| k.starts_with("CC")),
+            "{env:?} fija un compilador sin hacer falta"
+        );
+    }
+
+    /// The recurrence, not the instance. The same `RUSTFLAGS` line was copied
+    /// into five build functions, so the sixth tool would have copied it again
+    /// and arrived with the same broken linker. Nothing may hand `RUSTFLAGS`
+    /// to a command directly any more: the value comes from
+    /// `cross_build_env`, which is the only thing that knows whether a cross
+    /// linker is needed.
+    #[test]
+    fn ninguna_herramienta_arma_su_propio_rustflags() {
+        let src = include_str!("mod.rs");
+        let culprits: Vec<&str> = src
+            .lines()
+            .map(str::trim)
+            .filter(|l| l.contains("env(\"RUSTFLAGS\""))
+            .collect();
+        assert!(
+            culprits.is_empty(),
+            "estas líneas le pasan RUSTFLAGS a un comando a mano en vez de \
+             usar cross_build_env: {culprits:?}"
+        );
     }
 }
 
