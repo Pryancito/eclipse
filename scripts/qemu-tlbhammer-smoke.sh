@@ -48,17 +48,10 @@ LOG="$WORK/console.log"
 ESP_IMG="$WORK/esp.img"
 trap 'rm -rf "$WORK"' EXIT
 
-# Size by APPARENT size, not allocated blocks. The initramfs SFS is written
-# sparse (xtask's `fuse` does a `set_len` and never touches the free blocks --
-# 256 MiB of them on the QEMU live image), so plain `du -sm` under-reports it
-# by that much while mcopy copies the whole file. The result is a FAT32 image
-# the initramfs does not fit in: mcopy says "Disk full", the ESP ends up
-# without \EFI\Boot\BootX64.efi, and the guest drops into the UEFI shell
-# instead of booting -- which reads as a hung or broken kernel rather than as
-# an image that was never written. zCore/Makefile already sizes this way; the
-# `|| du -sm` fallback keeps non-GNU du (macOS) working as before.
-esp_mb=$(($( (du -sm --apparent-size "$ESP_DIR/EFI" 2>/dev/null \
-    || du -sm "$ESP_DIR/EFI") | cut -f1) + 128))
+# El tamaño del ESP lo calcula scripts/esp-size-mb.sh, que explica por qué es
+# el tamaño APARENTE y no los bloques asignados, y por qué su rama de reserva
+# no puede ser un `du` sin `--apparent-size`.
+esp_mb=$("$ROOT/scripts/esp-size-mb.sh" "$ESP_DIR/EFI" 128)
 dd if=/dev/zero of="$ESP_IMG" bs=1M count="$esp_mb" status=none
 mkfs.vfat -F 32 "$ESP_IMG" >/dev/null
 mmd -i "$ESP_IMG" ::/EFI ::/EFI/Boot ::/EFI/zCore

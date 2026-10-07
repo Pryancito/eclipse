@@ -142,8 +142,21 @@ else ifeq ($(ARCH), riscv64)
   zbi_dir := riscv64
 endif
 
+# Which image variant to boot. The root Makefile owns this knob and passes it
+# down; this default keeps a bare `make -C zCore run` behaving as it always has.
+# `desktop` carries NO suffix on purpose, so every historical path is unchanged.
+VARIANT ?= desktop
+ifeq ($(filter $(VARIANT),desktop minimal),)
+  $(error VARIANT debe ser `desktop` o `minimal`, no `$(VARIANT)`)
+endif
+VARIANT_SUFFIX := $(patsubst desktop,,$(patsubst minimal,-minimal,$(VARIANT)))
+
 ifeq ($(LINUX), 1)
-  user_img := $(ARCH).img
+# Variant-suffixed, because `cargo image --variant minimal` writes
+# `zCore/x86_64-minimal.img` and leaves `x86_64.img` alone. Without the suffix
+# here, `make qemu VARIANT=minimal` built the minimal image and then booted the
+# DESKTOP one -- or, on a tree that had only ever built minimal, booted nothing.
+  user_img := $(ARCH)$(VARIANT_SUFFIX).img
 else ifeq ($(USER), 1)
   user_img := ../zircon-user/target/zcore-user.zbi
 else
@@ -538,8 +551,7 @@ ifeq ($(ARCH), x86_64)
 # guest output.
 	@if [ ! -f "$(esp_img)" ] || [ -n "$$(find "$(esp)/EFI" -newer "$(esp_img)" \
 	      -type f ! -name rboot.conf -print -quit 2>/dev/null)" ]; then \
-	  esp_mb=$$(du -sm --apparent-size "$(esp)/EFI" 2>/dev/null | cut -f1 \
-	    || du -sm "$(esp)/EFI" | cut -f1); esp_mb=$$((esp_mb + 128)); \
+	  esp_mb=$$(sh "$(abspath ../scripts/esp-size-mb.sh)" "$(esp)/EFI" 128) || exit 1; \
 	  echo "Building $(esp_img) ($$esp_mb MiB FAT32 — real ESP image; fat:rw dir emulation caps at FAT16 504 MiB)"; \
 	  rm -f "$(esp_img)"; \
 	  dd if=/dev/zero of="$(esp_img)" bs=1M count=$$esp_mb status=none; \

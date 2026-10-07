@@ -57,6 +57,21 @@ impl LinuxRootfs {
         TARGET.join(format!("{stem}{}", self.1.suffix()))
     }
 
+    /// The live SFS image this variant boots: `zCore/x86_64.img` for desktop,
+    /// `zCore/x86_64-minimal.img` for minimal.
+    ///
+    /// Every launcher must go through this. The path used to be spelled out
+    /// wherever it was needed, and when the variant axis arrived the two sites
+    /// in `image.rs` learned the suffix while the two in `build.rs` did not:
+    /// `cargo qemu --variant minimal` built the minimal image and then booted
+    /// the desktop one, silently, or booted nothing at all on a tree that had
+    /// only ever built minimal.
+    pub fn live_image(&self) -> PathBuf {
+        PROJECT_DIR
+            .join("zCore")
+            .join(format!("{}{}.img", self.0.name(), self.1.suffix()))
+    }
+
     /// 构造启动内存文件系统 rootfs。
     /// 对于 x86_64，这个文件系统可用于 libos 启动。
     /// 若设置 `clear`，将清除已存在的目录。
@@ -4694,6 +4709,43 @@ mod variant_layout_tests {
             PROJECT_DIR.join("rootfs").join("aarch64-minimal")
         );
         assert_ne!(x86.path(), arm.path());
+    }
+
+    /// La imagen que arrancan los lanzadores. `desktop` tiene que seguir
+    /// siendo `zCore/x86_64.img`: es la ruta que nombran `make qemu`,
+    /// `zCore/Makefile`, `scripts/qemu-bench.sh` y `tools/x11-bench/run.sh`.
+    #[test]
+    fn la_imagen_viva_de_escritorio_conserva_su_ruta_historica() {
+        let desktop = LinuxRootfs::new(Arch::X86_64);
+        assert_eq!(
+            desktop.live_image(),
+            PROJECT_DIR.join("zCore").join("x86_64.img")
+        );
+        assert_eq!(
+            LinuxRootfs::with_variant(Arch::Aarch64, Variant::Desktop).live_image(),
+            PROJECT_DIR.join("zCore").join("aarch64.img")
+        );
+    }
+
+    /// Y la minimal tiene que apuntar a OTRO fichero, en las dos
+    /// arquitecturas. Si las dos variantes dieran la misma ruta, `cargo qemu
+    /// --variant minimal` arrancaría la de escritorio sin decir nada, que es
+    /// justo lo que hacía.
+    #[test]
+    fn la_imagen_viva_minimal_no_es_la_de_escritorio() {
+        for arch in [Arch::X86_64, Arch::Aarch64] {
+            let desktop = LinuxRootfs::with_variant(arch, Variant::Desktop).live_image();
+            let minimal = LinuxRootfs::with_variant(arch, Variant::Minimal).live_image();
+            assert_ne!(desktop, minimal, "{}", arch.name());
+            assert_eq!(
+                minimal,
+                PROJECT_DIR
+                    .join("zCore")
+                    .join(format!("{}-minimal.img", arch.name())),
+                "{}",
+                arch.name()
+            );
+        }
     }
 
     /// `eclipse-init` with no `/etc/eclipse/desktop` defaults to `labwc` (see
