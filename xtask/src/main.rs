@@ -11,6 +11,7 @@ mod build;
 mod commands;
 mod errors;
 mod linux;
+mod variant;
 
 use arch::{Arch, ArchArg};
 use build::{GdbArgs, OutArgs, QemuArgs};

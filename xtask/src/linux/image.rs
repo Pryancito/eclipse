@@ -1,4 +1,4 @@
-use crate::{commands::wget, Arch, PROJECT_DIR, TARGET};
+use crate::{commands::wget, Arch, PROJECT_DIR};
 use os_xtask_utils::{dir, CommandExt, Qemu, Tar};
 use std::{fs, path::Path};
 
@@ -238,6 +238,15 @@ fn build_live_rootfs(full: &Path, out: &Path) {
 impl super::LinuxRootfs {
     /// 生成镜像。
     pub fn image(&self) {
+        // What is being built, on the log's first line. The two variants write
+        // files of similar names for half an hour each; without this, a log
+        // pasted into a thread does not say which one it came from.
+        println!(
+            "=== Eclipse image: {arch}, {variant} variant (rootfs {rootfs}) ===",
+            arch = self.0.name(),
+            variant = self.variant().name(),
+            rootfs = self.path().display(),
+        );
         // 递归 rootfs
         self.make(false);
 
@@ -286,7 +295,7 @@ impl super::LinuxRootfs {
             // *before* the desktop stack is copied in: Mesa/LLVM/fonts stay in
             // `rootfs.btrfs.gz` (and, later, the QEMU live SFS). They must not
             // land in `\EFI\zCore\initramfs.img` or the ISO El Torito ESP.
-            let live_root = TARGET.join("live-rootfs");
+            let live_root = self.artifact_dir("live-rootfs");
             println!("Building minimal live/installer root...");
             build_live_rootfs(&rootfs_path, &live_root);
 
@@ -354,7 +363,7 @@ impl super::LinuxRootfs {
                 "Building bootstrap initramfs.img ({} MiB, no desktop stack)...",
                 bootstrap_size / (1024 * 1024)
             );
-            let initramfs_img = TARGET.join("initramfs.img");
+            let initramfs_img = self.artifact("initramfs", "img");
             fuse(&live_root, &initramfs_img, bootstrap_size);
 
             let rboot_efi = rboot_dir.join("target/x86_64-unknown-uefi/release/rboot.efi");
@@ -371,7 +380,7 @@ impl super::LinuxRootfs {
                 "Building efi.img ({} MiB)...",
                 efi_fat_bytes / (1024 * 1024)
             );
-            let efi_img = TARGET.join("efi.img");
+            let efi_img = self.artifact("efi", "img");
             let _ = fs::remove_file(&efi_img);
 
             let file = fs::OpenOptions::new()
@@ -438,7 +447,7 @@ impl super::LinuxRootfs {
             assert!(status.success(), "Failed to copy initramfs.img");
 
             println!("Compressing efi.img -> efi.img.gz...");
-            let target_efi_gz = TARGET.join("efi.img.gz");
+            let target_efi_gz = self.artifact("efi", "img.gz");
             let status = std::process::Command::new("gzip")
                 .arg("-c")
                 .arg(&efi_img)
@@ -459,7 +468,7 @@ impl super::LinuxRootfs {
             // real root, reached by pivot). Size it to the actual rootfs with
             // generous headroom.
             println!("Building rootfs.btrfs...");
-            let btrfs_img = TARGET.join("rootfs.btrfs");
+            let btrfs_img = self.artifact("rootfs", "btrfs");
             let rootfs_btrfs_size = std::cmp::max(
                 96 * 1024 * 1024u64,
                 padded_image_size(dir_size(&rootfs_path), 3, 5, 32),
@@ -472,7 +481,7 @@ impl super::LinuxRootfs {
             );
 
             println!("Compressing rootfs.btrfs -> rootfs.btrfs.gz...");
-            let target_btrfs_gz = TARGET.join("rootfs.btrfs.gz");
+            let target_btrfs_gz = self.artifact("rootfs", "btrfs.gz");
             let status = std::process::Command::new("gzip")
                 .arg("-c")
                 .arg(&btrfs_img)
@@ -484,9 +493,9 @@ impl super::LinuxRootfs {
             // 5b. Empty btrfs template used by the installer to format HOME
             // (written raw onto the partition; the kernel auto-expands it).
             println!("Building home.btrfs template...");
-            let home_img = TARGET.join("home.btrfs");
+            let home_img = self.artifact("home", "btrfs");
             super::btrfs_image::make_btrfs_image(&home_img, 32 * 1024 * 1024, "HOME", None);
-            let target_home_gz = TARGET.join("home.btrfs.gz");
+            let target_home_gz = self.artifact("home", "btrfs.gz");
             let status = std::process::Command::new("gzip")
                 .arg("-c")
                 .arg(&home_img)
@@ -515,7 +524,7 @@ impl super::LinuxRootfs {
                 "Building ISO installer initramfs ({} MiB, no desktop stack)...",
                 iso_size / (1024 * 1024)
             );
-            let iso_initramfs = TARGET.join("iso-initramfs.img");
+            let iso_initramfs = self.artifact("iso-initramfs", "img");
             fuse(&live_root, &iso_initramfs, iso_size);
 
             // Desktop stack belongs in the QEMU live initramfs only, never in
@@ -524,7 +533,16 @@ impl super::LinuxRootfs {
             // LIVE_KEEP; QEMU boots this tree without pivoting, so `startx`
             // still needs them here. Disable with ECLIPSE_XORG_LIVE=0 for a
             // lean QEMU image too.
-            super::xorg::copy_into_live(&rootfs_path, &live_root);
+            // `minimal` has none of those trees in its rootfs, so the copy
+            // would be a noisy no-op: it would warn about missing ICU data,
+            // glycin loaders and fonts on an image whose whole point is not
+            // having them. And the minimal live image has to STAY lean -- no
+            // Mesa even if an earlier desktop build left something behind.
+            if self.variant().has_desktop() {
+                super::xorg::copy_into_live(&rootfs_path, &live_root);
+            } else {
+                println!("minimal variant: not copying the desktop into the live root");
+            }
 
             // 6. QEMU live SFS: installer payloads + desktop. Not written to
             // the installed ESP or the ISO — those carry the lean images from
@@ -534,9 +552,11 @@ impl super::LinuxRootfs {
                 "Building QEMU live image ({} MiB)...",
                 live_size / (1024 * 1024)
             );
-            let image = PROJECT_DIR
-                .join("zCore")
-                .join(format!("{arch}.img", arch = self.0.name()));
+            let image = PROJECT_DIR.join("zCore").join(format!(
+                "{arch}{suffix}.img",
+                arch = self.0.name(),
+                suffix = self.variant().suffix()
+            ));
             fuse(&live_root, &image, live_size);
 
             println!("Build completed successfully!");
@@ -545,7 +565,11 @@ impl super::LinuxRootfs {
 
         // 镜像路径
         let inner = PROJECT_DIR.join("zCore");
-        let image = inner.join(format!("{arch}.img", arch = self.0.name()));
+        let image = inner.join(format!(
+            "{arch}{suffix}.img",
+            arch = self.0.name(),
+            suffix = self.variant().suffix()
+        ));
         // aarch64 还需要下载 firmware
         if let Arch::Aarch64 = self.0 {
             const URL: &str = "https://github.com/Luchangcheng2333/rayboot/releases/download/2.0.0/aarch64_firmware.tar.gz";

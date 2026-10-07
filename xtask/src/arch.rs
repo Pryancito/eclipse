@@ -1,6 +1,6 @@
 //! 支持架构的定义。
 
-use crate::{commands::wget, LinuxRootfs, XError, ARCHS, TARGET};
+use crate::{commands::wget, variant::Variant, LinuxRootfs, XError, ARCHS, TARGET};
 use os_xtask_utils::{dir, CommandExt, Tar};
 use std::{path::PathBuf, str::FromStr};
 
@@ -82,12 +82,22 @@ pub(crate) struct ArchArg {
     /// Build architecture, `riscv64` or `x86_64`.
     #[clap(short, long)]
     pub arch: Arch,
+
+    /// Image variant: `desktop` (labwc/Xorg + the whole apk closure) or
+    /// `minimal` (console only). Each variant has its own rootfs directory and
+    /// its own artifacts, so building one never disturbs the other.
+    ///
+    /// Defaults to `desktop`, which is where every historical path lives — so
+    /// every command that does not name a variant behaves as it always did.
+    #[clap(long, default_value = "desktop")]
+    pub variant: Variant,
 }
 
 impl ArchArg {
-    /// Returns the [`LinuxRootfs`] object related to selected architecture.
+    /// Returns the [`LinuxRootfs`] object related to selected architecture
+    /// and variant.
     #[inline]
     pub fn linux_rootfs(&self) -> LinuxRootfs {
-        LinuxRootfs::new(self.arch)
+        LinuxRootfs::with_variant(self.arch, self.variant)
     }
 }

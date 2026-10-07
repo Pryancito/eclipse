@@ -6,7 +6,7 @@ mod opencv;
 mod test;
 mod xorg;
 
-use crate::{commands::fetch_online, Arch, PROJECT_DIR, REPOS};
+use crate::{commands::fetch_online, variant::Variant, Arch, PROJECT_DIR, REPOS, TARGET};
 use os_xtask_utils::{dir, CommandExt, Ext, Git, Make};
 use std::{
     env,
@@ -16,13 +16,45 @@ use std::{
     path::{Path, PathBuf},
 };
 
-pub(crate) struct LinuxRootfs(Arch);
+pub(crate) struct LinuxRootfs(Arch, Variant);
 
 impl LinuxRootfs {
-    /// 生成指定架构的 linux rootfs 操作对象。
+    /// 生成指定架构的 linux rootfs 操作对象。The `desktop` variant, i.e. the
+    /// historical behaviour.
     #[inline]
     pub const fn new(arch: Arch) -> Self {
-        Self(arch)
+        Self(arch, Variant::Desktop)
+    }
+
+    /// Same, for an explicit variant (see [`Variant`]).
+    #[inline]
+    pub const fn with_variant(arch: Arch, variant: Variant) -> Self {
+        Self(arch, variant)
+    }
+
+    /// Which variant is being built.
+    #[inline]
+    pub const fn variant(&self) -> Variant {
+        self.1
+    }
+
+    /// Path of an intermediate artifact under `ignored/target`, with the
+    /// variant's suffix inserted BEFORE the extension: `efi.img.gz` for
+    /// `desktop`, `efi-minimal.img.gz` for `minimal`.
+    ///
+    /// Giving each variant its own files is what lets them be built one after
+    /// the other without the second overwriting the first one's payloads —
+    /// `make release` publishes both ISOs in one run, and the ISO target picks
+    /// up the payloads of the variant it is packaging rather than whichever
+    /// build finished last.
+    pub fn artifact(&self, stem: &str, ext: &str) -> PathBuf {
+        TARGET.join(format!("{stem}{}.{ext}", self.1.suffix()))
+    }
+
+    /// [`Self::artifact`] for a working directory, which carries no extension:
+    /// `live-rootfs` / `live-rootfs-minimal`.
+    pub fn artifact_dir(&self, stem: &str) -> PathBuf {
+        TARGET.join(format!("{stem}{}", self.1.suffix()))
     }
 
     /// 构造启动内存文件系统 rootfs。
@@ -115,17 +147,7 @@ impl LinuxRootfs {
             // build.
             Self::write_profile(&dir.join("etc"));
             Self::write_ntp(&dir);
-            desktop::install(&dir);
-            xorg::install(&dir, &bin.join("apk"), self.0.name());
-            // Needs the firefox package on disk, i.e. after xorg::install.
-            desktop::write_firefox_default_prefs(&dir);
-            desktop::write_firefox_desktop_override(&dir);
-            // Needs the GTK/gsettings packages on disk, same reason.
-            desktop::compile_gsettings_schemas(&dir);
-            // After apk too: it only downloads the IWADs when the `freedoom`
-            // package did not land, which is not known until apk has run.
-            desktop::ensure_freedoom_iwads(&dir);
-            xorg::report_freedoom(&dir, "the rootfs");
+            self.install_desktop_stack(&dir, &bin);
             // After apk so we can see whether the PulseAudio plugin/binary
             // landed, and so /etc/pulse wins over anything the package dropped.
             Self::write_asound_conf(&dir);
@@ -205,23 +227,7 @@ impl LinuxRootfs {
         Self::write_ntp(&dir);
         Self::write_passwd(&etc, &dir);
         Self::write_console_configs(&etc, &dir);
-        desktop::install(&dir);
-        // Bake the whole X.Org stack (server + libinput input driver + software
-        // GL + xkb data + base fonts + xterm) into the rootfs so `startx` works
-        // out of the box, instead of leaving it as a runtime `apk add` chore
-        // that a fresh install / a fresh QEMU boot does not have. Best-effort:
-        // an offline build just warns and ships without it. Uses the apk binary
-        // and repositories already staged above.
-        xorg::install(&dir, &bin.join("apk"), self.0.name());
-        // Needs the firefox package on disk, i.e. after xorg::install.
-        desktop::write_firefox_default_prefs(&dir);
-        desktop::write_firefox_desktop_override(&dir);
-        // Needs the GTK/gsettings packages on disk, same reason.
-        desktop::compile_gsettings_schemas(&dir);
-        // After apk too: it only downloads the IWADs when the `freedoom`
-        // package did not land, which is not known until apk has run.
-        desktop::ensure_freedoom_iwads(&dir);
-        xorg::report_freedoom(&dir, "the rootfs");
+        self.install_desktop_stack(&dir, &bin);
         Self::install_ca_certs(&dir);
 
         // /etc/machine-id — prevents dhcp_vendor "No such file or directory".
@@ -1471,7 +1477,79 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
     /// 指定架构的 rootfs 路径。
     #[inline]
     pub fn path(&self) -> PathBuf {
-        PROJECT_DIR.join("rootfs").join(self.0.name())
+        PROJECT_DIR
+            .join("rootfs")
+            .join(format!("{}{}", self.0.name(), self.1.suffix()))
+    }
+
+    /// The rootfs's desktop, or its absence.
+    ///
+    /// Both paths through [`Self::make`] — the incremental one and the
+    /// from-scratch one — ran this same sequence, copied word for word. What
+    /// happens when one of the two copies falls behind is already written in
+    /// this file: the incremental path used to RETURN before installing the
+    /// desktop, and for several rounds a freshly built image booted to
+    /// `sh: startx: not found`. One function, called from both.
+    ///
+    /// It is also the variant's seam: `minimal` installs none of this. It does
+    /// not prune a desktop rootfs afterwards — it never has one — so there is
+    /// no file list to keep in step with `DEFAULT_PACKAGES` every time a
+    /// package is added.
+    fn install_desktop_stack(&self, dir: &Path, bin: &Path) {
+        if !self.1.has_desktop() {
+            println!(
+                "minimal variant: no desktop (no labwc/Xorg, none of the Mesa/Firefox/XFCE \
+                 apk closure); the session is a console plus install-eclipse"
+            );
+            // Keyboard, locale and timezone are NOT the desktop's: `eclipse-init`
+            // runs `eclipse-kbd --boot` on every boot, compositor or not, and a
+            // console wants its layout and its local time just as much. Without
+            // them the minimal image comes up with the compiled-in default
+            // layout and no local time.
+            desktop::install_console(dir);
+            // `/etc/eclipse/desktop` is NOT written here: `install_eclipse_init`
+            // is its single writer and takes the value from
+            // `Variant::default_session()`. Two writers of one file is how the
+            // value ended up depending on whether `cargo rootfs` or
+            // `cargo image` ran last -- see the note there.
+            return;
+        }
+        desktop::install(dir);
+        // Bake the whole X.Org stack (server + libinput input driver + software
+        // GL + xkb data + base fonts + xterm) into the rootfs so `startx` works
+        // out of the box, instead of leaving it as a runtime `apk add` chore
+        // that a fresh install / a fresh QEMU boot does not have. Best-effort:
+        // an offline build just warns and ships without it. Uses the apk binary
+        // and repositories already staged above.
+        xorg::install(dir, &bin.join("apk"), self.0.name());
+        // Needs the firefox package on disk, i.e. after xorg::install.
+        desktop::write_firefox_default_prefs(dir);
+        desktop::write_firefox_desktop_override(dir);
+        // Needs the GTK/gsettings packages on disk, same reason.
+        desktop::compile_gsettings_schemas(dir);
+        // After apk too: it only downloads the IWADs when the `freedoom`
+        // package did not land, which is not known until apk has run.
+        desktop::ensure_freedoom_iwads(dir);
+        xorg::report_freedoom(dir, "the rootfs");
+    }
+
+    /// Writes `/etc/eclipse/desktop`, the persistent session `eclipse-init`
+    /// reads when the kernel command line carries no `desktop=`.
+    fn write_desktop_session(rootfs: &Path, session: &str) {
+        let etc_eclipse = rootfs.join("etc").join("eclipse");
+        if let Err(e) = fs::create_dir_all(&etc_eclipse) {
+            eprintln!("warning: could not create {etc_eclipse:?}: {e}");
+            return;
+        }
+        let path = etc_eclipse.join("desktop");
+        // With the trailing newline. `selected_desktop_from` takes the first
+        // whitespace-separated token, so it makes no difference to init -- but a
+        // config file that does not end in a newline is the one somebody later
+        // appends to with `echo >>` and ends up with `nonelabwc`.
+        match fs::write(&path, format!("{session}\n")) {
+            Ok(()) => println!("desktop session: {session} ({})", path.display()),
+            Err(e) => eprintln!("warning: could not write {path:?}: {e}"),
+        }
     }
 
     /// 编译 busybox。
@@ -3296,13 +3374,20 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
         let _ = fs::create_dir_all(&localbin);
         Self::write_init_wrappers(&localbin, &svc_dir);
 
-        // Default desktop selector: labwc, the hardware default. A boot with
+        // Default desktop selector: `labwc` on the desktop variant (the
+        // hardware default), `none` on the minimal one. A boot with
         // `desktop=xorg` on the kernel cmdline (see `make qemu`) overrides this;
         // editing this file changes the default persistently. See
         // eclipse-init's `selected_desktop`.
-        let eclipse_etc = rootfs.join("etc").join("eclipse");
-        let _ = fs::create_dir_all(&eclipse_etc);
-        fs::write(eclipse_etc.join("desktop"), b"labwc\n").unwrap();
+        //
+        // This is the ONLY writer of the file, on purpose. It hardcoded `labwc`
+        // while the minimal variant wrote `none` from `install_desktop_stack` --
+        // which runs BEFORE this function on the from-scratch path and AFTER it
+        // on the incremental one. So `cargo rootfs --variant minimal` left
+        // `labwc` behind and only a following `cargo image` corrected it: a
+        // minimal rootfs that boots hunting for a compositor it does not carry,
+        // depending on which of the two commands ran last.
+        Self::write_desktop_session(rootfs, self.1.default_session());
 
         println!("Installed eclipse-init as PID 1 with udhcpc, dbus, seatd, labwc, xorg, pulseaudio and boot-sound services.");
         true
@@ -4507,6 +4592,140 @@ mod lunar_client_tests {
                  as a window exists"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod variant_layout_tests {
+    use super::*;
+
+    fn scratch(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "eclipse-variant-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// The `desktop` variant has to keep EVERY historical path. `make qemu`,
+    /// `scripts/qemu-bench.sh`, `tools/x11-bench/run.sh` and the zCore Makefile
+    /// all name `rootfs/x86_64` and `ignored/target/efi.img.gz` literally. A
+    /// suffix here (`rootfs/x86_64-desktop`) would leave them pointing at a tree
+    /// nobody writes any more, and nothing would say so: the build would
+    /// succeed and the image would be the one from before the change.
+    #[test]
+    fn la_variante_de_escritorio_conserva_todas_las_rutas_historicas() {
+        let desktop = LinuxRootfs::new(Arch::X86_64);
+        assert_eq!(desktop.path(), PROJECT_DIR.join("rootfs").join("x86_64"));
+        assert_eq!(desktop.artifact("efi", "img.gz"), TARGET.join("efi.img.gz"));
+        assert_eq!(
+            desktop.artifact("rootfs", "btrfs.gz"),
+            TARGET.join("rootfs.btrfs.gz")
+        );
+        assert_eq!(
+            desktop.artifact("iso-initramfs", "img"),
+            TARGET.join("iso-initramfs.img")
+        );
+        assert_eq!(
+            desktop.artifact_dir("live-rootfs"),
+            TARGET.join("live-rootfs")
+        );
+        // `new` is the one every existing caller uses, so it must mean desktop.
+        assert_eq!(
+            desktop.path(),
+            LinuxRootfs::with_variant(Arch::X86_64, Variant::Desktop).path()
+        );
+    }
+
+    /// And `minimal` must share NOTHING with it. Two variants writing the same
+    /// `rootfs.btrfs.gz` is how `make release` would package the desktop
+    /// payload inside the minimal ISO: the build is green, the ISO boots, and
+    /// the installed system is the wrong one.
+    #[test]
+    fn la_minimal_no_comparte_ni_una_ruta_con_la_de_escritorio() {
+        let desktop = LinuxRootfs::new(Arch::X86_64);
+        let minimal = LinuxRootfs::with_variant(Arch::X86_64, Variant::Minimal);
+
+        assert_eq!(
+            minimal.path(),
+            PROJECT_DIR.join("rootfs").join("x86_64-minimal")
+        );
+        assert_ne!(desktop.path(), minimal.path());
+        for (stem, ext) in [
+            ("efi", "img"),
+            ("efi", "img.gz"),
+            ("initramfs", "img"),
+            ("iso-initramfs", "img"),
+            ("rootfs", "btrfs"),
+            ("rootfs", "btrfs.gz"),
+            ("home", "btrfs"),
+            ("home", "btrfs.gz"),
+        ] {
+            assert_ne!(
+                desktop.artifact(stem, ext),
+                minimal.artifact(stem, ext),
+                "{stem}.{ext} lo escriben las dos variantes"
+            );
+        }
+        assert_ne!(
+            desktop.artifact_dir("live-rootfs"),
+            minimal.artifact_dir("live-rootfs")
+        );
+        // The suffix goes BEFORE the extension, so the file keeps its type:
+        // `efi-minimal.img.gz` stays a .img.gz, and `make iso` can still glob
+        // or name it by extension.
+        assert_eq!(
+            minimal.artifact("efi", "img.gz"),
+            TARGET.join("efi-minimal.img.gz")
+        );
+    }
+
+    /// The arch still separates two rootfs of the same variant: `make release`
+    /// walks arch × variant, and four combinations need four trees.
+    #[test]
+    fn la_arquitectura_sigue_separando_dentro_de_una_variante() {
+        let x86 = LinuxRootfs::with_variant(Arch::X86_64, Variant::Minimal);
+        let arm = LinuxRootfs::with_variant(Arch::Aarch64, Variant::Minimal);
+        assert_eq!(
+            arm.path(),
+            PROJECT_DIR.join("rootfs").join("aarch64-minimal")
+        );
+        assert_ne!(x86.path(), arm.path());
+    }
+
+    /// `eclipse-init` with no `/etc/eclipse/desktop` defaults to `labwc` (see
+    /// `selected_desktop` in tools/eclipse-init). On the minimal image that
+    /// means a service respawning a compositor that was never installed, so the
+    /// file is not a nicety: it is what makes the minimal variant boot to a
+    /// console instead of to a retry loop.
+    #[test]
+    fn la_minimal_deja_escrito_que_no_hay_sesion_grafica() {
+        let dir = scratch("desktop-none");
+        LinuxRootfs::write_desktop_session(&dir, "none");
+        let written = fs::read_to_string(dir.join("etc/eclipse/desktop")).unwrap();
+        // The first whitespace token is what init reads.
+        assert_eq!(written.split_whitespace().next(), Some("none"));
+        // Terminated, so an `echo labwc >>` cannot produce `nonelabwc`.
+        assert!(
+            written.ends_with('\n'),
+            "{written:?} sin salto de línea final"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// It has to create `etc/eclipse` itself: the minimal rootfs reaches this
+    /// point with an `etc` that no one has put an `eclipse` directory into, and
+    /// a silently skipped write is a minimal image that boots looking for labwc.
+    #[test]
+    fn escribe_la_sesion_aunque_no_exista_el_directorio() {
+        let dir = scratch("desktop-mkdir");
+        assert!(!dir.join("etc").exists());
+        LinuxRootfs::write_desktop_session(&dir, "none");
+        assert!(dir.join("etc/eclipse/desktop").is_file());
+        let _ = fs::remove_dir_all(&dir);
     }
 }
 

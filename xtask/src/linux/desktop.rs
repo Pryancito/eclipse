@@ -58,11 +58,21 @@ pub fn install(rootfs: &Path) {
     write_x11_prepare(rootfs);
     write_gtk_caches_wrapper(rootfs);
     write_xkbmap_wrapper(rootfs);
+    install_console(rootfs);
+    write_eclipse_look(rootfs);
+    write_kde_helpers(rootfs);
+}
+
+/// The helpers that are NOT the desktop's: keyboard, locale and timezone.
+///
+/// `eclipse-init` runs `eclipse-kbd --boot` on every boot, compositor or not,
+/// and a console wants its keyboard layout and its local time just as much as a
+/// graphical session does. Hence this split out of [`install`]: the `minimal`
+/// variant (see `Variant`) calls only this one.
+pub(super) fn install_console(rootfs: &Path) {
     write_eclipse_kbd(rootfs);
     write_eclipse_locale(rootfs);
     write_eclipse_tz(rootfs);
-    write_eclipse_look(rootfs);
-    write_kde_helpers(rootfs);
 }
 
 /// `/usr/local/bin/eclipse-xkbmap`: load the X keyboard map into Xwayland once
