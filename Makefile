@@ -231,7 +231,7 @@ ifeq ($(ARCH), x86_64)
 	@rm -f "$(ESP_IMG)"
 	@# Why apparent size and not blocks, and why the measurement lives in a
 	@# script: scripts/esp-size-mb.sh says it, at length.
-	@esp_mb=$$(sh "$(CURDIR)/scripts/esp-size-mb.sh" "$(ESP_DIR)/EFI" 96); \
+	@esp_mb=$$(sh "$(CURDIR)/scripts/esp-size-mb.sh" "$(ESP_DIR)/EFI" 96) || exit 1; \
 		echo "ISO ESP: $$esp_mb MiB (sized to installer initramfs; installed efi.img.gz stays $(ESP_IMG_SIZE_MB) MiB)"; \
 		dd if=/dev/zero of="$(ESP_IMG)" bs=1M count=$$esp_mb status=none
 	@mkfs.vfat -F 32 "$(ESP_IMG)" >/dev/null
@@ -396,7 +396,7 @@ ifeq ($(ARCH), x86_64)
 	@rm -f "$(ESP_IMG)"
 	@# Why apparent size and not blocks, and why the measurement lives in a
 	@# script: scripts/esp-size-mb.sh says it, at length.
-	@esp_mb=$$(sh "$(CURDIR)/scripts/esp-size-mb.sh" "$(ESP_DIR)/EFI" 96); \
+	@esp_mb=$$(sh "$(CURDIR)/scripts/esp-size-mb.sh" "$(ESP_DIR)/EFI" 96) || exit 1; \
 		[ "$$esp_mb" -ge "$(ESP_IMG_SIZE_MB)" ] || esp_mb=$(ESP_IMG_SIZE_MB); \
 		echo "ESP: $$esp_mb MiB"; \
 		dd if=/dev/zero of="$(ESP_IMG)" bs=1M count=$$esp_mb status=none
@@ -426,7 +426,7 @@ ifeq ($(ARCH), x86_64)
 	@rm -f "$(DISK_IMG)"
 	@# Why apparent size and not blocks, and why the measurement lives in a
 	@# script: scripts/esp-size-mb.sh says it, at length.
-	@esp_mb=$$(sh "$(CURDIR)/scripts/esp-size-mb.sh" "$(ESP_DIR)/EFI" 96); \
+	@esp_mb=$$(sh "$(CURDIR)/scripts/esp-size-mb.sh" "$(ESP_DIR)/EFI" 96) || exit 1; \
 		[ "$$esp_mb" -ge "$(ESP_IMG_SIZE_MB)" ] || esp_mb=$(ESP_IMG_SIZE_MB); \
 		disk_mb=$$((esp_mb + 8)); \
 		echo "disk: $$disk_mb MiB (ESP $$esp_mb MiB)"; \

@@ -194,8 +194,20 @@ mod build_wiring_tests {
             .find(&format!("\n{target}:"))
             .unwrap_or_else(|| panic!("{target} no aparece en la base de datos de make"));
         let rest = &db[start + 1..];
-        let end = rest.find("\n\n").unwrap_or(rest.len());
-        rest[..end].to_string()
+        // Hasta la siguiente ENTRADA de la base de datos, no hasta el primer
+        // hueco: una receta puede llevar lineas vacias dentro (un `@echo ""`),
+        // y cortar ahi dejaba fuera la mitad de la de `iso` -- con lo que un
+        // test podia pasar por no haber llegado a leer la linea que juzga.
+        let mut out = Vec::new();
+        for (i, line) in rest.lines().enumerate() {
+            let continues =
+                i == 0 || line.is_empty() || line.starts_with('\t') || line.starts_with('#');
+            if !continues {
+                break;
+            }
+            out.push(line);
+        }
+        out.join("\n")
     }
 
     /// El fallo que importa de los cuatro: `make qemu VARIANT=minimal`
@@ -256,6 +268,28 @@ mod build_wiring_tests {
             assert!(
                 recipe.contains("VARIANT=$(VARIANT)"),
                 "{target} prepara el ESP sin pasarle la variante:\n{recipe}"
+            );
+        }
+    }
+
+    /// Las tres recetas que miden el ESP tienen que conservar el fallo del
+    /// script, no tragárselo. Ver
+    /// `un_fallo_al_medir_para_la_receta_y_no_cae_al_minimo` para el porqué.
+    #[test]
+    fn las_recetas_conservan_el_fallo_de_la_medida() {
+        for target in ["iso", "qcow2", "img"] {
+            let recipe = recipe_of(target);
+            // Solo las lineas que la LLAMAN: el comentario de encima la
+            // nombra tambien.
+            let medida: Vec<&str> = recipe
+                .lines()
+                .filter(|l| l.contains("esp-size-mb.sh") && !l.trim_start().starts_with("@#"))
+                .collect();
+            assert_eq!(medida.len(), 1, "{target}: {recipe}");
+            assert!(
+                medida[0].contains("|| exit 1"),
+                "{target} se traga un fallo de la medida:\n{}",
+                medida[0]
             );
         }
     }
@@ -433,6 +467,76 @@ mod esp_size_tests {
         let (ok, out, err) = run(&dir.join("no-existe"), "96", None);
         assert!(!ok, "un directorio que no existe ha devuelto {out:?}");
         assert!(err.contains("no existe el directorio"), "stderr: {err}");
+    }
+
+    /// Nadie vuelve a tener su propia copia de esta cuenta.
+    ///
+    /// Esto ya pasó una vez: `zCore/Makefile` tenía el cálculo correcto y los
+    /// tres scripts de `scripts/` nunca lo recibieron, así que arrancar por
+    /// `qemu-bench.sh` daba una FAT32 corta mientras `make qemu` iba bien. Y
+    /// volvió a pasar en esta tanda: arreglé los Makefiles y los scripts
+    /// seguían con la forma vieja, dos con el `||` detrás de la tubería y el
+    /// tercero cayendo a contar bloques. Un `du -sm` nuevo en `scripts/` es
+    /// una cuarta copia esperando a desincronizarse.
+    #[test]
+    fn ningun_script_dimensiona_el_esp_por_su_cuenta() {
+        let dir = PROJECT_DIR.join("scripts");
+        let mut culpables = Vec::new();
+        for entry in fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.file_name().and_then(|n| n.to_str()) == Some("esp-size-mb.sh") {
+                continue;
+            }
+            let Ok(body) = fs::read_to_string(&path) else {
+                continue;
+            };
+            for (n, line) in body.lines().enumerate() {
+                // El comentario puede nombrar `du -sm` al explicar por qué no
+                // se usa; lo que no puede es volver a calcularlo.
+                let code = line.split('#').next().unwrap_or("");
+                if code.contains("du -sm") || code.contains("du -h") {
+                    culpables.push(format!("{}:{}", path.display(), n + 1));
+                }
+            }
+        }
+        assert!(
+            culpables.is_empty(),
+            "estos sitios vuelven a medir el ESP por su cuenta en vez de usar \
+             scripts/esp-size-mb.sh: {culpables:?}"
+        );
+    }
+
+    /// Un fallo del script tiene que PARAR la receta.
+    ///
+    /// En `qcow2` e `img` la medida va seguida de un mínimo:
+    ///
+    ///     esp_mb=$(esp-size-mb.sh ...); [ "$esp_mb" -ge 1024 ] || esp_mb=1024
+    ///
+    /// Sin `|| exit 1`, un fallo del script deja `esp_mb` vacío, el `-ge`
+    /// falla por comparar una cadena vacía, se toma su rama `||`, y la receta
+    /// sigue con 1024 MiB **y termina con éxito**: justo el error silencioso
+    /// que el script existe para evitar. Aquí se compara una forma contra la
+    /// otra con un script que falla siempre.
+    #[test]
+    fn un_fallo_al_medir_para_la_receta_y_no_cae_al_minimo() {
+        let vieja = "esp_mb=$(exit 3); [ \"$esp_mb\" -ge 1024 ] || esp_mb=1024; echo $esp_mb";
+        let nueva =
+            "esp_mb=$(exit 3) || exit 1; [ \"$esp_mb\" -ge 1024 ] || esp_mb=1024; echo $esp_mb";
+
+        let run = |script: &str| {
+            let out = Command::new("sh").arg("-c").arg(script).output().unwrap();
+            (
+                out.status.success(),
+                String::from_utf8_lossy(&out.stdout).trim().to_string(),
+            )
+        };
+
+        // La forma vieja: éxito, y con el mínimo fijo puesto a dedo.
+        assert_eq!(run(vieja), (true, "1024".to_string()));
+        // La nueva: para, y no imprime tamaño alguno.
+        let (ok, salida) = run(nueva);
+        assert!(!ok, "la receta ha seguido adelante tras fallar la medida");
+        assert_eq!(salida, "", "no debería haber llegado a imprimir un tamaño");
     }
 
     /// Redondea hacia ARRIBA: un árbol de menos de 1 MiB necesita 1, no 0.

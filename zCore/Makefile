@@ -551,7 +551,7 @@ ifeq ($(ARCH), x86_64)
 # guest output.
 	@if [ ! -f "$(esp_img)" ] || [ -n "$$(find "$(esp)/EFI" -newer "$(esp_img)" \
 	      -type f ! -name rboot.conf -print -quit 2>/dev/null)" ]; then \
-	  esp_mb=$$(sh "$(abspath ../scripts/esp-size-mb.sh)" "$(esp)/EFI" 128); \
+	  esp_mb=$$(sh "$(abspath ../scripts/esp-size-mb.sh)" "$(esp)/EFI" 128) || exit 1; \
 	  echo "Building $(esp_img) ($$esp_mb MiB FAT32 — real ESP image; fat:rw dir emulation caps at FAT16 504 MiB)"; \
 	  rm -f "$(esp_img)"; \
 	  dd if=/dev/zero of="$(esp_img)" bs=1M count=$$esp_mb status=none; \
