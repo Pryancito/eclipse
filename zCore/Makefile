@@ -263,6 +263,27 @@ else
   endif
 endif
 
+# Embed the boot medium INSIDE the kernel instead of expecting the bootloader
+# to hand it over. `link-user-img` makes `zCore/src/fs.rs` `include_bytes!` the
+# image named by `USER_IMG` and return it from `init_ram_disk()`, so the kernel
+# needs nothing at all from the loader to find its root.
+#
+# This is what makes an aarch64 ISO possible. An ISO is ONE medium, so the root
+# cannot come from a second block device -- and the prebuilt rayboot that boots
+# aarch64 has no initramfs field in its `Boot.json`, so it cannot pass one
+# either. With the image inside `disk/os`, which is the very file rayboot reads
+# off the ESP, the whole question goes away and the loader is untouched.
+#
+# Off by default: `make qemu ARCH=aarch64` hands QEMU two drives and that keeps
+# working as it always has, with a kernel that is not 100+ MiB. `raspi4b` above
+# already turned it on for the same reason (no handoff on that board).
+LINK_USER_IMG ?= 0
+ifeq ($(LINK_USER_IMG), 1)
+  ifeq ($(filter link-user-img,$(features)),)
+    features += link-user-img
+  endif
+endif
+
 ifeq ($(MOCK), 1)
   features += mock-disk
 endif

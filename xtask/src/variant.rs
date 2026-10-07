@@ -184,9 +184,17 @@ mod build_wiring_tests {
     /// La receta que make EJECUTARÍA para `target`, tal como la tiene parseada
     /// (los `ifeq` ya resueltos), sin ejecutar nada.
     fn recipe_of(target: &str) -> String {
+        recipe_of_with(target, &[])
+    }
+
+    /// Lo mismo, con variables en la línea de órdenes. Hace falta para los
+    /// objetivos que se bifurcan por `ARCH`: la receta de `iso` depende de
+    /// cuál sea, y sin esto el test solo veía la del arch del host.
+    fn recipe_of_with(target: &str, extra: &[&str]) -> String {
         let out = Command::new("make")
             .current_dir(*PROJECT_DIR)
             .args(["-p", "-q"])
+            .args(extra)
             .output()
             .expect("make -p no se ha podido ejecutar");
         let db = String::from_utf8_lossy(&out.stdout);
@@ -208,6 +216,120 @@ mod build_wiring_tests {
             out.push(line);
         }
         out.join("\n")
+    }
+
+    /// Lo que hace posible la ISO de arm64. Un medio no puede traer dos
+    /// dispositivos de bloques, y el rayboot precompilado no sabe pasar un
+    /// initramfs, asi que la imagen viaja DENTRO del kernel. Sin
+    /// `LINK_USER_IMG=1` el kernel sale sin ella, arranca, y se queda
+    /// buscando una raiz que en una ISO no existe.
+    #[test]
+    fn el_iso_de_arm64_empotra_la_imagen_en_el_kernel() {
+        let recipe = recipe_of("iso-aarch64");
+        assert!(
+            recipe.contains("LINK_USER_IMG=1"),
+            "la receta de iso-aarch64 ya no empotra la imagen:\n{recipe}"
+        );
+        // Y el knob tiene que estar apagado por defecto, o `make qemu
+        // ARCH=aarch64` empieza a construir un kernel de 100+ MiB para nada.
+        let common = ["ARCH=aarch64", "LINUX=1"];
+        assert!(
+            !make_var("zCore", "features", &common).contains("link-user-img"),
+            "link-user-img se ha encendido por defecto"
+        );
+        let mut on: Vec<&str> = common.to_vec();
+        on.push("LINK_USER_IMG=1");
+        assert!(
+            make_var("zCore", "features", &on).contains("link-user-img"),
+            "LINK_USER_IMG=1 no enciende la feature"
+        );
+    }
+
+    /// Y la imagen que se empotra tiene que ser LA DE SU VARIANTE. `build.rs`
+    /// lee `USER_IMG` del entorno, y como ya imprime lineas
+    /// `rerun-if-changed`, cargo deja de re-ejecutarlo cuando cambia una
+    /// variable de entorno salvo que esté declarada. Sin la declaracion,
+    /// construir las dos variantes seguidas --que es justo lo que hace
+    /// `make release`-- reutiliza el `USER_IMG` de la PRIMERA: la ISO minimal
+    /// saldria con el rootfs de escritorio dentro, y en silencio.
+    #[test]
+    fn el_build_script_se_reejecuta_si_cambia_la_imagen() {
+        let build_rs = std::fs::read_to_string(PROJECT_DIR.join("zCore").join("build.rs"))
+            .expect("no se ha podido leer zCore/build.rs");
+        assert!(
+            build_rs.contains("cargo:rerun-if-env-changed=USER_IMG"),
+            "zCore/build.rs lee USER_IMG sin declarar que un cambio lo \
+             re-ejecuta: las dos variantes compartirian imagen"
+        );
+    }
+
+    /// rayboot lee el kernel de `os` en la RAIZ del ESP (`KERNEL_LOCATION` en
+    /// su config), no de `/EFI/...`. Copiarlo a cualquier otro sitio da un
+    /// arranque que muere antes de la primera linea del kernel.
+    #[test]
+    fn el_kernel_del_iso_de_arm64_va_en_la_raiz_del_esp() {
+        let recipe = recipe_of("iso-aarch64");
+        assert!(
+            recipe.contains("::/os"),
+            "la receta ya no copia el kernel a ::/os:\n{recipe}"
+        );
+    }
+
+    /// La sesion de la ISO es consola, como la de x86_64: `desktop=none` tiene
+    /// que estar en el cmdline del Boot.json y no solo en el build de zCore,
+    /// porque el objetivo `build` no toca el Boot.json (solo `run` lo hace).
+    #[test]
+    fn el_iso_de_arm64_arranca_sin_escritorio() {
+        let recipe = recipe_of("iso-aarch64");
+        assert!(
+            recipe.contains("DESKTOP=none"),
+            "el kernel de la ISO se construye con escritorio:\n{recipe}"
+        );
+        let cmdline = make_var(".", "ISO_CMDLINE_AARCH64", &["ARCH=aarch64"]);
+        assert!(
+            cmdline.contains("desktop=none"),
+            "{cmdline:?} no apaga el escritorio"
+        );
+    }
+
+    /// Y NO puede nombrar un disco raiz. En x86_64 el cmdline lleva
+    /// `ROOT=/dev/vda`; aqui la raiz es la imagen que va dentro del kernel, y
+    /// un `ROOT=` apuntando a un disco que no esta manda al kernel a buscar
+    /// algo que no existe.
+    #[test]
+    fn el_cmdline_del_iso_de_arm64_no_nombra_un_disco_raiz() {
+        let cmdline = make_var(".", "ISO_CMDLINE_AARCH64", &["ARCH=aarch64"]);
+        // `ROOTPROC=` lleva ROOT dentro, asi que se busca el valor, no la
+        // palabra: lo que no puede aparecer es una raiz de bloques.
+        assert!(
+            !cmdline.contains("ROOT=/dev"),
+            "{cmdline:?} nombra un disco raiz que en una ISO no existe"
+        );
+        assert!(
+            cmdline.contains("ROOTPROC="),
+            "{cmdline:?} se ha quedado sin proceso de consola"
+        );
+    }
+
+    /// `iso` tiene que repartir por arquitectura: x86_64 y aarch64 construyen
+    /// una, y lo demas cae en el objetivo que explica por que no.
+    #[test]
+    fn el_iso_reparte_por_arquitectura() {
+        let arm = recipe_of_with("iso", &["ARCH=aarch64"]);
+        assert!(
+            arm.contains("iso-aarch64"),
+            "iso con ARCH=aarch64 no llama a iso-aarch64:\n{arm}"
+        );
+        let risc = recipe_of_with("iso", &["ARCH=riscv64"]);
+        assert!(
+            risc.contains("iso-unsupported-arch"),
+            "iso con ARCH=riscv64 no explica por que no hay ISO:\n{risc}"
+        );
+        let x86 = recipe_of_with("iso", &["ARCH=x86_64"]);
+        assert!(
+            x86.contains("xorriso") && !x86.contains("iso-unsupported-arch"),
+            "iso con ARCH=x86_64 ha dejado de construir la ISO:\n{x86}"
+        );
     }
 
     /// El fallo que importa de los cuatro: `make qemu VARIANT=minimal`
@@ -277,7 +399,10 @@ mod build_wiring_tests {
     /// `un_fallo_al_medir_para_la_receta_y_no_cae_al_minimo` para el porqué.
     #[test]
     fn las_recetas_conservan_el_fallo_de_la_medida() {
-        for target in ["iso", "qcow2", "img"] {
+        // `iso-aarch64` mide su propio ESP igual que las tres de x86_64, asi
+        // que entra en la misma regla: un fallo de la medida tiene que parar
+        // la receta, no colarse como un tamaño cualquiera.
+        for target in ["iso", "qcow2", "img", "iso-aarch64"] {
             let recipe = recipe_of(target);
             // Solo las lineas que la LLAMAN: el comentario de encima la
             // nombra tambien.

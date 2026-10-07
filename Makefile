@@ -194,6 +194,19 @@ IMG_OUT := $(DIST_DIR)/eclipse-$(VARIANT)-$(ARCH).img
 # the extension).
 ARTIFACTS := $(CURDIR)/ignored/target
 ISO_INITRAMFS := $(ARTIFACTS)/iso-initramfs$(VARIANT_SUFFIX).img
+# The variant's live SFS, which on aarch64 is what gets linked into the kernel
+# (`LinuxRootfs::live_image` in xtask writes exactly this path).
+LIVE_IMG := $(CURDIR)/zCore/$(ARCH)$(VARIANT_SUFFIX).img
+# The FAT tree `cargo image` stages for aarch64: the prebuilt rayboot and its
+# Boot.json, plus the `os` kernel that `make -C zCore build` drops beside them.
+AARCH64_DISK := $(CURDIR)/zCore/disk
+AARCH64_BOOT_DIR := $(AARCH64_DISK)/EFI/Boot
+# The cmdline the arm64 ISO boots with, written into rayboot's Boot.json. It is
+# the x86_64 installer session's cmdline minus `ROOT=/dev/vda`: there is no root
+# block device to name, because the root is the image linked into the kernel.
+# `desktop=none` is here and not only in the zCore build because the `build`
+# target does not touch Boot.json -- only `run` and `debugrun` do.
+ISO_CMDLINE_AARCH64 := LOG=$(LOG):TERM=xterm-256color:console.shell=true:virtcon.disable=true:ROOTPROC=/bin/busybox?sh:desktop=none:renderer=auto
 EFI_GZ := $(ARTIFACTS)/efi$(VARIANT_SUFFIX).img.gz
 ROOTFS_GZ := $(ARTIFACTS)/rootfs$(VARIANT_SUFFIX).btrfs.gz
 HOME_GZ := $(ARTIFACTS)/home$(VARIANT_SUFFIX).btrfs.gz
@@ -255,53 +268,135 @@ ifeq ($(ARCH), x86_64)
 		-o "$(ISO_OUT)" \
 		"$(ISO_STAGING)" >/dev/null
 	@echo "ISO generado: $(ISO_OUT) ($(VARIANT), $(ARCH))"
+else ifeq ($(ARCH), aarch64)
+	@$(MAKE) --no-print-directory iso-aarch64 ARCH=$(ARCH) VARIANT=$(VARIANT)
 else
 	@$(MAKE) --no-print-directory iso-unsupported-arch
 endif
 
-# Why there is no ISO for an arch other than x86_64, said once and said
-# precisely — a message that only says "no soportado" costs the next person the
-# afternoon it cost to write this one.
+# The arm64 ISO. Mechanically simpler than the x86_64 one above, because the
+# boot medium is not assembled on the ESP at all: it travels INSIDE the kernel.
+#
+# An ISO is ONE medium, so the root filesystem cannot come from a second block
+# device the way `make qemu ARCH=aarch64` supplies it, and the prebuilt rayboot
+# that boots aarch64 cannot hand over an initramfs either -- its `Boot.json` has
+# no field for one. `LINK_USER_IMG=1` (see zCore/Makefile) sidesteps both: the
+# variant's SFS image is linked into the kernel, and the kernel reads its root
+# straight out of itself. The ESP then needs exactly three files, which is what
+# rayboot already expects to find:
+#
+#   /EFI/Boot/bootaa64.efi   the prebuilt rayboot (`cargo image` stages it)
+#   /EFI/Boot/Boot.json      its config; the cmdline is seded in below
+#   /os                      the kernel, with the rootfs inside it
+#
+# What this ISO is NOT: the x86_64 one carries installer payloads
+# (`rootfs.btrfs.gz`, `home.btrfs.gz`, `efi.img.gz`) and a separate, desktop-less
+# `iso-initramfs`, and `install-eclipse` writes them to disk. All of that is
+# still inside an `if let Arch::X86_64` in `xtask/src/linux/image.rs`, so the
+# arm64 ISO boots the variant's own live session and installs nothing. Bringing
+# the payload pipeline to arm64 is its own piece of work.
+#
+# A WARNING for anyone booting the result by hand: give QEMU `-m 1G`. With
+# `-m 4G` this kernel prints nothing at all after rayboot's
+# "jump to kernel" -- which reads exactly like a broken image and is not.
+# That is the opposite of the x86_64 ISO, which NEEDS 4G (rboot dies in
+# `OutOfFrames` with 2G). See `make qemu-iso-aarch64`.
+.PHONY: iso-aarch64
+iso-aarch64:
+	@test -f "$(LIVE_IMG)" || (echo "falta $(LIVE_IMG). ¿Ha fallado cargo image?"; exit 1)
+	@command -v mkfs.vfat >/dev/null || (echo "falta mkfs.vfat (paquete: dosfstools)"; exit 1)
+	@command -v mcopy >/dev/null || (echo "falta mcopy (paquete: mtools)"; exit 1)
+	@command -v mmd >/dev/null || (echo "falta mmd (paquete: mtools)"; exit 1)
+	@command -v xorriso >/dev/null || (echo "falta xorriso"; exit 1)
+	@# The kernel with the image inside. DESKTOP=none because this is the
+	@# console session, exactly as `esp-for-variant` does for x86_64.
+	@$(MAKE) -C zCore build MODE=release LINUX=1 LOG=$(LOG) GRAPHIC=on GL=$(GL) \
+		DESKTOP=none VARIANT=$(VARIANT) ARCH=$(ARCH) LINK_USER_IMG=1
+	@test -f "$(AARCH64_BOOT_DIR)/bootaa64.efi" || \
+		(echo "falta $(AARCH64_BOOT_DIR)/bootaa64.efi. ¿Ha fallado cargo image?"; exit 1)
+	@test -f "$(AARCH64_DISK)/os" || \
+		(echo "falta $(AARCH64_DISK)/os. ¿Ha fallado el build de zCore?"; exit 1)
+	@mkdir -p "$(DIST_DIR)" "$(BUILD_DIR)" "$(ISO_STAGING)/boot"
+	@# No `ROOT=`: there is no root block device to name, the root is the
+	@# image linked into the kernel. The rest mirrors the x86_64 session.
+	@sed -i 's#"cmdline":.*#"cmdline": "$(ISO_CMDLINE_AARCH64)",#' \
+		"$(AARCH64_BOOT_DIR)/Boot.json"
+	@rm -f "$(ESP_IMG)"
+	@# Why apparent size and not blocks, and why the measurement lives in a
+	@# script: scripts/esp-size-mb.sh says it, at length.
+	@esp_mb=$$(sh "$(CURDIR)/scripts/esp-size-mb.sh" "$(AARCH64_DISK)" 96) || exit 1; \
+		echo "ISO ESP: $$esp_mb MiB (el kernel lleva el rootfs dentro)"; \
+		dd if=/dev/zero of="$(ESP_IMG)" bs=1M count=$$esp_mb status=none
+	@mkfs.vfat -F 32 "$(ESP_IMG)" >/dev/null
+	@mmd -i "$(ESP_IMG)" ::/EFI ::/EFI/Boot >/dev/null
+	@mcopy -i "$(ESP_IMG)" -s "$(AARCH64_DISK)/EFI" ::/ >/dev/null
+	@# rayboot reads the kernel from `os` at the ROOT of the ESP
+	@# (`KERNEL_LOCATION` in its config), not from under /EFI.
+	@mcopy -i "$(ESP_IMG)" "$(AARCH64_DISK)/os" ::/os >/dev/null
+	@cp -f "$(ESP_IMG)" "$(ISO_STAGING)/boot/efi.img"
+	@xorriso -as mkisofs \
+		-R -J -V "ECLIPSE" \
+		-publisher "Eclipse $(VARIANT) $(ARCH)" \
+		-e "boot/efi.img" \
+		-no-emul-boot \
+		-append_partition 2 0xef "$(ESP_IMG)" \
+		-o "$(ISO_OUT)" \
+		"$(ISO_STAGING)" >/dev/null
+	@echo "ISO generado: $(ISO_OUT) ($(VARIANT), $(ARCH))"
+
+# Boot the arm64 ISO the way it has to be booted, so nobody has to rediscover
+# the 1 GiB ceiling or that rayboot's firmware lives under ignored/.
+.PHONY: qemu-iso-aarch64
+qemu-iso-aarch64:
+	@test -f "$(ISO_OUT)" || (echo "falta $(ISO_OUT). Corre: make iso ARCH=aarch64 VARIANT=$(VARIANT)"; exit 1)
+	qemu-system-aarch64 \
+		-machine virt -cpu cortex-a72 -m 1G -nographic -no-reboot \
+		-bios "$(CURDIR)/ignored/target/aarch64/firmware/QEMU_EFI.fd" \
+		-drive file="$(ISO_OUT)",if=none,format=raw,id=cd0,media=cdrom \
+		-device virtio-blk-device,drive=cd0
+
+# Why riscv64 has no ISO, said once and said precisely -- a message that only
+# says "no soportado" costs the next person the afternoon it cost to write this
+# one. (This block used to say the same about arm64. It no longer applies: see
+# `iso-aarch64` above.)
 #
 # This is NOT about the ISO tooling: xorriso does not care about the
 # architecture. It is the BOOT PATH. An Eclipse ISO is one single medium, so the
-# kernel has to get its root filesystem from the bootloader (an initramfs loaded
-# into RAM), and today only x86_64 does that:
+# kernel cannot take its root from a second block device; it has to be handed an
+# image in RAM, or carry one. There are two ways, and the tree uses both:
 #
 #   * x86_64 boots `rboot` (ours, in `rboot/`), which reads `initramfs.img` off
 #     the ESP and hands the kernel `initrd_start`/`initrd_size`
 #     (zCore/src/platform/x86/entry.rs). `fs::rootfs()` then mounts that RAM
 #     image, which is exactly what makes the live installer session possible.
 #   * aarch64 boots a PREBUILT `rayboot` 2.0.0 binary downloaded from a 2022
-#     GitHub release. Its `Boot.json` has no initramfs field at all, so
-#     `init_ram_disk()` returns None and `fs::rootfs()` falls back to
-#     `all_block().first_unwrap()` — the first block DEVICE. That is why
-#     `make qemu ARCH=aarch64` hands QEMU two drives: a FAT one to boot from
-#     and `aarch64.img` as the root. Two devices cannot be one ISO.
+#     GitHub release, whose `Boot.json` has no initramfs field at all -- so for
+#     `make qemu` the kernel falls back to `all_block().first_unwrap()`, the
+#     first block DEVICE, which is why that target hands QEMU two drives. For
+#     the ISO the loader is simply taken out of the question: `LINK_USER_IMG=1`
+#     links the image INTO the kernel and `init_ram_disk()` returns it from
+#     there (zCore/src/fs.rs, `link-user-img`). One medium, no handoff, and the
+#     prebuilt rayboot is untouched. Verified booting to `eclipse-init` as PID 1
+#     under QEMU + QEMU_EFI.fd.
 #   * riscv64 is booted by QEMU itself (`-kernel` + `-initrd`), with no UEFI
-#     medium in the picture.
+#     medium in the picture at all -- there is no ESP to put an ISO's bootloader
+#     on and nothing to hand xorriso as an El Torito image. An riscv64 ISO needs
+#     a UEFI boot path first (EDK2 for riscv + a loader), which is its own piece
+#     of work. `link-user-img` is NOT the missing half there: boards like `d1`
+#     and `c910light` already use it.
 #
-# So an arm64 ISO needs one of these two, and both are their own piece of work:
-#   a) `rboot` ported to `aarch64-unknown-uefi` (it is x86-only today: Cr3, the
-#      IDT, the `x86-interrupt` ABI, x86_64 page tables), or
-#   b) rayboot replaced/extended so it loads an initramfs and passes it in
-#      `platform/aarch64/entry.rs` the way the x86 one does.
-#
-# Everything ELSE for arm64 is already wired: `make rootfs`/`make image`
-# ARCH=aarch64 build `rootfs/aarch64[-minimal]` and `zCore/aarch64[-minimal].img`
-# for both variants, and `make release ARCHS="x86_64 aarch64"` walks the whole
-# matrix — the day (a) or (b) lands, this target is the only thing to fill in.
+# Everything else for arm64 was already wired and still is: `make rootfs`/`make
+# image` ARCH=aarch64 build `rootfs/aarch64[-minimal]` and
+# `zCore/aarch64[-minimal].img` for both variants.
 .PHONY: iso-unsupported-arch
 iso-unsupported-arch:
-	@echo "iso: todavía no hay ISO para ARCH=$(ARCH) (solo x86_64)."
+	@echo "iso: todavía no hay ISO para ARCH=$(ARCH) (sí para x86_64 y aarch64)."
 	@echo "  No es la ISO, es el arranque: una ISO es UN medio, así que el"
-	@echo "  cargador tiene que pasarle al kernel un initramfs, y eso hoy solo"
-	@echo "  lo hace rboot en x86_64. En aarch64 el cargador es un rayboot"
-	@echo "  prebuilt de 2022 cuyo Boot.json no tiene campo de initramfs, así"
-	@echo "  que el kernel coge su raíz del primer dispositivo de bloques"
-	@echo "  (por eso 'make qemu ARCH=aarch64' usa DOS discos)."
-	@echo "  Hace falta rboot portado a aarch64-unknown-uefi, o un rayboot que"
-	@echo "  cargue el initramfs. Ver el comentario sobre este objetivo."
+	@echo "  kernel no puede coger su raíz de un segundo disco: o se la pasa el"
+	@echo "  cargador, o la lleva dentro. En riscv64 no hay medio UEFI en"
+	@echo "  escena (QEMU arranca el kernel con -kernel/-initrd), así que no"
+	@echo "  hay ESP que meter en la ISO ni imagen de El Torito que darle a"
+	@echo "  xorriso. Hace falta antes un camino de arranque UEFI."
 	@echo "  Mientras tanto SÍ se construyen, en las dos variantes:"
 	@echo "    make image ARCH=$(ARCH) VARIANT=$(VARIANT)"
 	@echo "    -> rootfs/$(ARCH)$(VARIANT_SUFFIX) y zCore/$(ARCH)$(VARIANT_SUFFIX).img"
@@ -314,8 +409,8 @@ iso-unsupported-arch:
 #
 #   dist/eclipse-desktop-x86_64.iso
 #   dist/eclipse-minimal-x86_64.iso
-#   dist/eclipse-desktop-aarch64.iso     (see iso-unsupported-arch)
-#   dist/eclipse-minimal-aarch64.iso     (see iso-unsupported-arch)
+#   dist/eclipse-desktop-aarch64.iso
+#   dist/eclipse-minimal-aarch64.iso
 #
 # Narrow it along either axis, and a single combination still goes through this
 # same target -- there is no second code path for "just one":
@@ -326,9 +421,9 @@ iso-unsupported-arch:
 #
 # A combination that cannot be built does NOT abort the rest: every one is
 # attempted and the summary at the end says which ISOs this run produced and
-# which it did not (today: arm64, see `iso-unsupported-arch`). A release run is
-# half an hour per combination, so losing the x86_64 ISOs because arm64 has no
-# bootloader yet would be the worst of both.
+# which it did not (see `iso-unsupported-arch`). A release run is half an hour
+# per combination, so losing three ISOs because the fourth failed would be the
+# worst of both.
 ARCHS ?= x86_64 aarch64
 VARIANTS ?= desktop minimal
 
@@ -376,7 +471,7 @@ release:
 	@if [ -s "$(RELEASE_FAILED)" ]; then \
 	  echo ""; \
 	  echo "Sin construir: $$(tr '\n' ' ' < "$(RELEASE_FAILED)" | sed 's/ $$//')"; \
-	  echo "(para arm64, el motivo exacto: make iso-unsupported-arch ARCH=aarch64)"; \
+	  echo "(si falta alguna arquitectura, el motivo exacto: make iso-unsupported-arch ARCH=<arch>)"; \
 	  exit 1; \
 	fi
 
