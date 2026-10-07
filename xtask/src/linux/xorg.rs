@@ -21,7 +21,8 @@
 //! It is **best-effort**: a missing network, an unreachable mirror or an
 //! unavailable package prints a warning and leaves the image buildable (exactly
 //! like `nvidia_firmware`). The downloaded `.apk`s are cached under
-//! `ignored/apk-cache` so a second build — or an offline one — reuses them.
+//! `ignored/apk-cache/<arch>` so a second build — or an offline one — reuses
+//! them.
 //!
 //! Knobs:
 //!   * `ECLIPSE_XORG=0|off|no|false` — skip entirely (lean/minimal images).
@@ -413,6 +414,26 @@ fn enabled() -> bool {
     }
 }
 
+/// Donde se cachean los `.apk`, **por arco**.
+///
+/// apk nombra el fichero cacheado `<nombre>-<version>.apk`, sin el arco
+/// dentro, asi que una sola cache compartida le sirve al aarch64 el paquete de
+/// x86_64 que ya estaba ahi con ese nombre exacto, sin decir nada.
+fn apk_cache_dir(arch: &str) -> PathBuf {
+    PROJECT_DIR.join("ignored").join("apk-cache").join(arch)
+}
+
+/// El cargador dinamico de musl, cuyo nombre lleva el arco dentro.
+fn musl_loader_name(arch: &str) -> String {
+    format!("ld-musl-{arch}.so.1")
+}
+
+/// El soname contra el que estan enlazados los binarios de Alpine; es un alias
+/// del cargador, y tambien lleva el arco dentro.
+fn musl_libc_alias_name(arch: &str) -> String {
+    format!("libc.musl-{arch}.so.1")
+}
+
 /// Build one `apk add` invocation against the staging root. Factored out so the
 /// bulk install and the per-package retry below cannot drift apart in their
 /// flags — a retry that differed by one argument would "fail" for reasons that
@@ -630,14 +651,13 @@ pub(super) fn install(rootfs: &Path, apk_bin: &Path, arch: &str) {
         return;
     }
 
-    // The apk binary is a static target-arch build; running it on the host to
-    // populate the root only works when target arch == host arch. The desktop
-    // is x86_64-only anyway, so restrict to that and skip cross-builds cleanly.
-    if arch != "x86_64" {
-        println!("Xorg stack: skipped (only wired for x86_64, target is {arch})");
-        return;
-    }
-
+    // `apk_bin` es el apk del HOST (`LinuxRootfs::apk_host`), no el estatico
+    // del arco objetivo que se copia al rootfs: ese no arranca aqui en una
+    // compilacion cruzada, y por eso este paso se saltaba entero en todo lo que
+    // no fuera x86_64 — un `make release` de aarch64 salia con la variante
+    // desktop sin NADA del cierre de apk, solo con un println. El arco objetivo
+    // viaja en `--arch`, que es como Alpine misma cruza, y `--no-scripts` ya
+    // evita el unico paso que necesitaria ejecutar binarios del objetivo.
     if !apk_bin.is_file() {
         eprintln!(
             "warning: apk binary {apk_bin:?} not found; skipping Xorg install \
@@ -659,7 +679,10 @@ pub(super) fn install(rootfs: &Path, apk_bin: &Path, arch: &str) {
     // Persistent, gitignored cache so a re-build or an OFFLINE build reuses the
     // .apk files fetched by an earlier online build instead of hitting the
     // mirror again.
-    let cache = PROJECT_DIR.join("ignored").join("apk-cache");
+    // Por ARCO. apk nombra el `.apk` cacheado `<nombre>-<version>.apk`, sin el
+    // arco dentro, asi que una cache compartida le daba al aarch64 el paquete
+    // de x86_64 que ya estaba ahi con ese mismo nombre.
+    let cache = apk_cache_dir(arch);
     let _ = std::fs::create_dir_all(&cache);
 
     let packages: Vec<String> = match std::env::var("ECLIPSE_XORG_PACKAGES") {
@@ -902,9 +925,13 @@ pub(super) fn install(rootfs: &Path, apk_bin: &Path, arch: &str) {
                     .as_str(),
                 "0" | "off" | "no" | "false"
             );
-            let stage_ld = stage.join("lib/ld-musl-x86_64.so.1");
-            let ld = rootfs.join("lib/ld-musl-x86_64.so.1");
-            let libc_alias = rootfs.join("lib/libc.musl-x86_64.so.1");
+            // Por arco: en aarch64 el cargador se llama
+            // `ld-musl-aarch64.so.1` y con el nombre de x86_64 a pelo no se
+            // copiaba nada (y el alias apuntaba a un fichero inexistente).
+            let ld_name = musl_loader_name(arch);
+            let stage_ld = stage.join("lib").join(&ld_name);
+            let ld = rootfs.join("lib").join(&ld_name);
+            let libc_alias = rootfs.join("lib").join(musl_libc_alias_name(arch));
             if use_alpine_musl && stage_ld.is_file() {
                 if let Some(parent) = ld.parent() {
                     let _ = std::fs::create_dir_all(parent);
@@ -914,15 +941,15 @@ pub(super) fn install(rootfs: &Path, apk_bin: &Path, arch: &str) {
                     use std::os::unix::fs::PermissionsExt;
                     let _ = std::fs::set_permissions(&ld, std::fs::Permissions::from_mode(0o755));
                     println!(
-                        "Xorg stack: installed Alpine musl as /lib/ld-musl-x86_64.so.1 \
+                        "Xorg stack: installed Alpine musl as /lib/{ld_name} \
                          (one coherent loader for base + X; ECLIPSE_XORG_MUSL=0 to keep Eclipse's)"
                     );
                 }
             }
-            // `libc.musl-x86_64.so.1` is the soname the binaries NEED; it is an
+            // `libc.musl-<arch>.so.1` is the soname the binaries NEED; it is an
             // alias of the loader now in place. Create it additively.
             if ld.is_file() && !libc_alias.exists() {
-                let _ = std::os::unix::fs::symlink("ld-musl-x86_64.so.1", &libc_alias);
+                let _ = std::os::unix::fs::symlink(&ld_name, &libc_alias);
             }
             // Xorg opens its logfile (`/var/log/Xorg.0.log`) very early — before
             // probing any device — and dies with a fatal "Cannot open log file"
@@ -2176,6 +2203,94 @@ mod tests {
             "ESR must not be installed next to rapid-release: two 150 MiB \
              libxul.so in a RAM-backed image, and two menu entries"
         );
+    }
+
+    /// Un `apk add` para un arco cualquiera.
+    fn apk_add_for(arch: &str) -> Vec<String> {
+        apk_args(&mk_apk_add(
+            Path::new("/apk"),
+            Path::new("/stage"),
+            arch,
+            Path::new("/stage/etc/apk/repositories"),
+            &apk_cache_dir(arch),
+            Path::new("/no/such/keys"),
+            true,
+            true,
+        ))
+    }
+
+    /// El `--arch` que se le pasa a apk es el del OBJETIVO, no una constante.
+    /// Es lo que decide de que indice de Alpine sale el cierre de paquetes, y
+    /// hasta el #1758 este paso se saltaba entero en todo lo que no fuera
+    /// x86_64, asi que la variante desktop de aarch64 de `make release` salia
+    /// sin un solo paquete.
+    #[test]
+    fn el_arco_de_apk_es_el_del_objetivo() {
+        for arch in ["x86_64", "aarch64", "riscv64"] {
+            let args = apk_add_for(arch);
+            let i = args
+                .iter()
+                .position(|a| a == "--arch")
+                .unwrap_or_else(|| panic!("falta --arch para {arch}: {args:?}"));
+            assert_eq!(
+                args.get(i + 1).map(String::as_str),
+                Some(arch),
+                "apk tiene que resolver para {arch}, no para el arco del host"
+            );
+        }
+    }
+
+    /// La cache de `.apk` va por arco. apk nombra el fichero cacheado
+    /// `<nombre>-<version>.apk`, SIN el arco, asi que una cache compartida le
+    /// da al aarch64 el binario de x86_64 que dejo ahi la tirada anterior de
+    /// `make release`.
+    #[test]
+    fn la_cache_de_apk_no_se_comparte_entre_arcos() {
+        let x86 = apk_cache_dir("x86_64");
+        let arm = apk_cache_dir("aarch64");
+        assert_ne!(x86, arm, "dos arcos no pueden compartir cache de .apk");
+        assert!(
+            x86.ends_with("x86_64") && arm.ends_with("aarch64"),
+            "la hoja de la cache es el arco: {x86:?} / {arm:?}"
+        );
+        // Y lo que apk recibe es esa ruta, no otra.
+        let args = apk_add_for("aarch64");
+        let i = args.iter().position(|a| a == "--cache-dir").unwrap();
+        assert_eq!(
+            args.get(i + 1).map(String::as_str),
+            Some(arm.display().to_string().as_str()),
+            "el --cache-dir tiene que ser el del arco"
+        );
+    }
+
+    /// El cargador de musl lleva el arco en el nombre. Con `ld-musl-x86_64`
+    /// escrito a pelo, en aarch64 no se copiaba nada del cierre y el alias
+    /// `libc.musl-*` quedaba apuntando a un fichero que no existe.
+    #[test]
+    fn el_cargador_de_musl_se_nombra_por_arco() {
+        assert_eq!(musl_loader_name("aarch64"), "ld-musl-aarch64.so.1");
+        assert_eq!(musl_libc_alias_name("aarch64"), "libc.musl-aarch64.so.1");
+        assert_eq!(musl_loader_name("x86_64"), "ld-musl-x86_64.so.1");
+        assert_eq!(musl_libc_alias_name("x86_64"), "libc.musl-x86_64.so.1");
+    }
+
+    /// `install` no puede volver a rendirse por el arco. El motivo original
+    /// (el estatico de apk era del objetivo y no arranca en el host) ya no
+    /// aplica: lo que recibe es el apk del host.
+    #[test]
+    fn el_paso_de_paquetes_no_se_rinde_por_el_arco() {
+        let src = include_str!("xorg.rs");
+        let body = src
+            .split_once("pub(super) fn install(")
+            .expect("install sigue existiendo")
+            .1;
+        for linea in body.lines() {
+            let codigo = linea.split("//").next().unwrap_or("");
+            assert!(
+                !codigo.contains("arch != \"x86_64\""),
+                "ha vuelto el corte por arco en install: {linea}"
+            );
+        }
     }
 
     /// Every argument of one `apk add`, in order, as strings.

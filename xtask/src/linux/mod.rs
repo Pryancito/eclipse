@@ -162,7 +162,12 @@ impl LinuxRootfs {
             // build.
             Self::write_profile(&dir.join("etc"));
             Self::write_ntp(&dir);
-            self.install_desktop_stack(&dir, &bin);
+            // Before the desktop stack: `xorg::install` runs apk against this
+            // rootfs, and `/etc/apk/arch` is what decides which repository it
+            // reads. An incremental build never wrote it, so a rootfs built
+            // before this existed keeps resolving for the host's arch.
+            Self::write_apk_arch(&dir.join("etc"), self.0.name());
+            self.install_desktop_stack(&dir);
             // After apk so we can see whether the PulseAudio plugin/binary
             // landed, and so /etc/pulse wins over anything the package dropped.
             Self::write_asound_conf(&dir);
@@ -182,8 +187,26 @@ impl LinuxRootfs {
         fs::create_dir_all(&lib).unwrap();
 
         let apk = self.apk(&musl);
+        // El binario del objetivo es para el sistema instalado y es
+        // best-effort (aqui mismo, sin salida a repo.chimera-linux.org, el de
+        // aarch64 no se baja). La CONFIGURACION de apk — repositorios, arco,
+        // claves, bases de datos — no depende de que ese binario exista: la usa
+        // el apk del HOST para armar el cierre de paquetes del objetivo. Iban
+        // juntas dentro de este `if`, asi que un objetivo sin estatico salia
+        // ademas **sin `/etc/apk/repositories`**, y entonces `xorg::install`
+        // tambien se rendia.
         if apk.is_file() {
             fs::copy(&apk, bin.join("apk")).unwrap();
+        } else {
+            eprintln!(
+                "warning: no hay estatico de apk para {} ({}); el sistema instalado \
+                 saldra sin /bin/apk, pero el cierre de paquetes se arma igual con el \
+                 apk del host",
+                self.0.name(),
+                apk.display()
+            );
+        }
+        {
             let etc = dir.join("etc");
             let etc_apk = etc.join("apk");
             fs::create_dir_all(&etc_apk).unwrap();
@@ -193,6 +216,7 @@ impl LinuxRootfs {
             )
             .unwrap();
             fs::write(etc_apk.join("world"), "").unwrap();
+            Self::write_apk_arch(&etc, self.0.name());
 
             // Alpine repo signatures: without /etc/apk/keys/*.rsa.pub apk-tools
             // 3 reports "UNTRUSTED signature" on APKINDEX and installs nothing.
@@ -242,7 +266,7 @@ impl LinuxRootfs {
         Self::write_ntp(&dir);
         Self::write_passwd(&etc, &dir);
         Self::write_console_configs(&etc, &dir);
-        self.install_desktop_stack(&dir, &bin);
+        self.install_desktop_stack(&dir);
         Self::install_ca_certs(&dir);
 
         // /etc/machine-id — prevents dhcp_vendor "No such file or directory".
@@ -856,6 +880,24 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
             eprintln!("warning: failed to compile thr3");
         }
         executable
+    }
+
+    /// Escribe `/etc/apk/arch` con el arco OBJETIVO.
+    ///
+    /// Esto no es cosmetico: `/etc/apk/arch` es lo que apk lee para decidir
+    /// **de que repositorio** baja. `/etc/apk/repositories` solo nombra la
+    /// rama (`.../v3.24/main`); apk le pega el arco detras y pide
+    /// `.../v3.24/main/<arco>/APKINDEX.tar.gz`. Sin este fichero cae a su arco
+    /// compilado, que en una compilacion cruzada es **el del host**: un
+    /// `make release` de aarch64 resolvia contra el indice de x86_64.
+    /// Comprobado a mano: con `riscv64` aqui dentro, el mismo apk de x86_64
+    /// pide `.../main/riscv64/APKINDEX.tar.gz`. Y `apk --initdb` NO lo escribe.
+    fn write_apk_arch(etc: &Path, arch: &str) {
+        let etc_apk = etc.join("apk");
+        if fs::create_dir_all(&etc_apk).is_err() {
+            return;
+        }
+        let _ = fs::write(etc_apk.join("arch"), format!("{arch}\n"));
     }
 
     fn write_resolv_conf(etc: &Path) {
@@ -1510,7 +1552,7 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
     /// not prune a desktop rootfs afterwards — it never has one — so there is
     /// no file list to keep in step with `DEFAULT_PACKAGES` every time a
     /// package is added.
-    fn install_desktop_stack(&self, dir: &Path, bin: &Path) {
+    fn install_desktop_stack(&self, dir: &Path) {
         if !self.1.has_desktop() {
             println!(
                 "minimal variant: no desktop (no labwc/Xorg, none of the Mesa/Firefox/XFCE \
@@ -1534,9 +1576,12 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
         // GL + xkb data + base fonts + xterm) into the rootfs so `startx` works
         // out of the box, instead of leaving it as a runtime `apk add` chore
         // that a fresh install / a fresh QEMU boot does not have. Best-effort:
-        // an offline build just warns and ships without it. Uses the apk binary
-        // and repositories already staged above.
-        xorg::install(dir, &bin.join("apk"), self.0.name());
+        // an offline build just warns and ships without it.
+        //
+        // El apk del HOST, no el `bin/apk` del rootfs: ese es el estatico del
+        // arco objetivo y en una compilacion cruzada no arranca. El arco
+        // objetivo se le pasa aparte y viaja hasta el `--arch` de apk.
+        xorg::install(dir, &Self::apk_host(), self.0.name());
         // Needs the firefox package on disk, i.e. after xorg::install.
         desktop::write_firefox_default_prefs(dir);
         desktop::write_firefox_desktop_override(dir);
@@ -1682,9 +1727,24 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
     /// Arquitecturas disponibles en Chimera Linux que también soporta Eclipse OS:
     ///   x86_64 · aarch64 · riscv64
     fn apk(&self, _musl: &Path) -> PathBuf {
+        Self::apk_for(self.0.name())
+    }
+
+    /// El apk que corre AQUI, en el host de la compilacion.
+    ///
+    /// `apk()` baja el binario del arco OBJETIVO, que es el que se copia al
+    /// rootfs para que el sistema instalado tenga su propio apk. Pero el paso
+    /// de paquetes de `xorg::install` ejecuta apk **en el host**, y un estatico
+    /// de aarch64 no arranca en un x86_64. Para eso esta este: el binario del
+    /// host, al que se le dice el arco objetivo con `--arch`, que es como
+    /// Alpine misma cruza (`apk --arch aarch64 --root ...`).
+    fn apk_host() -> PathBuf {
+        Self::apk_for(std::env::consts::ARCH)
+    }
+
+    fn apk_for(arch: &str) -> PathBuf {
         const CHIMERA_APK_BASE: &str = "https://repo.chimera-linux.org/apk/latest";
 
-        let arch = self.0.name(); // "x86_64", "aarch64", "riscv64"
         let filename = format!("apk-{arch}.static");
         let url = format!("{CHIMERA_APK_BASE}/{filename}");
 
@@ -4881,6 +4941,86 @@ mod variant_layout_tests {
         LinuxRootfs::write_desktop_session(&dir, "none");
         assert!(dir.join("etc/eclipse/desktop").is_file());
         let _ = fs::remove_dir_all(&dir);
+    }
+}
+
+/// De que arquitectura baja apk los paquetes. Lo decide `/etc/apk/arch`
+/// dentro del rootfs, no `/etc/apk/repositories`: ese solo nombra la rama
+/// (`.../v3.24/main`) y apk le pega el arco detras. Sin ese fichero apk cae a
+/// su arco compilado — el del HOST en una compilacion cruzada.
+#[cfg(test)]
+mod apk_arch_tests {
+    use super::*;
+
+    /// Misma convencion que `xorg::scratch`: el arbol en /tmp va etiquetado
+    /// por proceso e hilo para que dos tests en paralelo no se pisen.
+    fn scratch(que: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!(
+            "eclipse-apk-arch-{que}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// Lo que se escribe es el arco objetivo, tal cual y con salto de linea,
+    /// que es como lo lee apk.
+    #[test]
+    fn el_arco_escrito_es_el_del_objetivo() {
+        for arch in ["x86_64", "aarch64", "riscv64"] {
+            let etc = scratch(arch).join("etc");
+            LinuxRootfs::write_apk_arch(&etc, arch);
+            let leido = fs::read_to_string(etc.join("apk").join("arch")).unwrap();
+            assert_eq!(leido, format!("{arch}\n"), "arco de {arch}");
+        }
+    }
+
+    /// Se escribe aunque `etc/apk` no exista todavia: en la ruta desde cero el
+    /// directorio lo crea el bloque de apk, pero en la incremental no hay quien
+    /// lo cree, y un `return` silencioso ahi dejaba el rootfs sin arco.
+    #[test]
+    fn crea_el_directorio_si_hace_falta() {
+        let etc = scratch("crea").join("etc");
+        assert!(!etc.exists());
+        LinuxRootfs::write_apk_arch(&etc, "aarch64");
+        assert!(etc.join("apk").join("arch").is_file());
+    }
+
+    /// Un segundo `cargo rootfs` para otro arco tiene que PISAR el valor, no
+    /// dejar el de la tirada anterior de `make release`.
+    #[test]
+    fn una_segunda_tirada_pisa_el_arco_de_la_primera() {
+        let etc = scratch("pisa").join("etc");
+        LinuxRootfs::write_apk_arch(&etc, "x86_64");
+        LinuxRootfs::write_apk_arch(&etc, "aarch64");
+        assert_eq!(
+            fs::read_to_string(etc.join("apk").join("arch")).unwrap(),
+            "aarch64\n"
+        );
+    }
+
+    /// La configuracion de apk no puede volver a colgar de que exista el
+    /// estatico del objetivo: ese es best-effort (aqui mismo el de aarch64 no
+    /// se baja) y lo que arma el cierre de paquetes es el apk del host. Iban
+    /// juntos dentro de un `if apk.is_file()`, asi que un objetivo sin
+    /// estatico salia ademas sin `/etc/apk/repositories`.
+    #[test]
+    fn la_configuracion_de_apk_no_cuelga_del_estatico_del_objetivo() {
+        let src = include_str!("mod.rs");
+        let i = src
+            .find("if apk.is_file() {")
+            .expect("sigue habiendo una comprobacion del estatico");
+        let bloque = &src[i..];
+        let fin = bloque.find("\n        }").unwrap_or(bloque.len());
+        let dentro = &bloque[..fin];
+        for aguja in ["repositories", "write_apk_arch", "install_apk_keys"] {
+            assert!(
+                !dentro.contains(aguja),
+                "{aguja} ha vuelto a quedar dentro del `if apk.is_file()`"
+            );
+        }
     }
 }
 
