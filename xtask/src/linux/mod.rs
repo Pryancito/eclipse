@@ -107,6 +107,10 @@ impl LinuxRootfs {
             if eclipse_bench.is_file() {
                 let _ = fs::copy(&eclipse_bench, bin.join("eclipse-bench"));
             }
+            let clock_probe = self.clock_probe(&musl);
+            if clock_probe.is_file() {
+                let _ = fs::copy(&clock_probe, bin.join("clock-probe"));
+            }
             let firefox_probe = self.firefox_probe(&musl);
             if firefox_probe.is_file() {
                 let _ = fs::copy(&firefox_probe, bin.join("firefox-probe"));
@@ -646,6 +650,16 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
             let dst = bin.join("eclipse-bench");
             let _ = dir::rm(&dst);
             fs::copy(&eclipse_bench, &dst).unwrap();
+        }
+
+        // clock-probe: the integrity of the clocks and the timers. Not a speed
+        // figure: it reads two clocks against each other and says whether the
+        // time the kernel reports is true. See tools/clock-probe.
+        let clock_probe = self.clock_probe(&musl);
+        if clock_probe.is_file() {
+            let dst = bin.join("clock-probe");
+            let _ = dir::rm(&dst);
+            fs::copy(&clock_probe, &dst).unwrap();
         }
 
         // firefox-probe: the kernel interfaces Firefox depends on.
@@ -2303,6 +2317,53 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
             .status();
         if !status.success() {
             println!("Failed to compile audio-probe");
+            return executable;
+        }
+
+        Ext::new(strip).arg("-s").arg(&executable).status();
+        executable
+    }
+
+    /// Cross-compile `clock-probe` (tools/clock-probe): the integrity probe for
+    /// the clocks and the timers. `-pthread` because the watchdog that keeps a
+    /// timer which never fires from hanging the probe is a thread, and the
+    /// per-thread CPU-clock check needs a second thread of its own. No libm.
+    /// Best-effort: a missing musl gcc skips the tool, as everywhere here.
+    fn clock_probe(&self, musl: &Path) -> PathBuf {
+        let dir = PROJECT_DIR.join("tools").join("clock-probe");
+        let executable = dir.join("clock-probe");
+        let source = dir.join("clock-probe.c");
+        if executable.is_file() && source.is_file() {
+            if let (Ok(bin_meta), Ok(src_meta)) = (fs::metadata(&executable), fs::metadata(&source))
+            {
+                if let (Ok(bin_mtime), Ok(src_mtime)) = (bin_meta.modified(), src_meta.modified()) {
+                    if bin_mtime >= src_mtime {
+                        return executable;
+                    }
+                }
+            }
+        }
+
+        println!("Compiling clock-probe...");
+        let musl = musl.canonicalize().unwrap();
+        let bin = musl.join("bin");
+        let arch = self.0.name();
+        let cc = format!("{}/{}-linux-musl-gcc", bin.display(), arch);
+        let strip = self.strip(&musl);
+
+        fs::create_dir_all(&dir).unwrap();
+        let status = Ext::new(&cc)
+            .current_dir(&dir)
+            .arg("-static")
+            .arg("-pthread")
+            .arg("-O2")
+            .arg("-s")
+            .arg("-o")
+            .arg(&executable)
+            .arg(&source)
+            .status();
+        if !status.success() {
+            println!("Failed to compile clock-probe");
             return executable;
         }
 
