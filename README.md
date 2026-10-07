@@ -184,13 +184,70 @@ cargo qemu --arch x86_64 --smp 4 --gdb 1234
 Reconstruye el rootfs de Linux.
 ```bash
 cargo rootfs --arch x86_64
+cargo rootfs --arch x86_64 --variant minimal   # sin escritorio
 ```
 
 #### **image**
 Construye el archivo de imagen del rootfs de Linux a partir del directorio correspondiente.
 ```bash
 cargo image --arch x86_64
+cargo image --arch x86_64 --variant minimal
 ```
+
+### Variantes e ISO de distribución
+
+Eclipse se publica en dos **variantes**, y cada una tiene su propio rootfs y sus
+propios artefactos:
+
+| Variante | Qué lleva | Rootfs | Sesión |
+|---|---|---|---|
+| `desktop` (por defecto) | labwc/Xorg y todo el cierre de apk: Mesa, Firefox, XFCE, freedoom | `rootfs/<arch>` | la que diga `desktop=` / `/etc/eclipse/desktop`, por defecto `labwc` |
+| `minimal` | el sistema base: busybox, red, audio, `install-eclipse` | `rootfs/<arch>-minimal` | consola (`/etc/eclipse/desktop` = `none`) |
+
+`minimal` **no es un recorte posterior** de la de escritorio: es un rootfs que
+nunca ejecuta `desktop::install` ni `xorg::install`, así que los ficheros del
+escritorio no llegan a estar en disco. No hay, por tanto, una lista de qué podar
+que haya que mantener al día cada vez que se añade un paquete.
+
+La variante `desktop` **no lleva sufijo** en ninguna ruta intermedia, así que
+`rootfs/x86_64`, `zCore/x86_64.img` e `ignored/target/efi.img.gz` siguen donde
+siempre y `make qemu` se comporta igual que antes de que existiera este eje.
+
+`make release` recorre la matriz de (variante × arquitectura) y saca una ISO por
+combinación, con el nombre diciendo las dos:
+
+```bash
+make release                                  # toda la matriz
+make release ARCHS=x86_64                     # las dos variantes de x86_64
+make release VARIANTS=minimal                 # minimal en las dos arquitecturas
+make release ARCHS=x86_64 VARIANTS=desktop    # una sola
+```
+
+```text
+dist/eclipse-desktop-x86_64.iso
+dist/eclipse-minimal-x86_64.iso
+```
+
+Y cada combinación se puede pedir también con el objetivo de siempre:
+
+```bash
+make iso                                      # desktop, x86_64
+make iso VARIANT=minimal                      # minimal, x86_64
+```
+
+Una combinación que falle **no aborta el resto**: `make release` las intenta
+todas y acaba con un resumen de qué ISO existe y qué falta.
+
+> **arm64 todavía no da ISO.** No es la ISO sino el arranque: una ISO es un solo
+> medio, así que el cargador tiene que pasarle al kernel un initramfs, y hoy eso
+> solo lo hace `rboot` en x86_64. En aarch64 el cargador es un `rayboot`
+> precompilado de 2022 cuyo `Boot.json` no tiene campo de initramfs, de modo que
+> el kernel coge su raíz del primer dispositivo de bloques — por eso
+> `make qemu ARCH=aarch64` le da a QEMU **dos** discos. Hace falta `rboot`
+> portado a `aarch64-unknown-uefi`, o un rayboot que cargue el initramfs. Lo
+> demás de arm64 sí está: `make image ARCH=aarch64 VARIANT=minimal` construye
+> `rootfs/aarch64-minimal` y `zCore/aarch64-minimal.img`. El detalle completo
+> está en el objetivo `iso-unsupported-arch` del `Makefile`.
 
 ## Soporte de Plataformas
 

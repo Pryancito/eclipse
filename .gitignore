@@ -7,6 +7,12 @@
 
 /ignored
 /rootfs
+# Las ISO/qcow2/img de `make iso` y `make release`, y su directorio de montaje.
+# `*.img` arriba ya cubre los .img, pero no una ISO de medio giga: `make release`
+# deja cuatro de ellas en dist/, y basta un `git add -A` para intentar
+# commitearlas.
+/dist
+/build
 /prebuilt/zircon/
 # for aarch64 only
 /zCore/disk
