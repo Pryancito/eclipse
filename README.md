@@ -202,12 +202,21 @@ propios artefactos:
 | Variante | Qué lleva | Rootfs | Sesión |
 |---|---|---|---|
 | `desktop` (por defecto) | labwc/Xorg y todo el cierre de apk: Mesa, Firefox, XFCE, freedoom | `rootfs/<arch>` | la que diga `desktop=` / `/etc/eclipse/desktop`, por defecto `labwc` |
-| `minimal` | el sistema base: busybox, red, audio, `install-eclipse` | `rootfs/<arch>-minimal` | consola (`/etc/eclipse/desktop` = `none`) |
+| `minimal` | el sistema base: busybox, red, `install-eclipse` | `rootfs/<arch>-minimal` | consola (`/etc/eclipse/desktop` = `none`) |
 
 `minimal` **no es un recorte posterior** de la de escritorio: es un rootfs que
 nunca ejecuta `desktop::install` ni `xorg::install`, así que los ficheros del
 escritorio no llegan a estar en disco. No hay, por tanto, una lista de qué podar
 que haya que mantener al día cada vez que se añade un paquete.
+
+> **Hoy `minimal` no tiene sonido ni zonas horarias con nombre.** No por
+> diseño: ALSA, PulseAudio, `mpg123`, `tzdata` y `musl-locales` están en la
+> lista de paquetes de `xorg::install`, que la variante minimal no ejecuta. El
+> rootfs minimal sí escribe `pulseaudio.service` (no lleva `desktop =`, así que
+> arranca) y `eclipse-tz`, de modo que el servicio se reintenta contra un
+> binario que no existe y `TZ=Europe/Madrid` se queda en UTC. Separar esas
+> dependencias de base del conjunto gráfico es una tanda aparte; está anotado
+> en la revisión del #1754.
 
 La variante `desktop` **no lleva sufijo** en ninguna ruta intermedia, así que
 `rootfs/x86_64`, `zCore/x86_64.img` e `ignored/target/efi.img.gz` siguen donde

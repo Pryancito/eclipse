@@ -171,7 +171,11 @@ impl QemuArgs {
     /// 在 qemu 中启动。
     pub fn qemu(self) {
         // 递归 image
-        self.arch.linux_rootfs().image();
+        let rootfs = self.arch.linux_rootfs();
+        rootfs.image();
+        // The image THIS variant just built, not the unsuffixed one: see
+        // LinuxRootfs::live_image.
+        let live_image = rootfs.live_image();
         // 构造各种字符串
         let arch = self.arch.arch;
         let arch_str = arch.name();
@@ -192,7 +196,7 @@ impl QemuArgs {
             .arg("-kernel")
             .arg(&bin)
             .arg("-initrd")
-            .arg(INNER.join(format!("{arch_str}.img")))
+            .arg(&live_image)
             .args(["-append", "\"LOG=warn\""])
             .args(["-display", "none"])
             .arg("-no-reboot")
@@ -216,10 +220,7 @@ impl QemuArgs {
                     .args(["-hda", &format!("fat:rw:{}/disk", INNER.display())])
                     .args([
                         "-drive",
-                        &format!(
-                            "file={}/aarch64.img,if=none,format=raw,id=x0",
-                            INNER.display()
-                        ),
+                        &format!("file={},if=none,format=raw,id=x0", live_image.display()),
                     ])
                     .args([
                         "-device",

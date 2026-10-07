@@ -552,11 +552,7 @@ impl super::LinuxRootfs {
                 "Building QEMU live image ({} MiB)...",
                 live_size / (1024 * 1024)
             );
-            let image = PROJECT_DIR.join("zCore").join(format!(
-                "{arch}{suffix}.img",
-                arch = self.0.name(),
-                suffix = self.variant().suffix()
-            ));
+            let image = self.live_image();
             fuse(&live_root, &image, live_size);
 
             println!("Build completed successfully!");
@@ -565,11 +561,7 @@ impl super::LinuxRootfs {
 
         // 镜像路径
         let inner = PROJECT_DIR.join("zCore");
-        let image = inner.join(format!(
-            "{arch}{suffix}.img",
-            arch = self.0.name(),
-            suffix = self.variant().suffix()
-        ));
+        let image = self.live_image();
         // aarch64 还需要下载 firmware
         if let Arch::Aarch64 = self.0 {
             const URL: &str = "https://github.com/Luchangcheng2333/rayboot/releases/download/2.0.0/aarch64_firmware.tar.gz";

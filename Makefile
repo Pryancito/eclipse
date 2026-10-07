@@ -23,8 +23,8 @@ AUDIO ?= on
 # see the branch history). The kernel cmdline gets `desktop=$(DESKTOP)`, which
 # eclipse-init reads to pick the session. Real hardware images carry no such
 # argument and also default to labwc via /etc/eclipse/desktop. Override with
-# `make qemu DESKTOP=xorg` to work on the X session.
-DESKTOP ?= labwc
+# `make qemu DESKTOP=xorg` to work on the X session. The default follows
+# VARIANT, so it is set just below, once VARIANT is known.
 
 # Which image variant to build: `desktop` (the Eclipse of always — labwc/Xorg
 # plus the whole apk closure: Mesa, Firefox, XFCE) or `minimal` (console only:
@@ -41,6 +41,17 @@ ifeq ($(filter $(VARIANT),desktop minimal),)
   $(error VARIANT debe ser `desktop` o `minimal`, no `$(VARIANT)`)
 endif
 VARIANT_SUFFIX := $(patsubst desktop,,$(patsubst minimal,-minimal,$(VARIANT)))
+
+# A minimal image carries no compositor, so the cmdline must not ask for one:
+# `desktop=` on the cmdline WINS over /etc/eclipse/desktop (selected_desktop()
+# in eclipse-init), so a hardcoded DESKTOP=labwc overrode the `none` the
+# minimal rootfs had written and the guest booted hunting for labwc. Still
+# overridable: `make qemu VARIANT=minimal DESKTOP=xorg`.
+ifeq ($(VARIANT),minimal)
+  DESKTOP ?= none
+else
+  DESKTOP ?= labwc
+endif
 
 # Extra kernel cmdline options passed straight through to the guest, e.g.
 # `make qemu KOPTS=drm.present_probe` or several at once separated by colons:
@@ -126,10 +137,10 @@ clean-everything: clean
 # 	cd rootfs/x86_64/rt-tests && make
 # 	echo x86 gcc build rt-test,now need manual modificy.
 qemu: image
-	$(MAKE) -C zCore run MODE=release LINUX=1 LOG=$(LOG) GRAPHIC=$(GRAPHIC) ACCEL=$(ACCEL) DESKTOP=$(DESKTOP) AUDIO=$(AUDIO) KOPTS=$(KOPTS)
+	$(MAKE) -C zCore run MODE=release LINUX=1 LOG=$(LOG) GRAPHIC=$(GRAPHIC) ACCEL=$(ACCEL) DESKTOP=$(DESKTOP) AUDIO=$(AUDIO) KOPTS=$(KOPTS) VARIANT=$(VARIANT)
 
 vbox: image
-	$(MAKE) -C zCore vbox MODE=release LINUX=1 LOG=$(LOG) GRAPHIC=$(GRAPHIC) ACCEL=$(ACCEL) DESKTOP=$(DESKTOP) IFACE=$(IFACE) KOPTS=$(KOPTS)
+	$(MAKE) -C zCore vbox MODE=release LINUX=1 LOG=$(LOG) GRAPHIC=$(GRAPHIC) ACCEL=$(ACCEL) DESKTOP=$(DESKTOP) IFACE=$(IFACE) KOPTS=$(KOPTS) VARIANT=$(VARIANT)
 
 # Macvtap networking: VM gets its own MAC/IP on the physical LAN.
 # Useful for testing the I219-V driver on bare metal.
@@ -187,10 +198,27 @@ EFI_GZ := $(ARTIFACTS)/efi$(VARIANT_SUFFIX).img.gz
 ROOTFS_GZ := $(ARTIFACTS)/rootfs$(VARIANT_SUFFIX).btrfs.gz
 HOME_GZ := $(ARTIFACTS)/home$(VARIANT_SUFFIX).btrfs.gz
 
+# The ESP that every distribution image is cut from, built for THIS variant.
+#
+# It exists as its own target because `iso` built it and `qcow2`/`img` did not:
+# they packaged `$(ESP_DIR)/EFI` as they found it. That directory has no variant
+# in its path, so its initramfs.img was whatever the last zCore build happened
+# to leave there — `make iso VARIANT=desktop && make qcow2 VARIANT=minimal`
+# wrote a qcow2 with the DESKTOP installer inside it under a minimal filename.
+# Nothing in the output said so.
+#
+# DESKTOP=none because this is the installer session for all three: console
+# plus install-eclipse, with the desktop living in the payloads the installer
+# writes to disk, not in the ESP.
+.PHONY: esp-for-variant
+esp-for-variant:
+	@test -f "$(ISO_INITRAMFS)" || (echo "falta $(ISO_INITRAMFS). ¿Ha fallado cargo image?"; exit 1)
+	@$(MAKE) -C zCore build MODE=release LINUX=1 LOG=$(LOG) GRAPHIC=on GL=$(GL) \
+		DESKTOP=none VARIANT=$(VARIANT) INITRAMFS_IMG="$(ISO_INITRAMFS)"
+
 iso: image
 ifeq ($(ARCH), x86_64)
-	@test -f "$(ISO_INITRAMFS)" || (echo "falta $(ISO_INITRAMFS). ¿Ha fallado cargo image?"; exit 1)
-	@$(MAKE) -C zCore build MODE=release LINUX=1 LOG=$(LOG) GRAPHIC=on GL=$(GL) DESKTOP=none INITRAMFS_IMG="$(ISO_INITRAMFS)"
+	@$(MAKE) --no-print-directory esp-for-variant ARCH=$(ARCH) VARIANT=$(VARIANT)
 	@mkdir -p "$(DIST_DIR)" "$(BUILD_DIR)" "$(ISO_STAGING)"
 	@test -d "$(ESP_DIR)/EFI" || (echo "ESP no encontrado en $(ESP_DIR). ¿Has compilado zCore para x86_64?"; exit 1)
 	@rm -rf "$(ISO_STAGING)/EFI" && cp -a "$(ESP_DIR)/EFI" "$(ISO_STAGING)/"
@@ -201,16 +229,9 @@ ifeq ($(ARCH), x86_64)
 	@rm -f "$(ESP_DIR)/EFI/zCore/x86_64.img" "$(ESP_DIR)/EFI/zCore/aarch64.img" \
 		"$(ESP_DIR)/EFI/zCore/riscv64.img"
 	@rm -f "$(ESP_IMG)"
-	@# APPARENT size, not allocated blocks: the SFS initramfs is written
-	@# SPARSE (`set_len` and nothing else), so a plain `du -sm` counts it at
-	@# about half, the FAT32 comes out short, and mcopy says "Disk full"
-	@# exactly when it copies BootX64.efi -- which goes last. The result is
-	@# an ISO with nothing to boot from, and on the guest console it reads
-	@# like a hung kernel. zCore/Makefile has had this fixed for a while
-	@# (with the note explaining why); these three copies of the same
-	@# calculation never got it. The `||` keeps non-GNU `du` (macOS) working.
-	@esp_mb=$$(du -sm --apparent-size "$(ESP_DIR)/EFI" 2>/dev/null | cut -f1 \
-		|| du -sm "$(ESP_DIR)/EFI" | cut -f1); esp_mb=$$((esp_mb + 96)); \
+	@# Why apparent size and not blocks, and why the measurement lives in a
+	@# script: scripts/esp-size-mb.sh says it, at length.
+	@esp_mb=$$(sh "$(CURDIR)/scripts/esp-size-mb.sh" "$(ESP_DIR)/EFI" 96); \
 		echo "ISO ESP: $$esp_mb MiB (sized to installer initramfs; installed efi.img.gz stays $(ESP_IMG_SIZE_MB) MiB)"; \
 		dd if=/dev/zero of="$(ESP_IMG)" bs=1M count=$$esp_mb status=none
 	@mkfs.vfat -F 32 "$(ESP_IMG)" >/dev/null
@@ -341,8 +362,9 @@ release:
 	  for v in $(VARIANTS); do \
 	    iso="$(DIST_DIR)/eclipse-$$v-$$a.iso"; \
 	    if grep -qx "$$v $$a" "$(RELEASE_BUILT)" 2>/dev/null; then \
-	      sz=$$(du -h --apparent-size "$$iso" 2>/dev/null | cut -f1 \
-	            || du -h "$$iso" 2>/dev/null | cut -f1); \
+	      sz=$$({ du -h --apparent-size "$$iso" 2>/dev/null \
+	              || du -h "$$iso" 2>/dev/null; } | cut -f1); \
+	      [ -n "$$sz" ] || sz="tamaño desconocido"; \
 	      echo "  OK      $$iso ($$sz)"; \
 	    elif [ -f "$$iso" ]; then \
 	      echo "  FALLÓ   $$v/$$a; el fichero que hay en dist/ es de otra tirada"; \
@@ -361,6 +383,9 @@ release:
 qcow2: image
 ifeq ($(ARCH), x86_64)
 	@mkdir -p "$(DIST_DIR)" "$(BUILD_DIR)"
+	@# Build the ESP for THIS variant instead of packaging whatever the last
+	@# zCore build left in a path that has no variant in it.
+	@$(MAKE) --no-print-directory esp-for-variant ARCH=$(ARCH) VARIANT=$(VARIANT)
 	@test -d "$(ESP_DIR)/EFI" || (echo "ESP no encontrado en $(ESP_DIR). ¿Has compilado zCore para x86_64?"; exit 1)
 	@command -v mkfs.vfat >/dev/null || (echo "falta mkfs.vfat (paquete: dosfstools)"; exit 1)
 	@command -v mcopy >/dev/null || (echo "falta mcopy (paquete: mtools)"; exit 1)
@@ -369,16 +394,9 @@ ifeq ($(ARCH), x86_64)
 	@rm -f "$(ESP_DIR)/EFI/zCore/x86_64.img" "$(ESP_DIR)/EFI/zCore/aarch64.img" \
 		"$(ESP_DIR)/EFI/zCore/riscv64.img"
 	@rm -f "$(ESP_IMG)"
-	@# APPARENT size, not allocated blocks: the SFS initramfs is written
-	@# SPARSE (`set_len` and nothing else), so a plain `du -sm` counts it at
-	@# about half, the FAT32 comes out short, and mcopy says "Disk full"
-	@# exactly when it copies BootX64.efi -- which goes last. The result is
-	@# an ISO with nothing to boot from, and on the guest console it reads
-	@# like a hung kernel. zCore/Makefile has had this fixed for a while
-	@# (with the note explaining why); these three copies of the same
-	@# calculation never got it. The `||` keeps non-GNU `du` (macOS) working.
-	@esp_mb=$$(du -sm --apparent-size "$(ESP_DIR)/EFI" 2>/dev/null | cut -f1 \
-		|| du -sm "$(ESP_DIR)/EFI" | cut -f1); esp_mb=$$((esp_mb + 96)); \
+	@# Why apparent size and not blocks, and why the measurement lives in a
+	@# script: scripts/esp-size-mb.sh says it, at length.
+	@esp_mb=$$(sh "$(CURDIR)/scripts/esp-size-mb.sh" "$(ESP_DIR)/EFI" 96); \
 		[ "$$esp_mb" -ge "$(ESP_IMG_SIZE_MB)" ] || esp_mb=$(ESP_IMG_SIZE_MB); \
 		echo "ESP: $$esp_mb MiB"; \
 		dd if=/dev/zero of="$(ESP_IMG)" bs=1M count=$$esp_mb status=none
@@ -395,6 +413,9 @@ endif
 img: image
 ifeq ($(ARCH), x86_64)
 	@mkdir -p "$(DIST_DIR)" "$(BUILD_DIR)"
+	@# Build the ESP for THIS variant instead of packaging whatever the last
+	@# zCore build left in a path that has no variant in it.
+	@$(MAKE) --no-print-directory esp-for-variant ARCH=$(ARCH) VARIANT=$(VARIANT)
 	@test -d "$(ESP_DIR)/EFI" || (echo "ESP no encontrado en $(ESP_DIR). ¿Has compilado zCore para x86_64?"; exit 1)
 	@command -v sgdisk >/dev/null || (echo "falta sgdisk (paquete: gdisk)"; exit 1)
 	@command -v mformat >/dev/null || (echo "falta mformat (paquete: mtools)"; exit 1)
@@ -403,16 +424,9 @@ ifeq ($(ARCH), x86_64)
 	@rm -f "$(ESP_DIR)/EFI/zCore/x86_64.img" "$(ESP_DIR)/EFI/zCore/aarch64.img" \
 		"$(ESP_DIR)/EFI/zCore/riscv64.img"
 	@rm -f "$(DISK_IMG)"
-	@# APPARENT size, not allocated blocks: the SFS initramfs is written
-	@# SPARSE (`set_len` and nothing else), so a plain `du -sm` counts it at
-	@# about half, the FAT32 comes out short, and mcopy says "Disk full"
-	@# exactly when it copies BootX64.efi -- which goes last. The result is
-	@# an ISO with nothing to boot from, and on the guest console it reads
-	@# like a hung kernel. zCore/Makefile has had this fixed for a while
-	@# (with the note explaining why); these three copies of the same
-	@# calculation never got it. The `||` keeps non-GNU `du` (macOS) working.
-	@esp_mb=$$(du -sm --apparent-size "$(ESP_DIR)/EFI" 2>/dev/null | cut -f1 \
-		|| du -sm "$(ESP_DIR)/EFI" | cut -f1); esp_mb=$$((esp_mb + 96)); \
+	@# Why apparent size and not blocks, and why the measurement lives in a
+	@# script: scripts/esp-size-mb.sh says it, at length.
+	@esp_mb=$$(sh "$(CURDIR)/scripts/esp-size-mb.sh" "$(ESP_DIR)/EFI" 96); \
 		[ "$$esp_mb" -ge "$(ESP_IMG_SIZE_MB)" ] || esp_mb=$(ESP_IMG_SIZE_MB); \
 		disk_mb=$$((esp_mb + 8)); \
 		echo "disk: $$disk_mb MiB (ESP $$esp_mb MiB)"; \
