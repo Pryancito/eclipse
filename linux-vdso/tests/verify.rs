@@ -489,23 +489,69 @@ fn the_generated_constants_say_what_the_kernel_reads() {
         data_size: 24,
         load_len: 4120,
     };
-    let src = build::meta_source(Some(&v), 4120);
+    let src = build::meta_source(Some(&v), 4120, None);
     for line in [
         "pub const AVAILABLE: bool = true;",
         "pub const DATA_OFFSET: usize = 4096;",
         "pub const DATA_SIZE: usize = 24;",
         "pub const IMAGE_LEN: usize = 4120;",
+        "pub const UNAVAILABLE_REASON: Option<&str> = None;",
     ] {
         assert!(src.contains(line), "falta {:?} en:\n{}", line, src);
     }
 }
 
+/// El motivo viaja al binario, no solo al `cargo:warning` que se va con el
+/// scroll. Sin el, `/proc/perf/kernel` solo podia adivinar, y adivinaba «no se
+/// encontro un cc utilizable» — que en aarch64 y riscv64 es falso y manda a
+/// buscar un compilador que nunca fue el problema.
+#[test]
+fn el_motivo_de_que_no_haya_imagen_llega_al_kernel() {
+    let none = build::meta_source(None, 0, Some("arquitectura objetivo \"aarch64\" sin vDSO"));
+    assert!(
+        none.contains(
+            "pub const UNAVAILABLE_REASON: Option<&str> = \
+             Some(\"arquitectura objetivo \\\"aarch64\\\" sin vDSO\");"
+        ),
+        "el motivo no llega, o llega sin escapar:\n{}",
+        none
+    );
+}
+
+/// Un motivo con comillas o barras dentro no puede romper el fichero generado:
+/// lo que sale tiene que seguir siendo Rust compilable.
+#[test]
+fn un_motivo_con_comillas_no_rompe_el_fichero_generado() {
+    for motivo in [
+        "\"cc\" no genera codigo x86_64",
+        "ruta C:\\cc\\bin rara",
+        "salto\nde linea",
+    ] {
+        let src = build::meta_source(None, 0, Some(motivo));
+        let linea = src
+            .lines()
+            .find(|l| l.contains("UNAVAILABLE_REASON"))
+            .expect("falta la linea del motivo");
+        assert!(
+            !linea.trim_end().trim_end_matches(';').ends_with('"') || linea.ends_with("\");"),
+            "la linea del motivo queda abierta: {}",
+            linea
+        );
+        assert!(
+            !src.contains(&format!("Some(\"{motivo}\")")),
+            "el motivo ha entrado sin escapar: {}",
+            src
+        );
+    }
+}
+
 /// There is one way to say "no image", and it carries no numbers to disagree
-/// with. The arm that writes it runs only on a host with no usable `cc`, which
-/// is precisely why it cannot be allowed to take an `available` flag of its own.
+/// with. The arm that writes it runs on a host with no usable `cc` and on every
+/// target that has no vDSO to build, which is precisely why it cannot be
+/// allowed to take an `available` flag of its own.
 #[test]
 fn saying_there_is_no_image_cannot_also_claim_one() {
-    let none = build::meta_source(None, 4120);
+    let none = build::meta_source(None, 4120, Some("sin cc"));
     assert!(none.contains("pub const AVAILABLE: bool = false;"));
     assert!(none.contains("pub const DATA_SIZE: usize = 0;"));
     assert!(none.contains("pub const DATA_OFFSET: usize = 0;"));
