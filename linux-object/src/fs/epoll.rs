@@ -4,6 +4,76 @@ use alloc::sync::Arc;
 use lock::Mutex;
 use zircon_object::object::*;
 
+/// How callers are actually using `epoll_wait(2)`, counted system-wide.
+///
+/// A box can be spending nearly all of its syscalls inside `epoll_pwait` for
+/// two completely different reasons, and the aggregate tables in
+/// `/proc/perf` cannot tell them apart: either userspace is passing a zero
+/// timeout in a loop (a poll-spin the application chose), or this kernel is
+/// handing back events that the caller does not consume and it comes
+/// straight back in (a readiness bug here). The counters below record the
+/// two inputs that separate those cases -- the timeout the caller asked for,
+/// and whether the return carried any events -- because neither is
+/// recoverable after the fact from a count of calls and an average duration.
+///
+/// Relaxed ordering throughout: these are diagnostic tallies, nothing
+/// branches on them, and a lost increment under contention costs a count out
+/// of hundreds of millions.
+pub mod stats {
+    use core::sync::atomic::{AtomicU64, Ordering::Relaxed};
+
+    /// Calls that asked for no wait at all (`timeout == 0`).
+    static CALLS_NONBLOCK: AtomicU64 = AtomicU64::new(0);
+    /// Calls that asked for a finite wait (`timeout > 0`).
+    static CALLS_TIMED: AtomicU64 = AtomicU64::new(0);
+    /// Calls that asked to wait indefinitely (`timeout < 0`).
+    static CALLS_FOREVER: AtomicU64 = AtomicU64::new(0);
+    /// Returns that carried no events, by timeout class.
+    static EMPTY_NONBLOCK: AtomicU64 = AtomicU64::new(0);
+    /// See [`EMPTY_NONBLOCK`].
+    static EMPTY_TIMED: AtomicU64 = AtomicU64::new(0);
+    /// Events delivered, summed over every return.
+    static EVENTS_DELIVERED: AtomicU64 = AtomicU64::new(0);
+
+    /// Classify one entry into `Epoll::wait` by the timeout it was given.
+    pub(super) fn entered(timeout_msecs: isize) {
+        match timeout_msecs {
+            0 => &CALLS_NONBLOCK,
+            n if n > 0 => &CALLS_TIMED,
+            _ => &CALLS_FOREVER,
+        }
+        .fetch_add(1, Relaxed);
+    }
+
+    /// Record one return of `Epoll::wait` carrying `events` events.
+    pub(super) fn returned(timeout_msecs: isize, events: usize) {
+        if events == 0 {
+            match timeout_msecs {
+                0 => EMPTY_NONBLOCK.fetch_add(1, Relaxed),
+                n if n > 0 => EMPTY_TIMED.fetch_add(1, Relaxed),
+                // A `timeout < 0` wait only returns empty on an error path,
+                // which does not come through here.
+                _ => 0,
+            };
+        } else {
+            EVENTS_DELIVERED.fetch_add(events as u64, Relaxed);
+        }
+    }
+
+    /// `(nonblock, timed, forever, empty_nonblock, empty_timed, events)`,
+    /// for `/proc/perf/kernel`.
+    pub fn snapshot() -> (u64, u64, u64, u64, u64, u64) {
+        (
+            CALLS_NONBLOCK.load(Relaxed),
+            CALLS_TIMED.load(Relaxed),
+            CALLS_FOREVER.load(Relaxed),
+            EMPTY_NONBLOCK.load(Relaxed),
+            EMPTY_TIMED.load(Relaxed),
+            EVENTS_DELIVERED.load(Relaxed),
+        )
+    }
+}
+
 /// Max nesting depth for one epoll watching another (mirrors Linux's
 /// `EP_MAX_NESTS`). Also bounds the cycle-detection walk in
 /// `Epoll::contains_epoll` itself, so a bug elsewhere that let a cycle slip
@@ -538,6 +608,9 @@ impl Epoll {
     /// wait for events on the interest list
     pub async fn wait(&self, maxevents: usize, timeout_msecs: isize) -> LxResult<Vec<EpollEvent>> {
         let begin_time = kernel_hal::timer::timer_now();
+        // Counted on entry, not per re-scan: one syscall is one wait, however
+        // many times the loop below goes round. See [`stats`].
+        stats::entered(timeout_msecs);
         loop {
             // Snapshot the interest list, keeping each watched file's OWN
             // `Arc<dyn FileLike>`. Two reasons this is the handle to poll,
@@ -624,12 +697,14 @@ impl Epoll {
             self.store_edges(&scanned_edges);
             if !events.is_empty() {
                 self.disarm_oneshot(&delivered);
+                stats::returned(timeout_msecs, events.len());
                 return Ok(events);
             }
 
             if timeout_msecs >= 0 {
                 let deadline = begin_time + core::time::Duration::from_millis(timeout_msecs as u64);
                 if kernel_hal::timer::timer_now() >= deadline {
+                    stats::returned(timeout_msecs, 0);
                     return Ok(Vec::new());
                 }
             }
@@ -691,6 +766,66 @@ impl Epoll {
             .await;
             drop(subs);
         }
+    }
+}
+
+#[cfg(test)]
+mod stats_tests {
+    //! The classification [`stats`] applies, which is the whole of what the
+    //! counters mean. The tallies themselves are process-global statics, so
+    //! these assert on deltas rather than absolute values -- the test binary
+    //! may run them in any order, and alongside the `Epoll::wait` tests.
+
+    use super::stats;
+
+    fn snap() -> (u64, u64, u64, u64, u64, u64) {
+        stats::snapshot()
+    }
+
+    /// `timeout == 0`, `> 0` and `< 0` are three different questions, and
+    /// which one a caller asked is the thing `/proc/perf` cannot recover
+    /// afterwards. Every negative value means "for ever", not just `-1`.
+    #[test]
+    fn an_entry_is_counted_against_its_timeout_class() {
+        let before = snap();
+        stats::entered(0);
+        stats::entered(5);
+        stats::entered(-1);
+        stats::entered(-2);
+        let after = snap();
+        assert_eq!(after.0 - before.0, 1, "nonblock");
+        assert_eq!(after.1 - before.1, 1, "timed");
+        assert_eq!(after.2 - before.2, 2, "forever");
+    }
+
+    /// An empty return is counted under the class that asked for it, and a
+    /// non-empty one adds to the delivered total instead -- the ratio of
+    /// those two is what says whether a caller is being handed readiness it
+    /// never consumes.
+    #[test]
+    fn a_return_is_counted_as_empty_or_as_events_delivered() {
+        let before = snap();
+        stats::returned(0, 0);
+        stats::returned(5, 0);
+        stats::returned(0, 3);
+        stats::returned(-1, 2);
+        let after = snap();
+        assert_eq!(after.3 - before.3, 1, "empty nonblock");
+        assert_eq!(after.4 - before.4, 1, "empty timed");
+        assert_eq!(after.5 - before.5, 5, "events delivered");
+    }
+
+    /// A `timeout < 0` wait cannot return empty through this path -- it only
+    /// leaves `Epoll::wait` with events or with an error -- so nothing is
+    /// counted for one, rather than being charged to the timed bucket.
+    #[test]
+    fn an_empty_forever_wait_lands_in_neither_empty_bucket() {
+        let before = snap();
+        stats::returned(-1, 0);
+        let after = snap();
+        assert_eq!(after.3, before.3);
+        assert_eq!(after.4, before.4);
+        assert_eq!(after.5, before.5);
     }
 }
 
