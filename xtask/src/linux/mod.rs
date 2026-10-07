@@ -1613,7 +1613,15 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
         // El apk del HOST, no el `bin/apk` del rootfs: ese es el estatico del
         // arco objetivo y en una compilacion cruzada no arranca. El arco
         // objetivo se le pasa aparte y viaja hasta el `--arch` de apk.
-        xorg::install(dir, &Self::apk_host(), self.0.name());
+        if apk_closure_fits_image(self.0.name()) {
+            xorg::install(dir, &Self::apk_host(), self.0.name());
+        } else {
+            println!(
+                "{}: sin el cierre de apk del escritorio (Mesa/Firefox/XFCE); no cabe en la \
+                 imagen de este arco, ver apk_closure_fits_image",
+                self.0.name()
+            );
+        }
         // Needs the firefox package on disk, i.e. after xorg::install.
         desktop::write_firefox_default_prefs(dir);
         desktop::write_firefox_desktop_override(dir);
@@ -4312,6 +4320,32 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
 }
 
 /// 为 PATH 环境变量附加路径。
+/// ¿Cabe el cierre de apk del escritorio en la imagen de ESTE arco?
+///
+/// El cierre (Xorg + Mesa/LLVM + Firefox + XFCE + fuentes) pesa cerca de un
+/// gigabyte instalado, y en todo lo que no es x86_64 la imagen que arranca
+/// QEMU **es el rootfs entero**: `image()` la dimensiona con
+/// `sfs_size_for(sfs_payload_bytes(rootfs))`, un 40% por encima del arbol.
+/// x86_64 no tiene ese problema porque fotografia un root minimo ANTES de
+/// copiar el escritorio y el cierre se va a `rootfs.btrfs.gz`.
+///
+/// Y de los dos que quedan, solo uno tiene un techo: `zCore/Makefile` le pasa
+/// la imagen de riscv64 **como `-initrd` con `-m 1G`**, asi que la imagen vive
+/// dentro de la RAM del invitado. Con el cierre dentro sale de 1,32 GiB y QEMU
+/// ni arranca -- dice «Some ROM regions are overlapping» y se va con estado 2,
+/// que es lo que le paso a `Linux Libc Test Baremetal (riscv64)` en cuanto el
+/// #1758 dejo de saltarse el paso por arco. aarch64 la monta por virtio-blk
+/// (`-drive file=aarch64.img`), fuera de la RAM, y ahi si cabe: su ISO de
+/// escritorio la necesita.
+///
+/// No es el corte por arco que quito el #1758: aquello se saltaba TODO lo que
+/// no fuera x86_64 -- y dejaba la desktop de aarch64 sin un solo paquete -- por
+/// no tener un apk que arrancase en el host. Esto es un techo de tamaño de un
+/// solo arco, con su motivo escrito.
+fn apk_closure_fits_image(arch: &str) -> bool {
+    arch != "riscv64"
+}
+
 fn join_path_env<I, S>(paths: I) -> OsString
 where
     I: IntoIterator<Item = S>,
@@ -7243,6 +7277,50 @@ mod rootfs_plumbing_tests {
         assert!(
             n >= 2,
             "the keys that were already there stopped being counted"
+        );
+    }
+}
+
+#[cfg(test)]
+mod apk_closure_tests {
+    use super::apk_closure_fits_image;
+
+    /// El arco que rompio: su imagen va de `-initrd` en un invitado de 1 GiB.
+    #[test]
+    fn riscv64_no_carga_el_cierre_de_apk() {
+        assert!(
+            !apk_closure_fits_image("riscv64"),
+            "la imagen de riscv64 la carga QEMU en la RAM del invitado (-initrd, -m 1G); \
+             con el cierre del escritorio dentro sale de 1,3 GiB y no arranca"
+        );
+    }
+
+    /// Y el que NO hay que volver a dejar sin paquetes: el #1758 existe por eso.
+    #[test]
+    fn aarch64_si_lo_carga() {
+        assert!(
+            apk_closure_fits_image("aarch64"),
+            "aarch64 monta su imagen por virtio-blk, fuera de la RAM, y su ISO de \
+             escritorio necesita el cierre: dejarla sin el es el bug que arreglo el #1758"
+        );
+    }
+
+    #[test]
+    fn x86_64_si_lo_carga() {
+        assert!(apk_closure_fits_image("x86_64"));
+    }
+
+    /// El techo es de UN arco, no «todo lo que no sea x86_64».
+    #[test]
+    fn no_es_un_corte_por_todo_lo_que_no_sea_x86() {
+        let fuera: Vec<&str> = ["x86_64", "aarch64", "riscv64"]
+            .into_iter()
+            .filter(|a| !apk_closure_fits_image(a))
+            .collect();
+        assert_eq!(
+            fuera,
+            vec!["riscv64"],
+            "solo riscv64 tiene techo de RAM; si aparece otro, que sea con su motivo escrito"
         );
     }
 }
