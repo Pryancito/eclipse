@@ -209,6 +209,28 @@ fn build_image(out_dir: &Path, image_path: &Path) -> Result<Vec<u8>, String> {
 /// beside the three numbers is a call site that can claim an image while handing
 /// over zeros for it -- and the arm that would get that wrong is the one no host
 /// with a working `cc` ever takes, so nothing would ever notice.
+/// The reason, collapsed onto one line.
+///
+/// The compiler-failure path builds its reason as `...:\n{stderr}`, and `cc`
+/// stderr runs to as many lines as it likes. That is right for the
+/// `cargo:warning`, which is read as a block, and wrong for the constant: the
+/// consumer is `vdso::status()`, whose contract is ONE line of
+/// `/proc/perf/kernel`. An embedded newline there turns the rest of the
+/// compiler's complaint into unlabelled rows of that file, and the klog message
+/// into several.
+///
+/// So the newlines become `; ` and nothing is dropped: the whole text still
+/// arrives, on one line. Collapses CR, LF and CRLF alike, and does not leave a
+/// trailing separator on stderr that ends with a newline, as most does.
+pub(crate) fn one_line(reason: &str) -> String {
+    reason
+        .split(['\n', '\r'])
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
 pub(crate) fn meta_source(
     verified: Option<&Verified>,
     len: usize,
@@ -224,7 +246,7 @@ pub(crate) fn meta_source(
     // sends whoever reads `/proc/perf/kernel` looking for a compiler that was
     // never the problem.
     let reason = match unavailable_reason {
-        Some(r) => format!("Some({:?})", r),
+        Some(r) => format!("Some({:?})", one_line(r)),
         None => "None".to_string(),
     };
     format!(

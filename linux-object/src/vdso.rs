@@ -282,6 +282,21 @@ fn publish_getcpu() {
 /// working and clock reads just stay expensive — so without this the only
 /// symptom of a broken vDSO is a benchmark number that did not move, which is
 /// indistinguishable from the feature not helping.
+/// La linea de estado cuando esta compilacion no trae imagen.
+///
+/// Aparte para que se pueda probar el motivo PROPAGADO, que es lo unico que
+/// este cambio aporta: el test de `status()` solo puede comprobar lo que esta
+/// maquina produce, asi que con la linea empotrada ahi dentro daba igual que
+/// dijera el motivo de la compilacion o el viejo «no encontro un cc
+/// utilizable», y el test pasaba de las dos maneras.
+fn sin_imagen(reason: Option<&str>) -> alloc::string::String {
+    use alloc::format;
+    match reason {
+        Some(r) => format!("sin imagen ({r})"),
+        None => "sin imagen (la compilacion no dijo por que)".into(),
+    }
+}
+
 pub fn status() -> alloc::string::String {
     use alloc::format;
     if !linux_vdso::AVAILABLE {
@@ -289,10 +304,7 @@ pub fn status() -> alloc::string::String {
         // «no encontro un cc utilizable», que es UNO de los motivos: en aarch64
         // y riscv64 no hay imagen porque el vDSO es codigo x86_64, y mandaba a
         // buscar un compilador que nunca fue el problema.
-        return match linux_vdso::UNAVAILABLE_REASON {
-            Some(r) => format!("sin imagen ({r})"),
-            None => "sin imagen (la compilacion no dijo por que)".into(),
-        };
+        return sin_imagen(linux_vdso::UNAVAILABLE_REASON);
     }
     let Some(vdso) = vdso() else {
         return "imagen presente pero no instalada (sin memoria fisica)".into();
@@ -748,5 +760,45 @@ mod tests {
     #[test]
     fn the_aux_vector_tag_is_the_one_linux_uses() {
         assert_eq!(AT_SYSINFO_EHDR, 33);
+    }
+
+    /// El motivo de la compilacion sale TAL CUAL en la linea de
+    /// `/proc/perf/kernel`: ni traducido, ni sustituido por una conjetura.
+    #[test]
+    fn el_motivo_de_la_compilacion_sale_en_la_linea_de_estado() {
+        let s = super::sin_imagen(Some("arquitectura objetivo \"aarch64\" sin vDSO"));
+        assert!(s.starts_with("sin imagen ("), "{:?}", s);
+        assert!(
+            s.contains("arquitectura objetivo \"aarch64\" sin vDSO"),
+            "el motivo de la compilacion tiene que llegar entero: {:?}",
+            s
+        );
+        assert!(
+            !s.contains("cc"),
+            "la linea vieja culpaba a un cc que en aarch64 no falta: {:?}",
+            s
+        );
+    }
+
+    /// Y cuando la compilacion no lo dijo, lo dice en vez de inventarlo.
+    #[test]
+    fn sin_motivo_lo_admite_en_vez_de_adivinar() {
+        let s = super::sin_imagen(None);
+        assert_eq!(s, "sin imagen (la compilacion no dijo por que)");
+    }
+
+    /// Una linea de `/proc/perf/kernel` es UNA linea. `one_line` en el
+    /// `build.rs` es quien lo garantiza; esto fija el contrato de este lado.
+    #[test]
+    fn la_linea_de_estado_es_una_sola_linea() {
+        for motivo in [linux_vdso::UNAVAILABLE_REASON, Some("a; b"), None] {
+            let s = super::sin_imagen(motivo);
+            assert_eq!(
+                s.lines().count(),
+                1,
+                "status() promete una linea y dio {:?}",
+                s
+            );
+        }
     }
 }
