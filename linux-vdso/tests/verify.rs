@@ -561,3 +561,44 @@ fn saying_there_is_no_image_cannot_also_claim_one() {
         none
     );
 }
+
+/// El motivo del `cc` llega en varias lineas (`...:\n{stderr}`), y el consumidor
+/// es una linea de `/proc/perf/kernel`. Con el salto dentro, el resto de la
+/// queja del compilador se convierte en filas sin etiqueta de ese fichero.
+#[test]
+fn el_motivo_multilinea_del_cc_sale_en_una_sola_linea() {
+    let stderr = "no usable cc:\nvdso.c:1:1: error: lo que sea\n  1 | #include <x>\n";
+    let generado = build::meta_source(None, 0, Some(stderr));
+    let linea = generado
+        .lines()
+        .find(|l| l.contains("UNAVAILABLE_REASON"))
+        .expect("la constante del motivo");
+    // Un literal de Rust escapa el salto, asi que el fichero generado compila
+    // igual; lo que hay que comprobar es que el VALOR no lo lleva.
+    assert!(
+        !linea.contains("\\n") && !linea.contains("\\r"),
+        "el valor sigue llevando saltos: {}",
+        linea
+    );
+    // Y no se pierde nada por el camino.
+    for trozo in ["no usable cc", "vdso.c:1:1", "lo que sea", "#include <x>"] {
+        assert!(
+            linea.contains(trozo),
+            "el motivo tiene que llegar entero, falta {:?}: {}",
+            trozo,
+            linea
+        );
+    }
+}
+
+/// `one_line` junta con `; `, y un stderr que acaba en salto -- casi todos --
+/// no deja un separador colgando al final.
+#[test]
+fn las_lineas_del_motivo_se_juntan_sin_separador_colgando() {
+    assert_eq!(build::one_line("una\ndos\n"), "una; dos");
+    assert_eq!(build::one_line("una\r\ndos"), "una; dos");
+    assert_eq!(build::one_line("sola"), "sola");
+    assert_eq!(build::one_line("\n\n"), "");
+    // Las lineas vacias de enmedio no dejan `; ; ` en la linea de estado.
+    assert_eq!(build::one_line("una\n\n\ndos"), "una; dos");
+}

@@ -550,7 +550,22 @@ jobs:
           sudo apt-get install -y qemu-system mtools dosfstools
           qemu-system-${{ matrix.arch }} --version
 
+      # Estos jobs prueban libc y busybox, no el escritorio, y fuera de x86_64
+      # la imagen que arranca QEMU es el rootfs ENTERO (`image()` la dimensiona
+      # con `sfs_size_for(sfs_payload_bytes(rootfs))`; x86_64 fotografia un root
+      # minimo antes y manda Mesa a `rootfs.btrfs.gz`). Desde que el #1758 dejo
+      # de saltarse `xorg::install` por arco, los 77 paquetes de
+      # Mesa/Firefox/XFCE entraban en esa imagen:
+      #   - riscv64 arranca con `-initrd ... -m 1G`, asi que a 1,32 GiB QEMU no
+      #     encendia la CPU («Some ROM regions are overlapping», estado 2);
+      #   - aarch64 si arranca (virtio-blk), pero `busybox du` recorre el arbol
+      #     entero y paso de 9 s a TIMEOUT.
+      # Apagarlo aqui devuelve a estos jobs el contenido que tenian antes del
+      # #1758 y les ahorra bajar el cierre. La variante desktop de verdad lo
+      # sigue llevando: la construye `make release`, no esto.
       - name: Prepare rootfs
+        env:
+          ECLIPSE_XORG: ${{ matrix.arch == 'x86_64' && 'on' || 'off' }}
         run: cargo libc-test --arch ${{ matrix.arch }} && cargo image --arch ${{ matrix.arch }}
 
       - name: Install cargo-binutils
@@ -605,7 +620,22 @@ jobs:
           sudo apt-get install -y qemu-system mtools dosfstools
           qemu-system-${{ matrix.arch }} --version
 
+      # Estos jobs prueban libc y busybox, no el escritorio, y fuera de x86_64
+      # la imagen que arranca QEMU es el rootfs ENTERO (`image()` la dimensiona
+      # con `sfs_size_for(sfs_payload_bytes(rootfs))`; x86_64 fotografia un root
+      # minimo antes y manda Mesa a `rootfs.btrfs.gz`). Desde que el #1758 dejo
+      # de saltarse `xorg::install` por arco, los 77 paquetes de
+      # Mesa/Firefox/XFCE entraban en esa imagen:
+      #   - riscv64 arranca con `-initrd ... -m 1G`, asi que a 1,32 GiB QEMU no
+      #     encendia la CPU («Some ROM regions are overlapping», estado 2);
+      #   - aarch64 si arranca (virtio-blk), pero `busybox du` recorre el arbol
+      #     entero y paso de 9 s a TIMEOUT.
+      # Apagarlo aqui devuelve a estos jobs el contenido que tenian antes del
+      # #1758 y les ahorra bajar el cierre. La variante desktop de verdad lo
+      # sigue llevando: la construye `make release`, no esto.
       - name: Prepare rootfs
+        env:
+          ECLIPSE_XORG: ${{ matrix.arch == 'x86_64' && 'on' || 'off' }}
         run: cargo other-test --arch ${{ matrix.arch }} && cargo image --arch ${{ matrix.arch }}
 
       - name: Install cargo-binutils
