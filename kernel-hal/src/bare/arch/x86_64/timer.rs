@@ -94,6 +94,17 @@ pub(super) fn tsc_hz_changed(hz: u64) {
         tsc_cal::mono_ns(cycle, tsc_base(cycle), mult),
         Ordering::Relaxed,
     );
+    // And tell userspace, because the multiplier it holds is now the wrong one.
+    // Today this is a no-op by boot order -- the vDSO is built at the first
+    // `exec`, long after the BSP recalibrates, so no observer is registered yet
+    // and the notification returns at once. It is here so that the invariant
+    // ("the kernel and the vDSO scale the counter with the same multiplier")
+    // holds by construction instead of by boot order: a recalibration that ever
+    // ran later would otherwise leave every process scaling the TSC at the old
+    // rate, i.e. two clocks on one machine drifting apart at a fixed
+    // percentage, which is what `clock-probe`'s `rate` and `offset` sections
+    // exist to catch and what nothing in the tree stops from happening.
+    crate::timer::notify_clock_changed();
 }
 
 /// This boot's time zero, latching `cycle` as it if nothing has latched one yet.
