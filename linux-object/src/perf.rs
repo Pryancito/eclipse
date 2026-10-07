@@ -599,6 +599,29 @@ pub fn kernel_report() -> String {
         cb_work_pct, weak_per_s, polls_per_s, user_pct, timer_per_s,
         if have_window { "" } else { " — lifetime" }
     );
+    // [diag] How `epoll_wait(2)` is being used, system-wide. Sits beside the
+    // busy attribution because an `epoll_pwait` that dominates the syscall
+    // table is ambiguous on its own: a huge `nonblock` count is userspace
+    // spinning with a zero timeout (nothing here can fix that), while a huge
+    // `events` count against few `read`s is this kernel reporting a readiness
+    // the caller cannot consume. The two look identical in `/proc/perf`.
+    let (ep_nb, ep_timed, ep_inf, ep_empty_nb, ep_empty_timed, ep_events) =
+        crate::fs::epoll_stats::snapshot();
+    if ep_nb | ep_timed | ep_inf != 0 {
+        let _ = writeln!(
+            out,
+            "epoll waits:  nonblock {} ({:.0}/s), timed {}, forever {}",
+            ep_nb,
+            rate(ep_nb),
+            ep_timed,
+            ep_inf
+        );
+        let _ = writeln!(
+            out,
+            "  (empty returns: {} of nonblock, {} of timed; {} events delivered)",
+            ep_empty_nb, ep_empty_timed, ep_events
+        );
+    }
     if off_sched_wedge && !all_halted && !nmi.is_empty() {
         // Distinct current RIPs across cores. A single shared value means every
         // wedged core is stuck at the same spin site (one lock / one loop);

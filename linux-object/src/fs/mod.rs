@@ -5,6 +5,8 @@ mod btrfs_mount;
 pub mod devfs;
 mod dmabuf;
 mod epoll;
+/// System-wide `epoll_wait(2)` usage counters, for `/proc/perf/kernel`.
+pub use epoll::stats as epoll_stats;
 mod eventfd;
 mod fat_mount;
 mod file;
