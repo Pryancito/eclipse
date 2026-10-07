@@ -569,6 +569,180 @@ cfg_if! {
             }
         }
 
+        /// Free blocks the front cache found written after their free, or
+        /// freed twice. See [`free_lists`].
+        static HEAP_WRITTEN_AFTER_FREE: core::sync::atomic::AtomicU32 =
+            core::sync::atomic::AtomicU32::new(0);
+
+        /// Broken free blocks caught so far. Like [`heap_wild_blocks`], a
+        /// diagnosis: each one is code that kept using memory it had freed.
+        pub fn heap_written_after_free() -> u32 {
+            HEAP_WRITTEN_AFTER_FREE.load(core::sync::atomic::Ordering::Relaxed)
+        }
+
+        /// The return addresses above `dealloc`, for the ring of frees.
+        ///
+        /// Frame pointers only, and only while each frame lies in the window
+        /// above this stack pointer and above the frame before it: a free must
+        /// never fault on a chain it is only recording. A coroutine starts with
+        /// `rbp = 0` and an entry from userspace leaves a user-half `rbp`
+        /// below every kernel frame, so either ends the walk.
+        #[cfg(not(feature = "mem-debug"))]
+        #[inline(always)]
+        fn caller_chain() -> [usize; free_ring::DEPTH] {
+            const WINDOW: usize = 64 * 1024;
+            let mut rets = [0; free_ring::DEPTH];
+            let (mut rbp, rsp): (usize, usize);
+            unsafe {
+                core::arch::asm!(
+                    "mov {}, rbp",
+                    "mov {}, rsp",
+                    out(reg) rbp,
+                    out(reg) rsp,
+                    options(nomem, nostack, preserves_flags),
+                )
+            };
+            for r in rets.iter_mut() {
+                if rbp < rsp || rbp - rsp > WINDOW - 16 || !rbp.is_multiple_of(8) {
+                    break;
+                }
+                *r = unsafe { core::ptr::read((rbp + 8) as *const usize) };
+                let next = unsafe { core::ptr::read(rbp as *const usize) };
+                if next <= rbp {
+                    break;
+                }
+                rbp = next;
+            }
+            rets
+        }
+
+        /// What a word found in a free block looks like, for the report.
+        #[cfg(not(feature = "mem-debug"))]
+        fn word_phrase(word: usize) -> &'static str {
+            let clock = kernel_hal::kaddr::clock_shape(
+                word as u64,
+                kernel_hal::deadline::duration_to_ns(kernel_hal::timer::timer_now()),
+            );
+            if clock != kernel_hal::kaddr::ClockShape::NotAClock {
+                return clock.as_str();
+            }
+            kernel_hal::kaddr::word_shape(word as u64).as_str()
+        }
+
+        /// Name the block the front cache refused, and the code that freed it.
+        ///
+        /// Nobody who wrote into a free block is on this stack: the write
+        /// happened some time after the free, and this is the next allocation
+        /// or free of that size, wherever it came from. What can be named is
+        /// the block, what was written into it, and -- from the ring of frees
+        /// -- the code that freed it. That code's object is the one still in
+        /// use somewhere after its free.
+        #[cfg(not(feature = "mem-debug"))]
+        #[cold]
+        #[inline(never)]
+        fn report_broken_free_block(broken: free_lists::Broken, size: usize) {
+            use core::sync::atomic::{AtomicU32, Ordering};
+            use free_lists::{Broken, LinkFault};
+            HEAP_WRITTEN_AFTER_FREE.fetch_add(1, Ordering::Relaxed);
+            static REPORTED: AtomicU32 = AtomicU32::new(0);
+            if REPORTED.fetch_add(1, Ordering::Relaxed) >= 8 {
+                return;
+            }
+            let block = broken.block();
+            match broken {
+                Broken::Tag { found, lost, .. } => emit(format_args!(
+                    "\n[heap-uaf] free {}-byte block {:#x} was WRITTEN AFTER ITS FREE: its \
+                     second word, the free mark, now holds {:#x} ({}). Leaked it and the {} \
+                     free block(s) behind it instead of handing them out.\n",
+                    size,
+                    block,
+                    found,
+                    word_phrase(found),
+                    lost,
+                )),
+                Broken::Link {
+                    link, lost, why, ..
+                } => {
+                    let what = match why {
+                        LinkFault::Outside => "which is no block of that size the heap owns",
+                        LinkFault::NotFree => {
+                            "a block of the heap that is not free: either this link was \
+                             overwritten with a pointer to a live block, or that block was \
+                             written after its own free"
+                        }
+                        LinkFault::Zeroed => "zero, with free blocks still counted behind it",
+                        LinkFault::PastEnd => "although it is the last free block of its size",
+                    };
+                    emit(format_args!(
+                        "\n[heap-uaf] free {}-byte block {:#x} was WRITTEN AFTER ITS FREE: its \
+                         link to the next free block is {:#x} ({}), {}. Leaked it and the {} \
+                         free block(s) behind it instead of following the link.\n",
+                        size,
+                        block,
+                        link,
+                        word_phrase(link),
+                        what,
+                        lost,
+                    ));
+                    if why == LinkFault::NotFree {
+                        report_freer(link);
+                    }
+                }
+                Broken::DoubleFree { .. } => emit(format_args!(
+                    "\n[heap-uaf] {}-byte block {:#x} FREED TWICE: it is already in the free \
+                     list, so it is not freed again. The second free is this call chain:\n",
+                    size, block,
+                )),
+            }
+            if let Broken::DoubleFree { .. } = broken {
+                let mut rbp: usize;
+                unsafe { core::arch::asm!("mov {}, rbp", out(reg) rbp) };
+                for _ in 0..16 {
+                    if !kernel_hal::kaddr::is_kernel_stack_qword(rbp as u64) {
+                        break;
+                    }
+                    let ret = unsafe { core::ptr::read_volatile((rbp + 8) as *const usize) };
+                    let next = unsafe { core::ptr::read_volatile(rbp as *const usize) };
+                    if ret == 0 {
+                        break;
+                    }
+                    emit(format_args!(
+                        "[heap-uaf]   ret={}\n",
+                        kernel_hal::ksyms::Addr(ret as u64)
+                    ));
+                    if next <= rbp {
+                        break;
+                    }
+                    rbp = next;
+                }
+            }
+            report_freer(block);
+        }
+
+        /// The last free of `block` the ring still holds.
+        #[cfg(not(feature = "mem-debug"))]
+        fn report_freer(block: usize) {
+            match slab::FREES.find(block) {
+                Some((rets, age)) => {
+                    emit(format_args!(
+                        "[heap-uaf] {:#x} was freed {} cached free(s) ago, by:\n",
+                        block, age,
+                    ));
+                    for ret in rets.iter().take_while(|r| **r != 0) {
+                        emit(format_args!(
+                            "[heap-uaf]   ret={}\n",
+                            kernel_hal::ksyms::Addr(*ret as u64)
+                        ));
+                    }
+                }
+                None => emit(format_args!(
+                    "[heap-uaf] {:#x}: its free is no longer in the ring of the last {} frees\n",
+                    block,
+                    slab::FREES.len(),
+                )),
+            }
+        }
+
         #[cold]
         #[inline(never)]
         fn report_heap_reentrancy(what: &str, sz: usize) {
@@ -1261,63 +1435,42 @@ cfg_if! {
         // cached class-`c` block satisfies the alignment of *any* allocation that
         // maps to class `c` — blocks in a class are freely interchangeable.
         //
+        // The lists themselves are `free_lists`, which checks every link and
+        // free mark before trusting it; this module is the lock around them.
+        //
         // Only enabled in the default build. `mem-debug` wants real buddy
         // round-trips for its canary/poison forensics, so it bypasses the cache.
         #[cfg(not(feature = "mem-debug"))]
         mod slab {
-            use super::Mutex;
+            use super::{
+                free_lists::{self, SlabCache},
+                free_ring, heap_regions, Mutex,
+            };
             use core::alloc::Layout;
-
-            // Cache buddy classes 2^3 (8 B, the buddy minimum) .. 2^12 (4 KiB).
-            // That covers every hot fork object and the general small-allocation
-            // churn; larger buffers (I/O, 1 MiB readahead) churn rarely and would
-            // pin too much idle RAM, so they go straight to the buddy.
-            const MIN_CLASS: usize = 3; // 2^3 = 8 B
-            const MAX_CLASS: usize = 12; // 2^12 = 4 KiB
-            const NUM_CLASSES: usize = MAX_CLASS - MIN_CLASS + 1;
-            // Per-class cap. Worst case is the top class: 4 KiB * 1024 = 4 MiB;
-            // the full table pins ≈8 MiB out of a 512 MiB heap. Bounding it keeps
-            // the buddy from starving of large contiguous blocks and stops idle
-            // RAM accumulating in the cache. A freed block past the cap is handed
-            // to the buddy (where its buddy may coalesce) instead of cached.
-            const CAP: u32 = 1024;
-
-            pub struct SlabCache {
-                // head[i]: first free block of class MIN_CLASS+i (0 = empty). The
-                // block's first word holds the next pointer while it is cached.
-                head: [usize; NUM_CLASSES],
-                count: [u32; NUM_CLASSES],
-            }
-
-            impl SlabCache {
-                const fn new() -> Self {
-                    SlabCache {
-                        head: [0; NUM_CLASSES],
-                        count: [0; NUM_CLASSES],
-                    }
-                }
-            }
 
             static SLAB: Mutex<SlabCache> = Mutex::new(SlabCache::new());
 
-            /// Cache-array index for `layout`, or `None` when it is larger than
-            /// the top cached class. The class formula matches
-            /// buddy_system_allocator exactly, so a cached block is byte-for-byte
-            /// what the buddy would have handed out.
-            #[inline]
-            fn cache_slot(layout: Layout) -> Option<usize> {
-                // Guard before `next_power_of_two` so an oversize request can
-                // never overflow it (and matches the buddy's own bypass of the
-                // cache for large blocks).
-                if layout.size() > (1 << MAX_CLASS) || layout.align() > (1 << MAX_CLASS) {
-                    return None;
-                }
-                let size = core::cmp::max(
-                    layout.size().next_power_of_two(),
-                    core::cmp::max(layout.align(), core::mem::size_of::<usize>()),
-                );
-                // size ∈ [8, 4096] given the guard, so class ∈ [3, 12].
-                Some(size.trailing_zeros() as usize - MIN_CLASS)
+            /// Who freed each cached block, newest last. See [`free_ring`].
+            pub static FREES: free_ring::FreeRing<4096> = free_ring::FreeRing::new();
+
+            /// Whether a link may be followed: a block of `size` bytes, aligned
+            /// to it, inside the heap. Before `init`, or once the registry has
+            /// lost track of a growth, [`heap_regions::check`] has no opinion
+            /// and only the alignment is left: an aligned wild link is then
+            /// followed, as every link used to be.
+            fn owns(addr: usize, size: usize) -> bool {
+                heap_regions::check(addr, size, size).is_none()
+            }
+
+            /// What [`try_free`] did with a block.
+            pub enum Freed {
+                /// In the cache.
+                Cached,
+                /// The caller must hand it to the buddy.
+                ToBuddy,
+                /// Already free: reported and not freed again. The caller must
+                /// not count it either -- its first free already did.
+                Refused,
             }
 
             /// Serve `layout` from the front cache, or null on a miss. A pure
@@ -1329,44 +1482,54 @@ cfg_if! {
             /// rather than spinning forever on a lock they already own.
             #[inline]
             pub fn try_alloc(layout: Layout) -> *mut u8 {
-                let Some(i) = cache_slot(layout) else {
+                let Some(i) = free_lists::cache_slot(layout) else {
                     return core::ptr::null_mut();
                 };
                 let Some(mut c) = SLAB.try_lock() else {
                     return core::ptr::null_mut();
                 };
-                let head = c.head[i];
-                if head == 0 {
-                    return core::ptr::null_mut();
+                match unsafe { c.pop(i, owns) } {
+                    Ok(Some(block)) => block as *mut u8,
+                    Ok(None) => core::ptr::null_mut(),
+                    Err(broken) => {
+                        // Off the lock first: the report formats, and whatever
+                        // it allocates must find the cache usable.
+                        drop(c);
+                        super::report_broken_free_block(broken, free_lists::class_size(i));
+                        core::ptr::null_mut()
+                    }
                 }
-                // Pop: the block's first word is the next pointer.
-                c.head[i] = unsafe { core::ptr::read(head as *const usize) };
-                c.count[i] -= 1;
-                head as *mut u8
             }
 
-            /// Return a freed block to the front cache. `false` means the class is
-            /// out of range, the cache is full, or the lock is already held on
-            /// this CPU — in all cases the caller must hand the block to the buddy.
+            /// Return a freed block to the front cache, leaving `rets` in
+            /// [`FREES`] when it is cached. `ToBuddy` means the class is out of
+            /// range, the cache is full, or the lock is already held -- in all
+            /// cases the caller must hand the block to the buddy.
             ///
             /// Uses `try_lock` instead of `lock` for the same re-entrancy safety
             /// reason as `try_alloc`.
             #[inline]
-            pub fn try_free(ptr: *mut u8, layout: Layout) -> bool {
-                let Some(i) = cache_slot(layout) else {
-                    return false;
+            pub fn try_free(ptr: *mut u8, layout: Layout, rets: [usize; free_ring::DEPTH]) -> Freed {
+                let Some(i) = free_lists::cache_slot(layout) else {
+                    return Freed::ToBuddy;
                 };
                 let Some(mut c) = SLAB.try_lock() else {
-                    return false;
+                    return Freed::ToBuddy;
                 };
-                if c.count[i] >= CAP {
-                    return false;
+                match unsafe { c.push(i, ptr as usize) } {
+                    Ok(true) => {
+                        // Under the lock: nothing can pop the block, write into
+                        // it and be caught before its freer is on record.
+                        FREES.note(ptr as usize, rets);
+                        Freed::Cached
+                    }
+                    Ok(false) => Freed::ToBuddy,
+                    Err(broken) => {
+                        drop(c);
+                        super::report_broken_free_block(broken, free_lists::class_size(i));
+                        Freed::Refused
+                    }
                 }
-                // Push: stash the old head in the block's first word.
-                unsafe { core::ptr::write(ptr as *mut usize, c.head[i]) };
-                c.head[i] = ptr as usize;
-                c.count[i] += 1;
-                true
             }
         }
 
@@ -1488,6 +1651,21 @@ cfg_if! {
                     report_wild_block("dealloc", fault, ptr as usize, sz, layout.align());
                     return;
                 }
+                let ext = Layout::from_size_align_unchecked(sz + REDZONE, layout.align());
+                // The front cache absorbs the free in O(1); only an
+                // out-of-range size or a cap-overflow reaches the buddy
+                // (default build only). Asked before anything counts this
+                // free: a block the cache finds already free was counted by
+                // its first free, and counting it again would lie about the
+                // heap in every report that reads these counters.
+                #[cfg(not(feature = "mem-debug"))]
+                let to_buddy = match slab::try_free(ptr, ext, caller_chain()) {
+                    slab::Freed::Cached => false,
+                    slab::Freed::ToBuddy => true,
+                    slab::Freed::Refused => return,
+                };
+                #[cfg(feature = "mem-debug")]
+                let to_buddy = true;
                 hot_track(sz, -1);
                 #[cfg(feature = "mem-debug")]
                 {
@@ -1513,13 +1691,6 @@ cfg_if! {
                 if sz >= BIG_ALLOC_MIN {
                     untrack_big_alloc(ptr as usize);
                 }
-                let ext = Layout::from_size_align_unchecked(sz + REDZONE, layout.align());
-                // Front cache absorbs the free in O(1); only an out-of-range size
-                // or a cap-overflow reaches the buddy (default build only).
-                #[cfg(not(feature = "mem-debug"))]
-                let to_buddy = !slab::try_free(ptr, ext);
-                #[cfg(feature = "mem-debug")]
-                let to_buddy = true;
                 if to_buddy {
                     // Same refusal as `alloc`, with the only outcome a free can
                     // have: the block is leaked. A leaked block is recoverable
@@ -2064,6 +2235,343 @@ pub mod heap_regions {
     }
 }
 
+/// The front cache's free lists, kept apart from the lock and the statics so
+/// the host can test them over an ordinary buffer.
+///
+/// A cached block's first word is the link to the next free block of its
+/// class, and nothing used to look at it: `pop` read the word and made it the
+/// new head. So a single write into a freed block -- a stale pointer, a double
+/// free, an object freed while something still held it -- became, one
+/// allocation later, an allocation AT whatever value had been written, and
+/// the next owner of that class wrote its fields through it, on some other
+/// CPU, in code that had done nothing wrong. That is the shape of what the
+/// captures keep showing after the direction flag was fixed: a
+/// `BTreeMap<usize, PageState>` writing through a clock value, a buddy walk
+/// faulting on `0x6cffffff47`, a `TaskCollection` whose `Vec` length is a
+/// heap pointer. One bad write, and every report blamed whoever came next.
+///
+/// So the lists stop trusting their own words:
+///
+/// * `push` writes [`tag_of`] into the second word of every block of 16 bytes
+///   or more, and `pop` refuses a block whose mark is gone;
+/// * `pop` refuses a link that is not a free block of this class the heap
+///   owns, a zero with blocks still counted behind it, and a link out of the
+///   last block;
+/// * `push` refuses a block that already carries its mark, or is already the
+///   head: freed twice. Pushing it again would put it in the list twice and
+///   hand it to two owners.
+///
+/// A refused block is leaked with the rest of its list, never handed out:
+/// whoever wrote into it may still hold it, nothing behind it can be reached
+/// without trusting the word that was just caught, and a leak is bytes where
+/// the alternative is the machine. The refusal is reported at the block, so
+/// the report names the block that was written after its free instead of the
+/// code that allocated it next.
+#[cfg_attr(feature = "libos", allow(dead_code))]
+pub mod free_lists {
+    use core::alloc::Layout;
+
+    // Cache buddy classes 2^3 (8 B, the buddy minimum) .. 2^12 (4 KiB).
+    // That covers every hot fork object and the general small-allocation
+    // churn; larger buffers (I/O, 1 MiB readahead) churn rarely and would
+    // pin too much idle RAM, so they go straight to the buddy.
+    pub const MIN_CLASS: usize = 3; // 2^3 = 8 B
+    pub const MAX_CLASS: usize = 12; // 2^12 = 4 KiB
+    pub const NUM_CLASSES: usize = MAX_CLASS - MIN_CLASS + 1;
+    // Per-class cap. Worst case is the top class: 4 KiB * 1024 = 4 MiB;
+    // the full table pins ≈8 MiB out of a 512 MiB heap. Bounding it keeps
+    // the buddy from starving of large contiguous blocks and stops idle
+    // RAM accumulating in the cache. A freed block past the cap is handed
+    // to the buddy (where its buddy may coalesce) instead of cached.
+    pub const CAP: u32 = 1024;
+
+    /// What a free block of the cache holds in its second word. Mixed with
+    /// the block's own address, so a value copied out of one free block into
+    /// another live object can never pass for the tag of the second.
+    const FREE_TAG: usize = 0x5a1b_f4ee_b10c_c0de;
+
+    pub fn tag_of(block: usize) -> usize {
+        FREE_TAG ^ block
+    }
+
+    /// Bytes in a block of class `i`.
+    pub const fn class_size(i: usize) -> usize {
+        1 << (i + MIN_CLASS)
+    }
+
+    /// Cache-array index for `layout`, or `None` when it is larger than
+    /// the top cached class. The class formula matches
+    /// buddy_system_allocator exactly, so a cached block is byte-for-byte
+    /// what the buddy would have handed out.
+    #[inline]
+    pub fn cache_slot(layout: Layout) -> Option<usize> {
+        // Guard before `next_power_of_two` so an oversize request can
+        // never overflow it (and matches the buddy's own bypass of the
+        // cache for large blocks).
+        if layout.size() > (1 << MAX_CLASS) || layout.align() > (1 << MAX_CLASS) {
+            return None;
+        }
+        let size = core::cmp::max(
+            layout.size().next_power_of_two(),
+            core::cmp::max(layout.align(), core::mem::size_of::<usize>()),
+        );
+        // size ∈ [8, 4096] given the guard, so class ∈ [3, 12].
+        Some(size.trailing_zeros() as usize - MIN_CLASS)
+    }
+
+    /// What was wrong with a free block's link.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum LinkFault {
+        /// Not a block of this class the heap owns.
+        Outside,
+        /// A block of the heap's, but one that does not carry the free mark.
+        NotFree,
+        /// Zero, with more free blocks still counted behind it.
+        Zeroed,
+        /// Non-zero, from the last free block of its class.
+        PastEnd,
+    }
+
+    /// A block the cache refused, and what was found in it.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum Broken {
+        /// `block`'s link to the next free block is `link`, which is wrong in
+        /// the way `why` says: something wrote over the block's first word
+        /// after it was freed. `lost` more blocks were behind it.
+        Link {
+            block: usize,
+            link: usize,
+            lost: u32,
+            why: LinkFault,
+        },
+        /// `block`'s second word holds `found` instead of its free mark:
+        /// something wrote into the block after it was freed. `lost` more
+        /// blocks were behind it.
+        Tag {
+            block: usize,
+            found: usize,
+            lost: u32,
+        },
+        /// `block` was freed while already free.
+        DoubleFree { block: usize },
+    }
+
+    impl Broken {
+        pub fn block(self) -> usize {
+            match self {
+                Broken::Link { block, .. }
+                | Broken::Tag { block, .. }
+                | Broken::DoubleFree { block } => block,
+            }
+        }
+    }
+
+    pub struct SlabCache {
+        // head[i]: first free block of class MIN_CLASS+i (0 = empty). The
+        // block's first word holds the next pointer while it is cached.
+        head: [usize; NUM_CLASSES],
+        count: [u32; NUM_CLASSES],
+    }
+
+    impl SlabCache {
+        pub const fn new() -> Self {
+            SlabCache {
+                head: [0; NUM_CLASSES],
+                count: [0; NUM_CLASSES],
+            }
+        }
+
+        /// Blocks cached in class `i`.
+        #[cfg(test)]
+        pub fn count(&self, i: usize) -> u32 {
+            self.count[i]
+        }
+
+        /// Take a block of class `i`; `Ok(None)` when the class is empty.
+        ///
+        /// `owns(addr, size)` answers whether `[addr, addr + size)` is a block
+        /// of the heap's, aligned to `size`.
+        ///
+        /// # Safety
+        /// Every block in the lists must have been given to [`push`] and be
+        /// memory this cache may read and write.
+        pub unsafe fn pop(
+            &mut self,
+            i: usize,
+            owns: impl Fn(usize, usize) -> bool,
+        ) -> Result<Option<usize>, Broken> {
+            let block = self.head[i];
+            if block == 0 {
+                return Ok(None);
+            }
+            let size = class_size(i);
+            let word = core::mem::size_of::<usize>();
+            let tagged = size >= 2 * word;
+            // Whatever is refused below, the rest of the list goes with it:
+            // nothing behind this block can be reached without trusting a
+            // word that was just shown to have been written by someone else.
+            let lost = self.count[i].saturating_sub(1);
+            if tagged {
+                let found = unsafe { core::ptr::read((block + word) as *const usize) };
+                if found != tag_of(block) {
+                    self.drop_class(i);
+                    return Err(Broken::Tag { block, found, lost });
+                }
+            }
+            let link = unsafe { core::ptr::read(block as *const usize) };
+            let why = if link == 0 {
+                (lost > 0).then_some(LinkFault::Zeroed)
+            } else if !owns(link, size) {
+                Some(LinkFault::Outside)
+            } else if tagged
+                // A link that lands on a block of the heap's can still be
+                // wrong -- a heap pointer is exactly what a stale owner
+                // stores -- so the block it names must be free as well.
+                && unsafe { core::ptr::read((link + word) as *const usize) } != tag_of(link)
+            {
+                Some(LinkFault::NotFree)
+            } else if lost == 0 {
+                Some(LinkFault::PastEnd)
+            } else {
+                None
+            };
+            if let Some(why) = why {
+                self.drop_class(i);
+                return Err(Broken::Link {
+                    block,
+                    link,
+                    lost,
+                    why,
+                });
+            }
+            if tagged {
+                // A live block must not carry the mark: `push` reads it as
+                // "already free".
+                unsafe { core::ptr::write((block + word) as *mut usize, 0) };
+            }
+            self.head[i] = link;
+            self.count[i] -= 1;
+            Ok(Some(block))
+        }
+
+        /// Forget class `i`'s list, leaking every block in it.
+        fn drop_class(&mut self, i: usize) {
+            self.head[i] = 0;
+            self.count[i] = 0;
+        }
+
+        /// Cache a freed block of class `i`. `Ok(false)` means the class is
+        /// full and the caller must hand the block to the buddy.
+        ///
+        /// # Safety
+        /// `block` must be a block of class `i` that the caller is freeing.
+        pub unsafe fn push(&mut self, i: usize, block: usize) -> Result<bool, Broken> {
+            let size = class_size(i);
+            let tagged = size >= 2 * core::mem::size_of::<usize>();
+            let tag = (block + core::mem::size_of::<usize>()) as *mut usize;
+            if block == self.head[i] || (tagged && unsafe { core::ptr::read(tag) } == tag_of(block))
+            {
+                return Err(Broken::DoubleFree { block });
+            }
+            if self.count[i] >= CAP {
+                return Ok(false);
+            }
+            // Push: stash the old head in the block's first word.
+            unsafe { core::ptr::write(block as *mut usize, self.head[i]) };
+            if tagged {
+                unsafe { core::ptr::write(tag, tag_of(block)) };
+            }
+            self.head[i] = block;
+            self.count[i] += 1;
+            Ok(true)
+        }
+    }
+}
+
+/// Who freed a block, for the report that finds it written after the free.
+///
+/// The heap cannot see the write itself; it sees the damage when the block
+/// comes round again, and by then the code that freed it is long gone from
+/// every stack. So every free leaves its caller's return addresses here, and
+/// the report looks the block up. A ring: old entries are overwritten, which
+/// a report says rather than naming somebody else.
+#[cfg_attr(feature = "libos", allow(dead_code))]
+pub mod free_ring {
+    use core::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Return addresses kept per free.
+    pub const DEPTH: usize = 6;
+
+    struct Slot {
+        block: AtomicUsize,
+        rets: [AtomicUsize; DEPTH],
+    }
+
+    impl Slot {
+        const fn new() -> Self {
+            Slot {
+                block: AtomicUsize::new(0),
+                rets: [const { AtomicUsize::new(0) }; DEPTH],
+            }
+        }
+    }
+
+    pub struct FreeRing<const N: usize> {
+        next: AtomicUsize,
+        slots: [Slot; N],
+    }
+
+    impl<const N: usize> FreeRing<N> {
+        pub const fn new() -> Self {
+            FreeRing {
+                next: AtomicUsize::new(0),
+                slots: [const { Slot::new() }; N],
+            }
+        }
+
+        /// Frees the ring remembers.
+        pub const fn len(&self) -> usize {
+            N
+        }
+
+        /// Record that `block` was freed from `rets`.
+        pub fn note(&self, block: usize, rets: [usize; DEPTH]) {
+            let n = self.next.fetch_add(1, Ordering::Relaxed);
+            let slot = &self.slots[n % N];
+            // Unpublish, fill, publish: a reader that sees `block` before and
+            // after reading the addresses read this free's addresses.
+            slot.block.store(0, Ordering::Release);
+            for (r, v) in slot.rets.iter().zip(rets) {
+                r.store(v, Ordering::Relaxed);
+            }
+            slot.block.store(block, Ordering::Release);
+        }
+
+        /// The latest free of `block` still in the ring: its return addresses,
+        /// and how many frees anywhere in the heap came after it.
+        pub fn find(&self, block: usize) -> Option<([usize; DEPTH], usize)> {
+            if block == 0 {
+                return None;
+            }
+            let newest = self.next.load(Ordering::Relaxed);
+            for age in 0..N.min(newest) {
+                let slot = &self.slots[(newest - 1 - age) % N];
+                if slot.block.load(Ordering::Acquire) != block {
+                    continue;
+                }
+                let mut rets = [0; DEPTH];
+                for (v, r) in rets.iter_mut().zip(&slot.rets) {
+                    *v = r.load(Ordering::Relaxed);
+                }
+                if slot.block.load(Ordering::Acquire) == block {
+                    return Some((rets, age));
+                }
+            }
+            None
+        }
+    }
+}
+
 #[cfg(test)]
 mod heap_region_tests {
     //! A wild `dealloc` is not a failed free: the buddy's lists are intrusive,
@@ -2273,5 +2781,381 @@ mod heap_region_tests {
         heap_regions::register(0x1000, 0x1000);
         heap_regions::register(0x2000, 0x1000);
         assert_eq!(heap_regions::registered(), 0);
+    }
+}
+
+#[cfg(test)]
+mod free_list_tests {
+    //! The front cache's lists used to follow whatever a freed block's first
+    //! word said. These tests write into freed blocks the way a stale owner
+    //! does -- a clock value, a small integer, a pointer to a live block, a
+    //! zero -- and require that the cache names the block and never hands out
+    //! anything it was not given.
+
+    use super::free_lists::{class_size, tag_of, Broken, LinkFault, SlabCache, CAP};
+    use super::free_ring::{FreeRing, DEPTH};
+    use std::alloc::Layout;
+
+    /// 64-byte blocks: a tagged class.
+    const C64: usize = 3;
+    /// 8-byte blocks: one word, no room for the free mark.
+    const C8: usize = 0;
+
+    /// Real memory for the lists to write their links and marks into.
+    struct Arena {
+        base: usize,
+        layout: Layout,
+    }
+
+    impl Arena {
+        fn new(len: usize) -> Self {
+            let layout = Layout::from_size_align(len, 4096).unwrap();
+            let base = unsafe { std::alloc::alloc_zeroed(layout) } as usize;
+            assert_ne!(base, 0);
+            Arena { base, layout }
+        }
+
+        /// The `n`th block of class `i`.
+        fn block(&self, i: usize, n: usize) -> usize {
+            assert!((n + 1) * class_size(i) <= self.layout.size());
+            self.base + n * class_size(i)
+        }
+
+        fn owns(&self) -> impl Fn(usize, usize) -> bool + '_ {
+            move |addr, size| {
+                addr >= self.base
+                    && addr + size <= self.base + self.layout.size()
+                    && addr.is_multiple_of(size)
+            }
+        }
+
+        fn write(&self, addr: usize, value: usize) {
+            assert!(addr >= self.base && addr + 8 <= self.base + self.layout.size());
+            unsafe { core::ptr::write(addr as *mut usize, value) }
+        }
+
+        fn read(&self, addr: usize) -> usize {
+            assert!(addr >= self.base && addr + 8 <= self.base + self.layout.size());
+            unsafe { core::ptr::read(addr as *const usize) }
+        }
+    }
+
+    impl Drop for Arena {
+        fn drop(&mut self) {
+            unsafe { std::alloc::dealloc(self.base as *mut u8, self.layout) }
+        }
+    }
+
+    /// The word the ninth capture found where a `BTreeMap` node pointer
+    /// belonged: an instant, not an address.
+    const CLOCK: usize = 0x0000_0012_a05f_2000;
+
+    #[test]
+    fn blocks_come_back_last_in_first_out_without_their_mark() {
+        let arena = Arena::new(4096);
+        let mut c = SlabCache::new();
+        let (a, b, d) = (
+            arena.block(C64, 0),
+            arena.block(C64, 1),
+            arena.block(C64, 2),
+        );
+        for x in [a, b, d] {
+            assert_eq!(unsafe { c.push(C64, x) }, Ok(true));
+        }
+        assert_eq!(c.count(C64), 3);
+        for x in [d, b, a] {
+            assert_eq!(unsafe { c.pop(C64, arena.owns()) }, Ok(Some(x)));
+            // A live block carrying the mark would read as "already free" to
+            // the next `push` of it.
+            assert_eq!(arena.read(x + 8), 0);
+        }
+        assert_eq!(unsafe { c.pop(C64, arena.owns()) }, Ok(None));
+        assert_eq!(c.count(C64), 0);
+    }
+
+    /// The ninth capture's shape: a clock value where a free block's link
+    /// was. The block that holds it is named, and the clock value is never
+    /// handed out as an allocation.
+    #[test]
+    fn a_link_overwritten_with_a_clock_value_is_caught_at_that_block() {
+        let arena = Arena::new(4096);
+        let mut c = SlabCache::new();
+        let (a, b, d) = (
+            arena.block(C64, 0),
+            arena.block(C64, 1),
+            arena.block(C64, 2),
+        );
+        for x in [a, b, d] {
+            unsafe { c.push(C64, x) }.unwrap();
+        }
+        arena.write(b, CLOCK);
+        assert_eq!(unsafe { c.pop(C64, arena.owns()) }, Ok(Some(d)));
+        assert_eq!(
+            unsafe { c.pop(C64, arena.owns()) },
+            Err(Broken::Link {
+                block: b,
+                link: CLOCK,
+                lost: 1,
+                why: LinkFault::Outside,
+            })
+        );
+        // The rest of the list is gone, not followed.
+        assert_eq!(c.count(C64), 0);
+        assert_eq!(unsafe { c.pop(C64, arena.owns()) }, Ok(None));
+    }
+
+    /// A heap pointer is exactly what a stale owner stores, and it passes
+    /// every address test. The block it names is live, so it has no mark.
+    #[test]
+    fn a_link_overwritten_with_a_live_block_is_caught() {
+        let arena = Arena::new(4096);
+        let mut c = SlabCache::new();
+        let (a, b, live) = (
+            arena.block(C64, 0),
+            arena.block(C64, 1),
+            arena.block(C64, 5),
+        );
+        for x in [a, b] {
+            unsafe { c.push(C64, x) }.unwrap();
+        }
+        arena.write(b, live);
+        assert_eq!(
+            unsafe { c.pop(C64, arena.owns()) },
+            Err(Broken::Link {
+                block: b,
+                link: live,
+                lost: 1,
+                why: LinkFault::NotFree,
+            })
+        );
+    }
+
+    /// A write that misses the link lands on the mark.
+    #[test]
+    fn a_write_over_the_free_mark_is_caught() {
+        let arena = Arena::new(4096);
+        let mut c = SlabCache::new();
+        let (a, b) = (arena.block(C64, 0), arena.block(C64, 1));
+        for x in [a, b] {
+            unsafe { c.push(C64, x) }.unwrap();
+        }
+        arena.write(b + 8, 0x71);
+        assert_eq!(
+            unsafe { c.pop(C64, arena.owns()) },
+            Err(Broken::Tag {
+                block: b,
+                found: 0x71,
+                lost: 1,
+            })
+        );
+    }
+
+    /// Zero is a valid link only from the last block. Anywhere else it is the
+    /// zero-writer this hunt began with, and it would have leaked the rest of
+    /// the list without a word.
+    #[test]
+    fn a_zeroed_link_with_blocks_behind_it_is_caught() {
+        let arena = Arena::new(4096);
+        let mut c = SlabCache::new();
+        let (a, b) = (arena.block(C64, 0), arena.block(C64, 1));
+        for x in [a, b] {
+            unsafe { c.push(C64, x) }.unwrap();
+        }
+        arena.write(b, 0);
+        assert_eq!(
+            unsafe { c.pop(C64, arena.owns()) },
+            Err(Broken::Link {
+                block: b,
+                link: 0,
+                lost: 1,
+                why: LinkFault::Zeroed,
+            })
+        );
+    }
+
+    /// One-word blocks have no mark, so a link to another block of the heap
+    /// passes the address test -- but not out of the last block.
+    #[test]
+    fn a_link_out_of_the_last_block_is_caught() {
+        let arena = Arena::new(4096);
+        let mut c = SlabCache::new();
+        let (a, other) = (arena.block(C8, 0), arena.block(C8, 9));
+        unsafe { c.push(C8, a) }.unwrap();
+        arena.write(a, other);
+        assert_eq!(
+            unsafe { c.pop(C8, arena.owns()) },
+            Err(Broken::Link {
+                block: a,
+                link: other,
+                lost: 0,
+                why: LinkFault::PastEnd,
+            })
+        );
+    }
+
+    /// Before: the second free put the block in the list twice, and two
+    /// allocations later two owners shared it.
+    #[test]
+    fn a_block_freed_twice_is_refused_and_the_list_stays_sound() {
+        let arena = Arena::new(4096);
+        let mut c = SlabCache::new();
+        let (a, b) = (arena.block(C64, 0), arena.block(C64, 1));
+        for x in [a, b] {
+            unsafe { c.push(C64, x) }.unwrap();
+        }
+        assert_eq!(
+            unsafe { c.push(C64, a) },
+            Err(Broken::DoubleFree { block: a })
+        );
+        assert_eq!(c.count(C64), 2);
+        assert_eq!(unsafe { c.pop(C64, arena.owns()) }, Ok(Some(b)));
+        assert_eq!(unsafe { c.pop(C64, arena.owns()) }, Ok(Some(a)));
+        assert_eq!(unsafe { c.pop(C64, arena.owns()) }, Ok(None));
+    }
+
+    /// Without a mark, the head is the one double free a one-word class can
+    /// still see -- and the one that would make the list point at itself.
+    #[test]
+    fn a_one_word_block_freed_twice_in_a_row_is_refused() {
+        let arena = Arena::new(4096);
+        let mut c = SlabCache::new();
+        let a = arena.block(C8, 0);
+        unsafe { c.push(C8, a) }.unwrap();
+        assert_eq!(
+            unsafe { c.push(C8, a) },
+            Err(Broken::DoubleFree { block: a })
+        );
+        assert_eq!(c.count(C8), 1);
+    }
+
+    /// The everyday case must stay quiet: a block that was handed out and
+    /// comes back is a free, not a double free.
+    #[test]
+    fn a_block_handed_out_and_freed_again_is_not_a_double_free() {
+        let arena = Arena::new(4096);
+        let mut c = SlabCache::new();
+        let a = arena.block(C64, 0);
+        unsafe { c.push(C64, a) }.unwrap();
+        assert_eq!(unsafe { c.pop(C64, arena.owns()) }, Ok(Some(a)));
+        assert_eq!(unsafe { c.push(C64, a) }, Ok(true));
+    }
+
+    /// The mark is mixed with the block's address, so a live object holding
+    /// a copy of another block's mark -- a struct copied out of freed memory
+    /// -- is not taken for a free block.
+    #[test]
+    fn another_blocks_mark_in_a_live_block_is_not_a_double_free() {
+        let arena = Arena::new(4096);
+        let mut c = SlabCache::new();
+        let (a, live) = (arena.block(C64, 0), arena.block(C64, 1));
+        unsafe { c.push(C64, a) }.unwrap();
+        arena.write(live + 8, tag_of(a));
+        assert_eq!(unsafe { c.push(C64, live) }, Ok(true));
+    }
+
+    /// A full class hands the block back without writing into it: the buddy
+    /// keeps its own links there.
+    #[test]
+    fn a_full_class_leaves_the_block_to_the_buddy_untouched() {
+        let arena = Arena::new((CAP as usize + 1) * class_size(C64));
+        let mut c = SlabCache::new();
+        for n in 0..CAP as usize {
+            assert_eq!(unsafe { c.push(C64, arena.block(C64, n)) }, Ok(true));
+        }
+        let extra = arena.block(C64, CAP as usize);
+        arena.write(extra, 0x1111);
+        arena.write(extra + 8, 0x2222);
+        assert_eq!(unsafe { c.push(C64, extra) }, Ok(false));
+        assert_eq!(arena.read(extra), 0x1111);
+        assert_eq!(arena.read(extra + 8), 0x2222);
+        assert_eq!(c.count(C64), CAP);
+    }
+
+    /// Whatever is written into free blocks, and wherever, `pop` hands out
+    /// only blocks that were freed and are still free: never a written value,
+    /// never a block twice.
+    #[test]
+    fn whatever_is_written_into_free_blocks_pop_hands_out_only_free_blocks() {
+        const BLOCKS: usize = 64;
+        let arena = Arena::new(BLOCKS * class_size(C64));
+        let mut c = SlabCache::new();
+        let mut free: Vec<usize> = Vec::new();
+        let mut live: Vec<usize> = (0..BLOCKS).map(|n| arena.block(C64, n)).collect();
+        let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed as usize
+        };
+        let (mut caught, mut handed) = (0, 0);
+        for _ in 0..20_000 {
+            match next() % 8 {
+                0..=2 if !live.is_empty() => {
+                    let b = live.swap_remove(next() % live.len());
+                    if unsafe { c.push(C64, b) } == Ok(true) {
+                        free.push(b);
+                    }
+                }
+                3..=5 => match unsafe { c.pop(C64, arena.owns()) } {
+                    Ok(Some(b)) => {
+                        let at = free.iter().position(|&f| f == b);
+                        assert!(at.is_some(), "handed out {b:#x}, which is not free");
+                        free.swap_remove(at.unwrap());
+                        live.push(b);
+                        handed += 1;
+                    }
+                    Ok(None) => assert_eq!(c.count(C64), 0),
+                    Err(_) => {
+                        // Leaked with its list: neither free nor ever handed
+                        // out again.
+                        caught += 1;
+                        assert_eq!(c.count(C64), 0);
+                        free.clear();
+                    }
+                },
+                6 if !free.is_empty() => {
+                    // A stale owner writes into a free block.
+                    let b = free[next() % free.len()];
+                    let value = match next() % 5 {
+                        0 => 0,
+                        1 => 0x71,
+                        2 => CLOCK + next() % 1000,
+                        3 if !live.is_empty() => live[next() % live.len()],
+                        _ => free[next() % free.len()],
+                    };
+                    arena.write(b + 8 * (next() % 2), value);
+                }
+                _ => {}
+            }
+        }
+        assert!(caught > 0 && handed > 0, "caught={caught} handed={handed}");
+    }
+
+    #[test]
+    fn the_ring_names_the_latest_free_of_a_block_and_how_long_ago() {
+        let ring: FreeRing<8> = FreeRing::new();
+        let rets = |x| [x; DEPTH];
+        ring.note(0xa0, rets(1));
+        ring.note(0xb0, rets(2));
+        ring.note(0xa0, rets(3));
+        assert_eq!(ring.find(0xa0), Some((rets(3), 0)));
+        assert_eq!(ring.find(0xb0), Some((rets(2), 1)));
+        assert_eq!(ring.find(0xc0), None);
+        assert_eq!(ring.find(0), None);
+    }
+
+    /// A free the ring has overwritten is "no longer in the ring", never the
+    /// free that took its slot.
+    #[test]
+    fn a_free_older_than_the_ring_is_not_attributed_to_anyone() {
+        let ring: FreeRing<4> = FreeRing::new();
+        ring.note(0xa0, [1; DEPTH]);
+        for n in 1..=4 {
+            ring.note(0xa0 + n * 0x10, [2; DEPTH]);
+        }
+        assert_eq!(ring.find(0xa0), None);
+        assert_eq!(ring.find(0xe0), Some(([2; DEPTH], 0)));
+        assert_eq!(ring.len(), 4);
     }
 }
