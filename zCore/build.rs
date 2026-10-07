@@ -20,11 +20,23 @@ fn main() {
     }
 
     // 如果需要链接 rootfs 镜像，将镜像路径设置到环境变量
+    //
+    // The `rerun-if-env-changed` is load-bearing, not hygiene. This script
+    // already prints `rerun-if-changed` lines, and once a build script prints
+    // any of those, cargo stops re-running it on an environment change unless
+    // the variable is declared here. So without this line, building two
+    // variants in a row -- which is exactly what `make release` does -- reuses
+    // the FIRST one's `USER_IMG`: the minimal ISO would ship the desktop
+    // rootfs linked into its kernel, silently, because `include_bytes!` only
+    // tracks the file at the path it was given last time.
     #[cfg(feature = "link-user-img")]
-    println!(
-        "cargo:rustc-env=USER_IMG={}",
-        std::env::var("USER_IMG").expect("USER_IMG must be set when link-user-img is enabled")
-    );
+    {
+        println!("cargo:rerun-if-env-changed=USER_IMG");
+        println!(
+            "cargo:rustc-env=USER_IMG={}",
+            std::env::var("USER_IMG").expect("USER_IMG must be set when link-user-img is enabled")
+        );
+    }
 
     // Build fingerprint: the git commit this kernel was compiled from, stamped
     // into the boot klog and the panic banner. Real-hardware debugging kept

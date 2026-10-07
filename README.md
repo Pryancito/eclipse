@@ -235,6 +235,8 @@ make release ARCHS=x86_64 VARIANTS=desktop    # una sola
 ```text
 dist/eclipse-desktop-x86_64.iso
 dist/eclipse-minimal-x86_64.iso
+dist/eclipse-desktop-aarch64.iso
+dist/eclipse-minimal-aarch64.iso
 ```
 
 Y cada combinación se puede pedir también con el objetivo de siempre:
@@ -247,16 +249,32 @@ make iso VARIANT=minimal                      # minimal, x86_64
 Una combinación que falle **no aborta el resto**: `make release` las intenta
 todas y acaba con un resumen de qué ISO existe y qué falta.
 
-> **arm64 todavía no da ISO.** No es la ISO sino el arranque: una ISO es un solo
-> medio, así que el cargador tiene que pasarle al kernel un initramfs, y hoy eso
-> solo lo hace `rboot` en x86_64. En aarch64 el cargador es un `rayboot`
-> precompilado de 2022 cuyo `Boot.json` no tiene campo de initramfs, de modo que
-> el kernel coge su raíz del primer dispositivo de bloques — por eso
-> `make qemu ARCH=aarch64` le da a QEMU **dos** discos. Hace falta `rboot`
-> portado a `aarch64-unknown-uefi`, o un rayboot que cargue el initramfs. Lo
-> demás de arm64 sí está: `make image ARCH=aarch64 VARIANT=minimal` construye
-> `rootfs/aarch64-minimal` y `zCore/aarch64-minimal.img`. El detalle completo
-> está en el objetivo `iso-unsupported-arch` del `Makefile`.
+> **La ISO de arm64 lleva la imagen dentro del kernel.** Una ISO es un solo
+> medio, así que el kernel no puede coger su raíz de un segundo disco como hace
+> `make qemu ARCH=aarch64`, y el `rayboot` precompilado que arranca aarch64
+> tampoco sabe pasarle un initramfs: su `Boot.json` no tiene campo para eso. Así
+> que para la ISO el cargador queda fuera de la ecuación — la imagen se enlaza
+> **dentro** del kernel (`LINK_USER_IMG=1`, la feature `link-user-img` de
+> `zCore/src/fs.rs`) y el kernel lee su raíz de sí mismo. Para arrancarla:
+>
+> ```bash
+> make iso ARCH=aarch64 VARIANT=minimal
+> make qemu-iso-aarch64 ARCH=aarch64 VARIANT=minimal
+> ```
+>
+> **Dale 1 GB, no 4.** Con `-m 4G` este kernel no imprime nada después del
+> «jump to kernel» de rayboot, que se lee igual que una ISO rota y no lo es; es
+> justo al revés que la de x86_64, que necesita 4 GB. `make qemu-iso-aarch64` ya
+> trae la receta buena.
+>
+> **No es un instalador.** La ISO de x86_64 lleva los payloads que
+> `install-eclipse` escribe a disco; eso sigue siendo x86-only en
+> `xtask/src/linux/image.rs`, así que la de arm64 arranca la sesión de consola de
+> su variante y no instala nada.
+>
+> **riscv64 sigue sin ISO**, y por otro motivo: QEMU arranca su kernel
+> directamente, sin medio UEFI, así que no hay ESP que meter en la ISO. El
+> detalle está en el objetivo `iso-unsupported-arch` del `Makefile`.
 
 ## Soporte de Plataformas
 
