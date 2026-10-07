@@ -167,6 +167,17 @@ impl LinuxRootfs {
             // reads. An incremental build never wrote it, so a rootfs built
             // before this existed keeps resolving for the host's arch.
             Self::write_apk_arch(&dir.join("etc"), self.0.name());
+            // Y las claves, por el mismo motivo: un rootfs construido antes de
+            // que hubiera claves por arco se queda sin las del objetivo, y
+            // entonces apk lee el APKINDEX, dice «UNTRUSTED signature» y no
+            // instala nada.
+            let keys = dir.join("etc").join("apk").join("keys");
+            let n = Self::install_apk_keys(&keys, self.0.name());
+            println!(
+                "apk keys: installed {n} key(s) into {} for {}",
+                keys.display(),
+                self.0.name()
+            );
             self.install_desktop_stack(&dir);
             // After apk so we can see whether the PulseAudio plugin/binary
             // landed, and so /etc/pulse wins over anything the package dropped.
@@ -224,7 +235,7 @@ impl LinuxRootfs {
             // the keys that actually ship live in `tools/apk/keys/` next to
             // the apk binary. prebuilt is still scanned for extra keys.
             let keys_dst = etc_apk.join("keys");
-            let n = Self::install_apk_keys(&keys_dst);
+            let n = Self::install_apk_keys(&keys_dst, self.0.name());
             if n == 0 {
                 eprintln!(
                     "warning: no Alpine apk keys found under tools/apk/keys or \
@@ -1474,31 +1485,52 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
     /// Search order: in-tree `tools/apk/keys` (always shipped), then
     /// `prebuilt/alpine-apk-keys` (gitignored extras, e.g. the e1000e bench
     /// mirror key). Returns how many `.pub` files landed.
-    fn install_apk_keys(dst: &Path) -> usize {
+    fn install_apk_keys(dst: &Path, arch: &str) -> usize {
         fs::create_dir_all(dst).unwrap();
-        for src in [
+        let mut del_arco = 0usize;
+        for base in [
             PROJECT_DIR.join("tools").join("apk").join("keys"),
             PROJECT_DIR.join("prebuilt").join("alpine-apk-keys"),
         ] {
-            let Ok(entries) = fs::read_dir(&src) else {
-                continue;
-            };
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.extension().and_then(|e| e.to_str()) != Some("pub") {
+            // Las sueltas valen para cualquier arco; las de `<base>/<arco>/`
+            // son las de ESE arco y son las que hacen falta de verdad.
+            for (src, es_del_arco) in [(base.clone(), false), (base.join(arch), true)] {
+                let Ok(entries) = fs::read_dir(&src) else {
                     continue;
+                };
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.extension().and_then(|e| e.to_str()) != Some("pub") {
+                        continue;
+                    }
+                    if fs::copy(&path, dst.join(entry.file_name())).is_ok() && es_del_arco {
+                        del_arco += 1;
+                    }
                 }
-                let _ = fs::copy(&path, dst.join(entry.file_name()));
             }
         }
-        fs::read_dir(dst)
+        let total = fs::read_dir(dst)
             .ok()
             .map(|it| {
                 it.flatten()
                     .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("pub"))
                     .count()
             })
-            .unwrap_or(0)
+            .unwrap_or(0);
+        // El caso que se escapaba: con claves de OTRO arco en el directorio,
+        // `total` sale distinto de cero, asi que nadie pasa
+        // `--allow-untrusted`, y apk se encuentra el APKINDEX del objetivo
+        // firmado por una clave que no tiene. Dice «UNTRUSTED signature»,
+        // **no instala nada** y la tirada sigue, porque el paso de paquetes es
+        // best-effort. Por eso este aviso habla del ARCO, no del total.
+        if del_arco == 0 && total > 0 {
+            eprintln!(
+                "warning: hay {total} clave(s) de apk pero ninguna de {arch}; el APKINDEX de \
+                 {arch} saldra «UNTRUSTED signature» y no se instalara ni un paquete. \
+                 Las de cada arco van en tools/apk/keys/{arch}/ (ver su README)"
+            );
+        }
+        total
     }
 
     /// Instala certificados raíz en el rootfs (requerido para wget https).
@@ -4949,6 +4981,144 @@ mod variant_layout_tests {
 /// (`.../v3.24/main`) y apk le pega el arco detras. Sin ese fichero apk cae a
 /// su arco compilado — el del HOST en una compilacion cruzada.
 #[cfg(test)]
+mod apk_keys_tests {
+    use super::*;
+
+    fn scratch(que: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!(
+            "eclipse-apk-keys-{que}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn claves_de(arco: &str) -> Vec<String> {
+        let dir = PROJECT_DIR
+            .join("tools")
+            .join("apk")
+            .join("keys")
+            .join(arco);
+        let mut v: Vec<String> = fs::read_dir(&dir)
+            .unwrap_or_else(|e| panic!("falta {}: {e}", dir.display()))
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".pub"))
+            .collect();
+        v.sort();
+        v
+    }
+
+    /// Alpine firma el APKINDEX de **cada arquitectura con una clave
+    /// distinta**, asi que cada arco que Eclipse compila tiene que traer las
+    /// suyas. El reparto sale del `_arch_keys` del APKBUILD de `alpine-keys`.
+    #[test]
+    fn cada_arco_trae_sus_claves() {
+        for (arco, esperadas) in [
+            ("x86_64", vec!["4a6a0840", "5261cecb", "6165ee59"]),
+            ("aarch64", vec!["58199dcc", "616ae350"]),
+            ("riscv64", vec!["60ac2099", "616db30d"]),
+        ] {
+            let tiene = claves_de(arco);
+            assert_eq!(tiene.len(), esperadas.len(), "claves de {arco}: {tiene:?}");
+            for id in esperadas {
+                assert!(
+                    tiene.iter().any(|n| n.contains(id)),
+                    "a {arco} le falta la clave {id}: {tiene:?}"
+                );
+            }
+        }
+    }
+
+    /// Dos arcos no comparten clave (salvo la de x86/x86_64, que aqui no
+    /// aplica): si la lista de uno se colara en la del otro, el aviso de
+    /// «UNTRUSTED signature» volveria sin que nada se queje.
+    #[test]
+    fn las_claves_de_un_arco_no_son_las_de_otro() {
+        let x86 = claves_de("x86_64");
+        let arm = claves_de("aarch64");
+        let risc = claves_de("riscv64");
+        for (a, b, n) in [
+            (&x86, &arm, "x86_64/aarch64"),
+            (&arm, &risc, "aarch64/riscv64"),
+        ] {
+            assert!(
+                !a.iter().any(|k| b.contains(k)),
+                "{n} comparten clave, y Alpine no las comparte"
+            );
+        }
+    }
+
+    /// Lo que se instala en el rootfs son las sueltas MAS las del objetivo, y
+    /// nunca las de otro arco.
+    #[test]
+    fn se_instalan_las_sueltas_y_las_del_objetivo() {
+        let dst = scratch("instala").join("keys");
+        let n = LinuxRootfs::install_apk_keys(&dst, "aarch64");
+        let puestas: Vec<String> = fs::read_dir(&dst)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(n, puestas.len(), "la cuenta es lo que apk va a confiar");
+        for k in claves_de("aarch64") {
+            assert!(puestas.contains(&k), "falta {k} en {puestas:?}");
+        }
+        for k in claves_de("riscv64") {
+            assert!(
+                !puestas.contains(&k),
+                "{k} es de riscv64 y no pinta nada en un rootfs de aarch64"
+            );
+        }
+    }
+
+    /// El fallo que hubo que arreglar, en su forma exacta: un directorio con
+    /// claves de OTRO arco cuenta como «hay claves», asi que nadie pasa
+    /// `--allow-untrusted`, y apk se encuentra la firma del objetivo sin la
+    /// clave que la verifica. Tiene que quedar una clave del arco pedido.
+    #[test]
+    fn un_rootfs_de_aarch64_no_se_queda_solo_con_claves_de_x86() {
+        let dst = scratch("mezcla").join("keys");
+        fs::create_dir_all(&dst).unwrap();
+        for k in claves_de("x86_64") {
+            fs::write(dst.join(&k), b"vieja\n").unwrap();
+        }
+        LinuxRootfs::install_apk_keys(&dst, "aarch64");
+        let puestas: Vec<String> = fs::read_dir(&dst)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            claves_de("aarch64").iter().any(|k| puestas.contains(k)),
+            "un rootfs de aarch64 sin una sola clave de aarch64: {puestas:?}"
+        );
+    }
+
+    /// Las siete son claves publicas RSA de verdad, no ficheros de relleno.
+    #[test]
+    fn las_claves_son_claves_publicas_rsa() {
+        for arco in ["x86_64", "aarch64", "riscv64"] {
+            let dir = PROJECT_DIR
+                .join("tools")
+                .join("apk")
+                .join("keys")
+                .join(arco);
+            for k in claves_de(arco) {
+                let t = fs::read_to_string(dir.join(&k)).unwrap();
+                assert!(
+                    t.starts_with("-----BEGIN PUBLIC KEY-----")
+                        && t.trim_end().ends_with("-----END PUBLIC KEY-----"),
+                    "{arco}/{k} no es una clave publica PEM"
+                );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
 mod apk_arch_tests {
     use super::*;
 
@@ -7063,7 +7233,7 @@ mod rootfs_plumbing_tests {
         fs::write(dst.join("alpine-one.rsa.pub"), b"key\n").unwrap();
         fs::write(dst.join("alpine-two.rsa.pub"), b"key\n").unwrap();
         fs::write(dst.join("README.txt"), b"not a key\n").unwrap();
-        let n = LinuxRootfs::install_apk_keys(&dst);
+        let n = LinuxRootfs::install_apk_keys(&dst, "x86_64");
         let pubs = fs::read_dir(&dst)
             .unwrap()
             .flatten()
