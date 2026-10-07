@@ -123,6 +123,39 @@ fn padded_image_size(payload_bytes: u64, num: u64, den: u64, floor_mib: u64) -> 
     mib * 1024 * 1024
 }
 
+/// La RAM del invitado de los arcos cuya imagen va DENTRO de ella.
+///
+/// `zCore/Makefile` arranca riscv64 con `-initrd $(USER_IMG) -m 1G`: la imagen
+/// se carga como region de ROM en la memoria del invitado, asi que su tamaño
+/// tiene un techo duro. aarch64 la monta por virtio-blk y no lo tiene.
+fn ram_resident_guest_bytes(arch: &str) -> Option<u64> {
+    match arch {
+        "riscv64" => Some(1024 * 1024 * 1024),
+        _ => None,
+    }
+}
+
+/// El aviso cuando la imagen no va a caber en la RAM del invitado, si procede.
+///
+/// Sin esto, pasarse del techo no se ve en la compilacion: sale mucho despues y
+/// en boca de QEMU, como «Some ROM regions are overlapping» entre la imagen y
+/// el `fdt`, y un «QEMU exited during startup with status 2» que no nombra ni
+/// el fichero ni su tamaño. Media hora de rastreo por una linea que el build
+/// podia haber dicho.
+fn ram_resident_warning(arch: &str, sfs_bytes: u64) -> Option<String> {
+    let ram = ram_resident_guest_bytes(arch)?;
+    (sfs_bytes > ram).then(|| {
+        format!(
+            "la imagen de {arch} son {} MiB y QEMU la carga como `-initrd` dentro de los \
+             {} MiB del invitado: no va a arrancar (dira «Some ROM regions are overlapping» \
+             y se ira con estado 2). Lo que la engorda es casi siempre el cierre de apk del \
+             escritorio; ver apk_closure_fits_image en linux/mod.rs",
+            sfs_bytes / (1024 * 1024),
+            ram / (1024 * 1024),
+        )
+    })
+}
+
 /// SFS image size for an initramfs holding `payload_bytes` (≈40% headroom).
 fn sfs_size_for(payload_bytes: u64) -> usize {
     padded_image_size(payload_bytes, 2, 5, 24) as usize
@@ -582,11 +615,11 @@ impl super::LinuxRootfs {
             fs::copy(fw_dir.join("Boot.json"), boot_dir.join("Boot.json")).unwrap();
         }
         // 生成镜像
-        fuse(
-            self.path(),
-            &image,
-            sfs_size_for(sfs_payload_bytes(&self.path())),
-        );
+        let sfs_size = sfs_size_for(sfs_payload_bytes(&self.path()));
+        if let Some(aviso) = ram_resident_warning(self.0.name(), sfs_size as u64) {
+            eprintln!("warning: {aviso}");
+        }
+        fuse(self.path(), &image, sfs_size);
         // 扩充一些额外空间，供某些测试使用
         Qemu::img()
             .arg("resize")
@@ -1220,5 +1253,51 @@ mod image_size_tests {
 
         assert_eq!(fs::read_link(dst.join("ls")).unwrap(), Path::new("busybox"));
         let _ = fs::remove_dir_all(&d);
+    }
+}
+
+#[cfg(test)]
+mod ram_resident_tests {
+    use super::{ram_resident_guest_bytes, ram_resident_warning};
+
+    const MIB: u64 = 1024 * 1024;
+
+    #[test]
+    fn solo_riscv64_tiene_techo_de_ram() {
+        assert_eq!(ram_resident_guest_bytes("riscv64"), Some(1024 * MIB));
+        assert_eq!(ram_resident_guest_bytes("aarch64"), None);
+        assert_eq!(ram_resident_guest_bytes("x86_64"), None);
+    }
+
+    /// El tamaño exacto que trajo el fallo: 1,32 GiB en un invitado de 1 GiB.
+    #[test]
+    fn la_imagen_que_no_arrancaba_avisa() {
+        let aviso = ram_resident_warning("riscv64", 1352 * MIB)
+            .expect("1352 MiB no caben en 1024 y el build tiene que decirlo");
+        assert!(aviso.contains("1352"), "el aviso dice el tamaño: {aviso}");
+        assert!(aviso.contains("1024"), "y el techo: {aviso}");
+        assert!(
+            aviso.contains("apk_closure_fits_image"),
+            "y a donde mirar: {aviso}"
+        );
+    }
+
+    #[test]
+    fn una_imagen_que_cabe_no_avisa() {
+        assert!(ram_resident_warning("riscv64", 300 * MIB).is_none());
+    }
+
+    /// Justo en el techo cabe; un byte mas, no.
+    #[test]
+    fn el_borde_esta_en_la_ram_del_invitado() {
+        assert!(ram_resident_warning("riscv64", 1024 * MIB).is_none());
+        assert!(ram_resident_warning("riscv64", 1024 * MIB + 1).is_some());
+    }
+
+    /// Un arco sin techo no avisa aunque la imagen sea enorme: la de aarch64
+    /// va por virtio-blk y la ISO de escritorio pesa de verdad.
+    #[test]
+    fn aarch64_no_avisa_por_grande_que_sea() {
+        assert!(ram_resident_warning("aarch64", 4096 * MIB).is_none());
     }
 }

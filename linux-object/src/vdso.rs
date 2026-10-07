@@ -85,7 +85,10 @@ fn vdso() -> Option<&'static Vdso> {
 
 fn build() -> Option<Vdso> {
     if !linux_vdso::AVAILABLE {
-        warn!("vdso: esta compilacion no incluye imagen; clock_gettime seguira siendo un syscall");
+        warn!(
+            "vdso: esta compilacion no incluye imagen ({}); clock_gettime seguira siendo un syscall",
+            linux_vdso::UNAVAILABLE_REASON.unwrap_or("sin motivo registrado")
+        );
         return None;
     }
 
@@ -282,7 +285,14 @@ fn publish_getcpu() {
 pub fn status() -> alloc::string::String {
     use alloc::format;
     if !linux_vdso::AVAILABLE {
-        return "sin imagen (la compilacion no encontro un cc utilizable)".into();
+        // El motivo lo da la compilacion, no se adivina aqui. Esta linea decia
+        // «no encontro un cc utilizable», que es UNO de los motivos: en aarch64
+        // y riscv64 no hay imagen porque el vDSO es codigo x86_64, y mandaba a
+        // buscar un compilador que nunca fue el problema.
+        return match linux_vdso::UNAVAILABLE_REASON {
+            Some(r) => format!("sin imagen ({r})"),
+            None => "sin imagen (la compilacion no dijo por que)".into(),
+        };
     }
     let Some(vdso) = vdso() else {
         return "imagen presente pero no instalada (sin memoria fisica)".into();

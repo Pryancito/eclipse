@@ -86,7 +86,7 @@ fn main() {
             let verified = verify(&linked);
             let image = strip(&linked, verified.load_len);
             fs::write(&image_path, &image).unwrap();
-            fs::write(&meta_path, meta_source(Some(&verified), image.len())).unwrap();
+            fs::write(&meta_path, meta_source(Some(&verified), image.len(), None)).unwrap();
         }
         Err(reason) => {
             println!(
@@ -100,7 +100,7 @@ fn main() {
             // includes this path to get the unstripped image, and a missing file
             // there is a compile error on a host that simply has no `cc`.
             fs::write(&link_path, b"").unwrap();
-            fs::write(&meta_path, meta_source(None, 0)).unwrap();
+            fs::write(&meta_path, meta_source(None, 0, Some(&reason))).unwrap();
         }
     }
 }
@@ -209,14 +209,30 @@ fn build_image(out_dir: &Path, image_path: &Path) -> Result<Vec<u8>, String> {
 /// beside the three numbers is a call site that can claim an image while handing
 /// over zeros for it -- and the arm that would get that wrong is the one no host
 /// with a working `cc` ever takes, so nothing would ever notice.
-pub(crate) fn meta_source(verified: Option<&Verified>, len: usize) -> String {
+pub(crate) fn meta_source(
+    verified: Option<&Verified>,
+    len: usize,
+    unavailable_reason: Option<&str>,
+) -> String {
     let (available, data_offset, data_size, len) = match verified {
         Some(v) => (true, v.data_offset, v.data_size, len),
         None => (false, 0, 0, 0),
     };
+    // The reason travels into the binary instead of only into a `cargo:warning`
+    // that scrolls past. Without it the kernel could only guess, and it guessed
+    // "no usable cc" -- which on aarch64 and riscv64 is the wrong answer and
+    // sends whoever reads `/proc/perf/kernel` looking for a compiler that was
+    // never the problem.
+    let reason = match unavailable_reason {
+        Some(r) => format!("Some({:?})", r),
+        None => "None".to_string(),
+    };
     format!(
         "/// Whether a usable image was linked into this build.\n\
          pub const AVAILABLE: bool = {};\n\
+         /// Why there is no image, in the build's own words, or `None` when\n\
+         /// there is one. What [`AVAILABLE`] leaves unsaid.\n\
+         pub const UNAVAILABLE_REASON: Option<&str> = {};\n\
          /// Byte offset of `_vdso_data` from the start of the mapped image.\n\
          pub const DATA_OFFSET: usize = {};\n\
          /// Size of `_vdso_data` as `vdso.c` laid it out, from its symbol-table\n\
@@ -224,7 +240,7 @@ pub(crate) fn meta_source(verified: Option<&Verified>, len: usize) -> String {
          pub const DATA_SIZE: usize = {};\n\
          /// Length of the image in bytes, before rounding up to whole pages.\n\
          pub const IMAGE_LEN: usize = {};\n",
-        available, data_offset, data_size, len
+        available, reason, data_offset, data_size, len
     )
 }
 
