@@ -787,9 +787,11 @@ const STOP_SCREEN_CALLERS: usize = 6;
 /// The words of a stack that a `CALL` pushed, in the order given.
 ///
 /// `tail(w)` is the eight bytes before `w` when `w` is in `.text`, and `None`
-/// when it is not. A return address is the one `.text` word whose bytes before
-/// it end in a `CALL`; a function pointer or vtable entry left in a local is
-/// not, and the stop screen has no room for those.
+/// when it is not. A return address is a `.text` word whose bytes before it
+/// end in a `CALL`; a function pointer or vtable entry left in a local is not,
+/// and the stop screen has no room for those. The bytes are not decoded from
+/// an instruction boundary, so an `E8` inside an immediate passes too: one
+/// more reason the screen calls them possible callers.
 #[cfg(any(test, all(target_arch = "x86_64", not(feature = "libos"))))]
 fn pick_return_addresses(
     words: impl IntoIterator<Item = u64>,
@@ -815,21 +817,18 @@ fn pick_return_addresses(
 /// one, and the NVIDIA RM's C is built without them -- `_mapInsertBase` does
 /// not even set one up -- so a fault inside the driver walked off into
 /// whatever its caller kept in `rbp`. The words above the faulting `rsp` hold
-/// the return addresses of every live frame whoever built it -- and, further
-/// up, return addresses an earlier call left in a big frame's dead slots,
-/// which is why the screen says the last lines may be leftovers. Each read is
-/// gated on the page table, and the scan stops at the first word off a
-/// present page: the stack does not go on past it.
+/// the return addresses of every live frame whoever built it -- and, between
+/// them, return addresses an earlier call left in a frame's dead slots, which
+/// can come before the live one. So these are possible callers, not a chain,
+/// and the screen says so. Each read is gated on the page table, asked
+/// without logging (`PageTable::is_present`), and the scan stops at the
+/// first word off a present page: the stack does not go on past it.
 #[cfg(all(target_arch = "x86_64", not(feature = "libos")))]
 fn faulting_stack_callers(out: &mut [u64]) -> usize {
-    use kernel_hal::vm::{GenericPageTable, PageTable};
+    use kernel_hal::vm::PageTable;
     const WORDS: u64 = 1024;
     let pt = PageTable::from_current();
-    let mapped = |a: u64| {
-        pt.query(a as usize)
-            .map(|(_, f, _)| !f.is_empty())
-            .unwrap_or(false)
-    };
+    let mapped = |a: u64| pt.is_present(a as usize);
     let (text_lo, _) = kernel_hal::kaddr::kernel_text();
     let start = kernel_hal::kstats::last_fault_rsp() & !0x7;
     let words = (0..WORDS)
@@ -854,7 +853,7 @@ fn faulting_stack_callers(out: &mut [u64]) -> usize {
     n
 }
 
-/// The callers of the faulting function, for a stop screen.
+/// The possible callers of the faulting function, for a stop screen.
 ///
 /// A halt prints the whole backtrace to the serial port and the oops buffer,
 /// and both are gone on a machine with only a monitor: the buffer does not
@@ -872,8 +871,8 @@ fn write_stop_screen_callers(b: &mut impl core::fmt::Write) {
     }
     let _ = write!(
         b,
-        "\ncalled from (read off the stack: the first lines are the callers, \
-         the last may be leftovers in a caller's frame):"
+        "\npossible callers, nearest first (return addresses read off the \
+         stack, not a verified chain: any line may be a stale one):"
     );
     for r in &rets[..n] {
         let _ = write!(b, "\n  {}", kernel_hal::ksyms::Addr(*r));
