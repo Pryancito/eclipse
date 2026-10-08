@@ -319,16 +319,46 @@ fn arm_io_wait(
     *io_armed = true;
 }
 
+/// Did an input frame land in the window between the descriptor scan above and
+/// the arming that follows it?
+///
+/// `hid_seq` is [`linux_object::fs::devfs::input::wait::input_seq`] as it stood
+/// *before* the scan. A frame in that window is the one wake that could be
+/// lost: its own wake drained a list this task had not joined yet, and the
+/// scan that would have seen the packet had already run -- so the task parked
+/// with a packet queued and woke on the fallback tick instead, which is the
+/// latency libinput reports as "your system is too slow".
+///
+/// `true` means go round again rather than park; the task is self-woken here,
+/// so the caller's `Poll::Pending` is re-polled at once. `false` when there is
+/// no input device in this set, which must not consult the counter at all:
+/// another process's keystroke is none of this wait's business.
+fn hid_frame_missed(cx: &mut Context, watch_hid: bool, hid_seq: u64) -> bool {
+    if !watch_hid || linux_object::fs::devfs::input::wait::input_seq() == hid_seq {
+        return false;
+    }
+    cx.waker().wake_by_ref();
+    true
+}
+
 fn clear_poll_io(
     timer: &mut Option<kernel_hal::timer_waker::TimerWakerSlot>,
     io_waker: &mut Option<core::task::Waker>,
     watch_net: bool,
     watch_interactive: bool,
-    watch_hid: bool,
 ) {
     kill_poll_timer(timer);
     if let Some(w) = io_waker.take() {
-        linux_object::net::clear_io_wait_wakers_hid(&w, watch_net, watch_interactive, watch_hid);
+        // `true` for the input list, whatever this pass computed. These
+        // futures live across every pass of the wait and overwrite their
+        // watch flags on each one, so an input fd closed mid-wait flips
+        // `watch_hid` from true to false and a clear gated on it would walk
+        // past the registration the earlier pass made -- leaving a waker that
+        // a later input frame fires into a wait that is over. Clearing one
+        // that was never made is a no-op (`clearing_an_unregistered_waker_
+        // does_nothing`), so the unconditional clear costs nothing and cannot
+        // strand anything.
+        linux_object::net::clear_io_wait_wakers_hid(&w, watch_net, watch_interactive, true);
     }
 }
 
@@ -379,8 +409,7 @@ impl Syscall<'_> {
             fn drop(&mut self) {
                 let wn = self.watch_net;
                 let wi = self.watch_interactive;
-                let wh = self.watch_hid;
-                clear_poll_io(&mut self.timer, &mut self.io_waker, wn, wi, wh);
+                clear_poll_io(&mut self.timer, &mut self.io_waker, wn, wi);
             }
         }
         impl<'a> Future for PollFuture<'a> {
@@ -400,6 +429,12 @@ impl Syscall<'_> {
                     .polls
                     .iter()
                     .any(|p| linux_object::net::fd_is_interactive(p.fd));
+                // Read BEFORE the scan below (see
+                // `linux_object::fs::devfs::input::wait::input_seq`): a frame
+                // landing between the scan and `arm_io_wait` drains a list
+                // this task is not in yet, and the wait would sleep out its
+                // fallback tick for an event that had already arrived.
+                let hid_seq = linux_object::fs::devfs::input::wait::input_seq();
                 let watch_hid = {
                     let proc = this.syscall.linux_process();
                     this.polls.iter().any(|p| {
@@ -483,7 +518,6 @@ impl Syscall<'_> {
                         &mut this.io_waker,
                         watch_net,
                         watch_interactive,
-                        watch_hid,
                     );
                     return Poll::Ready(Err(err));
                 }
@@ -494,7 +528,6 @@ impl Syscall<'_> {
                         &mut this.io_waker,
                         watch_net,
                         watch_interactive,
-                        watch_hid,
                     );
                     return Poll::Ready(Ok(events));
                 }
@@ -509,7 +542,6 @@ impl Syscall<'_> {
                         &mut this.io_waker,
                         watch_net,
                         watch_interactive,
-                        watch_hid,
                     );
                     return Poll::Ready(Err(e));
                 }
@@ -562,7 +594,6 @@ impl Syscall<'_> {
                             &mut this.io_waker,
                             watch_net,
                             watch_interactive,
-                            watch_hid,
                         );
                         return Poll::Ready(Ok(0));
                     }
@@ -586,6 +617,9 @@ impl Syscall<'_> {
                             &mut this.io_armed,
                         );
                         this.io_waker = Some(cx.waker().clone());
+                        if hid_frame_missed(cx, watch_hid, hid_seq) {
+                            return Poll::Pending;
+                        }
                         schedule_poll_wakeup(cx, wake_in, &mut this.timer);
                     }
                 }
@@ -853,8 +887,7 @@ impl Syscall<'_> {
             fn drop(&mut self) {
                 let wn = self.watch_net;
                 let wi = self.watch_interactive;
-                let wh = self.watch_hid;
-                clear_poll_io(&mut self.timer, &mut self.io_waker, wn, wi, wh);
+                clear_poll_io(&mut self.timer, &mut self.io_waker, wn, wi);
             }
         }
 
@@ -868,6 +901,10 @@ impl Syscall<'_> {
                 let watch_net = this.watch_net;
                 let watch_interactive = this.watch_interactive;
                 let watch_hid = this.watch_hid;
+                // Read BEFORE the scan below, for the reason `sys_poll`'s copy
+                // of this line gives: a frame between the scan and the arming
+                // drains a list this task is not in yet.
+                let hid_seq = linux_object::fs::devfs::input::wait::input_seq();
                 let terminal_only = this.terminal_only;
                 if this.io_armed {
                     arm_io_wait(
@@ -926,7 +963,6 @@ impl Syscall<'_> {
                         &mut this.io_waker,
                         watch_net,
                         watch_interactive,
-                        watch_hid,
                     );
                     return Poll::Ready(Err(err));
                 }
@@ -938,7 +974,6 @@ impl Syscall<'_> {
                         &mut this.io_waker,
                         watch_net,
                         watch_interactive,
-                        watch_hid,
                     );
                     // Flush the ready bitmaps to user space once.
                     this.read_fds.commit();
@@ -953,7 +988,6 @@ impl Syscall<'_> {
                         &mut this.io_waker,
                         watch_net,
                         watch_interactive,
-                        watch_hid,
                     );
                     return Poll::Ready(Err(e));
                 }
@@ -1003,7 +1037,6 @@ impl Syscall<'_> {
                             &mut this.io_waker,
                             watch_net,
                             watch_interactive,
-                            watch_hid,
                         );
                         return Poll::Ready(Ok(0));
                     }
@@ -1027,6 +1060,9 @@ impl Syscall<'_> {
                             &mut this.io_armed,
                         );
                         this.io_waker = Some(cx.waker().clone());
+                        if hid_frame_missed(cx, watch_hid, hid_seq) {
+                            return Poll::Pending;
+                        }
                         schedule_poll_wakeup(cx, wake_in, &mut this.timer);
                     }
                 }
@@ -1316,6 +1352,89 @@ mod abi_tests {
     #[test]
     fn pollfd_matches_linux_uapi() {
         assert_eq!(size_of::<PollFd>(), 8);
+    }
+}
+
+/// The one decision `poll(2)` and `select(2)` share about input frames, and the
+/// one both used to carry as a copy of the same four lines. A regression that
+/// drops or reorders it here fails these; a regression that drops the *call*
+/// from one of the two futures is what the call sites' single shared helper is
+/// for.
+#[cfg(test)]
+mod hid_frame_missed_tests {
+    use super::*;
+    use core::sync::atomic::{AtomicBool, Ordering};
+    use core::task::{RawWaker, RawWakerVTable, Waker};
+    use linux_object::fs::devfs::input::wait::{input_seq, wake_input_waiters};
+
+    /// A waker that remembers whether it was woken: the self-wake is half of
+    /// what this function has to do, and a `true` without it would park the
+    /// task for ever.
+    #[allow(unsafe_code)]
+    fn watching_waker(flag: &AtomicBool) -> Waker {
+        unsafe fn clone(p: *const ()) -> RawWaker {
+            RawWaker::new(p, &VTABLE)
+        }
+        unsafe fn wake(p: *const ()) {
+            // SAFETY: the pointer is the `&AtomicBool` this waker was built
+            // from, which outlives it.
+            unsafe { &*(p as *const AtomicBool) }.store(true, Ordering::SeqCst);
+        }
+        unsafe fn drop_fn(_: *const ()) {}
+        static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, wake, wake, drop_fn);
+        // SAFETY: as above; the vtable only ever reads through that pointer.
+        unsafe {
+            Waker::from_raw(RawWaker::new(
+                flag as *const AtomicBool as *const (),
+                &VTABLE,
+            ))
+        }
+    }
+
+    #[test]
+    fn a_frame_after_the_scan_sends_the_caller_round_again() {
+        let woken = AtomicBool::new(false);
+        let waker = watching_waker(&woken);
+        let mut cx = Context::from_waker(&waker);
+        // Read before the scan, as both futures do.
+        let seq = input_seq();
+        // The frame that used to be lost: queued after the scan, woken before
+        // this task was in the list.
+        wake_input_waiters();
+        assert!(
+            hid_frame_missed(&mut cx, true, seq),
+            "a frame in the window has to stop this pass from parking"
+        );
+        assert!(
+            woken.load(Ordering::SeqCst),
+            "and has to self-wake, or the `Poll::Pending` that follows parks              the task on the fallback tick after all"
+        );
+    }
+
+    #[test]
+    fn an_empty_window_parks() {
+        let woken = AtomicBool::new(false);
+        let waker = watching_waker(&woken);
+        let mut cx = Context::from_waker(&waker);
+        assert!(
+            !hid_frame_missed(&mut cx, true, input_seq()),
+            "nothing arrived, so this pass sleeps on the input waker list"
+        );
+        assert!(!woken.load(Ordering::SeqCst), "and nothing woke it");
+    }
+
+    #[test]
+    fn a_set_without_an_input_device_ignores_the_counter() {
+        let woken = AtomicBool::new(false);
+        let waker = watching_waker(&woken);
+        let mut cx = Context::from_waker(&waker);
+        let seq = input_seq();
+        wake_input_waiters();
+        assert!(
+            !hid_frame_missed(&mut cx, false, seq),
+            "no evdev node in this set: somebody else's keystroke must not cut              this wait's sleep short"
+        );
+        assert!(!woken.load(Ordering::SeqCst), "and must not wake it");
     }
 }
 
