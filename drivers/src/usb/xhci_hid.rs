@@ -3,9 +3,10 @@
 //!
 //! **Alcance:** controladores xHCI, puertos raíz y hubs USB hasta los cinco niveles
 //! que cabe nombrar en un route string (registro global de sondeo).
-//! **No cubierto:** el endpoint de cambio de estado del hub (los puertos se sondean
-//! por transferencia de control), Multi-TT, descriptores HID no boot, varios
-//! interfaces HID compuestos, USB3 recovery avanzado.
+//! Los cambios de puerto de un hub llegan por su endpoint de cambio de estado, con
+//! un barrido por transferencia de control como red de seguridad.
+//! **No cubierto:** Multi-TT, descriptores HID no boot, varios interfaces HID
+//! compuestos, USB3 recovery avanzado.
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -1086,10 +1087,13 @@ const HUB_PORT_CHANGES: [(u16, u16); 6] = [
 const USB_MAX_TIERS: u8 = 5;
 /// Y ningún hub tiene más puertos de los que un nibble puede nombrar.
 const HUB_MAX_PORTS: u8 = 15;
-/// Cada cuánto se barren los puertos de los hubs conocidos. Es un sondeo
-/// (ver [`XhciInner::scan_hubs_if_due`]) y cada puerto cuesta una transferencia
-/// de control, así que no conviene apretarlo.
+/// Cada cuánto se barren los puertos de un hub cuyo endpoint de cambio de
+/// estado no se pudo armar: ahí el sondeo es lo único que hay.
 const HUB_SCAN_PERIOD_US: u64 = 1_000_000;
+/// Y cada cuánto se barre uno que sí tiene su endpoint. Es una red de
+/// seguridad --un informe perdido, un hub que no avisa-- y cada puerto cuesta
+/// una transferencia de control, así que va mucho más espaciado.
+const HUB_BACKSTOP_PERIOD_US: u64 = 5_000_000;
 /// Tiempo máximo que se espera a que un puerto de hub salga del reset.
 const HUB_RESET_TIMEOUT_US: u64 = 800_000;
 /// `TRSTRCY`: recuperación tras el reset antes de hablarle al dispositivo
@@ -1211,6 +1215,30 @@ fn parse_hub_descriptor(raw: &[u8]) -> Option<HubInfo> {
         power_good_ms: ((raw[5] as u32) * 2).max(100),
         multi_tt: false,
     })
+}
+
+/// Bytes del mapa de bits de cambio de estado de un hub de `ports` puertos.
+///
+/// Es un bit por puerto más el bit 0, que es el del propio hub (USB 2.0
+/// §11.12.4), redondeado a bytes.
+fn hub_change_bytes(ports: u8) -> usize {
+    (ports as usize + 1).div_ceil(8)
+}
+
+/// Los puertos que un mapa de bits de cambio de estado señala.
+///
+/// El bit `N` es el puerto `N`; el bit 0 es un cambio del hub entero, que este
+/// driver no usa para nada todavía, así que no devuelve ningún puerto. Un bit
+/// por encima de `ports` es basura o un hub que miente: se ignora en vez de
+/// mandar un `GET_STATUS` a un puerto que no existe.
+fn hub_changed_ports(bitmap: &[u8], ports: u8) -> Vec<u8> {
+    (1..=ports)
+        .filter(|&port| {
+            bitmap
+                .get(port as usize / 8)
+                .is_some_and(|b| b & (1 << (port % 8)) != 0)
+        })
+        .collect()
 }
 
 /// El código de velocidad de PORTSC que corresponde a lo que el hub cuenta en
@@ -2212,8 +2240,11 @@ pub struct XhciInner {
     pending_ep_resets: Vec<(u8, u8, bool)>,
     /// Hubs ya configurados, en el orden en que se enumeraron.
     hubs: Vec<HubDev>,
-    /// Marca de tiempo (µs) del último barrido de puertos de hub.
-    hub_scan_last_us: u64,
+    /// `(slot del hub, puerto)` que un endpoint de cambio de estado ha
+    /// señalado. Diferidos por la misma razón que `pending_port_changes`: la
+    /// enumeración emite comandos y espera en el anillo de eventos, y eso no
+    /// puede correr anidado dentro de `pop_ev`.
+    pending_hub_ports: Vec<(u8, u8)>,
     /// HID enumeration deferred from PCI probe so boot can pass 80% quickly.
     boot_enum_pending: bool,
     /// Number of consecutive soft-recovery attempts since the controller last
@@ -2224,15 +2255,34 @@ pub struct XhciInner {
     halt_last_attempt_us: u64,
 }
 
-/// Un hub configurado: lo que hay que recordar para sondear sus puertos y para
-/// apuntar a su Transaction Translator desde los hijos.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Un hub configurado: lo que hay que recordar para enterarse de sus cambios de
+/// puerto y para apuntar a su Transaction Translator desde los hijos.
 struct HubDev {
     slot: u8,
     /// Código de velocidad del propio hub.
     speed: u8,
     ports: u8,
     multi_tt: bool,
+    /// DCI del endpoint de cambio de estado, 0 si no se pudo armar (entonces el
+    /// hub depende del sondeo de [`XhciInner::scan_hubs_if_due`]).
+    ep_dci: u8,
+    /// Marca de tiempo (µs) del último barrido de los puertos de este hub.
+    scan_last_us: u64,
+    /// Fuerza el próximo barrido sin esperar al periodo: lo pone un informe de
+    /// cambio de estado que se perdió.
+    scan_due: bool,
+    /// Único búfer del endpoint, y el tamaño del mapa de bits que cabe en él.
+    ///
+    /// Uno basta, al contrario que en un HID: el hub reenvía el mismo mapa de
+    /// bits hasta que se lee el estado del puerto que lo puso, así que no hay
+    /// un flujo que seguir y perder una repetición no pierde información.
+    buf: Option<DmaBuf>,
+    change_len: usize,
+}
+
+/// Lo que de un hub se lee sin tocar su lista: `(velocidad, puertos, multi_tt)`.
+fn hub_facts(h: &HubDev) -> (u8, u8, bool) {
+    (h.speed, h.ports, h.multi_tt)
 }
 
 struct HidDev {
@@ -2355,7 +2405,7 @@ impl XhciInner {
             port_enum_fails: alloc::vec![0u8; max_ports as usize + 2],
             pending_ep_resets: Vec::new(),
             hubs: Vec::new(),
-            hub_scan_last_us: 0,
+            pending_hub_ports: Vec::new(),
             boot_enum_pending: true,
             halt_attempts: 0,
             halt_last_attempt_us: 0,
@@ -2449,6 +2499,16 @@ impl XhciInner {
 
         if i == 0 || i > self.max_slots as usize {
             return false;
+        }
+
+        // El endpoint de cambio de estado de un hub no lleva informes HID: su
+        // carga es un mapa de bits de puertos, y su anillo tiene un solo TRB.
+        if self
+            .hubs
+            .iter()
+            .any(|h| h.slot == i as u8 && h.ep_dci == dci && dci != 0)
+        {
+            return self.handle_hub_status_event(i as u8, ev, cc);
         }
 
         if cc != TRB_CC_SUCCESS && cc != TRB_CC_SHORT {
@@ -3620,7 +3680,24 @@ impl XhciInner {
             speed,
             ports: info.ports,
             multi_tt: info.multi_tt,
+            ep_dci: 0,
+            scan_last_us: timer_now_us(),
+            scan_due: false,
+            buf: None,
+            change_len: 0,
         });
+        // Armarlo antes de encender los puertos: así los cambios de los
+        // dispositivos que ya estuvieran enchufados llegan por el endpoint en
+        // vez de depender del primer barrido.
+        if let Err(e) = self.arm_hub_status_endpoint(slot, csz, info.ports) {
+            warn!(
+                "[xhci] hub slot={}: sin endpoint de cambio de estado ({:?}); se queda con \
+                 el sondeo cada {} ms",
+                slot,
+                e,
+                HUB_SCAN_PERIOD_US / 1000
+            );
+        }
         for p in 1..=info.ports {
             if let Err(e) = self.hub_port_feature(slot, true, HUB_FEAT_PORT_POWER, p) {
                 warn!(
@@ -3639,13 +3716,19 @@ impl XhciInner {
             }
         }
         // El barrido periódico acaba de hacerse aquí: no repetirlo enseguida.
-        self.hub_scan_last_us = timer_now_us();
+        let now = timer_now_us();
+        if let Some(h) = self.hubs.iter_mut().find(|h| h.slot == slot) {
+            h.scan_last_us = now;
+            h.scan_due = false;
+        }
         Ok(())
     }
 
     /// Enumera (o limpia) lo que haya en el puerto `port` del hub `hub_slot`.
     fn try_hub_port(&mut self, hub_slot: u8, port: u8) -> DeviceResult<()> {
-        let Some(hub) = self.hubs.iter().find(|h| h.slot == hub_slot).copied() else {
+        let Some((hub_speed, _, hub_multi_tt)) =
+            self.hubs.iter().find(|h| h.slot == hub_slot).map(hub_facts)
+        else {
             return Ok(());
         };
         let Some(hub_topo) = self.slot_topo.get(hub_slot as usize).copied().flatten() else {
@@ -3711,8 +3794,8 @@ impl XhciInner {
             return Ok(());
         }
         xhci_spin_delay_us(HUB_RESET_RECOVERY_US);
-        let speed = hub_port_speed(hub.speed, status);
-        let Some(child) = hub_topo.child(hub_slot, hub.speed, port, speed, hub.multi_tt) else {
+        let speed = hub_port_speed(hub_speed, status);
+        let Some(child) = hub_topo.child(hub_slot, hub_speed, port, speed, hub_multi_tt) else {
             warn!(
                 "[xhci] hub slot={} puerto {}: queda más allá de los {} niveles que un \
                  route string puede nombrar, no se enumera",
@@ -3727,6 +3810,223 @@ impl XhciInner {
         self.setup_device(child, speed)
     }
 
+    /// Busca el endpoint de interrupción IN de la interfaz de clase hub en el
+    /// descriptor de configuración. Un hub tiene exactamente uno (USB 2.0
+    /// §11.12.1) y es por donde avisa de sus cambios de puerto.
+    fn hub_status_endpoint(&mut self, slot: u8) -> DeviceResult<(u8, u16, u8)> {
+        let sniff = DmaBuf::new(64, 64)?;
+        sniff.flush(0, 64);
+        if let Err(e) = self.ep0_control_in(slot, trb_setup(0x80, 0x06, 0x0200, 0, 9, 3), &sniff, 9)
+        {
+            sniff.leak();
+            return Err(e);
+        }
+        sniff.flush(0, 64);
+        let mut hdr = [0u8; 9];
+        sniff.read_into(0, &mut hdr);
+        let total = u16::from_le_bytes([hdr[2], hdr[3]]) as usize;
+        if !(9..=8192).contains(&total) {
+            return Err(DeviceError::InvalidParam);
+        }
+        let buf_len = (total.div_ceil(64) * 64).max(64);
+        let cfgb = DmaBuf::new(buf_len, 64)?;
+        cfgb.flush(0, buf_len);
+        if let Err(e) = self.ep0_control_in(
+            slot,
+            trb_setup(0x80, 0x06, 0x0200, 0, total as u16, 3),
+            &cfgb,
+            total as u32,
+        ) {
+            cfgb.leak();
+            return Err(e);
+        }
+        cfgb.flush(0, buf_len);
+        let mut raw = alloc::vec![0u8; total];
+        cfgb.read_into(0, &mut raw[..total]);
+        let mut in_hub_iface = false;
+        let mut o = 0usize;
+        while o + 2 <= total {
+            let dl = raw[o] as usize;
+            let dt = raw[o + 1];
+            if dl < 2 || o + dl > total {
+                break;
+            }
+            if dt == USB_DESC_IFACE && dl >= 9 {
+                in_hub_iface = raw[o + 5] == USB_CLASS_HUB;
+            }
+            if dt == USB_DESC_EP && dl >= 7 && in_hub_iface {
+                let addr = raw[o + 2];
+                let attr = raw[o + 3];
+                if (addr & 0x80) != 0 && (attr & 3) == 3 {
+                    let mps = u16::from_le_bytes([raw[o + 4], raw[o + 5]]) & 0x7ff;
+                    return Ok((addr, mps, raw[o + 6]));
+                }
+            }
+            o += dl;
+        }
+        Err(DeviceError::NotSupported)
+    }
+
+    /// Arma el endpoint de cambio de estado de un hub ya configurado.
+    ///
+    /// Si falla, el hub se queda con el sondeo de [`Self::scan_hubs_if_due`]:
+    /// más lento, pero un hub mudo sería peor.
+    fn arm_hub_status_endpoint(&mut self, slot: u8, csz: usize, ports: u8) -> DeviceResult<()> {
+        let (ep_addr, mps, interval) = self.hub_status_endpoint(slot)?;
+        // El mapa de bits nunca pasa de 16 bytes (15 puertos + el bit del hub),
+        // pero se le deja el paquete entero del endpoint para que un hub que
+        // mande más no desborde a Babble.
+        let len = hub_change_bytes(ports).max(mps as usize).max(2);
+        let dci = self.configure_int_in_endpoint(slot, csz, ep_addr, mps, interval, len, 16)?;
+        let buf = DmaBuf::new(len, 64)?;
+        // Evict the zeroing `DmaBuf::new` just did before the controller starts
+        // DMA-ing into it, igual que los búferes de informe HID.
+        buf.flush(0, len);
+        let phys = buf.sub_phys(0);
+        {
+            let ring = self
+                .xfer_rings
+                .get_mut(Self::ri(slot, dci))
+                .and_then(|o| o.as_mut())
+                .ok_or(DeviceError::NotSupported)?;
+            ring.push(trb_normal(phys, len as u16, true))?;
+        }
+        if let Some(h) = self.hubs.iter_mut().find(|h| h.slot == slot) {
+            h.ep_dci = dci;
+            h.change_len = len;
+            if let Some(old) = h.buf.replace(buf) {
+                old.leak();
+            }
+        } else {
+            buf.leak();
+            return Err(DeviceError::InvalidParam);
+        }
+        self.mmio.ring_db(slot, dci);
+        info!(
+            "[xhci] hub slot={}: cambios de puerto por el endpoint dci={} ({} bytes de mapa \
+             de bits, intervalo {})",
+            slot, dci, len, interval
+        );
+        Ok(())
+    }
+
+    /// Vuelve a armar el único TRB del endpoint de cambio de estado de un hub.
+    fn rearm_hub_status_trb(&mut self, slot: u8) {
+        let Some((dci, len, phys)) = self.hubs.iter().find(|h| h.slot == slot).and_then(|h| {
+            h.buf
+                .as_ref()
+                .map(|b| (h.ep_dci, h.change_len, b.sub_phys(0)))
+        }) else {
+            return;
+        };
+        if dci == 0 {
+            return;
+        }
+        let ridx = Self::ri(slot, dci);
+        if let Some(r) = self.xfer_rings.get_mut(ridx).and_then(|o| o.as_mut()) {
+            if r.push(trb_normal(phys, len as u16, true)).is_err() {
+                warn!(
+                    "[xhci] hub slot={}: el anillo del endpoint de estado está lleno; el \
+                     sondeo cubre los cambios",
+                    slot
+                );
+                return;
+            }
+        } else {
+            return;
+        }
+        fence(Ordering::SeqCst);
+        self.mmio.ring_db(slot, dci);
+    }
+
+    /// Atiende una Transfer Event del endpoint de cambio de estado de un hub:
+    /// apunta los puertos que el mapa de bits señala y vuelve a armar el TRB.
+    ///
+    /// Los puertos no se tocan aquí: esto corre dentro de `pop_ev` y enumerar
+    /// emite comandos que esperan en el anillo de eventos.
+    fn handle_hub_status_event(&mut self, slot: u8, ev: &Trb, cc: u32) -> bool {
+        let Some((dci, len)) = self
+            .hubs
+            .iter()
+            .find(|h| h.slot == slot)
+            .map(|h| (h.ep_dci, h.change_len))
+        else {
+            return false;
+        };
+        let ridx = Self::ri(slot, dci);
+        if let Some(r) = self.xfer_rings.get_mut(ridx).and_then(|o| o.as_mut()) {
+            r.advance_dequeue(1);
+        }
+        if cc != TRB_CC_SUCCESS && cc != TRB_CC_SHORT {
+            if cc_halts_endpoint(cc) {
+                let stalled = cc == 6;
+                if let Some(e) = self
+                    .pending_ep_resets
+                    .iter_mut()
+                    .find(|(sl, d, _)| *sl == slot && *d == dci)
+                {
+                    e.2 |= stalled;
+                } else {
+                    self.pending_ep_resets.push((slot, dci, stalled));
+                }
+            } else {
+                warn!(
+                    "[xhci] hub slot={} dci={} estado cc={} (el endpoint no está halted)",
+                    slot, dci, cc
+                );
+            }
+            self.rearm_hub_status_trb(slot);
+            // Un barrido cubre lo que ese informe perdido traía.
+            if let Some(h) = self.hubs.iter_mut().find(|h| h.slot == slot) {
+                h.scan_due = true;
+            }
+            return true;
+        }
+        // Residual en los 24 bits bajos: lo que NO se transfirió (§6.4.2.1).
+        let actual = len.saturating_sub((ev.status & 0x00ff_ffff) as usize);
+        let mut bitmap = [0u8; 16];
+        let n = actual.min(bitmap.len());
+        let ports = self
+            .hubs
+            .iter()
+            .find(|h| h.slot == slot)
+            .map(|h| h.ports)
+            .unwrap_or(0);
+        if let Some(buf) = self
+            .hubs
+            .iter()
+            .find(|h| h.slot == slot)
+            .and_then(|h| h.buf.as_ref())
+        {
+            // Invalidar para ver lo que el controlador acaba de escribir.
+            buf.flush(0, len);
+            buf.read_into(0, &mut bitmap[..n]);
+        }
+        for port in hub_changed_ports(&bitmap[..n], ports) {
+            if !self.pending_hub_ports.contains(&(slot, port)) {
+                self.pending_hub_ports.push((slot, port));
+            }
+        }
+        self.rearm_hub_status_trb(slot);
+        true
+    }
+
+    /// Atiende los puertos que los endpoints de estado han señalado.
+    fn drain_pending_hub_ports(&mut self) {
+        for _ in 0..64 {
+            let Some((slot, port)) = self.pending_hub_ports.first().copied() else {
+                return;
+            };
+            self.pending_hub_ports.remove(0);
+            if let Err(e) = self.try_hub_port(slot, port) {
+                warn!(
+                    "[xhci] hub slot={} puerto {}: el cambio señalado no se pudo atender ({:?})",
+                    slot, port, e
+                );
+            }
+        }
+    }
+
     /// Barre los puertos de los hubs conocidos buscando enchufes y
     /// desenchufes.
     ///
@@ -3739,12 +4039,25 @@ impl XhciInner {
             return;
         }
         let now = timer_now_us();
-        if now.wrapping_sub(self.hub_scan_last_us) < HUB_SCAN_PERIOD_US {
-            return;
-        }
-        self.hub_scan_last_us = now;
-        let hubs: Vec<(u8, u8)> = self.hubs.iter().map(|h| (h.slot, h.ports)).collect();
-        for (slot, ports) in hubs {
+        let due: Vec<(u8, u8)> = self
+            .hubs
+            .iter()
+            .filter(|h| {
+                h.scan_due
+                    || now.wrapping_sub(h.scan_last_us)
+                        >= if h.ep_dci != 0 {
+                            HUB_BACKSTOP_PERIOD_US
+                        } else {
+                            HUB_SCAN_PERIOD_US
+                        }
+            })
+            .map(|h| (h.slot, h.ports))
+            .collect();
+        for (slot, ports) in due {
+            if let Some(h) = self.hubs.iter_mut().find(|h| h.slot == slot) {
+                h.scan_last_us = now;
+                h.scan_due = false;
+            }
             if self
                 .slot_topo
                 .get(slot as usize)
@@ -4021,6 +4334,92 @@ impl XhciInner {
         Some(class)
     }
 
+    /// Configura un endpoint de interrupción IN del dispositivo `slot` y le
+    /// deja su anillo de transferencia montado y vacío. Devuelve el DCI.
+    ///
+    /// Lo usan por igual las interfaces HID y el endpoint de cambio de estado
+    /// de un hub: la parte delicada --copiar el Slot Context entero cuando
+    /// A0=1, subir Context Entries, el intervalo y el Max ESIT Payload-- es la
+    /// misma y tener dos copias de ella es como se rompe una de las dos.
+    fn configure_int_in_endpoint(
+        &mut self,
+        slot: u8,
+        csz: usize,
+        ep_addr: u8,
+        mps: u16,
+        interval: u8,
+        avg_trb_len: usize,
+        ring_trbs: usize,
+    ) -> DeviceResult<u8> {
+        let epn = ep_addr & 0x0f;
+        let dci = (epn * 2 + 1) as usize;
+        if dci >= 32 {
+            return Err(DeviceError::InvalidParam);
+        }
+
+        let cfg = DmaBuf::new(33 * csz, 64)?;
+        // Input Control Context: add Slot (A0) and the new endpoint (A_dci)
+        cfg.write_u32(4, 0x01 | (1u32 << dci));
+
+        // Copy the current Device Slot Context (at device-context offset 0) into the Input
+        // Slot Context (at input-context offset csz).  The xHCI spec requires software to
+        // supply a complete, valid Slot Context whenever A0=1 in a Configure Endpoint
+        // command – writing zeros would corrupt the USB device address and port fields.
+        if let Some(dev) = self.dev_ctx.get(slot as usize).and_then(|o| o.as_ref()) {
+            dev.flush(0, csz); // Invalidate cache lines so we read the fresh Device Context updated by the controller
+            for i in 0..(csz / 4) {
+                cfg.write_u32(csz + i * 4, dev.read_u32(i * 4));
+            }
+        }
+        // Raise Context Entries to cover the new endpoint DCI.
+        let slot_dw0 = cfg.read_u32(csz);
+        let cur_entries = (slot_dw0 >> 27) & 0x1f;
+        let new_entries = (dci as u32).max(cur_entries);
+        cfg.write_u32(csz, (slot_dw0 & !(0x1f << 27)) | (new_entries << 27));
+
+        let ep_off = csz + csz + (dci - 1) * csz;
+
+        // Endpoint Context DW0. Interval is bits 23:16 (xHCI 1.2 table 6-9);
+        // bits 31:24 are Max ESIT Payload Hi, RsvdZ unless LEC=1.
+        let speed = self.slot_speed[slot as usize];
+        cfg.write_u32(ep_off, xhci_endpoint_interval(speed, interval) << 16);
+
+        // Endpoint Context DW1: Error Count field (bits 2:1) = 3 (value 3 << 1 = 0b110),
+        // EP Type, Max Packet Size.  Error Count = 3 allows up to 3 retries after failure.
+        let ep_ty = (3u32 << 1) | EP_TYPE_INT_IN | ((mps as u32) << 16);
+        cfg.write_u32(ep_off + 4, ep_ty);
+        let ir = XferRing::new(ring_trbs)?;
+        let irp = ir.ring_phys() | 1; // DCS = 1
+        cfg.write_u64(ep_off + 8, irp);
+        // Endpoint Context DW4: Max ESIT Payload Lo (bits 31:16) and Average
+        // TRB Length (bits 15:0). DW4 exists for 32-byte contexts too (CSZ only
+        // changes the stride), and an interrupt endpoint's Max ESIT Payload is
+        // its max packet size; it used to be left at 0, which stricter xHCs
+        // may reject with Parameter Error or use to under-reserve bandwidth.
+        cfg.write_u32(
+            ep_off + 16,
+            ((mps as u32) << 16) | ((avg_trb_len as u32) & 0xffff),
+        );
+        let ridx = Self::ri(slot, dci as u8);
+        if let Some(old) = self.xfer_rings[ridx].replace(ir) {
+            old.leak();
+        }
+
+        // Flush before the doorbell, not after: the controller reads the input
+        // context by DMA the moment the command ring is rung.
+        cfg.flush(0, 33 * csz);
+        let p = self
+            .cmd
+            .push(trb_configure_endpoint(cfg.sub_phys(0), slot))?;
+        self.mmio.ring_db(0, 0);
+        if let Err(e) = self.wait_cmd_phys(p) {
+            cfg.leak();
+            return Err(e);
+        }
+
+        Ok(dci as u8)
+    }
+
     fn init_single_hid(
         &mut self,
         slot: u8,
@@ -4123,71 +4522,10 @@ impl XhciInner {
             true,
         );
 
-        let epn = ep_addr & 0x0f;
-        let dci = (epn * 2 + 1) as usize;
-        if dci >= 32 {
-            return Err(DeviceError::InvalidParam);
-        }
-
-        let cfg = DmaBuf::new(33 * csz, 64)?;
-        // Input Control Context: add Slot (A0) and the new endpoint (A_dci)
-        cfg.write_u32(4, 0x01 | (1u32 << dci));
-
-        // Copy the current Device Slot Context (at device-context offset 0) into the Input
-        // Slot Context (at input-context offset csz).  The xHCI spec requires software to
-        // supply a complete, valid Slot Context whenever A0=1 in a Configure Endpoint
-        // command – writing zeros would corrupt the USB device address and port fields.
-        if let Some(dev) = self.dev_ctx.get(slot as usize).and_then(|o| o.as_ref()) {
-            dev.flush(0, csz); // Invalidate cache lines so we read the fresh Device Context updated by the controller
-            for i in 0..(csz / 4) {
-                cfg.write_u32(csz + i * 4, dev.read_u32(i * 4));
-            }
-        }
-        // Raise Context Entries to cover the new endpoint DCI.
-        let slot_dw0 = cfg.read_u32(csz);
-        let cur_entries = (slot_dw0 >> 27) & 0x1f;
-        let new_entries = (dci as u32).max(cur_entries);
-        cfg.write_u32(csz, (slot_dw0 & !(0x1f << 27)) | (new_entries << 27));
-
-        let ep_off = csz + csz + (dci - 1) * csz;
-
-        // Endpoint Context DW0. Interval is bits 23:16 (xHCI 1.2 table 6-9);
-        // bits 31:24 are Max ESIT Payload Hi, RsvdZ unless LEC=1.
-        let speed = self.slot_speed[slot as usize];
-        cfg.write_u32(ep_off, xhci_endpoint_interval(speed, interval) << 16);
-
-        // Endpoint Context DW1: Error Count field (bits 2:1) = 3 (value 3 << 1 = 0b110),
-        // EP Type, Max Packet Size.  Error Count = 3 allows up to 3 retries after failure.
-        let ep_ty = (3u32 << 1) | EP_TYPE_INT_IN | ((mps as u32) << 16);
-        cfg.write_u32(ep_off + 4, ep_ty);
-        let ir = XferRing::new(64)?;
-        let irp = ir.ring_phys() | 1; // DCS = 1
-        cfg.write_u64(ep_off + 8, irp);
-        // Endpoint Context DW4: Max ESIT Payload Lo (bits 31:16) and Average
-        // TRB Length (bits 15:0). DW4 exists for 32-byte contexts too (CSZ only
-        // changes the stride), and an interrupt endpoint's Max ESIT Payload is
-        // its max packet size; it used to be left at 0, which stricter xHCs
-        // may reject with Parameter Error or use to under-reserve bandwidth.
-        cfg.write_u32(
-            ep_off + 16,
-            ((mps as u32) << 16) | ((report_len as u32) & 0xffff),
-        );
+        let dci = self
+            .configure_int_in_endpoint(slot, csz, ep_addr, mps, interval, report_len, 64)?
+            as usize;
         let ridx = Self::ri(slot, dci as u8);
-        if let Some(old) = self.xfer_rings[ridx].replace(ir) {
-            old.leak();
-        }
-
-        // Flush before the doorbell, not after: the controller reads the input
-        // context by DMA the moment the command ring is rung.
-        cfg.flush(0, 33 * csz);
-        let p = self
-            .cmd
-            .push(trb_configure_endpoint(cfg.sub_phys(0), slot))?;
-        self.mmio.ring_db(0, 0);
-        if let Err(e) = self.wait_cmd_phys(p) {
-            cfg.leak();
-            return Err(e);
-        }
 
         // Allocate one report buffer per pre-queued TRB so the controller can
         // race ahead by HID_QUEUE_DEPTH transfers without overwriting a buffer
@@ -4657,6 +4995,7 @@ impl XhciInner {
         }
         if may_enumerate {
             self.drain_pending_port_changes();
+            self.drain_pending_hub_ports();
             self.scan_hubs_if_due();
         }
         // Recover any HID endpoint that stalled during the drain above.
@@ -4690,16 +5029,26 @@ impl XhciInner {
             // The replacement TRBs went onto the ring as each failure was
             // handled, so there is nothing to re-arm here: the endpoint only
             // needs its doorbell rung to start consuming them again.
-            if let Some(idx) = self
+            if self
                 .hids
                 .iter()
-                .position(|h| h.slot_id == slot && h.ep_dci == dci)
+                .any(|h| h.slot_id == slot && h.ep_dci == dci)
             {
-                let _ = idx;
                 fence(Ordering::SeqCst);
                 self.mmio.ring_db(slot, dci);
                 warn!(
                     "[xhci] recovered HID endpoint slot={} dci={} after a transfer error",
+                    slot, dci
+                );
+            } else if self.hubs.iter().any(|h| h.slot == slot && h.ep_dci == dci) {
+                // El TRB de repuesto de un hub se empuja en
+                // `handle_hub_status_event`, pero un Reset Endpoint deja la
+                // campana sin tocar: sin esto, el hub se queda mudo y solo el
+                // sondeo lo cubre.
+                fence(Ordering::SeqCst);
+                self.mmio.ring_db(slot, dci);
+                warn!(
+                    "[xhci] recovered hub status endpoint slot={} dci={} after a transfer error",
                     slot, dci
                 );
             }
@@ -4912,7 +5261,19 @@ impl XhciInner {
             }
             self.slot_topo[slot as usize] = None;
             self.slot_speed[slot as usize] = 0;
-            self.hubs.retain(|h| h.slot != slot);
+            if let Some(pos) = self.hubs.iter().position(|h| h.slot == slot) {
+                let hub = self.hubs.remove(pos);
+                // El controlador ya no mira este búfer si el Disable Slot pasó;
+                // si no, se abandona como el resto de la DMA del slot.
+                if let Some(b) = hub.buf {
+                    if disabled {
+                        drop(b);
+                    } else {
+                        b.leak();
+                    }
+                }
+            }
+            self.pending_hub_ports.retain(|&(s, _)| s != slot);
             for ep in 1..32 {
                 let ri = Self::ri(slot, ep);
                 if ri < self.xfer_rings.len() {
@@ -5578,13 +5939,16 @@ impl InputScheme for XhciUsbHid {
             let _ = writeln!(
                 s,
                 "[usbhid] hub slot={} root_port={} route={:#x} tier={} ports={} speed={} \
-                 children={}",
+                 status_ep={} children={}",
                 h.slot,
                 topo.root_port,
                 topo.route,
                 topo.depth,
                 h.ports,
                 h.speed,
+                // dci=0 es «no se pudo armar»: ese hub va solo con el sondeo, y
+                // es lo primero que hay que saber si un cambio no se nota.
+                h.ep_dci,
                 (1..=xi.max_slots)
                     .filter(|&c| xi
                         .slot_topo
@@ -8000,6 +8364,44 @@ mod hub_tests {
             "un puerto que no cabe en un nibble no se puede enumerar, así que \
              tampoco se recorre"
         );
+    }
+
+    #[test]
+    fn the_change_bitmap_is_one_bit_per_port_plus_the_hubs_own() {
+        // Siete puertos + el bit del hub = 8 bits = 1 byte. Ocho puertos ya
+        // necesitan dos, y pedir uno habria dejado al puerto 8 fuera del
+        // informe para siempre.
+        assert_eq!(hub_change_bytes(1), 1);
+        assert_eq!(hub_change_bytes(7), 1);
+        assert_eq!(hub_change_bytes(8), 2);
+        assert_eq!(hub_change_bytes(HUB_MAX_PORTS), 2);
+    }
+
+    #[test]
+    fn the_bit_of_each_port_is_the_port_itself_and_bit_zero_is_not_a_port() {
+        // bit 1 -> puerto 1, bit 3 -> puerto 3.
+        assert_eq!(hub_changed_ports(&[0b0000_1010], 7), alloc::vec![1, 3]);
+        // El bit 0 es un cambio del hub entero, no un puerto: creerselo
+        // mandaria un GET_STATUS al puerto 0, que no existe.
+        assert_eq!(hub_changed_ports(&[0b0000_0001], 7), alloc::vec![]);
+        // Y el puerto 8 vive en el segundo byte, bit 0.
+        assert_eq!(hub_changed_ports(&[0, 0b0000_0001], 8), alloc::vec![8]);
+    }
+
+    #[test]
+    fn a_bit_above_the_port_count_or_past_the_report_is_ignored() {
+        // Un hub de cuatro puertos que marca el bit 6 miente o es basura.
+        assert_eq!(hub_changed_ports(&[0b0100_0000], 4), alloc::vec![]);
+        // Y un informe corto no se lee mas alla de lo que trajo.
+        assert_eq!(hub_changed_ports(&[0b0000_0100], 15), alloc::vec![2]);
+        assert_eq!(hub_changed_ports(&[], 7), alloc::vec![]);
+    }
+
+    #[test]
+    fn the_backstop_sweep_is_slower_than_the_sweep_that_is_the_only_signal() {
+        // Si se igualaran, un hub con su endpoint armado pagaria una
+        // transferencia de control por puerto y por segundo para nada.
+        assert!(HUB_BACKSTOP_PERIOD_US > HUB_SCAN_PERIOD_US);
     }
 
     #[test]
