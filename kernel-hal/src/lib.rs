@@ -7,6 +7,11 @@
 // id cast to `u8` -- which is why that gate was unconditional, and why it is
 // not any more.
 #![cfg_attr(all(feature = "libos", test), feature(thread_id_value))]
+// The native `#[bench]` harness, asked for only in a test build: the rows live
+// in `#[cfg(test)] mod benches` next to the code they measure, because
+// `mod common` is private and a `benches/` target would not see a single one
+// of these helpers. See `docs/README-benchmarks.md`.
+#![cfg_attr(test, feature(test))]
 #![feature(doc_cfg)]
 // #![feature(core_intrinsics)]
 #![allow(clippy::uninit_vec)]
@@ -16,6 +21,8 @@
 #![allow(dead_code)]
 
 extern crate alloc;
+#[cfg(test)]
+extern crate test;
 #[macro_use]
 extern crate log;
 #[macro_use]

@@ -605,3 +605,156 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod benches {
+    //! What arming and refreshing a timeout costs.
+    //!
+    //! This is the module every timed wait in the kernel goes through --
+    //! `poll`, `epoll_wait`, `select`, `nanosleep`, `futex` with a timeout,
+    //! `semop` with one -- and it is called from `poll`, not once per wait.
+    //! A future that is polled ten times before its deadline runs
+    //! [`ensure_timer_waker`] ten times. So the question is not what arming
+    //! a timer costs, it is what the ninth poll costs when the timer is
+    //! already armed for the right instant and nothing needs doing.
+    //!
+    //! The rows go through [`ensure_timer_waker_with`] rather than
+    //! [`ensure_timer_waker`] so the timer is a closure this module owns: the
+    //! real `timer_set` would hand the callback to the platform timer, which
+    //! would fire on a wall clock in the middle of a measurement.
+    //!
+    //! The probe waker counts its clones and drops with `SeqCst` atomics, so
+    //! a few nanoseconds of every row below are the probe. Both the refresh
+    //! and the re-arm row pay the same clone, so the *difference* between
+    //! them is clean even though neither absolute figure is.
+
+    use super::test_waker::{waker_of, Probe};
+    use super::*;
+    use test::{black_box, Bencher};
+
+    const DL: Duration = Duration::from_millis(50);
+    const LATER: Duration = Duration::from_millis(70);
+
+    /// A timer that keeps the callback instead of arming anything, so no
+    /// wall clock can fire in the middle of a row.
+    fn hold(_deadline: Duration, callback: TimerCallback) {
+        core::mem::forget(callback);
+    }
+
+    /// The common case, and the one that matters: the slot is already armed
+    /// for this exact deadline and still live, so the whole call is a waker
+    /// clone and a store under a lock. This is what every poll of an
+    /// already-armed timed wait pays.
+    #[bench]
+    fn refresh_an_armed_slot_for_the_same_deadline(b: &mut Bencher) {
+        let probe = Probe::new();
+        let waker = waker_of(&probe);
+        let mut slot = None;
+        ensure_timer_waker_with(&mut slot, DL, &waker, hold);
+        b.iter(|| {
+            ensure_timer_waker_with(black_box(&mut slot), black_box(DL), black_box(&waker), hold)
+        });
+        // Keep the slot alive past the loop: dropping it is a cancel, and a
+        // cancel inside the measurement would be measuring `kill`.
+        core::mem::forget(slot);
+    }
+
+    /// Arming from empty: an `Arc` allocation, a `Box` for the callback, a
+    /// waker clone. This is the first poll of a timed wait.
+    #[bench]
+    fn arm_an_empty_slot(b: &mut Bencher) {
+        let probe = Probe::new();
+        let waker = waker_of(&probe);
+        b.iter(|| {
+            let mut slot = None;
+            ensure_timer_waker_with(black_box(&mut slot), black_box(DL), black_box(&waker), hold);
+            core::mem::forget(black_box(slot));
+        });
+    }
+
+    /// Re-arming because the deadline moved: the cancel of the old timer
+    /// plus a fresh arm. Against the refresh row above, this is what a
+    /// caller pays for recomputing its deadline between polls instead of
+    /// keeping it -- a `poll(2)` that subtracts elapsed time from its
+    /// timeout each round does exactly that, and so takes this path every
+    /// time rather than the cheap one.
+    #[bench]
+    fn re_arm_because_the_deadline_moved(b: &mut Bencher) {
+        let probe = Probe::new();
+        let waker = waker_of(&probe);
+        b.iter(|| {
+            let mut slot = None;
+            ensure_timer_waker_with(&mut slot, black_box(DL), black_box(&waker), hold);
+            ensure_timer_waker_with(
+                black_box(&mut slot),
+                black_box(LATER),
+                black_box(&waker),
+                hold,
+            );
+            core::mem::forget(black_box(slot));
+        });
+    }
+
+    /// The cancel on its own, which is what every timed wait that returns
+    /// before its deadline runs -- so, every `poll` that had something to
+    /// report, which is the case a server is in all day.
+    #[bench]
+    fn kill_an_armed_slot(b: &mut Bencher) {
+        let probe = Probe::new();
+        let waker = waker_of(&probe);
+        b.iter(|| {
+            let mut slot = None;
+            ensure_timer_waker_with(&mut slot, black_box(DL), black_box(&waker), hold);
+            kill_timer_waker(black_box(&mut slot));
+            black_box(slot.is_none())
+        });
+    }
+
+    /// `kill` on a slot that was never armed: the shape of a `poll` with no
+    /// timeout at all, which must not pay for the timeout machinery.
+    #[bench]
+    fn kill_an_empty_slot(b: &mut Bencher) {
+        b.iter(|| {
+            let mut slot: Option<TimerWakerSlot> = None;
+            kill_timer_waker(black_box(&mut slot));
+            black_box(slot.is_none())
+        });
+    }
+
+    /// Reading the deadline back out, which is what a future compares
+    /// against to decide whether its timer is the one it wants.
+    #[bench]
+    fn read_the_deadline_of_an_armed_slot(b: &mut Bencher) {
+        let probe = Probe::new();
+        let waker = waker_of(&probe);
+        let mut slot = None;
+        ensure_timer_waker_with(&mut slot, DL, &waker, hold);
+        let slot = slot.expect("just armed");
+        b.iter(|| black_box(black_box(&slot).deadline()));
+        core::mem::forget(slot);
+    }
+
+    /// `is_done`, the atomic every refresh reads twice: once to decide
+    /// whether the slot is still live, and once after storing the fresh
+    /// waker to catch the callback that fired in between.
+    #[bench]
+    fn is_done_of_an_armed_slot(b: &mut Bencher) {
+        let probe = Probe::new();
+        let waker = waker_of(&probe);
+        let mut slot = None;
+        ensure_timer_waker_with(&mut slot, DL, &waker, hold);
+        let slot = slot.expect("just armed");
+        b.iter(|| black_box(black_box(&slot).is_done()));
+        core::mem::forget(slot);
+    }
+
+    /// The probe's own waker clone, with no timer machinery around it: the
+    /// floor under the refresh row, since cloning the waker is most of what
+    /// a refresh does.
+    #[bench]
+    fn the_waker_clone_alone(b: &mut Bencher) {
+        let probe = Probe::new();
+        let waker = waker_of(&probe);
+        b.iter(|| black_box(black_box(&waker).clone()));
+    }
+}
