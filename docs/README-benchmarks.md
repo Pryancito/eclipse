@@ -39,14 +39,19 @@ silently. Run them locally, on an idle machine, before and after a change.
 ## Where a bench file lives
 
 `benches/` is the usual place and is where the `linux-object` and
-`zircon-object` targets are. `linux-syscall` is the exception: every submodule
-of that crate is private (`mod file;`, `mod task;`, `mod vm;` ...), so a
-`benches/` target there would not see a single syscall helper. Its benches are
-`#[cfg(test)] mod benches` blocks beside the code they measure, which is the
-form the native harness documents first, and they build with the lib:
-`cargo bench -p linux-syscall`. `#![cfg_attr(test, feature(test))]` in its
-`lib.rs` asks for the unstable attribute only in a test build, so a kernel
-build never sees it.
+`zircon-object` targets are. `linux-syscall`, `kernel-hal` and `zcore-drivers`
+are the exceptions, for the same reason in all three: the modules worth
+measuring are private. Every submodule of `linux-syscall` is (`mod file;`,
+`mod task;`, `mod vm;` ...); `kernel-hal` declares `mod common;` with a
+handful of re-exports in `lib.rs`, so the user-copy and timer machinery is
+unreachable from outside; and the fence helpers in `zcore-drivers` are private
+to their module. A `benches/` target in any of them would not see a single
+helper. Their benches are `#[cfg(test)] mod benches` blocks beside the code
+they measure, which is the form the native harness documents first, and they
+build with the lib: `cargo bench -p linux-syscall`, `-p kernel-hal`,
+`-p zcore-drivers --features graphic,virtio,xhci-usb-hid`.
+`#![cfg_attr(test, feature(test))]` in each `lib.rs` asks for the unstable
+attribute only in a test build, so a kernel build never sees it.
 
 Beside the code has a second advantage worth having on purpose: a bench that
 sits under the function it measures is read by whoever changes that function.
@@ -118,6 +123,13 @@ two agree the measurement is standing on something.
 | `select`/`poll`/`epoll` per-call and per-fd work | `fs` section | `linux-syscall` `file::poll::benches::*` |
 | `getdents64` | `fs` section | `linux-syscall` `file::dir::benches::getdents64_*` |
 | `read`/`write` through a pipe ring | `net`/`fs` round trips | `linux-syscall` `file::file::benches::pipe_*` |
+| the permission check every copy to or from userspace pays | — | `kernel-hal` `common::user::benches::check_len_*` |
+| a one-value and a buffer copy across the user boundary | — | `kernel-hal` `common::user::benches::{read,write}_{one_u64,array_of_*}` |
+| taking a path string from userspace | `fs` section | `kernel-hal` `common::user::benches::as_c_str_*` |
+| `readv`/`writev`/`sendmsg` gather lists | — | `kernel-hal` `common::user::benches::{read_iovecs,read_to_vec,read_bytes_at,drain}_*` |
+| arming and refreshing a syscall timeout | — | `kernel-hal` `common::timer_waker::benches::*` |
+| looking at a GPU fence's landing zone | — | `zcore-drivers` `scheme::syncobj::benches::landed_*` |
+| the CPU-side fence wait's backoff policy | — | `zcore-drivers` `scheme::syncobj::benches::{wait_spin_backoff,fence_poll_step}_*` |
 | the flag and descriptor arguments of `open`, `dup`, `fcntl` | — | `linux-syscall` `file::fd::benches::*` |
 | `mincore` and `msync`, which walk a range page by page | `vm` section | `linux-syscall` `vm::benches::mincore_*`, `msync_*` |
 | the `(addr, len)` and flag words of the memory calls | — | `linux-syscall` `vm::benches::*_arg_check`, `mmap_*` |
@@ -408,3 +420,137 @@ kernel's own code and the figures are real. Anything that must reach a frame or
 a page table goes through the host underneath, so `vmar_map_unmap_*` includes a
 host `mmap` and is a ceiling on the bare-metal cost rather than a measurement
 of it.
+
+## What the HAL's copies said
+
+Three batches of syscall rows ended on the same sentence: what a syscall costs
+is "the entry, the copies and the subsystem". The subsystem had rows and the
+argument work turned out to be free, so that sentence was a budget with its
+largest line item unmeasured. These are the copies.
+
+- **A small copy is the permission check, not the memory.** `check_len` --
+  null, alignment, the user-half bound, and an indirect call into the address
+  space to ask whether anything is mapped there -- is **9.1 ns and flat**: the
+  same for one byte as for 4 KiB. Reading one `u64` across the boundary is
+  **9.2 ns**, which is that check and nothing else. So for a `timespec`, a
+  `sockaddr` or an `int`, the eight bytes are free and the permission question
+  is the whole price.
+- **`as_slice` costs exactly the check, and `read_array` costs the copy on top
+  of it.** `as_slice` is 8.9 ns at 64 bytes and 9.2 ns at 64 KiB -- flat,
+  because it checks the range and forms a slice over the caller's own memory.
+  `read_array` allocates and copies: 16.0 ns at 64 bytes, 56.5 ns at 4 KiB,
+  **1.58 us at 64 KiB**. A syscall that takes a copy it does not need pays
+  **1.6 us per 64 KiB** for the privilege. (That is the same shape as
+  `try_zeroed_buf`'s 20 ns/KiB of zeroing a buffer about to be overwritten,
+  and compounds with it.)
+- **The allocation is ~7 ns of a small read.** `write_array` does no
+  allocating and is 10.6 ns at 64 bytes against `read_array`'s 16.0; at 4 KiB
+  and above they converge (41.8 vs 56.5 ns, 1.56 vs 1.58 us) as memory
+  bandwidth takes over. Net of the check, a 64 KiB copy runs at about
+  0.024 ns/byte.
+- **Taking a path is mostly hunting for its NUL.** `as_c_str` is 20.9 ns for a
+  24-byte name, 87.9 ns for 256 bytes and 905 ns for 4 KiB -- about
+  **0.22 ns per byte of name**. `as_str` with the length already known is
+  15.4 ns at 256 bytes, so of `as_c_str`'s 87.9 the scan is **72 ns and the
+  UTF-8 validation is nearly free**. The scan is a byte-at-a-time
+  `find(|i| *ptr.add(i) == 0)`, and it runs over bytes the `check()` above it
+  validated one of. `execve`'s `argv` pays it per entry, plus a
+  `String` allocation each: 8 entries of 24 bytes is **303 ns** and 256
+  entries is **8.69 us**, about 34 ns per argument.
+- **`read_to_vec`'s cost is one permission check per iovec.** Gathering 1024
+  iovecs of 64 bytes takes **10.8 us** for 64 KiB of payload -- 0.164 ns/byte,
+  seven times the 0.024 ns/byte a single `read_array` of the same 64 KiB
+  manages. 1024 checks at 9.1 ns is 9.3 us of it, so the per-entry check is
+  essentially the whole figure.
+- **And the bounded alternative is quadratic.** `read_bytes_at` was added so
+  `writev` could drain an arbitrarily large gather list through a bounded
+  kernel buffer instead of `read_to_vec`'s single caller-sized allocation. It
+  bounds the allocation, which was the point. But it restarts its walk at
+  `vec[0]` on every call and skips forward, so reaching entry *n* walks the
+  *n* before it: one call for the front of a 1024-entry list is 11.9 ns, one
+  for the back is **354.6 ns**, about 0.34 ns per skipped entry. Draining the
+  whole list one iovec at a time, measured rather than fitted, is **183 ns for
+  16 entries and 183 us for 1024** -- 64 times the entries, 997 times the
+  time. Against `read_to_vec`'s 10.8 us for the same list, the bounded path is
+  **17x slower at `IOV_MAX`**. A cursor carried across calls would make it
+  linear; the function's signature already takes the offset the caller
+  tracks, so the information is there.
+- **The user-half bound is free.** 1.06 ns to accept, 1.01 ns to refuse a
+  kernel-half pointer, measured through `in_user_half_with` with the `libos`
+  exemption passed in as `false` -- because under `libos`, the only
+  configuration `kernel-hal` builds in on the host, `in_user_half` folds to a
+  constant `true` and no row can see the bound. `user_range_ok`, which every
+  DRM/KMS ioctl passes through, is 0.81 ns.
+
+## What the syscall timeout said
+
+`kernel-hal`'s `timer_waker` is what every timed wait in the kernel goes
+through -- `poll`, `epoll_wait`, `select`, `nanosleep`, a futex or `semop` with
+a timeout. It is called from `poll`, not once per wait, so the question is not
+what arming a timer costs but what the ninth poll costs when the timer is
+already armed for the right instant.
+
+- **Refreshing an armed timeout is the waker clone and nothing else.**
+  42.44 ns, against 42.70 ns for cloning the waker on its own. The slot
+  bookkeeping -- two atomic reads, a store under a lock, the race the second
+  `is_done` closes -- is inside the noise. Reading the slot's deadline is
+  0.81 ns and `is_done` is 0.64 ns.
+- **Re-arming costs 18 times as much: 753 ns.** Arming an empty slot is
+  361 ns (an `Arc`, a `Box` for the callback, a waker clone) and cancelling an
+  armed one is 400 ns, so a re-arm pays both. Cancelling a slot that was never
+  armed -- a `poll` with no timeout -- is 1.86 ns, so the machinery costs
+  nothing when it is not used.
+- **`poll` takes the expensive path every time, and its own comment says it
+  does not.** `schedule_poll_wakeup` in `linux-syscall/src/file/poll.rs`
+  computes `let deadline = mono_now() + after` on each poll, and
+  `ensure_timer_waker` keeps a timer only when `existing.inner.deadline ==
+  deadline`. `timer_now()` has nanosecond resolution, so that equality is
+  false on every poll and the refresh path is unreachable from there: each
+  round of a `poll`, `select` or `epoll_wait` that is waiting allocates an
+  `Arc` and a `Box`, cancels the previous timer and arms a new one. The
+  comment above the call reads "Refresh in place while the previous tick is
+  still pending; re-arm only after it fired. Avoids AtomicBool TOCTOU +
+  timer-heap churn."
+  The shape that does refresh is three files away and in the tree already:
+  `linux-object/src/net/wait.rs` stores an absolute `self.deadline` once and
+  passes the same value every poll, which lands on the 42 ns path. Holding
+  the deadline instead of recomputing it is the difference between 42 ns and
+  753 ns per poll of every timed wait in the system.
+
+## What the GPU fence path said
+
+A fence's landing zone is pinned sysmem the GPU writes, mapped uncached, so
+reading it is a trip off the CPU's caches rather than a load. Under `mock`,
+where these rows run, it is an ordinary L1 load -- so every figure below
+**under-weights the reads** relative to the arithmetic around them, and the
+savings from reading fewer of them are lower bounds.
+
+- **Reading each zone once instead of once per fence is worth 5.4x, at
+  least.** 256 fences in one zone -- a buffer two submits of one ring wrote,
+  which is the shape the comment on `hw_fences_landed` describes -- cost
+  1.48 us when the code read the word per fence, and **274 ns** reading it
+  once: about 1.0 ns per fence of pure compare after the first read. On
+  hardware each saved read is an uncached round trip, so the real ratio is
+  wider than 5.4.
+- **The `Vec` the fix keeps is scanned linearly, so the call is quadratic in
+  the number of DISTINCT zones**, and the code says so in as many words:
+  "these lists are a handful of entries long (one per ring that wrote the
+  buffer), and a `Vec` of pairs beats a map at that size". Measured, the
+  handful holds and the cliff past it is steep: 2 distinct zones 21.8 ns,
+  8 zones 68.5 ns, **256 zones 14.2 us** -- 52 times the one-zone case of the
+  same width. Crossing back over the per-fence reading it replaced happens at
+  roughly **28 distinct zones on host memory**, and higher on hardware, where
+  each avoided read is worth more. So the comment is right about today's
+  lists, and 256 is not an idle top end to have checked: it is the group size
+  NVK submits in.
+- **A wait that is going to park finds out for almost nothing.** The first
+  fence still in flight ends the call: 21.7 ns over a 256-fence list against
+  274 ns when all of them have landed. One fence, the overwhelmingly common
+  look, is 8.1 ns, and the wrapping compare that makes a `u32` counter past
+  its top behave is 0.86 ns.
+- **Choosing a backoff is free**: 0.59 ns on the eager probes, 0.96 ns once
+  doubling, 0.93 ns at the cap, and `fence_poll_step` is at the harness's
+  second floor. Worth stating because the reason the CPU-side `wait` used to
+  starve the compositor was that it re-took the table on every spin turn; if
+  deciding how long to pause had cost anything, that fix would have traded one
+  problem for another.

@@ -111,8 +111,15 @@ jobs:
           cargo bench -p zircon-object --bench futex --features libos,aspace-separate --no-run
           # `linux-syscall`'s benches are not a `benches/` target: every
           # submodule of that crate is private, so they live in `#[cfg(test)]`
-          # modules beside the syscalls and build with the lib.
+          # modules beside the syscalls and build with the lib. Same for
+          # `kernel-hal` (`mod common;` is private, and that is where the
+          # user-pointer copies and the timeout machinery live) and for
+          # `zcore-drivers` (the fence-landing-zone helpers are private to
+          # their module). These lines are the only thing compiling those
+          # rows, so without them they rot exactly as the comment above says.
           cargo bench -p linux-syscall --no-run
+          cargo bench -p kernel-hal --no-run
+          cargo bench -p zcore-drivers --features graphic,virtio,xhci-usb-hid --no-run
           # Three more crates whose unit tests `default-members` hid the same
           # way: the syscall entry points, the HAL (user-pointer copies, CPU
           # stats) and the anomaly detector.

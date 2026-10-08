@@ -2,6 +2,11 @@
 
 #![cfg_attr(not(feature = "mock"), no_std)]
 #![deny(warnings)]
+// The native `#[bench]` harness, asked for only in a test build. The rows
+// live in `#[cfg(test)] mod benches` next to the code they measure, the same
+// shape `linux-syscall` and `kernel-hal` use, because the interesting helpers
+// here are private to their module. See `docs/README-benchmarks.md`.
+#![cfg_attr(test, feature(test))]
 // The pinned nightly's clippy flags a batch of style lints across the legacy
 // driver code (register-offset tables written `0x0000/4` for column alignment,
 // MMIO `transmute`s, wide hardware-init signatures, driver doc formatting).
@@ -19,6 +24,8 @@
 #![feature(doc_cfg)]
 
 extern crate alloc;
+#[cfg(test)]
+extern crate test;
 
 #[macro_use]
 extern crate log;

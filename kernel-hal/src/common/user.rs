@@ -1025,3 +1025,473 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod benches {
+    //! What the copies cost.
+    //!
+    //! Three batches of syscall rows ended on the same sentence: what a
+    //! syscall costs is "the entry, the copies and the subsystem". The
+    //! subsystem has rows and the argument work turned out to be free, but
+    //! **the copies are this module** and had never been measured, so that
+    //! sentence was a budget with its largest line item missing. These rows
+    //! are that line item.
+    //!
+    //! Under `libos` a host `Vec` is a valid user buffer (the module comment
+    //! on the tests above says why), so every copy here runs for real.
+    //!
+    //! Two things about this harness are worth knowing before reading a
+    //! number, both in `docs/README-benchmarks.md`: `black_box` goes around
+    //! the **inputs**, not only the result, or the compiler folds the work
+    //! away; and a row of the shape "out-of-line call returning a `Result`"
+    //! has a floor of about 6.4 ns that is the harness and not work.
+    //!
+    //! One caveat specific to this module, and it is a real limit on what
+    //! these rows can say: **`in_user_half` is a constant `true` under
+    //! `libos`**, which is the only configuration `kernel-hal` builds in on
+    //! the host. So no row here measures the bare-metal user-half bound. The
+    //! rows that ask about it call [`in_user_half_with`] with the exemption
+    //! passed in, which is the seam the code already grew for the tests.
+
+    use super::*;
+    use test::{black_box, Bencher};
+
+    /// `check_len` consults `KHANDLER`, which has no default outside `libos`;
+    /// without this every row below returns `InvalidPointer` instead of
+    /// copying, and the whole module would read as a few nanoseconds of
+    /// nothing.
+    fn init_handler() {
+        crate::utils::test_frames::install();
+    }
+
+    /// A host buffer of `bytes` bytes, and the user pointer that names it.
+    /// Leaked on purpose: `UserPtr` hands out `&'static` slices, and a row
+    /// that freed its buffer each iteration would be measuring the allocator.
+    fn user_buf(bytes: usize) -> UserInPtr<u8> {
+        let buf = alloc::vec![0xa5u8; bytes].leak();
+        UserInPtr::from(buf.as_ptr() as usize)
+    }
+
+    // ---- the bound arithmetic -------------------------------------------
+
+    /// The bare-metal bound, with the `libos` exemption passed in as `false`
+    /// so the arithmetic actually runs. This is the only row here that says
+    /// anything about what a bare-metal build pays to reject a kernel
+    /// pointer.
+    #[bench]
+    fn in_user_half_bare_metal_accepts(b: &mut Bencher) {
+        b.iter(|| {
+            black_box(in_user_half_with(
+                black_box(false),
+                black_box(0x1000usize),
+                black_box(4096usize),
+            ))
+        });
+    }
+
+    /// The same bound refusing a kernel-half pointer: the case that used to
+    /// make every syscall out-pointer an arbitrary kernel-memory write.
+    #[bench]
+    fn in_user_half_bare_metal_refuses_a_kernel_pointer(b: &mut Bencher) {
+        b.iter(|| {
+            black_box(in_user_half_with(
+                black_box(false),
+                black_box(0xffff_8000_0000_0000usize),
+                black_box(4096usize),
+            ))
+        });
+    }
+
+    /// What a `libos` build pays for the same question, which is the
+    /// exemption folding: the contrast with the two rows above is the whole
+    /// cost of the bound.
+    #[bench]
+    fn in_user_half_under_libos(b: &mut Bencher) {
+        b.iter(|| {
+            black_box(in_user_half_with(
+                black_box(true),
+                black_box(0x1000usize),
+                black_box(4096usize),
+            ))
+        });
+    }
+
+    /// `user_range_ok` is what a device `io_control` handler calls before
+    /// dereferencing an ioctl argument, so it is on the hot path of every
+    /// DRM/KMS ioctl the compositor issues.
+    #[bench]
+    fn user_range_ok_accepts(b: &mut Bencher) {
+        b.iter(|| black_box(user_range_ok(black_box(0x1000usize), black_box(4096usize))));
+    }
+
+    // ---- the per-call check ---------------------------------------------
+
+    /// `check_len` is the part of every copy that is NOT the copy: the null
+    /// and alignment tests, the bound, and then an indirect call into the
+    /// address space (`KHANDLER.check_user_range`) to ask whether anything is
+    /// mapped there. Every row below pays this once; `as_c_str` pays it
+    /// twice. This row is what to subtract.
+    #[bench]
+    fn check_len_of_one_byte(b: &mut Bencher) {
+        init_handler();
+        let ptr = user_buf(4096);
+        b.iter(|| black_box(black_box(&ptr).check_len(black_box(1))));
+    }
+
+    /// The same check over a 4 KiB range. If this matches the row above, the
+    /// address-space question is O(1) in the length and the check is a fixed
+    /// cost per call rather than per byte.
+    #[bench]
+    fn check_len_of_4_kib(b: &mut Bencher) {
+        init_handler();
+        let ptr = user_buf(4096);
+        b.iter(|| black_box(black_box(&ptr).check_len(black_box(4096))));
+    }
+
+    /// The refusal, which costs whatever the tests before the address-space
+    /// question cost.
+    #[bench]
+    fn check_len_refuses_a_null_pointer(b: &mut Bencher) {
+        init_handler();
+        let ptr = UserInPtr::<u8>::from(0usize);
+        b.iter(|| black_box(black_box(&ptr).check_len(black_box(1))));
+    }
+
+    // ---- one value ------------------------------------------------------
+
+    /// The single-value read at the bottom of almost every syscall: one
+    /// `timespec`, one `sockaddr`, one `int`. If this is dominated by the
+    /// check above rather than by the eight bytes, then the cost of a small
+    /// copy is the permission question and not the memory.
+    #[bench]
+    fn read_one_u64(b: &mut Bencher) {
+        init_handler();
+        let buf = alloc::vec![0u64; 1].leak();
+        let ptr = UserInPtr::<u64>::from(buf.as_ptr() as usize);
+        b.iter(|| black_box(black_box(&ptr).read()));
+    }
+
+    /// The matching write, which is every syscall's out-parameter.
+    #[bench]
+    fn write_one_u64(b: &mut Bencher) {
+        init_handler();
+        let buf = alloc::vec![0u64; 1].leak();
+        let mut ptr = UserOutPtr::<u64>::from(buf.as_mut_ptr() as usize);
+        b.iter(|| black_box(black_box(&mut ptr).write(black_box(0x1234_5678u64))));
+    }
+
+    // ---- a buffer: the copy, and the copy that need not happen ----------
+
+    /// `read_array` allocates a `Vec` and copies into it. This family says
+    /// what a `write(2)`-sized buffer costs, and the slope says how much of
+    /// it is per byte.
+    fn bench_read_array(b: &mut Bencher, bytes: usize) {
+        init_handler();
+        let ptr = user_buf(bytes);
+        b.iter(|| black_box(black_box(&ptr).read_array(black_box(bytes))));
+    }
+
+    #[bench]
+    fn read_array_of_64_bytes(b: &mut Bencher) {
+        bench_read_array(b, 64);
+    }
+
+    #[bench]
+    fn read_array_of_4_kib(b: &mut Bencher) {
+        bench_read_array(b, 4096);
+    }
+
+    #[bench]
+    fn read_array_of_64_kib(b: &mut Bencher) {
+        bench_read_array(b, 64 * 1024);
+    }
+
+    /// `as_slice` answers the same question -- "give me these bytes" -- with
+    /// no allocation and no copy: it checks the range and forms a slice over
+    /// the caller's own memory. Against `read_array` at the same length, the
+    /// difference is everything a syscall pays for taking a copy it may not
+    /// need.
+    fn bench_as_slice(b: &mut Bencher, bytes: usize) {
+        init_handler();
+        let ptr = user_buf(bytes);
+        b.iter(|| black_box(black_box(&ptr).as_slice(black_box(bytes))));
+    }
+
+    #[bench]
+    fn as_slice_of_64_bytes(b: &mut Bencher) {
+        bench_as_slice(b, 64);
+    }
+
+    #[bench]
+    fn as_slice_of_4_kib(b: &mut Bencher) {
+        bench_as_slice(b, 4096);
+    }
+
+    #[bench]
+    fn as_slice_of_64_kib(b: &mut Bencher) {
+        bench_as_slice(b, 64 * 1024);
+    }
+
+    /// The write side of a buffer, which is what `read(2)` ends in.
+    fn bench_write_array(b: &mut Bencher, bytes: usize) {
+        init_handler();
+        let src = alloc::vec![0x5au8; bytes];
+        let dst = alloc::vec![0u8; bytes].leak();
+        let mut ptr = UserOutPtr::<u8>::from(dst.as_mut_ptr() as usize);
+        b.iter(|| black_box(black_box(&mut ptr).write_array(black_box(&src))));
+    }
+
+    #[bench]
+    fn write_array_of_64_bytes(b: &mut Bencher) {
+        bench_write_array(b, 64);
+    }
+
+    #[bench]
+    fn write_array_of_4_kib(b: &mut Bencher) {
+        bench_write_array(b, 4096);
+    }
+
+    #[bench]
+    fn write_array_of_64_kib(b: &mut Bencher) {
+        bench_write_array(b, 64 * 1024);
+    }
+
+    // ---- a path string --------------------------------------------------
+
+    /// A NUL-terminated user buffer holding `len` bytes of name.
+    fn user_c_str(len: usize) -> UserInPtr<u8> {
+        let mut buf = alloc::vec![b'a'; len];
+        buf.push(0);
+        let buf = buf.leak();
+        UserInPtr::from(buf.as_ptr() as usize)
+    }
+
+    /// `as_c_str` is how every path-taking syscall gets its path, so this is
+    /// on the hot path of `open`, `stat`, `execve` and the rest.
+    ///
+    /// It is three passes over the same bytes, not one: `check()` for the
+    /// first byte, a byte-at-a-time scan for the NUL, then `as_str` ->
+    /// `as_slice` -> a SECOND `check_len` over the length just found, and
+    /// `from_utf8` walking the bytes again to validate them. This family's
+    /// slope is what that costs per byte of name.
+    fn bench_as_c_str(b: &mut Bencher, len: usize) {
+        init_handler();
+        let ptr = user_c_str(len);
+        b.iter(|| black_box(black_box(&ptr).as_c_str()));
+    }
+
+    /// About the length of a real path: `/usr/lib/libvulkan.so.1`.
+    #[bench]
+    fn as_c_str_of_24_bytes(b: &mut Bencher) {
+        bench_as_c_str(b, 24);
+    }
+
+    /// `PATH_MAX`-ish, which is what a deep build tree hands in.
+    #[bench]
+    fn as_c_str_of_256_bytes(b: &mut Bencher) {
+        bench_as_c_str(b, 256);
+    }
+
+    /// Not a path any more, but it is what the slope needs to be readable,
+    /// and `MAX_C_STR_LEN` allows four megabytes of it.
+    #[bench]
+    fn as_c_str_of_4_kib(b: &mut Bencher) {
+        bench_as_c_str(b, 4096);
+    }
+
+    /// `as_str` with the length already known: `as_c_str` minus the scan for
+    /// the NUL, so the pair says what finding the terminator costs against
+    /// validating the bytes.
+    #[bench]
+    fn as_str_of_256_bytes_with_the_length_known(b: &mut Bencher) {
+        init_handler();
+        let ptr = user_c_str(256);
+        b.iter(|| black_box(black_box(&ptr).as_str(black_box(256))));
+    }
+
+    /// `execve`'s `argv`: a user array of pointers to C strings, each one
+    /// read with the three passes above. The question is whether the per-
+    /// entry cost is the string or the array walk.
+    fn bench_cstring_array(b: &mut Bencher, count: usize) {
+        init_handler();
+        let mut ptrs: alloc::vec::Vec<UserInPtr<u8>> = (0..count).map(|_| user_c_str(24)).collect();
+        ptrs.push(UserInPtr::from(0usize));
+        let ptrs = ptrs.leak();
+        let argv = UserInPtr::<UserInPtr<u8>>::from(ptrs.as_ptr() as usize);
+        b.iter(|| black_box(black_box(&argv).read_cstring_array()));
+    }
+
+    /// What a shell hands `execve`.
+    #[bench]
+    fn read_cstring_array_of_8_entries(b: &mut Bencher) {
+        bench_cstring_array(b, 8);
+    }
+
+    /// What a build system hands it.
+    #[bench]
+    fn read_cstring_array_of_256_entries(b: &mut Bencher) {
+        bench_cstring_array(b, 256);
+    }
+
+    // ---- the gather list ------------------------------------------------
+
+    /// A user `iovec` array of `count` entries, each naming `each` bytes.
+    fn user_iovecs(count: usize, each: usize) -> UserInPtr<IoVec<In>> {
+        let vecs: alloc::vec::Vec<IoVec<In>> = (0..count)
+            .map(|_| IoVec {
+                ptr: user_buf(each),
+                len: each,
+            })
+            .collect();
+        let vecs = vecs.leak();
+        UserInPtr::from(vecs.as_ptr() as usize)
+    }
+
+    /// `read_iovecs` is `readv`/`writev`/`sendmsg`'s door: one `read_array`
+    /// of the descriptor array, then a second pass over it summing the
+    /// lengths to refuse an overflow. Two walks of the same array, so the
+    /// slope should be twice the array's own cost.
+    fn bench_read_iovecs(b: &mut Bencher, count: usize) {
+        init_handler();
+        let ptr = user_iovecs(count, 64);
+        b.iter(|| black_box(black_box(&ptr).read_iovecs(black_box(count))));
+    }
+
+    #[bench]
+    fn read_iovecs_of_1_entry(b: &mut Bencher) {
+        bench_read_iovecs(b, 1);
+    }
+
+    #[bench]
+    fn read_iovecs_of_16_entries(b: &mut Bencher) {
+        bench_read_iovecs(b, 16);
+    }
+
+    /// `IOV_MAX`, which `read_iovecs` is what enforces.
+    #[bench]
+    fn read_iovecs_of_1024_entries(b: &mut Bencher) {
+        bench_read_iovecs(b, 1024);
+    }
+
+    /// `read_to_vec` gathers the whole list into one allocation whose size
+    /// userspace chooses. This is the call `read_bytes_at` was added to
+    /// avoid, so it is the baseline that decides whether avoiding it helped.
+    fn bench_read_to_vec(b: &mut Bencher, count: usize) {
+        init_handler();
+        let ptr = user_iovecs(count, 64);
+        let iovecs = ptr.read_iovecs(count).expect("a well-formed gather list");
+        b.iter(|| black_box(black_box(&iovecs).read_to_vec()));
+    }
+
+    #[bench]
+    fn read_to_vec_of_16_entries(b: &mut Bencher) {
+        bench_read_to_vec(b, 16);
+    }
+
+    #[bench]
+    fn read_to_vec_of_1024_entries(b: &mut Bencher) {
+        bench_read_to_vec(b, 1024);
+    }
+
+    /// One `read_bytes_at` at the START of the stream, where the walk has
+    /// nothing to skip. This is the cheap end, and the baseline for the row
+    /// below.
+    fn bench_read_bytes_at_front(b: &mut Bencher, count: usize) {
+        init_handler();
+        let ptr = user_iovecs(count, 64);
+        let iovecs = ptr.read_iovecs(count).expect("a well-formed gather list");
+        let mut buf = alloc::vec![0u8; 64];
+        b.iter(|| black_box(black_box(&iovecs).read_bytes_at(black_box(0), black_box(&mut buf))));
+    }
+
+    #[bench]
+    fn read_bytes_at_the_front_of_16_entries(b: &mut Bencher) {
+        bench_read_bytes_at_front(b, 16);
+    }
+
+    #[bench]
+    fn read_bytes_at_the_front_of_1024_entries(b: &mut Bencher) {
+        bench_read_bytes_at_front(b, 1024);
+    }
+
+    /// The same call asking for the LAST entry's bytes, which is the
+    /// question that matters: `read_bytes_at` restarts its walk at `vec[0]`
+    /// every time and skips forward, so reaching entry *n* walks the *n*
+    /// entries before it. A `writev` driven through a bounded buffer -- the
+    /// very thing this function exists for -- makes one such call per step,
+    /// so if this row grows with the list then the bounded loop is
+    /// **quadratic** in the number of iovecs and the unbounded
+    /// `read_to_vec` it replaced was linear.
+    fn bench_read_bytes_at_back(b: &mut Bencher, count: usize) {
+        init_handler();
+        let ptr = user_iovecs(count, 64);
+        let iovecs = ptr.read_iovecs(count).expect("a well-formed gather list");
+        let mut buf = alloc::vec![0u8; 64];
+        let last = (count - 1) * 64;
+        b.iter(|| {
+            black_box(black_box(&iovecs).read_bytes_at(black_box(last), black_box(&mut buf)))
+        });
+    }
+
+    #[bench]
+    fn read_bytes_at_the_back_of_16_entries(b: &mut Bencher) {
+        bench_read_bytes_at_back(b, 16);
+    }
+
+    #[bench]
+    fn read_bytes_at_the_back_of_1024_entries(b: &mut Bencher) {
+        bench_read_bytes_at_back(b, 1024);
+    }
+
+    /// `total_len` is the sum `read_iovecs` already computed once to check
+    /// for overflow and then threw away, so every caller that wants it pays
+    /// a third walk of the array.
+    #[bench]
+    fn total_len_of_1024_entries(b: &mut Bencher) {
+        init_handler();
+        let ptr = user_iovecs(1024, 64);
+        let iovecs = ptr.read_iovecs(1024).expect("a well-formed gather list");
+        b.iter(|| black_box(black_box(&iovecs).total_len()));
+    }
+
+    /// The whole point, measured rather than fitted: drain the entire gather
+    /// list through a bounded buffer, which is what `read_bytes_at` was
+    /// added to let `writev` do, and compare against `read_to_vec` of the
+    /// same list. One call per step, each restarting the walk at `vec[0]`.
+    ///
+    /// Against `read_to_vec_of_1024_entries` this is the answer to "did the
+    /// bounded buffer help": it bounds the ALLOCATION, which was the point,
+    /// and the walk is what it costs.
+    fn bench_drain_through_bounded_buf(b: &mut Bencher, count: usize) {
+        init_handler();
+        let ptr = user_iovecs(count, 64);
+        let iovecs = ptr.read_iovecs(count).expect("a well-formed gather list");
+        let total = count * 64;
+        // One iovec's worth, so the number of steps is the number of
+        // entries: the shape a bounded kernel buffer actually has.
+        let mut buf = alloc::vec![0u8; 64];
+        b.iter(|| {
+            let mut offset = 0usize;
+            while offset < black_box(total) {
+                let n = black_box(&iovecs)
+                    .read_bytes_at(black_box(offset), black_box(&mut buf))
+                    .expect("the list is well-formed");
+                if n == 0 {
+                    break;
+                }
+                offset += n;
+            }
+            black_box(offset)
+        });
+    }
+
+    #[bench]
+    fn drain_16_entries_through_a_bounded_buf(b: &mut Bencher) {
+        bench_drain_through_bounded_buf(b, 16);
+    }
+
+    #[bench]
+    fn drain_1024_entries_through_a_bounded_buf(b: &mut Bencher) {
+        bench_drain_through_bounded_buf(b, 1024);
+    }
+}
