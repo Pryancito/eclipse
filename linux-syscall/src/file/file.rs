@@ -4383,15 +4383,20 @@ mod benches {
     //! The pipe rows are what `read(2)` and `write(2)` cost once the
     //! descriptor is resolved and the bytes are in the kernel: the ring
     //! copy and the lock around it, without the user copy or the syscall
-    //! entry. 64 B / 4 KiB / 64 KiB is a family -- the slope is the copy,
-    //! and the intercept is what a call costs however small it is, which is
-    //! the number that decides whether buffering in libc is worth it.
+    //! entry. 64 B / 4 KiB / 64 KiB / 256 KiB is a family -- the slope is
+    //! the copy, and the intercept is what a call costs however small it
+    //! is, which is the number that decides whether buffering in libc is
+    //! worth it.
     //!
-    //! Every row black-boxes its inputs. `PIPE_BUF` is 4096 here, so the
-    //! 64 KiB row is sixteen ring-sized pieces and the 4 KiB row is one.
+    //! The ring is `PIPE_DEFAULT_CAPACITY`, which is **64 KiB**;
+    //! `PIPE_BUF` (4096) is only the length POSIX promises to write
+    //! atomically and is not the ring's size. So the 64 B, 4 KiB and
+    //! 64 KiB rows are each exactly one write/read pair, and only the
+    //! 256 KiB row is several ring loads. Every row black-boxes its
+    //! inputs.
 
     use super::*;
-    use linux_object::fs::{Pipe, PIPE_DEFAULT_CAPACITY};
+    use linux_object::fs::{Pipe, PIPE_BUF, PIPE_DEFAULT_CAPACITY};
     use rcore_fs::vfs::INode;
     use test::{black_box, Bencher};
 
@@ -4434,17 +4439,27 @@ mod benches {
         pipe_round_trip(b, 64);
     }
 
-    /// 4 KiB: `PIPE_BUF`, and what a shell pipeline moves per read.
+    /// 4 KiB: `PIPE_BUF`, the atomic-write promise, and what a shell
+    /// pipeline moves per read. Still one pair: the ring is sixteen times
+    /// this.
     #[bench]
     fn pipe_round_trip_of_4kib(b: &mut Bencher) {
-        pipe_round_trip(b, 4096);
+        pipe_round_trip(b, PIPE_BUF);
     }
 
-    /// 64 KiB: several ring loads, where the copy should dominate and the
-    /// per-call cost should disappear.
+    /// 64 KiB: the ring filled exactly once, which is the largest single
+    /// write a pipe takes without the writer having to wait for a reader.
     #[bench]
     fn pipe_round_trip_of_64kib(b: &mut Bencher) {
-        pipe_round_trip(b, 64 * 1024);
+        pipe_round_trip(b, PIPE_DEFAULT_CAPACITY);
+    }
+
+    /// 256 KiB: four ring loads, so the loop runs four times and the copy
+    /// should dominate while the per-call cost disappears. This is the only
+    /// row above that is more than one write/read pair.
+    #[bench]
+    fn pipe_round_trip_of_256kib(b: &mut Bencher) {
+        pipe_round_trip(b, 4 * PIPE_DEFAULT_CAPACITY);
     }
 
     /// A `read` on an empty pipe whose writer is still open: the answer that

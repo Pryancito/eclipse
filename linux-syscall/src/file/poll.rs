@@ -1943,7 +1943,8 @@ mod benches {
     }
 
     /// `select`'s three `FdSet::new` calls copy the caller's bitmap in and
-    /// allocate a second one for the answer, per call. 64 fds is one word.
+    /// allocate a second one for the answer, per call. `FD_PER_ITEM` is
+    /// `u32::BITS`, so 64 descriptors are two words.
     #[bench]
     fn fdset_new_of_64(b: &mut Bencher) {
         let mut words = [0xffff_ffffu32; 2];

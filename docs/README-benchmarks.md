@@ -126,9 +126,9 @@ two agree the measurement is standing on something.
 | an interval timer catching up after a stall | — | `linux-syscall` `time::benches::forward_periodic_*` |
 | `adjtimex`, `settimeofday`, `getitimer`, `alarm` | — | `linux-syscall` `time::benches::*` |
 | which target a `kill` names, what `sigaction` refuses | `sig` section | `linux-syscall` `signal::benches::*` |
-| descriptors and credentials passed over a Unix socket | — | `linux-syscall` `net::benches::parse_scm_rights_*`, `build_recv_cmsgs_*` |
-| `semop`'s atomic plan over a semaphore set | — | `linux-syscall` `ipc::benches::plan_semop_*` |
-| `semctl(GETALL)`/`(SETALL)` bulk transfers | — | `linux-syscall` `ipc::benches::semctl_*` |
+| descriptors and credentials passed over a Unix socket | ~1.5 ns per descriptor + ~25 ns | `linux-syscall` `net::benches::parse_scm_rights_*`, `build_recv_cmsgs_*` |
+| `semop`'s atomic plan over a semaphore set | 0.8 ns per semaphore **in the set** | `linux-syscall` `ipc::benches::plan_semop_*` |
+| `semctl(GETALL)`/`(SETALL)` bulk transfers | 276 / 381 ns over 512 | `linux-syscall` `ipc::benches::semctl_*` |
 | the `futex` operation word every contended mutex sends | `futex` section | `linux-syscall` `misc::benches::futex_op_*` |
 | `capget`/`capset`, `syslog`, `ioprio` | — | `linux-syscall` `misc::benches::*` |
 
@@ -174,14 +174,26 @@ computing an answer from `fd`. **So `black_box` goes around the inputs, not
 only around the result**, and a suspiciously flat family is the thing to
 re-check first.
 
+A flat family has a second cause worth knowing, because it looks identical: a
+loop that never ran. `msync_distinct_vmos_over_64_pages` and `_over_512_pages`
+both read 11 ns once the mapping moved off address 0, and the reason was that
+`distinct_vmos` takes an absolute `end` while the rows were still passing a
+length -- so `end` sat below `start` and the `while` body was never entered.
+`black_box` cannot catch that one: it is a correct call on wrong arguments. The
+rows read 30 ns per page, flat, once the end was an end.
+
 ## What the syscall rows said
 
-- **`getdents64` is quadratic in the size of the directory.** 8 entries cost
-  156 ns each; 256 entries cost 329 ns each. The record encoding is 3.7 ns, so
-  it is not the writer: reading entry *n* walks the entries before it. Fitted,
-  that is ~150 ns per name plus ~1.4 ns per preceding name — invisible on a
-  home directory and 140 ms per listing on a directory of ten thousand. The
-  scan is in the filesystem (`vendor/rcore-fs`), not in the syscall.
+- **`getdents64` is quadratic in the size of the directory.** The rows rewind
+  the handle inside the timed loop, so `getdents64_rewind_only` is the baseline
+  to subtract: **49 ns**, and flat from an 8-entry directory to a 256-entry one,
+  so one baseline covers the family. Net of it, 8 entries cost 152 ns each and
+  256 entries cost 348 ns each. The record encoding is 4.1 ns, so it is not
+  the writer: reading entry *n* walks the entries before it. Fitted, that is
+  **~146 ns per name plus ~1.6 ns per preceding name** — invisible on a home
+  directory and about **80 ms per listing** on a directory of ten thousand,
+  where the quadratic term is 98% of the bill. The scan is in the filesystem
+  (`vendor/rcore-fs`), not in the syscall.
 - **An `fd_set` costs ~53 ns at 64 fds and ~77 ns at 1024**, against 11 ns for
   a NULL one. `select` builds three per call, so the fixed cost of a `select`
   with one small set is around 130 ns before a single file is looked at — and
@@ -192,9 +204,14 @@ re-check first.
   caller that passes a wide `nfds` pays two thirds of a microsecond per wake
   for the check alone — which is why `select_nfds` clamps to what the `fd_set`
   can hold instead of trusting the argument.
-- **A pipe round trip is ~50 ns at 64 bytes and ~123 ns at 4 KiB**, so about
-  40 ns of it is the call and the rest is the copy. That is the number a libc
-  that buffers is buying its way out of.
+- **A pipe round trip is ~50 ns at 64 bytes and ~112 ns at 4 KiB**, so about
+  45 ns of it is the call and the rest is the copy. That is the number a libc
+  that buffers is buying its way out of. The ring is `PIPE_DEFAULT_CAPACITY`,
+  64 KiB -- `PIPE_BUF` (4096) is only the length POSIX promises to write
+  atomically -- so the 64 B, 4 KiB and 64 KiB rows are each one write/read
+  pair: 3.2 us to fill the ring once, 20 GB/s through it, and 13.0 us for
+  256 KiB, which is four ring loads at the same rate. The copy scales; the
+  call does not shrink.
 - **Argument validation is free**, everywhere it was measured: 0.6 to 7 ns
   against the ~330 ns a syscall entry costs from userspace. The narrowing
   helpers in `intarg.rs` were added to fix wrong answers, and they cost
@@ -203,7 +220,7 @@ re-check first.
 ## What the memory, process, clock, signal, socket and IPC rows said
 
 - **`msync` walks every page to discover one object.** `distinct_vmos` is
-  31 ns per page whether the range is 64 pages or 512, and the whole range is
+  30 ns per page whether the range is 64 pages or 512, and the whole range is
   one VMO in both. A `msync(MS_SYNC)` of a 100 MiB mapped file therefore spends
   about **0.8 ms** in `find_mapping` to learn what the first page already said.
   SQLite and Firefox both call it on their own schedules; the per-mapping walk
@@ -221,16 +238,32 @@ re-check first.
   it is not.** `prctl(PR_SET_NAME)` takes fifteen arbitrary bytes, and the
   invalid-UTF-8 path goes chunk by chunk replacing each bad byte — worth
   knowing only because the input is untrusted and the two paths differ.
-- Two families in this batch are written but not yet read off a quiet machine,
-  so no figure for them is quoted here: `parse_scm_rights_*` (1 / 16 / 253
-  descriptors passed over a Unix socket, the last being `SCM_MAX_FD`, the cap
-  that bounds the walk at all — without it the length came from the sender)
-  and `plan_semop_*`. The second is the one to read when the numbers land:
-  `semop(2)` is atomic, so the whole set's values are copied before a single
-  semaphore moves, and the pair "one operation on 16 semaphores" against "one
-  on 512" separates that copy from the work the call actually asked for. A
-  program using a wide semaphore array as a barrier would be paying for the
-  array's width on every call.
+- **`semop` pays for the semaphore set's width on every call, not for the
+  operations it asked for.** One operation on a 16-semaphore set plans in
+  38 ns; the same one operation on a 512-semaphore set takes 437 ns. That is
+  **0.8 ns per semaphore in the set**, paid whether the call touches one of
+  them or all of them, because `semop(2)` is atomic and the whole set's values
+  are copied before a single semaphore moves. A program using a wide semaphore
+  array as a barrier is therefore paying for the array's width on every
+  `semop`, and the fix is to plan against the semaphores the operations name
+  rather than snapshot the set. For scale, the work it did ask for is cheap by
+  comparison: 16 operations on 16 semaphores is 154 ns, and 500 operations on
+  512 is 1.6 us. A plan that would block bails in 15 ns, so a contended
+  semaphore does not pay the copy twice.
+- **A refused `SETALL` costs almost as much as one that is accepted**: 270 ns
+  against 381 ns over 512 semaphores. The values are all read and validated
+  before any is rejected, which is correct -- `semctl(2)` is all-or-nothing --
+  and `GETALL` of the same set is 276 ns, so the read dominates either way.
+- **Passing descriptors over a Unix socket costs ~1.5 ns each**, on top of
+  about 25 ns for the call: 27 ns for one descriptor, 81 ns for 16, 426 ns for
+  253 (`SCM_MAX_FD`, the cap that bounds the walk at all -- without it the
+  length came from the sender). Building the receive side is the same order:
+  36 ns for credentials alone, 118 ns for credentials plus 16 descriptors.
+- **But a buffer over the cap is walked in full before it is refused**:
+  254 descriptors cost 408 ns to reject, against 426 ns to accept 253. The cap
+  stops the kernel *using* an unbounded descriptor list, not *reading* one, so
+  the length a sender picks still buys it work. A malformed header, by
+  contrast, is thrown out in 10 ns.
 - **`clone3` decodes a `struct clone_args` in 5 ns**, nine refusals and all.
   `fork(3)` does not spend its time at the door.
 - **Everything else is 0.6 to 12 ns**, which is the same answer the file batch

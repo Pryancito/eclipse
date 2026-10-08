@@ -1822,10 +1822,33 @@ mod benches {
         File::new(dir, OpenFlags::RDONLY, String::from("/d"))
     }
 
+    /// Rewinding alone: `seek(Start(0))` on the same directory handle, with
+    /// no entry read and no record encoded. The three `getdents64_*` rows
+    /// below each rewind inside their timed loop, because a `getdents64`
+    /// that resumed where the last one stopped would read a shrinking tail
+    /// and measure a different call every iteration. So this row is their
+    /// baseline: subtract it before reading a per-name cost out of them.
+    /// `File::seek` takes the file's lock and asks the inode for its
+    /// metadata, so it is not free.
+    #[bench]
+    fn getdents64_rewind_only(b: &mut Bencher) {
+        let file = dir_of(8);
+        b.iter(|| black_box(file.seek(black_box(SeekFrom::Start(0))).unwrap()));
+    }
+
+    /// The same rewind over a 256-entry directory, in case the metadata
+    /// lookup behind it depends on the directory's size: if this row and the
+    /// one above agree, one baseline covers the whole family.
+    #[bench]
+    fn getdents64_rewind_only_of_256(b: &mut Bencher) {
+        let file = dir_of(256);
+        b.iter(|| black_box(file.seek(black_box(SeekFrom::Start(0))).unwrap()));
+    }
+
     /// One `getdents64` over a small directory, buffer big enough for all of
-    /// it: read every entry, encode every record. The file is rewound
-    /// between iterations, which is what `ls` does not do -- that cost is
-    /// `lseek`'s and is not in this row.
+    /// it: read every entry, encode every record. The rewind at the top of
+    /// the loop IS in this figure; `getdents64_rewind_only` is what to
+    /// subtract for the call's own cost.
     #[bench]
     fn getdents64_of_8_entries(b: &mut Bencher) {
         let file = dir_of(8);
@@ -1847,7 +1870,7 @@ mod benches {
     }
 
     /// The same call over 256 entries, which is one glibc `readdir` buffer's
-    /// worth of a real `/usr/lib`.
+    /// worth of a real `/usr/lib`. Includes the rewind, as above.
     #[bench]
     fn getdents64_of_256_entries(b: &mut Bencher) {
         let file = dir_of(256);
@@ -1871,7 +1894,7 @@ mod benches {
     /// 256 entries into a buffer that holds about half of them: the loop
     /// stops on a refused record and hands it back, which is the path every
     /// multi-call listing takes. It must cost no more than the entries it
-    /// did encode.
+    /// did encode. Includes the rewind, as above.
     #[bench]
     fn getdents64_of_256_into_a_short_buffer(b: &mut Bencher) {
         let file = dir_of(256);

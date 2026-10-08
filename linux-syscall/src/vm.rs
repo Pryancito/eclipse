@@ -3153,25 +3153,36 @@ mod benches {
         MMUFlags::READ | MMUFlags::WRITE | MMUFlags::USER
     }
 
-    /// A root VMAR with one mapping of `pages` pages, all faulted in, at
-    /// address 0. One mapping rather than many: `mincore` walks pages, not
-    /// mappings, and this is the shape its loop meets in a heap.
-    fn mapped(pages: usize) -> Arc<VmAddressRegion> {
+    /// A root VMAR with one mapping of `pages` pages at `base`, plus the
+    /// address it landed at. One mapping rather than many: `mincore` walks
+    /// pages, not mappings, and this is the shape its loop meets in a heap.
+    ///
+    /// `base` is a parameter, and every row below passes a different one, for
+    /// the same two reasons the test helper of the same name spells out:
+    /// under `libos` these mappings are backed by the *host* process's
+    /// address space, so two rows sharing a base fight over one host mapping;
+    /// and a low base runs into `vm.mmap_min_addr`, which on a CI runner is
+    /// 65536 and here is 4096 -- mapping at 0, as an earlier version of this
+    /// helper did, is an `EPERM` from the host `mmap` that only CI sees.
+    /// Bases start past the test helper's range so the two never collide.
+    fn mapped(base: usize, pages: usize) -> (Arc<VmAddressRegion>, usize) {
+        assert!(base >= 0x1000_0000 && base.is_multiple_of(PAGE_SIZE));
         let vmar = VmAddressRegion::new_root();
         let vmo = VmObject::new_paged(pages);
-        vmar.map_at(0, vmo, 0, pages * PAGE_SIZE, user_rw())
+        let addr = vmar
+            .map_at(base, vmo, 0, pages * PAGE_SIZE, user_rw())
             .expect("a fresh root VMAR has room for this");
-        vmar
+        (vmar, addr)
     }
 
     /// `mincore` over one page: the per-call cost, since the loop runs once.
     #[bench]
     fn mincore_residency_of_1_page(b: &mut Bencher) {
-        let vmar = mapped(1);
+        let (vmar, addr) = mapped(0x1000_0000, 1);
         b.iter(|| {
             black_box(mincore_residency(
                 black_box(&vmar),
-                black_box(0),
+                black_box(addr),
                 black_box(1),
             ))
         });
@@ -3180,11 +3191,11 @@ mod benches {
     /// 64 pages, a quarter of a megabyte.
     #[bench]
     fn mincore_residency_of_64_pages(b: &mut Bencher) {
-        let vmar = mapped(64);
+        let (vmar, addr) = mapped(0x1100_0000, 64);
         b.iter(|| {
             black_box(mincore_residency(
                 black_box(&vmar),
-                black_box(0),
+                black_box(addr),
                 black_box(64),
             ))
         });
@@ -3195,11 +3206,11 @@ mod benches {
     /// figure an allocator probing address-space layout pays per call.
     #[bench]
     fn mincore_residency_of_512_pages(b: &mut Bencher) {
-        let vmar = mapped(512);
+        let (vmar, addr) = mapped(0x1200_0000, 512);
         b.iter(|| {
             black_box(mincore_residency(
                 black_box(&vmar),
-                black_box(0),
+                black_box(addr),
                 black_box(512),
             ))
         });
@@ -3209,14 +3220,20 @@ mod benches {
     /// before it can write any of them back. It looks a mapping up per page
     /// and keeps a set, so its slope is the question: a `msync` of a mapped
     /// file is one object however large the range.
+    ///
+    /// `distinct_vmos` takes an absolute `end`, not a length. A row that
+    /// passed the length read 11 ns flat at both 64 and 512 pages, because
+    /// `end` was below `start` and the loop never ran once -- the same
+    /// signature as a folded call, and the reason a flat family is worth
+    /// doubting before it is believed.
     #[bench]
     fn msync_distinct_vmos_over_64_pages(b: &mut Bencher) {
-        let vmar = mapped(64);
+        let (vmar, addr) = mapped(0x1300_0000, 64);
         b.iter(|| {
             black_box(distinct_vmos(
                 black_box(&vmar),
-                black_box(0),
-                black_box(64 * PAGE_SIZE),
+                black_box(addr),
+                black_box(addr + 64 * PAGE_SIZE),
             ))
         });
     }
@@ -3224,12 +3241,12 @@ mod benches {
     /// The same over 512 pages of the same single object.
     #[bench]
     fn msync_distinct_vmos_over_512_pages(b: &mut Bencher) {
-        let vmar = mapped(512);
+        let (vmar, addr) = mapped(0x1400_0000, 512);
         b.iter(|| {
             black_box(distinct_vmos(
                 black_box(&vmar),
-                black_box(0),
-                black_box(512 * PAGE_SIZE),
+                black_box(addr),
+                black_box(addr + 512 * PAGE_SIZE),
             ))
         });
     }
