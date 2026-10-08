@@ -648,40 +648,59 @@ mod reentrancy_tests {
     static UPCALLS: AtomicU32 = AtomicU32::new(0);
     static ALWAYS_FREE: AtomicBool = AtomicBool::new(true);
 
-    /// How long the probe waits for the registry before calling it held.
+    /// How long the probe gives the registry before calling it held.
     ///
     /// A single `try_lock` cannot answer the question this test asks. It
     /// fails for a lock held by *anybody*, and on a host build there is no
     /// "this cpu" to ask instead: `HeldByCurrentCpu` is a constant `false`
     /// there. Meanwhile the hardware-fence poller
     /// (`syncobj_eventfd::arm_poller`, armed by this test's own
-    /// `new_sync_file`) fires from a timer and calls `wake_ready_waiters`,
-    /// which takes the registry for a few instructions -- so a `try_lock`
-    /// that happened to land inside that window reported the re-entrancy bug
-    /// when there was none. That is a flake, not a finding: red about once in
-    /// eight runs of the suite, and nothing in the kernel had changed.
+    /// `new_sync_file`) fires from a timer and takes the registry for a few
+    /// instructions -- so a `try_lock` that happened to land inside that
+    /// window reported the re-entrancy bug when there was none. That is a
+    /// flake, not a finding: red about once in eight runs of the suite, and
+    /// nothing in the kernel had changed.
     ///
-    /// The two cases are still easy to tell apart, because they differ in
-    /// kind and not in timing. A *re-entrant* hold -- the bug this test
-    /// exists for -- is held by the very call stack the hook runs on, so it
-    /// never comes free, however long anyone waits. A concurrent hold is over
-    /// in microseconds. So wait: a lock that comes free inside this budget
-    /// was somebody else's, and one that does not is the bug.
-    const PROBE_SPINS: usize = 1 << 22;
+    /// The two holds differ in *kind*, not in duration, and that is what the
+    /// probe below keys on. A re-entrant hold -- the bug this test exists for
+    /// -- belongs to the very call stack the upcall runs on, so it cannot be
+    /// released until that stack unwinds: it never comes free while the probe
+    /// is looking, however long the probe looks. A concurrent hold is over in
+    /// the handful of instructions `wake_ready_waiters` keeps the registry
+    /// for.
+    ///
+    /// So the probe *blocks* on another thread instead of spinning on this
+    /// one. That matters on the single-vCPU runner: a spin loop here keeps
+    /// the cpu away from the concurrent holder, so its own budget ran out
+    /// while the holder never got scheduled to release -- the budget was a
+    /// bound on the probe's cpu time, not on the hold. A blocking acquire
+    /// hands the cpu to the holder and returns the instant it releases, so
+    /// this deadline bounds the *hold*. Five seconds against a hold of a
+    /// `Vec` collect; the deadline is only ever reached by the bug.
+    const PROBE_DEADLINE: core::time::Duration = core::time::Duration::from_secs(5);
 
     /// Stands in for `syncobj_eventfd::on_syncobj_signaled`, which is what the
-    /// kernel really installs, and asks the one question that matters: is the
-    /// registry lock free right now? The real hook would take it.
+    /// kernel really installs, and asks the one question that matters: can the
+    /// registry be taken while this upcall runs? The real hook's first line
+    /// takes it.
+    ///
+    /// The acquire happens on a thread of its own, and the hook waits for
+    /// word back rather than for the lock, for the reason in
+    /// [`PROBE_DEADLINE`]. Under a re-entrant hold that thread is stuck
+    /// exactly where the kernel deadlocked -- but it is not *this* thread, so
+    /// the test reports the bug instead of hanging on it, and the thread
+    /// finishes on its own as soon as the offending stack unwinds.
     fn probe_hook(_handle: u32, _point: u64) {
+        extern crate std;
         UPCALLS.fetch_add(1, Ordering::SeqCst);
-        for _ in 0..PROBE_SPINS {
-            if let Some(g) = WAITERS.try_lock() {
-                drop(g);
-                return;
-            }
-            core::hint::spin_loop();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            drop(WAITERS.lock());
+            let _ = tx.send(());
+        });
+        if rx.recv_timeout(PROBE_DEADLINE).is_err() {
+            ALWAYS_FREE.store(false, Ordering::SeqCst);
         }
-        ALWAYS_FREE.store(false, Ordering::SeqCst);
     }
 
     #[test]
