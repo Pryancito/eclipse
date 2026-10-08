@@ -139,6 +139,23 @@ pub trait DrmScheme: Scheme {
         false
     }
 
+    /// Whether this GPU can serve the nouveau uAPI **right now**:
+    /// [`DrmScheme::nouveau_uapi_capable`] is the code, this is the hardware
+    /// behind it. On the NVIDIA driver it is "the RM is attached", which is
+    /// what `CHANNEL_ALLOC` and `EXEC` need; without it they answer `ENODEV`
+    /// and NVK reports a lost device.
+    ///
+    /// This is what decides whether a SECOND card is offered to Mesa as a
+    /// nouveau device at all (see `linux-object`'s `node_driver_id`). The
+    /// console GPU boots cold on purpose -- its GSP resume can wedge the bus
+    /// while the console renders through its BAR1 -- so until
+    /// `nvidia.console_gpu` brings it up there is nothing to offer, and a node
+    /// that enumerated as nouveau and then died on the first `EXEC` would be
+    /// worse than no node. Default: false, so a driver has to opt in.
+    fn nouveau_uapi_ready(&self) -> bool {
+        false
+    }
+
     /// Whether this GPU is scanning out the boot console. Such a GPU is
     /// deliberately excluded from the automatic RM bring-up on the BOOT path
     /// (its GSP resume can wedge the bus while the console renders through its

@@ -4036,6 +4036,14 @@ impl DrmScheme for NvidiaGpu {
         true
     }
 
+    /// The RM is attached, so `CHANNEL_ALLOC` and `EXEC` have a real device
+    /// behind them. Same condition as [`NvidiaGpu::ce_present_ready`], and for
+    /// the same reason: state-loaded is the whole question, and a console GPU
+    /// that `nvidia.console_gpu` brought up is as ready as a compute one.
+    fn nouveau_uapi_ready(&self) -> bool {
+        self.rm_device_instance.lock().is_some()
+    }
+
     /// Receives `gsp.bin` read from the mounted rootfs by `zCore`'s boot
     /// code (see `zCore/src/main.rs`, right after rootfs mount) -- stored
     /// for the real `kgspInitRm` call made lazily on the first

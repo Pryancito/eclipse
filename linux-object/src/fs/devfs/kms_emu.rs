@@ -417,6 +417,19 @@ pub(crate) struct EmuGpu {
     /// out of them. Whether such a block is fit to be served is the DRM core's
     /// decision, so the core needs a driver that can hand it a bad one.
     edid: Option<[u8; 128]>,
+    /// Whether this GPU drives the boot display, and whether it can compute.
+    /// The two roles `build_gpu_nodes` reads: on the NVIDIA driver they are
+    /// `drives_boot_display()` and its negation, so a card is one or the other
+    /// and never both.
+    console: bool,
+    compute: bool,
+    /// The PCI address this GPU reports, which is what the node order sorts on.
+    bdf: Option<(u32, u8, u8, u8)>,
+    /// Whether this GPU serves the nouveau uAPI, and whether its RM is up.
+    /// Live, because a deferred console bring-up really does flip the second
+    /// one under a client.
+    nouveau_capable: bool,
+    nouveau_ready: AtomicBool,
     calls: Mutex<GpuCalls>,
 }
 
@@ -434,8 +447,42 @@ impl EmuGpu {
             hw_cursor_plane: AtomicBool::new(false),
             next_fb: AtomicU32::new(EMU_DRIVER_FB_BASE),
             edid: None,
+            console: false,
+            compute: false,
+            bdf: None,
+            nouveau_capable: false,
+            nouveau_ready: AtomicBool::new(false),
             calls: Mutex::new(GpuCalls::default()),
         }
+    }
+
+    /// An NVIDIA-like GPU: it serves the nouveau uAPI, and `ready` says
+    /// whether its RM is attached yet. A card that is capable but cold is the
+    /// console GPU before `nvidia.console_gpu` has brought it up.
+    pub(crate) fn with_nouveau_uapi(self, ready: bool) -> EmuGpu {
+        let mut gpu = self;
+        gpu.nouveau_capable = true;
+        gpu.nouveau_ready = AtomicBool::new(ready);
+        gpu
+    }
+
+    /// The card that drives the boot display at `bdf`: `is_console_gpu()`, and
+    /// NOT a compute GPU, exactly as the NVIDIA driver answers for the GOP
+    /// card.
+    pub(crate) fn console_at(mut self, bus: u8, dev: u8) -> EmuGpu {
+        self.console = true;
+        self.compute = false;
+        self.bdf = Some((0, bus, dev, 0));
+        self
+    }
+
+    /// The headless card at `bdf`: `is_compute_gpu()` and not the console GPU,
+    /// which is what the second NVIDIA card on a two-card box answers.
+    pub(crate) fn compute_at(mut self, bus: u8, dev: u8) -> EmuGpu {
+        self.console = false;
+        self.compute = true;
+        self.bdf = Some((0, bus, dev, 0));
+        self
     }
 
     /// The block this GPU reports for its connector, whatever it is. Passing one
@@ -480,6 +527,26 @@ impl Scheme for EmuGpu {
 }
 
 impl DrmScheme for EmuGpu {
+    fn pci_bdf(&self) -> Option<(u32, u8, u8, u8)> {
+        self.bdf
+    }
+
+    fn is_console_gpu(&self) -> bool {
+        self.console
+    }
+
+    fn is_compute_gpu(&self) -> bool {
+        self.compute
+    }
+
+    fn nouveau_uapi_capable(&self) -> bool {
+        self.nouveau_capable
+    }
+
+    fn nouveau_uapi_ready(&self) -> bool {
+        self.nouveau_ready.load(Ordering::Relaxed)
+    }
+
     fn get_caps(&self) -> DrmCaps {
         DrmCaps {
             has_3d: false,
@@ -642,6 +709,13 @@ impl Gpu {
     /// multi-ioctl query sees the topology answer change underneath it.
     pub(crate) fn set_hardware_kms(&self, on: bool) {
         self.gpu.hardware_kms.store(on, Ordering::Relaxed);
+    }
+
+    /// Attach (or detach) this GPU's RM with the card already registered,
+    /// which is what a deferred console bring-up does: the card answers "not
+    /// ready" through the whole boot and then starts answering "ready".
+    pub(crate) fn set_nouveau_ready(&self, on: bool) {
+        self.gpu.nouveau_ready.store(on, Ordering::Relaxed);
     }
 
     /// Make the driver refuse every following flip, as a real one does when the

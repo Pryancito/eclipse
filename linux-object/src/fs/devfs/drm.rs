@@ -2470,11 +2470,18 @@ static GPU_NODES: Mutex<Vec<GpuNode>> = Mutex::new(Vec::new());
 ///   as index 0, which is exactly the situation today: `card1` is a headless
 ///   compute view of the same card, and `/sys/class/drm` gives it a distinct
 ///   fake BDF so libdrm does not merge the two node pairs.
-/// * Indices 2.. are the remaining compute GPUs **sorted by PCI BDF**. Sorting
-///   rather than taking registration order is the point: that list is the
-///   reverse of the PCI probe order, so which card became `card2` would be an
-///   accident that could differ between boots. A BDF sort is stable, so a node
-///   names the same card every time.
+/// * Indices 2.. are **every remaining card**, whatever its role, **sorted by
+///   PCI BDF**. Sorting rather than taking registration order is the point:
+///   that list is the reverse of the PCI probe order, so which card became
+///   `card2` would be an accident that could differ between boots. A BDF sort
+///   is stable, so a node names the same card every time.
+///
+/// Every registered card ends up named. It used to be only the ones with
+/// [`DrmScheme::is_compute_gpu`], and on a two-card box that is not the
+/// console GPU, nor the primary (which is the compute card), nor
+/// [`get_compute_driver`]'s pick (which refuses the console GPU) -- so the card
+/// driving the screen got no `/dev/dri` node, and the two pairs that did exist
+/// were both the same GPU.
 ///
 /// Only the first [`MAX_GPU_NODES`] GPUs get nodes: past that, `card{n}` would
 /// collide with the render range and two GPUs would answer to one minor.
@@ -2495,12 +2502,22 @@ pub fn build_gpu_nodes() {
         });
     }
 
-    // Everything else that can compute and is not already spoken for.
+    // Every OTHER card, whatever its role. Not just the ones that can compute:
+    // on a two-card box the console GPU is `is_compute_gpu() == false`, and the
+    // head above never names it either -- the primary is the last-probed card
+    // (the compute one, see `register_driver`'s `insert(0)`) and
+    // `get_compute_driver` deliberately refuses the console GPU. So filtering
+    // this list on `is_compute_gpu` left the card that drives the screen with
+    // NO `/dev/dri` node at all, while `card1` was a second view of the card
+    // `card0` already named: two node pairs, one GPU, and `vulkaninfo` could
+    // only ever report one card on a two-card box. A role is a reason to label
+    // a node (index 1 and up answer `eclipse-compute`, see `is_compute_minor`),
+    // never a reason to leave a card unnameable.
     let drivers = kernel_hal::drivers::all_drm();
     let list = drivers.as_vec();
     let mut rest: Vec<Arc<dyn DrmScheme>> = list
         .iter()
-        .filter(|d| d.is_compute_gpu() && !nodes.iter().any(|n| Arc::ptr_eq(&n.driver, d)))
+        .filter(|d| !nodes.iter().any(|n| Arc::ptr_eq(&n.driver, d)))
         .cloned()
         .collect();
     rest.sort_by_key(|d| d.pci_bdf());
@@ -2563,14 +2580,88 @@ pub(crate) fn table_sizes_for_test() -> (usize, usize) {
     (state.framebuffers.len(), state.handles.len())
 }
 
-/// Whether `minor` is one of the compute-only nodes (index 1 and up). Those
-/// advertise themselves as `eclipse-compute` and report no CRTCs, so Mesa and
-/// wlroots leave them alone and stay on `card0`.
+/// Whether `minor` is one of the nodes past index 0. Those report no CRTCs, so
+/// Mesa's KMS probe and wlroots leave them alone and the desktop stays on
+/// `card0` whatever else is plugged in.
+///
+/// This is about KMS topology ONLY. Which driver name a node answers with is a
+/// separate question -- see [`node_driver_id`] -- because a second NVIDIA card
+/// should be a nouveau render device while still not being a card the
+/// compositor may wander onto.
 pub fn is_compute_minor(minor: u32) -> bool {
     GPU_NODES
         .lock()
         .iter()
         .any(|n| n.index > 0 && n.owns_minor(minor))
+}
+
+/// Which driver a node says it is, which is what Mesa selects its userspace
+/// driver from.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum NodeDriverId {
+    /// `nouveau` 1.4.0: a real NVIDIA card serving the VM_BIND/EXEC uAPI. Mesa
+    /// loads `nouveau_dri.so` and NVK takes the card as a Vulkan device.
+    Nouveau,
+    /// `eclipse-compute` 0.1.0: an extra node that Mesa and NVK must skip,
+    /// opened only by `ecl-compute`.
+    Compute,
+    /// `zcore` 1.0.0: the software-KMS card, with no nouveau uAPI behind it.
+    Software,
+}
+
+/// What `VERSION` and `SET_VERSION` report for a node.
+///
+/// `nouveau_requested` is the `nvidia.nouveau_uapi` cmdline flag.
+///
+/// Index 0 keeps its answer unconditionally: it is the node the desktop's
+/// GBM/EGL path already opened, and its identity must not move under a running
+/// compositor.
+///
+/// Past index 0 a node is nouveau only when all three hold:
+///
+/// * it is the FIRST node of its card. The node at index 1 is deliberately a
+///   second view of the card index 0 already named (see [`build_gpu_nodes`]),
+///   and two nouveau nodes for one card is exactly what the fake-BDF alias
+///   exists to stop libdrm from doing;
+/// * its driver serves the nouveau uAPI at all
+///   ([`DrmScheme::nouveau_uapi_capable`]); and
+/// * that card is up ([`DrmScheme::nouveau_uapi_ready`]). The console GPU
+///   boots cold, so offering it to NVK before `nvidia.console_gpu` has brought
+///   it up would enumerate a Vulkan device whose first `EXEC` answers `ENODEV`.
+///
+/// The answer can therefore change once, when a deferred bring-up attaches the
+/// RM: a client that probed before sees the old identity, which is the same
+/// thing a hot-plug does and strictly better than handing out a dead card.
+pub fn node_driver_id(minor: u32, nouveau_requested: bool) -> NodeDriverId {
+    let nodes = GPU_NODES.lock();
+    let Some(node) = nodes.iter().find(|n| n.owns_minor(minor)) else {
+        // No table entry: the pre-table rule, where only index 0 exists.
+        return if nouveau_requested {
+            NodeDriverId::Nouveau
+        } else {
+            NodeDriverId::Software
+        };
+    };
+    if node.index == 0 {
+        return if nouveau_requested {
+            NodeDriverId::Nouveau
+        } else {
+            NodeDriverId::Software
+        };
+    }
+    let first_node_of_this_card = nodes
+        .iter()
+        .find(|n| Arc::ptr_eq(&n.driver, &node.driver))
+        .is_some_and(|n| n.index == node.index);
+    if nouveau_requested
+        && first_node_of_this_card
+        && node.driver.nouveau_uapi_capable()
+        && node.driver.nouveau_uapi_ready()
+    {
+        NodeDriverId::Nouveau
+    } else {
+        NodeDriverId::Compute
+    }
 }
 
 /// `nvidia.compute=BB.DD.F` on the kernel cmdline (hex, dots — the cmdline
@@ -8348,12 +8439,213 @@ mod damage_tests {
 
 /// The node naming and minor arithmetic, which is what `/dev/dri`,
 /// `/sys/class/drm` and `/sys/dev/char` all derive their entries from.
-/// Building the table itself needs registered drivers, so it is not testable
-/// here; this covers the part that used to be four hand-written names and is
-/// now shared arithmetic.
+/// Covers the minor arithmetic that used to be four hand-written names, and
+/// the table [`build_gpu_nodes`] builds over real registered drivers -- the
+/// emulated GPU can declare a role and a PCI address, which is all the node
+/// order reads.
 #[cfg(test)]
 mod node_tests {
     use super::*;
+    use crate::fs::devfs::kms_emu::{self, EmuGpu};
+
+    /// Leaves `GPU_NODES` empty however the test ends. A table left behind
+    /// holds an `Arc` to a dead emulated GPU and makes `is_compute_minor`
+    /// answer true for minors a later test expects to be plain KMS cards.
+    ///
+    /// Declare it AFTER the [`kms_emu::Screen`], so it drops BEFORE it: the
+    /// `Screen` holds the DRM test lock, and a reset that ran after the lock
+    /// was released could erase a table another test had just built under it.
+    struct NodeTable;
+    impl Drop for NodeTable {
+        fn drop(&mut self) {
+            *GPU_NODES.lock() = Vec::new();
+        }
+    }
+
+    /// `(card minor, pci bdf)` per node, in index order: what userspace ends
+    /// up seeing in `/dev/dri` and `/sys/class/drm`.
+    fn built() -> Vec<(u32, Option<(u32, u8, u8, u8)>)> {
+        build_gpu_nodes();
+        gpu_nodes()
+            .iter()
+            .map(|n| (n.card_minor(), n.driver.pci_bdf()))
+            .collect()
+    }
+
+    /// The two-card box this is all about: one RTX drives the screen, the other
+    /// is headless. Both have to be nameable -- `vulkaninfo` reported a single
+    /// card because `card0` and `card1` were two views of the compute card and
+    /// the console card had no node at all.
+    #[test]
+    fn the_console_card_gets_a_node_of_its_own_on_a_two_card_box() {
+        let screen = kms_emu::attach(64, 16);
+        let _table = NodeTable;
+        // Registration order is the reverse of the PCI probe order
+        // (`insert(0)`), so the console card goes in first and the compute one
+        // ends up primary -- exactly the box under test.
+        let _console =
+            screen.attach_gpu(EmuGpu::hardware_kms("emu-console").console_at(0x01, 0x00));
+        let _compute = screen.attach_gpu(EmuGpu::new("emu-compute").compute_at(0x65, 0x00));
+
+        let nodes = built();
+        assert_eq!(
+            nodes.len(),
+            3,
+            "expected card0/card1 for the compute card and card2 for the console one, got {:x?}",
+            nodes
+        );
+        let compute = Some((0, 0x65, 0x00, 0));
+        let console = Some((0, 0x01, 0x00, 0));
+        assert_eq!(nodes[0], (0, compute), "card0 must stay the primary GPU");
+        assert_eq!(
+            nodes[1],
+            (1, compute),
+            "card1 is still the headless compute view of card0's card"
+        );
+        assert_eq!(
+            nodes[2],
+            (2, console),
+            "the card driving the screen got no node"
+        );
+    }
+
+    /// A card with no role at all -- the VirtIO-like driver QEMU gives us --
+    /// still gets its pair. The old filter asked for `is_compute_gpu`, so a
+    /// second such card was simply dropped.
+    #[test]
+    fn a_card_with_no_role_is_named_too() {
+        let screen = kms_emu::attach(64, 16);
+        let _table = NodeTable;
+        let _first = screen.attach_gpu(EmuGpu::hardware_kms("emu-gpu-0"));
+        let _second = screen.attach_gpu(EmuGpu::new("emu-gpu-1"));
+
+        assert_eq!(
+            built().len(),
+            2,
+            "two registered cards, two node pairs -- neither declares a role"
+        );
+    }
+
+    /// One card stays one node pair: nothing to duplicate and nothing to add,
+    /// which is the console-only and QEMU case and must not have changed.
+    #[test]
+    fn a_single_card_still_gets_exactly_one_pair() {
+        let screen = kms_emu::attach(64, 16);
+        let _table = NodeTable;
+        let _only = screen.attach_gpu(EmuGpu::hardware_kms("emu-only").console_at(0x01, 0x00));
+
+        let nodes = built();
+        assert_eq!(nodes.len(), 1, "got {:x?}", nodes);
+        assert_eq!(nodes[0].0, 0);
+    }
+
+    /// Past the head, the order is the PCI address, not the registration
+    /// order: `card2` has to name the same card after a reboot.
+    #[test]
+    fn the_cards_past_the_head_are_sorted_by_pci_address() {
+        let screen = kms_emu::attach(64, 16);
+        let _table = NodeTable;
+        // Registered high BDF first, so registration order and BDF order
+        // disagree for the two cards that land past the head.
+        let _high = screen.attach_gpu(EmuGpu::hardware_kms("emu-high").console_at(0x65, 0x00));
+        let _low = screen.attach_gpu(EmuGpu::hardware_kms("emu-low").console_at(0x01, 0x00));
+        let _compute = screen.attach_gpu(EmuGpu::new("emu-compute").compute_at(0x0b, 0x00));
+
+        let nodes = built();
+        assert_eq!(nodes.len(), 4, "got {:x?}", nodes);
+        assert_eq!(
+            (nodes[2].1, nodes[3].1),
+            (Some((0, 0x01, 0x00, 0)), Some((0, 0x65, 0x00, 0))),
+            "card2/card3 are not in PCI order: {:x?}",
+            nodes
+        );
+    }
+
+    /// The identity of every node of a two-card box, which is what decides how
+    /// many Vulkan devices NVK enumerates. `card1` is the same card as `card0`
+    /// and must stay `eclipse-compute` however ready that card is; the second
+    /// card is nouveau once its RM is up, and `eclipse-compute` while it is
+    /// cold -- a node that enumerated as nouveau and died on the first EXEC
+    /// would be worse than no node.
+    #[test]
+    fn the_second_card_is_a_nouveau_device_only_once_its_rm_is_up() {
+        let screen = kms_emu::attach(64, 16);
+        let _table = NodeTable;
+        let console = screen.attach_gpu(
+            EmuGpu::hardware_kms("emu-console")
+                .console_at(0x01, 0x00)
+                .with_nouveau_uapi(false),
+        );
+        let _compute = screen.attach_gpu(
+            EmuGpu::new("emu-compute")
+                .compute_at(0x65, 0x00)
+                .with_nouveau_uapi(true),
+        );
+        build_gpu_nodes();
+        let id = |minor| node_driver_id(minor, true);
+
+        // Cold console card: one nouveau device, as today.
+        assert_eq!(id(0), NodeDriverId::Nouveau, "card0");
+        assert_eq!(id(128), NodeDriverId::Nouveau, "renderD128");
+        assert_eq!(id(1), NodeDriverId::Compute, "card1 is card0's own card");
+        assert_eq!(id(129), NodeDriverId::Compute, "renderD129");
+        assert_eq!(
+            id(2),
+            NodeDriverId::Compute,
+            "a cold card was offered to NVK"
+        );
+        assert_eq!(id(130), NodeDriverId::Compute, "renderD130");
+
+        // `nvidia.console_gpu` attaches its RM: now it is a real second device.
+        console.set_nouveau_ready(true);
+        assert_eq!(id(2), NodeDriverId::Nouveau, "card2");
+        assert_eq!(id(130), NodeDriverId::Nouveau, "renderD130");
+        assert_eq!(
+            id(1),
+            NodeDriverId::Compute,
+            "the alias node turned into a second nouveau device for card0's card"
+        );
+        assert_eq!(id(0), NodeDriverId::Nouveau, "card0 moved");
+    }
+
+    /// Without `nvidia.nouveau_uapi` nothing is nouveau, however capable and
+    /// ready the cards are: the flag is the request and this is QEMU's answer.
+    #[test]
+    fn no_node_is_nouveau_while_the_flag_is_off() {
+        let screen = kms_emu::attach(64, 16);
+        let _table = NodeTable;
+        let _console = screen.attach_gpu(
+            EmuGpu::hardware_kms("emu-console")
+                .console_at(0x01, 0x00)
+                .with_nouveau_uapi(true),
+        );
+        let _compute = screen.attach_gpu(
+            EmuGpu::new("emu-compute")
+                .compute_at(0x65, 0x00)
+                .with_nouveau_uapi(true),
+        );
+        build_gpu_nodes();
+
+        assert_eq!(node_driver_id(0, false), NodeDriverId::Software, "card0");
+        assert_eq!(node_driver_id(2, false), NodeDriverId::Compute, "card2");
+    }
+
+    /// A second card that does NOT serve the uAPI stays a compute node even
+    /// with the flag on and the card up: capability is not a flag's to grant.
+    #[test]
+    fn a_second_card_without_the_uapi_is_never_nouveau() {
+        let screen = kms_emu::attach(64, 16);
+        let _table = NodeTable;
+        let _other = screen.attach_gpu(EmuGpu::hardware_kms("emu-other").console_at(0x01, 0x00));
+        let _compute = screen.attach_gpu(
+            EmuGpu::new("emu-compute")
+                .compute_at(0x65, 0x00)
+                .with_nouveau_uapi(true),
+        );
+        build_gpu_nodes();
+
+        assert_eq!(node_driver_id(2, true), NodeDriverId::Compute, "card2");
+    }
 
     #[test]
     fn the_first_gpu_keeps_card0_and_render128() {
