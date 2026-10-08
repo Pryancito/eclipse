@@ -141,6 +141,7 @@ two agree the measurement is standing on something.
 | the GEM handle every driver-private ioctl looks up | — | `zcore-drivers` `scheme::gem_mmap::benches::*` |
 | the 2D primitives every framebuffer backend inherits | — | `zcore-drivers` `scheme::display::blit_tests::benches::*` |
 | the capability bitmap behind `EVIOCGBIT` | — | `zcore-drivers` `scheme::input::benches::*` |
+| the console's shadow buffer and its dirty region | — | `zcore-drivers` `utils::shadow_fb::tests::benches::*` |
 | `stat`/`fstat`/`statx` encoding | `fs` section | `linux-syscall` `file::stat::benches::*` |
 | `select`/`poll`/`epoll` per-call and per-fd work | `fs` section | `linux-syscall` `file::poll::benches::*` |
 | `getdents64` | `fs` section | `linux-syscall` `file::dir::benches::getdents64_*` |
@@ -964,4 +965,58 @@ display rows these are exact.
   level with the 128-byte one. Without the clamp it would walk 64512 codes past
   the end and `warn!` about every one.
 - **Outbound is free**: `to_le_bytes` is 2.81 ns for sixteen words.
+
+## What the console's shadow framebuffer said
+
+`utils::shadow_fb::tests::benches`, 23 rows over the console's whole CPU-side
+present path: the glyph renderer's pixels going in through `put_pixels`, the
+scroll through `copy_rect`, the dirty rectangle coming out through
+`take_dirty`, the cursor through `cell_pixels`, and `present` /
+`present_with_cursor` end to end. Everything here is cached RAM, so unlike the
+aperture rows these figures are exact; what they leave out is the device blit
+they hand off to, which the `scheme::display` rows price.
+
+The device is a sink that discards. `tests::Recorder` copies every blit into a
+fresh `Vec`, and for a full-screen present that is a 4 MiB allocation per
+iteration: a row measured against it measures the recorder. Nested one level
+inside the test module for the usual reason -- `take_dirty`, `cell_pixels`,
+`wc_expand_x` and the `inner` lock are all private.
+
+- **A full-screen present copies 8.3 MiB out of the shadow with interrupts
+  off.** `take_a_whole_dirty_screen` is 679,412 ns and
+  `present_a_whole_dirty_screen` is 680,227: the present *is* the snapshot
+  copy, and that copy runs under the shadow lock, which is IRQ-disabling.
+  `present` goes out of its way to release that lock before the device blit,
+  and says why -- the snapshot it takes first is still 0.68 ms with interrupts
+  off on a VT switch or a scroll. Not a change to make from a bench: the fix
+  would be a second scratch buffer, which is a design question.
+- **A scrolled line costs about 1.1 ms before a byte reaches the aperture**:
+  424,109 ns to move every text row up by one in the shadow, then 680,227 to
+  snapshot the screen it dirtied.
+- **A clean present is free**: 14.75 ns for the timer tick that finds nothing
+  dirty, which is what it finds most of the time. One dirty cell start to
+  finish is 71.07.
+- **The write-combining widening costs nothing.** `wc_expand_x` is 6.3-6.5 ns
+  whether the span is aligned or lands mid-line, against a floor of 0.97, and
+  it is called three times per present. Taking a widened cell out of the
+  shadow is 62.73 ns against 62.94 for the unwidened one -- the extra seven
+  columns are free, because sixteen rows of sixteen words and sixteen rows of
+  nine cost the same.
+- **The cursor blink is 538 ns, and 80% of it is bookkeeping.** Copying the
+  cell out with its nine columns inverted is 110.54 ns and without inversion
+  48.73; the rest of the 537.83 is the two `try_lock`s, the widening and the
+  `prev_cursor` comparison. Moving one cell (an erase and a draw, two blits) is
+  628.00.
+- **Filling is already vectorised and clearing is already memory-bound**: a
+  text row is 2,519 ns for 30,720 pixels (0.08 ns each), a whole-shadow clear
+  465,492 ns for 2,073,600 (0.22 ns each, around 18 GB/s).
+- **A negative result, recorded in the code.** A glyph is 268.88 ns for 144
+  pixels and 64.99 of that is the iterator and the clip, so the store costs
+  about 1.4 ns per pixel -- a lot for a bounds-checked word. `put_pixels`
+  updates the dirty bounding box *per pixel*, through the lock guard, which
+  looked like the answer. Folding the box in a local and committing it once
+  measured 268.88 against 271.43: nothing, inside the noise of either row. So
+  the simpler loop stays and the comment above it now says what was tried.
+  What a glyph's 1.4 ns actually goes on is the indexed store itself -- the
+  multiply, the bounds check and the word.
 
