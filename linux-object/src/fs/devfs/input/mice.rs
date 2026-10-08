@@ -225,7 +225,18 @@ impl MiceDev {
         for m in &mice {
             let cloned = inner.clone();
             m.subscribe(
-                Box::new(move |p| cloned.lock().handle_mouse_packet(p)),
+                Box::new(move |p| {
+                    // Lock dropped before the wake; see `EventDev::new` for
+                    // why an input interrupt has to fire this list at all.
+                    let readable = {
+                        let mut g = cloned.lock();
+                        g.handle_mouse_packet(p);
+                        g.stage_pos < g.stage_len || !g.buf.is_empty()
+                    };
+                    if readable {
+                        super::wait::wake_input_waiters();
+                    }
+                }),
                 false,
             );
         }

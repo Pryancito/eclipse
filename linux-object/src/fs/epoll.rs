@@ -579,6 +579,48 @@ impl FileLike for Epoll {
         Err(LxError::EINVAL)
     }
 
+    /// An epoll fd counts as an input device when anything it watches is one.
+    ///
+    /// `libinput_get_fd` returns libinput's own epoll fd, and that is what a
+    /// compositor puts in its event loop -- so the evdev nodes are never in
+    /// the outer wait's interest list, only one level down. Without this walk
+    /// the one wait that most needs the input waker list (labwc's) would not
+    /// register on it, and the mouse would keep being found by the re-scan
+    /// tick instead of by its own interrupt.
+    ///
+    /// Walked iteratively and depth-bounded for the same reason `any_ready`
+    /// is: a recursive walk stacked a snapshot per nest level on the
+    /// coroutine stack during desktop bring-up.
+    fn is_input_device(&self) -> bool {
+        let mut stack: Vec<(Arc<dyn FileLike>, usize)> = self
+            .inner
+            .lock()
+            .interest_list
+            .values()
+            .map(|(_, f)| (f.clone(), 0usize))
+            .collect();
+        while let Some((file, depth)) = stack.pop() {
+            if let Ok(child) = file.clone().downcast_arc::<Epoll>() {
+                if depth >= EPOLL_MAX_NEST_DEPTH {
+                    continue;
+                }
+                let nested: Vec<(Arc<dyn FileLike>, usize)> = child
+                    .inner
+                    .lock()
+                    .interest_list
+                    .values()
+                    .map(|(_, f)| (f.clone(), depth + 1))
+                    .collect();
+                stack.extend(nested);
+                continue;
+            }
+            if file.is_input_device() {
+                return true;
+            }
+        }
+        false
+    }
+
     fn poll(&self, _events: PollEvents) -> LxResult<PollStatus> {
         // An epoll fd is readable iff any watched fd is ready. Surfacing this is
         // what lets a nested epoll (e.g. libinput's fd inside wlroots' event
@@ -643,6 +685,14 @@ impl Epoll {
             let watch_interactive = interest_list
                 .iter()
                 .any(|(fd, _, _)| crate::net::fd_is_interactive(*fd));
+            // An evdev node carries no EventBus, so `subscribe_readiness`
+            // answers `None` for it and this wait would learn about a key or a
+            // mouse frame only on the next re-scan — the one device class
+            // whose interrupt did not wake the task waiting for it. Register
+            // on the input waker list instead. `is_input_device` walks a
+            // nested epoll, which is what a compositor actually watches:
+            // `libinput_get_fd` hands out libinput's own epoll fd.
+            let watch_hid = interest_list.iter().any(|(_, _, f)| f.is_input_device());
             crate::net::io_wait_tick(watch_net, watch_interactive);
             // Sync readiness scan. Do NOT call `async_poll` here: each scan used
             // to Box::pin+poll+drop a future per watched fd (libinput epoll in
@@ -757,10 +807,11 @@ impl Epoll {
             } else {
                 crate::net::wait::IO_WAIT_TICK_MS
             };
-            crate::net::wait::IoMultiplexWait::with_tick(
+            crate::net::wait::IoMultiplexWait::with_tick_hid(
                 timeout_msecs,
                 watch_net,
                 watch_interactive,
+                watch_hid,
                 tick_ms,
             )
             .await;
@@ -1303,6 +1354,110 @@ mod flag_tests {
         async fn async_poll(&self, events: PollEvents) -> LxResult<PollStatus> {
             self.poll(events)
         }
+    }
+
+    /// A file that answers `is_input_device`, which is the one thing an evdev
+    /// node does that nothing else in the host tests does.
+    struct Evdev {
+        base: KObjectBase,
+    }
+
+    impl_kobject!(Evdev);
+
+    #[async_trait]
+    impl FileLike for Evdev {
+        fn flags(&self) -> OpenFlags {
+            OpenFlags::empty()
+        }
+        fn set_flags(&self, _f: OpenFlags) -> LxResult {
+            Ok(())
+        }
+        async fn read(&self, _buf: &mut [u8]) -> LxResult<usize> {
+            Err(LxError::ENOSYS)
+        }
+        fn write(&self, _buf: &[u8]) -> LxResult<usize> {
+            Err(LxError::ENOSYS)
+        }
+        async fn read_at(&self, _offset: u64, _buf: &mut [u8]) -> LxResult<usize> {
+            Err(LxError::ENOSYS)
+        }
+        fn poll(&self, _events: PollEvents) -> LxResult<PollStatus> {
+            Ok(status(false, false, false, false))
+        }
+        async fn async_poll(&self, events: PollEvents) -> LxResult<PollStatus> {
+            self.poll(events)
+        }
+        fn is_input_device(&self) -> bool {
+            true
+        }
+    }
+
+    fn evdev() -> Arc<dyn FileLike> {
+        Arc::new(Evdev {
+            base: KObjectBase::new(),
+        })
+    }
+
+    /// An epoll of ordinary fds is not an input device, so a wait on it must
+    /// not register on the input waker list -- a 1 kHz mouse would wake it
+    /// for events it is not watching.
+    #[test]
+    fn an_epoll_without_an_input_device_is_not_one() {
+        let ep = epoll();
+        ep.ctl(ADD, FileDesc::from(3), ev(IN), Some(evfd(false)))
+            .unwrap();
+        assert!(!ep.is_input_device());
+    }
+
+    /// `libinput_get_fd` hands out libinput's own epoll fd, so a compositor's
+    /// event loop never sees the evdev node: it is one level down. The walk
+    /// through the nested epoll is what makes that wait register on the input
+    /// waker list at all -- without it the mouse is found by the re-scan tick
+    /// and nothing else, which is what libinput reports as "event processing
+    /// lagging behind".
+    #[test]
+    fn an_epoll_watching_an_evdev_node_is_an_input_device_through_the_nesting() {
+        let inner = epoll();
+        inner
+            .ctl(ADD, FileDesc::from(7), ev(IN), Some(evdev()))
+            .unwrap();
+        assert!(inner.is_input_device(), "the fd is directly in this one");
+
+        let outer = epoll();
+        outer
+            .ctl(ADD, FileDesc::from(3), ev(IN), Some(evfd(false)))
+            .unwrap();
+        outer
+            .ctl(ADD, FileDesc::from(4), ev(IN), Some(inner))
+            .unwrap();
+        assert!(outer.is_input_device(), "and one level down from this one");
+    }
+
+    /// `epoll_ctl` refuses to build a chain deeper than `EPOLL_MAX_NEST_DEPTH`
+    /// (ELOOP), so the depth bound in the walk is belt-and-braces: what has to
+    /// work is every nesting a process can actually create. Build the deepest
+    /// legal one and look through all of it.
+    #[test]
+    fn the_walk_reaches_through_the_deepest_nesting_epoll_ctl_allows() {
+        let deep = epoll();
+        deep.ctl(ADD, FileDesc::from(9), ev(IN), Some(evdev()))
+            .unwrap();
+        let mut cur: Arc<dyn FileLike> = deep;
+        let mut levels = 0;
+        loop {
+            let up = epoll();
+            if up
+                .ctl(ADD, FileDesc::from(3), ev(IN), Some(cur.clone()))
+                .is_err()
+            {
+                break; // ELOOP: this is as deep as a process can go
+            }
+            cur = up;
+            levels += 1;
+        }
+        assert!(levels > 0, "at least one level of nesting must be legal");
+        let top = cur.downcast_arc::<Epoll>().ok().unwrap();
+        assert!(top.is_input_device());
     }
 
     /// Their `uapi` values, and the reason they went missing: `events` is a

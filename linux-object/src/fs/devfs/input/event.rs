@@ -313,7 +313,24 @@ impl EventDev {
         let inner = Arc::new(Mutex::new(EventDevInner::new()));
         let cloned = inner.clone();
         input.subscribe(
-            Box::new(move |e| cloned.lock().handle_input_event(e)),
+            Box::new(move |e| {
+                // The lock is dropped before the wake: `wake_input_waiters`
+                // runs the parked tasks' wakers, and this handler is called
+                // from the HID interrupt with the device's queue in hand.
+                let readable = {
+                    let mut g = cloned.lock();
+                    g.handle_input_event(e);
+                    g.can_read()
+                };
+                // Only a finished frame is worth a wake -- `can_read` counts
+                // whole packets, so a half-built frame fires nothing. This is
+                // what makes an input interrupt wake a `poll`/`epoll` waiter
+                // at all; without it the only path was the wait's periodic
+                // re-scan. See `super::wait`.
+                if readable {
+                    super::wait::wake_input_waiters();
+                }
+            }),
             false,
         );
         Self {

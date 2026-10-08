@@ -7,7 +7,10 @@ use core::time::Duration;
 
 use kernel_hal::timer_waker::{self, TimerWakerSlot};
 
-use super::{clear_io_wait_wakers, register_io_wait_wakers, retain_io_wait_wakers};
+use super::{
+    clear_io_wait_wakers, clear_io_wait_wakers_hid, register_io_wait_wakers,
+    register_io_wait_wakers_hid, retain_io_wait_wakers, retain_io_wait_wakers_hid,
+};
 
 /// Fallback timer when no IRQ wakes a multiplex wait (poll/epoll/select).
 pub const IO_WAIT_TICK_MS: u64 = 4;
@@ -29,7 +32,7 @@ pub struct NetOrTtyWait {
     armed: bool,
     timer: Option<TimerWakerSlot>,
     watch_net: bool,
-    watch_hid: bool,
+    watch_interactive: bool,
     io_waker: Option<core::task::Waker>,
 }
 
@@ -40,7 +43,7 @@ impl NetOrTtyWait {
             armed: false,
             timer: None,
             watch_net: true,
-            watch_hid: true,
+            watch_interactive: true,
             io_waker: None,
         }
     }
@@ -50,7 +53,7 @@ impl Drop for NetOrTtyWait {
     fn drop(&mut self) {
         timer_waker::kill_timer_waker(&mut self.timer);
         if let Some(w) = self.io_waker.take() {
-            clear_io_wait_wakers(&w, self.watch_net, self.watch_hid);
+            clear_io_wait_wakers(&w, self.watch_net, self.watch_interactive);
         }
     }
 }
@@ -62,27 +65,27 @@ impl Future for NetOrTtyWait {
         if crate::fs::stdio::ctrl_c_pending_peek() {
             timer_waker::kill_timer_waker(&mut self.timer);
             if let Some(w) = self.io_waker.take() {
-                clear_io_wait_wakers(&w, self.watch_net, self.watch_hid);
+                clear_io_wait_wakers(&w, self.watch_net, self.watch_interactive);
             }
             return Poll::Ready(());
         }
         if kernel_hal::timer::timer_now() >= self.deadline {
             timer_waker::kill_timer_waker(&mut self.timer);
             if let Some(w) = self.io_waker.take() {
-                clear_io_wait_wakers(&w, self.watch_net, self.watch_hid);
+                clear_io_wait_wakers(&w, self.watch_net, self.watch_interactive);
             } else {
-                clear_io_wait_wakers(cx.waker(), self.watch_net, self.watch_hid);
+                clear_io_wait_wakers(cx.waker(), self.watch_net, self.watch_interactive);
             }
             return Poll::Ready(());
         }
         if self.armed {
-            retain_io_wait_wakers(cx.waker(), self.watch_net, self.watch_hid);
+            retain_io_wait_wakers(cx.waker(), self.watch_net, self.watch_interactive);
             timer_waker::kill_timer_waker(&mut self.timer);
-            clear_io_wait_wakers(cx.waker(), self.watch_net, self.watch_hid);
+            clear_io_wait_wakers(cx.waker(), self.watch_net, self.watch_interactive);
             self.io_waker = None;
             return Poll::Ready(());
         }
-        register_io_wait_wakers(cx.waker(), self.watch_net, self.watch_hid);
+        register_io_wait_wakers(cx.waker(), self.watch_net, self.watch_interactive);
         self.io_waker = Some(cx.waker().clone());
         let dl = self.deadline;
         timer_waker::ensure_timer_waker(&mut self.timer, dl, cx);
@@ -95,6 +98,9 @@ impl Future for NetOrTtyWait {
 pub struct IoMultiplexWait {
     deadline: Option<Duration>,
     watch_net: bool,
+    watch_interactive: bool,
+    /// Whether this wait's set holds an input device, so an input frame must
+    /// wake it. See `crate::fs::devfs::input::wait`.
     watch_hid: bool,
     armed: bool,
     timer: Option<TimerWakerSlot>,
@@ -108,14 +114,34 @@ pub struct IoMultiplexWait {
 }
 
 impl IoMultiplexWait {
-    pub fn new(timeout_msecs: isize, watch_net: bool, watch_hid: bool) -> Self {
-        Self::with_tick(timeout_msecs, watch_net, watch_hid, IO_WAIT_TICK_MS)
+    pub fn new(timeout_msecs: isize, watch_net: bool, watch_interactive: bool) -> Self {
+        Self::with_tick(timeout_msecs, watch_net, watch_interactive, IO_WAIT_TICK_MS)
     }
 
     /// [`new`](Self::new) with an explicit fallback interval — pass
     /// [`IO_WAIT_COVERED_TICK_MS`] when every watched fd has a parked
     /// readiness subscription doing the real waking.
-    pub fn with_tick(timeout_msecs: isize, watch_net: bool, watch_hid: bool, tick_ms: u64) -> Self {
+    pub fn with_tick(
+        timeout_msecs: isize,
+        watch_net: bool,
+        watch_interactive: bool,
+        tick_ms: u64,
+    ) -> Self {
+        Self::with_tick_hid(timeout_msecs, watch_net, watch_interactive, false, tick_ms)
+    }
+
+    /// [`with_tick`](Self::with_tick) plus the input-device waker list, for a
+    /// wait whose set holds an evdev node (directly, or through a nested
+    /// epoll: see [`crate::fs::FileLike::is_input_device`]). That
+    /// registration is what makes an input interrupt wake this task instead
+    /// of leaving it to the fallback tick.
+    pub fn with_tick_hid(
+        timeout_msecs: isize,
+        watch_net: bool,
+        watch_interactive: bool,
+        watch_hid: bool,
+        tick_ms: u64,
+    ) -> Self {
         let deadline = if timeout_msecs >= 0 {
             Some(kernel_hal::timer::timer_now() + Duration::from_millis(timeout_msecs as u64))
         } else {
@@ -124,6 +150,7 @@ impl IoMultiplexWait {
         Self {
             deadline,
             watch_net,
+            watch_interactive,
             watch_hid,
             armed: false,
             timer: None,
@@ -137,7 +164,7 @@ impl Drop for IoMultiplexWait {
     fn drop(&mut self) {
         timer_waker::kill_timer_waker(&mut self.timer);
         if let Some(w) = self.io_waker.take() {
-            clear_io_wait_wakers(&w, self.watch_net, self.watch_hid);
+            clear_io_wait_wakers_hid(&w, self.watch_net, self.watch_interactive, self.watch_hid);
         }
     }
 }
@@ -149,24 +176,44 @@ impl Future for IoMultiplexWait {
         if let Some(dl) = self.deadline {
             if kernel_hal::timer::timer_now() >= dl {
                 timer_waker::kill_timer_waker(&mut self.timer);
-                clear_io_wait_wakers(cx.waker(), self.watch_net, self.watch_hid);
+                clear_io_wait_wakers_hid(
+                    cx.waker(),
+                    self.watch_net,
+                    self.watch_interactive,
+                    self.watch_hid,
+                );
                 self.io_waker = None;
                 return Poll::Ready(());
             }
         }
         if self.armed {
-            retain_io_wait_wakers(cx.waker(), self.watch_net, self.watch_hid);
+            retain_io_wait_wakers_hid(
+                cx.waker(),
+                self.watch_net,
+                self.watch_interactive,
+                self.watch_hid,
+            );
             timer_waker::kill_timer_waker(&mut self.timer);
             // Drop the IRQ registration: the epoll loop boxes a fresh wait each
             // cycle. Leaving the waker in NET_RX/TTY lists after Ready meant a
             // later IRQ could wake a completed wait's task slot under churn
             // (observed as delayed KERNEL PAGE FAULT / null fn-ptr after a
             // long labwc session).
-            clear_io_wait_wakers(cx.waker(), self.watch_net, self.watch_hid);
+            clear_io_wait_wakers_hid(
+                cx.waker(),
+                self.watch_net,
+                self.watch_interactive,
+                self.watch_hid,
+            );
             self.io_waker = None;
             return Poll::Ready(());
         }
-        register_io_wait_wakers(cx.waker(), self.watch_net, self.watch_hid);
+        register_io_wait_wakers_hid(
+            cx.waker(),
+            self.watch_net,
+            self.watch_interactive,
+            self.watch_hid,
+        );
         self.io_waker = Some(cx.waker().clone());
         let tick = Duration::from_millis(self.tick_ms);
         let wake_at = if let Some(dl) = self.deadline {
