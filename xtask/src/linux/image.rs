@@ -283,6 +283,12 @@ impl super::LinuxRootfs {
         // 递归 rootfs
         self.make(false);
 
+        // Y mirarla antes de empaquetarla. Los tres fallos que dejaron una ISO
+        // de arm64 sin PID 1 y con apk mudo eran avisos en medio de media hora
+        // de salida; esto los convierte en un fallo de construccion. Ver
+        // `verify.rs`, y `ECLIPSE_ALLOW_INCOMPLETE_ROOTFS=1` para saltarlo.
+        self.verify();
+
         // For x86_64, build the installer images first
         if let Arch::X86_64 = self.0 {
             // The EFI image is assembled with external tools. Check for them

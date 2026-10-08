@@ -2267,7 +2267,15 @@ pub mod heap_regions {
 /// the alternative is the machine. The refusal is reported at the block, so
 /// the report names the block that was written after its free instead of the
 /// code that allocated it next.
-#[cfg_attr(feature = "libos", allow(dead_code))]
+// `mem-debug` belongs here for the same reason `libos` does: the `slab` module
+// that uses these lists is `cfg(not(feature = "mem-debug"))` -- memory
+// debugging wants real buddy round-trips for its canary -- so with the feature
+// on nothing calls them and `deny(warnings)` counts them as dead code.
+//
+// Without this, `MEM_DEBUG=1` did not compile at all: 18 `never used` errors.
+// That is why the feature sat here since it was written with no way to turn it
+// on -- no Makefile switch, and no job compiling it.
+#[cfg_attr(any(feature = "libos", feature = "mem-debug"), allow(dead_code))]
 pub mod free_lists {
     use core::alloc::Layout;
 
@@ -2495,7 +2503,9 @@ pub mod free_lists {
 /// every stack. So every free leaves its caller's return addresses here, and
 /// the report looks the block up. A ring: old entries are overwritten, which
 /// a report says rather than naming somebody else.
-#[cfg_attr(feature = "libos", allow(dead_code))]
+// Same as `free_lists`: under `mem-debug` the `slab` that feeds this ring is
+// not compiled, so the ring is left with no callers.
+#[cfg_attr(any(feature = "libos", feature = "mem-debug"), allow(dead_code))]
 pub mod free_ring {
     use core::sync::atomic::{AtomicUsize, Ordering};
 

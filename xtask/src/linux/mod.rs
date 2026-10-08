@@ -4,6 +4,7 @@ mod image;
 pub(crate) mod nvidia_firmware;
 mod opencv;
 mod test;
+mod verify;
 mod xorg;
 
 use crate::{commands::fetch_online, variant::Variant, Arch, PROJECT_DIR, REPOS, TARGET};

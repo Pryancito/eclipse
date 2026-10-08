@@ -13,6 +13,7 @@ LOG ?= error
 LINUX ?= 1
 MOCK ?=
 LIBOS ?=
+MEM_DEBUG ?=
 TEST ?=
 GRAPHIC ?=
 DISK ?=
@@ -286,6 +287,26 @@ endif
 
 ifeq ($(MOCK), 1)
   features += mock-disk
+endif
+
+# Memory-corruption forensics. Behind this feature `zCore/src/memory_x86_64.rs`
+# puts a 16-byte redzone with an 0xAB canary after every heap allocation, 0xA5
+# poison on a heap free and 0x5A on a frame free, and a bitset of allocated
+# frames that reports a double alloc and a double free ([frametrack]).
+#
+# This catches an overrun AT THE WRITE instead of ten minutes later, as a
+# BTreeMap that blows up or a Vec whose length was overwritten -- which is how
+# the last two corruptions arrived. Off by default: it costs a SeqCst RMW per
+# frame on the hottest path in the memory system.
+#
+# x86_64 only. No other architecture has the probes, so asking for it there
+# would quietly build a kernel with no memory debugging that looks like it has
+# some -- hence an error rather than a silence.
+ifeq ($(MEM_DEBUG), 1)
+  ifneq ($(ARCH), x86_64)
+    $(error MEM_DEBUG=1 only exists for ARCH=x86_64 (the probes live in zCore/src/memory_x86_64.rs))
+  endif
+  features += mem-debug
 endif
 
 ifeq ($(TEST), 1)
