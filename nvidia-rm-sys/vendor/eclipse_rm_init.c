@@ -1454,6 +1454,37 @@ static NvU32 g_grAllocGpuInst = 0xFFFFFFFF;
 static NvU64 g_vasGrantedSize = 0;
 static NvU64 g_vasGrantedBase = 0;
 
+/* Whether `gpuInstance` is a card OTHER than the one that owns the step16
+ * ladder, for the ladder's OWN entry points.
+ *
+ * The per-context entry points already gate on this (see g_grAllocGpuInst
+ * above), but each ladder step guards itself with nothing but its own
+ * `g_gr*Done`, and that flag says "this step ran", never "this step ran on
+ * YOUR card". So on a dual-card box the second GPU's step16/17/18/19/20/21
+ * or bench cache-hits the FIRST card's result and returns NV_OK with the
+ * first card's handles and numbers, without the second card being touched at
+ * all. A caller cannot tell: the status words all read OK. `cat
+ * /proc/gpuinit` and `/proc/gpustep16` walk EVERY registered DRM driver, so
+ * on a box booted with `nvidia.console_gpu` -- where both cards have RM
+ * attached -- that false success is what they print today.
+ *
+ * Rejecting rather than re-running, for the same reason the ctx gate rejects:
+ * one shared RM client owns the ladder's handle table, and a second card
+ * cannot build its own ladder on top of another card's client. Giving the
+ * second card a ladder of its own is real work; this gate is what stops that
+ * work from looking already done. Silent on the owner's own calls (the hot,
+ * idempotent path) and on a ladder with no owner yet. */
+static NvBool eclipseLadderForeignGpu(NvU32 gpuInstance, const char *step)
+{
+    if (!g_grAllocDone || gpuInstance == g_grAllocGpuInst)
+    {
+        return NV_FALSE;
+    }
+    nv_printf(0, "[eclipse-rm-trace] %s on gpu%u rejected (ladder owner is gpu%u)\n",
+              step, gpuInstance, g_grAllocGpuInst);
+    return NV_TRUE;
+}
+
 NV_STATUS eclipse_rm_step16(NvU32 gpuInstance, EclipseGrAlloc *pOut)
 {
     OBJGPU *pGpu;
@@ -1463,6 +1494,10 @@ NV_STATUS eclipse_rm_step16(NvU32 gpuInstance, EclipseGrAlloc *pOut)
     RsClient *pRsClient = NULL;
 
     if (pOut == NULL)
+    {
+        return NV_ERR_INVALID_ARGUMENT;
+    }
+    if (eclipseLadderForeignGpu(gpuInstance, "step16"))
     {
         return NV_ERR_INVALID_ARGUMENT;
     }
@@ -1772,6 +1807,10 @@ NV_STATUS eclipse_rm_step17(NvU32 gpuInstance, EclipseGrChannel *pOut)
     NvBool failed = NV_FALSE;
 
     if (pOut == NULL)
+    {
+        return NV_ERR_INVALID_ARGUMENT;
+    }
+    if (eclipseLadderForeignGpu(gpuInstance, "step17"))
     {
         return NV_ERR_INVALID_ARGUMENT;
     }
@@ -2781,6 +2820,10 @@ NV_STATUS eclipse_rm_step18(NvU32 gpuInstance, EclipseGrLaunch *pOut)
     {
         return NV_ERR_INVALID_ARGUMENT;
     }
+    if (eclipseLadderForeignGpu(gpuInstance, "step18"))
+    {
+        return NV_ERR_INVALID_ARGUMENT;
+    }
     if (g_grLaunchDone)
     {
         portMemCopy(pOut, sizeof(*pOut), &g_grLaunchCache, sizeof(g_grLaunchCache));
@@ -3196,6 +3239,10 @@ NV_STATUS eclipse_rm_step19(NvU32 gpuInstance, EclipseGrCompute *pOut)
     {
         return NV_ERR_INVALID_ARGUMENT;
     }
+    if (eclipseLadderForeignGpu(gpuInstance, "step19"))
+    {
+        return NV_ERR_INVALID_ARGUMENT;
+    }
     if (g_grComputeDone)
     {
         portMemCopy(pOut, sizeof(*pOut), &g_grComputeCache, sizeof(g_grComputeCache));
@@ -3554,6 +3601,10 @@ NV_STATUS eclipse_rm_step20(NvU32 gpuInstance, EclipseGrStore *pOut)
     {
         return NV_ERR_INVALID_ARGUMENT;
     }
+    if (eclipseLadderForeignGpu(gpuInstance, "step20"))
+    {
+        return NV_ERR_INVALID_ARGUMENT;
+    }
     if (g_grStoreDone)
     {
         portMemCopy(pOut, sizeof(*pOut), &g_grStoreCache, sizeof(g_grStoreCache));
@@ -3908,6 +3959,10 @@ NV_STATUS eclipse_rm_step21(NvU32 gpuInstance, EclipseGrThreads *pOut)
                        TRANSFER_FLAGS_SHADOW_INIT_MEM;
 
     if (pOut == NULL)
+    {
+        return NV_ERR_INVALID_ARGUMENT;
+    }
+    if (eclipseLadderForeignGpu(gpuInstance, "step21"))
     {
         return NV_ERR_INVALID_ARGUMENT;
     }
@@ -5100,6 +5155,10 @@ NV_STATUS eclipse_rm_bench(NvU32 gpuInstance, EclipseGrBench *pOut)
 
     if (pOut == NULL)
         return NV_ERR_INVALID_ARGUMENT;
+    if (eclipseLadderForeignGpu(gpuInstance, "bench"))
+    {
+        return NV_ERR_INVALID_ARGUMENT;
+    }
     if (g_grBenchDone)
     {
         portMemCopy(pOut, sizeof(*pOut), &g_grBenchCache, sizeof(g_grBenchCache));
