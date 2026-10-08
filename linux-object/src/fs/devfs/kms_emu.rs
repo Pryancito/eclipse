@@ -425,6 +425,11 @@ pub(crate) struct EmuGpu {
     compute: bool,
     /// The PCI address this GPU reports, which is what the node order sorts on.
     bdf: Option<(u32, u8, u8, u8)>,
+    /// Whether this GPU serves the nouveau uAPI, and whether its RM is up.
+    /// Live, because a deferred console bring-up really does flip the second
+    /// one under a client.
+    nouveau_capable: bool,
+    nouveau_ready: AtomicBool,
     calls: Mutex<GpuCalls>,
 }
 
@@ -445,8 +450,20 @@ impl EmuGpu {
             console: false,
             compute: false,
             bdf: None,
+            nouveau_capable: false,
+            nouveau_ready: AtomicBool::new(false),
             calls: Mutex::new(GpuCalls::default()),
         }
+    }
+
+    /// An NVIDIA-like GPU: it serves the nouveau uAPI, and `ready` says
+    /// whether its RM is attached yet. A card that is capable but cold is the
+    /// console GPU before `nvidia.console_gpu` has brought it up.
+    pub(crate) fn with_nouveau_uapi(self, ready: bool) -> EmuGpu {
+        let mut gpu = self;
+        gpu.nouveau_capable = true;
+        gpu.nouveau_ready = AtomicBool::new(ready);
+        gpu
     }
 
     /// The card that drives the boot display at `bdf`: `is_console_gpu()`, and
@@ -520,6 +537,14 @@ impl DrmScheme for EmuGpu {
 
     fn is_compute_gpu(&self) -> bool {
         self.compute
+    }
+
+    fn nouveau_uapi_capable(&self) -> bool {
+        self.nouveau_capable
+    }
+
+    fn nouveau_uapi_ready(&self) -> bool {
+        self.nouveau_ready.load(Ordering::Relaxed)
     }
 
     fn get_caps(&self) -> DrmCaps {
@@ -684,6 +709,13 @@ impl Gpu {
     /// multi-ioctl query sees the topology answer change underneath it.
     pub(crate) fn set_hardware_kms(&self, on: bool) {
         self.gpu.hardware_kms.store(on, Ordering::Relaxed);
+    }
+
+    /// Attach (or detach) this GPU's RM with the card already registered,
+    /// which is what a deferred console bring-up does: the card answers "not
+    /// ready" through the whole boot and then starts answering "ready".
+    pub(crate) fn set_nouveau_ready(&self, on: bool) {
+        self.gpu.nouveau_ready.store(on, Ordering::Relaxed);
     }
 
     /// Make the driver refuse every following flip, as a real one does when the

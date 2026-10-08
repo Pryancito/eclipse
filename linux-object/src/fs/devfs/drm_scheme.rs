@@ -845,7 +845,9 @@ impl DrmDev {
         match cmd {
             DRM_IOCTL_VERSION => {
                 let node = drm_node_name(self.minor);
-                let compute_node = drm::is_compute_minor(self.minor);
+                let driver_id =
+                    drm::node_driver_id(self.minor, zcore_drivers::display::nouveau_uapi_enabled());
+                let compute_node = driver_id == drm::NodeDriverId::Compute;
                 // When the nouveau experiment is on, make this visible at the
                 // default `warn` level and name the primary DRM driver: it tells
                 // us in one boot whether NVK/Mesa even reached VERSION on this
@@ -912,9 +914,12 @@ impl DrmDev {
                 // (NOT the legacy GEM_PUSHBUF path, absent here). If Mesa's GL
                 // winsys still reaches for GEM_PUSHBUF, the boot log's
                 // "[nouveau-uapi] unhandled ioctl ... GEM_PUSHBUF" line says so.
-                let nouveau = zcore_drivers::display::nouveau_uapi_enabled();
+                //
+                // Which card a node is comes from `node_driver_id`, not from
+                // the flag alone: a SECOND NVIDIA card that is up gets the
+                // nouveau identity too, so NVK enumerates both.
                 let v = unsafe { &mut *(data as *mut DrmVersion) };
-                let (major, minor, patchlevel) = driver_version(compute_node, nouveau);
+                let (major, minor, patchlevel) = driver_version(driver_id);
                 v.version_major = major;
                 v.version_minor = minor;
                 v.version_patchlevel = patchlevel;
@@ -924,21 +929,12 @@ impl DrmDev {
                 // gave, and the length written back is `strlen` whatever the
                 // room was. These carried the NUL in both the copy and the
                 // length, so `drmGetVersion` reported "nouveau" as 8 bytes.
-                let name: &[u8] = if compute_node {
-                    b"eclipse-compute"
-                } else if nouveau {
-                    b"nouveau"
-                } else {
-                    b"zcore"
+                let (name, desc): (&[u8], &[u8]) = match driver_id {
+                    drm::NodeDriverId::Compute => (b"eclipse-compute", b"Eclipse NVIDIA compute"),
+                    drm::NodeDriverId::Nouveau => (b"nouveau", b"nouveau"),
+                    drm::NodeDriverId::Software => (b"zcore", b"zCore DRM Driver"),
                 };
                 let date = b"20260503";
-                let desc: &[u8] = if compute_node {
-                    b"Eclipse NVIDIA compute"
-                } else if nouveau {
-                    b"nouveau"
-                } else {
-                    b"zCore DRM Driver"
-                };
                 drm_copy_field(v.name, &mut v.name_len, name)?;
                 drm_copy_field(v.date, &mut v.date_len, date)?;
                 drm_copy_field(v.desc, &mut v.desc_len, desc)?;
@@ -1222,10 +1218,10 @@ impl DrmDev {
                 // under nouveau, and read only the driver major, so a client
                 // asking for driver 1.7 was told yes.
                 let sv = unsafe { &mut *(data as *mut DrmSetVersion) };
-                let (dd_major, dd_minor, _) = driver_version(
-                    drm::is_compute_minor(self.minor),
+                let (dd_major, dd_minor, _) = driver_version(drm::node_driver_id(
+                    self.minor,
                     zcore_drivers::display::nouveau_uapi_enabled(),
-                );
+                ));
                 let req_if = (sv.drm_di_major, sv.drm_di_minor);
                 let req_dd = (sv.drm_dd_major, sv.drm_dd_minor);
                 sv.drm_di_major = 1;
@@ -4214,13 +4210,11 @@ fn drm_copy_field(buf: *mut u8, buf_len: &mut usize, value: &[u8]) -> Result<()>
 /// reports and SET_VERSION checks a request against. The compute node is
 /// its own 0.1.0; a nouveau node carries nouveau's 1.4.0 (the version that
 /// gates the VM_BIND/EXEC uAPI); the software card is 1.0.0.
-fn driver_version(compute_node: bool, nouveau: bool) -> (i32, i32, i32) {
-    if compute_node {
-        (0, 1, 0)
-    } else if nouveau {
-        (1, 4, 0)
-    } else {
-        (1, 0, 0)
+fn driver_version(id: drm::NodeDriverId) -> (i32, i32, i32) {
+    match id {
+        drm::NodeDriverId::Compute => (0, 1, 0),
+        drm::NodeDriverId::Nouveau => (1, 4, 0),
+        drm::NodeDriverId::Software => (1, 0, 0),
     }
 }
 
