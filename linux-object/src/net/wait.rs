@@ -102,6 +102,12 @@ pub struct IoMultiplexWait {
     /// Whether this wait's set holds an input device, so an input frame must
     /// wake it. See `crate::fs::devfs::input::wait`.
     watch_hid: bool,
+    /// `crate::fs::devfs::input::wait::input_seq` as it stood BEFORE the
+    /// caller's readiness scan. A frame landing between that scan and the
+    /// registration below would otherwise be lost -- the wake drains a list
+    /// this wait is not in yet -- and the task would sleep out the fallback
+    /// tick. Compared after registering; a move means re-scan now.
+    hid_seq: u64,
     armed: bool,
     timer: Option<TimerWakerSlot>,
     /// Fallback re-scan interval: [`IO_WAIT_TICK_MS`] normally,
@@ -127,7 +133,14 @@ impl IoMultiplexWait {
         watch_interactive: bool,
         tick_ms: u64,
     ) -> Self {
-        Self::with_tick_hid(timeout_msecs, watch_net, watch_interactive, false, tick_ms)
+        Self::with_tick_hid(
+            timeout_msecs,
+            watch_net,
+            watch_interactive,
+            false,
+            0,
+            tick_ms,
+        )
     }
 
     /// [`with_tick`](Self::with_tick) plus the input-device waker list, for a
@@ -140,6 +153,7 @@ impl IoMultiplexWait {
         watch_net: bool,
         watch_interactive: bool,
         watch_hid: bool,
+        hid_seq: u64,
         tick_ms: u64,
     ) -> Self {
         let deadline = if timeout_msecs >= 0 {
@@ -152,6 +166,7 @@ impl IoMultiplexWait {
             watch_net,
             watch_interactive,
             watch_hid,
+            hid_seq,
             armed: false,
             timer: None,
             tick_ms,
@@ -214,6 +229,21 @@ impl Future for IoMultiplexWait {
             self.watch_interactive,
             self.watch_hid,
         );
+        // Registered: from here a frame wakes this task. The one that could
+        // still be lost is the frame between the caller's readiness scan and
+        // the line above -- its wake drained a list this task was not in yet.
+        // `hid_seq` was read before that scan, so a move means exactly that
+        // happened: go round again rather than sleep out the fallback tick.
+        if self.watch_hid && crate::fs::devfs::input::wait::input_seq() != self.hid_seq {
+            clear_io_wait_wakers_hid(
+                cx.waker(),
+                self.watch_net,
+                self.watch_interactive,
+                self.watch_hid,
+            );
+            self.io_waker = None;
+            return Poll::Ready(());
+        }
         self.io_waker = Some(cx.waker().clone());
         let tick = Duration::from_millis(self.tick_ms);
         let wake_at = if let Some(dl) = self.deadline {

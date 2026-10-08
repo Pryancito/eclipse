@@ -324,11 +324,19 @@ fn clear_poll_io(
     io_waker: &mut Option<core::task::Waker>,
     watch_net: bool,
     watch_interactive: bool,
-    watch_hid: bool,
 ) {
     kill_poll_timer(timer);
     if let Some(w) = io_waker.take() {
-        linux_object::net::clear_io_wait_wakers_hid(&w, watch_net, watch_interactive, watch_hid);
+        // `true` for the input list, whatever this pass computed. These
+        // futures live across every pass of the wait and overwrite their
+        // watch flags on each one, so an input fd closed mid-wait flips
+        // `watch_hid` from true to false and a clear gated on it would walk
+        // past the registration the earlier pass made -- leaving a waker that
+        // a later input frame fires into a wait that is over. Clearing one
+        // that was never made is a no-op (`clearing_an_unregistered_waker_
+        // does_nothing`), so the unconditional clear costs nothing and cannot
+        // strand anything.
+        linux_object::net::clear_io_wait_wakers_hid(&w, watch_net, watch_interactive, true);
     }
 }
 
@@ -379,8 +387,7 @@ impl Syscall<'_> {
             fn drop(&mut self) {
                 let wn = self.watch_net;
                 let wi = self.watch_interactive;
-                let wh = self.watch_hid;
-                clear_poll_io(&mut self.timer, &mut self.io_waker, wn, wi, wh);
+                clear_poll_io(&mut self.timer, &mut self.io_waker, wn, wi);
             }
         }
         impl<'a> Future for PollFuture<'a> {
@@ -400,6 +407,12 @@ impl Syscall<'_> {
                     .polls
                     .iter()
                     .any(|p| linux_object::net::fd_is_interactive(p.fd));
+                // Read BEFORE the scan below (see
+                // `linux_object::fs::devfs::input::wait::input_seq`): a frame
+                // landing between the scan and `arm_io_wait` drains a list
+                // this task is not in yet, and the wait would sleep out its
+                // fallback tick for an event that had already arrived.
+                let hid_seq = linux_object::fs::devfs::input::wait::input_seq();
                 let watch_hid = {
                     let proc = this.syscall.linux_process();
                     this.polls.iter().any(|p| {
@@ -483,7 +496,6 @@ impl Syscall<'_> {
                         &mut this.io_waker,
                         watch_net,
                         watch_interactive,
-                        watch_hid,
                     );
                     return Poll::Ready(Err(err));
                 }
@@ -494,7 +506,6 @@ impl Syscall<'_> {
                         &mut this.io_waker,
                         watch_net,
                         watch_interactive,
-                        watch_hid,
                     );
                     return Poll::Ready(Ok(events));
                 }
@@ -509,7 +520,6 @@ impl Syscall<'_> {
                         &mut this.io_waker,
                         watch_net,
                         watch_interactive,
-                        watch_hid,
                     );
                     return Poll::Ready(Err(e));
                 }
@@ -562,7 +572,6 @@ impl Syscall<'_> {
                             &mut this.io_waker,
                             watch_net,
                             watch_interactive,
-                            watch_hid,
                         );
                         return Poll::Ready(Ok(0));
                     }
@@ -586,6 +595,15 @@ impl Syscall<'_> {
                             &mut this.io_armed,
                         );
                         this.io_waker = Some(cx.waker().clone());
+                        // Armed, so a frame from here on wakes this task. The
+                        // one that could have been missed is the frame between
+                        // the scan above and that arming; a moved counter says
+                        // it happened, so go round again instead of parking.
+                        if watch_hid && linux_object::fs::devfs::input::wait::input_seq() != hid_seq
+                        {
+                            cx.waker().wake_by_ref();
+                            return Poll::Pending;
+                        }
                         schedule_poll_wakeup(cx, wake_in, &mut this.timer);
                     }
                 }
@@ -853,8 +871,7 @@ impl Syscall<'_> {
             fn drop(&mut self) {
                 let wn = self.watch_net;
                 let wi = self.watch_interactive;
-                let wh = self.watch_hid;
-                clear_poll_io(&mut self.timer, &mut self.io_waker, wn, wi, wh);
+                clear_poll_io(&mut self.timer, &mut self.io_waker, wn, wi);
             }
         }
 
@@ -868,6 +885,10 @@ impl Syscall<'_> {
                 let watch_net = this.watch_net;
                 let watch_interactive = this.watch_interactive;
                 let watch_hid = this.watch_hid;
+                // Read BEFORE the scan below, for the reason `sys_poll`'s copy
+                // of this line gives: a frame between the scan and the arming
+                // drains a list this task is not in yet.
+                let hid_seq = linux_object::fs::devfs::input::wait::input_seq();
                 let terminal_only = this.terminal_only;
                 if this.io_armed {
                     arm_io_wait(
@@ -926,7 +947,6 @@ impl Syscall<'_> {
                         &mut this.io_waker,
                         watch_net,
                         watch_interactive,
-                        watch_hid,
                     );
                     return Poll::Ready(Err(err));
                 }
@@ -938,7 +958,6 @@ impl Syscall<'_> {
                         &mut this.io_waker,
                         watch_net,
                         watch_interactive,
-                        watch_hid,
                     );
                     // Flush the ready bitmaps to user space once.
                     this.read_fds.commit();
@@ -953,7 +972,6 @@ impl Syscall<'_> {
                         &mut this.io_waker,
                         watch_net,
                         watch_interactive,
-                        watch_hid,
                     );
                     return Poll::Ready(Err(e));
                 }
@@ -1003,7 +1021,6 @@ impl Syscall<'_> {
                             &mut this.io_waker,
                             watch_net,
                             watch_interactive,
-                            watch_hid,
                         );
                         return Poll::Ready(Ok(0));
                     }
@@ -1027,6 +1044,15 @@ impl Syscall<'_> {
                             &mut this.io_armed,
                         );
                         this.io_waker = Some(cx.waker().clone());
+                        // Armed, so a frame from here on wakes this task. The
+                        // one that could have been missed is the frame between
+                        // the scan above and that arming; a moved counter says
+                        // it happened, so go round again instead of parking.
+                        if watch_hid && linux_object::fs::devfs::input::wait::input_seq() != hid_seq
+                        {
+                            cx.waker().wake_by_ref();
+                            return Poll::Pending;
+                        }
                         schedule_poll_wakeup(cx, wake_in, &mut this.timer);
                     }
                 }

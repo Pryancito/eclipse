@@ -30,11 +30,33 @@
 //! an input device registers here.
 
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU64, Ordering};
 use kernel_hal::sync::Mutex;
 use lazy_static::lazy_static;
 
 lazy_static! {
     static ref INPUT_WAKERS: Mutex<Vec<core::task::Waker>> = Mutex::new(Vec::new());
+}
+
+/// How many input frames have fired this list since boot.
+///
+/// The list itself cannot be latched: a wake takes it whole, so an event that
+/// lands after a wait has scanned its fds and found nothing, but before that
+/// wait registers here, drains an empty list and is lost. The wait then sleeps
+/// on the fallback tick -- exactly the latency this list exists to remove.
+///
+/// A counter closes that window without latching anything. A wait reads it
+/// before it scans and compares after it registers: a value that moved means
+/// a frame arrived in between, so the wait re-scans instead of parking. The
+/// cost of a false positive is one extra pass round a loop that was about to
+/// run anyway.
+static INPUT_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Read [`INPUT_SEQ`]. Taken BEFORE the readiness scan and compared after
+/// registering, never the other way round: the point is to notice a frame
+/// that the scan could not have seen and the registration was too late for.
+pub fn input_seq() -> u64 {
+    INPUT_SEQ.load(Ordering::SeqCst)
 }
 
 /// Ceiling on parked waiters, as `MAX_TTY_INTR_WAKERS` is for the TTY list:
@@ -60,6 +82,10 @@ fn register_once(wakers: &mut Vec<core::task::Waker>, waker: &core::task::Waker)
 /// wait re-registers on its next poll, which is what keeps a 1 kHz mouse from
 /// costing one wake per report per waiter.
 pub fn wake_input_waiters() {
+    // Bumped BEFORE the list is taken, so a wait that reads the counter and
+    // then finds itself drained cannot read the old value: either it sees the
+    // move, or it was already registered and got the wake.
+    INPUT_SEQ.fetch_add(1, Ordering::SeqCst);
     let wakers: Vec<core::task::Waker> = core::mem::take(&mut *INPUT_WAKERS.lock());
     for w in wakers {
         w.wake();
@@ -202,6 +228,39 @@ mod tests {
         clear_input_waker(&wa);
         wake_input_waiters();
         assert_eq!(b.0.load(Ordering::SeqCst), 1);
+    }
+
+    /// The counter is what closes the window the list itself cannot: a frame
+    /// that lands after a wait scanned its fds and before it registered. The
+    /// wait reads this before scanning and again after registering, so the
+    /// move has to be visible across a wake that found nobody to wake.
+    #[test]
+    fn a_frame_moves_the_counter_even_with_nobody_registered() {
+        let _serial = drained();
+        let before = input_seq();
+        wake_input_waiters();
+        assert_ne!(input_seq(), before);
+    }
+
+    /// And it moves for a frame that DID wake somebody too, so the two paths
+    /// cannot disagree about whether an event happened.
+    #[test]
+    fn the_counter_moves_for_a_frame_that_woke_a_waiter() {
+        let _serial = drained();
+        let (c, w) = counting();
+        register_input_waker(w);
+        let before = input_seq();
+        wake_input_waiters();
+        assert_eq!(c.0.load(Ordering::SeqCst), 1);
+        assert_ne!(input_seq(), before);
+    }
+
+    /// Reading it changes nothing: a wait reads it twice per pass, and a read
+    /// that moved it would make every pass look like a missed frame and spin.
+    #[test]
+    fn reading_the_counter_does_not_move_it() {
+        let _serial = drained();
+        assert_eq!(input_seq(), input_seq());
     }
 
     /// The ceiling is a leak guard, not a policy: past it the oldest

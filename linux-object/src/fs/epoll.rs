@@ -693,6 +693,11 @@ impl Epoll {
             // nested epoll, which is what a compositor actually watches:
             // `libinput_get_fd` hands out libinput's own epoll fd.
             let watch_hid = interest_list.iter().any(|(_, _, f)| f.is_input_device());
+            // Read BEFORE the scan below: a frame that lands between the scan
+            // and the registration inside `IoMultiplexWait` drains a list this
+            // task is not in yet, and would cost it the fallback tick. The
+            // wait compares this after registering and re-scans if it moved.
+            let hid_seq = crate::fs::devfs::input::wait::input_seq();
             crate::net::io_wait_tick(watch_net, watch_interactive);
             // Sync readiness scan. Do NOT call `async_poll` here: each scan used
             // to Box::pin+poll+drop a future per watched fd (libinput epoll in
@@ -812,6 +817,7 @@ impl Epoll {
                 watch_net,
                 watch_interactive,
                 watch_hid,
+                hid_seq,
                 tick_ms,
             )
             .await;
