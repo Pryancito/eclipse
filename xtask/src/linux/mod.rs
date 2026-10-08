@@ -894,7 +894,7 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
         let dir = PROJECT_DIR.join("tools").join("thread-tests");
         let source = dir.join("thr3.c");
         let executable = dir.join("thr3-metal");
-        if executable.is_file() && source.is_file() {
+        if executable.is_file() && source.is_file() && self.cached_for_target(&executable) {
             if let (Ok(bin_meta), Ok(src_meta)) = (fs::metadata(&executable), fs::metadata(&source))
             {
                 if let (Ok(bin_mtime), Ok(src_mtime)) = (bin_meta.modified(), src_meta.modified()) {
@@ -1866,7 +1866,7 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
         let executable = dir.join("nl_dump");
         let source = dir.join("nl_dump.c");
         // Rebuild if missing or if source is newer than the binary.
-        if executable.is_file() && source.is_file() {
+        if executable.is_file() && source.is_file() && self.cached_for_target(&executable) {
             if let (Ok(bin_meta), Ok(src_meta)) = (fs::metadata(&executable), fs::metadata(&source))
             {
                 if let (Ok(bin_mtime), Ok(src_mtime)) = (bin_meta.modified(), src_meta.modified()) {
@@ -1909,7 +1909,7 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
         let executable = dir.join("edhcpc");
         let source = dir.join("edhcpc.c");
         // Rebuild if missing or if source is newer than the binary.
-        if executable.is_file() && source.is_file() {
+        if executable.is_file() && source.is_file() && self.cached_for_target(&executable) {
             if let (Ok(bin_meta), Ok(src_meta)) = (fs::metadata(&executable), fs::metadata(&source))
             {
                 if let (Ok(bin_mtime), Ok(src_mtime)) = (bin_meta.modified(), src_meta.modified()) {
@@ -1946,12 +1946,37 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
         executable
     }
 
+    /// Is an already-built artifact usable for the architecture being built?
+    ///
+    /// Every cached-artifact gate below reuses a file that lives in the SOURCE
+    /// tree (`tools/<name>/<name>`) when it is newer than its `.c`. That path
+    /// carries no architecture, and the only test was the mtime -- so a build
+    /// for one arch leaves its binary there and the NEXT build, for another
+    /// arch, finds a file newer than the source and hands it straight to the
+    /// rootfs. Nothing fails; the image just ships a binary for the wrong
+    /// machine.
+    ///
+    /// That is not hypothetical. It is what `cargo verify-rootfs` caught the
+    /// first time it ran in CI: `lib/libeclipse_dns.so` inside the aarch64
+    /// rootfs was an x86_64 ELF, because the x86_64 job had built it first.
+    /// The same hole was in all twenty-odd gates, and it is the same shape as
+    /// the bug that shipped an arm64 ISO with no PID 1.
+    ///
+    /// A file that is not an ELF (a script, an asset) says nothing about the
+    /// architecture, so it stays usable.
+    fn cached_for_target(&self, artifact: &Path) -> bool {
+        match verify::elf_machine(artifact) {
+            Some(machine) => machine == verify::expected_machine(self.0),
+            None => true,
+        }
+    }
+
     /// Build libeclipse_dns.so (LD_PRELOAD resolver shim).
     fn libeclipse_dns(&self, musl: &Path) -> PathBuf {
         let dir = PROJECT_DIR.join("tools").join("eclipse-resolv");
         let lib = dir.join("libeclipse_dns.so");
         let source = dir.join("resolv.c");
-        if lib.is_file() && source.is_file() {
+        if lib.is_file() && source.is_file() && self.cached_for_target(&lib) {
             if let (Ok(lib_meta), Ok(src_meta)) = (fs::metadata(&lib), fs::metadata(&source)) {
                 if let (Ok(lib_mtime), Ok(src_mtime)) = (lib_meta.modified(), src_meta.modified()) {
                     if lib_mtime >= src_mtime {
@@ -1991,7 +2016,7 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
         let dir = PROJECT_DIR.join("tools").join("eclipse-sdl-probe");
         let executable = dir.join("eclipse-sdl-probe");
         let source = dir.join("eclipse-sdl-probe.c");
-        if executable.is_file() && source.is_file() {
+        if executable.is_file() && source.is_file() && self.cached_for_target(&executable) {
             if let (Ok(bin_meta), Ok(src_meta)) = (fs::metadata(&executable), fs::metadata(&source))
             {
                 if let (Ok(bin_mtime), Ok(src_mtime)) = (bin_meta.modified(), src_meta.modified()) {
@@ -2031,7 +2056,7 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
         let dir = PROJECT_DIR.join("tools").join("eclipse-spawnfix");
         let lib = dir.join("libeclipse_spawnfix.so");
         let source = dir.join("spawnfix.c");
-        if lib.is_file() && source.is_file() {
+        if lib.is_file() && source.is_file() && self.cached_for_target(&lib) {
             if let (Ok(lib_meta), Ok(src_meta)) = (fs::metadata(&lib), fs::metadata(&source)) {
                 if let (Ok(lib_mtime), Ok(src_mtime)) = (lib_meta.modified(), src_meta.modified()) {
                     if lib_mtime >= src_mtime {
@@ -2068,7 +2093,7 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
         let dir = PROJECT_DIR.join("tools").join("eclipse-resolv");
         let executable = dir.join("eclipse-resolv");
         let source = dir.join("eclipse-resolv.c");
-        if executable.is_file() && source.is_file() {
+        if executable.is_file() && source.is_file() && self.cached_for_target(&executable) {
             if let (Ok(bin_meta), Ok(src_meta)) = (fs::metadata(&executable), fs::metadata(&source))
             {
                 if let (Ok(bin_mtime), Ok(src_mtime)) = (bin_meta.modified(), src_meta.modified()) {
@@ -2108,7 +2133,7 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
         let executable = dir.join("install-eclipse");
         let source = dir.join("install-eclipse.c");
         // Rebuild if missing or if source is newer than the binary.
-        if executable.is_file() && source.is_file() {
+        if executable.is_file() && source.is_file() && self.cached_for_target(&executable) {
             if let (Ok(bin_meta), Ok(src_meta)) = (fs::metadata(&executable), fs::metadata(&source))
             {
                 if let (Ok(bin_mtime), Ok(src_mtime)) = (bin_meta.modified(), src_meta.modified()) {
@@ -2168,7 +2193,7 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
         let dir = PROJECT_DIR.join("tools").join("eclipse-useradd");
         let executable = dir.join("eclipse-useradd");
         let source = dir.join("eclipse-useradd.c");
-        if executable.is_file() && source.is_file() {
+        if executable.is_file() && source.is_file() && self.cached_for_target(&executable) {
             if let (Ok(bin_meta), Ok(src_meta)) = (fs::metadata(&executable), fs::metadata(&source))
             {
                 if let (Ok(bin_mtime), Ok(src_mtime)) = (bin_meta.modified(), src_meta.modified()) {
@@ -2212,7 +2237,7 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
         let dir = PROJECT_DIR.join("tools").join("eclipse-bench");
         let executable = dir.join("eclipse-bench");
         let source = dir.join("eclipse-bench.c");
-        if executable.is_file() && source.is_file() {
+        if executable.is_file() && source.is_file() && self.cached_for_target(&executable) {
             if let (Ok(bin_meta), Ok(src_meta)) = (fs::metadata(&executable), fs::metadata(&source))
             {
                 if let (Ok(bin_mtime), Ok(src_mtime)) = (bin_meta.modified(), src_meta.modified()) {
@@ -2256,7 +2281,7 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
         let dir = PROJECT_DIR.join("tools").join("firefox-probe");
         let executable = dir.join("firefox-probe");
         let source = dir.join("firefox-probe.c");
-        if executable.is_file() && source.is_file() {
+        if executable.is_file() && source.is_file() && self.cached_for_target(&executable) {
             if let (Ok(bin_meta), Ok(src_meta)) = (fs::metadata(&executable), fs::metadata(&source))
             {
                 if let (Ok(bin_mtime), Ok(src_mtime)) = (bin_meta.modified(), src_meta.modified()) {
@@ -2305,7 +2330,7 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
         let dir = PROJECT_DIR.join("tools").join("audio-probe");
         let executable = dir.join("audio-probe");
         let source = dir.join("audio-probe.c");
-        if executable.is_file() && source.is_file() {
+        if executable.is_file() && source.is_file() && self.cached_for_target(&executable) {
             if let (Ok(bin_meta), Ok(src_meta)) = (fs::metadata(&executable), fs::metadata(&source))
             {
                 if let (Ok(bin_mtime), Ok(src_mtime)) = (bin_meta.modified(), src_meta.modified()) {
@@ -2352,7 +2377,7 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
         let dir = PROJECT_DIR.join("tools").join("clock-probe");
         let executable = dir.join("clock-probe");
         let source = dir.join("clock-probe.c");
-        if executable.is_file() && source.is_file() {
+        if executable.is_file() && source.is_file() && self.cached_for_target(&executable) {
             if let (Ok(bin_meta), Ok(src_meta)) = (fs::metadata(&executable), fs::metadata(&source))
             {
                 if let (Ok(bin_mtime), Ok(src_mtime)) = (bin_meta.modified(), src_meta.modified()) {
@@ -2398,7 +2423,7 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
         let dir = PROJECT_DIR.join("tools").join("drm-probe");
         let executable = dir.join("drm-probe");
         let source = dir.join("drm-probe.c");
-        if executable.is_file() && source.is_file() {
+        if executable.is_file() && source.is_file() && self.cached_for_target(&executable) {
             if let (Ok(bin_meta), Ok(src_meta)) = (fs::metadata(&executable), fs::metadata(&source))
             {
                 if let (Ok(bin_mtime), Ok(src_mtime)) = (bin_meta.modified(), src_meta.modified()) {
@@ -2444,7 +2469,7 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
         let dir = PROJECT_DIR.join("tools").join("gfx-probe");
         let executable = dir.join("gfx-probe");
         let source = dir.join("gfx-probe.c");
-        if executable.is_file() && source.is_file() {
+        if executable.is_file() && source.is_file() && self.cached_for_target(&executable) {
             if let (Ok(bin_meta), Ok(src_meta)) = (fs::metadata(&executable), fs::metadata(&source))
             {
                 if let (Ok(bin_mtime), Ok(src_mtime)) = (bin_meta.modified(), src_meta.modified()) {
@@ -2485,7 +2510,7 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
         let dir = PROJECT_DIR.join("tools").join("ecl-compute");
         let executable = dir.join("ecl-compute");
         let source = dir.join("ecl-compute.c");
-        if executable.is_file() && source.is_file() {
+        if executable.is_file() && source.is_file() && self.cached_for_target(&executable) {
             if let (Ok(bin_meta), Ok(src_meta)) = (fs::metadata(&executable), fs::metadata(&source))
             {
                 if let (Ok(bin_mtime), Ok(src_mtime)) = (bin_meta.modified(), src_meta.modified()) {
@@ -2558,7 +2583,7 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
             }
             false
         };
-        if executable.is_file() {
+        if executable.is_file() && self.cached_for_target(&executable) {
             if let Ok(bin_meta) = fs::metadata(&executable) {
                 if let Ok(bin_mtime) = bin_meta.modified() {
                     if !sources_newer(bin_mtime) {
@@ -2706,7 +2731,7 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
             .join("release")
             .join("eclipse-init");
         let source = dir.join("src").join("main.rs");
-        if executable.is_file() && source.is_file() {
+        if executable.is_file() && source.is_file() && self.cached_for_target(&executable) {
             if let (Ok(b), Ok(s)) = (fs::metadata(&executable), fs::metadata(&source)) {
                 if let (Ok(bm), Ok(sm)) = (b.modified(), s.modified()) {
                     if bm >= sm {
@@ -2761,7 +2786,7 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
             .max();
         if let (Ok(bin_meta), Some(src_mtime)) = (fs::metadata(&executable), newest_src) {
             if let Ok(bin_mtime) = bin_meta.modified() {
-                if bin_mtime >= src_mtime {
+                if bin_mtime >= src_mtime && self.cached_for_target(&executable) {
                     return executable;
                 }
             }
@@ -3062,7 +3087,7 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
         .max();
         if let (Ok(bin_meta), Some(src_mtime)) = (fs::metadata(&executable), newest_src) {
             if let Ok(bin_mtime) = bin_meta.modified() {
-                if bin_mtime >= src_mtime {
+                if bin_mtime >= src_mtime && self.cached_for_target(&executable) {
                     return executable;
                 }
             }
@@ -3592,7 +3617,7 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
             .max();
         if let (Ok(bin_meta), Some(src_mtime)) = (fs::metadata(&executable), newest_src) {
             if let Ok(bin_mtime) = bin_meta.modified() {
-                if bin_mtime >= src_mtime {
+                if bin_mtime >= src_mtime && self.cached_for_target(&executable) {
                     return executable;
                 }
             }

@@ -35,7 +35,7 @@ const EM_AARCH64: u16 = 183;
 const EM_RISCV: u16 = 243;
 
 /// Lo que cada binario de la rootfs tiene que declarar para este arco.
-const fn expected_machine(arch: Arch) -> u16 {
+pub(super) const fn expected_machine(arch: Arch) -> u16 {
     match arch {
         Arch::X86_64 => EM_X86_64,
         Arch::Aarch64 => EM_AARCH64,
@@ -62,7 +62,7 @@ fn machine_name(machine: u16) -> &'static str {
 /// ser ELF64 en los tres arcos que soportamos) y la máquina. Un script, una
 /// imagen o un fichero de texto no son un ELF y se saltan sin ruido --- no es
 /// un error que `/etc/profile` no tenga cabecera.
-fn elf_machine(path: &Path) -> Option<u16> {
+pub(super) fn elf_machine(path: &Path) -> Option<u16> {
     let bytes = fs::read(path).ok()?;
     if bytes.len() < 20 || &bytes[..4] != b"\x7fELF" {
         return None;
@@ -352,6 +352,38 @@ mod tests {
     /// `e_machine` equivocado haria pasar por ajeno a TODO binario del arco
     /// correcto --- es decir, rompe la imagen entera en vez de dejar colar
     /// una. Los valores son los de `elf.h` y no cambian nunca.
+    /// `cached_for_target` es la puerta que ahora llevan las 21 cachés de
+    /// artefactos de `mod.rs`. El caso que la hizo falta: el x86_64 construye
+    /// `tools/eclipse-resolv/libeclipse_dns.so`, el aarch64 lo encuentra más
+    /// nuevo que su `.c` y se lo lleva a la rootfs. Lo cazó
+    /// `cargo verify-rootfs` la primera vez que corrió en CI.
+    #[test]
+    fn una_cache_de_otro_arco_no_se_reutiliza() {
+        let arm = LinuxRootfs::new(Arch::Aarch64);
+        let x86 = LinuxRootfs::new(Arch::X86_64);
+        let del_host = scratch("cache-x86.so", &elf64(62));
+        assert!(
+            !arm.cached_for_target(&del_host),
+            "el de x86_64 no vale en arm"
+        );
+        assert!(x86.cached_for_target(&del_host), "en x86_64 si vale");
+
+        let del_arm = scratch("cache-arm.so", &elf64(183));
+        assert!(arm.cached_for_target(&del_arm));
+        assert!(!x86.cached_for_target(&del_arm));
+    }
+
+    /// Lo que no es un ELF no dice nada del arco, asi que sigue valiendo: un
+    /// script o un asset en la cache no tiene que forzar una recompilacion.
+    #[test]
+    fn lo_que_no_es_elf_sigue_valiendo_en_la_cache() {
+        let arm = LinuxRootfs::new(Arch::Aarch64);
+        assert!(arm.cached_for_target(&scratch("cache.sh", b"#!/bin/sh\nexit 0\n")));
+        // Y un fichero que no existe tampoco: de eso ya se encarga el
+        // `is_file()` de cada puerta.
+        assert!(arm.cached_for_target(std::path::Path::new("/no/existe/nada")));
+    }
+
     /// Una rootfs de mentira, completa y sana, para el arco pedido.
     ///
     /// Cada test la rompe por un sitio y comprueba que la rotura sale, que es
@@ -617,6 +649,51 @@ mod cableado_tests {
                 "el error no nombra MEM_DEBUG: {err}"
             );
         }
+    }
+
+    /// Las 21 caches de artefactos de `mod.rs` tienen que seguir pasando por
+    /// `cached_for_target`. Perder una no falla nada: simplemente esa
+    /// herramienta vuelve a poder llegar a la rootfs con el arco del build
+    /// anterior, que es el fallo que vino a tapar. Y el autor de la numero 22
+    /// no tiene por que saber que la puerta existe, asi que la cuenta se
+    /// comprueba aqui en vez de confiar en que se acuerde.
+    #[test]
+    fn toda_cache_de_artefacto_pasa_por_la_puerta_del_arco() {
+        let src = std::fs::read_to_string(
+            crate::PROJECT_DIR
+                .join("xtask")
+                .join("src")
+                .join("linux")
+                .join("mod.rs"),
+        )
+        .unwrap();
+
+        // Las que comparan contra un `source` suelto.
+        let mut sin_puerta = Vec::new();
+        for (n, l) in src.lines().enumerate() {
+            let t = l.trim();
+            let es_puerta = t.starts_with("if ")
+                && t.contains(".is_file() && source.is_file()")
+                && t.ends_with('{');
+            if es_puerta && !t.contains("cached_for_target") {
+                sin_puerta.push(n + 1);
+            }
+        }
+        assert!(
+            sin_puerta.is_empty(),
+            "caches sin comprobar el arco, en las lineas {sin_puerta:?} de mod.rs: \
+             añade `&& self.cached_for_target(&<artefacto>)` a la condicion"
+        );
+
+        // Y la cuenta, para que quitar una puerta se note aunque su `if`
+        // cambie de forma. Si añades una cache nueva --con su puerta-- sube
+        // este numero.
+        let puertas = src.matches("self.cached_for_target(").count();
+        assert_eq!(
+            puertas, 21,
+            "las puertas del arco eran 21 y ahora son {puertas}: si has añadido \
+             una cache con la suya, sube el numero; si has quitado una puerta, no"
+        );
     }
 
     /// `make image` tiene que verificar la rootfs sin que nadie se acuerde de
