@@ -119,6 +119,18 @@ two agree the measurement is standing on something.
 | `getdents64` | `fs` section | `linux-syscall` `file::dir::benches::getdents64_*` |
 | `read`/`write` through a pipe ring | `net`/`fs` round trips | `linux-syscall` `file::file::benches::pipe_*` |
 | the flag and descriptor arguments of `open`, `dup`, `fcntl` | — | `linux-syscall` `file::fd::benches::*` |
+| `mincore` and `msync`, which walk a range page by page | `vm` section | `linux-syscall` `vm::benches::mincore_*`, `msync_*` |
+| the `(addr, len)` and flag words of the memory calls | — | `linux-syscall` `vm::benches::*_arg_check`, `mmap_*` |
+| `clone`/`clone3`/`wait4` argument decoding | `proc` section | `linux-syscall` `task::benches::*` |
+| `prctl(PR_SET_NAME)` on an untrusted name | — | `linux-syscall` `task::benches::comm_from_*` |
+| an interval timer catching up after a stall | — | `linux-syscall` `time::benches::forward_periodic_*` |
+| `adjtimex`, `settimeofday`, `getitimer`, `alarm` | — | `linux-syscall` `time::benches::*` |
+| which target a `kill` names, what `sigaction` refuses | `sig` section | `linux-syscall` `signal::benches::*` |
+| descriptors and credentials passed over a Unix socket | — | `linux-syscall` `net::benches::parse_scm_rights_*`, `build_recv_cmsgs_*` |
+| `semop`'s atomic plan over a semaphore set | — | `linux-syscall` `ipc::benches::plan_semop_*` |
+| `semctl(GETALL)`/`(SETALL)` bulk transfers | — | `linux-syscall` `ipc::benches::semctl_*` |
+| the `futex` operation word every contended mutex sends | `futex` section | `linux-syscall` `misc::benches::futex_op_*` |
+| `capget`/`capset`, `syslog`, `ioprio` | — | `linux-syscall` `misc::benches::*` |
 
 The one empty cell is not an oversight. What the futex table costs, what a
 wake with no waiters costs, and every signal decision are all benched above;
@@ -187,6 +199,43 @@ re-check first.
   against the ~330 ns a syscall entry costs from userspace. The narrowing
   helpers in `intarg.rs` were added to fix wrong answers, and they cost
   nothing to have.
+
+## What the memory, process, clock, signal, socket and IPC rows said
+
+- **`msync` walks every page to discover one object.** `distinct_vmos` is
+  31 ns per page whether the range is 64 pages or 512, and the whole range is
+  one VMO in both. A `msync(MS_SYNC)` of a 100 MiB mapped file therefore spends
+  about **0.8 ms** in `find_mapping` to learn what the first page already said.
+  SQLite and Firefox both call it on their own schedules; the per-mapping walk
+  that `walk_mapped` does is the shape this one wants.
+- **`mincore` is 50 ns per page**, flat from 64 pages to 512 (66 ns for a
+  single one, which is the call). An allocator probing a gigabyte of heap
+  layout pays ~13 ms. The syscall already hands the range over in page-sized
+  chunks, so this is per chunk, not per call — but it is the figure that makes
+  `mincore` a poor way to ask about a large region.
+- **An interval timer's catch-up is O(1), and now there is proof.** 7.9 ns
+  when nothing was missed, 12.7 ns a thousand periods late, 12.1 ns a million
+  periods late. A stalled machine re-arming a 10 ms timer does not pay for the
+  stall, which is the property that stops a stall compounding itself.
+- **A process name from userspace costs 27 ns when it is ASCII and 48 ns when
+  it is not.** `prctl(PR_SET_NAME)` takes fifteen arbitrary bytes, and the
+  invalid-UTF-8 path goes chunk by chunk replacing each bad byte — worth
+  knowing only because the input is untrusted and the two paths differ.
+- Two families in this batch are written but not yet read off a quiet machine,
+  so no figure for them is quoted here: `parse_scm_rights_*` (1 / 16 / 253
+  descriptors passed over a Unix socket, the last being `SCM_MAX_FD`, the cap
+  that bounds the walk at all — without it the length came from the sender)
+  and `plan_semop_*`. The second is the one to read when the numbers land:
+  `semop(2)` is atomic, so the whole set's values are copied before a single
+  semaphore moves, and the pair "one operation on 16 semaphores" against "one
+  on 512" separates that copy from the work the call actually asked for. A
+  program using a wide semaphore array as a barrier would be paying for the
+  array's width on every call.
+- **`clone3` decodes a `struct clone_args` in 5 ns**, nine refusals and all.
+  `fork(3)` does not spend its time at the door.
+- **Everything else is 0.6 to 12 ns**, which is the same answer the file batch
+  gave: the syscalls' argument work is free, and what a syscall costs is the
+  entry, the copies and the subsystem.
 
 A caveat that applies to every in-kernel row: they run under `libos`, the only
 configuration that builds for the host. Object bookkeeping (VMO and VMAR

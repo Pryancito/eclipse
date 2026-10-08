@@ -2291,3 +2291,136 @@ mod socket_type_flag_tests {
         assert_eq!(peer_endpoint(None).err(), Some(LxError::ENOTCONN));
     }
 }
+
+#[cfg(test)]
+mod benches {
+    //! The socket syscalls' own work: the address a `bind`, `connect` or
+    //! `sendto` was handed, the ancillary data `sendmsg` and `recvmsg` walk
+    //! and build, and the flag words of `socket`, `socketpair` and the
+    //! send path.
+    //!
+    //! The wire parsing is `smoltcp`'s and has its own benches; what is here
+    //! is the boundary, which is where the untrusted bytes are.
+    //! `parse_scm_rights_fds` is the one to read: it walks a control buffer
+    //! whose every field -- including the step size -- comes from the sending
+    //! process, and it comes as a family (1 / 16 / 253 descriptors) so the
+    //! slope says what one attached descriptor costs the receiver.
+    //!
+    //! Every row black-boxes its inputs. Two cycles (~0.6 ns) is `b.iter`'s
+    //! own loop; a row there with an opaque input is a real compare and
+    //! branch, with a constant input it is a call that was folded away.
+
+    use super::*;
+    use test::{black_box, Bencher};
+
+    /// A control buffer carrying one `SCM_RIGHTS` message with `n`
+    /// descriptors, in the layout a peer's `sendmsg` produces.
+    fn rights_buffer(n: usize) -> Vec<u8> {
+        let fds: Vec<i32> = (0..n as i32).map(|i| i + 3).collect();
+        build_scm_rights_cmsg(&fds)
+    }
+
+    /// One descriptor passed over a Unix socket: the per-message cost.
+    #[bench]
+    fn parse_scm_rights_of_1_fd(b: &mut Bencher) {
+        let ctrl = rights_buffer(1);
+        b.iter(|| black_box(parse_scm_rights_fds(black_box(&ctrl))));
+    }
+
+    /// Sixteen, which is what a compositor or a sandbox launcher hands over
+    /// in one message.
+    #[bench]
+    fn parse_scm_rights_of_16_fds(b: &mut Bencher) {
+        let ctrl = rights_buffer(16);
+        b.iter(|| black_box(parse_scm_rights_fds(black_box(&ctrl))));
+    }
+
+    /// `SCM_MAX_FD`, the most one `sendmsg` may carry. The cap is the reason
+    /// this row has a ceiling at all: without it the length came from the
+    /// sender.
+    #[bench]
+    fn parse_scm_rights_of_253_fds(b: &mut Bencher) {
+        let ctrl = rights_buffer(253);
+        b.iter(|| black_box(parse_scm_rights_fds(black_box(&ctrl))));
+    }
+
+    /// A control buffer one descriptor over the cap: `EINVAL`, and the walk
+    /// has to get that far to know.
+    #[bench]
+    fn parse_scm_rights_over_the_cap(b: &mut Bencher) {
+        let ctrl = rights_buffer(254);
+        b.iter(|| black_box(parse_scm_rights_fds(black_box(&ctrl))));
+    }
+
+    /// A buffer whose `cmsg_len` is malformed: the walk stops, which is what
+    /// `__cmsg_nxthdr` does, and it must stop rather than spin.
+    #[bench]
+    fn parse_scm_rights_of_a_malformed_buffer(b: &mut Bencher) {
+        let mut ctrl = rights_buffer(4);
+        ctrl[..8].copy_from_slice(&u64::MAX.to_ne_bytes());
+        b.iter(|| black_box(parse_scm_rights_fds(black_box(&ctrl))));
+    }
+
+    /// The other direction: the control buffer `recvmsg` hands back with
+    /// sixteen descriptors and the sender's credentials, which is two
+    /// messages and the padding between them.
+    #[bench]
+    fn build_recv_cmsgs_of_16_fds_and_creds(b: &mut Bencher) {
+        let fds: Vec<i32> = (3..19).collect();
+        let creds = ucred_of(4242);
+        b.iter(|| black_box(build_recv_cmsgs(black_box(&fds), black_box(Some(&creds)))));
+    }
+
+    /// Credentials alone, which is what `SO_PASSCRED` costs per message
+    /// received -- and chromium's zygote reads one per child.
+    #[bench]
+    fn build_recv_cmsgs_of_creds_only(b: &mut Bencher) {
+        let creds = ucred_of(4242);
+        b.iter(|| black_box(build_recv_cmsgs(black_box(&[]), black_box(Some(&creds)))))
+    }
+
+    /// `struct ucred` for `SO_PEERCRED`, which looks the process up.
+    #[bench]
+    fn peercred_bytes_of_a_dead_peer(b: &mut Bencher) {
+        b.iter(|| black_box(peercred_bytes(black_box(None))));
+    }
+
+    /// `CMSG_ALIGN`, which every step of both walks goes through.
+    #[bench]
+    fn cmsg_alignment(b: &mut Bencher) {
+        b.iter(|| black_box(cmsg_align(black_box(20))));
+    }
+
+    /// `getsockopt`'s value-result `optlen`, which is what stopped a 12-byte
+    /// `ucred` from being written into a 4-byte buffer.
+    #[bench]
+    fn sockopt_out_length(b: &mut Bencher) {
+        b.iter(|| black_box(sockopt_out_len(black_box(4), black_box(12))));
+    }
+
+    /// Whether a `send` on this socket may block, from the call's flags, the
+    /// descriptor's and whether the queue has a bound at all.
+    #[bench]
+    fn send_mode_decision(b: &mut Bencher) {
+        b.iter(|| black_box(send_mode(black_box(0), black_box(false), black_box(true))));
+    }
+
+    /// `MSG_CMSG_CLOEXEC` on a received descriptor.
+    #[bench]
+    fn scm_rights_cloexec_flag(b: &mut Bencher) {
+        b.iter(|| black_box(scm_rights_cloexec(black_box(0x4000_0000))));
+    }
+
+    /// `socket(AF_UNIX, type, 0)`: the type word, where the two flag bits
+    /// ride along with the kind.
+    #[bench]
+    fn unix_socket_type_arg(b: &mut Bencher) {
+        b.iter(|| black_box(unix_socketpair_type(black_box(1))));
+    }
+
+    /// And its `protocol`, which must be 0 or `PF_UNIX`.
+    #[bench]
+    fn unix_protocol_arg(b: &mut Bencher) {
+        b.iter(|| black_box(unix_protocol(black_box(0))));
+    }
+}
