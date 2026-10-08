@@ -7286,3 +7286,206 @@ mod poll_pending_health_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod benches {
+    //! What the receive path pays per frame.
+    //!
+    //! These are the per-frame decisions, not the DMA: the checksum work the
+    //! driver does when the NIC did not validate a frame itself, and the
+    //! interrupt-throttle choice made on every IRQ. Both scale with traffic,
+    //! so a cost here is a cost per packet, and the software checksum walks
+    //! the whole frame -- which is the one thing on this path that is O(bytes)
+    //! rather than O(1).
+    //!
+    //! All of it is pure arithmetic over a byte slice, so these rows need no
+    //! hardware and no mock: what they measure is exactly what runs on the
+    //! machine.
+    //!
+    //! `black_box` goes around the inputs, not only the result; see
+    //! `docs/README-benchmarks.md`.
+
+    use super::*;
+    use test::{black_box, Bencher};
+
+    /// An Ethernet + IPv4 + TCP frame of `payload` bytes, with a correct IPv4
+    /// header checksum so the verifier walks the whole header rather than
+    /// bailing out early.
+    fn ipv4_tcp_frame(payload: usize) -> Vec<u8> {
+        let total = 20 + 20 + payload;
+        let mut f = alloc::vec![0u8; 14 + total];
+        // Ethernet: EtherType IPv4.
+        f[12] = 0x08;
+        f[13] = 0x00;
+        // IPv4: version 4, IHL 5, total length, protocol TCP.
+        f[14] = 0x45;
+        f[16..18].copy_from_slice(&(total as u16).to_be_bytes());
+        f[22] = 64; // ttl
+        f[23] = 6; // TCP
+        f[26..30].copy_from_slice(&[10, 0, 0, 1]);
+        f[30..34].copy_from_slice(&[10, 0, 0, 2]);
+        // Header checksum over the 20 header bytes.
+        let mut sum = 0u32;
+        let mut i = 14;
+        while i < 34 {
+            sum += ((f[i] as u32) << 8) | f[i + 1] as u32;
+            i += 2;
+        }
+        while sum >> 16 != 0 {
+            sum = (sum & 0xffff) + (sum >> 16);
+        }
+        let csum = !(sum as u16);
+        f[24..26].copy_from_slice(&csum.to_be_bytes());
+        f
+    }
+
+    // ---- the per-IRQ decision -------------------------------------------
+
+    /// The interrupt-throttle choice, taken on every receive interrupt. It
+    /// decides how often the NIC is allowed to interrupt next, so it is the
+    /// knob between latency and packets-per-interrupt, and it had better not
+    /// cost anything itself.
+    #[bench]
+    fn choose_itr_in_a_burst(b: &mut Bencher) {
+        b.iter(|| {
+            black_box(choose_itr(
+                black_box(E1000E_ITR_BALANCED),
+                black_box(1_000u64),
+                black_box(E1000E_ITR_BURST_THROUGHPUT),
+            ))
+        });
+    }
+
+    /// The same when the link is quiet, which is the other end of the
+    /// decision and takes a different branch.
+    #[bench]
+    fn choose_itr_when_idle(b: &mut Bencher) {
+        b.iter(|| {
+            black_box(choose_itr(
+                black_box(E1000E_ITR_BALANCED),
+                black_box(0u64),
+                black_box(0u64),
+            ))
+        });
+    }
+
+    /// Whether the frame needs software checking at all: three bit tests on
+    /// the descriptor's status byte, and the gate that keeps the walks below
+    /// off the common path. If this is not free, nothing else matters.
+    #[bench]
+    fn rx_csum_needs_sw_check_when_the_nic_did_it(b: &mut Bencher) {
+        let status = RXD_STAT_IPCS | RXD_STAT_TCPCS;
+        b.iter(|| black_box(rx_csum_needs_sw_check(black_box(status))));
+    }
+
+    #[bench]
+    fn rx_csum_needs_sw_check_when_the_nic_did_not(b: &mut Bencher) {
+        b.iter(|| black_box(rx_csum_needs_sw_check(black_box(RXD_STAT_IXSM))));
+    }
+
+    // ---- the IPv4 header walk -------------------------------------------
+
+    /// The IPv4 header checksum: twenty bytes, whatever the frame's size, so
+    /// this should be flat and is the baseline for the payload walks below.
+    fn bench_hdr_csum(b: &mut Bencher, payload: usize) {
+        let frame = ipv4_tcp_frame(payload);
+        b.iter(|| black_box(rx_ipv4_hdr_csum_bad(black_box(&frame))));
+    }
+
+    #[bench]
+    fn ipv4_hdr_csum_of_a_64_byte_frame(b: &mut Bencher) {
+        bench_hdr_csum(b, 22);
+    }
+
+    /// A full-MTU frame: if this matches the row above, the header walk is
+    /// the twenty bytes it should be and not the whole packet.
+    #[bench]
+    fn ipv4_hdr_csum_of_a_1500_byte_frame(b: &mut Bencher) {
+        bench_hdr_csum(b, 1460);
+    }
+
+    /// The early-out for a frame that is not IPv4 at all -- ARP, IPv6, a
+    /// VLAN tag -- which is two byte compares.
+    #[bench]
+    fn ipv4_hdr_csum_early_out_on_arp(b: &mut Bencher) {
+        let mut frame = ipv4_tcp_frame(22);
+        frame[12] = 0x08;
+        frame[13] = 0x06; // ARP
+        b.iter(|| black_box(rx_ipv4_hdr_csum_bad(black_box(&frame))));
+    }
+
+    // ---- the payload walk, which is the one that scales -----------------
+
+    /// `csum_add` over the bytes, which is what verifying a TCP or UDP
+    /// checksum in software comes down to. The slope is nanoseconds per byte
+    /// of payload, and at line rate that is the number that matters.
+    fn bench_csum_add(b: &mut Bencher, bytes: usize) {
+        let data = alloc::vec![0x5au8; bytes];
+        b.iter(|| black_box(csum_add(black_box(0u32), black_box(&data))));
+    }
+
+    #[bench]
+    fn csum_add_over_64_bytes(b: &mut Bencher) {
+        bench_csum_add(b, 64);
+    }
+
+    #[bench]
+    fn csum_add_over_1460_bytes(b: &mut Bencher) {
+        bench_csum_add(b, 1460);
+    }
+
+    /// A 9000-byte jumbo payload, because the slope is what decides whether
+    /// software checksumming is viable at all when the NIC declines.
+    #[bench]
+    fn csum_add_over_8960_bytes(b: &mut Bencher) {
+        bench_csum_add(b, 8960);
+    }
+
+    /// The whole software fallback on a frame the NIC did not check: parse
+    /// the headers, then walk the payload. This is what a frame costs when
+    /// the offload is off, and against `rx_csum_needs_sw_check` above it is
+    /// what the gate saves on every frame the NIC did check.
+    fn bench_sw_csum(b: &mut Bencher, payload: usize) {
+        let frame = ipv4_tcp_frame(payload);
+        b.iter(|| black_box(rx_sw_csum_bad(black_box(&frame), black_box(RXD_STAT_IXSM))));
+    }
+
+    #[bench]
+    fn sw_csum_of_a_64_byte_frame(b: &mut Bencher) {
+        bench_sw_csum(b, 22);
+    }
+
+    #[bench]
+    fn sw_csum_of_a_1500_byte_frame(b: &mut Bencher) {
+        bench_sw_csum(b, 1460);
+    }
+
+    /// The same frame when the NIC already validated the L4 checksum, so the
+    /// fallback skips the payload walk: the pair is the offload's worth.
+    #[bench]
+    fn sw_csum_of_a_1500_byte_frame_with_l4_trusted(b: &mut Bencher) {
+        let frame = ipv4_tcp_frame(1460);
+        let status = RXD_STAT_TCPCS;
+        b.iter(|| black_box(rx_sw_csum_bad(black_box(&frame), black_box(status))));
+    }
+
+    // ---- the multicast filter -------------------------------------------
+
+    /// The multicast hash, computed per address when the filter is
+    /// programmed -- so once per `setsockopt(IP_ADD_MEMBERSHIP)` rather than
+    /// per frame, but a thousand groups is a thousand of these.
+    #[bench]
+    fn hash_mc_addr(b: &mut Bencher) {
+        let addr = [0x01u8, 0x00, 0x5e, 0x00, 0x00, 0x01];
+        b.iter(|| black_box(e1000e_hash_mc_addr(black_box(&addr))));
+    }
+
+    /// Matching a PCI device id against the supported list, which runs once
+    /// per device at probe. Measured because it is a chain of range tests
+    /// that has grown with every chipset, and this says whether the shape
+    /// still costs nothing.
+    #[bench]
+    fn device_matched_decision(b: &mut Bencher) {
+        b.iter(|| black_box(e1000e_device_matched(black_box(0x15b7u16))));
+    }
+}

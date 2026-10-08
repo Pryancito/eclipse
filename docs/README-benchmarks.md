@@ -129,6 +129,8 @@ two agree the measurement is standing on something.
 | `readv`/`writev`/`sendmsg` gather lists | — | `kernel-hal` `common::user::benches::{read_iovecs,read_to_vec,read_bytes_at,drain}_*` |
 | arming and refreshing a syscall timeout | — | `kernel-hal` `common::timer_waker::benches::*` |
 | looking at a GPU fence's landing zone | — | `zcore-drivers` `scheme::syncobj::benches::landed_*` |
+| a character, a newline and a repaint on the kernel console | — | `zcore-drivers` `utils::graphic_console::benches::*` |
+| the receive path's per-frame checksum and throttle work | `net` section throughput | `zcore-drivers` `net::e1000e::benches::*` |
 | the CPU-side fence wait's backoff policy | — | `zcore-drivers` `scheme::syncobj::benches::{wait_spin_backoff,fence_poll_step}_*` |
 | the flag and descriptor arguments of `open`, `dup`, `fcntl` | — | `linux-syscall` `file::fd::benches::*` |
 | `mincore` and `msync`, which walk a range page by page | `vm` section | `linux-syscall` `vm::benches::mincore_*`, `msync_*` |
@@ -554,3 +556,73 @@ savings from reading fewer of them are lower bounds.
   starve the compositor was that it re-took the table on every spin turn; if
   deciding how long to pause had cost anything, that fix would have traded one
   problem for another.
+
+## What the kernel console said
+
+Two things make this worth a number rather than a shrug. A panic report that
+must get out goes over the serial line and *not* through here, and that split
+should be a decision rather than a habit. And the cursor blink reaches
+`present` from a hard IRQ with no current thread -- the path that needed a
+fat-pointer guard before it would stop faulting -- where anything expensive is
+expensive with interrupts off.
+
+The rows run against `FakeDisplay`, whose aperture is a heap buffer. A real
+framebuffer is uncached write-combining across a PCI aperture, so **every
+pixel figure below is a lower bound**; the cell bookkeeping is faithful, the
+stores are not.
+
+- **One character costs 855 ns**, which is the cache store plus an 8x16 glyph
+  blit: about 6.7 ns per pixel. So an 80-column line of kernel log is
+  **~68 us of glyph blitting** before anything scrolls. Two independent
+  families agree on this: `redraw_80x25` is 1.65 ms for 2000 cells, which is
+  825 ns a cell.
+- **A newline is a pixel band, and it grows with the console.** `new_line` is
+  **34 us at 80x25, 104 us at 80x50 and 494 us at 240x67** -- the geometry the
+  machine actually boots into. Together with the line above, **one line of
+  kernel output on a 1080p console costs over half a millisecond**, which is
+  the measurement behind keeping the graphical console off the path a panic
+  report takes.
+- **A region scroll is flat in the number of lines.** Scrolling the whole
+  screen up by one line is 38.3 us and by twelve is 34.7 us: one band move
+  either way, so an editor that scrolls a page pays once, not per line.
+  Downward is the same (36.9 us), and a four-row region is 6.9 us, so the cost
+  follows the band and not the screen. Clearing the screen is 29.5 us.
+- **A repaint is the expensive one, as designed: 1.65 ms at 80x25 and
+  14.7 ms at 240x67.** That is what a VT switch and a scrollback scroll each
+  run (`scroll_history_by_one_line` is 1.63 ms, which is the redraw inside
+  it), and at 1080p it is a dropped frame and then some.
+- **The blink is cheap and its guard is free.** `present` is 212 ns at 80x25
+  and 220 ns at 240x67 with the cursor drawn, against **19.7 ns** without --
+  so the blink's cost is the cursor itself and the rest of `present` is
+  nearly nothing at either size. And `display_dispatchable`, the fat-pointer
+  liveness check the blink path grew so it would stop calling through a
+  smashed vtable, is **1.28 ns**: asking on every blink costs nothing, which
+  is the answer that makes that guard uncontroversial.
+
+## What the receive path said
+
+Per-frame work on the way in, which is per-packet cost at line rate. All of it
+is pure arithmetic over a byte slice, so unlike the console and the fence rows
+there is no mock in the way: this is exactly what runs on the machine.
+
+- **Every per-frame decision except the checksum is free.** The gate that asks
+  whether the NIC already validated a frame is **0.76 ns**, the
+  interrupt-throttle choice taken on every receive IRQ is ~1.0 ns, the
+  multicast hash is 0.63 ns and matching a PCI device id against the
+  supported chipsets is 2.1 ns.
+- **The IPv4 header check is bounded, and the rows prove it**: 8.33 ns on a
+  64-byte frame and 8.42 ns on a 1500-byte one. Twenty bytes either way, which
+  is what it should be and what a bug here would break. A frame that is not
+  IPv4 at all leaves in 1.0 ns.
+- **Checksumming the payload in software runs at 0.16 ns/byte**: 11.5 ns over
+  64 bytes, 235 ns over 1460, 1.43 us over a jumbo 8960. That is a
+  byte-at-a-time one's-complement loop, about 6.3 GB/s.
+- **So the NIC's L4 offload is worth 243 ns a frame.** The whole software
+  fallback on a 1500-byte TCP frame the NIC did not check is **252.6 ns**,
+  against **9.66 ns** for the same frame when the NIC validated the L4
+  checksum and the walk is skipped. At gigabit line rate with full-MTU frames
+  (~82,500 frames/s) that difference is **about 20 ms of CPU per second, or
+  2% of a core** -- per gigabit, and the same 2% with jumbo frames, since the
+  cost is per byte. It is the one thing on this path that is O(bytes) rather
+  than O(1), and the 0.76 ns gate in front of it is what keeps it off the
+  common frame.
