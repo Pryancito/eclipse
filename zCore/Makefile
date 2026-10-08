@@ -570,15 +570,29 @@ ifeq ($(ARCH), x86_64)
 # once per test case in CI, and `Linux Other Test Baremetal (x86_64)` and
 # `Linux Libc Test Baremetal (x86_64)` timing out on every case with zero
 # guest output.
+#
+# The expensive branch builds into a SIDECAR and renames at the end, so the
+# image only ever becomes visible complete. That branch does not fit in the
+# 10 s per-case budget on a cold checkout, so the FIRST case is always killed
+# part-way through it. Writing straight to $(esp_img) left behind a file of
+# the right size with no filesystem structure inside, and the guard above
+# trusted it -- the guard only asks whether the file EXISTS -- so the retry
+# took the cheap branch and died on `::/EFI/Boot/rboot.conf: no match for
+# target`, failing the whole job rather than just that one case. With the
+# sidecar a killed build leaves nothing to trust and the retry rebuilds.
+# The `&&` chain covers the other way this goes wrong: a step that FAILS
+# without being killed must not publish a half-written image either.
 	@if [ ! -f "$(esp_img)" ] || [ -n "$$(find "$(esp)/EFI" -newer "$(esp_img)" \
 	      -type f ! -name rboot.conf -print -quit 2>/dev/null)" ]; then \
 	  esp_mb=$$(sh "$(abspath ../scripts/esp-size-mb.sh)" "$(esp)/EFI" 128) || exit 1; \
 	  echo "Building $(esp_img) ($$esp_mb MiB FAT32 — real ESP image; fat:rw dir emulation caps at FAT16 504 MiB)"; \
-	  rm -f "$(esp_img)"; \
-	  dd if=/dev/zero of="$(esp_img)" bs=1M count=$$esp_mb status=none; \
-	  mkfs.vfat -F 32 "$(esp_img)" >/dev/null; \
-	  mmd -i "$(esp_img)" ::/EFI ::/EFI/Boot ::/EFI/zCore; \
-	  mcopy -i "$(esp_img)" -s "$(esp)/EFI" ::/; \
+	  rm -f "$(esp_img).tmp"; \
+	  dd if=/dev/zero of="$(esp_img).tmp" bs=1M count=$$esp_mb status=none \
+	    && mkfs.vfat -F 32 "$(esp_img).tmp" >/dev/null \
+	    && mmd -i "$(esp_img).tmp" ::/EFI ::/EFI/Boot ::/EFI/zCore \
+	    && mcopy -i "$(esp_img).tmp" -s "$(esp)/EFI" ::/ \
+	    && mv -f "$(esp_img).tmp" "$(esp_img)"; \
+	  rm -f "$(esp_img).tmp"; \
 	else \
 	  mcopy -i "$(esp_img)" -o "$(esp)/EFI/Boot/rboot.conf" ::/EFI/Boot/rboot.conf; \
 	fi

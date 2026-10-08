@@ -1,9 +1,12 @@
 //! xHCI + USB HID: enumeración en puertos raíz, HID boot (teclado / ratón / tablet QEMU),
 //! MSI + `poll()` por timer, handoff USB legacy, anillos TRB alineados a la especificación.
 //!
-//! **Alcance:** controladores xHCI en puertos raíz (registro global de sondeo), sin hubs USB.
-//! **No cubierto:** descriptores HID no boot, varios interfaces HID compuestos, USB3
-//! recovery avanzado.
+//! **Alcance:** controladores xHCI, puertos raíz y hubs USB hasta los cinco niveles
+//! que cabe nombrar en un route string (registro global de sondeo).
+//! Los cambios de puerto de un hub llegan por su endpoint de cambio de estado, con
+//! un barrido por transferencia de control como red de seguridad.
+//! **No cubierto:** Multi-TT, descriptores HID no boot, varios interfaces HID
+//! compuestos, USB3 recovery avanzado.
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -1041,6 +1044,255 @@ impl EventRing {
     }
 }
 
+// ——— Velocidades (codigo de PORTSC.Port Speed, xHCI §5.4.8) ———
+
+const SPEED_FULL: u8 = 1;
+const SPEED_LOW: u8 = 2;
+const SPEED_HIGH: u8 = 3;
+const SPEED_SUPER: u8 = 4;
+
+// ——— Hubs USB ———
+
+const USB_CLASS_HUB: u8 = 0x09;
+/// `bDescriptorType` del descriptor de hub (USB 2.0 §11.23.2.1) y de su gemelo
+/// SuperSpeed (USB 3.2 §10.15.2.1).
+const USB_DESC_HUB: u8 = 0x29;
+const USB_DESC_SS_HUB: u8 = 0x2a;
+/// Selectores de característica de la clase hub (USB 2.0 §11.24.2).
+const HUB_FEAT_PORT_RESET: u16 = 4;
+const HUB_FEAT_PORT_POWER: u16 = 8;
+const HUB_FEAT_C_PORT_CONNECTION: u16 = 16;
+const HUB_FEAT_C_PORT_ENABLE: u16 = 17;
+const HUB_FEAT_C_PORT_SUSPEND: u16 = 18;
+const HUB_FEAT_C_PORT_OVER_CURRENT: u16 = 19;
+const HUB_FEAT_C_PORT_RESET: u16 = 20;
+/// Solo USB 2.0 con LPM.
+const HUB_FEAT_C_PORT_L1: u16 = 23;
+/// Solo SuperSpeed.
+const HUB_FEAT_C_PORT_LINK_STATE: u16 = 25;
+const HUB_FEAT_C_PORT_CONFIG_ERROR: u16 = 26;
+const HUB_FEAT_C_BH_PORT_RESET: u16 = 29;
+/// Bits de `wPortStatus` (USB 2.0 §11.24.2.7.1).
+const HUB_PORT_CONNECTION: u16 = 1 << 0;
+const HUB_PORT_ENABLE: u16 = 1 << 1;
+const HUB_PORT_RESET: u16 = 1 << 4;
+const HUB_PORT_LOW_SPEED: u16 = 1 << 9;
+const HUB_PORT_HIGH_SPEED: u16 = 1 << 10;
+/// Bits de `wPortChange` de un hub USB 2.0 y la característica que limpia cada
+/// uno (USB 2.0 §11.24.2.7.2, con el bit 5 de la ECN de LPM).
+const HUB_PORT_CHANGES_USB2: [(u16, u16); 6] = [
+    (1 << 0, HUB_FEAT_C_PORT_CONNECTION),
+    (1 << 1, HUB_FEAT_C_PORT_ENABLE),
+    (1 << 2, HUB_FEAT_C_PORT_SUSPEND),
+    (1 << 3, HUB_FEAT_C_PORT_OVER_CURRENT),
+    (1 << 4, HUB_FEAT_C_PORT_RESET),
+    (1 << 5, HUB_FEAT_C_PORT_L1),
+];
+
+/// Y los de un hub SuperSpeed (USB 3.2 §10.16.2.6), que no son los mismos: los
+/// bits 1 y 2 son reservados, el 5 es `C_BH_PORT_RESET` en vez de `C_PORT_L1`,
+/// y existen dos más arriba que USB 2.0 no tiene.
+const HUB_PORT_CHANGES_SS: [(u16, u16); 6] = [
+    (1 << 0, HUB_FEAT_C_PORT_CONNECTION),
+    (1 << 3, HUB_FEAT_C_PORT_OVER_CURRENT),
+    (1 << 4, HUB_FEAT_C_PORT_RESET),
+    (1 << 5, HUB_FEAT_C_BH_PORT_RESET),
+    (1 << 6, HUB_FEAT_C_PORT_LINK_STATE),
+    (1 << 7, HUB_FEAT_C_PORT_CONFIG_ERROR),
+];
+
+/// La tabla que le toca a un hub por su velocidad.
+///
+/// Con una sola tabla para los dos protocolos, un cambio se reconoce con la
+/// característica de otro y el bit se queda puesto: el hub vuelve a señalar ese
+/// puerto en cada informe de cambio de estado para siempre, y el driver lo
+/// vuelve a leer para siempre. Es lo que pasaba con el bit 5 en un hub USB 2.0
+/// (que es `C_PORT_L1`, no `C_BH_PORT_RESET`) y con los bits 6 y 7 de un hub
+/// SuperSpeed, que no se limpiaban nunca.
+fn hub_port_changes(hub_speed: u8) -> &'static [(u16, u16)] {
+    if hub_speed >= SPEED_SUPER {
+        &HUB_PORT_CHANGES_SS
+    } else {
+        &HUB_PORT_CHANGES_USB2
+    }
+}
+/// Un route string lleva cinco niveles de cuatro bits (xHCI §8.9), así que un
+/// dispositivo no puede estar a más de cinco hubs de la raíz.
+const USB_MAX_TIERS: u8 = 5;
+/// Y ningún hub tiene más puertos de los que un nibble puede nombrar.
+const HUB_MAX_PORTS: u8 = 15;
+/// Cada cuánto se barren los puertos de un hub cuyo endpoint de cambio de
+/// estado no se pudo armar: ahí el sondeo es lo único que hay.
+const HUB_SCAN_PERIOD_US: u64 = 1_000_000;
+/// Y cada cuánto se barre uno que sí tiene su endpoint. Es una red de
+/// seguridad --un informe perdido, un hub que no avisa-- y cada puerto cuesta
+/// una transferencia de control, así que va mucho más espaciado.
+const HUB_BACKSTOP_PERIOD_US: u64 = 5_000_000;
+/// Tiempo máximo que se espera a que un puerto de hub salga del reset.
+const HUB_RESET_TIMEOUT_US: u64 = 800_000;
+/// `TRSTRCY`: recuperación tras el reset antes de hablarle al dispositivo
+/// (USB 2.0 §7.1.7.5).
+const HUB_RESET_RECOVERY_US: u64 = 10_000;
+
+/// Dónde está un dispositivo en la topología USB, o sea todo lo que el Slot
+/// Context de xHCI necesita para alcanzarlo (§6.2.2).
+///
+/// Un dispositivo en un puerto raíz tiene `route == 0` y no tiene padre; uno
+/// detrás de un hub lleva en su route string el puerto aguas abajo de cada
+/// nivel, cuatro bits por nivel y el nivel 1 en los bits 3:0.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct DevTopo {
+    /// Puerto del hub raíz (base 1) del que cuelga todo el camino.
+    root_port: u8,
+    /// Route String: el campo de 20 bits del Slot Context DW0.
+    route: u32,
+    /// Slot del hub en el que está enchufado, 0 si está en un puerto raíz.
+    parent_slot: u8,
+    /// Puerto aguas abajo de ese hub (base 1), 0 si está en un puerto raíz.
+    parent_port: u8,
+    /// Slot del hub de alta velocidad cuyo Transaction Translator sirve a este
+    /// dispositivo, y el puerto del que cuelga. Cero cuando no necesita
+    /// ninguno: el dispositivo es HS o más rápido, o no hay un hub HS encima.
+    tt_slot: u8,
+    tt_port: u8,
+    /// `true` cuando ese hub tiene un TT por puerto en vez de uno para todos.
+    tt_multi: bool,
+    /// Niveles entre este dispositivo y el puerto raíz: 0 en un puerto raíz.
+    depth: u8,
+}
+
+impl DevTopo {
+    fn root(port: u8) -> Self {
+        Self {
+            root_port: port,
+            ..Self::default()
+        }
+    }
+
+    /// La topología de un dispositivo enchufado al puerto `port` de este hub,
+    /// que está en `self`, ocupa el slot `hub_slot` y corre a `hub_speed`,
+    /// cuando el propio dispositivo ha enlazado a `speed`.
+    ///
+    /// `None` si el puerto no cabe en un nibble o si el dispositivo quedaría
+    /// más allá del último nivel que un route string puede nombrar.
+    fn child(
+        &self,
+        hub_slot: u8,
+        hub_speed: u8,
+        port: u8,
+        speed: u8,
+        hub_multi_tt: bool,
+    ) -> Option<Self> {
+        if self.depth >= USB_MAX_TIERS || port == 0 || port > HUB_MAX_PORTS {
+            return None;
+        }
+        // Cada nivel se queda con un nibble, el nivel 1 en los bits 3:0.
+        let route = self.route | ((port as u32) << (4 * self.depth as u32));
+        let (tt_slot, tt_port, tt_multi) = if !matches!(speed, SPEED_FULL | SPEED_LOW) {
+            // Solo se traduce lo que va a baja o plena velocidad.
+            (0, 0, false)
+        } else if hub_speed == SPEED_HIGH {
+            // Este hub es el traductor.
+            (hub_slot, port, hub_multi_tt)
+        } else {
+            // Un hub FS/LS colgado de uno HS: el traductor sigue siendo aquel.
+            (self.tt_slot, self.tt_port, self.tt_multi)
+        };
+        Some(Self {
+            root_port: self.root_port,
+            route,
+            parent_slot: hub_slot,
+            parent_port: port,
+            tt_slot,
+            tt_port,
+            tt_multi,
+            depth: self.depth + 1,
+        })
+    }
+}
+
+/// Lo que hace falta saber de un hub ya enumerado.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct HubInfo {
+    ports: u8,
+    /// TT Think Time tal cual va al Slot Context DW2 (bits 17:16).
+    think_time: u8,
+    /// Retardo entre encender un puerto y que responda, en ms.
+    power_good_ms: u32,
+    /// Siempre `false`: habilitar Multi-TT exige un `SET_INTERFACE` a la
+    /// interfaz alternativa 1 del hub, que este driver no hace. Un TT único es
+    /// válido en cualquier hub, así que no pasa nada por quedarse ahí.
+    multi_tt: bool,
+}
+
+/// `bNbrPorts`, el think time y el retardo de encendido de un descriptor de hub
+/// (USB 2.0 §11.23.2.1, USB 3.2 §10.15.2.1, que comparten los seis primeros
+/// bytes).
+fn parse_hub_descriptor(raw: &[u8]) -> Option<HubInfo> {
+    if raw.len() < 6 {
+        return None;
+    }
+    if (raw[0] as usize) < 6 || (raw[1] != USB_DESC_HUB && raw[1] != USB_DESC_SS_HUB) {
+        return None;
+    }
+    let ports = raw[2];
+    if ports == 0 {
+        return None;
+    }
+    let chars = u16::from_le_bytes([raw[3], raw[4]]);
+    Some(HubInfo {
+        ports: ports.min(HUB_MAX_PORTS),
+        think_time: ((chars >> 5) & 3) as u8,
+        // `bPwrOn2PwrGood` va en unidades de 2 ms, y un hub que no pide nada
+        // sigue necesitando los 100 ms que la especificación da a un puerto
+        // para contestar después de encenderse.
+        power_good_ms: ((raw[5] as u32) * 2).max(100),
+        multi_tt: false,
+    })
+}
+
+/// Bytes del mapa de bits de cambio de estado de un hub de `ports` puertos.
+///
+/// Es un bit por puerto más el bit 0, que es el del propio hub (USB 2.0
+/// §11.12.4), redondeado a bytes.
+fn hub_change_bytes(ports: u8) -> usize {
+    (ports as usize + 1).div_ceil(8)
+}
+
+/// Los puertos que un mapa de bits de cambio de estado señala.
+///
+/// El bit `N` es el puerto `N`; el bit 0 es un cambio del hub entero, que este
+/// driver no usa para nada todavía, así que no devuelve ningún puerto. Un bit
+/// por encima de `ports` es basura o un hub que miente: se ignora en vez de
+/// mandar un `GET_STATUS` a un puerto que no existe.
+fn hub_changed_ports(bitmap: &[u8], ports: u8) -> Vec<u8> {
+    (1..=ports)
+        .filter(|&port| {
+            bitmap
+                .get(port as usize / 8)
+                .is_some_and(|b| b & (1 << (port % 8)) != 0)
+        })
+        .collect()
+}
+
+/// El código de velocidad de PORTSC que corresponde a lo que el hub cuenta en
+/// `wPortStatus`.
+///
+/// Un hub SuperSpeed solo tiene hijos SuperSpeed: los dispositivos USB 2.0 del
+/// mismo conector físico cuelgan del hub USB 2.0 acompañante, que el
+/// controlador enumera como otro dispositivo suyo.
+fn hub_port_speed(hub_speed: u8, status: u16) -> u8 {
+    if hub_speed >= SPEED_SUPER {
+        hub_speed
+    } else if status & HUB_PORT_LOW_SPEED != 0 {
+        SPEED_LOW
+    } else if status & HUB_PORT_HIGH_SPEED != 0 {
+        SPEED_HIGH
+    } else {
+        SPEED_FULL
+    }
+}
+
 const USB_CLASS_HID: u8 = 0x03;
 const HID_SUBCLASS_BOOT: u8 = 0x01;
 const HID_SUBCLASS_NONE: u8 = 0x00;
@@ -1057,6 +1309,22 @@ const USB_DESC_HID_REPORT: u8 = 0x22;
 const REPORT_DESC_SNAPSHOT: usize = 256;
 const EP_TYPE_CONTROL: u32 = 4 << 3;
 const EP_TYPE_INT_IN: u32 = 7 << 3;
+const EP_TYPE_BULK_OUT: u32 = 2 << 3;
+const EP_TYPE_BULK_IN: u32 = 6 << 3;
+
+/// El Device Context Index de un `bEndpointAddress`: `2*N` para un endpoint
+/// OUT, `2*N+1` para uno IN. Es la inversa de [`ep_addr_from_dci`].
+///
+/// `None` si no cabe en los 31 endpoints de un slot. El endpoint 0 no tiene
+/// direccion: su DCI es 1 y lo pone `setup_device`.
+fn dci_from_ep_addr(ep_addr: u8) -> Option<u8> {
+    let num = ep_addr & 0x0f;
+    if num == 0 {
+        return None;
+    }
+    let dci = num * 2 + u8::from(ep_addr & 0x80 != 0);
+    (dci < 32).then_some(dci)
+}
 const HID_PROTO_KEY: u8 = 1;
 const HID_PROTO_MOUSE: u8 = 2;
 const HID_PROTO_TABLET: u8 = 3;
@@ -1995,7 +2263,10 @@ pub struct XhciInner {
     context_size: usize,
     pub msi_vector: usize,
     slot_speed: Vec<u8>,
-    slot_port: Vec<u8>,
+    /// Topología de cada slot direccionado, indexada por slot id. `None` =
+    /// slot libre. Sustituye al antiguo `slot_port`: el puerto raíz es solo uno
+    /// de los campos, y detrás de un hub no identifica un dispositivo.
+    slot_topo: Vec<Option<DevTopo>>,
     dev_ctx: Vec<Option<DmaBuf>>,
     xfer_rings: Vec<Option<XferRing>>,
     scratch_tbl: Option<DmaBuf>,
@@ -2017,6 +2288,17 @@ pub struct XhciInner {
     /// drain. `stalled` means the completion code was Stall Error, so the
     /// DEVICE also has to be told to clear its halt.
     pending_ep_resets: Vec<(u8, u8, bool)>,
+    /// Todos los dispositivos enumerados, tengan driver o no.
+    devs: Vec<UsbDev>,
+    /// Unidades de almacenamiento masivo que respondieron.
+    mscs: Vec<MscDev>,
+    /// Hubs ya configurados, en el orden en que se enumeraron.
+    hubs: Vec<HubDev>,
+    /// `(slot del hub, puerto)` que un endpoint de cambio de estado ha
+    /// señalado. Diferidos por la misma razón que `pending_port_changes`: la
+    /// enumeración emite comandos y espera en el anillo de eventos, y eso no
+    /// puede correr anidado dentro de `pop_ev`.
+    pending_hub_ports: Vec<(u8, u8)>,
     /// HID enumeration deferred from PCI probe so boot can pass 80% quickly.
     boot_enum_pending: bool,
     /// Number of consecutive soft-recovery attempts since the controller last
@@ -2025,6 +2307,448 @@ pub struct XhciInner {
     /// Monotonic timestamp (µs) of the last soft-recovery attempt; used to
     /// back off so we don't bang on the controller every io-wait iteration.
     halt_last_attempt_us: u64,
+}
+
+/// Una unidad de almacenamiento masivo que hablo con nosotros.
+struct MscDev {
+    slot: u8,
+    iface: u8,
+    /// DCI de sus dos endpoints bulk.
+    dci_in: u8,
+    dci_out: u8,
+    max_lun: u8,
+    inquiry: ScsiInquiry,
+    /// `None` cuando la unidad contesto el INQUIRY pero no la capacidad: un
+    /// lector de tarjetas sin tarjeta es exactamente eso.
+    capacity: Option<ScsiCapacity>,
+    /// Etiqueta de la siguiente orden. Cada una tiene que llevar la suya.
+    next_tag: u32,
+}
+
+/// Cuanto se espera por una transferencia bulk. Una unidad que acaba de
+/// arrancar puede tardar segundos en contestar su primer TEST UNIT READY.
+const BULK_TIMEOUT_US: u64 = 5_000_000;
+/// Intentos de TEST UNIT READY antes de dar la unidad por no lista. Un pendrive
+/// contesta «unidad no lista, haciendose» mientras arranca.
+const MSC_READY_ATTEMPTS: u8 = 8;
+const MSC_READY_WAIT_US: u64 = 250_000;
+
+/// Un hub configurado: lo que hay que recordar para enterarse de sus cambios de
+/// puerto y para apuntar a su Transaction Translator desde los hijos.
+struct HubDev {
+    slot: u8,
+    /// Código de velocidad del propio hub.
+    speed: u8,
+    ports: u8,
+    multi_tt: bool,
+    /// DCI del endpoint de cambio de estado, 0 si no se pudo armar (entonces el
+    /// hub depende del sondeo de [`XhciInner::scan_hubs_if_due`]).
+    ep_dci: u8,
+    /// Marca de tiempo (µs) del último barrido de los puertos de este hub.
+    scan_last_us: u64,
+    /// Fuerza el próximo barrido sin esperar al periodo: lo pone un informe de
+    /// cambio de estado que se perdió.
+    scan_due: bool,
+    /// Único búfer del endpoint, y el tamaño del mapa de bits que cabe en él.
+    ///
+    /// Uno basta, al contrario que en un HID: el hub reenvía el mismo mapa de
+    /// bits hasta que se lee el estado del puerto que lo puso, así que no hay
+    /// un flujo que seguir y perder una repetición no pierde información.
+    buf: Option<DmaBuf>,
+    change_len: usize,
+}
+
+/// Cuántas interfaces de un dispositivo se recuerdan. Un compuesto normal trae
+/// dos o tres; ocho cubre un receptor inalámbrico con todo lo que lleva.
+const MAX_IFACES_RECORDED: usize = 8;
+
+/// Una interfaz tal como la declara el descriptor de configuración.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct IfaceRecord {
+    num: u8,
+    class: u8,
+    subclass: u8,
+    proto: u8,
+}
+
+/// Un dispositivo USB enumerado, con driver o sin él.
+///
+/// Antes de esto el driver solo se acordaba de lo que podía usar: una interfaz
+/// HID en [`XhciInner::hids`], un hub en [`XhciInner::hubs`]. Todo lo demás se
+/// direccionaba, se configuraba y se olvidaba, así que a la pregunta «¿el
+/// sistema ve mi pendrive?» no se podía contestar ni que sí ni que no. Esta
+/// lista es lo que la contesta, y es el punto de partida de cualquier driver de
+/// clase que venga despues.
+struct UsbDev {
+    slot: u8,
+    topo: DevTopo,
+    speed: u8,
+    vid: u16,
+    pid: u16,
+    /// `bDeviceClass` / `bDeviceSubClass` / `bDeviceProtocol`.
+    class: u8,
+    subclass: u8,
+    proto: u8,
+    ifaces: Vec<IfaceRecord>,
+    /// Interfaces que el descriptor declaraba y no caben en `ifaces`.
+    ifaces_dropped: u8,
+}
+
+/// El nombre de una clase USB, para que un volcado se lea sin la tabla delante.
+///
+/// Son los códigos que `usb.org` asigna y que de verdad aparecen en una
+/// máquina; cualquier otro sale como su número en hexadecimal.
+fn usb_class_name(class: u8) -> &'static str {
+    match class {
+        0x00 => "por interfaz",
+        0x01 => "audio",
+        0x02 => "cdc",
+        USB_CLASS_HID => "hid",
+        0x05 => "fisico",
+        0x06 => "imagen",
+        0x07 => "impresora",
+        0x08 => "almacenamiento",
+        USB_CLASS_HUB => "hub",
+        0x0a => "datos-cdc",
+        0x0b => "tarjeta-chip",
+        0x0d => "seguridad",
+        0x0e => "video",
+        0x0f => "salud",
+        0x10 => "audio-video",
+        0x11 => "pantalla",
+        0xdc => "diagnostico",
+        0xe0 => "inalambrico",
+        0xef => "varios",
+        0xfe => "especifico",
+        0xff => "del fabricante",
+        _ => "?",
+    }
+}
+
+/// Recorre un descriptor de configuración entregando cada descriptor suyo como
+/// `(bDescriptorType, cuerpo)`, y para en cuanto uno no cabe o miente sobre su
+/// longitud. Un `bLength` de 0 o 1 colgaría el recorrido.
+fn config_descriptors(raw: &[u8]) -> impl Iterator<Item = (u8, &[u8])> {
+    let mut o = 0usize;
+    core::iter::from_fn(move || {
+        if o + 2 > raw.len() {
+            return None;
+        }
+        let dl = raw[o] as usize;
+        if dl < 2 || o + dl > raw.len() {
+            return None;
+        }
+        let d = &raw[o..o + dl];
+        o += dl;
+        Some((d[1], d))
+    })
+}
+
+/// Las interfaces que declara un descriptor de configuración, en orden, y
+/// cuántas se quedaron fuera por el tope de [`MAX_IFACES_RECORDED`].
+///
+/// Solo el ajuste alternativo 0 de cada una: `bAlternateSetting` distinto de
+/// cero es otra cara de la MISMA interfaz, y contarlas por separado llena la
+/// lista de duplicados y desplaza a las interfaces de verdad.
+fn config_interfaces(raw: &[u8]) -> (Vec<IfaceRecord>, u8) {
+    let mut out: Vec<IfaceRecord> = Vec::new();
+    let mut dropped = 0u8;
+    for (dt, d) in config_descriptors(raw) {
+        if dt != USB_DESC_IFACE || d.len() < 9 || d[3] != 0 {
+            continue;
+        }
+        if out.len() < MAX_IFACES_RECORDED {
+            out.push(IfaceRecord {
+                num: d[2],
+                class: d[5],
+                subclass: d[6],
+                proto: d[7],
+            });
+        } else {
+            dropped = dropped.saturating_add(1);
+        }
+    }
+    (out, dropped)
+}
+
+/// El endpoint de interrupción IN de la primera interfaz de clase `class`:
+/// `(bEndpointAddress, wMaxPacketSize, bInterval)`.
+///
+/// `wMaxPacketSize` viene enmascarado a sus bits 10:0: los 12:11 son el campo
+/// de transacciones adicionales de alta velocidad y no pueden colarse en el
+/// Max Packet Size del contexto del endpoint.
+fn class_int_in_endpoint(raw: &[u8], class: u8) -> Option<(u8, u16, u8)> {
+    let mut inside = false;
+    for (dt, d) in config_descriptors(raw) {
+        if dt == USB_DESC_IFACE && d.len() >= 9 {
+            inside = d[5] == class;
+        }
+        if dt == USB_DESC_EP && d.len() >= 7 && inside {
+            let addr = d[2];
+            // Interrupción (bmAttributes bits 1:0 = 3) y dirección IN.
+            if (addr & 0x80) != 0 && (d[3] & 3) == 3 {
+                return Some((addr, u16::from_le_bytes([d[4], d[5]]) & 0x7ff, d[6]));
+            }
+        }
+    }
+    None
+}
+
+// ——— Almacenamiento masivo: Bulk-Only Transport y SCSI ———
+
+const USB_CLASS_MASS_STORAGE: u8 = 0x08;
+/// `bInterfaceProtocol` del Bulk-Only Transport, que es el que usa todo lo que
+/// se vende hoy. CBI (0x00, 0x01) es de los noventa y no se cubre.
+const MSC_PROTO_BULK_ONLY: u8 = 0x50;
+/// `bInterfaceSubClass`: SCSI transparente. Los demas (RBC, MMC, UFI) hablan
+/// otros conjuntos de ordenes.
+const MSC_SUBCLASS_SCSI: u8 = 0x06;
+/// `GET_MAX_LUN`, peticion de clase a la interfaz (USB MSC BOT §3.2).
+const MSC_REQ_GET_MAX_LUN: u8 = 0xfe;
+
+const BOT_CBW_LEN: usize = 31;
+const BOT_CSW_LEN: usize = 13;
+const BOT_CBW_SIGNATURE: u32 = 0x4342_5355; // "USBC"
+const BOT_CSW_SIGNATURE: u32 = 0x5342_5355; // "USBS"
+
+const SCSI_TEST_UNIT_READY: u8 = 0x00;
+const SCSI_REQUEST_SENSE: u8 = 0x03;
+const SCSI_INQUIRY: u8 = 0x12;
+const SCSI_READ_CAPACITY_10: u8 = 0x25;
+const SCSI_SERVICE_ACTION_IN_16: u8 = 0x9e;
+const SCSI_SAI_READ_CAPACITY_16: u8 = 0x10;
+
+/// Un Command Block Wrapper (USB MSC BOT §5.1): los 31 bytes que abren cada
+/// orden SCSI sobre el endpoint bulk OUT.
+///
+/// `data_len` es lo que se espera transferir en la fase de datos y `dir_in` su
+/// direccion. El `tag` vuelve identico en el CSW y es lo unico que ata la
+/// respuesta a su pregunta: creerse un CSW de otro tag es leer el resultado de
+/// la orden anterior.
+fn bot_cbw(
+    tag: u32,
+    data_len: u32,
+    dir_in: bool,
+    lun: u8,
+    cmd: &[u8],
+) -> Option<[u8; BOT_CBW_LEN]> {
+    // bCBWCBLength son 5 bits y el bloque de orden son 16 bytes de hueco.
+    if cmd.is_empty() || cmd.len() > 16 {
+        return None;
+    }
+    let mut w = [0u8; BOT_CBW_LEN];
+    w[0..4].copy_from_slice(&BOT_CBW_SIGNATURE.to_le_bytes());
+    w[4..8].copy_from_slice(&tag.to_le_bytes());
+    w[8..12].copy_from_slice(&data_len.to_le_bytes());
+    // bmCBWFlags: solo el bit 7, la direccion. El resto es reservado-cero, y
+    // un uno ahi es un CBW que el dispositivo puede rechazar entero.
+    w[12] = if dir_in { 0x80 } else { 0x00 };
+    w[13] = lun & 0x0f;
+    w[14] = cmd.len() as u8;
+    w[15..15 + cmd.len()].copy_from_slice(cmd);
+    Some(w)
+}
+
+/// El resultado de una orden, tal como viene en el Command Status Wrapper.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct BotCsw {
+    tag: u32,
+    /// Bytes de la fase de datos que NO se transfirieron.
+    residue: u32,
+    /// 0 = bien, 1 = la orden fallo (hay que pedir el sentido), 2 = error de
+    /// fase (el dispositivo quiere un reset del transporte).
+    status: u8,
+}
+
+/// Lee un CSW y comprueba que es el de `want_tag`.
+///
+/// `None` cuando no es un CSW valido o cuando contesta a otra orden: en los dos
+/// casos la respuesta no se puede usar, y el transporte necesita recuperarse.
+fn bot_parse_csw(raw: &[u8], want_tag: u32) -> Option<BotCsw> {
+    if raw.len() < BOT_CSW_LEN {
+        return None;
+    }
+    if u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]) != BOT_CSW_SIGNATURE {
+        return None;
+    }
+    let tag = u32::from_le_bytes([raw[4], raw[5], raw[6], raw[7]]);
+    if tag != want_tag {
+        return None;
+    }
+    let status = raw[12];
+    // 3 y 4 son reservados y 0x80 en adelante no existe: un dispositivo que
+    // los manda no esta diciendo «bien».
+    if status > 2 {
+        return None;
+    }
+    Some(BotCsw {
+        tag,
+        residue: u32::from_le_bytes([raw[8], raw[9], raw[10], raw[11]]),
+        status,
+    })
+}
+
+/// Lo que un INQUIRY cuenta del dispositivo.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct ScsiInquiry {
+    /// `Peripheral Device Type`: 0 = disco de bloques, 5 = CD/DVD, 0x1f = nada
+    /// conectado.
+    dev_type: u8,
+    removable: bool,
+    vendor: [u8; 8],
+    product: [u8; 16],
+    revision: [u8; 4],
+}
+
+/// Parsea los 36 bytes de un INQUIRY estandar (SPC-4 §6.4).
+fn scsi_parse_inquiry(raw: &[u8]) -> Option<ScsiInquiry> {
+    if raw.len() < 36 {
+        return None;
+    }
+    let mut out = ScsiInquiry {
+        dev_type: raw[0] & 0x1f,
+        // RMB es el bit 7 del byte 1; los otros siete son reservados.
+        removable: raw[1] & 0x80 != 0,
+        ..ScsiInquiry::default()
+    };
+    out.vendor.copy_from_slice(&raw[8..16]);
+    out.product.copy_from_slice(&raw[16..32]);
+    out.revision.copy_from_slice(&raw[32..36]);
+    Some(out)
+}
+
+/// Un campo de texto de un INQUIRY, sin los espacios con que SCSI lo rellena y
+/// sin los bytes que no se pueden imprimir.
+///
+/// SCSI rellena a la derecha con espacios, no con ceros, asi que volcarlo tal
+/// cual deja una columna de huecos; y un dispositivo malo mete control ahi, que
+/// en una linea de `/proc` rompe el formato de todo lo demas.
+fn scsi_text(field: &[u8]) -> alloc::string::String {
+    field
+        .iter()
+        .map(|&b| {
+            if (0x20..0x7f).contains(&b) {
+                b as char
+            } else {
+                '.'
+            }
+        })
+        .collect::<alloc::string::String>()
+        .trim_end()
+        .into()
+}
+
+/// La capacidad que devuelve un READ CAPACITY: `(ultimo LBA, bytes por bloque)`.
+///
+/// `read_capacity(10)` da el ultimo LBA en 32 bits, asi que `0xffff_ffff` no es
+/// una capacidad sino «no cabe, preguntame con el de 16» (SBC-3 §5.15).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ScsiCapacity {
+    last_lba: u64,
+    block_size: u32,
+    /// `true` cuando hay que repetir con READ CAPACITY(16).
+    needs_16: bool,
+}
+
+fn scsi_parse_capacity10(raw: &[u8]) -> Option<ScsiCapacity> {
+    if raw.len() < 8 {
+        return None;
+    }
+    // SCSI es big-endian en todo.
+    let last = u32::from_be_bytes([raw[0], raw[1], raw[2], raw[3]]);
+    let bs = u32::from_be_bytes([raw[4], raw[5], raw[6], raw[7]]);
+    if bs == 0 {
+        return None;
+    }
+    Some(ScsiCapacity {
+        last_lba: last as u64,
+        block_size: bs,
+        needs_16: last == u32::MAX,
+    })
+}
+
+fn scsi_parse_capacity16(raw: &[u8]) -> Option<ScsiCapacity> {
+    if raw.len() < 12 {
+        return None;
+    }
+    let mut lba = [0u8; 8];
+    lba.copy_from_slice(&raw[0..8]);
+    let bs = u32::from_be_bytes([raw[8], raw[9], raw[10], raw[11]]);
+    if bs == 0 {
+        return None;
+    }
+    Some(ScsiCapacity {
+        last_lba: u64::from_be_bytes(lba),
+        block_size: bs,
+        needs_16: false,
+    })
+}
+
+/// Sectores de 512 bytes que ocupa un disco de `last_lba` bloques de
+/// `block_size`, que es la unidad con la que habla `BlockScheme`.
+///
+/// `last_lba` es el ULTIMO bloque, no la cuenta: un disco de un solo bloque
+/// contesta 0, y tomarlo por la cuenta deja el ultimo sector fuera del disco.
+fn scsi_sectors_512(cap: &ScsiCapacity) -> u64 {
+    let blocks = cap.last_lba.saturating_add(1);
+    if cap.block_size >= 512 {
+        blocks.saturating_mul((cap.block_size / 512) as u64)
+    } else {
+        // Un bloque de menos de 512 bytes no existe en nada real, pero
+        // multiplicar por cero dejaria un disco de capacidad 0 que parece
+        // vacio en vez de parecer raro.
+        blocks
+    }
+}
+
+/// La pareja de endpoints bulk de la interfaz `iface`:
+/// `(IN, OUT)`, cada uno `(bEndpointAddress, wMaxPacketSize)`.
+///
+/// `None` si a la interfaz le falta uno de los dos. Se buscan por numero de
+/// interfaz y no «el primer bulk del descriptor» porque un disco externo con
+/// lector de tarjetas declara dos interfaces de almacenamiento, y armar los
+/// endpoints de una con el numero de la otra es hablarle al disco equivocado.
+///
+/// Solo el ajuste alternativo 0, como [`config_interfaces`]: los endpoints que
+/// siguen a una alternativa pertenecen a esa alternativa, que no es la que se
+/// ha seleccionado.
+fn iface_bulk_endpoints(raw: &[u8], iface: u8) -> Option<((u8, u16), (u8, u16))> {
+    let mut inside = false;
+    let mut ep_in = None;
+    let mut ep_out = None;
+    for (dt, d) in config_descriptors(raw) {
+        if dt == USB_DESC_IFACE && d.len() >= 9 {
+            inside = d[2] == iface && d[3] == 0;
+            continue;
+        }
+        if dt != USB_DESC_EP || d.len() < 7 || !inside {
+            continue;
+        }
+        // bmAttributes bits 1:0 = 2 es bulk.
+        if d[3] & 3 != 2 {
+            continue;
+        }
+        let mps = u16::from_le_bytes([d[4], d[5]]) & 0x7ff;
+        if mps == 0 {
+            continue;
+        }
+        let slot = if d[2] & 0x80 != 0 {
+            &mut ep_in
+        } else {
+            &mut ep_out
+        };
+        // El primero de cada direccion: una interfaz con mas de una pareja
+        // tiene la suya en la primera.
+        if slot.is_none() {
+            *slot = Some((d[2], mps));
+        }
+    }
+    Some((ep_in?, ep_out?))
+}
+
+/// Lo que de un hub se lee sin tocar su lista: `(velocidad, puertos, multi_tt)`.
+fn hub_facts(h: &HubDev) -> (u8, u8, bool) {
+    (h.speed, h.ports, h.multi_tt)
 }
 
 struct HidDev {
@@ -2137,7 +2861,7 @@ impl XhciInner {
             context_size,
             msi_vector,
             slot_speed: alloc::vec![0; ns],
-            slot_port: alloc::vec![0; ns],
+            slot_topo: alloc::vec![None; ns],
             dev_ctx,
             xfer_rings,
             scratch_tbl: None,
@@ -2146,6 +2870,10 @@ impl XhciInner {
             pending_port_changes: Vec::new(),
             port_enum_fails: alloc::vec![0u8; max_ports as usize + 2],
             pending_ep_resets: Vec::new(),
+            devs: Vec::new(),
+            mscs: Vec::new(),
+            hubs: Vec::new(),
+            pending_hub_ports: Vec::new(),
             boot_enum_pending: true,
             halt_attempts: 0,
             halt_last_attempt_us: 0,
@@ -2239,6 +2967,16 @@ impl XhciInner {
 
         if i == 0 || i > self.max_slots as usize {
             return false;
+        }
+
+        // El endpoint de cambio de estado de un hub no lleva informes HID: su
+        // carga es un mapa de bits de puertos, y su anillo tiene un solo TRB.
+        if self
+            .hubs
+            .iter()
+            .any(|h| h.slot == i as u8 && h.ep_dci == dci && dci != 0)
+        {
+            return self.handle_hub_status_event(i as u8, ev, cc);
         }
 
         if cc != TRB_CC_SUCCESS && cc != TRB_CC_SHORT {
@@ -2938,13 +3676,7 @@ impl XhciInner {
         if (portsc & 1) == 0 {
             return Ok(());
         }
-        if self
-            .slot_port
-            .iter()
-            .enumerate()
-            .skip(1)
-            .any(|(_, &p)| p == port)
-        {
+        if self.slot_on_root_port(port).is_some() {
             self.cleanup_port(port)?;
             portsc = self.mmio.read_op(off);
             if (portsc & 1) == 0 {
@@ -3004,7 +3736,7 @@ impl XhciInner {
         if spd == 0 || (self.mmio.read_op(off) & 1) == 0 {
             return Ok(());
         }
-        match self.setup_device(port, spd) {
+        match self.setup_device(DevTopo::root(port), spd) {
             Ok(()) => Ok(()),
             Err(first_err) => {
                 warn!(
@@ -3028,7 +3760,7 @@ impl XhciInner {
                 if spd_retry == 0 || (self.mmio.read_op(off) & 1) == 0 {
                     return Ok(());
                 }
-                match self.setup_device(port, spd_retry) {
+                match self.setup_device(DevTopo::root(port), spd_retry) {
                     Ok(()) => Ok(()),
                     Err(second_err) => {
                         let _ = self.cleanup_port(port);
@@ -3039,7 +3771,8 @@ impl XhciInner {
         }
     }
 
-    fn setup_device(&mut self, port: u8, speed: u8) -> DeviceResult<()> {
+    fn setup_device(&mut self, topo: DevTopo, speed: u8) -> DeviceResult<()> {
+        let port = topo.root_port;
         let cmd_trb_phys = self.cmd.push(trb_enable_slot())?;
         self.mmio.ring_db(0, 0); // Doorbell 0: Comando
         let slot = self.wait_cmd_phys_slot(cmd_trb_phys)?;
@@ -3047,7 +3780,7 @@ impl XhciInner {
             // `slot` comes straight out of a Command Completion event. Only
             // zero was rejected, so a controller (or a stale/replayed event)
             // naming a slot above Max Slots panicked the kernel on the indexes
-            // below -- `slot_speed`, `slot_port` and `dev_ctx` are all sized
+            // below -- `slot_speed`, `slot_topo` and `dev_ctx` are all sized
             // max_slots + 1. `handle_hid_transfer_side` already bounds it.
             error!(
                 "[xhci] slot id {} out of range (max {})",
@@ -3056,7 +3789,7 @@ impl XhciInner {
             return Err(DeviceError::IoError);
         }
         self.slot_speed[slot as usize] = speed;
-        self.slot_port[slot as usize] = port;
+        self.slot_topo[slot as usize] = Some(topo);
 
         let csz = self.context_size;
         let dev_sz = 32 * csz;
@@ -3082,14 +3815,27 @@ impl XhciInner {
         ic.write_u32(4, 0x03);
         let s0 = csz;
         // Slot Context DW0 (§6.2.2):
-        //   bits [19: 0] Route String = 0 (root hub, no hub entre medias)
+        //   bits [19: 0] Route String = el puerto de cada nivel de hub, un
+        //                               nibble por nivel; 0 en un puerto raíz
         //   bits [23:20] Speed        = PORTSC speed code
-        //   bit  [26]    MTT          = 0 (sin Multi-Transaction Translator)
-        //   bit  [27]    Hub          = 0 (no es un hub)
+        //   bit  [25]    MTT          = Multi-Transaction Translator
+        //   bit  [26]    Hub          = 0 (se pone en `configure_hub_slot`)
         //   bits [31:27] Ctx Entries  = 1 (solo EP0 inicial; se actualizará en Configure Endpoint)
-        let slot_dw0 = ((speed as u32) << 20) | (1u32 << 27); // Speed + Context Entries=1
+        let slot_dw0 = (topo.route & 0x000f_ffff)
+            | ((speed as u32) << 20)
+            | (if topo.tt_multi { 1u32 << 25 } else { 0 })
+            | (1u32 << 27); // Context Entries = 1
         ic.write_u32(s0, slot_dw0);
+        // DW1: Max Exit Latency [15:0] = 0, Root Hub Port Number [23:16],
+        // Number of Ports [31:24] = 0 (lo pone `configure_hub_slot`).
         ic.write_u32(s0 + 4, (port as u32) << 16);
+        // DW2: TT Hub Slot ID [7:0], TT Port Number [15:8], TTT [17:16].
+        // Sin esto, un teclado o un ratón de baja/plena velocidad detrás de un
+        // hub de alta velocidad no enumera: el controlador no sabe por qué
+        // traductor pasar sus transacciones.
+        if topo.tt_slot != 0 {
+            ic.write_u32(s0 + 8, (topo.tt_slot as u32) | ((topo.tt_port as u32) << 8));
+        }
         let ep0 = 2 * csz;
         // xHCI PORTSC speed: 1=FS 2=LS 3=HS 4=SS Gen1 5=SS Gen2 …
         // Both FS(speed=1) and LS(speed=2) devices must start EP0 at 8 bytes until the
@@ -3109,8 +3855,8 @@ impl XhciInner {
         let ri = Self::ri(slot, 1);
 
         warn!(
-            "[xhci] setup slot={} port={} speed={} csz={}",
-            slot, port, speed, csz
+            "[xhci] setup slot={} port={} route={:#x} tier={} tt=({},{}) speed={} csz={}",
+            slot, port, topo.route, topo.depth, topo.tt_slot, topo.tt_port, speed, csz
         );
         warn!(
             "[xhci]   dcbaa[{}]={:#x}",
@@ -3238,8 +3984,969 @@ impl XhciInner {
             }
         }
 
+        let dev_class = raw_desc[4];
+        self.devs.retain(|d| d.slot != slot);
+        self.devs.push(UsbDev {
+            slot,
+            topo,
+            speed,
+            vid,
+            pid,
+            class: dev_class,
+            subclass: raw_desc[5],
+            proto: raw_desc[6],
+            ifaces: Vec::new(),
+            ifaces_dropped: 0,
+        });
         self.setup_hid_from_config(slot, csz, port, vid, pid)?;
+        if dev_class == USB_CLASS_HUB {
+            self.setup_hub(slot, csz, topo, speed)?;
+        }
 
+        Ok(())
+    }
+
+    /// Slot del dispositivo que está directamente en el puerto raíz `port`.
+    fn slot_on_root_port(&self, port: u8) -> Option<u8> {
+        (1..=self.max_slots).find(|&s| {
+            self.slot_topo
+                .get(s as usize)
+                .copied()
+                .flatten()
+                .is_some_and(|t| t.root_port == port && t.depth == 0)
+        })
+    }
+
+    /// Slot del dispositivo enchufado al puerto `port` del hub `hub_slot`.
+    fn slot_under(&self, hub_slot: u8, port: u8) -> Option<u8> {
+        (1..=self.max_slots).find(|&s| {
+            self.slot_topo
+                .get(s as usize)
+                .copied()
+                .flatten()
+                .is_some_and(|t| t.parent_slot == hub_slot && t.parent_port == port)
+        })
+    }
+
+    /// Petición de clase hub sin etapa de datos: `SET_FEATURE` o
+    /// `CLEAR_FEATURE` sobre un puerto aguas abajo. `bmRequestType = 0x23`
+    /// (host->device, clase, destinatario «Other»).
+    fn hub_port_feature(
+        &mut self,
+        slot: u8,
+        set: bool,
+        feature: u16,
+        port: u8,
+    ) -> DeviceResult<()> {
+        let breq = if set { 0x03 } else { 0x01 };
+        self.ep0_control_out0(
+            slot,
+            trb_setup(0x23, breq, feature, port as u16, 0, 0),
+            true,
+        )
+    }
+
+    /// `GET_STATUS` de un puerto del hub: devuelve `(wPortStatus, wPortChange)`.
+    fn hub_port_status(&mut self, slot: u8, port: u8) -> DeviceResult<(u16, u16)> {
+        let buf = DmaBuf::new(64, 64)?;
+        buf.flush(0, 64); // evict stale zeros before DMA
+        if let Err(e) =
+            self.ep0_control_in(slot, trb_setup(0xa3, 0x00, 0, port as u16, 4, 3), &buf, 4)
+        {
+            // El controlador puede escribir aquí más tarde si la transferencia
+            // no llegó a completarse: se abandonan las páginas.
+            buf.leak();
+            return Err(e);
+        }
+        buf.flush(0, 64); // invalidate so CPU reads fresh DMA data
+        let mut raw = [0u8; 4];
+        buf.read_into(0, &mut raw);
+        Ok((
+            u16::from_le_bytes([raw[0], raw[1]]),
+            u16::from_le_bytes([raw[2], raw[3]]),
+        ))
+    }
+
+    /// Lee el descriptor de hub. `bmRequestType = 0xa0` (device->host, clase,
+    /// destinatario «Device»).
+    fn hub_descriptor(&mut self, slot: u8, speed: u8) -> DeviceResult<HubInfo> {
+        let dtype = if speed >= SPEED_SUPER {
+            USB_DESC_SS_HUB
+        } else {
+            USB_DESC_HUB
+        };
+        let buf = DmaBuf::new(64, 64)?;
+        buf.flush(0, 64);
+        if let Err(e) = self.ep0_control_in(
+            slot,
+            trb_setup(0xa0, 0x06, (dtype as u16) << 8, 0, 15, 3),
+            &buf,
+            15,
+        ) {
+            buf.leak();
+            return Err(e);
+        }
+        buf.flush(0, 64);
+        let mut raw = [0u8; 15];
+        buf.read_into(0, &mut raw);
+        parse_hub_descriptor(&raw).ok_or_else(|| {
+            warn!(
+                "[xhci] hub slot={}: descriptor de hub ilegible ({:?})",
+                slot, raw
+            );
+            DeviceError::InvalidParam
+        })
+    }
+
+    /// Le dice al controlador que este slot es un hub. Sin el bit Hub, el
+    /// número de puertos y el think time, no ruta nada aguas abajo (§4.3.3), y
+    /// un hijo que lo nombre como su TT recibe un Parameter Error.
+    ///
+    /// Va por Configure Endpoint y no por Evaluate Context: este último solo
+    /// evalúa Max Exit Latency e Interrupter Target (§4.6.7).
+    fn configure_hub_slot(&mut self, slot: u8, csz: usize, info: &HubInfo) -> DeviceResult<()> {
+        let input_sz = 33 * csz;
+        let ic = DmaBuf::new(input_sz, 64)?;
+        ic.write_u32(0, 0); // Drop Context flags: nada
+        ic.write_u32(4, 0x01); // Add Context flags: A0 (Slot Context)
+        let dev_sz = 32 * csz;
+        {
+            let Some(dev_ctx) = self.dev_ctx[slot as usize].as_ref() else {
+                return Err(DeviceError::InvalidParam);
+            };
+            // Invalidar antes de leer lo que el controlador escribió por DMA.
+            dev_ctx.flush(0, dev_sz);
+            for i in 0..(csz / 4) {
+                ic.write_u32(csz + i * 4, dev_ctx.read_u32(i * 4));
+            }
+        }
+        let s0 = csz;
+        ic.write_u32(s0, ic.read_u32(s0) | (1 << 26)); // Hub = 1
+        ic.write_u32(
+            s0 + 4,
+            (ic.read_u32(s0 + 4) & 0x00ff_ffff) | ((info.ports as u32) << 24),
+        );
+        ic.write_u32(
+            s0 + 8,
+            (ic.read_u32(s0 + 8) & !(3 << 16)) | ((info.think_time as u32 & 3) << 16),
+        );
+        // Flush ANTES del doorbell: el controlador lee el input context por DMA
+        // en cuanto se le llama.
+        ic.flush(0, input_sz);
+        let p = self
+            .cmd
+            .push(trb_configure_endpoint(ic.sub_phys(0), slot))?;
+        self.mmio.ring_db(0, 0);
+        if let Err(e) = self.wait_cmd_phys(p) {
+            // Si el comando no completó no se sabe cuándo deja de leerlo.
+            ic.leak();
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    /// Enciende todos los puertos de un hub recién direccionado y enumera lo
+    /// que ya esté enchufado en ellos.
+    fn setup_hub(&mut self, slot: u8, csz: usize, topo: DevTopo, speed: u8) -> DeviceResult<()> {
+        let info = self.hub_descriptor(slot, speed)?;
+        self.configure_hub_slot(slot, csz, &info)?;
+        info!(
+            "[xhci] hub slot={} con {} puertos (route={:#x}, nivel {}, think_time={}, \
+             power_good={}ms)",
+            slot, info.ports, topo.route, topo.depth, info.think_time, info.power_good_ms
+        );
+        self.hubs.retain(|h| h.slot != slot);
+        self.hubs.push(HubDev {
+            slot,
+            speed,
+            ports: info.ports,
+            multi_tt: info.multi_tt,
+            ep_dci: 0,
+            scan_last_us: timer_now_us(),
+            scan_due: false,
+            buf: None,
+            change_len: 0,
+        });
+        // Armarlo antes de encender los puertos: así los cambios de los
+        // dispositivos que ya estuvieran enchufados llegan por el endpoint en
+        // vez de depender del primer barrido.
+        if let Err(e) = self.arm_hub_status_endpoint(slot, csz, info.ports) {
+            warn!(
+                "[xhci] hub slot={}: sin endpoint de cambio de estado ({:?}); se queda con \
+                 el sondeo cada {} ms",
+                slot,
+                e,
+                HUB_SCAN_PERIOD_US / 1000
+            );
+        }
+        for p in 1..=info.ports {
+            if let Err(e) = self.hub_port_feature(slot, true, HUB_FEAT_PORT_POWER, p) {
+                warn!(
+                    "[xhci] hub slot={} puerto {}: PORT_POWER falló ({:?})",
+                    slot, p, e
+                );
+            }
+        }
+        xhci_spin_delay_us(info.power_good_ms as u64 * 1000);
+        for p in 1..=info.ports {
+            if let Err(e) = self.try_hub_port(slot, p) {
+                warn!(
+                    "[xhci] hub slot={} puerto {}: enumeración falló ({:?})",
+                    slot, p, e
+                );
+            }
+        }
+        // El barrido periódico acaba de hacerse aquí: no repetirlo enseguida.
+        let now = timer_now_us();
+        if let Some(h) = self.hubs.iter_mut().find(|h| h.slot == slot) {
+            h.scan_last_us = now;
+            h.scan_due = false;
+        }
+        Ok(())
+    }
+
+    /// Enumera (o limpia) lo que haya en el puerto `port` del hub `hub_slot`.
+    fn try_hub_port(&mut self, hub_slot: u8, port: u8) -> DeviceResult<()> {
+        let Some((hub_speed, _, hub_multi_tt)) =
+            self.hubs.iter().find(|h| h.slot == hub_slot).map(hub_facts)
+        else {
+            return Ok(());
+        };
+        let Some(hub_topo) = self.slot_topo.get(hub_slot as usize).copied().flatten() else {
+            return Ok(());
+        };
+        let (status, change) = self.hub_port_status(hub_slot, port)?;
+        // Reconocer los cambios ANTES de enumerar, y solo esos, por la misma
+        // razón que en `handle_port_status_change`: la enumeración tarda, y un
+        // desenchufe que ocurra mientras corre no se puede perder.
+        for &(bit, feat) in hub_port_changes(hub_speed) {
+            if change & bit != 0 {
+                let _ = self.hub_port_feature(hub_slot, false, feat, port);
+            }
+        }
+        let connected = status & HUB_PORT_CONNECTION != 0;
+        let existing = self.slot_under(hub_slot, port);
+        match (connected, existing) {
+            (false, Some(child)) => {
+                info!(
+                    "[xhci] hub slot={} puerto {}: desconexión, liberando el slot {}",
+                    hub_slot, port, child
+                );
+                return self.cleanup_slot_tree(child);
+            }
+            (false, None) => return Ok(()),
+            // Ya enumerado y sigue ahí.
+            (true, Some(_)) => return Ok(()),
+            (true, None) => {}
+        }
+        // `PORT_RESET` tambien en un hub SuperSpeed: ahi es el que arranca el
+        // entrenamiento del enlace. `BH_PORT_RESET` es un reset en caliente,
+        // para recuperarse, no para enumerar por primera vez.
+        self.hub_port_feature(hub_slot, true, HUB_FEAT_PORT_RESET, port)?;
+        let mut status = 0u16;
+        let mut enabled = false;
+        let start = timer_now_us();
+        let mut spins = 0u64;
+        while !xhci_wait_expired(start, HUB_RESET_TIMEOUT_US, spins) {
+            xhci_spin_delay_us(10_000);
+            spins = spins.saturating_add(1);
+            let (s, c) = self.hub_port_status(hub_slot, port)?;
+            status = s;
+            for &(bit, feat) in hub_port_changes(hub_speed) {
+                if c & bit != 0 {
+                    let _ = self.hub_port_feature(hub_slot, false, feat, port);
+                }
+            }
+            if s & HUB_PORT_CONNECTION == 0 {
+                // Se fue mientras se reseteaba.
+                return Ok(());
+            }
+            if s & HUB_PORT_RESET == 0 && s & HUB_PORT_ENABLE != 0 {
+                enabled = true;
+                break;
+            }
+        }
+        if !enabled {
+            warn!(
+                "[xhci] hub slot={} puerto {}: el reset no habilitó el puerto \
+                 (wPortStatus={:#06x})",
+                hub_slot, port, status
+            );
+            return Ok(());
+        }
+        xhci_spin_delay_us(HUB_RESET_RECOVERY_US);
+        let speed = hub_port_speed(hub_speed, status);
+        let Some(child) = hub_topo.child(hub_slot, hub_speed, port, speed, hub_multi_tt) else {
+            warn!(
+                "[xhci] hub slot={} puerto {}: queda más allá de los {} niveles que un \
+                 route string puede nombrar, no se enumera",
+                hub_slot, port, USB_MAX_TIERS
+            );
+            return Ok(());
+        };
+        info!(
+            "[xhci] hub slot={} puerto {}: dispositivo a velocidad {} (route={:#x}, nivel {})",
+            hub_slot, port, speed, child.route, child.depth
+        );
+        self.setup_device(child, speed)
+    }
+
+    /// Busca el endpoint de interrupción IN de la interfaz de clase hub en el
+    /// descriptor de configuración. Un hub tiene exactamente uno (USB 2.0
+    /// §11.12.1) y es por donde avisa de sus cambios de puerto.
+    fn hub_status_endpoint(&mut self, slot: u8) -> DeviceResult<(u8, u16, u8)> {
+        let sniff = DmaBuf::new(64, 64)?;
+        sniff.flush(0, 64);
+        if let Err(e) = self.ep0_control_in(slot, trb_setup(0x80, 0x06, 0x0200, 0, 9, 3), &sniff, 9)
+        {
+            sniff.leak();
+            return Err(e);
+        }
+        sniff.flush(0, 64);
+        let mut hdr = [0u8; 9];
+        sniff.read_into(0, &mut hdr);
+        let total = u16::from_le_bytes([hdr[2], hdr[3]]) as usize;
+        if !(9..=8192).contains(&total) {
+            return Err(DeviceError::InvalidParam);
+        }
+        let buf_len = (total.div_ceil(64) * 64).max(64);
+        let cfgb = DmaBuf::new(buf_len, 64)?;
+        cfgb.flush(0, buf_len);
+        if let Err(e) = self.ep0_control_in(
+            slot,
+            trb_setup(0x80, 0x06, 0x0200, 0, total as u16, 3),
+            &cfgb,
+            total as u32,
+        ) {
+            cfgb.leak();
+            return Err(e);
+        }
+        cfgb.flush(0, buf_len);
+        let mut raw = alloc::vec![0u8; total];
+        cfgb.read_into(0, &mut raw[..total]);
+        class_int_in_endpoint(&raw, USB_CLASS_HUB).ok_or(DeviceError::NotSupported)
+    }
+
+    /// Arma el endpoint de cambio de estado de un hub ya configurado.
+    ///
+    /// Si falla, el hub se queda con el sondeo de [`Self::scan_hubs_if_due`]:
+    /// más lento, pero un hub mudo sería peor.
+    fn arm_hub_status_endpoint(&mut self, slot: u8, csz: usize, ports: u8) -> DeviceResult<()> {
+        let (ep_addr, mps, interval) = self.hub_status_endpoint(slot)?;
+        // El mapa de bits nunca pasa de 16 bytes (15 puertos + el bit del hub),
+        // pero se le deja el paquete entero del endpoint para que un hub que
+        // mande más no desborde a Babble.
+        let len = hub_change_bytes(ports).max(mps as usize).max(2);
+        let dci =
+            self.configure_endpoint(slot, csz, ep_addr, EP_TYPE_INT_IN, mps, interval, len, 16)?;
+        let buf = DmaBuf::new(len, 64)?;
+        // Evict the zeroing `DmaBuf::new` just did before the controller starts
+        // DMA-ing into it, igual que los búferes de informe HID.
+        buf.flush(0, len);
+        let phys = buf.sub_phys(0);
+        {
+            let ring = self
+                .xfer_rings
+                .get_mut(Self::ri(slot, dci))
+                .and_then(|o| o.as_mut())
+                .ok_or(DeviceError::NotSupported)?;
+            ring.push(trb_normal(phys, len as u16, true))?;
+        }
+        if let Some(h) = self.hubs.iter_mut().find(|h| h.slot == slot) {
+            h.ep_dci = dci;
+            h.change_len = len;
+            if let Some(old) = h.buf.replace(buf) {
+                old.leak();
+            }
+        } else {
+            buf.leak();
+            return Err(DeviceError::InvalidParam);
+        }
+        self.mmio.ring_db(slot, dci);
+        info!(
+            "[xhci] hub slot={}: cambios de puerto por el endpoint dci={} ({} bytes de mapa \
+             de bits, intervalo {})",
+            slot, dci, len, interval
+        );
+        Ok(())
+    }
+
+    /// Vuelve a armar el único TRB del endpoint de cambio de estado de un hub.
+    fn rearm_hub_status_trb(&mut self, slot: u8) {
+        let Some((dci, len, phys)) = self.hubs.iter().find(|h| h.slot == slot).and_then(|h| {
+            h.buf
+                .as_ref()
+                .map(|b| (h.ep_dci, h.change_len, b.sub_phys(0)))
+        }) else {
+            return;
+        };
+        if dci == 0 {
+            return;
+        }
+        let ridx = Self::ri(slot, dci);
+        if let Some(r) = self.xfer_rings.get_mut(ridx).and_then(|o| o.as_mut()) {
+            if r.push(trb_normal(phys, len as u16, true)).is_err() {
+                warn!(
+                    "[xhci] hub slot={}: el anillo del endpoint de estado está lleno; el \
+                     sondeo cubre los cambios",
+                    slot
+                );
+                return;
+            }
+        } else {
+            return;
+        }
+        fence(Ordering::SeqCst);
+        self.mmio.ring_db(slot, dci);
+    }
+
+    /// Atiende una Transfer Event del endpoint de cambio de estado de un hub:
+    /// apunta los puertos que el mapa de bits señala y vuelve a armar el TRB.
+    ///
+    /// Los puertos no se tocan aquí: esto corre dentro de `pop_ev` y enumerar
+    /// emite comandos que esperan en el anillo de eventos.
+    fn handle_hub_status_event(&mut self, slot: u8, ev: &Trb, cc: u32) -> bool {
+        let Some((dci, len)) = self
+            .hubs
+            .iter()
+            .find(|h| h.slot == slot)
+            .map(|h| (h.ep_dci, h.change_len))
+        else {
+            return false;
+        };
+        let ridx = Self::ri(slot, dci);
+        if let Some(r) = self.xfer_rings.get_mut(ridx).and_then(|o| o.as_mut()) {
+            r.advance_dequeue(1);
+        }
+        if cc != TRB_CC_SUCCESS && cc != TRB_CC_SHORT {
+            if cc_halts_endpoint(cc) {
+                let stalled = cc == 6;
+                if let Some(e) = self
+                    .pending_ep_resets
+                    .iter_mut()
+                    .find(|(sl, d, _)| *sl == slot && *d == dci)
+                {
+                    e.2 |= stalled;
+                } else {
+                    self.pending_ep_resets.push((slot, dci, stalled));
+                }
+            } else {
+                warn!(
+                    "[xhci] hub slot={} dci={} estado cc={} (el endpoint no está halted)",
+                    slot, dci, cc
+                );
+            }
+            self.rearm_hub_status_trb(slot);
+            // Un barrido cubre lo que ese informe perdido traía.
+            if let Some(h) = self.hubs.iter_mut().find(|h| h.slot == slot) {
+                h.scan_due = true;
+            }
+            return true;
+        }
+        // Residual en los 24 bits bajos: lo que NO se transfirió (§6.4.2.1).
+        let actual = len.saturating_sub((ev.status & 0x00ff_ffff) as usize);
+        let mut bitmap = [0u8; 16];
+        let n = actual.min(bitmap.len());
+        let ports = self
+            .hubs
+            .iter()
+            .find(|h| h.slot == slot)
+            .map(|h| h.ports)
+            .unwrap_or(0);
+        if let Some(buf) = self
+            .hubs
+            .iter()
+            .find(|h| h.slot == slot)
+            .and_then(|h| h.buf.as_ref())
+        {
+            // Invalidar para ver lo que el controlador acaba de escribir.
+            buf.flush(0, len);
+            buf.read_into(0, &mut bitmap[..n]);
+        }
+        for port in hub_changed_ports(&bitmap[..n], ports) {
+            if !self.pending_hub_ports.contains(&(slot, port)) {
+                self.pending_hub_ports.push((slot, port));
+            }
+        }
+        self.rearm_hub_status_trb(slot);
+        true
+    }
+
+    /// Atiende los puertos que los endpoints de estado han señalado.
+    fn drain_pending_hub_ports(&mut self) {
+        for _ in 0..64 {
+            let Some((slot, port)) = self.pending_hub_ports.first().copied() else {
+                return;
+            };
+            self.pending_hub_ports.remove(0);
+            if let Err(e) = self.try_hub_port(slot, port) {
+                warn!(
+                    "[xhci] hub slot={} puerto {}: el cambio señalado no se pudo atender ({:?})",
+                    slot, port, e
+                );
+            }
+        }
+    }
+
+    /// Una transferencia bulk, de principio a fin, y los bytes que movio.
+    ///
+    /// Sincrona: empuja un Normal TRB, toca la campana y espera su Transfer
+    /// Event. Es la misma forma que `wait_ep0_status_any` y por la misma razon
+    /// --hay que atender el anillo de eventos mientras se espera, porque por el
+    /// pasan tambien los informes de los teclados-- asi que no puede correr
+    /// anidada dentro de `pop_ev`.
+    fn bulk_transfer(&mut self, slot: u8, dci: u8, buf_phys: u64, len: u32) -> DeviceResult<u32> {
+        let ridx = Self::ri(slot, dci);
+        let trb_phys = {
+            let ring = self
+                .xfer_rings
+                .get_mut(ridx)
+                .and_then(|o| o.as_mut())
+                .ok_or(DeviceError::NotSupported)?;
+            // Una transferencia bulk puede ser de longitud cero: un CBW sin
+            // fase de datos no lleva TRB de datos, pero el CSW si.
+            ring.push(trb_normal(buf_phys, len as u16, true))?
+        };
+        if let Some(r) = self.xfer_rings.get(ridx).and_then(|o| o.as_ref()) {
+            r.buf.flush(0, r.buf.len);
+        }
+        fence(Ordering::SeqCst);
+        self.mmio.ring_db(slot, dci);
+
+        let start = timer_now_us();
+        let mut spins = 0u64;
+        while !xhci_wait_expired(start, BULK_TIMEOUT_US, spins) {
+            if let Some(ev) = self.pop_ev(None) {
+                if (ev.ctrl >> 10) & 0x3f == 32
+                    && ((ev.ctrl >> 24) & 0xff) as u8 == slot
+                    && ((ev.ctrl >> 16) & 0x1f) as u8 == dci
+                    // VirtualBox apunta a veces al TRB SIGUIENTE al completado,
+                    // igual que en EP0.
+                    && (ev.p == trb_phys || ev.p == trb_phys.wrapping_add(16))
+                {
+                    if let Some(r) = self.xfer_rings.get_mut(ridx).and_then(|o| o.as_mut()) {
+                        r.advance_dequeue(1);
+                    }
+                    let cc = (ev.status >> 24) & 0xff;
+                    if cc == TRB_CC_SUCCESS || cc == TRB_CC_SHORT {
+                        // Residual en los 24 bits bajos: lo que NO se movio.
+                        return Ok(len.saturating_sub(ev.status & 0x00ff_ffff));
+                    }
+                    // Un STALL en un endpoint bulk es como el dispositivo dice
+                    // «esa orden no» (USB MSC BOT §6.7.2): se le quita el halt
+                    // y se sigue, que es lo que espera el CSW de despues.
+                    if cc == 6 {
+                        let _ = self.clear_endpoint_halt(slot, dci);
+                    }
+                    let _ = self.reset_endpoint_and_dequeue(slot, dci);
+                    warn!("[xhci] bulk slot={} dci={} cc={}", slot, dci, cc);
+                    return Err(DeviceError::IoError);
+                }
+            }
+            spins = spins.saturating_add(1);
+            spin_loop();
+        }
+        // Igual que en EP0: adelantar el dequeue del software por encima del TD
+        // que nunca completo, o el siguiente timbre lo repite y su respuesta
+        // tardia satisface la espera de la orden de despues.
+        if let Some(r) = self.xfer_rings.get_mut(ridx).and_then(|o| o.as_mut()) {
+            r.advance_dequeue(1);
+        }
+        let _ = self.reset_endpoint_and_dequeue(slot, dci);
+        warn!("[xhci] bulk slot={} dci={} timeout", slot, dci);
+        Err(DeviceError::IoError)
+    }
+
+    /// Una orden SCSI completa sobre Bulk-Only Transport: CBW, fase de datos y
+    /// CSW. Devuelve los bytes de datos que llegaron.
+    ///
+    /// `Err` cuando el transporte fallo; `Ok` con el `status` del CSW distinto
+    /// de cero cuando la orden llego y la unidad la rechazo, que son dos cosas
+    /// muy distintas y mezclarlas convierte «no hay tarjeta metida» en «el
+    /// dispositivo no funciona».
+    fn msc_command(
+        &mut self,
+        idx: usize,
+        cmd: &[u8],
+        data: Option<(&DmaBuf, u32, bool)>,
+    ) -> DeviceResult<(u32, u8)> {
+        let (slot, dci_in, dci_out, tag) = {
+            let m = self.mscs.get_mut(idx).ok_or(DeviceError::InvalidParam)?;
+            let tag = m.next_tag;
+            m.next_tag = m.next_tag.wrapping_add(1);
+            (m.slot, m.dci_in, m.dci_out, tag)
+        };
+        let (data_len, dir_in) = data.map(|(_, l, i)| (l, i)).unwrap_or((0, false));
+        let cbw = bot_cbw(tag, data_len, dir_in, 0, cmd).ok_or(DeviceError::InvalidParam)?;
+
+        let wrap = DmaBuf::new(64, 64)?;
+        for (i, b) in cbw.iter().enumerate() {
+            // `DmaBuf` escribe en dwords; el CBW no esta alineado a cuatro.
+            let off = i & !3;
+            let mut w = wrap.read_u32(off).to_le_bytes();
+            w[i & 3] = *b;
+            wrap.write_u32(off, u32::from_le_bytes(w));
+        }
+        wrap.flush(0, 64);
+        if self
+            .bulk_transfer(slot, dci_out, wrap.sub_phys(0), BOT_CBW_LEN as u32)
+            .is_err()
+        {
+            wrap.leak();
+            return Err(DeviceError::IoError);
+        }
+
+        let mut moved = 0u32;
+        if let Some((buf, len, is_in)) = data {
+            if len > 0 {
+                let dci = if is_in { dci_in } else { dci_out };
+                if !is_in {
+                    buf.flush(0, len as usize);
+                }
+                // Un STALL aqui no es el fin: la unidad puede haber decidido
+                // mandar menos de lo pedido y el CSW de despues lo explica.
+                moved = self
+                    .bulk_transfer(slot, dci, buf.sub_phys(0), len)
+                    .unwrap_or(0);
+                if is_in {
+                    buf.flush(0, len as usize);
+                }
+            }
+        }
+
+        wrap.flush(0, 64);
+        if self
+            .bulk_transfer(slot, dci_in, wrap.sub_phys(0), BOT_CSW_LEN as u32)
+            .is_err()
+        {
+            wrap.leak();
+            return Err(DeviceError::IoError);
+        }
+        wrap.flush(0, 64);
+        let mut raw = [0u8; BOT_CSW_LEN];
+        wrap.read_into(0, &mut raw);
+        let Some(csw) = bot_parse_csw(&raw, tag) else {
+            warn!(
+                "[xhci] msc slot={} CSW invalido o de otra orden (tag esperado {}): {:?}",
+                slot, tag, raw
+            );
+            return Err(DeviceError::IoError);
+        };
+        Ok((moved, csw.status))
+    }
+
+    /// Prepara una interfaz de almacenamiento masivo y le pregunta quien es.
+    ///
+    /// No la registra como disco: eso necesita una via para dar de alta un
+    /// dispositivo de bloque en caliente, que hoy no existe. Lo que si hace es
+    /// contestar la pregunta de si el sistema ve la unidad, con su nombre y su
+    /// capacidad, en `/proc/usbhid`.
+    fn setup_mass_storage(
+        &mut self,
+        slot: u8,
+        csz: usize,
+        iface: u8,
+        subclass: u8,
+        proto: u8,
+        cfg_desc: &[u8],
+    ) -> DeviceResult<()> {
+        if proto != MSC_PROTO_BULK_ONLY {
+            warn!(
+                "[xhci] msc slot={} iface={}: bInterfaceProtocol={:#04x} no es Bulk-Only",
+                slot, iface, proto
+            );
+            return Err(DeviceError::NotSupported);
+        }
+        let (ep_in, ep_out) = iface_bulk_endpoints(cfg_desc, iface).ok_or_else(|| {
+            warn!(
+                "[xhci] msc slot={} iface={}: no declara una pareja de endpoints bulk",
+                slot, iface
+            );
+            DeviceError::NotSupported
+        })?;
+        // Un TD de una pagina cubre el CBW, el CSW y un INQUIRY de sobra.
+        let dci_in = self.configure_endpoint(
+            slot,
+            csz,
+            ep_in.0,
+            EP_TYPE_BULK_IN,
+            ep_in.1,
+            0,
+            MAX_HID_TD,
+            64,
+        )?;
+        let dci_out = self.configure_endpoint(
+            slot,
+            csz,
+            ep_out.0,
+            EP_TYPE_BULK_OUT,
+            ep_out.1,
+            0,
+            MAX_HID_TD,
+            64,
+        )?;
+        // GET_MAX_LUN es opcional: un STALL significa una sola unidad logica.
+        let max_lun = self.msc_max_lun(slot, iface).unwrap_or(0);
+        self.mscs.retain(|m| !(m.slot == slot && m.iface == iface));
+        self.mscs.push(MscDev {
+            slot,
+            iface,
+            dci_in,
+            dci_out,
+            max_lun,
+            inquiry: ScsiInquiry::default(),
+            capacity: None,
+            next_tag: 1,
+        });
+        let idx = self.mscs.len() - 1;
+        if subclass != MSC_SUBCLASS_SCSI {
+            // RBC, MMC y UFI hablan otro conjunto de ordenes. Queda apuntada
+            // para que se vea en `/proc/usbhid`, pero no se le pregunta nada.
+            warn!(
+                "[xhci] msc slot={} iface={}: bInterfaceSubClass={:#04x} no es SCSI \
+                 transparente; no se le preguntan ordenes",
+                slot, iface, subclass
+            );
+            return Ok(());
+        }
+        self.msc_identify(idx);
+        Ok(())
+    }
+
+    /// `GET_MAX_LUN`: peticion de clase a la interfaz, un byte de respuesta.
+    fn msc_max_lun(&mut self, slot: u8, iface: u8) -> DeviceResult<u8> {
+        let buf = DmaBuf::new(64, 64)?;
+        buf.flush(0, 64);
+        if let Err(e) = self.ep0_control_in(
+            slot,
+            trb_setup(0xa1, MSC_REQ_GET_MAX_LUN, 0, iface as u16, 1, 3),
+            &buf,
+            1,
+        ) {
+            buf.leak();
+            return Err(e);
+        }
+        buf.flush(0, 64);
+        let mut raw = [0u8; 1];
+        buf.read_into(0, &mut raw);
+        // El campo son 4 bits: un dispositivo que devuelve basura no puede
+        // reclamar dieciseis unidades logicas.
+        Ok(raw[0] & 0x0f)
+    }
+
+    /// TEST UNIT READY hasta que conteste, luego INQUIRY y READ CAPACITY.
+    fn msc_identify(&mut self, idx: usize) {
+        // Por indice y no por referencia porque cada orden pide `&mut self`.
+        // Se comprueba en cada vuelta: perder la unidad a media identificacion
+        // es un desenchufe, no un panico.
+        let Some(slot) = self.mscs.get(idx).map(|m| m.slot) else {
+            return;
+        };
+        let mut ready = false;
+        for attempt in 0..MSC_READY_ATTEMPTS {
+            match self.msc_command(idx, &[SCSI_TEST_UNIT_READY, 0, 0, 0, 0, 0], None) {
+                Ok((_, 0)) => {
+                    ready = true;
+                    break;
+                }
+                Ok((_, st)) => {
+                    // La unidad contesta «no lista» mientras arranca. Pedirle
+                    // el sentido es lo que limpia su condicion de atencion; sin
+                    // eso, algunas repiten el mismo fallo para siempre.
+                    let sense = DmaBuf::new(64, 64).ok();
+                    if let Some(sb) = sense {
+                        let _ = self.msc_command(
+                            idx,
+                            &[SCSI_REQUEST_SENSE, 0, 0, 0, 18, 0],
+                            Some((&sb, 18, true)),
+                        );
+                    }
+                    if attempt + 1 == MSC_READY_ATTEMPTS {
+                        warn!(
+                            "[xhci] msc slot={}: no lista tras {} intentos (CSW status {})",
+                            slot, MSC_READY_ATTEMPTS, st
+                        );
+                    }
+                    xhci_spin_delay_us(MSC_READY_WAIT_US);
+                }
+                Err(e) => {
+                    warn!("[xhci] msc slot={}: TEST UNIT READY fallo ({:?})", slot, e);
+                    return;
+                }
+            }
+        }
+
+        let Ok(buf) = DmaBuf::new(256, 64) else {
+            return;
+        };
+        buf.flush(0, 256);
+        match self.msc_command(idx, &[SCSI_INQUIRY, 0, 0, 0, 36, 0], Some((&buf, 36, true))) {
+            Ok((_, 0)) => {
+                let mut raw = [0u8; 36];
+                buf.read_into(0, &mut raw);
+                if let (Some(inq), Some(m)) = (scsi_parse_inquiry(&raw), self.mscs.get_mut(idx)) {
+                    m.inquiry = inq;
+                    let luns = m.max_lun as u16 + 1;
+                    info!(
+                        "[xhci] msc slot={}: {} {} {} (tipo {:#04x}, {}extraible, {} LUN)",
+                        slot,
+                        scsi_text(&inq.vendor),
+                        scsi_text(&inq.product),
+                        scsi_text(&inq.revision),
+                        inq.dev_type,
+                        if inq.removable { "" } else { "no " },
+                        luns,
+                    );
+                }
+            }
+            other => {
+                warn!(
+                    "[xhci] msc slot={}: INQUIRY no contesto ({:?})",
+                    slot, other
+                );
+                return;
+            }
+        }
+        if !ready {
+            // Sin medio dentro no hay capacidad que leer, y preguntarla solo
+            // suma un fallo mas al log.
+            return;
+        }
+        buf.flush(0, 256);
+        if let Ok((_, 0)) = self.msc_command(
+            idx,
+            &[SCSI_READ_CAPACITY_10, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            Some((&buf, 8, true)),
+        ) {
+            let mut raw = [0u8; 8];
+            buf.read_into(0, &mut raw);
+            let cap = scsi_parse_capacity10(&raw);
+            if let Some(c) = cap {
+                if c.needs_16 {
+                    buf.flush(0, 256);
+                    let cdb = [
+                        SCSI_SERVICE_ACTION_IN_16,
+                        SCSI_SAI_READ_CAPACITY_16,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        32,
+                        0,
+                        0,
+                    ];
+                    if let Ok((_, 0)) = self.msc_command(idx, &cdb, Some((&buf, 32, true))) {
+                        let mut raw16 = [0u8; 32];
+                        buf.read_into(0, &mut raw16);
+                        let parsed = scsi_parse_capacity16(&raw16);
+                        if let Some(m) = self.mscs.get_mut(idx) {
+                            m.capacity = parsed;
+                        }
+                    }
+                } else if let Some(m) = self.mscs.get_mut(idx) {
+                    m.capacity = Some(c);
+                }
+            }
+            if let Some(c) = self.mscs.get(idx).and_then(|m| m.capacity) {
+                info!(
+                    "[xhci] msc slot={}: {} sectores de 512 B ({} bloques de {} B)",
+                    slot,
+                    scsi_sectors_512(&c),
+                    c.last_lba.saturating_add(1),
+                    c.block_size
+                );
+            }
+        }
+    }
+
+    /// Barre los puertos de los hubs conocidos buscando enchufes y
+    /// desenchufes.
+    ///
+    /// Un hub avisa de esos cambios por su endpoint de interrupción de cambio
+    /// de estado, que este driver todavía no arma, así que se sondean los
+    /// puertos: a [`HUB_SCAN_PERIOD_US`], porque cada puerto cuesta una
+    /// transferencia de control.
+    fn scan_hubs_if_due(&mut self) {
+        if self.hubs.is_empty() {
+            return;
+        }
+        let now = timer_now_us();
+        let due: Vec<(u8, u8)> = self
+            .hubs
+            .iter()
+            .filter(|h| {
+                h.scan_due
+                    || now.wrapping_sub(h.scan_last_us)
+                        >= if h.ep_dci != 0 {
+                            HUB_BACKSTOP_PERIOD_US
+                        } else {
+                            HUB_SCAN_PERIOD_US
+                        }
+            })
+            .map(|h| (h.slot, h.ports))
+            .collect();
+        for (slot, ports) in due {
+            if let Some(h) = self.hubs.iter_mut().find(|h| h.slot == slot) {
+                h.scan_last_us = now;
+                h.scan_due = false;
+            }
+            if self
+                .slot_topo
+                .get(slot as usize)
+                .copied()
+                .flatten()
+                .is_none()
+            {
+                continue;
+            }
+            for p in 1..=ports {
+                if let Err(e) = self.try_hub_port(slot, p) {
+                    // Si el hub deja de contestar, insistir en los puertos que
+                    // quedan solo multiplica el coste del fallo.
+                    warn!(
+                        "[xhci] hub slot={} puerto {}: el sondeo falló ({:?}), se deja el \
+                         resto del hub para la próxima vuelta",
+                        slot, p, e
+                    );
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Libera `slot` y todo lo que esté enchufado detrás, de lo más profundo a
+    /// lo más superficial: un hub que se va se lleva su subárbol, y el
+    /// controlador no puede quedarse con un Disable Slot hecho sobre un padre
+    /// al que sus hijos todavía nombran como su TT.
+    fn cleanup_slot_tree(&mut self, slot: u8) -> DeviceResult<()> {
+        let mut order = alloc::vec![slot];
+        let mut i = 0;
+        while i < order.len() {
+            let parent = order[i];
+            for s in 1..=self.max_slots {
+                if !order.contains(&s)
+                    && self
+                        .slot_topo
+                        .get(s as usize)
+                        .copied()
+                        .flatten()
+                        .is_some_and(|t| t.parent_slot == parent)
+                {
+                    order.push(s);
+                }
+            }
+            i += 1;
+        }
+        for s in order.into_iter().rev() {
+            self.free_slot(s)?;
+        }
         Ok(())
     }
 
@@ -3285,6 +4992,17 @@ impl XhciInner {
             "[xhci] Configuration Descriptor slot={} bytes: {:?}",
             slot, raw
         );
+        // Apuntar TODA interfaz, no solo las que este driver sabe usar: un
+        // dispositivo cuya única interfaz es de una clase que no manejamos es
+        // exactamente el caso que había que poder ver desde fuera.
+        {
+            let (ifaces, dropped) = config_interfaces(&raw);
+            if let Some(d) = self.devs.iter_mut().find(|d| d.slot == slot) {
+                d.ifaces = ifaces;
+                d.ifaces_dropped = dropped;
+            }
+        }
+
         let config_val = raw.get(5).copied().unwrap_or(1).max(1);
 
         // SET_CONFIGURATION
@@ -3293,6 +5011,22 @@ impl XhciInner {
             trb_setup(0x00, 0x09, config_val as u16, 0, 0, 0),
             true,
         );
+
+        // Las interfaces de almacenamiento masivo se preparan antes de recorrer
+        // los endpoints HID: `setup_mass_storage` emite su propio Configure
+        // Endpoint y ordenes SCSI, y entrelazarlo con el recorrido de abajo
+        // dejaria el descriptor a medio leer entre comando y comando.
+        for i in config_interfaces(&raw).0 {
+            if i.class == USB_CLASS_MASS_STORAGE {
+                if let Err(e) = self.setup_mass_storage(slot, csz, i.num, i.subclass, i.proto, &raw)
+                {
+                    warn!(
+                        "[xhci] slot={} iface={}: almacenamiento masivo no preparado ({:?})",
+                        slot, i.num, e
+                    );
+                }
+            }
+        }
 
         let mut o = 0usize;
         let mut cur_iface: Option<(u8, u8, u8, u16)> = None; // num, proto, subclass, report_desc_len
@@ -3466,6 +5200,103 @@ impl XhciInner {
         Some(class)
     }
 
+    /// Configura un endpoint del dispositivo `slot` y le deja su anillo de
+    /// transferencia montado y vacío. Devuelve el DCI.
+    ///
+    /// Lo usan las interfaces HID, el endpoint de cambio de estado de un hub y
+    /// los endpoints bulk de un dispositivo de almacenamiento: la parte
+    /// delicada --copiar el Slot Context entero cuando A0=1, subir Context
+    /// Entries, el intervalo y el Max ESIT Payload-- es la misma y tener
+    /// varias copias de ella es como se rompe una.
+    fn configure_endpoint(
+        &mut self,
+        slot: u8,
+        csz: usize,
+        ep_addr: u8,
+        ep_type: u32,
+        mps: u16,
+        interval: u8,
+        avg_trb_len: usize,
+        ring_trbs: usize,
+    ) -> DeviceResult<u8> {
+        let dci = dci_from_ep_addr(ep_addr).ok_or(DeviceError::InvalidParam)? as usize;
+
+        let cfg = DmaBuf::new(33 * csz, 64)?;
+        // Input Control Context: add Slot (A0) and the new endpoint (A_dci)
+        cfg.write_u32(4, 0x01 | (1u32 << dci));
+
+        // Copy the current Device Slot Context (at device-context offset 0) into the Input
+        // Slot Context (at input-context offset csz).  The xHCI spec requires software to
+        // supply a complete, valid Slot Context whenever A0=1 in a Configure Endpoint
+        // command – writing zeros would corrupt the USB device address and port fields.
+        if let Some(dev) = self.dev_ctx.get(slot as usize).and_then(|o| o.as_ref()) {
+            dev.flush(0, csz); // Invalidate cache lines so we read the fresh Device Context updated by the controller
+            for i in 0..(csz / 4) {
+                cfg.write_u32(csz + i * 4, dev.read_u32(i * 4));
+            }
+        }
+        // Raise Context Entries to cover the new endpoint DCI.
+        let slot_dw0 = cfg.read_u32(csz);
+        let cur_entries = (slot_dw0 >> 27) & 0x1f;
+        let new_entries = (dci as u32).max(cur_entries);
+        cfg.write_u32(csz, (slot_dw0 & !(0x1f << 27)) | (new_entries << 27));
+
+        let ep_off = csz + csz + (dci - 1) * csz;
+
+        // Endpoint Context DW0. Interval is bits 23:16 (xHCI 1.2 table 6-9);
+        // bits 31:24 are Max ESIT Payload Hi, RsvdZ unless LEC=1. Un endpoint
+        // bulk no tiene intervalo: el campo es RsvdZ para él (§6.2.3.6), y
+        // meterle el exponente de un endpoint de interrupción es un Parameter
+        // Error en los controladores estrictos.
+        let speed = self.slot_speed[slot as usize];
+        let bulk = ep_type == EP_TYPE_BULK_IN || ep_type == EP_TYPE_BULK_OUT;
+        cfg.write_u32(
+            ep_off,
+            if bulk {
+                0
+            } else {
+                xhci_endpoint_interval(speed, interval) << 16
+            },
+        );
+
+        // Endpoint Context DW1: Error Count field (bits 2:1) = 3 (value 3 << 1 = 0b110),
+        // EP Type, Max Packet Size.  Error Count = 3 allows up to 3 retries after failure.
+        let ep_ty = (3u32 << 1) | ep_type | ((mps as u32) << 16);
+        cfg.write_u32(ep_off + 4, ep_ty);
+        let ir = XferRing::new(ring_trbs)?;
+        let irp = ir.ring_phys() | 1; // DCS = 1
+        cfg.write_u64(ep_off + 8, irp);
+        // Endpoint Context DW4: Max ESIT Payload Lo (bits 31:16) and Average
+        // TRB Length (bits 15:0). DW4 exists for 32-byte contexts too (CSZ only
+        // changes the stride), and an interrupt endpoint's Max ESIT Payload is
+        // its max packet size; it used to be left at 0, which stricter xHCs
+        // may reject with Parameter Error or use to under-reserve bandwidth.
+        // Un endpoint bulk no reserva ancho de banda, así que su Max ESIT
+        // Payload es 0 y solo lleva la longitud media de TRB.
+        cfg.write_u32(
+            ep_off + 16,
+            (if bulk { 0 } else { (mps as u32) << 16 }) | ((avg_trb_len as u32) & 0xffff),
+        );
+        let ridx = Self::ri(slot, dci as u8);
+        if let Some(old) = self.xfer_rings[ridx].replace(ir) {
+            old.leak();
+        }
+
+        // Flush before the doorbell, not after: the controller reads the input
+        // context by DMA the moment the command ring is rung.
+        cfg.flush(0, 33 * csz);
+        let p = self
+            .cmd
+            .push(trb_configure_endpoint(cfg.sub_phys(0), slot))?;
+        self.mmio.ring_db(0, 0);
+        if let Err(e) = self.wait_cmd_phys(p) {
+            cfg.leak();
+            return Err(e);
+        }
+
+        Ok(dci as u8)
+    }
+
     fn init_single_hid(
         &mut self,
         slot: u8,
@@ -3568,71 +5399,17 @@ impl XhciInner {
             true,
         );
 
-        let epn = ep_addr & 0x0f;
-        let dci = (epn * 2 + 1) as usize;
-        if dci >= 32 {
-            return Err(DeviceError::InvalidParam);
-        }
-
-        let cfg = DmaBuf::new(33 * csz, 64)?;
-        // Input Control Context: add Slot (A0) and the new endpoint (A_dci)
-        cfg.write_u32(4, 0x01 | (1u32 << dci));
-
-        // Copy the current Device Slot Context (at device-context offset 0) into the Input
-        // Slot Context (at input-context offset csz).  The xHCI spec requires software to
-        // supply a complete, valid Slot Context whenever A0=1 in a Configure Endpoint
-        // command – writing zeros would corrupt the USB device address and port fields.
-        if let Some(dev) = self.dev_ctx.get(slot as usize).and_then(|o| o.as_ref()) {
-            dev.flush(0, csz); // Invalidate cache lines so we read the fresh Device Context updated by the controller
-            for i in 0..(csz / 4) {
-                cfg.write_u32(csz + i * 4, dev.read_u32(i * 4));
-            }
-        }
-        // Raise Context Entries to cover the new endpoint DCI.
-        let slot_dw0 = cfg.read_u32(csz);
-        let cur_entries = (slot_dw0 >> 27) & 0x1f;
-        let new_entries = (dci as u32).max(cur_entries);
-        cfg.write_u32(csz, (slot_dw0 & !(0x1f << 27)) | (new_entries << 27));
-
-        let ep_off = csz + csz + (dci - 1) * csz;
-
-        // Endpoint Context DW0. Interval is bits 23:16 (xHCI 1.2 table 6-9);
-        // bits 31:24 are Max ESIT Payload Hi, RsvdZ unless LEC=1.
-        let speed = self.slot_speed[slot as usize];
-        cfg.write_u32(ep_off, xhci_endpoint_interval(speed, interval) << 16);
-
-        // Endpoint Context DW1: Error Count field (bits 2:1) = 3 (value 3 << 1 = 0b110),
-        // EP Type, Max Packet Size.  Error Count = 3 allows up to 3 retries after failure.
-        let ep_ty = (3u32 << 1) | EP_TYPE_INT_IN | ((mps as u32) << 16);
-        cfg.write_u32(ep_off + 4, ep_ty);
-        let ir = XferRing::new(64)?;
-        let irp = ir.ring_phys() | 1; // DCS = 1
-        cfg.write_u64(ep_off + 8, irp);
-        // Endpoint Context DW4: Max ESIT Payload Lo (bits 31:16) and Average
-        // TRB Length (bits 15:0). DW4 exists for 32-byte contexts too (CSZ only
-        // changes the stride), and an interrupt endpoint's Max ESIT Payload is
-        // its max packet size; it used to be left at 0, which stricter xHCs
-        // may reject with Parameter Error or use to under-reserve bandwidth.
-        cfg.write_u32(
-            ep_off + 16,
-            ((mps as u32) << 16) | ((report_len as u32) & 0xffff),
-        );
+        let dci = self.configure_endpoint(
+            slot,
+            csz,
+            ep_addr,
+            EP_TYPE_INT_IN,
+            mps,
+            interval,
+            report_len,
+            64,
+        )? as usize;
         let ridx = Self::ri(slot, dci as u8);
-        if let Some(old) = self.xfer_rings[ridx].replace(ir) {
-            old.leak();
-        }
-
-        // Flush before the doorbell, not after: the controller reads the input
-        // context by DMA the moment the command ring is rung.
-        cfg.flush(0, 33 * csz);
-        let p = self
-            .cmd
-            .push(trb_configure_endpoint(cfg.sub_phys(0), slot))?;
-        self.mmio.ring_db(0, 0);
-        if let Err(e) = self.wait_cmd_phys(p) {
-            cfg.leak();
-            return Err(e);
-        }
 
         // Allocate one report buffer per pre-queued TRB so the controller can
         // race ahead by HID_QUEUE_DEPTH transfers without overwriting a buffer
@@ -4102,6 +5879,8 @@ impl XhciInner {
         }
         if may_enumerate {
             self.drain_pending_port_changes();
+            self.drain_pending_hub_ports();
+            self.scan_hubs_if_due();
         }
         // Recover any HID endpoint that stalled during the drain above.
         self.drain_pending_ep_resets();
@@ -4134,16 +5913,26 @@ impl XhciInner {
             // The replacement TRBs went onto the ring as each failure was
             // handled, so there is nothing to re-arm here: the endpoint only
             // needs its doorbell rung to start consuming them again.
-            if let Some(idx) = self
+            if self
                 .hids
                 .iter()
-                .position(|h| h.slot_id == slot && h.ep_dci == dci)
+                .any(|h| h.slot_id == slot && h.ep_dci == dci)
             {
-                let _ = idx;
                 fence(Ordering::SeqCst);
                 self.mmio.ring_db(slot, dci);
                 warn!(
                     "[xhci] recovered HID endpoint slot={} dci={} after a transfer error",
+                    slot, dci
+                );
+            } else if self.hubs.iter().any(|h| h.slot == slot && h.ep_dci == dci) {
+                // El TRB de repuesto de un hub se empuja en
+                // `handle_hub_status_event`, pero un Reset Endpoint deja la
+                // campana sin tocar: sin esto, el hub se queda mudo y solo el
+                // sondeo lo cubre.
+                fence(Ordering::SeqCst);
+                self.mmio.ring_db(slot, dci);
+                warn!(
+                    "[xhci] recovered hub status endpoint slot={} dci={} after a transfer error",
                     slot, dci
                 );
             }
@@ -4248,7 +6037,7 @@ impl XhciInner {
         // the port in either case rather than deciding from the stale sample.
         let now = self.mmio.read_op(off);
         let ccs_now = (now & 1) != 0;
-        let has_slot = (1..=self.max_slots).any(|s| self.slot_port[s as usize] == port_id);
+        let has_slot = self.slot_on_root_port(port_id).is_some();
         let fails = self
             .port_enum_fails
             .get_mut(port_id as usize)
@@ -4281,19 +6070,45 @@ impl XhciInner {
         Ok(())
     }
 
+    /// Libera todo lo que cuelga del puerto raíz `port_id`.
+    ///
+    /// No es un solo slot: si en ese puerto había un hub, sus dispositivos
+    /// también se han ido, y el antiguo código solo liberaba el primer slot que
+    /// encontraba. Se va de lo más profundo a lo más superficial.
     fn cleanup_port(&mut self, port_id: u8) -> DeviceResult<()> {
-        let mut found_slot = None;
-        for s in 1..=self.max_slots {
-            if self.slot_port[s as usize] == port_id {
-                found_slot = Some(s);
-                break;
-            }
+        let mut victims: Vec<(u8, u8)> = (1..=self.max_slots)
+            .filter_map(|s| {
+                self.slot_topo
+                    .get(s as usize)
+                    .copied()
+                    .flatten()
+                    .filter(|t| t.root_port == port_id)
+                    .map(|t| (t.depth, s))
+            })
+            .collect();
+        victims.sort_unstable_by_key(|&(depth, _)| core::cmp::Reverse(depth));
+        for (_, slot) in victims {
+            self.free_slot(slot)?;
         }
-        if let Some(slot) = found_slot {
-            info!(
-                "[xhci] desconexión en puerto {}, liberando slot {}",
-                port_id, slot
-            );
+        Ok(())
+    }
+
+    /// Deshace un slot: para sus endpoints, lo saca del DCBAA, lo deshabilita y
+    /// devuelve (o abandona, si el Disable Slot falló) sus contextos y anillos.
+    ///
+    /// No toca a los hijos: eso lo hace [`Self::cleanup_slot_tree`].
+    fn free_slot(&mut self, slot: u8) -> DeviceResult<()> {
+        if self
+            .slot_topo
+            .get(slot as usize)
+            .copied()
+            .flatten()
+            .is_none()
+        {
+            return Ok(());
+        }
+        {
+            info!("[xhci] liberando el slot {}", slot);
             // Stop every endpoint this slot still has a ring for, so the
             // controller is no longer walking those TRBs. Best effort: the
             // device is already gone, and a Stop Endpoint on an endpoint that
@@ -4328,8 +6143,23 @@ impl XhciInner {
                     dev.leak();
                 }
             }
-            self.slot_port[slot as usize] = 0;
+            self.slot_topo[slot as usize] = None;
             self.slot_speed[slot as usize] = 0;
+            if let Some(pos) = self.hubs.iter().position(|h| h.slot == slot) {
+                let hub = self.hubs.remove(pos);
+                // El controlador ya no mira este búfer si el Disable Slot pasó;
+                // si no, se abandona como el resto de la DMA del slot.
+                if let Some(b) = hub.buf {
+                    if disabled {
+                        drop(b);
+                    } else {
+                        b.leak();
+                    }
+                }
+            }
+            self.pending_hub_ports.retain(|&(s, _)| s != slot);
+            self.devs.retain(|d| d.slot != slot);
+            self.mscs.retain(|m| m.slot != slot);
             for ep in 1..32 {
                 let ri = Self::ri(slot, ep);
                 if ri < self.xfer_rings.len() {
@@ -4983,6 +6813,115 @@ impl InputScheme for XhciUsbHid {
             let _ = writeln!(s, "[usbhid] controller not initialised");
             return s;
         };
+        if xi.devs.is_empty() {
+            let _ = writeln!(s, "[usbhid] no USB devices enumerated");
+        }
+        for d in xi.devs.iter() {
+            // Un dispositivo sin driver sale igual que uno con driver: a la
+            // pregunta de si el sistema lo ve, esta linea es la respuesta.
+            let _ = write!(
+                s,
+                "[usbhid] dev slot={} {:04x}:{:04x} class={:#04x}/{:#04x}/{:#04x} ({}) \
+                 speed={} root_port={} route={:#x} tier={} ifaces=[",
+                d.slot,
+                d.vid,
+                d.pid,
+                d.class,
+                d.subclass,
+                d.proto,
+                usb_class_name(d.class),
+                d.speed,
+                d.topo.root_port,
+                d.topo.route,
+                d.topo.depth,
+            );
+            for (n, i) in d.ifaces.iter().enumerate() {
+                let _ = write!(
+                    s,
+                    "{}{}:{:#04x}/{:#04x}/{:#04x}({})",
+                    if n == 0 { "" } else { " " },
+                    i.num,
+                    i.class,
+                    i.subclass,
+                    i.proto,
+                    usb_class_name(i.class),
+                );
+            }
+            if d.ifaces_dropped != 0 {
+                let _ = write!(s, " +{} mas", d.ifaces_dropped);
+            }
+            let _ = writeln!(
+                s,
+                "] bound={}",
+                xi.hids.iter().filter(|h| h.slot_id == d.slot).count()
+            );
+        }
+        for m in xi.mscs.iter() {
+            // La linea que contesta «si, el sistema ve tu pendrive», con su
+            // nombre y su tamano. `cap=none` es una unidad que hablo pero no
+            // tiene medio dentro, que es distinto de no estar.
+            let _ = write!(
+                s,
+                "[usbhid] msc slot={} iface={} bulk_in={} bulk_out={} luns={} \
+                 \"{} {} {}\" type={:#04x} removable={} ",
+                m.slot,
+                m.iface,
+                m.dci_in,
+                m.dci_out,
+                m.max_lun as u16 + 1,
+                scsi_text(&m.inquiry.vendor),
+                scsi_text(&m.inquiry.product),
+                scsi_text(&m.inquiry.revision),
+                m.inquiry.dev_type,
+                m.inquiry.removable,
+            );
+            match m.capacity {
+                Some(c) => {
+                    let _ = writeln!(
+                        s,
+                        "sectors512={} blocks={} block_size={}",
+                        scsi_sectors_512(&c),
+                        c.last_lba.saturating_add(1),
+                        c.block_size
+                    );
+                }
+                None => {
+                    let _ = writeln!(s, "cap=none");
+                }
+            }
+        }
+        for h in xi.hubs.iter() {
+            let topo = xi
+                .slot_topo
+                .get(h.slot as usize)
+                .copied()
+                .flatten()
+                .unwrap_or_default();
+            // Sin esta linea, un teclado detras de un hub que no enumera no se
+            // distingue de un hub que nunca se configuro.
+            let _ = writeln!(
+                s,
+                "[usbhid] hub slot={} root_port={} route={:#x} tier={} ports={} speed={} \
+                 status_ep={} children={}",
+                h.slot,
+                topo.root_port,
+                topo.route,
+                topo.depth,
+                h.ports,
+                h.speed,
+                // dci=0 es «no se pudo armar»: ese hub va solo con el sondeo, y
+                // es lo primero que hay que saber si un cambio no se nota.
+                h.ep_dci,
+                (1..=xi.max_slots)
+                    .filter(|&c| xi
+                        .slot_topo
+                        .get(c as usize)
+                        .copied()
+                        .flatten()
+                        .is_some_and(|t| t.parent_slot == h.slot))
+                    .count()
+            );
+        }
         if xi.hids.is_empty() {
             let _ = writeln!(s, "[usbhid] no HID interfaces bound");
         }
@@ -7155,5 +9094,752 @@ mod mmio_tests {
             0xa5a5_a5a5,
             "una cadena sin capacidad legacy ha escrito USBLEGCTLSTS"
         );
+    }
+}
+
+#[cfg(test)]
+mod hub_tests {
+    use super::*;
+
+    /// Un descriptor de configuración sintético: cabecera, luego los
+    /// descriptores que se le pasen ya montados.
+    fn config(parts: &[&[u8]]) -> Vec<u8> {
+        let mut out = alloc::vec![9u8, 0x02, 0, 0, 1, 1, 0, 0x80, 50];
+        for p in parts {
+            out.extend_from_slice(p);
+        }
+        let total = out.len() as u16;
+        out[2] = total as u8;
+        out[3] = (total >> 8) as u8;
+        out
+    }
+
+    fn iface(num: u8, alt: u8, class: u8, sub: u8, proto: u8) -> Vec<u8> {
+        alloc::vec![9, USB_DESC_IFACE, num, alt, 1, class, sub, proto, 0]
+    }
+
+    fn endpoint(addr: u8, attr: u8, mps: u16, interval: u8) -> Vec<u8> {
+        alloc::vec![
+            7,
+            USB_DESC_EP,
+            addr,
+            attr,
+            mps as u8,
+            (mps >> 8) as u8,
+            interval
+        ]
+    }
+
+    #[test]
+    fn every_interface_is_recorded_and_not_only_the_ones_with_a_driver() {
+        // Lo que habia que poder ver: un pendrive, cuya unica interfaz es de
+        // una clase que este driver no maneja.
+        let raw = config(&[&iface(0, 0, 0x08, 0x06, 0x50)]);
+        let (ifaces, dropped) = config_interfaces(&raw);
+        assert_eq!(
+            ifaces,
+            alloc::vec![IfaceRecord {
+                num: 0,
+                class: 0x08,
+                subclass: 0x06,
+                proto: 0x50
+            }]
+        );
+        assert_eq!(dropped, 0);
+    }
+
+    #[test]
+    fn an_alternate_setting_is_the_same_interface_and_not_another_one() {
+        // Un hub multi-TT declara su interfaz dos veces, alt 0 y alt 1.
+        // Contarlas por separado llena la lista de duplicados.
+        let raw = config(&[
+            &iface(0, 0, USB_CLASS_HUB, 0, 0),
+            &iface(0, 1, USB_CLASS_HUB, 0, 2),
+        ]);
+        let (ifaces, _) = config_interfaces(&raw);
+        assert_eq!(ifaces.len(), 1);
+        assert_eq!(ifaces[0].proto, 0);
+    }
+
+    #[test]
+    fn more_interfaces_than_fit_are_counted_and_not_dropped_in_silence() {
+        let mut parts: Vec<Vec<u8>> = Vec::new();
+        for n in 0..(MAX_IFACES_RECORDED as u8 + 3) {
+            parts.push(iface(n, 0, USB_CLASS_HID, 0, 1));
+        }
+        let refs: Vec<&[u8]> = parts.iter().map(|p| p.as_slice()).collect();
+        let (ifaces, dropped) = config_interfaces(&config(&refs));
+        assert_eq!(ifaces.len(), MAX_IFACES_RECORDED);
+        assert_eq!(dropped, 3);
+    }
+
+    #[test]
+    fn the_hub_status_endpoint_is_the_interrupt_in_of_the_hub_interface() {
+        let raw = config(&[
+            &iface(0, 0, USB_CLASS_HUB, 0, 0),
+            &endpoint(0x81, 0x03, 2, 12),
+        ]);
+        assert_eq!(
+            class_int_in_endpoint(&raw, USB_CLASS_HUB),
+            Some((0x81, 2, 12))
+        );
+    }
+
+    #[test]
+    fn an_endpoint_of_another_interface_is_not_the_hubs() {
+        // Un compuesto raro: una interfaz HID con su endpoint delante del hub.
+        // Quedarse con el primer interrupt-IN del descriptor habria armado el
+        // endpoint del raton como si fuera el del hub.
+        let raw = config(&[
+            &iface(0, 0, USB_CLASS_HID, 1, 1),
+            &endpoint(0x81, 0x03, 8, 10),
+            &iface(1, 0, USB_CLASS_HUB, 0, 0),
+            &endpoint(0x82, 0x03, 1, 12),
+        ]);
+        assert_eq!(
+            class_int_in_endpoint(&raw, USB_CLASS_HUB),
+            Some((0x82, 1, 12))
+        );
+        assert_eq!(
+            class_int_in_endpoint(&raw, USB_CLASS_HID),
+            Some((0x81, 8, 10))
+        );
+        assert_eq!(class_int_in_endpoint(&raw, 0x08), None);
+    }
+
+    #[test]
+    fn an_out_or_bulk_endpoint_is_not_an_interrupt_in() {
+        let raw = config(&[
+            &iface(0, 0, USB_CLASS_HUB, 0, 0),
+            // Interrupcion, pero OUT.
+            &endpoint(0x01, 0x03, 2, 12),
+            // IN, pero bulk.
+            &endpoint(0x82, 0x02, 512, 0),
+        ]);
+        assert_eq!(class_int_in_endpoint(&raw, USB_CLASS_HUB), None);
+    }
+
+    #[test]
+    fn the_high_speed_transaction_bits_never_leak_into_the_packet_size() {
+        // wMaxPacketSize = 0x1400: 1024 bytes y dos transacciones adicionales
+        // en los bits 12:11. Esos bits en el Max Packet Size del contexto son
+        // un tamano absurdo.
+        let raw = config(&[
+            &iface(0, 0, USB_CLASS_HUB, 0, 0),
+            &endpoint(0x81, 0x03, 0x1400, 4),
+        ]);
+        assert_eq!(
+            class_int_in_endpoint(&raw, USB_CLASS_HUB).map(|e| e.1),
+            Some(0x400)
+        );
+    }
+
+    #[test]
+    fn a_descriptor_that_lies_about_its_length_stops_the_walk_instead_of_hanging() {
+        // bLength 0 avanzaria cero bytes y daria vueltas para siempre; uno que
+        // se sale del buffer leeria mas alla de lo que el dispositivo mando.
+        assert_eq!(config_descriptors(&[0, USB_DESC_IFACE, 0]).count(), 0);
+        assert_eq!(config_descriptors(&[1, USB_DESC_IFACE]).count(), 0);
+        assert_eq!(config_descriptors(&[40, USB_DESC_IFACE, 0, 0]).count(), 0);
+        // Y lo que si cabe se entrega antes de parar en lo que no.
+        let raw = alloc::vec![4u8, USB_DESC_IFACE, 0, 0, 40, USB_DESC_EP, 0];
+        assert_eq!(config_descriptors(&raw).count(), 1);
+    }
+
+    #[test]
+    fn a_dci_is_two_n_for_an_out_endpoint_and_two_n_plus_one_for_an_in_one() {
+        // Y es la inversa exacta de `ep_addr_from_dci`: si las dos no coinciden,
+        // un CLEAR_FEATURE acaba dirigido a otro endpoint.
+        for num in 1..16u8 {
+            for &dir in &[0u8, 0x80] {
+                let addr = num | dir;
+                let dci = dci_from_ep_addr(addr).expect("cabe en 31 endpoints");
+                assert_eq!(dci, num * 2 + u8::from(dir != 0));
+                assert_eq!(ep_addr_from_dci(dci), addr as u16);
+            }
+        }
+        // EP0 no tiene direccion: su DCI lo pone `setup_device`.
+        assert_eq!(dci_from_ep_addr(0x00), None);
+        assert_eq!(dci_from_ep_addr(0x80), None);
+    }
+
+    #[test]
+    fn a_command_block_wrapper_carries_its_tag_length_direction_and_command() {
+        let w =
+            bot_cbw(0x1234_5678, 36, true, 0, &[SCSI_INQUIRY, 0, 0, 0, 36, 0]).expect("CBW valido");
+        assert_eq!(&w[0..4], b"USBC");
+        assert_eq!(u32::from_le_bytes([w[4], w[5], w[6], w[7]]), 0x1234_5678);
+        assert_eq!(u32::from_le_bytes([w[8], w[9], w[10], w[11]]), 36);
+        assert_eq!(w[12], 0x80, "bmCBWFlags: solo el bit 7, la direccion");
+        assert_eq!(w[13], 0);
+        assert_eq!(w[14], 6);
+        assert_eq!(&w[15..21], &[SCSI_INQUIRY, 0, 0, 0, 36, 0]);
+        // Lo que no se llena queda a cero: el hueco del bloque de orden son 16
+        // bytes y el dispositivo lee bCBWCBLength de ellos.
+        assert!(w[21..].iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn a_write_command_is_not_marked_as_an_in_transfer() {
+        let w = bot_cbw(1, 512, false, 3, &[0x2a, 0, 0, 0, 0, 0, 0, 0, 1, 0]).unwrap();
+        assert_eq!(w[12], 0x00);
+        assert_eq!(w[13], 3, "el LUN va en bCBWLUN");
+    }
+
+    #[test]
+    fn a_command_that_does_not_fit_the_wrapper_is_refused() {
+        // El hueco del bloque de orden son 16 bytes, ni uno mas; y una orden
+        // vacia no es una orden.
+        assert!(bot_cbw(1, 0, false, 0, &[0u8; 16]).is_some());
+        assert!(bot_cbw(1, 0, false, 0, &[0u8; 17]).is_none());
+        assert!(bot_cbw(1, 0, false, 0, &[]).is_none());
+    }
+
+    fn csw(sig: &[u8; 4], tag: u32, residue: u32, status: u8) -> [u8; BOT_CSW_LEN] {
+        let mut w = [0u8; BOT_CSW_LEN];
+        w[0..4].copy_from_slice(sig);
+        w[4..8].copy_from_slice(&tag.to_le_bytes());
+        w[8..12].copy_from_slice(&residue.to_le_bytes());
+        w[12] = status;
+        w
+    }
+
+    #[test]
+    fn a_status_wrapper_is_read_when_it_answers_the_command_that_was_sent() {
+        let raw = csw(b"USBS", 7, 4, 1);
+        assert_eq!(
+            bot_parse_csw(&raw, 7),
+            Some(BotCsw {
+                tag: 7,
+                residue: 4,
+                status: 1
+            })
+        );
+    }
+
+    #[test]
+    fn a_status_wrapper_of_another_command_is_not_this_commands_answer() {
+        // Es el fallo que convierte el resultado de la orden anterior en el de
+        // esta: un «bien» que era de otra pregunta.
+        let raw = csw(b"USBS", 6, 0, 0);
+        assert_eq!(bot_parse_csw(&raw, 7), None);
+    }
+
+    #[test]
+    fn a_status_wrapper_that_is_not_one_is_refused() {
+        // Firma mala, estado que no existe, y uno truncado.
+        assert_eq!(bot_parse_csw(&csw(b"USBC", 1, 0, 0), 1), None);
+        assert_eq!(bot_parse_csw(&csw(b"USBS", 1, 0, 3), 1), None);
+        assert_eq!(bot_parse_csw(&csw(b"USBS", 1, 0, 0x80), 1), None);
+        assert_eq!(bot_parse_csw(&csw(b"USBS", 1, 0, 0)[..12], 1), None);
+        // Y el error de fase (2) si es un estado: pide un reset del transporte.
+        assert_eq!(
+            bot_parse_csw(&csw(b"USBS", 1, 0, 2), 1).map(|c| c.status),
+            Some(2)
+        );
+    }
+
+    fn inquiry_bytes(dev_type: u8, rmb: u8, vendor: &[u8], product: &[u8]) -> [u8; 36] {
+        let mut raw = [b' '; 36];
+        raw[0] = dev_type;
+        raw[1] = rmb;
+        raw[2] = 0x06;
+        raw[3] = 0x02;
+        raw[4] = 31;
+        raw[5] = 0;
+        raw[6] = 0;
+        raw[7] = 0;
+        raw[8..8 + vendor.len()].copy_from_slice(vendor);
+        raw[16..16 + product.len()].copy_from_slice(product);
+        raw[32..36].copy_from_slice(b"1.00");
+        raw
+    }
+
+    #[test]
+    fn an_inquiry_gives_the_type_the_removable_bit_and_the_three_text_fields() {
+        let raw = inquiry_bytes(0x00, 0x80, b"SanDisk", b"Ultra");
+        let inq = scsi_parse_inquiry(&raw).expect("INQUIRY valido");
+        assert_eq!(inq.dev_type, 0x00, "0 es un disco de bloques");
+        assert!(inq.removable);
+        // SCSI rellena con espacios, no con ceros: volcarlo tal cual deja una
+        // columna de huecos en cada linea de /proc.
+        assert_eq!(scsi_text(&inq.vendor), "SanDisk");
+        assert_eq!(scsi_text(&inq.product), "Ultra");
+        assert_eq!(scsi_text(&inq.revision), "1.00");
+    }
+
+    #[test]
+    fn the_device_type_is_five_bits_and_the_removable_bit_is_only_bit_seven() {
+        // Byte 0 lleva el qualifier en los bits 7:5; tomarlo por el tipo
+        // convierte un disco normal en un dispositivo que no existe.
+        let raw = inquiry_bytes(0xe0 | 0x05, 0x7f, b"HL-DT-ST", b"DVDRAM");
+        let inq = scsi_parse_inquiry(&raw).unwrap();
+        assert_eq!(inq.dev_type, 0x05, "5 es un CD/DVD");
+        assert!(
+            !inq.removable,
+            "RMB es solo el bit 7; los otros siete son reservados"
+        );
+    }
+
+    #[test]
+    fn a_text_field_with_control_bytes_does_not_break_the_line_it_is_printed_on() {
+        assert_eq!(scsi_text(b"ab\x00cd\x1b  "), "ab.cd.");
+        assert_eq!(scsi_text(b"        "), "");
+    }
+
+    #[test]
+    fn an_inquiry_shorter_than_its_mandatory_fields_is_refused() {
+        assert_eq!(scsi_parse_inquiry(&[0u8; 35]), None);
+        assert_eq!(scsi_parse_inquiry(&[]), None);
+    }
+
+    #[test]
+    fn a_read_capacity_is_big_endian_and_names_the_last_block_not_the_count() {
+        // 0x0000_0fff bloques de 512: el ultimo LBA es 4095, o sea 4096
+        // bloques. Tomar el ultimo LBA por la cuenta deja el ultimo sector
+        // fuera del disco.
+        let raw = [0x00, 0x00, 0x0f, 0xff, 0x00, 0x00, 0x02, 0x00];
+        let cap = scsi_parse_capacity10(&raw).expect("capacidad valida");
+        assert_eq!(cap.last_lba, 4095);
+        assert_eq!(cap.block_size, 512);
+        assert!(!cap.needs_16);
+        assert_eq!(scsi_sectors_512(&cap), 4096);
+    }
+
+    #[test]
+    fn a_four_kilobyte_block_counts_as_eight_sectors_of_five_hundred_twelve() {
+        let raw = [0x00, 0x00, 0x00, 0x09, 0x00, 0x00, 0x10, 0x00];
+        let cap = scsi_parse_capacity10(&raw).unwrap();
+        assert_eq!(cap.block_size, 4096);
+        // 10 bloques de 4 KiB = 80 sectores de 512 B.
+        assert_eq!(scsi_sectors_512(&cap), 80);
+    }
+
+    #[test]
+    fn a_disk_that_does_not_fit_in_thirty_two_bits_asks_for_the_sixteen_byte_command() {
+        let raw = [0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x02, 0x00];
+        let cap = scsi_parse_capacity10(&raw).unwrap();
+        assert!(
+            cap.needs_16,
+            "0xffffffff no es una capacidad: es «preguntame con el de 16»"
+        );
+        // Y el de 16 trae el LBA en ocho bytes.
+        let raw16 = [
+            0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00,
+        ];
+        let big = scsi_parse_capacity16(&raw16).expect("capacidad de 16 valida");
+        assert_eq!(big.last_lba, 0x1_0000_0000);
+        assert_eq!(big.block_size, 512);
+        assert!(!big.needs_16);
+    }
+
+    #[test]
+    fn a_block_size_of_zero_is_not_a_capacity() {
+        // Dividir 512 entre el seria una division por cero, y creerselo seria
+        // un disco de capacidad infinita.
+        assert_eq!(scsi_parse_capacity10(&[0, 0, 0, 9, 0, 0, 0, 0]), None);
+        assert_eq!(scsi_parse_capacity16(&[0u8; 12]), None);
+        assert_eq!(scsi_parse_capacity10(&[0, 0, 0, 9, 0, 0, 2]), None);
+    }
+
+    #[test]
+    fn the_bulk_pair_belongs_to_its_own_interface() {
+        // Un disco externo con lector de tarjetas declara dos interfaces de
+        // almacenamiento. Coger «el primer bulk del descriptor» para las dos es
+        // hablarle al disco equivocado.
+        let raw = config(&[
+            &iface(0, 0, USB_CLASS_MASS_STORAGE, MSC_SUBCLASS_SCSI, 0x50),
+            &endpoint(0x81, 0x02, 512, 0),
+            &endpoint(0x02, 0x02, 512, 0),
+            &iface(1, 0, USB_CLASS_MASS_STORAGE, MSC_SUBCLASS_SCSI, 0x50),
+            &endpoint(0x83, 0x02, 512, 0),
+            &endpoint(0x04, 0x02, 512, 0),
+        ]);
+        assert_eq!(
+            iface_bulk_endpoints(&raw, 0),
+            Some(((0x81, 512), (0x02, 512)))
+        );
+        assert_eq!(
+            iface_bulk_endpoints(&raw, 1),
+            Some(((0x83, 512), (0x04, 512)))
+        );
+        assert_eq!(iface_bulk_endpoints(&raw, 2), None);
+    }
+
+    #[test]
+    fn an_interface_missing_half_the_pair_has_no_pair() {
+        // Sin el OUT no hay por donde mandar el CBW, asi que media pareja no
+        // sirve de nada y armarla a medias deja el endpoint IN configurado para
+        // siempre sin nadie que lo use.
+        let only_in = config(&[
+            &iface(0, 0, USB_CLASS_MASS_STORAGE, MSC_SUBCLASS_SCSI, 0x50),
+            &endpoint(0x81, 0x02, 512, 0),
+        ]);
+        assert_eq!(iface_bulk_endpoints(&only_in, 0), None);
+        // Y un interrupt o un isocrono no son bulk.
+        let not_bulk = config(&[
+            &iface(0, 0, USB_CLASS_MASS_STORAGE, MSC_SUBCLASS_SCSI, 0x50),
+            &endpoint(0x81, 0x03, 512, 1),
+            &endpoint(0x02, 0x01, 512, 1),
+        ]);
+        assert_eq!(iface_bulk_endpoints(&not_bulk, 0), None);
+    }
+
+    #[test]
+    fn the_endpoints_of_an_alternate_setting_are_not_the_selected_ones() {
+        let raw = config(&[
+            &iface(0, 0, USB_CLASS_MASS_STORAGE, MSC_SUBCLASS_SCSI, 0x50),
+            &endpoint(0x81, 0x02, 512, 0),
+            &endpoint(0x02, 0x02, 512, 0),
+            &iface(0, 1, USB_CLASS_MASS_STORAGE, MSC_SUBCLASS_SCSI, 0x50),
+            &endpoint(0x85, 0x02, 1024, 0),
+            &endpoint(0x06, 0x02, 1024, 0),
+        ]);
+        assert_eq!(
+            iface_bulk_endpoints(&raw, 0),
+            Some(((0x81, 512), (0x02, 512))),
+            "los endpoints que siguen a la alternativa 1 son de la alternativa 1"
+        );
+    }
+
+    #[test]
+    fn the_classes_that_matter_have_a_name_and_the_rest_do_not_pretend_to() {
+        assert_eq!(usb_class_name(USB_CLASS_HID), "hid");
+        assert_eq!(usb_class_name(USB_CLASS_HUB), "hub");
+        assert_eq!(usb_class_name(0x08), "almacenamiento");
+        assert_eq!(usb_class_name(0x42), "?");
+    }
+
+    /// El Slot Context DW0 tal como lo escribe `setup_device`, para poder
+    /// comprobar aquí lo que llega al controlador sin un controlador.
+    fn slot_dw0(topo: &DevTopo, speed: u8) -> u32 {
+        (topo.route & 0x000f_ffff)
+            | ((speed as u32) << 20)
+            | (if topo.tt_multi { 1u32 << 25 } else { 0 })
+            | (1u32 << 27)
+    }
+
+    #[test]
+    fn a_device_on_a_root_port_has_no_route_and_no_translator() {
+        let t = DevTopo::root(7);
+        assert_eq!(t.route, 0);
+        assert_eq!(t.depth, 0);
+        assert_eq!(t.root_port, 7);
+        assert_eq!((t.parent_slot, t.parent_port), (0, 0));
+        assert_eq!((t.tt_slot, t.tt_port), (0, 0));
+        // DW0 de un dispositivo HS en el puerto raíz: solo velocidad y
+        // Context Entries = 1.
+        assert_eq!(slot_dw0(&t, SPEED_HIGH), (3 << 20) | (1 << 27));
+    }
+
+    #[test]
+    fn each_hub_tier_owns_its_own_nibble_of_the_route_string() {
+        let root = DevTopo::root(2);
+        // Nivel 1: puerto 3 del hub raíz.
+        let t1 = root
+            .child(1, SPEED_HIGH, 3, SPEED_HIGH, false)
+            .expect("nivel 1");
+        assert_eq!(t1.route, 0x3);
+        assert_eq!(t1.depth, 1);
+        // Nivel 2: puerto 5 de ese hub.
+        let t2 = t1
+            .child(2, SPEED_HIGH, 5, SPEED_HIGH, false)
+            .expect("nivel 2");
+        assert_eq!(t2.route, 0x53);
+        // Nivel 3: puerto 15, el más alto que cabe en un nibble.
+        let t3 = t2
+            .child(3, SPEED_HIGH, 15, SPEED_HIGH, false)
+            .expect("nivel 3");
+        assert_eq!(t3.route, 0xf53);
+        // El puerto raíz se arrastra intacto por toda la cadena: es lo que va
+        // al Slot Context DW1, no el puerto del hub.
+        assert_eq!(t3.root_port, 2);
+        assert_eq!(t3.depth, 3);
+        // Y el route string vive en los 20 bits bajos de DW0, sin pisar la
+        // velocidad.
+        assert_eq!(
+            slot_dw0(&t3, SPEED_HIGH),
+            0xf53 | (3 << 20) | (1 << 27),
+            "el route string no puede desbordar al campo Speed"
+        );
+    }
+
+    #[test]
+    fn the_fifth_tier_is_the_last_one_a_route_string_can_name() {
+        let mut t = DevTopo::root(1);
+        for tier in 1..=USB_MAX_TIERS {
+            t = t
+                .child(tier, SPEED_HIGH, 1, SPEED_HIGH, false)
+                .unwrap_or_else(|| panic!("el nivel {} debería caber", tier));
+            assert_eq!(t.depth, tier);
+        }
+        // Cinco niveles ocupan los 20 bits enteros; el sexto no tiene nibble.
+        assert_eq!(t.route, 0x11111);
+        assert!(
+            t.child(6, SPEED_HIGH, 1, SPEED_HIGH, false).is_none(),
+            "un sexto nivel no cabe en el route string y no debe enumerarse"
+        );
+    }
+
+    #[test]
+    fn a_port_that_does_not_fit_a_nibble_is_refused() {
+        let root = DevTopo::root(1);
+        assert!(root.child(1, SPEED_HIGH, 0, SPEED_HIGH, false).is_none());
+        assert!(
+            root.child(1, SPEED_HIGH, HUB_MAX_PORTS + 1, SPEED_HIGH, false)
+                .is_none(),
+            "el puerto 16 se solaparía con el nibble del nivel siguiente"
+        );
+        assert!(root
+            .child(1, SPEED_HIGH, HUB_MAX_PORTS, SPEED_HIGH, false)
+            .is_some());
+    }
+
+    #[test]
+    fn a_low_speed_device_behind_a_high_speed_hub_gets_that_hub_as_its_translator() {
+        let hub = DevTopo::root(4);
+        let mouse = hub
+            .child(9, SPEED_HIGH, 2, SPEED_LOW, false)
+            .expect("un ratón LS detrás de un hub HS");
+        assert_eq!(
+            (mouse.tt_slot, mouse.tt_port),
+            (9, 2),
+            "el TT es el hub HS del que cuelga, por el puerto del que cuelga"
+        );
+        assert!(!mouse.tt_multi);
+        // Y el mismo hub, con un dispositivo HS, no traduce nada.
+        let disk = hub
+            .child(9, SPEED_HIGH, 3, SPEED_HIGH, false)
+            .expect("un dispositivo HS");
+        assert_eq!((disk.tt_slot, disk.tt_port), (0, 0));
+    }
+
+    #[test]
+    fn a_full_speed_hub_below_a_high_speed_one_keeps_pointing_at_the_translator() {
+        // HS raíz -> hub HS (slot 9, puerto 2) -> hub FS -> teclado LS.
+        let root = DevTopo::root(1);
+        let fs_hub = root
+            .child(9, SPEED_HIGH, 2, SPEED_FULL, false)
+            .expect("hub FS");
+        assert_eq!((fs_hub.tt_slot, fs_hub.tt_port), (9, 2));
+        let kbd = fs_hub
+            .child(11, SPEED_FULL, 4, SPEED_LOW, false)
+            .expect("teclado LS");
+        assert_eq!(
+            (kbd.tt_slot, kbd.tt_port),
+            (9, 2),
+            "el traductor sigue siendo el hub HS, no el hub FS intermedio"
+        );
+        assert_eq!(kbd.route, 0x42);
+    }
+
+    #[test]
+    fn a_multi_tt_hub_marks_mtt_on_the_child_and_not_on_a_fast_one() {
+        let root = DevTopo::root(1);
+        let slow = root
+            .child(6, SPEED_HIGH, 1, SPEED_FULL, true)
+            .expect("FS detrás de un hub multi-TT");
+        assert!(slow.tt_multi);
+        assert_eq!(slot_dw0(&slow, SPEED_FULL) & (1 << 25), 1 << 25);
+        let fast = root
+            .child(6, SPEED_HIGH, 1, SPEED_HIGH, true)
+            .expect("HS detrás del mismo hub");
+        assert!(
+            !fast.tt_multi,
+            "MTT solo aplica a lo que pasa por el traductor"
+        );
+        assert_eq!(slot_dw0(&fast, SPEED_HIGH) & (1 << 25), 0);
+    }
+
+    #[test]
+    fn a_superspeed_hub_has_only_superspeed_children() {
+        // Un hub SS no mira los bits de LS/HS: lo que cuelga de él es SS por
+        // definición, y los USB 2.0 del mismo conector van por el hub
+        // acompañante.
+        assert_eq!(hub_port_speed(SPEED_SUPER, HUB_PORT_LOW_SPEED), SPEED_SUPER);
+        assert_eq!(hub_port_speed(5, HUB_PORT_HIGH_SPEED), 5);
+    }
+
+    #[test]
+    fn a_usb2_hub_reads_the_speed_off_its_port_status() {
+        assert_eq!(
+            hub_port_speed(SPEED_HIGH, HUB_PORT_CONNECTION | HUB_PORT_LOW_SPEED),
+            SPEED_LOW
+        );
+        assert_eq!(
+            hub_port_speed(SPEED_HIGH, HUB_PORT_CONNECTION | HUB_PORT_HIGH_SPEED),
+            SPEED_HIGH
+        );
+        // Ninguno de los dos bits = plena velocidad. Es el caso por defecto, y
+        // tomarlo por LS dejaría a cada dispositivo FS con un EP0 de 8 bytes.
+        assert_eq!(
+            hub_port_speed(SPEED_HIGH, HUB_PORT_CONNECTION | HUB_PORT_ENABLE),
+            SPEED_FULL
+        );
+    }
+
+    #[test]
+    fn a_hub_descriptor_gives_its_ports_think_time_and_power_delay() {
+        // bLength, bDescriptorType, bNbrPorts, wHubCharacteristics,
+        // bPwrOn2PwrGood (en unidades de 2 ms).
+        let raw = [9u8, USB_DESC_HUB, 4, 0x29, 0x00, 50, 0, 0, 0xff];
+        let info = parse_hub_descriptor(&raw).expect("descriptor válido");
+        assert_eq!(info.ports, 4);
+        // wHubCharacteristics = 0x0029: TT Think Time en los bits 6:5 = 1.
+        assert_eq!(info.think_time, 1);
+        assert_eq!(info.power_good_ms, 100);
+        assert!(!info.multi_tt);
+    }
+
+    #[test]
+    fn the_power_delay_never_drops_below_the_hundred_milliseconds_of_the_spec() {
+        let raw = [9u8, USB_DESC_HUB, 2, 0x00, 0x00, 1, 0, 0, 0];
+        let info = parse_hub_descriptor(&raw).expect("descriptor válido");
+        assert_eq!(
+            info.power_good_ms, 100,
+            "2 ms no bastan: un puerto recién encendido tiene 100 ms para contestar"
+        );
+        let slow = [9u8, USB_DESC_HUB, 2, 0x00, 0x00, 100, 0, 0, 0];
+        assert_eq!(
+            parse_hub_descriptor(&slow).unwrap().power_good_ms,
+            200,
+            "y un hub que pide más se respeta"
+        );
+    }
+
+    #[test]
+    fn a_superspeed_hub_descriptor_is_read_with_the_same_first_six_bytes() {
+        let raw = [12u8, USB_DESC_SS_HUB, 4, 0x00, 0x00, 10, 0, 0, 0, 0, 0, 0];
+        let info = parse_hub_descriptor(&raw).expect("descriptor SS válido");
+        assert_eq!(info.ports, 4);
+        assert_eq!(info.power_good_ms, 100);
+    }
+
+    #[test]
+    fn a_descriptor_that_is_not_one_is_refused_instead_of_believed() {
+        // Un hub sin puertos, un tipo que no es de hub, uno truncado y uno
+        // cuyo bLength no llega a los campos que se leen: ninguno vale, y
+        // creerse cualquiera de ellos sería encender puertos que no existen.
+        assert!(parse_hub_descriptor(&[9, USB_DESC_HUB, 0, 0, 0, 10]).is_none());
+        assert!(parse_hub_descriptor(&[9, 0x02, 4, 0, 0, 10]).is_none());
+        assert!(parse_hub_descriptor(&[9, USB_DESC_HUB, 4, 0]).is_none());
+        assert!(parse_hub_descriptor(&[3, USB_DESC_HUB, 4, 0, 0, 10]).is_none());
+        assert!(parse_hub_descriptor(&[]).is_none());
+    }
+
+    #[test]
+    fn the_port_count_is_clamped_to_what_a_route_string_can_name() {
+        let raw = [9u8, USB_DESC_HUB, 40, 0, 0, 10];
+        assert_eq!(
+            parse_hub_descriptor(&raw).unwrap().ports,
+            HUB_MAX_PORTS,
+            "un puerto que no cabe en un nibble no se puede enumerar, así que \
+             tampoco se recorre"
+        );
+    }
+
+    #[test]
+    fn the_change_bitmap_is_one_bit_per_port_plus_the_hubs_own() {
+        // Siete puertos + el bit del hub = 8 bits = 1 byte. Ocho puertos ya
+        // necesitan dos, y pedir uno habria dejado al puerto 8 fuera del
+        // informe para siempre.
+        assert_eq!(hub_change_bytes(1), 1);
+        assert_eq!(hub_change_bytes(7), 1);
+        assert_eq!(hub_change_bytes(8), 2);
+        assert_eq!(hub_change_bytes(HUB_MAX_PORTS), 2);
+    }
+
+    #[test]
+    fn the_bit_of_each_port_is_the_port_itself_and_bit_zero_is_not_a_port() {
+        // bit 1 -> puerto 1, bit 3 -> puerto 3.
+        assert_eq!(hub_changed_ports(&[0b0000_1010], 7), alloc::vec![1, 3]);
+        // El bit 0 es un cambio del hub entero, no un puerto: creerselo
+        // mandaria un GET_STATUS al puerto 0, que no existe.
+        assert_eq!(hub_changed_ports(&[0b0000_0001], 7), alloc::vec![]);
+        // Y el puerto 8 vive en el segundo byte, bit 0.
+        assert_eq!(hub_changed_ports(&[0, 0b0000_0001], 8), alloc::vec![8]);
+    }
+
+    #[test]
+    fn a_bit_above_the_port_count_or_past_the_report_is_ignored() {
+        // Un hub de cuatro puertos que marca el bit 6 miente o es basura.
+        assert_eq!(hub_changed_ports(&[0b0100_0000], 4), alloc::vec![]);
+        // Y un informe corto no se lee mas alla de lo que trajo.
+        assert_eq!(hub_changed_ports(&[0b0000_0100], 15), alloc::vec![2]);
+        assert_eq!(hub_changed_ports(&[], 7), alloc::vec![]);
+    }
+
+    #[test]
+    fn the_backstop_sweep_is_slower_than_the_sweep_that_is_the_only_signal() {
+        // Si se igualaran, un hub con su endpoint armado pagaria una
+        // transferencia de control por puerto y por segundo para nada.
+        assert!(HUB_BACKSTOP_PERIOD_US > HUB_SCAN_PERIOD_US);
+    }
+
+    #[test]
+    fn every_change_bit_of_a_usb2_hub_has_the_feature_that_clears_it() {
+        // Si la tabla se desalinea, un cambio se reconoce con la caracteristica
+        // de otro y el bit se queda puesto: el hub vuelve a señalar ese puerto
+        // en cada informe, para siempre.
+        assert_eq!(
+            HUB_PORT_CHANGES_USB2,
+            [
+                (1 << 0, 16), // C_PORT_CONNECTION
+                (1 << 1, 17), // C_PORT_ENABLE
+                (1 << 2, 18), // C_PORT_SUSPEND
+                (1 << 3, 19), // C_PORT_OVER_CURRENT
+                (1 << 4, 20), // C_PORT_RESET
+                (1 << 5, 23), // C_PORT_L1, no C_BH_PORT_RESET
+            ]
+        );
+    }
+
+    #[test]
+    fn a_superspeed_hub_has_its_own_change_bits_and_they_are_not_the_usb2_ones() {
+        assert_eq!(
+            HUB_PORT_CHANGES_SS,
+            [
+                (1 << 0, 16), // C_PORT_CONNECTION
+                (1 << 3, 19), // C_OVER_CURRENT
+                (1 << 4, 20), // C_PORT_RESET
+                (1 << 5, 29), // C_BH_PORT_RESET
+                (1 << 6, 25), // C_PORT_LINK_STATE
+                (1 << 7, 26), // C_PORT_CONFIG_ERROR
+            ]
+        );
+        // Los bits 1 y 2 son reservados en SuperSpeed: mandarle un
+        // CLEAR_FEATURE(C_PORT_ENABLE) a un hub SS es una peticion que no
+        // existe en su protocolo.
+        assert!(!HUB_PORT_CHANGES_SS
+            .iter()
+            .any(|&(bit, _)| bit == 1 << 1 || bit == 1 << 2));
+    }
+
+    #[test]
+    fn each_hub_is_given_the_table_of_its_own_protocol() {
+        assert_eq!(hub_port_changes(SPEED_LOW), &HUB_PORT_CHANGES_USB2);
+        assert_eq!(hub_port_changes(SPEED_FULL), &HUB_PORT_CHANGES_USB2);
+        assert_eq!(hub_port_changes(SPEED_HIGH), &HUB_PORT_CHANGES_USB2);
+        assert_eq!(hub_port_changes(SPEED_SUPER), &HUB_PORT_CHANGES_SS);
+        // SuperSpeed Gen2 y lo que venga por encima siguen siendo SuperSpeed.
+        assert_eq!(hub_port_changes(5), &HUB_PORT_CHANGES_SS);
+        assert_eq!(hub_port_changes(6), &HUB_PORT_CHANGES_SS);
+    }
+
+    #[test]
+    fn no_change_bit_is_left_without_a_feature_to_clear_it() {
+        // Un bit señalado que ninguna tabla sabe limpiar es el fallo entero:
+        // el puerto se queda avisando y el driver releyendolo. Para cada
+        // protocolo, todo bit que su wPortChange define tiene su fila.
+        let usb2_defined: u16 = 0b0011_1111;
+        let covered: u16 = HUB_PORT_CHANGES_USB2
+            .iter()
+            .fold(0, |acc, &(bit, _)| acc | bit);
+        assert_eq!(covered, usb2_defined);
+        let ss_defined: u16 = 0b1111_1001;
+        let covered_ss: u16 = HUB_PORT_CHANGES_SS
+            .iter()
+            .fold(0, |acc, &(bit, _)| acc | bit);
+        assert_eq!(covered_ss, ss_defined);
     }
 }
