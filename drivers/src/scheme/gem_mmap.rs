@@ -840,7 +840,7 @@ mod benches {
         depopulate(1024);
     }
 
-    // --- the ownership check, and the two scans it costs with the lookup ---
+    // --- the ownership check, which rides the lookup's own scan ---
 
     /// `holds`: the same scan plus a walk of the entry's holder list.
     #[bench]
@@ -851,11 +851,14 @@ mod benches {
         depopulate(256);
     }
 
-    /// The claim worth a number: `lookup_for` is what the driver-private mmap,
-    /// PRIME export and `ADDFB` actually call, and on the accept path it
-    /// scans the table **twice** — once inside `holds` and once inside
-    /// `lookup`. Against `lookup_one_of_256` this row says whether that
-    /// second walk is worth folding into one pass.
+    /// `lookup_for` is what the driver-private mmap, PRIME export and `ADDFB`
+    /// actually call, and it is the row this batch's fix came out of: on the
+    /// accept path it used to scan the table **twice**, once inside `holds`
+    /// and once inside `lookup`, and read **120.9 ns** here where one walk is
+    /// 58.1. It now decides ownership over the entry its single scan already
+    /// found, so the row should land **level with `lookup_one_of_256`** — the
+    /// check free on top of the walk it already needed. A figure near twice
+    /// that one again would mean the second walk is back.
     #[bench]
     fn look_up_for_a_holder_in_a_table_of_256(b: &mut Bencher) {
         let _g = SERIAL.lock();
