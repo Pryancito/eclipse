@@ -317,3 +317,44 @@ mod dirent_writer_alloc_tests {
         assert_eq!(w.cap, 4096);
     }
 }
+
+#[cfg(test)]
+mod benches {
+    //! What `getdirentries` pays per name, and the `stat` field it fills for
+    //! each one. `dirsiz` runs once per entry and the type map once per
+    //! entry, so a FreeBSD `readdir` over a large directory pays both as
+    //! many times as there are names -- on top of the filesystem walk that
+    //! `file::dir::benches` showed is quadratic.
+    //!
+    //! Compare against `crate::benches::the_second_floor_control` before
+    //! reading a cost into any of them.
+
+    use super::*;
+    use test::{black_box, Bencher};
+
+    #[bench]
+    fn dirent_type_of_a_file(b: &mut Bencher) {
+        b.iter(|| black_box(dirent_type(black_box(FileType::File))));
+    }
+
+    /// The last arm of the match, which costs the same as the first if the
+    /// compiler made a table of it.
+    #[bench]
+    fn dirent_type_of_a_named_pipe(b: &mut Bencher) {
+        b.iter(|| black_box(dirent_type(black_box(FileType::NamedPipe))));
+    }
+
+    /// The record length for a name of the length a shared library has: the
+    /// header, the name, its NUL, rounded up to eight.
+    #[bench]
+    fn dirsiz_of_a_library_name(b: &mut Bencher) {
+        b.iter(|| black_box(dirsiz(black_box(22))));
+    }
+
+    /// A name whose length lands exactly on the boundary, so the round-up
+    /// adds nothing: the same work either way, which is the point.
+    #[bench]
+    fn dirsiz_already_aligned(b: &mut Bencher) {
+        b.iter(|| black_box(dirsiz(black_box(7))));
+    }
+}

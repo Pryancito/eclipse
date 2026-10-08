@@ -215,6 +215,25 @@ pub struct SigInfo {
     pub signo: i32,
     pub errno: i32,
     pub code: SignalCode,
+    /// The four bytes between `si_code` and the union, named rather than left
+    /// to the compiler.
+    ///
+    /// `SiginfoFields` is `align(8)`, so `repr(C)` puts four bytes of padding
+    /// here, and padding is not initialised by a struct literal -- not even
+    /// one that writes every named field. [`SigInfo::as_bytes`] then reads
+    /// the whole struct as bytes and hands all 128 of them to userspace, so
+    /// those four were four bytes of **whatever the kernel stack happened to
+    /// hold**, copied into the caller's `siginfo_t` at the offset where the
+    /// real `siginfo_t` keeps its own padding. Reading uninitialised memory
+    /// is also undefined behaviour, which is why
+    /// `nothing_found_zeroes_infop_and_leaves_rusage_alone` passed on a
+    /// quiet machine and failed on a busy one: the assertion that a
+    /// `SigInfo::default()` is all zeroes was reading the stack.
+    ///
+    /// Naming the field is what fixes it: every constructor here builds on
+    /// `..Self::default()`, so one zero in one place covers all of them, and
+    /// the layout does not change (`size_of::<SigInfo>()` is still 128).
+    _pad: u32,
     pub field: SiginfoFields,
 }
 
@@ -224,6 +243,7 @@ impl Default for SigInfo {
             signo: 0,
             errno: 0,
             code: SignalCode::USER,
+            _pad: 0,
             field: Default::default(),
         }
     }
@@ -335,8 +355,10 @@ impl SigInfo {
 
     /// The bytes of this `siginfo_t` as userspace will read them.
     pub fn as_bytes(&self) -> &[u8] {
-        // SAFETY: `SigInfo` is `repr(C)`, has no padding bytes that are not
-        // zeroed by `Default`/the constructors, and is read only.
+        // SAFETY: `SigInfo` is `repr(C)` and has no implicit padding -- the
+        // four bytes before the union are the named `_pad` field, which
+        // `Default` zeroes and every constructor inherits -- so every byte
+        // read here has been written. It is read only.
         unsafe {
             core::slice::from_raw_parts(
                 self as *const Self as *const u8,
@@ -1050,5 +1072,69 @@ mod layout_tests {
         assert_eq!(word(16), 4242, "si_pid");
         assert_eq!(word(20), 1000, "si_uid");
         assert_eq!(word(24), 7, "si_status");
+    }
+}
+
+#[cfg(test)]
+mod siginfo_layout_tests {
+    //! The layout `as_bytes` promises userspace, and the padding that used to
+    //! be uninitialised inside it.
+
+    use super::*;
+
+    #[test]
+    fn a_siginfo_is_the_128_bytes_userspace_reads() {
+        assert_eq!(core::mem::size_of::<SigInfo>(), 128);
+        assert_eq!(core::mem::align_of::<SigInfo>(), 8);
+    }
+
+    #[test]
+    fn the_union_starts_at_byte_16_where_glibc_reads_it() {
+        let info = SigInfo::default();
+        let base = &info as *const SigInfo as usize;
+        let field = &info.field as *const SiginfoFields as usize;
+        assert_eq!(field - base, 16, "si_pid lands four bytes off otherwise");
+    }
+
+    /// The bug the named `_pad` field fixes: `SigInfo` has no **implicit**
+    /// padding left, so every byte `as_bytes` hands out has been written by
+    /// a field.
+    ///
+    /// Proved by arithmetic rather than by inspecting an instance, because an
+    /// instance cannot prove it: padding bytes take whatever was in the
+    /// memory the struct was built in, so a struct WITH uninitialised padding
+    /// reads as all-zero whenever that memory happened to be zero -- which is
+    /// most of the time on a quiet machine, and is exactly why this went
+    /// unnoticed. The sum of the field sizes equalling the struct's size is
+    /// the property itself: it holds now, and without `_pad` it is 124
+    /// against 128.
+    #[test]
+    fn a_siginfo_has_no_implicit_padding() {
+        use core::mem::size_of;
+        let fields = size_of::<i32>()          // si_signo
+            + size_of::<i32>()                 // si_errno
+            + size_of::<SignalCode>()          // si_code
+            + size_of::<u32>()                 // _pad
+            + size_of::<SiginfoFields>(); // the union
+        assert_eq!(
+            fields,
+            size_of::<SigInfo>(),
+            "the difference is implicit padding, and `as_bytes` copies it to userspace"
+        );
+    }
+
+    /// `SignalCode` is the `int` of `si_code` and not something wider, which
+    /// is what makes the four bytes above the right amount.
+    #[test]
+    fn si_code_is_an_int() {
+        assert_eq!(core::mem::size_of::<SignalCode>(), 4);
+    }
+
+    /// A default `siginfo_t` is all zeroes, which is how `waitid(2)` says it
+    /// found nothing (`si_pid == 0`). This is the assertion that was reading
+    /// the stack before `_pad` existed.
+    #[test]
+    fn a_default_siginfo_is_all_zeroes() {
+        assert!(SigInfo::default().as_bytes().iter().all(|&b| b == 0));
     }
 }

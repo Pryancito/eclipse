@@ -366,3 +366,116 @@ mod pidfd_siginfo_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod benches {
+    //! The two decisions `pidfd_open` and `pidfd_send_signal` make before
+    //! they need a live process. Both are small, and both are here because
+    //! they were missing: `pidfd_open` accepted flags it then ignored, and
+    //! `pidfd_send_signal` took its `siginfo` and dropped it with
+    //! `let _ = info`, which is the one shape of bug that looks exactly like
+    //! correct code.
+    //!
+    //! Every row black-boxes its inputs. Two cycles (~0.6 ns) is `b.iter`'s
+    //! own loop; a row there with an opaque input is a real compare and
+    //! branch, a row there with a constant input is a call that was folded
+    //! away and never ran.
+
+    use super::*;
+    use test::{black_box, Bencher};
+
+    const NONBLOCK: u32 = OpenFlags::NON_BLOCK.bits() as u32;
+
+    /// The ordinary `pidfd_open(pid, 0)`: no flags, and the fd comes back
+    /// close-on-exec whatever the caller asked.
+    #[bench]
+    fn pidfd_open_flags_of_zero(b: &mut Bencher) {
+        b.iter(|| black_box(pidfd_open_flags(black_box(0))));
+    }
+
+    #[bench]
+    fn pidfd_open_flags_nonblock(b: &mut Bencher) {
+        b.iter(|| black_box(pidfd_open_flags(black_box(NONBLOCK))));
+    }
+
+    /// `PIDFD_THREAD`, which is refused rather than ignored: a `PidFd` holds
+    /// a process, so accepting it would hand back an fd that waits on the
+    /// wrong thing and reports the wrong exit.
+    #[bench]
+    fn pidfd_open_flags_thread_refused(b: &mut Bencher) {
+        b.iter(|| black_box(pidfd_open_flags(black_box(PIDFD_THREAD))));
+    }
+
+    #[bench]
+    fn pidfd_open_flags_unknown_bit(b: &mut Bencher) {
+        b.iter(|| black_box(pidfd_open_flags(black_box(1 << 20))));
+    }
+
+    /// `pidfd_send_signal(fd, sig, NULL, 0)`: the common case, where the
+    /// kernel fills the `siginfo` in itself so there is nothing to disagree
+    /// with and nothing to forge. One `Option` test.
+    #[bench]
+    fn check_pidfd_siginfo_with_no_info(b: &mut Bencher) {
+        b.iter(|| {
+            black_box(check_pidfd_siginfo(
+                black_box(9),
+                black_box(None),
+                black_box(false),
+            ))
+        });
+    }
+
+    /// A `siginfo` that agrees with the signal number and names a kill from
+    /// the caller: both checks run and both pass.
+    #[bench]
+    fn check_pidfd_siginfo_accepted(b: &mut Bencher) {
+        let head = SigInfoHead {
+            signo: 9,
+            errno: 0,
+            code: 0,
+        };
+        b.iter(|| {
+            black_box(check_pidfd_siginfo(
+                black_box(9),
+                black_box(Some(head)),
+                black_box(true),
+            ))
+        });
+    }
+
+    /// The mismatched number, which must be `EINVAL` and must be answered
+    /// *first*: a caller that got `EPERM` for a typo would go looking for
+    /// privileges it does not need.
+    #[bench]
+    fn check_pidfd_siginfo_mismatched_number(b: &mut Bencher) {
+        let head = SigInfoHead {
+            signo: 15,
+            errno: 0,
+            code: 0,
+        };
+        b.iter(|| {
+            black_box(check_pidfd_siginfo(
+                black_box(9),
+                black_box(Some(head)),
+                black_box(true),
+            ))
+        });
+    }
+
+    /// Forging a `si_code` at somebody else, which is `EPERM`.
+    #[bench]
+    fn check_pidfd_siginfo_refused_at_another_process(b: &mut Bencher) {
+        let head = SigInfoHead {
+            signo: 9,
+            errno: 0,
+            code: 0,
+        };
+        b.iter(|| {
+            black_box(check_pidfd_siginfo(
+                black_box(9),
+                black_box(Some(head)),
+                black_box(false),
+            ))
+        });
+    }
+}

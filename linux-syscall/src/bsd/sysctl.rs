@@ -196,3 +196,93 @@ mod tests {
         assert!(name_to_mib("kern.nonexistent").is_none());
     }
 }
+
+#[cfg(test)]
+mod benches {
+    //! `sysctl` is on the startup path of every FreeBSD process: libc's
+    //! `sysconf(_SC_NPROCESSORS_ONLN)` and jemalloc's initialisation both
+    //! read `hw.ncpu` and `hw.pagesize` before `main` runs.
+    //!
+    //! The rows separate the three parts: the name-to-MIB lookup, which
+    //! allocates a `Vec` for a two-element MIB on every `sysctlbyname`; the
+    //! query, which is two nested matches; and `to_bytes`, which allocates
+    //! again to serialise. A string leaf allocates twice over.
+    //!
+    //! Compare against `crate::benches::the_second_floor_control` before
+    //! reading a cost into any of them.
+
+    use super::*;
+    use test::{black_box, Bencher};
+
+    fn ctx() -> SysctlCtx {
+        SysctlCtx {
+            ncpus: 8,
+            page_size: 4096,
+            usrstack: 0x7fff_ffff_f000,
+            ps_strings: 0x7fff_ffff_e000,
+            physmem: 8 << 30,
+            hostname: String::from("eclipse"),
+            arnd: [0x5a; 16],
+        }
+    }
+
+    /// `sysctlbyname("hw.ncpu", ...)`: the string match, plus the `to_vec`
+    /// that turns a static two-element slice into an allocation.
+    #[bench]
+    fn name_to_mib_of_hw_ncpu(b: &mut Bencher) {
+        b.iter(|| black_box(name_to_mib(black_box("hw.ncpu"))));
+    }
+
+    /// A name that is not modelled, which is `None` and allocates nothing:
+    /// against the row above, the difference is the `Vec`.
+    #[bench]
+    fn name_to_mib_of_an_unknown_name(b: &mut Bencher) {
+        b.iter(|| black_box(name_to_mib(black_box("kern.boottime"))));
+    }
+
+    /// The longest name in the table, to say whether the match compares
+    /// lengths first or walks bytes.
+    #[bench]
+    fn name_to_mib_of_hw_machine_arch(b: &mut Bencher) {
+        b.iter(|| black_box(name_to_mib(black_box("hw.machine_arch"))));
+    }
+
+    /// An integer leaf: the query alone, no allocation.
+    #[bench]
+    fn query_an_int_leaf(b: &mut Bencher) {
+        let ctx = ctx();
+        let mib = [ctl::CTL_HW, ctl::HW_NCPU];
+        b.iter(|| black_box(query(black_box(&mib), black_box(&ctx))));
+    }
+
+    /// A string leaf, which clones the hostname out of the context.
+    #[bench]
+    fn query_a_string_leaf(b: &mut Bencher) {
+        let ctx = ctx();
+        let mib = [ctl::CTL_KERN, ctl::KERN_HOSTNAME];
+        b.iter(|| black_box(query(black_box(&mib), black_box(&ctx))));
+    }
+
+    /// A MIB that names nothing, which the caller reports as `ENOENT`.
+    #[bench]
+    fn query_an_unmodelled_mib(b: &mut Bencher) {
+        let ctx = ctx();
+        let mib = [ctl::CTL_KERN, 9999];
+        b.iter(|| black_box(query(black_box(&mib), black_box(&ctx))));
+    }
+
+    /// Serialising the answer into the bytes `sysctl` copies out. The
+    /// integer is four bytes through a `Vec`; the string is a second
+    /// allocation on top of the clone the query already made.
+    #[bench]
+    fn to_bytes_of_an_int(b: &mut Bencher) {
+        let val = SysctlVal::Int(8);
+        b.iter(|| black_box(black_box(&val).to_bytes()));
+    }
+
+    #[bench]
+    fn to_bytes_of_a_string(b: &mut Bencher) {
+        let val = SysctlVal::Str(String::from("FreeBSD"));
+        b.iter(|| black_box(black_box(&val).to_bytes()));
+    }
+}

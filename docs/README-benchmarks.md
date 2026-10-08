@@ -131,6 +131,18 @@ two agree the measurement is standing on something.
 | `semctl(GETALL)`/`(SETALL)` bulk transfers | 276 / 381 ns over 512 | `linux-syscall` `ipc::benches::semctl_*` |
 | the `futex` operation word every contended mutex sends | `futex` section | `linux-syscall` `misc::benches::futex_op_*` |
 | `capget`/`capset`, `syslog`, `ioprio` | — | `linux-syscall` `misc::benches::*` |
+| the syscall number every dispatch decodes | — | `linux-syscall` `benches::sys_try_from_*` |
+| the zeroed kernel buffer behind every sized read | — | `linux-syscall` `benches::try_zeroed_buf_*` |
+| the tail of an extensible struct (`clone3`, `sched_setattr`) | — | `linux-syscall` `benches::extensible_tail_*` |
+| the `(int)` of a `pid_t`, `id_t` or `loff_t` argument | — | `linux-syscall` `intarg::benches::*` |
+| `setgroups`'s list, up to `NGROUPS_MAX` | — | `linux-syscall` `intarg::benches::groups_list_*` |
+| taking a descriptor back when its number never arrives | — | `linux-syscall` `outparams::benches::*` |
+| "is this fd a pipe", twice per `splice` | — | `linux-syscall` `file::splice::benches::pipe_inode_*` |
+| the twelve xattr syscalls, which answer from a table | — | `linux-syscall` `file::xattr::benches::*` |
+| `pidfd_open`'s flags and `pidfd_send_signal`'s `siginfo` | — | `linux-syscall` `file::pidfd::benches::*` |
+| a FreeBSD binary's flag words, both ways | — | `linux-syscall` `bsd::translate::benches::*` |
+| the FreeBSD `errno` every failing syscall is mapped to | — | `linux-syscall` `bsd::errno::benches::*` |
+| `sysctl`, which libc and jemalloc read before `main` | — | `linux-syscall` `bsd::sysctl::benches::*` |
 
 The one empty cell is not an oversight. What the futex table costs, what a
 wake with no waiters costs, and every signal decision are all benched above;
@@ -174,8 +186,32 @@ computing an answer from `fd`. **So `black_box` goes around the inputs, not
 only around the result**, and a suspiciously flat family is the thing to
 re-check first.
 
-A flat family has a second cause worth knowing, because it looks identical: a
-loop that never ran. `msync_distinct_vmos_over_64_pages` and `_over_512_pages`
+**There is a second floor, at about 6.5 ns, and it is the more dangerous of
+the two** -- because a row sitting on it looks like a measurement. Dozens of
+unrelated one-compare helpers land between 6.0 and 7.0 ns: `Sys::try_from`,
+`sched_pid`, `task_pid`, `readlink_bufsiz`, `waitid_id`, `groups_size`,
+`mincore_arg_check`, `munmap_arg_check`, `user_range_resolve`,
+`semget_nsems_arg`, `unix_socket_type_arg`, `alsa_ioctl_name`. The tell is
+that the *accepted* and the *refused* row of the same helper land there
+together, to within noise, although they take different branches and return
+different values -- and a figure that does not move when the work does is not
+the work.
+
+`benches::the_second_floor_control` is the row that settles it: a function
+that decides nothing, takes a register and returns `Ok(raw)`, marked
+`#[inline(never)]` so it stays a call the way a cross-module helper does.
+
+```
+test benches::the_second_floor_control ... bench: 6.34 ns/iter (+/- 1.71)
+```
+
+So **6.5 ns means "too cheap to measure this way", not "6.5 nanoseconds of
+decision"**, and the earlier claim here that argument validation costs "0.6 to
+12 ns" was reading the harness for the upper half of that range. Compare any
+row near 6.5 against this control before quoting it as a cost.
+
+A flat family has a third cause worth knowing, because it looks identical to
+folding: a loop that never ran. `msync_distinct_vmos_over_64_pages` and `_over_512_pages`
 both read 11 ns once the mapping moved off address 0, and the reason was that
 `distinct_vmos` takes an absolute `end` while the rows were still passing a
 length -- so `end` sat below `start` and the `while` body was never entered.
@@ -212,10 +248,10 @@ rows read 30 ns per page, flat, once the end was an end.
   pair: 3.2 us to fill the ring once, 20 GB/s through it, and 13.0 us for
   256 KiB, which is four ring loads at the same rate. The copy scales; the
   call does not shrink.
-- **Argument validation is free**, everywhere it was measured: 0.6 to 7 ns
-  against the ~330 ns a syscall entry costs from userspace. The narrowing
-  helpers in `intarg.rs` were added to fix wrong answers, and they cost
-  nothing to have.
+- **Argument validation is free**, everywhere it was measured: every row is at
+  one of the harness's two floors, against the ~330 ns a syscall entry costs
+  from userspace. The narrowing helpers in `intarg.rs` were added to fix wrong
+  answers, and they cost nothing to have.
 
 ## What the memory, process, clock, signal, socket and IPC rows said
 
@@ -266,9 +302,45 @@ rows read 30 ns per page, flat, once the end was an end.
   contrast, is thrown out in 10 ns.
 - **`clone3` decodes a `struct clone_args` in 5 ns**, nine refusals and all.
   `fork(3)` does not spend its time at the door.
-- **Everything else is 0.6 to 12 ns**, which is the same answer the file batch
-  gave: the syscalls' argument work is free, and what a syscall costs is the
-  entry, the copies and the subsystem.
+- **Everything else is at one of the two floors**, which is the same answer the
+  file batch gave once the floors are accounted for: the syscalls' argument
+  work is free, and what a syscall costs is the entry, the copies and the
+  subsystem. Read "at the floor" and not "6.5 ns"; see the control row above.
+
+## What the dispatch layer said
+
+- **Decoding the syscall number is free, and that matters more than it
+  sounds.** `Sys::try_from` reads at the second floor for the first number in
+  the table, the middle, the last Linux one (439), Eclipse's own at 601 past a
+  gap of a hundred and sixty, and a number that is not in the table at all --
+  all within noise of each other, so the generated `TryFrom` is a table and
+  not a chain of compares. That is the answer to a thing worth checking:
+  dispatch decodes the number once, and the `[einval-hunt]` logging decodes it
+  up to **four more times** on an `EINVAL`. At the floor, four decodes cost
+  nothing; against a 353-arm chain they would have.
+- **`try_zeroed_buf` is 20 ns per KiB, and that is a buffer about to be
+  overwritten.** 35 ns for a page, 1.30 us for `SYSCALL_IO_MAX`. Every sized
+  read in this crate goes through it (and must, because `vec![0u8; n]` took
+  the machine down on a 24 KiB `read`), but the zeroing is not what makes it
+  safe -- `try_reserve_exact` is. A 64 KiB `read` therefore spends 1.3 us
+  writing zeroes into memory the read then fills, which is about the cost of
+  the pipe round trip itself. Linux does not zero a read buffer. The refusal
+  is 1.3 ns, so a process hammering an impossible length costs nothing.
+- **An extensible struct's tail is checked a byte at a time**: 0.34 ns per
+  byte, so 1.40 us over a 4 KiB tail. In practice the tails are tiny -- 8.7 ns
+  for the 24 bytes a `clone3` from a newer libc carries -- and a set byte is
+  found and refused in 1.3 ns, so it does stop early. Worth knowing only
+  because the length is the caller's to choose.
+- **`setgroups`'s cost is the copy, not the validation.** Scanning 65536 gids
+  for `(gid_t)-1` takes 3.9 us net of the vector it is handed, which is
+  0.06 ns per gid -- vectorised -- against 6.4 us to clone the list. A
+  `(gid_t)-1` at the front is found at once.
+- **Keeping the caller intact costs nothing.** `commit_and_report_old` and
+  `hand_out_pair` sit at the first floor, 0.6 to 1.1 ns, take-back path
+  included. The objection to a helper for "a call that fails must leave the
+  caller exactly as it found them" was always that it costs something; it does
+  not, and writing it by hand at each call site is what left `pipe2((int *)1,
+  0)` leaking two descriptors a turn.
 
 A caveat that applies to every in-kernel row: they run under `libos`, the only
 configuration that builds for the host. Object bookkeeping (VMO and VMAR

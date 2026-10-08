@@ -202,3 +202,114 @@ mod xattr_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod benches {
+    //! The twelve xattr syscalls answer from a table in this kernel -- no
+    //! filesystem here keeps extended attributes -- so what they cost IS
+    //! `xattr_precheck` and `xattr_answer`, and nothing else. That makes
+    //! these rows the whole of `getxattr`, minus the path lookup.
+    //!
+    //! It also makes the order observable: `fs/xattr.c` judges the flags,
+    //! then the name, then the value, and these helpers keep that order
+    //! because a caller that is wrong twice over must hear the same reason
+    //! Linux gives.
+    //!
+    //! Every row black-boxes its inputs. Two cycles (~0.6 ns) is `b.iter`'s
+    //! own loop; a row there with an opaque input is a real compare and
+    //! branch, a row there with a constant input is a call that was folded
+    //! away and never ran.
+
+    use super::*;
+    use test::{black_box, Bencher};
+
+    /// A `user.` name of the length a real attribute has.
+    const NAME: &str = "user.selinux.context";
+
+    /// `getxattr`'s check: a name to measure and nothing else.
+    #[bench]
+    fn precheck_get(b: &mut Bencher) {
+        b.iter(|| {
+            black_box(xattr_precheck(
+                black_box(XattrOp::Get),
+                black_box(Some(NAME)),
+            ))
+        })
+    }
+
+    /// `setxattr`'s: the flags word, the name, then the value length -- all
+    /// three, which is the longest path through this function.
+    #[bench]
+    fn precheck_set(b: &mut Bencher) {
+        b.iter(|| {
+            black_box(xattr_precheck(
+                black_box(XattrOp::Set { size: 64, flags: 1 }),
+                black_box(Some(NAME)),
+            ))
+        })
+    }
+
+    /// `listxattr`, which has none of the three: the floor of this family,
+    /// and what the dispatcher used to answer for all twelve.
+    #[bench]
+    fn precheck_list(b: &mut Bencher) {
+        b.iter(|| black_box(xattr_precheck(black_box(XattrOp::List), black_box(None))))
+    }
+
+    /// A flags word with a bit neither `XATTR_CREATE` nor `XATTR_REPLACE`:
+    /// refused first, before the name is looked at.
+    #[bench]
+    fn precheck_set_with_unknown_flags(b: &mut Bencher) {
+        b.iter(|| {
+            black_box(xattr_precheck(
+                black_box(XattrOp::Set { size: 64, flags: 4 }),
+                black_box(Some(NAME)),
+            ))
+        })
+    }
+
+    /// A name one byte over `XATTR_NAME_MAX`, which is `ERANGE`. The check is
+    /// a length compare, not a walk, so it costs the same as a short name --
+    /// the row exists to show that.
+    #[bench]
+    fn precheck_name_too_long(b: &mut Bencher) {
+        let long = alloc::string::String::from_utf8(alloc::vec![b'x'; XATTR_NAME_MAX + 1]).unwrap();
+        b.iter(|| {
+            black_box(xattr_precheck(
+                black_box(XattrOp::Get),
+                black_box(Some(long.as_str())),
+            ))
+        })
+    }
+
+    /// The empty name, which is `ERANGE` too: `getxattr(path, "", ...)`.
+    #[bench]
+    fn precheck_empty_name(b: &mut Bencher) {
+        b.iter(|| black_box(xattr_precheck(black_box(XattrOp::Get), black_box(Some("")))))
+    }
+
+    /// A value over `XATTR_SIZE_MAX`, which is `E2BIG` and is judged last.
+    #[bench]
+    fn precheck_value_too_big(b: &mut Bencher) {
+        b.iter(|| {
+            black_box(xattr_precheck(
+                black_box(XattrOp::Set {
+                    size: XATTR_SIZE_MAX + 1,
+                    flags: 0,
+                }),
+                black_box(Some(NAME)),
+            ))
+        })
+    }
+
+    /// The answer itself, once the file is known to exist.
+    #[bench]
+    fn answer_get(b: &mut Bencher) {
+        b.iter(|| black_box(xattr_answer(black_box(XattrOp::Get))))
+    }
+
+    #[bench]
+    fn answer_list(b: &mut Bencher) {
+        b.iter(|| black_box(xattr_answer(black_box(XattrOp::List))))
+    }
+}

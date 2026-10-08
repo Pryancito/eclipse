@@ -1305,3 +1305,145 @@ mod clockid_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod benches {
+    //! What a FreeBSD binary pays at the ABI boundary. Every one of its
+    //! syscalls goes through here twice: a flag word or two translated on the
+    //! way in, and the result re-encoded on the way out.
+    //!
+    //! `sift` is the shape to watch. It walks the whole map on every call --
+    //! thirteen entries for `open`, and it rebuilds `known` out of the map as
+    //! it goes although `known` is the same value every time. So the rows
+    //! come in map-size order: `msync` (two entries), `wait` (three),
+    //! `at` (four), `mmap` (nine), `open` (thirteen). A slope across them is
+    //! the per-entry cost a FreeBSD `open` pays for flags it does not set,
+    //! and it is loop-invariant work that a `const` per map would remove.
+    //!
+    //! Compare every row against `crate::benches::the_second_floor_control`
+    //! before reading a cost into it: a row near 6.5 ns is this harness's
+    //! second floor, not a decision that costs 6.5 nanoseconds.
+
+    use super::*;
+    use test::{black_box, Bencher};
+
+    /// What a libc `open(path, O_RDWR | O_CREAT | O_CLOEXEC, mode)` carries:
+    /// an access mode and three bits that all have Linux peers, so the sift
+    /// walks the map and finds three of thirteen.
+    #[bench]
+    fn open_flags_of_an_ordinary_open(b: &mut Bencher) {
+        let word = oflags::O_RDWR | oflags::O_CREAT | oflags::O_CLOEXEC;
+        b.iter(|| black_box(open_flags_to_linux(black_box(word))));
+    }
+
+    /// `O_RDONLY` alone: no bits in the map at all, so this row is the walk
+    /// over thirteen entries that finds nothing. Against the row above, the
+    /// difference is what matching costs; against the smaller maps below,
+    /// the difference is the walk itself.
+    #[bench]
+    fn open_flags_of_a_bare_rdonly(b: &mut Bencher) {
+        b.iter(|| black_box(open_flags_to_linux(black_box(oflags::O_RDONLY))));
+    }
+
+    /// `O_EXLOCK`: understood and not doable here, which must be
+    /// `EOPNOTSUPP` and not a silent success -- a program that asked for a
+    /// lock and did not get it writes over another writer without ever
+    /// finding out. The refusal is tested after the whole map is walked.
+    #[bench]
+    fn open_flags_refused(b: &mut Bencher) {
+        let word = oflags::O_RDWR | oflags::O_EXLOCK;
+        b.iter(|| black_box(open_flags_to_linux(black_box(word))));
+    }
+
+    /// A bit that is not a flag on either system: `EINVAL`, and also only
+    /// after the walk.
+    #[bench]
+    fn open_flags_unknown_bit(b: &mut Bencher) {
+        b.iter(|| black_box(open_flags_to_linux(black_box(1 << 30))));
+    }
+
+    /// The same sift over a nine-entry map.
+    #[bench]
+    fn mmap_flags_of_an_anonymous_private_mapping(b: &mut Bencher) {
+        let word = mman::MAP_PRIVATE | mman::MAP_ANON;
+        b.iter(|| black_box(mmap_flags_to_linux(black_box(word))));
+    }
+
+    /// Over a four-entry map: the `*at` calls' `AT_` word.
+    #[bench]
+    fn at_flags_of_symlink_nofollow(b: &mut Bencher) {
+        b.iter(|| black_box(at_flags_to_linux(black_box(oflags::AT_SYMLINK_NOFOLLOW))));
+    }
+
+    /// Over a three-entry map.
+    #[bench]
+    fn wait_options_of_wnohang(b: &mut Bencher) {
+        b.iter(|| black_box(wait_options_to_linux(black_box(wait::WNOHANG))));
+    }
+
+    /// Over a two-entry map: the smallest sift here, so it is the closest
+    /// thing to the fixed cost the others add their entries to.
+    #[bench]
+    fn msync_flags_of_ms_sync(b: &mut Bencher) {
+        b.iter(|| black_box(msync_flags_to_linux(black_box(msync::MS_SYNC))));
+    }
+
+    /// `F_SETFL`'s word, which has no refusals and so no `Result`: the sift
+    /// without its two tests.
+    #[bench]
+    fn setfl_flags(b: &mut Bencher) {
+        b.iter(|| black_box(setfl_flags_to_linux(black_box(oflags::O_NONBLOCK))));
+    }
+
+    /// The way back out: a Linux flag word as FreeBSD's `F_GETFL` reports it.
+    #[bench]
+    fn open_flags_back_to_freebsd(b: &mut Bencher) {
+        b.iter(|| black_box(open_flags_from_linux(black_box(2 | 0o2000))));
+    }
+
+    /// `fcntl`'s command, which is a match and not a sift.
+    #[bench]
+    fn fcntl_command(b: &mut Bencher) {
+        b.iter(|| black_box(fcntl_to_linux(black_box(3), black_box(0))))
+    }
+
+    /// Signal numbers both ways. FreeBSD and Linux agree up to 15 and then
+    /// do not, so these are the calls every `kill`, `sigaction` and delivery
+    /// to a FreeBSD process goes through.
+    #[bench]
+    fn signal_to_linux_of_sigusr1(b: &mut Bencher) {
+        b.iter(|| black_box(signal_to_linux(black_box(30))));
+    }
+
+    #[bench]
+    fn signal_from_linux_of_sigusr1(b: &mut Bencher) {
+        b.iter(|| black_box(signal_from_linux(black_box(10))));
+    }
+
+    /// `wait4`'s status word, re-encoded: the signal number inside it has to
+    /// be translated too, so this is not a pass-through.
+    #[bench]
+    fn wait_status_of_a_signalled_child(b: &mut Bencher) {
+        b.iter(|| black_box(wait_status_to_freebsd(black_box(9))));
+    }
+
+    #[bench]
+    fn wait_status_of_a_clean_exit(b: &mut Bencher) {
+        b.iter(|| black_box(wait_status_to_freebsd(black_box(0))));
+    }
+
+    #[bench]
+    fn madvise_advice(b: &mut Bencher) {
+        b.iter(|| black_box(madvise_to_linux(black_box(1))));
+    }
+
+    #[bench]
+    fn rlimit_resource(b: &mut Bencher) {
+        b.iter(|| black_box(rlimit_to_linux(black_box(0))));
+    }
+
+    #[bench]
+    fn clockid(b: &mut Bencher) {
+        b.iter(|| black_box(clockid_to_linux(black_box(0))));
+    }
+}
