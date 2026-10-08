@@ -648,15 +648,40 @@ mod reentrancy_tests {
     static UPCALLS: AtomicU32 = AtomicU32::new(0);
     static ALWAYS_FREE: AtomicBool = AtomicBool::new(true);
 
+    /// How long the probe waits for the registry before calling it held.
+    ///
+    /// A single `try_lock` cannot answer the question this test asks. It
+    /// fails for a lock held by *anybody*, and on a host build there is no
+    /// "this cpu" to ask instead: `HeldByCurrentCpu` is a constant `false`
+    /// there. Meanwhile the hardware-fence poller
+    /// (`syncobj_eventfd::arm_poller`, armed by this test's own
+    /// `new_sync_file`) fires from a timer and calls `wake_ready_waiters`,
+    /// which takes the registry for a few instructions -- so a `try_lock`
+    /// that happened to land inside that window reported the re-entrancy bug
+    /// when there was none. That is a flake, not a finding: red about once in
+    /// eight runs of the suite, and nothing in the kernel had changed.
+    ///
+    /// The two cases are still easy to tell apart, because they differ in
+    /// kind and not in timing. A *re-entrant* hold -- the bug this test
+    /// exists for -- is held by the very call stack the hook runs on, so it
+    /// never comes free, however long anyone waits. A concurrent hold is over
+    /// in microseconds. So wait: a lock that comes free inside this budget
+    /// was somebody else's, and one that does not is the bug.
+    const PROBE_SPINS: usize = 1 << 22;
+
     /// Stands in for `syncobj_eventfd::on_syncobj_signaled`, which is what the
     /// kernel really installs, and asks the one question that matters: is the
     /// registry lock free right now? The real hook would take it.
     fn probe_hook(_handle: u32, _point: u64) {
         UPCALLS.fetch_add(1, Ordering::SeqCst);
-        match WAITERS.try_lock() {
-            Some(g) => drop(g),
-            None => ALWAYS_FREE.store(false, Ordering::SeqCst),
+        for _ in 0..PROBE_SPINS {
+            if let Some(g) = WAITERS.try_lock() {
+                drop(g);
+                return;
+            }
+            core::hint::spin_loop();
         }
+        ALWAYS_FREE.store(false, Ordering::SeqCst);
     }
 
     #[test]
