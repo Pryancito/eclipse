@@ -243,10 +243,15 @@ mod benches {
     //! control flow and not the work it wraps. What a real `rt_sigaction`
     //! costs lives in `signal::benches`.
     //!
-    //! Every row black-boxes its inputs. Two cycles (~0.6 ns) is `b.iter`'s
-    //! own loop; a row there with an opaque input is a real compare and
-    //! branch, a row there with a constant input is a call that was folded
-    //! away and never ran.
+    //! Every row black-boxes its inputs -- and that includes the WHOLE
+    //! `Result` each closure hands back, not just the value inside it.
+    //! `|| Ok(black_box(4))` hides the 4 and leaves the `Ok` in plain sight,
+    //! so the compiler still knows which way every `?` in the helper goes
+    //! and can fold the control flow this module exists to measure away.
+    //! `|| black_box(Ok(4))` is what hides the decision. Two cycles
+    //! (~0.6 ns) is `b.iter`'s own loop; a row there with an opaque input is
+    //! a real compare and branch, a row there with a constant input is a
+    //! call that was folded away and never ran.
 
     use super::*;
     use test::{black_box, Bencher};
@@ -266,7 +271,7 @@ mod benches {
         b.iter(|| {
             let mut out: UserOutPtr<u64> = UserOutPtr::from(black_box(addr));
             black_box(commit_and_report_old(black_box(1234u64), &mut out, || {
-                Ok(())
+                black_box(Ok(()))
             }))
         });
     }
@@ -279,7 +284,7 @@ mod benches {
         b.iter(|| {
             let mut out: UserOutPtr<u64> = UserOutPtr::from(black_box(0usize));
             black_box(commit_and_report_old(black_box(1234u64), &mut out, || {
-                Ok(())
+                black_box(Ok(()))
             }))
         });
     }
@@ -294,7 +299,7 @@ mod benches {
         b.iter(|| {
             let mut out: UserOutPtr<u64> = UserOutPtr::from(black_box(addr));
             black_box(commit_and_report_old(black_box(1234u64), &mut out, || {
-                Err(LxError::EFAULT)
+                black_box(Err(LxError::EFAULT))
             }))
         });
     }
@@ -306,8 +311,8 @@ mod benches {
         b.iter(|| {
             black_box(hand_out_pair(
                 black_box(3i32),
-                || Ok(black_box(4i32)),
-                |_, _| Ok(()),
+                || black_box(Ok(4i32)),
+                |_, _| black_box(Ok(())),
                 |fd| {
                     black_box(fd);
                 },
@@ -323,8 +328,8 @@ mod benches {
         b.iter(|| {
             black_box(hand_out_pair(
                 black_box(3i32),
-                || Ok(black_box(4i32)),
-                |_, _| Err(LxError::EFAULT),
+                || black_box(Ok(4i32)),
+                |_, _| black_box(Err(LxError::EFAULT)),
                 |fd| {
                     black_box(fd);
                 },
@@ -339,8 +344,8 @@ mod benches {
         b.iter(|| {
             black_box(hand_out_pair(
                 black_box(3i32),
-                || Err::<i32, _>(LxError::EMFILE),
-                |_, _| Ok(()),
+                || black_box(Err::<i32, _>(LxError::EMFILE)),
+                |_, _| black_box(Ok(())),
                 |fd| {
                     black_box(fd);
                 },
@@ -355,7 +360,7 @@ mod benches {
         b.iter(|| {
             black_box(hand_out_one(
                 black_box(9i32),
-                |_| Ok(()),
+                |_| black_box(Ok(())),
                 |fd| {
                     black_box(fd);
                 },
@@ -368,7 +373,7 @@ mod benches {
         b.iter(|| {
             black_box(hand_out_one(
                 black_box(9i32),
-                |_| Err(LxError::EFAULT),
+                |_| black_box(Err(LxError::EFAULT)),
                 |fd| {
                     black_box(fd);
                 },

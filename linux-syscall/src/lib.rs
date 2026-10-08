@@ -1382,11 +1382,19 @@ mod benches {
     fn einval_hunt_alsa_early_out_decision(b: &mut Bencher) {
         // The shape of the test inside `einval_hunt`, without the logging:
         // decode, then two byte compares on the ioctl command.
+        //
+        // The number comes from `Sys::IOCTL`, never written out: `build.rs`
+        // picks a different table per architecture, and `ioctl` is 16 only
+        // on x86_64 -- on aarch64 and riscv64 it is 29, and 16 is
+        // `fremovexattr` there. Spelled out, the `matches!` would be false
+        // on those targets and the `&&` would short-circuit, so the row
+        // would measure a failed decode instead of ALSA's early-out.
         let cmd = 0xc250_4110u32; // _IOWR('A', 0x10, snd_pcm_hw_params)
+        let ioctl = Sys::IOCTL as u32;
         b.iter(|| {
             let cmd = black_box(cmd);
             black_box(
-                matches!(Sys::try_from(black_box(16u32)), Ok(Sys::IOCTL))
+                matches!(Sys::try_from(black_box(ioctl)), Ok(Sys::IOCTL))
                     && ((cmd >> 8) & 0xff) == b'A' as u32
                     && (cmd & 0xff) == 0x10,
             )
@@ -1452,10 +1460,19 @@ mod benches {
     /// between 6.0 and 7.0 ns, and crucially the *accepted* and *refused* row
     /// of the same helper land there together, to within noise, although they
     /// take different branches and return different values. A figure that
-    /// does not move when the work does is not the work. So this harness has
-    /// a **second floor** above the 0.6 ns one, and a row sitting on it means
-    /// "too cheap to measure this way", not "6.5 nanoseconds of decision".
-    /// Compare any such row against this one before reading a cost into it.
+    /// does not move when the work does is not the work.
+    ///
+    /// What this row establishes is bounded, and worth stating plainly: it is
+    /// the floor **for a row of this shape** -- a helper the compiler keeps
+    /// out of line, returning an `LxResult` in the two-register layout. It is
+    /// not a universal 6.5 ns tax. A helper the compiler inlines has no such
+    /// floor and sits near 0.6 ns; a helper returning something of a different
+    /// size pays a different call cost; and two rows of a branchless helper
+    /// landing together is what branchless code does, not evidence of a
+    /// floor. So this is a yardstick to hold a row against, matched by shape,
+    /// and the pair of accepted and refused rows landing together is
+    /// corroboration, not proof. Where a row's shape does not match this
+    /// one, measure its own empty equivalent before reading a cost into it.
     #[bench]
     fn the_second_floor_control(b: &mut Bencher) {
         #[inline(never)]

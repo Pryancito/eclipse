@@ -210,6 +210,17 @@ decision"**, and the earlier claim here that argument validation costs "0.6 to
 12 ns" was reading the harness for the upper half of that range. Compare any
 row near 6.5 against this control before quoting it as a cost.
 
+What the control establishes is bounded, and the bound matters when applying
+it. It is the floor **for a row of that shape**: a helper the compiler keeps
+out of line, taking a register and returning an `LxResult` in the two-register
+layout. It is not a tax every row pays. A helper the compiler inlines has no
+such floor and sits near 0.6 ns, a helper returning something of a different
+size pays a different call cost, and two rows of a *branchless* helper landing
+together is what branchless code does rather than evidence of a floor. The
+dozen helpers listed above do match the control's shape, which is why the
+reading holds for them; a row whose shape does not match wants its own empty
+equivalent measured beside it before anything is read into the number.
+
 A flat family has a third cause worth knowing, because it looks identical to
 folding: a loop that never ran. `msync_distinct_vmos_over_64_pages` and `_over_512_pages`
 both read 11 ns once the mapping moved off address 0, and the reason was that
@@ -335,12 +346,23 @@ rows read 30 ns per page, flat, once the end was an end.
   for `(gid_t)-1` takes 3.9 us net of the vector it is handed, which is
   0.06 ns per gid -- vectorised -- against 6.4 us to clone the list. A
   `(gid_t)-1` at the front is found at once.
-- **Keeping the caller intact costs nothing.** `commit_and_report_old` and
-  `hand_out_pair` sit at the first floor, 0.6 to 1.1 ns, take-back path
-  included. The objection to a helper for "a call that fails must leave the
-  caller exactly as it found them" was always that it costs something; it does
-  not, and writing it by hand at each call site is what left `pipe2((int *)1,
-  0)` leaking two descriptors a turn.
+- **Keeping the caller intact costs about a nanosecond.** With each closure's
+  whole `Result` black-boxed -- so the helper cannot be told which way its `?`
+  goes before it runs -- `hand_out_one` is 0.75 ns when the number reaches the
+  caller and 0.91 ns when the descriptor comes back out of the table;
+  `hand_out_pair` is 0.99 / 1.15 ns, and 1.34 ns when the second descriptor is
+  the one that fails; `commit_and_report_old` is 0.92 ns with a NULL
+  out-pointer and 1.26 ns with a real copy out, which is the copy showing up,
+  and 0.91 ns when the change itself fails and the copy never happens. The
+  ordering is the control flow: every row differs from its sibling in the
+  direction the extra work goes, which is how you know the rows ran.
+  Black-boxing only the value inside the `Ok` left the discriminant visible
+  and the branch foldable; these are the figures after fixing that. The
+  objection to a helper for "a call that fails must leave the caller exactly
+  as it found them" was always that it costs something: it costs a
+  nanosecond, against the ~330 ns of the syscall entry it sits inside, and
+  writing it by hand at each call site is what left `pipe2((int *)1, 0)`
+  leaking two descriptors a turn.
 
 ## What the FreeBSD personality said
 

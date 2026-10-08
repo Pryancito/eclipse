@@ -1106,16 +1106,24 @@ mod siginfo_layout_tests {
     /// reads as all-zero whenever that memory happened to be zero -- which is
     /// most of the time on a quiet machine, and is exactly why this went
     /// unnoticed. The sum of the field sizes equalling the struct's size is
-    /// the property itself: it holds now, and without `_pad` it is 124
-    /// against 128.
+    /// the property itself.
+    ///
+    /// Every term is `size_of_val` of the field it names, never a type
+    /// written out by hand. That is what makes the test a guard rather than
+    /// a restatement: with `size_of::<u32>()` spelled out for `_pad`, taking
+    /// the field away would leave the sum at 128 and the struct back at 128
+    /// through implicit alignment, so the test would pass over the very leak
+    /// it exists to catch. Named this way, taking the field away does not
+    /// compile.
     #[test]
     fn a_siginfo_has_no_implicit_padding() {
-        use core::mem::size_of;
-        let fields = size_of::<i32>()          // si_signo
-            + size_of::<i32>()                 // si_errno
-            + size_of::<SignalCode>()          // si_code
-            + size_of::<u32>()                 // _pad
-            + size_of::<SiginfoFields>(); // the union
+        use core::mem::{size_of, size_of_val};
+        let info = SigInfo::default();
+        let fields = size_of_val(&info.signo)
+            + size_of_val(&info.errno)
+            + size_of_val(&info.code)
+            + size_of_val(&info._pad)
+            + size_of_val(&info.field);
         assert_eq!(
             fields,
             size_of::<SigInfo>(),
