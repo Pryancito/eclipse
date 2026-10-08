@@ -1066,6 +1066,11 @@ const HUB_FEAT_C_PORT_ENABLE: u16 = 17;
 const HUB_FEAT_C_PORT_SUSPEND: u16 = 18;
 const HUB_FEAT_C_PORT_OVER_CURRENT: u16 = 19;
 const HUB_FEAT_C_PORT_RESET: u16 = 20;
+/// Solo USB 2.0 con LPM.
+const HUB_FEAT_C_PORT_L1: u16 = 23;
+/// Solo SuperSpeed.
+const HUB_FEAT_C_PORT_LINK_STATE: u16 = 25;
+const HUB_FEAT_C_PORT_CONFIG_ERROR: u16 = 26;
 const HUB_FEAT_C_BH_PORT_RESET: u16 = 29;
 /// Bits de `wPortStatus` (USB 2.0 §11.24.2.7.1).
 const HUB_PORT_CONNECTION: u16 = 1 << 0;
@@ -1073,15 +1078,44 @@ const HUB_PORT_ENABLE: u16 = 1 << 1;
 const HUB_PORT_RESET: u16 = 1 << 4;
 const HUB_PORT_LOW_SPEED: u16 = 1 << 9;
 const HUB_PORT_HIGH_SPEED: u16 = 1 << 10;
-/// Bits de `wPortChange`, en el mismo orden que sus características `C_*`.
-const HUB_PORT_CHANGES: [(u16, u16); 6] = [
+/// Bits de `wPortChange` de un hub USB 2.0 y la característica que limpia cada
+/// uno (USB 2.0 §11.24.2.7.2, con el bit 5 de la ECN de LPM).
+const HUB_PORT_CHANGES_USB2: [(u16, u16); 6] = [
     (1 << 0, HUB_FEAT_C_PORT_CONNECTION),
     (1 << 1, HUB_FEAT_C_PORT_ENABLE),
     (1 << 2, HUB_FEAT_C_PORT_SUSPEND),
     (1 << 3, HUB_FEAT_C_PORT_OVER_CURRENT),
     (1 << 4, HUB_FEAT_C_PORT_RESET),
-    (1 << 5, HUB_FEAT_C_BH_PORT_RESET),
+    (1 << 5, HUB_FEAT_C_PORT_L1),
 ];
+
+/// Y los de un hub SuperSpeed (USB 3.2 §10.16.2.6), que no son los mismos: los
+/// bits 1 y 2 son reservados, el 5 es `C_BH_PORT_RESET` en vez de `C_PORT_L1`,
+/// y existen dos más arriba que USB 2.0 no tiene.
+const HUB_PORT_CHANGES_SS: [(u16, u16); 6] = [
+    (1 << 0, HUB_FEAT_C_PORT_CONNECTION),
+    (1 << 3, HUB_FEAT_C_PORT_OVER_CURRENT),
+    (1 << 4, HUB_FEAT_C_PORT_RESET),
+    (1 << 5, HUB_FEAT_C_BH_PORT_RESET),
+    (1 << 6, HUB_FEAT_C_PORT_LINK_STATE),
+    (1 << 7, HUB_FEAT_C_PORT_CONFIG_ERROR),
+];
+
+/// La tabla que le toca a un hub por su velocidad.
+///
+/// Con una sola tabla para los dos protocolos, un cambio se reconoce con la
+/// característica de otro y el bit se queda puesto: el hub vuelve a señalar ese
+/// puerto en cada informe de cambio de estado para siempre, y el driver lo
+/// vuelve a leer para siempre. Es lo que pasaba con el bit 5 en un hub USB 2.0
+/// (que es `C_PORT_L1`, no `C_BH_PORT_RESET`) y con los bits 6 y 7 de un hub
+/// SuperSpeed, que no se limpiaban nunca.
+fn hub_port_changes(hub_speed: u8) -> &'static [(u16, u16)] {
+    if hub_speed >= SPEED_SUPER {
+        &HUB_PORT_CHANGES_SS
+    } else {
+        &HUB_PORT_CHANGES_USB2
+    }
+}
 /// Un route string lleva cinco niveles de cuatro bits (xHCI §8.9), así que un
 /// dispositivo no puede estar a más de cinco hubs de la raíz.
 const USB_MAX_TIERS: u8 = 5;
@@ -4185,7 +4219,7 @@ impl XhciInner {
         // Reconocer los cambios ANTES de enumerar, y solo esos, por la misma
         // razón que en `handle_port_status_change`: la enumeración tarda, y un
         // desenchufe que ocurra mientras corre no se puede perder.
-        for (bit, feat) in HUB_PORT_CHANGES {
+        for &(bit, feat) in hub_port_changes(hub_speed) {
             if change & bit != 0 {
                 let _ = self.hub_port_feature(hub_slot, false, feat, port);
             }
@@ -4218,7 +4252,7 @@ impl XhciInner {
             spins = spins.saturating_add(1);
             let (s, c) = self.hub_port_status(hub_slot, port)?;
             status = s;
-            for (bit, feat) in HUB_PORT_CHANGES {
+            for &(bit, feat) in hub_port_changes(hub_speed) {
                 if c & bit != 0 {
                     let _ = self.hub_port_feature(hub_slot, false, feat, port);
                 }
@@ -9743,20 +9777,69 @@ mod hub_tests {
     }
 
     #[test]
-    fn every_change_bit_has_the_feature_that_clears_it() {
-        // El bit N de wPortChange se limpia con C_PORT_*; si la tabla se
-        // desalinea, un cambio se reconoce con la característica de otro y el
-        // puerto se queda avisando para siempre.
+    fn every_change_bit_of_a_usb2_hub_has_the_feature_that_clears_it() {
+        // Si la tabla se desalinea, un cambio se reconoce con la caracteristica
+        // de otro y el bit se queda puesto: el hub vuelve a señalar ese puerto
+        // en cada informe, para siempre.
         assert_eq!(
-            HUB_PORT_CHANGES,
+            HUB_PORT_CHANGES_USB2,
             [
-                (1 << 0, 16),
-                (1 << 1, 17),
-                (1 << 2, 18),
-                (1 << 3, 19),
-                (1 << 4, 20),
-                (1 << 5, 29),
+                (1 << 0, 16), // C_PORT_CONNECTION
+                (1 << 1, 17), // C_PORT_ENABLE
+                (1 << 2, 18), // C_PORT_SUSPEND
+                (1 << 3, 19), // C_PORT_OVER_CURRENT
+                (1 << 4, 20), // C_PORT_RESET
+                (1 << 5, 23), // C_PORT_L1, no C_BH_PORT_RESET
             ]
         );
+    }
+
+    #[test]
+    fn a_superspeed_hub_has_its_own_change_bits_and_they_are_not_the_usb2_ones() {
+        assert_eq!(
+            HUB_PORT_CHANGES_SS,
+            [
+                (1 << 0, 16), // C_PORT_CONNECTION
+                (1 << 3, 19), // C_OVER_CURRENT
+                (1 << 4, 20), // C_PORT_RESET
+                (1 << 5, 29), // C_BH_PORT_RESET
+                (1 << 6, 25), // C_PORT_LINK_STATE
+                (1 << 7, 26), // C_PORT_CONFIG_ERROR
+            ]
+        );
+        // Los bits 1 y 2 son reservados en SuperSpeed: mandarle un
+        // CLEAR_FEATURE(C_PORT_ENABLE) a un hub SS es una peticion que no
+        // existe en su protocolo.
+        assert!(!HUB_PORT_CHANGES_SS
+            .iter()
+            .any(|&(bit, _)| bit == 1 << 1 || bit == 1 << 2));
+    }
+
+    #[test]
+    fn each_hub_is_given_the_table_of_its_own_protocol() {
+        assert_eq!(hub_port_changes(SPEED_LOW), &HUB_PORT_CHANGES_USB2);
+        assert_eq!(hub_port_changes(SPEED_FULL), &HUB_PORT_CHANGES_USB2);
+        assert_eq!(hub_port_changes(SPEED_HIGH), &HUB_PORT_CHANGES_USB2);
+        assert_eq!(hub_port_changes(SPEED_SUPER), &HUB_PORT_CHANGES_SS);
+        // SuperSpeed Gen2 y lo que venga por encima siguen siendo SuperSpeed.
+        assert_eq!(hub_port_changes(5), &HUB_PORT_CHANGES_SS);
+        assert_eq!(hub_port_changes(6), &HUB_PORT_CHANGES_SS);
+    }
+
+    #[test]
+    fn no_change_bit_is_left_without_a_feature_to_clear_it() {
+        // Un bit señalado que ninguna tabla sabe limpiar es el fallo entero:
+        // el puerto se queda avisando y el driver releyendolo. Para cada
+        // protocolo, todo bit que su wPortChange define tiene su fila.
+        let usb2_defined: u16 = 0b0011_1111;
+        let covered: u16 = HUB_PORT_CHANGES_USB2
+            .iter()
+            .fold(0, |acc, &(bit, _)| acc | bit);
+        assert_eq!(covered, usb2_defined);
+        let ss_defined: u16 = 0b1111_1001;
+        let covered_ss: u16 = HUB_PORT_CHANGES_SS
+            .iter()
+            .fold(0, |acc, &(bit, _)| acc | bit);
+        assert_eq!(covered_ss, ss_defined);
     }
 }
