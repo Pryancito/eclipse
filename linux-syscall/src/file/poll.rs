@@ -293,13 +293,29 @@ fn io_wait_interval(
     io_wait_interval_for(watch_net, watch_interactive, terminal_only, on_active_vt)
 }
 
-fn arm_io_wait(cx: &mut Context, watch_net: bool, watch_interactive: bool, io_armed: &mut bool) {
+fn arm_io_wait(
+    cx: &mut Context,
+    watch_net: bool,
+    watch_interactive: bool,
+    watch_hid: bool,
+    io_armed: &mut bool,
+) {
     if *io_armed {
-        linux_object::net::retain_io_wait_wakers(cx.waker(), watch_net, watch_interactive);
+        linux_object::net::retain_io_wait_wakers_hid(
+            cx.waker(),
+            watch_net,
+            watch_interactive,
+            watch_hid,
+        );
         *io_armed = false;
         return;
     }
-    linux_object::net::register_io_wait_wakers(cx.waker(), watch_net, watch_interactive);
+    linux_object::net::register_io_wait_wakers_hid(
+        cx.waker(),
+        watch_net,
+        watch_interactive,
+        watch_hid,
+    );
     *io_armed = true;
 }
 
@@ -308,10 +324,11 @@ fn clear_poll_io(
     io_waker: &mut Option<core::task::Waker>,
     watch_net: bool,
     watch_interactive: bool,
+    watch_hid: bool,
 ) {
     kill_poll_timer(timer);
     if let Some(w) = io_waker.take() {
-        linux_object::net::clear_io_wait_wakers(&w, watch_net, watch_interactive);
+        linux_object::net::clear_io_wait_wakers_hid(&w, watch_net, watch_interactive, watch_hid);
     }
 }
 
@@ -344,6 +361,11 @@ impl Syscall<'_> {
             /// Last watch flags + waker parked in IRQ lists (for Drop cleanup).
             watch_net: bool,
             watch_interactive: bool,
+            /// This set holds an input device (directly, or inside a nested
+            /// epoll), so an input frame must wake this wait rather than
+            /// leaving it to the re-scan tick. See
+            /// `linux_object::fs::devfs::input::wait`.
+            watch_hid: bool,
             /// Every fd in the set is a terminal: the only shape that may be
             /// demoted to the slow background-VT tick (see `io_wait_interval`).
             terminal_only: bool,
@@ -357,7 +379,8 @@ impl Syscall<'_> {
             fn drop(&mut self) {
                 let wn = self.watch_net;
                 let wi = self.watch_interactive;
-                clear_poll_io(&mut self.timer, &mut self.io_waker, wn, wi);
+                let wh = self.watch_hid;
+                clear_poll_io(&mut self.timer, &mut self.io_waker, wn, wi, wh);
             }
         }
         impl<'a> Future for PollFuture<'a> {
@@ -377,10 +400,27 @@ impl Syscall<'_> {
                     .polls
                     .iter()
                     .any(|p| linux_object::net::fd_is_interactive(p.fd));
+                let watch_hid = {
+                    let proc = this.syscall.linux_process();
+                    this.polls.iter().any(|p| {
+                        <FileDesc as Into<i32>>::into(p.fd) >= 0
+                            && proc
+                                .get_file_like(p.fd)
+                                .map(|f| f.is_input_device())
+                                .unwrap_or(false)
+                    })
+                };
                 this.watch_net = watch_net;
                 this.watch_interactive = watch_interactive;
+                this.watch_hid = watch_hid;
                 if this.io_armed {
-                    arm_io_wait(cx, watch_net, watch_interactive, &mut this.io_armed);
+                    arm_io_wait(
+                        cx,
+                        watch_net,
+                        watch_interactive,
+                        watch_hid,
+                        &mut this.io_armed,
+                    );
                 }
                 linux_object::net::io_wait_tick(watch_net, watch_interactive);
                 let proc = this.syscall.linux_process();
@@ -443,6 +483,7 @@ impl Syscall<'_> {
                         &mut this.io_waker,
                         watch_net,
                         watch_interactive,
+                        watch_hid,
                     );
                     return Poll::Ready(Err(err));
                 }
@@ -453,6 +494,7 @@ impl Syscall<'_> {
                         &mut this.io_waker,
                         watch_net,
                         watch_interactive,
+                        watch_hid,
                     );
                     return Poll::Ready(Ok(events));
                 }
@@ -467,6 +509,7 @@ impl Syscall<'_> {
                         &mut this.io_waker,
                         watch_net,
                         watch_interactive,
+                        watch_hid,
                     );
                     return Poll::Ready(Err(e));
                 }
@@ -519,6 +562,7 @@ impl Syscall<'_> {
                             &mut this.io_waker,
                             watch_net,
                             watch_interactive,
+                            watch_hid,
                         );
                         return Poll::Ready(Ok(0));
                     }
@@ -534,7 +578,13 @@ impl Syscall<'_> {
                             )
                         };
                         let wake_in = wake_after(limit, tick);
-                        arm_io_wait(cx, watch_net, watch_interactive, &mut this.io_armed);
+                        arm_io_wait(
+                            cx,
+                            watch_net,
+                            watch_interactive,
+                            watch_hid,
+                            &mut this.io_armed,
+                        );
                         this.io_waker = Some(cx.waker().clone());
                         schedule_poll_wakeup(cx, wake_in, &mut this.timer);
                     }
@@ -553,6 +603,7 @@ impl Syscall<'_> {
             timer: None,
             watch_net: false,
             watch_interactive: false,
+            watch_hid: false,
             terminal_only: false,
             io_waker: None,
             subs: Vec::new(),
@@ -748,6 +799,17 @@ impl Syscall<'_> {
                     || write_fds.contains(FileDesc::from(fd))
                     || err_fds.contains(FileDesc::from(fd)))
         });
+        // Same for whether the set holds an input device: an evdev node has
+        // no event bus to subscribe to, so without this registration a key or
+        // a mouse frame would be found only by the re-scan tick.
+        let watch_hid = {
+            let files = self.linux_process().get_files()?;
+            (0..nfds).any(|fd| {
+                let fd = FileDesc::from(fd);
+                (read_fds.contains(fd) || write_fds.contains(fd) || err_fds.contains(fd))
+                    && files.get(&fd).map(|f| f.is_input_device()).unwrap_or(false)
+            })
+        };
         // Membership is fixed, so the "only terminals" shape is too — the one
         // shape `io_wait_interval` may demote to the background-VT tick.
         let terminal_only = {
@@ -770,6 +832,11 @@ impl Syscall<'_> {
             nfds: usize,
             watch_net: bool,
             watch_interactive: bool,
+            /// This set holds an input device (directly, or inside a nested
+            /// epoll), so an input frame must wake this wait rather than
+            /// leaving it to the re-scan tick. See
+            /// `linux_object::fs::devfs::input::wait`.
+            watch_hid: bool,
             /// See `PollFuture::terminal_only`.
             terminal_only: bool,
             timeout_msecs: isize,
@@ -786,7 +853,8 @@ impl Syscall<'_> {
             fn drop(&mut self) {
                 let wn = self.watch_net;
                 let wi = self.watch_interactive;
-                clear_poll_io(&mut self.timer, &mut self.io_waker, wn, wi);
+                let wh = self.watch_hid;
+                clear_poll_io(&mut self.timer, &mut self.io_waker, wn, wi, wh);
             }
         }
 
@@ -799,9 +867,16 @@ impl Syscall<'_> {
                 this.subs.clear();
                 let watch_net = this.watch_net;
                 let watch_interactive = this.watch_interactive;
+                let watch_hid = this.watch_hid;
                 let terminal_only = this.terminal_only;
                 if this.io_armed {
-                    arm_io_wait(cx, watch_net, watch_interactive, &mut this.io_armed);
+                    arm_io_wait(
+                        cx,
+                        watch_net,
+                        watch_interactive,
+                        watch_hid,
+                        &mut this.io_armed,
+                    );
                 }
                 linux_object::net::io_wait_tick(watch_net, watch_interactive);
                 let files = this.syscall.linux_process().get_files()?;
@@ -851,6 +926,7 @@ impl Syscall<'_> {
                         &mut this.io_waker,
                         watch_net,
                         watch_interactive,
+                        watch_hid,
                     );
                     return Poll::Ready(Err(err));
                 }
@@ -862,6 +938,7 @@ impl Syscall<'_> {
                         &mut this.io_waker,
                         watch_net,
                         watch_interactive,
+                        watch_hid,
                     );
                     // Flush the ready bitmaps to user space once.
                     this.read_fds.commit();
@@ -876,6 +953,7 @@ impl Syscall<'_> {
                         &mut this.io_waker,
                         watch_net,
                         watch_interactive,
+                        watch_hid,
                     );
                     return Poll::Ready(Err(e));
                 }
@@ -925,6 +1003,7 @@ impl Syscall<'_> {
                             &mut this.io_waker,
                             watch_net,
                             watch_interactive,
+                            watch_hid,
                         );
                         return Poll::Ready(Ok(0));
                     }
@@ -940,7 +1019,13 @@ impl Syscall<'_> {
                             )
                         };
                         let wake_in = wake_after(limit, tick);
-                        arm_io_wait(cx, watch_net, watch_interactive, &mut this.io_armed);
+                        arm_io_wait(
+                            cx,
+                            watch_net,
+                            watch_interactive,
+                            watch_hid,
+                            &mut this.io_armed,
+                        );
                         this.io_waker = Some(cx.waker().clone());
                         schedule_poll_wakeup(cx, wake_in, &mut this.timer);
                     }
@@ -955,6 +1040,7 @@ impl Syscall<'_> {
             nfds,
             watch_net,
             watch_interactive,
+            watch_hid,
             terminal_only,
             timeout_msecs,
             begin_time,

@@ -4,7 +4,7 @@ pub mod drm_scheme;
 pub mod drm_trail;
 mod dsp;
 mod fbdev;
-mod input;
+pub mod input;
 #[cfg(test)]
 pub(crate) mod kms_emu;
 mod mixer;

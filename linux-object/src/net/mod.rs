@@ -991,21 +991,52 @@ pub fn register_io_wait_wakers(
     watch_net: bool,
     watch_interactive: bool,
 ) {
+    register_io_wait_wakers_hid(waker, watch_net, watch_interactive, false)
+}
+
+/// [`register_io_wait_wakers`] plus the input-device list.
+///
+/// `watch_hid` is its own flag and not folded into `watch_interactive`, which
+/// is true for every non-socket fd: an input frame fires its list, and a
+/// 1 kHz mouse firing the TTY list would wake every shell parked on a spare
+/// VT a thousand times a second. See `crate::fs::devfs::input::wait`.
+pub fn register_io_wait_wakers_hid(
+    waker: &core::task::Waker,
+    watch_net: bool,
+    watch_interactive: bool,
+    watch_hid: bool,
+) {
     if watch_net {
         kernel_hal::net::register_net_rx_waker(waker.clone());
     }
     if watch_interactive {
         crate::fs::stdio::register_tty_intr_waker(waker.clone());
     }
+    if watch_hid {
+        crate::fs::devfs::input::wait::register_input_waker(waker.clone());
+    }
 }
 
 /// Called on the poll after an IRQ or timer wake (keep registrations).
 pub fn retain_io_wait_wakers(waker: &core::task::Waker, watch_net: bool, watch_interactive: bool) {
+    retain_io_wait_wakers_hid(waker, watch_net, watch_interactive, false)
+}
+
+/// [`retain_io_wait_wakers`] plus the input-device list.
+pub fn retain_io_wait_wakers_hid(
+    waker: &core::task::Waker,
+    watch_net: bool,
+    watch_interactive: bool,
+    watch_hid: bool,
+) {
     if watch_net {
         kernel_hal::net::retain_net_rx_waker(waker);
     }
     if watch_interactive {
         crate::fs::stdio::retain_tty_intr_waker(waker);
+    }
+    if watch_hid {
+        crate::fs::devfs::input::wait::retain_input_waker(waker);
     }
 }
 
@@ -1013,11 +1044,26 @@ pub fn retain_io_wait_wakers(waker: &core::task::Waker, watch_net: bool, watch_i
 /// dropped. Without this, epoll/poll re-arm leaves stale entries that a later
 /// IRQ can fire into after the wait cycle finished.
 pub fn clear_io_wait_wakers(waker: &core::task::Waker, watch_net: bool, watch_interactive: bool) {
+    clear_io_wait_wakers_hid(waker, watch_net, watch_interactive, false)
+}
+
+/// [`clear_io_wait_wakers`] plus the input-device list. Always safe to pass
+/// `watch_hid: true` on a clear: removing a registration that was never made
+/// is a no-op, and leaving one behind is what fires into a recycled task.
+pub fn clear_io_wait_wakers_hid(
+    waker: &core::task::Waker,
+    watch_net: bool,
+    watch_interactive: bool,
+    watch_hid: bool,
+) {
     if watch_net {
         kernel_hal::net::clear_net_rx_waker(waker);
     }
     if watch_interactive {
         crate::fs::stdio::clear_tty_intr_waker(waker);
+    }
+    if watch_hid {
+        crate::fs::devfs::input::wait::clear_input_waker(waker);
     }
 }
 
