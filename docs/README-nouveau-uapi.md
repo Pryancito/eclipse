@@ -354,6 +354,17 @@ escalera compartida `step16` (client/device/subdevice) se construyen hasta
   `nvidia.nocepresent`). Es la única vía a algo de aceleración en una caja de
   **una sola GPU**: sin segunda tarjeta no hay de dónde hacer P2P, así que una
   GPU de consola fría significa blit por CPU y nada más.
+- **`osInitMapping`**: la mitad portable de la implementación de Linux
+  (`osinit.c:1260`) vive ahora en `vendor/eclipse_rm_init.c`: desactiva el
+  mapeo de la ROM de expansión y pone el latency timer PCI al máximo, por la
+  ventana `NV_PCFG` de la propia tarjeta. Antes era un stub de
+  `os_boundary.rs` que devolvía `NV_ERR_NOT_SUPPORTED`, y como
+  `kbifInit` (`kernel_bif.c:130`) la llama bajo `NV_CHECK_OK_OR_RETURN`, eso
+  abortaba `gpuStatePreInit` en la etapa 4: la GPU de consola quedaba
+  enganchada pero sin estado RM ninguno (`PFB_CSTATUS=0xbadf5040`, runlists a
+  cero). Corre en **todas** las tarjetas que engancha el RM, también la de
+  cómputo, así que `nvidia.noosinitmapping` devuelve el stub viejo sin
+  recompilar.
 - **Prime GRAPHICS**: `ctx_prime` exige compute+3D; un fallo **descarta** el
   contexto (software fallback) en vez de publicar READY y colgar FECS en el
   primer draw. `step18` también prima GRAPHICS en ctx0. Timeout de prime =

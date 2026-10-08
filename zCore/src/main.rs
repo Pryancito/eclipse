@@ -769,6 +769,19 @@ fn primary_main(config: kernel_hal::KernelConfig) {
             // instead, once the pause is in place (see
             // `schedule_deferred_console_bringup`). Passing both flags is still
             // the way to ask for on-demand bring-up at the first client.
+            // Escape hatch for the real `osInitMapping` (the portable half of
+            // Linux's osinit.c:1260, implemented in `eclipse_rm_init.c`). It
+            // runs on EVERY GPU the RM attaches, the compute card included, so
+            // if those two config-space writes ever disturb a path that works
+            // today, this flag puts back the old `NV_ERR_NOT_SUPPORTED` without
+            // a rebuild. Expect `gpuStatePreInit` to fail at BIF when it is on.
+            if kernel_hal::cmdline::flag(&options.cmdline, "nvidia.noosinitmapping") {
+                kernel_hal::drivers::set_osinit_mapping_enabled(false);
+                klog_info!(
+                    "Eclipse: nvidia.noosinitmapping -- osInitMapping vuelve a NOT_SUPPORTED \
+                     (gpuStatePreInit fallara en kbifInit)"
+                );
+            }
             if kernel_hal::cmdline::flag(&options.cmdline, "nvidia.console_gsp") {
                 kernel_hal::drivers::set_console_gsp_enabled(true);
                 klog_info!(

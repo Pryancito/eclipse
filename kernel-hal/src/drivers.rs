@@ -296,6 +296,25 @@ pub fn console_gsp_enabled() -> bool {
     false
 }
 
+/// Turns Eclipse's real `osInitMapping` off again (`nvidia.noosinitmapping`),
+/// putting back the `NV_ERR_NOT_SUPPORTED` that used to abort `kbifInit`.
+/// Default ON. No-op where the NVIDIA driver doesn't exist.
+#[cfg(target_arch = "x86_64")]
+pub fn set_osinit_mapping_enabled(v: bool) {
+    zcore_drivers::display::set_osinit_mapping_enabled(v);
+}
+#[cfg(not(target_arch = "x86_64"))]
+pub fn set_osinit_mapping_enabled(_v: bool) {}
+
+#[cfg(target_arch = "x86_64")]
+pub fn osinit_mapping_enabled() -> bool {
+    zcore_drivers::display::osinit_mapping_enabled()
+}
+#[cfg(not(target_arch = "x86_64"))]
+pub fn osinit_mapping_enabled() -> bool {
+    false
+}
+
 /// Hands the NVIDIA RM a provider of real per-thread identity (see
 /// `zcore_drivers::display::set_rm_thread_id_provider`). No-op off x86_64.
 #[cfg(target_arch = "x86_64")]
