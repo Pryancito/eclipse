@@ -751,13 +751,17 @@ mod scrollback_tests {
 
     /// A display whose aperture is a heap buffer, sized in character cells so
     /// the console's `width()`/`height()` come out exactly as asked.
-    struct FakeDisplay {
+    ///
+    /// `pub(super)` so the bench module beside this one can build a console
+    /// over it too, rather than growing a second fake that could drift from
+    /// this one and quietly measure a different display.
+    pub(super) struct FakeDisplay {
         info: DisplayInfo,
         mem: Mutex<Vec<u8>>,
     }
 
     impl FakeDisplay {
-        fn new(cols: usize, rows: usize) -> Arc<Self> {
+        pub(super) fn new(cols: usize, rows: usize) -> Arc<Self> {
             let width = (cols * CHAR_WIDTH) as u32;
             let height = (rows * CHAR_HEIGHT) as u32;
             let pitch = width * 4;
@@ -1531,5 +1535,267 @@ mod scrollback_tests {
         lsb.buf.truncate(1);
         lsb.new_line(tagged(22));
         assert_eq!(lsb.buf.len(), 3);
+    }
+}
+
+#[cfg(test)]
+mod benches {
+    //! What a line of kernel output costs on the graphical console.
+    //!
+    //! This matters for two reasons that have both bitten this tree. The
+    //! first is the panic path: a report that must get out goes over the
+    //! serial line and NOT through here, and knowing what "through here"
+    //! costs is what makes that split a decision rather than a habit. The
+    //! second is the cursor blink, which reaches `present` from a hard IRQ
+    //! with no current thread -- the path that needed a fat-pointer guard
+    //! before it would stop faulting, and where anything expensive is
+    //! expensive with interrupts off.
+    //!
+    //! The rows use the same `FakeDisplay` as the tests beside them, whose
+    //! aperture is a heap buffer, so the blits run for real against memory.
+    //! A real framebuffer is uncached write-combining across a PCI aperture,
+    //! so **every pixel figure here is a lower bound** -- the arithmetic and
+    //! the cell bookkeeping are faithful, the stores are not.
+    //!
+    //! `black_box` goes around the inputs, not only the result; see
+    //! `docs/README-benchmarks.md`.
+
+    use super::scrollback_tests::FakeDisplay;
+    use super::*;
+    use rcore_console::Color;
+    use test::{black_box, Bencher};
+
+    /// 80x25, which is what the console comes up as.
+    const COLS: usize = 80;
+    const ROWS: usize = 25;
+
+    fn console(cols: usize, rows: usize) -> LinearScrollbackBuffer {
+        LinearScrollbackBuffer::new(FakeDisplay::new(cols, rows))
+    }
+
+    /// A blank cell with a distinguishable background, so nothing the
+    /// compiler can see makes a write a no-op.
+    fn cell(tag: u8) -> Cell {
+        Cell {
+            c: 'x',
+            fg: Cell::default().fg,
+            bg: Color::Indexed(tag),
+            flags: Flags::empty(),
+        }
+    }
+
+    // ---- the IRQ-path guard ---------------------------------------------
+
+    /// The fat-pointer liveness check that stands in front of every
+    /// `present` reached from the timer tick. It was added because a
+    /// half-torn-down display there is a call through a smashed vtable in
+    /// IRQ context; what it costs decides whether asking on every blink is
+    /// reasonable.
+    #[bench]
+    fn display_dispatchable_on_a_live_display(b: &mut Bencher) {
+        let display: Arc<dyn DisplayScheme> = FakeDisplay::new(COLS, ROWS);
+        b.iter(|| black_box(display_dispatchable(black_box(&display))));
+    }
+
+    // ---- one character --------------------------------------------------
+
+    /// One cell: the cache store plus the glyph blit. Multiply by the width
+    /// of a log line for what printing it costs.
+    #[bench]
+    fn write_one_cell(b: &mut Bencher) {
+        let mut con = console(COLS, ROWS);
+        let mut tag = 17u8;
+        b.iter(|| {
+            tag = if tag >= 230 { 17 } else { tag + 1 };
+            con.write(black_box(3), black_box(10), black_box(cell(tag)))
+        });
+    }
+
+    /// Reading a cell back, which is what `redraw` does per cell.
+    #[bench]
+    fn read_one_cell(b: &mut Bencher) {
+        let con = console(COLS, ROWS);
+        b.iter(|| black_box(black_box(&con).read(black_box(3), black_box(10))));
+    }
+
+    // ---- a newline, which is a scroll -----------------------------------
+
+    /// `new_line` at the bottom of the screen: rotate the row cache, push
+    /// the departing line into the history, and move a pixel band up by one
+    /// character cell. This is what every line of kernel log past the first
+    /// screenful costs.
+    fn bench_new_line(b: &mut Bencher, cols: usize, rows: usize) {
+        let mut con = console(cols, rows);
+        con.set_cursor(rows - 1, 0);
+        let mut tag = 17u8;
+        b.iter(|| {
+            tag = if tag >= 230 { 17 } else { tag + 1 };
+            con.new_line(black_box(cell(tag)))
+        });
+    }
+
+    /// The console's own geometry.
+    #[bench]
+    fn new_line_on_80x25(b: &mut Bencher) {
+        bench_new_line(b, COLS, ROWS);
+    }
+
+    /// A 1080p-ish console, which is what the machine actually boots into:
+    /// if the cost is the pixel band then this is where it shows.
+    #[bench]
+    fn new_line_on_240x67(b: &mut Bencher) {
+        bench_new_line(b, 240, 67);
+    }
+
+    /// Twice the rows at the same width, to separate "per row of cache"
+    /// from "per pixel moved".
+    #[bench]
+    fn new_line_on_80x50(b: &mut Bencher) {
+        bench_new_line(b, COLS, 50);
+    }
+
+    // ---- a region scroll ------------------------------------------------
+
+    /// `scroll_region_up` over the whole screen by one line: what an
+    /// escape-sequence scroll from a full-screen program (an editor, `less`)
+    /// costs, against `new_line`'s same-shaped move.
+    #[bench]
+    fn scroll_region_up_the_whole_screen_by_1(b: &mut Bencher) {
+        let mut con = console(COLS, ROWS);
+        b.iter(|| {
+            con.scroll_region_up(
+                black_box(0),
+                black_box(ROWS - 1),
+                black_box(1),
+                black_box(cell(18)),
+            )
+        });
+    }
+
+    /// The same by more lines at once. If the cost is per line rather than
+    /// per call, a program that scrolls a page pays for every line of it.
+    #[bench]
+    fn scroll_region_up_the_whole_screen_by_12(b: &mut Bencher) {
+        let mut con = console(COLS, ROWS);
+        b.iter(|| {
+            con.scroll_region_up(
+                black_box(0),
+                black_box(ROWS - 1),
+                black_box(12),
+                black_box(cell(18)),
+            )
+        });
+    }
+
+    /// Downward, which is the other half of a scroll region.
+    #[bench]
+    fn scroll_region_down_the_whole_screen_by_1(b: &mut Bencher) {
+        let mut con = console(COLS, ROWS);
+        b.iter(|| {
+            con.scroll_region_down(
+                black_box(0),
+                black_box(ROWS - 1),
+                black_box(1),
+                black_box(cell(18)),
+            )
+        });
+    }
+
+    /// A small region, so the pair says whether the cost follows the band's
+    /// height or the screen's.
+    #[bench]
+    fn scroll_region_up_four_rows_by_1(b: &mut Bencher) {
+        let mut con = console(COLS, ROWS);
+        b.iter(|| {
+            con.scroll_region_up(
+                black_box(4),
+                black_box(8),
+                black_box(1),
+                black_box(cell(18)),
+            )
+        });
+    }
+
+    // ---- clearing and repainting ----------------------------------------
+
+    /// `clear`, which is `\x1b[2J` and also what a fresh console does.
+    #[bench]
+    fn clear_the_whole_screen(b: &mut Bencher) {
+        let mut con = console(COLS, ROWS);
+        b.iter(|| con.clear(black_box(cell(18))));
+    }
+
+    /// `redraw`: every cell of the cache back onto the pixels. This is the
+    /// expensive one by construction, and it is what scrolling the history
+    /// and a VT switch both run.
+    fn bench_redraw(b: &mut Bencher, cols: usize, rows: usize) {
+        let mut con = console(cols, rows);
+        for r in 0..rows {
+            for c in 0..cols {
+                con.write(r, c, cell(17 + (r % 200) as u8));
+            }
+        }
+        b.iter(|| black_box(&mut con).redraw());
+    }
+
+    #[bench]
+    fn redraw_80x25(b: &mut Bencher) {
+        bench_redraw(b, COLS, ROWS);
+    }
+
+    #[bench]
+    fn redraw_240x67(b: &mut Bencher) {
+        bench_redraw(b, 240, 67);
+    }
+
+    /// Scrolling the history by a line, which is `redraw` plus the mapping
+    /// of a scrollback position onto `history ++ buf`.
+    #[bench]
+    fn scroll_history_by_one_line(b: &mut Bencher) {
+        let mut con = console(COLS, ROWS);
+        // Fill the history so there is somewhere to scroll to.
+        con.set_cursor(ROWS - 1, 0);
+        for i in 0..200 {
+            con.new_line(cell(17 + (i % 200) as u8));
+        }
+        let mut dir = 1i32;
+        b.iter(|| {
+            dir = -dir;
+            black_box(&mut con).scroll_history(black_box(dir))
+        });
+    }
+
+    // ---- the present ----------------------------------------------------
+
+    /// `present`, which is the shadow buffer reaching the display: the call
+    /// the cursor blink makes from a hard IRQ every half second, and the one
+    /// the fat-pointer guard above stands in front of.
+    fn bench_present(b: &mut Bencher, cols: usize, rows: usize) {
+        let mut con = console(cols, rows);
+        for c in 0..cols {
+            con.write(0, c, cell(19));
+        }
+        b.iter(|| black_box(&con).present(black_box(true)));
+    }
+
+    #[bench]
+    fn present_80x25(b: &mut Bencher) {
+        bench_present(b, COLS, ROWS);
+    }
+
+    #[bench]
+    fn present_240x67(b: &mut Bencher) {
+        bench_present(b, 240, 67);
+    }
+
+    /// `present(false)`, the other half of the blink: same path, no cursor
+    /// drawn. The pair is what one blink of the cursor costs.
+    #[bench]
+    fn present_240x67_without_the_cursor(b: &mut Bencher) {
+        let mut con = console(240, 67);
+        for c in 0..240 {
+            con.write(0, c, cell(19));
+        }
+        b.iter(|| black_box(&con).present(black_box(false)));
     }
 }
