@@ -342,6 +342,43 @@ rows read 30 ns per page, flat, once the end was an end.
   not, and writing it by hand at each call site is what left `pipe2((int *)1,
   0)` leaking two descriptors a turn.
 
+## What the FreeBSD personality said
+
+- **Asking "is this fd a pipe" costs more than a small `splice` moves.**
+  `pipe_inode` is **32 ns**, hit or miss alike, and `splice_bytes` calls it
+  once per side plus a third `downcast_ref` at each use site -- so about 95 ns
+  of `TypeId` comparison through a vtable before a byte moves, against ~50 ns
+  for a whole 64-byte pipe round trip. For a `splice` of a page it is noise;
+  for the small ones it is most of the call. The shape that would fix it is
+  asking the `FileLike` what it is rather than trying to cast it to each
+  thing in turn.
+- **A `sysctl` is mostly allocation.** `sysctlbyname("hw.ncpu")` resolves the
+  name in 19.8 ns against 5.6 ns for a name that is not modelled, and the
+  difference is the `to_vec` that turns a static two-element MIB into a heap
+  allocation. Then `to_bytes` allocates again to produce the four bytes that
+  get copied out: 17.8 ns. A string leaf allocates twice over, 15.9 ns to
+  clone the hostname out of the context and 24.9 ns to serialise it. So an
+  8-byte answer costs about 38 ns of allocator, and libc's
+  `sysconf(_SC_NPROCESSORS_ONLN)` and jemalloc's initialisation both read
+  these before `main` runs.
+- **The flag translation is not the loop it looks like.** `sift` walks its
+  whole map on every call, thirteen entries for `open`, rebuilding a value
+  that never changes -- and it costs **0.17 ns per entry** (1.48 ns over a
+  two-entry map, 3.35 ns over thirteen). The maps are `const`, so the loop is
+  unrolled at compile time and the invariant folded away; there is nothing for
+  a hand-written constant to save. A refusal is cheaper still, because it
+  short-circuits.
+- **`errno` translation is a jump table**: 0.70 ns for the first arm, for one
+  past the identical run, and for the three with no FreeBSD peer alike. So
+  does `dirent_type`, and `dirsiz` is 0.7 ns -- which matters because a
+  FreeBSD `readdir` pays both once per name, on top of the filesystem walk
+  that is quadratic in the directory's size.
+- **The twelve xattr syscalls are free.** They answer from a table in this
+  kernel, so what they cost IS `xattr_precheck` plus `xattr_answer`: 1.1 to
+  1.8 ns for the checks, the answer at the second floor. Reading the name and
+  the flags before looking the file up -- which is what `fs/xattr.c` does and
+  what the dispatcher used to skip -- costs nothing.
+
 A caveat that applies to every in-kernel row: they run under `libos`, the only
 configuration that builds for the host. Object bookkeeping (VMO and VMAR
 structures, the mapping list, the path cache, the descriptor table) is the

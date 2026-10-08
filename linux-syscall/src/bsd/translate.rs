@@ -1312,13 +1312,18 @@ mod benches {
     //! syscalls goes through here twice: a flag word or two translated on the
     //! way in, and the result re-encoded on the way out.
     //!
-    //! `sift` is the shape to watch. It walks the whole map on every call --
-    //! thirteen entries for `open`, and it rebuilds `known` out of the map as
-    //! it goes although `known` is the same value every time. So the rows
-    //! come in map-size order: `msync` (two entries), `wait` (three),
-    //! `at` (four), `mmap` (nine), `open` (thirteen). A slope across them is
-    //! the per-entry cost a FreeBSD `open` pays for flags it does not set,
-    //! and it is loop-invariant work that a `const` per map would remove.
+    //! `sift` looked like the shape to watch: it walks the whole map on every
+    //! call -- thirteen entries for `open` -- and rebuilds `known` out of the
+    //! map as it goes although `known` is the same value every time. So the
+    //! rows come in map-size order: `msync` (two entries), `wait` (three),
+    //! `at` (four), `mmap` (nine), `open` (thirteen), and the slope across
+    //! them is the answer.
+    //!
+    //! It is **0.17 ns per map entry** (1.48 ns at two entries, 3.35 at
+    //! thirteen), which is the maps being `const`: the loop is unrolled at
+    //! compile time and the loop-invariant `known` folded into a constant, so
+    //! there is nothing for a hand-written `const` per map to remove. The
+    //! worry was wrong, and the rows are what say so.
     //!
     //! Compare every row against `crate::benches::the_second_floor_control`
     //! before reading a cost into it: a row near 6.5 ns is this harness's
