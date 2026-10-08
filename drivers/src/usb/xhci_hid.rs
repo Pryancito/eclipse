@@ -2238,6 +2238,8 @@ pub struct XhciInner {
     /// drain. `stalled` means the completion code was Stall Error, so the
     /// DEVICE also has to be told to clear its halt.
     pending_ep_resets: Vec<(u8, u8, bool)>,
+    /// Todos los dispositivos enumerados, tengan driver o no.
+    devs: Vec<UsbDev>,
     /// Hubs ya configurados, en el orden en que se enumeraron.
     hubs: Vec<HubDev>,
     /// `(slot del hub, puerto)` que un endpoint de cambio de estado ha
@@ -2278,6 +2280,142 @@ struct HubDev {
     /// un flujo que seguir y perder una repetición no pierde información.
     buf: Option<DmaBuf>,
     change_len: usize,
+}
+
+/// Cuántas interfaces de un dispositivo se recuerdan. Un compuesto normal trae
+/// dos o tres; ocho cubre un receptor inalámbrico con todo lo que lleva.
+const MAX_IFACES_RECORDED: usize = 8;
+
+/// Una interfaz tal como la declara el descriptor de configuración.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct IfaceRecord {
+    num: u8,
+    class: u8,
+    subclass: u8,
+    proto: u8,
+}
+
+/// Un dispositivo USB enumerado, con driver o sin él.
+///
+/// Antes de esto el driver solo se acordaba de lo que podía usar: una interfaz
+/// HID en [`XhciInner::hids`], un hub en [`XhciInner::hubs`]. Todo lo demás se
+/// direccionaba, se configuraba y se olvidaba, así que a la pregunta «¿el
+/// sistema ve mi pendrive?» no se podía contestar ni que sí ni que no. Esta
+/// lista es lo que la contesta, y es el punto de partida de cualquier driver de
+/// clase que venga despues.
+struct UsbDev {
+    slot: u8,
+    topo: DevTopo,
+    speed: u8,
+    vid: u16,
+    pid: u16,
+    /// `bDeviceClass` / `bDeviceSubClass` / `bDeviceProtocol`.
+    class: u8,
+    subclass: u8,
+    proto: u8,
+    ifaces: Vec<IfaceRecord>,
+    /// Interfaces que el descriptor declaraba y no caben en `ifaces`.
+    ifaces_dropped: u8,
+}
+
+/// El nombre de una clase USB, para que un volcado se lea sin la tabla delante.
+///
+/// Son los códigos que `usb.org` asigna y que de verdad aparecen en una
+/// máquina; cualquier otro sale como su número en hexadecimal.
+fn usb_class_name(class: u8) -> &'static str {
+    match class {
+        0x00 => "por interfaz",
+        0x01 => "audio",
+        0x02 => "cdc",
+        USB_CLASS_HID => "hid",
+        0x05 => "fisico",
+        0x06 => "imagen",
+        0x07 => "impresora",
+        0x08 => "almacenamiento",
+        USB_CLASS_HUB => "hub",
+        0x0a => "datos-cdc",
+        0x0b => "tarjeta-chip",
+        0x0d => "seguridad",
+        0x0e => "video",
+        0x0f => "salud",
+        0x10 => "audio-video",
+        0x11 => "pantalla",
+        0xdc => "diagnostico",
+        0xe0 => "inalambrico",
+        0xef => "varios",
+        0xfe => "especifico",
+        0xff => "del fabricante",
+        _ => "?",
+    }
+}
+
+/// Recorre un descriptor de configuración entregando cada descriptor suyo como
+/// `(bDescriptorType, cuerpo)`, y para en cuanto uno no cabe o miente sobre su
+/// longitud. Un `bLength` de 0 o 1 colgaría el recorrido.
+fn config_descriptors(raw: &[u8]) -> impl Iterator<Item = (u8, &[u8])> {
+    let mut o = 0usize;
+    core::iter::from_fn(move || {
+        if o + 2 > raw.len() {
+            return None;
+        }
+        let dl = raw[o] as usize;
+        if dl < 2 || o + dl > raw.len() {
+            return None;
+        }
+        let d = &raw[o..o + dl];
+        o += dl;
+        Some((d[1], d))
+    })
+}
+
+/// Las interfaces que declara un descriptor de configuración, en orden, y
+/// cuántas se quedaron fuera por el tope de [`MAX_IFACES_RECORDED`].
+///
+/// Solo el ajuste alternativo 0 de cada una: `bAlternateSetting` distinto de
+/// cero es otra cara de la MISMA interfaz, y contarlas por separado llena la
+/// lista de duplicados y desplaza a las interfaces de verdad.
+fn config_interfaces(raw: &[u8]) -> (Vec<IfaceRecord>, u8) {
+    let mut out: Vec<IfaceRecord> = Vec::new();
+    let mut dropped = 0u8;
+    for (dt, d) in config_descriptors(raw) {
+        if dt != USB_DESC_IFACE || d.len() < 9 || d[3] != 0 {
+            continue;
+        }
+        if out.len() < MAX_IFACES_RECORDED {
+            out.push(IfaceRecord {
+                num: d[2],
+                class: d[5],
+                subclass: d[6],
+                proto: d[7],
+            });
+        } else {
+            dropped = dropped.saturating_add(1);
+        }
+    }
+    (out, dropped)
+}
+
+/// El endpoint de interrupción IN de la primera interfaz de clase `class`:
+/// `(bEndpointAddress, wMaxPacketSize, bInterval)`.
+///
+/// `wMaxPacketSize` viene enmascarado a sus bits 10:0: los 12:11 son el campo
+/// de transacciones adicionales de alta velocidad y no pueden colarse en el
+/// Max Packet Size del contexto del endpoint.
+fn class_int_in_endpoint(raw: &[u8], class: u8) -> Option<(u8, u16, u8)> {
+    let mut inside = false;
+    for (dt, d) in config_descriptors(raw) {
+        if dt == USB_DESC_IFACE && d.len() >= 9 {
+            inside = d[5] == class;
+        }
+        if dt == USB_DESC_EP && d.len() >= 7 && inside {
+            let addr = d[2];
+            // Interrupción (bmAttributes bits 1:0 = 3) y dirección IN.
+            if (addr & 0x80) != 0 && (d[3] & 3) == 3 {
+                return Some((addr, u16::from_le_bytes([d[4], d[5]]) & 0x7ff, d[6]));
+            }
+        }
+    }
+    None
 }
 
 /// Lo que de un hub se lee sin tocar su lista: `(velocidad, puertos, multi_tt)`.
@@ -2404,6 +2542,7 @@ impl XhciInner {
             pending_port_changes: Vec::new(),
             port_enum_fails: alloc::vec![0u8; max_ports as usize + 2],
             pending_ep_resets: Vec::new(),
+            devs: Vec::new(),
             hubs: Vec::new(),
             pending_hub_ports: Vec::new(),
             boot_enum_pending: true,
@@ -3517,6 +3656,19 @@ impl XhciInner {
         }
 
         let dev_class = raw_desc[4];
+        self.devs.retain(|d| d.slot != slot);
+        self.devs.push(UsbDev {
+            slot,
+            topo,
+            speed,
+            vid,
+            pid,
+            class: dev_class,
+            subclass: raw_desc[5],
+            proto: raw_desc[6],
+            ifaces: Vec::new(),
+            ifaces_dropped: 0,
+        });
         self.setup_hid_from_config(slot, csz, port, vid, pid)?;
         if dev_class == USB_CLASS_HUB {
             self.setup_hub(slot, csz, topo, speed)?;
@@ -3843,28 +3995,7 @@ impl XhciInner {
         cfgb.flush(0, buf_len);
         let mut raw = alloc::vec![0u8; total];
         cfgb.read_into(0, &mut raw[..total]);
-        let mut in_hub_iface = false;
-        let mut o = 0usize;
-        while o + 2 <= total {
-            let dl = raw[o] as usize;
-            let dt = raw[o + 1];
-            if dl < 2 || o + dl > total {
-                break;
-            }
-            if dt == USB_DESC_IFACE && dl >= 9 {
-                in_hub_iface = raw[o + 5] == USB_CLASS_HUB;
-            }
-            if dt == USB_DESC_EP && dl >= 7 && in_hub_iface {
-                let addr = raw[o + 2];
-                let attr = raw[o + 3];
-                if (addr & 0x80) != 0 && (attr & 3) == 3 {
-                    let mps = u16::from_le_bytes([raw[o + 4], raw[o + 5]]) & 0x7ff;
-                    return Ok((addr, mps, raw[o + 6]));
-                }
-            }
-            o += dl;
-        }
-        Err(DeviceError::NotSupported)
+        class_int_in_endpoint(&raw, USB_CLASS_HUB).ok_or(DeviceError::NotSupported)
     }
 
     /// Arma el endpoint de cambio de estado de un hub ya configurado.
@@ -4153,6 +4284,17 @@ impl XhciInner {
             "[xhci] Configuration Descriptor slot={} bytes: {:?}",
             slot, raw
         );
+        // Apuntar TODA interfaz, no solo las que este driver sabe usar: un
+        // dispositivo cuya única interfaz es de una clase que no manejamos es
+        // exactamente el caso que había que poder ver desde fuera.
+        {
+            let (ifaces, dropped) = config_interfaces(&raw);
+            if let Some(d) = self.devs.iter_mut().find(|d| d.slot == slot) {
+                d.ifaces = ifaces;
+                d.ifaces_dropped = dropped;
+            }
+        }
+
         let config_val = raw.get(5).copied().unwrap_or(1).max(1);
 
         // SET_CONFIGURATION
@@ -5274,6 +5416,7 @@ impl XhciInner {
                 }
             }
             self.pending_hub_ports.retain(|&(s, _)| s != slot);
+            self.devs.retain(|d| d.slot != slot);
             for ep in 1..32 {
                 let ri = Self::ri(slot, ep);
                 if ri < self.xfer_rings.len() {
@@ -5927,6 +6070,49 @@ impl InputScheme for XhciUsbHid {
             let _ = writeln!(s, "[usbhid] controller not initialised");
             return s;
         };
+        if xi.devs.is_empty() {
+            let _ = writeln!(s, "[usbhid] no USB devices enumerated");
+        }
+        for d in xi.devs.iter() {
+            // Un dispositivo sin driver sale igual que uno con driver: a la
+            // pregunta de si el sistema lo ve, esta linea es la respuesta.
+            let _ = write!(
+                s,
+                "[usbhid] dev slot={} {:04x}:{:04x} class={:#04x}/{:#04x}/{:#04x} ({}) \
+                 speed={} root_port={} route={:#x} tier={} ifaces=[",
+                d.slot,
+                d.vid,
+                d.pid,
+                d.class,
+                d.subclass,
+                d.proto,
+                usb_class_name(d.class),
+                d.speed,
+                d.topo.root_port,
+                d.topo.route,
+                d.topo.depth,
+            );
+            for (n, i) in d.ifaces.iter().enumerate() {
+                let _ = write!(
+                    s,
+                    "{}{}:{:#04x}/{:#04x}/{:#04x}({})",
+                    if n == 0 { "" } else { " " },
+                    i.num,
+                    i.class,
+                    i.subclass,
+                    i.proto,
+                    usb_class_name(i.class),
+                );
+            }
+            if d.ifaces_dropped != 0 {
+                let _ = write!(s, " +{} mas", d.ifaces_dropped);
+            }
+            let _ = writeln!(
+                s,
+                "] bound={}",
+                xi.hids.iter().filter(|h| h.slot_id == d.slot).count()
+            );
+        }
         for h in xi.hubs.iter() {
             let topo = xi
                 .slot_topo
@@ -8137,6 +8323,159 @@ mod mmio_tests {
 #[cfg(test)]
 mod hub_tests {
     use super::*;
+
+    /// Un descriptor de configuración sintético: cabecera, luego los
+    /// descriptores que se le pasen ya montados.
+    fn config(parts: &[&[u8]]) -> Vec<u8> {
+        let mut out = alloc::vec![9u8, 0x02, 0, 0, 1, 1, 0, 0x80, 50];
+        for p in parts {
+            out.extend_from_slice(p);
+        }
+        let total = out.len() as u16;
+        out[2] = total as u8;
+        out[3] = (total >> 8) as u8;
+        out
+    }
+
+    fn iface(num: u8, alt: u8, class: u8, sub: u8, proto: u8) -> Vec<u8> {
+        alloc::vec![9, USB_DESC_IFACE, num, alt, 1, class, sub, proto, 0]
+    }
+
+    fn endpoint(addr: u8, attr: u8, mps: u16, interval: u8) -> Vec<u8> {
+        alloc::vec![
+            7,
+            USB_DESC_EP,
+            addr,
+            attr,
+            mps as u8,
+            (mps >> 8) as u8,
+            interval
+        ]
+    }
+
+    #[test]
+    fn every_interface_is_recorded_and_not_only_the_ones_with_a_driver() {
+        // Lo que habia que poder ver: un pendrive, cuya unica interfaz es de
+        // una clase que este driver no maneja.
+        let raw = config(&[&iface(0, 0, 0x08, 0x06, 0x50)]);
+        let (ifaces, dropped) = config_interfaces(&raw);
+        assert_eq!(
+            ifaces,
+            alloc::vec![IfaceRecord {
+                num: 0,
+                class: 0x08,
+                subclass: 0x06,
+                proto: 0x50
+            }]
+        );
+        assert_eq!(dropped, 0);
+    }
+
+    #[test]
+    fn an_alternate_setting_is_the_same_interface_and_not_another_one() {
+        // Un hub multi-TT declara su interfaz dos veces, alt 0 y alt 1.
+        // Contarlas por separado llena la lista de duplicados.
+        let raw = config(&[
+            &iface(0, 0, USB_CLASS_HUB, 0, 0),
+            &iface(0, 1, USB_CLASS_HUB, 0, 2),
+        ]);
+        let (ifaces, _) = config_interfaces(&raw);
+        assert_eq!(ifaces.len(), 1);
+        assert_eq!(ifaces[0].proto, 0);
+    }
+
+    #[test]
+    fn more_interfaces_than_fit_are_counted_and_not_dropped_in_silence() {
+        let mut parts: Vec<Vec<u8>> = Vec::new();
+        for n in 0..(MAX_IFACES_RECORDED as u8 + 3) {
+            parts.push(iface(n, 0, USB_CLASS_HID, 0, 1));
+        }
+        let refs: Vec<&[u8]> = parts.iter().map(|p| p.as_slice()).collect();
+        let (ifaces, dropped) = config_interfaces(&config(&refs));
+        assert_eq!(ifaces.len(), MAX_IFACES_RECORDED);
+        assert_eq!(dropped, 3);
+    }
+
+    #[test]
+    fn the_hub_status_endpoint_is_the_interrupt_in_of_the_hub_interface() {
+        let raw = config(&[
+            &iface(0, 0, USB_CLASS_HUB, 0, 0),
+            &endpoint(0x81, 0x03, 2, 12),
+        ]);
+        assert_eq!(
+            class_int_in_endpoint(&raw, USB_CLASS_HUB),
+            Some((0x81, 2, 12))
+        );
+    }
+
+    #[test]
+    fn an_endpoint_of_another_interface_is_not_the_hubs() {
+        // Un compuesto raro: una interfaz HID con su endpoint delante del hub.
+        // Quedarse con el primer interrupt-IN del descriptor habria armado el
+        // endpoint del raton como si fuera el del hub.
+        let raw = config(&[
+            &iface(0, 0, USB_CLASS_HID, 1, 1),
+            &endpoint(0x81, 0x03, 8, 10),
+            &iface(1, 0, USB_CLASS_HUB, 0, 0),
+            &endpoint(0x82, 0x03, 1, 12),
+        ]);
+        assert_eq!(
+            class_int_in_endpoint(&raw, USB_CLASS_HUB),
+            Some((0x82, 1, 12))
+        );
+        assert_eq!(
+            class_int_in_endpoint(&raw, USB_CLASS_HID),
+            Some((0x81, 8, 10))
+        );
+        assert_eq!(class_int_in_endpoint(&raw, 0x08), None);
+    }
+
+    #[test]
+    fn an_out_or_bulk_endpoint_is_not_an_interrupt_in() {
+        let raw = config(&[
+            &iface(0, 0, USB_CLASS_HUB, 0, 0),
+            // Interrupcion, pero OUT.
+            &endpoint(0x01, 0x03, 2, 12),
+            // IN, pero bulk.
+            &endpoint(0x82, 0x02, 512, 0),
+        ]);
+        assert_eq!(class_int_in_endpoint(&raw, USB_CLASS_HUB), None);
+    }
+
+    #[test]
+    fn the_high_speed_transaction_bits_never_leak_into_the_packet_size() {
+        // wMaxPacketSize = 0x1400: 1024 bytes y dos transacciones adicionales
+        // en los bits 12:11. Esos bits en el Max Packet Size del contexto son
+        // un tamano absurdo.
+        let raw = config(&[
+            &iface(0, 0, USB_CLASS_HUB, 0, 0),
+            &endpoint(0x81, 0x03, 0x1400, 4),
+        ]);
+        assert_eq!(
+            class_int_in_endpoint(&raw, USB_CLASS_HUB).map(|e| e.1),
+            Some(0x400)
+        );
+    }
+
+    #[test]
+    fn a_descriptor_that_lies_about_its_length_stops_the_walk_instead_of_hanging() {
+        // bLength 0 avanzaria cero bytes y daria vueltas para siempre; uno que
+        // se sale del buffer leeria mas alla de lo que el dispositivo mando.
+        assert_eq!(config_descriptors(&[0, USB_DESC_IFACE, 0]).count(), 0);
+        assert_eq!(config_descriptors(&[1, USB_DESC_IFACE]).count(), 0);
+        assert_eq!(config_descriptors(&[40, USB_DESC_IFACE, 0, 0]).count(), 0);
+        // Y lo que si cabe se entrega antes de parar en lo que no.
+        let raw = alloc::vec![4u8, USB_DESC_IFACE, 0, 0, 40, USB_DESC_EP, 0];
+        assert_eq!(config_descriptors(&raw).count(), 1);
+    }
+
+    #[test]
+    fn the_classes_that_matter_have_a_name_and_the_rest_do_not_pretend_to() {
+        assert_eq!(usb_class_name(USB_CLASS_HID), "hid");
+        assert_eq!(usb_class_name(USB_CLASS_HUB), "hub");
+        assert_eq!(usb_class_name(0x08), "almacenamiento");
+        assert_eq!(usb_class_name(0x42), "?");
+    }
 
     /// El Slot Context DW0 tal como lo escribe `setup_device`, para poder
     /// comprobar aquí lo que llega al controlador sin un controlador.
