@@ -147,6 +147,7 @@ two agree the measurement is standing on something.
 | the 2D primitives every framebuffer backend inherits | — | `zcore-drivers` `scheme::display::blit_tests::benches::*` |
 | the capability bitmap behind `EVIOCGBIT` | — | `zcore-drivers` `scheme::input::benches::*` |
 | the console's shadow buffer and its dirty region | — | `zcore-drivers` `utils::shadow_fb::tests::benches::*` |
+| the pointer, both halves of it | — | `zcore-drivers` `input::ps2_input::tests::benches::*`, `input::mouse::mouse_tests::benches::*` |
 | `stat`/`fstat`/`statx` encoding | `fs` section | `linux-syscall` `file::stat::benches::*` |
 | `select`/`poll`/`epoll` per-call and per-fd work | `fs` section | `linux-syscall` `file::poll::benches::*` |
 | `getdents64` | `fs` section | `linux-syscall` `file::dir::benches::getdents64_*` |
@@ -1026,4 +1027,56 @@ inside the test module for the usual reason -- `take_dirty`, `cell_pixels`,
   the simpler loop stays and the comment above it now says what was tried.
   What a glyph's 1.4 ns actually goes on is the indexed store itself -- the
   multiply, the bounds check and the word.
+
+## What the pointer path said
+
+Two families, one per half. `input::ps2_input::tests::benches` (5 rows) is a
+hardware aux packet off the 8042 being decoded into deltas and buttons, in the
+IRQ handler, once per packet -- 125 a second at the default PS/2 sample rate
+and 200 at the highest the controller takes.
+`input::mouse::mouse_tests::benches` (16 rows) is the other end: each event
+folded into `MouseState`, then the bytes a `/dev/input/mice` client reads back.
+No hardware, no aperture, pure arithmetic.
+
+**The whole software pointer path is about 16 ns per hardware packet.** That is
+`fold_in_a_whole_report` -- two axes, a wheel and the `SYN_REPORT` that closes
+them -- at 15.74 ns, plus 1.45-2.60 to decode the packet that produced them and
+1.8-2.1 to hand a client its three or four bytes. At 125 packets a second that
+is two microseconds of CPU per second. There is nothing here to optimise, and
+the rows exist to say so with a number instead of an opinion.
+
+- **The decode is 1.45 ns for plain PS/2 and about 2.5 for either wheel
+  protocol**, which is the bit arithmetic they add (`-sign_extend32(packet[3],
+  3)` and friends). `packet_len`, which the IRQ handler asks per byte it
+  receives, is 0.70.
+- **A packet out is 1.8-2.1 ns** whichever protocol, and a flick of the wrist
+  -- more movement than one packet can carry, so 127 goes out and the rest
+  stays queued -- is 1.77, i.e. splitting costs nothing over not splitting.
+  `is_drained`, which `/dev/input/mice` asks between packets, is 0.81.
+
+### Two rows are gone, and one family must be read whole
+
+Three negative results, all of them about the harness rather than the code:
+
+- **A `#[inline(never)]` control for the decode read 6.7 ns, above every row
+  it was meant to bound.** That is this harness's other floor -- what a
+  non-inlined call returning a value costs -- and it means
+  `decode_aux_packet` inlines at the call site while the control pays a call
+  it does not. A floor bounds a family that comes out *flat*; this one is not
+  flat, and its own ordering is the evidence instead. Row deleted.
+- **An all-zero packet read 6.43 and 6.44 ns in two runs**, four times the
+  moving packets, from the same code on different bytes. Reproducible and
+  unexplained, and at the same ~6.4 ns, so it was measuring the call. A row
+  nobody can account for is not evidence. Deleted, with the reason in its
+  place.
+- **`update`'s nine rows come out between 6.4 and 8.2 ns, and the ordering is
+  impossible**: `close_a_report`, which copies the struct out and zeroes three
+  fields, is the *cheapest* of them, while the arms that do nothing cost the
+  same as the arms that do work. `update` takes `&mut self`, so each iteration
+  stores the state and the next loads it back, and that round trip is most of
+  the figure. It is an artifact of measuring one event at a time -- in the
+  kernel the state is touched once per event anyway, behind a lock -- so the
+  rows stay as a bound (no event costs more than 8 ns) and the figure to quote
+  is the whole report. Four events for about twice one row is itself the proof
+  that a single row is mostly fixed cost.
 

@@ -652,4 +652,74 @@ mod tests {
         assert!(Ps2MouseProto::Imps.has_wheel());
         assert!(Ps2MouseProto::Imex.has_wheel());
     }
+
+    /// Native `#[bench]` rows for the pointer's inbound half: one aux packet
+    /// off the 8042, decoded into deltas and buttons.
+    ///
+    /// Paid once per hardware packet, in the IRQ handler -- 125 a second at
+    /// the default PS/2 sample rate, 200 at the highest the controller takes.
+    /// Pure arithmetic; the outbound half, where those deltas become what a
+    /// client reads, is `input::mouse::mouse_tests::benches`.
+    #[cfg(test)]
+    mod benches {
+        use super::*;
+        use test::{black_box, Bencher};
+
+        /// Three bytes, no wheel, both signs set so neither sign-extension
+        /// branch is skipped.
+        #[bench]
+        fn decode_a_plain_ps2_packet(b: &mut Bencher) {
+            let p = pkt([0x38, 0xfb, 0xfd, 0]);
+            b.iter(|| black_box(decode_aux_packet(black_box(Ps2MouseProto::Ps2), &p)));
+        }
+
+        /// IntelliMouse: the fourth byte is a signed 8-bit wheel.
+        #[bench]
+        fn decode_an_intellimouse_packet(b: &mut Bencher) {
+            let p = pkt([0x38, 0xfb, 0xfd, 0xff]);
+            b.iter(|| black_box(decode_aux_packet(black_box(Ps2MouseProto::Imps), &p)));
+        }
+
+        /// Explorer: the fourth byte packs a 4-bit wheel and two buttons, so
+        /// this is the arm with the bit arithmetic Linux spells as
+        /// `-sign_extend32(packet[3], 3)`.
+        #[bench]
+        fn decode_an_explorer_packet(b: &mut Bencher) {
+            let p = pkt([0x38, 0xfb, 0xfd, 0x3f]);
+            b.iter(|| black_box(decode_aux_packet(black_box(Ps2MouseProto::Imex), &p)));
+        }
+
+        /// The same Explorer arm with the horizontal-wheel encoding, which is
+        /// the five-bit case.
+        #[bench]
+        fn decode_an_explorer_tilt(b: &mut Bencher) {
+            let p = pkt([0x08, 0, 0, 0x02]);
+            b.iter(|| black_box(decode_aux_packet(black_box(Ps2MouseProto::Imex), &p)));
+        }
+
+        // Two rows that were here are not, and the reason is worth more than
+        // they were.
+        //
+        // A `#[inline(never)]` control returning an `AuxPacket` of the same
+        // size read 6.7 ns -- ABOVE every row it was supposed to bound. That
+        // is this harness's other floor, the one a non-inlined call returning
+        // a value costs: `decode_aux_packet` inlines at these call sites and
+        // the control paid a call it does not. A floor bounds a family that
+        // comes out FLAT; this one does not, and its own ordering is the
+        // evidence instead -- plain PS/2 cheapest, the two wheel protocols
+        // dearer, which is the arithmetic they add.
+        //
+        // An all-zero packet ("a mouse held still") read 6.43 and 6.44 ns in
+        // two runs, four times the moving packets, from the same code on
+        // different bytes. Reproducible and unexplained, and it is the same
+        // ~6.4 ns, so it was measuring the call rather than the decode. A row
+        // nobody can account for is not evidence of anything.
+
+        /// How many bytes a protocol's packet has, which the IRQ handler asks
+        /// per byte it receives.
+        #[bench]
+        fn ask_the_packet_length(b: &mut Bencher) {
+            b.iter(|| black_box(black_box(Ps2MouseProto::Imex).packet_len()));
+        }
+    }
 }
