@@ -44,8 +44,9 @@ are the exceptions, for the same reason in all three: the modules worth
 measuring are private. Every submodule of `linux-syscall` is (`mod file;`,
 `mod task;`, `mod vm;` ...); `kernel-hal` declares `mod common;` with a
 handful of re-exports in `lib.rs`, so the user-copy and timer machinery is
-unreachable from outside; and the fence helpers in `zcore-drivers` are private
-to their module. A `benches/` target in any of them would not see a single
+unreachable from outside; and in `zcore-drivers` the fence helpers, the scrollback
+console, the receive-path arithmetic, the GPFIFO ring accounting and the
+present path are each private to their own module. A `benches/` target in any of them would not see a single
 helper. Their benches are `#[cfg(test)] mod benches` blocks beside the code
 they measure, which is the form the native harness documents first, and they
 build with the lib: `cargo bench -p linux-syscall`, `-p kernel-hal`,
@@ -119,6 +120,12 @@ two agree the measurement is standing on something.
 | the pending-set scan and the handler's mask | `sig` section | `linux-object` `sigset_*`, `signal_action_*` |
 | `siginfo` and `sigaltstack` bookkeeping | `sig` section verdicts | `linux-object` `siginfo_*`, `signal_stack_*` |
 | allocator and anonymous mappings | `heap` section | `zircon-object` `vmar_map_unmap_*` (the mapping half only) |
+| the GPFIFO ring wrap every `EXEC` pays per push | — | `zcore-drivers` `display::nouveau_uapi::benches::advance_*`, `ring_state_*` |
+| GP entry and host-semaphore encoding | — | `zcore-drivers` `display::nouveau_uapi::benches::encode_*`, `build_a_semaphore_*` |
+| the per-ioctl nouveau decode and the crash trail's names | — | `zcore-drivers` `display::nouveau_uapi::benches::decode_*`, `recognise_*`, `name_*` |
+| a page flip and its swapchain | — | `zcore-drivers` `display::nvidia::present_benches::flip_*` |
+| GPU identification and the BOOT0 decode | — | `zcore-drivers` `display::nvidia::present_benches::identify_*`, `decode_*_boot0` |
+| what a monitor says about itself | — | `zcore-drivers` `display::edid::benches::*` |
 | `stat`/`fstat`/`statx` encoding | `fs` section | `linux-syscall` `file::stat::benches::*` |
 | `select`/`poll`/`epoll` per-call and per-fd work | `fs` section | `linux-syscall` `file::poll::benches::*` |
 | `getdents64` | `fs` section | `linux-syscall` `file::dir::benches::getdents64_*` |
@@ -626,3 +633,133 @@ there is no mock in the way: this is exactly what runs on the machine.
   cost is per byte. It is the one thing on this path that is O(bytes) rather
   than O(1), and the 0.76 ns gate in front of it is what keeps it off the
   common frame.
+
+## What the GPU submit path said
+
+The `EXEC` uAPI is the path NVK drives every frame, and `fast_submit` writes
+one GPFIFO entry per push with NVK batching hundreds of pushes into a single
+submission. All of this is integer arithmetic over values read out of the
+channel's USERD window, so there is no mock in the way and these are the real
+figures.
+
+- **The ring wrap was the most expensive thing on the submit path, and it was
+  a division.** `fast_submit` advanced its write cursor with `slot = (slot +
+  1) % entries` after each entry. `entries` comes from outside this kernel —
+  `eclipse_rm_exec_fast_prepare` fills it in and it may not be a power of two
+  — so the compiler could not turn it into a mask and emitted a hardware
+  divide per entry: **556 ns for a batch of 256 against 86 ns for the same
+  advance written as a compare**, 2.17 ns a slot against 0.34. For scale,
+  *encoding* those 256 GP entries costs **242 ns**, so the wrap was more than
+  twice the work it was wrapping. `nouveau_uapi::next_slot` is now that
+  compare: the cursor starts at the wrapped `put` and never leaves the ring,
+  so `slot + 1` can only reach `entries`, and
+  `the_slot_cursor_wraps_exactly_as_the_division_did` walks every slot of
+  several ring sizes against the division it replaced.
+- **`ring_state` took three divisions and only two were forced.** 5.60 ns per
+  call, against **2.96 ns** with the last wrap written as a conditional
+  subtract. `put_raw % entries` and `get_raw % entries` have to stay — both
+  come from the GPU and from the RM's own self-test submissions on channel 0
+  and may be anything — but `(put + entries - get) % entries` runs on values
+  already inside the ring, so the dividend is in `[1, 2*entries)` and the
+  wrap can only subtract once. It is now that subtract, with
+  `the_in_flight_count_is_what_the_division_answered` walking every pointer
+  pair of several ring sizes, the overflow case included.
+  `fast_submit` pays this once per `EXEC` *and again on every poll of the
+  ring-full wait*, so the saving is per poll, not per submission.
+- Together that is **about 470 ns of pure division removed from every `EXEC`
+  that carries a 256-push batch**, and the shape of the fix is the point: the
+  figure came out of one bench pair, not from reading the code.
+- **Everything else on the path is already free.** A GP entry pair encodes in
+  **0.91 ns**, the push variant that also reads the no-prefetch flag in 1.06,
+  a push header in 1.14, and either six-dword host semaphore stream — the
+  RELEASE that every fence rides on and the ACQUIRE that a same-channel wait
+  does — in **2.5 ns**. A ring of no entries is refused in 1.29 ns, before any
+  division, which is what keeps an `EXEC` on a channel the RM handed over
+  without a GPFIFO from being a divide-by-zero panic.
+- **The per-ioctl decode is nothing, and the ioctl *name* lookup is less than
+  nothing.** `is_cpu_prep_ioctl` answers in **0.70 ns** on a prep and 0.74 ns
+  rejecting an `EXEC`; the nowait flag test is 0.63 ns. `nouveau_ioctl_name`
+  reads **6.5 ns** for `EXEC`, for the last NR in nouveau's range and for an
+  unknown one alike — and `the_name_lookup_floor`, a non-inlined call
+  returning a `&'static str` and deciding nothing, reads **6.42 ns**. So the
+  whole `match` over the `nouveau_drm.h` vocabulary is free and those three
+  rows are the harness. `decode_ioc`'s 6.34 ns is the same story in the same
+  shape.
+
+## What the present path said
+
+`page_flip` under the host RM shim: the surface is recorded rather than
+programmed into a display front end, so every flip figure here is **the
+driver's own per-frame bookkeeping and a lower bound on a real flip**, which
+adds a pushbuffer write across a PCI aperture and whatever the front end then
+takes to fetch it.
+
+- **A steady-state flip is 81 ns**, of which **9.87 ns** is the framebuffer
+  lookup that a flip naming an unregistered id pays and nothing else. So the
+  drain check, the KMS bookkeeping and the eight counters together are about
+  70 ns a frame.
+- **The flip is flat in the swapchain's depth**: 78.5 ns round a two-buffer
+  swapchain, 78.6 round four, 77.2 round sixteen. That is the claim
+  `rotating_a_swapchain_builds_one_ctxdma_per_buffer_not_one_per_flip` makes,
+  now with numbers behind it — the lookup walking the swapchain per flip would
+  be unmissable at sixteen. Their spread is wide enough to rule out a walk,
+  not a nanosecond of drift with depth.
+- **`wait_vblank` lands on `b.iter`'s own floor, 0.56 ns**, which says nothing
+  about how long a real wait takes — the test clock does not advance under
+  this fixture — and everything about the regression it guards: a path that
+  spun a frame on the calling CPU could not land there however the clock
+  behaved.
+- The `/proc` stats line is **180 ns**, eight atomics and a formatted
+  `String`: nothing in the flip path has a reason to avoid it.
+- **There is deliberately no figure for bringing the flip ladder up.**
+  Measuring it needs a fresh GPU per iteration and the fixture costs hundreds
+  of microseconds with a spread wider than its own mean, so the build sits
+  under the fixture's noise: the two rows that tried came out with a variance
+  sixteen times the mean and an "empty equivalent" dearer than the row it was
+  supposed to bound. What justifies the lazy build and its latch is the shape
+  — once per modeset, against a flip that is 81 ns per frame — not a number
+  this harness can produce.
+- **Identifying the GPU is free.** `identify_gpu` reads 6.87 ns on this
+  hardware's own device id and 6.56 on one in no arm of the table, against
+  **6.84 ns** for `the_identification_floor` — a non-inlined call returning
+  the same three-field tuple and deciding nothing. The `match` over every
+  NVIDIA part the table names is a jump table and costs nothing; those rows
+  are the call. `arch_from_pmc_boot0` is inlined and reads **1.4 to 1.6 ns**
+  whether the chip id is Turing's or past every range, and naming a GPU fault's
+  reason and access type — the one decode here that runs per fault rather than
+  once per probe — is 1.87 ns.
+
+## What the EDID decoder said
+
+Once per connector probe rather than per frame, so what matters is the shape.
+Pure functions over 128 bytes, no mock: these are the real figures.
+
+- **Validating a block is 1.84 ns** — header compare plus the 128-byte
+  checksum — against 0.88 ns for a block whose header is wrong, so the whole
+  fold is about a nanosecond because the compiler vectorises it. A block with
+  a good header and a bad checksum costs **1.52 ns**, level with accepting
+  one, which is what it must be: a refusal that were cheaper would mean the
+  fold short-circuits.
+- **A probe folding the same block three times costs nothing.** The three
+  public entry points each validate for themselves, and
+  `a_whole_connector_probe_as_the_caller_makes_it` (19.48 ns) is level with
+  `a_whole_connector_probe_validated_once` (19.28). That pair was written
+  expecting to show waste and answers no, so the public shape stays as it is —
+  every entry point safe to call on bytes nobody has checked — and the pair
+  stays as the evidence.
+- Decoding the preferred mode is **7.46 ns**, the whole preferred timing
+  **10.35 ns**, and reading the physical size **8.82 ns** from the first
+  descriptor or **9.81 ns** after walking all four and falling back to the
+  centimetre bytes. The derived numbers are cheap too: `is_valid`'s nine
+  comparisons 1.66 ns, the refresh in whole hertz 1.90 ns and in millihertz
+  2.97 — a 64-bit divide by a product the compiler cannot see, which is what
+  stopped a 75, 120 or 144 Hz panel being told it runs at 60.
+- **The partial-block completion rows are all floor.** Completing the 32 bytes
+  the NVIDIA RM hands back is **12.83 ns** against **12.73 ns** for
+  `the_completion_floor` — a non-inlined call returning the same
+  `Option<[u8; 128]>` and deciding nothing — so the copy and the 127-byte fold
+  cost nothing measurable. The two refusals read 17.7 ns, *dearer* than doing
+  the work, which is the giveaway: at this scale the row is the 129-byte
+  return value being moved, and the ordering between 12.7 and 17.8 ns is not
+  work. A third floor shape worth remembering, after the ~0.6 ns `b.iter` loop
+  and the ~6.4 ns call returning an `LxResult`.

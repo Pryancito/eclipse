@@ -354,7 +354,11 @@ mod tests {
 
     /// Build a block with a correct header and checksum. `f` fills in the
     /// interesting bytes before the checksum is computed over the result.
-    fn edid(f: impl FnOnce(&mut [u8; BLOCK_LEN])) -> [u8; BLOCK_LEN] {
+    ///
+    /// `pub(super)` so the bench module beside this one measures the decoder
+    /// over the same blocks these tests assert on, instead of growing a
+    /// second builder that could drift from this one.
+    pub(super) fn edid(f: impl FnOnce(&mut [u8; BLOCK_LEN])) -> [u8; BLOCK_LEN] {
         let mut b = [0u8; BLOCK_LEN];
         b[..8].copy_from_slice(&HEADER);
         b[18] = 1; // version 1
@@ -368,7 +372,14 @@ mod tests {
     }
 
     /// Write a detailed timing descriptor into slot `slot` (0..4).
-    fn timing(b: &mut [u8; BLOCK_LEN], slot: usize, w_px: u32, h_px: u32, w_mm: u32, h_mm: u32) {
+    pub(super) fn timing(
+        b: &mut [u8; BLOCK_LEN],
+        slot: usize,
+        w_px: u32,
+        h_px: u32,
+        w_mm: u32,
+        h_mm: u32,
+    ) {
         let o = 54 + slot * 18;
         b[o] = 0x01; // any non-zero pixel clock marks it as a timing
         b[o + 1] = 0x02;
@@ -385,7 +396,7 @@ mod tests {
     /// blankings and all four sync numbers, each spilling its high bits into
     /// the shared byte the way a monitor writes them.
     #[allow(clippy::too_many_arguments)]
-    fn full_timing(
+    pub(super) fn full_timing(
         b: &mut [u8; BLOCK_LEN],
         slot: usize,
         clock_khz: u32,
@@ -414,7 +425,7 @@ mod tests {
 
     /// Digital separate sync, negative h, positive v: what almost every
     /// modern monitor states.
-    const SEPARATE_NH_PV: u8 = 0b0001_1100;
+    pub(super) const SEPARATE_NH_PV: u8 = 0b0001_1100;
 
     /// `1920x1080@60`, the DMT timing, to the number. 148500 kHz over a
     /// 2200x1125 total is exactly 60.000 Hz, which makes it the one mode where
@@ -1110,5 +1121,248 @@ mod tests {
              zero and this test needs a different head"
         );
         assert!(block_valid(&finish_partial_block(&head).unwrap()));
+    }
+}
+
+/// Native `#[bench]` rows for the EDID decoder.
+///
+/// This runs once per connector probe rather than per frame, so the figures
+/// matter less for throughput than for what they say about shape: whether the
+/// 128-byte checksum is paid once or several times for one probe, and whether
+/// a refusal costs what an acceptance does.
+///
+/// Inline, beside the tests, so the rows measure the decoder over the very
+/// blocks the tests assert on (`tests::edid`, `tests::timing`,
+/// `tests::full_timing`) rather than a second builder that could drift. No
+/// hardware and no mock: these 128 bytes are the whole input, so the figures
+/// are the real ones.
+///
+/// `cargo +nightly bench -p zcore-drivers --features graphic,virtio,xhci-usb-hid`
+#[cfg(test)]
+mod benches {
+    use super::tests::{edid, full_timing, timing, SEPARATE_NH_PV};
+    use super::*;
+    use test::{black_box, Bencher};
+
+    /// `1920x1080@60`, the DMT timing to the number: 148500 kHz over a
+    /// 2200x1125 total. What the panel on the development box states.
+    fn a_1080p60_block() -> [u8; BLOCK_LEN] {
+        edid(|b| {
+            full_timing(
+                b,
+                0,
+                148_500,
+                (1920, 280, 88, 44),
+                (1080, 45, 4, 5),
+                SEPARATE_NH_PV,
+            );
+            b[21] = 60; // 60 cm wide
+            b[22] = 34;
+        })
+    }
+
+    /// A block whose four descriptor slots are all detailed timings, none of
+    /// which states a physical size. `physical_size_mm` walks every one of
+    /// them before falling back to the centimetre bytes, so this is its worst
+    /// case and the one a TV produces.
+    fn four_timings_without_a_size() -> [u8; BLOCK_LEN] {
+        edid(|b| {
+            for slot in 0..4 {
+                timing(b, slot, 1920, 1080, 0, 0);
+            }
+            b[21] = 88;
+            b[22] = 50;
+        })
+    }
+
+    // --- validity, which three of the four public entry points pay ---
+
+    /// `block_valid` on a good block: the header compare plus the 128-byte
+    /// checksum fold. This is the unit the rows below are built out of.
+    #[bench]
+    fn validate_a_good_block(b: &mut Bencher) {
+        let block = a_1080p60_block();
+        b.iter(|| black_box(block_valid(black_box(&block[..]))));
+    }
+
+    /// A block whose header is wrong — what a GOP that never filled its
+    /// buffer, or a flaky DDC line, hands over. It returns on the eighth byte,
+    /// so the difference from the row above is what the checksum costs.
+    #[bench]
+    fn reject_a_block_with_a_bad_header(b: &mut Bencher) {
+        let mut block = a_1080p60_block();
+        block[0] = 0x55;
+        b.iter(|| black_box(block_valid(black_box(&block[..]))));
+    }
+
+    /// A block with the right header and a wrong checksum: the whole fold runs
+    /// and then refuses. Should cost what accepting costs — a refusal that is
+    /// cheaper would mean the fold is short-circuiting, which it must not.
+    #[bench]
+    fn reject_a_block_with_a_bad_checksum(b: &mut Bencher) {
+        let mut block = a_1080p60_block();
+        block[BLOCK_LEN - 1] ^= 0xFF;
+        b.iter(|| black_box(block_valid(black_box(&block[..]))));
+    }
+
+    /// Short of a whole block: the length guard, ahead of everything.
+    #[bench]
+    fn reject_a_short_block(b: &mut Bencher) {
+        let block = a_1080p60_block();
+        b.iter(|| black_box(block_valid(black_box(&block[..32]))));
+    }
+
+    // --- the public entry points, as a connector probe calls them ---
+
+    /// `preferred_mode`: validity, then the first detailed timing's two active
+    /// counts.
+    #[bench]
+    fn decode_the_preferred_mode(b: &mut Bencher) {
+        let block = a_1080p60_block();
+        b.iter(|| black_box(preferred_mode(black_box(&block[..]))));
+    }
+
+    /// `preferred_timing`: the same, plus every other field of the descriptor
+    /// and the `is_valid` check.
+    #[bench]
+    fn decode_the_preferred_timing(b: &mut Bencher) {
+        let block = a_1080p60_block();
+        b.iter(|| black_box(preferred_timing(black_box(&block[..]))));
+    }
+
+    /// `physical_size_mm` where the first descriptor states a size: it stops
+    /// there.
+    #[bench]
+    fn read_the_physical_size_from_the_first_timing(b: &mut Bencher) {
+        let block = a_1080p60_block();
+        b.iter(|| black_box(physical_size_mm(black_box(&block[..]))));
+    }
+
+    /// The same call when no descriptor states one, so all four are walked and
+    /// the centimetre bytes answer. The gap from the row above is what the
+    /// walk costs.
+    #[bench]
+    fn read_the_physical_size_after_walking_four_timings(b: &mut Bencher) {
+        let block = four_timings_without_a_size();
+        b.iter(|| black_box(physical_size_mm(black_box(&block[..]))));
+    }
+
+    /// The claim worth a number: a connector probe wants the mode, the timing
+    /// and the size, and each of those three entry points calls `block_valid`
+    /// itself — so one probe folds the same 128 bytes three times. This row is
+    /// the three calls as a caller makes them.
+    #[bench]
+    fn a_whole_connector_probe_as_the_caller_makes_it(b: &mut Bencher) {
+        let block = a_1080p60_block();
+        b.iter(|| {
+            let d = black_box(&block[..]);
+            black_box((preferred_mode(d), preferred_timing(d), physical_size_mm(d)))
+        });
+    }
+
+    /// The same three answers with the block validated once.
+    ///
+    /// **This row answers no.** It was written expecting to show that a probe
+    /// folds the same 128 bytes three times for nothing, and it measures the
+    /// same figure as the row above: the fold costs about a nanosecond (see
+    /// `validate_a_good_block` against `reject_a_block_with_a_bad_header`),
+    /// because the compiler vectorises it, and three of them are lost in the
+    /// descriptor walking. So the public shape stays as it is — each entry
+    /// point safe to call on bytes nobody has checked — and this pair is kept
+    /// as the evidence that hoisting the check would buy nothing.
+    #[bench]
+    fn a_whole_connector_probe_validated_once(b: &mut Bencher) {
+        let block = a_1080p60_block();
+        b.iter(|| {
+            let d = black_box(&block[..]);
+            if !block_valid(d) {
+                return black_box((None, None, None));
+            }
+            black_box((preferred_mode(d), preferred_timing(d), physical_size_mm(d)))
+        });
+    }
+
+    // --- the derived numbers, per mode advertised ---
+
+    /// `refresh_mhz`: a 64-bit multiply and a 64-bit divide by a product the
+    /// compiler cannot see. Paid once per mode the kernel advertises, and the
+    /// reason a 75, 120 or 144 Hz panel is no longer told it runs at 60.
+    #[bench]
+    fn compute_the_refresh_in_millihertz(b: &mut Bencher) {
+        let t = preferred_timing(&a_1080p60_block()[..]).expect("a valid 1080p60 timing");
+        b.iter(|| black_box(black_box(&t).refresh_mhz()));
+    }
+
+    /// The same in whole hertz, which is what `drm_mode_modeinfo` carries.
+    #[bench]
+    fn compute_the_refresh_in_hertz(b: &mut Bencher) {
+        let t = preferred_timing(&a_1080p60_block()[..]).expect("a valid 1080p60 timing");
+        b.iter(|| black_box(black_box(&t).refresh_hz()));
+    }
+
+    /// `is_valid`, nine comparisons, which decides whether wlroots gets a mode
+    /// or drops the output.
+    #[bench]
+    fn check_a_timing_is_drivable(b: &mut Bencher) {
+        let t = preferred_timing(&a_1080p60_block()[..]).expect("a valid 1080p60 timing");
+        b.iter(|| black_box(black_box(&t).is_valid()));
+    }
+
+    /// The ~96 DPI fallback for a display that states no size: two multiplies
+    /// and two divides by constants.
+    #[bench]
+    fn estimate_a_size_from_the_mode(b: &mut Bencher) {
+        b.iter(|| black_box(estimated_size_mm(black_box(1920), black_box(1080))));
+    }
+
+    // --- completing the RM's partial read ---
+
+    /// `finish_partial_block` on the 32 bytes the NVIDIA RM hands back for the
+    /// active panel: a copy, a 127-byte fold and one byte written. Paid once
+    /// per connector that has no full EDID, which on this hardware is every
+    /// one of them.
+    #[bench]
+    fn complete_the_rms_32_byte_head(b: &mut Bencher) {
+        let full = a_1080p60_block();
+        let head = &full[..32];
+        b.iter(|| black_box(finish_partial_block(black_box(head))));
+    }
+
+    /// A head that is not an EDID at all: the header compare refuses before
+    /// the copy. The gap from the row above is the copy plus the fold.
+    #[bench]
+    fn refuse_a_head_that_is_not_an_edid(b: &mut Bencher) {
+        let mut full = a_1080p60_block();
+        full[1] = 0x00;
+        let head = &full[..32];
+        b.iter(|| black_box(finish_partial_block(black_box(head))));
+    }
+
+    /// A whole block handed to the completer, which must refuse rather than
+    /// recompute a checksum and mask the corruption `block_valid` catches.
+    #[bench]
+    fn refuse_to_complete_a_whole_block(b: &mut Bencher) {
+        let full = a_1080p60_block();
+        b.iter(|| black_box(finish_partial_block(black_box(&full[..]))));
+    }
+
+    /// The empty equivalent of the three `finish_partial_block` rows, and the
+    /// reason they can be read: a call the compiler will not inline that
+    /// returns the same `Option<[u8; 128]>` and decides nothing. Those rows
+    /// come out level whether they copy and fold or refuse on the eighth byte,
+    /// which is what it looks like when the measurement is the 129-byte return
+    /// value being moved rather than the work behind it.
+    #[bench]
+    fn the_completion_floor(b: &mut Bencher) {
+        #[inline(never)]
+        fn decides_nothing(head: &[u8]) -> Option<[u8; BLOCK_LEN]> {
+            if head.len() == usize::MAX {
+                None
+            } else {
+                Some([0u8; BLOCK_LEN])
+            }
+        }
+        let full = a_1080p60_block();
+        b.iter(|| black_box(decides_nothing(black_box(&full[..32]))));
     }
 }
