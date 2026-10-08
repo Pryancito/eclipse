@@ -1686,3 +1686,129 @@ mod sigtimedwait_tests {
         assert_eq!(waiter.lock_linux().sigwait.val(), 0, "wait set left behind");
     }
 }
+
+#[cfg(test)]
+mod benches {
+    //! The signal syscalls' own decisions: which target a `kill` names, which
+    //! dispositions `rt_sigaction` may be given, whether a caller may choose
+    //! its own `siginfo_t`, and what `sigaltstack` refuses.
+    //!
+    //! The bookkeeping these calls run through -- the pending set, the
+    //! handler's mask, `siginfo` construction, the `sigaltstack` arithmetic
+    //! -- is `linux-object`'s and is benched in
+    //! `linux-object/benches/signal.rs`. Those rows read 1 to 12 ns against
+    //! the ~2 us a `kill(self)` plus handler costs from userspace, so the
+    //! cost of a signal is the frame, not the decisions. These rows are the
+    //! other half of that bracket: the syscall's own argument work, which
+    //! turns out to be the same handful of nanoseconds.
+    //!
+    //! Every row black-boxes its inputs. Two cycles (~0.6 ns) is `b.iter`'s
+    //! own loop, so a row there with an opaque input is a real compare and
+    //! branch -- with a constant input it is a call that was folded away.
+
+    use super::*;
+    use test::{black_box, Bencher};
+
+    /// `kill(pid, sig)`: one process, which is nearly every call.
+    #[bench]
+    fn kill_target_of_a_pid(b: &mut Bencher) {
+        b.iter(|| black_box(kill_target(black_box(4242))));
+    }
+
+    /// `kill(-pgid, sig)`: a whole process group, which is what a shell
+    /// sends on Ctrl-C. This is the arm whose negation overflowed when the
+    /// register was read whole.
+    #[bench]
+    fn kill_target_of_a_process_group(b: &mut Bencher) {
+        b.iter(|| black_box(kill_target(black_box(-4242))));
+    }
+
+    /// The `(int)` of `kill`'s first argument, which is what makes the
+    /// negation above total.
+    #[bench]
+    fn kill_pid_argument(b: &mut Bencher) {
+        b.iter(|| black_box(pid_arg(black_box(isize::MIN))));
+    }
+
+    /// `tkill`/`tgkill`'s thread id, where a non-positive one is `EINVAL`
+    /// rather than `ESRCH`.
+    #[bench]
+    fn single_task_id_argument(b: &mut Bencher) {
+        b.iter(|| black_box(single_task_id(black_box(4242))));
+    }
+
+    /// `rt_sigaction`, `rt_sigprocmask`, `rt_sigpending` and
+    /// `rt_sigtimedwait` all carry a `sigsetsize` the kernel must agree
+    /// with, so this check runs on every one of them.
+    #[bench]
+    fn sigsetsize_check(b: &mut Bencher) {
+        let size = core::mem::size_of::<Sigset>();
+        b.iter(|| black_box(check_sigsetsize(black_box(size))));
+    }
+
+    /// Whether `rt_sigaction` may do what it was asked: `SIGKILL` and
+    /// `SIGSTOP` can be read but not set. The loop that saves every
+    /// disposition from 1 to `NSIG` runs this 64 times.
+    #[bench]
+    fn sigaction_disposition_refusal(b: &mut Bencher) {
+        b.iter(|| {
+            black_box((
+                sigaction_refused(black_box(Signal::SIGINT), black_box(false)),
+                sigaction_refused(black_box(Signal::SIGKILL), black_box(true)),
+                sigaction_refused(black_box(Signal::SIGKILL), black_box(false)),
+            ))
+        });
+    }
+
+    /// What `kill -9 1` and `sigqueue(1, SIGKILL, v)` do, which is the same
+    /// thing now and was not before: the init guard, with self-kill judged
+    /// first so init can still end itself.
+    #[bench]
+    fn sigkill_target_decision(b: &mut Bencher) {
+        b.iter(|| black_box(sigkill_outcome(black_box(4242), black_box(7777))));
+    }
+
+    /// Whether a sender may choose its own `si_code`, which is what keeps a
+    /// process from forging a `SI_USER` from somebody else.
+    #[bench]
+    fn siginfo_forgery_check(b: &mut Bencher) {
+        b.iter(|| black_box(may_queue_siginfo(black_box(-1), black_box(false))));
+    }
+
+    /// The `siginfo_t` `rt_sigqueueinfo` ended up queueing, with the signal
+    /// number overwritten from the argument.
+    #[bench]
+    fn siginfo_from_the_sender(b: &mut Bencher) {
+        let info = SigInfo::default();
+        b.iter(|| {
+            black_box(queued_from_user(
+                black_box(Signal::SIGUSR1),
+                black_box(info),
+            ))
+        });
+    }
+
+    /// `sigaltstack`'s three refusals in Linux's order, for a call that is
+    /// enabling a stack from a thread not on one.
+    #[bench]
+    fn sigaltstack_validation(b: &mut Bencher) {
+        let ss = SignalStack {
+            sp: 0x7fff_0000_0000,
+            flags: SignalStackFlags::empty(),
+            size: 64 * 1024,
+        };
+        b.iter(|| black_box(check_sigaltstack(black_box(ss), black_box(false))));
+    }
+
+    /// And from a thread that is on its alternate stack, which is `EPERM`
+    /// before a single field of the new stack is read.
+    #[bench]
+    fn sigaltstack_validation_from_the_stack_itself(b: &mut Bencher) {
+        let ss = SignalStack {
+            sp: 0x7fff_0000_0000,
+            flags: SignalStackFlags::empty(),
+            size: 1,
+        };
+        b.iter(|| black_box(check_sigaltstack(black_box(ss), black_box(true))));
+    }
+}

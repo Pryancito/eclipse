@@ -1778,3 +1778,209 @@ mod last_component_tests {
         assert_eq!(rename_slash_check(true, false, true), Ok(()));
     }
 }
+
+#[cfg(test)]
+mod benches {
+    //! `getdents64` from the inside, and the path and flag work the whole
+    //! `*at` family shares.
+    //!
+    //! The `getdents64` rows are the syscall minus its two user copies: a
+    //! real ramfs directory read one entry at a time through the same
+    //! `DirEntries` implementation the handler uses, with every entry
+    //! encoded into a `struct linux_dirent64` by the same writer. 8 and 256
+    //! entries are a family: the slope says what a name costs, and the gap
+    //! to it says what the call costs.
+    //!
+    //! Every row black-boxes its inputs. The flag and path rows are a
+    //! handful of instructions each, so a figure near a nanosecond there is
+    //! the real instruction count -- but only because the input is opaque;
+    //! sub-nanosecond *with a constant input* means the call was folded away
+    //! and nothing ran.
+
+    use super::*;
+    use rcore_fs::vfs::FileSystem;
+    use rcore_fs_ramfs::RamFS;
+    use test::{black_box, Bencher};
+
+    /// A ramfs directory holding `n` files named like a package's: long
+    /// enough that the name, not the record header, is most of the entry.
+    fn dir_of(n: usize) -> Arc<File> {
+        let fs = RamFS::new();
+        let root = fs.root_inode();
+        let dir = root.create("d", FileType::Dir, 0o755).unwrap();
+        for i in 0..n {
+            dir.create(
+                &format!("libsomething-{:04}.so.1", i),
+                FileType::File,
+                0o644,
+            )
+            .unwrap();
+        }
+        // The inode holds only a `Weak` to its filesystem and the reads
+        // upgrade it; keep the ramfs alive.
+        core::mem::forget(fs);
+        File::new(dir, OpenFlags::RDONLY, String::from("/d"))
+    }
+
+    /// Rewinding alone: `seek(Start(0))` on the same directory handle, with
+    /// no entry read and no record encoded. The three `getdents64_*` rows
+    /// below each rewind inside their timed loop, because a `getdents64`
+    /// that resumed where the last one stopped would read a shrinking tail
+    /// and measure a different call every iteration. So this row is their
+    /// baseline: subtract it before reading a per-name cost out of them.
+    /// `File::seek` takes the file's lock and asks the inode for its
+    /// metadata, so it is not free.
+    #[bench]
+    fn getdents64_rewind_only(b: &mut Bencher) {
+        let file = dir_of(8);
+        b.iter(|| black_box(file.seek(black_box(SeekFrom::Start(0))).unwrap()));
+    }
+
+    /// The same rewind over a 256-entry directory, in case the metadata
+    /// lookup behind it depends on the directory's size: if this row and the
+    /// one above agree, one baseline covers the whole family.
+    #[bench]
+    fn getdents64_rewind_only_of_256(b: &mut Bencher) {
+        let file = dir_of(256);
+        b.iter(|| black_box(file.seek(black_box(SeekFrom::Start(0))).unwrap()));
+    }
+
+    /// One `getdents64` over a small directory, buffer big enough for all of
+    /// it: read every entry, encode every record. The rewind at the top of
+    /// the loop IS in this figure; `getdents64_rewind_only` is what to
+    /// subtract for the call's own cost.
+    #[bench]
+    fn getdents64_of_8_entries(b: &mut Bencher) {
+        let file = dir_of(8);
+        let mut kbuf = alloc::vec![0u8; 4096];
+        b.iter(|| {
+            file.seek(SeekFrom::Start(0)).unwrap();
+            let mut writer = DirentBufWriter::new(black_box(&mut kbuf));
+            let mut src = file.clone();
+            let n = collect_dirents(&mut src, |next, meta, name| {
+                writer.try_write(
+                    meta.inode as u64,
+                    next,
+                    DirentType::from(meta.type_).bits(),
+                    name,
+                )
+            });
+            black_box((n, writer.as_slice().len()))
+        });
+    }
+
+    /// The same call over 256 entries, which is one glibc `readdir` buffer's
+    /// worth of a real `/usr/lib`. Includes the rewind, as above.
+    #[bench]
+    fn getdents64_of_256_entries(b: &mut Bencher) {
+        let file = dir_of(256);
+        let mut kbuf = alloc::vec![0u8; 64 * 1024];
+        b.iter(|| {
+            file.seek(SeekFrom::Start(0)).unwrap();
+            let mut writer = DirentBufWriter::new(black_box(&mut kbuf));
+            let mut src = file.clone();
+            let n = collect_dirents(&mut src, |next, meta, name| {
+                writer.try_write(
+                    meta.inode as u64,
+                    next,
+                    DirentType::from(meta.type_).bits(),
+                    name,
+                )
+            });
+            black_box((n, writer.as_slice().len()))
+        });
+    }
+
+    /// 256 entries into a buffer that holds about half of them: the loop
+    /// stops on a refused record and hands it back, which is the path every
+    /// multi-call listing takes. It must cost no more than the entries it
+    /// did encode. Includes the rewind, as above.
+    #[bench]
+    fn getdents64_of_256_into_a_short_buffer(b: &mut Bencher) {
+        let file = dir_of(256);
+        let mut kbuf = alloc::vec![0u8; 6 * 1024];
+        b.iter(|| {
+            file.seek(SeekFrom::Start(0)).unwrap();
+            let mut writer = DirentBufWriter::new(black_box(&mut kbuf));
+            let mut src = file.clone();
+            let n = collect_dirents(&mut src, |next, meta, name| {
+                writer.try_write(
+                    meta.inode as u64,
+                    next,
+                    DirentType::from(meta.type_).bits(),
+                    name,
+                )
+            });
+            black_box((n, writer.as_slice().len()))
+        });
+    }
+
+    /// One record, encoded: the per-name half of the rows above.
+    #[bench]
+    fn dirent_record_write(b: &mut Bencher) {
+        let mut kbuf = alloc::vec![0u8; 4096];
+        b.iter(|| {
+            let mut writer = DirentBufWriter::new(black_box(&mut kbuf));
+            black_box(writer.try_write(
+                black_box(1234),
+                black_box(1),
+                black_box(DirentType::REG.bits()),
+                black_box("libsomething-0001.so.1"),
+            ))
+        });
+    }
+
+    /// The file type of an entry, mapped onto `d_type`.
+    #[bench]
+    fn dirent_type_from_file_type(b: &mut Bencher) {
+        b.iter(|| black_box(DirentType::from(black_box(FileType::File))));
+    }
+
+    /// The `flags` word of every `*at` syscall, checked against the set that
+    /// call accepts.
+    #[bench]
+    fn at_flags_check(b: &mut Bencher) {
+        b.iter(|| {
+            black_box(at_flags(
+                black_box(AtFlags::SYMLINK_NOFOLLOW.bits()),
+                black_box(FSTATAT_FLAGS),
+            ))
+        });
+    }
+
+    /// The `mode` of `open(O_CREAT)`, `mkdir` and `mknod`, masked down to
+    /// permission bits.
+    #[bench]
+    fn create_perm_mask(b: &mut Bencher) {
+        b.iter(|| black_box(create_perm(black_box(0o100_644))));
+    }
+
+    /// Splitting a path into its directory and its last component, which
+    /// every `unlink`, `rename`, `mkdir`, `symlink` and `mknod` does once.
+    #[bench]
+    fn last_component_of_a_short_path(b: &mut Bencher) {
+        b.iter(|| black_box(last_component(black_box("/tmp/f"))));
+    }
+
+    /// The same on a path of the depth a build system uses. `split_path`
+    /// scans from the end, so the two should not differ much -- and a row
+    /// that says otherwise is a scan from the front.
+    #[bench]
+    fn last_component_of_a_deep_path(b: &mut Bencher) {
+        b.iter(|| {
+            black_box(last_component(black_box(
+                "/usr/lib/gcc/x86_64-linux-gnu/13/include/stddef.h",
+            )))
+        });
+    }
+
+    /// The trailing-slash promise, tested on the same deep path.
+    #[bench]
+    fn trailing_slash_check(b: &mut Bencher) {
+        b.iter(|| {
+            black_box(has_trailing_slash(black_box(
+                "/usr/lib/gcc/x86_64-linux-gnu/13/include/stddef.h",
+            )))
+        });
+    }
+}

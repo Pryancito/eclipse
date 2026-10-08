@@ -1909,3 +1909,218 @@ mod epoll_create_tests {
         assert_eq!(epoll_create_size(0x1_0000_0001), Ok(1));
     }
 }
+
+#[cfg(test)]
+mod benches {
+    //! What `select`, `pselect6`, `poll`, `ppoll`, `epoll_create` and
+    //! `epoll_wait` spend before they ever look at a file: narrowing their
+    //! arguments, building the `fd_set` bitmaps, and the per-fd scans that
+    //! run once per pass of the wait loop.
+    //!
+    //! The rows that end in a count (`_of_64`, `_of_1024`) are a family on
+    //! purpose: the slope says whether the work is per call or per fd, which
+    //! is the whole question for a process sitting in `select` with a wide
+    //! `nfds`.
+    //!
+    //! Every row black-boxes its *inputs* as well as its result; with a
+    //! constant argument the compiler folds these narrowings away entirely
+    //! and the row reports loop overhead instead.
+
+    use super::*;
+    use test::{black_box, Bencher};
+
+    fn user_fdset(words: &mut [u32]) -> UserInOutPtr<u32> {
+        UserInOutPtr::from(words.as_mut_ptr() as usize)
+    }
+
+    /// `(asked about, still open)` for `nfds` descriptors: every fourth one
+    /// is in a set, and all of them are open, so the scan runs to the end.
+    fn scan_tables(nfds: usize) -> (Vec<bool>, Vec<bool>) {
+        (
+            (0..nfds).map(|fd| fd % 4 == 0).collect(),
+            alloc::vec![true; nfds],
+        )
+    }
+
+    /// `select`'s three `FdSet::new` calls copy the caller's bitmap in and
+    /// allocate a second one for the answer, per call. `FD_PER_ITEM` is
+    /// `u32::BITS`, so 64 descriptors are two words.
+    #[bench]
+    fn fdset_new_of_64(b: &mut Bencher) {
+        let mut words = [0xffff_ffffu32; 2];
+        // `UserInOutPtr` is not `Copy`, so the pointer is rebuilt from its
+        // black-boxed address inside the loop. That is one `from` per
+        // iteration, which is a move of a `usize`.
+        let addr = user_fdset(&mut words).as_addr();
+        b.iter(|| {
+            black_box(FdSet::new(UserInOutPtr::from(black_box(addr)), black_box(64)).unwrap())
+        });
+    }
+
+    /// 256 fds: eight words in, eight allocated out.
+    #[bench]
+    fn fdset_new_of_256(b: &mut Bencher) {
+        let mut words = [0xffff_ffffu32; 8];
+        // `UserInOutPtr` is not `Copy`, so the pointer is rebuilt from its
+        // black-boxed address inside the loop. That is one `from` per
+        // iteration, which is a move of a `usize`.
+        let addr = user_fdset(&mut words).as_addr();
+        b.iter(|| {
+            black_box(FdSet::new(UserInOutPtr::from(black_box(addr)), black_box(256)).unwrap())
+        });
+    }
+
+    /// The widest set this kernel accepts, `MAX_SELECT_NFDS`. Three of these
+    /// are the fixed cost of one `select` call with a full set.
+    #[bench]
+    fn fdset_new_of_1024(b: &mut Bencher) {
+        let mut words = [0xffff_ffffu32; MAX_FDSET_SIZE];
+        // `UserInOutPtr` is not `Copy`, so the pointer is rebuilt from its
+        // black-boxed address inside the loop. That is one `from` per
+        // iteration, which is a move of a `usize`.
+        let addr = user_fdset(&mut words).as_addr();
+        b.iter(|| {
+            black_box(
+                FdSet::new(
+                    UserInOutPtr::from(black_box(addr)),
+                    black_box(MAX_SELECT_NFDS),
+                )
+                .unwrap(),
+            )
+        });
+    }
+
+    /// A NULL set, which is the common case for two of the three: no copy,
+    /// no allocation. The gap to the rows above is what a set *costs*.
+    #[bench]
+    fn fdset_new_null(b: &mut Bencher) {
+        b.iter(|| {
+            black_box(FdSet::new(black_box(UserInOutPtr::from(0)), black_box(1024)).unwrap())
+        });
+    }
+
+    /// `contains`, which the scan asks once per fd per set per pass.
+    #[bench]
+    fn fdset_contains(b: &mut Bencher) {
+        let mut words = [0xffff_ffffu32; MAX_FDSET_SIZE];
+        let set = FdSet::new(user_fdset(&mut words), MAX_SELECT_NFDS).unwrap();
+        b.iter(|| black_box(black_box(&set).contains(FileDesc::from(black_box(777usize)))));
+    }
+
+    /// The scan `select` runs before it waits, looking for a descriptor the
+    /// caller asked about and does not hold: `EBADF` for the whole call.
+    /// With nothing closed it is the full sweep, which is the cost that is
+    /// always paid.
+    ///
+    /// Both predicates read a black-boxed table rather than computing an
+    /// answer from `fd`. With plain arithmetic in them the compiler can see
+    /// that the scan finds nothing and deletes it: the 1024-fd row read the
+    /// same 6 ns as the 64-fd one, which is one `find` that never ran.
+    #[bench]
+    fn select_closed_fd_scan_of_64(b: &mut Bencher) {
+        let (asked, open) = scan_tables(64);
+        b.iter(|| {
+            let (asked, open) = (black_box(&asked), black_box(&open));
+            black_box(select_closed_fd(
+                black_box(64),
+                |fd| asked[fd],
+                |fd| open[fd],
+            ))
+        });
+    }
+
+    /// The same sweep over the widest set: sixteen times the fds.
+    #[bench]
+    fn select_closed_fd_scan_of_1024(b: &mut Bencher) {
+        let (asked, open) = scan_tables(MAX_SELECT_NFDS);
+        b.iter(|| {
+            let (asked, open) = (black_box(&asked), black_box(&open));
+            black_box(select_closed_fd(
+                black_box(MAX_SELECT_NFDS),
+                |fd| asked[fd],
+                |fd| open[fd],
+            ))
+        });
+    }
+
+    /// Mapping one file's poll status onto `select`'s three sets, once per
+    /// ready fd per pass.
+    #[bench]
+    fn select_ready_of_status(b: &mut Bencher) {
+        let status = PollStatus {
+            read: true,
+            write: false,
+            error: false,
+            hangup: false,
+        };
+        b.iter(|| black_box(select_ready(black_box(&status))));
+    }
+
+    /// `select`'s `int n`, narrowed and clamped.
+    #[bench]
+    fn select_nfds_arg(b: &mut Bencher) {
+        b.iter(|| black_box(select_nfds(black_box(64))));
+    }
+
+    /// `poll`'s `nfds`, which is checked against `RLIMIT_NOFILE`.
+    #[bench]
+    fn poll_nfds_arg(b: &mut Bencher) {
+        b.iter(|| black_box(poll_nfds(black_box(64), black_box(1024))));
+    }
+
+    /// `poll`'s and `ppoll`'s `int timeout`, narrowed so that a negative one
+    /// is a wait with no deadline.
+    #[bench]
+    fn poll_timeout_arg(b: &mut Bencher) {
+        b.iter(|| black_box(poll_timeout_msecs(black_box(usize::MAX))));
+    }
+
+    /// `epoll_wait`'s `maxevents` and `epoll_create`'s `size`.
+    #[bench]
+    fn epoll_arg_checks(b: &mut Bencher) {
+        b.iter(|| {
+            black_box((
+                epoll_maxevents(black_box(64)),
+                epoll_create_size(black_box(1)),
+            ))
+        });
+    }
+
+    /// The decision at the end of a pass that found nothing: return empty or
+    /// sleep, and for how long. Once per pass, for every waiting process.
+    #[bench]
+    fn poll_wait_decision_with_deadline(b: &mut Bencher) {
+        let begin = Duration::from_secs(10);
+        let now = Duration::from_millis(10_050);
+        b.iter(|| {
+            black_box(poll_wait_decision(
+                black_box(1000),
+                black_box(begin),
+                black_box(now),
+            ))
+        });
+    }
+
+    /// The shape test that decides whether a wait may be demoted to the
+    /// background-VT tick. It walks the whole fd set, so it is a family too;
+    /// this is the answer-on-the-first-fd case, which is the common one.
+    #[bench]
+    fn only_terminals_of_64_mixed(b: &mut Bencher) {
+        let fds: Vec<Option<bool>> = (0..64)
+            .map(|i| match i % 3 {
+                0 => None,
+                1 => Some(true),
+                _ => Some(false),
+            })
+            .collect();
+        b.iter(|| black_box(only_terminals(black_box(&fds).iter().copied())));
+    }
+
+    /// The same set with every fd a terminal: no early answer, the whole
+    /// walk.
+    #[bench]
+    fn only_terminals_of_64_all_ttys(b: &mut Bencher) {
+        let fds: Vec<Option<bool>> = (0..64).map(|_| Some(true)).collect();
+        b.iter(|| black_box(only_terminals(black_box(&fds).iter().copied())));
+    }
+}

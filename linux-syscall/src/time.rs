@@ -3175,3 +3175,221 @@ mod alarm_rounding_tests {
         assert_eq!(alarm_remaining_secs(ms(3_999)), 4);
     }
 }
+
+#[cfg(test)]
+mod benches {
+    //! The clock syscalls: `clock_gettime`'s and `gettimeofday`'s
+    //! conversions, `times`, `alarm`, `setitimer`/`getitimer`,
+    //! `timer_settime`, `adjtimex`, `settimeofday` and `getrusage`.
+    //!
+    //! Reading a clock itself is the HAL's and is not here; what is here is
+    //! everything around it, which is where the wrong answers were. The one
+    //! row worth the whole module is the `forward_periodic` pair: an interval
+    //! timer that missed its deadline has to work out which expiry is next,
+    //! and the question is whether that is a loop. It is a division, so the
+    //! two rows should read the same whether one period was missed or a
+    //! thousand -- and a machine that stalls under load leans on exactly
+    //! that.
+    //!
+    //! Every row black-boxes its inputs. Two cycles (~0.6 ns) is `b.iter`'s
+    //! own loop; a row there with an opaque input is a real compare and
+    //! branch, with a constant input it is a call that was folded away.
+
+    use super::*;
+    use test::{black_box, Bencher};
+
+    /// A periodic timer whose next expiry has not arrived: the common case,
+    /// and no overrun to count.
+    #[bench]
+    fn forward_periodic_without_overrun(b: &mut Bencher) {
+        let expiry = Duration::from_millis(1000);
+        let interval = Duration::from_millis(10);
+        let now = Duration::from_millis(1005);
+        b.iter(|| {
+            black_box(forward_periodic(
+                black_box(expiry),
+                black_box(interval),
+                black_box(now),
+            ))
+        });
+    }
+
+    /// The same timer a thousand periods late, which is what a stalled
+    /// machine hands it. If this row is a thousand times the one above, the
+    /// catch-up is a loop and a stall compounds itself; if it is flat, the
+    /// arithmetic is doing its job.
+    #[bench]
+    fn forward_periodic_a_thousand_periods_late(b: &mut Bencher) {
+        let expiry = Duration::from_millis(1000);
+        let interval = Duration::from_millis(10);
+        let now = Duration::from_millis(11_000);
+        b.iter(|| {
+            black_box(forward_periodic(
+                black_box(expiry),
+                black_box(interval),
+                black_box(now),
+            ))
+        });
+    }
+
+    /// And a million periods late, the arm where the overrun count
+    /// saturates.
+    #[bench]
+    fn forward_periodic_a_million_periods_late(b: &mut Bencher) {
+        let expiry = Duration::from_millis(1000);
+        let interval = Duration::from_micros(10);
+        let now = Duration::from_millis(11_000);
+        b.iter(|| {
+            black_box(forward_periodic(
+                black_box(expiry),
+                black_box(interval),
+                black_box(now),
+            ))
+        });
+    }
+
+    /// `getitimer`: the slot rendered as a `struct itimerval`, which is a
+    /// subtraction that was once written out twice and rounded two ways.
+    #[bench]
+    fn getitimer_render_slot(b: &mut Bencher) {
+        let slot = ItimerSlot {
+            interval: Duration::from_millis(10),
+            deadline: Some(Duration::from_millis(1500)),
+            generation: 7,
+        };
+        let now = Duration::from_millis(1234);
+        b.iter(|| black_box(itimerval_from_slot(black_box(&slot), black_box(now))));
+    }
+
+    /// `alarm`'s return value, which is seconds and rounds to nearest
+    /// except that any time left at all is at least one.
+    #[bench]
+    fn alarm_remaining_seconds(b: &mut Bencher) {
+        b.iter(|| black_box(alarm_remaining_secs(black_box(Duration::from_millis(1600)))));
+    }
+
+    /// Which signal an expiring `setitimer` slot delivers.
+    #[bench]
+    fn itimer_signal_number(b: &mut Bencher) {
+        b.iter(|| black_box(itimer_signo(black_box(0))));
+    }
+
+    /// `timer_settime`'s `TIMER_ABSTIME`.
+    #[bench]
+    fn timer_settime_abs_flag(b: &mut Bencher) {
+        b.iter(|| black_box(timer_settime_abs(black_box(0))));
+    }
+
+    /// `times(2)`: the monotonic clock in clock ticks, which is what every
+    /// `times` and every `/proc/<pid>/stat` field is expressed in.
+    #[bench]
+    fn clock_ticks_of_uptime(b: &mut Bencher) {
+        let up = Duration::from_secs(86_400);
+        b.iter(|| black_box(clock_ticks_since_boot(black_box(up))));
+    }
+
+    /// A userspace `struct timespec`, turned into the `Duration` every
+    /// deadline is kept as.
+    #[bench]
+    fn timespec_into_duration(b: &mut Bencher) {
+        let ts = TimeSpec {
+            sec: 1_700_000_000,
+            nsec: 123_456_789,
+        };
+        b.iter(|| black_box(timespec_to_duration(black_box(ts))));
+    }
+
+    /// `clock_gettime(CLOCK_TAI)`: the wall clock plus the leap-second
+    /// offset.
+    #[bench]
+    fn tai_from_wall_clock(b: &mut Bencher) {
+        let wall = TimeSpec {
+            sec: 1_700_000_000,
+            nsec: 123_456_789,
+        };
+        b.iter(|| black_box(tai_time(black_box(wall), black_box(37))));
+    }
+
+    /// `adjtimex`'s whole validation pass, which Linux runs before anything
+    /// is stored and this kernel once ran in pieces afterwards. This is the
+    /// call `chrony` and `ntpd` make every few seconds.
+    #[bench]
+    fn adjtimex_validation(b: &mut Bencher) {
+        let tx = Timex {
+            modes: ADJ_STATUS | ADJ_FREQUENCY,
+            freq: 1 << 16,
+            ..Timex::default()
+        };
+        b.iter(|| black_box(adjtimex_validate(black_box(&tx))));
+    }
+
+    /// The validation of the arm that refuses: `ADJ_TICK` with a tick
+    /// outside the range, which must leave the NTP state untouched.
+    #[bench]
+    fn adjtimex_validation_refusing(b: &mut Bencher) {
+        let tx = Timex {
+            modes: ADJ_STATUS | ADJ_TICK,
+            tick: 1,
+            ..Timex::default()
+        };
+        b.iter(|| black_box(adjtimex_validate(black_box(&tx))));
+    }
+
+    /// Whether an `adjtimex` call is a read or a write of the clock, which
+    /// decides whether it needs privilege.
+    #[bench]
+    fn adjtimex_write_decision(b: &mut Bencher) {
+        b.iter(|| black_box(adjtimex_changes_the_clock(black_box(ADJ_SETOFFSET))));
+    }
+
+    /// `ADJ_FREQUENCY`, which Linux clamps rather than refusing.
+    #[bench]
+    fn adjtimex_frequency_clamp(b: &mut Bencher) {
+        b.iter(|| black_box(clamp_freq(black_box(1 << 40))));
+    }
+
+    /// `ADJ_SETOFFSET`'s `timeval`, in the unit this call named.
+    #[bench]
+    fn adjtimex_setoffset_nanoseconds(b: &mut Bencher) {
+        let tv = TimeValI64 {
+            sec: 1,
+            usec: 500_000,
+        };
+        b.iter(|| black_box(setoffset_ns(black_box(&tv), black_box(false))));
+    }
+
+    /// `settimeofday`'s plan: the timezone check, and the one-time clock
+    /// step a first call with a timezone and no time implies.
+    #[bench]
+    fn settimeofday_planning(b: &mut Bencher) {
+        let tz = TimeZone {
+            minuteswest: -120,
+            dsttime: 0,
+        };
+        let now = Duration::from_secs(1_700_000_000);
+        b.iter(|| {
+            // A fresh latch per iteration: the plan consumes it, and reusing
+            // one would measure the second call for ever after.
+            let first = AtomicBool::new(true);
+            black_box(settimeofday_plan(
+                black_box(None),
+                black_box(Some(tz)),
+                &first,
+                black_box(now),
+            ))
+        });
+    }
+
+    /// `settimeofday`'s and `clock_settime`'s `timespec`, refused when the
+    /// nanoseconds are not nanoseconds.
+    #[bench]
+    fn settod_time_arg(b: &mut Bencher) {
+        b.iter(|| black_box(settod_time(black_box(1_700_000_000), black_box(1))));
+    }
+
+    /// `getrusage`'s two refusals, in Linux's order.
+    #[bench]
+    fn getrusage_arg_check(b: &mut Bencher) {
+        b.iter(|| black_box(getrusage_args(black_box(0), black_box(false))));
+    }
+}

@@ -786,3 +786,114 @@ mod stat_conversion_tests {
         assert_eq!(x.stx_mode, 0o41777);
     }
 }
+
+#[cfg(test)]
+mod benches {
+    //! What `fstat`, `lstat`, `fstatat` and `statx` spend once the inode is
+    //! in hand: turning a `Metadata` into the `struct stat` the uAPI
+    //! declares. The lookup is `vfs.rs`'s and is benched in
+    //! `linux-object/benches/vfs.rs`; this is the part that belongs to the
+    //! syscall.
+    //!
+    //! Every row black-boxes its *inputs* as well as its result. With the
+    //! input a constant the compiler folds the whole conversion into the
+    //! literal struct and the row reports loop overhead -- a figure under a
+    //! nanosecond here is the signature of that mistake, not of speed.
+    //!
+    //! `Metadata` is `Clone`, not `Copy`, and `From` consumes it, so each
+    //! row pays one clone. `metadata_clone` is that clone on its own, to be
+    //! subtracted.
+
+    use super::*;
+    use linux_object::fs::vfs::Timespec;
+    use test::{black_box, Bencher};
+
+    fn meta(type_: FileType) -> Metadata {
+        Metadata {
+            dev: 0x0801,
+            inode: 1234567,
+            size: 8192,
+            blk_size: 4096,
+            blocks: 16,
+            atime: Timespec {
+                sec: 1_700_000_000,
+                nsec: 123_456_789,
+            },
+            mtime: Timespec {
+                sec: 1_700_000_001,
+                nsec: 987_654_321,
+            },
+            ctime: Timespec {
+                sec: 1_700_000_002,
+                nsec: 1,
+            },
+            type_,
+            mode: 0o644,
+            nlinks: 1,
+            uid: 1000,
+            gid: 1000,
+            rdev: 0,
+        }
+    }
+
+    /// The clone every conversion row below pays on top of its own work.
+    #[bench]
+    fn metadata_clone(b: &mut Bencher) {
+        let m = meta(FileType::File);
+        b.iter(|| black_box(black_box(&m).clone()));
+    }
+
+    /// `fstat`/`lstat`/`fstatat` on a regular file.
+    #[bench]
+    fn stat_from_metadata_file(b: &mut Bencher) {
+        let m = meta(FileType::File);
+        b.iter(|| black_box(Stat::from(black_box(&m).clone())));
+    }
+
+    /// The same for a directory: a different `st_mode` arm, same cost --
+    /// which is the point of having both, since `from_type_mode` matches on
+    /// the type.
+    #[bench]
+    fn stat_from_metadata_dir(b: &mut Bencher) {
+        let m = meta(FileType::Dir);
+        b.iter(|| black_box(Stat::from(black_box(&m).clone())));
+    }
+
+    /// A character device: the arm that also carries `st_rdev`.
+    #[bench]
+    fn stat_from_metadata_chardev(b: &mut Bencher) {
+        let mut m = meta(FileType::CharDevice);
+        m.rdev = 0x0103;
+        b.iter(|| black_box(Stat::from(black_box(&m).clone())));
+    }
+
+    /// `statx`: a far bigger struct, with the device numbers split into
+    /// major and minor and a `stx_btime` the others do not carry.
+    #[bench]
+    fn statx_from_metadata(b: &mut Bencher) {
+        let m = meta(FileType::File);
+        b.iter(|| black_box(Statx::from(black_box(&m).clone())));
+    }
+
+    /// The `st_mode` of the pair: the type match plus the permission bits,
+    /// with no struct around it.
+    #[bench]
+    fn stat_mode_from_type_mode(b: &mut Bencher) {
+        b.iter(|| {
+            black_box(StatMode::from_type_mode(
+                black_box(FileType::File),
+                black_box(0o644),
+            ))
+        });
+    }
+
+    /// One timestamp. `struct stat` carries three of them.
+    #[bench]
+    fn timespec_from_vfs_timespec(b: &mut Bencher) {
+        let t = Timespec {
+            sec: 1_700_000_000,
+            nsec: 123_456_789,
+        };
+        b.iter(|| black_box(TimeSpec::from(black_box(t))));
+    }
+}

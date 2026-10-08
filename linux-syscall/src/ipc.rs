@@ -2239,3 +2239,170 @@ mod ipc_access_tests {
         assert_eq!(shmat_access(SHM_RND), IPC_R | IPC_W);
     }
 }
+
+#[cfg(test)]
+mod benches {
+    //! System V IPC: `semop`'s plan, `semctl`'s bulk value transfers,
+    //! `shmat`'s placement, and the argument work of `semget`, `msgrcv` and
+    //! the three `*ctl` calls.
+    //!
+    //! `plan_semop` is the row that matters. `semop(2)` is atomic, so the
+    //! whole `sembuf` array has to be shown to fit *before* a single
+    //! semaphore moves -- which means a copy of the set's values and a walk
+    //! of the operations, per call, every call. The families (1 / 16 / 500
+    //! operations, and a set of 16 against one of 512) say what each half of
+    //! that costs, and they are the numbers a program using a large
+    //! semaphore array as a barrier is paying.
+    //!
+    //! Every row black-boxes its inputs. Two cycles (~0.6 ns) is `b.iter`'s
+    //! own loop; a row there with an opaque input is a real compare and
+    //! branch, with a constant input it is a call that was folded away.
+
+    use super::*;
+    use test::{black_box, Bencher};
+
+    /// A semaphore set of `n` semaphores, each at 1: the shape a barrier or
+    /// a resource pool holds.
+    fn values(n: usize) -> Vec<isize> {
+        alloc::vec![1isize; n]
+    }
+
+    /// `n` operations, each taking one unit of a different semaphore, which
+    /// is the atomic multi-lock `semop` exists for.
+    fn ops(n: usize) -> Vec<SemBuf> {
+        (0..n).map(|i| SemBuf::new(i as u16, -1, 0)).collect()
+    }
+
+    /// One operation on a set of sixteen: the per-call cost, since the walk
+    /// runs once. The copy of the set is in here too, and the pair with the
+    /// 512-semaphore row below separates them.
+    #[bench]
+    fn plan_semop_of_1_op_on_16_semaphores(b: &mut Bencher) {
+        let (v, o) = (values(16), ops(1));
+        b.iter(|| black_box(plan_semop(black_box(&v), black_box(&o))));
+    }
+
+    /// Sixteen operations on the same set: a full barrier pass.
+    #[bench]
+    fn plan_semop_of_16_ops_on_16_semaphores(b: &mut Bencher) {
+        let (v, o) = (values(16), ops(16));
+        b.iter(|| black_box(plan_semop(black_box(&v), black_box(&o))));
+    }
+
+    /// `SEMOPM` operations, the largest call Linux allows, on a set wide
+    /// enough to hold them.
+    #[bench]
+    fn plan_semop_of_500_ops_on_512_semaphores(b: &mut Bencher) {
+        let (v, o) = (values(512), ops(500));
+        b.iter(|| black_box(plan_semop(black_box(&v), black_box(&o))));
+    }
+
+    /// One operation on a set of 512. Against the one-op-on-sixteen row
+    /// this is the copy alone, which is the cost `semop` pays for the set's
+    /// *size* rather than for the work asked of it.
+    #[bench]
+    fn plan_semop_of_1_op_on_512_semaphores(b: &mut Bencher) {
+        let (v, o) = (values(512), ops(1));
+        b.iter(|| black_box(plan_semop(black_box(&v), black_box(&o))));
+    }
+
+    /// An operation that cannot proceed: the plan stops at it and names it,
+    /// having moved nothing. This is what every contended `semop` reaches.
+    #[bench]
+    fn plan_semop_that_would_block(b: &mut Bencher) {
+        let v = alloc::vec![0isize; 16];
+        let o = ops(16);
+        b.iter(|| black_box(plan_semop(black_box(&v), black_box(&o))));
+    }
+
+    /// `semctl(GETALL)` over a set of 512, clamped to `SEMVMX` on the way
+    /// out.
+    #[bench]
+    fn semctl_getall_of_512(b: &mut Bencher) {
+        let snapshot: Vec<(isize, u64)> = (0..512).map(|i| (i as isize, 0u64)).collect();
+        b.iter(|| black_box(getall_values(black_box(&snapshot))));
+    }
+
+    /// `semctl(SETALL)` of 512 values, judged whole before any is applied.
+    #[bench]
+    fn semctl_setall_of_512(b: &mut Bencher) {
+        let raw: Vec<u16> = (0..512).map(|i| (i % 100) as u16).collect();
+        b.iter(|| black_box(setall_values(black_box(&raw))));
+    }
+
+    /// The same with one value out of range, which must refuse the whole
+    /// array. The last entry, so the scan runs to the end.
+    #[bench]
+    fn semctl_setall_of_512_refused(b: &mut Bencher) {
+        let mut raw: Vec<u16> = (0..512).map(|i| (i % 100) as u16).collect();
+        raw[511] = u16::MAX;
+        b.iter(|| black_box(setall_values(black_box(&raw))));
+    }
+
+    /// `semctl(SETVAL)`'s single value.
+    #[bench]
+    fn semctl_setval_arg(b: &mut Bencher) {
+        b.iter(|| black_box(setval_from_arg(black_box(7))));
+    }
+
+    /// How many operations one `semop` will carry out, checked before the
+    /// array is read.
+    #[bench]
+    fn semop_count_arg(b: &mut Bencher) {
+        b.iter(|| black_box(semop_count(black_box(16))));
+    }
+
+    /// One `sembuf`'s `sem_flg`, which used to drop unknown bits silently.
+    #[bench]
+    fn semop_flags_arg(b: &mut Bencher) {
+        b.iter(|| black_box(sem_flags(black_box(0x1000))));
+    }
+
+    /// `semget`'s `nsems`.
+    #[bench]
+    fn semget_nsems_arg(b: &mut Bencher) {
+        b.iter(|| black_box(semget_nsems(black_box(16))));
+    }
+
+    /// `shmat`'s flags, turned into the mapping's permissions and where it
+    /// may go.
+    #[bench]
+    fn shmat_flags_and_placement(b: &mut Bencher) {
+        b.iter(|| black_box(shmat_flags_and_place(black_box(0), black_box(0))));
+    }
+
+    /// `shmat(shmid, addr, SHM_RND)`: the arm that rounds the address down.
+    #[bench]
+    fn shmat_rounded_address(b: &mut Bencher) {
+        b.iter(|| black_box(rounded_attach_addr(black_box(0x1000_0fff))));
+    }
+
+    /// Which permission `shmat` needs, from its flags.
+    #[bench]
+    fn shmat_access_mode(b: &mut Bencher) {
+        b.iter(|| black_box(shmat_access(black_box(0))));
+    }
+
+    /// `msgrcv`'s `msgflg` and `msgsz`.
+    #[bench]
+    fn msgrcv_args(b: &mut Bencher) {
+        b.iter(|| {
+            black_box((
+                msgrcv_copy_flags(black_box(0)),
+                msgrcv_bufsz(black_box(4096)),
+            ))
+        });
+    }
+
+    /// Which object a `semctl` or `msgctl` command names: the set itself, or
+    /// one semaphore in it, or a table index.
+    #[bench]
+    fn ipc_ctl_subject(b: &mut Bencher) {
+        b.iter(|| {
+            black_box((
+                semctl_subject(black_box(SemctlCmds::GETVAL), black_box(3)),
+                msgctl_subject(black_box(2), black_box(0)),
+            ))
+        });
+    }
+}

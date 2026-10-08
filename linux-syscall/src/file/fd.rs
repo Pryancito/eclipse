@@ -2158,3 +2158,141 @@ mod perf_open_flag_tests {
         assert!(perf_open_plan(0, 0, -1, -1, 4).is_ok());
     }
 }
+
+#[cfg(test)]
+mod benches {
+    //! `open`, `openat`, `dup`, `dup2`, `dup3` and `fcntl`, measured at the
+    //! part that is the syscall's own: the flag word, the descriptor number,
+    //! and the rules that decide what the resolved inode may be opened as.
+    //! The path resolution these calls do first is `linux-object`'s and is
+    //! benched in `linux-object/benches/vfs.rs`.
+    //!
+    //! Every row black-boxes its inputs, so the figures are the real
+    //! instruction counts of a few bitfield tests -- which is the finding:
+    //! an `open` does not spend its time here, and these numbers are what
+    //! the rest of the call is measured against.
+
+    use super::*;
+    use test::{black_box, Bencher};
+
+    const NOFILE: u64 = 1024;
+
+    /// `open(path, O_RDONLY)`: the flag word of the commonest open there is.
+    #[bench]
+    fn open_flags_rdonly(b: &mut Bencher) {
+        b.iter(|| black_box(open_flags(black_box(0))));
+    }
+
+    /// `open(path, O_WRONLY|O_CREAT|O_TRUNC)`: what a shell redirection
+    /// sends.
+    #[bench]
+    fn open_flags_create_trunc(b: &mut Bencher) {
+        let raw = (OpenFlags::WRONLY | OpenFlags::CREATE | OpenFlags::TRUNCATE).bits();
+        b.iter(|| black_box(open_flags(black_box(raw))));
+    }
+
+    /// `open(path, O_PATH|O_RDWR|O_TRUNC)`: the arm that *drops* bits, which
+    /// is a second pass over the word.
+    #[bench]
+    fn open_flags_o_path_drops_bits(b: &mut Bencher) {
+        let raw = (OpenFlags::PATH | OpenFlags::RDWR | OpenFlags::TRUNCATE).bits();
+        b.iter(|| black_box(open_flags(black_box(raw))));
+    }
+
+    /// A flag word with a bit this kernel does not name: `EINVAL`, and the
+    /// answer costs no more than accepting one.
+    #[bench]
+    fn open_flags_unknown_bit(b: &mut Bencher) {
+        b.iter(|| black_box(open_flags(black_box(1 << 31))));
+    }
+
+    /// The flag word of `eventfd2`, `timerfd_create`, `signalfd4`, `pipe2`
+    /// and `epoll_create1`, which each accept their own small set.
+    #[bench]
+    fn anon_fd_flag_check(b: &mut Bencher) {
+        let allowed = (OpenFlags::CLOEXEC | OpenFlags::NON_BLOCK).bits();
+        b.iter(|| {
+            black_box(anon_fd_flags(
+                black_box(OpenFlags::CLOEXEC.bits()),
+                black_box(allowed),
+            ))
+        });
+    }
+
+    /// What the resolved inode may be opened as: four rules, run once per
+    /// `open` that got as far as an inode.
+    #[bench]
+    fn open_resolved_type_of_a_file(b: &mut Bencher) {
+        b.iter(|| {
+            black_box(open_resolved_type(
+                black_box(OpenFlags::RDONLY),
+                black_box(FileType::File),
+            ))
+        });
+    }
+
+    /// The same for a directory opened `O_DIRECTORY|O_RDONLY`, which is what
+    /// `opendir` sends.
+    #[bench]
+    fn open_resolved_type_of_a_directory(b: &mut Bencher) {
+        let flags = OpenFlags::RDONLY | OpenFlags::DIRECTORY;
+        b.iter(|| {
+            black_box(open_resolved_type(
+                black_box(flags),
+                black_box(FileType::Dir),
+            ))
+        });
+    }
+
+    /// Whether this open truncates, and whether a `nodev` mount may refuse
+    /// it: two more per-open tests.
+    #[bench]
+    fn open_truncate_and_nodev_decisions(b: &mut Bencher) {
+        let flags = OpenFlags::WRONLY | OpenFlags::TRUNCATE;
+        b.iter(|| {
+            black_box((
+                truncates_on_open(
+                    black_box(flags),
+                    black_box(FileType::File),
+                    black_box(false),
+                ),
+                nodev_blocks(black_box(flags), black_box(FileType::File)),
+            ))
+        });
+    }
+
+    /// Whether an `O_PATH` open takes hold of the link rather than its
+    /// target, which reads the path's last byte.
+    #[bench]
+    fn o_path_link_decision(b: &mut Bencher) {
+        let flags = OpenFlags::PATH | OpenFlags::NOFOLLOW;
+        b.iter(|| {
+            black_box(o_path_holds_the_link(
+                black_box(flags),
+                black_box(false),
+                black_box("/usr/bin/awk"),
+            ))
+        });
+    }
+
+    /// `fcntl(fd, F_DUPFD, start)`: the start number, bounded by the
+    /// process's `RLIMIT_NOFILE`.
+    #[bench]
+    fn dupfd_start_arg(b: &mut Bencher) {
+        b.iter(|| black_box(dupfd_start(black_box(3), black_box(NOFILE))));
+    }
+
+    /// `dup2(fd, newfd)` / `dup3`: the target number, which has its own
+    /// errno.
+    #[bench]
+    fn dup2_target_arg(b: &mut Bencher) {
+        b.iter(|| black_box(dup_target(black_box(10), black_box(NOFILE))));
+    }
+
+    /// `flock(fd, op)`: the operation word, which carries both a command and
+    /// `LOCK_NB`.
+    #[bench]
+    fn flock_operation(b: &mut Bencher) {
+        b.iter(|| black_box(flock_translate(black_box(1))));
+    }
+}

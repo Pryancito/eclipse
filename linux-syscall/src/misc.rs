@@ -2401,3 +2401,172 @@ mod getrandom_tests {
         assert_eq!(getrandom_args(1, 0), Ok(1));
     }
 }
+
+#[cfg(test)]
+mod benches {
+    //! `futex`, `capget`/`capset`, `syslog`, the `ioprio` pair and the
+    //! remaining odds: the calls that live in no family of their own.
+    //!
+    //! `futex_op_check` is the one worth reading. It runs on every
+    //! `pthread_mutex_lock` that contends and every `pthread_cond_wait`, and
+    //! the futex path is the one place in the kernel where a few nanoseconds
+    //! are a visible share of the call: `FUTEX_WAKE` with no waiters is
+    //! ~330 ns from userspace and 11 ns of futex code, so anything the
+    //! syscall adds before the futex is a measurable part of the rest.
+    //!
+    //! Every row black-boxes its inputs. Two cycles (~0.6 ns) is `b.iter`'s
+    //! own loop; a row there with an opaque input is a real compare and
+    //! branch, with a constant input it is a call that was folded away.
+
+    use super::*;
+    use test::{black_box, Bencher};
+
+    /// `FUTEX_WAIT | FUTEX_PRIVATE_FLAG`, which is what glibc sends for a
+    /// contended process-private mutex: every one of them goes through here.
+    #[bench]
+    fn futex_op_of_a_private_wait(b: &mut Bencher) {
+        let op = FUTEX_WAIT | FUTEX_PRIVATE_FLAG;
+        b.iter(|| black_box(futex_op_check(black_box(op), black_box(0))));
+    }
+
+    /// `FUTEX_WAKE | FUTEX_PRIVATE_FLAG`: the unlock side.
+    #[bench]
+    fn futex_op_of_a_private_wake(b: &mut Bencher) {
+        let op = FUTEX_WAKE | FUTEX_PRIVATE_FLAG;
+        b.iter(|| black_box(futex_op_check(black_box(op), black_box(0))));
+    }
+
+    /// `FUTEX_WAIT_BITSET`, which carries a mask that must not be empty --
+    /// the one arm where `val3` is read.
+    #[bench]
+    fn futex_op_of_a_bitset_wait(b: &mut Bencher) {
+        let op = FUTEX_WAIT_BITSET | FUTEX_PRIVATE_FLAG | FUTEX_CLOCK_REALTIME;
+        b.iter(|| black_box(futex_op_check(black_box(op), black_box(u32::MAX))));
+    }
+
+    /// An operation this kernel does not implement: `ENOSYS`, which is what
+    /// makes glibc fall back instead of hanging.
+    #[bench]
+    fn futex_op_unimplemented(b: &mut Bencher) {
+        b.iter(|| {
+            black_box(futex_op_check(
+                black_box(FUTEX_WAIT_REQUEUE_PI),
+                black_box(0),
+            ))
+        });
+    }
+
+    /// A relative `FUTEX_WAIT` timeout, turned into a monotonic deadline.
+    #[bench]
+    fn futex_relative_deadline(b: &mut Bencher) {
+        let now = Duration::from_secs(1000);
+        let timeout = Duration::from_millis(50);
+        b.iter(|| {
+            black_box(futex_deadline(
+                black_box(now),
+                black_box(Some(timeout)),
+                black_box(None),
+            ))
+        });
+    }
+
+    /// The untimed wait, whose deadline has to be a real one that never
+    /// fires rather than no deadline at all -- which is the difference
+    /// between an interruptible park and a wedged process.
+    #[bench]
+    fn futex_untimed_deadline(b: &mut Bencher) {
+        let now = Duration::from_secs(1000);
+        b.iter(|| {
+            black_box(futex_deadline(
+                black_box(now),
+                black_box(None),
+                black_box(None),
+            ))
+        });
+    }
+
+    /// `capget(&hdr, NULL)` with an unknown version: libcap's probe for the
+    /// kernel's capability version, which must be 0 and not `EINVAL`.
+    #[bench]
+    fn capget_version_probe(b: &mut Bencher) {
+        b.iter(|| black_box(capget_plan(black_box(0), black_box(0), black_box(true))));
+    }
+
+    /// A real `capget` of the caller's own capabilities.
+    #[bench]
+    fn capget_of_the_caller(b: &mut Bencher) {
+        b.iter(|| {
+            black_box((
+                capget_plan(
+                    black_box(LINUX_CAPABILITY_VERSION_3),
+                    black_box(0),
+                    black_box(false),
+                ),
+                capget_names_the_caller(black_box(0), black_box(4242)),
+            ))
+        });
+    }
+
+    /// `capset`'s verdict: whether the three sets asked for are reachable
+    /// from the ones held, against the bounding set.
+    #[bench]
+    fn capset_verdict(b: &mut Bencher) {
+        let old = CapSets {
+            effective: CAP_FULL_SET,
+            permitted: CAP_FULL_SET,
+            inheritable: 0,
+        };
+        let new = CapSets {
+            effective: 0,
+            permitted: CAP_FULL_SET,
+            inheritable: 0,
+        };
+        b.iter(|| {
+            black_box(capset_sets_verdict(
+                black_box(&old),
+                black_box(CAP_FULL_SET),
+                black_box(&new),
+            ))
+        });
+    }
+
+    /// `syslog(SYSLOG_ACTION_READ_ALL, buf, len)`: what `dmesg` sends, and
+    /// the one action an unprivileged caller may make.
+    #[bench]
+    fn syslog_read_all_plan(b: &mut Bencher) {
+        b.iter(|| {
+            black_box(syslog_plan(
+                black_box(SYSLOG_ACTION_READ_ALL),
+                black_box(false),
+                black_box(4096),
+                black_box(false),
+            ))
+        });
+    }
+
+    /// `ioprio_get`/`ioprio_set`: the class and level out of the word, the
+    /// `which` argument, and the verdict on a value a caller asked for.
+    #[bench]
+    fn ioprio_decode_and_verdict(b: &mut Bencher) {
+        b.iter(|| {
+            black_box((
+                ioprio_class_and_level(black_box(2 << 13 | 4)),
+                ioprio_which(black_box(1)),
+                ioprio_set_verdict(black_box(2 << 13 | 4), black_box(false)),
+            ))
+        });
+    }
+
+    /// The priority a thread actually runs at: what was set, or what its
+    /// nice value implies when nothing was.
+    #[bench]
+    fn ioprio_effective_value(b: &mut Bencher) {
+        b.iter(|| {
+            black_box((
+                nice_ioprio(black_box(-5)),
+                effective_ioprio(black_box(0), black_box(-5)),
+                ioprio_best(black_box(2 << 13), black_box(1 << 13)),
+            ))
+        });
+    }
+}
