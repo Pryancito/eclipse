@@ -26,6 +26,13 @@
 extern crate alloc;
 #[cfg(test)]
 extern crate test;
+// A test build links `std` anyway -- `test` depends on it -- and the
+// non-temporal-blit instrumentation in `utils::dma_sync::test_flag` needs
+// `thread_local!` to stay honest under a parallel harness: a process-global
+// counter cannot say whether THIS test's blit took the fast path when another
+// thread's blit can bump it in between.
+#[cfg(test)]
+extern crate std;
 
 #[macro_use]
 extern crate log;

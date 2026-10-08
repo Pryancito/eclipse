@@ -1142,11 +1142,12 @@ mod blit_tests {
             // believing it had the scalar path -- so on x86_64 BOTH sides went
             // down `nt_store_rows` and it compared the non-temporal path with
             // itself, which is the exact failure its own doc warns about. The
-            // counter below is the guard that says so out loud.
+            // counter below is the guard that says so out loud; it counts per
+            // thread, so no other test's or bench row's blit can land between
+            // the two reads and turn this into a spurious failure.
             let slow = FakeDisplay::write_back(sw, sh, pitch);
             assert!(!slow.fb_write_combining());
             {
-                let _flag = crate::utils::dma_sync::test_flag::as_detected();
                 let before = crate::utils::dma_sync::test_flag::nt_store_calls();
                 slow.blit_from(dx, dy, &src, stride, w, h);
                 assert_eq!(

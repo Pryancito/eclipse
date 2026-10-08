@@ -565,23 +565,38 @@ mod wc_tests {
 #[cfg(test)]
 pub(crate) mod test_flag {
     use super::{probe_cpu_features, HAS_NT_BLIT};
-    use core::sync::atomic::{AtomicUsize, Ordering};
+    use core::cell::Cell;
+    use core::sync::atomic::Ordering;
 
-    /// How many times [`super::nt_store_rows`] has actually taken the
-    /// non-temporal path. A test that compares the fast path against the slow
-    /// one is worthless if the fast one quietly declined -- the two agree
-    /// perfectly when they are the same code -- so the comparison checks this
-    /// moved.
-    static NT_STORE_CALLS: AtomicUsize = AtomicUsize::new(0);
-
-    pub(crate) fn note_nt_store() {
-        NT_STORE_CALLS.fetch_add(1, Ordering::Relaxed);
+    std::thread_local! {
+        /// How many times [`super::nt_store_rows`] has taken the non-temporal
+        /// path **on this thread**. A test that compares the fast path against
+        /// the slow one is worthless if the fast one quietly declined -- the two
+        /// agree perfectly when they are the same code -- so the comparison
+        /// checks this moved; and a test that means to prove its slow side
+        /// stayed slow checks it did NOT.
+        ///
+        /// Per thread, and not a process-global counter, because the [`Scoped`]
+        /// guard below does not isolate it. The guard only excludes other
+        /// callers that take the same lock, while every ordinary blit test and
+        /// every write-combining bench row calls `nt_store_rows` without it: on
+        /// the default parallel harness one of those can land between a
+        /// before/after pair and make an otherwise sound assertion fail, or
+        /// make a vacuous one pass. A thread-local count is each test's own.
+        static NT_STORE_CALLS: Cell<usize> = const { Cell::new(0) };
     }
 
-    /// The count so far. Only meaningful while a [`Scoped`] guard is held,
-    /// which is what keeps another thread's blit out of it.
+    pub(crate) fn note_nt_store() {
+        // A thread that is tearing down can no longer reach its thread-local;
+        // nothing is measuring on it either, so dropping the count is right.
+        let _ = NT_STORE_CALLS.try_with(|c| c.set(c.get() + 1));
+    }
+
+    /// The count so far on the calling thread. The blit being counted has to
+    /// happen on the same thread as the two reads around it, which for a test
+    /// body and the benches here it does.
     pub fn nt_store_calls() -> usize {
-        NT_STORE_CALLS.load(Ordering::Relaxed)
+        NT_STORE_CALLS.try_with(|c| c.get()).unwrap_or(0)
     }
 
     lazy_static::lazy_static! {

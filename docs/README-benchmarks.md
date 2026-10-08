@@ -64,10 +64,15 @@ wanted it.
 Beside the code has a second advantage worth having on purpose: a bench that
 sits under the function it measures is read by whoever changes that function.
 
-One family needs `--test-threads=1`: the display rows that choose between
-`blit_from`'s two paths hold a process-wide flag and a spin lock while they
-measure, so run in parallel the whole family reads wrong. CI pins one thread
-already; a hand run should too.
+Run the display families with `--test-threads=1`. Nothing in them needs a
+lock -- which path a row takes is its own backend's `wc` field, and no bench
+row touches `dma_sync::test_flag` -- but each row owns an 8.8 MiB fake
+aperture and a source buffer to match, and several of them measuring at once
+compete for the same memory bandwidth and the same cache. Measured in
+parallel, one 64x64 blit row read 1.2 us in one pass and 13 us in the next;
+serially both passes agree. CI never runs `cargo bench` (it compiles the
+targets with `--no-run`), and the `cargo test` run that does execute each row
+once already passes `--test-threads=1`; a hand run has to say so itself.
 
 ## Which harness, and why
 
@@ -851,10 +856,12 @@ framebuffer backend inherits: the present path's `blit_from`, the console's
 the software cursor's `read_into`, and the per-pixel arithmetic under all of
 them. The fixture is `blit_tests`'s own fake aperture, a heap `Vec`.
 
-**Run these with `--test-threads=1`.** Two rows hold a process-wide flag and a
-spin lock while they measure; run in parallel the family comes out incoherent,
-and the first time this batch was measured a 64x64 blit read 1.2 us in one run
-and 13 us in the next. CI already pins one thread.
+**Run these with `--test-threads=1`.** Not for a lock -- no row here takes one
+-- but because each row owns an 8.8 MiB aperture plus its source, so rows
+measuring side by side compete for memory bandwidth and cache. The first time
+this batch was measured in parallel a 64x64 blit read 1.2 us in one pass and
+13 us in the next; serially the two agree. The `cargo test` run that executes
+each row once already pins one thread.
 
 **And every figure is a lower bound.** The fake aperture is write-back, cached
 and prefetched. A real scanout is uncached write-combining behind a PCI BAR,
