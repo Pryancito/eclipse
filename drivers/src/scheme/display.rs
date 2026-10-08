@@ -340,6 +340,28 @@ pub trait DisplayScheme: Scheme {
             let (left, right) = XMap::of(info.width).range(left, right);
             let pitch = info.pitch() as usize;
             let px = color.raw_value().to_ne_bytes();
+            // Sixteen pixels of the colour, so a row is laid down a whole
+            // write-combining line at a time. Writing four bytes per loop trip
+            // made the fill the slowest primitive here by a wide margin: a
+            // full-screen clear measured FOUR TIMES the cost of `copy_rect`
+            // moving the same screen plus reading it back, which is a loop
+            // bound, not a memory bound (see `benches` below). On a real
+            // write-combining aperture the wide store is better still, for the
+            // same reason `expand_x_for_wc` exists: a 64-byte line arrives
+            // complete instead of as sixteen partial combines.
+            //
+            // Byte for byte the same fill as the four-byte loop. `end - start`
+            // is `(right - left) * 4` -- both offsets carry the same
+            // `y * pitch` -- so the span is a whole number of pixels, the wide
+            // trips cover sixteen of them each and the tail loop covers the
+            // rest; the bound is still checked once per row, before anything
+            // is written to it.
+            let mut line = [0u8; 64];
+            let mut i = 0;
+            while i < line.len() {
+                line[i..i + 4].copy_from_slice(&px);
+                i += 4;
+            }
             let mut fb = self.fb();
             let buf: &mut [u8] = &mut fb;
             for y in top..bottom {
@@ -347,6 +369,10 @@ pub trait DisplayScheme: Scheme {
                 let end = y as usize * pitch + right as usize * 4;
                 if end > buf.len() {
                     break;
+                }
+                while off + 64 <= end {
+                    buf[off..off + 64].copy_from_slice(&line);
+                    off += 64;
                 }
                 while off < end {
                     buf[off..off + 4].copy_from_slice(&px);
@@ -794,10 +820,27 @@ mod blit_tests {
     struct FakeDisplay {
         info: DisplayInfo,
         mem: Mutex<alloc::vec::Vec<u8>>,
+        /// What [`fb_write_combining`](DisplayScheme::fb_write_combining)
+        /// answers, and so which of `blit_from`'s two paths this backend gets.
+        /// The non-temporal store path is gated on this and on
+        /// `dma_sync::has_nt_store`, which is a `const fn` that is simply true
+        /// on x86_64 -- so this flag, and not the `test_flag` pinning, is the
+        /// only way to reach the scalar fallback at all.
+        wc: bool,
     }
 
     impl FakeDisplay {
         fn new(width: u32, height: u32, pitch_px: u32) -> Arc<Self> {
+            Self::with_wc(width, height, pitch_px, true)
+        }
+
+        /// A backend that is NOT write-combining -- a virtio-gpu host-shared
+        /// framebuffer -- and therefore takes `blit_from`'s scalar row copies.
+        fn write_back(width: u32, height: u32, pitch_px: u32) -> Arc<Self> {
+            Self::with_wc(width, height, pitch_px, false)
+        }
+
+        fn with_wc(width: u32, height: u32, pitch_px: u32, wc: bool) -> Arc<Self> {
             let pitch = pitch_px * 4;
             let size = (pitch * height) as usize;
             Arc::new(Self {
@@ -810,6 +853,7 @@ mod blit_tests {
                     fb_size: size,
                 },
                 mem: Mutex::new(alloc::vec![0u8; size]),
+                wc,
             })
         }
 
@@ -848,9 +892,11 @@ mod blit_tests {
             unsafe { FrameBuffer::from_raw_parts_mut(m.as_mut_ptr(), m.len()) }
         }
         /// The two real backends (UEFI GOP and NVIDIA BAR1) both report true,
-        /// which is what makes the edge alignment matter at all.
+        /// which is what makes the edge alignment matter at all, and is the
+        /// default here. [`write_back`](FakeDisplay::write_back) builds the
+        /// other kind.
         fn fb_write_combining(&self) -> bool {
-            true
+            self.wc
         }
     }
 
@@ -1087,11 +1133,31 @@ mod blit_tests {
                 dy
             );
 
-            let slow = FakeDisplay::new(sw, sh, pitch);
+            // The slow side has to be a backend that is NOT write-combining,
+            // and pinning `test_flag` is not how you get one. `blit_from`
+            // gates its non-temporal path on `self.fb_write_combining() &&
+            // has_nt_store()`, and `has_nt_store` is a `const fn` that is
+            // simply `cfg!(target_arch = "x86_64")`: it consults no flag and
+            // `pinned(false)` cannot move it. This test used to pin that flag,
+            // believing it had the scalar path -- so on x86_64 BOTH sides went
+            // down `nt_store_rows` and it compared the non-temporal path with
+            // itself, which is the exact failure its own doc warns about. The
+            // counter below is the guard that says so out loud; it counts per
+            // thread, so no other test's or bench row's blit can land between
+            // the two reads and turn this into a spurious failure.
+            let slow = FakeDisplay::write_back(sw, sh, pitch);
+            assert!(!slow.fb_write_combining());
             {
-                let flag = crate::utils::dma_sync::test_flag::pinned(false);
-                assert!(!flag.nt);
+                let before = crate::utils::dma_sync::test_flag::nt_store_calls();
                 slow.blit_from(dx, dy, &src, stride, w, h);
+                assert_eq!(
+                    crate::utils::dma_sync::test_flag::nt_store_calls(),
+                    before,
+                    "{} took the non-temporal path on the side that is \
+                     supposed to be the scalar one, so this compares that path \
+                     with itself",
+                    label
+                );
             }
 
             let fast = FakeDisplay::new(sw, sh, pitch);
@@ -1158,6 +1224,7 @@ mod blit_tests {
                 fb_size: size,
             },
             mem: Mutex::new(alloc::vec![0u8; size]),
+            wc: true,
         })
     }
 
@@ -1369,6 +1436,126 @@ mod blit_tests {
         }
     }
 
+    /// The wide fill against the four-byte loop it replaced, byte for byte.
+    ///
+    /// `fill_rect` used to write one pixel per loop trip; it now lays a row
+    /// down sixteen pixels at a time with a four-byte tail, which is four
+    /// times faster on a whole console row. That is only allowed to be a
+    /// speed-up: the set of bytes written, the clipping, and the one bound
+    /// check per row all have to be exactly what they were. The reference
+    /// implementation below IS the old loop, spelled out here so the
+    /// comparison is against the code that shipped and not against a
+    /// paraphrase of it.
+    #[test]
+    fn the_wide_fill_lays_down_exactly_what_the_four_byte_loop_did() {
+        // (width, height, pitch_px, short_by, rect x, y, w, h)
+        let cases: &[(u32, u32, u32, usize, u32, u32, u32, u32)] = &[
+            // Spans either side of the sixteen-pixel step: under it, exactly
+            // it, and one past it, so the tail loop is reached with 0, 1 and
+            // 15 pixels left over.
+            (64, 4, 64, 0, 0, 0, 1, 1),
+            (64, 4, 64, 0, 0, 0, 15, 2),
+            (64, 4, 64, 0, 0, 0, 16, 2),
+            (64, 4, 64, 0, 0, 0, 17, 2),
+            (64, 4, 64, 0, 0, 0, 31, 3),
+            // Odd left edges, so no wide trip starts on a 64-byte boundary.
+            (64, 4, 64, 0, 1, 0, 40, 2),
+            (64, 4, 64, 0, 3, 1, 33, 2),
+            (64, 4, 64, 0, 15, 0, 17, 4),
+            // A padded scanline: the fill must stop at the visible width and
+            // leave the padding to the next row.
+            (60, 4, 64, 0, 0, 0, 60, 4),
+            (60, 4, 64, 0, 50, 2, 40, 2),
+            // Clipped at each edge, and off the edge entirely.
+            (64, 4, 64, 0, 60, 0, 40, 1),
+            (64, 4, 64, 0, 0, 3, 64, 9),
+            (64, 4, 64, 0, 64, 0, 16, 1),
+            (64, 4, 64, 0, 0, 4, 16, 1),
+            (64, 4, 64, 0, 0, 0, 0, 4),
+            // A whole screen, which is what `clear` asks for.
+            (64, 4, 64, 0, 0, 0, 64, 4),
+            // An aperture shorter than `pitch * height`: the last rows
+            // straddle the end and the per-row bound has to stop the fill at
+            // the same row it stopped at before.
+            (64, 4, 64, 1, 0, 0, 64, 4),
+            (64, 4, 64, 200, 0, 0, 64, 4),
+            (60, 4, 64, 40, 50, 0, 40, 4),
+        ];
+        let mut wrote_something = false;
+        for &(w, h, pitch_px, short_by, rx, ry, rw, rh) in cases {
+            let make = || {
+                if short_by == 0 {
+                    FakeDisplay::new(w, h, pitch_px)
+                } else {
+                    truncated(w, h, pitch_px, short_by)
+                }
+            };
+            let label = alloc::format!(
+                "{}x{} pitch {} short {} fill {}x{} at ({},{})",
+                w,
+                h,
+                pitch_px,
+                short_by,
+                rw,
+                rh,
+                rx,
+                ry
+            );
+
+            let got = make();
+            got.fill_rect(
+                &Rectangle {
+                    x: rx,
+                    y: ry,
+                    width: rw,
+                    height: rh,
+                },
+                RED,
+            );
+
+            // ---- the four-byte loop, as it was written ----
+            let want = make();
+            {
+                let info = want.info();
+                let left = rx.min(info.width);
+                let right = rx.saturating_add(rw).min(info.width);
+                let top = ry.min(info.height);
+                let bottom = ry.saturating_add(rh).min(info.height);
+                if left < right && top < bottom {
+                    let (left, right) = XMap::of(info.width).range(left, right);
+                    let pitch = info.pitch() as usize;
+                    let px = RED.raw_value().to_ne_bytes();
+                    let mut m = want.mem.lock();
+                    for y in top..bottom {
+                        let mut off = y as usize * pitch + left as usize * 4;
+                        let end = y as usize * pitch + right as usize * 4;
+                        if end > m.len() {
+                            break;
+                        }
+                        while off < end {
+                            m[off..off + 4].copy_from_slice(&px);
+                            off += 4;
+                        }
+                    }
+                }
+            }
+
+            assert_eq!(
+                got.snapshot(),
+                want.snapshot(),
+                "the wide fill and the four-byte loop disagree for {}",
+                label
+            );
+            if got.snapshot() != make().snapshot() {
+                wrote_something = true;
+            }
+        }
+        assert!(
+            wrote_something,
+            "every case came out blank, so the comparison compared nothing"
+        );
+    }
+
     #[test]
     fn clearing_the_screen_leaves_the_off_screen_padding_alone() {
         let d = FakeDisplay::new(4, 3, 6);
@@ -1496,6 +1683,7 @@ mod blit_tests {
                 fb_size: size,
             },
             mem: Mutex::new(alloc::vec![0u8; size]),
+            wc: true,
         })
     }
 
@@ -1908,5 +2096,378 @@ mod blit_tests {
             mem[7], 0xAA,
             "the fourth byte of a 24-bit pixel was written"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // What the generic 2D primitives cost.
+    // ------------------------------------------------------------------
+
+    /// Native `#[bench]` rows for the primitives above, through the same fake
+    /// aperture their tests use. `cargo +nightly bench -p zcore-drivers --features mock`.
+    ///
+    /// **Every figure here is a lower bound, and by a wide margin.** The fake
+    /// aperture is a heap `Vec`: write-back, cached, prefetched, and on this
+    /// machine entirely in L2/L3 for the smaller rows. A real scanout is
+    /// uncached write-combining memory behind a PCI BAR, where a store costs
+    /// far more and a *read back* costs more still -- which is the whole
+    /// reason `blit_argb_over` skips reading the destination for an opaque
+    /// pixel and why the non-temporal path exists at all. So these rows price
+    /// the arithmetic, the clipping and the loop shape, which is what they are
+    /// for, and not the bus. Ratios between rows of the same family carry
+    /// across; absolute numbers do not.
+    ///
+    /// The process-wide mirror flag is deliberately never touched: every test
+    /// in this module reads it, and a row that flipped it would make their
+    /// result depend on execution order. The mirror's own arithmetic is
+    /// measured through [`xmap`], which builds a mapping without the flag.
+    #[cfg(test)]
+    mod benches {
+        use super::*;
+        use test::{black_box, Bencher};
+
+        /// 1080p on a 2048-pixel pitch: a real GOP mode with 512 bytes of
+        /// off-screen padding per scanline. 8.8 MiB of aperture.
+        fn hd() -> Arc<FakeDisplay> {
+            FakeDisplay::new(1920, 1080, 2048)
+        }
+
+        /// A 64x64 pointer bitmap's worth of source pixels, premultiplied with
+        /// the alpha `a` in every pixel.
+        fn cursor(a: u32) -> alloc::vec::Vec<u32> {
+            solid((a << 24) | 0x0020_4060, 64, 64)
+        }
+
+        // ---- blit_from: the present path ----
+
+        /// A whole frame pushed through the scalar row copies. This is what one
+        /// full-screen damage rectangle costs when the CPU has no non-temporal
+        /// stores, or when the destination is not write-combining (virtio).
+        #[bench]
+        fn blit_a_whole_1080p_frame_with_row_copies(b: &mut Bencher) {
+            let d = FakeDisplay::write_back(1920, 1080, 2048);
+            let src = numbered(1920, 1080);
+            b.iter(|| d.blit_from(0, 0, black_box(&src), 1920, 1920, 1080));
+        }
+
+        /// The same frame onto a write-combining backend, which on x86_64
+        /// always means `nt_store_rows`: the gate is `has_nt_store()`, a
+        /// `const fn` that is true on this architecture and consults no CPUID
+        /// bit. Remember that the fake aperture is cached, so the non-temporal
+        /// path's real advantage -- not evicting pixels nobody reads back, and
+        /// completing whole write-combining lines -- is invisible here, while
+        /// its cost (a store that goes to DRAM) is fully visible. The pair
+        /// bounds the loop shape, not the bus.
+        #[bench]
+        fn blit_a_whole_1080p_frame_as_this_cpu_would(b: &mut Bencher) {
+            let d = hd();
+            let src = numbered(1920, 1080);
+            b.iter(|| d.blit_from(0, 0, black_box(&src), 1920, 1920, 1080));
+        }
+
+        /// One scanline of damage, which is a one-line text update and the
+        /// cursor overlay's own row both.
+        #[bench]
+        fn blit_one_1080p_damage_row(b: &mut Bencher) {
+            let d = hd();
+            let src = numbered(1920, 2);
+            b.iter(|| d.blit_from(0, 540, black_box(&src), 1920, 1920, 1));
+        }
+
+        /// A pointer-sized window: 64x64, the shape every cursor move blits.
+        #[bench]
+        fn blit_a_64x64_window(b: &mut Bencher) {
+            let d = hd();
+            let src = numbered(64, 64);
+            b.iter(|| d.blit_from(400, 300, black_box(&src), 64, 64, 64));
+        }
+
+        /// The `expand_x_for_wc` shape: a 16-pixel window at the right edge
+        /// whose tail lands in the scanline's off-screen padding. Two rows, so
+        /// this is the per-call overhead of the primitive more than the copy.
+        #[bench]
+        fn blit_the_sixteen_pixel_padded_tail(b: &mut Bencher) {
+            let d = FakeDisplay::new(1366, 4, 1536);
+            let src = numbered(16, 2);
+            b.iter(|| d.blit_from(1360, 0, black_box(&src), 16, 16, 2));
+        }
+
+        /// The same 64x64 window onto a backend that is not write-combining,
+        /// so the pair prices the two paths on the shape the cursor actually
+        /// blits -- the full-frame pair does it at the other extreme.
+        ///
+        /// **If this row comes out cheaper than the one above, that is not by
+        /// itself an argument for a size threshold.** `MOVNTDQ` into
+        /// write-BACK memory, which is all a heap `Vec` can be, is a
+        /// known-slow combination: the line goes to DRAM instead of staying in
+        /// the cache. The path exists for write-COMBINING memory, where there
+        /// is no cache to keep it in and filling the combine buffer is the
+        /// whole point. Which way round the two go on a real BAR1 is a
+        /// question only hardware can answer.
+        #[bench]
+        fn blit_a_64x64_window_with_row_copies(b: &mut Bencher) {
+            let d = FakeDisplay::write_back(1920, 1080, 2048);
+            let src = numbered(64, 64);
+            b.iter(|| d.blit_from(400, 300, black_box(&src), 64, 64, 64));
+        }
+
+        /// A blit starting past the visible width but still inside the
+        /// scanline's padding, which is a legal destination (see
+        /// `padded_w`): the copy happens, into bytes nobody scans out.
+        #[bench]
+        fn blit_into_the_off_screen_padding_only(b: &mut Bencher) {
+            let d = hd();
+            let src = numbered(64, 64);
+            b.iter(|| d.blit_from(1920, 300, black_box(&src), 64, 64, 64));
+        }
+
+        /// A blit past the end of the pitch as well: all clipping, no copy.
+        /// Not a floor -- it is what the primitive costs to decide there is
+        /// nothing to do, which is what a damage rectangle outside the mode
+        /// costs.
+        #[bench]
+        fn blit_clipped_away_entirely(b: &mut Bencher) {
+            let d = hd();
+            let src = numbered(64, 64);
+            b.iter(|| d.blit_from(2048, 300, black_box(&src), 64, 64, 64));
+        }
+
+        // ---- fill_rect and clear ----
+
+        /// A full-screen clear, the ARGB8888 word-store loop.
+        #[bench]
+        fn clear_a_whole_1080p_screen(b: &mut Bencher) {
+            let d = hd();
+            b.iter(|| d.clear(black_box(RED)));
+        }
+
+        /// One 16-pixel-tall console row, which is what scrolling leaves blank.
+        #[bench]
+        fn fill_one_console_row_of_1080p(b: &mut Bencher) {
+            let d = hd();
+            let rect = Rectangle {
+                x: 0,
+                y: 1064,
+                width: 1920,
+                height: 16,
+            };
+            b.iter(|| d.fill_rect(black_box(&rect), RED));
+        }
+
+        /// A 64x64 fill through the word-store loop, to pair with the
+        /// pixel-by-pixel row below on exactly the same rectangle.
+        #[bench]
+        fn fill_a_64x64_rectangle_in_argb8888(b: &mut Bencher) {
+            let d = hd();
+            let rect = Rectangle {
+                x: 100,
+                y: 100,
+                width: 64,
+                height: 64,
+            };
+            b.iter(|| d.fill_rect(black_box(&rect), RED));
+        }
+
+        /// The same 64x64 rectangle on a 24-bit mode, which has no word-store
+        /// loop and goes through `draw_pixel` per pixel -- re-deriving the
+        /// framebuffer slice, re-reading the mirror flag and re-checking the
+        /// bound 4096 times. The ratio against the row above is the whole
+        /// reason the ARGB8888 special case is written out.
+        #[bench]
+        fn fill_a_64x64_rectangle_pixel_by_pixel(b: &mut Bencher) {
+            let mut d = FakeDisplay::new(1920, 1080, 2048);
+            Arc::get_mut(&mut d).unwrap().info.format = ColorFormat::RGB888;
+            let rect = Rectangle {
+                x: 100,
+                y: 100,
+                width: 64,
+                height: 64,
+            };
+            b.iter(|| d.fill_rect(black_box(&rect), RED));
+        }
+
+        /// A rectangle that starts past the bottom edge: the clip decision
+        /// alone.
+        #[bench]
+        fn fill_a_rectangle_clipped_away_entirely(b: &mut Bencher) {
+            let d = hd();
+            let rect = Rectangle {
+                x: 0,
+                y: 1080,
+                width: 1920,
+                height: 16,
+            };
+            b.iter(|| d.fill_rect(black_box(&rect), RED));
+        }
+
+        // ---- copy_rect: the console scroll ----
+
+        /// The console scroll: 1079 rows moved up by one. Source and
+        /// destination overlap, so this is `copy_within` per row, and on real
+        /// hardware it is a *read* out of the aperture as well as a write.
+        #[bench]
+        fn scroll_a_1080p_console_up_one_row(b: &mut Bencher) {
+            let d = hd();
+            b.iter(|| d.copy_rect(0, black_box(1), 0, 0, 1920, 1079));
+        }
+
+        /// A 64x64 block moved, to price the per-row overhead against the
+        /// full-screen scroll above.
+        #[bench]
+        fn copy_a_64x64_block(b: &mut Bencher) {
+            let d = hd();
+            b.iter(|| d.copy_rect(black_box(100), 100, 400, 400, 64, 64));
+        }
+
+        // ---- blit_argb_over: the kernel-composited cursor ----
+
+        /// A fully opaque 64x64 pointer. Opaque pixels are copied without
+        /// reading the destination, which is the case the operator is written
+        /// to favour.
+        #[bench]
+        fn composite_an_opaque_64x64_cursor(b: &mut Bencher) {
+            let d = hd();
+            let src = cursor(0xff);
+            b.iter(|| d.blit_argb_over(400, 300, black_box(&src), 64, 64, 64));
+        }
+
+        /// A half-transparent 64x64 pointer: every pixel is a
+        /// read-modify-write and three divisions by 255. On a PCIe aperture the
+        /// read is the expensive half and this row cannot show it; what it does
+        /// show is the arithmetic against the opaque row.
+        #[bench]
+        fn composite_a_half_transparent_64x64_cursor(b: &mut Bencher) {
+            let d = hd();
+            let src = cursor(0x80);
+            b.iter(|| d.blit_argb_over(400, 300, black_box(&src), 64, 64, 64));
+        }
+
+        /// A fully transparent 64x64 pointer: every pixel is skipped on the
+        /// alpha test, so this is the loop and the clipping with no pixel work
+        /// at all -- the floor of this family, in its own units.
+        #[bench]
+        fn composite_a_fully_transparent_64x64_cursor(b: &mut Bencher) {
+            let d = hd();
+            let src = cursor(0x00);
+            b.iter(|| d.blit_argb_over(400, 300, black_box(&src), 64, 64, 64));
+        }
+
+        /// A pointer half off the left edge, which is the per-pixel `px < 0`
+        /// branch taken for half the window. Clipping here is per pixel, not
+        /// per row, and this row is what that costs.
+        #[bench]
+        fn composite_a_cursor_half_off_the_left_edge(b: &mut Bencher) {
+            let d = hd();
+            let src = cursor(0xff);
+            b.iter(|| d.blit_argb_over(-32, 300, black_box(&src), 64, 64, 64));
+        }
+
+        // ---- read_into: what the software cursor saves ----
+
+        /// The 64x64 window the software cursor reads back before drawing
+        /// itself. On real hardware this is an uncached read out of a PCIe
+        /// aperture; here it is a cached memcpy, so of every row in this module
+        /// this is the one whose figure is furthest from the truth.
+        #[bench]
+        fn read_back_a_64x64_window(b: &mut Bencher) {
+            let d = hd();
+            let mut dst = alloc::vec![0u32; 64 * 64];
+            b.iter(|| {
+                black_box(d.read_into(400, 300, black_box(&mut dst), 64, 64, 64));
+            });
+        }
+
+        /// One whole scanline read back.
+        #[bench]
+        fn read_back_one_1080p_row(b: &mut Bencher) {
+            let d = hd();
+            let mut dst = alloc::vec![0u32; 2048];
+            b.iter(|| {
+                black_box(d.read_into(0, 540, black_box(&mut dst), 2048, 1920, 1));
+            });
+        }
+
+        /// A refusal: the window is empty. Pairs with the two above to show
+        /// that the bounds work before the copy costs nothing worth hoisting.
+        #[bench]
+        fn refuse_a_read_of_an_empty_window(b: &mut Bencher) {
+            let d = hd();
+            let mut dst = alloc::vec![0u32; 64];
+            b.iter(|| {
+                black_box(d.read_into(0, 1080, black_box(&mut dst), 64, 64, 64));
+            });
+        }
+
+        // ---- the per-pixel arithmetic, and its floors ----
+
+        /// One pixel drawn through the public primitive: framebuffer slice,
+        /// mirror flag, offset, bound check, `write_color`.
+        #[bench]
+        fn draw_one_pixel(b: &mut Bencher) {
+            let d = hd();
+            b.iter(|| d.draw_pixel(black_box(500), black_box(400), RED));
+        }
+
+        /// The same call rejected on the visible bound, which is what every
+        /// off-screen pixel of a clipped glyph costs.
+        #[bench]
+        fn draw_one_pixel_outside_the_screen(b: &mut Bencher) {
+            let d = hd();
+            b.iter(|| d.draw_pixel(black_box(1920), black_box(400), RED));
+        }
+
+        /// `XMap::px` with the mirror off: the default, and Moebius's machines.
+        #[bench]
+        fn map_one_pixel_unmirrored(b: &mut Bencher) {
+            let m = xmap(false, 1920);
+            b.iter(|| black_box(m.px(black_box(1000))));
+        }
+
+        /// `XMap::px` with the mirror on: two saturating subtractions.
+        #[bench]
+        fn map_one_pixel_mirrored(b: &mut Bencher) {
+            let m = xmap(true, 1920);
+            b.iter(|| black_box(m.px(black_box(1000))));
+        }
+
+        /// A whole span mapped at once, which is what `fill_rect` and
+        /// `copy_rect` do instead of asking per pixel.
+        #[bench]
+        fn map_a_mirrored_range(b: &mut Bencher) {
+            let m = xmap(true, 1920);
+            b.iter(|| {
+                let (l, r) = m.range(black_box(100), black_box(500));
+                black_box(l ^ r)
+            });
+        }
+
+        /// `pixel_fits`: a `checked_add` and a comparison.
+        #[bench]
+        fn check_that_one_pixel_fits(b: &mut Bencher) {
+            b.iter(|| black_box(pixel_fits(black_box(8_000_000), 4, 8_847_360)));
+        }
+
+        /// The floor for the two mapping rows: a call that decides nothing and
+        /// hands back a `u32`. Three figures level with this one mean the
+        /// mapping arithmetic is free and what was measured was the call.
+        #[bench]
+        fn the_mapping_floor(b: &mut Bencher) {
+            #[inline(never)]
+            fn nothing(x: u32) -> u32 {
+                x
+            }
+            b.iter(|| black_box(nothing(black_box(1000))));
+        }
+
+        /// The floor for [`check_that_one_pixel_fits`], which returns a `bool`
+        /// and not a `u32`: a family's floor has to hand back the same thing of
+        /// the same size, or the comparison is between two different calls.
+        #[bench]
+        fn the_bound_check_floor(b: &mut Bencher) {
+            #[inline(never)]
+            fn nothing(x: usize) -> bool {
+                x != 0
+            }
+            b.iter(|| black_box(nothing(black_box(8_000_000))));
+        }
     }
 }

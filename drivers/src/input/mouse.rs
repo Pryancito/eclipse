@@ -444,4 +444,229 @@ mod mouse_tests {
         assert!(s.update(&ev(InputEventType::Syn, SYN_DROPPED, 0)).is_none());
         assert!(s.update(&ev(InputEventType::Syn, SYN_REPORT, 0)).is_some());
     }
+
+    /// Native `#[bench]` rows for the pointer's outbound half.
+    /// `cargo +nightly bench -p zcore-drivers --features graphic,virtio,xhci-usb-hid
+    /// -- mouse_tests::benches`.
+    ///
+    /// `update` runs **once per input event**, which on a moving pointer is
+    /// three or four events per report and a report per hardware packet --
+    /// 125 of them a second on a default PS/2 sample rate, more on USB. The
+    /// inbound half, where a hardware packet becomes those events, is
+    /// `ps2_input::tests::benches`. Pure arithmetic over a 16-byte struct, so
+    /// these figures are exact; what they leave out is the listener and the
+    /// lock around them, which `handle_input_event` adds and no bench here
+    /// can reach without a scheme and a subscriber.
+    #[cfg(test)]
+    mod benches {
+        use super::*;
+        use crate::input::input_event_codes::{key::*, rel::*, syn::*};
+        use test::{black_box, Bencher};
+
+        /// One event folded into a state that is already carrying movement,
+        /// which is what the second and later events of a report see.
+        ///
+        /// **Read the whole family before any single row of it.** Every row
+        /// built on this comes out between 6.4 and 8.2 ns, including the arms
+        /// that do nothing at all, and `close_a_report` -- which copies the
+        /// struct out and zeroes three fields -- is the CHEAPEST of them. An
+        /// arm that does the most work cannot be the cheapest, so what these
+        /// rows measure is not the fold: `update` takes `&mut self`, so each
+        /// iteration stores the state and the next one loads it back, and that
+        /// round trip through memory is most of the figure. It is an artifact
+        /// of measuring one event at a time, not a property of the code --
+        /// in the kernel the state is touched once per event anyway, behind a
+        /// lock. The row worth quoting is `fold_in_a_whole_report`: four
+        /// events for about twice one row, which is itself the proof that a
+        /// single row is mostly fixed cost.
+        fn on_a_moving_pointer(b: &mut Bencher, e: InputEvent) {
+            let mut s = MouseState {
+                dx: 7,
+                dy: -3,
+                dz: 0,
+                buttons: MouseFlags::LEFT_BTN,
+            };
+            b.iter(|| black_box(s.update(black_box(&e))));
+        }
+
+        // ---- one event ----
+
+        #[bench]
+        fn fold_in_a_horizontal_step(b: &mut Bencher) {
+            on_a_moving_pointer(b, ev(InputEventType::RelAxis, REL_X, 4));
+        }
+
+        /// The vertical axis, which is turned over on the way in.
+        #[bench]
+        fn fold_in_a_vertical_step(b: &mut Bencher) {
+            on_a_moving_pointer(b, ev(InputEventType::RelAxis, REL_Y, 4));
+        }
+
+        #[bench]
+        fn fold_in_a_wheel_notch(b: &mut Bencher) {
+            on_a_moving_pointer(b, ev(InputEventType::RelAxis, REL_WHEEL, 1));
+        }
+
+        /// An axis this state does not track (`REL_HWHEEL`, a tablet's
+        /// `REL_DIAL`): the `_ => {}` arm, and the floor of this family.
+        #[bench]
+        fn fold_in_an_axis_it_does_not_track(b: &mut Bencher) {
+            on_a_moving_pointer(b, ev(InputEventType::RelAxis, REL_HWHEEL, 1));
+        }
+
+        #[bench]
+        fn fold_in_a_button_press(b: &mut Bencher) {
+            on_a_moving_pointer(b, ev(InputEventType::Key, BTN_RIGHT, 1));
+        }
+
+        /// A key that is not one of the three buttons -- every keyboard key
+        /// that reaches a device advertising both -- which returns on the
+        /// `_ => return None` of the button match.
+        #[bench]
+        fn fold_in_a_key_that_is_not_a_button(b: &mut Bencher) {
+            on_a_moving_pointer(b, ev(InputEventType::Key, 0x1c, 1));
+        }
+
+        /// `SYN_REPORT`: the one event that answers `Some`, copying the state
+        /// out and zeroing the three deltas.
+        #[bench]
+        fn close_a_report(b: &mut Bencher) {
+            on_a_moving_pointer(b, ev(InputEventType::Syn, SYN_REPORT, 0));
+        }
+
+        /// A `Syn` that is not `SYN_REPORT` (`SYN_MT_REPORT`, `SYN_DROPPED`),
+        /// which falls through without closing anything.
+        #[bench]
+        fn fold_in_a_syn_that_is_not_a_report(b: &mut Bencher) {
+            on_a_moving_pointer(b, ev(InputEventType::Syn, 1, 0));
+        }
+
+        /// A type this state ignores entirely (`EV_MSC`, which a real mouse
+        /// sends a `MSC_SCAN` of per button), the outermost `_ => {}`.
+        #[bench]
+        fn fold_in_a_type_it_ignores(b: &mut Bencher) {
+            on_a_moving_pointer(b, ev(InputEventType::Misc, 4, 0x90001));
+        }
+
+        /// The floor: a call that decides nothing and hands back the same
+        /// `Option<MouseState>` the rows above do. Those are 20 bytes moving,
+        /// and without this row a flat family says only that its arms cost
+        /// the same as each other.
+        #[bench]
+        fn the_fold_floor(b: &mut Bencher) {
+            #[inline(never)]
+            fn nothing(e: &InputEvent) -> Option<MouseState> {
+                if e.value == i32::MIN {
+                    Some(MouseState::default())
+                } else {
+                    None
+                }
+            }
+            let e = ev(InputEventType::RelAxis, REL_X, 4);
+            b.iter(|| black_box(nothing(black_box(&e))));
+        }
+
+        // ---- a whole report ----
+
+        /// What one hardware packet costs on this side: two axes, a wheel and
+        /// the `SYN_REPORT` that closes them. 125 of these a second at the
+        /// default PS/2 sample rate.
+        #[bench]
+        fn fold_in_a_whole_report(b: &mut Bencher) {
+            let events = [
+                ev(InputEventType::RelAxis, REL_X, 4),
+                ev(InputEventType::RelAxis, REL_Y, -2),
+                ev(InputEventType::RelAxis, REL_WHEEL, 0),
+                ev(InputEventType::Syn, SYN_REPORT, 0),
+            ];
+            let mut s = MouseState::default();
+            b.iter(|| {
+                let mut out = None;
+                for e in black_box(&events) {
+                    out = out.or(s.update(e));
+                }
+                black_box(out)
+            });
+        }
+
+        // ---- what a client reads back ----
+
+        /// One packet out of a state that fits in one, plain PS/2: three
+        /// bytes, and the wheel dropped because there is nowhere to put it.
+        #[bench]
+        fn take_a_plain_ps2_packet(b: &mut Bencher) {
+            let mut s = MouseState {
+                dx: 4,
+                dy: -2,
+                dz: 1,
+                buttons: MouseFlags::LEFT_BTN,
+            };
+            b.iter(|| {
+                s.dx = 4;
+                s.dy = -2;
+                s.dz = 1;
+                black_box(s.take_ps2_packet(black_box(Ps2Mode::Ps2)))
+            });
+        }
+
+        /// IntelliMouse: a fourth byte with a signed 8-bit wheel.
+        #[bench]
+        fn take_an_intellimouse_packet(b: &mut Bencher) {
+            let mut s = MouseState {
+                dx: 4,
+                dy: -2,
+                dz: 1,
+                buttons: MouseFlags::LEFT_BTN,
+            };
+            b.iter(|| {
+                s.dx = 4;
+                s.dy = -2;
+                s.dz = 1;
+                black_box(s.take_ps2_packet(black_box(Ps2Mode::ImPs2)))
+            });
+        }
+
+        /// Explorer: four bits of wheel, so a large scroll is split.
+        #[bench]
+        fn take_an_explorer_packet(b: &mut Bencher) {
+            let mut s = MouseState {
+                dx: 4,
+                dy: -2,
+                dz: 40,
+                buttons: MouseFlags::LEFT_BTN,
+            };
+            b.iter(|| {
+                s.dx = 4;
+                s.dy = -2;
+                s.dz = 40;
+                black_box(s.take_ps2_packet(black_box(Ps2Mode::ImEx)))
+            });
+        }
+
+        /// A flick of the wrist: more movement than one packet can say, so
+        /// the packet carries 127 and the rest stays queued. The row that
+        /// used to be a clamp-and-discard.
+        #[bench]
+        fn take_a_packet_out_of_a_flick(b: &mut Bencher) {
+            let mut s = MouseState::default();
+            b.iter(|| {
+                s.dx = 900;
+                s.dy = -900;
+                black_box(s.take_ps2_packet(black_box(Ps2Mode::Ps2)))
+            });
+        }
+
+        /// The question `/dev/input/mice` asks between packets: is there
+        /// another one to send?
+        #[bench]
+        fn ask_whether_the_state_is_drained(b: &mut Bencher) {
+            let s = MouseState {
+                dx: 0,
+                dy: 0,
+                dz: 0,
+                buttons: MouseFlags::LEFT_BTN,
+            };
+            b.iter(|| black_box(black_box(&s).is_drained()));
+        }
+    }
 }

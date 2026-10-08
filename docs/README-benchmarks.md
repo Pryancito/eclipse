@@ -54,8 +54,25 @@ build with the lib: `cargo bench -p linux-syscall`, `-p kernel-hal`,
 `#![cfg_attr(test, feature(test))]` in each `lib.rs` asks for the unstable
 attribute only in a test build, so a kernel build never sees it.
 
+Two of them nest one level further. The rows for the generic 2D primitives
+live in `#[cfg(test)] mod benches` *inside* `scheme::display`'s `blit_tests`,
+because what they need is that module's fake framebuffer backend, and a child
+module sees its ancestors' private items while a sibling would see none of
+them. The alternative was marking a fixture `pub(super)` for every row that
+wanted it.
+
 Beside the code has a second advantage worth having on purpose: a bench that
 sits under the function it measures is read by whoever changes that function.
+
+Run the display families with `--test-threads=1`. Nothing in them needs a
+lock -- which path a row takes is its own backend's `wc` field, and no bench
+row touches `dma_sync::test_flag` -- but each row owns an 8.8 MiB fake
+aperture and a source buffer to match, and several of them measuring at once
+compete for the same memory bandwidth and the same cache. Measured in
+parallel, one 64x64 blit row read 1.2 us in one pass and 13 us in the next;
+serially both passes agree. CI never runs `cargo bench` (it compiles the
+targets with `--no-run`), and the `cargo test` run that does execute each row
+once already passes `--test-threads=1`; a hand run has to say so itself.
 
 ## Which harness, and why
 
@@ -127,6 +144,10 @@ two agree the measurement is standing on something.
 | GPU identification and the BOOT0 decode | — | `zcore-drivers` `display::nvidia::present_benches::identify_*`, `decode_*_boot0` |
 | what a monitor says about itself | — | `zcore-drivers` `display::edid::benches::*` |
 | the GEM handle every driver-private ioctl looks up | — | `zcore-drivers` `scheme::gem_mmap::benches::*` |
+| the 2D primitives every framebuffer backend inherits | — | `zcore-drivers` `scheme::display::blit_tests::benches::*` |
+| the capability bitmap behind `EVIOCGBIT` | — | `zcore-drivers` `scheme::input::benches::*` |
+| the console's shadow buffer and its dirty region | — | `zcore-drivers` `utils::shadow_fb::tests::benches::*` |
+| the pointer, both halves of it | — | `zcore-drivers` `input::ps2_input::tests::benches::*`, `input::mouse::mouse_tests::benches::*` |
 | `stat`/`fstat`/`statx` encoding | `fs` section | `linux-syscall` `file::stat::benches::*` |
 | `select`/`poll`/`epoll` per-call and per-fd work | `fs` section | `linux-syscall` `file::poll::benches::*` |
 | `getdents64` | `fs` section | `linux-syscall` `file::dir::benches::getdents64_*` |
@@ -827,3 +848,235 @@ a middle hit. A non-inlined control taking the same lock reads 13.5 ns, above
 the one-object row it would be bounding, because `lookup` inlines and the
 control pays a call it does not. A floor built out of the wrong shape measures
 the control.
+
+## What the generic 2D primitives said
+
+`scheme::display::blit_tests::benches`, 30 rows over the primitives every
+framebuffer backend inherits: the present path's `blit_from`, the console's
+`fill_rect` and `copy_rect`, the kernel-composited cursor's `blit_argb_over`,
+the software cursor's `read_into`, and the per-pixel arithmetic under all of
+them. The fixture is `blit_tests`'s own fake aperture, a heap `Vec`.
+
+**Run these with `--test-threads=1`.** Not for a lock -- no row here takes one
+-- but because each row owns an 8.8 MiB aperture plus its source, so rows
+measuring side by side compete for memory bandwidth and cache. The first time
+this batch was measured in parallel a 64x64 blit read 1.2 us in one pass and
+13 us in the next; serially the two agree. The `cargo test` run that executes
+each row once already pins one thread.
+
+**And every figure is a lower bound.** The fake aperture is write-back, cached
+and prefetched. A real scanout is uncached write-combining behind a PCI BAR,
+where a store costs far more and a read back costs more still. Ratios inside a
+family carry across; absolute numbers do not, and the non-temporal rows do not
+carry across at all (see below).
+
+### A test was comparing the non-temporal path with itself
+
+`the_two_write_combining_paths_agree_byte_for_byte` pinned
+`dma_sync::test_flag` to false to get `blit_from`'s scalar row copies. It does
+not get them. `blit_from` gates the non-temporal path on
+`self.fb_write_combining() && has_nt_store()`, and `has_nt_store()` is a
+`const fn` returning `cfg!(target_arch = "x86_64")`: it reads no flag, and
+`test_flag` moves `HAS_NT_BLIT`, which only `nt_blit_rows` consults. So on
+x86_64 both sides of that comparison went down `nt_store_rows` and the test
+compared one path with itself -- the exact failure its own doc warns about,
+and its guard (`nt_store_calls()` moved) only ever checked the fast side.
+
+The slow side is now a backend that answers `false` to
+`fb_write_combining()`, which is what a virtio-gpu host-shared framebuffer is,
+and the test asserts `nt_store_calls()` did **not** move for it. Advancing the
+wide loop by 68 instead of 64 bytes, and running the old `pinned(false)`
+arrangement, both fail it.
+
+### The fill wrote four bytes per loop trip
+
+Measuring it is what found it. The ARGB8888 fast path in `fill_rect` -- the
+path the comment above it says becomes "a tight word-store loop" -- wrote one
+pixel per trip, and a full-screen clear cost **four times** what `copy_rect`
+cost moving the same screen *and reading it back*. A loop bound, not a memory
+bound. It now lays a row down in 64-byte lines with a four-byte tail, which on
+a real write-combining aperture is better still for the reason
+`expand_x_for_wc` exists: the line arrives complete instead of as sixteen
+partial combines.
+
+| row | before | after |
+| --- | --- | --- |
+| `fill_one_console_row_of_1080p` (1920x16) | 9,613 ns | **2,420 ns** |
+| `fill_a_64x64_rectangle_in_argb8888` | 1,637 ns | **511 ns** |
+| `clear_a_whole_1080p_screen` | 788,039 ns | **549,931 ns** |
+
+Byte for byte the same fill: `end - start` is `(right - left) * 4`, the wide
+trips cover sixteen pixels each, the tail covers the rest, and the bound is
+still checked once per row before anything is written.
+`the_wide_fill_lays_down_exactly_what_the_four_byte_loop_did` compares the
+whole aperture against the old loop, spelled out in the test, over nineteen
+cases: spans of 1, 15, 16, 17 and 31 pixels, left edges at 1, 3 and 15, padded
+and unpadded pitches, every edge clipped, and apertures 1, 40 and 200 bytes
+short of `pitch * height`.
+
+### The rest of what the rows say
+
+- **The ARGB8888 special case in `fill_rect` is worth 63x.** The same 64x64
+  rectangle: 511 ns through the wide loop, 32,270 ns through `draw_pixel` on a
+  24-bit mode. `draw_one_pixel` is 7.95 ns and 4096 of them is 32.6 us, so the
+  pixel-by-pixel figure is exactly 4096 `draw_pixel` calls and nothing else.
+- **`XMap` is free.** Every mapping row sits on the floor:
+  `map_one_pixel_unmirrored` 0.62 ns, `map_one_pixel_mirrored` 0.68,
+  `map_a_mirrored_range` 1.21, against `the_mapping_floor` 0.48. Reading the
+  mirror flag once per operation instead of once per pixel cost nothing, and
+  the mirror itself costs nothing. `check_that_one_pixel_fits` is 0.72 against
+  a `bool` floor of 0.94, i.e. inlined away.
+- **Clipping is free.** A blit clipped away entirely is 3.70 ns, a fill
+  clipped away 2.28, a refused `read_into` 1.33, a `draw_pixel` outside the
+  screen 0.60 -- the last of those *is* the floor, so the visible-bounds test
+  costs nothing per pixel of a clipped glyph.
+- **In `blit_argb_over` the bookkeeping, not the pixel, is the cost.** A 64x64
+  cursor: 3,028 ns fully transparent (every pixel skipped on the alpha test),
+  5,419 fully opaque, 11,379 half transparent. So 56% of an opaque composite is
+  the loop and its four per-pixel branches, and the premultiplied blend adds
+  about 1.5 ns per pixel on top. Half off the left edge is 6,046 -- half the
+  pixels written and *dearer* than all of them on screen, which says the
+  per-pixel clip costs as much as the store it skips. A fully opaque run could
+  be a row copy; that is a change to the operator, not a measurement, so it is
+  not in this batch.
+- **The console scroll is cheaper than the clear it makes room for**: 396,001
+  ns to move 1079 rows up by one, against 549,931 to paint the screen. On a
+  real aperture that reverses, and badly: `copy_rect` *reads* the framebuffer.
+- **The non-temporal rows do not carry across.** A 64x64 window is 13,117 ns
+  on the write-combining path and 1,170 ns on the scalar one; a whole 1080p
+  frame is 935,228 against 718,597. `MOVNTDQ` into write-back memory, which is
+  all a heap `Vec` can be, goes to DRAM instead of staying in the cache the
+  next reader would have found it in -- so the fake aperture charges the
+  non-temporal path its full cost and pays it none of its benefit. **This pair
+  is not an argument for a size threshold.** Which way round the two go on a
+  real BAR1 is a hardware question.
+
+## What the input capability bitmap said
+
+`scheme::input::benches`, 12 rows. No hardware and no aperture, so unlike the
+display rows these are exact.
+
+- **Asking is free.** `contains` is 0.66 ns against a `bool` floor of 0.94,
+  i.e. inlined. A code past the 1024-bit bitmap is 0.50 ns, so the `at` guard
+  that keeps an out-of-range code from indexing off the end of a 16-word array
+  -- a kernel panic taken from whatever code a driver was handed -- costs
+  nothing at all. `contains_all` of nine codes is 6.92 ns, 1.29 when the first
+  is missing.
+- **`EVIOCGBIT` inbound is 1.7 us, and it is a probe cost, not an event
+  cost.** `from_bitmap` walks the wire bit by bit: 757 ns for 1024 clear bits
+  and 1,697 ns when every one is set, so 0.74 ns per bit walked and 0.92 more
+  per bit set. It is paid once per `(device, event type)` pair when the device
+  is probed and never per input event, which is why it is left alone rather
+  than rewritten word-at-a-time.
+- **The clamp does what it claims.** An 8192-byte bitmap -- 65536 bits, and
+  `virtio/input.rs` sizes this from a byte the *device* writes -- is 1,732 ns,
+  level with the 128-byte one. Without the clamp it would walk 64512 codes past
+  the end and `warn!` about every one.
+- **Outbound is free**: `to_le_bytes` is 2.81 ns for sixteen words.
+
+## What the console's shadow framebuffer said
+
+`utils::shadow_fb::tests::benches`, 23 rows over the console's whole CPU-side
+present path: the glyph renderer's pixels going in through `put_pixels`, the
+scroll through `copy_rect`, the dirty rectangle coming out through
+`take_dirty`, the cursor through `cell_pixels`, and `present` /
+`present_with_cursor` end to end. Everything here is cached RAM, so unlike the
+aperture rows these figures are exact; what they leave out is the device blit
+they hand off to, which the `scheme::display` rows price.
+
+The device is a sink that discards. `tests::Recorder` copies every blit into a
+fresh `Vec`, and for a full-screen present that is a 4 MiB allocation per
+iteration: a row measured against it measures the recorder. Nested one level
+inside the test module for the usual reason -- `take_dirty`, `cell_pixels`,
+`wc_expand_x` and the `inner` lock are all private.
+
+- **A full-screen present copies 8.3 MiB out of the shadow with interrupts
+  off.** `take_a_whole_dirty_screen` is 679,412 ns and
+  `present_a_whole_dirty_screen` is 680,227: the present *is* the snapshot
+  copy, and that copy runs under the shadow lock, which is IRQ-disabling.
+  `present` goes out of its way to release that lock before the device blit,
+  and says why -- the snapshot it takes first is still 0.68 ms with interrupts
+  off on a VT switch or a scroll. Not a change to make from a bench: the fix
+  would be a second scratch buffer, which is a design question.
+- **A scrolled line costs about 1.1 ms before a byte reaches the aperture**:
+  424,109 ns to move every text row up by one in the shadow, then 680,227 to
+  snapshot the screen it dirtied.
+- **A clean present is free**: 14.75 ns for the timer tick that finds nothing
+  dirty, which is what it finds most of the time. One dirty cell start to
+  finish is 71.07.
+- **The write-combining widening costs nothing.** `wc_expand_x` is 6.3-6.5 ns
+  whether the span is aligned or lands mid-line, against a floor of 0.97, and
+  it is called three times per present. Taking a widened cell out of the
+  shadow is 62.73 ns against 62.94 for the unwidened one -- the extra seven
+  columns are free, because sixteen rows of sixteen words and sixteen rows of
+  nine cost the same.
+- **The cursor blink is 538 ns, and 80% of it is bookkeeping.** Copying the
+  cell out with its nine columns inverted is 110.54 ns and without inversion
+  48.73; the rest of the 537.83 is the two `try_lock`s, the widening and the
+  `prev_cursor` comparison. Moving one cell (an erase and a draw, two blits) is
+  628.00.
+- **Filling is already vectorised and clearing is already memory-bound**: a
+  text row is 2,519 ns for 30,720 pixels (0.08 ns each), a whole-shadow clear
+  465,492 ns for 2,073,600 (0.22 ns each, around 18 GB/s).
+- **A negative result, recorded in the code.** A glyph is 268.88 ns for 144
+  pixels and 64.99 of that is the iterator and the clip, so the store costs
+  about 1.4 ns per pixel -- a lot for a bounds-checked word. `put_pixels`
+  updates the dirty bounding box *per pixel*, through the lock guard, which
+  looked like the answer. Folding the box in a local and committing it once
+  measured 268.88 against 271.43: nothing, inside the noise of either row. So
+  the simpler loop stays and the comment above it now says what was tried.
+  What a glyph's 1.4 ns actually goes on is the indexed store itself -- the
+  multiply, the bounds check and the word.
+
+## What the pointer path said
+
+Two families, one per half. `input::ps2_input::tests::benches` (5 rows) is a
+hardware aux packet off the 8042 being decoded into deltas and buttons, in the
+IRQ handler, once per packet -- 125 a second at the default PS/2 sample rate
+and 200 at the highest the controller takes.
+`input::mouse::mouse_tests::benches` (16 rows) is the other end: each event
+folded into `MouseState`, then the bytes a `/dev/input/mice` client reads back.
+No hardware, no aperture, pure arithmetic.
+
+**The whole software pointer path is about 16 ns per hardware packet.** That is
+`fold_in_a_whole_report` -- two axes, a wheel and the `SYN_REPORT` that closes
+them -- at 15.74 ns, plus 1.45-2.60 to decode the packet that produced them and
+1.8-2.1 to hand a client its three or four bytes. At 125 packets a second that
+is two microseconds of CPU per second. There is nothing here to optimise, and
+the rows exist to say so with a number instead of an opinion.
+
+- **The decode is 1.45 ns for plain PS/2 and about 2.5 for either wheel
+  protocol**, which is the bit arithmetic they add (`-sign_extend32(packet[3],
+  3)` and friends). `packet_len`, which the IRQ handler asks per byte it
+  receives, is 0.70.
+- **A packet out is 1.8-2.1 ns** whichever protocol, and a flick of the wrist
+  -- more movement than one packet can carry, so 127 goes out and the rest
+  stays queued -- is 1.77, i.e. splitting costs nothing over not splitting.
+  `is_drained`, which `/dev/input/mice` asks between packets, is 0.81.
+
+### Two rows are gone, and one family must be read whole
+
+Three negative results, all of them about the harness rather than the code:
+
+- **A `#[inline(never)]` control for the decode read 6.7 ns, above every row
+  it was meant to bound.** That is this harness's other floor -- what a
+  non-inlined call returning a value costs -- and it means
+  `decode_aux_packet` inlines at the call site while the control pays a call
+  it does not. A floor bounds a family that comes out *flat*; this one is not
+  flat, and its own ordering is the evidence instead. Row deleted.
+- **An all-zero packet read 6.43 and 6.44 ns in two runs**, four times the
+  moving packets, from the same code on different bytes. Reproducible and
+  unexplained, and at the same ~6.4 ns, so it was measuring the call. A row
+  nobody can account for is not evidence. Deleted, with the reason in its
+  place.
+- **`update`'s nine rows come out between 6.4 and 8.2 ns, and the ordering is
+  impossible**: `close_a_report`, which copies the struct out and zeroes three
+  fields, is the *cheapest* of them, while the arms that do nothing cost the
+  same as the arms that do work. `update` takes `&mut self`, so each iteration
+  stores the state and the next loads it back, and that round trip is most of
+  the figure. It is an artifact of measuring one event at a time -- in the
+  kernel the state is touched once per event anyway, behind a lock -- so the
+  rows stay as a bound (no event costs more than 8 ns) and the figure to quote
+  is the whole report. Four events for about twice one row is itself the proof
+  that a single row is mostly fixed cost.
+

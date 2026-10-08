@@ -166,6 +166,13 @@ impl ShadowFramebuffer {
     /// Write a batch of `(x, y, argb)` pixels (used by the glyph renderer).
     ///
     /// Taking an iterator lets a whole glyph be rendered under a single lock.
+    ///
+    /// `mark` runs per pixel, and folding the box in a local and committing it
+    /// once instead was tried and measured: it buys nothing (268.9 ns against
+    /// 271.4 for a glyph, inside the noise of either row), so the simpler loop
+    /// stays. What a glyph's 1.4 ns per pixel actually goes on is the indexed
+    /// store itself -- the multiply, the bounds check and the word -- not the
+    /// bounding box. See `benches::draw_one_glyph`.
     pub fn put_pixels(&self, pixels: impl Iterator<Item = (usize, usize, u32)>) {
         let (w, h) = (self.width, self.height);
         let Some(mut g) = self.lock_inner() else {
@@ -781,6 +788,368 @@ mod tests {
         fb.present_with_cursor(dev.as_ref(), Some((2, 0)), 8, 8);
         // Only the content rect, no cursor blit.
         assert_eq!(dev.rects(), vec![(0, 0, 16, 8)]);
+    }
+
+    /// Native `#[bench]` rows for the console's shadow framebuffer.
+    /// `cargo +nightly bench -p zcore-drivers --features graphic,virtio,xhci-usb-hid
+    /// -- --test-threads=1 shadow_fb`.
+    ///
+    /// This is the console's whole present path on the CPU side: the glyph
+    /// renderer's pixels go in through [`put_pixels`](ShadowFramebuffer::put_pixels),
+    /// the scroll through [`copy_rect`](ShadowFramebuffer::copy_rect), and
+    /// [`present`](ShadowFramebuffer::present) hands the dirty rectangle to the
+    /// device. Everything here happens in cached RAM, so unlike the aperture
+    /// rows in `scheme::display` these figures are exact -- what they do not
+    /// include is the device blit they hand off to, which the device rows price.
+    ///
+    /// The device here is a sink that discards. `tests::Recorder` copies every
+    /// blit into a fresh `Vec`, which for a full-screen present is a 4 MiB
+    /// allocation per iteration: a row measured against it measures the
+    /// recorder.
+    #[cfg(test)]
+    mod benches {
+        use super::*;
+        use test::{black_box, Bencher};
+
+        /// A display that throws every blit away, so a `present` row measures
+        /// the present and not the device.
+        struct Sink {
+            info: DisplayInfo,
+            wc: bool,
+        }
+
+        impl Sink {
+            fn new(width: u32, height: u32, wc: bool) -> Arc<Self> {
+                Arc::new(Self {
+                    info: DisplayInfo {
+                        width,
+                        height,
+                        pitch: width * 4,
+                        format: ColorFormat::ARGB8888,
+                        fb_base_vaddr: 0,
+                        fb_size: (width * height * 4) as usize,
+                    },
+                    wc,
+                })
+            }
+        }
+
+        impl Scheme for Sink {
+            fn name(&self) -> &str {
+                "sink"
+            }
+        }
+
+        impl DisplayScheme for Sink {
+            fn info(&self) -> DisplayInfo {
+                self.info
+            }
+            fn fb(&self) -> FrameBuffer<'_> {
+                // SAFETY: never written through -- `blit_from` below discards
+                // and nothing else here touches the aperture. A zero-length
+                // view cannot be read or written out of bounds.
+                unsafe {
+                    FrameBuffer::from_raw_parts_mut(core::ptr::NonNull::dangling().as_ptr(), 0)
+                }
+            }
+            fn fb_write_combining(&self) -> bool {
+                self.wc
+            }
+            fn blit_from(
+                &self,
+                _dst_x: u32,
+                _dst_y: u32,
+                src: &[u32],
+                _src_stride: usize,
+                _width: u32,
+                _height: u32,
+            ) {
+                // Touch one pixel so the whole call cannot be optimised away,
+                // and copy nothing.
+                black_box(src.first());
+            }
+            fn need_flush(&self) -> bool {
+                false
+            }
+        }
+
+        /// 1080p, the mode the console actually runs at here.
+        const W: usize = 1920;
+        const H: usize = 1080;
+        /// One text cell: 9x16 pixels, which is what the built-in font is.
+        const CW: usize = 9;
+        const CH: usize = 16;
+
+        fn hd() -> Arc<ShadowFramebuffer> {
+            ShadowFramebuffer::new(W, H)
+        }
+
+        /// One glyph's worth of pixels, as the renderer hands them over: every
+        /// cell position, in reading order.
+        fn glyph(col: usize, row: usize) -> alloc::vec::Vec<(usize, usize, u32)> {
+            (0..CH)
+                .flat_map(|r| {
+                    (0..CW).map(move |c| (col * CW + c, row * CH + r, 0x00C0_C0C0 | r as u32))
+                })
+                .collect()
+        }
+
+        // ---- what the glyph renderer pays ----
+
+        /// One character drawn: 144 pixels, each one bounds-checked, stored,
+        /// and folded into the dirty bounding box. `mark` runs per pixel, so
+        /// this row is also what 144 bounding-box updates cost.
+        #[bench]
+        fn draw_one_glyph(b: &mut Bencher) {
+            let fb = hd();
+            let px = glyph(40, 20);
+            b.iter(|| fb.put_pixels(black_box(&px).iter().copied()));
+        }
+
+        /// The same 144 pixels entirely off the screen, which is every pixel
+        /// taking the `continue`: the clip and the iterator with no store and
+        /// no `mark`.
+        #[bench]
+        fn draw_one_glyph_off_the_screen(b: &mut Bencher) {
+            let fb = hd();
+            let px = glyph(1000, 1000);
+            b.iter(|| fb.put_pixels(black_box(&px).iter().copied()));
+        }
+
+        /// A whole line of text, 80 glyphs, which is what one `println!` of a
+        /// full line costs the shadow before anything reaches the device.
+        #[bench]
+        fn draw_eighty_glyphs(b: &mut Bencher) {
+            let fb = hd();
+            let px: alloc::vec::Vec<_> = (0..80).flat_map(|c| glyph(c, 20)).collect();
+            b.iter(|| fb.put_pixels(black_box(&px).iter().copied()));
+        }
+
+        // ---- the console's own fills and its scroll ----
+
+        /// Blanking one text row, which every scroll ends with.
+        #[bench]
+        fn fill_one_text_row(b: &mut Bencher) {
+            let fb = hd();
+            b.iter(|| fb.fill_rect(0, black_box(H - CH), W, CH, 0));
+        }
+
+        /// Blanking one cell.
+        #[bench]
+        fn fill_one_cell(b: &mut Bencher) {
+            let fb = hd();
+            b.iter(|| fb.fill_rect(black_box(360), 320, CW, CH, 0));
+        }
+
+        /// The whole shadow cleared, which is what instantiating or switching a
+        /// VT does. A per-pixel `*px = argb` over 2,073,600 words.
+        #[bench]
+        fn clear_the_whole_shadow(b: &mut Bencher) {
+            let fb = hd();
+            b.iter(|| fb.clear(black_box(0x0010_2030)));
+        }
+
+        /// The console scroll: every text row up by one, in cached RAM. The
+        /// device never sees this; what it sees is the present that follows.
+        #[bench]
+        fn scroll_the_console_up_one_text_row(b: &mut Bencher) {
+            let fb = hd();
+            b.iter(|| fb.copy_rect(0, black_box(CH), 0, 0, W, H - CH));
+        }
+
+        // ---- taking the dirty rectangle out ----
+
+        /// The dirty rectangle is set by hand rather than by drawing into the
+        /// shadow, because `take_dirty` consumes it: a row that re-dirtied by
+        /// drawing would measure the drawing. The lock and the assignment are
+        /// what [`the_dirty_floor`] measures, so subtract it.
+        fn timed_take(b: &mut Bencher, rect: DirtyRect, wc: bool) {
+            let fb = hd();
+            let mut out = alloc::vec::Vec::new();
+            b.iter(|| {
+                let mut g = fb.inner.lock();
+                g.dirty = Some(rect);
+                black_box(fb.take_dirty(&mut g, wc, &mut out))
+            });
+        }
+
+        /// One cell's worth of dirt on a write-back destination.
+        #[bench]
+        fn take_one_dirty_cell(b: &mut Bencher) {
+            timed_take(b, (360, 320, 360 + CW, 320 + CH), false);
+        }
+
+        /// The same cell on a write-combining one, where the span is widened
+        /// to whole 64-byte lines: a 9-pixel cell starting at column 360
+        /// becomes 16 pixels starting at 352.
+        #[bench]
+        fn take_one_dirty_cell_widened_for_write_combining(b: &mut Bencher) {
+            timed_take(b, (360, 320, 360 + CW, 320 + CH), true);
+        }
+
+        /// A whole text row.
+        #[bench]
+        fn take_one_dirty_text_row(b: &mut Bencher) {
+            timed_take(b, (0, H - CH, W, H), false);
+        }
+
+        /// The whole screen, which a scroll or a VT switch dirties: 8.3 MiB
+        /// copied out of the shadow into the present scratch, under the shadow
+        /// lock, before a single byte reaches the device.
+        #[bench]
+        fn take_a_whole_dirty_screen(b: &mut Bencher) {
+            timed_take(b, (0, 0, W, H), false);
+        }
+
+        /// The floor for the four rows above: the lock, the assignment, and a
+        /// `take_dirty` that finds nothing to do.
+        #[bench]
+        fn the_dirty_floor(b: &mut Bencher) {
+            let fb = hd();
+            let mut out = alloc::vec::Vec::new();
+            b.iter(|| {
+                let mut g = fb.inner.lock();
+                g.dirty = None;
+                black_box(fb.take_dirty(&mut g, false, &mut out))
+            });
+        }
+
+        // ---- the cursor ----
+
+        /// The cursor cell copied out of the shadow with nothing inverted,
+        /// which is the erase half of a blink.
+        #[bench]
+        fn copy_the_cursor_cell(b: &mut Bencher) {
+            let fb = hd();
+            let g = fb.inner.lock();
+            let mut out = alloc::vec::Vec::new();
+            let data = &g.data;
+            b.iter(|| {
+                ShadowFramebuffer::cell_pixels(
+                    data,
+                    W,
+                    black_box((352, 320, 16, CH)),
+                    0..0,
+                    &mut out,
+                )
+            });
+        }
+
+        /// The same cell with the cursor's own nine columns inverted, which is
+        /// the draw half. The gap is what the per-pixel `invert.contains` costs
+        /// over a straight copy.
+        #[bench]
+        fn copy_the_cursor_cell_inverted(b: &mut Bencher) {
+            let fb = hd();
+            let g = fb.inner.lock();
+            let mut out = alloc::vec::Vec::new();
+            let data = &g.data;
+            b.iter(|| {
+                ShadowFramebuffer::cell_pixels(
+                    data,
+                    W,
+                    black_box((352, 320, 16, CH)),
+                    360..360 + CW,
+                    &mut out,
+                )
+            });
+        }
+
+        /// The write-combining widening, on a span that is already aligned.
+        #[bench]
+        fn widen_an_aligned_span(b: &mut Bencher) {
+            b.iter(|| black_box(ShadowFramebuffer::wc_expand_x(black_box(352), 368, W)));
+        }
+
+        /// The same on a span that starts and ends mid-line, which is where a
+        /// 9-pixel text cell lands fifteen columns out of sixteen.
+        #[bench]
+        fn widen_a_mid_line_span(b: &mut Bencher) {
+            b.iter(|| black_box(ShadowFramebuffer::wc_expand_x(black_box(360), 369, W)));
+        }
+
+        /// The floor for the two widening rows: a call that decides nothing
+        /// and hands back a pair of the same size.
+        #[bench]
+        fn the_widening_floor(b: &mut Bencher) {
+            #[inline(never)]
+            fn nothing(x0: usize, x1: usize) -> (usize, usize) {
+                (x0, x1)
+            }
+            b.iter(|| {
+                let (a, c) = nothing(black_box(360), black_box(369));
+                black_box(a ^ c)
+            });
+        }
+
+        // ---- the present itself ----
+
+        /// A present with nothing dirty, which is what the timer tick finds
+        /// most of the time: two locks and a `None`.
+        #[bench]
+        fn present_a_clean_shadow(b: &mut Bencher) {
+            let fb = hd();
+            let dev = Sink::new(W as u32, H as u32, true);
+            b.iter(|| fb.present(black_box(dev.as_ref())));
+        }
+
+        /// One cell dirty, start to finish. The dirt is set by hand for the
+        /// same reason as in [`timed_take`].
+        #[bench]
+        fn present_one_dirty_cell(b: &mut Bencher) {
+            let fb = hd();
+            let dev = Sink::new(W as u32, H as u32, true);
+            b.iter(|| {
+                fb.inner.lock().dirty = Some((360, 320, 360 + CW, 320 + CH));
+                fb.present(black_box(dev.as_ref()));
+            });
+        }
+
+        /// The whole screen dirty: the scroll's and the VT switch's present.
+        #[bench]
+        fn present_a_whole_dirty_screen(b: &mut Bencher) {
+            let fb = hd();
+            let dev = Sink::new(W as u32, H as u32, true);
+            b.iter(|| {
+                fb.inner.lock().dirty = Some((0, 0, W, H));
+                fb.present(black_box(dev.as_ref()));
+            });
+        }
+
+        /// The blink, in place: nothing dirty, the cursor in the cell it was
+        /// already in, so there is a draw and no erase. This runs on the timer
+        /// tick, in IRQ context, twice a second forever.
+        #[bench]
+        fn blink_the_cursor_in_place(b: &mut Bencher) {
+            let fb = hd();
+            let dev = Sink::new(W as u32, H as u32, true);
+            fb.present_with_cursor(dev.as_ref(), Some((40, 20)), CW, CH);
+            b.iter(|| fb.present_with_cursor(black_box(dev.as_ref()), Some((40, 20)), CW, CH));
+        }
+
+        /// The cursor moving one cell, which is every keystroke: an erase of
+        /// the old cell and a draw of the new one, two device blits.
+        #[bench]
+        fn move_the_cursor_one_cell(b: &mut Bencher) {
+            let fb = hd();
+            let dev = Sink::new(W as u32, H as u32, true);
+            let mut col = 40;
+            b.iter(|| {
+                col = if col == 40 { 41 } else { 40 };
+                fb.present_with_cursor(black_box(dev.as_ref()), Some((col, 20)), CW, CH);
+            });
+        }
+
+        /// The cursor hidden: the erase with no draw.
+        #[bench]
+        fn hide_the_cursor(b: &mut Bencher) {
+            let fb = hd();
+            let dev = Sink::new(W as u32, H as u32, true);
+            b.iter(|| {
+                fb.present_with_cursor(dev.as_ref(), Some((40, 20)), CW, CH);
+                fb.present_with_cursor(black_box(dev.as_ref()), None, CW, CH);
+            });
+        }
     }
 }
 
