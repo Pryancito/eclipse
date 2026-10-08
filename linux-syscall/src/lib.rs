@@ -15,8 +15,17 @@
 //!
 
 #![no_std]
+// `#[bench]` and `test::Bencher` are libtest's, and still unstable. The
+// benches live in `#[cfg(test)]` modules beside the code they measure --
+// which is the only place they can live, because every submodule of this
+// crate is private, so a `benches/` target would not see a single syscall
+// helper. Gated on `test` so a kernel build never asks for the feature.
+#![cfg_attr(test, feature(test))]
 #![deny(warnings, unsafe_code, missing_docs)]
 #![allow(clippy::upper_case_acronyms)]
+
+#[cfg(test)]
+extern crate test;
 
 #[macro_use]
 extern crate alloc;
