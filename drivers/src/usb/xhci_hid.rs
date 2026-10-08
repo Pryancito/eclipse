@@ -1275,6 +1275,22 @@ const USB_DESC_HID_REPORT: u8 = 0x22;
 const REPORT_DESC_SNAPSHOT: usize = 256;
 const EP_TYPE_CONTROL: u32 = 4 << 3;
 const EP_TYPE_INT_IN: u32 = 7 << 3;
+const EP_TYPE_BULK_OUT: u32 = 2 << 3;
+const EP_TYPE_BULK_IN: u32 = 6 << 3;
+
+/// El Device Context Index de un `bEndpointAddress`: `2*N` para un endpoint
+/// OUT, `2*N+1` para uno IN. Es la inversa de [`ep_addr_from_dci`].
+///
+/// `None` si no cabe en los 31 endpoints de un slot. El endpoint 0 no tiene
+/// direccion: su DCI es 1 y lo pone `setup_device`.
+fn dci_from_ep_addr(ep_addr: u8) -> Option<u8> {
+    let num = ep_addr & 0x0f;
+    if num == 0 {
+        return None;
+    }
+    let dci = num * 2 + u8::from(ep_addr & 0x80 != 0);
+    (dci < 32).then_some(dci)
+}
 const HID_PROTO_KEY: u8 = 1;
 const HID_PROTO_MOUSE: u8 = 2;
 const HID_PROTO_TABLET: u8 = 3;
@@ -2240,6 +2256,8 @@ pub struct XhciInner {
     pending_ep_resets: Vec<(u8, u8, bool)>,
     /// Todos los dispositivos enumerados, tengan driver o no.
     devs: Vec<UsbDev>,
+    /// Unidades de almacenamiento masivo que respondieron.
+    mscs: Vec<MscDev>,
     /// Hubs ya configurados, en el orden en que se enumeraron.
     hubs: Vec<HubDev>,
     /// `(slot del hub, puerto)` que un endpoint de cambio de estado ha
@@ -2256,6 +2274,30 @@ pub struct XhciInner {
     /// back off so we don't bang on the controller every io-wait iteration.
     halt_last_attempt_us: u64,
 }
+
+/// Una unidad de almacenamiento masivo que hablo con nosotros.
+struct MscDev {
+    slot: u8,
+    iface: u8,
+    /// DCI de sus dos endpoints bulk.
+    dci_in: u8,
+    dci_out: u8,
+    max_lun: u8,
+    inquiry: ScsiInquiry,
+    /// `None` cuando la unidad contesto el INQUIRY pero no la capacidad: un
+    /// lector de tarjetas sin tarjeta es exactamente eso.
+    capacity: Option<ScsiCapacity>,
+    /// Etiqueta de la siguiente orden. Cada una tiene que llevar la suya.
+    next_tag: u32,
+}
+
+/// Cuanto se espera por una transferencia bulk. Una unidad que acaba de
+/// arrancar puede tardar segundos en contestar su primer TEST UNIT READY.
+const BULK_TIMEOUT_US: u64 = 5_000_000;
+/// Intentos de TEST UNIT READY antes de dar la unidad por no lista. Un pendrive
+/// contesta «unidad no lista, haciendose» mientras arranca.
+const MSC_READY_ATTEMPTS: u8 = 8;
+const MSC_READY_WAIT_US: u64 = 250_000;
 
 /// Un hub configurado: lo que hay que recordar para enterarse de sus cambios de
 /// puerto y para apuntar a su Transaction Translator desde los hijos.
@@ -2418,6 +2460,258 @@ fn class_int_in_endpoint(raw: &[u8], class: u8) -> Option<(u8, u16, u8)> {
     None
 }
 
+// ——— Almacenamiento masivo: Bulk-Only Transport y SCSI ———
+
+const USB_CLASS_MASS_STORAGE: u8 = 0x08;
+/// `bInterfaceProtocol` del Bulk-Only Transport, que es el que usa todo lo que
+/// se vende hoy. CBI (0x00, 0x01) es de los noventa y no se cubre.
+const MSC_PROTO_BULK_ONLY: u8 = 0x50;
+/// `bInterfaceSubClass`: SCSI transparente. Los demas (RBC, MMC, UFI) hablan
+/// otros conjuntos de ordenes.
+const MSC_SUBCLASS_SCSI: u8 = 0x06;
+/// `GET_MAX_LUN`, peticion de clase a la interfaz (USB MSC BOT §3.2).
+const MSC_REQ_GET_MAX_LUN: u8 = 0xfe;
+
+const BOT_CBW_LEN: usize = 31;
+const BOT_CSW_LEN: usize = 13;
+const BOT_CBW_SIGNATURE: u32 = 0x4342_5355; // "USBC"
+const BOT_CSW_SIGNATURE: u32 = 0x5342_5355; // "USBS"
+
+const SCSI_TEST_UNIT_READY: u8 = 0x00;
+const SCSI_REQUEST_SENSE: u8 = 0x03;
+const SCSI_INQUIRY: u8 = 0x12;
+const SCSI_READ_CAPACITY_10: u8 = 0x25;
+const SCSI_SERVICE_ACTION_IN_16: u8 = 0x9e;
+const SCSI_SAI_READ_CAPACITY_16: u8 = 0x10;
+
+/// Un Command Block Wrapper (USB MSC BOT §5.1): los 31 bytes que abren cada
+/// orden SCSI sobre el endpoint bulk OUT.
+///
+/// `data_len` es lo que se espera transferir en la fase de datos y `dir_in` su
+/// direccion. El `tag` vuelve identico en el CSW y es lo unico que ata la
+/// respuesta a su pregunta: creerse un CSW de otro tag es leer el resultado de
+/// la orden anterior.
+fn bot_cbw(
+    tag: u32,
+    data_len: u32,
+    dir_in: bool,
+    lun: u8,
+    cmd: &[u8],
+) -> Option<[u8; BOT_CBW_LEN]> {
+    // bCBWCBLength son 5 bits y el bloque de orden son 16 bytes de hueco.
+    if cmd.is_empty() || cmd.len() > 16 {
+        return None;
+    }
+    let mut w = [0u8; BOT_CBW_LEN];
+    w[0..4].copy_from_slice(&BOT_CBW_SIGNATURE.to_le_bytes());
+    w[4..8].copy_from_slice(&tag.to_le_bytes());
+    w[8..12].copy_from_slice(&data_len.to_le_bytes());
+    // bmCBWFlags: solo el bit 7, la direccion. El resto es reservado-cero, y
+    // un uno ahi es un CBW que el dispositivo puede rechazar entero.
+    w[12] = if dir_in { 0x80 } else { 0x00 };
+    w[13] = lun & 0x0f;
+    w[14] = cmd.len() as u8;
+    w[15..15 + cmd.len()].copy_from_slice(cmd);
+    Some(w)
+}
+
+/// El resultado de una orden, tal como viene en el Command Status Wrapper.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct BotCsw {
+    tag: u32,
+    /// Bytes de la fase de datos que NO se transfirieron.
+    residue: u32,
+    /// 0 = bien, 1 = la orden fallo (hay que pedir el sentido), 2 = error de
+    /// fase (el dispositivo quiere un reset del transporte).
+    status: u8,
+}
+
+/// Lee un CSW y comprueba que es el de `want_tag`.
+///
+/// `None` cuando no es un CSW valido o cuando contesta a otra orden: en los dos
+/// casos la respuesta no se puede usar, y el transporte necesita recuperarse.
+fn bot_parse_csw(raw: &[u8], want_tag: u32) -> Option<BotCsw> {
+    if raw.len() < BOT_CSW_LEN {
+        return None;
+    }
+    if u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]) != BOT_CSW_SIGNATURE {
+        return None;
+    }
+    let tag = u32::from_le_bytes([raw[4], raw[5], raw[6], raw[7]]);
+    if tag != want_tag {
+        return None;
+    }
+    let status = raw[12];
+    // 3 y 4 son reservados y 0x80 en adelante no existe: un dispositivo que
+    // los manda no esta diciendo «bien».
+    if status > 2 {
+        return None;
+    }
+    Some(BotCsw {
+        tag,
+        residue: u32::from_le_bytes([raw[8], raw[9], raw[10], raw[11]]),
+        status,
+    })
+}
+
+/// Lo que un INQUIRY cuenta del dispositivo.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct ScsiInquiry {
+    /// `Peripheral Device Type`: 0 = disco de bloques, 5 = CD/DVD, 0x1f = nada
+    /// conectado.
+    dev_type: u8,
+    removable: bool,
+    vendor: [u8; 8],
+    product: [u8; 16],
+    revision: [u8; 4],
+}
+
+/// Parsea los 36 bytes de un INQUIRY estandar (SPC-4 §6.4).
+fn scsi_parse_inquiry(raw: &[u8]) -> Option<ScsiInquiry> {
+    if raw.len() < 36 {
+        return None;
+    }
+    let mut out = ScsiInquiry {
+        dev_type: raw[0] & 0x1f,
+        // RMB es el bit 7 del byte 1; los otros siete son reservados.
+        removable: raw[1] & 0x80 != 0,
+        ..ScsiInquiry::default()
+    };
+    out.vendor.copy_from_slice(&raw[8..16]);
+    out.product.copy_from_slice(&raw[16..32]);
+    out.revision.copy_from_slice(&raw[32..36]);
+    Some(out)
+}
+
+/// Un campo de texto de un INQUIRY, sin los espacios con que SCSI lo rellena y
+/// sin los bytes que no se pueden imprimir.
+///
+/// SCSI rellena a la derecha con espacios, no con ceros, asi que volcarlo tal
+/// cual deja una columna de huecos; y un dispositivo malo mete control ahi, que
+/// en una linea de `/proc` rompe el formato de todo lo demas.
+fn scsi_text(field: &[u8]) -> alloc::string::String {
+    field
+        .iter()
+        .map(|&b| {
+            if (0x20..0x7f).contains(&b) {
+                b as char
+            } else {
+                '.'
+            }
+        })
+        .collect::<alloc::string::String>()
+        .trim_end()
+        .into()
+}
+
+/// La capacidad que devuelve un READ CAPACITY: `(ultimo LBA, bytes por bloque)`.
+///
+/// `read_capacity(10)` da el ultimo LBA en 32 bits, asi que `0xffff_ffff` no es
+/// una capacidad sino «no cabe, preguntame con el de 16» (SBC-3 §5.15).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ScsiCapacity {
+    last_lba: u64,
+    block_size: u32,
+    /// `true` cuando hay que repetir con READ CAPACITY(16).
+    needs_16: bool,
+}
+
+fn scsi_parse_capacity10(raw: &[u8]) -> Option<ScsiCapacity> {
+    if raw.len() < 8 {
+        return None;
+    }
+    // SCSI es big-endian en todo.
+    let last = u32::from_be_bytes([raw[0], raw[1], raw[2], raw[3]]);
+    let bs = u32::from_be_bytes([raw[4], raw[5], raw[6], raw[7]]);
+    if bs == 0 {
+        return None;
+    }
+    Some(ScsiCapacity {
+        last_lba: last as u64,
+        block_size: bs,
+        needs_16: last == u32::MAX,
+    })
+}
+
+fn scsi_parse_capacity16(raw: &[u8]) -> Option<ScsiCapacity> {
+    if raw.len() < 12 {
+        return None;
+    }
+    let mut lba = [0u8; 8];
+    lba.copy_from_slice(&raw[0..8]);
+    let bs = u32::from_be_bytes([raw[8], raw[9], raw[10], raw[11]]);
+    if bs == 0 {
+        return None;
+    }
+    Some(ScsiCapacity {
+        last_lba: u64::from_be_bytes(lba),
+        block_size: bs,
+        needs_16: false,
+    })
+}
+
+/// Sectores de 512 bytes que ocupa un disco de `last_lba` bloques de
+/// `block_size`, que es la unidad con la que habla `BlockScheme`.
+///
+/// `last_lba` es el ULTIMO bloque, no la cuenta: un disco de un solo bloque
+/// contesta 0, y tomarlo por la cuenta deja el ultimo sector fuera del disco.
+fn scsi_sectors_512(cap: &ScsiCapacity) -> u64 {
+    let blocks = cap.last_lba.saturating_add(1);
+    if cap.block_size >= 512 {
+        blocks.saturating_mul((cap.block_size / 512) as u64)
+    } else {
+        // Un bloque de menos de 512 bytes no existe en nada real, pero
+        // multiplicar por cero dejaria un disco de capacidad 0 que parece
+        // vacio en vez de parecer raro.
+        blocks
+    }
+}
+
+/// La pareja de endpoints bulk de la interfaz `iface`:
+/// `(IN, OUT)`, cada uno `(bEndpointAddress, wMaxPacketSize)`.
+///
+/// `None` si a la interfaz le falta uno de los dos. Se buscan por numero de
+/// interfaz y no «el primer bulk del descriptor» porque un disco externo con
+/// lector de tarjetas declara dos interfaces de almacenamiento, y armar los
+/// endpoints de una con el numero de la otra es hablarle al disco equivocado.
+///
+/// Solo el ajuste alternativo 0, como [`config_interfaces`]: los endpoints que
+/// siguen a una alternativa pertenecen a esa alternativa, que no es la que se
+/// ha seleccionado.
+fn iface_bulk_endpoints(raw: &[u8], iface: u8) -> Option<((u8, u16), (u8, u16))> {
+    let mut inside = false;
+    let mut ep_in = None;
+    let mut ep_out = None;
+    for (dt, d) in config_descriptors(raw) {
+        if dt == USB_DESC_IFACE && d.len() >= 9 {
+            inside = d[2] == iface && d[3] == 0;
+            continue;
+        }
+        if dt != USB_DESC_EP || d.len() < 7 || !inside {
+            continue;
+        }
+        // bmAttributes bits 1:0 = 2 es bulk.
+        if d[3] & 3 != 2 {
+            continue;
+        }
+        let mps = u16::from_le_bytes([d[4], d[5]]) & 0x7ff;
+        if mps == 0 {
+            continue;
+        }
+        let slot = if d[2] & 0x80 != 0 {
+            &mut ep_in
+        } else {
+            &mut ep_out
+        };
+        // El primero de cada direccion: una interfaz con mas de una pareja
+        // tiene la suya en la primera.
+        if slot.is_none() {
+            *slot = Some((d[2], mps));
+        }
+    }
+    Some((ep_in?, ep_out?))
+}
+
 /// Lo que de un hub se lee sin tocar su lista: `(velocidad, puertos, multi_tt)`.
 fn hub_facts(h: &HubDev) -> (u8, u8, bool) {
     (h.speed, h.ports, h.multi_tt)
@@ -2543,6 +2837,7 @@ impl XhciInner {
             port_enum_fails: alloc::vec![0u8; max_ports as usize + 2],
             pending_ep_resets: Vec::new(),
             devs: Vec::new(),
+            mscs: Vec::new(),
             hubs: Vec::new(),
             pending_hub_ports: Vec::new(),
             boot_enum_pending: true,
@@ -4008,7 +4303,8 @@ impl XhciInner {
         // pero se le deja el paquete entero del endpoint para que un hub que
         // mande más no desborde a Babble.
         let len = hub_change_bytes(ports).max(mps as usize).max(2);
-        let dci = self.configure_int_in_endpoint(slot, csz, ep_addr, mps, interval, len, 16)?;
+        let dci =
+            self.configure_endpoint(slot, csz, ep_addr, EP_TYPE_INT_IN, mps, interval, len, 16)?;
         let buf = DmaBuf::new(len, 64)?;
         // Evict the zeroing `DmaBuf::new` just did before the controller starts
         // DMA-ing into it, igual que los búferes de informe HID.
@@ -4153,6 +4449,384 @@ impl XhciInner {
                 warn!(
                     "[xhci] hub slot={} puerto {}: el cambio señalado no se pudo atender ({:?})",
                     slot, port, e
+                );
+            }
+        }
+    }
+
+    /// Una transferencia bulk, de principio a fin, y los bytes que movio.
+    ///
+    /// Sincrona: empuja un Normal TRB, toca la campana y espera su Transfer
+    /// Event. Es la misma forma que `wait_ep0_status_any` y por la misma razon
+    /// --hay que atender el anillo de eventos mientras se espera, porque por el
+    /// pasan tambien los informes de los teclados-- asi que no puede correr
+    /// anidada dentro de `pop_ev`.
+    fn bulk_transfer(&mut self, slot: u8, dci: u8, buf_phys: u64, len: u32) -> DeviceResult<u32> {
+        let ridx = Self::ri(slot, dci);
+        let trb_phys = {
+            let ring = self
+                .xfer_rings
+                .get_mut(ridx)
+                .and_then(|o| o.as_mut())
+                .ok_or(DeviceError::NotSupported)?;
+            // Una transferencia bulk puede ser de longitud cero: un CBW sin
+            // fase de datos no lleva TRB de datos, pero el CSW si.
+            ring.push(trb_normal(buf_phys, len as u16, true))?
+        };
+        if let Some(r) = self.xfer_rings.get(ridx).and_then(|o| o.as_ref()) {
+            r.buf.flush(0, r.buf.len);
+        }
+        fence(Ordering::SeqCst);
+        self.mmio.ring_db(slot, dci);
+
+        let start = timer_now_us();
+        let mut spins = 0u64;
+        while !xhci_wait_expired(start, BULK_TIMEOUT_US, spins) {
+            if let Some(ev) = self.pop_ev(None) {
+                if (ev.ctrl >> 10) & 0x3f == 32
+                    && ((ev.ctrl >> 24) & 0xff) as u8 == slot
+                    && ((ev.ctrl >> 16) & 0x1f) as u8 == dci
+                    // VirtualBox apunta a veces al TRB SIGUIENTE al completado,
+                    // igual que en EP0.
+                    && (ev.p == trb_phys || ev.p == trb_phys.wrapping_add(16))
+                {
+                    if let Some(r) = self.xfer_rings.get_mut(ridx).and_then(|o| o.as_mut()) {
+                        r.advance_dequeue(1);
+                    }
+                    let cc = (ev.status >> 24) & 0xff;
+                    if cc == TRB_CC_SUCCESS || cc == TRB_CC_SHORT {
+                        // Residual en los 24 bits bajos: lo que NO se movio.
+                        return Ok(len.saturating_sub(ev.status & 0x00ff_ffff));
+                    }
+                    // Un STALL en un endpoint bulk es como el dispositivo dice
+                    // «esa orden no» (USB MSC BOT §6.7.2): se le quita el halt
+                    // y se sigue, que es lo que espera el CSW de despues.
+                    if cc == 6 {
+                        let _ = self.clear_endpoint_halt(slot, dci);
+                    }
+                    let _ = self.reset_endpoint_and_dequeue(slot, dci);
+                    warn!("[xhci] bulk slot={} dci={} cc={}", slot, dci, cc);
+                    return Err(DeviceError::IoError);
+                }
+            }
+            spins = spins.saturating_add(1);
+            spin_loop();
+        }
+        // Igual que en EP0: adelantar el dequeue del software por encima del TD
+        // que nunca completo, o el siguiente timbre lo repite y su respuesta
+        // tardia satisface la espera de la orden de despues.
+        if let Some(r) = self.xfer_rings.get_mut(ridx).and_then(|o| o.as_mut()) {
+            r.advance_dequeue(1);
+        }
+        let _ = self.reset_endpoint_and_dequeue(slot, dci);
+        warn!("[xhci] bulk slot={} dci={} timeout", slot, dci);
+        Err(DeviceError::IoError)
+    }
+
+    /// Una orden SCSI completa sobre Bulk-Only Transport: CBW, fase de datos y
+    /// CSW. Devuelve los bytes de datos que llegaron.
+    ///
+    /// `Err` cuando el transporte fallo; `Ok` con el `status` del CSW distinto
+    /// de cero cuando la orden llego y la unidad la rechazo, que son dos cosas
+    /// muy distintas y mezclarlas convierte «no hay tarjeta metida» en «el
+    /// dispositivo no funciona».
+    fn msc_command(
+        &mut self,
+        idx: usize,
+        cmd: &[u8],
+        data: Option<(&DmaBuf, u32, bool)>,
+    ) -> DeviceResult<(u32, u8)> {
+        let (slot, dci_in, dci_out, tag) = {
+            let m = self.mscs.get_mut(idx).ok_or(DeviceError::InvalidParam)?;
+            let tag = m.next_tag;
+            m.next_tag = m.next_tag.wrapping_add(1);
+            (m.slot, m.dci_in, m.dci_out, tag)
+        };
+        let (data_len, dir_in) = data.map(|(_, l, i)| (l, i)).unwrap_or((0, false));
+        let cbw = bot_cbw(tag, data_len, dir_in, 0, cmd).ok_or(DeviceError::InvalidParam)?;
+
+        let wrap = DmaBuf::new(64, 64)?;
+        for (i, b) in cbw.iter().enumerate() {
+            // `DmaBuf` escribe en dwords; el CBW no esta alineado a cuatro.
+            let off = i & !3;
+            let mut w = wrap.read_u32(off).to_le_bytes();
+            w[i & 3] = *b;
+            wrap.write_u32(off, u32::from_le_bytes(w));
+        }
+        wrap.flush(0, 64);
+        if self
+            .bulk_transfer(slot, dci_out, wrap.sub_phys(0), BOT_CBW_LEN as u32)
+            .is_err()
+        {
+            wrap.leak();
+            return Err(DeviceError::IoError);
+        }
+
+        let mut moved = 0u32;
+        if let Some((buf, len, is_in)) = data {
+            if len > 0 {
+                let dci = if is_in { dci_in } else { dci_out };
+                if !is_in {
+                    buf.flush(0, len as usize);
+                }
+                // Un STALL aqui no es el fin: la unidad puede haber decidido
+                // mandar menos de lo pedido y el CSW de despues lo explica.
+                moved = self
+                    .bulk_transfer(slot, dci, buf.sub_phys(0), len)
+                    .unwrap_or(0);
+                if is_in {
+                    buf.flush(0, len as usize);
+                }
+            }
+        }
+
+        wrap.flush(0, 64);
+        if self
+            .bulk_transfer(slot, dci_in, wrap.sub_phys(0), BOT_CSW_LEN as u32)
+            .is_err()
+        {
+            wrap.leak();
+            return Err(DeviceError::IoError);
+        }
+        wrap.flush(0, 64);
+        let mut raw = [0u8; BOT_CSW_LEN];
+        wrap.read_into(0, &mut raw);
+        let Some(csw) = bot_parse_csw(&raw, tag) else {
+            warn!(
+                "[xhci] msc slot={} CSW invalido o de otra orden (tag esperado {}): {:?}",
+                slot, tag, raw
+            );
+            return Err(DeviceError::IoError);
+        };
+        Ok((moved, csw.status))
+    }
+
+    /// Prepara una interfaz de almacenamiento masivo y le pregunta quien es.
+    ///
+    /// No la registra como disco: eso necesita una via para dar de alta un
+    /// dispositivo de bloque en caliente, que hoy no existe. Lo que si hace es
+    /// contestar la pregunta de si el sistema ve la unidad, con su nombre y su
+    /// capacidad, en `/proc/usbhid`.
+    fn setup_mass_storage(
+        &mut self,
+        slot: u8,
+        csz: usize,
+        iface: u8,
+        subclass: u8,
+        proto: u8,
+        cfg_desc: &[u8],
+    ) -> DeviceResult<()> {
+        if proto != MSC_PROTO_BULK_ONLY {
+            warn!(
+                "[xhci] msc slot={} iface={}: bInterfaceProtocol={:#04x} no es Bulk-Only",
+                slot, iface, proto
+            );
+            return Err(DeviceError::NotSupported);
+        }
+        let (ep_in, ep_out) = iface_bulk_endpoints(cfg_desc, iface).ok_or_else(|| {
+            warn!(
+                "[xhci] msc slot={} iface={}: no declara una pareja de endpoints bulk",
+                slot, iface
+            );
+            DeviceError::NotSupported
+        })?;
+        // Un TD de una pagina cubre el CBW, el CSW y un INQUIRY de sobra.
+        let dci_in = self.configure_endpoint(
+            slot,
+            csz,
+            ep_in.0,
+            EP_TYPE_BULK_IN,
+            ep_in.1,
+            0,
+            MAX_HID_TD,
+            64,
+        )?;
+        let dci_out = self.configure_endpoint(
+            slot,
+            csz,
+            ep_out.0,
+            EP_TYPE_BULK_OUT,
+            ep_out.1,
+            0,
+            MAX_HID_TD,
+            64,
+        )?;
+        // GET_MAX_LUN es opcional: un STALL significa una sola unidad logica.
+        let max_lun = self.msc_max_lun(slot, iface).unwrap_or(0);
+        self.mscs.retain(|m| !(m.slot == slot && m.iface == iface));
+        self.mscs.push(MscDev {
+            slot,
+            iface,
+            dci_in,
+            dci_out,
+            max_lun,
+            inquiry: ScsiInquiry::default(),
+            capacity: None,
+            next_tag: 1,
+        });
+        let idx = self.mscs.len() - 1;
+        if subclass != MSC_SUBCLASS_SCSI {
+            // RBC, MMC y UFI hablan otro conjunto de ordenes. Queda apuntada
+            // para que se vea en `/proc/usbhid`, pero no se le pregunta nada.
+            warn!(
+                "[xhci] msc slot={} iface={}: bInterfaceSubClass={:#04x} no es SCSI \
+                 transparente; no se le preguntan ordenes",
+                slot, iface, subclass
+            );
+            return Ok(());
+        }
+        self.msc_identify(idx);
+        Ok(())
+    }
+
+    /// `GET_MAX_LUN`: peticion de clase a la interfaz, un byte de respuesta.
+    fn msc_max_lun(&mut self, slot: u8, iface: u8) -> DeviceResult<u8> {
+        let buf = DmaBuf::new(64, 64)?;
+        buf.flush(0, 64);
+        if let Err(e) = self.ep0_control_in(
+            slot,
+            trb_setup(0xa1, MSC_REQ_GET_MAX_LUN, 0, iface as u16, 1, 3),
+            &buf,
+            1,
+        ) {
+            buf.leak();
+            return Err(e);
+        }
+        buf.flush(0, 64);
+        let mut raw = [0u8; 1];
+        buf.read_into(0, &mut raw);
+        // El campo son 4 bits: un dispositivo que devuelve basura no puede
+        // reclamar dieciseis unidades logicas.
+        Ok(raw[0] & 0x0f)
+    }
+
+    /// TEST UNIT READY hasta que conteste, luego INQUIRY y READ CAPACITY.
+    fn msc_identify(&mut self, idx: usize) {
+        // Por indice y no por referencia porque cada orden pide `&mut self`.
+        // Se comprueba en cada vuelta: perder la unidad a media identificacion
+        // es un desenchufe, no un panico.
+        let Some(slot) = self.mscs.get(idx).map(|m| m.slot) else {
+            return;
+        };
+        let mut ready = false;
+        for attempt in 0..MSC_READY_ATTEMPTS {
+            match self.msc_command(idx, &[SCSI_TEST_UNIT_READY, 0, 0, 0, 0, 0], None) {
+                Ok((_, 0)) => {
+                    ready = true;
+                    break;
+                }
+                Ok((_, st)) => {
+                    // La unidad contesta «no lista» mientras arranca. Pedirle
+                    // el sentido es lo que limpia su condicion de atencion; sin
+                    // eso, algunas repiten el mismo fallo para siempre.
+                    let sense = DmaBuf::new(64, 64).ok();
+                    if let Some(sb) = sense {
+                        let _ = self.msc_command(
+                            idx,
+                            &[SCSI_REQUEST_SENSE, 0, 0, 0, 18, 0],
+                            Some((&sb, 18, true)),
+                        );
+                    }
+                    if attempt + 1 == MSC_READY_ATTEMPTS {
+                        warn!(
+                            "[xhci] msc slot={}: no lista tras {} intentos (CSW status {})",
+                            slot, MSC_READY_ATTEMPTS, st
+                        );
+                    }
+                    xhci_spin_delay_us(MSC_READY_WAIT_US);
+                }
+                Err(e) => {
+                    warn!("[xhci] msc slot={}: TEST UNIT READY fallo ({:?})", slot, e);
+                    return;
+                }
+            }
+        }
+
+        let Ok(buf) = DmaBuf::new(256, 64) else {
+            return;
+        };
+        buf.flush(0, 256);
+        match self.msc_command(idx, &[SCSI_INQUIRY, 0, 0, 0, 36, 0], Some((&buf, 36, true))) {
+            Ok((_, 0)) => {
+                let mut raw = [0u8; 36];
+                buf.read_into(0, &mut raw);
+                if let (Some(inq), Some(m)) = (scsi_parse_inquiry(&raw), self.mscs.get_mut(idx)) {
+                    m.inquiry = inq;
+                    let luns = m.max_lun as u16 + 1;
+                    info!(
+                        "[xhci] msc slot={}: {} {} {} (tipo {:#04x}, {}extraible, {} LUN)",
+                        slot,
+                        scsi_text(&inq.vendor),
+                        scsi_text(&inq.product),
+                        scsi_text(&inq.revision),
+                        inq.dev_type,
+                        if inq.removable { "" } else { "no " },
+                        luns,
+                    );
+                }
+            }
+            other => {
+                warn!(
+                    "[xhci] msc slot={}: INQUIRY no contesto ({:?})",
+                    slot, other
+                );
+                return;
+            }
+        }
+        if !ready {
+            // Sin medio dentro no hay capacidad que leer, y preguntarla solo
+            // suma un fallo mas al log.
+            return;
+        }
+        buf.flush(0, 256);
+        if let Ok((_, 0)) = self.msc_command(
+            idx,
+            &[SCSI_READ_CAPACITY_10, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            Some((&buf, 8, true)),
+        ) {
+            let mut raw = [0u8; 8];
+            buf.read_into(0, &mut raw);
+            let cap = scsi_parse_capacity10(&raw);
+            if let Some(c) = cap {
+                if c.needs_16 {
+                    buf.flush(0, 256);
+                    let cdb = [
+                        SCSI_SERVICE_ACTION_IN_16,
+                        SCSI_SAI_READ_CAPACITY_16,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        32,
+                        0,
+                        0,
+                    ];
+                    if let Ok((_, 0)) = self.msc_command(idx, &cdb, Some((&buf, 32, true))) {
+                        let mut raw16 = [0u8; 32];
+                        buf.read_into(0, &mut raw16);
+                        let parsed = scsi_parse_capacity16(&raw16);
+                        if let Some(m) = self.mscs.get_mut(idx) {
+                            m.capacity = parsed;
+                        }
+                    }
+                } else if let Some(m) = self.mscs.get_mut(idx) {
+                    m.capacity = Some(c);
+                }
+            }
+            if let Some(c) = self.mscs.get(idx).and_then(|m| m.capacity) {
+                info!(
+                    "[xhci] msc slot={}: {} sectores de 512 B ({} bloques de {} B)",
+                    slot,
+                    scsi_sectors_512(&c),
+                    c.last_lba.saturating_add(1),
+                    c.block_size
                 );
             }
         }
@@ -4303,6 +4977,22 @@ impl XhciInner {
             trb_setup(0x00, 0x09, config_val as u16, 0, 0, 0),
             true,
         );
+
+        // Las interfaces de almacenamiento masivo se preparan antes de recorrer
+        // los endpoints HID: `setup_mass_storage` emite su propio Configure
+        // Endpoint y ordenes SCSI, y entrelazarlo con el recorrido de abajo
+        // dejaria el descriptor a medio leer entre comando y comando.
+        for i in config_interfaces(&raw).0 {
+            if i.class == USB_CLASS_MASS_STORAGE {
+                if let Err(e) = self.setup_mass_storage(slot, csz, i.num, i.subclass, i.proto, &raw)
+                {
+                    warn!(
+                        "[xhci] slot={} iface={}: almacenamiento masivo no preparado ({:?})",
+                        slot, i.num, e
+                    );
+                }
+            }
+        }
 
         let mut o = 0usize;
         let mut cur_iface: Option<(u8, u8, u8, u16)> = None; // num, proto, subclass, report_desc_len
@@ -4476,28 +5166,26 @@ impl XhciInner {
         Some(class)
     }
 
-    /// Configura un endpoint de interrupción IN del dispositivo `slot` y le
-    /// deja su anillo de transferencia montado y vacío. Devuelve el DCI.
+    /// Configura un endpoint del dispositivo `slot` y le deja su anillo de
+    /// transferencia montado y vacío. Devuelve el DCI.
     ///
-    /// Lo usan por igual las interfaces HID y el endpoint de cambio de estado
-    /// de un hub: la parte delicada --copiar el Slot Context entero cuando
-    /// A0=1, subir Context Entries, el intervalo y el Max ESIT Payload-- es la
-    /// misma y tener dos copias de ella es como se rompe una de las dos.
-    fn configure_int_in_endpoint(
+    /// Lo usan las interfaces HID, el endpoint de cambio de estado de un hub y
+    /// los endpoints bulk de un dispositivo de almacenamiento: la parte
+    /// delicada --copiar el Slot Context entero cuando A0=1, subir Context
+    /// Entries, el intervalo y el Max ESIT Payload-- es la misma y tener
+    /// varias copias de ella es como se rompe una.
+    fn configure_endpoint(
         &mut self,
         slot: u8,
         csz: usize,
         ep_addr: u8,
+        ep_type: u32,
         mps: u16,
         interval: u8,
         avg_trb_len: usize,
         ring_trbs: usize,
     ) -> DeviceResult<u8> {
-        let epn = ep_addr & 0x0f;
-        let dci = (epn * 2 + 1) as usize;
-        if dci >= 32 {
-            return Err(DeviceError::InvalidParam);
-        }
+        let dci = dci_from_ep_addr(ep_addr).ok_or(DeviceError::InvalidParam)? as usize;
 
         let cfg = DmaBuf::new(33 * csz, 64)?;
         // Input Control Context: add Slot (A0) and the new endpoint (A_dci)
@@ -4522,13 +5210,24 @@ impl XhciInner {
         let ep_off = csz + csz + (dci - 1) * csz;
 
         // Endpoint Context DW0. Interval is bits 23:16 (xHCI 1.2 table 6-9);
-        // bits 31:24 are Max ESIT Payload Hi, RsvdZ unless LEC=1.
+        // bits 31:24 are Max ESIT Payload Hi, RsvdZ unless LEC=1. Un endpoint
+        // bulk no tiene intervalo: el campo es RsvdZ para él (§6.2.3.6), y
+        // meterle el exponente de un endpoint de interrupción es un Parameter
+        // Error en los controladores estrictos.
         let speed = self.slot_speed[slot as usize];
-        cfg.write_u32(ep_off, xhci_endpoint_interval(speed, interval) << 16);
+        let bulk = ep_type == EP_TYPE_BULK_IN || ep_type == EP_TYPE_BULK_OUT;
+        cfg.write_u32(
+            ep_off,
+            if bulk {
+                0
+            } else {
+                xhci_endpoint_interval(speed, interval) << 16
+            },
+        );
 
         // Endpoint Context DW1: Error Count field (bits 2:1) = 3 (value 3 << 1 = 0b110),
         // EP Type, Max Packet Size.  Error Count = 3 allows up to 3 retries after failure.
-        let ep_ty = (3u32 << 1) | EP_TYPE_INT_IN | ((mps as u32) << 16);
+        let ep_ty = (3u32 << 1) | ep_type | ((mps as u32) << 16);
         cfg.write_u32(ep_off + 4, ep_ty);
         let ir = XferRing::new(ring_trbs)?;
         let irp = ir.ring_phys() | 1; // DCS = 1
@@ -4538,9 +5237,11 @@ impl XhciInner {
         // changes the stride), and an interrupt endpoint's Max ESIT Payload is
         // its max packet size; it used to be left at 0, which stricter xHCs
         // may reject with Parameter Error or use to under-reserve bandwidth.
+        // Un endpoint bulk no reserva ancho de banda, así que su Max ESIT
+        // Payload es 0 y solo lleva la longitud media de TRB.
         cfg.write_u32(
             ep_off + 16,
-            ((mps as u32) << 16) | ((avg_trb_len as u32) & 0xffff),
+            (if bulk { 0 } else { (mps as u32) << 16 }) | ((avg_trb_len as u32) & 0xffff),
         );
         let ridx = Self::ri(slot, dci as u8);
         if let Some(old) = self.xfer_rings[ridx].replace(ir) {
@@ -4664,9 +5365,16 @@ impl XhciInner {
             true,
         );
 
-        let dci = self
-            .configure_int_in_endpoint(slot, csz, ep_addr, mps, interval, report_len, 64)?
-            as usize;
+        let dci = self.configure_endpoint(
+            slot,
+            csz,
+            ep_addr,
+            EP_TYPE_INT_IN,
+            mps,
+            interval,
+            report_len,
+            64,
+        )? as usize;
         let ridx = Self::ri(slot, dci as u8);
 
         // Allocate one report buffer per pre-queued TRB so the controller can
@@ -5417,6 +6125,7 @@ impl XhciInner {
             }
             self.pending_hub_ports.retain(|&(s, _)| s != slot);
             self.devs.retain(|d| d.slot != slot);
+            self.mscs.retain(|m| m.slot != slot);
             for ep in 1..32 {
                 let ri = Self::ri(slot, ep);
                 if ri < self.xfer_rings.len() {
@@ -6112,6 +6821,40 @@ impl InputScheme for XhciUsbHid {
                 "] bound={}",
                 xi.hids.iter().filter(|h| h.slot_id == d.slot).count()
             );
+        }
+        for m in xi.mscs.iter() {
+            // La linea que contesta «si, el sistema ve tu pendrive», con su
+            // nombre y su tamano. `cap=none` es una unidad que hablo pero no
+            // tiene medio dentro, que es distinto de no estar.
+            let _ = write!(
+                s,
+                "[usbhid] msc slot={} iface={} bulk_in={} bulk_out={} luns={} \
+                 \"{} {} {}\" type={:#04x} removable={} ",
+                m.slot,
+                m.iface,
+                m.dci_in,
+                m.dci_out,
+                m.max_lun as u16 + 1,
+                scsi_text(&m.inquiry.vendor),
+                scsi_text(&m.inquiry.product),
+                scsi_text(&m.inquiry.revision),
+                m.inquiry.dev_type,
+                m.inquiry.removable,
+            );
+            match m.capacity {
+                Some(c) => {
+                    let _ = writeln!(
+                        s,
+                        "sectors512={} blocks={} block_size={}",
+                        scsi_sectors_512(&c),
+                        c.last_lba.saturating_add(1),
+                        c.block_size
+                    );
+                }
+                None => {
+                    let _ = writeln!(s, "cap=none");
+                }
+            }
         }
         for h in xi.hubs.iter() {
             let topo = xi
@@ -8467,6 +9210,262 @@ mod hub_tests {
         // Y lo que si cabe se entrega antes de parar en lo que no.
         let raw = alloc::vec![4u8, USB_DESC_IFACE, 0, 0, 40, USB_DESC_EP, 0];
         assert_eq!(config_descriptors(&raw).count(), 1);
+    }
+
+    #[test]
+    fn a_dci_is_two_n_for_an_out_endpoint_and_two_n_plus_one_for_an_in_one() {
+        // Y es la inversa exacta de `ep_addr_from_dci`: si las dos no coinciden,
+        // un CLEAR_FEATURE acaba dirigido a otro endpoint.
+        for num in 1..16u8 {
+            for &dir in &[0u8, 0x80] {
+                let addr = num | dir;
+                let dci = dci_from_ep_addr(addr).expect("cabe en 31 endpoints");
+                assert_eq!(dci, num * 2 + u8::from(dir != 0));
+                assert_eq!(ep_addr_from_dci(dci), addr as u16);
+            }
+        }
+        // EP0 no tiene direccion: su DCI lo pone `setup_device`.
+        assert_eq!(dci_from_ep_addr(0x00), None);
+        assert_eq!(dci_from_ep_addr(0x80), None);
+    }
+
+    #[test]
+    fn a_command_block_wrapper_carries_its_tag_length_direction_and_command() {
+        let w =
+            bot_cbw(0x1234_5678, 36, true, 0, &[SCSI_INQUIRY, 0, 0, 0, 36, 0]).expect("CBW valido");
+        assert_eq!(&w[0..4], b"USBC");
+        assert_eq!(u32::from_le_bytes([w[4], w[5], w[6], w[7]]), 0x1234_5678);
+        assert_eq!(u32::from_le_bytes([w[8], w[9], w[10], w[11]]), 36);
+        assert_eq!(w[12], 0x80, "bmCBWFlags: solo el bit 7, la direccion");
+        assert_eq!(w[13], 0);
+        assert_eq!(w[14], 6);
+        assert_eq!(&w[15..21], &[SCSI_INQUIRY, 0, 0, 0, 36, 0]);
+        // Lo que no se llena queda a cero: el hueco del bloque de orden son 16
+        // bytes y el dispositivo lee bCBWCBLength de ellos.
+        assert!(w[21..].iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn a_write_command_is_not_marked_as_an_in_transfer() {
+        let w = bot_cbw(1, 512, false, 3, &[0x2a, 0, 0, 0, 0, 0, 0, 0, 1, 0]).unwrap();
+        assert_eq!(w[12], 0x00);
+        assert_eq!(w[13], 3, "el LUN va en bCBWLUN");
+    }
+
+    #[test]
+    fn a_command_that_does_not_fit_the_wrapper_is_refused() {
+        // El hueco del bloque de orden son 16 bytes, ni uno mas; y una orden
+        // vacia no es una orden.
+        assert!(bot_cbw(1, 0, false, 0, &[0u8; 16]).is_some());
+        assert!(bot_cbw(1, 0, false, 0, &[0u8; 17]).is_none());
+        assert!(bot_cbw(1, 0, false, 0, &[]).is_none());
+    }
+
+    fn csw(sig: &[u8; 4], tag: u32, residue: u32, status: u8) -> [u8; BOT_CSW_LEN] {
+        let mut w = [0u8; BOT_CSW_LEN];
+        w[0..4].copy_from_slice(sig);
+        w[4..8].copy_from_slice(&tag.to_le_bytes());
+        w[8..12].copy_from_slice(&residue.to_le_bytes());
+        w[12] = status;
+        w
+    }
+
+    #[test]
+    fn a_status_wrapper_is_read_when_it_answers_the_command_that_was_sent() {
+        let raw = csw(b"USBS", 7, 4, 1);
+        assert_eq!(
+            bot_parse_csw(&raw, 7),
+            Some(BotCsw {
+                tag: 7,
+                residue: 4,
+                status: 1
+            })
+        );
+    }
+
+    #[test]
+    fn a_status_wrapper_of_another_command_is_not_this_commands_answer() {
+        // Es el fallo que convierte el resultado de la orden anterior en el de
+        // esta: un «bien» que era de otra pregunta.
+        let raw = csw(b"USBS", 6, 0, 0);
+        assert_eq!(bot_parse_csw(&raw, 7), None);
+    }
+
+    #[test]
+    fn a_status_wrapper_that_is_not_one_is_refused() {
+        // Firma mala, estado que no existe, y uno truncado.
+        assert_eq!(bot_parse_csw(&csw(b"USBC", 1, 0, 0), 1), None);
+        assert_eq!(bot_parse_csw(&csw(b"USBS", 1, 0, 3), 1), None);
+        assert_eq!(bot_parse_csw(&csw(b"USBS", 1, 0, 0x80), 1), None);
+        assert_eq!(bot_parse_csw(&csw(b"USBS", 1, 0, 0)[..12], 1), None);
+        // Y el error de fase (2) si es un estado: pide un reset del transporte.
+        assert_eq!(
+            bot_parse_csw(&csw(b"USBS", 1, 0, 2), 1).map(|c| c.status),
+            Some(2)
+        );
+    }
+
+    fn inquiry_bytes(dev_type: u8, rmb: u8, vendor: &[u8], product: &[u8]) -> [u8; 36] {
+        let mut raw = [b' '; 36];
+        raw[0] = dev_type;
+        raw[1] = rmb;
+        raw[2] = 0x06;
+        raw[3] = 0x02;
+        raw[4] = 31;
+        raw[5] = 0;
+        raw[6] = 0;
+        raw[7] = 0;
+        raw[8..8 + vendor.len()].copy_from_slice(vendor);
+        raw[16..16 + product.len()].copy_from_slice(product);
+        raw[32..36].copy_from_slice(b"1.00");
+        raw
+    }
+
+    #[test]
+    fn an_inquiry_gives_the_type_the_removable_bit_and_the_three_text_fields() {
+        let raw = inquiry_bytes(0x00, 0x80, b"SanDisk", b"Ultra");
+        let inq = scsi_parse_inquiry(&raw).expect("INQUIRY valido");
+        assert_eq!(inq.dev_type, 0x00, "0 es un disco de bloques");
+        assert!(inq.removable);
+        // SCSI rellena con espacios, no con ceros: volcarlo tal cual deja una
+        // columna de huecos en cada linea de /proc.
+        assert_eq!(scsi_text(&inq.vendor), "SanDisk");
+        assert_eq!(scsi_text(&inq.product), "Ultra");
+        assert_eq!(scsi_text(&inq.revision), "1.00");
+    }
+
+    #[test]
+    fn the_device_type_is_five_bits_and_the_removable_bit_is_only_bit_seven() {
+        // Byte 0 lleva el qualifier en los bits 7:5; tomarlo por el tipo
+        // convierte un disco normal en un dispositivo que no existe.
+        let raw = inquiry_bytes(0xe0 | 0x05, 0x7f, b"HL-DT-ST", b"DVDRAM");
+        let inq = scsi_parse_inquiry(&raw).unwrap();
+        assert_eq!(inq.dev_type, 0x05, "5 es un CD/DVD");
+        assert!(
+            !inq.removable,
+            "RMB es solo el bit 7; los otros siete son reservados"
+        );
+    }
+
+    #[test]
+    fn a_text_field_with_control_bytes_does_not_break_the_line_it_is_printed_on() {
+        assert_eq!(scsi_text(b"ab\x00cd\x1b  "), "ab.cd.");
+        assert_eq!(scsi_text(b"        "), "");
+    }
+
+    #[test]
+    fn an_inquiry_shorter_than_its_mandatory_fields_is_refused() {
+        assert_eq!(scsi_parse_inquiry(&[0u8; 35]), None);
+        assert_eq!(scsi_parse_inquiry(&[]), None);
+    }
+
+    #[test]
+    fn a_read_capacity_is_big_endian_and_names_the_last_block_not_the_count() {
+        // 0x0000_0fff bloques de 512: el ultimo LBA es 4095, o sea 4096
+        // bloques. Tomar el ultimo LBA por la cuenta deja el ultimo sector
+        // fuera del disco.
+        let raw = [0x00, 0x00, 0x0f, 0xff, 0x00, 0x00, 0x02, 0x00];
+        let cap = scsi_parse_capacity10(&raw).expect("capacidad valida");
+        assert_eq!(cap.last_lba, 4095);
+        assert_eq!(cap.block_size, 512);
+        assert!(!cap.needs_16);
+        assert_eq!(scsi_sectors_512(&cap), 4096);
+    }
+
+    #[test]
+    fn a_four_kilobyte_block_counts_as_eight_sectors_of_five_hundred_twelve() {
+        let raw = [0x00, 0x00, 0x00, 0x09, 0x00, 0x00, 0x10, 0x00];
+        let cap = scsi_parse_capacity10(&raw).unwrap();
+        assert_eq!(cap.block_size, 4096);
+        // 10 bloques de 4 KiB = 80 sectores de 512 B.
+        assert_eq!(scsi_sectors_512(&cap), 80);
+    }
+
+    #[test]
+    fn a_disk_that_does_not_fit_in_thirty_two_bits_asks_for_the_sixteen_byte_command() {
+        let raw = [0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x02, 0x00];
+        let cap = scsi_parse_capacity10(&raw).unwrap();
+        assert!(
+            cap.needs_16,
+            "0xffffffff no es una capacidad: es «preguntame con el de 16»"
+        );
+        // Y el de 16 trae el LBA en ocho bytes.
+        let raw16 = [
+            0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00,
+        ];
+        let big = scsi_parse_capacity16(&raw16).expect("capacidad de 16 valida");
+        assert_eq!(big.last_lba, 0x1_0000_0000);
+        assert_eq!(big.block_size, 512);
+        assert!(!big.needs_16);
+    }
+
+    #[test]
+    fn a_block_size_of_zero_is_not_a_capacity() {
+        // Dividir 512 entre el seria una division por cero, y creerselo seria
+        // un disco de capacidad infinita.
+        assert_eq!(scsi_parse_capacity10(&[0, 0, 0, 9, 0, 0, 0, 0]), None);
+        assert_eq!(scsi_parse_capacity16(&[0u8; 12]), None);
+        assert_eq!(scsi_parse_capacity10(&[0, 0, 0, 9, 0, 0, 2]), None);
+    }
+
+    #[test]
+    fn the_bulk_pair_belongs_to_its_own_interface() {
+        // Un disco externo con lector de tarjetas declara dos interfaces de
+        // almacenamiento. Coger «el primer bulk del descriptor» para las dos es
+        // hablarle al disco equivocado.
+        let raw = config(&[
+            &iface(0, 0, USB_CLASS_MASS_STORAGE, MSC_SUBCLASS_SCSI, 0x50),
+            &endpoint(0x81, 0x02, 512, 0),
+            &endpoint(0x02, 0x02, 512, 0),
+            &iface(1, 0, USB_CLASS_MASS_STORAGE, MSC_SUBCLASS_SCSI, 0x50),
+            &endpoint(0x83, 0x02, 512, 0),
+            &endpoint(0x04, 0x02, 512, 0),
+        ]);
+        assert_eq!(
+            iface_bulk_endpoints(&raw, 0),
+            Some(((0x81, 512), (0x02, 512)))
+        );
+        assert_eq!(
+            iface_bulk_endpoints(&raw, 1),
+            Some(((0x83, 512), (0x04, 512)))
+        );
+        assert_eq!(iface_bulk_endpoints(&raw, 2), None);
+    }
+
+    #[test]
+    fn an_interface_missing_half_the_pair_has_no_pair() {
+        // Sin el OUT no hay por donde mandar el CBW, asi que media pareja no
+        // sirve de nada y armarla a medias deja el endpoint IN configurado para
+        // siempre sin nadie que lo use.
+        let only_in = config(&[
+            &iface(0, 0, USB_CLASS_MASS_STORAGE, MSC_SUBCLASS_SCSI, 0x50),
+            &endpoint(0x81, 0x02, 512, 0),
+        ]);
+        assert_eq!(iface_bulk_endpoints(&only_in, 0), None);
+        // Y un interrupt o un isocrono no son bulk.
+        let not_bulk = config(&[
+            &iface(0, 0, USB_CLASS_MASS_STORAGE, MSC_SUBCLASS_SCSI, 0x50),
+            &endpoint(0x81, 0x03, 512, 1),
+            &endpoint(0x02, 0x01, 512, 1),
+        ]);
+        assert_eq!(iface_bulk_endpoints(&not_bulk, 0), None);
+    }
+
+    #[test]
+    fn the_endpoints_of_an_alternate_setting_are_not_the_selected_ones() {
+        let raw = config(&[
+            &iface(0, 0, USB_CLASS_MASS_STORAGE, MSC_SUBCLASS_SCSI, 0x50),
+            &endpoint(0x81, 0x02, 512, 0),
+            &endpoint(0x02, 0x02, 512, 0),
+            &iface(0, 1, USB_CLASS_MASS_STORAGE, MSC_SUBCLASS_SCSI, 0x50),
+            &endpoint(0x85, 0x02, 1024, 0),
+            &endpoint(0x06, 0x02, 1024, 0),
+        ]);
+        assert_eq!(
+            iface_bulk_endpoints(&raw, 0),
+            Some(((0x81, 512), (0x02, 512))),
+            "los endpoints que siguen a la alternativa 1 son de la alternativa 1"
+        );
     }
 
     #[test]
