@@ -1867,7 +1867,22 @@ pub(super) fn ring_state(
         (get_raw % entries) as u64,
         entries as u64,
     );
-    let used = (put + entries64 - get) % entries64;
+    // One conditional subtract, not a third division. `put` and `get` are
+    // both below `entries` by the lines above, so `put + entries - get` lies
+    // in `[1, 2*entries)` and the wrap can only ever subtract once. The two
+    // divisions above are forced -- `put_raw` and `get_raw` come from the GPU
+    // and from the RM's own self-test submissions and may be anything -- but
+    // this one was buying nothing, and `fast_submit` pays it once per `EXEC`
+    // and again on every poll of the ring-full wait
+    // (`benches::ring_state_with_room` against
+    // `benches::ring_state_with_the_last_wrap_as_a_subtract`: 5.6 ns against
+    // 3.0).
+    let raw = put + entries64 - get;
+    let used = if raw >= entries64 {
+        raw - entries64
+    } else {
+        raw
+    };
     Some(RingState {
         put: put as u32,
         get: get as u32,
@@ -1884,6 +1899,32 @@ pub(super) struct RingState {
     pub put: u32,
     pub get: u32,
     pub room: bool,
+}
+
+/// The next ring slot after `slot`, for a write cursor walking the GPFIFO.
+///
+/// A compare, not a division. The submit path advances this once per GP entry
+/// it writes, and NVK batches hundreds of pushes into one `EXEC`, so the
+/// divisor -- which comes from outside this kernel and so cannot be assumed a
+/// power of two for the compiler to turn into a mask -- was costing a hardware
+/// divide per entry: `benches::advance_a_batch_of_slots_by_modulo` against
+/// `benches::advance_a_batch_of_slots_by_compare`, 556 ns against 86 for a
+/// batch of 256, which is more than encoding the entries costs (242 ns).
+///
+/// Identical to `(slot + 1) % entries` for every `slot < entries`, which is
+/// the invariant the cursor keeps: it starts at the wrapped `put` that
+/// [`ring_state`] returns and every step goes back through here. The `>=`
+/// rather than `==` is for safety rather than for the invariant -- a caller
+/// that somehow arrived with `slot >= entries` gets a slot inside the ring
+/// instead of one past the end of the ring page.
+#[inline]
+pub(super) const fn next_slot(slot: u32, entries: u32) -> u32 {
+    let next = slot + 1;
+    if next >= entries {
+        0
+    } else {
+        next
+    }
 }
 
 /// `NV906F_GP_ENTRY0`: GET = bits 31:2 of the push VA's low half,
@@ -2473,6 +2514,94 @@ mod direct_submit_tests {
         }
     }
 
+    /// `next_slot` is the wrap the submit cursor takes after every GP entry,
+    /// written as a compare because the divisor is not a constant and NVK
+    /// batches hundreds of entries into one `EXEC`. It has to be the same
+    /// answer as the division it replaced for every slot the cursor can hold,
+    /// which is every slot below `entries` -- checked here exhaustively for
+    /// the ring this hardware gets and at the edges of the range.
+    #[test]
+    fn the_slot_cursor_wraps_exactly_as_the_division_did() {
+        for entries in [1u32, 2, 3, 7, 8, 128, 4096] {
+            for slot in 0..entries {
+                assert_eq!(
+                    next_slot(slot, entries),
+                    (slot + 1) % entries,
+                    "slot {} of {} entries",
+                    slot,
+                    entries
+                );
+            }
+        }
+        // And a slot that is somehow already outside the ring lands inside it
+        // rather than one past the end of the ring page.
+        assert_eq!(next_slot(9999, 128), 0);
+        assert_eq!(next_slot(u32::MAX - 1, 128), 0);
+    }
+
+    /// `ring_state`'s last wrap is a conditional subtract rather than a third
+    /// division, which is only sound because `put` and `get` are already
+    /// inside the ring when it runs. This walks every pointer pair of several
+    /// ring sizes against the arithmetic as it was written, including the
+    /// raw pointers past the end that the RM's own submissions produce.
+    #[test]
+    fn the_in_flight_count_is_what_the_division_answered() {
+        fn used_by_division(put_raw: u32, get_raw: u32, entries: u32) -> u64 {
+            let (put, get, e) = (
+                (put_raw % entries) as u64,
+                (get_raw % entries) as u64,
+                entries as u64,
+            );
+            (put + e - get) % e
+        }
+        for entries in [1u32, 2, 3, 8, 128] {
+            for put in 0..entries * 3 {
+                for get in 0..entries * 3 {
+                    let used = used_by_division(put, get, entries);
+                    for needed in 0..entries + 2 {
+                        let st = ring_state(put, get, entries, needed).expect("a real ring");
+                        assert_eq!(st.put, put % entries);
+                        assert_eq!(st.get, get % entries);
+                        assert_eq!(
+                            st.room,
+                            (used + needed as u64) < (entries as u64),
+                            "put {} get {} of {} entries, needed {}",
+                            put,
+                            get,
+                            entries,
+                            needed
+                        );
+                    }
+                }
+            }
+        }
+        // The nonsense ring size the 64-bit arithmetic exists for: a ring of
+        // `u32::MAX` slots with all but one of them in flight. The subtract
+        // has to agree with the division here too, and the answer is that
+        // four more entries do NOT fit -- which is the overflow the 64-bit
+        // arithmetic exists to get right, since in 32 bits `used + needed`
+        // wraps and reports a full ring as an empty one.
+        let used = used_by_division(u32::MAX - 1, 0, u32::MAX);
+        assert_eq!(used, (u32::MAX - 1) as u64);
+        let st = ring_state(u32::MAX - 1, 0, u32::MAX, 4).expect("a huge ring");
+        assert_eq!(st.put, u32::MAX - 1);
+        assert_eq!(st.get, 0);
+        assert_eq!(st.room, (used + 4) < u32::MAX as u64);
+        assert!(!st.room, "all but one slot is in flight");
+        // One entry still does not fit, and zero does: the boundary the
+        // reserved slot puts there.
+        assert!(
+            !ring_state(u32::MAX - 1, 0, u32::MAX, 1)
+                .expect("a huge ring")
+                .room
+        );
+        assert!(
+            ring_state(u32::MAX - 2, 0, u32::MAX, 0)
+                .expect("a huge ring")
+                .room
+        );
+    }
+
     /// The pointers are taken modulo the ring, because the RM's own self-test
     /// submissions move `GPPut` on channel 0 behind this path's back and the
     /// value read back can be past the end.
@@ -2789,5 +2918,366 @@ mod errno_reporter_tests {
                 );
             }
         }
+    }
+}
+
+/// Native `#[bench]` rows for the nouveau uAPI's decode and submission
+/// arithmetic — the per-ioctl and per-GP-entry work on the `EXEC` path NVK
+/// drives every frame.
+///
+/// Inline rather than in `benches/`, like `linux-syscall`, `kernel-hal` and
+/// the rest of this crate: everything measured here is `pub(super)` or
+/// private (`ring_state`, `decode_ioc`, the GP-entry encoders), so a separate
+/// bench target would see none of it.
+///
+/// Nothing here touches hardware or a mock — it is integer arithmetic over
+/// values the submit path reads from the channel's USERD window, so these are
+/// the real figures, not a lower bound.
+///
+/// `cargo +nightly bench -p zcore-drivers --features graphic,virtio,xhci-usb-hid`
+#[cfg(test)]
+mod benches {
+    use super::*;
+    use test::{black_box, Bencher};
+
+    /// The ring this hardware actually gets: `FastCtx` documents 128 eight-byte
+    /// GP entries, and `eclipse_rm_exec_fast_prepare` fills that in.
+    const ENTRIES: u32 = 128;
+
+    /// What NVK sends per `EXEC`: it batches pushes rather than issuing one
+    /// per draw, so the per-submission wrap arithmetic is paid this many times.
+    const NVK_BATCH: usize = 256;
+
+    // --- ring accounting, once per submit and once per drain poll ---
+
+    /// `ring_state` on an empty ring with room: the common case, and the one
+    /// `fast_submit` pays on every `EXEC` that is not behind.
+    #[bench]
+    fn ring_state_with_room(b: &mut Bencher) {
+        b.iter(|| {
+            black_box(ring_state(
+                black_box(0),
+                black_box(0),
+                black_box(ENTRIES),
+                black_box(4),
+            ))
+            .map(|s| s.room)
+        });
+    }
+
+    /// The same call when the ring is full. `fast_submit` spins on this for up
+    /// to ten seconds while GPGet is behind, so this is the cost of one poll
+    /// of that wait, not a once-per-submit cost.
+    #[bench]
+    fn ring_state_without_room(b: &mut Bencher) {
+        b.iter(|| {
+            black_box(ring_state(
+                black_box(127),
+                black_box(0),
+                black_box(ENTRIES),
+                black_box(4),
+            ))
+            .map(|s| s.room)
+        });
+    }
+
+    /// Pointers past the end of the ring, which the RM's own self-test
+    /// submissions on channel 0 produce. Takes the same three divisions, so it
+    /// should cost the same: a difference here would mean the wrap is
+    /// data-dependent, which it must not be.
+    #[bench]
+    fn ring_state_with_wrapped_pointers(b: &mut Bencher) {
+        b.iter(|| {
+            black_box(ring_state(
+                black_box(ENTRIES * 3 + 5),
+                black_box(ENTRIES * 7 + 9),
+                black_box(ENTRIES),
+                black_box(4),
+            ))
+            .map(|s| s.room)
+        });
+    }
+
+    /// A ring of no entries: the early return, before any division. The floor
+    /// for a row of this shape, so the three rows above can be read against
+    /// something that does no arithmetic at all.
+    #[bench]
+    fn ring_state_refuses_an_empty_ring(b: &mut Bencher) {
+        b.iter(|| {
+            black_box(ring_state(
+                black_box(0),
+                black_box(0),
+                black_box(0),
+                black_box(1),
+            ))
+            .is_none()
+        });
+    }
+
+    /// A ring size the submit path cannot trust to be sane. The accounting
+    /// runs in 64 bits for exactly this, and a 64-bit division by a runtime
+    /// divisor is what these rows are measuring.
+    #[bench]
+    fn ring_state_with_a_nonsense_ring_size(b: &mut Bencher) {
+        b.iter(|| {
+            black_box(ring_state(
+                black_box(u32::MAX - 1),
+                black_box(0),
+                black_box(u32::MAX),
+                black_box(4),
+            ))
+            .map(|s| s.room)
+        });
+    }
+
+    /// The claim worth a number: `ring_state` takes **three** divisions by a
+    /// divisor the compiler cannot see, and only one of them is forced.
+    /// `put_raw % entries` and `get_raw % entries` are over untrusted inputs,
+    /// but `used = (put + entries - get) % entries` is not: `put` and `get`
+    /// are already below `entries`, so the dividend is in `[1, 2*entries)` and
+    /// the modulo can only ever subtract once. This row is that same
+    /// accounting with the third division replaced by the conditional
+    /// subtract, so the difference is what the divide costs.
+    #[bench]
+    fn ring_state_with_the_last_wrap_as_a_subtract(b: &mut Bencher) {
+        fn room_without_the_third_divide(
+            put_raw: u32,
+            get_raw: u32,
+            entries: u32,
+            needed: u32,
+        ) -> Option<bool> {
+            if entries == 0 {
+                return None;
+            }
+            let (put, get, entries64) = (
+                (put_raw % entries) as u64,
+                (get_raw % entries) as u64,
+                entries as u64,
+            );
+            // put and get are both < entries, so this sum is in
+            // [1, 2*entries): one conditional subtract, never a division.
+            let raw = put + entries64 - get;
+            let used = if raw >= entries64 {
+                raw - entries64
+            } else {
+                raw
+            };
+            Some(used + (needed as u64) < entries64)
+        }
+        b.iter(|| {
+            black_box(room_without_the_third_divide(
+                black_box(0),
+                black_box(0),
+                black_box(ENTRIES),
+                black_box(4),
+            ))
+        });
+    }
+
+    // --- the per-GP-entry wrap, paid once per push ---
+
+    /// `fast_submit` advances its write cursor with `slot = (slot + 1) %
+    /// entries` after every GP entry it writes, so one NVK batch pays this
+    /// `NVK_BATCH` times with a divisor the compiler cannot see.
+    #[bench]
+    fn advance_a_batch_of_slots_by_modulo(b: &mut Bencher) {
+        b.iter(|| {
+            let entries = black_box(ENTRIES);
+            let mut slot = black_box(0u32);
+            for _ in 0..black_box(NVK_BATCH) {
+                slot = (slot + 1) % entries;
+            }
+            black_box(slot)
+        });
+    }
+
+    /// The same advance written as a compare. `slot` is always below
+    /// `entries`, so `slot + 1` can only reach `entries` and the wrap is one
+    /// branch — no division, and no assumption that the ring is a power of
+    /// two (it comes from outside this kernel and may not be).
+    #[bench]
+    fn advance_a_batch_of_slots_by_compare(b: &mut Bencher) {
+        b.iter(|| {
+            let entries = black_box(ENTRIES);
+            let mut slot = black_box(0u32);
+            for _ in 0..black_box(NVK_BATCH) {
+                slot += 1;
+                if slot == entries {
+                    slot = 0;
+                }
+            }
+            black_box(slot)
+        });
+    }
+
+    /// One slot advance, to place the two batch rows above: a batch of 256
+    /// should cost 256 of these, and if it does not the loop is not the loop.
+    #[bench]
+    fn advance_one_slot_by_modulo(b: &mut Bencher) {
+        b.iter(|| black_box(black_box(7u32).wrapping_add(1) % black_box(ENTRIES)));
+    }
+
+    // --- the GP entry and semaphore encoders, once per push ---
+
+    /// `gp_entry0` and `gp_entry1`, the pair written for every push. Both are
+    /// `const fn` and inlined, so this is the arithmetic alone. Combined with
+    /// a xor rather than returned as a tuple: handing `black_box` a two-word
+    /// tuple costs more than the arithmetic it is hiding, which is what made
+    /// an earlier version of this row read six times the batch row's
+    /// per-entry figure.
+    #[bench]
+    fn encode_one_gp_entry(b: &mut Bencher) {
+        b.iter(|| {
+            let va = black_box(0x7f_1234_5000u64);
+            let len = black_box(4096u32);
+            black_box(gp_entry0(va) ^ gp_entry1(va, len))
+        });
+    }
+
+    /// The push variant, which also reads the no-prefetch flag.
+    #[bench]
+    fn encode_one_push_gp_entry(b: &mut Bencher) {
+        b.iter(|| {
+            let va = black_box(0x7f_1234_5000u64);
+            black_box(gp_entry1_push(
+                va,
+                black_box(4096u32),
+                black_box(EXEC_PUSH_NO_PREFETCH),
+            ))
+        });
+    }
+
+    /// A whole NVK batch of GP entries, encoded. This is the work
+    /// `fast_submit` does between taking the lock and poking the doorbell,
+    /// minus the volatile writes into the ring page.
+    #[bench]
+    fn encode_a_batch_of_gp_entries(b: &mut Bencher) {
+        b.iter(|| {
+            let base = black_box(0x7f_1234_5000u64);
+            let mut acc = 0u32;
+            for i in 0..black_box(NVK_BATCH) {
+                let va = base + (i as u64) * 4096;
+                acc ^= gp_entry0(va) ^ gp_entry1(va, black_box(4096));
+            }
+            black_box(acc)
+        });
+    }
+
+    /// The six-dword host semaphore RELEASE stream, built once per fenced
+    /// submission.
+    #[bench]
+    fn build_a_semaphore_release_stream(b: &mut Bencher) {
+        b.iter(|| {
+            black_box(sem_release_stream(
+                black_box(0x7f_1000_0040u64),
+                black_box(42u32),
+            ))
+        });
+    }
+
+    /// The ACQUIRE stream, built once per same-channel wait fence. `EXEC`
+    /// budgets its acquires, so a submission can carry several.
+    #[bench]
+    fn build_a_semaphore_acquire_stream(b: &mut Bencher) {
+        b.iter(|| {
+            black_box(sem_acquire_stream(
+                black_box(0x7f_1000_0040u64),
+                black_box(42u32),
+            ))
+        });
+    }
+
+    /// The method header every stream starts with.
+    #[bench]
+    fn encode_a_push_header(b: &mut Bencher) {
+        b.iter(|| {
+            black_box(push_hdr(
+                black_box(0),
+                black_box(NVC46F_SEM_ADDR_LO),
+                black_box(5),
+            ))
+        });
+    }
+
+    // --- the per-ioctl decode, ahead of every dispatch ---
+
+    /// `decode_ioc`, three shifts and masks, on every driver-private ioctl.
+    #[bench]
+    fn decode_an_ioctl_request(b: &mut Bencher) {
+        let request = black_box(0xc010_6446u32);
+        b.iter(|| black_box(decode_ioc(black_box(request))));
+    }
+
+    /// `is_cpu_prep_ioctl` on a request that is one: the recogniser the async
+    /// pre-wait in `linux-object` runs ahead of every DRM ioctl.
+    #[bench]
+    fn recognise_a_cpu_prep_ioctl(b: &mut Bencher) {
+        let request =
+            black_box(0x4000_0000u32 | ((CPU_PREP_REQUEST_BYTES as u32) << 16) | 0x6400 | 0x42);
+        b.iter(|| black_box(is_cpu_prep_ioctl(black_box(request))));
+    }
+
+    /// The same recogniser on an `EXEC`, which is what it actually sees most
+    /// of the time. It must reject without reading anything but the request
+    /// word, and should land with the row above.
+    #[bench]
+    fn reject_an_exec_as_not_cpu_prep(b: &mut Bencher) {
+        let request = black_box(0xc040_6449u32);
+        b.iter(|| black_box(is_cpu_prep_ioctl(black_box(request))));
+    }
+
+    /// The nowait flag test, one bit, on every prep that is recognised.
+    #[bench]
+    fn test_the_cpu_prep_nowait_flag(b: &mut Bencher) {
+        b.iter(|| black_box(cpu_prep_is_nowait(black_box(NOUVEAU_GEM_CPU_PREP_NOWAIT))));
+    }
+
+    /// `nouveau_ioctl_name` on `EXEC`, the one the crash-time ioctl trail
+    /// looks up per entry. A `match` over the whole `nouveau_drm.h`
+    /// vocabulary — this row says whether it compiles to a table or a chain.
+    #[bench]
+    fn name_the_exec_ioctl(b: &mut Bencher) {
+        b.iter(|| {
+            black_box(nouveau_ioctl_name(black_box(
+                DRM_NOUVEAU_EXEC + DRM_COMMAND_BASE,
+            )))
+        });
+    }
+
+    /// The same lookup for the last NR in nouveau's range. If the `match` is a
+    /// jump table the two rows land together; if it is a comparison chain this
+    /// one is dearer, and the trail pays it per entry it prints.
+    #[bench]
+    fn name_the_last_nouveau_ioctl(b: &mut Bencher) {
+        b.iter(|| {
+            black_box(nouveau_ioctl_name(black_box(
+                DRM_NOUVEAU_GEM_CPU_FINI + DRM_COMMAND_BASE,
+            )))
+        });
+    }
+
+    /// An NR outside the private range: the fallthrough arm.
+    #[bench]
+    fn name_an_unknown_ioctl(b: &mut Bencher) {
+        b.iter(|| black_box(nouveau_ioctl_name(black_box(DRM_COMMAND_BASE + 0x3f))));
+    }
+
+    /// The empty equivalent of the three rows above, and the reason they can
+    /// be read at all: a call the compiler will not inline that returns a
+    /// `&'static str` and decides nothing. Three name lookups landing on the
+    /// same figure is evidence of a jump table only if that figure is above
+    /// this one; if it sits on top of it, the rows are measuring the call and
+    /// the fat pointer coming back, not the `match`.
+    #[bench]
+    fn the_name_lookup_floor(b: &mut Bencher) {
+        #[inline(never)]
+        fn decides_nothing(nr: u32) -> &'static str {
+            if nr == u32::MAX {
+                "never"
+            } else {
+                "always"
+            }
+        }
+        b.iter(|| black_box(decides_nothing(black_box(DRM_COMMAND_BASE))));
     }
 }
