@@ -23,8 +23,14 @@ impl<T: Scheme + ?Sized> DeviceList<T> {
     }
 
     /// Drop EVERY entry that IS `dev` (same allocation, not merely equal),
-    /// returning whether any were found. Hosted builds only -- see
-    /// [`remove_device_hosted`].
+    /// returning whether any were found.
+    ///
+    /// Bare metal needs this too, since USB storage: a disk that is unplugged
+    /// has to leave the list, and leaving it there is worse than cosmetic --
+    /// its slot gets reassigned to whatever is plugged in next, so a read
+    /// through the stale entry lands on a different device. What bare metal
+    /// still must not do is unregister a DISPLAY, for the reason in
+    /// [`add_device_hosted`]; nothing does.
     ///
     /// Every entry, not the first one: [`Self::add`] is an unconditional
     /// `push`, so the same `Arc` can be in here twice (`sysfs`'s `Disks` adds
@@ -34,7 +40,6 @@ impl<T: Scheme + ?Sized> DeviceList<T> {
     /// because every lookup that matters takes the FIRST entry
     /// (`primary_display`, `all_uart().first()`), the copy is the one the
     /// kernel would then go on using.
-    #[cfg(feature = "libos")]
     fn remove(&self, dev: &Arc<T>) -> bool {
         let mut list = self.0.write();
         let before = list.len();
@@ -92,7 +97,6 @@ struct AllDeviceList {
 }
 
 impl AllDeviceList {
-    #[cfg(feature = "libos")]
     pub fn remove_device(&self, dev: &Device) -> bool {
         match dev {
             Device::Block(d) => self.block.remove(d),
@@ -161,11 +165,12 @@ pub(crate) fn add_device(dev: Device) {
 /// the present path was therefore unreachable from a test on a machine with
 /// no GPU, which is every machine in CI.
 ///
-/// Note there is deliberately no *removal*: `DeviceList` is append-only, and
-/// `primary_display()` takes the first entry, so the first display a process
-/// registers is the one every later caller sees. A test-side emulation
-/// registers exactly one device and reprograms it instead (see
-/// `linux-object`'s `kms_emu`).
+/// Removal exists ([`remove_device_hosted`], and [`remove_device_hotplug`] on
+/// bare metal), but it is not for displays: `primary_display()` takes the
+/// FIRST entry, so the first display a process registers is the one every
+/// later caller sees, and taking it away mid-flight pulls the scanout target
+/// out from under the compositor. A test-side emulation registers exactly one
+/// device and reprograms it instead (see `linux-object`'s `kms_emu`).
 #[cfg(feature = "libos")]
 pub fn add_device_hosted(dev: Device) {
     DEVICES.add_device(dev)
@@ -184,6 +189,30 @@ pub fn add_device_hosted(dev: Device) {
 #[cfg(feature = "libos")]
 pub fn remove_device_hosted(dev: &Device) -> bool {
     DEVICES.remove_device(dev)
+}
+
+/// Register a device that appeared after the bus probe, and unregister it when
+/// it goes away. Installed into `zcore_drivers::hotplug` by
+/// [`install_hotplug_sink`]; a driver never calls these directly, because the
+/// dependency runs this way round (`kernel-hal` -> `zcore_drivers`).
+fn add_device_hotplug(dev: Device) {
+    DEVICES.add_device(dev)
+}
+
+/// See [`add_device_hotplug`]. Matches by identity, not by value.
+fn remove_device_hotplug(dev: &Device) -> bool {
+    DEVICES.remove_device(dev)
+}
+
+/// Let drivers register devices that appear later than the bus probe.
+///
+/// Called once from the per-architecture driver init. Until it runs, a driver
+/// that finds such a device is told so by `hotplug::add` returning `false`
+/// rather than silently dropping it: a USB disk enumerated before this point
+/// would otherwise be a disk the driver thinks it published and nothing can
+/// open.
+pub fn install_hotplug_sink() {
+    zcore_drivers::hotplug::set_sink(add_device_hotplug, remove_device_hotplug);
 }
 
 /// Returns all devices which implement the [`BlockScheme`].

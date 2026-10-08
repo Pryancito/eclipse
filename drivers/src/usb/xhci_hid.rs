@@ -8,13 +8,13 @@
 //! **No cubierto:** Multi-TT, descriptores HID no boot, varios interfaces HID
 //! compuestos, USB3 recovery avanzado.
 
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 #[cfg(target_arch = "x86_64")]
 use core::arch::x86_64::{_mm_clflush, _mm_mfence};
 use core::hint::spin_loop;
 use core::ptr::{read_volatile, write_volatile};
-use core::sync::atomic::{fence, AtomicBool, Ordering};
+use core::sync::atomic::{fence, AtomicBool, AtomicU64, Ordering};
 
 use lock::Mutex;
 use pci::PCIDevice;
@@ -25,7 +25,7 @@ use crate::bus::pci_drivers::PciDriver;
 use crate::bus::{phys_to_virt, PAGE_SIZE};
 use crate::input::input_event_codes::{abs::*, ev::*, input_prop::*, key::*, rel::*, syn::*};
 use crate::prelude::{AbsInfo, CapabilityType, InputCapability, InputEvent, InputEventType};
-use crate::scheme::{impl_event_scheme, InputScheme, IrqScheme, Scheme};
+use crate::scheme::{impl_event_scheme, BlockScheme, InputScheme, IrqScheme, Scheme};
 use crate::utils::EventListener;
 use crate::{Device, DeviceError, DeviceResult};
 use pci::BAR;
@@ -307,6 +307,25 @@ impl DmaBuf {
         unsafe {
             core::ptr::copy_nonoverlapping((self.virt + off) as *const u8, dst.as_mut_ptr(), n);
         }
+    }
+
+    /// Pareja de `read_into`: mete `src` en el bufer y devuelve cuantos bytes
+    /// entraron de verdad.
+    ///
+    /// Devuelve la cuenta en vez de `()` a proposito. Si el bufer se queda
+    /// corto, una escritura que no se enterase mandaria al disco un CBW que
+    /// dice «un sector» con medio sector de datos viejos detras, y el disco lo
+    /// escribiria sin protestar. Quien llama compara y aborta.
+    #[must_use]
+    fn write_from(&self, off: usize, src: &[u8]) -> usize {
+        let n = src.len().min(self.len.saturating_sub(off));
+        if n == 0 {
+            return 0;
+        }
+        unsafe {
+            core::ptr::copy_nonoverlapping(src.as_ptr(), (self.virt + off) as *mut u8, n);
+        }
+        n
     }
 
     fn sub_phys(&self, off: usize) -> u64 {
@@ -2292,6 +2311,16 @@ pub struct XhciInner {
     devs: Vec<UsbDev>,
     /// Unidades de almacenamiento masivo que respondieron.
     mscs: Vec<MscDev>,
+    /// Unidades que ya contestaron su capacidad y estan por dar de alta como
+    /// disco, y discos dados de alta que estan por dar de baja.
+    ///
+    /// Las dos cosas se hacen FUERA del cerrojo de este controlador: dar de
+    /// alta toca las listas de `kernel-hal`, y encadenar ese cerrojo con este
+    /// es como se montan los ciclos que ya han parado esta maquina. Asi que
+    /// quien descubre la unidad solo la apunta aqui, y `drain_disk_changes` la
+    /// recoge cuando no tiene nada cogido.
+    pending_disk_regs: Vec<u64>,
+    pending_disk_unregs: Vec<Arc<UsbDisk>>,
     /// Hubs ya configurados, en el orden en que se enumeraron.
     hubs: Vec<HubDev>,
     /// `(slot del hub, puerto)` que un endpoint de cambio de estado ha
@@ -2323,6 +2352,26 @@ struct MscDev {
     capacity: Option<ScsiCapacity>,
     /// Etiqueta de la siguiente orden. Cada una tiene que llevar la suya.
     next_tag: u32,
+    /// Identidad estable de ESTA unidad, que no es su `slot`.
+    ///
+    /// Los slots se reutilizan: desenchufar un pendrive y enchufar otro en el
+    /// mismo puerto puede devolver el mismo numero de slot. Un `UsbDisk` que
+    /// guardase el slot leeria del disco nuevo creyendo que es el viejo, con
+    /// el cache de bloques del sistema de archivos del viejo encima. Asi que lo
+    /// que guarda es este contador, que no se reutiliza nunca.
+    disk_id: u64,
+    /// El disco de bloques dado de alta, mientras lo este. `None` en una unidad
+    /// sin medio dentro (un lector de tarjetas vacio) o que no llego a
+    /// contestar su capacidad.
+    disk: Option<Arc<UsbDisk>>,
+    /// Bufer de rebote para las fases de datos, creado en el primer acceso.
+    ///
+    /// Lo que entrega el sistema de archivos es un `&[u8]` cualquiera, que no
+    /// tiene por que ser contiguo en fisico ni estar donde el controlador pueda
+    /// llegar, asi que todo pasa por aqui. Vive en la unidad y no en cada
+    /// llamada porque pedirselo al asignador de DMA en cada lectura de disco es
+    /// lo contrario de lo que hace un camino de E/S.
+    bounce: Option<DmaBuf>,
 }
 
 /// Cuanto se espera por una transferencia bulk. Una unidad que acaba de
@@ -2517,6 +2566,69 @@ const SCSI_INQUIRY: u8 = 0x12;
 const SCSI_READ_CAPACITY_10: u8 = 0x25;
 const SCSI_SERVICE_ACTION_IN_16: u8 = 0x9e;
 const SCSI_SAI_READ_CAPACITY_16: u8 = 0x10;
+/// Lo mas que cabe en el campo de longitud de un TRB Normal (xHCI §6.4.1.1).
+///
+/// El parametro de `trb_normal` es un `u16` y el campo son 17 bits, asi que
+/// pedir 64 KiB justos daria longitud 0: una peticion que hay que partir, no
+/// recortar. Con bloques de 512 son 127 bloques por vuelta.
+const MSC_MAX_TRB_LEN: u32 = 65_535;
+/// Tamano del bufer de rebote de cada unidad. Tiene que cubrir una vuelta
+/// entera de `MSC_MAX_TRB_LEN`.
+const MSC_BOUNCE_BYTES: usize = 64 * 1024;
+/// Identidad que se le da a la siguiente unidad. Ver `MscDev::disk_id`.
+static NEXT_DISK_ID: AtomicU64 = AtomicU64::new(1);
+
+const SCSI_READ_10: u8 = 0x28;
+const SCSI_WRITE_10: u8 = 0x2a;
+const SCSI_SYNCHRONIZE_CACHE_10: u8 = 0x35;
+
+/// READ(10) / WRITE(10) (SBC-3 §5.10 y §5.32).
+///
+/// Devuelve `None` en vez de recortar cuando la peticion no cabe en el CDB: el
+/// LBA son cuatro bytes y la cuenta dos, asi que una peticion mas alla de
+/// 2 TiB o de 65535 bloques no se puede expresar. Recortarla silenciosamente
+/// escribiria en el sitio equivocado o dejaria media escritura hecha, y las
+/// dos cosas corrompen el sistema de archivos; quien llama tiene que partirla.
+fn scsi_rw10(op: u8, lba: u64, blocks: u32) -> Option<[u8; 10]> {
+    if blocks == 0 || blocks > u16::MAX as u32 || lba > u32::MAX as u64 {
+        return None;
+    }
+    let l = (lba as u32).to_be_bytes();
+    let n = (blocks as u16).to_be_bytes();
+    Some([op, 0, l[0], l[1], l[2], l[3], 0, n[0], n[1], 0])
+}
+
+/// SYNCHRONIZE CACHE(10) de toda la unidad (SBC-3 §5.26).
+///
+/// Cuenta de bloques 0 es «desde el LBA dado hasta el final», que es justo lo
+/// que quiere un `flush()`, y es el unico sitio donde el cero no es un error.
+fn scsi_sync_cache10() -> [u8; 10] {
+    [SCSI_SYNCHRONIZE_CACHE_10, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+}
+
+/// La fase de datos de una orden de disco, y en que sentido va.
+///
+/// Un solo enum en vez de dos metodos casi iguales, y sobre todo en vez de un
+/// `&mut [u8]` para los dos sentidos: una escritura recibe un `&[u8]` del
+/// sistema de archivos, y obligarla a copiarlo a un `Vec` mutable solo para
+/// encajar en la firma anade una copia de cada sector escrito.
+enum MscData<'a> {
+    Read(&'a mut [u8]),
+    Write(&'a [u8]),
+}
+
+impl MscData<'_> {
+    fn len(&self) -> usize {
+        match self {
+            Self::Read(d) => d.len(),
+            Self::Write(d) => d.len(),
+        }
+    }
+
+    fn is_write(&self) -> bool {
+        matches!(self, Self::Write(_))
+    }
+}
 
 /// Un Command Block Wrapper (USB MSC BOT §5.1): los 31 bytes que abren cada
 /// orden SCSI sobre el endpoint bulk OUT.
@@ -2872,6 +2984,8 @@ impl XhciInner {
             pending_ep_resets: Vec::new(),
             devs: Vec::new(),
             mscs: Vec::new(),
+            pending_disk_regs: Vec::new(),
+            pending_disk_unregs: Vec::new(),
             hubs: Vec::new(),
             pending_hub_ports: Vec::new(),
             boot_enum_pending: true,
@@ -4564,6 +4678,19 @@ impl XhciInner {
     /// de cero cuando la orden llego y la unidad la rechazo, que son dos cosas
     /// muy distintas y mezclarlas convierte «no hay tarjeta metida» en «el
     /// dispositivo no funciona».
+    /// Devuelve el bufer de rebote a su unidad, o lo pierde si la unidad ya no
+    /// esta en la lista.
+    ///
+    /// Indexar seria un panico el dia en que la lista pueda cambiar durante una
+    /// orden, y liberar el bufer cuando no hay a quien devolverlo es peor que
+    /// perderlo: el controlador puede seguir mirandolo.
+    fn return_bounce(&mut self, idx: usize, bounce: DmaBuf) {
+        match self.mscs.get_mut(idx) {
+            Some(m) => m.bounce = Some(bounce),
+            None => bounce.leak(),
+        }
+    }
+
     fn msc_command(
         &mut self,
         idx: usize,
@@ -4635,12 +4762,132 @@ impl XhciInner {
         Ok((moved, csw.status))
     }
 
+    /// Una tanda de READ(10) o WRITE(10) sobre la unidad `disk_id`, partida en
+    /// las vueltas que quepan en un TRB.
+    ///
+    /// `first_block` y la longitud van en bloques del DISPOSITIVO, no en
+    /// sectores de 512: esa traduccion la hace [`UsbDisk`], que es quien sabe
+    /// que el resto del kernel cuenta de 512 en 512.
+    fn msc_rw(&mut self, disk_id: u64, first_block: u64, mut data: MscData<'_>) -> DeviceResult {
+        let Some(idx) = self.mscs.iter().position(|m| m.disk_id == disk_id) else {
+            // La unidad se fue mientras alguien tenia el disco abierto. Eso no
+            // es un error del llamante y no es lo mismo que una E/S fallida.
+            return Err(DeviceError::NotReady);
+        };
+        let (slot, bs, dev_blocks) = {
+            let m = &self.mscs[idx];
+            let cap = m.capacity.ok_or(DeviceError::NotReady)?;
+            (
+                m.slot,
+                cap.block_size as usize,
+                cap.last_lba.saturating_add(1),
+            )
+        };
+        if bs == 0 {
+            return Err(DeviceError::NotSupported);
+        }
+        let len = data.len();
+        if len == 0 || !len.is_multiple_of(bs) {
+            return Err(DeviceError::InvalidParam);
+        }
+        let total = len / bs;
+        // El final tiene que caber en el disco. Sin esto, leer el ultimo sector
+        // con un bufer de mas se convierte en un LBA fuera de rango, y la
+        // unidad contesta un error que arriba se lee como disco roto en vez de
+        // como peticion mal hecha.
+        if first_block
+            .checked_add(total as u64)
+            .is_none_or(|end| end > dev_blocks)
+        {
+            return Err(DeviceError::InvalidParam);
+        }
+
+        let bounce = match self.mscs[idx].bounce.take() {
+            Some(b) => b,
+            None => DmaBuf::new(MSC_BOUNCE_BYTES, 64)?,
+        };
+        // Lo que cabe en una vuelta: el campo del TRB y el bufer, los dos
+        // redondeados HACIA ABAJO a un bloque entero, porque medio bloque no es
+        // una peticion valida.
+        let per_turn = ((MSC_MAX_TRB_LEN as usize).min(bounce.len) / bs).max(1);
+        let write = data.is_write();
+        let op = if write { SCSI_WRITE_10 } else { SCSI_READ_10 };
+
+        let mut done = 0usize; // en bloques del dispositivo
+        while done < total {
+            let turn = per_turn.min(total - done);
+            let bytes = turn * bs;
+            let off = done * bs;
+
+            if let MscData::Write(src) = &data {
+                if bounce.write_from(0, &src[off..off + bytes]) != bytes {
+                    self.return_bounce(idx, bounce);
+                    return Err(DeviceError::BufferTooSmall);
+                }
+            }
+            let Some(cdb) = scsi_rw10(op, first_block + done as u64, turn as u32) else {
+                self.return_bounce(idx, bounce);
+                return Err(DeviceError::InvalidParam);
+            };
+            match self.msc_command(idx, &cdb, Some((&bounce, bytes as u32, !write))) {
+                Ok((moved, 0)) if moved as usize == bytes => {}
+                Ok((moved, status)) => {
+                    // La orden llego y la unidad no la hizo, o la hizo a
+                    // medias. Un `Ok` aqui dejaria datos sin escribir, o un
+                    // bufer medio lleno de ceros creyendose un sector leido.
+                    warn!(
+                        "[xhci] disco slot={} {} lba={} bloques={}: CSW status={} movidos={}/{}",
+                        slot,
+                        if write { "WRITE" } else { "READ" },
+                        first_block + done as u64,
+                        turn,
+                        status,
+                        moved,
+                        bytes
+                    );
+                    self.return_bounce(idx, bounce);
+                    return Err(DeviceError::IoError);
+                }
+                Err(e) => {
+                    // El transporte fallo: el controlador puede seguir
+                    // escribiendo en el bufer de rebote, asi que ese bufer no
+                    // vuelve ni a la unidad ni al asignador. Mismo criterio que
+                    // el resto de la DMA de este driver.
+                    bounce.leak();
+                    return Err(e);
+                }
+            }
+            if let MscData::Read(dst) = &mut data {
+                bounce.read_into(0, &mut dst[off..off + bytes]);
+            }
+            done += turn;
+        }
+        self.return_bounce(idx, bounce);
+        Ok(())
+    }
+
+    /// SYNCHRONIZE CACHE(10): que la unidad baje su cache volatil al medio.
+    fn msc_flush(&mut self, disk_id: u64) -> DeviceResult {
+        let Some(idx) = self.mscs.iter().position(|m| m.disk_id == disk_id) else {
+            return Err(DeviceError::NotReady);
+        };
+        match self.msc_command(idx, &scsi_sync_cache10(), None) {
+            // Un pendrive sin cache de escritura contesta que no conoce la
+            // orden, y eso no es un fallo: no tiene nada que bajar. Por eso el
+            // status distinto de cero no se convierte en error aqui, al
+            // contrario que en una lectura.
+            Ok(_) => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
     /// Prepara una interfaz de almacenamiento masivo y le pregunta quien es.
     ///
-    /// No la registra como disco: eso necesita una via para dar de alta un
-    /// dispositivo de bloque en caliente, que hoy no existe. Lo que si hace es
-    /// contestar la pregunta de si el sistema ve la unidad, con su nombre y su
-    /// capacidad, en `/proc/usbhid`.
+    /// Tampoco la da de alta como disco aqui: solo la apunta en
+    /// `pending_disk_regs` cuando contesto su capacidad, y el alta la hace
+    /// `drain_disk_changes` fuera de este cerrojo. Pase lo que pase con el
+    /// alta, la unidad sale en `/proc/usbhid` con su nombre y su capacidad,
+    /// que es lo que contesta «¿ve el sistema mi pendrive?».
     fn setup_mass_storage(
         &mut self,
         slot: u8,
@@ -4687,6 +4934,15 @@ impl XhciInner {
         )?;
         // GET_MAX_LUN es opcional: un STALL significa una sola unidad logica.
         let max_lun = self.msc_max_lun(slot, iface).unwrap_or(0);
+        for m in self
+            .mscs
+            .iter_mut()
+            .filter(|m| m.slot == slot && m.iface == iface)
+        {
+            if let Some(d) = m.disk.take() {
+                self.pending_disk_unregs.push(d);
+            }
+        }
         self.mscs.retain(|m| !(m.slot == slot && m.iface == iface));
         self.mscs.push(MscDev {
             slot,
@@ -4697,6 +4953,9 @@ impl XhciInner {
             inquiry: ScsiInquiry::default(),
             capacity: None,
             next_tag: 1,
+            disk_id: NEXT_DISK_ID.fetch_add(1, Ordering::Relaxed),
+            disk: None,
+            bounce: None,
         });
         let idx = self.mscs.len() - 1;
         if subclass != MSC_SUBCLASS_SCSI {
@@ -4862,6 +5121,15 @@ impl XhciInner {
                     c.last_lba.saturating_add(1),
                     c.block_size
                 );
+                // Con capacidad ya es un disco. Sin ella no: un lector de
+                // tarjetas vacio contesta el INQUIRY y nada mas, y darlo de
+                // alta pondria en el sistema un disco de cero sectores que
+                // falla cada lectura.
+                if let Some(id) = self.mscs.get(idx).map(|m| m.disk_id) {
+                    if !self.pending_disk_regs.contains(&id) {
+                        self.pending_disk_regs.push(id);
+                    }
+                }
             }
         }
     }
@@ -6159,6 +6427,14 @@ impl XhciInner {
             }
             self.pending_hub_ports.retain(|&(s, _)| s != slot);
             self.devs.retain(|d| d.slot != slot);
+            // El disco se va con la unidad. Dejarlo dado de alta es peor que
+            // cosmetico: este slot se reasigna a lo siguiente que enchufen, y
+            // una lectura por la entrada vieja caeria en otro dispositivo.
+            for m in self.mscs.iter_mut().filter(|m| m.slot == slot) {
+                if let Some(d) = m.disk.take() {
+                    self.pending_disk_unregs.push(d);
+                }
+            }
             self.mscs.retain(|m| m.slot != slot);
             for ep in 1..32 {
                 let ri = Self::ri(slot, ep);
@@ -6454,6 +6730,123 @@ fn emit_keyboard_delta(
     *new_k
 }
 
+/// Un disco USB dado de alta como dispositivo de bloque.
+///
+/// El resto del kernel cuenta en sectores de 512 (ver `BlockScheme`) y la
+/// unidad direcciona en bloques suyos, que en un disco externo pueden ser de
+/// 4096. La traduccion vive aqui, y es la razon de que esta capa exista en vez
+/// de llamar a `msc_rw` desde fuera.
+pub struct UsbDisk {
+    /// El controlador, en debil: el disco lo tiene el sistema de archivos y
+    /// puede sobrevivir al controlador. Un `Arc` aqui seria un ciclo.
+    ctrl: Weak<XhciUsbHid>,
+    /// Ver `MscDev::disk_id`. Lo que NO se guarda aqui es el slot.
+    disk_id: u64,
+    name: alloc::string::String,
+    /// Bloques del dispositivo y su tamano, tal cual los dio READ CAPACITY.
+    dev_blocks: u64,
+    dev_block_size: u32,
+}
+
+impl UsbDisk {
+    /// Con el controlador cogido, una tanda en bloques del dispositivo.
+    fn with_inner<F, R>(&self, f: F) -> DeviceResult<R>
+    where
+        F: FnOnce(&mut XhciInner) -> DeviceResult<R>,
+    {
+        let ctrl = self.ctrl.upgrade().ok_or(DeviceError::NotReady)?;
+        let mut g = ctrl.inner.lock();
+        let xi = g.as_mut().ok_or(DeviceError::NotReady)?;
+        f(xi)
+    }
+
+    /// El rango de bloques del dispositivo que cubre `[byte_off, byte_off+len)`,
+    /// y el desplazamiento dentro del primero.
+    ///
+    /// Con bloques de 512 esto es la identidad; existe por los discos de 4096,
+    /// donde un sector de 512 del kernel es un cuarto de bloque y pedirle a la
+    /// unidad «el bloque 7» cuando el kernel dijo «el sector 7» lee 4 KiB del
+    /// sitio equivocado.
+    fn dev_span(&self, byte_off: u64, len: usize) -> Option<(u64, usize, usize)> {
+        let bs = self.dev_block_size as u64;
+        if bs == 0 || len == 0 {
+            return None;
+        }
+        let first = byte_off / bs;
+        let last = byte_off.checked_add(len as u64 - 1)? / bs;
+        let nblocks = (last - first + 1) as usize;
+        Some((first, nblocks, (byte_off % bs) as usize))
+    }
+}
+
+impl Scheme for UsbDisk {
+    fn name(&self) -> &str {
+        &self.name
+    }
+}
+
+impl BlockScheme for UsbDisk {
+    fn read_block(&self, block_id: usize, buf: &mut [u8]) -> DeviceResult {
+        if buf.is_empty() || !buf.len().is_multiple_of(512) {
+            return Err(DeviceError::InvalidParam);
+        }
+        let byte_off = (block_id as u64)
+            .checked_mul(512)
+            .ok_or(DeviceError::InvalidParam)?;
+        let (first, nblocks, skip) = self
+            .dev_span(byte_off, buf.len())
+            .ok_or(DeviceError::InvalidParam)?;
+        let bs = self.dev_block_size as usize;
+        if skip == 0 && buf.len() == nblocks * bs {
+            // El caso de siempre: 512 por bloque, o una peticion que ya cae en
+            // bloques enteros. Sin copia intermedia.
+            return self.with_inner(|xi| xi.msc_rw(self.disk_id, first, MscData::Read(buf)));
+        }
+        let mut stage = alloc::vec![0u8; nblocks * bs];
+        self.with_inner(|xi| xi.msc_rw(self.disk_id, first, MscData::Read(&mut stage)))?;
+        buf.copy_from_slice(&stage[skip..skip + buf.len()]);
+        Ok(())
+    }
+
+    fn write_block(&self, block_id: usize, buf: &[u8]) -> DeviceResult {
+        if buf.is_empty() || !buf.len().is_multiple_of(512) {
+            return Err(DeviceError::InvalidParam);
+        }
+        let byte_off = (block_id as u64)
+            .checked_mul(512)
+            .ok_or(DeviceError::InvalidParam)?;
+        let (first, nblocks, skip) = self
+            .dev_span(byte_off, buf.len())
+            .ok_or(DeviceError::InvalidParam)?;
+        let bs = self.dev_block_size as usize;
+        if skip == 0 && buf.len() == nblocks * bs {
+            return self.with_inner(|xi| xi.msc_rw(self.disk_id, first, MscData::Write(buf)));
+        }
+        // Bloque del dispositivo mas grande que la peticion: hay que leer,
+        // modificar y escribir. Escribir el bloque entero con el resto a ceros
+        // se lleva por delante los sectores vecinos, que en una tabla de
+        // particiones son la tabla.
+        let mut stage = alloc::vec![0u8; nblocks * bs];
+        self.with_inner(|xi| xi.msc_rw(self.disk_id, first, MscData::Read(&mut stage)))?;
+        stage[skip..skip + buf.len()].copy_from_slice(buf);
+        self.with_inner(|xi| xi.msc_rw(self.disk_id, first, MscData::Write(&stage)))
+    }
+
+    fn flush(&self) -> DeviceResult {
+        self.with_inner(|xi| xi.msc_flush(self.disk_id))
+    }
+
+    fn block_count(&self) -> usize {
+        // En sectores de 512, que es lo que cuenta `block_id`.
+        let bs = self.dev_block_size.max(512) as u64;
+        self.dev_blocks.saturating_mul(bs / 512) as usize
+    }
+
+    fn logical_block_size(&self) -> usize {
+        (self.dev_block_size as usize).max(512)
+    }
+}
+
 pub struct XhciUsbHid {
     listener: EventListener<InputEvent>,
     inner: Mutex<Option<XhciInner>>,
@@ -6497,6 +6890,88 @@ pub fn set_poll_instance(dev: Option<Arc<XhciUsbHid>>) {
 /// (io-wait ticks poll HID); the HID path draws the cursor, which takes the
 /// framebuffer lock. Two orders, one cycle. `try_lock` here breaks it at the
 /// only point where blocking buys nothing at all.
+/// Publica los discos que se enchufaron y retira los que se fueron.
+///
+/// Se llama SIN el cerrojo del controlador cogido, y lo coge ella sola el
+/// tiempo justo de vaciar las dos colas. Dar de alta un dispositivo entra en
+/// las listas de `kernel-hal`, y encadenar ese cerrojo con el del controlador
+/// --que ademas toca un manejador de interrupcion-- es la forma de montar un
+/// ciclo. Por eso las colas existen en vez de llamar a `hotplug` desde dentro
+/// de `msc_identify`.
+fn drain_disk_changes(dev: &Arc<XhciUsbHid>) {
+    let mut to_add: Vec<(u64, u64, u32, alloc::string::String)> = Vec::new();
+    let mut to_remove: Vec<Arc<UsbDisk>> = Vec::new();
+    {
+        let Some(mut g) = dev.inner.try_lock() else {
+            // Otro ya lo tiene. Las colas siguen ahi para la vuelta siguiente;
+            // no se pierde nada por no insistir ahora.
+            return;
+        };
+        let Some(xi) = g.as_mut() else {
+            return;
+        };
+        to_remove.append(&mut xi.pending_disk_unregs);
+        for id in core::mem::take(&mut xi.pending_disk_regs) {
+            let Some(m) = xi.mscs.iter().find(|m| m.disk_id == id) else {
+                continue; // se fue entre que se apunto y ahora
+            };
+            let Some(cap) = m.capacity else {
+                continue;
+            };
+            let name = alloc::format!("usbdisk{}", id);
+            to_add.push((id, cap.last_lba.saturating_add(1), cap.block_size, name));
+        }
+    }
+
+    for d in to_remove {
+        let name = d.name.clone();
+        if crate::hotplug::remove(&crate::Device::Block(d)) {
+            info!("[xhci] disco {} dado de baja", name);
+        }
+    }
+    for (id, dev_blocks, dev_block_size, name) in to_add {
+        let disk = Arc::new(UsbDisk {
+            ctrl: Arc::downgrade(dev),
+            disk_id: id,
+            name: name.clone(),
+            dev_blocks,
+            dev_block_size,
+        });
+        // Se guarda la MISMA `Arc` que se da de alta: la baja es por identidad,
+        // asi que una copia equivalente no serviria para retirarla.
+        if !crate::hotplug::add(crate::Device::Block(disk.clone())) {
+            continue;
+        }
+        let Some(mut g) = dev.inner.try_lock() else {
+            // Dado de alta y sin poder anotarlo: hay que retirarlo, o se queda
+            // en el sistema un disco que ningun desenchufe podra quitar.
+            let _ = crate::hotplug::remove(&crate::Device::Block(disk));
+            warn!("[xhci] {}: no se pudo anotar el disco; se retira", name);
+            continue;
+        };
+        match g.as_mut().and_then(|xi| {
+            xi.mscs
+                .iter_mut()
+                .find(|m| m.disk_id == id)
+                .map(|m| m.disk = Some(disk.clone()))
+        }) {
+            Some(()) => info!(
+                "[xhci] disco {} dado de alta: {} sectores de 512 B",
+                name,
+                disk.block_count()
+            ),
+            None => {
+                drop(g);
+                let _ = crate::hotplug::remove(&crate::Device::Block(disk));
+                warn!(
+                    "[xhci] {}: la unidad se fue al darla de alta; se retira",
+                    name
+                );
+            }
+        }
+    }
+}
+
 pub fn poll() {
     let Some(instances) = POLL_INSTANCES.try_lock().map(|g| g.clone()) else {
         return;
@@ -6576,6 +7051,9 @@ pub fn poll() {
             xi.process_irq_events(Some(&d.listener), true);
             d.refresh_role_flags(xi);
         }
+        // Fuera del cerrojo, a proposito: ver `drain_disk_changes`.
+        drop(g);
+        drain_disk_changes(&d);
     }
 }
 
@@ -6619,6 +7097,12 @@ impl XhciUsbHid {
             has_tablet_flag,
         });
         set_poll_instance(Some(arc.clone()));
+        // La enumeracion de arranba de arriba corrio antes de que existiera
+        // esta `Arc`, asi que un pendrive que ya estuviera enchufado al
+        // encender esta apuntado y sin publicar. Publicarlo aqui es lo que
+        // hace que un arranque con el disco puesto se vea igual que
+        // enchufarlo despues.
+        drain_disk_changes(&arc);
         Ok(arc)
     }
 
@@ -6877,16 +7361,29 @@ impl InputScheme for XhciUsbHid {
             );
             match m.capacity {
                 Some(c) => {
-                    let _ = writeln!(
+                    let _ = write!(
                         s,
-                        "sectors512={} blocks={} block_size={}",
+                        "sectors512={} blocks={} block_size={} ",
                         scsi_sectors_512(&c),
                         c.last_lba.saturating_add(1),
                         c.block_size
                     );
                 }
                 None => {
-                    let _ = writeln!(s, "cap=none");
+                    let _ = write!(s, "cap=none ");
+                }
+            }
+            // Lo PRIMERO que hay que mirar cuando una unidad sale aqui y en
+            // `/dev` no hay nada: `disk=-` es que el alta no se hizo (sin
+            // capacidad, o sin destino de hotplug instalado todavia), y
+            // `disk=<nombre>` es que el dispositivo de bloque existe y el
+            // problema esta mas arriba, en quien monta.
+            match m.disk.as_ref() {
+                Some(d) => {
+                    let _ = writeln!(s, "disk={}", d.name());
+                }
+                None => {
+                    let _ = writeln!(s, "disk=-");
                 }
             }
         }
@@ -9841,5 +10338,160 @@ mod hub_tests {
             .iter()
             .fold(0, |acc, &(bit, _)| acc | bit);
         assert_eq!(covered_ss, ss_defined);
+    }
+}
+
+#[cfg(test)]
+mod disk_tests {
+    use super::*;
+    use crate::scheme::BlockScheme;
+
+    /// Un disco de mentira: sin controlador detras (`Weak::new()` no sube
+    /// nunca), que es justo lo que hace falta para probar la aritmetica de
+    /// traduccion sin tocar hardware.
+    fn fake_disk(dev_blocks: u64, dev_block_size: u32) -> UsbDisk {
+        UsbDisk {
+            ctrl: Weak::new(),
+            disk_id: 1,
+            name: alloc::string::String::from("usbdisk-test"),
+            dev_blocks,
+            dev_block_size,
+        }
+    }
+
+    #[test]
+    fn el_cdb_de_read10_lleva_el_lba_y_la_cuenta_en_big_endian() {
+        // SBC-3 §5.10: LBA en los bytes 2..=5 y cuenta en 7..=8, los dos en
+        // big-endian. Con little-endian el disco lee de otro sitio y nadie
+        // avisa, asi que el orden se comprueba byte a byte.
+        let cdb = scsi_rw10(SCSI_READ_10, 0x0123_4567, 0x0abc).expect("cabe en el CDB");
+        assert_eq!(cdb[0], 0x28);
+        assert_eq!(&cdb[2..6], &[0x01, 0x23, 0x45, 0x67]);
+        assert_eq!(&cdb[7..9], &[0x0a, 0xbc]);
+        assert_eq!(cdb[9], 0, "byte de control");
+    }
+
+    #[test]
+    fn write10_solo_cambia_el_opcode() {
+        let r = scsi_rw10(SCSI_READ_10, 42, 8).unwrap();
+        let w = scsi_rw10(SCSI_WRITE_10, 42, 8).unwrap();
+        assert_eq!(w[0], 0x2a);
+        assert_eq!(r[1..], w[1..]);
+    }
+
+    #[test]
+    fn una_peticion_que_no_cabe_en_el_cdb_se_rechaza_no_se_recorta() {
+        // Las tres que no se pueden expresar. Recortarlas escribiria en el
+        // sitio equivocado o dejaria media escritura hecha.
+        assert!(scsi_rw10(SCSI_READ_10, 0, 65_536).is_none(), "cuenta > u16");
+        assert!(
+            scsi_rw10(SCSI_READ_10, u32::MAX as u64 + 1, 1).is_none(),
+            "LBA > u32"
+        );
+        assert!(scsi_rw10(SCSI_READ_10, 0, 0).is_none(), "cero bloques");
+        // Y el borde de los dos, que SI cabe.
+        assert!(scsi_rw10(SCSI_READ_10, u32::MAX as u64, 65_535).is_some());
+    }
+
+    #[test]
+    fn sync_cache_de_cero_bloques_es_hasta_el_final() {
+        let cdb = scsi_sync_cache10();
+        assert_eq!(cdb[0], 0x35);
+        // LBA 0 y cuenta 0: toda la unidad (SBC-3 §5.26).
+        assert_eq!(&cdb[2..6], &[0, 0, 0, 0]);
+        assert_eq!(&cdb[7..9], &[0, 0]);
+    }
+
+    #[test]
+    fn con_bloques_de_512_un_sector_del_kernel_es_un_bloque_de_la_unidad() {
+        let d = fake_disk(2048, 512);
+        assert_eq!(d.dev_span(0, 512), Some((0, 1, 0)));
+        assert_eq!(d.dev_span(512 * 7, 512), Some((7, 1, 0)));
+        assert_eq!(d.dev_span(512 * 7, 4096), Some((7, 8, 0)));
+        assert_eq!(d.block_count(), 2048);
+        assert_eq!(d.logical_block_size(), 512);
+    }
+
+    #[test]
+    fn con_bloques_de_4096_un_sector_del_kernel_es_un_cuarto_de_bloque() {
+        let d = fake_disk(1000, 4096);
+        // El sector 7 del kernel cae DENTRO del bloque 0 de la unidad, a 3584
+        // bytes del principio. Pedirle «el bloque 7» leeria 4 KiB de otro
+        // sitio.
+        assert_eq!(d.dev_span(512 * 7, 512), Some((0, 1, 3584)));
+        assert_eq!(d.dev_span(4096, 512), Some((1, 1, 0)));
+        // Una peticion a caballo de dos bloques son dos bloques.
+        assert_eq!(d.dev_span(512 * 7, 1024), Some((0, 2, 3584)));
+        // La capacidad se anuncia en sectores de 512, no en bloques.
+        assert_eq!(d.block_count(), 8000);
+        assert_eq!(d.logical_block_size(), 4096);
+    }
+
+    #[test]
+    fn un_buffer_que_no_es_multiplo_de_512_se_rechaza() {
+        // El convenio de `BlockScheme` es sectores de 512 enteros. Un bufer
+        // corto que pasara llegaria al disco como un CBW que promete un sector
+        // con medio sector detras.
+        let d = fake_disk(2048, 512);
+        let mut corto = [0u8; 500];
+        assert_eq!(
+            d.read_block(0, &mut corto).unwrap_err(),
+            DeviceError::InvalidParam
+        );
+        assert_eq!(
+            d.write_block(0, &corto).unwrap_err(),
+            DeviceError::InvalidParam
+        );
+        let mut vacio: [u8; 0] = [];
+        assert_eq!(
+            d.read_block(0, &mut vacio).unwrap_err(),
+            DeviceError::InvalidParam
+        );
+    }
+
+    #[test]
+    fn sin_controlador_detras_la_peticion_valida_dice_que_no_esta_listo() {
+        // Desenchufar no es un fallo de E/S: `NotReady` y no `IoError`, para
+        // que quien monta sepa que el disco se fue en vez de darlo por roto.
+        let d = fake_disk(2048, 512);
+        let mut buf = [0u8; 512];
+        assert_eq!(
+            d.read_block(0, &mut buf).unwrap_err(),
+            DeviceError::NotReady
+        );
+        assert_eq!(d.write_block(0, &buf).unwrap_err(), DeviceError::NotReady);
+        assert_eq!(d.flush().unwrap_err(), DeviceError::NotReady);
+    }
+
+    #[test]
+    fn la_fase_de_datos_sabe_su_longitud_y_su_sentido() {
+        let mut dst = [0u8; 1024];
+        assert_eq!(MscData::Read(&mut dst).len(), 1024);
+        assert!(!MscData::Read(&mut dst).is_write());
+        let src = [0u8; 512];
+        assert_eq!(MscData::Write(&src).len(), 512);
+        assert!(MscData::Write(&src).is_write());
+    }
+
+    #[test]
+    fn una_vuelta_cabe_en_un_trb_y_en_bloques_enteros() {
+        // La cuenta de `msc_rw`, con el bufer entero disponible.
+        for (bs, esperado) in [(512usize, 127usize), (4096, 15), (2048, 31)] {
+            let per_turn = ((MSC_MAX_TRB_LEN as usize).min(MSC_BOUNCE_BYTES) / bs).max(1);
+            assert_eq!(per_turn, esperado, "bloques de {bs}");
+            assert!(
+                per_turn * bs <= MSC_MAX_TRB_LEN as usize,
+                "una vuelta con bloques de {} no cabe en un TRB Normal",
+                bs
+            );
+            assert!(per_turn <= u16::MAX as usize);
+        }
+    }
+
+    #[test]
+    fn el_bufer_de_rebote_cubre_una_vuelta_entera() {
+        // Si el bufer fuese menor que el campo del TRB, `per_turn` saldria del
+        // bufer y la ultima vuelta copiaria menos de lo que promete el CBW.
+        assert!(MSC_BOUNCE_BYTES >= MSC_MAX_TRB_LEN as usize);
     }
 }
