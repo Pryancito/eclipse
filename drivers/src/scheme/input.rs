@@ -383,3 +383,127 @@ mod capability_tests {
         );
     }
 }
+
+/// Native `#[bench]` rows for the capability bitmap, which is the wire format
+/// of `EVIOCGBIT`. `cargo +nightly bench -p zcore-drivers -- input::benches`.
+///
+/// Nothing here touches hardware or an aperture, so unlike the display rows
+/// these figures are exact. What they bound is the per-ioctl cost of
+/// publishing a device's capabilities and the per-query cost of asking whether
+/// a code is in them -- the question `mouse.rs` asks before it believes a
+/// device is a usable pointer.
+#[cfg(test)]
+mod benches {
+    use super::*;
+    use test::{black_box, Bencher};
+
+    /// A device's worth of codes, spread across the words so no row measures
+    /// one hot cache line: two event types, three buttons, two axes, a wheel.
+    const CODES: &[u16] = &[0, 1, 272, 273, 274, 8, 1023, 63, 64];
+
+    fn full() -> InputCapability {
+        let mut cap = InputCapability::empty();
+        for code in 0..InputCapability::BITS {
+            cap.set(code);
+        }
+        cap
+    }
+
+    #[bench]
+    fn set_one_code(b: &mut Bencher) {
+        let mut cap = InputCapability::empty();
+        b.iter(|| cap.set(black_box(273)));
+    }
+
+    #[bench]
+    fn set_nine_codes(b: &mut Bencher) {
+        let mut cap = InputCapability::empty();
+        b.iter(|| cap.set_all(black_box(CODES)));
+    }
+
+    #[bench]
+    fn ask_for_one_code(b: &mut Bencher) {
+        let cap = full();
+        b.iter(|| black_box(cap.contains(black_box(273))));
+    }
+
+    /// A code the bitmap cannot hold: the `at` guard refuses before indexing.
+    /// Level with the row above means the bound that keeps an out-of-range
+    /// code from panicking the kernel costs nothing.
+    #[bench]
+    fn ask_for_a_code_past_the_bitmap(b: &mut Bencher) {
+        let cap = full();
+        b.iter(|| black_box(cap.contains(black_box(u16::MAX))));
+    }
+
+    /// What `mouse.rs` asks: nine codes, all present, so the loop runs to the
+    /// end.
+    #[bench]
+    fn ask_for_nine_codes_all_present(b: &mut Bencher) {
+        let cap = full();
+        b.iter(|| black_box(cap.contains_all(black_box(CODES))));
+    }
+
+    /// The same question answered no on the first code, which is the early
+    /// exit. The gap to the row above is what the other eight cost.
+    #[bench]
+    fn ask_for_nine_codes_with_the_first_missing(b: &mut Bencher) {
+        let cap = InputCapability::empty();
+        b.iter(|| black_box(cap.contains_all(black_box(CODES))));
+    }
+
+    /// `EVIOCGBIT` inbound: 128 bytes of solid ones decoded bit by bit, which
+    /// is 1024 trips through `set`. This is the whole cost of accepting a
+    /// device's capability bitmap, and it is paid once per `(device, event
+    /// type)` pair at probe -- never per event.
+    #[bench]
+    fn read_a_full_128_byte_bitmap(b: &mut Bencher) {
+        let wire = [0xffu8; 128];
+        b.iter(|| black_box(InputCapability::from_bitmap(black_box(&wire))));
+    }
+
+    /// The same 1024 trips with every bit clear, so `set` is never called. The
+    /// gap to the row above is what setting 1024 bits costs; this row is what
+    /// walking them costs whether they are set or not.
+    #[bench]
+    fn read_an_empty_128_byte_bitmap(b: &mut Bencher) {
+        let wire = [0x00u8; 128];
+        b.iter(|| black_box(InputCapability::from_bitmap(black_box(&wire))));
+    }
+
+    /// 8192 bytes, which is 65536 bits, clamped to the 1024 this bitmap holds.
+    /// Level with `read_a_full_128_byte_bitmap` is the point: the clamp means a
+    /// device that reports an enormous bitmap costs the same as one that
+    /// reports the right size, instead of walking 64512 codes past the end and
+    /// warning about every one. `virtio/input.rs` sizes this from a byte the
+    /// DEVICE writes.
+    #[bench]
+    fn read_an_eight_kilobyte_bitmap(b: &mut Bencher) {
+        let wire = [0xffu8; 8192];
+        b.iter(|| black_box(InputCapability::from_bitmap(black_box(&wire))));
+    }
+
+    #[bench]
+    fn read_an_empty_bitmap(b: &mut Bencher) {
+        b.iter(|| black_box(InputCapability::from_bitmap(black_box(&[]))));
+    }
+
+    /// `EVIOCGBIT` outbound: sixteen words to 128 little-endian bytes.
+    #[bench]
+    fn write_the_wire_form(b: &mut Bencher) {
+        let cap = full();
+        b.iter(|| black_box(cap.to_le_bytes()));
+    }
+
+    /// The floor for the two `contains` rows, which hand back a `bool`: a call
+    /// that decides nothing. A row level with this one is a row that measured
+    /// the call and not the work.
+    #[bench]
+    fn the_capability_floor(b: &mut Bencher) {
+        #[inline(never)]
+        fn nothing(code: u16) -> bool {
+            code != 0
+        }
+        b.iter(|| black_box(nothing(black_box(273))));
+    }
+}
