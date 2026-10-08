@@ -1425,18 +1425,22 @@ mod benches {
     /// an already-set flag.
     ///
     /// This row reads **below** the 0.6 ns floor, and that is the answer, not
-    /// a mistake: the function returns `()`, so `black_box` has nothing to
-    /// hold on to, and an acquire load of a static the loop never writes is
-    /// something the compiler is free to hoist out of it. Read it as "the
-    /// steady-state cost is one load, and not even a reliably repeated one",
-    /// which is the same thing the comment at the call site claims. What it
-    /// does NOT measure is the `compare_exchange` behind the load, which the
-    /// very first syscall of the boot pays once.
+    /// a mistake: the function returns `()`, so there is no value to hold on
+    /// to, and an acquire load of a static the loop never writes is something
+    /// the compiler is free to hoist out of it. Read it as "the steady-state
+    /// cost is one load, and not even a reliably repeated one", which is the
+    /// same thing the comment at the call site claims. What it does NOT
+    /// measure is the `compare_exchange` behind the load, which the very
+    /// first syscall of the boot pays once.
     #[bench]
     fn perf_accounting_ensure_registered(b: &mut Bencher) {
         // Warm it, so whatever is left of the row is the steady state.
         perf_accounting::ensure_registered();
-        b.iter(|| black_box(perf_accounting::ensure_registered()));
+        // Handed to `iter` as a function rather than wrapped in `black_box`:
+        // `ensure_registered` returns `()`, and black-boxing a unit is a
+        // no-op that only reads as if it did something. `Bencher::iter`
+        // black-boxes whatever the closure returns anyway.
+        b.iter(perf_accounting::ensure_registered);
     }
 
     /// A control: a function that decides nothing, takes a register and hands
