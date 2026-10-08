@@ -22,8 +22,13 @@
 //! arranque de la rootfs con busybox de init).
 
 use crate::arch::Arch;
-use crate::LinuxRootfs;
-use std::{fs, path::Path};
+use crate::{LinuxRootfs, PROJECT_DIR};
+use std::{
+    ffi::{OsStr, OsString},
+    fs,
+    io::Read,
+    path::Path,
+};
 
 /// La escotilla, por si alguien quiere a propósito una imagen incompleta.
 const ALLOW_INCOMPLETE: &str = "ECLIPSE_ALLOW_INCOMPLETE_ROOTFS";
@@ -33,6 +38,16 @@ const ALLOW_INCOMPLETE: &str = "ECLIPSE_ALLOW_INCOMPLETE_ROOTFS";
 const EM_X86_64: u16 = 62;
 const EM_AARCH64: u16 = 183;
 const EM_RISCV: u16 = 243;
+
+/// Lo que se devuelve cuando el fichero SI es un ELF pero no uno de los
+/// nuestros: clase distinta de ELF64 o big endian. No es `None` --- «no es un
+/// ELF» se salta en silencio, y esto no se salta: ninguna maquina esperada
+/// vale `u16::MAX`, asi que sale en el informe.
+///
+/// El caso concreto que lo hizo falta: RV32 y RV64 comparten `EM_RISCV`, asi
+/// que mirando solo la maquina un binario de 32 bits pasaba por bueno en una
+/// rootfs de riscv64.
+const MACHINE_RARA: u16 = u16::MAX;
 
 /// Lo que cada binario de la rootfs tiene que declarar para este arco.
 pub(super) const fn expected_machine(arch: Arch) -> u16 {
@@ -52,28 +67,63 @@ fn machine_name(machine: u16) -> &'static str {
         EM_RISCV => "riscv",
         3 => "i386",
         40 => "arm",
+        MACHINE_RARA => "una clase o endianness que no construimos",
         _ => "desconocida",
     }
 }
 
 /// Lee el `e_machine` de un fichero, o `None` si no es un ELF.
 ///
-/// Solo mira los 20 primeros bytes: el número mágico, la clase (que tiene que
-/// ser ELF64 en los tres arcos que soportamos) y la máquina. Un script, una
-/// imagen o un fichero de texto no son un ELF y se saltan sin ruido --- no es
-/// un error que `/etc/profile` no tenga cabecera.
+/// Lee **solo los 20 primeros bytes**, no el fichero entero: esto lo llama
+/// `check_elf_machines` por cada fichero regular de la rootfs, y una rootfs de
+/// escritorio lleva firmware y assets de cientos de MB que no hay por que
+/// cargar en memoria para mirar una cabecera.
+///
+/// Un script, una imagen o un fichero de texto no son un ELF y se saltan sin
+/// ruido --- no es un error que `/etc/profile` no tenga cabecera. Lo que si es
+/// un ELF pero no de los nuestros (ELF32, big endian) sale como
+/// [`MACHINE_RARA`] y se reporta.
 pub(super) fn elf_machine(path: &Path) -> Option<u16> {
-    let bytes = fs::read(path).ok()?;
-    if bytes.len() < 20 || &bytes[..4] != b"\x7fELF" {
+    let mut header = [0u8; 20];
+    fs::File::open(path).ok()?.read_exact(&mut header).ok()?;
+    if &header[..4] != b"\x7fELF" {
         return None;
     }
-    // EI_DATA: 1 = little endian, que es lo único que construimos. Un ELF big
-    // endian aquí ya sería la anomalía que buscamos, así que no se salta: se
-    // devuelve una máquina que no va a coincidir con ninguna esperada.
-    if bytes[5] != 1 {
-        return Some(u16::MAX);
+    // EI_CLASS: 2 = ELF64, y los tres arcos que soportamos son de 64 bits.
+    // EI_DATA: 1 = little endian, que es lo unico que construimos.
+    if header[4] != 2 || header[5] != 1 {
+        return Some(MACHINE_RARA);
     }
-    Some(u16::from_le_bytes([bytes[18], bytes[19]]))
+    Some(u16::from_le_bytes([header[18], header[19]]))
+}
+
+/// Los `.pub` que hay en un directorio, por nombre.
+fn claves_pub(dir: &Path) -> Vec<OsString> {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    entries
+        .filter_map(Result::ok)
+        .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("pub"))
+        .map(|e| e.file_name())
+        .collect()
+}
+
+/// Los nombres de clave que ESTE arco necesita: los `.pub` de
+/// `tools/apk/keys/<arco>/` y `prebuilt/alpine-apk-keys/<arco>/`, que son
+/// exactamente los que `install_apk_keys` cuenta como «del arco».
+///
+/// Sale vacio si no hay fuente de la que sacarlos, y entonces no se exige
+/// nada: el verificador no puede inventarse el nombre de una clave de Alpine.
+fn claves_del_arco(arch: &str) -> Vec<OsString> {
+    let mut out = Vec::new();
+    for base in [
+        PROJECT_DIR.join("tools").join("apk").join("keys"),
+        PROJECT_DIR.join("prebuilt").join("alpine-apk-keys"),
+    ] {
+        out.extend(claves_pub(&base.join(arch)));
+    }
+    out
 }
 
 /// Un problema encontrado en la rootfs, con la frase que se le enseña a quien
@@ -199,15 +249,33 @@ impl LinuxRootfs {
         }
 
         let keys = etc_apk.join("keys");
-        let n = fs::read_dir(&keys)
-            .map(|d| d.filter_map(Result::ok).count())
-            .unwrap_or(0);
-        if n == 0 {
+        let instaladas = claves_pub(&keys);
+        if instaladas.is_empty() {
             out.push(Problem(
-                "/etc/apk/keys esta vacio: apk dice UNTRUSTED signature y no instala nada, \
-                 en silencio"
+                "/etc/apk/keys no tiene una sola clave .pub: apk dice UNTRUSTED signature y no \
+                 instala nada, en silencio"
                     .into(),
             ));
+            return out;
+        }
+
+        // Que el directorio tenga ALGO no basta, y es justo el caso que
+        // `install_apk_keys` avisa y nadie lee: con las claves de otro arco
+        // ahi dentro el contador sale distinto de cero, nadie pasa
+        // `--allow-untrusted`, y apk se encuentra el APKINDEX del objetivo
+        // firmado por una clave que no tiene. Asi que se exige por NOMBRE una
+        // de las del arco.
+        let necesarias = claves_del_arco(self.0.name());
+        if !necesarias.is_empty() && !necesarias.iter().any(|k| instaladas.contains(k)) {
+            out.push(Problem(format!(
+                "/etc/apk/keys tiene {} clave(s) pero ninguna de {}: el APKINDEX de {} saldra \
+                 «UNTRUSTED signature» y no se instalara ni un paquete. Las de cada arco van en \
+                 tools/apk/keys/{}/",
+                instaladas.len(),
+                self.0.name(),
+                self.0.name(),
+                self.0.name(),
+            )));
         }
         out
     }
@@ -238,6 +306,16 @@ impl LinuxRootfs {
                     name.to_str(),
                     Some("libc-test") | Some("other-test") | Some("proc") | Some("sys")
                 ) {
+                    continue;
+                }
+                // `lib/firmware/` no es userspace del objetivo: son blobs para
+                // el procesador de un periferico. El `gsp.bin` de la GSP es un
+                // ELF de RISC-V, y lo instala `image()` DESPUES de verificar,
+                // asi que la siguiente construccion --- que preserva la rootfs
+                // --- lo encontraria y enrojeceria una imagen de x86_64
+                // perfectamente sana. Dicho de otra forma: sin esto, el
+                // verificador pasa la primera vez y falla la segunda.
+                if name == "firmware" && dir.file_name() == Some(OsStr::new("lib")) {
                     continue;
                 }
                 // `file_type()` de `read_dir` NO sigue los enlaces, asi que un
@@ -403,8 +481,19 @@ mod tests {
         let apk = root.join("etc").join("apk");
         fs::create_dir_all(apk.join("keys")).unwrap();
         fs::write(apk.join("arch"), format!("{}\n", arch.name())).unwrap();
-        fs::write(apk.join("keys").join("una.rsa.pub"), b"clave").unwrap();
+        // Una clave DE ESTE ARCO, con su nombre de verdad: con cualquier otro
+        // nombre la rootfs no estaria sana, que es justo lo que ahora se mira.
+        fs::write(apk.join("keys").join(clave_del_arco(arch)), b"clave").unwrap();
         root
+    }
+
+    /// El nombre de una clave real del arco, sacado del arbol como lo hace el
+    /// verificador.
+    fn clave_del_arco(arch: Arch) -> OsString {
+        claves_del_arco(arch.name())
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| panic!("tools/apk/keys/{}/ sin claves .pub", arch.name()))
     }
 
     #[test]
@@ -471,12 +560,105 @@ mod tests {
             root.join("etc")
                 .join("apk")
                 .join("keys")
-                .join("una.rsa.pub"),
+                .join(clave_del_arco(Arch::X86_64)),
         )
         .unwrap();
         let p = r.check_apk(&root);
         assert_eq!(p.len(), 1);
         assert!(p[0].0.contains("UNTRUSTED"), "{}", p[0].0);
+    }
+
+    /// El caso que el contador de entradas no veia: el directorio tiene
+    /// claves, pero son de OTRO arco. `install_apk_keys` ya lo avisaba por
+    /// `eprintln!`; esto lo convierte en un fallo.
+    #[test]
+    fn con_claves_de_otro_arco_se_acusa() {
+        let r = LinuxRootfs::new(Arch::Aarch64);
+        let root = rootfs_sana("claves-de-otro-arco", Arch::Aarch64, 183);
+        let keys = root.join("etc").join("apk").join("keys");
+        fs::remove_file(keys.join(clave_del_arco(Arch::Aarch64))).unwrap();
+        fs::write(keys.join(clave_del_arco(Arch::X86_64)), b"clave").unwrap();
+        let p = r.check_apk(&root);
+        assert_eq!(
+            p.len(),
+            1,
+            "{p:?}",
+            p = p.iter().map(|x| &x.0).collect::<Vec<_>>()
+        );
+        assert!(
+            p[0].0.contains("ninguna de aarch64") && p[0].0.contains("UNTRUSTED"),
+            "{}",
+            p[0].0
+        );
+    }
+
+    /// Y lo que no es una clave no cuenta como clave: un README en
+    /// `/etc/apk/keys` dejaba pasar el contador de entradas.
+    #[test]
+    fn un_readme_no_cuenta_como_clave_de_apk() {
+        let r = LinuxRootfs::new(Arch::X86_64);
+        let root = rootfs_sana("claves-readme", Arch::X86_64, 62);
+        let keys = root.join("etc").join("apk").join("keys");
+        fs::remove_file(keys.join(clave_del_arco(Arch::X86_64))).unwrap();
+        fs::write(keys.join("README.md"), b"las claves van aqui").unwrap();
+        let p = r.check_apk(&root);
+        assert_eq!(p.len(), 1);
+        assert!(p[0].0.contains("UNTRUSTED"), "{}", p[0].0);
+    }
+
+    /// El firmware de la GSP es un ELF de RISC-V y vive en `/lib/firmware/`,
+    /// y lo instala `image()` DESPUES de verificar. Sin la excepcion, la
+    /// SEGUNDA construccion de una imagen de x86_64 --- que preserva la rootfs
+    /// --- se encontraria el firmware de la pasada anterior y fallaria sola.
+    #[test]
+    fn el_firmware_no_es_userspace_del_objetivo() {
+        let r = LinuxRootfs::new(Arch::X86_64);
+        let root = rootfs_sana("firmware", Arch::X86_64, 62);
+        let gsp = root.join("lib").join("firmware").join("nvidia").join("gsp");
+        fs::create_dir_all(&gsp).unwrap();
+        fs::write(gsp.join("gsp.bin"), elf64(EM_RISCV)).unwrap();
+        let p = r.check_elf_machines(&root);
+        assert!(
+            p.is_empty(),
+            "{:?}",
+            p.iter().map(|x| &x.0).collect::<Vec<_>>()
+        );
+
+        // Pero un ELF de otro arco en `lib/` a secas si sale: la excepcion es
+        // `lib/firmware`, no `lib` entero.
+        fs::write(root.join("lib").join("libajena.so"), elf64(EM_RISCV)).unwrap();
+        let p = r.check_elf_machines(&root);
+        assert_eq!(
+            p.len(),
+            1,
+            "{:?}",
+            p.iter().map(|x| &x.0).collect::<Vec<_>>()
+        );
+        assert!(p[0].0.contains("libajena.so"), "{}", p[0].0);
+    }
+
+    /// RV32 y RV64 comparten `EM_RISCV`, asi que mirando solo la maquina un
+    /// binario de 32 bits se colaba en una rootfs de riscv64.
+    #[test]
+    fn un_elf32_no_pasa_por_bueno() {
+        let mut v = elf64(EM_RISCV);
+        v[4] = 1; // ELFCLASS32
+        let p = scratch("rv32.elf", &v);
+        assert_eq!(elf_machine(&p), Some(MACHINE_RARA));
+        assert_ne!(elf_machine(&p), Some(expected_machine(Arch::Riscv64)));
+        // Y tampoco vale como cache de riscv64.
+        assert!(!LinuxRootfs::new(Arch::Riscv64).cached_for_target(&p));
+    }
+
+    /// Solo la cabecera: con 20 bytes exactos ya se lee la maquina, asi que el
+    /// barrido no carga en memoria el firmware ni los assets de la rootfs.
+    #[test]
+    fn solo_se_leen_los_veinte_primeros_bytes() {
+        let mut v = elf64(EM_AARCH64);
+        v.truncate(20);
+        assert_eq!(elf_machine(&scratch("justo20.elf", &v)), Some(EM_AARCH64));
+        v.truncate(19);
+        assert_eq!(elf_machine(&scratch("corto19.elf", &v)), None);
     }
 
     /// Y el que cierra el circulo: un binario del host dentro de una rootfs
