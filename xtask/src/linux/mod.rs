@@ -18,6 +18,24 @@ use std::{
 
 pub(crate) struct LinuxRootfs(Arch, Variant);
 
+/// What makes every userspace tool in the rootfs a static, non-PIE ET_EXEC,
+/// like the busybox and apk beside them.
+///
+/// `+crt-static` is not redundant with the musl triple. `x86_64-unknown-linux-musl`
+/// and `aarch64-unknown-linux-musl` carry `crt-static-default: true` in their
+/// target spec; **`riscv64gc-unknown-linux-musl` does not**, so without this
+/// flag the riscv64 tools came out dynamically linked while the comments above
+/// them said static. It cost nothing while none of those binaries needed a
+/// symbol the Eclipse rootfs does not export -- and then `panic = "unwind"` in
+/// eclipse-init (#1748) had PID 1 importing `_Unwind_RaiseException`,
+/// `_Unwind_Resume` and friends from the `libgcc_s.so` that rustc links
+/// dynamically for the unwinder on that target. The rootfs has no such
+/// library: "Error relocating /sbin/init: symbol not found", `init(1) exited
+/// with code 127`, and riscv64 did not boot at all. Linked static, the
+/// unwinder comes from the `libunwind.a` the Rust musl target already ships
+/// beside its `libc.a` and nothing is imported.
+const STATIC_RUSTFLAGS: &str = "-C relocation-model=static -C target-feature=+crt-static";
+
 impl LinuxRootfs {
     /// 生成指定架构的 linux rootfs 操作对象。The `desktop` variant, i.e. the
     /// historical behaviour.
@@ -2654,7 +2672,7 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
     /// The pure half of [`Self::cross_build_env`], so the shape of the
     /// environment can be tested without a 100 MiB toolchain download.
     fn cross_build_env_with(&self, cc: Option<&str>) -> Vec<(String, String)> {
-        let mut rustflags = String::from("-C relocation-model=static");
+        let mut rustflags = String::from(STATIC_RUSTFLAGS);
         let mut env = Vec::new();
         if let Some(cc) = cc {
             rustflags.push_str(" -C linker=");
@@ -5318,10 +5336,7 @@ mod cross_linker_tests {
         let env = rootfs.cross_build_env();
         assert_eq!(
             env,
-            vec![(
-                "RUSTFLAGS".to_string(),
-                "-C relocation-model=static".to_string()
-            )],
+            vec![("RUSTFLAGS".to_string(), STATIC_RUSTFLAGS.to_string())],
             "el caso nativo ha dejado de ser el de siempre"
         );
     }
@@ -5391,6 +5406,30 @@ mod cross_linker_tests {
             !env.iter().any(|(k, _)| k.starts_with("CC")),
             "{env:?} fija un compilador sin hacer falta"
         );
+    }
+
+    /// Every arch, cross or native, links static. riscv64 is the one that
+    /// needs saying: its musl target spec has no `crt-static-default`, so
+    /// before this flag its `/sbin/init` was a dynamic binary that asked the
+    /// rootfs for `_Unwind_*` out of a `libgcc_s.so` nobody ships, exited 127
+    /// and left the arch unbootable.
+    #[test]
+    fn todos_los_arcos_enlazan_estatico() {
+        for arch in [Arch::X86_64, Arch::Aarch64, Arch::Riscv64] {
+            for cc in [None, Some("/toolchain/bin/cross-gcc")] {
+                let env = LinuxRootfs::new(arch).cross_build_env_with(cc);
+                let rustflags = env
+                    .iter()
+                    .find(|(k, _)| k == "RUSTFLAGS")
+                    .map(|(_, v)| v.as_str())
+                    .expect("RUSTFLAGS");
+                assert!(
+                    rustflags.contains("-C target-feature=+crt-static"),
+                    "{} se enlazaria dinamico: {rustflags:?}",
+                    arch.name()
+                );
+            }
+        }
     }
 
     /// The recurrence, not the instance. The same `RUSTFLAGS` line was copied
