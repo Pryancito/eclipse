@@ -24,8 +24,9 @@ mod uefi;
 pub use nouveau_uapi::nouveau_ioctl_name;
 #[cfg(target_arch = "x86_64")]
 pub use nouveau_uapi::{
-    console_gsp_enabled, exec_fast_enabled, hwflip_enabled, set_console_gsp_enabled,
-    set_exec_fast_enabled, set_hwflip_enabled, set_surfaceflip_enabled, surfaceflip_enabled,
+    console_gsp_enabled, exec_fast_enabled, hwflip_enabled, osinit_mapping_enabled,
+    set_console_gsp_enabled, set_exec_fast_enabled, set_hwflip_enabled, set_osinit_mapping_enabled,
+    set_surfaceflip_enabled, surfaceflip_enabled,
 };
 /// `GEM_CPU_PREP`'s recogniser and request reader, for the async pre-wait in
 /// `linux-object`: that ioctl blocks, and `INode::io_control` is synchronous,

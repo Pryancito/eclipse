@@ -40,6 +40,7 @@
  * replacing the old os_boundary.rs stub that returned NOT_SUPPORTED
  * (which would have failed OBJSYS construction cleanly).
  */
+#include "nv_ref.h"         /* NV_CONFIG_PCI_NV_3 / NV_CONFIG_PCI_NV_12 */
 #include "gpu_mgr/gpu_mgr.h"
 #include "gpu/gpu.h"
 #include "core/system.h"
@@ -214,6 +215,45 @@ NV_STATUS osRmInitRm(void)
                               THREAD_STATE_SETUP_FLAGS_SLI_LOGIC_ENABLED |
                               THREAD_STATE_SETUP_FLAGS_DO_NOT_INCLUDE_SLEEP_TIME_ENABLED);
     ECLIPSE_TRACE("osRmInitRm: done");
+
+    return NV_OK;
+}
+
+/*
+ * Eclipse's implementation of the osInitMapping platform hook, called
+ * from the real kbifConstructEngine -> kbifInit (kernel_bif.c:130) with
+ * NV_CHECK_OK_OR_RETURN, so whatever this returns decides whether
+ * gpuStatePreInit gets past BIF. The os_boundary.rs stub returned
+ * NV_ERR_NOT_SUPPORTED, which is why gpuStatePreInit failed at stage 4
+ * on the console GPU with "NV_ERR_NOT_SUPPORTED (0x56) returned from
+ * osInitMapping(pGpu) @ kernel_bif.c:130" and the card ended up with no
+ * RM at all (PFB_CSTATUS 0xbadf5040, every runlist zero).
+ *
+ * The portable part of Linux's version (osinit.c:1260) is two PCI
+ * config-space writes through the GPU's own NV_PCFG BAR0 window, which
+ * is just MMIO on Eclipse too (gpuWriteBusConfigReg_GM107 -> GPU_REG_WR32):
+ * clear the expansion-ROM base address, because some PCI BIOSes leave
+ * the ROM mapped where it can collide, and max out the PCI latency
+ * timer. The Linux-only parts are deliberately omitted: initCoreLogic()
+ * belongs to the chipset/core-logic object Eclipse does not build, and
+ * nvp->flags |= NV_INIT_FLAG_CORE_LOGIC is private state of nv_priv_t,
+ * a struct that only the Linux platform layer has.
+ */
+NV_STATUS eclipse_rm_os_init_mapping(OBJGPU *pGpu)
+{
+    if (pGpu == NULL)
+    {
+        return NV_ERR_INVALID_ARGUMENT;
+    }
+
+    /* Some PCI BIOSes leave the ROM mapped, which can collide. Disable it. */
+    GPU_BUS_CFG_WR32(pGpu, NV_CONFIG_PCI_NV_12, 0);
+
+    /* Make sure our PCI latency timer is sufficient (max it out). */
+    GPU_BUS_CFG_WR32(pGpu, NV_CONFIG_PCI_NV_3,
+        DRF_DEF(_CONFIG, _PCI_NV_3, _LATENCY_TIMER, _248_CLOCKS));
+
+    ECLIPSE_TRACE("osInitMapping: ROM disabled, latency timer maxed");
 
     return NV_OK;
 }

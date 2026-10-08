@@ -525,6 +525,25 @@ fn primary_main(config: kernel_hal::KernelConfig) {
             // stub is no longer a lie -- it is the truth of this port.
             // (`kernel_hal::drivers::set_rm_thread_id_provider` stays for
             // the day the gate is lifted and RM concurrency is done right.)
+            // Escape hatch for the real `osInitMapping` (the portable half of
+            // Linux's osinit.c:1260, implemented in `eclipse_rm_init.c`). It
+            // runs on EVERY GPU the RM attaches, the compute card included, so
+            // if those two config-space writes ever disturb a path that works
+            // today, this flag puts back the old `NV_ERR_NOT_SUPPORTED` without
+            // a rebuild. Expect `gpuStatePreInit` to fail at BIF when it is on.
+            //
+            // It has to be latched HERE, before `auto_bringup_compute_gpus()`
+            // below: that is the first RM attach of the boot, and its ladder
+            // reaches `gpuStatePreInit` -> `kbifInit` -> `osInitMapping`. A
+            // flag parsed after it would arrive too late to protect the
+            // compute card, which is the card it exists to protect.
+            if kernel_hal::cmdline::flag(&options.cmdline, "nvidia.noosinitmapping") {
+                kernel_hal::drivers::set_osinit_mapping_enabled(false);
+                klog_info!(
+                    "Eclipse: nvidia.noosinitmapping -- osInitMapping vuelve a NOT_SUPPORTED \
+                     (gpuStatePreInit fallara en kbifInit)"
+                );
+            }
             load_nvidia_gsp_firmware(&rootfs.root_inode());
             // Latch the nouveau GEM CPU-mapping cache policy before any GEM
             // object can be created (the first mmap fixes a VMO's policy for

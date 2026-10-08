@@ -71,6 +71,19 @@ pub fn console_gsp_enabled() -> bool {
     CONSOLE_GSP.load(Ordering::Relaxed)
 }
 
+/// Escape hatch for the real `osInitMapping` (`nvidia.noosinitmapping`).
+/// The flag itself lives in `nvidia-rm-sys`, next to the hook it governs;
+/// this is only the cmdline-facing door, because `zCore` reaches the
+/// NVIDIA driver through `kernel_hal::drivers`, never through
+/// `nvidia-rm-sys` directly.
+pub fn set_osinit_mapping_enabled(v: bool) {
+    nvidia_rm_sys::os_boundary::set_osinit_mapping_enabled(v);
+}
+
+pub fn osinit_mapping_enabled() -> bool {
+    nvidia_rm_sys::os_boundary::osinit_mapping_enabled()
+}
+
 /// Opt-in CE present via `page_flip` (`nvidia.hwflip`). Default **off**: keep
 /// software scanout until the CE path is proven for KMS flips. Does NOT
 /// claim hardware KMS (`has_hardware_kms` stays false).
