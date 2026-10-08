@@ -279,3 +279,52 @@ mod tests {
         assert_eq!(nums.len(), before, "a repeated entry in ALL");
     }
 }
+
+#[cfg(test)]
+mod benches {
+    //! Every failing syscall a FreeBSD binary makes ends here. The map is a
+    //! match over about a hundred arms with no arithmetic in it, so the
+    //! question is only whether the compiler turned it into a table: if it
+    //! did, the arm's position does not matter, and these rows are spread
+    //! across the range to say so.
+    //!
+    //! Compare against `crate::benches::the_second_floor_control` before
+    //! reading a cost into any of them.
+
+    use super::*;
+    use test::{black_box, Bencher};
+
+    /// `EPERM` is 1 on both systems and the first arm of the identical run.
+    #[bench]
+    fn errno_at_the_front(b: &mut Bencher) {
+        b.iter(|| black_box(lx_to_freebsd(black_box(LxError::EPERM))));
+    }
+
+    /// `ENOENT`: the error a FreeBSD dynamic loader collects most of, probing
+    /// for libraries down a search path.
+    #[bench]
+    fn errno_of_enoent(b: &mut Bencher) {
+        b.iter(|| black_box(lx_to_freebsd(black_box(LxError::ENOENT))));
+    }
+
+    /// Past the run where the two systems agree, so the arm is a rewrite.
+    #[bench]
+    fn errno_of_eagain(b: &mut Bencher) {
+        b.iter(|| black_box(lx_to_freebsd(black_box(LxError::EAGAIN))));
+    }
+
+    /// One of the three with no FreeBSD peer, which answer a near number
+    /// rather than land on one that means something else.
+    #[bench]
+    fn errno_with_no_peer(b: &mut Bencher) {
+        b.iter(|| black_box(lx_to_freebsd(black_box(LxError::ETIME))));
+    }
+
+    /// `EUNDEF`: not an error on either system. It reaches here only from a
+    /// `SysResult` built wrong, and on the Linux path it would be returned
+    /// as `-0`, indistinguishable from success.
+    #[bench]
+    fn errno_of_eundef(b: &mut Bencher) {
+        b.iter(|| black_box(lx_to_freebsd(black_box(LxError::EUNDEF))));
+    }
+}

@@ -1308,3 +1308,258 @@ mod syscall_answer_tests {
         assert!(!at_syscall_takes_flags(&Sys::FCHMODAT));
     }
 }
+
+#[cfg(test)]
+mod benches {
+    //! The dispatch layer: what every syscall pays before its handler runs,
+    //! and what it pays on the way out.
+    //!
+    //! `Sys::try_from` is the one that matters most, because it is not called
+    //! once per syscall. The dispatch decodes the number, and on an `EINVAL`
+    //! the `[einval-hunt]` logging decodes it up to **four more times** (the
+    //! ALSA early-out, the watched-family match, the x86-only `POLL` arm and
+    //! the `error!` line). Whether that is free depends on whether the
+    //! generated `TryFrom` is a jump table or a chain of compares, which a
+    //! single row cannot say -- so it is benched across the table: the first
+    //! number, the middle, the far end, Eclipse's own numbers past 600, and a
+    //! number that is not in the table at all.
+    //!
+    //! Every row black-boxes its inputs. Two cycles (~0.6 ns) is `b.iter`'s
+    //! own loop; a row there with an opaque input is a real compare and
+    //! branch, a row there with a constant input is a call that was folded
+    //! away and never ran.
+
+    use super::*;
+    use test::{black_box, Bencher};
+
+    /// `read`: number 0, the first arm of the generated match.
+    #[bench]
+    fn sys_try_from_the_first_number(b: &mut Bencher) {
+        b.iter(|| black_box(Sys::try_from(black_box(0u32))));
+    }
+
+    /// `ioctl`: number 16, and the number `einval_hunt` tests for first.
+    #[bench]
+    fn sys_try_from_ioctl(b: &mut Bencher) {
+        b.iter(|| black_box(Sys::try_from(black_box(16u32))));
+    }
+
+    /// Near the middle of the Linux range.
+    #[bench]
+    fn sys_try_from_the_middle(b: &mut Bencher) {
+        b.iter(|| black_box(Sys::try_from(black_box(202u32))));
+    }
+
+    /// `faccessat2` (439): the far end of the Linux numbers, and the one
+    /// `at_syscall_takes_flags` answers yes for.
+    #[bench]
+    fn sys_try_from_the_last_linux_number(b: &mut Bencher) {
+        b.iter(|| black_box(Sys::try_from(black_box(439u32))));
+    }
+
+    /// Eclipse's own numbers sit at 600 and above, past a gap of a hundred
+    /// and sixty: if the decode is a dense jump table, that gap is where it
+    /// stops being one.
+    #[bench]
+    fn sys_try_from_an_eclipse_number(b: &mut Bencher) {
+        b.iter(|| black_box(Sys::try_from(black_box(601u32))));
+    }
+
+    /// A number this kernel does not have, which is what glibc and musl
+    /// issue on purpose to find out whether a syscall exists. It must come
+    /// back as an error, and it is the only answer that walks the whole
+    /// match if the decode is a chain.
+    #[bench]
+    fn sys_try_from_a_number_not_in_the_table(b: &mut Bencher) {
+        b.iter(|| black_box(Sys::try_from(black_box(452u32))));
+    }
+
+    /// The `[einval-hunt]` decision for an `ioctl` that is ALSA's
+    /// `PCM_HW_REFINE`: alsa-lib finds a supported rate BY issuing refine
+    /// until the kernel says `EINVAL`, so this early-out is on a hot loop
+    /// whenever anything plays sound. It is the first of the decodes.
+    #[bench]
+    fn einval_hunt_alsa_early_out_decision(b: &mut Bencher) {
+        // The shape of the test inside `einval_hunt`, without the logging:
+        // decode, then two byte compares on the ioctl command.
+        //
+        // The number comes from `Sys::IOCTL`, never written out: `build.rs`
+        // picks a different table per architecture, and `ioctl` is 16 only
+        // on x86_64 -- on aarch64 and riscv64 it is 29, and 16 is
+        // `fremovexattr` there. Spelled out, the `matches!` would be false
+        // on those targets and the `&&` would short-circuit, so the row
+        // would measure a failed decode instead of ALSA's early-out.
+        let cmd = 0xc250_4110u32; // _IOWR('A', 0x10, snd_pcm_hw_params)
+        let ioctl = Sys::IOCTL as u32;
+        b.iter(|| {
+            let cmd = black_box(cmd);
+            black_box(
+                matches!(Sys::try_from(black_box(ioctl)), Ok(Sys::IOCTL))
+                    && ((cmd >> 8) & 0xff) == b'A' as u32
+                    && (cmd & 0xff) == 0x10,
+            )
+        });
+    }
+
+    /// Turning a handler's `SysResult` into the register the caller reads.
+    /// Every syscall ends here, twice over in the `bsd` personality, which
+    /// re-encodes it again.
+    #[bench]
+    fn syscall_ret_of_a_success(b: &mut Bencher) {
+        b.iter(|| black_box(syscall_ret(black_box(Ok(4096)))));
+    }
+
+    #[bench]
+    fn syscall_ret_of_an_error(b: &mut Bencher) {
+        b.iter(|| black_box(syscall_ret(black_box(Err(LxError::EINVAL)))));
+    }
+
+    /// Which register a `*at` syscall's flags come from, and whether it has
+    /// any. This pair is what stopped a three-argument `faccessat` from
+    /// reading whatever libc's stub left in the fourth register as `AT_`
+    /// flags, so it runs on every `access`, `chmod` and `stat` a shell makes.
+    #[bench]
+    fn at_flags_register_for_a_three_argument_call(b: &mut Bencher) {
+        b.iter(|| black_box(at_flags_register(black_box(false), black_box(0xdead_beef))));
+    }
+
+    #[bench]
+    fn at_syscall_takes_flags_decision(b: &mut Bencher) {
+        b.iter(|| black_box(at_syscall_takes_flags(black_box(&Sys::FACCESSAT2))));
+    }
+
+    /// The `/proc/perf` resolver registration, which the dispatch calls on
+    /// **every** syscall. After the first one it is a plain acquire load of
+    /// an already-set flag.
+    ///
+    /// This row reads **below** the 0.6 ns floor, and that is the answer, not
+    /// a mistake: the function returns `()`, so there is no value to hold on
+    /// to, and an acquire load of a static the loop never writes is something
+    /// the compiler is free to hoist out of it. Read it as "the steady-state
+    /// cost is one load, and not even a reliably repeated one", which is the
+    /// same thing the comment at the call site claims. What it does NOT
+    /// measure is the `compare_exchange` behind the load, which the very
+    /// first syscall of the boot pays once.
+    #[bench]
+    fn perf_accounting_ensure_registered(b: &mut Bencher) {
+        // Warm it, so whatever is left of the row is the steady state.
+        perf_accounting::ensure_registered();
+        // Handed to `iter` as a function rather than wrapped in `black_box`:
+        // `ensure_registered` returns `()`, and black-boxing a unit is a
+        // no-op that only reads as if it did something. `Bencher::iter`
+        // black-boxes whatever the closure returns anyway.
+        b.iter(perf_accounting::ensure_registered);
+    }
+
+    /// A control: a function that decides nothing, takes a register and hands
+    /// back the same `LxResult<usize>` the argument helpers do.
+    ///
+    /// It exists because of a pattern across these rows that would otherwise
+    /// be read as a cost. Dozens of unrelated one-compare helpers -- in
+    /// `intarg`, `vm`, `net`, `ipc`, `misc`, and `Sys::try_from` here -- land
+    /// between 6.0 and 7.0 ns, and crucially the *accepted* and *refused* row
+    /// of the same helper land there together, to within noise, although they
+    /// take different branches and return different values. A figure that
+    /// does not move when the work does is not the work.
+    ///
+    /// What this row establishes is bounded, and worth stating plainly: it is
+    /// the floor **for a row of this shape** -- a helper the compiler keeps
+    /// out of line, returning an `LxResult` in the two-register layout. It is
+    /// not a universal 6.5 ns tax. A helper the compiler inlines has no such
+    /// floor and sits near 0.6 ns; a helper returning something of a different
+    /// size pays a different call cost; and two rows of a branchless helper
+    /// landing together is what branchless code does, not evidence of a
+    /// floor. So this is a yardstick to hold a row against, matched by shape,
+    /// and the pair of accepted and refused rows landing together is
+    /// corroboration, not proof. Where a row's shape does not match this
+    /// one, measure its own empty equivalent before reading a cost into it.
+    #[bench]
+    fn the_second_floor_control(b: &mut Bencher) {
+        #[inline(never)]
+        fn decides_nothing(raw: usize) -> LxResult<usize> {
+            Ok(raw)
+        }
+        b.iter(|| black_box(decides_nothing(black_box(1234))));
+    }
+
+    /// `copy_struct_from_user`'s rule: the bytes past what this kernel knows
+    /// of an extensible struct must all be zero, or the caller is asking for
+    /// a feature it will not get (`E2BIG`). `clone3`, `sched_setattr` and the
+    /// rest each check their own tail, and the tail's length is the caller's
+    /// `size` minus ours -- so it is a scan with a length userspace picks.
+    fn bench_extensible_tail(b: &mut Bencher, n: usize) {
+        let tail = alloc::vec![0u8; n];
+        b.iter(|| black_box(extensible_tail_is_empty(black_box(&tail))));
+    }
+
+    /// The common case: the caller built the same version we know, so there
+    /// is no tail at all.
+    #[bench]
+    fn extensible_tail_of_0(b: &mut Bencher) {
+        bench_extensible_tail(b, 0);
+    }
+
+    /// 24 bytes: what a `clone3` from a libc newer than this kernel carries
+    /// past `CLONE_ARGS_SIZE_VER0`.
+    #[bench]
+    fn extensible_tail_of_24(b: &mut Bencher) {
+        bench_extensible_tail(b, 24);
+    }
+
+    #[bench]
+    fn extensible_tail_of_4096(b: &mut Bencher) {
+        bench_extensible_tail(b, 4096);
+    }
+
+    /// A tail whose first byte is set, which is the refusal: it must stop
+    /// there rather than read the rest of what the caller named.
+    #[bench]
+    fn extensible_tail_refused_at_the_first_byte(b: &mut Bencher) {
+        let mut tail = alloc::vec![0u8; 4096];
+        tail[0] = 1;
+        b.iter(|| black_box(extensible_tail_is_empty(black_box(&tail))));
+    }
+
+    /// The fallible, zeroed kernel buffer **every** allocation in this crate
+    /// whose size comes from userspace goes through. `vec![0u8; n]` here took
+    /// the machine down on a 24 KiB `read`; this is what the fallible version
+    /// costs instead.
+    fn bench_zeroed_buf(b: &mut Bencher, n: usize) {
+        b.iter(|| black_box(try_zeroed_buf(black_box(n))));
+    }
+
+    /// One page: the size of an ordinary `read`.
+    #[bench]
+    fn try_zeroed_buf_of_4_kib(b: &mut Bencher) {
+        bench_zeroed_buf(b, 4096);
+    }
+
+    /// `SYSCALL_IO_MAX`, the ceiling one read or write may ask for.
+    #[bench]
+    fn try_zeroed_buf_of_64_kib(b: &mut Bencher) {
+        bench_zeroed_buf(b, SYSCALL_IO_MAX);
+    }
+
+    /// The length no allocator can satisfy, which must come back as `ENOMEM`
+    /// rather than abort the machine. If the refusal is cheap, the fallible
+    /// path costs nothing even when a process hammers it.
+    #[bench]
+    fn try_zeroed_buf_refused(b: &mut Bencher) {
+        bench_zeroed_buf(b, usize::MAX);
+    }
+
+    /// Naming an ALSA ioctl for the log. The guard in front of the table is
+    /// the interesting part: it rejects the legacy TTY numbers, whose second
+    /// byte is also `b'T'`, so every `isatty()` probe on a non-tty fd used to
+    /// be read as an ALSA timer call and reported. That flooded the console.
+    #[bench]
+    fn alsa_ioctl_name_rejects_a_tty_number(b: &mut Bencher) {
+        // TCGETS: a flat legacy number with no direction and no payload size.
+        b.iter(|| black_box(alsa_ioctl_name(black_box(0x5401))));
+    }
+
+    #[bench]
+    fn alsa_ioctl_name_of_a_pcm_call(b: &mut Bencher) {
+        b.iter(|| black_box(alsa_ioctl_name(black_box(0xc250_4110))));
+    }
+}

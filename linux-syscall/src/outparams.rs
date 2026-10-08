@@ -228,3 +228,156 @@ mod outparam_tests {
         assert_eq!(result, Err(LxError::EMFILE));
     }
 }
+
+#[cfg(test)]
+mod benches {
+    //! What the rule costs. These helpers exist because "a call that fails
+    //! leaves the caller exactly as it found them" was written out by hand at
+    //! each call site and was missing a piece at most of them, and the
+    //! objection to a helper is always that it costs something. These rows
+    //! are the answer: the undo path is a `match` on a `Result`, and the
+    //! copy out is one `copy_to_user` of a struct that was going to happen
+    //! anyway.
+    //!
+    //! The closures are deliberately empty, so each row is the helper's own
+    //! control flow and not the work it wraps. What a real `rt_sigaction`
+    //! costs lives in `signal::benches`.
+    //!
+    //! Every row black-boxes its inputs -- and that includes the WHOLE
+    //! `Result` each closure hands back, not just the value inside it.
+    //! `|| Ok(black_box(4))` hides the 4 and leaves the `Ok` in plain sight,
+    //! so the compiler still knows which way every `?` in the helper goes
+    //! and can fold the control flow this module exists to measure away.
+    //! `|| black_box(Ok(4))` is what hides the decision. Two cycles
+    //! (~0.6 ns) is `b.iter`'s own loop; a row there with an opaque input is
+    //! a real compare and branch, a row there with a constant input is a
+    //! call that was folded away and never ran.
+
+    use super::*;
+    use test::{black_box, Bencher};
+
+    /// `libos` addresses are ordinary host addresses, so a local variable is
+    /// a valid stand-in for the caller's buffer and the copy runs for real.
+    fn user_out<T>(slot: &mut T) -> UserOutPtr<T> {
+        UserOutPtr::from(slot as *mut T as usize)
+    }
+
+    /// The whole of `sigaltstack`'s and `setitimer`'s epilogue when it works:
+    /// the change, then one copy of the old value out to userspace.
+    #[bench]
+    fn commit_and_report_old_with_a_real_copy(b: &mut Bencher) {
+        let mut slot = 0u64;
+        let addr = user_out(&mut slot).as_addr();
+        b.iter(|| {
+            let mut out: UserOutPtr<u64> = UserOutPtr::from(black_box(addr));
+            black_box(commit_and_report_old(black_box(1234u64), &mut out, || {
+                black_box(Ok(()))
+            }))
+        });
+    }
+
+    /// The same, with the NULL out-pointer every one of these syscalls takes
+    /// for "do not report the old value" -- the common case for a program
+    /// that only sets. Against the row above, the difference is the copy.
+    #[bench]
+    fn commit_and_report_old_with_a_null_pointer(b: &mut Bencher) {
+        b.iter(|| {
+            let mut out: UserOutPtr<u64> = UserOutPtr::from(black_box(0usize));
+            black_box(commit_and_report_old(black_box(1234u64), &mut out, || {
+                black_box(Ok(()))
+            }))
+        });
+    }
+
+    /// The failed change, which must not touch the caller's buffer: the bug
+    /// this helper was written for. It is cheaper than the success, because
+    /// the copy never happens.
+    #[bench]
+    fn commit_and_report_old_when_the_change_fails(b: &mut Bencher) {
+        let mut slot = 0u64;
+        let addr = user_out(&mut slot).as_addr();
+        b.iter(|| {
+            let mut out: UserOutPtr<u64> = UserOutPtr::from(black_box(addr));
+            black_box(commit_and_report_old(black_box(1234u64), &mut out, || {
+                black_box(Err(LxError::EFAULT))
+            }))
+        });
+    }
+
+    /// `pipe2` and `socketpair` reaching their caller: both descriptors
+    /// installed, the numbers reported, nothing taken back.
+    #[bench]
+    fn hand_out_pair_that_reaches_the_caller(b: &mut Bencher) {
+        b.iter(|| {
+            black_box(hand_out_pair(
+                black_box(3i32),
+                || black_box(Ok(4i32)),
+                |_, _| black_box(Ok(())),
+                |fd| {
+                    black_box(fd);
+                },
+            ))
+        });
+    }
+
+    /// `pipe2((int *)1, 0)`: the numbers never reach the caller, so both
+    /// descriptors come back out of the table. This is the path that used to
+    /// leak two descriptors a turn until the fd table was full.
+    #[bench]
+    fn hand_out_pair_taken_back(b: &mut Bencher) {
+        b.iter(|| {
+            black_box(hand_out_pair(
+                black_box(3i32),
+                || black_box(Ok(4i32)),
+                |_, _| black_box(Err(LxError::EFAULT)),
+                |fd| {
+                    black_box(fd);
+                },
+            ))
+        });
+    }
+
+    /// The fd limit: installing the second descriptor is what fails, with no
+    /// bad pointer anywhere, and the first one is already in the table.
+    #[bench]
+    fn hand_out_pair_when_the_second_never_arrives(b: &mut Bencher) {
+        b.iter(|| {
+            black_box(hand_out_pair(
+                black_box(3i32),
+                || black_box(Err::<i32, _>(LxError::EMFILE)),
+                |_, _| black_box(Ok(())),
+                |fd| {
+                    black_box(fd);
+                },
+            ))
+        });
+    }
+
+    /// `clone(CLONE_PIDFD)` with a `parent_tid` that works, and with one that
+    /// faults: the pidfd stays, or comes back out of the table.
+    #[bench]
+    fn hand_out_one_that_reaches_the_caller(b: &mut Bencher) {
+        b.iter(|| {
+            black_box(hand_out_one(
+                black_box(9i32),
+                |_| black_box(Ok(())),
+                |fd| {
+                    black_box(fd);
+                },
+            ))
+        });
+    }
+
+    #[bench]
+    fn hand_out_one_taken_back(b: &mut Bencher) {
+        b.iter(|| {
+            black_box(hand_out_one(
+                black_box(9i32),
+                |_| black_box(Err(LxError::EFAULT)),
+                |fd| {
+                    black_box(fd);
+                },
+            ))
+        });
+    }
+}

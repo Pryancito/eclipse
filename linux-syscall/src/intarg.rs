@@ -381,3 +381,190 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod benches {
+    //! What the uAPI's `(int)` costs. These helpers sit at the very front of
+    //! a syscall -- before any lookup, any copy, any lock -- so the question
+    //! they answer is whether reading an argument correctly is something a
+    //! kernel can afford to do on every call. It is: every row but one is a
+    //! truncating cast and a compare.
+    //!
+    //! The exception is `groups_list`, which scans what `setgroups(2)` was
+    //! handed looking for `(gid_t)-1`, and whose length the caller chooses up
+    //! to `NGROUPS_MAX`. That one comes as a family so the slope can be read.
+    //!
+    //! Every row black-boxes its inputs. Two cycles (~0.6 ns) is `b.iter`'s
+    //! own loop; a row there with an opaque input is a real compare and
+    //! branch, a row there with a constant input is a call that was folded
+    //! away and never ran.
+
+    use super::*;
+    use test::{black_box, Bencher};
+
+    /// A 32-bit `-1` sign-extended into the register, which is what glibc and
+    /// musl put there, and the value every helper here has a rule about.
+    const MINUS_ONE: usize = usize::MAX;
+
+    #[bench]
+    fn int_arg_of_a_register(b: &mut Bencher) {
+        b.iter(|| black_box(int_arg(black_box(MINUS_ONE))));
+    }
+
+    #[bench]
+    fn rusage_who_accepted(b: &mut Bencher) {
+        b.iter(|| black_box(rusage_who(black_box(MINUS_ONE))));
+    }
+
+    /// The refused `who`, because the match falls through all three arms
+    /// before it answers: a different path, not a different cost.
+    #[bench]
+    fn rusage_who_refused(b: &mut Bencher) {
+        b.iter(|| black_box(rusage_who(black_box(42))));
+    }
+
+    #[bench]
+    fn sched_pid_accepted(b: &mut Bencher) {
+        b.iter(|| black_box(sched_pid(black_box(1234))));
+    }
+
+    #[bench]
+    fn sched_pid_negative(b: &mut Bencher) {
+        b.iter(|| black_box(sched_pid(black_box(MINUS_ONE))));
+    }
+
+    /// The NULL `struct sched_param`, which is `EINVAL` before the pid is
+    /// even read: the short-circuit this helper exists for.
+    #[bench]
+    fn sched_param_pid_null_param(b: &mut Bencher) {
+        b.iter(|| black_box(sched_param_pid(black_box(1234), black_box(true))));
+    }
+
+    #[bench]
+    fn readlink_bufsiz_accepted(b: &mut Bencher) {
+        b.iter(|| black_box(readlink_bufsiz(black_box(4096))));
+    }
+
+    /// `readlink(path, buf, -1)`, which used to be a huge buffer clamped to a
+    /// page and wrote past the caller's end.
+    #[bench]
+    fn readlink_bufsiz_negative(b: &mut Bencher) {
+        b.iter(|| black_box(readlink_bufsiz(black_box(MINUS_ONE))));
+    }
+
+    #[bench]
+    fn task_pid_accepted(b: &mut Bencher) {
+        b.iter(|| black_box(task_pid(black_box(1234))));
+    }
+
+    #[bench]
+    fn waitid_id_accepted(b: &mut Bencher) {
+        b.iter(|| black_box(waitid_id(black_box(1234), black_box(false))));
+    }
+
+    /// `P_PGID` with an `id` of zero: the caller's own group, allowed only
+    /// because the flag says so.
+    #[bench]
+    fn waitid_id_zero_for_pgid(b: &mut Bencher) {
+        b.iter(|| black_box(waitid_id(black_box(0), black_box(true))));
+    }
+
+    /// The `(offset, len)` of `sync_file_range`, including the checked add
+    /// that catches an end past `LLONG_MAX`.
+    #[bench]
+    fn loff_range_accepted(b: &mut Bencher) {
+        b.iter(|| black_box(loff_range(black_box(4096), black_box(65536))));
+    }
+
+    /// The overflowing pair, which is the one the `checked_add` is for.
+    #[bench]
+    fn loff_range_overflowing(b: &mut Bencher) {
+        b.iter(|| black_box(loff_range(black_box(i64::MAX as usize), black_box(4096))));
+    }
+
+    #[bench]
+    fn loff_len_accepted(b: &mut Bencher) {
+        b.iter(|| black_box(loff_len(black_box(65536))));
+    }
+
+    /// `setuid(-1)`, which returned 0 and left every id at 4294967295.
+    #[bench]
+    fn set_id_refused(b: &mut Bencher) {
+        b.iter(|| black_box(set_id(black_box(MINUS_ONE))));
+    }
+
+    #[bench]
+    fn set_id_accepted(b: &mut Bencher) {
+        b.iter(|| black_box(set_id(black_box(1000))));
+    }
+
+    /// `getgroups`'s `gidsetsize` and `setgroups`'s, which are the same
+    /// register read two different ways -- signed for one, unsigned and
+    /// capped for the other.
+    #[bench]
+    fn groups_size_for_get(b: &mut Bencher) {
+        b.iter(|| black_box(groups_size(black_box(32), black_box(false))));
+    }
+
+    #[bench]
+    fn groups_size_for_set_over_the_cap(b: &mut Bencher) {
+        b.iter(|| black_box(groups_size(black_box(NGROUPS_MAX + 1), black_box(true))));
+    }
+
+    /// `groups_list` over `n` groups, none of them `(gid_t)-1`, so the scan
+    /// runs to the end -- which is the case `setgroups(2)` takes when it
+    /// succeeds, and the only row here with a length in it.
+    fn bench_groups_list(b: &mut Bencher, n: usize) {
+        let groups: alloc::vec::Vec<u32> = (0..n as u32).collect();
+        b.iter(|| {
+            // `groups_list` consumes the vector and hands it back, so the
+            // clone is in the figure. `groups_list_clone_only` is what to
+            // subtract for the scan on its own.
+            black_box(groups_list(black_box(groups.clone())))
+        });
+    }
+
+    /// The clone the rows below pay for, on its own.
+    fn bench_groups_clone(b: &mut Bencher, n: usize) {
+        let groups: alloc::vec::Vec<u32> = (0..n as u32).collect();
+        b.iter(|| black_box(black_box(&groups).clone()));
+    }
+
+    #[bench]
+    fn groups_list_of_1(b: &mut Bencher) {
+        bench_groups_list(b, 1);
+    }
+
+    /// 32 groups: more than a desktop login has, and the shape `id` prints.
+    #[bench]
+    fn groups_list_of_32(b: &mut Bencher) {
+        bench_groups_list(b, 32);
+    }
+
+    /// `NGROUPS_MAX`, the widest list the kernel will take, which is what
+    /// bounds this scan at all: without the cap in `groups_size` the length
+    /// came from the caller.
+    #[bench]
+    fn groups_list_of_ngroups_max(b: &mut Bencher) {
+        bench_groups_list(b, NGROUPS_MAX);
+    }
+
+    #[bench]
+    fn groups_list_clone_only_of_32(b: &mut Bencher) {
+        bench_groups_clone(b, 32);
+    }
+
+    #[bench]
+    fn groups_list_clone_only_of_ngroups_max(b: &mut Bencher) {
+        bench_groups_clone(b, NGROUPS_MAX);
+    }
+
+    /// A `(gid_t)-1` at the front, which the scan finds at once: against the
+    /// row above, the difference is what a refusal saves.
+    #[bench]
+    fn groups_list_refused_at_the_front(b: &mut Bencher) {
+        let mut groups: alloc::vec::Vec<u32> = (0..NGROUPS_MAX as u32).collect();
+        groups[0] = u32::MAX;
+        b.iter(|| black_box(groups_list(black_box(groups.clone()))));
+    }
+}

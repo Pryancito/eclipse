@@ -718,3 +718,71 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod benches {
+    //! What `splice(2)` decides before it moves a byte.
+    //!
+    //! The moving itself is not here: `splice_bytes` is `async` and driving
+    //! it from a bench would put `async_std`'s executor in the figure rather
+    //! than the splice. What a pipe's write-and-read actually costs is in
+    //! `file::file::benches::pipe_round_trip_*`, at the `INode` layer, for
+    //! the same reason.
+    //!
+    //! What is here is `pipe_inode`, which is the question "is this fd a
+    //! pipe" and runs **twice per splice** -- once for each side -- plus a
+    //! third `downcast_ref` at each use site. Both are `dyn` downcasts, so
+    //! the row says what a `TypeId` compare through a vtable costs, on a
+    //! syscall whose whole job is to avoid a copy.
+    //!
+    //! Every row black-boxes its inputs. Two cycles (~0.6 ns) is `b.iter`'s
+    //! own loop; a row there with an opaque input is a real compare and
+    //! branch, a row there with a constant input is a call that was folded
+    //! away and never ran.
+
+    use super::*;
+    use alloc::string::String;
+    use rcore_fs::vfs::FileSystem;
+    use rcore_fs_ramfs::RamFS;
+    use test::{black_box, Bencher};
+
+    fn pipe_write_end() -> Arc<dyn FileLike> {
+        let (_, w) = Pipe::create_pair();
+        File::new(Arc::new(w), OpenFlags::WRONLY, String::from("pipe_w:[]"))
+    }
+
+    /// A ramfs file: a `File` like the pipe above, but not over a `Pipe`, so
+    /// the second downcast is the one that fails.
+    fn ramfs_file() -> Arc<dyn FileLike> {
+        let fs = RamFS::new();
+        let inode = fs.root_inode().create("f", FileType::File, 0o644).unwrap();
+        // The inode holds only a `Weak` to its filesystem; keep it alive.
+        core::mem::forget(fs);
+        File::new(inode, OpenFlags::RDWR, String::from("/f"))
+    }
+
+    /// The hit: both downcasts succeed, which is what every side of a real
+    /// `splice` pays.
+    #[bench]
+    fn pipe_inode_of_a_pipe(b: &mut Bencher) {
+        let f = pipe_write_end();
+        b.iter(|| black_box(pipe_inode(black_box(&f))));
+    }
+
+    /// The miss on the inode: a `File`, so the first downcast succeeds and
+    /// the `Pipe` one does not. This is the file side of a
+    /// file-to-pipe `splice`, and `sendfile`'s input.
+    #[bench]
+    fn pipe_inode_of_a_file(b: &mut Bencher) {
+        let f = ramfs_file();
+        b.iter(|| black_box(pipe_inode(black_box(&f))));
+    }
+
+    /// The length clamp every splice takes before anything else: the caller
+    /// may name any `size_t`, and `SYSCALL_IO_MAX` is what bounds the kernel
+    /// buffer behind it.
+    #[bench]
+    fn splice_len_clamp(b: &mut Bencher) {
+        b.iter(|| black_box(black_box(usize::MAX).min(super::super::SYSCALL_IO_MAX)));
+    }
+}
