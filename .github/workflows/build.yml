@@ -101,6 +101,43 @@ jobs:
       - name: Xtask Build bare-metal linux
         run: cargo bin -m virt-${{ matrix.arch }}
 
+  # The memory-debugging build, in a job of its own.
+  #
+  # `MEM_DEBUG=1` turns on the redzone canary after every allocation, the
+  # poison on free and the frame bitset that reports a double alloc. It is the
+  # one tool in the tree that catches a corruption AT THE WRITE instead of ten
+  # minutes later, and it sat here unreachable: no switch in the Makefile, no
+  # job compiling it, and when it was finally asked for it did not compile at
+  # all (18 `never used` errors, because the `slab` that uses those lists is
+  # switched off by this very feature).
+  #
+  # Hence this job. A feature nothing compiles rots again within a week, and
+  # then the next corruption is found the way the last three were: by reading
+  # a photograph of a blue screen.
+  mem-debug:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: 'recursive'
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.rust_toolchain }}
+          components: rust-src, llvm-tools-preview, clippy
+
+      - name: Install cargo-binutils
+        run: cargo install cargo-binutils --locked
+
+      - name: Pull prebuilt images
+        run: make zircon-init
+
+      - name: Build x86_64 with MEM_DEBUG=1
+        run: cd zCore && make build ARCH=x86_64 MEM_DEBUG=1
+
+      - name: Clippy x86_64 with MEM_DEBUG=1
+        run: cd zCore && make clippy ARCH=x86_64 MEM_DEBUG=1
+
   build-user:
     # The unpatched runtime prebuilts do not contain a Fuchsia C/C++ SDK sysroot.
     if: ${{ false }}

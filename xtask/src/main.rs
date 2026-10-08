@@ -228,6 +228,19 @@ enum Commands {
     /// cargo image --arch riscv64
     /// ```
     Image(ArchArg),
+
+    /// 校验已构建的 rootfs。Verifies the rootfs that was already built.
+    ///
+    /// Checks that PID 1 is `eclipse-init`, that `/etc/apk/{arch,keys}` are
+    /// the target's, and that no ELF in the rootfs was linked for another
+    /// architecture. `cargo image` already runs it; this runs it on its own.
+    ///
+    /// # Example
+    ///
+    /// ```bash
+    /// cargo verify-rootfs --arch aarch64
+    /// ```
+    VerifyRootfs(ArchArg),
     /// 提取 NVIDIA GSP-RM 固件。Extracts the NVIDIA GSP-RM firmware.
     ///
     /// 版本取自被固定的子模块，因此不会与内核中的 RM 不一致。
@@ -336,6 +349,7 @@ fn main() {
         LibcTest(arg) => arg.linux_rootfs().put_libc_test(),
         OtherTest(arg) => arg.linux_rootfs().put_other_test(),
         Image(arg) => arg.linux_rootfs().image(),
+        VerifyRootfs(arg) => arg.linux_rootfs().verify(),
         NvidiaFirmware(arg) => {
             if !linux::nvidia_firmware::make(arg.out.map(PathBuf::from), arg.force) {
                 std::process::exit(1);

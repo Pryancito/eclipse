@@ -55,6 +55,9 @@ impl IoMapper for IoMapperImpl {
 
 /// Initialize device drivers.
 pub(super) fn init() -> DeviceResult {
+    // See the x86_64 note: before any probe, so a driver that finds a
+    // hot-pluggable device during bring-up has somewhere to publish it.
+    crate::drivers::install_hotplug_sink();
     // PCIe configuration space, before anything can ask for it.
     //
     // `zcore_drivers::bus::pci` reads config space through a bare

@@ -57,6 +57,7 @@ pub mod builder;
 #[macro_use]
 pub mod bus;
 pub mod display;
+pub mod hotplug;
 pub mod input;
 pub mod io;
 pub mod irq;

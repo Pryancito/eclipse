@@ -231,6 +231,11 @@ fn init_acpi_power_button(irq: &Arc<Apic>) {
 }
 
 pub(super) fn init_early() -> DeviceResult {
+    // Before any probe, so that a driver which finds a hot-pluggable device
+    // during its own bring-up has somewhere to publish it. A USB disk
+    // enumerated ahead of this would be dropped with a warning -- which is
+    // the honest outcome, but a useless one.
+    drivers::install_hotplug_sink();
     let uart = Arc::new(Uart16550Pmio::new(0x3F8));
     drivers::add_device(Device::Uart(BufferedUart::new(uart)));
     let uart = Arc::new(Uart16550Pmio::new(0x2F8));
