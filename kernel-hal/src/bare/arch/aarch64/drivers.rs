@@ -11,6 +11,9 @@ use zcore_drivers::virtio::{VirtIOHeader, VirtIoBlk};
 use zcore_drivers::Device;
 
 pub fn init_early() {
+    // See the x86_64 note: before any probe, so a driver that finds a
+    // hot-pluggable device during bring-up has somewhere to publish it.
+    drivers::install_hotplug_sink();
     let uart = Pl011Uart::new(phys_to_virt(KCONFIG.uart_base));
     let uart = Arc::new(uart);
     let gic = gic_400::init(
