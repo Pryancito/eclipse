@@ -126,6 +126,7 @@ two agree the measurement is standing on something.
 | a page flip and its swapchain | — | `zcore-drivers` `display::nvidia::present_benches::flip_*` |
 | GPU identification and the BOOT0 decode | — | `zcore-drivers` `display::nvidia::present_benches::identify_*`, `decode_*_boot0` |
 | what a monitor says about itself | — | `zcore-drivers` `display::edid::benches::*` |
+| the GEM handle every driver-private ioctl looks up | — | `zcore-drivers` `scheme::gem_mmap::benches::*` |
 | `stat`/`fstat`/`statx` encoding | `fs` section | `linux-syscall` `file::stat::benches::*` |
 | `select`/`poll`/`epoll` per-call and per-fd work | `fs` section | `linux-syscall` `file::poll::benches::*` |
 | `getdents64` | `fs` section | `linux-syscall` `file::dir::benches::getdents64_*` |
@@ -763,3 +764,66 @@ Pure functions over 128 bytes, no mock: these are the real figures.
   return value being moved, and the ordering between 12.7 and 17.8 ns is not
   work. A third floor shape worth remembering, after the ~0.6 ns `b.iter` loop
   and the ~6.4 ns call returning an `LxResult`.
+
+## What the GEM handle registry said
+
+`gem_mmap::MAPPINGS` is a `Vec<MappedGem>` behind one mutex, and every
+driver-private GEM ioctl goes through it: `GEM_NEW` registers, `GEM_CLOSE`
+drops a reference, `GEM_INFO`, `VM_BIND`, the driver-private mmap, PRIME
+export and `ADDFB` all look a handle up, and a process exit walks the whole
+table. Each operation is a linear scan, with each entry's holder list scanned
+in turn. No hardware and no mock: it is integers and a mutex, so these are the
+real figures.
+
+The rows ask where "a handful of buffers" stops, because a compositor with
+Xwayland and a browser under it holds one object per surface, per texture
+upload staging buffer, per dma-buf in flight and per KMS framebuffer.
+
+- **The scan is linear and it is the cost.** A lookup of a handle in the
+  middle of the table reads **7.56 ns with one object, 9.52 with 16, 15.05
+  with 64, 58.13 with 256 and 175.81 with 1024** — about 0.35 ns per entry
+  walked. A **miss** in a table of 1024 is **362.64 ns**, exactly twice the
+  middle hit, which is the arithmetic closing: a miss runs to the end. That is
+  the figure a generic (dumb) handle pays on every call that asks here first.
+- **`lookup_for` walked the table twice, and now walks it once.** It is what
+  the driver-private mmap, PRIME export and `ADDFB` call, and it used to ask
+  `holds` and then `lookup` — two independent scans for every accepted
+  handle: **120.91 ns at 256 live objects where one walk is 58.13**. The
+  ownership decision is now a helper over the entry a single scan already
+  found, and the row reads **58.57 ns**, level with the bare lookup: the
+  check is free on top of the walk it already needed.
+  `one_pass_answers_what_the_two_passes_did` walks the matrix the old pair
+  covered — tracked or not, driver-private range or below it, held or not,
+  and the pid-0 arm — against the two-pass arrangement spelled out in the
+  test. It and two of the existing ownership tests all fail if the decision
+  is broken.
+- **`GEM_NEW` is quadratic in the table.** `register` scans for an existing
+  entry before appending, so a fresh handle costs **22.86 ns into an empty
+  table and 203.43 ns into one of 256**. Filling the table to 256 is
+  therefore about 25 us of scanning, and to 1024 about 400 us — paid once
+  per buffer at allocation, not per frame, but paid again by every
+  re-register.
+- **Process exit is linear, not quadratic.** `release_pid` for a pid that
+  holds nothing walks every object and every holder: 78.66 ns over 64 objects
+  and 262.76 over 256. `rekey_pid`, the zombie-context handover, walks every
+  holder of every object with no early exit: 394.38 ns over 256. Both are
+  once-per-process.
+- A holder list is not where the cost is: `holds` on the last of **64**
+  holders of a single object is **16.88 ns**, against 57.93 ns for one holder
+  of an object in the middle of a table of 256. It is the table that is long,
+  not the lists.
+- **The remaining shape is the `Vec` itself**, and that is a bigger change
+  than this batch: keying the registry by handle would turn every row above
+  into a constant, but the module's ownership semantics (holders by pid, the
+  permissive arm for low handles, the dma-buf sentinel) are what the existing
+  tests are about, and swapping the container under them is a decision for
+  the author, not a measurement. The numbers to decide with are the ones
+  above.
+
+There is no empty-equivalent row in this section and the lookup family does
+not need one: a floor says whether a *flat* family is measuring work, and this
+family is not flat — it scales with the table and a miss costs exactly twice
+a middle hit. A non-inlined control taking the same lock reads 13.5 ns, above
+the one-object row it would be bounding, because `lookup` inlines and the
+control pays a call it does not. A floor built out of the wrong shape measures
+the control.

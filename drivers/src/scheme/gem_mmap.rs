@@ -235,9 +235,28 @@ pub fn holds(handle: u32, pid: u64) -> bool {
     if pid == 0 {
         return true;
     }
-    match MAPPINGS.lock().iter().find(|e| e.handle == handle) {
+    holds_entry(
+        MAPPINGS.lock().iter().find(|e| e.handle == handle),
+        handle,
+        pid,
+    )
+}
+
+/// The ownership decision [`holds`] makes, given the entry a scan already
+/// found (or `None` for an untracked handle). Factored out so a caller that
+/// has to walk the table anyway -- [`lookup_for`], which every
+/// driver-private mmap, PRIME export and `ADDFB` goes through -- can decide
+/// and read the range in ONE pass instead of two. The table is a linear scan
+/// and the second walk cost as much as the first: 120.9 ns against 58.6 for
+/// `lookup` alone at 256 live objects (`benches::look_up_for_a_holder_in_a_
+/// table_of_256` against `benches::lookup_one_of_256`).
+///
+/// `pid == 0` is the caller's to handle before calling this, because it is
+/// decided without the table at all.
+fn holds_entry(entry: Option<&MappedGem>, handle: u32, pid: u64) -> bool {
+    match entry {
         Some(e) => e.holders.contains(&pid),
-        None => handle < 0x8000_0000,
+        None => handle < DRIVER_HANDLE_BASE,
     }
 }
 
@@ -351,13 +370,25 @@ pub fn lookup(handle: u32) -> Option<(u64, u64)> {
 /// is not held by the caller is the only case worth reporting -- an unknown
 /// handle is an ordinary miss, not an ownership decision.
 pub fn lookup_for(handle: u32, pid: u64) -> Option<(u64, u64)> {
-    if !holds(handle, pid) {
+    // ONE pass: the scan that decides ownership is the scan that reads the
+    // range. This used to call `holds` and then `lookup`, walking the table
+    // twice for every accepted handle, which at 256 live objects was 120.9 ns
+    // where one walk is 58.6 (see `holds_entry`). The guard is dropped before
+    // anything is logged -- a temporary lock guard left in an `if` condition
+    // would be held across the log call below.
+    let (allowed, range, tracked) = {
+        let table = MAPPINGS.lock();
+        let entry = table.iter().find(|e| e.handle == handle);
+        let range = entry.map(|e| (e.phys_addr, e.size));
+        let allowed = pid == 0 || holds_entry(entry, handle, pid);
+        (allowed, range, entry.is_some())
+    };
+    if allowed {
+        return range;
+    }
+    {
         use core::sync::atomic::{AtomicU32, Ordering};
         static DENIED: AtomicU32 = AtomicU32::new(0);
-        // Bound to a `let`, NOT left as an `if` condition: a temporary lock
-        // guard in the condition lives to the end of the `if`, which would
-        // hold MAPPINGS across the log call below.
-        let tracked = MAPPINGS.lock().iter().any(|e| e.handle == handle);
         if tracked {
             let n = DENIED.fetch_add(1, Ordering::Relaxed);
             if n < 8 {
@@ -371,9 +402,8 @@ pub fn lookup_for(handle: u32, pid: u64) -> Option<(u64, u64)> {
                 );
             }
         }
-        return None;
     }
-    lookup(handle)
+    None
 }
 
 /// Reverse lookup: which driver-private GEM handle owns the object whose
@@ -454,6 +484,67 @@ mod handle_slice_tests {
 /// These drive the pid-parameterised layer directly (`lookup_for`, `add_ref`,
 /// `dec_ref`, `release_pid`) because the uAPI entry points above read the
 /// caller from the current thread, which a host test does not have.
+#[cfg(test)]
+mod one_pass_lookup_tests {
+    use super::*;
+
+    /// `lookup_for` reads the range in the same pass that decides ownership,
+    /// where it used to call `holds` and then `lookup` and walk the table
+    /// twice. The two have to answer the same thing in every case the old
+    /// pair did, so this walks the matrix: tracked or not, in the
+    /// driver-private range or below it, held by the caller or not, and the
+    /// pid-0 arm that is decided without the table at all.
+    #[test]
+    fn one_pass_answers_what_the_two_passes_did() {
+        /// The arrangement the old code made, spelled out: ownership first
+        /// through `holds`, then the range through `lookup`.
+        fn two_passes(handle: u32, pid: u64) -> Option<(u64, u64)> {
+            if !holds(handle, pid) {
+                return None;
+            }
+            lookup(handle)
+        }
+
+        const OWNER: u64 = 99_101;
+        const STRANGER: u64 = 99_102;
+        // Clear of every other module's range in this file.
+        let tracked_hi = DRIVER_HANDLE_BASE + 0x0200_0001;
+        let untracked_hi = DRIVER_HANDLE_BASE + 0x0200_0002;
+        let untracked_lo = 0x42u32;
+        let phys = 0xa0_0000_0000u64;
+        register(tracked_hi, phys, 0x2_0000, OWNER);
+
+        for (handle, pid) in [
+            (tracked_hi, OWNER),
+            (tracked_hi, STRANGER),
+            (tracked_hi, 0),
+            (untracked_hi, OWNER),
+            (untracked_hi, 0),
+            (untracked_lo, OWNER),
+            (untracked_lo, 0),
+        ] {
+            assert_eq!(
+                lookup_for(handle, pid),
+                two_passes(handle, pid),
+                "handle {:#x} pid {}",
+                handle,
+                pid
+            );
+        }
+        // And the answers are the ones that matter, not just equal to each
+        // other: the owner gets the range, a stranger gets nothing from a
+        // tracked driver-private handle, and an untracked low handle is not
+        // this table's to refuse.
+        assert_eq!(lookup_for(tracked_hi, OWNER), Some((phys, 0x2_0000)));
+        assert_eq!(lookup_for(tracked_hi, STRANGER), None);
+        assert_eq!(lookup_for(untracked_hi, OWNER), None);
+        assert_eq!(lookup_for(untracked_lo, OWNER), None, "nothing registered");
+        assert!(holds(untracked_lo, OWNER), "low handles stay permissive");
+
+        while !matches!(dec_ref(tracked_hi, 0), DecRef::NotTracked | DecRef::Freed) {}
+    }
+}
+
 #[cfg(test)]
 mod xwayland_chain_tests {
     use super::*;
@@ -631,5 +722,306 @@ mod xwayland_chain_tests {
         assert!(lookup_for(handle, XWAYLAND).is_some());
 
         drop_handle(handle);
+    }
+}
+
+/// Native `#[bench]` rows for the GEM handle registry — the table every
+/// driver-private GEM ioctl goes through.
+///
+/// `MAPPINGS` is a `Vec<MappedGem>` behind one mutex and every operation on it
+/// is a linear scan, with each entry's `holders` a `Vec<u64>` scanned in turn.
+/// That is the right shape for a handful of buffers and the question these
+/// rows answer is where "a handful" stops: a compositor with Xwayland and a
+/// browser under it holds one object per surface, per texture upload staging
+/// buffer and per KMS framebuffer, and every `GEM_CLOSE`, `GEM_INFO`,
+/// `VM_BIND`, driver-private mmap, PRIME export and `ADDFB` pays a scan.
+///
+/// Inline rather than in `benches/`, like the rest of this crate: `MAPPINGS`
+/// and `MappedGem` are private to this module, so a separate target could not
+/// build a table to measure.
+///
+/// Nothing here touches hardware: the registry is a `Vec` of integers and a
+/// mutex, so these are the real figures. The rows take a lock of their own and
+/// use a handle range no test uses, and each one empties what it registered
+/// before it returns, so a row's table size does not leak into the next row's
+/// or into a test's scans.
+///
+/// There is no empty-equivalent row here and the lookup family does not need
+/// one: a floor says whether a *flat* family is measuring work, and this
+/// family is not flat — it scales with the table, a miss costs exactly twice
+/// a hit in the middle, and the slope is the evidence. (A non-inlined control
+/// taking the same lock reads 13.5 ns, above the one-object row it would be
+/// bounding, because `lookup` inlines and the control pays a call it does
+/// not: a floor built out of the wrong shape measures the control.)
+///
+/// `cargo +nightly bench -p zcore-drivers --features graphic,virtio,xhci-usb-hid`
+#[cfg(test)]
+mod benches {
+    use super::*;
+    use test::{black_box, Bencher};
+
+    /// These rows write `MAPPINGS`, which is process-wide, so they take turns
+    /// with each other.
+    static SERIAL: lock::Mutex<()> = lock::Mutex::new(());
+
+    /// A handle range of this module's own, clear of every test's.
+    const BASE: u32 = DRIVER_HANDLE_BASE + 0x0100_0000;
+    const PID: u64 = 77_001;
+
+    /// A physical base far from any test's, so `lookup_by_phys` cannot match
+    /// one of their entries.
+    const PHYS: u64 = 0x90_0000_0000;
+
+    /// Register `count` objects, each held by one pid, and hand back the
+    /// handle in the middle of the table — the average a scan walks to.
+    fn populate(count: u32) -> u32 {
+        for i in 0..count {
+            register(BASE + i, PHYS + (i as u64) * 0x10_0000, 0x10_0000, PID);
+        }
+        BASE + count / 2
+    }
+
+    fn depopulate(count: u32) {
+        for i in 0..count {
+            while !matches!(dec_ref(BASE + i, 0), DecRef::NotTracked | DecRef::Freed) {}
+        }
+    }
+
+    // --- the scan every GEM ioctl pays ---
+
+    fn bench_lookup(b: &mut Bencher, count: u32) {
+        let _g = SERIAL.lock();
+        let middle = populate(count);
+        b.iter(|| black_box(lookup(black_box(middle))));
+        depopulate(count);
+    }
+
+    /// One live object: the floor, and what the table looks like in a VM with
+    /// nothing but the console on it.
+    #[bench]
+    fn lookup_one_of_1(b: &mut Bencher) {
+        bench_lookup(b, 1);
+    }
+
+    /// Sixteen, about a bare compositor.
+    #[bench]
+    fn lookup_one_of_16(b: &mut Bencher) {
+        bench_lookup(b, 16);
+    }
+
+    /// Sixty-four.
+    #[bench]
+    fn lookup_one_of_64(b: &mut Bencher) {
+        bench_lookup(b, 64);
+    }
+
+    /// Two hundred and fifty-six: a compositor, Xwayland and a couple of
+    /// clients with their swapchains and staging buffers.
+    #[bench]
+    fn lookup_one_of_256(b: &mut Bencher) {
+        bench_lookup(b, 256);
+    }
+
+    /// A thousand, which a browser with many tabs reaches on its own. If the
+    /// scan is the cost, this row is a thousand times the first.
+    #[bench]
+    fn lookup_one_of_1024(b: &mut Bencher) {
+        bench_lookup(b, 1024);
+    }
+
+    /// A handle that is not in the table at all: the scan runs to the end
+    /// without matching, which is the worst case of the same walk and what a
+    /// generic (dumb) handle costs on every call that asks here first.
+    #[bench]
+    fn miss_in_a_table_of_1024(b: &mut Bencher) {
+        let _g = SERIAL.lock();
+        populate(1024);
+        b.iter(|| black_box(lookup(black_box(BASE + 0x0010_0000))));
+        depopulate(1024);
+    }
+
+    // --- the ownership check, which rides the lookup's own scan ---
+
+    /// `holds`: the same scan plus a walk of the entry's holder list.
+    #[bench]
+    fn check_the_holder_of_1_in_a_table_of_256(b: &mut Bencher) {
+        let _g = SERIAL.lock();
+        let middle = populate(256);
+        b.iter(|| black_box(holds(black_box(middle), black_box(PID))));
+        depopulate(256);
+    }
+
+    /// `lookup_for` is what the driver-private mmap, PRIME export and `ADDFB`
+    /// actually call, and it is the row this batch's fix came out of: on the
+    /// accept path it used to scan the table **twice**, once inside `holds`
+    /// and once inside `lookup`, and read **120.9 ns** here where one walk is
+    /// 58.1. It now decides ownership over the entry its single scan already
+    /// found, so the row should land **level with `lookup_one_of_256`** — the
+    /// check free on top of the walk it already needed. A figure near twice
+    /// that one again would mean the second walk is back.
+    #[bench]
+    fn look_up_for_a_holder_in_a_table_of_256(b: &mut Bencher) {
+        let _g = SERIAL.lock();
+        let middle = populate(256);
+        b.iter(|| black_box(lookup_for(black_box(middle), black_box(PID))));
+        depopulate(256);
+    }
+
+    /// An object held by a long holder list — the Xwayland chain plus a
+    /// dma-buf and a KMS framebuffer is several, and a compositor that
+    /// re-imports per frame without closing would be many. The entry is first
+    /// in the table so this row is the holder walk and not the table walk.
+    #[bench]
+    fn check_the_holder_of_64_in_a_table_of_1(b: &mut Bencher) {
+        let _g = SERIAL.lock();
+        register(BASE, PHYS, 0x10_0000, PID);
+        for i in 1..64u64 {
+            add_ref(BASE, PID + i).expect("the object is tracked");
+        }
+        // The last holder added, so the walk runs the whole list.
+        b.iter(|| black_box(holds(black_box(BASE), black_box(PID + 63))));
+        depopulate(1);
+    }
+
+    /// The reverse lookup PRIME `FD_TO_HANDLE` does on every self-import: the
+    /// same linear walk, keyed on the physical address instead of the handle.
+    #[bench]
+    fn reverse_look_up_by_phys_in_a_table_of_256(b: &mut Bencher) {
+        let _g = SERIAL.lock();
+        populate(256);
+        let middle_phys = PHYS + 128 * 0x10_0000;
+        b.iter(|| black_box(lookup_by_phys(black_box(middle_phys))));
+        depopulate(256);
+    }
+
+    // --- registering and closing ---
+
+    /// `register` of a handle already present (a re-register): the scan finds
+    /// it and updates the range in place.
+    #[bench]
+    fn re_register_into_a_table_of_256(b: &mut Bencher) {
+        let _g = SERIAL.lock();
+        let middle = populate(256);
+        b.iter(|| {
+            register(
+                black_box(middle),
+                black_box(PHYS),
+                black_box(0x10_0000),
+                black_box(PID),
+            )
+        });
+        depopulate(256);
+    }
+
+    /// A `GEM_CLOSE` that leaves other references: the scan, the holder walk
+    /// and a `swap_remove`. The reference is put back inside the loop so the
+    /// row measures the same work every iteration, which means it also carries
+    /// one `add_ref` — read it against `check_the_holder_of_1_in_a_table_of_256`
+    /// rather than as the cost of a close alone.
+    #[bench]
+    fn close_one_reference_of_two_in_a_table_of_256(b: &mut Bencher) {
+        let _g = SERIAL.lock();
+        let middle = populate(256);
+        add_ref(middle, PID + 1).expect("the object is tracked");
+        b.iter(|| {
+            let r = black_box(dec_ref(black_box(middle), black_box(PID + 1)));
+            add_ref(middle, PID + 1);
+            r
+        });
+        depopulate(256);
+    }
+
+    // --- process exit, which is where the two scans multiply ---
+
+    /// `release_pid` is the process-exit teardown, and it is the one operation
+    /// here that walks **every** object and **every** holder of each: a
+    /// `retain_mut` over the table with a `retain` over each holder list
+    /// inside it.
+    ///
+    /// Measured for a pid that holds nothing, because that call leaves the
+    /// table alone and so can run in a loop over one table. The case where
+    /// the exiting pid owns everything cannot be isolated this way — the call
+    /// empties the table, so the row would have to rebuild it, and rebuilding
+    /// is itself quadratic (see the `register` rows) and swamps what is being
+    /// measured. What it adds on top of these two rows is a `Vec::retain` and
+    /// one `swap_remove` per owned object.
+    #[bench]
+    fn release_a_pid_holding_nothing_of_64_objects(b: &mut Bencher) {
+        bench_release(b, 64);
+    }
+
+    /// The same walk over 256 objects.
+    #[bench]
+    fn release_a_pid_holding_nothing_of_256_objects(b: &mut Bencher) {
+        bench_release(b, 256);
+    }
+
+    fn bench_release(b: &mut Bencher, count: u32) {
+        let _g = SERIAL.lock();
+        populate(count);
+        let stranger = PID + 999;
+        b.iter(|| black_box(release_pid(black_box(stranger))));
+        depopulate(count);
+    }
+
+    // --- registering, which is the same scan and is paid per GEM_NEW ---
+
+    /// `register` of a fresh handle into an empty table: the floor of the
+    /// family below.
+    #[bench]
+    fn register_a_fresh_handle_into_an_empty_table(b: &mut Bencher) {
+        let _g = SERIAL.lock();
+        b.iter(|| {
+            register(
+                black_box(BASE),
+                black_box(PHYS),
+                black_box(0x10_0000),
+                black_box(PID),
+            );
+            dec_ref(BASE, PID)
+        });
+        depopulate(1);
+    }
+
+    /// The claim: `register` scans the whole table before appending, so
+    /// filling the table is quadratic. This row registers one fresh handle
+    /// into a table of 256 and closes it again, so the figure is one full
+    /// walk plus a push — and 256 of those is what a compositor's startup
+    /// pays to get there.
+    #[bench]
+    fn register_a_fresh_handle_into_a_table_of_256(b: &mut Bencher) {
+        let _g = SERIAL.lock();
+        populate(256);
+        let fresh = BASE + 0x0010_0000;
+        b.iter(|| {
+            register(
+                black_box(fresh),
+                black_box(PHYS),
+                black_box(0x10_0000),
+                black_box(PID),
+            );
+            dec_ref(fresh, PID)
+        });
+        depopulate(256);
+    }
+
+    /// `rekey_pid`, the zombie-context handover: it walks every holder of
+    /// every object unconditionally, with no early exit, because a pid may
+    /// appear in any number of them.
+    #[bench]
+    fn rekey_a_pid_across_256_objects(b: &mut Bencher) {
+        let _g = SERIAL.lock();
+        populate(256);
+        let mut from = PID;
+        b.iter(|| {
+            let to = from + 1;
+            let n = black_box(rekey_pid(black_box(from), black_box(to)));
+            from = to;
+            n
+        });
+        // The holders now carry whatever pid the last iteration moved them to.
+        for i in 0..256u32 {
+            while !matches!(dec_ref(BASE + i, 0), DecRef::NotTracked | DecRef::Freed) {}
+        }
     }
 }
