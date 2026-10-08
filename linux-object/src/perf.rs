@@ -1046,6 +1046,13 @@ pub fn kernel_report() -> String {
             irq_note(v)
         );
     }
+    // The kernel's boot timeline, last: it does not change after boot, so it is
+    // reference material at the bottom of a live report rather than something
+    // to read first. It is also printed to the console at the end of the boot,
+    // but a console scrolls and a machine that is already up is where one
+    // usually wonders where the boot went.
+    let _ = writeln!(out);
+    let _ = write!(out, "{}", kernel_hal::boot_marks::render());
     out
 }
 

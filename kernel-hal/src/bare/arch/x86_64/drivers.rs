@@ -239,10 +239,13 @@ pub(super) fn init_early() -> DeviceResult {
 }
 
 fn boot_progress(p: u32) {
+    // The bar is only drawable with a framebuffer, but the TIMESTAMP is worth
+    // having on every build: the stretches these marks bracket (the TSC check,
+    // the PCI scan) are among the most expensive in the boot, and a
+    // serial-only machine is exactly where one reads the timeline.
+    crate::boot_marks::mark(p);
     #[cfg(feature = "graphic")]
     crate::console::early_progress_bar(p);
-    #[cfg(not(feature = "graphic"))]
-    let _ = p;
 }
 
 pub(super) fn init() -> DeviceResult {
