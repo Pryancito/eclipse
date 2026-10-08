@@ -2041,7 +2041,7 @@ impl Syscall<'_> {
                     .as_any_ref()
                     .downcast_ref::<linux_object::fs::devfs::DrmDev>()
                 {
-                    dev.wait_vblank_sleep(arg1).await;
+                    dev.wait_vblank_sleep(arg1).await?;
                 }
             }
         }
@@ -2058,7 +2058,7 @@ impl Syscall<'_> {
                         .as_any_ref()
                         .downcast_ref::<linux_object::fs::devfs::DrmDev>()
                     {
-                        dev.syncobj_wait_sleep(syncobj_cmd, arg1).await;
+                        dev.syncobj_wait_sleep(syncobj_cmd, arg1).await?;
                     }
                 }
             }
@@ -2079,7 +2079,7 @@ impl Syscall<'_> {
                     .as_any_ref()
                     .downcast_ref::<linux_object::fs::devfs::DrmDev>()
                 {
-                    dev.atomic_in_fence_sleep(arg1).await;
+                    dev.atomic_in_fence_sleep(arg1).await?;
                 }
             }
         }
@@ -2094,7 +2094,7 @@ impl Syscall<'_> {
                     .as_any_ref()
                     .downcast_ref::<linux_object::fs::devfs::DrmDev>()
                 {
-                    dev.cpu_prep_sleep(request as u32, arg1).await;
+                    dev.cpu_prep_sleep(request as u32, arg1).await?;
                 }
             }
         }
@@ -2111,7 +2111,7 @@ impl Syscall<'_> {
                     .as_any_ref()
                     .downcast_ref::<linux_object::fs::devfs::DrmDev>()
                 {
-                    dev.present_fence_sleep(request as u32, arg1).await;
+                    dev.present_fence_sleep(request as u32, arg1).await?;
                 }
             }
         }
