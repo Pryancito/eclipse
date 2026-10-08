@@ -28,7 +28,7 @@ use std::ffi::CString;
 use std::fs;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 /// A respawn service that exits sooner than this after starting is treated as
@@ -422,9 +422,199 @@ const CHILD_ENV: &[&str] = &[
     "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/0/bus",
 ];
 
+// ── The boot timeline ──────────────────────────────────────────────────────
+//
+// "Can the boot be made faster?" cannot be answered by reading the code: the
+// expensive parts of this init are not the ones that compute, they are the ones
+// that WAIT -- a `wait_socket =` for a daemon that is still linking itself, a
+// `wait_path =` for device nodes the kernel has not enumerated yet, the settle
+// window after them, a `oneshot` that runs a shell script. None of those were
+// measured, and none of them are visible in a console log, because until now
+// init's lines carried no time at all: a reader could see the ORDER of the boot
+// and had no way to see its SHAPE.
+//
+// So: every line init prints is stamped with its offset from PID 1's first
+// statement, every wait is timed, and at the end of the boot the stretches are
+// printed worst-first with what they do not account for. The cost is one
+// `Instant::now()` per wait and a `Vec` of a few dozen short strings.
+
+/// When PID 1 started: the `+0.000` of every stamped line and of the timeline.
+///
+/// `OnceLock` and not a plain `static mut`: set once at the top of `main`, read
+/// from `log`, which runs on every line including ones printed from inside a
+/// `catch_unwind`. A read before it is set (the multi-call helper path, which
+/// never gets as far as `main`'s PID 1 setup) prints an unstamped line rather
+/// than a wrong one.
+static BOOT_T0: OnceLock<Instant> = OnceLock::new();
+
+/// One measured stretch of the boot: a wait, or a step that runs to completion.
+///
+/// Only LEAVES are recorded -- a gate, a settle window, a oneshot's run -- never
+/// a wrapper around several of them. The whole point of the table is that the
+/// rows add up to something less than the total and the difference is real
+/// unaccounted time; nesting one row inside another would let the rows sum past
+/// the boot and make `rest` meaningless.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct BootStep {
+    /// What was waited for, as the row should read.
+    what: String,
+    /// When it started, since init's first statement.
+    at: Duration,
+    /// How long it took.
+    took: Duration,
+}
+
+/// The stretches recorded so far. Rendered once, at the end of the boot.
+static BOOT_STEPS: Mutex<Vec<BootStep>> = Mutex::new(Vec::new());
+
+/// Set once the timeline has been rendered. From then on nothing is recorded:
+/// a `respawn` that crashes an hour later goes through the same gates as it did
+/// at boot ([`start_service`] serves both), and those waits are not boot --
+/// recording them would grow this vector for the life of the machine and
+/// rewrite the history of a boot that is already over.
+static BOOT_RECORDED: AtomicBool = AtomicBool::new(false);
+
+/// Hard cap on recorded stretches, so a boot that somehow loops through
+/// [`start_service`] many times before the timeline is rendered cannot grow
+/// this without bound. Generous: a full desktop boot records about thirty.
+const BOOT_STEPS_MAX: usize = 512;
+
+/// Stretches shorter than this are left out of the table and land in `rest`.
+/// A boot has a long tail of sub-millisecond steps, and a table that lists
+/// them is one nobody reads to the end.
+const BOOT_STEP_FLOOR: Duration = Duration::from_millis(5);
+
+/// Where the timeline is left for later reading. The console scrolls, and the
+/// question "where did my boot go" is usually asked on a machine that is
+/// already up. `/run` is a tmpfs init has just mounted.
+const BOOT_TIMELINE_PATH: &str = "/run/eclipse-boot-timeline";
+
+/// Time since PID 1's first statement, or `None` before `main` set the origin.
+fn since_boot() -> Option<Duration> {
+    BOOT_T0.get().map(Instant::elapsed)
+}
+
+/// Run `f`, record how long it took as one row of the timeline, and answer its
+/// value.
+fn timed<T>(what: impl Into<String>, f: impl FnOnce() -> T) -> T {
+    let start = Instant::now();
+    let value = f();
+    note_step(what, start.elapsed());
+    value
+}
+
+/// Record one stretch of the boot.
+fn note_step(what: impl Into<String>, took: Duration) {
+    if BOOT_RECORDED.load(Ordering::SeqCst) {
+        return;
+    }
+    let ended_at = since_boot().unwrap_or_default();
+    // Poisoned is not a reason to lose the measurement: `unwind` means a panic
+    // anywhere in a start can poison this, and a timeline with a hole in it is
+    // worse than one taken from a boot that had a bug in it.
+    let mut steps = BOOT_STEPS.lock().unwrap_or_else(|p| p.into_inner());
+    if steps.len() >= BOOT_STEPS_MAX {
+        return;
+    }
+    steps.push(BootStep {
+        what: what.into(),
+        at: ended_at.saturating_sub(took),
+        took,
+    });
+}
+
+/// Render the timeline, stop recording, and leave it in
+/// [`BOOT_TIMELINE_PATH`]. Called once, at the end of the start loop.
+fn report_boot_timeline() {
+    let total = since_boot().unwrap_or_default();
+    let steps = {
+        let steps = BOOT_STEPS.lock().unwrap_or_else(|p| p.into_inner());
+        steps.clone()
+    };
+    // After the render, not before it: a step still in flight when this runs
+    // (there is none today, but `start_service` is called under `guard`) would
+    // otherwise be dropped silently.
+    BOOT_RECORDED.store(true, Ordering::SeqCst);
+    let text = render_boot_timeline(&steps, total);
+    for line in text.lines() {
+        log(line);
+    }
+    let _ = fs::write(BOOT_TIMELINE_PATH, &text);
+}
+
+/// The boot timeline as plain text: the stretches that cost something, worst
+/// first, and the time no row accounts for.
+///
+/// Worst-first and not chronological, because the table answers one question --
+/// what is there to cut -- and the console lines above it, now stamped, already
+/// give the order. `rest` is everything the rows do not cover: the forks and
+/// execs, the sub-[`BOOT_STEP_FLOOR`] tail, and anything that was never timed,
+/// which is the number that says whether this instrumentation is still missing
+/// something.
+fn render_boot_timeline(steps: &[BootStep], total: Duration) -> String {
+    let named: Duration = steps.iter().map(|s| s.took).sum();
+    let mut out = String::new();
+    out.push_str(&format!(
+        "boot timeline: {} to the supervision loop, {} of it waiting\n",
+        secs(total),
+        secs(named.min(total))
+    ));
+    let mut rows: Vec<&BootStep> = steps.iter().filter(|s| s.took >= BOOT_STEP_FLOOR).collect();
+    // Longest first; ties broken by when they happened, so a table of equal
+    // rows is stable and reads in boot order.
+    rows.sort_by(|a, b| b.took.cmp(&a.took).then(a.at.cmp(&b.at)));
+    for step in &rows {
+        out.push_str(&format!(
+            "  {:>8}  {:>3}%  at {:>8}  {}\n",
+            secs(step.took),
+            percent_of(step.took, total),
+            secs(step.at),
+            step.what
+        ));
+    }
+    // `saturating_sub`: `total` is read after the steps, so it cannot be the
+    // smaller of the two today -- but a future caller that reads it first would
+    // otherwise get a row claiming the rest of the boot took 584 million years.
+    let rest = total.saturating_sub(named);
+    out.push_str(&format!(
+        "  {:>8}  {:>3}%  {}\n",
+        secs(rest),
+        percent_of(rest, total),
+        "          everything not timed above (forks, execs, short steps)"
+    ));
+    out
+}
+
+/// Seconds with three decimals: `  1.234s`. Milliseconds would need a second
+/// unit for the long waits, and a boot is read in seconds.
+fn secs(d: Duration) -> String {
+    format!("{:.3}s", d.as_secs_f64())
+}
+
+/// `part` as a whole percentage of `total`, saturating at 100 and answering 0
+/// for a zero total (a timeline rendered before the clock moved).
+fn percent_of(part: Duration, total: Duration) -> u64 {
+    let total = total.as_micros();
+    if total == 0 {
+        return 0;
+    }
+    ((part.as_micros() * 100) / total).min(100) as u64
+}
+
+/// Print one line on the console, stamped with its offset from the start of
+/// the boot.
+///
+/// The stamp is the cheapest half of making the boot measurable: every line
+/// this init has ever printed said WHAT happened and nothing about when, so a
+/// pasted boot log showed the order of the boot and hid its shape -- a
+/// ten-second gate and a ten-millisecond one looked identical. Unstamped only
+/// before `main` sets the origin (the `--exec-on-graphics-vt` helper path).
 fn log(msg: &str) {
     // PID 1 has stdout/stderr wired to the console by the kernel.
-    println!("[eclipse-init] {msg}");
+    match since_boot() {
+        Some(t) => println!("[eclipse-init] [{:>8}] {msg}", secs(t)),
+        None => println!("[eclipse-init] {msg}"),
+    }
 }
 
 /// How long init waits before re-entering a supervision loop that panicked, so
@@ -505,6 +695,9 @@ fn main() {
         }
     }
 
+    // The origin of every stamped line and of the boot timeline. Taken before
+    // the first line is printed, so nothing in the boot is outside the clock.
+    let _ = BOOT_T0.set(Instant::now());
     log("starting");
 
     // Name the panic on the console before it unwinds: the default hook writes
@@ -523,16 +716,25 @@ fn main() {
     // take a while, and a SIGTERM/SIGINT/SIGUSRx arriving before the handlers
     // exist hits SIG_DFL, which this kernel implements as terminate.
     install_signal_handlers();
-    mount_pseudo_filesystems();
+    // Timed, all of it: `mount_pseudo_filesystems` wipes /run and /tmp, and the
+    // four `apply_*` steps read and rewrite files under /etc and /proc. None of
+    // it had ever been measured, and "init took a second before it started
+    // anything" is exactly the kind of thing that hides there.
+    timed(
+        "mount the pseudo-filesystems, wipe /run and /tmp",
+        mount_pseudo_filesystems,
+    );
 
     // Align /proc/kbd, /etc/eclipse/keyboard and labwc's XKB_DEFAULT_LAYOUT
     // before the compositor starts, so the first keymap matches the console.
-    apply_keyboard_layout();
-    apply_locale();
-    apply_timezone();
-    apply_look();
+    timed("apply the keyboard layout", apply_keyboard_layout);
+    timed("apply the locale", apply_locale);
+    timed("apply the timezone", apply_timezone);
+    timed("apply the look", apply_look);
 
-    let mut services = load_services(Path::new("/etc/eclipse/services"));
+    let mut services = timed("read the service files", || {
+        load_services(Path::new("/etc/eclipse/services"))
+    });
 
     // Pick the desktop session and drop every service tagged for a different
     // one, so only the selected compositor/X stack is supervised.
@@ -562,7 +764,12 @@ fn main() {
     // sharing tty1 with the boot shell. The kernel then keeps the display on
     // tty7 once the session sets KD_GRAPHICS and returns to tty1 when it exits.
     if matches!(desktop.as_str(), "labwc" | "xorg") {
-        switch_to_graphics_vt();
+        // `VT_WAITACTIVE` blocks until the switch lands, so this is a wait and
+        // belongs in the timeline like any other.
+        timed(
+            "switch the display to the graphics VT",
+            switch_to_graphics_vt,
+        );
     }
 
     let order = ordered_names(&services);
@@ -591,6 +798,9 @@ fn main() {
         guard(&format!("starting {name}"), || start_service(svc));
     }
 
+    // Everything declared has been started (or given up on): the boot proper is
+    // over, so this is where its timeline is complete.
+    report_boot_timeline();
     log("entering supervision loop");
     // PID 1 may not return and may not die, so a panic in here is caught and
     // the loop re-entered. The pause is what keeps a panic on the first
@@ -1755,7 +1965,9 @@ fn start_service(svc: &mut Service) {
         .clone()
         .or_else(|| (svc.name == "labwc").then(|| String::from("/run/seatd.sock")));
     if let Some(path) = wait {
-        wait_for_socket(&path, Duration::from_secs(10));
+        timed(format!("{}: wait for the socket {path}", svc.name), || {
+            wait_for_socket(&path, Duration::from_secs(10))
+        });
     }
     // See `Service::wait_path`: input nodes for labwc. Always wait for
     // `/dev/input` when starting labwc, even if the service file is an older
@@ -1765,9 +1977,16 @@ fn start_service(svc: &mut Service) {
         .clone()
         .or_else(|| (svc.name == "labwc").then(|| String::from("/dev/input")));
     if let Some(path) = wait_path {
-        wait_for_path(&path, Duration::from_secs(8));
+        timed(format!("{}: wait for {path} to appear", svc.name), || {
+            wait_for_path(&path, Duration::from_secs(8))
+        });
         if Path::new(&path).is_dir() {
-            wait_for_dir_settled(&path, Duration::from_secs(8), Duration::from_secs(1));
+            // Timed SEPARATELY from the appearance: they are different costs
+            // with different cures -- one is the kernel enumerating devices,
+            // the other is a fixed settle window this init chooses.
+            timed(format!("{}: wait for {path} to settle", svc.name), || {
+                wait_for_dir_settled(&path, Duration::from_secs(8), Duration::from_secs(1))
+            });
         }
     }
     // Name an unrunnable `exec =` on the console: the child that fails execve
@@ -1795,7 +2014,10 @@ fn start_service(svc: &mut Service) {
             if let Some(pid) = spawn(&svc.exec, svc.log.as_deref()) {
                 // Wait for this child specifically -- but not for ever: a
                 // oneshot that never exits used to hang the whole boot.
-                await_oneshot(&svc.name, pid, start_timeout(svc.kind, svc.timeout));
+                let limit = start_timeout(svc.kind, svc.timeout);
+                timed(format!("{}: run the oneshot", svc.name), || {
+                    await_oneshot(&svc.name, pid, limit)
+                });
             }
         }
         Kind::Respawn => {
@@ -2922,6 +3144,134 @@ fn errno() -> libc::c_int {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -- The boot timeline -------------------------------------------------
+
+    fn step(what: &str, at_ms: u64, took_ms: u64) -> BootStep {
+        BootStep {
+            what: String::from(what),
+            at: Duration::from_millis(at_ms),
+            took: Duration::from_millis(took_ms),
+        }
+    }
+
+    #[test]
+    fn the_timeline_lists_the_worst_stretch_first() {
+        // The table answers one question -- what is there to cut -- and the
+        // stamped console lines above it already give the order, so sorting it
+        // chronologically would bury the answer in the middle.
+        let steps = vec![
+            step("labwc: wait for /dev/input to settle", 3_000, 1_100),
+            step("gtk-caches: run the oneshot", 1_000, 2_000),
+            step("labwc: wait for the socket /run/seatd.sock", 2_900, 90),
+        ];
+        let text = render_boot_timeline(&steps, Duration::from_millis(5_000));
+        let order: Vec<&str> = text
+            .lines()
+            .skip(1)
+            .filter_map(|l| l.split_whitespace().last())
+            .collect();
+        assert_eq!(order[0], "oneshot");
+        assert!(order[1].ends_with("settle"), "{text}");
+    }
+
+    #[test]
+    fn a_stretch_under_the_floor_lands_in_the_rest_row_and_not_in_the_table() {
+        // A boot has a long tail of sub-millisecond steps; a table that lists
+        // them is one nobody reads to the end. They must still be ACCOUNTED
+        // for, or the rest row stops meaning "time nothing explains".
+        let steps = vec![step("a blink", 10, 1), step("a real wait", 100, 900)];
+        let text = render_boot_timeline(&steps, Duration::from_millis(1_000));
+        assert!(!text.contains("a blink"), "{text}");
+        assert!(text.contains("a real wait"), "{text}");
+        // 1000 - 901 = 99 ms unexplained.
+        assert!(text.contains("0.099s"), "{text}");
+    }
+
+    #[test]
+    fn the_rest_row_is_what_the_named_stretches_do_not_account_for() {
+        // The number that says whether this instrumentation is still missing
+        // something: if `rest` is most of the boot, the waits are not where the
+        // time is going and the next measurement has to go somewhere else.
+        let steps = vec![step("one", 0, 400), step("two", 400, 400)];
+        let text = render_boot_timeline(&steps, Duration::from_millis(1_000));
+        assert!(text.contains("0.200s"), "{text}");
+        assert!(text.contains("20%"), "{text}");
+    }
+
+    #[test]
+    fn a_timeline_with_no_stretch_still_says_how_long_the_boot_took() {
+        // The console-session boot starts almost nothing: no gate, no oneshot,
+        // nothing over the floor. The header is then the whole answer, and a
+        // header that says "0.000s" because it was computed from the rows
+        // would be a lie about a boot that really did take time.
+        let text = render_boot_timeline(&[], Duration::from_millis(1_234));
+        assert!(text.contains("1.234s to the supervision loop"), "{text}");
+        assert!(text.contains("0.000s of it waiting"), "{text}");
+    }
+
+    #[test]
+    fn the_rest_row_cannot_wrap_when_the_stretches_outrun_the_total() {
+        // `total` is read after the steps, so it cannot be the smaller today.
+        // Without the saturating subtraction a future caller that read it
+        // first would print a row claiming the boot's remainder took 584
+        // million years, which is the kind of number that gets a measurement
+        // dismissed as broken.
+        let steps = vec![step("one", 0, 2_000)];
+        let text = render_boot_timeline(&steps, Duration::from_millis(1_000));
+        assert!(text.contains("0.000s    0%"), "{text}");
+        // And the header reports the waiting capped at the boot, not 2.000s.
+        assert!(text.contains("1.000s of it waiting"), "{text}");
+    }
+
+    #[test]
+    fn a_percentage_of_a_boot_that_took_no_time_is_zero_and_not_a_division_by_zero() {
+        assert_eq!(percent_of(Duration::from_millis(5), Duration::ZERO), 0);
+        assert_eq!(
+            percent_of(Duration::from_millis(500), Duration::from_millis(1_000)),
+            50
+        );
+        // Capped: a stretch longer than the total reads 100%, never 200%.
+        assert_eq!(
+            percent_of(Duration::from_millis(3_000), Duration::from_millis(1_000)),
+            100
+        );
+    }
+
+    #[test]
+    fn nothing_is_recorded_once_the_timeline_has_been_rendered() {
+        // `start_service` serves both the boot and every crash-restart after
+        // it, so a respawn that dies an hour later walks the same gates. Those
+        // waits are not boot: recording them would grow the vector for the
+        // life of the machine and rewrite the history of a boot that is over.
+        let before = BOOT_RECORDED.swap(true, Ordering::SeqCst);
+        let len = BOOT_STEPS.lock().unwrap_or_else(|p| p.into_inner()).len();
+        note_step("a restart an hour after the boot", Duration::from_secs(5));
+        assert_eq!(
+            BOOT_STEPS.lock().unwrap_or_else(|p| p.into_inner()).len(),
+            len
+        );
+        BOOT_RECORDED.store(before, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn a_stretch_is_recorded_at_when_it_started_not_when_it_ended() {
+        // The `at` column lines a row up against the stamped console lines
+        // above it; a wait charged to the moment it FINISHED points the reader
+        // at whatever ran next instead of at the thing that waited.
+        let before = BOOT_RECORDED.swap(false, Ordering::SeqCst);
+        let _ = BOOT_T0.set(Instant::now());
+        BOOT_STEPS.lock().unwrap_or_else(|p| p.into_inner()).clear();
+        std::thread::sleep(Duration::from_millis(60));
+        note_step(
+            "a wait that has already happened",
+            Duration::from_millis(50),
+        );
+        let steps = BOOT_STEPS.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        BOOT_RECORDED.store(before, Ordering::SeqCst);
+        assert_eq!(steps.len(), 1, "{steps:?}");
+        assert!(steps[0].at < Duration::from_millis(50), "{steps:?}");
+    }
 
     // -- Boot arguments ----------------------------------------------------
     //

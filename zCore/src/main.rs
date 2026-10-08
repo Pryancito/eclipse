@@ -497,6 +497,13 @@ fn primary_main(config: kernel_hal::KernelConfig) {
                 //"MESA_LOADER_DRIVER_OVERRIDE=kms_swrast".into(),
             ];
             let rootfs = fs::rootfs();
+            // The root filesystem is mounted. Its own mark, because the 90->95
+            // stretch used to be the biggest unexplained gap in the boot
+            // timeline and it holds two completely different things: mounting
+            // the root (a disk, or unpacking the initramfs) and then a long run
+            // of cmdline switches that only set flags. Separating them says
+            // which of the two to look at.
+            kernel_hal::console::early_progress_bar(91);
             // Load hunter's /etc/hunter/{whitelist,blacklist} from the root fs
             // and enable exec learning (trust-on-first-use). Safe if absent.
             linux_object::fs::hunter_config::load(&rootfs.root_inode());
@@ -869,6 +876,25 @@ fn primary_main(config: kernel_hal::KernelConfig) {
             // Keep secondary CPUs idle until root is mounted and init is spawned.
             STARTED.store(true, Ordering::SeqCst);
             kernel_hal::console::early_progress_bar(100);
+            // The kernel half of the boot, as a timeline. Printed here because
+            // this is the last mark: by now init(1) is running, so the table is
+            // complete and nothing is waiting on it. `dmesg` timestamps every
+            // line it prints, which says when the kernel SPOKE; this says where
+            // it spent the silence between two lines, which is the only figure
+            // "make the boot faster" can start from.
+            for line in kernel_hal::boot_marks::render().lines() {
+                // Both sinks, deliberately. `klog_info!` writes to the dmesg
+                // ring ONLY, which is where one reads it on a machine that is
+                // already up (`dmesg`, and the tail of `/proc/perf/kernel`);
+                // the direct serial write is what puts it in a captured boot
+                // log, which is the form a boot measurement is actually pasted
+                // in. It does not go through `log::`, so `LOG=warn` -- the
+                // level every image ships at -- cannot swallow it, the same
+                // reason the oops and `[ipi-watch]` diagnostics bypass it.
+                klog_info!("{}", line);
+                kernel_hal::console::serial_write_str(line);
+                kernel_hal::console::serial_write_str("\r\n");
+            }
             // Either flag wants the console GPU up; the task runs once and
             // serves both (hardware cursor plane and/or local CE present).
             let want_console_gpu = kernel_hal::cmdline::flag(&options.cmdline, "nvidia.console_gpu");

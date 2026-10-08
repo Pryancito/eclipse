@@ -769,6 +769,10 @@ pub fn debug_write_fmt(fmt: Arguments) {
 ///
 /// This is intended for very early boot stages before the native graphic driver exists.
 pub fn early_progress_bar(progress: u32) {
+    // Timestamp it too: the same marks that draw the bar are the kernel's boot
+    // timeline (see `boot_marks`). One relaxed store per mark, fewer than
+    // twenty in a boot.
+    crate::boot_marks::mark(progress);
     crate::hal_fn::console::console_progress_early(progress);
 }
 

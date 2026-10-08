@@ -10,6 +10,7 @@ pub mod addr;
 pub mod affinity_walk;
 #[cfg(feature = "graphic")]
 pub mod boot_logo;
+pub mod boot_marks;
 pub mod cache_maint;
 pub mod cmdline;
 pub mod console;
