@@ -20,7 +20,7 @@ use zircon_object::vm::VmObject;
 
 use super::drm;
 use super::drm_trail;
-use crate::error::LxError;
+use crate::error::{LxError, LxResult};
 use zcore_drivers::display::edid;
 
 /// Parks until the DRM card fd has a queued event. Flat `Future` (no nested
@@ -232,7 +232,7 @@ impl DrmDev {
     ///
     /// Requests that asked for an event instead of blocking are left alone —
     /// that path already defers correctly through the timer queue.
-    pub async fn wait_vblank_sleep(&self, data: usize) {
+    pub async fn wait_vblank_sleep(&self, data: usize) -> LxResult<()> {
         // Linux caps this wait at 3 seconds (`DRM_WAIT_ON(..., 3 * HZ, ...)`).
         // Match it: a target far in the future must not park a thread forever,
         // and the sync arm reporting the current sequence after the cap is the
@@ -240,14 +240,14 @@ impl DrmDev {
         const MAX_WAIT: Duration = Duration::from_secs(3);
 
         if ucheck(data, core::mem::size_of::<DrmWaitVblank>()).is_err() {
-            return; // io_control will reject it with EFAULT in a moment
+            return Ok(()); // io_control will reject it with EFAULT in a moment
         }
         let req = unsafe { *(data as *const DrmWaitVblank) };
         if wait_vblank_check(req.typ).is_err() {
-            return; // the sync arm refuses it at once; nothing to sleep for
+            return Ok(()); // the sync arm refuses it at once; nothing to sleep for
         }
         if req.typ & _DRM_VBLANK_EVENT != 0 {
-            return; // event form: delivered by the timer queue, never blocks
+            return Ok(()); // event form: delivered by the timer queue, never blocks
         }
         const _DRM_VBLANK_RELATIVE: u32 = 0x1;
         const _DRM_VBLANK_NEXTONMISS: u32 = 0x1000_0000;
@@ -261,7 +261,7 @@ impl DrmDev {
         };
         if (target.wrapping_sub(now_seq) as i32) <= 0 {
             if req.typ & _DRM_VBLANK_NEXTONMISS == 0 {
-                return; // already reached: nothing to wait for
+                return Ok(()); // already reached: nothing to wait for
             }
             target = now_seq.wrapping_add(1);
         }
@@ -281,13 +281,14 @@ impl DrmDev {
             };
             acct.probe();
             if deadline >= cap {
-                kernel_hal::thread::sleep_until(cap).await;
+                crate::process::interruptible(kernel_hal::thread::sleep_until(cap)).await?;
                 // Stopped by the 3 s cap, not by the vblank asked for.
                 acct.timed_out();
                 break;
             }
-            kernel_hal::thread::sleep_until(deadline).await;
+            crate::process::interruptible(kernel_hal::thread::sleep_until(deadline)).await?;
         }
+        Ok(())
     }
 
     /// Sleep until a blocking `SYNCOBJ_WAIT` / `TIMELINE_WAIT` would succeed
@@ -300,15 +301,15 @@ impl DrmDev {
     /// pending hardware fences itself, under the table lock it takes anyway
     /// -- and back off between probes ([`fence_poll_wait`]). The sync arm
     /// then finishes the ioctl (usually on the first iteration).
-    pub async fn syncobj_wait_sleep(&self, cmd: u32, data: usize) {
+    pub async fn syncobj_wait_sleep(&self, cmd: u32, data: usize) -> LxResult<()> {
         if !zcore_drivers::display::nouveau_uapi_enabled() {
-            return;
+            return Ok(());
         }
         // A request the sync arm will refuse, or answer without waiting, is
         // not slept on. `data` is the caller's own pointer here, so the struct
         // is checked before it is read (`read_syncobj_wait` does not).
         if ucheck(data, syncobj_wait_prefix(cmd)).is_err() {
-            return;
+            return Ok(());
         }
         let Ok(Some(SyncobjWaitReq {
             handles,
@@ -318,7 +319,7 @@ impl DrmDev {
             ..
         })) = read_syncobj_wait(cmd, data)
         else {
-            return;
+            return Ok(());
         };
         let deadline_us = (timeout_nsec.max(0) as u64) / 1000;
         let wait_all = flags & DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL != 0;
@@ -351,15 +352,15 @@ impl DrmDev {
                     ) {
                         acct.timed_out();
                     }
-                    return;
+                    return Ok(());
                 }
                 None => {
                     // If the absolute deadline is already behind `timer_now`,
                     // wait_ready should have returned Timeout; the helper still
                     // refuses to sleep past it if the clocks disagree slightly.
-                    if !fence_poll_wait(acct.probes, deadline).await {
+                    if !fence_poll_wait(acct.probes, deadline).await? {
                         acct.timed_out();
-                        return;
+                        return Ok(());
                     }
                     acct.probe();
                 }
@@ -383,9 +384,9 @@ impl DrmDev {
     /// Every early return leaves the commit behaving exactly as before this
     /// existed: a malformed request, an fd that is not a fence, or a TEST_ONLY
     /// probe simply does not wait, and the sync arm reports on it as usual.
-    pub async fn atomic_in_fence_sleep(&self, data: usize) {
+    pub async fn atomic_in_fence_sleep(&self, data: usize) -> LxResult<()> {
         let Some((handle, point)) = self.atomic_in_fence(data) else {
-            return;
+            return Ok(());
         };
         let now = kernel_hal::timer::timer_now();
         let deadline_us = now.as_micros() as u64 + PRESENT_FENCE_TIMEOUT_US;
@@ -404,7 +405,7 @@ impl DrmDev {
                 true,
                 deadline_us,
             ) {
-                Some(Ok(_)) => return,
+                Some(Ok(_)) => return Ok(()),
                 Some(Err(outcome)) => {
                     if matches!(
                         outcome,
@@ -433,12 +434,12 @@ impl DrmDev {
                             );
                         }
                     }
-                    return;
+                    return Ok(());
                 }
                 None => {
-                    if !fence_poll_wait(acct.probes, deadline).await {
+                    if !fence_poll_wait(acct.probes, deadline).await? {
                         acct.timed_out();
-                        return;
+                        return Ok(());
                     }
                     acct.probe();
                 }
@@ -465,28 +466,28 @@ impl DrmDev {
     /// `NOWAIT` prep is never slept on: it answers EBUSY instead of blocking,
     /// so a sleep ahead of it would turn the one flag that promises not to
     /// block into a ten-second stall.
-    pub async fn cpu_prep_sleep(&self, cmd: u32, data: usize) {
+    pub async fn cpu_prep_sleep(&self, cmd: u32, data: usize) -> LxResult<()> {
         if !zcore_drivers::display::nouveau_uapi_enabled() {
-            return;
+            return Ok(());
         }
         if !zcore_drivers::display::is_cpu_prep_ioctl(cmd) {
-            return;
+            return Ok(());
         }
         // `data` is the caller's own pointer, checked before it is read: the
         // driver's arm reads it unchecked, but that runs after `io_control`
         // has vetted the fd, and this runs on anything userspace hands us.
         if ucheck(data, zcore_drivers::display::CPU_PREP_REQUEST_BYTES).is_err() {
-            return;
+            return Ok(());
         }
         // SAFETY: `is_cpu_prep_ioctl` accepted the size, and `ucheck` just
         // said those bytes are readable by this process.
         let (handle, flags) = unsafe { zcore_drivers::display::cpu_prep_request(data) };
         if zcore_drivers::display::cpu_prep_is_nowait(flags) {
-            return;
+            return Ok(());
         }
         let fences = drm::cpu_prep_fences(handle, drm::current_pid());
         if fences.is_empty() {
-            return;
+            return Ok(());
         }
         // The driver's own bound, so a sleep here can never outlast the wait
         // it stands in for: the sync arm answers EBUSY past it either way.
@@ -500,11 +501,11 @@ impl DrmDev {
             // semaphore word, and this loop takes the list again on every
             // probe.
             if zcore_drivers::scheme::syncobj::hw_fences_landed(&fences) {
-                return;
+                return Ok(());
             }
-            if !fence_poll_wait(acct.probes, deadline).await {
+            if !fence_poll_wait(acct.probes, deadline).await? {
                 acct.timed_out();
-                return;
+                return Ok(());
             }
             acct.probe();
         }
@@ -534,28 +535,28 @@ impl DrmDev {
     /// early return leaves the present exactly as it behaved before this
     /// existed, and a fence that misses the bound is reported and presented
     /// anyway -- a torn frame is a glitch, a frame that never comes is a hang.
-    pub async fn present_fence_sleep(&self, cmd: u32, data: usize) {
+    pub async fn present_fence_sleep(&self, cmd: u32, data: usize) -> LxResult<()> {
         // The only fences that exist here are the nouveau-uAPI ring's, so with
         // that surface off there is nothing to ask about -- and this runs on
         // every flip of the software desktop too, which must stay untouched.
         if !zcore_drivers::display::nouveau_uapi_enabled() {
-            return;
+            return Ok(());
         }
         let Some(kind) = legacy_present_kind(cmd) else {
-            return;
+            return Ok(());
         };
         // Read-only, and anything malformed simply does not wait: the sync arm
         // is about to reject it with EFAULT/EINVAL on its own.
         let fb_id = match kind {
             LegacyPresent::PageFlip => {
                 if ucheck(data, core::mem::size_of::<DrmModeCrtcPageFlip>()).is_err() {
-                    return;
+                    return Ok(());
                 }
                 unsafe { (*(data as *const DrmModeCrtcPageFlip)).fb_id }
             }
             LegacyPresent::SetCrtc => {
                 if ucheck(data, core::mem::size_of::<DrmModeGetCrtc>()).is_err() {
-                    return;
+                    return Ok(());
                 }
                 unsafe { (*(data as *const DrmModeGetCrtc)).fb_id }
             }
@@ -563,7 +564,7 @@ impl DrmDev {
         // A `SETCRTC` with a null fb turns the pipe off. It presents nothing,
         // so there is nothing to wait for.
         if fb_id == 0 {
-            return;
+            return Ok(());
         }
         let fences = drm::scanout_render_fence(fb_id);
         let n = FENCE_PRESENTS
@@ -596,7 +597,7 @@ impl DrmDev {
                     n
                 );
             }
-            return;
+            return Ok(());
         }
         let waited_from = kernel_hal::timer::timer_now();
         let deadline = waited_from + core::time::Duration::from_micros(PRESENT_FENCE_TIMEOUT_US);
@@ -619,9 +620,9 @@ impl DrmDev {
                         fences.len()
                     );
                 }
-                return;
+                return Ok(());
             }
-            if !fence_poll_wait(acct.probes, deadline).await {
+            if !fence_poll_wait(acct.probes, deadline).await? {
                 acct.timed_out();
                 // Budgeted for the same reason as the atomic wait: a ring that
                 // stopped landing fences misses this bound on EVERY frame, and
@@ -643,7 +644,7 @@ impl DrmDev {
                         }
                     );
                 }
-                return;
+                return Ok(());
             }
             acct.probe();
         }
@@ -3461,15 +3462,19 @@ impl Drop for PreWaitAccount {
 /// hardware lands in far less than the old 1 ms tick, so the tick, not the
 /// GPU, was setting the frame rate: see `fence_poll_step` for the whole
 /// reasoning and for why the backoff ends up at that same tick.
-async fn fence_poll_wait(probes: u32, deadline: Duration) -> bool {
+async fn fence_poll_wait(probes: u32, deadline: Duration) -> LxResult<bool> {
     use zcore_drivers::scheme::syncobj::{fence_poll_step, PollStep};
+    // Asked on every look, so the yield arm is interruptible too: it sleeps
+    // for no time at all, but a client that spends a whole frame in the busy
+    // phase would otherwise take no signal for that frame.
+    crate::process::check_signals()?;
     match fence_poll_step(probes) {
         PollStep::Yield => {
             if kernel_hal::timer::timer_now() >= deadline {
-                return false;
+                return Ok(false);
             }
             kernel_hal::thread::yield_now().await;
-            true
+            Ok(true)
         }
         PollStep::Sleep { us } => {
             let Some(wake) = next_poll_wake(
@@ -3477,10 +3482,13 @@ async fn fence_poll_wait(probes: u32, deadline: Duration) -> bool {
                 deadline,
                 Duration::from_micros(us),
             ) else {
-                return false;
+                return Ok(false);
             };
-            kernel_hal::thread::sleep_until(wake).await;
-            true
+            // `interruptible`, not a bare `sleep_until`: a sleep is exactly
+            // the abandonable future it documents, and a `^C` that lands in
+            // the middle of one must not wait it out.
+            crate::process::interruptible(kernel_hal::thread::sleep_until(wake)).await?;
+            Ok(true)
         }
     }
 }
@@ -19078,6 +19086,85 @@ mod pre_wait_resolve_tests {
                 name
             );
         }
+    }
+
+    /// Every pre-wait is interruptible, and so is the backoff the fence ones
+    /// share.
+    ///
+    /// These five are the only places in this kernel where a thread sleeps
+    /// with no fd behind it and no readiness waker to fire: nothing but the
+    /// fence it waits for, or its own deadline, ever ends them. They used to
+    /// ask nothing about signals, so a `^C` on a GL client did nothing until
+    /// the wait finished on its own -- three seconds for `WAIT_VBLANK`, the
+    /// client's own deadline for the syncobj waits, `GEM_CPU_PREP`'s own for
+    /// that one. On a desktop that is the first `^C` on `glxgears` landing
+    /// nowhere and the second one killing it.
+    ///
+    /// Linux sleeps all of these interruptibly and answers `-ERESTARTSYS`
+    /// (`drm_syncobj_wait`, `drm_wait_vblank`), and libdrm's `drmIoctl()`
+    /// retries on `EINTR`, so the only caller that notices the change is the
+    /// one being killed -- which is the point: the signal is taken at the
+    /// syscall boundary.
+    ///
+    /// Nothing can run these in a test (they need a live `DrmDev`, a process
+    /// and a GPU), so the guard is on the shape, like the two above.
+    #[test]
+    fn every_pre_wait_can_be_interrupted_by_a_signal() {
+        let src = include_str!("drm_scheme.rs");
+        for name in [
+            "pub async fn wait_vblank_sleep(",
+            "pub async fn syncobj_wait_sleep(",
+            "pub async fn atomic_in_fence_sleep(",
+            "pub async fn cpu_prep_sleep(",
+            "pub async fn present_fence_sleep(",
+        ] {
+            let body = body(src, name);
+            assert!(
+                body.lines()
+                    .next()
+                    .unwrap_or_default()
+                    .contains("-> LxResult<()>"),
+                "{} has no way to tell its caller a signal arrived, so the \
+                 ioctl cannot answer EINTR",
+                name
+            );
+            let code: alloc::string::String = body
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .collect();
+            // A bare `sleep_until` is a sleep no signal can cut short, which
+            // is exactly what these were.
+            assert_eq!(
+                code.matches("kernel_hal::thread::sleep_until(").count(),
+                code.matches("interruptible(kernel_hal::thread::sleep_until(")
+                    .count(),
+                "{} sleeps somewhere a signal cannot reach",
+                name
+            );
+            assert!(
+                code.contains("interruptible(kernel_hal::thread::sleep_until(")
+                    || code.contains("fence_poll_wait(acct.probes, deadline).await?"),
+                "{} waits without ever asking whether a signal arrived",
+                name
+            );
+        }
+        // The backoff the four fence waits park in. Sliced by hand: `body`
+        // stops at the next indented doc comment, and this one is a free
+        // function whose neighbours are not indented.
+        let fpw = src
+            .split_once("async fn fence_poll_wait(")
+            .expect("fence_poll_wait is no longer in this file")
+            .1;
+        let fpw = &fpw[..fpw.find("\n}\n").expect("an unterminated function")];
+        assert!(
+            fpw.contains("check_signals()?"),
+            "fence_poll_wait no longer asks about signals, so a client in its \
+             busy phase takes none for the whole frame"
+        );
+        assert!(
+            fpw.contains("interruptible(kernel_hal::thread::sleep_until("),
+            "fence_poll_wait is back to an uninterruptible sleep"
+        );
     }
 
     /// A wait satisfied on its first look reports no parking, however long
