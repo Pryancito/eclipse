@@ -1776,38 +1776,79 @@ impl NvidiaGpu {
         // ~30ms apart: FRM/LINE counters advancing = live raster fetch.
         // Gated on PMC_ENABLE bit30 (PDISP engine enabled) to avoid priv
         // errors on a display-less config.
-        if rd(0x000200) & (1 << 30) != 0 {
-            let mut dpca_a = [0u32; 4];
-            for (i, slot) in dpca_a.iter_mut().enumerate() {
-                *slot = rd(0x616330 + i * 2048);
-            }
-            // ~30ms spin so a live raster visibly advances its counters.
-            let t0 = unsafe { crate::bus::drivers_timer_now_as_micros() };
-            while unsafe { crate::bus::drivers_timer_now_as_micros() }.wrapping_sub(t0) < 30_000 {
-                gpu_spin();
-            }
-            for i in 0..4usize {
-                let head = rd(0x612078 + i * 2048);
-                let mode = (head >> 8) & 0x3;
-                let dpca_b = rd(0x616330 + i * 2048);
-                let line = alloc::format!(
-                    "[{}] preboot head{} STATE={:#010x} (mode={} {}) DPCA {:#010x} -> {:#010x} ({})",
-                    tag,
-                    i,
-                    head,
-                    mode,
-                    match mode { 0 => "SLEEP", 1 => "SNOOZE", 2 => "AWAKE", _ => "?" },
-                    dpca_a[i],
-                    dpca_b,
-                    if dpca_a[i] != dpca_b { "ADVANCING = live raster" } else { "frozen" }
-                );
-                log::error!("{}", line);
-                let _ = writeln!(s, "{}", line);
-            }
-        } else {
+        s.push_str(&self.dump_head_liveness(tag, "preboot"));
+        s
+    }
+
+    /// Head liveness on its own, so the same four lines can be printed again
+    /// AFTER a bring-up and compared with the `preboot` ones. That comparison
+    /// is the whole point: on the console GPU, `gpuStateLoad` takes
+    /// `KernelDisplay` all the way to Post-Load, which hands the display
+    /// engine to RM/GSP while nothing programs a mode afterwards -- and the
+    /// monitor goes black with the GPU otherwise alive (the CE test right
+    /// after it passes, and the log still gets written). Which of the two
+    /// things happened decides the fix, and only these registers tell them
+    /// apart: a head that fell to SLEEP needs a real modeset through RM,
+    /// while a head still AWAKE and ADVANCING is scanning out of somewhere
+    /// else and only needs pointing back at the console framebuffer, which
+    /// the surfaceflip path already knows how to do.
+    ///
+    /// `NV_PDISP_FE_CORE_HEAD_STATE(i)` = 0x612078 + i*2048, mode bits 9:8
+    /// (0=SLEEP, 1=SNOOZE, 2=AWAKE; dev_disp.h v04_00:31-35).
+    /// `NV_PDISP_RG_DPCA(i)` = 0x616330 + i*2048 (v03_00 header -- read-only
+    /// probe, 0xBADFxxxx means not present at that offset on v04), read twice
+    /// ~30 ms apart: FRM/LINE counters advancing = live raster fetch. Gated on
+    /// PMC_ENABLE bit 30 (PDISP enabled) to avoid priv errors on a
+    /// display-less config. Read-only throughout.
+    fn dump_head_liveness(&self, tag: &str, phase: &str) -> String {
+        use core::fmt::Write;
+        let bar0 = self._bar0;
+        let rd =
+            |off: usize| -> u32 { unsafe { core::ptr::read_volatile((bar0 + off) as *const u32) } };
+        let mut s = String::new();
+        if rd(0x000200) & (1 << 30) == 0 {
             let line = alloc::format!(
-                "[{}] preboot PDISP disabled in PMC_ENABLE (no head dump)",
-                tag
+                "[{}] {} PDISP disabled in PMC_ENABLE (no head dump)",
+                tag,
+                phase
+            );
+            log::error!("{}", line);
+            let _ = writeln!(s, "{}", line);
+            return s;
+        }
+        let mut dpca_a = [0u32; 4];
+        for (i, slot) in dpca_a.iter_mut().enumerate() {
+            *slot = rd(0x616330 + i * 2048);
+        }
+        // ~30ms spin so a live raster visibly advances its counters.
+        let t0 = unsafe { crate::bus::drivers_timer_now_as_micros() };
+        while unsafe { crate::bus::drivers_timer_now_as_micros() }.wrapping_sub(t0) < 30_000 {
+            gpu_spin();
+        }
+        for i in 0..4usize {
+            let head = rd(0x612078 + i * 2048);
+            let mode = (head >> 8) & 0x3;
+            let dpca_b = rd(0x616330 + i * 2048);
+            let line = alloc::format!(
+                "[{}] {} head{} STATE={:#010x} (mode={} {}) DPCA {:#010x} -> {:#010x} ({})",
+                tag,
+                phase,
+                i,
+                head,
+                mode,
+                match mode {
+                    0 => "SLEEP",
+                    1 => "SNOOZE",
+                    2 => "AWAKE",
+                    _ => "?",
+                },
+                dpca_a[i],
+                dpca_b,
+                if dpca_a[i] != dpca_b {
+                    "ADVANCING = live raster"
+                } else {
+                    "frozen"
+                }
             );
             log::error!("{}", line);
             let _ = writeln!(s, "{}", line);
@@ -5216,8 +5257,14 @@ impl DrmScheme for NvidiaGpu {
         s.push_str(&self.bringup_step8());
         s.push_str("[gpustep14] --- stage 4: gpuStatePreInit/Init/Load (gpustep9) ---\n");
         s.push_str(&self.bringup_step9());
+        // Head liveness again, right after the state load, to compare against
+        // the `preboot` lines above: this is where the monitor goes black on
+        // the console GPU, and these four lines say whether the raster stopped
+        // or merely moved. Read-only, ~30 ms.
+        s.push_str(&self.dump_head_liveness("gpustep14", "post-stage4"));
         s.push_str("[gpustep14] --- stage 5: copy-engine data movement (gpustep10) ---\n");
         s.push_str(&self.bringup_step10());
+        s.push_str(&self.dump_head_liveness("gpustep14", "post-stage5"));
         s.push_str("[gpustep14] === console GPU bring-up chain complete (see per-stage results above) ===\n");
         s
     }
