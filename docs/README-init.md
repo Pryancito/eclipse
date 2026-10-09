@@ -20,7 +20,7 @@ publica en `/etc/eclipse/services/`.
 |---|---|---|---|---|---|---|---|
 | Supervisión y reinicio | sí | sí | sí | no (solo arranque) | sí | sí | sí |
 | Backoff del lazo de crash | `RestartSec` | 1 s fijo | 1 s fijo | — | 10 s mínimo | sí | 250 ms → 8 s, exponencial |
-| **Rendirse con un servicio que no puede funcionar** | `StartLimitBurst` → `failed` | no | no | — | *throttle* | → `maintenance` | **sí (20 caídas seguidas)** |
+| **Rendirse con un servicio que no puede funcionar** | `StartLimitBurst` → `failed` | no | no | — | *throttle* | → `maintenance` | **sí (20 caídas seguidas, o 20 arranques en media hora)** |
 | **Límite de tiempo al arrancar** | `TimeoutStartSec` 90 s | no | `timeout-up` | sí | `ExitTimeOut` | obligatorio | **sí (90 s, `timeout =`)** |
 | Orden por dependencias | sí | no | sí | sí | no | sí | sí (`after =`, topológico) |
 | Espera de *readiness* | `Type=notify` | no | *fd* de notificación | no | *socket activation* | no | sondeo de socket/ruta acotado |
@@ -172,6 +172,54 @@ un hijo concreto y una cosecha de «cualquier hijo» se lo quitaría de debajo d
 La contabilidad salió del lazo a `note_exit`, que ya se puede probar: cuatro
 tests, y el que importa fija que una caída de 40 ms durante una puerta de 10 s
 sigue siendo una caída.
+
+## Lo que se cerró en la sexta tanda
+
+**Un `respawn` que duerme antes de rendirse ya no es inmortal.** El límite de
+caídas de la primera tanda solo se dispara con un servicio que *nunca* pasa de
+`HEALTHY_UPTIME`, y eso deja fuera a toda una familia de bucles: un envoltorio
+que **duerme** antes de salir. Todos los `eclipse-*` de las imágenes lo hacen;
+`eclipse-pulseaudio` es
+
+```sh
+command -v pulseaudio >/dev/null 2>&1 || { echo ...; sleep 8; exit 127; }
+```
+
+así que cada intento vivía 8 s, se leía como una vuelta sana, ponía la cuenta de
+caídas a cero y se reiniciaba al instante con el backoff reseteado. En un
+arranque `minimal` (que no trae pulseaudio) eso es, mientras la máquina esté
+encendida:
+
+```text
+respawn: pulseaudio exited after 8.125682158s (exit 127 ...), restarting
+respawn: pulseaudio exited after 8.032575278s (exit 127 ...), restarting
+```
+
+Un `sleep` dentro del servicio es exactamente para lo que está el backoff del
+supervisor, y de paso desactivaba el backoff **y** el límite de caídas. Dos
+cosas lo cierran:
+
+1. **Un 126 o un 127 no es una vuelta sana**, dure lo que dure. Son los dos
+   únicos códigos que no son la opinión del programa sino el informe de que no
+   llegó a correr: el binario no está, o está y no se puede ejecutar. Ningún
+   reintento arregla ninguno de los dos, así que cuentan como caída y el
+   servicio acaba dándose por perdido con su línea y su log.
+2. **Se cuentan los arranques**, no solo las caídas: más de 20 en media hora y
+   se da por perdido, con cualquier código de salida y con cualquier vida. Es la
+   red que coge los `sleep 60; exit 1`, que ningún código delata. La ventana es
+   larga a propósito —los envoltorios duermen hasta 60 s— porque la de systemd
+   (5 arranques en 10 s) no vería ninguno de estos bucles; y un `respawn` sano
+   no se reinicia nunca, así que cada arranque es una muerte. Uno que se caiga
+   una vez por hora no se descarta jamás.
+
+Se cuenta en `start_service`, que es el único sitio por donde pasan todos los
+arranques: un servicio cuyo intento duerme parece sano al salir y
+completamente normal al entrar. La negativa **no** se apunta en la ventana, o
+echaría de ella un arranque de verdad.
+
+Los `sleep` de los envoltorios se quedan como están: ahora solo marcan el ritmo
+de los reintentos, y lo que tenía que cambiar era el supervisor, al que ningún
+`sleep` puede engañar.
 
 ## Los tres ajustes de arranque, a la vez
 
