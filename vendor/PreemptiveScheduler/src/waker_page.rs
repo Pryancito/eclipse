@@ -85,6 +85,37 @@ pub struct WakerPage {
     // completed: AtomicU64SC,
     dropped: AtomicU64SC,
     borrowed: AtomicU64SC,
+    /// Which of these 64 slots hold a task that carries a CPU affinity mask.
+    ///
+    /// This lane is not scheduler state: nothing is published or consumed
+    /// through it and no wake reads it. It exists so that the two scans that
+    /// have to ask "may *this* CPU run that task" can answer for most slots
+    /// without touching the task at all. A task with no mask is allowed on
+    /// every CPU unconditionally (`Task::allowed_on` returns `true` for
+    /// `None`), which is the fact
+    /// [`FutureCollection::affine`](crate::task_collection::FutureCollection::affine)
+    /// already exploits for a whole queue; this is the same fact per slot.
+    ///
+    /// The difference that makes it worth a lane: `affine` counts tasks *with
+    /// a mask*, not tasks pinned away from the asker, so one
+    /// `sched_setaffinity` anywhere on a CPU's queue switched both scans to
+    /// their per-bit form for every task on it -- a `PinSlab` lookup and an
+    /// `allowed_on` per runnable bit, on the way into `hlt` and on every
+    /// victim of every idle steal pass. Measured at a thousand runnable
+    /// tasks: 10 ns -> 3.3 us for the pre-halt recheck and 30 ns -> 3.7 us
+    /// for a thief's probe. With this lane the scans popcount
+    /// `runnable & !affine` and walk only the remainder.
+    ///
+    /// The invariant is that a slot's bit is set exactly while its current
+    /// occupant carries a mask, and it is kept by the two calls that bracket
+    /// a slot's life: [`initialize`](Self::initialize) clears it as it hands
+    /// the slot out (so a reused slot never inherits the last occupant's
+    /// answer) and [`mark_affine`](Self::mark_affine) sets it for the one
+    /// insert that needs it. `Task::affinity` is an `Option` fixed when the
+    /// task is built -- `sched_setaffinity` changes the mask *inside* it, not
+    /// whether there is one -- so nothing can change a slot's answer while it
+    /// is occupied.
+    affine: AtomicU64SC,
     /// Logical CPU whose [`TaskCollection`](crate::task_collection::TaskCollection)
     /// owns this page. A cross-CPU wake targets this CPU's run queue; if it is
     /// halted, `wake_by_ref` sends it a reschedule IPI so the wake is honoured
@@ -100,6 +131,7 @@ impl WakerPage {
             // completed: AtomicU64SC::new(0),
             dropped: AtomicU64SC::new(0),
             borrowed: AtomicU64SC::new(0),
+            affine: AtomicU64SC::new(0),
             owner_cpu,
         }
     }
@@ -108,6 +140,16 @@ impl WakerPage {
         Arc::new(WakerPage::new_inner(owner_cpu))
     }
 
+    /// Hand slot `idx` out: published as runnable, and every other lane
+    /// cleared so the new occupant inherits nothing from the last one.
+    ///
+    /// `affine` is cleared here rather than only in [`clear`](Self::clear)
+    /// deliberately. Clearing it on retirement alone would be enough today --
+    /// `FutureCollection::remove` is the only caller of `PinSlab::remove` and
+    /// it retires the slot first -- but that makes a scan's correctness rest
+    /// on the slab's reuse discipline, one call away in another module. The
+    /// extra `lock`-prefixed instruction costs ~4 ns on a ~234 ns spawn and
+    /// buys an invariant that holds whatever the slab does.
     pub fn initialize(&self, idx: usize) {
         debug_assert!(idx < 64);
         self.notified.fetch_or(1 << idx);
@@ -115,6 +157,26 @@ impl WakerPage {
         // self.completed.fetch_and(!(1 << idx));
         self.dropped.fetch_and(!(1 << idx));
         self.borrowed.fetch_and(!(1 << idx));
+        self.affine.fetch_and(!(1 << idx));
+    }
+
+    /// Record that the task now in slot `idx` carries an affinity mask.
+    ///
+    /// Called by `FutureCollection::insert` right after
+    /// [`initialize`](Self::initialize), for the one task in a thousand that
+    /// has one. See the [`affine`](Self::affine) lane.
+    pub fn mark_affine(&self, idx: usize) {
+        debug_assert!(idx < 64);
+        self.affine.fetch_or(1 << idx);
+    }
+
+    /// The slots on this page whose task carries an affinity mask.
+    ///
+    /// Everything *not* in this set and runnable is work for whoever owns the
+    /// page, with no question to ask and no task to fetch.
+    #[inline]
+    pub fn affine_bits(&self) -> u64 {
+        self.affine.load()
     }
 
     pub fn mark_dropped(&self, idx: usize) {
@@ -334,7 +396,8 @@ impl WakerPage {
         self.yielded.fetch_and(mask);
         // self.completed.fetch_and(mask);
         self.dropped.fetch_and(mask);
-        self.borrowed.fetch_and(mask)
+        self.borrowed.fetch_and(mask);
+        self.affine.fetch_and(mask)
     }
 
     pub fn make_waker(self: &Arc<Self>, idx: usize, dropped: &Arc<AtomicBool>) -> WakerRef {

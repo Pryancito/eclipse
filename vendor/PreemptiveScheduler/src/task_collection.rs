@@ -246,6 +246,12 @@ impl FutureCollection {
         }
         let (page, subpage_idx) = self.page(key);
         page.initialize(subpage_idx);
+        if affine {
+            // So the two scans below can tell this slot apart from the ones
+            // that may run anywhere, without fetching the task. See
+            // `WakerPage::affine_bits`.
+            page.mark_affine(subpage_idx);
+        }
         // Build the task's one shared waker now that its page slot exists.
         // (Clone the page Arc first so the `pages` borrow ends before the
         // mutable `slab` access below.)
@@ -536,17 +542,30 @@ impl TaskCollection {
                     let page = &inner.pages[page_idx];
                     let (notified, dropped, borrowed) = page.peek();
                     let runnable = notified & !dropped & !borrowed;
-                    if runnable != 0 {
-                        for subpage_idx in BitIter::from(runnable) {
-                            let key = pack_key(DEFAULT_PRIORITY, page_idx, subpage_idx);
-                            let allowed = inner
-                                .slab
-                                .get(unmask_priority(key))
-                                .map(|task| task.allowed_on(cpu))
-                                .unwrap_or(true);
-                            if allowed {
-                                return true;
-                            }
+                    if runnable == 0 {
+                        continue;
+                    }
+                    // A runnable slot whose task carries no mask is allowed
+                    // here, full stop -- `allowed_on` is unconditionally
+                    // `true` for a task with no mask, which is the whole of
+                    // the `affine == 0` shortcut above narrowed to one slot.
+                    // So one `and` answers for every such slot on the page
+                    // and only the masked ones are worth a `PinSlab` lookup.
+                    // Both lanes are read under this collection's lock, which
+                    // `insert` also needs, so the two cannot disagree.
+                    let affine = page.affine_bits();
+                    if runnable & !affine != 0 {
+                        return true;
+                    }
+                    for subpage_idx in BitIter::from(runnable & affine) {
+                        let key = pack_key(DEFAULT_PRIORITY, page_idx, subpage_idx);
+                        let allowed = inner
+                            .slab
+                            .get(unmask_priority(key))
+                            .map(|task| task.allowed_on(cpu))
+                            .unwrap_or(true);
+                        if allowed {
+                            return true;
                         }
                     }
                 }
@@ -622,7 +641,13 @@ impl TaskCollection {
             if runnable == 0 {
                 continue;
             }
-            for subpage_idx in BitIter::from(runnable) {
+            // Same split as `has_ready`, except that this figure is a count
+            // and not a question, so it has no early exit and the popcount is
+            // the whole of the saving: unmasked runnable slots are allowed for
+            // every thief and are counted without being fetched.
+            let affine = inner.pages[page_idx].affine_bits();
+            n += (runnable & !affine).count_ones() as usize;
+            for subpage_idx in BitIter::from(runnable & affine) {
                 let key = pack_key(DEFAULT_PRIORITY, page_idx, subpage_idx);
                 let allowed = inner
                     .slab
@@ -1219,7 +1244,7 @@ mod collection_tests {
         fn record(cpu: usize) {
             if cpu == 2 {
                 PUBLISHED_BEFORE_KICK.store(
-                    crate::runtime::stranded_mask_for_test() & 1 != 0,
+                    crate::runtime::stranded_mask_for_test() & LONE_BIT != 0,
                     Ordering::SeqCst,
                 );
             }
@@ -1232,11 +1257,14 @@ mod collection_tests {
         crate::runtime::set_cpu_sleeping(2, false);
         crate::runtime::set_resched_ipi_sender(record);
         PUBLISHED_BEFORE_KICK.store(false, Ordering::SeqCst);
-        let tc = TaskCollection::new(0);
+        let tc = TaskCollection::new(LONE_CPU);
         tc.add_task(pending(), Some(Arc::new(AtomicU64::new(1 << 2))));
         tc.add_task(pending(), None);
         let (_, _, waker) = tc.try_take_task().unwrap();
-        assert_eq!(crate::runtime::stranded_mask_for_test() & 0b11, 1);
+        assert_eq!(
+            crate::runtime::stranded_mask_for_test() & LONE_BIT,
+            LONE_BIT
+        );
         assert!(PUBLISHED_BEFORE_KICK.load(Ordering::SeqCst));
         waker.mark_borrowed(false);
         crate::runtime::clear_need_resched(2);
@@ -1289,6 +1317,24 @@ mod collection_tests {
     fn pinned_elsewhere() -> Option<Arc<AtomicU64>> {
         Some(Arc::new(AtomicU64::new(1 << 1)))
     }
+
+    /// A CPU id no other test in this module builds a collection for, for the
+    /// four tests that assert on the stranded mark.
+    ///
+    /// That mark is a per-CPU global keyed by the *collection's* owner CPU,
+    /// and `schedule` clears it through `note_not_stranded` on every pass
+    /// that refuses nothing. Two dozen tests here hand tasks out of a
+    /// collection owned by CPU 0 without holding `resched_test_lock`, so a
+    /// test asserting on CPU 0's mark loses it to whichever of those the
+    /// harness happens to run beside it: `cargo test` failed about one run in
+    /// twelve, naming a different victim each time, while CI never saw it
+    /// because `--test-threads=1` serialises the suite. Taking the lock in
+    /// the asserting test is not enough -- the other two dozen would all have
+    /// to take it too. Owning a CPU nobody else names takes the shared word
+    /// out of the question instead.
+    const LONE_CPU: u8 = 5;
+    /// [`LONE_CPU`]'s bit in the stranded mask.
+    const LONE_BIT: u64 = 1 << LONE_CPU;
 
     /// Drain the queue, returning the keys in the order they were handed out.
     /// Releases each borrow, as a Pending poll would.
@@ -1607,14 +1653,15 @@ mod collection_tests {
     fn refusing_a_task_pinned_elsewhere_says_so_where_a_rescuer_reads_it() {
         let _g = crate::runtime::resched_test_lock();
         crate::runtime::clear_stranded_for_test();
-        let tc = TaskCollection::new(0);
+        let tc = TaskCollection::new(LONE_CPU);
         tc.add_task(pending(), pinned_elsewhere());
 
-        // The pass refuses it (CPU 0 is not in the mask) and hands out nothing.
+        // The pass refuses it (the owner is not in the mask) and hands out
+        // nothing.
         assert!(tc.take_task().is_none());
         assert_eq!(
-            crate::runtime::stranded_mask_for_test() & 1,
-            1,
+            crate::runtime::stranded_mask_for_test() & LONE_BIT,
+            LONE_BIT,
             "nobody will ever come for this task"
         );
     }
@@ -1626,7 +1673,7 @@ mod collection_tests {
     fn refusing_a_yielded_task_pinned_elsewhere_still_says_so() {
         let _g = crate::runtime::resched_test_lock();
         crate::runtime::clear_stranded_for_test();
-        let tc = TaskCollection::new(0);
+        let tc = TaskCollection::new(LONE_CPU);
         let key = tc.add_task(pending(), pinned_elsewhere());
         assert!(tc.take_task().is_none());
         crate::runtime::clear_stranded_for_test();
@@ -1640,8 +1687,8 @@ mod collection_tests {
         }
         assert!(tc.take_task().is_none(), "ran a task pinned elsewhere");
         assert_eq!(
-            crate::runtime::stranded_mask_for_test() & 1,
-            1,
+            crate::runtime::stranded_mask_for_test() & LONE_BIT,
+            LONE_BIT,
             "a yielded-lane refusal cleared the mark a rescuer reads"
         );
     }
@@ -1676,17 +1723,20 @@ mod collection_tests {
     fn a_pass_that_refuses_nothing_takes_the_mark_back_off() {
         let _g = crate::runtime::resched_test_lock();
         crate::runtime::clear_stranded_for_test();
-        let tc = TaskCollection::new(0);
+        let tc = TaskCollection::new(LONE_CPU);
         let pinned = tc.add_task(pending(), pinned_elsewhere());
         assert!(tc.take_task().is_none());
-        assert_eq!(crate::runtime::stranded_mask_for_test() & 1, 1);
+        assert_eq!(
+            crate::runtime::stranded_mask_for_test() & LONE_BIT,
+            LONE_BIT
+        );
 
         // The task goes away (it migrated, or it exited). The next clean pass
         // has nothing to refuse.
         tc.remove_task(pinned);
         let _ = tc.take_task();
         assert_eq!(
-            crate::runtime::stranded_mask_for_test() & 1,
+            crate::runtime::stranded_mask_for_test() & LONE_BIT,
             0,
             "the mark outlived the task that earned it"
         );
@@ -2115,6 +2165,198 @@ mod collection_tests {
         assert!(tc.try_take_task().is_none());
     }
 
+    // ── the per-slot affinity lane ─────────────────────────────────────────
+
+    /// What `has_ready` and `ready_num_for` would answer if they still asked
+    /// the slab about every runnable bit: the code that stood in both before
+    /// `WakerPage::affine_bits` existed, spelled out here so the two can be
+    /// compared on the same queue.
+    fn per_bit_walk(tc: &TaskCollection, cpu: usize) -> (bool, usize) {
+        let mut inner = tc.get_mut_inner(DEFAULT_PRIORITY);
+        let mut ready = false;
+        let mut n = 0usize;
+        for page_idx in 0..inner.pages.len() {
+            let (notified, dropped, borrowed) = inner.pages[page_idx].peek();
+            let runnable = notified & !dropped & !borrowed;
+            for subpage_idx in BitIter::from(runnable) {
+                let key = pack_key(DEFAULT_PRIORITY, page_idx, subpage_idx);
+                let allowed = inner
+                    .slab
+                    .get(unmask_priority(key))
+                    .map(|task| task.allowed_on(cpu))
+                    .unwrap_or(true);
+                if allowed {
+                    ready = true;
+                    n += 1;
+                }
+            }
+        }
+        (ready, n)
+    }
+
+    /// The mask pattern for task `i` under `shape`. `None` is a task that may
+    /// run anywhere, which is the case the lane exists to answer cheaply.
+    fn mask_for(shape: usize, i: usize) -> Option<u64> {
+        match shape {
+            // Nothing pinned: the queue-wide `affine == 0` shortcut, which
+            // the lane must not disturb.
+            0 => None,
+            // One pinned task among many, which is the case that used to
+            // switch the whole queue to its per-bit form.
+            1 => (i == 7).then_some(0b10),
+            // Everything pinned elsewhere: the 3.3 us worst case.
+            2 => Some(0b10),
+            // Everything pinned here.
+            3 => Some(0b01),
+            // Alternating, and alternating which CPU.
+            4 => i
+                .is_multiple_of(2)
+                .then_some(if i.is_multiple_of(4) { 0b01 } else { 0b10 }),
+            // Pinned to a CPU past the end of the mask's reach, which
+            // `allowed_on` answers `true` for when the asker is >= 64.
+            5 => Some(1u64 << 63),
+            // A mask naming nobody, which no CPU satisfies.
+            6 => Some(0),
+            _ => i.is_multiple_of(3).then_some(0b101),
+        }
+    }
+
+    #[test]
+    fn the_affine_lane_answers_exactly_what_a_per_bit_walk_would() {
+        let _g = crate::runtime::resched_test_lock();
+        let mut compared = 0usize;
+        let mut saw_fast_bits = false;
+        let mut saw_walked_bits = false;
+        let mut saw_ready = false;
+        let mut saw_not_ready = false;
+        let mut saw_partial_count = false;
+
+        // Three page counts (one page exactly, one bit over, three pages),
+        // eight mask shapes, and four disturbances of the lanes underneath.
+        for &n in &[1usize, 64, 65, 130] {
+            for shape in 0..8 {
+                for disturb in 0..4 {
+                    let tc = TaskCollection::new(0);
+                    let keys: Vec<_> = (0..n)
+                        .map(|i| {
+                            tc.add_task(
+                                pending(),
+                                mask_for(shape, i).map(|m| Arc::new(AtomicU64::new(m))),
+                            )
+                        })
+                        .collect();
+
+                    // Put the lanes in a state the scans have to cope with:
+                    // tasks checked out to an executor, tasks retired, and
+                    // slots whose wake was never published.
+                    match disturb {
+                        0 => {}
+                        1 => {
+                            // Borrow a few, which masks them out of runnable.
+                            for _ in 0..3.min(n) {
+                                if let Some((_k, _t, w)) = tc.take_task() {
+                                    core::mem::forget(w);
+                                }
+                            }
+                        }
+                        2 => {
+                            // Retire a few, which masks them out too.
+                            for key in keys.iter().take(5.min(n)) {
+                                tc.remove_task(*key);
+                            }
+                        }
+                        _ => {
+                            // Drain everything, so no wake is published at all
+                            // and every page is runnable-empty.
+                            drain(&tc);
+                        }
+                    }
+
+                    for cpu in [0usize, 1, 2, 64] {
+                        let (want_ready, want_n) = per_bit_walk(&tc, cpu);
+                        // `has_ready` asks about the CPU it is running on,
+                        // which on the host is 0, so it is only comparable
+                        // against the walk for CPU 0.
+                        if cpu == 0 {
+                            assert_eq!(
+                                tc.has_ready(),
+                                want_ready,
+                                "has_ready disagreed: n={n} shape={shape} disturb={disturb}",
+                            );
+                            saw_ready |= want_ready;
+                            saw_not_ready |= !want_ready;
+                        }
+                        assert_eq!(
+                            tc.ready_num_for(cpu),
+                            Some(want_n),
+                            "ready_num_for({cpu}) disagreed: n={n} shape={shape} disturb={disturb}",
+                        );
+                        compared += 1;
+                    }
+
+                    // Was this configuration actually exercising the split?
+                    let inner = tc.get_mut_inner(DEFAULT_PRIORITY);
+                    for page in &inner.pages {
+                        let (notified, dropped, borrowed) = page.peek();
+                        let runnable = notified & !dropped & !borrowed;
+                        let affine = page.affine_bits();
+                        saw_fast_bits |= runnable & !affine != 0;
+                        saw_walked_bits |= runnable & affine != 0;
+                        if runnable & affine != 0 && runnable & !affine != 0 {
+                            saw_partial_count = true;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Non-vacuity: the comparison above is only worth anything if the
+        // configurations reached both sides of the new branch, both answers
+        // of `has_ready`, and at least one page holding some of each.
+        assert_eq!(compared, 4 * 8 * 4 * 4);
+        assert!(
+            saw_fast_bits,
+            "no configuration had an unmasked runnable slot"
+        );
+        assert!(
+            saw_walked_bits,
+            "no configuration had a masked runnable slot"
+        );
+        assert!(saw_partial_count, "no page ever held both kinds at once");
+        assert!(
+            saw_ready && saw_not_ready,
+            "has_ready never answered both ways"
+        );
+    }
+
+    #[test]
+    fn a_reused_slot_does_not_inherit_the_last_occupants_affinity() {
+        let _g = crate::runtime::resched_test_lock();
+        let tc = TaskCollection::new(0);
+        let pinned = tc.add_task(pending(), Some(Arc::new(AtomicU64::new(0b10))));
+        let (page_idx, subpage_idx) = {
+            let (_, p, sp) = unpack_key(pinned);
+            (p, sp)
+        };
+        let bit = 1u64 << subpage_idx;
+        let page = tc.get_mut_inner(DEFAULT_PRIORITY).pages[page_idx].clone();
+        assert_eq!(page.affine_bits() & bit, bit, "the mask went unrecorded");
+
+        // Retire it and spawn an unpinned task, which the slab hands the same
+        // slot back for. A stale bit here would only cost a `PinSlab` lookup,
+        // but the invariant the scans are written against is exactness.
+        tc.remove_task(pinned);
+        assert_eq!(page.affine_bits() & bit, 0, "retirement left the bit up");
+        let reused = tc.add_task(pending(), None);
+        assert_eq!(unmask_priority(reused), unmask_priority(pinned));
+        assert_eq!(page.affine_bits() & bit, 0, "the new task inherited a mask");
+        assert_eq!(
+            tc.ready_num_for(1),
+            Some(1),
+            "the reused slot went uncounted"
+        );
+    }
+
     // ── diagnostics ────────────────────────────────────────────────────────
 
     #[test]
@@ -2172,6 +2414,22 @@ mod collection_tests {
             let tc = TaskCollection::new(0);
             for _ in 0..n {
                 tc.add_task(pending(), Some(Arc::new(AtomicU64::new(0b10))));
+            }
+            tc
+        }
+
+        /// `n` tasks of which the first `pinned` are pinned to CPU 1 and the
+        /// rest may run anywhere. This is the shape that actually happens --
+        /// an IRQ pool, or one `sched_setaffinity` on a queue of ordinary
+        /// threads -- and the one `WakerPage::affine_bits` was added for: the
+        /// queue-wide `FutureCollection::affine` counter cannot tell it from
+        /// `queue_of_pinned`, so before the lane both scans walked all `n`
+        /// bits here too.
+        fn queue_part_pinned(n: usize, pinned: usize) -> Arc<TaskCollection> {
+            let tc = TaskCollection::new(0);
+            for i in 0..n {
+                let mask = (i < pinned).then(|| Arc::new(AtomicU64::new(0b10)));
+                tc.add_task(pending(), mask);
             }
             tc
         }
@@ -2281,10 +2539,31 @@ mod collection_tests {
         /// The worst case the `affine` shortcut exists for: every task on the
         /// queue is pinned to another CPU, so the walk visits all 1024
         /// runnable bits, asks the slab about each one, and answers "nothing
-        /// for you" — on the way into `hlt`.
+        /// for you" — on the way into `hlt`. `WakerPage::affine_bits` does not
+        /// improve this and was not expected to: every bit it would skip is a
+        /// bit that genuinely carries a mask.
         #[bench]
         fn pre_halt_recheck_with_a_thousand_tasks_pinned_elsewhere(b: &mut Bencher) {
             let tc = queue_of_pinned(1024);
+            b.iter(|| tc.has_ready());
+        }
+
+        /// The row that says what the lane does *not* buy, which was worth
+        /// finding out: the first 512 slots pinned to another CPU, the rest
+        /// free. The lane answers a page at a time, so a page whose every
+        /// runnable slot is masked is still walked bit by bit — the question
+        /// "is any of these allowed here" cannot be answered without the
+        /// masks. Measured 1,741 ns before the lane and 1,347 after, and all
+        /// of that 23% is the eight wholly-unmasked pages at the far end.
+        ///
+        /// `has_ready` was never the one paying, because it has always
+        /// returned at the first allowed slot: what it costs is however many
+        /// disallowed slots sort ahead of the first allowed one, and the lane
+        /// cannot shorten that. The scan that had no early exit is
+        /// `ready_num_for`, two sections down.
+        #[bench]
+        fn pre_halt_recheck_with_half_the_queue_pinned_elsewhere(b: &mut Bencher) {
+            let tc = queue_part_pinned(1024, 512);
             b.iter(|| tc.has_ready());
         }
 
@@ -2321,6 +2600,25 @@ mod collection_tests {
         #[bench]
         fn count_runnable_for_a_thief_with_a_thousand_pinned_tasks(b: &mut Bencher) {
             let tc = queue_of_pinned(1024);
+            b.iter(|| tc.ready_num_for(black_box(0)));
+        }
+
+        /// The headline row for the lane: one pinned task among a thousand,
+        /// which is what an IRQ pool or a single `sched_setaffinity` leaves
+        /// on an otherwise ordinary queue. `ready_num_for` has no early exit,
+        /// so before the lane this was 1024 `PinSlab` lookups and an
+        /// `allowed_on` each — per victim, per idle steal pass — for a figure
+        /// that is now a popcount and one lookup. **3,273 ns before, 55
+        /// after.**
+        ///
+        /// Read it next to
+        /// `count_runnable_for_a_thief_with_a_thousand_pinned_tasks`, which
+        /// the lane leaves at 3.7 us: when every task really does carry a
+        /// mask there is nothing to skip, and the saving here is exactly the
+        /// 1023 tasks that never had one.
+        #[bench]
+        fn count_runnable_for_a_thief_with_one_pinned_task_among_a_thousand(b: &mut Bencher) {
+            let tc = queue_part_pinned(1024, 1);
             b.iter(|| tc.ready_num_for(black_box(0)));
         }
 
