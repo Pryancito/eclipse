@@ -755,14 +755,30 @@ mod tests {
     }
 }
 
-/// Las dos redes de este arreglo viven en sitios que un refactor puede dejar
-/// sin llamante sin que nada se queje: la llamada a `verify()` dentro de
-/// `image()`, y el interruptor `MEM_DEBUG` del Makefile de zCore. Si
-/// desaparecen, no falla nada --- simplemente volvemos a construir imagenes a
-/// ciegas. Asi que se fijan aqui.
+/// Las redes de este arreglo viven en sitios que un refactor puede dejar sin
+/// llamante sin que nada se queje: la llamada a `verify()` dentro de
+/// `image()`, el interruptor `MEM_DEBUG` del Makefile de zCore, y el job que
+/// construye la ISO y la arranca. Si desaparecen, no falla nada --- simplemente
+/// volvemos a construir imagenes a ciegas. Asi que se fijan aqui.
 #[cfg(test)]
 mod cableado_tests {
     use std::process::Command;
+
+    /// Un fichero del arbol, sin sus lineas comentadas.
+    ///
+    /// Hace falta de verdad: los comentarios de `iso-smoke.sh` explican POR QUE
+    /// no se pasa `-enable-kvm`, asi que un grep a pelo lo encuentra en el
+    /// comentario y el test pasa con la escotilla puesta. Asi se perdio ya una
+    /// red: `// self.verify();` sobrevivio a su propio test.
+    fn sin_comentarios(rel: &str, marca: &str) -> String {
+        let texto = std::fs::read_to_string(crate::PROJECT_DIR.join(rel))
+            .unwrap_or_else(|e| panic!("no se pudo leer {rel}: {e}"));
+        texto
+            .lines()
+            .filter(|l| !l.trim_start().starts_with(marca))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
 
     /// El valor que `make` resuelve DE VERDAD para una variable, con los
     /// `ifeq` ya aplicados. Mas fuerte que grepear el fichero: un `ifeq` mal
@@ -912,5 +928,76 @@ mod cableado_tests {
             verify > make,
             "verify() tiene que ir DESPUES de construir la rootfs, no antes"
         );
+    }
+
+    /// La ISO que se distribuye tiene que construirse Y arrancarse en cada
+    /// tirada. `make release` la sacaba y nadie la encendia: los tres fallos
+    /// que la dejaron inservible en arm64 no los caza compilar.
+    #[test]
+    fn el_job_de_la_iso_la_construye_y_la_arranca() {
+        let wf = sin_comentarios(".github/workflows/build.yml", "#");
+        assert!(wf.contains("\n  iso:\n"), "no hay job `iso` en Build CI");
+        assert!(
+            wf.contains("make release ARCHS=x86_64 VARIANTS=minimal"),
+            "el job no construye la ISO"
+        );
+        assert!(
+            wf.contains("scripts/iso-smoke.sh"),
+            "la ISO se construye y no se arranca, que es el agujero de antes"
+        );
+    }
+
+    /// El patron que espera el humo tiene que ser una linea que escriba
+    /// **eclipse-init**, no un prompt ni un «ok».
+    ///
+    /// Lo que fallo en arm64 fue que busybox tomo el relevo de PID 1 en
+    /// silencio, y busybox arranca igual de bien: un patron generico habria
+    /// dado por buena justo la imagen rota.
+    #[test]
+    fn el_humo_espera_una_linea_que_solo_escribe_init() {
+        let sh = sin_comentarios("scripts/iso-smoke.sh", "#");
+        let patron = sh
+            .lines()
+            .find_map(|l| l.trim().strip_prefix("PATRON='")?.strip_suffix('\''))
+            .expect("iso-smoke.sh sin PATRON por defecto")
+            .to_string();
+        assert!(
+            !patron.is_empty(),
+            "un patron vacio lo encuentra `grep` en cualquier consola"
+        );
+        let init =
+            std::fs::read_to_string(crate::PROJECT_DIR.join("tools/eclipse-init/src/main.rs"))
+                .expect("no se pudo leer eclipse-init");
+        assert!(
+            init.contains(&patron),
+            "eclipse-init no escribe nunca «{patron}»: el humo esperaria algo \
+             que no llega, o peor, algo que tambien dice otro PID 1"
+        );
+    }
+
+    /// Las dos escotillas que hacen que el humo falle por el entorno y no por
+    /// la ISO: `-enable-kvm` (que en un runner sin `/dev/kvm` saca a QEMU con 1
+    /// sin explicar nada) y menos de 4 GiB (con 2 GiB `rboot` muere en
+    /// `OutOfFrames` antes de la primera linea de kernel, y eso se lee como una
+    /// ISO rota).
+    #[test]
+    fn el_humo_no_pide_kvm_y_arranca_con_cuatro_gigas() {
+        let sh = sin_comentarios("scripts/iso-smoke.sh", "#");
+        assert!(
+            !sh.contains("-enable-kvm"),
+            "iso-smoke.sh pide KVM y en CI no hay /dev/kvm"
+        );
+        let mem = sh
+            .lines()
+            .find_map(|l| l.trim().strip_prefix("MEM="))
+            .expect("iso-smoke.sh sin MEM por defecto")
+            .trim()
+            .to_string();
+        let gigas: u32 = mem
+            .strip_suffix('G')
+            .unwrap_or("0")
+            .parse()
+            .unwrap_or_else(|_| panic!("MEM por defecto ilegible: {mem}"));
+        assert!(gigas >= 4, "MEM por defecto es {mem} y rboot necesita 4G");
     }
 }

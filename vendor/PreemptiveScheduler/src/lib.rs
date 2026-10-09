@@ -1,5 +1,10 @@
 #![no_std]
 #![feature(allocator_api)]
+// The `#[bench]` rows next to the code they measure need `test::Bencher`, and
+// the harness that runs them is nightly-only. `cfg_attr(test, ...)` keeps the
+// feature gate out of every build that is not the host test build, so the
+// kernel still compiles on a toolchain without it.
+#![cfg_attr(test, feature(test))]
 // some interfaces is still under developing
 #![allow(dead_code)]
 
@@ -37,6 +42,14 @@ extern crate log;
 // reporting it).
 #[cfg(test)]
 extern crate std;
+
+// The bench harness. `extern crate test` is what makes `test::Bencher` and
+// `test::black_box` nameable from the `mod benches` blocks; the rows live
+// inline next to the mechanisms they time (and usually *inside* the existing
+// test module, which is the only thing that can see those modules' private
+// fixtures).
+#[cfg(test)]
+extern crate test;
 
 mod context;
 mod diag;
