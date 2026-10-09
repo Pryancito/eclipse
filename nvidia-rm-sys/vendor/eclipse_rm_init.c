@@ -1500,11 +1500,13 @@ static NvU64 g_vasGrantedBase = 0;
  * The per-context entry points already gate on this (see g_grAllocGpuInst
  * above), but each ladder step guards itself with nothing but its own
  * `g_gr*Done`, and that flag says "this step ran", never "this step ran on
- * YOUR card". So on a dual-card box the second GPU's step16/17/18/19/20/21
- * or bench cache-hits the FIRST card's result and returns NV_OK with the
+ * YOUR card". So on a dual-card box the second GPU's step16..step23 or
+ * bench cache-hits the FIRST card's result and returns NV_OK with the
  * first card's handles and numbers, without the second card being touched at
  * all. A caller cannot tell: the status words all read OK. `cat
- * /proc/gpuinit` and `/proc/gpustep16` walk EVERY registered DRM driver, so
+ * /proc/gpuinit` and every `/proc/gpustepNN` walk EVERY registered DRM
+ * driver -- which is how step22 and step23 were missed when this gate first
+ * went in, and why adding a ladder step means adding its gate -- so
  * on a box booted with `nvidia.console_gpu` -- where both cards have RM
  * attached -- that false success is what they print today.
  *
@@ -4335,6 +4337,10 @@ NV_STATUS eclipse_rm_step22(NvU32 gpuInstance, EclipseGrThreads *pOut)
     {
         return NV_ERR_INVALID_ARGUMENT;
     }
+    if (eclipseLadderForeignGpu(gpuInstance, "step22"))
+    {
+        return NV_ERR_INVALID_ARGUMENT;
+    }
     if (g_grGridDone)
     {
         portMemCopy(pOut, sizeof(*pOut), &g_grGridCache, sizeof(g_grGridCache));
@@ -4719,6 +4725,10 @@ NV_STATUS eclipse_rm_step23(NvU32 gpuInstance, EclipseGrThreads *pOut)
                        TRANSFER_FLAGS_SHADOW_INIT_MEM;
 
     if (pOut == NULL)
+    {
+        return NV_ERR_INVALID_ARGUMENT;
+    }
+    if (eclipseLadderForeignGpu(gpuInstance, "step23"))
     {
         return NV_ERR_INVALID_ARGUMENT;
     }
