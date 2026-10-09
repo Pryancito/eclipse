@@ -401,6 +401,10 @@ const ALLOC_LAYOUT: Layout = match Layout::from_size_align(ALLOC_SIZE, PAGE_SIZE
 const STACK_CANARY: u64 = 0x5354_4143_4b5f_4f56; // "STACK_OV"
 const GUARD_WORDS: usize = GUARD_SIZE / core::mem::size_of::<u64>();
 
+/// Lo que cuesta nacer una pila de corrutina; ver las notas del modulo.
+#[cfg(test)]
+mod stack_birth_benches;
+
 // ── Live coroutine-stack registry (double-alloc tripwire) ────────────────────
 //
 // Every crash capture zeroes a run of a *transient* executor's stack (exec
