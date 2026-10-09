@@ -1725,8 +1725,11 @@ impl DrmDev {
                 // implemented as a busy 16.7 ms spin, and calling it on every
                 // WAIT_VBLANK ioctl causes severe CPU starvation on a
                 // cooperative async runtime — making the system appear frozen.
+                // The card to ask is the one that drives the panel, not
+                // `drivers.first()`: on a two-card box that is the compute
+                // card, which has no raster and so no vblank to wait on.
                 if !drm::software_kms_active() {
-                    if let Some(driver) = drm::get_primary_driver() {
+                    if let Some(driver) = drm::get_display_driver() {
                         if driver.has_hardware_kms() {
                             let _ = driver.wait_vblank(0);
                         }

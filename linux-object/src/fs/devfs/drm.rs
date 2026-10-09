@@ -1947,12 +1947,24 @@ fn primary_display() -> Option<Arc<dyn DisplayScheme>> {
 
 /// Whether the software KMS path should drive the output.
 ///
-/// True when a framebuffer display exists but no registered DRM driver declares
-/// hardware-KMS scanout support. In that case we keep the software fallback:
+/// True when a framebuffer display exists but the card that drives it declares
+/// no hardware-KMS scanout support. In that case we keep the software fallback:
 /// dumb-buffer blits to the primary framebuffer display (`blit_from`).
+///
+/// The card asked is [`get_display_driver`], not [`get_primary_driver`]. On a
+/// box with a console card and a compute card, `drivers.first()` is the
+/// COMPUTE one -- `register_driver` does `insert(0, ..)`, so the first entry is
+/// the last card probed -- and asking it whether it can scan out answers a
+/// question about a card with no monitor on it. Both directions of that are
+/// wrong and visible to userspace, since this gates the CRTCs and encoders the
+/// compositor is shown and the atomic path: a compute card that claims
+/// hardware KMS (`hwflip_ready()` is one global for the whole box, not a
+/// per-card fact) hides a panel that the CPU blit is really painting, and a
+/// compute card that claims none hides real hardware scanout on the console
+/// card.
 pub fn software_kms_active() -> bool {
     let have_display = primary_display().is_some();
-    let driver_can_scanout = get_primary_driver()
+    let driver_can_scanout = get_display_driver()
         .map(|d| d.has_hardware_kms())
         .unwrap_or(false);
     have_display && !driver_can_scanout
@@ -2363,6 +2375,29 @@ pub(crate) fn unregister_driver(driver: &Arc<dyn DrmScheme>) -> bool {
 /// Get the primary DRM driver
 pub fn get_primary_driver() -> Option<Arc<dyn DrmScheme>> {
     DRM_STATE.lock().drivers.first().cloned()
+}
+
+/// The DRM driver of the card that drives the display, for the questions that
+/// are about the monitor rather than about whoever happens to be first in the
+/// list: does the panel need the software blit, and is there a real vblank to
+/// wait on.
+///
+/// That is the first registered driver which is not a compute GPU. A compute
+/// GPU is one that drives no display by definition (the NVIDIA driver answers
+/// `is_compute_gpu()` false exactly for the card whose BAR1 holds the boot
+/// framebuffer), and a non-NVIDIA driver answers false too, which is right:
+/// a plain KMS or framebuffer driver does drive the output. When every
+/// registered driver says it is a compute GPU there is no better answer than
+/// [`get_primary_driver`], so that is the fallback rather than `None` -- a
+/// `None` here would silently turn the software-KMS answer around.
+pub fn get_display_driver() -> Option<Arc<dyn DrmScheme>> {
+    let state = DRM_STATE.lock();
+    state
+        .drivers
+        .iter()
+        .find(|d| !d.is_compute_gpu())
+        .or_else(|| state.drivers.first())
+        .cloned()
 }
 
 /// Base minor of the render-node range, as Linux allocates them: primary
@@ -8385,3 +8420,10 @@ mod present_cost_tests;
 
 #[cfg(test)]
 mod damage_against_the_panel_tests;
+
+/// Tests for which card the display questions are asked of.
+///
+/// They exist because `software_kms_active()` asked `drivers.first()`, which on
+/// a two-card box is the compute card -- the one with no monitor on it.
+#[cfg(test)]
+mod display_driver_tests;
