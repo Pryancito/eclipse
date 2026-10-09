@@ -14,6 +14,8 @@ pub mod config;
 #[cfg(any(feature = "boot-ui", test))]
 pub mod fb;
 #[cfg(any(feature = "boot-ui", test))]
+pub mod frames;
+#[cfg(any(feature = "boot-ui", test))]
 pub mod logo;
 #[cfg(any(feature = "boot-ui", test))]
 pub mod page_table;
