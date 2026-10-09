@@ -138,6 +138,65 @@ jobs:
       - name: Clippy x86_64 with MEM_DEBUG=1
         run: cd zCore && make clippy ARCH=x86_64 MEM_DEBUG=1
 
+  # La ISO que se distribuye, construida y ARRANCADA.
+  #
+  # El hueco que tapa: `make release` saca `dist/eclipse-<variante>-<arco>.iso`
+  # y nada la tocaba despues. Los jobs de `Test CI` construyen la rootfs y
+  # arrancan `cargo image`, pero la ISO de UEFI --- con su ESP, su El Torito y
+  # sus payloads --- no la montaba nadie, y es justo la que se le da a alguien.
+  # Los tres fallos que la dejaron inservible en arm64 (las herramientas de
+  # `tools/` enlazadas con el `ld` del host, `/etc/apk/arch` sin escribir, las
+  # claves de firma sin ir por arco) no los caza compilar: el primero salia como
+  # un `warning:` y una imagen con busybox de PID 1.
+  #
+  # `cargo image` ya verifica la rootfs antes de empaquetarla
+  # (`xtask/src/linux/verify.rs`), y eso cubre lo que se puede mirar sin
+  # encender nada. Esto es la otra mitad: que la ISO arranque de verdad y que
+  # PID 1 sea eclipse-init, que es lo que busybox no dice.
+  #
+  # Solo minimal/x86_64: es la unica arquitectura con ISO de UEFI y la variante
+  # mas corta de construir. Una matriz entera aqui cuesta cuatro veces mas
+  # tiempo de runner para vigilar el mismo andamio.
+  iso:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: 'recursive'
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.rust_toolchain }}
+          components: rust-src, llvm-tools-preview
+
+      - name: Install cargo-binutils
+        run: cargo install cargo-binutils --locked
+
+      # mkfs.vfat/mtools montan el ESP de la ISO y xorriso la cierra; QEMU la
+      # arranca. El firmware UEFI ya viene en el arbol (`rboot/OVMF.fd`), asi
+      # que no hay que instalar OVMF.
+      - name: Install ISO and QEMU tooling
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y dosfstools mtools xorriso qemu-system-x86
+
+      - name: Pull prebuilt images
+        run: make zircon-init
+
+      - name: Build the minimal x86_64 ISO
+        run: make release ARCHS=x86_64 VARIANTS=minimal
+
+      - name: Boot it
+        run: scripts/iso-smoke.sh -a x86_64 -v minimal
+
+      - name: Upload the guest console log
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: iso-smoke-console
+          path: build/iso-smoke.log
+          if-no-files-found: warn
+
   build-user:
     # The unpatched runtime prebuilts do not contain a Fuchsia C/C++ SDK sysroot.
     if: ${{ false }}
