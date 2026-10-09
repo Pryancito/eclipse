@@ -4403,3 +4403,258 @@ mod parked_frame_tests {
         assert_eq!(frame_dump_words(stack.top(), stack.top()), 0);
     }
 }
+
+/// Rows for the scheduler's flat, global-reading paths: the per-trap
+/// reschedule questions, the voluntary-yield marker, the statistics counters
+/// and the affinity picker.
+///
+/// `take_need_resched` and `need_resched_pending` are the two that matter most
+/// for being *cheap*, because the trap path asks them on every timer tick,
+/// every IPI and every syscall-free interrupt, on a machine where the answer
+/// is almost always no. The picker rows matter for the opposite reason: they
+/// are the only thing here that scales with the number of CPUs.
+///
+/// Caveats, same as the other two modules': the host has one CPU, so
+/// `cpu_id()` is 0 and no IPI is ever sent (no sender is registered either);
+/// after the first iteration of a `request_resched` row this CPU's
+/// `NEED_RESCHED` bit is already up, so the figure is the coalesced wake; and
+/// the test profile pays `debug_assert!`s the kernel does not.
+#[cfg(test)]
+mod benches {
+    use super::*;
+    use test::{black_box, Bencher};
+
+    /// Publish `mask` as the executor-ready set for the duration of a row, and
+    /// put back whatever was there.
+    struct Machine(u64);
+
+    impl Machine {
+        fn of(cpus: u64) -> Self {
+            Machine(set_executor_ready_mask_for_test(cpus))
+        }
+    }
+
+    impl Drop for Machine {
+        fn drop(&mut self) {
+            set_executor_ready_mask_for_test(self.0);
+        }
+    }
+
+    // No control row: see the note in
+    // `crate::waker_page::waker_page_tests::benches`. This module is where it
+    // was most misleading -- the control measured 0.64 ns and eight of the
+    // rows below it are cheaper than that, `read_the_weak_affinity_counters`
+    // at 0.28 ns and `ask_for_a_reschedule_request_and_find_none` at 0.45,
+    // because almost everything here is one relaxed load and a mask test that
+    // the compiler inlines into the loop. The floor of this family is the load
+    // itself.
+
+    // ── what the trap path asks on every trap ──────────────────────────────
+
+    /// The overwhelmingly common answer: no request pending. One relaxed load
+    /// and a mask test, which is what the early return in `take_need_resched`
+    /// is for.
+    #[bench]
+    fn ask_for_a_reschedule_request_and_find_none(b: &mut Bencher) {
+        let _g = resched_test_lock();
+        NEED_RESCHED.fetch_and(!1, Ordering::SeqCst);
+        b.iter(|| take_need_resched());
+    }
+
+    /// Peeking without taking, which is what the trap path does before it asks
+    /// the running thread whether it may be preempted yet.
+    #[bench]
+    fn peek_at_a_reschedule_request(b: &mut Bencher) {
+        let _g = resched_test_lock();
+        b.iter(|| need_resched_pending());
+    }
+
+    /// The request actually being consumed: the relaxed pre-check fails, so
+    /// this pays the `AcqRel` RMW and the counter bump. Republished each round
+    /// so every iteration takes the same path.
+    #[bench]
+    fn take_a_reschedule_request(b: &mut Bencher) {
+        let _g = resched_test_lock();
+        b.iter(|| {
+            NEED_RESCHED.fetch_or(1, Ordering::Relaxed);
+            take_need_resched()
+        });
+    }
+
+    // ── the voluntary-yield marker ─────────────────────────────────────────
+
+    /// What `YieldFuture` pays per poll to say which waker its self-wake is
+    /// for: two relaxed stores, one on each side of the wake.
+    #[bench]
+    fn raise_and_clear_the_voluntary_marker(b: &mut Bencher) {
+        b.iter(|| {
+            begin_voluntary_yield(black_box(0x1234));
+            end_voluntary_yield();
+        });
+    }
+
+    /// The question every wake asks: is this one my own yield? Answered no,
+    /// which is the answer for every external wake in the kernel.
+    #[bench]
+    fn ask_whether_a_wake_is_a_voluntary_yield_and_it_is_not(b: &mut Bencher) {
+        end_voluntary_yield();
+        b.iter(|| is_voluntary_yield_wake(black_box(0x1234)));
+    }
+
+    /// The same question answered yes, which is the `sched_yield(2)` path.
+    #[bench]
+    fn ask_whether_a_wake_is_a_voluntary_yield_and_it_is(b: &mut Bencher) {
+        begin_voluntary_yield(0x1234);
+        b.iter(|| is_voluntary_yield_wake(black_box(0x1234)));
+        end_voluntary_yield();
+    }
+
+    // ── raising a wake ─────────────────────────────────────────────────────
+
+    /// The plain delivery kick, for a wake whose task is already being
+    /// polled: mark the CPU worth stealing from and read the sleeping mask.
+    #[bench]
+    fn kick_a_possibly_halted_owner(b: &mut Bencher) {
+        let _g = resched_test_lock();
+        b.iter(|| maybe_send_resched_ipi(black_box(0)));
+    }
+
+    /// A wake-up preemption request, coalesced onto one that is already
+    /// pending — the steady state of a burst of wakes for one CPU, and the
+    /// case the counters exist to tell apart from a latch.
+    #[bench]
+    fn publish_a_coalesced_reschedule_request(b: &mut Bencher) {
+        let _g = resched_test_lock();
+        request_resched(0);
+        b.iter(|| request_resched(black_box(0)));
+    }
+
+    /// The first request of a burst, which is the one that counts and (on a
+    /// real machine, for another CPU) sends the IPI. Paired with the trap that
+    /// consumes it, because that is the only way to get the 0 -> 1 transition
+    /// on every iteration.
+    #[bench]
+    fn publish_a_fresh_reschedule_request_and_consume_it(b: &mut Bencher) {
+        let _g = resched_test_lock();
+        b.iter(|| {
+            request_resched(black_box(0));
+            take_need_resched()
+        });
+    }
+
+    // ── the counters ───────────────────────────────────────────────────────
+
+    #[bench]
+    fn read_the_wakeup_preempt_counters(b: &mut Bencher) {
+        b.iter(|| wakeup_preempt_stats());
+    }
+
+    #[bench]
+    fn read_the_work_stealing_counters(b: &mut Bencher) {
+        b.iter(|| sched_steal_stats());
+    }
+
+    #[bench]
+    fn read_the_weak_affinity_counters(b: &mut Bencher) {
+        b.iter(|| sched_weak_stats());
+    }
+
+    #[bench]
+    fn read_the_executor_ready_mask(b: &mut Bencher) {
+        b.iter(|| executor_ready_mask());
+    }
+
+    // ── placement and affinity ─────────────────────────────────────────────
+
+    #[bench]
+    fn narrow_a_mask_to_the_cpus_that_could_take_the_task(b: &mut Bencher) {
+        b.iter(|| reachable_affinity_cpus(black_box(0b1010), black_box(0b1111)));
+    }
+
+    #[bench]
+    fn move_a_spawn_off_a_cold_cpu(b: &mut Bencher) {
+        b.iter(|| park_cpu_if_cold(black_box(3), black_box(0b0011)));
+    }
+
+    #[bench]
+    fn choose_where_a_pinned_task_is_born(b: &mut Bencher) {
+        b.iter(|| affinity_home(black_box(0b1100), black_box(0b0111)));
+    }
+
+    /// The picker with no load information, which is the historical answer and
+    /// the one `affinity_changed` falls back on: a mask and two
+    /// `trailing_zeros`.
+    #[bench]
+    fn pick_a_cpu_to_kick_without_loads(b: &mut Bencher) {
+        b.iter(|| {
+            pick_affinity_kick_target_by(
+                black_box(0b1110),
+                black_box(0),
+                black_box(0b1111),
+                black_box(0b1000),
+                None::<fn(usize) -> usize>,
+            )
+        });
+    }
+
+    /// With loads, on a four-CPU machine: one ascending pass, one closure call
+    /// per candidate.
+    #[bench]
+    fn pick_a_cpu_to_kick_with_loads_on_four_cpus(b: &mut Bencher) {
+        b.iter(|| {
+            pick_affinity_kick_target_by(
+                black_box(0b1110),
+                black_box(0),
+                black_box(0b1111),
+                black_box(0),
+                Some(|cpu: usize| cpu),
+            )
+        });
+    }
+
+    /// The same on a machine with all 64 CPUs allowed and ready, which is the
+    /// only thing in this module that scales with core count. The closure is
+    /// a cheap stand-in; the kernel's `try_lock`s a peer runtime per
+    /// candidate, so read this as the picker's own cost and not as the kick's.
+    #[bench]
+    fn pick_a_cpu_to_kick_with_loads_on_sixty_four_cpus(b: &mut Bencher) {
+        b.iter(|| {
+            pick_affinity_kick_target_by(
+                black_box(u64::MAX),
+                black_box(0),
+                black_box(u64::MAX),
+                black_box(0),
+                Some(|cpu: usize| cpu),
+            )
+        });
+    }
+
+    /// The whole kick, picker included, as `sched_setaffinity` calls it: the
+    /// interrupts-off window and a `try_lock` of every allowed runtime.
+    /// No runtime exists on the host, so every candidate answers "busy" and
+    /// the row is the walk without the lock contention.
+    #[bench]
+    fn kick_a_cpu_the_new_affinity_mask_allows(b: &mut Bencher) {
+        let _g = resched_test_lock();
+        let _m = Machine::of(0b1111);
+        b.iter(|| affinity_changed(black_box(0b1110)));
+    }
+
+    /// The load average's sample: one `try_lock` and one `placement_load` per
+    /// online CPU. The row below it is the same call on a machine the ready
+    /// mask says has 64 CPUs, which is what `num_online_cpus` was changed to
+    /// stop scanning.
+    #[bench]
+    fn sample_the_runnable_count_on_four_cpus(b: &mut Bencher) {
+        let _g = resched_test_lock();
+        let _m = Machine::of(0b1111);
+        b.iter(|| runnable_task_count());
+    }
+
+    #[bench]
+    fn sample_the_runnable_count_on_sixty_four_cpus(b: &mut Bencher) {
+        let _g = resched_test_lock();
+        let _m = Machine::of(u64::MAX);
+        b.iter(|| runnable_task_count());
+    }
+}

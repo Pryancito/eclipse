@@ -26,6 +26,8 @@ cargo bench -p zircon-object --bench vm     --features libos,aspace-separate
 cargo bench -p zircon-object --bench futex  --features libos,aspace-separate
 cargo bench -p linux-syscall                            # the syscalls themselves
 cargo bench --manifest-path smoltcp/Cargo.toml          # wire parsing, upstream's
+cargo bench --manifest-path vendor/PreemptiveScheduler/Cargo.toml \
+  --lib benches -- --test-threads=1                     # the scheduler itself
 ```
 
 `-- <substring>` narrows any of them to the rows whose name matches, which is
@@ -60,6 +62,25 @@ because what they need is that module's fake framebuffer backend, and a child
 module sees its ancestors' private items while a sibling would see none of
 them. The alternative was marking a fixture `pub(super)` for every row that
 wanted it.
+
+`vendor/PreemptiveScheduler` is a fourth, and the clearest case: the crate is
+`#![no_std]` with `mod context; mod executor; mod runtime; mod task_collection;
+mod waker_page;` and no re-exports of any of them, so nothing outside the crate
+can name a `WakerPage`, a `TaskCollection` or a key. Three of its four bench
+modules nest inside the existing test module beside them -- `key_tests`,
+`waker_page_tests`, `collection_tests` -- which is where the fixtures already
+are (`page()`, `queue_of(n)`, `pending()`, `cede()`), and the fourth sits at
+the top of `runtime.rs` because what it measures are that module's own
+`pub(crate)` functions and statics.
+
+Run the scheduler families with `--test-threads=1` as well, for a different
+reason from the display ones: nearly every row there reads or writes one of the
+scheduler's *globals* -- `NEED_RESCHED`, `SLEEPING_CPUS`, `EXECUTOR_READY`, the
+per-CPU voluntary-yield markers, the statistics counters. The crate's own tests
+already serialise on `runtime::resched_test_lock()` for that reason and the
+rows that touch those globals take the same lock, but a lock held across
+`b.iter` serialises the *measurement* too, so two rows running at once would
+simply take turns and report each other's waiting.
 
 Beside the code has a second advantage worth having on purpose: a bench that
 sits under the function it measures is read by whoever changes that function.
@@ -183,6 +204,10 @@ two agree the measurement is standing on something.
 | "is this fd a pipe", twice per `splice` | — | `linux-syscall` `file::splice::benches::pipe_inode_*` |
 | the twelve xattr syscalls, which answer from a table | — | `linux-syscall` `file::xattr::benches::*` |
 | `pidfd_open`'s flags and `pidfd_send_signal`'s `siginfo` | — | `linux-syscall` `file::pidfd::benches::*` |
+| the wake bitmap every `Waker` in the kernel publishes into | — | `executor` `waker_page::waker_page_tests::benches::*` |
+| one CPU's run queue, and the three load figures it publishes | — | `executor` `task_collection::collection_tests::benches::*` |
+| the task key the generator packs and the slab unpacks | — | `executor` `task_collection::key_tests::benches::*` |
+| the reschedule question every trap asks, and the affinity picker | `psched` section | `executor` `runtime::benches::*` |
 | a FreeBSD binary's flag words, both ways | — | `linux-syscall` `bsd::translate::benches::*` |
 | the FreeBSD `errno` every failing syscall is mapped to | — | `linux-syscall` `bsd::errno::benches::*` |
 | `sysctl`, which libc and jemalloc read before `main` | — | `linux-syscall` `bsd::sysctl::benches::*` |
@@ -1080,3 +1105,194 @@ Three negative results, all of them about the harness rather than the code:
   is the whole report. Four events for about twice one row is itself the proof
   that a single row is mostly fixed cost.
 
+
+## What the scheduler's own paths said
+
+74 rows across `vendor/PreemptiveScheduler`, the crate the kernel's
+`PreemptiveScheduler` is: the wake bitmap (`waker_page`), one CPU's run queue
+(`task_collection`), the task key, and the reschedule and affinity paths in
+`runtime`. This is the in-kernel counterpart to `eclipse-bench`'s `psched`
+section, which measures the same scheduler from userspace through
+`/proc/perf/kernel`; where that section can say a mechanism is 17x slower than
+it should be, these rows can say what the mechanism costs.
+
+Figures from one idle x86_64 host, `--test-threads=1`, test profile (so every
+`debug_assert!` in them is in the figure and in none of the kernel's).
+
+Four things none of these rows model, each of which would otherwise make a
+kernel figure look cheaper than it is. **Uncontended**: one host thread owns
+every cacheline for the whole run, and on hardware a cross-CPU wake has to take
+the line off its owner -- that transfer, not the `lock`-prefixed instruction,
+is what a wake costs. **No IPI**: `cpu_id()` is 0 on the host, these pages are
+owned by CPU 0, and no sender is registered, so the rows carry the bookkeeping
+around the kick and never the kick. **Coalesced**: `request_resched` only counts
+and kicks on the 0 -> 1 transition of its target's `NEED_RESCHED` bit, so after
+the first iteration of a wake row the bit is up and the figure is a *coalesced*
+wake; the two `..._and_consume_it` rows pay the transition every time.
+**One CPU**: the two 64-CPU picker rows pass the machine in as arguments, which
+is the only way to ask that question on a host with one core.
+
+### What a wake costs
+
+| | ns |
+| --- | --- |
+| ask whether one slot has a wake (`has_pending_wake`) | 0.64 |
+| ask whether the page has work (`has_notified`) | 0.51 |
+| publish an urgent wake (`notify`, two lanes) | 10.9 |
+| publish a voluntary yield (`mark_yielded`, one lane) | 8.5 |
+| drain an empty urgent lane (`take_notified`) | 8.4 |
+| drain one urgent wake | 18.5 |
+| drain a full page of 64 urgent wakes | 787.5 |
+| drain a wake that has to be deferred (borrowed slot) | 22.7 |
+| claim exactly one published wake (`reclaim_notified`) | 18.8 |
+| claim nothing (mask 0, the early return) | 0.37 |
+| a voluntary yield self-wake, end to end | 7.1 |
+| an external wake for a task being polled | 11.8 |
+| an external wake for a task nobody is polling | 16.7 |
+| a wake and the trap that consumes it | 33.0 |
+| clone a `Waker` | 33.3 |
+| initialise a slot (four lanes) | 16.8 |
+| clear a slot (four lanes) | 21.6 |
+
+The shape of this whole family is two numbers. A SeqCst *load* on x86-64 is a
+plain `mov`, which is the sub-nanosecond end; a SeqCst *read-modify-write* is a
+`lock`-prefixed instruction on a line this thread already owns, which is the
+~8 ns end. Every figure above is one or the other, times how many. That is why
+the four-lane calls are ~2.5x the one-lane ones and why every question the
+bitmap answers is free.
+
+Three things worth noticing in it.
+
+**The lane ordering is the right way round.** The voluntary yield is the
+cheapest of the three wakes (7.1 ns), the wake for a task already being polled
+is next (11.8), and the external wake for a sleeping task is the dearest (16.7)
+because it is the only one that publishes a preemption request. The hot path --
+`sched_yield(2)`, which a spinning thread does thousands of times a second --
+is the one the code made cheapest, and the rare path pays for the extra
+machinery. Nothing to do here.
+
+**A full page's 64 wakes come out in one swap.** `drain_an_empty_urgent_lane`
+is 8.4 ns and does not change when the lane is full; of the 787 ns of
+`drain_a_full_page_of_urgent_wakes`, some 704 are the 64 `notify` calls that
+set the bits up and one drain takes them all back out. Collecting a hundred runnable tasks costs the same as collecting
+none, which is the entire point of the bitmap and is worth having measured once.
+
+**A `Waker` clone costs twice an external wake.** 33.3 ns against 16.7, because
+`WakerRef` carries three `Arc`s -- `page`, `dropped` and `lifecycle` -- so a
+clone is three atomic increments and the drop that follows it is three
+decrements. The kernel pays this every time a future stores the waker it was
+polled with, which for a sleeping task is once per poll. Whether the `dropped`
+flag and the `lifecycle` mutex could live in the page slot they already index,
+leaving one `Arc`, is a design question and not a measurement one.
+
+### What the run queue costs
+
+| | ns |
+| --- | --- |
+| read the raw task count (`task_num`) | 0.32 |
+| pre-halt recheck, one page (`has_ready`) | 10.0 |
+| pre-halt recheck, sixteen pages | 9.7 |
+| **pre-halt recheck, a thousand tasks pinned elsewhere** | **3,307** |
+| count runnable, one page (`ready_num`) | 9.9 |
+| count runnable, sixteen pages | 28.6 |
+| count runnable for a thief, one page (`ready_num_for`) | 7.9 |
+| count runnable for a thief, sixteen pages | 30.4 |
+| **count runnable for a thief, a thousand pinned tasks** | **3,687** |
+| placement load, one page | 10.1 |
+| placement load, sixteen pages | 28.8 |
+| hand out a task and take it back | 88.2 |
+| hand out a task to a thief | 95.0 |
+| ask an empty queue for work, one page | 25.8 |
+| **ask an empty queue that once held a thousand** | **181.3** |
+| spawn a task and retire it | 233.9 |
+| spawn a pinned task and retire it | 210.1 |
+| build a run queue (32 priority queues) | 214.7 |
+| summarise for the hang detector, one page | 239.2 |
+| summarise for the hang detector, sixteen pages | 258.8 |
+
+**The scheduler's own inner loop is free.** Handing a task out and taking it
+back is 88 ns. At a 1 ms timeslice that is 0.009% of the slice, so whatever the
+`psched` section's 17x bistability is, it is not the queue machinery: there is
+no amount of tuning here that would show up in a benchmark. The same for the
+trap path -- `need_resched_pending` is a 0.49 ns relaxed load, where the RMW
+path costs 21 ns for the publish-and-take pair that is the only way to pay it
+on every iteration. Two orders of magnitude between peeking and taking is
+exactly why the code peeks first, asks the running thread whether it may be
+preempted, and only then takes.
+
+**One pinned task turns the scans 330x more expensive, for the whole queue.**
+`has_ready` and `ready_num_for` answer from the page bitmaps alone when
+`FutureCollection::affine` is zero, and walk every runnable bit with a
+`PinSlab` lookup per bit when it is not. `affine` counts tasks *with a mask*,
+not tasks pinned away from the asker, so a single `sched_setaffinity` anywhere
+on a CPU's queue switches both scans to the slow form for every task on it.
+With a thousand runnable tasks the pre-halt recheck goes from 10 ns to 3.3 us
+-- on the way into `hlt`, every time -- and a thief's probe of that victim goes
+from 30 ns to 3.7 us, on every victim on every idle pass. The bitmap shortcut
+was written for exactly this and it works; what is missing is a form of it that
+survives one pinned task. A per-page mask of which slots are affine would let
+the scan popcount `runnable & !affine` and walk only the remainder, which is
+the whole of the difference above. That is a behaviour-adjacent change in the
+hottest path in the scheduler, so it is written here and not shipped.
+
+**`pages` never shrinks, and the idle path pays the high-water mark.**
+`FutureCollection::insert` pushes a page per 64 tasks and `remove` frees the
+slab entry and nothing else, so a CPU that once held a thousand tasks keeps its
+sixteen pages. Asking that empty queue for work is 181 ns against 25.8 at one
+page, and the difference is `schedule`'s one `take_dropped` swap per page
+(16 x ~8 ns = 128, which is the gap). After a fork storm, every idle pass on
+that CPU pays it forever. Two ways out, both of them judgement calls: load the
+dropped lane before swapping it (an RMW only when there is something to reap),
+or shrink `pages` when its tail is empty. The first is not quite a
+transformation of equals -- a bit set between the load and the return is seen
+one pass later rather than in this one -- so it is an offer too.
+
+**The hang detector locks 32 queues to read one.** `debug_pending` is 239 ns at
+one page and 259 at sixteen: the depth barely matters, the 32 locks are the
+figure. 31 of those queues are empty by construction, because
+`priority_add_task` asserts that every task lands on `DEFAULT_PRIORITY`, which
+is the realisation `has_ready` already acted on for itself ("the other 31
+queues stay empty and `try_lock`ing them on the way into `hlt` was pure cache
+traffic"). This is a diagnostic path called when something has already gone
+wrong, so it is the least urgent of the four.
+
+### What the reschedule and affinity paths cost
+
+| | ns |
+| --- | --- |
+| ask for a reschedule request and find none | 0.48 |
+| peek at a reschedule request | 0.49 |
+| publish a request and take it (the RMW path) | 21.1 |
+| raise and clear the voluntary marker | 0.67 |
+| ask whether a wake is a voluntary yield | 0.93 |
+| kick a possibly halted owner | 0.95 |
+| publish a coalesced reschedule request | 7.3 |
+| publish a fresh request and consume it | 17.4 |
+| read the executor-ready mask | 0.25 |
+| read the wake-up preempt / steal / weak counters | 0.45 / 1.27 / 0.38 |
+| narrow a mask to the CPUs that could take the task | 0.58 |
+| choose where a pinned task is born | 0.94 |
+| pick a CPU to kick, no loads | 1.40 |
+| pick a CPU to kick with loads, four CPUs | 4.99 |
+| **pick a CPU to kick with loads, 64 CPUs** | **89.2** |
+| kick a CPU the new affinity mask allows (whole call) | 17.1 |
+| sample the runnable count, four CPUs | 3.13 |
+| **sample the runnable count, 64 CPUs** | **51.8** |
+
+Everything the trap path asks on every trap is a relaxed load and a mask test,
+and measures as one. The counters are free to read, which matters because
+`/proc/perf/kernel` reads all of them per sample.
+
+**The two rows in bold are per-CPU scans whose per-CPU cost this host cannot
+charge.** `pick_affinity_kick_target_by` calls its load closure once per
+candidate CPU; on the host that closure is arithmetic, so 64 candidates cost
+89 ns. In the kernel the closure `try_lock`s a peer's runtime and calls
+`placement_load` on it, which the table above puts at 10 to 29 ns of page
+walking. So a `sched_setaffinity` on a 64-core machine is not 89 ns, it is 64
+locks and 64 page walks -- of the order of a microsecond and a half -- and
+`affinity_changed` does the whole thing inside `run_with_intr_saved_off!`, so
+that is an interrupts-off window. `runnable_task_count` has the same shape per
+load-average sample (51.8 ns here with no runtime to lock; 64 real
+`placement_load`s in the kernel). Neither is on a path that runs often, and
+both are already careful about *which* CPUs they visit; the number is recorded
+so that whoever makes placement cleverer knows what the scan already costs.

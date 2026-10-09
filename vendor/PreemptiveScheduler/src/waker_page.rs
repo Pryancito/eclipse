@@ -1070,4 +1070,310 @@ mod waker_page_tests {
         r.mark_borrowed(30, true);
         assert!(r.has_pending_wake(30));
     }
+
+    /// Rows for the bitmap above, and for the wake path that drives it.
+    ///
+    /// Every lane is a `u64` behind SeqCst atomics, so each row is one or a
+    /// handful of uncontended `lock`-prefixed RMWs on one cacheline: these are
+    /// the figures to compare a *number of wakes* against, not a lock cost.
+    /// Four things they do not model, all of them listed because each one would
+    /// otherwise make a kernel figure look cheaper than it is:
+    ///
+    ///  * **Uncontended.** One host thread owns the line for the whole run. On
+    ///    hardware a cross-CPU wake takes the line off its owner, and that
+    ///    transfer, not the RMW, is what a wake costs.
+    ///  * **No IPI.** `cpu_id()` is 0 on the host and these pages are owned by
+    ///    CPU 0, so `request_resched`'s self-IPI is skipped by the code itself,
+    ///    and no sender is registered anyway. The rows carry the bookkeeping
+    ///    around the kick, never the kick.
+    ///  * **Coalesced.** `request_resched` only counts and kicks on the 0 -> 1
+    ///    transition of this CPU's `NEED_RESCHED` bit. After the first
+    ///    iteration of a wake row the bit is up and stays up, so the figure is
+    ///    the *coalesced* wake. `a_wake_and_the_trap_that_consumes_it` is the
+    ///    paired row that pays the transition every time.
+    ///  * **Test profile.** `debug_assert!(offset < 64)` is in every figure
+    ///    here and in none of the kernel's.
+    #[cfg(test)]
+    mod benches {
+        use super::*;
+        use test::{black_box, Bencher};
+
+        // There is no `#[inline(never)]` control row in this module, and the
+        // one that was here has been deleted rather than kept as a bound.
+        // It measured 0.49 ns and three of the rows below it came out
+        // *cheaper* -- `claim_nothing` at 0.37 ns, `ask_whether_one_slot_is_
+        // checked_out` at 0.44 -- because a control that must not be inlined
+        // pays a `call` and a `ret` that these functions, which the compiler
+        // does inline, never pay. A floor that reads above the rows it is
+        // supposed to bound is not evidence of anything. What bounds this
+        // family is its own ordering: a SeqCst *load* on x86-64 is a plain
+        // `mov`, which is the sub-nanosecond end, and a SeqCst *read-modify-
+        // write* is a `lock`-prefixed instruction, which is the ~8 ns end.
+        // Every figure here is one or the other, times how many.
+
+        // ── publishing one slot ────────────────────────────────────────────
+
+        #[bench]
+        fn publish_an_urgent_wake(b: &mut Bencher) {
+            let p = page();
+            b.iter(|| p.notify(black_box(17)));
+        }
+
+        #[bench]
+        fn publish_a_voluntary_yield(b: &mut Bencher) {
+            let p = page();
+            b.iter(|| p.mark_yielded(black_box(17)));
+        }
+
+        #[bench]
+        fn check_a_slot_out(b: &mut Bencher) {
+            let p = page();
+            b.iter(|| p.mark_borrowed(black_box(17), black_box(true)));
+        }
+
+        #[bench]
+        fn hand_a_slot_back(b: &mut Bencher) {
+            let p = page();
+            b.iter(|| p.mark_borrowed(black_box(17), black_box(false)));
+        }
+
+        #[bench]
+        fn mark_a_slot_dropped(b: &mut Bencher) {
+            let p = page();
+            b.iter(|| p.mark_dropped(black_box(17)));
+        }
+
+        /// Four lanes written, which is what a slot costs to hand out.
+        #[bench]
+        fn initialise_a_slot(b: &mut Bencher) {
+            let p = page();
+            b.iter(|| p.initialize(black_box(17)));
+        }
+
+        /// Four lanes written, which is what retiring one costs.
+        #[bench]
+        fn clear_a_slot(b: &mut Bencher) {
+            let p = page();
+            b.iter(|| p.clear(black_box(17)));
+        }
+
+        // ── reading ────────────────────────────────────────────────────────
+
+        #[bench]
+        fn ask_whether_one_slot_is_checked_out(b: &mut Bencher) {
+            let p = page();
+            p.mark_borrowed(17, true);
+            b.iter(|| p.is_borrowed(black_box(17)));
+        }
+
+        #[bench]
+        fn ask_whether_the_page_has_work(b: &mut Bencher) {
+            let p = page();
+            p.notify(17);
+            b.iter(|| p.has_notified());
+        }
+
+        #[bench]
+        fn ask_whether_one_slot_has_a_wake(b: &mut Bencher) {
+            let p = page();
+            p.notify(17);
+            b.iter(|| p.has_pending_wake(black_box(17)));
+        }
+
+        #[bench]
+        fn snapshot_the_page_for_diagnostics(b: &mut Bencher) {
+            let p = page();
+            p.notify(17);
+            b.iter(|| p.peek());
+        }
+
+        // ── draining a lane ────────────────────────────────────────────────
+
+        /// The common case by a wide margin: the generator asks and the lane
+        /// is empty. Three loads and a swap, whatever the page holds.
+        #[bench]
+        fn drain_an_empty_urgent_lane(b: &mut Bencher) {
+            let p = page();
+            b.iter(|| p.take_notified());
+        }
+
+        /// One wake in the lane, republished each round so the row measures
+        /// the same thing every iteration.
+        #[bench]
+        fn drain_one_urgent_wake(b: &mut Bencher) {
+            let p = page();
+            b.iter(|| {
+                p.notify(black_box(17));
+                p.take_notified()
+            });
+        }
+
+        /// A full page: 64 wakes come out in one swap, which is the whole
+        /// point of the bitmap. Read this against
+        /// `drain_one_urgent_wake` — the difference is what 63 extra tasks
+        /// cost to *collect* (the per-task work is the poll, elsewhere).
+        #[bench]
+        fn drain_a_full_page_of_urgent_wakes(b: &mut Bencher) {
+            let p = page();
+            b.iter(|| {
+                for i in 0..64 {
+                    p.notify(black_box(i));
+                }
+                p.take_notified()
+            });
+        }
+
+        /// The deferral path: the wake lands on a slot an executor holds, so
+        /// `take_notified` has to publish it again instead of reporting it.
+        /// This is the extra RMW that stopped wakes being lost under stealing.
+        #[bench]
+        fn drain_a_wake_that_has_to_be_deferred(b: &mut Bencher) {
+            let p = page();
+            p.mark_borrowed(17, true);
+            b.iter(|| {
+                p.notify(black_box(17));
+                p.take_notified()
+            });
+        }
+
+        #[bench]
+        fn drain_an_empty_voluntary_lane(b: &mut Bencher) {
+            let p = page();
+            b.iter(|| p.take_yielded());
+        }
+
+        #[bench]
+        fn drain_the_dropped_lane(b: &mut Bencher) {
+            let p = page();
+            b.iter(|| p.take_dropped());
+        }
+
+        /// What the collection cursor actually does per handout: claim exactly
+        /// the one bit it chose and leave the rest of the lane published.
+        #[bench]
+        fn claim_exactly_one_published_wake(b: &mut Bencher) {
+            let p = page();
+            let bit = 1u64 << 17;
+            b.iter(|| {
+                p.notify(black_box(17));
+                p.reclaim_notified(black_box(bit))
+            });
+        }
+
+        /// The same call with nothing to claim, which is the early return the
+        /// cursor takes whenever its chosen lane came up empty.
+        #[bench]
+        fn claim_nothing(b: &mut Bencher) {
+            let p = page();
+            b.iter(|| p.reclaim_notified(black_box(0)));
+        }
+
+        #[bench]
+        fn park_a_snapshot_back_in_the_lane(b: &mut Bencher) {
+            let p = page();
+            let mask = 1u64 << 17;
+            b.iter(|| p.park_notified(black_box(mask)));
+        }
+
+        // ── the wake path ──────────────────────────────────────────────────
+        //
+        // These go through `WakerRef`, which is what the kernel's `Waker`
+        // actually calls, so they also pay the runtime's reschedule
+        // bookkeeping. They touch that runtime's globals, hence the lock the
+        // tests in this crate use.
+
+        fn waker() -> (Arc<WakerPage>, Arc<AtomicBool>, WakerRef) {
+            let p = page();
+            let dropped = Arc::new(AtomicBool::new(false));
+            let w = p.make_waker(17, &dropped);
+            p.initialize(17);
+            (p, dropped, w)
+        }
+
+        /// A wake from outside for a task nobody is polling: the one the
+        /// kernel raises from a timer, a futex release or net RX.
+        #[bench]
+        fn an_external_wake(b: &mut Bencher) {
+            let _g = crate::runtime::resched_test_lock();
+            let (_p, _d, w) = waker();
+            b.iter(|| w.wake_by_ref());
+        }
+
+        /// The same wake for a task already checked out to an executor: the
+        /// cheap kick, with no preemption request attached.
+        #[bench]
+        fn an_external_wake_for_a_task_being_polled(b: &mut Bencher) {
+            let _g = crate::runtime::resched_test_lock();
+            let (p, _d, w) = waker();
+            p.mark_borrowed(17, true);
+            b.iter(|| w.wake_by_ref());
+        }
+
+        /// `sched_yield(2)`: a self-wake from inside the task's own poll, with
+        /// the voluntary marker up, which files it in the low-priority lane.
+        /// The marker is published once outside the loop because that is where
+        /// `YieldFuture` publishes it too — per poll, not per wake.
+        #[bench]
+        fn a_voluntary_yield_self_wake(b: &mut Bencher) {
+            let _g = crate::runtime::resched_test_lock();
+            let (p, _d, w) = waker();
+            p.mark_borrowed(17, true);
+            crate::runtime::begin_voluntary_yield(&w as *const WakerRef as usize);
+            b.iter(|| w.wake_by_ref());
+            crate::runtime::end_voluntary_yield();
+        }
+
+        /// Releasing a borrow with nothing waiting: the lifecycle lock, a
+        /// dropped-flag load, one RMW and the pending-wake question.
+        #[bench]
+        fn release_a_borrow_with_no_wake_waiting(b: &mut Bencher) {
+            let _g = crate::runtime::resched_test_lock();
+            let (p, _d, w) = waker();
+            p.take_notified();
+            b.iter(|| w.mark_borrowed(black_box(false)));
+        }
+
+        /// Releasing a borrow that a wake landed on while it was held — the
+        /// case that goes on to kick a halted owner.
+        #[bench]
+        fn release_a_borrow_a_wake_is_waiting_on(b: &mut Bencher) {
+            let _g = crate::runtime::resched_test_lock();
+            let (p, _d, w) = waker();
+            p.notify(17);
+            b.iter(|| w.mark_borrowed(black_box(false)));
+        }
+
+        /// What a `Waker` clone costs: three `Arc` bumps, which is what the
+        /// kernel pays every time a future stores the waker it was polled
+        /// with.
+        #[bench]
+        fn clone_a_waker(b: &mut Bencher) {
+            let (_p, _d, w) = waker();
+            b.iter(|| black_box(w.clone()));
+        }
+
+        /// Retiring a task. One-shot by construction (`dropped` latches), so
+        /// the first iteration does the work and the rest measure the early
+        /// return — which is the honest figure for every repeat drop, and is
+        /// why the row is named for the check rather than the drop.
+        #[bench]
+        fn the_dropped_latch_turning_a_second_drop_away(b: &mut Bencher) {
+            let (_p, _d, w) = waker();
+            b.iter(|| w.drop_by_ref());
+        }
+
+        /// A wake and the trap that consumes it, which is the only way to pay
+        /// `request_resched`'s 0 -> 1 transition on every iteration. The pair
+        /// is what one wake-up preemption really costs; the single-sided rows
+        /// above are its coalesced steady state.
+        #[bench]
+        fn a_wake_and_the_trap_that_consumes_it(b: &mut Bencher) {
+            let _g = crate::runtime::resched_test_lock();
+            let (_p, _d, w) = waker();
+            b.iter(|| {
+                w.wake_by_ref();
+                crate::runtime::take_need_resched()
+            });
+        }
+    }
 }
