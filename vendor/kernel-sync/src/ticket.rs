@@ -249,11 +249,28 @@ impl<T: ?Sized> TicketMutex<T> {
     /// bare metal and on a hosted test build.
     #[inline]
     pub(crate) fn holder_is_current_cpu(&self) -> bool {
+        self.holder_is_cpu(crate::interrupt::current_cpu_id())
+    }
+
+    /// The same question against a cpu id the caller resolved itself.
+    ///
+    /// Exists for the fault path, which cannot trust the GS-published id that
+    /// [`holder_is_current_cpu`](Self::holder_is_current_cpu) reads: a fault
+    /// taken with a foreign or smashed GS would answer about somebody else's
+    /// critical section. Its callers resolve the id from the APIC instead.
+    ///
+    /// Note the residual limit: the holder record stores whatever id the
+    /// ACQUIRER published, so a lock taken while GS already lied carries a
+    /// wrong record and no comparison here can recover it. And an id that does
+    /// not resolve (`NO_CPU`) simply matches nobody, which is the safe way for
+    /// a diagnostic to be wrong.
+    #[inline]
+    pub(crate) fn holder_is_cpu(&self, me: u8) -> bool {
         if self.holder_file.load(Ordering::Acquire) == 0 {
             return false;
         }
         let lc = self.holder_line_cpu.load(Ordering::Relaxed);
-        (lc >> 32) as u32 == crate::interrupt::current_cpu_id() as u32
+        (lc >> 32) as u32 == me as u32
     }
 
     /// The next ticket the lock will hand out, for the tests that speak the

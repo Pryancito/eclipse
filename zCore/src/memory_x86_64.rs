@@ -450,8 +450,15 @@ cfg_if! {
         /// walk -- and went into the fault handler still holding it. Reading
         /// that off three reports and a line number took a build with matching
         /// sources; the fault path can just say so.
+        /// Asked through the APIC-resolved id, not the GS-published one: this
+        /// is only ever called from the fault path, and the faults it reports
+        /// on are the same ones a smashed or foreign GS manufactures. A
+        /// `held_by_current_cpu` here would answer about whatever cpu GS
+        /// claimed we were. The trade is that an id that does not resolve
+        /// matches nobody, so the report says nothing rather than naming the
+        /// wrong cpu.
         pub fn heap_held_by_current_cpu() -> bool {
-            HEAP_ALLOCATOR.0.held_by_current_cpu()
+            HEAP_ALLOCATOR.0.held_by_current_cpu_via_apic()
         }
 
         /// The heap lock was found held **by this very CPU** at the moment we

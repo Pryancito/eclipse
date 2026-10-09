@@ -160,6 +160,20 @@ pub trait HeldByCurrentCpu {
     /// `true` only when this CPU is already inside this lock's critical
     /// section, i.e. when acquiring it again would spin forever.
     fn held_by_current_cpu(&self) -> bool;
+
+    /// The same answer for a caller that cannot trust GS.
+    ///
+    /// [`held_by_current_cpu`](Self::held_by_current_cpu) asks who we are
+    /// through the GS-published logical id, which is the right answer on every
+    /// ordinary path and the wrong one on exactly the path that matters for a
+    /// crash report: a fault taken with a foreign or smashed GS would report
+    /// about another cpu's critical section. This one resolves the id from the
+    /// APIC, like the rest of the fault-path diagnostics.
+    ///
+    /// Not a re-entrancy guard: an id that does not resolve matches nobody, so
+    /// it may answer `false` where the plain one answers `true`. It is for a
+    /// report, which prefers saying nothing to naming the wrong cpu.
+    fn held_by_current_cpu_via_apic(&self) -> bool;
 }
 
 cfg_if::cfg_if! {
@@ -169,6 +183,11 @@ cfg_if::cfg_if! {
             fn held_by_current_cpu(&self) -> bool {
                 ticket::TicketMutex::holder_is_current_cpu(self)
             }
+
+            #[inline]
+            fn held_by_current_cpu_via_apic(&self) -> bool {
+                ticket::TicketMutex::holder_is_cpu(self, crate::interrupt::current_cpu_id_via_apic())
+            }
         }
     } else if #[cfg(target_os = "none")] {
         impl<T: ?Sized> HeldByCurrentCpu for Mutex<T> {
@@ -176,11 +195,21 @@ cfg_if::cfg_if! {
             fn held_by_current_cpu(&self) -> bool {
                 spin::SpinMutex::holder_is_current_cpu(self)
             }
+
+            #[inline]
+            fn held_by_current_cpu_via_apic(&self) -> bool {
+                spin::SpinMutex::holder_is_cpu(self, crate::interrupt::current_cpu_id_via_apic())
+            }
         }
     } else {
         impl<T: ?Sized> HeldByCurrentCpu for Mutex<T> {
             #[inline]
             fn held_by_current_cpu(&self) -> bool {
+                false
+            }
+
+            #[inline]
+            fn held_by_current_cpu_via_apic(&self) -> bool {
                 false
             }
         }

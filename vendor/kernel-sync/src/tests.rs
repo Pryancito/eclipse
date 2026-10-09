@@ -991,6 +991,38 @@ fn a_core_with_an_id_is_never_confused_with_one_without() {
     assert_eq!(current_cpu_id(), me);
 }
 
+/// The fault path cannot trust the GS-published id, so it asks with an id it
+/// resolved itself. That question must be about the id it passes and nothing
+/// else -- otherwise a report taken with a smashed GS attributes one cpu's
+/// critical section to another, which is worse than saying nothing.
+#[test]
+fn a_holder_can_be_asked_about_with_an_id_the_caller_resolved() {
+    on_a_cpu(|| {
+        let me = this_cpu();
+        let t = Ticket::new(0u32);
+        let g = t.try_lock().expect("free");
+        assert!(t.holder_is_cpu(me), "we are the holder on record");
+        assert!(
+            !t.holder_is_cpu(me.wrapping_add(1)),
+            "another cpu's id must not match our record"
+        );
+        assert!(
+            !t.holder_is_cpu(NO_CPU),
+            "an id that resolves to nobody matches nobody, which is how a \
+             diagnostic should be wrong"
+        );
+        drop(g);
+        assert!(!t.holder_is_cpu(me), "the record is cleared on release");
+
+        let s = Spin::new(0u32);
+        let g = s.try_lock().expect("free");
+        assert!(s.holder_is_cpu(me));
+        assert!(!s.holder_is_cpu(me.wrapping_add(1)));
+        drop(g);
+        assert!(!s.holder_is_cpu(me));
+    });
+}
+
 // ── the ticket the lock hands out ────────────────────────────────────────────
 
 #[test]
