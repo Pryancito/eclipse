@@ -25,6 +25,54 @@ use zcore_drivers::scheme::RouteInfo;
 /// Bound queued netlink replies (unread sockets must not grow without limit).
 const NETLINK_RX_QUEUE_MAX: usize = 64;
 
+/// El cuerpo de un `NLMSG_ERROR`: el errno NEGADO y la cabecera de la peticion
+/// que lo provoco, que es lo que `libnetlink` compara contra su `nlmsg_seq`.
+///
+/// `error == 0` es el ACK de exito; cualquier otro valor es un fallo, y
+/// `iproute2` lo imprime con `strerror(-err->error)`.
+#[repr(C)]
+#[derive(Copy, Clone)]
+struct NetlinkError {
+    error: i32,
+    msg: NetlinkMessageHeader,
+}
+
+const _: () = {
+    assert!(size_of::<NetlinkError>() == 20);
+};
+
+/// Los errnos con los que contesta esta ruta. No hay `LxError` aqui: lo que
+/// viaja por el socket es el numero de Linux, y escribirlo a mano es la unica
+/// forma de que la tabla se lea de una vez.
+mod errno {
+    pub const ESRCH: i32 = 3;
+    pub const EIO: i32 = 5;
+    pub const EEXIST: i32 = 17;
+    pub const ENODEV: i32 = 19;
+    pub const EINVAL: i32 = 22;
+    pub const ENOMEM: i32 = 12;
+    pub const EOPNOTSUPP: i32 = 95;
+    pub const ENETDOWN: i32 = 100;
+    pub const ENETUNREACH: i32 = 101;
+}
+
+/// El errno que le corresponde a un fallo del driver.
+///
+/// Un `DeviceError` no dice nada a userspace: `ip` imprime lo que saque de
+/// `strerror`, asi que un `NotSupported` tiene que llegar como EOPNOTSUPP y no
+/// como un EIO que manda a buscar un fallo de hardware que no existe.
+fn errno_del_driver(e: zcore_drivers::DeviceError) -> i32 {
+    use zcore_drivers::DeviceError::*;
+    match e {
+        NotSupported => errno::EOPNOTSUPP,
+        InvalidParam | BufferTooSmall => errno::EINVAL,
+        AlreadyExists => errno::EEXIST,
+        NoResources | DmaError => errno::ENOMEM,
+        NotReady => errno::ENETDOWN,
+        IoError => errno::EIO,
+    }
+}
+
 fn push_netlink_rx(queue: &mut Vec<Vec<u8>>, msg: Vec<u8>) {
     if queue.len() >= NETLINK_RX_QUEUE_MAX {
         queue.remove(0);
@@ -458,60 +506,134 @@ impl Socket for NetlinkSocketState {
                     }
                 }
                 NetlinkMessageType::NewAddr => {
-                    if let Some((ifindex, cidr)) = parse_ifaddr_cidr(data) {
-                        if let Ok(iface) = crate::net::iface_by_linux_ifindex(ifindex) {
-                            let _ = iface.add_ip_address(cidr);
-                            if let IpCidr::Ipv4(v4) = cidr {
-                                let _ = iface.set_ipv4_address(v4);
-                                crate::net::prepare_ipv4_stack();
-                            }
-                            log::debug!(
-                                "[netlink] NewAddr {} on {} ifindex={}",
-                                cidr,
-                                iface.get_ifname(),
-                                ifindex
-                            );
-                        } else {
-                            log::warn!("[netlink] NewAddr: unknown ifindex {}", ifindex);
+                    let errno = match parse_ifaddr_cidr(data) {
+                        None => {
+                            log::warn!("[netlink] NewAddr: unparsable request");
+                            errno::EINVAL
                         }
-                    }
-                    push_ack(&mut buffer, header, reply_pid);
+                        Some((ifindex, cidr)) => {
+                            match crate::net::iface_by_linux_ifindex(ifindex) {
+                                Err(_) => {
+                                    log::warn!("[netlink] NewAddr: unknown ifindex {}", ifindex);
+                                    errno::ENODEV
+                                }
+                                Ok(iface) => match iface.add_ip_address(cidr) {
+                                    Err(e) => {
+                                        log::warn!(
+                                            "[netlink] NewAddr {} on {}: {:?}",
+                                            cidr,
+                                            iface.get_ifname(),
+                                            e
+                                        );
+                                        errno_del_driver(e)
+                                    }
+                                    Ok(()) => {
+                                        if let IpCidr::Ipv4(v4) = cidr {
+                                            // La direccion YA esta puesta; esto
+                                            // solo la asciende a primaria, y hay
+                                            // drivers que no lo implementan (el
+                                            // loopback, por ejemplo). Un fallo
+                                            // aqui no puede convertir un
+                                            // `ip addr add` que tomo en un error.
+                                            if let Err(e) = iface.set_ipv4_address(v4) {
+                                                log::warn!(
+                                                    "[netlink] NewAddr {}: added, but not promoted to primary on {}: {:?}",
+                                                    cidr,
+                                                    iface.get_ifname(),
+                                                    e
+                                                );
+                                            }
+                                            crate::net::prepare_ipv4_stack();
+                                        }
+                                        log::debug!(
+                                            "[netlink] NewAddr {} on {} ifindex={}",
+                                            cidr,
+                                            iface.get_ifname(),
+                                            ifindex
+                                        );
+                                        0
+                                    }
+                                },
+                            }
+                        }
+                    };
+                    push_ack(&mut buffer, header, reply_pid, errno);
                 }
                 NetlinkMessageType::NewRoute => {
-                    if let Some((rtm, dst_cidr, gw_ip, oif)) = parse_route_request(data) {
-                        if oif != 0 {
-                            if let Ok(iface) = crate::net::iface_by_linux_ifindex(oif) {
-                                let _ = iface.add_route(dst_cidr, gw_ip);
-                                info!(
-                                    "[netlink] NewRoute: {:?} gw={:?} via {} (oif {})",
-                                    dst_cidr,
-                                    gw_ip,
-                                    iface.get_ifname(),
-                                    oif
-                                );
-                            }
-                        } else if let Some(gw) = gw_ip {
-                            // Gateway without RTA_OIF: pick first matching family iface.
-                            let ifaces = get_net_device();
-                            let iface = ifaces.iter().find(|i| {
-                                i.get_ip_address().iter().any(|a| {
-                                    matches!(
-                                        (a, &gw),
-                                        (IpCidr::Ipv4(_), smoltcp::wire::IpAddress::Ipv4(_))
-                                            | (IpCidr::Ipv6(_), smoltcp::wire::IpAddress::Ipv6(_))
-                                    )
-                                })
-                            });
-                            if let Some(iface) = iface {
-                                let _ = iface.add_route(dst_cidr, Some(gw));
-                            }
+                    let errno = match parse_route_request(data) {
+                        None => {
+                            log::warn!("[netlink] NewRoute: unparsable request");
+                            errno::EINVAL
                         }
-                        if matches!(dst_cidr, IpCidr::Ipv4(_)) {
-                            crate::net::prepare_ipv4_stack();
+                        Some((rtm, dst_cidr, gw_ip, oif)) => {
+                            let _ = rtm;
+                            let errno = if oif != 0 {
+                                match crate::net::iface_by_linux_ifindex(oif) {
+                                    Err(_) => {
+                                        log::warn!("[netlink] NewRoute: unknown oif {}", oif);
+                                        errno::ENODEV
+                                    }
+                                    Ok(iface) => match iface.add_route(dst_cidr, gw_ip) {
+                                        Err(e) => {
+                                            log::warn!(
+                                                "[netlink] NewRoute {:?} via {}: {:?}",
+                                                dst_cidr,
+                                                iface.get_ifname(),
+                                                e
+                                            );
+                                            errno_del_driver(e)
+                                        }
+                                        Ok(()) => {
+                                            info!(
+                                                "[netlink] NewRoute: {:?} gw={:?} via {} (oif {})",
+                                                dst_cidr,
+                                                gw_ip,
+                                                iface.get_ifname(),
+                                                oif
+                                            );
+                                            0
+                                        }
+                                    },
+                                }
+                            } else if let Some(gw) = gw_ip {
+                                match iface_de_la_pasarela(&gw) {
+                                    // Ninguna interfaz tiene una direccion de la
+                                    // familia de la pasarela: es exactamente el
+                                    // ENETUNREACH de Linux, no un exito.
+                                    None => {
+                                        log::warn!(
+                                            "[netlink] NewRoute: no iface for gateway {:?}",
+                                            gw
+                                        );
+                                        errno::ENETUNREACH
+                                    }
+                                    Some(iface) => match iface.add_route(dst_cidr, Some(gw)) {
+                                        Err(e) => {
+                                            log::warn!(
+                                                "[netlink] NewRoute {:?} gw={:?}: {:?}",
+                                                dst_cidr,
+                                                gw,
+                                                e
+                                            );
+                                            errno_del_driver(e)
+                                        }
+                                        Ok(()) => 0,
+                                    },
+                                }
+                            } else {
+                                // Ni dispositivo ni pasarela: no hay por donde
+                                // instalarla. Antes se contestaba OK y la ruta
+                                // no existia.
+                                log::warn!("[netlink] NewRoute: neither RTA_OIF nor RTA_GATEWAY");
+                                errno::EINVAL
+                            };
+                            if errno == 0 && matches!(dst_cidr, IpCidr::Ipv4(_)) {
+                                crate::net::prepare_ipv4_stack();
+                            }
+                            errno
                         }
-                        let _ = rtm;
-                    }
-                    push_ack(&mut buffer, header, reply_pid);
+                    };
+                    push_ack(&mut buffer, header, reply_pid, errno);
                 }
                 NetlinkMessageType::GetRoute => {
                     let ifaces = get_net_device();
@@ -530,59 +652,121 @@ impl Socket for NetlinkSocketState {
                     info!("[netlink] GetRoute: dumped routes");
                 }
                 NetlinkMessageType::DelAddr => {
-                    if let Some((ifindex, cidr)) = parse_ifaddr_cidr(data) {
-                        if let Ok(iface) = crate::net::iface_by_linux_ifindex(ifindex) {
-                            let skip = matches!(
-                                cidr,
-                                smoltcp::wire::IpCidr::Ipv6(v6) if v6.address().is_link_local()
-                            );
-                            if !skip {
-                                let _ = iface.remove_ip_address(cidr);
-                            }
-                            info!(
-                                "[netlink] DelAddr: removed {} from {} (ifindex {})",
-                                cidr,
-                                iface.get_ifname(),
-                                ifindex
-                            );
+                    let errno = match parse_ifaddr_cidr(data) {
+                        None => {
+                            log::warn!("[netlink] DelAddr: unparsable request");
+                            errno::EINVAL
                         }
-                    }
-                    push_ack(&mut buffer, header, reply_pid);
+                        Some((ifindex, cidr)) => {
+                            match crate::net::iface_by_linux_ifindex(ifindex) {
+                                Err(_) => {
+                                    log::warn!("[netlink] DelAddr: unknown ifindex {}", ifindex);
+                                    errno::ENODEV
+                                }
+                                Ok(iface) => {
+                                    // Una link-local de IPv6 no se quita: la pila
+                                    // la necesita y quitarla deja la interfaz sin
+                                    // vecindad. Se contesta exito porque es una
+                                    // negativa deliberada, no un fallo.
+                                    let skip = matches!(
+                                        cidr,
+                                        smoltcp::wire::IpCidr::Ipv6(v6) if v6.address().is_link_local()
+                                    );
+                                    if skip {
+                                        0
+                                    } else {
+                                        match iface.remove_ip_address(cidr) {
+                                            Err(e) => {
+                                                log::warn!(
+                                                    "[netlink] DelAddr {} from {}: {:?}",
+                                                    cidr,
+                                                    iface.get_ifname(),
+                                                    e
+                                                );
+                                                errno_del_driver(e)
+                                            }
+                                            Ok(()) => {
+                                                info!(
+                                                    "[netlink] DelAddr: removed {} from {} (ifindex {})",
+                                                    cidr,
+                                                    iface.get_ifname(),
+                                                    ifindex
+                                                );
+                                                0
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    };
+                    push_ack(&mut buffer, header, reply_pid, errno);
                 }
                 NetlinkMessageType::DelRoute => {
-                    if let Some((_rtm, dst_cidr, gw_ip, oif)) = parse_route_request(data) {
-                        let iface = if oif != 0 {
-                            crate::net::iface_by_linux_ifindex(oif).ok()
-                        } else {
-                            None
-                        };
-                        if let Some(iface) = iface {
-                            let _ = iface.del_route(dst_cidr, gw_ip);
-                            info!(
-                                "[netlink] DelRoute: removed {:?} gw={:?} from {}",
-                                dst_cidr,
-                                gw_ip,
-                                iface.get_ifname()
-                            );
+                    let errno = match parse_route_request(data) {
+                        None => {
+                            log::warn!("[netlink] DelRoute: unparsable request");
+                            errno::EINVAL
                         }
-                    }
-                    push_ack(&mut buffer, header, reply_pid);
+                        Some((_rtm, dst_cidr, gw_ip, oif)) => {
+                            let ifaces = get_net_device();
+                            let iface = if oif != 0 {
+                                crate::net::iface_by_linux_ifindex(oif).ok()
+                            } else {
+                                // `ip route del <dst>` no lleva RTA_OIF, y antes
+                                // eso era un no-op con ACK de exito: la ruta
+                                // seguia ahi y nadie se enteraba. La dueña es la
+                                // interfaz que tiene esa ruta instalada.
+                                ifaces
+                                    .iter()
+                                    .find(|i| i.get_routes().iter().any(|r| r.dst == dst_cidr))
+                                    .cloned()
+                            };
+                            match iface {
+                                None => {
+                                    log::warn!(
+                                        "[netlink] DelRoute: no iface holds {:?} (oif {})",
+                                        dst_cidr,
+                                        oif
+                                    );
+                                    if oif != 0 {
+                                        errno::ENODEV
+                                    } else {
+                                        // Lo que Linux contesta cuando la ruta a
+                                        // borrar no existe.
+                                        errno::ESRCH
+                                    }
+                                }
+                                Some(iface) => match iface.del_route(dst_cidr, gw_ip) {
+                                    Err(e) => {
+                                        log::warn!(
+                                            "[netlink] DelRoute {:?} from {}: {:?}",
+                                            dst_cidr,
+                                            iface.get_ifname(),
+                                            e
+                                        );
+                                        errno_del_driver(e)
+                                    }
+                                    Ok(()) => {
+                                        info!(
+                                            "[netlink] DelRoute: removed {:?} gw={:?} from {}",
+                                            dst_cidr,
+                                            gw_ip,
+                                            iface.get_ifname()
+                                        );
+                                        0
+                                    }
+                                },
+                            }
+                        }
+                    };
+                    push_ack(&mut buffer, header, reply_pid, errno);
                 }
                 _ => {
                     // Unknown/unimplemented request: return NLMSG_ERROR with -EOPNOTSUPP.
                     // This is better than a silent NLMSG_DONE which confuses userland.
-                    const EOPNOTSUPP: i32 = 95;
-                    #[repr(C)]
-                    #[derive(Copy, Clone)]
-                    struct NetlinkError {
-                        error: i32,
-                        msg: NetlinkMessageHeader,
-                    }
-                    const _: () = {
-                        assert!(size_of::<NetlinkError>() == 20);
-                    };
                     let err = NetlinkError {
-                        error: -EOPNOTSUPP,
+                        error: -errno::EOPNOTSUPP,
                         msg: *header,
                     };
                     let mut msg = Vec::new();
@@ -1230,9 +1414,26 @@ fn push_route_dump_entry(
     push_netlink_rx(buffer, msg);
 }
 
-/// Build a success ACK (NLMSG_ERROR with error=0) and push it onto `buffer` —
-/// but ONLY when the request asked for one with `NLM_F_ACK`, which is what
-/// Linux does.
+/// La interfaz por la que instalar una ruta cuya peticion trae pasarela pero
+/// no `RTA_OIF`: la primera que tenga una direccion de la familia de la
+/// pasarela.
+fn iface_de_la_pasarela(gw: &IpAddress) -> Option<Arc<dyn zcore_drivers::scheme::NetScheme>> {
+    get_net_device().into_iter().find(|i| {
+        i.get_ip_address().iter().any(|a| {
+            matches!((a, gw), (IpCidr::Ipv4(_), IpAddress::Ipv4(_)))
+                || matches!((a, gw), (IpCidr::Ipv6(_), IpAddress::Ipv6(_)))
+        })
+    })
+}
+
+/// Contesta a una peticion de escritura con su `NLMSG_ERROR`: `errno == 0` es
+/// el ACK de exito, y cualquier otro valor es el fallo de verdad.
+///
+/// El ACK de exito sale SOLO si la peticion lo pidio con `NLM_F_ACK`, que es
+/// lo que hace Linux. **Un fallo sale siempre**, con `NLM_F_ACK` o sin el:
+/// Linux tampoco se lo calla, y callarselo es justo lo que hacia que
+/// `ip addr add` dijera que todo fue bien y el sintoma apareciera despues y en
+/// otro sitio (sin direccion en la interfaz, o sin ruta por defecto).
 ///
 /// Acking unconditionally is what broke `ip addr flush`. busybox's
 /// `rtnl_send_check` writes the batch of RTM_DELADDR messages, peeks the
@@ -1251,8 +1452,10 @@ fn push_route_dump_entry(
 ///
 /// `ip addr add` and `ip route add|del` go through `rtnl_talk`, which DOES set
 /// NLM_F_ACK and waits for the reply, so they keep their ACK and keep working.
-fn push_ack(buffer: &mut Vec<Vec<u8>>, req: &NetlinkMessageHeader, nl_pid: u32) {
-    if !req.nlmsg_flags.contains(NetlinkMessageFlags::ACK) {
+/// Y ese mismo `rtnl_send_check` es lo que hace que un fallo sin `NLM_F_ACK`
+/// llegue: trata cualquier `NLMSG_ERROR` como un fallo, que es lo que es.
+fn push_ack(buffer: &mut Vec<Vec<u8>>, req: &NetlinkMessageHeader, nl_pid: u32, errno: i32) {
+    if errno == 0 && !req.nlmsg_flags.contains(NetlinkMessageFlags::ACK) {
         info!(
             "[netlink] no ACK requested (flags={:#x}, seq={}); staying silent like Linux",
             req.nlmsg_flags.bits(),
@@ -1260,17 +1463,8 @@ fn push_ack(buffer: &mut Vec<Vec<u8>>, req: &NetlinkMessageHeader, nl_pid: u32) 
         );
         return;
     }
-    #[repr(C)]
-    #[derive(Copy, Clone)]
-    struct NetlinkError {
-        error: i32,
-        msg: NetlinkMessageHeader,
-    }
-    const _: () = {
-        assert!(size_of::<NetlinkError>() == 20);
-    };
     let err = NetlinkError {
-        error: 0,
+        error: -errno,
         msg: *req,
     };
     let mut msg = Vec::new();
@@ -1286,9 +1480,10 @@ fn push_ack(buffer: &mut Vec<Vec<u8>>, req: &NetlinkMessageHeader, nl_pid: u32) 
     msg.align4();
     msg.set_ext(0, msg.len() as u32);
     info!(
-        "[netlink] push_ack: seq={}, len={}",
+        "[netlink] push_ack: seq={}, len={}, errno={}",
         req.nlmsg_seq,
-        msg.len()
+        msg.len(),
+        errno
     );
     push_netlink_rx(buffer, msg);
 }
@@ -1355,6 +1550,9 @@ mod netlink_tests {
     //! the way `iproute2` walks it.
 
     use super::*;
+
+    // Edicion 2018: `TryInto` no esta en el preludio.
+    use core::convert::TryInto;
 
     const NLMSG_HDR: usize = size_of::<NetlinkMessageHeader>();
     const IFA_LOCAL: u16 = 2;
@@ -1838,5 +2036,162 @@ mod netlink_tests {
         let mut whole = [0u8; 32];
         assert_eq!(Socket::read(&nl, &mut whole).await.0, Ok(8));
         assert_eq!(Socket::take_msg_flags(&nl), 0);
+    }
+
+    /// Lee un `NLMSG_ERROR` como lo lee `libnetlink`: el tipo de la cabecera,
+    /// el `error` que viene detras y la longitud declarada.
+    fn lee_error(msg: &[u8]) -> (u16, i32, u32) {
+        let len = u32::from_ne_bytes(msg[0..4].try_into().unwrap());
+        let tipo = u16::from_ne_bytes(msg[4..6].try_into().unwrap());
+        let error = i32::from_ne_bytes(msg[NLMSG_HDR..NLMSG_HDR + 4].try_into().unwrap());
+        (tipo, error, len)
+    }
+
+    fn pide_ack(con_ack: bool) -> NetlinkMessageHeader {
+        let mut h = header(NetlinkMessageType::NewAddr.into());
+        if con_ack {
+            h.nlmsg_flags |= NetlinkMessageFlags::ACK;
+        }
+        h
+    }
+
+    /// El fallo tiene que salir SIN que la peticion pida `NLM_F_ACK`: es lo que
+    /// hace Linux, y es la mitad del arreglo. Con la regla anterior
+    /// («sin NLM_F_ACK, silencio») un `ip addr add` a una interfaz que no
+    /// existe no recibia nada y se daba por bueno.
+    #[test]
+    fn un_fallo_sale_aunque_no_se_pida_ack() {
+        let mut buffer = Vec::new();
+        push_ack(&mut buffer, &pide_ack(false), 42, errno::ENODEV);
+        assert_eq!(buffer.len(), 1, "un fallo no se calla nunca");
+        let (tipo, error, _) = lee_error(&buffer[0]);
+        assert_eq!(tipo, u16::from(NetlinkMessageType::Error));
+        assert_eq!(error, -19, "el errno viaja NEGADO, como nlmsgerr");
+    }
+
+    /// Y la regla de Linux para el exito sigue en pie: sin `NLM_F_ACK` no sale
+    /// nada. Es lo que hace que `ip addr flush` funcione (su `rtnl_send_check`
+    /// toma cualquier `NLMSG_ERROR` por un fallo).
+    #[test]
+    fn el_ack_de_exito_sigue_callandose_sin_la_bandera() {
+        let mut buffer = Vec::new();
+        push_ack(&mut buffer, &pide_ack(false), 42, 0);
+        assert!(buffer.is_empty(), "un exito sin NLM_F_ACK no contesta");
+    }
+
+    /// Con la bandera, el exito es un `NLMSG_ERROR` con `error == 0` y los 36
+    /// bytes de `nlmsghdr` + `nlmsgerr` que espera userspace.
+    #[test]
+    fn el_ack_de_exito_con_la_bandera_lleva_cero() {
+        let mut buffer = Vec::new();
+        push_ack(&mut buffer, &pide_ack(true), 42, 0);
+        assert_eq!(buffer.len(), 1);
+        let (tipo, error, len) = lee_error(&buffer[0]);
+        assert_eq!(tipo, u16::from(NetlinkMessageType::Error));
+        assert_eq!(error, 0);
+        assert_eq!(len as usize, buffer[0].len());
+        assert_eq!(len, 36, "16 de nlmsghdr + 4 de error + 16 de la copia");
+    }
+
+    /// Un fallo con la bandera puesta tampoco se convierte en exito.
+    #[test]
+    fn con_la_bandera_el_fallo_sigue_siendo_fallo() {
+        let mut buffer = Vec::new();
+        push_ack(&mut buffer, &pide_ack(true), 42, errno::EINVAL);
+        assert_eq!(lee_error(&buffer[0]).1, -22);
+    }
+
+    /// El `nlmsg_seq` de la peticion tiene que volver tal cual dentro de la
+    /// copia: `rtnl_talk` descarta todo lo que no lleve SU secuencia, asi que
+    /// un fallo con la secuencia mal puesta se pierde igual que no mandarlo.
+    #[test]
+    fn el_fallo_devuelve_la_secuencia_de_la_peticion() {
+        let mut buffer = Vec::new();
+        let mut req = pide_ack(true);
+        req.nlmsg_seq = 1234;
+        push_ack(&mut buffer, &req, 42, errno::ESRCH);
+        let msg = &buffer[0];
+        assert_eq!(
+            u32::from_ne_bytes(msg[8..12].try_into().unwrap()),
+            1234,
+            "la secuencia de la cabecera del ACK"
+        );
+        // Y la copia de la peticion empieza tras el `error`.
+        let copia = NLMSG_HDR + 4;
+        assert_eq!(
+            u32::from_ne_bytes(msg[copia + 8..copia + 12].try_into().unwrap()),
+            1234,
+            "la secuencia dentro de la copia de la peticion"
+        );
+    }
+
+    /// Cada fallo del driver tiene su errno, y ninguno cae en un EIO que
+    /// mandaria a buscar un fallo de hardware que no existe.
+    #[test]
+    fn cada_fallo_de_driver_tiene_su_errno() {
+        use zcore_drivers::DeviceError::*;
+        for (e, esperado) in [
+            (NotSupported, 95),
+            (InvalidParam, 22),
+            (BufferTooSmall, 22),
+            (AlreadyExists, 17),
+            (NoResources, 12),
+            (DmaError, 12),
+            (NotReady, 100),
+            (IoError, 5),
+        ] {
+            assert_eq!(errno_del_driver(e), esperado, "{:?}", e);
+        }
+    }
+
+    /// Y el camino completo, por el socket: `ip addr add ... dev <ifindex que
+    /// no existe>`. Antes contestaba un ACK de exito y la direccion no estaba
+    /// en ninguna parte; el sintoma salia despues, sin red y sin un error que
+    /// lo explicara.
+    #[test]
+    fn newaddr_a_una_interfaz_que_no_existe_contesta_enodev() {
+        let nl = NetlinkSocketState::default();
+        let req = newaddr_request(9999, 24, IFA_LOCAL, &[10, 0, 0, 5]);
+        assert_eq!(Socket::write(&nl, &req, None), Ok(req.len()));
+        let cola = nl.data.lock();
+        assert_eq!(cola.len(), 1, "un fallo contesta sin que se pida NLM_F_ACK");
+        assert_eq!(lee_error(&cola[0]).1, -19, "-ENODEV");
+    }
+
+    /// Una peticion que el parser no entiende (aqui, sin atributo de
+    /// direccion) es EINVAL, no un exito.
+    #[test]
+    fn una_peticion_de_direccion_sin_direccion_es_einval() {
+        let nl = NetlinkSocketState::default();
+        let mut req = Vec::new();
+        req.push_ext(header(NetlinkMessageType::NewAddr.into()));
+        req.push_ext(IfaceAddrMsg {
+            ifa_family: 2,
+            ifa_prefixlen: 24,
+            ifa_flags: 0,
+            ifa_scope: 0,
+            ifa_index: 1,
+        });
+        req.align4();
+        req.set_ext(0, req.len() as u32);
+        assert_eq!(Socket::write(&nl, &req, None), Ok(req.len()));
+        let cola = nl.data.lock();
+        assert_eq!(cola.len(), 1);
+        assert_eq!(lee_error(&cola[0]).1, -22, "-EINVAL");
+    }
+
+    /// `ip route del <dst>` que no encuentra la ruta es ESRCH. Es el caso que
+    /// no se intentaba siquiera: sin RTA_OIF no se buscaba dueño, no se
+    /// borraba nada y se contestaba que si.
+    #[test]
+    fn borrar_una_ruta_que_nadie_tiene_es_esrch() {
+        let nl = NetlinkSocketState::default();
+        let req = newroute_request(24, Some(&[10, 1, 2, 0]), None, 0);
+        let mut req = req;
+        req.set_ext(4, u16::from(NetlinkMessageType::DelRoute));
+        assert_eq!(Socket::write(&nl, &req, None), Ok(req.len()));
+        let cola = nl.data.lock();
+        assert_eq!(cola.len(), 1);
+        assert_eq!(lee_error(&cola[0]).1, -3, "-ESRCH");
     }
 }
