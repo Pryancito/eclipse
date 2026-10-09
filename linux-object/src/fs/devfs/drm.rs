@@ -2340,65 +2340,8 @@ pub fn nouveau_cpu_vmo_forget(handle: u32) {
     NOUVEAU_CPU_VMOS.lock().remove(&handle);
 }
 
-/// Register a new DRM driver
-pub fn register_driver(driver: Arc<dyn DrmScheme>) {
-    let mut state = DRM_STATE.lock();
-    if driver.name() == "simplefb" {
-        state.drivers.push(driver);
-    } else {
-        state.drivers.insert(0, driver);
-    }
-}
-
-/// Unregister a driver [`register_driver`] added, matched by identity
-/// (`Arc::ptr_eq`) rather than by name. Returns whether one was removed.
-///
-/// Test-only, and `DRM_STATE.drivers` is append-only for a reason: nothing in
-/// this kernel unplugs a GPU. But a unit-test binary runs every test of the
-/// crate in ONE process, and a registered driver changes the answers the whole
-/// DRM core gives -- `software_kms_active()` asks every driver whether it can
-/// scan out, `get_primary_driver()` takes the first entry, and `get_resources`
-/// filters the topology on whether any driver has hardware KMS. One left behind
-/// would put every later test on the hardware path.
-#[cfg(test)]
-pub(crate) fn unregister_driver(driver: &Arc<dyn DrmScheme>) -> bool {
-    let mut state = DRM_STATE.lock();
-    match state.drivers.iter().position(|d| Arc::ptr_eq(d, driver)) {
-        Some(pos) => {
-            state.drivers.remove(pos);
-            true
-        }
-        None => false,
-    }
-}
-
-/// Get the primary DRM driver
-pub fn get_primary_driver() -> Option<Arc<dyn DrmScheme>> {
-    DRM_STATE.lock().drivers.first().cloned()
-}
-
-/// The DRM driver of the card that drives the display, for the questions that
-/// are about the monitor rather than about whoever happens to be first in the
-/// list: does the panel need the software blit, and is there a real vblank to
-/// wait on.
-///
-/// That is the first registered driver which is not a compute GPU. A compute
-/// GPU is one that drives no display by definition (the NVIDIA driver answers
-/// `is_compute_gpu()` false exactly for the card whose BAR1 holds the boot
-/// framebuffer), and a non-NVIDIA driver answers false too, which is right:
-/// a plain KMS or framebuffer driver does drive the output. When every
-/// registered driver says it is a compute GPU there is no better answer than
-/// [`get_primary_driver`], so that is the fallback rather than `None` -- a
-/// `None` here would silently turn the software-KMS answer around.
-pub fn get_display_driver() -> Option<Arc<dyn DrmScheme>> {
-    let state = DRM_STATE.lock();
-    state
-        .drivers
-        .iter()
-        .find(|d| !d.is_compute_gpu())
-        .or_else(|| state.drivers.first())
-        .cloned()
-}
+mod driver_registry;
+pub use driver_registry::*;
 
 /// Base minor of the render-node range, as Linux allocates them: primary
 /// nodes are `card0..card63`, render nodes `renderD128..renderD191`.
@@ -2697,67 +2640,6 @@ pub fn node_driver_id(minor: u32, nouveau_requested: bool) -> NodeDriverId {
     } else {
         NodeDriverId::Compute
     }
-}
-
-/// `nvidia.compute=BB.DD.F` on the kernel cmdline (hex, dots — the cmdline
-/// already uses `:` as its token separator, so a PCI BDF with colons cannot
-/// be a single token). Example: `nvidia.compute=65.00.0`.
-fn parse_nvidia_compute_bdf() -> Option<(u8, u8, u8)> {
-    let cmdline = kernel_hal::boot::cmdline();
-    for tok in cmdline.split([':', ' ', '\t', '\n']) {
-        let Some(rest) = tok.strip_prefix("nvidia.compute=") else {
-            continue;
-        };
-        if rest.is_empty() {
-            continue;
-        }
-        let mut parts = rest.split('.');
-        let bus = u8::from_str_radix(parts.next()?, 16).ok()?;
-        let dev = u8::from_str_radix(parts.next()?, 16).ok()?;
-        let func = parts
-            .next()
-            .and_then(|p| u8::from_str_radix(p, 16).ok())
-            .unwrap_or(0);
-        return Some((bus, dev, func));
-    }
-    None
-}
-
-/// The NVIDIA GPU that owns compute (SAXPY, NVK EXEC, CE-present): either
-/// the `nvidia.compute=BB.DD.F` pin, or the first driver with
-/// [`DrmScheme::is_compute_gpu`]. Never the console GPU — its GSP resume
-/// can wedge the bus.
-pub fn get_compute_driver() -> Option<Arc<dyn DrmScheme>> {
-    let drivers = kernel_hal::drivers::all_drm();
-    let list = drivers.as_vec();
-    if let Some((bus, dev, func)) = parse_nvidia_compute_bdf() {
-        if let Some(d) = list.iter().find(|d| {
-            matches!(
-                d.pci_bdf(),
-                Some((_, b, dv, f)) if b == bus && dv == dev && f == func
-            )
-        }) {
-            if d.is_console_gpu() {
-                kernel_hal::klog_info!(
-                    "[drm] nvidia.compute={:02x}.{:02x}.{:x} is the console GPU — ignoring pin \
-                     (GSP on the GOP card can wedge the bus)",
-                    bus,
-                    dev,
-                    func
-                );
-            } else {
-                return Some(d.clone());
-            }
-        } else {
-            kernel_hal::klog_info!(
-                "[drm] nvidia.compute={:02x}.{:02x}.{:x} does not match any DRM GPU",
-                bus,
-                dev,
-                func
-            );
-        }
-    }
-    list.iter().find(|d| d.is_compute_gpu()).cloned()
 }
 
 /// Hard ceiling on live GEM objects. Contiguous dumb buffers are expensive
@@ -3357,8 +3239,12 @@ pub fn create_fb_with_layout(
     let want_driver_fb = !software_kms_active()
         || zcore_drivers::display::surfaceflip_enabled()
         || zcore_drivers::display::hwflip_enabled();
+    // `get_display_driver`, not the first entry: a driver fb exists to be
+    // scanned out, and only the card with the monitor can scan one out. It has
+    // to be the same card `page_flip` below is offered, or the flip would
+    // carry an id from another card's namespace.
     let driver_fb_id = if want_driver_fb {
-        get_primary_driver().and_then(|driver| driver.create_fb(handle_id, width, height, pitch))
+        get_display_driver().and_then(|driver| driver.create_fb(handle_id, width, height, pitch))
     } else {
         None
     };
@@ -6905,7 +6791,14 @@ pub fn present_now_checked(
     // Prefer a driver page_flip (NVC57E surfaceflip / CE hwflip) when the
     // driver accepted the fb; fall back to GOP blit so a failed HW flip
     // never blacks the panel.
-    let hw = get_primary_driver().and_then(|driver| {
+    // The card that has the monitor, not `drivers.first()`: on a two-card box
+    // that first entry is the compute card (`register_driver` inserts at 0, so
+    // it is the LAST card probed), and flipping it cannot put a pixel on the
+    // panel -- the GOP framebuffer is not even inside its BAR1. The CE branch
+    // of the NVIDIA driver's `page_flip` has no `drives_boot_display()` guard
+    // of its own, so this is the only thing standing between `nvidia.hwflip`
+    // and a copy-engine blit submitted on the wrong card.
+    let hw = get_display_driver().and_then(|driver| {
         let driver_fb_id = DRM_STATE
             .lock()
             .framebuffers
@@ -7536,7 +7429,10 @@ pub fn atomic_commit(
 
 pub fn get_caps() -> Option<DrmCaps> {
     if !software_kms_active() {
-        if let Some(d) = get_primary_driver() {
+        // The panel's capabilities come from the card that drives it. A compute
+        // card reports its own display engine's limits, which userspace would
+        // then apply to a monitor that card is not connected to.
+        if let Some(d) = get_display_driver() {
             return Some(d.get_caps());
         }
     }

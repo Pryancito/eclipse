@@ -80,3 +80,29 @@ fn all_compute_falls_back_to_the_primary_instead_of_none() {
         "with nothing but compute cards the primary stays the answer"
     );
 }
+
+/// What `DRM_IOCTL_GET_CAP` and the mode limits come from. These describe the
+/// monitor, so they have to come off the card the monitor is plugged into: a
+/// compute card reports its own display engine's limits, and userspace would
+/// then size a surface for a panel that card is not connected to.
+#[test]
+fn the_panel_limits_come_from_the_card_the_panel_is_on() {
+    let screen = kms_emu::attach(64, 16);
+    let _console = screen.attach_gpu(
+        EmuGpu::hardware_kms("emu-console")
+            .console_at(0x01, 0x00)
+            .with_caps(3840, 2160),
+    );
+    let _compute = screen.attach_gpu(
+        EmuGpu::hardware_kms("emu-compute")
+            .compute_at(0x65, 0x00)
+            .with_caps(640, 480),
+    );
+
+    let caps = get_caps().expect("hardware KMS is active, so a driver answers");
+    assert_eq!(
+        (caps.max_width, caps.max_height),
+        (3840, 2160),
+        "the caps came off the compute card, which has no monitor on it"
+    );
+}

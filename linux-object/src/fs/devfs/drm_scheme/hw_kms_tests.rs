@@ -1880,3 +1880,53 @@ fn lists_are_filled_as_far_as_the_caller_made_room_and_objects_match_their_type(
     );
     assert_eq!(by_type(60, DRM_MODE_OBJECT_ANY), Ok(0));
 }
+
+/// Moebius's two-card box, on the frame path. `register_driver` inserts at 0,
+/// so `drivers.first()` is the LAST card probed -- the headless compute one --
+/// and both the driver framebuffer and the flip used to be asked of it. A flip
+/// on that card cannot put a pixel on the monitor: the boot framebuffer is not
+/// inside its BAR1 at all, and the CE branch of the NVIDIA driver's
+/// `page_flip` has no `drives_boot_display()` guard of its own.
+#[test]
+fn the_frame_goes_to_the_card_with_the_monitor_not_to_the_first_one() {
+    let screen = kms_emu::attach(64, 16);
+    let console = screen.attach_gpu(EmuGpu::hardware_kms("emu-console").console_at(0x01, 0x00));
+    let compute = screen.attach_gpu(EmuGpu::hardware_kms("emu-compute").compute_at(0x65, 0x00));
+    let c = Client::open(0);
+    let buf = c.create_dumb(64, 16);
+    paint(&buf, 0x0000_1234);
+    let fb = c.addfb2(&buf);
+
+    // ADDFB2 asked the console card for the driver fb, and only that card.
+    assert_eq!(
+        console.created_fbs().len(),
+        1,
+        "the card with the monitor was not asked for a framebuffer"
+    );
+    assert!(
+        compute.created_fbs().is_empty(),
+        "the headless card was asked to build a framebuffer to scan out"
+    );
+    let driver_fb = console.created_fbs()[0].driver_fb_id;
+
+    c.page_flip(drm::SYNTH_CRTC_ID, fb, 0x5151).expect("flip");
+
+    assert_eq!(
+        console.flips(),
+        alloc::vec![driver_fb],
+        "the flip went somewhere other than the card driving the panel"
+    );
+    assert!(
+        compute.flips().is_empty(),
+        "the headless card was flipped -- on hardware that is a copy-engine \
+         submit against a framebuffer outside its BAR1"
+    );
+
+    drm::flush_pending_flip_completions();
+    let mut b = [0u8; 32];
+    assert_eq!(c.read_events(&mut b).expect("completion"), 32);
+    assert_eq!(parse_events(&b)[0].user_data, 0x5151);
+
+    c.rmfb(fb).expect("RMFB");
+    c.destroy_dumb(buf.handle).expect("DESTROY_DUMB");
+}
