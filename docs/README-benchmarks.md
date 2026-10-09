@@ -66,12 +66,19 @@ wanted it.
 `vendor/PreemptiveScheduler` is a fourth, and the clearest case: the crate is
 `#![no_std]` with `mod context; mod executor; mod runtime; mod task_collection;
 mod waker_page;` and no re-exports of any of them, so nothing outside the crate
-can name a `WakerPage`, a `TaskCollection` or a key. Three of its four bench
+can name a `WakerPage`, a `TaskCollection` or a key. Four of its five bench
 modules nest inside the existing test module beside them -- `key_tests`,
-`waker_page_tests`, `collection_tests` -- which is where the fixtures already
-are (`page()`, `queue_of(n)`, `pending()`, `cede()`), and the fourth sits at
-the top of `runtime.rs` because what it measures are that module's own
-`pub(crate)` functions and statics.
+`waker_page_tests`, `collection_tests`, `stack_registry_tests` -- which is
+where the fixtures already are (`page()`, `queue_of(n)`, `pending()`, `cede()`,
+`clean()`, `fill(n)`), and the fifth sits at the top of `runtime.rs` because
+what it measures are that module's own `pub(crate)` functions and statics.
+
+`stack_registry_tests` is the one where nesting was not a convenience but the
+only option: its rows need `clean()`, an RAII guard that wipes two module-level
+512-slot tables and restores them afterwards, and `fill(n)`, which puts `n`
+synthetic stacks in both. Those are not fixtures a row could build for itself
+-- the tables are `static`, so a row that forgot to restore them would poison
+every row after it, and the three equivalence tests next door besides.
 
 Run the scheduler families with `--test-threads=1` as well, for a different
 reason from the display ones: nearly every row there reads or writes one of the
@@ -1108,10 +1115,10 @@ Three negative results, all of them about the harness rather than the code:
 
 ## What the scheduler's own paths said
 
-74 rows across `vendor/PreemptiveScheduler`, the crate the kernel's
+91 rows across `vendor/PreemptiveScheduler`, the crate the kernel's
 `PreemptiveScheduler` is: the wake bitmap (`waker_page`), one CPU's run queue
-(`task_collection`), the task key, and the reschedule and affinity paths in
-`runtime`. This is the in-kernel counterpart to `eclipse-bench`'s `psched`
+(`task_collection`), the task key, the reschedule and affinity paths in
+`runtime`, and the live-stack registries in `executor`. This is the in-kernel counterpart to `eclipse-bench`'s `psched`
 section, which measures the same scheduler from userspace through
 `/proc/perf/kernel`; where that section can say a mechanism is 17x slower than
 it should be, these rows can say what the mechanism costs.
@@ -1345,3 +1352,91 @@ load-average sample (51.8 ns here with no runtime to lock; 64 real
 `placement_load`s in the kernel). Neither is on a path that runs often, and
 both are already careful about *which* CPUs they visit; the number is recorded
 so that whoever makes placement cleverer knows what the scan already costs.
+
+### What the double-alloc tripwires cost
+
+The two functions in `executor.rs` that nothing in this crate calls, and that
+run on **every allocation the kernel makes**.
+`zCore/src/memory_x86_64.rs`'s `heap_alias_check` calls
+`alloc_overlaps_live_stack` on every block the global allocator is about to
+hand out; `zCore/src/memory.rs`'s `frame_alias_check` calls
+`overlapping_live_stack` on every frame range `frame_alloc` returns. Each
+answers "is this memory already somebody's executor stack?", and an overlap
+names the aliasing *at hand-out*, before any corruption — which is why they
+exist and why they are on the hot path at all.
+
+Both walked all 512 slots of their table, every call, with an `Acquire` load
+each: 4 KiB and 64 cachelines per allocation.
+
+Both columns come from the same binary, the bound taken out by hand for the
+"before" pass:
+
+| | before | after |
+| --- | --- | --- |
+| heap tripwire, **no live stacks at all** | 118.2 ns | **0.94** |
+| heap tripwire, four live stacks | 106.7 ns | **2.95** |
+| heap tripwire, sixty-four live stacks | 150.4 ns | **51.7** |
+| heap tripwire, a page-sized block rather than 64 bytes | 124.3 ns | **3.32** |
+| frame tripwire, no live stacks | 132.8 ns | **0.94** |
+| frame tripwire, four live stacks | 124.9 ns | **3.20** |
+| catching an alias in the first slot | 1.13 ns | 1.25 |
+| publish a stack in both registries and retract it | 42.3 ns | 41.0 |
+| publish into registries already holding four | 41.7 ns | 52.5 |
+
+**The giveaway is the first row, not the second.** 118 ns with *no live stack
+at all*, and 107 with four — the four-stack case measuring *faster* than
+the empty one, which is the shape of a figure that does not depend on its
+input at all. The cost never had anything to do with how many
+stacks were live, because every call read all 512 slots whether they held
+anything or not. The page-sized-block row says the same thing from the other
+side: the length of the block being checked is not what the check costs either.
+Both call sites' comments described it as "a short scan" and
+"a scan of the small live-executor set" — accurate about the data, wrong about
+the loop.
+
+The fix is a monotonic high-water mark per table (`STACK_REG_BASE_HWM`,
+`STACK_REG_HWM`): one past the highest slot ever written, so a machine with
+four executors reads four slots. **Monotonic is the entire safety argument.**
+It is raised with `fetch_max` and never lowered — not on removal, not on
+reuse — so it can only over-approximate the occupied range, and that is the one
+direction a bound in front of a tripwire may err in: too high costs a few loads
+of zero, too low would turn a live stack into "no overlap", a false negative
+from a check whose whole value is that a clean answer means something. The
+`fetch_max` is published *before* the slot's releasing `compare_exchange` and
+read `Acquire` before any slot, so any base a reader can observe lies inside
+the bound that reader read.
+
+The bill is the last two rows: two extra read-modify-writes per executor
+creation. The two rows disagree about what that costs — the empty table came
+back a nanosecond faster and the four-slot one eleven slower, against error
+bars of ±7 to ±14 — so the honest reading is "at or below what these rows
+can measure", on a path that runs once per CPU at boot.
+
+The sixty-four-stack row is the shape to expect on a machine that really has
+that many: 150 —> 51.7, a third of the cost rather than a hundredth, because
+sixty-four slots is sixty-four loads however the bound is drawn.
+
+Four more rows measure the counters `/proc` reads off this module: the two
+incompleteness counters together are 0.31 ns and the guard counts 0.31, both
+plain relaxed loads — which matters, because those two counters are what
+makes a clean tripwire answer mean anything, and nothing is going to stop
+reading them on cost grounds. `sched_stats` is 12.0 for its per-CPU sum and
+`stack_pool_stats` 38.3, the difference being the `spin::Mutex` it takes for
+the overflow list.
+
+Three tests hold it: one replays every lookup against an unbounded full walk
+across eight occupancies and a churn pattern (fill, retract from the bottom,
+re-publish, so freed slots are reused below the mark), one asserts the bound is
+*tight* at four — without it a bound stuck at 512 would pass the equivalence
+test and buy nothing — and one asserts retiring every stack does not lower it.
+
+**Two rows you should not read in either direction, which is why they are
+not in the table.** The
+`_with_the_table_full` and `_in_the_last_slot` rows move 20 to 30 % between
+runs of the *same* binary — 265 to 346 ns, with error bars of ±50 to ±170 — so
+(for the record, the before/after pass put the heap full table at 265 -> 330
+and the frame one at 290 -> 331, both inside the spread the same code shows
+against itself). With the bound at 512 the scan does the same 512 loads plus
+one; the difference is physically a nanosecond. A 300 ns figure
+carrying a ±170 error bar has no finding in it, and spending an hour deciding
+whether a change made it worse is an hour spent on the instrument.

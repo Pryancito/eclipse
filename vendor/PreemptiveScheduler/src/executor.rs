@@ -442,6 +442,53 @@ static STACK_REG_OCC: [core::sync::atomic::AtomicU64; STACK_REG_WORDS] =
 static STACK_REG_BASE_OVERFLOW: core::sync::atomic::AtomicUsize =
     core::sync::atomic::AtomicUsize::new(0);
 
+/// One past the highest slot of [`STACK_REG_BASE`] that has ever been written,
+/// so that [`alloc_overlaps_live_stack`] stops there instead of at 512.
+///
+/// The scan it bounds is the hottest loop in the kernel that nobody had
+/// measured: the `GlobalAlloc` hook calls that function on **every block it
+/// hands out**, and it walked all `STACK_REG_SLOTS` entries — 4 KiB, 64
+/// cachelines — with an `Acquire` load each. Measured at 138 ns with *no live
+/// stack at all* and 143 with four, which is the giveaway: the cost never had
+/// anything to do with how many stacks were live, and both call sites' comments
+/// described it as "a short scan" and "a scan of the small live-executor set".
+/// A machine with four executors now pays four loads.
+///
+/// Monotonic, and that is the whole safety argument. It is raised with
+/// `fetch_max` and never lowered, not on removal and not on reuse, so it can
+/// only ever over-approximate the occupied range. That is the one direction a
+/// bound in front of a tripwire may err in: too high costs a few loads of
+/// zero, too low would turn a live stack into "no overlap" — a false negative
+/// from a check whose entire value is that a clean answer means something.
+/// (This is why it is a high-water mark and not the occupancy *summary* the
+/// `#[cfg(test)]` model next door replays: that one was cleared on removal,
+/// which could erase the bit of a replacement inserted in between.)
+///
+/// The ordering is the other half. The `fetch_max` is published **before** the
+/// `compare_exchange` that writes the slot, and the reader loads this with
+/// `Acquire` before any slot. So a reader that can see slot `i` non-zero has
+/// synchronised with that slot's releasing CAS, which is ordered after the
+/// `fetch_max`, and therefore reads a bound greater than `i`: **any base
+/// visible to a reader is inside the bound that reader read.** A registration
+/// that lands after the reader sampled the bound is missed — exactly as it was
+/// missed before, by loading its slot while it was still zero.
+///
+/// The `.min(STACK_REG_SLOTS)` at each use is not defensive noise: `fetch_max`
+/// can only ever be given `i + 1` for an in-range `i`, so the bound cannot
+/// exceed the array — but the slice index is in the global allocator's path,
+/// where a panic is not a diagnostic but a second fault, so the clamp buys
+/// panic-freedom from the compiler rather than from an argument.
+///
+/// What the bound does **not** buy: the full-table rows. A scan with the
+/// bound at 512 does the same 512 loads plus one, and the `_with_the_table_full`
+/// and `_in_the_last_slot` rows move by 20-30 % between runs of the *same*
+/// binary (±50 to ±170 ns on a 300-400 ns figure). Do not read a difference
+/// out of those two rows in either direction; the rows that carry the finding
+/// are the shallow ones, where the figure is a handful of nanoseconds and the
+/// error bar is under one.
+static STACK_REG_BASE_HWM: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
 /// Record `[alloc_base, alloc_base + ALLOC_SIZE)` as a live stack. `base == 0`
 /// slots are free. Counts, rather than silently drops, an insert that does not
 /// fit: an unrecorded stack makes [`alloc_overlaps_live_stack`] return false
@@ -449,18 +496,18 @@ static STACK_REG_BASE_OVERFLOW: core::sync::atomic::AtomicUsize =
 /// "no aliasing".
 fn stack_reg_insert(alloc_base: usize) {
     use core::sync::atomic::Ordering::{AcqRel, Relaxed};
-    for slot in STACK_REG_BASE.iter() {
+    for (i, slot) in STACK_REG_BASE.iter().enumerate() {
         // Load first (see the note on `stack_reg_remove`).
         if slot.load(Relaxed) != 0 {
             continue;
         }
         #[cfg(test)]
-        let i = STACK_REG_BASE
-            .iter()
-            .position(|candidate| core::ptr::eq(candidate, slot))
-            .unwrap();
-        #[cfg(test)]
         stack_reg_occ_set(i);
+        // Before the CAS, not after: see the ordering paragraph on
+        // `STACK_REG_BASE_HWM`. Raising it for a CAS that then fails is
+        // harmless, since the bound may over-approximate and may not
+        // under-approximate.
+        STACK_REG_BASE_HWM.fetch_max(i + 1, AcqRel);
         if slot
             .compare_exchange(0, alloc_base, AcqRel, Relaxed)
             .is_ok()
@@ -511,15 +558,16 @@ pub fn untracked_alloc_stacks() -> usize {
 /// moves on, exactly as before.
 fn stack_reg_remove(alloc_base: usize) {
     use core::sync::atomic::Ordering::{AcqRel, Relaxed};
-    for slot in STACK_REG_BASE.iter() {
+    // Not bounded by `STACK_REG_BASE_HWM`, deliberately: lowering the bound is
+    // what would make it unsafe, so a removal must not be the thing that
+    // teaches it a slot is free, and a remove that scans a few hundred slots
+    // of zero happens once per executor teardown rather than once per
+    // allocation.
+    for (i, slot) in STACK_REG_BASE.iter().enumerate() {
         if slot.load(Relaxed) != alloc_base {
             continue;
         }
-        #[cfg(test)]
-        let i = STACK_REG_BASE
-            .iter()
-            .position(|candidate| core::ptr::eq(candidate, slot))
-            .unwrap();
+        let _ = i;
         if slot
             .compare_exchange(alloc_base, 0, AcqRel, Relaxed)
             .is_ok()
@@ -553,7 +601,11 @@ fn stack_reg_remove(alloc_base: usize) {
 pub fn alloc_overlaps_live_stack(ptr: usize, len: usize) -> Option<usize> {
     use core::sync::atomic::Ordering::Acquire;
     let a_end = ptr.saturating_add(len);
-    for slot in STACK_REG_BASE.iter() {
+    // Loaded before any slot, and bounds the scan: see
+    // [`STACK_REG_BASE_HWM`], which carries the argument that no base this
+    // loop can observe lies beyond it.
+    let hwm = STACK_REG_BASE_HWM.load(Acquire);
+    for slot in STACK_REG_BASE[..hwm.min(STACK_REG_SLOTS)].iter() {
         let base = slot.load(Acquire);
         if base == 0 {
             continue;
@@ -863,16 +915,23 @@ static STACK_REG: [core::sync::atomic::AtomicUsize; MAX_TRACKED_STACKS] =
 /// reported so a silent gap is never mistaken for a clean result).
 static STACK_REG_OVERFLOW: core::sync::atomic::AtomicUsize =
     core::sync::atomic::AtomicUsize::new(0);
+/// [`STACK_REG_BASE_HWM`]'s twin for this table, bounding
+/// [`overlapping_live_stack`], which `frame_alloc` calls on every frame range
+/// it hands out. Measured at 137 ns with no live stack and 146 with four.
+/// The monotonicity and ordering arguments are the ones written out on
+/// [`STACK_REG_BASE_HWM`]; nothing here differs but the array.
+static STACK_REG_HWM: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
 /// Publish `[alloc_base, alloc_base + ALLOC_SIZE)` as a live stack.
 fn register_stack(alloc_base: usize) {
     use core::sync::atomic::Ordering::{AcqRel, Relaxed};
-    for slot in STACK_REG.iter() {
+    for (i, slot) in STACK_REG.iter().enumerate() {
         // Load first: see the note on `stack_reg_remove`. This table is the one
         // `overlapping_live_stack` reads from the frame allocator.
         if slot.load(Relaxed) != 0 {
             continue;
         }
+        STACK_REG_HWM.fetch_max(i + 1, AcqRel);
         if slot
             .compare_exchange(0, alloc_base, AcqRel, Relaxed)
             .is_ok()
@@ -935,7 +994,9 @@ fn retract_live_stack(alloc_base: usize) {
 /// the one answer a range it cannot even measure must not give.
 pub fn overlapping_live_stack(start: usize, len: usize) -> Option<usize> {
     let end = start.saturating_add(len);
-    for slot in STACK_REG.iter() {
+    // See [`STACK_REG_HWM`], and [`STACK_REG_BASE_HWM`] for why this is sound.
+    let hwm = STACK_REG_HWM.load(core::sync::atomic::Ordering::Acquire);
+    for slot in STACK_REG[..hwm.min(STACK_REG_SLOTS)].iter() {
         let base = slot.load(core::sync::atomic::Ordering::Acquire);
         if base != 0 && start < base.saturating_add(ALLOC_SIZE) && base < end {
             return Some(base);
@@ -2672,9 +2733,35 @@ mod stack_registry_tests {
             }
             STACK_REG_OVERFLOW.store(0, Ordering::SeqCst);
             STACK_REG_BASE_OVERFLOW.store(0, Ordering::SeqCst);
+            // The two scan bounds are monotonic in production, on purpose.
+            // Emptying the tables without lowering them would leave every
+            // later test and bench row scanning the deepest slot any earlier
+            // one happened to touch, so the fixture that empties the tables
+            // puts the bounds back with them.
+            STACK_REG_HWM.store(0, Ordering::SeqCst);
+            STACK_REG_BASE_HWM.store(0, Ordering::SeqCst);
         }
     }
 
+    /// Empty both registries and both scan bounds *without* taking the lock,
+    /// for a case that already holds it through a [`Clean`] guard and wants a
+    /// fresh table for the next one. `clean()` cannot be nested: the lock is a
+    /// plain `std::sync::Mutex`, and taking it twice on one thread hangs.
+    fn wipe_registries() {
+        for slot in STACK_REG.iter() {
+            slot.store(0, Ordering::SeqCst);
+        }
+        for slot in STACK_REG_BASE.iter() {
+            slot.store(0, Ordering::SeqCst);
+        }
+        for word in STACK_REG_OCC.iter() {
+            word.store(0, Ordering::SeqCst);
+        }
+        STACK_REG_OVERFLOW.store(0, Ordering::SeqCst);
+        STACK_REG_BASE_OVERFLOW.store(0, Ordering::SeqCst);
+        STACK_REG_HWM.store(0, Ordering::SeqCst);
+        STACK_REG_BASE_HWM.store(0, Ordering::SeqCst);
+    }
     fn clean() -> Clean {
         let g = test_lock();
         for slot in STACK_REG.iter() {
@@ -2688,6 +2775,8 @@ mod stack_registry_tests {
         }
         STACK_REG_OVERFLOW.store(0, Ordering::SeqCst);
         STACK_REG_BASE_OVERFLOW.store(0, Ordering::SeqCst);
+        STACK_REG_HWM.store(0, Ordering::SeqCst);
+        STACK_REG_BASE_HWM.store(0, Ordering::SeqCst);
         Clean(g)
     }
 
@@ -2719,6 +2808,161 @@ mod stack_registry_tests {
             polled, 23,
             "el conteo de polls no suma todas las CPUs: /proc miente"
         );
+    }
+
+    // ── the bound in front of the two tripwires ────────────────────────────
+
+    /// What each lookup did before `STACK_REG_BASE_HWM` and `STACK_REG_HWM`
+    /// bounded it: the whole table, every time.
+    fn unbounded_heap_lookup(ptr: usize, len: usize) -> Option<usize> {
+        let a_end = ptr.saturating_add(len);
+        for slot in STACK_REG_BASE.iter() {
+            let base = slot.load(Ordering::Acquire);
+            if base == 0 {
+                continue;
+            }
+            let b_end = base.saturating_add(ALLOC_SIZE);
+            if ptr < b_end && base < a_end {
+                return Some(base);
+            }
+        }
+        None
+    }
+
+    /// The frame table's twin of [`unbounded_heap_lookup`].
+    fn unbounded_frame_lookup(start: usize, len: usize) -> Option<usize> {
+        let end = start.saturating_add(len);
+        for slot in STACK_REG.iter() {
+            let base = slot.load(Ordering::Acquire);
+            if base != 0 && start < base.saturating_add(ALLOC_SIZE) && base < end {
+                return Some(base);
+            }
+        }
+        None
+    }
+
+    /// A base that cannot overlap any other: bases are spaced four MiB apart,
+    /// which is more than `ALLOC_SIZE`.
+    fn nth(i: usize) -> usize {
+        BASE + (i + 1) * 4 * 1024 * 1024
+    }
+
+    /// The bound may only ever over-approximate, so the two lookups have to
+    /// agree on every state the registries can be in — including after the
+    /// churn that moves live stacks to higher slots than the bound was first
+    /// raised for.
+    #[test]
+    fn the_scan_bound_never_hides_a_live_stack() {
+        let _c = clean();
+        let mut compared = 0usize;
+        let mut hits = 0usize;
+        let mut misses = 0usize;
+
+        // How many stacks are live, from none to a full table.
+        for &live in &[0usize, 1, 2, 4, 7, 64, 511, 512] {
+            wipe_registries();
+            for i in 0..live {
+                publish_live_stack(nth(i));
+            }
+            // A base that is there, one that never was, and the slot just
+            // past the deepest one in use.
+            for probe in [nth(0), nth(live.saturating_sub(1)), nth(live), nth(600)] {
+                assert_eq!(
+                    alloc_overlaps_live_stack(probe, 64),
+                    unbounded_heap_lookup(probe, 64),
+                    "heap lookup disagreed with the full walk: live={live} probe={probe:#x}",
+                );
+                assert_eq!(
+                    overlapping_live_stack(probe, 4096),
+                    unbounded_frame_lookup(probe, 4096),
+                    "frame lookup disagreed with the full walk: live={live} probe={probe:#x}",
+                );
+                if unbounded_heap_lookup(probe, 64).is_some() {
+                    hits += 1;
+                } else {
+                    misses += 1;
+                }
+                compared += 2;
+            }
+        }
+
+        // Churn: fill, retract from the bottom, and re-publish. The freed
+        // slots are reused from slot 0, so this is the shape that would catch
+        // a bound that tracked *current* occupancy instead of the high-water
+        // mark — and it is also the shape a real machine produces, since
+        // transient executors come and go while the immortal two stay.
+        {
+            wipe_registries();
+            for i in 0..8 {
+                publish_live_stack(nth(i));
+            }
+            for i in 0..5 {
+                retract_live_stack(nth(i));
+            }
+            for i in 8..11 {
+                publish_live_stack(nth(i));
+            }
+            for i in 0..12 {
+                let probe = nth(i);
+                assert_eq!(
+                    alloc_overlaps_live_stack(probe, 64),
+                    unbounded_heap_lookup(probe, 64),
+                    "heap lookup disagreed after churn: probe={probe:#x}",
+                );
+                assert_eq!(
+                    overlapping_live_stack(probe, 4096),
+                    unbounded_frame_lookup(probe, 4096),
+                    "frame lookup disagreed after churn: probe={probe:#x}",
+                );
+                compared += 2;
+            }
+        }
+
+        assert_eq!(compared, 8 * 4 * 2 + 12 * 2);
+        assert!(hits > 0 && misses > 0, "every probe went the same way");
+    }
+
+    /// The bound is the thing that makes the scan cheap, so it has to be
+    /// tight: a machine with four executors must not be scanning 512 slots.
+    #[test]
+    fn the_bound_is_as_tight_as_the_slots_actually_used() {
+        let _c = clean();
+        assert_eq!(STACK_REG_BASE_HWM.load(Ordering::SeqCst), 0);
+        assert_eq!(STACK_REG_HWM.load(Ordering::SeqCst), 0);
+        for i in 0..4 {
+            publish_live_stack(nth(i));
+        }
+        assert_eq!(
+            STACK_REG_BASE_HWM.load(Ordering::SeqCst),
+            4,
+            "the heap scan reaches past the slots in use"
+        );
+        assert_eq!(STACK_REG_HWM.load(Ordering::SeqCst), 4);
+    }
+
+    /// And it must not come back down, which is the whole safety argument:
+    /// a bound that fell to the current occupancy could exclude a slot a
+    /// concurrent insert had just taken above it.
+    #[test]
+    fn retiring_every_stack_does_not_lower_the_bound() {
+        let _c = clean();
+        for i in 0..6 {
+            publish_live_stack(nth(i));
+        }
+        assert_eq!(STACK_REG_BASE_HWM.load(Ordering::SeqCst), 6);
+        for i in 0..6 {
+            retract_live_stack(nth(i));
+        }
+        assert_eq!(
+            STACK_REG_BASE_HWM.load(Ordering::SeqCst),
+            6,
+            "a removal lowered the scan bound"
+        );
+        assert_eq!(STACK_REG_HWM.load(Ordering::SeqCst), 6);
+        // And a stack published afterwards, back in slot 0, is still found.
+        publish_live_stack(nth(0));
+        assert_eq!(alloc_overlaps_live_stack(nth(0), 64), Some(nth(0)));
+        assert_eq!(overlapping_live_stack(nth(0), 4096), Some(nth(0)));
     }
 
     /// Model the removed summary and reproduce its failing reuse interleaving.
@@ -3022,6 +3266,197 @@ mod stack_registry_tests {
         retract(overflowing);
         assert_eq!(untracked_live_stacks(), 1);
         assert_eq!(untracked_alloc_stacks(), 1);
+    }
+
+    /// Rows for the two double-alloc tripwires, which are the only thing in
+    /// this crate on a path the kernel takes on *every* allocation.
+    ///
+    /// `alloc_overlaps_live_stack` is called by the kernel's `GlobalAlloc` on
+    /// every block it hands out, and `overlapping_live_stack` by
+    /// `frame_alloc` on every frame range. Both walk a fixed array of 512
+    /// `AtomicUsize` — 4 KiB, 64 cachelines — with an `Acquire` load per slot
+    /// and no bound on how far they go, whatever the number of live stacks
+    /// actually is. So each row here is read for two things: what the check
+    /// costs on a machine with four executors (the real case), and whether
+    /// that cost has anything to do with four.
+    ///
+    /// Every row holds the registries' own test lock and empties both tables
+    /// on the way out, because they are module globals that the rest of this
+    /// file's tests assert on.
+    ///
+    /// Not modelled, for the same reasons as the crate's other bench modules:
+    /// one host thread owns the lines uncontended, where a real machine has
+    /// several CPUs allocating at once; and the test profile pays
+    /// `debug_assert!`s the kernel does not.
+    #[cfg(test)]
+    mod benches {
+        use super::*;
+        use test::{black_box, Bencher};
+
+        /// Bases `ALLOC_SIZE` apart and then rounded up, so no two of them
+        /// overlap and none overlaps `PROBE`.
+        fn fill(n: usize) {
+            for i in 0..n {
+                publish_live_stack(BASE + (i + 1) * 4 * 1024 * 1024);
+            }
+        }
+
+        /// A block the allocator might hand out, below every base `fill`
+        /// uses, so a miss really walks the whole table.
+        const PROBE: usize = BASE;
+
+        // ── the GlobalAlloc tripwire, per kernel heap allocation ───────────
+
+        /// The check on a machine that has not created an executor yet: 512
+        /// loads of zero. Read the next two rows against this one — if they
+        /// are the same figure, the scan is not about live stacks at all.
+        #[bench]
+        fn the_heap_tripwire_with_no_live_stacks(b: &mut Bencher) {
+            let _c = clean();
+            b.iter(|| alloc_overlaps_live_stack(black_box(PROBE), black_box(64)));
+        }
+
+        /// What a real machine actually asks: two immortal executors and a
+        /// couple of transient ones.
+        #[bench]
+        fn the_heap_tripwire_with_four_live_stacks(b: &mut Bencher) {
+            let _c = clean();
+            fill(4);
+            b.iter(|| alloc_overlaps_live_stack(black_box(PROBE), black_box(64)));
+        }
+
+        #[bench]
+        fn the_heap_tripwire_with_sixty_four_live_stacks(b: &mut Bencher) {
+            let _c = clean();
+            fill(64);
+            b.iter(|| alloc_overlaps_live_stack(black_box(PROBE), black_box(64)));
+        }
+
+        /// Unreachable below 512 live executors, and the noisiest row here:
+        /// it swings between 265 and 346 ns across runs of one binary. See the
+        /// last paragraph on [`STACK_REG_BASE_HWM`] before reading anything
+        /// into a change in it.
+        #[bench]
+        fn the_heap_tripwire_with_the_table_full(b: &mut Bencher) {
+            let _c = clean();
+            fill(512);
+            b.iter(|| alloc_overlaps_live_stack(black_box(PROBE), black_box(64)));
+        }
+
+        /// The hit: an aliasing block, caught on the first slot. This is the
+        /// case the tripwire exists for and the only one that ends early.
+        #[bench]
+        fn the_heap_tripwire_catching_an_alias_in_the_first_slot(b: &mut Bencher) {
+            let _c = clean();
+            fill(4);
+            let probe = BASE + 4 * 1024 * 1024;
+            b.iter(|| alloc_overlaps_live_stack(black_box(probe), black_box(64)));
+        }
+
+        /// The same hit against the last stack of a full table, which is the
+        /// worst case the check can have — and, like the row above, too noisy
+        /// to read a change out of (325 to 419 ns, same binary).
+        #[bench]
+        fn the_heap_tripwire_catching_an_alias_in_the_last_slot(b: &mut Bencher) {
+            let _c = clean();
+            fill(512);
+            let probe = BASE + 512 * 4 * 1024 * 1024;
+            b.iter(|| alloc_overlaps_live_stack(black_box(probe), black_box(64)));
+        }
+
+        /// A block the size of a page rather than 64 bytes, to show the
+        /// length is not what the scan costs.
+        #[bench]
+        fn the_heap_tripwire_on_a_page_sized_block(b: &mut Bencher) {
+            let _c = clean();
+            fill(4);
+            b.iter(|| alloc_overlaps_live_stack(black_box(PROBE), black_box(4096)));
+        }
+
+        // ── the frame_alloc tripwire, per frame range ──────────────────────
+
+        #[bench]
+        fn the_frame_tripwire_with_no_live_stacks(b: &mut Bencher) {
+            let _c = clean();
+            b.iter(|| overlapping_live_stack(black_box(PROBE), black_box(4096)));
+        }
+
+        #[bench]
+        fn the_frame_tripwire_with_four_live_stacks(b: &mut Bencher) {
+            let _c = clean();
+            fill(4);
+            b.iter(|| overlapping_live_stack(black_box(PROBE), black_box(4096)));
+        }
+
+        #[bench]
+        fn the_frame_tripwire_with_the_table_full(b: &mut Bencher) {
+            let _c = clean();
+            fill(512);
+            b.iter(|| overlapping_live_stack(black_box(PROBE), black_box(4096)));
+        }
+
+        // ── publishing and retracting a stack ──────────────────────────────
+
+        /// What `Executor::new` pays to publish its stack in both registries,
+        /// on an empty table: the first free slot is slot 0.
+        #[bench]
+        fn publish_a_stack_into_empty_registries(b: &mut Bencher) {
+            let _c = clean();
+            b.iter(|| {
+                publish_live_stack(black_box(PROBE));
+                retract_live_stack(black_box(PROBE));
+            });
+        }
+
+        /// The same with four stacks already there, so each insert scans past
+        /// them and each remove scans to the matching slot.
+        #[bench]
+        fn publish_a_stack_into_registries_holding_four(b: &mut Bencher) {
+            let _c = clean();
+            fill(4);
+            b.iter(|| {
+                publish_live_stack(black_box(PROBE));
+                retract_live_stack(black_box(PROBE));
+            });
+        }
+
+        /// The overflow path: both tables full, so both inserts scan all 512
+        /// slots, find nothing, and bump a counter. Reached only after 512
+        /// live stacks, but it is what the scan costs when it fails.
+        #[bench]
+        fn publish_a_stack_when_both_registries_are_full(b: &mut Bencher) {
+            let _c = clean();
+            fill(512);
+            b.iter(|| publish_live_stack(black_box(PROBE)));
+        }
+
+        // ── the counters /proc reads ───────────────────────────────────────
+
+        /// `sched_stats` sums one `polled` counter per CPU, so it is 64 loads
+        /// plus two, every time `/proc/perf/kernel` is read.
+        #[bench]
+        fn read_the_scheduler_counters(b: &mut Bencher) {
+            b.iter(sched_stats);
+        }
+
+        /// `stack_pool_stats` counts the occupied slots of the retained-stack
+        /// pool and then takes a `spin::Mutex` for the overflow list.
+        #[bench]
+        fn read_the_stack_pool_counters(b: &mut Bencher) {
+            b.iter(stack_pool_stats);
+        }
+
+        #[bench]
+        fn read_the_guard_counts(b: &mut Bencher) {
+            b.iter(hard_guard_executor_counts);
+        }
+
+        /// The two incompleteness counters, which are what makes a clean
+        /// tripwire result mean anything: one relaxed load each.
+        #[bench]
+        fn read_the_untracked_stack_counts(b: &mut Bencher) {
+            b.iter(|| (untracked_alloc_stacks(), untracked_live_stacks()));
+        }
     }
 }
 
