@@ -93,7 +93,18 @@ otro sitio.
   después pasa por las mismas puertas; grabar esas esperas haría crecer la lista
   mientras la máquina viva y reescribiría la historia de un arranque ya acabado.
 
-## 3. Lo que ya se sabía medir, y no es esto
+## 3. Lo que la primera medida justificó
+
+Los tres `apply_*` del init — teclado, idioma, zona — eran 1,13 s de 1,46 s, y
+son independientes entre sí: ahora se lanzan a la vez. La cuenta, el cerrojo que
+lo hace seguro y la escotilla (`init.serial_setup`) están en
+`docs/README-init.md`.
+
+Nada más, todavía. El sondeo PCI del núcleo es el otro tramo gordo (441 ms de
+882 ms en QEMU) pero esa cifra es de un PCI emulado: antes de tocarlo hace falta
+la tabla de una máquina de verdad.
+
+## 4. Lo que ya se sabía medir, y no es esto
 
 - `BOOTTRACE=<comm>` en la línea de órdenes del núcleo graba **cada fichero que
   abre un proceso** (`linux-object/src/boot_trace.rs`) y lo publica en

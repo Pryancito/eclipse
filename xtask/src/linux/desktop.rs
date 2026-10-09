@@ -306,16 +306,54 @@ fn write_eclipse_kbd(rootfs: &Path) {
           \x20 current\n\
           }\n\
           \n\
-          upsert_xkb() {\n\
-          \x20 layout=$1\n\
+          # One writer at a time for $ENVF. The three boot steps that write it\n\
+          # -- eclipse-kbd (XKB_DEFAULT_LAYOUT), eclipse-locale (LANG) and\n\
+          # eclipse-tz (TZ) -- are independent of each other, so eclipse-init\n\
+          # runs them AT ONCE (init.serial_setup on the kernel command line is\n\
+          # the way back to one after another). Three read-modify-writes of one\n\
+          # file at once lose keys: each reads the old file and the last mv\n\
+          # wins. A directory is the lock because mkdir either creates it or\n\
+          # fails, atomically, on every filesystem this runs on -- no busybox\n\
+          # applet needed, and nothing left behind by a crash but an empty\n\
+          # directory.\n\
+          env_lock() {\n\
+          \x20 i=0\n\
+          \x20 while ! mkdir \"$ENVF.lock\" 2>/dev/null; do\n\
+          \x20   i=$((i+1))\n\
+          \x20   # BOUNDED, and then it takes the lock anyway. A boot step that\n\
+          \x20   # waits for ever on a stale lock directory is how one hanging\n\
+          \x20   # script wedges a whole machine (the reason a oneshot has a\n\
+          \x20   # timeout at all); losing one key on one boot is the cheaper\n\
+          \x20   # failure by a wide margin.\n\
+          \x20   if [ \"$i\" -ge 60 ]; then\n\
+          \x20     rm -rf \"$ENVF.lock\" 2>/dev/null\n\
+          \x20     mkdir \"$ENVF.lock\" 2>/dev/null\n\
+          \x20     break\n\
+          \x20   fi\n\
+          \x20   sleep 0.05 2>/dev/null || sleep 1\n\
+          \x20 done\n\
+          }\n\
+          \n\
+          env_unlock() {\n\
+          \x20 rmdir \"$ENVF.lock\" 2>/dev/null || rm -rf \"$ENVF.lock\" 2>/dev/null\n\
+          }\n\
+          \n\
+          upsert_env() {\n\
+          \x20 key=$1; val=$2\n\
           \x20 mkdir -p \"$(dirname \"$ENVF\")\"\n\
+          \x20 env_lock\n\
+          \x20 # The temporary carries the pid: a fixed \"$ENVF.new\" is a second\n\
+          \x20 # collision between concurrent writers, and it lands inside the\n\
+          \x20 # blind spot above if the lock is ever stolen.\n\
+          \x20 tmp=\"$ENVF.$$\"\n\
           \x20 if [ -f \"$ENVF\" ]; then\n\
-          \x20   grep -v '^XKB_DEFAULT_LAYOUT=' \"$ENVF\" > \"$ENVF.new\" 2>/dev/null || :\n\
-          \x20   echo \"XKB_DEFAULT_LAYOUT=$layout\" >> \"$ENVF.new\"\n\
-          \x20   mv \"$ENVF.new\" \"$ENVF\"\n\
+          \x20   grep -v \"^${key}=\" \"$ENVF\" > \"$tmp\" 2>/dev/null || :\n\
+          \x20   echo \"${key}=$val\" >> \"$tmp\"\n\
+          \x20   mv \"$tmp\" \"$ENVF\"\n\
           \x20 else\n\
-          \x20   echo \"XKB_DEFAULT_LAYOUT=$layout\" > \"$ENVF\"\n\
+          \x20   echo \"${key}=$val\" > \"$ENVF\"\n\
           \x20 fi\n\
+          \x20 env_unlock\n\
           }\n\
           \n\
           apply() {\n\
@@ -330,7 +368,7 @@ fn write_eclipse_kbd(rootfs: &Path) {
           \x20 fi\n\
           \x20 mkdir -p /etc/eclipse\n\
           \x20 echo \"layout=$layout\" > \"$CONF\"\n\
-          \x20 upsert_xkb \"$layout\"\n\
+          \x20 upsert_env XKB_DEFAULT_LAYOUT \"$layout\"\n\
           \x20 if [ \"$boot\" != boot ]; then\n\
           \x20   if [ -n \"${LABWC_PID:-}\" ] && kill -0 \"$LABWC_PID\" 2>/dev/null; then\n\
           \x20     kill -HUP \"$LABWC_PID\" 2>>\"$LOG\" || true\n\
@@ -444,16 +482,54 @@ fn write_eclipse_locale(rootfs: &Path) {
           \x20 current\n\
           }\n\
           \n\
+          # One writer at a time for $ENVF. The three boot steps that write it\n\
+          # -- eclipse-kbd (XKB_DEFAULT_LAYOUT), eclipse-locale (LANG) and\n\
+          # eclipse-tz (TZ) -- are independent of each other, so eclipse-init\n\
+          # runs them AT ONCE (init.serial_setup on the kernel command line is\n\
+          # the way back to one after another). Three read-modify-writes of one\n\
+          # file at once lose keys: each reads the old file and the last mv\n\
+          # wins. A directory is the lock because mkdir either creates it or\n\
+          # fails, atomically, on every filesystem this runs on -- no busybox\n\
+          # applet needed, and nothing left behind by a crash but an empty\n\
+          # directory.\n\
+          env_lock() {\n\
+          \x20 i=0\n\
+          \x20 while ! mkdir \"$ENVF.lock\" 2>/dev/null; do\n\
+          \x20   i=$((i+1))\n\
+          \x20   # BOUNDED, and then it takes the lock anyway. A boot step that\n\
+          \x20   # waits for ever on a stale lock directory is how one hanging\n\
+          \x20   # script wedges a whole machine (the reason a oneshot has a\n\
+          \x20   # timeout at all); losing one key on one boot is the cheaper\n\
+          \x20   # failure by a wide margin.\n\
+          \x20   if [ \"$i\" -ge 60 ]; then\n\
+          \x20     rm -rf \"$ENVF.lock\" 2>/dev/null\n\
+          \x20     mkdir \"$ENVF.lock\" 2>/dev/null\n\
+          \x20     break\n\
+          \x20   fi\n\
+          \x20   sleep 0.05 2>/dev/null || sleep 1\n\
+          \x20 done\n\
+          }\n\
+          \n\
+          env_unlock() {\n\
+          \x20 rmdir \"$ENVF.lock\" 2>/dev/null || rm -rf \"$ENVF.lock\" 2>/dev/null\n\
+          }\n\
+          \n\
           upsert_env() {\n\
           \x20 key=$1; val=$2\n\
           \x20 mkdir -p \"$(dirname \"$ENVF\")\"\n\
+          \x20 env_lock\n\
+          \x20 # The temporary carries the pid: a fixed \"$ENVF.new\" is a second\n\
+          \x20 # collision between concurrent writers, and it lands inside the\n\
+          \x20 # blind spot above if the lock is ever stolen.\n\
+          \x20 tmp=\"$ENVF.$$\"\n\
           \x20 if [ -f \"$ENVF\" ]; then\n\
-          \x20   grep -v \"^${key}=\" \"$ENVF\" > \"$ENVF.new\" 2>/dev/null || :\n\
-          \x20   echo \"${key}=$val\" >> \"$ENVF.new\"\n\
-          \x20   mv \"$ENVF.new\" \"$ENVF\"\n\
+          \x20   grep -v \"^${key}=\" \"$ENVF\" > \"$tmp\" 2>/dev/null || :\n\
+          \x20   echo \"${key}=$val\" >> \"$tmp\"\n\
+          \x20   mv \"$tmp\" \"$ENVF\"\n\
           \x20 else\n\
           \x20   echo \"${key}=$val\" > \"$ENVF\"\n\
           \x20 fi\n\
+          \x20 env_unlock\n\
           }\n\
           \n\
           apply() {\n\
@@ -576,16 +652,54 @@ fn write_eclipse_tz(rootfs: &Path) {
           \x20 current_tz\n\
           }\n\
           \n\
+          # One writer at a time for $ENVF. The three boot steps that write it\n\
+          # -- eclipse-kbd (XKB_DEFAULT_LAYOUT), eclipse-locale (LANG) and\n\
+          # eclipse-tz (TZ) -- are independent of each other, so eclipse-init\n\
+          # runs them AT ONCE (init.serial_setup on the kernel command line is\n\
+          # the way back to one after another). Three read-modify-writes of one\n\
+          # file at once lose keys: each reads the old file and the last mv\n\
+          # wins. A directory is the lock because mkdir either creates it or\n\
+          # fails, atomically, on every filesystem this runs on -- no busybox\n\
+          # applet needed, and nothing left behind by a crash but an empty\n\
+          # directory.\n\
+          env_lock() {\n\
+          \x20 i=0\n\
+          \x20 while ! mkdir \"$ENVF.lock\" 2>/dev/null; do\n\
+          \x20   i=$((i+1))\n\
+          \x20   # BOUNDED, and then it takes the lock anyway. A boot step that\n\
+          \x20   # waits for ever on a stale lock directory is how one hanging\n\
+          \x20   # script wedges a whole machine (the reason a oneshot has a\n\
+          \x20   # timeout at all); losing one key on one boot is the cheaper\n\
+          \x20   # failure by a wide margin.\n\
+          \x20   if [ \"$i\" -ge 60 ]; then\n\
+          \x20     rm -rf \"$ENVF.lock\" 2>/dev/null\n\
+          \x20     mkdir \"$ENVF.lock\" 2>/dev/null\n\
+          \x20     break\n\
+          \x20   fi\n\
+          \x20   sleep 0.05 2>/dev/null || sleep 1\n\
+          \x20 done\n\
+          }\n\
+          \n\
+          env_unlock() {\n\
+          \x20 rmdir \"$ENVF.lock\" 2>/dev/null || rm -rf \"$ENVF.lock\" 2>/dev/null\n\
+          }\n\
+          \n\
           upsert_env() {\n\
           \x20 key=$1; val=$2\n\
           \x20 mkdir -p \"$(dirname \"$ENVF\")\"\n\
+          \x20 env_lock\n\
+          \x20 # The temporary carries the pid: a fixed \"$ENVF.new\" is a second\n\
+          \x20 # collision between concurrent writers, and it lands inside the\n\
+          \x20 # blind spot above if the lock is ever stolen.\n\
+          \x20 tmp=\"$ENVF.$$\"\n\
           \x20 if [ -f \"$ENVF\" ]; then\n\
-          \x20   grep -v \"^${key}=\" \"$ENVF\" > \"$ENVF.new\" 2>/dev/null || :\n\
-          \x20   echo \"${key}=$val\" >> \"$ENVF.new\"\n\
-          \x20   mv \"$ENVF.new\" \"$ENVF\"\n\
+          \x20   grep -v \"^${key}=\" \"$ENVF\" > \"$tmp\" 2>/dev/null || :\n\
+          \x20   echo \"${key}=$val\" >> \"$tmp\"\n\
+          \x20   mv \"$tmp\" \"$ENVF\"\n\
           \x20 else\n\
           \x20   echo \"${key}=$val\" > \"$ENVF\"\n\
           \x20 fi\n\
+          \x20 env_unlock\n\
           }\n\
           \n\
           apply() {\n\
@@ -3473,6 +3587,144 @@ mod tests {
             dir.join("root/.config/labwc/autostart.README").is_file(),
             "breadcrumb README should explain the move to init services"
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Run one of the generated boot steps with `--boot` under `HOME`, the way
+    /// eclipse-init does, and answer whether a shell could be started at all.
+    fn run_boot_step(dir: &Path, name: &str) -> Option<std::process::Child> {
+        std::process::Command::new("sh")
+            .arg(dir.join("usr/local/bin").join(name))
+            .arg("--boot")
+            .env("HOME", dir.join("root"))
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .ok()
+    }
+
+    #[test]
+    fn a_boot_step_waits_for_the_lock_on_the_labwc_environment() {
+        // eclipse-init starts eclipse-kbd, eclipse-locale and eclipse-tz AT THE
+        // SAME TIME (they are independent of each other, and one after another
+        // they were 85% of init's boot). All three upsert a key into the same
+        // ~/.config/labwc/environment with a read-modify-write, so without
+        // mutual exclusion each one reads the file as it was and the last `mv`
+        // wins: two of the three keys silently disappear, and the symptom lands
+        // a boot later as a keyboard in the wrong layout or an untranslated
+        // session.
+        //
+        // Tested by HOLDING the lock rather than by racing: a race that depends
+        // on three host processes interleaving passes on a fast machine whether
+        // the lock is there or not, which is a test that checks nothing.
+        let dir = std::env::temp_dir().join(format!("eclipse-envlock-held-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        write_eclipse_tz(&dir);
+        let envf = dir.join("root/.config/labwc/environment");
+        let _ = fs::create_dir_all(envf.parent().unwrap());
+        let _ = fs::write(&envf, "TZ=Etc/UTC\n");
+        let lock = dir.join("root/.config/labwc/environment.lock");
+        fs::create_dir_all(&lock).unwrap();
+        let Some(mut kid) = run_boot_step(&dir, "eclipse-tz") else {
+            eprintln!("skipping: no POSIX sh on this host");
+            let _ = fs::remove_dir_all(&dir);
+            return;
+        };
+        // While the lock is held the file must keep the value it had. Half a
+        // second is many times the whole uncontended run of this script.
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        assert_eq!(
+            fs::read_to_string(&envf).unwrap_or_default(),
+            "TZ=Etc/UTC\n",
+            "the boot step wrote $ENVF while the lock was held"
+        );
+        fs::remove_dir(&lock).unwrap();
+        let _ = kid.wait();
+        let env = fs::read_to_string(&envf).unwrap_or_default();
+        assert!(
+            env.lines().any(|l| l.starts_with("TZ=")),
+            "the boot step never wrote TZ after the lock was dropped:\n{env}"
+        );
+        assert_eq!(
+            env.lines().filter(|l| l.starts_with("TZ=")).count(),
+            1,
+            "TZ ended up in the file twice:\n{env}"
+        );
+        assert!(!lock.exists(), "the lock was left behind");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_stale_lock_delays_a_boot_step_and_never_wedges_it() {
+        // The property that matters more than the race: a lock nobody will ever
+        // drop -- a machine that lost power inside the critical section leaves
+        // the directory behind on the installed root -- must not stop the boot.
+        // One hanging boot script is how a whole machine ends up wedged (the
+        // reason a oneshot has a timeout at all), so the wait is bounded and
+        // then the step takes the lock anyway. Losing one key on one boot is the
+        // cheaper failure by a wide margin.
+        let dir =
+            std::env::temp_dir().join(format!("eclipse-envlock-stale-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        write_eclipse_tz(&dir);
+        let envf = dir.join("root/.config/labwc/environment");
+        let _ = fs::create_dir_all(envf.parent().unwrap());
+        let lock = dir.join("root/.config/labwc/environment.lock");
+        fs::create_dir_all(&lock).unwrap();
+        let Some(mut kid) = run_boot_step(&dir, "eclipse-tz") else {
+            eprintln!("skipping: no POSIX sh on this host");
+            let _ = fs::remove_dir_all(&dir);
+            return;
+        };
+        // Bounded from Rust as well as in the script: a boot step that really
+        // does hang must fail this test, not hang the whole suite with it.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            match kid.try_wait() {
+                Ok(Some(_)) => break,
+                Ok(None) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(100))
+                }
+                Ok(None) => {
+                    let _ = kid.kill();
+                    let _ = fs::remove_dir_all(&dir);
+                    panic!("eclipse-tz --boot never returned with a stale env lock in place");
+                }
+                Err(e) => panic!("cannot wait for eclipse-tz: {e}"),
+            }
+        }
+        let env = fs::read_to_string(&envf).unwrap_or_default();
+        assert!(
+            env.lines().any(|l| l.starts_with("TZ=")),
+            "the boot step gave up on writing TZ instead of taking the stale lock:\n{env}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn every_writer_of_the_labwc_environment_takes_the_lock() {
+        // The invariant, pinned where a fourth writer would be added: a step
+        // that upserts a key into that file without `env_lock` reintroduces the
+        // lost-update race above, and a fixed `$ENVF.new` temporary collides
+        // with a concurrent writer even under the lock if it is ever stolen.
+        let dir = std::env::temp_dir().join(format!("eclipse-envlock-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        write_eclipse_kbd(&dir);
+        write_eclipse_locale(&dir);
+        write_eclipse_tz(&dir);
+        for name in ["eclipse-kbd", "eclipse-locale", "eclipse-tz"] {
+            let text = fs::read_to_string(dir.join("usr/local/bin").join(name)).unwrap();
+            assert!(text.contains("env_lock"), "{name} upserts $ENVF unlocked");
+            assert!(text.contains("env_unlock"), "{name} never drops the lock");
+            assert!(
+                text.contains("tmp=\"$ENVF.$$\""),
+                "{name} must write through a pid-unique temporary"
+            );
+            assert!(
+                !text.contains("> \"$ENVF.new\""),
+                "{name} still writes the shared $ENVF.new temporary"
+            );
+        }
         let _ = fs::remove_dir_all(&dir);
     }
 
