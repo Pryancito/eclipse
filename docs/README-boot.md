@@ -178,10 +178,22 @@ argumento nuevo:
 
 Los dos tramos gordos que quedan en rboot, por orden:
 
-- **La lectura del initramfs**, la marca 45 %: 3,49 s para 75 MiB a través del
-  driver FAT del firmware, unos 21 MB/s. Es el tramo mayor que queda, y a
-  diferencia de los de abajo es lento **también en hardware**: la velocidad de ese
-  driver no la pone la emulación.
+- **La lectura del initramfs**, la marca 45 %: 3,49 s — y esta fila es una
+  trampa que conviene leer entera antes de intentar recortarla.
+
+  Lo que `make qemu` pone en `\EFI\zCore\initramfs.img` **no es el initramfs de
+  arranque de 75 MiB**, es la imagen viva de la variante, **396 MiB**. Una
+  máquina instalada lee la de 75 MiB. Y el driver FAT del firmware **no es
+  lento**: 396 MiB en 3486 ms son **119 MB/s**, y la lectura del ELF del núcleo
+  de la marca 15 % da **122 MB/s** por separado — dos medidas independientes que
+  concuerdan. A ese ritmo los 75 MiB de una máquina instalada son unos **660 ms**.
+
+  Así que no hay nada que recortar aquí hasta tener la tabla de una máquina de
+  verdad: lo que decide esta fila es **qué fichero se lee**, no a qué velocidad, y
+  en QEMU se lee uno cinco veces más grande que el que se arranca de verdad. De
+  los 75 MiB instalados, unos 23 son el blob de firmware GSP de NVIDIA, que está
+  ahí a propósito porque la GPU lo necesita antes del pivote a la raíz btrfs
+  (ver `xtask/src/linux/image.rs`).
 - **El mapeo del ELF del núcleo**, la marca 46 %: 3,44 s. No es el `.text`: el
   último `PT_LOAD` del núcleo tiene `FileSiz` 0 y **`MemSiz` 548 MiB**, y de
   ellos 512 MiB son un solo objeto, `zcore::memory::init::HEAP` — el montón del
@@ -202,12 +214,19 @@ Los dos tramos gordos que quedan en rboot, por orden:
 - **El sondeo PCI del núcleo**: 441 ms de 882 ms en QEMU, pero esa cifra es de un
   PCI *emulado*. Antes de tocarlo hace falta la tabla de una máquina de verdad.
 
-Y la advertencia que vale para todas estas cifras: **son de QEMU con TCG**, sin
-aceleración. Una pasada que *mapea* (el mapa físico) es trabajo del MMU y se
-recorta igual en hardware; una pasada que *copia o pone a cero* mucha memoria
-(los 512 MiB del montón, los 75 MiB del initramfs) la emulación la castiga mucho
-más de lo que lo hará una máquina de verdad. Por eso el reparto de una máquina
-real puede ser distinto, y es la tabla que falta.
+Y las dos advertencias que valen para todas estas cifras:
+
+- **Son de QEMU con TCG**, sin aceleración. Una pasada que *mapea* (el mapa
+  físico) es trabajo del MMU y se recorta igual en hardware; una que *copia o
+  pone a cero* mucha memoria la emulación la castiga mucho más de lo que lo hará
+  una máquina de verdad.
+- **No es la misma imagen.** `make qemu` arranca la imagen viva de la variante;
+  una máquina instalada arranca el initramfs de 75 MiB y pivota a btrfs. La fila
+  del 45 % es la que más cambia por esto, pero el tamaño de la imagen también
+  mueve `max_phys_addr` y con él el mapa físico.
+
+Por eso el reparto de una máquina real puede ser distinto, y es la tabla que
+falta.
 
 ## 4. Lo que ya se sabía medir, y no es esto
 
