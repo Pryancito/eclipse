@@ -432,12 +432,13 @@ impl KernelHandler for ZcoreKernelHandler {
                 let _ = write!(
                     b,
                     "KERNEL NULL-RANGE PAGE FAULT cpu={} vaddr={:#x} flags={:?}\nrip={}\n\
-                     in_timer={} (not a userspace-caused fault)",
+                     in_timer={} (not a userspace-caused fault){}",
                     kernel_hal::cpu::cpu_id(),
                     fault_vaddr,
                     access_flags,
                     kernel_hal::ksyms::Addr(kernel_hal::kstats::last_fault_rip()),
                     in_timer,
+                    heap_lock_banner_note(crate::memory::heap_held_by_current_cpu()),
                 );
                 #[cfg(target_arch = "x86_64")]
                 write_stop_screen_callers(&mut b);
@@ -763,12 +764,13 @@ fn report_unresolved_kernel_fault(
         let _ = write!(
             b,
             "KERNEL PAGE FAULT cpu={} vaddr={:#x} flags={:?}\nrip={}\nhave_thread={} \
-             (unresolved by the user vmar: a kernel-side bug, not a userspace SIGSEGV)",
+             (unresolved by the user vmar: a kernel-side bug, not a userspace SIGSEGV){}",
             kernel_hal::cpu::cpu_id(),
             fault_vaddr,
             access_flags,
             kernel_hal::ksyms::Addr(rip),
             have_thread,
+            heap_lock_banner_note(crate::memory::heap_held_by_current_cpu()),
         );
         #[cfg(target_arch = "x86_64")]
         write_stop_screen_callers(&mut b);
@@ -1044,6 +1046,29 @@ fn print_fault_registers(fault_vaddr: usize, access_flags: MMUFlags) {
                 b[15],
             ));
         }
+    }
+}
+
+/// The one sentence that classifies a fault taken with the kernel heap lock
+/// held, for the stop screen.
+///
+/// [`report_heap_lock_held`] has said this on the serial console since #1671,
+/// and the owner of the machine this diagnoses has no serial capture: he
+/// photographs the screen. The capture of 2026-10-09 is the whole case --
+/// cpu0 faulted inside `dealloc`, three other cpus then piled up in `alloc`
+/// behind the lock it never gave back, and the screen showed four DEADLOCK
+/// blocks and no hint that they were all the same event. A reader who does
+/// not already know that is left with four bugs instead of one.
+///
+/// Returns `""` when the lock was not held, so the caller can always write it.
+#[cfg_attr(feature = "libos", allow(dead_code))]
+fn heap_lock_banner_note(held: bool) -> &'static str {
+    if held {
+        "\nTHIS CPU HELD THE KERNEL HEAP LOCK when it faulted: the fault is inside \
+         the allocator and that lock is never given back, so every DEADLOCK report \
+         after this one names this cpu as HOLDER as a CONSEQUENCE, not a second bug."
+    } else {
+        ""
     }
 }
 
@@ -1538,6 +1563,50 @@ mod stop_screen_caller_tests {
         assert_eq!(
             pick_return_addresses([0, 0x1, TEXT + 0x20], tail, &mut out),
             0
+        );
+    }
+}
+
+/// The judged lines of the fault reporter, on the host.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A stop screen the owner photographs has no serial console behind it, so
+    /// the sentence that turns four DEADLOCK blocks into one event has to be in
+    /// the banner itself.
+    #[test]
+    fn a_fault_with_the_heap_lock_held_says_so_on_the_screen() {
+        let note = heap_lock_banner_note(true);
+        assert!(
+            note.starts_with('\n'),
+            "it is appended to a line: {:?}",
+            note
+        );
+        assert!(note.contains("HELD THE KERNEL HEAP LOCK"));
+        assert!(
+            note.contains("CONSEQUENCE"),
+            "the point is that the DEADLOCK reports that follow are not a second bug"
+        );
+    }
+
+    /// And costs the ordinary fault nothing: no stray blank line, no sentence
+    /// about a lock nobody held.
+    #[test]
+    fn a_fault_without_the_lock_adds_nothing_at_all() {
+        assert_eq!(heap_lock_banner_note(false), "");
+    }
+
+    /// The banner is a fixed stack buffer whose writer truncates silently, so a
+    /// note long enough to push the lines after it off the screen would trade
+    /// one lost finding for another.
+    #[test]
+    fn the_note_cannot_crowd_the_rest_of_the_banner_out() {
+        assert!(
+            heap_lock_banner_note(true).len() < 256,
+            "note is {} B of a {} B banner",
+            heap_lock_banner_note(true).len(),
+            crate::lang::BANNER_BYTES,
         );
     }
 }

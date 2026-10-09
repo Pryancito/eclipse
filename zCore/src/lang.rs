@@ -111,6 +111,39 @@ fn alloc_error(layout: Layout) -> ! {
     panic!("memory allocation of {} bytes failed", layout.size());
 }
 
+/// Does `sym` name a frame of the kernel's own fault/panic diagnosis path?
+///
+/// Asked of a HOLDER's `is now at` symbol, and it decides the banner's
+/// verdict. A lock whose holder faulted inside its critical section is never
+/// released, so every other cpu piles up behind it and the report reads
+/// exactly like a cycle -- which is how a convoy of waiters gets chased as an
+/// AB-BA that was never there. When the holder is sitting in
+/// `handle_page_fault`, the deadlock is not the bug; the fault printed above
+/// it is. [`self_deadlock_cpu`] already calls the case where the holder is
+/// *also* a waiter; this one is the commoner shape, where the faulted holder
+/// never comes back for the lock at all.
+///
+/// Matched on substrings, because these frames are generic and mangled
+/// (`<zcore::handler::ZcoreKernelHandler as kernel_hal::..>::handle_page_fault`)
+/// and `ksyms` hands back one folded name per address. Deliberately narrow:
+/// the kernel's own trap/panic/containment entry points only, never a name an
+/// ordinary caller could carry.
+pub(crate) fn sym_is_diagnosing(sym: &str) -> bool {
+    const NEEDLES: &[&str] = &[
+        "handle_page_fault",
+        "handle_trap",
+        "trap_handler",
+        "report_unresolved_kernel_fault",
+        "print_fault_backtrace",
+        "oops::try_contain",
+        "rust_begin_unwind",
+        "panic_banner",
+        "panic_handler",
+        "panic_fmt",
+    ];
+    NEEDLES.iter().any(|n| sym.contains(n))
+}
+
 /// How many bytes a banner may occupy. A stack buffer, because the panic
 /// handler must not allocate (the panic may BE an OOM) and must not depend on
 /// any lock.
@@ -129,12 +162,12 @@ fn alloc_error(layout: Layout) -> ! {
 /// 2 KiB of a 2 MiB coroutine stack, once, on a machine that is already wedged.
 /// [`tests::the_non_acker_cap_is_small_enough_to_leave_the_rest_of_the_banner_room`]
 /// is what keeps this number ahead of what the banner prints.
-const BANNER_BYTES: usize = 2048;
+pub(crate) const BANNER_BYTES: usize = 2048;
 
 /// Bytes [`StackBuf::with_reserve`] holds back for the deadlock banner's final
 /// verdict plus the `[+N B cut]` marker: the longest `DIAG:` line is ~190
 /// bytes and the marker ~20.
-const VERDICT_RESERVE: usize = 256;
+const VERDICT_RESERVE: usize = 352;
 
 /// Fixed-size, no-alloc formatter for the panic banner. The panic handler must
 /// not allocate (the panic may BE an OOM) and must not depend on any lock.
@@ -528,6 +561,7 @@ fn dl_paint() {
     // capture seen (one holder, or the two sides of a cycle) and leaves the
     // line that names the conclusion room to land.
     let reporting = panicking_cpu();
+    let mut holder_diagnosing = false;
     for &c in holder_cpus.iter().take(holder_n.min(2)) {
         let rip = kernel_hal::kstats::nmi_rip(c);
         if c == reporting {
@@ -545,6 +579,9 @@ fn dl_paint() {
                 c
             );
         } else if rip != 0 {
+            if let Some((sym, _)) = kernel_hal::ksyms::lookup(rip) {
+                holder_diagnosing |= sym_is_diagnosing(sym);
+            }
             let _ = write!(
                 b,
                 "\nHOLDER cpu{} is now at {}",
@@ -582,6 +619,21 @@ fn dl_paint() {
             "\nDIAG: shootdown starvation — the HOLDER waits a TLB ack from a CPU \
              that never pumps; symbolize the non-acker nmi_rip above to name it. \
              Not AB-BA."
+        );
+    } else if holder_diagnosing {
+        // The case the either/or below cannot call, and the one the captures
+        // keep showing: a HOLDER sitting in the kernel's own fault path, i.e.
+        // it faulted with the lock held and will never give it back. The
+        // discriminator was already on the screen -- the `is now at` symbol --
+        // but reading it asked the reader to know which symbols are the fault
+        // path, which is exactly what a photograph of a wedged machine does
+        // not help with.
+        let _ = write!(
+            b,
+            "\nDIAG: a HOLDER faulted or panicked INSIDE its critical section (its \
+             \"is now at\" is in the kernel's own fault/panic path), so that lock is \
+             never given back. Not AB-BA: this report is a CONSEQUENCE of the fault \
+             printed above it, not a second bug. Diagnose that fault."
         );
     } else {
         // NOT "therefore AB-BA". Ruling out shootdown starvation leaves more
@@ -1291,6 +1343,57 @@ mod tests {
         let _ = write!(b, "{}", "y".repeat(BANNER_BYTES * 2));
         assert_eq!(b.valid_str().len(), BANNER_BYTES - VERDICT_RESERVE);
         assert!(b.dropped() > 0);
+    }
+
+    /// The symbol off the capture of 2026-10-09, verbatim as `ksyms` folds it.
+    /// This is the line that decides the verdict, so the match has to survive
+    /// the generic mangling it arrives wrapped in.
+    #[test]
+    fn a_holder_sitting_in_the_page_fault_handler_is_recognised() {
+        assert!(sym_is_diagnosing(
+            "<zcore::handler::ZcoreKernelHa..as kernel_hal::kernel_handler::KernelHandler>::handle_page_fault"
+        ));
+        assert!(sym_is_diagnosing("zcore::handler::print_fault_backtrace"));
+        assert!(sym_is_diagnosing("zcore::oops::try_contain"));
+        assert!(sym_is_diagnosing("rust_begin_unwind"));
+    }
+
+    /// Narrow on purpose: the two sites the captures actually show a holder
+    /// wedged at with no fault anywhere -- the allocator's coalescing scan and
+    /// a shootdown wait -- must not be read as "it faulted", or the verdict
+    /// sends the reader looking for a fault report that was never printed.
+    #[test]
+    fn an_ordinary_wedged_holder_is_not_read_as_a_fault() {
+        for sym in [
+            "<zcore::memory::LockedHeap<32> as core::alloc::global::GlobalAlloc>::dealloc",
+            "lock::ticket::TicketMutex<T>::lock",
+            "kernel_hal::vm::flush_tlb_range",
+            "hal_cpu_idle",
+            "zcore::handler::handle_syscall",
+        ] {
+            assert!(!sym_is_diagnosing(sym), "{} read as the fault path", sym);
+        }
+    }
+
+    /// The verdict is written after `release_reserve`, so the reserve is the
+    /// only thing standing between the longest verdict and a photograph that
+    /// ends mid-sentence. Longest, plus the `did not fit` line that may follow
+    /// it.
+    #[test]
+    fn the_longest_verdict_still_fits_the_bytes_held_back_for_it() {
+        const FAULTED_HOLDER: &str = "\nDIAG: a HOLDER faulted or panicked INSIDE its \
+                                      critical section (its \"is now at\" is in the \
+                                      kernel's own fault/panic path), so that lock is \
+                                      never given back. Not AB-BA: this report is a \
+                                      CONSEQUENCE of the fault printed above it, not a \
+                                      second bug. Diagnose that fault.";
+        const DID_NOT_FIT: &str = "\n[1234 B of this report did not fit]";
+        assert!(
+            FAULTED_HOLDER.len() + DID_NOT_FIT.len() <= VERDICT_RESERVE,
+            "{} B of verdict and tail for a {} B reserve",
+            FAULTED_HOLDER.len() + DID_NOT_FIT.len(),
+            VERDICT_RESERVE,
+        );
     }
 
     /// The bug, in the shape the machine produces it: a header, then a block of
