@@ -351,8 +351,8 @@ mod tests {
         AT_NS[54].store(0, Ordering::Relaxed);
         AT_NS[55].store(0, Ordering::Relaxed);
         // 55% is charged 5.5 ms, the distance from 54%, not its own 7.5 ms.
-        assert!(text.contains("5.500ms"), "{text}");
-        assert!(text.contains("7.500ms"), "{text}");
+        assert!(text.contains("5.500ms"), "{}", text);
+        assert!(text.contains("7.500ms"), "{}", text);
     }
 
     #[test]
