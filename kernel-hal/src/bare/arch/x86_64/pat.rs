@@ -81,9 +81,13 @@ const PHYS_ADDR_MASK: u64 = 0x000f_ffff_ffff_f000;
 /// rboot (this pass finds NotMapped) and is later mapped UncachedDevice by
 /// the PCI `query_or_map`, so only a re-run after PCI can retype it.
 ///
-/// Only 4 KiB leaves are converted; a huge-page leaf (which rboot never
-/// creates for the physmap) is left untouched — UC/WB there is slower, not
-/// incorrect — and reported once.
+/// Only 4 KiB leaves are converted; a huge-page leaf is left untouched —
+/// UC/WB there is slower, not incorrect — and reported once. rboot maps the
+/// physmap in 2 MiB pages but carves out the blocks holding `fb_addr ..
+/// fb_addr + fb_size` precisely so this pass has 4 KiB leaves to retype; a
+/// huge leaf here therefore means the firmware moved the framebuffer after
+/// rboot read it, and `huge leaves skipped` in the log below is the first
+/// place a 300-instead-of-2000-FPS framebuffer would show up.
 pub fn enable_framebuffer_wc() {
     if !pat_wc_ready() || KCONFIG.fb_addr == 0 || KCONFIG.fb_size == 0 {
         return;

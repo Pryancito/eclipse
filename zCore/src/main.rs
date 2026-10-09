@@ -882,6 +882,12 @@ fn primary_main(config: kernel_hal::KernelConfig) {
             // line it prints, which says when the kernel SPOKE; this says where
             // it spent the silence between two lines, which is the only figure
             // "make the boot faster" can start from.
+            // The loader's marks are raw TSC readings; name the frequency to
+            // divide them by now, not at `_start`, where the only figure
+            // available was a CPUID guess. By here the device probe has checked
+            // one against the ACPI PM timer.
+            #[cfg(target_arch = "x86_64")]
+            kernel_hal::boot_marks::set_loader_tsc_hz(kernel_hal::cpu::tsc_hz());
             for line in kernel_hal::boot_marks::render().lines() {
                 // Both sinks, deliberately. `klog_info!` writes to the dmesg
                 // ring ONLY, which is where one reads it on a machine that is

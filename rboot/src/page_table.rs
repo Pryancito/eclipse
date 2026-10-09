@@ -174,6 +174,22 @@ pub trait Machine {
     /// # Safety
     /// Both must be mapped, page-aligned and 4 KiB long.
     unsafe fn copy_page(&mut self, dst: u64, src: u64);
+
+    /// Install one 2 MiB mapping, allocating any intermediate tables.
+    ///
+    /// Every machine must answer this rather than inherit a fallback, because
+    /// the whole point of the call is that it is NOT five hundred and twelve
+    /// 4 KiB mappings: a silent fallback would make the host tests agree with a
+    /// loader that quietly went back to taking seven seconds.
+    ///
+    /// # Safety
+    /// As [`Machine::map`].
+    unsafe fn map_huge(
+        &mut self,
+        page: Page<Size2MiB>,
+        frame: PhysFrame<Size2MiB>,
+        flags: PageTableFlags,
+    ) -> Result<(), MapError>;
 }
 
 /// The real machine: the firmware's page tables and its page allocator.
@@ -184,7 +200,7 @@ pub struct Firmware<'a, M, A> {
 
 impl<M, A> Machine for Firmware<'_, M, A>
 where
-    M: Mapper<Size4KiB>,
+    M: Mapper<Size4KiB> + Mapper<Size2MiB>,
     A: FrameAllocator<Size4KiB>,
 {
     fn allocate_frame(&mut self) -> Option<PhysFrame<Size4KiB>> {
@@ -234,6 +250,33 @@ where
     unsafe fn copy_page(&mut self, dst: u64, src: u64) {
         type PageArray = [u64; PAGE_SIZE as usize / 8];
         (dst as *mut PageArray).write((src as *const PageArray).read());
+    }
+
+    unsafe fn map_huge(
+        &mut self,
+        page: Page<Size2MiB>,
+        frame: PhysFrame<Size2MiB>,
+        flags: PageTableFlags,
+    ) -> Result<(), MapError> {
+        match self.mapper.map_to(page, frame, flags, self.allocator) {
+            Ok(flush) => {
+                flush.flush();
+                Ok(())
+            }
+            // A page directory entry that is already in use: either something
+            // put a 2 MiB leaf here, or it points at a page table full of 4 KiB
+            // leaves. The caller falls back to 4 KiB for this block rather than
+            // tearing down whatever is there.
+            Err(MapToError::PageAlreadyMapped(existing)) => Err(MapError::AlreadyMapped {
+                page: page.start_address().as_u64(),
+                frame: existing.start_address().as_u64(),
+            }),
+            Err(MapToError::ParentEntryHugePage) => Err(MapError::AlreadyMapped {
+                page: page.start_address().as_u64(),
+                frame: frame.start_address().as_u64(),
+            }),
+            Err(MapToError::FrameAllocationFailed) => Err(MapError::OutOfFrames),
+        }
     }
 }
 
@@ -322,27 +365,106 @@ pub fn map_stack(addr: u64, pages: u64, m: &mut impl Machine) -> Result<(), MapE
     Ok(())
 }
 
-/// Map physical memory `[0, max_addr]`, rounded out to whole frames, to
-/// virtual space at `offset`.
+/// How much one 2 MiB page covers, in bytes.
+pub const HUGE_SIZE: u64 = 512 * PAGE_SIZE;
+
+/// Does `[start, end)` overlap any of `ranges` (each `[from, to)`)?
 ///
-/// `max_addr` is included on purpose: every caller computes it as "one past
-/// the last byte the kernel will touch" (`fb_addr + fb_size`,
-/// `initramfs_addr + initramfs_size`), and a framebuffer whose size is not a
-/// multiple of 4 KiB would otherwise lose its last page.
+/// An empty or inverted range matches nothing: `fine` comes from the firmware's
+/// idea of where the framebuffer is, and a machine that reports a zero-sized one
+/// must not pull the whole physmap down to 4 KiB pages.
+fn overlaps(start: u64, end: u64, ranges: &[(u64, u64)]) -> bool {
+    ranges
+        .iter()
+        .any(|&(from, to)| to > from && start < to && from < end)
+}
+
+/// Map all of physical memory at `offset`, in 2 MiB pages where it can.
+///
+/// **This used to be one `map_page` per 4 KiB frame**, and on the measured boot
+/// timeline it was the single most expensive thing in the whole boot: 6.98 s of
+/// an 11.8 s boot, mapping 12 GB as 3,145,728 separate mappings, each walking
+/// four levels of page table and taking fresh frames off the firmware. It is
+/// linear in the machine's RAM, and the floor is 4 GB whatever the machine has
+/// (see `max_phys_addr` in the loader), so it only gets worse on a big box. The
+/// same 12 GB is 6,144 mappings at 2 MiB.
+///
+/// `fine` names physical ranges that must keep 4 KiB leaves. There is one, and
+/// it is not optional: the kernel retypes the boot framebuffer's physmap PTEs to
+/// write-combining after the PCI scan (`kernel_hal`'s `pat::enable_framebuffer_wc`)
+/// and it can only do that to a 4 KiB leaf — it skips a huge leaf, correctly but
+/// leaving the framebuffer write-back, which measured as 300 FPS against 2000 in
+/// glxgears on real hardware. Any 2 MiB block overlapping a `fine` range is
+/// mapped the old way. `fine` is also where the escape hatch lands: one range
+/// covering everything is exactly the old behaviour.
+///
+/// A block the firmware (or an earlier pass) already has an entry for falls back
+/// to 4 KiB too, where [`map_page`] tolerates an entry that already points at the
+/// very same frame — which is how the low megabytes survive.
+///
+/// Mapping rounds **up** to the 2 MiB block holding `max_addr`, so a few frames
+/// past the end of RAM may get an entry. Harmless: nothing reads through them,
+/// and the 4 KiB version already included the whole frame holding `max_addr`.
 pub fn map_physical_memory(
     offset: u64,
     max_addr: u64,
+    fine: &[(u64, u64)],
     m: &mut impl Machine,
 ) -> Result<(), MapError> {
     let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE;
-    for frame in PhysFrame::range_inclusive(frame_of(0)?, frame_of(max_addr)?) {
-        let phys = frame.start_address().as_u64();
-        let virt = offset
-            .checked_add(phys)
-            .ok_or(MapError::AddressOverflow(offset))?;
-        map_page(m, page_of(virt)?, frame, flags)?;
+    // Both ends are checked before anything is mapped, so a bad `offset` or a
+    // bad `max_addr` is refused rather than half-applied. The per-frame version
+    // got this for free by validating inside the loop; these three lines name
+    // the same three failures, with the same addresses in them.
+    frame_of(max_addr)?;
+    page_of(offset)?;
+    offset
+        .checked_add(max_addr)
+        .ok_or(MapError::AddressOverflow(offset))?;
+    let mut block = 0u64;
+    loop {
+        let block_end = block + HUGE_SIZE;
+        let huge_ok = !overlaps(block, block_end, fine)
+            && matches!(map_huge_block(offset, block, flags, m), Ok(()));
+        if !huge_ok {
+            // 4 KiB for this block: either it must stay fine-grained, or
+            // something is already in the page directory entry.
+            let upto = block_end.min(max_addr + PAGE_SIZE);
+            for phys in (block..upto).step_by(PAGE_SIZE as usize) {
+                let virt = offset
+                    .checked_add(phys)
+                    .ok_or(MapError::AddressOverflow(offset))?;
+                map_page(m, page_of(virt)?, frame_of(phys)?, flags)?;
+            }
+        }
+        if block_end > max_addr {
+            return Ok(());
+        }
+        block = block_end;
     }
-    Ok(())
+}
+
+/// One 2 MiB mapping of `block`, or whatever went wrong.
+fn map_huge_block(
+    offset: u64,
+    block: u64,
+    flags: PageTableFlags,
+    m: &mut impl Machine,
+) -> Result<(), MapError> {
+    let virt = offset
+        .checked_add(block)
+        .ok_or(MapError::AddressOverflow(offset))?;
+    let page = Page::<Size2MiB>::from_start_address(
+        VirtAddr::try_new(virt).map_err(|_| MapError::NotCanonical(virt))?,
+    )
+    .map_err(|_| MapError::UnalignedImage(virt))?;
+    let frame = PhysFrame::<Size2MiB>::from_start_address(
+        PhysAddr::try_new(block).map_err(|_| MapError::NotPhysical(block))?,
+    )
+    .map_err(|_| MapError::UnalignedImage(block))?;
+    // SAFETY: nothing is reading through the physmap yet; this is the pass that
+    // creates it.
+    unsafe { m.map_huge(page, frame, flags | PageTableFlags::HUGE_PAGE) }
 }
 
 fn map_segment(
@@ -484,6 +606,9 @@ mod tests {
     const FRESH: u64 = 0x2_0000_0000;
     /// A canonical higher-half base, the shape zCore is linked at.
     const KVA: u64 = 0xffff_ff00_0000_0000;
+    /// A `fine` list that covers everything, which is what the `PHYSMAP4K`
+    /// hatch passes and what the loader did for every frame before this change.
+    const ALL_FINE: [(u64, u64); 1] = [(0, u64::MAX)];
 
     const PT_LOAD: u32 = 1;
     const PT_NOTE: u32 = 4;
@@ -496,6 +621,11 @@ mod tests {
     #[derive(Default)]
     struct Fake {
         mapped: BTreeMap<u64, (u64, PageTableFlags)>,
+        /// 2 MiB leaves, kept apart from `mapped` on purpose: a test that
+        /// wants the fine-grained path must be able to say so, and "512 keys
+        /// appeared in `mapped`" and "one 2 MiB leaf appeared" are the two
+        /// outcomes the whole change is about.
+        huge: BTreeMap<u64, (u64, PageTableFlags)>,
         handed: u64,
         budget: Option<u64>,
         zeroed: Vec<(u64, usize)>,
@@ -525,6 +655,15 @@ mod tests {
         }
         fn pages(&self) -> Vec<u64> {
             self.mapped.keys().copied().collect()
+        }
+        fn huge_pages(&self) -> Vec<u64> {
+            self.huge.keys().copied().collect()
+        }
+        fn huge_frame_at(&self, virt: u64) -> Option<u64> {
+            self.huge.get(&virt).map(|(f, _)| *f)
+        }
+        fn huge_flags_at(&self, virt: u64) -> Option<PageTableFlags> {
+            self.huge.get(&virt).map(|(_, f)| *f)
         }
     }
 
@@ -580,6 +719,36 @@ mod tests {
 
         unsafe fn copy_page(&mut self, dst: u64, src: u64) {
             self.copied.push((dst, src));
+        }
+
+        unsafe fn map_huge(
+            &mut self,
+            page: Page<Size2MiB>,
+            frame: PhysFrame<Size2MiB>,
+            flags: PageTableFlags,
+        ) -> Result<(), MapError> {
+            let virt = page.start_address().as_u64();
+            // The real `map_to` cannot put a 2 MiB leaf where the page
+            // directory entry already points at a page table, and that is
+            // exactly how the firmware leaves the low memory it mapped itself.
+            // Modelling it is what keeps the fallback honest: without this the
+            // host tests would be happy with a loader that silently stamped
+            // over the firmware's own mappings.
+            let clash = self
+                .mapped
+                .range(virt..virt.saturating_add(HUGE_SIZE))
+                .map(|(_, &(frame, _))| frame)
+                .next()
+                .or_else(|| self.huge.get(&virt).map(|&(frame, _)| frame));
+            if let Some(existing) = clash {
+                return Err(MapError::AlreadyMapped {
+                    page: virt,
+                    frame: existing,
+                });
+            }
+            self.huge
+                .insert(virt, (frame.start_address().as_u64(), flags));
+            Ok(())
         }
     }
 
@@ -1120,9 +1289,9 @@ mod tests {
     // ----------------------------------------------------- physical memory
 
     #[test]
-    fn physical_memory_is_mapped_frame_by_frame_at_the_offset() {
+    fn physical_memory_is_mapped_frame_by_frame_inside_a_fine_range() {
         let mut m = Fake::default();
-        assert_eq!(map_physical_memory(KVA, 0x3000, &mut m), Ok(()));
+        assert_eq!(map_physical_memory(KVA, 0x3000, &ALL_FINE, &mut m), Ok(()));
         // `max_addr` is one past the last byte every caller cares about, and
         // its frame is included on purpose.
         assert_eq!(
@@ -1142,7 +1311,7 @@ mod tests {
     fn a_page_the_firmware_already_points_at_the_same_frame_is_accepted() {
         let mut m = Fake::default();
         m.preset(KVA + 0x1000, 0x1000);
-        assert_eq!(map_physical_memory(KVA, 0x2000, &mut m), Ok(()));
+        assert_eq!(map_physical_memory(KVA, 0x2000, &ALL_FINE, &mut m), Ok(()));
         assert_eq!(m.frame_at(KVA + 0x1000), Some(0x1000));
     }
 
@@ -1151,7 +1320,7 @@ mod tests {
         let mut m = Fake::default();
         m.preset(KVA + 0x1000, 0x9_0000);
         assert_eq!(
-            map_physical_memory(KVA, 0x2000, &mut m),
+            map_physical_memory(KVA, 0x2000, &ALL_FINE, &mut m),
             Err(MapError::AlreadyMapped {
                 page: KVA + 0x1000,
                 frame: 0x9_0000
@@ -1160,11 +1329,141 @@ mod tests {
     }
 
     #[test]
+    fn whole_blocks_outside_a_fine_range_are_one_mapping_each_not_five_hundred_and_twelve() {
+        let mut m = Fake::default();
+        // Three 2 MiB blocks' worth of RAM. The old loader made 1536 mappings
+        // of this; the point of the change is that it is three.
+        let max = 3 * HUGE_SIZE - 1;
+        assert_eq!(map_physical_memory(KVA, max, &[], &mut m), Ok(()));
+        assert_eq!(
+            m.huge_pages(),
+            std::vec![KVA, KVA + HUGE_SIZE, KVA + 2 * HUGE_SIZE]
+        );
+        assert!(
+            m.pages().is_empty(),
+            "no 4 KiB leaf should have been needed"
+        );
+        for i in 0..3u64 {
+            assert_eq!(m.huge_frame_at(KVA + i * HUGE_SIZE), Some(i * HUGE_SIZE));
+        }
+    }
+
+    #[test]
+    fn a_huge_leaf_carries_the_huge_page_bit() {
+        let mut m = Fake::default();
+        assert_eq!(map_physical_memory(KVA, 0x1000, &[], &mut m), Ok(()));
+        let flags = m
+            .huge_flags_at(KVA)
+            .expect("block 0 should be a 2 MiB leaf");
+        assert!(flags.contains(PageTableFlags::HUGE_PAGE));
+        assert!(flags.contains(PageTableFlags::PRESENT | PageTableFlags::WRITABLE));
+    }
+
+    #[test]
+    fn the_last_block_is_rounded_up_so_max_addr_is_always_covered() {
+        let mut m = Fake::default();
+        // One byte into the second block: the kernel must still be able to
+        // read through `phys_to_virt(max_addr)`.
+        assert_eq!(map_physical_memory(KVA, HUGE_SIZE, &[], &mut m), Ok(()));
+        assert_eq!(m.huge_pages(), std::vec![KVA, KVA + HUGE_SIZE]);
+    }
+
+    #[test]
+    fn a_block_holding_the_framebuffer_keeps_its_four_kib_leaves() {
+        let mut m = Fake::default();
+        // A framebuffer parked in the middle of the second block. The kernel
+        // retypes those PTEs to write-combining after the PCI scan and can
+        // only do it to a 4 KiB leaf, so that block must stay fine-grained --
+        // and the blocks either side of it must NOT.
+        let fb = HUGE_SIZE + 0x8_0000;
+        let fine = [(fb, fb + 0x10_0000)];
+        assert_eq!(
+            map_physical_memory(KVA, 3 * HUGE_SIZE - 1, &fine, &mut m),
+            Ok(())
+        );
+        assert_eq!(m.huge_pages(), std::vec![KVA, KVA + 2 * HUGE_SIZE]);
+        // The whole middle block, every frame of it, as 4 KiB leaves.
+        assert_eq!(m.pages().len(), 512);
+        assert_eq!(m.frame_at(KVA + fb), Some(fb));
+        assert_eq!(m.frame_at(KVA + HUGE_SIZE), Some(HUGE_SIZE));
+        assert_eq!(
+            m.frame_at(KVA + 2 * HUGE_SIZE - PAGE_SIZE),
+            Some(2 * HUGE_SIZE - PAGE_SIZE)
+        );
+    }
+
+    #[test]
+    fn a_framebuffer_the_firmware_reports_as_empty_does_not_drag_everything_down_to_four_kib() {
+        let mut m = Fake::default();
+        assert_eq!(
+            map_physical_memory(KVA, HUGE_SIZE - 1, &[(0x9000, 0x9000)], &mut m),
+            Ok(())
+        );
+        assert_eq!(m.huge_pages(), std::vec![KVA]);
+        assert!(m.pages().is_empty());
+    }
+
+    #[test]
+    fn a_block_the_firmware_already_has_an_entry_for_falls_back_to_four_kib() {
+        let mut m = Fake::default();
+        // This is the low memory the firmware mapped itself: `map_huge` cannot
+        // replace a page table with a leaf, so the block goes frame by frame,
+        // where an entry already pointing at the same frame is accepted.
+        m.preset(KVA + 0x3000, 0x3000);
+        assert_eq!(
+            map_physical_memory(KVA, 2 * HUGE_SIZE - 1, &[], &mut m),
+            Ok(())
+        );
+        assert_eq!(m.huge_pages(), std::vec![KVA + HUGE_SIZE]);
+        assert_eq!(m.pages().len(), 512);
+        assert_eq!(m.frame_at(KVA + 0x3000), Some(0x3000));
+    }
+
+    #[test]
+    fn a_fine_grained_fallback_still_refuses_a_page_pointing_somewhere_else() {
+        let mut m = Fake::default();
+        m.preset(KVA + 0x3000, 0x9_0000);
+        assert_eq!(
+            map_physical_memory(KVA, HUGE_SIZE - 1, &[], &mut m),
+            Err(MapError::AlreadyMapped {
+                page: KVA + 0x3000,
+                frame: 0x9_0000
+            })
+        );
+    }
+
+    #[test]
+    fn a_physical_memory_offset_that_is_not_block_aligned_degrades_to_four_kib() {
+        // `rboot.conf` can say anything. An offset that cannot carry a 2 MiB
+        // leaf must come out as the old loader, not as an error: slow beats a
+        // machine that does not boot.
+        let mut m = Fake::default();
+        let offset = KVA + PAGE_SIZE;
+        assert_eq!(map_physical_memory(offset, 0x1000, &[], &mut m), Ok(()));
+        assert!(m.huge_pages().is_empty());
+        assert_eq!(m.pages(), std::vec![offset, offset + PAGE_SIZE]);
+    }
+
+    #[test]
+    fn the_hatch_that_asks_for_four_kib_everywhere_is_the_old_behaviour() {
+        let mut fine = Fake::default();
+        assert_eq!(
+            map_physical_memory(KVA, 0x3000, &ALL_FINE, &mut fine),
+            Ok(())
+        );
+        assert!(fine.huge_pages().is_empty());
+        assert_eq!(
+            fine.pages(),
+            std::vec![KVA, KVA + 0x1000, KVA + 0x2000, KVA + 0x3000]
+        );
+    }
+
+    #[test]
     fn a_non_canonical_physical_memory_offset_is_refused_instead_of_panicking() {
         let bad = 0x0001_0000_0000_0000;
         let mut m = Fake::default();
         assert_eq!(
-            map_physical_memory(bad, 0x1000, &mut m),
+            map_physical_memory(bad, 0x1000, &[], &mut m),
             Err(MapError::NotCanonical(bad))
         );
     }
@@ -1174,7 +1473,7 @@ mod tests {
         let offset = u64::MAX - 0xfff;
         let mut m = Fake::default();
         assert_eq!(
-            map_physical_memory(offset, 0x2000, &mut m),
+            map_physical_memory(offset, 0x2000, &[], &mut m),
             Err(MapError::AddressOverflow(offset))
         );
     }
@@ -1184,7 +1483,7 @@ mod tests {
         let bad = 1u64 << 52;
         let mut m = Fake::default();
         assert_eq!(
-            map_physical_memory(KVA, bad, &mut m),
+            map_physical_memory(KVA, bad, &[], &mut m),
             Err(MapError::NotPhysical(bad))
         );
     }

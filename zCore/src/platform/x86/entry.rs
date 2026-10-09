@@ -1,8 +1,21 @@
 use kernel_hal::KernelConfig;
 use rboot::BootInfo;
 
+/// The two halves of the progress bar have to agree on where the loader's range
+/// ends, and this is the one place that can see both constants. A mismatch would
+/// silently drop the loader's last marks -- the `ExitBootServices` pair, which is
+/// exactly where a real machine hangs.
+const _: () = assert!(kernel_hal::boot_marks::LOADER_SLOTS == rboot::LOADER_MARKS);
+
 #[unsafe(no_mangle)]
 pub extern "C" fn _start(boot_info: &'static BootInfo) -> ! {
+    // The loader half of the boot timeline, first thing: the array lives in
+    // `BootInfo`, on a heap the firmware still owns at this point, and rboot
+    // measured things no kernel mark can see -- reading the kernel ELF and the
+    // whole initramfs through the firmware's FAT driver. Raw TSC readings;
+    // `primary_main` names the frequency to divide them by once it has one worth
+    // trusting. See `kernel_hal::boot_marks`.
+    kernel_hal::boot_marks::set_loader_marks(&boot_info.loader_marks);
     let info = boot_info.graphic_info;
     // Paint 52% *before* heap / klog / PIT calibration. rboot leaves the bar
     // at 51%; a stall in `memory::init` used to look like a failed jump.
