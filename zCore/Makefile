@@ -14,6 +14,7 @@ LINUX ?= 1
 MOCK ?=
 LIBOS ?=
 MEM_DEBUG ?=
+ULEAK_SCAN ?=
 TEST ?=
 GRAPHIC ?=
 DISK ?=
@@ -307,6 +308,24 @@ ifeq ($(MEM_DEBUG), 1)
     $(error MEM_DEBUG=1 only exists for ARCH=x86_64 (the probes live in zCore/src/memory_x86_64.rs))
   endif
   features += mem-debug
+endif
+
+# The user-pointer leak scanner, in a switch of its own.
+#
+# `uleak-scan` watches the return path of every data-returning syscall for a
+# kernel physmap pointer (`0xffff8000_...`) on its way to userspace -- the
+# original cause of apk dying with `rbp` in kernel space. Its own doc comment
+# in `kernel-hal/src/common/user.rs` says "re-enable the feature to chase a
+# regression", and until now there was no way to: no switch here, no job
+# building it. A tool you are told to turn on and cannot is not a tool.
+#
+# Not under LIBOS=1: the scan is `cfg(not(feature = "libos"))`, so asking for
+# it there would build a kernel with no scanner that looks like it has one.
+ifeq ($(ULEAK_SCAN), 1)
+  ifeq ($(LIBOS), 1)
+    $(error ULEAK_SCAN=1 does not exist in LIBOS mode (the scan is cfg(not(libos)), see kernel-hal/src/common/user.rs))
+  endif
+  features += uleak-scan
 endif
 
 ifeq ($(TEST), 1)

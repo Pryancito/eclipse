@@ -10,6 +10,8 @@ mod arch;
 mod build;
 mod commands;
 mod errors;
+#[cfg(test)]
+mod features;
 mod linux;
 mod variant;
 
