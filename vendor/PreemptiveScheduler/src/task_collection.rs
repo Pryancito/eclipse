@@ -994,6 +994,58 @@ mod key_tests {
         // field has to be exactly as wide as a page is long.
         assert_eq!(1 << PAGE_INDEX_SHIFT, crate::waker_page::WAKER_PAGE_SIZE);
     }
+
+    /// Rows for the three functions this module tests.
+    ///
+    /// Nothing here allocates, locks or touches memory it did not already
+    /// have in a register, so the figures are single nanoseconds and the only
+    /// way to read them is against each other. These run in the test profile,
+    /// so `pack_key`'s three `debug_assert!`s are *in* its figure and are not
+    /// in the kernel's.
+    #[cfg(test)]
+    mod benches {
+        use super::*;
+        use test::{black_box, Bencher};
+
+        // No control row. The one that stood here measured 1.24 ns and every
+        // row below it is cheaper -- `strip_the_priority_field` at 0.29 --
+        // because a control that must not be inlined pays a `call` and a `ret`
+        // and these three shifts-and-masks do not even survive as a call. A
+        // floor above the rows it bounds measures the floor, so it is gone;
+        // the same happened in the crate's other three bench modules, and
+        // `crate::waker_page::waker_page_tests::benches` carries the long form
+        // of the argument.
+
+        #[bench]
+        fn pack_a_key(b: &mut Bencher) {
+            b.iter(|| pack_key(black_box(DEFAULT_PRIORITY), black_box(1_000), black_box(17)));
+        }
+
+        #[bench]
+        fn unpack_a_key(b: &mut Bencher) {
+            let key = pack_key(DEFAULT_PRIORITY, 1_000, 17);
+            b.iter(|| unpack_key(black_box(key)));
+        }
+
+        #[bench]
+        fn strip_the_priority_field(b: &mut Bencher) {
+            let key = pack_key(DEFAULT_PRIORITY, 1_000, 17);
+            b.iter(|| unmask_priority(black_box(key)));
+        }
+
+        /// What the generator does per handout: pack the slot it chose, then
+        /// mask the priority off again for the slab lookup.
+        #[bench]
+        fn pack_then_strip_as_the_generator_does(b: &mut Bencher) {
+            b.iter(|| {
+                unmask_priority(pack_key(
+                    black_box(DEFAULT_PRIORITY),
+                    black_box(1_000),
+                    black_box(17),
+                ))
+            });
+        }
+    }
 }
 
 /// One CPU's run queue: what it will hand its executor, and what it refuses to.
@@ -2079,5 +2131,238 @@ mod collection_tests {
         assert_eq!(tc.debug_pending(), (2, 1, 0, 1), "the borrow went unseen");
         waker.drop_by_ref();
         assert_eq!(tc.debug_pending(), (2, 1, 1, 1));
+    }
+
+    /// Rows for the run queue: what a spawn costs, what a handout costs, and
+    /// what the three load figures cost to read.
+    ///
+    /// The load figures are the ones worth measuring. `has_ready` runs on
+    /// every trip into `hlt`, `ready_num`/`ready_num_for` run on every victim
+    /// on every idle steal pass, and `placement_load` runs per spawn and per
+    /// load-average sample — so each of them is read here at two queue depths,
+    /// because all four walk `pages` and `pages` only ever grows: a
+    /// `FutureCollection` that once held a thousand tasks keeps its sixteen
+    /// pages after they have all retired (`FutureCollection::remove` frees the
+    /// slab entry, never a page). The depth these rows bound is a high-water
+    /// mark, not a current task count.
+    ///
+    /// Same four caveats as `waker_page::waker_page_tests::benches`:
+    /// uncontended host atomics, no IPI, a coalesced `NEED_RESCHED` after the
+    /// first iteration, and `debug_assert!`s that the kernel does not pay.
+    #[cfg(test)]
+    mod benches {
+        use super::*;
+        use test::{black_box, Bencher};
+
+        /// A queue holding `n` runnable tasks, which is `n / 64` rounded up
+        /// waker pages for the scans to walk. Every task is fresh, so every
+        /// slot is published in the urgent lane.
+        fn queue_of(n: usize) -> Arc<TaskCollection> {
+            let tc = TaskCollection::new(0);
+            for _ in 0..n {
+                tc.add_task(pending(), None);
+            }
+            tc
+        }
+
+        /// The same, with every task pinned to CPU 1 — so `affine` is not
+        /// zero, the bitmap shortcut is off, and the scans ask the slab about
+        /// each runnable bit in turn.
+        fn queue_of_pinned(n: usize) -> Arc<TaskCollection> {
+            let tc = TaskCollection::new(0);
+            for _ in 0..n {
+                tc.add_task(pending(), Some(Arc::new(AtomicU64::new(0b10))));
+            }
+            tc
+        }
+
+        // No control row: see the note in
+        // `crate::waker_page::waker_page_tests::benches`. The one that stood
+        // here measured 0.64 ns and `read_the_raw_task_count` -- a single
+        // relaxed load -- came out at 0.29, so the floor was above the row it
+        // bounded. The rows below are read against each other and against the
+        // two ends named in that note.
+
+        // ── birth and death ────────────────────────────────────────────────
+
+        /// One CPU's whole run queue: 32 priority queues built, each with its
+        /// own lock and slab, of which exactly one is ever used. Paid once per
+        /// CPU at boot.
+        #[bench]
+        fn build_a_run_queue(b: &mut Bencher) {
+            b.iter(|| black_box(TaskCollection::new(0)));
+        }
+
+        /// A spawn and the retirement that undoes it. They are measured as a
+        /// pair because a row that only spawned would grow the slab without
+        /// bound across the harness's millions of iterations; the pair is also
+        /// what a short-lived kernel thread actually costs.
+        #[bench]
+        fn spawn_a_task_and_retire_it(b: &mut Bencher) {
+            let tc = TaskCollection::new(0);
+            b.iter(|| {
+                let key = tc.add_task(pending(), None);
+                tc.remove_task(black_box(key));
+            });
+        }
+
+        /// The same with an affinity mask, which is one more `Arc` and the
+        /// `affine` counter that turns the bitmap shortcuts off for the whole
+        /// queue.
+        #[bench]
+        fn spawn_a_pinned_task_and_retire_it(b: &mut Bencher) {
+            let tc = TaskCollection::new(0);
+            b.iter(|| {
+                let key = tc.add_task(pending(), Some(Arc::new(AtomicU64::new(0b11))));
+                tc.remove_task(black_box(key));
+            });
+        }
+
+        // ── handing a task out ─────────────────────────────────────────────
+
+        /// The scheduler's inner loop: take the next task under both locks and
+        /// hand it back as a voluntary yield, which is what a CPU does once
+        /// per timeslice per task.
+        #[bench]
+        fn hand_out_a_task_and_take_it_back(b: &mut Bencher) {
+            let _g = crate::runtime::resched_test_lock();
+            let tc = queue_of(1);
+            b.iter(|| {
+                let (_key, _task, waker) = tc.take_task().unwrap();
+                cede(&waker);
+            });
+        }
+
+        /// The same handout to a thief from another CPU: `try_lock` on both,
+        /// and the borrow released without a self-wake.
+        #[bench]
+        fn hand_out_a_task_to_a_thief(b: &mut Bencher) {
+            let _g = crate::runtime::resched_test_lock();
+            let tc = queue_of(1);
+            b.iter(|| {
+                let (_key, _task, waker) = tc.try_take_task().unwrap();
+                waker.wake_by_ref();
+                waker.mark_borrowed(false);
+            });
+        }
+
+        /// Asking an empty queue, which is what the idle path and every thief
+        /// that picks a quiet victim get. One page to walk.
+        #[bench]
+        fn ask_an_empty_queue_for_work(b: &mut Bencher) {
+            let tc = queue_of(1);
+            drain(&tc);
+            b.iter(|| black_box(tc.take_task()).is_none());
+        }
+
+        /// The same refusal on a queue that once held a thousand tasks: the
+        /// pages are still there and the generator still walks them.
+        #[bench]
+        fn ask_an_empty_queue_that_once_held_a_thousand(b: &mut Bencher) {
+            let tc = queue_of(1024);
+            drain(&tc);
+            b.iter(|| black_box(tc.take_task()).is_none());
+        }
+
+        // ── the pre-halt recheck ───────────────────────────────────────────
+
+        #[bench]
+        fn pre_halt_recheck_one_page(b: &mut Bencher) {
+            let tc = queue_of(64);
+            b.iter(|| tc.has_ready());
+        }
+
+        #[bench]
+        fn pre_halt_recheck_sixteen_pages(b: &mut Bencher) {
+            let tc = queue_of(1024);
+            b.iter(|| tc.has_ready());
+        }
+
+        /// The worst case the `affine` shortcut exists for: every task on the
+        /// queue is pinned to another CPU, so the walk visits all 1024
+        /// runnable bits, asks the slab about each one, and answers "nothing
+        /// for you" — on the way into `hlt`.
+        #[bench]
+        fn pre_halt_recheck_with_a_thousand_tasks_pinned_elsewhere(b: &mut Bencher) {
+            let tc = queue_of_pinned(1024);
+            b.iter(|| tc.has_ready());
+        }
+
+        // ── the three load figures ─────────────────────────────────────────
+
+        #[bench]
+        fn count_runnable_one_page(b: &mut Bencher) {
+            let tc = queue_of(64);
+            b.iter(|| tc.ready_num());
+        }
+
+        #[bench]
+        fn count_runnable_sixteen_pages(b: &mut Bencher) {
+            let tc = queue_of(1024);
+            b.iter(|| tc.ready_num());
+        }
+
+        #[bench]
+        fn count_runnable_for_a_thief_one_page(b: &mut Bencher) {
+            let tc = queue_of(64);
+            b.iter(|| tc.ready_num_for(black_box(0)));
+        }
+
+        #[bench]
+        fn count_runnable_for_a_thief_sixteen_pages(b: &mut Bencher) {
+            let tc = queue_of(1024);
+            b.iter(|| tc.ready_num_for(black_box(0)));
+        }
+
+        /// What the steal scan would pay per victim per pass without the
+        /// `affine == 0` shortcut: a `PinSlab` lookup and an `allowed_on` for
+        /// every runnable bit, and no early exit, because this figure is a
+        /// count and not a question.
+        #[bench]
+        fn count_runnable_for_a_thief_with_a_thousand_pinned_tasks(b: &mut Bencher) {
+            let tc = queue_of_pinned(1024);
+            b.iter(|| tc.ready_num_for(black_box(0)));
+        }
+
+        #[bench]
+        fn read_the_placement_load_one_page(b: &mut Bencher) {
+            let tc = queue_of(64);
+            b.iter(|| tc.placement_load());
+        }
+
+        #[bench]
+        fn read_the_placement_load_sixteen_pages(b: &mut Bencher) {
+            let tc = queue_of(1024);
+            b.iter(|| tc.placement_load());
+        }
+
+        /// The figure placement used to steer by, and the reason the one above
+        /// exists: a relaxed load of one counter, whatever the queue holds.
+        #[bench]
+        fn read_the_raw_task_count(b: &mut Bencher) {
+            let tc = queue_of(1024);
+            b.iter(|| tc.task_num());
+        }
+
+        // ── diagnostics ────────────────────────────────────────────────────
+
+        #[bench]
+        fn summarise_the_queue_for_the_hang_detector_one_page(b: &mut Bencher) {
+            let tc = queue_of(64);
+            b.iter(|| tc.debug_pending());
+        }
+
+        /// Read this against the row above and against
+        /// `count_runnable_sixteen_pages`: unlike the three load figures,
+        /// `debug_pending` walks and locks all 32 priority queues, of which 31
+        /// are empty by construction (`priority_add_task` asserts that every
+        /// task lands on `DEFAULT_PRIORITY`). It is a hang-detector path, so
+        /// that is a choice and not a bug — but the 31 locks are what the
+        /// difference is.
+        #[bench]
+        fn summarise_the_queue_for_the_hang_detector_sixteen_pages(b: &mut Bencher) {
+            let tc = queue_of(1024);
+            b.iter(|| tc.debug_pending());
+        }
     }
 }
