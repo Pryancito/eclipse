@@ -13,6 +13,8 @@ mod errors;
 #[cfg(test)]
 mod features;
 mod linux;
+#[cfg(test)]
+mod tamano;
 mod variant;
 
 use arch::{Arch, ArchArg};
