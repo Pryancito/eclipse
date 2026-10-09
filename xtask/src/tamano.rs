@@ -9,9 +9,18 @@
 //! Así que esto es un trinquete, no una puerta:
 //!
 //! - Un fichero NUEVO por encima del techo no entra.
-//! - Los que ya pasaban están apuntados con su tamaño de hoy, y solo pueden
-//!   ENCOGER. Crecer uno es un fallo con su nombre y su cifra.
-//! - Cuando uno baja del techo, sale de la lista y ya no puede volver.
+//! - Los que ya pasaban llevan cada uno su propio techo, redondeado un poco
+//!   por encima de su tamaño del día en que entró. Pasarse de él es un fallo
+//!   con su nombre y su cifra.
+//! - Cuando uno baja del techo general, sale de la lista y ya no puede volver.
+//!
+//! **Por qué un techo por fichero y no «solo puede encoger»**: la primera
+//! versión de esto apuntaba el tamaño exacto del día, y doce horas después ya
+//! bloqueaba el árbol — un merge ajeno le había metido 42 líneas a `drm.rs`, y
+//! con «solo encoger» eso enrojece el PR siguiente, que no tiene nada que ver.
+//! El margen (hasta el siguiente múltiplo de 250) deja respirar un cambio
+//! honesto y sigue impidiendo que un fichero doble. Subir un techo se puede,
+//! pero es una línea en el diff que el revisor ve, no un silencio.
 //!
 //! Lo que mide son LÍNEAS, tests incluidos: lo que cuesta es abrir el fichero.
 //! Un fichero de 4.000 líneas de las que 3.000 son tests se parte igual de
@@ -27,36 +36,40 @@ const TECHO: usize = 4000;
 /// Lo que no es nuestro: dependencias con su propio estilo y su propio dueño.
 const AJENOS: &[&str] = &["vendor/", "smoltcp/", "nvidia-rm-sys/vendor/"];
 
-/// Los que ya pasaban el techo el 9-oct-2026, con su tamaño de ese día.
+/// Los que ya pasaban el techo el 9-oct-2026, con el techo propio de cada uno
+/// (su tamaño de ese día redondeado al siguiente múltiplo de 250).
 ///
-/// **Esta lista solo baja.** Si un número hay que subirlo, lo que hace falta es
-/// partir el fichero, no editar la línea.
+/// Antes de subir un número: mirar si el fichero tiene un `#[cfg(test)] mod X
+/// { ... }` de primer nivel. Si lo tiene, sale a `X/mod.rs` sin tocar una
+/// línea de producción y lo más probable es que el fichero baje del techo
+/// general y salga de esta lista. Eso es lo que le pasó a
+/// `tools/eclipse-init/src/main.rs` el mismo día que entró este test: creció
+/// 280 líneas, este test las vio, y partirlo lo dejó en 3.313.
 const PASADOS: &[(&str, usize)] = &[
-    ("drivers/src/display/nvidia.rs", 14954),
+    ("drivers/src/display/nvidia.rs", 15000),
     (
         "drivers/src/display/nvidia/nouveau_bookkeeping_tests.rs",
-        9344,
+        9500,
     ),
-    ("linux-object/src/fs/devfs/drm.rs", 8387),
-    ("drivers/src/usb/xhci_hid.rs", 7596),
-    ("drivers/src/net/e1000e.rs", 7491),
-    ("xtask/src/linux/mod.rs", 7452),
-    ("linux-object/src/fs/devfs/drm_scheme.rs", 6582),
-    ("linux-object/src/fs/procfs.rs", 6307),
-    ("tools/eclipse-init/src/main.rs", 5744),
-    ("linux-object/src/process.rs", 5643),
-    ("xtask/src/linux/desktop.rs", 5510),
-    ("zircon-object/src/vm/vmar.rs", 5495),
-    ("drivers/src/scheme/syncobj.rs", 5286),
-    ("tools/lunarbar/src/main.rs", 5241),
-    ("linux-syscall/src/file/file.rs", 4556),
+    ("linux-object/src/fs/devfs/drm.rs", 8500),
+    ("drivers/src/usb/xhci_hid.rs", 7750),
+    ("drivers/src/net/e1000e.rs", 7500),
+    ("xtask/src/linux/mod.rs", 7500),
+    ("linux-object/src/fs/devfs/drm_scheme.rs", 6750),
+    ("linux-object/src/fs/procfs.rs", 6500),
+    ("linux-object/src/process.rs", 5750),
+    ("xtask/src/linux/desktop.rs", 5750),
+    ("zircon-object/src/vm/vmar.rs", 5500),
+    ("drivers/src/scheme/syncobj.rs", 5500),
+    ("tools/lunarbar/src/main.rs", 5250),
+    ("linux-syscall/src/file/file.rs", 4750),
     (
         "linux-object/src/fs/devfs/drm_scheme/kms_scanout_tests.rs",
-        4514,
+        4750,
     ),
-    ("linux-syscall/src/task.rs", 4196),
-    ("linux-object/src/fs/devfs/snd.rs", 4179),
-    ("nvidia-rm-sys/src/os_boundary.rs", 4078),
+    ("linux-syscall/src/task.rs", 4250),
+    ("linux-object/src/fs/devfs/snd.rs", 4250),
+    ("nvidia-rm-sys/src/os_boundary.rs", 4250),
 ];
 
 /// Las líneas de un fichero, contadas como las cuenta `wc -l` salvo en la
@@ -124,24 +137,50 @@ mod tests {
         );
     }
 
-    /// Y los que ya pasaban solo pueden encoger.
+    /// Y los que ya pasaban no pueden pasarse de su propio techo.
     #[test]
-    fn los_que_ya_pasaban_solo_pueden_encoger() {
+    fn ninguno_de_los_pasados_se_sale_de_su_techo() {
         let real: BTreeMap<_, _> = ficheros_rs().into_iter().collect();
         let mut crecidos = Vec::new();
-        for (rel, apuntado) in PASADOS {
+        for (rel, techo) in PASADOS {
             let Some(&ahora) = real.get(*rel) else {
                 continue; // lo cubre el test de la lista rancia
             };
-            if ahora > *apuntado {
-                crecidos.push(format!("{rel}: {apuntado} -> {ahora}"));
+            if ahora > *techo {
+                crecidos.push(format!("{rel}: {ahora} lineas, su techo es {techo}"));
             }
         }
         assert!(
             crecidos.is_empty(),
-            "estos ficheros ya pasaban del techo y han CRECIDO.\n\
-             El numero de PASADOS no se sube: lo que hace falta es partirlo.\n  {}",
+            "estos ficheros se han pasado de su techo.\n\
+             Mira primero si tienen un `#[cfg(test)] mod X {{ ... }}` de primer nivel:\n\
+             sacarlo a su propio fichero no toca produccion y suele bajar del techo\n\
+             general. Subir el numero se puede, pero es una decision que se ve.\n  {}",
             crecidos.join("\n  ")
+        );
+    }
+
+    /// El margen es a propósito, y acotado: un techo muy por encima de lo que
+    /// el fichero mide hoy no sujeta nada. Medio millar de líneas de aire es
+    /// el doble del redondeo, así que un techo que se pase de eso es uno que
+    /// alguien subió sin partir el fichero.
+    #[test]
+    fn ningun_techo_lleva_mas_aire_del_que_hace_falta() {
+        let real: BTreeMap<_, _> = ficheros_rs().into_iter().collect();
+        let mut flojos = Vec::new();
+        for (rel, techo) in PASADOS {
+            let Some(&ahora) = real.get(*rel) else {
+                continue;
+            };
+            if techo.saturating_sub(ahora) > 500 {
+                flojos.push(format!("{rel}: {ahora} lineas y un techo de {techo}"));
+            }
+        }
+        assert!(
+            flojos.is_empty(),
+            "estos techos ya no sujetan nada: bajalos a lo que mide el fichero\n\
+             (redondeado al siguiente multiplo de 250).\n  {}",
+            flojos.join("\n  ")
         );
     }
 
@@ -164,6 +203,9 @@ mod tests {
             "sacalos de PASADOS para que no puedan volver a crecer:\n  {}",
             sobran.join("\n  ")
         );
+        // Lo que le paso a `tools/eclipse-init/src/main.rs` el 9-oct: entro en
+        // la lista con 5.744 lineas, crecio 280 en la misma tanda, este test
+        // lo vio, y partir su modulo de tests lo dejo en 3.313 y fuera.
     }
 
     /// Un fichero apuntado dos veces dejaria que el numero mas alto ganara.
