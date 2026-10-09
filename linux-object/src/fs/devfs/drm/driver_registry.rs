@@ -75,7 +75,20 @@ pub fn get_display_driver() -> Option<Arc<dyn DrmScheme>> {
 /// already uses `:` as its token separator, so a PCI BDF with colons cannot
 /// be a single token). Example: `nvidia.compute=65.00.0`.
 fn parse_nvidia_compute_bdf() -> Option<(u8, u8, u8)> {
-    let cmdline = kernel_hal::boot::cmdline();
+    parse_compute_bdf_in(kernel_hal::boot::cmdline().as_str())
+}
+
+/// [`parse_nvidia_compute_bdf`] against a given cmdline, which is the only way
+/// to test it: the real one comes from the bootloader.
+///
+/// The function field is optional (a GPU is function 0), but **an unparsable
+/// one is a rejection, not a default**. Falling back to 0 on anything that did
+/// not parse meant `nvidia.compute=65.00.zz` pinned compute to `65.00.0`
+/// without a word, which is a pin the user never asked for -- and a pin is
+/// exactly the knob someone reaches for when the automatic choice already went
+/// wrong, so it has to either mean what it says or say nothing. Extra
+/// dot-separated segments are a rejection for the same reason.
+fn parse_compute_bdf_in(cmdline: &str) -> Option<(u8, u8, u8)> {
     for tok in cmdline.split([':', ' ', '\t', '\n']) {
         let Some(rest) = tok.strip_prefix("nvidia.compute=") else {
             continue;
@@ -86,14 +99,20 @@ fn parse_nvidia_compute_bdf() -> Option<(u8, u8, u8)> {
         let mut parts = rest.split('.');
         let bus = u8::from_str_radix(parts.next()?, 16).ok()?;
         let dev = u8::from_str_radix(parts.next()?, 16).ok()?;
-        let func = parts
-            .next()
-            .and_then(|p| u8::from_str_radix(p, 16).ok())
-            .unwrap_or(0);
+        let func = match parts.next() {
+            Some(p) => u8::from_str_radix(p, 16).ok()?,
+            None => 0,
+        };
+        if parts.next().is_some() {
+            return None;
+        }
         return Some((bus, dev, func));
     }
     None
 }
+
+#[cfg(test)]
+mod compute_bdf_tests;
 
 /// The NVIDIA GPU that owns compute (SAXPY, NVK EXEC, CE-present): either
 /// the `nvidia.compute=BB.DD.F` pin, or the first driver with
