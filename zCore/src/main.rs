@@ -886,7 +886,13 @@ fn primary_main(config: kernel_hal::KernelConfig) {
             // divide them by now, not at `_start`, where the only figure
             // available was a CPUID guess. By here the device probe has checked
             // one against the ACPI PM timer.
-            #[cfg(target_arch = "x86_64")]
+            // `not(libos)` as well as the architecture: `kernel_hal::cpu` is
+            // `bare/arch/x86_64/cpu.rs` on baremetal, which has `tsc_hz()`,
+            // but `libos/cpu.rs` under the `libos` feature, which does not --
+            // and a libos build on an x86_64 host satisfies `target_arch`
+            // alone, so the guard without this broke `cargo build --package
+            // zcore --features "linux libos"` outright.
+            #[cfg(all(target_arch = "x86_64", not(feature = "libos")))]
             kernel_hal::boot_marks::set_loader_tsc_hz(kernel_hal::cpu::tsc_hz());
             for line in kernel_hal::boot_marks::render().lines() {
                 // Both sinks, deliberately. `klog_info!` writes to the dmesg
