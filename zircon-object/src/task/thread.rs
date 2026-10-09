@@ -1,5 +1,9 @@
 mod thread_state;
 
+/// Lo que un hilo de calculo paga en cada tick; ver las notas del modulo.
+#[cfg(test)]
+mod sched_benches;
+
 pub use self::thread_state::ThreadStateKind;
 
 use alloc::{boxed::Box, sync::Arc};
