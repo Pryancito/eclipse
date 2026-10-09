@@ -1725,9 +1725,8 @@ impl DrmDev {
                 // implemented as a busy 16.7 ms spin, and calling it on every
                 // WAIT_VBLANK ioctl causes severe CPU starvation on a
                 // cooperative async runtime — making the system appear frozen.
-                // The card to ask is the one that drives the panel, not
-                // `drivers.first()`: on a two-card box that is the compute
-                // card, which has no raster and so no vblank to wait on.
+                // The panel's card, not `drivers.first()` -- which on a
+                // two-card box has no raster (see `drm::get_display_driver`).
                 if !drm::software_kms_active() {
                     if let Some(driver) = drm::get_display_driver() {
                         if driver.has_hardware_kms() {
@@ -6044,55 +6043,8 @@ pub(crate) fn is_core_drm_nr(nr: u32) -> bool {
     !(DRM_COMMAND_BASE..DRM_COMMAND_END).contains(&nr)
 }
 
-const DRM_COMMAND_BASE: u32 = 0x40;
-const DRM_COMMAND_END: u32 = 0xA0;
-
-const IOC_WRITE_DIR: u32 = 1 << 30;
-const IOC_READ_DIR: u32 = 2 << 30;
-
-const fn ioc_size(cmd: u32) -> usize {
-    ((cmd >> 16) & 0x3fff) as usize
-}
-
-/// The byte counts `drm_ioctl()` derives for one call: what to copy in from the
-/// caller, what to copy back, and how big the kernel-side struct must be.
-#[derive(Debug, PartialEq, Eq)]
-struct IoctlSizes {
-    in_size: usize,
-    out_size: usize,
-    ksize: usize,
-}
-
-/// `drm_ioctl()`'s size arithmetic, verbatim:
-///
-/// ```text
-/// in_size = out_size = _IOC_SIZE(cmd);
-/// if ((cmd & ioctl->cmd & IOC_IN)  == 0) in_size  = 0;
-/// if ((cmd & ioctl->cmd & IOC_OUT) == 0) out_size = 0;
-/// ksize = max(max(in_size, out_size), drv_size);
-/// ```
-///
-/// Direction is INTERSECTED with the handler's own, which is what stops a
-/// caller from encoding `_IOC_READ` on a write-only ioctl to have the kernel
-/// copy a struct back that it was never going to fill.
-fn reconcile_sizes(cmd: u32, canon: u32) -> IoctlSizes {
-    let user_size = ioc_size(cmd);
-    let in_size = if cmd & canon & IOC_WRITE_DIR != 0 {
-        user_size
-    } else {
-        0
-    };
-    let out_size = if cmd & canon & IOC_READ_DIR != 0 {
-        user_size
-    } else {
-        0
-    };
-    IoctlSizes {
-        in_size,
-        out_size,
-        ksize: core::cmp::max(core::cmp::max(in_size, out_size), ioc_size(canon)),
-    }
-}
+mod ioctl_sizes;
+use ioctl_sizes::*;
 
 /// `drm_ioctl()`: reconcile the size the client encoded with the size we parse,
 /// then dispatch on the canonical command.

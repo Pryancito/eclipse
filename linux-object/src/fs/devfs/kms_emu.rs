@@ -425,6 +425,11 @@ pub(crate) struct EmuGpu {
     compute: bool,
     /// The PCI address this GPU reports, which is what the node order sorts on.
     bdf: Option<(u32, u8, u8, u8)>,
+    /// The panel limits this GPU reports from `get_caps`. Two cards really do
+    /// report different ones -- a headless card's display engine is not the
+    /// one with the monitor on it -- and without a difference there is no way
+    /// to tell which card the core asked.
+    caps_max: (u32, u32),
     /// Whether this GPU serves the nouveau uAPI, and whether its RM is up.
     /// Live, because a deferred console bring-up really does flip the second
     /// one under a client.
@@ -450,6 +455,7 @@ impl EmuGpu {
             console: false,
             compute: false,
             bdf: None,
+            caps_max: (4096, 4096),
             nouveau_capable: false,
             nouveau_ready: AtomicBool::new(false),
             calls: Mutex::new(GpuCalls::default()),
@@ -489,6 +495,13 @@ impl EmuGpu {
     /// that is not a valid EDID is the point: the core has to refuse it.
     pub(crate) fn with_edid(mut self, block: [u8; 128]) -> EmuGpu {
         self.edid = Some(block);
+        self
+    }
+
+    /// The panel limits this GPU reports, so a test can tell which card the
+    /// core asked for its capabilities.
+    pub(crate) fn with_caps(mut self, max_width: u32, max_height: u32) -> EmuGpu {
+        self.caps_max = (max_width, max_height);
         self
     }
 
@@ -551,8 +564,8 @@ impl DrmScheme for EmuGpu {
         DrmCaps {
             has_3d: false,
             has_cursor: true,
-            max_width: 4096,
-            max_height: 4096,
+            max_width: self.caps_max.0,
+            max_height: self.caps_max.1,
         }
     }
 
