@@ -152,7 +152,7 @@ pub(crate) fn sym_is_diagnosing(sym: &str) -> bool {
     // The zCore kernel handler's own page-fault entry, whichever way `ksyms`
     // folded the generic: the impl type or the trait it implements.
     if sym.contains("handle_page_fault")
-        && (sym.contains("zcore::handler") || sym.contains("KernelHandler"))
+        && (sym.contains("zcore::handler") || sym.contains("kernel_handler::KernelHandler"))
     {
         return true;
     }
@@ -580,7 +580,7 @@ fn dl_paint() {
     // the verdict must not depend on which holders fit on the screen. With a
     // three-cpu cycle, or an earlier holder still in its slot, the one that
     // faulted can sit third in this list.
-    let mut diagnosing_cpu = usize::MAX;
+    let mut diagnosing_cpu: Option<usize> = None;
     for &c in holder_cpus.iter().take(holder_n) {
         if c == reporting {
             continue;
@@ -589,7 +589,7 @@ fn dl_paint() {
         if rip != 0 {
             if let Some((sym, _)) = kernel_hal::ksyms::lookup(rip) {
                 if sym_is_diagnosing(sym) {
-                    diagnosing_cpu = c;
+                    diagnosing_cpu = Some(c);
                     break;
                 }
             }
@@ -650,7 +650,7 @@ fn dl_paint() {
              that never pumps; symbolize the non-acker nmi_rip above to name it. \
              Not AB-BA."
         );
-    } else if diagnosing_cpu != usize::MAX {
+    } else if let Some(faulted) = diagnosing_cpu {
         // The case the either/or below cannot call, and the one the captures
         // keep showing: a HOLDER sitting in the kernel's own fault path, i.e.
         // it faulted with the lock held and will never give it back. The
@@ -666,7 +666,7 @@ fn dl_paint() {
              is in the kernel's own fault/panic path), so that lock is never given \
              back. Not AB-BA: this report is a CONSEQUENCE of the fault printed above \
              it, not a second bug. Diagnose that fault.",
-            diagnosing_cpu
+            faulted
         );
     } else {
         // NOT "therefore AB-BA". Ruling out shootdown starvation leaves more
@@ -1389,6 +1389,11 @@ mod tests {
         ));
         assert!(sym_is_diagnosing(
             "<T as kernel_hal::kernel_handler::KernelHandler>::handle_page_fault"
+        ));
+        // And the bare type name is not enough on its own: the pairing is what
+        // separates the zCore handler from a handler of somebody else's.
+        assert!(!sym_is_diagnosing(
+            "<SomeOtherKernelHandler>::handle_page_fault"
         ));
         assert!(sym_is_diagnosing("zcore::handler::print_fault_backtrace"));
         assert!(sym_is_diagnosing("zcore::oops::try_contain"));
