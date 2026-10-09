@@ -231,8 +231,22 @@ mod tests {
         std::thread::spawn(move || {
             let _ = crate::serve(&p, false, false);
         });
+        // Waiting for the socket FILE is not waiting for the daemon: `bind`
+        // creates the file and `listen` comes after it, so a connect that lands
+        // in between gets ECONNREFUSED. That window made
+        // `the_handshake_gets_a_unique_name_from_a_real_bus` fail about one run
+        // in twelve, on the `connect` of its first line, with the daemon
+        // perfectly healthy. So probe with a real connection and only come back
+        // once one lands; the probe is dropped straight away, which is a peer
+        // that connects and goes without authenticating -- a case the daemon
+        // handles and these tests do not look at.
         let deadline = Instant::now() + TIMEOUT;
-        while !std::path::Path::new(&path).exists() {
+        loop {
+            if std::path::Path::new(&path).exists()
+                && std::os::unix::net::UnixStream::connect(&path).is_ok()
+            {
+                break;
+            }
             assert!(Instant::now() < deadline, "el demonio no llego a escuchar");
             std::thread::yield_now();
         }
