@@ -11,28 +11,53 @@ segundos y otra de diez milisegundos se leían igual.
 Este documento describe las dos medidas que ya existen. No propone recortes: un
 recorte se justifica con una de estas tablas delante, no al revés.
 
-## 1. La mitad del núcleo: `boot timeline`
+## 1. Las dos mitades de la barra, en una tabla
 
-El arranque ya recorría una barra de progreso del 52 % al 100 %
+La barra de progreso del arranque ya iba de punta a punta: **rboot pinta del 0 %
+al 51 %** (`rboot::progress::bar`) y **el núcleo del 52 % al 100 %**
 (`kernel_hal::console::early_progress_bar`), con marcas al final de cada tramo
 caro. Esas marcas se dibujaban en el framebuffer y se olvidaban; ahora también
-se **fechan** (`kernel-hal/src/common/boot_marks.rs`). No hay ni una llamada
+se **fechan**, y las dos mitades salen en la misma tabla. No hay ni una llamada
 nueva: el coste es un `store` relajado por marca, y en un arranque entero hay
-menos de veinte.
+menos de treinta.
+
+Las dos mitades no pueden medir igual, porque no tienen el mismo reloj:
+
+- **rboot guarda `rdtsc` en crudo** (`rboot/src/marks.rs`), sin calibrar nada. El
+  único reloj que el firmware ofrece calibrado es `BootServices::stall`, y
+  llamarlo **gastaría** 10-20 ms del arranque para poder medirlo: medir no puede
+  costar lo que se intenta recortar. Los contadores viajan al núcleo en
+  `BootInfo::loader_marks`, que crece por la cola de la estructura (la
+  convención de ABI de este `BootInfo`), y el núcleo los convierte a nanosegundos
+  con `kernel_hal::cpu::tsc_hz()`.
+- **El núcleo fecha con `timer_now()`**, ya en nanosegundos.
 
 La tabla sale por consola al final del arranque, cuando `init(1)` ya corre, y
 queda además al final de `/proc/perf/kernel`, que es donde uno se pregunta por el
 arranque en una máquina que ya está encendida:
 
 ```
-boot timeline — 16 marks, 1832.441ms to the last one
+boot timeline — 26 marks, 8127.226ms to the last one
   gap = time spent in the stretch ENDING at that mark;
   marks below 81% are timed with the provisional TSC frequency.
-   mark        at       gap  stretch
-    87%  912.330ms  402.118ms  PCI scan
-    91%  1402.11ms  310.882ms  root filesystem mounted
-   ...
+  before 0%: about 2777.288ms in the firmware, from processor reset to rboot
+  (the TSC counts from reset -- a warm reset or a hypervisor need not start it at 0).
+   mark          at         gap  stretch
+     0%     0.000ms     0.000ms  rboot: config read, GOP mode set, splash drawn
+    15%   190.897ms   190.041ms  rboot: kernel ELF read off the ESP
+    45%  3748.113ms  3557.216ms  rboot: initramfs read off the ESP
+    46%  7191.059ms  3442.945ms  rboot: memory map walked, kernel ELF and stack mapped
+    47%  7199.858ms     8.799ms  rboot: all of physical memory mapped
+    49%  7299.951ms    99.793ms  rboot: ExitBootServices
+    52%  7300.396ms     0.000ms  entered the kernel (arch entry)
+    87%  7838.000ms   454.012ms  PCI scan
+   100%  8127.226ms   154.744ms  init(1) running
 ```
+
+Esa línea `before 0%` es el **firmware antes de rboot**: el TSC de la marca 0 %
+cuenta desde el reinicio del procesador, así que su valor ya es lo que tardó la
+UEFI en llegar a nuestro cargador. Es la única parte del arranque que no es
+nuestra, y conviene saber cuánto vale antes de celebrar un recorte.
 
 La columna que se lee es **`gap`**: lo que costó el tramo que *termina* en esa
 marca. `at` está solo para alinear la fila con una hora de `dmesg`.
@@ -48,9 +73,12 @@ conclusión equivocada:
 - **Un `gap` es tiempo de reloj, no trabajo.** Un tramo que espera a un firmware
   o a un dispositivo se ve exactamente igual que uno que calcula.
 
-Añadir una marca nueva es una llamada a `early_progress_bar` y una línea en
-`boot_marks::label`. Una marca sin nombre sale como su número, no como un
-panic: nadie tiene que pasar por ese fichero antes de instrumentar algo.
+Añadir una marca nueva es una llamada a `early_progress_bar` (o a `step` en
+`rboot/src/main.rs`) y una línea en `boot_marks::label`. Una marca sin nombre
+sale como su número, no como un panic: nadie tiene que pasar por ese fichero
+antes de instrumentar algo. Las filas se ordenan **por hora, no por
+porcentaje**, porque una marca que se pinta dos veces o fuera de orden es
+precisamente lo que se quiere ver.
 
 ## 2. La mitad del init: `boot timeline` de `eclipse-init`
 
@@ -93,7 +121,85 @@ otro sitio.
   después pasa por las mismas puertas; grabar esas esperas haría crecer la lista
   mientras la máquina viva y reescribiría la historia de un arranque ya acabado.
 
-## 3. Lo que ya se sabía medir, y no es esto
+## 3. Lo que las medidas justificaron
+
+### El init: los tres ajustes a la vez
+
+Los tres `apply_*` del init — teclado, idioma, zona — eran 1,13 s de 1,46 s, y
+son independientes entre sí: ahora se lanzan a la vez. La cuenta, el cerrojo que
+lo hace seguro y la escotilla (`init.serial_setup`) están en
+`docs/README-init.md`.
+
+### rboot: el mapa físico en páginas de 2 MiB
+
+La primera tabla completa dio un resultado que cambia la pregunta: **de los 11,8 s
+del arranque medido, 10,9 s eran de rboot**, y todo lo que se había medido antes
+—núcleo e init juntos— era el 15 % del arranque. Dentro de rboot, el tramo que
+acababa en la marca 47 % costaba **6,98 s**, pero esa marca medía dos cosas a la
+vez, así que lo primero fue **partirla**: la 46 % cierra con el ELF y la pila del
+núcleo mapeados, la 47 % con la memoria física. Partida, el reparto sale **mitad y
+mitad**: unos 3,4 s el ELF y unos 3 s el mapa físico.
+
+Esos 3 s eran una sola función: `page_table::map_physical_memory` mapeaba
+**cada marco de 4 KiB** de la memoria física, uno por uno. Doce gigas son
+3.145.728 llamadas, cada una recorriendo cuatro niveles de tabla y pidiendo
+marcos nuevos al firmware. El coste es **lineal en la RAM de la máquina** y el
+suelo son 4 GB pase lo que pase (`max` sobre `0x1_0000_0000` en `main.rs`), así
+que una máquina grande arranca más despacio por tenerla.
+
+Los mismos doce gigas son **6.144 mapeos con páginas de 2 MiB**, y eso es lo que
+hace ahora: la marca 47 % pasó de **2800,8 ms a 8,8 ms**, 318 veces menos. Esas
+dos cifras son el mismo binario arrancado dos veces, con y sin la escotilla de
+abajo, que es la única comparación que vale: bajo TCG un mismo tramo varía un
+30 % de arranque a arranque, así que una cifra de hoy contra una de ayer no
+prueba nada. Lo que no es gratis, y es la razón de que la firma tenga un
+argumento nuevo:
+
+- `map_physical_memory(offset, max_addr, fine, m)` recibe en `fine` los rangos
+  **físicos que tienen que conservar hojas de 4 KiB**. Hay uno y no es opcional:
+  el núcleo repasa las entradas del framebuffer de arranque para ponerlas en
+  *write-combining* después del sondeo PCI (`pat::enable_framebuffer_wc`), y eso
+  **solo puede hacerlo sobre una hoja de 4 KiB** — una hoja grande la salta,
+  correctamente, pero deja el framebuffer en *write-back*, que en hardware de
+  verdad se midió como 300 FPS contra 2000 en `glxgears`. Cualquier bloque de
+  2 MiB que solape un rango de `fine` se mapea a la antigua.
+- Un bloque para el que el firmware (o una pasada anterior) ya tiene una entrada
+  también cae a 4 KiB, donde `map_page` tolera una entrada que ya apunta al mismo
+  marco. Así sobreviven los megas bajos que la UEFI mapeó ella misma.
+- `Machine::map_huge` **no tiene implementación por omisión a propósito**. Una
+  reserva silenciosa haría que los tests del anfitrión estuvieran contentos con
+  un cargador que hubiera vuelto a tardar siete segundos.
+- La escotilla es **`PHYSMAP4K`** en la línea de órdenes, que pasa un `fine` que
+  cubre todo: exactamente el comportamiento anterior. Como `justrun` reescribe
+  el `cmdline` del `rboot.conf` del ESP sin recompilar, `make justrun
+  KOPTS=PHYSMAP4K` da el A/B con un mismo binario.
+
+### Lo que queda sin tocar
+
+Los dos tramos gordos que quedan en rboot, por orden:
+
+- **El mapeo del ELF del núcleo**, la marca 46 %: 3,44 s. No es el `.text`: el
+  último `PT_LOAD` del núcleo tiene `FileSiz` 0 y **`MemSiz` 548 MiB**, y de
+  ellos 512 MiB son un solo objeto, `zcore::memory::init::HEAP` — el montón del
+  núcleo, reservado en `.bss`. rboot lo mapea marco a marco (133.936 marcos, un
+  `allocate_pages` del firmware por cada uno) y lo pone a cero entero, en cada
+  arranque. Hay dos recortes independientes ahí: pedirle al firmware trozos
+  grandes en vez de un marco por llamada, y mapear ese segmento con páginas de
+  2 MiB como ya se hace con el mapa físico. Que el montón sea de 512 MiB
+  estáticos es una decisión aparte, y no es nuestra.
+- **La lectura del initramfs**, la marca 45 %: 3,56 s para 75 MiB a través del
+  driver FAT del firmware, unos 21 MB/s.
+- **El sondeo PCI del núcleo**: 441 ms de 882 ms en QEMU, pero esa cifra es de un
+  PCI *emulado*. Antes de tocarlo hace falta la tabla de una máquina de verdad.
+
+Y la advertencia que vale para todas estas cifras: **son de QEMU con TCG**, sin
+aceleración. Una pasada que *mapea* (el mapa físico) es trabajo del MMU y se
+recorta igual en hardware; una pasada que *copia o pone a cero* mucha memoria
+(los 512 MiB del montón, los 75 MiB del initramfs) la emulación la castiga mucho
+más de lo que lo hará una máquina de verdad. Por eso el reparto de una máquina
+real puede ser distinto, y es la tabla que falta.
+
+## 4. Lo que ya se sabía medir, y no es esto
 
 - `BOOTTRACE=<comm>` en la línea de órdenes del núcleo graba **cada fichero que
   abre un proceso** (`linux-object/src/boot_trace.rs`) y lo publica en

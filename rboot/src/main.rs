@@ -36,8 +36,22 @@ use xmas_elf::ElfFile;
 
 mod idt;
 mod libc_shim;
+mod marks;
 
 const CONFIG_PATH: &str = "\\EFI\\Boot\\rboot.conf";
+
+/// Paint a boot progress mark and timestamp it.
+///
+/// Every mark in `efi_main` goes through here rather than calling
+/// [`progress::bar`] directly, so the loader half of the boot timeline costs no
+/// call site of its own and cannot drift out of step with the bar (see
+/// [`marks`]). The intermediate bars that `load_file_progress` paints while a
+/// file streams in deliberately do NOT come through here: they are fractions of
+/// one mark, not marks.
+fn step(gi: &GraphicInfo, progress: u32) {
+    marks::mark(progress);
+    progress::bar(gi.mode, gi.fb_addr, progress);
+}
 
 #[entry]
 fn efi_main(image: Handle, mut st: SystemTable<Boot>) -> Status {
@@ -79,9 +93,9 @@ fn efi_main(image: Handle, mut st: SystemTable<Boot>) -> Status {
     }
     // Draw splash logo immediately after GOP init (this also clears screen to white).
     logo::draw_centered(graphic_info.mode, graphic_info.fb_addr);
-    progress::bar(graphic_info.mode, graphic_info.fb_addr, 0);
+    step(&graphic_info, 0);
     debug!("rboot config: {:#x?}", config);
-    progress::bar(graphic_info.mode, graphic_info.fb_addr, 5);
+    step(&graphic_info, 5);
 
     let smbios_addr = st
         .config_table()
@@ -100,7 +114,7 @@ fn efi_main(image: Handle, mut st: SystemTable<Boot>) -> Status {
         );
         ElfFile::new(buf).expect("failed to parse ELF")
     };
-    progress::bar(graphic_info.mode, graphic_info.fb_addr, 15);
+    step(&graphic_info, 15);
     debug!(
         "kernel elf loaded: entry={:#x}",
         elf.header.pt2.entry_point()
@@ -129,7 +143,7 @@ fn efi_main(image: Handle, mut st: SystemTable<Boot>) -> Status {
     } else {
         (0, 0)
     };
-    progress::bar(graphic_info.mode, graphic_info.fb_addr, 45);
+    step(&graphic_info, 45);
 
     let max_mmap_size = st.boot_services().memory_map_size().map_size;
     let mmap_storage = Box::leak(vec![0u8; max_mmap_size * 2].into_boxed_slice());
@@ -155,7 +169,6 @@ fn efi_main(image: Handle, mut st: SystemTable<Boot>) -> Status {
             // highest conventional RAM entry in the memory map we iterated.
             .max(initramfs_addr + initramfs_size)
     };
-    progress::bar(graphic_info.mode, graphic_info.fb_addr, 46);
 
     let mut page_table = current_page_table();
     unsafe {
@@ -181,16 +194,43 @@ fn efi_main(image: Handle, mut st: SystemTable<Boot>) -> Status {
         &mut machine,
     )
     .expect("failed to map stack");
+    // Mark 46 lands here, not after the memory-map walk above (0.7 ms, which
+    // nothing was ever going to hide): the point of splitting 46 from 47 is to
+    // tell the kernel image's own mappings apart from the physmap's, because
+    // for most of this project's life they were one 7-second number.
+    step(&graphic_info, 46);
     debug!("mapping physical memory...");
-    page_table::map_physical_memory(config.physical_memory_offset, max_phys_addr, &mut machine)
-        .expect("failed to map physical memory");
-    progress::bar(graphic_info.mode, graphic_info.fb_addr, 47);
+    // The physmap goes in 2 MiB pages, which took the longest step of the boot
+    // from 6.98 s down to a rounding error. Two ranges have to keep 4 KiB
+    // leaves, and the first one is not optional: the kernel retypes the boot
+    // framebuffer's physmap entries to write-combining after the PCI scan
+    // (`kernel_hal`'s `pat::enable_framebuffer_wc`), it can only do that to a
+    // 4 KiB leaf, and a framebuffer left write-back measured 300 FPS against
+    // 2000 in glxgears on real hardware. `PHYSMAP4K` on the cmdline asks for
+    // 4 KiB everywhere, which is exactly what the loader did before.
+    let fb_fine = (
+        graphic_info.fb_addr,
+        graphic_info.fb_addr + graphic_info.fb_size,
+    );
+    let fine: &[(u64, u64)] = if cmdline::has_flag(config.cmdline, "PHYSMAP4K") {
+        &[(0, u64::MAX)]
+    } else {
+        core::slice::from_ref(&fb_fine)
+    };
+    page_table::map_physical_memory(
+        config.physical_memory_offset,
+        max_phys_addr,
+        fine,
+        &mut machine,
+    )
+    .expect("failed to map physical memory");
+    step(&graphic_info, 47);
     debug!("sanity checks before ExitBootServices...");
 
     // Sanity checks while Boot Services are still alive.
     // If these fault on real hardware, the firmware is much more likely to show a dump.
     let stacktop = config.stack_top();
-    progress::bar(graphic_info.mode, graphic_info.fb_addr, 47);
+    step(&graphic_info, 47);
     unsafe {
         // 1) Confirm the entry virtual address is mapped & readable.
         let entry_va = ENTRY as *const u8;
@@ -199,7 +239,7 @@ fn efi_main(image: Handle, mut st: SystemTable<Boot>) -> Status {
         let sp_probe = (stacktop - 8) as *mut u64;
         core::ptr::write_volatile(sp_probe, 0);
     }
-    progress::bar(graphic_info.mode, graphic_info.fb_addr, 48);
+    step(&graphic_info, 48);
     unsafe {
         Cr0::update(|f| f.insert(Cr0Flags::WRITE_PROTECT));
     }
@@ -220,14 +260,16 @@ fn efi_main(image: Handle, mut st: SystemTable<Boot>) -> Status {
         cmdline: config.cmdline,
         edid,
         edid_size,
+        // Filled in below, once the marks around `ExitBootServices` are in.
+        loader_marks: [0; rboot::LOADER_MARKS],
     });
 
     // On some real machines, ExitBootServices can be the point where things go wrong.
     // Update the bar just before attempting it so we can pinpoint the hang visually.
-    progress::bar(graphic_info.mode, graphic_info.fb_addr, 48);
+    step(&graphic_info, 48);
     debug!("calling ExitBootServices (raw)...");
     let (map_size, desc_size) = exit_boot_services_raw(&mut st, image, mmap_storage);
-    progress::bar(graphic_info.mode, graphic_info.fb_addr, 49);
+    step(&graphic_info, 49);
     debug!("ExitBootServices ok, collecting memory map...");
 
     // Reinterpret the raw memory map buffer as `MemoryDescriptor` entries.
@@ -243,19 +285,24 @@ fn efi_main(image: Handle, mut st: SystemTable<Boot>) -> Status {
         }
         memory_map.push(d);
     }
-    progress::bar(graphic_info.mode, graphic_info.fb_addr, 49);
+    step(&graphic_info, 49);
 
     bootinfo_box.memory_map = memory_map;
+    // Hand-off point to the kernel. Painted BEFORE the leak, because the marks
+    // have to be copied into the struct while it is still ours to write and this
+    // is the last mark anyone can act on: 51% is only the tiny IDT the handoff
+    // installs, and the kernel's own 52% bounds it from the other side.
+    step(&graphic_info, 50);
+    // `taken()` allocates nothing, which matters here -- boot services are gone.
+    bootinfo_box.loader_marks = marks::taken();
     let bootinfo: &'static BootInfo = Box::leak(bootinfo_box);
-    // Hand-off point to the kernel.
-    progress::bar(graphic_info.mode, graphic_info.fb_addr, 50);
 
     unsafe {
         debug!("jumping to kernel entry...");
         // If we see 51% but not the kernel marker (52%), the hang is inside the
         // handoff asm / very first instruction fetch. Always install a tiny IDT
         // so a #PF/#GP paints 99% instead of freezing the last rboot frame.
-        progress::bar(graphic_info.mode, graphic_info.fb_addr, 51);
+        step(&graphic_info, 51);
         idt::init(graphic_info.mode, graphic_info.fb_addr);
         jump_to_entry(bootinfo, stacktop);
     }

@@ -726,10 +726,10 @@ fn main() {
     );
 
     // Align /proc/kbd, /etc/eclipse/keyboard and labwc's XKB_DEFAULT_LAYOUT
-    // before the compositor starts, so the first keymap matches the console.
-    timed("apply the keyboard layout", apply_keyboard_layout);
-    timed("apply the locale", apply_locale);
-    timed("apply the timezone", apply_timezone);
+    // before the compositor starts, so the first keymap matches the console --
+    // and the locale and the timezone with them, since every service init
+    // spawns from here on inherits them (see `child_env_for`).
+    apply_boot_settings();
     timed("apply the look", apply_look);
 
     let mut services = timed("read the service files", || {
@@ -1134,31 +1134,95 @@ fn desktop_from_cmdline(cmdline: &str) -> Option<String> {
         .map(String::from)
 }
 
-/// Apply the persisted / cmdline keyboard layout before any compositor starts.
-/// `eclipse-kbd --boot` writes `/proc/kbd` and `XKB_DEFAULT_LAYOUT` but does
-/// not SIGHUP labwc (it is not running yet). Missing script is not fatal: an
-/// image built before this tool still boots, just with the compiled default.
-fn apply_keyboard_layout() {
-    match std::process::Command::new("/usr/local/bin/eclipse-kbd")
-        .arg("--boot")
-        .status()
-    {
-        Ok(st) if st.success() => {}
-        Ok(st) => log(&format!("eclipse-kbd --boot exited {st}")),
-        Err(e) => log(&format!("eclipse-kbd --boot skipped: {e}")),
+/// Kernel command line token that puts the three boot settings back to one
+/// after another. The escape hatch for [`apply_boot_settings`]: if running them
+/// at once ever misbehaves on a machine, `init.serial_setup` restores exactly
+/// the old order without a rebuild.
+const SERIAL_SETUP: &str = "init.serial_setup";
+
+/// The three boot settings, as (what the timeline calls it, the program).
+///
+/// A table and not three calls because they are run as a group, and because the
+/// one thing that must stay true of them -- that they are INDEPENDENT of each
+/// other -- is easier to see as a list than as three statements that happen to
+/// be adjacent.
+const BOOT_SETTINGS: [(&str, &str); 3] = [
+    ("the keyboard layout", "/usr/local/bin/eclipse-kbd"),
+    ("the locale", "/usr/local/bin/eclipse-locale"),
+    ("the timezone", "/usr/local/bin/eclipse-tz"),
+];
+
+/// Apply the keyboard layout, the locale and the timezone, all three at once.
+///
+/// These are three shell scripts, each of which forks eight or ten busybox
+/// applets of its own (`awk`, `tr`, `dd`, `grep`, `mv`), and run one after
+/// another they were **85% of init's whole boot**: 1.13 s of 1.46 s on the
+/// measured QEMU boot that `docs/README-boot.md` records, against 150 ms for
+/// everything else init does before the first service. On this kernel a
+/// `fork`/`execve` is the expensive operation, and this is thirty of them in a
+/// row on the critical path, with PID 1 blocked in `waitpid` for all of it.
+///
+/// Nothing orders them: each reads its own `/etc/eclipse` file and the kernel
+/// command line, each writes its own file, and none reads anything another
+/// writes. The one thing they share is labwc's `environment`, which all three
+/// upsert a key into -- and three read-modify-writes of one file at once lose
+/// keys, so the scripts now take a bounded lock around exactly that (see
+/// `write_eclipse_kbd` and its siblings in xtask, and the tests that hold the
+/// lock against them). That lock is what makes this sound; without it this
+/// function would be a silent keyboard-layout bug one boot later.
+///
+/// They still all finish before this returns, because the first service init
+/// starts must already see the locale and the timezone in its environment.
+/// What changes is only that the three waits overlap.
+fn apply_boot_settings() {
+    if cmdline_has(SERIAL_SETUP) {
+        log(&format!(
+            "{SERIAL_SETUP}: applying the boot settings one at a time"
+        ));
+        for (what, prog) in BOOT_SETTINGS {
+            timed(format!("apply {what}"), || {
+                wait_boot_setting(what, prog, spawn_boot_setting(prog))
+            });
+        }
+        return;
+    }
+    // Fork all three, THEN wait: a loop that waited inside it would be the
+    // serial version with extra words.
+    let started: Vec<(&str, &str, Option<std::process::Child>)> = BOOT_SETTINGS
+        .iter()
+        .map(|(what, prog)| (*what, *prog, spawn_boot_setting(prog)))
+        .collect();
+    timed(
+        "apply the keyboard layout, the locale and the timezone (at once)",
+        || {
+            for (what, prog, child) in started {
+                wait_boot_setting(what, prog, child);
+            }
+        },
+    );
+}
+
+/// Start one boot setting, or say on the console why it could not start.
+fn spawn_boot_setting(prog: &str) -> Option<std::process::Child> {
+    match std::process::Command::new(prog).arg("--boot").spawn() {
+        Ok(child) => Some(child),
+        Err(e) => {
+            // Not fatal and never has been: an image without the desktop stack
+            // has no such script, and the boot carries on with the defaults.
+            log(&format!("{prog} --boot skipped: {e}"));
+            None
+        }
     }
 }
 
-/// Apply `/etc/eclipse/locale` / cmdline `lang=` before any compositor starts.
-/// Writes LANG/LANGUAGE into labwc's environment and selects `menu.xml`.
-fn apply_locale() {
-    match std::process::Command::new("/usr/local/bin/eclipse-locale")
-        .arg("--boot")
-        .status()
-    {
+/// Wait for one boot setting and report a non-zero exit, exactly as the three
+/// separate `status()` calls used to.
+fn wait_boot_setting(what: &str, prog: &str, child: Option<std::process::Child>) {
+    let Some(mut child) = child else { return };
+    match child.wait() {
         Ok(st) if st.success() => {}
-        Ok(st) => log(&format!("eclipse-locale --boot exited {st}")),
-        Err(e) => log(&format!("eclipse-locale --boot skipped: {e}")),
+        Ok(st) => log(&format!("{prog} --boot exited {st} ({what} may be wrong)")),
+        Err(e) => log(&format!("{prog} --boot could not be waited for: {e}")),
     }
 }
 
@@ -1236,17 +1300,6 @@ fn apply_look() {
         Ok(st) if st.success() => {}
         Ok(st) => log(&format!("eclipse-look --boot exited {st}")),
         Err(e) => log(&format!("eclipse-look --boot skipped: {e}")),
-    }
-}
-
-fn apply_timezone() {
-    match std::process::Command::new("/usr/local/bin/eclipse-tz")
-        .arg("--boot")
-        .status()
-    {
-        Ok(st) if st.success() => {}
-        Ok(st) => log(&format!("eclipse-tz --boot exited {st}")),
-        Err(e) => log(&format!("eclipse-tz --boot skipped: {e}")),
     }
 }
 
@@ -3271,6 +3324,73 @@ mod tests {
         BOOT_RECORDED.store(before, Ordering::SeqCst);
         assert_eq!(steps.len(), 1, "{steps:?}");
         assert!(steps[0].at < Duration::from_millis(50), "{steps:?}");
+    }
+
+    // -- The three boot settings -------------------------------------------
+
+    #[test]
+    fn the_three_boot_settings_are_independent_of_each_other() {
+        // What makes running them at once sound, pinned where a fourth would be
+        // added: each reads its own `/etc/eclipse` file and writes its own, and
+        // no two of them name the same program. The one file all three DO write
+        // -- labwc's `environment` -- is serialised by the lock inside the
+        // scripts, and xtask's tests hold that lock against them.
+        let progs: BTreeSet<&str> = BOOT_SETTINGS.iter().map(|(_, prog)| *prog).collect();
+        assert_eq!(progs.len(), BOOT_SETTINGS.len(), "{BOOT_SETTINGS:?}");
+        let names: BTreeSet<&str> = BOOT_SETTINGS.iter().map(|(what, _)| *what).collect();
+        assert_eq!(names.len(), BOOT_SETTINGS.len(), "{BOOT_SETTINGS:?}");
+        for (_, prog) in BOOT_SETTINGS {
+            assert!(prog.starts_with('/'), "{prog} must be an absolute path");
+        }
+    }
+
+    #[test]
+    fn the_escape_hatch_is_recognised_on_a_colon_joined_command_line() {
+        // The Eclipse kernel joins boot arguments with `:`, so a token tested
+        // with a space-splitting parser is a hatch that silently is not there.
+        let colon = "LOG=warn:init.serial_setup:desktop=labwc";
+        assert!(cmdline_has_in(colon, SERIAL_SETUP));
+        assert!(cmdline_has_in("LOG=warn init.serial_setup", SERIAL_SETUP));
+        assert!(!cmdline_has_in("LOG=warn:desktop=labwc", SERIAL_SETUP));
+        // And not matched as a prefix of something else: a token that fires on
+        // `init.serial_setupx` would be a hatch nobody can close.
+        assert!(!cmdline_has_in("LOG=warn:init.serial_setupx", SERIAL_SETUP));
+    }
+
+    #[test]
+    fn a_boot_setting_whose_program_is_missing_is_not_fatal() {
+        // An image without the desktop stack has no such script, and the boot
+        // has always carried on with the compiled defaults. Spawning, not
+        // `status()`, must keep that: a `None` child is waited for as a no-op.
+        let child = spawn_boot_setting("/nonexistent/eclipse-kbd");
+        assert!(child.is_none());
+        wait_boot_setting("the keyboard layout", "/nonexistent/eclipse-kbd", child);
+    }
+
+    #[test]
+    fn the_three_boot_settings_really_do_overlap() {
+        // The point of the change: three waits that overlap instead of adding
+        // up. Three `sleep`s of 300 ms each take about 300 ms together and about
+        // 900 ms one after another, so the distinction is not a matter of
+        // measurement noise. Driven through the same spawn/wait pair the boot
+        // uses, because a test that re-implemented them would pass over a
+        // `apply_boot_settings` that still waited inside its loop.
+        let started = std::time::Instant::now();
+        let kids: Vec<Option<std::process::Child>> = (0..3)
+            .map(|_| std::process::Command::new("sleep").arg("0.3").spawn().ok())
+            .collect();
+        if kids.iter().any(Option::is_none) {
+            eprintln!("skipping: no `sleep` on this host");
+            return;
+        }
+        for kid in kids {
+            wait_boot_setting("a test sleep", "sleep", kid);
+        }
+        let waited = started.elapsed();
+        assert!(
+            waited < Duration::from_millis(700),
+            "three 300 ms waits took {waited:?}; they did not overlap"
+        );
     }
 
     // -- Boot arguments ----------------------------------------------------

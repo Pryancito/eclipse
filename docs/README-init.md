@@ -173,6 +173,37 @@ La contabilidad salió del lazo a `note_exit`, que ya se puede probar: cuatro
 tests, y el que importa fija que una caída de 40 ms durante una puerta de 10 s
 sigue siendo una caída.
 
+## Los tres ajustes de arranque, a la vez
+
+`eclipse-kbd --boot`, `eclipse-locale --boot` y `eclipse-tz --boot` son tres
+guiones de shell, cada uno con ocho o diez `fork`/`execve` de applets de busybox
+dentro (`awk`, `tr`, `dd`, `grep`, `mv`). Corriendo uno detrás de otro eran el
+**85 % del arranque entero del init**: 1,13 s de 1,46 s en el arranque de QEMU
+que mide `docs/README-boot.md`, contra 150 ms todo lo demás que hace el init
+antes del primer servicio. En este núcleo lo caro es el `fork`/`execve`, y eso
+son treinta seguidos en el camino crítico con el PID 1 bloqueado en `waitpid`.
+
+Nada los ordena entre sí: cada uno lee su propio fichero de `/etc/eclipse` y la
+línea de órdenes, y escribe el suyo. Así que se lanzan los tres y **luego** se
+espera a los tres. Siguen terminando todos antes de que arranque el primer
+servicio, porque ese servicio tiene que ver ya el idioma y la zona en su
+entorno; lo único que cambia es que las tres esperas se solapan.
+
+Lo que lo hace seguro, y sin lo cual esto sería un fallo de distribución de
+teclado un arranque más tarde: los tres **sí** escriben un fichero común, el
+`environment` de labwc, y tres lecturas-modificaciones-escrituras simultáneas de
+un fichero pierden claves (cada una lee el fichero viejo y gana el último `mv`).
+Los guiones toman ahora un cerrojo alrededor de exactamente eso — un directorio,
+porque `mkdir` o lo crea o falla, atómicamente, en cualquier sistema de ficheros
+—, **acotado**: a los tres segundos se lo queda igual y sigue. Un guion de
+arranque que espere para siempre a un cerrojo rancio es justo cómo se queda
+colgada una máquina entera, y perder una clave en un arranque es el fallo
+barato. Los tests de xtask sujetan el cerrojo contra los tres guiones y
+comprueban las dos cosas: que esperan, y que ninguno se queda clavado.
+
+**Escotilla**: `init.serial_setup` en la línea de órdenes del núcleo los vuelve
+a correr uno detrás de otro, en el mismo orden de antes, sin recompilar nada.
+
 ## Cola
 
 Nada pendiente de esta revisión. Lo que queda son decisiones tomadas (el

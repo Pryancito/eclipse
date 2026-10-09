@@ -48,7 +48,27 @@ pub struct BootInfo {
     /// existing field's offset (ABI-stable across partial rebuilds).
     pub edid: [u8; 128],
     pub edid_size: u32,
+    /// Raw TSC reading at each of rboot's boot progress marks (0..51), `0` for a
+    /// mark not reached. The loader half of the boot timeline: the kernel
+    /// converts these against a frequency it has checked against the ACPI PM
+    /// timer and prints them above its own marks, so one table covers the whole
+    /// boot. See `rboot::marks` (in the loader binary) and
+    /// `kernel_hal::boot_marks`.
+    ///
+    /// Raw and not nanoseconds because the only clock the firmware offers rboot
+    /// is `BootServices::stall`, and calibrating against it would mean spending
+    /// ten or twenty milliseconds of the boot to measure it.
+    ///
+    /// After `edid`, like everything new here: growing the tail never shifts an
+    /// existing field's offset.
+    pub loader_marks: [u64; LOADER_MARKS],
 }
+
+/// One slot per percentage rboot can pass to the progress bar, so a mark is
+/// recorded by indexing. rboot owns 0..=51 of the bar and the kernel takes over
+/// at 52; the array is sized for the whole of rboot's range plus the handoff
+/// mark, and a percentage outside it is dropped rather than trusted.
+pub const LOADER_MARKS: usize = 52;
 
 /// Graphic output information
 #[derive(Debug, Copy, Clone)]

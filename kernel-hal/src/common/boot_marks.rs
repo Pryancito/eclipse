@@ -42,6 +42,32 @@ const SLOTS: usize = 101;
 /// one that bounds the stretch before it.
 static AT_NS: [AtomicU64; SLOTS] = [const { AtomicU64::new(0) }; SLOTS];
 
+/// Raw TSC reading at each of the loader's marks, as rboot handed them over
+/// (`BootInfo::loader_marks`); `0` means "not reached", and all zeros means no
+/// loader half was supplied at all.
+///
+/// Raw, because rboot has no clock of its own worth calibrating: the only one
+/// the firmware offers it is `BootServices::stall`, and calibrating against it
+/// would mean spending ten or twenty milliseconds of the boot to measure it.
+/// Converted here instead, against the frequency the kernel has already checked
+/// against the ACPI PM timer.
+static LOADER_TSC: [AtomicU64; LOADER_SLOTS] = [const { AtomicU64::new(0) }; LOADER_SLOTS];
+
+/// The loader owns 0..=51 of the progress bar; the kernel takes over at 52.
+///
+/// Must match `rboot::LOADER_MARKS`. kernel-hal does not depend on rboot (it
+/// builds for three architectures and only one of them has a UEFI loader), so
+/// the two are tied together by a compile-time assertion at the x86 entry point,
+/// which sees both.
+pub const LOADER_SLOTS: usize = 52;
+
+/// TSC frequency to convert [`LOADER_TSC`] with, or `0` while unknown.
+///
+/// Set once the kernel's own calibration is trustworthy, which is long after
+/// `_start` copies the array in -- at `_start` the frequency is still a CPUID
+/// guess, or nothing at all.
+static LOADER_TSC_HZ: AtomicU64 = AtomicU64::new(0);
+
 /// The first mark whose timestamp is taken with a TSC frequency that has been
 /// checked against the ACPI PM timer (`recalibrate_tsc_hz`, the first thing the
 /// x86 device probe does). Anything below this is timed with the provisional
@@ -54,6 +80,19 @@ const TSC_TRUSTED_FROM: u32 = 81;
 /// mark that brackets something expensive is worth naming).
 fn label(progress: u32) -> &'static str {
     match progress {
+        // rboot (the UEFI loader). Everything here happens before the kernel's
+        // first instruction, under the firmware's own page tables and its FAT
+        // driver -- which is why the two file reads are usually the whole story.
+        0 => "rboot: config read, GOP mode set, splash drawn",
+        5 => "rboot: ACPI and SMBIOS tables found",
+        15 => "rboot: kernel ELF read off the ESP",
+        45 => "rboot: initramfs read off the ESP",
+        46 => "rboot: memory map walked, kernel ELF and stack mapped",
+        47 => "rboot: all of physical memory mapped",
+        48 => "rboot: handoff probes, BootInfo built",
+        49 => "rboot: ExitBootServices",
+        50 => "rboot: memory map copied for the kernel",
+        51 => "rboot: handoff IDT installed",
         52 => "entered the kernel (arch entry)",
         53 => "logging up",
         54 => "kernel heap and frame allocator",
@@ -91,6 +130,69 @@ pub fn mark(progress: u32) {
     let _ = slot.compare_exchange(0, now.max(1), Ordering::Relaxed, Ordering::Relaxed);
 }
 
+/// Take the loader's half of the timeline, as rboot handed it over.
+///
+/// Called from the architecture entry point, before anything else: the array
+/// lives in `BootInfo`, which the firmware's heap owns and which nothing should
+/// be read out of later than it has to be.
+pub fn set_loader_marks(marks: &[u64]) {
+    for (slot, raw) in LOADER_TSC.iter().zip(marks.iter()) {
+        slot.store(*raw, Ordering::Relaxed);
+    }
+}
+
+/// Name the TSC frequency the loader's raw readings are to be divided by.
+///
+/// Separate from [`set_loader_marks`] because the two are known at opposite ends
+/// of the boot: the readings arrive in the first instructions, and a frequency
+/// worth dividing by only exists once the device probe has checked one against
+/// the ACPI PM timer. Until this is set, the loader's half of the table says it
+/// cannot be converted rather than printing a figure derived from a guess.
+pub fn set_loader_tsc_hz(hz: u64) {
+    LOADER_TSC_HZ.store(hz, Ordering::Relaxed);
+}
+
+/// The loader's marks as `(progress, ns since the loader's first mark)`, plus
+/// the raw TSC at that first mark -- roughly what the firmware spent before the
+/// loader ran, since the counter starts at processor reset.
+///
+/// Empty when no loader half was supplied, or when no frequency to convert it
+/// with is known yet.
+fn loader_rows() -> (Vec<(u32, u64)>, u64) {
+    let hz = LOADER_TSC_HZ.load(Ordering::Relaxed);
+    let raw: Vec<(u32, u64)> = LOADER_TSC
+        .iter()
+        .enumerate()
+        .filter_map(|(p, at)| match at.load(Ordering::Relaxed) {
+            0 => None,
+            tsc => Some((p as u32, tsc)),
+        })
+        .collect();
+    let Some((_, first)) = raw.first().copied() else {
+        return (Vec::new(), 0);
+    };
+    if hz == 0 {
+        return (Vec::new(), first);
+    }
+    // Deltas from the loader's own first mark, which is where its clock starts
+    // as far as anyone can say: the absolute value is the firmware's, and is
+    // reported on its own line instead of as this table's first row.
+    let rows = raw
+        .iter()
+        .map(|(p, tsc)| (*p, tsc_to_ns(tsc.saturating_sub(first), hz)))
+        .collect();
+    (rows, first)
+}
+
+/// `tsc` ticks as nanoseconds at `hz`, in 128-bit so a long boot on a fast
+/// counter cannot wrap the multiply.
+fn tsc_to_ns(tsc: u64, hz: u64) -> u64 {
+    if hz == 0 {
+        return 0;
+    }
+    ((tsc as u128 * 1_000_000_000) / hz as u128) as u64
+}
+
 /// The marks reached so far, in the order they were reached, as
 /// `(progress, at_ns)`.
 ///
@@ -117,17 +219,24 @@ pub fn reached() -> Vec<(u32, u64)> {
 /// The gap is the figure to read: it is the cost of the stretch that *ends* at
 /// this mark. `at` is there to line the row up against a `dmesg` timestamp.
 pub fn render() -> String {
-    let rows = reached();
+    let kernel = reached();
+    let (loader, firmware_tsc) = loader_rows();
     let mut out = String::new();
-    if rows.is_empty() {
+    if kernel.is_empty() && loader.is_empty() {
         let _ = writeln!(out, "boot timeline:  no progress mark has been reached");
         return out;
     }
-    let total = rows.last().map(|(_, ns)| *ns).unwrap_or(0);
+    // The two halves are timed by two different clocks with two different
+    // origins -- the loader's counts from its own first mark, the kernel's from
+    // when its clock started -- so the kernel's rows are shifted to sit after
+    // the loader's. The handoff itself (a jump and a tiny IDT) is the only thing
+    // that falls between them, and it is microseconds.
+    let loader_total = loader.last().map(|(_, ns)| *ns).unwrap_or(0);
+    let total = loader_total + kernel.last().map(|(_, ns)| *ns).unwrap_or(0);
     let _ = writeln!(
         out,
         "boot timeline — {} marks, {} to the last one",
-        rows.len(),
+        loader.len() + kernel.len(),
         fmt_ms(total)
     );
     let _ = writeln!(
@@ -139,23 +248,48 @@ pub fn render() -> String {
         "  marks below {}% are timed with the provisional TSC frequency.",
         TSC_TRUSTED_FROM
     );
+    if firmware_tsc > 0 {
+        let hz = LOADER_TSC_HZ.load(Ordering::Relaxed);
+        match hz {
+            0 => {
+                let _ = writeln!(
+                    out,
+                    "  the loader's marks arrived but no checked TSC frequency did; \
+                     not converted."
+                );
+            }
+            hz => {
+                let _ = writeln!(
+                    out,
+                    "  before 0%: about {} in the firmware, from processor reset to rboot\n\
+                     \x20 (the TSC counts from reset -- a warm reset or a hypervisor need not \
+                     start it at 0).",
+                    fmt_ms(tsc_to_ns(firmware_tsc, hz))
+                );
+            }
+        }
+    }
     // Ten wide, not eight: a stamp past a hundred milliseconds is nine
     // characters with the unit on it ("136.739ms"), and on a real boot most of
     // the column is past that -- at eight the numbers pushed the `stretch`
     // column out of line on exactly the rows worth reading.
     let _ = writeln!(out, "   mark          at         gap  stretch");
     let mut prev = 0u64;
-    for (progress, at) in &rows {
+    let rows = loader
+        .iter()
+        .map(|(p, ns)| (*p, *ns))
+        .chain(kernel.iter().map(|(p, ns)| (*p, ns + loader_total)));
+    for (progress, at) in rows {
         let gap = at.saturating_sub(prev);
-        prev = *at;
+        prev = at;
         let _ = writeln!(
             out,
             "   {:>3}%  {:>10}  {:>10}  {}{}",
             progress,
-            fmt_ms(*at),
+            fmt_ms(at),
             fmt_ms(gap),
-            label(*progress),
-            if *progress < TSC_TRUSTED_FROM {
+            label(progress),
+            if progress < TSC_TRUSTED_FROM {
                 " (*)"
             } else {
                 ""
