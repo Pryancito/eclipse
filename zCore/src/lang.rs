@@ -125,22 +125,37 @@ fn alloc_error(layout: Layout) -> ! {
 ///
 /// Matched on substrings, because these frames are generic and mangled
 /// (`<zcore::handler::ZcoreKernelHandler as kernel_hal::..>::handle_page_fault`)
-/// and `ksyms` hands back one folded name per address. Deliberately narrow:
-/// the kernel's own trap/panic/containment entry points only, never a name an
-/// ordinary caller could carry.
+/// and `ksyms` hands back one folded name per address.
+///
+/// Narrow on purpose, and two names are the reason the test for it is as long
+/// as it is:
+///
+///  * `handle_page_fault` alone is not the kernel handler. `zircon-object`
+///    has two of its own (`vm::vmar` and the guest's), and a holder sitting in
+///    those is taking a fault its vmar RESOLVES -- slow, not fatal. So that
+///    needle only counts paired with the zCore handler that cannot resolve it.
+///  * `panic_banner` is not here at all, though it looks like it belongs: the
+///    deadlock reporter below calls it itself, so a peer NMI landing there
+///    would have the renderer diagnose itself. The panic frames that do count
+///    (`rust_begin_unwind`, the hook) are above it anyway.
 pub(crate) fn sym_is_diagnosing(sym: &str) -> bool {
     const NEEDLES: &[&str] = &[
-        "handle_page_fault",
         "handle_trap",
         "trap_handler",
         "report_unresolved_kernel_fault",
         "print_fault_backtrace",
         "oops::try_contain",
         "rust_begin_unwind",
-        "panic_banner",
         "panic_handler",
         "panic_fmt",
     ];
+    // The zCore kernel handler's own page-fault entry, whichever way `ksyms`
+    // folded the generic: the impl type or the trait it implements.
+    if sym.contains("handle_page_fault")
+        && (sym.contains("zcore::handler") || sym.contains("KernelHandler"))
+    {
+        return true;
+    }
     NEEDLES.iter().any(|n| sym.contains(n))
 }
 
@@ -561,7 +576,25 @@ fn dl_paint() {
     // capture seen (one holder, or the two sides of a cycle) and leaves the
     // line that names the conclusion room to land.
     let reporting = panicking_cpu();
-    let mut holder_diagnosing = false;
+    // Every RECORDED holder, not just the two the banner has room to print:
+    // the verdict must not depend on which holders fit on the screen. With a
+    // three-cpu cycle, or an earlier holder still in its slot, the one that
+    // faulted can sit third in this list.
+    let mut diagnosing_cpu = usize::MAX;
+    for &c in holder_cpus.iter().take(holder_n) {
+        if c == reporting {
+            continue;
+        }
+        let rip = kernel_hal::kstats::nmi_rip(c);
+        if rip != 0 {
+            if let Some((sym, _)) = kernel_hal::ksyms::lookup(rip) {
+                if sym_is_diagnosing(sym) {
+                    diagnosing_cpu = c;
+                    break;
+                }
+            }
+        }
+    }
     for &c in holder_cpus.iter().take(holder_n.min(2)) {
         let rip = kernel_hal::kstats::nmi_rip(c);
         if c == reporting {
@@ -579,9 +612,6 @@ fn dl_paint() {
                 c
             );
         } else if rip != 0 {
-            if let Some((sym, _)) = kernel_hal::ksyms::lookup(rip) {
-                holder_diagnosing |= sym_is_diagnosing(sym);
-            }
             let _ = write!(
                 b,
                 "\nHOLDER cpu{} is now at {}",
@@ -620,7 +650,7 @@ fn dl_paint() {
              that never pumps; symbolize the non-acker nmi_rip above to name it. \
              Not AB-BA."
         );
-    } else if holder_diagnosing {
+    } else if diagnosing_cpu != usize::MAX {
         // The case the either/or below cannot call, and the one the captures
         // keep showing: a HOLDER sitting in the kernel's own fault path, i.e.
         // it faulted with the lock held and will never give it back. The
@@ -628,12 +658,15 @@ fn dl_paint() {
         // but reading it asked the reader to know which symbols are the fault
         // path, which is exactly what a photograph of a wedged machine does
         // not help with.
+        // The cpu is named here because it may be a holder the banner had no
+        // room to print, and then this line is the only mention of it.
         let _ = write!(
             b,
-            "\nDIAG: a HOLDER faulted or panicked INSIDE its critical section (its \
-             \"is now at\" is in the kernel's own fault/panic path), so that lock is \
-             never given back. Not AB-BA: this report is a CONSEQUENCE of the fault \
-             printed above it, not a second bug. Diagnose that fault."
+            "\nDIAG: HOLDER cpu{} faulted or panicked INSIDE its critical section (it \
+             is in the kernel's own fault/panic path), so that lock is never given \
+             back. Not AB-BA: this report is a CONSEQUENCE of the fault printed above \
+             it, not a second bug. Diagnose that fault.",
+            diagnosing_cpu
         );
     } else {
         // NOT "therefore AB-BA". Ruling out shootdown starvation leaves more
@@ -1345,22 +1378,45 @@ mod tests {
         assert!(b.dropped() > 0);
     }
 
-    /// The symbol off the capture of 2026-10-09, verbatim as `ksyms` folds it.
+    /// The symbol off the capture of 2026-10-09, verbatim as `ksyms` folds it,
+    /// plus the other shape the same generic can fold to (the trait side).
     /// This is the line that decides the verdict, so the match has to survive
-    /// the generic mangling it arrives wrapped in.
+    /// the mangling it arrives wrapped in.
     #[test]
-    fn a_holder_sitting_in_the_page_fault_handler_is_recognised() {
+    fn a_holder_sitting_in_the_kernel_page_fault_handler_is_recognised() {
         assert!(sym_is_diagnosing(
             "<zcore::handler::ZcoreKernelHa..as kernel_hal::kernel_handler::KernelHandler>::handle_page_fault"
+        ));
+        assert!(sym_is_diagnosing(
+            "<T as kernel_hal::kernel_handler::KernelHandler>::handle_page_fault"
         ));
         assert!(sym_is_diagnosing("zcore::handler::print_fault_backtrace"));
         assert!(sym_is_diagnosing("zcore::oops::try_contain"));
         assert!(sym_is_diagnosing("rust_begin_unwind"));
     }
 
-    /// Narrow on purpose: the two sites the captures actually show a holder
-    /// wedged at with no fault anywhere -- the allocator's coalescing scan and
-    /// a shootdown wait -- must not be read as "it faulted", or the verdict
+    /// The two false positives that would make this verdict worse than the
+    /// ambiguous one it replaces, because it ends in "Not AB-BA" and a cycle
+    /// is exactly what it would be hiding:
+    ///
+    ///  * `zircon_object`'s own page-fault handlers, where a holder is taking
+    ///    a fault its vmar RESOLVES;
+    ///  * `panic_banner`, which the deadlock reporter calls ITSELF, so a peer
+    ///    NMI landing there is the renderer, not a fault.
+    #[test]
+    fn a_resolvable_vm_fault_or_the_renderer_is_not_the_fault_path() {
+        for sym in [
+            "zircon_object::vm::vmar::VmAddressRegion::handle_page_fault",
+            "<zircon_object::hypervisor::guest::Guest>::handle_page_fault",
+            "kernel_hal::console::panic_banner",
+        ] {
+            assert!(!sym_is_diagnosing(sym), "{} read as the fault path", sym);
+        }
+    }
+
+    /// Narrow on purpose: the sites the captures actually show a holder wedged
+    /// at with no fault anywhere -- the allocator's coalescing scan and a
+    /// shootdown wait -- must not be read as "it faulted", or the verdict
     /// sends the reader looking for a fault report that was never printed.
     #[test]
     fn an_ordinary_wedged_holder_is_not_read_as_a_fault() {
@@ -1381,17 +1437,18 @@ mod tests {
     /// it.
     #[test]
     fn the_longest_verdict_still_fits_the_bytes_held_back_for_it() {
-        const FAULTED_HOLDER: &str = "\nDIAG: a HOLDER faulted or panicked INSIDE its \
-                                      critical section (its \"is now at\" is in the \
-                                      kernel's own fault/panic path), so that lock is \
-                                      never given back. Not AB-BA: this report is a \
-                                      CONSEQUENCE of the fault printed above it, not a \
-                                      second bug. Diagnose that fault.";
+        let faulted_holder = format!(
+            "\nDIAG: HOLDER cpu{} faulted or panicked INSIDE its critical section (it \
+             is in the kernel's own fault/panic path), so that lock is never given \
+             back. Not AB-BA: this report is a CONSEQUENCE of the fault printed above \
+             it, not a second bug. Diagnose that fault.",
+            usize::MAX
+        );
         const DID_NOT_FIT: &str = "\n[1234 B of this report did not fit]";
         assert!(
-            FAULTED_HOLDER.len() + DID_NOT_FIT.len() <= VERDICT_RESERVE,
+            faulted_holder.len() + DID_NOT_FIT.len() <= VERDICT_RESERVE,
             "{} B of verdict and tail for a {} B reserve",
-            FAULTED_HOLDER.len() + DID_NOT_FIT.len(),
+            faulted_holder.len() + DID_NOT_FIT.len(),
             VERDICT_RESERVE,
         );
     }

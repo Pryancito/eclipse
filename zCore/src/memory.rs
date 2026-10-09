@@ -364,7 +364,10 @@ pub fn heap_available() -> bool {
 #[allow(dead_code)]
 pub fn heap_held_by_current_cpu() -> bool {
     use lock::HeldByCurrentCpu;
-    HEAP.0.held_by_current_cpu()
+    // Via the APIC, for the reason given on the x86_64 twin: the only caller
+    // is the fault reporter, and GS is one of the things a fault may have
+    // smashed.
+    HEAP.0.held_by_current_cpu_via_apic()
 }
 
 /// Total bytes managed by the heap (mirrors `memory_x86_64::heap_total`).
