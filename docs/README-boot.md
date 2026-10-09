@@ -178,6 +178,10 @@ argumento nuevo:
 
 Los dos tramos gordos que quedan en rboot, por orden:
 
+- **La lectura del initramfs**, la marca 45 %: 3,49 s para 75 MiB a través del
+  driver FAT del firmware, unos 21 MB/s. Es el tramo mayor que queda, y a
+  diferencia de los de abajo es lento **también en hardware**: la velocidad de ese
+  driver no la pone la emulación.
 - **El mapeo del ELF del núcleo**, la marca 46 %: 3,44 s. No es el `.text`: el
   último `PT_LOAD` del núcleo tiene `FileSiz` 0 y **`MemSiz` 548 MiB**, y de
   ellos 512 MiB son un solo objeto, `zcore::memory::init::HEAP` — el montón del
@@ -187,8 +191,14 @@ Los dos tramos gordos que quedan en rboot, por orden:
   grandes en vez de un marco por llamada, y mapear ese segmento con páginas de
   2 MiB como ya se hace con el mapa físico. Que el montón sea de 512 MiB
   estáticos es una decisión aparte, y no es nuestra.
-- **La lectura del initramfs**, la marca 45 %: 3,56 s para 75 MiB a través del
-  driver FAT del firmware, unos 21 MB/s.
+
+  **El primero de los dos ya está hecho**: `rboot/src/frames.rs` pide la memoria
+  al firmware de cuatro mebibytes en cuatro mebibytes y reparte marcos bumpeando
+  un puntero, así que las ~134.000 llamadas a `allocate_pages` son 137. La marca
+  46 % pasó de **3442,9 ms a 2238,6 ms**. Lo que queda ahí dentro son dos cosas
+  que ninguna marca separa todavía: los ~134.000 `map_to` de 4 KiB y el
+  `write_bytes` de 548 MiB. Las dos son caras **sobre todo bajo TCG**, así que el
+  reparto de una máquina real puede hacer que no valga la pena tocarlas.
 - **El sondeo PCI del núcleo**: 441 ms de 882 ms en QEMU, pero esa cifra es de un
   PCI *emulado*. Antes de tocarlo hace falta la tabla de una máquina de verdad.
 

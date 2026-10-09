@@ -21,7 +21,7 @@ use alloc::vec::Vec;
 use core::arch::asm;
 use log::warn;
 use rboot::config::{self, Resolution};
-use rboot::{cmdline, fb, logo, page_table, progress, video, BootInfo, GraphicInfo};
+use rboot::{cmdline, fb, frames, logo, page_table, progress, video, BootInfo, GraphicInfo};
 use uefi::proto::console::gop::{GraphicsOutput, ModeInfo, PixelFormat};
 use uefi::proto::media::file::*;
 use uefi::proto::media::fs::SimpleFileSystem;
@@ -180,7 +180,10 @@ fn efi_main(image: Handle, mut st: SystemTable<Boot>) -> Status {
         // immediately on real hardware.
         Efer::update(|f| f.insert(EferFlags::NO_EXECUTE_ENABLE));
     }
-    let mut allocator = UEFIFrameAllocator(bs);
+    let mut allocator = UEFIFrameAllocator {
+        bs,
+        arena: frames::Arena::new(),
+    };
     let mut machine = page_table::Firmware {
         mapper: &mut page_table,
         allocator: &mut allocator,
@@ -632,14 +635,25 @@ fn current_page_table() -> OffsetPageTable<'static> {
     unsafe { OffsetPageTable::new(p4_table, VirtAddr::new(0)) }
 }
 
-struct UEFIFrameAllocator<'a>(&'a BootServices);
+/// Frames for the page tables and for the kernel's `.bss`, taken from the
+/// firmware a few megabytes at a time rather than a page at a time. See
+/// `rboot::frames` for why, and for what it costs.
+struct UEFIFrameAllocator<'a> {
+    bs: &'a BootServices,
+    arena: frames::Arena,
+}
 
 unsafe impl FrameAllocator<Size4KiB> for UEFIFrameAllocator<'_> {
     fn allocate_frame(&mut self) -> Option<PhysFrame> {
-        let addr = self
-            .0
-            .allocate_pages(AllocateType::AnyPages, MemoryType::LOADER_DATA, 1)
-            .ok()?;
+        let bs = self.bs;
+        let addr = self.arena.frame(|pages| {
+            bs.allocate_pages(
+                AllocateType::AnyPages,
+                MemoryType::LOADER_DATA,
+                pages as usize,
+            )
+            .ok()
+        })?;
         Some(PhysFrame::containing_address(PhysAddr::new(addr)))
     }
 }
