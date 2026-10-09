@@ -1228,12 +1228,61 @@ not tasks pinned away from the asker, so a single `sched_setaffinity` anywhere
 on a CPU's queue switches both scans to the slow form for every task on it.
 With a thousand runnable tasks the pre-halt recheck goes from 10 ns to 3.3 us
 -- on the way into `hlt`, every time -- and a thief's probe of that victim goes
-from 30 ns to 3.7 us, on every victim on every idle pass. The bitmap shortcut
-was written for exactly this and it works; what is missing is a form of it that
-survives one pinned task. A per-page mask of which slots are affine would let
-the scan popcount `runnable & !affine` and walk only the remainder, which is
-the whole of the difference above. That is a behaviour-adjacent change in the
-hottest path in the scheduler, so it is written here and not shipped.
+from 30 ns to 3.7 us, on every victim on every idle pass.
+
+**Fixed, and it is a narrower fix than the paragraph above predicted.**
+`WakerPage` now carries a fifth lane, `affine`, recording which of its 64
+slots hold a task that has a mask at all; a task with none is allowed on every
+CPU unconditionally, which is the fact `FutureCollection::affine` already
+exploits for a whole queue, now known per slot. Both scans split each page into
+`runnable & !affine`, which needs no question asked, and `runnable & affine`,
+which is walked as before. The invariant is kept by the two calls that bracket
+a slot's life: `initialize` clears the bit as the slot is handed out and
+`mark_affine` sets it for the one insert that needs it.
+
+| | before | after |
+| --- | --- | --- |
+| a thief's probe, one pinned task among a thousand | 3,273 ns | **55 ns** |
+| a thief's probe, a thousand pinned tasks | 3,687 ns | 3,881 ns |
+| pre-halt recheck, half the queue pinned elsewhere | 1,741 ns | 1,347 ns |
+| pre-halt recheck, a thousand pinned elsewhere | 3,394 ns | 3,330 ns |
+| initialise a slot | 16.8 ns | 26.8 ns |
+| clear a slot | 21.6 ns | 29.6 ns |
+| spawn a task and retire it | 233.9 ns | 246.3 ns |
+
+The first row is the point: the mixed queue — an IRQ pool, or one
+`sched_setaffinity` among ordinary threads — is what actually happens, and a
+thief's probe of it goes 59x faster. The rows after it are the honest rest of
+the story.
+
+A queue where every task really is pinned is unchanged, and was never going to
+change: every bit the lane would skip is a bit that carries a mask.
+
+`has_ready` barely moves either, and for a reason worth recording, because the
+measurement contradicted the prediction. It has always returned at the *first*
+allowed slot, so what it pays is however many disallowed slots sort ahead of
+that one, and the lane answers a page at a time: a page whose every runnable
+slot is masked is still walked bit by bit. All of its 23% comes from the
+wholly-unmasked pages at the far end of the scan. The scan that had no early
+exit, and therefore the one that was really paying, is `ready_num_for`.
+
+The bill is the last three rows: a fourth `fetch_and` in `initialize` and a
+fifth in `clear`, which is ~12 ns on a ~234 ns spawn, 5%. Clearing the lane
+only in `clear` would halve that, since a slot is always retired before the
+slab reuses it — but then a scan's correctness would rest on the slab's reuse
+discipline one module away, so the spawn pays instead and
+`a_reused_slot_does_not_inherit_the_last_occupants_affinity` pins the
+invariant either way. Spawns are rare next to steal-scan probes.
+
+The equivalence is not argued, it is tested:
+`the_affine_lane_answers_exactly_what_a_per_bit_walk_would` compares both
+scans against the per-bit walk they replaced over 512 configurations (four
+queue depths x eight mask shapes x four disturbances of the lanes x four
+asking CPUs), with non-vacuity assertions that both sides of the new branch,
+both answers of `has_ready` and pages holding some of each were all reached.
+Four separate sabotages of the new code — dropping the walk, ignoring the
+lane in each scan, not recording a mask on insert, and not clearing the lane
+on retirement — are each caught by it.
 
 **`pages` never shrinks, and the idle path pays the high-water mark.**
 `FutureCollection::insert` pushes a page per 64 tasks and `remove` frees the
