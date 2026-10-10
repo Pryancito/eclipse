@@ -3509,8 +3509,10 @@ impl Scheme for E1000eInterface {
             // A bottom-half is already queued and the ICR read above cleared
             // these causes in hardware. Stash them so the poll still sees
             // them instead of dropping a link-state change or an RX overrun.
+            // Do NOT rearm IMS here: the BH has IMC held, and re-enabling
+            // interrupts lets another edge clear ICR again after the BH has
+            // already `swap(0)`'d `pending_icr`, orphaning those causes.
             self.pending_icr.fetch_or(icr, Ordering::AcqRel);
-            self.ims_rearm();
             return;
         }
         self.poll_pending_set_us

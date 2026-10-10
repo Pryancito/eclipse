@@ -445,7 +445,16 @@ impl INode for Pipe {
                     drop(data);
                     return Poll::Ready(this.pipe.poll());
                 }
-                if this.sub_id.is_none() {
+                // Not `sub_id.is_none()`: the callback is one-shot, so after
+                // the first wake the id names nothing on the bus. Another
+                // reader that drains the buffer before we run leaves us
+                // Pending forever with no callback. See `EventBusFuture`.
+                let live = this
+                    .sub_id
+                    .map(|id| data.eventbus.is_subscribed(id))
+                    .unwrap_or(false);
+                if !live {
+                    this.sub_id = None;
                     // Only this end's own transitions: the flags are latched
                     // and `subscribe` fires at once on any that is already
                     // set, so a reader parked on an empty pipe must not be

@@ -96,10 +96,23 @@ fn main() {
 /// errors out of rust-lld, with nothing pointing at the submodule. Fail here
 /// instead, where the message can say what to run.
 ///
-/// Only for `target_os = "none"`, i.e. the bare-metal kernel targets that
-/// actually link a binary. Host builds (`cargo build --all-features` in CI)
-/// stop at rlibs, never resolve these symbols, and keep the old warning.
+/// Only for `target_os = "none"` (bare-metal kernel). Hosted builds skip the
+/// NVIDIA C entirely so host test binaries can supply `eclipse_rm_*` shims
+/// without colliding with `eclipse_rm_init.c`.
 fn build_first_real_nvidia_file() {
+    // Hosted / libos builds must not compile the RM C objects. Host test
+    // binaries (notably `zcore-drivers`) supply `#[no_mangle] eclipse_rm_*`
+    // stand-ins in `rm_host_shims`; linking the real `eclipse_rm_init.c`
+    // beside those yields `duplicate symbol: eclipse_rm_*`. Kernel builds
+    // (`target_os = "none"`) are the only ones that need the real C.
+    // Matches the hosted stubs in `rm_init.rs` for edid / hdmi_audio.
+    if !building_for_kernel() {
+        println!(
+            "cargo:warning=nvidia-rm-sys: skipping real NVIDIA C source for hosted build (os={})",
+            std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_else(|_| "unknown".to_string())
+        );
+        return;
+    }
     // The real NVIDIA RM core is x86_64 hardware: skip C compilation for
     // non-x86_64 targets to avoid cross-compilation issues (wrong-arch
     // object files) and missing-cross-compiler build failures.

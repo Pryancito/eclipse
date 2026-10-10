@@ -619,6 +619,32 @@ impl Syscall<'_> {
             );
             return Err(LxError::EINVAL);
         }
+        // Sharing flags without CLONE_THREAD are not implemented (except
+        // VFORK|VM, which is the ordinary vfork). Accepting them as a plain
+        // fork lied about FILES/FS/VM/SIGHAND/PARENT sharing.
+        const UNSUPPORTED_SHARE: CloneFlags = CloneFlags::from_bits_truncate(
+            CloneFlags::FILES.bits()
+                | CloneFlags::FS.bits()
+                | CloneFlags::SIGHAND.bits()
+                | CloneFlags::PARENT.bits(),
+        );
+        if !clone_flags.contains(CloneFlags::THREAD)
+            && (clone_flags.intersects(UNSUPPORTED_SHARE)
+                || (clone_flags.contains(CloneFlags::VM)
+                    && !clone_flags.contains(CloneFlags::VFORK)))
+        {
+            warn!(
+                "clone: rejecting unimplemented share flags {:#x}",
+                flags & (UNSUPPORTED_SHARE.bits() | CloneFlags::VM.bits())
+            );
+            return Err(LxError::EINVAL);
+        }
+        // Linux: CLONE_THREAD requires CLONE_SIGHAND, which requires CLONE_VM.
+        if clone_flags.contains(CloneFlags::THREAD)
+            && !(clone_flags.contains(CloneFlags::SIGHAND) && clone_flags.contains(CloneFlags::VM))
+        {
+            return Err(LxError::EINVAL);
+        }
         // Fork-like clones: if the THREAD bit is not set, the caller wants a
         // new process. This covers SIGCHLD (0x11), VFORK|VM|SIGCHLD (0x4111)
         // and other combinations used by musl/glibc fork/posix_spawn/system().
@@ -665,6 +691,9 @@ impl Syscall<'_> {
                 info!("sys_clone: dispatching to sys_fork for flags {:#x}", flags);
                 self.fork_impl(newsp, tls, ctid)?
             };
+            // CSIGNAL (low 8 bits of the legacy flags word): signal the parent
+            // gets when this child exits. 0 means send nothing (clone3).
+            process.linux().set_exit_signal((flags & 0xff) as u8);
             let pid = process.id() as usize;
             // In the parent, once the child exists (Linux writes it before the
             // child runs, but from the same clone_process, i.e. in the same
@@ -1075,7 +1104,7 @@ impl Syscall<'_> {
     /// > A call to any exec function from a process with more than one thread
     /// > shall result in all threads being terminated and the new executable image
     /// > being loaded and executed.
-    pub fn sys_execve(
+    pub async fn sys_execve(
         &mut self,
         path: UserInPtr<u8>,
         argv: UserInPtr<UserInPtr<u8>>,
@@ -1139,10 +1168,13 @@ impl Syscall<'_> {
 
         // POSIX/Linux: execve in a multithreaded process kills every other
         // thread in the group before the address space is replaced. Leaving
-        // them alive ran the old RIP/stack against the new image.
+        // them alive ran the old RIP/stack against the new image. Wait until
+        // they are gone: otherwise the loader remaps while a sibling still
+        // walks the old page tables.
         {
             let proc = self.zircon_process();
             let me = self.thread.id();
+            let mut siblings = alloc::vec::Vec::new();
             for tid in proc.thread_ids() {
                 if tid == me {
                     continue;
@@ -1150,8 +1182,13 @@ impl Syscall<'_> {
                 if let Ok(obj) = proc.get_child(tid) {
                     if let Ok(t) = obj.downcast_arc::<Thread>() {
                         zircon_object::task::Task::kill(t.as_ref());
+                        siblings.push(t);
                     }
                 }
+            }
+            for t in siblings {
+                let obj: Arc<dyn KernelObject> = t;
+                obj.wait_signal(Signal::THREAD_TERMINATED).await;
             }
         }
 

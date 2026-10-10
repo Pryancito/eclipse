@@ -10,6 +10,7 @@ use crate::{
 };
 use alloc::{
     boxed::Box,
+    collections::BTreeMap,
     string::String,
     sync::{Arc, Weak},
     vec,
@@ -765,11 +766,22 @@ impl ProcessExt for Process {
                                     .unwrap_or(0),
                                 wait_status_exited(exit_code),
                             );
-                            let _ = send_signal_to_process_with_info(
-                                reaper.id() as usize,
-                                LinuxSignal::SIGCHLD,
-                                Some(info),
-                            );
+                            let exit_sig = child
+                                .try_linux()
+                                .map(|lp| lp.exit_signal())
+                                .unwrap_or(LinuxSignal::SIGCHLD as u8);
+                            // `exit_signal == 0` means "no signal" (clone3).
+                            if exit_sig != 0 {
+                                if let Ok(Some(sig)) =
+                                    LinuxSignal::from_syscall_arg(exit_sig as usize)
+                                {
+                                    let _ = send_signal_to_process_with_info(
+                                        reaper.id() as usize,
+                                        sig,
+                                        Some(info),
+                                    );
+                                }
+                            }
                         }
                     }
                 }
@@ -921,6 +933,9 @@ pub async fn wait_child_interest(
                     let mut inner = proc.linux().inner.lock();
                     inner.children.remove(&pid);
                     inner.reaped_children.remove(&pid);
+                    // So a later `record_child_exit` from death-notify does not
+                    // re-insert this pid as a fresh zombie.
+                    inner.waited_without_zombie.insert(pid);
                     inner.add_children_cpu(cpu);
                 }
                 return Ok((wait_status_exited(code), cpu));
@@ -928,7 +943,7 @@ pub async fn wait_child_interest(
         }
         if let Some(status) = child
             .try_linux()
-            .and_then(|lp| lp.take_wait_notification(interest))
+            .and_then(|lp| lp.take_wait_notification(interest, reap))
         {
             return Ok((status, ChildCpu::default()));
         }
@@ -945,6 +960,7 @@ pub async fn wait_child_interest(
                     let mut inner = proc.linux().inner.lock();
                     inner.children.remove(&pid);
                     inner.reaped_children.remove(&pid);
+                    inner.waited_without_zombie.insert(pid);
                     inner.add_children_cpu(cpu);
                 }
                 return Ok((wait_status_exited(code), cpu));
@@ -952,7 +968,7 @@ pub async fn wait_child_interest(
         }
         if let Some(status) = child
             .try_linux()
-            .and_then(|lp| lp.take_wait_notification(interest))
+            .and_then(|lp| lp.take_wait_notification(interest, reap))
         {
             return Ok((status, ChildCpu::default()));
         }
@@ -1044,6 +1060,7 @@ fn scan_waitable_children(
                     let mut inner = proc.linux().inner.lock();
                     inner.children.remove(&pid);
                     inner.reaped_children.remove(&pid);
+                    inner.waited_without_zombie.insert(pid);
                     inner.add_children_cpu(cpu);
                 }
                 return Some(Ok((pid, wait_status_exited(code), cpu)));
@@ -1051,7 +1068,7 @@ fn scan_waitable_children(
         }
         if let Some(status) = child
             .try_linux()
-            .and_then(|lp| lp.take_wait_notification(interest))
+            .and_then(|lp| lp.take_wait_notification(interest, reap))
         {
             return Some(Ok((pid, status, ChildCpu::default())));
         }
@@ -1211,6 +1228,10 @@ struct LinuxProcessInner {
     /// Exit codes and final CPU usage for children already detached (freed
     /// `Arc<Process>` at exit).
     reaped_children: HashMap<KoID, (i64, ChildCpu)>,
+    /// Pids `wait*` already collected from the live `Exited` path (no zombie
+    /// left). [`Self::record_child_exit`] must not re-insert those, or a
+    /// second `wait` would collect the same child again.
+    waited_without_zombie: HashSet<KoID>,
     /// CPU totals of children this process has reaped (`wait*` with reap):
     /// what getrusage(RUSAGE_CHILDREN) and times() cutime/cstime report.
     children_utime_ns: u64,
@@ -1297,6 +1318,18 @@ struct LinuxProcessInner {
     keep_caps: bool,
     /// Signal actions
     signal_actions: SignalActions,
+    /// Process-directed signals that every thread currently has blocked.
+    ///
+    /// Linux keeps these on `shared_pending` so the first thread to unblock
+    /// (or open a matching `signalfd`) receives them. Queuing only on the
+    /// first tid left the signal stuck there forever when that thread kept
+    /// it masked and another later unmasked it.
+    shared_pending: Sigset,
+    /// `siginfo_t` for bits in [`Self::shared_pending`].
+    shared_pending_info: BTreeMap<u8, SigInfo>,
+    /// Exit signal delivered to the parent when this process dies
+    /// (`clone`'s CSIGNAL / `clone3.exit_signal`). Default `SIGCHLD`.
+    exit_signal: u8,
     /// Program break (top of heap).
     ///
     /// Initialized to 0; set to the end of the loaded ELF image by the loader
@@ -1587,6 +1620,12 @@ impl LinuxProcess {
     pub fn record_child_exit(&self, child_id: KoID, exit_code: i64, cpu: ChildCpu) {
         let mut inner = self.inner.lock();
         inner.children.remove(&child_id);
+        // A concurrent `wait*` can collect the live `Exited` child before
+        // `PROCESS_TERMINATED` runs this path; that wait leaves a mark in
+        // `waited_without_zombie` so we do not invent a second zombie.
+        if inner.waited_without_zombie.remove(&child_id) {
+            return;
+        }
         inner.reaped_children.insert(child_id, (exit_code, cpu));
     }
 
@@ -1599,6 +1638,7 @@ impl LinuxProcess {
         let mut inner = self.inner.lock();
         inner.children.remove(&child_id);
         inner.reaped_children.remove(&child_id);
+        inner.waited_without_zombie.remove(&child_id);
     }
 
     /// CPU totals of already-reaped children, in nanoseconds (utime, stime).
@@ -1653,6 +1693,9 @@ impl LinuxProcess {
             inner: Mutex::new(LinuxProcessInner {
                 files,
                 start_ns: monotonic_now_ns(),
+                // Default derive would leave this 0 ("no signal"); fork/clone
+                // override with CSIGNAL, but plain create must match Linux.
+                exit_signal: LinuxSignal::SIGCHLD as u8,
                 ..Default::default()
             }),
         }
@@ -1773,14 +1816,21 @@ impl LinuxProcess {
 
     /// Consume a pending stop/continue notification for `wait*` if `interest`
     /// asks for it. Does not change `job_stopped` itself.
-    pub fn take_wait_notification(&self, interest: WaitInterest) -> Option<ExitCode> {
+    ///
+    /// When `reap` is false (`WNOWAIT`), the pending bit is left set so a
+    /// later wait can still see the same stop/continue.
+    pub fn take_wait_notification(&self, interest: WaitInterest, reap: bool) -> Option<ExitCode> {
         let mut inner = self.inner.lock();
         if interest.stopped && inner.job_stop_pending {
-            inner.job_stop_pending = false;
+            if reap {
+                inner.job_stop_pending = false;
+            }
             return Some(wait_status_stopped(inner.job_stop_sig));
         }
         if interest.continued && inner.job_continued_pending {
-            inner.job_continued_pending = false;
+            if reap {
+                inner.job_continued_pending = false;
+            }
             return Some(WAIT_STATUS_CONTINUED);
         }
         None
@@ -1909,6 +1959,20 @@ impl LinuxProcess {
     pub fn add_file_cloexec(&self, file: Arc<dyn FileLike>, cloexec: bool) -> LxResult<FileDesc> {
         let inner = self.inner.lock();
         let fd = inner.get_free_fd();
+        self.insert_file(inner, fd, file, cloexec)
+    }
+
+    /// Like [`Self::add_file_cloexec`], but the free descriptor is chosen at
+    /// or above `start` under the same lock that inserts it — what
+    /// `fcntl(F_DUPFD)` needs so two callers cannot claim one number.
+    pub fn add_file_from_cloexec(
+        &self,
+        file: Arc<dyn FileLike>,
+        cloexec: bool,
+        start: usize,
+    ) -> LxResult<FileDesc> {
+        let inner = self.inner.lock();
+        let fd = inner.get_free_fd_from(start);
         self.insert_file(inner, fd, file, cloexec)
     }
 
@@ -3656,6 +3720,60 @@ impl LinuxProcess {
         flush_signal_handlers(&mut self.inner.lock().signal_actions.table);
     }
 
+    /// Exit signal this process will send its parent (`clone` CSIGNAL).
+    pub fn exit_signal(&self) -> u8 {
+        self.inner.lock().exit_signal
+    }
+
+    /// Set the exit signal for a new process (0 = send nothing).
+    pub fn set_exit_signal(&self, sig: u8) {
+        self.inner.lock().exit_signal = sig;
+    }
+
+    /// Queue a process-directed signal that every thread currently has blocked.
+    pub fn queue_shared_signal(&self, signal: LinuxSignal, info: Option<SigInfo>) {
+        let mut inner = self.inner.lock();
+        inner.shared_pending.insert(signal);
+        if let Some(info) = info {
+            inner
+                .shared_pending_info
+                .entry(signal as u8)
+                .or_insert(info);
+        }
+    }
+
+    /// Move any shared-pending signals this thread no longer has blocked onto
+    /// the thread's own pending set. Called after a mask change and before
+    /// delivery / signalfd reads.
+    ///
+    /// Lock order: thread Linux lock, then process `inner` (same as
+    /// [`check_signals_of`]'s discard path).
+    pub fn pull_shared_pending_into(&self, thread: &Arc<Thread>) {
+        use crate::thread::ThreadExt;
+        let Some(mut lt) = thread.try_lock_linux() else {
+            return;
+        };
+        self.pull_shared_pending_locked(&mut lt);
+    }
+
+    /// Same as [`Self::pull_shared_pending_into`] when the caller already holds
+    /// the thread's Linux lock (signalfd / mask updates).
+    pub fn pull_shared_pending_locked(&self, lt: &mut crate::thread::LinuxThread) {
+        let mut inner = self.inner.lock();
+        if inner.shared_pending.is_empty() {
+            return;
+        }
+        let mut rest = inner.shared_pending;
+        while let Some(sig) = rest.find_first_signal() {
+            rest.remove(sig);
+            if lt.wants_signal(sig) {
+                inner.shared_pending.remove(sig);
+                let info = inner.shared_pending_info.remove(&(sig as u8));
+                lt.queue_signal(sig, info);
+            }
+        }
+    }
+
     /// Close file that FD_CLOEXEC is set
     pub fn remove_cloexec_files(&self) {
         // Remove under the lock, DROP outside it — see `close_file` for the
@@ -4110,6 +4228,7 @@ impl LinuxProcessInner {
             // for them: Linux zeroes `cutime`/`cstime` in `copy_process`.
             children: Default::default(),
             reaped_children: Default::default(),
+            waited_without_zombie: Default::default(),
             children_utime_ns: 0,
             children_stime_ns: 0,
             // `p->pdeath_signal = 0` in `copy_process`, and the subreaper
@@ -4134,6 +4253,11 @@ impl LinuxProcessInner {
             // inherited by a plain fork (only `CLONE_SYSVSEM` shares it), and
             // that is exactly what the `Clone` drops.
             semaphores: self.semaphores.clone(),
+            // Process-directed pending set and exit signal are per-process
+            // state of the *new* task, not a copy of the parent's queues.
+            shared_pending: Sigset::default(),
+            shared_pending_info: BTreeMap::new(),
+            exit_signal: LinuxSignal::SIGCHLD as u8,
         }
     }
 
@@ -4922,6 +5046,11 @@ pub fn set_signal_action_in(process: &Arc<Process>, signal: LinuxSignal, action:
     if !discards_when_pending(action.handler, signal) {
         return;
     }
+    if let Some(lp) = process.try_linux() {
+        let mut inner = lp.inner.lock();
+        inner.shared_pending.remove(signal);
+        inner.shared_pending_info.remove(&(signal as u8));
+    }
     for tid in process.thread_ids() {
         if let Ok(thread) = process.get_child(tid) {
             if let Ok(thread) = thread.downcast_arc::<Thread>() {
@@ -5004,6 +5133,11 @@ pub fn check_signals_of(thread: &Arc<Thread>) -> LxResult<()> {
             }
             if matches!(thread.proc().status(), Status::Exited(_)) {
                 return Err(LxError::EINTR);
+            }
+            // Pull process-shared pending bits this thread can now take
+            // (unblocked / sigwait) before scanning the per-thread set.
+            if let Some(lp) = thread.proc().try_linux() {
+                lp.pull_shared_pending_into(thread);
             }
             // Snapshot the deliverable (unblocked) pending signals, then drop the
             // per-thread lock before consulting the per-process disposition table
@@ -5505,11 +5639,23 @@ pub fn send_signal_to_process_with_info(
         // Every thread has the signal blocked: it must still become *pending*
         // (POSIX — masking only delays delivery, it does not discard the
         // signal), so it is delivered once unblocked or consumed via signalfd.
-        // The old code dropped it here, which is why a Wayland compositor that
-        // blocks SIGINT for its signalfd never saw Ctrl-C.
+        // The first tid holds it (what `sigpending` and the park tests see);
+        // `shared_pending` mirrors it so a later-unblocking / sigwait thread
+        // can still pull via [`LinuxProcess::pull_shared_pending_into`].
         if let Some(thread) = first {
             thread.lock_linux().queue_signal(signal, info);
-            wake_signal_sleeper(&thread);
+            if let Some(lp) = process.try_linux() {
+                lp.queue_shared_signal(signal, info);
+            }
+            // Wake every sleeper: a thread in signalfd/sigwait may notice the
+            // shared bit even though the per-thread bit sits on `first`.
+            for tid in process.thread_ids() {
+                if let Ok(thread_obj) = process.get_child(tid) {
+                    if let Ok(t) = thread_obj.downcast_arc::<Thread>() {
+                        wake_signal_sleeper(&t);
+                    }
+                }
+            }
         }
         // Pulse even when every thread had the Linux signal blocked: waitpid
         // still needs to return so the waiter can notice the pending set.

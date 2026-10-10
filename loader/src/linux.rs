@@ -612,6 +612,11 @@ async fn run_user(thread: CurrentThread) {
         // It fires whenever a thread has a pending signal (e.g. the job-control
         // SIGTTIN a shell sends itself), wedging that core in an interrupts-off
         // spin forever: the silent multi-core busy/heat (and a hang risk).
+        // Process-shared pending bits become per-thread pending once this
+        // thread no longer blocks them (or is in sigwait).
+        if let Some(lp) = thread.proc().try_linux() {
+            lp.pull_shared_pending_into(&thread.inner());
+        }
         let pending_signal = thread.inner().lock_linux().handle_signal();
         if let Some((signal, sigmask)) = pending_signal {
             ctx = handle_signal(&thread, ctx, signal, sigmask);

@@ -782,46 +782,22 @@ impl Syscall<'_> {
         match vmar.protect(addr, len, flags) {
             Ok(()) => Ok(0),
             Err(e) => {
-                if hunter::policy::wx_mode() == hunter::Mode::Enforce {
-                    error!(
-                        "mprotect: addr={:#x} len={:#x} flags={:?} → {:?} (rejected under W^X enforce)",
-                        addr, len, flags, e
-                    );
-                    return Err(LxError::EINVAL);
-                }
-                // `error!`, not `warn!`: the default cmdline is `LOG=error`
-                // (zCore/rboot.conf), so this was invisible on exactly the
-                // configuration people run. And it is not a cosmetic failure --
-                // swallowing it returns 0 to a caller whose permissions are not
-                // what it asked for.
-                //
-                // Not necessarily unchanged, either: `VmAddressRegion::protect`
-                // validates coverage and flags up front, but then applies to
-                // overlapping children in a loop with `?`, so a child failing
-                // mid-way leaves the ones before it already changed. A failure
-                // therefore means the transition is INCOMPLETE -- part of the
-                // range may carry the new permissions and part the old -- which
-                // is harder to reason about than a clean no-op, not easier.
-                //
-                // SpiderMonkey's JIT does mmap(PROT_NONE) -> mprotect(RW)
-                // -> write code -> mprotect(RX) -> call it; told the last step
-                // succeeded, it jumps into a page that is still not executable
-                // and takes a user instruction-fetch fault (`err=0x14`, with
-                // `rip == rax` from the indirect call). Firefox does that at a
-                // fixed address on every boot.
-                //
-                // The error kind is what picks the cause apart: NOT_FOUND means
-                // the range is not fully covered by mappings/children (a hole,
-                // or a split this kernel made that Linux would not have),
-                // ACCESS_DENIED means a mapping's max permissions forbid the
-                // transition. Print it rather than infer it.
+                // Never return success on a failed protect. Swallowing the
+                // error told SpiderMonkey/Firefox their mprotect(RX) worked
+                // when part (or all) of the range still lacked EXECUTE, and
+                // the next indirect call instruction-fetched a non-executable
+                // page. Surface the real failure: NOT_FOUND → ENOMEM (Linux
+                // for a hole in the range), ACCESS_DENIED → EACCES, else EINVAL.
                 error!(
-                    "mprotect: addr={:#x} len={:#x} flags={:?} → {:?} — returning success on an \
-                     INCOMPLETE transition; part of the range may still hold the old \
-                     permissions, and a caller that now executes or writes it will fault",
+                    "mprotect: addr={:#x} len={:#x} flags={:?} → {:?}",
                     addr, len, flags, e
                 );
-                Ok(0)
+                Err(match e {
+                    zircon_object::ZxError::NOT_FOUND => LxError::ENOMEM,
+                    zircon_object::ZxError::ACCESS_DENIED => LxError::EACCES,
+                    zircon_object::ZxError::INVALID_ARGS => LxError::EINVAL,
+                    _ => LxError::EINVAL,
+                })
             }
         }
     }

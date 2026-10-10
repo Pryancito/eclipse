@@ -314,7 +314,9 @@ impl Syscall<'_> {
                     BsdRet::from_result(r)
                 }
             },
-            sys::EXECVE => BsdRet::from_result(self.sys_execve(a0.into(), a1.into(), a2.into())),
+            sys::EXECVE => {
+                BsdRet::from_result(self.sys_execve(a0.into(), a1.into(), a2.into()).await)
+            }
             sys::EXIT => BsdRet::from_result(self.sys_exit(a0 as _)),
             sys::THR_EXIT => BsdRet::from_result(self.sys_exit(0)),
             sys::SETPRIORITY => BsdRet::from_result(self.sys_setpriority(a0, a1, a2 as i32)),

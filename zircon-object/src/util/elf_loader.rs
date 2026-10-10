@@ -2207,6 +2207,57 @@ mod tests {
         assert_eq!(&buf, b"0123456789abcdef");
     }
 
+    /// The busybox ash crash at boot: `initvar` → `hashvar(NULL)`.
+    ///
+    /// Ash keeps its builtin variables' `name=value` pointers in `.rodata`
+    /// (`varinit_data`, VA 0x57b158 on the Alpine static build we ship). After
+    /// a borrow-load those bytes must still be the file's, not demand-zero:
+    /// a truncated exec image left them as NULL and every `/bin/sh` died on
+    /// the first `movzbl (%rax)` of `hashvar`.
+    #[test]
+    fn busybox_ash_varinit_data_survives_a_borrow_load() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../rootfs/x86_64/bin/busybox");
+        let bytes = match std::fs::read(path) {
+            Ok(b) => b,
+            Err(_) => return, // tree without a built rootfs (some CI shards)
+        };
+        if bytes.len() < 0x18_0000 || &bytes[..4] != b"\x7fELF" {
+            return;
+        }
+        // Pointer to "IFS= \t\n" baked into this binary's varinit_data[0].
+        const VARINIT_TEXT_PTR_OFF: usize = 0x17b160; // VA 0x57b160 - 0x400000
+        const IFS_STR_OFF: usize = 0x1a729e; // VA 0x5a729e - 0x400000
+        assert_eq!(&bytes[IFS_STR_OFF..IFS_STR_OFF + 7], b"IFS= \t\n");
+        let mut ptr_buf = [0u8; 8];
+        ptr_buf.copy_from_slice(&bytes[VARINIT_TEXT_PTR_OFF..VARINIT_TEXT_PTR_OFF + 8]);
+        let expected = u64::from_le_bytes(ptr_buf);
+        assert_eq!(expected, 0x5a729e);
+
+        // Match `read_as_vmo`: content_size = file size, backing rounded up.
+        let image = VmObject::new_paged_with_options(false, false, bytes.len()).unwrap();
+        image.write(0, &bytes).unwrap();
+        let elf = parse_checked_elf(&bytes).unwrap();
+        let vmar = VmAddressRegion::new_root();
+        let seg = vmar.load_from_elf_image(&elf, &image).unwrap();
+        assert!(seg.is_borrower(), "RX LOAD of busybox must borrow the image");
+
+        // Through the segment VMO (offset = VA - 0x400000).
+        let mut got = [0u8; 8];
+        seg.read(0x17b160, &mut got).unwrap();
+        assert_eq!(
+            u64::from_le_bytes(got),
+            0x5a729e,
+            "varinit_data[0].var_text must still point at IFS= after borrow-load"
+        );
+        // Through the user mapping (aspace-separate: root base is non-zero).
+        let mut got2 = [0u8; 8];
+        vmar.read_memory(vmar.addr() + 0x57b160, &mut got2).unwrap();
+        assert_eq!(u64::from_le_bytes(got2), 0x5a729e);
+        let mut ifs = [0u8; 7];
+        vmar.read_memory(vmar.addr() + 0x5a729e, &mut ifs).unwrap();
+        assert_eq!(&ifs, b"IFS= \t\n");
+    }
+
     #[test]
     fn a_segment_with_more_bytes_in_the_file_than_in_memory_is_refused() {
         // `p_filesz > p_memsz` sizes the VMO for the memory image and then

@@ -665,16 +665,46 @@ impl Syscall<'_> {
                     let future = futex.wait(contended);
                     // ALWAYS through `blocking_run`, even with no timeout:
                     // see `futex_deadline`. Awaiting the raw future here left
-                    // a contended PI mutex unkillable.
+                    // a contended PI mutex unkillable. And a POSIX signal must
+                    // end it too — same race as FUTEX_WAIT — or `kill`/
+                    // `__synccall` leave the waiter deaf while the lock is
+                    // contended.
+                    let thread = self.thread.inner();
+                    let futex_wait = future;
+                    pin_mut!(futex_wait);
+                    let interrupted = async {
+                        let mut park = SignalPark::new(&thread);
+                        loop {
+                            park.prepare();
+                            if check_signals_of(&thread).is_err() {
+                                return;
+                            }
+                            park.park(None).await;
+                        }
+                    };
+                    pin_mut!(interrupted);
+                    let raced = async {
+                        match select(futex_wait, interrupted).await {
+                            Either::Left((res, _)) => res,
+                            Either::Right(((), mut futex_wait)) => {
+                                match poll!(&mut futex_wait) {
+                                    Poll::Ready(res) => res,
+                                    Poll::Pending => Err(ZxError::CANCELED),
+                                }
+                            }
+                        }
+                    };
+                    pin_mut!(raced);
                     let res: ZxResult = self
                         .thread
-                        .blocking_run(future, ThreadState::BlockedFutex, deadline, None)
+                        .blocking_run(raced, ThreadState::BlockedFutex, deadline, None)
                         .await;
                     match res {
                         // Woken by UNLOCK_PI, or the word changed under us
                         // before we were queued: re-read and retry.
                         Ok(_) | Err(ZxError::BAD_STATE) => continue,
                         Err(ZxError::TIMED_OUT) => return Err(LxError::ETIMEDOUT),
+                        Err(ZxError::CANCELED) => return Err(LxError::EINTR),
                         Err(e) => return Err(e.into()),
                     }
                 }

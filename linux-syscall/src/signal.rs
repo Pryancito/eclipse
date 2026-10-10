@@ -460,15 +460,19 @@ impl Syscall<'_> {
             // succeeds there, and rejecting it here was a guard harder than
             // the kernel's: one that refuses programs the kernel accepts.
             let how = How::try_from(how).map_err(|_| LxError::EINVAL)?;
-            let mut thread = self.thread.lock_linux();
-            // SIGKILL and SIGSTOP can never be blocked; the three helpers
-            // below all drop them, and `sigprocmask(2)` is explicit that the
-            // attempt is ignored rather than refused.
-            match how {
-                How::Block => thread.block_signals(&set),
-                How::Unblock => thread.unblock_signals(&set),
-                How::SetMask => thread.set_signal_mask(set),
+            {
+                let mut thread = self.thread.lock_linux();
+                // SIGKILL and SIGSTOP can never be blocked; the three helpers
+                // below all drop them, and `sigprocmask(2)` is explicit that the
+                // attempt is ignored rather than refused.
+                match how {
+                    How::Block => thread.block_signals(&set),
+                    How::Unblock => thread.unblock_signals(&set),
+                    How::SetMask => thread.set_signal_mask(set),
+                }
             }
+            // Unblocking may make a process-shared pending signal deliverable.
+            self.linux_process().pull_shared_pending_into(self.thread);
             Ok(())
         })?;
         Ok(0)
@@ -802,6 +806,7 @@ impl Syscall<'_> {
             thread.set_signal_mask(newmask);
             thread.saved_sigmask = Some(old_mask);
         }
+        self.linux_process().pull_shared_pending_into(self.thread);
         // Block until a signal becomes deliverable under the temporary mask
         // (or the thread/process is being torn down). `check_signals` reports
         // this as `EINTR`, which is exactly the return value `sigsuspend` owes
@@ -983,6 +988,7 @@ impl Syscall<'_> {
             lt.saved_sigmask = Some(old);
             old
         };
+        self.linux_process().pull_shared_pending_into(&thread);
         Ok(Some(TempSigmaskGuard {
             thread,
             old,

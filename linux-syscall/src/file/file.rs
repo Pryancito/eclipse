@@ -2523,11 +2523,8 @@ impl Syscall<'_> {
                     Ok(0)
                 }
                 FcntlCmd::DUPFD | FcntlCmd::DUPFD_CLOEXEC => {
-                    let new_fd = FileDesc::from(self.sys_dupfd(fd, arg)?);
-                    if cmd == FcntlCmd::DUPFD_CLOEXEC {
-                        proc.set_fd_cloexec(new_fd, true)?;
-                    }
-                    Ok(new_fd.into())
+                    let cloexec = cmd == FcntlCmd::DUPFD_CLOEXEC;
+                    Ok(self.sys_dupfd_cloexec(fd, arg, cloexec)?)
                 }
                 _ => Err(LxError::EINVAL),
             }

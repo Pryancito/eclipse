@@ -510,11 +510,27 @@ impl Futex {
             waiter.reset_futex(requeue_futex.clone());
         }
         // Deliver wakeups last, with no futex lock held. A tombstone among
-        // them wakes nobody and so counts for nobody.
+        // them wakes nobody and so counts for nobody — same top-up as
+        // [`Futex::wake`]: keep going until `wake_count` live waiters have
+        // been woken or the queue is empty.
         let mut woken = 0;
         for waiter in to_wake {
             if waiter.wake() {
                 woken += 1;
+            }
+        }
+        while woken < wake_count {
+            let waiter = {
+                let mut inner = self.inner.lock();
+                inner.waiter_queue.pop_front()
+            };
+            match waiter {
+                Some(waiter) => {
+                    if waiter.wake() {
+                        woken += 1;
+                    }
+                }
+                None => break,
             }
         }
         Ok(woken + requeued)

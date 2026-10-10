@@ -676,13 +676,13 @@ impl Syscall<'_> {
         if usize::from(fd1) == fd2 || flags & !O_CLOEXEC != 0 {
             return Err(LxError::EINVAL);
         }
-        self.sys_dup2(fd1, fd2)?;
-        let fd2 = FileDesc::from(fd2);
-        if flags & O_CLOEXEC != 0 {
-            // Per-descriptor CLOEXEC on the new fd — set in the fd table, not
-            // in the File object (whose flags are only a creation-time record).
-            self.linux_process().set_fd_cloexec(fd2, true)?;
-        }
+        let proc = self.linux_process();
+        let fd2 = dup_target(fd2, proc.file_limit().cur)?;
+        let file_like = proc.get_file_like(fd1)?;
+        // Install with CLOEXEC in the same table lock as the replace: a
+        // separate `dup2` then `set_fd_cloexec` left a window where `execve`
+        // on another thread kept the new fd despite `O_CLOEXEC`.
+        let _ = proc.replace_file(fd2, file_like, flags & O_CLOEXEC != 0)?;
         Ok(fd2.into())
     }
 
@@ -734,13 +734,21 @@ impl Syscall<'_> {
     /// the open range off the end of `usize`, which is a kernel panic from a
     /// process with no privileges.
     pub fn sys_dupfd(&self, fd1: FileDesc, start: usize) -> SysResult {
+        self.sys_dupfd_cloexec(fd1, start, false)
+    }
+
+    /// `fcntl(F_DUPFD)` / `F_DUPFD_CLOEXEC`: pick and install under one lock.
+    pub fn sys_dupfd_cloexec(&self, fd1: FileDesc, start: usize, cloexec: bool) -> SysResult {
         let proc = self.linux_process();
         let nofile = proc.file_limit().cur;
         let start = dupfd_start(start, nofile)?;
-        let new_fd = dupfd_picked(proc.get_free_fd_from(start).into(), nofile)?;
-        // sys_dup2 registers the new fd with CLOEXEC off (POSIX dup
-        // semantics); F_DUPFD_CLOEXEC re-tags it afterwards.
-        self.sys_dup2(fd1, new_fd.into())
+        // Pick and install under one lock: `get_free_fd_from` then `dup2`
+        // let two concurrent F_DUPFD callers claim the same number, and a
+        // separate CLOEXEC set after install raced with `execve`.
+        let file_like = proc.get_file_like(fd1)?;
+        let new_fd = proc.add_file_from_cloexec(file_like, cloexec, start)?;
+        let new_fd = dupfd_picked(new_fd.into(), nofile)?;
+        Ok(new_fd.into())
     }
 
     /// create a copy of the file descriptor fd, and uses the lowest-numbered unused descriptor for the new descriptor.

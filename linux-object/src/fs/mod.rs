@@ -2154,8 +2154,17 @@ impl INodeExt for dyn INode {
         while offset < size {
             let len = (size - offset).min(buf.len());
             let read_len = self.read_at(offset, &mut buf[..len])?;
+            // A mid-file EOF used to return a VMO whose tail was still demand
+            // zero. Exec then borrowed that image: the ELF header and early
+            // `.text` were fine, but later `.rodata` (busybox ash's
+            // `varinit_data` at ~0x17b000) read as zeros, so `initvar` called
+            // `hashvar(NULL)` and every `/bin/sh` died with SIGSEGV @ 0x0.
             if read_len == 0 {
-                break;
+                error!(
+                    "read_as_vmo: unexpected EOF at {:#x}/{:#x}",
+                    offset, size
+                );
+                return Err(rcore_fs::vfs::FsError::DeviceError);
             }
             vmo.write(offset, &buf[..read_len])
                 .map_err(|_| rcore_fs::vfs::FsError::DeviceError)?;
@@ -3173,6 +3182,104 @@ mod tests {
         let mut back = alloc::vec![0u8; data.len()];
         vmo.read(0, &mut back).unwrap();
         assert!(back == data, "read_as_vmo returned different bytes");
+    }
+
+    /// Mid-file EOF must fail the exec image read, not hand back a VMO whose
+    /// unread tail is demand-zero. That shape let smoke tests pass the ELF
+    /// header while busybox ash's `varinit_data` stayed NULL → SIGSEGV @ 0x0.
+    #[test]
+    fn read_as_vmo_rejects_mid_file_eof() {
+        use super::INodeExt;
+        use alloc::{string::String, sync::Arc};
+        use rcore_fs::vfs::*;
+        use rcore_fs_ramfs::RamFS;
+
+        /// Reports a large size but only serves the first `cap` bytes.
+        struct ShortFile {
+            inner: Arc<dyn INode>,
+            cap: usize,
+            size: usize,
+        }
+
+        impl INode for ShortFile {
+            fn read_at(&self, offset: usize, buf: &mut [u8]) -> Result<usize> {
+                if offset >= self.cap {
+                    return Ok(0);
+                }
+                let n = (self.cap - offset).min(buf.len());
+                self.inner.read_at(offset, &mut buf[..n])
+            }
+            fn write_at(&self, offset: usize, buf: &[u8]) -> Result<usize> {
+                self.inner.write_at(offset, buf)
+            }
+            fn poll(&self) -> Result<PollStatus> {
+                self.inner.poll()
+            }
+            fn metadata(&self) -> Result<Metadata> {
+                let mut m = self.inner.metadata()?;
+                m.size = self.size;
+                Ok(m)
+            }
+            fn set_metadata(&self, metadata: &Metadata) -> Result<()> {
+                self.inner.set_metadata(metadata)
+            }
+            fn sync_all(&self) -> Result<()> {
+                self.inner.sync_all()
+            }
+            fn sync_data(&self) -> Result<()> {
+                self.inner.sync_data()
+            }
+            fn resize(&self, len: usize) -> Result<()> {
+                self.inner.resize(len)
+            }
+            fn create(&self, name: &str, type_: FileType, mode: u32) -> Result<Arc<dyn INode>> {
+                self.inner.create(name, type_, mode)
+            }
+            fn link(&self, name: &str, other: &Arc<dyn INode>) -> Result<()> {
+                self.inner.link(name, other)
+            }
+            fn unlink(&self, name: &str) -> Result<()> {
+                self.inner.unlink(name)
+            }
+            fn move_(&self, old: &str, target: &Arc<dyn INode>, new: &str) -> Result<()> {
+                self.inner.move_(old, target, new)
+            }
+            fn find(&self, name: &str) -> Result<Arc<dyn INode>> {
+                self.inner.find(name)
+            }
+            fn get_entry(&self, id: usize) -> Result<String> {
+                self.inner.get_entry(id)
+            }
+            fn io_control(&self, cmd: u32, data: usize) -> Result<usize> {
+                self.inner.io_control(cmd, data)
+            }
+            fn mmap(&self, area: MMapArea) -> Result<()> {
+                self.inner.mmap(area)
+            }
+            fn fs(&self) -> Arc<dyn FileSystem> {
+                self.inner.fs()
+            }
+            fn as_any_ref(&self) -> &dyn core::any::Any {
+                self.inner.as_any_ref()
+            }
+        }
+
+        let fs = RamFS::new();
+        let inner = fs
+            .root_inode()
+            .create("short", FileType::File, 0o644)
+            .unwrap();
+        let payload = alloc::vec![0xABu8; 8000];
+        inner.write_at(0, &payload).unwrap();
+        let short: Arc<dyn INode> = Arc::new(ShortFile {
+            inner,
+            cap: 8000,
+            size: 40_000, // claims more than `cap` can deliver
+        });
+        assert!(
+            short.read_as_vmo().is_err(),
+            "a mid-file EOF must not yield a half-zero exec image"
+        );
     }
 }
 

@@ -377,14 +377,13 @@ impl CurrentThreadExt for CurrentThread {
         }
         drop(linux_thread);
         // `exit(2)` from the LAST thread of a process is the process's exit,
-        // and its code is the process's code. Zircon's `remove_thread` ends
-        // the process when its last thread goes, but a process nobody called
-        // `exit` on terminates as `Exited(0)` -- so this argument, which was
-        // spelled `_exit_code` and read by nobody, was dropped on the floor
-        // and every `_exit(3)`/`syscall(SYS_exit, n)` that was not routed
-        // through `exit_group` reported SUCCESS to whoever was in `wait`.
+        // and its code is the process's code. Publish the hint first: two
+        // concurrent `_exit` calls can both see `thread_count() == 2` and
+        // neither win the `last_thread_of` race, so without the hint
+        // `remove_thread` → `terminate` invents `Exited(0)`.
         // (`exit_group` sets the status itself, and a status already set is
         // kept, so this changes nothing for the ordinary path.)
+        self.proc().hint_exit_code(exit_code as i64);
         if last_thread_of(self.proc().thread_count()) {
             self.proc().exit(exit_code as i64);
         }

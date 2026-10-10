@@ -8,6 +8,7 @@ use super::*;
 // `crate::signal::Signal` (the Linux signal enum) would shadow
 // `zircon_object::object::Signal` (the KObject signal bits used by
 // `impl_kobject!`), so alias it.
+use crate::process::ProcessExt;
 use crate::signal::{SigInfo, Signal as LinuxSignal, Sigset};
 use crate::thread::ThreadExt;
 use alloc::sync::Arc;
@@ -80,6 +81,9 @@ impl SignalFd {
     fn pending_matched(&self) -> Sigset {
         let mask = self.mask.load(SeqCst);
         if let Some(thread) = Self::current_thread() {
+            if let Some(lp) = thread.proc().try_linux() {
+                lp.pull_shared_pending_into(&thread);
+            }
             let tl = thread.lock_linux();
             return Sigset::new(tl.signals.val() & mask);
         }
@@ -127,6 +131,9 @@ impl SignalFd {
         let mask = self.mask.load(SeqCst);
         let thread = Self::current_thread()?;
         let mut tl = thread.lock_linux();
+        if let Some(lp) = thread.proc().try_linux() {
+            lp.pull_shared_pending_locked(&mut tl);
+        }
         let sig = Sigset::new(tl.signals.val() & mask).find_first_signal()?;
         Some(tl.take_siginfo(sig))
     }

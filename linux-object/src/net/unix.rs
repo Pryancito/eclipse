@@ -485,7 +485,13 @@ impl Future for UnixEventWait {
                 kernel_hal::timer_waker::kill_timer_waker(&mut this.timer);
                 return Poll::Ready(Ok(()));
             }
-            if this.sub_id.is_none() {
+            // Not `sub_id.is_none()`: one-shot callback; see `EventBusFuture`.
+            let live = this
+                .sub_id
+                .map(|id| inner.eventbus.is_subscribed(id))
+                .unwrap_or(false);
+            if !live {
+                this.sub_id = None;
                 let waker = cx.waker().clone();
                 let mask = this.mask;
                 this.sub_id = inner.eventbus.subscribe(Box::new(move |ev| {
@@ -576,29 +582,38 @@ impl Future for UnixPollWait<'_> {
                 if let Some(id) = this.sub_id.take() {
                     inner.eventbus.unsubscribe(id);
                 }
-            } else if this.sub_id.is_none() {
-                // Wake only for events we actually asked for. connect_pair
-                // latches WRITABLE and EventBus::subscribe fires immediately on
-                // already-set flags: if the callback also matched WRITABLE while
-                // the waiter only wanted POLLIN, every fresh async_poll (poll/
-                // epoll re-scan creates a new future) woke the task with no
-                // data → busy-spin shared across labwc/seatd/lunarbg/lunarbar.
-                // Same mask contract as EventBusFuture (used by read()).
-                let mut wake_mask = Event::CLOSED | Event::ERROR;
-                if want_read {
-                    wake_mask |= Event::READABLE;
-                }
-                if want_write {
-                    wake_mask |= Event::WRITABLE;
-                }
-                let waker = cx.waker().clone();
-                this.sub_id = inner.eventbus.subscribe(Box::new(move |ev| {
-                    if (ev & wake_mask).is_empty() {
-                        return false;
+            } else {
+                // Not `sub_id.is_none()`: one-shot callback; see `EventBusFuture`.
+                // Without this a drained peer leaves poll/epoll Pending forever.
+                let live = this
+                    .sub_id
+                    .map(|id| inner.eventbus.is_subscribed(id))
+                    .unwrap_or(false);
+                if !live {
+                    this.sub_id = None;
+                    // Wake only for events we actually asked for. connect_pair
+                    // latches WRITABLE and EventBus::subscribe fires immediately on
+                    // already-set flags: if the callback also matched WRITABLE while
+                    // the waiter only wanted POLLIN, every fresh async_poll (poll/
+                    // epoll re-scan creates a new future) woke the task with no
+                    // data → busy-spin shared across labwc/seatd/lunarbg/lunarbar.
+                    // Same mask contract as EventBusFuture (used by read()).
+                    let mut wake_mask = Event::CLOSED | Event::ERROR;
+                    if want_read {
+                        wake_mask |= Event::READABLE;
                     }
-                    waker.wake_by_ref();
-                    true
-                }));
+                    if want_write {
+                        wake_mask |= Event::WRITABLE;
+                    }
+                    let waker = cx.waker().clone();
+                    this.sub_id = inner.eventbus.subscribe(Box::new(move |ev| {
+                        if (ev & wake_mask).is_empty() {
+                            return false;
+                        }
+                        waker.wake_by_ref();
+                        true
+                    }));
+                }
             }
             let peer = if !ready && want_write {
                 inner.live_peer()

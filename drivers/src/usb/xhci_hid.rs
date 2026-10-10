@@ -14,7 +14,7 @@ use alloc::vec::Vec;
 use core::arch::x86_64::{_mm_clflush, _mm_mfence};
 use core::hint::spin_loop;
 use core::ptr::{read_volatile, write_volatile};
-use core::sync::atomic::{fence, AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{fence, AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use lock::Mutex;
 use pci::PCIDevice;
@@ -388,8 +388,8 @@ impl Drop for DmaBuf {
 pub struct XhciMmio {
     cap_base: usize,
     cap_len: u64,
-    op_base: usize,
-    rt_base: usize,
+    pub(crate) op_base: usize,
+    pub(crate) rt_base: usize,
     db_base: usize,
     bar_size: usize,
 }
@@ -6858,6 +6858,12 @@ pub struct XhciUsbHid {
     /// device. See `has_rel_mouse`.
     has_rel_mouse_flag: AtomicBool,
     has_tablet_flag: AtomicBool,
+    /// MMIO ops/runtime bases for a lock-free IRQ ack when `try_lock` fails.
+    /// Without this, an MSI that arrives while `/proc/usbhid` holds the mutex
+    /// returns without clearing USBSTS.EINT / IMAN.IP, and the controller
+    /// stays silent until the next lucky poll.
+    ack_op_base: AtomicUsize,
+    ack_rt_base: AtomicUsize,
 }
 
 /// Lista global para drenar event rings desde el timer (QEMU / IRQ perdidos).
@@ -7058,6 +7064,30 @@ pub fn poll() {
 }
 
 impl XhciUsbHid {
+    /// Clear USBSTS.EINT and IMAN.IP without taking `inner`. Safe for the MSI
+    /// path when another CPU already holds the mutex: these two registers are
+    /// write-1-to-clear / RMW of sticky interrupt bits, and a missed drain is
+    /// recovered by `poll()`.
+    fn ack_host_interrupt_unlocked(&self) {
+        let op = self.ack_op_base.load(Ordering::Relaxed);
+        let rt = self.ack_rt_base.load(Ordering::Relaxed);
+        if op == 0 || rt == 0 {
+            return;
+        }
+        fence(Ordering::Acquire);
+        let usbsts = unsafe { read_volatile((op + 0x04) as *const u32) };
+        if (usbsts & 0x08) != 0 {
+            fence(Ordering::Release);
+            unsafe { write_volatile((op + 0x04) as *mut u32, 0x08) };
+            fence(Ordering::Release);
+        }
+        fence(Ordering::Acquire);
+        let iman = unsafe { read_volatile((rt + 0x20) as *const u32) };
+        fence(Ordering::Release);
+        unsafe { write_volatile((rt + 0x20) as *mut u32, (iman & 0x02) | 0x01) };
+        fence(Ordering::Release);
+    }
+
     pub fn probe(
         dev: &PCIDevice,
         mmio_vaddr: usize,
@@ -7088,6 +7118,8 @@ impl XhciUsbHid {
             AtomicBool::new(inner.hids.iter().any(|h| h.protocol == HID_PROTO_MOUSE));
         let has_tablet_flag =
             AtomicBool::new(inner.hids.iter().any(|h| h.protocol == HID_PROTO_TABLET));
+        let ack_op = inner.mmio.op_base;
+        let ack_rt = inner.mmio.rt_base;
         let arc = Arc::new(Self {
             listener: EventListener::new(),
             inner: Mutex::new(Some(inner)),
@@ -7095,6 +7127,8 @@ impl XhciUsbHid {
             halted: AtomicBool::new(false),
             has_rel_mouse_flag,
             has_tablet_flag,
+            ack_op_base: AtomicUsize::new(ack_op),
+            ack_rt_base: AtomicUsize::new(ack_rt),
         });
         set_poll_instance(Some(arc.clone()));
         // La enumeracion de arranba de arriba corrio antes de que existiera
@@ -7149,10 +7183,12 @@ impl Scheme for XhciUsbHid {
         // thread on this same CPU is inside `debug_report()` (a `cat
         // /proc/usbhid`) or any other holder when the MSI arrives, a blocking
         // acquire here spins forever against a holder that cannot run until we
-        // return. `poll()` already took this route for the same reason, and it
-        // is the path that picks up whatever this turn leaves undrained: the
-        // events stay on the ring, and the io-wait tick acks and drains them.
+        // return. When the lock is busy, still ACK the MSI: an edge-triggered
+        // interrupt is not re-delivered until USBSTS.EINT / IMAN.IP are
+        // cleared, and poll() alone may not run soon enough to reopen the
+        // device. The ring drain waits for the next poll tick.
         let Some(mut g) = self.inner.try_lock() else {
+            self.ack_host_interrupt_unlocked();
             return;
         };
         if let Some(ref mut xi) = *g {

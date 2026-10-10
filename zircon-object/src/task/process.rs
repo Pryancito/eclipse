@@ -1,7 +1,7 @@
 use alloc::{boxed::Box, sync::Arc, vec::Vec};
 use core::{
     any::Any,
-    sync::atomic::{AtomicI32, AtomicU64, AtomicUsize, Ordering},
+    sync::atomic::{AtomicI32, AtomicI64, AtomicU64, AtomicUsize, Ordering},
 };
 
 use futures::channel::oneshot::{self, Receiver, Sender};
@@ -95,6 +95,13 @@ pub struct Process {
     dead_threads_time: AtomicU64,
     /// Kernel-mode counterpart of `dead_threads_time` (see `Thread::sys_time_ns`).
     dead_threads_sys_time: AtomicU64,
+    /// Exit code a thread asked to publish when it becomes the last one.
+    ///
+    /// `i64::MIN` means unset. Two concurrent `_exit` calls can both see
+    /// `thread_count() == 2` and neither call [`Process::exit`]; without this
+    /// hint `terminate` invents `Exited(0)`. Written before the thread leaves
+    /// the list; consumed when the list empties.
+    exit_code_hint: AtomicI64,
     /// The process's futex objects, keyed by the address of their word.
     ///
     /// Outside `inner` ON PURPOSE, for the same reason as `LinuxProcess`'s
@@ -352,6 +359,7 @@ impl Process {
             debug_exceptionate: Exceptionate::new(ExceptionChannelType::Debugger),
             dead_threads_time: AtomicU64::new(0),
             dead_threads_sys_time: AtomicU64::new(0),
+            exit_code_hint: AtomicI64::new(i64::MIN),
             futexes: Mutex::new(FutexTable::default()),
             inner: Mutex::new(ProcessInner::default()),
         });
@@ -384,6 +392,7 @@ impl Process {
             debug_exceptionate: Exceptionate::new(ExceptionChannelType::Debugger),
             dead_threads_time: AtomicU64::new(0),
             dead_threads_sys_time: AtomicU64::new(0),
+            exit_code_hint: AtomicI64::new(i64::MIN),
             futexes: Mutex::new(FutexTable::default()),
             inner: Mutex::new(ProcessInner::default()),
         });
@@ -413,6 +422,7 @@ impl Process {
             debug_exceptionate: Exceptionate::new(ExceptionChannelType::Debugger),
             dead_threads_time: AtomicU64::new(0),
             dead_threads_sys_time: AtomicU64::new(0),
+            exit_code_hint: AtomicI64::new(i64::MIN),
             futexes: Mutex::new(FutexTable::default()),
             inner: Mutex::new(ProcessInner::default()),
         });
@@ -994,9 +1004,22 @@ impl Process {
         let mut inner = self.inner.lock();
         inner.threads.retain(|t| t.id() != tid);
         if inner.threads.is_empty() {
+            if !matches!(inner.status, Status::Exited(_)) {
+                let hint = self.exit_code_hint.load(Ordering::Acquire);
+                inner.status = Status::Exited(if hint == i64::MIN { 0 } else { hint });
+            }
             drop(inner);
             self.terminate();
         }
+    }
+
+    /// Record the exit code a thread will publish if it turns out to be last.
+    ///
+    /// Must be called before the thread leaves the process list. Races between
+    /// concurrent `_exit` calls leave the last writer's value, which is what
+    /// Linux does when several threads exit without `exit_group`.
+    pub fn hint_exit_code(&self, retcode: i64) {
+        self.exit_code_hint.store(retcode, Ordering::Release);
     }
 
     /// Get information of this process.

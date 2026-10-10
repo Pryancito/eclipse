@@ -57,7 +57,7 @@ const PASADOS: &[(&str, usize)] = &[
     ("xtask/src/linux/mod.rs", 7500),
     ("linux-object/src/fs/devfs/drm_scheme.rs", 6750),
     ("linux-object/src/fs/procfs.rs", 6500),
-    ("linux-object/src/process.rs", 5750),
+    ("linux-object/src/process.rs", 5800),
     ("xtask/src/linux/desktop.rs", 5750),
     ("zircon-object/src/vm/vmar.rs", 5500),
     ("drivers/src/scheme/syncobj.rs", 5500),

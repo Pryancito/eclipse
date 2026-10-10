@@ -603,7 +603,10 @@ impl Scheme for E1000Interface {
                 drop(guard);
             });
         } else {
-            self.ims_rearm();
+            // Bottom-half already pending and IMC held. ICR was cleared by the
+            // read above; stashing is not available on this older path, but
+            // rearming IMS would let further edges clear causes the BH never
+            // sees. Leave the NIC masked until the queued poll's Drop rearms.
         }
     }
 }
