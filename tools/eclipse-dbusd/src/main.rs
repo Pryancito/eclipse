@@ -1476,8 +1476,43 @@ mod tests {
         (p, fds[1])
     }
 
-    fn is_open(fd: RawFd) -> bool {
-        unsafe { libc::fcntl(fd, libc::F_GETFD) != -1 }
+    /// What object a descriptor is on, as the kernel sees it, or `None` when
+    /// the number is not open at all.
+    fn fd_identity(fd: RawFd) -> Option<(u64, u64)> {
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        if unsafe { libc::fstat(fd, &mut st) } != 0 {
+            return None;
+        }
+        Some((st.st_dev as u64, st.st_ino as u64))
+    }
+
+    /// A descriptor on an object of its own, with the identity to recognise it
+    /// by later.
+    ///
+    /// These tests used to watch a `dup(2)` and ask `fcntl(F_GETFD)` whether
+    /// it was still open. That cannot tell "closed" from "this number is
+    /// somebody else's now": descriptor numbers belong to the whole process,
+    /// so another test in this binary gets the number the instant it is freed
+    /// and the check reads as "still open" again. It made
+    /// `a_flush_writes_a_chunk_once_and_lets_go_of_its_descriptors` and
+    /// `a_peer_that_goes_closes_every_descriptor_it_was_holding` fail about
+    /// one run in five, each blaming the other's allocation.
+    ///
+    /// An identity check alone would not have been enough either: every
+    /// `dup(2)` names the SAME object (stderr), so two of them are
+    /// indistinguishable. Hence an anonymous file per watched descriptor,
+    /// with an inode nobody else in the process has.
+    fn watched_fd() -> (RawFd, (u64, u64)) {
+        let name = b"eclipse-dbusd-test\0";
+        let fd = unsafe { libc::memfd_create(name.as_ptr() as *const libc::c_char, 0) };
+        assert!(fd >= 0, "memfd_create: {}", io::Error::last_os_error());
+        let id = fd_identity(fd).expect("a fresh memfd is open");
+        (fd, id)
+    }
+
+    /// Is THAT descriptor -- the object, not the number -- still open?
+    fn still_open(fd: RawFd, id: (u64, u64)) -> bool {
+        fd_identity(fd) == Some(id)
     }
 
     /// Send `bytes` with `fds` riding along as `SCM_RIGHTS`, each descriptor
@@ -1657,13 +1692,13 @@ mod tests {
     #[test]
     fn a_flush_writes_a_chunk_once_and_lets_go_of_its_descriptors() {
         let (mut p, other) = socket_pair();
-        let spare = unsafe { libc::dup(2) };
+        let (spare, spare_id) = watched_fd();
         p.queue(b"hello".to_vec(), vec![spare]);
         assert!(flush(&mut p), "the peer is still there");
         assert!(p.out.is_empty(), "a written chunk is popped, not retried");
         assert_eq!(p.out_done, 0, "and the cursor is back to the start");
         assert!(
-            !is_open(spare),
+            !still_open(spare, spare_id),
             "the daemon's copy of the descriptor is gone"
         );
 
@@ -1718,21 +1753,25 @@ mod tests {
     /// the ones queued for a write that will not happen now.
     #[test]
     fn a_peer_that_goes_closes_every_descriptor_it_was_holding() {
-        let received = unsafe { libc::dup(2) };
-        let queued = unsafe { libc::dup(2) };
-        let own = {
+        let (received, received_id) = watched_fd();
+        let (queued, queued_id) = watched_fd();
+        let (own, own_id) = {
             let (mut p, other) = socket_pair();
             unsafe { libc::close(other) };
             p.recv_fds.push_back(received);
             p.queue(b"never sent".to_vec(), vec![queued]);
-            p.fd
+            let id = fd_identity(p.fd).expect("the socket is open");
+            (p.fd, id)
         };
-        assert!(!is_open(received), "a descriptor nobody claimed is closed");
         assert!(
-            !is_open(queued),
+            !still_open(received, received_id),
+            "a descriptor nobody claimed is closed"
+        );
+        assert!(
+            !still_open(queued, queued_id),
             "so is one queued for a write that never ran"
         );
-        assert!(!is_open(own), "and the socket itself");
+        assert!(!still_open(own, own_id), "and the socket itself");
     }
 
     /// `Ok(false)` is how the read path says the peer closed its end. Read it
@@ -1909,7 +1948,7 @@ mod tests {
         let mut m = Message::method_call("org.example.Nobody", "/org/a", "org.example", "Do");
         m.serial = 2;
         m.unix_fds = 1;
-        let spare = unsafe { libc::dup(2) };
+        let (spare, spare_id) = watched_fd();
         route(1, m, vec![spare], &mut b);
 
         assert_eq!(b.outbox.len(), 2, "the bus answered");
@@ -1917,7 +1956,7 @@ mod tests {
         let parked = PENDING_FDS.with(|p| p.borrow().len());
         assert_eq!(parked, 0, "and the error was given no descriptors");
         assert!(
-            !is_open(spare),
+            !still_open(spare, spare_id),
             "a descriptor with nowhere to go is closed, not leaked"
         );
     }
