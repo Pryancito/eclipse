@@ -781,7 +781,7 @@ impl Syscall<'_> {
         // shmdt(2): an address nothing is attached at is EINVAL. It used to
         // answer 0, which also covered the second attachment of a segment
         // the old table had forgotten.
-        let shm_identifier = proc.shm_detach(addr).ok_or(LxError::EINVAL)?;
+        let (id, shm_identifier) = proc.shm_detach(addr).ok_or(LxError::EINVAL)?;
         // shmat() mapped the shared VMO into this address space; shmdt() must
         // remove that mapping. Previously it only dropped the tracking entry
         // and decremented nattch, leaving the segment MAPPED after detach:
@@ -802,6 +802,9 @@ impl Syscall<'_> {
             .guard
             .lock()
             .detach(self.zircon_process().id() as u32);
+        // MIT-SHM: Mesa marks the segment IPC_RMID right after its own shmat;
+        // when the last attach (often Xwayland's) drops, the id must go away.
+        linux_object::ipc::shm_destroy_if_orphaned(id, &shm_identifier.guard);
         Ok(0)
     }
 
@@ -874,18 +877,13 @@ impl Syscall<'_> {
                     return Err(LxError::EPERM);
                 }
                 // shmctl(2): `EINVAL` when the id does not name a segment any
-                // more, which is what a second `IPC_RMID` is. It answered 0
-                // and freed the key of whatever segment had been filed under
-                // this one's key in the meantime.
+                // more (already destroyed). While attaches remain, Linux keeps
+                // the id under SHM_DEST so the X server can still `shmat` --
+                // Mesa's dri_sw path does shmget/shmat/IPC_RMID before
+                // xcb_shm_attach every software frame.
                 if !linux_object::ipc::shm_unlink(id, &guard) {
                     return Err(LxError::EINVAL);
                 }
-                // The attachment stays. shmget(2): the segment is destroyed
-                // only once the last process detaches, and every user of the
-                // X11 extension removes the id the moment it has attached --
-                // dropping the attachment here left `shmdt` with nothing to
-                // find, so the mapping was never torn down and each image
-                // leaked its address range for the life of the process.
                 Ok(0)
             }
             ShmctlCmds::IPC_SET => {

@@ -117,12 +117,18 @@ fn arm_poller() {
     // this, only the eventfd path armed it — so a lone `sync_wait` on a
     // sync_file never saw the GPU land its fence and Zink killed the
     // swapchain (`zink: swapchain killed` → `GLXBadCurrentWindow`).
-    let interested =
-        WAITER_COUNT.load(Ordering::Relaxed) > 0 || super::syncobj_file::pending_waiter_count() > 0;
-    if !interested
-        || !zcore_drivers::scheme::syncobj::has_pending()
-        || POLLER_ARMED.swap(true, Ordering::AcqRel)
-    {
+    let sync_files = super::syncobj_file::pending_waiter_count() > 0;
+    let eventfds = WAITER_COUNT.load(Ordering::Relaxed) > 0;
+    if !(sync_files || eventfds) || POLLER_ARMED.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    // Eventfd-only: stand down when nothing is in flight (cheap idle).
+    // Sync_file waiters (GLX/DRI3) must keep ticking even before the fence
+    // exists — Mesa often exports a SYNC_FD and only then submits, and
+    // without a tick after that submit `sync_wait` parks forever (glxgears
+    // window up, gears frozen, no FPS).
+    if !sync_files && !zcore_drivers::scheme::syncobj::has_pending() {
+        POLLER_ARMED.store(false, Ordering::Release);
         return;
     }
     kernel_hal::timer::timer_set(
@@ -142,6 +148,12 @@ fn arm_poller() {
 /// exported a fence still in flight has no SYNCOBJ_EVENTFD waiter).
 pub(super) fn ensure_hw_fence_poller() {
     arm_poller();
+}
+
+/// Test/diag: whether the periodic HW-fence poller is currently scheduled.
+#[cfg(test)]
+pub(super) fn poller_is_armed() -> bool {
+    POLLER_ARMED.load(Ordering::Acquire)
 }
 
 /// Registered point-advance hook (see [`init`]). Deliver every waiter whose

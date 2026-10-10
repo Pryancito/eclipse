@@ -3912,9 +3912,9 @@ impl LinuxProcess {
             .attach(id, shared_guard, addr)
     }
 
-    /// Forget the attachment at `addr`, and say what was there; `None` when
-    /// nothing was, which `shmdt` answers with `EINVAL`.
-    pub fn shm_detach(&self, addr: usize) -> Option<ShmIdentifier> {
+    /// Forget the attachment at `addr`, and say `(id, what was there)`;
+    /// `None` when nothing was, which `shmdt` answers with `EINVAL`.
+    pub fn shm_detach(&self, addr: usize) -> Option<(usize, ShmIdentifier)> {
         self.inner.lock().shm_identifiers.detach(addr)
     }
 }

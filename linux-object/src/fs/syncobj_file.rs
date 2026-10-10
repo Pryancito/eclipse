@@ -101,6 +101,10 @@ impl SyncobjHandle {
         // returning), latch ready immediately so the first `sync_wait(fd, 0)`
         // succeeds. On real hardware the fence is often still in flight —
         // register a waiter and arm the HW-fence poller instead.
+        // Resolve first: the fence may have landed between `export_fence` and
+        // this call (common on a fast GPU). Without it we would register a
+        // waiter for a point already reached and rely entirely on the poller.
+        let _ = zcore_drivers::scheme::syncobj::poll_pending();
         let already = zcore_drivers::scheme::syncobj::query(handle)
             .map(|p| p >= point)
             .unwrap_or(false);
@@ -110,6 +114,10 @@ impl SyncobjHandle {
             eventbus.lock().set(Event::READABLE);
         } else {
             register_waiter(handle, point, signaled.clone(), eventbus.clone());
+            // Fence may have landed in the gap between `query` and the insert
+            // (same race `syncobj_eventfd::register` closes). Re-check unlocked.
+            let _ = zcore_drivers::scheme::syncobj::poll_pending();
+            wake_ready_waiters();
         }
         Arc::new(Self {
             base: KObjectBase::new(),
@@ -373,8 +381,28 @@ impl FileLike for SyncobjHandle {
             if !events.wants_read() || status.read {
                 return Ok(status);
             }
+            // Keep the HW-fence poller armed while we sleep on the EventBus:
+            // a pure `wait_for_event` only returns when READABLE is published,
+            // and that publish is what the poller (or a later syncobj ioctl)
+            // does. If arming was missed, re-arm here and also re-check on a
+            // short tick so GLX `sync_wait` cannot hang forever after the
+            // GPU has already written the landing zone.
+            super::syncobj_eventfd::ensure_hw_fence_poller();
             let bus = self.eventbus.clone();
-            crate::sync::wait_for_event(bus, Event::READABLE).await?;
+            let wait = crate::sync::wait_for_event(bus, Event::READABLE);
+            let tick = kernel_hal::thread::sleep_until(kernel_hal::timer::deadline_after(
+                core::time::Duration::from_millis(1),
+            ));
+            futures::pin_mut!(wait);
+            futures::pin_mut!(tick);
+            // Either the EventBus fired (fence published) or the tick expired
+            // (re-run `fence_ready` via `poll` above). Errors from the wait
+            // (EINTR) must propagate.
+            match futures::future::select(wait, tick).await {
+                futures::future::Either::Left((Err(e), _)) => return Err(e),
+                futures::future::Either::Left((Ok(_), _))
+                | futures::future::Either::Right((_, _)) => {}
+            }
         }
     }
 
@@ -620,6 +648,81 @@ mod sync_file_poll_tests {
             "sys_poll must be able to park on a sync_file"
         );
         drop(fd);
+    }
+
+    /// The GLX/DRI3 `SwapBuffers` path: EXEC attaches a HW fence, Mesa exports
+    /// a `SYNC_FD` (`export_fence` → carrier syncobj + `new_sync_file`), and
+    /// `sync_wait` polls that fd. The GPU landing the zone must make the fd
+    /// POLLIN without any further syncobj ioctl from the waiter — otherwise
+    /// glxgears shows one static frame and never prints FPS
+    /// (`eglgears_wayland` still works because it uses SYNCOBJ_EVENTFD).
+    #[test]
+    fn a_glx_exported_sync_file_becomes_pollable_when_its_hw_fence_lands() {
+        let _serial = super::super::syncobj_eventfd::hardware_fence_tests::TEST_SERIAL.lock();
+        super::super::syncobj_eventfd::init();
+
+        let src = zcore_drivers::scheme::syncobj::create(false);
+        let mut zone: u32 = 0;
+        let zone_ptr = &mut zone as *mut u32;
+        assert!(zcore_drivers::scheme::syncobj::attach_hw_fence(
+            src,
+            1,
+            zone_ptr as usize,
+            0,
+            1,
+            0,
+            true,
+        ));
+        let carrier =
+            zcore_drivers::scheme::syncobj::export_fence(src).expect("export SYNC_FD carrier");
+        let fd = SyncobjHandle::new_sync_file(carrier, 1);
+        assert!(
+            !fd.poll(PollEvents::IN).expect("poll").read,
+            "fence still in flight at export"
+        );
+        assert!(
+            pending_waiter_count() > 0,
+            "the sync_file must be waiting on the in-flight fence"
+        );
+
+        // SAFETY: zone is this stack frame; the syncobj layer reads it through
+        // the address handed to attach_hw_fence.
+        unsafe { zone_ptr.write_volatile(1) };
+        // No EventBus publish yet — only what Mesa's blocking poll does:
+        // re-enter fence_ready → poll_pending → publish.
+        assert!(
+            fd.poll(PollEvents::IN).expect("poll after land").read,
+            "once the GPU lands the zone, sync_wait(fd) must see POLLIN"
+        );
+        drop(fd);
+        let _ = zcore_drivers::scheme::syncobj::destroy(src);
+    }
+
+    /// Mesa often exports the SYNC_FD before the submit that will signal it.
+    /// The sync_file waiter must keep the HW poller armed across that gap.
+    #[test]
+    fn a_sync_file_waiter_keeps_the_poller_armed_before_the_fence_exists() {
+        let _serial = super::super::syncobj_eventfd::hardware_fence_tests::TEST_SERIAL.lock();
+        super::super::syncobj_eventfd::init();
+
+        let handle = zcore_drivers::scheme::syncobj::create(false);
+        assert!(zcore_drivers::scheme::syncobj::add_ref(handle));
+        let fd = SyncobjHandle::new_sync_file(handle, 1);
+        assert!(pending_waiter_count() > 0);
+        assert!(
+            !zcore_drivers::scheme::syncobj::has_pending(),
+            "nothing submitted yet"
+        );
+        // Re-arm explicitly (register_waiter already did); the point is that
+        // sync_file waiters alone are enough — eventfd-only would stand down.
+        super::super::syncobj_eventfd::ensure_hw_fence_poller();
+        assert!(
+            super::super::syncobj_eventfd::poller_is_armed(),
+            "a sync_file waiter with no fence yet must still leave the poller \
+             armed, or a later submit is never noticed"
+        );
+        drop(fd);
+        let _ = zcore_drivers::scheme::syncobj::destroy(handle);
     }
 }
 

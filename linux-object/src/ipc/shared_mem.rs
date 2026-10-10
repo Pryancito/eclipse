@@ -139,18 +139,18 @@ pub fn shm_totals() -> (usize, usize, usize) {
     (table.len(), tot, rss)
 }
 
-/// `shmctl(id, IPC_RMID, ..)`: the id stops naming the segment and no further
-/// `shmat` can find it.
-///
-/// The memory itself lives on while anyone is attached -- `shmat` mapped the
-/// VMO into the address space, which holds its own reference -- which is what
-/// shmget(2) requires and what every user of the X11 extension depends on:
-/// the idiom is `shmget` + `shmat` + `shmctl(IPC_RMID)` **immediately**, so
-/// the segment cannot outlive the client that made it, and then the buffer is
-/// used for the lifetime of the image.
+/// `shmctl(id, IPC_RMID, ..)` when nothing is attached: drop the id now.
+/// Prefer [`shm_unlink`], which matches Linux's deferred destroy under
+/// [`SHM_DEST`].
 pub fn shm_unregister(id: ShmId) -> bool {
     SHMID2SHM.write().remove(&id).is_some()
 }
+
+/// `SHM_DEST` in `shmid_ds.shm_perm.mode`: the segment was `IPC_RMID`'d and
+/// will be destroyed on the last detach (`include/uapi/linux/shm.h`). Same
+/// numeric value as `IPC_CREAT`, but that flag lives in `shmget`'s argument,
+/// not in the stored mode.
+pub const SHM_DEST: u32 = 0o1000;
 
 /// Take `guard` out of the key table, and only when the key still names
 /// **this** segment.
@@ -192,24 +192,62 @@ fn unlink_key(key2shm: &mut BTreeMap<u32, Weak<Mutex<ShmGuard>>>, guard: &Arc<Mu
     }
 }
 
-/// `shmctl(id, IPC_RMID, ..)` whole: the id and the key both stop naming the
-/// segment, whose memory lives on for whoever is already attached.
+/// `shmctl(id, IPC_RMID, ..)` whole: free the key, and either destroy the
+/// segment now or mark it [`SHM_DEST`] so it dies on the last detach.
 ///
-/// `false` means `id` does not name `guard` any more -- a second `IPC_RMID` on
-/// the same id -- which shmctl(2) answers with `EINVAL`. It used to answer 0
-/// and do the damage described in [`unlink_key`] on the way.
+/// Linux (`do_shm_rmid`): if anyone is still attached, the id **stays** in the
+/// table and further `shmat` calls succeed -- that is the MIT-SHM idiom Mesa
+/// and every X11 client use (`shmget` + `shmat` + `IPC_RMID` immediately,
+/// then the X server `shmat`s the same id). Removing the id here made
+/// Xwayland's attach fail with `EINVAL`, and Mesa logged
+/// `Failed to attach to x11 shm` on every software frame under X11.
+///
+/// `false` means `id` does not name `guard` any more -- a second `IPC_RMID`
+/// after the segment was already destroyed -- which shmctl(2) answers with
+/// `EINVAL`. A second `IPC_RMID` while still `SHM_DEST` is success (no-op
+/// beyond ensuring the key stays private).
 pub fn shm_unlink(id: ShmId, guard: &Arc<Mutex<ShmGuard>>) -> bool {
-    // Both tables before the segment: see `unlink_key`. Taken in the same
-    // order the old `shmctl` took them (`remove` then `shm_unregister`), so
-    // this adds no new pair.
+    // Both tables before the segment: see `unlink_key`.
     let mut key2shm = KEY2SHM.write();
     let mut ids = SHMID2SHM.write();
     if !ids.get(&id).is_some_and(|filed| Arc::ptr_eq(filed, guard)) {
         return false;
     }
-    ids.remove(&id);
     unlink_key(&mut key2shm, guard);
+    let nattch = {
+        let g = guard.lock();
+        let mut ds = g.shmid_ds.lock();
+        // Linux: "Do not find it any more" by key; the id stays until destroy.
+        ds.perm.key = 0;
+        if ds.nattch > 0 {
+            ds.perm.mode |= SHM_DEST;
+            return true;
+        }
+        ds.nattch
+    };
+    debug_assert_eq!(nattch, 0);
+    ids.remove(&id);
     true
+}
+
+/// After a detach (`shmdt`, `exit`, `execve`): if the segment was marked
+/// [`SHM_DEST`] and nobody is attached any more, drop it from the id table.
+///
+/// Safe to call on every detach; a live or unmarked segment is a no-op.
+pub fn shm_destroy_if_orphaned(id: ShmId, guard: &Arc<Mutex<ShmGuard>>) {
+    // Tables before the segment -- same order as `shm_unlink`.
+    let mut ids = SHMID2SHM.write();
+    if !ids.get(&id).is_some_and(|filed| Arc::ptr_eq(filed, guard)) {
+        return;
+    }
+    let doomed = {
+        let g = guard.lock();
+        let ds = g.shmid_ds.lock();
+        ds.nattch == 0 && ds.perm.mode & SHM_DEST != 0
+    };
+    if doomed {
+        ids.remove(&id);
+    }
 }
 
 /// Free the key of a segment nobody is going to remove by id. Only the tests
@@ -427,7 +465,9 @@ impl ShmGuard {
         }
         lock.perm.uid = new.perm.uid;
         lock.perm.gid = new.perm.gid;
-        lock.perm.mode = new.perm.mode & 0x1ff;
+        // Linux keeps SHM_DEST / SHM_LOCKED; only the nine permission bits
+        // come from userspace.
+        lock.perm.mode = (lock.perm.mode & !0x1ff) | (new.perm.mode & 0x1ff);
         Ok(())
     }
 
@@ -680,9 +720,8 @@ mod shm_tests {
         assert!(shm_lookup(id).is_none());
     }
 
-    /// `shmctl(id, IPC_RMID)` is what every user of the X11 extension calls
-    /// the moment it has attached: the id must stop working while the memory
-    /// stays alive for whoever is already attached.
+    /// `IPC_RMID` with nobody attached destroys the id immediately; the
+    /// memory stays alive for whoever still holds an `Arc` to the guard.
     #[test]
     fn removing_the_id_does_not_take_the_memory_with_it() {
         let _guard = test_lock();
@@ -699,6 +738,53 @@ mod shm_tests {
             .unwrap();
         // And removing it twice is not an error the second time round.
         assert!(!shm_unregister(id));
+    }
+
+    /// Mesa / MIT-SHM: `shmget` + `shmat` + `IPC_RMID`, then the X server
+    /// `shmat`s the same id. Linux keeps the id under `SHM_DEST` until the
+    /// last detach; removing it early is exactly `Failed to attach to x11 shm`.
+    #[test]
+    fn ipc_rmid_keeps_the_id_alive_while_anyone_is_attached() {
+        let _guard = test_lock();
+        clear_ids();
+        let seg = get(0, 4096, CREAT | 0o600).unwrap();
+        let id = shm_register(&seg).unwrap();
+        seg.lock().attach(1); // client shmat
+        assert!(shm_unlink(id, &seg), "IPC_RMID after client attach");
+        assert!(
+            shm_lookup(id).is_some(),
+            "id must still name the segment for the X server"
+        );
+        assert_ne!(
+            seg.lock().shmid_ds.lock().perm.mode & SHM_DEST,
+            0,
+            "marked SHM_DEST"
+        );
+        // Xwayland shmat -- the path es2gears_x11 takes every frame.
+        assert!(seg.lock().may_access(ROOT, ROOT, &[], IPC_R | IPC_W));
+        seg.lock().attach(2);
+        assert_eq!(seg.lock().shmid_ds.lock().nattch, 2);
+        seg.lock().detach(2);
+        shm_destroy_if_orphaned(id, &seg);
+        assert!(shm_lookup(id).is_some(), "client still holds it");
+        seg.lock().detach(1);
+        shm_destroy_if_orphaned(id, &seg);
+        assert!(shm_lookup(id).is_none(), "last detach destroys a SHM_DEST segment");
+        clear_ids();
+    }
+
+    /// `IPC_RMID` with no attaches removes the id at once (Linux `do_shm_rmid`
+    /// when `shm_nattch == 0`).
+    #[test]
+    fn ipc_rmid_with_no_attaches_destroys_immediately() {
+        let _guard = test_lock();
+        clear_ids();
+        let seg = get(0, 4096, CREAT | 0o666).unwrap();
+        let id = shm_register(&seg).unwrap();
+        assert!(shm_unlink(id, &seg));
+        assert!(shm_lookup(id).is_none());
+        assert!(!shm_unlink(id, &seg), "second IPC_RMID is EINVAL");
+        clear_ids();
     }
 
     /// A segment outlives the process that created it, so the table is the

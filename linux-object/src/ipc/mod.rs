@@ -325,15 +325,17 @@ impl ShmProc {
 
     /// Forget the attachment at `addr` -- that one only: the same segment
     /// attached elsewhere stays attached there, and the segment itself stays
-    /// known. Returns what was attached, or `None` when nothing was, which
-    /// shmdt(2) answers with `EINVAL`.
+    /// known. Returns `(id, what was attached)`, or `None` when nothing was,
+    /// which shmdt(2) answers with `EINVAL`. The id is what
+    /// [`shm_destroy_if_orphaned`] needs after the caller's
+    /// [`ShmGuard::detach`].
     ///
     /// The accounting on the segment is the caller's, through
     /// [`ShmGuard::detach`], because it carries the pid.
-    pub fn detach(&mut self, addr: usize) -> Option<ShmIdentifier> {
+    pub fn detach(&mut self, addr: usize) -> Option<(ShmId, ShmIdentifier)> {
         let id = self.attached.remove(&addr)?;
         let guard = self.segments.get(&id)?.clone();
-        Some(ShmIdentifier { addr, guard })
+        Some((id, ShmIdentifier { addr, guard }))
     }
 
     /// Forget the segment `id` and every attachment of it, without
@@ -367,11 +369,13 @@ impl ShmProc {
 impl Drop for ShmProc {
     /// The address space that held these attachments is gone (`exit`,
     /// `execve`): each of them is a detach on its segment (`shm_close`).
-    /// A segment only known, never attached, is not.
+    /// A segment only known, never attached, is not. A [`SHM_DEST`] segment
+    /// whose last user was this process is destroyed here too.
     fn drop(&mut self) {
         for id in self.attached.values() {
             if let Some(guard) = self.segments.get(id) {
                 guard.lock().account_detach();
+                shm_destroy_if_orphaned(*id, guard);
             }
         }
     }
@@ -475,7 +479,8 @@ mod shm_proc_tests {
         assert_eq!(proc.attachment_count(), 2);
 
         // Detaching one leaves the other attached, and the segment known.
-        let gone = proc.detach(HERE).expect("HERE was attached");
+        let (gone_id, gone) = proc.detach(HERE).expect("HERE was attached");
+        assert_eq!(gone_id, ID);
         assert_eq!(gone.addr, HERE);
         assert!(Arc::ptr_eq(&gone.guard, &guard));
         assert_eq!(proc.get_id(HERE), None);

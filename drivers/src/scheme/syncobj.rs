@@ -1695,7 +1695,7 @@ pub fn import_snapshot(dst: u32, src: u32, target: u64) -> bool {
 /// still-pending software timeline→timeline transfer reaches exactly the point
 /// that was asked for, the way `drm_syncobj_add_point` does.
 pub fn transfer(dst: u32, dst_point: u64, src: u32, src_point: u64) -> bool {
-    let (new_point, deferred) = {
+    let (outcome, deferred) = {
         let mut table = TABLE.lock();
         let d = resolve_locked(&mut table);
         let Some(src_eff) = effective_point(&table, src, LINK_DEPTH) else {
@@ -1769,7 +1769,15 @@ pub fn transfer(dst: u32, dst_point: u64, src: u32, src_point: u64) -> bool {
         if binary {
             obj.links.clear();
         }
-        let np = if reached {
+        // `signaled` = dst advanced (wake waiters on the landed point).
+        // `submitted` = a HW fence was attached but has not landed yet — same
+        // announcement [`attach_hw_fence`] makes, so SYNCOBJ_EVENTFD /
+        // sync_file pollers re-arm when waiters already sit on `dst`. Without
+        // it, `export_fence` (GLX/DRI3 SYNC_FD) copied the fence onto the
+        // carrier and returned with nobody watching: Mesa's `sync_wait` then
+        // parked forever after the first SwapBuffers and glxgears showed a
+        // frozen window with no FPS.
+        let (signaled, submitted) = if reached {
             let before = obj.point;
             if behind_a_node {
                 obj.push_link(Link {
@@ -1780,21 +1788,22 @@ pub fn transfer(dst: u32, dst_point: u64, src: u32, src_point: u64) -> bool {
                 if tainted {
                     mark_errored(&mut table, dst, before, point);
                 }
-                None
+                (None, None)
             } else {
                 obj.point = obj.point.max(point);
                 let after = obj.point;
                 if tainted {
                     mark_errored(&mut table, dst, before, after);
                 }
-                Some(after)
+                (Some(after), None)
             }
         } else if let Some(f) = hw {
             if point == 1 && obj.point == 1 {
                 // The binary slot is replaced: signaled no more.
                 obj.point = 0;
             }
-            if point > obj.point {
+            let attached = point > obj.point;
+            if attached {
                 table.pending.push(PendingFence {
                     handle: dst,
                     point,
@@ -1806,7 +1815,7 @@ pub fn transfer(dst: u32, dst_point: u64, src: u32, src_point: u64) -> bool {
                 });
                 PENDING_COUNT.store(table.pending.len(), Ordering::Relaxed);
             }
-            None
+            (None, attached.then_some(point))
         } else {
             if binary && obj.point == 1 {
                 // The binary slot is replaced: signaled no more.
@@ -1817,18 +1826,24 @@ pub fn transfer(dst: u32, dst_point: u64, src: u32, src_point: u64) -> bool {
                 dst_point: point,
             });
             ANY_LINKS.store(true, Ordering::Relaxed);
-            None
+            (None, None)
         };
         if had_link {
             collect_orphans(&mut table);
         }
-        (np, d)
+        ((signaled, submitted), d)
     };
-    // Lock released: a satisfied transfer advanced `dst`, so wake its waiters.
+    // Lock released. Resolve first (same order as [`attach_hw_fence`]), then
+    // announce: a satisfied transfer wakes waiters on the landed point; a
+    // HW-fence copy announces the *submitted* point so SYNCOBJ_EVENTFD /
+    // sync_file pollers re-arm when waiters already sit on `dst`.
+    deferred.run();
+    let (new_point, submitted) = outcome;
     if let Some(p) = new_point {
         notify_signal(dst, p);
+    } else if let Some(p) = submitted {
+        notify_signal(dst, p);
     }
-    deferred.run();
     true
 }
 
@@ -3482,9 +3497,12 @@ mod tests {
             Some(0),
             "the fence has not landed: the semaphore must stay unsignaled"
         );
+        // The surrogate may get a *submitted* announce from the HW-fence
+        // transfer (same as `attach_hw_fence`); that is not a landed signal.
+        // The acquire semaphore itself must stay quiet until the GPU writes.
         assert!(
-            !signals().iter().any(|&(h, _)| h == sem || h == surrogate),
-            "and nobody was woken early, got {:?}",
+            !signals().iter().any(|&(h, _)| h == sem),
+            "and the semaphore was not woken early, got {:?}",
             signals()
         );
         landing.land(7);
