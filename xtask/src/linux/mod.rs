@@ -4143,6 +4143,10 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
               export HOME=/var/run/pulse\n\
               export PULSE_RUNTIME_PATH=/run/pulse\n\
               export PULSE_STATE_PATH=/var/lib/pulse\n\
+              # Headroom for shared libs + /etc/group during initgroups(3).\n\
+              # Without it a fd table inherited near RLIMIT_NOFILE makes Pulse\n\
+              # die with: Failed to change group list: No file descriptors available\n\
+              ulimit -n 65536 2>/dev/null || ulimit -n 4096 2>/dev/null || true\n\
               # --log-level=info: the sink's 'Trying resume...', 'Resumed successfully...' and\n\
               # 'Starting playback.' are info-level; audio-probe [pulse-play] reads them from the log.\n\
               # A system.pa whose module-native-protocol-unix has no\n\

@@ -2720,6 +2720,12 @@ fn spawn(argv: &[String], log_path: Option<&str>) -> Option<i32> {
             // optional log file or /dev/null so service chatter never hits
             // the screen. init keeps the real console for its own lines.
             silence_stdio(log_path);
+            // Drop every inherited descriptor above stderr. PID 1 accumulates
+            // non-CLOEXEC fds (service logs, DRM probes, netlink, …); without
+            // this a child such as pulseaudio starts already at RLIMIT_NOFILE
+            // and dies in initgroups(3) opening /etc/group:
+            //   Failed to change group list: No file descriptors available
+            close_inherited_fds();
             libc::execve(prog.as_ptr(), p_args.as_ptr(), p_env.as_ptr());
             // execve only returns on failure.
             libc::_exit(127);
@@ -2780,6 +2786,29 @@ fn sweep_logs(services: &BTreeMap<String, Service>) {
         if let Some(line) = rotate_log(path) {
             log(&line);
         }
+    }
+}
+
+/// Close every fd ≥ 3 the child inherited from PID 1.
+///
+/// Async-signal-safe (`getrlimit`/`close` only). Caps the walk at 65536 so a
+/// broken `RLIMIT_NOFILE` of `RLIM_INFINITY` cannot turn into an unbounded
+/// close loop on the fork path.
+unsafe fn close_inherited_fds() {
+    let mut lim = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    let soft = if libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) == 0 {
+        // `rlim_cur` is one past the last legal fd number (Linux).
+        lim.rlim_cur.min(65536) as i32
+    } else {
+        1024
+    };
+    let mut fd = 3;
+    while fd < soft {
+        libc::close(fd);
+        fd += 1;
     }
 }
 

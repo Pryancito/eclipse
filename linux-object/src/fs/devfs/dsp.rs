@@ -276,6 +276,16 @@ fn convert_frames(format: i32, channels: usize, src: &[u8], frames: usize, dst: 
     }
 }
 
+/// One sample of digital silence for `format` (what SYNC pads a partial with).
+fn silence_byte(format: i32) -> u8 {
+    match format {
+        AFMT_U8 => 0x80,
+        AFMT_MU_LAW => 0xff,
+        AFMT_A_LAW => 0xd5,
+        _ => 0,
+    }
+}
+
 // ── Per-open runtime (Linux `snd_pcm_oss_runtime`) ──────────────────────────
 
 /// The client-visible parameters. Changing one marks the runtime dirty; the
@@ -316,8 +326,6 @@ struct OssRuntime {
     partial_len: usize,
     /// Client bytes accepted since open (Linux `oss.bytes`).
     bytes: u64,
-    /// Whole fragments reported played by the last `GETOPTR`.
-    optr_blocks: u64,
 }
 
 impl OssRuntime {
@@ -334,7 +342,6 @@ impl OssRuntime {
             partial: [0; 16],
             partial_len: 0,
             bytes: 0,
-            optr_blocks: 0,
         }
     }
 
@@ -739,6 +746,11 @@ impl DspDev {
             if nonblock {
                 break;
             }
+            // Held with a full buffer: space will not appear until SETTRIGGER.
+            // That is not a wedged device — answer EAGAIN, not EIO.
+            if !rt.trigger && self.room(&rt) < cf {
+                break;
+            }
             // Buffer full: the device frees space at the PCM byte rate. The
             // synchronous INode contract leaves no waker to park on, so
             // retry with a backoff, bounded so a wedged stream cannot hang
@@ -775,12 +787,11 @@ impl DspDev {
         }
         rt.bytes += consumed as u64;
         if consumed == 0 {
-            if nonblock {
+            // Full + held, or nonblock with no room: retry later. EIO is for
+            // a ring that should have been draining and did not.
+            if nonblock || !rt.trigger {
                 return Err(FsError::Again);
             }
-            // A blocking write that took nothing: the ring never freed a
-            // whole client frame before the deadline above. The numbers are
-            // in that `warn!`; this says which `write(2)` it answered.
             kernel_hal::klog_warn!(
                 "[dsp{}] write: nothing taken from a {} B write -> EIO",
                 self.index,
@@ -791,24 +802,62 @@ impl DspDev {
         Ok(consumed)
     }
 
-    /// `SNDCTL_DSP_SYNC`: play out everything queued, then leave the stream
-    /// stopped so the next write starts it afresh (Linux sets `oss.prepare`).
-    fn sync(&self, rt: &mut OssRuntime) -> Result<()> {
-        self.make_ready(rt)?;
-        rt.partial_len = 0;
-        if rt.trigger && self.audio.is_playing() {
-            let deadline = kernel_hal::timer::timer_now()
-                + core::time::Duration::from_secs(self.drain_secs(self.audio.queued_bytes()));
-            while self.audio.queued_bytes() > 0 && self.audio.is_playing() {
-                if kernel_hal::timer::timer_now() >= deadline {
-                    break;
-                }
-                Self::backoff();
-            }
+    /// Pad a carried-over partial client frame out with silence and queue it.
+    fn flush_partial(&self, rt: &mut OssRuntime) -> Result<()> {
+        if rt.partial_len == 0 {
+            return Ok(());
         }
+        let cf = rt.client_frame();
+        let mut frame = [0u8; 16];
+        let fill = silence_byte(rt.params.format);
+        frame[..cf].fill(fill);
+        frame[..rt.partial_len].copy_from_slice(&rt.partial[..rt.partial_len]);
+        rt.partial_len = 0;
+        let format = rt.params.format;
+        let channels = rt.params.channels;
+        if format == AFMT_S16_LE && channels == 2 {
+            let _ = self
+                .audio
+                .write(&frame[..cf])
+                .map_err(|_| FsError::DeviceError)?;
+        } else {
+            let mut hw = Vec::new();
+            convert_frames(format, channels, &frame[..cf], 1, &mut hw);
+            let _ = self.audio.write(&hw).map_err(|_| FsError::DeviceError)?;
+        }
+        rt.bytes += cf as u64;
+        Ok(())
+    }
+
+    /// Wait until the device queue is empty (or `deadline`), without holding
+    /// `rt` — SYNC and close both need that so other ioctls are not wedged.
+    fn wait_drained(&self, queued_hint: usize) {
+        let deadline = kernel_hal::timer::timer_now()
+            + core::time::Duration::from_secs(self.drain_secs(queued_hint));
+        while self.audio.queued_bytes() > 0 {
+            if kernel_hal::timer::timer_now() >= deadline {
+                break;
+            }
+            Self::backoff();
+        }
+    }
+
+    /// `SNDCTL_DSP_SYNC` / close: flush the partial, play out the queue, then
+    /// leave the stream prepared. Caller must not hold `rt` across the wait.
+    fn sync_begin(&self, rt: &mut OssRuntime) -> Result<usize> {
+        self.make_ready(rt)?;
+        self.flush_partial(rt)?;
+        if rt.trigger {
+            let _ = self.audio.set_start_hold(false);
+            super::snd::arm_playback_watchdog();
+        }
+        Ok(self.audio.queued_bytes())
+    }
+
+    fn sync_finish(&self, rt: &mut OssRuntime) {
         let _ = self.audio.reset();
         rt.prepare = true;
-        Ok(())
+        rt.partial_len = 0;
     }
 
     /// `SNDCTL_DSP_RESET`: stop at once and drop what was queued.
@@ -816,7 +865,6 @@ impl DspDev {
         let _ = self.audio.reset();
         rt.prepare = true;
         rt.partial_len = 0;
-        rt.optr_blocks = 0;
     }
 
     fn set_trigger(&self, rt: &mut OssRuntime, bits: i32) -> Result<()> {
@@ -844,28 +892,52 @@ impl DspDev {
     }
 
     fn ospace(&self, rt: &mut OssRuntime) -> Result<AudioBufInfo> {
-        self.make_ready(rt)?;
+        // Linux: with `oss.prepare` / dirty params, report a full buffer
+        // without consuming the prepare (GETOSPACE is observational).
+        if rt.prepare || rt.params_dirty {
+            let (period, periods) = if rt.period_bytes != 0 && !rt.params_dirty {
+                (rt.period_bytes, rt.periods)
+            } else {
+                self.geometry(&rt.params, rt.hw_rate.max(rt.params.rate))
+            };
+            let bytes = period.saturating_mul(periods);
+            return Ok(AudioBufInfo {
+                fragments: periods.min(i32::MAX as usize) as i32,
+                fragstotal: periods.min(i32::MAX as usize) as i32,
+                fragsize: period.min(i32::MAX as usize) as i32,
+                bytes: bytes.min(i32::MAX as usize) as i32,
+            });
+        }
         // Linux: the free bytes less what sits in its partial-period buffer.
         let bytes = self.room(rt).saturating_sub(rt.partial_len);
         Ok(AudioBufInfo {
-            fragments: (bytes / rt.period_bytes.max(1)) as i32,
-            fragstotal: rt.periods as i32,
-            fragsize: rt.period_bytes as i32,
-            bytes: bytes as i32,
+            fragments: (bytes / rt.period_bytes.max(1)).min(i32::MAX as usize) as i32,
+            fragstotal: rt.periods.min(i32::MAX as usize) as i32,
+            fragsize: rt.period_bytes.min(i32::MAX as usize) as i32,
+            bytes: bytes.min(i32::MAX as usize) as i32,
         })
     }
 
-    fn optr(&self, rt: &mut OssRuntime) -> Result<CountInfo> {
-        self.make_ready(rt)?;
-        let played = rt.bytes.saturating_sub(self.odelay(rt) as u64);
-        let blocks = played / rt.period_bytes.max(1) as u64;
-        let delta = blocks.saturating_sub(rt.optr_blocks);
-        rt.optr_blocks = blocks;
-        Ok(CountInfo {
-            bytes: (played & i32::MAX as u64) as i32,
-            blocks: delta.min(i32::MAX as u64) as i32,
-            ptr: (played % rt.buffer_bytes().max(1) as u64) as i32,
-        })
+    fn optr(&self, rt: &OssRuntime) -> CountInfo {
+        // Linux `snd_pcm_oss_get_ptr`: while prepare, zeros and no side effects.
+        if rt.prepare || rt.params_dirty || rt.period_bytes == 0 {
+            return CountInfo {
+                bytes: 0,
+                blocks: 0,
+                ptr: 0,
+            };
+        }
+        // `bytes` = total accepted since open; `blocks` = fragments still
+        // queued (delay / period); `ptr` = playhead within the OSS buffer.
+        let delay = self.odelay(rt);
+        let period = rt.period_bytes.max(1);
+        let buffer = rt.buffer_bytes().max(1);
+        let played = rt.bytes.saturating_sub(delay as u64);
+        CountInfo {
+            bytes: (rt.bytes & i32::MAX as u64) as i32,
+            blocks: (delay / period).min(i32::MAX as usize) as i32,
+            ptr: (played % buffer as u64) as i32,
+        }
     }
 }
 
@@ -874,14 +946,20 @@ impl Drop for DspDev {
         if !self.client {
             return;
         }
-        // Close does NOT reset the stream: OSS `close(2)` drains by default
-        // (`SNDCTL_DSP_SYNC` is the explicit form) and the ring plays out on
-        // its own at the PCM byte rate. Dropping it here would cut the tail
-        // off a `cat music.raw > /dev/dsp`. Releasing the claim is enough —
-        // the next opener, PCM or OSS, resets on PREPARE / SETFMT anyway.
-        // A start hold does not outlive the fd that set it, though: a held
-        // ring is by definition not playing, and the next client must not
-        // inherit it.
+        // Linux `snd_pcm_oss_release` SYNCs before freeing the substream.
+        // On HDA the `audio` Arc is a `HdaStream`: dropping it without a
+        // drain removes the mixer client and throws away still-queued PCM
+        // (`cat music.raw > /dev/dsp` would lose the tail). On unmixed
+        // devices the claim must not go free while the ring is still full.
+        let queued = {
+            let mut rt = self.rt.lock();
+            self.sync_begin(&mut rt).unwrap_or(0)
+        };
+        self.wait_drained(queued);
+        {
+            let mut rt = self.rt.lock();
+            self.sync_finish(&mut rt);
+        }
         let _ = self.audio.set_start_hold(false);
         if self.release_opened_on_drop {
             self.opened.store(false, Ordering::Release);
@@ -902,13 +980,15 @@ impl INode for DspDev {
     }
 
     fn poll(&self) -> Result<PollStatus> {
-        // Linux `snd_pcm_oss_poll`: writable while the stream is not running
-        // (a write would start it) or once a whole fragment fits.
+        // Writable when a whole fragment fits (or the stream is not yet
+        // configured). Do not treat "not playing" as writable: with
+        // SETTRIGGER off the ring does not drain, so a full buffer must
+        // report !POLLOUT or poll loops spin against EAGAIN.
         let rt = self.rt.lock();
         let write = if rt.params_dirty || rt.prepare || rt.period_bytes == 0 {
             true
         } else {
-            !self.audio.is_playing() || self.room(&rt) >= rt.period_bytes
+            self.room(&rt) >= rt.period_bytes
         };
         Ok(PollStatus {
             read: false,
@@ -924,11 +1004,21 @@ impl INode for DspDev {
         match cmd {
             OSS_GETVERSION => uwrite::<i32>(data, SNDRV_OSS_VERSION)?,
             SNDCTL_DSP_RESET => self.reset(&mut rt),
-            SNDCTL_DSP_SYNC => self.sync(&mut rt)?,
+            SNDCTL_DSP_SYNC => {
+                let queued = self.sync_begin(&mut rt)?;
+                drop(rt);
+                self.wait_drained(queued);
+                rt = self.rt.lock();
+                self.sync_finish(&mut rt);
+            }
             SNDCTL_DSP_POST => {
-                // "Start what is buffered": nothing to flush at frame
-                // granularity, but a stopped stream with data gets kicked.
+                // Linux `snd_pcm_oss_post` → START: push whatever is buffered.
                 self.make_ready(&mut rt)?;
+                if rt.trigger {
+                    self.audio
+                        .set_start_hold(false)
+                        .map_err(|_| FsError::DeviceError)?;
+                }
                 super::snd::arm_playback_watchdog();
             }
             SNDCTL_DSP_SPEED => {
@@ -951,8 +1041,9 @@ impl INode for DspDev {
             SNDCTL_DSP_SETFMT => {
                 let req = uread::<i32>(data)?;
                 if req != AFMT_QUERY {
-                    // An unsupported format is answered with U8, as on Linux.
-                    let fmt = if SUPPORTED_FORMATS & req == req {
+                    // Exactly one supported AFMT bit: a mask of several would
+                    // pass the subset check and then decode as silence.
+                    let fmt = if req.count_ones() == 1 && SUPPORTED_FORMATS & req == req {
                         req
                     } else {
                         AFMT_U8
@@ -967,7 +1058,10 @@ impl INode for DspDev {
             }
             SOUND_PCM_READ_BITS => {
                 self.make_ready(&mut rt)?;
-                uwrite::<i32>(data, rt.params.format)?;
+                // Bits per sample, not the AFMT_* mask (soundcard.h /
+                // `SOUND_PCM_READ_BITS`).
+                let bits = (sample_bytes(rt.params.format).unwrap_or(2) * 8) as i32;
+                uwrite::<i32>(data, bits)?;
             }
             SNDCTL_DSP_GETFMTS => uwrite::<i32>(data, SUPPORTED_FORMATS)?,
             SNDCTL_DSP_CHANNELS | SNDCTL_DSP_STEREO => {
@@ -982,7 +1076,8 @@ impl INode for DspDev {
                     if req > 128 {
                         return Err(FsError::InvalidParam);
                     }
-                    // The ring is stereo; anything wider is downmixed to it.
+                    // The ring is stereo; wider requests are clamped (clients
+                    // must honour the returned channel count).
                     req.clamp(1, 2) as usize
                 };
                 if channels != rt.params.channels {
@@ -1004,24 +1099,38 @@ impl INode for DspDev {
             }
             SNDCTL_DSP_SETFRAGMENT => {
                 let val = uread::<i32>(data)? as u32;
-                // Once per open, and not after SUBDIVIDE (Linux).
-                if rt.params.subdivision != 0 || rt.params.fragshift != 0 {
+                // Once per open, and not after SUBDIVIDE (Linux). `maxfrags`
+                // starts at 0 and is set on the first call even when
+                // `fragshift` stays unset (0 = keep the default size).
+                if rt.params.subdivision != 0
+                    || rt.params.fragshift != 0
+                    || rt.params.maxfrags != 0
+                {
                     return Err(FsError::InvalidParam);
                 }
                 let fragshift = val & 0xffff;
                 if fragshift >= 25 {
                     return Err(FsError::InvalidParam);
                 }
-                rt.params.fragshift = fragshift.max(4);
+                // `fragshift == 0` means "leave the default size"; forcing it
+                // to 4 made a no-op request change the geometry.
+                if fragshift != 0 {
+                    rt.params.fragshift = fragshift.max(4);
+                }
                 rt.params.maxfrags = ((val >> 16) & 0xffff).max(2) as usize;
                 rt.params_dirty = true;
+                let applied = (rt.params.maxfrags as u32) << 16 | rt.params.fragshift;
+                uwrite::<i32>(data, applied as i32)?;
             }
             SNDCTL_DSP_SUBDIVIDE => {
                 let val = uread::<i32>(data)?;
                 if val == 0 {
                     uwrite::<i32>(data, rt.params.subdivision.max(1) as i32)?;
                 } else {
-                    if rt.params.subdivision != 0 || rt.params.fragshift != 0 {
+                    if rt.params.subdivision != 0
+                        || rt.params.fragshift != 0
+                        || rt.params.maxfrags != 0
+                    {
                         return Err(FsError::InvalidParam);
                     }
                     if val != 1 && val != 2 && val != 4 {
@@ -1038,7 +1147,7 @@ impl INode for DspDev {
             }
             SNDCTL_DSP_GETISPACE | SNDCTL_DSP_GETIPTR => return Err(FsError::InvalidParam),
             SNDCTL_DSP_GETOPTR => {
-                let info = self.optr(&mut rt)?;
+                let info = self.optr(&rt);
                 uwrite::<CountInfo>(data, info)?;
             }
             SNDCTL_DSP_GETODELAY => {
@@ -1269,10 +1378,7 @@ mod tests {
         // 48 kHz S16LE stereo: the ring's 49152 B round down to a 32 KiB
         // buffer, halved once under a second of audio then split in four.
         assert_eq!(ioctl_int(&node, SOUND_PCM_READ_RATE, 0).unwrap(), 48_000);
-        assert_eq!(
-            ioctl_int(&node, SOUND_PCM_READ_BITS, 0).unwrap(),
-            AFMT_S16_LE
-        );
+        assert_eq!(ioctl_int(&node, SOUND_PCM_READ_BITS, 0).unwrap(), 16);
         assert_eq!(ioctl_int(&node, SOUND_PCM_READ_CHANNELS, 0).unwrap(), 2);
         assert_eq!(ioctl_int(&node, SNDCTL_DSP_GETBLKSIZE, 0).unwrap(), 4096);
         let sp = ospace(&node);
@@ -1288,10 +1394,7 @@ mod tests {
         let node = DspDev::with_defaults(audio.clone(), 0, new_audio_claim(), OssDefaults::Audio)
             .open_client()
             .unwrap();
-        assert_eq!(
-            ioctl_int(&node, SOUND_PCM_READ_BITS, 0).unwrap(),
-            AFMT_MU_LAW
-        );
+        assert_eq!(ioctl_int(&node, SOUND_PCM_READ_BITS, 0).unwrap(), 8);
         assert_eq!(ioctl_int(&node, SOUND_PCM_READ_CHANNELS, 0).unwrap(), 1);
         assert_eq!(ioctl_int(&node, SOUND_PCM_READ_RATE, 0).unwrap(), 8_000);
         assert_eq!(node.metadata().unwrap().rdev, make_rdev(14, 4));
@@ -1362,7 +1465,8 @@ mod tests {
         assert_eq!(ioctl_int(&node, SNDCTL_DSP_GETODELAY, 0).unwrap(), 4);
         audio.drain(8);
         let p = optr(&node);
-        assert_eq!((p.bytes, p.ptr), (2, 2));
+        // `bytes` is total accepted (Linux `oss.bytes`); `ptr` is the playhead.
+        assert_eq!((p.bytes, p.ptr), (4, 2));
         assert_eq!(ioctl_int(&node, SNDCTL_DSP_GETODELAY, 0).unwrap(), 2);
     }
 
@@ -1433,13 +1537,12 @@ mod tests {
         assert!(node.poll().unwrap().write);
         assert_eq!(ospace(&node).fragments, 1);
         assert_eq!(as_dsp(&node).write_pcm(&pcm, true).unwrap(), 4096);
-        // GETOPTR counts whole fragments played since the last call.
-        let p = optr(&node);
-        assert_eq!((p.bytes, p.blocks, p.ptr), (4096, 1, 4096));
-        audio.drain(8192);
+        // GETOPTR: total bytes in, fragments still queued, playhead in buffer.
         let p = optr(&node);
         assert_eq!((p.bytes, p.blocks, p.ptr), (12288, 2, 4096));
-        assert_eq!(optr(&node).blocks, 0);
+        audio.drain(8192);
+        let p = optr(&node);
+        assert_eq!((p.bytes, p.blocks, p.ptr), (12288, 0, 4096));
     }
 
     #[test]
@@ -1488,8 +1591,15 @@ mod tests {
         assert_eq!(d.write_pcm(&pcm, false).unwrap(), 4096);
         assert!(!audio.is_playing());
         assert_eq!(audio.queued_bytes(), 8192);
-        // …a held stream still polls writable (a write would not block)…
+        // Room remains: still POLLOUT. Fill the OSS buffer — then poll must
+        // not claim writable while the hold keeps the ring from draining.
         assert!(node.poll().unwrap().write);
+        let rest = ospace(&node).bytes as usize;
+        assert!(rest > 0);
+        let fill = alloc::vec![0u8; rest];
+        assert_eq!(d.write_pcm(&fill, false).unwrap(), rest);
+        assert!(!node.poll().unwrap().write);
+        assert!(matches!(d.write_pcm(&pcm, true), Err(FsError::Again)));
         // …and the enable starts it with everything primed.
         ioctl_int(&node, SNDCTL_DSP_SETTRIGGER, PCM_ENABLE_OUTPUT).unwrap();
         assert_eq!(
@@ -1498,7 +1608,7 @@ mod tests {
         );
         assert!(audio.is_playing());
         assert!(!audio.st.lock().hold);
-        assert_eq!(audio.queued_bytes(), 8192);
+        assert_eq!(audio.queued_bytes(), 8192 + rest);
     }
 
     #[test]
@@ -1520,6 +1630,9 @@ mod tests {
         audio.drain(4096);
         ioctl_int(&node, SNDCTL_DSP_SYNC, 0).unwrap();
         assert_eq!(audio.st.lock().resets, before + 1);
+        assert!(d.rt.lock().prepare);
+        // Observational ioctls must not consume `prepare`.
+        assert_eq!(optr(&node).bytes, 0);
         assert!(d.rt.lock().prepare);
         // The next write prepares (a reset) without reprogramming.
         let params = audio.st.lock().params_calls;

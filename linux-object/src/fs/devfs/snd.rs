@@ -40,7 +40,7 @@
 
 use alloc::boxed::Box;
 use alloc::collections::VecDeque;
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::any::Any;
 use core::convert::TryFrom;
@@ -512,6 +512,13 @@ pub struct PcmDev {
     /// a client of an unmixed device. A client with a stream of its own
     /// never took it.
     release_opened_on_drop: bool,
+    /// Card-wide: which mixing client's `period_clock` `/dev/snd/timer`
+    /// samples. Shared by the registry node and every `open_stream` client;
+    /// unmixed opens share the registry `st` so the focus stays unused.
+    timer_focus: Arc<Mutex<Option<Weak<PcmDev>>>>,
+    /// `Weak` to this `Arc` when the node was built with `Arc::new_cyclic`
+    /// (mixing clients); empty on the registry node and on unmixed clients.
+    self_weak: Weak<PcmDev>,
 }
 
 impl PcmDev {
@@ -533,6 +540,8 @@ impl PcmDev {
             opened,
             client: false,
             release_opened_on_drop: false,
+            timer_focus: Arc::new(Mutex::new(None)),
+            self_weak: Weak::new(),
         }
     }
 
@@ -568,9 +577,8 @@ impl PcmDev {
     /// and state, mixed in the kernel with every other open (PulseAudio's
     /// and a bare `mpg123 -o alsa` at once). The runtime state is fresh
     /// per open, so nothing one client sets reaches another. The timer
-    /// node (`/dev/snd/timer`) still samples the registry node's state,
-    /// which no client-of-a-stream drives; a `dmix` on top of a device
-    /// that already mixes has nothing to add anyway.
+    /// node (`/dev/snd/timer`) samples whichever mixing client last entered
+    /// RUNNING (via [`Self::timer_focus`]).
     ///
     /// On a device with one ring and no mixer, the one process that owns
     /// it keeps the shared runtime state and timer view until close, and
@@ -578,14 +586,20 @@ impl PcmDev {
     /// shares the claim, included.
     pub fn open_client(&self) -> Result<Arc<dyn INode>> {
         if let Some(stream) = self.audio.open_stream().map_err(|_| FsError::DeviceError)? {
-            return Ok(Arc::new(PcmDev {
+            let focus = self.timer_focus.clone();
+            let card = self.card;
+            let inode_id = self.inode_id;
+            let opened = self.opened.clone();
+            return Ok(Arc::new_cyclic(|weak| PcmDev {
                 audio: stream,
-                card: self.card,
-                inode_id: self.inode_id,
+                card,
+                inode_id,
                 st: Self::fresh_state(),
-                opened: self.opened.clone(),
+                opened,
                 client: true,
                 release_opened_on_drop: false,
+                timer_focus: focus,
+                self_weak: weak.clone(),
             }));
         }
         if self
@@ -603,6 +617,8 @@ impl PcmDev {
             opened: self.opened.clone(),
             client: true,
             release_opened_on_drop: true,
+            timer_focus: self.timer_focus.clone(),
+            self_weak: Weak::new(),
         }))
     }
 
@@ -660,13 +676,18 @@ impl PcmDev {
             return;
         }
         if self.avail(st) >= st.stop_threshold {
+            let avail = self.avail(st);
+            let stop = st.stop_threshold;
             st.state = STATE_XRUN;
             st.stalled_since = None;
+            // Same stop as the XRUN ioctl: leave the engine looping silence
+            // and the next client's DELAY/is_playing stay wrong until PREPARE.
+            let _ = self.audio.reset();
+            let _ = self.audio.set_start_hold(false);
+            self.clear_timer_focus();
             info!(
                 "[snd] pcmC{}D0p: ring ran dry (avail {} >= stop_threshold {}) -> XRUN",
-                self.card,
-                self.avail(st),
-                st.stop_threshold
+                self.card, avail, stop
             );
         }
     }
@@ -682,13 +703,50 @@ impl PcmDev {
             sec: now.as_secs() as i64,
             nsec: now.subsec_nanos() as i64,
         };
+        self.publish_timer_focus();
         arm_playback_watchdog();
+    }
+
+    /// Publish this mixing client as the card's `/dev/snd/timer` source.
+    fn publish_timer_focus(&self) {
+        if self.self_weak.strong_count() > 0 {
+            *self.timer_focus.lock() = Some(self.self_weak.clone());
+        }
+    }
+
+    /// Drop timer focus when this client was the one the timer was following.
+    fn clear_timer_focus(&self) {
+        let mut focus = self.timer_focus.lock();
+        if focus
+            .as_ref()
+            .is_some_and(|w| w.ptr_eq(&self.self_weak))
+        {
+            *focus = None;
+        }
     }
 
     /// What the ALSA timer bound to this stream samples: whether the stream
     /// runs, how many whole periods the hardware pointer has passed, and the
     /// period length in ns (the timer's resolution).
     pub(crate) fn period_clock(&self) -> PeriodClock {
+        // Prefer the mixing client that is actually RUNNING: the registry
+        // node's own `st` stays OPEN forever on HDA (`open_stream` always
+        // answers Some). Upgrade under the focus lock, then drop it before
+        // sampling — `period_clock_local` may clear the focus on XRUN.
+        let client = self
+            .timer_focus
+            .lock()
+            .as_ref()
+            .and_then(|w| w.upgrade());
+        if let Some(client) = client {
+            if !core::ptr::eq(client.as_ref(), self) {
+                return client.period_clock_local();
+            }
+        }
+        self.period_clock_local()
+    }
+
+    fn period_clock_local(&self) -> PeriodClock {
         // Lock order everywhere in this file is `st` then the audio driver
         // (`hw_ptr` -> `queued_frames` refreshes the hardware position);
         // nothing takes them the other way round.
@@ -1445,22 +1503,29 @@ impl PcmDev {
     }
 
     fn drain(&self) -> Result<()> {
-        let (rate, state) = {
+        let rate = {
             let mut st = self.st.lock();
             // Linux starts a PREPARED stream that holds data before draining
             // it, whatever its start_threshold.
             if st.state == STATE_PREPARED && self.queued_frames() > 0 {
                 self.start_running(&mut st);
             }
-            (st.rate.max(1) as u64, st.state)
+            // Only a stream whose DMA is actually running can drain. Waiting
+            // on a paused one -- PulseAudio corks a sink and then drains it
+            // on the way out -- burns the whole timeout in a spin loop with
+            // nothing on the other end. Linux treats DRAIN on a stopped
+            // stream as immediately complete.
+            if st.state == STATE_PAUSED || !self.audio.is_playing() {
+                let _ = self.audio.reset();
+                st.state = STATE_SETUP;
+                st.appl_ptr = 0;
+                st.stalled_since = None;
+                self.clear_timer_focus();
+                return Ok(());
+            }
+            st.state = STATE_DRAINING;
+            st.rate.max(1) as u64
         };
-        // Only a stream whose DMA is actually running can drain. Waiting on a
-        // paused one -- PulseAudio corks a sink and then drains it on the way
-        // out -- burns the whole timeout in a spin loop with nothing on the
-        // other end, and the caller's close(2) blocks for seconds. Linux
-        // treats DRAIN on a stopped stream as immediately complete
-        // (`snd_pcm_drain` only waits while the substream is RUNNING).
-        let drainable = state != STATE_PAUSED && self.audio.is_playing();
         let deadline = kernel_hal::timer::timer_now()
             + core::time::Duration::from_secs(
                 (self.audio.queued_bytes() as u64)
@@ -1468,7 +1533,13 @@ impl PcmDev {
                     .saturating_add(2)
                     .min(10),
             );
-        while drainable && self.audio.queued_bytes() > 0 {
+        while self.audio.queued_bytes() > 0 {
+            {
+                let st = self.st.lock();
+                if st.state != STATE_DRAINING {
+                    break;
+                }
+            }
             if kernel_hal::timer::timer_now() >= deadline {
                 break;
             }
@@ -1486,7 +1557,9 @@ impl PcmDev {
         let _ = self.audio.reset();
         let mut st = self.st.lock();
         st.state = STATE_SETUP;
+        st.appl_ptr = 0;
         st.stalled_since = None;
+        self.clear_timer_focus();
         Ok(())
     }
 
@@ -1538,7 +1611,9 @@ impl PcmDev {
         s.trigger_tstamp = st.trigger_tstamp;
         s.appl_ptr = st.appl_ptr;
         s.hw_ptr = self.hw_ptr(&st);
-        s.delay = self.queued_frames() as i64;
+        // Same figure as the DELAY ioctl: client queue plus driver silence
+        // ahead of it (`AudioScheme::delay_bytes`), not bare `queued_bytes`.
+        s.delay = self.audio.delay_bytes() as i64 / BYTES_PER_FRAME as i64;
         s.avail = self.avail(&st);
         s.avail_max = st.buffer_size;
         let now = kernel_hal::timer::timer_now();
@@ -1664,6 +1739,12 @@ impl PcmDev {
                     return Err(FsError::InvalidParam);
                 }
                 if p.avail_min == 0 {
+                    return Err(FsError::InvalidParam);
+                }
+                // Linux `snd_pcm_sw_params`: stop_threshold 0 is -EINVAL, and
+                // leaving it at 0 makes every RUNNING peek an instant XRUN
+                // (`avail >= 0`).
+                if p.stop_threshold == 0 {
                     return Err(FsError::InvalidParam);
                 }
                 if p.silence_size >= st.boundary {
@@ -1883,24 +1964,24 @@ impl PcmDev {
                 drop(st);
                 let _ = self.audio.reset();
                 let _ = self.audio.set_start_hold(false);
+                self.clear_timer_focus();
                 Ok(0)
             }
             0x49 => {
                 // FORWARD — skip unplayed frames from the playhead.
+                //
+                // The HDA `HostStream::forward` zeros the head of the queue
+                // without shrinking it ("still take their time"). Advancing
+                // `appl_ptr` here made `hw_ptr = appl - queued` jump by the
+                // skip while DMA had not moved, then jump again as those
+                // silent frames drained — a permanent desync. The frames were
+                // already written (`appl_ptr` already counts them); skipping
+                // their content must not count them twice.
                 ucheck::<u64>(data)?;
                 let frames = unsafe { *(data as *mut u64) };
                 let bytes = (frames * BYTES_PER_FRAME) as usize;
                 let skipped = self.audio.forward(bytes).unwrap_or(0);
                 let skipped_frames = skipped as u64 / BYTES_PER_FRAME;
-                if skipped_frames > 0 {
-                    // The mirror image of REWIND: the client has given up
-                    // those frames, so the application pointer moves over
-                    // them. Leaving it behind made the kernel's `avail` and
-                    // alsa-lib's disagree by exactly the skipped amount for
-                    // the rest of the stream.
-                    let mut st = self.st.lock();
-                    st.appl_ptr = (st.appl_ptr + skipped_frames) % st.boundary.max(1);
-                }
                 unsafe { *(data as *mut u64) = skipped_frames };
                 Ok(0)
             }
@@ -1949,6 +2030,7 @@ impl Drop for PcmDev {
             st.appl_ptr = 0;
             st.stalled_since = None;
         }
+        self.clear_timer_focus();
         if self.release_opened_on_drop {
             self.opened.store(false, Ordering::Release);
         }
@@ -3339,13 +3421,14 @@ mod timer_tests {
             assert!(matches!(pcm.io_control(0x4148, 0), Err(FsError::BadState)));
         }
 
-        /// FORWARD is REWIND's mirror image: the frames it gives up move the
-        /// application pointer with them, or the kernel's `avail` and
-        /// alsa-lib's disagree by that much for the rest of the stream.
+        /// FORWARD skips playhead content that was already written: `appl_ptr`
+        /// stays put (those frames already count). FakeAudio drops them from
+        /// the queue; HostStream would silence them in place — either way the
+        /// application pointer must not advance a second time.
         #[test]
-        fn forward_moves_the_application_pointer_like_rewind_does() {
+        fn forward_skips_queued_frames_without_moving_appl_ptr() {
             let audio = Arc::new(FakeAudio::new(8 * BYTES_PER_FRAME as usize));
-            let pcm = PcmDev::new(audio, 0);
+            let pcm = PcmDev::new(audio.clone(), 0);
             pcm.st.lock().state = STATE_PREPARED;
             let samples = [0u8; 8 * BYTES_PER_FRAME as usize];
             let mut xfer = SndXferI {
@@ -3355,18 +3438,20 @@ mod timer_tests {
             };
             pcm.writei(&mut xfer, OpenFlags::NON_BLOCK).unwrap();
             assert_eq!(pcm.st.lock().appl_ptr, 8);
+            assert_eq!(audio.queued_bytes(), 8 * BYTES_PER_FRAME as usize);
 
             let mut frames: u64 = 3;
             pcm.io_control(0x4149, &mut frames as *mut u64 as usize)
                 .unwrap();
             assert_eq!(frames, 3, "three frames skipped");
-            assert_eq!(pcm.st.lock().appl_ptr, 11);
+            assert_eq!(pcm.st.lock().appl_ptr, 8, "already-written frames stay counted once");
+            assert_eq!(audio.queued_bytes(), 5 * BYTES_PER_FRAME as usize);
 
             let mut back: u64 = 3;
             pcm.io_control(0x4146, &mut back as *mut u64 as usize)
                 .unwrap();
             assert_eq!(back, 3);
-            assert_eq!(pcm.st.lock().appl_ptr, 8, "REWIND puts it back");
+            assert_eq!(pcm.st.lock().appl_ptr, 5, "REWIND drops the tail and appl with it");
         }
     }
 
@@ -3509,6 +3594,12 @@ mod timer_tests {
                 Err(FsError::InvalidParam)
             ));
             p.avail_min = 4;
+            p.stop_threshold = 0;
+            assert!(matches!(
+                pcm.io_control(0x4113, &mut p as *mut SndPcmSwParams as usize),
+                Err(FsError::InvalidParam)
+            ));
+            p.stop_threshold = 16;
             p.tstamp_mode = 2;
             assert!(matches!(
                 pcm.io_control(0x4113, &mut p as *mut SndPcmSwParams as usize),
@@ -3521,7 +3612,6 @@ mod timer_tests {
                 Err(FsError::InvalidParam)
             ));
             p.silence_threshold = 0;
-            p.stop_threshold = 16;
             pcm.io_control(0x4113, &mut p as *mut SndPcmSwParams as usize)
                 .unwrap();
             let st = pcm.st.lock();
