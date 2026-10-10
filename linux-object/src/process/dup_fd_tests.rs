@@ -380,3 +380,37 @@ fn the_exec_sweep_closes_the_marked_descriptor_and_keeps_its_twin() {
     assert!(proc.get_file_like(kept).is_ok());
     assert_eq!(proc.get_file_like(swept).err(), Some(LxError::EBADF));
 }
+
+/// `fcntl(F_DUPFD, start)` with every slot from `start` taken must answer
+/// `EMFILE` *without* inserting a descriptor past `RLIMIT_NOFILE`. The old
+/// path allocated past the limit, then the syscall rejected it — leaving a
+/// leaked fd the process was not allowed to hold.
+#[test]
+fn dupfd_past_nofile_does_not_leave_a_descriptor_behind() {
+    let proc = a_process();
+    proc.rlimit(
+        RLIMIT_NOFILE,
+        Some(RLimit {
+            cur: 4,
+            max: 4096,
+        }),
+        false,
+    )
+    .unwrap();
+    // Occupy 0..3 so a search from 2 has nowhere legal to land.
+    for _ in 0..4 {
+        proc.add_file(an_open_log(Log::new(), OpenFlags::RDONLY))
+            .unwrap();
+    }
+    let src = FileDesc::from(0usize);
+    let file = proc.get_file_like(src).unwrap();
+    assert_eq!(
+        proc.add_file_from_cloexec(file, false, 2),
+        Err(LxError::EMFILE)
+    );
+    // Nothing past the limit may appear in the table.
+    assert_eq!(
+        proc.get_file_like(FileDesc::from(4usize)).err(),
+        Some(LxError::EBADF)
+    );
+}

@@ -733,7 +733,11 @@ impl ProcessExt for Process {
                     }
                     if let Some(reaper) = reaper_for(&parent) {
                         if let Some(reaper_lp) = reaper.try_linux() {
-                            let policy = child_death_policy(reaper_lp);
+                            let exit_sig = child
+                                .try_linux()
+                                .map(|lp| lp.exit_signal())
+                                .unwrap_or(LinuxSignal::SIGCHLD as u8);
+                            let policy = child_death_policy(reaper_lp, exit_sig);
                             // The zircon bit wakes a blocked `wait*` either
                             // way: with nothing left to collect it comes back
                             // ECHILD, which is how POSIX says a `wait` ends
@@ -766,10 +770,6 @@ impl ProcessExt for Process {
                                     .unwrap_or(0),
                                 wait_status_exited(exit_code),
                             );
-                            let exit_sig = child
-                                .try_linux()
-                                .map(|lp| lp.exit_signal())
-                                .unwrap_or(LinuxSignal::SIGCHLD as u8);
                             // `exit_signal == 0` means "no signal" (clone3).
                             if exit_sig != 0 {
                                 if let Ok(Some(sig)) =
@@ -929,16 +929,11 @@ pub async fn wait_child_interest(
         if interest.exited {
             if let Status::Exited(code) = child.status() {
                 let cpu = child_cpu(&child);
-                if reap {
-                    let mut inner = proc.linux().inner.lock();
-                    inner.children.remove(&pid);
-                    inner.reaped_children.remove(&pid);
-                    // So a later `record_child_exit` from death-notify does not
-                    // re-insert this pid as a fresh zombie.
-                    inner.waited_without_zombie.insert(pid);
-                    inner.add_children_cpu(cpu);
+                if !reap || claim_exited_child(proc, pid, cpu) {
+                    return Ok((wait_status_exited(code), cpu));
                 }
-                return Ok((wait_status_exited(code), cpu));
+                // Another waiter already collected this live exit.
+                continue;
             }
         }
         if let Some(status) = child
@@ -956,14 +951,10 @@ pub async fn wait_child_interest(
         if interest.exited {
             if let Status::Exited(code) = child.status() {
                 let cpu = child_cpu(&child);
-                if reap {
-                    let mut inner = proc.linux().inner.lock();
-                    inner.children.remove(&pid);
-                    inner.reaped_children.remove(&pid);
-                    inner.waited_without_zombie.insert(pid);
-                    inner.add_children_cpu(cpu);
+                if !reap || claim_exited_child(proc, pid, cpu) {
+                    return Ok((wait_status_exited(code), cpu));
                 }
-                return Ok((wait_status_exited(code), cpu));
+                continue;
             }
         }
         if let Some(status) = child
@@ -1056,14 +1047,11 @@ fn scan_waitable_children(
         if interest.exited {
             if let Status::Exited(code) = child.status() {
                 let cpu = child_cpu(&child);
-                if reap {
-                    let mut inner = proc.linux().inner.lock();
-                    inner.children.remove(&pid);
-                    inner.reaped_children.remove(&pid);
-                    inner.waited_without_zombie.insert(pid);
-                    inner.add_children_cpu(cpu);
+                if !reap || claim_exited_child(proc, pid, cpu) {
+                    return Some(Ok((pid, wait_status_exited(code), cpu)));
                 }
-                return Some(Ok((pid, wait_status_exited(code), cpu)));
+                // Lost the claim race — try the next child.
+                continue;
             }
         }
         if let Some(status) = child
@@ -1074,6 +1062,25 @@ fn scan_waitable_children(
         }
     }
     None
+}
+
+/// Atomically claim a live `Exited` child for a reaping `wait*`.
+///
+/// Two waiters can both observe `Status::Exited` before either holds the
+/// process lock; only the remove that finds the pid still in `children`
+/// may report it. Returns `false` when another waiter (or death-notify)
+/// already took the child.
+fn claim_exited_child(proc: &Arc<Process>, pid: KoID, cpu: ChildCpu) -> bool {
+    let mut inner = proc.linux().inner.lock();
+    if inner.children.remove(&pid).is_none() {
+        return false;
+    }
+    inner.reaped_children.remove(&pid);
+    // So a later `record_child_exit` from death-notify does not
+    // re-insert this pid as a fresh zombie.
+    inner.waited_without_zombie.insert(pid);
+    inner.add_children_cpu(cpu);
+    true
 }
 
 /// System-call personality of a process: which operating system's ABI its
@@ -2047,17 +2054,20 @@ impl LinuxProcess {
         file: Arc<dyn FileLike>,
         cloexec: bool,
     ) -> LxResult<FileDesc> {
-        if inner.files.len() < inner.nofile() {
-            if cloexec {
-                inner.cloexec_fds.insert(fd);
-            } else {
-                inner.cloexec_fds.remove(&fd);
-            }
-            inner.files.insert(fd, file);
-            Ok(fd)
-        } else {
-            Err(LxError::EMFILE)
+        // Refuse before insert: `get_free_fd_from(start)` can return a number
+        // past `RLIMIT_NOFILE` when every slot from `start` up is taken but the
+        // table still has holes below — inserting then failing in the syscall
+        // left a descriptor the process was not allowed to hold.
+        if usize::from(fd) >= inner.nofile() || inner.files.len() >= inner.nofile() {
+            return Err(LxError::EMFILE);
         }
+        if cloexec {
+            inner.cloexec_fds.insert(fd);
+        } else {
+            inner.cloexec_fds.remove(&fd);
+        }
+        inner.files.insert(fd, file);
+        Ok(fd)
     }
 
     /// Set or clear this descriptor's `FD_CLOEXEC` flag (`fcntl(F_SETFD)`).
@@ -3742,6 +3752,11 @@ impl LinuxProcess {
         }
     }
 
+    /// Process-directed signals not yet pulled onto any thread (`shared_pending`).
+    pub fn shared_pending(&self) -> Sigset {
+        self.inner.lock().shared_pending
+    }
+
     /// Move any shared-pending signals this thread no longer has blocked onto
     /// the thread's own pending set. Called after a mask change and before
     /// delivery / signalfd reads.
@@ -4496,7 +4511,18 @@ struct ChildDeathPolicy {
 /// handler means the same for the zombie, but the handler still runs
 /// (sigaction(2), and the `psig->action[SIGCHLD-1]` test in
 /// `do_notify_parent`). Anything else leaves the zombie and sends the signal.
-fn child_death_policy(reaper: &LinuxProcess) -> ChildDeathPolicy {
+///
+/// Those rules apply only when the child's `exit_signal` is `SIGCHLD`. A
+/// custom `clone`/`clone3` exit signal (or `0` = send nothing) must not be
+/// swallowed by the parent's `SIGCHLD` disposition — Linux still leaves a
+/// zombie and delivers that signal (or none).
+fn child_death_policy(reaper: &LinuxProcess, exit_sig: u8) -> ChildDeathPolicy {
+    if exit_sig != LinuxSignal::SIGCHLD as u8 {
+        return ChildDeathPolicy {
+            autoreap: false,
+            notify: exit_sig != 0,
+        };
+    }
     let action = reaper.signal_action(LinuxSignal::SIGCHLD);
     if action.handler == crate::signal::SIG_IGN {
         ChildDeathPolicy {
@@ -5638,17 +5664,14 @@ pub fn send_signal_to_process_with_info(
         }
         // Every thread has the signal blocked: it must still become *pending*
         // (POSIX — masking only delays delivery, it does not discard the
-        // signal), so it is delivered once unblocked or consumed via signalfd.
-        // The first tid holds it (what `sigpending` and the park tests see);
-        // `shared_pending` mirrors it so a later-unblocking / sigwait thread
-        // can still pull via [`LinuxProcess::pull_shared_pending_into`].
-        if let Some(thread) = first {
-            thread.lock_linux().queue_signal(signal, info);
+        // signal). Queue it once on `shared_pending` — never also on the first
+        // tid — so a later unblock / sigwait / signalfd pull cannot deliver
+        // the same process-directed signal twice.
+        if first.is_some() {
             if let Some(lp) = process.try_linux() {
                 lp.queue_shared_signal(signal, info);
             }
-            // Wake every sleeper: a thread in signalfd/sigwait may notice the
-            // shared bit even though the per-thread bit sits on `first`.
+            // Wake every sleeper: any thread may be the one that pulls next.
             for tid in process.thread_ids() {
                 if let Ok(thread_obj) = process.get_child(tid) {
                     if let Ok(t) = thread_obj.downcast_arc::<Thread>() {

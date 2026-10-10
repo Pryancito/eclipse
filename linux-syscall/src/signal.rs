@@ -831,7 +831,10 @@ impl Syscall<'_> {
         // Pending here means "sent but withheld by the mask": what is both in
         // the undelivered set and currently blocked. Unblocked entries are on
         // their way to delivery and are not reported, matching Linux.
-        let pending = Sigset::new(thread.signals.val() & thread.signal_mask().val());
+        // Process-directed bits live on `shared_pending` until a thread pulls
+        // them; omit them and a mask-blocked `kill` is invisible to sigpending.
+        let shared = self.linux_process().shared_pending().val();
+        let pending = Sigset::new((thread.signals.val() | shared) & thread.signal_mask().val());
         drop(thread);
         info!("rt_sigpending: pending={:#x}", pending.val());
         set.write(pending)?;

@@ -191,3 +191,42 @@ fn a_parent_that_wants_its_zombies_keeps_them() {
     let (pid, status, _) = async_std::task::block_on(wait_child_any(&parent, true, true)).unwrap();
     assert_eq!((pid, status), (child.id(), wait_status_exited(5)));
 }
+
+/// `clone`'s custom exit signal is not `SIGCHLD`, so the parent's
+/// `SIG_IGN`/`SA_NOCLDWAIT` on SIGCHLD must not autoreap the child or
+/// swallow the notification.
+#[test]
+fn a_custom_exit_signal_ignores_sigchld_ign() {
+    let (parent, thread) = a_parent(43_010);
+    sigchld_action(&parent, crate::signal::SIG_IGN, SignalActionFlags::empty());
+    let child = Process::fork_from(&parent).unwrap();
+    child
+        .linux()
+        .set_exit_signal(LinuxSignal::SIGUSR1 as u8);
+    clear_pending(&thread);
+    child.exit(0);
+    assert!(
+        parent.linux().is_zombie_child(child.id()),
+        "SIG_IGN on SIGCHLD autoreaped a child with exit_signal=SIGUSR1"
+    );
+    assert!(
+        thread.lock_linux().signals.contains(LinuxSignal::SIGUSR1),
+        "custom exit signal was not delivered"
+    );
+    assert!(
+        !pending_sigchld(&thread),
+        "SIGCHLD should not have been queued for a custom exit signal"
+    );
+}
+
+#[test]
+fn exit_signal_zero_leaves_a_zombie_and_sends_nothing() {
+    let (parent, thread) = a_parent(43_011);
+    let child = Process::fork_from(&parent).unwrap();
+    child.linux().set_exit_signal(0);
+    clear_pending(&thread);
+    child.exit(0);
+    assert!(parent.linux().is_zombie_child(child.id()));
+    assert!(!pending_sigchld(&thread));
+    assert!(!thread.lock_linux().signals.contains(LinuxSignal::SIGUSR1));
+}

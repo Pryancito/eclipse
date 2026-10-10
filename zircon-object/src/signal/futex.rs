@@ -485,11 +485,16 @@ impl Futex {
             {
                 return Err(ZxError::INVALID_ARGS);
             }
-            for _ in 0..wake_count {
-                if let Some(waiter) = inner.waiter_queue.pop_front() {
-                    to_wake.push(waiter);
-                } else {
-                    break;
+            // Peel live wake targets *before* choosing whom to requeue.
+            // Popping `wake_count` slots blindly then topping up after the
+            // move steals waiters that should have been requeued (or fails
+            // to wake anyone when the leading slots were tombstones and
+            // everything live had already been moved).
+            while to_wake.len() < wake_count {
+                match inner.waiter_queue.pop_front() {
+                    Some(waiter) if waiter.is_tombstone_unlocked() => continue,
+                    Some(waiter) => to_wake.push(waiter),
+                    None => break,
                 }
             }
             let requeue_count = requeue_count.min(inner.waiter_queue.len());
@@ -509,28 +514,13 @@ impl Futex {
         for waiter in to_requeue {
             waiter.reset_futex(requeue_futex.clone());
         }
-        // Deliver wakeups last, with no futex lock held. A tombstone among
-        // them wakes nobody and so counts for nobody — same top-up as
-        // [`Futex::wake`]: keep going until `wake_count` live waiters have
-        // been woken or the queue is empty.
+        // Deliver wakeups last, with no futex lock held. No post-requeue
+        // top-up: remaining source waiters were deliberately left alone,
+        // and requeued ones now live on the target queue.
         let mut woken = 0;
         for waiter in to_wake {
             if waiter.wake() {
                 woken += 1;
-            }
-        }
-        while woken < wake_count {
-            let waiter = {
-                let mut inner = self.inner.lock();
-                inner.waiter_queue.pop_front()
-            };
-            match waiter {
-                Some(waiter) => {
-                    if waiter.wake() {
-                        woken += 1;
-                    }
-                }
-                None => break,
             }
         }
         Ok(woken + requeued)
@@ -681,6 +671,18 @@ impl Waiter {
             true
         } else {
             false
+        }
+    }
+
+    /// Peek whether this waiter is already cancelled/woken, without blocking.
+    ///
+    /// Used under a futex queue lock where taking `waiter.inner` for real
+    /// would invert the poll/Drop order. A contested lock is treated as
+    /// live so a waiter mid-poll is not skipped.
+    fn is_tombstone_unlocked(&self) -> bool {
+        match self.inner.try_lock() {
+            Some(inner) => inner.woken,
+            None => false,
         }
     }
 
@@ -1190,6 +1192,40 @@ mod tests {
         );
         assert_eq!(source.inner.lock().waiter_queue.len(), 0);
         assert_eq!(target.inner.lock().waiter_queue.len(), 2);
+    }
+
+    /// A leading tombstone must not consume the wake budget before requeue
+    /// chooses whom to move — otherwise the live waiter is requeued (or left
+    /// stranded) and nobody is woken.
+    #[test]
+    fn requeue_skips_tombstones_before_choosing_whom_to_move() {
+        let source = futex_with(1);
+        let target = futex_with(2);
+        enqueue_tombstone(&source, None);
+        let waiters: Vec<_> = (0..2).map(|_| queue_waiter(&source, 1, None)).collect();
+
+        assert_eq!(source.requeue(1, 1, 1, &target, None, true), Ok(2));
+        assert_eq!(waiters[0].1.count(), 1, "the first live waiter is woken");
+        assert_eq!(waiters[1].1.count(), 0, "the second is moved, not woken");
+        assert_eq!(source.inner.lock().waiter_queue.len(), 0);
+        assert_eq!(target.inner.lock().waiter_queue.len(), 1);
+    }
+
+    /// Same shape with a requeue count that would have swallowed every live
+    /// waiter under the old pop-then-top-up path.
+    #[test]
+    fn requeue_still_wakes_when_tombstones_lead_and_the_rest_would_move() {
+        let source = futex_with(1);
+        let target = futex_with(2);
+        enqueue_tombstone(&source, None);
+        enqueue_tombstone(&source, None);
+        let waiters: Vec<_> = (0..2).map(|_| queue_waiter(&source, 1, None)).collect();
+
+        assert_eq!(source.requeue(1, 1, 2, &target, None, true), Ok(2));
+        assert_eq!(waiters[0].1.count(), 1);
+        assert_eq!(waiters[1].1.count(), 0);
+        assert_eq!(target.inner.lock().waiter_queue.len(), 1);
+        assert_eq!(source.inner.lock().waiter_queue.len(), 0);
     }
 
     /// A thread may not come out owning a futex it is itself blocked on.

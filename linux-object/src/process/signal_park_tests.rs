@@ -1,6 +1,6 @@
-//! A process-directed signal that every thread blocks went to the first
-//! thread, whatever the others were waiting for; and `pause`,
-//! `sigsuspend` and `sigtimedwait` looked for it every 10 ms.
+//! A process-directed signal that every thread blocks lands on
+//! `shared_pending` (pulled by the thread that can take it); and `pause`,
+//! `sigsuspend` and `sigtimedwait` wake via `SignalPark` instead of polling.
 extern crate std;
 
 use super::*;
@@ -52,18 +52,28 @@ fn a_process_signal_lands_on_the_thread_waiting_for_it_though_blocked() {
 }
 
 #[test]
-fn with_nobody_waiting_a_blocked_signal_still_goes_to_the_first_thread() {
+fn with_nobody_waiting_a_blocked_signal_stays_on_shared_pending() {
     let (proc, first, second) = two_blocking_threads(43_412);
     send_signal_to_process(proc.id() as usize, LinuxSignal::SIGUSR1).unwrap();
-    assert!(first.lock_linux().signals.contains(LinuxSignal::SIGUSR1));
+    // Process-directed and every thread blocked: one bit on shared_pending,
+    // not a private copy on the first tid (that doubled delivery on pull).
+    assert!(
+        proc.linux()
+            .shared_pending()
+            .contains(LinuxSignal::SIGUSR1),
+        "blocked process signal never reached shared_pending"
+    );
+    assert!(!first.lock_linux().signals.contains(LinuxSignal::SIGUSR1));
     assert!(!second.lock_linux().signals.contains(LinuxSignal::SIGUSR1));
 }
 
 #[test]
 fn a_blocked_signal_still_ends_the_park() {
-    // What `sigtimedwait` relies on: the caller has the set blocked, and
-    // the park must wake on the queueing, not on the deadline.
+    // What `sigtimedwait` relies on: the caller has the set blocked (and
+    // names it in `sigwait`), and the park must wake on the queueing, not
+    // on the deadline.
     let (proc, first, _second) = two_blocking_threads(43_413);
+    first.lock_linux().sigwait = usr1();
     let mut park = SignalPark::new(&first);
     park.prepare();
     usr1_later(proc.id(), Duration::from_millis(50));
@@ -75,6 +85,8 @@ fn a_blocked_signal_still_ends_the_park() {
         "parked {:?}: the blocked signal did not wake it",
         start.elapsed()
     );
+    // With `sigwait` set the send path delivers straight to this thread
+    // (`wants_signal`); without it the bit would sit on shared_pending.
     assert!(first.lock_linux().signals.contains(LinuxSignal::SIGUSR1));
 }
 
