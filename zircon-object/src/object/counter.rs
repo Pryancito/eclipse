@@ -113,4 +113,19 @@ mod tests {
             "SIGNALED is for Event, not Counter"
         );
     }
+
+    /// A counter starts at zero, zero is not positive, so a fresh counter
+    /// starts with `COUNTER_NON_POSITIVE` already asserted: a waiter asking
+    /// "is it still empty?" has to be told yes without anyone writing first.
+    /// Every test here wrote a value before looking.
+    #[test]
+    fn a_fresh_counter_is_already_non_positive() {
+        let counter = Counter::new();
+        assert_eq!(counter.read(), 0);
+        assert!(
+            counter.signal().contains(Signal::COUNTER_NON_POSITIVE),
+            "a waiter on an empty counter would never be woken"
+        );
+        assert!(!counter.signal().contains(Signal::COUNTER_POSITIVE));
+    }
 }

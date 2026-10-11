@@ -302,4 +302,104 @@ mod tests {
         // See https://github.com/mozilla/grcov/issues/450
         let _ = HandleBasicInfo::default();
     }
+
+    /// The layout `zx_object_get_info(ZX_INFO_HANDLE_BASIC)` copies straight
+    /// out to userspace, so the offsets are the ABI and not an implementation
+    /// detail. `size_of` and `align_of` alone do not hold it: `repr(Rust)`
+    /// sorts the fields by decreasing alignment, which here keeps the size at
+    /// 32 and the alignment at 8 while moving `related_koid` from 24 up to 8
+    /// -- every field after `koid` then read from the wrong place, with
+    /// nothing in the tree to see it.
+    #[test]
+    fn handle_basic_info_is_the_zx_info_handle_basic_layout() {
+        use core::mem::{align_of, offset_of, size_of};
+        assert_eq!(size_of::<HandleBasicInfo>(), 32);
+        assert_eq!(align_of::<HandleBasicInfo>(), 8);
+        assert_eq!(offset_of!(HandleBasicInfo, koid), 0);
+        assert_eq!(offset_of!(HandleBasicInfo, rights), 8);
+        assert_eq!(offset_of!(HandleBasicInfo, obj_type), 12);
+        assert_eq!(offset_of!(HandleBasicInfo, related_koid), 16);
+        assert_eq!(offset_of!(HandleBasicInfo, props), 24);
+        assert_eq!(offset_of!(HandleBasicInfo, padding), 28);
+    }
+
+    /// `zx_handle_info_t`: four words, in the order
+    /// `zx_channel_read_etc` writes them.
+    #[test]
+    fn handle_info_is_the_zx_handle_info_layout() {
+        use core::mem::{align_of, offset_of, size_of};
+        assert_eq!(size_of::<HandleInfo>(), 16);
+        assert_eq!(align_of::<HandleInfo>(), 4);
+        assert_eq!(offset_of!(HandleInfo, handle), 0);
+        assert_eq!(offset_of!(HandleInfo, obj_type), 4);
+        assert_eq!(offset_of!(HandleInfo, rights), 8);
+        assert_eq!(offset_of!(HandleInfo, unused), 12);
+    }
+
+    /// The words the kernel promises as zero. Both structs are copied out
+    /// whole, so a word left unwritten is whatever the kernel's own memory
+    /// held; nothing in this file read either of them before. And
+    /// `INVALID_HANDLE` is `0` by number, which is what makes a zeroed
+    /// `HandleInfo.handle` say "no handle here" to its caller.
+    #[test]
+    fn the_words_promised_as_zero_are_zero() {
+        assert_eq!(INVALID_HANDLE, 0);
+        let handle = Handle::new(crate::task::Job::root(), Rights::DEFAULT_JOB);
+        assert_eq!(handle.get_info().padding, 0, "padding carries kernel bytes");
+        let info = handle.get_handle_info();
+        assert_eq!(info.unused, 0, "unused carries kernel bytes");
+        // `get_handle_info` leaves the handle value for its caller to fill
+        // in, which is what its doc promises; zero is the value that says so.
+        assert_eq!(info.handle, 0);
+    }
+
+    /// `koid` and `related_koid` answer two different questions, and the only
+    /// test that ever built a `HandleBasicInfo` read neither: the first is the
+    /// object's own id, the second the id of the object it is paired with --
+    /// a channel's other end, a thread's process, a job's parent -- and zero
+    /// when it has none. Swapping them leaves two plausible koids in the
+    /// struct, which is why it needs two objects whose ids differ to see it
+    /// at all.
+    ///
+    /// A channel pair is what that costs least: a process would do as well,
+    /// but each one takes one of the 127 hosted address-space windows, and
+    /// this suite already runs out of them at sixteen threads.
+    #[test]
+    fn the_two_koids_are_the_object_and_the_one_it_is_paired_with() {
+        // Both ends stay alive here: a channel reports its peer through a
+        // `Weak`, so a dropped peer answers zero and proves nothing.
+        let (left, right) = crate::ipc::Channel::create();
+        let info = Handle::new(left.clone(), Rights::DEFAULT_CHANNEL).get_info();
+        assert_eq!(info.koid, left.id());
+        assert_eq!(
+            info.related_koid,
+            right.id(),
+            "a channel is paired with its other end"
+        );
+
+        // And an object with nothing on the other side answers zero rather
+        // than repeating its own koid.
+        let event = crate::signal::Event::new();
+        let info = Handle::new(event.clone(), Rights::DEFAULT_EVENT).get_info();
+        assert_eq!(info.koid, event.id());
+        assert_eq!(info.related_koid, 0);
+    }
+
+    /// The rights both info structs report. `test_get_info` read `obj_type`
+    /// and `props` and never these, so every handle in the system could have
+    /// reported no rights at all: `zx_object_get_info(ZX_INFO_HANDLE_BASIC)`
+    /// is how a process asks what a handle it holds is allowed to do.
+    #[test]
+    fn both_info_structs_report_the_handles_own_rights() {
+        let obj = crate::task::Job::root();
+        let handle = Handle::new(obj.clone(), Rights::DEFAULT_JOB);
+        assert_eq!(handle.get_info().rights, Rights::DEFAULT_JOB.bits());
+        assert_eq!(handle.get_handle_info().rights, Rights::DEFAULT_JOB.bits());
+
+        // A narrower handle on the same object reports the narrower set, so
+        // the number comes from the handle and not from the object.
+        let narrow = Handle::new(obj, Rights::READ);
+        assert_eq!(narrow.get_info().rights, Rights::READ.bits());
+        assert_ne!(narrow.get_info().rights, Rights::DEFAULT_JOB.bits());
+    }
 }
