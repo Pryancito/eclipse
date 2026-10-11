@@ -1341,6 +1341,15 @@ impl FileLike for File {
         if let Some(slave) = inode.downcast_ref::<super::pty::PtySlave>() {
             return Some(slave.subscribe_readiness(events, waker));
         }
+        // A VT terminal: `/dev/ttyN`, and `/dev/tty0`/`/dev/console` too --
+        // `CurrentVtTty::as_any_ref` delegates to its inner `Stdin`, so one arm
+        // covers both. Until this was here a shell parked in `poll(stdin)` on a
+        // console kept the 4 ms backstop and polled the xHCI 250 times a second
+        // for nothing; see `Stdin::subscribe_readiness` for why the long
+        // backstop is safe for a terminal.
+        if let Some(stdin) = inode.downcast_ref::<super::stdio::Stdin>() {
+            return Some(stdin.subscribe_readiness(events, waker));
+        }
         // Regular files / directories are always ready (poll never parks on
         // them), and everything else — device nodes without an event bus,
         // FIFOs resolved through the fs — keeps the caller's short re-poll
@@ -2768,5 +2777,66 @@ mod shared_vmo_registry_tests {
             "a mapped cache was pruned out from under its mapper"
         );
         drop(live_vmo);
+    }
+}
+
+#[cfg(test)]
+mod terminal_subscription_tests {
+    //! A terminal fd must answer `subscribe_readiness` with a subscription.
+    //!
+    //! This is the arm that decides whether a `poll(stdin)` is "covered": an
+    //! fd that answers `None` keeps the 4 ms re-scan backstop for the whole
+    //! set, and every one of those re-scans polls the xHCI. A VT answered
+    //! `None` until this arm existed, which on an idle machine was 244 of the
+    //! 353 wakeups a second -- about 19,5 % of a host core doing nothing.
+
+    use super::*;
+    use core::task::{RawWaker, RawWakerVTable, Waker};
+
+    fn dummy_waker() -> Waker {
+        fn raw(_: *const ()) -> RawWaker {
+            unsafe fn clone(p: *const ()) -> RawWaker {
+                raw(p)
+            }
+            unsafe fn nop(_: *const ()) {}
+            RawWaker::new(
+                core::ptr::null(),
+                &RawWakerVTable::new(clone, nop, nop, nop),
+            )
+        }
+        unsafe { Waker::from_raw(raw(core::ptr::null())) }
+    }
+
+    /// A `/dev/ttyN` fd.
+    #[test]
+    fn a_vt_terminal_is_subscribable() {
+        let f = File::new(
+            super::super::stdio::vt_stdin(0),
+            OpenFlags::RDONLY,
+            String::from("/dev/tty1"),
+        );
+        assert!(
+            f.subscribe_readiness(PollEvents::IN, &dummy_waker())
+                .is_some(),
+            "a terminal that cannot park a waker holds the whole poll set at the 4 ms backstop"
+        );
+    }
+
+    /// `/dev/tty0` and `/dev/console` are a `CurrentVtTty`, a different inode
+    /// type -- but its `as_any_ref` delegates to the inner `Stdin`, so the one
+    /// arm covers both. Pinned here because that delegation is the only reason
+    /// it does, and it is not visible at the dispatch.
+    #[test]
+    fn the_current_vt_control_node_is_subscribable_too() {
+        let f = File::new(
+            super::super::stdio::current_vt_tty(),
+            OpenFlags::RDONLY,
+            String::from("/dev/console"),
+        );
+        assert!(
+            f.subscribe_readiness(PollEvents::IN, &dummy_waker())
+                .is_some(),
+            "/dev/console is where an init shell's stdin usually points"
+        );
     }
 }
