@@ -816,7 +816,11 @@ mod tests {
     #[test]
     fn every_namespace_counts_one_more_bit_than_its_highest_code() {
         for (name, max, cnt) in [
-            ("INPUT_PROP", input_prop::INPUT_PROP_MAX, input_prop::INPUT_PROP_CNT),
+            (
+                "INPUT_PROP",
+                input_prop::INPUT_PROP_MAX,
+                input_prop::INPUT_PROP_CNT,
+            ),
             ("EV", ev::EV_MAX, ev::EV_CNT),
             ("SYN", syn::SYN_MAX, syn::SYN_CNT),
             ("KEY", key::KEY_MAX, key::KEY_CNT),

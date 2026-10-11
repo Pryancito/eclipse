@@ -221,7 +221,11 @@ mod tests {
         let ctrl = TableIrq::new();
         let dev = CountingDevice::new();
         ctrl.register_device(7, dev.clone()).unwrap();
-        assert_eq!(dev.calls.load(Ordering::Relaxed), 0, "fired at register time");
+        assert_eq!(
+            dev.calls.load(Ordering::Relaxed),
+            0,
+            "fired at register time"
+        );
         ctrl.fire(7);
         assert_eq!(dev.calls.load(Ordering::Relaxed), 1);
         assert_eq!(dev.last_irq.load(Ordering::Relaxed), 7);

@@ -15,9 +15,9 @@ pub trait UartScheme: Scheme + EventScheme<Event = ()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scheme::impl_event_scheme;
     use crate::sync::Mutex;
     use crate::utils::EventListener;
-    use crate::scheme::impl_event_scheme;
     use crate::DeviceError;
     use alloc::vec::Vec;
 

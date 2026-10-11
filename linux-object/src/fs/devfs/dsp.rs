@@ -1102,9 +1102,7 @@ impl INode for DspDev {
                 // Once per open, and not after SUBDIVIDE (Linux). `maxfrags`
                 // starts at 0 and is set on the first call even when
                 // `fragshift` stays unset (0 = keep the default size).
-                if rt.params.subdivision != 0
-                    || rt.params.fragshift != 0
-                    || rt.params.maxfrags != 0
+                if rt.params.subdivision != 0 || rt.params.fragshift != 0 || rt.params.maxfrags != 0
                 {
                     return Err(FsError::InvalidParam);
                 }

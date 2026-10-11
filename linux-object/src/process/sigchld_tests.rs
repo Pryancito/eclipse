@@ -200,9 +200,7 @@ fn a_custom_exit_signal_ignores_sigchld_ign() {
     let (parent, thread) = a_parent(43_010);
     sigchld_action(&parent, crate::signal::SIG_IGN, SignalActionFlags::empty());
     let child = Process::fork_from(&parent).unwrap();
-    child
-        .linux()
-        .set_exit_signal(LinuxSignal::SIGUSR1 as u8);
+    child.linux().set_exit_signal(LinuxSignal::SIGUSR1 as u8);
     clear_pending(&thread);
     child.exit(0);
     assert!(
