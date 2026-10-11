@@ -505,13 +505,105 @@ impl From<Metadata> for Statx {
 #[cfg(all(test, target_arch = "x86_64"))]
 mod abi_tests {
     use super::*;
-    use core::mem::{align_of, size_of};
+    use core::mem::{align_of, offset_of, size_of};
 
     #[test]
     fn stat_layout_is_stable() {
         // Lock layout: userspace musl binaries depend on this size/alignment.
         assert_eq!(size_of::<Stat>(), 120);
         assert_eq!(align_of::<Stat>(), 8);
+    }
+
+    /// `struct stat`, field by field, as x86_64 Linux fixes it.
+    ///
+    /// The size and the alignment above are not the layout: `repr(Rust)` is
+    /// free to order the fields as it likes and happens to give these same
+    /// 120 bytes and the same alignment of 8, so dropping `repr(C)` from the
+    /// struct left this module green. The order **is** the ABI -- musl reads
+    /// `st_mode` at offset 24 and nothing tells it otherwise -- so it is
+    /// pinned here offset by offset, against
+    /// `arch/x86/include/uapi/asm/stat.h`.
+    #[test]
+    fn stat_is_the_x86_64_struct_stat_field_by_field() {
+        assert_eq!(offset_of!(Stat, dev), 0);
+        assert_eq!(offset_of!(Stat, ino), 8);
+        assert_eq!(offset_of!(Stat, nlink), 16);
+        assert_eq!(offset_of!(Stat, mode), 24);
+        assert_eq!(offset_of!(Stat, uid), 28);
+        assert_eq!(offset_of!(Stat, gid), 32);
+        assert_eq!(offset_of!(Stat, _pad0), 36);
+        assert_eq!(offset_of!(Stat, rdev), 40);
+        assert_eq!(offset_of!(Stat, size), 48);
+        assert_eq!(offset_of!(Stat, blksize), 56);
+        assert_eq!(offset_of!(Stat, blocks), 64);
+        assert_eq!(offset_of!(Stat, atime), 72);
+        assert_eq!(offset_of!(Stat, mtime), 88);
+        assert_eq!(offset_of!(Stat, ctime), 104);
+        // Which accounts for every one of the 120 bytes: the last field is
+        // sixteen long and ends exactly at the end of the struct.
+        assert_eq!(offset_of!(Stat, ctime) + size_of::<TimeSpec>(), 120);
+    }
+
+    /// `struct timespec` as `struct stat` carries it: two signed longs and
+    /// nothing else.
+    #[test]
+    fn the_timespec_of_struct_stat_is_two_signed_longs() {
+        assert_eq!(size_of::<TimeSpec>(), 16);
+        assert_eq!(align_of::<TimeSpec>(), 8);
+        assert_eq!(offset_of!(TimeSpec, sec), 0);
+        assert_eq!(offset_of!(TimeSpec, nsec), 8);
+    }
+
+    /// `struct statx` is 256 bytes with a fixed place for each field, and
+    /// **nothing here pinned any of it**: not the size, not the order.
+    ///
+    /// It is the one of the two that a modern glibc reaches for (`stat()` is
+    /// `statx()` underneath on several arches), the spare area at the end is
+    /// where the fields added after this kernel live -- `stx_mnt_id` at 144,
+    /// `stx_dio_mem_align` at 152 -- and userspace sizes its own buffer at
+    /// 256 and reads each field straight out of it. Against
+    /// `include/uapi/linux/stat.h`.
+    #[test]
+    fn statx_is_the_uapi_struct_statx_field_by_field() {
+        assert_eq!(size_of::<Statx>(), 256);
+        assert_eq!(align_of::<Statx>(), 8);
+        assert_eq!(offset_of!(Statx, stx_mask), 0);
+        assert_eq!(offset_of!(Statx, stx_blksize), 4);
+        assert_eq!(offset_of!(Statx, stx_attributes), 8);
+        assert_eq!(offset_of!(Statx, stx_nlink), 16);
+        assert_eq!(offset_of!(Statx, stx_uid), 20);
+        assert_eq!(offset_of!(Statx, stx_gid), 24);
+        assert_eq!(offset_of!(Statx, stx_mode), 28);
+        assert_eq!(offset_of!(Statx, __spare0), 30);
+        assert_eq!(offset_of!(Statx, stx_ino), 32);
+        assert_eq!(offset_of!(Statx, stx_size), 40);
+        assert_eq!(offset_of!(Statx, stx_blocks), 48);
+        assert_eq!(offset_of!(Statx, stx_attributes_mask), 56);
+        // The four timestamps are in the uapi's order, which is not the
+        // alphabet's and not `struct stat`'s: atime, btime, ctime, mtime.
+        assert_eq!(offset_of!(Statx, stx_atime), 64);
+        assert_eq!(offset_of!(Statx, stx_btime), 80);
+        assert_eq!(offset_of!(Statx, stx_ctime), 96);
+        assert_eq!(offset_of!(Statx, stx_mtime), 112);
+        assert_eq!(offset_of!(Statx, stx_rdev_major), 128);
+        assert_eq!(offset_of!(Statx, stx_rdev_minor), 132);
+        assert_eq!(offset_of!(Statx, stx_dev_major), 136);
+        assert_eq!(offset_of!(Statx, stx_dev_minor), 140);
+        assert_eq!(offset_of!(Statx, __spare2), 144);
+        // And the spare area is what fills the struct out to 256, so every
+        // byte of it is accounted for.
+        assert_eq!(offset_of!(Statx, __spare2) + 14 * 8, 256);
+    }
+
+    /// `struct statx_timestamp`: a signed second, an unsigned nanosecond and
+    /// a reserved word, sixteen bytes in all.
+    #[test]
+    fn the_statx_timestamp_is_the_uapi_timestamp() {
+        assert_eq!(size_of::<StatxTimestamp>(), 16);
+        assert_eq!(align_of::<StatxTimestamp>(), 8);
+        assert_eq!(offset_of!(StatxTimestamp, tv_sec), 0);
+        assert_eq!(offset_of!(StatxTimestamp, tv_nsec), 8);
+        assert_eq!(offset_of!(StatxTimestamp, __reserved), 12);
     }
 }
 
@@ -650,6 +742,39 @@ mod mode_tests {
         let dir = StatMode::from_type_mode(FileType::Dir, 0o40_755 & 0o7777);
         assert_eq!(dir.bits(), 0o40_755);
     }
+
+    /// The permission bits are the uapi's numbers, one by one.
+    ///
+    /// Everything above goes through the masks (`OWNER_MASK`, `GROUP_MASK`,
+    /// `OTHER_MASK`) or through `PERMISSION_MASK`, and `from_bits_truncate`
+    /// keeps a bit that any flag of the set names -- so `OWNER_READ` moved
+    /// from `0o400` to `0o200`, or `OTHER_EXEC` from `0o1` to `0o2`, left
+    /// this module green: the mask that covers them still named the bit. The
+    /// numbers are `S_IRUSR` and the rest, and a caller reading the set by
+    /// name gets whatever these say.
+    #[test]
+    fn every_permission_bit_is_the_number_the_uapi_gives() {
+        // `include/uapi/linux/stat.h`.
+        assert_eq!(StatMode::SET_UID.bits(), 0o4000);
+        assert_eq!(StatMode::SET_GID.bits(), 0o2000);
+        assert_eq!(StatMode::STICKY.bits(), 0o1000);
+        assert_eq!(StatMode::OWNER_READ.bits(), 0o400);
+        assert_eq!(StatMode::OWNER_WRITE.bits(), 0o200);
+        assert_eq!(StatMode::OWNER_EXEC.bits(), 0o100);
+        assert_eq!(StatMode::GROUP_READ.bits(), 0o40);
+        assert_eq!(StatMode::GROUP_WRITE.bits(), 0o20);
+        assert_eq!(StatMode::GROUP_EXEC.bits(), 0o10);
+        assert_eq!(StatMode::OTHER_READ.bits(), 0o4);
+        assert_eq!(StatMode::OTHER_WRITE.bits(), 0o2);
+        assert_eq!(StatMode::OTHER_EXEC.bits(), 0o1);
+        // And each mask is the three of its own class, which is what makes
+        // the three of them cover `0o777`.
+        assert_eq!(StatMode::OWNER_MASK.bits(), 0o700);
+        assert_eq!(StatMode::GROUP_MASK.bits(), 0o70);
+        assert_eq!(StatMode::OTHER_MASK.bits(), 0o7);
+        assert_eq!(StatMode::PERMISSION_MASK, 0o7777);
+        assert_eq!(StatMode::TYPE_MASK.bits(), 0o170_000);
+    }
 }
 
 /// The two ways an inode reaches userspace -- `struct stat` and
@@ -784,6 +909,106 @@ mod stat_conversion_tests {
         let x: Statx = m.into();
         assert_eq!(s.mode.bits(), 0o41777);
         assert_eq!(x.stx_mode, 0o41777);
+    }
+
+    /// Every byte the kernel promises as zero is zero.
+    ///
+    /// `struct stat`'s `__pad0` and `struct statx`'s `__spare0` and
+    /// `__spare2` are not decoration: Linux zeroes the whole buffer before it
+    /// fills it (`cp_new_stat`, `cp_statx`), and the spare area is where the
+    /// fields added after this kernel live. A userspace newer than this one
+    /// reads `stx_mnt_id` out of the first eight bytes of `__spare2` and
+    /// `stx_dio_mem_align` out of the next four, so anything left in there
+    /// comes back as a real answer to a question this kernel cannot answer.
+    /// Nothing here looked at those bytes at all.
+    #[test]
+    fn the_reserved_bytes_are_zero_in_both_buffers() {
+        let m = meta();
+        let s: Stat = m.clone().into();
+        let x: Statx = m.into();
+        assert_eq!(s._pad0, 0);
+        assert_eq!(x.__spare0, [0; 1]);
+        // 112 bytes, which is the whole tail of the 256: `stx_mnt_id`,
+        // `stx_dio_mem_align`, `stx_dio_offset_align`, `stx_subvol` and the
+        // rest of what a newer kernel reports there.
+        assert_eq!(x.__spare2, [0u64; 14]);
+        // The reserved word of each timestamp, too.
+        for (name, t) in [
+            ("atime", x.stx_atime),
+            ("btime", x.stx_btime),
+            ("ctime", x.stx_ctime),
+            ("mtime", x.stx_mtime),
+        ] {
+            assert_eq!(t.__reserved, 0, "{} left its reserved word set", name);
+        }
+    }
+
+    /// The mask `statx` reports is the uapi's number, not whatever this file
+    /// says it is.
+    ///
+    /// The test above compares `x.stx_mask` with `STATX_BASIC_STATS`, so it
+    /// holds for any value at all: `0x07ff` changed to `0x03ff` -- which
+    /// drops `STATX_BLOCKS`, so `stx_blocks` is filled and then disclaimed --
+    /// left the module green. The mask is how a caller decides which fields
+    /// it may read, so the number is the ABI.
+    #[test]
+    fn the_basic_stats_mask_is_the_eleven_bits_the_uapi_names() {
+        assert_eq!(STATX_BASIC_STATS, 0x07ff);
+        // `include/uapi/linux/stat.h`, in order: TYPE, MODE, NLINK, UID, GID,
+        // ATIME, MTIME, CTIME, INO, SIZE, BLOCKS.
+        let named = 0x1 | 0x2 | 0x4 | 0x8 | 0x10 | 0x20 | 0x40 | 0x80 | 0x100 | 0x200 | 0x400;
+        assert_eq!(STATX_BASIC_STATS, named);
+        // Every field the mask claims is one this kernel fills, which is the
+        // promise the number makes.
+        let x: Statx = meta().into();
+        assert_eq!(x.stx_blocks, 9, "STATX_BLOCKS is claimed");
+        assert_eq!(x.stx_size, 4097, "STATX_SIZE is claimed");
+        assert_eq!(u64::from(x.stx_nlink), 3, "STATX_NLINK is claimed");
+    }
+
+    /// A device whose major needs more than eight bits and whose minor needs
+    /// more than four.
+    ///
+    /// `statx` splits the packed `(major << 8) | minor` with `>> 8 & 0xfff`
+    /// and `& 0xff`, and the test above uses major `0x5` with minor `0x2b`
+    /// and rdev major `0x1` with minor `0x3` -- small enough that narrowing
+    /// either mask changes nothing. Both masks are exercised here to their
+    /// own width, so a mask that loses a nibble shows up.
+    ///
+    /// The eight bits the packing gives the minor are this tree's own limit
+    /// (`Metadata::dev` is `(major << 8) | minor`), not `statx`'s: the uapi
+    /// has twenty bits of minor, and nothing here can carry a minor above
+    /// `0xff` to split in the first place.
+    #[test]
+    fn a_wide_major_and_a_wide_minor_survive_the_split() {
+        let m = Metadata {
+            dev: (0x123 << 8) | 0x5a,
+            rdev: (0xabc << 8) | 0xde,
+            ..meta()
+        };
+        let x: Statx = m.into();
+        assert_eq!(x.stx_dev_major, 0x123, "the major lost its top nibble");
+        assert_eq!(x.stx_dev_minor, 0x5a);
+        assert_eq!(x.stx_rdev_major, 0xabc);
+        assert_eq!(x.stx_rdev_minor, 0xde, "the minor lost its top nibble");
+    }
+
+    /// `stx_btime` carries a copy of `ctime`, and that is a decision, not an
+    /// accident.
+    ///
+    /// Nothing records a birth time here, so the field is filled with the
+    /// nearest thing and `stx_mask` does not claim it (the test above pins
+    /// that half). A caller that checks the mask -- `stat -c %w` does -- sees
+    /// no birth time and prints `-`; one that reads the field anyway gets a
+    /// plausible number rather than whatever was in its buffer. Changing
+    /// which timestamp it copies was invisible: no test read the field.
+    #[test]
+    fn the_birth_time_is_a_copy_of_the_change_time() {
+        let m = meta();
+        let x: Statx = m.clone().into();
+        assert_eq!(x.stx_btime.tv_sec, m.ctime.sec);
+        assert_eq!(x.stx_btime.tv_nsec, m.ctime.nsec as u32);
+        assert_eq!(x.stx_btime.tv_sec, x.stx_ctime.tv_sec);
     }
 }
 
