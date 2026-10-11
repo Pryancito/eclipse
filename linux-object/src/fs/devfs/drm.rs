@@ -2720,9 +2720,33 @@ pub fn alloc_buffer(size: usize) -> Option<GemHandle> {
     }
 }
 
+/// Why a PRIME export was refused, with the errno Linux gives each:
+/// `drm_gem_prime_handle_to_dmabuf` looks the handle up in the file first
+/// (`drm_gem_object_lookup`: ENOENT), then asks the driver to export it, and
+/// nouveau refuses a `NO_SHARE` object there (`nouveau_gem_prime_export`:
+/// EPERM).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExportRefusal {
+    /// Not a handle of this file: nobody created it, or another process did.
+    NotFound,
+    /// Created `NOUVEAU_GEM_DOMAIN_NO_SHARE`.
+    NotShareable,
+}
+
+impl From<ExportRefusal> for crate::error::LxError {
+    fn from(r: ExportRefusal) -> Self {
+        match r {
+            ExportRefusal::NotFound => crate::error::LxError::ENOENT,
+            ExportRefusal::NotShareable => crate::error::LxError::EPERM,
+        }
+    }
+}
+
 /// Export a GEM handle for PRIME: return its `(phys_addr, size, backing VMO)`
 /// so it can be wrapped in a dma-buf and shared with another DRM node.
-pub fn export_handle(handle_id: u32) -> Option<(u64, usize, Arc<VmObject>)> {
+pub fn export_handle(
+    handle_id: u32,
+) -> core::result::Result<(u64, usize, Arc<VmObject>), ExportRefusal> {
     // PRIME export is a uAPI entry point, so it resolves the handle the way
     // Linux's `drm_gem_object_lookup(file_priv, handle)` does -- against what
     // the CALLER may touch. Without this any process could hand
@@ -2738,7 +2762,7 @@ pub fn export_handle(handle_id: u32) -> Option<(u64, usize, Arc<VmObject>)> {
             .find(|(h, _, owner)| h.id == handle_id && owned_by(*owner, pid))
             .map(|(h, vmo, _)| (h.phys_addr, h.size, vmo.clone()))
         {
-            return Some(v);
+            return Ok(v);
         }
     }
     // Driver-private GEM object (nouveau-uAPI GEM_NEW): same fallback the
@@ -2752,9 +2776,18 @@ pub fn export_handle(handle_id: u32) -> Option<(u64, usize, Arc<VmObject>)> {
     // Same ownership rule on the driver-private side: `lookup_for` is
     // `lookup` plus `holds(handle, pid)`, which is the nouveau table's own
     // record of who took a reference.
-    let (phys_addr, size) = zcore_drivers::scheme::gem_mmap::lookup_for(handle_id, pid)?;
+    let (phys_addr, size) = zcore_drivers::scheme::gem_mmap::lookup_for(handle_id, pid)
+        .ok_or(ExportRefusal::NotFound)?;
+    // The object is the file's; now the driver's say (`nouveau_gem_prime_export`).
+    if zcore_drivers::scheme::gem_mmap::no_share(handle_id) {
+        return Err(ExportRefusal::NotShareable);
+    }
+    // The dma-buf hands this range out through its own VMO, which never
+    // reaches `DrmDev::get_vmo`, so the export is where this object's host
+    // address is given away. See `gem_mmap::note_host_pa_handed_out`.
+    zcore_drivers::scheme::gem_mmap::note_host_pa_handed_out(handle_id);
     let vmo = nouveau_cpu_vmo(handle_id, phys_addr, size as usize);
-    Some((phys_addr, size as usize, vmo))
+    Ok((phys_addr, size as usize, vmo))
 }
 
 /// Reverse lookup for PRIME self-import: the nouveau-uAPI GEM handle whose
@@ -3157,7 +3190,14 @@ pub fn create_fb_with_layout(
     // ("create_fb returned None") before any atomic commit — the exact RTX
     // bring-up blocker seen as "Swapchain for output 'HDMI-A-1' failed test".
     let (phys_addr, buf_size) = match resolve_gem_backing_for(handle_id, current_pid()) {
-        Some(v) => v,
+        Some(v) => {
+            // A framebuffer's pixels are read straight out of the physmap
+            // window by `scanout`, with no userspace mapping anywhere, so
+            // this object needs a host address. See
+            // `gem_mmap::note_host_pa_handed_out`.
+            zcore_drivers::scheme::gem_mmap::note_host_pa_handed_out(handle_id);
+            v
+        }
         None => {
             // Loud, not a silent `?`: an unresolvable ADDFB2 handle is exactly
             // "the swapchain buffer has no backing the present path can read",

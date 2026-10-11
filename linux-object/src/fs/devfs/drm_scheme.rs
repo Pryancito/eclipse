@@ -732,6 +732,16 @@ impl DrmDev {
             // dumb-buffer branch above is already owner-checked inside
             // `handle_vmo`; this was the remaining door.
             mmap_len_check(len, size as usize)?;
+            // One of the four places a nouveau GEM's host physical address is
+            // actually handed to a consumer (here, PRIME export, ADDFB2 and
+            // the cursor); /proc/gpudbg totals them, because an object nothing
+            // needs a host address for could live in VRAM rather than cross
+            // PCIe on every GPU access -- and today every GEM object is
+            // sysmem. Counted here rather than after the VMAR install
+            // succeeds on purpose: asking for a CPU mapping is the signal,
+            // and an mmap that fails to install was still a client that
+            // needed this object host-visible.
+            zcore_drivers::scheme::gem_mmap::note_host_pa_handed_out(handle_id);
             Ok(drm::nouveau_cpu_vmo(handle_id, phys_addr, size as usize))
         } else {
             Err(FsError::InvalidParam)
@@ -2180,6 +2190,10 @@ impl DrmDev {
                         else {
                             return Err(FsError::EntryNotFound);
                         };
+                        // The cursor's pixels are read from the physmap
+                        // window, so this object needs a host address even
+                        // though nobody mmaps it.
+                        zcore_drivers::scheme::gem_mmap::note_host_pa_handed_out(cur.handle);
                         let bytes = (cur.width as usize) * (cur.height as usize) * 4;
                         if size < bytes {
                             return Err(FsError::InvalidParam);
@@ -6535,3 +6549,8 @@ mod wsi_refusal_trace_tests;
 /// same way.
 #[cfg(test)]
 mod scanout_modifier_tests;
+
+/// `drm_gem_prime_handle_to_dmabuf`: ENOENT for a handle the file does not
+/// hold, EPERM for a `NO_SHARE` object.
+#[cfg(test)]
+mod prime_export_tests;
