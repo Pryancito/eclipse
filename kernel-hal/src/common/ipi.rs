@@ -250,6 +250,53 @@ pub fn smp_enabled() -> bool {
     SMP_ENABLED.load(Ordering::Relaxed)
 }
 
+/// How many CPUs this boot may bring up in total, the boot CPU included.
+///
+/// `MAX_CORE_NUM` means "every CPU the firmware reports", which is the
+/// default and what every boot did before this knob existed. `smp=<N>` on the
+/// command line lowers it.
+///
+/// **Why a count and not just the on/off switch above.** `smp=off` is all or
+/// one: on a machine with twenty hardware threads the only two configurations
+/// reachable without a rebuild were one CPU and twenty. Twenty is also what a
+/// `-smp 20` QEMU pays for twenty times over — twenty vCPU threads each taking
+/// its own 250 Hz tick, on a host that has to emulate every one of them — and
+/// the complaint that opened this work was exactly that: slow, and hot. A
+/// count makes "bring up two of them" a boot argument.
+///
+/// The cap is on the COUNT, not on which ids: the firmware's order is kept and
+/// the tail is dropped, so `smp=2` is the boot CPU plus the first AP the MADT
+/// (or the device tree) names. Picking particular ids is what task affinity is
+/// for, and a boot that renumbers CPUs would make every per-CPU table in the
+/// system mean something different from the firmware's own report.
+static SMP_MAX_CPUS: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(MAX_CORE_NUM);
+
+/// Lower the CPU count for this boot (called from `zCore` for `smp=<N>`).
+///
+/// `0` is refused rather than stored: the boot CPU is already running by the
+/// time anyone can ask, so a cap of zero cannot be obeyed, and clamping it to
+/// one is the only honest reading of it. Values above `MAX_CORE_NUM` clamp
+/// down to it, because a cap that promises more slots than the per-CPU tables
+/// have is not a cap.
+pub fn set_smp_max_cpus(n: usize) {
+    SMP_MAX_CPUS.store(n.clamp(1, MAX_CORE_NUM), Ordering::Relaxed);
+}
+
+/// The CPU count ceiling for this boot, the boot CPU included. Never zero.
+pub fn smp_max_cpus() -> usize {
+    SMP_MAX_CPUS.load(Ordering::Relaxed).clamp(1, MAX_CORE_NUM)
+}
+
+/// How many application processors may still be started, given the ceiling.
+///
+/// The boot CPU is always one of them, so this is the ceiling minus one — and
+/// `0` when the ceiling is `1`, which is the same single-core boot `smp=off`
+/// asks for.
+pub fn smp_max_aps() -> usize {
+    smp_max_cpus() - 1
+}
+
 /// Bitmask of logical CPU ids that are actually online and able to service
 /// IPIs. The BSP (logical 0) is always online; APs OR in their bit once they
 /// reach `secondary_init`. Shootdowns only target online CPUs — APs that failed
@@ -2714,6 +2761,61 @@ mod ipi_tests {
         assert!(!smp_enabled());
         set_smp_enabled(before);
         assert_eq!(smp_enabled(), before);
+    }
+
+    #[test]
+    fn the_cpu_ceiling_defaults_to_every_slot_the_tables_hold() {
+        let _g = test_lock();
+        let before = smp_max_cpus();
+        assert_eq!(before, MAX_CORE_NUM, "no ceiling is the default");
+        assert_eq!(smp_max_aps(), MAX_CORE_NUM - 1);
+        set_smp_max_cpus(before);
+    }
+
+    #[test]
+    fn a_ceiling_of_two_leaves_room_for_exactly_one_ap() {
+        // The boot CPU is already running and already registered by the time
+        // bring-up reads this, so the ceiling on APs is one less than the CPU
+        // count asked for. Off by one here and `smp=2` boots three cores.
+        let _g = test_lock();
+        let before = smp_max_cpus();
+        set_smp_max_cpus(2);
+        assert_eq!(smp_max_cpus(), 2);
+        assert_eq!(smp_max_aps(), 1);
+        set_smp_max_cpus(before);
+    }
+
+    #[test]
+    fn a_ceiling_of_one_asks_for_no_ap_at_all() {
+        // Which is the same single-core boot `smp=off` asks for, by the same
+        // route: `start_application_processors` starts zero APs.
+        let _g = test_lock();
+        let before = smp_max_cpus();
+        set_smp_max_cpus(1);
+        assert_eq!(smp_max_aps(), 0);
+        set_smp_max_cpus(before);
+    }
+
+    #[test]
+    fn a_ceiling_of_zero_is_read_as_one_and_never_underflows() {
+        // `smp_max_aps` is `smp_max_cpus() - 1` on a `usize`, so a stored zero
+        // would wrap into "start eighteen quintillion APs". The clamp is on
+        // both the store and the load for that reason.
+        let _g = test_lock();
+        let before = smp_max_cpus();
+        set_smp_max_cpus(0);
+        assert_eq!(smp_max_cpus(), 1);
+        assert_eq!(smp_max_aps(), 0);
+        set_smp_max_cpus(before);
+    }
+
+    #[test]
+    fn a_ceiling_above_what_the_tables_hold_clamps_down_to_them() {
+        let _g = test_lock();
+        let before = smp_max_cpus();
+        set_smp_max_cpus(usize::MAX);
+        assert_eq!(smp_max_cpus(), MAX_CORE_NUM);
+        set_smp_max_cpus(before);
     }
 
     // ── the address-space filter, and the pair that makes it work ──────────

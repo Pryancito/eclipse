@@ -85,15 +85,23 @@ device tree:       {device_tree_paddr:016x}..{:016x}
     // "single-core boot forced (smp=off)" the boot log then prints is a switch
     // the kernel says it obeyed and did not. x86_64 checks the same flag inside
     // `start_application_processors`, which runs late enough to just read it.
-    if dtb_says_smp_off(&dtb) {
-        kernel_hal::set_smp_enabled(false);
-        println!("[smp] secondary harts not started (smp=off)");
-    } else {
-        boot_secondary_harts(
-            hartid,
-            &dtb,
-            secondary_hart_start as *const () as usize - mem_info.offset(),
-        );
+    match dtb_smp_limit(&dtb) {
+        Some(1) => {
+            kernel_hal::set_smp_enabled(false);
+            kernel_hal::set_smp_max_cpus(1);
+            println!("[smp] secondary harts not started (smp=off)");
+        }
+        limit => {
+            if let Some(n) = limit {
+                kernel_hal::set_smp_max_cpus(n);
+                println!("[smp] hart bring-up capped at {n} CPU(s) (smp={n})");
+            }
+            boot_secondary_harts(
+                hartid,
+                &dtb,
+                secondary_hart_start as *const () as usize - mem_info.offset(),
+            );
+        }
     }
     // 转交控制权
     crate::primary_main(KernelConfig {
@@ -105,15 +113,24 @@ device tree:       {device_tree_paddr:016x}..{:016x}
     unreachable!()
 }
 
-/// Whether the device tree's `/chosen/bootargs` asks for a single-core boot.
+/// The CPU count the device tree's `/chosen/bootargs` asks this boot to stop
+/// at, or `None` when it asks for no ceiling at all.
+///
+/// `Some(1)` is the single-core boot `smp=off` asks for; any larger number is
+/// an `smp=<N>` ceiling, clamped to what the per-CPU tables can hold.
 ///
 /// The answer is decided inside the walk rather than carried out of it: the
 /// property's bytes live only as long as the callback. They are the raw,
 /// NUL-terminated property, so `cmdline::from_c_bytes` strips the terminator —
 /// without it the value of the *last* flag on the line reads as `"off\0"`,
 /// which spells no boolean, and the flag looks unwritten.
-fn dtb_says_smp_off(dtb: &Dtb) -> bool {
-    let mut off = false;
+///
+/// Why riscv64 answers this here and x86_64 answers it inside
+/// `start_application_processors`: the harts are released before
+/// `primary_main` exists, so a ceiling read later is a ceiling the kernel
+/// announces and does not obey.
+fn dtb_smp_limit(dtb: &Dtb) -> Option<usize> {
+    let mut limit = None;
     dtb.walk(|path, obj| match obj {
         DtbObj::SubNode { name } => {
             if path.is_root() && name == Str::from("chosen") {
@@ -124,13 +141,13 @@ fn dtb_says_smp_off(dtb: &Dtb) -> bool {
         }
         DtbObj::Property(Property::General { name, value }) if name == Str::from("bootargs") => {
             if let Some(cmdline) = kernel_hal::cmdline::from_c_bytes(value) {
-                off = kernel_hal::cmdline::is_off(cmdline, "smp");
+                limit = kernel_hal::cmdline::smp_limit(cmdline);
             }
             Terminate
         }
         DtbObj::Property(_) => StepOver,
     });
-    off
+    limit
 }
 
 /// 副核启动。
@@ -206,11 +223,10 @@ fn boot_secondary_harts(boot_hartid: usize, dtb: &Dtb, start_addr: usize) {
     // `MAX_HART_NUM` bounds the raw hart id (the boot stack array `select_stack`
     // indexes); `MAX_CORE_NUM - 1` bounds how many secondaries the per-CPU
     // tables can hold on top of this one.
-    let mut walk = HartWalk::new(
-        boot_hartid,
-        MAX_HART_NUM,
-        kernel_hal::config::MAX_CORE_NUM.saturating_sub(1),
-    );
+    //
+    // `smp_max_aps()` folds the `smp=<N>` ceiling into the second of those:
+    // it is `MAX_CORE_NUM - 1` unless the command line lowered it.
+    let mut walk = HartWalk::new(boot_hartid, MAX_HART_NUM, kernel_hal::smp_max_aps());
     let mut cpus = false;
     dtb.walk(|path, obj| match obj {
         DtbObj::SubNode { name } => {

@@ -283,11 +283,37 @@ fn primary_main(config: kernel_hal::KernelConfig) {
         // it), and is fixed; see `kernel_hal::common::ipi::SMP_ENABLED`.
         // `smp=off` remains for bringing a suspect machine up single-core
         // without a rebuild.
-        if kernel_hal::cmdline::is_off(&options.cmdline, "smp") {
-            kernel_hal::set_smp_enabled(false);
-            klog_info!("Eclipse: single-core boot forced (smp=off)");
-        } else {
-            klog_info!("Eclipse: SMP multi-core bring-up enabled (pass `smp=off` to disable)");
+        //
+        // `smp=<N>` caps the CPU COUNT instead, the boot CPU included, so a
+        // machine with twenty hardware threads can be brought up on two of
+        // them without a rebuild — the configuration a `-smp 20` QEMU makes
+        // expensive (twenty vCPU threads, twenty 250 Hz ticks, one host to
+        // emulate them all). `smp=1` is the same single-core boot as
+        // `smp=off`, and reaches it through the same path.
+        //
+        // The number is read BEFORE the boolean on purpose: `smp=1` spells a
+        // true boolean, so an `is_off` test alone would see "SMP requested"
+        // and bring up every CPU under a log line claiming one.
+        match kernel_hal::cmdline::smp_limit(&options.cmdline) {
+            Some(1) => {
+                // One CPU. The master switch stays the thing that says so --
+                // it is what every arch's bring-up already reads -- and the
+                // ceiling is set to match so nothing downstream can read the
+                // two differently.
+                kernel_hal::set_smp_enabled(false);
+                kernel_hal::set_smp_max_cpus(1);
+                klog_info!("Eclipse: single-core boot forced (smp=off)");
+            }
+            Some(n) => {
+                kernel_hal::set_smp_max_cpus(n);
+                klog_info!("Eclipse: SMP bring-up capped at {} CPU(s) (smp={})", n, n);
+            }
+            None => {
+                klog_info!(
+                    "Eclipse: SMP multi-core bring-up enabled (pass `smp=off`, or `smp=<N>` to \
+                     cap the CPU count)"
+                );
+            }
         }
         // Keep the kernel text console on screen even while a compositor holds
         // its VT in KD_GRAPHICS. Normally KD_GRAPHICS suppresses presentation

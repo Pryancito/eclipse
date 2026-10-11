@@ -222,10 +222,76 @@ pub fn counts_per_tick(hz: u64, ticks_per_sec: u64) -> u32 {
 /// timers its owner was about to serve itself, turning the per-CPU split back
 /// into the all-CPUs-wake-for-every-timer it exists to undo.
 pub fn stray_deadline_cpu(now_ns: u64, me: usize, next: &[u64], lag_ns: u64) -> Option<usize> {
+    // The slice form answers the same question through the masked one, so the
+    // tests written against this signature also pin the version the tick runs.
+    let armed = armed_mask(next);
+    stray_deadline_cpu_armed(now_ns, me, armed, lag_ns, |cpu| next[cpu])
+}
+
+/// Which CPUs in `next` have anything pending at all, as a bitmask.
+///
+/// Only a test builds the mask this way; the kernel maintains it as deadlines
+/// are published (see `timer::ARMED_CPUS`), which is the whole point.
+pub fn armed_mask(next: &[u64]) -> u64 {
+    let mut armed = 0u64;
+    for (cpu, &next_ns) in next.iter().enumerate().take(64) {
+        if next_ns != NO_DEADLINE {
+            armed |= 1u64 << cpu;
+        }
+    }
+    armed
+}
+
+/// [`stray_deadline_cpu`] driven by a bitmask of the CPUs that have anything
+/// pending, asking for a deadline only where the mask says there is one.
+///
+/// **Why the mask.** The slice form reads every slot, which on this kernel
+/// means `MAX_CORE_NUM` — 64 — `Acquire` loads, from every CPU, on every
+/// timer tick: the caller even built the snapshot as a 512-byte array on the
+/// tick's own stack. Those loads are not free the way a local array's would
+/// be. Each slot is another CPU's published deadline, written by that CPU
+/// whenever it arms or expires a timer, so reading all 64 pulls other cores'
+/// cachelines to this one at 250 Hz per CPU, and the lines bounce straight
+/// back when their owners next write them. At `-smp 20` that is 5.000 sweeps
+/// a second over 64 shared slots to answer a question that is "no" on every
+/// healthy tick — the stray sweep exists for a core that has STOPPED ticking,
+/// which is not the normal case.
+///
+/// With the mask the normal answer costs one load: a machine where nobody
+/// else has a timer armed (and an idle one where nobody has) returns before
+/// reading any deadline at all, and a two-CPU machine reads at most one. The
+/// loop then visits only armed CPUs instead of all 64, so what it costs
+/// follows how many timers are actually pending rather than how many CPU
+/// slots the kernel was compiled for.
+///
+/// The mask may lag the deadlines it describes — it is published alongside
+/// them, not atomically with them — and both directions are harmless: a bit
+/// set for a CPU that has since emptied its heap costs one `NO_DEADLINE` load
+/// and is skipped, and a bit missing for a CPU that has just armed one costs
+/// at most one tick of extra latency on a callback the sweep only looks at
+/// once it is already `lag_ns` late.
+pub fn stray_deadline_cpu_armed(
+    now_ns: u64,
+    me: usize,
+    armed: u64,
+    lag_ns: u64,
+    mut next_of: impl FnMut(usize) -> u64,
+) -> Option<usize> {
+    let mut bits = if me < 64 {
+        armed & !(1u64 << me)
+    } else {
+        armed
+    };
+    if bits == 0 {
+        return None;
+    }
     let cutoff = now_ns.checked_sub(lag_ns)?;
     let mut worst: Option<(usize, u64)> = None;
-    for (cpu, &next_ns) in next.iter().enumerate() {
-        if cpu == me || next_ns == NO_DEADLINE || !is_due(cutoff, next_ns) {
+    while bits != 0 {
+        let cpu = bits.trailing_zeros() as usize;
+        bits &= bits - 1;
+        let next_ns = next_of(cpu);
+        if next_ns == NO_DEADLINE || !is_due(cutoff, next_ns) {
             continue;
         }
         if worst.is_none_or(|(_, w)| next_ns < w) {
@@ -965,5 +1031,82 @@ mod tests {
     fn the_first_milliseconds_of_a_boot_adopt_nothing() {
         let next = [NO_DEADLINE, 0];
         assert_eq!(stray_deadline_cpu(MS, 0, &next, LAG), None);
+    }
+
+    // ── the armed mask, which is what the tick actually reads ───────────────
+
+    #[test]
+    fn an_empty_mask_asks_for_no_deadline_at_all() {
+        // The whole point of the mask: on a healthy tick the answer is "no"
+        // and it costs one load, not one per CPU slot the kernel was built
+        // for. A deadline read here would be a read the tick does not need.
+        let mut asked = 0usize;
+        let found = stray_deadline_cpu_armed(NOW, 0, 0, LAG, |_| {
+            asked += 1;
+            0
+        });
+        assert_eq!(found, None);
+        assert_eq!(asked, 0, "an empty mask must not read any deadline");
+    }
+
+    #[test]
+    fn only_the_cpus_the_mask_names_are_asked() {
+        // And never the caller's own, whose heap it drains through the normal
+        // path -- so a two-CPU machine reads at most one deadline per tick.
+        let mut asked = alloc::vec::Vec::new();
+        let found = stray_deadline_cpu_armed(NOW, 0, 0b1011, LAG, |cpu| {
+            asked.push(cpu);
+            NO_DEADLINE
+        });
+        assert_eq!(found, None);
+        assert_eq!(
+            asked,
+            alloc::vec![1, 3],
+            "cpu 0 is the caller, cpu 2 is idle"
+        );
+    }
+
+    #[test]
+    fn a_mask_bit_left_set_on_an_emptied_heap_costs_one_load_and_nothing_else() {
+        // The mask is published next to the deadline, not atomically with it,
+        // so it can name a CPU that has since drained its heap.
+        let mut asked = 0usize;
+        let found = stray_deadline_cpu_armed(NOW, 0, 0b10, LAG, |_| {
+            asked += 1;
+            NO_DEADLINE
+        });
+        assert_eq!(found, None);
+        assert_eq!(asked, 1);
+    }
+
+    #[test]
+    fn the_mask_form_and_the_slice_form_give_the_same_answer() {
+        // The slice form is what the tests above are written against, so this
+        // is what carries them over to the version the tick runs.
+        let cases: [&[u64]; 5] = [
+            &[NO_DEADLINE, NO_DEADLINE],
+            &[NOW, NOW - 50 * MS],
+            &[NO_DEADLINE, NOW - 50 * MS, NOW - 60 * MS],
+            &[NOW - 9 * MS, NO_DEADLINE, NOW - 9 * MS],
+            &[NO_DEADLINE, NOW + 50 * MS],
+        ];
+        for next in cases {
+            for me in 0..next.len() {
+                let slice = stray_deadline_cpu(NOW, me, next, LAG);
+                let masked =
+                    stray_deadline_cpu_armed(NOW, me, armed_mask(next), LAG, |cpu| next[cpu]);
+                assert_eq!(slice, masked, "next={next:?} me={me}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_mask_is_the_cpus_with_something_pending() {
+        assert_eq!(armed_mask(&[NO_DEADLINE, NO_DEADLINE]), 0);
+        assert_eq!(armed_mask(&[NOW, NO_DEADLINE, NOW]), 0b101);
+        // Zero is a real deadline (the instant of boot), not "nothing": the
+        // "nothing" marker is `NO_DEADLINE`, and reading zero as empty is how
+        // a heap armed at time zero would be dropped.
+        assert_eq!(armed_mask(&[0]), 0b1);
     }
 }

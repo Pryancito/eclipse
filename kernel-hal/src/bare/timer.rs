@@ -105,7 +105,7 @@ type DueCallbacks = alloc::vec::Vec<Box<dyn FnOnce(Duration) + Send + Sync>>;
 fn drain_cpu_heap(cpu: usize, now: Duration) -> DueCallbacks {
     let mut t = TIMER_HEAPS[cpu].lock();
     let expired = t.drain_expired(now);
-    NEXT_DEADLINE_NS[cpu].store(t.next_ns(), Ordering::Release);
+    publish_deadline(cpu, t.next_ns());
     expired
 }
 
@@ -125,7 +125,7 @@ fn drain_cpu_heap(cpu: usize, now: Duration) -> DueCallbacks {
 fn try_drain_cpu_heap(cpu: usize, now: Duration) -> Option<DueCallbacks> {
     let mut t = TIMER_HEAPS[cpu].try_lock()?;
     let expired = t.drain_expired(now);
-    NEXT_DEADLINE_NS[cpu].store(t.next_ns(), Ordering::Release);
+    publish_deadline(cpu, t.next_ns());
     Some(expired)
 }
 
@@ -151,20 +151,47 @@ pub fn timer_pending_count() -> usize {
         .sum()
 }
 
-/// The earliest deadline published per CPU, snapshotted for the stray sweep.
-fn next_deadlines() -> [u64; crate::config::MAX_CORE_NUM] {
-    core::array::from_fn(|cpu| NEXT_DEADLINE_NS[cpu].load(Ordering::Acquire))
+/// Which CPUs have a deadline pending right now, one bit per dense logical
+/// id — the same thing [`NEXT_DEADLINE_NS`] says, in a shape the stray sweep
+/// can read in one load instead of 64.
+///
+/// Kept in step with `NEXT_DEADLINE_NS` by [`publish_deadline`], which is the
+/// only writer of either. It is not updated atomically WITH the deadline it
+/// describes and does not need to be: see `deadline::stray_deadline_cpu_armed`
+/// for why both kinds of lag are harmless.
+static ARMED_CPUS: AtomicU64 = AtomicU64::new(0);
+
+/// Publish `cpu`'s earliest pending deadline, keeping [`ARMED_CPUS`] in step.
+///
+/// Called under the owning heap's lock, which is what orders two publishes for
+/// the same CPU against each other. The mask is a separate RMW, so a reader
+/// can see the new mask with the old deadline or the reverse; both readings
+/// are safe (again, see `stray_deadline_cpu_armed`).
+fn publish_deadline(cpu: usize, next: u64) {
+    NEXT_DEADLINE_NS[cpu].store(next, Ordering::Release);
+    if cpu >= 64 {
+        return;
+    }
+    let bit = 1u64 << cpu;
+    if next == NO_DEADLINE {
+        ARMED_CPUS.fetch_and(!bit, Ordering::Release);
+    } else {
+        ARMED_CPUS.fetch_or(bit, Ordering::Release);
+    }
 }
 
 /// Which CPU, if any, has `word` published as its next deadline right now.
 ///
 /// A fault report that finds a nanosecond-looking word where a return address
-/// belongs has a hypothesis to test, and this is the test. `timer_tick` builds
-/// [`next_deadlines`] -- a `[u64; MAX_CORE_NUM]` of absolute nanosecond
-/// deadlines -- **on its own stack**, every tick, for the stray sweep. So a
-/// deadline-shaped word in a stack slot on the timer path may be nothing but
-/// that array's residue from an earlier frame, and chasing it as a smashed
-/// code pointer is chasing the kernel's own bookkeeping.
+/// belongs has a hypothesis to test, and this is the test. The tick used to
+/// build a `[u64; MAX_CORE_NUM]` of absolute nanosecond deadlines **on its own
+/// stack**, every tick, for the stray sweep -- so a deadline-shaped word in a
+/// stack slot on the timer path could be nothing but that array's residue from
+/// an earlier frame, and chasing it as a smashed code pointer was chasing the
+/// kernel's own bookkeeping. The sweep no longer builds that array (see
+/// [`ARMED_CPUS`]), so residue of that exact shape stops accumulating from
+/// here on -- but a frame below an older one can still hold it, and the
+/// published deadlines are still live words a smash could copy.
 ///
 /// Answering it turns a guess into a measurement: a hit says the word is a
 /// live deadline this kernel published, which is residue; a miss says it is
@@ -540,7 +567,7 @@ hal_fn_impl! {
             // concurrent updates can't race with `timer_tick`'s post-expire
             // publish.
             let next = t.next_ns();
-            NEXT_DEADLINE_NS[cpu].store(next, Ordering::Release);
+            publish_deadline(cpu, next);
             // Bring this CPU's timer forward to the new deadline if it is
             // nearer than the pending fire. Without this the timer would only
             // be noticed on the next 4 ms tick, which is the whole of the
@@ -730,13 +757,21 @@ hal_fn_impl! {
             let mine_due = is_due(now_ns, NEXT_DEADLINE_NS[me].load(Ordering::Acquire));
             // Stray adoption: a heap whose owner stopped taking ticks would
             // hold its callbacks for ever, so any ticking CPU serves one that
-            // has fallen more than `STRAY_LAG_NS` behind. `MAX_CORE_NUM`
-            // relaxed loads per tick, and no other heap is ever locked unless
-            // something is genuinely late.
+            // has fallen more than `STRAY_LAG_NS` behind. One relaxed load per
+            // tick when no other CPU has a timer armed, and one deadline read
+            // per CPU that has -- never `MAX_CORE_NUM` of them, which is what
+            // this cost before `ARMED_CPUS` existed. No other heap is ever
+            // locked unless something is genuinely late.
             let stray = if skip_dyn {
                 None
             } else {
-                crate::deadline::stray_deadline_cpu(now_ns, me, &next_deadlines(), STRAY_LAG_NS)
+                crate::deadline::stray_deadline_cpu_armed(
+                    now_ns,
+                    me,
+                    ARMED_CPUS.load(Ordering::Acquire),
+                    STRAY_LAG_NS,
+                    |cpu| NEXT_DEADLINE_NS[cpu].load(Ordering::Acquire),
+                )
             };
             if skip_dyn || (!mine_due && stray.is_none()) {
                 // On skip_dyn leave the heap untouched so live one-shots

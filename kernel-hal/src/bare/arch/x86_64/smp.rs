@@ -443,13 +443,37 @@ pub fn start_application_processors() {
         return;
     }
 
-    let ap_lapic_ids = match enumerate_aps(acpi_rsdp) {
+    let mut ap_lapic_ids = match enumerate_aps(acpi_rsdp) {
         Some(ids) => ids,
         None => return,
     };
 
     if ap_lapic_ids.is_empty() {
         crate::klog_warn!("[smp] no application processors in ACPI MADT; booting single-core");
+        return;
+    }
+
+    // `smp=<N>` ceiling. The BSP is already registered, so the ceiling on APs
+    // is one less than the CPU count asked for; `smp=1` reaches zero here and
+    // is the same single-core boot `smp=off` gives, by the same route.
+    //
+    // The tail is what gets dropped, not a selection: see `smp_max_cpus`. The
+    // dropped APs are never INIT/SIPI'd at all, so they stay in the firmware's
+    // wait-for-SIPI state — they take no tick, enter no executor loop, and
+    // cost nothing. That is the point of the knob: on an emulator every vCPU
+    // that is brought up is a host thread taking its own 250 Hz tick.
+    let max_aps = crate::common::ipi::smp_max_aps();
+    if ap_lapic_ids.len() > max_aps {
+        crate::klog_info!(
+            "[smp] {} AP(s) in the MADT, starting {} (smp={})",
+            ap_lapic_ids.len(),
+            max_aps,
+            max_aps + 1
+        );
+        ap_lapic_ids.truncate(max_aps);
+    }
+    if ap_lapic_ids.is_empty() {
+        crate::klog_warn!("[smp] AP bring-up capped at one CPU — single-core");
         return;
     }
 
