@@ -638,7 +638,12 @@ pub trait DrmScheme: Scheme {
     /// want opposite things from whoever is debugging: an unknown handle is a
     /// lifetime or ownership bug, a VRAM handle is a buffer the CPU present
     /// simply cannot read. Default: nothing tracked.
-    fn gem_aperture(&self, _handle_id: u32) -> GemAperture {
+    ///
+    /// `pid` is who asks. Handles are per file in Linux
+    /// (`drm_gem_object_lookup(file_priv, handle)` fails for another file's),
+    /// so an object the process may not touch is `Unknown` to it, the same
+    /// as no object at all; 0 is the kernel, which may touch every object.
+    fn gem_aperture(&self, _handle_id: u32, _pid: u64) -> GemAperture {
         GemAperture::Unknown
     }
 
@@ -960,7 +965,7 @@ mod tests {
     /// never `Vram` -- the two want opposite things from whoever is reading.
     #[test]
     fn an_untracked_handle_has_an_unknown_aperture() {
-        assert_eq!(BareDrm::new().gem_aperture(7), GemAperture::Unknown);
+        assert_eq!(BareDrm::new().gem_aperture(7, 0), GemAperture::Unknown);
     }
 
     /// And the three apertures must stay distinct, since the present path

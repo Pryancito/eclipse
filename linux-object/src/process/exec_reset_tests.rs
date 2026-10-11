@@ -376,6 +376,24 @@ fn an_ordinary_process_exec_ing_an_ordinary_image_is_not_secure() {
     assert!(!inner.apply_exec_ids_from_a_normal_mount(0o0755, ROOT_UID, ROOT_UID));
 }
 
+#[test]
+fn an_ordinary_user_in_no_supplementary_group_is_not_secure_either() {
+    // The same case with the supplementary list EMPTY, which is what a
+    // system account looks like -- `nobody`, a daemon user, anyone whose
+    // `/etc/group` lines name no extra group. `in_group_p(new->egid)` is
+    // `egid == current_egid() || groups_search(...)`, and for these the
+    // second half answers no, so the first half is the only thing between
+    // an ordinary `execve` and secure mode. Every other fixture in this
+    // file carries its own gid in the list and so never asks it.
+    let mut inner = a_process_about_to_exec();
+    inner.credentials.groups = Vec::new();
+    assert!(
+        !inner.apply_exec_ids_from_a_normal_mount(0o0755, 1000, 1000),
+        "an exec that moves nothing is not a raise, list or no list"
+    );
+    assert_eq!(inner.credentials.egid, 1000);
+}
+
 // --- The aux-vector identity block --------------------------------------
 
 #[test]

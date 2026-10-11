@@ -764,3 +764,130 @@ fn a_no_access_riscv_page_does_not_panic_the_kernel() {
     assert_eq!(e.addr(), FRAME);
     assert!(e.flags().is_empty());
 }
+
+// ── the dirty bit, which bounds the scheduler's stack poison ────────────────
+//
+// `PageTableImpl::dirty_depth_from_top` turns these answers into "how much of
+// a recycled coroutine stack has to be poisoned". A `Some(false)` that should
+// have been `Some(true)` or `None` leaves a previous occupant's live return
+// addresses on the stack, where `classify_parked_frame` accepts them as a
+// resumable frame — so the interesting case of each format is the one where
+// it must NOT claim a page is clean.
+
+const X86_ACCESSED: u64 = 1 << 5;
+const X86_DIRTY: u64 = 1 << 6;
+
+#[test]
+fn the_x86_entry_reports_the_hardware_dirty_bit() {
+    // A mapping this kernel just wrote: never written through, so clean.
+    let fresh = a_leaf(X86PTE::zeroed(), FRAME, rw(), false);
+    assert_eq!(fresh.raw() & X86_DIRTY, 0, "set_flags must not emit D");
+    assert_eq!(fresh.dirty(), Some(false));
+
+    // The same entry after the CPU has taken a store through it. Bit 6 is the
+    // only difference; A is set alongside it by any access and must not be
+    // mistaken for it.
+    let written = X86PTE::from_raw(fresh.raw() | X86_DIRTY | X86_ACCESSED);
+    assert_eq!(written.dirty(), Some(true));
+    let read_only_touch = X86PTE::from_raw(fresh.raw() | X86_ACCESSED);
+    assert_eq!(
+        read_only_touch.dirty(),
+        Some(false),
+        "the accessed bit is set by a read; it is not a write"
+    );
+
+    // And it is bit 6 and nothing else: every other bit set, D clear.
+    let everything_else = X86PTE::from_raw(!X86_DIRTY);
+    assert_eq!(everything_else.dirty(), Some(false));
+    assert_eq!(X86PTE::from_raw(X86_DIRTY).dirty(), Some(true));
+}
+
+#[test]
+fn the_x86_dirty_bit_survives_a_flag_rewrite() {
+    // The stack quarantine write-protects the usable region of a coroutine
+    // stack when it is freed and restores it when the block is reused, and
+    // both halves go through `set_flags`. If that rebuilt the entry without D,
+    // the bound would be told a stack still carrying a previous occupant's
+    // return addresses was never written -- and `classify_parked_frame`
+    // accepts a real frame as resumable.
+    let mut e = X86PTE::from_raw(a_leaf(X86PTE::zeroed(), FRAME, rw(), false).raw() | X86_DIRTY);
+    assert_eq!(e.dirty(), Some(true));
+    e.set_flags(MMUFlags::READ, false);
+    assert_eq!(
+        e.dirty(),
+        Some(true),
+        "taking WRITE away is not a clean page"
+    );
+    assert_eq!(e.flags(), MMUFlags::READ);
+    assert_eq!(e.addr(), FRAME);
+
+    // Including all the way down to no access at all, which is how the
+    // quarantine and the guard bands take a page away.
+    e.set_flags(MMUFlags::empty(), false);
+    assert!(!e.is_present());
+    assert_eq!(e.dirty(), Some(true));
+    e.set_flags(rw(), false);
+    assert_eq!(e.dirty(), Some(true), "and it comes back with the page");
+
+    // A clean entry is not made dirty by a rewrite either: the bit is carried,
+    // not invented.
+    let mut clean = a_leaf(X86PTE::zeroed(), FRAME, rw(), false);
+    clean.set_flags(MMUFlags::READ, false);
+    assert_eq!(clean.dirty(), Some(false));
+}
+
+#[test]
+fn a_child_of_a_split_can_be_marked_written() {
+    // What `split_huge_page` does to each of the 512 children: build it from
+    // zero, give it the parent's address and flags, and then mark it written,
+    // because neither of those can carry a bit the hardware maintains -- and
+    // sampling the parent instead would be a lost update, since the old leaf
+    // stays live until the publish.
+    let parent = X86PTE::from_raw(a_leaf(X86PTE::zeroed(), FRAME, rw(), true).raw() | X86_DIRTY);
+    assert_eq!(parent.dirty(), Some(true));
+
+    let mut child = X86PTE::zeroed();
+    child.clear();
+    child.set_addr(FRAME);
+    child.set_flags(parent.flags(), false);
+    assert_eq!(child.dirty(), Some(false), "a child starts clean");
+    child.set_dirty();
+    assert_eq!(child.dirty(), Some(true));
+    assert_eq!(child.raw() & X86_DIRTY, X86_DIRTY, "bit 6, per the SDM");
+    assert_eq!(child.addr(), FRAME);
+    assert_eq!(child.flags(), rw(), "and nothing else moved");
+    assert_eq!(child.raw() & X86_PS, 0, "a 4 KiB child is not a leaf");
+
+    // Idempotent: marking an entry that already says so changes nothing.
+    let before = child.raw();
+    child.set_dirty();
+    assert_eq!(child.raw(), before);
+}
+
+#[test]
+fn the_other_two_formats_refuse_to_answer() {
+    // Both have a bit that looks like one and is not: RISC-V sets D in
+    // software on every mapping (so it means "writable"), and AArch64's AF is
+    // set by a read. Claiming either is a write is the unsafe direction, so
+    // both say `None` and the scheduler poisons the whole region.
+    let rv = a_leaf(Rv64PTE::zeroed(), FRAME, rw(), false);
+    assert_eq!(rv.raw() & RV_DIRTY, RV_DIRTY, "the bit is set, and it lies");
+    assert_eq!(rv.dirty(), None);
+
+    let a64 = a_leaf(AARCH64PTE::zeroed(), FRAME, rw(), false);
+    assert_eq!(a64.raw() & A64_AF, A64_AF, "AF, which a read also sets");
+    assert_eq!(a64.dirty(), None);
+
+    // And `set_dirty` is the no-op it is documented to be on both: a format
+    // that cannot answer must not be made to look as if it could.
+    let mut rv = rv;
+    let before = rv.raw();
+    rv.set_dirty();
+    assert_eq!(rv.raw(), before);
+    assert_eq!(rv.dirty(), None);
+    let mut a64 = a64;
+    let before = a64.raw();
+    a64.set_dirty();
+    assert_eq!(a64.raw(), before);
+    assert_eq!(a64.dirty(), None);
+}

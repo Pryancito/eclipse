@@ -166,10 +166,11 @@ mod tests {
         assert_eq!(Signal::USER_ALL.bits(), 0xff00_0000);
     }
 
-    /// The four signals that mean "this object is finished" are all
-    /// `SIGNALED`, deliberately: a waiter does not have to know which kind of
-    /// object it holds. Written down so the next reader does not "fix" the
-    /// duplication, and so moving `SIGNALED` moves all five together or none.
+    /// The four `*_TERMINATED` signals, and `VMO_ZERO_CHILDREN` with them,
+    /// are all `SIGNALED`, deliberately: a waiter does not have to know which
+    /// kind of object it holds. Written down so the next reader does not
+    /// "fix" the duplication, and so moving `SIGNALED` moves all five
+    /// together or none.
     #[test]
     fn the_terminated_signals_are_all_the_signaled_bit() {
         for (name, signal) in [

@@ -1363,7 +1363,7 @@ impl Syscall<'_> {
                         // says what the fd is open as (`DRM_RDWR`) and whether
                         // it is close-on-exec (`DRM_CLOEXEC`); `add_file` reads
                         // the second off the object, as it does for `open`.
-                        let (phys, size, vmo) = match drm::export_handle(handle) {
+                        let (phys, size, vmo) = match drm::export_handle(handle, drm_file.minor()) {
                             Ok(v) => v,
                             Err(refusal) => {
                                 warn!(

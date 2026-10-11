@@ -1695,6 +1695,12 @@ impl DrmFileState {
         file
     }
 
+    /// The node this file was opened on ([`NO_MINOR`] for a placeholder):
+    /// which card's objects a handle of this file names.
+    pub fn minor(&self) -> u32 {
+        self.minor
+    }
+
     /// `drm_getmagic`: this file's magic, minted on first use and registered
     /// with its device so the master can `AUTH_MAGIC` it.
     pub fn magic(&self) -> u32 {
@@ -2558,6 +2564,14 @@ pub(crate) fn table_sizes_for_test() -> (usize, usize) {
     (state.framebuffers.len(), state.handles.len())
 }
 
+/// Forget the node table a test built with [`build_gpu_nodes`], so the next
+/// test starts from the pre-table rule (every minor is the primary's) rather
+/// than from drivers this test has already dropped.
+#[cfg(test)]
+pub(crate) fn clear_gpu_nodes_for_test() {
+    *GPU_NODES.lock() = Vec::new();
+}
+
 /// Whether `minor` is one of the nodes past index 0. Those report no CRTCs, so
 /// Mesa's KMS probe and wlroots leave them alone and the desktop stays on
 /// `card0` whatever else is plugged in.
@@ -2724,13 +2738,19 @@ pub fn alloc_buffer(size: usize) -> Option<GemHandle> {
 /// `drm_gem_prime_handle_to_dmabuf` looks the handle up in the file first
 /// (`drm_gem_object_lookup`: ENOENT), then asks the driver to export it, and
 /// nouveau refuses a `NO_SHARE` object there (`nouveau_gem_prime_export`:
-/// EPERM).
+/// EPERM). The third refusal is this kernel's own: a dma-buf here is built
+/// over a host physical address, and a VRAM-only object has none (Linux
+/// would export it), so it keeps the EINVAL every export used to get rather
+/// than claim the handle does not exist.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ExportRefusal {
     /// Not a handle of this file: nobody created it, or another process did.
     NotFound,
     /// Created `NOUVEAU_GEM_DOMAIN_NO_SHARE`.
     NotShareable,
+    /// A GEM object of the file with no host physical address (device
+    /// memory): nothing here can build a dma-buf over it.
+    NoHostAddress,
 }
 
 impl From<ExportRefusal> for crate::error::LxError {
@@ -2738,6 +2758,7 @@ impl From<ExportRefusal> for crate::error::LxError {
         match r {
             ExportRefusal::NotFound => crate::error::LxError::ENOENT,
             ExportRefusal::NotShareable => crate::error::LxError::EPERM,
+            ExportRefusal::NoHostAddress => crate::error::LxError::EINVAL,
         }
     }
 }
@@ -2746,6 +2767,18 @@ impl From<ExportRefusal> for crate::error::LxError {
 /// so it can be wrapped in a dma-buf and shared with another DRM node.
 pub fn export_handle(
     handle_id: u32,
+    minor: u32,
+) -> core::result::Result<(u64, usize, Arc<VmObject>), ExportRefusal> {
+    export_handle_for(handle_id, minor, current_pid())
+}
+
+/// [`export_handle`] on behalf of `pid`: the caller of the ioctl, or 0 for
+/// the kernel, which may touch every object. `minor` is the node the file
+/// was opened on, whose card is the one asked about a driver-private handle.
+pub fn export_handle_for(
+    handle_id: u32,
+    minor: u32,
+    pid: u64,
 ) -> core::result::Result<(u64, usize, Arc<VmObject>), ExportRefusal> {
     // PRIME export is a uAPI entry point, so it resolves the handle the way
     // Linux's `drm_gem_object_lookup(file_priv, handle)` does -- against what
@@ -2753,7 +2786,6 @@ pub fn export_handle(
     // `PRIME_HANDLE_TO_FD` a small integer, get a dma-buf fd over someone
     // else's buffer and mmap it: handle ids are sequential from 1, so reading
     // the compositor's scanout took no guessing at all.
-    let pid = current_pid();
     {
         let state = DRM_STATE.lock();
         if let Some(v) = state
@@ -2776,12 +2808,29 @@ pub fn export_handle(
     // Same ownership rule on the driver-private side: `lookup_for` is
     // `lookup` plus `holds(handle, pid)`, which is the nouveau table's own
     // record of who took a reference.
-    let (phys_addr, size) = zcore_drivers::scheme::gem_mmap::lookup_for(handle_id, pid)
-        .ok_or(ExportRefusal::NotFound)?;
-    // The object is the file's; now the driver's say (`nouveau_gem_prime_export`).
-    if zcore_drivers::scheme::gem_mmap::no_share(handle_id) {
+    // The object is the file's; now the driver's say
+    // (`nouveau_gem_prime_export`). Asked before the mapping, because the
+    // NO_SHARE record is kept apart from it: a VRAM-only object has no
+    // mapping entry, and its export said ENOENT where Linux says EPERM.
+    if zcore_drivers::scheme::gem_mmap::no_share(handle_id, pid) {
         return Err(ExportRefusal::NotShareable);
     }
+    let Some((phys_addr, size)) = zcore_drivers::scheme::gem_mmap::lookup_for(handle_id, pid)
+    else {
+        // No mapping is not "no object": `lookup_for` only knows the objects
+        // with a host address. The driver tells a VRAM object (exists, no
+        // host address: a refusal of its own) from no object at all
+        // (ENOENT). Asked of the card behind the file's node and on behalf
+        // of the caller, as `drm_gem_object_lookup(file_priv, handle)` is: a
+        // VRAM object of another process, or of another card, is ENOENT
+        // here, not EINVAL (the primary card used to be asked, by handle
+        // alone, so it said EINVAL for the first and ENOENT for a VRAM
+        // object that only the file's own card has).
+        return Err(match unresolved_backing_reason(handle_id, pid, minor) {
+            UnresolvedBacking::Vram => ExportRefusal::NoHostAddress,
+            UnresolvedBacking::Unknown => ExportRefusal::NotFound,
+        });
+    };
     // The dma-buf hands this range out through its own VMO, which never
     // reaches `DrmDev::get_vmo`, so the export is where this object's host
     // address is given away. See `gem_mmap::note_host_pa_handed_out`.
@@ -3107,8 +3156,14 @@ pub enum UnresolvedBacking {
 }
 
 /// Ask the driver which it was.
-fn unresolved_backing_reason(handle_id: u32) -> UnresolvedBacking {
-    unresolved_backing_from(get_primary_driver().map(|d| d.gem_aperture(handle_id)))
+///
+/// Asked of the card behind `minor` (the primary when no node has it, the
+/// pre-table rule) and on behalf of `pid` (0: the kernel), because a GEM
+/// handle names an object of one file on one card: a nouveau object only
+/// the other card has, or only another process may touch, is `Unknown`.
+fn unresolved_backing_reason(handle_id: u32, pid: u64, minor: u32) -> UnresolvedBacking {
+    let driver = driver_for_minor(minor).or_else(get_primary_driver);
+    unresolved_backing_from(driver.map(|d| d.gem_aperture(handle_id, pid)))
 }
 
 /// The judgement itself, under the driver lookup so a test can make one.
@@ -3212,7 +3267,10 @@ pub fn create_fb_with_layout(
             // "not in dumb table nor nouveau GEM" about a VRAM GEM is a lie,
             // and it is the lie a Vulkan swapchain gets, because NVK renders
             // into device memory.
-            match unresolved_backing_reason(handle_id) {
+            // The frame path is `card0`'s, and the resolver above already
+            // refused the handle on the caller's behalf: ask as the kernel,
+            // so the line says what the object IS.
+            match unresolved_backing_reason(handle_id, 0, NodeMinors::new(0).card()) {
                 UnresolvedBacking::Vram => warn!(
                     "[drm] create_fb (ADDFB2): handle={:#x} is a VRAM-only GEM -- it exists, but \
                      it has no host physical address (the RM refuses gem_map_cpu for ADDR_FBMEM: \

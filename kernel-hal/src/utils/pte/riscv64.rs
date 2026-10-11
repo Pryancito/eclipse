@@ -107,6 +107,15 @@ impl GenericPTE for Rv64PTE {
     fn is_leaf(&self) -> bool {
         PTF::from_bits_truncate(self.0 as usize).intersects(PTF::READABLE | PTF::EXECUTABLE)
     }
+    /// Deliberately `None`, although the bit exists: [`Self::set_flags`] sets
+    /// DIRTY on **every** mapping it writes, because the RISC-V spec leaves
+    /// updating A/D in hardware optional and this kernel does it in software.
+    /// So the bit here means "writable", not "written", and wiring it up would
+    /// answer "the whole region was written" for a freshly mapped page — safe,
+    /// but by accident. `None` says what is true: this format cannot tell.
+    fn dirty(&self) -> Option<bool> {
+        None
+    }
 
     fn set_addr(&mut self, paddr: PhysAddr) {
         self.0 = (self.0 & !PHYS_ADDR_MASK) | ((paddr as u64 >> 2) & PHYS_ADDR_MASK);

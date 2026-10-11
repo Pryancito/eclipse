@@ -762,6 +762,22 @@ pub fn kernel_report() -> String {
             "sched weak:   {} created, peak live {}, soft-cap hits {}; stack-pool {}/overflow {}",
             created, peak, cap_hits, pool, overflow
         );
+        // What the bounded stack poison is actually doing. `whole` climbing
+        // with `bounded` at zero is the hook answering `None` (a huge leaf
+        // over the kernel heap, or an architecture with no dirty bit): the
+        // poison then costs what it always did, 2 MiB of stores per stack.
+        let (bounded, whole, saved) = kernel_hal::kstats::poison_bound_stats();
+        if bounded + whole > 0 {
+            let _ = writeln!(
+                out,
+                "stack poison: {} bounded, {} whole, {} MiB of stores skipped \
+                 ({:.0}% of stacks bounded)",
+                bounded,
+                whole,
+                saved * 4 / 1024,
+                bounded as f64 * 100.0 / (bounded + whole) as f64
+            );
+        }
         let (hw, size) = kernel_hal::kstats::stack_high_water();
         if size > 0 {
             let _ = writeln!(

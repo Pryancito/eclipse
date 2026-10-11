@@ -47,6 +47,71 @@ fn pidfd_waitid_empty(caller_nohang: bool) -> Result<(), LxError> {
     }
 }
 
+/// `prctl(2)`'s option numbers (`<linux/prctl.h>`). Out here rather than
+/// inside [`Syscall::sys_prctl`], where the `match` read each of them back
+/// through the same name it was written with: a number that drifted would
+/// still match itself, every test would stay green, and the only thing that
+/// would break is the libc on the other side, which sends the number. A
+/// `PR_SET_NAME` that drifted leaves `pthread_setname_np` with no effect, and
+/// a `PR_SET_NO_NEW_PRIVS` that drifted leaves a process believing it has
+/// closed the door on setuid when it has not. Neither says anything.
+const PR_SET_PDEATHSIG: i32 = 1;
+/// See [`PR_SET_PDEATHSIG`].
+const PR_GET_PDEATHSIG: i32 = 2;
+/// See [`PR_SET_PDEATHSIG`].
+const PR_GET_DUMPABLE: i32 = 3;
+/// See [`PR_SET_PDEATHSIG`].
+const PR_SET_DUMPABLE: i32 = 4;
+/// See [`PR_SET_PDEATHSIG`].
+const PR_GET_KEEPCAPS: i32 = 7;
+/// See [`PR_SET_PDEATHSIG`].
+const PR_SET_KEEPCAPS: i32 = 8;
+/// See [`PR_SET_PDEATHSIG`].
+const PR_SET_NAME: i32 = 15;
+/// See [`PR_SET_PDEATHSIG`].
+const PR_GET_NAME: i32 = 16;
+/// See [`PR_SET_PDEATHSIG`].
+const PR_GET_SECCOMP: i32 = 21;
+/// See [`PR_SET_PDEATHSIG`].
+const PR_SET_SECCOMP: i32 = 22;
+/// See [`PR_SET_PDEATHSIG`].
+const PR_CAPBSET_READ: i32 = 23;
+/// See [`PR_SET_PDEATHSIG`].
+const PR_CAPBSET_DROP: i32 = 24;
+/// See [`PR_SET_PDEATHSIG`].
+const PR_SET_TIMERSLACK: i32 = 29;
+/// See [`PR_SET_PDEATHSIG`].
+const PR_GET_TIMERSLACK: i32 = 30;
+/// See [`PR_SET_PDEATHSIG`].
+const PR_SET_CHILD_SUBREAPER: i32 = 36;
+/// See [`PR_SET_PDEATHSIG`].
+const PR_GET_CHILD_SUBREAPER: i32 = 37;
+/// See [`PR_SET_PDEATHSIG`].
+const PR_SET_NO_NEW_PRIVS: i32 = 38;
+/// See [`PR_SET_PDEATHSIG`].
+const PR_GET_NO_NEW_PRIVS: i32 = 39;
+/// See [`PR_SET_PDEATHSIG`].
+const PR_GET_TID_ADDRESS: i32 = 40;
+/// See [`PR_SET_PDEATHSIG`].
+const PR_SET_THP_DISABLE: i32 = 41;
+/// See [`PR_SET_PDEATHSIG`].
+const PR_GET_THP_DISABLE: i32 = 42;
+
+/// Linux's default timer slack, 50 us (`init_task`'s `timer_slack_ns`), which
+/// is what `PR_SET_TIMERSLACK` restores for a non-positive argument and what
+/// `PR_GET_TIMERSLACK` reports until somebody sets another.
+const TIMERSLACK_DEFAULT_NS: u64 = 50_000;
+
+/// The most `argv` plus `envp` may take, which is Linux's `_STK_LIM / 4`
+/// derived from the stack the loader actually maps rather than restated as a
+/// number. The cap covers the bytes plus one 8-byte table pointer per entry.
+///
+/// It is a bound, not an ABI number: what matters is that it stays strictly
+/// below the stack image the builder lays out --- the `assert!` in there
+/// PANICKED THE KERNEL from an ordinary userspace command --- and that it
+/// still leaves room for one long argument.
+const ARG_MAX: usize = USER_STACK_PAGES * PAGE_SIZE / 4;
+
 /// `SCHED_RESET_ON_FORK`: OR-ed into the policy by `sched_setscheduler` /
 /// `sched_setattr`. Accepted but not modelled (we never fork-reset).
 const SCHED_RESET_ON_FORK: usize = 0x4000_0000;
@@ -1133,7 +1198,6 @@ impl Syscall<'_> {
         // stack (`_STK_LIM / 4`), so derive it from the stack the loader maps
         // rather than restating a number: the cap covers the arg/env bytes
         // plus one 8-byte table pointer per entry.
-        const ARG_MAX: usize = USER_STACK_PAGES * PAGE_SIZE / 4;
         let arg_bytes: usize = args.iter().map(|s| s.len() + 1 + 8).sum::<usize>()
             + envs.iter().map(|s| s.len() + 1 + 8).sum::<usize>();
         if arg_bytes > ARG_MAX {
@@ -2236,30 +2300,6 @@ impl Syscall<'_> {
     pub fn sys_prctl(&self, option: i32, a2: usize, a3: usize, a4: usize, a5: usize) -> SysResult {
         use linux_object::thread::TASK_COMM_LEN;
 
-        const PR_SET_PDEATHSIG: i32 = 1;
-        const PR_GET_PDEATHSIG: i32 = 2;
-        const PR_GET_DUMPABLE: i32 = 3;
-        const PR_SET_DUMPABLE: i32 = 4;
-        const PR_SET_NAME: i32 = 15;
-        const PR_GET_NAME: i32 = 16;
-        const PR_GET_SECCOMP: i32 = 21;
-        const PR_SET_SECCOMP: i32 = 22;
-        const PR_CAPBSET_READ: i32 = 23;
-        const PR_CAPBSET_DROP: i32 = 24;
-        const PR_SET_TIMERSLACK: i32 = 29;
-        const PR_GET_TIMERSLACK: i32 = 30;
-        const PR_SET_CHILD_SUBREAPER: i32 = 36;
-        const PR_GET_CHILD_SUBREAPER: i32 = 37;
-        const PR_SET_NO_NEW_PRIVS: i32 = 38;
-        const PR_GET_NO_NEW_PRIVS: i32 = 39;
-        const PR_GET_TID_ADDRESS: i32 = 40;
-        const PR_GET_KEEPCAPS: i32 = 7;
-        const PR_SET_KEEPCAPS: i32 = 8;
-        const PR_SET_THP_DISABLE: i32 = 41;
-        const PR_GET_THP_DISABLE: i32 = 42;
-        /// Default timer slack, ns (Linux: 50 µs for every fresh task).
-        const TIMERSLACK_DEFAULT_NS: u64 = 50_000;
-
         debug!(
             "prctl: option={}, args={:#x},{:#x},{:#x},{:#x}",
             option, a2, a3, a4, a5
@@ -2805,178 +2845,10 @@ pub(crate) fn clone3_to_clone(words: [u64; 8]) -> LxResult<Clone3Args> {
 }
 
 #[cfg(test)]
-mod fork_child_tid_tests {
-    use super::*;
-    use kernel_hal::PAGE_SIZE;
-    use linux_object::process::LinuxProcess;
-    use rcore_fs_ramfs::RamFS;
-    use zircon_object::task::ROOT_JOB;
-    use zircon_object::vm::{MMUFlags, VmObject};
+mod abi_tests;
 
-    /// glibc's `arch_fork`: `CLONE_CHILD_SETTID | CLONE_CHILD_CLEARTID | SIGCHLD`.
-    const GLIBC_FORK: usize = 0x0120_0011;
-    /// The word every fork-time bit will be stored at (the parent's page is
-    /// seeded with this so the test can tell whose copy got written).
-    const SENTINEL: i32 = 0x5a5a_5a5a;
-
-    fn flags(bits: usize) -> CloneFlags {
-        CloneFlags::from_bits_truncate(bits)
-    }
-
-    /// A parent with one thread and one writable page holding a word set to
-    /// [`SENTINEL`]; returns it with that word's address.
-    fn a_parent(pid: KoID) -> (Arc<Process>, usize) {
-        let parent = Process::create_with_fixed_id_ext(
-            &ROOT_JOB,
-            pid,
-            "parent",
-            LinuxProcess::new(RamFS::new(), 0),
-        )
-        .unwrap();
-        let _main = Thread::create_linux(&parent).unwrap();
-        // At a fixed, non-zero offset: an auto-placed page can land at 0,
-        // which every caller of these functions reads as "no pointer".
-        let page = parent
-            .vmar()
-            .map(
-                Some(0x10_0000),
-                VmObject::new_paged(1),
-                0,
-                PAGE_SIZE,
-                MMUFlags::READ | MMUFlags::WRITE | MMUFlags::USER,
-            )
-            .unwrap();
-        assert_ne!(page, 0);
-        // Inside the page, not at its start: a tid word is a field of the
-        // TCB, and a page-aligned one would let a rounded address pass.
-        let word = page + 0x40;
-        assert_eq!(
-            parent
-                .vmar()
-                .write_memory(word, &SENTINEL.to_ne_bytes())
-                .unwrap(),
-            4
-        );
-        (parent, word)
-    }
-
-    fn word_at(proc: &Arc<Process>, vaddr: usize) -> i32 {
-        let mut b = [0u8; 4];
-        assert_eq!(proc.vmar().read_memory(vaddr, &mut b).unwrap(), 4);
-        i32::from_ne_bytes(b)
-    }
-
-    /// A forked child of `parent` with its one, unstarted thread.
-    fn a_forked_child(parent: &Arc<Process>) -> (Arc<Process>, Arc<Thread>) {
-        let child = Process::fork_from(parent).unwrap();
-        let thread = Thread::create_linux(&child).unwrap();
-        (child, thread)
-    }
-
-    #[test]
-    fn glibcs_fork_flags_ask_for_both_the_store_and_the_clear() {
-        let req = ChildTidRequest::from_clone(flags(GLIBC_FORK), 0x7000_0010.into());
-        assert_eq!(
-            req,
-            ChildTidRequest {
-                ptr: 0x7000_0010,
-                set: true,
-                clear: true
-            }
-        );
-        // musl's fork is a bare SIGCHLD: nothing asked, nothing done.
-        let req = ChildTidRequest::from_clone(flags(0x11), 0x7000_0010.into());
-        assert_eq!(
-            req,
-            ChildTidRequest {
-                ptr: 0x7000_0010,
-                set: false,
-                clear: false
-            }
-        );
-        assert_eq!(ChildTidRequest::none().ptr, 0);
-    }
-
-    #[test]
-    fn the_childs_tid_lands_in_the_childs_copy_of_the_page_not_the_parents() {
-        // The very bug: the store went through the parent's pointer, i.e.
-        // into the parent's copy, and the child's TCB kept the parent's tid.
-        let (parent, page) = a_parent(43_361);
-        let (child, thread) = a_forked_child(&parent);
-        publish_child_tid(
-            &thread,
-            ChildTidRequest::from_clone(flags(GLIBC_FORK), page.into()),
-        );
-        assert_eq!(word_at(&child, page), thread.id() as i32, "child's copy");
-        assert_eq!(word_at(&parent, page), SENTINEL, "parent's copy");
-        // (The first thread of a process carries the pid as its tid, as on
-        // Linux, so the word also reads as the child's getpid().)
-        assert_eq!(thread.id(), child.id());
-    }
-
-    #[test]
-    fn the_clear_on_exit_is_registered_as_set_tid_address_would() {
-        let (parent, page) = a_parent(43_362);
-        let (_child, thread) = a_forked_child(&parent);
-        assert!(thread.tid_address().is_null());
-        publish_child_tid(
-            &thread,
-            ChildTidRequest::from_clone(flags(GLIBC_FORK), page.into()),
-        );
-        assert_eq!(thread.tid_address().as_addr(), page);
-    }
-
-    #[test]
-    fn without_the_flags_the_word_is_left_alone() {
-        // A `clone(SIGCHLD, ..., ctid)` with a live ctid and neither bit
-        // (musl leaves the register holding whatever): nothing may be written
-        // and nothing registered, or exit would zero a word nobody gave it.
-        let (parent, page) = a_parent(43_363);
-        let (child, thread) = a_forked_child(&parent);
-        publish_child_tid(
-            &thread,
-            ChildTidRequest::from_clone(flags(0x11), page.into()),
-        );
-        assert_eq!(word_at(&child, page), SENTINEL);
-        assert!(thread.tid_address().is_null());
-        // CLEARTID alone registers and does not store (pthread-style callers
-        // that pass the two separately).
-        publish_child_tid(
-            &thread,
-            ChildTidRequest::from_clone(flags(0x0020_0011), page.into()),
-        );
-        assert_eq!(word_at(&child, page), SENTINEL);
-        assert_eq!(thread.tid_address().as_addr(), page);
-    }
-
-    #[test]
-    fn a_word_the_child_has_not_mapped_is_skipped_not_fatal() {
-        // Linux stores from the child (`schedule_tail`) and ignores the
-        // fault; the fork has already happened, so failing it here would
-        // leave a child the caller was told does not exist.
-        let (parent, page) = a_parent(43_364);
-        let (child, thread) = a_forked_child(&parent);
-        publish_child_tid(
-            &thread,
-            ChildTidRequest::from_clone(flags(GLIBC_FORK), (page + 0x10_0000).into()),
-        );
-        assert_eq!(word_at(&child, page), SENTINEL);
-        // The clear is still registered: exit tolerates an unmapped word.
-        assert_eq!(thread.tid_address().as_addr(), page + 0x10_0000);
-    }
-
-    #[test]
-    fn a_null_word_is_a_no_op_whatever_the_flags() {
-        let (parent, page) = a_parent(43_365);
-        let (child, thread) = a_forked_child(&parent);
-        publish_child_tid(
-            &thread,
-            ChildTidRequest::from_clone(flags(GLIBC_FORK), 0.into()),
-        );
-        assert_eq!(word_at(&child, page), SENTINEL);
-        assert!(thread.tid_address().is_null());
-    }
-}
+#[cfg(test)]
+mod fork_child_tid_tests;
 
 #[cfg(test)]
 mod pdeathsig_tests {
@@ -3031,369 +2903,10 @@ mod pdeathsig_tests {
 }
 
 #[cfg(test)]
-mod clone3_tests {
-    use super::*;
-
-    /// `struct clone_args` version 0, as eight `u64`, in field order.
-    fn args(
-        flags: u64,
-        pidfd: u64,
-        child_tid: u64,
-        parent_tid: u64,
-        exit_signal: u64,
-        stack: u64,
-        stack_size: u64,
-        tls: u64,
-    ) -> [u64; 8] {
-        [
-            flags,
-            pidfd,
-            child_tid,
-            parent_tid,
-            exit_signal,
-            stack,
-            stack_size,
-            tls,
-        ]
-    }
-
-    fn ok(words: [u64; 8]) -> Clone3Args {
-        clone3_to_clone(words).expect("should decode")
-    }
-
-    #[test]
-    fn a_stack_that_overflows_is_refused_instead_of_panicking_the_kernel() {
-        // `stack + stack_size` are both read straight out of userspace, and a
-        // plain `+` panics on a debug build. Any process could have taken the
-        // kernel down with this the moment clone3 became reachable.
-        assert_eq!(
-            clone3_to_clone(args(0, 0, 0, 0, 0, u64::MAX, 1, 0)),
-            Err(LxError::EINVAL)
-        );
-        assert_eq!(
-            clone3_to_clone(args(0, 0, 0, 0, 0, 1, u64::MAX, 0)),
-            Err(LxError::EINVAL)
-        );
-        assert_eq!(
-            clone3_to_clone(args(0, 0, 0, 0, 0, u64::MAX, u64::MAX, 0)),
-            Err(LxError::EINVAL)
-        );
-        // The largest pair that does not overflow is still a legal request.
-        let a = ok(args(0, 0, 0, 0, 0, u64::MAX - 1, 1, 0));
-        assert_eq!(a.newsp, u64::MAX as usize);
-    }
-
-    #[test]
-    fn the_child_stack_pointer_is_the_top_of_the_range() {
-        // Legacy clone is handed the top of the stack; clone3 gives the low
-        // address and a size, and the kernel adds them.
-        let a = ok(args(0, 0, 0, 0, 0, 0x7000_0000, 0x10_0000, 0));
-        assert_eq!(a.newsp, 0x7010_0000);
-        // No stack at all means "share the caller's", not "top of nothing".
-        let a = ok(args(0, 0, 0, 0, 0, 0, 0, 0));
-        assert_eq!(a.newsp, 0);
-    }
-
-    #[test]
-    fn a_stack_without_a_size_or_a_size_without_a_stack_is_refused() {
-        assert_eq!(
-            clone3_to_clone(args(0, 0, 0, 0, 0, 0x7000_0000, 0, 0)),
-            Err(LxError::EINVAL)
-        );
-        assert_eq!(
-            clone3_to_clone(args(0, 0, 0, 0, 0, 0, 0x10_0000, 0)),
-            Err(LxError::EINVAL)
-        );
-    }
-
-    #[test]
-    fn the_exit_signal_is_folded_back_into_the_legacy_flags_word() {
-        // clone3 gives the exit signal its own field; legacy clone packs it
-        // into the low byte of flags, which is what sys_clone reads.
-        let a = ok(args(0x0011_0f00, 0, 0, 0, 17, 0, 0, 0));
-        assert_eq!(a.flags & 0xff, 17, "SIGCHLD must survive the conversion");
-        assert_eq!(a.flags & !0xff, 0x0011_0f00);
-    }
-
-    #[test]
-    fn flags_carrying_a_signal_in_their_low_byte_are_refused() {
-        // In clone3 the low byte of flags is reserved; a caller putting the
-        // signal there as well would have it counted twice.
-        assert_eq!(
-            clone3_to_clone(args(0x0011_0f11, 0, 0, 0, 0, 0, 0, 0)),
-            Err(LxError::EINVAL)
-        );
-    }
-
-    /// `CLONE_CLEAR_SIGHAND` (1<<32) and friends are not in `CloneFlags`.
-    /// Truncating them used to answer success while leaving handlers alone;
-    /// glibc/`posix_spawn` need `EINVAL` so they can fall back.
-    #[test]
-    fn an_unknown_clone3_flag_is_einval_not_a_silent_success() {
-        const CLONE_CLEAR_SIGHAND: u64 = 1 << 32;
-        const CLONE_INTO_CGROUP: u64 = 1 << 33;
-        assert_eq!(
-            clone3_to_clone(args(CLONE_CLEAR_SIGHAND, 0, 0, 0, 0, 0, 0, 0)),
-            Err(LxError::EINVAL)
-        );
-        assert_eq!(
-            clone3_to_clone(args(CLONE_INTO_CGROUP, 0, 0, 0, 0, 0, 0, 0)),
-            Err(LxError::EINVAL)
-        );
-        // A known bit beside an unknown one is still EINVAL.
-        let with_vfork = CloneFlags::VFORK.bits() as u64 | CLONE_CLEAR_SIGHAND;
-        assert_eq!(
-            clone3_to_clone(args(with_vfork, 0, 0, 0, 0, 0, 0, 0)),
-            Err(LxError::EINVAL)
-        );
-        // Known flags still decode.
-        assert!(
-            clone3_to_clone(args(CloneFlags::VFORK.bits() as u64, 0, 0, 0, 0, 0, 0, 0)).is_ok()
-        );
-    }
-
-    /// Legacy `clone` truncates the same unknown bits; it must refuse them
-    /// for the same reason `clone3` does.
-    #[test]
-    fn legacy_clone_also_rejects_unknown_flags() {
-        const CLONE_CLEAR_SIGHAND: usize = 1 << 32;
-        assert_eq!(
-            clone_flags_from_word(CLONE_CLEAR_SIGHAND),
-            Err(LxError::EINVAL)
-        );
-        assert_eq!(
-            clone_flags_from_word(CloneFlags::VFORK.bits() | CLONE_CLEAR_SIGHAND),
-            Err(LxError::EINVAL)
-        );
-        let known = CloneFlags::VFORK.bits() | 17; // SIGCHLD in CSIGNAL
-        let f = clone_flags_from_word(known).unwrap();
-        assert!(f.contains(CloneFlags::VFORK));
-        assert_eq!(f.bits() & 0xff, 17);
-    }
-
-    #[test]
-    fn a_signal_number_that_does_not_exist_is_refused() {
-        assert!(clone3_to_clone(args(0, 0, 0, 0, 64, 0, 0, 0)).is_ok());
-        assert_eq!(
-            clone3_to_clone(args(0, 0, 0, 0, 65, 0, 0, 0)),
-            Err(LxError::EINVAL)
-        );
-        assert_eq!(
-            clone3_to_clone(args(0, 0, 0, 0, u64::MAX, 0, 0, 0)),
-            Err(LxError::EINVAL)
-        );
-    }
-
-    #[test]
-    fn the_pidfd_travels_in_the_parent_tid_slot_only_when_asked_for() {
-        let pidfd_flag = CloneFlags::PIDFD.bits() as u64;
-        let a = ok(args(pidfd_flag, 0xfd00, 0, 0xba5e, 0, 0, 0, 0));
-        assert_eq!(a.parent_slot, 0xfd00, "CLONE_PIDFD uses its own field");
-        let a = ok(args(0, 0xfd00, 0, 0xba5e, 0, 0, 0, 0));
-        assert_eq!(a.parent_slot, 0xba5e, "without it, parent_tid as usual");
-    }
-
-    #[test]
-    fn asking_for_a_pidfd_and_a_parent_tid_at_once_is_refused_not_guessed() {
-        // The legacy entry point has one slot for both, so one of the two
-        // would be written to the other's pointer.
-        let both = (CloneFlags::PIDFD.bits() | CloneFlags::PARENT_SETTID.bits()) as u64;
-        assert_eq!(
-            clone3_to_clone(args(both, 0x1000, 0, 0x2000, 0, 0, 0, 0)),
-            Err(LxError::EINVAL)
-        );
-    }
-
-    #[test]
-    fn the_remaining_fields_are_passed_through_untouched() {
-        let a = ok(args(0x0001_0000, 0, 0xc71d, 0xba5e, 0, 0, 0, 0x715));
-        assert_eq!(a.child_tid, 0xc71d);
-        assert_eq!(a.tls, 0x715);
-        assert_eq!(a.parent_slot, 0xba5e);
-    }
-
-    #[test]
-    fn version_zero_of_the_struct_is_sixty_four_bytes() {
-        assert_eq!(CLONE_ARGS_SIZE_VER0, 64);
-        assert_eq!(CLONE_ARGS_SIZE_VER0 / 8, 8, "eight u64 fields");
-    }
-}
+mod clone3_tests;
 
 #[cfg(test)]
-mod wait_option_tests {
-    //! `wait4` and `waitid` read the same options word and Linux holds them
-    //! to two different masks. `waitid` checked its own, but inline, where no
-    //! test could reach it; `wait4` ran the word through
-    //! `WaitFlags::from_bits_truncate` and kept whatever was left.
-
-    use super::*;
-
-    const WNOHANG: u32 = 0x0000_0001;
-    const WUNTRACED: u32 = 0x0000_0002;
-    const WEXITED: u32 = 0x0000_0004;
-    const WCONTINUED: u32 = 0x0000_0008;
-    const WNOWAIT: u32 = 0x0100_0000;
-    const WNOTHREAD: u32 = 0x2000_0000;
-    const WALL: u32 = 0x4000_0000;
-    const WCLONE: u32 = 0x8000_0000;
-
-    /// `__WALL` is 0x40000000 and `__WCLONE` is 0x80000000. They were the
-    /// other way round in `waitid`'s own `bitflags`. Neither changes what
-    /// this kernel does yet, which is exactly why a swap sat there unnoticed
-    /// and would have been believed by the first caller to act on it.
-    #[test]
-    fn the_two_underscore_flags_are_the_bits_linux_gives_them() {
-        assert_eq!(wait_opts::WALL, 0x4000_0000);
-        assert_eq!(wait_opts::WCLONE, 0x8000_0000);
-        assert_eq!(wait_opts::WNOTHREAD, 0x2000_0000);
-        // `WSTOPPED` is `WUNTRACED` under another name, which is why one
-        // field carries both syscalls' meaning.
-        assert_eq!(wait_opts::WUNTRACED, 0x0000_0002);
-        // And the two masks, written out, so a bit cannot move between them
-        // without this failing.
-        assert_eq!(wait_opts::WAIT4, 0xE000_000B);
-        assert_eq!(wait_opts::WAITID, 0xE100_000F);
-        assert_eq!(wait_opts::WAITID_REQUIRED, 0x0000_000E);
-    }
-
-    /// The interest is `(exited, stopped, continued)` **in that order**, and
-    /// the last two are separate bits asking for separate things.
-    ///
-    /// Swapping the two in `wait4_options` passed green: the tests that ask
-    /// about them pass both at once, or neither, so the two fields were never
-    /// told apart. A `wait4(-1, &st, WUNTRACED)` that reports a child resumed
-    /// by `SIGCONT` instead of one stopped by `SIGTSTP` is a shell that
-    /// prints "Continued" when you press Ctrl-Z.
-    #[test]
-    fn stopped_and_continued_are_asked_for_one_at_a_time() {
-        assert_eq!(
-            wait4_options(WUNTRACED).unwrap().interest,
-            (true, true, false),
-            "WUNTRACED asked for the wrong state change"
-        );
-        assert_eq!(
-            wait4_options(WCONTINUED).unwrap().interest,
-            (true, false, true),
-            "WCONTINUED asked for the wrong state change"
-        );
-        // And `waitid`, which reads the same two bits into the same two
-        // places, with its own `exited` rather than an implied one.
-        assert_eq!(
-            waitid_options(WUNTRACED).unwrap().interest,
-            (false, true, false)
-        );
-        assert_eq!(
-            waitid_options(WCONTINUED).unwrap().interest,
-            (false, false, true)
-        );
-    }
-
-    /// `waitid(2)`'s `idtype_t`, from `include/uapi/linux/wait.h`.
-    ///
-    /// `P_PIDFD` was **wrongly 5** here, so `waitid(P_PIDFD, fd, ...)` --
-    /// which is what glib's `g_child_watch_source_new()` does -- matched no
-    /// arm of the dispatch and came back `EINVAL`. The fix had no test, and
-    /// putting the 5 back passed green: the four numbers are read inside an
-    /// `async` method on `Syscall`, which no unit test can build, so the only
-    /// thing that can guard them is pinning them here.
-    #[test]
-    fn the_four_waitid_id_types_are_the_numbers_linux_gives_them() {
-        assert_eq!(P_ALL, 0);
-        assert_eq!(P_PID, 1);
-        assert_eq!(P_PGID, 2);
-        assert_eq!(P_PIDFD, 3, "P_PIDFD is back to the wrong number");
-        // And no two of them are the same, which is what a dispatch on them
-        // needs and what a copy-paste would break.
-        let all = [P_ALL, P_PID, P_PGID, P_PIDFD];
-        for (i, a) in all.iter().enumerate() {
-            for b in &all[i + 1..] {
-                assert_ne!(a, b, "two id types share a number");
-            }
-        }
-    }
-
-    /// A non-blocking pidfd without `WNOHANG` turns an empty wait into
-    /// `EAGAIN`; with `WNOHANG` it stays the usual empty success.
-    #[test]
-    fn a_nonblocking_pidfd_empty_wait_is_eagain_unless_wnohang() {
-        assert_eq!(pidfd_waitid_empty(true), Ok(()));
-        assert_eq!(pidfd_waitid_empty(false), Err(LxError::EAGAIN));
-    }
-
-    /// `WEXITED` and `WNOWAIT` belong to `waitid`. `kernel_wait4`'s mask
-    /// leaves both out, so naming either is EINVAL there.
-    #[test]
-    fn wait4_refuses_the_two_bits_that_are_waitids() {
-        assert_eq!(wait4_options(WEXITED), Err(LxError::EINVAL));
-        assert_eq!(wait4_options(WNOWAIT), Err(LxError::EINVAL));
-        assert_eq!(wait4_options(WNOHANG | WNOWAIT), Err(LxError::EINVAL));
-        // And they are fine on waitid, which is the point of the two masks.
-        assert!(waitid_options(WEXITED).is_ok());
-        assert!(waitid_options(WEXITED | WNOWAIT).is_ok());
-    }
-
-    /// `wait4(pid, &st, WNOWAIT, NULL)` used to leave the zombie in place --
-    /// an extension of this kernel's own, since the call is EINVAL in Linux.
-    /// A `wait4` always reaps.
-    #[test]
-    fn a_wait4_always_reaps_and_always_reports_an_exit() {
-        let o = wait4_options(0).unwrap();
-        assert!(o.reap);
-        assert_eq!(o.interest, (true, false, false));
-        assert!(!o.nohang);
-        let o = wait4_options(WNOHANG | WUNTRACED | WCONTINUED).unwrap();
-        assert!(o.nohang);
-        assert!(o.reap);
-        assert_eq!(o.interest, (true, true, true));
-    }
-
-    #[test]
-    fn wait4_takes_every_bit_on_its_own_mask_and_nothing_else() {
-        assert!(
-            wait4_options(WNOHANG | WUNTRACED | WCONTINUED | WNOTHREAD | WALL | WCLONE).is_ok()
-        );
-        for stray in [0x10u32, 0x20, 0x1_0000, 0x1000_0000] {
-            assert_eq!(wait4_options(stray), Err(LxError::EINVAL), "{:#x}", stray);
-        }
-    }
-
-    /// `waitid` has no default interest, so a word naming none of the three
-    /// is a wait for nothing. Linux refuses it rather than block forever.
-    #[test]
-    fn a_waitid_that_asks_for_nothing_is_refused() {
-        assert_eq!(waitid_options(0), Err(LxError::EINVAL));
-        assert_eq!(waitid_options(WNOHANG), Err(LxError::EINVAL));
-        assert_eq!(waitid_options(WNOWAIT | WALL), Err(LxError::EINVAL));
-        for one in [WEXITED, WUNTRACED, WCONTINUED] {
-            assert!(waitid_options(one).is_ok(), "{:#x}", one);
-        }
-    }
-
-    #[test]
-    fn waitid_reports_exactly_what_it_was_asked_for() {
-        let o = waitid_options(WEXITED).unwrap();
-        assert_eq!(o.interest, (true, false, false));
-        assert!(o.reap);
-        let o = waitid_options(WUNTRACED | WNOWAIT | WNOHANG).unwrap();
-        assert_eq!(o.interest, (false, true, false));
-        assert!(!o.reap);
-        assert!(o.nohang);
-        let o = waitid_options(WEXITED | WUNTRACED | WCONTINUED).unwrap();
-        assert_eq!(o.interest, (true, true, true));
-    }
-
-    #[test]
-    fn waitid_refuses_a_bit_outside_its_mask_too() {
-        for stray in [0x10u32, 0x0200_0000, 0x1000_0000] {
-            assert_eq!(
-                waitid_options(stray | WEXITED),
-                Err(LxError::EINVAL),
-                "{:#x}",
-                stray
-            );
-        }
-    }
-}
+mod wait_option_tests;
 
 #[cfg(test)]
 mod prctl_arg_tests {
@@ -4042,192 +3555,4 @@ mod setaffinity_migration_tests {
 }
 
 #[cfg(test)]
-mod benches {
-    //! The process syscalls: `clone`, `clone3`, `wait4`, `waitid`,
-    //! `setpgid`, the `sched_*attr` pair, `prctl` and `nanosleep`'s
-    //! remainder.
-    //!
-    //! None of these can be benched end to end on the host -- a `clone` needs
-    //! a scheduler and `wait4` needs a child to reap -- so what is measured
-    //! is the part that is pure decision: the flag words, the pid arguments,
-    //! the extensible-struct sizes, and the two bits of real work in the
-    //! family (`comm_from_user_bytes`, which walks a name byte by byte, and
-    //! the `rusage` a reaped child hands back).
-    //!
-    //! That is not a consolation prize. `clone3_to_clone` is nine refusals
-    //! over a 64-byte struct and it runs on every `posix_spawn`; if it cost
-    //! anything, `fork` would show it. The rows say it does not.
-    //!
-    //! Every row black-boxes its inputs. Two cycles (~0.6 ns) is `b.iter`'s
-    //! own loop, so a row there with an opaque input is a real compare and
-    //! branch -- with a *constant* input it is a call that was folded away.
-
-    use super::*;
-    use test::{black_box, Bencher};
-
-    /// glibc's `arch_fork` flag word: `CLONE_CHILD_SETTID |
-    /// CLONE_CHILD_CLEARTID | SIGCHLD`, which is what every `fork(3)` sends.
-    const GLIBC_FORK: usize = 0x0120_0011;
-
-    /// `clone`'s flag word, as `fork(3)` sends it.
-    #[bench]
-    fn clone_flags_of_a_fork(b: &mut Bencher) {
-        b.iter(|| black_box(clone_flags_from_word(black_box(GLIBC_FORK & !0xff))));
-    }
-
-    /// A flag word with a bit this kernel does not name, which must be
-    /// `EINVAL` so glibc falls back instead of being told it got something
-    /// it did not.
-    #[bench]
-    fn clone_flags_unknown_bit(b: &mut Bencher) {
-        b.iter(|| black_box(clone_flags_from_word(black_box(1 << 40))));
-    }
-
-    /// `clone3`'s whole `struct clone_args`, decoded into the legacy
-    /// arguments: nine refusals over eight words, once per `posix_spawn`.
-    #[bench]
-    fn clone3_decode_a_fork(b: &mut Bencher) {
-        let words: [u64; 8] = [
-            (GLIBC_FORK & !0xff) as u64,
-            0,
-            0x7fff_0000_1000,
-            0,
-            17,
-            0,
-            0,
-            0,
-        ];
-        b.iter(|| black_box(clone3_to_clone(black_box(words))));
-    }
-
-    /// `clone3` with a stack: the arm that adds `stack + stack_size`, which
-    /// is what a threading runtime sends.
-    #[bench]
-    fn clone3_decode_a_thread(b: &mut Bencher) {
-        let words: [u64; 8] = [
-            0x0003_d0f00,
-            0,
-            0x7fff_0000_1000,
-            0,
-            0,
-            0x7fff_0010_0000,
-            8 * 1024 * 1024,
-            0x7fff_0000_2000,
-        ];
-        b.iter(|| black_box(clone3_to_clone(black_box(words))));
-    }
-
-    /// How many bytes of `struct clone_args` `clone3` will read.
-    #[bench]
-    fn clone3_struct_size(b: &mut Bencher) {
-        b.iter(|| black_box(clone3_size(black_box(CLONE_ARGS_SIZE_VER0))));
-    }
-
-    /// The same question for `sched_setattr` and `sched_getattr`, which
-    /// answer it with different errnos on purpose.
-    #[bench]
-    fn sched_attr_struct_sizes(b: &mut Bencher) {
-        b.iter(|| {
-            black_box((
-                sched_setattr_size(black_box(0)),
-                sched_getattr_size(black_box(SCHED_ATTR_SIZE_VER0)),
-            ))
-        });
-    }
-
-    /// What `sched_setattr` was actually asked to change, from its flags and
-    /// its policy.
-    #[bench]
-    fn sched_setattr_decision(b: &mut Bencher) {
-        b.iter(|| black_box(sched_setattr_plan(black_box(0), black_box(0))));
-    }
-
-    /// `wait4`'s option word.
-    #[bench]
-    fn wait4_option_word(b: &mut Bencher) {
-        b.iter(|| black_box(wait4_options(black_box(1))));
-    }
-
-    /// `waitid`'s, which has one check more: a word naming nothing to wait
-    /// for is refused rather than blocked on.
-    #[bench]
-    fn waitid_option_word(b: &mut Bencher) {
-        b.iter(|| black_box(waitid_options(black_box(4))));
-    }
-
-    /// The `rusage` a reaped child hands back, which `time(1)` prints.
-    #[bench]
-    fn child_rusage_build(b: &mut Bencher) {
-        let cpu = linux_object::process::ChildCpu {
-            utime_ns: 1_234_567_890,
-            stime_ns: 98_765_432,
-        };
-        b.iter(|| black_box(child_rusage(black_box(cpu))));
-    }
-
-    /// `setpgid(0, 0)`: both arguments resolved, which is what a shell sends
-    /// per job.
-    #[bench]
-    fn setpgid_arguments(b: &mut Bencher) {
-        b.iter(|| black_box(setpgid_args(black_box(4242), black_box(0), black_box(0))));
-    }
-
-    /// The `pid` of `getpgid`/`getsid`, where a negative one is `ESRCH` and
-    /// zero is the caller.
-    #[bench]
-    fn pid_argument_resolve(b: &mut Bencher) {
-        b.iter(|| black_box(resolve_pid_arg(black_box(4242), black_box(0))));
-    }
-
-    /// `prctl(PR_SET_NAME, "name")`: fifteen ASCII bytes, truncated at the
-    /// NUL and at `TASK_COMM_LEN`. This one walks the bytes, so it is the
-    /// only row here that is not a handful of instructions.
-    #[bench]
-    fn comm_from_ascii_bytes(b: &mut Bencher) {
-        let bytes = b"firefox\0\0\0\0\0\0\0\0";
-        b.iter(|| black_box(comm_from_user_bytes(black_box(bytes))));
-    }
-
-    /// The same with bytes that are not UTF-8, which go through the
-    /// chunk-by-chunk path and come out as `?`. A process name arrives from
-    /// userspace, so this is not a corner case, it is an untrusted string.
-    #[bench]
-    fn comm_from_invalid_utf8_bytes(b: &mut Bencher) {
-        let bytes = &[
-            0xffu8, 0xfe, b'a', 0xc3, b'b', 0x80, b'c', 0, 0, 0, 0, 0, 0, 0, 0,
-        ];
-        b.iter(|| black_box(comm_from_user_bytes(black_box(bytes))));
-    }
-
-    /// The name of the running program, taken off the end of its path.
-    #[bench]
-    fn comm_from_exec_path(b: &mut Bencher) {
-        b.iter(|| black_box(comm_from_path(black_box("/usr/lib/firefox/firefox"))));
-    }
-
-    /// `prctl(PR_SET_KEEPCAPS)`, which takes 0 or 1 and nothing else, and
-    /// `PR_SET_TIMERSLACK`, which takes anything.
-    #[bench]
-    fn prctl_boolean_and_slack_args(b: &mut Bencher) {
-        b.iter(|| {
-            black_box((
-                keepcaps_arg(black_box(1)),
-                timerslack_arg(black_box(50_000)),
-            ))
-        });
-    }
-
-    /// `prctl(PR_SET_PDEATHSIG)`, whose argument used to be read as a byte.
-    #[bench]
-    fn prctl_pdeathsig_arg(b: &mut Bencher) {
-        b.iter(|| black_box(pdeathsig_from_arg(black_box(15))));
-    }
-
-    /// What `nanosleep` writes into `rem` when a signal cut it short.
-    #[bench]
-    fn nanosleep_remainder(b: &mut Bencher) {
-        let deadline = core::time::Duration::from_nanos(5_000_000_000);
-        let now = core::time::Duration::from_nanos(1_234_567_890);
-        b.iter(|| black_box(nanosleep_remaining(black_box(deadline), black_box(now))));
-    }
-}
+mod benches;
