@@ -85,3 +85,35 @@ fn dropping_the_subscription_leaves_nothing_on_the_bus() {
     );
     stdin.eventbus.lock().clear(Event::READABLE);
 }
+
+// ---- que terminales barren el xHCI desde un `read` bloqueante ------------
+
+/// La VT activa lo barre, porque es donde alguien escribe.
+#[test]
+fn the_active_terminal_keeps_sweeping_the_controller() {
+    assert!(vt_read_polls_input(0, 0, 9));
+    assert!(vt_read_polls_input(3, 3, 9));
+}
+
+/// La VT del puerto serie tambien, SIEMPRE: la entrada llega por el UART, asi
+/// que no existe el caso «nadie la esta mirando». Olvidarla deja una consola
+/// serie sorda, que es como se depura esto.
+#[test]
+fn the_serial_terminal_sweeps_even_when_it_is_not_the_active_one() {
+    assert!(vt_read_polls_input(2, 0, 2));
+    assert!(vt_read_polls_input(2, 5, 2));
+}
+
+/// Una VT de fondo no lo barre: una tecla no puede llegarle. Esos son los seis
+/// `busybox` de `/dev/tty1`..`/dev/tty6` que se comian los 225 barridos por
+/// segundo con la maquina parada.
+#[test]
+fn a_background_terminal_does_not_sweep_the_controller() {
+    for vt in [1usize, 3, 4, 5, 6] {
+        assert!(
+            !vt_read_polls_input(vt, 0, 9),
+            "la VT {} no esta activa ni es la serie",
+            vt
+        );
+    }
+}
