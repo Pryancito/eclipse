@@ -72,6 +72,12 @@ pub fn tickless_idle() -> bool {
 /// [`crate::deadline::may_stretch_tick`], where it is testable on the host. The
 /// cost of keeping the boot CPU at full rate is what every CPU paid before, so
 /// a single-CPU boot behaves exactly as it always has.
+/// Only x86_64 has the re-armable per-CPU timer this reads
+/// ([`DEADLINE_TIMER`] is itself x86_64-only), and the one call site is
+/// inside `timer_idle_enter`'s own x86_64 block, so the guard goes here
+/// rather than leaving a function that names a static that does not exist on
+/// the other two arches.
+#[cfg(target_arch = "x86_64")]
 #[inline]
 fn may_go_tickless(cpu: usize) -> bool {
     crate::deadline::may_stretch_tick(cpu, tickless_idle(), DEADLINE_TIMER.load(Ordering::Relaxed))
