@@ -558,6 +558,106 @@ impl Clone for WakerRef {
 mod waker_page_tests {
     use super::*;
 
+    /// La pagina recien hecha: todos los carriles a cero y el dueño apuntado.
+    ///
+    /// `new_inner` es la que escribe cada campo a mano, y un carril que
+    /// naciera a uno es un hueco que se reparte sin ocupante: en `notified`
+    /// seria una tarea que no existe repartida en la primera vuelta, y en
+    /// `borrowed` un hueco que nadie puede volver a pedir nunca.
+    #[test]
+    fn a_fresh_page_has_every_lane_clear_and_knows_its_owner() {
+        for owner in [0u8, 1, 63, 255] {
+            let page = WakerPage::new_inner(owner);
+            assert_eq!(page.owner_cpu, owner);
+            assert_eq!(page.peek_lanes(), (0, 0, 0, 0));
+            assert_eq!(page.affine_bits(), 0);
+        }
+        // Y la version en `Arc`, que es la que usa la coleccion, es la misma.
+        let shared = WakerPage::new(7);
+        assert_eq!(shared.owner_cpu, 7);
+        assert_eq!(shared.peek_lanes(), (0, 0, 0, 0));
+    }
+
+    /// `peek_lanes` es la lectura que usa el reparto por bitmap
+    /// (`bitmap_candidate`), y lo que la separa de `peek` es que NO une
+    /// `notified` con `yielded`: el carril voluntario se sirve detras del
+    /// urgente, asi que verlos sumados es servir una cesion como si fuera una
+    /// urgencia.
+    #[test]
+    fn the_lanes_are_read_apart_where_peek_reads_them_summed() {
+        let page = WakerPage::new(0);
+        page.initialize(1);
+        page.notify(5);
+        page.mark_borrowed(2, true);
+        page.mark_dropped(3);
+        page.mark_yielded(4);
+
+        let (notified, yielded, dropped, borrowed) = page.peek_lanes();
+        assert_eq!(notified, (1 << 1) | (1 << 5));
+        assert_eq!(yielded, 1 << 4, "la cesion no se mezcla con lo urgente");
+        assert_eq!(dropped, 1 << 3);
+        assert_eq!(borrowed, 1 << 2);
+
+        let (ready, peek_dropped, peek_borrowed) = page.peek();
+        assert_eq!(
+            ready,
+            notified | yielded,
+            "`peek` es el resumen para diagnostico: ahi si van sumados"
+        );
+        assert_eq!((peek_dropped, peek_borrowed), (dropped, borrowed));
+    }
+
+    /// El carril de afinidad lo pone `FutureCollection::insert` para la tarea
+    /// de cada mil que lleva mascara, y `initialize` lo limpia al repartir el
+    /// hueco: lo que no puede pasar es que un hueco reusado herede la
+    /// respuesta del ocupante anterior.
+    #[test]
+    fn the_affinity_lane_is_set_per_slot_and_not_inherited() {
+        let page = WakerPage::new(0);
+        page.initialize(0);
+        page.initialize(9);
+        page.mark_affine(9);
+        assert_eq!(page.affine_bits(), 1 << 9);
+
+        page.mark_affine(9);
+        assert_eq!(page.affine_bits(), 1 << 9, "marcarlo dos veces es lo mismo");
+
+        // El hueco se retira y se vuelve a repartir, ahora a una tarea sin
+        // mascara.
+        page.clear(9);
+        assert_eq!(page.affine_bits(), 0);
+        page.initialize(9);
+        assert_eq!(
+            page.affine_bits(),
+            0,
+            "un hueco reusado heredo la afinidad del ocupante anterior: el \
+             barrido le preguntaria a otra CPU por una tarea que corre aqui"
+        );
+
+        page.mark_affine(63);
+        page.mark_affine(0);
+        assert_eq!(page.affine_bits(), (1 << 63) | 1);
+    }
+
+    /// `fetch_and_prev` existe porque sacar un conjunto de bits de un carril
+    /// es saber cuales estaban puestos: el `fetch_and` de al lado tira el
+    /// valor anterior, y quien reclama un hueco tiene que distinguir «lo
+    /// reclame yo» de «ya no estaba».
+    #[test]
+    fn taking_bits_out_of_a_lane_reports_which_were_there() {
+        let lane = AtomicU64SC::new(0b1010);
+        assert_eq!(lane.fetch_and_prev(!0b0010), 0b1010);
+        assert_eq!(lane.load(), 0b1000);
+        assert_eq!(
+            lane.fetch_and_prev(!0b0010),
+            0b1000,
+            "el bit ya no estaba, y eso es lo que hay que poder leer"
+        );
+        assert_eq!(lane.load(), 0b1000);
+        assert_eq!(lane.fetch_and_prev(0), 0b1000);
+        assert_eq!(lane.load(), 0);
+    }
+
     #[test]
     fn retirement_waits_for_old_checkout_writes_before_a_slot_is_reused() {
         let page = WakerPage::new(0);
