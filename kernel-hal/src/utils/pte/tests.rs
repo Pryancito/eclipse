@@ -837,12 +837,12 @@ fn the_x86_dirty_bit_survives_a_flag_rewrite() {
 }
 
 #[test]
-fn a_split_of_a_written_huge_page_hands_the_dirt_down() {
+fn a_child_of_a_split_can_be_marked_written() {
     // What `split_huge_page` does to each of the 512 children: build it from
-    // zero, give it the parent's address and flags, and then -- because D
-    // cannot be carried by either of those -- say so explicitly. The ends of
-    // a coroutine stack's guard bands force exactly this split, and the pages
-    // in between belong to the region the bound is asked about.
+    // zero, give it the parent's address and flags, and then mark it written,
+    // because neither of those can carry a bit the hardware maintains -- and
+    // sampling the parent instead would be a lost update, since the old leaf
+    // stays live until the publish.
     let parent = X86PTE::from_raw(a_leaf(X86PTE::zeroed(), FRAME, rw(), true).raw() | X86_DIRTY);
     assert_eq!(parent.dirty(), Some(true));
 
@@ -857,6 +857,11 @@ fn a_split_of_a_written_huge_page_hands_the_dirt_down() {
     assert_eq!(child.addr(), FRAME);
     assert_eq!(child.flags(), rw(), "and nothing else moved");
     assert_eq!(child.raw() & X86_PS, 0, "a 4 KiB child is not a leaf");
+
+    // Idempotent: marking an entry that already says so changes nothing.
+    let before = child.raw();
+    child.set_dirty();
+    assert_eq!(child.raw(), before);
 }
 
 #[test]

@@ -192,11 +192,6 @@ impl<L: PageTableLevel, PTE: GenericPTE> PageTableImpl<L, PTE> {
             }
             let base = entry.addr();
             let flags = entry.flags();
-            // Carried by hand: the children below are built from zero, and a
-            // parent the CPU had marked written must not become 512 pages that
-            // read clean. Over-reporting (512 dirty children for one written
-            // page) only costs the scheduler stores.
-            let was_dirty = entry.dirty() == Some(true);
             // Allocated before the parent is touched: running out of frames
             // must leave the mapping exactly as it was.
             let table_paddr = alloc().ok_or(PagingError::NoMemory)?;
@@ -209,9 +204,28 @@ impl<L: PageTableLevel, PTE: GenericPTE> PageTableImpl<L, PTE> {
                 e.clear();
                 e.set_addr(base + i * child as usize);
                 e.set_flags(flags, child != PageSize::Size4K);
-                if was_dirty {
-                    e.set_dirty();
-                }
+                // Every child is born dirty, whatever the parent said.
+                //
+                // The children are built from zero and the parent's dirty bit
+                // cannot be carried into them, so it has to be put back by
+                // hand -- and *sampling* the parent is a lost update: the old
+                // leaf stays published until the store below, so a write
+                // through it on another CPU can set the parent's D after the
+                // sample, and the publish then replaces a now-dirty leaf with
+                // clean children. `SPLIT_LOCK` excludes other splitters, not
+                // ordinary writes through a live kernel mapping, and a CPU
+                // holding a stale huge TLB entry can write across the publish
+                // too. So the only answer that cannot be wrong in the
+                // dangerous direction is "all of them".
+                //
+                // It costs nothing where it matters: a split is never undone,
+                // and on x86-64 -- the one architecture whose dirty bit
+                // `dirty_depth_from_top` believes -- the kernel heap is part
+                // of the kernel image and already mapped in 4 KiB pages, so
+                // this loop does not run over it at all. Where it does run,
+                // the result is "poison the whole region", which is what the
+                // scheduler did before any of this existed.
+                e.set_dirty();
             }
             // The 512 stores above have to reach memory before the pointer to
             // them does: the frame was zeroed when it was reserved, so another
@@ -1848,11 +1862,26 @@ mod walker_tests {
         assert_eq!(pt.dirty_depth_from_top(REGION, 8 * K), None);
     }
 
-    /// And after the split that `stack_guard` performs to install a guard
-    /// band, the children carry the parent's dirt: a 2 MiB page the CPU had
-    /// marked written must not become 512 pages that read clean.
+    /// And a split leaves every child marked written, whatever the parent
+    /// said. Sampling the parent is a lost update -- the old leaf is live
+    /// until the publish, so a write through it can set D after the sample --
+    /// and the only answer that cannot be wrong in the dangerous direction is
+    /// "all of them". Downstream that means "poison the whole region", which
+    /// is what the scheduler did before any of this existed.
     #[test]
-    fn the_children_of_a_written_huge_page_are_all_written() {
+    fn every_child_of_a_split_is_born_written() {
+        let mut frames = vec![];
+        let mut split_at = |pt: &mut PageTableImpl<PageTableLevel4, TestPTE>, vaddr: usize| {
+            pt.split_huge_page(vaddr, || {
+                let f = PhysFrame::new_zero()?;
+                let paddr = f.paddr();
+                frames.push(f);
+                Some(paddr)
+            })
+            .unwrap();
+        };
+
+        // A parent the CPU had marked written.
         let mut pt = a_table::<PageTableLevel4>();
         pt.map(Page::new_aligned(REGION, PageSize::Size2M), 16 * M, rw())
             .unwrap();
@@ -1861,44 +1890,31 @@ mod walker_tests {
             assert_eq!(size, PageSize::Size2M);
             entry.0 |= D;
         }
-        let mut frames = vec![];
-        pt.split_huge_page(REGION, || {
-            let f = PhysFrame::new_zero()?;
-            let paddr = f.paddr();
-            frames.push(f);
-            Some(paddr)
-        })
-        .unwrap();
+        split_at(&mut pt, REGION);
+        assert_eq!(pt.dirty_depth_from_top(REGION, 8 * K), Some(8 * K));
 
+        // And one it had not: same answer, because the sample it would have
+        // been taken from is exactly what races the publish.
+        let mut pt = a_table::<PageTableLevel4>();
+        pt.map(Page::new_aligned(REGION, PageSize::Size2M), 32 * M, rw())
+            .unwrap();
+        assert_eq!(pt.get_entry_mut(REGION).unwrap().0 .0 & D, 0, "clean");
+        split_at(&mut pt, REGION);
         assert_eq!(
             pt.dirty_depth_from_top(REGION, 8 * K),
             Some(8 * K),
-            "the split lost the parent's dirty bit"
+            "a child born clean is a write that raced the split, lost"
         );
-        // Every one of the 512, not just the one the split was asked about.
+
+        // Every one of the 512, not just the one the split was asked about,
+        // and the split still describes the same memory with the same flags.
         for off in [0usize, 1, 42, 511] {
             let (entry, size) = pt.get_entry_mut(REGION + off * K).unwrap();
             assert_eq!(size, PageSize::Size4K);
             assert_eq!(entry.dirty(), Some(true));
+            assert_eq!(entry.addr(), 32 * M + off * K);
+            assert_eq!(entry.flags(), rw());
         }
-
-        // A split of a clean parent stays clean: the dirt is carried, not
-        // invented, or the bound would never bound anything.
-        let mut pt = a_table::<PageTableLevel4>();
-        pt.map(
-            Page::new_aligned(REGION + 2 * M, PageSize::Size2M),
-            32 * M,
-            rw(),
-        )
-        .unwrap();
-        pt.split_huge_page(REGION + 2 * M, || {
-            let f = PhysFrame::new_zero()?;
-            let paddr = f.paddr();
-            frames.push(f);
-            Some(paddr)
-        })
-        .unwrap();
-        assert_eq!(pt.dirty_depth_from_top(REGION + 2 * M, 8 * K), Some(0));
     }
 
     /// The walk resolves one table per 2 MiB rather than one per page, so a
