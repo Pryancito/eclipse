@@ -598,7 +598,12 @@ impl KernelHandler for ZcoreKernelHandler {
                 if live == 0 {
                     continue;
                 }
-                let _ = write!(s, "  ~{:>6} KiB in ~{} blocks <-", (bytes * scale) >> 10, live * scale);
+                let _ = write!(
+                    s,
+                    "  ~{:>6} KiB in ~{} blocks <-",
+                    (bytes * scale) >> 10,
+                    live * scale
+                );
                 for f in frames.iter() {
                     if *f != 0 {
                         let _ = write!(s, " {}", kernel_hal::ksyms::Addr(*f as u64));
@@ -612,7 +617,8 @@ impl KernelHandler for ZcoreKernelHandler {
         } else {
             let _ = writeln!(
                 s,
-                "call sites: not sampling yet (arms at the first heap-pressure level)"
+                "call sites: no sampled block is live (sampling arms at the first \
+                 heap-pressure level)"
             );
         }
         let _ = writeln!(s, "hot exact sizes:");

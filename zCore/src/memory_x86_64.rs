@@ -991,8 +991,8 @@ cfg_if! {
             let (rows, missed, scale) = heap_alloc_sites();
             if !rows.iter().any(|(live, _, _)| *live > 0) {
                 emit(format_args!(
-                    "[heap-pressure] holders by call site: sampling armed, \
-                     nothing tracked yet; the next report names them\n"
+                    "[heap-pressure] holders by call site: no sampled block is live; \
+                     the next report names them\n"
                 ));
                 return;
             }
@@ -2434,8 +2434,14 @@ pub mod alloc_sites {
     /// prompted this, that is ~130 tracked blocks per leaking site: plenty to
     /// name it, and a thousandth of the cost of tracking them all.
     pub const SAMPLE_SHIFT: u32 = 10;
-    /// Sampled blocks tracked at once, direct-mapped by pointer.
+    /// Sampled blocks tracked at once, direct-mapped by pointer. A power of
+    /// two: [`slot_of`] takes the top bits of a multiply.
     pub const SAMPLES: usize = 4096;
+    const _: () = assert!(SAMPLES.is_power_of_two());
+
+    /// `site_of` while one CPU is changing a slot. Not a value `record` can
+    /// leave behind: a site index plus one is at most `SITES`.
+    const BUSY: usize = usize::MAX;
 
     pub struct Site {
         /// Hash of the call chain; 0 marks a free slot.
@@ -2464,7 +2470,8 @@ pub mod alloc_sites {
         sites: [Site; SITES],
         /// The sampled block at this slot, or 0.
         ptr: [AtomicUsize; SAMPLES],
-        /// Its site index plus one; 0 means the slot is empty.
+        /// Its site index plus one; 0 means the slot is empty, and
+        /// [`BUSY`] means another CPU is mid-change (see [`Table::seize`]).
         site_of: [AtomicUsize; SAMPLES],
         /// Its size, so a free can subtract exactly what the alloc added.
         size_of: [AtomicUsize; SAMPLES],
@@ -2509,16 +2516,28 @@ pub mod alloc_sites {
                 return;
             };
             let s = slot_of(ptr);
-            // Whatever was in this slot loses its tracking, so give its site
-            // the block back first: an untracked free can no longer find it.
-            self.release(s);
-            self.site_of[s].store(si + 1, Ordering::Relaxed);
+            let Some(prev) = self.seize(s) else {
+                self.missed.fetch_add(1, Ordering::Relaxed);
+                return;
+            };
+            // Under the slot's own lock. Without it two allocations landing
+            // on one slot both found it empty, both charged their site, and
+            // only the last pointer stayed findable -- so the other charge
+            // could never be released and the row grew for ever. A slot's
+            // contents (pointer, site, size) change together or not at all.
+            self.ptr[s].store(0, Ordering::Relaxed);
+            if prev != 0 {
+                // Whatever was here loses its tracking, so give its site the
+                // block back: an untracked free can no longer find it.
+                self.give_back(prev, self.size_of[s].load(Ordering::Relaxed));
+            }
             self.size_of[s].store(size, Ordering::Relaxed);
             self.sites[si].live.fetch_add(1, Ordering::Relaxed);
             self.sites[si].bytes.fetch_add(size, Ordering::Relaxed);
-            // Published last: a reader (or a concurrent free) that sees the
+            // Published before the slot is let go, so a free that sees the
             // pointer sees a slot whose site and size are already written.
             self.ptr[s].store(ptr, Ordering::Release);
+            self.release(s, si + 1);
         }
 
         /// Undo the charge for `ptr`, if it was one of the sampled blocks.
@@ -2531,23 +2550,45 @@ pub mod alloc_sites {
             if self.ptr[s].load(Ordering::Acquire) != ptr {
                 return false;
             }
-            self.ptr[s].store(0, Ordering::Relaxed);
-            self.release(s)
-        }
-
-        /// Give slot `s`'s block back to its site and empty the slot. The
-        /// index is taken with a swap so two CPUs racing on one slot cannot
-        /// both subtract the same block.
-        fn release(&self, s: usize) -> bool {
-            let prev = self.site_of[s].swap(0, Ordering::AcqRel);
-            if prev == 0 {
+            let Some(prev) = self.seize(s) else {
+                return false;
+            };
+            // Asked AGAIN under the lock: between the load above and the
+            // lock a `record` can have replaced this slot, and subtracting
+            // then charges the free of one block to the site of another.
+            if prev == 0 || self.ptr[s].load(Ordering::Relaxed) != ptr {
+                self.release(s, prev);
                 return false;
             }
+            self.ptr[s].store(0, Ordering::Relaxed);
             let size = self.size_of[s].load(Ordering::Relaxed);
+            self.release(s, 0);
+            self.give_back(prev, size);
+            true
+        }
+
+        /// Take slot `s` for this CPU, returning what it held. `None` means
+        /// another CPU holds it: the sample is dropped rather than waited
+        /// for -- this runs inside `alloc`, where there is nothing to wait
+        /// with, and a dropped sample is an under-count, which is the error
+        /// this table is allowed to make.
+        fn seize(&self, s: usize) -> Option<usize> {
+            match self.site_of[s].swap(BUSY, Ordering::AcqRel) {
+                BUSY => None,
+                prev => Some(prev),
+            }
+        }
+
+        /// Let slot `s` go, leaving `val` in it (0 for empty).
+        fn release(&self, s: usize, val: usize) {
+            self.site_of[s].store(val, Ordering::Release);
+        }
+
+        /// Give one block of `size` back to the site `prev - 1` names.
+        fn give_back(&self, prev: usize, size: usize) {
             let site = &self.sites[prev - 1];
             sub(&site.live, 1);
             sub(&site.bytes, size);
-            true
         }
 
         /// The slot holding `key`, claiming a free one if it is new.
@@ -2573,12 +2614,10 @@ pub mod alloc_sites {
                     }
                     continue;
                 }
-                match site.key.compare_exchange(
-                    0,
-                    key,
-                    Ordering::AcqRel,
-                    Ordering::Relaxed,
-                ) {
+                match site
+                    .key
+                    .compare_exchange(0, key, Ordering::AcqRel, Ordering::Relaxed)
+                {
                     Ok(_) => return Some(self.adopt(i, frames)),
                     Err(racer) if racer == key => return Some(i),
                     Err(_) => continue,
@@ -2637,12 +2676,18 @@ pub mod alloc_sites {
         });
     }
 
-    /// Which direct-mapped slot tracks `ptr`. The low four bits are dropped:
-    /// the buddy's blocks are at least 8-byte aligned and the classes that
-    /// matter are far coarser, so keeping them would leave most of the table
-    /// unreachable.
-    fn slot_of(ptr: usize) -> usize {
-        (ptr >> 4) % SAMPLES
+    /// Which direct-mapped slot tracks `ptr`.
+    ///
+    /// Taking the low bits of the address would be worst exactly where this
+    /// table is pointed: the buddy hands out power-of-two blocks at their own
+    /// alignment, so with `(ptr >> 4) % SAMPLES` the 1 KiB class could reach
+    /// 64 of the 4096 slots and anything 64 KiB-aligned reached ONE. The
+    /// table would evict itself long before it was full. Fibonacci hashing
+    /// instead: multiply and take the top bits, so every bit of the address
+    /// reaches the index.
+    pub fn slot_of(ptr: usize) -> usize {
+        const GOLDEN: usize = 0x9e37_79b9_7f4a_7c15;
+        ptr.wrapping_mul(GOLDEN) >> (usize::BITS - SAMPLES.trailing_zeros())
     }
 
     /// FNV-1a over the chain, never 0 (0 means "free slot").
