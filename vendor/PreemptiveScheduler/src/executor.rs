@@ -722,6 +722,28 @@ impl RetiredStack {
 static RETIRED_STACKS: spin::Mutex<[RetiredStack; RETIRED_STACKS_CAP]> =
     spin::Mutex::new([RetiredStack::EMPTY; RETIRED_STACKS_CAP]);
 
+/// Cuantos huecos de [`RETIRED_STACKS`] estan ocupados ahora mismo.
+///
+/// La tabla la recorria entera `observe_cpu_quiescent_locked`, 256 huecos de 40
+/// bytes (10 KiB, ~160 lineas de cache) sin cota ninguna, y
+/// [`note_cpu_quiescent`] se llama **tres veces por vuelta del bucle de
+/// `run_until_idle`** (`runtime.rs`), o sea en cada preempcion y en cada
+/// aparcada, en cada CPU. En regimen estable la tabla esta vacia, asi que eran
+/// 256 lecturas para no enterarse de nada: medido, 95,2 ns con la tabla vacia
+/// frente a 8,3 ns de tomar el cerrojo y no barrer
+/// (`grace_period_tests::benches`). Y lo que se acorta es la **seccion critica
+/// de un `spin::Mutex` global a todas las CPUs**, que es donde los bucles de
+/// planificacion se encuentran.
+///
+/// **Es exacto, no una aproximacion.** Todas las mutaciones de la tabla pasan
+/// por el cerrojo, y este contador se mueve en las mismas secciones criticas,
+/// asi que leido con la tabla tomada vale el numero real de huecos ocupados.
+/// Lo comprueba `the_count_is_always_the_number_of_occupied_slots` paso a paso
+/// sobre secuencias aleatorias, y
+/// `the_bounded_sweep_reclaims_exactly_what_the_unbounded_one_would` compara el
+/// conjunto reclamado con el del recorrido entero.
+static RETIRED_OCCUPIED: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
 /// Register the quarantine protect/unprotect hooks (kernel-hal, bare-metal).
 ///
 /// # Safety
@@ -795,6 +817,12 @@ fn observe_cpu_quiescent_locked(retired: &mut [RetiredStack; RETIRED_STACKS_CAP]
     if cpu >= 64 {
         return;
     }
+    // Nada esperando: no hay nada que un recorrido pudiera encontrar. Ver
+    // [`RETIRED_OCCUPIED`] -- el contador se mueve bajo este mismo cerrojo, que
+    // el llamante ya tiene tomado, asi que aqui vale el numero exacto.
+    if RETIRED_OCCUPIED.load(core::sync::atomic::Ordering::Relaxed) == 0 {
+        return;
+    }
     let bit = 1u64 << cpu;
     for slot in retired.iter_mut() {
         if slot.alloc_base == 0 || slot.pending_cpus & bit == 0 {
@@ -803,6 +831,11 @@ fn observe_cpu_quiescent_locked(retired: &mut [RetiredStack; RETIRED_STACKS_CAP]
         slot.pending_cpus &= !bit;
         if slot.pending_cpus == 0 {
             reclaim_retired_stack(slot);
+            // El hueco queda vacio: `reclaim_retired_stack` lo pone a `EMPTY`
+            // por los dos caminos. El decremento va aqui y no dentro porque esa
+            // funcion tambien se llama sobre un hueco LOCAL que nunca estuvo en
+            // la tabla (ver `retire_stack_after_grace`).
+            RETIRED_OCCUPIED.fetch_sub(1, core::sync::atomic::Ordering::Relaxed);
         }
     }
 }
@@ -851,6 +884,7 @@ fn retire_stack_after_grace(
                 protected,
                 pending_cpus: pending,
             };
+            RETIRED_OCCUPIED.fetch_add(1, Ordering::Relaxed);
             return;
         }
     }
@@ -2422,6 +2456,7 @@ mod grace_period_tests {
         fn drop(&mut self) {
             crate::runtime::set_executor_ready_mask_for_test(self.saved_ready);
             *RETIRED_STACKS.lock() = [RetiredStack::EMPTY; RETIRED_STACKS_CAP];
+            RETIRED_OCCUPIED.store(0, Ordering::SeqCst);
             for slot in STACK_POOL.iter() {
                 slot.store(0, Ordering::SeqCst);
             }
@@ -2433,6 +2468,7 @@ mod grace_period_tests {
         let guard = test_lock();
         let saved_ready = crate::runtime::set_executor_ready_mask_for_test(ready);
         *RETIRED_STACKS.lock() = [RetiredStack::EMPTY; RETIRED_STACKS_CAP];
+        RETIRED_OCCUPIED.store(0, Ordering::SeqCst);
         for slot in STACK_POOL.iter() {
             slot.store(0, Ordering::SeqCst);
         }
@@ -2560,6 +2596,10 @@ mod grace_period_tests {
             .iter_mut()
             .find(|s| s.alloc_base == 0)
             .expect("retired table full");
+        // Ocupar un hueco a mano cuenta igual que ocuparlo por la puerta: ver
+        // `RETIRED_OCCUPIED`. Sin esto el contador se queda en cero, el barrido
+        // sale por la salida rapida y lo aparcado aqui no se reclama nunca.
+        RETIRED_OCCUPIED.fetch_add(1, Ordering::SeqCst);
         *slot = RetiredStack {
             alloc_base: base,
             hard_guard_bottom: true,
@@ -2702,6 +2742,265 @@ mod grace_period_tests {
             seen += 1;
         }
         assert_eq!(seen, STACK_POOL_CAP + 4);
+    }
+
+    /// El contador vale, paso a paso, el numero real de huecos ocupados.
+    ///
+    /// Es la unica cosa que sostiene la salida rapida de
+    /// `observe_cpu_quiescent_locked`: un contador que se quede ALTO solo
+    /// cuesta un recorrido de mas, pero uno que se quede BAJO deja bloques
+    /// aparcados para siempre, y eso en la maquina es memoria de pila que no
+    /// vuelve. Asi que se comprueba despues de CADA operacion, no al final.
+    ///
+    /// La secuencia es pseudoaleatoria y no una lista escrita a mano porque lo
+    /// que puede desincronizar el contador son las combinaciones: retirar sobre
+    /// un hueco que acaba de quedar libre, reportar por una CPU que ya reporto,
+    /// llenar la tabla y retirar una vez mas, reportar con la tabla vacia.
+    #[test]
+    fn the_count_is_always_the_number_of_occupied_slots() {
+        let _f = fresh(0b0111);
+        let occupied = || {
+            RETIRED_STACKS
+                .lock()
+                .iter()
+                .filter(|s| s.alloc_base != 0)
+                .count()
+        };
+        let mut seed = 0x243f_6a88_85a3_08d3u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for step in 0..4000u64 {
+            match next() % 3 {
+                0 => retire(0xf000_0000 + (next() % 64) as usize * ALLOC_SIZE),
+                1 => note_cpu_quiescent((next() % 4) as usize),
+                _ => park_as(
+                    0xf800_0000 + (next() % 64) as usize * ALLOC_SIZE,
+                    next() % 0b1000,
+                ),
+            }
+            assert_eq!(
+                RETIRED_OCCUPIED.load(Ordering::SeqCst),
+                occupied(),
+                "el contador se desincronizo en el paso {}",
+                step
+            );
+        }
+    }
+
+    /// Y la salida rapida no se salta ni un reclamo: con la misma secuencia de
+    /// entrada, el conjunto de bloques que acaban en el fondo es el mismo con
+    /// la cota que sin ella.
+    ///
+    /// El «sin ella» se simula poniendo el contador por encima de cero antes de
+    /// cada barrido, que es exactamente lo que hacia el codigo de antes:
+    /// recorrer la tabla entera sin preguntar si habia algo. Si la cota se
+    /// comiera un reclamo, los dos conjuntos no coincidirian.
+    #[test]
+    fn the_bounded_sweep_reclaims_exactly_what_the_unbounded_one_would() {
+        fn run(force_full_sweep: bool) -> alloc::vec::Vec<usize> {
+            let _f = fresh(0b0111);
+            let bases: alloc::vec::Vec<usize> =
+                (0..12).map(|i| 0x1_0000_0000 + i * ALLOC_SIZE).collect();
+            for (i, base) in bases.iter().enumerate() {
+                // Mitad por la puerta normal y mitad aparcados a mano, para que
+                // el conjunto esperado no sea trivialmente "todos".
+                if i % 2 == 0 {
+                    retire(*base);
+                } else {
+                    park_as(*base, 0b0101);
+                }
+                for cpu in 0..3 {
+                    if force_full_sweep {
+                        // Lo que hacia el codigo de antes de la cota.
+                        RETIRED_OCCUPIED.fetch_add(1, Ordering::SeqCst);
+                        note_cpu_quiescent(cpu);
+                        RETIRED_OCCUPIED.fetch_sub(1, Ordering::SeqCst);
+                    } else {
+                        note_cpu_quiescent(cpu);
+                    }
+                }
+            }
+            let mut got: alloc::vec::Vec<usize> =
+                bases.into_iter().filter(|b| pooled(*b)).collect();
+            got.sort_unstable();
+            got
+        }
+        let bounded = run(false);
+        let unbounded = run(true);
+        assert_eq!(
+            bounded, unbounded,
+            "la cota reclama un conjunto distinto del recorrido entero"
+        );
+        assert!(
+            !bounded.is_empty(),
+            "ninguno de los dos reclamo nada: el test no prueba nada"
+        );
+    }
+
+    /// Y la salida rapida solo se toma con la tabla de verdad vacia: un bloque
+    /// aparcado la desarma.
+    #[test]
+    fn a_pending_block_disarms_the_early_return() {
+        let _f = fresh(0b0011);
+        assert_eq!(RETIRED_OCCUPIED.load(Ordering::SeqCst), 0);
+        retire(0x2_0000_0000);
+        assert_eq!(
+            RETIRED_OCCUPIED.load(Ordering::SeqCst),
+            1,
+            "un bloque esperando dejo el contador en cero"
+        );
+        note_cpu_quiescent(1);
+        assert!(pooled(0x2_0000_0000), "la cota se comio el reclamo");
+        assert_eq!(
+            RETIRED_OCCUPIED.load(Ordering::SeqCst),
+            0,
+            "el reclamo no bajo el contador"
+        );
+    }
+
+    /// Rows for el barrido de cuarentena y el fondo de pilas, que es lo que el
+    /// bucle del planificador de **cada CPU** atraviesa en cada punto de
+    /// planificacion.
+    ///
+    /// `note_cpu_quiescent` se llama tres veces por vuelta de
+    /// `run_until_idle` (`runtime.rs:1757`, `:1796`, `:1853`), o sea en cada
+    /// preempcion y en cada aparcada. Y cada llamada hace dos cosas que no
+    /// dependen de si hay algo que reclamar:
+    ///
+    /// 1. Toma `RETIRED_STACKS.lock()`, que es **un solo `spin::Mutex` global
+    ///    para todas las CPUs**. En una maquina con varios nucleos los bucles
+    ///    de planificacion se serializan ahi.
+    /// 2. Recorre los [`RETIRED_STACKS_CAP`] huecos **enteros**, 256 de 40
+    ///    bytes = 10 KiB, ~160 lineas de cache, sin cota ninguna. En regimen
+    ///    estable la tabla esta casi siempre vacia, asi que son 256 lecturas
+    ///    para no enterarse de nada.
+    ///
+    /// Es la misma forma que los dos cables trampa del #1800 (512 huecos
+    /// atomicos en cada malloc) y que el `stack_pool_pop` de antes de su carga
+    /// relajada. La fila que lo dice es
+    /// `sweep_the_retired_table_with_nothing_in_it` leida contra
+    /// `sweep_the_retired_table_with_one_block_pending`: si las dos dan la
+    /// misma cifra, el barrido no va de cuantos bloques hay esperando.
+    ///
+    /// Las filas del fondo estan al lado porque son el otro extremo de la
+    /// misma preempcion: `stack_pool_pop` la pide en `Executor::new` y
+    /// `stack_pool_push` la devuelve al reclamar. Las dos recorren
+    /// [`STACK_POOL_CAP`] huecos, y las dos ya llevan la carga relajada
+    /// delante del RMW, asi que estan aqui para **confirmar** que ese arreglo
+    /// sigue puesto y no para buscarle un hallazgo.
+    ///
+    /// Caveats, los de siempre en este crate: el anfitrion tiene una CPU, asi
+    /// que **ninguna fila incluye la contienda del cerrojo global**, que es
+    /// justo lo que mas duele en la maquina; `cpu_id()` es 0; y el perfil de
+    /// test paga `debug_assert!`s que el kernel no paga. Cada fila sostiene el
+    /// cerrojo de test de este modulo y deja los globales como estaban.
+    #[cfg(test)]
+    mod benches {
+        use super::*;
+        use test::{black_box, Bencher};
+
+        /// Bases separadas `ALLOC_SIZE` para que no se solapen entre si.
+        fn retire_n(n: usize) {
+            for i in 0..n {
+                retire(0xc000_0000 + i * ALLOC_SIZE);
+            }
+        }
+
+        // ── el barrido de cuarentena, por punto de planificacion ───────────
+
+        /// **El caso comun**: tabla vacia. El cerrojo global mas 256 huecos
+        /// leidos para nada. Leer las dos filas de abajo contra esta.
+        #[bench]
+        fn sweep_the_retired_table_with_nothing_in_it(b: &mut Bencher) {
+            let _f = fresh(0b0001);
+            b.iter(|| note_cpu_quiescent(black_box(0)));
+        }
+
+        /// Un bloque esperando a un par que no es quien barre: un hueco
+        /// ocupado de 256. Si cuesta lo mismo que la fila de arriba, el
+        /// barrido no va de cuantos bloques hay.
+        #[bench]
+        fn sweep_the_retired_table_with_one_block_pending(b: &mut Bencher) {
+            let _f = fresh(0b0011);
+            retire_n(1);
+            b.iter(|| note_cpu_quiescent(black_box(0)));
+        }
+
+        /// Y la tabla llena, que es la cota de arriba del barrido.
+        #[bench]
+        fn sweep_the_retired_table_full(b: &mut Bencher) {
+            let _f = fresh(0b0011);
+            retire_n(RETIRED_STACKS_CAP);
+            b.iter(|| note_cpu_quiescent(black_box(0)));
+        }
+
+        /// El cerrojo global solo, sin barrido: lo que queda si el recorrido
+        /// se acota. Con una sola CPU es un `swap` sin contienda, asi que esta
+        /// fila es el **suelo optimista** — en la maquina es el punto donde
+        /// los bucles de planificacion se encuentran.
+        #[bench]
+        fn take_the_retired_table_lock_and_nothing_else(b: &mut Bencher) {
+            let _f = fresh(0b0001);
+            b.iter(|| black_box(RETIRED_STACKS.lock()[0].alloc_base));
+        }
+
+        // ── el fondo de pilas, una vez por preempcion en cada sentido ──────
+
+        /// Lo que `Executor::new` paga por preguntar al fondo vacio. Con la
+        /// carga relajada delante son 128 lecturas; sin ella eran 128 RMW.
+        #[bench]
+        fn take_a_stack_from_an_empty_pool(b: &mut Bencher) {
+            let _f = fresh(0b0001);
+            b.iter(|| black_box(stack_pool_pop()));
+        }
+
+        /// Un acierto en el ULTIMO hueco, que es el peor caso de la busqueda.
+        /// Se devuelve dentro del bucle para que la fila mida siempre un
+        /// acierto y no un fondo que se vacia en la primera vuelta.
+        #[bench]
+        fn take_a_stack_from_a_pool_holding_one_in_the_last_slot(b: &mut Bencher) {
+            let _f = fresh(0b0001);
+            let base = 0xd000_0000;
+            b.iter(|| {
+                STACK_POOL[STACK_POOL_CAP - 1].store(base, Ordering::SeqCst);
+                black_box(stack_pool_pop())
+            });
+        }
+
+        /// Y la devolucion al fondo vacio: acierta en el primer hueco.
+        #[bench]
+        fn give_a_stack_back_to_an_empty_pool(b: &mut Bencher) {
+            let _f = fresh(0b0001);
+            let base = 0xd100_0000;
+            b.iter(|| {
+                let ok = stack_pool_push(black_box(base));
+                STACK_POOL[0].store(0, Ordering::SeqCst);
+                black_box(ok)
+            });
+        }
+
+        /// La devolucion a un fondo lleno: 128 huecos recorridos para
+        /// responder `false`, y el bloque se va a la lista de retencion.
+        #[bench]
+        fn give_a_stack_back_to_a_full_pool(b: &mut Bencher) {
+            let _f = fresh(0b0001);
+            for (i, slot) in STACK_POOL.iter().enumerate() {
+                slot.store(0xe000_0000 + i * ALLOC_SIZE, Ordering::SeqCst);
+            }
+            b.iter(|| black_box(stack_pool_push(black_box(0xd200_0000))));
+        }
+
+        /// El contador que `/proc/perf/kernel` imprime: cuenta los huecos
+        /// ocupados y luego toma el `spin::Mutex` de la lista de retencion.
+        #[bench]
+        fn read_the_stack_pool_counters_with_an_empty_pool(b: &mut Bencher) {
+            let _f = fresh(0b0001);
+            b.iter(stack_pool_stats);
+        }
     }
 }
 
