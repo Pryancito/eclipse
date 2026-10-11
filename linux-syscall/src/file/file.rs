@@ -1364,13 +1364,13 @@ impl Syscall<'_> {
                         // it is close-on-exec (`DRM_CLOEXEC`); `add_file` reads
                         // the second off the object, as it does for `open`.
                         let (phys, size, vmo) = match drm::export_handle(handle) {
-                            Some(v) => v,
-                            None => {
+                            Ok(v) => v,
+                            Err(refusal) => {
                                 warn!(
-                                    "[drm] PRIME export EINVAL: handle={} not in GEM table",
-                                    handle
+                                    "[drm] PRIME export handle={} refused: {:?}",
+                                    handle, refusal
                                 );
-                                return Err(LxError::EINVAL);
+                                return Err(refusal.into());
                             }
                         };
                         let dmabuf = DmaBuf::from_prime(handle, phys, size, vmo, flags);

@@ -956,6 +956,10 @@ pub(super) const NOUVEAU_GEM_DOMAIN_VRAM: u32 = 1 << 1;
 /// GEM_NEW has to honour it on its own or every host-visible Vulkan
 /// allocation fails.
 pub(super) const NOUVEAU_GEM_DOMAIN_GART: u32 = 1 << 2;
+/// `NOUVEAU_GEM_DOMAIN_NO_SHARE`: the object is private to its VM (it shares
+/// the VM's reservation), so it needs a uvmm (`VM_INIT`) and can never be
+/// exported through PRIME (`nouveau_gem_prime_export`: EPERM).
+pub(super) const NOUVEAU_GEM_DOMAIN_NO_SHARE: u32 = 1 << 5;
 
 // --- DRM_NOUVEAU_VM_BIND_OP_* ---
 pub(super) const VM_BIND_OP_MAP: u32 = 0x0;
