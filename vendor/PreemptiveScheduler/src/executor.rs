@@ -459,6 +459,32 @@ const ALLOC_LAYOUT: Layout = match Layout::from_size_align(ALLOC_SIZE, PAGE_SIZE
 const STACK_CANARY: u64 = 0x5354_4143_4b5f_4f56; // "STACK_OV"
 const GUARD_WORDS: usize = GUARD_SIZE / core::mem::size_of::<u64>();
 
+/// Lo que se escribe por la zona utilizable de una pila recien nacida, para
+/// que un `ret` a un hueco que nadie uso sea un `rip` malo y distinguible en
+/// vez de `rip = 0`.
+///
+/// Estaba declarado dentro del bloque `unsafe` que lo escribe, asi que las
+/// filas de `stack_birth_benches` tenian que copiarlo y vigilar la copia con
+/// un test. Aqui lo ven los dos.
+pub(crate) const STACK_POISON: u64 = 0xDEAD_BEEF_DEAD_BEEF;
+
+/// Escribe [`STACK_POISON`] por las `bytes` de zona utilizable que empiezan en
+/// `base`.
+///
+/// # Safety
+///
+/// `[base, base + bytes)` tiene que estar mapeado, alineado a 8, ser multiplo
+/// de 8, y quien llama tiene que ser su unico dueño mientras esto corre.
+#[inline]
+pub(crate) unsafe fn poison_usable_region(base: usize, bytes: usize) {
+    let words = bytes / core::mem::size_of::<u64>();
+    // SAFETY: lo que el llamante promete arriba.
+    unsafe { core::slice::from_raw_parts_mut(base as *mut u64, words) }.fill(STACK_POISON);
+    // Lo unico que el `volatile` de antes conseguia de verdad: que nadie
+    // decida que estas escrituras estan muertas. Una vez, no una por palabra.
+    core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+}
+
 /// La palabra que le toca al hueco `i` de la banda de guarda.
 ///
 /// El indice va DENTRO de cada palabra para que un `memset` del valor magico
@@ -1617,14 +1643,35 @@ impl Executor {
         // Poison usable stack before context is written on top. Fresh buddy
         // pages are BSS-zero; a RET into never-used slots was rip=0 / [rsp]=0.
         // Non-zero poison makes that a distinctive bad-RIP #PF instead.
-        unsafe {
-            let p = stack_base as *mut u64;
-            let words = STACK_SIZE / core::mem::size_of::<u64>();
-            const STACK_POISON: u64 = 0xDEAD_BEEF_DEAD_BEEF;
-            for i in 0..words {
-                core::ptr::write_volatile(p.add(i), STACK_POISON);
-            }
-        }
+        //
+        // **This is almost all of a mid-poll preemption.** A thread the timer
+        // interrupts inside a poll freezes its frame as a weak executor and
+        // the CPU continues in a NEW one, so every such preemption runs this
+        // function; with the stack pool warm (the steady state) every other
+        // step is a pool pop, two registry inserts and three quarantine
+        // sweeps, about 150 ns in total, against ~104.000 ns here. The
+        // `executor::stack_birth_benches` rows carry the table.
+        //
+        // The loop used to be `write_volatile` per word. A volatile write has
+        // to happen exactly as written, so the compiler could neither widen
+        // the stores nor vectorise them: what ran was one 8-byte store per
+        // iteration, 262.144 times. `fill` writes the SAME bytes over the same
+        // region and lets the compiler pick the store width, which on the host
+        // is 103.600 ns -> 77.400 ns, a quarter off every mid-poll preemption
+        // (`poison_a_whole_stack_one_volatile_word_at_a_time` against
+        // `poison_a_whole_stack_with_a_fill_and_a_fence`; the sibling test
+        // `the_fill_and_the_volatile_loop_write_the_same_bytes` pins that the
+        // two write the same thing).
+        //
+        // The `volatile` was never about ordering or about another CPU seeing
+        // these stores -- a block only reaches here after the grace period has
+        // retired it, so nobody else may touch it -- it was about the stores
+        // not being dropped as dead. The compiler fence below is what says
+        // that, and says it once instead of 262.144 times.
+        // SAFETY: `[stack_base, stack_base + STACK_SIZE)` is this block's usable
+        // region, mapped and 8-aligned, and this executor is its only owner
+        // until it publishes itself below.
+        unsafe { poison_usable_region(stack_base, STACK_SIZE) };
         note_first_executor_created(hard_guard_bottom, hard_guard_top);
         let mut pin_executor = Pin::new(Box::new(Executor {
             id: executor_alloc_id(),
