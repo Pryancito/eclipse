@@ -183,4 +183,39 @@ mod tests {
         stop.store(true, Ordering::Relaxed);
         writer.join().unwrap();
     }
+
+    /// `ZX_CLOCK_OPT_MAPPABLE` is the whole difference between a clock
+    /// userspace reads with a syscall and one it reads out of a page it has
+    /// mapped, and nothing asked for either: inverting the flag hands a page
+    /// to whoever asked for a plain clock and none to whoever asked for a
+    /// mappable one.
+    #[test]
+    fn only_a_mappable_clock_gets_a_page() {
+        assert!(
+            Clock::new(0, false).mapped_vmo().is_none(),
+            "a plain clock has no page to map"
+        );
+        let clock = Clock::new(0, true);
+        let vmo = clock.mapped_vmo().expect("a mappable clock has a page");
+        assert_eq!(clock.mapped_size(), PAGE_SIZE);
+        assert_eq!(vmo.len(), PAGE_SIZE, "and the page is the size it maps");
+    }
+
+    /// The first eight bytes of that page are Fuchsia's `error_bound`, and
+    /// `u64::MAX` is how it says "unknown". The rest is the zeroes the VMO
+    /// was created with, which matters because userspace maps and reads the
+    /// whole page: a byte of kernel memory left in there is disclosed.
+    #[test]
+    fn the_mapped_page_opens_with_an_unknown_error_bound() {
+        let vmo = Clock::new(0, true).mapped_vmo().unwrap();
+        let mut head = [0u8; 8];
+        vmo.read(0, &mut head).unwrap();
+        assert_eq!(u64::from_ne_bytes(head), u64::MAX);
+        let mut rest = [0xffu8; 32];
+        vmo.read(8, &mut rest).unwrap();
+        assert!(
+            rest.iter().all(|&b| b == 0),
+            "the page is not zero after the error bound"
+        );
+    }
 }
