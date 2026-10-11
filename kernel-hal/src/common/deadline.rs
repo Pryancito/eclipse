@@ -229,6 +229,22 @@ pub fn may_stretch_tick(cpu: usize, tickless_on: bool, deadline_timer_on: bool) 
     tickless_on && deadline_timer_on && cpu != TIMEKEEPER_CPU
 }
 
+/// Whether taking the stretch would actually widen anything for this CPU.
+///
+/// Expressing a stretch costs LAPIC writes: the flag widens the bound, but
+/// the re-arm that follows still shortens the span back to this CPU's own
+/// earliest deadline. So a CPU whose next deadline is already inside the fast
+/// tick arms the very same count it had — the writes buy nothing, and on a
+/// machine that idles and wakes thousands of times a second (boot is exactly
+/// that) they are pure cost. A CPU that owns no deadline at all is the case
+/// the stretch exists for, so it always qualifies.
+pub fn stretch_is_worth_it(now_ns: u64, next_ns: u64, fast_tick_ns: u64) -> bool {
+    if next_ns == NO_DEADLINE {
+        return true;
+    }
+    next_ns.saturating_sub(now_ns) > fast_tick_ns
+}
+
 /// Which *other* CPU's timer heap, if any, has fallen so far behind that the
 /// CPU taking its own tick should drain it on the owner's behalf.
 ///
@@ -1228,6 +1244,23 @@ mod tests {
             None,
             "the hysteresis declines it, so the restore must not go through here"
         );
+    }
+
+    #[test]
+    fn a_cpu_whose_timer_fires_within_the_tick_gains_nothing_by_stretching() {
+        // The re-arm would shorten the span straight back to this deadline,
+        // so the flag and its LAPIC writes buy nothing.
+        assert!(!stretch_is_worth_it(NOW, NOW + TICK / 2, TICK));
+        assert!(!stretch_is_worth_it(NOW, NOW + TICK, TICK));
+        // Past-due counts as inside the tick: it fires on the next tick either
+        // way.
+        assert!(!stretch_is_worth_it(NOW, NOW - MS, TICK));
+    }
+
+    #[test]
+    fn an_idle_cpu_with_no_deadline_of_its_own_is_the_case_the_stretch_is_for() {
+        assert!(stretch_is_worth_it(NOW, NO_DEADLINE, TICK));
+        assert!(stretch_is_worth_it(NOW, NOW + TICK + 1, TICK));
     }
 
     #[test]

@@ -484,20 +484,21 @@ fn rearm_after_tick(now_ns: u64) {
     let tick_ns = tick_bound_ns();
     let tick_due = now_ns.saturating_add(tick_ns);
     TICK_DUE_NS[cpu].store(tick_due, Ordering::Relaxed);
-    // Reset the armed marker first so the arm below is free to shorten again.
-    ARMED_NS[cpu].store(tick_due, Ordering::Relaxed);
-    super::arch::timer::set_tick_count(super::arch::timer::ns_to_tick_count(tick_ns));
     // This CPU's own earliest deadline, not the machine's: arming every core
     // for every timer anywhere is what used to pull the whole machine up to
     // the `MIN_ARM_NS` interrupt floor (see `TIMER_HEAPS`).
     let next = NEXT_DEADLINE_NS[cpu].load(Ordering::Acquire);
-    let Some(span) = crate::deadline::rearm_span(now_ns, next, tick_due, tick_ns, MIN_ARM_NS)
-    else {
-        return;
-    };
+    let shortened = crate::deadline::rearm_span(now_ns, next, tick_due, tick_ns, MIN_ARM_NS);
+    // ONE write to the count register, not two. Programming `tick_ns` and then
+    // immediately overwriting it with the shortened span cost every tick on
+    // every CPU a second LAPIC write that nothing ever read: the count is
+    // reloaded from whatever was written last, so only the last value matters.
+    let span = shortened.unwrap_or(tick_ns);
     super::arch::timer::set_tick_count(super::arch::timer::ns_to_tick_count(span));
     ARMED_NS[cpu].store(now_ns.saturating_add(span), Ordering::Relaxed);
-    crate::kstats::note_timer_rearm();
+    if shortened.is_some() {
+        crate::kstats::note_timer_rearm();
+    }
 }
 
 /// Most recent monotonic time (ns) at which the shared xHCI controller was
@@ -979,8 +980,20 @@ hal_fn_impl! {
                 // the same `MIN_ARM_NS` floor and the same hysteresis as every
                 // other arm. The first attempt wrote the LAPIC count by hand
                 // here, which is how the flag and `ARMED_NS` came to disagree.
+                let now_ns = duration_to_ns(timer_now());
+                if !crate::deadline::stretch_is_worth_it(
+                    now_ns,
+                    NEXT_DEADLINE_NS[cpu].load(Ordering::Acquire),
+                    super::arch::timer::fast_tick_ns(),
+                ) {
+                    // Its own timer fires inside the fast tick anyway, so the
+                    // stretch would arm the very same count. Leave the flag
+                    // down and write nothing: with the flag down there is also
+                    // nothing for `timer_idle_exit` to undo.
+                    return;
+                }
                 super::percpu::set_timer_idle_armed(true);
-                rearm_after_tick(duration_to_ns(timer_now()));
+                rearm_after_tick(now_ns);
             }
         }
 
