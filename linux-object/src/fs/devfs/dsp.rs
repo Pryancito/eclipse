@@ -1215,6 +1215,12 @@ impl INode for DspDev {
 }
 
 #[cfg(test)]
+mod conversion_tests;
+
+#[cfg(test)]
+mod geometry_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use zcore_drivers::DeviceResult;
