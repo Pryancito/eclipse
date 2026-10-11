@@ -717,6 +717,41 @@ mod tests {
             LxError::EBADF
         );
     }
+
+    /// One byte is a whole splice, and it is not the end of the input.
+    ///
+    /// The read of a non-pipe input goes through a single check that tells
+    /// "the file is at its end" from "the file gave me something": get that
+    /// boundary wrong by one and a one-byte read answers 0 with the byte
+    /// still in the file -- which every caller reads as end of input and
+    /// stops on, so `cat`-shaped loops lose the tail of a file whose last
+    /// read is short.
+    #[async_std::test]
+    async fn one_byte_moves_and_is_not_the_end_of_the_input() {
+        let (_read_end, w, queue) = pipe(OpenFlags::empty());
+        let f = file(b"z");
+        assert_eq!(
+            splice(&f, None, &w, None, 1, true).await.unwrap(),
+            Spliced {
+                moved: 1,
+                off_in: None,
+                off_out: None,
+            }
+        );
+        assert_eq!(queued(&queue), b"z".to_vec());
+        // Now the file really is at its end: nothing moves, nothing is
+        // queued, and it is not an error.
+        assert_eq!(
+            splice(&f, None, &w, None, 16, true).await.unwrap(),
+            Spliced {
+                moved: 0,
+                off_in: None,
+                off_out: None,
+            }
+        );
+        assert_eq!(queued(&queue), b"z".to_vec());
+        assert_eq!(f.seek(SeekFrom::Current(0)).unwrap(), 1);
+    }
 }
 
 #[cfg(test)]

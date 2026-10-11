@@ -446,8 +446,9 @@ impl Syscall<'_> {
                     Err(FsError::EntryNotFound) => {
                         // `build_open_flags`: `op->mode = mode & S_IALLUGO`.
                         // Without the mask, `open(..., O_CREAT, 0o100644)`
-                        // left `S_IFREG` in the inode mode (mkdir/mknod
-                        // already strip via `create_perm`).
+                        // left `S_IFREG` in the inode mode. `mknod` shares
+                        // this mask; `mkdir` has a narrower one of its own
+                        // (`mkdir_perm`), which also drops the set-id bits.
                         let create_mode = proc.apply_umask(super::dir::create_perm(mode));
                         let inode =
                             dir_inode.create(file_name, FileType::File, create_mode as u32)?;
