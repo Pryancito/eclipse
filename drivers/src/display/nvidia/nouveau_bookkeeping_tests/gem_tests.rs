@@ -24,16 +24,38 @@ fn gem_new_no_share_needs_a_uvmm_and_marks_the_object_unexportable() {
     let private = gem_new_rm(&gpu, 4096, gart | nv::NOUVEAU_GEM_DOMAIN_NO_SHARE, A).unwrap();
     assert_eq!(private.domain, gart, "the bit is not a domain");
     let shared = gem_new_rm(&gpu, 4096, gart, A).unwrap();
-    assert!(crate::scheme::gem_mmap::no_share(private.handle));
-    assert!(!crate::scheme::gem_mmap::no_share(shared.handle));
+    assert!(crate::scheme::gem_mmap::no_share(private.handle, A));
+    assert!(
+        !crate::scheme::gem_mmap::no_share(private.handle, B),
+        "its creator's alone"
+    );
+    assert!(!crate::scheme::gem_mmap::no_share(shared.handle, A));
     assert_eq!(
         crate::scheme::gem_mmap::lookup_for(private.handle, A).map(|(_, size)| size),
         Some(4096),
         "the process itself still maps it"
     );
+    // A VRAM-only object has no host address and no mapping entry; the
+    // record does not depend on one.
+    let vram = gem_new_rm(
+        &gpu,
+        4096,
+        nv::NOUVEAU_GEM_DOMAIN_VRAM | nv::NOUVEAU_GEM_DOMAIN_NO_SHARE,
+        A,
+    )
+    .unwrap();
+    assert_eq!(vram.map_handle, 0, "not CPU-mappable");
+    assert!(crate::scheme::gem_mmap::lookup_for(vram.handle, A).is_none());
+    assert!(
+        crate::scheme::gem_mmap::no_share(vram.handle, A),
+        "marked all the same"
+    );
+    // Its one holder closing it takes the record with the object.
+    assert!(gpu.nouveau_gem_close(vram.handle, A));
+    assert!(!crate::scheme::gem_mmap::no_share(vram.handle, A));
     gpu.nouveau_release_process(A);
     assert!(
-        !crate::scheme::gem_mmap::no_share(private.handle),
+        !crate::scheme::gem_mmap::no_share(private.handle, A),
         "gone with the object"
     );
 }

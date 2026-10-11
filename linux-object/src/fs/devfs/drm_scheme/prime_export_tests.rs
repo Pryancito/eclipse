@@ -5,6 +5,7 @@
 use super::gl_client_sequence_tests::Client;
 use super::*;
 use crate::error::LxError;
+use crate::fs::devfs::kms_emu::{self, EmuGpu};
 use drm::ExportRefusal;
 use zcore_drivers::scheme::gem_mmap;
 use zircon_object::vm::PAGE_SIZE;
@@ -38,7 +39,7 @@ fn an_export_is_enoent_for_a_handle_the_file_does_not_hold_and_eperm_for_a_no_sh
     let me = drm::current_pid();
     gem_mmap::register(MINE, 0x1000_0000, 2 * PAGE_SIZE as u64, me);
     gem_mmap::register(PRIVATE, 0x1002_0000, PAGE_SIZE as u64, me);
-    assert!(gem_mmap::mark_no_share(PRIVATE));
+    gem_mmap::mark_no_share(PRIVATE, me);
     assert_eq!(
         drm::export_handle(MINE).map(|(phys, size, _)| (phys, size)),
         Ok((0x1000_0000, 2 * PAGE_SIZE))
@@ -47,11 +48,16 @@ fn an_export_is_enoent_for_a_handle_the_file_does_not_hold_and_eperm_for_a_no_sh
         drm::export_handle(PRIVATE).err(),
         Some(ExportRefusal::NotShareable)
     );
-    assert!(!gem_mmap::mark_no_share(UNTRACKED), "not tracked");
-    assert!(!gem_mmap::no_share(UNTRACKED));
+    assert!(!gem_mmap::no_share(UNTRACKED, me));
     for h in [MINE, PRIVATE] {
         assert!(gem_mmap::unregister(h));
     }
+    assert_eq!(
+        drm::export_handle(PRIVATE).err(),
+        Some(ExportRefusal::NotShareable),
+        "the record is the object's, not the mapping's"
+    );
+    assert!(gem_mmap::clear_no_share(PRIVATE));
     assert_eq!(
         drm::export_handle(PRIVATE).err(),
         Some(ExportRefusal::NotFound)
@@ -63,9 +69,50 @@ fn an_export_is_enoent_for_a_handle_the_file_does_not_hold_and_eperm_for_a_no_sh
     );
 }
 
+/// A VRAM-only object has no host address, so no mapping the export could
+/// build a dma-buf over, and the lookup alone called it ENOENT; it exists,
+/// and the driver says so (`gem_aperture`). It is refused on its own terms
+/// (EINVAL, what every export got before), and a NO_SHARE one is EPERM like
+/// any other, mapping or not. Nothing of the kind is an object of nobody's.
+#[test]
+fn a_vram_object_exists_and_is_refused_for_its_own_reason() {
+    const VRAM: u32 = 0xbfff_0020;
+    const VRAM_PRIVATE: u32 = 0xbfff_0021;
+    const NOBODYS: u32 = 0xbfff_0022;
+    let screen = kms_emu::attach(16, 16);
+    let _gpu = screen.attach_gpu(
+        EmuGpu::hardware_kms("emu-gpu")
+            .with_vram_object(VRAM)
+            .with_vram_object(VRAM_PRIVATE),
+    );
+    let me = drm::current_pid();
+    gem_mmap::mark_no_share(VRAM_PRIVATE, me);
+    assert_eq!(
+        drm::export_handle(VRAM).err(),
+        Some(ExportRefusal::NoHostAddress),
+        "exists, no host address"
+    );
+    assert_eq!(
+        drm::export_handle(VRAM_PRIVATE).err(),
+        Some(ExportRefusal::NotShareable),
+        "NO_SHARE without a mapping"
+    );
+    assert_eq!(
+        drm::export_handle(NOBODYS).err(),
+        Some(ExportRefusal::NotFound),
+        "no object"
+    );
+    assert!(gem_mmap::clear_no_share(VRAM_PRIVATE));
+    assert_eq!(
+        drm::export_handle(VRAM_PRIVATE).err(),
+        Some(ExportRefusal::NoHostAddress)
+    );
+}
+
 /// The errno each refusal becomes at the ioctl.
 #[test]
-fn the_refusals_are_enoent_and_eperm() {
+fn the_refusals_are_enoent_eperm_and_einval() {
     assert_eq!(LxError::from(ExportRefusal::NotFound), LxError::ENOENT);
     assert_eq!(LxError::from(ExportRefusal::NotShareable), LxError::EPERM);
+    assert_eq!(LxError::from(ExportRefusal::NoHostAddress), LxError::EINVAL);
 }

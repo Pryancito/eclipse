@@ -7954,6 +7954,9 @@ impl DrmScheme for NvidiaGpu {
         let Some(obj) = removed else {
             return false;
         };
+        // The object is gone, and with it its NO_SHARE record (a process
+        // exit drops them by owner in `gem_mmap::release_pid`).
+        crate::scheme::gem_mmap::clear_no_share(handle);
         // Drop any KMS framebuffer built on this handle BEFORE `gem_free`
         // below hands its VRAM back. `create_fb` accepts a nouveau GEM object
         // as fb backing and caches its `phys_addr`/`h_memory`, but only the
@@ -14394,13 +14397,16 @@ impl NvidiaGpu {
                 };
                 let map_handle = if let Some(pa) = phys_addr {
                     crate::scheme::gem_mmap::register(handle, pa, req.info.size, owner_pid);
-                    if no_share {
-                        crate::scheme::gem_mmap::mark_no_share(handle);
-                    }
                     (handle as u64) << 12
                 } else {
                     0
                 };
+                // With or without a host address: a VRAM-only object is as
+                // private as a GART one, and the record lives apart from the
+                // mapping entry it used to be a flag on.
+                if no_share {
+                    crate::scheme::gem_mmap::mark_no_share(handle, owner_pid);
+                }
                 let used_domain = if sysmem {
                     nv::NOUVEAU_GEM_DOMAIN_GART
                 } else {
