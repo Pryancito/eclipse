@@ -152,8 +152,6 @@ struct MappedGem {
     /// the two atomics below, so an object that was used and then freed still
     /// counts.
     host_pa_given: bool,
-    /// `NOUVEAU_GEM_DOMAIN_NO_SHARE` at `GEM_NEW`: never exportable.
-    no_share: bool,
 }
 
 /// Outcome of [`dec_ref`], so `GEM_CLOSE` can tell "still shared, keep it" from
@@ -177,6 +175,13 @@ pub enum DecRef {
 
 lazy_static::lazy_static! {
     static ref MAPPINGS: Mutex<Vec<MappedGem>> = Mutex::new(Vec::new());
+    /// The objects created `NOUVEAU_GEM_DOMAIN_NO_SHARE`, as `(handle,
+    /// owner pid)`. Kept apart from [`MAPPINGS`], which only has the objects
+    /// with a host physical address: a VRAM-only object has no mapping entry
+    /// and is just as private. A record goes when its object goes
+    /// ([`clear_no_share`], [`release_pid`]); nothing else about the object
+    /// changes it, since a NO_SHARE object can never gain a second holder.
+    static ref NO_SHARE: Mutex<Vec<(u32, u64)>> = Mutex::new(Vec::new());
 }
 
 /// How many distinct GEM objects have had their host physical address handed
@@ -261,7 +266,6 @@ pub fn register(handle: u32, phys_addr: u64, size: u64, owner_pid: u64) {
             size,
             holders: alloc::vec![owner_pid],
             host_pa_given: false,
-            no_share: false,
         });
     }
 }
@@ -353,6 +357,8 @@ pub fn release_pid(pid: u64) -> Vec<(u32, bool)> {
     if pid == 0 {
         return out;
     }
+    // Its NO_SHARE objects go with it: each is its creator's alone.
+    NO_SHARE.lock().retain(|&(_, owner)| owner != pid);
     let mut table = MAPPINGS.lock();
     table.retain_mut(|e| {
         let before = e.holders.len();
@@ -365,6 +371,40 @@ pub fn release_pid(pid: u64) -> Vec<(u32, bool)> {
         !freed
     });
     out
+}
+
+/// Records `handle`, owned by `owner_pid`, as created with
+/// `NOUVEAU_GEM_DOMAIN_NO_SHARE`: a PRIME export of it is refused (Linux
+/// `nouveau_gem_prime_export`, EPERM). Whether or not the object has a host
+/// physical address: the record was a flag on the mapping entry, so a
+/// VRAM-only NO_SHARE object was never marked and its export said the handle
+/// did not exist.
+pub fn mark_no_share(handle: u32, owner_pid: u64) {
+    let mut set = NO_SHARE.lock();
+    if !set.iter().any(|&(h, _)| h == handle) {
+        set.push((handle, owner_pid));
+    }
+}
+
+/// Whether `handle` is a NO_SHARE object `pid` holds. The owner is the only
+/// holder such an object can have, and pid 0 (no current thread) sees every
+/// object, as [`holds`] does; another process's NO_SHARE object answers
+/// `false`, so the export path tells it nothing a `drm_gem_object_lookup`
+/// in its own file would not.
+pub fn no_share(handle: u32, pid: u64) -> bool {
+    NO_SHARE
+        .lock()
+        .iter()
+        .any(|&(h, owner)| h == handle && (pid == 0 || owner == pid))
+}
+
+/// Drops `handle`'s NO_SHARE record: the object is gone (`GEM_CLOSE` by its
+/// one holder). Returns whether there was one.
+pub fn clear_no_share(handle: u32) -> bool {
+    let mut set = NO_SHARE.lock();
+    let before = set.len();
+    set.retain(|&(h, _)| h != handle);
+    set.len() != before
 }
 
 /// Moves every reference `from` holds to `to`, across all objects: a zombie
@@ -385,6 +425,15 @@ pub fn rekey_pid(from: u64, to: u64) -> usize {
             }
         }
     }
+    // The NO_SHARE records are keyed by owner too, so the zombie's follow
+    // its references and the teardown of the old pid takes none of the new
+    // process's.
+    for (_, owner) in NO_SHARE.lock().iter_mut() {
+        if *owner == from {
+            *owner = to;
+            n += 1;
+        }
+    }
     n
 }
 
@@ -398,29 +447,6 @@ pub fn rekey_pid(from: u64, to: u64) -> usize {
 /// to free the buffer out from under the compositor -> its next GEM_INFO/VM_BIND
 /// on that handle faulted. Kept as a last-resort primitive; currently unused.
 #[allow(dead_code)]
-/// Marks `handle` as created with `NOUVEAU_GEM_DOMAIN_NO_SHARE`: a PRIME
-/// export of it is refused (Linux `nouveau_gem_prime_export`, EPERM). Returns
-/// whether the handle is tracked here.
-pub fn mark_no_share(handle: u32) -> bool {
-    let mut table = MAPPINGS.lock();
-    match table.iter_mut().find(|e| e.handle == handle) {
-        Some(e) => {
-            e.no_share = true;
-            true
-        }
-        None => false,
-    }
-}
-
-/// Whether `handle` was created `NO_SHARE` (false for a handle not tracked
-/// here: the export path answers that one as unknown first).
-pub fn no_share(handle: u32) -> bool {
-    MAPPINGS
-        .lock()
-        .iter()
-        .any(|e| e.handle == handle && e.no_share)
-}
-
 pub fn unregister(handle: u32) -> bool {
     let mut table = MAPPINGS.lock();
     if let Some(pos) = table.iter().position(|e| e.handle == handle) {
@@ -1107,6 +1133,41 @@ mod benches {
         for i in 0..256u32 {
             while !matches!(dec_ref(BASE + i, 0), DecRef::NotTracked | DecRef::Freed) {}
         }
+    }
+}
+
+#[cfg(test)]
+mod no_share_record_tests {
+    use super::*;
+
+    /// A NO_SHARE record lives apart from the mapping entry: a handle with
+    /// no mapping (VRAM-only) keeps it, only its owner (or the kernel) sees
+    /// it, a process exit drops the ones it owned, a rekey moves them, and
+    /// unregistering the mapping does not touch it.
+    #[test]
+    fn a_no_share_record_outlives_the_mapping_and_belongs_to_its_owner() {
+        const VRAM: u32 = 0xbffe_0001;
+        const GART: u32 = 0xbffe_0002;
+        const OWNER: u64 = 77_001;
+        const OTHER: u64 = 77_002;
+        const ZOMBIE: u64 = 77_003;
+        mark_no_share(VRAM, OWNER);
+        mark_no_share(VRAM, OTHER);
+        register(GART, 0x7000_0000, 4096, OWNER);
+        mark_no_share(GART, OWNER);
+        assert!(no_share(VRAM, OWNER), "no mapping needed");
+        assert!(no_share(VRAM, 0), "the kernel sees every object");
+        assert!(!no_share(VRAM, OTHER), "the first mark is the owner");
+        assert!(no_share(GART, OWNER));
+        assert!(unregister(GART));
+        assert!(no_share(GART, OWNER), "the mapping is not the object");
+        assert!(clear_no_share(GART));
+        assert!(!clear_no_share(GART), "once");
+        assert!(!no_share(GART, OWNER));
+        assert_eq!(rekey_pid(OWNER, ZOMBIE), 1, "the record moved");
+        assert!(no_share(VRAM, ZOMBIE) && !no_share(VRAM, OWNER));
+        release_pid(ZOMBIE);
+        assert!(!no_share(VRAM, 0), "gone with the process");
     }
 }
 

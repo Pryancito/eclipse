@@ -346,7 +346,7 @@ pub(crate) fn poke(pitch_px: u32, x: u32, y: u32, v: u32) {
 /// hardware KMS, and the only one is `NvidiaGpu` behind MMIO. So this is one,
 /// recording what it was asked to do and answering as a real driver would --
 /// including refusing a flip, which is the case the fallback exists for.
-use kernel_hal::drivers::scheme::drm::{DrmCaps, DrmConnector, DrmCrtc, DrmPlane};
+use kernel_hal::drivers::scheme::drm::{DrmCaps, DrmConnector, DrmCrtc, DrmPlane, GemAperture};
 use kernel_hal::drivers::scheme::DrmScheme;
 
 /// First framebuffer id the emulated GPU hands out. Deliberately nowhere near
@@ -435,6 +435,10 @@ pub(crate) struct EmuGpu {
     /// one under a client.
     nouveau_capable: bool,
     nouveau_ready: AtomicBool,
+    /// Driver-private GEM objects this GPU keeps in device memory, the way
+    /// nouveau's VRAM-only `GEM_NEW` ones never enter the core's table nor
+    /// `gem_mmap` (no host address): what `gem_aperture` answers `Vram` for.
+    vram_objects: Vec<u32>,
     calls: Mutex<GpuCalls>,
 }
 
@@ -458,8 +462,17 @@ impl EmuGpu {
             caps_max: (4096, 4096),
             nouveau_capable: false,
             nouveau_ready: AtomicBool::new(false),
+            vram_objects: Vec::new(),
             calls: Mutex::new(GpuCalls::default()),
         }
+    }
+
+    /// One more GEM object of this GPU that lives in device memory: no host
+    /// address, so no mapping anywhere the core looks, but an object all the
+    /// same.
+    pub(crate) fn with_vram_object(mut self, handle: u32) -> EmuGpu {
+        self.vram_objects.push(handle);
+        self
     }
 
     /// An NVIDIA-like GPU: it serves the nouveau uAPI, and `ready` says
@@ -558,6 +571,14 @@ impl DrmScheme for EmuGpu {
 
     fn nouveau_uapi_ready(&self) -> bool {
         self.nouveau_ready.load(Ordering::Relaxed)
+    }
+
+    fn gem_aperture(&self, handle_id: u32) -> GemAperture {
+        if self.vram_objects.contains(&handle_id) {
+            GemAperture::Vram
+        } else {
+            GemAperture::Unknown
+        }
     }
 
     fn get_caps(&self) -> DrmCaps {
