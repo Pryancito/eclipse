@@ -449,6 +449,11 @@ mod executor_gates {
         }
     }
 
+    /// El hueco `off` (en palabras) de la pila que empieza en `base`.
+    fn sp_at(base: usize, off: usize) -> usize {
+        base + off * 8
+    }
+
     fn with_parked_frame(sp: usize, base: usize) -> core::mem::ManuallyDrop<Executor> {
         StubExecutor {
             stack_base: base,
@@ -536,6 +541,113 @@ mod executor_gates {
             good + 8,
             base
         )));
+    }
+
+    // ── que significa para la puerta CADA contenido de la zona utilizable ──
+    //
+    // El envenenado de `Executor::new` es el 99,84 % de una preempcion a mitad
+    // de poll (`executor::stack_birth_benches` lleva el denominador), y la
+    // pregunta obvia es si se puede acotar a lo que un marco llega a tocar. Lo
+    // que decide eso no es el coste, es lo que la puerta de abajo contesta
+    // sobre las palabras que la cota dejaria SIN tocar, y son tres contenidos
+    // distintos con tres respuestas distintas.
+    //
+    // Estos tres tests son esas tres respuestas. El tercero es el que dice que
+    // acotar no sale gratis.
+
+    /// Cada hueco de 8 bytes de una pila envenenada se rechaza, y se rechaza
+    /// como **sospecha de escritura** (`looks_like_a_smash`), que es lo que
+    /// enciende el modo degradado del nucleo y lo que hace que el fallo se
+    /// INFORME en vez de pasar por un puntero raro.
+    ///
+    /// Esto es lo que el envenenado compra: la zona utilizable entera es, hueco
+    /// a hueco, un marco que la puerta rechaza y denuncia.
+    #[test]
+    fn every_slot_of_a_poisoned_stack_is_refused_and_reported_as_a_smash() {
+        let mut stack = HostStack::new();
+        stack.words.fill(crate::executor::STACK_POISON);
+        let base = stack.base();
+        let top = base + crate::STACK_SIZE;
+        // Los extremos y un hueco cualquiera de dentro: el veredicto no
+        // depende de donde caiga el marco, solo del contenido.
+        for off in [0usize, 1, 64, 1024, crate::STACK_SIZE / 8 - FRAME_SIZE / 8] {
+            let sp = base + off * 8;
+            // SAFETY: `[base, top)` es el buffer vivo de `stack`.
+            let verdict = unsafe { classify_parked_frame(sp, base, top) };
+            assert_eq!(
+                verdict,
+                FrameVerdict::RipNotInText {
+                    rip: crate::executor::STACK_POISON
+                },
+                "el hueco {} de una pila envenenada",
+                off
+            );
+            assert!(
+                verdict.looks_like_a_smash(),
+                "un marco envenenado tiene que denunciarse, no pasar por \
+                 puntero raro"
+            );
+        }
+    }
+
+    /// Y lo que habia ANTES del envenenado: paginas de camaradas recien
+    /// nacidas son BSS a cero, asi que `cr3 == 0` y la puerta dice
+    /// `DeadPageTable`. Tambien se rechaza y tambien se denuncia --- o sea que
+    /// para un bloque NUEVO el envenenado no cambia el veredicto, solo lo hace
+    /// legible (un `rip` distinguible en vez de `rip = 0`, que es lo que decia
+    /// el `[null-exec]`).
+    #[test]
+    fn every_slot_of_a_fresh_zeroed_stack_is_refused_as_a_dead_root() {
+        let stack = HostStack::new();
+        let base = stack.base();
+        let top = base + crate::STACK_SIZE;
+        for off in [0usize, 64, crate::STACK_SIZE / 8 - FRAME_SIZE / 8] {
+            // SAFETY: como arriba.
+            let verdict = unsafe { classify_parked_frame(sp_at(base, off), base, top) };
+            assert_eq!(verdict, FrameVerdict::DeadPageTable, "hueco {}", off);
+            assert!(verdict.looks_like_a_smash());
+        }
+    }
+
+    /// **El tercero, y por el que acotar el envenenado no sale gratis.**
+    ///
+    /// Un bloque del fondo de pilas no es BSS: trae lo que escribio su
+    /// ocupante anterior, y lo que escribio un ocupante son marcos de verdad,
+    /// con un `cr3` vivo y una `rip` dentro del texto del kernel. O sea
+    /// **exactamente el unico contenido que la puerta acepta**. Un `ret` ahi no
+    /// es un `rip` malo que se informa: es un salto a codigo del kernel con la
+    /// pila de otro.
+    ///
+    /// Asi que una cota solo es segura si cubre TODO lo que el ocupante
+    /// anterior escribio, y de eso el crate no lleva cuenta por bloque:
+    /// `stack_high_water()` es un solo global, se muestrea unicamente en
+    /// `sched_yield`, y una cadena que baje mas sin aparcar no lo mueve. Es un
+    /// diagnostico, no una cota. Acotar el envenenado pide primero una
+    /// profundidad apuntada POR BLOQUE donde el bloque se retira.
+    #[test]
+    fn a_recycled_frame_is_the_one_content_the_gate_accepts() {
+        let mut stack = HostStack::new();
+        stack.words.fill(crate::executor::STACK_POISON);
+        let base = stack.base();
+        let top = base + crate::STACK_SIZE;
+        // El ocupante anterior bajo hasta 64 KiB del tope y aparco un marco
+        // ahi; el envenenado acotado a 4 KiB no lo tocaria.
+        let deep = crate::STACK_SIZE / 8 - 64 * 1024 / 8;
+        let sp = stack.park_frame(deep, 0x1000, KERNEL_TEXT.start as usize);
+        // SAFETY: como arriba.
+        assert_eq!(
+            unsafe { classify_parked_frame(sp, base, top) },
+            FrameVerdict::Resumable,
+            "el marco que una cota corta dejaria intacto es el que la puerta \
+             deja reanudar"
+        );
+        // Y el envenenado entero SI lo tapa: eso es lo que hace hoy.
+        stack.words.fill(crate::executor::STACK_POISON);
+        // SAFETY: como arriba.
+        assert!(
+            unsafe { classify_parked_frame(sp, base, top) }.looks_like_a_smash(),
+            "re-envenenar la zona entera convierte el marco viejo en denuncia"
+        );
     }
 
     /// Cuantas palabras puede leer el informe de la negativa: nueve, y nunca

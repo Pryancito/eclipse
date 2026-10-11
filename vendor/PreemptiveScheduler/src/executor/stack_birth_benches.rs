@@ -15,32 +15,106 @@
 //!    las trae puestas.
 //! 3. Si no hay guardas duras, escribe el canario blando: [`GUARD_WORDS`]
 //!    escrituras volatiles, una por palabra de los 512 KiB de la guarda baja.
-//! 4. **Envenena la zona utilizable entera, siempre**: [`STACK_SIZE`] / 8
-//!    escrituras volatiles de `0xDEADBEEF_DEADBEEF`, venga el bloque del fondo
-//!    o del monton.
+//! 4. **Envenena la zona utilizable entera, siempre**: [`STACK_SIZE`] bytes de
+//!    `0xDEADBEEF_DEADBEEF`, venga el bloque del fondo o del monton.
 //!
 //! El cuarto paso es el que estas filas miden, porque es el unico que no tiene
 //! ninguna salida rapida y el unico cuyo tamaño es la pila completa. Y la
-//! forma en que esta escrito importa tanto como el tamaño: son
+//! forma en que esta escrito importaba tanto como el tamaño: era
 //! `write_volatile` en un bucle, y una escritura volatil tiene que ocurrir
-//! exactamente como esta escrita, asi que el compilador **no puede** juntarlas
-//! ni convertirlas en un `memset`. Lo que corre es una tienda de 8 bytes por
-//! iteracion, 262.144 veces, sobre 2 MiB que no caben en ninguna cache de
-//! datos de un nucleo.
+//! exactamente como esta escrita, asi que el compilador **no podia** juntarlas
+//! ni vectorizarlas. Lo que corria era una tienda de 8 bytes por iteracion,
+//! 262.144 veces, sobre 2 MiB que no caben en ninguna cache de datos de un
+//! nucleo. **Esta tanda lo cambia por un `fill` con una barrera detras**, que
+//! escribe los mismos bytes dejando elegir el ancho de la tienda.
 //!
 //! De ahi el trio de filas:
 //!
-//! - `poison_a_whole_stack_one_volatile_word_at_a_time` es el bucle tal como
-//!   esta.
+//! - `poison_a_whole_stack_one_volatile_word_at_a_time` es el bucle **tal como
+//!   estaba**.
 //! - `poison_a_whole_stack_with_a_fill_and_a_fence` escribe exactamente los
 //!   mismos bytes en la misma region, pero sin volatil y con una barrera de
-//!   compilador detras, que es lo que el `volatile` esta ahi para conseguir
+//!   compilador detras, que es lo que el `volatile` estaba ahi para conseguir
 //!   (que las escrituras no se eliminen por muertas). Lo que las separa es el
-//!   ancho de la tienda, no el contenido.
-//! - `poison_only_the_deepest_sixty_four_kilobytes` es la cota: lo que
-//!   costaria envenenar solo la parte de la pila que un marco llega a tocar.
-//!   El crate ya sabe cuanto es eso — `stack_high_water()` lo apunta — asi que
-//!   la fila esta aqui para poder leer la cuenta, no para proponerla.
+//!   ancho de la tienda, no el contenido, y eso lo piña el test
+//!   `the_fill_and_the_volatile_loop_write_the_same_bytes`. **Es lo que
+//!   `Executor::new` hace desde esta tanda.**
+//! - `poison_only_the_deepest_sixty_four_kilobytes` y sus cuatro hermanas de
+//!   la curva son la cota: lo que costaria envenenar solo la parte de la pila
+//!   que un marco llega a tocar.
+//!
+//! # El hallazgo: el `volatile` costaba una cuarta parte de la preempcion
+//!
+//! Medido en este contenedor, mediana de cuatro vueltas:
+//!
+//! | fila | coste |
+//! | --- | --- |
+//! | `poison_a_whole_stack_one_volatile_word_at_a_time` | **105.100 ns** |
+//! | `poison_a_whole_stack_with_a_fill_and_a_fence` | **76.100 ns** |
+//!
+//! Los mismos bytes en la misma region, **29.000 ns menos**: algo mas de una
+//! cuarta parte de todo lo que cuesta una preempcion a mitad de poll, por
+//! dejar que el compilador elija el ancho de la tienda. El `volatile` nunca
+//! iba de orden ni de que otra CPU viera estas escrituras — un bloque llega
+//! aqui despues de que el periodo de gracia lo haya retirado, asi que nadie
+//! mas puede tocarlo —, iba de que las escrituras no se tiraran por muertas, y
+//! eso lo dice la barrera de compilador una vez en vez de 262.144 veces.
+//!
+//! # La curva: acotar vale lo que su proporcion, ni mas ni menos
+//!
+//! Las filas de cota, todas sobre el mismo buffer de 2 MiB, mediana de cuatro
+//! vueltas:
+//!
+//! | tamaño | palabras | coste | por palabra |
+//! | --- | --- | --- | --- |
+//! | 4 KiB | 512 | 190 ns | 0,37 ns |
+//! | 32 KiB | 4.096 | 1.619 ns | 0,40 ns |
+//! | 64 KiB | 8.192 | 3.160 ns | 0,39 ns |
+//! | 256 KiB | 32.768 | 12.700 ns | 0,39 ns |
+//! | 1 MiB | 131.072 | 49.300 ns | 0,38 ns |
+//! | 2 MiB | 262.144 | 105.100 ns | 0,40 ns |
+//!
+//! **No hay rodilla.** El coste por palabra es el mismo, 0,37-0,40 ns, a lo
+//! largo de un factor 512 de tamaño: ni la L1, ni la L2, ni el salto a RAM se
+//! ven. Asi que una cota vale exactamente su proporcion y **el tamaño que se
+//! elija es una cuestion de seguridad, no de rendimiento**: no hay un numero
+//! magico que compre mas de lo que mide.
+//!
+//! Lo que si cambia con el tamaño es **cuanto costaba el `volatile`**: a 2 MiB
+//! era 1,38x y a 64 KiB es 1,97x (`fill_only_the_deepest_sixty_four_kilobytes`,
+//! 1.601 ns frente a 3.160). A 2 MiB las dos formas chocan con el ancho de
+//! banda a RAM y el ancho de la tienda importa menos; cuanto mas cabe la region
+//! en cache, mas se nota. O sea que si el envenenado se acotara alguna vez,
+//! haberle quitado el `volatile` valdria **mas** alli que aqui.
+//!
+//! # Por que acotarlo NO sale gratis
+//!
+//! La cuenta invita a acotar: 2 MiB -> 64 KiB serian 105.100 ns -> 1.601 ns con
+//! el `fill`, 66 veces menos. Lo que lo impide no es el coste, es lo que la
+//! puerta `classify_parked_frame` contesta sobre las palabras que la cota
+//! dejaria sin tocar, y son tres contenidos con tres respuestas (los tres
+//! tests estan en `runtime::probe_tests::executor_gates`):
+//!
+//! - **envenenado**: `RipNotInText`, y `looks_like_a_smash()`. Rechazado y
+//!   denunciado, hueco a hueco.
+//! - **cero** (paginas de camaradas recien nacidas): `DeadPageTable`. Tambien
+//!   rechazado y denunciado; para un bloque NUEVO el envenenado no cambia el
+//!   veredicto, solo lo hace legible.
+//! - **lo que dejo el ocupante anterior** (un bloque del fondo de pilas):
+//!   marcos de verdad, con un `cr3` vivo y una `rip` dentro del texto del
+//!   kernel. O sea **el unico contenido que la puerta acepta**. Un `ret` ahi no
+//!   es un `rip` malo que se informa: es un salto a codigo del kernel con la
+//!   pila de otro.
+//!
+//! Asi que una cota solo es segura si cubre todo lo que el ocupante anterior
+//! escribio, y de eso el crate **no lleva cuenta por bloque**:
+//! `stack_high_water()` es un solo global, se muestrea unicamente en
+//! `sched_yield`, y una cadena que baje mas sin aparcar no lo mueve. Es un
+//! diagnostico, no una cota. Dicho en la forma de las tres tandas anteriores:
+//! el re-envenenado de un bloque del fondo es otro recorrido de capacidad en
+//! vez de ocupacion, **pero esta vez no hay contador que lo acote, y ponerlo
+//! es lo que habria que construir primero** (una profundidad apuntada por
+//! bloque donde el bloque se retira).
 //!
 //! # Lo que estas filas NO dicen
 //!
@@ -70,18 +144,19 @@
 //! | --- | --- | --- |
 //! | pedir el bloque al fondo | `take_a_stack_from_a_pool_holding_one_in_the_last_slot` | 50 ns |
 //! | publicarlo en los dos registros | `publish_a_stack_into_registries_holding_four` | 55 ns |
-//! | **envenenar los 2 MiB** | `poison_a_whole_stack_one_volatile_word_at_a_time` | **94.844 ns** |
+//! | **envenenar los 2 MiB** | `poison_a_whole_stack_with_a_fill_and_a_fence` | **76.100 ns** |
 //! | tres barridos de cuarentena | `sweep_the_retired_table_with_nothing_in_it` x3 | 26 ns |
 //! | devolver el bloque al fondo | `give_a_stack_back_to_an_empty_pool` | 15 ns |
 //!
-//! Todo lo que no es el envenenado suma **unos 150 ns**: el **0,16 %**. Dicho
+//! Todo lo que no es el envenenado suma **unos 150 ns**: el **0,2 %**. Dicho
 //! al derecho: **una preempcion a mitad de poll es el envenenado y nada mas**.
 //! Las tres tandas anteriores encontraron barridos de tabla fija de verdad
 //! (512 huecos en cada malloc, 256 en cada punto de planificacion, 128 RMW en
 //! cada `Executor::new`) y los tres estaban bien arreglados, pero los tres
-//! juntos caben en ese 0,16 %. Y `poison_only_the_deepest_sixty_four_kilobytes`
+//! juntos caben en ese 0,2 %. Y `poison_only_the_deepest_sixty_four_kilobytes`
 //! dice lo que costaria una preempcion si el envenenado se acotara a lo que un
-//! marco llega a tocar: **unos 3 us en vez de 95**.
+//! marco llega a tocar: **unos 3 us en vez de 105** --- por que eso no sale
+//! gratis esta arriba.
 //!
 //! Lo unico que el nucleo paga aqui y el anfitrion no es el paso 2, y **en una
 //! preempcion con el fondo caliente el paso 2 no corre**: el bloque trae las
@@ -104,16 +179,11 @@
 //! cargo bench -p executor -- executor::stack_birth_benches
 //! ```
 
-use super::{GUARD_SIZE, GUARD_WORDS, STACK_CANARY, STACK_SIZE};
+use super::{
+    poison_usable_region, GUARD_SIZE, GUARD_WORDS, STACK_CANARY, STACK_POISON, STACK_SIZE,
+};
 use alloc::vec;
-use core::sync::atomic::{compiler_fence, Ordering};
 use test::{black_box, Bencher};
-
-/// El valor que `Executor::new` escribe por la zona utilizable. Copiado y no
-/// importado porque alla es un `const` dentro del bloque `unsafe`: si alli
-/// cambia y aqui no, lo que falla es la igualdad que comprueba
-/// `the_fill_and_the_volatile_loop_write_the_same_bytes`.
-const STACK_POISON: u64 = 0xDEAD_BEEF_DEAD_BEEF;
 
 /// Un bloque alineado a 8 del tamaño que se le pida, en palabras.
 fn words(n: usize) -> vec::Vec<u64> {
@@ -130,12 +200,27 @@ fn poison_volatile(p: *mut u64, n: usize) {
     }
 }
 
-/// Los mismos bytes en la misma region, sin volatil y con la barrera detras.
+/// Una fila de la curva: las `bytes` ultimas palabras de un buffer de
+/// `STACK_SIZE`, con el bucle volatil tal como esta en `Executor::new`.
+fn poison_deepest(b: &mut Bencher, bytes: usize) {
+    let total = STACK_SIZE / core::mem::size_of::<u64>();
+    let n = bytes / core::mem::size_of::<u64>();
+    let mut buf = words(total);
+    let from = total - n;
+    b.iter(|| {
+        poison_volatile(
+            black_box(unsafe { buf.as_mut_ptr().add(from) }),
+            black_box(n),
+        );
+        black_box(buf[from])
+    });
+}
+
+/// Los mismos bytes en la misma region, sin volatil y con la barrera detras:
+/// [`poison_usable_region`], que es lo que `Executor::new` llama.
 fn poison_filled(buf: &mut [u64]) {
-    buf.fill(STACK_POISON);
-    // Lo que el `volatile` consigue de verdad: que nadie decida que estas
-    // escrituras estan muertas porque nada en este hilo las vuelve a leer.
-    compiler_fence(Ordering::SeqCst);
+    // SAFETY: `buf` es un trozo vivo y exclusivo del llamante, alineado a 8.
+    unsafe { poison_usable_region(buf.as_mut_ptr() as usize, buf.len() * 8) };
 }
 
 // ── el envenenado de la zona utilizable, que se paga siempre ───────────────
@@ -186,6 +271,61 @@ fn poison_only_the_deepest_sixty_four_kilobytes(b: &mut Bencher) {
     });
 }
 
+// ── la curva: que se gana acotando el envenenado ──────────────────────
+//
+// `poison_only_the_deepest_sixty_four_kilobytes` da UN punto de la curva, y un
+// punto no dice si acotar paga. Estas filas dan la forma: si el coste es lineal
+// en el tamaño sin rodilla, cualquier cota vale lo que su proporcion y el
+// numero que se elija es una cuestion de seguridad y no de rendimiento; si hay
+// una rodilla donde la region deja de caber en la cache, una cota por debajo
+// vale MAS que su proporcion.
+//
+// Todas escriben en el mismo buffer de 2 MiB, sus `n` ultimas palabras: la pila
+// crece hacia abajo desde el tope, asi que la zona que un marco toca es el
+// final del bloque, y darle a cada fila un buffer de su tamaño cambiaria
+// tambien la huella de cache.
+
+/// Cuatro KiB: una pagina, la cota mas agresiva que tiene sentido.
+#[bench]
+fn poison_only_the_deepest_four_kilobytes(b: &mut Bencher) {
+    poison_deepest(b, 4 * 1024);
+}
+
+/// Treinta y dos KiB.
+#[bench]
+fn poison_only_the_deepest_thirty_two_kilobytes(b: &mut Bencher) {
+    poison_deepest(b, 32 * 1024);
+}
+
+/// Doscientos cincuenta y seis KiB.
+#[bench]
+fn poison_only_the_deepest_two_hundred_fifty_six_kilobytes(b: &mut Bencher) {
+    poison_deepest(b, 256 * 1024);
+}
+
+/// Un MiB: la mitad de la zona utilizable.
+#[bench]
+fn poison_only_the_deepest_one_mebibyte(b: &mut Bencher) {
+    poison_deepest(b, 1024 * 1024);
+}
+
+/// Los mismos 64 KiB de la cota, pero con el `fill` en vez del bucle volatil.
+/// Leida contra `poison_only_the_deepest_sixty_four_kilobytes` dice si lo que
+/// cuesta el `volatile` es proporcional al tamaño o un peaje fijo: en la
+/// pareja de 2 MiB son ~20 us de diferencia, asi que si aqui la diferencia es
+/// ~1/32 de eso, el `volatile` se paga por palabra y no por llamada.
+#[bench]
+fn fill_only_the_deepest_sixty_four_kilobytes(b: &mut Bencher) {
+    let total = STACK_SIZE / core::mem::size_of::<u64>();
+    let n = 64 * 1024 / core::mem::size_of::<u64>();
+    let mut buf = words(total);
+    let from = total - n;
+    b.iter(|| {
+        poison_filled(black_box(&mut buf[from..]));
+        black_box(buf[from])
+    });
+}
+
 // ── el canario blando, que solo se paga sin guardas duras ──────────────────
 
 /// El paso 3: [`GUARD_WORDS`] escrituras volatiles por los 512 KiB de la
@@ -214,6 +354,12 @@ mod tests {
     /// Las dos formas de envenenar escriben los mismos bytes. Es lo que
     /// convierte la comparacion de las dos filas en una comparacion de coste y
     /// no de trabajo: si una escribiera menos, la cifra mas baja no diria nada.
+    ///
+    /// Y es ademas la unica prueba que tiene el camino de produccion:
+    /// `poison_usable_region` la llama `Executor::new`, que en el anfitrion no
+    /// corre (lee `cr3`), asi que lo que se puede comprobar aqui es que la
+    /// funcion escribe lo mismo que escribia el bucle volatil, palabra por
+    /// palabra y en toda la region.
     #[test]
     fn the_fill_and_the_volatile_loop_write_the_same_bytes() {
         const N: usize = 4096;
@@ -228,9 +374,37 @@ mod tests {
         );
     }
 
-    /// El valor copiado es el que `Executor::new` escribe. Una fila que midiera
-    /// el coste de escribir OTRO patron seguiria siendo valida como coste, pero
-    /// la prueba de igualdad de arriba dejaria de hablar del kernel.
+    /// Y la region entera, los dos extremos incluidos: una mutacion que
+    /// escriba una palabra de menos por cualquiera de las dos puntas deja un
+    /// hueco que la puerta aceptaria.
+    #[test]
+    fn the_poison_reaches_both_ends_of_the_region_and_stops_there() {
+        const N: usize = 4096;
+        // Dos palabras de centinela a cada lado, que no se deben tocar.
+        let mut buf = words(N + 4);
+        let region = buf[2..N + 2].as_mut_ptr() as usize;
+        // SAFETY: `region` son N palabras vivas y exclusivas de este test.
+        unsafe { poison_usable_region(region, N * 8) };
+        assert_eq!(buf[2], STACK_POISON, "la primera palabra");
+        assert_eq!(buf[N + 1], STACK_POISON, "la ultima palabra");
+        assert!(
+            buf[2..N + 2].iter().all(|w| *w == STACK_POISON),
+            "quedo un hueco sin envenenar dentro de la region"
+        );
+        assert_eq!(
+            (buf[0], buf[1], buf[N + 2], buf[N + 3]),
+            (0, 0, 0, 0),
+            "el envenenado se salio de su region"
+        );
+    }
+
+    /// El patron sigue siendo uno que ninguna direccion de retorno del kernel
+    /// puede ser. Ya no hace falta vigilar una copia --- las filas importan
+    /// `STACK_POISON` de `executor` ---, pero si que el valor siga sirviendo
+    /// para lo que esta: `classify_parked_frame` lo rechaza porque no cae en el
+    /// texto del kernel, y lo rechaza como SOSPECHA DE ESCRITURA, no como
+    /// puntero raro (ver `a_recycled_frame_is_the_one_content_the_gate_accepts`
+    /// en `runtime::probe_tests`).
     #[test]
     fn the_poison_here_is_the_poison_the_kernel_writes() {
         assert_eq!(

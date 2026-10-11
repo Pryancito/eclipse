@@ -2724,13 +2724,19 @@ pub fn alloc_buffer(size: usize) -> Option<GemHandle> {
 /// `drm_gem_prime_handle_to_dmabuf` looks the handle up in the file first
 /// (`drm_gem_object_lookup`: ENOENT), then asks the driver to export it, and
 /// nouveau refuses a `NO_SHARE` object there (`nouveau_gem_prime_export`:
-/// EPERM).
+/// EPERM). The third refusal is this kernel's own: a dma-buf here is built
+/// over a host physical address, and a VRAM-only object has none (Linux
+/// would export it), so it keeps the EINVAL every export used to get rather
+/// than claim the handle does not exist.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ExportRefusal {
     /// Not a handle of this file: nobody created it, or another process did.
     NotFound,
     /// Created `NOUVEAU_GEM_DOMAIN_NO_SHARE`.
     NotShareable,
+    /// A GEM object of the file with no host physical address (device
+    /// memory): nothing here can build a dma-buf over it.
+    NoHostAddress,
 }
 
 impl From<ExportRefusal> for crate::error::LxError {
@@ -2738,6 +2744,7 @@ impl From<ExportRefusal> for crate::error::LxError {
         match r {
             ExportRefusal::NotFound => crate::error::LxError::ENOENT,
             ExportRefusal::NotShareable => crate::error::LxError::EPERM,
+            ExportRefusal::NoHostAddress => crate::error::LxError::EINVAL,
         }
     }
 }
@@ -2776,12 +2783,25 @@ pub fn export_handle(
     // Same ownership rule on the driver-private side: `lookup_for` is
     // `lookup` plus `holds(handle, pid)`, which is the nouveau table's own
     // record of who took a reference.
-    let (phys_addr, size) = zcore_drivers::scheme::gem_mmap::lookup_for(handle_id, pid)
-        .ok_or(ExportRefusal::NotFound)?;
-    // The object is the file's; now the driver's say (`nouveau_gem_prime_export`).
-    if zcore_drivers::scheme::gem_mmap::no_share(handle_id) {
+    // The object is the file's; now the driver's say
+    // (`nouveau_gem_prime_export`). Asked before the mapping, because the
+    // NO_SHARE record is kept apart from it: a VRAM-only object has no
+    // mapping entry, and its export said ENOENT where Linux says EPERM.
+    if zcore_drivers::scheme::gem_mmap::no_share(handle_id, pid) {
         return Err(ExportRefusal::NotShareable);
     }
+    let Some((phys_addr, size)) = zcore_drivers::scheme::gem_mmap::lookup_for(handle_id, pid)
+    else {
+        // No mapping is not "no object": `lookup_for` only knows the objects
+        // with a host address. The driver tells a VRAM object (exists, no
+        // host address: a refusal of its own) from no object at all
+        // (ENOENT). It answers by handle, not by file, which is what every
+        // present-path diagnostic on an unresolved handle already gets.
+        return Err(match unresolved_backing_reason(handle_id) {
+            UnresolvedBacking::Vram => ExportRefusal::NoHostAddress,
+            UnresolvedBacking::Unknown => ExportRefusal::NotFound,
+        });
+    };
     // The dma-buf hands this range out through its own VMO, which never
     // reaches `DrmDev::get_vmo`, so the export is where this object's host
     // address is given away. See `gem_mmap::note_host_pa_handed_out`.

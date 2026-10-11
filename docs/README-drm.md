@@ -111,7 +111,7 @@ Leyenda: ✅ implementado · 🟡 parcial / no-op deliberado · ❌ no implement
 | `DRM_IOCTL_MODE_MAP_DUMB` | ✅ | *offset* = `handle << 12`; `mmap` mapea el VMO físico |
 | `DRM_IOCTL_MODE_DESTROY_DUMB` | ✅ | |
 | `DRM_IOCTL_GEM_CLOSE` | ✅ | |
-| `DRM_IOCTL_PRIME_HANDLE_TO_FD` / `FD_TO_HANDLE` | ✅ | dma-buf real (fd de proceso); despachado en la capa de syscalls porque necesita la tabla de fds. El export busca el handle en el fichero primero (`ENOENT` si nadie lo creó o es de otro proceso, como `drm_gem_object_lookup`) y rechaza con `EPERM` un objeto nouveau creado `NO_SHARE` (`nouveau_gem_prime_export`) |
+| `DRM_IOCTL_PRIME_HANDLE_TO_FD` / `FD_TO_HANDLE` | ✅ | dma-buf real (fd de proceso); despachado en la capa de syscalls porque necesita la tabla de fds. El export busca el handle en el fichero primero (`ENOENT` si nadie lo creó o es de otro proceso, como `drm_gem_object_lookup`) y rechaza con `EPERM` un objeto nouveau creado `NO_SHARE` (`nouveau_gem_prime_export`), tenga o no dirección de host. **Un objeto solo VRAM existe pero no se puede exportar desde aquí** (el dma-buf se monta sobre una dirección física de host y no tiene; Linux sí lo exportaría): `EINVAL`, lo que daba todo export antes, y no `ENOENT`; el driver (`gem_aperture`) es quien distingue «existe sin dirección» de «no existe» |
 | `DRM_IOCTL_GEM_FLINK` / `GEM_OPEN` | ❌ | interfaz legacy insegura; los clientes nuevos deben usar PRIME (igual que recomienda `drm-uapi.rst`) |
 
 ### Framebuffers
