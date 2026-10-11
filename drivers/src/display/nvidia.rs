@@ -8089,7 +8089,7 @@ impl DrmScheme for NvidiaGpu {
         }
     }
 
-    fn gem_aperture(&self, handle_id: u32) -> GemAperture {
+    fn gem_aperture(&self, handle_id: u32, pid: u64) -> GemAperture {
         // `phys_addr` is the one that decides, not `domain`: GEM_NEW only
         // resolves a host PA for a sysmem/GART object, and that PA is exactly
         // what the CPU present path needs. A VRAM object carries a
@@ -8097,15 +8097,18 @@ impl DrmScheme for NvidiaGpu {
         // scan out and the CPU cannot touch.
         // The two locks are taken one after the other and never nested, the
         // way `create_fb` does it: `imported_handle` takes its own.
+        // `gem_usable_by` is the same gate GEM_INFO and VM_BIND put on a
+        // handle: an object of another process is no object to this one.
         let found = {
             let gem = self.nouveau_gem.lock();
             gem.iter()
                 .find(|o| o.handle == handle_id)
-                .map(|o| o.phys_addr.is_some())
+                .map(|o| (gem_usable_by(o, pid), o.phys_addr.is_some()))
         };
         match found {
-            Some(true) => GemAperture::Sysmem,
-            Some(false) => GemAperture::Vram,
+            Some((false, _)) => GemAperture::Unknown,
+            Some((true, true)) => GemAperture::Sysmem,
+            Some((true, false)) => GemAperture::Vram,
             // Not a nouveau GEM. A PRIME import always has a host PA.
             None if self.imported_handle(handle_id).is_some() => GemAperture::Sysmem,
             None => GemAperture::Unknown,
