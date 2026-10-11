@@ -686,12 +686,10 @@ impl Syscall<'_> {
                     let raced = async {
                         match select(futex_wait, interrupted).await {
                             Either::Left((res, _)) => res,
-                            Either::Right(((), mut futex_wait)) => {
-                                match poll!(&mut futex_wait) {
-                                    Poll::Ready(res) => res,
-                                    Poll::Pending => Err(ZxError::CANCELED),
-                                }
-                            }
+                            Either::Right(((), mut futex_wait)) => match poll!(&mut futex_wait) {
+                                Poll::Ready(res) => res,
+                                Poll::Pending => Err(ZxError::CANCELED),
+                            },
                         }
                     };
                     pin_mut!(raced);

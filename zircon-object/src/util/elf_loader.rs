@@ -2239,7 +2239,10 @@ mod tests {
         let elf = parse_checked_elf(&bytes).unwrap();
         let vmar = VmAddressRegion::new_root();
         let seg = vmar.load_from_elf_image(&elf, &image).unwrap();
-        assert!(seg.is_borrower(), "RX LOAD of busybox must borrow the image");
+        assert!(
+            seg.is_borrower(),
+            "RX LOAD of busybox must borrow the image"
+        );
 
         // Through the segment VMO (offset = VA - 0x400000).
         let mut got = [0u8; 8];

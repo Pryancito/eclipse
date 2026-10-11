@@ -769,7 +769,10 @@ mod shm_tests {
         assert!(shm_lookup(id).is_some(), "client still holds it");
         seg.lock().detach(1);
         shm_destroy_if_orphaned(id, &seg);
-        assert!(shm_lookup(id).is_none(), "last detach destroys a SHM_DEST segment");
+        assert!(
+            shm_lookup(id).is_none(),
+            "last detach destroys a SHM_DEST segment"
+        );
         clear_ids();
     }
 
