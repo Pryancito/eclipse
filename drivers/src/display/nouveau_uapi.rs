@@ -879,6 +879,7 @@ pub(super) const fn pte_kind_is_supported(kind: u32) -> bool {
 }
 
 // --- DRM_NOUVEAU_SYNC_* (drm_nouveau_sync.flags) ---
+pub(super) const SYNC_SYNCOBJ: u32 = 0x0;
 pub(super) const SYNC_TIMELINE_SYNCOBJ: u32 = 0x1;
 pub(super) const SYNC_TYPE_MASK: u32 = 0xf;
 

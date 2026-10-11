@@ -3933,6 +3933,63 @@ fn user_slice_ok<T>(ptr: u64, count: u32) -> bool {
     }
 }
 
+/// The sync lists of an EXEC or a VM_BIND, checked the way `nouveau_job_submit`
+/// does before anything is waited for, submitted, bound or signaled: the
+/// waits first (`nouveau_job_add_deps`: a type that is neither SYNCOBJ nor
+/// TIMELINE_SYNCOBJ is EOPNOTSUPP, then the handle must be the caller's,
+/// ENOENT), then the sigs (`nouveau_job_fence_attach_prepare`: an unknown
+/// type is EINVAL, then the handle, ENOENT). Only the type nibble of `flags`
+/// is the type; the other bits are not looked at, as in Linux.
+fn nouveau_syncs_ok(
+    what: &str,
+    waits: &[super::nouveau_uapi::DrmNouveauSync],
+    sigs: &[super::nouveau_uapi::DrmNouveauSync],
+    owner_pid: u64,
+) -> Result<(), i32> {
+    use super::nouveau_uapi as nv;
+    let known = |s: &nv::DrmNouveauSync| {
+        let stype = s.flags & nv::SYNC_TYPE_MASK;
+        stype == nv::SYNC_SYNCOBJ || stype == nv::SYNC_TIMELINE_SYNCOBJ
+    };
+    // Linux walks the waits and then the sigs, each entry whole (its type,
+    // then its handle), so the first bad entry decides the errno. The
+    // handle half is ONE take of the table lock for the whole list (see
+    // `syncobj::first_unusable_by`; NVK batches up to 256 waits and 256
+    // signals into one EXEC): the first unusable handle in that order is
+    // the entry the walk stops at, since every entry before it holds a
+    // usable one.
+    let first_bad = crate::scheme::syncobj::first_unusable_by(
+        owner_pid,
+        waits.iter().chain(sigs.iter()).map(|s| s.handle),
+    );
+    for (list, unknown_type, side) in [(waits, nv::EOPNOTSUPP, "wait"), (sigs, nv::EINVAL, "sig")] {
+        for s in list {
+            if !known(s) {
+                crate::klog_warn!(
+                    "[nouveau-uapi] {}: {} syncobj handle={} has an unknown sync type (flags={:#x}) -- nothing done pid={}",
+                    what,
+                    side,
+                    s.handle,
+                    s.flags,
+                    owner_pid
+                );
+                return Err(unknown_type);
+            }
+            if first_bad == Some(s.handle) {
+                crate::klog_warn!(
+                    "[nouveau-uapi] {}: {} syncobj handle={} is unknown or not this process's -- nothing done (ENOENT) pid={}",
+                    what,
+                    side,
+                    s.handle,
+                    owner_pid
+                );
+                return Err(nv::ENOENT);
+            }
+        }
+    }
+    Ok(())
+}
+
 /// A CPU wait `syncobj::wait` reported satisfied, but only because a fence
 /// behind it TIMED OUT: the release the client waited for never happened.
 /// EXEC's contract for a wait that never arrives is EIO (NVK: device lost),
@@ -13031,19 +13088,7 @@ impl NvidiaGpu {
                 // looks the whole list up in the caller's file,
                 // `nouveau_job_fence_attach_prepare` / `nouveau_job_add_deps`,
                 // before the job runs; another process's handle is ENOENT).
-                // ONE take of the syncobj table lock for the whole list, not
-                // one per handle: see `syncobj::first_unusable_by`.
-                if let Some(bad) = crate::scheme::syncobj::first_unusable_by(
-                    owner_pid,
-                    sigs.iter().chain(waits.iter()).map(|s| s.handle),
-                ) {
-                    crate::klog_warn!(
-                        "[nouveau-uapi] VM_BIND: syncobj handle={} is unknown or not this process's -- nothing bound (ENOENT) pid={}",
-                        bad,
-                        owner_pid
-                    );
-                    return Err(nv::ENOENT);
-                }
+                nouveau_syncs_ok("VM_BIND", waits, sigs, owner_pid)?;
                 // Every op is checked BEFORE any is applied, and before the
                 // waits: `nouveau_uvmm_bind_job_submit` runs
                 // `bind_validate_op` over the whole list when the job is
@@ -13235,21 +13280,7 @@ impl NvidiaGpu {
                     } else {
                         &[]
                     };
-                    // ONE take of the syncobj table lock for the whole list,
-                    // not one per handle: see
-                    // `syncobj::first_unusable_by`. NVK batches up to 256
-                    // waits and 256 signals into one EXEC.
-                    if let Some(bad) = crate::scheme::syncobj::first_unusable_by(
-                        owner_pid,
-                        sigs.iter().chain(waits.iter()).map(|s| s.handle),
-                    ) {
-                        crate::klog_warn!(
-                            "[nouveau-uapi] EXEC: syncobj handle={} is unknown or not this process's -- nothing submitted (ENOENT) pid={}",
-                            bad,
-                            owner_pid
-                        );
-                        return Err(nv::ENOENT);
-                    }
+                    nouveau_syncs_ok("EXEC", waits, sigs, owner_pid)?;
                 }
                 if req.push_count == 0 {
                     // An EXEC with no pushes is nouveau's CHANNEL HEALTH
