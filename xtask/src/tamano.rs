@@ -67,7 +67,6 @@ const PASADOS: &[(&str, usize)] = &[
         "linux-object/src/fs/devfs/drm_scheme/kms_scanout_tests.rs",
         4750,
     ),
-    ("linux-syscall/src/task.rs", 4250),
     ("nvidia-rm-sys/src/os_boundary.rs", 4250),
 ];
 
