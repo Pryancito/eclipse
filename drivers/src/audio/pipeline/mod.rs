@@ -34,5 +34,9 @@
 pub mod host;
 pub mod mixer;
 mod proto;
+/// The generated table's own invariants. Its own file because the generator
+/// prints the whole of `proto.rs`.
+#[cfg(test)]
+mod proto_tests;
 pub mod src;
 pub mod volume;

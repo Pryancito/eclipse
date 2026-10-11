@@ -257,3 +257,297 @@ extern "C" fn drivers_wake_net_rx_waiters() {
 
 #[no_mangle]
 extern "C" fn drivers_net_drain() {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    extern "C" {
+        fn drivers_dma_alloc(pages: usize) -> usize;
+        fn drivers_dma_dealloc(paddr: usize, pages: usize) -> i32;
+        fn drivers_dma_mark_uncached(paddr: usize, pages: usize) -> i32;
+        fn drivers_dma_verify_uncached(paddr: usize, pages: usize) -> i32;
+        fn drivers_phys_to_virt(paddr: usize) -> usize;
+        fn drivers_virt_to_phys(vaddr: usize) -> usize;
+        fn drivers_wake_net_rx_waiters();
+    }
+
+    /// Every switch here is the only way a test elsewhere in the crate can
+    /// reach an error path, and every counter is the only evidence those
+    /// tests have that a call happened at all. A switch that silently stopped
+    /// working would not fail anything: the tests using it would simply stop
+    /// asserting what they claim to, and pass. So the doubles get their own
+    /// tests.
+    ///
+    /// Allocation succeeds and is ZEROED by default, which is what every
+    /// caller in the crate assumes about a fresh DMA region.
+    #[test]
+    fn allocation_succeeds_zeroed_and_page_aligned_by_default() {
+        alone_with_the_allocator(|| {
+            let base = unsafe { drivers_dma_alloc(2) };
+            assert_ne!(base, 0);
+            assert_eq!(base % 4096, 0, "the default answer is not page-aligned");
+            let bytes = unsafe { core::slice::from_raw_parts(base as *const u8, 2 * 4096) };
+            assert!(bytes.iter().all(|b| *b == 0), "the region came back dirty");
+            assert_eq!(ALLOC_CALLS.load(Ordering::SeqCst), 1);
+            assert_eq!(ALLOC_PAGES.load(Ordering::SeqCst), 2);
+        });
+    }
+
+    /// `ALLOC_PAGES` counts what was ASKED for, which is where a byte length
+    /// rounded the wrong way shows up; `ALLOC_CALLS` counts the calls. The
+    /// two must not be the same number by accident.
+    #[test]
+    fn the_pages_asked_for_are_counted_apart_from_the_calls() {
+        alone_with_the_allocator(|| {
+            for pages in [1, 4, 16] {
+                assert_ne!(unsafe { drivers_dma_alloc(pages) }, 0);
+            }
+            assert_eq!(ALLOC_CALLS.load(Ordering::SeqCst), 3);
+            assert_eq!(ALLOC_PAGES.load(Ordering::SeqCst), 21);
+        });
+    }
+
+    /// `FAIL_ALLOC` is out of memory, which the kernel answers with 0.
+    #[test]
+    fn the_failure_switch_answers_out_of_memory() {
+        alone_with_the_allocator(|| {
+            FAIL_ALLOC.store(true, Ordering::SeqCst);
+            assert_eq!(unsafe { drivers_dma_alloc(1) }, 0);
+            // A failed allocation is still a call: a caller that asked and
+            // got nothing is exactly what the counters are for.
+            assert_eq!(ALLOC_CALLS.load(Ordering::SeqCst), 1);
+            assert_eq!(ALLOC_PAGES.load(Ordering::SeqCst), 1);
+        });
+    }
+
+    /// `FAIL_ALLOC_AFTER` is the interesting one: it must let the first N
+    /// calls through and fail from the N+1-th, which is the only way to
+    /// reach the path that gives the earlier regions back. An off-by-one here
+    /// would fail the wrong allocation and quietly test a different path.
+    #[test]
+    fn failing_after_n_lets_exactly_n_through() {
+        alone_with_the_allocator(|| {
+            FAIL_ALLOC_AFTER.store(2, Ordering::SeqCst);
+            assert_ne!(unsafe { drivers_dma_alloc(1) }, 0, "the 1st was refused");
+            assert_ne!(unsafe { drivers_dma_alloc(1) }, 0, "the 2nd was refused");
+            assert_eq!(unsafe { drivers_dma_alloc(1) }, 0, "the 3rd was allowed");
+            assert_eq!(unsafe { drivers_dma_alloc(1) }, 0);
+            assert_eq!(ALLOC_CALLS.load(Ordering::SeqCst), 4);
+        });
+    }
+
+    /// Zero means fail from the very first call, with nothing let through.
+    #[test]
+    fn failing_after_zero_refuses_everything() {
+        alone_with_the_allocator(|| {
+            FAIL_ALLOC_AFTER.store(0, Ordering::SeqCst);
+            assert_eq!(unsafe { drivers_dma_alloc(1) }, 0);
+        });
+    }
+
+    /// A misaligned answer must still point INSIDE the allocation, or a test
+    /// that rounds it up and writes there corrupts the heap instead of
+    /// exercising the alignment check.
+    #[test]
+    fn a_misaligned_answer_still_points_inside_the_allocation() {
+        alone_with_the_allocator(|| {
+            MISALIGN_ALLOC.store(true, Ordering::SeqCst);
+            let base = unsafe { drivers_dma_alloc(1) };
+            assert_ne!(base, 0);
+            assert_ne!(base % 4096, 0, "the answer is aligned after all");
+            // Rounded up to the next page it is still within the slack page
+            // the hook allocates on top of what was asked for.
+            let rounded = (base + 4095) & !4095;
+            let bytes = unsafe { core::slice::from_raw_parts(rounded as *const u8, 4096) };
+            assert!(bytes.iter().all(|b| *b == 0));
+        });
+    }
+
+    /// `POISON_ALLOC` is what a recycled frame actually looks like, so it has
+    /// to be non-zero everywhere -- a poison that left any part zeroed would
+    /// let a caller that forgets to clear its ring pass anyway.
+    #[test]
+    fn the_poison_switch_hands_back_dirty_memory_throughout() {
+        alone_with_the_allocator(|| {
+            POISON_ALLOC.store(true, Ordering::SeqCst);
+            let base = unsafe { drivers_dma_alloc(1) };
+            assert_ne!(base, 0);
+            let bytes = unsafe { core::slice::from_raw_parts(base as *const u8, 2 * 4096) };
+            assert!(bytes.iter().all(|b| *b == 0x5a), "the poison left holes");
+        });
+    }
+
+    /// Deallocation counts and leaks on purpose: freeing for real would pull
+    /// the memory out from under a test that keeps a raw pointer into a ring.
+    /// Every question asked about it is whether it was CALLED.
+    #[test]
+    fn deallocation_is_counted_and_never_fails() {
+        alone_with_the_allocator(|| {
+            let base = unsafe { drivers_dma_alloc(3) };
+            assert_eq!(unsafe { drivers_dma_dealloc(base, 3) }, 0);
+            assert_eq!(unsafe { drivers_dma_dealloc(base, 1) }, 0);
+            assert_eq!(DEALLOC_CALLS.load(Ordering::SeqCst), 2);
+            assert_eq!(DEALLOC_PAGES.load(Ordering::SeqCst), 4);
+            // And the memory is still readable afterwards, which is the whole
+            // reason it leaks.
+            let bytes = unsafe { core::slice::from_raw_parts(base as *const u8, 4096) };
+            assert!(bytes.iter().all(|b| *b == 0));
+        });
+    }
+
+    /// The cache-policy calls succeed by default and fail on their switch,
+    /// with the kernel's own convention: 0 is success, negative is failure.
+    #[test]
+    fn the_cache_policy_calls_follow_the_kernels_sign_convention() {
+        alone_with_the_allocator(|| {
+            assert_eq!(unsafe { drivers_dma_mark_uncached(0x1000, 1) }, 0);
+            assert_eq!(unsafe { drivers_dma_verify_uncached(0x1000, 1) }, 0);
+            assert_eq!(MARK_CALLS.load(Ordering::SeqCst), 1);
+            assert_eq!(VERIFY_CALLS.load(Ordering::SeqCst), 1);
+
+            FAIL_MARK.store(true, Ordering::SeqCst);
+            FAIL_VERIFY.store(true, Ordering::SeqCst);
+            assert!(unsafe { drivers_dma_mark_uncached(0x1000, 1) } < 0);
+            assert!(unsafe { drivers_dma_verify_uncached(0x1000, 1) } < 0);
+            assert_eq!(MARK_CALLS.load(Ordering::SeqCst), 2);
+            assert_eq!(VERIFY_CALLS.load(Ordering::SeqCst), 2);
+        });
+    }
+
+    /// The address translations are the identity in a host build, and they
+    /// have to be each other's inverse: a driver that converts a ring
+    /// descriptor one way and reads it back the other must land where it
+    /// started.
+    #[test]
+    fn the_address_translations_are_the_identity_and_inverse() {
+        for a in [0usize, 1, 4096, 0xdead_beef, usize::MAX] {
+            assert_eq!(unsafe { drivers_phys_to_virt(a) }, a);
+            assert_eq!(unsafe { drivers_virt_to_phys(a) }, a);
+            assert_eq!(unsafe { drivers_phys_to_virt(drivers_virt_to_phys(a)) }, a);
+        }
+    }
+
+    /// The wake counter is how a test tells a driver that polls and wakes
+    /// from one that polls and leaves a blocked reader on the fallback park
+    /// timer -- which looks exactly like a slow network.
+    #[test]
+    fn every_wake_of_the_rx_waiters_is_counted() {
+        alone_with_the_allocator(|| {
+            assert_eq!(WAKE_CALLS.load(Ordering::SeqCst), 0);
+            unsafe { drivers_wake_net_rx_waiters() };
+            unsafe { drivers_wake_net_rx_waiters() };
+            assert_eq!(WAKE_CALLS.load(Ordering::SeqCst), 2);
+        });
+    }
+
+    /// `fetch_add` returns the value from BEFORE the add, like the
+    /// `AtomicUsize` it stands in for. `drivers_dma_alloc` compares that
+    /// return against `FAIL_ALLOC_AFTER`, so a `fetch_add` that returned the
+    /// new value would shift the failure by one call.
+    #[test]
+    fn the_thread_counter_returns_the_value_from_before_the_add() {
+        alone_with_the_allocator(|| {
+            assert_eq!(ALLOC_CALLS.fetch_add(1, Ordering::SeqCst), 0);
+            assert_eq!(ALLOC_CALLS.fetch_add(5, Ordering::SeqCst), 1);
+            assert_eq!(ALLOC_CALLS.load(Ordering::SeqCst), 6);
+        });
+    }
+
+    /// `reset` is what makes the isolation real; it must clear every switch
+    /// and zero every counter, including `FAIL_ALLOC_AFTER`, whose default is
+    /// `usize::MAX` and not zero -- resetting that one to zero would refuse
+    /// every allocation in the rest of the suite.
+    #[test]
+    fn reset_restores_every_default_including_the_one_that_is_not_zero() {
+        alone_with_the_allocator(|| {
+            for flag in [
+                &FAIL_ALLOC,
+                &MISALIGN_ALLOC,
+                &POISON_ALLOC,
+                &FAIL_MARK,
+                &FAIL_VERIFY,
+            ] {
+                flag.store(true, Ordering::SeqCst);
+            }
+            for counter in [
+                &ALLOC_CALLS,
+                &ALLOC_PAGES,
+                &DEALLOC_CALLS,
+                &DEALLOC_PAGES,
+                &MARK_CALLS,
+                &VERIFY_CALLS,
+                &WAKE_CALLS,
+            ] {
+                counter.store(7, Ordering::SeqCst);
+            }
+            FAIL_ALLOC_AFTER.store(0, Ordering::SeqCst);
+
+            reset();
+
+            for flag in [
+                &FAIL_ALLOC,
+                &MISALIGN_ALLOC,
+                &POISON_ALLOC,
+                &FAIL_MARK,
+                &FAIL_VERIFY,
+            ] {
+                assert!(!flag.load(Ordering::SeqCst));
+            }
+            for counter in [
+                &ALLOC_CALLS,
+                &ALLOC_PAGES,
+                &DEALLOC_CALLS,
+                &DEALLOC_PAGES,
+                &MARK_CALLS,
+                &VERIFY_CALLS,
+                &WAKE_CALLS,
+            ] {
+                assert_eq!(counter.load(Ordering::SeqCst), 0);
+            }
+            assert_eq!(FAIL_ALLOC_AFTER.load(Ordering::SeqCst), usize::MAX);
+            assert_ne!(unsafe { drivers_dma_alloc(1) }, 0, "allocation still fails");
+        });
+    }
+
+    /// `alone_with_the_allocator` resets on BOTH sides, so a test that leaves
+    /// a switch set cannot leak it to the next one on the same thread.
+    #[test]
+    fn the_guard_resets_on_the_way_out_as_well_as_in() {
+        alone_with_the_allocator(|| {
+            FAIL_ALLOC.store(true, Ordering::SeqCst);
+            ALLOC_CALLS.store(99, Ordering::SeqCst);
+        });
+        assert!(!FAIL_ALLOC.load(Ordering::SeqCst));
+        assert_eq!(ALLOC_CALLS.load(Ordering::SeqCst), 0);
+    }
+
+    /// The state is PER THREAD, which is the whole reason these are
+    /// `thread_local!` and not statics: the suite ran at `--test-threads=16`
+    /// and failed about two runs in three while they were process-wide. A
+    /// switch set here must not be visible to another thread, and a counter
+    /// bumped there must not be visible here.
+    #[test]
+    fn one_threads_switches_and_counters_are_invisible_to_another() {
+        alone_with_the_allocator(|| {
+            FAIL_ALLOC.store(true, Ordering::SeqCst);
+            ALLOC_CALLS.store(42, Ordering::SeqCst);
+
+            let seen = std::thread::spawn(|| {
+                let flag = FAIL_ALLOC.load(Ordering::SeqCst);
+                let count = ALLOC_CALLS.load(Ordering::SeqCst);
+                // And this thread allocating must not touch ours.
+                assert_ne!(unsafe { drivers_dma_alloc(1) }, 0);
+                (flag, count, ALLOC_CALLS.load(Ordering::SeqCst))
+            })
+            .join()
+            .unwrap();
+
+            assert!(!seen.0, "the other thread saw our failure switch");
+            assert_eq!(seen.1, 0, "the other thread saw our call count");
+            assert_eq!(seen.2, 1, "the other thread did not count its own call");
+            assert!(FAIL_ALLOC.load(Ordering::SeqCst));
+            assert_eq!(ALLOC_CALLS.load(Ordering::SeqCst), 42);
+        });
+    }
+}

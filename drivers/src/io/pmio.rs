@@ -112,3 +112,44 @@ impl Io for Pmio<u32> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A PMIO unit IS its port number -- `read`/`write` are `in`/`out`, which
+    /// fault outside ring 0, so the port is the only thing about a PMIO
+    /// register map a host test can check, and in such a map the port number
+    /// is the register exactly as a field offset is in an MMIO one.
+    #[test]
+    fn a_unit_remembers_the_port_it_was_built_for() {
+        assert_eq!(Pmio::<u8>::new(0x3f8).port(), 0x3f8);
+        assert_eq!(Pmio::<u16>::new(0xcf8).port(), 0xcf8);
+        assert_eq!(Pmio::<u32>::new(0xcfc).port(), 0xcfc);
+    }
+
+    /// The whole 16-bit port space is addressable, including the ends: a
+    /// `u8`-wide port field, or a truncation to one, would lose the high half
+    /// of the space and silently talk to the wrong device.
+    #[test]
+    fn the_whole_sixteen_bit_port_space_is_addressable() {
+        assert_eq!(Pmio::<u8>::new(0).port(), 0);
+        assert_eq!(Pmio::<u8>::new(u16::MAX).port(), u16::MAX);
+        assert_eq!(Pmio::<u32>::new(0xffff).port(), 0xffff);
+    }
+
+    /// `new` is `const`, because a register map is a `const` table of these;
+    /// and the unit is `Copy`, which is what lets a driver hand one out by
+    /// value without giving up its own.
+    #[test]
+    fn a_unit_is_const_constructible_and_copies_by_value() {
+        const COM1: Pmio<u8> = Pmio::new(0x3f8);
+        let copy = COM1;
+        assert_eq!(copy.port(), COM1.port());
+        // A `PhantomData` type parameter costs nothing: the unit is its port.
+        assert_eq!(
+            core::mem::size_of::<Pmio<u32>>(),
+            core::mem::size_of::<u16>()
+        );
+    }
+}
