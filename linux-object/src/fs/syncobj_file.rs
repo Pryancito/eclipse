@@ -246,29 +246,43 @@ pub(super) fn pending_waiter_count() -> usize {
 }
 
 /// Staging for the poller tests next door, which are about `arm_poller`'s
-/// claim and not about any one fd: they need "a sync_file waiter exists" and
-/// "none does" as plain states, without an `Arc<SyncobjHandle>` whose `Drop`
-/// would retire the waiter at an arbitrary point in the body.
+/// claim and not about any one fd: they need "a sync_file waiter exists" as a
+/// plain state, without an `Arc<SyncobjHandle>` whose `Drop` would retire the
+/// waiter at an arbitrary point in the body.
+///
+/// Adds and removes exactly ONE sentinel waiter and never touches another.
+/// `WAITERS` is process-wide and one test binary runs every test of the crate
+/// in one process, so a `clear()` here would drop the live waiters of the
+/// sync_file tests in this module -- the failure mode
+/// [`the_point_advance_upcall_never_runs_with_the_waiter_registry_held`]
+/// already records in its own comment (red in 4 of 6 parallel runs). The
+/// sentinel's handle and point are the ones no real syncobj can hold, so it
+/// cannot be confused with anybody's waiter, and nothing can ever satisfy it:
+/// `query(u32::MAX)` answers `None`, which is a drop without a wake.
 #[cfg(test)]
 pub(crate) mod tests_support {
     use super::*;
 
-    /// A waiter on a handle nothing will ever signal. Only the count matters.
+    /// The sentinel: a handle nothing will ever signal, at a point nothing
+    /// can reach. Only its presence in the count matters.
+    const SENTINEL: (u32, u64) = (u32::MAX, u64::MAX);
+
     pub(crate) fn push_waiter_for_test() {
         let mut waiters = WAITERS.lock();
         waiters.push(SyncFileWaiter {
-            handle: u32::MAX,
-            point: u64::MAX,
+            handle: SENTINEL.0,
+            point: SENTINEL.1,
             signaled: Arc::new(AtomicBool::new(false)),
             eventbus: EventBus::new(),
         });
         WAITER_COUNT.store(waiters.len(), Ordering::SeqCst);
     }
 
-    pub(crate) fn clear_waiters_for_test() {
+    /// Take the sentinels back out, and only those.
+    pub(crate) fn pop_waiters_for_test() {
         let mut waiters = WAITERS.lock();
-        waiters.clear();
-        WAITER_COUNT.store(0, Ordering::SeqCst);
+        waiters.retain(|w| (w.handle, w.point) != SENTINEL);
+        WAITER_COUNT.store(waiters.len(), Ordering::SeqCst);
     }
 }
 
