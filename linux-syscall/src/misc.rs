@@ -13,6 +13,24 @@ use linux_object::time::*;
 use zircon_object::task::ThreadState;
 use zircon_object::{ZxError, ZxResult};
 
+/// `arch_prctl(2)`'s four codes, from `<asm/prctl.h>`. Out here rather than
+/// inside the call so a test can say what they are: the dispatch below reads
+/// each of them back through the same name it was written with, so a code that
+/// drifted would still match itself and nothing in this file would notice --
+/// while user code, which sends the number, would be answered `EINVAL`. For
+/// `ARCH_SET_FS` that is every thread's TLS pointer.
+#[cfg(target_arch = "x86_64")]
+const ARCH_SET_GS: i32 = 0x1001;
+/// See [`ARCH_SET_GS`].
+#[cfg(target_arch = "x86_64")]
+const ARCH_SET_FS: i32 = 0x1002;
+/// See [`ARCH_SET_GS`].
+#[cfg(target_arch = "x86_64")]
+const ARCH_GET_FS: i32 = 0x1003;
+/// See [`ARCH_SET_GS`].
+#[cfg(target_arch = "x86_64")]
+const ARCH_GET_GS: i32 = 0x1004;
+
 impl Syscall<'_> {
     #[cfg(target_arch = "x86_64")]
     /// set architecture-specific thread state
@@ -30,11 +48,6 @@ impl Syscall<'_> {
     pub fn sys_arch_prctl(&mut self, code: i32, addr: usize) -> SysResult {
         use kernel_hal::context::UserContextField;
         use zircon_object::vm::{USER_ASPACE_BASE, USER_ASPACE_SIZE};
-
-        const ARCH_SET_GS: i32 = 0x1001;
-        const ARCH_SET_FS: i32 = 0x1002;
-        const ARCH_GET_FS: i32 = 0x1003;
-        const ARCH_GET_GS: i32 = 0x1004;
 
         // Both bases reach the CPU through `wrmsr` on the way back to user
         // mode, and `wrmsr` to IA32_FS_BASE/IA32_GS_BASE raises #GP when the
@@ -176,9 +189,8 @@ impl Syscall<'_> {
     /// mappings are not randomized) are kept so the caller reads back what it
     /// configured and inheritance across fork/exec behaves like Linux.
     pub fn sys_personality(&self, persona: usize) -> SysResult {
-        const QUERY: u32 = 0xffff_ffff;
         let proc = self.linux_process();
-        if persona as u32 == QUERY {
+        if persona as u32 == PERSONALITY_QUERY {
             return Ok(proc.personality() as usize);
         }
         info!("personality: persona={:#x}", persona);
@@ -413,42 +425,13 @@ impl Syscall<'_> {
     pub fn sys_membarrier(&self, cmd: i32, flags: u32, _cpu_id: i32) -> SysResult {
         use core::sync::atomic::{fence, Ordering};
 
-        const QUERY: i32 = 0;
-        const GLOBAL: i32 = 1 << 0;
-        const GLOBAL_EXPEDITED: i32 = 1 << 1;
-        const REGISTER_GLOBAL_EXPEDITED: i32 = 1 << 2;
-        const PRIVATE_EXPEDITED: i32 = 1 << 3;
-        const REGISTER_PRIVATE_EXPEDITED: i32 = 1 << 4;
-        const PRIVATE_EXPEDITED_SYNC_CORE: i32 = 1 << 5;
-        const REGISTER_PRIVATE_EXPEDITED_SYNC_CORE: i32 = 1 << 6;
-
         info!("membarrier: cmd={:#x}, flags={:#x}", cmd, flags);
 
-        // The only defined flag (MEMBARRIER_CMD_FLAG_CPU) applies to the RSEQ
-        // command, which we don't advertise; reject any flag.
-        if flags != 0 {
-            return Err(LxError::EINVAL);
+        let (answer, barrier) = membarrier_verdict(cmd, flags)?;
+        if barrier {
+            fence(Ordering::SeqCst);
         }
-
-        let supported = GLOBAL
-            | GLOBAL_EXPEDITED
-            | REGISTER_GLOBAL_EXPEDITED
-            | PRIVATE_EXPEDITED
-            | REGISTER_PRIVATE_EXPEDITED
-            | PRIVATE_EXPEDITED_SYNC_CORE
-            | REGISTER_PRIVATE_EXPEDITED_SYNC_CORE;
-
-        match cmd {
-            QUERY => Ok(supported as usize),
-            GLOBAL | GLOBAL_EXPEDITED | PRIVATE_EXPEDITED | PRIVATE_EXPEDITED_SYNC_CORE => {
-                fence(Ordering::SeqCst);
-                Ok(0)
-            }
-            REGISTER_GLOBAL_EXPEDITED
-            | REGISTER_PRIVATE_EXPEDITED
-            | REGISTER_PRIVATE_EXPEDITED_SYNC_CORE => Ok(0),
-            _ => Err(LxError::EINVAL),
-        }
+        Ok(answer)
     }
 
     /// The `Futex` a process-shared futex word names, or `None` when this
@@ -612,9 +595,6 @@ impl Syscall<'_> {
             // thread priorities, so there is nothing to inherit, and the
             // lock/unlock protocol above is the whole user-visible contract.
             FUTEX_LOCK_PI | FUTEX_LOCK_PI2 | FUTEX_TRYLOCK_PI => {
-                const FUTEX_WAITERS: i32 = 0x8000_0000_u32 as i32;
-                const FUTEX_OWNER_DIED: i32 = 0x4000_0000;
-                const FUTEX_TID_MASK: i32 = 0x3fff_ffff;
                 let tid = (self.thread.id() as i32) & FUTEX_TID_MASK;
                 // The timeout is ABSOLUTE: CLOCK_REALTIME for LOCK_PI
                 // (always), and for LOCK_PI2 whichever clock
@@ -708,8 +688,6 @@ impl Syscall<'_> {
                 }
             }
             FUTEX_UNLOCK_PI => {
-                const FUTEX_WAITERS: i32 = 0x8000_0000_u32 as i32;
-                const FUTEX_TID_MASK: i32 = 0x3fff_ffff;
                 let tid = (self.thread.id() as i32) & FUTEX_TID_MASK;
                 if futex.load() & FUTEX_TID_MASK != tid {
                     // Only the owner may unlock (Linux: EPERM).
@@ -1087,6 +1065,21 @@ pub(crate) const FUTEX_LOCK_PI2: u32 = 13;
 pub(crate) const FUTEX_PRIVATE_FLAG: u32 = 0x80;
 pub(crate) const FUTEX_CLOCK_REALTIME: u32 = 0x100;
 
+/// The three fields of a PI futex's lock word (`<linux/futex.h>`), shared with
+/// musl and glibc. They were written twice, once in each of the two commands
+/// that read the word, so nothing kept the two copies in step and nothing
+/// could say what either one was.
+///
+/// `FUTEX_WAITERS`: somebody is, or was, blocked in the kernel on this word,
+/// so the owner's unlock has to come through `FUTEX_UNLOCK_PI` instead of
+/// being done in userspace.
+const FUTEX_WAITERS: i32 = 0x8000_0000_u32 as i32;
+/// `FUTEX_OWNER_DIED`: the owner died holding it (robust mutexes), and the
+/// next owner is to be told `EOWNERDEAD`.
+const FUTEX_OWNER_DIED: i32 = 0x4000_0000;
+/// `FUTEX_TID_MASK`: the rest of the word is the owner's TID, 0 meaning free.
+const FUTEX_TID_MASK: i32 = 0x3fff_ffff;
+
 /// What `do_futex` decides from `op` and `val3` BEFORE it touches `uaddr`,
 /// answered in the same order Linux answers it, with the command it settled
 /// on:
@@ -1283,6 +1276,72 @@ enum SyslogPlan {
     Unread,
     /// `SYSLOG_ACTION_SIZE_BUFFER`: the size of the ring.
     BufferSize,
+}
+
+/// `personality(0xffffffff)` is the read, not a persona anyone can set:
+/// `PER_QUERY` in `<sys/personality.h>`. Out here so a test can say so --
+/// inside the call, the word that asks and the word that is compared were the
+/// same constant, and `setarch --list` reading back a persona it never set
+/// would have looked like success.
+const PERSONALITY_QUERY: u32 = 0xffff_ffff;
+
+/// `membarrier(2)`'s commands (`<linux/membarrier.h>`). `MEMBARRIER_CMD_QUERY`
+/// is 0 and the rest are single bits, because the answer to the query is the
+/// OR of the commands that work -- so these numbers are not just a dispatch,
+/// they are a value this kernel hands to userspace.
+const MEMBARRIER_QUERY: i32 = 0;
+/// See [`MEMBARRIER_QUERY`].
+const MEMBARRIER_GLOBAL: i32 = 1 << 0;
+/// See [`MEMBARRIER_QUERY`].
+const MEMBARRIER_GLOBAL_EXPEDITED: i32 = 1 << 1;
+/// See [`MEMBARRIER_QUERY`].
+const MEMBARRIER_REGISTER_GLOBAL_EXPEDITED: i32 = 1 << 2;
+/// See [`MEMBARRIER_QUERY`].
+const MEMBARRIER_PRIVATE_EXPEDITED: i32 = 1 << 3;
+/// See [`MEMBARRIER_QUERY`].
+const MEMBARRIER_REGISTER_PRIVATE_EXPEDITED: i32 = 1 << 4;
+/// See [`MEMBARRIER_QUERY`].
+const MEMBARRIER_PRIVATE_EXPEDITED_SYNC_CORE: i32 = 1 << 5;
+/// See [`MEMBARRIER_QUERY`].
+const MEMBARRIER_REGISTER_PRIVATE_EXPEDITED_SYNC_CORE: i32 = 1 << 6;
+
+/// The commands [`Syscall::sys_membarrier`] answers, which is what it reports
+/// for `MEMBARRIER_CMD_QUERY`.
+const MEMBARRIER_SUPPORTED: i32 = MEMBARRIER_GLOBAL
+    | MEMBARRIER_GLOBAL_EXPEDITED
+    | MEMBARRIER_REGISTER_GLOBAL_EXPEDITED
+    | MEMBARRIER_PRIVATE_EXPEDITED
+    | MEMBARRIER_REGISTER_PRIVATE_EXPEDITED
+    | MEMBARRIER_PRIVATE_EXPEDITED_SYNC_CORE
+    | MEMBARRIER_REGISTER_PRIVATE_EXPEDITED_SYNC_CORE;
+
+/// What `membarrier(2)` answers, and whether a fence has to be issued before
+/// it does. Pure, so the numbers and the three kinds of command are testable
+/// without one.
+///
+/// A program reads the query's answer to decide what it may call afterwards,
+/// so an advertised command that then says `EINVAL` -- or one that works but
+/// is missing from the answer -- is a contradiction userspace cannot work
+/// around.
+fn membarrier_verdict(cmd: i32, flags: u32) -> LxResult<(usize, bool)> {
+    // The only defined flag (MEMBARRIER_CMD_FLAG_CPU) applies to the RSEQ
+    // command, which we don't advertise; reject any flag.
+    if flags != 0 {
+        return Err(LxError::EINVAL);
+    }
+    match cmd {
+        MEMBARRIER_QUERY => Ok((MEMBARRIER_SUPPORTED as usize, false)),
+        MEMBARRIER_GLOBAL
+        | MEMBARRIER_GLOBAL_EXPEDITED
+        | MEMBARRIER_PRIVATE_EXPEDITED
+        | MEMBARRIER_PRIVATE_EXPEDITED_SYNC_CORE => Ok((0, true)),
+        // Registration is a no-op here: expedited membarrier is always
+        // permitted, so there is nothing to register and nothing to order.
+        MEMBARRIER_REGISTER_GLOBAL_EXPEDITED
+        | MEMBARRIER_REGISTER_PRIVATE_EXPEDITED
+        | MEMBARRIER_REGISTER_PRIVATE_EXPEDITED_SYNC_CORE => Ok((0, false)),
+        _ => Err(LxError::EINVAL),
+    }
 }
 
 const SYSLOG_ACTION_CLOSE: i32 = 0;
@@ -1547,6 +1606,136 @@ pub(crate) fn ioprio_best(a: u16, b: u16) -> u16 {
         }
     };
     valid(a).min(valid(b))
+}
+
+#[cfg(test)]
+mod abi_numbers_tests {
+    //! The numbers this file hands to userspace, or reads from it, written
+    //! out here by hand from the headers and compared against nothing else in
+    //! the file.
+    //!
+    //! Each of them used to be declared inside the call that reads it, where
+    //! the word that asks and the word it is compared against were the same
+    //! constant: changing it left every test green and broke only the
+    //! programs on the other side of the syscall, which send the number.
+
+    use super::*;
+
+    /// `arch_prctl`'s four codes (`<asm/prctl.h>`). `ARCH_SET_FS` is every
+    /// thread's TLS pointer, and `ARCH_SET_GS` is what wasm2c's bounds
+    /// checking sets -- Firefox aborts on an `EINVAL` from it, which is how
+    /// the GS half came to be implemented at all.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn the_arch_prctl_codes_are_the_ones_asm_prctl_gives() {
+        assert_eq!(ARCH_SET_GS, 0x1001, "ARCH_SET_GS");
+        assert_eq!(ARCH_SET_FS, 0x1002, "ARCH_SET_FS");
+        assert_eq!(ARCH_GET_FS, 0x1003, "ARCH_GET_FS");
+        assert_eq!(ARCH_GET_GS, 0x1004, "ARCH_GET_GS");
+    }
+
+    /// The three fields of a PI futex's lock word (`<linux/futex.h>`), which
+    /// musl and glibc read and write directly in userspace.
+    ///
+    /// They have to tile the word exactly: an overlap would read part of a
+    /// TID as a flag -- or an owner's death as part of its TID, so the next
+    /// owner looks like a live one and the mutex is never handed over -- and
+    /// a gap would be a bit of the word nothing in the protocol owns.
+    #[test]
+    fn the_pi_lock_word_fields_are_the_ones_linux_futex_h_gives() {
+        assert_eq!(FUTEX_WAITERS as u32, 0x8000_0000, "FUTEX_WAITERS");
+        assert_eq!(FUTEX_OWNER_DIED, 0x4000_0000, "FUTEX_OWNER_DIED");
+        assert_eq!(FUTEX_TID_MASK, 0x3fff_ffff, "FUTEX_TID_MASK");
+        assert_eq!(FUTEX_WAITERS & FUTEX_OWNER_DIED, 0, "the two flags overlap");
+        assert_eq!(
+            FUTEX_TID_MASK & (FUTEX_WAITERS | FUTEX_OWNER_DIED),
+            0,
+            "a flag bit is inside the TID field"
+        );
+        assert_eq!(
+            (FUTEX_TID_MASK | FUTEX_OWNER_DIED | FUTEX_WAITERS) as u32,
+            u32::MAX,
+            "the three fields leave a bit of the word unowned"
+        );
+    }
+
+    /// `personality(0xffffffff)` is the read, not a persona anyone may set
+    /// (`PER_QUERY`). Told to set it instead, `setarch --list` would read
+    /// back a persona it never configured and call it success.
+    #[test]
+    fn the_personality_query_is_the_word_sys_personality_h_gives() {
+        assert_eq!(PERSONALITY_QUERY, 0xffff_ffff);
+    }
+
+    /// `membarrier`'s commands (`<linux/membarrier.h>`). The query is 0 and
+    /// the rest are single bits because the query's answer is the OR of the
+    /// commands that work: these numbers are a value this kernel hands out,
+    /// not just a dispatch.
+    #[test]
+    fn the_membarrier_commands_are_the_bits_linux_membarrier_h_gives() {
+        assert_eq!(MEMBARRIER_QUERY, 0, "MEMBARRIER_CMD_QUERY");
+        assert_eq!(MEMBARRIER_GLOBAL, 0x1, "GLOBAL");
+        assert_eq!(MEMBARRIER_GLOBAL_EXPEDITED, 0x2, "GLOBAL_EXPEDITED");
+        assert_eq!(
+            MEMBARRIER_REGISTER_GLOBAL_EXPEDITED, 0x4,
+            "REGISTER_GLOBAL_EXPEDITED"
+        );
+        assert_eq!(MEMBARRIER_PRIVATE_EXPEDITED, 0x8, "PRIVATE_EXPEDITED");
+        assert_eq!(
+            MEMBARRIER_REGISTER_PRIVATE_EXPEDITED, 0x10,
+            "REGISTER_PRIVATE_EXPEDITED"
+        );
+        assert_eq!(
+            MEMBARRIER_PRIVATE_EXPEDITED_SYNC_CORE, 0x20,
+            "PRIVATE_EXPEDITED_SYNC_CORE"
+        );
+        assert_eq!(
+            MEMBARRIER_REGISTER_PRIVATE_EXPEDITED_SYNC_CORE, 0x40,
+            "REGISTER_PRIVATE_EXPEDITED_SYNC_CORE"
+        );
+        // The query answers with the OR of exactly those seven.
+        assert_eq!(membarrier_verdict(0, 0), Ok((0x7f, false)));
+    }
+
+    /// And every command the query advertises is one the call then accepts.
+    /// A bit in that answer which comes back `EINVAL` is a contradiction a
+    /// program has no way around: the answer is read precisely to decide what
+    /// may be called afterwards.
+    #[test]
+    fn every_command_the_query_advertises_is_one_the_call_accepts() {
+        let (answer, barrier) = membarrier_verdict(MEMBARRIER_QUERY, 0).unwrap();
+        assert!(!barrier, "the query is not a barrier");
+        for bit in 0..31 {
+            let cmd = 1i32 << bit;
+            let advertised = answer as i32 & cmd != 0;
+            let accepted = membarrier_verdict(cmd, 0).is_ok();
+            assert_eq!(
+                advertised, accepted,
+                "command {:#x}: advertised {}, accepted {}",
+                cmd, advertised, accepted
+            );
+        }
+        // The barrier commands fence; registering one does not.
+        assert_eq!(membarrier_verdict(MEMBARRIER_GLOBAL, 0), Ok((0, true)));
+        assert_eq!(
+            membarrier_verdict(MEMBARRIER_PRIVATE_EXPEDITED_SYNC_CORE, 0),
+            Ok((0, true))
+        );
+        assert_eq!(
+            membarrier_verdict(MEMBARRIER_REGISTER_GLOBAL_EXPEDITED, 0),
+            Ok((0, false))
+        );
+        // The one flag the uapi defines belongs to a command this kernel does
+        // not advertise, so no command here takes a flag.
+        assert_eq!(
+            membarrier_verdict(MEMBARRIER_GLOBAL, 1),
+            Err(LxError::EINVAL)
+        );
+        assert_eq!(
+            membarrier_verdict(MEMBARRIER_QUERY, 1),
+            Err(LxError::EINVAL)
+        );
+    }
 }
 
 #[cfg(test)]

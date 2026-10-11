@@ -1054,13 +1054,22 @@ pub(crate) const FCHMODAT_FLAGS: usize =
 pub(crate) const UTIMENSAT_FLAGS: usize =
     AtFlags::SYMLINK_NOFOLLOW.bits() | AtFlags::EMPTY_PATH.bits();
 
-/// Permission bits `mknod(2)` and `open(O_CREAT)` keep: `S_IALLUGO`, all
-/// twelve (`vfs_mknod`'s `vfs_prepare_mode(.., mode, mode)` keeps whatever
-/// permission bits it is given, and `build_open_flags` masks with
-/// `S_IALLUGO`). Type bits in the argument (`S_IFDIR` / `S_IFREG` from a
-/// caller that reused `st_mode`) must not land in the inode's mode.
+/// Permission bits `mknod(2)` and `open(O_CREAT)` may be asked for:
+/// `S_IALLUGO`, all twelve. That is the mask `vfs_mknod` hands
+/// `vfs_prepare_mode` and the one `build_open_flags` applies, and unlike
+/// `mkdir`'s it leaves the two set-id bits in.
 ///
-/// `mkdir(2)` keeps fewer: see [`mkdir_perm`].
+/// **Admitting a bit is not keeping it.** `vfs_prepare_mode` runs
+/// `mode_strip_sgid` before any mask, which drops `S_ISGID` from a
+/// non-directory that asks for `S_IXGRP` as well when its creator does not
+/// act as the group the file lands in. That condition belongs with the rest
+/// of the ownership rules, and lives in `initialize_created_metadata`; here
+/// there is only the mask.
+///
+/// Type bits in the argument (`S_IFDIR` / `S_IFREG` from a caller that
+/// reused `st_mode`) must not land in the inode's mode.
+///
+/// `mkdir(2)` may be asked for fewer: see [`mkdir_perm`].
 pub(crate) fn create_perm(mode: usize) -> u16 {
     (mode & 0o7777) as u16
 }
@@ -1937,10 +1946,13 @@ mod mkdir_perm_tests {
         assert_eq!(create_perm(usize::MAX), 0o7777);
     }
 
-    /// `mknod` and `open(O_CREAT)` are the two that may be asked for a
-    /// set-id file, and `vfs_mknod`/`vfs_create` hand the bits through.
+    /// `mknod` and `open(O_CREAT)` are the two whose mask admits a set-id
+    /// bit, which is all this function decides. Whether the bit survives is
+    /// a separate question with its own condition and its own tests:
+    /// `mode_strip_sgid` takes `S_ISGID` off a group-executable file whose
+    /// creator is not in its group, in `initialize_created_metadata`.
     #[test]
-    fn the_set_id_bits_reach_a_file_that_is_created_with_them() {
+    fn the_mask_admits_the_set_id_bits_of_a_file_that_is_created_with_them() {
         assert_eq!(create_perm(0o4755), 0o4755);
         assert_eq!(create_perm(0o2755), 0o2755);
         assert_eq!(create_perm(0o6755), 0o6755);

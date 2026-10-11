@@ -454,3 +454,161 @@ fn the_pair_cannot_be_moved_one_at_a_time_by_hand() {
     c.set_egid(SPOOL);
     assert_eq!(c.fsgid, SPOOL);
 }
+
+// ---- the set-group-ID bit a new file may not ask for -------------
+
+/// A set-group-ID directory, which is how a shared area says "everything
+/// made in here belongs to this group".
+fn a_shared_directory(gid: u32) -> Metadata {
+    let mut meta = a_metadata(0o2775, OTHER, gid);
+    meta.type_ = FileType::Dir;
+    meta
+}
+
+/// A process acting as `fsgid`, in no supplementary group.
+///
+/// The id goes in directly rather than through `set_fsgid`, which would
+/// refuse a group this process never held -- which is its job, and the
+/// reason a file server gets the id from somewhere else entirely.
+fn creator_acting_as(fsgid: u32) -> LinuxProcess {
+    let proc = process_as(REAL, REAL, REAL);
+    proc.inner.lock().credentials.fsgid = fsgid;
+    proc
+}
+
+#[test]
+fn a_set_group_id_executable_cannot_be_asked_for_in_a_group_the_creator_is_not_in() {
+    // `mode_strip_sgid()`. The gid of a new file in a set-group-ID
+    // directory comes from the DIRECTORY, so this one call asks for a
+    // set-group-ID executable owned by a group its creator does not hold --
+    // and `apply_exec_ids` honours `S_ISGID`, so whoever runs it holds the
+    // group. `open(path, O_CREAT, 0o2755)` is all it takes.
+    let proc = creator_acting_as(REAL);
+    let inode: Arc<dyn INode> = Owned::new();
+    proc.initialize_created_metadata(&inode, Some(&a_shared_directory(SPOOL)), 0o2755, false)
+        .unwrap();
+    let meta = inode.metadata().unwrap();
+    assert_eq!(
+        meta.gid as u32, SPOOL,
+        "the group still comes from the directory"
+    );
+    assert_eq!(
+        meta.mode & 0o7777,
+        0o0755,
+        "but the set-group-ID bit is not handed over: {:o}",
+        meta.mode & 0o7777
+    );
+}
+
+#[test]
+fn a_member_of_the_group_keeps_the_set_group_id_bit() {
+    // The other side of the same rule, and the reason it is a condition and
+    // not a mask: a member of the group may make a set-group-ID program of
+    // it, which is what the bit is for.
+    let proc = creator_acting_as(SPOOL);
+    let inode: Arc<dyn INode> = Owned::new();
+    proc.initialize_created_metadata(&inode, Some(&a_shared_directory(SPOOL)), 0o2755, false)
+        .unwrap();
+    assert_eq!(inode.metadata().unwrap().mode & 0o7777, 0o2755);
+
+    // And a supplementary group counts, which is what `in_group_p()` reads.
+    let proc = creator_acting_as(REAL);
+    proc.inner.lock().credentials.groups.push(SPOOL);
+    let inode: Arc<dyn INode> = Owned::new();
+    proc.initialize_created_metadata(&inode, Some(&a_shared_directory(SPOOL)), 0o2755, false)
+        .unwrap();
+    assert_eq!(inode.metadata().unwrap().mode & 0o7777, 0o2755);
+}
+
+#[test]
+fn without_the_group_execute_bit_the_set_group_id_bit_is_left_alone() {
+    // `(mode & (S_ISGID | S_IXGRP)) != (S_ISGID | S_IXGRP)` returns early.
+    // On a file nobody can execute, `S_ISGID` is the System V mandatory
+    // locking convention and gives away nothing, so stripping it would
+    // break a program that works on Linux -- and break it silently, since
+    // the create still succeeds.
+    let proc = creator_acting_as(REAL);
+    let inode: Arc<dyn INode> = Owned::new();
+    proc.initialize_created_metadata(&inode, Some(&a_shared_directory(SPOOL)), 0o2644, false)
+        .unwrap();
+    assert_eq!(inode.metadata().unwrap().mode & 0o7777, 0o2644);
+}
+
+#[test]
+fn a_new_directory_still_inherits_the_bit_from_its_parent() {
+    // The exemption, and the rule the strip must not eat: on a directory
+    // `S_ISGID` is `inode_init_owner`'s inheritance -- where the files made
+    // inside it will land -- and not a privilege the caller asked for.
+    // Linux returns early on `S_ISDIR` for exactly this reason.
+    let proc = creator_acting_as(REAL);
+    let inode: Arc<dyn INode> = Owned::new();
+    proc.initialize_created_metadata(&inode, Some(&a_shared_directory(SPOOL)), 0o0775, true)
+        .unwrap();
+    let meta = inode.metadata().unwrap();
+    assert_eq!(meta.gid as u32, SPOOL);
+    assert_eq!(
+        meta.mode & 0o7777,
+        0o2775,
+        "a subdirectory of a shared area is shared too"
+    );
+}
+
+#[test]
+fn a_new_directory_may_ask_for_the_bit_in_a_group_it_does_not_hold() {
+    // The exemption again, this time with the caller ASKING for the bit
+    // rather than inheriting it, which is the half the inheritance test
+    // cannot see. `mkdir("/shared/sub", 02775)` is what `install -d -g` and
+    // every "make the rest of this tree shared too" script do, and Linux
+    // lets it through because `S_ISDIR(mode)` returns before any of the
+    // ownership questions are asked.
+    let proc = creator_acting_as(REAL);
+    let inode: Arc<dyn INode> = Owned::new();
+    proc.initialize_created_metadata(&inode, Some(&a_shared_directory(SPOOL)), 0o2775, true)
+        .unwrap();
+    assert_eq!(inode.metadata().unwrap().mode & 0o7777, 0o2775);
+}
+
+#[test]
+fn root_may_still_ask_for_it() {
+    // `in_group_or_capable()`: `CAP_FSETID`. An installer running as root
+    // creates set-group-ID programs in group directories for a living.
+    let proc = process_as(ROOT_UID, ROOT_UID, ROOT_UID);
+    let inode: Arc<dyn INode> = Owned::new();
+    proc.initialize_created_metadata(&inode, Some(&a_shared_directory(SPOOL)), 0o2755, false)
+        .unwrap();
+    assert_eq!(inode.metadata().unwrap().mode & 0o7777, 0o2755);
+}
+
+/// An inode whose stored mode already carries its file type, the way a real
+/// filesystem's does. [`Owned::new`] stores a bare `0o644`, which is one of
+/// the two reasons the masks below went unmeasured.
+fn an_inode_with_mode(mode: u16) -> Arc<Owned> {
+    Arc::new(Owned(Mutex::new(a_metadata(mode, NO_ID, NO_ID))))
+}
+
+#[test]
+fn only_the_permission_bits_of_what_was_asked_for_reach_the_inode() {
+    // Two masks, one on each side of the mode being assembled, and neither
+    // had a test: the bits of the ARGUMENT above `S_IALLUGO` must not land
+    // in the inode's mode -- a caller that reused a `st_mode` brings
+    // `S_IFREG` or `S_IFDIR` along inside it -- and the bits the INODE
+    // already has above it must survive, because that is where its own file
+    // type lives.
+    //
+    // The two differ here on purpose, a regular file asked for with the
+    // directory bit, because that is the only shape in which "the mask was
+    // not applied" and "the mask ate what it was keeping" both look
+    // different from the right answer. With the same type on both sides the
+    // three agree and the test proves nothing.
+    const S_IFREG: u16 = 0o100_000;
+    const S_IFDIR: u16 = 0o040_000;
+    let proc = creator_acting_as(REAL);
+    let inode: Arc<dyn INode> = an_inode_with_mode(S_IFREG | 0o644);
+    proc.initialize_created_metadata(&inode, None, S_IFDIR | 0o755, false)
+        .unwrap();
+    assert_eq!(
+        inode.metadata().unwrap().mode,
+        S_IFREG | 0o755,
+        "the inode keeps its own type and takes only the permission bits"
+    );
+}

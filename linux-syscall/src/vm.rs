@@ -856,24 +856,13 @@ impl Syscall<'_> {
         flags: usize,
         new_addr: usize,
     ) -> SysResult {
-        const MREMAP_MAYMOVE: usize = 1;
-        const MREMAP_FIXED: usize = 2;
-        const MREMAP_DONTUNMAP: usize = 4;
         // mmap_lock: remap moves/resizes mappings (see sys_mmap).
         let _aspace = self.linux_process().aspace_lock().lock();
         info!(
             "mremap: old_addr={:#x}, old_len={:#x}, new_len={:#x}, flags={:#x}, new_addr={:#x}",
             old_addr, old_len, new_len, flags, new_addr
         );
-        if flags & !(MREMAP_MAYMOVE | MREMAP_FIXED | MREMAP_DONTUNMAP) != 0 {
-            return Err(LxError::EINVAL);
-        }
-        if flags & MREMAP_DONTUNMAP != 0 {
-            return Err(LxError::EINVAL);
-        }
-        if flags & MREMAP_FIXED != 0 && flags & MREMAP_MAYMOVE == 0 {
-            return Err(LxError::EINVAL);
-        }
+        let (may_move, at_new_addr) = mremap_flags(flags)?;
         // Linux: old_addr must be page-aligned; lengths round up to pages. A
         // zero old_len (the MAP_SHARED duplication trick) is not supported.
         let (old_len, new_len) = mremap_args(old_addr, old_len, new_len)?;
@@ -891,15 +880,9 @@ impl Syscall<'_> {
             .and_then(|m| m.get_flags(old_addr).ok())
             .map(|f| f.contains(MMUFlags::WRITE))
             .unwrap_or(true);
-        let fixed = (flags & MREMAP_FIXED != 0).then_some(new_addr);
+        let fixed = at_new_addr.then_some(new_addr);
         let ret = vmar
-            .remap(
-                old_addr,
-                old_len,
-                new_len,
-                flags & MREMAP_MAYMOVE != 0,
-                fixed,
-            )
+            .remap(old_addr, old_len, new_len, may_move, fixed)
             .map_err(|e| match e {
                 zircon_object::ZxError::NOT_FOUND => LxError::EFAULT,
                 zircon_object::ZxError::INVALID_ARGS => LxError::EINVAL,
@@ -1008,10 +991,7 @@ impl Syscall<'_> {
             "mlock2: addr={:#x}, len={:#x}, flags={:#x}",
             addr, len, flags
         );
-        const MLOCK_ONFAULT: usize = 1;
-        if flags & !MLOCK_ONFAULT != 0 {
-            return Err(LxError::EINVAL);
-        }
+        mlock2_flags(flags)?;
         self.sys_mlock(addr, len)
     }
 
@@ -1077,9 +1057,7 @@ impl Syscall<'_> {
         // had been dropped/PROT_NONE'd — mimalloc reused exactly such a page and
         // found its old bytes, hence the deterministic "corrupted free list
         // entry" abort during `apk update`.
-        const MADV_DONTNEED: usize = 4;
-        const MADV_FREE: usize = 8;
-        if advice == MADV_DONTNEED || advice == MADV_FREE {
+        if madvise_discards(advice) {
             // Zero the committed pages in the range THROUGH THE VMO so they read
             // back as zero on next access — including pages whose PTE was dropped
             // or turned PROT_NONE, which a page-table walk cannot see (that gap
@@ -1203,6 +1181,37 @@ const UNHONOURED_MADVISE: &[usize] = &[9, 10, 11, 18, 19];
 /// classification is unit-testable independently of the syscall plumbing.
 fn madvise_advice_known(advice: usize) -> bool {
     KNOWN_MADVISE.contains(&advice)
+}
+
+/// `MADV_DONTNEED`: the caller is done with the range's contents.
+const MADV_DONTNEED: usize = 4;
+/// `MADV_FREE`: the caller is done with them and the kernel may take the
+/// pages whenever it likes.
+const MADV_FREE: usize = 8;
+
+/// Whether this advice has to DISCARD the range rather than be noted and
+/// ignored, which is the one `madvise` promise an allocator builds on.
+///
+/// Pure, and the two numbers it is made of are the whole reason it exists:
+/// every other advice here may be a no-op, so a value that drifted would not
+/// fail anything -- it would quietly hand back stale bytes to a caller that
+/// decommitted the range and later reused it. That is the mimalloc / mozjemalloc
+/// corruption described on `sys_madvise`, which has no error message of its own.
+fn madvise_discards(advice: usize) -> bool {
+    advice == MADV_DONTNEED || advice == MADV_FREE
+}
+
+/// `MLOCK_ONFAULT`: lock the pages as they are faulted in, not now. The only
+/// flag `mlock2(2)` defines.
+const MLOCK_ONFAULT: usize = 1;
+
+/// `mlock2(2)`'s flag word: `MLOCK_ONFAULT` or nothing. Pure, so the number is
+/// pinned without a range to lock.
+fn mlock2_flags(flags: usize) -> LxResult<()> {
+    if flags & !MLOCK_ONFAULT != 0 {
+        return Err(LxError::EINVAL);
+    }
+    Ok(())
 }
 
 /// The first address no user mapping can reach.
@@ -1595,6 +1604,36 @@ fn mremap_args(old_addr: usize, old_len: usize, new_len: usize) -> LxResult<(usi
         UserRange::Empty | UserRange::Beyond => return Err(LxError::EINVAL),
     };
     Ok((old_len, new_len))
+}
+
+/// `MREMAP_MAYMOVE`: the mapping may be moved rather than grown in place.
+const MREMAP_MAYMOVE: usize = 1;
+/// `MREMAP_FIXED`: put it at `new_addr`, replacing whatever is there.
+const MREMAP_FIXED: usize = 2;
+/// `MREMAP_DONTUNMAP`: move it and leave the old range mapped (Linux >= 5.7).
+const MREMAP_DONTUNMAP: usize = 4;
+
+/// What `mremap(2)`'s flag word asks for: whether the mapping may move, and
+/// whether `new_addr` is where it has to land. `EINVAL` for a word this kernel
+/// cannot answer.
+///
+/// Pure, so the three rules and the three numbers are testable without a
+/// mapping to move. `MREMAP_FIXED` without `MREMAP_MAYMOVE` is Linux's own
+/// refusal (`mm/mremap.c`): naming an address and forbidding the move at the
+/// same time asks for two things at once.
+fn mremap_flags(flags: usize) -> LxResult<(bool, bool)> {
+    if flags & !(MREMAP_MAYMOVE | MREMAP_FIXED | MREMAP_DONTUNMAP) != 0 {
+        return Err(LxError::EINVAL);
+    }
+    // Not supported: the caller is told so rather than handed a move that
+    // unmapped the old range behind its back.
+    if flags & MREMAP_DONTUNMAP != 0 {
+        return Err(LxError::EINVAL);
+    }
+    if flags & MREMAP_FIXED != 0 && flags & MREMAP_MAYMOVE == 0 {
+        return Err(LxError::EINVAL);
+    }
+    Ok((flags & MREMAP_MAYMOVE != 0, flags & MREMAP_FIXED != 0))
 }
 
 /// Where `brk(2)` should move the program break, or `None` to leave it where it
@@ -3053,6 +3092,177 @@ mod mmap_flag_tests {
         // Huge-size encodings alone are meaningless without MAP_HUGETLB;
         // Linux ignores them on a normal mmap, and so do we.
         assert_eq!(mmap_no_hugetlb(MAP_PRIVATE | MAP_HUGE_2MB), Ok(()));
+    }
+}
+
+#[cfg(test)]
+mod mmap_wire_numbers_tests {
+    //! The numbers the memory syscalls are made of, written out here by hand
+    //! from `<asm-generic/mman.h>`, `<asm-generic/mman-common.h>` and
+    //! `<linux/mman.h>`, and compared against nothing else in this file.
+    //!
+    //! Every other test above assembles its flag word out of the same
+    //! constants it then reads back through, so a word built from `MAP_STACK`
+    //! agrees with whatever `MAP_STACK` is worth. Here the numbers are the
+    //! interface -- userspace sends them -- and getting one wrong is not a
+    //! no-op: `MAP_SHARED_VALIDATE` answers `EOPNOTSUPP` to every bit outside
+    //! `LEGACY_MAP_MASK`, so a flag whose value drifted out of the mask turns
+    //! an ordinary mapping into a refusal, and `mremap`/`mlock2` answer
+    //! `EINVAL` to a word they no longer recognise.
+
+    use super::*;
+
+    /// Every flag `LEGACY_MAP_MASK` is built from, by the number userspace
+    /// sends rather than by the name this file gives it.
+    const LEGACY_FLAGS: &[(&str, usize)] = &[
+        ("MAP_FIXED", 0x10),
+        ("MAP_ANONYMOUS", 0x20),
+        ("MAP_GROWSDOWN", 0x100),
+        ("MAP_DENYWRITE", 0x800),
+        ("MAP_EXECUTABLE", 0x1000),
+        ("MAP_LOCKED", 0x2000),
+        ("MAP_NORESERVE", 0x4000),
+        ("MAP_POPULATE", 0x8000),
+        ("MAP_NONBLOCK", 0x1_0000),
+        ("MAP_STACK", 0x2_0000),
+        ("MAP_HUGETLB", 0x4_0000),
+        // Bit 26, which rides in on MAP_HUGE_2MB's lowest bit; Linux's macro
+        // names it separately all the same.
+        ("MAP_UNINITIALIZED", 0x400_0000),
+        ("MAP_HUGE_2MB", 0x5400_0000),
+        ("MAP_HUGE_1GB", 0x7800_0000),
+    ];
+
+    /// The validating kind has to let the whole legacy word through, one flag
+    /// at a time: a bit that fell out of the mask becomes `EOPNOTSUPP` for a
+    /// call every loader and allocator makes.
+    #[test]
+    fn the_validating_kind_tolerates_every_flag_the_headers_call_legacy() {
+        for &(name, bit) in LEGACY_FLAGS {
+            assert_eq!(
+                shared_validate_flags(MAP_SHARED_VALIDATE | bit),
+                Ok(()),
+                "{} ({:#x}) fell out of LEGACY_MAP_MASK",
+                name,
+                bit
+            );
+        }
+    }
+
+    /// `MAP_32BIT` is x86_64's alone; `<linux/mman.h>` has it as 0 in this
+    /// mask everywhere else, which makes bit 6 an unknown flag there.
+    #[test]
+    fn the_x86_64_only_flag_is_in_the_mask_on_x86_64_and_nowhere_else() {
+        #[cfg(target_arch = "x86_64")]
+        {
+            assert_eq!(MAP_32BIT, 0x40);
+            assert_eq!(shared_validate_flags(MAP_SHARED_VALIDATE | 0x40), Ok(()));
+        }
+        // Not reached on this host, where the suite runs; the arm is here so
+        // the other half of the `cfg` is written down beside the constant.
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            assert_eq!(MAP_32BIT, 0);
+            assert_eq!(
+                shared_validate_flags(MAP_SHARED_VALIDATE | 0x40),
+                Err(LxError::EOPNOTSUPP)
+            );
+        }
+    }
+
+    /// The huge-page sizes are a `log2` of the page size sitting in bits
+    /// 26..32, not flags. The whole word is written out here, so a size built
+    /// from the wrong shift or the wrong exponent shows up instead of
+    /// `21 << 26` being compared against `21 << 26`.
+    #[test]
+    fn the_huge_page_sizes_are_the_words_userspace_sends() {
+        assert_eq!(MAP_HUGE_2MB, 0x5400_0000, "MAP_HUGE_2MB is 21 << 26");
+        assert_eq!(MAP_HUGE_1GB, 0x7800_0000, "MAP_HUGE_1GB is 30 << 26");
+    }
+
+    /// And nothing the headers leave undefined is inside the mask, which is
+    /// the whole value of `MAP_SHARED_VALIDATE`: a program asks for it so
+    /// that a flag this kernel does not implement is refused rather than
+    /// quietly dropped.
+    #[test]
+    fn no_bit_the_headers_leave_undefined_is_inside_the_mask() {
+        // 0x4 and 0x8 are the rest of MAP_TYPE, an enum of three; 0x80, 0x200
+        // and 0x400 were never given a meaning; 0x8_0000 is MAP_SYNC and
+        // 0x10_0000 MAP_FIXED_NOREPLACE, the two the kind exists to refuse;
+        // bits 21..26 sit below the huge-size field, and bit 31 would be a
+        // huge size nobody asked for.
+        for bit in [
+            0x4usize,
+            0x8,
+            0x80,
+            0x200,
+            0x400,
+            0x8_0000,
+            0x10_0000,
+            0x20_0000,
+            0x40_0000,
+            0x80_0000,
+            0x100_0000,
+            0x200_0000,
+            0x8000_0000,
+        ] {
+            assert_eq!(LEGACY_MAP_MASK & bit, 0, "{:#x} is inside the mask", bit);
+        }
+    }
+
+    /// `vm.mmap_min_addr`: the window a kernel-chosen mapping stays out of,
+    /// so that address 0 goes on meaning "no pointer".
+    #[test]
+    fn the_floor_for_a_kernel_chosen_mapping_is_the_default_sysctl() {
+        assert_eq!(MMAP_MIN_ADDR, 65536, "vm.mmap_min_addr is 64 KiB");
+    }
+
+    /// `mremap`'s three flags by number, and the words it refuses.
+    #[test]
+    fn the_mremap_flags_are_the_bits_the_headers_give() {
+        const MAYMOVE: usize = 1;
+        const FIXED: usize = 2;
+        const DONTUNMAP: usize = 4;
+        assert_eq!(mremap_flags(0), Ok((false, false)));
+        assert_eq!(mremap_flags(MAYMOVE), Ok((true, false)));
+        assert_eq!(mremap_flags(MAYMOVE | FIXED), Ok((true, true)));
+        // Naming an address while forbidding the move asks for both at once.
+        assert_eq!(mremap_flags(FIXED), Err(LxError::EINVAL));
+        // Not implemented, and said so rather than moving the mapping and
+        // leaving the caller to find the old range gone.
+        assert_eq!(mremap_flags(DONTUNMAP), Err(LxError::EINVAL));
+        assert_eq!(mremap_flags(MAYMOVE | DONTUNMAP), Err(LxError::EINVAL));
+        // And a bit `mremap(2)` does not define at all.
+        assert_eq!(mremap_flags(8), Err(LxError::EINVAL));
+        assert_eq!(mremap_flags(MAYMOVE | 0x10), Err(LxError::EINVAL));
+    }
+
+    /// `mlock2`'s one flag by number: a word with anything else in it is
+    /// `EINVAL`, and `MLOCK_ONFAULT` itself must not be.
+    #[test]
+    fn the_only_flag_mlock2_defines_is_the_bit_the_headers_give() {
+        assert_eq!(mlock2_flags(0), Ok(()));
+        assert_eq!(mlock2_flags(1), Ok(()), "MLOCK_ONFAULT");
+        assert_eq!(mlock2_flags(2), Err(LxError::EINVAL));
+        assert_eq!(mlock2_flags(3), Err(LxError::EINVAL));
+    }
+
+    /// The two advices that have to discard, by number. Every other advice
+    /// this kernel accepts may be ignored, so these two are the only values
+    /// whose drift has a consequence -- and the consequence is stale bytes
+    /// handed back to an allocator that decommitted the range, with no error
+    /// anywhere (see `sys_madvise`).
+    #[test]
+    fn the_advices_that_must_discard_are_the_two_numbers_the_headers_give() {
+        assert!(madvise_discards(4), "MADV_DONTNEED");
+        assert!(madvise_discards(8), "MADV_FREE");
+        // MADV_NORMAL/RANDOM/SEQUENTIAL/WILLNEED, the KSM and dump hints,
+        // MADV_COLD/PAGEOUT and the poisoning pair: none of them discards.
+        for advice in [
+            0usize, 1, 2, 3, 5, 9, 12, 13, 14, 15, 16, 17, 20, 21, 100, 101,
+        ] {
+            assert!(!madvise_discards(advice), "advice {} discards", advice);
+        }
     }
 }
 

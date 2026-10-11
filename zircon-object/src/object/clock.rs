@@ -205,17 +205,24 @@ mod tests {
     /// `u64::MAX` is how it says "unknown". The rest is the zeroes the VMO
     /// was created with, which matters because userspace maps and reads the
     /// whole page: a byte of kernel memory left in there is disclosed.
+    ///
+    /// So the whole of the rest is what this reads. A sample of it would only
+    /// say that the bytes next to the error bound are clean, and a page is
+    /// disclosed by its worst byte, not by its first ones.
     #[test]
     fn the_mapped_page_opens_with_an_unknown_error_bound() {
         let vmo = Clock::new(0, true).mapped_vmo().unwrap();
         let mut head = [0u8; 8];
         vmo.read(0, &mut head).unwrap();
         assert_eq!(u64::from_ne_bytes(head), u64::MAX);
-        let mut rest = [0xffu8; 32];
+        let mut rest = alloc::vec![0xffu8; PAGE_SIZE - 8];
         vmo.read(8, &mut rest).unwrap();
-        assert!(
-            rest.iter().all(|&b| b == 0),
-            "the page is not zero after the error bound"
+        let dirty = rest.iter().position(|&b| b != 0);
+        assert_eq!(
+            dirty,
+            None,
+            "byte {} of the page is not zero after the error bound",
+            dirty.map_or(0, |i| i + 8)
         );
     }
 }

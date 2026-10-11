@@ -58,13 +58,24 @@ fn send_mode(flags: usize, fd_non_block: bool, bounded_queue: bool) -> SendMode 
 /// count the kernel writes back. Only its layout is used (stride and the
 /// `msg_len` offset); the per-entry `msg_hdr` is re-read by the wrapped
 /// single-message syscalls straight from user memory.
+///
+/// Both batch calls walk the user's array by [`MMSGHDR_STRIDE`] and write the
+/// count at [`MMSGHDR_LEN_OFFSET`], which is why those two come from this
+/// declaration and not from arithmetic: a `msghdr` that grows a field would
+/// otherwise leave the walk one stride short of the real `mmsghdr` and put
+/// each count inside the NEXT entry, over its `msg_name` pointer.
 #[repr(C)]
-#[allow(dead_code)]
 struct MMsgHdr {
     msg_hdr: MsgHdr,
     msg_len: u32,
     _pad: u32,
 }
+
+/// The distance between two `struct mmsghdr` in the user's array.
+const MMSGHDR_STRIDE: usize = size_of::<MMsgHdr>();
+
+/// Where the per-message transfer count sits inside one of them.
+const MMSGHDR_LEN_OFFSET: usize = core::mem::offset_of!(MMsgHdr, msg_len);
 
 /// Read a `sockaddr` from user space, honoring the user-supplied `addrlen`.
 ///
@@ -1467,7 +1478,7 @@ impl Syscall<'_> {
         );
         const MMSG_MAX: usize = 64;
         let base = msgvec.as_addr();
-        let stride = core::mem::size_of::<MsgHdr>() + 8; // + u32 msg_len + pad
+        let stride = MMSGHDR_STRIDE;
         let mut sent = 0usize;
         for i in 0..vlen.min(MMSG_MAX) {
             let hdr_ptr: UserInPtr<MsgHdr> = (base + i * stride).into();
@@ -1475,7 +1486,7 @@ impl Syscall<'_> {
             match self.sendmsg_hdr(sockfd, &hdr, flags).await {
                 Ok(n) => {
                     let mut len_ptr: UserOutPtr<u32> =
-                        (base + i * stride + core::mem::size_of::<MsgHdr>()).into();
+                        (base + i * stride + MMSGHDR_LEN_OFFSET).into();
                     len_ptr.write(n as u32)?;
                     sent += 1;
                 }
@@ -1507,7 +1518,7 @@ impl Syscall<'_> {
         );
         const MMSG_MAX: usize = 64;
         let base = msgvec.as_addr();
-        let stride = core::mem::size_of::<MsgHdr>() + 8;
+        let stride = MMSGHDR_STRIDE;
         let mut received = 0usize;
         for i in 0..vlen.min(MMSG_MAX) {
             let hdr_ptr: UserInOutPtr<MsgHdr> = (base + i * stride).into();
@@ -1515,7 +1526,7 @@ impl Syscall<'_> {
             match self.sys_recvmsg(sockfd, hdr_ptr, per_flags).await {
                 Ok(n) => {
                     let mut len_ptr: UserOutPtr<u32> =
-                        (base + i * stride + core::mem::size_of::<MsgHdr>()).into();
+                        (base + i * stride + MMSGHDR_LEN_OFFSET).into();
                     len_ptr.write(n as u32)?;
                     received += 1;
                 }
@@ -2289,6 +2300,97 @@ mod socket_type_flag_tests {
     #[test]
     fn getpeername_without_a_peer_is_enotconn() {
         assert_eq!(peer_endpoint(None).err(), Some(LxError::ENOTCONN));
+    }
+}
+
+/// The numbers on the wire: the layout of a `struct mmsghdr` and the
+/// constants a caller writes into a control message.
+///
+/// These are the half the tests above cannot reach. Every one of them builds
+/// its argument out of the same constant it then compares against, or
+/// round-trips the builder against the parser -- which is the strongest test
+/// there is of the two agreeing with EACH OTHER, and no test at all of either
+/// agreeing with the uapi. Change `SOL_SOCKET_LEVEL` to 2 and the builder
+/// writes a 2, the parser looks for a 2, and the whole module above stays
+/// green while every real program's control messages stop being seen.
+///
+/// So the numbers here are written by hand, from the headers, and compared
+/// against nothing in this file.
+#[cfg(test)]
+mod wire_numbers_tests {
+    use super::*;
+    use core::mem::{align_of, offset_of, size_of};
+
+    #[test]
+    fn the_batch_entry_is_the_mmsghdr_of_the_uapi() {
+        // `struct mmsghdr { struct msghdr msg_hdr; unsigned int msg_len; }`,
+        // which the compiler pads to 8 because `msghdr` holds pointers. Both
+        // batch calls walk the user's array by this size and write the count
+        // at this offset, so these two numbers ARE where `sendmmsg(2)` and
+        // `recvmmsg(2)` reach into user memory.
+        assert_eq!(size_of::<MMsgHdr>(), 64);
+        assert_eq!(align_of::<MMsgHdr>(), 8);
+        assert_eq!(offset_of!(MMsgHdr, msg_hdr), 0);
+        assert_eq!(offset_of!(MMsgHdr, msg_len), 56);
+        assert_eq!(offset_of!(MMsgHdr, _pad), 60);
+        // And the one `msghdr` inside it, whose size is what the entry is
+        // built around: a field added to it moves `msg_len`, and the two
+        // constants below are the only reason the walk follows.
+        assert_eq!(size_of::<MsgHdr>(), 56);
+        assert_eq!(MMSGHDR_STRIDE, 64);
+        assert_eq!(MMSGHDR_LEN_OFFSET, 56);
+    }
+
+    #[test]
+    fn the_stride_is_the_whole_entry_and_not_the_header_plus_a_guess() {
+        // What this replaces, written out: `size_of::<MsgHdr>() + 8` for the
+        // stride and `size_of::<MsgHdr>()` for the offset. The two agree with
+        // the entry today, which is why nothing caught the arithmetic -- and
+        // the day a `msghdr` field is added they stop agreeing, the walk
+        // falls one stride short per entry, and each transfer count lands
+        // inside the next entry, on top of its `msg_name` pointer.
+        assert_eq!(MMSGHDR_STRIDE, size_of::<MsgHdr>() + 8);
+        assert_eq!(MMSGHDR_LEN_OFFSET, size_of::<MsgHdr>());
+        // The count has to fit inside the entry it belongs to, which is the
+        // property the arithmetic never stated.
+        assert!(MMSGHDR_LEN_OFFSET + size_of::<u32>() <= MMSGHDR_STRIDE);
+    }
+
+    #[test]
+    fn the_control_message_numbers_are_the_ones_the_headers_give() {
+        // `<asm-generic/socket.h>` and `<sys/socket.h>`. A control message
+        // whose level or type does not match what the peer's libc wrote is
+        // simply not seen: `recvmsg` hands back a buffer the caller walks and
+        // finds nothing in, with no error anywhere.
+        assert_eq!(CMSG_HDR_LEN, 16, "sizeof(struct cmsghdr) on a 64-bit ABI");
+        assert_eq!(SOL_SOCKET, 1);
+        assert_eq!(SOL_SOCKET_LEVEL, 1, "SOL_SOCKET as cmsg_level");
+        assert_eq!(
+            SOL_SOCKET as i32, SOL_SOCKET_LEVEL,
+            "and they are one level"
+        );
+        assert_eq!(SCM_RIGHTS, 1);
+        assert_eq!(SCM_CREDENTIALS, 2);
+        assert_eq!(SO_PASSCRED, 16);
+        assert_eq!(SCM_MAX_FD, 253, "SCM_MAX_FD, the kernel's own cap");
+    }
+
+    #[test]
+    fn the_message_flags_are_the_bits_the_headers_give() {
+        // Each of these is read off a `flags` word the caller passed, so a
+        // wrong bit is a request honoured as a different one: a `MSG_PEEK`
+        // taken for a `MSG_DONTWAIT` consumes the datagram it was asked to
+        // leave alone.
+        assert_eq!(MSG_PEEK, 0x2);
+        assert_eq!(MSG_NOSIGNAL, 0x4000);
+        assert_eq!(MSG_DONTWAIT, 0x40);
+        assert_eq!(MSG_CMSG_CLOEXEC, 0x4000_0000);
+        assert_eq!(MSG_CTRUNC, 0x8, "the one WRITTEN back, into msg_flags");
+        // `MSG_NOSIGNAL` and `MSG_CMSG_CLOEXEC` are a factor of 0x10000
+        // apart and both end in 0x4000; a digit dropped from the second
+        // turns "install these descriptors close-on-exec" into "do not
+        // raise SIGPIPE", which is a flag the send path reads.
+        assert_ne!(MSG_CMSG_CLOEXEC, MSG_NOSIGNAL);
     }
 }
 
