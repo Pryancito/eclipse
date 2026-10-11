@@ -477,7 +477,12 @@ fn the_three_requests_that_used_to_be_rejected_are_accepted() {
     assert!(d.refine(&mut p), "dos fragmentos rechazados");
     assert_eq!(iv(&p, PcmDev::IV_PERIODS), (2, 2));
     let (ps_lo, ps_hi) = iv(&p, PcmDev::IV_PERIOD_SIZE);
-    assert!(ps_lo <= 256 && 256 <= ps_hi, "256 fuera de {}..{}", ps_lo, ps_hi);
+    assert!(
+        ps_lo <= 256 && 256 <= ps_hi,
+        "256 fuera de {}..{}",
+        ps_lo,
+        ps_hi
+    );
 
     // 0,5 s a 11,025 kHz por tiempo de búfer.
     let mut p = any();
@@ -699,7 +704,11 @@ fn refining_twice_changes_nothing() {
         }
         assert!(d.refine(&mut p), "{:?} rechazado", (rate, ps, bs));
         let once = p.intervals;
-        assert!(d.refine(&mut p), "{:?} rechazado en la segunda", (rate, ps, bs));
+        assert!(
+            d.refine(&mut p),
+            "{:?} rechazado en la segunda",
+            (rate, ps, bs)
+        );
         for (idx, (a, b)) in once.iter().zip(p.intervals.iter()).enumerate() {
             assert_eq!(
                 (a.min, a.max),

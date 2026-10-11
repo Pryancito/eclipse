@@ -870,7 +870,10 @@ mod tests {
         assert_eq!(client_buffer_bytes(CAP, 44_100, 0), 0);
         // Y un ocupado mayor que la capacidad no da un sitio negativo.
         assert_eq!(client_counts(1024, 4096, None, FRAME).0, 0);
-        assert_eq!(client_counts(1024, 4096, Some((44_100, 48_000)), FRAME).0, 0);
+        assert_eq!(
+            client_counts(1024, 4096, Some((44_100, 48_000)), FRAME).0,
+            0
+        );
     }
 
     /// `accept_client_frames` guarda [`SRC_SLACK_FRAMES`] marcos de

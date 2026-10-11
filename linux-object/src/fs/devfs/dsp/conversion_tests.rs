@@ -173,7 +173,12 @@ fn the_zero_of_every_linear_format_is_zero() {
 #[test]
 fn full_scale_stays_full_scale_in_every_linear_format() {
     for (format, lo, hi, want_hi) in [
-        (AFMT_U8, &[0x00u8, 0, 0, 0][..], &[0xff, 0, 0, 0][..], 32512i16),
+        (
+            AFMT_U8,
+            &[0x00u8, 0, 0, 0][..],
+            &[0xff, 0, 0, 0][..],
+            32512i16,
+        ),
         (AFMT_S8, &[0x80][..], &[0x7f][..], 32512),
         (AFMT_S16_LE, &[0x00, 0x80][..], &[0xff, 0x7f][..], i16::MAX),
         (AFMT_S16_BE, &[0x80, 0x00][..], &[0x7f, 0xff][..], i16::MAX),
@@ -389,8 +394,10 @@ fn a_surround_frame_keeps_its_first_two_channels_and_its_stride() {
     // Dos marcos de 4 canales S8: (1,2,3,4) y (5,6,7,8).
     convert_frames(AFMT_S8, 4, &[1, 2, 3, 4, 5, 6, 7, 8], 2, &mut dst);
     let got: Vec<i16> = dst
-        .chunks_exact(2)
-        .map(|c| i16::from_le_bytes([c[0], c[1]]))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|c| i16::from_le_bytes(*c))
         .collect();
     assert_eq!(got, [1 << 8, 2 << 8, 5 << 8, 6 << 8]);
 }

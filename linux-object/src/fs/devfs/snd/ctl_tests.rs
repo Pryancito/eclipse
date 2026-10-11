@@ -625,9 +625,15 @@ fn the_node_is_ioctl_only_and_numbered_like_alsa() {
         dev.read_at(0, &mut [0u8; 4]),
         Err(FsError::NotSupported)
     ));
-    assert!(matches!(dev.write_at(0, &[0u8; 4]), Err(FsError::NotSupported)));
+    assert!(matches!(
+        dev.write_at(0, &[0u8; 4]),
+        Err(FsError::NotSupported)
+    ));
     let p = dev.poll().unwrap();
-    assert_eq!((p.read, p.write, p.error, p.hangup), (false, false, false, false));
+    assert_eq!(
+        (p.read, p.write, p.error, p.hangup),
+        (false, false, false, false)
+    );
 
     let m = dev.metadata().unwrap();
     assert_eq!(m.type_, FileType::CharDevice);
@@ -639,5 +645,8 @@ fn the_node_is_ioctl_only_and_numbered_like_alsa() {
     }
     // Y cada nodo tiene su propio inodo.
     let (_, other) = ctl();
-    assert_ne!(dev.metadata().unwrap().inode, other.metadata().unwrap().inode);
+    assert_ne!(
+        dev.metadata().unwrap().inode,
+        other.metadata().unwrap().inode
+    );
 }

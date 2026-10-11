@@ -377,10 +377,7 @@ mod tests {
         assert_eq!(ioctl_int(&dev, READ_CAPS, 0).unwrap(), 0);
         // La máscara son exactamente los dos canales que este mezclador
         // tiene, y ninguno más.
-        assert_eq!(
-            DEVMASK,
-            (1 << SOUND_MIXER_VOLUME) | (1 << SOUND_MIXER_PCM)
-        );
+        assert_eq!(DEVMASK, (1 << SOUND_MIXER_VOLUME) | (1 << SOUND_MIXER_PCM));
         // `RECSRC` contesta cero se lea o se escriba: no hay fuente de
         // grabación que elegir.
         assert_eq!(ioctl_int(&dev, READ_RECSRC, 0).unwrap(), 0);
@@ -481,11 +478,8 @@ mod tests {
             id: [b'z'; 16],
             name: [b'z'; 32],
         };
-        dev.io_control(
-            SOUND_OLD_MIXER_INFO,
-            &mut old as *mut OldMixerInfo as usize,
-        )
-        .unwrap();
+        dev.io_control(SOUND_OLD_MIXER_INFO, &mut old as *mut OldMixerInfo as usize)
+            .unwrap();
         assert_eq!(cstr(&old.id), "EclipseHDA3");
         assert_eq!(cstr(&old.name), "fake-audio");
     }
