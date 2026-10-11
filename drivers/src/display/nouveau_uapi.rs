@@ -704,15 +704,20 @@ pub(super) fn format_client_mem() -> alloc::string::String {
         GEM_BOTH.load(Ordering::Relaxed),
         mib(GEM_BOTH_BYTES.load(Ordering::Relaxed)),
     );
-    // And the datum that decides whether a VRAM placement path is worth
-    // building: bytes no client ever mmaps are bytes that need no host PA, so
-    // they could live in VRAM instead of crossing PCIe on every GPU access.
-    let (mapped_n, mapped_bytes) = crate::scheme::gem_mmap::cpu_mapped_totals();
+    // And the datum that bears on whether a VRAM placement path is worth
+    // building: an object whose host physical address nothing ever asks for
+    // needs no host PA, so it could live in VRAM instead of crossing PCIe on
+    // every GPU access. The four consumers that ask are an mmap, a PRIME
+    // export, an ADDFB2 framebuffer and the hardware cursor -- the last two
+    // read the physmap window with no userspace mapping at all, so counting
+    // mmap alone would call them VRAM-eligible when they are not.
+    let (host_pa_n, host_pa_bytes) = crate::scheme::gem_mmap::host_pa_totals();
     let _ = writeln!(
         s,
-        "[gpudbg]  GEM CPU-mmap'd by a client: {} object(s), {} MiB (of {} allocated)",
-        mapped_n,
-        mib(mapped_bytes),
+        "[gpudbg]  GEM host PA handed out (mmap/PRIME/fb/cursor): {} object(s), {} MiB (of {} \
+         allocated)",
+        host_pa_n,
+        mib(host_pa_bytes),
         gem_total,
     );
     let non_generic = VMBIND_NON_GENERIC.load(Ordering::Relaxed);

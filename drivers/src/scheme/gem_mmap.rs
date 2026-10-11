@@ -146,11 +146,12 @@ struct MappedGem {
     /// without closing its own self-imports leaked the buffer until reboot
     /// (its import references were not attributable to it).
     holders: Vec<u64>,
-    /// Whether a client has ever mmap'd this object through
-    /// `DrmDev::get_vmo`. Only guards double-counting while the entry lives;
-    /// the running totals are the two atomics below, so an object that was
-    /// mapped and then freed still counts.
-    cpu_mapped: bool,
+    /// Whether this object's host physical address has ever been handed to a
+    /// consumer that needs it (mmap, PRIME export, ADDFB2, the cursor). Only
+    /// guards double-counting while the entry lives; the running totals are
+    /// the two atomics below, so an object that was used and then freed still
+    /// counts.
+    host_pa_given: bool,
 }
 
 /// Outcome of [`dec_ref`], so `GEM_CLOSE` can tell "still shared, keep it" from
@@ -176,39 +177,54 @@ lazy_static::lazy_static! {
     static ref MAPPINGS: Mutex<Vec<MappedGem>> = Mutex::new(Vec::new());
 }
 
-/// How many distinct GEM objects a client has mmap'd, and their total bytes.
+/// How many distinct GEM objects have had their host physical address handed
+/// out, and their total bytes.
 ///
-/// `/proc/gpudbg` already counts how many GEM objects COULD be CPU-mapped
-/// (a host PA resolved for them), which on the nouveau path is every single
+/// `/proc/gpudbg` already counts how many GEM objects COULD give one out (a
+/// host PA resolved at `GEM_NEW`), which on the nouveau path is every single
 /// one -- `GEM_NEW` backs GART, and GART|VRAM, with sysmem precisely so a
-/// host PA exists. That tells us nothing about how many the client actually
-/// touches from the CPU, and that is the number that decides whether a VRAM
-/// placement path is worth building: bytes no client ever mmaps are bytes
-/// that could live in VRAM instead of crossing PCIe on every access.
-static CPU_MAPPED_COUNT: AtomicU32 = AtomicU32::new(0);
-static CPU_MAPPED_BYTES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-
-/// Note that a client mmap'd `handle`, counting it once per object.
+/// host PA exists. This counts the ones something actually asked for, which
+/// is the number that bears on a VRAM placement path: an object nothing ever
+/// needs a host address for could live in VRAM instead of crossing PCIe on
+/// every GPU access.
 ///
-/// Called from the mmap path only. `lookup_for` is not the place: PRIME
-/// export and dma-buf also go through it, and neither is a CPU mapping.
-pub fn note_cpu_mapped(handle: u32) {
+/// "Host PA handed out" is deliberately wider than "a client mmap'd it", and
+/// the wider reading is the correct one for this question. A GEM that backs
+/// an ADDFB2 framebuffer or the hardware cursor is read by the present path
+/// straight out of the physmap window, with no userspace mapping anywhere
+/// (`linux-object`'s drm module resolves it and `scanout` reads
+/// `phys_to_virt(fb.phys_addr)`), and a GEM exported over PRIME is mapped
+/// through the dma-buf's own VMO, which never reaches `DrmDev::get_vmo`.
+/// Counting only mmap would call all of those VRAM-eligible when they are
+/// not. So the callers are the places that actually take the address: mmap,
+/// PRIME export, ADDFB2 and the cursor.
+static HOST_PA_COUNT: AtomicU32 = AtomicU32::new(0);
+static HOST_PA_BYTES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Note that `handle`'s host physical address was handed out, counting it
+/// once per object however many consumers take it.
+///
+/// `lookup_for` itself is not the seam: `gem_handle_mappable` and the ADDFB2
+/// and cursor validity checks go through it to answer a yes/no question and
+/// take no address, so counting there would count probes.
+pub fn note_host_pa_handed_out(handle: u32) {
     let mut table = MAPPINGS.lock();
     if let Some(e) = table.iter_mut().find(|e| e.handle == handle) {
-        if !e.cpu_mapped {
-            e.cpu_mapped = true;
+        if !e.host_pa_given {
+            e.host_pa_given = true;
             let size = e.size;
-            CPU_MAPPED_COUNT.fetch_add(1, Ordering::Relaxed);
-            CPU_MAPPED_BYTES.fetch_add(size, Ordering::Relaxed);
+            HOST_PA_COUNT.fetch_add(1, Ordering::Relaxed);
+            HOST_PA_BYTES.fetch_add(size, Ordering::Relaxed);
         }
     }
 }
 
-/// `(objects, bytes)` a client has mmap'd since boot.
-pub fn cpu_mapped_totals() -> (u32, u64) {
+/// `(objects, bytes)` whose host physical address has been handed out since
+/// boot.
+pub fn host_pa_totals() -> (u32, u64) {
     (
-        CPU_MAPPED_COUNT.load(Ordering::Relaxed),
-        CPU_MAPPED_BYTES.load(Ordering::Relaxed),
+        HOST_PA_COUNT.load(Ordering::Relaxed),
+        HOST_PA_BYTES.load(Ordering::Relaxed),
     )
 }
 
@@ -242,7 +258,7 @@ pub fn register(handle: u32, phys_addr: u64, size: u64, owner_pid: u64) {
             phys_addr,
             size,
             holders: alloc::vec![owner_pid],
-            cpu_mapped: false,
+            host_pa_given: false,
         });
     }
 }
@@ -1069,7 +1085,7 @@ mod benches {
 }
 
 #[cfg(test)]
-mod cpu_mapped_counter_tests {
+mod host_pa_counter_tests {
     use super::*;
 
     /// Pid of the client doing the mapping. In the driver-private range, where
@@ -1089,24 +1105,25 @@ mod cpu_mapped_counter_tests {
         body()
     }
 
-    /// A client mmap'ing the same buffer twice (a re-map after munmap, or two
-    /// threads racing into the same fd) must not count its bytes twice: the
-    /// number is "how much memory a client reaches from the CPU", and double
-    /// counting it would make a VRAM placement look less worthwhile than it is.
+    /// One object taken by several consumers (mmap'd, then exported over
+    /// PRIME, then stamped as a framebuffer) must not count its bytes once
+    /// per consumer: the number is "how many bytes something needs a host
+    /// address for", and double counting would make a VRAM placement look
+    /// less worthwhile than it is.
     #[test]
-    fn mapping_the_same_object_twice_counts_it_once() {
+    fn several_consumers_of_one_object_count_it_once() {
         alone_with_the_counters(|| {
             let handle = DRIVER_HANDLE_BASE + 0x20_0001;
             let size = 0x10_0000;
             register(handle, 0x5_0000_0000, size, CLIENT);
 
-            let (n0, b0) = cpu_mapped_totals();
-            note_cpu_mapped(handle);
-            note_cpu_mapped(handle);
-            note_cpu_mapped(handle);
-            let (n1, b1) = cpu_mapped_totals();
+            let (n0, b0) = host_pa_totals();
+            note_host_pa_handed_out(handle);
+            note_host_pa_handed_out(handle);
+            note_host_pa_handed_out(handle);
+            let (n1, b1) = host_pa_totals();
 
-            assert_eq!(n1 - n0, 1, "three mmaps of one object are one object");
+            assert_eq!(n1 - n0, 1, "three consumers of one object are one object");
             assert_eq!(b1 - b0, size, "and its bytes are counted once");
 
             drop_handle(handle);
@@ -1114,33 +1131,33 @@ mod cpu_mapped_counter_tests {
     }
 
     /// The totals are "since boot", so freeing the object must not take its
-    /// bytes back out: a frame that was mapped, used and freed is still a
-    /// frame that had to live where the CPU could reach it.
+    /// bytes back out: a frame that was used and freed is still a frame that
+    /// had to live where the CPU could reach it.
     #[test]
     fn the_totals_survive_the_object_being_freed() {
         alone_with_the_counters(|| {
             let handle = DRIVER_HANDLE_BASE + 0x20_0002;
             let size = 0x4_0000;
             register(handle, 0x5_0010_0000, size, CLIENT);
-            note_cpu_mapped(handle);
-            let (n0, b0) = cpu_mapped_totals();
+            note_host_pa_handed_out(handle);
+            let (n0, b0) = host_pa_totals();
 
             assert!(unregister(handle), "the entry was there to remove");
-            let (n1, b1) = cpu_mapped_totals();
+            let (n1, b1) = host_pa_totals();
 
             assert_eq!((n1, b1), (n0, b0), "freeing it does not un-count it");
         });
     }
 
-    /// An mmap of a handle this table never saw must not be counted: it has
-    /// no size here, so counting it would add an object worth zero bytes and
-    /// make the average object look smaller than it is.
+    /// A handle this table never saw must not be counted: it has no size
+    /// here, so counting it would add an object worth zero bytes and make the
+    /// average object look smaller than it is.
     #[test]
     fn an_untracked_handle_is_not_counted() {
         alone_with_the_counters(|| {
-            let (n0, b0) = cpu_mapped_totals();
-            note_cpu_mapped(DRIVER_HANDLE_BASE + 0x2f_f001);
-            assert_eq!(cpu_mapped_totals(), (n0, b0));
+            let (n0, b0) = host_pa_totals();
+            note_host_pa_handed_out(DRIVER_HANDLE_BASE + 0x2f_f001);
+            assert_eq!(host_pa_totals(), (n0, b0));
         });
     }
 
@@ -1155,10 +1172,10 @@ mod cpu_mapped_counter_tests {
             register(a, 0x5_0020_0000, 0x1_0000, CLIENT);
             register(b, 0x5_0030_0000, 0x2_0000, CLIENT);
 
-            let (n0, b0) = cpu_mapped_totals();
-            note_cpu_mapped(a);
-            note_cpu_mapped(b);
-            let (n1, b1) = cpu_mapped_totals();
+            let (n0, b0) = host_pa_totals();
+            note_host_pa_handed_out(a);
+            note_host_pa_handed_out(b);
+            let (n1, b1) = host_pa_totals();
 
             assert_eq!(n1 - n0, 2);
             assert_eq!(b1 - b0, 0x3_0000);

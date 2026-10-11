@@ -2753,6 +2753,10 @@ pub fn export_handle(handle_id: u32) -> Option<(u64, usize, Arc<VmObject>)> {
     // `lookup` plus `holds(handle, pid)`, which is the nouveau table's own
     // record of who took a reference.
     let (phys_addr, size) = zcore_drivers::scheme::gem_mmap::lookup_for(handle_id, pid)?;
+    // The dma-buf hands this range out through its own VMO, which never
+    // reaches `DrmDev::get_vmo`, so the export is where this object's host
+    // address is given away. See `gem_mmap::note_host_pa_handed_out`.
+    zcore_drivers::scheme::gem_mmap::note_host_pa_handed_out(handle_id);
     let vmo = nouveau_cpu_vmo(handle_id, phys_addr, size as usize);
     Some((phys_addr, size as usize, vmo))
 }
@@ -3157,7 +3161,14 @@ pub fn create_fb_with_layout(
     // ("create_fb returned None") before any atomic commit — the exact RTX
     // bring-up blocker seen as "Swapchain for output 'HDMI-A-1' failed test".
     let (phys_addr, buf_size) = match resolve_gem_backing_for(handle_id, current_pid()) {
-        Some(v) => v,
+        Some(v) => {
+            // A framebuffer's pixels are read straight out of the physmap
+            // window by `scanout`, with no userspace mapping anywhere, so
+            // this object needs a host address. See
+            // `gem_mmap::note_host_pa_handed_out`.
+            zcore_drivers::scheme::gem_mmap::note_host_pa_handed_out(handle_id);
+            v
+        }
         None => {
             // Loud, not a silent `?`: an unresolvable ADDFB2 handle is exactly
             // "the swapchain buffer has no backing the present path can read",

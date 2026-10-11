@@ -732,14 +732,16 @@ impl DrmDev {
             // dumb-buffer branch above is already owner-checked inside
             // `handle_vmo`; this was the remaining door.
             mmap_len_check(len, size as usize)?;
-            // Count the object as CPU-mapped, once. This is the only place a
-            // client actually gets a CPU mapping of a nouveau GEM object:
-            // `lookup_for` is also the PRIME-export and dma-buf path, and
-            // neither of those needs a host PA for the CPU. /proc/gpudbg
-            // reports the total, because bytes no client ever mmaps are
-            // bytes that could live in VRAM rather than cross PCIe on every
-            // GPU access -- and today every GEM object is sysmem.
-            zcore_drivers::scheme::gem_mmap::note_cpu_mapped(handle_id);
+            // One of the four places a nouveau GEM's host physical address is
+            // actually handed to a consumer (here, PRIME export, ADDFB2 and
+            // the cursor); /proc/gpudbg totals them, because an object nothing
+            // needs a host address for could live in VRAM rather than cross
+            // PCIe on every GPU access -- and today every GEM object is
+            // sysmem. Counted here rather than after the VMAR install
+            // succeeds on purpose: asking for a CPU mapping is the signal,
+            // and an mmap that fails to install was still a client that
+            // needed this object host-visible.
+            zcore_drivers::scheme::gem_mmap::note_host_pa_handed_out(handle_id);
             Ok(drm::nouveau_cpu_vmo(handle_id, phys_addr, size as usize))
         } else {
             Err(FsError::InvalidParam)
@@ -2188,6 +2190,10 @@ impl DrmDev {
                         else {
                             return Err(FsError::EntryNotFound);
                         };
+                        // The cursor's pixels are read from the physmap
+                        // window, so this object needs a host address even
+                        // though nobody mmaps it.
+                        zcore_drivers::scheme::gem_mmap::note_host_pa_handed_out(cur.handle);
                         let bytes = (cur.width as usize) * (cur.height as usize) * 4;
                         if size < bytes {
                             return Err(FsError::InvalidParam);
