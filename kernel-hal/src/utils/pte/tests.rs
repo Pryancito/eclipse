@@ -892,11 +892,12 @@ fn a_child_of_a_split_can_be_marked_written() {
     assert_eq!(child.raw(), before);
 }
 
-/// The regression that took every coroutine stack's hard guard band away: the
-/// dirty bit carried across `set_flags` made a no-access entry non-empty, and
-/// `From<PTF>` then fell through to `READ`.
+/// The regression that took every coroutine stack's hard guard band away --
+/// the dirty bit carried across `set_flags` made a no-access entry non-empty,
+/// so `From<PTF>` fell through to `READ` -- and the older one of the same
+/// shape underneath it: a no-access huge leaf keeps its page-size bit.
 #[test]
-fn the_hardware_bits_are_not_permissions() {
+fn an_absent_entry_grants_nothing_whatever_else_it_carries() {
     use ::x86_64::structures::paging::page_table::PageTableFlags as PTF;
     // Straight through the conversion, both bits, on their own and together.
     assert!(
@@ -928,6 +929,40 @@ fn the_hardware_bits_are_not_permissions() {
         "the band is still readable after clearing its permissions"
     );
     assert_eq!(e.addr(), FRAME, "and the frame is still in the entry");
+
+    // And the other bit that is not a permission: the page-size bit. A
+    // no-access huge leaf keeps PS -- that is how this kernel spells
+    // PROT_NONE over 2 MiB -- and `split_huge_page` copies what `flags()`
+    // says into 512 PRESENT children, so reading PS as `READ | EXECUTE`
+    // turns a mapping the process may not touch into 512 it may read and
+    // execute.
+    let mut huge = a_leaf(X86PTE::zeroed(), FRAME, rw(), true);
+    assert_eq!(huge.raw() & X86_PS, X86_PS);
+    huge.set_flags(MMUFlags::empty(), true);
+    assert_eq!(
+        huge.raw() & X86_PS,
+        X86_PS,
+        "still a leaf, so still claimed"
+    );
+    assert!(huge.is_leaf(), "and `map` over it must still be refused");
+    assert!(!huge.is_present());
+    assert!(
+        huge.flags().is_empty(),
+        "a PROT_NONE huge mapping grants {:?}",
+        huge.flags()
+    );
+
+    // Which is the whole rule: no PRESENT bit, no permissions, whatever else
+    // the entry carries.
+    for raw in [X86_PS, X86_DIRTY, X86_ACCESSED, X86_WRITABLE, X86_USER, 0] {
+        let e = X86PTE::from_raw(FRAME as u64 | raw);
+        assert!(
+            e.flags().is_empty(),
+            "an absent entry with {:#x} granted {:?}",
+            raw,
+            e.flags()
+        );
+    }
 }
 
 #[test]
