@@ -91,6 +91,15 @@ pub fn set_clock_observer(_observer: fn()) {}
 /// Force the TSC to be considered usable by userspace (libos: no vDSO).
 pub fn set_force_tsc_invariant(_force: bool) {}
 
+/// Tickless idle switch (libos: the host owns the CPUs and there is no LAPIC
+/// count to stretch, so there is nothing to turn off).
+pub fn set_tickless_idle(_on: bool) {}
+
+/// Whether idle CPUs may stretch their tick (libos: never).
+pub fn tickless_idle() -> bool {
+    false
+}
+
 /// Bare-metal timer-callback containment flag (libos: always false).
 pub fn in_timer_callback() -> bool {
     false

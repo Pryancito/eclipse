@@ -199,6 +199,36 @@ pub fn counts_per_tick(hz: u64, ticks_per_sec: u64) -> u32 {
     (hz / ticks_per_sec).clamp(1, u32::MAX as u64) as u32
 }
 
+/// The one CPU that keeps the full-rate tick however idle it is.
+///
+/// Linux calls it the timekeeper and keeps one for the same reason: some
+/// per-tick work belongs to the machine, not to a CPU. On this kernel that is
+/// the xHCI HID poll and the text cursor blink, both claimed by whichever core
+/// ticks first and neither of which has an owner.
+///
+/// The boot CPU, because it is the only id guaranteed to exist and be online:
+/// an AP can be absent (`smp=1`), capped out (`smp=<N>`) or simply fail to
+/// start, and a timekeeper that was never brought up is no timekeeper.
+pub const TIMEKEEPER_CPU: usize = 0;
+
+/// Whether `cpu` may stretch its tick past the scheduler period when it runs
+/// out of work.
+///
+/// **This is the rule the first attempt at tickless idle did not have, and the
+/// reason it killed the keyboard.** It stretched every idle CPU, so on an idle
+/// machine the HID poll — which any ticking core may claim, rate-limited to
+/// ~125 Hz between them — was reached at the stretched rate by all of them,
+/// and input went with it. Keeping [`TIMEKEEPER_CPU`] at full rate means the
+/// path that died is the path that cannot stop running.
+///
+/// The deadline timer is the other condition and not a detail: the stretch is
+/// expressed by re-arming this CPU's timer for a wider bound, and with the
+/// deadline timer off there is no re-arm — only a fixed periodic count that
+/// nothing would ever bring back.
+pub fn may_stretch_tick(cpu: usize, tickless_on: bool, deadline_timer_on: bool) -> bool {
+    tickless_on && deadline_timer_on && cpu != TIMEKEEPER_CPU
+}
+
 /// Which *other* CPU's timer heap, if any, has fallen so far behind that the
 /// CPU taking its own tick should drain it on the owner's behalf.
 ///
@@ -1098,6 +1128,106 @@ mod tests {
                 assert_eq!(slice, masked, "next={next:?} me={me}");
             }
         }
+    }
+
+    // ── tickless idle: who may stretch, and what the wider bound arms ──────
+
+    /// 50 ms ≈ 20 Hz: the ceiling an idle CPU sleeps to when it owns no timer.
+    const IDLE_CAP: u64 = 50 * MS;
+
+    #[test]
+    fn the_timekeeper_never_stretches_whatever_else_is_true() {
+        // The rule that keeps the keyboard alive. The first attempt at
+        // tickless stretched every idle CPU, and the xHCI HID poll — which any
+        // ticking core may claim — was then reached at 20 Hz by all of them.
+        assert!(!may_stretch_tick(TIMEKEEPER_CPU, true, true));
+        assert!(may_stretch_tick(TIMEKEEPER_CPU + 1, true, true));
+    }
+
+    #[test]
+    fn nobody_stretches_with_the_switch_down_or_the_deadline_timer_off() {
+        // `tickless=off` is the escape hatch and has to reach every CPU. And
+        // with the deadline timer off there is no re-arm to express a stretch
+        // with, only a fixed periodic count that nothing would bring back.
+        for cpu in [TIMEKEEPER_CPU, TIMEKEEPER_CPU + 1, 19] {
+            // Edition 2018 here: no inline format args in a panic message.
+            assert!(!may_stretch_tick(cpu, false, true), "cpu={}", cpu);
+            assert!(!may_stretch_tick(cpu, true, false), "cpu={}", cpu);
+            assert!(!may_stretch_tick(cpu, false, false), "cpu={}", cpu);
+        }
+    }
+
+    #[test]
+    fn an_idle_cpu_that_owns_no_timer_arms_the_whole_stretched_bound() {
+        // `rearm_after_tick` passes the bound as `tick_ns`; with no deadline of
+        // its own there is nothing to bring the timer forward for, so the
+        // freshly programmed 50 ms period stands. `None` is that answer.
+        assert_eq!(
+            rearm_span(NOW, NO_DEADLINE, NOW + IDLE_CAP, IDLE_CAP, FLOOR),
+            None
+        );
+    }
+
+    #[test]
+    fn the_stretch_never_delays_a_timer_the_cpu_already_owns() {
+        // The bound is a ceiling, not a span. An idle CPU holding a 3 ms
+        // deadline still wakes in 3 ms — which is the half the first attempt
+        // got wrong in the other direction, by arming a hand-computed count
+        // that ignored the heap.
+        assert_eq!(
+            rearm_span(NOW, NOW + 3 * MS, NOW + IDLE_CAP, IDLE_CAP, FLOOR),
+            Some(3 * MS)
+        );
+        // And one further out than the fast tick but inside the stretch is now
+        // armed for its own distance instead of being clamped to 4 ms.
+        assert_eq!(
+            rearm_span(NOW, NOW + 30 * MS, NOW + IDLE_CAP, IDLE_CAP, FLOOR),
+            Some(30 * MS)
+        );
+    }
+
+    #[test]
+    fn a_deadline_beyond_the_stretch_is_cut_back_to_it() {
+        // So a timer *set* after this CPU halted is still serviced within the
+        // cap, and the HID-rate work on the timekeeper is unaffected either way.
+        assert_eq!(
+            rearm_span(NOW, NOW + 10_000 * MS, NOW + IDLE_CAP, IDLE_CAP, FLOOR),
+            None,
+            "nothing inside the window to bring the timer forward for"
+        );
+    }
+
+    #[test]
+    fn a_timer_set_on_a_stretched_cpu_brings_its_tick_forward() {
+        // `timer_set` arms through `arm_span` with the stretched bound. A CPU
+        // armed 50 ms out that is handed a 2 ms timer must not wait 50 ms for
+        // it: this is the shell's `poll(stdin)` re-arm, i.e. the exact symptom
+        // reported as "all timers stalled".
+        assert_eq!(
+            arm_span(
+                NOW,
+                NOW + 2 * MS,
+                NOW + IDLE_CAP,
+                NOW + IDLE_CAP,
+                IDLE_CAP,
+                FLOOR
+            ),
+            Some(2 * MS)
+        );
+    }
+
+    #[test]
+    fn coming_back_to_the_fast_tick_is_not_refused_by_the_hysteresis() {
+        // The way back is `rearm_after_tick` with the narrow bound, and it
+        // republishes `TICK_DUE`/`ARMED` itself rather than asking `arm_span`
+        // -- because narrowing the ceiling buys nothing by the hysteresis test
+        // and would be declined. This pins that the asking form really would
+        // decline it, which is why the code does not ask.
+        assert_eq!(
+            arm_span(NOW, NOW + TICK, NOW + TICK, NOW + TICK, TICK, FLOOR),
+            None,
+            "the hysteresis declines it, so the restore must not go through here"
+        );
     }
 
     #[test]

@@ -14,30 +14,121 @@ use crate::deadline::{duration_to_ns, is_due, TimerHeap, NO_DEADLINE};
 /// workload. (Previous value was 100 Hz / 10 ms which caused noticeable lag.)
 pub(super) const TICKS_PER_SEC: u64 = 250;
 
-/// Master switch for tickless idle. Set to `false` to fall back to the plain
-/// full-rate periodic tick everywhere. Only consumed on arches with a re-armable
-/// per-CPU timer (x86_64 today).
+/// Master switch for tickless idle, lowered by `tickless=off` on the kernel
+/// command line. Only consumed on arches with a re-armable per-CPU timer
+/// (x86_64 today).
 ///
-/// Currently DISABLED: stretching the LAPIC count in `timer_idle_enter` was
-/// observed to stop the timer from firing once a CPU actually halts — pending
-/// timers (the poll/select 4 ms re-arm, socket fallbacks, scheduled wakeups)
-/// then never expire. A net busy-spin had been masking this by keeping the CPUs
-/// awake and the LAPIC at its full-rate count; the moment the spin was removed
-/// (so the cores genuinely halted) all timers stalled, which froze the shell's
-/// `poll(stdin)` re-poll loop and with it the xHCI HID polling — i.e. the
-/// keyboard/mouse went dead. With tickless off the LAPIC keeps its 250 Hz
-/// periodic count, so timers fire reliably; an idle CPU still halts via `hlt`
-/// between ticks (≈99 % idle), it just wakes every 4 ms. Re-enabling tickless
-/// needs the re-arm path fixed so a halted CPU's timer still expires.
-#[allow(dead_code)]
-const TICKLESS_IDLE: bool = false;
+/// **It was a `const false` for a while, and the history is the design.** The
+/// first attempt stretched the LAPIC count on EVERY idle CPU, and what people
+/// saw was that "the timer stopped firing once a CPU actually halts": pending
+/// timers never expired, the shell's `poll(stdin)` re-poll loop froze, and with
+/// it the xHCI HID poll — the keyboard and mouse went dead. Three separate
+/// things were wrong, and only the first was ever written down:
+///
+/// 1. **Nothing was left on watch.** Two jobs ride on whichever CPU happens to
+///    be ticking, not on the CPU that owns them: the xHCI HID poll (rate-limited
+///    to ~125 Hz across all cores) and the text cursor blink. Stretch every
+///    CPU to 20 Hz and input is sampled at 20 Hz — on a machine where the shell
+///    is also waiting on a timer that nobody is taking. Hence
+///    [`crate::deadline::TIMEKEEPER_CPU`]: one CPU never stretches, so the full-rate path that
+///    died is exactly the path that keeps running.
+/// 2. **The tick undid the stretch, and then the stretch undid the tick.**
+///    `rearm_after_tick` reprogrammed `fast_tick_count()` unconditionally at
+///    the end of every tick, so a stretched CPU came back to 4 ms one tick
+///    later; meanwhile `timer_idle_enter` wrote the LAPIC count by hand,
+///    bypassing [`ARMED_NS`] and `TICK_DUE_NS`, so the two mechanisms
+///    disagreed about what this CPU was armed for. Now there is one answer:
+///    [`tick_bound_ns`], the bound this CPU's tick is allowed to reach, which
+///    the idle flag widens — and every arm goes through the same
+///    `arm_span`/`rearm_span` arithmetic as before, floor and hysteresis
+///    included.
+/// 3. **Almost nothing cleared the flag.** `timer_idle_exit` was reached only
+///    from `ThreadSwitchFuture::poll`, i.e. only when a USER thread ran. A CPU
+///    woken for kernel work — a driver future, a deferred job — kept the
+///    stretched bound while it worked. It is now cleared on the idle callback's
+///    own entry, and the tick clears a stale one itself the moment it sees a
+///    live executor on this CPU.
+///
+/// What it buys: an idle CPU wakes at 20 Hz instead of 250. On a 20-thread
+/// machine that is 630 wakes a second instead of 5.000, and under an emulator
+/// every one of those is a host thread leaving `hlt`.
+static TICKLESS_IDLE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(true);
+
+/// Turn tickless idle off (or back on) for this boot. `tickless=off`.
+pub fn set_tickless_idle(on: bool) {
+    TICKLESS_IDLE.store(on, Ordering::Relaxed);
+}
+
+/// Whether idle CPUs may stretch their tick this boot.
+#[inline]
+pub fn tickless_idle() -> bool {
+    TICKLESS_IDLE.load(Ordering::Relaxed)
+}
+
+/// Whether `cpu` is allowed to stretch its tick when it runs out of work.
+///
+/// The rule itself — and why `crate::deadline::TIMEKEEPER_CPU` never stretches,
+/// which is the whole fix — lives with the arithmetic in
+/// [`crate::deadline::may_stretch_tick`], where it is testable on the host. The
+/// cost of keeping the boot CPU at full rate is what every CPU paid before, so
+/// a single-CPU boot behaves exactly as it always has.
+#[inline]
+fn may_go_tickless(cpu: usize) -> bool {
+    crate::deadline::may_stretch_tick(cpu, tickless_idle(), DEADLINE_TIMER.load(Ordering::Relaxed))
+}
+
+/// How far ahead this CPU's tick may be programmed right now.
+///
+/// The single answer both arm paths and the gap accounting take, so they cannot
+/// disagree about what this CPU is armed for — which is what went wrong the
+/// first time (see [`TICKLESS_IDLE`]). A nearer pending deadline still wins:
+/// this is the ceiling, not the span.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn tick_bound_ns() -> u64 {
+    if super::percpu::timer_idle_armed() {
+        IDLE_TICK_CAP_NS
+    } else {
+        super::arch::timer::fast_tick_ns()
+    }
+}
+
+/// End this CPU's tickless stretch and put its tick back at the full rate.
+///
+/// Idempotent and cheap (one per-CPU flag read) when there is no stretch to
+/// end, which is what lets every path that resumes work on a CPU call it
+/// unconditionally — and every path that resumes work on a CPU has to, or the
+/// stretched preemption ceiling outlives the idleness that earned it.
+///
+/// Not gated on [`tickless_idle`]: a CPU stretched before the switch was
+/// lowered still has to be able to come back.
+#[cfg(target_arch = "x86_64")]
+fn clear_idle_stretch() {
+    if !super::percpu::timer_idle_armed() {
+        return;
+    }
+    super::percpu::set_timer_idle_armed(false);
+    // `rearm_after_tick` republishes `TICK_DUE_NS` and `ARMED_NS` and programs
+    // the count itself, so the narrower bound lands without any hysteresis to
+    // argue with. Except when the deadline timer is off: then it returns having
+    // done nothing, and a CPU would keep its stretched 50 ms count for ever.
+    if DEADLINE_TIMER.load(Ordering::Relaxed) {
+        rearm_after_tick(duration_to_ns(super::arch::timer::timer_now()));
+    } else {
+        super::arch::timer::set_tick_count(super::arch::timer::fast_tick_count());
+    }
+}
 
 /// Upper bound on how long an idle CPU may sleep between scheduler ticks, in
 /// nanoseconds (50 ms ≈ 20 Hz). Nearer pending timers are always honoured; this
-/// only bounds the "nothing pending" case so USB-HID polling and the cursor
-/// blink keep running, and so a timer *set* after a CPU has already halted is
-/// serviced within this bound. Lowering it trades idle CPU for responsiveness.
-#[allow(dead_code)]
+/// only bounds the "nothing pending" case, and so a timer *set* after a CPU has
+/// already halted is serviced within this bound. Lowering it trades idle CPU
+/// for responsiveness.
+///
+/// USB-HID polling and the cursor blink do NOT depend on this bound: they are
+/// the machine's work, not a CPU's, and they stay on the timekeeper CPU at full
+/// rate. Believing they rode on this cap is what made the first attempt at
+/// tickless kill the keyboard.
 const IDLE_TICK_CAP_NS: u64 = 50_000_000;
 
 lazy_static::lazy_static! {
@@ -362,7 +453,10 @@ fn arm_deadline(now_ns: u64, target_ns: u64) {
         target_ns,
         TICK_DUE_NS[cpu].load(Ordering::Relaxed),
         ARMED_NS[cpu].load(Ordering::Relaxed),
-        super::arch::timer::fast_tick_ns(),
+        // The stretched bound while this CPU is idle-armed, so a timer set on a
+        // halted CPU is not clamped back to 4 ms and does not silently cancel
+        // the stretch either.
+        tick_bound_ns(),
         MIN_ARM_NS,
     ) else {
         return; // already firing at least this soon
@@ -384,12 +478,15 @@ fn rearm_after_tick(now_ns: u64) {
     if cpu >= crate::config::MAX_CORE_NUM {
         return;
     }
-    let tick_ns = super::arch::timer::fast_tick_ns();
+    // The bound, not the fast period: an idle-armed CPU re-establishes its
+    // stretched ceiling here. Writing `fast_tick_count()` unconditionally is
+    // what undid every stretch one tick after it was taken.
+    let tick_ns = tick_bound_ns();
     let tick_due = now_ns.saturating_add(tick_ns);
     TICK_DUE_NS[cpu].store(tick_due, Ordering::Relaxed);
     // Reset the armed marker first so the arm below is free to shorten again.
     ARMED_NS[cpu].store(tick_due, Ordering::Relaxed);
-    super::arch::timer::set_tick_count(super::arch::timer::fast_tick_count());
+    super::arch::timer::set_tick_count(super::arch::timer::ns_to_tick_count(tick_ns));
     // This CPU's own earliest deadline, not the machine's: arming every core
     // for every timer anywhere is what used to pull the whole machine up to
     // the `MIN_ARM_NS` interrupt floor (see `TIMER_HEAPS`).
@@ -694,12 +791,30 @@ hal_fn_impl! {
             let now = timer_now();
 
             // Gap since this CPU's previous tick: a CPU that did not run for
-            // tens of ms shows up here (see `kstats::note_tick_gap`).
+            // tens of ms shows up here (see `kstats::note_tick_gap`). The
+            // nominal period is the bound this tick was PROGRAMMED for, not
+            // the fast one: an idle CPU that slept its stretched 50 ms on
+            // purpose is not a late tick, and counting it as one would bury
+            // the busy gaps that are the real signal.
             #[cfg(target_arch = "x86_64")]
-            crate::kstats::note_tick_gap(
-                duration_to_ns(now),
-                super::arch::timer::fast_tick_ns(),
-            );
+            let programmed_ns = tick_bound_ns();
+            #[cfg(target_arch = "x86_64")]
+            crate::kstats::note_tick_gap(duration_to_ns(now), programmed_ns);
+
+            // A stretch this CPU no longer deserves. `timer_idle_exit` is the
+            // ordinary way out, but it is reached from the thread-switch poll
+            // and the idle callback, and neither runs if this CPU was woken
+            // straight into kernel work. Left standing, the flag would keep a
+            // 50 ms preemption ceiling on a CPU that is running a task.
+            //
+            // `irq_on_idle_executor` answers `false` both for "an executor is
+            // current" and for "its runtime lock is held, so unknown", and
+            // both are the safe direction here: the only thing lost is idle
+            // savings on this one CPU until its next halt.
+            #[cfg(target_arch = "x86_64")]
+            if super::percpu::timer_idle_armed() && !::executor::irq_on_idle_executor() {
+                clear_idle_stretch();
+            }
 
             // Maintain the cross-CPU monotonic floor (and watch for TSC skew)
             // at tick rate, so `timer_now()`'s invariant-TSC fast path can skip
@@ -849,27 +964,31 @@ hal_fn_impl! {
 
         fn timer_idle_enter() {
             #[cfg(target_arch = "x86_64")]
-            if TICKLESS_IDLE {
-                // Stretch this CPU's tick to the next pending timer deadline,
-                // capped, so a fully idle CPU stops taking the 250 Hz tick. The
-                // periodic timer keeps firing at the stretched period; on the
-                // next wake `timer_idle_exit` restores the fast tick.
-                let now = duration_to_ns(timer_now());
-                let next = NEXT_DEADLINE_NS[timer_cpu()].load(Ordering::Acquire);
-                let span = next.saturating_sub(now).min(IDLE_TICK_CAP_NS);
-                super::arch::timer::set_tick_count(super::arch::timer::ns_to_tick_count(span));
+            {
+                let cpu = timer_cpu();
+                if !may_go_tickless(cpu) {
+                    // A CPU that never stretches has nothing to clear; one that
+                    // stretched before `tickless=off` was lowered does, and
+                    // this is where it comes back.
+                    clear_idle_stretch();
+                    return;
+                }
+                // Raise the flag and then re-arm through the ORDINARY path: the
+                // flag widens `tick_bound_ns`, and `rearm_after_tick` still
+                // shortens the span for this CPU's own earliest deadline, with
+                // the same `MIN_ARM_NS` floor and the same hysteresis as every
+                // other arm. The first attempt wrote the LAPIC count by hand
+                // here, which is how the flag and `ARMED_NS` came to disagree.
                 super::percpu::set_timer_idle_armed(true);
+                rearm_after_tick(duration_to_ns(timer_now()));
             }
         }
 
         fn timer_idle_exit() {
+            // Resuming real work: back to the full-rate scheduler tick so
+            // preemption runs at its normal cadence.
             #[cfg(target_arch = "x86_64")]
-            if TICKLESS_IDLE && super::percpu::timer_idle_armed() {
-                // Resuming real work: restore the full-rate scheduler tick so
-                // preemption and HID polling run at their normal cadence.
-                super::arch::timer::set_tick_count(super::arch::timer::fast_tick_count());
-                super::percpu::set_timer_idle_armed(false);
-            }
+            clear_idle_stretch();
         }
     }
 }
