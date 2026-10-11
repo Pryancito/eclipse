@@ -30,6 +30,33 @@ pub trait GenericPTE: Debug + Clone + Copy + Sync + Send {
     /// Returns whether this entry maps to a huge frame (or it's a terminal entry).
     fn is_leaf(&self) -> bool;
 
+    /// Whether the hardware has ever recorded a write through this entry, or
+    /// `None` when this format cannot answer.
+    ///
+    /// `None` is the default on purpose. The one reader —
+    /// [`PageTableImpl::dirty_depth_from_top`], which bounds the scheduler's
+    /// stack poison — treats `None` as "assume every page was written", so a
+    /// format that has no such bit, or whose bit means something else, costs
+    /// an optimisation and nothing more. `Some(false)` is a *promise* that
+    /// nobody wrote this page, and a wrong promise there leaves a previous
+    /// coroutine's live return addresses sitting on a recycled stack.
+    fn dirty(&self) -> Option<bool> {
+        None
+    }
+
+    /// Record that a write may have happened through this entry.
+    ///
+    /// The hardware's own dirty bit cannot be *carried*: when a huge leaf is
+    /// split, its 512 children are built from zero, and when flags are
+    /// rewritten the entry is rebuilt from its address. Both would turn a page
+    /// the CPU had marked written into one that reads clean, which is the one
+    /// direction [`PageTableImpl::dirty_depth_from_top`] must never be wrong
+    /// in. So the two places that do it say so explicitly.
+    ///
+    /// A no-op by default, which is sound because a format whose
+    /// [`GenericPTE::dirty`] is `None` is never believed in the first place.
+    fn set_dirty(&mut self) {}
+
     /// Set flags for all types of entries.
     fn set_flags(&mut self, flags: MMUFlags, is_huge: bool);
     /// Set physical address for terminal entries.
@@ -101,6 +128,27 @@ impl<L: PageTableLevel, PTE: GenericPTE> PageTableImpl<L, PTE> {
         Ok((p1e, PageSize::Size4K))
     }
 
+    /// The table of 4 KiB entries that holds the one for `vaddr`, read only.
+    ///
+    /// `AlreadyMapped` when a huge leaf covers the address, so there is no
+    /// such table — the same spelling [`next_table_mut`] uses for "something
+    /// is mapped here, but it is not a table".
+    fn p1_table_of(&self, vaddr: VirtAddr) -> PagingResult<&[PTE]> {
+        let p3 = if L::LEVEL == 3 {
+            table_of_mut::<PTE>(self.table_phys())
+        } else if L::LEVEL == 4 {
+            let p4 = table_of_mut::<PTE>(self.table_phys());
+            let p4e = &p4[p4_index(vaddr)];
+            next_table_mut(p4e)?
+        } else {
+            unreachable!()
+        };
+        let p3e = &p3[p3_index(vaddr)];
+        let p2 = next_table_mut(p3e)?;
+        let p2e = &p2[p2_index(vaddr)];
+        Ok(next_table_mut(p2e)?)
+    }
+
     /// Replace the huge leaf that describes `vaddr` with a table of
     /// next-smaller leaves covering exactly the same physical range with the
     /// same flags, repeating until `vaddr` is described by a 4 KiB entry.
@@ -156,6 +204,28 @@ impl<L: PageTableLevel, PTE: GenericPTE> PageTableImpl<L, PTE> {
                 e.clear();
                 e.set_addr(base + i * child as usize);
                 e.set_flags(flags, child != PageSize::Size4K);
+                // Every child is born dirty, whatever the parent said.
+                //
+                // The children are built from zero and the parent's dirty bit
+                // cannot be carried into them, so it has to be put back by
+                // hand -- and *sampling* the parent is a lost update: the old
+                // leaf stays published until the store below, so a write
+                // through it on another CPU can set the parent's D after the
+                // sample, and the publish then replaces a now-dirty leaf with
+                // clean children. `SPLIT_LOCK` excludes other splitters, not
+                // ordinary writes through a live kernel mapping, and a CPU
+                // holding a stale huge TLB entry can write across the publish
+                // too. So the only answer that cannot be wrong in the
+                // dangerous direction is "all of them".
+                //
+                // It costs nothing where it matters: a split is never undone,
+                // and on x86-64 -- the one architecture whose dirty bit
+                // `dirty_depth_from_top` believes -- the kernel heap is part
+                // of the kernel image and already mapped in 4 KiB pages, so
+                // this loop does not run over it at all. Where it does run,
+                // the result is "poison the whole region", which is what the
+                // scheduler did before any of this existed.
+                e.set_dirty();
             }
             // The 512 stores above have to reach memory before the pointer to
             // them does: the frame was zeroed when it was reserved, so another
@@ -297,6 +367,65 @@ impl<L: PageTableLevel, PTE: GenericPTE> PageTableImpl<L, PTE> {
     /// or a stack guard page is a mapping the CPU still faults on.
     pub fn is_present(&self, vaddr: VirtAddr) -> bool {
         matches!(self.get_entry_mut(vaddr), Ok((entry, _)) if entry.is_present())
+    }
+
+    /// How many bytes at the **top** of `[base, base + size)` the hardware may
+    /// have recorded a write to, or `None` when this table cannot say.
+    ///
+    /// This is the permission slip for the scheduler's bounded stack poison
+    /// (`executor::poison_bound`). A coroutine stack grows down from the top
+    /// of its usable region, so what a previous occupant left behind is a run
+    /// of pages at the top, and poisoning only those is the difference between
+    /// 2 MiB and a few pages of stores on every preemption-mid-poll. What
+    /// makes it safe rather than hopeful is that the answer comes from the
+    /// hardware's own dirty bit, which nothing here ever clears: it is
+    /// monotone per frame, so it can only ever over-report, and over-reporting
+    /// costs stores.
+    ///
+    /// The scan runs bottom-up and stops at the **first** dirty page, which is
+    /// the deepest one: every page above it is inside the answer anyway, so
+    /// whether it is dirty, huge or absent does not change the result. A page
+    /// below that cannot answer — no dirty bit on this architecture, a huge
+    /// leaf, nothing mapped — makes the whole thing `None`, which the caller
+    /// reads as "poison everything", i.e. exactly what it did before this
+    /// existed.
+    ///
+    /// One walk per 2 MiB and then a straight scan of 8-byte entries, rather
+    /// than a walk per page: the 512 walks a naive loop would do cost more
+    /// than the stores they are there to avoid.
+    pub fn dirty_depth_from_top(&self, base: VirtAddr, size: usize) -> Option<usize> {
+        const PAGE: usize = PageSize::Size4K as usize;
+        const CHUNK: usize = PageSize::Size2M as usize;
+        if size == 0 {
+            return Some(0);
+        }
+        // Not page-aligned: the dirty bit is per page and this is not the
+        // caller's shape. Refuse rather than round, which would be a promise
+        // about bytes outside the pages that were asked about.
+        if !base.is_multiple_of(PAGE) || !size.is_multiple_of(PAGE) {
+            return None;
+        }
+        let mut table: Option<(usize, &[PTE])> = None;
+        for off in (0..size).step_by(PAGE) {
+            let vaddr = base + off;
+            let chunk = vaddr & !(CHUNK - 1);
+            let t = match table {
+                Some((c, t)) if c == chunk => t,
+                _ => {
+                    let t = self.p1_table_of(vaddr).ok()?;
+                    table = Some((chunk, t));
+                    t
+                }
+            };
+            let entry = &t[p1_index(vaddr)];
+            if !entry.is_present() {
+                return None;
+            }
+            if entry.dirty()? {
+                return Some(size - off);
+            }
+        }
+        Some(0)
     }
 
     pub fn clone_kernel(&self) -> Self {
@@ -559,6 +688,14 @@ mod walker_tests {
     /// The page-size bit: set in a P3 or P2 entry that maps a frame instead of
     /// pointing at the next table.
     const PS: u64 = 1 << 7;
+    /// The dirty bit, where x86 keeps it.
+    const D: u64 = 1 << 6;
+    /// Not a hardware bit: it makes an entry *mute*, so one table can hold
+    /// both entries that can answer "was this written" and entries that
+    /// cannot — which is what riscv64 and aarch64 always answer, and what a
+    /// mixed table can never happen to be on a real machine but is the
+    /// difference between "poison everything" and "poison nothing".
+    const MUTE: u64 = 1 << 5;
     const ADDR_MASK: u64 = 0x000f_ffff_ffff_f000;
     /// The `MMUFlags` the caller asked for, parked above the address so they
     /// survive a round trip. A real entry re-derives them from the hardware
@@ -585,6 +722,16 @@ mod walker_tests {
         }
         fn is_leaf(&self) -> bool {
             self.0 & PS != 0
+        }
+        fn dirty(&self) -> Option<bool> {
+            if self.0 & MUTE != 0 {
+                None
+            } else {
+                Some(self.0 & D != 0)
+            }
+        }
+        fn set_dirty(&mut self) {
+            self.0 |= D;
         }
         fn set_addr(&mut self, paddr: PhysAddr) {
             self.0 = (self.0 & !ADDR_MASK) | (paddr as u64 & ADDR_MASK);
@@ -1600,5 +1747,215 @@ mod walker_tests {
                 Err(PagingError::NotMapped)
             ));
         }
+    }
+
+    // ── the dirty depth that bounds the scheduler's stack poison ───────────
+    //
+    // `Executor::new` poisons the usable region of every coroutine stack it
+    // builds, 2 MiB of stores, because a frame left there by the previous
+    // occupant of a recycled block is the one stack content
+    // `classify_parked_frame` accepts as resumable. This is what lets it
+    // poison only the pages that were written: an answer that is too small is
+    // that frame surviving, so every test below is about the direction of the
+    // error.
+
+    /// Map `pages` 4 KiB pages from `base` and hand back the table.
+    fn a_mapped_run<L: PageTableLevel>(base: usize, pages: usize) -> PageTableImpl<L, TestPTE> {
+        let mut pt = a_table::<L>();
+        for i in 0..pages {
+            pt.map(
+                Page::new_aligned(base + i * K, PageSize::Size4K),
+                0x1000_0000 + i * K,
+                rw(),
+            )
+            .unwrap();
+        }
+        pt
+    }
+
+    /// Set raw bits on the entry for `vaddr`, the way the CPU would.
+    fn set_bits<L: PageTableLevel>(pt: &PageTableImpl<L, TestPTE>, vaddr: usize, bits: u64) {
+        let (entry, size) = pt.get_entry_mut(vaddr).unwrap();
+        assert_eq!(size, PageSize::Size4K, "a 4 KiB entry, like the real one");
+        entry.0 |= bits;
+    }
+
+    const REGION: usize = 0x2e00_0000_0000;
+
+    #[test]
+    fn a_region_nobody_wrote_needs_no_poison() {
+        let pt = a_mapped_run::<PageTableLevel4>(REGION, 8);
+        assert_eq!(pt.dirty_depth_from_top(REGION, 8 * K), Some(0));
+    }
+
+    /// The test that separates the right answer from the one that is right by
+    /// the same amount in the wrong direction. A stack grows DOWN from the top
+    /// of its region, so the answer is counted down from the top: a write at
+    /// offset `2 * K` of an eight-page region means six pages have to be
+    /// poisoned, not two.
+    #[test]
+    fn the_depth_is_counted_down_from_the_top() {
+        let pt = a_mapped_run::<PageTableLevel4>(REGION, 8);
+        set_bits(&pt, REGION + 2 * K, D);
+        assert_eq!(pt.dirty_depth_from_top(REGION, 8 * K), Some(6 * K));
+
+        // Only the topmost page written is the cheapest real answer, and the
+        // one a bound that measured from the bottom would report as 8 pages.
+        let pt = a_mapped_run::<PageTableLevel4>(REGION, 8);
+        set_bits(&pt, REGION + 7 * K, D);
+        assert_eq!(pt.dirty_depth_from_top(REGION, 8 * K), Some(K));
+
+        // And the bottom page written is the whole region.
+        let pt = a_mapped_run::<PageTableLevel4>(REGION, 8);
+        set_bits(&pt, REGION, D);
+        assert_eq!(pt.dirty_depth_from_top(REGION, 8 * K), Some(8 * K));
+    }
+
+    /// Several written pages: the answer covers the deepest, not the first
+    /// one found or the count of them.
+    #[test]
+    fn the_deepest_written_page_sets_the_depth() {
+        let pt = a_mapped_run::<PageTableLevel4>(REGION, 8);
+        for off in [1usize, 5, 6] {
+            set_bits(&pt, REGION + off * K, D);
+        }
+        assert_eq!(pt.dirty_depth_from_top(REGION, 8 * K), Some(7 * K));
+    }
+
+    /// An entry that cannot say, below the dirt, makes the whole answer
+    /// `None` — which the scheduler reads as "poison everything", exactly
+    /// what it did before any of this existed.
+    #[test]
+    fn a_page_that_cannot_answer_refuses_the_whole_region() {
+        let pt = a_mapped_run::<PageTableLevel4>(REGION, 8);
+        set_bits(&pt, REGION + 4 * K, D);
+        set_bits(&pt, REGION + 1 * K, MUTE);
+        assert_eq!(pt.dirty_depth_from_top(REGION, 8 * K), None);
+    }
+
+    /// Above the dirt it costs nothing: those pages are inside the answer
+    /// anyway, so the scan never looks at them.
+    #[test]
+    fn a_mute_page_above_the_dirt_changes_nothing() {
+        let pt = a_mapped_run::<PageTableLevel4>(REGION, 8);
+        set_bits(&pt, REGION + 2 * K, D);
+        set_bits(&pt, REGION + 5 * K, MUTE);
+        assert_eq!(pt.dirty_depth_from_top(REGION, 8 * K), Some(6 * K));
+    }
+
+    /// Nothing mapped is not "nothing written": the entry says nothing about
+    /// what the page held when it was mapped somewhere else.
+    #[test]
+    fn an_unmapped_page_refuses() {
+        let pt = a_mapped_run::<PageTableLevel4>(REGION, 8);
+        assert_eq!(pt.dirty_depth_from_top(REGION, 9 * K), None);
+    }
+
+    /// A huge leaf has one dirty bit for 512 pages, so it cannot answer about
+    /// any of them. This is the common case on riscv64 and aarch64, where the
+    /// kernel heap is a window of a physmap mapped with 2 MiB pages.
+    #[test]
+    fn a_huge_leaf_over_the_region_refuses() {
+        let mut pt = a_table::<PageTableLevel4>();
+        pt.map(Page::new_aligned(REGION, PageSize::Size2M), 16 * M, rw())
+            .unwrap();
+        assert_eq!(pt.dirty_depth_from_top(REGION, 8 * K), None);
+    }
+
+    /// And a split leaves every child marked written, whatever the parent
+    /// said. Sampling the parent is a lost update -- the old leaf is live
+    /// until the publish, so a write through it can set D after the sample --
+    /// and the only answer that cannot be wrong in the dangerous direction is
+    /// "all of them". Downstream that means "poison the whole region", which
+    /// is what the scheduler did before any of this existed.
+    #[test]
+    fn every_child_of_a_split_is_born_written() {
+        let mut frames = vec![];
+        let mut split_at = |pt: &mut PageTableImpl<PageTableLevel4, TestPTE>, vaddr: usize| {
+            pt.split_huge_page(vaddr, || {
+                let f = PhysFrame::new_zero()?;
+                let paddr = f.paddr();
+                frames.push(f);
+                Some(paddr)
+            })
+            .unwrap();
+        };
+
+        // A parent the CPU had marked written.
+        let mut pt = a_table::<PageTableLevel4>();
+        pt.map(Page::new_aligned(REGION, PageSize::Size2M), 16 * M, rw())
+            .unwrap();
+        {
+            let (entry, size) = pt.get_entry_mut(REGION).unwrap();
+            assert_eq!(size, PageSize::Size2M);
+            entry.0 |= D;
+        }
+        split_at(&mut pt, REGION);
+        assert_eq!(pt.dirty_depth_from_top(REGION, 8 * K), Some(8 * K));
+
+        // And one it had not: same answer, because the sample it would have
+        // been taken from is exactly what races the publish.
+        let mut pt = a_table::<PageTableLevel4>();
+        pt.map(Page::new_aligned(REGION, PageSize::Size2M), 32 * M, rw())
+            .unwrap();
+        assert_eq!(pt.get_entry_mut(REGION).unwrap().0 .0 & D, 0, "clean");
+        split_at(&mut pt, REGION);
+        assert_eq!(
+            pt.dirty_depth_from_top(REGION, 8 * K),
+            Some(8 * K),
+            "a child born clean is a write that raced the split, lost"
+        );
+
+        // Every one of the 512, not just the one the split was asked about,
+        // and the split still describes the same memory with the same flags.
+        for off in [0usize, 1, 42, 511] {
+            let (entry, size) = pt.get_entry_mut(REGION + off * K).unwrap();
+            assert_eq!(size, PageSize::Size4K);
+            assert_eq!(entry.dirty(), Some(true));
+            assert_eq!(entry.addr(), 32 * M + off * K);
+            assert_eq!(entry.flags(), rw());
+        }
+    }
+
+    /// The walk resolves one table per 2 MiB rather than one per page, so a
+    /// region that straddles a boundary is the case where a cached table
+    /// would be used for addresses it does not describe.
+    #[test]
+    fn the_walk_crosses_a_two_mebibyte_boundary() {
+        let base = REGION + 4 * M - 4 * K;
+        let pt = a_mapped_run::<PageTableLevel4>(base, 8);
+        // The page written is the first one of the SECOND table. With the
+        // first table reused for it, its entry would be read at index 0..3 of
+        // the wrong table, which this run leaves clean.
+        set_bits(&pt, base + 4 * K, D);
+        assert_eq!(pt.dirty_depth_from_top(base, 8 * K), Some(4 * K));
+
+        // And the other way round: the deepest page is in the first table.
+        let pt = a_mapped_run::<PageTableLevel4>(base, 8);
+        set_bits(&pt, base + K, D);
+        assert_eq!(pt.dirty_depth_from_top(base, 8 * K), Some(7 * K));
+    }
+
+    /// A request that is not whole pages is refused rather than rounded: the
+    /// dirty bit is per page, and rounding would be a promise about bytes
+    /// outside the pages that were asked about.
+    #[test]
+    fn a_request_that_is_not_whole_pages_is_refused() {
+        let pt = a_mapped_run::<PageTableLevel4>(REGION, 8);
+        assert_eq!(pt.dirty_depth_from_top(REGION + 8, 4 * K), None);
+        assert_eq!(pt.dirty_depth_from_top(REGION, 4 * K + 8), None);
+        assert_eq!(pt.dirty_depth_from_top(REGION, 0), Some(0), "no region");
+    }
+
+    /// Sv39's root is the P3, and `dirty_depth_from_top` reaches the leaves
+    /// through its own walk rather than `get_entry_mut`: on a 3-level table
+    /// that walk starts one level down.
+    #[test]
+    fn the_three_level_table_answers_too() {
+        let base = 0x2a_0000_0000;
+        let pt = a_mapped_run::<PageTableLevel3>(base, 8);
+        assert_eq!(pt.dirty_depth_from_top(base, 8 * K), Some(0));
+        set_bits(&pt, base + 3 * K, D);
+        assert_eq!(pt.dirty_depth_from_top(base, 8 * K), Some(5 * K));
     }
 }
