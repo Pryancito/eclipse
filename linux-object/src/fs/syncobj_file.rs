@@ -245,6 +245,33 @@ pub(super) fn pending_waiter_count() -> usize {
     WAITER_COUNT.load(Ordering::Relaxed)
 }
 
+/// Staging for the poller tests next door, which are about `arm_poller`'s
+/// claim and not about any one fd: they need "a sync_file waiter exists" and
+/// "none does" as plain states, without an `Arc<SyncobjHandle>` whose `Drop`
+/// would retire the waiter at an arbitrary point in the body.
+#[cfg(test)]
+pub(crate) mod tests_support {
+    use super::*;
+
+    /// A waiter on a handle nothing will ever signal. Only the count matters.
+    pub(crate) fn push_waiter_for_test() {
+        let mut waiters = WAITERS.lock();
+        waiters.push(SyncFileWaiter {
+            handle: u32::MAX,
+            point: u64::MAX,
+            signaled: Arc::new(AtomicBool::new(false)),
+            eventbus: EventBus::new(),
+        });
+        WAITER_COUNT.store(waiters.len(), Ordering::SeqCst);
+    }
+
+    pub(crate) fn clear_waiters_for_test() {
+        let mut waiters = WAITERS.lock();
+        waiters.clear();
+        WAITER_COUNT.store(0, Ordering::SeqCst);
+    }
+}
+
 /// Called from the syncobj point-advance hook (and from our own poll path
 /// after `poll_pending`). Latch + wake every sync_file whose point is now
 /// reached.
@@ -417,6 +444,15 @@ impl FileLike for SyncobjHandle {
         // Re-check before parking: a fence that landed between the scan and
         // subscribe must latch READABLE so the EventBus fires the waker now.
         let _ = self.fence_ready();
+        // Offering a subscription is what makes `sys_poll` park with NO tick
+        // of its own: from here on the EventBus is the only thing that can
+        // wake this poll, and the only thing that publishes it for a hardware
+        // fence is the periodic poller. Arm it as part of offering, so
+        // parking and polling are one step — an arm that was dropped
+        // anywhere earlier (the claim race `arm_poller` documents, a waiter
+        // registered before the submit) cannot turn into a `sync_wait` that
+        // never returns. `arm_poller` is a cheap no-op once armed.
+        super::syncobj_eventfd::ensure_hw_fence_poller();
         let mask = super::poll_events_to_bus_mask(events);
         Some(crate::sync::subscribe_readiness_on(
             &self.eventbus,
@@ -709,9 +745,14 @@ mod sync_file_poll_tests {
         assert!(zcore_drivers::scheme::syncobj::add_ref(handle));
         let fd = SyncobjHandle::new_sync_file(handle, 1);
         assert!(pending_waiter_count() > 0);
-        assert!(
-            !zcore_drivers::scheme::syncobj::has_pending(),
-            "nothing submitted yet"
+        // About THIS handle, not the whole table: `has_pending()` is global
+        // and one test binary runs every test of the crate in one process, so
+        // a fence another test left in flight made this read answer "pending"
+        // for a reason that has nothing to do with this handle.
+        assert_eq!(
+            zcore_drivers::scheme::syncobj::query_submitted(handle),
+            Some(0),
+            "nothing submitted yet on this handle"
         );
         // Re-arm explicitly (register_waiter already did); the point is that
         // sync_file waiters alone are enough — eventfd-only would stand down.
