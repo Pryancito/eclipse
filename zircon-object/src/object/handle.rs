@@ -304,12 +304,17 @@ mod tests {
     }
 
     /// The layout `zx_object_get_info(ZX_INFO_HANDLE_BASIC)` copies straight
-    /// out to userspace, so the offsets are the ABI and not an implementation
-    /// detail. `size_of` and `align_of` alone do not hold it: `repr(Rust)`
-    /// sorts the fields by decreasing alignment, which here keeps the size at
-    /// 32 and the alignment at 8 while moving `related_koid` from 24 up to 8
-    /// -- every field after `koid` then read from the wrong place, with
-    /// nothing in the tree to see it.
+    /// out to userspace, so the offsets below are the ABI and not an
+    /// implementation detail: they are where a C caller of
+    /// `zx_info_handle_basic_t` reads each field.
+    ///
+    /// `size_of` and `align_of` alone do not hold them. Rust promises nothing
+    /// about where it puts the fields of a struct that is not `repr(C)`, and
+    /// that is the point of the test: dropping the attribute leaves this
+    /// rustc with the same size 32 and alignment 8 and still moves fields,
+    /// which a reader of the copied bytes cannot see -- it gets one field's
+    /// value where it expected another's. Only an offset per field says where
+    /// they are.
     #[test]
     fn handle_basic_info_is_the_zx_info_handle_basic_layout() {
         use core::mem::{align_of, offset_of, size_of};
