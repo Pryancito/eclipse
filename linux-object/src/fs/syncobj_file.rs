@@ -245,6 +245,47 @@ pub(super) fn pending_waiter_count() -> usize {
     WAITER_COUNT.load(Ordering::Relaxed)
 }
 
+/// Staging for the poller tests next door, which are about `arm_poller`'s
+/// claim and not about any one fd: they need "a sync_file waiter exists" as a
+/// plain state, without an `Arc<SyncobjHandle>` whose `Drop` would retire the
+/// waiter at an arbitrary point in the body.
+///
+/// Adds and removes exactly ONE sentinel waiter and never touches another.
+/// `WAITERS` is process-wide and one test binary runs every test of the crate
+/// in one process, so a `clear()` here would drop the live waiters of the
+/// sync_file tests in this module -- the failure mode
+/// [`the_point_advance_upcall_never_runs_with_the_waiter_registry_held`]
+/// already records in its own comment (red in 4 of 6 parallel runs). The
+/// sentinel's handle and point are the ones no real syncobj can hold, so it
+/// cannot be confused with anybody's waiter, and nothing can ever satisfy it:
+/// `query(u32::MAX)` answers `None`, which is a drop without a wake.
+#[cfg(test)]
+pub(crate) mod tests_support {
+    use super::*;
+
+    /// The sentinel: a handle nothing will ever signal, at a point nothing
+    /// can reach. Only its presence in the count matters.
+    const SENTINEL: (u32, u64) = (u32::MAX, u64::MAX);
+
+    pub(crate) fn push_waiter_for_test() {
+        let mut waiters = WAITERS.lock();
+        waiters.push(SyncFileWaiter {
+            handle: SENTINEL.0,
+            point: SENTINEL.1,
+            signaled: Arc::new(AtomicBool::new(false)),
+            eventbus: EventBus::new(),
+        });
+        WAITER_COUNT.store(waiters.len(), Ordering::SeqCst);
+    }
+
+    /// Take the sentinels back out, and only those.
+    pub(crate) fn pop_waiters_for_test() {
+        let mut waiters = WAITERS.lock();
+        waiters.retain(|w| (w.handle, w.point) != SENTINEL);
+        WAITER_COUNT.store(waiters.len(), Ordering::SeqCst);
+    }
+}
+
 /// Called from the syncobj point-advance hook (and from our own poll path
 /// after `poll_pending`). Latch + wake every sync_file whose point is now
 /// reached.
@@ -417,6 +458,15 @@ impl FileLike for SyncobjHandle {
         // Re-check before parking: a fence that landed between the scan and
         // subscribe must latch READABLE so the EventBus fires the waker now.
         let _ = self.fence_ready();
+        // Offering a subscription is what makes `sys_poll` park with NO tick
+        // of its own: from here on the EventBus is the only thing that can
+        // wake this poll, and the only thing that publishes it for a hardware
+        // fence is the periodic poller. Arm it as part of offering, so
+        // parking and polling are one step — an arm that was dropped
+        // anywhere earlier (the claim race `arm_poller` documents, a waiter
+        // registered before the submit) cannot turn into a `sync_wait` that
+        // never returns. `arm_poller` is a cheap no-op once armed.
+        super::syncobj_eventfd::ensure_hw_fence_poller();
         let mask = super::poll_events_to_bus_mask(events);
         Some(crate::sync::subscribe_readiness_on(
             &self.eventbus,
@@ -709,9 +759,14 @@ mod sync_file_poll_tests {
         assert!(zcore_drivers::scheme::syncobj::add_ref(handle));
         let fd = SyncobjHandle::new_sync_file(handle, 1);
         assert!(pending_waiter_count() > 0);
-        assert!(
-            !zcore_drivers::scheme::syncobj::has_pending(),
-            "nothing submitted yet"
+        // About THIS handle, not the whole table: `has_pending()` is global
+        // and one test binary runs every test of the crate in one process, so
+        // a fence another test left in flight made this read answer "pending"
+        // for a reason that has nothing to do with this handle.
+        assert_eq!(
+            zcore_drivers::scheme::syncobj::query_submitted(handle),
+            Some(0),
+            "nothing submitted yet on this handle"
         );
         // Re-arm explicitly (register_waiter already did); the point is that
         // sync_file waiters alone are enough — eventfd-only would stand down.
