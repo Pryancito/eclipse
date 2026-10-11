@@ -39,6 +39,97 @@ const OPTIONS: &[(&str, i32)] = &[
     ("PR_GET_THP_DISABLE", 42),
 ];
 
+/// Every option code `<linux/prctl.h>` has ever handed out, with the name
+/// Linux gave it, in numeric order. 17, 18, 48 and 49 are absent because
+/// Linux has never assigned them.
+///
+/// The whole table and not a sample of it. The claim being made is that a
+/// number this kernel declares is either Linux's number for that same option
+/// or not a `prctl` option number at all, and a sample can only make that
+/// claim about the numbers it happens to hold.
+const ASSIGNED: &[(&str, i32)] = &[
+    ("PR_SET_PDEATHSIG", 1),
+    ("PR_GET_PDEATHSIG", 2),
+    ("PR_GET_DUMPABLE", 3),
+    ("PR_SET_DUMPABLE", 4),
+    ("PR_GET_UNALIGN", 5),
+    ("PR_SET_UNALIGN", 6),
+    ("PR_GET_KEEPCAPS", 7),
+    ("PR_SET_KEEPCAPS", 8),
+    ("PR_GET_FPEMU", 9),
+    ("PR_SET_FPEMU", 10),
+    ("PR_GET_FPEXC", 11),
+    ("PR_SET_FPEXC", 12),
+    ("PR_GET_TIMING", 13),
+    ("PR_SET_TIMING", 14),
+    ("PR_SET_NAME", 15),
+    ("PR_GET_NAME", 16),
+    ("PR_GET_ENDIAN", 19),
+    ("PR_SET_ENDIAN", 20),
+    ("PR_GET_SECCOMP", 21),
+    ("PR_SET_SECCOMP", 22),
+    ("PR_CAPBSET_READ", 23),
+    ("PR_CAPBSET_DROP", 24),
+    ("PR_GET_TSC", 25),
+    ("PR_SET_TSC", 26),
+    ("PR_GET_SECUREBITS", 27),
+    ("PR_SET_SECUREBITS", 28),
+    ("PR_SET_TIMERSLACK", 29),
+    ("PR_GET_TIMERSLACK", 30),
+    ("PR_TASK_PERF_EVENTS_DISABLE", 31),
+    ("PR_TASK_PERF_EVENTS_ENABLE", 32),
+    ("PR_MCE_KILL", 33),
+    ("PR_MCE_KILL_GET", 34),
+    ("PR_SET_MM", 35),
+    ("PR_SET_CHILD_SUBREAPER", 36),
+    ("PR_GET_CHILD_SUBREAPER", 37),
+    ("PR_SET_NO_NEW_PRIVS", 38),
+    ("PR_GET_NO_NEW_PRIVS", 39),
+    ("PR_GET_TID_ADDRESS", 40),
+    ("PR_SET_THP_DISABLE", 41),
+    ("PR_GET_THP_DISABLE", 42),
+    ("PR_MPX_ENABLE_MANAGEMENT", 43),
+    ("PR_MPX_DISABLE_MANAGEMENT", 44),
+    ("PR_SET_FP_MODE", 45),
+    ("PR_GET_FP_MODE", 46),
+    ("PR_CAP_AMBIENT", 47),
+    ("PR_SVE_SET_VL", 50),
+    ("PR_SVE_GET_VL", 51),
+    ("PR_GET_SPECULATION_CTRL", 52),
+    ("PR_SET_SPECULATION_CTRL", 53),
+    ("PR_PAC_RESET_KEYS", 54),
+    ("PR_SET_TAGGED_ADDR_CTRL", 55),
+    ("PR_GET_TAGGED_ADDR_CTRL", 56),
+    ("PR_SET_IO_FLUSHER", 57),
+    ("PR_GET_IO_FLUSHER", 58),
+    ("PR_SET_SYSCALL_USER_DISPATCH", 59),
+    ("PR_PAC_SET_ENABLED_KEYS", 60),
+    ("PR_PAC_GET_ENABLED_KEYS", 61),
+    ("PR_SCHED_CORE", 62),
+    ("PR_SME_SET_VL", 63),
+    ("PR_SME_GET_VL", 64),
+    ("PR_SET_MDWE", 65),
+    ("PR_GET_MDWE", 66),
+    ("PR_SET_MEMORY_MERGE", 67),
+    ("PR_GET_MEMORY_MERGE", 68),
+    ("PR_RISCV_V_SET_CONTROL", 69),
+    ("PR_RISCV_V_GET_CONTROL", 70),
+    ("PR_RISCV_SET_ICACHE_FLUSH_CTX", 71),
+    ("PR_PPC_GET_DEXCR", 72),
+    ("PR_PPC_SET_DEXCR", 73),
+    ("PR_GET_SHADOW_STACK_STATUS", 74),
+    ("PR_SET_SHADOW_STACK_STATUS", 75),
+    ("PR_LOCK_SHADOW_STACK_STATUS", 76),
+    ("PR_TIMER_CREATE_RESTORE_IDS", 77),
+    ("PR_FUTEX_HASH", 78),
+    ("PR_RSEQ_SLICE_EXTENSION", 79),
+    ("PR_GET_CFI", 80),
+    ("PR_SET_CFI", 81),
+    ("PR_GET_AUXV", 0x4155_5856),
+    ("PR_SET_VMA", 0x5356_4d41),
+    ("PR_SET_PTRACER", 0x5961_6d61),
+];
+
 /// What this file declares, paired with its name, so the two lists can be
 /// compared element by element.
 fn declared() -> alloc::vec::Vec<(&'static str, i32)> {
@@ -93,21 +184,30 @@ fn no_two_prctl_options_share_a_number() {
     }
 }
 
-/// And the gaps are gaps: a number Linux gave to an option this kernel does
-/// not implement must not be one of ours, or the call would answer for an
-/// option it never implemented.
+/// And every option this kernel declares is Linux's number for that same
+/// option, checked against the whole UAPI table rather than a handful of it.
+///
+/// `every_prctl_option_is_the_number_linux_prctl_h_gives` above says each of
+/// the 21 equals the literal written beside it; this says the same thing from
+/// the other side, so a new option added here on a number Linux already gave
+/// to something else is caught at the number instead of at the name. A
+/// `prctl` that answers for an option it never implemented is worse than one
+/// that answers `EINVAL`: `PR_SET_MM` arriving as `PR_SET_THP_DISABLE` would
+/// take a pointer for a flag.
 #[test]
-fn the_numbers_this_kernel_does_not_implement_are_not_taken() {
-    let mine = declared();
-    // PR_GET_UNALIGN 5, PR_SET_UNALIGN 6, PR_GET_FPEMU 9, PR_SET_FPEMU 10,
-    // PR_MCE_KILL 33, PR_MCE_KILL_GET 34, PR_SET_MM 35, PR_SET_FP_MODE 45,
-    // PR_SET_VMA 0x53564d41.
-    for taken in [5, 6, 9, 10, 33, 34, 35, 45, 0x5356_4d41] {
-        assert!(
-            !mine.iter().any(|&(_, v)| v == taken),
-            "{} is Linux's for an option this kernel does not implement",
-            taken
-        );
+fn no_option_this_kernel_declares_takes_a_number_linux_gave_to_another() {
+    for (name, number) in declared() {
+        match ASSIGNED.iter().find(|&&(_, n)| n == number) {
+            Some(&(linux_name, _)) => assert_eq!(
+                linux_name, name,
+                "{} is declared as {}, which <linux/prctl.h> gives to {}",
+                name, number, linux_name
+            ),
+            None => panic!(
+                "{} is {}, a number <linux/prctl.h> has never assigned",
+                name, number
+            ),
+        }
     }
 }
 
