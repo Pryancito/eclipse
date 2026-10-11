@@ -1058,7 +1058,13 @@ cfg_if! {
         #[inline]
         fn note_heap_pressure(used: usize, ptr: usize, sz: usize) {
             let reported = HEAP_PRESSURE_REPORTED.load(Ordering::Relaxed);
-            if reported > 0 && ALLOC_SITES.sampled() {
+            // Not the big blocks: `BIG_TRACK` already names every one of
+            // those EXACTLY, and a sampled one here comes out multiplied by
+            // the sampling rate -- one executor stack sampled read as
+            // `~2686976 KiB`, which is three times the heap and the first
+            // row of the report. The table is for what the big-block table
+            // cannot reach.
+            if reported > 0 && sz < BIG_ALLOC_MIN && ALLOC_SITES.sampled() {
                 record_alloc_site(ptr, sz);
             }
             if reported >= HEAP_PRESSURE_LEVELS.len() {
@@ -2545,13 +2551,26 @@ pub mod alloc_sites {
         }
 
         /// The slot holding `key`, claiming a free one if it is new.
+        ///
+        /// A full table is NOT the end of it. The sites that fill this first
+        /// are the busy ones, and busy is not the same as holding: on an idle
+        /// boot the table filled with churn in seconds and then counted every
+        /// later sample as missed, which is exactly how a leak that starts
+        /// ten minutes in would be locked out of its own report. So a site
+        /// with nothing live left is not a site any more, and its slot goes
+        /// to whoever turns up next. The scan for one only runs when the
+        /// table is full, which is already the cold path.
         fn claim(&self, key: usize, frames: &[usize; FRAMES]) -> Option<usize> {
+            let mut dead = None;
             for (i, site) in self.sites.iter().enumerate() {
                 let cur = site.key.load(Ordering::Relaxed);
                 if cur == key {
                     return Some(i);
                 }
                 if cur != 0 {
+                    if dead.is_none() && site.live.load(Ordering::Relaxed) == 0 {
+                        dead = Some((i, cur));
+                    }
                     continue;
                 }
                 match site.key.compare_exchange(
@@ -2560,17 +2579,33 @@ pub mod alloc_sites {
                     Ordering::AcqRel,
                     Ordering::Relaxed,
                 ) {
-                    Ok(_) => {
-                        for (slot, f) in site.frames.iter().zip(frames) {
-                            slot.store(*f, Ordering::Relaxed);
-                        }
-                        return Some(i);
-                    }
+                    Ok(_) => return Some(self.adopt(i, frames)),
                     Err(racer) if racer == key => return Some(i),
                     Err(_) => continue,
                 }
             }
-            None
+            // Take the dead slot, but only if it is still the same dead site:
+            // anything else and this sample is better lost than charged to
+            // whoever claimed it in between.
+            let (i, was) = dead?;
+            let site = &self.sites[i];
+            if site.live.load(Ordering::Relaxed) != 0 {
+                return None;
+            }
+            site.key
+                .compare_exchange(was, key, Ordering::AcqRel, Ordering::Relaxed)
+                .ok()
+                .map(|_| self.adopt(i, frames))
+        }
+
+        /// Start slot `i` on `frames` from zero.
+        fn adopt(&self, i: usize, frames: &[usize; FRAMES]) -> usize {
+            let site = &self.sites[i];
+            site.bytes.store(0, Ordering::Relaxed);
+            for (slot, f) in site.frames.iter().zip(frames) {
+                slot.store(*f, Ordering::Relaxed);
+            }
+            i
         }
 
         /// Live sampled blocks per site, heaviest first, and the samples that

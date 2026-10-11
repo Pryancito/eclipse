@@ -84,6 +84,44 @@ fn pasados_los_huecos_de_sitio_se_cuentan_las_muestras_perdidas() {
     assert_eq!(rows.iter().filter(|(live, _, _)| *live > 0).count(), SITES);
 }
 
+/// Found by running it: on an idle boot the table filled with churn within
+/// seconds and from then on counted EVERY sample as missed. A leak that
+/// starts ten minutes into a desktop session would never get a slot -- the
+/// report would be a list of the busiest callers and the one it exists to
+/// name would be in the "found no slot" line.
+#[test]
+fn un_sitio_sin_nada_vivo_le_cede_el_hueco_al_siguiente() {
+    let t = Table::new();
+    for i in 0..SITES {
+        t.record(blk(i), 8, chain(i));
+    }
+    // The first site gives its only block back: it holds nothing now.
+    assert!(t.forget(blk(0)));
+    t.record(blk(500), 64, chain(SITES));
+    let (_, missed) = t.rows();
+    assert_eq!(missed, 0, "la tabla llena no cedio el hueco muerto");
+    assert_eq!(row_for(&t, chain(SITES)), (1, 64));
+    assert_eq!(row_for(&t, chain(0)), (0, 0));
+    // And the new owner starts from zero, not from what the dead site left.
+    t.record(blk(501), 64, chain(SITES));
+    assert_eq!(row_for(&t, chain(SITES)), (2, 128));
+}
+
+/// The other half: a site that still holds something is NOT evicted, however
+/// full the table is. Counting a live site out would lose exactly the rows
+/// worth printing.
+#[test]
+fn un_sitio_con_bloques_vivos_no_se_desaloja() {
+    let t = Table::new();
+    for i in 0..SITES {
+        t.record(blk(i), 8, chain(i));
+    }
+    t.record(blk(500), 64, chain(SITES));
+    let (rows, missed) = t.rows();
+    assert_eq!(missed, 1);
+    assert_eq!(rows.iter().filter(|(live, _, _)| *live > 0).count(), SITES);
+}
+
 #[test]
 fn un_free_de_algo_no_muestreado_no_toca_nada() {
     let t = Table::new();
