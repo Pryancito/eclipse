@@ -1,4 +1,5 @@
 use super::*;
+use crate::scheme::drm::GemAperture;
 
 /// `nouveau_gem_new`: `NOUVEAU_GEM_DOMAIN_NO_SHARE` needs the client's
 /// uvmm (EINVAL without a VM_INIT) and makes the object unexportable
@@ -46,6 +47,16 @@ fn gem_new_no_share_needs_a_uvmm_and_marks_the_object_unexportable() {
     .unwrap();
     assert_eq!(vram.map_handle, 0, "not CPU-mappable");
     assert!(crate::scheme::gem_mmap::lookup_for(vram.handle, A).is_none());
+    // The aperture is told to its owner and to the kernel; to another
+    // process the object does not exist (`drm_gem_object_lookup` is per
+    // file), which is what keeps its PRIME export ENOENT there.
+    assert_eq!(gpu.gem_aperture(vram.handle, A), GemAperture::Vram);
+    assert_eq!(gpu.gem_aperture(vram.handle, 0), GemAperture::Vram);
+    assert_eq!(
+        gpu.gem_aperture(vram.handle, B),
+        GemAperture::Unknown,
+        "another process's object is no object"
+    );
     assert!(
         crate::scheme::gem_mmap::no_share(vram.handle, A),
         "marked all the same"
