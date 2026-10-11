@@ -2272,8 +2272,16 @@ impl INode for Stdin {
                     this.armed = true;
                 }
 
-                // Poll xHCI from read() path (does not go through poll(2)).
-                crate::net::io_wait_tick(false, true);
+                // Poll xHCI from read() path (does not go through poll(2)) --
+                // but only for a terminal a keystroke can actually reach. See
+                // `vt_read_polls_input`.
+                if vt_read_polls_input(
+                    this.stdin.vt,
+                    kernel_hal::console::active_vt(),
+                    kernel_hal::console::serial_vt(),
+                ) {
+                    crate::net::io_wait_tick(false, true);
+                }
 
                 this.stdin.flush_ready_flag();
                 if this.stdin.read_ready() {
@@ -2379,6 +2387,26 @@ impl INode for Stdin {
 /// `/dev/tty0`. Reads and writes still go to the inner (fixed) stdin, so the
 /// boot console is byte-for-byte unchanged — only the ioctl target follows the
 /// active VT.
+/// Whether a blocking `read` parked on VT `vt` should sweep the xHCI.
+///
+/// Only a terminal a keystroke can actually reach: the **active** VT, and the
+/// one the serial console is attached to (input arrives there over the UART, so
+/// it is never "not being looked at").
+///
+/// A background VT cannot receive a keystroke at all -- that is already the
+/// stated reason `poll(2)` demotes a background-VT terminal to
+/// `SLOW_IO_WAIT_TICK` -- but the blocking-read path never consulted it and
+/// swept the controller on every poll. Measured in QEMU: a minimal image parks
+/// **six** busybox shells on `/dev/tty1`..`/dev/tty6`, and with the machine
+/// idle 225 of its 277 wakeups a second ended in an xHCI sweep. Each sweep is a
+/// burst of MMIO, i.e. of VM exits under emulation.
+///
+/// The active VT and the serial VT keep the sweep exactly as before, so nothing
+/// changes for the terminal someone is typing at.
+fn vt_read_polls_input(vt: usize, active_vt: usize, serial_vt: usize) -> bool {
+    vt == active_vt || vt == serial_vt
+}
+
 pub struct CurrentVtTty {
     inner: Arc<Stdin>,
 }
