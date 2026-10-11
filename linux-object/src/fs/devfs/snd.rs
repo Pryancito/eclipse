@@ -2744,6 +2744,9 @@ impl INode for TimerClient {
 #[cfg(test)]
 mod timer_tests;
 
+#[cfg(test)]
+mod hw_params_tests;
+
 // ── Control device node ─────────────────────────────────────────────────────
 
 pub struct CtlDev {
