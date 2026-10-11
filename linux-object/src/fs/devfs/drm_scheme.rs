@@ -732,6 +732,14 @@ impl DrmDev {
             // dumb-buffer branch above is already owner-checked inside
             // `handle_vmo`; this was the remaining door.
             mmap_len_check(len, size as usize)?;
+            // Count the object as CPU-mapped, once. This is the only place a
+            // client actually gets a CPU mapping of a nouveau GEM object:
+            // `lookup_for` is also the PRIME-export and dma-buf path, and
+            // neither of those needs a host PA for the CPU. /proc/gpudbg
+            // reports the total, because bytes no client ever mmaps are
+            // bytes that could live in VRAM rather than cross PCIe on every
+            // GPU access -- and today every GEM object is sysmem.
+            zcore_drivers::scheme::gem_mmap::note_cpu_mapped(handle_id);
             Ok(drm::nouveau_cpu_vmo(handle_id, phys_addr, size as usize))
         } else {
             Err(FsError::InvalidParam)

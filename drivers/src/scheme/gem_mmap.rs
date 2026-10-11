@@ -146,6 +146,11 @@ struct MappedGem {
     /// without closing its own self-imports leaked the buffer until reboot
     /// (its import references were not attributable to it).
     holders: Vec<u64>,
+    /// Whether a client has ever mmap'd this object through
+    /// `DrmDev::get_vmo`. Only guards double-counting while the entry lives;
+    /// the running totals are the two atomics below, so an object that was
+    /// mapped and then freed still counts.
+    cpu_mapped: bool,
 }
 
 /// Outcome of [`dec_ref`], so `GEM_CLOSE` can tell "still shared, keep it" from
@@ -169,6 +174,42 @@ pub enum DecRef {
 
 lazy_static::lazy_static! {
     static ref MAPPINGS: Mutex<Vec<MappedGem>> = Mutex::new(Vec::new());
+}
+
+/// How many distinct GEM objects a client has mmap'd, and their total bytes.
+///
+/// `/proc/gpudbg` already counts how many GEM objects COULD be CPU-mapped
+/// (a host PA resolved for them), which on the nouveau path is every single
+/// one -- `GEM_NEW` backs GART, and GART|VRAM, with sysmem precisely so a
+/// host PA exists. That tells us nothing about how many the client actually
+/// touches from the CPU, and that is the number that decides whether a VRAM
+/// placement path is worth building: bytes no client ever mmaps are bytes
+/// that could live in VRAM instead of crossing PCIe on every access.
+static CPU_MAPPED_COUNT: AtomicU32 = AtomicU32::new(0);
+static CPU_MAPPED_BYTES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Note that a client mmap'd `handle`, counting it once per object.
+///
+/// Called from the mmap path only. `lookup_for` is not the place: PRIME
+/// export and dma-buf also go through it, and neither is a CPU mapping.
+pub fn note_cpu_mapped(handle: u32) {
+    let mut table = MAPPINGS.lock();
+    if let Some(e) = table.iter_mut().find(|e| e.handle == handle) {
+        if !e.cpu_mapped {
+            e.cpu_mapped = true;
+            let size = e.size;
+            CPU_MAPPED_COUNT.fetch_add(1, Ordering::Relaxed);
+            CPU_MAPPED_BYTES.fetch_add(size, Ordering::Relaxed);
+        }
+    }
+}
+
+/// `(objects, bytes)` a client has mmap'd since boot.
+pub fn cpu_mapped_totals() -> (u32, u64) {
+    (
+        CPU_MAPPED_COUNT.load(Ordering::Relaxed),
+        CPU_MAPPED_BYTES.load(Ordering::Relaxed),
+    )
 }
 
 /// Holder id a live dma-buf fd records against a nouveau GEM object.
@@ -201,6 +242,7 @@ pub fn register(handle: u32, phys_addr: u64, size: u64, owner_pid: u64) {
             phys_addr,
             size,
             holders: alloc::vec![owner_pid],
+            cpu_mapped: false,
         });
     }
 }
@@ -1023,5 +1065,106 @@ mod benches {
         for i in 0..256u32 {
             while !matches!(dec_ref(BASE + i, 0), DecRef::NotTracked | DecRef::Freed) {}
         }
+    }
+}
+
+#[cfg(test)]
+mod cpu_mapped_counter_tests {
+    use super::*;
+
+    /// Pid of the client doing the mapping. In the driver-private range, where
+    /// [`holds`] is strict, so nothing here passes for the wrong reason.
+    const CLIENT: u64 = 91_001;
+
+    fn drop_handle(handle: u32) {
+        while !matches!(dec_ref(handle, 0), DecRef::NotTracked | DecRef::Freed) {}
+    }
+
+    /// Every test here reads the running totals, does something, and reads
+    /// them again, so two of them overlapping would see each other's bytes in
+    /// their own delta. They take turns.
+    fn alone_with_the_counters<R>(body: impl FnOnce() -> R) -> R {
+        static TURNSTILE: Mutex<()> = Mutex::new(());
+        let _guard = TURNSTILE.lock();
+        body()
+    }
+
+    /// A client mmap'ing the same buffer twice (a re-map after munmap, or two
+    /// threads racing into the same fd) must not count its bytes twice: the
+    /// number is "how much memory a client reaches from the CPU", and double
+    /// counting it would make a VRAM placement look less worthwhile than it is.
+    #[test]
+    fn mapping_the_same_object_twice_counts_it_once() {
+        alone_with_the_counters(|| {
+            let handle = DRIVER_HANDLE_BASE + 0x20_0001;
+            let size = 0x10_0000;
+            register(handle, 0x5_0000_0000, size, CLIENT);
+
+            let (n0, b0) = cpu_mapped_totals();
+            note_cpu_mapped(handle);
+            note_cpu_mapped(handle);
+            note_cpu_mapped(handle);
+            let (n1, b1) = cpu_mapped_totals();
+
+            assert_eq!(n1 - n0, 1, "three mmaps of one object are one object");
+            assert_eq!(b1 - b0, size, "and its bytes are counted once");
+
+            drop_handle(handle);
+        });
+    }
+
+    /// The totals are "since boot", so freeing the object must not take its
+    /// bytes back out: a frame that was mapped, used and freed is still a
+    /// frame that had to live where the CPU could reach it.
+    #[test]
+    fn the_totals_survive_the_object_being_freed() {
+        alone_with_the_counters(|| {
+            let handle = DRIVER_HANDLE_BASE + 0x20_0002;
+            let size = 0x4_0000;
+            register(handle, 0x5_0010_0000, size, CLIENT);
+            note_cpu_mapped(handle);
+            let (n0, b0) = cpu_mapped_totals();
+
+            assert!(unregister(handle), "the entry was there to remove");
+            let (n1, b1) = cpu_mapped_totals();
+
+            assert_eq!((n1, b1), (n0, b0), "freeing it does not un-count it");
+        });
+    }
+
+    /// An mmap of a handle this table never saw must not be counted: it has
+    /// no size here, so counting it would add an object worth zero bytes and
+    /// make the average object look smaller than it is.
+    #[test]
+    fn an_untracked_handle_is_not_counted() {
+        alone_with_the_counters(|| {
+            let (n0, b0) = cpu_mapped_totals();
+            note_cpu_mapped(DRIVER_HANDLE_BASE + 0x2f_f001);
+            assert_eq!(cpu_mapped_totals(), (n0, b0));
+        });
+    }
+
+    /// Two distinct objects add up, bytes included -- the obvious case, and
+    /// the one that pins that the once-only rule above is per object and not
+    /// per table.
+    #[test]
+    fn two_objects_add_up() {
+        alone_with_the_counters(|| {
+            let a = DRIVER_HANDLE_BASE + 0x20_0003;
+            let b = DRIVER_HANDLE_BASE + 0x20_0004;
+            register(a, 0x5_0020_0000, 0x1_0000, CLIENT);
+            register(b, 0x5_0030_0000, 0x2_0000, CLIENT);
+
+            let (n0, b0) = cpu_mapped_totals();
+            note_cpu_mapped(a);
+            note_cpu_mapped(b);
+            let (n1, b1) = cpu_mapped_totals();
+
+            assert_eq!(n1 - n0, 2);
+            assert_eq!(b1 - b0, 0x3_0000);
+
+            drop_handle(a);
+            drop_handle(b);
+        });
     }
 }
