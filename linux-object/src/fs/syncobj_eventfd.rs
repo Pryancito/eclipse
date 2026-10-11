@@ -112,36 +112,108 @@ static POLLER_ARMED: core::sync::atomic::AtomicBool = core::sync::atomic::Atomic
 /// periodic timer polls the fences on their behalf; the signal hook then
 /// delivers the eventfd exactly as an explicit signal would. Idle otherwise.
 fn arm_poller() {
-    // Keep the poller alive while *either* SYNCOBJ_EVENTFD waiters *or*
-    // sync_file poll waiters (GLX/DRI3) care about hardware fences. Before
-    // this, only the eventfd path armed it — so a lone `sync_wait` on a
-    // sync_file never saw the GPU land its fence and Zink killed the
-    // swapchain (`zink: swapchain killed` → `GLXBadCurrentWindow`).
-    let sync_files = super::syncobj_file::pending_waiter_count() > 0;
-    let eventfds = WAITER_COUNT.load(Ordering::Relaxed) > 0;
-    if !(sync_files || eventfds) || POLLER_ARMED.swap(true, Ordering::AcqRel) {
+    // `POLLER_ARMED` is a CLAIM, not just a flag: whoever wins the swap owes
+    // the others either an armed timer or a fresh re-read. Every caller that
+    // loses the swap returns in silence, trusting the winner, so a winner
+    // that stands down on a snapshot taken BEFORE those callers published
+    // their waiter loses their wake-up for good.
+    //
+    // That is the race that left `glxgears` on one frame with no FPS. labwc
+    // arms SYNCOBJ_EVENTFD on a client's acquire point before the client
+    // submits, so `register` → `arm_poller` routinely runs with
+    // `has_pending() == false` and takes the stand-down path. A GLX client
+    // exporting its SYNC_FD on another cpu called `arm_poller` inside that
+    // window, lost the swap, and returned; the eventfd side then released the
+    // claim having armed nothing. Nobody was left polling the hardware
+    // fences, and `sys_poll` on a sync_file parks on its EventBus with no
+    // tick of its own (see `syncobj_file::subscribe_readiness`) — so the fd
+    // never became readable and Mesa's `sync_wait` never returned.
+    //
+    // Bounded, so a caller can never spin here: each retry is one more
+    // publish that happened while the claim was held, and `MAX_RETRIES`
+    // re-reads is already more than the number of cpus that can be inside
+    // `arm_poller` at once. The last word belongs to whoever publishes next,
+    // and every publisher calls `arm_poller` itself.
+    const MAX_RETRIES: u32 = 4;
+    for _ in 0..=MAX_RETRIES {
+        // Keep the poller alive while *either* SYNCOBJ_EVENTFD waiters *or*
+        // sync_file poll waiters (GLX/DRI3) care about hardware fences.
+        // Before this, only the eventfd path armed it — so a lone
+        // `sync_wait` on a sync_file never saw the GPU land its fence and
+        // Zink killed the swapchain (`zink: swapchain killed` →
+        // `GLXBadCurrentWindow`).
+        if !interested() {
+            return;
+        }
+        if POLLER_ARMED.swap(true, Ordering::AcqRel) {
+            // Already claimed. The holder re-reads before standing down, so
+            // the waiter published above is either already covered by the
+            // armed timer or will be seen by that re-read.
+            return;
+        }
+        // Eventfd-only: stand down when nothing is in flight (cheap idle).
+        // Sync_file waiters (GLX/DRI3) must keep ticking even before the
+        // fence exists — Mesa often exports a SYNC_FD and only then
+        // submits, and without a tick after that submit `sync_wait` parks
+        // forever (glxgears window up, gears frozen, no FPS).
+        if !should_tick() {
+            if !release_and_recheck() {
+                return;
+            }
+            continue;
+        }
+        kernel_hal::timer::timer_set(
+            kernel_hal::timer::deadline_after(POLL_INTERVAL),
+            alloc::boxed::Box::new(|_| {
+                POLLER_ARMED.store(false, Ordering::Release);
+                // Resolves landed fences and fires the signal hook (below)
+                // for every point that advanced, which delivers the eventfds
+                // / wakes sync_file EventBuses.
+                zcore_drivers::scheme::syncobj::poll_pending();
+                arm_poller();
+            }),
+        );
         return;
     }
-    // Eventfd-only: stand down when nothing is in flight (cheap idle).
-    // Sync_file waiters (GLX/DRI3) must keep ticking even before the fence
-    // exists — Mesa often exports a SYNC_FD and only then submits, and
-    // without a tick after that submit `sync_wait` parks forever (glxgears
-    // window up, gears frozen, no FPS).
-    if !sync_files && !zcore_drivers::scheme::syncobj::has_pending() {
-        POLLER_ARMED.store(false, Ordering::Release);
-        return;
-    }
-    kernel_hal::timer::timer_set(
-        kernel_hal::timer::deadline_after(POLL_INTERVAL),
-        alloc::boxed::Box::new(|_| {
-            POLLER_ARMED.store(false, Ordering::Release);
-            // Resolves landed fences and fires the signal hook (below) for
-            // every point that advanced, which delivers the eventfds / wakes
-            // sync_file EventBuses.
-            zcore_drivers::scheme::syncobj::poll_pending();
-            arm_poller();
-        }),
-    );
+}
+
+/// The stand-down half of [`arm_poller`]: give the claim back, then look
+/// again.
+///
+/// `true` means the poller must be armed after all. Separated from the loop
+/// because the order is the whole fix and nothing else can test it: a waiter
+/// that published while this cpu held the claim had its own `arm_poller`
+/// swallowed by that claim's `swap`, so the only thing that can still notice
+/// it is a read taken AFTER the release. Reading before releasing, which is
+/// what the loop would do if this were inlined the obvious way, answers the
+/// question the claim already made stale.
+fn release_and_recheck() -> bool {
+    POLLER_ARMED.store(false, Ordering::Release);
+    // `should_tick`, not `interested`: an eventfd waiter published under the
+    // claim needs no timer (`attach_hw_fence` announces its submit through
+    // the signal hook, which arms the poller then), so answering `interested`
+    // here would send the loop round again on the ordinary idle stand-down
+    // and spin until `MAX_RETRIES` for nothing.
+    should_tick()
+}
+
+/// Whether anybody at all is waiting on a hardware fence: a `SYNCOBJ_EVENTFD`
+/// waiter, or a `sync_file` fd somebody is polling (GLX/DRI3).
+fn interested() -> bool {
+    super::syncobj_file::pending_waiter_count() > 0 || WAITER_COUNT.load(Ordering::SeqCst) > 0
+}
+
+/// Whether the poller has work to do right now.
+///
+/// A `sync_file` waiter counts even with no fence in flight: Mesa exports the
+/// `SYNC_FD` and only then submits the work that will signal it, and the
+/// submit itself is noticed only by a tick. An eventfd waiter does not —
+/// `attach_hw_fence` announces the submit through the signal hook, which arms
+/// the poller again.
+fn should_tick() -> bool {
+    super::syncobj_file::pending_waiter_count() > 0
+        || (WAITER_COUNT.load(Ordering::SeqCst) > 0
+            && zcore_drivers::scheme::syncobj::has_pending())
 }
 
 /// Arm the hardware-fence poller from the sync_file path (a GLX client that
@@ -352,6 +424,31 @@ pub(crate) mod hardware_fence_tests {
         WAITERS.lock().clear();
         WAITER_COUNT.store(0, Ordering::SeqCst);
         POLLER_ARMED.store(false, Ordering::Release);
+        // The sync_file registry too: `arm_poller`'s decision reads BOTH
+        // tables, and one test binary runs every test of the crate in one
+        // process. A waiter another test left behind (its fd dropped without
+        // its fence ever landing) makes `should_tick()` true here for a reason
+        // that has nothing to do with this test.
+        super::super::syncobj_file::tests_support::clear_waiters_for_test();
+    }
+
+    /// Stage one eventfd waiter straight into the registry.
+    ///
+    /// Not `register`: that runs `deliver_ready_waiters`, and another test of
+    /// this crate destroying its syncobjs fires the same process-wide hook,
+    /// whose pass retires a waiter whose handle has gone (`query` answers
+    /// `None`). The tests below are about `arm_poller`'s decision, which reads
+    /// nothing but the two counts and `has_pending()`, so they stage the
+    /// counts and leave delivery to the tests that are about delivery.
+    fn push_eventfd_waiter_for_test() {
+        let mut waiters = WAITERS.lock();
+        waiters.push(Waiter {
+            handle: u32::MAX,
+            point: u64::MAX,
+            wait_available: false,
+            ev: CountingEventfd::new(),
+        });
+        WAITER_COUNT.store(waiters.len(), Ordering::SeqCst);
     }
 
     /// An explicit signal delivers, which is the path that always worked and
@@ -461,6 +558,103 @@ pub(crate) mod hardware_fence_tests {
         assert!(
             POLLER_ARMED.load(Ordering::Acquire),
             "poller must stay armed until the fence lands"
+        );
+
+        reset();
+    }
+
+    /// The lost wake-up that left `glxgears` on one frame with no FPS.
+    ///
+    /// labwc arms `SYNCOBJ_EVENTFD` on a client's acquire point before the
+    /// client submits, so the eventfd side of `arm_poller` routinely reaches
+    /// the stand-down path with `has_pending() == false`. A GLX client
+    /// exporting its `SYNC_FD` on another cpu calls `arm_poller` inside that
+    /// window: it loses the claim's `swap` and returns in silence, trusting
+    /// the holder. The holder must therefore look AGAIN after giving the
+    /// claim back -- a read taken before the release answers a question the
+    /// claim already made stale.
+    ///
+    /// `release_and_recheck` is that read, and this is the only place the
+    /// order can be tested: the two cpus cannot be staged from one thread,
+    /// but the state they leave behind can.
+    #[test]
+    fn standing_down_does_not_lose_a_waiter_that_published_under_the_claim() {
+        let _serial = TEST_SERIAL.lock();
+        reset();
+
+        // The eventfd side owns the claim and is on its way to the stand-down
+        // path, because nothing is in flight yet.
+        POLLER_ARMED.store(true, Ordering::Release);
+
+        // The GLX client publishes its sync_file waiter now and calls
+        // `arm_poller` itself. It loses the swap, so it arms nothing and
+        // returns trusting the holder.
+        super::super::syncobj_file::tests_support::push_waiter_for_test();
+        ensure_hw_fence_poller();
+        assert!(
+            poller_is_armed(),
+            "the claim is still the eventfd side's: the GLX client armed \
+             nothing of its own"
+        );
+
+        assert!(
+            release_and_recheck(),
+            "the sync_file waiter published while the claim was held is the \
+             one nobody else will arm for: standing down on the snapshot \
+             taken before the release parks Mesa's sync_wait for ever"
+        );
+        assert!(
+            !poller_is_armed(),
+            "and the claim is given back BEFORE the look, which is the whole \
+             order: a read taken while still holding it answers the question \
+             the claim made stale"
+        );
+
+        reset();
+    }
+
+    /// The other half: with nothing at all waiting, the recheck agrees and the
+    /// claim stays released, so an idle machine arms no 250 us timer.
+    #[test]
+    fn standing_down_with_nobody_waiting_leaves_the_poller_idle() {
+        let _serial = TEST_SERIAL.lock();
+        reset();
+        POLLER_ARMED.store(true, Ordering::Release);
+        assert!(
+            !release_and_recheck(),
+            "nobody is waiting on a hardware fence: re-arming here would tick \
+             every 250 us for the life of the boot"
+        );
+        assert!(!poller_is_armed(), "and the claim was given back");
+        reset();
+    }
+
+    /// The decision table `arm_poller` runs on, stated once. A `sync_file`
+    /// waiter counts even with no fence in flight (Mesa exports the `SYNC_FD`
+    /// and only then submits the work that signals it, and only a tick
+    /// notices that submit); an eventfd waiter does not, because
+    /// `attach_hw_fence` announces the submit through the signal hook.
+    #[test]
+    fn an_eventfd_waiter_needs_a_pending_fence_to_tick_and_a_sync_file_does_not() {
+        let _serial = TEST_SERIAL.lock();
+        reset();
+
+        assert!(!interested() && !should_tick(), "idle");
+
+        push_eventfd_waiter_for_test();
+        assert!(interested(), "an eventfd waiter is interested");
+        assert_eq!(
+            should_tick(),
+            syncobj::has_pending(),
+            "an eventfd waiter alone ticks only while a fence is in flight: \
+             `attach_hw_fence` announces the submit through the signal hook, \
+             which arms the poller again"
+        );
+
+        super::super::syncobj_file::tests_support::push_waiter_for_test();
+        assert!(
+            should_tick(),
+            "a sync_file waiter ticks on its own, fence or no fence"
         );
 
         reset();
