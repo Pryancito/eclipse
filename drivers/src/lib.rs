@@ -456,7 +456,11 @@ mod tests {
             ),
             (Device::Irq(Arc::new(StubIrq)), "stub-irq", "IrqDevice"),
             (Device::Net(Arc::new(StubNet)), "stub-net", "NetDevice"),
-            (Device::Uart(Arc::new(StubUart::new())), "stub-uart", "UartDevice"),
+            (
+                Device::Uart(Arc::new(StubUart::new())),
+                "stub-uart",
+                "UartDevice"
+            ),
             (Device::Drm(Arc::new(StubDrm)), "stub-drm", "DrmDevice"),
             (
                 Device::DrmDisplay(Arc::new(StubDrm), Arc::new(StubDisplay::new())),

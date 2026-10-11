@@ -240,10 +240,7 @@ mod tests {
     fn default_netstats_is_all_zero() {
         let s = NetStats::default();
         assert_eq!(s.rx_bytes + s.rx_packets + s.tx_bytes + s.tx_packets, 0);
-        assert_eq!(
-            s.rx_errors + s.rx_dropped + s.tx_errors + s.tx_dropped,
-            0
-        );
+        assert_eq!(s.rx_errors + s.rx_dropped + s.tx_errors + s.tx_dropped, 0);
     }
 
     /// A route with no gateway is on-link, which is a different thing from a

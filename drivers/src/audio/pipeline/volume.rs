@@ -357,4 +357,69 @@ mod tests {
         let out = run_left(&mut v, 4000, 3);
         assert_eq!(out, [1000, 1000, 1000]);
     }
+
+    /// Un cambio de formato re-deriva los tiempos de la rampa y NO toca
+    /// las ganancias: cambiar de ritmo no es cambiar el volumen, y
+    /// perderlo ahí sería subir el sonido a tope en medio de una
+    /// canción.
+    #[test]
+    fn a_format_change_keeps_the_gains_and_re_derives_the_ramp() {
+        let mut v = Volume::new(48_000, 2);
+        v.set_target(0, ZERO_DB / 2);
+        v.set_target(1, ZERO_DB / 2);
+        // Dejar la rampa a medias: varias actualizaciones, menos que la
+        // rampa entera.
+        let chunk = v.update_frames as usize * 4;
+        run_left(&mut v, 20_000, chunk);
+        let mid = v.current();
+        assert!(mid[0] != ZERO_DB && mid[0] != ZERO_DB / 2, "{:?}", mid);
+
+        let (before_update, before_ramp) = (v.update_frames, v.ramp_frames);
+        v.set_format(8_000, 1);
+        assert_eq!(v.current(), mid, "el cambio de formato movio la ganancia");
+        assert_ne!(v.update_frames, before_update);
+        assert_ne!(v.ramp_frames, before_ramp);
+
+        // Y la rampa del ritmo nuevo tarda lo que dice RAMP_MS de ESE
+        // ritmo: 32 ms a 8 kHz son 256 marcos, no los 1536 de 48 kHz.
+        let mut v = Volume::new(8_000, 2);
+        assert_eq!(v.ramp_frames, 8_000 / 1000 * RAMP_MS);
+        v.set_target(0, 0);
+        v.set_target(1, 0);
+        let ramp = v.ramp_frames as usize;
+        let out = run_left(&mut v, 10_000, ramp + 10);
+        assert_eq!(v.current()[0], 0);
+        assert!(out[ramp..].iter().all(|&s| s == 0));
+        // Y a 48 kHz la misma rampa son seis veces más marcos, así que a
+        // los 256 de 8 kHz todavía no ha llegado.
+        let mut v = Volume::new(48_000, 2);
+        v.set_target(0, 0);
+        v.set_target(1, 0);
+        run_left(&mut v, 10_000, 8_000 / 1000 * RAMP_MS as usize);
+        assert_ne!(v.current()[0], 0);
+
+        // Los canales se recortan a los que la plataforma lleva, y un
+        // canal que no existe se ignora en vez de escribir fuera.
+        let mut v = Volume::new(48_000, 99);
+        v.set_target(MAX_CHANNELS, 0);
+        v.set_target(usize::MAX, 0);
+        assert_eq!(v.current(), [ZERO_DB; MAX_CHANNELS]);
+        assert!(v.is_passthrough());
+        // Con cero canales pedidos sigue habiendo uno.
+        let mut v = Volume::new(48_000, 0);
+        v.set_target(0, 0);
+        assert!(!v.is_passthrough());
+    }
+
+    /// El silenciado gana sobre el porcentaje, también sobre el 100.
+    #[test]
+    fn mute_wins_over_any_percent() {
+        assert_eq!(gain_from_percent(100, true), 0);
+        assert_eq!(gain_from_percent(0, false), 0);
+        assert_eq!(gain_from_percent(255, false), ZERO_DB);
+        assert_eq!(gain_from_percent(255, true), 0);
+        for p in 0..=100u8 {
+            assert_eq!(gain_from_percent(p, true), 0, "{}%", p);
+        }
+    }
 }

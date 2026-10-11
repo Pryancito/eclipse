@@ -717,10 +717,7 @@ impl PcmDev {
     /// Drop timer focus when this client was the one the timer was following.
     fn clear_timer_focus(&self) {
         let mut focus = self.timer_focus.lock();
-        if focus
-            .as_ref()
-            .is_some_and(|w| w.ptr_eq(&self.self_weak))
-        {
+        if focus.as_ref().is_some_and(|w| w.ptr_eq(&self.self_weak)) {
             *focus = None;
         }
     }
@@ -733,11 +730,7 @@ impl PcmDev {
         // node's own `st` stays OPEN forever on HDA (`open_stream` always
         // answers Some). Upgrade under the focus lock, then drop it before
         // sampling — `period_clock_local` may clear the focus on XRUN.
-        let client = self
-            .timer_focus
-            .lock()
-            .as_ref()
-            .and_then(|w| w.upgrade());
+        let client = self.timer_focus.lock().as_ref().and_then(|w| w.upgrade());
         if let Some(client) = client {
             if !core::ptr::eq(client.as_ref(), self) {
                 return client.period_clock_local();
@@ -2743,6 +2736,12 @@ impl INode for TimerClient {
 
 #[cfg(test)]
 mod timer_tests;
+
+#[cfg(test)]
+mod hw_params_tests;
+
+#[cfg(test)]
+mod ctl_tests;
 
 // ── Control device node ─────────────────────────────────────────────────────
 

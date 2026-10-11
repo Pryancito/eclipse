@@ -58,9 +58,7 @@ fn with_nobody_waiting_a_blocked_signal_stays_on_shared_pending() {
     // Process-directed and every thread blocked: one bit on shared_pending,
     // not a private copy on the first tid (that doubled delivery on pull).
     assert!(
-        proc.linux()
-            .shared_pending()
-            .contains(LinuxSignal::SIGUSR1),
+        proc.linux().shared_pending().contains(LinuxSignal::SIGUSR1),
         "blocked process signal never reached shared_pending"
     );
     assert!(!first.lock_linux().signals.contains(LinuxSignal::SIGUSR1));

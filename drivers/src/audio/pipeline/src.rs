@@ -371,4 +371,101 @@ mod tests {
         r.process(&input, &mut out);
         assert!((tone_amp(&out, 48000, 3000.0, 2000) - 10000.0).abs() / 10000.0 < 0.03);
     }
+
+    /// Los ritmos que el conversor dice tener son los que de verdad
+    /// usa, ya saneados: un cero sube a uno (y no divide por cero al
+    /// calcular el paso), y los canales se recortan a los que la
+    /// plataforma lleva.
+    #[test]
+    fn the_rates_and_channels_are_the_sanitised_ones() {
+        let r = Resampler::new(44_100, 48_000, 2);
+        assert_eq!(r.rates(), (44_100, 48_000));
+        assert!(!r.passthrough());
+        // Un cero en cualquiera de los dos lados no es un cero.
+        assert_eq!(Resampler::new(0, 48_000, 2).rates(), (1, 48_000));
+        assert_eq!(Resampler::new(44_100, 0, 2).rates(), (44_100, 1));
+        assert_eq!(Resampler::new(0, 0, 2).rates(), (1, 1));
+        // Y con los dos a cero es paso directo, no una división por cero.
+        assert!(Resampler::new(0, 0, 2).passthrough());
+
+        // Los canales se recortan por los dos lados, y el conversor
+        // sigue funcionando con los que le quedan.
+        for (asked, got) in [(0usize, 1usize), (1, 1), (2, 2), (8, 8), (9, 8), (99, 8)] {
+            let mut r = Resampler::new(24_000, 48_000, asked);
+            let input: Vec<i16> = (0..(64 * got as i16)).collect();
+            let mut out = Vec::new();
+            r.process(&input, &mut out);
+            assert_eq!(out.len() % got, 0, "{} canales -> {}", asked, got);
+        }
+    }
+
+    /// La pista de tamaño es una COTA: lo que `process` emite nunca pasa
+    /// de ella. Es con lo que el camino del anfitrión dimensiona su
+    /// búfer de salida, así que quedarse corta es escribir fuera.
+    #[test]
+    fn the_output_hint_is_never_short() {
+        for (fin, fout) in [
+            (44_100u32, 48_000u32),
+            (48_000, 48_000),
+            (8_000, 48_000),
+            (96_000, 48_000),
+            (192_000, 48_000),
+            (11_025, 48_000),
+            (48_000, 44_100),
+        ] {
+            let mut r = Resampler::new(fin, fout, 2);
+            // Bloque a bloque: la fase fraccionaria se arrastra entre
+            // llamadas, que es de donde sale el «+1» de la pista.
+            for frames in [1usize, 7, 64, 480, 1024] {
+                let input = alloc::vec![0i16; frames * 2];
+                let hint = r.out_frames_hint(frames);
+                let mut out = Vec::new();
+                r.process(&input, &mut out);
+                assert!(
+                    out.len() / 2 <= hint,
+                    "{} -> {} Hz, {} marcos: emitio {} con pista {}",
+                    fin,
+                    fout,
+                    frames,
+                    out.len() / 2,
+                    hint
+                );
+            }
+        }
+        // La pista nunca es cero, ni para cero marcos: un búfer de cero
+        // no cabe ni la cola de un bloque anterior.
+        assert_eq!(Resampler::new(44_100, 48_000, 2).out_frames_hint(0), 1);
+    }
+
+    /// El prototipo se interpola en Q16: en un índice entero es el
+    /// coeficiente de la tabla, a medio camino es la media de los dos, y
+    /// pasado el final es cero (que es lo que recorta la ventana en vez
+    /// de leer fuera de la tabla).
+    #[test]
+    fn the_prototype_is_interpolated_and_zero_past_its_end() {
+        for i in [0usize, 1, 17, N / 2, N - 2, N - 1] {
+            assert_eq!(coef((i as u64) << 16), SRC_PROTO[i] as i64, "tap {}", i);
+        }
+        // A medio camino, la media de los dos vecinos (con el redondeo
+        // hacia abajo del desplazamiento).
+        for i in [0usize, 1, 17, N / 2, N - 2] {
+            let want = (SRC_PROTO[i] as i64 + SRC_PROTO[i + 1] as i64) / 2;
+            let got = coef(((i as u64) << 16) | 0x8000);
+            assert!(
+                (got - want).abs() <= 1,
+                "tap {}: {} contra {}",
+                i,
+                got,
+                want
+            );
+        }
+        // El último tap interpola hacia cero, no hacia la tabla de al
+        // lado.
+        let last = coef((((N - 1) as u64) << 16) | 0x8000);
+        assert_eq!(last, SRC_PROTO[N - 1] as i64 / 2);
+        // Y de ahí en adelante, cero.
+        assert_eq!(coef((N as u64) << 16), 0);
+        assert_eq!(coef(((N as u64) << 16) | 0xffff), 0);
+        assert_eq!(coef(u64::MAX), 0);
+    }
 }

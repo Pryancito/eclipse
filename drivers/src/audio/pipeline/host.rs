@@ -842,4 +842,135 @@ mod tests {
         assert_eq!(s.write(&data), 0);
         assert_eq!(s.queued_link(), CAP);
     }
+
+    /// Las guardas de los casos degenerados: un marco de cero bytes o un
+    /// ritmo de cero no dividen por cero, contestan cero. Ningún camino
+    /// de producción los produce — el marco es `channels * 2` con
+    /// `channels >= 1`, y `Resampler::new` sube los ritmos a 1 — pero
+    /// son funciones públicas del módulo y una división por cero aquí es
+    /// un panic en el kernel.
+    #[test]
+    fn the_degenerate_cases_answer_zero_instead_of_dividing_by_zero() {
+        assert_eq!(accept_client_frames(1000, 0, 48_000), 0);
+        assert_eq!(accept_client_frames(1000, 48_000, 0), 0);
+        assert_eq!(accept_client_frames(0, 44_100, 48_000), 0);
+
+        assert_eq!(link_to_client_bytes(4096, 44_100, 48_000, 0), 0);
+        assert_eq!(link_to_client_bytes(4096, 44_100, 0, FRAME), 0);
+        // `fin = 0` no divide: el numerador es el que vale cero.
+        assert_eq!(link_to_client_bytes(4096, 0, 48_000, FRAME), 0);
+
+        assert_eq!(client_to_link_bytes(4096, 44_100, 48_000, 0), 0);
+        assert_eq!(client_to_link_bytes(4096, 0, 48_000, FRAME), 0);
+        assert_eq!(client_to_link_bytes(4096, 44_100, 0, FRAME), 0);
+
+        assert_eq!(client_counts(CAP, 0, None, 0), (0, 0));
+        assert_eq!(client_counts(CAP, 0, Some((44_100, 48_000)), 0), (0, 0));
+        assert_eq!(honourable_bytes(100, 100, 0), 0);
+        assert_eq!(client_buffer_bytes(CAP, 44_100, 0), 0);
+        // Y un ocupado mayor que la capacidad no da un sitio negativo.
+        assert_eq!(client_counts(1024, 4096, None, FRAME).0, 0);
+        assert_eq!(
+            client_counts(1024, 4096, Some((44_100, 48_000)), FRAME).0,
+            0
+        );
+    }
+
+    /// `accept_client_frames` guarda [`SRC_SLACK_FRAMES`] marcos de
+    /// enlace: con ese hueco o menos no acepta nada, que es el «búfer
+    /// lleno» que el cliente espera y sondea.
+    #[test]
+    fn nothing_is_accepted_while_only_the_slack_is_free() {
+        for &fin in &CLIENT_RATES {
+            if fin == LINK_RATE {
+                continue;
+            }
+            for free in 0..=SRC_SLACK_FRAMES {
+                assert_eq!(
+                    accept_client_frames(free, fin, LINK_RATE),
+                    0,
+                    "{} Hz con {} marcos libres",
+                    fin,
+                    free
+                );
+            }
+            // Y un marco más ya deja pasar algo cuando se sube de ritmo
+            // (al bajar, un marco de enlace no llega a un marco de
+            // cliente y el cero es correcto).
+            if fin > LINK_RATE {
+                assert!(accept_client_frames(SRC_SLACK_FRAMES + 1, fin, LINK_RATE) >= 1);
+            }
+        }
+    }
+
+    /// Lo que se puede honrar de un `rewind`/`forward`: nunca más de lo
+    /// que hay encolado, y siempre marcos enteros. El redondeo a marco
+    /// no es cosmético — dejar el flujo a mitad de muestra convierte
+    /// cada izquierda en una derecha de ahí en adelante.
+    #[test]
+    fn an_honourable_amount_is_whole_frames_and_never_more_than_is_queued() {
+        // Lo pedido manda mientras quepa.
+        assert_eq!(honourable_bytes(400, 1000, FRAME), 400);
+        // Lo encolado es el tope.
+        assert_eq!(honourable_bytes(4000, 1000, FRAME), 1000);
+        // Y el tope también se redondea a marco.
+        assert_eq!(honourable_bytes(4000, 1002, FRAME), 1000);
+        // Nada encolado, nada que honrar.
+        assert_eq!(honourable_bytes(400, 0, FRAME), 0);
+        // Medio marco no es medio marco, es ninguno.
+        for frame in [2usize, 4, 6, 16] {
+            for bytes in 0..32usize {
+                let got = honourable_bytes(bytes, 1024, frame);
+                assert_eq!(got % frame, 0, "{} bytes con marco {}", bytes, frame);
+                assert!(got <= bytes);
+                assert!(bytes - got < frame);
+            }
+        }
+    }
+
+    /// Las dos conversiones del flujo son la identidad sin conversor y
+    /// mutuamente inversas con uno, a menos de un marco: son las que
+    /// traducen un `rewind` del cliente a bytes del enlace.
+    #[test]
+    fn the_stream_conversions_are_the_identity_without_a_converter() {
+        let s = HostStream::new(CAP, 2);
+        assert_eq!(s.frame_bytes(), FRAME);
+        assert_eq!(s.client_rate(), LINK_RATE);
+        assert!(!s.is_resampling());
+        for bytes in [0usize, 4, 4096, CAP] {
+            assert_eq!(s.to_client_bytes(bytes), bytes);
+            assert_eq!(s.to_link_bytes(bytes), bytes);
+        }
+
+        // Con conversor, la ida escala y la vuelta deshace la ida a
+        // menos de un marco.
+        for &fin in &CLIENT_RATES {
+            let mut s = HostStream::new(CAP, 2);
+            assert_eq!(s.set_params(fin), fin);
+            assert_eq!(s.client_rate(), fin);
+            assert_eq!(s.is_resampling(), fin != LINK_RATE);
+            for frames in [0usize, 1, 100, 3000] {
+                let client = frames * FRAME;
+                let link = s.to_link_bytes(client);
+                assert_eq!(link % FRAME, 0);
+                let back = s.to_client_bytes(link);
+                assert!(
+                    back <= client && client - back <= FRAME,
+                    "{} Hz: {} -> {} -> {}",
+                    fin,
+                    client,
+                    link,
+                    back
+                );
+            }
+        }
+
+        // Y un canal distinto de dos cambia el marco.
+        for channels in [1usize, 2, 4, 6, 8] {
+            let s = HostStream::new(CAP, channels);
+            assert_eq!(s.frame_bytes(), channels * 2);
+        }
+        // Cero canales no existe: el marco nunca es cero.
+        assert_eq!(HostStream::new(CAP, 0).frame_bytes(), 2);
+    }
 }
