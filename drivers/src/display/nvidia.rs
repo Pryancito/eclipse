@@ -14414,6 +14414,7 @@ impl NvidiaGpu {
                 // CPU-mmap-able host PA resolved for it.
                 super::nouveau_uapi::record_gem_new(
                     req.info.domain,
+                    req.info.size,
                     phys_addr.is_some(),
                     req.info.tile_flags,
                     !sysmem,

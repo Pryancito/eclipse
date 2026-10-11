@@ -510,6 +510,21 @@ static GEM_REQ_GART: AtomicU32 = AtomicU32::new(0);
 static GEM_CPU_MAPPABLE: AtomicU32 = AtomicU32::new(0);
 static GEM_TILED: AtomicU32 = AtomicU32::new(0);
 static GEM_VRAM_BACKED: AtomicU32 = AtomicU32::new(0);
+/// Requested domains split by EXCLUSIVITY, in objects and in bytes.
+///
+/// The plain `req_vram` / `req_gart` counts cannot be read as placements,
+/// because they overlap: `GEM_NEW` resolves `GART | VRAM` to sysmem
+/// (`let sysmem = want_gart || !want_vram`), so a boot where every request
+/// carries GART can only ever report `vram_backed=0`, whatever it asked for.
+/// Splitting them says how much of that is a client genuinely asking for
+/// host-visible memory and how much is `DEVICE_LOCAL | HOST_VISIBLE` losing
+/// its VRAM half to the rule.
+static GEM_VRAM_ONLY: AtomicU32 = AtomicU32::new(0);
+static GEM_GART_ONLY: AtomicU32 = AtomicU32::new(0);
+static GEM_BOTH: AtomicU32 = AtomicU32::new(0);
+static GEM_VRAM_ONLY_BYTES: AtomicU64 = AtomicU64::new(0);
+static GEM_GART_ONLY_BYTES: AtomicU64 = AtomicU64::new(0);
+static GEM_BOTH_BYTES: AtomicU64 = AtomicU64::new(0);
 static VMBIND_MAP: AtomicU32 = AtomicU32::new(0);
 static VMBIND_UNMAP: AtomicU32 = AtomicU32::new(0);
 static VMBIND_SPARSE: AtomicU32 = AtomicU32::new(0);
@@ -528,6 +543,65 @@ fn note_kind_seen(kind: u32) {
     KINDS_SEEN[k >> 6].fetch_or(1u64 << (k & 63), Ordering::Relaxed);
 }
 
+/// Which of the three requested-domain tallies a `GEM_NEW` belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum DomainBucket {
+    /// VRAM alone: `DEVICE_LOCAL` without `HOST_VISIBLE`. The only shape
+    /// `GEM_NEW` places in real VRAM.
+    VramOnly,
+    /// GART alone: the client wants host-visible memory and says so.
+    GartOnly,
+    /// Both. Nouveau's uAPI reads a domain mask as a placement PREFERENCE,
+    /// but `let sysmem = want_gart || !want_vram` reads any GART bit as a
+    /// requirement, so every one of these goes to sysmem. This is the bucket
+    /// that decides whether a VRAM placement path would buy anything: a boot
+    /// whose bytes are nearly all here is a boot that asked for VRAM and got
+    /// PCIe.
+    Both,
+}
+
+/// Classify a requested domain mask. Pure, so the three-way split is pinned
+/// by [`domain_bucket_tests`] rather than only by reading the caller.
+pub(super) fn domain_bucket(want_vram: bool, want_gart: bool) -> DomainBucket {
+    match (want_vram, want_gart) {
+        (true, true) => DomainBucket::Both,
+        (true, false) => DomainBucket::VramOnly,
+        // Neither is refused before `record_gem_new` is reached, so it
+        // cannot arrive here; counting it as GART-only keeps the totals
+        // adding up to `total` if that ever stops being true.
+        (false, _) => DomainBucket::GartOnly,
+    }
+}
+
+#[cfg(test)]
+mod domain_bucket_tests {
+    use super::*;
+
+    #[test]
+    fn vram_with_gart_is_its_own_bucket_not_a_vram_one() {
+        // The whole point: this is what NVK's DEVICE_LOCAL|HOST_VISIBLE
+        // arrives as, and `GEM_NEW` sends it to sysmem. Counting it as a
+        // VRAM request is what made `req_vram=120 vram_backed=0` look like
+        // a failure rather than the rule working as written.
+        assert_eq!(domain_bucket(true, true), DomainBucket::Both);
+        assert_ne!(domain_bucket(true, true), DomainBucket::VramOnly);
+    }
+
+    #[test]
+    fn each_single_domain_lands_in_its_own_bucket() {
+        assert_eq!(domain_bucket(true, false), DomainBucket::VramOnly);
+        assert_eq!(domain_bucket(false, true), DomainBucket::GartOnly);
+    }
+
+    #[test]
+    fn a_mask_with_neither_domain_still_lands_somewhere() {
+        // `GEM_NEW` refuses it earlier, so this is unreachable today. It is
+        // counted anyway so the three buckets keep summing to `total` if
+        // that refusal ever moves.
+        assert_eq!(domain_bucket(false, false), DomainBucket::GartOnly);
+    }
+}
+
 /// Record one `GEM_NEW`. `req_domain` is the client's requested
 /// NOUVEAU_GEM_DOMAIN_* mask (before we override it to the domain actually
 /// used), `cpu_mappable` true when a host PA resolved, `vram_backed` true
@@ -535,17 +609,27 @@ fn note_kind_seen(kind: u32) {
 /// `tile_flags` the requested tiling (upper bits carry the PTE kind).
 pub(super) fn record_gem_new(
     req_domain: u32,
+    size: u64,
     cpu_mappable: bool,
     tile_flags: u32,
     vram_backed: bool,
 ) {
     GEM_TOTAL.fetch_add(1, Ordering::Relaxed);
-    if req_domain & NOUVEAU_GEM_DOMAIN_VRAM != 0 {
+    let want_vram = req_domain & NOUVEAU_GEM_DOMAIN_VRAM != 0;
+    let want_gart = req_domain & NOUVEAU_GEM_DOMAIN_GART != 0;
+    if want_vram {
         GEM_REQ_VRAM.fetch_add(1, Ordering::Relaxed);
     }
-    if req_domain & NOUVEAU_GEM_DOMAIN_GART != 0 {
+    if want_gart {
         GEM_REQ_GART.fetch_add(1, Ordering::Relaxed);
     }
+    let (n, bytes) = match domain_bucket(want_vram, want_gart) {
+        DomainBucket::Both => (&GEM_BOTH, &GEM_BOTH_BYTES),
+        DomainBucket::VramOnly => (&GEM_VRAM_ONLY, &GEM_VRAM_ONLY_BYTES),
+        DomainBucket::GartOnly => (&GEM_GART_ONLY, &GEM_GART_ONLY_BYTES),
+    };
+    n.fetch_add(1, Ordering::Relaxed);
+    bytes.fetch_add(size, Ordering::Relaxed);
     if cpu_mappable {
         GEM_CPU_MAPPABLE.fetch_add(1, Ordering::Relaxed);
     }
@@ -603,6 +687,38 @@ pub(super) fn format_client_mem() -> alloc::string::String {
         GEM_CPU_MAPPABLE.load(Ordering::Relaxed),
         GEM_TILED.load(Ordering::Relaxed),
         GEM_VRAM_BACKED.load(Ordering::Relaxed),
+    );
+    // What the counts above cannot say. `req_vram`/`req_gart` overlap, so a
+    // boot where every request carries GART reports `vram_backed=0` no matter
+    // what it asked for; `both` is how much of that is
+    // `DEVICE_LOCAL | HOST_VISIBLE` losing its VRAM half to
+    // `let sysmem = want_gart || !want_vram`.
+    let mib = |b: u64| b / (1024 * 1024);
+    let _ = writeln!(
+        s,
+        "[gpudbg]  GEM_NEW domains: vram_only={} ({} MiB) gart_only={} ({} MiB) both={} ({} MiB)",
+        GEM_VRAM_ONLY.load(Ordering::Relaxed),
+        mib(GEM_VRAM_ONLY_BYTES.load(Ordering::Relaxed)),
+        GEM_GART_ONLY.load(Ordering::Relaxed),
+        mib(GEM_GART_ONLY_BYTES.load(Ordering::Relaxed)),
+        GEM_BOTH.load(Ordering::Relaxed),
+        mib(GEM_BOTH_BYTES.load(Ordering::Relaxed)),
+    );
+    // And the datum that bears on whether a VRAM placement path is worth
+    // building: an object whose host physical address nothing ever asks for
+    // needs no host PA, so it could live in VRAM instead of crossing PCIe on
+    // every GPU access. The four consumers that ask are an mmap, a PRIME
+    // export, an ADDFB2 framebuffer and the hardware cursor -- the last two
+    // read the physmap window with no userspace mapping at all, so counting
+    // mmap alone would call them VRAM-eligible when they are not.
+    let (host_pa_n, host_pa_bytes) = crate::scheme::gem_mmap::host_pa_totals();
+    let _ = writeln!(
+        s,
+        "[gpudbg]  GEM host PA handed out (mmap/PRIME/fb/cursor): {} object(s), {} MiB (of {} \
+         allocated)",
+        host_pa_n,
+        mib(host_pa_bytes),
+        gem_total,
     );
     let non_generic = VMBIND_NON_GENERIC.load(Ordering::Relaxed);
     let _ = writeln!(
