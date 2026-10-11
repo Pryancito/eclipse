@@ -72,6 +72,13 @@ pub fn tickless_idle() -> bool {
 /// [`crate::deadline::may_stretch_tick`], where it is testable on the host. The
 /// cost of keeping the boot CPU at full rate is what every CPU paid before, so
 /// a single-CPU boot behaves exactly as it always has.
+///
+/// `cfg`'d like its one caller and like `DEADLINE_TIMER`, which it reads: the
+/// deadline timer is an x86_64 LAPIC mode and does not exist on the other two
+/// architectures, so without this `kernel-hal` did not COMPILE for aarch64 or
+/// riscv64 -- `cannot find value DEADLINE_TIMER in this scope`, which is the
+/// whole of `test-bare-metal` on both.
+#[cfg(target_arch = "x86_64")]
 #[inline]
 fn may_go_tickless(cpu: usize) -> bool {
     crate::deadline::may_stretch_tick(cpu, tickless_idle(), DEADLINE_TIMER.load(Ordering::Relaxed))
