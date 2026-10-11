@@ -355,6 +355,30 @@ fn ensure_4k(pt: &mut PageTable, base: usize, size: usize) -> Result<(), BandRef
     Ok(())
 }
 
+/// How many bytes at the top of the usable region of a coroutine stack may
+/// have been written, for the scheduler's bounded poison.
+///
+/// `Executor::new` poisons the usable region of every stack it builds so that
+/// a frame parked there by the *previous* occupant of a recycled block cannot
+/// be mistaken for a resumable one — and that is 2 MiB of stores on a path the
+/// scheduler takes on every preemption mid-poll, about 99,8 % of its cost.
+/// Almost all of those stores land on pages nobody ever touched. This asks the
+/// page table which ones were, so the scheduler can poison just those.
+///
+/// `None` means "no idea", and the scheduler then poisons everything, which is
+/// what it did before this hook existed: that is the answer on riscv64 and
+/// aarch64 (no usable dirty bit), and on x86-64 whenever a huge leaf still
+/// covers part of the region — the two hard guard bands split the ends of it
+/// as a side effect of being installed, but not necessarily the middle.
+///
+/// Read-only, allocation-free and lock-free, because it runs inside
+/// `Executor::new` with the scheduler's runtime lock held and interrupts off.
+fn dirty_depth(base: usize, size: usize) -> Option<usize> {
+    // Same reasoning as `install`: the kernel half of every address space
+    // walks into the same sub-tables, so whichever table is loaded will do.
+    PageTable::from_current().dirty_depth_from_top(base, size)
+}
+
 /// Register this module's hooks with the scheduler.
 ///
 /// Must run after the kernel page tables are pinned and *before* the first
@@ -375,6 +399,11 @@ pub fn init() {
     // frame ever leaves its page-table entry. Only used when STACKQUARANTINE=1
     // arms the scheduler side.
     unsafe { executor::set_stack_quarantine_hooks(quarantine_protect, quarantine_unprotect) };
+    // SAFETY: [`dirty_depth`] only reads page-table entries, and the contract
+    // it has to keep is that it never under-reports — see its own docs and
+    // `GenericPTE::dirty`. Registered last: until it is, the scheduler
+    // poisons whole regions, which is always correct.
+    unsafe { executor::set_stack_dirty_depth_hook(dirty_depth) };
 }
 
 /// `(bands installed, install requests refused)` since boot.

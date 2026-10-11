@@ -162,6 +162,9 @@ impl StubExecutor {
 mod metadata_tests;
 
 #[cfg(test)]
+mod poison_bound_tests;
+
+#[cfg(test)]
 mod executor_observer_tests {
     use super::*;
 
@@ -483,6 +486,141 @@ pub(crate) unsafe fn poison_usable_region(base: usize, bytes: usize) {
     // Lo unico que el `volatile` de antes conseguia de verdad: que nadie
     // decida que estas escrituras estan muertas. Una vez, no una por palabra.
     core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+}
+
+// ── la cota del envenenado ─────────────────────────────────────
+//
+// Envenenar la zona utilizable entera es el 99,8 % de una preempcion a mitad
+// de poll (`stack_birth_benches`), y el coste es lineal en el tamaño, asi que
+// una cota vale su proporcion. Lo que hacia insegura cualquier cota es lo que
+// la cota deja SIN tocar en un bloque que viene del fondo de pilas: no es
+// relleno, son los marcos que dejo su ocupante anterior, con un `cr3` vivo y
+// una `rip` dentro del texto del kernel, o sea el unico contenido que
+// `classify_parked_frame` acepta
+// (`runtime::probe_tests::executor_gates::a_recycled_frame_is_the_one_content_the_gate_accepts`).
+//
+// **Lo que hace segura la cota: preguntarle al hardware.** La MMU marca el bit
+// de sucio (`D`) del PTE en la primera escritura a cada pagina. Una cota que
+// cubra todas las paginas con `D` puesto cubre, por construccion, todo lo que
+// cualquier ocupante de este bloque haya escrito jamas.
+//
+// Y la pieza que lo hace barato: **el bit no se borra nunca**. Borrar `D` sin
+// derribar el TLB de todas las CPUs deja una ventana en la que una entrada de
+// TLB que ya trae `D` puesto absorbe la escritura y el hardware no vuelve a
+// tocar la tabla, o sea una pagina escrita que leeriamos como limpia --
+// justo el fallo que la cota no puede permitirse --, y un derribo de 512
+// paginas por retirada cuesta mas que los 105 us que ahorra. Sin borrarlo,
+// `D` solo acumula desde que se creo el mapeo, asi que la respuesta es
+// **monotona y conservadora**: puede sobrar region, nunca faltar. De paso, lo
+// que se obtiene es una marca de agua POR BLOQUE a lo largo de todas sus
+// encarnaciones, que es exactamente lo que hacia falta y lo que
+// `stack_high_water()` no es (un global muestreado solo en `sched_yield`).
+//
+// La cota se pide en paginas de 4 KiB porque es la unidad del bit. La zona
+// utilizable ya esta partida en 4 KiB casi siempre: instalar las dos guardas
+// duras parte las paginas enormes de los dos extremos del bloque, y el bloque
+// entero son 2.560 KiB, asi que solo se queda enorme la de en medio cuando el
+// bloque cruza tres paginas de 2 MiB. Donde no se pueda contestar (mapeo
+// enorme, una arquitectura sin bit de sucio en hardware -- riscv64 lo pone a
+// mano en cada mapeo y aarch64 solo tiene el de acceso), el gancho contesta
+// `None` y se envenena la zona entera, igual que la guarda dura degrada al
+// canario blando.
+
+/// Que parte de `[base, base + size)` ha sido escrita alguna vez, en bytes
+/// contados **desde el tope** (la pila crece hacia abajo, asi que lo escrito
+/// es el final del bloque).
+///
+/// `None` significa «no se puede contestar»: el llamante envenena todo.
+/// Contestar de mas es correcto; contestar de menos no.
+type StackDirtyDepthHook = fn(base: usize, size: usize) -> Option<usize>;
+
+static STACK_DIRTY_DEPTH: spin::Mutex<Option<StackDirtyDepthHook>> = spin::Mutex::new(None);
+
+/// Registrar el lector del bit de sucio, que es lo que acota el envenenado.
+///
+/// # Safety
+///
+/// El gancho tiene que **sobreestimar o acertar, nunca quedarse corto**: si
+/// devuelve `Some(n)`, ninguna palabra por debajo de `base + size - n` puede
+/// haber sido escrita desde que se creo el mapeo. Tiene que contestar sin
+/// tomar cerrojos que el planificador pueda estar sosteniendo y sin derribar
+/// el TLB, porque corre dentro de `Executor::new`, con interrupciones
+/// apagadas. Un gancho que no pueda prometer eso devuelve `None`.
+pub unsafe fn set_stack_dirty_depth_hook(hook: StackDirtyDepthHook) {
+    *STACK_DIRTY_DEPTH.lock() = Some(hook);
+}
+
+/// Poner o quitar el gancho, y devolver el cerrojo que serializa a los tests
+/// que lo tocan: es un global y `cargo test` corre en paralelo.
+#[cfg(test)]
+pub(crate) fn with_dirty_depth_hook(
+    hook: Option<StackDirtyDepthHook>,
+) -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    *STACK_DIRTY_DEPTH.lock() = hook;
+    guard
+}
+
+/// Bloques cuyo envenenado se pudo acotar, y bloques que hubo que envenenar
+/// enteros porque el gancho no contesto.
+static POISON_BOUNDED: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+static POISON_WHOLE: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+/// Paginas de 4 KiB que la cota se ha ahorrado envenenar, acumuladas.
+static POISON_PAGES_SAVED: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
+/// `(acotados, enteros, paginas ahorradas)` del envenenado de pilas.
+pub fn poison_bound_counts() -> (usize, usize, usize) {
+    use core::sync::atomic::Ordering::Relaxed;
+    (
+        POISON_BOUNDED.load(Relaxed),
+        POISON_WHOLE.load(Relaxed),
+        POISON_PAGES_SAVED.load(Relaxed),
+    )
+}
+
+/// Cuanto hay que envenenar de `[base, base + size)`, en bytes desde el tope.
+///
+/// Devuelve `size` cuando no hay cota que valga. Redondea la respuesta del
+/// gancho **hacia arriba** a pagina y la recorta a `size`: una cota que no
+/// llegue al final de su propia pagina dejaria media pagina sucia sin tocar,
+/// y una mayor que la region es un gancho roto, no una invitacion a salirse.
+pub(crate) fn poison_bound(base: usize, size: usize) -> usize {
+    let Some(hook) = *STACK_DIRTY_DEPTH.lock() else {
+        return size;
+    };
+    match hook(base, size) {
+        Some(depth) => {
+            let pages = depth.div_ceil(PAGE_SIZE);
+            (pages * PAGE_SIZE).min(size)
+        }
+        None => size,
+    }
+}
+
+/// Envenenar lo que haga falta de la zona utilizable, que es lo que paga cada
+/// preempcion a mitad de poll. Ver el bloque de arriba.
+///
+/// # Safety
+///
+/// Como [`poison_usable_region`]: `[base, base + size)` mapeado, alineado y
+/// de uso exclusivo del llamante.
+pub(crate) unsafe fn poison_usable_region_bounded(base: usize, size: usize) {
+    use core::sync::atomic::Ordering::Relaxed;
+    let bound = poison_bound(base, size);
+    if bound == size {
+        POISON_WHOLE.fetch_add(1, Relaxed);
+    } else {
+        POISON_BOUNDED.fetch_add(1, Relaxed);
+        POISON_PAGES_SAVED.fetch_add((size - bound) / PAGE_SIZE, Relaxed);
+    }
+    // Lo escrito es el FINAL del bloque: la pila crece hacia abajo desde
+    // `base + size`. Envenenar los primeros `bound` bytes en vez de los
+    // ultimos dejaria intactos justo los marcos que la cota existe para tapar.
+    // SAFETY: `bound <= size`, asi que `[base + size - bound, base + size)`
+    // cae dentro de lo que el llamante promete.
+    unsafe { poison_usable_region(base + size - bound, bound) };
 }
 
 /// La palabra que le toca al hueco `i` de la banda de guarda.
@@ -1671,7 +1809,7 @@ impl Executor {
         // SAFETY: `[stack_base, stack_base + STACK_SIZE)` is this block's usable
         // region, mapped and 8-aligned, and this executor is its only owner
         // until it publishes itself below.
-        unsafe { poison_usable_region(stack_base, STACK_SIZE) };
+        unsafe { poison_usable_region_bounded(stack_base, STACK_SIZE) };
         note_first_executor_created(hard_guard_bottom, hard_guard_top);
         let mut pin_executor = Pin::new(Box::new(Executor {
             id: executor_alloc_id(),

@@ -117,6 +117,22 @@ impl GenericPTE for X86PTE {
     fn is_leaf(&self) -> bool {
         PTF::from_bits_truncate(self.0).contains(PTF::HUGE_PAGE)
     }
+    /// The one format of the three whose hardware maintains this bit: the CPU
+    /// sets D on the first write through the entry and never clears it by
+    /// itself. Nothing in the kernel clears it either, which is what makes it
+    /// usable without a shootdown — clearing D without invalidating every
+    /// CPU's TLB would let an entry that already has D absorb a write, and the
+    /// page would read clean after being written.
+    ///
+    /// Only meaningful on a leaf; an intermediate table entry's bit 6 is
+    /// ignored by the walker. The one caller only ever asks about 4 KiB leaves.
+    fn dirty(&self) -> Option<bool> {
+        Some(PTF::from_bits_truncate(self.0).contains(PTF::DIRTY))
+    }
+
+    fn set_dirty(&mut self) {
+        self.0 |= PTF::DIRTY.bits();
+    }
 
     fn set_addr(&mut self, paddr: PhysAddr) {
         self.0 = (self.0 & !PHYS_ADDR_MASK) | (paddr as u64 & PHYS_ADDR_MASK);
@@ -128,6 +144,16 @@ impl GenericPTE for X86PTE {
             flags |= PTF::HUGE_PAGE;
         }
         let mut bits = self.addr() as u64 | flags.bits();
+        // Carry the two bits the CPU maintains rather than rebuilding them as
+        // zero. DIRTY is read by `PageTableImpl::dirty_depth_from_top` to
+        // bound the scheduler's stack poison, and the paths that rewrite flags
+        // over a live mapping include the stack quarantine, which
+        // write-protects the usable region of a coroutine stack on teardown
+        // and restores it on reuse: losing D there would report a stack full
+        // of a previous occupant's frames as untouched. Keeping a stale D on
+        // an entry that was just repointed can only over-report, and nothing
+        // else in the kernel reads either bit.
+        bits |= self.0 & (PTF::ACCESSED | PTF::DIRTY).bits();
         // WriteCombining selects PAT entry 7 (PAT|PCD|PWT). `From<MMUFlags>`
         // already contributed PCD|PWT; the PAT bit cannot live in `PTF`
         // because its position is level-dependent — bit 7 in a 4 KiB PTE,

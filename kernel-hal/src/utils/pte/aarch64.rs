@@ -199,6 +199,13 @@ impl GenericPTE for AARCH64PTE {
         // showed; since a leaf now stops `next_table_mut`, say it properly.
         !self.is_unused() && !PTF::from_bits_truncate(self.0 as usize).contains(PTF::NON_BLOCK)
     }
+    /// `None`: AArch64 has no dirty bit here. What it has is AF (access flag),
+    /// which a read sets as readily as a write, and the optional DBM
+    /// (dirty-bit modifier) scheme this kernel does not configure. A bit that
+    /// a read can set is not an answer to "was this written".
+    fn dirty(&self) -> Option<bool> {
+        None
+    }
     fn set_addr(&mut self, paddr: PhysAddr) {
         // Keep the attributes. This assigned the address alone, which wiped
         // VALID and every permission bit with it -- and the walker's
