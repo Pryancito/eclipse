@@ -1713,3 +1713,263 @@ mod termios_tests {
         assert_eq!(t.input_char(b'\r'), Some(b'\n'));
     }
 }
+
+#[cfg(test)]
+mod request_number_tests {
+    //! The request numbers themselves, derived instead of copied.
+    //!
+    //! Everything above is a wire number: the second argument of `ioctl(2)`,
+    //! chosen by userspace and matched here. Nothing inside this kernel can
+    //! check one, because both halves of every dispatch read the same
+    //! constant and agree with each other whatever it says. A wrong number
+    //! does not fail to compile and does not return an error anybody traces:
+    //! the request falls past its arm to the `ENOTTY` at the end, and the
+    //! caller reads that as "this is not a terminal". `tcgetattr` answering
+    //! that is a shell that will not take a line, `TIOCGWINSZ` answering it
+    //! is every curses program sizing itself against an 0x0 screen, and
+    //! `TIOCSCTTY` answering it is a login that never gets a controlling
+    //! terminal and so never gets a job-control signal.
+    //!
+    //! So the numbers below are not copied from the constants; they are built
+    //! the way `include/uapi/asm-generic/ioctl.h` builds them, from the magic
+    //! letter and the command number that the headers write beside each name.
+    //! Those two halves can be read against the header line by line, and they
+    //! agree with the constant only if the constant is right.
+    //!
+    //! The `#[cfg(target_arch = "mips")]` twins of nine of these are the one
+    //! part of the table no test can reach: this tree builds x86_64, aarch64
+    //! and riscv64, so that arm is never compiled here, and its numbers use
+    //! mips's own encoding (three direction bits at 29, with read and write
+    //! swapped) rather than the generic one below.
+
+    use super::*;
+
+    /// `_IO(type, nr)`: a request that transfers nothing. The terminal,
+    /// console and VT tables are written out as bare hex in the headers, but
+    /// every one of them is this.
+    fn io(ty: u8, nr: u8) -> usize {
+        ((ty as usize) << 8) | nr as usize
+    }
+
+    /// `_IOR(type, nr, size)`: the kernel writes `size` bytes back. Direction
+    /// `_IOC_READ` is 2 and sits at bit 30 in the generic encoding.
+    fn ior(ty: u8, nr: u8, size: usize) -> usize {
+        (2usize << 30) | (size << 16) | io(ty, nr)
+    }
+
+    /// `_IOW(type, nr, size)`: userspace hands `size` bytes in.
+    fn iow(ty: u8, nr: u8, size: usize) -> usize {
+        (1usize << 30) | (size << 16) | io(ty, nr)
+    }
+
+    #[test]
+    fn the_terminal_requests_are_the_numbers_asm_generic_ioctls_h_gives() {
+        // `'T'` is 0x54, and the command number is what the header writes
+        // after it. These are the requests a libc terminal call sends.
+        assert_eq!(TCGETS, io(b'T', 0x01), "tcgetattr");
+        assert_eq!(TCSETS, io(b'T', 0x02), "tcsetattr TCSANOW");
+        assert_eq!(TCSETSW, io(b'T', 0x03), "tcsetattr TCSADRAIN");
+        assert_eq!(TCSETSF, io(b'T', 0x04), "tcsetattr TCSAFLUSH");
+        assert_eq!(TCFLSH, io(b'T', 0x0B), "tcflush");
+        assert_eq!(TIOCSCTTY, io(b'T', 0x0E));
+        assert_eq!(TIOCGPGRP, io(b'T', 0x0F), "tcgetpgrp");
+        assert_eq!(TIOCSPGRP, io(b'T', 0x10), "tcsetpgrp");
+        assert_eq!(TIOCOUTQ, io(b'T', 0x11));
+        assert_eq!(TIOCGWINSZ, io(b'T', 0x13));
+        assert_eq!(TIOCSWINSZ, io(b'T', 0x14));
+        assert_eq!(TIOCMGET, io(b'T', 0x15));
+        assert_eq!(TIOCMBIS, io(b'T', 0x16));
+        assert_eq!(TIOCMBIC, io(b'T', 0x17));
+        assert_eq!(TIOCMSET, io(b'T', 0x18));
+        assert_eq!(FIONREAD, io(b'T', 0x1B));
+        assert_eq!(TIOCLINUX, io(b'T', 0x1C));
+        assert_eq!(FIONBIO, io(b'T', 0x21));
+        assert_eq!(TIOCNOTTY, io(b'T', 0x22));
+        assert_eq!(TIOCGSID, io(b'T', 0x29), "tcgetsid");
+        assert_eq!(FIONCLEX, io(b'T', 0x50));
+        assert_eq!(FIOCLEX, io(b'T', 0x51));
+        assert_eq!(TIOCGICOUNT, io(b'T', 0x5D));
+    }
+
+    #[test]
+    fn the_bytes_waiting_to_read_have_one_number_under_two_names() {
+        // `TIOCINQ` is spelled as an alias in the header too, not a number of
+        // its own, and a program may send either name.
+        assert_eq!(TIOCINQ, FIONREAD);
+        assert_eq!(TIOCINQ, 0x541B);
+    }
+
+    #[test]
+    fn the_pty_requests_carry_their_direction_and_their_size() {
+        // The three the header writes with the macros rather than as hex, so
+        // the direction and size bits are part of the number a `/dev/ptmx`
+        // caller sends. `posix_openpt` sends all three in order.
+        assert_eq!(
+            TIOCGPTN,
+            ior(b'T', 0x30, 4),
+            "_IOR('T', 0x30, unsigned int)"
+        );
+        assert_eq!(TIOCSPTLCK, iow(b'T', 0x31, 4), "_IOW('T', 0x31, int)");
+        assert_eq!(TIOCGPTPEER, io(b'T', 0x41), "_IO('T', 0x41), no argument");
+        // Spelled out once, because getting these two swapped is the kind of
+        // mistake that leaves the number looking plausible: read is 2 and
+        // write is 1, and both sit above the size.
+        assert_eq!(TIOCGPTN, 0x8004_5430);
+        assert_eq!(TIOCSPTLCK, 0x4004_5431);
+        assert_ne!(TIOCGPTN & (3 << 30), TIOCSPTLCK & (3 << 30));
+    }
+
+    #[test]
+    fn the_console_requests_are_the_numbers_linux_kd_h_gives() {
+        // `'K'` is 0x4B. These are what a VT program -- `openvt`, `kbd`, an
+        // X server or a Wayland compositor taking the console -- sends.
+        assert_eq!(KDMKTONE, io(b'K', 0x30));
+        assert_eq!(KDGETLED, io(b'K', 0x31));
+        assert_eq!(KDSETLED, io(b'K', 0x32));
+        assert_eq!(KDGKBTYPE, io(b'K', 0x33));
+        assert_eq!(KDSETMODE, io(b'K', 0x3A));
+        assert_eq!(KDGETMODE, io(b'K', 0x3B));
+        assert_eq!(KDGKBMODE, io(b'K', 0x44));
+        assert_eq!(KDSKBMODE, io(b'K', 0x45));
+        assert_eq!(KDGKBENT, io(b'K', 0x46));
+        // Set and get differ by one in both pairs, and in opposite
+        // directions: mode is set 0x3A / get 0x3B, keyboard mode is get 0x44
+        // / set 0x45. Nothing but the header says which way round.
+        assert_eq!(KDGETMODE, KDSETMODE + 1);
+        assert_eq!(KDSKBMODE, KDGKBMODE + 1);
+    }
+
+    #[test]
+    fn the_vt_requests_are_the_numbers_linux_vt_h_gives() {
+        // `'V'` is 0x56, and these run from 0 with one gap: 0x5604 is
+        // `VT_SENDSIG`, which this kernel does not implement.
+        assert_eq!(VT_OPENQRY, io(b'V', 0x00));
+        assert_eq!(VT_GETMODE, io(b'V', 0x01));
+        assert_eq!(VT_SETMODE, io(b'V', 0x02));
+        assert_eq!(VT_GETSTATE, io(b'V', 0x03));
+        assert_eq!(VT_RELDISP, io(b'V', 0x05));
+        assert_eq!(VT_ACTIVATE, io(b'V', 0x06));
+        assert_eq!(VT_WAITACTIVE, io(b'V', 0x07));
+        assert_eq!(VT_DISALLOCATE, io(b'V', 0x08));
+        // The gap is real: 0x5604 is `VT_SENDSIG`, which this kernel does not
+        // implement, so no name here may take it.
+        for n in [
+            VT_OPENQRY,
+            VT_GETMODE,
+            VT_SETMODE,
+            VT_GETSTATE,
+            VT_RELDISP,
+            VT_ACTIVATE,
+            VT_WAITACTIVE,
+            VT_DISALLOCATE,
+        ] {
+            assert_ne!(n, io(b'V', 0x04), "0x5604 is VT_SENDSIG");
+        }
+    }
+
+    #[test]
+    fn no_two_requests_this_kernel_dispatches_on_share_a_number() {
+        // Two arms of one `match` that agreed would be an `unreachable_patterns`
+        // error, but these are dispatched from several places -- the console
+        // discipline, the pseudo-terminal, the VT device -- so a collision
+        // across two of those tables compiles and the second request silently
+        // does the first one's work.
+        let requests: &[(&str, usize)] = &[
+            ("TCGETS", TCGETS),
+            ("TCSETS", TCSETS),
+            ("TCSETSW", TCSETSW),
+            ("TCSETSF", TCSETSF),
+            ("TCFLSH", TCFLSH),
+            ("TIOCSCTTY", TIOCSCTTY),
+            ("TIOCGPGRP", TIOCGPGRP),
+            ("TIOCSPGRP", TIOCSPGRP),
+            ("TIOCOUTQ", TIOCOUTQ),
+            ("TIOCGWINSZ", TIOCGWINSZ),
+            ("TIOCSWINSZ", TIOCSWINSZ),
+            ("TIOCMGET", TIOCMGET),
+            ("TIOCMBIS", TIOCMBIS),
+            ("TIOCMBIC", TIOCMBIC),
+            ("TIOCMSET", TIOCMSET),
+            ("FIONREAD", FIONREAD),
+            ("TIOCLINUX", TIOCLINUX),
+            ("FIONBIO", FIONBIO),
+            ("TIOCNOTTY", TIOCNOTTY),
+            ("TIOCGSID", TIOCGSID),
+            ("TIOCGICOUNT", TIOCGICOUNT),
+            ("FIONCLEX", FIONCLEX),
+            ("FIOCLEX", FIOCLEX),
+            ("TIOCGPTN", TIOCGPTN),
+            ("TIOCSPTLCK", TIOCSPTLCK),
+            ("TIOCGPTPEER", TIOCGPTPEER),
+            ("KDMKTONE", KDMKTONE),
+            ("KDGETLED", KDGETLED),
+            ("KDSETLED", KDSETLED),
+            ("KDGKBTYPE", KDGKBTYPE),
+            ("KDSETMODE", KDSETMODE),
+            ("KDGETMODE", KDGETMODE),
+            ("KDGKBMODE", KDGKBMODE),
+            ("KDSKBMODE", KDSKBMODE),
+            ("KDGKBENT", KDGKBENT),
+            ("VT_OPENQRY", VT_OPENQRY),
+            ("VT_GETMODE", VT_GETMODE),
+            ("VT_SETMODE", VT_SETMODE),
+            ("VT_GETSTATE", VT_GETSTATE),
+            ("VT_RELDISP", VT_RELDISP),
+            ("VT_ACTIVATE", VT_ACTIVATE),
+            ("VT_WAITACTIVE", VT_WAITACTIVE),
+            ("VT_DISALLOCATE", VT_DISALLOCATE),
+        ];
+        for (i, (na, a)) in requests.iter().enumerate() {
+            for (nb, b) in &requests[i + 1..] {
+                assert_ne!(a, b, "{} and {} are the same request", na, nb);
+            }
+        }
+    }
+
+    #[test]
+    fn the_modem_lines_are_the_bits_asm_generic_termios_h_gives() {
+        // `TIOCMGET` answers with an `int` of these, and `TIOCMBIS`/`TIOCMBIC`
+        // take one. A program watching for a hang-up reads `TIOCM_CAR`, and a
+        // flow-controlled link reads `TIOCM_CTS`.
+        assert_eq!(TIOCM_DTR, 0x002);
+        assert_eq!(TIOCM_RTS, 0x004);
+        assert_eq!(TIOCM_CTS, 0x020);
+        assert_eq!(TIOCM_CAR, 0x040, "TIOCM_CD is the same bit");
+        assert_eq!(TIOCM_DSR, 0x100);
+        // Five different single bits, and none of them the 0x001 the header
+        // keeps for `TIOCM_LE`.
+        let lines = [TIOCM_DTR, TIOCM_RTS, TIOCM_CTS, TIOCM_CAR, TIOCM_DSR];
+        for (i, a) in lines.iter().enumerate() {
+            assert_eq!(a.count_ones(), 1, "line {} is not one bit", i);
+            assert_ne!(*a, 0x001, "0x001 is TIOCM_LE");
+            for b in &lines[i + 1..] {
+                assert_ne!(a, b);
+            }
+        }
+    }
+
+    #[test]
+    fn the_values_those_requests_carry_are_the_ones_the_headers_give() {
+        // Small numbers, which is what makes them easy to get wrong and
+        // impossible to notice: `KDSETMODE` with the wrong one puts the
+        // console into graphics mode when a program asked for text, and the
+        // screen simply stops being written to.
+        assert_eq!(KD_TEXT, 0x00);
+        assert_eq!(KD_GRAPHICS, 0x01);
+        assert_eq!(K_RAW, 0x00);
+        assert_eq!(K_XLATE, 0x01);
+        assert_eq!(K_MEDIUMRAW, 0x02);
+        assert_eq!(K_UNICODE, 0x03);
+        assert_eq!(K_OFF, 0x04);
+        assert_eq!(KT_LATIN, 0);
+        assert_eq!(KT_FN, 1);
+        assert_eq!(KT_SPEC, 2);
+        // `VT_SETMODE` hands in a `vt_mode` whose first byte is one of these,
+        // and `VT_RELDISP` answers an acquire with `VT_ACKACQ`.
+        assert_eq!(VT_AUTO, 0x00);
+        assert_eq!(VT_PROCESS, 0x01);
+        assert_eq!(VT_ACKACQ, 0x02);
+        // `TIOCLINUX` multiplexes on its argument's first byte.
+        assert_eq!(TIOCL_GETSHIFTSTATE, 6);
+    }
+}
