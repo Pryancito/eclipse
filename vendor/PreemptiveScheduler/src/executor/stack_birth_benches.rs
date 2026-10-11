@@ -53,15 +53,55 @@
 //!   mueve con el tamaño de la L2 y con el ancho de banda a RAM. Lo que se
 //!   traslada es la RELACION entre las tres filas, y que la primera no cabe en
 //!   cache en ninguna maquina.
-//! - **No se mide un `Executor::new` entero.** Construirlo en el anfitrion
-//!   reserva 2,6 MiB, publica en los dos registros globales que el resto de
-//!   los tests de este fichero comprueban, y toca los contadores de guarda. Las
+//! - **No se mide un `Executor::new` entero**, y no se puede: la razon esta
+//!   abajo, en «Por que no hay una fila que mida `Executor::new` entero». Las
 //!   filas de aqui son puras: un buffer propio, ningun global.
+//!
+//! # El denominador: con el fondo caliente, el envenenado es TODA la preempcion
+//!
+//! Las filas de arriba dan el coste del cuarto paso. Las de los otros modulos
+//! de este crate dan el de todo lo demas que hace `Executor::new` cuando el
+//! bloque viene del fondo de pilas, que es el caso normal del nucleo en
+//! regimen (crear y liberar se compensan, asi que el fondo casi nunca esta
+//! vacio). Medidas el 11-oct en el mismo contenedor, a minutos unas de
+//! otras:
+//!
+//! | lo que hace una preempcion | fila | coste |
+//! | --- | --- | --- |
+//! | pedir el bloque al fondo | `take_a_stack_from_a_pool_holding_one_in_the_last_slot` | 50 ns |
+//! | publicarlo en los dos registros | `publish_a_stack_into_registries_holding_four` | 55 ns |
+//! | **envenenar los 2 MiB** | `poison_a_whole_stack_one_volatile_word_at_a_time` | **94.844 ns** |
+//! | tres barridos de cuarentena | `sweep_the_retired_table_with_nothing_in_it` x3 | 26 ns |
+//! | devolver el bloque al fondo | `give_a_stack_back_to_an_empty_pool` | 15 ns |
+//!
+//! Todo lo que no es el envenenado suma **unos 150 ns**: el **0,16 %**. Dicho
+//! al derecho: **una preempcion a mitad de poll es el envenenado y nada mas**.
+//! Las tres tandas anteriores encontraron barridos de tabla fija de verdad
+//! (512 huecos en cada malloc, 256 en cada punto de planificacion, 128 RMW en
+//! cada `Executor::new`) y los tres estaban bien arreglados, pero los tres
+//! juntos caben en ese 0,16 %. Y `poison_only_the_deepest_sixty_four_kilobytes`
+//! dice lo que costaria una preempcion si el envenenado se acotara a lo que un
+//! marco llega a tocar: **unos 3 us en vez de 95**.
+//!
+//! Lo unico que el nucleo paga aqui y el anfitrion no es el paso 2, y **en una
+//! preempcion con el fondo caliente el paso 2 no corre**: el bloque trae las
+//! guardas puestas. Asi que para ese caso la suma de arriba no tiene hueco.
+//!
+//! ## Por que no hay una fila que mida `Executor::new` entero
+//!
+//! No es pureza, es que no se puede: `init_stack_and_context` llama a
+//! `crate::arch::pg_base_register()`, que en x86_64 es `mov reg, cr3`. Una
+//! instruccion privilegiada en un test del anfitrion es un #GP, o sea
+//! SIGSEGV, antes de que la fila mida nada. (Probado, 11-oct.) Por eso el
+//! denominador se arma sumando filas y no cronometrando la funcion. Y por eso
+//! la reserva del monton en un fallo de fondo tampoco tiene fila: ahi `Global`
+//! es el `malloc` del anfitrion, no el asignador de camaradas del nucleo, y la
+//! cifra no se trasladaria.
 //!
 //! Correr:
 //!
 //! ```sh
-//! cargo bench -p PreemptiveScheduler -- executor::stack_birth_benches
+//! cargo bench -p executor -- executor::stack_birth_benches
 //! ```
 
 use super::{GUARD_SIZE, GUARD_WORDS, STACK_CANARY, STACK_SIZE};
