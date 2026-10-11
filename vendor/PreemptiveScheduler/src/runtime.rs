@@ -2729,6 +2729,11 @@ pub(crate) fn get_current_runtime() -> MutexGuard<'static, ExecutorRuntime> {
     crate::diag::diag_lock(GLOBAL_RUNTIME.force(id))
 }
 
+/// Lo que contestan las sondas en una CPU sin runtime; ver las notas del
+/// modulo.
+#[cfg(test)]
+mod probe_tests;
+
 #[cfg(test)]
 mod containment_tests {
     use super::*;

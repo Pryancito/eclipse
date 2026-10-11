@@ -182,6 +182,21 @@ impl Task {
     pub fn id(&self) -> usize {
         self.id
     }
+
+    /// Deja el cerrojo del futuro tomado y sin dueño, que es el estado exacto
+    /// que deja un panico dentro de [`Task::poll`].
+    ///
+    /// Costura de test para los del ejecutor
+    /// (`executor::metadata_tests`): ahi no se puede entrar en un poll de
+    /// verdad -- `Executor::run` necesita una pila de corrutina y un `cr3` --
+    /// y sin el cerrojo huerfano `abandon` no tiene nada que forzar, asi que
+    /// `Executor::abandon_current_task` se probaria contra un estado que el
+    /// camino del panico nunca ve. El campo es privado del modulo, que es por
+    /// lo que esto vive aqui y no alli.
+    #[cfg(test)]
+    pub(crate) fn leak_future_lock_for_test(&self) {
+        core::mem::forget(self.future.try_lock().expect("future lock"));
+    }
 }
 
 pub struct FutureCollection {
@@ -1090,6 +1105,240 @@ mod collection_tests {
 
     fn pending() -> impl Future<Output = ()> + Send + 'static {
         core::future::pending::<()>()
+    }
+
+    #[test]
+    fn task_ids_are_handed_out_once_each() {
+        let first = alloc_id();
+        assert!(alloc_id() > first, "los ids ni se repiten ni bajan");
+        let a = Task::new(pending(), 0, None);
+        let b = Task::new(pending(), 0, None);
+        assert_ne!(a.id(), b.id());
+        assert_ne!(a.id(), 0, "el cero es «ninguna tarea» en el ejecutor");
+    }
+
+    /// `affinity_mask` es la lectura que usan el reparto y el rescate; lo que
+    /// la separa de `allowed_on` es que distingue «sin mascara» de «mascara
+    /// vacia», y la segunda es una tarea que no puede correr en ningun sitio.
+    #[test]
+    fn a_task_reports_its_mask_apart_from_having_none() {
+        let free = Task::new(pending(), 0, None);
+        assert_eq!(free.affinity_mask(), None);
+        assert!(free.allowed_on(0) && free.allowed_on(63) && free.allowed_on(64));
+
+        let mask = Arc::new(AtomicU64::new(0b0101));
+        let pinned = Task::new(pending(), 0, Some(mask.clone()));
+        assert_eq!(pinned.affinity_mask(), Some(0b0101));
+        assert!(pinned.allowed_on(0) && pinned.allowed_on(2));
+        assert!(!pinned.allowed_on(1) && !pinned.allowed_on(3));
+        assert!(
+            pinned.allowed_on(64),
+            "la mascara solo cubre las 64 primeras CPUs logicas"
+        );
+
+        // `sched_setaffinity` cambia la mascara DENTRO del `Arc`, no el
+        // `Option`: la lectura tiene que ver el cambio.
+        mask.store(0b1000, Ordering::Relaxed);
+        assert_eq!(pinned.affinity_mask(), Some(0b1000));
+        assert!(!pinned.allowed_on(0) && pinned.allowed_on(3));
+
+        let nowhere = Task::new(pending(), 0, Some(Arc::new(AtomicU64::new(0))));
+        assert_eq!(
+            nowhere.affinity_mask(),
+            Some(0),
+            "«en ninguna parte» no es lo mismo que «donde sea»"
+        );
+        assert!(!nowhere.allowed_on(0));
+    }
+
+    /// El `Debug` de `Task` toma el cerrojo interno con `diag_lock`, que es lo
+    /// que lo hace imprimible desde el camino de un informe: con el cerrojo ya
+    /// tomado por el que informa habria sido un deadlock dentro del panico.
+    #[test]
+    fn a_task_prints_its_scheduler_state() {
+        let task = Task::new(pending(), 3, None);
+        let printed = alloc::format!("{:?}", task);
+        assert!(printed.contains("priority: 3"), "{}", printed);
+        assert!(printed.contains("RUNNABLE"), "{}", printed);
+        assert!(printed.contains("intr_enable: false"), "{}", printed);
+    }
+
+    /// La preferencia del cursor: de los huecos listos, el primero a partir de
+    /// `next`, y solo si no hay ninguno se vuelve al principio. Es lo que hace
+    /// que el reparto sea una rueda y no un «siempre el hueco 0».
+    #[test]
+    fn the_cursor_prefers_the_first_slot_at_or_after_it_before_wrapping() {
+        const NEXT: usize = 10;
+        let mut best = None;
+        TaskCollection::consider_slot(&mut best, 3, NEXT);
+        assert_eq!(best, Some(3), "sin nada mejor, el que haya");
+        TaskCollection::consider_slot(&mut best, 20, NEXT);
+        assert_eq!(
+            best,
+            Some(20),
+            "un hueco a partir del cursor gana al de antes"
+        );
+        TaskCollection::consider_slot(&mut best, 12, NEXT);
+        assert_eq!(best, Some(12), "y entre esos, el mas cercano al cursor");
+        TaskCollection::consider_slot(&mut best, 30, NEXT);
+        assert_eq!(best, Some(12));
+        TaskCollection::consider_slot(&mut best, 0, NEXT);
+        assert_eq!(best, Some(12), "dar la vuelta no adelanta a nadie");
+        TaskCollection::consider_slot(&mut best, NEXT, NEXT);
+        assert_eq!(
+            best,
+            Some(NEXT),
+            "el cursor mismo es el primero de la vuelta"
+        );
+
+        // Y antes del cursor, el mas pequeño: es la vuelta completa.
+        let mut wrapped = None;
+        for slot in [7, 2, 9, 5] {
+            TaskCollection::consider_slot(&mut wrapped, slot, NEXT);
+        }
+        assert_eq!(wrapped, Some(2));
+    }
+
+    /// `bitmap_candidate` es el barrido que elige el hueco; lo que se prueba
+    /// aqui es a quien NO mira, porque cada uno de esos carriles repartido es
+    /// una tarea corriendo dos veces o un futuro ya muerto.
+    #[test]
+    fn the_bitmap_scan_skips_dropped_and_borrowed_slots() {
+        let mut inner = FutureCollection::new(DEFAULT_PRIORITY, 0);
+        assert_eq!(
+            TaskCollection::bitmap_candidate(&mut inner, 0, false),
+            None,
+            "una coleccion sin paginas no nombra ningun hueco"
+        );
+        for _ in 0..3 {
+            inner.insert(pending(), None);
+        }
+        let (page, _) = inner.page(pack_key(DEFAULT_PRIORITY, 0, 0));
+        let page = page.clone();
+
+        assert_eq!(
+            TaskCollection::bitmap_candidate(&mut inner, 0, false),
+            Some(0)
+        );
+        page.mark_borrowed(0, true);
+        assert_eq!(
+            TaskCollection::bitmap_candidate(&mut inner, 0, false),
+            Some(1),
+            "un hueco prestado es un poll en vuelo: repartirlo es correrlo dos veces"
+        );
+        page.mark_dropped(1);
+        assert_eq!(
+            TaskCollection::bitmap_candidate(&mut inner, 0, false),
+            Some(2),
+            "un hueco retirado es un futuro muerto"
+        );
+        page.mark_borrowed(2, true);
+        assert_eq!(TaskCollection::bitmap_candidate(&mut inner, 0, false), None);
+    }
+
+    /// El carril voluntario se sirve aparte y detras: una cesion que tambien
+    /// tiene una urgencia pendiente se reparte por la urgencia, no por la
+    /// cesion.
+    #[test]
+    fn a_voluntary_yield_behind_an_urgent_wake_is_not_served_as_a_yield() {
+        let mut inner = FutureCollection::new(DEFAULT_PRIORITY, 0);
+        for _ in 0..2 {
+            inner.insert(pending(), None);
+        }
+        let page = inner.pages[0].clone();
+        // `insert` publica el hueco como urgente; una cesion es lo que queda
+        // cuando esa urgencia ya se sirvio.
+        page.reclaim_notified(0b11);
+        page.mark_yielded(0);
+        page.mark_yielded(1);
+        assert_eq!(
+            TaskCollection::bitmap_candidate(&mut inner, 0, true),
+            Some(0)
+        );
+
+        page.notify(0);
+        assert_eq!(
+            TaskCollection::bitmap_candidate(&mut inner, 0, true),
+            Some(1),
+            "el hueco 0 tiene una urgencia pendiente: ya no es una cesion"
+        );
+        assert_eq!(
+            TaskCollection::bitmap_candidate(&mut inner, 0, false),
+            Some(0)
+        );
+    }
+
+    /// Un bit puesto sobre un hueco que ya no esta en el slab se limpia por el
+    /// camino y el barrido sigue. Sin eso el bit se queda encendido para
+    /// siempre y cada vuelta del reparto vuelve a tropezar con el.
+    #[test]
+    fn a_bit_with_no_slab_slot_behind_it_is_cleared_and_the_scan_goes_on() {
+        let mut inner = FutureCollection::new(DEFAULT_PRIORITY, 0);
+        let first = inner.insert(pending(), None);
+        inner.insert(pending(), None);
+        let page = inner.pages[0].clone();
+
+        // El hueco se va del slab sin que nadie apague su bit.
+        let (_, _, subpage) = unpack_key(first);
+        inner.slab.remove(subpage);
+        assert_eq!(page.peek_lanes().0 & 1, 1, "el bit sigue encendido");
+
+        assert_eq!(
+            TaskCollection::bitmap_candidate(&mut inner, 0, false),
+            Some(1)
+        );
+        assert_eq!(
+            page.peek_lanes().0 & 1,
+            0,
+            "el bit huerfano se queda encendido y el barrido tropieza con el en \
+             cada vuelta"
+        );
+    }
+
+    /// Los tres informes de corrupcion. Son `#[cold]` y el valor que tienen es
+    /// NO ser un panico dentro del ejecutor: una CPU con los cerrojos del
+    /// planificador tomados que panica se lleva la maquina y entierra la
+    /// corrupcion que la causo. Asi que lo que se fija es que se puedan llamar
+    /// y que el limitador de una sola vez no atrape.
+    #[test]
+    fn the_corruption_reports_do_not_panic_inside_the_executor() {
+        report_missing_generator(0);
+        report_missing_generator(3);
+        report_overwritten_collection(0, 0);
+        report_overwritten_collection(7, MAX_PRIORITY + 1);
+    }
+
+    /// El unico de los tres que SI panica, porque su llamante no puede llevar
+    /// un `None`. El mensaje tiene que decir cual de las dos cosas es: un
+    /// `Vec` pisado o una clave que nombra una prioridad que no existe. Decir
+    /// la equivocada manda a leer el planificador cuando lo que hay es memoria
+    /// corrupta.
+    #[test]
+    fn an_overwritten_vec_and_an_impossible_priority_say_different_things() {
+        let smashed = std::panic::catch_unwind(|| overwritten_collection(2, 0, 4)).unwrap_err();
+        let smashed = smashed
+            .downcast_ref::<alloc::string::String>()
+            .expect("el panico lleva su mensaje");
+        assert!(smashed.contains("overwritten"), "{}", smashed);
+        assert!(smashed.contains("len 0"), "{}", smashed);
+        assert!(
+            smashed.contains("not to be trusted") || smashed.contains("same wrecked struct"),
+            "el cpu_id sale de la misma estructura destrozada y hay que decirlo: {}",
+            smashed
+        );
+
+        let out_of_range =
+            std::panic::catch_unwind(|| overwritten_collection(2, MAX_PRIORITY, MAX_PRIORITY))
+                .unwrap_err();
+        let out_of_range = out_of_range
+            .downcast_ref::<alloc::string::String>()
+            .expect("el panico lleva su mensaje");
+        assert!(
+            !out_of_range.contains("overwritten"),
+            "con la longitud correcta el culpable es la clave, no el `Vec`: {}",
+            out_of_range
+        );
+        assert!(out_of_range.contains("outside"), "{}", out_of_range);
     }
 
     #[test]

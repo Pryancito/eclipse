@@ -77,35 +77,93 @@ pub struct Executor {
     resume_claim: ResumeClaim,
 }
 
+/// An `Executor` with no stack behind it, for the tests that only read or
+/// write its shared metadata.
+///
+/// `Executor::new` is not callable on the host at all -- it allocates a 2.6 MiB
+/// stack and `init_stack_and_context` reads `cr3`, a privileged instruction
+/// that SIGSEGVs a user-mode test process -- so this literal is the only seam
+/// through which the observers and the containment latches can be exercised.
+/// `ManuallyDrop` because `Drop for Executor` retires `stack_base - GUARD_SIZE`
+/// into the real quarantine/pool machinery, and there is no stack here to
+/// retire.
+///
+/// Module scope rather than inside one test module: [`executor_observer_tests`],
+/// the sibling [`metadata_tests`] and `runtime::probe_tests` build one, and
+/// the last of those is the reason it is `pub(crate)`: las dos puertas que
+/// deciden si se vuelve a entrar en un marco parado (`executor_frame_resumable`
+/// y `executor_stack_abandonable`) toman un `&Executor` y viven alli.
+#[cfg(test)]
+pub(crate) fn metadata_only_executor() -> core::mem::ManuallyDrop<Executor> {
+    // No stack is allocated: these tests exercise shared metadata only,
+    // and must not run the stack-retirement destructor.
+    core::mem::ManuallyDrop::new(Executor {
+        id: 0,
+        task_collection: TaskCollection::new(0),
+        stack_base: 0,
+        hard_guard_bottom: false,
+        hard_guard_top: false,
+        context: ExecuterContext::default(),
+        #[cfg(any(target_arch = "riscv64", target_arch = "aarch64"))]
+        context_data: core::cell::UnsafeCell::new(ContextData::default()),
+        task_id: AtomicUsize::new(0),
+        state: AtomicU8::new(ExecutorState::UNUSED as u8),
+        current_task: AtomicPtr::new(core::ptr::null_mut()),
+        current_waker: AtomicPtr::new(core::ptr::null_mut()),
+        run_started: AtomicBool::new(false),
+        scheduler_critical: AtomicBool::new(false),
+        return_cr3_pin: spin::Mutex::new(None),
+        abandoned: AtomicBool::new(false),
+        force_replace: AtomicBool::new(false),
+        resume_claim: ResumeClaim::new(),
+    })
+}
+
+/// Un ejecutor de mentira con la geometria de pila y las trabas que se le
+/// digan, para los tests que viven FUERA de este modulo.
+///
+/// `runtime::probe_tests` prueba las dos puertas que toman un `&Executor`
+/// (`executor_frame_resumable` y `executor_stack_abandonable`), y los campos
+/// que esas puertas leen son privados de aqui. Esto es la unica forma de
+/// armarlos sin abrir el `struct` a todo el crate.
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct StubExecutor {
+    /// Base de la pila usable. Las puertas leen `[base, base + STACK_SIZE)`,
+    /// asi que detras tiene que haber memoria de verdad.
+    pub(crate) stack_base: usize,
+    /// Con guarda dura `canary_intact()` contesta sin leer la banda.
+    pub(crate) hard_guard_bottom: bool,
+    /// Contabilidad del planificador en curso: cierra todo abandono.
+    pub(crate) scheduler_critical: bool,
+    /// El sp del marco parado que `executor_frame_resumable` va a mirar.
+    pub(crate) parked_sp: Option<usize>,
+}
+
+#[cfg(test)]
+impl StubExecutor {
+    pub(crate) fn build(self) -> core::mem::ManuallyDrop<Executor> {
+        let mut executor = metadata_only_executor();
+        executor.stack_base = self.stack_base;
+        executor.hard_guard_bottom = self.hard_guard_bottom;
+        executor
+            .scheduler_critical
+            .store(self.scheduler_critical, Ordering::Release);
+        if let Some(sp) = self.parked_sp {
+            executor.context.set_context(sp);
+        }
+        executor
+    }
+}
+
+/// Lo que los observadores y las trabas de contencion contestan sin pila
+/// detras; ver las notas del modulo.
+#[cfg(test)]
+mod metadata_tests;
+
 #[cfg(test)]
 mod executor_observer_tests {
     use super::*;
-    use core::mem::ManuallyDrop;
-
-    fn metadata_only_executor() -> ManuallyDrop<Executor> {
-        // No stack is allocated: these tests exercise shared metadata only,
-        // and must not run the stack-retirement destructor.
-        ManuallyDrop::new(Executor {
-            id: 0,
-            task_collection: TaskCollection::new(0),
-            stack_base: 0,
-            hard_guard_bottom: false,
-            hard_guard_top: false,
-            context: ExecuterContext::default(),
-            #[cfg(any(target_arch = "riscv64", target_arch = "aarch64"))]
-            context_data: core::cell::UnsafeCell::new(ContextData::default()),
-            task_id: AtomicUsize::new(0),
-            state: AtomicU8::new(ExecutorState::UNUSED as u8),
-            current_task: AtomicPtr::new(core::ptr::null_mut()),
-            current_waker: AtomicPtr::new(core::ptr::null_mut()),
-            run_started: AtomicBool::new(false),
-            scheduler_critical: AtomicBool::new(false),
-            return_cr3_pin: spin::Mutex::new(None),
-            abandoned: AtomicBool::new(false),
-            force_replace: AtomicBool::new(false),
-            resume_claim: ResumeClaim::new(),
-        })
-    }
 
     #[test]
     fn runtime_transitions_do_not_require_an_exclusive_executor_borrow() {
@@ -400,6 +458,18 @@ const ALLOC_LAYOUT: Layout = match Layout::from_size_align(ALLOC_SIZE, PAGE_SIZE
 /// `[stack_base + STACK_SIZE, stack_base + STACK_SIZE + TOP_GUARD_SIZE)`.
 const STACK_CANARY: u64 = 0x5354_4143_4b5f_4f56; // "STACK_OV"
 const GUARD_WORDS: usize = GUARD_SIZE / core::mem::size_of::<u64>();
+
+/// La palabra que le toca al hueco `i` de la banda de guarda.
+///
+/// El indice va DENTRO de cada palabra para que un `memset` del valor magico
+/// no se cuele como banda intacta. Nombrada para que los tests de la puerta de
+/// abandono (`runtime::probe_tests`) pinten la banda igual que
+/// `Executor::new`, en vez de repetir el XOR y pasar si uno de los dos se
+/// equivoca.
+#[cfg(test)]
+pub(crate) fn stack_canary_word(i: usize) -> u64 {
+    STACK_CANARY ^ i as u64
+}
 
 /// Lo que cuesta nacer una pila de corrutina; ver las notas del modulo.
 #[cfg(test)]
@@ -2677,6 +2747,79 @@ mod grace_period_tests {
 
         *STACK_QUAR_PROTECT.lock() = None;
         *STACK_QUAR_UNPROTECT.lock() = None;
+    }
+
+    /// El anillo de diagnostico, que es lo que `Drop for Executor` usa para
+    /// decidir que bloque se desaloja cuando la cuarentena esta armada.
+    ///
+    /// Lo que devuelve es el bloque DESALOJADO, no el que entra: en
+    /// bare-metal ese es el que se da por retirado para siempre (no vuelve a
+    /// la arena compartida), asi que confundirlo con el que acaba de entrar
+    /// seria liberar el bloque que se acaba de proteger.
+    #[test]
+    fn the_quarantine_ring_hands_back_the_block_it_evicts() {
+        let _f = fresh(0b0001);
+        for slot in QUAR_RING_SLOTS.iter() {
+            slot.store(0, Ordering::SeqCst);
+        }
+        QUAR_RING_IDX.store(0, Ordering::SeqCst);
+
+        // Las primeras QUAR_RING entradas desalojan huecos vacios: cero, que
+        // es "no habia nada", no "se desalojo la direccion 0".
+        let first: alloc::vec::Vec<usize> =
+            (0..QUAR_RING).map(|i| 0x1_0000 + i * ALLOC_SIZE).collect();
+        for base in first.iter() {
+            assert_eq!(quar_ring_push(*base), 0, "el anillo empezaba vacio");
+        }
+        // Y a partir de ahi, cada entrada saca la mas vieja, en orden.
+        for (i, base) in first.iter().enumerate() {
+            let fresh_base = 0x9_0000 + i * ALLOC_SIZE;
+            assert_eq!(
+                quar_ring_push(fresh_base),
+                *base,
+                "la vuelta {i} del anillo no saco el bloque mas antiguo"
+            );
+        }
+
+        for slot in QUAR_RING_SLOTS.iter() {
+            slot.store(0, Ordering::SeqCst);
+        }
+        QUAR_RING_IDX.store(0, Ordering::SeqCst);
+    }
+
+    /// El indice del anillo es un contador que no se reinicia nunca, asi que
+    /// la unica cosa que lo mantiene dentro de la tabla es el `%`. Un
+    /// desbordamiento del contador es la primera vez que ese modulo tiene que
+    /// valer para algo.
+    #[test]
+    fn the_ring_index_stays_inside_the_table_across_a_counter_wrap() {
+        let _f = fresh(0b0001);
+        for slot in QUAR_RING_SLOTS.iter() {
+            slot.store(0, Ordering::SeqCst);
+        }
+        QUAR_RING_IDX.store(usize::MAX - 2, Ordering::SeqCst);
+
+        // Cuatro entradas: tres antes del desbordamiento y una despues. Nadie
+        // escribe fuera, y el bloque que entro vuelve a salir una vuelta
+        // despues, con el indice ya reiniciado.
+        for i in 0..4 {
+            quar_ring_push(0x4_0000 + i * ALLOC_SIZE);
+        }
+        let live: alloc::vec::Vec<usize> = QUAR_RING_SLOTS
+            .iter()
+            .map(|s| s.load(Ordering::SeqCst))
+            .filter(|v| *v != 0)
+            .collect();
+        assert_eq!(
+            live.len(),
+            4,
+            "una entrada se perdio o se escribio dos veces"
+        );
+
+        for slot in QUAR_RING_SLOTS.iter() {
+            slot.store(0, Ordering::SeqCst);
+        }
+        QUAR_RING_IDX.store(0, Ordering::SeqCst);
     }
 
     #[test]

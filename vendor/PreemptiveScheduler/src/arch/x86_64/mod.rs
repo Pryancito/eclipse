@@ -162,6 +162,51 @@ pub(crate) fn intr_get() -> bool {
 
 #[cfg(test)]
 mod host_state_tests {
+    /// La lectura de RSP detras del shim de arquitectura. Es la que usa
+    /// `irq_should_skip_heavy_work` para decidir si queda pila: cuando era
+    /// ensamblador en linea dentro de esa funcion, en riscv64 y aarch64 la
+    /// guarda simplemente no existia.
+    #[test]
+    fn the_stack_pointer_shim_reads_the_caller_s_own_frame() {
+        let local = 0u64;
+        let sp = super::stack_pointer();
+        let addr = &raw const local as usize;
+        assert_ne!(sp, 0);
+        assert_eq!(sp % 8, 0, "RSP tiene que estar alineado a palabra");
+        assert!(
+            addr >= sp && addr - sp < 4096,
+            "un local de este marco ({:#x}) tiene que caer justo por encima del \
+             RSP leido ({:#x})",
+            addr,
+            sp
+        );
+        // Y dos lecturas del mismo marco dan lo mismo: si no, lo que devuelve
+        // no es el RSP sino algo que el compilador mueve.
+        assert_eq!(sp, super::stack_pointer());
+    }
+
+    /// El contador de rebotes de `switch.S`: lo escribe el ensamblador por su
+    /// nombre sin adornar, y lo lee el informe de `[switch-bounce]`. Lo que se
+    /// fija aqui es que la pareja se lea entera y por su sitio -- un cero en
+    /// un arranque limpio, no basura de otra variable.
+    #[test]
+    fn the_switch_bounce_counters_read_back_as_a_pair() {
+        use core::sync::atomic::Ordering::Relaxed;
+        let (count, sp) = super::switch_bounce_snapshot();
+        assert_eq!(
+            (count, sp),
+            (0, 0),
+            "en el anfitrion no hay `switch.S` que rebote nada"
+        );
+
+        super::SWITCH_BOUNCE_COUNT.store(3, Relaxed);
+        super::SWITCH_BOUNCE_SP.store(0xdead_beef, Relaxed);
+        assert_eq!(super::switch_bounce_snapshot(), (3, 0xdead_beef));
+
+        super::SWITCH_BOUNCE_COUNT.store(count, Relaxed);
+        super::SWITCH_BOUNCE_SP.store(sp, Relaxed);
+    }
+
     #[test]
     fn cpu_identity_override_is_thread_local_and_restorable() {
         let previous = super::set_cpu_id_for_test(9);
