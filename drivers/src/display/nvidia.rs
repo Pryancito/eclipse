@@ -196,40 +196,7 @@ fn nouveau_fence_timeout_hook(
 
 // --- Registers and Constants (aligned with Nova / open-gpu-kernel-modules) ---
 #[allow(dead_code)]
-mod regs {
-    pub const NV_PMC_BOOT_0: u32 = 0x0000_0000;
-    pub const PMC_BOOT0_CHIP_ID_SHIFT: u32 = 20;
-    pub const PMC_BOOT0_CHIP_ID_MASK: u32 = 0xFFF;
-
-    pub const PMC_BOOT0_CHIPID_TURING_MIN: u32 = 0x160;
-    pub const PMC_BOOT0_CHIPID_TURING_MAX: u32 = 0x16F;
-    pub const PMC_BOOT0_CHIPID_AMPERE_MIN: u32 = 0x170;
-    pub const PMC_BOOT0_CHIPID_AMPERE_MAX: u32 = 0x17F;
-    pub const PMC_BOOT0_CHIPID_ADA_MIN: u32 = 0x190;
-    pub const PMC_BOOT0_CHIPID_ADA_MAX: u32 = 0x19F;
-    // The chip-id field is NINE bits wide (nouveau reads it as
-    // `(boot0 & 0x1ff00000) >> 20`, which `nouveau_chipset_id` below does
-    // too), so no real part can ever report an id of 0x200 or above. Hopper
-    // used to sit at 0x1B0..=0x1BF and Blackwell at `>= 0x200`, which made the
-    // Blackwell arm unreachable and handed every consumer Blackwell id to
-    // Hopper. The two bounds here are the ones this file's own
-    // `nouveau_chipset_id` fallback table already names as representative:
-    // 0x180 = GH100 (Hopper) and 0x1b2 = GB202 (Blackwell).
-    pub const PMC_BOOT0_CHIPID_HOPPER_MIN: u32 = 0x180;
-    pub const PMC_BOOT0_CHIPID_HOPPER_MAX: u32 = 0x18F;
-    pub const PMC_BOOT0_CHIPID_BLACKWELL_MIN: u32 = 0x1A0;
-
-    pub const NV_PFB_CSTATUS: u32 = 0x0010_020C;
-    pub const NV_PFB_CSTATUS_MEM_SIZE_MASK: u32 = 0x7FFF;
-
-    pub const NV_THERM_TEMP: u32 = 0x0002_0400;
-    pub const NV_THERM_TEMP_VALUE_MASK: u32 = 0x1FF;
-    pub const NV_THERM_TEMP_VALUE_SIGN_BIT: u32 = 0x100;
-
-    // Display resolution registers (legacy/fallback)
-    pub const NV50_HEAD0_RASTER_SIZE: u32 = 0x610798;
-    pub const NV40_PCRTC_HEAD0_SIZE: u32 = 0x60002C;
-}
+mod regs;
 
 /// TU106 (Turing) GMMU encode helpers — NV_MMU_VER2 page-table format.
 ///
@@ -239,35 +206,7 @@ mod regs {
 /// flushed (a later, riskier step). Critical fact: the leaf PTE address field
 /// is `phys >> 4` (the 53:8 field stores `phys>>12`, and `(phys>>12)<<8 ==
 /// phys>>4`); writing `phys>>12` directly hangs the GPU.
-mod gmmu {
-    /// SYSTEM_COHERENT aperture (HOST). VRAM=0, HOST=2, NCOH=3.
-    pub const AP_HOST: u64 = 2;
-    /// PITCH (uncompressed) kind.
-    pub const KIND_PITCH: u64 = 0x00;
-
-    /// Leaf PTE for a 4 KiB sysmem page, read-write, uncompressed.
-    /// VALID(0) | APERTURE 2:1 = HOST | VOL(3) | ADDRESS=phys>>4 | KIND 63:56.
-    #[inline]
-    pub fn encode_pte_sys(phys: u64) -> u64 {
-        (phys >> 4) | (1 << 0) | (AP_HOST << 1) | (1 << 3) | (KIND_PITCH << 56)
-    }
-
-    /// Single PDE (PD1/PD2/PD3 levels) pointing at the next table in sysmem.
-    /// APERTURE 2:1 = HOST (aperture != 0 ⇒ present; there is no VALID bit) |
-    /// VOL(3) | ADDRESS_SYS 53:8 = next>>4. The dual-PDE SMALL half is encoded
-    /// identically and stored in the high qword at byte `pdei*0x10 + 8`.
-    #[inline]
-    pub fn encode_pde_sys(next_table_phys: u64) -> u64 {
-        (next_table_phys >> 4) | (AP_HOST << 1) | (1 << 3)
-    }
-
-    /// Instance-block PD-base qword (@0x200): root PD phys OR'd with
-    /// VER2(1<<10) | 64KiB(1<<11) | HOST_target(2<<0) | VOL(1<<2) == `|0xC06`.
-    #[inline]
-    pub fn inst_pd_base(root_phys: u64) -> u64 {
-        root_phys | 0xC06
-    }
-}
+mod gmmu;
 
 /// Coherent-sysmem structures for the Turing copy-engine bring-up (the verified
 /// memory plan). All allocated via `DmaRegion::alloc_coherent` (page-aligned,
