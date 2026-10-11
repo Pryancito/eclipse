@@ -186,6 +186,13 @@ pub fn wait_for_exit(proc: Option<Arc<Process>>) -> ! {
     // stack or for the next timer tick. Returning `true` makes the executor
     // re-check its run queue instead of halting.
     executor::set_idle_callback(|| {
+        // This CPU is running kernel code again, whatever it decides below, so
+        // any tickless stretch it took last time ends here. The thread-switch
+        // poll clears it too, but that one only runs when a USER thread runs —
+        // a CPU woken for a driver future or a deferred job never reached it,
+        // and kept a 50 ms preemption ceiling while it worked. One per-CPU flag
+        // read when there is nothing to undo.
+        kernel_hal::timer::timer_idle_exit();
         // Lazy-TLB restore point: this CPU is about to idle (or steal work),
         // so drop any lingering user CR3 and return to the kernel page table.
         // `ThreadSwitchFuture::poll` no longer restores the kernel CR3 after

@@ -315,6 +315,18 @@ fn primary_main(config: kernel_hal::KernelConfig) {
                 );
             }
         }
+        // Tickless idle: an idle CPU stretches its tick to its own next
+        // deadline (capped) instead of taking 250 Hz for nothing. Default ON;
+        // `tickless=off` is the escape hatch, and it is one the bootloader can
+        // set without a rebuild — which matters because the failure this
+        // mechanism had the first time was an unresponsive keyboard, and a
+        // machine you cannot type into is one you fix from the boot menu.
+        if kernel_hal::cmdline::is_off(&options.cmdline, "tickless") {
+            kernel_hal::timer::set_tickless_idle(false);
+            klog_info!(
+                "Eclipse: tickless idle disabled (tickless=off) — full-rate tick on every CPU"
+            );
+        }
         // Keep the kernel text console on screen even while a compositor holds
         // its VT in KD_GRAPHICS. Normally KD_GRAPHICS suppresses presentation
         // so labwc owns the display, which also means a hard hang's last
