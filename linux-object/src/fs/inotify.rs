@@ -424,3 +424,62 @@ mod tests {
         assert_eq!(d.flags(), i.flags());
     }
 }
+
+#[cfg(test)]
+mod mask_bit_tests {
+    //! The mask bits, one literal each.
+    //!
+    //! `ALL_INOTIFY_BITS` is already asserted against a literal above, and
+    //! that pins the union: move any one of these bits and the union changes.
+    //! What it cannot see is two of them swapped, because the union comes out
+    //! the same, and every other test here names the bits instead of writing
+    //! them. `IN_MASK_ADD` and `IN_MASK_CREATE` are the pair that costs:
+    //! swapped, a second `inotify_add_watch` on a path already watched gets
+    //! `EEXIST` where it asked to merge, and glib's `GFileMonitor` and
+    //! systemd's path units drop the watch instead of widening it.
+
+    use super::*;
+
+    #[test]
+    fn every_mask_bit_is_the_one_inotify_h_gives() {
+        // The twelve event bits are bits 0 to 11 -- `IN_ACCESS` 0x1 through
+        // `IN_MOVE_SELF` 0x800 -- and the three the kernel raises on its own
+        // sit at 13, 14 and 15. Bit 12 is not defined, which is why a mask
+        // carrying it is `EINVAL`.
+        assert_eq!(IN_ALL_EVENTS, 0x0000_0fff);
+        assert_eq!(IN_KERNEL_EVENTS, 0x0000_e000);
+        assert_eq!(IN_ALL_EVENTS.count_ones(), 12);
+        assert_eq!(IN_KERNEL_EVENTS.count_ones(), 3);
+
+        // The control bits, which live in the top byte and change how the
+        // call behaves rather than what it reports.
+        assert_eq!(IN_ONLYDIR, 0x0100_0000);
+        assert_eq!(IN_DONT_FOLLOW, 0x0200_0000);
+        assert_eq!(IN_EXCL_UNLINK, 0x0400_0000);
+        assert_eq!(IN_MASK_CREATE, 0x1000_0000);
+        assert_eq!(IN_MASK_ADD, 0x2000_0000);
+        assert_eq!(IN_ISDIR, 0x4000_0000);
+        assert_eq!(IN_ONESHOT, 0x8000_0000);
+    }
+
+    #[test]
+    fn no_control_bit_lands_on_an_event_bit_or_on_another_one() {
+        let control = [
+            ("IN_ONLYDIR", IN_ONLYDIR),
+            ("IN_DONT_FOLLOW", IN_DONT_FOLLOW),
+            ("IN_EXCL_UNLINK", IN_EXCL_UNLINK),
+            ("IN_MASK_CREATE", IN_MASK_CREATE),
+            ("IN_MASK_ADD", IN_MASK_ADD),
+            ("IN_ISDIR", IN_ISDIR),
+            ("IN_ONESHOT", IN_ONESHOT),
+        ];
+        for (i, &(na, a)) in control.iter().enumerate() {
+            assert_eq!(a.count_ones(), 1, "{} is not a single bit", na);
+            assert_eq!(a & IN_ALL_EVENTS, 0, "{} is also an event", na);
+            assert_eq!(a & IN_KERNEL_EVENTS, 0, "{} is also an event", na);
+            for &(nb, b) in &control[i + 1..] {
+                assert_ne!(a, b, "{} and {} are the same bit", na, nb);
+            }
+        }
+    }
+}
