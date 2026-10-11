@@ -816,6 +816,53 @@ mod dirent_collection_tests {
             Err(LxError::EIO)
         );
     }
+
+    /// An error that arrives after an entry was handed over is the next
+    /// call's answer, not this one's.
+    ///
+    /// `getdents64` does the same (`lastdirent = buf.current_dir; if
+    /// (lastdirent) ... error = count - buf.count;`), and the reason is that
+    /// `next_entry` has already moved the directory position past the names
+    /// it gave out: answering with the error throws those names away and
+    /// nothing can ask for them again, so `ls` and `find` silently miss a
+    /// run of entries whenever one of them will not resolve. The test above
+    /// covers the other half, where the very first entry fails and the error
+    /// is all there is to say.
+    #[test]
+    fn an_error_after_an_entry_waits_for_the_next_call() {
+        struct TwoThenBroken {
+            pos: usize,
+        }
+        impl DirEntries for TwoThenBroken {
+            fn next_entry(&mut self) -> LxResult<Option<(Metadata, String)>> {
+                if self.pos >= 2 {
+                    return Err(LxError::EIO);
+                }
+                self.pos += 1;
+                Ok(Some((entry(self.pos), String::from("name"))))
+            }
+            fn unread_entry(&mut self) {
+                self.pos -= 1;
+            }
+            fn position(&self) -> u64 {
+                self.pos as u64
+            }
+        }
+
+        let mut dir = TwoThenBroken { pos: 0 };
+        let mut names = Vec::new();
+        assert_eq!(
+            collect_dirents(&mut dir, |_, _, name| {
+                names.push(String::from(name));
+                true
+            }),
+            Ok(2),
+            "the two entries that were read are the answer"
+        );
+        assert_eq!(names.len(), 2);
+        // Nothing is pushed this time, so now the error is all there is.
+        assert_eq!(collect_dirents(&mut dir, |_, _, _| true), Err(LxError::EIO));
+    }
 }
 
 #[allow(dead_code)]
@@ -1400,6 +1447,62 @@ mod rename_trap_tests {
         // A real tree, for contrast, reaches its own root and says no.
         assert_eq!(is_same_or_below(&root, &a.metadata().unwrap()), Ok(false));
     }
+
+    /// A filesystem's own root: `..` is itself, which is where the walk of
+    /// any mounted filesystem stops.
+    struct Mounted {
+        meta: Metadata,
+    }
+
+    impl INode for Mounted {
+        fn read_at(&self, _: usize, _: &mut [u8]) -> rcore_fs::vfs::Result<usize> {
+            Err(rcore_fs::vfs::FsError::NotSupported)
+        }
+        fn write_at(&self, _: usize, _: &[u8]) -> rcore_fs::vfs::Result<usize> {
+            Err(rcore_fs::vfs::FsError::NotSupported)
+        }
+        fn poll(&self) -> rcore_fs::vfs::Result<rcore_fs::vfs::PollStatus> {
+            Err(rcore_fs::vfs::FsError::NotSupported)
+        }
+        fn metadata(&self) -> rcore_fs::vfs::Result<Metadata> {
+            Ok(self.meta.clone())
+        }
+        fn find(&self, _name: &str) -> rcore_fs::vfs::Result<Arc<dyn INode>> {
+            Ok(Arc::new(Mounted {
+                meta: self.meta.clone(),
+            }))
+        }
+        fn as_any_ref(&self) -> &dyn core::any::Any {
+            self
+        }
+    }
+
+    /// A directory is a device and an inode number, not an inode number.
+    ///
+    /// Inode numbers repeat across filesystems -- every root is numbered
+    /// from the same low end -- so the number alone makes two unrelated
+    /// directories look like one, and `true` here is the answer that refuses
+    /// the rename with `EINVAL`. The walk compares both halves; the tests
+    /// above never notice, because every inode of every ramfs reports
+    /// `dev: 0` and this one needs two devices.
+    #[test]
+    fn an_equal_inode_number_on_another_device_is_not_the_same_directory() {
+        let (root, _, _, _) = a_tree();
+        let mut here = root.metadata().unwrap();
+        here.dev = 7;
+        here.inode = 42;
+        let dir: Arc<dyn INode> = Arc::new(Mounted { meta: here.clone() });
+        // The same directory, both halves agreeing.
+        assert_eq!(is_same_or_below(&dir, &here), Ok(true));
+        // The same number, another filesystem: a different directory, and
+        // the walk reaches the root whose `..` is itself and says no.
+        let mut elsewhere = here.clone();
+        elsewhere.dev = 9;
+        assert_eq!(is_same_or_below(&dir, &elsewhere), Ok(false));
+        // And the other way round, in case only one side is read.
+        let other: Arc<dyn INode> = Arc::new(Mounted { meta: elsewhere });
+        assert_eq!(is_same_or_below(&other, &here), Ok(false));
+    }
 }
 
 /// Validate a renameat2 `flags` argument (renameat2(2)). Pure, so the flag
@@ -1446,6 +1549,24 @@ mod rename_flag_tests {
                 "{flags:#x}"
             );
         }
+    }
+
+    /// The numbers are `renameat2(2)`'s own, and userspace passes them by
+    /// number.
+    ///
+    /// Everything above is written in terms of the constants, so it holds
+    /// for any three distinct bits at all: `RENAME_WHITEOUT` moved onto
+    /// `RENAME_EXCHANGE`'s bit left the module green, because every answer
+    /// here is `EINVAL` either way. The numbers are the ABI, and the day one
+    /// of these is implemented the right one has to be.
+    #[test]
+    fn the_rename_flags_are_the_numbers_the_uapi_gives() {
+        // `include/uapi/linux/fs.h`.
+        assert_eq!(RENAME_NOREPLACE, 1);
+        assert_eq!(RENAME_EXCHANGE, 2);
+        assert_eq!(RENAME_WHITEOUT, 4);
+        // Which is also what makes `1 << 3` above an unknown bit.
+        assert_eq!(RENAME_NOREPLACE | RENAME_EXCHANGE | RENAME_WHITEOUT, 0b111);
     }
 }
 
@@ -2414,5 +2535,42 @@ mod dirent_record_tests {
         ] {
             assert_eq!(DirentType::from(type_).bits(), dt, "{type_:?}");
         }
+    }
+
+    /// The NUL has a byte of its own, and only one name length in eight
+    /// shows it.
+    ///
+    /// `d_reclen` is `19 + name.len() + 1` rounded up to eight, so dropping
+    /// the NUL's byte from that sum changes nothing for seven lengths out of
+    /// eight: the rounding hands the byte straight back. It shows when
+    /// `19 + name.len()` is already a multiple of eight -- five characters,
+    /// or thirteen, or twenty-one -- and there the record comes out eight
+    /// bytes short while the NUL still goes to `19 + 5`, one byte past the
+    /// record that was just sized. The name is then unterminated inside its
+    /// own record, which is the one thing glibc's `readdir` leans on after
+    /// `d_reclen`. Every name in the tests above is one of the other seven
+    /// lengths, so this one is here on purpose.
+    #[test]
+    fn the_nul_has_a_byte_of_its_own() {
+        let name = "cinco";
+        assert_eq!(
+            (HDR + name.len()) % 8,
+            0,
+            "the length has to be one the rounding does not hide"
+        );
+        assert_eq!(
+            aligned_up(HDR + name.len()) + 8,
+            aligned_up(HDR + name.len() + 1),
+            "and there the NUL's byte is worth a whole eight"
+        );
+        let mut buf = [0xffu8; 64];
+        let mut w = DirentBufWriter::new(&mut buf);
+        assert!(w.try_write(5, 6, DirentType::REG.bits(), name));
+        let used: Vec<u8> = w.as_slice().to_vec();
+        assert_eq!(used.len(), aligned_up(HDR + name.len() + 1));
+        assert_eq!(used[HDR + name.len()], 0, "the NUL is inside the record");
+        let got = records(&used);
+        assert_eq!(got[0].reclen as usize, used.len());
+        assert_eq!(got[0].name, name);
     }
 }
