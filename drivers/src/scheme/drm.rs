@@ -733,3 +733,422 @@ pub trait DrmScheme: Scheme {
     /// per-process state to release).
     fn nouveau_release_process(&self, _pid: u64) {}
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sync::Mutex;
+    use alloc::vec;
+
+    /// A DRM driver that implements only the methods the trait requires, so
+    /// whatever else a test reads back from it is the trait's own default.
+    ///
+    /// The defaults in this trait are not cosmetic: several of them decide
+    /// whether a GPU is offered to Mesa as a nouveau device at all, and a
+    /// `false` that turned into a `true` would aim the whole nouveau uAPI at
+    /// whatever DRM driver happens to be primary (virtio-gpu under QEMU) on a
+    /// machine with no NVIDIA GPU in it.
+    struct BareDrm {
+        /// Every `(request, arg)` the default `ioctl_owned` forwarded.
+        ioctls: Mutex<Vec<(u32, usize)>>,
+    }
+
+    impl BareDrm {
+        fn new() -> Self {
+            Self {
+                ioctls: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl Scheme for BareDrm {
+        fn name(&self) -> &str {
+            "bare-drm"
+        }
+    }
+
+    impl DrmScheme for BareDrm {
+        fn get_caps(&self) -> DrmCaps {
+            DrmCaps {
+                has_3d: false,
+                has_cursor: false,
+                max_width: 1920,
+                max_height: 1080,
+            }
+        }
+        fn create_fb(&self, _handle_id: u32, _w: u32, _h: u32, _pitch: u32) -> Option<u32> {
+            None
+        }
+        fn page_flip(&self, _fb_id: u32) -> bool {
+            false
+        }
+        fn set_cursor(&self, _crtc: u32, _x: i32, _y: i32, _handle: u32, _flags: u32) -> bool {
+            false
+        }
+        fn wait_vblank(&self, _crtc_id: u32) -> bool {
+            false
+        }
+        fn get_resources(&self) -> (Vec<u32>, Vec<u32>, Vec<u32>) {
+            (Vec::new(), Vec::new(), Vec::new())
+        }
+        fn get_connector(&self, _id: u32) -> Option<DrmConnector> {
+            None
+        }
+        fn get_crtc(&self, _id: u32) -> Option<DrmCrtc> {
+            None
+        }
+        fn get_plane(&self, _id: u32) -> Option<DrmPlane> {
+            None
+        }
+        fn get_planes(&self) -> Vec<u32> {
+            Vec::new()
+        }
+        #[allow(clippy::too_many_arguments)]
+        fn set_plane(
+            &self,
+            _plane_id: u32,
+            _crtc_id: u32,
+            _fb_id: u32,
+            _x: i32,
+            _y: i32,
+            _w: u32,
+            _h: u32,
+            _src_x: u32,
+            _src_y: u32,
+            _src_w: u32,
+            _src_h: u32,
+        ) -> bool {
+            false
+        }
+        fn ioctl(&self, request: u32, arg: usize) -> Result<usize, i32> {
+            self.ioctls.lock().push((request, arg));
+            Ok(request as usize)
+        }
+    }
+
+    /// A driver that does NOT override `ioctl` either, so the trait's own
+    /// `ENOSYS` is what answers.
+    struct NoIoctlDrm;
+
+    impl Scheme for NoIoctlDrm {
+        fn name(&self) -> &str {
+            "no-ioctl-drm"
+        }
+    }
+
+    impl DrmScheme for NoIoctlDrm {
+        fn get_caps(&self) -> DrmCaps {
+            DrmCaps {
+                has_3d: false,
+                has_cursor: false,
+                max_width: 0,
+                max_height: 0,
+            }
+        }
+        fn create_fb(&self, _handle_id: u32, _w: u32, _h: u32, _pitch: u32) -> Option<u32> {
+            None
+        }
+        fn page_flip(&self, _fb_id: u32) -> bool {
+            false
+        }
+        fn set_cursor(&self, _crtc: u32, _x: i32, _y: i32, _handle: u32, _flags: u32) -> bool {
+            false
+        }
+        fn wait_vblank(&self, _crtc_id: u32) -> bool {
+            false
+        }
+        fn get_resources(&self) -> (Vec<u32>, Vec<u32>, Vec<u32>) {
+            (Vec::new(), Vec::new(), Vec::new())
+        }
+        fn get_connector(&self, _id: u32) -> Option<DrmConnector> {
+            None
+        }
+        fn get_crtc(&self, _id: u32) -> Option<DrmCrtc> {
+            None
+        }
+        fn get_plane(&self, _id: u32) -> Option<DrmPlane> {
+            None
+        }
+        fn get_planes(&self) -> Vec<u32> {
+            Vec::new()
+        }
+        #[allow(clippy::too_many_arguments)]
+        fn set_plane(
+            &self,
+            _plane_id: u32,
+            _crtc_id: u32,
+            _fb_id: u32,
+            _x: i32,
+            _y: i32,
+            _w: u32,
+            _h: u32,
+            _src_x: u32,
+            _src_y: u32,
+            _src_w: u32,
+            _src_h: u32,
+        ) -> bool {
+            false
+        }
+    }
+
+    /// `unsupported()` is what every driver that cannot launch compute work
+    /// answers, and userspace reads the three fields: `-ENOSYS` as a NEGATED
+    /// errno (the field is positive for NV_STATUS), nothing dispatched, and a
+    /// report that says why rather than an empty string.
+    #[test]
+    fn an_unsupported_compute_launch_reports_negated_enosys() {
+        let r = ComputeLaunchResult::unsupported();
+        assert_eq!(r.status, -38);
+        assert!(r.status < 0, "a negated errno must stay negative");
+        assert_eq!(r.elapsed_ns, 0);
+        assert_eq!(r.grid_threads, 0);
+        assert!(!r.report.is_empty());
+    }
+
+    /// A driver that does not override `compute_launch` must answer the same
+    /// thing for every op, including an op number that does not exist.
+    #[test]
+    fn a_driver_without_compute_refuses_every_op() {
+        let dev = BareDrm::new();
+        for op in [COMPUTE_OP_INFO, COMPUTE_OP_SAXPY, COMPUTE_OP_BENCH, 99] {
+            let r = dev.compute_launch(op);
+            assert_eq!(r.status, -38, "op {} was not refused", op);
+            assert_eq!(r.grid_threads, 0);
+        }
+    }
+
+    /// The op numbers cross the ioctl boundary, so they are ABI: they must
+    /// stay at their own values and stay distinct from each other.
+    #[test]
+    fn the_compute_op_numbers_are_distinct_and_pinned() {
+        assert_eq!(COMPUTE_OP_INFO, 0);
+        assert_eq!(COMPUTE_OP_SAXPY, 1);
+        assert_eq!(COMPUTE_OP_BENCH, 2);
+    }
+
+    /// Every capability predicate defaults to false. This is the whole
+    /// safety model of the trait: the `nvidia.nouveau_uapi` cmdline flag is a
+    /// *request*, these are the *capability*, and a driver has to opt in.
+    #[test]
+    fn every_capability_predicate_is_false_by_default() {
+        let dev = BareDrm::new();
+        assert!(!dev.nouveau_uapi_capable());
+        assert!(!dev.nouveau_uapi_ready());
+        assert!(!dev.is_console_gpu());
+        assert!(!dev.is_compute_gpu());
+        assert!(!dev.has_hardware_kms());
+        assert!(!dev.has_hw_vblank());
+        assert!(!dev.ce_present(0x1000, 4096));
+        assert!(!dev.ce_present_2d_pitched(0x1000, 4096, 0, 4096, 4096, 1080));
+        assert!(!dev.ce_present_ready());
+        assert!(!dev.hw_cursor_set(&[0; 4], 2, 2));
+        assert!(!dev.hw_cursor_move(10, 10));
+        assert!(!dev.hw_cursor_hide());
+    }
+
+    /// A driver that does not track PCI must say it does not know, not make
+    /// up a location: `linux-object` builds the sysfs identity of
+    /// `/dev/dri/card0` from these NUMBERS, and a fabricated 0:0.0 would
+    /// describe a different device than the one serving the ioctls.
+    #[test]
+    fn a_driver_that_does_not_track_pci_answers_unknown() {
+        assert!(BareDrm::new().pci_bdf().is_none());
+    }
+
+    /// `gem_aperture` exists precisely to tell an unknown handle apart from a
+    /// VRAM one, so a driver that tracks nothing must answer `Unknown` and
+    /// never `Vram` -- the two want opposite things from whoever is reading.
+    #[test]
+    fn an_untracked_handle_has_an_unknown_aperture() {
+        assert_eq!(BareDrm::new().gem_aperture(7), GemAperture::Unknown);
+    }
+
+    /// And the three apertures must stay distinct, since the present path
+    /// branches on them.
+    #[test]
+    fn the_three_apertures_are_distinct() {
+        assert_ne!(GemAperture::Sysmem, GemAperture::Vram);
+        assert_ne!(GemAperture::Sysmem, GemAperture::Unknown);
+        assert_ne!(GemAperture::Vram, GemAperture::Unknown);
+    }
+
+    /// With no fence to wait for, a present is left exactly as
+    /// unsynchronised as it was before -- `None` and an empty list, never a
+    /// zero landing zone, which a caller would then poll at address 0.
+    #[test]
+    fn a_driver_with_no_fences_names_none() {
+        let dev = BareDrm::new();
+        assert!(dev.render_fence_for_scanout(1, 100).is_none());
+        assert!(dev.cpu_prep_fences(1, 100).is_empty());
+    }
+
+    /// A handle this driver never allocated is not its to close: answering
+    /// true would make the generic dispatcher believe a buffer it still owns
+    /// was released.
+    #[test]
+    fn a_foreign_gem_handle_is_not_closed() {
+        assert!(!BareDrm::new().nouveau_gem_close(3, 100));
+    }
+
+    /// The generic DRM core allocates the buffer and only tells the driver;
+    /// a driver with nothing to do about it must ACCEPT the import (true),
+    /// because a refusal fails `CREATE_DUMB` on a perfectly good buffer.
+    /// Freeing it again must be a no-op and not panic.
+    #[test]
+    fn importing_a_core_allocated_buffer_is_accepted_and_freeing_it_is_a_no_op() {
+        let dev = BareDrm::new();
+        let handle = GemHandle {
+            id: 1,
+            size: 4096,
+            phys_addr: 0x1000,
+        };
+        assert!(dev.import_buffer(handle));
+        dev.free_buffer(handle);
+    }
+
+    /// Every text node is empty by default. A placeholder line would read as
+    /// a diagnosis in `/proc/gpudbg`, and `gpu_role_line` is concatenated
+    /// into `/proc/gpuroles`, where a non-NVIDIA driver must contribute
+    /// nothing at all rather than a blank row.
+    #[test]
+    fn every_text_node_is_empty_by_default() {
+        let dev = BareDrm::new();
+        for (name, text) in [
+            ("gpu_role_line", dev.gpu_role_line()),
+            ("debug_dump", dev.debug_dump()),
+            ("hw_dump", dev.hw_dump()),
+            ("auto_bringup_compute", dev.auto_bringup_compute()),
+            ("deferred_console_bringup", dev.deferred_console_bringup()),
+            ("quiesce_for_reboot", dev.quiesce_for_reboot()),
+            ("survival_report", dev.survival_report()),
+            ("bringup_ce_fill_fb", dev.bringup_ce_fill_fb()),
+            ("bringup_ce_fill_fb_p2p", dev.bringup_ce_fill_fb_p2p()),
+            ("bringup_edid", dev.bringup_edid()),
+            ("bringup_bench", dev.bringup_bench()),
+        ] {
+            assert!(text.is_empty(), "{} is not empty: {:?}", name, text);
+        }
+    }
+
+    /// Same for the whole bring-up ladder. Each step is its own `/proc` node
+    /// and each one of them is a hardware operation, so a driver that has
+    /// none must say nothing for all of them -- a step left reporting
+    /// something would be read as a step that ran.
+    #[test]
+    fn the_whole_bringup_ladder_is_silent_by_default() {
+        let dev = BareDrm::new();
+        let steps: Vec<(u32, String)> = vec![
+            (2, dev.bringup_step2()),
+            (3, dev.bringup_step3()),
+            (4, dev.bringup_step4()),
+            (5, dev.bringup_step5()),
+            (6, dev.bringup_step6()),
+            (7, dev.bringup_step7()),
+            (8, dev.bringup_step8()),
+            (9, dev.bringup_step9()),
+            (10, dev.bringup_step10()),
+            (11, dev.bringup_step11()),
+            (12, dev.bringup_step12()),
+            (13, dev.bringup_step13()),
+            (14, dev.bringup_step14()),
+            (15, dev.bringup_step15()),
+            (16, dev.bringup_step16()),
+            (17, dev.bringup_step17()),
+            (18, dev.bringup_step18()),
+            (19, dev.bringup_step19()),
+            (20, dev.bringup_step20()),
+            (21, dev.bringup_step21()),
+            (22, dev.bringup_step22()),
+            (23, dev.bringup_step23()),
+        ];
+        // Every rung from 2 to 23 is present and silent. A rung missing from
+        // this list is a rung nobody checked.
+        assert_eq!(steps.len(), 22);
+        for (n, text) in steps {
+            assert!(text.is_empty(), "step{} is not silent: {:?}", n, text);
+        }
+    }
+
+    /// Pushing firmware (or the reason it could not be loaded) down to a
+    /// driver that needs none must be ignored silently: boot code pushes it
+    /// to EVERY driver, non-NVIDIA ones included.
+    #[test]
+    fn pushing_firmware_at_a_driver_that_needs_none_is_ignored() {
+        let dev = BareDrm::new();
+        dev.set_gsp_firmware(vec![0u8; 16]);
+        dev.set_gsp_firmware_status(String::from("gsp.bin: not found"));
+    }
+
+    /// A driver with no private ioctls answers `ENOSYS` as a POSITIVE errno
+    /// (this surface returns `Result<usize, i32>`, not a negated errno), so
+    /// Mesa sees an unimplemented ioctl rather than a driver error.
+    #[test]
+    fn a_driver_without_private_ioctls_answers_enosys() {
+        assert_eq!(NoIoctlDrm.ioctl(0x40, 0), Err(38));
+        assert_eq!(NoIoctlDrm.ioctl_owned(0x40, 0, 100), Err(38));
+    }
+
+    /// The default `ioctl_owned` is a pass-through: it must forward BOTH the
+    /// request and the argument unchanged and drop only the pid. A swapped
+    /// pair here would hand a driver another ioctl's argument.
+    #[test]
+    fn the_owned_ioctl_forwards_request_and_argument_unchanged() {
+        let dev = BareDrm::new();
+        assert_eq!(dev.ioctl_owned(0xc0, 0xdead_beef, 4242), Ok(0xc0));
+        assert_eq!(&*dev.ioctls.lock(), &[(0xc0, 0xdead_beef)]);
+    }
+
+    /// Process exit calls this on every DRM driver, so a driver with no
+    /// per-process state must tolerate it -- including for a pid it never saw.
+    #[test]
+    fn releasing_a_process_a_driver_never_saw_is_a_no_op() {
+        BareDrm::new().nouveau_release_process(9999);
+    }
+
+    /// `get_connector_edid` is `None` and not a zeroed array: 128 zero bytes
+    /// are a *valid-looking* EDID block with a bad checksum, which the mode
+    /// parser would try to read.
+    #[test]
+    fn a_connector_with_no_edid_answers_none_rather_than_zeros() {
+        assert!(BareDrm::new().get_connector_edid(0).is_none());
+    }
+
+    /// The descriptor structs cross the ioctl boundary by value; they must
+    /// stay `Copy` and keep their fields through a copy.
+    #[test]
+    fn the_descriptor_structs_survive_a_copy() {
+        let caps = BareDrm::new().get_caps();
+        let copy = caps;
+        assert_eq!((copy.max_width, copy.max_height), (1920, 1080));
+        assert!(!copy.has_3d && !copy.has_cursor);
+
+        let conn = DrmConnector {
+            id: 1,
+            connected: true,
+            mm_width: 530,
+            mm_height: 300,
+            connector_type: 11,
+        };
+        let conn_copy = conn;
+        assert!(conn_copy.connected);
+        assert_eq!(conn_copy.connector_type, 11);
+
+        let crtc = DrmCrtc {
+            id: 2,
+            fb_id: 3,
+            x: 0,
+            y: 0,
+        };
+        assert_eq!((crtc.id, crtc.fb_id), (2, 3));
+
+        let plane = DrmPlane {
+            id: 4,
+            crtc_id: 2,
+            fb_id: 3,
+            possible_crtcs: 0b11,
+            plane_type: 1,
+        };
+        assert_eq!(plane.plane_type, 1, "1 is the primary plane");
+        assert_eq!(plane.possible_crtcs.count_ones(), 2);
+    }
+}

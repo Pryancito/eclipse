@@ -169,3 +169,172 @@ pub trait AudioScheme: Scheme {
         alloc::string::String::new()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use core::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A PCM device that implements only the required methods of
+    /// `AudioScheme`, so everything else a test reads is the default.
+    struct BareAudio {
+        /// How many bytes the ring holds queued, so the delegating defaults
+        /// can be seen to delegate rather than return a constant.
+        queued: AtomicUsize,
+    }
+
+    impl BareAudio {
+        fn new(queued: usize) -> Self {
+            Self {
+                queued: AtomicUsize::new(queued),
+            }
+        }
+    }
+
+    impl Scheme for BareAudio {
+        fn name(&self) -> &str {
+            "bare-audio"
+        }
+    }
+
+    impl AudioScheme for BareAudio {
+        fn set_params(&self, rate: u32, channels: u8) -> DeviceResult<(u32, u8)> {
+            Ok((rate, channels))
+        }
+        fn params(&self) -> (u32, u8) {
+            (48_000, 2)
+        }
+        fn write(&self, pcm: &[u8]) -> DeviceResult<usize> {
+            self.queued.fetch_add(pcm.len(), Ordering::Relaxed);
+            Ok(pcm.len())
+        }
+        fn free_bytes(&self) -> usize {
+            self.buffer_bytes() - self.queued_bytes()
+        }
+        fn buffer_bytes(&self) -> usize {
+            4096
+        }
+        fn queued_bytes(&self) -> usize {
+            self.queued.load(Ordering::Relaxed)
+        }
+        fn reset(&self) -> DeviceResult {
+            self.queued.store(0, Ordering::Relaxed);
+            Ok(())
+        }
+    }
+
+    /// A device with one ring and no mixer must say so with `None`, not with
+    /// an error: the front end then serialises opens on the single ring, and
+    /// an error would make the first `open("/dev/dsp")` fail outright.
+    #[test]
+    fn a_device_without_a_mixer_offers_no_private_stream() {
+        assert!(BareAudio::new(0).open_stream().unwrap().is_none());
+    }
+
+    /// `delay_bytes` is ALSA's `DELAY`, and for a device that inserts no
+    /// silence of its own it is exactly what is queued. Answering a larger
+    /// figure by default would make every client's latency estimate wrong.
+    #[test]
+    fn the_default_delay_is_exactly_what_is_queued() {
+        let dev = BareAudio::new(0);
+        assert_eq!(dev.delay_bytes(), 0);
+        dev.write(&[0u8; 512]).unwrap();
+        assert_eq!(dev.queued_bytes(), 512);
+        assert_eq!(dev.delay_bytes(), 512);
+        dev.reset().unwrap();
+        assert_eq!(dev.delay_bytes(), 0);
+    }
+
+    /// `buffer_bytes_at` must delegate, and it must IGNORE the rate it is
+    /// given: a rate-independent ring holds the same bytes whatever the
+    /// client asks for, and a figure that moved with the rate would have the
+    /// front end size a buffer the ring cannot hold.
+    #[test]
+    fn the_buffer_size_is_rate_independent_by_default() {
+        let dev = BareAudio::new(0);
+        assert_eq!(dev.buffer_bytes_at(8_000), dev.buffer_bytes());
+        assert_eq!(dev.buffer_bytes_at(44_100), dev.buffer_bytes());
+        assert_eq!(dev.buffer_bytes_at(192_000), dev.buffer_bytes());
+    }
+
+    /// A rate of zero is nonsense but reachable from userspace; the default
+    /// must not divide by it.
+    #[test]
+    fn asking_for_the_buffer_size_at_zero_hertz_does_not_fault() {
+        assert_eq!(BareAudio::new(0).buffer_bytes_at(0), 4096);
+    }
+
+    /// `is_playing` defaults to false, which is what lets the ALSA watchdog
+    /// stop an idle sink: a default of true would leave RUN set forever on
+    /// every device that does not track its DMA engine.
+    #[test]
+    fn a_device_that_does_not_track_its_engine_reports_not_playing() {
+        assert!(!BareAudio::new(1024).is_playing());
+    }
+
+    /// Rewind and forward discard NOTHING by default and say so by returning
+    /// zero. A default that claimed to have dropped bytes would desynchronise
+    /// the client's pointer from the ring.
+    #[test]
+    fn rewind_and_forward_discard_nothing_by_default() {
+        let dev = BareAudio::new(2048);
+        assert_eq!(dev.rewind(1024), Ok(0));
+        assert_eq!(dev.forward(1024), Ok(0));
+        assert_eq!(dev.queued_bytes(), 2048, "the ring was touched");
+    }
+
+    /// Pause, resume and the start hold succeed as no-ops. They are what an
+    /// OSS client drives with `SETTRIGGER`; failing them would break clients
+    /// on devices that simply have nothing to pause.
+    #[test]
+    fn the_transport_knobs_succeed_as_no_ops() {
+        let dev = BareAudio::new(0);
+        assert_eq!(dev.pause(), Ok(()));
+        assert_eq!(dev.resume(), Ok(()));
+        assert_eq!(dev.set_start_hold(true), Ok(()));
+        assert_eq!(dev.set_start_hold(false), Ok(()));
+    }
+
+    /// The default gain is full volume, unmuted: a device with no analog
+    /// volume (every HDMI/DP pin) must not come up reporting silence, or
+    /// `amixer` shows a muted master on working speakers.
+    #[test]
+    fn the_default_gain_is_full_and_unmuted() {
+        assert_eq!(BareAudio::new(0).gain(), (100, 100, false, false));
+    }
+
+    /// And setting it is accepted even though nothing happens, including the
+    /// out-of-range percent a client may send.
+    #[test]
+    fn setting_the_gain_is_accepted_as_a_no_op() {
+        let dev = BareAudio::new(0);
+        assert_eq!(dev.set_gain(50, 50, false, false), Ok(()));
+        assert_eq!(dev.set_gain(255, 0, true, true), Ok(()));
+        assert_eq!(dev.gain(), (100, 100, false, false), "gain was stored");
+    }
+
+    /// Card 0 is picked by the highest score, so an unopinionated device must
+    /// sit at zero: a non-zero default would let a driver that never thought
+    /// about it outrank the monitor's HDMI pin.
+    #[test]
+    fn an_unopinionated_device_scores_zero_for_card_zero() {
+        assert_eq!(BareAudio::new(0).default_score(), 0);
+    }
+
+    /// `/proc/gpusnd` on a device with nothing to say is empty, not a line of
+    /// placeholder text that would read as a diagnosis.
+    #[test]
+    fn a_device_with_nothing_to_report_dumps_nothing() {
+        assert!(BareAudio::new(0).diagnostics().is_empty());
+    }
+
+    /// The contract `queued_bytes` documents: it is exactly the ring less
+    /// what `write` would take right now. A client computes `avail` from it,
+    /// so the two must not disagree.
+    #[test]
+    fn what_is_queued_plus_what_is_free_is_the_whole_ring() {
+        let dev = BareAudio::new(0);
+        dev.write(&[0u8; 1500]).unwrap();
+        assert_eq!(dev.queued_bytes() + dev.free_bytes(), dev.buffer_bytes());
+    }
+}
