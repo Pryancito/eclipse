@@ -1187,6 +1187,36 @@ static SPINE_SMASHES: core::sync::atomic::AtomicUsize = core::sync::atomic::Atom
 /// like a clean run.
 static SPINE_OVERFLOW: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
+/// One past the highest slot index this boot has ever occupied.
+///
+/// **Why a high-water mark.** The registry is `2 * MAX_CORE_NUM` = 128 slots
+/// because a 20-thread desktop overflowed a flat 16, and `spine_verify` runs
+/// from the timer tick on EVERY CPU, so the sweep's length was 128 regardless
+/// of how many executors the machine actually has. On a two-CPU boot that is
+/// 126 loads of empty slots per tick per CPU; at `-smp 20` it is 5.000 sweeps
+/// a second, each reading 16 cachelines of `SPINE_ADDR` that other CPUs write
+/// whenever they register or retire an executor.
+///
+/// `spine_register` always takes the lowest free slot, so the occupied slots
+/// stay packed at the bottom and this is the length of the packed region: on a
+/// two-CPU boot a handful, at `-smp 20` a few dozen, never 128 unless 128 were
+/// genuinely live at once. It does not shrink — a mark that fell back would
+/// have to be recomputed under the same lock it exists to shorten, and the
+/// peak is what bounds the array anyway.
+///
+/// It is also the "nothing is registered yet" test: zero means the sweep can
+/// return without taking `SPINE_ACCESS` at all, which is what every CPU's tick
+/// does before the first executor is born.
+static SPINE_HIGH: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// How far a sweep of the spine registry has to go. See [`SPINE_HIGH`].
+#[inline]
+fn spine_high() -> usize {
+    SPINE_HIGH
+        .load(core::sync::atomic::Ordering::Acquire)
+        .min(SPINE_SLOTS)
+}
+
 fn spine_register(slot: usize, val: u64, exec_id: usize, stack_base: usize) {
     use core::sync::atomic::Ordering::{AcqRel, Relaxed, Release};
     let _interrupts = crate::InterruptGuard::new(false);
@@ -1207,6 +1237,9 @@ fn spine_register(slot: usize, val: u64, exec_id: usize, stack_base: usize) {
             SPINE_EXEC[i].store(exec_id, Relaxed);
             SPINE_BASE[i].store(stack_base, Relaxed);
             SPINE_ADDR[i].store(slot, Release);
+            // Before the generation bump, so a sweep that reacts to the new
+            // generation already sees a mark that covers slot `i`.
+            SPINE_HIGH.fetch_max(i + 1, Release);
             SPINE_GEN.fetch_add(1, Release);
             return;
         }
@@ -1239,7 +1272,7 @@ fn spine_unregister(slot: usize) {
     use core::sync::atomic::Ordering::{AcqRel, Relaxed, Release};
     let _interrupts = crate::InterruptGuard::new(false);
     let _access = SPINE_ACCESS.lock();
-    for i in 0..SPINE_SLOTS {
+    for i in 0..spine_high() {
         if SPINE_ADDR[i]
             .compare_exchange(slot, 0, AcqRel, Relaxed)
             .is_ok()
@@ -1259,7 +1292,7 @@ fn spine_unregister_by_stack(stack_base: usize) {
     let _access = SPINE_ACCESS.lock();
     let lo = stack_base;
     let hi = stack_base + STACK_SIZE;
-    for i in 0..SPINE_SLOTS {
+    for i in 0..spine_high() {
         let a = SPINE_ADDR[i].load(Acquire);
         if a != 0 && a != usize::MAX && a >= lo && a < hi {
             if SPINE_ADDR[i]
@@ -1376,9 +1409,17 @@ pub fn spine_verify() -> Option<SpineSmash> {
     // IRQ callers never spin; unregister/reuse waits until the protected read
     // finishes. Registered return words are immutable until unregister, unlike
     // arbitrary surrounding frame words, which must not be scanned.
+    // One relaxed-ish load before anything else: with no registration yet
+    // there is nothing to verify, and this is the common case on every CPU's
+    // tick until the first executor is born. It also keeps the global
+    // `SPINE_ACCESS` CAS off the tick in that window.
+    let high = spine_high();
+    if high == 0 {
+        return None;
+    }
     let _interrupts = crate::InterruptGuard::new(false);
     let _access = SPINE_ACCESS.try_lock()?;
-    for i in 0..SPINE_SLOTS {
+    for i in 0..high {
         let a = SPINE_ADDR[i].load(Acquire);
         if a == 0 || a == usize::MAX {
             continue;
@@ -3946,6 +3987,9 @@ mod spine_tests {
         }
         SPINE_SMASHES.store(0, Ordering::SeqCst);
         SPINE_OVERFLOW.store(0, Ordering::SeqCst);
+        // `SPINE_HIGH` is deliberately NOT reset: it is monotonic for the life
+        // of the process by design (see its own comment), so a test that wants
+        // the sweep to reach a slot it wrote by hand moves the mark itself.
     }
 
     struct Clean(#[allow(dead_code)] std::sync::MutexGuard<'static, ()>);
@@ -4144,6 +4188,77 @@ mod spine_tests {
     }
 
     #[test]
+    fn the_sweep_stops_at_the_highest_slot_ever_used() {
+        // `spine_verify` runs from the timer tick on every CPU, so its length
+        // is paid 250 times a second per core. The registry is 128 slots
+        // because a 20-thread machine needs them; a two-CPU machine must not
+        // pay for the 126 it never fills.
+        let _c = clean();
+        // The mark is monotonic for the life of the test process, so what this
+        // pins is the step: one registration into slot 0 does not widen the
+        // swept region past slot 0. A sweep whose length were `SPINE_SLOTS`
+        // would stay 128 whatever is registered.
+        let before = spine_high();
+        let mut fake = Fake::new(64, 0, UNTOUCHED);
+        let slot = fake.at(8 * 8);
+        spine_register(slot, RETURN_INTO_RUN_EXECUTOR, 1, fake.base());
+        assert_eq!(spine_high(), before.max(1));
+        // And the slot is really swept, i.e. the shortened region still
+        // reaches it: a mark one slot short would hide a smash on it.
+        fake.set(slot, 0);
+        assert!(
+            spine_verify().is_some(),
+            "a smash inside the swept region must still be found"
+        );
+    }
+
+    #[test]
+    fn an_entry_above_the_mark_is_not_swept_at_all() {
+        // The counterpart of the test above, and the one that actually pins
+        // the bound: an entry written past the high-water mark looks exactly
+        // like a registered slot whose word has been overwritten, so a sweep
+        // that still ran to `SPINE_SLOTS` would report it. The memory is the
+        // test's own, so a mutation that ignores the mark fails here instead
+        // of faulting.
+        let _c = clean();
+        // The mark is monotonic for the life of the process and the suite
+        // includes a test that fills the table, so it is set by hand here --
+        // which is also the configuration this is about: a machine with one
+        // live executor and 127 slots it will never use.
+        let was = spine_high();
+        SPINE_HIGH.store(1, Ordering::SeqCst);
+        let above = 5;
+        let fake = Fake::new(64, 0, UNTOUCHED);
+        let slot = fake.at(8 * 8);
+        SPINE_BASE[above].store(fake.base(), Ordering::SeqCst);
+        SPINE_EXEC[above].store(42, Ordering::SeqCst);
+        SPINE_VAL[above].store(RETURN_INTO_RUN_EXECUTOR, Ordering::SeqCst);
+        SPINE_ADDR[above].store(slot, Ordering::SeqCst);
+        // `UNTOUCHED` is not the registered return address, so this entry IS
+        // a mismatch; only the mark keeps the sweep away from it.
+        let seen = spine_verify().map(|s| s.exec_id);
+        SPINE_HIGH.fetch_max(was, Ordering::SeqCst);
+        assert_eq!(
+            seen, None,
+            "slot {above} is above the mark and must not be read"
+        );
+    }
+
+    #[test]
+    fn the_mark_never_falls_back_when_a_slot_is_given_back() {
+        // It is a high-water mark on purpose: recomputing it on unregister
+        // would mean another pass over the table under the very lock the mark
+        // exists to spend less time holding.
+        let _c = clean();
+        let fake = Fake::new(64, 0, UNTOUCHED);
+        let slot = fake.at(8 * 8);
+        spine_register(slot, RETURN_INTO_RUN_EXECUTOR, 1, fake.base());
+        let with_one = spine_high();
+        spine_unregister(slot);
+        assert_eq!(spine_high(), with_one);
+    }
+
+    #[test]
     fn every_registration_and_every_removal_moves_the_generation() {
         // Each CPU reprograms its debug registers only when this number moves.
         // A registration that does not move it is watched by whichever CPUs
@@ -4194,6 +4309,10 @@ mod spine_tests {
         let _c = clean();
         SPINE_ADDR[0].store(usize::MAX, Ordering::SeqCst);
         SPINE_BASE[0].store(0, Ordering::SeqCst);
+        // By hand too, because the sweep stops at the high-water mark and only
+        // `spine_register` moves it: without this the sweep would never reach
+        // slot 0 and the assertion below would hold for the wrong reason.
+        SPINE_HIGH.fetch_max(1, Ordering::SeqCst);
         assert!(watched().is_empty());
         assert!(spine_verify().is_none());
     }

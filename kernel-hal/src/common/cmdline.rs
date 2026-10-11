@@ -109,6 +109,35 @@ pub fn is_off(cmdline: &str, key: &str) -> bool {
     value(cmdline, key).and_then(parse_bool) == Some(false)
 }
 
+/// The CPU count `smp=` asks this boot to stop at, or `None` when the command
+/// line sets no ceiling and every CPU the firmware reports should come up.
+///
+/// Three spellings, and they are one knob:
+///
+/// - `smp=off` (or `=0`, `=false`, `=no`) is `Some(1)`: one CPU, the escape
+///   hatch for bringing a suspect machine up single-core without a rebuild.
+/// - `smp=<N>` is `Some(N)`, clamped into `1..=MAX_CORE_NUM`. This is the one
+///   that was missing: on a machine with twenty hardware threads the only two
+///   configurations reachable from the command line were one CPU and twenty,
+///   and twenty is what a `-smp 20` QEMU pays for twenty times over — twenty
+///   vCPU threads, each taking its own 250 Hz tick, on one host.
+/// - nothing, or a value that spells neither a number nor a boolean, is
+///   `None`: the default, unchanged.
+///
+/// **The number is read before the boolean**, which is the whole subtlety
+/// here: `smp=1` spells a *true* boolean, so an [`is_off`] test alone reads it
+/// as "SMP requested" and brings up every CPU under a log line that says one.
+/// `smp=0` spells a false one and means the same as `smp=1`; both land on
+/// `Some(1)` rather than on a cap of zero, because the boot CPU is already
+/// running by the time anyone can ask and a cap it cannot obey is not a cap.
+pub fn smp_limit(cmdline: &str) -> Option<usize> {
+    if is_off(cmdline, "smp") {
+        return Some(1);
+    }
+    let n = value(cmdline, "smp").and_then(parse_number)?;
+    Some(n.clamp(1, crate::config::MAX_CORE_NUM as u64) as usize)
+}
+
 /// The command line out of a NUL-terminated byte string, which is the shape a
 /// device tree's `/chosen/bootargs` property has.
 ///
@@ -501,6 +530,79 @@ mod tests {
         assert_eq!(
             value("nvidia.hwcursor=banana", "nvidia.hwcursor"),
             Some("banana")
+        );
+    }
+
+    // ── the CPU-count ceiling ───────────────────────────────────────────────
+
+    #[test]
+    fn a_command_line_that_says_nothing_about_smp_sets_no_ceiling() {
+        assert_eq!(smp_limit("LOG=info"), None);
+        assert_eq!(smp_limit(""), None);
+    }
+
+    #[test]
+    fn every_spelling_of_off_asks_for_one_cpu() {
+        for line in [
+            "smp=off",
+            "smp=0",
+            "smp=false",
+            "smp=no",
+            "LOG=info:smp=off",
+        ] {
+            assert_eq!(smp_limit(line), Some(1), "{line}");
+        }
+    }
+
+    #[test]
+    fn a_ceiling_of_one_is_read_as_one_and_not_as_a_true_boolean() {
+        // THE bug this function exists to not have: `parse_bool("1")` is
+        // `Some(true)`, so reading the boolean first turns `smp=1` into "SMP
+        // requested" and brings up all twenty CPUs under a log line saying
+        // one.
+        assert_eq!(parse_bool("1"), Some(true), "why the order matters");
+        assert_eq!(smp_limit("smp=1"), Some(1));
+    }
+
+    #[test]
+    fn a_number_is_the_cpu_count_including_the_boot_cpu() {
+        assert_eq!(smp_limit("smp=2"), Some(2));
+        assert_eq!(smp_limit("smp=6"), Some(6));
+        assert_eq!(smp_limit("LOG=warn:smp=2:VARIANT=minimal"), Some(2));
+    }
+
+    #[test]
+    fn a_ceiling_above_what_the_tables_hold_clamps_to_what_they_hold() {
+        // A ceiling that promises more slots than the per-CPU tables have is
+        // not a ceiling.
+        let max = crate::config::MAX_CORE_NUM;
+        assert_eq!(smp_limit("smp=4096"), Some(max));
+        assert_eq!(smp_limit(&alloc::format!("smp={max}")), Some(max));
+    }
+
+    #[test]
+    fn a_value_that_spells_no_number_and_no_boolean_sets_no_ceiling() {
+        // Same rule as every other knob here: a typo means nothing, never
+        // something else. `smp=on` is the default spelled out loud.
+        assert_eq!(smp_limit("smp=banana"), None);
+        assert_eq!(smp_limit("smp=2cpus"), None);
+        assert_eq!(smp_limit("smp=on"), None);
+        assert_eq!(smp_limit("smp=true"), None);
+        assert_eq!(smp_limit("smp"), None);
+    }
+
+    #[test]
+    fn the_ceiling_is_read_from_a_device_trees_nul_terminated_bootargs() {
+        // riscv64 reads it out of `/chosen/bootargs`, where the last flag on
+        // the line carries the NUL -- which spells no number and no boolean,
+        // so without `from_c_bytes` the ceiling would read as unset.
+        let raw = b"LOG=warn:smp=2\0";
+        let line = from_c_bytes(raw).unwrap();
+        assert_eq!(smp_limit(line), Some(2));
+        assert_eq!(
+            smp_limit(core::str::from_utf8(raw).unwrap()),
+            None,
+            "the NUL the stripper is for"
         );
     }
 }
