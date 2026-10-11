@@ -12658,6 +12658,46 @@ impl NvidiaGpu {
             }
 
             nv::NR_CHANNEL_ALLOC => {
+                let req = unsafe { &mut *(arg as *mut nv::DrmNouveauChannelAlloc) };
+                // `nouveau_abi16_ioctl_channel_alloc`, Kepler and later: with
+                // `fb_ctxdma_handle == ~0` the client names the ENGINE in
+                // `tt_ctxdma_handle` (libdrm's nve0 channels and NVK: GR, or
+                // CE for a copy queue); a name that is none of the five is
+                // ENOSYS, and VP/PPP/BSP name runlists a Turing has not got
+                // (`nvif_fifo_runlist` finds none: EINVAL). Otherwise the two
+                // are legacy ctxdma handles, and only `tt == ~0` is refused
+                // (EINVAL). The engine words are consumed: Linux writes 0 and
+                // 0 back for them, there and then. The name is read and
+                // checked, not acted on: every channel here is the one RM
+                // channel on the graphics runlist (`step17`/`ctx_alloc`),
+                // so a channel asked for as CE copies with that runlist's
+                // GRCEs, not with a CE runlist of its own as on Linux.
+                if req.fb_ctxdma_handle == u32::MAX {
+                    match req.tt_ctxdma_handle {
+                        nv::NOUVEAU_FIFO_ENGINE_GR | nv::NOUVEAU_FIFO_ENGINE_CE => {}
+                        nv::NOUVEAU_FIFO_ENGINE_VP
+                        | nv::NOUVEAU_FIFO_ENGINE_PPP
+                        | nv::NOUVEAU_FIFO_ENGINE_BSP => {
+                            log::warn!(
+                                "[nouveau-uapi] CHANNEL_ALLOC: engine {:#x} has no runlist on this GPU -> EINVAL",
+                                req.tt_ctxdma_handle
+                            );
+                            return Err(nv::EINVAL);
+                        }
+                        other => {
+                            log::warn!(
+                                "[nouveau-uapi] CHANNEL_ALLOC: {:#x} names no engine -> ENOSYS",
+                                other
+                            );
+                            return Err(nv::ENOSYS);
+                        }
+                    }
+                    req.fb_ctxdma_handle = 0;
+                    req.tt_ctxdma_handle = 0;
+                } else if req.tt_ctxdma_handle == u32::MAX {
+                    log::warn!("[nouveau-uapi] CHANNEL_ALLOC: tt_ctxdma_handle ~0 -> EINVAL");
+                    return Err(nv::EINVAL);
+                }
                 // [auto-bringup] Only THIS GPU. On dual-GPU boxes card0 is the
                 // compute card: ensure_console_gpu_brought_up is a no-op there
                 // (drives_boot_display == false). Never walk other GPUs here —
@@ -12851,7 +12891,6 @@ impl NvidiaGpu {
                     owner_pid,
                 });
                 drop(chan);
-                let req = unsafe { &mut *(arg as *mut nv::DrmNouveauChannelAlloc) };
                 req.channel = new_id;
                 req.notifier_handle = channel.h_notifier;
                 req.pushbuf_domains = nv::NOUVEAU_GEM_DOMAIN_VRAM;
@@ -14824,92 +14863,10 @@ impl PciDriver for NvidiaGpuDriverPci {
 #[cfg(test)]
 mod decode_tests;
 
+/// `NvidiaGpu::for_test`: the GPU with nothing behind it that every
+/// bookkeeping test runs on.
 #[cfg(test)]
-impl NvidiaGpu {
-    /// A GPU with no PCI device behind it: BAR0 reads as zero (so the chip
-    /// id falls back to `architecture`), no RM instance, no boot
-    /// framebuffer. That is the state every nouveau ioctl sees on a GPU the
-    /// RM never attached, and it is enough for every arm that is
-    /// bookkeeping rather than hardware.
-    pub(super) fn for_test(device_id: u16, vram_size_mb: u32) -> Self {
-        // Zeros, 16 MiB of them: the GR hang probe reads BAR0 up to
-        // 0x00bb_0090. `vec![0; n]` is `alloc_zeroed`, so the pages that are
-        // never touched cost nothing.
-        let bar0 = alloc::boxed::Box::leak(alloc::vec![0u8; 16 << 20].into_boxed_slice()).as_ptr()
-            as usize;
-        let gem_handle_slice = crate::scheme::gem_mmap::test_handle_slice();
-        // The id table decides the architecture as it does for real; an id
-        // it does not know stands in for a Turing board it cannot size.
-        let (architecture, gpu_model) = match identify_gpu(device_id) {
-            (NvidiaArchitecture::Unknown, _, _) => (NvidiaArchitecture::Turing, "test"),
-            (arch, model, _) => (arch, model),
-        };
-        Self {
-            name: String::from("nvidia-test"),
-            info: DisplayInfo {
-                width: 0,
-                height: 0,
-                pitch: 0,
-                format: ColorFormat::ARGB8888,
-                fb_base_vaddr: 0,
-                fb_size: 256 << 20,
-            },
-            architecture,
-            gpu_model,
-            device_id,
-            vram_size_mb,
-            pitch_override: None,
-            _bar0: bar0,
-            _bar1: 0,
-            bar1_phys: 0,
-            bar0_phys: 0,
-            bar0_len: 0,
-            bar2_phys: 0,
-            bar2_len: 0,
-            pci_domain: 0,
-            pci_bus: 0,
-            pci_device: 0,
-            vram_allocator: Mutex::new(None),
-            bringup: Mutex::new(None),
-            rm_attach_result: Mutex::new(None),
-            rm_device_instance: Mutex::new(None),
-            rm_display_snap: Mutex::new(None),
-            auto_bringup_done: AtomicBool::new(false),
-            gsp_firmware: Mutex::new(None),
-            gsp_fw_status: Mutex::new(None),
-            gsp_init_result: Mutex::new(None),
-            state_init_result: Mutex::new(None),
-            step10_result: Mutex::new(None),
-            imported_handles: Mutex::new(Vec::new()),
-            nouveau_channels: Mutex::new(Vec::new()),
-            nouveau_gem: Mutex::new(Vec::new()),
-            nouveau_gem_next_handle: AtomicU32::new(gem_handle_slice.base()),
-            nouveau_gem_handle_end: gem_handle_slice.end(),
-            nouveau_vm_mappings: Mutex::new(Vec::new()),
-            nouveau_uvmm: Mutex::new(Vec::new()),
-            nouveau_pid_ctx: Mutex::new(Vec::new()),
-            nouveau_fast: Mutex::new(
-                (0..super::nouveau_uapi::MAX_CTX)
-                    .map(|_| FastSlot::Unprepared)
-                    .collect(),
-            ),
-            nouveau_peer_fence: Mutex::new(alloc::collections::BTreeMap::new()),
-            nouveau_zombies: Mutex::new(Vec::new()),
-            nouveau_deferred_frees: Mutex::new(Vec::new()),
-            nouveau_ctx_teardown: Mutex::new(Vec::new()),
-            kms_framebuffers: Mutex::new(Vec::new()),
-            next_kms_fb_id: AtomicU32::new(1),
-            kms_state: Mutex::new(NvidiaKmsState {
-                crtc_fb: 0,
-                plane_fb: 0,
-                last_vblank_us: 0,
-            }),
-            msi_vector: AtomicUsize::new(usize::MAX),
-            ctx0_owner: AtomicU64::new(0),
-            ctx0_resetting: AtomicBool::new(false),
-        }
-    }
-}
+mod test_gpu;
 
 #[cfg(test)]
 mod nouveau_bookkeeping_tests;

@@ -9449,3 +9449,7 @@ mod glxgears_vblank_mode {
         d.finish();
     }
 }
+
+/// The channel arms (`CHANNEL_ALLOC` and kin): a child so it shares this
+/// harness, a file so this one stays under its ceiling.
+mod abi16_tests;

@@ -878,6 +878,14 @@ pub(super) const fn pte_kind_is_supported(kind: u32) -> bool {
     kind <= PTE_KIND_GENERIC
 }
 
+// --- NOUVEAU_FIFO_ENGINE_* (drm_nouveau_channel_alloc.tt_ctxdma_handle when
+// fb_ctxdma_handle is ~0: the engine the channel is for, Kepler and later) ---
+pub(super) const NOUVEAU_FIFO_ENGINE_GR: u32 = 0x01;
+pub(super) const NOUVEAU_FIFO_ENGINE_VP: u32 = 0x02;
+pub(super) const NOUVEAU_FIFO_ENGINE_PPP: u32 = 0x04;
+pub(super) const NOUVEAU_FIFO_ENGINE_BSP: u32 = 0x08;
+pub(super) const NOUVEAU_FIFO_ENGINE_CE: u32 = 0x30;
+
 // --- DRM_NOUVEAU_SYNC_* (drm_nouveau_sync.flags) ---
 pub(super) const SYNC_SYNCOBJ: u32 = 0x0;
 pub(super) const SYNC_TIMELINE_SYNCOBJ: u32 = 0x1;
