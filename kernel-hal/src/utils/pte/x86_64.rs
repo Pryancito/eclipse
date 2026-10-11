@@ -74,6 +74,20 @@ impl From<MMUFlags> for PTF {
 
 impl From<PTF> for MMUFlags {
     fn from(f: PTF) -> Self {
+        // ACCESSED and DIRTY are the hardware's bookkeeping, not permissions,
+        // and they are dropped before anything else is read.
+        //
+        // `set_flags` carries them across a flag rewrite (see there), so a
+        // band whose permissions have just been taken away is an entry with no
+        // PRESENT bit and, very often, D still set. Leaving them in made that
+        // entry non-empty, so this fell through to `READ` and reported a page
+        // with no access as readable -- and `guard_band::took_effect`, which
+        // exists precisely to verify that the permission really went away,
+        // then refused every coroutine stack's hard guard band as "still
+        // readable after clearing its permissions". Every stack ran on the
+        // soft canary instead, which only notices an overflow after the
+        // neighbouring heap is already overwritten.
+        let f = f.difference(PTF::ACCESSED | PTF::DIRTY);
         if f.is_empty() {
             return Self::empty();
         }

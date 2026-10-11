@@ -240,6 +240,34 @@ fn no_access_is_claimed_but_absent<P: GenericPTE>(zeroed: fn() -> P, arch: &str)
         arch
     );
     assert!(!e.is_unused(), "{}: a no-access page looks unmapped", arch);
+
+    // And the same for a page the hardware had already marked written before
+    // its permissions were taken away, which is the ordinary case for a
+    // coroutine stack's guard band: the heap page under it has been written.
+    // `set_flags` carries ACCESSED and DIRTY across a flag rewrite, and those
+    // two bits are bookkeeping, not permission -- an entry that keeps them
+    // must still read as granting nothing, or `guard_band::took_effect`
+    // refuses the band as "still readable after clearing its permissions" and
+    // the stack falls back to the soft canary.
+    let mut e = a_leaf(zeroed(), FRAME, rw(), false);
+    e.set_dirty();
+    e.set_flags(MMUFlags::empty(), false);
+    assert!(
+        !e.is_present(),
+        "{}: a no-access page that was written is present",
+        arch
+    );
+    assert!(
+        e.flags().is_empty(),
+        "{}: a no-access page that was written grants {:?}",
+        arch,
+        e.flags()
+    );
+    assert!(
+        !e.is_unused(),
+        "{}: a no-access page that was written looks unmapped",
+        arch
+    );
 }
 
 #[test]
@@ -862,6 +890,44 @@ fn a_child_of_a_split_can_be_marked_written() {
     let before = child.raw();
     child.set_dirty();
     assert_eq!(child.raw(), before);
+}
+
+/// The regression that took every coroutine stack's hard guard band away: the
+/// dirty bit carried across `set_flags` made a no-access entry non-empty, and
+/// `From<PTF>` then fell through to `READ`.
+#[test]
+fn the_hardware_bits_are_not_permissions() {
+    use ::x86_64::structures::paging::page_table::PageTableFlags as PTF;
+    // Straight through the conversion, both bits, on their own and together.
+    assert!(
+        MMUFlags::from(PTF::DIRTY).is_empty(),
+        "D is not a permission"
+    );
+    assert!(MMUFlags::from(PTF::ACCESSED).is_empty(), "nor is A");
+    assert!(MMUFlags::from(PTF::ACCESSED | PTF::DIRTY).is_empty());
+    assert!(MMUFlags::from(PTF::empty()).is_empty());
+
+    // And they do not disturb the permissions of an entry that has some: a
+    // written, writable page is still read-write.
+    assert_eq!(
+        MMUFlags::from(PTF::PRESENT | PTF::WRITABLE | PTF::NO_EXECUTE | PTF::DIRTY),
+        rw(),
+        "the hardware bits changed what the entry grants"
+    );
+
+    // The band, end to end: a written heap page whose permissions are taken
+    // away the way `guard_band::set_band_flags` takes them away, read back the
+    // way `took_effect` reads it.
+    let mut e = a_leaf(X86PTE::zeroed(), FRAME, rw(), false);
+    e.set_dirty();
+    e.set_flags(MMUFlags::empty(), false);
+    assert_eq!(e.raw() & X86_DIRTY, X86_DIRTY, "D is still there");
+    assert_eq!(e.raw() & X86_PRESENT, 0, "and the page is gone");
+    assert!(
+        !e.flags().contains(MMUFlags::READ),
+        "the band is still readable after clearing its permissions"
+    );
+    assert_eq!(e.addr(), FRAME, "and the frame is still in the entry");
 }
 
 #[test]
