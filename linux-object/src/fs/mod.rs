@@ -2160,10 +2160,7 @@ impl INodeExt for dyn INode {
             // `varinit_data` at ~0x17b000) read as zeros, so `initvar` called
             // `hashvar(NULL)` and every `/bin/sh` died with SIGSEGV @ 0x0.
             if read_len == 0 {
-                error!(
-                    "read_as_vmo: unexpected EOF at {:#x}/{:#x}",
-                    offset, size
-                );
+                error!("read_as_vmo: unexpected EOF at {:#x}/{:#x}", offset, size);
                 return Err(rcore_fs::vfs::FsError::DeviceError);
             }
             vmo.write(offset, &buf[..read_len])

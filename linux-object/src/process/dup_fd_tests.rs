@@ -388,15 +388,8 @@ fn the_exec_sweep_closes_the_marked_descriptor_and_keeps_its_twin() {
 #[test]
 fn dupfd_past_nofile_does_not_leave_a_descriptor_behind() {
     let proc = a_process();
-    proc.rlimit(
-        RLIMIT_NOFILE,
-        Some(RLimit {
-            cur: 4,
-            max: 4096,
-        }),
-        false,
-    )
-    .unwrap();
+    proc.rlimit(RLIMIT_NOFILE, Some(RLimit { cur: 4, max: 4096 }), false)
+        .unwrap();
     // Occupy 0..3 so a search from 2 has nowhere legal to land.
     for _ in 0..4 {
         proc.add_file(an_open_log(Log::new(), OpenFlags::RDONLY))

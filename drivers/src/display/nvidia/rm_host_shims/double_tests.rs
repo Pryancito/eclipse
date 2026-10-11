@@ -19,8 +19,8 @@
 
 extern crate std;
 
-use super::*;
 use super::super::nouveau_bookkeeping_tests::LOCK;
+use super::*;
 
 /// These are plain `repr(C)` out-parameters the C side fills; none of them
 /// derives `Default`, and all-bits-zero is what the caller hands in.
@@ -102,7 +102,10 @@ fn resetting_the_fake_empties_every_ledger_including_the_one_that_is_not_zero() 
     assert!(f.calls.is_empty(), "the call trail survived the reset");
     assert!(!f.ring_full, "a switch survived the reset");
     assert_eq!((f.gem_frees, f.ctx_frees, f.unmaps, f.bad), (0, 0, 0, 0));
-    assert_eq!(f.next, 0x100, "the handle counter's empty value is not zero");
+    assert_eq!(
+        f.next, 0x100,
+        "the handle counter's empty value is not zero"
+    );
 }
 
 /// Handles are minted from one counter shared by objects, bindings and
@@ -121,7 +124,10 @@ fn no_handle_the_fake_mints_is_zero_or_repeats() {
         seen.push(h);
         seen.push(bind(1, h, 0x10_0000 + (i as u64) * 0x1000, 4096).h_virt);
         let (mut obj, mut st) = (0u32, 0u32);
-        assert_eq!(eclipse_rm_class_alloc(0, 1, 0x902d, &mut obj, &mut st), NV_OK);
+        assert_eq!(
+            eclipse_rm_class_alloc(0, 1, 0x902d, &mut obj, &mut st),
+            NV_OK
+        );
         assert_eq!(st, 0);
         seen.push(obj);
     }
@@ -143,7 +149,10 @@ fn freeing_or_unmapping_something_the_fake_never_handed_out_is_refused_and_count
     reset_fake_rm();
 
     assert_eq!(eclipse_rm_gem_free(0, 0xdead), NV_ERR_OBJECT_NOT_FOUND);
-    assert_eq!(eclipse_rm_vm_bind_unmap(0, 0xdead, 4096, 0), NV_ERR_OBJECT_NOT_FOUND);
+    assert_eq!(
+        eclipse_rm_vm_bind_unmap(0, 0xdead, 4096, 0),
+        NV_ERR_OBJECT_NOT_FOUND
+    );
     assert_eq!(eclipse_rm_class_free(0, 0xdead), NV_ERR_OBJECT_NOT_FOUND);
     let f = FAKE_RM.lock();
     assert_eq!(f.bad, 3, "a refusal was not counted");
@@ -284,7 +293,10 @@ fn unmapping_frees_the_va_it_held_and_nothing_else() {
     bind(1, h, 0x30_1000, 0x1000);
 
     assert_eq!(bind(1, h, 0x30_0000, 0x1000).map_status, RM_VA_TAKEN);
-    assert_eq!(eclipse_rm_vm_bind_unmap(0, first.h_virt, 0x1000, 0x30_0000), NV_OK);
+    assert_eq!(
+        eclipse_rm_vm_bind_unmap(0, first.h_virt, 0x1000, 0x30_0000),
+        NV_OK
+    );
     assert_eq!(
         bind(1, h, 0x30_0000, 0x1000).map_status,
         0,
@@ -330,7 +342,11 @@ fn a_context_that_failed_part_way_answers_ok_and_leaves_nothing_alive() {
     FAKE_RM.lock().incomplete_ctx = true;
 
     let mut out = zeroed::<CtxAlloc>();
-    assert_eq!(eclipse_rm_ctx_alloc(0, 3, &mut out), NV_OK, "the call itself succeeds");
+    assert_eq!(
+        eclipse_rm_ctx_alloc(0, 3, &mut out),
+        NV_OK,
+        "the call itself succeeds"
+    );
     assert_ne!(out.sched_status, NV_OK, "the failure is in the status word");
     assert!(
         FAKE_RM.lock().ctxs.is_empty(),
@@ -375,7 +391,11 @@ fn a_push_must_lie_wholly_inside_one_binding() {
     let h = gem(0x1000, true);
     bind(1, h, 0x60_0000, 0x1000);
 
-    assert_eq!(submit(1, 0x60_0000, 0x1000), [0, 0, 0, 0], "the exact range");
+    assert_eq!(
+        submit(1, 0x60_0000, 0x1000),
+        [0, 0, 0, 0],
+        "the exact range"
+    );
     assert_eq!(submit(1, 0x60_0f00, 0x100), [0, 0, 0, 0], "the last bytes");
     assert_eq!(
         submit(1, 0x60_0f00, 0x101)[0],
@@ -470,7 +490,10 @@ fn a_submit_that_never_happened_reports_no_fence_address() {
     );
     assert_eq!(out.lookup_status, NV_ERR_OBJECT_NOT_FOUND);
     assert_eq!(out.fence_submit_status, 0xFFFF_FFFF);
-    assert_eq!(out.fence_sem_phys, 0, "a fence address for a submit that did not happen");
+    assert_eq!(
+        out.fence_sem_phys, 0,
+        "a fence address for a submit that did not happen"
+    );
 }
 
 /// The hardware ladder -- GSP, display, EDID, HDMI audio, the cursor, the
@@ -485,11 +508,17 @@ fn the_hardware_ladder_says_not_supported_and_never_ok() {
     let mut sink = [0u8; 256];
     let p = sink.as_mut_ptr();
     let answers = [
-        ("attach_gpu", eclipse_rm_attach_gpu(0, 0, 0, 0, p, 0, 0, 0, 0, 0, p)),
+        (
+            "attach_gpu",
+            eclipse_rm_attach_gpu(0, 0, 0, 0, p, 0, 0, 0, 0, 0, p),
+        ),
         ("bench", eclipse_rm_bench(0, p)),
         ("ce_blit", eclipse_rm_ce_blit(0, 0, 0, 0, p)),
         ("ce_blit_p2p", eclipse_rm_ce_blit_p2p(0, 0, 0, 0, p)),
-        ("ce_blit_p2p_2d", eclipse_rm_ce_blit_p2p_2d(0, 0, 0, 0, 0, 0, 0, p)),
+        (
+            "ce_blit_p2p_2d",
+            eclipse_rm_ce_blit_p2p_2d(0, 0, 0, 0, 0, 0, 0, p),
+        ),
         ("ce_fill_fb", eclipse_rm_ce_fill_fb(0, 0, 0, 0)),
         ("ce_fill_fb_p2p", eclipse_rm_ce_fill_fb_p2p(0, 0, 0, 0)),
         ("ce_release_inflight", eclipse_rm_ce_release_inflight()),
@@ -536,7 +565,10 @@ fn the_notifier_address_is_refused_before_a_channel_is_built() {
     reset_fake_rm();
     let mut pa = 0xffff_ffff_ffff_ffffu64;
     assert_ne!(eclipse_rm_chan_notifier_pa(0, &mut pa), NV_OK);
-    assert_eq!(pa, 0xffff_ffff_ffff_ffff, "it wrote the out-parameter anyway");
+    assert_eq!(
+        pa, 0xffff_ffff_ffff_ffff,
+        "it wrote the out-parameter anyway"
+    );
 
     FAKE_RM.lock().chan_built = true;
     assert_eq!(eclipse_rm_chan_notifier_pa(0, &mut pa), NV_OK);
@@ -553,7 +585,11 @@ fn resetting_context_zero_is_a_no_op_until_there_is_a_channel() {
     reset_fake_rm();
 
     assert_eq!(eclipse_rm_ctx0_reset(0), NV_OK);
-    assert_eq!(FAKE_RM.lock().ctx0_resets, 0, "it counted a reset of nothing");
+    assert_eq!(
+        FAKE_RM.lock().ctx0_resets,
+        0,
+        "it counted a reset of nothing"
+    );
 
     ctx(0);
     ctx(1);
@@ -628,7 +664,10 @@ fn the_direct_submit_window_describes_memory_that_is_really_there() {
     // 8192 u64 words = 64 KiB, and the ring is 8 bytes an entry.
     const BUF_BYTES: u64 = 8192 * 8;
     let ring_end = u64::from(FAST_GPFIFO_OFF) + u64::from(FAST_ENTRIES) * 8;
-    assert!(ring_end <= BUF_BYTES, "the GPFIFO ring runs past the buffer");
+    assert!(
+        ring_end <= BUF_BYTES,
+        "the GPFIFO ring runs past the buffer"
+    );
     assert!(u64::from(FAST_SEM_OFF) > u64::from(FAST_PB_OFF));
     assert!(u64::from(FAST_GPFIFO_OFF) > u64::from(FAST_SEM_OFF));
     // The USERD window is its own allocation, and GPGet/GPPut lie in it.
@@ -701,7 +740,11 @@ fn releasing_a_window_that_was_never_handed_out_is_not_recorded() {
     assert!(FAKE_RM.lock().fast_ctxs.is_empty());
     // And a second release of the same window finds nothing.
     eclipse_rm_exec_fast_release(0, 1);
-    assert_eq!(FAKE_RM.lock().fast_releases, [1], "a double release counted twice");
+    assert_eq!(
+        FAKE_RM.lock().fast_releases,
+        [1],
+        "a double release counted twice"
+    );
 }
 
 /// Every entry point records itself, in order, including the ones that
