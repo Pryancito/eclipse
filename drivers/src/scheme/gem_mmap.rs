@@ -152,6 +152,8 @@ struct MappedGem {
     /// the two atomics below, so an object that was used and then freed still
     /// counts.
     host_pa_given: bool,
+    /// `NOUVEAU_GEM_DOMAIN_NO_SHARE` at `GEM_NEW`: never exportable.
+    no_share: bool,
 }
 
 /// Outcome of [`dec_ref`], so `GEM_CLOSE` can tell "still shared, keep it" from
@@ -259,6 +261,7 @@ pub fn register(handle: u32, phys_addr: u64, size: u64, owner_pid: u64) {
             size,
             holders: alloc::vec![owner_pid],
             host_pa_given: false,
+            no_share: false,
         });
     }
 }
@@ -395,6 +398,29 @@ pub fn rekey_pid(from: u64, to: u64) -> usize {
 /// to free the buffer out from under the compositor -> its next GEM_INFO/VM_BIND
 /// on that handle faulted. Kept as a last-resort primitive; currently unused.
 #[allow(dead_code)]
+/// Marks `handle` as created with `NOUVEAU_GEM_DOMAIN_NO_SHARE`: a PRIME
+/// export of it is refused (Linux `nouveau_gem_prime_export`, EPERM). Returns
+/// whether the handle is tracked here.
+pub fn mark_no_share(handle: u32) -> bool {
+    let mut table = MAPPINGS.lock();
+    match table.iter_mut().find(|e| e.handle == handle) {
+        Some(e) => {
+            e.no_share = true;
+            true
+        }
+        None => false,
+    }
+}
+
+/// Whether `handle` was created `NO_SHARE` (false for a handle not tracked
+/// here: the export path answers that one as unknown first).
+pub fn no_share(handle: u32) -> bool {
+    MAPPINGS
+        .lock()
+        .iter()
+        .any(|e| e.handle == handle && e.no_share)
+}
+
 pub fn unregister(handle: u32) -> bool {
     let mut table = MAPPINGS.lock();
     if let Some(pos) = table.iter().position(|e| e.handle == handle) {

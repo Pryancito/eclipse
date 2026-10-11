@@ -6549,3 +6549,8 @@ mod wsi_refusal_trace_tests;
 /// same way.
 #[cfg(test)]
 mod scanout_modifier_tests;
+
+/// `drm_gem_prime_handle_to_dmabuf`: ENOENT for a handle the file does not
+/// hold, EPERM for a `NO_SHARE` object.
+#[cfg(test)]
+mod prime_export_tests;

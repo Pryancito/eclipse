@@ -14218,6 +14218,17 @@ impl NvidiaGpu {
                 // visible once VM_BIND started working and NVK got far enough
                 // to want host memory. If both bits are set we keep GART
                 // (CPU-visible sysmem); VRAM-only is real LOCAL.
+                // `nouveau_gem_new`: a NO_SHARE object lives on its VM's
+                // reservation, so it takes a uvmm (VM_INIT) first: EINVAL
+                // without one, before the domain is even looked at.
+                let no_share = req.info.domain & nv::NOUVEAU_GEM_DOMAIN_NO_SHARE != 0;
+                if no_share && !self.nouveau_has_uvmm(owner_pid) {
+                    crate::klog_warn!(
+                        "[nouveau-uapi] GEM_NEW: NO_SHARE without a uvmm (no VM_INIT) -> EINVAL pid={}",
+                        owner_pid
+                    );
+                    return Err(nv::EINVAL);
+                }
                 let want_vram = req.info.domain & nv::NOUVEAU_GEM_DOMAIN_VRAM != 0;
                 let want_gart = req.info.domain & nv::NOUVEAU_GEM_DOMAIN_GART != 0;
                 if !want_vram && !want_gart {
@@ -14383,6 +14394,9 @@ impl NvidiaGpu {
                 };
                 let map_handle = if let Some(pa) = phys_addr {
                     crate::scheme::gem_mmap::register(handle, pa, req.info.size, owner_pid);
+                    if no_share {
+                        crate::scheme::gem_mmap::mark_no_share(handle);
+                    }
                     (handle as u64) << 12
                 } else {
                     0
