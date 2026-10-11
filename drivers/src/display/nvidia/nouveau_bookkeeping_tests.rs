@@ -11,7 +11,7 @@ use super::*;
 use core::mem::size_of;
 use lock::Mutex as TestMutex;
 
-static LOCK: TestMutex<()> = TestMutex::new(());
+pub(super) static LOCK: TestMutex<()> = TestMutex::new(());
 
 const A: u64 = 66_001;
 const B: u64 = 66_002;

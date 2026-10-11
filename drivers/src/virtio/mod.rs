@@ -63,3 +63,73 @@ mod hal_for_tests {
         vaddr
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every error `virtio-drivers` can return has to map to its own
+    /// `DeviceError`, and the mapping is written out by hand: two arms that
+    /// answered the same thing would turn a full buffer into a device that is
+    /// not ready, and a caller that retries on `NotReady` would spin.
+    ///
+    /// `Error` is not exhaustive-matchable from here (it is another crate's),
+    /// so the guard against a variant being added and silently falling into
+    /// the wrong arm is that each of the six known ones is named here.
+    #[test]
+    fn every_virtio_error_maps_to_its_own_device_error() {
+        let expected = [
+            DeviceError::BufferTooSmall,
+            DeviceError::NotReady,
+            DeviceError::InvalidParam,
+            DeviceError::DmaError,
+            DeviceError::AlreadyExists,
+            DeviceError::IoError,
+        ];
+        let pairs = [
+            (Error::BufferTooSmall, DeviceError::BufferTooSmall),
+            (Error::NotReady, DeviceError::NotReady),
+            (Error::InvalidParam, DeviceError::InvalidParam),
+            (Error::DmaError, DeviceError::DmaError),
+            (Error::AlreadyUsed, DeviceError::AlreadyExists),
+            (Error::IoError, DeviceError::IoError),
+        ];
+        for (from, want) in pairs {
+            let shown = alloc::format!("{:?}", from);
+            assert_eq!(DeviceError::from(from), want, "{} maps wrong", shown);
+        }
+        // And no two of them land on the same `DeviceError`: a collision is
+        // what loses the distinction the mapping exists to keep.
+        for (i, a) in expected.iter().enumerate() {
+            for (j, b) in expected.iter().enumerate() {
+                if i != j {
+                    assert_ne!(a, b, "two virtio errors map to the same device error");
+                }
+            }
+        }
+    }
+
+    /// `AlreadyUsed` is the one arm whose names do not match, so it is the one
+    /// a careless edit would "fix" into something else.
+    #[test]
+    fn an_already_used_descriptor_is_an_already_existing_resource() {
+        assert_eq!(
+            DeviceError::from(Error::AlreadyUsed),
+            DeviceError::AlreadyExists
+        );
+    }
+
+    /// The conversion is what `?` uses throughout the virtio drivers, so it
+    /// has to work through `Result`, not only as a direct call.
+    #[test]
+    fn the_conversion_works_through_the_question_mark_operator() {
+        fn inner() -> Result<(), Error> {
+            Err(Error::DmaError)
+        }
+        fn outer() -> crate::DeviceResult {
+            inner()?;
+            Ok(())
+        }
+        assert_eq!(outer(), Err(DeviceError::DmaError));
+    }
+}

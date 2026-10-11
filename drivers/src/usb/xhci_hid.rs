@@ -7630,3 +7630,8 @@ mod hub_tests;
 
 #[cfg(test)]
 mod disk_tests;
+
+/// The command TRBs and the bounds on the wait loops, which the modules above
+/// leave uncovered.
+#[cfg(test)]
+mod trb_tests;

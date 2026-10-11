@@ -803,3 +803,211 @@ pub mod snd {
     pub const SND_MAX: u16 = 0x07;
     pub const SND_CNT: u16 = SND_MAX + 1;
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every namespace in this file is a bitmap index space: `*_MAX` is the
+    /// highest code and `*_CNT` the number of bits a bitmap of it needs, so
+    /// `CNT` must be `MAX + 1` everywhere. One off by one and the top code of
+    /// that namespace is outside the bitmap userspace is handed -- the key or
+    /// switch exists in the kernel and is invisible in `EVIOCGBIT`.
+    #[test]
+    fn every_namespace_counts_one_more_bit_than_its_highest_code() {
+        for (name, max, cnt) in [
+            ("INPUT_PROP", input_prop::INPUT_PROP_MAX, input_prop::INPUT_PROP_CNT),
+            ("EV", ev::EV_MAX, ev::EV_CNT),
+            ("SYN", syn::SYN_MAX, syn::SYN_CNT),
+            ("KEY", key::KEY_MAX, key::KEY_CNT),
+            ("REL", rel::REL_MAX, rel::REL_CNT),
+            ("ABS", abs::ABS_MAX, abs::ABS_CNT),
+            ("SW", sw::SW_MAX, sw::SW_CNT),
+            ("MSC", msc::MSC_MAX, msc::MSC_CNT),
+            ("LED", led::LED_MAX, led::LED_CNT),
+            ("REP", rep::REP_MAX, rep::REP_CNT),
+            ("SND", snd::SND_MAX, snd::SND_CNT),
+        ] {
+            assert_eq!(cnt, max + 1, "{}_CNT is not {}_MAX + 1", name, name);
+        }
+    }
+
+    /// Every code in a namespace has to be at or below that namespace's
+    /// `MAX`, or the bitmap sized from `CNT` cannot hold it. This is the whole
+    /// reason `MAX` exists, and it is a hand-copied table, so a code added
+    /// above the ceiling is the easy mistake.
+    #[test]
+    fn no_code_sits_above_its_own_namespaces_ceiling() {
+        for (name, max, codes) in [
+            (
+                "REL",
+                rel::REL_MAX,
+                &[
+                    rel::REL_X,
+                    rel::REL_Y,
+                    rel::REL_Z,
+                    rel::REL_RX,
+                    rel::REL_RY,
+                    rel::REL_RZ,
+                    rel::REL_HWHEEL,
+                    rel::REL_DIAL,
+                    rel::REL_WHEEL,
+                    rel::REL_MISC,
+                    rel::REL_RESERVED,
+                    rel::REL_WHEEL_HI_RES,
+                    rel::REL_HWHEEL_HI_RES,
+                ][..],
+            ),
+            (
+                "SYN",
+                syn::SYN_MAX,
+                &[
+                    syn::SYN_REPORT,
+                    syn::SYN_CONFIG,
+                    syn::SYN_MT_REPORT,
+                    syn::SYN_DROPPED,
+                ][..],
+            ),
+            (
+                "EV",
+                ev::EV_MAX,
+                &[
+                    ev::EV_SYN,
+                    ev::EV_KEY,
+                    ev::EV_REL,
+                    ev::EV_ABS,
+                    ev::EV_MSC,
+                    ev::EV_SW,
+                    ev::EV_LED,
+                    ev::EV_SND,
+                    ev::EV_REP,
+                    ev::EV_FF,
+                    ev::EV_PWR,
+                    ev::EV_FF_STATUS,
+                ][..],
+            ),
+            (
+                "SW",
+                sw::SW_MAX,
+                &[
+                    sw::SW_LID,
+                    sw::SW_TABLET_MODE,
+                    sw::SW_HEADPHONE_INSERT,
+                    sw::SW_RFKILL_ALL,
+                    sw::SW_RADIO,
+                    sw::SW_MICROPHONE_INSERT,
+                    sw::SW_DOCK,
+                    sw::SW_LINEOUT_INSERT,
+                    sw::SW_JACK_PHYSICAL_INSERT,
+                    sw::SW_VIDEOOUT_INSERT,
+                    sw::SW_CAMERA_LENS_COVER,
+                    sw::SW_KEYPAD_SLIDE,
+                    sw::SW_FRONT_PROXIMITY,
+                    sw::SW_ROTATE_LOCK,
+                    sw::SW_LINEIN_INSERT,
+                    sw::SW_MUTE_DEVICE,
+                    sw::SW_PEN_INSERTED,
+                ][..],
+            ),
+        ] {
+            for code in codes {
+                assert!(
+                    *code <= max,
+                    "{} code {:#x} is above {}_MAX {:#x}",
+                    name,
+                    code,
+                    name,
+                    max
+                );
+            }
+        }
+    }
+
+    /// The four pairs that share a value do so because Linux defines them as
+    /// aliases, not because the table was mis-copied. Pinning them is what
+    /// tells the two cases apart the next time the file is diffed against
+    /// upstream and a duplicate turns up.
+    #[test]
+    fn the_four_aliases_are_the_ones_linux_defines() {
+        assert_eq!(sw::SW_RADIO, sw::SW_RFKILL_ALL);
+        assert_eq!(key::KEY_ZOOM, key::KEY_FULL_SCREEN);
+        assert_eq!(key::KEY_SCREEN, key::KEY_ASPECT_RATIO);
+        assert_eq!(key::KEY_DISPLAYTOGGLE, key::KEY_BRIGHTNESS_TOGGLE);
+    }
+
+    /// The buttons a mouse driver reports are consecutive from `BTN_LEFT`, and
+    /// the HID-to-Linux mapping in the USB driver assumes exactly that order:
+    /// left, right, middle, side, extra. A reordering here swaps the
+    /// right-click and middle-click of every mouse.
+    #[test]
+    fn the_mouse_buttons_are_consecutive_from_the_left_one() {
+        assert_eq!(key::BTN_RIGHT, key::BTN_LEFT + 1);
+        assert_eq!(key::BTN_MIDDLE, key::BTN_LEFT + 2);
+        assert_eq!(key::BTN_SIDE, key::BTN_LEFT + 3);
+        assert_eq!(key::BTN_EXTRA, key::BTN_LEFT + 4);
+        // And they are where Linux puts them, which is what `evtest` and
+        // every compositor expect.
+        assert_eq!(key::BTN_LEFT, 0x110);
+        assert_eq!(key::BTN_MOUSE, key::BTN_LEFT);
+    }
+
+    /// `KEY_RESERVED` is 0 so that an all-zero report means "no key": a
+    /// non-zero reserved code would make an empty keyboard report press
+    /// something.
+    #[test]
+    fn the_reserved_key_is_zero() {
+        assert_eq!(key::KEY_RESERVED, 0);
+        assert_eq!(syn::SYN_REPORT, 0, "a report sync is not code zero");
+    }
+
+    /// The event TYPES are what `InputEventType::try_from` converts, and the
+    /// three a HID device produces must stay distinct and inside `EV_MAX`:
+    /// `EV_KEY` read as `EV_REL` turns a keypress into pointer motion.
+    #[test]
+    fn the_event_types_a_hid_device_produces_are_distinct() {
+        let types = [ev::EV_SYN, ev::EV_KEY, ev::EV_REL, ev::EV_ABS];
+        for (i, a) in types.iter().enumerate() {
+            for (j, b) in types.iter().enumerate() {
+                if i != j {
+                    assert_ne!(a, b, "two event types share a value");
+                }
+            }
+            assert!(*a <= ev::EV_MAX);
+        }
+        // EV_SYN must be 0: a `write` of a zeroed event struct is a sync, and
+        // the whole protocol is built on that.
+        assert_eq!(ev::EV_SYN, 0);
+    }
+
+    /// The high-resolution wheel axes are separate codes from the plain ones,
+    /// not aliases: a compositor that sees only `REL_WHEEL_HI_RES` scrolls at
+    /// 120 times the speed if the two are conflated.
+    #[test]
+    fn the_high_resolution_wheels_are_their_own_axes() {
+        assert_ne!(rel::REL_WHEEL, rel::REL_WHEEL_HI_RES);
+        assert_ne!(rel::REL_HWHEEL, rel::REL_HWHEEL_HI_RES);
+        assert_ne!(rel::REL_WHEEL_HI_RES, rel::REL_HWHEEL_HI_RES);
+    }
+
+    /// Every code in this file has to fit the capability bitmap the input
+    /// scheme hands userspace, which is the consumer of all of it: a `KEY_MAX`
+    /// above the bitmap means the top of the key space is silently dropped
+    /// (`InputCapability::set` warns and carries on, which costs the feature
+    /// rather than the kernel -- but it costs the feature).
+    #[test]
+    fn the_whole_key_space_fits_the_capability_bitmap() {
+        use crate::scheme::input::InputCapability;
+        let mut cap = InputCapability::empty();
+        cap.set(key::KEY_MAX);
+        assert!(
+            cap.contains(key::KEY_MAX),
+            "KEY_MAX {:#x} does not fit the {}-bit capability bitmap",
+            key::KEY_MAX,
+            InputCapability::BITS
+        );
+        // Const-folded, so it is spelled as a comparison clippy cannot see
+        // through: the point is that the count, not just the top code, fits.
+        let cnt = core::hint::black_box(key::KEY_CNT);
+        assert!(cnt <= InputCapability::BITS);
+    }
+}

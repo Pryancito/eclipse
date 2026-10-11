@@ -77,3 +77,202 @@ pub fn remove(dev: &Device) -> bool {
         None => false,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::scheme::{BlockScheme, Scheme};
+    use crate::DeviceResult;
+    use alloc::sync::Arc;
+    use core::sync::atomic::{AtomicUsize, Ordering};
+
+    /// `SINK` is one global for the whole process, so these tests take turns.
+    /// There is nothing to be gained from running them together and the
+    /// install is by definition shared state.
+    static TURNSTILE: Mutex<()> = Mutex::new(());
+
+    /// What the installed sink saw. The sink is a plain `fn` pointer (that is
+    /// what lets the static be built in `const`), so it cannot capture: the
+    /// bookkeeping has to be global too, and is reset by the guard below.
+    static ADDED: AtomicUsize = AtomicUsize::new(0);
+    static REMOVED: AtomicUsize = AtomicUsize::new(0);
+    /// A tag for the last device the sink was given, so a test can tell WHICH
+    /// device arrived rather than just how many. A `u64` cannot hold a name,
+    /// and the sink cannot capture one, so the name is folded into a number.
+    static LAST_ADDED: AtomicUsize = AtomicUsize::new(0);
+
+    /// Clears the installed sink and the counters on both sides of a test, so
+    /// one that installs a sink cannot leave it behind for the next.
+    struct Alone(#[allow(dead_code)] crate::sync::MutexGuard<'static, ()>);
+
+    impl Alone {
+        fn new() -> Self {
+            let g = TURNSTILE.lock();
+            clear();
+            Self(g)
+        }
+    }
+
+    impl Drop for Alone {
+        fn drop(&mut self) {
+            clear();
+        }
+    }
+
+    fn clear() {
+        *SINK.lock() = None;
+        ADDED.store(0, Ordering::SeqCst);
+        REMOVED.store(0, Ordering::SeqCst);
+        LAST_ADDED.store(0, Ordering::SeqCst);
+    }
+
+    fn record_add(dev: Device) {
+        ADDED.fetch_add(1, Ordering::SeqCst);
+        LAST_ADDED.store(tag(&dev), Ordering::SeqCst);
+    }
+
+    /// A sink that claims it found whatever it was asked to remove.
+    fn record_remove_found(_dev: &Device) -> bool {
+        REMOVED.fetch_add(1, Ordering::SeqCst);
+        true
+    }
+
+    /// A sink that was given a device it does not have.
+    fn record_remove_missing(_dev: &Device) -> bool {
+        REMOVED.fetch_add(1, Ordering::SeqCst);
+        false
+    }
+
+    /// A number that stands for the driver inside a `Device`, folded from the
+    /// name it reports.
+    fn tag(dev: &Device) -> usize {
+        dev.inner()
+            .name()
+            .bytes()
+            .fold(0usize, |acc, b| acc * 31 + b as usize)
+    }
+
+    /// A stand-in for a USB disk: something that can be put in a `Device`.
+    struct Pendrive(&'static str);
+
+    impl Scheme for Pendrive {
+        fn name(&self) -> &str {
+            self.0
+        }
+    }
+
+    impl BlockScheme for Pendrive {
+        fn read_block(&self, _id: usize, _buf: &mut [u8]) -> DeviceResult {
+            Ok(())
+        }
+        fn write_block(&self, _id: usize, _buf: &[u8]) -> DeviceResult {
+            Ok(())
+        }
+        fn flush(&self) -> DeviceResult {
+            Ok(())
+        }
+        fn block_count(&self) -> usize {
+            128
+        }
+    }
+
+    fn disk(name: &'static str) -> Device {
+        Device::Block(Arc::new(Pendrive(name)))
+    }
+
+    /// Before `kernel-hal` fills the hole, there is nowhere for a device to
+    /// go. Saying so is the whole point: a driver that believed it had
+    /// registered its disk would sit waiting for reads that never arrive.
+    #[test]
+    fn without_a_sink_an_added_device_is_reported_as_discarded() {
+        let _alone = Alone::new();
+        assert!(!sink_installed());
+        assert!(!add(disk("sda")), "add claimed success with no sink");
+        assert!(!remove(&disk("sda")), "remove claimed success with no sink");
+    }
+
+    /// With a sink installed, the device reaches it -- and the SAME device,
+    /// which matters because the sink is handed it by value.
+    #[test]
+    fn an_added_device_reaches_the_installed_sink() {
+        let _alone = Alone::new();
+        set_sink(record_add, record_remove_found);
+        assert!(sink_installed());
+
+        let dev = disk("sdb");
+        let expected = tag(&dev);
+        assert!(add(dev));
+        assert_eq!(ADDED.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            LAST_ADDED.load(Ordering::SeqCst),
+            expected,
+            "another device arrived at the sink"
+        );
+    }
+
+    /// A removal is answered by the SINK, not by this module: a device the
+    /// kernel does not have registered must come back `false` even with a
+    /// sink installed, because that is a different situation from "nowhere to
+    /// ask" and whoever is debugging needs them apart.
+    #[test]
+    fn a_removal_answers_what_the_sink_found() {
+        let _alone = Alone::new();
+
+        set_sink(record_add, record_remove_found);
+        assert!(remove(&disk("sdc")));
+        assert_eq!(REMOVED.load(Ordering::SeqCst), 1);
+
+        set_sink(record_add, record_remove_missing);
+        assert!(!remove(&disk("sdc")));
+        assert_eq!(REMOVED.load(Ordering::SeqCst), 2);
+    }
+
+    /// Installing twice is a caller bug, but the LAST one has to win: an
+    /// image that restarts its drivers must not keep handing devices to the
+    /// sink of the previous run.
+    #[test]
+    fn installing_a_second_sink_replaces_the_first() {
+        let _alone = Alone::new();
+
+        /// A sink that counts into `REMOVED` on an ADD, so a device that went
+        /// to the old sink instead of the new one is visible.
+        fn wrong_add(_dev: Device) {
+            REMOVED.fetch_add(100, Ordering::SeqCst);
+        }
+
+        set_sink(wrong_add, record_remove_found);
+        set_sink(record_add, record_remove_found);
+        assert!(add(disk("sdd")));
+        assert_eq!(ADDED.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            REMOVED.load(Ordering::SeqCst),
+            0,
+            "the device went to the replaced sink"
+        );
+    }
+
+    /// `add` is `#[must_use]`, and the reason is that a caller which ignores
+    /// it has silently dropped a device; the handful of devices in a row case
+    /// must each be reported.
+    #[test]
+    fn several_devices_in_a_row_each_reach_the_sink() {
+        let _alone = Alone::new();
+        set_sink(record_add, record_remove_found);
+        for name in ["sde", "sdf", "sdg"] {
+            assert!(add(disk(name)));
+        }
+        assert_eq!(ADDED.load(Ordering::SeqCst), 3);
+    }
+
+    /// The hole is a pair of plain `fn` pointers so the static can be built
+    /// in `const` with nothing allocated: pin that it is still `None` before
+    /// anyone installs anything, which is what makes `sink_installed` a
+    /// usable question for a driver deciding whether to build a device at
+    /// all.
+    #[test]
+    fn the_hole_starts_empty_and_asking_does_not_fill_it() {
+        let _alone = Alone::new();
+        assert!(!sink_installed());
+        assert!(!sink_installed());
+    }
+}

@@ -1146,3 +1146,9 @@ extern "C" fn eclipse_rm_exec_submit_signaled(
     }
     NV_OK
 }
+
+/// The double's own invariants: a fake that silently stops refusing makes
+/// every suite above it pass while asserting nothing. Its own file because
+/// this one is already the RM's whole surface.
+#[cfg(test)]
+mod double_tests;
