@@ -1861,6 +1861,55 @@ impl Stdin {
         }
     }
 
+    /// Park `waker` on this terminal's event bus for the next readiness
+    /// transition (see `FileLike::subscribe_readiness`; reached through
+    /// `File`'s inode downcast).
+    ///
+    /// **This is what lets a `poll(stdin)` stop re-scanning at 250 Hz.** A
+    /// terminal reported "not subscribable", so a shell parked in
+    /// `poll(stdin)`/`select` kept the 4 ms backstop for the life of the wait
+    /// -- and every one of those re-scans calls `io_wait_tick`, i.e. a burst of
+    /// xHCI MMIO. Measured on an idle machine: 244 of the 353 wakeups a second
+    /// were exactly this, ~19,5 % of a host core with nothing happening. Ptys
+    /// and pipes have carried a real waker all along; a VT had not.
+    ///
+    /// Safe to gate the long backstop on, because the wake does not depend on
+    /// this bus alone. Input reaches a terminal by three paths and this adds a
+    /// fourth: `push` sets `READABLE` on the bus (here), or, if the bus lock is
+    /// contended, defers it to `data_ready` and fires the TTY interrupt list --
+    /// which a terminal wait is always registered on too (`watch_interactive`).
+    /// And the ~125 Hz background xHCI poll on the timekeeper CPU keeps running
+    /// whatever any waiter does, so a keystroke is seen within ~8 ms even if
+    /// every poller in the system has backed off.
+    ///
+    /// `flush_ready_flag` first, and that is not a detail: a byte that `push`
+    /// left in `data_ready` without reaching the bus would otherwise not be
+    /// pending AT subscribe time, the waker would be stored instead of fired,
+    /// and the reader would sleep out the whole backstop on data it already
+    /// had.
+    pub fn subscribe_readiness(
+        &self,
+        events: crate::fs::PollEvents,
+        waker: &core::task::Waker,
+    ) -> crate::sync::ReadinessSub {
+        self.flush_ready_flag();
+        let mask = crate::fs::poll_events_to_bus_mask(events);
+        match crate::sync::subscribe_waker(&mut self.eventbus.lock(), mask, waker) {
+            // The bus is a field of this `Stdin`, not an `Arc` of its own, so
+            // the unsubscribe handle cannot hold it. It holds the VT number
+            // instead and goes back through `vt_stdin`: the table is static and
+            // a VT's `Stdin` outlives every wait on it, so the lookup always
+            // finds the same bus this subscription went on.
+            Some(id) => {
+                let vt = self.vt;
+                crate::sync::ReadinessSub::new(Box::new(move || {
+                    vt_stdin(vt).eventbus.lock().unsubscribe(id);
+                }))
+            }
+            None => crate::sync::ReadinessSub::noop(),
+        }
+    }
+
     /// pop a byte from the Stdin buffer
     pub fn pop(&self) -> u8 {
         self.flush_ready_flag();
@@ -3908,3 +3957,6 @@ mod stdout_node_tests {
         assert_eq!(out.read_at(0, &mut buf), Err(FsError::NotSupported));
     }
 }
+
+#[cfg(test)]
+mod terminal_readiness_tests;
