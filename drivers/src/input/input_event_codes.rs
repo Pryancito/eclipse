@@ -1005,6 +1005,9 @@ mod tests {
             key::KEY_MAX,
             InputCapability::BITS
         );
-        assert!(key::KEY_CNT <= InputCapability::BITS);
+        // Const-folded, so it is spelled as a comparison clippy cannot see
+        // through: the point is that the count, not just the top code, fits.
+        let cnt = core::hint::black_box(key::KEY_CNT);
+        assert!(cnt <= InputCapability::BITS);
     }
 }

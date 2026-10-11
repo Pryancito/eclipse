@@ -1105,9 +1105,14 @@ mod tests {
         BareDrm::new().nouveau_release_process(9999);
     }
 
-    /// `get_connector_edid` is `None` and not a zeroed array: 128 zero bytes
-    /// are a *valid-looking* EDID block with a bad checksum, which the mode
-    /// parser would try to read.
+    /// `get_connector_edid` is `None` and not a zeroed array. The difference
+    /// matters because the caller's only question is "is there EDID data":
+    /// `None` says there is none, while a zeroed block says there is, and
+    /// `display::edid::block_valid` then has to be the thing that rejects it
+    /// (it does, on the mandatory `00 ff ff ff ff ff ff 00` header -- the
+    /// checksum alone would NOT catch it, since 128 zero bytes sum to zero).
+    /// A driver that answered zeros would be relying on that check instead of
+    /// saying what it knows.
     #[test]
     fn a_connector_with_no_edid_answers_none_rather_than_zeros() {
         assert!(BareDrm::new().get_connector_edid(0).is_none());
@@ -1115,10 +1120,22 @@ mod tests {
 
     /// The descriptor structs cross the ioctl boundary by value; they must
     /// stay `Copy` and keep their fields through a copy.
+    ///
+    /// The assignments below would compile as *moves* if `Copy` were dropped,
+    /// so each type is named to a function that demands `Copy`: that is what
+    /// actually fails the build if the derive goes away.
     #[test]
     fn the_descriptor_structs_survive_a_copy() {
+        fn requires_copy<T: Copy>() {}
+        requires_copy::<DrmCaps>();
+        requires_copy::<DrmConnector>();
+        requires_copy::<DrmCrtc>();
+        requires_copy::<DrmPlane>();
+
         let caps = BareDrm::new().get_caps();
         let copy = caps;
+        // And the original is still usable, which a move would forbid.
+        assert_eq!(caps.max_width, copy.max_width);
         assert_eq!((copy.max_width, copy.max_height), (1920, 1080));
         assert!(!copy.has_3d && !copy.has_cursor);
 

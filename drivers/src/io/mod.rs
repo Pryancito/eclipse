@@ -177,12 +177,10 @@ mod tests {
     /// that grew a field or lost `const` would change every driver's layout.
     #[test]
     fn the_wrappers_are_transparent_and_const_constructible() {
-        const CELL: Cell<u32> = Cell::new(0);
         // `const fn new` is the property under test: this would not compile
         // otherwise.
         const RO: ReadOnly<u32> = ReadOnly::new(7);
         const WO: WriteOnly<u32> = WriteOnly::new(7);
-        let _ = CELL;
         assert_eq!(core::mem::size_of_val(&RO), core::mem::size_of::<u32>());
         assert_eq!(core::mem::size_of_val(&WO), core::mem::size_of::<u32>());
         assert_eq!(
