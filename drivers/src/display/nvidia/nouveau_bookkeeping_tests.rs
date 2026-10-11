@@ -239,8 +239,8 @@ fn a_vram_gem_reads_as_vram_and_a_gart_one_as_sysmem() {
     let gart = object(&gpu, A, MIB, Some(0x8000_0000));
     let vram = vram_object(&gpu, A, MIB);
 
-    assert_eq!(gpu.gem_aperture(gart), GemAperture::Sysmem);
-    assert_eq!(gpu.gem_aperture(vram), GemAperture::Vram);
+    assert_eq!(gpu.gem_aperture(gart, A), GemAperture::Sysmem);
+    assert_eq!(gpu.gem_aperture(vram, A), GemAperture::Vram);
 }
 
 /// A handle the driver has never seen is `Unknown`, not `Vram`. Reading
@@ -254,7 +254,7 @@ fn a_handle_the_driver_never_made_is_unknown() {
     let real = object(&gpu, A, MIB, Some(0x8000_0000));
 
     assert_eq!(
-        gpu.gem_aperture(real.wrapping_add(0x1_0000)),
+        gpu.gem_aperture(real.wrapping_add(0x1_0000), A),
         GemAperture::Unknown
     );
 }

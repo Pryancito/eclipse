@@ -437,8 +437,9 @@ pub(crate) struct EmuGpu {
     nouveau_ready: AtomicBool,
     /// Driver-private GEM objects this GPU keeps in device memory, the way
     /// nouveau's VRAM-only `GEM_NEW` ones never enter the core's table nor
-    /// `gem_mmap` (no host address): what `gem_aperture` answers `Vram` for.
-    vram_objects: Vec<u32>,
+    /// `gem_mmap` (no host address): what `gem_aperture` answers `Vram` for,
+    /// `(handle, owner pid)`, owner 0 being nobody's in particular.
+    vram_objects: Vec<(u32, u64)>,
     calls: Mutex<GpuCalls>,
 }
 
@@ -471,7 +472,15 @@ impl EmuGpu {
     /// address, so no mapping anywhere the core looks, but an object all the
     /// same.
     pub(crate) fn with_vram_object(mut self, handle: u32) -> EmuGpu {
-        self.vram_objects.push(handle);
+        self.vram_objects.push((handle, 0));
+        self
+    }
+
+    /// [`with_vram_object`](Self::with_vram_object), but `pid`'s: another
+    /// process asking `gem_aperture` about it is told `Unknown`, the way the
+    /// NVIDIA driver answers for an object the asker may not touch.
+    pub(crate) fn with_vram_object_of(mut self, handle: u32, pid: u64) -> EmuGpu {
+        self.vram_objects.push((handle, pid));
         self
     }
 
@@ -573,8 +582,12 @@ impl DrmScheme for EmuGpu {
         self.nouveau_ready.load(Ordering::Relaxed)
     }
 
-    fn gem_aperture(&self, handle_id: u32) -> GemAperture {
-        if self.vram_objects.contains(&handle_id) {
+    fn gem_aperture(&self, handle_id: u32, pid: u64) -> GemAperture {
+        let mine = self
+            .vram_objects
+            .iter()
+            .any(|&(h, owner)| h == handle_id && (pid == 0 || owner == 0 || owner == pid));
+        if mine {
             GemAperture::Vram
         } else {
             GemAperture::Unknown
@@ -721,6 +734,11 @@ impl Drop for Gpu {
 }
 
 impl Gpu {
+    /// Whether `driver` is this GPU: what finds its node in `drm::gpu_nodes()`.
+    pub(crate) fn is_driver(&self, driver: &Arc<dyn DrmScheme>) -> bool {
+        Arc::ptr_eq(&self.driver, driver)
+    }
+
     /// The framebuffer ids the driver was asked to flip, in order. These are the
     /// DRIVER's ids, not the DRM core's.
     pub(crate) fn flips(&self) -> Vec<u32> {

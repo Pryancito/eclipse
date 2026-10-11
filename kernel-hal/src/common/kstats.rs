@@ -231,6 +231,27 @@ pub fn sched_stats() -> (u64, u64, u64) {
     (0, 0, 0)
 }
 
+/// `(stacks bounded, stacks poisoned whole, 4 KiB pages of stores saved)`.
+///
+/// `Executor::new` poisons the usable region of every coroutine stack it
+/// builds, and that is about 99,8 % of the cost of a preemption mid-poll. The
+/// bound asks the page table which pages were ever written and poisons only
+/// those (`stack_guard::dirty_depth`). These three numbers are the only way to
+/// tell, on a running machine, whether it is doing anything: a `whole` count
+/// that keeps climbing with `bounded` at zero means the hook is answering
+/// `None` — huge leaves over the kernel heap, or an architecture with no dirty
+/// bit — and the poison costs exactly what it always did.
+/// (libos has no scheduler of ours and reports zeros.)
+#[cfg(target_os = "none")]
+pub fn poison_bound_stats() -> (usize, usize, usize) {
+    executor::poison_bound_counts()
+}
+
+#[cfg(not(target_os = "none"))]
+pub fn poison_bound_stats() -> (usize, usize, usize) {
+    (0, 0, 0)
+}
+
 /// `(deadline timer enabled, wake-up preemption enabled)`.
 ///
 /// Both are boot switches (`TIMERDEADLINE=0` / `WAKEPREEMPT=0`). Reporting them

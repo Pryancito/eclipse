@@ -6,7 +6,7 @@
 
 use core::convert::TryFrom;
 use core::fmt::{Debug, Formatter, Result};
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use x86_64::structures::paging::page_table::PageTableFlags as PTF;
 
@@ -117,6 +117,22 @@ impl GenericPTE for X86PTE {
     fn is_leaf(&self) -> bool {
         PTF::from_bits_truncate(self.0).contains(PTF::HUGE_PAGE)
     }
+    /// The one format of the three whose hardware maintains this bit: the CPU
+    /// sets D on the first write through the entry and never clears it by
+    /// itself. Nothing in the kernel clears it either, which is what makes it
+    /// usable without a shootdown — clearing D without invalidating every
+    /// CPU's TLB would let an entry that already has D absorb a write, and the
+    /// page would read clean after being written.
+    ///
+    /// Only meaningful on a leaf; an intermediate table entry's bit 6 is
+    /// ignored by the walker. The one caller only ever asks about 4 KiB leaves.
+    fn dirty(&self) -> Option<bool> {
+        Some(PTF::from_bits_truncate(self.0).contains(PTF::DIRTY))
+    }
+
+    fn set_dirty(&mut self) {
+        self.0 |= PTF::DIRTY.bits();
+    }
 
     fn set_addr(&mut self, paddr: PhysAddr) {
         self.0 = (self.0 & !PHYS_ADDR_MASK) | (paddr as u64 & PHYS_ADDR_MASK);
@@ -138,7 +154,45 @@ impl GenericPTE for X86PTE {
         if cache_policy == CachePolicy::WriteCombining as u32 && pat_wc_ready() {
             bits |= if is_huge { 1 << 12 } else { 1 << 7 };
         }
-        self.0 = bits;
+        // The store is a read-modify-write, and an ATOMIC one, because the
+        // other writer of this `u64` is the CPU's own page-table walker.
+        //
+        // ACCESSED and DIRTY are the two bits the hardware maintains, and this
+        // entry has to come out of a flag rewrite with them still set: DIRTY
+        // is what `PageTableImpl::dirty_depth_from_top` reads to bound the
+        // scheduler's stack poison, and the stack quarantine rewrites the
+        // flags of a coroutine stack's usable region on every teardown and
+        // every reuse. Reporting a stack full of a previous occupant's frames
+        // as untouched is the one error the bound cannot afford.
+        //
+        // Reading `self.0`, OR-ing the bits in and storing would lose a D the
+        // CPU set in between -- and once the TLB entry that write used has D
+        // recorded, the hardware need not set it again, so the page would read
+        // clean for the rest of its life. A `compare_exchange` loop cannot:
+        // either it sees the CPU's D and carries it, or it lands first and the
+        // CPU's own update sets D afterwards.
+        //
+        // Carrying a stale D onto an entry that was just repointed can only
+        // over-report, which costs stores, and nothing else in the kernel
+        // reads either bit.
+        const HW: u64 = PTF::ACCESSED.bits() | PTF::DIRTY.bits();
+        // SAFETY: `X86PTE` is a `repr(transparent)` `u64`, so an `AtomicU64`
+        // describes the same object with the same layout; `&mut self` is
+        // exclusive as far as Rust is concerned, and the CPU -- which is the
+        // reason this has to be atomic at all -- is outside that model.
+        let cell = unsafe { &*(self as *mut Self as *const AtomicU64) };
+        let mut cur = cell.load(Ordering::Relaxed);
+        loop {
+            match cell.compare_exchange_weak(
+                cur,
+                bits | (cur & HW),
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(seen) => cur = seen,
+            }
+        }
     }
     fn set_table(&mut self, paddr: PhysAddr) {
         self.0 = (paddr as u64 & PHYS_ADDR_MASK)
