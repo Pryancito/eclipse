@@ -594,7 +594,8 @@ cfg_if! {
         /// never fault on a chain it is only recording. A coroutine starts with
         /// `rbp = 0` and an entry from userspace leaves a user-half `rbp`
         /// below every kernel frame, so either ends the walk.
-        #[cfg(not(feature = "mem-debug"))]
+        // No longer `cfg(not(mem-debug))`: the free ring is the memory-debug
+        // build's only caller, but `record_alloc_site` is every build's.
         #[inline(always)]
         fn caller_chain() -> [usize; free_ring::DEPTH] {
             const WINDOW: usize = 64 * 1024;
@@ -957,10 +958,115 @@ cfg_if! {
         const HEAP_PRESSURE_LEVELS: [usize; 4] = [60, 75, 85, 95];
         static HEAP_PRESSURE_REPORTED: AtomicUsize = AtomicUsize::new(0);
 
+        /// Live small blocks by allocating call site. Armed by the first
+        /// pressure report and not before: see [`alloc_sites`]. Until then
+        /// the alloc and free paths pay one relaxed load of
+        /// `HEAP_PRESSURE_REPORTED` -- a counter `note_heap_pressure` was
+        /// already reading on every allocation anyway.
+        static ALLOC_SITES: alloc_sites::Table = alloc_sites::Table::new();
+
+        /// Whether the site table is collecting. One load, shared with the
+        /// pressure check on the alloc path.
+        #[inline]
+        fn alloc_sites_armed() -> bool {
+            HEAP_PRESSURE_REPORTED.load(Ordering::Relaxed) > 0
+        }
+
+        /// Live sampled blocks per call site, heaviest first; the count of
+        /// samples that found no slot; and the scale each sample stands for.
+        pub fn heap_alloc_sites() -> ([alloc_sites::Row; alloc_sites::SITES], usize, usize) {
+            let (rows, missed) = ALLOC_SITES.rows();
+            (rows, missed, 1 << alloc_sites::SAMPLE_SHIFT)
+        }
+
+        /// The `[heap-pressure]` tail: who is holding the small blocks.
+        ///
+        /// Prints nothing on the first report, which is the one that arms the
+        /// table -- there is no sample yet, and a header over an empty list
+        /// reads like "nobody", which is the wrong answer. From the second
+        /// level on it names the sites that have been holding blocks since.
+        #[cold]
+        #[inline(never)]
+        fn report_alloc_sites() {
+            let (rows, missed, scale) = heap_alloc_sites();
+            if !rows.iter().any(|(live, _, _)| *live > 0) {
+                emit(format_args!(
+                    "[heap-pressure] holders by call site: no sampled block is live; \
+                     the next report names them\n"
+                ));
+                return;
+            }
+            emit(format_args!(
+                "[heap-pressure] live blocks by allocating call site \
+                 (1 in {} sampled, so x{}):\n",
+                scale, scale,
+            ));
+            for (live, bytes, frames) in rows {
+                if live == 0 {
+                    continue;
+                }
+                emit(format_args!(
+                    "[heap-pressure]   ~{:>6} KiB in ~{} blocks <-",
+                    (bytes * scale) >> 10,
+                    live * scale,
+                ));
+                for f in frames.iter() {
+                    if *f != 0 {
+                        emit(format_args!(" {}", kernel_hal::ksyms::Addr(*f as u64)));
+                    }
+                }
+                emit(format_args!("\n"));
+            }
+            if missed > 0 {
+                emit(format_args!(
+                    "[heap-pressure]   ({} samples found no slot: more than {} call sites)\n",
+                    missed,
+                    alloc_sites::SITES,
+                ));
+            }
+        }
+
+        /// Charge a sampled allocation to whoever asked for it.
+        #[cold]
+        #[inline(never)]
+        fn record_alloc_site(ptr: usize, sz: usize) {
+            let chain = caller_chain();
+            let mut frames = [0usize; alloc_sites::FRAMES];
+            // `caller_chain` starts at this function's own caller, which is
+            // always `alloc`; the useful end of the chain is the rest. And
+            // only words that are actually kernel code: the frame-pointer
+            // walk ends on whatever the last frame happens to hold, and a
+            // junk word printed as a call site is a junk key -- it would
+            // split one real site across several rows of the report.
+            let mut n = 0;
+            for v in chain.iter().skip(1) {
+                if n == frames.len() {
+                    break;
+                }
+                if kernel_hal::kaddr::is_kernel_text(*v as u64) {
+                    frames[n] = *v;
+                    n += 1;
+                }
+            }
+            if n == 0 {
+                return;
+            }
+            ALLOC_SITES.record(ptr, sz, frames);
+        }
+
         /// One compare on the alloc path; the report itself is `#[cold]`.
         #[inline]
-        fn note_heap_pressure(used: usize) {
+        fn note_heap_pressure(used: usize, ptr: usize, sz: usize) {
             let reported = HEAP_PRESSURE_REPORTED.load(Ordering::Relaxed);
+            // Not the big blocks: `BIG_TRACK` already names every one of
+            // those EXACTLY, and a sampled one here comes out multiplied by
+            // the sampling rate -- one executor stack sampled read as
+            // `~2686976 KiB`, which is three times the heap and the first
+            // row of the report. The table is for what the big-block table
+            // cannot reach.
+            if reported > 0 && sz < BIG_ALLOC_MIN && ALLOC_SITES.sampled() {
+                record_alloc_site(ptr, sz);
+            }
             if reported >= HEAP_PRESSURE_LEVELS.len() {
                 return;
             }
@@ -986,20 +1092,44 @@ cfg_if! {
                 used >> 20,
                 HEAP_TOTAL.load(Ordering::Relaxed) >> 20,
             ));
+            // Heaviest class FIRST. This report is read off a photograph of
+            // the screen, and the graphic console draws a line at a time: the
+            // one hardware capture of it caught the small classes and lost
+            // everything after them, so the rows that were worth the photo
+            // were the rows that never made it into frame. Ascending order
+            // puts the answer last for no reason -- the size classes are not
+            // a sequence anyone reads in order.
+            let mut rows = [(0usize, 0usize); HEAP_BUCKETS];
+            let mut counted = 0usize;
             for (i, count) in HEAP_LIVE.iter().enumerate() {
                 let live = count.load(Ordering::Relaxed);
                 let size = 1usize << i;
+                rows[i] = (live.saturating_mul(size), live);
+                counted = counted.saturating_add(rows[i].0);
+            }
+            rows.sort_unstable_by_key(|r| core::cmp::Reverse(r.0));
+            for (bytes, live) in rows {
                 // Only classes that could matter: a MiB or more if every
                 // block sat at the class bound.
-                if live > 0 && (live * size) >> 20 > 0 {
+                if live > 0 && bytes >> 20 > 0 {
                     emit(format_args!(
                         "[heap-pressure]   <={:>9}B x {:<8} (<= {} MiB)\n",
-                        size,
+                        bytes / live,
                         live,
-                        (live * size) >> 20,
+                        bytes >> 20,
                     ));
                 }
             }
+            // What the classes can account for, against what is in use. Each
+            // class is counted at its upper bound, so this is a ceiling: if
+            // it comes out BELOW the bytes in use, rows are missing from the
+            // screen and the heap is somewhere this report did not print.
+            emit(format_args!(
+                "[heap-pressure] the size classes account for at most {} MiB of the {} MiB in use\n",
+                counted >> 20,
+                used >> 20,
+            ));
+            report_alloc_sites();
             #[cfg(feature = "linux")]
             {
                 let (created, live, bytes) = linux_object::fs::memfd_stats();
@@ -1357,7 +1487,12 @@ cfg_if! {
         fn leak_trace_dump(size: usize, live: usize) {
             let mut rsp: usize;
             unsafe { core::arch::asm!("mov {}, rsp", out(reg) rsp) };
-            kernel_hal::console::serial_write_fmt_spin(format_args!(
+            // `emit`, not the serial writer alone. This fires while a leak is
+            // still growing, which is the moment it is worth catching -- and
+            // the machine it fires on is a desktop whose owner reads the
+            // screen and photographs it. Printed to serial only, every one of
+            // these traces has gone to a console nobody was looking at.
+            emit(format_args!(
                 "\n[leaktrace] {}B live={} stack-scan:",
                 size, live
             ));
@@ -1367,17 +1502,28 @@ cfg_if! {
             // with the image: `.text` starts at its first page and ends
             // around 5.7 MiB, so this both dropped real return addresses and
             // printed heap-shaped words as if they were code.
+            // Twelve, not the twenty-four this scanned when it printed bare
+            // addresses: a symbolised name is a dozen characters, and a row
+            // that wraps three times on the graphic console is unreadable in
+            // exactly the place this now prints.
             let mut printed = 0;
             let mut p = rsp;
-            while printed < 24 && p < rsp + 32 * 1024 {
+            while printed < 12 && p < rsp + 32 * 1024 {
                 let v = unsafe { core::ptr::read_volatile(p as *const usize) };
                 if kernel_hal::kaddr::is_kernel_text(v as u64) {
-                    kernel_hal::console::serial_write_fmt_spin(format_args!(" {:#x}", v));
+                    // Symbolised, as the big-block report already does. A
+                    // bare `0xffffff00001a2b3c` has to be resolved by hand
+                    // against the build that printed it, and the build that
+                    // printed it is a photograph.
+                    if printed > 0 && printed % 4 == 0 {
+                        emit(format_args!("\n[leaktrace]  "));
+                    }
+                    emit(format_args!(" {}", kernel_hal::ksyms::Addr(v as u64)));
                     printed += 1;
                 }
                 p += 8;
             }
-            kernel_hal::console::serial_write_fmt_spin(format_args!("\n"));
+            emit(format_args!("\n"));
         }
 
         /// (size, live-count) pairs for the exact-size tracker (0 = unused slot).
@@ -1617,7 +1763,7 @@ cfg_if! {
                     HEAP_LIVE[bucket_of(sz)].fetch_add(1, Ordering::Relaxed);
                     hot_track(sz, 1);
                     try_grow_heap(used);
-                    note_heap_pressure(used);
+                    note_heap_pressure(used, p as usize, sz);
                     if sz >= BIG_ALLOC_MIN {
                         track_big_alloc(p as usize, sz);
                     }
@@ -1674,6 +1820,13 @@ cfg_if! {
                 #[cfg(feature = "mem-debug")]
                 let to_buddy = true;
                 hot_track(sz, -1);
+                // Before the counters below, and whether or not the block
+                // reaches the buddy: a block the front cache keeps is still
+                // not live, and a site that is charged for it would be
+                // accused of holding memory it gave back.
+                if alloc_sites_armed() && ALLOC_SITES.tracks(ptr as usize) {
+                    ALLOC_SITES.forget(ptr as usize);
+                }
                 #[cfg(feature = "mem-debug")]
                 {
                     let cz = ptr.add(sz);
@@ -2242,6 +2395,312 @@ pub mod heap_regions {
     }
 }
 
+/// Who holds the SMALL blocks.
+///
+/// `BIG_TRACK` names the call site of every live block >= 2 MiB, and that is
+/// the half of the heap a size-class histogram could already explain. The
+/// half it cannot is the one that actually ends the machine: a report off
+/// hardware read `<=1024B x 132437` (129 MiB) and `<=512B x 83637` (40 MiB) --
+/// two hundred thousand live blocks of a uniform size, which is a leak or a
+/// cache with no ceiling, and the report said only how many, never who.
+///
+/// A call-chain walk per allocation is out of the question on this path. So
+/// nothing here runs until the heap crosses its first pressure level, and
+/// from then on one allocation in `1 << SAMPLE_SHIFT` records its chain. The
+/// sampled block's pointer goes in a direct-mapped table so that its *free*
+/// can find the site again: what this prints is LIVE blocks per site, not
+/// allocations, and that distinction is the whole point -- a cache that
+/// allocates a million blocks and frees them is not what is holding the heap.
+///
+/// Every count here is a sample scaled by `1 << SAMPLE_SHIFT` and is reported
+/// as such. Under a race on one direct-mapped slot a sample can be dropped,
+/// which loses a block from a site's count; the arithmetic is deliberately
+/// saturating so the error is always an UNDER-count. A diagnostic that
+/// over-reports sends the hunt somewhere there is nothing to find.
+// Reached only from the allocator, which is `cfg(not(libos))`; the host test
+// suite builds libos and drives the pure logic below directly.
+#[cfg_attr(feature = "libos", allow(dead_code))]
+pub mod alloc_sites {
+    use core::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Distinct call sites held at once. Beyond this a site is counted in
+    /// `missed` rather than silently dropped: a report that quietly omits the
+    /// leaker is worse than one that says it ran out of room.
+    pub const SITES: usize = 24;
+    /// Return addresses kept per site. Four is one screen line symbolised and
+    /// enough to tell two callers of the same `Vec::push` apart.
+    pub const FRAMES: usize = 4;
+    /// One allocation in 1024 is sampled. At the 132k live blocks that
+    /// prompted this, that is ~130 tracked blocks per leaking site: plenty to
+    /// name it, and a thousandth of the cost of tracking them all.
+    pub const SAMPLE_SHIFT: u32 = 10;
+    /// Sampled blocks tracked at once, direct-mapped by pointer. A power of
+    /// two: [`slot_of`] takes the top bits of a multiply.
+    pub const SAMPLES: usize = 4096;
+    const _: () = assert!(SAMPLES.is_power_of_two());
+
+    /// `site_of` while one CPU is changing a slot. Not a value `record` can
+    /// leave behind: a site index plus one is at most `SITES`.
+    const BUSY: usize = usize::MAX;
+
+    pub struct Site {
+        /// Hash of the call chain; 0 marks a free slot.
+        key: AtomicUsize,
+        live: AtomicUsize,
+        bytes: AtomicUsize,
+        frames: [AtomicUsize; FRAMES],
+    }
+
+    impl Site {
+        const fn new() -> Self {
+            Site {
+                key: AtomicUsize::new(0),
+                live: AtomicUsize::new(0),
+                bytes: AtomicUsize::new(0),
+                frames: [const { AtomicUsize::new(0) }; FRAMES],
+            }
+        }
+    }
+
+    /// One row of [`Table::rows`]: live sampled blocks, their bytes, and the
+    /// call chain that asked for them.
+    pub type Row = (usize, usize, [usize; FRAMES]);
+
+    pub struct Table {
+        sites: [Site; SITES],
+        /// The sampled block at this slot, or 0.
+        ptr: [AtomicUsize; SAMPLES],
+        /// Its site index plus one; 0 means the slot is empty, and
+        /// [`BUSY`] means another CPU is mid-change (see [`Table::seize`]).
+        site_of: [AtomicUsize; SAMPLES],
+        /// Its size, so a free can subtract exactly what the alloc added.
+        size_of: [AtomicUsize; SAMPLES],
+        /// Samples dropped for want of a site slot.
+        missed: AtomicUsize,
+        seq: AtomicUsize,
+    }
+
+    impl Table {
+        pub const fn new() -> Self {
+            Table {
+                sites: [const { Site::new() }; SITES],
+                ptr: [const { AtomicUsize::new(0) }; SAMPLES],
+                site_of: [const { AtomicUsize::new(0) }; SAMPLES],
+                size_of: [const { AtomicUsize::new(0) }; SAMPLES],
+                missed: AtomicUsize::new(0),
+                seq: AtomicUsize::new(0),
+            }
+        }
+
+        /// One allocation in `1 << SAMPLE_SHIFT`. The counter is the only
+        /// thing the alloc path pays once the table is armed.
+        #[inline]
+        pub fn sampled(&self) -> bool {
+            self.seq.fetch_add(1, Ordering::Relaxed) & ((1 << SAMPLE_SHIFT) - 1) == 0
+        }
+
+        /// Whether `ptr` is one of the sampled blocks. One load and a compare:
+        /// this is what the free path pays.
+        #[inline]
+        pub fn tracks(&self, ptr: usize) -> bool {
+            ptr != 0 && self.ptr[slot_of(ptr)].load(Ordering::Relaxed) == ptr
+        }
+
+        /// Charge `ptr` (`size` bytes, allocated from `frames`) to its site.
+        pub fn record(&self, ptr: usize, size: usize, frames: [usize; FRAMES]) {
+            if ptr == 0 {
+                return;
+            }
+            let Some(si) = self.claim(key_of(&frames), &frames) else {
+                self.missed.fetch_add(1, Ordering::Relaxed);
+                return;
+            };
+            let s = slot_of(ptr);
+            let Some(prev) = self.seize(s) else {
+                self.missed.fetch_add(1, Ordering::Relaxed);
+                return;
+            };
+            // Under the slot's own lock. Without it two allocations landing
+            // on one slot both found it empty, both charged their site, and
+            // only the last pointer stayed findable -- so the other charge
+            // could never be released and the row grew for ever. A slot's
+            // contents (pointer, site, size) change together or not at all.
+            self.ptr[s].store(0, Ordering::Relaxed);
+            if prev != 0 {
+                // Whatever was here loses its tracking, so give its site the
+                // block back: an untracked free can no longer find it.
+                self.give_back(prev, self.size_of[s].load(Ordering::Relaxed));
+            }
+            self.size_of[s].store(size, Ordering::Relaxed);
+            self.sites[si].live.fetch_add(1, Ordering::Relaxed);
+            self.sites[si].bytes.fetch_add(size, Ordering::Relaxed);
+            // Published before the slot is let go, so a free that sees the
+            // pointer sees a slot whose site and size are already written.
+            self.ptr[s].store(ptr, Ordering::Release);
+            self.release(s, si + 1);
+        }
+
+        /// Undo the charge for `ptr`, if it was one of the sampled blocks.
+        /// Returns whether anything was found.
+        pub fn forget(&self, ptr: usize) -> bool {
+            if ptr == 0 {
+                return false;
+            }
+            let s = slot_of(ptr);
+            if self.ptr[s].load(Ordering::Acquire) != ptr {
+                return false;
+            }
+            let Some(prev) = self.seize(s) else {
+                return false;
+            };
+            // Asked AGAIN under the lock: between the load above and the
+            // lock a `record` can have replaced this slot, and subtracting
+            // then charges the free of one block to the site of another.
+            if prev == 0 || self.ptr[s].load(Ordering::Relaxed) != ptr {
+                self.release(s, prev);
+                return false;
+            }
+            self.ptr[s].store(0, Ordering::Relaxed);
+            let size = self.size_of[s].load(Ordering::Relaxed);
+            self.release(s, 0);
+            self.give_back(prev, size);
+            true
+        }
+
+        /// Take slot `s` for this CPU, returning what it held. `None` means
+        /// another CPU holds it: the sample is dropped rather than waited
+        /// for -- this runs inside `alloc`, where there is nothing to wait
+        /// with, and a dropped sample is an under-count, which is the error
+        /// this table is allowed to make.
+        fn seize(&self, s: usize) -> Option<usize> {
+            match self.site_of[s].swap(BUSY, Ordering::AcqRel) {
+                BUSY => None,
+                prev => Some(prev),
+            }
+        }
+
+        /// Let slot `s` go, leaving `val` in it (0 for empty).
+        fn release(&self, s: usize, val: usize) {
+            self.site_of[s].store(val, Ordering::Release);
+        }
+
+        /// Give one block of `size` back to the site `prev - 1` names.
+        fn give_back(&self, prev: usize, size: usize) {
+            let site = &self.sites[prev - 1];
+            sub(&site.live, 1);
+            sub(&site.bytes, size);
+        }
+
+        /// The slot holding `key`, claiming a free one if it is new.
+        ///
+        /// A full table is NOT the end of it. The sites that fill this first
+        /// are the busy ones, and busy is not the same as holding: on an idle
+        /// boot the table filled with churn in seconds and then counted every
+        /// later sample as missed, which is exactly how a leak that starts
+        /// ten minutes in would be locked out of its own report. So a site
+        /// with nothing live left is not a site any more, and its slot goes
+        /// to whoever turns up next. The scan for one only runs when the
+        /// table is full, which is already the cold path.
+        fn claim(&self, key: usize, frames: &[usize; FRAMES]) -> Option<usize> {
+            let mut dead = None;
+            for (i, site) in self.sites.iter().enumerate() {
+                let cur = site.key.load(Ordering::Relaxed);
+                if cur == key {
+                    return Some(i);
+                }
+                if cur != 0 {
+                    if dead.is_none() && site.live.load(Ordering::Relaxed) == 0 {
+                        dead = Some((i, cur));
+                    }
+                    continue;
+                }
+                match site
+                    .key
+                    .compare_exchange(0, key, Ordering::AcqRel, Ordering::Relaxed)
+                {
+                    Ok(_) => return Some(self.adopt(i, frames)),
+                    Err(racer) if racer == key => return Some(i),
+                    Err(_) => continue,
+                }
+            }
+            // Take the dead slot, but only if it is still the same dead site:
+            // anything else and this sample is better lost than charged to
+            // whoever claimed it in between.
+            let (i, was) = dead?;
+            let site = &self.sites[i];
+            if site.live.load(Ordering::Relaxed) != 0 {
+                return None;
+            }
+            site.key
+                .compare_exchange(was, key, Ordering::AcqRel, Ordering::Relaxed)
+                .ok()
+                .map(|_| self.adopt(i, frames))
+        }
+
+        /// Start slot `i` on `frames` from zero.
+        fn adopt(&self, i: usize, frames: &[usize; FRAMES]) -> usize {
+            let site = &self.sites[i];
+            site.bytes.store(0, Ordering::Relaxed);
+            for (slot, f) in site.frames.iter().zip(frames) {
+                slot.store(*f, Ordering::Relaxed);
+            }
+            i
+        }
+
+        /// Live sampled blocks per site, heaviest first, and the samples that
+        /// found no slot. Allocates nothing: this runs from the pressure
+        /// report, inside `alloc`.
+        pub fn rows(&self) -> ([Row; SITES], usize) {
+            let mut out = [(0usize, 0usize, [0usize; FRAMES]); SITES];
+            for (o, site) in out.iter_mut().zip(self.sites.iter()) {
+                if site.key.load(Ordering::Relaxed) == 0 {
+                    continue;
+                }
+                o.0 = site.live.load(Ordering::Relaxed);
+                o.1 = site.bytes.load(Ordering::Relaxed);
+                for (f, slot) in o.2.iter_mut().zip(site.frames.iter()) {
+                    *f = slot.load(Ordering::Relaxed);
+                }
+            }
+            out.sort_unstable_by_key(|r| core::cmp::Reverse(r.1));
+            (out, self.missed.load(Ordering::Relaxed))
+        }
+    }
+
+    /// Saturating, because a dropped sample must cost a site a block rather
+    /// than wrap its counter to `usize::MAX` and put a nonsense row at the
+    /// top of the report.
+    fn sub(v: &AtomicUsize, by: usize) {
+        let _ = v.try_update(Ordering::Relaxed, Ordering::Relaxed, |x| {
+            Some(x.saturating_sub(by))
+        });
+    }
+
+    /// Which direct-mapped slot tracks `ptr`.
+    ///
+    /// Taking the low bits of the address would be worst exactly where this
+    /// table is pointed: the buddy hands out power-of-two blocks at their own
+    /// alignment, so with `(ptr >> 4) % SAMPLES` the 1 KiB class could reach
+    /// 64 of the 4096 slots and anything 64 KiB-aligned reached ONE. The
+    /// table would evict itself long before it was full. Fibonacci hashing
+    /// instead: multiply and take the top bits, so every bit of the address
+    /// reaches the index.
+    pub fn slot_of(ptr: usize) -> usize {
+        const GOLDEN: usize = 0x9e37_79b9_7f4a_7c15;
+        ptr.wrapping_mul(GOLDEN) >> (usize::BITS - SAMPLES.trailing_zeros())
+    }
+
+    /// FNV-1a over the chain, never 0 (0 means "free slot").
+    pub fn key_of(frames: &[usize; FRAMES]) -> usize {
+        let mut h: usize = 0xcbf2_9ce4_8422_2325;
+        for f in frames {
+            h ^= *f;
+            h = h.wrapping_mul(0x1000_0000_01b3);
+        }
+        h | 1
+    }
+}
+
 /// The front cache's free lists, kept apart from the lock and the statics so
 /// the host can test them over an ordinary buffer.
 ///
@@ -2588,6 +3047,10 @@ pub mod free_ring {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "memory/alloc_site_tests.rs"]
+mod alloc_site_tests;
 
 #[cfg(test)]
 mod heap_region_tests {

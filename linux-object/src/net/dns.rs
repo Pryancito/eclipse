@@ -389,11 +389,27 @@ fn udp_exchange(
     }
     let handle = set.add(socket);
     drop(set);
+    // The socket is already IN the set, so an early return here does not drop
+    // it -- it strands it, with its two 512-byte buffers and its metadata
+    // vectors, for the rest of the uptime. Both of these fail for ordinary
+    // reasons (a local port already taken, no route yet), and after
+    // `MAX_SMOLTCIP_SOCKETS` of them the set is full of sockets nobody owns
+    // and every later resolution answers ENOMEM: DNS stops, permanently, and
+    // nothing says why. So the handle is removed on the way out, as it
+    // already is on both of the paths below.
     {
         let mut set = sockets.lock();
         let mut sock = set.get::<UdpSocket>(handle);
-        sock.bind(local).map_err(|_| LxError::EINVAL)?;
-        sock.send_slice(query, remote).map_err(|_| LxError::EIO)?;
+        let started = sock
+            .bind(local)
+            .map_err(|_| LxError::EINVAL)
+            .and_then(|_| sock.send_slice(query, remote).map_err(|_| LxError::EIO));
+        if let Err(e) = started {
+            drop(sock);
+            drop(set);
+            sockets.lock().remove(handle);
+            return Err(e);
+        }
     }
 
     let mut buf = [0u8; 512];

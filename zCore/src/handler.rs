@@ -581,6 +581,46 @@ impl KernelHandler for ZcoreKernelHandler {
                 );
             }
         }
+        // WHO holds the SMALL blocks. The histogram above says "132437 live
+        // blocks of <= 1 KiB"; this says which code asked for them, which is
+        // the question a leak hunt actually has and the one the big-block
+        // table (>= 2 MiB) cannot reach. Sampled, and collecting only once
+        // the heap has crossed its first pressure level -- before that it is
+        // empty on purpose and says so.
+        let (sites, missed, scale) = memory::heap_alloc_sites();
+        if sites.iter().any(|(live, _, _)| *live > 0) {
+            let _ = writeln!(
+                s,
+                "live blocks by allocating call site (1 in {} sampled, so x{}):",
+                scale, scale
+            );
+            for (live, bytes, frames) in sites {
+                if live == 0 {
+                    continue;
+                }
+                let _ = write!(
+                    s,
+                    "  ~{:>6} KiB in ~{} blocks <-",
+                    (bytes * scale) >> 10,
+                    live * scale
+                );
+                for f in frames.iter() {
+                    if *f != 0 {
+                        let _ = write!(s, " {}", kernel_hal::ksyms::Addr(*f as u64));
+                    }
+                }
+                let _ = writeln!(s);
+            }
+            if missed > 0 {
+                let _ = writeln!(s, "  ({} samples found no slot)", missed);
+            }
+        } else {
+            let _ = writeln!(
+                s,
+                "call sites: no sampled block is live (sampling arms at the first \
+                 heap-pressure level)"
+            );
+        }
         let _ = writeln!(s, "hot exact sizes:");
         for (size, live) in memory::heap_hot_sizes() {
             if size != 0 && live > 0 {
