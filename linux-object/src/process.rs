@@ -3296,6 +3296,31 @@ impl LinuxProcess {
             .map(|meta| meta.gid)
             .unwrap_or(creds.fsgid as _);
         let mut final_mode = mode & MODE_PERM_MASK;
+        // `mode_strip_sgid()` (`fs/inode.c`), which `vfs_prepare_mode` runs
+        // BEFORE applying each path's permission mask, so it reaches every
+        // creating path whatever mask that path asks for. A new
+        // NON-directory that asks for set-group-ID and group-execute at once
+        // loses `S_ISGID` unless its creator acts as the group the file is
+        // landing in.
+        //
+        // What that stops: the gid of a new file inside a set-group-ID
+        // directory comes from the DIRECTORY and not from its creator (just
+        // above), so without this a caller who is not in that group can say
+        // `open(path, O_CREAT, 0o2755)` there and get a set-group-ID
+        // executable owned BY the group -- and [`Self::apply_exec_ids`]
+        // honours `S_ISGID`, so running it is holding the group.
+        //
+        // Directories are exempt, as they are in Linux (`S_ISDIR` returns
+        // early): on a directory `S_ISGID` is the inheritance below, which is
+        // a rule about where new files land and not a privilege the caller is
+        // asking to be given.
+        if !is_dir
+            && (final_mode & (MODE_SET_GID | MODE_EXEC_GRP)) == (MODE_SET_GID | MODE_EXEC_GRP)
+            && creds.fsuid != ROOT_UID
+            && !Self::acts_as_group(&creds, metadata.gid as u32, true)
+        {
+            final_mode &= !MODE_SET_GID;
+        }
         if let Some(parent) = parent_metadata {
             if (parent.mode & MODE_SET_GID) != 0 && is_dir {
                 final_mode |= MODE_SET_GID;
