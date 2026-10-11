@@ -331,7 +331,10 @@ mod tests {
     //! byte that the old shape lost: it read the input first and found out
     //! afterwards how much of it the output could take.
 
-    use super::{splice_bytes, Spliced};
+    use super::{
+        splice_bytes, Spliced, SPLICE_FLAGS_ALL, SPLICE_F_GIFT, SPLICE_F_MORE, SPLICE_F_MOVE,
+        SPLICE_F_NONBLOCK,
+    };
     use alloc::string::String;
     use alloc::sync::Arc;
     use linux_object::error::{LxError, LxResult};
@@ -716,6 +719,60 @@ mod tests {
             splice(&f, Some(0), &a_r, None, 4, false).await.unwrap_err(),
             LxError::EBADF
         );
+    }
+
+    /// One byte is a whole splice, and it is not the end of the input.
+    ///
+    /// The read of a non-pipe input goes through a single check that tells
+    /// "the file is at its end" from "the file gave me something": get that
+    /// boundary wrong by one and a one-byte read answers 0 with the byte
+    /// still in the file -- which every caller reads as end of input and
+    /// stops on, so `cat`-shaped loops lose the tail of a file whose last
+    /// read is short.
+    #[async_std::test]
+    async fn one_byte_moves_and_is_not_the_end_of_the_input() {
+        let (_read_end, w, queue) = pipe(OpenFlags::empty());
+        let f = file(b"z");
+        assert_eq!(
+            splice(&f, None, &w, None, 1, true).await.unwrap(),
+            Spliced {
+                moved: 1,
+                off_in: None,
+                off_out: None,
+            }
+        );
+        assert_eq!(queued(&queue), b"z".to_vec());
+        // Now the file really is at its end: nothing moves, nothing is
+        // queued, and it is not an error.
+        assert_eq!(
+            splice(&f, None, &w, None, 16, true).await.unwrap(),
+            Spliced {
+                moved: 0,
+                off_in: None,
+                off_out: None,
+            }
+        );
+        assert_eq!(queued(&queue), b"z".to_vec());
+        assert_eq!(f.seek(SeekFrom::Current(0)).unwrap(), 1);
+    }
+
+    /// The flags are the numbers the uapi gives.
+    ///
+    /// Nothing else here reads them: validating a `flags` word needs
+    /// `sys_splice`, which needs a live process, so the whole module stayed
+    /// green with `SPLICE_F_MOVE` moved to 16 -- and then
+    /// `splice(.., SPLICE_F_MOVE)` from a real caller is an unknown bit and
+    /// `EINVAL`.
+    #[test]
+    fn the_splice_flags_are_the_numbers_the_uapi_gives() {
+        // `include/uapi/linux/fcntl.h`.
+        assert_eq!(SPLICE_F_MOVE, 0x01);
+        assert_eq!(SPLICE_F_NONBLOCK, 0x02);
+        assert_eq!(SPLICE_F_MORE, 0x04);
+        assert_eq!(SPLICE_F_GIFT, 0x08);
+        // The mask is those four and nothing else: it is what tells a flag
+        // this kernel does not know from one it is right to ignore.
+        assert_eq!(SPLICE_FLAGS_ALL, 0x0f);
     }
 }
 

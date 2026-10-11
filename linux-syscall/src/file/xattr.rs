@@ -201,6 +201,41 @@ mod xattr_tests {
             Err(LxError::EOPNOTSUPP)
         );
     }
+
+    /// The two limits are the numbers the uapi gives, and not whatever this
+    /// file happens to say they are.
+    ///
+    /// Both tests above are written in terms of the constants
+    /// (`"u".repeat(XATTR_NAME_MAX)`, `set(XATTR_SIZE_MAX + 1)`), so they
+    /// hold for any value at all: 255 changed to 256, or 65536 to 65535,
+    /// left the whole module green. The numbers are part of the ABI --
+    /// userspace sizes its own buffers by them -- so they are pinned here by
+    /// number, and the boundary is counted out by hand rather than named.
+    #[test]
+    fn the_two_limits_are_the_numbers_the_uapi_gives() {
+        // `include/uapi/linux/limits.h`.
+        assert_eq!(XATTR_NAME_MAX, 255);
+        assert_eq!(XATTR_SIZE_MAX, 65536);
+        // `XATTR_CREATE | XATTR_REPLACE`, the only two `setxattr` knows.
+        assert_eq!(XATTR_FLAGS_KNOWN, 0b11);
+
+        // The name's edge: 255 characters is a name, 256 is not.
+        let name_255 = "u".repeat(255);
+        let name_256 = "u".repeat(256);
+        assert_eq!(xattr_precheck(XattrOp::Get, Some(&name_255)), Ok(()));
+        assert_eq!(
+            xattr_precheck(XattrOp::Get, Some(&name_256)).err(),
+            Some(LxError::ERANGE)
+        );
+
+        // And the value's: 65536 bytes is a value, 65537 is `E2BIG`.
+        let set = |size| XattrOp::Set { size, flags: 0 };
+        assert_eq!(xattr_precheck(set(65536), Some("user.a")), Ok(()));
+        assert_eq!(
+            xattr_precheck(set(65537), Some("user.a")).err(),
+            Some(LxError::E2BIG)
+        );
+    }
 }
 
 #[cfg(test)]

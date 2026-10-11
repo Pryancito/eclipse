@@ -95,7 +95,7 @@ impl Syscall<'_> {
             return Err(LxError::EEXIST);
         }
         proc.check_access(&dir_metadata, 0o3, true)?;
-        let create_mode = proc.apply_umask(create_perm(mode));
+        let create_mode = proc.apply_umask(mkdir_perm(mode));
         let created = inode.create(file_name, FileType::Dir, create_mode as u32)?;
         proc.initialize_created_metadata(&created, Some(&dir_metadata), create_mode, true)?;
         linux_object::fs::dcache_invalidate();
@@ -816,10 +816,64 @@ mod dirent_collection_tests {
             Err(LxError::EIO)
         );
     }
+
+    /// An error that arrives after an entry was handed over is the next
+    /// call's answer, not this one's.
+    ///
+    /// `getdents64` does the same (`lastdirent = buf.current_dir; if
+    /// (lastdirent) ... error = count - buf.count;`), and the reason is that
+    /// `next_entry` has already moved the directory position past the names
+    /// it gave out: answering with the error throws those names away and
+    /// nothing can ask for them again, so `ls` and `find` silently miss a
+    /// run of entries whenever one of them will not resolve. The test above
+    /// covers the other half, where the very first entry fails and the error
+    /// is all there is to say.
+    #[test]
+    fn an_error_after_an_entry_waits_for_the_next_call() {
+        struct TwoThenBroken {
+            pos: usize,
+        }
+        impl DirEntries for TwoThenBroken {
+            fn next_entry(&mut self) -> LxResult<Option<(Metadata, String)>> {
+                if self.pos >= 2 {
+                    return Err(LxError::EIO);
+                }
+                self.pos += 1;
+                Ok(Some((entry(self.pos), String::from("name"))))
+            }
+            fn unread_entry(&mut self) {
+                self.pos -= 1;
+            }
+            fn position(&self) -> u64 {
+                self.pos as u64
+            }
+        }
+
+        let mut dir = TwoThenBroken { pos: 0 };
+        let mut names = Vec::new();
+        assert_eq!(
+            collect_dirents(&mut dir, |_, _, name| {
+                names.push(String::from(name));
+                true
+            }),
+            Ok(2),
+            "the two entries that were read are the answer"
+        );
+        assert_eq!(names.len(), 2);
+        // Nothing is pushed this time, so now the error is all there is.
+        assert_eq!(collect_dirents(&mut dir, |_, _, _| true), Err(LxError::EIO));
+    }
 }
 
 #[allow(dead_code)]
-#[repr(Rust, packed)] // Don't use 'C'. Or its size will align up to 8 bytes.
+// `C` for the field order the uapi fixes, `packed` for the size: `repr(C)`
+// alone aligns the struct to 8 and pads it to 24, which is what the note
+// this replaces was about, but `packed` takes the alignment to 1 and the
+// size back to the 19 bytes of `struct linux_dirent64`'s header. `repr(Rust)`
+// gave the same 19 bytes here and promises nothing about the order they come
+// in -- and the order is the ABI, since `getdents64` is the one place these
+// bytes leave the kernel.
+#[repr(C, packed)]
 pub struct LinuxDirent64 {
     /// Inode number
     ino: u64,
@@ -1000,12 +1054,43 @@ pub(crate) const FCHMODAT_FLAGS: usize =
 pub(crate) const UTIMENSAT_FLAGS: usize =
     AtFlags::SYMLINK_NOFOLLOW.bits() | AtFlags::EMPTY_PATH.bits();
 
-/// Permission bits create syscalls keep (`vfs_mkdir` /
-/// `build_open_flags`: `mode &= S_IRWXUGO|S_ISVTX` / `S_IALLUGO`). Type
-/// bits in the argument (`S_IFDIR` / `S_IFREG` from a caller that reused
-/// `st_mode`) must not land in the inode's mode.
+/// Permission bits `mknod(2)` and `open(O_CREAT)` keep: `S_IALLUGO`, all
+/// twelve (`vfs_mknod`'s `vfs_prepare_mode(.., mode, mode)` keeps whatever
+/// permission bits it is given, and `build_open_flags` masks with
+/// `S_IALLUGO`). Type bits in the argument (`S_IFDIR` / `S_IFREG` from a
+/// caller that reused `st_mode`) must not land in the inode's mode.
+///
+/// `mkdir(2)` keeps fewer: see [`mkdir_perm`].
 pub(crate) fn create_perm(mode: usize) -> u16 {
     (mode & 0o7777) as u16
+}
+
+/// Permission bits `mkdir(2)` keeps: `S_IRWXUGO|S_ISVTX`, which is
+/// `0o1777` -- the nine of `rwx` and the sticky bit, and **not** the two
+/// set-id bits.
+///
+/// `vfs_mkdir` asks for that mask by name
+/// (`vfs_prepare_mode(idmap, dir, mode, S_IRWXUGO | S_ISVTX, 0)`), while
+/// `vfs_mknod` and `vfs_create` ask for `S_IALLUGO`; this used the second
+/// mask for all three. So `mkdir(path, 0o2775)` made a **set-group-ID
+/// directory**, where Linux makes an ordinary `0o775` one.
+///
+/// That is not a cosmetic difference: the set-group-ID bit on a directory is
+/// what makes everything created inside it take the directory's group
+/// instead of the creator's, for as deep as the tree goes. And
+/// `mkdir(path, st.st_mode)` is an ordinary thing for an archiver or an
+/// installer to write (`tar`, `cpio`, `rsync -p`, `install -d`), so a mode
+/// that came off a stat of a set-group-ID directory used to reproduce that
+/// bit on a fresh tree silently. `mkdir -m 2775` goes through `mkdir()` and
+/// then `chmod()` for exactly this reason: the set-id bits cannot arrive
+/// through `mkdir`.
+///
+/// Inheriting the bit from the parent is a different rule and stays as it
+/// was: `initialize_created_metadata` puts `S_ISGID` on a new directory
+/// whose parent has it, which is `inode_init_owner`'s job and not this
+/// mask's.
+pub(crate) fn mkdir_perm(mode: usize) -> u16 {
+    (mode & 0o1777) as u16
 }
 
 /// The file `dirfd` is open on, for a syscall given `AT_EMPTY_PATH` and an
@@ -1294,6 +1379,130 @@ mod rename_trap_tests {
         let (_root, _a, b, other) = a_tree();
         assert_eq!(is_same_or_below(&b, &other.metadata().unwrap()), Ok(false));
     }
+
+    /// A parent pointer that goes nowhere: `..` is always one more rung and
+    /// never the rung itself.
+    ///
+    /// This is the filesystem the walk's bound exists for, and it is built
+    /// without depth on purpose: a real 4096-deep tree of ramfs directories
+    /// overflows the stack when it is dropped.
+    struct Ladder {
+        rung: usize,
+        meta: Metadata,
+    }
+
+    impl INode for Ladder {
+        fn read_at(&self, _: usize, _: &mut [u8]) -> rcore_fs::vfs::Result<usize> {
+            Err(rcore_fs::vfs::FsError::NotSupported)
+        }
+        fn write_at(&self, _: usize, _: &[u8]) -> rcore_fs::vfs::Result<usize> {
+            Err(rcore_fs::vfs::FsError::NotSupported)
+        }
+        fn poll(&self) -> rcore_fs::vfs::Result<rcore_fs::vfs::PollStatus> {
+            Err(rcore_fs::vfs::FsError::NotSupported)
+        }
+        fn metadata(&self) -> rcore_fs::vfs::Result<Metadata> {
+            let mut meta = self.meta.clone();
+            meta.inode = self.rung;
+            Ok(meta)
+        }
+        fn find(&self, _name: &str) -> rcore_fs::vfs::Result<Arc<dyn INode>> {
+            Ok(Arc::new(Ladder {
+                rung: self.rung + 1,
+                meta: self.meta.clone(),
+            }))
+        }
+        fn as_any_ref(&self) -> &dyn core::any::Any {
+            self
+        }
+    }
+
+    /// The walk is bounded, and reaching the bound answers `ELOOP` and not
+    /// `false`.
+    ///
+    /// `false` is the answer that lets the rename through, so a bound that
+    /// gave up quietly would allow exactly the cycle this check exists to
+    /// refuse -- and only on the filesystem that is already broken, which is
+    /// the one nobody tries by hand.
+    #[test]
+    fn a_walk_that_never_reaches_a_fixed_point_is_eloop_and_not_a_no() {
+        let (root, a, _, _) = a_tree();
+        let ladder: Arc<dyn INode> = Arc::new(Ladder {
+            rung: 1,
+            meta: root.metadata().unwrap(),
+        });
+        // Rung 0 is nowhere on the ladder, which starts at 1 and climbs.
+        let mut nowhere = root.metadata().unwrap();
+        nowhere.inode = 0;
+        assert_eq!(
+            is_same_or_below(&ladder, &nowhere),
+            Err(LxError::ELOOP),
+            "the bound has to be an error, not a no"
+        );
+        // The same ladder still answers when the ancestor is on it, which is
+        // also what proves the walk climbs rather than standing still.
+        let mut rung_three = root.metadata().unwrap();
+        rung_three.inode = 3;
+        assert_eq!(is_same_or_below(&ladder, &rung_three), Ok(true));
+        // A real tree, for contrast, reaches its own root and says no.
+        assert_eq!(is_same_or_below(&root, &a.metadata().unwrap()), Ok(false));
+    }
+
+    /// A filesystem's own root: `..` is itself, which is where the walk of
+    /// any mounted filesystem stops.
+    struct Mounted {
+        meta: Metadata,
+    }
+
+    impl INode for Mounted {
+        fn read_at(&self, _: usize, _: &mut [u8]) -> rcore_fs::vfs::Result<usize> {
+            Err(rcore_fs::vfs::FsError::NotSupported)
+        }
+        fn write_at(&self, _: usize, _: &[u8]) -> rcore_fs::vfs::Result<usize> {
+            Err(rcore_fs::vfs::FsError::NotSupported)
+        }
+        fn poll(&self) -> rcore_fs::vfs::Result<rcore_fs::vfs::PollStatus> {
+            Err(rcore_fs::vfs::FsError::NotSupported)
+        }
+        fn metadata(&self) -> rcore_fs::vfs::Result<Metadata> {
+            Ok(self.meta.clone())
+        }
+        fn find(&self, _name: &str) -> rcore_fs::vfs::Result<Arc<dyn INode>> {
+            Ok(Arc::new(Mounted {
+                meta: self.meta.clone(),
+            }))
+        }
+        fn as_any_ref(&self) -> &dyn core::any::Any {
+            self
+        }
+    }
+
+    /// A directory is a device and an inode number, not an inode number.
+    ///
+    /// Inode numbers repeat across filesystems -- every root is numbered
+    /// from the same low end -- so the number alone makes two unrelated
+    /// directories look like one, and `true` here is the answer that refuses
+    /// the rename with `EINVAL`. The walk compares both halves; the tests
+    /// above never notice, because every inode of every ramfs reports
+    /// `dev: 0` and this one needs two devices.
+    #[test]
+    fn an_equal_inode_number_on_another_device_is_not_the_same_directory() {
+        let (root, _, _, _) = a_tree();
+        let mut here = root.metadata().unwrap();
+        here.dev = 7;
+        here.inode = 42;
+        let dir: Arc<dyn INode> = Arc::new(Mounted { meta: here.clone() });
+        // The same directory, both halves agreeing.
+        assert_eq!(is_same_or_below(&dir, &here), Ok(true));
+        // The same number, another filesystem: a different directory, and
+        // the walk reaches the root whose `..` is itself and says no.
+        let mut elsewhere = here.clone();
+        elsewhere.dev = 9;
+        assert_eq!(is_same_or_below(&dir, &elsewhere), Ok(false));
+        // And the other way round, in case only one side is read.
+        let other: Arc<dyn INode> = Arc::new(Mounted { meta: elsewhere });
+        assert_eq!(is_same_or_below(&other, &here), Ok(false));
+    }
 }
 
 /// Validate a renameat2 `flags` argument (renameat2(2)). Pure, so the flag
@@ -1340,6 +1549,24 @@ mod rename_flag_tests {
                 "{flags:#x}"
             );
         }
+    }
+
+    /// The numbers are `renameat2(2)`'s own, and userspace passes them by
+    /// number.
+    ///
+    /// Everything above is written in terms of the constants, so it holds
+    /// for any three distinct bits at all: `RENAME_WHITEOUT` moved onto
+    /// `RENAME_EXCHANGE`'s bit left the module green, because every answer
+    /// here is `EINVAL` either way. The numbers are the ABI, and the day one
+    /// of these is implemented the right one has to be.
+    #[test]
+    fn the_rename_flags_are_the_numbers_the_uapi_gives() {
+        // `include/uapi/linux/fs.h`.
+        assert_eq!(RENAME_NOREPLACE, 1);
+        assert_eq!(RENAME_EXCHANGE, 2);
+        assert_eq!(RENAME_WHITEOUT, 4);
+        // Which is also what makes `1 << 3` above an unknown bit.
+        assert_eq!(RENAME_NOREPLACE | RENAME_EXCHANGE | RENAME_WHITEOUT, 0b111);
     }
 }
 
@@ -1616,14 +1843,90 @@ mod at_flags_tests {
             Some(LxError::EINVAL)
         );
     }
+
+    /// The sweep above is one-sided: it checks that every bit *outside* a
+    /// mask is refused, and for `fchownat` and `fchmodat` nothing checked
+    /// that the bits inside one are taken. A mask that quietly lost a bit of
+    /// its own left every test here green while the syscall refused a flag
+    /// Linux accepts -- which is how `faccessat` and `utimensat` came to
+    /// answer `EINVAL` to `AT_EMPTY_PATH` in the first place.
+    #[test]
+    fn every_mask_accepts_each_bit_it_names() {
+        for (name, allowed) in [
+            ("fstatat", FSTATAT_FLAGS),
+            ("statx", STATX_FLAGS),
+            ("linkat", LINKAT_FLAGS),
+            ("fchownat", FCHOWNAT_FLAGS),
+            ("faccessat", FACCESSAT_FLAGS),
+            ("fchmodat", FCHMODAT_FLAGS),
+            ("utimensat", UTIMENSAT_FLAGS),
+        ] {
+            assert_ne!(allowed, 0, "{name} allows nothing at all");
+            for bit in 0..usize::BITS as usize {
+                let flag = 1usize << bit;
+                if allowed & flag == 0 {
+                    continue;
+                }
+                assert_eq!(
+                    at_flags(flag, allowed).err(),
+                    None,
+                    "{name} refused {flag:#x}, which it allows"
+                );
+            }
+            // And the whole set at once, which is what a caller that sends
+            // everything it is allowed to send looks like.
+            assert!(
+                at_flags(allowed, allowed).is_ok(),
+                "{} refused its own set {:#x}",
+                name,
+                allowed
+            );
+        }
+    }
+
+    /// The four masks the test above leaves unpinned, by number: each is what
+    /// its own kernel function compares against, so a bit added to or taken
+    /// out of one is a change in what that syscall accepts and not an
+    /// internal detail.
+    #[test]
+    fn the_remaining_masks_are_the_numbers_linux_uses() {
+        // `do_fchownat` (`fs/open.c`): `AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH`.
+        assert_eq!(FCHOWNAT_FLAGS, 0x100 | 0x1000);
+        // `do_faccessat` (`fs/open.c`), which also takes `AT_EACCESS`.
+        assert_eq!(FACCESSAT_FLAGS, 0x100 | 0x200 | 0x1000);
+        // `do_fchmodat` (`fs/open.c`), `fchmodat2(2)`'s set.
+        assert_eq!(FCHMODAT_FLAGS, 0x100 | 0x1000);
+        // `do_utimes_path` (`fs/utimes.c`).
+        assert_eq!(UTIMENSAT_FLAGS, 0x100 | 0x1000);
+    }
+
+    /// `fchownat` and `fchmodat` take `AT_SYMLINK_NOFOLLOW`, which is the
+    /// whole of `lchown(2)` and of `fchmodat(.., AT_SYMLINK_NOFOLLOW)`, and
+    /// they must still refuse `linkat`'s opposite bit.
+    #[test]
+    fn fchownat_and_fchmodat_take_symlink_nofollow_and_not_its_opposite() {
+        for (name, allowed) in [("fchownat", FCHOWNAT_FLAGS), ("fchmodat", FCHMODAT_FLAGS)] {
+            let parsed = at_flags(AtFlags::SYMLINK_NOFOLLOW.bits(), allowed)
+                .unwrap_or_else(|err| panic!("{} answered {:?}", name, err));
+            assert!(parsed.contains(AtFlags::SYMLINK_NOFOLLOW), "{}", name);
+            let parsed = at_flags(AtFlags::EMPTY_PATH.bits(), allowed).unwrap();
+            assert!(parsed.contains(AtFlags::EMPTY_PATH), "{}", name);
+            assert_eq!(
+                at_flags(AtFlags::SYMLINK_FOLLOW.bits(), allowed).err(),
+                Some(LxError::EINVAL),
+                "{name} took linkat's bit"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
 mod mkdir_perm_tests {
-    use super::create_perm;
+    use super::{create_perm, mkdir_perm};
 
-    /// Create syscalls keep only `S_IRWXUGO|S_ISVTX`. A caller that passes
-    /// `0o100644` / `0o40755` (with type bits) must not leave them in the mode.
+    /// `mknod(2)` and `open(O_CREAT)` keep all twelve permission bits
+    /// (`S_IALLUGO`). A caller that passes `0o100644` / `0o40755` (with type
+    /// bits) must not leave them in the mode.
     #[test]
     fn type_bits_are_stripped_before_umask() {
         assert_eq!(create_perm(0o755), 0o755);
@@ -1632,6 +1935,58 @@ mod mkdir_perm_tests {
         assert_eq!(create_perm(0o1777), 0o1777);
         assert_eq!(create_perm(0o41777), 0o1777);
         assert_eq!(create_perm(usize::MAX), 0o7777);
+    }
+
+    /// `mknod` and `open(O_CREAT)` are the two that may be asked for a
+    /// set-id file, and `vfs_mknod`/`vfs_create` hand the bits through.
+    #[test]
+    fn the_set_id_bits_reach_a_file_that_is_created_with_them() {
+        assert_eq!(create_perm(0o4755), 0o4755);
+        assert_eq!(create_perm(0o2755), 0o2755);
+        assert_eq!(create_perm(0o6755), 0o6755);
+        assert_eq!(create_perm(0o100_4755), 0o4755);
+    }
+
+    /// `mkdir` is the one that may not: `vfs_mkdir` masks with
+    /// `S_IRWXUGO|S_ISVTX`, so the two set-id bits never arrive through it.
+    /// They used to, and a set-group-ID directory changes the group of
+    /// everything created under it.
+    #[test]
+    fn mkdir_drops_the_set_id_bits_and_keeps_the_sticky_one() {
+        assert_eq!(mkdir_perm(0o2775), 0o775, "set-group-ID");
+        assert_eq!(mkdir_perm(0o4755), 0o755, "set-user-ID");
+        assert_eq!(mkdir_perm(0o6755), 0o755, "both");
+        // The sticky bit is in the mask Linux names, and `/tmp` is made with
+        // it: `mkdir -m 1777`.
+        assert_eq!(mkdir_perm(0o1777), 0o1777);
+        assert_eq!(
+            mkdir_perm(0o3777),
+            0o1777,
+            "sticky survives, set-gid does not"
+        );
+        assert_eq!(mkdir_perm(usize::MAX), 0o1777);
+    }
+
+    /// The type bits go the same way for both, since `mkdir(path, st.st_mode)`
+    /// off a stat is where the set-id bits came from in the first place.
+    #[test]
+    fn mkdir_strips_the_type_bits_too() {
+        assert_eq!(mkdir_perm(0o755), 0o755);
+        assert_eq!(mkdir_perm(0o40755), 0o755);
+        // `st_mode` of a set-group-ID directory, straight from a stat.
+        assert_eq!(mkdir_perm(0o42775), 0o775);
+    }
+
+    /// The two masks differ in exactly the two set-id bits and nowhere else:
+    /// a `mkdir` that lost the sticky bit or a `mknod` that gained a strip
+    /// would both be a regression, and they are each other's reference.
+    #[test]
+    fn the_two_masks_differ_only_in_the_set_id_bits() {
+        for mode in 0..0o10000usize {
+            let both = create_perm(mode) & 0o1777;
+            assert_eq!(mkdir_perm(mode), both, "{mode:#o}");
+        }
+        assert_eq!(create_perm(0o7777) & !mkdir_perm(0o7777), 0o6000);
     }
 }
 
@@ -1982,5 +2337,240 @@ mod benches {
                 "/usr/lib/gcc/x86_64-linux-gnu/13/include/stddef.h",
             )))
         });
+    }
+}
+
+#[cfg(test)]
+mod dirent_record_tests {
+    //! The bytes `getdents64` leaves in the caller's buffer.
+    //!
+    //! `collect_dirents` is tested above with a `push` that only counts
+    //! names, so nothing covered the one thing between it and userspace:
+    //! `DirentBufWriter::try_write` lays out a packed header and a name
+    //! through raw pointers, and glibc's `readdir` walks the answer by
+    //! `d_reclen` alone. A byte wrong in that field and every entry after the
+    //! first is read out of the middle of its predecessor.
+
+    use super::*;
+    use alloc::vec::Vec;
+
+    /// `struct linux_dirent64`'s header: `d_ino` 8 + `d_off` 8 +
+    /// `d_reclen` 2 + `d_type` 1, with no padding before `d_name`.
+    const HDR: usize = 19;
+
+    /// One record as userspace reads it back.
+    #[derive(Debug, PartialEq, Eq)]
+    struct Record {
+        ino: u64,
+        off: u64,
+        reclen: u16,
+        type_: u8,
+        name: String,
+    }
+
+    /// Walk a `getdents64` answer the way glibc does: by `d_reclen`, with no
+    /// knowledge of where the previous name ended.
+    fn records(buf: &[u8]) -> Vec<Record> {
+        let mut out = Vec::new();
+        let mut at = 0;
+        while at + HDR <= buf.len() {
+            let u64_at = |o: usize| {
+                let mut b = [0u8; 8];
+                b.copy_from_slice(&buf[at + o..at + o + 8]);
+                u64::from_ne_bytes(b)
+            };
+            let reclen = u16::from_ne_bytes([buf[at + 16], buf[at + 17]]);
+            assert!(
+                reclen as usize >= HDR + 1,
+                "d_reclen {} is too short",
+                reclen
+            );
+            assert!(
+                at + reclen as usize <= buf.len(),
+                "d_reclen runs off the end"
+            );
+            let name_bytes = &buf[at + HDR..at + reclen as usize];
+            let nul = name_bytes
+                .iter()
+                .position(|&b| b == 0)
+                .expect("d_name is NUL-terminated");
+            out.push(Record {
+                ino: u64_at(0),
+                off: u64_at(8),
+                reclen,
+                type_: buf[at + 18],
+                name: String::from(core::str::from_utf8(&name_bytes[..nul]).unwrap()),
+            });
+            at += reclen as usize;
+        }
+        out
+    }
+
+    /// The record length, computed the other way round from the writer's
+    /// own `div_ceil`, so a test that agreed with a wrong formula would not
+    /// hold.
+    fn aligned_up(n: usize) -> usize {
+        n.next_multiple_of(8)
+    }
+
+    #[test]
+    fn the_record_is_the_layout_glibc_walks() {
+        let mut buf = [0u8; 64];
+        let mut w = DirentBufWriter::new(&mut buf);
+        assert!(w.try_write(0x1234_5678_9abc_def0, 0x11, DirentType::REG.bits(), "hola"));
+        let want = aligned_up(HDR + "hola".len() + 1);
+        assert_eq!(w.as_slice().len(), want, "the answer is one whole record");
+        assert_eq!(
+            records(w.as_slice()),
+            [Record {
+                ino: 0x1234_5678_9abc_def0,
+                off: 0x11,
+                reclen: want as u16,
+                type_: 8,
+                name: String::from("hola"),
+            }]
+        );
+    }
+
+    #[test]
+    fn each_field_is_itself_and_not_its_neighbour() {
+        // `d_ino` and `d_off` are both `u64` and next to each other, so a
+        // swap between them is invisible to anything that only counts bytes.
+        let mut buf = [0u8; 64];
+        let mut w = DirentBufWriter::new(&mut buf);
+        assert!(w.try_write(7, 9, DirentType::DIR.bits(), "d"));
+        let got = records(w.as_slice());
+        assert_eq!(got.len(), 1);
+        assert_eq!((got[0].ino, got[0].off), (7, 9));
+        assert_eq!(
+            got[0].type_, 4,
+            "d_type is the DT_ number, not the bitflag index"
+        );
+    }
+
+    #[test]
+    fn every_record_starts_on_an_eight_byte_boundary() {
+        // `d_reclen` is rounded up to 8 because userspace reads `d_ino` and
+        // `d_off` straight out of the buffer as `u64`s.
+        let names = ["a", "bb", "ccc", "dddddddddddd", "e"];
+        let mut buf = [0u8; 256];
+        let mut w = DirentBufWriter::new(&mut buf);
+        for (i, name) in names.iter().enumerate() {
+            assert!(
+                w.try_write(i as u64 + 1, i as u64 + 1, DirentType::REG.bits(), name),
+                "{} did not fit",
+                name
+            );
+        }
+        let got = records(w.as_slice());
+        assert_eq!(got.len(), names.len());
+        let mut at = 0;
+        for (r, name) in got.iter().zip(names) {
+            assert_eq!(at % 8, 0, "{name} starts at {at}");
+            assert_eq!(r.name, name);
+            assert_eq!(r.reclen as usize, aligned_up(HDR + name.len() + 1));
+            at += r.reclen as usize;
+        }
+        assert_eq!(at, w.as_slice().len(), "no gap and no overshoot");
+    }
+
+    #[test]
+    fn a_record_that_does_not_fit_is_refused_and_nothing_is_written() {
+        // `getdents64` hands the refused entry back to the directory and
+        // answers with what fitted, so a writer that wrote part of a record
+        // anyway would put a torn header in front of the next call's data.
+        let want = aligned_up(HDR + "name".len() + 1);
+        let mut buf = vec![0u8; want - 1];
+        let empty = {
+            let mut w = DirentBufWriter::new(&mut buf);
+            assert!(!w.try_write(1, 1, DirentType::REG.bits(), "name"));
+            w.as_slice().is_empty()
+        };
+        assert!(empty);
+        assert!(buf.iter().all(|&b| b == 0), "the buffer was touched anyway");
+    }
+
+    #[test]
+    fn a_buffer_that_holds_the_record_exactly_takes_it() {
+        // The boundary the comparison sits on: room for the record and not
+        // one byte more is enough.
+        let want = aligned_up(HDR + "name".len() + 1);
+        let mut buf = vec![0u8; want];
+        let mut w = DirentBufWriter::new(&mut buf);
+        assert!(w.try_write(1, 2, DirentType::LNK.bits(), "name"));
+        assert_eq!(w.as_slice().len(), want);
+        // And the next one has nowhere to go.
+        assert!(!w.try_write(3, 4, DirentType::REG.bits(), "x"));
+        assert_eq!(w.as_slice().len(), want, "the refusal changed nothing");
+    }
+
+    #[test]
+    fn the_name_is_followed_by_its_nul_and_the_padding_is_not_read() {
+        // A name whose record needs padding: the NUL goes right after the
+        // name, and what follows it inside the record is never part of it.
+        let mut buf = [0xffu8; 64];
+        let mut w = DirentBufWriter::new(&mut buf);
+        assert!(w.try_write(1, 1, DirentType::CHR.bits(), "ab"));
+        let used: Vec<u8> = w.as_slice().to_vec();
+        assert_eq!(&used[HDR..HDR + 2], b"ab");
+        assert_eq!(used[HDR + 2], 0, "the NUL is where the name ends");
+        // The padding is whatever the buffer held; the parse must not need it.
+        assert_eq!(records(&used)[0].name, "ab");
+    }
+
+    /// The numbers are the uapi's `DT_*`, and `getdents64` is the only place
+    /// they ever leave the kernel: a wrong one makes `ls` colour a file as a
+    /// device, and `find -type` miss it.
+    #[test]
+    fn the_dirent_types_are_the_dt_numbers_linux_uses() {
+        assert_eq!(DirentType::UNKNOWN.bits(), 0);
+        for (type_, dt) in [
+            (FileType::NamedPipe, 1u8),
+            (FileType::CharDevice, 2),
+            (FileType::Dir, 4),
+            (FileType::BlockDevice, 6),
+            (FileType::File, 8),
+            (FileType::SymLink, 10),
+            (FileType::Socket, 12),
+        ] {
+            assert_eq!(DirentType::from(type_).bits(), dt, "{type_:?}");
+        }
+    }
+
+    /// The NUL has a byte of its own, and only one name length in eight
+    /// shows it.
+    ///
+    /// `d_reclen` is `19 + name.len() + 1` rounded up to eight, so dropping
+    /// the NUL's byte from that sum changes nothing for seven lengths out of
+    /// eight: the rounding hands the byte straight back. It shows when
+    /// `19 + name.len()` is already a multiple of eight -- five characters,
+    /// or thirteen, or twenty-one -- and there the record comes out eight
+    /// bytes short while the NUL still goes to `19 + 5`, one byte past the
+    /// record that was just sized. The name is then unterminated inside its
+    /// own record, which is the one thing glibc's `readdir` leans on after
+    /// `d_reclen`. Every name in the tests above is one of the other seven
+    /// lengths, so this one is here on purpose.
+    #[test]
+    fn the_nul_has_a_byte_of_its_own() {
+        let name = "cinco";
+        assert_eq!(
+            (HDR + name.len()) % 8,
+            0,
+            "the length has to be one the rounding does not hide"
+        );
+        assert_eq!(
+            aligned_up(HDR + name.len()) + 8,
+            aligned_up(HDR + name.len() + 1),
+            "and there the NUL's byte is worth a whole eight"
+        );
+        let mut buf = [0xffu8; 64];
+        let mut w = DirentBufWriter::new(&mut buf);
+        assert!(w.try_write(5, 6, DirentType::REG.bits(), name));
+        let used: Vec<u8> = w.as_slice().to_vec();
+        assert_eq!(used.len(), aligned_up(HDR + name.len() + 1));
+        assert_eq!(used[HDR + name.len()], 0, "the NUL is inside the record");
+        let got = records(&used);
+        assert_eq!(got[0].reclen as usize, used.len());
+        assert_eq!(got[0].name, name);
     }
 }
