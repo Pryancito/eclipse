@@ -1148,9 +1148,12 @@ mod no_share_record_tests {
     fn a_no_share_record_outlives_the_mapping_and_belongs_to_its_owner() {
         const VRAM: u32 = 0xbffe_0001;
         const GART: u32 = 0xbffe_0002;
-        const OWNER: u64 = 77_001;
-        const OTHER: u64 = 77_002;
-        const ZOMBIE: u64 = 77_003;
+        // Pids of this test's own: 77_001 is the bench module's, whose rows
+        // run as tests too and register 256 holders under it, and a rekey
+        // caught in the middle of that moved them all (182 of 1).
+        const OWNER: u64 = 78_101;
+        const OTHER: u64 = 78_102;
+        const ZOMBIE: u64 = 78_103;
         mark_no_share(VRAM, OWNER);
         mark_no_share(VRAM, OTHER);
         register(GART, 0x7000_0000, 4096, OWNER);

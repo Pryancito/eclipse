@@ -167,6 +167,27 @@ fn a_vram_object_is_its_owners_and_its_cards() {
         Some(ExportRefusal::NotFound),
         "the other card has no such object"
     );
+    // NO_SHARE does not make the object the other card's: the lookup in the
+    // file comes first and says ENOENT there, EPERM only through its own
+    // card's node (the record used to be asked before the node, so the
+    // handle was EPERM through any node).
+    gem_mmap::mark_no_share(THEIRS, 4242);
+    assert_eq!(
+        drm::export_handle_for(THEIRS, card_console, 4242).err(),
+        Some(ExportRefusal::NotShareable),
+        "its owner, through its card: the driver's refusal"
+    );
+    assert_eq!(
+        drm::export_handle_for(THEIRS, card_compute, 4242).err(),
+        Some(ExportRefusal::NotFound),
+        "its owner, through the other card: not a handle of that file"
+    );
+    assert_eq!(
+        drm::export_handle_for(THEIRS, card_console, 7).err(),
+        Some(ExportRefusal::NotFound),
+        "another process: still not its handle"
+    );
+    assert!(gem_mmap::clear_no_share(THEIRS));
 }
 
 /// The errno each refusal becomes at the ioctl.

@@ -2704,3 +2704,199 @@ fn a_renderer_line_is_said_once_and_a_different_one_is_still_said() {
         "a decision that changed was swallowed"
     );
 }
+
+// ── what a crashing service said, on the console ─────────────────────────
+
+/// The window is the LAST lines, in their original order, and a blank line
+/// is not one of them.
+///
+/// Order matters more than it looks: a reversed tail puts PulseAudio's
+/// "Daemon startup failed" above the module error that caused it, and the
+/// reader chases the wrong one.
+#[test]
+fn el_vuelco_se_queda_con_las_ultimas_lineas_y_en_su_orden() {
+    let mut text = String::new();
+    for n in 0..30 {
+        text.push_str(&format!("linea {n}\n\n"));
+    }
+    let lines = tail_lines(&text);
+    assert_eq!(lines.len(), LOG_TAIL_LINES);
+    assert_eq!(lines[0], "linea 22");
+    assert_eq!(lines[LOG_TAIL_LINES - 1], "linea 29");
+    assert!(
+        lines.iter().all(|l| !l.trim().is_empty()),
+        "una linea en blanco gasta una de las ocho: {lines:?}"
+    );
+}
+
+/// One 4 KiB line (a module list, a backtrace) must not take the screen.
+#[test]
+fn una_linea_desbocada_se_corta_a_lo_ancho_de_la_consola() {
+    let line = "x".repeat(LOG_TAIL_COLS * 10);
+    let out = tail_lines(&line);
+    assert_eq!(out.len(), 1);
+    assert!(out[0].ends_with(" ..."), "no se marco el corte: {}", out[0]);
+    assert_eq!(
+        out[0].chars().count(),
+        LOG_TAIL_COLS + 4,
+        "se corto por un sitio que no es el ancho pactado"
+    );
+}
+
+/// A log bigger than the window is read from its END, and the half line the
+/// byte offset lands in the middle of is dropped.
+#[test]
+fn un_log_mas_grande_que_la_ventana_se_lee_por_el_final() {
+    let dir = scratch("logtail-grande");
+    let path = dir.join("svc.log");
+    let mut text = String::new();
+    // Comfortably past LOG_TAIL_BYTES so the seek really happens.
+    for n in 0..4000 {
+        text.push_str(&format!("relleno {n:06} ------------------------------\n"));
+    }
+    text.push_str("Failed to change group list: No file descriptors available\n");
+    text.push_str("Daemon startup failed.\n");
+    fs::write(&path, &text).unwrap();
+
+    let lines = log_tail(path.to_str().unwrap());
+    assert_eq!(lines.len(), LOG_TAIL_LINES);
+    assert_eq!(lines[LOG_TAIL_LINES - 1], "Daemon startup failed.");
+    assert!(
+        lines[LOG_TAIL_LINES - 2].starts_with("Failed to change group list"),
+        "{lines:?}"
+    );
+    let entera = "relleno 000000 ------------------------------".len();
+    assert!(
+        lines
+            .iter()
+            .all(|l| !l.starts_with("relleno") || l.len() == entera),
+        "la primera linea de la ventana entro partida: {lines:?}"
+    );
+}
+
+/// A short log is read whole, without a seek that would fail on it.
+#[test]
+fn un_log_corto_se_lee_entero() {
+    let dir = scratch("logtail-corto");
+    let path = dir.join("svc.log");
+    fs::write(&path, b"primera\nsegunda\n").unwrap();
+    assert_eq!(log_tail(path.to_str().unwrap()), vec!["primera", "segunda"]);
+}
+
+/// Nothing to read is not something to print, and it must not burn the one
+/// echo this service gets: the log can simply not exist yet.
+#[test]
+fn sin_log_no_se_vuelca_nada_ni_se_gasta_el_turno() {
+    let dir = scratch("logtail-vacio");
+    let mut svc = respawn_svc("mudo", "");
+    svc.log = Some(dir.join("no-existe.log").to_string_lossy().into_owned());
+    report_log_tail(&mut svc);
+    assert!(
+        !svc.tail_shown,
+        "se dio por volcado un log que no se pudo leer, asi que el error de \
+         verdad ya no saldria nunca"
+    );
+
+    let path = dir.join("tarde.log");
+    fs::write(&path, b"ya hay algo\n").unwrap();
+    svc.log = Some(path.to_string_lossy().into_owned());
+    report_log_tail(&mut svc);
+    assert!(svc.tail_shown);
+}
+
+/// Once per service per boot: twenty retries of the same crash would scroll
+/// the console away, which is the very thing giving up on it protects.
+#[test]
+fn el_vuelco_se_hace_una_vez_por_servicio() {
+    let dir = scratch("logtail-una-vez");
+    let path = dir.join("svc.log");
+    fs::write(&path, b"el error\n").unwrap();
+    let mut svc = respawn_svc("repetidor", "");
+    svc.log = Some(path.to_string_lossy().into_owned());
+    report_log_tail(&mut svc);
+    assert!(svc.tail_shown);
+    svc.tail_shown = false;
+    report_log_tail(&mut svc);
+    assert!(svc.tail_shown, "el centinela no es lo que decide el vuelco");
+}
+
+/// The FIRST crash is what puts the error on screen: at 22 s, not at the
+/// 143 s where the crash loop is finally given up on.
+#[test]
+fn la_primera_caida_ya_vuelca_el_log_del_servicio() {
+    let dir = scratch("logtail-primera");
+    let path = dir.join("pulseaudio.log");
+    fs::write(&path, b"Daemon startup failed.\n").unwrap();
+    let mut map = BTreeMap::new();
+    let mut svc = respawn_svc("pulseaudio", "");
+    svc.log = Some(path.to_string_lossy().into_owned());
+    let started = Instant::now();
+    svc.pid = Some(777);
+    svc.started_at = Some(started);
+    map.insert("pulseaudio".to_string(), svc);
+
+    // exit 1 after 50 ms, exactly like the console photo.
+    note_exit(&mut map, 777, 1 << 8, started + Duration::from_millis(50));
+
+    assert_eq!(map["pulseaudio"].crash_starts, 1);
+    assert!(
+        map["pulseaudio"].tail_shown,
+        "la primera caida no volco el log, asi que el error solo se leeria \
+         despues de los 143 s del abandono"
+    );
+}
+
+/// The half line the window opens in the middle of is dropped, and it is
+/// dropped BEFORE the last few are taken.
+///
+/// With ordinary short lines this never shows: the fragment is hundreds of
+/// lines above the tail and falls out of it anyway. It shows with the lines
+/// that actually matter here -- a service that prints one very long line --
+/// where the fragment would be one of the eight, cut to the console width,
+/// and would read as a line the service wrote.
+#[test]
+fn el_trozo_de_linea_del_principio_de_la_ventana_no_llega_a_la_consola() {
+    let dir = scratch("logtail-partida");
+    let path = dir.join("svc.log");
+    let mut text = "a".repeat(9000);
+    text.push('\n');
+    text.push_str(&"b".repeat(9000));
+    text.push('\n');
+    text.push_str("Daemon startup failed.\n");
+    fs::write(&path, &text).unwrap();
+
+    let lines = log_tail(path.to_str().unwrap());
+    assert_eq!(lines.len(), 2, "{lines:?}");
+    assert!(
+        lines[0].starts_with("bbb"),
+        "entro el trozo de la primera linea: {lines:?}"
+    );
+    assert_eq!(lines[1], "Daemon startup failed.");
+}
+
+/// A service's log goes to the kernel console verbatim, so an escape
+/// sequence in it would be OBEYED: `\x1b[2J` clears the screen, a carriage
+/// return overwrites the line above. That would wipe the very boot messages
+/// this volcado exists to put on screen.
+#[test]
+fn una_secuencia_de_escape_en_el_log_no_llega_a_mandar_en_la_consola() {
+    let out = tail_lines("\x1b[2J\x1b[Hborrando\rotra vez\x07\n");
+    assert_eq!(out.len(), 1);
+    assert!(
+        !out[0].contains('\x1b') && !out[0].contains('\r') && !out[0].contains('\x07'),
+        "un caracter de control llego entero a la consola: {:?}",
+        out[0]
+    );
+    assert!(out[0].contains("borrando"), "{:?}", out[0]);
+    assert!(out[0].contains("otra vez"), "{:?}", out[0]);
+}
+
+/// A line that is nothing but control characters is not a line: it would
+/// print as a row of spaces and cost one of the eight. (The printable
+/// remains of an escape sequence -- the `[0m` of `\x1b[0m` -- ARE content,
+/// and stay: neutering the escape is the job, hiding the log is not.)
+#[test]
+fn una_linea_de_puro_control_no_gasta_una_de_las_ocho() {
+    let out = tail_lines("\x07\x07\x00\nel error de verdad\n");
+    assert_eq!(out, vec!["el error de verdad"]);
+}
