@@ -58,6 +58,7 @@ cargo test -p zcore-boot-opts --lib
 cargo bench -p linux-object --bench vfs --features mock-disk --no-run
 cargo bench -p linux-object --bench signal --features mock-disk --no-run
 cargo bench -p linux-object --bench process --features mock-disk --no-run
+cargo bench -p linux-object --lib --features mock-disk --no-run
 cargo bench -p zircon-object --bench vm --features libos,aspace-separate --no-run
 cargo bench -p zircon-object --bench futex --features libos,aspace-separate --no-run
 cargo bench -p linux-syscall --no-run
