@@ -232,6 +232,28 @@ fn primary_main(config: kernel_hal::KernelConfig) {
                 klog_info!("Eclipse: boot-trace ARMED for comm '{}' (BOOTTRACE)", comm);
             }
         }
+        // How many syscalls share one clock reading for `/proc/perf`'s latency
+        // columns. The dispatch brackets every syscall with `timer_now()`, and
+        // `rdtsc` benches at 10.91 ns -- twice per call, about 22 ns on every
+        // syscall the machine makes, more than three times what hunter's whole
+        // per-syscall security gate costs, and paid whether or not anyone ever
+        // reads the file. The call *counts* stay exact either way (a relaxed
+        // increment); only the nanoseconds need the clock. Default 16.
+        // `PERFSAMPLE=1` times every syscall and makes the columns exact,
+        // which is the A/B against this.
+        // Lives in linux-object, which a zircon-only kernel does not link.
+        #[cfg(feature = "linux")]
+        if let Some(n) = kernel_hal::cmdline::value(&options.cmdline, "PERFSAMPLE")
+            .and_then(kernel_hal::cmdline::parse_number)
+        {
+            let n = n.min(u32::MAX as u64) as u32;
+            linux_object::perf::set_sample_interval(n);
+            klog_info!(
+                "Eclipse: /proc/perf latency sampled 1 call in {} (PERFSAMPLE={})",
+                linux_object::perf::sample_interval(),
+                n
+            );
+        }
         // Hunter's flood/fork-bomb rate heuristics. OFF by default: they cost a
         // clock read + an IRQ-off shard-lock + BTreeMap update on EVERY syscall
         // of every process (all threads of one process serialize on the shard).

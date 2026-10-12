@@ -334,7 +334,15 @@ impl Syscall<'_> {
         // clear below, and with the blocked marking the run loop does, so a
         // sleeping thread can say what it is sleeping in.
         self.thread.set_current_syscall(Some(num));
-        let perf_start = kernel_hal::timer::timer_now();
+        // Whether to time this one. `rdtsc` benches at 10.91 ns and this path
+        // reads the clock twice, about 22 ns on every syscall -- three times
+        // what hunter's whole security gate costs -- so by default one call
+        // in sixteen is timed and `/proc/perf`'s latency columns are
+        // extrapolated, with the call counts still exact. `PERFSAMPLE=1`
+        // times every one. The boot tracer needs a real duration for every
+        // syscall it records, so it overrides the sampler while it is armed.
+        let perf_timed = linux_object::perf::should_time_syscall(self.linux_process().perf());
+        let perf_start = perf_timed.then(kernel_hal::timer::timer_now);
         let ret = match sys_type {
             Sys::READ => self.sys_read(a0.into(), a1.into(), a2).await,
             Sys::WRITE => self.sys_write(a0.into(), a1.into(), a2).await,
@@ -803,11 +811,16 @@ impl Syscall<'_> {
         // which would panic on a plain `Duration` subtraction.
         self.thread.set_current_syscall(None);
         self.check_ext_intact("after", num);
-        let elapsed_ns = kernel_hal::timer::timer_now()
-            .checked_sub(perf_start)
-            .unwrap_or_default()
-            .as_nanos() as u64;
-        linux_object::perf::record(self.linux_process(), num, elapsed_ns);
+        let elapsed_ns = match perf_start {
+            Some(start) => kernel_hal::timer::timer_now()
+                .checked_sub(start)
+                .unwrap_or_default()
+                .as_nanos() as u64,
+            // Not sampled: no clock was read on the way in, so there is no
+            // duration to report. The call is still counted.
+            None => 0,
+        };
+        linux_object::perf::record(self.linux_process(), num, elapsed_ns, perf_timed);
         // Boot-trace: record this syscall in the /proc/bootprofile timeline if it
         // was slow enough to be one of the desktop-startup stalls the open trace
         // cannot see into. Gated on the same relaxed atomic as record_open. For
