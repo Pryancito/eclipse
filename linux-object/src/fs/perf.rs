@@ -1478,3 +1478,165 @@ mod tests {
         assert_eq!(ev.write_at(0, b"x").unwrap_err(), LxError::ESPIPE);
     }
 }
+
+#[cfg(test)]
+mod abi_numbers_tests {
+    //! The numbers `perf` sends and reads, written out rather than followed.
+    //!
+    //! The tests above build their `perf_event_attr` with the same
+    //! `ATTR_OFF_*` the implementation reads it back through, and pick a
+    //! sample's fields with the same `PERF_SAMPLE_*` the sampler switches on.
+    //! That proves the two halves agree with each other, which they always
+    //! will: both follow the constant wherever it goes. The other side of
+    //! this ABI is `perf` itself, which uses the numbers below and nothing
+    //! else, so only a literal can say a constant is wrong.
+    //!
+    //! Where a number is already pinned above it is not repeated here: the
+    //! attr offsets, the flag bits and the record header are asserted against
+    //! literals by `the_attr_fields_are_where_perf_puts_them` and
+    //! `a_record_header_carries_the_numbers_a_consumer_switches_on`.
+
+    use super::*;
+
+    /// `_IO('$', nr)`: the perf ioctls that transfer nothing.
+    fn io(nr: u8) -> usize {
+        ((b'$' as usize) << 8) | nr as usize
+    }
+
+    /// `_IOW('$', nr, size)`: userspace hands `size` bytes in.
+    fn iow(nr: u8, size: usize) -> usize {
+        (1usize << 30) | (size << 16) | io(nr)
+    }
+
+    /// `_IOR('$', nr, size)`: the kernel writes `size` bytes back.
+    fn ior(nr: u8, size: usize) -> usize {
+        (2usize << 30) | (size << 16) | io(nr)
+    }
+
+    #[test]
+    fn the_sample_type_bits_are_the_ones_perf_event_h_gives() {
+        // A sample's body is a run of words with no tags in it, so the only
+        // thing that says which word is which is the set of bits in
+        // `sample_type`. `perf script` walks that set in this order; a bit
+        // that moved makes every word after it in the record be read as the
+        // wrong field, and the tool reports it without complaining.
+        //
+        // The bits are given as their shift, which is how the header writes
+        // them, and the names are in the header's own order so the two can be
+        // read side by side.
+        let bits: &[(&str, u64, u32)] = &[
+            ("IP", PERF_SAMPLE_IP, 0),
+            ("TID", PERF_SAMPLE_TID, 1),
+            ("TIME", PERF_SAMPLE_TIME, 2),
+            ("ADDR", PERF_SAMPLE_ADDR, 3),
+            ("READ", PERF_SAMPLE_READ, 4),
+            ("CALLCHAIN", PERF_SAMPLE_CALLCHAIN, 5),
+            ("ID", PERF_SAMPLE_ID, 6),
+            ("CPU", PERF_SAMPLE_CPU, 7),
+            ("PERIOD", PERF_SAMPLE_PERIOD, 8),
+            ("STREAM_ID", PERF_SAMPLE_STREAM_ID, 9),
+            ("RAW", PERF_SAMPLE_RAW, 10),
+            ("BRANCH_STACK", PERF_SAMPLE_BRANCH_STACK, 11),
+            ("REGS_USER", PERF_SAMPLE_REGS_USER, 12),
+            ("STACK_USER", PERF_SAMPLE_STACK_USER, 13),
+            ("WEIGHT", PERF_SAMPLE_WEIGHT, 14),
+            ("DATA_SRC", PERF_SAMPLE_DATA_SRC, 15),
+            ("IDENTIFIER", PERF_SAMPLE_IDENTIFIER, 16),
+            ("TRANSACTION", PERF_SAMPLE_TRANSACTION, 17),
+            ("REGS_INTR", PERF_SAMPLE_REGS_INTR, 18),
+            ("PHYS_ADDR", PERF_SAMPLE_PHYS_ADDR, 19),
+        ];
+        for &(name, bit, shift) in bits {
+            assert_eq!(bit, 1u64 << shift, "PERF_SAMPLE_{}", name);
+        }
+        // Twenty consecutive bits from 0, and nothing in bit 20, which the
+        // header keeps for `PERF_SAMPLE_AUX`.
+        let all = bits.iter().fold(0u64, |a, &(_, b, _)| a | b);
+        assert_eq!(all, 0x000f_ffff);
+        assert_eq!(all & (1 << 20), 0, "bit 20 is PERF_SAMPLE_AUX");
+    }
+
+    #[test]
+    fn the_read_format_bits_are_the_ones_perf_event_h_gives() {
+        // `read_format` decides how many words a `read(2)` of the event
+        // hands back, and the two time bits add a word each. Swapping them
+        // keeps the count the same, so the test above cannot see it, and the
+        // consequence is quiet: `perf stat` reads `time_running` as
+        // `time_enabled`, scales the count by the wrong ratio, and prints a
+        // number that is simply wrong.
+        assert_eq!(PERF_FORMAT_TOTAL_TIME_ENABLED, 1 << 0);
+        assert_eq!(PERF_FORMAT_TOTAL_TIME_RUNNING, 1 << 1);
+        assert_eq!(PERF_FORMAT_ID, 1 << 2);
+        // Bit 3 is `PERF_FORMAT_GROUP` and bit 4 is `PERF_FORMAT_LOST`;
+        // neither is implemented, so neither may be taken.
+        let known =
+            PERF_FORMAT_TOTAL_TIME_ENABLED | PERF_FORMAT_TOTAL_TIME_RUNNING | PERF_FORMAT_ID;
+        assert_eq!(known, 0b111);
+    }
+
+    #[test]
+    fn the_ioctl_numbers_are_the_ones_the_uapi_macros_build() {
+        // `'$'` is 0x24. Four of these are plain requests and three carry an
+        // argument, so their direction and size are part of the number; a
+        // request perf sends and this kernel does not recognise comes back
+        // `ENOTTY`, and `perf record` gives up on the event.
+        assert_eq!(PERF_EVENT_IOC_ENABLE, io(0));
+        assert_eq!(PERF_EVENT_IOC_DISABLE, io(1));
+        assert_eq!(PERF_EVENT_IOC_REFRESH, io(2));
+        assert_eq!(PERF_EVENT_IOC_RESET, io(3));
+        assert_eq!(PERF_EVENT_IOC_PERIOD, iow(4, 8), "_IOW('$', 4, __u64)");
+        assert_eq!(PERF_EVENT_IOC_SET_OUTPUT, io(5));
+        assert_eq!(PERF_EVENT_IOC_SET_FILTER, iow(6, 8), "_IOW('$', 6, char *)");
+        assert_eq!(PERF_EVENT_IOC_ID, ior(7, 8), "_IOR('$', 7, __u64 *)");
+        // The two that look alike differ only in their direction bits, which
+        // is the half of the number that is easiest to get backwards.
+        assert_eq!(PERF_EVENT_IOC_PERIOD, 0x4008_2404);
+        assert_eq!(PERF_EVENT_IOC_ID, 0x8008_2407);
+    }
+
+    #[test]
+    fn the_control_page_fields_are_at_the_bytes_perf_reads_them_from() {
+        // `struct perf_event_mmap_page`: the four ring words start at 1024,
+        // a whole page's worth of header away from `version` at 0, and run
+        // consecutively. 1056 is `aux_head`, which this kernel leaves zero,
+        // so a `data_size` that slid one word along tells perf the ring is
+        // empty and the tool reports no samples at all.
+        assert_eq!(PC_VERSION, 0);
+        assert_eq!(PC_DATA_HEAD, 1024);
+        assert_eq!(PC_DATA_TAIL, 1032);
+        assert_eq!(PC_DATA_OFFSET, 1040);
+        assert_eq!(PC_DATA_SIZE, 1048);
+        // Four `u64` in a row, which is the only thing that makes a wrong one
+        // read as its neighbour instead of as rubbish.
+        for (i, off) in [PC_DATA_HEAD, PC_DATA_TAIL, PC_DATA_OFFSET, PC_DATA_SIZE]
+            .iter()
+            .enumerate()
+        {
+            assert_eq!(*off, 1024 + i * 8, "the four ring words are consecutive");
+        }
+    }
+
+    #[test]
+    fn the_event_selector_is_read_from_the_byte_the_uapi_puts_it_at() {
+        // `config` is the only field of the attr nothing in this kernel acts
+        // on yet, which is exactly why no other test can see its offset: it
+        // is read and stored and never looked at. It is also the field that
+        // says WHICH event was asked for, so the day a real counter is wired
+        // up a wrong offset here selects a different event and the numbers
+        // come back plausible and wrong.
+        let mut a = alloc::vec![0u8; 128];
+        a[8..16].copy_from_slice(&0x1111_2222_3333_4444u64.to_ne_bytes());
+        let ev = PerfEvent::new(&a, -1, -1, OpenFlags::empty());
+        assert_eq!(
+            ev.inner.lock()._config,
+            0x1111_2222_3333_4444,
+            "config is the u64 at byte 8, after type and size"
+        );
+        // And it is not the field at 16, which is the period.
+        let mut b = alloc::vec![0u8; 128];
+        b[16..24].copy_from_slice(&7u64.to_ne_bytes());
+        let other = PerfEvent::new(&b, -1, -1, OpenFlags::empty());
+        assert_eq!(other.inner.lock()._config, 0);
+        assert_eq!(other.inner.lock().period, 7);
+    }
+}

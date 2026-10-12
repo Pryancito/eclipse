@@ -1675,7 +1675,7 @@ fn vm_bind_maps_into_the_callers_own_context_and_a_map_over_a_live_range_replace
         "B's binding is still live"
     );
     assert_eq!(
-        vm_bind_ops(&gpu, A, &mut [unmap(0x1000, 0x1000)]),
+        vm_bind_ops(&gpu, A, &mut [unmap(0x1_0000_1000, 0x1000)]),
         Ok(0),
         "nothing there: fine"
     );
@@ -1943,7 +1943,7 @@ fn vm_bind_programs_uncompressed_kinds_verbatim_and_hands_the_rest_to_the_rm_def
         (0xff, 0x00),
     ];
     for (i, (asked, _)) in cases.iter().enumerate() {
-        let va = 0x1000_0000 + (i as u64) * 0x1_0000;
+        let va = 0x1_1000_0000 + (i as u64) * 0x1_0000;
         assert_eq!(
             vm_bind_ops(&gpu, A, &mut [op(nv::VM_BIND_OP_MAP, *asked, h, va, 4096)]),
             Ok(0),
@@ -1961,7 +1961,7 @@ fn vm_bind_programs_uncompressed_kinds_verbatim_and_hands_the_rest_to_the_rm_def
         vm_bind_ops(
             &gpu,
             A,
-            &mut [op(nv::VM_BIND_OP_MAP, 0x0200, h, 0x2000_0000, 4096)]
+            &mut [op(nv::VM_BIND_OP_MAP, 0x0200, h, 0x1_2000_0000, 4096)]
         ),
         Ok(0)
     );
@@ -1973,7 +1973,7 @@ fn vm_bind_programs_uncompressed_kinds_verbatim_and_hands_the_rest_to_the_rm_def
         vm_bind_ops(
             &gpu,
             A,
-            &mut [op(nv::VM_BIND_OP_MAP, 0x0206, h, 0x2001_0000, 4096)]
+            &mut [op(nv::VM_BIND_OP_MAP, 0x0206, h, 0x1_2001_0000, 4096)]
         ),
         Ok(0)
     );
@@ -2029,7 +2029,7 @@ fn with_the_rm_a_subchannel_new_builds_the_class_on_the_callers_context_and_chan
         .unwrap()
         .handle;
     assert_eq!(
-        vm_bind_ops(&gpu, A, &mut [map(h, 0x5000_0000, 4096)]),
+        vm_bind_ops(&gpu, A, &mut [map(h, 0x1_5000_0000, 4096)]),
         Ok(0)
     );
     assert_eq!(channel_free(&gpu, 0, A), Ok(0));
@@ -2071,11 +2071,11 @@ fn process_exit_with_the_rm_frees_classes_then_the_context_then_memory_and_never
         .unwrap()
         .handle;
     assert_eq!(
-        vm_bind_ops(&gpu, A, &mut [map(ha, 0x1000_0000, 65536)]),
+        vm_bind_ops(&gpu, A, &mut [map(ha, 0x1_1000_0000, 65536)]),
         Ok(0)
     );
     assert_eq!(
-        vm_bind_ops(&gpu, B, &mut [map(hb, 0x1000_0000, 4096)]),
+        vm_bind_ops(&gpu, B, &mut [map(hb, 0x1_1000_0000, 4096)]),
         Ok(0)
     );
     assert_eq!(subchan_new(0, 0xc597, 0x1000).send(&gpu, A), Ok(0));
@@ -9456,3 +9456,7 @@ mod abi16_tests;
 
 /// The GEM arms (`GEM_NEW` and kin): same harness, own file, same reason.
 mod gem_tests;
+
+/// The VM_BIND arms (ranges, the VA space, the reserved area): same harness,
+/// own file, same reason.
+mod vm_bind_tests;
