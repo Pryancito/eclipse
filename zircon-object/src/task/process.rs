@@ -140,6 +140,55 @@ define_count_helper!(Process);
 /// that broke gives its direction.
 pub(super) const EXT_CANARY: u64 = 0x4558_5443_414e_5259; // "EXTCANRY"
 
+/// Lowest address a live kernel object can sit at. Everything under the first
+/// page is a null pointer with a field offset on it, never an allocation.
+const MIN_OBJECT_ADDR: usize = 0x1000;
+
+/// Offset from an `Arc<T>`'s allocation to its payload: the two reference
+/// counts, rounded up to `T`'s alignment.
+///
+/// The standard library's `ArcInner` is `#[repr(C)] { strong, weak, data }`, so
+/// this is arithmetic rather than a guess -- but it is read HERE for a report
+/// only, to turn a corrupt entry's payload pointer back into the word a
+/// `clone` would have incremented, i.e. the `vaddr=` of the page fault it
+/// would have taken. Nothing dereferences it.
+const fn arc_payload_offset<T>() -> usize {
+    let align = core::mem::align_of::<T>();
+    if align > 16 {
+        align
+    } else {
+        16
+    }
+}
+
+/// Whether a thread-list entry can possibly still be a live `Arc<Thread>`.
+///
+/// [`Process::exit`] clones the list, and cloning an `Arc` is a `lock incq` on
+/// its strong count: an unconditional WRITE through whatever word the `Vec`
+/// holds, before anything has looked at it. The capture of 2026-10-12 is
+/// exactly that instruction --
+///
+/// ```text
+/// KERNEL NULL-RANGE PAGE FAULT cpu=4 vaddr=0x71 flags=WRITE
+/// rip=<zircon_object::task::process::Process>::exit+0xb9
+/// ```
+///
+/// -- `exit+0xb9` being `lock incq (%rdx)` with `%rdx` loaded from the thread
+/// list one instruction earlier. An entry holding `0x71` is not a pointer at
+/// all, and no amount of care inside `exit` makes dereferencing it safe: the
+/// only thing to do is to see it coming.
+///
+/// Two properties, both free: an `Arc<Thread>`'s payload lives at a real
+/// address, and it is aligned for `Thread` (64 bytes in this build, since
+/// `ThreadInner` is cache-line aligned). `0x71` fails both.
+///
+/// This cannot certify a pointer -- a stale-but-plausible address passes --
+/// and it is not meant to. It catches the shape the smashes have actually had.
+fn thread_entry_looks_live(t: &Arc<Thread>) -> bool {
+    let payload = Arc::as_ptr(t) as usize;
+    payload >= MIN_OBJECT_ADDR && payload.is_multiple_of(core::mem::align_of::<Thread>())
+}
+
 /// Read the header of a Rust trait-object vtable: `(drop_in_place, size, align)`.
 ///
 /// Naming the type behind an unexpected vtable by matching its ADDRESS means
@@ -546,6 +595,10 @@ impl Process {
                 return;
             }
             inner.status = Status::Exited(retcode);
+            // BEFORE the clone, which is a `lock incq` through every entry:
+            // see `thread_entry_looks_live` for the capture that made this
+            // the machine's last instruction.
+            inner.sweep_corrupt_threads(self.base.id, "Process::exit");
             (inner.threads.clone(), core::mem::take(&mut inner.handles))
         };
         if threads.is_empty() {
@@ -1002,6 +1055,11 @@ impl Process {
 
     pub(super) fn remove_thread(&self, tid: KoID) {
         let mut inner = self.inner.lock();
+        // `retain` asks every entry for its id, which is a load through it,
+        // and then DROPS the ones it rejects, which is a write to their strong
+        // count. The same two hazards as the clone in `Process::exit`, on the
+        // other teardown path.
+        inner.sweep_corrupt_threads(self.base.id, "Process::remove_thread");
         inner.threads.retain(|t| t.id() != tid);
         if inner.threads.is_empty() {
             if !matches!(inner.status, Status::Exited(_)) {
@@ -1144,6 +1202,68 @@ impl Task for Process {
 const HANDLE_ID_MASK: u32 = (1 << 30) - 1;
 
 impl ProcessInner {
+    /// Take out of the thread list every entry that cannot be a live object,
+    /// and say so, loudly, for each one.
+    ///
+    /// Returns how many were taken out, so a caller can tell an ordinary list
+    /// from a smashed one.
+    ///
+    /// Two things about the removal. A corrupt entry is **leaked on purpose**:
+    /// `Arc`'s own `Drop` decrements the very word a clone increments, so
+    /// dropping it takes the same page fault one instruction later, and
+    /// `Vec::retain` would do exactly that. And the list is rebuilt rather
+    /// than filtered in place for the same reason -- the entries that survive
+    /// are moved, never dropped.
+    ///
+    /// The report names the buffer as well as the entry: one bad word among
+    /// good ones is a write that landed on this `Vec`, while a whole buffer of
+    /// nonsense is a `Vec` whose own pointer is stale. Nothing here can tell
+    /// those apart later, and the numbers are gone the moment the machine is
+    /// rebooted.
+    fn sweep_corrupt_threads(&mut self, pid: KoID, whence: &str) -> usize {
+        if self.threads.iter().all(thread_entry_looks_live) {
+            return 0;
+        }
+        let ptr = self.threads.as_ptr() as usize;
+        let (len, cap) = (self.threads.len(), self.threads.capacity());
+        let taken = core::mem::take(&mut self.threads);
+        let mut kept = Vec::with_capacity(taken.len());
+        let mut dropped = 0usize;
+        for (i, thread) in taken.into_iter().enumerate() {
+            if thread_entry_looks_live(&thread) {
+                kept.push(thread);
+                continue;
+            }
+            dropped += 1;
+            let payload = Arc::as_ptr(&thread) as usize;
+            let strong_word = payload.wrapping_sub(arc_payload_offset::<Thread>());
+            // Never dropped: see the note above.
+            core::mem::forget(thread);
+            let report = alloc::format!(
+                "[thread-list] pid={} {}: entry {}/{} is not a live Arc<Thread> \
+                 (payload={:#x}, strong count at {:#x} -- a clone of this entry is \
+                 a WRITE there, which is the #PF this check exists to see coming); \
+                 buffer ptr={:#x} len={} cap={}. Entry skipped and leaked; the \
+                 process still exits. One bad entry among good ones is a write \
+                 that landed on this buffer, a buffer of nothing but bad entries \
+                 is a Vec whose own pointer is stale.",
+                pid,
+                whence,
+                i,
+                len,
+                payload,
+                strong_word,
+                ptr,
+                len,
+                cap,
+            );
+            error!("{}", report);
+            kernel_hal::klog_err!("{}\n", report);
+        }
+        self.threads = kept;
+        dropped
+    }
+
     /// Add a handle to the process
     fn add_handle(&mut self, handle: Handle) -> HandleValue {
         // A handle value is a 30-bit id shifted up two, with the low bits
@@ -1830,6 +1950,147 @@ mod tests {
                 "el handle {} no es el objeto que se instalo en su sitio",
                 value
             );
+        }
+    }
+
+    /// The check has to say yes to the only thing the list ever legitimately
+    /// holds, or `Process::exit` would start throwing live threads away --
+    /// a far worse bug than the one it is here to survive.
+    #[test]
+    fn a_thread_the_list_really_holds_passes_the_check() {
+        let root_job = Job::root();
+        let proc = Process::create(&root_job, "proc").expect("failed to create process");
+        let thread = Thread::create(&proc, "thread").expect("failed to create thread");
+        assert!(
+            thread_entry_looks_live(&thread),
+            "un Arc<Thread> vivo tiene que pasar: payload={:#x}, align={}",
+            Arc::as_ptr(&thread) as usize,
+            core::mem::align_of::<Thread>(),
+        );
+        // A process and its threads hold each other, so a test that just lets
+        // them go leaks one hosted address-space window -- and the pool is a
+        // process-wide 127 for the whole binary, which this suite already
+        // sits right at the edge of.
+        release(&proc, &[&thread]);
+    }
+
+    /// And no to the word that actually killed the machine.
+    #[test]
+    fn the_word_that_killed_the_machine_does_not_pass() {
+        // SAFETY: never dereferenced and never dropped -- `forget` below. This
+        // is the value the stop screen of 2026-10-12 reported as `vaddr=0x71`.
+        let bogus: Arc<Thread> = unsafe { core::mem::transmute(0x71usize) };
+        let passes = thread_entry_looks_live(&bogus);
+        core::mem::forget(bogus);
+        assert!(
+            !passes,
+            "0x71 no es un objeto: ni esta alineado ni es una direccion"
+        );
+
+        // And the other half of the check on its own: an address big enough to
+        // be a real one, off by a byte. A single stray byte written over the
+        // low end of a live pointer leaves exactly this.
+        //
+        // SAFETY: as above -- never dereferenced, never dropped.
+        let skewed: Arc<Thread> = unsafe { core::mem::transmute(0xffff_8000_1234_5679usize) };
+        let passes = thread_entry_looks_live(&skewed);
+        core::mem::forget(skewed);
+        assert!(
+            !passes,
+            "un puntero desalineado para Thread (align={}) no puede pasar",
+            core::mem::align_of::<Thread>(),
+        );
+
+        // And the first half on its own: a small word that happens to be
+        // aligned -- a count, a length, a flag word -- is still not an object.
+        //
+        // SAFETY: as above -- never dereferenced, never dropped.
+        let small: Arc<Thread> = unsafe { core::mem::transmute(0x40usize) };
+        let passes = thread_entry_looks_live(&small);
+        core::mem::forget(small);
+        assert!(
+            !passes,
+            "0x40 esta alineado y aun asi no es una direccion de objeto"
+        );
+    }
+
+    /// The address the report prints must be the one on the screen, or the
+    /// next capture cannot be matched against this one.
+    #[test]
+    fn the_report_names_the_same_address_the_page_fault_did() {
+        // SAFETY: as above -- arithmetic on the pointer only.
+        let bogus: Arc<Thread> = unsafe { core::mem::transmute(0x71usize) };
+        let payload = Arc::as_ptr(&bogus) as usize;
+        core::mem::forget(bogus);
+        assert_eq!(
+            payload.wrapping_sub(arc_payload_offset::<Thread>()),
+            0x71,
+            "el informe imprime {:#x} donde la pantalla dijo 0x71",
+            payload.wrapping_sub(arc_payload_offset::<Thread>()),
+        );
+    }
+
+    /// The sweep keeps every live entry, drops the smashed one, and -- the
+    /// part that matters -- gets there without dereferencing it. A `retain`
+    /// would have dropped it, and `Arc::drop` writes to the same word a clone
+    /// does.
+    #[test]
+    fn the_sweep_keeps_the_live_threads_and_leaks_the_smashed_one() {
+        let root_job = Job::root();
+        let proc = Process::create(&root_job, "proc").expect("failed to create process");
+        let first = Thread::create(&proc, "first").expect("failed to create thread");
+        let second = Thread::create(&proc, "second").expect("failed to create thread");
+
+        let mut inner = ProcessInner::default();
+        inner.threads.push(first.clone());
+        // SAFETY: the sweep must `forget` this, never drop or deref it. If it
+        // does either, this test faults instead of failing -- which is itself
+        // the answer.
+        inner
+            .threads
+            .push(unsafe { core::mem::transmute::<usize, Arc<Thread>>(0x71usize) });
+        inner.threads.push(second.clone());
+
+        let dropped = inner.sweep_corrupt_threads(proc.id(), "test");
+
+        assert_eq!(dropped, 1, "solo el de en medio estaba roto");
+        assert_eq!(
+            inner.threads.iter().map(|t| t.id()).collect::<Vec<_>>(),
+            alloc::vec![first.id(), second.id()],
+            "los vivos siguen ahi y en su orden",
+        );
+        drop(inner);
+        release(&proc, &[&first, &second]);
+    }
+
+    /// An untouched list costs nothing and is left exactly as it was: the
+    /// sweep runs on every exit, so a rebuild of the `Vec` on the ordinary
+    /// path would be a tax on every process that ever dies.
+    #[test]
+    fn an_intact_list_is_not_rebuilt() {
+        let root_job = Job::root();
+        let proc = Process::create(&root_job, "proc").expect("failed to create process");
+        let thread = Thread::create(&proc, "thread").expect("failed to create thread");
+
+        let mut inner = ProcessInner::default();
+        inner.threads.push(thread.clone());
+        let before = inner.threads.as_ptr();
+
+        assert_eq!(inner.sweep_corrupt_threads(proc.id(), "test"), 0);
+        assert_eq!(
+            inner.threads.as_ptr(),
+            before,
+            "la lista sana no se reconstruye"
+        );
+        drop(inner);
+        release(&proc, &[&thread]);
+    }
+
+    /// Break the `Process` <-> `Thread` cycle so the process is actually
+    /// dropped and its hosted address-space window goes back to the pool.
+    fn release(proc: &Arc<Process>, threads: &[&Arc<Thread>]) {
+        for t in threads {
+            proc.remove_thread(t.id());
         }
     }
 }
