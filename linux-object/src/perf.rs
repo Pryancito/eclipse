@@ -621,6 +621,16 @@ pub fn kernel_report() -> String {
             "  (empty returns: {} of nonblock, {} of timed; {} events delivered)",
             ep_empty_nb, ep_empty_timed, ep_events
         );
+        // The third reading of the same table: ready bits an EPOLLET entry
+        // held back because nothing had moved since it last reported them.
+        // Each one is an `epoll_pwait` return -- and the syscall after it --
+        // that did not happen. A big number here against a modest `events`
+        // count is an event loop that would otherwise be spinning.
+        let _ = writeln!(
+            out,
+            "  (edge-suppressed: {} level reports held back)",
+            crate::fs::epoll_stats::edge_suppressed_total()
+        );
     }
     if off_sched_wedge && !all_halted && !nmi.is_empty() {
         // Distinct current RIPs across cores. A single shared value means every
