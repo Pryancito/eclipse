@@ -28,7 +28,66 @@ use core::sync::atomic::{AtomicU64, Ordering};
 /// this tree adds); anything beyond is counted in the last slot.
 pub const MAX_SYSCALL: usize = 512;
 
-static COUNTS: [AtomicU64; MAX_SYSCALL] = [const { AtomicU64::new(0) }; MAX_SYSCALL];
+/// How many copies of the histogram there are: one per possible CPU.
+///
+/// The histogram is the one thing here that **cannot** be indexed by process
+/// -- a system-wide count is the thing it is -- so the only way to stop CPUs
+/// serialising on `COUNTS[num]` is to give each its own row and add them up
+/// when somebody reads the file. The cost is `MAX_SYSCALL * 8 * BANKS` =
+/// **256 KiB of `.bss`**, against a kernel whose `.bss` is already measured
+/// in hundreds of megabytes, and 32768 relaxed loads on a `/proc/syscalls`
+/// read, which happens when a human asks.
+///
+/// One per possible CPU and not a smaller number on purpose: a bank shared
+/// by two CPUs is the same contention at a quarter of the memory, and
+/// picking which CPUs share it is a question with no good answer that would
+/// be asked again every time the core count changed.
+const COUNT_BANKS: usize = kernel_hal::config::MAX_CORE_NUM;
+
+/// `& (COUNT_BANKS - 1)` is the index, so the count has to be a power of two.
+/// Checked where a mistake cannot ship.
+const _: () = assert!(COUNT_BANKS.is_power_of_two());
+
+/// All banks off, which is what `SYSCALLBANKS=off` leaves behind: every CPU
+/// masks to bank 0 and the table behaves exactly as it did before the banks
+/// existed. A mask rather than a flag so the hot path is one load and an
+/// `and` either way, with no branch to predict -- and so the A/B Moebius
+/// runs on hardware measures the banks and not a branch.
+static BANK_MASK: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(COUNT_BANKS - 1);
+
+/// Turn the per-CPU banks off (`SYSCALLBANKS=off`), or back on. Boot knob.
+pub fn set_banks_enabled(on: bool) {
+    BANK_MASK.store(if on { COUNT_BANKS - 1 } else { 0 }, Ordering::Relaxed);
+}
+
+/// Whether the per-CPU banks are on.
+pub fn banks_enabled() -> bool {
+    BANK_MASK.load(Ordering::Relaxed) != 0
+}
+
+/// Which copy of the histogram a given CPU counts into.
+///
+/// `cpu_id()` is a `u8`, so it can name a CPU past the array; the mask is
+/// what bounds it, and it is the same mask the knob turns off.
+///
+/// Takes the CPU rather than asking, so the mask has a test: on the host
+/// `kernel_hal::cpu::cpu_id()` is a constant 0 -- libos has one logical CPU
+/// -- so a [`count_bank`] that dropped the mask entirely would answer 0 here
+/// either way, and nothing in a `cargo test` could tell.
+#[inline]
+fn bank_of_cpu(cpu: u8) -> usize {
+    (cpu as usize) & BANK_MASK.load(Ordering::Relaxed)
+}
+
+/// Which copy of the histogram this CPU counts into.
+#[inline]
+fn count_bank() -> usize {
+    bank_of_cpu(kernel_hal::cpu::cpu_id())
+}
+
+static COUNTS: [[AtomicU64; MAX_SYSCALL]; COUNT_BANKS] =
+    [const { [const { AtomicU64::new(0) }; MAX_SYSCALL] }; COUNT_BANKS];
 
 /// How many processes' last calls the table remembers.
 pub const TRACE_LEN: usize = 256;
@@ -48,7 +107,15 @@ pub const TRACE_LEN: usize = 256;
 /// so one spinning process could own all 256 slots and hide every sleeping
 /// one -- the exact case the paragraph above says this exists for. A slot per
 /// pid answers the question with one relaxed store, keeps the quiet processes
-/// visible, and shares a line only with the threads of its own process.
+/// visible, and takes the cross-CPU traffic off the common case.
+///
+/// Not *isolation*, and the difference matters: two pids whose slots collide
+/// write the same word, and eight `AtomicU64`s share a 64-byte line, so
+/// neighbouring slots false-share whatever happens. What the change bought
+/// was the removal of a word **every** thread on the machine wrote on
+/// **every** syscall; what is left is a word a handful of unrelated
+/// processes may share by chance. The benches measure the difference rather
+/// than asserting it ([`benches`][self::benches]).
 ///
 /// Two pids whose slots collide overwrite each other; with 256 slots that
 /// starts at a few dozen live processes, and the loser is a process whose
@@ -72,12 +139,92 @@ fn trace_slot(pid: u64) -> usize {
 /// Count one call of syscall `num` by process `pid`.
 #[inline]
 pub fn record(pid: u64, num: u32) {
+    record_in_bank(count_bank(), pid, num)
+}
+
+/// The body of [`record`], with the bank handed in.
+///
+/// Split out so the benches can measure what two CPUs counting the same
+/// syscall cost **against** two CPUs counting it into their own banks. On
+/// the host `kernel_hal::cpu::cpu_id()` is a constant 0 -- libos has one
+/// logical CPU -- so every thread of a `cargo bench` would land in bank 0
+/// and the rows would show the contention this change is meant to remove.
+/// The seam is what makes the claim measurable here; `SYSCALLBANKS=off` is
+/// what makes it measurable on real hardware.
+#[inline]
+fn record_in_bank(bank: usize, pid: u64, num: u32) {
     let idx = (num as usize).min(MAX_SYSCALL - 1);
-    COUNTS[idx].fetch_add(1, Ordering::Relaxed);
-    TRACE[trace_slot(pid)].store(
-        ((pid & 0xffff_ffff) << 32) | (num as u64 | 0x8000_0000),
-        Ordering::Relaxed,
-    );
+    COUNTS[bank & (COUNT_BANKS - 1)][idx].fetch_add(1, Ordering::Relaxed);
+    TRACE[trace_slot(pid)].store(pack(pid, num), Ordering::Relaxed);
+}
+
+/// Pack a `(pid, syscall)` into one word, never zero.
+///
+/// Zero means "never written", so some bit has to be spent saying "written",
+/// and a 64-bit word has no room for a 64-bit pid, a 32-bit syscall number
+/// and that bit. The bit comes out of the **pid**, which is already an
+/// approximation here -- the stored pid is the low half of a 64-bit KoID --
+/// so one more truncated bit changes its kind not at all. Zircon hands KoIDs
+/// out from `1 << 32` upwards, so the low half starts at 0 and climbs: the
+/// 31-bit field is exact until the kernel has created 2^31 objects.
+///
+/// It used to come out of the **syscall number** (`num | 0x8000_0000`, read
+/// back masked with `0x7fff_ffff`), which silently turned every number with
+/// bit 31 set into `0x7fff_ffff`. That is the opposite of what this table is
+/// for: the module promises raw numbers precisely so an invalid probe shows
+/// as the number the program actually passed. Found by Copilot on #1852.
+#[inline]
+fn pack(pid: u64, num: u32) -> u64 {
+    const WRITTEN: u64 = 1 << 63;
+    WRITTEN | ((pid & 0x7fff_ffff) << 32) | num as u64
+}
+
+/// The inverse of [`pack`], for a word known not to be zero.
+#[inline]
+fn unpack(v: u64) -> (u64, u32) {
+    ((v >> 32) & 0x7fff_ffff, v as u32)
+}
+
+/// Forget `pid`'s slot, if it is still `pid`'s.
+///
+/// Called from the process-teardown path. Without it a slot stays populated
+/// until some other pid hashes there, so the table drifts towards naming
+/// processes that exited long ago -- and because KoIDs are recycled, a stale
+/// call could be read as a freshly created process's last one before it had
+/// made any. The ring this replaced recycled its slots by being a ring; a
+/// slot per pid has to be told.
+///
+/// The compare is what makes it safe to call late: by the time teardown runs,
+/// another live process may own the slot, and clearing that one would hide a
+/// process that is still running.
+pub fn forget(pid: u64) {
+    let slot = &TRACE[trace_slot(pid)];
+    let v = slot.load(Ordering::Relaxed);
+    if v != 0 && unpack(v).0 == (pid & 0x7fff_ffff) {
+        slot.store(0, Ordering::Relaxed);
+    }
+}
+
+/// How many times syscall `num` has been counted **in one bank**.
+///
+/// Test-only: production has no reason to look at a single CPU's row, and
+/// the sum is what the file prints. It exists because the totals cannot see
+/// a bank index that is merely *wrong*: a mask that folded bank 63 onto bank
+/// 0 would keep every total exact and quietly put two CPUs back on one
+/// cacheline, which is the whole thing this table is cut up to avoid.
+#[cfg(test)]
+fn calls_in_bank(bank: usize, num: u32) -> u64 {
+    let idx = (num as usize).min(MAX_SYSCALL - 1);
+    COUNTS[bank][idx].load(Ordering::Relaxed)
+}
+
+/// How many times syscall `num` has been called, across every bank.
+pub fn calls_of(num: u32) -> u64 {
+    let idx = (num as usize).min(MAX_SYSCALL - 1);
+    COUNTS
+        .iter()
+        .map(|bank| bank[idx].load(Ordering::Relaxed))
+        .sum()
 }
 
 /// Each process's most recent call, as `(pid, syscall)`.
@@ -86,7 +233,7 @@ pub fn trace() -> alloc::vec::Vec<(u64, u32)> {
     for slot in TRACE.iter() {
         let v = slot.load(Ordering::Relaxed);
         if v != 0 {
-            out.push((v >> 32, (v as u32) & 0x7fff_ffff));
+            out.push(unpack(v));
         }
     }
     out
@@ -94,11 +241,17 @@ pub fn trace() -> alloc::vec::Vec<(u64, u32)> {
 
 /// Every syscall seen at least once, as `(number, calls)`, busiest first.
 pub fn snapshot() -> alloc::vec::Vec<(u32, u64)> {
-    let mut v: alloc::vec::Vec<(u32, u64)> = COUNTS
-        .iter()
-        .enumerate()
-        .filter_map(|(i, c)| {
-            let n = c.load(Ordering::Relaxed);
+    // Summed across the banks. Not a consistent snapshot of anything: a CPU
+    // can count into a bank already added while another is still being read,
+    // so a number can be short by a few calls. That was already true of a
+    // single row read while the machine ran, and the file is read twice and
+    // subtracted anyway.
+    let mut v: alloc::vec::Vec<(u32, u64)> = (0..MAX_SYSCALL)
+        .filter_map(|i| {
+            let n: u64 = COUNTS
+                .iter()
+                .map(|bank| bank[i].load(Ordering::Relaxed))
+                .sum();
             (n > 0).then_some((i as u32, n))
         })
         .collect();
@@ -265,12 +418,12 @@ mod tests {
     #[test]
     fn a_recorded_call_reaches_the_histogram() {
         const MINE: u32 = 500;
-        let before = COUNTS[MINE as usize].load(Ordering::Relaxed);
+        let before = calls_of(MINE);
         let pid = unclaimed_pids(1)[0];
         for _ in 0..7 {
             record(pid, MINE);
         }
-        assert_eq!(COUNTS[MINE as usize].load(Ordering::Relaxed) - before, 7);
+        assert_eq!(calls_of(MINE) - before, 7);
         assert_eq!(
             snapshot()
                 .into_iter()
@@ -280,20 +433,202 @@ mod tests {
         );
     }
 
+    /// Every bank a CPU can name is one that exists, and the mask is what
+    /// makes that true. `cpu_id()` is a `u8`, so it can say 200.
+    #[test]
+    fn every_bank_a_cpu_can_name_is_inside_the_array() {
+        let was = banks_enabled();
+        set_banks_enabled(true);
+        for cpu in [0u8, 1, 63, 64, 200, 255] {
+            let bank = bank_of_cpu(cpu);
+            assert!(bank < COUNT_BANKS, "cpu {} named bank {}", cpu, bank);
+        }
+        assert_eq!(1usize << COUNT_BANKS.trailing_zeros(), COUNT_BANKS);
+        // And the first `COUNT_BANKS` CPUs each get one of their own, which
+        // is the point: a mask that collapsed two of them would keep every
+        // total exact and put two CPUs back on one cacheline.
+        let banks: alloc::collections::BTreeSet<usize> =
+            (0..COUNT_BANKS).map(|c| bank_of_cpu(c as u8)).collect();
+        assert_eq!(
+            banks.len(),
+            COUNT_BANKS,
+            "{} CPUs share {} banks between them",
+            COUNT_BANKS,
+            banks.len()
+        );
+        set_banks_enabled(was);
+    }
+
+    /// Distinct bank arguments have to reach distinct rows. The totals
+    /// cannot see this: a bank index that folds 63 onto 0 keeps every sum
+    /// exact and silently undoes the change.
+    #[test]
+    fn distinct_banks_land_in_distinct_rows() {
+        const MINE: u32 = 503;
+        let pid = unclaimed_pids(1)[0];
+        let before: alloc::vec::Vec<u64> =
+            (0..COUNT_BANKS).map(|b| calls_in_bank(b, MINE)).collect();
+        // The last bank especially: an off-by-one in the mask takes that one.
+        for bank in [0, 1, COUNT_BANKS / 2, COUNT_BANKS - 1] {
+            record_in_bank(bank, pid, MINE);
+            assert_eq!(
+                calls_in_bank(bank, MINE) - before[bank],
+                1,
+                "a call for bank {} did not land in bank {}",
+                bank,
+                bank
+            );
+        }
+    }
+
+    /// The whole point: a call counted into any bank is in the total. A bank
+    /// the reader forgets is a syscall that stops being counted, which looks
+    /// exactly like a process that stopped making it.
+    #[test]
+    fn a_call_in_any_bank_is_in_the_total() {
+        const MINE: u32 = 501;
+        let before = calls_of(MINE);
+        let pid = unclaimed_pids(1)[0];
+        // The first, the last, and one in the middle: a reader that walked
+        // only the first bank, or stopped one short, fails here.
+        for bank in [0, COUNT_BANKS / 2, COUNT_BANKS - 1] {
+            record_in_bank(bank, pid, MINE);
+        }
+        assert_eq!(
+            calls_of(MINE) - before,
+            3,
+            "a bank is not being added up: counted {} of 3",
+            calls_of(MINE) - before
+        );
+        assert_eq!(
+            snapshot()
+                .into_iter()
+                .find(|(n, _)| *n == MINE)
+                .map(|(_, c)| c),
+            Some(before + 3),
+            "/proc/syscalls disagrees with calls_of"
+        );
+    }
+
+    /// A bank index past the array is masked rather than panicking. The
+    /// production caller cannot produce one today (`count_bank` masks), but
+    /// the body takes a number and the mask is the only thing between it and
+    /// a kernel panic on a `/proc` write away.
+    #[test]
+    fn a_bank_past_the_array_is_masked_and_not_a_panic() {
+        const MINE: u32 = 502;
+        let before = calls_of(MINE);
+        let pid = unclaimed_pids(1)[0];
+        record_in_bank(COUNT_BANKS, pid, MINE);
+        record_in_bank(usize::MAX, pid, MINE);
+        assert_eq!(calls_of(MINE) - before, 2);
+    }
+
+    /// The knob: off is the old behaviour (every CPU on bank 0), on is one
+    /// bank per CPU. Both are a mask, so neither costs a branch.
+    #[test]
+    fn the_knob_collapses_every_cpu_onto_one_bank_and_back() {
+        let was = banks_enabled();
+        set_banks_enabled(false);
+        assert!(!banks_enabled());
+        for cpu in [0u8, 1, 7, 63, 255] {
+            assert_eq!(
+                bank_of_cpu(cpu),
+                0,
+                "with the banks off cpu {} still counts into a bank of its own",
+                cpu
+            );
+        }
+        set_banks_enabled(true);
+        assert!(banks_enabled());
+        assert_eq!(bank_of_cpu(7), 7, "the mask did not come back");
+        assert_eq!(count_bank(), bank_of_cpu(kernel_hal::cpu::cpu_id()));
+        set_banks_enabled(was);
+    }
+
     /// A syscall number past the table is counted in the last slot rather
     /// than indexing out of bounds -- the `min` in `record`.
     #[test]
     fn a_syscall_number_past_the_table_lands_in_the_last_slot() {
-        let last = MAX_SYSCALL - 1;
-        let before = COUNTS[last].load(Ordering::Relaxed);
+        let last = (MAX_SYSCALL - 1) as u32;
+        let before = calls_of(last);
         let pid = unclaimed_pids(1)[0];
         record(pid, u32::MAX);
-        assert_eq!(COUNTS[last].load(Ordering::Relaxed) - before, 1);
-        // And the entry keeps the number it was given, masked the way the
-        // packing does: the pid must still be readable beside it.
+        assert_eq!(calls_of(last) - before, 1);
+        // And the entry keeps the number it was given, whole: the histogram
+        // clamps, the last-call table does not. See the test below.
         assert_eq!(
-            trace().into_iter().find(|(p, _)| *p == pid).map(|(p, _)| p),
-            Some(pid)
+            trace().into_iter().find(|(p, _)| *p == pid),
+            Some((pid, u32::MAX))
+        );
+    }
+
+    /// **Every bit of the syscall number survives the round trip.**
+    ///
+    /// The marker that says "this slot was written" used to live in bit 31 of
+    /// the number, so `u32::MAX` came back as `0x7fff_ffff` and every number
+    /// with the top bit set was silently rewritten. The module promises raw
+    /// numbers exactly so an invalid probe shows as the number the program
+    /// passed; rewriting it is the one thing this table must not do.
+    ///
+    /// Found by Copilot on #1852, after that packing had already merged. The
+    /// test it would have failed is this one, and the test that was there
+    /// instead asserted only that the **pid** survived.
+    #[test]
+    fn the_syscall_number_survives_whatever_bits_it_has_set() {
+        let pids = unclaimed_pids(4);
+        // 0 and the bit the old marker took; `MAX` and `MAX - 1` so an
+        // off-by-one in the field width shows.
+        for (pid, num) in pids.iter().zip([0u32, 0x8000_0000, u32::MAX, u32::MAX - 1]) {
+            record(*pid, num);
+            assert_eq!(
+                trace().into_iter().find(|(p, _)| *p == *pid),
+                Some((*pid, num)),
+                "syscall {:#x} did not come back whole for pid {}",
+                num,
+                pid
+            );
+        }
+    }
+
+    /// A slot whose process died is cleared, or the table drifts into naming
+    /// processes that exited long ago -- and KoIDs come back round, so a
+    /// stale call could be read as a brand-new process's last one.
+    #[test]
+    fn a_dead_process_stops_being_named() {
+        let pid = unclaimed_pids(1)[0];
+        record(pid, 42);
+        assert!(trace().into_iter().any(|(p, _)| p == pid));
+
+        forget(pid);
+
+        assert!(
+            !trace().into_iter().any(|(p, _)| p == pid),
+            "a process that exited is still named as making a call"
+        );
+    }
+
+    /// And `forget` only clears the slot while it is still that pid's: by the
+    /// time teardown runs, a live process may have taken it, and clearing
+    /// that one would hide a process that is still running.
+    #[test]
+    fn forgetting_a_dead_process_does_not_clear_a_live_ones_slot() {
+        // Two pids in the same slot: the collision is the case.
+        let first = unclaimed_pids(1)[0];
+        let want = trace_slot(first);
+        let second = (first + 1..first + (TRACE_LEN as u64 * 64))
+            .find(|p| trace_slot(*p) == want)
+            .expect("no second pid shares the slot");
+
+        record(first, 42);
+        record(second, 43);
+        // `second` wrote last, so the slot is its.
+        forget(first);
+
+        assert_eq!(
+            trace().into_iter().find(|(p, _)| *p == second),
+            Some((second, 43)),
+            "forgetting the dead process took the live one's slot with it"
         );
     }
 }
@@ -307,7 +642,9 @@ mod benches {
     //!
     //! `record` does two atomic operations: the histogram slot, and the
     //! per-process last-call entry. One is shared by every CPU making the
-    //! *same* syscall; the other only by the threads of one process. It used
+    //! *same* syscall; the other mostly by the threads of one process --
+    //! mostly, because colliding pids write the same word and adjacent slots
+    //! share a line. It used
     //! to do a third -- a `fetch_add` on a single global ring head, by every
     //! thread on the machine, on every syscall -- and a single-threaded row
     //! cannot see what that costs, because an uncontended `lock xadd` on a
@@ -335,12 +672,54 @@ mod benches {
     //! of the uncontended figure, which is what "shares nothing" should read
     //! like. The head is gone; see [`TRACE`].
     //!
-    //! What is left is row 3, and it is the histogram: four threads making
-    //! the same syscall still serialise on `COUNTS[num]`, at 87 ns under
-    //! saturation. That one cannot be indexed by process -- a system-wide
-    //! count is the thing it is -- so cutting it means a per-CPU table, which
-    //! is a different change with a memory cost to argue about. Measured and
-    //! left alone on purpose.
+    //! Row 3 was the histogram, and it is the one this file carries now.
+    //! Four threads making the same syscall serialised on `COUNTS[num]`.
+    //! It cannot be indexed by process -- a system-wide count is the thing
+    //! it is -- so it is indexed by **CPU**, one copy of the histogram each,
+    //! added up when somebody reads `/proc/syscalls`.
+    //!
+    //! ## Deciding it was worth 256 KiB
+    //!
+    //! The saturation figure is the one that comes out of this module by
+    //! default, and it is the one that could not decide anything: 87 ns, and
+    //! re-run it says 100 with a band of 68. So the row was taken at each
+    //! thread count instead:
+    //!
+    //! | threads on the same syscall | ns |
+    //! |---|---|
+    //! | 1 (alone) | 8.50 |
+    //! | 2 | **32.59** |
+    //! | 3 | 50.28 |
+    //! | 4 | 84-100 |
+    //!
+    //! **Two** is the row that decided it: +24 ns per syscall on a two-core
+    //! machine, which is the same order as the two clock reads the previous
+    //! change took off this path, and it is stable (+/- 8) where the
+    //! saturation row is not. A four-point curve costs three bench passes
+    //! and turns "87 ns under saturation, worth arguing about" into a
+    //! decision.
+    //!
+    //! ## What the banks cost and buy
+    //!
+    //! ```text
+    //! record_alone                                              8.81
+    //! record_while_others_count_different_syscalls              8.56
+    //! record_while_others_count_the_same_syscall               84.15
+    //! ..._the_same_syscall_in_their_own_banks                   8.56   <--
+    //! count_bank_of_this_cpu                                    0.94
+    //! record_shaped_control                                     0.62
+    //! ```
+    //!
+    //! The pair is the claim: the same four threads on the same syscall
+    //! number, differing in nothing but which bank they count into, and the
+    //! own-banks row lands on `record_alone`. The price is `count_bank`,
+    //! 0.94 against a 0.62 control, so about **0.3 ns on every syscall**
+    //! whether anything is contending or not.
+    //!
+    //! `cpu_id()` is a constant 0 on this host -- libos has one logical CPU
+    //! -- so the bank has to be handed in for the rows to differ at all.
+    //! That is what [`record_in_bank`] is for, and `SYSCALLBANKS=off` is the
+    //! same A/B on real hardware, where the CPU ids are real.
     //!
     //! **Read the contended rows with the container in mind.** This host has
     //! 4 cores and is shared, the background threads are neither pinned nor
@@ -369,24 +748,43 @@ mod benches {
     /// Runs `b.iter` with `OTHERS` threads calling `record` in a loop,
     /// numbering their calls with `other_num`.
     fn with_background(b: &mut Bencher, other_num: impl Fn(usize) -> u32 + Send + Sync + 'static) {
+        with_background_in_banks(b, other_num, |_| 0)
+    }
+
+    /// The same, with each thread's histogram bank handed in too.
+    ///
+    /// Two knobs because the two questions are separate: which *syscall
+    /// number* the other threads count (which cacheline inside a bank), and
+    /// which *bank* they count it into (which copy of the histogram). The
+    /// second is what [`COUNT_BANKS`] exists for, and on this host it has to
+    /// be handed in: libos has one logical CPU, so `count_bank()` answers 0
+    /// for every thread and `record` alone could never show the difference.
+    fn with_background_in_banks(
+        b: &mut Bencher,
+        other_num: impl Fn(usize) -> u32 + Send + Sync + 'static,
+        other_bank: impl Fn(usize) -> usize + Send + Sync + 'static,
+    ) {
         let stop = Arc::new(AtomicBool::new(false));
         let other_num = Arc::new(other_num);
+        let other_bank = Arc::new(other_bank);
         let mut threads = Vec::with_capacity(OTHERS);
         for i in 0..OTHERS {
             let stop = Arc::clone(&stop);
             let other_num = Arc::clone(&other_num);
+            let other_bank = Arc::clone(&other_bank);
             threads.push(thread::spawn(move || {
                 let num = other_num(i);
+                let bank = other_bank(i);
                 // A plain spin on `record`: the point is the cacheline
                 // traffic, so there is nothing to yield to.
                 while !stop.load(Ordering::Relaxed) {
                     for _ in 0..1024 {
-                        record(900 + i as u64, num);
+                        record_in_bank(bank, 900 + i as u64, num);
                     }
                 }
             }));
         }
-        b.iter(|| record(black_box(1), black_box(ORDINARY)));
+        b.iter(|| record_in_bank(black_box(0), black_box(1), black_box(ORDINARY)));
         stop.store(true, Ordering::Relaxed);
         for t in threads {
             let _ = t.join();
@@ -419,6 +817,25 @@ mod benches {
         // Numbers far enough apart to be on different cachelines: eight
         // `AtomicU64`s to a 64-byte line, so stride by 16.
         with_background(b, |i| 64 + (i as u32 + 1) * 16);
+    }
+
+    /// **The pair that justifies the banks.** The same four threads on the
+    /// same syscall number as the row above, except each counts into a bank
+    /// of its own, which is what a real machine does once the histogram is
+    /// per-CPU. Everything else about the row is identical, so the
+    /// difference between the two is the contention and nothing else.
+    #[bench]
+    fn record_while_others_count_the_same_syscall_in_their_own_banks(b: &mut Bencher) {
+        with_background_in_banks(b, |_| ORDINARY, |i| i + 1);
+    }
+
+    /// And what `count_bank` itself costs: one relaxed load of a read-mostly
+    /// word and an `and`. It is on every syscall whether or not anything is
+    /// contending, so it is the price of the rows above and belongs beside
+    /// them.
+    #[bench]
+    fn count_bank_of_this_cpu(b: &mut Bencher) {
+        b.iter(|| black_box(count_bank()));
     }
 
     /// The pid-to-slot mix on its own: one multiply and a shift, which is
