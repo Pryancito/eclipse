@@ -598,9 +598,6 @@ impl Syscall<'_> {
     /// (see [linux man msgctl(2)](https://www.man7.org/linux/man-pages/man2/msgctl.2.html)).
     pub fn sys_msgctl(&self, id: usize, cmd: usize, buf: usize) -> SysResult {
         info!("msgctl: id={}, cmd={}, buf={:#x}", id, cmd, buf);
-        const IPC_RMID: usize = 0;
-        const IPC_SET: usize = 1;
-        const IPC_STAT: usize = 2;
         match cmd {
             IPC_RMID => msg_remove(id, self.linux_process().euid()).map(|_| 0),
             IPC_SET => {
@@ -1017,7 +1014,19 @@ numeric_enum! {
     }
 }
 
-/// `msgctl(2)` commands beyond `IPC_RMID`/`IPC_SET`/`IPC_STAT`.
+/// The three commands every System V object takes, from `<linux/ipc.h>`.
+///
+/// `semctl` and `shmctl` reach them through [`SemctlCmds`] and [`ShmctlCmds`],
+/// which carry their own copy of the same four numbers; these used to be a
+/// third copy, declared inside `sys_msgctl`'s body where no test could see
+/// them. `IPC_RMID` is the one that costs: a `msgctl` that took it for
+/// `IPC_STAT` would destroy the queue the caller only meant to read.
+const IPC_RMID: usize = 0;
+/// `IPC_SET`: write some members of the `msqid_ds` the caller hands in.
+const IPC_SET: usize = 1;
+/// `IPC_STAT`: copy the kernel's `msqid_ds` out to the caller.
+const IPC_STAT: usize = 2;
+/// `IPC_INFO`: the system's limits, with the first argument ignored.
 const IPC_INFO: usize = 3;
 /// `MSG_STAT`: `IPC_STAT` by table index, returning the id.
 const MSG_STAT: usize = 11;
@@ -2402,5 +2411,171 @@ mod benches {
                 msgctl_subject(black_box(2), black_box(0)),
             ))
         });
+    }
+}
+
+#[cfg(test)]
+mod command_number_tests {
+    //! The numbers `semctl`, `shmctl`, `msgctl`, `semop` and `msgrcv` are
+    //! made of, written out here from the headers and compared against
+    //! nothing else in the tree.
+    //!
+    //! Every one of these is a word userspace hands in: the third argument of
+    //! `semctl(2)` and `shmctl(2)`, the second of `msgctl(2)`, the flag word
+    //! of `semop(2)` and `msgrcv(2)`. Nothing inside this kernel can check
+    //! one, because the `match` arm and the number it matches are the same
+    //! constant and agree with each other whatever it says. Measured by
+    //! mutation over the whole suite, 22 of these 28 numbers could be changed
+    //! without a single test noticing.
+    //!
+    //! `IPC_RMID` is the one that costs. It is the command that *destroys*
+    //! the object, and it sits next to `IPC_STAT`, which only reads it. A
+    //! number that drifted so that one arrived as the other would have
+    //! `ipcs -q` deleting the queues it was asked to list, and nothing would
+    //! report an error.
+    //!
+    //! The four shared commands are written out three times in this file ---
+    //! once in each of the two tables and once as the plain constants
+    //! `msgctl` uses --- so the second test here is that the three agree.
+
+    use super::*;
+
+    #[test]
+    fn the_commands_every_ipc_object_takes_are_the_numbers_linux_ipc_h_gives() {
+        assert_eq!(IPC_RMID, 0, "destroys the object");
+        assert_eq!(IPC_SET, 1);
+        assert_eq!(IPC_STAT, 2);
+        assert_eq!(IPC_INFO, 3);
+    }
+
+    #[test]
+    fn the_three_command_tables_agree_on_the_shared_four() {
+        // Nothing in the compiler keeps these in step: they are three
+        // separate declarations of one set of ABI numbers, and a `semctl`
+        // and a `msgctl` that disagreed about which number means "remove"
+        // would be two different kernels to the same libc.
+        let rows: &[(&str, usize, SemctlCmds, ShmctlCmds)] = &[
+            (
+                "IPC_RMID",
+                IPC_RMID,
+                SemctlCmds::IPC_RMID,
+                ShmctlCmds::IPC_RMID,
+            ),
+            ("IPC_SET", IPC_SET, SemctlCmds::IPC_SET, ShmctlCmds::IPC_SET),
+            (
+                "IPC_STAT",
+                IPC_STAT,
+                SemctlCmds::IPC_STAT,
+                ShmctlCmds::IPC_STAT,
+            ),
+            (
+                "IPC_INFO",
+                IPC_INFO,
+                SemctlCmds::IPC_INFO,
+                ShmctlCmds::IPC_INFO,
+            ),
+        ];
+        for &(name, plain, sem, shm) in rows {
+            assert_eq!(sem as usize, plain, "{} differs in SemctlCmds", name);
+            assert_eq!(shm as usize, plain, "{} differs in ShmctlCmds", name);
+        }
+    }
+
+    #[test]
+    fn the_semctl_commands_are_the_numbers_linux_sem_h_gives() {
+        // `<linux/sem.h>`, which starts the per-object commands at 11 and
+        // leaves 4 to 10 unused. `GETVAL` and `SETVAL` read and write one
+        // semaphore's value, so swapping their numbers makes a read into a
+        // write of whatever the caller left in `arg`.
+        assert_eq!(SemctlCmds::GETPID as usize, 11);
+        assert_eq!(SemctlCmds::GETVAL as usize, 12);
+        assert_eq!(SemctlCmds::GETALL as usize, 13);
+        assert_eq!(SemctlCmds::GETNCNT as usize, 14);
+        assert_eq!(SemctlCmds::GETZCNT as usize, 15);
+        assert_eq!(SemctlCmds::SETVAL as usize, 16);
+        assert_eq!(SemctlCmds::SETALL as usize, 17);
+        assert_eq!(SemctlCmds::SEM_STAT as usize, 18);
+        assert_eq!(SemctlCmds::SEM_INFO as usize, 19);
+        assert_eq!(SemctlCmds::SEM_STAT_ANY as usize, 20);
+    }
+
+    #[test]
+    fn the_shmctl_commands_are_the_numbers_linux_shm_h_gives() {
+        // `<linux/shm.h>` reuses 11 to 15 for its own five, which is why a
+        // number copied from the wrong header still looks plausible:
+        // `SHM_STAT` is 13 and `GETALL` is 13, and they are different calls.
+        assert_eq!(ShmctlCmds::SHM_LOCK as usize, 11);
+        assert_eq!(ShmctlCmds::SHM_UNLOCK as usize, 12);
+        assert_eq!(ShmctlCmds::SHM_STAT as usize, 13);
+        assert_eq!(ShmctlCmds::SHM_INFO as usize, 14);
+        assert_eq!(ShmctlCmds::SHM_STAT_ANY as usize, 15);
+    }
+
+    #[test]
+    fn the_msgctl_commands_are_the_numbers_linux_msg_h_gives() {
+        // `<linux/msg.h>`, and `ipcs -q` walks the table with `MSG_STAT`.
+        assert_eq!(MSG_STAT, 11);
+        assert_eq!(MSG_INFO, 12);
+        assert_eq!(MSG_STAT_ANY, 13);
+        // And the five `msgctl` takes are five different commands.
+        let all = [
+            IPC_RMID,
+            IPC_SET,
+            IPC_STAT,
+            IPC_INFO,
+            MSG_STAT,
+            MSG_INFO,
+            MSG_STAT_ANY,
+        ];
+        for (i, a) in all.iter().enumerate() {
+            for b in &all[i + 1..] {
+                assert_ne!(a, b, "two msgctl commands share a number");
+            }
+        }
+    }
+
+    #[test]
+    fn the_shmat_flags_are_the_octal_numbers_linux_shm_h_gives() {
+        // Written in octal, which is how `<linux/shm.h>` writes them.
+        // `SHM_RDONLY` is the one with teeth: lost, a read-only attach
+        // becomes writable and the caller can corrupt a segment it was only
+        // given to read.
+        assert_eq!(SHM_RDONLY, 0o10000);
+        assert_eq!(SHM_RND, 0o20000);
+        assert_eq!(SHM_REMAP, 0o40000);
+        // Three consecutive bits, and none of them the 0o100000 the header
+        // keeps for `SHM_EXEC`.
+        for f in [SHM_RDONLY, SHM_RND, SHM_REMAP] {
+            assert_eq!(f.count_ones(), 1);
+            assert_ne!(f, 0o100000, "0o100000 is SHM_EXEC");
+        }
+        assert_eq!(SHM_RND, SHM_RDONLY << 1);
+        assert_eq!(SHM_REMAP, SHM_RND << 1);
+    }
+
+    #[test]
+    fn the_wait_and_receive_flags_are_the_numbers_the_headers_give() {
+        // `IPC_NOWAIT` is written twice in this file, once in octal for
+        // `msgsnd`/`msgrcv` and once in hex inside `SemFlags` for `semop`,
+        // and they are the same bit of the same ABI: `00004000` is `0x800`.
+        assert_eq!(IPC_NOWAIT, 0o4000);
+        assert_eq!(SemFlags::IPC_NOWAIT.bits(), 0x800);
+        assert_eq!(IPC_NOWAIT, SemFlags::IPC_NOWAIT.bits() as usize);
+        // `SEM_UNDO` is the one the kernel has to honour on exit: lost, a
+        // process that dies holding a semaphore never gives it back and
+        // every other waiter blocks forever.
+        assert_eq!(SemFlags::SEM_UNDO.bits(), 0x1000);
+        // `<linux/msg.h>`'s three, in its own octal.
+        assert_eq!(MSG_NOERROR, 0o10000);
+        assert_eq!(MSG_EXCEPT, 0o20000);
+        assert_eq!(MSG_COPY, 0o40000);
+        let recv = [MSG_NOERROR, MSG_EXCEPT, MSG_COPY];
+        for (i, a) in recv.iter().enumerate() {
+            assert_eq!(a.count_ones(), 1);
+            assert_ne!(*a, IPC_NOWAIT, "msgrcv takes IPC_NOWAIT too");
+            for b in &recv[i + 1..] {
+                assert_ne!(a, b);
+            }
+        }
     }
 }
