@@ -2873,3 +2873,30 @@ fn el_trozo_de_linea_del_principio_de_la_ventana_no_llega_a_la_consola() {
     );
     assert_eq!(lines[1], "Daemon startup failed.");
 }
+
+/// A service's log goes to the kernel console verbatim, so an escape
+/// sequence in it would be OBEYED: `\x1b[2J` clears the screen, a carriage
+/// return overwrites the line above. That would wipe the very boot messages
+/// this volcado exists to put on screen.
+#[test]
+fn una_secuencia_de_escape_en_el_log_no_llega_a_mandar_en_la_consola() {
+    let out = tail_lines("\x1b[2J\x1b[Hborrando\rotra vez\x07\n");
+    assert_eq!(out.len(), 1);
+    assert!(
+        !out[0].contains('\x1b') && !out[0].contains('\r') && !out[0].contains('\x07'),
+        "un caracter de control llego entero a la consola: {:?}",
+        out[0]
+    );
+    assert!(out[0].contains("borrando"), "{:?}", out[0]);
+    assert!(out[0].contains("otra vez"), "{:?}", out[0]);
+}
+
+/// A line that is nothing but control characters is not a line: it would
+/// print as a row of spaces and cost one of the eight. (The printable
+/// remains of an escape sequence -- the `[0m` of `\x1b[0m` -- ARE content,
+/// and stay: neutering the escape is the job, hiding the log is not.)
+#[test]
+fn una_linea_de_puro_control_no_gasta_una_de_las_ocho() {
+    let out = tail_lines("\x07\x07\x00\nel error de verdad\n");
+    assert_eq!(out, vec!["el error de verdad"]);
+}

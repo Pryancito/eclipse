@@ -2799,8 +2799,40 @@ const LOG_TAIL_BYTES: u64 = 16 * 1024;
 /// single 4 KiB line (a module list, a backtrace) would take the screen.
 const LOG_TAIL_COLS: usize = 200;
 
-/// The last [`LOG_TAIL_LINES`] non-empty lines of `text`, each cut to
-/// [`LOG_TAIL_COLS`] characters.
+/// One log line as it may be printed: control characters neutered, trailing
+/// whitespace gone, and cut to [`LOG_TAIL_COLS`] characters with a visible
+/// mark when it was cut.
+///
+/// The escapes are the point, not the width. This is a service's own output
+/// going to the kernel console verbatim, and a log holding `\x1b[2J` or a
+/// carriage return would CLEAR or overwrite the boot messages above it --
+/// which is precisely the diagnostic this feature exists to put there. Every
+/// control character becomes a space, so an escape sequence prints as the
+/// harmless `[2J` instead of being obeyed. ANSI-coloured service output (a
+/// very common thing in a log) also stops arriving as colour, which is the
+/// right trade: init's own lines are plain.
+///
+/// One pass over the characters: the line can be multiple KiB (a backtrace,
+/// a module dump) and counting it before cutting it walked it twice.
+fn console_safe(line: &str) -> String {
+    let mut chars = line.chars();
+    let mut out: String = chars
+        .by_ref()
+        .take(LOG_TAIL_COLS)
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    // `next` only after the take: it is the one character past the cut, and
+    // asking for it is how the cut is detected without a second walk.
+    let cut = chars.next().is_some();
+    out.truncate(out.trim_end().len());
+    if cut {
+        out.push_str(" ...");
+    }
+    out
+}
+
+/// The last [`LOG_TAIL_LINES`] non-empty lines of `text`, each one as
+/// [`console_safe`] leaves it.
 ///
 /// Separate from the file reading so it can be tested without a filesystem,
 /// and because every edge here is a real log: a file that ends without a
@@ -2810,25 +2842,12 @@ const LOG_TAIL_COLS: usize = 200;
 /// byte offset, not at a line boundary, so it is dropped unless it is the
 /// only one there is.
 fn tail_lines(text: &str) -> Vec<String> {
-    let lines: Vec<&str> = text
+    let lines: Vec<String> = text
         .lines()
-        .map(|l| l.trim_end_matches(['\r', ' ', '\t']))
+        .map(console_safe)
         .filter(|l| !l.is_empty())
         .collect();
-    lines
-        .iter()
-        .rev()
-        .take(LOG_TAIL_LINES)
-        .rev()
-        .map(|l| {
-            if l.chars().count() > LOG_TAIL_COLS {
-                let cut: String = l.chars().take(LOG_TAIL_COLS).collect();
-                format!("{cut} ...")
-            } else {
-                (*l).to_string()
-            }
-        })
-        .collect()
+    lines.into_iter().rev().take(LOG_TAIL_LINES).rev().collect()
 }
 
 /// The tail of the log file at `path`, ready to print. Empty for every
@@ -2837,10 +2856,21 @@ fn log_tail(path: &str) -> Vec<String> {
     let Ok(mut file) = fs::File::open(path) else {
         return Vec::new();
     };
-    let size = file.metadata().map(|m| m.len()).unwrap_or(0);
-    // Seek only when the file is bigger than the window; `seek` on a short
-    // file with a negative-looking offset would be an error, not a rewind.
-    if size > LOG_TAIL_BYTES && file.seek(SeekFrom::End(-(LOG_TAIL_BYTES as i64))).is_err() {
+    // The size comes from a seek to the end and not from `metadata`, so a
+    // `stat` that fails cannot answer 0 and send the read below down the
+    // "small file, read it whole" path -- on a megabyte log that is the one
+    // thing PID 1 must not do.
+    let Ok(size) = file.seek(SeekFrom::End(0)) else {
+        return Vec::new();
+    };
+    // And back to where the read starts: the end-seek above left the cursor
+    // past the last byte, so a short file needs an explicit rewind.
+    let from = if size > LOG_TAIL_BYTES {
+        SeekFrom::End(-(LOG_TAIL_BYTES as i64))
+    } else {
+        SeekFrom::Start(0)
+    };
+    if file.seek(from).is_err() {
         return Vec::new();
     }
     let mut buf = Vec::new();
