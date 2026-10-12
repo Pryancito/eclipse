@@ -232,7 +232,7 @@ fn the_zombies_the_dying_process_never_reaped_move_to_the_adopter() {
     let parent = a_child_of(&top);
     parent
         .linux()
-        .record_child_exit(46_777, 9, Default::default());
+        .record_child_exit(46_777, 9, Default::default(), 0);
     assert!(holds_zombie(&parent, 46_777));
 
     parent.exit(0);

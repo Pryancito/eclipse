@@ -74,3 +74,8 @@ required-features = ["mock-disk"]
 name = "signal"
 harness = true
 required-features = ["mock-disk"]
+
+[[bench]]
+name = "process"
+harness = true
+required-features = ["mock-disk"]

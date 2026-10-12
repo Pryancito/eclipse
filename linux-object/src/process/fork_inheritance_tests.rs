@@ -192,7 +192,14 @@ fn the_open_files_survive_the_fork() {
 #[test]
 fn a_child_starts_with_no_children_of_its_own() {
     let mut parent = a_configured_parent();
-    parent.reaped_children.insert(99, (0, Default::default()));
+    parent.reaped_children.insert(
+        99,
+        ReapedChild {
+            code: 0,
+            cpu: Default::default(),
+            pgid: 0,
+        },
+    );
     let child = fork_of(&parent);
     assert!(child.children.is_empty());
     assert!(
