@@ -383,6 +383,15 @@ pub fn hwflip_enabled() -> bool {
     false
 }
 
+/// Implicit synchronisation on shared buffers (`nvidia.implicit_sync`).
+/// Default ON; the hatch only turns it off.
+#[cfg(target_arch = "x86_64")]
+pub fn set_implicit_sync_enabled(v: bool) {
+    zcore_drivers::display::set_implicit_sync_enabled(v);
+}
+#[cfg(not(target_arch = "x86_64"))]
+pub fn set_implicit_sync_enabled(_v: bool) {}
+
 /// Opt-in NVC57E ISO surface flip (`nvidia.surfaceflip`). Default off.
 #[cfg(target_arch = "x86_64")]
 pub fn set_surfaceflip_enabled(v: bool) {

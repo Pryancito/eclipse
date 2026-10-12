@@ -711,6 +711,21 @@ fn primary_main(config: kernel_hal::KernelConfig) {
                 linux_object::fs::devfs::drm::set_atomic_enabled(true);
                 klog_info!("Eclipse: DRM atomic modesetting ENABLED (drm.atomic)");
             }
+            // Sincronizacion implicita en los buffers que un proceso presta
+            // a otro, ENCENDIDA por defecto: un EXEC espera a lo que el dueno
+            // del buffer tenga en vuelo antes de leerlo, que es lo que en
+            // Linux hace el `dma_resv` del objeto. Sin ella, un compositor que
+            // muestrea el frame recien dibujado de un cliente no esperaba a
+            // nadie salvo que ambos hablasen `linux-drm-syncobj-v1`, y el
+            // frame salia a medio pintar. `nvidia.implicit_sync=off` vuelve al
+            // comportamiento anterior sin recompilar.
+            if kernel_hal::cmdline::is_off(&options.cmdline, "nvidia.implicit_sync") {
+                kernel_hal::drivers::set_implicit_sync_enabled(false);
+                klog_info!(
+                    "Eclipse: nvidia.implicit_sync=off -- un EXEC solo espera los syncobj que \
+                     nombra su cliente (puede salir un frame a medio dibujar)"
+                );
+            }
             // Pre-present fence wait, ON by default: a legacy SETCRTC /
             // PAGE_FLIP waits for the GPU to finish writing the buffer before
             // it is scanned out, the way the atomic path already waits on
