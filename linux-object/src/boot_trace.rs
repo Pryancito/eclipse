@@ -384,6 +384,32 @@ pub fn render() -> String {
     out
 }
 
+/// Hold the recorder's turnstile, with the state wiped, until the end of the
+/// test.
+///
+/// Crate-visible, not private to the test module below: `perf`'s sampler is
+/// overridden while this recorder is armed (the tracer needs a real duration
+/// for every syscall, not one call in sixteen), and the test of *that* has to
+/// arm the recorder and so has to serialise against these tests too.
+///
+/// The guard travels in a `let _alone = ...` binding so a failed assertion's
+/// unwind releases it; naming it `_` would drop it on the spot and serialise
+/// nothing.
+#[cfg(test)]
+#[must_use = "bind it to `_alone`: a bare `_` releases the turnstile at once"]
+pub(crate) fn alone_with_the_recorder() -> spin::MutexGuard<'static, ()> {
+    static GUARD: spin::Mutex<()> = spin::Mutex::new(());
+    let guard = GUARD.lock();
+    ENABLED.store(false, Ordering::Relaxed);
+    *TARGET.lock() = None;
+    ARMED_PID.store(0, Ordering::Relaxed);
+    T0_NS.store(0, Ordering::Relaxed);
+    T0_UPTIME_NS.store(0, Ordering::Relaxed);
+    RECS.lock().clear();
+    DROPPED.store(0, Ordering::Relaxed);
+    guard
+}
+
 #[cfg(test)]
 mod tests {
     //! Every piece of this recorder's state is a process-global `static`:
@@ -398,26 +424,6 @@ mod tests {
 
     use super::*;
     use core::sync::atomic::AtomicBool;
-
-    /// Hold the recorder's turnstile, with the state wiped, until the end of the
-    /// test.
-    ///
-    /// The guard travels in a `let _alone = ...` binding so a failed assertion's
-    /// unwind releases it; naming it `_` would drop it on the spot and serialise
-    /// nothing.
-    #[must_use = "bind it to `_alone`: a bare `_` releases the turnstile at once"]
-    fn alone_with_the_recorder() -> spin::MutexGuard<'static, ()> {
-        static GUARD: spin::Mutex<()> = spin::Mutex::new(());
-        let guard = GUARD.lock();
-        ENABLED.store(false, Ordering::Relaxed);
-        *TARGET.lock() = None;
-        ARMED_PID.store(0, Ordering::Relaxed);
-        T0_NS.store(0, Ordering::Relaxed);
-        T0_UPTIME_NS.store(0, Ordering::Relaxed);
-        RECS.lock().clear();
-        DROPPED.store(0, Ordering::Relaxed);
-        guard
-    }
 
     /// A pid in the range real ones come from: koids start at `1 << 32`.
     const PID: u64 = 1 << 32;

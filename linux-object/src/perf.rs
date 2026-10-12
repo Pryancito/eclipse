@@ -49,14 +49,83 @@ pub fn name_of(num: u32) -> String {
     alloc::format!("sys_{}", num)
 }
 
+/// How many syscalls share one clock reading, so the latency columns can be
+/// filled without timing every call. 1 times every one.
+///
+/// **Why there is a sampler at all.** The dispatch brackets every syscall
+/// with `kernel_hal::timer::timer_now()`, and on x86_64 that is `rdtsc`,
+/// which benches at **10.91 ns** -- twice per syscall, about 22 ns, paid by
+/// every call whether or not anyone ever reads `/proc/perf`. For comparison,
+/// the whole of hunter's per-syscall security gate is 5.95 ns. The *counts*
+/// are what name a process spinning in a syscall and they cost a relaxed
+/// increment, so they stay exact; it is only the nanoseconds that need the
+/// clock, and a profile does not need every call measured to say which
+/// syscall is slow.
+///
+/// A sampled call's reading is multiplied by this interval as it is recorded,
+/// so `TOTAL ms` and `AVG us` stay on the same scale they always were -- an
+/// **estimate** now, which the reports say. Changing the interval at runtime
+/// mixes two scales in the running totals; it is a boot knob (`PERFSAMPLE=`)
+/// for that reason.
+static SAMPLE_INTERVAL: AtomicU32 = AtomicU32::new(DEFAULT_SAMPLE_INTERVAL);
+
+/// One call in sixteen. Enough samples that a syscall called at all is timed
+/// within a few hundred calls, and 15/16 of the clock reads gone.
+const DEFAULT_SAMPLE_INTERVAL: u32 = 16;
+
+/// Set how many syscalls share one clock reading; 1 times every syscall and
+/// makes the latency columns exact. Called once at boot from `PERFSAMPLE=`.
+pub fn set_sample_interval(n: u32) {
+    SAMPLE_INTERVAL.store(n.max(1), Relaxed);
+}
+
+/// How many syscalls share one clock reading. Never zero.
+#[inline]
+pub fn sample_interval() -> u32 {
+    SAMPLE_INTERVAL.load(Relaxed).max(1)
+}
+
+/// Whether the dispatch should bracket this process's next syscall with the
+/// clock.
+///
+/// Two reasons to time a call, and they live here together rather than as an
+/// `||` in the dispatcher so the composition is testable: the sampler says so
+/// ([`ProcPerf::should_time`]), or the boot tracer is armed. The tracer puts a
+/// duration against every syscall it records, so one call in sixteen would
+/// leave fifteen of its rows reading zero; it overrides the sampler for as
+/// long as it is armed, which is a boot-time window.
+///
+/// Read at syscall *entry*. Arming the tracer between a call's entry and its
+/// exit leaves that one call untimed and so recorded at 0 ns -- one row, in
+/// the window where somebody is arming a boot tracer by hand.
+#[inline]
+pub fn should_time_syscall(perf: &ProcPerf) -> bool {
+    crate::boot_trace::enabled() || perf.should_time()
+}
+
 /// Record one completed syscall: bump the global tables and the calling
-/// process's own counters. `ns` is the wall-clock time the syscall took.
-pub fn record(proc: &LinuxProcess, num: u32, ns: u64) {
+/// process's own counters.
+///
+/// `ns` is the wall-clock time the syscall took when `timed` is set, and
+/// meaningless otherwise -- an untimed call is counted and contributes no
+/// time, which is the whole point of [`SAMPLE_INTERVAL`]. The reading is
+/// scaled here rather than at render time so the stored totals keep their
+/// units and no second counter is needed to divide by.
+pub fn record(proc: &LinuxProcess, num: u32, ns: u64, timed: bool) {
+    let scaled = if timed {
+        ns.saturating_mul(sample_interval() as u64)
+    } else {
+        0
+    };
     if (num as usize) < PERF_NR {
         SYS_COUNT[num as usize].fetch_add(1, Relaxed);
-        SYS_NS[num as usize].fetch_add(ns, Relaxed);
+        // Skipped when untimed: adding zero still dirties a cacheline that
+        // every CPU making this syscall shares.
+        if timed {
+            SYS_NS[num as usize].fetch_add(scaled, Relaxed);
+        }
     }
-    proc.perf().record(num, ns);
+    proc.perf().record(num, scaled, timed);
 }
 
 /// Per-process syscall accounting, stored inline on [`LinuxProcess`] so it is
@@ -93,13 +162,47 @@ impl ProcPerf {
         }
     }
 
-    fn record(&self, num: u32, ns: u64) {
+    fn record(&self, num: u32, ns: u64, timed: bool) {
         self.count.fetch_add(1, Relaxed);
-        self.ns.fetch_add(ns, Relaxed);
+        // `ns` is already zero when untimed, so dropping this guard changes
+        // no reading: it is an *equivalent* mutant, and no unit test can
+        // fall for it. It stays because the two totals are a cacheline the
+        // threads of this process share, and an add of zero dirties it just
+        // the same.
+        if timed {
+            self.ns.fetch_add(ns, Relaxed);
+        }
         if (num as usize) < self.per.len() {
             self.per[num as usize].fetch_add(1, Relaxed);
-            self.per_ns[num as usize].fetch_add(ns, Relaxed);
+            if timed {
+                self.per_ns[num as usize].fetch_add(ns, Relaxed);
+            }
         }
+    }
+
+    /// Whether the dispatch should read the clock around this process's next
+    /// syscall.
+    ///
+    /// Asked at syscall entry, and it has to be cheap or it defeats itself:
+    /// one relaxed load of `count`, a counter the exit path of this same
+    /// syscall is about to increment anyway, so the line is one this CPU
+    /// already wants. **Per process on purpose** -- a global sampling counter
+    /// would be exactly the machine-wide atomic increment that
+    /// `syscall_stats` just had removed from this path, and sampling a
+    /// process's own calls is also the right denominator for
+    /// `/proc/<pid>/perf`.
+    ///
+    /// The threads of one process share the counter, so a racing pair can
+    /// both see the same value and both time their call, or neither. Either
+    /// way the estimate stays within the sampler's own error: no count is
+    /// lost, and a double sample is one extra reading scaled by the same
+    /// interval.
+    #[inline]
+    pub fn should_time(&self) -> bool {
+        let n = sample_interval();
+        // `n == 1` first only to skip the divide in exact mode; the
+        // remainder would answer the same.
+        n == 1 || self.count.load(Relaxed).is_multiple_of(n as u64)
     }
 
     /// `(total calls, total nanoseconds)`.
@@ -116,6 +219,17 @@ fn fmt_table(out: &mut String, mut rows: Vec<(u32, u64, u64)>) {
         "  {:<20} {:>12} {:>12} {:>10}",
         "SYSCALL", "CALLS", "TOTAL ms", "AVG us"
     );
+    let n = sample_interval();
+    if n > 1 {
+        // Said once per table rather than per row: CALLS is exact, the two
+        // time columns are extrapolated from one call in `n`, and a reader
+        // who does not know that would read a sampling artefact as a stall.
+        let _ = writeln!(
+            out,
+            "  (CALLS exact; TOTAL ms and AVG us estimated from 1 call in {} -- PERFSAMPLE=1 to time every one)",
+            n
+        );
+    }
     for (num, calls, ns) in rows {
         if calls == 0 {
             continue;
@@ -1469,6 +1583,376 @@ pub fn proc_report(proc: &LinuxProcess, pid: u64) -> String {
     out
 }
 
+/// Run `f` with the sampling interval at `n`, and alone: nothing else in the
+/// test binary may be looking at the interval meanwhile.
+///
+/// [`SAMPLE_INTERVAL`] is one process-global static -- it is a boot knob, and
+/// production sets it once -- so without this turnstile two tests that want
+/// different intervals read each other's, which showed up as three failures
+/// at `--test-threads=16` and none at 1. The per-process counters needed no
+/// such thing: each test already uses a pid of its own.
+///
+/// Lock order, for anything that also needs the boot recorder's turnstile
+/// ([`crate::boot_trace::alone_with_the_recorder`]): **this one first**.
+#[cfg(test)]
+pub(crate) fn with_interval(n: u32, f: impl FnOnce()) {
+    static GUARD: spin::Mutex<()> = spin::Mutex::new(());
+    let _guard = GUARD.lock();
+    let was = sample_interval();
+    set_sample_interval(n);
+    f();
+    set_sample_interval(was);
+}
+
+#[cfg(test)]
+mod sampling_tests {
+    //! The latency sampler: which syscalls get a clock reading, and what the
+    //! stored totals mean once only one call in `n` is timed.
+    //!
+    //! Every test runs inside [`with_interval`], because the interval is one
+    //! static the whole crate's test binary shares.
+
+    use super::*;
+    use crate::process::ProcessExt;
+    use rcore_fs_ramfs::RamFS;
+    use zircon_object::object::KoID;
+    use zircon_object::task::Process;
+
+    /// A real process, so the tests go through the **production** [`record`]
+    /// and not a copy of its arithmetic.
+    ///
+    /// The first version of these tests had a `record_scaled` helper in the
+    /// test module that repeated the scaling, and it cost four surviving
+    /// mutants: removing the scaling from `record`, making it wrap instead of
+    /// saturate, and two more all passed, because nothing in the suite ever
+    /// called the function being mutated. **A test that reimplements what it
+    /// is testing tests the reimplementation.**
+    ///
+    /// Each test uses a pid of its own: the per-process counters are the
+    /// subject here, and `cargo test` runs in parallel.
+    fn a_process(pid: KoID) -> alloc::sync::Arc<Process> {
+        Process::create_linux(&zircon_object::task::ROOT_JOB, RamFS::new(), 0, None, pid).unwrap()
+    }
+
+    /// The interval can never be zero, whatever it is set to: `should_time`
+    /// takes `count % n`, and a zero would be a division by zero in the
+    /// syscall entry path of every process -- a boot knob typo taking the
+    /// machine down.
+    #[test]
+    fn a_zero_interval_is_refused_and_reads_as_one() {
+        with_interval(16, || {
+            set_sample_interval(0);
+            assert_eq!(sample_interval(), 1);
+            // And the arithmetic it feeds does not trap: `should_time` takes
+            // `count % n`, which with a zero would be a division by zero in
+            // the syscall entry path of every process.
+            let proc = a_process(910_001);
+            assert!(proc.linux().perf().should_time());
+            record(proc.linux(), 0, 100, true);
+        });
+    }
+
+    /// `PERFSAMPLE=1` is the exact mode: every syscall is timed, and a
+    /// reading is stored at face value rather than multiplied.
+    #[test]
+    fn an_interval_of_one_times_every_syscall_and_scales_nothing() {
+        with_interval(1, || {
+            let proc = a_process(910_002);
+            let p = proc.linux();
+            for _ in 0..8 {
+                assert!(p.perf().should_time(), "every call is timed at interval 1");
+                record(p, 0, 100, true);
+            }
+            assert_eq!(p.perf().totals(), (8, 800));
+        });
+    }
+
+    /// At interval `n`, one call in `n` is timed -- the first, then every
+    /// `n`th after it.
+    #[test]
+    fn one_call_in_n_is_timed() {
+        with_interval(4, || {
+            let proc = a_process(910_003);
+            let p = proc.linux();
+            let mut timed = 0;
+            for _ in 0..16 {
+                let t = p.perf().should_time();
+                if t {
+                    timed += 1;
+                }
+                record(p, 0, 100, t);
+            }
+            assert_eq!(timed, 4, "16 calls at interval 4");
+            // Counts exact, time extrapolated: four readings of 100 ns, each
+            // standing for four calls.
+            assert_eq!(p.perf().totals(), (16, 16 * 100));
+        });
+    }
+
+    /// **The property that makes the estimate usable.** The scaled total is
+    /// what timing every call would have produced, for a syscall whose cost
+    /// does not depend on where it falls in the sequence.
+    #[test]
+    fn the_scaled_total_matches_what_timing_every_call_would_give() {
+        let exact = {
+            let proc = a_process(910_004);
+            let p = proc.linux();
+            with_interval(1, || {
+                for _ in 0..64 {
+                    record(p, 0, 250, true);
+                }
+            });
+            p.perf().totals()
+        };
+        let sampled = {
+            let proc = a_process(910_005);
+            let p = proc.linux();
+            with_interval(8, || {
+                for _ in 0..64 {
+                    let t = p.perf().should_time();
+                    record(p, 0, 250, t);
+                }
+            });
+            p.perf().totals()
+        };
+        assert_eq!(exact, sampled);
+    }
+
+    /// An untimed call is counted and contributes no time.
+    #[test]
+    fn an_untimed_call_is_counted_and_adds_no_time() {
+        with_interval(1_000_000, || {
+            let proc = a_process(910_006);
+            let p = proc.linux();
+            // Past the first call nothing is sampled at this interval.
+            record(p, 0, 999, p.perf().should_time());
+            for _ in 0..32 {
+                assert!(!p.perf().should_time());
+                record(p, 0, 999, false);
+            }
+            let (calls, ns) = p.perf().totals();
+            assert_eq!(calls, 33, "every call is counted");
+            // Only the first was timed, scaled by the interval. The 32
+            // untimed calls contribute nothing -- which is the *visible*
+            // half; that they also skip the two `fetch_add`s is a cost, not
+            // a value, and `sampling_benches` is where that is held.
+            assert_eq!(ns, 999 * 1_000_000);
+        });
+    }
+
+    /// A reading so large that scaling it would wrap saturates instead. The
+    /// clock can read a huge span across a migration between unsynchronised
+    /// TSCs, and a wrapped total is a negative-looking figure in a report
+    /// rather than a big one.
+    #[test]
+    fn a_reading_too_large_to_scale_saturates() {
+        with_interval(16, || {
+            let proc = a_process(910_007);
+            let p = proc.linux();
+            record(p, 0, u64::MAX / 2, true);
+            let (_, ns) = p.perf().totals();
+            assert_eq!(ns, u64::MAX, "scaling saturates rather than wrapping");
+        });
+    }
+
+    /// The table says the time columns are an estimate, and says it only when
+    /// they are.
+    ///
+    /// A reader who takes an extrapolated `AVG us` for a measured one reads a
+    /// sampling artefact as a stall, and that is the kind of figure this
+    /// kernel's debugging actually turns on.
+    #[test]
+    fn the_report_says_when_the_time_columns_are_estimated() {
+        with_interval(16, || {
+            let mut out = String::new();
+            fmt_table(&mut out, alloc::vec![(0, 100, 1_000)]);
+            assert!(out.contains("estimated from 1 call in 16"), "{}", out);
+            assert!(out.contains("PERFSAMPLE=1"), "{}", out);
+        });
+        with_interval(1, || {
+            let mut out = String::new();
+            fmt_table(&mut out, alloc::vec![(0, 100, 1_000)]);
+            assert!(
+                !out.contains("estimated"),
+                "exact mode must not claim an estimate: {}",
+                out
+            );
+        });
+    }
+}
+
+#[cfg(test)]
+mod tracer_override_tests {
+    //! The one thing that must not be sampled: the boot tracer's own rows.
+    //!
+    //! `/proc/bootprofile` exists to say which syscall ate 350 ms of the
+    //! desktop's startup, and it puts a duration against every call it
+    //! records. With one call in sixteen timed, fifteen of its rows would
+    //! read `0 ns` -- not "unknown", *zero*, which reads as a fast syscall
+    //! and is the opposite of what the file is for.
+    //!
+    //! Every test here takes the recorder's turnstile, because arming it is
+    //! process-global state shared with `boot_trace`'s own tests.
+
+    use super::*;
+    use crate::process::ProcessExt;
+    use rcore_fs_ramfs::RamFS;
+    use zircon_object::object::KoID;
+    use zircon_object::task::Process;
+
+    fn a_process(pid: KoID) -> alloc::sync::Arc<Process> {
+        Process::create_linux(&zircon_object::task::ROOT_JOB, RamFS::new(), 0, None, pid).unwrap()
+    }
+
+    /// With the tracer off, the sampler decides: a process that has just made
+    /// a call is inside the interval and must *not* be timed.
+    #[test]
+    fn with_the_tracer_off_the_sampler_decides() {
+        with_interval(16, || {
+            let _alone = crate::boot_trace::alone_with_the_recorder();
+            let proc = a_process(920_001);
+            let p = proc.linux();
+            assert!(
+                should_time_syscall(p.perf()),
+                "the first call of a process is the sampled one"
+            );
+            record(p, 0, 100, true);
+            assert!(
+                !should_time_syscall(p.perf()),
+                "the second call of sixteen was timed anyway: nothing is being saved"
+            );
+        });
+    }
+
+    /// Armed, and every call is timed whatever the interval says.
+    #[test]
+    fn an_armed_tracer_times_every_syscall() {
+        with_interval(16, || {
+            let _alone = crate::boot_trace::alone_with_the_recorder();
+            let proc = a_process(920_002);
+            let p = proc.linux();
+            crate::boot_trace::set_target("bootprofile-test");
+            assert!(crate::boot_trace::enabled());
+            for n in 0..40u64 {
+                assert!(
+                    should_time_syscall(p.perf()),
+                    "call {} went untimed with the boot tracer armed: its row would read 0 ns",
+                    n
+                );
+                record(p, 0, 100, true);
+            }
+        });
+    }
+
+    /// And the override is the tracer's, not a blanket "always true": with
+    /// the interval at 1 both reasons agree, so the test above could pass on
+    /// a mutant that ignores the sampler entirely. This is the other side.
+    #[test]
+    fn the_override_is_the_tracers_and_not_unconditional() {
+        with_interval(4, || {
+            let _alone = crate::boot_trace::alone_with_the_recorder();
+            let proc = a_process(920_003);
+            let p = proc.linux();
+            // Off: one in four.
+            let mut timed_off = 0;
+            for _ in 0..16 {
+                if should_time_syscall(p.perf()) {
+                    timed_off += 1;
+                }
+                record(p, 0, 100, true);
+            }
+            assert_eq!(
+                timed_off, 4,
+                "the sampler is not sampling with the tracer off"
+            );
+
+            crate::boot_trace::set_target("bootprofile-test");
+            let mut timed_on = 0;
+            for _ in 0..16 {
+                if should_time_syscall(p.perf()) {
+                    timed_on += 1;
+                }
+                record(p, 0, 100, true);
+            }
+            assert_eq!(
+                timed_on, 16,
+                "the armed tracer did not override the sampler"
+            );
+        });
+    }
+}
+
+#[cfg(test)]
+mod sampling_benches {
+    //! What the sampler costs, against what it saves.
+    //!
+    //! The saving is in `kernel-hal`: `rdtsc_alone` there benches at **10.91
+    //! ns**, and the dispatch read the clock twice on every syscall. At the
+    //! default interval of 16, fifteen syscalls in sixteen now read it
+    //! neither time, so the saving is about `2 * 10.91 * 15/16` -- call it
+    //! 20 ns -- against whatever [`ProcPerf::should_time`] costs, which is
+    //! the row below.
+    //!
+    //! `should_time` is one relaxed load and a modulo of a counter the exit
+    //! path of the same syscall increments anyway, so the line is already
+    //! wanted by this CPU. If this row were not far under a nanosecond the
+    //! sampler would not be worth having, which is why it is here.
+    //!
+    //! Measured here (host, three runs):
+    //!
+    //! ```text
+    //! should_time_at_the_default_interval    1.85 ns
+    //! should_time_in_exact_mode              0.61 ns   (the b.iter floor)
+    //! proc_perf_record_timed                24.4  ns
+    //! proc_perf_record_untimed              12.9  ns
+    //! ```
+    //!
+    //! So the decision costs 1.85 ns and replaces ~21.8 ns of clock on
+    //! fifteen calls in sixteen. The accounting pair is the other half and
+    //! was not expected: timed is four relaxed increments and untimed two,
+    //! and the figure halves with the count -- 6 ns per `lock xadd` even
+    //! uncontended, which is what makes that halving the evidence and not
+    //! noise. Untimed also leaves two shared lines clean, which no
+    //! single-threaded row can show.
+
+    use super::*;
+    use test::{black_box, Bencher};
+
+    #[bench]
+    fn should_time_at_the_default_interval(b: &mut Bencher) {
+        with_interval(DEFAULT_SAMPLE_INTERVAL, || {
+            let p = ProcPerf::new();
+            b.iter(|| black_box(black_box(&p).should_time()));
+        });
+    }
+
+    /// Exact mode, which short-circuits before the load and the modulo: the
+    /// floor of the decision.
+    #[bench]
+    fn should_time_in_exact_mode(b: &mut Bencher) {
+        with_interval(1, || {
+            let p = ProcPerf::new();
+            b.iter(|| black_box(black_box(&p).should_time()));
+        });
+    }
+
+    /// The per-process accounting of a timed call: four relaxed increments.
+    #[bench]
+    fn proc_perf_record_timed(b: &mut Bencher) {
+        let p = ProcPerf::new();
+        b.iter(|| black_box(&p).record(black_box(0), black_box(1_000), black_box(true)));
+    }
+
+    /// The same untimed: two increments instead of four, which is the other
+    /// half of what the sampler buys -- the two it skips are on lines shared
+    /// by every thread of the process.
+    #[bench]
+    fn proc_perf_record_untimed(b: &mut Bencher) {
+        let p = ProcPerf::new();
+        b.iter(|| black_box(&p).record(black_box(0), black_box(0), black_box(false)));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1931,6 +2415,20 @@ mod tests {
         assert!(fork_phase_line((0, 0, 0, 0, 0, 0)).is_none());
     }
 
+    /// The data rows of a rendered table, by their shape.
+    ///
+    /// This used to be `lines().skip(1)`, which assumed the table's preamble
+    /// was exactly the column header -- and the moment a second preamble line
+    /// appeared (the note saying the time columns are sampled) the test read
+    /// it as the busiest syscall. Selecting rows by what a row looks like
+    /// says what the test means and survives the next line added above them.
+    fn table_rows(out: &str) -> Vec<&str> {
+        out.lines()
+            .map(str::trim)
+            .filter(|l| l.starts_with("sys_"))
+            .collect()
+    }
+
     #[test]
     fn the_syscall_table_is_busiest_first_and_skips_what_was_never_called() {
         let mut out = String::new();
@@ -1938,23 +2436,21 @@ mod tests {
             &mut out,
             alloc::vec![(1, 5, 5_000_000), (2, 50, 1_000_000), (3, 0, 0)],
         );
-        let names: Vec<&str> = out
-            .lines()
-            .skip(1)
-            .map(|l| l.trim().split_whitespace().next().unwrap())
+        let rows = table_rows(&out);
+        let names: Vec<&str> = rows
+            .iter()
+            .map(|l| l.split_whitespace().next().unwrap())
             .collect();
         assert_eq!(names, alloc::vec!["sys_2", "sys_1"]);
         // A row that was never called is not a row; its average would be a
         // division by zero.
         assert!(!out.contains("sys_3"), "{}", out);
         // 5 calls over 5 ms total is 1000 us each; the total column is ms.
-        let busiest = out.lines().nth(1).unwrap();
-        assert!(busiest.contains("1.000"), "{}", busiest);
-        let second = out.lines().nth(2).unwrap();
+        assert!(rows[0].contains("1.000"), "{}", rows[0]);
         assert!(
-            second.contains("5.000") && second.contains("1000.00"),
+            rows[1].contains("5.000") && rows[1].contains("1000.00"),
             "{}",
-            second
+            rows[1]
         );
     }
 
@@ -1978,10 +2474,10 @@ mod tests {
     #[test]
     fn a_syscall_past_the_table_still_counts_in_the_process_total() {
         let p = ProcPerf::new();
-        p.record(3, 1_000);
-        p.record(3, 3_000);
-        p.record(PERF_NR as u32, 500); // out of range, must not index
-        p.record(u32::MAX, 500);
+        p.record(3, 1_000, true);
+        p.record(3, 3_000, true);
+        p.record(PERF_NR as u32, 500, true); // out of range, must not index
+        p.record(u32::MAX, 500, true);
         assert_eq!(p.totals(), (4, 5_000));
         assert_eq!(p.per[3].load(Relaxed), 2);
         assert_eq!(p.per_ns[3].load(Relaxed), 4_000);
