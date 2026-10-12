@@ -241,6 +241,34 @@ fn wake_after(limit: Option<Duration>, tick: Duration) -> Duration {
     }
 }
 
+/// What a wait must pump, from whether each watched fd is a socket:
+/// `(watch_net, watch_interactive)`.
+///
+/// Both halves, from one pass, because resolving a descriptor to its file
+/// costs a table lookup and the two questions are the same question: a set
+/// with a socket in it needs the network stack driven, and a set with
+/// anything else in it needs the interactive path. A set can need both, and
+/// an empty set needs neither.
+///
+/// It used to be two reads of the fd NUMBER (`>= SOCKET_FD` / `< SOCKET_FD`),
+/// which also meant a negative fd -- the "ignore this entry" value poll(2)
+/// documents -- read as a socket and pumped the stack for nothing.
+fn watch_kinds(sockets: impl Iterator<Item = bool>) -> (bool, bool) {
+    let mut net = false;
+    let mut interactive = false;
+    for is_socket in sockets {
+        if is_socket {
+            net = true;
+        } else {
+            interactive = true;
+        }
+        if net && interactive {
+            break;
+        }
+    }
+    (net, interactive)
+}
+
 /// Whether a wait's fd set is the one shape [`io_wait_interval`] may demote to
 /// the background-VT tick: at least one fd that counts, and every one of them
 /// a terminal. `None` is an fd that does not count -- a negative `pollfd`
@@ -435,14 +463,25 @@ impl Syscall<'_> {
                 // Unsubscribe last pass's readiness wakers before re-scanning;
                 // fresh ones are parked below if we wait again.
                 this.subs.clear();
-                let watch_net = this
-                    .polls
-                    .iter()
-                    .any(|p| linux_object::net::fd_is_socket(p.fd));
-                let watch_interactive = this
-                    .polls
-                    .iter()
-                    .any(|p| linux_object::net::fd_is_interactive(p.fd));
+                // Asked of the FILE and not of the fd number. Sockets are
+                // handed out from `SOCKET_FD` only while the process may
+                // hold a descriptor that high (see
+                // `LinuxProcess::add_socket`), so "fd >= 1000" stopped
+                // meaning "socket" the moment a process with a small
+                // `RLIMIT_NOFILE` opened one -- and a wait that does not
+                // know it is watching a socket never pumps the stack
+                // underneath it.
+                let (watch_net, watch_interactive) = {
+                    let proc = this.syscall.linux_process();
+                    let sockets = this.polls.iter().map(|p| {
+                        <FileDesc as Into<i32>>::into(p.fd) >= 0
+                            && proc
+                                .get_file_like(p.fd)
+                                .map(|f| f.is_socket())
+                                .unwrap_or(false)
+                    });
+                    watch_kinds(sockets)
+                };
                 // Read BEFORE the scan below (see
                 // `linux_object::fs::devfs::input::wait::input_seq`): a frame
                 // landing between the scan and `arm_io_wait` drains a list
@@ -830,18 +869,17 @@ impl Syscall<'_> {
         // The select set membership (`origin`) does not change while the future
         // is being polled, so whether we need to pump the network / interactive
         // I/O is invariant. Compute it once here instead of on every wakeup.
-        let watch_net = (0..nfds).any(|fd| {
-            fd >= linux_object::net::SOCKET_FD
-                && (read_fds.contains(FileDesc::from(fd))
-                    || write_fds.contains(FileDesc::from(fd))
-                    || err_fds.contains(FileDesc::from(fd)))
-        });
-        let watch_interactive = (0..nfds).any(|fd| {
-            linux_object::net::fd_is_interactive(FileDesc::from(fd))
-                && (read_fds.contains(FileDesc::from(fd))
-                    || write_fds.contains(FileDesc::from(fd))
-                    || err_fds.contains(FileDesc::from(fd)))
-        });
+        // Asked of the FILE and not of the fd number: a socket lands on a
+        // low descriptor whenever the process may not hold one at
+        // `SOCKET_FD` (see `LinuxProcess::add_socket`).
+        let (watch_net, watch_interactive) = {
+            let files = self.linux_process().get_files()?;
+            watch_kinds((0..nfds).filter_map(|fd| {
+                let fd = FileDesc::from(fd);
+                (read_fds.contains(fd) || write_fds.contains(fd) || err_fds.contains(fd))
+                    .then(|| files.get(&fd).map(|f| f.is_socket()).unwrap_or(false))
+            }))
+        };
         // Same for whether the set holds an input device: an evdev node has
         // no event bus to subscribe to, so without this registration a key or
         // a mouse frame would be found only by the re-scan tick.
@@ -2085,6 +2123,57 @@ mod poll_tests {
             Some(LxError::EINVAL)
         );
         assert!(FdSet::new(user_fdset(&mut words), MAX_SELECT_NFDS).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod watch_kinds_tests {
+    //! What a wait decides to pump, now that it asks the file and not the
+    //! descriptor number.
+    //!
+    //! The number stopped answering the question when `add_socket` started
+    //! falling back to a low descriptor: a process whose `RLIMIT_NOFILE` is
+    //! below `SOCKET_FD` (PulseAudio sets 256) cannot hold a descriptor at
+    //! 1000 at all, so its sockets live down among stdin and stdout. Under
+    //! the old test such a socket never pumped the network stack, and a
+    //! `poll` on it would have waited for a packet nobody was moving.
+
+    use super::watch_kinds;
+
+    #[test]
+    fn un_socket_en_un_descriptor_bajo_sigue_pidiendo_red() {
+        assert_eq!(watch_kinds([true].iter().copied()), (true, false));
+    }
+
+    #[test]
+    fn solo_ficheros_no_piden_red() {
+        assert_eq!(watch_kinds([false, false].iter().copied()), (false, true));
+    }
+
+    #[test]
+    fn una_mezcla_pide_las_dos_cosas() {
+        assert_eq!(
+            watch_kinds([false, true, false].iter().copied()),
+            (true, true)
+        );
+    }
+
+    /// A set with nothing in it asks for neither: a `poll(NULL, 0, t)` is a
+    /// sleep, and pumping the stack for it is work nobody asked for.
+    #[test]
+    fn un_conjunto_vacio_no_pide_nada() {
+        assert_eq!(watch_kinds(core::iter::empty()), (false, false));
+    }
+
+    /// One pass, and it stops as soon as both answers are known: the walk is
+    /// per wake-up on every `poll` in the system.
+    #[test]
+    fn no_recorre_de_mas_cuando_ya_sabe_las_dos_respuestas() {
+        let mut seen = 0;
+        let kinds = [false, true, false, true, false];
+        let out = watch_kinds(kinds.iter().copied().inspect(|_| seen += 1));
+        assert_eq!(out, (true, true));
+        assert_eq!(seen, 2, "siguio mirando fds despues de saber la respuesta");
     }
 }
 

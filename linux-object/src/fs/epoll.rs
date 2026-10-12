@@ -743,12 +743,11 @@ impl Epoll {
                     .collect();
                 (list, inner.edge.clone())
             };
-            let watch_net = interest_list
-                .iter()
-                .any(|(fd, _, _)| crate::net::fd_is_socket(*fd));
-            let watch_interactive = interest_list
-                .iter()
-                .any(|(fd, _, _)| crate::net::fd_is_interactive(*fd));
+            // Asked of the FILE and not of the fd number: a socket on a low
+            // descriptor (see `LinuxProcess::add_socket`) is still a socket,
+            // and a wait that misses it never pumps the network stack.
+            let watch_net = interest_list.iter().any(|(_, _, f)| f.is_socket());
+            let watch_interactive = interest_list.iter().any(|(_, _, f)| !f.is_socket());
             // An evdev node carries no EventBus, so `subscribe_readiness`
             // answers `None` for it and this wait would learn about a key or a
             // mouse frame only on the next re-scan — the one device class

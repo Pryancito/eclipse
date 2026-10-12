@@ -5,7 +5,7 @@
 #[macro_use]
 pub mod socket_address;
 use crate::error::{LxError, LxResult};
-use crate::fs::{FileDesc, FileLike, PollEvents};
+use crate::fs::{FileLike, PollEvents};
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use kernel_hal::user::{IoVecOut, UserInOutPtr, UserInPtr};
 use log::*;
@@ -841,18 +841,15 @@ static LAST_NET_POLL_US: AtomicU64 = AtomicU64::new(0);
 static LAST_NET_HOUSEKEEPING_US: AtomicU64 = AtomicU64::new(0);
 static LAST_DEFERRED_IDLE_US: AtomicU64 = AtomicU64::new(0);
 
-/// True for socket / packet / netlink fds (see [`SOCKET_FD`]).
-#[inline]
-pub fn fd_is_socket(fd: FileDesc) -> bool {
-    usize::from(fd) >= SOCKET_FD
-}
-
-/// True for stdin, TTY, `/dev/input/*`, etc. (prioritize HID over NIC in wait loops).
-#[inline]
-pub fn fd_is_interactive(fd: FileDesc) -> bool {
-    let raw: i32 = fd.into();
-    (raw as usize) < SOCKET_FD && raw >= 0
-}
+// `fd_is_socket` / `fd_is_interactive` lived here: "is this fd a socket?"
+// answered by comparing the NUMBER against `SOCKET_FD`. poll, select and
+// epoll asked them to decide whether a wait had to pump the network stack.
+// They are gone because the premise is gone: a socket only gets a descriptor
+// at or above `SOCKET_FD` while the process is allowed to hold one that high
+// (see `LinuxProcess::add_socket`), so a process with a small
+// `RLIMIT_NOFILE` has sockets on low descriptors. The three waits ask
+// `FileLike::is_socket` now. `fd_is_interactive` also read a negative fd --
+// poll(2)'s "ignore this entry" -- as a socket, and pumped the stack for it.
 
 #[inline]
 fn mono_us() -> u64 {
@@ -2970,21 +2967,5 @@ mod tests {
         assert!(is_ipv4_placeholder(Ipv4Address::new(240, 0, 0, 0)));
         assert!(!is_ipv4_placeholder(Ipv4Address::new(192, 168, 1, 1)));
         assert!(!is_ipv4_placeholder(Ipv4Address::new(0, 0, 0, 0)));
-    }
-
-    #[test]
-    fn fd_is_socket_uses_socket_base() {
-        assert!(!fd_is_socket(FileDesc::from(0)));
-        assert!(!fd_is_socket(FileDesc::from(999)));
-        assert!(fd_is_socket(FileDesc::from(SOCKET_FD as i32)));
-        assert!(fd_is_socket(FileDesc::from((SOCKET_FD + 42) as i32)));
-    }
-
-    #[test]
-    fn fd_is_interactive_covers_stdin_not_sockets() {
-        assert!(fd_is_interactive(FileDesc::from(0)));
-        assert!(fd_is_interactive(FileDesc::from(2)));
-        assert!(!fd_is_interactive(FileDesc::from(SOCKET_FD as i32)));
-        assert!(!fd_is_interactive(FileDesc::from(-1)));
     }
 }
