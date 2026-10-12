@@ -731,3 +731,86 @@ fn a_pixel_that_moves_between_bands_marks_both() {
     let after = bands(&p, 512, 0, 0, 512, 8).unwrap();
     assert_eq!(before.diff_mask(&after), 0b11);
 }
+
+/// The histogram's whole job: a mask lands on exactly the bands it names, so a
+/// contiguous run of hot bands really is a contiguous run of screen columns.
+/// Driven over a local array rather than the boot-long statics, so the
+/// production function is the one under test without a test ordering race.
+#[test]
+fn a_mask_adds_one_to_exactly_the_bands_it_names() {
+    let hits: Vec<AtomicU32> = (0..PROBE_MAX_BANDS).map(|_| AtomicU32::new(0)).collect();
+    bump_bands(0b0000_1110, &hits);
+    let got: Vec<u32> = hits.iter().map(|h| h.load(Ordering::Relaxed)).collect();
+    assert_eq!(got[..5], [0, 1, 1, 1, 0]);
+    assert!(got[5..].iter().all(|&n| n == 0));
+}
+
+/// Counts accumulate, because the number that matters is "how often", not
+/// "whether": one band hot on every frame and its neighbour hot once is the
+/// difference between a window that always races and one that raced at startup.
+#[test]
+fn band_counts_accumulate_across_mismatches() {
+    let hits: Vec<AtomicU32> = (0..PROBE_MAX_BANDS).map(|_| AtomicU32::new(0)).collect();
+    bump_bands(0b01, &hits);
+    bump_bands(0b11, &hits);
+    bump_bands(0b01, &hits);
+    assert_eq!(hits[0].load(Ordering::Relaxed), 3);
+    assert_eq!(hits[1].load(Ordering::Relaxed), 1);
+}
+
+/// A mismatch whose second read produced no answer at all has a mask of 0. It
+/// still counted as a mismatch, and it must land in NO band: a reader sees the
+/// band total fall below the mismatch count and knows that is what happened.
+#[test]
+fn an_empty_mask_lands_in_no_band() {
+    let hits: Vec<AtomicU32> = (0..PROBE_MAX_BANDS).map(|_| AtomicU32::new(0)).collect();
+    bump_bands(0, &hits);
+    assert!(hits.iter().all(|h| h.load(Ordering::Relaxed) == 0));
+}
+
+/// Bits past the array are dropped, not folded into the last band: a band whose
+/// count covered columns it does not describe would read as a wider hot run
+/// than the screen has, which is the one thing the histogram exists to get
+/// right.
+#[test]
+fn bits_past_the_array_are_dropped_not_folded() {
+    let hits: Vec<AtomicU32> = (0..4).map(|_| AtomicU32::new(0)).collect();
+    bump_bands(0b1_0001, &hits);
+    let got: Vec<u32> = hits.iter().map(|h| h.load(Ordering::Relaxed)).collect();
+    assert_eq!(got, [1, 0, 0, 0]);
+}
+
+/// A repair that found no span to redo is not a repaired present: counting it
+/// would make `rounds / repaired` -- the ratio that says whether the budget is
+/// being spent -- divide by frames where nothing was repaired at all.
+#[test]
+fn a_repair_of_zero_rounds_counts_nothing() {
+    let _g = serialised();
+    let before = present_probe_counters();
+    note_repair(0);
+    let after = present_probe_counters();
+    assert_eq!(after.repaired, before.repaired);
+    assert_eq!(after.repair_rounds, before.repair_rounds);
+}
+
+/// One present, its rounds. Both numbers, because `MAX_REPAIR_ROUNDS` caps the
+/// second: rounds at twice the presents is every repair spending its whole
+/// budget on a span that never settled.
+#[test]
+fn a_repair_counts_one_present_and_its_rounds() {
+    let _g = serialised();
+    let before = present_probe_counters();
+    note_repair(2);
+    let after = present_probe_counters();
+    assert_eq!(after.repaired, before.repaired + 1);
+    assert_eq!(after.repair_rounds, before.repair_rounds + 2);
+}
+
+/// The last mismatch is remembered whole, so a reader who catches the flicker
+/// and `cat`s straight away sees the frame they just watched.
+#[test]
+fn the_last_mismatch_is_remembered() {
+    let _g = serialised();
+    note_probe_mismatch(7, 64, 1920, 0b1010);
+    assert_eq!(present_probe_counters().last, Some((7, 64, 1920, 0b1010)));
+}

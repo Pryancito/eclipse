@@ -587,6 +587,7 @@ impl DrmDev {
         // what happens on a real desktop is a question about a real machine, so
         // the number goes in the log.
         if fences.is_empty() {
+            FENCE_PRESENTS_NO_FENCE.fetch_add(1, Ordering::Relaxed);
             if report {
                 log::info!(
                     "[drm] present fence: fb {} (#{}) has NO render fence to wait on -- \
@@ -609,6 +610,13 @@ impl DrmDev {
             // semaphore word, and this loop takes the list again on every
             // probe.
             if zcore_drivers::scheme::syncobj::hw_fences_landed(&fences) {
+                FENCE_PRESENTS_LANDED.fetch_add(1, Ordering::Relaxed);
+                FENCE_WAIT_US_TOTAL.fetch_add(
+                    kernel_hal::timer::timer_now()
+                        .saturating_sub(waited_from)
+                        .as_micros() as u64,
+                    Ordering::Relaxed,
+                );
                 if report {
                     log::info!(
                         "[drm] present fence: fb {} (#{}) waited {}us for {} fence(s) to land",
@@ -624,6 +632,7 @@ impl DrmDev {
             }
             if !fence_poll_wait(acct.probes, deadline).await? {
                 acct.timed_out();
+                FENCE_PRESENTS_TIMEOUT.fetch_add(1, Ordering::Relaxed);
                 // Budgeted for the same reason as the atomic wait: a ring that
                 // stopped landing fences misses this bound on EVERY frame, and
                 // klog writes synchronously to the UART.
@@ -3347,6 +3356,41 @@ const FENCE_REPORT_EVERY: u64 = drm::FULL_FRAME_REPORT_EVERY;
 
 /// Legacy presents that reached the fence wait with the nouveau uAPI on.
 static FENCE_PRESENTS: AtomicU64 = AtomicU64::new(0);
+
+/// How those presents ended, for `/proc/present`.
+///
+/// The klog already says it, on the first two presents and then once every
+/// [`FENCE_REPORT_EVERY`]; what it cannot say is the proportion over a whole
+/// session, and that is the number that decides whether the implicit-sync wait
+/// is doing anything at all. A desktop whose presents are nearly all
+/// `no_fence` is one where nothing waits for the GPU before the blit reads the
+/// buffer, which looks on screen exactly like a client that hands over
+/// unfinished frames -- the two are told apart here and nowhere else.
+///
+/// `no_fence` counts a present that found nothing to wait on, which includes
+/// every present while `drm.flip_fence=off` ([`drm::flip_fence_enabled`] makes
+/// [`drm::scanout_render_fence`] answer empty), so the report prints the hatch
+/// beside the counters rather than leaving a reader to assume it is on.
+static FENCE_PRESENTS_NO_FENCE: AtomicU64 = AtomicU64::new(0);
+static FENCE_PRESENTS_LANDED: AtomicU64 = AtomicU64::new(0);
+static FENCE_PRESENTS_TIMEOUT: AtomicU64 = AtomicU64::new(0);
+/// Microseconds spent waiting across the presents counted in
+/// [`FENCE_PRESENTS_LANDED`], so a reader can divide and see what the wait
+/// costs a frame.
+static FENCE_WAIT_US_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// What the legacy present's fence wait did, over the whole boot:
+/// `(presents, no fence to wait on, fences landed, timed out, microseconds
+/// waited)`.
+pub fn present_fence_counters() -> (u64, u64, u64, u64, u64) {
+    (
+        FENCE_PRESENTS.load(Ordering::Relaxed),
+        FENCE_PRESENTS_NO_FENCE.load(Ordering::Relaxed),
+        FENCE_PRESENTS_LANDED.load(Ordering::Relaxed),
+        FENCE_PRESENTS_TIMEOUT.load(Ordering::Relaxed),
+        FENCE_WAIT_US_TOTAL.load(Ordering::Relaxed),
+    )
+}
 
 /// Whether the `n`-th present's fence outcome gets a line in the klog.
 ///
