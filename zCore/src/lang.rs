@@ -983,11 +983,15 @@ fn panic(info: &PanicInfo) -> ! {
     {
         use core::fmt::Write;
         let mut b = StackBuf::new();
+        // The build id, for the same reason the deadlock banner carries one: a
+        // stale build booted after a fix landed reads exactly like the fix not
+        // working, and a photographed stop screen is all anybody has.
         if let Some(loc) = info.location() {
             let _ = write!(
                 b,
-                "KERNEL PANIC cpu={} {}:{}\n{}",
+                "KERNEL PANIC cpu={} [build {}] {}:{}\n{}",
                 kernel_hal::cpu::cpu_id(),
+                env!("ECLIPSE_BUILD_ID"),
                 loc.file(),
                 loc.line(),
                 info.message()
@@ -995,8 +999,9 @@ fn panic(info: &PanicInfo) -> ! {
         } else {
             let _ = write!(
                 b,
-                "KERNEL PANIC cpu={}\n{}",
+                "KERNEL PANIC cpu={} [build {}]\n{}",
                 kernel_hal::cpu::cpu_id(),
+                env!("ECLIPSE_BUILD_ID"),
                 info.message()
             );
         }
