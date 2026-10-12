@@ -1274,12 +1274,7 @@ mod tests {
         std::thread::spawn(move || {
             let _ = serve(&p, false, false);
         });
-        // Wait for the socket to appear rather than sleeping a fixed time.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while !Path::new(&path).exists() {
-            assert!(std::time::Instant::now() < deadline, "daemon never bound");
-            std::thread::yield_now();
-        }
+        wait_until_listening(&path);
         let result = selftest::run(&path);
         let _ = fs::remove_file(&path);
         result.expect("selftest");
@@ -1326,7 +1321,32 @@ mod tests {
         assert!(!fd_queue_overflowed(0));
     }
 
-    /// Start a daemon on its own socket and wait for it to bind.
+    /// Wait until the daemon is really listening, not merely until its socket
+    /// file is there.
+    ///
+    /// `UnixListener::bind` is two syscalls, `bind` and then `listen`: the
+    /// file appears at the first one and the backlog only exists after the
+    /// second, so a connection that lands between them is refused outright --
+    /// `ECONNREFUSED`, which is an answer and not something to wait through.
+    /// The window is a few instructions wide, and waiting on the file instead
+    /// walked into it about once in twenty runs of the whole binary in
+    /// parallel, which is how CI runs it.
+    ///
+    /// A connection that succeeds is the only signal that means "listening".
+    /// `connectable` is the same check the daemon itself uses to tell a live
+    /// bus from a stale socket file.
+    fn wait_until_listening(path: &str) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !connectable(path) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "daemon never listened on {path}"
+            );
+            std::thread::yield_now();
+        }
+    }
+
+    /// Start a daemon on its own socket and wait for it to listen.
     fn a_bus(tag: &str) -> String {
         let path = format!(
             "/tmp/eclipse-dbusd-test-{}-{}-{}.sock",
@@ -1341,11 +1361,7 @@ mod tests {
         std::thread::spawn(move || {
             let _ = serve(&p, false, false);
         });
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while !Path::new(&path).exists() {
-            assert!(std::time::Instant::now() < deadline, "daemon never bound");
-            std::thread::yield_now();
-        }
+        wait_until_listening(&path);
         path
     }
 
