@@ -11,6 +11,9 @@
 
 use super::*;
 use linux_object::error::LxResult;
+use linux_object::fs::ioctl::{
+    FIOASYNC, FIOCLEX, FIONBIO, FIONCLEX, FIONREAD, FIOQSIZE, TIOCGPTPEER, TIOCGWINSZ, TIOCSCTTY,
+};
 use linux_object::{process::FsInfo, thread::ThreadExt, time::TimeSpec};
 use rcore_fs::vfs::INode;
 
@@ -109,6 +112,70 @@ fn seek_from(whence: usize, offset: i64) -> linux_object::error::LxResult<SeekFr
         SEEK_END => Ok(SeekFrom::End(offset)),
         _ => Err(LxError::EINVAL),
     }
+}
+
+/// `sync_file_range(2)`'s flags (`<linux/fs.h>`).
+const SYNC_FILE_RANGE_WAIT_BEFORE: usize = 1;
+/// See [`SYNC_FILE_RANGE_WAIT_BEFORE`].
+const SYNC_FILE_RANGE_WRITE: usize = 2;
+/// See [`SYNC_FILE_RANGE_WAIT_BEFORE`].
+const SYNC_FILE_RANGE_WAIT_AFTER: usize = 4;
+
+/// Whether `sync_file_range` accepts this flag word, and if so whether it
+/// asks for any write-back at all.
+///
+/// A bit the call does not have has to be `EINVAL`: that is how a caller finds
+/// out this kernel is older than the flag it wanted, and a flag word taken
+/// wholesale reports success for work nobody asked for in a way nobody can
+/// see. An empty flag word is legal and means "do nothing", which is why the
+/// answer is a bool and not just `Ok(())`.
+fn sync_file_range_writes_back(flags: usize) -> LxResult<bool> {
+    if flags & !(SYNC_FILE_RANGE_WAIT_BEFORE | SYNC_FILE_RANGE_WRITE | SYNC_FILE_RANGE_WAIT_AFTER)
+        != 0
+    {
+        return Err(LxError::EINVAL);
+    }
+    Ok(flags != 0)
+}
+
+#[cfg(test)]
+mod ioctl_number_tests;
+
+#[cfg(test)]
+mod sync_file_range_tests;
+
+/// Whether an `EINVAL` from the file's own ioctl handler should be reported
+/// as `ENOTTY`: the request is in the `0x54xx` terminal block and is not one
+/// of the file ioctls that block also carries.
+///
+/// The block runs from `TCGETS` (0x5401) to [`FIOQSIZE`] (0x5460), which is
+/// its last number, so the range is **inclusive**. An exclusive `..` here
+/// leaves `FIOQSIZE` out by one, and then the exclusion below has nothing
+/// left to do for it.
+///
+/// The five excluded requests are legal on every kind of fd -- pipes,
+/// sockets, regular files -- and are answered at the VFS layer above, so an
+/// `EINVAL` from one of them is the file's real answer and not "this is not
+/// a terminal".
+///
+/// Two requests that look like they belong in that list do not.
+/// `TIOCOUTQ` (0x5411) is a question about a terminal's output queue, so it
+/// stays in the block. And [`FIOQSIZE`] is a VFS file ioctl, but not one
+/// that applies to every fd: Linux answers it only for a directory, a
+/// non-anonymous regular file or a symlink, and for anything else --- a
+/// pipe, a socket --- it returns `ENOTTY` itself (`fs/ioctl.c`,
+/// `do_vfs_ioctl`). So the block has to cover it, which is why the range
+/// ends `..=FIOQSIZE` and not `..`: the number is the last one in the
+/// block, and an exclusive bound would leave a pipe's `FIOQSIZE` answering
+/// `EINVAL` where Linux answers `ENOTTY`.
+///
+/// Every number here is named rather than written out. This used to be a
+/// bare `matches!(request, 0x541B | 0x5421 | ...)` whose last arm was
+/// `0x545E` -- a number `<asm-generic/ioctls.h>` has never assigned -- while
+/// the comment beside it called that arm `FIOQSIZE`, which is 0x5460.
+pub(crate) fn tty_block_wants_enotty(request: usize) -> bool {
+    (0x5400..=FIOQSIZE).contains(&request)
+        && !matches!(request, FIONREAD | FIONBIO | FIONCLEX | FIOCLEX | FIOASYNC)
 }
 
 impl Syscall<'_> {
@@ -1248,19 +1315,11 @@ impl Syscall<'_> {
         nbytes: usize,
         flags: usize,
     ) -> SysResult {
-        const SYNC_FILE_RANGE_WAIT_BEFORE: usize = 1;
-        const SYNC_FILE_RANGE_WRITE: usize = 2;
-        const SYNC_FILE_RANGE_WAIT_AFTER: usize = 4;
         info!(
             "sync_file_range: fd={:?}, offset={}, nbytes={}, flags={:#x}",
             fd, offset, nbytes, flags
         );
-        if flags
-            & !(SYNC_FILE_RANGE_WAIT_BEFORE | SYNC_FILE_RANGE_WRITE | SYNC_FILE_RANGE_WAIT_AFTER)
-            != 0
-        {
-            return Err(LxError::EINVAL);
-        }
+        let writes_back = sync_file_range_writes_back(flags)?;
         // `ksys_sync_file_range`: the range is judged after the flags and
         // before the descriptor. Both are `loff_t`, so a negative offset or
         // length, or an end past `LLONG_MAX`, is EINVAL; read as `u64` they
@@ -1268,7 +1327,7 @@ impl Syscall<'_> {
         crate::intarg::loff_range(offset, nbytes)?;
         let proc = self.linux_process();
         let file = proc.get_file(fd)?;
-        if flags != 0 {
+        if writes_back {
             file.sync_data()?;
         }
         Ok(0)
@@ -2131,12 +2190,10 @@ impl Syscall<'_> {
         // (tools/lunarbar/src/sysinfo.rs).
         //
         // Exact small values, never sign-extended (bit 31 clear), so there is
-        // no collision with the DRM 0xC0xx_64xx family handled below.
-        const FIONBIO: usize = 0x5421;
-        const FIOCLEX: usize = 0x5451;
-        const FIONCLEX: usize = 0x5450;
-        const FIONREAD: usize = 0x541B;
-        const FIOASYNC: usize = 0x5452;
+        // no collision with the DRM 0xC0xx_64xx family handled below. The
+        // numbers come from `linux_object::fs::ioctl`, which is the one place
+        // this kernel writes them: they used to be declared again right here,
+        // and a second copy of an ABI number is a copy that can drift.
         match request {
             // FIONREAD/SIOCINQ: bytes waiting to be read. Legal on sockets and
             // pipes, and answered per object kind (see `FileLike::
@@ -2293,7 +2350,6 @@ impl Syscall<'_> {
         // to the prompt instead of looping in busybox ash's
         // `killpg(0, SIGTTIN)` background wait. The pty inode's own ioctl
         // handler cannot do this — it has no process context — so seed it here.
-        const TIOCSCTTY: usize = 0x540E;
         if cmd == TIOCSCTTY {
             if let Some(file) = file_like.downcast_ref::<linux_object::fs::File>() {
                 let inode = file.inode();
@@ -2314,7 +2370,6 @@ impl Syscall<'_> {
         // fd (Linux 4.13+). Needs the fd table, so it lives here rather than
         // in the inode's ioctl. `arg1` carries the open flags (O_RDWR |
         // O_NOCTTY | O_CLOEXEC from rustix-openpty / glibc `openpty`).
-        const TIOCGPTPEER: usize = 0x5441;
         if cmd == TIOCGPTPEER {
             if let Some(file) = file_like.downcast_ref::<linux_object::fs::File>() {
                 let inode = file.inode();
@@ -2335,7 +2390,6 @@ impl Syscall<'_> {
             }
         }
         // `TIOCGWINSZ` (get terminal window size).
-        const TIOCGWINSZ: usize = 0x5413;
         let ret = match file_like.ioctl(request, arg1, arg2, arg3) {
             // Some programs insist on a valid window size and keep retrying
             // `TIOCGWINSZ` when it fails on a char device that is not a full
@@ -2364,22 +2418,18 @@ impl Syscall<'_> {
                 ptr.write(ws)?;
                 Ok(0)
             }
-            // A tty-class request (TCGETS..TIOCGPTPEER, the 0x54xx block) on
-            // something that is not a char device answers ENOTTY on Linux —
-            // the file's handler simply does not know the request. Some of our
-            // inode impls say EINVAL instead (sfs maps every unknown cmd to
-            // `FsError::IOCTLError` -> EINVAL), which musl's `isatty()`
-            // tolerates but errno-checking callers do not: that was the
-            // `[einval-hunt] IOCTL a1=0x5413 (TIOCGWINSZ) on fd 2 -> EINVAL`
-            // hit against a service's log-file stderr. The VFS file ioctls
-            // sharing the block (TIOCOUTQ 0x5411 aside: FIONREAD 0x541B,
-            // FIONBIO 0x5421, FIONCLEX/FIOCLEX 0x5450/1, FIOASYNC 0x5452,
-            // FIOQSIZE 0x545E) are excluded — they are legal on pipes and
-            // sockets and answered elsewhere.
+            // A tty-class request on something that is not a char device
+            // answers ENOTTY on Linux: the file's handler simply does not
+            // know the request. Some of our inode impls say EINVAL instead
+            // (sfs maps every unknown cmd to `FsError::IOCTLError` ->
+            // EINVAL), which musl's `isatty()` tolerates but errno-checking
+            // callers do not: that was the `[einval-hunt] IOCTL a1=0x5413
+            // (TIOCGWINSZ) on fd 2 -> EINVAL` hit against a service's
+            // log-file stderr. Which requests the block covers, and which
+            // file ioctls inside it are left alone, is
+            // `tty_block_wants_enotty`.
             Err(LxError::EINVAL)
-                if (0x5400..0x5460).contains(&request)
-                    && !matches!(request, 0x541B | 0x5421 | 0x5450 | 0x5451 | 0x5452 | 0x545E)
-                    && !file_like.is_char_device() =>
+                if tty_block_wants_enotty(request) && !file_like.is_char_device() =>
             {
                 Err(LxError::ENOTTY)
             }

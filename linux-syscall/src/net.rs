@@ -202,6 +202,41 @@ const SOL_SOCKET: usize = 1;
 /// `SO_PASSCRED`: attach the sender's credentials to every message read from
 /// this socket.
 const SO_PASSCRED: usize = 16;
+/// `SO_PEERCRED`: `struct ucred { pid_t pid; uid_t uid; gid_t gid; }`, the
+/// credentials of the process on the other end of a connected unix socket.
+/// seatd reads it to authorize a Wayland client (labwc), and dbus-daemon,
+/// polkit and logind decide who a client IS from the answer.
+const SO_PEERCRED: usize = 17;
+/// `SO_TYPE`: `SOCK_STREAM` / `SOCK_DGRAM` / ... Python's `ssl` asks it of
+/// every socket it wraps and refuses the socket unless the answer is
+/// `SOCK_STREAM`.
+const SO_TYPE: usize = 3;
+/// `SO_PEERSEC`: the peer's LSM security context. A kernel with no LSM
+/// answers `ENOPROTOOPT`, which is what this one does.
+const SO_PEERSEC: usize = 31;
+/// `SO_PEERGROUPS`: the peer's supplementary groups. A kernel older than 4.13
+/// answers `ENOPROTOOPT`, which is what this one does.
+const SO_PEERGROUPS: usize = 59;
+/// `net.core.{w,r}mem_default`: what Linux reports for a socket with no queue
+/// of its own, which is every unix socket here.
+///
+/// A tuning number rather than an ABI one -- Linux lets a sysctl move it --
+/// so what is fixed about it is that it is a whole number of pages and never
+/// zero: a caller that sizes its writes by the answer, as Firefox does for
+/// its own IPC channels, would write nothing at all.
+const MEM_DEFAULT: usize = 212_992;
+
+/// The two `SOL_SOCKET` options whose `ENOPROTOOPT` is the answer mainline
+/// Linux gives too, so a `getsockopt` for one of them is not worth shouting
+/// about.
+///
+/// dbus, polkit and logind ask every AF_UNIX peer for both on connect, and
+/// logging those at `error!` filled the console with a repeating "invalid
+/// optname: 31 / invalid optname: 59" that reads like a fault and is not one.
+fn is_peer_identity_optname(optname: usize) -> bool {
+    matches!(optname, SO_PEERSEC | SO_PEERGROUPS)
+}
+
 /// Most file descriptors one `sendmsg` may carry (`SCM_MAX_FD`,
 /// include/net/scm.h). Linux answers `EINVAL` above it; without a cap, one
 /// `sendmsg` with a 64 KiB control buffer asks the receiver to install 16000
@@ -540,7 +575,6 @@ impl Syscall<'_> {
                 // ("invalid optname: 17") and seatd refused the client. The uid
                 // and gid are the peer's own, not a constant: dbus-daemon,
                 // polkit and logind decide who a client IS from this answer.
-                const SO_PEERCRED: usize = 17;
                 if optname == SO_PEERCRED {
                     let file_like = self.linux_process().get_file_like(sockfd.into())?;
                     let peer = file_like.as_socket().ok().and_then(|s| s.peer_pid());
@@ -565,7 +599,6 @@ impl Syscall<'_> {
                     let on = u32::from(file_like.as_socket()?.passcred());
                     return write_sockopt_out(optval, optlen, &on.to_ne_bytes());
                 }
-                const SO_TYPE: usize = 3;
                 if optname == SO_TYPE {
                     let file_like = self.linux_process().get_file_like(sockfd.into())?;
                     let ty = file_like
@@ -589,14 +622,13 @@ impl Syscall<'_> {
                         // console with a repeating "invalid optname: 31 /
                         // invalid optname: 59" that reads like a fault and is
                         // not one.
-                        const SO_PEERSEC: usize = 31;
-                        const SO_PEERGROUPS: usize = 59;
-                        match optname {
-                            SO_PEERSEC | SO_PEERGROUPS => debug!(
+                        if is_peer_identity_optname(optname) {
+                            debug!(
                                 "getsockopt: SOL_SOCKET optname {} (peer identity) not supported",
                                 optname
-                            ),
-                            _ => warn!("getsockopt: unsupported SOL_SOCKET optname: {}", optname),
+                            );
+                        } else {
+                            warn!("getsockopt: unsupported SOL_SOCKET optname: {}", optname);
                         }
                         return Err(LxError::ENOPROTOOPT);
                     }
@@ -610,7 +642,6 @@ impl Syscall<'_> {
                 // which is what Firefox does to its own IPC channels.
                 // Linux answers with net.core.{w,r}mem_default for a socket
                 // with no queue of its own, so answer that.
-                const MEM_DEFAULT: usize = 212_992;
                 let buffer_capacity = || {
                     file_like
                         .clone()
@@ -2373,6 +2404,69 @@ mod wire_numbers_tests {
         assert_eq!(SCM_CREDENTIALS, 2);
         assert_eq!(SO_PASSCRED, 16);
         assert_eq!(SCM_MAX_FD, 253, "SCM_MAX_FD, the kernel's own cap");
+    }
+
+    /// The `SOL_SOCKET` options this layer answers by hand, each of which
+    /// used to be declared inside `sys_getsockopt` -- where nothing could
+    /// name it, and nothing could call the code around it either, since a
+    /// `Syscall` needs a live process. `SO_PASSCRED`, pinned just above, is
+    /// the only one of the five that had been hoisted out.
+    ///
+    /// Each number is the one `<asm-generic/socket.h>` gives, written out
+    /// here rather than read back out of the tree. A wrong one is not an
+    /// error anywhere: the option simply stops being answered, and the
+    /// caller gets the `ENOPROTOOPT` that means "this kernel is too old".
+    #[test]
+    fn the_socket_option_numbers_are_the_ones_asm_generic_socket_h_gives() {
+        for (name, actual, expected) in [
+            ("SO_TYPE", SO_TYPE, 3),
+            ("SO_PASSCRED", SO_PASSCRED, 16),
+            ("SO_PEERCRED", SO_PEERCRED, 17),
+            ("SO_PEERSEC", SO_PEERSEC, 31),
+            ("SO_PEERGROUPS", SO_PEERGROUPS, 59),
+        ] {
+            assert_eq!(actual, expected, "{}", name);
+        }
+        // The two that sit next to each other in the header mean opposite
+        // things: one is a flag the caller sets on its own socket, the other
+        // is the peer's identity it reads back. seatd authorizes a Wayland
+        // client on the second, so the two standing in for one another hands
+        // an authorization decision the wrong answer.
+        assert_ne!(SO_PASSCRED, SO_PEERCRED);
+    }
+
+    /// The two options whose `ENOPROTOOPT` is deliberate and quiet. Written
+    /// as raw numbers, so that the two swapping with a neighbour is a
+    /// failure here and not a rename.
+    #[test]
+    fn only_the_two_peer_identity_options_are_quiet_about_their_enoprotoopt() {
+        assert!(is_peer_identity_optname(31), "SO_PEERSEC");
+        assert!(is_peer_identity_optname(59), "SO_PEERGROUPS");
+        // Everything else is a real "unsupported optname", worth a warning:
+        // including the three this layer DOES answer, which never reach the
+        // classifier at all, and the numbers either side of the two.
+        for shouted in [0usize, 3, 16, 17, 30, 32, 58, 60, 7, 8] {
+            assert!(!is_peer_identity_optname(shouted), "optname {}", shouted);
+        }
+    }
+
+    /// `net.core.{w,r}mem_default` is a tuning number, not an ABI one, so
+    /// what is pinned is its invariant rather than its value: Linux lets a
+    /// sysctl move it, and a test on the exact figure would go red on a
+    /// legitimate retune.
+    ///
+    /// Zero is the value that costs. `getsockopt(SO_SNDBUF)` on a unix
+    /// socket is answered from here, and Firefox sizes the writes to its own
+    /// IPC channels by the answer: a zero would have it write nothing, with
+    /// no error anywhere to say why.
+    #[test]
+    fn the_default_buffer_size_is_a_whole_number_of_pages_and_never_zero() {
+        assert!(MEM_DEFAULT > 0, "a zero buffer size is not a buffer size");
+        assert_eq!(MEM_DEFAULT % 4096, 0, "a whole number of pages");
+        assert!(MEM_DEFAULT >= 4096, "at least one page");
+        // It stands in for both directions, so one number has to serve as
+        // SO_SNDBUF and as SO_RCVBUF.
+        assert_eq!((MEM_DEFAULT, MEM_DEFAULT), (MEM_DEFAULT, MEM_DEFAULT));
     }
 
     #[test]

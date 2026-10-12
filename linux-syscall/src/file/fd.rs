@@ -122,10 +122,94 @@ fn flock_translate(operation: usize) -> LxResult<(FlockCmd, bool)> {
 /// `O_CLOEXEC`, as every anonymous-fd constructor spells it: `EFD_CLOEXEC`,
 /// `TFD_CLOEXEC`, `SFD_CLOEXEC`, `IN_CLOEXEC`, `EPOLL_CLOEXEC` and
 /// `SOCK_CLOEXEC` are all the same bit, and all land on `OpenFlags::CLOEXEC`.
+/// `dup3(2)`'s only flag is that same bit under its plain name, and reads it
+/// from here.
 pub(crate) const ANON_CLOEXEC: usize = 0o2_000_000;
 /// `O_NONBLOCK`, likewise: `EFD_NONBLOCK`, `TFD_NONBLOCK`, `SFD_NONBLOCK`,
 /// `IN_NONBLOCK`. Lands on `OpenFlags::NON_BLOCK`.
 pub(crate) const ANON_NONBLOCK: usize = 0o4_000;
+
+/// `EFD_SEMAPHORE` (`<linux/eventfd.h>`: `1 << 0`), the one flag `eventfd2`
+/// has of its own. `OpenFlags` spells that bit `WRONLY`, which is why
+/// `EventFd` reads it back under that name.
+///
+/// It used to be declared inside `sys_eventfd2`, where no test could name it,
+/// while the test module below carried a second copy of the literal: the two
+/// agreed, and nothing checked that they went on agreeing.
+pub(crate) const EFD_SEMAPHORE: usize = 1;
+
+/// `timerfd_settime(2)`'s flags (`<linux/timerfd.h>`): read the deadline as
+/// absolute rather than as an offset from now.
+const TFD_TIMER_ABSTIME: usize = 1;
+/// See [`TFD_TIMER_ABSTIME`]. Accepted and ignored: it asks to be woken with
+/// `ECANCELED` when the realtime clock is stepped, and nothing here steps it
+/// behind a timer's back.
+const TFD_TIMER_CANCEL_ON_SET: usize = 2;
+
+/// `TFD_SETTIME_FLAGS`: whether `timerfd_settime` accepts this flag word.
+/// Anything else is `EINVAL`, which is how a caller finds out the kernel is
+/// older than the flag it asked for.
+fn timerfd_settime_flags_ok(flags: usize) -> bool {
+    flags & !(TFD_TIMER_ABSTIME | TFD_TIMER_CANCEL_ON_SET) == 0
+}
+
+/// `close_range(2)`'s flags (`<linux/close_range.h>`).
+const CLOSE_RANGE_UNSHARE: usize = 1 << 1;
+/// See [`CLOSE_RANGE_UNSHARE`].
+const CLOSE_RANGE_CLOEXEC: usize = 1 << 2;
+
+/// What a `close_range(2)` call turns out to be asking for. The two are not
+/// variations on one another: one of them leaves every descriptor open.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CloseRangeAction {
+    /// `CLOSE_RANGE_CLOEXEC`: mark the range close-on-exec, leave it open.
+    MarkCloexec,
+    /// No `CLOSE_RANGE_CLOEXEC`: close the range.
+    Close,
+}
+
+/// All of `close_range(2)`'s decision, with the clamped range beside it.
+///
+/// `flags` is load-bearing and must NOT be dropped:
+/// - `CLOSE_RANGE_CLOEXEC` means "MARK this range close-on-exec"; the
+///   descriptors stay open and usable. Treating it as "close" turns a routine
+///   hardening call (glibc, dbus, systemd and GLib all make one) into a mass
+///   close of live fds -- which is also what these two numbers standing in
+///   for each other would do, because the kernel would then see no flag here
+///   at all and fall to the closing branch.
+/// - `CLOSE_RANGE_UNSHARE` asks for a private fd table first; this kernel
+///   never shares one between processes, so it is a no-op rather than an
+///   error.
+/// - Any other bit must be `EINVAL`, which is how callers detect an old
+///   kernel and fall back.
+fn close_range_action(
+    first: usize,
+    last: usize,
+    flags: usize,
+) -> LxResult<(CloseRangeAction, FileDesc, FileDesc)> {
+    if flags & !(CLOSE_RANGE_UNSHARE | CLOSE_RANGE_CLOEXEC) != 0 || first > last {
+        return Err(LxError::EINVAL);
+    }
+    let action = if flags & CLOSE_RANGE_CLOEXEC != 0 {
+        CloseRangeAction::MarkCloexec
+    } else {
+        CloseRangeAction::Close
+    };
+    // `FileDesc` is an i32, so the canonical `close_range(3, ~0U, 0)` idiom
+    // would wrap `last` to -1 and silently match nothing. Clamp.
+    Ok((
+        action,
+        FileDesc::from(first.min(i32::MAX as usize)),
+        FileDesc::from(last.min(i32::MAX as usize)),
+    ))
+}
+
+/// `dup3(2)`'s argument check: the two things it refuses where `dup2` does
+/// not. Its only flag is `O_CLOEXEC`, the same bit as [`ANON_CLOEXEC`], read
+/// from there rather than written out a third time.
+fn dup3_args_ok(fd1: usize, fd2: usize, flags: usize) -> bool {
+    fd1 != fd2 && flags & !ANON_CLOEXEC == 0
+}
 
 /// The open flags an anonymous-fd constructor was asked for, or `EINVAL` if
 /// the caller set a bit that syscall does not have.
@@ -205,12 +289,7 @@ impl Syscall<'_> {
         new_value: UserInPtr<ITimerSpec>,
         mut old_value: UserOutPtr<ITimerSpec>,
     ) -> SysResult {
-        // `TFD_SETTIME_FLAGS`. CANCEL_ON_SET is accepted and does nothing:
-        // it asks to be woken with ECANCELED when the realtime clock is
-        // stepped, and nothing here steps it behind a timer's back.
-        const TFD_TIMER_ABSTIME: usize = 1;
-        const TFD_TIMER_CANCEL_ON_SET: usize = 2;
-        if flags & !(TFD_TIMER_ABSTIME | TFD_TIMER_CANCEL_ON_SET) != 0 {
+        if !timerfd_settime_flags_ok(flags) {
             return Err(LxError::EINVAL);
         }
         let file_like = self.linux_process().get_file_like(fd)?;
@@ -629,20 +708,9 @@ impl Syscall<'_> {
     }
 
     /// `close_range(2)`: act on every open descriptor in `[first, last]`.
-    ///
-    /// `flags` is load-bearing and must NOT be dropped:
-    /// - `CLOSE_RANGE_CLOEXEC` means "MARK this range close-on-exec"; the
-    ///   descriptors stay open and usable. Treating it as "close" turns a
-    ///   routine hardening call (glibc, dbus, systemd, GLib all make one)
-    ///   into a mass close of live fds.
-    /// - `CLOSE_RANGE_UNSHARE` asks for a private fd table first; this kernel
-    ///   never shares one between processes, so it is a no-op rather than an
-    ///   error.
-    /// - Any other bit must be `EINVAL`, which is how callers detect an old
-    ///   kernel and fall back.
+    /// What the flag word decides, and why it must not be dropped, is
+    /// [`close_range_action`].
     pub fn sys_close_range(&self, first: usize, last: usize, flags: usize) -> SysResult {
-        const CLOSE_RANGE_UNSHARE: usize = 1 << 1;
-        const CLOSE_RANGE_CLOEXEC: usize = 1 << 2;
         let proc = self.linux_process();
         // Diagnostic at klog level: a mass close of a live fd table is
         // invisible at the default log level otherwise.
@@ -653,17 +721,10 @@ impl Syscall<'_> {
             last,
             flags
         );
-        if flags & !(CLOSE_RANGE_UNSHARE | CLOSE_RANGE_CLOEXEC) != 0 || first > last {
-            return Err(LxError::EINVAL);
-        }
-        // `FileDesc` is an i32, so the canonical `close_range(3, ~0U, 0)`
-        // idiom would wrap `last` to -1 and silently match nothing. Clamp.
-        let first = FileDesc::from(first.min(i32::MAX as usize));
-        let last = FileDesc::from(last.min(i32::MAX as usize));
-        if flags & CLOSE_RANGE_CLOEXEC != 0 {
-            proc.set_range_cloexec(first, last);
-        } else {
-            proc.close_range(first, last);
+        let (action, first, last) = close_range_action(first, last, flags)?;
+        match action {
+            CloseRangeAction::MarkCloexec => proc.set_range_cloexec(first, last),
+            CloseRangeAction::Close => proc.close_range(first, last),
         }
         Ok(0)
     }
@@ -673,8 +734,7 @@ impl Syscall<'_> {
     /// reason the syscall exists, and what the old alias-to-dup2 dropped.
     pub fn sys_dup3(&self, fd1: FileDesc, fd2: usize, flags: usize) -> SysResult {
         info!("dup3: from {:?} to {} flags {:#o}", fd1, fd2, flags);
-        const O_CLOEXEC: usize = 0o2000000;
-        if usize::from(fd1) == fd2 || flags & !O_CLOEXEC != 0 {
+        if !dup3_args_ok(usize::from(fd1), fd2, flags) {
             return Err(LxError::EINVAL);
         }
         let proc = self.linux_process();
@@ -683,7 +743,7 @@ impl Syscall<'_> {
         // Install with CLOEXEC in the same table lock as the replace: a
         // separate `dup2` then `set_fd_cloexec` left a window where `execve`
         // on another thread kept the new fd despite `O_CLOEXEC`.
-        let _ = proc.replace_file(fd2, file_like, flags & O_CLOEXEC != 0)?;
+        let _ = proc.replace_file(fd2, file_like, flags & ANON_CLOEXEC != 0)?;
         Ok(fd2.into())
     }
 
@@ -885,9 +945,8 @@ impl Syscall<'_> {
     /// and by the kernel to notify user-space applications of events.
     pub fn sys_eventfd2(&self, initval: u32, flags: usize) -> SysResult {
         info!("eventfd2: initval={}, flags={:#x}", initval, flags);
-        // `EFD_FLAGS_SET`. EFD_SEMAPHORE is bit 0, which `OpenFlags` spells
-        // `WRONLY`; `EventFd` reads it back under its own name.
-        const EFD_SEMAPHORE: usize = 1;
+        // `EFD_FLAGS_SET`, with `EFD_SEMAPHORE` taken from module scope so
+        // that the number is the same one a test can read.
         let flags = anon_fd_flags(flags, EFD_SEMAPHORE | ANON_CLOEXEC | ANON_NONBLOCK)?;
         let proc = self.linux_process();
         let eventfd = EventFd::new(initval, flags);
@@ -1445,6 +1504,130 @@ mod flock_translate_tests {
 }
 
 #[cfg(test)]
+mod fd_abi_number_tests {
+    //! The flag words `timerfd_settime`, `close_range` and `dup3` are handed
+    //! by userspace, each of which used to be checked against constants
+    //! declared inside the syscall method -- where no test could name them,
+    //! and no test could call the check either, because a `Syscall` needs a
+    //! live process. Every number here is written out from the uapi header
+    //! rather than taken from the tree, and every call below passes the raw
+    //! number rather than the constant, so that two constants swapping
+    //! places is a failure and not a rename.
+
+    use super::*;
+
+    #[test]
+    fn the_timerfd_settime_flags_are_the_numbers_linux_timerfd_h_gives() {
+        // `#define TFD_TIMER_ABSTIME (1 << 0)`
+        // `#define TFD_TIMER_CANCEL_ON_SET (1 << 1)`
+        assert_eq!(TFD_TIMER_ABSTIME, 1);
+        assert_eq!(TFD_TIMER_CANCEL_ON_SET, 2);
+        // They are a different flag word from `timerfd_create`'s, which is
+        // why `TFD_CLOEXEC` and `TFD_NONBLOCK` may share their bits and a
+        // settime call must still refuse them.
+        assert!(!timerfd_settime_flags_ok(ANON_CLOEXEC));
+        assert!(!timerfd_settime_flags_ok(ANON_NONBLOCK));
+    }
+
+    #[test]
+    fn the_only_flags_timerfd_settime_accepts_are_those_two() {
+        // Raw numbers: the whole of `TFD_SETTIME_FLAGS` is 0b11.
+        for accepted in [0usize, 1, 2, 3] {
+            assert!(timerfd_settime_flags_ok(accepted), "flags {:#x}", accepted);
+        }
+        // And anything else is EINVAL, which is how a caller detects a kernel
+        // older than the flag it wanted. Including alongside a valid one,
+        // which is how the whole word gets dropped rather than one bit.
+        for refused in [4usize, 8, 3 | 4, 1 << 30, 1 << 63, usize::MAX] {
+            assert!(!timerfd_settime_flags_ok(refused), "flags {:#x}", refused);
+        }
+    }
+
+    #[test]
+    fn the_close_range_flags_are_the_numbers_linux_close_range_h_gives() {
+        // `#define CLOSE_RANGE_UNSHARE (1U << 1)`
+        // `#define CLOSE_RANGE_CLOEXEC (1U << 2)`
+        assert_eq!(CLOSE_RANGE_UNSHARE, 2);
+        assert_eq!(CLOSE_RANGE_CLOEXEC, 4);
+        // Bit 0 belongs to neither, so it is one of the strays below.
+        assert_eq!(CLOSE_RANGE_UNSHARE & CLOSE_RANGE_CLOEXEC, 0);
+    }
+
+    /// The one that costs: the two flags standing in for each other makes
+    /// `close_range(3, ~0U, CLOSE_RANGE_CLOEXEC)` -- which glibc, dbus,
+    /// systemd and GLib all make -- see no flag it knows and fall to the
+    /// closing branch, so a hardening call becomes a mass close of every
+    /// live descriptor the process had.
+    ///
+    /// Every flag word here is the raw number, never the constant: a test
+    /// that passes `CLOSE_RANGE_CLOEXEC` cannot see the two swap places.
+    #[test]
+    fn the_cloexec_flag_marks_the_range_and_never_closes_it() {
+        let action = |flags| close_range_action(3, 100, flags).unwrap().0;
+        assert_eq!(
+            action(4),
+            CloseRangeAction::MarkCloexec,
+            "CLOSE_RANGE_CLOEXEC"
+        );
+        assert_eq!(
+            action(2),
+            CloseRangeAction::Close,
+            "CLOSE_RANGE_UNSHARE alone"
+        );
+        assert_eq!(action(0), CloseRangeAction::Close, "no flags at all");
+        assert_eq!(action(2 | 4), CloseRangeAction::MarkCloexec, "both");
+    }
+
+    #[test]
+    fn a_bit_close_range_does_not_have_is_einval() {
+        for stray in [1usize, 8, 16, 1 << 31, usize::MAX] {
+            assert_eq!(
+                close_range_action(3, 100, stray).err(),
+                Some(LxError::EINVAL),
+                "flags {:#x}",
+                stray
+            );
+        }
+        // Including beside a flag it does have, so the stray is not simply
+        // dropped and the rest honoured.
+        assert_eq!(
+            close_range_action(3, 100, 4 | 8).err(),
+            Some(LxError::EINVAL)
+        );
+    }
+
+    #[test]
+    fn the_range_is_clamped_to_an_i32_and_an_inverted_one_is_einval() {
+        // `FileDesc` is an i32, so the canonical `close_range(3, ~0U, 0)`
+        // idiom would wrap `last` to -1 and match nothing at all.
+        let (_, first, last) = close_range_action(3, usize::MAX, 0).unwrap();
+        assert_eq!(first, FileDesc::from(3usize));
+        assert_eq!(last, FileDesc::from(i32::MAX as usize));
+        // A single descriptor is a legal range; an inverted one is not.
+        let (_, first, last) = close_range_action(5, 5, 0).unwrap();
+        assert_eq!(first, last);
+        assert_eq!(
+            close_range_action(100, 3, 0).err(),
+            Some(LxError::EINVAL),
+            "first > last"
+        );
+    }
+
+    #[test]
+    fn dup3_refuses_its_own_descriptor_and_every_flag_but_cloexec() {
+        assert!(dup3_args_ok(3, 4, 0));
+        // `O_CLOEXEC` written out, so that reading it from the wrong
+        // constant is a failure here.
+        assert!(dup3_args_ok(3, 4, 0o2_000_000));
+        // The two things `dup2` allows and `dup3` does not.
+        assert!(!dup3_args_ok(4, 4, 0), "equal descriptors");
+        for stray in [1usize, 0o4_000, 0o2_000_000 | 1, 1 << 30] {
+            assert!(!dup3_args_ok(3, 4, stray), "flags {:#o}", stray);
+        }
+    }
+}
+
+#[cfg(test)]
 mod anon_fd_flag_tests {
     //! `eventfd2`, `timerfd_create`, `signalfd4`, `inotify_init1`,
     //! `epoll_create1` and `pipe2` are each handed a flag word by userspace
@@ -1456,7 +1639,9 @@ mod anon_fd_flag_tests {
     use super::*;
 
     /// The sets each caller passes, spelled as the uapi headers spell them.
-    const EFD_SEMAPHORE: usize = 1;
+    /// `EFD_SEMAPHORE` comes from module scope on purpose: a second copy here
+    /// agreed with production's by luck, and that is what the pin below is
+    /// for.
     const EFD_FLAGS: usize = EFD_SEMAPHORE | ANON_CLOEXEC | ANON_NONBLOCK;
     const TFD_FLAGS: usize = ANON_CLOEXEC | ANON_NONBLOCK;
     const EPOLL_FLAGS: usize = ANON_CLOEXEC;
@@ -1475,6 +1660,20 @@ mod anon_fd_flag_tests {
         assert_eq!(ANON_NONBLOCK, 0o4_000);
         assert_eq!(OpenFlags::CLOEXEC.bits(), ANON_CLOEXEC);
         assert_eq!(OpenFlags::NON_BLOCK.bits(), ANON_NONBLOCK);
+    }
+
+    /// `#define EFD_SEMAPHORE (1 << 0)`, the one bit `eventfd2` has of its
+    /// own, and the one `OpenFlags` happens to spell `WRONLY`.
+    ///
+    /// There used to be two copies of this number -- production's inside
+    /// `sys_eventfd2`, and this module's own, a few lines above -- and the
+    /// test built `EFD_FLAGS` from its own copy. So it compared the number
+    /// against itself: production could have said anything.
+    #[test]
+    fn the_eventfd_flag_is_the_bit_eventfd_h_gives() {
+        assert_eq!(EFD_SEMAPHORE, 1);
+        assert_eq!(EFD_SEMAPHORE, OpenFlags::WRONLY.bits());
+        assert_eq!(EFD_FLAGS, 1 | 0o2_000_000 | 0o4_000);
     }
 
     #[test]
