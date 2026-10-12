@@ -1156,10 +1156,6 @@ impl_kobject!(UnixSocketState);
 
 #[async_trait]
 impl FileLike for UnixSocketState {
-    fn is_socket(&self) -> bool {
-        true
-    }
-
     /// A socket reports `S_IFSOCK` to `fstat(2)`, as on Linux.
     fn metadata(&self) -> LxResult<rcore_fs::vfs::Metadata> {
         Ok(crate::fs::anon_metadata(
@@ -2395,6 +2391,12 @@ mod is_socket_tests {
     //! no would be a wait that never pumps the network stack underneath it.
     //! That used to be read off the descriptor number, which only worked
     //! while every socket was numbered from 1000 up.
+    //!
+    //! No socket implements `is_socket`: the trait's default answers from
+    //! `as_socket`, which every socket already implements and nothing else
+    //! does. These check that the derivation really reaches them -- and that
+    //! an ordinary file still says no, which is the half that would make the
+    //! whole thing useless if it broke.
 
     use super::*;
     use crate::net::netlink::NetlinkSocketState;
@@ -2409,5 +2411,12 @@ mod is_socket_tests {
     fn un_socket_netlink_se_declara_socket() {
         let s = NetlinkSocketState::new(SocketType::SOCK_RAW);
         assert!(FileLike::is_socket(&s));
+    }
+
+    #[test]
+    fn un_fichero_normal_no_es_un_socket() {
+        use crate::process::dup_fd_tests::{an_open_log, Log};
+        let f = an_open_log(Log::new(), crate::fs::OpenFlags::RDWR);
+        assert!(!f.is_socket());
     }
 }

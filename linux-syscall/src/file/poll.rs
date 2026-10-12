@@ -241,6 +241,19 @@ fn wake_after(limit: Option<Duration>, tick: Duration) -> Duration {
     }
 }
 
+/// One entry of a poll set as [`watch_kinds`] reads it: `None` for an entry
+/// poll(2) ignores, `Some(is_socket)` for one it watches.
+///
+/// poll(2): "if fd is negative then the corresponding events field is
+/// ignored". Classifying such an entry as a non-socket -- which is what it
+/// looks like once the descriptor cannot be resolved -- made a set of
+/// nothing but ignored entries ask for the interactive path, so a plain
+/// `poll(fds, n, timeout)` used to wake on every tty interrupt for the
+/// length of its timeout.
+fn poll_entry_kind(raw: i32, is_socket: impl FnOnce() -> bool) -> Option<bool> {
+    (raw >= 0).then(is_socket)
+}
+
 /// What a wait must pump, from whether each watched fd is a socket:
 /// `(watch_net, watch_interactive)`.
 ///
@@ -250,9 +263,11 @@ fn wake_after(limit: Option<Duration>, tick: Duration) -> Duration {
 /// anything else in it needs the interactive path. A set can need both, and
 /// an empty set needs neither.
 ///
-/// It used to be two reads of the fd NUMBER (`>= SOCKET_FD` / `< SOCKET_FD`),
-/// which also meant a negative fd -- the "ignore this entry" value poll(2)
-/// documents -- read as a socket and pumped the stack for nothing.
+/// It used to be two reads of the fd NUMBER (`fd_is_socket`: `>= SOCKET_FD`,
+/// and `fd_is_interactive`: `< SOCKET_FD` and not negative). The first of
+/// those cast the descriptor to `usize`, so a negative fd -- the "ignore
+/// this entry" value poll(2) documents -- came out enormous, read as a
+/// socket, and pumped the stack for nothing.
 fn watch_kinds(sockets: impl Iterator<Item = bool>) -> (bool, bool) {
     let mut net = false;
     let mut interactive = false;
@@ -473,12 +488,17 @@ impl Syscall<'_> {
                 // underneath it.
                 let (watch_net, watch_interactive) = {
                     let proc = this.syscall.linux_process();
-                    let sockets = this.polls.iter().map(|p| {
-                        <FileDesc as Into<i32>>::into(p.fd) >= 0
-                            && proc
-                                .get_file_like(p.fd)
+                    // A negative fd is poll(2)'s "ignore this entry" and is
+                    // skipped, not classified: counted as a non-socket it
+                    // made a list of nothing but ignored entries ask for the
+                    // interactive path, and a plain timeout then woke on
+                    // every tty interrupt.
+                    let sockets = this.polls.iter().filter_map(|p| {
+                        poll_entry_kind(p.fd.into(), || {
+                            proc.get_file_like(p.fd)
                                 .map(|f| f.is_socket())
                                 .unwrap_or(false)
+                        })
                     });
                     watch_kinds(sockets)
                 };
@@ -2163,6 +2183,31 @@ mod watch_kinds_tests {
     #[test]
     fn un_conjunto_vacio_no_pide_nada() {
         assert_eq!(watch_kinds(core::iter::empty()), (false, false));
+    }
+
+    /// poll(2)'s "ignore this entry": a negative descriptor is skipped, not
+    /// counted as a non-socket. Counted, a set of nothing but ignored
+    /// entries asked for the interactive path and woke on tty traffic for
+    /// the length of a timeout nobody meant to make interactive.
+    #[test]
+    fn un_descriptor_negativo_no_se_clasifica_siquiera() {
+        assert_eq!(super::poll_entry_kind(-1, || panic!("no se mira")), None);
+        assert_eq!(
+            watch_kinds(
+                [-1, -2]
+                    .iter()
+                    .filter_map(|fd| super::poll_entry_kind(*fd, || panic!("no se mira")))
+            ),
+            (false, false)
+        );
+    }
+
+    /// And an entry that IS watched is classified by its file, including the
+    /// one the process cannot resolve (a closed fd), which is not a socket.
+    #[test]
+    fn un_descriptor_valido_se_clasifica_por_su_fichero() {
+        assert_eq!(super::poll_entry_kind(3, || true), Some(true));
+        assert_eq!(super::poll_entry_kind(0, || false), Some(false));
     }
 
     /// One pass, and it stops as soon as both answers are known: the walk is

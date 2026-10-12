@@ -848,8 +848,10 @@ static LAST_DEFERRED_IDLE_US: AtomicU64 = AtomicU64::new(0);
 // at or above `SOCKET_FD` while the process is allowed to hold one that high
 // (see `LinuxProcess::add_socket`), so a process with a small
 // `RLIMIT_NOFILE` has sockets on low descriptors. The three waits ask
-// `FileLike::is_socket` now. `fd_is_interactive` also read a negative fd --
-// poll(2)'s "ignore this entry" -- as a socket, and pumped the stack for it.
+// `FileLike::is_socket` now, which is answered by `as_socket` so there is one
+// definition of "is a socket" and not two. `fd_is_socket` also cast the
+// descriptor to `usize`, so a negative fd -- poll(2)'s "ignore this entry" --
+// came out enormous and read as a socket, and the stack was pumped for it.
 
 #[inline]
 fn mono_us() -> u64 {

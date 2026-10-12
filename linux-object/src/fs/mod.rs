@@ -950,8 +950,15 @@ pub trait FileLike: KernelObject + downcast_rs::DowncastSync {
     /// and every socket it asked for was `EMFILE` with three fds open. With
     /// the question asked here instead, a socket that lands on a low
     /// descriptor is still a socket.
+    ///
+    /// Answered from [`FileLike::as_socket`] and not overridden anywhere, so
+    /// there is one definition of "is a socket" and not two: a file that
+    /// hands out a `&dyn Socket` IS one. A second, hand-written list is a
+    /// list the eighth socket type gets left off -- and the cost of being
+    /// left off is a `poll` on that socket that never pumps the stack
+    /// underneath it, which is the hardest kind of bug to see.
     fn is_socket(&self) -> bool {
-        false
+        self.as_socket().is_ok()
     }
     /// True if the underlying inode is a character device (`S_IFCHR`).
     ///
