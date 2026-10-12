@@ -2958,10 +2958,12 @@ fn proc_syscalls_content() -> alloc::string::String {
     for (num, calls) in crate::syscall_stats::snapshot() {
         let _ = writeln!(out, "{:>4} {}", num, calls);
     }
-    // The last calls made, oldest first. With every process asleep this names
-    // the syscall each one went to sleep in -- the thing a histogram cannot
-    // say and a log will never print.
-    out.push_str("# recent: pid/syscall, oldest first\n");
+    // Each process's last call. With every process asleep this names the
+    // syscall each one went to sleep in -- the thing a histogram cannot say
+    // and a log will never print. Not ordered: ordering it cost one
+    // machine-wide atomic increment per syscall and hid the quiet processes
+    // behind the busy one (see `syscall_stats::TRACE`).
+    out.push_str("# last call per process: pid/syscall\n");
     let mut line = alloc::string::String::new();
     for (i, (pid, num)) in crate::syscall_stats::trace().into_iter().enumerate() {
         let _ = write!(line, "{}/{} ", pid, num);
