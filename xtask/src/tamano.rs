@@ -72,7 +72,7 @@ const PASADOS: &[(&str, usize)] = &[
     // es lo que no se puede sacar: el sitio donde se decide. **Lo que toca es
     // partir el fichero**, como dice el comentario de arriba, y no es la tanda
     // que mete una escotilla nueva.
-    ("drivers/src/display/nvidia.rs", 15250),
+    ("drivers/src/display/nvidia.rs", 14750),
     (
         "drivers/src/display/nvidia/nouveau_bookkeeping_tests.rs",
         9500,
