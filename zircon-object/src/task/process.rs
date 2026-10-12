@@ -20,6 +20,20 @@ use crate::{
     ZxError, ZxResult,
 };
 
+/// The koid every init process is born with.
+///
+/// PID 1 is not a label: `getppid` answering 1 is how a daemon knows it was
+/// reparented after its parent died, `kill(1, ...)` is how a shutdown is
+/// asked for, and `/proc/1` is what every process manager reads first. The
+/// Linux personality's own loader names the same number when it starts init
+/// (`loader/src/linux.rs::run_init_if_present`), and the two have to agree:
+/// a process created here with another koid is an init that nothing can
+/// address and whose children's `getppid` answers a pid that does not exist.
+///
+/// It lived inside `create_init_with_vmar`'s body, where nothing could name
+/// it from a test.
+const INIT_PID: KoID = 1;
+
 /// A callback run once per process teardown, for per-pid resources owned by
 /// crates this one cannot depend on.
 pub type ProcessExitHook = fn(KoID);
@@ -451,7 +465,6 @@ impl Process {
         vmar: Arc<VmAddressRegion>,
         ext: impl Any + Send + Sync,
     ) -> ZxResult<Arc<Self>> {
-        const INIT_PID: KoID = 1;
         let proc = Arc::new(Process {
             base: KObjectBase::with_id(INIT_PID, name, Signal::default()),
             _counter: CountHelper::new(),
@@ -2625,5 +2638,47 @@ mod process_info_layout_tests {
         assert_eq!(&bytes[0..8], &(-7i64).to_le_bytes());
         assert_eq!(&bytes[8..11], &[1, 0, 1]);
         assert_eq!(&bytes[11..16], &[0; 5]);
+    }
+}
+
+#[cfg(test)]
+mod init_pid_tests {
+    use super::*;
+    use crate::object::KernelObject;
+
+    /// The init process is born as PID 1, and nothing else is.
+    ///
+    /// PID 1 is not a label. `getppid` answering 1 is how a daemon learns it
+    /// was reparented after its parent died, `kill(1, ...)` is how a shutdown
+    /// is asked for, and `/proc/1` is what a process manager reads first. The
+    /// number lived inside `create_init_with_vmar`'s body, where no test
+    /// could name it, and the Linux personality's loader writes the same
+    /// number again on its own side.
+    #[test]
+    fn the_init_process_is_born_as_pid_one() {
+        assert_eq!(INIT_PID, 1);
+        let root_job = Job::root();
+        let init = Process::create_init_with_ext(&root_job, "init", ())
+            .expect("failed to create the init process");
+        assert_eq!(
+            init.id(),
+            INIT_PID,
+            "this is the koid getppid, kill(1, ..) and /proc/1 name"
+        );
+        assert_eq!(init.id(), 1);
+    }
+
+    /// An ordinary process is never PID 1.
+    ///
+    /// `create_init_*` is the only path that forces the koid; every other
+    /// process takes the next one from the global counter, which starts above
+    /// it. A constructor that stopped forcing it would hand init whatever
+    /// number happened to be next.
+    #[test]
+    fn an_ordinary_process_does_not_get_the_init_koid() {
+        let root_job = Job::root();
+        let proc = Process::create(&root_job, "not-init").expect("failed to create process");
+        assert_ne!(proc.id(), INIT_PID);
+        assert!(proc.id() > INIT_PID, "the counter starts above PID 1");
     }
 }

@@ -1174,6 +1174,55 @@ impl ElfExt for ElfFile<'_> {
     }
 }
 
+/// The return address an IRELATIVE resolver is made to come back to.
+///
+/// Deliberately unmapped, canonical, and cheap to recognise: `ret` popping
+/// this into RIP takes an immediate instruction-fetch `#PF` at EXACTLY this
+/// address, which is how a resolver's return is detected.
+///
+/// It must be **non-zero**: a NULL-derived bug elsewhere in the resolver
+/// could coincidentally jump to 0, and the fault would then be read as a
+/// clean return and whatever happened to be in RAX written into a live GOT
+/// slot. It must also lie in the **first page**, which is the one page no
+/// image is ever mapped over: `linux-object`'s loader reserves
+/// `[0, PIE_LOAD_BASE)` as a low-address guard before it maps a PIE, and a
+/// non-PIE's absolute vaddrs start far above it. Move this into a mapped,
+/// executable page and every resolver in the batch returns into real code
+/// instead of faulting, which is not a crash but the IFUNC path silently
+/// never working again -- the symptom this whole function exists to fix.
+///
+/// It lived inside the function body, where nothing could name it and no
+/// test could reach it: the function resolves relocations by *executing*
+/// user code, so there is no test to write against the function itself.
+#[cfg(target_arch = "x86_64")]
+const IRELATIVE_SENTINEL_RETURN: usize = 0x8;
+
+/// Is this page fault the resolver returning, rather than the resolver
+/// crashing?
+///
+/// The address must match exactly and the fault must be an **instruction
+/// fetch**. Both halves carry weight. A range instead of an equality would
+/// read a wild jump to a nearby low address as a clean return; dropping the
+/// `EXECUTE` test would read a resolver that *dereferenced* the sentinel --
+/// a plausible null-ish pointer bug -- as a clean return. Either one writes
+/// a value the resolver never returned into a live GOT slot, which is the
+/// one outcome the fail-closed contract exists to prevent.
+#[cfg(target_arch = "x86_64")]
+fn is_irelative_sentinel_return(vaddr: usize, flags: MMUFlags) -> bool {
+    vaddr == IRELATIVE_SENTINEL_RETURN && flags.contains(MMUFlags::EXECUTE)
+}
+
+/// Where the sentinel return address is seeded in the one-page scratch stack.
+///
+/// `ret` reads the word AT the stack pointer, so the seeded word has to be
+/// the last one that fits inside the page: one word below its top. Seeding at
+/// the top itself writes the eight bytes that follow the page, which is
+/// either a refused write or somebody else's memory.
+#[cfg(target_arch = "x86_64")]
+fn irelative_scratch_sp(scratch: usize) -> usize {
+    scratch + PAGE_SIZE - core::mem::size_of::<usize>()
+}
+
 /// Resolve a batch of `R_X86_64_IRELATIVE` relocations by actually EXECUTING
 /// each resolver function once, synchronously, in a brief ring-3 excursion into
 /// the target address space. Unlike every other relocation type, IRELATIVE's
@@ -1216,12 +1265,6 @@ fn resolve_irelative_x86_64(
 ) -> Result<alloc::vec::Vec<(usize, usize)>, &'static str> {
     use kernel_hal::context::{TrapReason, UserContext, UserContextField};
 
-    // Deliberately unmapped, canonical, and cheap to recognise: `ret` popping
-    // this into RIP takes an immediate instruction-fetch #PF at EXACTLY this
-    // address, which is how a resolver's return is detected. Address 0 is
-    // avoided (a NULL-derived bug elsewhere could coincidentally target it).
-    const SENTINEL_RETURN: usize = 0x8;
-
     // A scratch stack: this runs before the process has a real stack (that is
     // allocated by the caller AFTER this relocation pass), so borrow one page
     // from the interpreter's own VMAR for the duration of this call, then give
@@ -1236,13 +1279,12 @@ fn resolve_irelative_x86_64(
             MMUFlags::READ | MMUFlags::WRITE | MMUFlags::USER,
         )
         .map_err(|_| "IRELATIVE: failed to map scratch stack")?;
-    let scratch_top = scratch + PAGE_SIZE;
-    let sp = scratch_top - core::mem::size_of::<usize>();
+    let sp = irelative_scratch_sp(scratch);
     let unmap_scratch = || {
         let _ = vmar.unmap(scratch, PAGE_SIZE);
     };
     if vmar
-        .write_memory(sp, &SENTINEL_RETURN.to_ne_bytes())
+        .write_memory(sp, &IRELATIVE_SENTINEL_RETURN.to_ne_bytes())
         .is_err()
     {
         unmap_scratch();
@@ -1271,7 +1313,7 @@ fn resolve_irelative_x86_64(
                     continue;
                 }
                 TrapReason::PageFault(vaddr, flags)
-                    if vaddr == SENTINEL_RETURN && flags.contains(MMUFlags::EXECUTE) =>
+                    if is_irelative_sentinel_return(vaddr, flags) =>
                 {
                     resolved.push((got_addr, ctx.get_field(UserContextField::ReturnValue)));
                     break;
@@ -2915,6 +2957,117 @@ mod reloc_type_tests {
         // are the aarch64 numbers either side of the three it does name.
         for ty in [0u32, 4, 5, 18, 36, 38, 1024, 1028] {
             assert_eq!(reloc_kind(ty), RelocKind::Unknown, "type {}", ty);
+        }
+    }
+}
+
+#[cfg(all(test, target_arch = "x86_64"))]
+mod irelative_sentinel_tests {
+    use super::*;
+
+    /// The sentinel is not null, and it lives in the first page.
+    ///
+    /// Both halves are load-bearing and neither is visible from the function
+    /// that uses them: it resolves relocations by *executing* user code, so
+    /// there is no test to write against the function itself. Null would let
+    /// a resolver's own NULL-derived bug look like a clean return; a sentinel
+    /// outside the first page can fall inside a mapped image, and then no
+    /// resolver ever faults and the whole batch is abandoned on the first
+    /// entry -- the IFUNC path silently never working again, which is the
+    /// symptom this code exists to cure.
+    #[test]
+    fn the_sentinel_is_not_null_and_sits_in_the_page_no_image_covers() {
+        assert_ne!(
+            IRELATIVE_SENTINEL_RETURN, 0,
+            "a resolver that jumps through a null pointer must not look like a clean return"
+        );
+        assert!(
+            IRELATIVE_SENTINEL_RETURN < PAGE_SIZE,
+            "the first page is the one page no image is mapped over"
+        );
+        assert_eq!(IRELATIVE_SENTINEL_RETURN, 0x8);
+    }
+
+    /// A clean return is this address AND an instruction fetch, both.
+    #[test]
+    fn a_clean_return_is_the_exact_address_and_an_instruction_fetch() {
+        assert!(is_irelative_sentinel_return(
+            IRELATIVE_SENTINEL_RETURN,
+            MMUFlags::EXECUTE
+        ));
+        // The real fault carries the rest of the access bits too.
+        assert!(is_irelative_sentinel_return(
+            IRELATIVE_SENTINEL_RETURN,
+            MMUFlags::READ | MMUFlags::EXECUTE | MMUFlags::USER
+        ));
+    }
+
+    /// A fault next door to the sentinel is a crash, not a return.
+    ///
+    /// A resolver that jumps through a small bogus value lands near zero, not
+    /// on the sentinel. Read as a return, its RAX -- whatever it happened to
+    /// hold -- goes into a live GOT slot, and the next call through that slot
+    /// jumps to it.
+    #[test]
+    fn a_fault_at_a_neighbouring_address_is_not_a_return() {
+        // `wrapping_sub` so that this test, and not the compiler, is what
+        // reports a sentinel moved to zero: `0 - 1` is a const-evaluation
+        // overflow, and a build that fails names the arithmetic here instead
+        // of the invariant above.
+        for vaddr in [
+            0,
+            1,
+            IRELATIVE_SENTINEL_RETURN.wrapping_sub(1),
+            IRELATIVE_SENTINEL_RETURN + 1,
+            PAGE_SIZE,
+            usize::MAX,
+        ] {
+            assert!(
+                !is_irelative_sentinel_return(vaddr, MMUFlags::EXECUTE),
+                "{:#x} is not the sentinel",
+                vaddr
+            );
+        }
+    }
+
+    /// A resolver that DEREFERENCED the sentinel has not returned either.
+    #[test]
+    fn a_read_or_a_write_of_the_sentinel_is_not_a_return() {
+        for flags in [
+            MMUFlags::empty(),
+            MMUFlags::READ,
+            MMUFlags::WRITE,
+            MMUFlags::READ | MMUFlags::WRITE | MMUFlags::USER,
+        ] {
+            assert!(
+                !is_irelative_sentinel_return(IRELATIVE_SENTINEL_RETURN, flags),
+                "a {:?} fault is the resolver touching the address, not returning to it",
+                flags
+            );
+        }
+    }
+
+    /// The sentinel is seeded in the last word that fits inside the page.
+    ///
+    /// `ret` reads the word AT the stack pointer, so it has to be a word that
+    /// is actually inside the scratch page. Seeded at the top instead, the
+    /// eight bytes written are the ones after the page.
+    #[test]
+    fn the_sentinel_is_seeded_in_the_last_word_that_fits_in_the_page() {
+        let word = core::mem::size_of::<usize>();
+        for scratch in [0x1000, 0x4000, 0x7fff_ffff_f000] {
+            let sp = irelative_scratch_sp(scratch);
+            assert!(sp >= scratch, "inside the page, not before it");
+            assert!(
+                sp + word <= scratch + PAGE_SIZE,
+                "the whole word has to fit inside the page"
+            );
+            assert_eq!(
+                sp + word,
+                scratch + PAGE_SIZE,
+                "and it is the LAST word that fits, so a push has room below it"
+            );
+            assert_eq!(sp % word, 0, "a word-aligned stack pointer");
         }
     }
 }
