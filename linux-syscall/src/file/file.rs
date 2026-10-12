@@ -11,6 +11,9 @@
 
 use super::*;
 use linux_object::error::LxResult;
+use linux_object::fs::ioctl::{
+    FIOASYNC, FIOCLEX, FIONBIO, FIONCLEX, FIONREAD, FIOQSIZE, TIOCGPTPEER, TIOCGWINSZ, TIOCSCTTY,
+};
 use linux_object::{process::FsInfo, thread::ThreadExt, time::TimeSpec};
 use rcore_fs::vfs::INode;
 
@@ -109,6 +112,36 @@ fn seek_from(whence: usize, offset: i64) -> linux_object::error::LxResult<SeekFr
         SEEK_END => Ok(SeekFrom::End(offset)),
         _ => Err(LxError::EINVAL),
     }
+}
+
+#[cfg(test)]
+mod ioctl_number_tests;
+
+/// Whether an `EINVAL` from the file's own ioctl handler should be reported
+/// as `ENOTTY`: the request is in the `0x54xx` terminal block and is not one
+/// of the file ioctls that block also carries.
+///
+/// The block runs from `TCGETS` (0x5401) to [`FIOQSIZE`] (0x5460), which is
+/// its last number, so the range is **inclusive**. An exclusive `..` here
+/// leaves `FIOQSIZE` out by one, and then the exclusion below has nothing
+/// left to do for it.
+///
+/// The six excluded requests are legal on pipes, sockets and regular files
+/// and are answered at the VFS layer above, so an `EINVAL` from one of them
+/// is the file's real answer and not "this is not a terminal". `TIOCOUTQ`
+/// (0x5411) is NOT among them: it is a question about a terminal's output
+/// queue and belongs to the block.
+///
+/// Every number here is named rather than written out. This used to be a
+/// bare `matches!(request, 0x541B | 0x5421 | ...)` whose last arm was
+/// `0x545E` -- a number `<asm-generic/ioctls.h>` has never assigned -- while
+/// the comment beside it called that arm `FIOQSIZE`, which is 0x5460.
+pub(crate) fn tty_block_wants_enotty(request: usize) -> bool {
+    (0x5400..=FIOQSIZE).contains(&request)
+        && !matches!(
+            request,
+            FIONREAD | FIONBIO | FIONCLEX | FIOCLEX | FIOASYNC | FIOQSIZE
+        )
 }
 
 impl Syscall<'_> {
@@ -2131,12 +2164,10 @@ impl Syscall<'_> {
         // (tools/lunarbar/src/sysinfo.rs).
         //
         // Exact small values, never sign-extended (bit 31 clear), so there is
-        // no collision with the DRM 0xC0xx_64xx family handled below.
-        const FIONBIO: usize = 0x5421;
-        const FIOCLEX: usize = 0x5451;
-        const FIONCLEX: usize = 0x5450;
-        const FIONREAD: usize = 0x541B;
-        const FIOASYNC: usize = 0x5452;
+        // no collision with the DRM 0xC0xx_64xx family handled below. The
+        // numbers come from `linux_object::fs::ioctl`, which is the one place
+        // this kernel writes them: they used to be declared again right here,
+        // and a second copy of an ABI number is a copy that can drift.
         match request {
             // FIONREAD/SIOCINQ: bytes waiting to be read. Legal on sockets and
             // pipes, and answered per object kind (see `FileLike::
@@ -2293,7 +2324,6 @@ impl Syscall<'_> {
         // to the prompt instead of looping in busybox ash's
         // `killpg(0, SIGTTIN)` background wait. The pty inode's own ioctl
         // handler cannot do this — it has no process context — so seed it here.
-        const TIOCSCTTY: usize = 0x540E;
         if cmd == TIOCSCTTY {
             if let Some(file) = file_like.downcast_ref::<linux_object::fs::File>() {
                 let inode = file.inode();
@@ -2314,7 +2344,6 @@ impl Syscall<'_> {
         // fd (Linux 4.13+). Needs the fd table, so it lives here rather than
         // in the inode's ioctl. `arg1` carries the open flags (O_RDWR |
         // O_NOCTTY | O_CLOEXEC from rustix-openpty / glibc `openpty`).
-        const TIOCGPTPEER: usize = 0x5441;
         if cmd == TIOCGPTPEER {
             if let Some(file) = file_like.downcast_ref::<linux_object::fs::File>() {
                 let inode = file.inode();
@@ -2335,7 +2364,6 @@ impl Syscall<'_> {
             }
         }
         // `TIOCGWINSZ` (get terminal window size).
-        const TIOCGWINSZ: usize = 0x5413;
         let ret = match file_like.ioctl(request, arg1, arg2, arg3) {
             // Some programs insist on a valid window size and keep retrying
             // `TIOCGWINSZ` when it fails on a char device that is not a full
@@ -2364,22 +2392,18 @@ impl Syscall<'_> {
                 ptr.write(ws)?;
                 Ok(0)
             }
-            // A tty-class request (TCGETS..TIOCGPTPEER, the 0x54xx block) on
-            // something that is not a char device answers ENOTTY on Linux —
-            // the file's handler simply does not know the request. Some of our
-            // inode impls say EINVAL instead (sfs maps every unknown cmd to
-            // `FsError::IOCTLError` -> EINVAL), which musl's `isatty()`
-            // tolerates but errno-checking callers do not: that was the
-            // `[einval-hunt] IOCTL a1=0x5413 (TIOCGWINSZ) on fd 2 -> EINVAL`
-            // hit against a service's log-file stderr. The VFS file ioctls
-            // sharing the block (TIOCOUTQ 0x5411 aside: FIONREAD 0x541B,
-            // FIONBIO 0x5421, FIONCLEX/FIOCLEX 0x5450/1, FIOASYNC 0x5452,
-            // FIOQSIZE 0x545E) are excluded — they are legal on pipes and
-            // sockets and answered elsewhere.
+            // A tty-class request on something that is not a char device
+            // answers ENOTTY on Linux: the file's handler simply does not
+            // know the request. Some of our inode impls say EINVAL instead
+            // (sfs maps every unknown cmd to `FsError::IOCTLError` ->
+            // EINVAL), which musl's `isatty()` tolerates but errno-checking
+            // callers do not: that was the `[einval-hunt] IOCTL a1=0x5413
+            // (TIOCGWINSZ) on fd 2 -> EINVAL` hit against a service's
+            // log-file stderr. Which requests the block covers, and which
+            // file ioctls inside it are left alone, is
+            // `tty_block_wants_enotty`.
             Err(LxError::EINVAL)
-                if (0x5400..0x5460).contains(&request)
-                    && !matches!(request, 0x541B | 0x5421 | 0x5450 | 0x5451 | 0x5452 | 0x545E)
-                    && !file_like.is_char_device() =>
+                if tty_block_wants_enotty(request) && !file_like.is_char_device() =>
             {
                 Err(LxError::ENOTTY)
             }
