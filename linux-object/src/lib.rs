@@ -1,6 +1,13 @@
 //! Linux kernel objects
 
 #![no_std]
+// `#[bench]` and `test::Bencher` are libtest's, and still unstable. Most of
+// this crate's rows live in the `benches/` targets, but the syscall-accounting
+// ones cannot: `ProcPerf::record` is private to `perf`, which is the point of
+// it -- so those rows sit in `#[cfg(test)]` modules beside the code, the way
+// `linux-syscall` and `kernel-hal` do it. Gated on `test` so a kernel build
+// never asks for the feature.
+#![cfg_attr(test, feature(test))]
 #![deny(warnings)]
 // #![deny(missing_docs)] 形同虚设了
 #![allow(clippy::upper_case_acronyms)]
@@ -8,6 +15,8 @@
 
 #[macro_use]
 extern crate alloc;
+#[cfg(test)]
+extern crate test;
 
 #[macro_use]
 extern crate log;
