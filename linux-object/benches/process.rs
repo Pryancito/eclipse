@@ -186,10 +186,12 @@ fn bench_close_range_three(b: &mut Bencher, n: usize) {
             )
             .expect("three numbers were just freed");
         }
-        test::black_box(proc.close_range(
+        // The sweep returns nothing, so there is no result to black-box; the
+        // inputs are what the compiler must not be able to see through.
+        proc.close_range(
             test::black_box(FileDesc::from(3)),
             test::black_box(FileDesc::from(5)),
-        ));
+        );
     });
 }
 
@@ -216,11 +218,7 @@ fn close_range_three_of_8192(b: &mut Bencher) {
 /// a narrow sweep that costs what this one costs is the finding.
 fn bench_set_range_cloexec_all(b: &mut Bencher, n: usize) {
     let proc = with_open_files(n);
-    b.iter(|| {
-        test::black_box(
-            proc.set_range_cloexec(test::black_box(FileDesc::from(3)), FileDesc::from(i32::MAX)),
-        )
-    });
+    b.iter(|| proc.set_range_cloexec(test::black_box(FileDesc::from(3)), FileDesc::from(i32::MAX)));
 }
 
 #[bench]
@@ -242,10 +240,10 @@ fn set_range_cloexec_all_of_8192(b: &mut Bencher) {
 fn bench_set_range_cloexec_three(b: &mut Bencher, n: usize) {
     let proc = with_open_files(n);
     b.iter(|| {
-        test::black_box(proc.set_range_cloexec(
+        proc.set_range_cloexec(
             test::black_box(FileDesc::from(3)),
             test::black_box(FileDesc::from(5)),
-        ))
+        )
     });
 }
 

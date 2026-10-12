@@ -57,6 +57,7 @@ cargo test -p zcore-boot-opts --lib
 # are the same lines the `unit-test` job runs; `--no-run` costs seconds.
 cargo bench -p linux-object --bench vfs --features mock-disk --no-run
 cargo bench -p linux-object --bench signal --features mock-disk --no-run
+cargo bench -p linux-object --bench process --features mock-disk --no-run
 cargo bench -p zircon-object --bench vm --features libos,aspace-separate --no-run
 cargo bench -p zircon-object --bench futex --features libos,aspace-separate --no-run
 cargo bench -p linux-syscall --no-run
