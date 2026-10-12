@@ -984,3 +984,22 @@ pub(crate) mod test_globals {
         LOCK.lock().unwrap_or_else(|e| e.into_inner())
     }
 }
+
+#[cfg(test)]
+mod limit_number_tests {
+    //! The two numbers this file enforces, against the literals
+    //! `include/uapi/linux/sem.h` gives.
+    //!
+    //! `SEMMSL` is already pinned from `linux-syscall`, which reports it
+    //! through `semctl(IPC_INFO)` and imports it from here; `SEMMNI` was a
+    //! hand-written copy there, and renumbered here it survived both suites.
+
+    use super::*;
+
+    #[test]
+    fn the_semaphore_limits_are_the_numbers_linux_defaults_to() {
+        // `#define SEMMNI 32000`, `#define SEMMSL 32000`.
+        assert_eq!(SEMMNI, 32000);
+        assert_eq!(SEMMSL, 32000);
+    }
+}

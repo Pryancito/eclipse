@@ -1373,3 +1373,30 @@ mod blocking_wait_tests {
         assert_eq!(queue.waiter_count(), 0);
     }
 }
+
+#[cfg(test)]
+mod limit_number_tests {
+    //! The three numbers this file enforces, against the literals
+    //! `include/uapi/linux/msg.h` gives.
+    //!
+    //! Every other test here builds its expectation FROM the constant
+    //! (`queue_of(MSGMNB)`, `for i in 0..MSGMNI`), which pins the behaviour
+    //! and not the number: renumbered, all three survived the whole suite. On
+    //! top of that they are the numbers `msgctl(IPC_INFO)` reports from
+    //! `linux-syscall`, and a limit reported but not enforced leaves a reader
+    //! no way to size itself.
+
+    use super::*;
+
+    #[test]
+    fn the_queue_limits_are_the_numbers_linux_defaults_to() {
+        // `#define MSGMAX 8192`, `#define MSGMNB 16384`, and MSGMNI 32000
+        // from Documentation/admin-guide/sysctl/kernel.rst.
+        assert_eq!(MSGMAX, 8192);
+        assert_eq!(MSGMNB, 16384);
+        assert_eq!(MSGMNI, 32000);
+        // And one message has to fit in an empty queue: with MSGMAX above
+        // MSGMNB a `msgsnd` of a legal size could never be queued at all.
+        assert!(MSGMAX <= MSGMNB);
+    }
+}
