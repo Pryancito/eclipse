@@ -3,6 +3,9 @@ extern crate std;
 use self::std::vec;
 use self::std::vec::Vec;
 use super::*;
+// Straight from the counters module: `drm.rs` itself has no non-test caller
+// for this one, and an import it does not use is an error under `deny(warnings)`.
+use super::present_counters::bump_bands;
 
 /// Put the process-global latches back however the body leaves them, and
 /// serialise against every other test that touches them.
