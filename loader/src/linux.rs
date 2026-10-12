@@ -18,6 +18,7 @@ use linux_object::thread::{CurrentThreadExt, ThreadExt};
 // unconditional import broke riscv64/aarch64 builds (`deny(warnings)`).
 #[cfg(target_arch = "x86_64")]
 use linux_object::process::Abi;
+use linux_object::process::INIT_PID;
 use linux_object::signal::SignalActionFlags;
 use linux_object::{loader::LinuxElfLoader, process::ProcessExt};
 use zircon_object::task::{CurrentThread, Process, Thread, ThreadState};
@@ -75,7 +76,6 @@ fn frame_fits_writable(ranges: &[(usize, usize, bool)], base: usize, len: usize)
 ///
 /// Used by the libos example/tests, where one program is the whole system.
 pub fn run(args: Vec<String>, envs: Vec<String>, rootfs: Arc<dyn FileSystem>) -> Arc<Process> {
-    const INIT_PID: KoID = 1;
     spawn(args, envs, rootfs, 0, None, INIT_PID, true, true).expect("run: program not found")
 }
 
@@ -129,7 +129,6 @@ pub fn run_init_if_present(
         );
         return None;
     }
-    const INIT_PID: KoID = 1;
     let init = args[0].clone();
     // `foreground = false`: init shares vt 0 with the primary shell and must not
     // seize its foreground process group (that would wedge the shell on SIGTTIN).
@@ -528,6 +527,26 @@ fn addr_is_executable(vmar: &Arc<VmAddressRegion>, addr: usize) -> bool {
         .is_some_and(|f| f.contains(kernel_hal::MMUFlags::EXECUTE))
 }
 
+/// How many stack words [`user_stack_backtrace`] looks at.
+const BACKTRACE_SCAN_WORDS: usize = 128;
+
+/// Bytes of stack to look at: [`BACKTRACE_SCAN_WORDS`] words of whatever
+/// width this target has.
+///
+/// Derived rather than spelled out as a byte count, because the scan walks
+/// the buffer with `chunks_exact(word)`: a byte count that is not a whole
+/// number of words drops its tail silently, and the deepest frames are the
+/// ones at the end. It is also a buffer on the kernel stack inside a fault
+/// report, so it has to stay small -- a backtrace helper that overflows the
+/// stack turns a diagnosable fault into an undiagnosable one.
+const BACKTRACE_SCAN_BYTES: usize = BACKTRACE_SCAN_WORDS * core::mem::size_of::<usize>();
+
+/// Cap on rendered frames: a screenful on a serial console.
+///
+/// It can only bind if it is at or below [`BACKTRACE_SCAN_WORDS`], since a
+/// frame has to be a word that was looked at. A cap above that is not a cap.
+const BACKTRACE_MAX_FRAMES: usize = 24;
+
 /// Scan the user stack from `sp` upwards for words that point into an
 /// executable page and render each as `stack[+off] = addr [lib+offset]`,
 /// `offset` being the FILE offset (`MappingDump::file_offset`) so it feeds
@@ -542,17 +561,13 @@ fn addr_is_executable(vmar: &Arc<VmAddressRegion>, addr: usize) -> bool {
 /// the first page's. The scan is bounded both in bytes looked at and in
 /// lines printed so a report stays a screenful on the serial console.
 fn user_stack_backtrace(vmar: &Arc<VmAddressRegion>, sp: usize) -> Vec<String> {
-    /// Bytes of stack to look at (128 words on a 64-bit target).
-    const SCAN_BYTES: usize = 1024;
-    /// Cap on rendered frames.
-    const MAX_FRAMES: usize = 24;
     let mut out = Vec::new();
     if sp == 0 {
         return out;
     }
     let word = core::mem::size_of::<usize>();
     let sp = sp & !(word - 1);
-    let mut buf = [0u8; SCAN_BYTES];
+    let mut buf = [0u8; BACKTRACE_SCAN_BYTES];
     let got = match vmar.read_memory(sp, &mut buf) {
         Ok(n) => n,
         Err(_) => return out,
@@ -578,7 +593,7 @@ fn user_stack_backtrace(vmar: &Arc<VmAddressRegion>, sp: usize) -> Vec<String> {
             "stack[+{:#x}] = {addr:#x} [{name}+{offset:#x}]",
             i * word
         ));
-        if out.len() >= MAX_FRAMES {
+        if out.len() >= BACKTRACE_MAX_FRAMES {
             break;
         }
     }
@@ -742,7 +757,7 @@ fn handle_signal(
         // the supervisor (`kill -HUP 1` from a root shell, or any signal that
         // races init's handler installation at boot), leaving the system
         // running with no PID 1 — no service restarts, no shutdown path.
-        if thread.proc().id() == linux_object::process::INIT_PID {
+        if thread.proc().id() == INIT_PID {
             warn!(
                 "signal {:?} for init (pid 1) has no handler; discarded (Linux semantics)",
                 signal
@@ -1922,5 +1937,93 @@ mod park_tests {
             "dos aparcadas seguidas dejan la marca puesta"
         );
         assert!(!t.tick_should_preempt());
+    }
+}
+
+#[cfg(test)]
+mod init_pid_and_backtrace_bounds_tests {
+    //! The pid init is born with, and the two bounds on the stack dump.
+    //!
+    //! All three used to be written inside a function body, where nothing
+    //! could name them. `INIT_PID` was the worse of the two cases: the same
+    //! `= 1` was written out **four times in three crates** --- once in
+    //! `zircon_object::task` (which creates the process with that koid), once
+    //! as `linux_object::process::INIT_PID`, and twice more here, in `run`
+    //! and in `run_init_if_present` --- while the signal path in this very
+    //! file already read the personality's. Only the `linux-object` copy had
+    //! a test, so renumbering it left the two local ones reporting the old
+    //! value with every suite green. The two local copies are gone and the
+    //! personality now derives from the crate that assigns the koid, so there
+    //! is one number left.
+
+    use super::*;
+    use core::mem::size_of;
+
+    /// The pid is 1, and that is an ABI number rather than a label: `getppid`
+    /// answering 1 is how a daemon learns it was reparented, `kill(1, sig)`
+    /// is how a shutdown is asked for, and `/proc/1` is what every process
+    /// manager reads first. An init born with any other koid is one nothing
+    /// can address.
+    #[test]
+    fn init_is_spawned_with_the_pid_userspace_addresses() {
+        assert_eq!(INIT_PID, 1);
+    }
+
+    /// And the number this file spawns with is the number the object layer
+    /// assigns, not a copy that agrees with it today.
+    ///
+    /// This is the test that the four copies really did collapse into one: it
+    /// fails the moment anyone writes the literal back into
+    /// `linux_object::process`.
+    #[test]
+    fn the_pid_spawned_with_is_the_one_the_object_layer_assigns() {
+        assert_eq!(INIT_PID, zircon_object::task::INIT_PID);
+    }
+
+    /// The frame cap has to be reachable, or it is not a cap.
+    ///
+    /// A frame is a word that was looked at, so at most
+    /// `BACKTRACE_SCAN_WORDS` of them can ever be rendered. Raise the cap
+    /// above that and the "bounded in lines printed" half of the promise
+    /// quietly becomes the other half.
+    #[test]
+    fn the_frame_cap_is_low_enough_to_ever_bind() {
+        assert!(BACKTRACE_MAX_FRAMES >= 1);
+        assert!(
+            BACKTRACE_MAX_FRAMES <= BACKTRACE_SCAN_WORDS,
+            "{} > {}",
+            BACKTRACE_MAX_FRAMES,
+            BACKTRACE_SCAN_WORDS
+        );
+    }
+
+    /// The scan is a whole number of words, so no tail is dropped.
+    ///
+    /// The loop walks the buffer with `chunks_exact(word)`, which skips the
+    /// remainder; the deepest frames are the ones at the end of the buffer,
+    /// so a remainder is the part of the trace that would have been most
+    /// worth having.
+    #[test]
+    fn the_scan_is_a_whole_number_of_words_so_no_tail_is_skipped() {
+        assert_eq!(BACKTRACE_SCAN_BYTES % size_of::<usize>(), 0);
+        assert_eq!(
+            BACKTRACE_SCAN_BYTES / size_of::<usize>(),
+            BACKTRACE_SCAN_WORDS
+        );
+    }
+
+    /// And the buffer it puts on the kernel stack fits in a page.
+    ///
+    /// It is a plain array in a function on the fault-report path, so its
+    /// size is kernel stack spent while a fault is being described. A
+    /// backtrace helper that overflows the stack turns a diagnosable fault
+    /// into an undiagnosable one, which is the opposite of the job.
+    #[test]
+    fn the_buffer_this_puts_on_the_kernel_stack_fits_in_a_page() {
+        assert!(
+            BACKTRACE_SCAN_BYTES <= 4096,
+            "{} bytes of stack",
+            BACKTRACE_SCAN_BYTES
+        );
     }
 }
