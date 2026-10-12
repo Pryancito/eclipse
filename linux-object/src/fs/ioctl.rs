@@ -659,6 +659,21 @@ pub const FIOCLEX: usize = 0x6601;
 // for non-blocking/blocking IO control setting
 pub const FIONBIO: usize = 0x5421;
 
+/// Turn SIGIO/SIGURG delivery on this fd on or off; the argument is a
+/// pointer to `int`. A VFS-layer file ioctl like the three above, legal on
+/// pipes and sockets.
+pub const FIOASYNC: usize = 0x5452;
+/// The number of bytes allocated to this file, which Linux answers from the
+/// inode (`inode_get_bytes`) for a directory, a non-anonymous regular file
+/// or a symlink, and refuses with `ENOTTY` for anything else -- a pipe, a
+/// socket. It is NOT a queue length: the queue ioctls of this block are
+/// `FIONREAD`/`TIOCINQ` and `TIOCOUTQ`.
+///
+/// `<asm-generic/ioctls.h>` puts it at the very top of the `0x54xx` block,
+/// the last number in it, so a range check over the block that means to
+/// include it has to be inclusive.
+pub const FIOQSIZE: usize = 0x5460;
+
 // Queue / session ioctls (`<asm-generic/ioctls.h>`).
 /// Bytes available to read (a.k.a. `TIOCINQ`); written as an `int`.
 pub const FIONREAD: usize = 0x541B;
@@ -1789,6 +1804,12 @@ mod request_number_tests {
         assert_eq!(FIONCLEX, io(b'T', 0x50));
         assert_eq!(FIOCLEX, io(b'T', 0x51));
         assert_eq!(TIOCGICOUNT, io(b'T', 0x5D));
+        // The two file ioctls the syscall layer serves for every fd kind.
+        // `FIOQSIZE` is the block's LAST number, which is what makes an
+        // exclusive range over the block leave it out by one.
+        assert_eq!(FIOASYNC, io(b'T', 0x52), "set or clear O_ASYNC");
+        assert_eq!(FIOQSIZE, io(b'T', 0x60), "bytes allocated to the file");
+        assert_eq!(FIOQSIZE, 0x5460);
     }
 
     #[test]
@@ -1898,6 +1919,8 @@ mod request_number_tests {
             ("TIOCGICOUNT", TIOCGICOUNT),
             ("FIONCLEX", FIONCLEX),
             ("FIOCLEX", FIOCLEX),
+            ("FIOASYNC", FIOASYNC),
+            ("FIOQSIZE", FIOQSIZE),
             ("TIOCGPTN", TIOCGPTN),
             ("TIOCSPTLCK", TIOCSPTLCK),
             ("TIOCGPTPEER", TIOCGPTPEER),

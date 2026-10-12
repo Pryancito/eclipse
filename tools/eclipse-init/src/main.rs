@@ -26,6 +26,7 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ffi::CString;
 use std::fs;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -361,6 +362,11 @@ struct Service {
     /// `crash_starts`, but a service that is restarted twenty times in half an
     /// hour is not healthy however long each try lived.
     starts: VecDeque<Instant>,
+    /// Whether this service's own output has already been echoed to the
+    /// console (see [`report_log_tail`]). Once per service per boot: the
+    /// point is to put the first failure on screen, not to replay every
+    /// retry of a crash loop.
+    tail_shown: bool,
 }
 
 /// Default environment handed to every service (and inherited by their
@@ -1586,6 +1592,7 @@ fn parse_service(name: &str, text: &str) -> Option<Service> {
         given_up: false,
         starts: VecDeque::new(),
         crash_starts: 0,
+        tail_shown: false,
     })
 }
 
@@ -2167,6 +2174,7 @@ fn start_service(svc: &mut Service) {
                 svc.given_up = true;
                 svc.pid = None;
                 svc.restart_at = None;
+                report_log_tail(svc);
                 log(&format!(
                     "respawn: {} has been started {} times in the last {:?} and is \
                      still not working; giving up on it for the rest of this boot, so \
@@ -2775,6 +2783,147 @@ fn rotate_log(path: &str) -> Option<String> {
     ))
 }
 
+/// How many of a service's own last lines go on the console when it dies.
+///
+/// Eight: enough for PulseAudio's "Failed to ..." plus the couple of lines of
+/// context around it, and short enough that two crashing services do not
+/// scroll the boot away.
+const LOG_TAIL_LINES: usize = 8;
+
+/// How much of the END of a log file is read to find those lines. A log is
+/// capped at [`MAX_LOG_BYTES`] but a service can write one very long line, and
+/// PID 1 must not pull a megabyte into memory to print eight lines.
+const LOG_TAIL_BYTES: u64 = 16 * 1024;
+
+/// How wide one echoed line may be. The console is 80 to 100 columns, and a
+/// single 4 KiB line (a module list, a backtrace) would take the screen.
+const LOG_TAIL_COLS: usize = 200;
+
+/// One log line as it may be printed: control characters neutered, trailing
+/// whitespace gone, and cut to [`LOG_TAIL_COLS`] characters with a visible
+/// mark when it was cut.
+///
+/// The escapes are the point, not the width. This is a service's own output
+/// going to the kernel console verbatim, and a log holding `\x1b[2J` or a
+/// carriage return would CLEAR or overwrite the boot messages above it --
+/// which is precisely the diagnostic this feature exists to put there. Every
+/// control character becomes a space, so an escape sequence prints as the
+/// harmless `[2J` instead of being obeyed. ANSI-coloured service output (a
+/// very common thing in a log) also stops arriving as colour, which is the
+/// right trade: init's own lines are plain.
+///
+/// One pass over the characters: the line can be multiple KiB (a backtrace,
+/// a module dump) and counting it before cutting it walked it twice.
+fn console_safe(line: &str) -> String {
+    let mut chars = line.chars();
+    let mut out: String = chars
+        .by_ref()
+        .take(LOG_TAIL_COLS)
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    // `next` only after the take: it is the one character past the cut, and
+    // asking for it is how the cut is detected without a second walk.
+    let cut = chars.next().is_some();
+    out.truncate(out.trim_end().len());
+    if cut {
+        out.push_str(" ...");
+    }
+    out
+}
+
+/// The last [`LOG_TAIL_LINES`] non-empty lines of `text`, each one as
+/// [`console_safe`] leaves it.
+///
+/// Separate from the file reading so it can be tested without a filesystem,
+/// and because every edge here is a real log: a file that ends without a
+/// newline, a run that only printed blank lines, a line with invalid UTF-8
+/// in it (already replaced by the lossy decode above), and the first line of
+/// the window, which is almost always half a line -- the read starts at a
+/// byte offset, not at a line boundary, so it is dropped unless it is the
+/// only one there is.
+fn tail_lines(text: &str) -> Vec<String> {
+    let lines: Vec<String> = text
+        .lines()
+        .map(console_safe)
+        .filter(|l| !l.is_empty())
+        .collect();
+    lines.into_iter().rev().take(LOG_TAIL_LINES).rev().collect()
+}
+
+/// The tail of the log file at `path`, ready to print. Empty for every
+/// failure: a log that cannot be read must not change what init does.
+fn log_tail(path: &str) -> Vec<String> {
+    let Ok(mut file) = fs::File::open(path) else {
+        return Vec::new();
+    };
+    // The size comes from a seek to the end and not from `metadata`, so a
+    // `stat` that fails cannot answer 0 and send the read below down the
+    // "small file, read it whole" path -- on a megabyte log that is the one
+    // thing PID 1 must not do.
+    let Ok(size) = file.seek(SeekFrom::End(0)) else {
+        return Vec::new();
+    };
+    // And back to where the read starts: the end-seek above left the cursor
+    // past the last byte, so a short file needs an explicit rewind.
+    let from = if size > LOG_TAIL_BYTES {
+        SeekFrom::End(-(LOG_TAIL_BYTES as i64))
+    } else {
+        SeekFrom::Start(0)
+    };
+    if file.seek(from).is_err() {
+        return Vec::new();
+    }
+    let mut buf = Vec::new();
+    if file.read_to_end(&mut buf).is_err() {
+        return Vec::new();
+    }
+    let text = String::from_utf8_lossy(&buf);
+    // The window began at a byte offset, so it opens in the middle of a
+    // line. Dropped BEFORE the tail is taken, or the fragment costs one of
+    // the lines the reader actually gets -- and a fragment of a 4 KiB line
+    // would cost all of them.
+    let text = match (size > LOG_TAIL_BYTES, text.find('\n')) {
+        (true, Some(nl)) => &text[nl + 1..],
+        _ => &text,
+    };
+    tail_lines(text)
+}
+
+/// Echo a crashing service's own last lines to the console, once per service
+/// per boot.
+///
+/// The supervisor's line says a service exited 1 after 50 ms; the REASON is in
+/// the service's `log =`, under /tmp, on a machine whose only output is the
+/// screen in front of whoever is debugging it. Telling them the path is not
+/// the same as showing them the error: it means rebooting into a shell with
+/// the failure no longer happening. So the first crash of a service puts its
+/// own words on the console, where every other boot failure already is.
+///
+/// Once, because the whole point of giving up on a crash loop is a console
+/// that stays readable. `tail_shown` is never cleared: a service that comes
+/// back healthy and crashes again hours later is a different question, and the
+/// log file still holds it.
+fn report_log_tail(svc: &mut Service) {
+    if svc.tail_shown {
+        return;
+    }
+    let Some(path) = svc.log.clone() else {
+        return;
+    };
+    let lines = log_tail(&path);
+    if lines.is_empty() {
+        return;
+    }
+    svc.tail_shown = true;
+    log(&format!(
+        "respawn: {} said this before dying ({path}):",
+        svc.name
+    ));
+    for line in lines {
+        log(&format!("  | {line}"));
+    }
+}
+
 /// Rotate every log the service table names that has outgrown the cap.
 ///
 /// By distinct path, because two services can share one `log =`
@@ -3035,6 +3184,7 @@ fn note_exit(services: &mut BTreeMap<String, Service>, pid: i32, status: i32, at
         // only costing the console? Checked before the restart is even
         // scheduled, so a service given up on here never gets a deadline.
         if note_crash(svc, uptime, exit_code) {
+            report_log_tail(svc);
             log(&format!(
                 "respawn: {} exited after {:?} ({}) and has now failed {} times in a \
                  row without ever staying up {:?}; giving up on it for the rest of \
@@ -3051,6 +3201,11 @@ fn note_exit(services: &mut BTreeMap<String, Service>, pid: i32, status: i32, at
                     .unwrap_or_default(),
             ));
         } else {
+            // The FIRST crash, not only the twentieth: the error is the same
+            // one, and reading it at 22 s beats reading it at 143 s.
+            if svc.crash_starts == 1 {
+                report_log_tail(svc);
+            }
             let (wait, next) = restart_delay(uptime, svc.backoff);
             svc.backoff = next;
             svc.restart_at = Some(at + wait);
