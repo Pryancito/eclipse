@@ -12920,7 +12920,11 @@ impl NvidiaGpu {
                     let Some(pos) = chans.iter().position(|c| {
                         c.id == req.channel && (owner_pid == 0 || c.owner_pid == owner_pid)
                     }) else {
-                        log::warn!(
+                        // `debug!`, not `warn!`: `nouveau_abi16_ioctl_channel_free`
+                        // answers ENOENT and writes nothing to the log, and a
+                        // client that frees idempotently or retries would turn
+                        // a warning here into noise. The errno is the report.
+                        log::debug!(
                             "[nouveau-uapi] CHANNEL_FREE: no such channel {} (for pid={}) -> ENOENT",
                             req.channel,
                             owner_pid
