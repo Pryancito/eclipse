@@ -2787,3 +2787,52 @@ mod benches {
         });
     }
 }
+
+#[cfg(test)]
+mod cap_user_data_layout_tests {
+    use super::*;
+    use core::mem::{align_of, offset_of, size_of};
+
+    /// `CapUserData` is `struct __user_cap_data_struct`, which `capget`
+    /// writes into the caller's buffer and `capset` reads out of it. Linux
+    /// spells it
+    ///
+    /// ```text
+    /// struct __user_cap_data_struct {
+    ///         __u32 effective;
+    ///         __u32 permitted;
+    ///         __u32 inheritable;
+    /// };
+    /// ```
+    ///
+    /// Three `u32` in a row, and the three sets mean very different things:
+    /// trading `effective` and `permitted` would report as already held every
+    /// capability the process is merely allowed to raise, and `capset` would
+    /// raise the ones it only meant to keep available.
+    #[test]
+    fn user_cap_data_struct_is_three_words_of_thirty_two_bits() {
+        assert_eq!(size_of::<CapUserData>(), 12);
+        assert_eq!(align_of::<CapUserData>(), 4);
+        assert_eq!(offset_of!(CapUserData, effective), 0);
+        assert_eq!(offset_of!(CapUserData, permitted), 4);
+        assert_eq!(offset_of!(CapUserData, inheritable), 8);
+    }
+
+    /// The twelve bytes as the three sets write them, read back: this notices
+    /// two sets trading places even where their offsets are not read one by
+    /// one.
+    #[test]
+    #[allow(unsafe_code)]
+    fn the_twelve_bytes_are_the_sets_that_wrote_them() {
+        let data = CapUserData {
+            effective: 0xaaaa_0001,
+            permitted: 0xbbbb_0002,
+            inheritable: 0xcccc_0003,
+        };
+        let bytes: [u8; 12] =
+            unsafe { core::ptr::read_unaligned(&data as *const _ as *const [u8; 12]) };
+        assert_eq!(&bytes[0..4], &0xaaaa_0001u32.to_le_bytes());
+        assert_eq!(&bytes[4..8], &0xbbbb_0002u32.to_le_bytes());
+        assert_eq!(&bytes[8..12], &0xcccc_0003u32.to_le_bytes());
+    }
+}
