@@ -343,6 +343,10 @@ impl ProcessExt for Process {
                     // Record locks die with the process (same as the
                     // fork path below; see `record_lock::release_owner`).
                     crate::fs::record_lock::release_owner(proc.id());
+                    // And so does its slot in `/proc/syscalls`'s last-call
+                    // table: a slot per pid is not a ring, so nothing
+                    // recycles it on its own, and KoIDs come back round.
+                    crate::syscall_stats::forget(proc.id());
                     // And so does what the layers above keep by pid (the
                     // POSIX timers); see `register_process_exit_hook`.
                     run_process_exit_hooks(proc.id());

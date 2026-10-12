@@ -107,7 +107,15 @@ pub const TRACE_LEN: usize = 256;
 /// so one spinning process could own all 256 slots and hide every sleeping
 /// one -- the exact case the paragraph above says this exists for. A slot per
 /// pid answers the question with one relaxed store, keeps the quiet processes
-/// visible, and shares a line only with the threads of its own process.
+/// visible, and takes the cross-CPU traffic off the common case.
+///
+/// Not *isolation*, and the difference matters: two pids whose slots collide
+/// write the same word, and eight `AtomicU64`s share a 64-byte line, so
+/// neighbouring slots false-share whatever happens. What the change bought
+/// was the removal of a word **every** thread on the machine wrote on
+/// **every** syscall; what is left is a word a handful of unrelated
+/// processes may share by chance. The benches measure the difference rather
+/// than asserting it ([`benches`][self::benches]).
 ///
 /// Two pids whose slots collide overwrite each other; with 256 slots that
 /// starts at a few dozen live processes, and the loser is a process whose
@@ -147,10 +155,54 @@ pub fn record(pid: u64, num: u32) {
 fn record_in_bank(bank: usize, pid: u64, num: u32) {
     let idx = (num as usize).min(MAX_SYSCALL - 1);
     COUNTS[bank & (COUNT_BANKS - 1)][idx].fetch_add(1, Ordering::Relaxed);
-    TRACE[trace_slot(pid)].store(
-        ((pid & 0xffff_ffff) << 32) | (num as u64 | 0x8000_0000),
-        Ordering::Relaxed,
-    );
+    TRACE[trace_slot(pid)].store(pack(pid, num), Ordering::Relaxed);
+}
+
+/// Pack a `(pid, syscall)` into one word, never zero.
+///
+/// Zero means "never written", so some bit has to be spent saying "written",
+/// and a 64-bit word has no room for a 64-bit pid, a 32-bit syscall number
+/// and that bit. The bit comes out of the **pid**, which is already an
+/// approximation here -- the stored pid is the low half of a 64-bit KoID --
+/// so one more truncated bit changes its kind not at all. Zircon hands KoIDs
+/// out from `1 << 32` upwards, so the low half starts at 0 and climbs: the
+/// 31-bit field is exact until the kernel has created 2^31 objects.
+///
+/// It used to come out of the **syscall number** (`num | 0x8000_0000`, read
+/// back masked with `0x7fff_ffff`), which silently turned every number with
+/// bit 31 set into `0x7fff_ffff`. That is the opposite of what this table is
+/// for: the module promises raw numbers precisely so an invalid probe shows
+/// as the number the program actually passed. Found by Copilot on #1852.
+#[inline]
+fn pack(pid: u64, num: u32) -> u64 {
+    const WRITTEN: u64 = 1 << 63;
+    WRITTEN | ((pid & 0x7fff_ffff) << 32) | num as u64
+}
+
+/// The inverse of [`pack`], for a word known not to be zero.
+#[inline]
+fn unpack(v: u64) -> (u64, u32) {
+    ((v >> 32) & 0x7fff_ffff, v as u32)
+}
+
+/// Forget `pid`'s slot, if it is still `pid`'s.
+///
+/// Called from the process-teardown path. Without it a slot stays populated
+/// until some other pid hashes there, so the table drifts towards naming
+/// processes that exited long ago -- and because KoIDs are recycled, a stale
+/// call could be read as a freshly created process's last one before it had
+/// made any. The ring this replaced recycled its slots by being a ring; a
+/// slot per pid has to be told.
+///
+/// The compare is what makes it safe to call late: by the time teardown runs,
+/// another live process may own the slot, and clearing that one would hide a
+/// process that is still running.
+pub fn forget(pid: u64) {
+    let slot = &TRACE[trace_slot(pid)];
+    let v = slot.load(Ordering::Relaxed);
+    if v != 0 && unpack(v).0 == (pid & 0x7fff_ffff) {
+        slot.store(0, Ordering::Relaxed);
+    }
 }
 
 /// How many times syscall `num` has been counted **in one bank**.
@@ -181,7 +233,7 @@ pub fn trace() -> alloc::vec::Vec<(u64, u32)> {
     for slot in TRACE.iter() {
         let v = slot.load(Ordering::Relaxed);
         if v != 0 {
-            out.push((v >> 32, (v as u32) & 0x7fff_ffff));
+            out.push(unpack(v));
         }
     }
     out
@@ -503,11 +555,80 @@ mod tests {
         let pid = unclaimed_pids(1)[0];
         record(pid, u32::MAX);
         assert_eq!(calls_of(last) - before, 1);
-        // And the entry keeps the number it was given, masked the way the
-        // packing does: the pid must still be readable beside it.
+        // And the entry keeps the number it was given, whole: the histogram
+        // clamps, the last-call table does not. See the test below.
         assert_eq!(
-            trace().into_iter().find(|(p, _)| *p == pid).map(|(p, _)| p),
-            Some(pid)
+            trace().into_iter().find(|(p, _)| *p == pid),
+            Some((pid, u32::MAX))
+        );
+    }
+
+    /// **Every bit of the syscall number survives the round trip.**
+    ///
+    /// The marker that says "this slot was written" used to live in bit 31 of
+    /// the number, so `u32::MAX` came back as `0x7fff_ffff` and every number
+    /// with the top bit set was silently rewritten. The module promises raw
+    /// numbers exactly so an invalid probe shows as the number the program
+    /// passed; rewriting it is the one thing this table must not do.
+    ///
+    /// Found by Copilot on #1852, after that packing had already merged. The
+    /// test it would have failed is this one, and the test that was there
+    /// instead asserted only that the **pid** survived.
+    #[test]
+    fn the_syscall_number_survives_whatever_bits_it_has_set() {
+        let pids = unclaimed_pids(4);
+        // 0 and the bit the old marker took; `MAX` and `MAX - 1` so an
+        // off-by-one in the field width shows.
+        for (pid, num) in pids.iter().zip([0u32, 0x8000_0000, u32::MAX, u32::MAX - 1]) {
+            record(*pid, num);
+            assert_eq!(
+                trace().into_iter().find(|(p, _)| *p == *pid),
+                Some((*pid, num)),
+                "syscall {:#x} did not come back whole for pid {}",
+                num,
+                pid
+            );
+        }
+    }
+
+    /// A slot whose process died is cleared, or the table drifts into naming
+    /// processes that exited long ago -- and KoIDs come back round, so a
+    /// stale call could be read as a brand-new process's last one.
+    #[test]
+    fn a_dead_process_stops_being_named() {
+        let pid = unclaimed_pids(1)[0];
+        record(pid, 42);
+        assert!(trace().into_iter().any(|(p, _)| p == pid));
+
+        forget(pid);
+
+        assert!(
+            !trace().into_iter().any(|(p, _)| p == pid),
+            "a process that exited is still named as making a call"
+        );
+    }
+
+    /// And `forget` only clears the slot while it is still that pid's: by the
+    /// time teardown runs, a live process may have taken it, and clearing
+    /// that one would hide a process that is still running.
+    #[test]
+    fn forgetting_a_dead_process_does_not_clear_a_live_ones_slot() {
+        // Two pids in the same slot: the collision is the case.
+        let first = unclaimed_pids(1)[0];
+        let want = trace_slot(first);
+        let second = (first + 1..first + (TRACE_LEN as u64 * 64))
+            .find(|p| trace_slot(*p) == want)
+            .expect("no second pid shares the slot");
+
+        record(first, 42);
+        record(second, 43);
+        // `second` wrote last, so the slot is its.
+        forget(first);
+
+        assert_eq!(
+            trace().into_iter().find(|(p, _)| *p == second),
+            Some((second, 43)),
+            "forgetting the dead process took the live one's slot with it"
         );
     }
 }
@@ -521,7 +642,9 @@ mod benches {
     //!
     //! `record` does two atomic operations: the histogram slot, and the
     //! per-process last-call entry. One is shared by every CPU making the
-    //! *same* syscall; the other only by the threads of one process. It used
+    //! *same* syscall; the other mostly by the threads of one process --
+    //! mostly, because colliding pids write the same word and adjacent slots
+    //! share a line. It used
     //! to do a third -- a `fetch_add` on a single global ring head, by every
     //! thread on the machine, on every syscall -- and a single-threaded row
     //! cannot see what that costs, because an uncontended `lock xadd` on a
