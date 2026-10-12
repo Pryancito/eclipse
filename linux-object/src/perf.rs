@@ -631,6 +631,15 @@ pub fn kernel_report() -> String {
             "  (edge-suppressed: {} level reports held back)",
             crate::fs::epoll_stats::edge_suppressed_total()
         );
+        // The fourth reading, and the one that is a bug report on its own: a
+        // return that carried an error instead of events. Userspace retries
+        // at once, so a figure anywhere near the call count is a livelock --
+        // the program is not spinning by choice, the kernel is bouncing it.
+        let _ = writeln!(
+            out,
+            "  (error returns: {} — EINTR or a watched file whose poll failed)",
+            crate::fs::epoll_stats::error_returns_total()
+        );
     }
     if off_sched_wedge && !all_halted && !nmi.is_empty() {
         // Distinct current RIPs across cores. A single shared value means every

@@ -586,7 +586,26 @@ pub struct LinuxThread {
     /// robust_list
     robust_list: UserInPtr<RobustList>,
     robust_list_len: usize,
-    /// handling signals
+    /// The signal most recently handed to a handler, for `/proc` and for
+    /// `sigreturn`'s own bookkeeping. INFORMATIONAL: it gates nothing.
+    ///
+    /// It used to gate [`Self::handle_signal`], which delivered nothing at
+    /// all while it was set -- and it is set from handler entry until the
+    /// `sigreturn`. A thread inside a handler therefore took no other signal,
+    /// however long the handler ran, while `check_signals_of` went on
+    /// reporting that second signal as deliverable and answering `EINTR` to
+    /// every blocking syscall. The signal was never delivered, so the `EINTR`
+    /// repeated for ever: a livelock with the process making no progress and
+    /// burning a core. Measured on a hung Firefox (12-oct): **3.056.442 of
+    /// 3.130.607 `epoll_pwait` calls, 97.6 %, returned `EINTR`**, with the
+    /// same storm in `futex` behind it.
+    ///
+    /// What stops a signal re-entering its own handler is the MASK, as in
+    /// Linux: `handler_mask` adds `sa_mask` and the signal itself (unless
+    /// `SA_NODEFER`) on entry, and `sigreturn` puts the old mask back. That
+    /// is already done (see `handle_signal` in `loader/src/linux.rs`), which
+    /// is why the gate was redundant for its stated purpose and fatal for
+    /// every other signal.
     pub handling_signal: Option<u32>,
     /// Thread name (`prctl(PR_SET_NAME)` / `/proc/<pid>/comm`), at most
     /// [`TASK_COMM_LEN`]` - 1` bytes. Empty = never set: readers fall back to
@@ -955,22 +974,23 @@ impl LinuxThread {
     }
 
     pub fn handle_signal(&mut self) -> Option<(Signal, Sigset)> {
-        if self.handling_signal.is_none() {
-            let signal = self
-                .signals
-                .mask_with(&self.signal_mask)
-                .find_first_signal();
-            if let Some(signal) = signal {
-                self.handling_signal = Some(signal as u32);
-                self.signals.remove(signal);
-                // If a `rt_sigsuspend` (or similar) saved a mask to restore once
-                // the handler returns, hand that mask to the signal frame so it
-                // is reinstated on `sigreturn`. Otherwise keep the current mask.
-                let restore_mask = self.saved_sigmask.take().unwrap_or(self.signal_mask);
-                return Some((signal, restore_mask));
-            }
-        }
-        None
+        // The mask decides, and nothing else: a signal a handler blocked is
+        // not in `mask_with`, and the signal being handled blocks itself
+        // through `handler_mask`. There is NO "one handler at a time" gate --
+        // see [`Self::handling_signal`] for the livelock that was.
+        let signal = self
+            .signals
+            .mask_with(&self.signal_mask)
+            .find_first_signal()?;
+        self.handling_signal = Some(signal as u32);
+        self.signals.remove(signal);
+        // If a `rt_sigsuspend` (or similar) saved a mask to restore once
+        // the handler returns, hand that mask to the signal frame so it
+        // is reinstated on `sigreturn`. Otherwise keep the current mask --
+        // which, for a handler entered from inside another handler, is the
+        // OUTER handler's mask, so the inner `sigreturn` lands back in it.
+        let restore_mask = self.saved_sigmask.take().unwrap_or(self.signal_mask);
+        Some((signal, restore_mask))
     }
 }
 
@@ -1036,6 +1056,76 @@ mod signal_delivery_tests {
     }
 
     #[test]
+    fn a_second_signal_is_delivered_while_another_handler_runs() {
+        // THE LIVELOCK. Delivery used to stop dead for the whole length of a
+        // handler, while `check_signals_of` went on answering `EINTR` to
+        // every blocking syscall for the signal it refused to deliver: the
+        // syscall returned `EINTR`, userspace retried, and nothing ever
+        // changed. 97.6 % of a hung Firefox's `epoll_pwait` calls.
+        let mut t = thread();
+        t.signals.insert(Signal::SIGUSR1);
+        let (first, _) = t.handle_signal().expect("SIGUSR1 was pending");
+        assert_eq!(first, Signal::SIGUSR1);
+        // What the loader does on handler entry (`handler_mask`): block the
+        // signal being handled.
+        t.block_signals(&one(Signal::SIGUSR1));
+
+        t.signals.insert(Signal::SIGTERM);
+        let (second, _) = t
+            .handle_signal()
+            .expect("a signal that arrives during a handler has to be delivered, as in Linux");
+        assert_eq!(second, Signal::SIGTERM);
+        assert!(
+            !t.signals.contains(Signal::SIGTERM),
+            "left pending, every blocking syscall keeps answering EINTR for it and the \
+             thread never gets past it"
+        );
+    }
+
+    #[test]
+    fn the_handled_signal_is_not_redelivered_because_its_own_mask_blocks_it() {
+        // The other half of the one above: with no gate, re-entry is stopped
+        // by the mask `handler_mask` installed, exactly as Linux stops it.
+        let mut t = thread();
+        t.signals.insert(Signal::SIGUSR1);
+        t.handle_signal().expect("SIGUSR1 was pending");
+        t.block_signals(&one(Signal::SIGUSR1));
+
+        t.signals.insert(Signal::SIGUSR1);
+        assert!(
+            t.handle_signal().is_none(),
+            "the handler's own mask is what keeps the signal out of its own handler"
+        );
+        assert!(
+            t.signals.contains(Signal::SIGUSR1),
+            "and it waits there for the sigreturn, it is not lost"
+        );
+    }
+
+    #[test]
+    fn a_nested_delivery_restores_the_outer_handlers_mask() {
+        // The inner frame carries the mask in force when it was built, which
+        // is the outer handler's -- so the inner `sigreturn` lands back
+        // inside the outer handler with its `sa_mask` still up, not with the
+        // mask from before any signal arrived.
+        let mut t = thread();
+        t.signals.insert(Signal::SIGUSR1);
+        let (_, outer_restore) = t.handle_signal().unwrap();
+        assert!(
+            outer_restore.is_empty(),
+            "nothing was blocked before the first signal"
+        );
+        t.block_signals(&one(Signal::SIGUSR1));
+
+        t.signals.insert(Signal::SIGTERM);
+        let (_, inner_restore) = t.handle_signal().unwrap();
+        assert!(
+            inner_restore.contains(Signal::SIGUSR1),
+            "the inner sigreturn would drop the outer handler's sa_mask"
+        );
+    }
+
+    #[test]
     fn the_lowest_numbered_pending_signal_goes_first() {
         let mut t = thread();
         t.signals.insert(Signal::SIGWINCH);
@@ -1093,21 +1183,33 @@ mod signal_delivery_tests {
     }
 
     #[test]
-    fn nothing_new_is_delivered_while_a_handler_is_running() {
-        // Re-entering the handler would build a second signal frame on a stack
-        // that already holds one, on top of the first handler's locals.
+    fn frames_cannot_pile_up_because_each_handler_blocks_its_own_signal() {
+        // This replaces a test that asserted the opposite -- that NOTHING is
+        // delivered while a handler runs -- whose stated reason was that a
+        // second frame would be built on a stack that already holds one.
+        // That reason is real and Linux answers it the same way this does:
+        // not by refusing every signal, but by blocking each one inside its
+        // own handler, so a given signal can add at most one frame and the
+        // nesting is bounded by the number of distinct unblocked signals.
+        // Refusing every signal instead cost a livelock -- see
+        // [`LinuxThread::handling_signal`].
         let mut t = thread();
         t.signals.insert(Signal::SIGUSR1);
         assert!(t.handle_signal().is_some());
+        t.block_signals(&one(Signal::SIGUSR1));
+        t.signals.insert(Signal::SIGUSR2);
+        assert!(t.handle_signal().is_some(), "SIGUSR2 nests, as in Linux");
+        t.block_signals(&one(Signal::SIGUSR2));
+
+        // Both arrive again while both handlers are on the stack.
+        t.signals.insert(Signal::SIGUSR1);
         t.signals.insert(Signal::SIGUSR2);
         assert!(
             t.handle_signal().is_none(),
-            "a second signal was delivered on top of the running handler"
+            "a handler's own signal got back into it and the frames pile up"
         );
-        assert!(
-            t.signals.contains(Signal::SIGUSR2),
-            "and it was consumed doing it"
-        );
+        assert!(t.signals.contains(Signal::SIGUSR1), "it waits, not lost");
+        assert!(t.signals.contains(Signal::SIGUSR2), "it waits, not lost");
     }
 
     #[test]
@@ -1129,8 +1231,8 @@ mod signal_delivery_tests {
         assert!(t.saved_sigmask.is_none(), "the saved mask was not taken");
 
         // Next time round there is nothing saved, so the current mask is what
-        // the frame carries.
-        t.handling_signal = None;
+        // the frame carries. (No reset of `handling_signal` here: it gates
+        // nothing -- see the field.)
         t.block_signals(&one(Signal::SIGWINCH));
         t.signals.insert(Signal::SIGTERM);
         let (_, restore) = t.handle_signal().unwrap();
@@ -1375,7 +1477,7 @@ mod signal_delivery_tests {
         );
         assert!(
             t.handling_signal.is_none(),
-            "the handler is still marked as running, so no further signal is delivered"
+            "sigreturn left the thread marked as mid-handler"
         );
     }
 
