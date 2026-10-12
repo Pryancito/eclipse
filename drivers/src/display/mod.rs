@@ -37,6 +37,12 @@ pub use nouveau_uapi::{
 };
 #[cfg(target_arch = "x86_64")]
 pub use nouveau_uapi::{enabled as nouveau_uapi_enabled, set_enabled as set_nouveau_uapi_enabled};
+/// The implicit-sync hatch (`nvidia.implicit_sync=off`), for `zCore`'s
+/// cmdline parsing by way of `kernel_hal::drivers`.
+#[cfg(target_arch = "x86_64")]
+pub use nvidia::implicit_sync::{
+    enabled as implicit_sync_enabled, set_enabled as set_implicit_sync_enabled,
+};
 #[cfg(target_arch = "x86_64")]
 pub use nvidia::{
     boot_edid, hdmi_audio_status, nvidia_hda_is_monitor_gpu, set_boot_edid, set_boot_fb_info,
