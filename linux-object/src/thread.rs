@@ -514,6 +514,17 @@ pub enum RobustDeath {
     },
 }
 
+/// The three fields of a robust futex word, from `linux/futex.h`: the top bit
+/// says a thread is waiting, the next one that the owner died without
+/// releasing it, and the thirty below them hold the owner's tid.
+///
+/// They are the uAPI. glibc's `__pthread_mutex_lock` and musl's equivalent
+/// write and read the same word, so a number out of step here does not break
+/// a test, it breaks every robust mutex in userspace.
+const FUTEX_WAITERS: i32 = 0x8000_0000_u32 as i32;
+const FUTEX_OWNER_DIED: i32 = 0x4000_0000;
+const FUTEX_TID_MASK: i32 = 0x3fff_ffff;
+
 /// Linux's `handle_futex_death`, without the memory access.
 ///
 /// Userspace cannot do this itself: the whole point is that the owner is gone.
@@ -522,10 +533,14 @@ pub enum RobustDeath {
 /// dead owner left half-done. Without the mark, every waiter stays blocked in
 /// the kernel for as long as the process lives.
 pub fn robust_death_action(uval: i32, tid: i32, pi: bool) -> RobustDeath {
-    const FUTEX_WAITERS: i32 = 0x8000_0000_u32 as i32;
-    const FUTEX_OWNER_DIED: i32 = 0x4000_0000;
-    const FUTEX_TID_MASK: i32 = 0x3fff_ffff;
-    if uval & FUTEX_TID_MASK != tid & FUTEX_TID_MASK {
+    // The word's low thirty bits against the RAW tid, as `handle_futex_death`
+    // compares them. Masking the tid as well would make every pair of tids
+    // 0x4000_0000 apart alias, and these tids are kernel object ids -- a
+    // counter with none of the `PID_MAX_LIMIT` cap that keeps a Linux tid
+    // inside the mask. The thread that aliased would mark a lock its owner
+    // still holds as owner-dead, and the waiters would get `EOWNERDEAD` from
+    // a lock nobody abandoned.
+    if uval & FUTEX_TID_MASK != tid {
         return RobustDeath::NotOurs;
     }
     RobustDeath::Died {
@@ -1688,8 +1703,17 @@ mod robust_list_tests {
     #[test]
     fn the_three_lock_word_bits_are_the_ones_the_libcs_use() {
         // These are the uAPI: glibc and musl write and read the same word.
-        assert_eq!(OWNER_DIED, 1 << 30);
-        assert_eq!(WAITERS, 1i32 << 31);
+        // Against the kernel's own constants, which is the whole point: this
+        // module keeps its own copies to build the expectations below from,
+        // and a test that compares its literal with its literal passes
+        // whatever the kernel says. The constants lived inside
+        // `robust_death_action` until the mutation run showed that nothing
+        // named their numbers.
+        assert_eq!(super::FUTEX_OWNER_DIED, 1 << 30);
+        assert_eq!(super::FUTEX_WAITERS, 1i32 << 31);
+        assert_eq!(super::FUTEX_TID_MASK, 0x3fff_ffff);
+        assert_eq!(OWNER_DIED, super::FUTEX_OWNER_DIED);
+        assert_eq!(WAITERS, super::FUTEX_WAITERS);
         // And the mask is everything below them.
         assert_eq!(
             robust_death_action(0x3fff_ffff, 0x3fff_ffff, false),
@@ -1698,6 +1722,31 @@ mod robust_list_tests {
                 wake: false
             }
         );
+    }
+
+    #[test]
+    fn a_tid_too_wide_for_the_mask_claims_nothing() {
+        // The comparison is the word's low thirty bits against the WHOLE tid,
+        // as `handle_futex_death` does it. Masking the tid as well would
+        // alias every pair of tids 0x4000_0000 apart, and these tids are
+        // kernel object ids: a counter, with none of the `PID_MAX_LIMIT` cap
+        // that keeps a Linux tid inside the mask. The thread that aliased
+        // would mark a lock its owner still holds as owner-dead, and the
+        // waiters would get EOWNERDEAD from a lock nobody abandoned.
+        for wide in [7 | OWNER_DIED, 7 | WAITERS, 7 | WAITERS | OWNER_DIED] {
+            assert_eq!(
+                robust_death_action(7, wide, false),
+                RobustDeath::NotOurs,
+                "tid {:#x} claimed the lock of tid 7",
+                wide
+            );
+        }
+        // A tid that does fit is untouched: the mask is there to hide the two
+        // flag bits the libc wrote into the word, nothing else.
+        assert!(matches!(
+            robust_death_action(7 | WAITERS, 7, false),
+            RobustDeath::Died { .. }
+        ));
     }
 
     #[test]

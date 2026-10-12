@@ -549,6 +549,15 @@ fn proc_task_stat(proc: &Process, thread: Option<&Arc<Thread>>) -> String {
     out
 }
 
+/// The page size `/proc` reports memory in.
+///
+/// `statm` is in pages, and so is field 24 of `stat`, and `ps` turns them
+/// back into bytes by multiplying by the page size `sysconf` gave it -- so
+/// this has to be the kernel's own. It was written twice in this file, once
+/// as `PAGE` and once as `PAGE_KB`: a name that says kilobytes and held
+/// bytes.
+const PROC_PAGE_SIZE: u64 = 4096;
+
 /// Fields 23 and 24 of `/proc/<pid>/stat` from the task's memory totals:
 /// `vsize` is `mm->total_vm << PAGE_SHIFT`, in BYTES, and `rss` is
 /// `get_mm_rss(mm)`, in PAGES (`do_task_stat`, `fs/proc/array.c`). The two
@@ -556,8 +565,10 @@ fn proc_task_stat(proc: &Process, thread: Option<&Arc<Thread>>) -> String {
 /// second by the page size, so a byte count in `rss` would show every
 /// process at four thousand times its size.
 fn stat_memory_fields(mapped_bytes: u64, resident_bytes: u64) -> (i64, i64) {
-    const PAGE: u64 = 4096;
-    (mapped_bytes as i64, (resident_bytes / PAGE) as i64)
+    (
+        mapped_bytes as i64,
+        (resident_bytes / PROC_PAGE_SIZE) as i64,
+    )
 }
 
 /// The `State:` line of `/proc/<pid>/status` for a `/proc/<pid>/stat` state
@@ -650,11 +661,10 @@ fn credential_lines(creds: &crate::process::Credentials) -> String {
 /// lib data dt" per proc.rst. text/lib/data/dt read zero (Linux itself zeroes
 /// lib and dt); `ps` computes RSS from field 2.
 fn proc_pid_statm(proc: &Process) -> String {
-    const PAGE_KB: u64 = 4096;
     let stats = proc.vmar().get_task_stats();
-    let size = stats.mapped_bytes() / PAGE_KB;
-    let shared = stats.shared_bytes() / PAGE_KB;
-    let resident = stats.private_bytes() / PAGE_KB + shared;
+    let size = stats.mapped_bytes() / PROC_PAGE_SIZE;
+    let shared = stats.shared_bytes() / PROC_PAGE_SIZE;
+    let resident = stats.private_bytes() / PROC_PAGE_SIZE + shared;
     alloc::format!("{} {} {} 0 0 0 0\n", size, resident, shared)
 }
 
@@ -4677,6 +4687,18 @@ mod pid_stat_tests {
         let bare = a_process(4317);
         bare.linux().set_execute_path("/bin/true");
         assert_eq!(proc_pid_cmdline(&bare), b"/bin/true\0");
+    }
+
+    /// The page size `/proc` divides by has to be the kernel's own: `ps`
+    /// multiplies field 24 of `stat` and the first two fields of `statm` back
+    /// up by the page size `sysconf` handed it, so a procfs dividing by
+    /// anything else reports every process at the wrong size. The number was
+    /// written twice in this file, as `PAGE` and as `PAGE_KB`, each inside
+    /// its own function.
+    #[test]
+    fn the_page_size_proc_reports_in_is_the_kernels_own() {
+        assert_eq!(PROC_PAGE_SIZE as usize, PAGE_SIZE);
+        assert_eq!(PROC_PAGE_SIZE, 4096);
     }
 }
 
