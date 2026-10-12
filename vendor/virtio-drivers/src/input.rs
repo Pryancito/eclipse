@@ -462,3 +462,60 @@ mod tests {
         assert!(input.pop_pending_event().is_none());
     }
 }
+
+#[cfg(test)]
+mod input_config_layout_tests {
+    use super::*;
+    use core::mem::{align_of, offset_of, size_of};
+
+    /// `AbsInfo` and `DevIDs` are virtio-input configuration space: the device
+    /// writes them and the driver reads them back by selecting a subsystem
+    /// and a subselect, so every offset here is the ABI. Linux spells both in
+    /// `include/uapi/linux/virtio_input.h`:
+    ///
+    /// ```text
+    /// struct virtio_input_absinfo {     struct virtio_input_devids {
+    ///         __le32 min;                       __le16 bustype;
+    ///         __le32 max;                       __le16 vendor;
+    ///         __le32 fuzz;                      __le16 product;
+    ///         __le32 flat;                      __le16 version;
+    ///         __le32 res;               };
+    /// };
+    /// ```
+    ///
+    /// Every field of each is the same width as its neighbour, so any two of
+    /// them trade places without a word of complaint, and the suite cannot
+    /// see it: its tests drive the two event queues and never the
+    /// configuration space. Seven of seven such swaps survived them.
+    ///
+    /// The eighth did not, and it is worth saying why: swapping `event_type`
+    /// and `code` in `InputEvent` is caught by
+    /// `an_event_the_device_writes_comes_back_intact_and_its_slot_is_offered_again`,
+    /// which reads a whole event back out of the used ring. Where a test
+    /// really drives the data path, the layout is already pinned, and nothing
+    /// is added for it here.
+    #[test]
+    fn virtio_input_absinfo_is_five_words_of_thirty_two_bits() {
+        assert_eq!(size_of::<AbsInfo>(), 20);
+        assert_eq!(align_of::<AbsInfo>(), 4);
+        assert_eq!(offset_of!(AbsInfo, min), 0);
+        assert_eq!(offset_of!(AbsInfo, max), 4);
+        assert_eq!(offset_of!(AbsInfo, fuzz), 8);
+        assert_eq!(offset_of!(AbsInfo, flat), 12);
+        assert_eq!(offset_of!(AbsInfo, res), 16);
+    }
+
+    /// The order is the one evdev uses, and it is neither alphabetical nor by
+    /// importance: the bus first, then the vendor, then the product, then the
+    /// version. Trading the vendor for the product is the kind of thing that
+    /// only ever shows up as the wrong name in a device listing.
+    #[test]
+    fn virtio_input_devids_is_bustype_vendor_product_version() {
+        assert_eq!(size_of::<DevIDs>(), 8);
+        assert_eq!(align_of::<DevIDs>(), 2);
+        assert_eq!(offset_of!(DevIDs, bustype), 0);
+        assert_eq!(offset_of!(DevIDs, vendor), 2);
+        assert_eq!(offset_of!(DevIDs, product), 4);
+        assert_eq!(offset_of!(DevIDs, version), 6);
+    }
+}
