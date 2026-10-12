@@ -2108,17 +2108,21 @@ mod vt_layout_tests {
     fn vt_mode_is_eight_bytes_with_the_two_flags_first() {
         assert_eq!(size_of::<VtMode>(), 8);
         assert_eq!(align_of::<VtMode>(), 2);
-        // Both are `__u8`, and swapping them turns an automatic VT into one
-        // that waits for a vertical retrace.
+        // Both are `__u8`. `vt.h` spells them `mode` ("vt mode") and `waitv`
+        // ("if set, hang on writes if not active"), so swapping them reads a
+        // VT_PROCESS request as a request to block writes on an inactive VT,
+        // and the mode byte as that flag.
         assert_eq!(offset_of!(VtMode, mode), 0);
         assert_eq!(offset_of!(VtMode, waitv), 1);
     }
 
     #[test]
-    fn the_three_signal_numbers_are_release_acquire_free() {
+    fn the_three_signal_numbers_are_release_then_acquire_then_unused() {
         // `__s16` each, so `relsig` sits at 2 and not at 3. Its width is the
         // one thing here that rustc does hold on its own: `vt_signal` in
         // `stdio.rs` takes an `i16`, so widening the field fails to compile.
+        // `frsig` is `/* unused (set to 0) */` in `vt.h`; it still has to be
+        // where the header puts it, because `acqsig` is in front of it.
         assert_eq!(offset_of!(VtMode, relsig), 2);
         assert_eq!(offset_of!(VtMode, acqsig), 4);
         assert_eq!(offset_of!(VtMode, frsig), 6);
