@@ -368,7 +368,7 @@ impl ProcessExt for Process {
                         let dropped = {
                             let futexes = core::mem::take(&mut *lp.futexes.lock());
                             let mut inner = lp.inner.lock();
-                            let files = core::mem::take(&mut inner.files);
+                            let files = inner.take_all_files();
                             inner.cloexec_fds.clear();
                             inner.semaphores = Default::default();
                             let shm = core::mem::take(&mut inner.shm_identifiers);
@@ -723,7 +723,7 @@ impl ProcessExt for Process {
                         let dropped = {
                             let futexes = core::mem::take(&mut *lp.futexes.lock());
                             let mut inner = lp.inner.lock();
-                            let files = core::mem::take(&mut inner.files);
+                            let files = inner.take_all_files();
                             inner.cloexec_fds.clear();
                             inner.semaphores = Default::default();
                             let shm = core::mem::take(&mut inner.shm_identifiers);
@@ -1214,6 +1214,25 @@ struct LinuxProcessInner {
     limits: RLimits,
     /// Opened files
     files: HashMap<FileDesc, Arc<dyn FileLike>>,
+    /// A LOWER BOUND on the lowest free descriptor, which is what
+    /// [`Self::get_free_fd_from`] starts its search at instead of zero.
+    ///
+    /// Linux keeps the same thing (`files_struct::next_fd`) for the same
+    /// reason: `alloc_fd` must return the lowest free number, and finding it
+    /// by probing upwards from zero costs one lookup per descriptor the
+    /// process already holds. That is paid on every `open`, `dup`, `pipe`,
+    /// `socket` and `accept`, so filling a table is quadratic in its size --
+    /// measured here at 10.9 ns on an empty table and 26.7 **micro**seconds
+    /// at eight thousand open descriptors, one `accept` of a server's
+    /// steady state (`benches/process.rs`, `fd_alloc_of_*`).
+    ///
+    /// The invariant is one-sided and that is deliberate: this is only ever
+    /// allowed to be at or BELOW the lowest free descriptor. Too low merely
+    /// costs the probes it saved; too high would hand out a number that is
+    /// not the lowest free one, which is a visible ABI difference. So every
+    /// removal lowers it ([`Self::note_fd_freed`]) and nothing raises it
+    /// except walking over descriptors found to be occupied.
+    next_fd: usize,
     /// Per-descriptor `FD_CLOEXEC` state — the set of fds the next `execve`
     /// must close. POSIX makes this a property of the DESCRIPTOR, not the open
     /// file description: `fork` copies it per-process and plain `dup` clears it
@@ -1964,7 +1983,7 @@ impl LinuxProcess {
     /// See [`opened_cloexec`] for why those cannot let the flag be read off
     /// the object.
     pub fn add_file_cloexec(&self, file: Arc<dyn FileLike>, cloexec: bool) -> LxResult<FileDesc> {
-        let inner = self.inner.lock();
+        let mut inner = self.inner.lock();
         let fd = inner.get_free_fd();
         self.insert_file(inner, fd, file, cloexec)
     }
@@ -1978,7 +1997,7 @@ impl LinuxProcess {
         cloexec: bool,
         start: usize,
     ) -> LxResult<FileDesc> {
-        let inner = self.inner.lock();
+        let mut inner = self.inner.lock();
         let fd = inner.get_free_fd_from(start);
         self.insert_file(inner, fd, file, cloexec)
     }
@@ -2002,10 +2021,12 @@ impl LinuxProcess {
     /// hold 24 sockets (1000..=1023) and no more.
     pub fn add_socket(&self, file: Arc<dyn FileLike>) -> LxResult<FileDesc> {
         let cloexec = opened_cloexec(&file);
-        let inner = self.inner.lock();
-        let fd = socket_fd(inner.get_free_fd_from(SOCKET_FD), inner.nofile(), || {
-            inner.get_free_fd()
-        });
+        let mut inner = self.inner.lock();
+        // Both halves are read out before the fallback closure, which needs
+        // the guard mutably now that the search keeps a hint.
+        let preferred = inner.get_free_fd_from(SOCKET_FD);
+        let nofile = inner.nofile();
+        let fd = socket_fd(preferred, nofile, || inner.get_free_fd());
         self.insert_file(inner, fd, file, cloexec)
     }
 
@@ -2641,6 +2662,9 @@ impl LinuxProcess {
             let mut inner = self.inner.lock();
             inner.cloexec_fds.remove(&fd);
             let removed = inner.files.remove(&fd);
+            if removed.is_some() {
+                inner.note_fd_freed(fd);
+            }
             let forget = removed
                 .as_ref()
                 .map(|f| inner.epoll_forget_plan(vec![(fd, f.clone())]));
@@ -2664,12 +2688,7 @@ impl LinuxProcess {
     /// stay open and usable and only disappear at the next `execve`.
     pub fn set_range_cloexec(&self, first: FileDesc, last: FileDesc) {
         let mut inner = self.inner.lock();
-        let fds: Vec<_> = inner
-            .files
-            .keys()
-            .filter(|&&fd| fd >= first && fd <= last)
-            .cloned()
-            .collect();
+        let fds = inner.open_fds_in_range(first, last);
         for fd in fds {
             inner.cloexec_fds.insert(fd);
         }
@@ -2681,17 +2700,16 @@ impl LinuxProcess {
         // released — see `close_file` for the re-entrancy deadlock this avoids.
         let (removed, forget): (Vec<(FileDesc, Arc<dyn FileLike>)>, _) = {
             let mut inner = self.inner.lock();
-            let fds: Vec<_> = inner
-                .files
-                .keys()
-                .filter(|&&fd| fd >= first && fd <= last)
-                .cloned()
-                .collect();
+            let fds = inner.open_fds_in_range(first, last);
             let removed: Vec<_> = fds
                 .into_iter()
                 .filter_map(|fd| {
                     inner.cloexec_fds.remove(&fd);
-                    inner.files.remove(&fd).map(|f| (fd, f))
+                    let removed = inner.files.remove(&fd).map(|f| (fd, f));
+                    if removed.is_some() {
+                        inner.note_fd_freed(fd);
+                    }
+                    removed
                 })
                 .collect();
             let forget = inner.epoll_forget_plan(removed.clone());
@@ -3844,7 +3862,13 @@ impl LinuxProcess {
             let close_fds = inner.cloexec_fds.drain().collect::<Vec<_>>();
             let removed: RemovedFds = close_fds
                 .into_iter()
-                .filter_map(|fd| inner.files.remove(&fd).map(|f| (fd, f)))
+                .filter_map(|fd| {
+                    let removed = inner.files.remove(&fd).map(|f| (fd, f));
+                    if removed.is_some() {
+                        inner.note_fd_freed(fd);
+                    }
+                    removed
+                })
                 .collect();
             let forget = inner.epoll_forget_plan(removed.clone());
             (removed, forget, inner.execute_path.clone())
@@ -4242,6 +4266,9 @@ impl LinuxProcessInner {
             environ: self.environ.clone(),
             current_working_directory: self.current_working_directory.clone(),
             files: self.files.clone(),
+            // The child's table is a copy of the parent's, so the parent's
+            // lower bound on its lowest free descriptor holds for it too.
+            next_fd: self.next_fd,
             // POSIX fork(2): the child gets its own COPY of each fd's
             // FD_CLOEXEC flag — later fcntl(F_SETFD) in either process
             // must not affect the other.
@@ -4346,15 +4373,98 @@ impl LinuxProcessInner {
         self.children_stime_ns += cpu.stime_ns;
     }
 
-    fn get_free_fd(&self) -> FileDesc {
+    fn get_free_fd(&mut self) -> FileDesc {
         self.get_free_fd_from(0)
     }
 
-    fn get_free_fd_from(&self, start: usize) -> FileDesc {
-        (start..)
-            .map(|i| i.into())
-            .find(|fd| !self.files.contains_key(fd))
-            .unwrap()
+    fn get_free_fd_from(&mut self, start: usize) -> FileDesc {
+        // Walk the hint over anything that is occupied. Each step past a
+        // descriptor is paid once for as long as that descriptor stays open,
+        // which is what makes filling a table linear rather than quadratic.
+        // It also makes the hint self-healing: the loop only ever advances
+        // over OCCUPIED numbers, so a hint left too low by any path costs
+        // probes and cannot cost correctness.
+        while self.files.contains_key(&FileDesc::from(self.next_fd)) {
+            self.next_fd += 1;
+        }
+        if start <= self.next_fd {
+            // The lowest free descriptor at or above `start` is the lowest
+            // free one outright, because `start` is at or below it.
+            FileDesc::from(self.next_fd)
+        } else {
+            // `fcntl(F_DUPFD, start)` above the hint: the hint says nothing
+            // about what is free up there, so this half still probes. It is
+            // bounded by the descriptors held ABOVE `start`, and the hint is
+            // left alone -- lowering it here would be wrong and raising it
+            // would discard the hole it is pointing at.
+            (start..)
+                .map(|i| i.into())
+                .find(|fd| !self.files.contains_key(fd))
+                .unwrap()
+        }
+    }
+
+    /// The open descriptors in `[first, last]`, which is what both halves of
+    /// `close_range(2)` need before they touch anything.
+    ///
+    /// Two ways round, chosen by which is smaller. Walking the TABLE is what
+    /// the two callers used to do unconditionally, and it costs one step per
+    /// descriptor the process holds however narrow the range is: the three
+    /// descriptors a child closes before `exec` cost 128 microseconds to find
+    /// at eight thousand open descriptors (`benches/process.rs`,
+    /// `close_range_three_of_8192`) -- ten times what marking the WHOLE table
+    /// close-on-exec costs, for three of them. Walking the RANGE instead is
+    /// one lookup per number in it, which is the better way round exactly
+    /// when the range is the narrower of the two.
+    ///
+    /// Either way the answer is the same set, and the order is not promised
+    /// by either (`files` is a hash map); nothing downstream depends on one.
+    fn open_fds_in_range(&self, first: FileDesc, last: FileDesc) -> Vec<FileDesc> {
+        // The width is read off the i32 the descriptor actually is, not off
+        // the `usize` it converts to: a negative number widens to about 2^64
+        // there, and a width taken from that would send a range down the
+        // wrong branch. An empty range leaves by the arm below rather than
+        // by arithmetic that happens to come out unreachable.
+        let width = match i64::from(i32::from(last)) - i64::from(i32::from(first)) {
+            d if d >= 0 => d as usize + 1,
+            // `last` below `first`: nothing is in the range. The syscall
+            // refuses this outright (`close_range_action` answers `EINVAL`),
+            // so it is here for the in-kernel callers and not for a program.
+            _ => return Vec::new(),
+        };
+        if width <= self.files.len() {
+            (usize::from(first)..=usize::from(last))
+                .map(FileDesc::from)
+                .filter(|fd| self.files.contains_key(fd))
+                .collect()
+        } else {
+            self.files
+                .keys()
+                .filter(|&&fd| fd >= first && fd <= last)
+                .cloned()
+                .collect()
+        }
+    }
+
+    /// Record that `fd` is no longer in `files`, so the next allocation can
+    /// hand it back out. The one way the hint ever moves down one descriptor
+    /// at a time.
+    fn note_fd_freed(&mut self, fd: FileDesc) {
+        self.next_fd = self.next_fd.min(usize::from(fd));
+    }
+
+    /// Empty the descriptor table, returning what was in it so the caller can
+    /// drop the files with no lock held. This is what a dying process does.
+    ///
+    /// The hint goes back to the bottom in the same breath, and that is why
+    /// this is a method rather than the `mem::take` it replaced: every OTHER
+    /// way a descriptor goes away reports itself through
+    /// [`Self::note_fd_freed`], and a bulk removal that forgot to would leave
+    /// the bound above the lowest free descriptor -- the one direction it is
+    /// not allowed to be.
+    fn take_all_files(&mut self) -> HashMap<FileDesc, Arc<dyn FileLike>> {
+        self.next_fd = 0;
+        core::mem::take(&mut self.files)
     }
 }
 
@@ -5877,6 +5987,9 @@ mod dying_process_tests;
 
 #[cfg(test)]
 mod socket_fd_tests;
+
+#[cfg(test)]
+mod fd_alloc_tests;
 
 #[cfg(test)]
 mod rlimit_layout_tests {
