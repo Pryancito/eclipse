@@ -144,21 +144,79 @@ pub(super) const EXT_CANARY: u64 = 0x4558_5443_414e_5259; // "EXTCANRY"
 /// page is a null pointer with a field offset on it, never an allocation.
 const MIN_OBJECT_ADDR: usize = 0x1000;
 
-/// Offset from an `Arc<T>`'s allocation to its payload: the two reference
-/// counts, rounded up to `T`'s alignment.
-///
-/// The standard library's `ArcInner` is `#[repr(C)] { strong, weak, data }`, so
-/// this is arithmetic rather than a guess -- but it is read HERE for a report
-/// only, to turn a corrupt entry's payload pointer back into the word a
-/// `clone` would have incremented, i.e. the `vaddr=` of the page fault it
-/// would have taken. Nothing dereferences it.
-const fn arc_payload_offset<T>() -> usize {
-    let align = core::mem::align_of::<T>();
-    if align > 16 {
-        align
+/// Alignment of the allocation an `Arc<T>` points at: the two reference
+/// counts come first, so it is `T`'s alignment or a word, whichever is
+/// coarser.
+const fn arc_alloc_align<T>() -> usize {
+    let a = core::mem::align_of::<T>();
+    let w = core::mem::align_of::<usize>();
+    if a > w {
+        a
     } else {
-        16
+        w
     }
+}
+
+/// The raw word a thread-list slot holds: the `Arc`'s own pointer value, read
+/// as an integer.
+///
+/// `Arc::as_ptr` is the obvious way to get at this and the wrong one here: it
+/// does pointer arithmetic on the `Arc`'s inner pointer to reach the payload,
+/// and arithmetic on a pointer into no allocation is undefined behaviour even
+/// when nothing is dereferenced. The whole point of the check below is to be
+/// sound on a value that is already nonsense, so it reads the slot's own bytes
+/// instead and never builds a pointer out of them.
+///
+/// `Arc<T>` for a sized `T` is one pointer wide, asserted here so that an
+/// `Arc` that ever stopped being one would fail to compile rather than quietly
+/// report half of itself. That word is the address of the allocation whose
+/// FIRST field is the strong count -- which is to say, exactly the word a
+/// clone writes to, so what this returns is the `vaddr=` of the page fault the
+/// clone would have taken.
+fn thread_entry_word(t: &Arc<Thread>) -> usize {
+    const _: () = assert!(core::mem::size_of::<Arc<Thread>>() == core::mem::size_of::<usize>());
+    // SAFETY: reads the bytes of the slot itself, which is live memory behind
+    // a live reference. Nothing is formed into a pointer, nothing is
+    // dereferenced, and the value is only ever compared against integers.
+    unsafe { *(t as *const Arc<Thread> as *const usize) }
+}
+
+/// More threads than any process will ever have. A `cap` past this is a
+/// number that was never a capacity.
+const MAX_PLAUSIBLE_THREADS: usize = 1 << 20;
+
+/// Whether a `Vec` header can still describe a real buffer -- decided from its
+/// three numbers alone, WITHOUT reading the buffer.
+///
+/// The entry check below is no use if the `Vec` itself is the thing that was
+/// smashed: walking it to look at the entries reads through that pointer, and
+/// letting the `Vec` go frees `cap` elements at that address, which is a wild
+/// write into the allocator's own bookkeeping rather than a page fault with a
+/// report attached. Both happen before any entry is ever examined.
+///
+/// `elem_align` is the alignment of the element type. An empty `Vec` owns no
+/// buffer and carries a dangling aligned pointer, which is why `cap == 0` is
+/// answered on its own instead of failing the address test.
+fn vec_header_looks_live(ptr: usize, len: usize, cap: usize, elem_align: usize) -> bool {
+    if cap == 0 {
+        return len == 0;
+    }
+    len <= cap
+        && cap <= MAX_PLAUSIBLE_THREADS
+        && ptr >= MIN_OBJECT_ADDR
+        && ptr.is_multiple_of(elem_align)
+}
+
+/// What a sweep of the thread list found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SweepVerdict {
+    /// Every entry could be a live object.
+    Intact,
+    /// This many entries could not, and were taken out.
+    Entries(usize),
+    /// The `Vec` header itself is not describing a buffer, so no entry could
+    /// be looked at and the whole list was abandoned.
+    WholeList,
 }
 
 /// Whether a thread-list entry can possibly still be a live `Arc<Thread>`.
@@ -178,15 +236,15 @@ const fn arc_payload_offset<T>() -> usize {
 /// all, and no amount of care inside `exit` makes dereferencing it safe: the
 /// only thing to do is to see it coming.
 ///
-/// Two properties, both free: an `Arc<Thread>`'s payload lives at a real
-/// address, and it is aligned for `Thread` (64 bytes in this build, since
-/// `ThreadInner` is cache-line aligned). `0x71` fails both.
+/// Two properties, both free: the allocation lives at a real address, and it
+/// is aligned for what it holds (64 bytes here, since `ThreadInner` is
+/// cache-line aligned). `0x71` fails both.
 ///
 /// This cannot certify a pointer -- a stale-but-plausible address passes --
 /// and it is not meant to. It catches the shape the smashes have actually had.
 fn thread_entry_looks_live(t: &Arc<Thread>) -> bool {
-    let payload = Arc::as_ptr(t) as usize;
-    payload >= MIN_OBJECT_ADDR && payload.is_multiple_of(core::mem::align_of::<Thread>())
+    let word = thread_entry_word(t);
+    word >= MIN_OBJECT_ADDR && word.is_multiple_of(arc_alloc_align::<Thread>())
 }
 
 /// Read the header of a Rust trait-object vtable: `(drop_in_place, size, align)`.
@@ -1205,27 +1263,51 @@ impl ProcessInner {
     /// Take out of the thread list every entry that cannot be a live object,
     /// and say so, loudly, for each one.
     ///
-    /// Returns how many were taken out, so a caller can tell an ordinary list
-    /// from a smashed one.
+    /// Three things about the removal. The `Vec` header is judged FIRST, from
+    /// its own three numbers: if the list's own pointer is what was smashed,
+    /// then walking it to look at the entries reads through that pointer and
+    /// letting it go frees `cap` elements at that address -- both before any
+    /// entry has been examined. In that case nothing is read and the whole
+    /// buffer is leaked.
     ///
-    /// Two things about the removal. A corrupt entry is **leaked on purpose**:
-    /// `Arc`'s own `Drop` decrements the very word a clone increments, so
-    /// dropping it takes the same page fault one instruction later, and
-    /// `Vec::retain` would do exactly that. And the list is rebuilt rather
-    /// than filtered in place for the same reason -- the entries that survive
-    /// are moved, never dropped.
+    /// A corrupt entry is **leaked on purpose** too: `Arc`'s own `Drop`
+    /// decrements the very word a clone increments, so dropping it takes the
+    /// same page fault one instruction later, and `Vec::retain` would do
+    /// exactly that. And the list is rebuilt rather than filtered in place for
+    /// the same reason -- the entries that survive are moved, never dropped.
     ///
     /// The report names the buffer as well as the entry: one bad word among
-    /// good ones is a write that landed on this `Vec`, while a whole buffer of
-    /// nonsense is a `Vec` whose own pointer is stale. Nothing here can tell
+    /// good ones is a write that landed on this `Vec`, while a header that is
+    /// not a header is a `Vec` whose own pointer is stale. Nothing can tell
     /// those apart later, and the numbers are gone the moment the machine is
     /// rebooted.
-    fn sweep_corrupt_threads(&mut self, pid: KoID, whence: &str) -> usize {
-        if self.threads.iter().all(thread_entry_looks_live) {
-            return 0;
-        }
+    fn sweep_corrupt_threads(&mut self, pid: KoID, whence: &str) -> SweepVerdict {
         let ptr = self.threads.as_ptr() as usize;
         let (len, cap) = (self.threads.len(), self.threads.capacity());
+        if !vec_header_looks_live(ptr, len, cap, core::mem::align_of::<Arc<Thread>>()) {
+            // Nothing above read the buffer and nothing below will: the old
+            // `Vec` is forgotten rather than dropped, which leaks it and keeps
+            // the allocator away from that address.
+            core::mem::forget(core::mem::take(&mut self.threads));
+            let report = alloc::format!(
+                "[thread-list] pid={} {}: the thread list's own Vec header is not a \
+                 header (ptr={:#x} len={} cap={}). No entry was read and the whole \
+                 buffer is leaked: walking it would read through that pointer, and \
+                 freeing it would hand the allocator that address. The process still \
+                 exits, with its threads abandoned.",
+                pid,
+                whence,
+                ptr,
+                len,
+                cap,
+            );
+            error!("{}", report);
+            kernel_hal::klog_err!("{}\n", report);
+            return SweepVerdict::WholeList;
+        }
+        if self.threads.iter().all(thread_entry_looks_live) {
+            return SweepVerdict::Intact;
+        }
         let taken = core::mem::take(&mut self.threads);
         let mut kept = Vec::with_capacity(taken.len());
         let mut dropped = 0usize;
@@ -1235,24 +1317,21 @@ impl ProcessInner {
                 continue;
             }
             dropped += 1;
-            let payload = Arc::as_ptr(&thread) as usize;
-            let strong_word = payload.wrapping_sub(arc_payload_offset::<Thread>());
+            let word = thread_entry_word(&thread);
             // Never dropped: see the note above.
             core::mem::forget(thread);
             let report = alloc::format!(
                 "[thread-list] pid={} {}: entry {}/{} is not a live Arc<Thread> \
-                 (payload={:#x}, strong count at {:#x} -- a clone of this entry is \
-                 a WRITE there, which is the #PF this check exists to see coming); \
-                 buffer ptr={:#x} len={} cap={}. Entry skipped and leaked; the \
-                 process still exits. One bad entry among good ones is a write \
-                 that landed on this buffer, a buffer of nothing but bad entries \
-                 is a Vec whose own pointer is stale.",
+                 ({:#x} -- a clone of this entry is a WRITE to that very address, \
+                 which is the #PF this check exists to see coming); buffer ptr={:#x} \
+                 len={} cap={}. Entry skipped and leaked; the process still exits. \
+                 One bad entry among good ones is a write that landed on this \
+                 buffer.",
                 pid,
                 whence,
                 i,
                 len,
-                payload,
-                strong_word,
+                word,
                 ptr,
                 len,
                 cap,
@@ -1261,7 +1340,7 @@ impl ProcessInner {
             kernel_hal::klog_err!("{}\n", report);
         }
         self.threads = kept;
-        dropped
+        SweepVerdict::Entries(dropped)
     }
 
     /// Add a handle to the process
@@ -2018,15 +2097,78 @@ mod tests {
     /// next capture cannot be matched against this one.
     #[test]
     fn the_report_names_the_same_address_the_page_fault_did() {
-        // SAFETY: as above -- arithmetic on the pointer only.
+        // SAFETY: never dereferenced, never dropped -- `forget` below.
         let bogus: Arc<Thread> = unsafe { core::mem::transmute(0x71usize) };
-        let payload = Arc::as_ptr(&bogus) as usize;
+        let word = thread_entry_word(&bogus);
         core::mem::forget(bogus);
         assert_eq!(
-            payload.wrapping_sub(arc_payload_offset::<Thread>()),
-            0x71,
+            word, 0x71,
             "el informe imprime {:#x} donde la pantalla dijo 0x71",
-            payload.wrapping_sub(arc_payload_offset::<Thread>()),
+            word,
+        );
+    }
+
+    /// And it has to be the same word for a live entry too: the strong count
+    /// sits at the front of the allocation, so what a clone writes to is the
+    /// address stored in the slot, not the payload.
+    #[test]
+    fn the_word_of_a_live_entry_is_its_allocation() {
+        let root_job = Job::root();
+        let proc = Process::create(&root_job, "proc").expect("failed to create process");
+        let thread = Thread::create(&proc, "thread").expect("failed to create thread");
+
+        let word = thread_entry_word(&thread);
+        let payload = Arc::as_ptr(&thread) as usize;
+        assert!(
+            word <= payload && payload - word < 4096,
+            "la palabra guardada ({:#x}) es la asignacion, justo antes del payload ({:#x})",
+            word,
+            payload,
+        );
+        assert!(word.is_multiple_of(arc_alloc_align::<Thread>()));
+        release(&proc, &[&thread]);
+    }
+
+    /// A `Vec` whose own header is nonsense must never be walked and never be
+    /// freed: reading it goes through that pointer, and dropping it hands the
+    /// allocator `cap` elements at that address. If the sweep gets this wrong
+    /// the test faults instead of failing, which is itself the answer.
+    #[test]
+    fn a_vec_header_that_is_not_a_header_is_abandoned_whole() {
+        let mut inner = ProcessInner::default();
+        // SAFETY: never read, never freed -- the sweep must `forget` it. The
+        // numbers are a smashed header: a buffer at 0x71 holding three
+        // elements.
+        inner.threads = unsafe { Vec::from_raw_parts(0x71 as *mut Arc<Thread>, 3, 3) };
+
+        let verdict = inner.sweep_corrupt_threads(7, "test");
+
+        assert_eq!(verdict, SweepVerdict::WholeList);
+        assert!(inner.threads.is_empty(), "la lista queda vacia, no rota");
+    }
+
+    /// The three numbers on their own, since the test above cannot tell a
+    /// check that reads them from one that answers `false` to everything.
+    #[test]
+    fn a_vec_header_is_judged_by_its_three_numbers() {
+        // What an empty `Vec` really looks like: no buffer, a dangling
+        // aligned pointer well under the first page.
+        assert!(vec_header_looks_live(8, 0, 0, 8));
+        assert!(!vec_header_looks_live(8, 1, 0, 8), "len sin cap");
+        // An ordinary live one.
+        assert!(vec_header_looks_live(0xffff_8000_0040_0000, 2, 4, 8));
+        assert!(
+            !vec_header_looks_live(0xffff_8000_0040_0000, 5, 4, 8),
+            "len por encima de cap"
+        );
+        assert!(
+            !vec_header_looks_live(0xffff_8000_0040_0001, 1, 4, 8),
+            "puntero desalineado"
+        );
+        assert!(!vec_header_looks_live(0x71, 3, 3, 8), "puntero imposible");
+        assert!(
+            !vec_header_looks_live(0xffff_8000_0040_0000, 1, usize::MAX, 8),
+            "una capacidad que nunca fue una capacidad"
         );
     }
 
@@ -2051,9 +2193,13 @@ mod tests {
             .push(unsafe { core::mem::transmute::<usize, Arc<Thread>>(0x71usize) });
         inner.threads.push(second.clone());
 
-        let dropped = inner.sweep_corrupt_threads(proc.id(), "test");
+        let verdict = inner.sweep_corrupt_threads(proc.id(), "test");
 
-        assert_eq!(dropped, 1, "solo el de en medio estaba roto");
+        assert_eq!(
+            verdict,
+            SweepVerdict::Entries(1),
+            "solo el de en medio estaba roto"
+        );
         assert_eq!(
             inner.threads.iter().map(|t| t.id()).collect::<Vec<_>>(),
             alloc::vec![first.id(), second.id()],
@@ -2076,7 +2222,10 @@ mod tests {
         inner.threads.push(thread.clone());
         let before = inner.threads.as_ptr();
 
-        assert_eq!(inner.sweep_corrupt_threads(proc.id(), "test"), 0);
+        assert_eq!(
+            inner.sweep_corrupt_threads(proc.id(), "test"),
+            SweepVerdict::Intact
+        );
         assert_eq!(
             inner.threads.as_ptr(),
             before,
