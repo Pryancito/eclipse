@@ -2280,3 +2280,71 @@ mod dma_tests {
         });
     }
 }
+#[cfg(test)]
+mod header_layout_tests {
+    //! The two structures the controller reads out of memory by itself.
+    //!
+    //! A Command Header and its PRD entries are not messages this driver
+    //! sends anywhere; they are memory the HBA fetches by DMA at offsets the
+    //! spec fixes. Nothing in this kernel can disagree with itself about
+    //! them, because every read and write goes through the field name, so
+    //! swapping two same-typed neighbours compiles clean and leaves the
+    //! controller reading a byte count where a physical address belongs.
+    //! Measured over the whole `zcore-drivers` suite, all six swaps the two
+    //! allow survived its 1515 tests.
+    //!
+    //! Both sizes are load-bearing arithmetic a few lines above: the command
+    //! list strides 32 bytes per slot, and `PRDT_MAX` is 56 because 56 times
+    //! 16 fills the command table to its 1 KiB stride exactly.
+    //!
+    //! Against the AHCI 1.3.1 spec, 4.2.2 for the header and 4.2.3 for the
+    //! PRDT.
+
+    use super::*;
+    use core::mem::{align_of, offset_of, size_of};
+
+    #[test]
+    fn the_command_header_is_the_thirty_two_bytes_of_section_4_2_2() {
+        assert_eq!(size_of::<CommandHeader>(), 32);
+        assert_eq!(align_of::<CommandHeader>(), 4);
+        // DW0: the FIS length in the low byte, the port-multiplier and flag
+        // byte next, then the PRDT length as a half-word.
+        assert_eq!(offset_of!(CommandHeader, cfl), 0);
+        assert_eq!(offset_of!(CommandHeader, pm), 1);
+        assert_eq!(offset_of!(CommandHeader, prdtl), 2);
+        // DW1 is the byte count the controller writes back.
+        assert_eq!(offset_of!(CommandHeader, prdbc), 4);
+        // DW2 and DW3 are the command table's address, low half first.
+        assert_eq!(offset_of!(CommandHeader, ctba), 8);
+        assert_eq!(offset_of!(CommandHeader, ctbau), 12);
+        // DW4 to DW7 are reserved, and they are what fills the header out to
+        // the 32-byte stride the command list is indexed with.
+        assert_eq!(offset_of!(CommandHeader, reserved), 16);
+        assert_eq!(offset_of!(CommandHeader, reserved) + 4 * 4, 32);
+    }
+
+    #[test]
+    fn the_prd_entry_is_the_sixteen_bytes_of_section_4_2_3() {
+        assert_eq!(size_of::<PrdEntry>(), 16);
+        assert_eq!(align_of::<PrdEntry>(), 4);
+        // The data base address, low half first, exactly as for the command
+        // table above.
+        assert_eq!(offset_of!(PrdEntry, dba), 0);
+        assert_eq!(offset_of!(PrdEntry, dbau), 4);
+        assert_eq!(offset_of!(PrdEntry, _rsvd), 8);
+        // And the byte count with the interrupt-on-completion bit, which is
+        // the one word the controller reads to know how far to go.
+        assert_eq!(offset_of!(PrdEntry, dbc_ioc), 12);
+        assert_eq!(offset_of!(PrdEntry, dbc_ioc) + 4, 16);
+    }
+
+    /// And the arithmetic the two sizes hold up, which is what would break
+    /// silently if either grew: a port's command list is 32 slots of header,
+    /// and its command table ends on a 1 KiB boundary with the PRDT filling
+    /// the rest.
+    #[test]
+    fn the_table_strides_are_the_two_sizes_times_their_counts() {
+        assert_eq!(size_of::<CommandHeader>() * 32, 1024);
+        assert_eq!(0x80 + PRDT_MAX * size_of::<PrdEntry>(), 1024);
+    }
+}

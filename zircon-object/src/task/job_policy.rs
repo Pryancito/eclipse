@@ -496,3 +496,51 @@ mod job_policy_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod basic_policy_layout_tests {
+    use super::*;
+    use core::mem::{align_of, offset_of, size_of};
+
+    /// `BasicPolicy` is read straight out of userspace: `sys_job_set_policy`
+    /// hands the caller's buffer to `UserInPtr::as_slice`, so these eight
+    /// bytes are whatever the process wrote. Swapping `condition` and
+    /// `action` compiles, leaves the size at eight, and makes every policy a
+    /// process sets mean the other thing, because `parse` reads both halves
+    /// through their field names.
+    ///
+    /// The size goes in this test rather than its own, because no mutation of
+    /// these two fields can falsify it on its own: widening either one stops
+    /// `from_raw(u32)` from compiling.
+    #[test]
+    fn zx_policy_basic_t_is_a_condition_word_then_an_action_word() {
+        assert_eq!(size_of::<BasicPolicy>(), 8);
+        assert_eq!(align_of::<BasicPolicy>(), 4);
+        assert_eq!(offset_of!(BasicPolicy, condition), 0);
+        assert_eq!(offset_of!(BasicPolicy, action), 4);
+    }
+
+    /// The eight bytes as userspace writes them: a little-endian condition in
+    /// the first word and the action in the second. Reading them back is what
+    /// notices the two words trading places, and `parse` is read afterwards
+    /// so the bytes and the meaning are pinned together.
+    #[test]
+    #[allow(unsafe_code)]
+    fn the_first_word_is_the_condition_and_the_second_is_the_action() {
+        let policy = BasicPolicy {
+            condition: PolicyCondition::BadHandle as u32,
+            action: PolicyAction::Kill as u32,
+        };
+        let bytes: [u8; 8] =
+            unsafe { core::ptr::read_unaligned(&policy as *const _ as *const [u8; 8]) };
+        assert_eq!(
+            &bytes[0..4],
+            &(PolicyCondition::BadHandle as u32).to_le_bytes()
+        );
+        assert_eq!(&bytes[4..8], &(PolicyAction::Kill as u32).to_le_bytes());
+        assert!(matches!(
+            policy.parse(),
+            Ok((PolicyCondition::BadHandle, PolicyAction::Kill))
+        ));
+    }
+}

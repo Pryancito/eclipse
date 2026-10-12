@@ -402,3 +402,28 @@ mod tests {
         assert_eq!(d.desc_type as u64, DescriptorType::Sum as u64);
     }
 }
+
+#[cfg(test)]
+mod header_layout_tests {
+    use super::*;
+    use core::mem::{align_of, offset_of, size_of};
+
+    /// The header of the descriptor VMO, which userspace maps and walks.
+    ///
+    /// `loader/src/zircon.rs` reads it back as `size_of::<DescriptorVmoHeader>()`
+    /// raw bytes, and the magic is how a reader decides the mapping is the one
+    /// it expects. The size was checked already; that keeps the twenty-four
+    /// bytes whatever order the fields are in, and swapping the magic with the
+    /// CPU count puts a plausible small integer where the reader looks for the
+    /// magic.
+    #[test]
+    fn the_descriptor_vmo_header_is_the_magic_then_the_cpus_then_the_table() {
+        assert_eq!(size_of::<DescriptorVmoHeader>(), 24);
+        assert_eq!(align_of::<DescriptorVmoHeader>(), 8);
+        assert_eq!(offset_of!(DescriptorVmoHeader, magic), 0);
+        assert_eq!(offset_of!(DescriptorVmoHeader, max_cpus), 8);
+        assert_eq!(offset_of!(DescriptorVmoHeader, descriptor_table_size), 16);
+        // The magic is the first word, which is what makes it checkable at all.
+        assert_eq!(DescriptorVmoHeader::default().magic, KCOUNTER_MAGIC);
+    }
+}

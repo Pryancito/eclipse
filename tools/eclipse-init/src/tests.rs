@@ -1444,17 +1444,44 @@ fn a_wait_that_is_never_satisfied_reports_a_timeout() {
 fn something_that_arrives_during_the_last_sleep_is_not_reported_missing() {
     // A service sent into its backoff over a socket that IS there is a
     // 10-second stall for nothing.
+    //
+    // The predicate is false for the whole budget and true from the instant it
+    // runs out, which is where the final look happens. It used to count polls
+    // instead ("more than four calls"), which assumed the 40 ms budget always
+    // fits four 10 ms sleeps: one overshooting sleep on a loaded CI runner left
+    // three, and the job failed with `4 llamadas`. Nothing about this wait
+    // promises a number of polls, so no test of it may depend on one.
+    let timeout = Duration::from_millis(40);
     let calls = std::cell::Cell::new(0);
+    let start = Instant::now();
     let outcome = wait_until(
-        Duration::from_millis(40),
+        timeout,
         || {
             calls.set(calls.get() + 1);
-            // false while the loop runs, true by the final look
-            calls.get() > 4
+            start.elapsed() >= timeout
         },
         || false,
     );
     assert_eq!(outcome, Wait::Ready, "{} llamadas", calls.get());
+}
+
+#[test]
+fn the_last_look_happens_even_when_the_budget_is_already_spent() {
+    // The one spelling of the test above that cannot depend on a clock at all:
+    // with no budget the loop body never runs, so the single call to `ready` IS
+    // the last look. Take the last look away and `calls` is zero and the answer
+    // is `TimedOut`, whatever the machine is doing.
+    let calls = std::cell::Cell::new(0);
+    let outcome = wait_until(
+        Duration::ZERO,
+        || {
+            calls.set(calls.get() + 1);
+            true
+        },
+        || false,
+    );
+    assert_eq!(outcome, Wait::Ready);
+    assert_eq!(calls.get(), 1, "el ultimo vistazo es la unica llamada");
 }
 
 #[test]

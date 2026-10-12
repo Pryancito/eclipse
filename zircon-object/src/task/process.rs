@@ -20,6 +20,20 @@ use crate::{
     ZxError, ZxResult,
 };
 
+/// The koid every init process is born with.
+///
+/// PID 1 is not a label: `getppid` answering 1 is how a daemon knows it was
+/// reparented after its parent died, `kill(1, ...)` is how a shutdown is
+/// asked for, and `/proc/1` is what every process manager reads first. The
+/// Linux personality's own loader names the same number when it starts init
+/// (`loader/src/linux.rs::run_init_if_present`), and the two have to agree:
+/// a process created here with another koid is an init that nothing can
+/// address and whose children's `getppid` answers a pid that does not exist.
+///
+/// It lived inside `create_init_with_vmar`'s body, where nothing could name
+/// it from a test.
+const INIT_PID: KoID = 1;
+
 /// A callback run once per process teardown, for per-pid resources owned by
 /// crates this one cannot depend on.
 pub type ProcessExitHook = fn(KoID);
@@ -451,7 +465,6 @@ impl Process {
         vmar: Arc<VmAddressRegion>,
         ext: impl Any + Send + Sync,
     ) -> ZxResult<Arc<Self>> {
-        const INIT_PID: KoID = 1;
         let proc = Arc::new(Process {
             base: KObjectBase::with_id(INIT_PID, name, Signal::default()),
             _counter: CountHelper::new(),
@@ -2556,5 +2569,122 @@ mod ext_and_lifecycle_tests {
         proc.dead_threads_sys_time_add(7);
         assert_eq!(proc.dead_threads_time(), 100);
         assert_eq!(proc.dead_threads_sys_time(), 7);
+    }
+}
+
+#[cfg(test)]
+mod process_info_layout_tests {
+    use super::*;
+    use core::mem::{align_of, offset_of, size_of};
+
+    /// `ProcessInfo` is what `object_get_info(ZX_INFO_PROCESS)` copies into
+    /// the caller's buffer, so its sixteen bytes and the order of the three
+    /// flags are the ABI. Nothing else in the crate pinned them: every read
+    /// and write goes through a field name, so swapping two adjacent `bool`s
+    /// compiles cleanly, leaves `size_of` at sixteen, and passes the whole
+    /// suite while a debugger reads "has it started" out of the byte that
+    /// says "has it exited".
+    ///
+    /// Worth spelling out here rather than deriving from today's header:
+    /// upstream Zircon later folded these three bools into a single `flags`
+    /// word, so the current `zx_info_process_t` no longer describes what this
+    /// kernel writes. The layout below is the earlier form, and keeping it is
+    /// ours alone.
+    ///
+    /// The reserved tail is five bytes, and the size alone cannot say so:
+    /// eleven bytes of fields plus anything from one to five bytes of tail all
+    /// round up to the same sixteen under an alignment of eight. Its exact
+    /// length is held by the byte test below, whose constructor spells
+    /// `[0; 5]`, so shrinking the tail stops compiling rather than failing an
+    /// assert. What the size catches is the element type: a tail of `u16`
+    /// pushes the whole struct to twenty-four.
+    #[test]
+    fn zx_info_process_t_is_two_words() {
+        assert_eq!(size_of::<ProcessInfo>(), 16);
+        assert_eq!(align_of::<ProcessInfo>(), 8);
+        assert_eq!(offset_of!(ProcessInfo, return_code), 0);
+
+        let info = ProcessInfo::default();
+        assert_eq!(info.padding1.len(), 5);
+        assert!(
+            info.padding1.iter().all(|&b| b == 0),
+            "the reserved tail is copied to userspace, so Default has to zero it",
+        );
+    }
+
+    #[test]
+    fn the_three_flags_are_started_then_exited_then_debugger_attached() {
+        assert_eq!(offset_of!(ProcessInfo, started), 8);
+        assert_eq!(offset_of!(ProcessInfo, has_exited), 9);
+        assert_eq!(offset_of!(ProcessInfo, debugger_attached), 10);
+        assert_eq!(offset_of!(ProcessInfo, padding1), 11);
+    }
+
+    /// The sixteen bytes read back as bytes, which is how a debugger actually
+    /// reads them: this notices two flags trading places even where their
+    /// offsets are not read one by one.
+    #[test]
+    #[allow(unsafe_code)]
+    fn the_sixteen_bytes_are_the_fields_that_wrote_them() {
+        let info = ProcessInfo {
+            return_code: -7,
+            started: true,
+            has_exited: false,
+            debugger_attached: true,
+            padding1: [0; 5],
+        };
+        let bytes: [u8; 16] =
+            unsafe { core::ptr::read_unaligned(&info as *const _ as *const [u8; 16]) };
+        assert_eq!(&bytes[0..8], &(-7i64).to_le_bytes());
+        assert_eq!(&bytes[8..11], &[1, 0, 1]);
+        assert_eq!(&bytes[11..16], &[0; 5]);
+    }
+}
+
+#[cfg(test)]
+mod init_pid_tests {
+    use super::*;
+    use crate::object::KernelObject;
+    use crate::signal::Event;
+
+    /// The init process is born as PID 1, and nothing else is.
+    ///
+    /// PID 1 is not a label. `getppid` answering 1 is how a daemon learns it
+    /// was reparented after its parent died, `kill(1, ...)` is how a shutdown
+    /// is asked for, and `/proc/1` is what a process manager reads first. The
+    /// number lived inside `create_init_with_vmar`'s body, where no test
+    /// could name it, and the Linux personality's loader writes the same
+    /// number again on its own side.
+    #[test]
+    fn the_init_process_is_born_as_pid_one() {
+        assert_eq!(INIT_PID, 1);
+        let root_job = Job::root();
+        let init = Process::create_init_with_ext(&root_job, "init", ())
+            .expect("failed to create the init process");
+        assert_eq!(
+            init.id(),
+            INIT_PID,
+            "this is the koid getppid, kill(1, ..) and /proc/1 name"
+        );
+        assert_eq!(init.id(), 1);
+    }
+
+    /// No ordinary object is ever handed the init koid.
+    ///
+    /// `create_init_*` is the only path that forces a koid; everything else
+    /// takes the next one from the global counter, which starts above it. A
+    /// constructor that stopped forcing it would hand init whatever number
+    /// happened to be next.
+    ///
+    /// Asked of an `Event` rather than of a second process on purpose: a
+    /// `Process` holds a root VMAR, which with `aspace-separate` takes one of
+    /// only 127 hosted address-space windows, and this suite already runs at
+    /// the edge of that limit at 16 threads. The invariant is about the
+    /// counter, not about processes, so it can be asked for free.
+    #[test]
+    fn no_ordinary_object_is_handed_the_init_koid() {
+        let obj = Event::new();
+        assert_ne!(obj.id(), INIT_PID);
+        assert!(obj.id() > INIT_PID, "the counter starts above PID 1");
     }
 }

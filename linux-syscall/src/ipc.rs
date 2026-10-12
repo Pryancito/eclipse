@@ -2621,3 +2621,123 @@ mod command_number_tests {
         }
     }
 }
+#[cfg(test)]
+mod sembuf_layout_tests {
+    //! `struct sembuf` as `semop(2)` reads it from userspace.
+    //!
+    //! `semop` takes an array of these straight from the caller, so the
+    //! offsets are what decides which short is the semaphore number, which
+    //! is the operation and which is the flags. Swapping `op` and `flags`
+    //! compiles clean and turns every `SEM_UNDO` into an operation of
+    //! +0x1000 on the semaphore. Nothing pinned it.
+    //!
+    //! Against `include/uapi/linux/sem.h`.
+
+    use super::*;
+    use core::mem::{align_of, offset_of, size_of};
+
+    #[test]
+    fn sembuf_is_the_three_shorts_of_the_sysv_struct_sembuf() {
+        assert_eq!(size_of::<SemBuf>(), 6);
+        assert_eq!(align_of::<SemBuf>(), 2);
+        assert_eq!(offset_of!(SemBuf, num), 0);
+        assert_eq!(offset_of!(SemBuf, op), 2);
+        assert_eq!(offset_of!(SemBuf, flags), 4);
+        assert_eq!(offset_of!(SemBuf, flags) + 2, 6);
+    }
+}
+
+/// The four `*_INFO` answers, field by field.
+///
+/// `IPC_INFO`, `SEM_INFO`, `MSG_INFO` and `SHM_INFO` copy these straight into
+/// a buffer the caller sized from its own headers, so the order of the fields
+/// is the ABI. Every one of them already had its *size* checked -- `ShmInfo`
+/// even has a `const_assert_eq!` in production -- and that is not the same
+/// thing: swapping two neighbours of the same width keeps the size and the
+/// alignment untouched by construction. Twenty-three such swaps left all four
+/// sizes exactly as they were, and not one of them was caught.
+///
+/// What that gets wrong is quiet. `ipcs -u` would report the resident pages as
+/// the swapped ones, or the maximum number of semaphores per set as the
+/// system-wide maximum: numbers that stay plausible and that nobody can tell
+/// are wrong by looking at them.
+#[cfg(test)]
+mod info_layout_tests {
+    use super::*;
+    use core::mem::{align_of, offset_of, size_of};
+
+    /// `struct seminfo`, `include/uapi/linux/sem.h`: ten `int` in this order,
+    /// which `semctl_info` fills.
+    #[test]
+    fn struct_seminfo_is_ten_ints_in_the_headers_order() {
+        assert_eq!(size_of::<SemInfo>(), 40);
+        assert_eq!(align_of::<SemInfo>(), 4);
+        assert_eq!(offset_of!(SemInfo, semmap), 0);
+        assert_eq!(offset_of!(SemInfo, semmni), 4);
+        assert_eq!(offset_of!(SemInfo, semmns), 8);
+        assert_eq!(offset_of!(SemInfo, semmnu), 12);
+        assert_eq!(offset_of!(SemInfo, semmsl), 16);
+        assert_eq!(offset_of!(SemInfo, semopm), 20);
+        assert_eq!(offset_of!(SemInfo, semume), 24);
+        assert_eq!(offset_of!(SemInfo, semusz), 28);
+        assert_eq!(offset_of!(SemInfo, semvmx), 32);
+        assert_eq!(offset_of!(SemInfo, semaem), 36);
+    }
+
+    /// `struct msginfo`, `include/uapi/linux/msg.h`: seven `int` and then an
+    /// `unsigned short`, which is why the record is thirty bytes of fields in
+    /// thirty-two bytes of struct.
+    #[test]
+    fn struct_msginfo_is_seven_ints_and_then_a_short() {
+        assert_eq!(size_of::<MsgInfo>(), 32);
+        assert_eq!(align_of::<MsgInfo>(), 4);
+        assert_eq!(offset_of!(MsgInfo, msgpool), 0);
+        assert_eq!(offset_of!(MsgInfo, msgmap), 4);
+        assert_eq!(offset_of!(MsgInfo, msgmax), 8);
+        assert_eq!(offset_of!(MsgInfo, msgmnb), 12);
+        assert_eq!(offset_of!(MsgInfo, msgmni), 16);
+        assert_eq!(offset_of!(MsgInfo, msgssz), 20);
+        assert_eq!(offset_of!(MsgInfo, msgtot), 24);
+        assert_eq!(offset_of!(MsgInfo, msgseg), 28);
+        // Two bytes of the thirty-two are the tail padding after the short.
+        assert_eq!(offset_of!(MsgInfo, msgseg) + 2, 30);
+    }
+
+    /// `struct shm_info`, `include/uapi/linux/shm.h`: an `int` and then five
+    /// `__kernel_ulong_t`. The four bytes after `used_ids` are padding C puts
+    /// in exactly where Rust does, which is the only reason forty-eight bytes
+    /// is the right answer for six fields.
+    #[test]
+    fn struct_shm_info_is_an_int_then_five_words_past_its_padding() {
+        assert_eq!(size_of::<ShmInfo>(), 48);
+        assert_eq!(align_of::<ShmInfo>(), 8);
+        assert_eq!(offset_of!(ShmInfo, used_ids), 0);
+        assert_eq!(offset_of!(ShmInfo, shm_tot), 8);
+        assert_eq!(offset_of!(ShmInfo, shm_rss), 16);
+        assert_eq!(offset_of!(ShmInfo, shm_swp), 24);
+        assert_eq!(offset_of!(ShmInfo, swap_attempts), 32);
+        assert_eq!(offset_of!(ShmInfo, swap_successes), 40);
+    }
+
+    /// `struct shminfo64`, `include/uapi/linux/shm.h`: five
+    /// `__kernel_ulong_t` and then four more the header spells out one by one
+    /// as `__unused1..4`, which this struct keeps as one array of the same
+    /// width and count.
+    #[test]
+    fn struct_shminfo64_is_five_words_and_four_unused_ones() {
+        assert_eq!(size_of::<ShmInfo64>(), 72);
+        assert_eq!(align_of::<ShmInfo64>(), 8);
+        assert_eq!(offset_of!(ShmInfo64, shmmax), 0);
+        assert_eq!(offset_of!(ShmInfo64, shmmin), 8);
+        assert_eq!(offset_of!(ShmInfo64, shmmni), 16);
+        assert_eq!(offset_of!(ShmInfo64, shmseg), 24);
+        assert_eq!(offset_of!(ShmInfo64, shmall), 32);
+        assert_eq!(offset_of!(ShmInfo64, unused), 40);
+        assert_eq!(size_of::<[usize; 4]>(), 32);
+        assert_eq!(
+            size_of::<ShmInfo64>() - offset_of!(ShmInfo64, unused),
+            32,
+            "the four unused words are the whole tail"
+        );
+    }
+}

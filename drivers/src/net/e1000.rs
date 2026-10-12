@@ -1254,3 +1254,69 @@ mod ring_tests {
         assert!(tx_frame_postable(TX_SCRATCH_LEN + 1));
     }
 }
+
+#[cfg(test)]
+mod e1000_desc_layout_tests {
+    use super::*;
+    use core::mem::{align_of, offset_of, size_of};
+
+    /// Both descriptor rings are read and written by the card itself over
+    /// DMA, so these sixteen bytes are the hardware ABI and not ours to
+    /// choose. Intel's own layout, as Linux spells it in
+    /// `drivers/net/ethernet/intel/e1000/e1000_hw.h`, is
+    ///
+    /// ```text
+    /// struct e1000_tx_desc {           struct e1000_rx_desc {
+    ///     __le64 buffer_addr;              __le64 buffer_addr;
+    ///     union { __le32 data;             __le16 length;
+    ///         struct {                     __le16 csum;
+    ///             __le16 length;           u8 status;
+    ///             u8 cso;                  u8 errors;
+    ///             u8 cmd;                  __le16 special;
+    ///         } flags;                 };
+    ///     } lower;
+    ///     union { __le32 data;
+    ///         struct {
+    ///             u8 status;
+    ///             u8 css;
+    ///             __le16 special;
+    ///         } fields;
+    ///     } upper;
+    /// };
+    /// ```
+    ///
+    /// Nothing pinned it, and no behaviour test can: every read and write
+    /// here goes through a field name, so swapping two adjacent single-byte
+    /// fields compiles, leaves the size at sixteen, and passes the whole
+    /// suite while the card reads the checksum offset as the descriptor
+    /// command. Five of five such swaps survived the crate's 1513 tests.
+    #[test]
+    fn a_transmit_descriptor_is_the_sixteen_bytes_the_card_reads() {
+        assert_eq!(size_of::<E1000SendDesc>(), 16);
+        assert_eq!(align_of::<E1000SendDesc>(), 8);
+        assert_eq!(offset_of!(E1000SendDesc, addr), 0);
+        assert_eq!(offset_of!(E1000SendDesc, len), 8);
+        assert_eq!(offset_of!(E1000SendDesc, cso), 10);
+        assert_eq!(offset_of!(E1000SendDesc, cmd), 11);
+        assert_eq!(offset_of!(E1000SendDesc, status), 12);
+        assert_eq!(offset_of!(E1000SendDesc, css), 13);
+        assert_eq!(offset_of!(E1000SendDesc, special), 14);
+    }
+
+    /// `length` at offset eight is what the driver trusts to know how much of
+    /// the buffer the card filled, and `status` at twelve carries the
+    /// descriptor-done bit it polls. The checksum sits between them and the
+    /// error bits right after, both adjacent to their neighbour and the same
+    /// width as it.
+    #[test]
+    fn a_receive_descriptor_is_the_sixteen_bytes_the_card_writes() {
+        assert_eq!(size_of::<E1000RecvDesc>(), 16);
+        assert_eq!(align_of::<E1000RecvDesc>(), 8);
+        assert_eq!(offset_of!(E1000RecvDesc, addr), 0);
+        assert_eq!(offset_of!(E1000RecvDesc, len), 8);
+        assert_eq!(offset_of!(E1000RecvDesc, chksum), 10);
+        assert_eq!(offset_of!(E1000RecvDesc, status), 12);
+        assert_eq!(offset_of!(E1000RecvDesc, errors), 13);
+        assert_eq!(offset_of!(E1000RecvDesc, special), 14);
+    }
+}

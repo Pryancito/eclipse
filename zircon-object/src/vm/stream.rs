@@ -437,3 +437,32 @@ mod tests {
         assert_eq!(stream.get_info().seek, 3);
     }
 }
+
+/// The wire layout of [`StreamInfo`], Zircon's `zx_info_stream_t`, which
+/// `zx_object_get_info(ZX_INFO_STREAM)` copies out.
+///
+/// `options` is a `u32`, and the pad behind it is what pushes `seek` onto a
+/// word boundary -- so widening that pad, or swapping it with `options`, moves
+/// both 64-bit fields, and both survived this crate's whole suite. Zircon
+/// spells the pad `uint8_t padding1[4]`, which on little-endian is the same
+/// four bytes as a zero `u32`. Field order per
+/// `zircon/system/public/zircon/syscalls/object.h`.
+#[cfg(test)]
+mod stream_info_layout_tests {
+    use super::StreamInfo;
+    use core::mem::{align_of, offset_of, size_of};
+
+    #[test]
+    fn zx_info_stream_t_is_three_words() {
+        assert_eq!(size_of::<StreamInfo>(), 24);
+        assert_eq!(align_of::<StreamInfo>(), 8);
+    }
+
+    #[test]
+    fn the_options_word_and_its_pad_come_before_the_two_offsets() {
+        assert_eq!(offset_of!(StreamInfo, options), 0);
+        assert_eq!(offset_of!(StreamInfo, padding1), 4);
+        assert_eq!(offset_of!(StreamInfo, seek), 8);
+        assert_eq!(offset_of!(StreamInfo, content_size), 16);
+    }
+}

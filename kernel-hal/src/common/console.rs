@@ -1577,3 +1577,33 @@ mod panic_path_tests {
         }
     }
 }
+#[cfg(test)]
+mod win_size_layout_tests {
+    //! `struct winsize` as `TIOCGWINSZ` hands it to userspace.
+    //!
+    //! Every full-screen program -- nano, less, top, the shell's own line
+    //! editor -- lays itself out from these four numbers, and the order is
+    //! the ABI. Swapping `ws_row` and `ws_col` gives a terminal that reports
+    //! its rows as its columns, and an app then overflows its own window:
+    //! the same symptom the serial size override cures, from a different
+    //! cause. Nothing pinned any of it, and measured over the crate's whole
+    //! suite all three swaps survived.
+    //!
+    //! Against `include/uapi/asm-generic/termios.h`.
+
+    use super::*;
+    use core::mem::{align_of, offset_of, size_of};
+
+    #[test]
+    fn the_win_size_is_the_four_unsigned_shorts_of_posix_winsize() {
+        assert_eq!(size_of::<ConsoleWinSize>(), 8);
+        assert_eq!(align_of::<ConsoleWinSize>(), 2);
+        assert_eq!(offset_of!(ConsoleWinSize, ws_row), 0);
+        assert_eq!(offset_of!(ConsoleWinSize, ws_col), 2);
+        assert_eq!(offset_of!(ConsoleWinSize, ws_xpixel), 4);
+        assert_eq!(offset_of!(ConsoleWinSize, ws_ypixel), 6);
+        // Which accounts for all eight bytes: the last field is two wide and
+        // ends exactly at the end of the struct.
+        assert_eq!(offset_of!(ConsoleWinSize, ws_ypixel) + 2, 8);
+    }
+}

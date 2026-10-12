@@ -406,3 +406,68 @@ mod tests {
         assert_eq!(blk.header.fake_interrupt_ack(), 1);
     }
 }
+
+#[cfg(test)]
+mod blk_config_layout_tests {
+    use super::*;
+    use core::mem::{align_of, offset_of, size_of};
+
+    /// `BlkConfig` is the virtio-blk configuration space: the device writes
+    /// it and the driver reads it, so every offset here is the ABI. Linux
+    /// spells the same fields in the same order in
+    /// `include/uapi/linux/virtio_blk.h`, with the three geometry fields
+    /// wrapped in a struct of their own:
+    ///
+    /// ```text
+    /// __virtio64 capacity;
+    /// __virtio32 size_max;
+    /// __virtio32 seg_max;
+    /// struct virtio_blk_geometry {
+    ///         __virtio16 cylinders;
+    ///         __u8 heads;
+    ///         __u8 sectors;
+    /// } geometry;
+    /// __virtio32 blk_size;
+    /// __u8 physical_block_exp;
+    /// __u8 alignment_offset;
+    /// __virtio16 min_io_size;
+    /// __virtio32 opt_io_size;
+    /// ```
+    ///
+    /// Flattening that geometry struct, as here, keeps the same bytes: it is
+    /// two-byte aligned and sits on a two-byte boundary either way.
+    ///
+    /// The suite cannot pin any of this, because its tests drive the request
+    /// path and never the configuration space: `size_max` against `seg_max`
+    /// is the largest segment read as how many of them, `heads` against
+    /// `sectors` is the geometry upside down, and `physical_block_exp`
+    /// against `alignment_offset` is the physical block size read as the
+    /// offset into it. The three swaps survived.
+    ///
+    /// The size goes in this test rather than its own, because no swap of two
+    /// same-width neighbours can falsify it.
+    #[test]
+    fn the_capacity_comes_first_then_the_two_limits() {
+        assert_eq!(size_of::<BlkConfig>(), 32);
+        assert_eq!(align_of::<BlkConfig>(), 8);
+        assert_eq!(offset_of!(BlkConfig, capacity), 0);
+        assert_eq!(offset_of!(BlkConfig, size_max), 8);
+        assert_eq!(offset_of!(BlkConfig, seg_max), 12);
+    }
+
+    #[test]
+    fn the_geometry_is_cylinders_then_heads_then_sectors() {
+        assert_eq!(offset_of!(BlkConfig, cylinders), 16);
+        assert_eq!(offset_of!(BlkConfig, heads), 18);
+        assert_eq!(offset_of!(BlkConfig, sectors), 19);
+        assert_eq!(offset_of!(BlkConfig, blk_size), 20);
+    }
+
+    #[test]
+    fn the_block_size_hints_come_after_the_geometry() {
+        assert_eq!(offset_of!(BlkConfig, physical_block_exp), 24);
+        assert_eq!(offset_of!(BlkConfig, alignment_offset), 25);
+        assert_eq!(offset_of!(BlkConfig, min_io_size), 26);
+        assert_eq!(offset_of!(BlkConfig, opt_io_size), 28);
+    }
+}

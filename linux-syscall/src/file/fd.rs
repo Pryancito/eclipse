@@ -2504,3 +2504,40 @@ mod benches {
         b.iter(|| black_box(flock_translate(black_box(1))));
     }
 }
+#[cfg(test)]
+mod itimerspec_layout_tests {
+    //! `struct itimerspec` as `timerfd_settime(2)` reads it and
+    //! `timerfd_gettime(2)` writes it back.
+    //!
+    //! The interval comes first and the value second, which is the opposite
+    //! of the order the names suggest, and the two are the same type -- so a
+    //! swap compiles clean and turns a one-shot timer into a repeating one,
+    //! and back. Nothing pinned it, here or on the `TimeSpec` it is made of:
+    //! `linux_object::time::TimeSpec` is a different struct from the
+    //! `TimeSpec` of `stat.rs`, and it is the one of the two that had no
+    //! layout test.
+    //!
+    //! Against `include/uapi/linux/time.h`. The numbers are the 64-bit ones,
+    //! which is every arch this kernel builds for.
+
+    use super::*;
+    use core::mem::{align_of, offset_of, size_of};
+
+    #[test]
+    fn itimerspec_is_the_interval_and_then_the_value() {
+        assert_eq!(size_of::<ITimerSpec>(), 32);
+        assert_eq!(align_of::<ITimerSpec>(), 8);
+        assert_eq!(offset_of!(ITimerSpec, it_interval), 0);
+        assert_eq!(offset_of!(ITimerSpec, it_value), 16);
+        assert_eq!(offset_of!(ITimerSpec, it_value) + 16, 32);
+    }
+
+    /// And the `struct timespec` it carries twice: two words, seconds first.
+    #[test]
+    fn the_timespec_of_an_itimerspec_is_two_words_seconds_first() {
+        assert_eq!(size_of::<TimeSpec>(), 16);
+        assert_eq!(align_of::<TimeSpec>(), 8);
+        assert_eq!(offset_of!(TimeSpec, sec), 0);
+        assert_eq!(offset_of!(TimeSpec, nsec), 8);
+    }
+}

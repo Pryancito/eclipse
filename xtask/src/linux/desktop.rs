@@ -1832,6 +1832,38 @@ fn write_freedoom_wrapper(rootfs: &Path) {
     }
 }
 
+/// The Freedoom release this image ships.
+///
+/// It is written three times -- here and twice inside [`FREEDOOM_URL`] -- and
+/// it also names the directory INSIDE the zip, which is where a drift bites:
+/// the unpack asks for `freedoom-<version>/<wad>`, so a version that is not
+/// the zip's own prefix makes `unzip` exit non-zero, the python fallback raise
+/// `KeyError`, and the build print "neither unzip nor python3 could unpack" --
+/// blaming the host's tooling for a one-line mismatch.
+const FREEDOOM_VERSION: &str = "0.13.0";
+
+/// Where the zip comes from. Must name [`FREEDOOM_VERSION`] in both places.
+const FREEDOOM_URL: &str =
+    "https://github.com/freedoom/freedoom/releases/download/v0.13.0/freedoom-0.13.0.zip";
+
+/// From `community/freedoom/APKBUILD` in aports 3.24-stable, for this same
+/// release zip -- an independent pin, not one taken from the download.
+///
+/// Lowercase hex, 128 digits, because that is what `sha512_of` hands back and
+/// the comparison is an equality: a SHA-256 or an uppercase pin matches
+/// nothing, and the zip is then discarded with a warning rather than unpacked.
+const FREEDOOM_SHA512: &str = "ff71b279900751cb606286ab36d0990febdeb78fee2a9c6adf31491e977e8e045a0d5f30ff6b729d4962c98a30f3138d74f03d25c3569dd3b3e29167601014b9";
+
+/// The two IWADs, which are both the archive member names and the file names
+/// they land under, so they have to be two different plain names.
+const FREEDOOM_WADS: [&str; 2] = ["freedoom1.wad", "freedoom2.wad"];
+
+/// Best-effort in turn, cheapest first: wads already in the rootfs win (from
+/// the apk package, or dropped there by hand), then the cached zip, then the
+/// download. The zip is checked against the SHA-512 that Alpine's own APKBUILD
+/// pins for the very same file, and a mismatch is discarded rather than
+/// unpacked. No network, no unzip and a bad hash each warn and leave the image
+/// exactly as it was. `ECLIPSE_FREEDOOM_FETCH=0` skips all of it.
 /// The Freedoom IWADs, fetched straight from the upstream release when the
 /// Alpine package did not make it into the image.
 ///
@@ -1846,22 +1878,7 @@ fn write_freedoom_wrapper(rootfs: &Path) {
 /// are BSD-licensed and redistributable, and upstream publishes both in one
 /// zip at a stable URL, so fetch them directly rather than ship a launcher
 /// that cannot launch.
-///
-/// Best-effort in turn, cheapest first: wads already in the rootfs win (from
-/// the apk package, or dropped there by hand), then the cached zip, then the
-/// download. The zip is checked against the SHA-512 that Alpine's own APKBUILD
-/// pins for the very same file, and a mismatch is discarded rather than
-/// unpacked. No network, no unzip and a bad hash each warn and leave the image
-/// exactly as it was. `ECLIPSE_FREEDOOM_FETCH=0` skips all of it.
 pub fn ensure_freedoom_iwads(rootfs: &Path) {
-    const VERSION: &str = "0.13.0";
-    const URL: &str =
-        "https://github.com/freedoom/freedoom/releases/download/v0.13.0/freedoom-0.13.0.zip";
-    /// From `community/freedoom/APKBUILD` in aports 3.24-stable, for this same
-    /// release zip -- an independent pin, not one taken from the download.
-    const SHA512: &str = "ff71b279900751cb606286ab36d0990febdeb78fee2a9c6adf31491e977e8e045a0d5f30ff6b729d4962c98a30f3138d74f03d25c3569dd3b3e29167601014b9";
-    const WADS: [&str; 2] = ["freedoom1.wad", "freedoom2.wad"];
-
     if matches!(
         std::env::var("ECLIPSE_FREEDOOM_FETCH")
             .unwrap_or_default()
@@ -1888,7 +1905,7 @@ pub fn ensure_freedoom_iwads(rootfs: &Path) {
             .map(|d| rootfs.join(d).join(wad))
             .find(|p| p.is_file())
     };
-    if let (Some(one), Some(two)) = (found(WADS[0]), found(WADS[1])) {
+    if let (Some(one), Some(two)) = (found(FREEDOOM_WADS[0]), found(FREEDOOM_WADS[1])) {
         println!(
             "Freedoom: IWADs already in the rootfs ({}, {})",
             one.display(),
@@ -1899,18 +1916,18 @@ pub fn ensure_freedoom_iwads(rootfs: &Path) {
 
     let cache = crate::PROJECT_DIR.join("ignored").join("freedoom");
     let _ = fs::create_dir_all(&cache);
-    let zip = cache.join(format!("freedoom-{VERSION}.zip"));
+    let zip = cache.join(format!("freedoom-{FREEDOOM_VERSION}.zip"));
 
-    if zip.is_file() && sha512_of(&zip).as_deref() != Some(SHA512) {
+    if zip.is_file() && sha512_of(&zip).as_deref() != Some(FREEDOOM_SHA512) {
         eprintln!("warning: Freedoom: cached zip does not match its hash; refetching");
         let _ = fs::remove_file(&zip);
     }
     if !zip.is_file() {
         // `-O` to a temporary name so an interrupted transfer never leaves a
         // truncated file that looks cached.
-        let part = cache.join(format!("freedoom-{VERSION}.zip.part"));
+        let part = cache.join(format!("freedoom-{FREEDOOM_VERSION}.zip.part"));
         let _ = fs::remove_file(&part);
-        println!("Freedoom: fetching the IWADs from {URL}");
+        println!("Freedoom: fetching the IWADs from {FREEDOOM_URL}");
         // wget first, curl second: plenty of build hosts ship only one of the
         // two, and `Command::status()` on a missing binary is an Err, not a
         // failing exit code -- so a host without wget silently took the "could
@@ -1932,7 +1949,7 @@ pub fn ensure_freedoom_iwads(rootfs: &Path) {
             std::process::Command::new(tool)
                 .args(&args)
                 .arg(&part)
-                .arg(URL)
+                .arg(FREEDOOM_URL)
                 .status()
                 .map(|s| s.success())
                 .unwrap_or(false)
@@ -1940,7 +1957,7 @@ pub fn ensure_freedoom_iwads(rootfs: &Path) {
         if !ok || fs::rename(&part, &zip).is_err() {
             let _ = fs::remove_file(&part);
             eprintln!(
-                "warning: Freedoom: neither wget nor curl could download {URL} -- \
+                "warning: Freedoom: neither wget nor curl could download {FREEDOOM_URL} -- \
                  shipping without the IWADs. The launcher will say so; drop a .wad \
                  into /usr/share/games/doom (in the rootfs or on the running \
                  system) to fix it."
@@ -1949,10 +1966,10 @@ pub fn ensure_freedoom_iwads(rootfs: &Path) {
         }
     }
     match sha512_of(&zip).as_deref() {
-        Some(SHA512) => {}
+        Some(FREEDOOM_SHA512) => {}
         Some(other) => {
             eprintln!(
-                "warning: Freedoom: {} has sha512 {other}, expected {SHA512} -- \
+                "warning: Freedoom: {} has sha512 {other}, expected {FREEDOOM_SHA512} -- \
                  discarding it rather than unpacking it",
                 zip.display()
             );
@@ -1979,7 +1996,11 @@ pub fn ensure_freedoom_iwads(rootfs: &Path) {
         .arg("-o")
         .arg("-j")
         .arg(&zip)
-        .args(WADS.iter().map(|w| format!("freedoom-{VERSION}/{w}")))
+        .args(
+            FREEDOOM_WADS
+                .iter()
+                .map(|w| format!("freedoom-{FREEDOOM_VERSION}/{w}")),
+        )
         .arg("-d")
         .arg(&dest)
         .status()
@@ -1992,7 +2013,7 @@ pub fn ensure_freedoom_iwads(rootfs: &Path) {
             "import sys, zipfile\n\
              z = zipfile.ZipFile(sys.argv[1])\n\
              for w in sys.argv[3:]:\n\
-             \x20   data = z.read('freedoom-{VERSION}/' + w)\n\
+             \x20   data = z.read('freedoom-{FREEDOOM_VERSION}/' + w)\n\
              \x20   open(sys.argv[2] + '/' + w, 'wb').write(data)\n"
         );
         let ok = std::process::Command::new("python3")
@@ -2000,7 +2021,7 @@ pub fn ensure_freedoom_iwads(rootfs: &Path) {
             .arg(&script)
             .arg(&zip)
             .arg(&dest)
-            .args(WADS)
+            .args(FREEDOOM_WADS)
             .status()
             .map(|s| s.success())
             .unwrap_or(false);
@@ -2013,7 +2034,7 @@ pub fn ensure_freedoom_iwads(rootfs: &Path) {
             return;
         }
     }
-    let sizes: Vec<String> = WADS
+    let sizes: Vec<String> = FREEDOOM_WADS
         .iter()
         .map(|w| {
             let p = dest.join(w);
@@ -5506,5 +5527,99 @@ mod wallpaper {
             assert_eq!(&png[12..16], b"IHDR");
             assert_eq!(&png[png.len() - 8..png.len() - 4], b"IEND");
         }
+    }
+}
+
+#[cfg(test)]
+mod freedoom_pin_tests {
+    //! The four constants that pin the Freedoom download. Nothing reached
+    //! them before: `ensure_freedoom_iwads` needs a rootfs, a network and
+    //! `unzip`, and every way it can fail is a `warning:` and an early
+    //! return, so a mutant in any of the four survived the whole suite.
+
+    use super::*;
+
+    /// The version is written three times: once here and twice inside the
+    /// URL. The third copy is the one that bites, because it also names the
+    /// directory INSIDE the zip: the unpack asks `unzip` for
+    /// `freedoom-<version>/freedoom1.wad`, so a version that is not the zip's
+    /// own prefix makes unzip exit non-zero, the python fallback raise
+    /// `KeyError`, and the build print "neither unzip nor python3 could
+    /// unpack" -- which blames the host's tooling for a one-line mismatch and
+    /// ships an image with no game data.
+    #[test]
+    fn the_url_names_the_version_the_pin_says() {
+        assert!(
+            FREEDOOM_URL.contains(&format!("/v{FREEDOOM_VERSION}/")),
+            "{FREEDOOM_URL} is not the tag {FREEDOOM_VERSION} names"
+        );
+        assert!(
+            FREEDOOM_URL.ends_with(&format!("/freedoom-{FREEDOOM_VERSION}.zip")),
+            "{FREEDOOM_URL} is not the asset {FREEDOOM_VERSION} names"
+        );
+        assert_eq!(
+            FREEDOOM_URL.matches(FREEDOOM_VERSION).count(),
+            2,
+            "the tag and the asset name are the two copies in the URL"
+        );
+    }
+
+    /// The member path the unpack asks for, built exactly as the two unpack
+    /// paths build it. Spelled out here so a reader can see what the version
+    /// is for, and so a change to either copy has to agree with the other.
+    #[test]
+    fn the_member_asked_for_is_the_zips_own_prefix() {
+        for wad in FREEDOOM_WADS {
+            let member = format!("freedoom-{FREEDOOM_VERSION}/{wad}");
+            assert!(
+                member.starts_with("freedoom-"),
+                "{member} is not a Freedoom release prefix"
+            );
+            let (prefix, name) = member.split_once('/').expect("one separator");
+            assert_eq!(prefix, format!("freedoom-{FREEDOOM_VERSION}"));
+            assert_eq!(name, wad, "the member name is the file name");
+        }
+    }
+
+    /// Two IWADs, and they are both the archive member name and the file name
+    /// they land under. The same name twice unpacks one game over itself and
+    /// the second never arrives: the install line then prints the same file
+    /// twice and the launcher offers one episode.
+    #[test]
+    fn the_two_iwads_are_two_different_plain_names() {
+        let [one, two] = FREEDOOM_WADS;
+        assert_ne!(one, two, "the second game would never be unpacked");
+        for wad in FREEDOOM_WADS {
+            assert!(wad.ends_with(".wad"), "{wad} is not an IWAD");
+            assert!(!wad.contains('/'), "{wad} is a path, not a member name");
+            assert_eq!(wad, wad.to_ascii_lowercase(), "{wad} is not lowercase");
+        }
+    }
+
+    /// `sha512_of` hands back lowercase hex and the comparison is an
+    /// equality, so the pin has to be written the same way: a SHA-256 (half
+    /// the digits) or an uppercase pin matches nothing, and the zip is then
+    /// discarded with a warning rather than unpacked -- the build keeps
+    /// going and the image ships empty.
+    #[test]
+    fn the_pin_is_a_sha512_as_the_host_tools_print_it() {
+        assert_eq!(FREEDOOM_SHA512.len(), 128, "a SHA-512 is 64 bytes of hex");
+        assert!(
+            FREEDOOM_SHA512
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+            "the pin is not lowercase hex"
+        );
+    }
+
+    /// The download is unauthenticated apart from the hash, so the transport
+    /// has to be the one that cannot be downgraded silently, and the asset
+    /// has to come from the project's own releases.
+    #[test]
+    fn the_zip_comes_from_the_projects_own_releases_over_https() {
+        assert!(
+            FREEDOOM_URL.starts_with("https://github.com/freedoom/freedoom/releases/"),
+            "{FREEDOOM_URL} is not a Freedoom release asset"
+        );
     }
 }

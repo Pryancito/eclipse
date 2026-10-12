@@ -120,15 +120,7 @@ impl Syscall<'_> {
             "mknodat: dirfd={:?}, path={:?}, mode={:#o}, dev={:#x}",
             dirfd, path, mode, dev
         );
-        const S_IFMT: usize = 0o170000;
-        let file_type = match mode & S_IFMT {
-            0o010000 => FileType::NamedPipe,   // S_IFIFO
-            0o020000 => FileType::CharDevice,  // S_IFCHR
-            0o060000 => FileType::BlockDevice, // S_IFBLK
-            0o140000 => FileType::Socket,      // S_IFSOCK
-            0o100000 | 0 => FileType::File,    // S_IFREG / unspecified => regular file
-            _ => return Err(LxError::EINVAL),  // directories must use mkdir
-        };
+        let file_type = mknod_file_type(mode)?;
         let (dir_path, last) = last_component(path)?;
         let file_name = last.to_create(has_trailing_slash(path))?;
         let proc = self.linux_process();
@@ -1072,6 +1064,33 @@ pub(crate) const UTIMENSAT_FLAGS: usize =
 /// `mkdir(2)` may be asked for fewer: see [`mkdir_perm`].
 pub(crate) fn create_perm(mode: usize) -> u16 {
     (mode & 0o7777) as u16
+}
+
+/// The kind of node a `mknodat` mode names.
+///
+/// `S_IFMT` and the six type codes are `<sys/stat.h>`, and they used to live
+/// inside `sys_mknodat`, where **no test could reach them**: the method needs
+/// a live process, and a constant declared in a method body has no name
+/// outside it. What they decide is which kind of node ends up on the disk for
+/// the major and minor the caller named, so a mask one bit short is not a
+/// refusal but a character device where a block device was asked for.
+///
+/// A mode with no type bits at all is a regular file: that is what POSIX says
+/// `mknod` does, and what `mknod path 0` from a shell relies on.
+///
+/// Directories are the one type `mknod` refuses. They go through `mkdir`,
+/// which is the only path that links `.` and `..`, so a directory made here
+/// would be unreachable from inside itself.
+pub(crate) fn mknod_file_type(mode: usize) -> LxResult<FileType> {
+    const S_IFMT: usize = 0o170000;
+    Ok(match mode & S_IFMT {
+        0o010000 => FileType::NamedPipe,   // S_IFIFO
+        0o020000 => FileType::CharDevice,  // S_IFCHR
+        0o060000 => FileType::BlockDevice, // S_IFBLK
+        0o140000 => FileType::Socket,      // S_IFSOCK
+        0o100000 | 0 => FileType::File,    // S_IFREG / unspecified
+        _ => return Err(LxError::EINVAL),  // directories must use mkdir
+    })
 }
 
 /// Permission bits `mkdir(2)` keeps: `S_IRWXUGO|S_ISVTX`, which is
@@ -2584,5 +2603,96 @@ mod dirent_record_tests {
         let got = records(&used);
         assert_eq!(got[0].reclen as usize, used.len());
         assert_eq!(got[0].name, name);
+    }
+}
+
+#[cfg(test)]
+mod mknod_file_type_tests {
+    use super::*;
+
+    /// The five type codes `mknod` accepts, written out from `<sys/stat.h>`.
+    ///
+    /// The type a `mknod` records is what every later `open` of that path
+    /// dispatches on, and getting it wrong is not a failure anyone sees: the
+    /// node appears, with the major and minor the caller asked for, answering
+    /// as the wrong kind of thing. A character device where a block device was
+    /// asked for reads one byte at a time from something that only answers in
+    /// sectors.
+    #[test]
+    fn every_type_code_of_sys_stat_names_its_own_kind() {
+        assert_eq!(
+            mknod_file_type(0o010000),
+            Ok(FileType::NamedPipe),
+            "S_IFIFO"
+        );
+        assert_eq!(
+            mknod_file_type(0o020000),
+            Ok(FileType::CharDevice),
+            "S_IFCHR"
+        );
+        assert_eq!(
+            mknod_file_type(0o060000),
+            Ok(FileType::BlockDevice),
+            "S_IFBLK"
+        );
+        assert_eq!(mknod_file_type(0o100000), Ok(FileType::File), "S_IFREG");
+        assert_eq!(mknod_file_type(0o140000), Ok(FileType::Socket), "S_IFSOCK");
+    }
+
+    /// A mode with no type bits at all is a regular file.
+    ///
+    /// That is what POSIX says `mknod` does, and what `mknod path 0` from a
+    /// shell relies on: `mknod(2)`'s "zero file type is equivalent to
+    /// `S_IFREG`". Without the arm, the most ordinary call of all -- make me a
+    /// file -- is the one that answers `EINVAL`.
+    #[test]
+    fn a_mode_with_no_type_bits_is_a_regular_file() {
+        assert_eq!(mknod_file_type(0), Ok(FileType::File));
+        assert_eq!(mknod_file_type(0o644), Ok(FileType::File));
+        assert_eq!(mknod_file_type(0o7777), Ok(FileType::File));
+    }
+
+    /// The type lives in the top four bits of the field, not the bottom three.
+    ///
+    /// `S_IFMT` is `0o170000`, four bits wide. A mask one bit short keeps
+    /// `S_IFIFO`, `S_IFCHR` and `S_IFBLK` working -- they fit in three bits --
+    /// and quietly turns `S_IFSOCK` into a refusal and `S_IFLNK` into a
+    /// character device. Those two are the only calls that can tell.
+    #[test]
+    fn the_type_field_is_four_bits_wide_and_the_high_one_counts() {
+        // `S_IFSOCK`, the one accepted code with the high bit set.
+        assert_eq!(mknod_file_type(0o140000), Ok(FileType::Socket));
+        // `S_IFLNK`, which must be refused and whose low three bits are
+        // `S_IFCHR`'s.
+        assert_eq!(mknod_file_type(0o120000), Err(LxError::EINVAL));
+    }
+
+    /// A directory is the one type `mknod` refuses.
+    ///
+    /// Directories go through `mkdir`, which is the only path that links `.`
+    /// and `..`, so a directory made here would be a directory nothing could
+    /// walk out of.
+    #[test]
+    fn a_directory_has_to_go_through_mkdir() {
+        assert_eq!(mknod_file_type(0o040000), Err(LxError::EINVAL), "S_IFDIR");
+        assert_eq!(mknod_file_type(0o040755), Err(LxError::EINVAL));
+        // And the mask itself is not a type.
+        assert_eq!(mknod_file_type(0o170000), Err(LxError::EINVAL));
+    }
+
+    /// The permission bits never reach the type decision.
+    ///
+    /// Every real `mknod` passes them in the same word, so a decision that
+    /// looked at the whole `mode` would answer `EINVAL` for every call that
+    /// asks for anything other than mode 0.
+    #[test]
+    fn the_permission_bits_do_not_reach_the_type() {
+        assert_eq!(mknod_file_type(0o020644), Ok(FileType::CharDevice));
+        assert_eq!(mknod_file_type(0o010777), Ok(FileType::NamedPipe));
+        assert_eq!(mknod_file_type(0o060660), Ok(FileType::BlockDevice));
+        assert_eq!(mknod_file_type(0o140600), Ok(FileType::Socket));
+        assert_eq!(mknod_file_type(0o100644), Ok(FileType::File));
+        // The set-id and sticky bits are permission bits too.
+        assert_eq!(mknod_file_type(0o027777), Ok(FileType::CharDevice));
     }
 }

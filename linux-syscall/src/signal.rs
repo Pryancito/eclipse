@@ -1821,3 +1821,58 @@ mod benches {
         b.iter(|| black_box(check_sigaltstack(black_box(ss), black_box(true))));
     }
 }
+
+#[cfg(test)]
+mod siginfo_head_layout_tests {
+    use super::*;
+    use core::mem::{align_of, offset_of, size_of};
+
+    /// `SigInfoHead` is the twelve-byte prefix of the `siginfo_t` a process
+    /// hands to `rt_sigqueueinfo` and `pidfd_send_signal`, and the permission
+    /// rule is decided on `code`. The three fields are `i32` in a row, so
+    /// trading two of them compiles and leaves the size at twelve.
+    ///
+    /// The swap is not hypothetical. `include/uapi/asm-generic/siginfo.h`
+    /// spells the prefix twice, and the second form is exactly `signo`,
+    /// `code`, `errno`:
+    ///
+    /// ```text
+    /// #ifndef __ARCH_HAS_SWAPPED_SIGINFO
+    ///     int si_signo; int si_errno; int si_code;
+    /// #else
+    ///     int si_signo; int si_code; int si_errno;
+    /// #endif
+    /// ```
+    ///
+    /// MIPS defines that macro. So trading `errno` and `code` here would give
+    /// this kernel the swapped layout while it keeps answering x86_64
+    /// processes, and the rule that wants a negative `si_code` would be
+    /// reading `si_errno`, which is normally zero.
+    #[test]
+    fn the_prefix_is_signo_then_errno_then_code_as_x86_64_spells_it() {
+        assert_eq!(size_of::<SigInfoHead>(), 12);
+        assert_eq!(align_of::<SigInfoHead>(), 4);
+        assert_eq!(offset_of!(SigInfoHead, signo), 0);
+        assert_eq!(offset_of!(SigInfoHead, errno), 4);
+        assert_eq!(offset_of!(SigInfoHead, code), 8);
+    }
+
+    /// The twelve bytes as a process writes them, read back: this notices
+    /// `errno` and `code` trading places even where their offsets are not
+    /// read one by one, and it is the shape the permission rule is decided
+    /// on.
+    #[test]
+    #[allow(unsafe_code)]
+    fn the_twelve_bytes_are_the_fields_that_wrote_them() {
+        let head = SigInfoHead {
+            signo: 10,
+            errno: 0,
+            code: -1,
+        };
+        let bytes: [u8; 12] =
+            unsafe { core::ptr::read_unaligned(&head as *const _ as *const [u8; 12]) };
+        assert_eq!(&bytes[0..4], &10i32.to_le_bytes());
+        assert_eq!(&bytes[4..8], &0i32.to_le_bytes());
+        assert_eq!(&bytes[8..12], &(-1i32).to_le_bytes());
+    }
+}

@@ -362,6 +362,20 @@ fn clear_poll_io(
     }
 }
 
+/// The sixth argument of `pselect6` is a pointer to
+/// `{ const sigset_t *ss; size_t ss_len; }` (`struct sigset_argpack` in
+/// `fs/select.c`). It is read out of the caller's memory with a single
+/// `UserInPtr::read`, so the order of the two words is the ABI: read the wrong
+/// way round, the length is used as a pointer and the pointer as a length.
+///
+/// It used to be declared inside `sys_pselect6`, where nothing outside that
+/// function body could name it and therefore nothing could pin it.
+#[repr(C)]
+struct PSelectSigsetArg {
+    ss: usize,
+    ss_len: usize,
+}
+
 impl Syscall<'_> {
     /// Wait for some event on a file descriptor
     pub async fn sys_poll(
@@ -714,11 +728,6 @@ impl Syscall<'_> {
         let (sigmask, sigsetsize) = if sigset_arg == 0 {
             (UserInPtr::<Sigset>::from(0), 0)
         } else {
-            #[repr(C)]
-            struct PSelectSigsetArg {
-                ss: usize,
-                ss_len: usize,
-            }
             let arg: PSelectSigsetArg = UserInPtr::from(sigset_arg).read()?;
             (UserInPtr::from(arg.ss), arg.ss_len)
         };
@@ -2327,5 +2336,50 @@ mod benches {
     fn only_terminals_of_64_all_ttys(b: &mut Bencher) {
         let fds: Vec<Option<bool>> = (0..64).map(|_| Some(true)).collect();
         b.iter(|| black_box(only_terminals(black_box(&fds).iter().copied())));
+    }
+}
+
+#[cfg(test)]
+mod pselect_sigset_arg_layout_tests {
+    use super::PSelectSigsetArg;
+    use core::mem::{align_of, offset_of, size_of};
+
+    /// `struct sigset_argpack`: the pointer and then the length, both a word
+    /// wide. Swapping them is the worst shape this operator produces, because
+    /// the two values stay individually plausible: `ss_len` would be read from
+    /// the bytes holding a userspace address, so the size check that guards
+    /// the sigmask sees a huge number, and `ss` would be read from the bytes
+    /// holding a small length and used as the address to read the mask from.
+    #[test]
+    fn the_sixth_argument_is_the_pointer_and_then_its_length() {
+        assert_eq!(size_of::<PSelectSigsetArg>(), 16);
+        assert_eq!(align_of::<PSelectSigsetArg>(), 8);
+        assert_eq!(offset_of!(PSelectSigsetArg, ss), 0);
+        assert_eq!(offset_of!(PSelectSigsetArg, ss_len), 8);
+    }
+}
+
+#[cfg(test)]
+mod pollfd_layout_tests {
+    use super::PollFd;
+    use core::mem::{align_of, offset_of, size_of};
+
+    /// `struct pollfd`: the descriptor, the mask the caller asks for, and the
+    /// mask the kernel answers with. The last two are the same width and sit
+    /// next to each other, so the eight bytes stay eight bytes if they trade
+    /// places -- and then `poll(2)` reads the caller's request out of the slot
+    /// it is supposed to write the answer into, and writes the answer over the
+    /// request. Every `poll` test in the crate passed with them swapped,
+    /// because the kernel stays consistent with itself: both sides go through
+    /// the field name.
+    #[test]
+    fn struct_pollfd_asks_in_one_mask_and_answers_in_the_next() {
+        assert_eq!(size_of::<PollFd>(), 8);
+        assert_eq!(align_of::<PollFd>(), 4);
+        assert_eq!(offset_of!(PollFd, fd), 0);
+        assert_eq!(offset_of!(PollFd, events), 4);
+        assert_eq!(offset_of!(PollFd, revents), 6);
+        // Two bytes each, and the answer comes after the question.
+        assert!(offset_of!(PollFd, revents) > offset_of!(PollFd, events));
     }
 }
