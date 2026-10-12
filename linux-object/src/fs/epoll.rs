@@ -38,6 +38,16 @@ pub mod stats {
     /// since it last reported them. Each one is an `epoll_wait` return --
     /// and the syscall behind it -- that did not happen.
     static EDGE_SUPPRESSED: AtomicU64 = AtomicU64::new(0);
+    /// Returns that carried an ERROR rather than events: `EINTR` for a
+    /// deliverable signal, or a watched file whose `poll` failed.
+    ///
+    /// Counted because its absence hid a livelock for good. Every other exit
+    /// from [`super::Epoll::wait`] was tallied and this one was not, so a
+    /// process whose every `epoll_pwait` came back `EINTR` showed up in
+    /// `/proc/perf` as millions of calls against a handful of delivered
+    /// events, and the only way to see it was to subtract. On a hung Firefox
+    /// (12-oct) that subtraction came to 3.056.442 calls of 3.130.607.
+    static ERROR_RETURNS: AtomicU64 = AtomicU64::new(0);
 
     /// Classify one entry into `Epoll::wait` by the timeout it was given.
     pub(super) fn entered(timeout_msecs: isize) {
@@ -74,6 +84,17 @@ pub mod stats {
     /// [`snapshot`] so the tuple every caller destructures keeps its arity.
     pub fn edge_suppressed_total() -> u64 {
         EDGE_SUPPRESSED.load(Relaxed)
+    }
+
+    /// Record one return of `Epoll::wait` that carried an error. See
+    /// [`ERROR_RETURNS`].
+    pub(super) fn returned_error() {
+        ERROR_RETURNS.fetch_add(1, Relaxed);
+    }
+
+    /// See [`ERROR_RETURNS`]. Read on its own, as [`edge_suppressed_total`].
+    pub fn error_returns_total() -> u64 {
+        ERROR_RETURNS.load(Relaxed)
     }
 
     /// `(nonblock, timed, forever, empty_nonblock, empty_timed, events)`,
@@ -767,7 +788,10 @@ impl Epoll {
                 };
                 let status = match file.poll(interest) {
                     Ok(status) => status,
-                    Err(err) => return Err(err),
+                    Err(err) => {
+                        stats::returned_error();
+                        return Err(err);
+                    }
                 };
                 let mut ready = ready_events(event.events, &status);
                 if edge_triggered {
@@ -823,7 +847,10 @@ impl Epoll {
             // A blocking wait may be interrupted by a deliverable signal, but a
             // signal must not hide events that are already ready, nor turn a
             // non-blocking/expired wait into `EINTR`.
-            crate::process::check_signals()?;
+            if let Err(err) = crate::process::check_signals() {
+                stats::returned_error();
+                return Err(err);
+            }
 
             // Park a readiness waker on every watched fd that can carry one, so
             // a pipe write / unix-socket send / timerfd expiry wakes this task
