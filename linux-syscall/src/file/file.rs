@@ -114,8 +114,35 @@ fn seek_from(whence: usize, offset: i64) -> linux_object::error::LxResult<SeekFr
     }
 }
 
+/// `sync_file_range(2)`'s flags (`<linux/fs.h>`).
+const SYNC_FILE_RANGE_WAIT_BEFORE: usize = 1;
+/// See [`SYNC_FILE_RANGE_WAIT_BEFORE`].
+const SYNC_FILE_RANGE_WRITE: usize = 2;
+/// See [`SYNC_FILE_RANGE_WAIT_BEFORE`].
+const SYNC_FILE_RANGE_WAIT_AFTER: usize = 4;
+
+/// Whether `sync_file_range` accepts this flag word, and if so whether it
+/// asks for any write-back at all.
+///
+/// A bit the call does not have has to be `EINVAL`: that is how a caller finds
+/// out this kernel is older than the flag it wanted, and a flag word taken
+/// wholesale reports success for work nobody asked for in a way nobody can
+/// see. An empty flag word is legal and means "do nothing", which is why the
+/// answer is a bool and not just `Ok(())`.
+fn sync_file_range_writes_back(flags: usize) -> LxResult<bool> {
+    if flags & !(SYNC_FILE_RANGE_WAIT_BEFORE | SYNC_FILE_RANGE_WRITE | SYNC_FILE_RANGE_WAIT_AFTER)
+        != 0
+    {
+        return Err(LxError::EINVAL);
+    }
+    Ok(flags != 0)
+}
+
 #[cfg(test)]
 mod ioctl_number_tests;
+
+#[cfg(test)]
+mod sync_file_range_tests;
 
 /// Whether an `EINVAL` from the file's own ioctl handler should be reported
 /// as `ENOTTY`: the request is in the `0x54xx` terminal block and is not one
@@ -1288,19 +1315,11 @@ impl Syscall<'_> {
         nbytes: usize,
         flags: usize,
     ) -> SysResult {
-        const SYNC_FILE_RANGE_WAIT_BEFORE: usize = 1;
-        const SYNC_FILE_RANGE_WRITE: usize = 2;
-        const SYNC_FILE_RANGE_WAIT_AFTER: usize = 4;
         info!(
             "sync_file_range: fd={:?}, offset={}, nbytes={}, flags={:#x}",
             fd, offset, nbytes, flags
         );
-        if flags
-            & !(SYNC_FILE_RANGE_WAIT_BEFORE | SYNC_FILE_RANGE_WRITE | SYNC_FILE_RANGE_WAIT_AFTER)
-            != 0
-        {
-            return Err(LxError::EINVAL);
-        }
+        let writes_back = sync_file_range_writes_back(flags)?;
         // `ksys_sync_file_range`: the range is judged after the flags and
         // before the descriptor. Both are `loff_t`, so a negative offset or
         // length, or an end past `LLONG_MAX`, is EINVAL; read as `u64` they
@@ -1308,7 +1327,7 @@ impl Syscall<'_> {
         crate::intarg::loff_range(offset, nbytes)?;
         let proc = self.linux_process();
         let file = proc.get_file(fd)?;
-        if flags != 0 {
+        if writes_back {
             file.sync_data()?;
         }
         Ok(0)
