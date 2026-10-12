@@ -38,6 +38,19 @@ use zircon_object::vm::{
 /// physical footprint.
 const MAX_MMAP_LEN: usize = 64 * 1024 * 1024 * 1024;
 
+/// How much heap `brk` reserves at a time, instead of one VMO per call.
+///
+/// Glibc's malloc calls `brk` in 4-32 KiB increments, which the old code
+/// turned into a fresh VMO and VMAR mapping each time: hundreds of VMAR
+/// entries for one arena, and the allocator and TLB-shootdown pressure that
+/// goes with them.
+///
+/// It was declared inside `sys_brk`, where nothing could name it. What has to
+/// hold is not the number itself but its shape: a whole number of pages, or
+/// the reservation and the `roundup_pages` the rest of `sys_brk` does would
+/// describe different ends of the heap.
+const BRK_CHUNK: usize = 1 << 20;
+
 /// Linux `vm.mmap_min_addr` (default 64 KiB): floor for kernel-chosen mmap
 /// placement. Without it the VMAR's first-fit search can hand a non-FIXED
 /// `mmap(NULL, ...)` the address 0 — userspace then treats 0 as a valid
@@ -522,8 +535,6 @@ impl Syscall<'_> {
         // increments, which the old code translated into a fresh VMO + VMAR
         // mapping each time — hundreds of VMAR entries for a single arena
         // and a corresponding bump in allocator / TLB-shootdown pressure.
-        const BRK_CHUNK: usize = 1 << 20;
-
         let proc = self.linux_process();
         let current_brk = proc.brk();
         // Lazy init: the loader populates `brk` directly before the first
@@ -3563,5 +3574,41 @@ mod benches {
     #[bench]
     fn mlockall_flag_check(b: &mut Bencher) {
         b.iter(|| black_box(check_mlockall_flags(black_box(1))));
+    }
+}
+
+#[cfg(test)]
+mod brk_chunk_tests {
+    use super::*;
+
+    /// The `brk` reservation is a whole number of pages.
+    ///
+    /// It is not the number that matters but its shape: the rest of `sys_brk`
+    /// rounds the caller's break up with `roundup_pages`, so a reservation
+    /// that is not page-aligned and the break it is meant to cover describe
+    /// different ends of the same heap, and the mapping comes out one page
+    /// short of where the process is allowed to write.
+    #[test]
+    fn the_brk_reservation_is_a_whole_number_of_pages() {
+        assert_eq!(BRK_CHUNK % PAGE_SIZE, 0);
+        assert_eq!(roundup_pages(BRK_CHUNK), BRK_CHUNK);
+        assert!(
+            BRK_CHUNK >= PAGE_SIZE,
+            "a reservation of no pages reserves nothing"
+        );
+    }
+
+    /// And it is big enough to be worth the reservation.
+    ///
+    /// The point of reserving ahead is that glibc's malloc asks for 4 to 32
+    /// KiB at a time: one reservation has to absorb many of those calls, or
+    /// the VMAR fills with entries again and nothing was gained.
+    #[test]
+    fn one_reservation_absorbs_many_malloc_calls() {
+        assert!(
+            BRK_CHUNK / (32 * 1024) >= 32,
+            "a 32 KiB malloc has to be answered from the reservation 32 times over"
+        );
+        assert_eq!(BRK_CHUNK, 1 << 20);
     }
 }
