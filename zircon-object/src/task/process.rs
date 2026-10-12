@@ -31,8 +31,12 @@ use crate::{
 /// address and whose children's `getppid` answers a pid that does not exist.
 ///
 /// It lived inside `create_init_with_vmar`'s body, where nothing could name
-/// it from a test.
-const INIT_PID: KoID = 1;
+/// it from a test. It is public because this is the crate that *creates* the
+/// process with that koid, so it is the one number the rest of the tree has
+/// to agree with: `linux_object::process::INIT_PID` is this constant, and
+/// `loader` reads it from there. There used to be four separate `= 1` in
+/// three crates, and only one of the four had a test.
+pub const INIT_PID: KoID = 1;
 
 /// A callback run once per process teardown, for per-pid resources owned by
 /// crates this one cannot depend on.

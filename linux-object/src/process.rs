@@ -4837,7 +4837,12 @@ pub fn process_exists(pid: KoID) -> bool {
 /// Linux PID of the `init` process (the base program). The system's reaper of
 /// last resort for orphaned children, and the one process a `kill(-1, sig)`
 /// broadcast must never reach.
-pub const INIT_PID: KoID = 1;
+///
+/// Not written out here: it is the koid `zircon_object::task::create_init_*`
+/// actually hands the process, so that is where it comes from. A copy of the
+/// literal would be a second number that has to agree with the first, which
+/// is what this tree had, in three crates at once.
+pub const INIT_PID: KoID = zircon_object::task::INIT_PID;
 
 /// Live INIT (PID 1) process, or `None` if there is no running init.
 /// True for the Linux magic exe links that must not replace a real
