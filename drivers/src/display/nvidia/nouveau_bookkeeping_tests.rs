@@ -964,8 +964,8 @@ fn nvif_refuses_a_short_payload_and_an_unknown_type_before_reading_a_body() {
     );
     assert_eq!(
         Nvif::new(0x09, 0, 0, 0, HDR + NEW).send(&gpu, A),
-        Err(nv::ENOSYS),
-        "a type this driver has no arm for"
+        Err(nv::EINVAL),
+        "a type nouveau_abi16_ioctl has no arm for"
     );
     assert_eq!(
         device_new(u64::MAX).cut(HDR + NEW - 1).send(&gpu, A),
@@ -978,9 +978,12 @@ fn nvif_refuses_a_short_payload_and_an_unknown_type_before_reading_a_body() {
         "MTHD without its 8-byte body"
     );
     assert_eq!(
-        device_info(nv::NV_DEVICE_V0_INFO)
-            .cut(HDR + MTHD + INFO - 1)
-            .send(&gpu, A),
+        {
+            assert_eq!(device_new(u64::MAX).send(&gpu, A), Ok(0));
+            device_info(nv::NV_DEVICE_V0_INFO)
+                .cut(HDR + MTHD + INFO - 1)
+                .send(&gpu, A)
+        },
         Err(nv::EINVAL),
         "INFO with no room for its 104-byte reply"
     );
@@ -1027,6 +1030,7 @@ fn nvif_new_of_the_device_object_takes_only_the_client_default() {
 fn nvif_device_info_reports_the_board_and_floors_its_vram() {
     let _g = LOCK.lock();
     let gpu = gpu();
+    assert_eq!(device_new(u64::MAX).send(&gpu, A), Ok(0));
     let mut r = device_info(nv::NV_DEVICE_V0_INFO);
     assert_eq!(r.send(&gpu, A), Ok(0));
     let info: nv::NvDeviceInfoV0 = r.get(HDR + MTHD);
@@ -1048,12 +1052,13 @@ fn nvif_device_info_reports_the_board_and_floors_its_vram() {
     assert_eq!(cstr(&info.name), "nvidia-test");
     assert_eq!(
         device_info(0x05).send(&gpu, A),
-        Err(nv::ENOSYS),
+        Err(nv::EINVAL),
         "the only method is INFO"
     );
     // A board the id table does not know: the architecture's floor,
     // never a 0 that would leave NVK with an empty VRAM heap.
     let unknown = NvidiaGpu::for_test(0x1fff, 0);
+    assert_eq!(device_new(u64::MAX).send(&unknown, A), Ok(0));
     let mut r = device_info(nv::NV_DEVICE_V0_INFO);
     assert_eq!(r.send(&unknown, A), Ok(0));
     let info: nv::NvDeviceInfoV0 = r.get(HDR + MTHD);
@@ -1181,12 +1186,12 @@ fn nvif_del_and_the_class_registry_are_scoped_to_the_owner_and_the_channel() {
     // A DEL names the object by the cookie mesa passed at NEW (a heap
     // pointer, so equal across processes): only the caller's goes.
     assert_eq!(
-        Nvif::new(nv::NVIF_IOCTL_V0_DEL, 0xff, 3, 0x1000, HDR).send(&gpu, STRANGER),
+        Nvif::new(nv::NVIF_IOCTL_V0_DEL, 0, 3, 0x1000, HDR).send(&gpu, STRANGER),
         Ok(0),
         "nothing of STRANGER's: a no-op, as in Linux's nvif_object_dtor"
     );
     assert_eq!(
-        Nvif::new(nv::NVIF_IOCTL_V0_DEL, 0xff, 3, 0x1000, HDR).send(&gpu, A),
+        Nvif::new(nv::NVIF_IOCTL_V0_DEL, 0, 3, 0x1000, HDR).send(&gpu, A),
         Ok(0)
     );
     assert_eq!(nv::class_object_remove(0x1000, A), None, "gone");
@@ -2012,7 +2017,7 @@ fn with_the_rm_a_subchannel_new_builds_the_class_on_the_callers_context_and_chan
     }
     // DEL frees the RM object, the caller's only.
     assert_eq!(
-        Nvif::new(nv::NVIF_IOCTL_V0_DEL, 0xff, 0, 0x1000, HDR).send(&gpu, B),
+        Nvif::new(nv::NVIF_IOCTL_V0_DEL, 0, 0, 0x1000, HDR).send(&gpu, B),
         Ok(0)
     );
     assert_eq!(FAKE_RM.lock().class_frees, 1);

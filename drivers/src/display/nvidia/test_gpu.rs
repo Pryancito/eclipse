@@ -67,6 +67,7 @@ impl NvidiaGpu {
             nouveau_gem_handle_end: gem_handle_slice.end(),
             nouveau_vm_mappings: Mutex::new(Vec::new()),
             nouveau_uvmm: Mutex::new(Vec::new()),
+            nouveau_nvif_devices: Mutex::new(Vec::new()),
             nouveau_pid_ctx: Mutex::new(Vec::new()),
             nouveau_fast: Mutex::new((0..nv::MAX_CTX).map(|_| FastSlot::Unprepared).collect()),
             nouveau_peer_fence: Mutex::new(alloc::collections::BTreeMap::new()),
