@@ -1996,3 +1996,140 @@ mod request_number_tests {
         assert_eq!(TIOCL_GETSHIFTSTATE, 6);
     }
 }
+
+/// The wire layout of [`Termios`], Linux's `struct termios`, and the one
+/// struct in this file whose size has already cost a bug.
+///
+/// The doc comment on the struct tells it: this used to carry the `termios2`
+/// tail (`c_ispeed`/`c_ospeed`) with `NCCS = 32`, so `TCGETS` wrote 60 bytes
+/// into the 36-byte buffer glibc's `tcgetattr` puts on the stack, clobbered
+/// the return address and made every glibc `exec` flaky. Nothing has guarded
+/// those 36 bytes since: widening `c_line` from `u8` to `u32` -- 40 bytes,
+/// with `c_cc` three bytes further along -- passed this whole crate's suite.
+///
+/// Numbers from `include/uapi/asm-generic/termbits.h`, which x86 uses as is:
+/// it has no `asm/termbits.h` of its own.
+#[cfg(test)]
+mod termios_layout_tests {
+    use super::Termios;
+    use core::mem::{align_of, offset_of, size_of};
+
+    #[test]
+    fn termios_is_the_thirty_six_bytes_glibc_hands_to_tcgetattr() {
+        assert_eq!(size_of::<Termios>(), 36);
+        assert_eq!(align_of::<Termios>(), 4);
+    }
+
+    #[test]
+    fn the_four_flag_words_are_input_output_control_local() {
+        assert_eq!(offset_of!(Termios, c_iflag), 0);
+        assert_eq!(offset_of!(Termios, c_oflag), 4);
+        assert_eq!(offset_of!(Termios, c_cflag), 8);
+        assert_eq!(offset_of!(Termios, c_lflag), 12);
+    }
+
+    #[test]
+    fn the_line_discipline_is_one_byte_and_the_control_chars_follow_it() {
+        // `c_line` is a `cc_t`, one byte, not a word. It is the field that
+        // decides where `c_cc` starts and whether the struct is 36 bytes.
+        assert_eq!(offset_of!(Termios, c_line), 16);
+        assert_eq!(offset_of!(Termios, c_cc), 17);
+    }
+
+    #[test]
+    fn there_are_nccs_nineteen_control_characters() {
+        // `NCCS` is 19 in `asm-generic/termbits.h`. It is 32 in the BSDs and
+        // in `termios2`, and that 32 is where the 60-byte struct came from.
+        let t = Termios::default_tty();
+        assert_eq!(t.c_cc.len(), 19);
+        assert_eq!(size_of::<Termios>(), 16 + 1 + 19);
+    }
+}
+
+/// The wire layout of [`SerialIcounter`], Linux's
+/// `struct serial_icounter_struct`, which `TIOCGICOUNT` copies out whole.
+///
+/// Eleven counters and a nine-word reserved tail: twenty `int`s, 80 bytes.
+/// Every field is an `int`, so any two can trade places, and the tail can
+/// lose a word, without rustc or any behaviour test noticing -- a virtual TTY
+/// reports zeros, and zeros read the same in any order. Numbers from
+/// `include/uapi/linux/serial.h`.
+#[cfg(test)]
+mod serial_icounter_layout_tests {
+    use super::SerialIcounter;
+    use core::mem::{align_of, offset_of, size_of};
+
+    #[test]
+    fn serial_icounter_struct_is_twenty_ints() {
+        assert_eq!(size_of::<SerialIcounter>(), 80);
+        assert_eq!(align_of::<SerialIcounter>(), 4);
+    }
+
+    #[test]
+    fn the_four_modem_lines_come_first_as_cts_dsr_rng_dcd() {
+        assert_eq!(offset_of!(SerialIcounter, cts), 0);
+        assert_eq!(offset_of!(SerialIcounter, dsr), 4);
+        assert_eq!(offset_of!(SerialIcounter, rng), 8);
+        assert_eq!(offset_of!(SerialIcounter, dcd), 12);
+    }
+
+    #[test]
+    fn the_byte_counts_come_before_the_four_error_counts() {
+        assert_eq!(offset_of!(SerialIcounter, rx), 16);
+        assert_eq!(offset_of!(SerialIcounter, tx), 20);
+        assert_eq!(offset_of!(SerialIcounter, frame), 24);
+        assert_eq!(offset_of!(SerialIcounter, overrun), 28);
+        assert_eq!(offset_of!(SerialIcounter, parity), 32);
+        assert_eq!(offset_of!(SerialIcounter, brk), 36);
+        assert_eq!(offset_of!(SerialIcounter, buf_overrun), 40);
+    }
+
+    #[test]
+    fn the_reserved_tail_is_nine_words_and_every_one_reports_zero() {
+        assert_eq!(offset_of!(SerialIcounter, reserved), 44);
+        let c = SerialIcounter::default();
+        assert_eq!(c.reserved.len(), 9);
+        assert!(c.reserved.iter().all(|&w| w == 0));
+    }
+}
+
+/// The wire layout of [`VtMode`] and [`VtStat`], Linux's `struct vt_mode`
+/// (`VT_GETMODE`/`VT_SETMODE`) and `struct vt_stat` (`VT_GETSTATE`).
+///
+/// `stdio.rs` writes a `VtStat` straight through a raw pointer into the
+/// caller's buffer, so its six bytes are the whole contract. Numbers from
+/// `include/uapi/linux/vt.h`.
+#[cfg(test)]
+mod vt_layout_tests {
+    use super::{VtMode, VtStat};
+    use core::mem::{align_of, offset_of, size_of};
+
+    #[test]
+    fn vt_mode_is_eight_bytes_with_the_two_flags_first() {
+        assert_eq!(size_of::<VtMode>(), 8);
+        assert_eq!(align_of::<VtMode>(), 2);
+        // Both are `__u8`, and swapping them turns an automatic VT into one
+        // that waits for a vertical retrace.
+        assert_eq!(offset_of!(VtMode, mode), 0);
+        assert_eq!(offset_of!(VtMode, waitv), 1);
+    }
+
+    #[test]
+    fn the_three_signal_numbers_are_release_acquire_free() {
+        // `__s16` each, so `relsig` sits at 2 and not at 3. Its width is the
+        // one thing here that rustc does hold on its own: `vt_signal` in
+        // `stdio.rs` takes an `i16`, so widening the field fails to compile.
+        assert_eq!(offset_of!(VtMode, relsig), 2);
+        assert_eq!(offset_of!(VtMode, acqsig), 4);
+        assert_eq!(offset_of!(VtMode, frsig), 6);
+    }
+
+    #[test]
+    fn vt_stat_is_three_shorts_as_active_signal_state() {
+        assert_eq!(size_of::<VtStat>(), 6);
+        assert_eq!(align_of::<VtStat>(), 2);
+        assert_eq!(offset_of!(VtStat, v_active), 0);
+        assert_eq!(offset_of!(VtStat, v_signal), 2);
+        assert_eq!(offset_of!(VtStat, v_state), 4);
+    }
+}
