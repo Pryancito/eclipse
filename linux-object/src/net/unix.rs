@@ -1156,6 +1156,10 @@ impl_kobject!(UnixSocketState);
 
 #[async_trait]
 impl FileLike for UnixSocketState {
+    fn is_socket(&self) -> bool {
+        true
+    }
+
     /// A socket reports `S_IFSOCK` to `fstat(2)`, as on Linux.
     fn metadata(&self) -> LxResult<rcore_fs::vfs::Metadata> {
         Ok(crate::fs::anon_metadata(
@@ -2381,5 +2385,29 @@ mod edge_direction_tests {
             seq_before,
             a.readiness_seq(PollEvents::IN)
         );
+    }
+}
+
+#[cfg(test)]
+mod is_socket_tests {
+    //! The other half of the fix in `LinuxProcess::add_socket`: poll, select
+    //! and epoll ask the FILE whether it is a socket, so a socket that said
+    //! no would be a wait that never pumps the network stack underneath it.
+    //! That used to be read off the descriptor number, which only worked
+    //! while every socket was numbered from 1000 up.
+
+    use super::*;
+    use crate::net::netlink::NetlinkSocketState;
+
+    #[test]
+    fn un_socket_unix_se_declara_socket() {
+        let s = UnixSocketState::new();
+        assert!(FileLike::is_socket(&*s));
+    }
+
+    #[test]
+    fn un_socket_netlink_se_declara_socket() {
+        let s = NetlinkSocketState::new(SocketType::SOCK_RAW);
+        assert!(FileLike::is_socket(&s));
     }
 }

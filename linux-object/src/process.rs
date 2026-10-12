@@ -1984,10 +1984,28 @@ impl LinuxProcess {
     }
 
     /// Add a socket to the fd table.
+    ///
+    /// Sockets are handed out from [`SOCKET_FD`] (1000) up, which is what
+    /// `fd_is_socket` was reading when it decided whether a poll had to pump
+    /// the network stack. That base is now a preference and not a rule,
+    /// because a descriptor at 1000 is one a process with a small
+    /// `RLIMIT_NOFILE` may not hold at all: `insert_file` refuses any fd at
+    /// or past the limit, so PulseAudio -- which drops its own soft limit to
+    /// 256 before it does anything else -- got `EMFILE` from the first
+    /// socket it asked for, with three descriptors open. musl prints that as
+    /// "No file descriptors available", and it killed the sound server on
+    /// every boot.
+    ///
+    /// So: 1000 when the process can hold it, the lowest free descriptor
+    /// otherwise. The fallback also lifts the ceiling the base imposed on
+    /// everyone else -- with the default soft limit of 1024 a process could
+    /// hold 24 sockets (1000..=1023) and no more.
     pub fn add_socket(&self, file: Arc<dyn FileLike>) -> LxResult<FileDesc> {
         let cloexec = opened_cloexec(&file);
         let inner = self.inner.lock();
-        let fd = inner.get_free_fd_from(SOCKET_FD);
+        let fd = socket_fd(inner.get_free_fd_from(SOCKET_FD), inner.nofile(), || {
+            inner.get_free_fd()
+        });
         self.insert_file(inner, fd, file, cloexec)
     }
 
@@ -4339,6 +4357,22 @@ impl LinuxProcessInner {
             .unwrap()
     }
 }
+
+/// The descriptor a new socket gets: `preferred` (the first hole at or above
+/// [`SOCKET_FD`]) while the process is allowed to hold it, and otherwise the
+/// lowest free descriptor, from `low`.
+///
+/// Split out of [`LinuxProcess::add_socket`] so the decision can be tested
+/// without a process: the case that matters is a process whose soft
+/// `RLIMIT_NOFILE` is BELOW the socket base, where the preferred descriptor
+/// is one `insert_file` would refuse outright.
+fn socket_fd(preferred: FileDesc, nofile: usize, low: impl FnOnce() -> FileDesc) -> FileDesc {
+    if usize::from(preferred) < nofile {
+        preferred
+    } else {
+        low()
+    }
+}
 /// Deliver SIGINT to the foreground terminal process group (job control).
 pub fn deliver_sigint_to_foreground() {
     deliver_sigint_for_vt(None)
@@ -5790,7 +5824,7 @@ mod rename_permission_tests;
 mod dac_tests;
 
 #[cfg(test)]
-mod dup_fd_tests;
+pub(crate) mod dup_fd_tests;
 
 #[cfg(test)]
 mod job_control_membership_tests;
@@ -5835,3 +5869,6 @@ mod session_and_group_tests;
 
 #[cfg(test)]
 mod dying_process_tests;
+
+#[cfg(test)]
+mod socket_fd_tests;

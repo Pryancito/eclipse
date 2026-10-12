@@ -938,6 +938,21 @@ pub trait FileLike: KernelObject + downcast_rs::DowncastSync {
     fn is_input_device(&self) -> bool {
         false
     }
+    /// True if this fd is a socket of any family (INET, UNIX, NETLINK,
+    /// PACKET, ...).
+    ///
+    /// poll/select/epoll ask this to decide whether a wait has to pump the
+    /// network stack. They used to ask the fd NUMBER instead -- sockets are
+    /// handed out from [`crate::net::SOCKET_FD`] (1000) up, so "fd >= 1000"
+    /// stood in for "is a socket". That is why the number mattered at all,
+    /// and the number is exactly what a process with a small
+    /// `RLIMIT_NOFILE` cannot have: PulseAudio drops its own limit to 256
+    /// and every socket it asked for was `EMFILE` with three fds open. With
+    /// the question asked here instead, a socket that lands on a low
+    /// descriptor is still a socket.
+    fn is_socket(&self) -> bool {
+        false
+    }
     /// True if the underlying inode is a character device (`S_IFCHR`).
     ///
     /// Used to scope tty-ish ioctl fallbacks (e.g. `TIOCGWINSZ`) so pipes,
