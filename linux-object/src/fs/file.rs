@@ -3,6 +3,7 @@
 use alloc::{boxed::Box, string::String, sync::Arc};
 
 use async_trait::async_trait;
+use core::sync::atomic::{AtomicU64, Ordering};
 use kernel_hal::sync::RwLock;
 
 use rcore_fs::vfs::{FileType, FsError, INode, Metadata, PollStatus, Timespec};
@@ -877,26 +878,54 @@ pub fn fs_grow_error(inode: &Arc<dyn INode>, e: FsError) -> LxError {
     }
 }
 
+/// How many distinct paths an ENOSPC report is spent on. One slot per path,
+/// so a writer retrying the same file does not use up the budget of the
+/// others; the whole table has to stay inside one cache line, because both
+/// scans below run on the write path with the filesystem locks held.
+const ENOSPC_SLOTS: usize = 8;
+
+/// The FNV-1a 64-bit offset basis.
+const ENOSPC_FNV_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+
+/// The FNV-1a 64-bit prime. It has to be **odd**: multiplying mod 2^64 by an
+/// even number is not injective, so two paths that had reached different
+/// states could merge from there on and share one slot, and only the first of
+/// the two would ever be named.
+const ENOSPC_FNV_PRIME: u64 = 0x0100_0000_01b3;
+
+/// FNV-1a of the path with the low bit forced on.
+///
+/// **Zero is the free marker of the slot table**, so a key may never be zero:
+/// a path whose hash came out zero would read as already present in every
+/// free slot, and the one file that filled the disk would be the one file
+/// never named. The low bit is what guarantees that for every path, whatever
+/// its hash.
+fn enospc_key(path: &str) -> u64 {
+    path.bytes().fold(ENOSPC_FNV_BASIS, |h, b| {
+        (h ^ b as u64).wrapping_mul(ENOSPC_FNV_PRIME)
+    }) | 1
+}
+
+/// Claim a slot for `key`; true only the first time that key is seen.
+///
+/// False for a retry of a path already in the table, and false once the table
+/// is full, which is what bounds the console flood.
+fn claim_enospc_slot(seen: &[AtomicU64], key: u64) -> bool {
+    seen.iter().all(|s| s.load(Ordering::Relaxed) != key)
+        && seen.iter().any(|s| {
+            s.compare_exchange(0, key, Ordering::AcqRel, Ordering::Relaxed)
+                .is_ok()
+        })
+}
+
 /// Say which file filled the disk. The root image is an SFS sized with ~40%
 /// headroom over its payload, so when it fills the interesting fact is WHAT
 /// filled it -- a runaway log, a browser cache, a leak in the allocator -- and
 /// nothing else in the log answers that. Printed for the first few distinct
 /// paths only; a writer that keeps retrying would otherwise flood the console.
 fn report_enospc(path: &str, offset: u64, len: usize, size: Option<u64>) {
-    use core::sync::atomic::{AtomicU64, Ordering};
-    // One slot per distinct path (FNV-1a of the path; 0 = free), so a writer
-    // retrying the same file does not use up the budget of the others.
-    const SLOTS: usize = 8;
-    static SEEN: [AtomicU64; SLOTS] = [const { AtomicU64::new(0) }; SLOTS];
-    let key = path.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| {
-        (h ^ b as u64).wrapping_mul(0x0100_0000_01b3)
-    }) | 1;
-    let fresh = SEEN.iter().all(|s| s.load(Ordering::Relaxed) != key)
-        && SEEN.iter().any(|s| {
-            s.compare_exchange(0, key, Ordering::AcqRel, Ordering::Relaxed)
-                .is_ok()
-        });
-    if fresh {
+    static SEEN: [AtomicU64; ENOSPC_SLOTS] = [const { AtomicU64::new(0) }; ENOSPC_SLOTS];
+    if claim_enospc_slot(&SEEN, enospc_key(path)) {
         error!(
             "[enospc] write of {} bytes at offset {:#x} to {} refused: no space left on device              (file is {} bytes now)",
             len,
@@ -2838,5 +2867,155 @@ mod terminal_subscription_tests {
                 .is_some(),
             "/dev/console is where an init shell's stdin usually points"
         );
+    }
+}
+
+#[cfg(test)]
+mod enospc_report_tests {
+    //! The filter that keeps a full disk from flooding the console: one
+    //! report per distinct path, for the first few paths only. Nothing
+    //! reached it before, because `report_enospc` only logs -- a mutant in
+    //! any of its three decisions survived the whole suite.
+
+    use super::*;
+
+    fn fresh_table() -> [AtomicU64; ENOSPC_SLOTS] {
+        [const { AtomicU64::new(0) }; ENOSPC_SLOTS]
+    }
+
+    fn occupied(table: &[AtomicU64]) -> usize {
+        table
+            .iter()
+            .filter(|s| s.load(Ordering::Relaxed) != 0)
+            .count()
+    }
+
+    /// Zero is the free marker of the slot table, so a key may never be
+    /// zero, and the low bit is what guarantees it whatever the hash came
+    /// out. Without it a path that hashed to zero would read as already
+    /// present in every free slot: the one file that filled the disk would
+    /// be the one file never named, which is the whole point of the report.
+    #[test]
+    fn a_key_can_never_be_the_zero_that_marks_a_free_slot() {
+        for path in [
+            "",
+            "/",
+            "/dev/null",
+            "/var/log/messages",
+            "/var/log/eclipse/journal.log",
+            "/home/moebius/.cache/mozilla/firefox/blob",
+        ] {
+            let key = enospc_key(path);
+            assert_ne!(key, 0, "{:?} would read as a free slot", path);
+            assert_eq!(key & 1, 1, "{:?} must carry the low bit", path);
+        }
+        // And that is why it matters: a zero key cannot be claimed at all,
+        // not even in an empty table.
+        let table = fresh_table();
+        assert!(
+            !claim_enospc_slot(&table, 0),
+            "zero means free, so it can never be a key"
+        );
+        assert_eq!(occupied(&table), 0, "and it claimed nothing");
+    }
+
+    /// The multiplier has to be invertible mod 2^64, which for a power-of-two
+    /// modulus means odd. With an even one the fold's step stops being
+    /// injective -- two paths that had reached states differing only in the
+    /// top bit merge from there on and share a slot, so one of the two files
+    /// is never named however different the paths are.
+    #[test]
+    fn the_multiplier_of_the_hash_has_to_be_invertible() {
+        assert_eq!(
+            ENOSPC_FNV_PRIME & 1,
+            1,
+            "an even multiplier is not injective mod 2^64"
+        );
+        let step = |h: u64| (h ^ b'/' as u64).wrapping_mul(ENOSPC_FNV_PRIME);
+        let states = [
+            0u64,
+            1,
+            2,
+            u64::MAX,
+            1 << 63,
+            (1 << 63) + 1,
+            ENOSPC_FNV_BASIS,
+        ];
+        for (i, &a) in states.iter().enumerate() {
+            for &b in &states[i + 1..] {
+                assert_ne!(
+                    step(a),
+                    step(b),
+                    "{:#x} and {:#x} merged into one state",
+                    a,
+                    b
+                );
+            }
+        }
+    }
+
+    /// A writer that keeps retrying the same write is the normal shape of a
+    /// full disk, and it must not use up the budget of the others: one slot
+    /// for the path, and the report once.
+    #[test]
+    fn the_same_file_is_reported_once_however_often_the_write_retries() {
+        let table = fresh_table();
+        let key = enospc_key("/var/log/eclipse/journal.log");
+        assert!(claim_enospc_slot(&table, key), "the first refused write");
+        for n in 0..6 {
+            assert!(
+                !claim_enospc_slot(&table, key),
+                "retry {} is not a new file",
+                n
+            );
+        }
+        assert_eq!(occupied(&table), 1, "and it spent exactly one slot");
+    }
+
+    /// Distinct paths each get a slot, and when the table is full the report
+    /// stops: that is what bounds the flood. The budget is more than one on
+    /// purpose, because naming only the first file to fail says nothing
+    /// about which one filled the disk.
+    #[test]
+    fn the_budget_is_spent_on_distinct_files_and_then_it_is_gone() {
+        assert!(ENOSPC_SLOTS > 1, "one name is not an answer");
+        let table = fresh_table();
+        for i in 0..ENOSPC_SLOTS {
+            let path = alloc::format!("/var/log/app-{i}.log");
+            assert!(claim_enospc_slot(&table, enospc_key(&path)), "{}", path);
+        }
+        assert_eq!(occupied(&table), ENOSPC_SLOTS, "every slot taken");
+        assert!(
+            !claim_enospc_slot(&table, enospc_key("/tmp/one-too-many")),
+            "the table is full and the budget is gone"
+        );
+    }
+
+    /// Two scans of the table on every refused write, with the filesystem
+    /// locks held, so the whole table has to be one cache line.
+    #[test]
+    fn the_whole_table_is_one_cache_line() {
+        assert!(
+            ENOSPC_SLOTS * core::mem::size_of::<u64>() <= 64,
+            "{} slots do not fit in one cache line, so each scan is several misses",
+            ENOSPC_SLOTS
+        );
+    }
+
+    /// Two log files in the same directory are two files: a long shared
+    /// prefix is what real paths look like, and the slot is keyed by the
+    /// hash alone.
+    #[test]
+    fn two_files_in_the_same_directory_do_not_share_a_slot() {
+        let table = fresh_table();
+        let a = "/var/log/eclipse/session/attempt-a.log";
+        let b = "/var/log/eclipse/session/attempt-b.log";
+        assert_ne!(enospc_key(a), enospc_key(b), "same key for two files");
+        assert!(claim_enospc_slot(&table, enospc_key(a)));
+        assert!(
+            claim_enospc_slot(&table, enospc_key(b)),
+            "the second file is still worth naming"
+        );
+        assert_eq!(occupied(&table), 2);
     }
 }
