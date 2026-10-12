@@ -600,9 +600,12 @@ fn channels_without_the_rm_are_discovery_only_and_free_is_owner_scoped() {
         Err(nv::ENODEV),
         "no VA space was ever built"
     );
-    assert_eq!(channel_free(&gpu, 0, B), Err(nv::EINVAL), "not B's channel");
-    assert_eq!(channel_free(&gpu, 7, A), Err(nv::EINVAL));
+    // `nouveau_abi16_chan` finds nothing: ENOENT, as EXEC answers.
+    assert_eq!(channel_free(&gpu, 0, B), Err(nv::ENOENT), "not B's channel");
+    assert_eq!(channel_free(&gpu, 7, A), Err(nv::ENOENT), "never allocated");
+    assert_eq!(channel_free(&gpu, -1, A), Err(nv::ENOENT));
     assert_eq!(channel_free(&gpu, 0, A), Ok(0));
+    assert_eq!(channel_free(&gpu, 0, A), Err(nv::ENOENT), "already freed");
     assert_eq!(channels_of(&gpu, A), 1);
     assert_eq!(
         channel_alloc(&gpu, B).unwrap().channel,
