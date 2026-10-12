@@ -144,6 +144,32 @@ pub struct PacketGuestMem {
     pub _reserved: u64,
 }
 
+/// The host never compiles this variant, so the oracle for its layout is the
+/// compiler rather than a test: `cargo test` on an x86_64 host builds the
+/// x86_64 declaration above and nothing here. The numbers are
+/// `zx_packet_guest_mem_t` as the aarch64 header spells it.
+#[cfg(target_arch = "aarch64")]
+const _: () = {
+    assert!(
+        core::mem::size_of::<PacketGuestMem>() == 32,
+        "the payload is a union of 32-byte variants"
+    );
+    assert!(
+        core::mem::offset_of!(PacketGuestMem, addr) == 0,
+        "the faulting address first"
+    );
+    assert!(core::mem::offset_of!(PacketGuestMem, access_size) == 8);
+    assert!(core::mem::offset_of!(PacketGuestMem, sign_extend) == 9);
+    assert!(core::mem::offset_of!(PacketGuestMem, xt) == 10);
+    assert!(core::mem::offset_of!(PacketGuestMem, read) == 11);
+    assert!(core::mem::offset_of!(PacketGuestMem, _padding1) == 12);
+    assert!(
+        core::mem::offset_of!(PacketGuestMem, data) == 16,
+        "the data word is aligned, after four bytes of padding"
+    );
+    assert!(core::mem::offset_of!(PacketGuestMem, _reserved) == 24);
+};
+
 #[cfg(target_arch = "riscv64")]
 #[repr(C)]
 #[derive(Default, Debug, Copy, Clone, Eq, PartialEq)]
@@ -154,6 +180,24 @@ pub struct PacketGuestMem {
     pub _reserved1: u64,
     pub _reserved2: u64,
 }
+
+/// As above: nothing on the host compiles this one either. Only the address
+/// carries anything, and it is the same width as the three words that pad the
+/// variant out to the union's size, so a swap would hand userspace a zero.
+#[cfg(target_arch = "riscv64")]
+const _: () = {
+    assert!(
+        core::mem::size_of::<PacketGuestMem>() == 32,
+        "the payload is a union of 32-byte variants"
+    );
+    assert!(
+        core::mem::offset_of!(PacketGuestMem, addr) == 0,
+        "the faulting address first"
+    );
+    assert!(core::mem::offset_of!(PacketGuestMem, _reserved) == 8);
+    assert!(core::mem::offset_of!(PacketGuestMem, _reserved1) == 16);
+    assert!(core::mem::offset_of!(PacketGuestMem, _reserved2) == 24);
+};
 
 #[repr(C)]
 #[derive(Default, Debug, Copy, Clone, Eq, PartialEq)]
@@ -757,5 +801,88 @@ mod wire_tests {
             !startup(0x100, 0).eq(&startup(0x200, 0)),
             "two startup ids were compared as one"
         );
+    }
+}
+
+#[cfg(test)]
+mod payload_layout_tests {
+    use super::*;
+    use core::mem::{align_of, offset_of, size_of};
+
+    // `wire_tests::port_packet_size` checks that each payload variant is 32
+    // bytes, which is the union's size and part of the ABI -- but a size is
+    // not a layout. Two neighbouring fields of the same type trade places
+    // without moving a byte of the total, and every reader and writer goes
+    // through the field name, so the swap cancels out on both sides: four such
+    // swaps survive the whole suite. Zircon spells these structures in
+    // `zircon/system/public/zircon/syscalls/port.h`, and the numbers below are
+    // written out from it rather than computed from the declaration.
+
+    /// `trigger` is the signal set the waiter asked about and `observed` the
+    /// set that is actually asserted: a request and its answer, both a
+    /// `zx_signals_t`, side by side and the same width. Swapped, a waiter is
+    /// told that it asked about what happened and that what it asked about
+    /// happened -- which is true often enough to look right.
+    #[test]
+    fn zx_packet_signal_t_asks_in_the_first_word_and_answers_in_the_second() {
+        assert_eq!(size_of::<PacketSignal>(), 32);
+        assert_eq!(align_of::<PacketSignal>(), 8);
+        assert_eq!(offset_of!(PacketSignal, trigger), 0);
+        assert_eq!(offset_of!(PacketSignal, observed), 4);
+        assert_eq!(offset_of!(PacketSignal, count), 8);
+        assert_eq!(offset_of!(PacketSignal, timestamp), 16);
+        assert_eq!(offset_of!(PacketSignal, _reserved1), 24);
+        // The two signal sets are a word each and share the first eight
+        // bytes, so the count cannot begin before them.
+        assert!(offset_of!(PacketSignal, observed) < offset_of!(PacketSignal, count));
+    }
+
+    /// `zx_packet_guest_bell_t` is one address and twenty-four bytes of
+    /// nothing. The address is the same width as the reserved word that
+    /// follows it, so the one swap worth making puts the guest's bell address
+    /// in a word nobody reads and hands userspace a zero instead.
+    #[test]
+    fn zx_packet_guest_bell_t_is_an_address_and_then_three_reserved_words() {
+        assert_eq!(size_of::<PacketGuestBell>(), 32);
+        assert_eq!(align_of::<PacketGuestBell>(), 8);
+        assert_eq!(offset_of!(PacketGuestBell, addr), 0);
+        assert_eq!(offset_of!(PacketGuestBell, _reserved0), 8);
+        assert_eq!(offset_of!(PacketGuestBell, _reserved1), 16);
+        assert_eq!(offset_of!(PacketGuestBell, _reserved2), 24);
+    }
+
+    /// The x86_64 `zx_packet_guest_mem_t`: the address that trapped, the
+    /// length of the instruction, the instruction itself and its operand
+    /// size. No two neighbours here are the same type, so the swap has
+    /// nothing to take hold of; this is here so that all three
+    /// architectures' variants are pinned the same way. The aarch64 and
+    /// riscv64 ones are `const` assertions by their declarations instead,
+    /// because no host build compiles them.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn the_x86_64_guest_memory_packet_carries_the_instruction_that_trapped() {
+        assert_eq!(size_of::<PacketGuestMem>(), 32);
+        assert_eq!(offset_of!(PacketGuestMem, addr), 0);
+        assert_eq!(offset_of!(PacketGuestMem, inst_len), 8);
+        assert_eq!(offset_of!(PacketGuestMem, inst_buf), 9);
+        assert_eq!(offset_of!(PacketGuestMem, default_operand_size), 24);
+        assert_eq!(offset_of!(PacketGuestMem, _reserved), 25);
+    }
+
+    /// The two variants the swap cannot reach, written down so nobody
+    /// measures them again: every neighbouring same-typed pair in
+    /// `zx_packet_guest_io_t` and `zx_packet_interrupt_t` is one reserved
+    /// word next to another, and trading two reserved words of the same type
+    /// changes nothing observable. What they do have is a head of
+    /// differently-typed fields, and that is what is pinned here.
+    #[test]
+    fn the_io_and_interrupt_packets_begin_where_the_specification_says() {
+        assert_eq!(offset_of!(PacketGuestIo, port), 0);
+        assert_eq!(offset_of!(PacketGuestIo, access_size), 2);
+        assert_eq!(offset_of!(PacketGuestIo, input), 3);
+        assert_eq!(offset_of!(PacketGuestIo, data), 4);
+        assert_eq!(offset_of!(PacketGuestIo, _reserved0), 8);
+        assert_eq!(offset_of!(PacketInterrupt, timestamp), 0);
+        assert_eq!(offset_of!(PacketInterrupt, _reserved0), 8);
     }
 }
