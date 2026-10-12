@@ -1217,6 +1217,24 @@ struct LinuxProcessInner {
     limits: RLimits,
     /// Opened files
     files: HashMap<FileDesc, Arc<dyn FileLike>>,
+    /// The descriptors of this table whose open file description is an
+    /// `epoll`, so that a close can ask them to forget what it closed without
+    /// walking the table to find them.
+    ///
+    /// `epoll_forget_plan` runs on every `close(2)` and used to find the
+    /// epolls by cloning and downcasting EVERY entry -- an atomic increment
+    /// and a vtable check per open descriptor, on a path a program takes once
+    /// per file it reads. That is 114 microseconds for one close at eight
+    /// thousand open descriptors (`benches/process.rs`,
+    /// `close_and_reopen_of_8192`), and the great majority of processes have
+    /// no epoll at all to find.
+    ///
+    /// Kept in step by [`Self::note_fd_inserted`] and
+    /// [`Self::note_fd_freed`], the two places a descriptor appears in or
+    /// leaves `files`. The invariant is exact and not one-sided: these are
+    /// EXACTLY the descriptors whose file is an epoll, which
+    /// `process/fd_alloc_tests.rs` checks against the table itself.
+    epoll_fds: HashSet<FileDesc>,
     /// A LOWER BOUND on the lowest free descriptor, which is what
     /// [`Self::get_free_fd_from`] starts its search at instead of zero.
     ///
@@ -2072,6 +2090,7 @@ impl LinuxProcess {
             } else {
                 inner.cloexec_fds.remove(&fd);
             }
+            inner.note_fd_inserted(fd, &file);
             inner.files.insert(fd, file);
             // `dup2` onto an open descriptor closes it, and closing it tells
             // the epolls, like `close` does. Planned after the insert so the
@@ -2108,6 +2127,7 @@ impl LinuxProcess {
         } else {
             inner.cloexec_fds.remove(&fd);
         }
+        inner.note_fd_inserted(fd, &file);
         inner.files.insert(fd, file);
         Ok(fd)
     }
@@ -4026,17 +4046,35 @@ impl LinuxProcessInner {
     ///
     /// `closed` must already be out of `files`.
     fn epoll_forget_plan(&self, closed: Vec<(FileDesc, Arc<dyn FileLike>)>) -> EpollForgetPlan {
+        if self.epoll_fds.is_empty() {
+            // The common case, and the reason the set exists: nothing to tell,
+            // and nothing walked to find that out.
+            return EpollForgetPlan {
+                epolls: Vec::new(),
+                gone: Vec::new(),
+            };
+        }
         let epolls: Vec<Arc<crate::fs::Epoll>> = self
-            .files
-            .values()
+            .epoll_fds
+            .iter()
+            .filter_map(|fd| self.files.get(fd))
             .filter_map(|f| f.clone().downcast_arc::<crate::fs::Epoll>().ok())
             .collect();
         let gone = if epolls.is_empty() {
             Vec::new()
         } else {
+            // The surviving descriptors' descriptions, by pointer, built once
+            // rather than re-walked for each closed descriptor: a
+            // `close_range` of k descriptors over a table of n was k*n
+            // comparisons.
+            let held: HashSet<*const ()> = self
+                .files
+                .values()
+                .map(|f| Arc::as_ptr(f) as *const ())
+                .collect();
             closed
                 .into_iter()
-                .filter(|(_, file)| !self.files.values().any(|f| Arc::ptr_eq(f, file)))
+                .filter(|(_, file)| !held.contains(&(Arc::as_ptr(file) as *const ())))
                 .collect()
         };
         EpollForgetPlan { epolls, gone }
@@ -4270,8 +4308,10 @@ impl LinuxProcessInner {
             current_working_directory: self.current_working_directory.clone(),
             files: self.files.clone(),
             // The child's table is a copy of the parent's, so the parent's
-            // lower bound on its lowest free descriptor holds for it too.
+            // lower bound on its lowest free descriptor holds for it too --
+            // and the same descriptors hold the same epolls.
             next_fd: self.next_fd,
+            epoll_fds: self.epoll_fds.clone(),
             // POSIX fork(2): the child gets its own COPY of each fd's
             // FD_CLOEXEC flag — later fcntl(F_SETFD) in either process
             // must not affect the other.

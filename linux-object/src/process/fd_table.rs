@@ -92,6 +92,25 @@ impl LinuxProcessInner {
     /// at a time.
     pub(super) fn note_fd_freed(&mut self, fd: FileDesc) {
         self.next_fd = self.next_fd.min(usize::from(fd));
+        self.epoll_fds.remove(&fd);
+    }
+
+    /// Record that `file` is about to go into `files` under `fd`. The other
+    /// half of [`Self::note_fd_freed`]: it keeps
+    /// `LinuxProcessInner::epoll_fds` exactly the set of descriptors whose
+    /// file is an epoll.
+    ///
+    /// Call it BEFORE the insert, with the file that is going in. It has to
+    /// remove as well as add, because `dup2` installs a descriptor over one
+    /// that is already open: an epoll replaced by an ordinary file would
+    /// otherwise leave its number in the set, and every later close would
+    /// then build a plan for an epoll that is not there.
+    pub(super) fn note_fd_inserted(&mut self, fd: FileDesc, file: &Arc<dyn FileLike>) {
+        if file.clone().downcast_arc::<crate::fs::Epoll>().is_ok() {
+            self.epoll_fds.insert(fd);
+        } else {
+            self.epoll_fds.remove(&fd);
+        }
     }
 
     /// Empty the descriptor table, returning what was in it so the caller can
@@ -105,6 +124,7 @@ impl LinuxProcessInner {
     /// not allowed to be.
     pub(super) fn take_all_files(&mut self) -> HashMap<FileDesc, Arc<dyn FileLike>> {
         self.next_fd = 0;
+        self.epoll_fds.clear();
         core::mem::take(&mut self.files)
     }
 }

@@ -50,6 +50,11 @@ use rcore_fs_ramfs::RamFS;
 use std::sync::Arc;
 use test::Bencher;
 
+/// An epoll, as `epoll_create(2)` makes one.
+fn epoll() -> Arc<dyn linux_object::fs::FileLike> {
+    linux_object::fs::Epoll::new(OpenFlags::empty())
+}
+
 /// A process holding `n` open descriptors, numbered 0..n with no holes, which
 /// is what a real table looks like: Linux hands out the lowest free number, so
 /// a process that has opened `n` files and closed none has exactly this shape.
@@ -285,6 +290,40 @@ fn bench_close_and_reopen(b: &mut Bencher, n: usize) {
             .expect("the number just came free"),
         )
     });
+}
+
+/// The same pair with an epoll open in the table, which is the case the
+/// `epoll_fds` set cannot make free: the epolls are found without a walk now,
+/// but a close still has to work out whether the description it closed is
+/// held by any surviving descriptor. The pair with `close_and_reopen_of_*`
+/// says what having an epoll at all costs a process's closes.
+fn bench_close_and_reopen_watched(b: &mut Bencher, n: usize) {
+    let proc = with_open_files(n);
+    proc.add_file(epoll())
+        .expect("one more, inside the raised limit");
+    let inode = proc.root_inode().lookup("leaf").expect("created above");
+    let last = FileDesc::from(n.saturating_sub(1));
+    b.iter(|| {
+        proc.close_file(test::black_box(last)).expect("it is open");
+        test::black_box(
+            proc.add_file(File::new(
+                inode.clone(),
+                OpenFlags::RDONLY,
+                String::from("/leaf"),
+            ))
+            .expect("the number just came free"),
+        )
+    });
+}
+
+#[bench]
+fn close_and_reopen_watched_of_256(b: &mut Bencher) {
+    bench_close_and_reopen_watched(b, 256);
+}
+
+#[bench]
+fn close_and_reopen_watched_of_8192(b: &mut Bencher) {
+    bench_close_and_reopen_watched(b, 8192);
 }
 
 #[bench]

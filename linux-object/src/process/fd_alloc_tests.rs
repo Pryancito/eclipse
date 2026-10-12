@@ -440,3 +440,275 @@ fn a_range_that_runs_backwards_contains_nothing() {
         assert!(!proc.fd_cloexec(FileDesc::from(fd)).unwrap());
     }
 }
+
+/// Which descriptors hold an epoll, which is what a close consults instead of
+/// walking the table to find them.
+///
+/// This invariant is exact and not one-sided like `next_fd`'s: a descriptor
+/// missing from the set is an epoll a close would fail to tell, and a
+/// descriptor left in it is a plan built for an epoll that is not there. So
+/// every case below checks the set against the TABLE rather than against what
+/// the test expects, and `dup2` over a live epoll is in there because that is
+/// the one path that has to REMOVE a number the insert did not add.
+mod epoll_fds {
+    use super::*;
+    use crate::fs::Epoll;
+
+    /// The set, read off the table itself: the descriptors whose file really
+    /// is an epoll. Whatever the bookkeeping says, this is the answer.
+    fn epolls_in_the_table(proc: &LinuxProcess) -> Vec<usize> {
+        let inner = proc.inner.lock();
+        let mut fds: Vec<usize> = inner
+            .files
+            .iter()
+            .filter(|(_, f)| (*f).clone().downcast_arc::<Epoll>().is_ok())
+            .map(|(fd, _)| usize::from(*fd))
+            .collect();
+        fds.sort_unstable();
+        fds
+    }
+
+    /// And what the bookkeeping says.
+    fn bookkeeping(proc: &LinuxProcess) -> Vec<usize> {
+        let inner = proc.inner.lock();
+        let mut fds: Vec<usize> = inner.epoll_fds.iter().map(|fd| usize::from(*fd)).collect();
+        fds.sort_unstable();
+        fds
+    }
+
+    fn assert_in_step(proc: &LinuxProcess, step: &str) {
+        assert_eq!(
+            bookkeeping(proc),
+            epolls_in_the_table(proc),
+            "the epoll set and the table disagree after {}",
+            step
+        );
+    }
+
+    /// A process with no epoll has an empty set, which is the case that makes
+    /// a close cost nothing at all.
+    #[test]
+    fn a_process_with_no_epoll_has_nothing_in_the_set() {
+        let proc = a_process();
+        open_n(&proc, 5);
+        assert!(bookkeeping(&proc).is_empty());
+        assert_in_step(&proc, "five ordinary opens");
+    }
+
+    /// `epoll_create` puts its descriptor in, and a close takes it out again.
+    #[test]
+    fn an_epoll_goes_in_when_opened_and_out_when_closed() {
+        let proc = a_process();
+        open_n(&proc, 3);
+        let ep = proc.add_file(Epoll::new(OpenFlags::empty())).unwrap();
+        assert_eq!(bookkeeping(&proc), vec![usize::from(ep)]);
+        assert_in_step(&proc, "epoll_create");
+
+        proc.close_file(ep).expect("it is open");
+        assert!(bookkeeping(&proc).is_empty());
+        assert_in_step(&proc, "closing the epoll");
+    }
+
+    /// `dup2(other, epollfd)`: the epoll is gone from that number and an
+    /// ordinary file is there instead. Nothing was ADDED, so only a removal
+    /// keeps the books straight -- and if it does not, every later close
+    /// builds a plan for an epoll the table no longer holds.
+    #[test]
+    fn a_dup2_over_a_live_epoll_takes_it_out_of_the_set() {
+        let proc = a_process();
+        let ep = proc.add_file(Epoll::new(OpenFlags::empty())).unwrap();
+        assert_eq!(bookkeeping(&proc), vec![usize::from(ep)]);
+
+        proc.replace_file(ep, an_open_log(Log::new(), OpenFlags::RDWR), false)
+            .expect("dup2 onto an open descriptor");
+        assert!(
+            bookkeeping(&proc).is_empty(),
+            "the number still claims to hold an epoll"
+        );
+        assert_in_step(&proc, "dup2 of a file over the epoll");
+    }
+
+    /// And the other way round: `dup2(epollfd, other)` puts an epoll under a
+    /// number that held an ordinary file.
+    #[test]
+    fn a_dup2_of_an_epoll_over_a_file_puts_it_in_the_set() {
+        let proc = a_process();
+        let fds = open_n(&proc, 3);
+        proc.replace_file(fds[1], Epoll::new(OpenFlags::empty()), false)
+            .expect("dup2 onto an open descriptor");
+        assert_eq!(bookkeeping(&proc), vec![usize::from(fds[1])]);
+        assert_in_step(&proc, "dup2 of an epoll over a file");
+    }
+
+    /// Two epolls under three descriptors, two of them the SAME epoll through
+    /// `dup`: both numbers are in the set, and closing one leaves the other.
+    #[test]
+    fn a_dup_of_an_epoll_is_two_descriptors_in_the_set() {
+        let proc = a_process();
+        let ep = Epoll::new(OpenFlags::empty());
+        let a = proc.add_file(ep.clone()).unwrap();
+        let b = proc.add_file_cloexec(ep, false).unwrap();
+        assert_eq!(bookkeeping(&proc), vec![usize::from(a), usize::from(b)]);
+
+        proc.close_file(a).expect("it is open");
+        assert_eq!(bookkeeping(&proc), vec![usize::from(b)]);
+        assert_in_step(&proc, "closing one of two descriptors for one epoll");
+    }
+
+    /// The sweeps take their descriptors out too: `close_range` over a range
+    /// holding an epoll, and the execve sweep over an `O_CLOEXEC` one.
+    #[test]
+    fn the_sweeps_take_their_epolls_out_of_the_set() {
+        let proc = a_process();
+        open_n(&proc, 3);
+        let swept = proc.add_file(Epoll::new(OpenFlags::empty())).unwrap();
+        let on_exec = proc
+            .add_file_cloexec(Epoll::new(OpenFlags::empty()), true)
+            .unwrap();
+        assert_eq!(bookkeeping(&proc).len(), 2);
+
+        proc.close_range(swept, swept);
+        assert_eq!(bookkeeping(&proc), vec![usize::from(on_exec)]);
+        assert_in_step(&proc, "close_range over an epoll");
+
+        proc.remove_cloexec_files();
+        assert!(bookkeeping(&proc).is_empty());
+        assert_in_step(&proc, "the execve sweep over an O_CLOEXEC epoll");
+    }
+
+    /// Emptying the table at death clears the set with it, the same way it
+    /// resets the allocator's bound.
+    #[test]
+    fn emptying_the_table_clears_the_set() {
+        let proc = a_process();
+        proc.add_file(Epoll::new(OpenFlags::empty())).unwrap();
+        let mut inner = proc.inner.lock();
+        inner.take_all_files();
+        assert!(inner.epoll_fds.is_empty());
+    }
+
+    /// `fork` copies the table, so the child's epoll descriptors are the
+    /// parent's. A child whose set came up empty would never tell its
+    /// inherited epoll about a close.
+    #[test]
+    fn a_forked_child_inherits_which_descriptors_are_epolls() {
+        let parent = a_process();
+        open_n(&parent, 2);
+        let ep = parent.add_file(Epoll::new(OpenFlags::empty())).unwrap();
+
+        let inner = parent.inner.lock();
+        let child = inner.forked_child(0, 0, 0);
+        assert_eq!(
+            child
+                .epoll_fds
+                .iter()
+                .map(|fd| usize::from(*fd))
+                .collect::<Vec<_>>(),
+            vec![usize::from(ep)]
+        );
+    }
+}
+
+/// The CABLING between a close and the epolls watching what it closed, which
+/// is what `epoll_forget_plan` is for.
+///
+/// `Epoll::forget_closed` has its own tests in `fs::epoll`; what had none is
+/// the wiring -- that a `close(2)` on this process reaches the epoll at all,
+/// and that it reaches it only when the description really is gone. The test
+/// reads the effect through `forget_closed`'s own count: it answers how many
+/// entries it dropped, so **zero** means the close already did it and **one**
+/// means the close did not.
+mod a_close_tells_the_epolls {
+    use super::*;
+    use crate::fs::{Epoll, EventFd};
+
+    const EPOLL_CTL_ADD: i32 = 1;
+
+    fn watch(ep: &Arc<Epoll>, fd: FileDesc, file: Arc<dyn FileLike>) {
+        ep.ctl(
+            EPOLL_CTL_ADD,
+            fd,
+            crate::fs::EpollEvent { events: 1, data: 0 },
+            Some(file),
+        )
+        .expect("an eventfd can be watched");
+    }
+
+    /// The plain case: one epoll, one watched descriptor, closed.
+    #[test]
+    fn closing_a_watched_descriptor_drops_its_entry() {
+        let proc = a_process();
+        let ep = Epoll::new(OpenFlags::empty());
+        proc.add_file(ep.clone()).unwrap();
+        let watched: Arc<dyn FileLike> = EventFd::new(0, OpenFlags::empty());
+        let fd = proc.add_file(watched.clone()).unwrap();
+        watch(&ep, fd, watched.clone());
+
+        proc.close_file(fd).expect("it is open");
+        assert_eq!(
+            ep.forget_closed(&watched),
+            0,
+            "the close did not tell the epoll"
+        );
+    }
+
+    /// `close_range` over the watched descriptor does it too.
+    #[test]
+    fn a_swept_range_tells_the_epolls_about_what_it_closed() {
+        let proc = a_process();
+        let ep = Epoll::new(OpenFlags::empty());
+        proc.add_file(ep.clone()).unwrap();
+        let watched: Arc<dyn FileLike> = EventFd::new(0, OpenFlags::empty());
+        let fd = proc.add_file(watched.clone()).unwrap();
+        watch(&ep, fd, watched.clone());
+
+        proc.close_range(fd, fd);
+        assert_eq!(ep.forget_closed(&watched), 0);
+    }
+
+    /// And the rule that makes the whole plan more than "drop it on close":
+    /// a `dup` of the watched descriptor still holds the description, so
+    /// closing one of the two must NOT drop the entry. epoll(7) says the
+    /// program has to `EPOLL_CTL_DEL` in that case, and Linux drops the entry
+    /// from `__fput`, when the last reference goes.
+    #[test]
+    fn closing_one_of_two_descriptors_for_a_watched_file_keeps_the_entry() {
+        let proc = a_process();
+        let ep = Epoll::new(OpenFlags::empty());
+        proc.add_file(ep.clone()).unwrap();
+        let watched: Arc<dyn FileLike> = EventFd::new(0, OpenFlags::empty());
+        let first = proc.add_file(watched.clone()).unwrap();
+        let second = proc.add_file_cloexec(watched.clone(), false).unwrap();
+        watch(&ep, first, watched.clone());
+
+        proc.close_file(first).expect("it is open");
+        assert_eq!(
+            ep.forget_closed(&watched),
+            1,
+            "the dup at {} still holds the description, so the entry stays",
+            usize::from(second)
+        );
+    }
+
+    /// A process with no epoll in its table: nothing to tell, and the close
+    /// must not pretend otherwise. This is the path the `epoll_fds` set made
+    /// free, so it is also the one that would silently stop working if the
+    /// set were ever wrong in the other direction.
+    #[test]
+    fn a_close_with_no_epoll_in_the_table_tells_nobody() {
+        let proc = a_process();
+        // The epoll exists but belongs to no descriptor of this table, which
+        // is as far as this process's close is concerned the same as nothing.
+        let ep = Epoll::new(OpenFlags::empty());
+        let watched: Arc<dyn FileLike> = EventFd::new(0, OpenFlags::empty());
+        let fd = proc.add_file(watched.clone()).unwrap();
+        watch(&ep, fd, watched.clone());
+
+        proc.close_file(fd).expect("it is open");
+        assert_eq!(
+            ep.forget_closed(&watched),
+            1,
+            "a close told an epoll no descriptor of this table holds"
+        );
+    }
+}
