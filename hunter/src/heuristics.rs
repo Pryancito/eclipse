@@ -1531,3 +1531,143 @@ mod syscall_path_tests {
         done(pid);
     }
 }
+
+#[cfg(test)]
+mod benches {
+    //! The detector's half of the per-syscall gate.
+    //!
+    //! [`on_syscall`] runs on every syscall whatever the stance, because its
+    //! switch is not the policy domain's: with the rate heuristics off it
+    //! still calls [`classify`] first, and only then decides it has nothing
+    //! to do. So `classify` is the one piece of hunter that no configuration
+    //! can turn off, and these rows are mostly about it.
+    //!
+    //! ## The chain's length is not where the time is
+    //!
+    //! `classify` is documented as "constant-time classification against a
+    //! per-architecture table". It is not a table: it is a chain of up to
+    //! **twenty** `is(num, nr::X)` compares, and it returns `None` only after
+    //! all twenty have failed -- so the input that walks the whole thing is
+    //! an **ordinary** syscall, which is every `read`, `write`, `ioctl`,
+    //! `futex` and `epoll_pwait` the machine makes, while a sensitive one
+    //! leaves early. That reads like a bug waiting to be fixed, and it was
+    //! tried: a `const` bitmap of the nineteen numbers the chain can match,
+    //! one bounds check and one bit test in front of it, proven
+    //! answer-for-answer identical over the whole numeric range.
+    //!
+    //! **It bought nothing.** `classify` for an ordinary syscall stayed at
+    //! 2.7 ns, `on_syscall`'s early-out at 3.1, and
+    //! [`crate::benches::the_gate_in_the_default_stance`] at 5.95 -- every
+    //! figure inside its own noise. The bit test on its own measures 0.98 ns,
+    //! so the prefilter did run and did skip the compares; what it could not
+    //! skip is the rest of the call, and the rest of the call is what the
+    //! 2.7 ns is. The rows below are left arranged so that is visible:
+    //! `is_fork` is three compares returning a `bool` and sits at the
+    //! `b.iter` floor, `is_privileged` is ten and reaches 2.3, and `classify`
+    //! is twenty and reaches 2.7 -- a 2.3x spread over a 7x difference in
+    //! compares, around a floor that is most of all three figures.
+    //!
+    //! So the chain stays, ninety lines of new surface in security-critical
+    //! classification are not spent on a figure that does not move, and the
+    //! fixed cost of a syscall has to be looked for somewhere else. It is in
+    //! `kernel-hal`: see the clock rows in
+    //! [`kernel_hal::common::tsc_cal`](../../kernel_hal/common/tsc_cal/index.html).
+    //!
+    //! The rows that need the rate heuristics on take the `test_globals`
+    //! lock, like the unit tests, because the switch is global.
+
+    use super::*;
+    use test::{black_box, Bencher};
+
+    /// `read` on x86_64, and nothing hunter classifies: the input that walks
+    /// the whole chain.
+    const ORDINARY: u32 = 0;
+
+    /// **The row.** `classify` for an ordinary syscall -- every syscall a
+    /// desktop makes. No stance can skip it.
+    #[bench]
+    fn classify_an_ordinary_syscall(b: &mut Bencher) {
+        b.iter(|| black_box(classify(black_box(ORDINARY))));
+    }
+
+    /// The first arm of the chain: `init_module`. Two compares, and nothing
+    /// on a desktop ever makes this call -- the cheap end of the chain is the
+    /// end nothing uses.
+    #[bench]
+    fn classify_the_first_arm(b: &mut Bencher) {
+        b.iter(|| black_box(classify(black_box(nr::INIT_MODULE))));
+    }
+
+    /// `reboot`: the last arm before `None`, so a hit here costs what a miss
+    /// costs. With the row above it brackets the chain, and the
+    /// ordinary-syscall row has to sit at this end of it.
+    #[bench]
+    fn classify_the_last_arm(b: &mut Bencher) {
+        b.iter(|| black_box(classify(black_box(nr::REBOOT))));
+    }
+
+    /// `ptrace`, a few arms in: the one sensitive syscall a debugger or a
+    /// sandbox actually makes in a loop.
+    #[bench]
+    fn classify_ptrace(b: &mut Bencher) {
+        b.iter(|| black_box(classify(black_box(nr::PTRACE))));
+    }
+
+    /// Three compares returning a `bool`, asked only when the rate
+    /// heuristics are on. The short end of the compares-against-floor ladder
+    /// this module's documentation reads off.
+    #[bench]
+    fn is_fork_for_an_ordinary_syscall(b: &mut Bencher) {
+        b.iter(|| black_box(is_fork(black_box(ORDINARY))));
+    }
+
+    /// Ten compares returning a `bool`, asked only for a syscall `classify`
+    /// already matched. The middle of that ladder.
+    #[bench]
+    fn is_privileged_for_a_classified_syscall(b: &mut Bencher) {
+        b.iter(|| black_box(is_privileged(black_box(nr::PTRACE))));
+    }
+
+    /// `on_syscall`'s early-out: the shipped stance. `classify` plus one
+    /// relaxed load plus a branch, and nothing shared is touched.
+    #[bench]
+    fn on_syscall_early_out(b: &mut Bencher) {
+        let _g = crate::test_globals::lock();
+        set_anomaly_detection(false);
+        b.iter(|| black_box(on_syscall(black_box(1), black_box(ORDINARY))));
+    }
+
+    /// `HUNTERANOMALY=1`: the same call, now paying a clock read plus the
+    /// pid's shard mutex, the eviction check and a `BTreeMap` entry lookup
+    /// with the window rolled -- per syscall, per process, serialising every
+    /// thread of a process at syscall entry. The module doc above calls this
+    /// "a measurable tax"; this row is the measurement, and it is why the
+    /// switch is off by default.
+    #[bench]
+    fn on_syscall_with_the_rate_heuristics_on(b: &mut Bencher) {
+        let _g = crate::test_globals::lock();
+        crate::policy::reset_for_test();
+        set_anomaly_detection(true);
+        // Seat the pid in the map first, so the row measures the steady state
+        // and not one insertion amortised over a million iterations.
+        on_syscall(4_242, ORDINARY);
+        b.iter(|| black_box(on_syscall(black_box(4_242), black_box(ORDINARY))));
+        set_anomaly_detection(false);
+        stats_shard(4_242).lock().remove(&4_242);
+    }
+
+    /// The floor these rows sit on: `b.iter` black-boxing a `u32` and handing
+    /// it back.
+    ///
+    /// Not a control for any one row, and that is deliberate. The first
+    /// version of this section used an `#[inline(never)]` function of
+    /// `classify`'s signature, and it read **6.69 ns against `classify`'s
+    /// 2.94** -- the empty row dearer than the row it was controlling for,
+    /// which means it was the wrong shape: it paid an out-of-line call that
+    /// the subject does not. A control that costs more than its subject
+    /// establishes nothing, so what is left is the floor itself.
+    #[bench]
+    fn the_iter_floor(b: &mut Bencher) {
+        b.iter(|| black_box(black_box(ORDINARY)));
+    }
+}

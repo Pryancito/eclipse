@@ -50,4 +50,18 @@ cargo test -p zcore-loader --lib --no-default-features --features linux,libos
 # Host-safe cmdline parsers (zcore binary stays test=false).
 cargo test -p zcore-boot-opts --lib
 
+# The `#[bench]` rows. COMPILED, not run: a row takes tens of seconds and its
+# figure is meaningless on a shared machine, but a bench target that nothing
+# builds rots, and these rows live in `#[cfg(test)]` modules beside private
+# code rather than in a `benches/` target, so nothing else reaches them. These
+# are the same lines the `unit-test` job runs; `--no-run` costs seconds.
+cargo bench -p linux-object --bench vfs --features mock-disk --no-run
+cargo bench -p linux-object --bench signal --features mock-disk --no-run
+cargo bench -p zircon-object --bench vm --features libos,aspace-separate --no-run
+cargo bench -p zircon-object --bench futex --features libos,aspace-separate --no-run
+cargo bench -p linux-syscall --no-run
+cargo bench -p kernel-hal --no-run
+cargo bench -p zcore-drivers --features graphic,virtio,xhci-usb-hid --no-run
+cargo bench -p hunter --lib --no-run
+
 echo "run-unit-tests.sh: all host unit suites passed."

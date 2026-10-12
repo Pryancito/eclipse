@@ -506,3 +506,103 @@ mod tests {
         assert_eq!(window_duration(1, 0), Duration::from_nanos(1_000_000_000));
     }
 }
+
+#[cfg(test)]
+mod benches {
+    //! What reading the clock costs, because the syscall dispatch reads it
+    //! **twice per syscall**.
+    //!
+    //! `linux-syscall`'s dispatch brackets every handler with
+    //! `kernel_hal::timer::timer_now()` so `/proc/perf` can report per-syscall
+    //! latency. On x86_64 that is `rdtsc` plus [`mono_ns`] plus two relaxed
+    //! loads, and nothing had ever put a number on it -- which matters
+    //! because it is paid by every syscall whether anyone ever reads
+    //! `/proc/perf` or not, and it is paid twice.
+    //!
+    //! The rows split the two halves, because only one of them is ours:
+    //! `mono_ns` is arithmetic this tree chose, and `rdtsc` is the machine's.
+    //! A row for the pair says what the dispatch pays; the `mono_ns` row
+    //! alone says how much of that is worth looking at.
+    //!
+    //! These numbers are from the host CPU, not from a kernel build, and
+    //! `rdtsc` is the same instruction either way -- but a `libos` test
+    //! binary runs it in a VM under a hypervisor that may or may not be
+    //! trapping it, so read the pair as an upper bound on the arithmetic's
+    //! share and not as the kernel's absolute figure.
+
+    use super::*;
+    use test::{black_box, Bencher};
+
+    /// A 3.7 GHz machine's multiplier, the shape `tsc_ns_mult_init` produces.
+    fn mult() -> u64 {
+        ns_mult(3_700_000_000)
+    }
+
+    /// The scaling itself: a `u128` multiply and a shift, saturating on the
+    /// base. This is the whole of what this tree added to a clock read.
+    #[bench]
+    fn mono_ns_of_a_running_counter(b: &mut Bencher) {
+        let (base, mult) = (black_box(1_000_000_000u64), mult());
+        b.iter(|| {
+            black_box(mono_ns(
+                black_box(4_000_000_000),
+                black_box(base),
+                black_box(mult),
+            ))
+        });
+    }
+
+    /// A reading below the base, which is the saturating branch: a sibling
+    /// CPU slightly behind the floor takes it, so it is not a cold path on an
+    /// SMP machine.
+    #[bench]
+    fn mono_ns_of_a_counter_behind_the_base(b: &mut Bencher) {
+        let (base, mult) = (black_box(4_000_000_000u64), mult());
+        b.iter(|| {
+            black_box(mono_ns(
+                black_box(1_000_000_000),
+                black_box(base),
+                black_box(mult),
+            ))
+        });
+    }
+
+    /// `rdtsc` and the scaling together: one dispatch-side clock read, which
+    /// the dispatch does twice. The atomic loads `timer_now` wraps this in
+    /// are not here, so this is the floor of that pair, not its cost.
+    #[cfg(target_arch = "x86_64")]
+    #[bench]
+    fn rdtsc_and_scale_one_clock_read(b: &mut Bencher) {
+        let (base, mult) = (black_box(0u64), mult());
+        b.iter(|| {
+            let cycle = unsafe { core::arch::x86_64::_rdtsc() };
+            black_box(mono_ns(black_box(cycle), black_box(base), black_box(mult)))
+        });
+    }
+
+    /// The counter read on its own, so the row above can be split: whatever
+    /// this costs is the machine's and no change here can take it away.
+    #[cfg(target_arch = "x86_64")]
+    #[bench]
+    fn rdtsc_alone(b: &mut Bencher) {
+        b.iter(|| black_box(unsafe { core::arch::x86_64::_rdtsc() }));
+    }
+
+    /// A control of `mono_ns`'s shape: three `u64`s in, one out, no
+    /// arithmetic. Without it the `mono_ns` rows would be read against zero,
+    /// and the `b.iter` loop is not zero.
+    #[bench]
+    fn mono_ns_shaped_control(b: &mut Bencher) {
+        #[inline(never)]
+        fn computes_nothing(cycle: u64, _base: u64, _mult: u64) -> u64 {
+            cycle
+        }
+        b.iter(|| {
+            black_box(computes_nothing(
+                black_box(4_000_000_000),
+                black_box(1_000_000_000),
+                black_box(1),
+            ))
+        });
+    }
+}
