@@ -42,6 +42,11 @@ cargo test -p rcore-fs-devfs --lib
 cargo test -p rcore-fs --lib
 cargo test -p virtio-drivers --lib -- --test-threads=1
 cargo test -p region-alloc --lib -- --test-threads=1
+# The loader, the code around user mode. Its default features pull in
+# `zircon`, whose `include_bytes!` of the prebuilt userboot blobs is not in
+# a plain checkout, so the test target is built for the Linux personality
+# alone -- the same line CI runs.
+cargo test -p zcore-loader --lib --no-default-features --features linux,libos
 # Host-safe cmdline parsers (zcore binary stays test=false).
 cargo test -p zcore-boot-opts --lib
 
