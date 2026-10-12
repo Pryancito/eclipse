@@ -28,18 +28,72 @@ use lock::Mutex;
 
 use crate::event_log::{record, Severity};
 
-/// Mirror of `GLOBAL_POLICIES.len()`, maintained by every mutator while it
-/// still holds the map lock. Lets the per-syscall check skip the globally
-/// contended lock entirely in the default system state (no whitelists
-/// registered), which is semantically identical to a map miss.
-static POLICY_COUNT: AtomicUsize = AtomicUsize::new(0);
+/// How many shards the whitelist registry is cut into.
+///
+/// Sixty-four: the per-syscall check reads one shard's counter, so what this
+/// number buys is the share of processes that keep the lock-free path once
+/// *something* on the machine is sandboxed. A single map had none -- the
+/// first whitelist registered anywhere put every syscall of every process
+/// through one IRQ-off spin lock, which is the cliff this removes. The cost
+/// is 64 counters and 64 empty `BTreeMap`s, a few hundred bytes.
+const POLICY_SHARDS: usize = 64;
+
+/// How many of the mixed pid's top bits name the shard. Derived, not written:
+/// a hand-written shift and a changed [`POLICY_SHARDS`] would disagree
+/// silently, and the disagreement reads as a *smaller* array in use -- no
+/// wrong answers, just shards nothing ever reaches.
+const POLICY_SHARD_BITS: u32 = POLICY_SHARDS.trailing_zeros();
+
+/// The derivation above only holds for a power of two, so it is checked where
+/// a mistake cannot ship: at compile time.
+const _: () = assert!(POLICY_SHARDS.is_power_of_two());
+
+/// Which shard a pid's whitelist lives in.
+///
+/// Mixed rather than masked, for the same reason `syscall_stats::trace_slot`
+/// mixes: Zircon KoIDs come off one counter that hands numbers to **every**
+/// kernel object, not just processes, so a run of live pids shares low bits
+/// more than it looks. One `imul` and the question is gone.
+///
+/// No `%`: taking the top [`POLICY_SHARD_BITS`] bits of a 64-bit value can
+/// only land inside the array, and the assert above is what makes that true.
+#[inline]
+fn policy_shard(pid: u64) -> usize {
+    const MIX: u64 = 0x9e37_79b9_7f4a_7c15;
+    (pid.wrapping_mul(MIX) >> (64 - POLICY_SHARD_BITS)) as usize
+}
+
+/// The two shard indices of a cross-shard operation, smallest first.
+///
+/// Its own function because the whole of the no-deadlock argument is that
+/// every path that holds two shard locks takes them in **this** order, and a
+/// reversed pair is not a wrong answer -- it is two CPUs each holding what
+/// the other waits for, with interrupts off. A test can assert this is
+/// sorted; no test can assert the absence of a deadlock without risking a
+/// hung job that names nothing.
+#[inline]
+fn shard_lock_order(a: usize, b: usize) -> (usize, usize) {
+    if a < b {
+        (a, b)
+    } else {
+        (b, a)
+    }
+}
+
+/// Mirror of each shard's `len()`, maintained by every mutator while it still
+/// holds that shard's lock. Lets the per-syscall check skip the lock entirely
+/// for any pid whose shard holds no whitelist, which is semantically
+/// identical to a map miss.
+static POLICY_COUNTS: [AtomicUsize; POLICY_SHARDS] = [const { AtomicUsize::new(0) }; POLICY_SHARDS];
+
+/// Registry of process-specific syscall whitelists, by [`policy_shard`].
+/// Whitelists are stored sorted so the per-syscall check is a binary search.
+/// Mutators must refresh that shard's [`POLICY_COUNTS`] entry before
+/// releasing its lock.
+static POLICIES: [Mutex<BTreeMap<u64, Vec<u32>>>; POLICY_SHARDS] =
+    [const { Mutex::new(BTreeMap::new()) }; POLICY_SHARDS];
 
 lazy_static::lazy_static! {
-    /// Registry of process-specific syscall whitelists. Whitelists are stored
-    /// sorted so the per-syscall check is a binary search. Mutators must
-    /// refresh `POLICY_COUNT` before releasing the lock.
-    pub static ref GLOBAL_POLICIES: Mutex<BTreeMap<u64, Vec<u32>>> = Mutex::new(BTreeMap::new());
-
     /// Path prefixes a binary must never be executed from (untrusted, writable
     /// world locations). Configurable at runtime.
     pub static ref UNTRUSTED_EXEC_PREFIXES: Mutex<Vec<String>> =
@@ -295,9 +349,11 @@ pub(crate) fn reset_for_test() {
     BLACKLISTED_EXEC_PREFIXES.lock().clear();
     *UNTRUSTED_EXEC_PREFIXES.lock() = default_untrusted_prefixes();
     *DEFAULT_WHITELIST.lock() = None;
-    let mut map = GLOBAL_POLICIES.lock();
-    map.clear();
-    POLICY_COUNT.store(map.len(), Ordering::Release);
+    for shard in 0..POLICY_SHARDS {
+        let mut map = POLICIES[shard].lock();
+        map.clear();
+        POLICY_COUNTS[shard].store(map.len(), Ordering::Release);
+    }
 }
 
 // ---- Back-compat shims for the original boolean enforcement switch --------
@@ -316,21 +372,29 @@ pub fn get_enforcement_mode() -> bool {
 /// Registers a whitelist of allowed syscall numbers for a process.
 pub fn register_policy(pid: u64, mut allowed_syscalls: Vec<u32>) {
     allowed_syscalls.sort_unstable();
-    let mut map = GLOBAL_POLICIES.lock();
+    let shard = policy_shard(pid);
+    let mut map = POLICIES[shard].lock();
     map.insert(pid, allowed_syscalls);
-    POLICY_COUNT.store(map.len(), Ordering::Release);
+    POLICY_COUNTS[shard].store(map.len(), Ordering::Release);
 }
 
 /// Removes the security policy for a process (e.g. when it exits).
 pub fn remove_policy(pid: u64) {
-    let mut map = GLOBAL_POLICIES.lock();
+    let shard = policy_shard(pid);
+    let mut map = POLICIES[shard].lock();
     map.remove(&pid);
-    POLICY_COUNT.store(map.len(), Ordering::Release);
+    POLICY_COUNTS[shard].store(map.len(), Ordering::Release);
 }
 
 /// Number of processes that currently have a syscall whitelist registered.
 pub fn active_policy_count() -> usize {
-    GLOBAL_POLICIES.lock().len()
+    // The shard counters, not the maps: this is a reporting path (`/proc`,
+    // tests), and summing 64 relaxed loads beats taking 64 IRQ-off locks
+    // while the machine is making syscalls through them.
+    POLICY_COUNTS
+        .iter()
+        .map(|c| c.load(Ordering::Acquire))
+        .sum()
 }
 
 /// Sets (or clears) the default whitelist applied to freshly-exec'd images.
@@ -350,19 +414,42 @@ pub fn apply_default_policy(pid: u64) {
     if let Some(list) = DEFAULT_WHITELIST.lock().as_ref() {
         let mut sorted = list.clone();
         sorted.sort_unstable();
-        let mut map = GLOBAL_POLICIES.lock();
+        let shard = policy_shard(pid);
+        let mut map = POLICIES[shard].lock();
         map.insert(pid, sorted);
-        POLICY_COUNT.store(map.len(), Ordering::Release);
+        POLICY_COUNTS[shard].store(map.len(), Ordering::Release);
     }
 }
 
 /// Inherits the parent's whitelist into a forked child so a process cannot
 /// shed its policy merely by forking (P4).
 pub fn inherit_policy(parent_pid: u64, child_pid: u64) {
-    let mut map = GLOBAL_POLICIES.lock();
-    if let Some(list) = map.get(&parent_pid).cloned() {
-        map.insert(child_pid, list);
-        POLICY_COUNT.store(map.len(), Ordering::Release);
+    let (ps, cs) = (policy_shard(parent_pid), policy_shard(child_pid));
+    if ps == cs {
+        let mut map = POLICIES[ps].lock();
+        if let Some(list) = map.get(&parent_pid).cloned() {
+            map.insert(child_pid, list);
+            POLICY_COUNTS[cs].store(map.len(), Ordering::Release);
+        }
+        return;
+    }
+    // Two shards, so both are held: a fork must not be able to see the
+    // parent's whitelist and then install nothing because it was removed in
+    // between. **Always in index order** -- two inherits in opposite
+    // directions would otherwise each hold what the other is waiting for,
+    // and these are IRQ-off locks, so that deadlock takes the CPUs with it.
+    let (lo, hi) = shard_lock_order(ps, cs);
+    let mut g_lo = POLICIES[lo].lock();
+    let mut g_hi = POLICIES[hi].lock();
+    let list = if ps == lo {
+        g_lo.get(&parent_pid).cloned()
+    } else {
+        g_hi.get(&parent_pid).cloned()
+    };
+    if let Some(list) = list {
+        let child = if cs == lo { &mut *g_lo } else { &mut *g_hi };
+        child.insert(child_pid, list);
+        POLICY_COUNTS[cs].store(child.len(), Ordering::Release);
     }
 }
 
@@ -375,15 +462,16 @@ pub fn is_syscall_allowed(pid: u64, syscall_num: u32) -> Result<(), bool> {
     if mode == Mode::Off {
         return Ok(());
     }
-    // Lock-free fast path for the default system state: no whitelist is
-    // registered for ANY process, so every pid resolves to the permissive
-    // map-miss arm below. Skips a globally-contended, IRQ-off lock that would
-    // otherwise serialize every CPU on every syscall. A racing first
-    // registration is indistinguishable from this call having run before it.
-    if POLICY_COUNT.load(Ordering::Acquire) == 0 {
+    // Lock-free fast path: this pid's shard holds no whitelist, so the pid
+    // resolves to the permissive map-miss arm below whatever the rest of the
+    // machine is doing. Skips an IRQ-off lock that would otherwise serialize
+    // every CPU making this syscall. A racing first registration is
+    // indistinguishable from this call having run before it.
+    let shard = policy_shard(pid);
+    if POLICY_COUNTS[shard].load(Ordering::Acquire) == 0 {
         return Ok(());
     }
-    let policies = GLOBAL_POLICIES.lock();
+    let policies = POLICIES[shard].lock();
     match policies.get(&pid) {
         // Whitelists are kept sorted by the registration paths.
         Some(allowed) if allowed.binary_search(&syscall_num).is_ok() => Ok(()),
@@ -1084,17 +1172,25 @@ mod syscall_whitelist_tests {
         g
     }
 
-    /// The mirror counter is what lets the per-syscall check skip a globally
-    /// contended, IRQ-off lock, and it is only sound while it equals the map
-    /// it mirrors: stuck above the truth it costs a lock, stuck below it skips
-    /// the whitelist of every process on the machine. Every mutator has to
-    /// refresh it before releasing the lock, so check it after each one.
+    /// The mirror counters are what let the per-syscall check skip an
+    /// IRQ-off lock, and each is only sound while it equals the shard it
+    /// mirrors: stuck above the truth it costs a lock, stuck below it skips
+    /// the whitelist of every process in that shard. Every mutator has to
+    /// refresh its shard's counter before releasing that shard's lock, so
+    /// check them all after each one.
+    ///
+    /// Checked **per shard**, not as a total: a mutator that refreshed the
+    /// wrong shard's counter would leave the sum right and both shards
+    /// wrong, which is the one mistake sharding adds.
     fn mirror_is_exact() {
-        assert_eq!(
-            POLICY_COUNT.load(Ordering::Acquire),
-            GLOBAL_POLICIES.lock().len(),
-            "POLICY_COUNT stopped mirroring GLOBAL_POLICIES"
-        );
+        for shard in 0..POLICY_SHARDS {
+            assert_eq!(
+                POLICY_COUNTS[shard].load(Ordering::Acquire),
+                POLICIES[shard].lock().len(),
+                "shard {} stopped mirroring its map",
+                shard
+            );
+        }
     }
 
     #[test]
@@ -1176,6 +1272,220 @@ mod syscall_whitelist_tests {
         register_policy(83, alloc::vec![1]);
         assert!(is_syscall_allowed(84, 999).is_ok());
         assert_eq!(is_syscall_allowed(83, 999), Err(true));
+    }
+
+    /// Two pids that land in the **same** shard, and two that land in
+    /// different ones. The sharding is what these tests are about, so they
+    /// pick their pids by asking [`policy_shard`] rather than hoping.
+    fn two_pids_sharing_a_shard(from: u64) -> (u64, u64) {
+        let first = from;
+        let want = policy_shard(first);
+        for pid in from + 1..from + (POLICY_SHARDS as u64 * 64) {
+            if policy_shard(pid) == want {
+                return (first, pid);
+            }
+        }
+        panic!(
+            "no second pid in {} shares shard {} with {}",
+            POLICY_SHARDS * 64,
+            want,
+            first
+        );
+    }
+
+    fn two_pids_in_different_shards(from: u64) -> (u64, u64) {
+        let first = from;
+        let want = policy_shard(first);
+        for pid in from + 1..from + (POLICY_SHARDS as u64 * 64) {
+            if policy_shard(pid) != want {
+                return (first, pid);
+            }
+        }
+        panic!(
+            "every pid in a run of {} shares one shard",
+            POLICY_SHARDS * 64
+        );
+    }
+
+    /// The point of the whole shard array: a sandboxed process must not cost
+    /// the rest of the machine its lock-free path. Before sharding, the first
+    /// whitelist registered anywhere put **every** syscall of **every**
+    /// process through one IRQ-off spin lock.
+    #[test]
+    fn a_whitelist_for_one_process_leaves_the_other_shards_lock_free() {
+        let _g = start();
+        let (sandboxed, other) = two_pids_in_different_shards(90_000);
+        register_policy(sandboxed, alloc::vec![1]);
+
+        assert_eq!(
+            POLICY_COUNTS[policy_shard(other)].load(Ordering::Acquire),
+            0,
+            "a whitelist in another shard took the lock-free path away from \
+             pid {}",
+            other
+        );
+        assert_ne!(
+            POLICY_COUNTS[policy_shard(sandboxed)].load(Ordering::Acquire),
+            0,
+            "the sandboxed pid's own shard has to take the lock"
+        );
+        // And the answers are unchanged either way.
+        assert!(is_syscall_allowed(other, 999).is_ok());
+        assert_eq!(is_syscall_allowed(sandboxed, 999), Err(true));
+    }
+
+    /// A pid must be looked up in the shard it was written to. Writing and
+    /// reading through different shard functions would read as "no policy"
+    /// -- permissive, so a sandbox that silently does nothing.
+    #[test]
+    fn a_whitelist_is_found_in_the_shard_it_was_written_to() {
+        let _g = start();
+        // Pids all over the range, so no single shard can carry the test.
+        for pid in [1u64, 2, 255, 4096, 1 << 32, (1 << 32) + 7, u64::MAX / 3] {
+            register_policy(pid, alloc::vec![42]);
+            assert!(
+                is_syscall_allowed(pid, 42).is_ok(),
+                "pid {} lost the whitelist it was just given (shard {})",
+                pid,
+                policy_shard(pid)
+            );
+            assert_eq!(
+                is_syscall_allowed(pid, 43),
+                Err(true),
+                "pid {} was not checked at all",
+                pid
+            );
+            remove_policy(pid);
+            assert!(
+                is_syscall_allowed(pid, 43).is_ok(),
+                "pid {} kept a whitelist that was removed",
+                pid
+            );
+        }
+    }
+
+    /// `inherit_policy` is the one path that touches two shards, and it takes
+    /// both locks in index order. Both directions, so a lock order that only
+    /// works one way does not pass.
+    #[test]
+    fn a_fork_inherits_the_whitelist_across_shards_in_either_direction() {
+        let _g = start();
+        let (a, b) = two_pids_in_different_shards(91_000);
+        assert_ne!(policy_shard(a), policy_shard(b));
+
+        register_policy(a, alloc::vec![7]);
+        inherit_policy(a, b);
+        assert_eq!(
+            is_syscall_allowed(b, 8),
+            Err(true),
+            "the child inherited nothing"
+        );
+        assert!(is_syscall_allowed(b, 7).is_ok());
+        mirror_is_exact();
+
+        // The other way round, so one of the two runs with parent > child.
+        remove_policy(a);
+        remove_policy(b);
+        register_policy(b, alloc::vec![9]);
+        inherit_policy(b, a);
+        assert_eq!(is_syscall_allowed(a, 8), Err(true));
+        assert!(is_syscall_allowed(a, 9).is_ok());
+        mirror_is_exact();
+    }
+
+    /// And within one shard, where the two-lock path must not be taken at all
+    /// -- these are IRQ-off locks and they do not recurse, so taking the same
+    /// one twice wedges the CPU rather than failing.
+    #[test]
+    fn a_fork_inherits_the_whitelist_inside_one_shard() {
+        let _g = start();
+        let (parent, child) = two_pids_sharing_a_shard(92_000);
+        assert_eq!(policy_shard(parent), policy_shard(child));
+
+        register_policy(parent, alloc::vec![7]);
+        inherit_policy(parent, child);
+        assert!(is_syscall_allowed(child, 7).is_ok());
+        assert_eq!(is_syscall_allowed(child, 8), Err(true));
+        mirror_is_exact();
+    }
+
+    /// The reported count is the number of whitelisted processes, not the
+    /// number of shards that hold one.
+    #[test]
+    fn the_reported_count_is_processes_and_not_shards() {
+        let _g = start();
+        let (a, b) = two_pids_sharing_a_shard(93_000);
+        register_policy(a, alloc::vec![1]);
+        register_policy(b, alloc::vec![1]);
+        assert_eq!(
+            active_policy_count(),
+            2,
+            "two processes in one shard were counted as one"
+        );
+        let (_, c) = two_pids_in_different_shards(a);
+        register_policy(c, alloc::vec![1]);
+        assert_eq!(active_policy_count(), 3);
+    }
+
+    /// A run of consecutive pids has to spread, or sharding buys nothing:
+    /// Zircon hands KoIDs out of one counter shared with every kernel object,
+    /// so live pids arrive in runs.
+    #[test]
+    fn a_run_of_pids_spreads_across_the_shards() {
+        let base = 1u64 << 32;
+        let mut seen = alloc::collections::BTreeSet::new();
+        for pid in base..base + 256 {
+            seen.insert(policy_shard(pid));
+        }
+        assert!(
+            seen.len() > POLICY_SHARDS / 2,
+            "256 consecutive pids reached only {} of {} shards",
+            seen.len(),
+            POLICY_SHARDS
+        );
+    }
+
+    /// Whatever the mix does, a shard index has to be one that exists.
+    #[test]
+    fn every_shard_index_is_inside_the_array() {
+        for pid in [0u64, 1, u64::MAX, u64::MAX / 2, 1 << 63] {
+            assert!(policy_shard(pid) < POLICY_SHARDS, "pid {}", pid);
+        }
+    }
+
+    /// And the shift is the one the array size asks for. Written as its own
+    /// test because the bound above cannot see the mistake it guards: a shift
+    /// too small for the array leaves shards nothing ever reaches, which
+    /// gives no wrong answers and so shows up in nothing but throughput.
+    #[test]
+    fn the_shift_names_every_shard_and_no_more() {
+        assert_eq!(1usize << POLICY_SHARD_BITS, POLICY_SHARDS);
+        let reached: alloc::collections::BTreeSet<usize> =
+            (0..POLICY_SHARDS as u64 * 512).map(policy_shard).collect();
+        assert_eq!(
+            reached.len(),
+            POLICY_SHARDS,
+            "the mix and the shift between them reach only {} of {} shards",
+            reached.len(),
+            POLICY_SHARDS
+        );
+    }
+
+    /// The no-deadlock invariant of the one path that holds two shard locks:
+    /// the pair is sorted whichever way round it is asked for. These are
+    /// IRQ-off locks, so getting this wrong takes the CPUs with it rather
+    /// than returning a wrong answer, and a test that *provoked* the deadlock
+    /// would hang the job instead of naming anything.
+    #[test]
+    fn two_shard_locks_are_always_taken_in_index_order() {
+        assert_eq!(shard_lock_order(2, 5), (2, 5));
+        assert_eq!(
+            shard_lock_order(5, 2),
+            (2, 5),
+            "a cross-shard operation takes its locks in the order it was \
+             asked, which is how two of them deadlock"
+        );
+        assert_eq!(shard_lock_order(7, 7), (7, 7));
     }
 
     #[test]
@@ -1386,5 +1696,179 @@ mod exec_learning_tests {
             !is_exec_allowed("/opt/one-too-many"),
             "a program the cap refused to learn is not quietly trusted either"
         );
+    }
+}
+
+#[cfg(test)]
+mod benches {
+    //! What the whitelist registry costs the processes that have no
+    //! whitelist, which on a running machine is nearly all of them.
+    //!
+    //! This is the row that found the cliff. [`is_syscall_allowed`] runs on
+    //! every syscall of every process, and its lock-free path used to be
+    //! gated on a **machine-wide** count: the first whitelist registered
+    //! anywhere sent every syscall of every process through one IRQ-off spin
+    //! lock to look a pid up in a map it was not in. 5.95 ns became 14.55 ns
+    //! uncontended -- and uncontended is the best case a single global lock
+    //! ever has, which is why the rows below come in pairs with background
+    //! threads. **A single-threaded row cannot see a lock's real cost**: an
+    //! uncontended acquire is a few cycles, and the whole problem is the
+    //! other CPUs.
+    //!
+    //! Measured here, the same rows against the same binary before and after
+    //! the shard array (the first three are `check_syscall`'s whole gate, in
+    //! `crate::benches`; the rest are this module's):
+    //!
+    //! ```text
+    //!                                            antes    despues
+    //! the_gate_in_the_default_stance              6.15       5.89
+    //! the_gate_once_any_process_is_whitelisted   14.23       6.01   <-- el precipicio
+    //! the_gate_for_a_whitelisted_caller          16.24      14.37
+    //! the_gate_shaped_control                     0.94       0.95
+    //!
+    //! the_gate_with_nothing_sandboxed                        1.24
+    //! ..._for_another_process_once_one_is_sandboxed           1.54
+    //! ..._for_another_process_with_three_threads_at_it        1.24
+    //! ..._for_the_sandboxed_process_itself                    8.72
+    //! policy_shard_of_a_pid                                  0.71
+    //! ```
+    //!
+    //! The cliff row lands on the default stance: sandboxing one process now
+    //! costs the rest of the machine nothing measurable. And the contended
+    //! row is **not above** its own uncontended twin, which is what "shares
+    //! no word with anyone" is supposed to look like -- it was the
+    //! single-threaded figure that understated the old cost, not this one
+    //! that overstates the new.
+    //!
+    //! Read the contended figures as a saturation point, not a prediction:
+    //! this host has four cores and is shared, the background threads are not
+    //! pinned, and they spin on the gate with no work in between, which no
+    //! real load does. What the rows establish is the **shape** -- which
+    //! word, and whose lock, is shared with whom -- and that is a property of
+    //! the code and not of this machine.
+
+    extern crate std;
+
+    use super::*;
+    use crate::test_globals;
+    use core::sync::atomic::AtomicBool;
+    use test::{black_box, Bencher};
+
+    /// The syscall number the rows ask about; never on any whitelist here, so
+    /// no row is measuring a binary search that finds something.
+    const ORDINARY: u32 = 60;
+
+    /// Whitelisted for the duration of a row. Its shard is the one that keeps
+    /// the lock; every other pid in the rows is checked against another.
+    const SANDBOXED: u64 = 880_001;
+
+    /// A pid in a different shard from [`SANDBOXED`], which before this
+    /// change bought it nothing at all.
+    fn an_unsandboxed_pid(nth: u64) -> u64 {
+        let want = policy_shard(SANDBOXED);
+        let mut found = 0;
+        for pid in 881_000..881_000 + (POLICY_SHARDS as u64 * 64) {
+            if policy_shard(pid) != want {
+                if found == nth {
+                    return pid;
+                }
+                found += 1;
+            }
+        }
+        panic!("no {}th pid outside shard {}", nth, want);
+    }
+
+    /// Three other threads hammering the gate for pids of their own while the
+    /// row runs. Three and not more because the host has four cores: a fourth
+    /// would be measuring the scheduler.
+    const OTHERS: usize = 3;
+
+    fn with_background(b: &mut Bencher, pid: u64) {
+        static STOP: AtomicBool = AtomicBool::new(false);
+        STOP.store(false, Ordering::Relaxed);
+        let mut hands = alloc::vec::Vec::new();
+        for n in 0..OTHERS {
+            let other = an_unsandboxed_pid(n as u64 + 1);
+            hands.push(std::thread::spawn(move || {
+                while !STOP.load(Ordering::Relaxed) {
+                    for _ in 0..256 {
+                        black_box(is_syscall_allowed(black_box(other), ORDINARY).is_ok());
+                    }
+                }
+            }));
+        }
+        b.iter(|| black_box(is_syscall_allowed(black_box(pid), ORDINARY).is_ok()));
+        STOP.store(true, Ordering::Relaxed);
+        for h in hands {
+            let _ = h.join();
+        }
+    }
+
+    /// The default system state: nothing sandboxed anywhere. One relaxed load
+    /// of this pid's shard counter and out.
+    #[bench]
+    fn the_gate_with_nothing_sandboxed(b: &mut Bencher) {
+        let _g = test_globals::lock();
+        reset_for_test();
+        let pid = an_unsandboxed_pid(0);
+        b.iter(|| black_box(is_syscall_allowed(black_box(pid), ORDINARY).is_ok()));
+    }
+
+    /// **The cliff row.** One unrelated process is sandboxed. Before
+    /// sharding this pid lost its lock-free path; now it is in another shard
+    /// and reads its own zero, so this row should sit on the one above.
+    #[bench]
+    fn the_gate_for_another_process_once_one_is_sandboxed(b: &mut Bencher) {
+        let _g = test_globals::lock();
+        reset_for_test();
+        register_policy(SANDBOXED, alloc::vec![1]);
+        let pid = an_unsandboxed_pid(0);
+        b.iter(|| black_box(is_syscall_allowed(black_box(pid), ORDINARY).is_ok()));
+        remove_policy(SANDBOXED);
+    }
+
+    /// The same, with three other threads gating syscalls of their own. This
+    /// is the pair that matters: the cost of a single global lock is what the
+    /// other CPUs do to it, and the difference between this row and the one
+    /// above is the whole claim.
+    #[bench]
+    fn the_gate_for_another_process_with_three_threads_at_it(b: &mut Bencher) {
+        let _g = test_globals::lock();
+        reset_for_test();
+        register_policy(SANDBOXED, alloc::vec![1]);
+        let pid = an_unsandboxed_pid(0);
+        with_background(b, pid);
+        remove_policy(SANDBOXED);
+    }
+
+    /// And the sandboxed process itself, which does take its shard's lock and
+    /// binary-search its list: the cost the operator asked for by sandboxing
+    /// it. Here so the rows above are read as a saving and not as the
+    /// check disappearing.
+    #[bench]
+    fn the_gate_for_the_sandboxed_process_itself(b: &mut Bencher) {
+        let _g = test_globals::lock();
+        reset_for_test();
+        register_policy(SANDBOXED, alloc::vec![ORDINARY]);
+        b.iter(|| black_box(is_syscall_allowed(black_box(SANDBOXED), ORDINARY).is_ok()));
+        remove_policy(SANDBOXED);
+    }
+
+    /// The shaped control: the row's own scaffolding with the gate taken out,
+    /// so the figures above are read against what `b.iter` and two
+    /// `black_box`es cost and not against zero.
+    #[bench]
+    fn the_gate_shaped_control(b: &mut Bencher) {
+        let _g = test_globals::lock();
+        reset_for_test();
+        let pid = an_unsandboxed_pid(0);
+        b.iter(|| black_box(black_box(pid) != 0));
+    }
+
+    /// What the gate's own first step costs on its own.
+    #[bench]
+    fn policy_shard_of_a_pid(b: &mut Bencher) {
+        let pid = an_unsandboxed_pid(0);
+        b.iter(|| black_box(policy_shard(black_box(pid))));
     }
 }
