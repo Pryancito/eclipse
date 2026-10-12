@@ -278,3 +278,116 @@ const_assert!(size_of::<DiskINode>() <= BLKSIZE);
 const_assert!(size_of::<DiskEntry>() <= BLKSIZE);
 const_assert!(size_of::<IndirectBlock>() == BLKSIZE);
 const_assert!(DEFAULT_INFO.len() <= MAX_INFO_LEN);
+#[cfg(test)]
+mod layout_tests {
+    //! The on-disk format, written out byte by byte.
+    //!
+    //! `as_buf` hands a `SuperBlock` or a `DiskINode` to the block device as
+    //! a raw byte slice, so the order of the fields *is* the format: an image
+    //! written by one build has to stay readable by the next. What guarded
+    //! that was these two lines at the bottom of the file:
+    //!
+    //! ```text
+    //! const_assert!(size_of::<SuperBlock>() <= BLKSIZE);
+    //! const_assert!(size_of::<DiskINode>() <= BLKSIZE);
+    //! ```
+    //!
+    //! An inequality against 4096, which every conceivable layout of these
+    //! two satisfies. Measured over the crate's suite: swapping `magic` with
+    //! `blocks`, or `atime` with `mtime`, passes all eighteen tests.
+    //!
+    //! And the suite is not weak, it is structurally unable to see it. Every
+    //! test that runs creates its own filesystem and reads it back with the
+    //! same code, which agrees with itself whatever the order is. The five
+    //! that open an image made elsewhere -- `open_sample_file` and the four
+    //! `kernel_image_file_*` -- are the ones that would notice, and all five
+    //! are `#[ignore]`d because `sfs.img` is not in the tree. So an
+    //! assertion on the bytes is the only oracle there is.
+    //!
+    //! The numbers are the 64-bit ones. `device_inode_id` is a `usize` inside
+    //! an on-disk struct, so a 32-bit build writes a different format
+    //! altogether; that is worth knowing and is not something a test fixes.
+
+    use super::*;
+    use core::mem::{align_of, offset_of};
+
+    #[test]
+    fn the_superblock_is_forty_eight_bytes_in_a_fixed_order() {
+        assert_eq!(size_of::<SuperBlock>(), 48);
+        assert_eq!(align_of::<SuperBlock>(), 4);
+        assert_eq!(offset_of!(SuperBlock, magic), 0);
+        assert_eq!(offset_of!(SuperBlock, blocks), 4);
+        assert_eq!(offset_of!(SuperBlock, unused_blocks), 8);
+        assert_eq!(offset_of!(SuperBlock, info), 12);
+        // The info string is thirty-two bytes of it, and the freemap count
+        // follows on from the end of it.
+        assert_eq!(offset_of!(SuperBlock, freemap_blocks), 44);
+        assert_eq!(offset_of!(SuperBlock, freemap_blocks) + 4, 48);
+    }
+
+    #[test]
+    fn the_inode_is_a_hundred_and_twenty_eight_bytes_in_a_fixed_order() {
+        assert_eq!(size_of::<DiskINode>(), 128);
+        assert_eq!(align_of::<DiskINode>(), 8);
+        assert_eq!(offset_of!(DiskINode, size), 0);
+        assert_eq!(offset_of!(DiskINode, type_), 4);
+        assert_eq!(offset_of!(DiskINode, nlinks), 6);
+        assert_eq!(offset_of!(DiskINode, blocks), 8);
+        assert_eq!(offset_of!(DiskINode, direct), 12);
+        // Twelve direct block numbers, four bytes each, so the first
+        // indirect one lands at 12 + 48.
+        assert_eq!(offset_of!(DiskINode, indirect), 60);
+        assert_eq!(offset_of!(DiskINode, db_indirect), 64);
+        // Bytes 68..72 are padding: `device_inode_id` is a usize and has to
+        // be eight-aligned.
+        assert_eq!(offset_of!(DiskINode, device_inode_id), 72);
+        assert_eq!(offset_of!(DiskINode, atime), 80);
+        assert_eq!(offset_of!(DiskINode, mtime), 96);
+        assert_eq!(offset_of!(DiskINode, ctime), 112);
+        // Which accounts for all 128: the last timestamp is sixteen wide and
+        // ends exactly at the end of the struct.
+        assert_eq!(offset_of!(DiskINode, ctime) + 16, 128);
+    }
+
+    /// The three timestamps are `rcore_fs::vfs::Timespec`, which is **not**
+    /// `#[repr(C)]`: `repr(Rust)` may order its two fields as it likes, and
+    /// it happens to put the seconds first. Three of them go straight to
+    /// disk inside every inode, so this is the only thing between the format
+    /// and that freedom.
+    #[test]
+    fn the_timestamps_are_a_signed_second_and_then_a_nanosecond() {
+        assert_eq!(size_of::<Timespec>(), 16);
+        assert_eq!(align_of::<Timespec>(), 8);
+        assert_eq!(offset_of!(Timespec, sec), 0);
+        assert_eq!(offset_of!(Timespec, nsec), 8);
+    }
+
+    /// `FileType` is the one field of an inode that is not an integer, and
+    /// its `#[repr(u16)]` is what makes it two bytes in the right place.
+    /// The numbers are on disk too, so they are written out here.
+    #[test]
+    fn the_file_type_is_two_bytes_and_its_numbers_are_the_on_disk_ones() {
+        assert_eq!(size_of::<FileType>(), 2);
+        assert_eq!(FileType::Invalid as u16, 0);
+        assert_eq!(FileType::File as u16, 1);
+        assert_eq!(FileType::Dir as u16, 2);
+        assert_eq!(FileType::SymLink as u16, 3);
+        assert_eq!(FileType::CharDevice as u16, 4);
+        assert_eq!(FileType::BlockDevice as u16, 5);
+    }
+
+    /// And the two string newtypes, which are what keeps a name or an info
+    /// string a fixed-width field on disk instead of a pointer.
+    #[test]
+    fn the_name_and_info_strings_are_fixed_width_byte_arrays() {
+        assert_eq!(size_of::<Str32>(), 32);
+        assert_eq!(align_of::<Str32>(), 1);
+        assert_eq!(size_of::<Str256>(), 256);
+        assert_eq!(align_of::<Str256>(), 1);
+        // Which is what makes a directory entry 260 bytes: an inode number
+        // and a name, with nothing between them.
+        assert_eq!(size_of::<DiskEntry>(), 260);
+        assert_eq!(offset_of!(DiskEntry, id), 0);
+        assert_eq!(offset_of!(DiskEntry, name), 4);
+    }
+}
