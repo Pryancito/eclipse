@@ -225,7 +225,19 @@ impl Device for FileByteDevice {
 /// 8 MiB is generous enough to keep the hot working set (inode table, block
 /// group descriptors, directory blocks, recently-read file data) resident while
 /// staying well under the per-mount budget the exec/VMO cache already spends.
-const CACHE_CAPACITY_SECTORS: usize = 64 * 1024 * 1024 / SECTOR;
+///
+/// The figure above is what this cap was written for; the constant said 64 MiB
+/// from the day it was born, and nothing ever measured that. It is a cap on
+/// allocation *count* as much as on bytes, because every resident sector is its
+/// own heap block: a `Box<[u8; 512]>`, plus its entry in `lines` (~24 B) and in
+/// `lru` (~16 B), both of which land in `BTreeMap` nodes of their own. At
+/// 64 MiB that is 131072 separate 512-byte blocks plus some 24000 map nodes,
+/// and it showed: on a machine with the heap over half full, those 512-byte
+/// blocks were the single largest size class in the kernel's heap-pressure
+/// report, one `BlockCache::insert` under btrfs's `read_logical` at a time.
+/// The cache was behaving exactly as designed -- it has a bound and it evicts;
+/// the bound was simply eight times what its own paragraph claims.
+const CACHE_CAPACITY_SECTORS: usize = 8 * 1024 * 1024 / SECTOR;
 
 /// Forward read-ahead window. On a cache miss for a request smaller than this,
 /// the backing device is read this far past the request in one command and the
@@ -554,9 +566,16 @@ impl CachedDevice {
 
     fn with_capacity(inner: Arc<dyn Device>, size_bytes: usize, capacity_sectors: usize) -> Self {
         let dev_end = size_bytes.div_ceil(SECTOR) * SECTOR;
+        // Never budget for more sectors than the device can ever hold. A small
+        // backing store -- an EFI partition, a loopback image -- would otherwise
+        // carry the same ceiling as a multi-terabyte disk, and every mount pays
+        // this budget separately. The cache grows lazily, so this changes
+        // nothing for a device larger than the cap; it only stops a tiny one
+        // from reserving a ceiling it can never reach.
+        let capacity = capacity_sectors.min(dev_end / SECTOR);
         Self {
             inner,
-            cache: Mutex::new(BlockCache::new(capacity_sectors)),
+            cache: Mutex::new(BlockCache::new(capacity)),
             dev_end,
             streams: Mutex::new(StreamTable::new()),
         }
@@ -1686,6 +1705,59 @@ mod block_byte_tests {
             c.lines.len(),
             "invalidate left a stale LRU key behind"
         );
+    }
+
+    #[test]
+    fn the_default_budget_is_the_one_its_own_paragraph_claims() {
+        // The constant and the paragraph above it disagreed by 8x from the day
+        // they were written, and the only thing that caught it was a heap
+        // report on a running machine. Pin the figure so prose and code cannot
+        // drift apart again silently.
+        assert_eq!(
+            CACHE_CAPACITY_SECTORS * SECTOR,
+            8 * 1024 * 1024,
+            "the per-device budget must stay the 8 MiB its doc comment states"
+        );
+        assert_eq!(CACHE_CAPACITY_SECTORS, 16384);
+    }
+
+    /// A backing device of a given size and nothing else: these tests only ask
+    /// what ceiling the cache was built with, which depends on the size alone.
+    fn device_of(len: usize) -> Arc<dyn Device> {
+        Arc::new(PartialWriteDevice {
+            data: Mutex::new(vec![0u8; len]),
+            fail_from: usize::MAX,
+        })
+    }
+
+    #[test]
+    fn a_device_smaller_than_the_budget_does_not_reserve_the_whole_budget() {
+        // 8 sectors of backing store, asked for a 64-sector ceiling.
+        let cd = CachedDevice::with_capacity(device_of(8 * SECTOR), 8 * SECTOR, 64);
+        assert_eq!(
+            cd.cache.lock().capacity,
+            8,
+            "a tiny device must not carry a ceiling it can never reach"
+        );
+    }
+
+    #[test]
+    fn a_device_larger_than_the_budget_keeps_the_budget() {
+        let cd = CachedDevice::with_capacity(device_of(4096 * SECTOR), 4096 * SECTOR, 64);
+        assert_eq!(
+            cd.cache.lock().capacity,
+            64,
+            "the cap, not the device, is what bounds a device larger than it"
+        );
+    }
+
+    #[test]
+    fn a_partial_last_sector_still_counts_as_a_whole_one() {
+        // 3 full sectors and 100 bytes: the device holds 4 addressable sectors,
+        // so the budget may cover 4 -- clamping to 3 would leave the tail
+        // uncacheable forever.
+        let cd = CachedDevice::with_capacity(device_of(3 * SECTOR + 100), 3 * SECTOR + 100, 64);
+        assert_eq!(cd.cache.lock().capacity, 4);
     }
 
     #[test]

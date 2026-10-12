@@ -431,17 +431,21 @@ impl KernelHandler for ZcoreKernelHandler {
                 let mut b = crate::lang::StackBuf::new();
                 let _ = write!(
                     b,
-                    "KERNEL NULL-RANGE PAGE FAULT cpu={} vaddr={:#x} flags={:?}\nrip={}\n\
+                    "KERNEL NULL-RANGE PAGE FAULT cpu={} vaddr={:#x} flags={:?} \
+                     [build {}]\nrip={}\n\
                      in_timer={} (not a userspace-caused fault){}",
                     kernel_hal::cpu::cpu_id(),
                     fault_vaddr,
                     access_flags,
+                    env!("ECLIPSE_BUILD_ID"),
                     kernel_hal::ksyms::Addr(kernel_hal::kstats::last_fault_rip()),
                     in_timer,
                     heap_lock_banner_note(crate::memory::heap_held_by_current_cpu()),
                 );
                 #[cfg(target_arch = "x86_64")]
                 write_stop_screen_callers(&mut b);
+                #[cfg(target_arch = "x86_64")]
+                write_stop_screen_registers(&mut b, fault_vaddr, access_flags);
                 kernel_hal::console::panic_banner(b.valid_str());
             }
             serial_literal_spin("\n[KERNEL BUG] halting (diag rev 10)\n");
@@ -803,17 +807,21 @@ fn report_unresolved_kernel_fault(
         let mut b = crate::lang::StackBuf::new();
         let _ = write!(
             b,
-            "KERNEL PAGE FAULT cpu={} vaddr={:#x} flags={:?}\nrip={}\nhave_thread={} \
+            "KERNEL PAGE FAULT cpu={} vaddr={:#x} flags={:?} [build {}]\nrip={}\n\
+             have_thread={} \
              (unresolved by the user vmar: a kernel-side bug, not a userspace SIGSEGV){}",
             kernel_hal::cpu::cpu_id(),
             fault_vaddr,
             access_flags,
+            env!("ECLIPSE_BUILD_ID"),
             kernel_hal::ksyms::Addr(rip),
             have_thread,
             heap_lock_banner_note(crate::memory::heap_held_by_current_cpu()),
         );
         #[cfg(target_arch = "x86_64")]
         write_stop_screen_callers(&mut b);
+        #[cfg(target_arch = "x86_64")]
+        write_stop_screen_registers(&mut b, fault_vaddr, access_flags);
         kernel_hal::console::panic_banner(b.valid_str());
     }
     serial_literal_spin("\n[KERNEL BUG] halting (diag rev 11)\n");
@@ -918,6 +926,148 @@ fn write_stop_screen_callers(b: &mut impl core::fmt::Write) {
     );
     for r in &rets[..n] {
         let _ = write!(b, "\n  {}", kernel_hal::ksyms::Addr(*r));
+    }
+}
+
+/// The registers of `gprs` that say something about `fault_vaddr`, one bit per
+/// register.
+///
+/// Narrower than [`RegSays::worth_a_line`] on purpose: that one also names
+/// clock values and code pointers, which earn their line in a serial report
+/// that may run to thirty of them and crowd out the one line that matters on a
+/// screen somebody is photographing. What a photograph has to carry is which
+/// register held the base and at what offset -- the first question of every
+/// capture.
+#[cfg(any(all(target_arch = "x86_64", not(feature = "libos")), test))]
+fn base_candidate_mask(gprs: &[u64; 16], fault_vaddr: u64, execute: bool) -> u16 {
+    let mut out: u16 = 0;
+    for (i, &value) in gprs.iter().enumerate() {
+        if kernel_hal::kaddr::register_role(value, fault_vaddr, execute)
+            != kernel_hal::kaddr::RegRole::Unrelated
+        {
+            out |= 1 << i;
+        }
+    }
+    out
+}
+
+/// What the register file says about the faulting address, for a stop screen.
+///
+/// The same argument as [`write_stop_screen_callers`], one step further. The
+/// `[kfault-regs]` block has named the base register and its offset since
+/// #1794, and the capture of 2026-10-12 --
+///
+/// ```text
+/// KERNEL NULL-RANGE PAGE FAULT cpu=4 vaddr=0x71 flags=WRITE
+/// rip=<zircon_object::task::process::Process>::exit+0xb9
+/// ```
+///
+/// -- arrived without a single one of its lines, because a halt is where they
+/// are most certainly lost: the oops buffer is `.bss` and says so itself
+/// ("contents are lost on reboot"), the drainer that writes
+/// `/var/log/oops.log` is a userspace process that is no longer running, and
+/// the machine has no serial capture. The screen is the whole record, and what
+/// is not on it did not happen.
+///
+/// Order is by what a reader needs first: the base register, then DF, then the
+/// raw file, then the instruction's own bytes. The banner truncates from the
+/// end.
+#[cfg(all(target_arch = "x86_64", not(feature = "libos")))]
+fn write_stop_screen_registers(
+    b: &mut impl core::fmt::Write,
+    fault_vaddr: usize,
+    access_flags: MMUFlags,
+) {
+    let gprs = kernel_hal::kstats::last_fault_gprs();
+    if gprs.iter().all(|&r| r == 0) {
+        let _ = write!(b, "\nno register file was recorded for this fault");
+        return;
+    }
+    let execute = access_flags.contains(MMUFlags::EXECUTE);
+    let now_ns = kernel_hal::deadline::duration_to_ns(kernel_hal::timer::timer_now());
+    let mask = base_candidate_mask(&gprs, fault_vaddr as u64, execute);
+    if mask == 0 {
+        let _ = write!(
+            b,
+            "\nno register holds the faulting address or a base within {:#x} of it: \
+             an index register or a larger displacement formed it; the bytes at rip \
+             say which",
+            kernel_hal::kaddr::MAX_PLAUSIBLE_DISPLACEMENT,
+        );
+    } else {
+        let _ = write!(b, "\nwhere the address came from:");
+        let mut done: u16 = 0;
+        for (i, &value) in gprs.iter().enumerate() {
+            if mask & (1 << i) == 0 || done & (1 << i) != 0 {
+                continue;
+            }
+            let mut same: u16 = 0;
+            for (j, &v) in gprs.iter().enumerate().skip(i) {
+                if v == value {
+                    same |= 1 << j;
+                }
+            }
+            done |= same;
+            let _ = write!(
+                b,
+                "\n  {} = {:#x}: {}",
+                RegNames(same),
+                value,
+                RegSays {
+                    value,
+                    fault_vaddr: fault_vaddr as u64,
+                    execute,
+                    now_ns,
+                },
+            );
+        }
+    }
+    let rflags = kernel_hal::kstats::last_fault_rflags();
+    if rflags & kernel_hal::kaddr::RFLAGS_DF != 0 {
+        let _ = write!(
+            b,
+            "\nrflags={:#x}: DF IS SET — every memcpy/memset of this kernel context \
+             ran BACKWARDS",
+            rflags,
+        );
+    } else if rflags != 0 {
+        let _ = write!(b, "\nrflags={:#x} (DF clear)", rflags);
+    }
+    let _ = write!(
+        b,
+        "\nrax={:#x} rbx={:#x} rcx={:#x} rdx={:#x}\nrsi={:#x} rdi={:#x} rbp={:#x} rsp={:#x}\n\
+         r8={:#x} r9={:#x} r10={:#x} r11={:#x}\nr12={:#x} r13={:#x} r14={:#x} r15={:#x}",
+        gprs[0],
+        gprs[1],
+        gprs[2],
+        gprs[3],
+        gprs[4],
+        gprs[5],
+        gprs[6],
+        gprs[7],
+        gprs[8],
+        gprs[9],
+        gprs[10],
+        gprs[11],
+        gprs[12],
+        gprs[13],
+        gprs[14],
+        gprs[15],
+    );
+    // The instruction itself, so a reader can decode which operand took the
+    // fault instead of inferring it from `exit+0xb9`. Only from inside
+    // `.text`, where the CPU was just fetching.
+    let rip = kernel_hal::kstats::last_fault_rip();
+    if kernel_hal::kaddr::is_kernel_text(rip) && kernel_hal::kaddr::is_kernel_text(rip + 15) {
+        let mut bytes = [0u8; 16];
+        for (k, byte) in bytes.iter_mut().enumerate() {
+            // SAFETY: inside kernel `.text`, which is mapped and never unmapped.
+            *byte = unsafe { core::ptr::read_volatile((rip + k as u64) as *const u8) };
+        }
+        let _ = write!(b, "\nbytes at rip:");
+        for byte in bytes.iter() {
+            let _ = write!(b, " {:02x}", byte);
+        }
     }
 }
 
@@ -1635,6 +1785,37 @@ mod tests {
     #[test]
     fn a_fault_without_the_lock_adds_nothing_at_all() {
         assert_eq!(heap_lock_banner_note(false), "");
+    }
+
+    /// A null base with the field offset on it is the shape every one of these
+    /// captures has had -- `vaddr=0x71` from `Process::exit+0xb9`, which is a
+    /// `lock incq (%rdx)` through a smashed thread-list entry. The screen has
+    /// to name the register that held it.
+    #[test]
+    fn a_register_holding_the_base_of_the_fault_is_named() {
+        let mut gprs = [0u64; 16];
+        // Everything but one register holds something unrelated, so a mask
+        // that named them all would pass this by accident.
+        for (i, r) in gprs.iter_mut().enumerate() {
+            *r = 0xffff_ff00_0040_0000 + (i as u64 + 1) * 0x1_0000;
+        }
+        gprs[3] = 0; // rdx: the null base
+        let mask = base_candidate_mask(&gprs, 0x71, false);
+        assert_eq!(mask, 1 << 3, "solo rdx explica una direccion de 0x71");
+    }
+
+    /// And says nothing when nothing in the file explains the address: a
+    /// candidate base invented out of an unrelated value sends the reader
+    /// after the wrong object.
+    #[test]
+    fn registers_that_explain_nothing_are_not_named() {
+        let mut gprs = [0u64; 16];
+        for (i, r) in gprs.iter_mut().enumerate() {
+            // Small values: counts and lengths, which line up against a
+            // near-null fault address only by coincidence.
+            *r = i as u64 + 1;
+        }
+        assert_eq!(base_candidate_mask(&gprs, 0x71, false), 0);
     }
 
     /// The banner is a fixed stack buffer whose writer truncates silently, so a

@@ -51,6 +51,34 @@ struct CpuLocalRegion {
     dbg_save: usize,
 }
 
+/// The one field of [`CpuLocalRegion`] whose offset is hardcoded elsewhere.
+///
+/// `GSBASE` and the TSS descriptor both point at this struct, and the entry
+/// stubs read `gs:4` and `gs:12` as offsets *into the TSS* -- the ring-0 stack
+/// pointer and the slot where the user stack is stashed. That only works while
+/// `tss` is the first field: move it and every `syscall` and every trap loads
+/// its kernel stack from whatever word happens to be at `gs:4`, which is the
+/// first push of the entry path and therefore a fault with no stack to report
+/// it on.
+///
+/// The other fields need no guard, and that is worth writing down rather than
+/// leaving to the next reader: the assembly reaches `cpu_local`,
+/// `logical_cpu_id`, `logical_cpu_valid` and `dbg_save` through
+/// `const offset_of!(..)` (see [`DBG_SAVE_GS_OFFSET`] and the `gs:[{off}]`
+/// operands below), so reordering them moves the asm's operand with the field.
+/// A mutation that swaps two of them survives because it is *equivalent*, not
+/// because it is untested.
+///
+/// A compile-time assertion rather than a unit test because this module only
+/// exists under `target_os = "none"` / `"uefi"`, so no host `cargo test`
+/// compiles it.
+const _: () = {
+    assert!(
+        core::mem::offset_of!(CpuLocalRegion, tss) == 0,
+        "the entry stubs read gs:4 and gs:12 as offsets into the TSS, so it has to come first"
+    );
+};
+
 /// DEBUG: offset de `dbg_save` dentro de [`CpuLocalRegion`], para el asm.
 pub const DBG_SAVE_GS_OFFSET: usize = core::mem::offset_of!(CpuLocalRegion, dbg_save);
 

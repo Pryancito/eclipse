@@ -187,6 +187,49 @@ fn sockopt_out_len(requested: usize, actual: usize) -> usize {
 /// 16 bytes on a 64-bit target, followed by the payload, with each message
 /// `CMSG_ALIGN`ed to 8.
 const CMSG_HDR_LEN: usize = 16;
+/// The largest `msg_controllen` this kernel will read.
+///
+/// `msg_controllen` is entirely the caller's, and it sizes a `read_array`, so
+/// an unbounded one is a multi-gigabyte allocation (an abort, not an error) or
+/// a walk off the end of the caller's control buffer. Linux bounds the same
+/// thing by `optmem_max`.
+const CONTROL_MAX: usize = 64 * 1024;
+/// How many `struct mmsghdr` entries one `sendmmsg` or `recvmmsg` walks.
+///
+/// It was written out twice, once inside `sys_sendmmsg` and once inside
+/// `sys_recvmmsg`, which is the shape a drift arrives in: the two halves of
+/// one limit, in two method bodies, with nothing comparing them.
+const MMSG_MAX: usize = 64;
+
+/// How many entries of the caller's `mmsghdr` array one batch call walks.
+///
+/// `vlen` is the caller's, and it is the bound of a loop that reads user
+/// memory and sends on a socket on every turn, so an unclamped one is a
+/// `sendmmsg` that never returns. Clamping rather than refusing is what
+/// `sendmmsg(2)` describes: the call answers with how many it sent, and a
+/// caller with more to send calls again.
+fn mmsg_batch(vlen: usize) -> usize {
+    vlen.min(MMSG_MAX)
+}
+
+/// What to do with the `msg_control` of a `sendmsg`: read `SCM_RIGHTS` out of
+/// it, ignore it, or refuse the call.
+///
+/// Both the floor and the ceiling used to be written inside `sendmsg_hdr`,
+/// and the floor was a bare `16` -- a second copy of [`CMSG_HDR_LEN`], three
+/// hundred lines from the first. A control buffer shorter than one header
+/// carries no message, so it is ignored rather than refused: that is what
+/// Linux does, and a caller that zeroes a `struct msghdr` and sets only
+/// `msg_control` depends on it.
+fn scm_control_action(is_null: bool, controllen: usize) -> LxResult<bool> {
+    if is_null || controllen < CMSG_HDR_LEN {
+        return Ok(false);
+    }
+    if controllen > CONTROL_MAX {
+        return Err(LxError::EINVAL);
+    }
+    Ok(true)
+}
 /// `SOL_SOCKET`, as it appears in `cmsg_level`.
 const SOL_SOCKET_LEVEL: i32 = 1;
 /// `SCM_RIGHTS`, as it appears in `cmsg_type`.
@@ -1038,14 +1081,7 @@ impl Syscall<'_> {
         };
 
         // SCM_RIGHTS: resolve any attached fds before queueing the bytes.
-        // `msg_controllen` is fully user-controlled; bound it before `read_array`
-        // so a huge value cannot request a multi-GiB allocation (alloc abort) or
-        // walk off the mapped control buffer. Linux bounds this by optmem_max.
-        const CONTROL_MAX: usize = 64 * 1024;
-        let passed_fds = if !hdr.msg_control.is_null() && hdr.msg_controllen >= 16 {
-            if hdr.msg_controllen > CONTROL_MAX {
-                return Err(LxError::EINVAL);
-            }
+        let passed_fds = if scm_control_action(hdr.msg_control.is_null(), hdr.msg_controllen)? {
             let ctrl = hdr.msg_control.read_array(hdr.msg_controllen)?;
             self.collect_scm_rights_fds(&ctrl)?
         } else {
@@ -1507,11 +1543,10 @@ impl Syscall<'_> {
             "sys_sendmmsg: sockfd:{}, msgvec:{:?}, vlen:{}",
             sockfd, msgvec, vlen
         );
-        const MMSG_MAX: usize = 64;
         let base = msgvec.as_addr();
         let stride = MMSGHDR_STRIDE;
         let mut sent = 0usize;
-        for i in 0..vlen.min(MMSG_MAX) {
+        for i in 0..mmsg_batch(vlen) {
             let hdr_ptr: UserInPtr<MsgHdr> = (base + i * stride).into();
             let hdr = hdr_ptr.read()?;
             match self.sendmsg_hdr(sockfd, &hdr, flags).await {
@@ -1547,11 +1582,10 @@ impl Syscall<'_> {
             "sys_recvmmsg: sockfd:{}, msgvec:{:?}, vlen:{}",
             sockfd, msgvec, vlen
         );
-        const MMSG_MAX: usize = 64;
         let base = msgvec.as_addr();
         let stride = MMSGHDR_STRIDE;
         let mut received = 0usize;
-        for i in 0..vlen.min(MMSG_MAX) {
+        for i in 0..mmsg_batch(vlen) {
             let hdr_ptr: UserInOutPtr<MsgHdr> = (base + i * stride).into();
             let per_flags = if i == 0 { flags } else { flags | MSG_DONTWAIT };
             match self.sys_recvmsg(sockfd, hdr_ptr, per_flags).await {
@@ -2618,5 +2652,108 @@ mod benches {
     #[bench]
     fn unix_protocol_arg(b: &mut Bencher) {
         b.iter(|| black_box(unix_protocol(black_box(0))));
+    }
+}
+
+#[cfg(test)]
+mod control_and_batch_bounds_tests {
+    use super::*;
+
+    /// A control buffer too short to hold one header carries no message, and
+    /// is ignored rather than refused.
+    ///
+    /// That is what Linux does, and a caller that zeroes a `struct msghdr`,
+    /// sets only `msg_control` and leaves `msg_controllen` at 0 depends on it:
+    /// refusing would break every ordinary `sendmsg` written that way. The
+    /// floor is `sizeof(struct cmsghdr)`, which is the whole of a control
+    /// message that has no payload.
+    #[test]
+    fn a_control_buffer_shorter_than_one_header_is_ignored_and_not_refused() {
+        // A null pointer, whatever the length claims.
+        assert_eq!(scm_control_action(true, 0), Ok(false));
+        assert_eq!(scm_control_action(true, 4096), Ok(false));
+        // A buffer too short to hold `struct cmsghdr`.
+        assert_eq!(scm_control_action(false, 0), Ok(false));
+        assert_eq!(scm_control_action(false, 8), Ok(false));
+        assert_eq!(scm_control_action(false, CMSG_HDR_LEN - 1), Ok(false));
+        // Exactly one header is a message, payload or no payload.
+        assert_eq!(scm_control_action(false, CMSG_HDR_LEN), Ok(true));
+        assert_eq!(scm_control_action(false, CMSG_HDR_LEN + 1), Ok(true));
+    }
+
+    /// The floor is the header length and not a number that happens to match
+    /// it.
+    ///
+    /// It used to be a bare `16` inside `sendmsg_hdr`, three hundred lines
+    /// from the `CMSG_HDR_LEN` it is a copy of. The day the ABI moves, one of
+    /// the two moves.
+    #[test]
+    fn the_floor_is_the_header_length_itself() {
+        assert_eq!(CMSG_HDR_LEN, 16, "sizeof(struct cmsghdr) on a 64-bit ABI");
+        assert_eq!(scm_control_action(false, CMSG_HDR_LEN), Ok(true));
+        assert_eq!(scm_control_action(false, CMSG_HDR_LEN - 1), Ok(false));
+    }
+
+    /// The largest control buffer this kernel will read is 64 KiB.
+    ///
+    /// `msg_controllen` is entirely the caller's and it sizes a `read_array`,
+    /// so the ceiling is what stands between one `sendmsg` and a multi-gigabyte
+    /// allocation -- which is an abort, not an error. Linux bounds the same
+    /// thing by `optmem_max`, whose default is this number.
+    #[test]
+    fn the_biggest_control_buffer_the_kernel_will_read_is_sixty_four_kib() {
+        assert_eq!(CONTROL_MAX, 64 * 1024, "the optmem_max default");
+        assert_eq!(scm_control_action(false, 64 * 1024), Ok(true));
+        assert_eq!(
+            scm_control_action(false, 64 * 1024 + 1),
+            Err(LxError::EINVAL)
+        );
+        assert_eq!(scm_control_action(false, usize::MAX), Err(LxError::EINVAL));
+        // The ceiling has to clear the floor, or no control message could ever
+        // pass at all.
+        assert!(CONTROL_MAX > CMSG_HDR_LEN);
+    }
+
+    /// A null `msg_control` wins over any length, including one past the
+    /// ceiling.
+    ///
+    /// The order matters: a caller that leaves the pointer null and the length
+    /// as whatever was on the stack must get an ordinary send, not `EINVAL`.
+    #[test]
+    fn a_null_pointer_is_answered_before_the_ceiling() {
+        assert_eq!(scm_control_action(true, usize::MAX), Ok(false));
+        assert_eq!(scm_control_action(true, CONTROL_MAX + 1), Ok(false));
+    }
+
+    /// One batch call walks at most 64 entries, whatever `vlen` says.
+    ///
+    /// `vlen` is the caller's, and it is the bound of a loop that reads user
+    /// memory and sends on a socket on every turn: unclamped, `sendmmsg` with
+    /// `vlen` of `usize::MAX` is a call that never comes back. Clamping rather
+    /// than refusing is `sendmmsg(2)`'s own answer -- the call reports how many
+    /// it sent and a caller with more to send calls again -- so the number is
+    /// invisible to a correct caller and load-bearing for a hostile one.
+    #[test]
+    fn a_batch_call_walks_at_most_sixty_four_entries() {
+        assert_eq!(mmsg_batch(0), 0);
+        assert_eq!(mmsg_batch(1), 1);
+        assert_eq!(mmsg_batch(63), 63);
+        assert_eq!(mmsg_batch(64), 64, "the whole batch, not half of it");
+        assert_eq!(mmsg_batch(65), 64);
+        assert_eq!(mmsg_batch(usize::MAX), 64);
+        // Bounded, and still making progress: a clamp of 0 would turn every
+        // `sendmmsg` into `Ok(0)` and a caller looping until it had sent them
+        // all into a caller looping forever.
+        assert!(mmsg_batch(usize::MAX) > 0);
+    }
+
+    /// The walk the clamp allows stays inside an address.
+    ///
+    /// Both batch calls index with `base + i * MMSGHDR_STRIDE`, so the clamp
+    /// and the stride together are what keeps that arithmetic from wrapping.
+    #[test]
+    fn the_whole_batch_fits_in_an_address() {
+        assert!(MMSG_MAX.checked_mul(MMSGHDR_STRIDE).is_some());
+        assert_eq!(MMSG_MAX * MMSGHDR_STRIDE, 4096, "one page of entries");
     }
 }

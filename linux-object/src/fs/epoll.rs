@@ -34,6 +34,10 @@ pub mod stats {
     static EMPTY_TIMED: AtomicU64 = AtomicU64::new(0);
     /// Events delivered, summed over every return.
     static EVENTS_DELIVERED: AtomicU64 = AtomicU64::new(0);
+    /// Ready bits an `EPOLLET` entry held back because nothing had moved
+    /// since it last reported them. Each one is an `epoll_wait` return --
+    /// and the syscall behind it -- that did not happen.
+    static EDGE_SUPPRESSED: AtomicU64 = AtomicU64::new(0);
 
     /// Classify one entry into `Epoll::wait` by the timeout it was given.
     pub(super) fn entered(timeout_msecs: isize) {
@@ -58,6 +62,18 @@ pub mod stats {
         } else {
             EVENTS_DELIVERED.fetch_add(events as u64, Relaxed);
         }
+    }
+
+    /// Record one scan of an `EPOLLET` entry that was ready by level and
+    /// reported nothing. See [`EDGE_SUPPRESSED`].
+    pub(super) fn edge_suppressed() {
+        EDGE_SUPPRESSED.fetch_add(1, Relaxed);
+    }
+
+    /// See [`EDGE_SUPPRESSED`]. Read on its own rather than through
+    /// [`snapshot`] so the tuple every caller destructures keeps its arity.
+    pub fn edge_suppressed_total() -> u64 {
+        EDGE_SUPPRESSED.load(Relaxed)
     }
 
     /// `(nonblock, timed, forever, empty_nonblock, empty_timed, events)`,
@@ -107,10 +123,37 @@ const EPOLLWAKEUP: u32 = 1 << 29;
 /// an `EPOLL_CTL_MOD` re-arms it.
 const EPOLLONESHOT: u32 = 1 << 30;
 /// See [`EPOLLEXCLUSIVE`]. Edge-triggered: see [`edge_step`]. Honoured for
-/// the files that count their readiness publications
-/// (`FileLike::readiness_seq`: eventfd, unix sockets, pipes); every other file
-/// is still reported by level, which costs wakeups but never loses one.
+/// every file, measured against its publication counter
+/// (`FileLike::readiness_seq`: eventfd, unix sockets, pipes) where there is
+/// one and against the level alone where there is not -- see
+/// [`UNCOUNTED_SEQ`].
 const EPOLLET: u32 = 1 << 31;
+
+/// The publication counter [`edge_step`] measures an `EPOLLET` entry against
+/// when its file keeps none (`FileLike::readiness_seq` answered `None`):
+/// a constant, so the only edge left is the one in the level itself -- a bit
+/// that was low at the previous scan and is high now.
+///
+/// Reporting such an entry by level instead is the spin `EPOLLET` exists to
+/// stop, and it is not hypothetical: the eventfd case alone cost Firefox's
+/// parent process 31 million `epoll_wait` calls in five minutes (01-oct),
+/// which is why eventfd, pipes and unix sockets got counters. Every other fd
+/// class kept the spin -- a TCP or netlink socket, a signalfd, an inotify fd,
+/// a timerfd, a nested epoll, a syncobj. `mio`, and so every `tokio` program,
+/// registers every one of its sources with `EPOLLET`, and an idle connected
+/// socket's `EPOLLOUT` is up for ever: reported by level, that is one
+/// `epoll_pwait` per loop turn at full speed, with the `futex` traffic of
+/// whatever the loop wakes on each turn behind it.
+///
+/// What the constant costs is the edge this kernel cannot see: a level that
+/// rises without the file publishing anything and without a scan catching it
+/// low in between. [`EDGE_REARM`] is the insurance for exactly that -- the
+/// entry is reported again anyway after it, so such a program is late by
+/// 250 ms rather than deaf for good. Linux, which sees every edge, would stay
+/// quiet indefinitely; being *more* talkative than Linux is a cost an
+/// edge-triggered program absorbs by construction, since it must tolerate a
+/// spurious wakeup anyway.
+const UNCOUNTED_SEQ: u64 = 0;
 
 /// How long an edge-triggered entry stays quiet about a level that has not
 /// moved, before it is reported again anyway.
@@ -453,12 +496,12 @@ impl Epoll {
 
     /// Store the [`EdgeState`]s a scan computed, for the entries that still
     /// watch the file the scan looked at.
-    fn store_edges(&self, scanned: &[(FileDesc, Arc<dyn FileLike>, EdgeState)]) {
+    fn store_edges(&self, scanned: &[(FileDesc, Arc<dyn FileLike>, EdgeState, bool)]) {
         if scanned.is_empty() {
             return;
         }
         let mut inner = self.inner.lock();
-        for (fd, file, state) in scanned {
+        for (fd, file, state, _counted) in scanned {
             let current = match inner.interest_list.get(fd) {
                 Some((event, current)) => event.events & EPOLLET != 0 && Arc::ptr_eq(current, file),
                 None => false,
@@ -711,11 +754,12 @@ impl Epoll {
             let now = kernel_hal::timer::timer_now();
             for (fd, event, file) in &interest_list {
                 let interest = PollEvents::from_bits_truncate(event.events as u16);
-                // An edge-triggered entry on a file that counts its
-                // publications. The counter is read BEFORE the level: a
+                // The publication counter of an edge-triggered entry, for
+                // the files that keep one. Read BEFORE the level: a
                 // publication after this line moves it past what is stored,
                 // and the next scan (or the edge subscription below) sees it.
-                let seq = if event.events & EPOLLET != 0 {
+                let edge_triggered = event.events & EPOLLET != 0;
+                let seq = if edge_triggered {
                     file.readiness_seq(interest)
                 } else {
                     None
@@ -725,10 +769,22 @@ impl Epoll {
                     Err(err) => return Err(err),
                 };
                 let mut ready = ready_events(event.events, &status);
-                if let Some(seq) = seq {
-                    let (report, state) = edge_step(edges.get(fd).copied(), seq, ready, now);
-                    scanned_edges.push((*fd, file.clone(), state));
+                if edge_triggered {
+                    // A file that keeps no counter is measured against
+                    // `UNCOUNTED_SEQ`, leaving `edge_step` the level alone to
+                    // go on. See it for why that beats reporting the entry by
+                    // level.
+                    let (report, state) = edge_step(
+                        edges.get(fd).copied(),
+                        seq.unwrap_or(UNCOUNTED_SEQ),
+                        ready,
+                        now,
+                    );
+                    scanned_edges.push((*fd, file.clone(), state, seq.is_some()));
                     if !report {
+                        if ready != 0 {
+                            stats::edge_suppressed();
+                        }
                         ready = 0;
                     }
                 }
@@ -795,11 +851,22 @@ impl Epoll {
                 let interest = PollEvents::from_bits_truncate(event.events as u16);
                 let edge = scanned_edges
                     .iter()
-                    .find(|(f, _, _)| f == fd)
-                    .map(|(_, _, state)| state.seq);
+                    .find(|(f, _, _, _)| f == fd)
+                    .map(|(_, _, state, counted)| (*state, *counted));
                 let sub = match edge {
-                    Some(seen) => file.subscribe_edge(interest, &waker, seen),
-                    None => file.subscribe_readiness(interest, &waker),
+                    // Counted: park on the file's next publication, which is
+                    // the edge itself.
+                    Some((state, true)) => file.subscribe_edge(interest, &waker, state.seq),
+                    // Uncounted, and the scan is suppressing a level it has
+                    // already reported. A level subscription fires the
+                    // instant it is taken -- the flag is up, that is why it
+                    // is suppressed -- so taking one here would spin this
+                    // loop inside the kernel instead of in userspace. There
+                    // is nothing useful to park on: leave the set on its
+                    // short backstop tick, which is what it was already on
+                    // before this entry had an edge state at all.
+                    Some((state, false)) if state.quiet != 0 => None,
+                    _ => file.subscribe_readiness(interest, &waker),
                 };
                 match sub {
                     Some(sub) => subs.push(sub),
@@ -2115,18 +2182,179 @@ mod edge_trigger_tests {
     }
 
     #[test]
-    fn a_file_that_counts_nothing_is_still_reported_by_level() {
-        // Without a counter this kernel cannot see the file's edges, and an
-        // edge it cannot see must not become an event it never reports.
+    fn a_file_that_counts_nothing_is_reported_once_not_on_every_scan() {
+        // The level is the only edge this kernel can see on such a file, so
+        // it is the one it uses: reported the first time the bit is up, then
+        // quiet until it falls and rises again -- or until `EDGE_REARM`. The
+        // old answer, reporting it on every scan, is one `epoll_pwait` per
+        // loop turn at full speed for every `mio` source that is not an
+        // eventfd, a pipe or a unix socket. See `UNCOUNTED_SEQ`.
         let ep = Epoll::new(OpenFlags::empty());
         let file: Arc<dyn FileLike> = Arc::new(Uncounted {
             base: KObjectBase::new(),
         });
         ep.ctl(ADD, FileDesc::from(5), ev(IN | EPOLLET, 3), Some(file))
             .unwrap();
+        assert_eq!(wait_now(&ep), alloc::vec![(IN, 3)]);
+        assert_eq!(wait_now(&ep), Vec::new());
+        assert_eq!(wait_now(&ep), Vec::new());
+    }
+
+    #[test]
+    fn a_file_that_counts_nothing_is_still_reported_by_level_without_epollet() {
+        // The level report is what a caller that did NOT ask for an edge
+        // gets, every time, however long the bit stays up.
+        let ep = Epoll::new(OpenFlags::empty());
+        let file: Arc<dyn FileLike> = Arc::new(Uncounted {
+            base: KObjectBase::new(),
+        });
+        ep.ctl(ADD, FileDesc::from(5), ev(IN, 3), Some(file))
+            .unwrap();
         for _ in 0..3 {
             assert_eq!(wait_now(&ep), alloc::vec![(IN, 3)]);
         }
+    }
+
+    #[test]
+    fn a_suppressing_uncounted_entry_is_not_level_subscribed() {
+        // A timerfd, a signalfd, a DRM device: a bus to park on, but no
+        // publication counter. With a level that is up and already reported,
+        // a LEVEL subscription fires the instant it is taken -- the latched
+        // flag is what it waits for -- so the wait would go straight round
+        // again. That is the same spin as before, moved inside the kernel.
+        use crate::sync::{Event, EventBus};
+        struct Bussed {
+            base: KObjectBase,
+            bus: Arc<lock::Mutex<EventBus>>,
+        }
+        impl_kobject!(Bussed);
+        #[async_trait]
+        impl FileLike for Bussed {
+            fn flags(&self) -> OpenFlags {
+                OpenFlags::empty()
+            }
+            fn set_flags(&self, _f: OpenFlags) -> LxResult {
+                Ok(())
+            }
+            async fn read(&self, _buf: &mut [u8]) -> LxResult<usize> {
+                Ok(0)
+            }
+            fn write(&self, _buf: &[u8]) -> LxResult<usize> {
+                Ok(0)
+            }
+            async fn read_at(&self, _offset: u64, _buf: &mut [u8]) -> LxResult<usize> {
+                Ok(0)
+            }
+            fn poll(&self, _events: PollEvents) -> LxResult<PollStatus> {
+                Ok(PollStatus {
+                    read: true,
+                    write: false,
+                    error: false,
+                    hangup: false,
+                })
+            }
+            async fn async_poll(&self, events: PollEvents) -> LxResult<PollStatus> {
+                self.poll(events)
+            }
+            fn subscribe_readiness(
+                &self,
+                events: PollEvents,
+                waker: &core::task::Waker,
+            ) -> Option<crate::sync::ReadinessSub> {
+                let mask = super::poll_events_to_bus_mask(events);
+                Some(crate::sync::subscribe_readiness_on(&self.bus, mask, waker))
+            }
+        }
+        let bus = Arc::new(lock::Mutex::new(EventBus::default()));
+        bus.lock().set(Event::READABLE);
+        let file = Arc::new(Bussed {
+            base: KObjectBase::new(),
+            bus: bus.clone(),
+        });
+        let ep = Epoll::new(OpenFlags::empty());
+        ep.ctl(
+            ADD,
+            FileDesc::from(5),
+            ev(IN | EPOLLET, 11),
+            Some(file as Arc<dyn FileLike>),
+        )
+        .unwrap();
+        // First time: the bit is up and new, so it is reported.
+        assert_eq!(wait_now(&ep), alloc::vec![(IN, 11)]);
+        // Now it is suppressed. A blocking wait has to sleep.
+        let (count, waker) = counting_waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut fut = alloc::boxed::Box::pin(ep.wait(16, -1));
+        assert!(fut.as_mut().poll(&mut cx).is_pending());
+        assert_eq!(
+            count.0.load(Ordering::SeqCst),
+            0,
+            "a level subscription on an already-up flag wakes the wait at once"
+        );
+    }
+
+    #[test]
+    fn an_uncounted_entry_reports_again_when_its_level_falls_and_rises() {
+        // The edge this kernel CAN see on a file with no counter, and the
+        // reason the level is worth measuring against at all.
+        use core::sync::atomic::{AtomicBool, Ordering};
+        struct Switch {
+            base: KObjectBase,
+            on: AtomicBool,
+        }
+        impl_kobject!(Switch);
+        #[async_trait]
+        impl FileLike for Switch {
+            fn flags(&self) -> OpenFlags {
+                OpenFlags::empty()
+            }
+            fn set_flags(&self, _f: OpenFlags) -> LxResult {
+                Ok(())
+            }
+            async fn read(&self, _buf: &mut [u8]) -> LxResult<usize> {
+                Ok(0)
+            }
+            fn write(&self, _buf: &[u8]) -> LxResult<usize> {
+                Ok(0)
+            }
+            async fn read_at(&self, _offset: u64, _buf: &mut [u8]) -> LxResult<usize> {
+                Ok(0)
+            }
+            fn poll(&self, _events: PollEvents) -> LxResult<PollStatus> {
+                Ok(PollStatus {
+                    read: self.on.load(Ordering::Relaxed),
+                    write: false,
+                    error: false,
+                    hangup: false,
+                })
+            }
+            async fn async_poll(&self, events: PollEvents) -> LxResult<PollStatus> {
+                self.poll(events)
+            }
+        }
+        let sw = Arc::new(Switch {
+            base: KObjectBase::new(),
+            on: AtomicBool::new(true),
+        });
+        let ep = Epoll::new(OpenFlags::empty());
+        ep.ctl(
+            ADD,
+            FileDesc::from(5),
+            ev(IN | EPOLLET, 9),
+            Some(sw.clone() as Arc<dyn FileLike>),
+        )
+        .unwrap();
+        assert_eq!(wait_now(&ep), alloc::vec![(IN, 9)]);
+        assert_eq!(wait_now(&ep), Vec::new());
+        // Drained: the scan sees the bit low and forgets it reported it.
+        sw.on.store(false, Ordering::Relaxed);
+        assert_eq!(wait_now(&ep), Vec::new());
+        sw.on.store(true, Ordering::Relaxed);
+        assert_eq!(
+            wait_now(&ep),
+            alloc::vec![(IN, 9)],
+            "low then high is an edge, counter or no counter"
+        );
     }
 
     const T0: Duration = Duration::from_secs(10);
@@ -2450,7 +2678,7 @@ mod edge_bookkeeping_tests {
         let f = evfd();
         add(&ep, fd, IN | EPOLLET, f.clone());
         assert_eq!(stored_edge(&ep, fd), None, "nothing scanned yet");
-        ep.store_edges(&[(fd, f, state())]);
+        ep.store_edges(&[(fd, f, state(), true)]);
         assert_eq!(stored_edge(&ep, fd), Some(state()));
     }
 
@@ -2476,7 +2704,7 @@ mod edge_bookkeeping_tests {
             Some(f.clone()),
         )
         .unwrap();
-        ep.store_edges(&[(fd, f, state())]);
+        ep.store_edges(&[(fd, f, state(), true)]);
         assert_eq!(stored_edge(&ep, fd), None);
     }
 
@@ -2495,7 +2723,7 @@ mod edge_bookkeeping_tests {
             .unwrap();
         let reused = evfd();
         add(&ep, fd, IN | EPOLLET, reused);
-        ep.store_edges(&[(fd, scanned, state())]);
+        ep.store_edges(&[(fd, scanned, state(), true)]);
         assert_eq!(stored_edge(&ep, fd), None);
     }
 
@@ -2508,7 +2736,7 @@ mod edge_bookkeeping_tests {
         add(&ep, fd, IN | EPOLLET, f.clone());
         ep.ctl(DEL, fd, EpollEvent { events: 0, data: 0 }, None)
             .unwrap();
-        ep.store_edges(&[(fd, f, state())]);
+        ep.store_edges(&[(fd, f, state(), true)]);
         assert_eq!(stored_edge(&ep, fd), None);
         assert!(ep.inner.lock().interest_list.is_empty());
     }
@@ -2545,7 +2773,10 @@ mod edge_bookkeeping_tests {
         let staying = FileDesc::from(5);
         add(&ep, gone, IN | EPOLLET, closing.clone());
         add(&ep, staying, IN | EPOLLET, other.clone());
-        ep.store_edges(&[(gone, closing.clone(), state()), (staying, other, state())]);
+        ep.store_edges(&[
+            (gone, closing.clone(), state(), true),
+            (staying, other, state(), true),
+        ]);
         assert_eq!(stored_edge(&ep, gone), Some(state()));
         assert_eq!(ep.forget_closed(&closing), 1);
         assert_eq!(stored_edge(&ep, gone), None, "state of a dropped entry");

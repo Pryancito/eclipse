@@ -869,3 +869,59 @@ mod tests {
         assert!(root_job.signal().contains(Signal::JOB_TERMINATED));
     }
 }
+
+#[cfg(test)]
+mod job_info_layout_tests {
+    use super::*;
+    use core::mem::{align_of, offset_of, size_of};
+
+    /// `JobInfo` is what `object_get_info(ZX_INFO_JOB)` copies out, and the
+    /// bindings upstream spell the same four fields in the same order:
+    /// `return_code`, `exited`, `kill_on_oom`, `debugger_attached`. The three
+    /// bools are adjacent and the same type, so trading two of them compiles,
+    /// leaves the size at sixteen, and turns "this job is killed when memory
+    /// runs out" into "this job has exited".
+    /// Same tail as `ProcessInfo`: the alignment of eight swallows a shorter
+    /// one, so the size cannot tell five bytes from one. The exact length is
+    /// held by the byte test below, whose constructor spells `[0; 5]`, so
+    /// shrinking it stops compiling. What the size catches is the element
+    /// type.
+    #[test]
+    fn zx_info_job_t_is_two_words() {
+        assert_eq!(size_of::<JobInfo>(), 16);
+        assert_eq!(align_of::<JobInfo>(), 8);
+        assert_eq!(offset_of!(JobInfo, return_code), 0);
+
+        let info = JobInfo::default();
+        assert_eq!(info.padding.len(), 5);
+        assert!(
+            info.padding.iter().all(|&b| b == 0),
+            "the reserved tail is copied to userspace, so Default has to zero it",
+        );
+    }
+
+    #[test]
+    fn the_three_flags_are_exited_then_kill_on_oom_then_debugger_attached() {
+        assert_eq!(offset_of!(JobInfo, exited), 8);
+        assert_eq!(offset_of!(JobInfo, kill_on_oom), 9);
+        assert_eq!(offset_of!(JobInfo, debugger_attached), 10);
+        assert_eq!(offset_of!(JobInfo, padding), 11);
+    }
+
+    #[test]
+    #[allow(unsafe_code)]
+    fn the_sixteen_bytes_are_the_fields_that_wrote_them() {
+        let info = JobInfo {
+            return_code: -9,
+            exited: true,
+            kill_on_oom: false,
+            debugger_attached: true,
+            padding: [0; 5],
+        };
+        let bytes: [u8; 16] =
+            unsafe { core::ptr::read_unaligned(&info as *const _ as *const [u8; 16]) };
+        assert_eq!(&bytes[0..8], &(-9i64).to_le_bytes());
+        assert_eq!(&bytes[8..11], &[1, 0, 1]);
+        assert_eq!(&bytes[11..16], &[0; 5]);
+    }
+}

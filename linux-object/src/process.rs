@@ -4871,7 +4871,12 @@ pub fn process_exists(pid: KoID) -> bool {
 /// Linux PID of the `init` process (the base program). The system's reaper of
 /// last resort for orphaned children, and the one process a `kill(-1, sig)`
 /// broadcast must never reach.
-pub const INIT_PID: KoID = 1;
+///
+/// Not written out here: it is the koid `zircon_object::task::create_init_*`
+/// actually hands the process, so that is where it comes from. A copy of the
+/// literal would be a second number that has to agree with the first, which
+/// is what this tree had, in three crates at once.
+pub const INIT_PID: KoID = zircon_object::task::INIT_PID;
 
 /// Live INIT (PID 1) process, or `None` if there is no running init.
 /// True for the Linux magic exe links that must not replace a real
@@ -5872,3 +5877,29 @@ mod dying_process_tests;
 
 #[cfg(test)]
 mod socket_fd_tests;
+
+#[cfg(test)]
+mod rlimit_layout_tests {
+    //! `struct rlimit` as `getrlimit(2)` and `prlimit64(2)` hand it over.
+    //!
+    //! The soft limit comes first and the hard limit second, both the same
+    //! width -- so a swap compiles clean and reports the hard limit where
+    //! the soft one belongs. Which is not hypothetical here: a stack limit
+    //! that announced 8 MiB while the loader mapped 512 KiB is what killed
+    //! halloy in `libvulkan`, and the number userspace believed came out of
+    //! this struct.
+    //!
+    //! Against `include/uapi/linux/resource.h`.
+
+    use super::*;
+    use core::mem::{align_of, offset_of, size_of};
+
+    #[test]
+    fn rlimit_is_the_two_rlim_t_of_struct_rlimit_the_soft_one_first() {
+        assert_eq!(size_of::<RLimit>(), 16);
+        assert_eq!(align_of::<RLimit>(), 8);
+        assert_eq!(offset_of!(RLimit, cur), 0);
+        assert_eq!(offset_of!(RLimit, max), 8);
+        assert_eq!(offset_of!(RLimit, max) + 8, 16);
+    }
+}

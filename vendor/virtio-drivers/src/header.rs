@@ -566,3 +566,117 @@ mod tests {
         assert!(core::mem::size_of::<VirtIOHeader>() <= 0x100);
     }
 }
+
+#[cfg(test)]
+mod register_map_layout_tests {
+    use super::*;
+    use core::mem::{align_of, offset_of, size_of};
+
+    // Every offset below is written out by hand from virtio 1.1, 4.2.2 "MMIO
+    // Device Register Layout", and from 4.2.4 for the three legacy registers
+    // this header still carries. None of them is computed from the struct: the
+    // point is for the numbers to disagree with the declaration on the day the
+    // declaration stops matching the specification.
+    //
+    // Nothing else in this crate can see these offsets. `fake_init` sets the
+    // device's registers through the field *names*, and the `fake_*` readers
+    // read them back the same way, so two fields of the same type trading
+    // places cancels out everywhere -- `verify()` included, which would then
+    // be comparing the magic value against the version register and the
+    // version against the magic. All eleven such swaps survive the suite.
+
+    #[test]
+    fn the_four_identity_registers_come_first_in_the_specifications_order() {
+        assert_eq!(offset_of!(VirtIOHeader, magic), 0x000);
+        assert_eq!(offset_of!(VirtIOHeader, version), 0x004);
+        assert_eq!(offset_of!(VirtIOHeader, device_id), 0x008);
+        assert_eq!(offset_of!(VirtIOHeader, vendor_id), 0x00c);
+    }
+
+    #[test]
+    fn each_side_of_the_feature_word_has_its_own_register_and_selector() {
+        // The feature word is 64 bits read through a 32-bit register, so each
+        // direction is a pair: the register and the half-selector that says
+        // which half it holds. Swapping a register with its selector writes
+        // the features into the selector and the selector into the features.
+        assert_eq!(offset_of!(VirtIOHeader, device_features), 0x010);
+        assert_eq!(offset_of!(VirtIOHeader, device_features_sel), 0x014);
+        assert_eq!(offset_of!(VirtIOHeader, __r1), 0x018);
+        assert_eq!(offset_of!(VirtIOHeader, driver_features), 0x020);
+        assert_eq!(offset_of!(VirtIOHeader, driver_features_sel), 0x024);
+    }
+
+    #[test]
+    fn the_three_legacy_registers_sit_where_the_legacy_interface_says() {
+        // A modern device ignores these three and a legacy one needs all of
+        // them, which is why they are holes in 4.2.2 and registers in 4.2.4.
+        assert_eq!(offset_of!(VirtIOHeader, guest_page_size), 0x028);
+        assert_eq!(offset_of!(VirtIOHeader, __r2), 0x02c);
+        assert_eq!(offset_of!(VirtIOHeader, queue_align), 0x03c);
+        assert_eq!(offset_of!(VirtIOHeader, queue_pfn), 0x040);
+    }
+
+    #[test]
+    fn the_queue_selector_is_followed_by_the_size_the_device_offers_and_the_one_the_driver_takes() {
+        assert_eq!(offset_of!(VirtIOHeader, queue_sel), 0x030);
+        assert_eq!(offset_of!(VirtIOHeader, queue_num_max), 0x034);
+        assert_eq!(offset_of!(VirtIOHeader, queue_num), 0x038);
+        // The device answers in the first and the driver publishes in the
+        // second, one word apart: the asking and the answering registers of
+        // the same question, which is exactly the pair worth pinning.
+        assert_eq!(
+            offset_of!(VirtIOHeader, queue_num) - offset_of!(VirtIOHeader, queue_num_max),
+            4
+        );
+    }
+
+    #[test]
+    fn queue_ready_follows_the_page_frame_number_it_replaced() {
+        assert_eq!(offset_of!(VirtIOHeader, queue_ready), 0x044);
+        assert_eq!(offset_of!(VirtIOHeader, __r3), 0x048);
+        assert_eq!(offset_of!(VirtIOHeader, queue_notify), 0x050);
+        assert_eq!(offset_of!(VirtIOHeader, __r4), 0x054);
+    }
+
+    #[test]
+    fn the_interrupt_pair_and_the_status_are_where_a_device_raises_them() {
+        assert_eq!(offset_of!(VirtIOHeader, interrupt_status), 0x060);
+        assert_eq!(offset_of!(VirtIOHeader, interrupt_ack), 0x064);
+        assert_eq!(offset_of!(VirtIOHeader, __r5), 0x068);
+        assert_eq!(offset_of!(VirtIOHeader, status), 0x070);
+        assert_eq!(offset_of!(VirtIOHeader, __r6), 0x074);
+    }
+
+    #[test]
+    fn each_of_the_three_ring_addresses_is_written_low_half_first() {
+        // These six registers are the only thing that tells the device where
+        // the queue lives, and they are write-only: nothing reads them back,
+        // so no round trip through the fake device can notice a pair that
+        // traded places. The device would simply fetch descriptors from
+        // (low << 32 | high) and walk somebody else's memory.
+        assert_eq!(offset_of!(VirtIOHeader, queue_desc_low), 0x080);
+        assert_eq!(offset_of!(VirtIOHeader, queue_desc_high), 0x084);
+        assert_eq!(offset_of!(VirtIOHeader, __r7), 0x088);
+        assert_eq!(offset_of!(VirtIOHeader, queue_avail_low), 0x090);
+        assert_eq!(offset_of!(VirtIOHeader, queue_avail_high), 0x094);
+        assert_eq!(offset_of!(VirtIOHeader, __r8), 0x098);
+        assert_eq!(offset_of!(VirtIOHeader, queue_used_low), 0x0a0);
+        assert_eq!(offset_of!(VirtIOHeader, queue_used_high), 0x0a4);
+    }
+
+    #[test]
+    fn the_generation_counter_is_the_last_word_before_the_config_space() {
+        // Twenty-one reserved words stand between the last ring address and
+        // the generation counter, and that count is what puts the counter at
+        // 0x0fc instead of somewhere inside the gap.
+        assert_eq!(offset_of!(VirtIOHeader, __r9), 0x0a8);
+        assert_eq!(offset_of!(VirtIOHeader, config_generation), 0x0fc);
+        // Exactly 0x100, not "at most": `config_space()` adds that offset to
+        // the header's own address, so the register map has to fill the window
+        // to the byte, and a map that came up short would leave registers the
+        // device drives unread rather than overlapping the config space.
+        assert_eq!(size_of::<VirtIOHeader>(), CONFIG_SPACE_OFFSET);
+        assert_eq!(size_of::<VirtIOHeader>(), 0x100);
+        assert_eq!(align_of::<VirtIOHeader>(), 4);
+    }
+}

@@ -642,6 +642,27 @@ fn union_apk_world(src: &Path, dst: &Path) {
     let _ = std::fs::write(dst, body);
 }
 
+/// The ONLY trees merged from the staging root into the real rootfs.
+///
+/// Never `bin/`, `lib/`, `sbin/` or base `/etc`: those are the hand-staged
+/// base the closure would otherwise clobber, and `copy_uncapped` overwrites,
+/// so one top-level entry here replaces the loader, the libc or the shell the
+/// image boots with -- and nothing fails at build time. `usr/lib` holds the X
+/// and mesa libs (musl lives in `/lib`, which is skipped), so the base
+/// loader/libc is preserved.
+const X_TREES: &[&str] = &[
+    "usr/bin",
+    "usr/lib",
+    "usr/libexec",
+    "usr/share",
+    "etc/fonts",
+    "etc/X11",
+    // XFCE/GTK: session defaults (xfce4/xfconf per-channel XML, autostart,
+    // menus) and the D-Bus policy files.
+    "etc/xdg",
+    "etc/dbus-1",
+];
+
 /// Populate `rootfs` with the X.Org stack. `apk_bin` is the (host-runnable)
 /// apk binary already staged into the rootfs by `mod.rs`, `arch` the target
 /// arch name (e.g. "x86_64"). Best-effort: never panics, never fails the build.
@@ -834,23 +855,6 @@ pub(super) fn install(rootfs: &Path, apk_bin: &Path, arch: &str) {
     }
     match &outcome {
         Ok(s) if s.success() => {
-            // Merge ONLY the X-owned trees from the staging root into the real
-            // rootfs. Never copy bin/ lib/ sbin/ or base /etc: those are the
-            // hand-staged base the closure would otherwise clobber. usr/lib
-            // holds the X + mesa libs (musl lives in /lib, which we skip), so
-            // the base loader/libc is preserved.
-            const X_TREES: &[&str] = &[
-                "usr/bin",
-                "usr/lib",
-                "usr/libexec",
-                "usr/share",
-                "etc/fonts",
-                "etc/X11",
-                // XFCE/GTK: session defaults (xfce4/xfconf per-channel XML,
-                // autostart, menus) and the D-Bus policy files.
-                "etc/xdg",
-                "etc/dbus-1",
-            ];
             let skip_nothing = stage.join("\0does-not-exist");
             for rel in X_TREES {
                 copy_uncapped(&stage.join(rel), &rootfs.join(rel), &skip_nothing);
@@ -2946,5 +2950,73 @@ mod tests {
             "the full rootfs's world is the source here, not the destination"
         );
         let _ = fs::remove_dir_all(&d);
+    }
+}
+
+#[cfg(test)]
+mod x_trees_tests {
+    //! The list that decides what the X closure is allowed to overwrite in
+    //! the real rootfs. `install` needs apk, a staging root and root
+    //! privileges, so no test reached the list before.
+
+    use super::*;
+
+    /// The base is hand-staged: `/lib` holds musl's loader, `/bin` busybox,
+    /// `/sbin` the init helpers and base `/etc` the files the image was built
+    /// with. `copy_uncapped` overwrites, so one top-level entry in this list
+    /// replaces the loader, the libc or the shell the image boots with --
+    /// and nothing fails at build time, because the build has already
+    /// succeeded by then.
+    #[test]
+    fn the_merge_never_reaches_the_hand_staged_base() {
+        for tree in X_TREES {
+            let top = tree.split('/').next().expect("a first component");
+            assert!(
+                matches!(top, "usr" | "etc"),
+                "{tree} is not an X-owned tree"
+            );
+            assert!(
+                tree.split('/').count() >= 2,
+                "{tree} is a whole top-level directory, not a tree inside one"
+            );
+            assert!(!tree.starts_with('/'), "{tree} is not relative");
+            assert!(!tree.ends_with('/'), "{tree} has a trailing separator");
+        }
+    }
+
+    /// The three the X session cannot start without: the binaries, the
+    /// libraries and the data (fonts, icons, xkb maps). `usr/bin` is where
+    /// `Xorg` itself lands, so dropping it installs the server in the staging
+    /// root and then leaves it on the floor -- which is exactly how `bash`
+    /// went missing, and the launcher died with `env: can't execute 'bash'`.
+    #[test]
+    fn the_x_server_its_libraries_and_its_data_are_all_merged() {
+        for needed in ["usr/bin", "usr/lib", "usr/share"] {
+            assert!(
+                X_TREES.contains(&needed),
+                "{needed} is not merged, so part of the stack is built and dropped"
+            );
+        }
+    }
+
+    /// No tree contains another, and none is repeated. A pair like `usr` and
+    /// `usr/bin` would copy the same files twice, and the second pass would
+    /// do it after the first had already landed -- so the slow part of the
+    /// build would run twice for the same result.
+    #[test]
+    fn no_tree_is_copied_twice_or_from_inside_another() {
+        for (i, a) in X_TREES.iter().enumerate() {
+            for b in &X_TREES[i + 1..] {
+                assert_ne!(a, b, "{a} is listed twice");
+                assert!(
+                    !b.starts_with(&format!("{a}/")),
+                    "{b} is already inside {a}"
+                );
+                assert!(
+                    !a.starts_with(&format!("{b}/")),
+                    "{a} is already inside {b}"
+                );
+            }
+        }
     }
 }

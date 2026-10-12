@@ -1088,8 +1088,17 @@ impl SemInfo {
     /// `include/uapi/linux/sem.h` defaults, as `semctl_info` fills them.
     /// `IPC_INFO` reports the limits alone; `SEM_INFO` puts the number of
     /// sets in `semusz` and of semaphores in `semaem`.
+    ///
+    /// The two limits a caller can actually hit come from the crate that
+    /// ENFORCES them, never from a copy here. A limit reported but not
+    /// enforced is the bug this pair already had once: `IPC_INFO` said 32000
+    /// and `semget` refused past 256, so PostgreSQL's sizing -- which reads
+    /// the limit and then asks for it -- was told yes and then no. `SEMMSL`
+    /// was fixed then; `SEMMNI` stayed a copy, and a mutation run showed why
+    /// that matters: renumbered in `linux-object`, the copy kept reporting
+    /// the old value and both suites stayed green.
     fn linux_limits(for_sem_info: bool, sets: usize, sems: usize) -> Self {
-        const SEMMNI: i32 = 32000;
+        const SEMMNI: i32 = linux_object::ipc::SEMMNI as i32;
         const SEMMSL: i32 = linux_object::ipc::SEMMSL as i32;
         let mut info = SemInfo {
             semmap: SEMMNI * SEMMSL,
@@ -1130,10 +1139,16 @@ impl MsgInfo {
     /// `include/uapi/linux/msg.h` defaults, as `msgctl_info` fills them.
     /// `MSG_INFO` puts the number of queues in `msgpool`, the bytes queued
     /// in `msgmap` and the messages in `msgtot`.
+    ///
+    /// The three limits come from the crate that enforces them, for the
+    /// reason [`SemInfo::linux_limits`] gives: `msgmni` bounds `msgget`,
+    /// `msgmax` bounds one `msgsnd` and `msgmnb` is the queue's capacity, and
+    /// a reader that is told one number and refused at another has no way to
+    /// size itself.
     fn linux_limits(for_msg_info: bool, queues: usize, bytes: usize, messages: usize) -> Self {
-        const MSGMNI: i32 = 32000;
-        const MSGMAX: i32 = 8192;
-        const MSGMNB: i32 = 16384;
+        const MSGMNI: i32 = linux_object::ipc::MSGMNI as i32;
+        const MSGMAX: i32 = linux_object::ipc::MSGMAX as i32;
+        const MSGMNB: i32 = linux_object::ipc::MSGMNB as i32;
         let mut info = MsgInfo {
             msgpool: MSGMNI * MSGMNB / 1024,
             msgmap: MSGMNB,
@@ -1822,6 +1837,33 @@ mod ipc_table_command_tests {
         let counts = MsgInfo::linux_limits(true, 2, 30, 3);
         assert_eq!((counts.msgpool, counts.msgmap, counts.msgtot), (2, 30, 3));
         assert_eq!(counts.msgseg, 0xffff);
+    }
+
+    /// `msgssz` and `msgseg`, the two fields of `struct msginfo` that
+    /// `msgctl_info` does not compute: `ipc/msg.c` writes `MSGSSZ` and
+    /// `MSGSEG` into them literally. A reader divides `msgpool` by the
+    /// segment size to get the segment count, so the pair has to be the one
+    /// Linux reports; nothing named `msgssz`, and halved it the suite stayed
+    /// green.
+    #[test]
+    fn the_segment_fields_of_msginfo_are_the_ones_linux_writes() {
+        let limits = MsgInfo::linux_limits(false, 0, 0, 0);
+        assert_eq!(limits.msgssz, 16);
+        assert_eq!(limits.msgseg, 0xffff);
+    }
+
+    /// The three totals of `struct seminfo`. `ipc/sem.c` fills `semmap`,
+    /// `semmns` and `semmnu` with `SEMMNS` -- the semaphores the whole system
+    /// allows, which Linux defines as `SEMMNI * SEMMSL` -- and `semume` with
+    /// `SEMMSL`. Only `semmsl` and `semmni` were named, so `semmap` could
+    /// have been either factor on its own.
+    #[test]
+    fn the_total_fields_of_seminfo_are_semmni_times_semmsl() {
+        let limits = SemInfo::linux_limits(false, 0, 0);
+        assert_eq!(limits.semmap, 32000 * 32000);
+        assert_eq!(limits.semmns, 32000 * 32000);
+        assert_eq!(limits.semmnu, 32000 * 32000);
+        assert_eq!(limits.semume, 32000);
     }
 }
 
@@ -2577,5 +2619,125 @@ mod command_number_tests {
                 assert_ne!(a, b);
             }
         }
+    }
+}
+#[cfg(test)]
+mod sembuf_layout_tests {
+    //! `struct sembuf` as `semop(2)` reads it from userspace.
+    //!
+    //! `semop` takes an array of these straight from the caller, so the
+    //! offsets are what decides which short is the semaphore number, which
+    //! is the operation and which is the flags. Swapping `op` and `flags`
+    //! compiles clean and turns every `SEM_UNDO` into an operation of
+    //! +0x1000 on the semaphore. Nothing pinned it.
+    //!
+    //! Against `include/uapi/linux/sem.h`.
+
+    use super::*;
+    use core::mem::{align_of, offset_of, size_of};
+
+    #[test]
+    fn sembuf_is_the_three_shorts_of_the_sysv_struct_sembuf() {
+        assert_eq!(size_of::<SemBuf>(), 6);
+        assert_eq!(align_of::<SemBuf>(), 2);
+        assert_eq!(offset_of!(SemBuf, num), 0);
+        assert_eq!(offset_of!(SemBuf, op), 2);
+        assert_eq!(offset_of!(SemBuf, flags), 4);
+        assert_eq!(offset_of!(SemBuf, flags) + 2, 6);
+    }
+}
+
+/// The four `*_INFO` answers, field by field.
+///
+/// `IPC_INFO`, `SEM_INFO`, `MSG_INFO` and `SHM_INFO` copy these straight into
+/// a buffer the caller sized from its own headers, so the order of the fields
+/// is the ABI. Every one of them already had its *size* checked -- `ShmInfo`
+/// even has a `const_assert_eq!` in production -- and that is not the same
+/// thing: swapping two neighbours of the same width keeps the size and the
+/// alignment untouched by construction. Twenty-three such swaps left all four
+/// sizes exactly as they were, and not one of them was caught.
+///
+/// What that gets wrong is quiet. `ipcs -u` would report the resident pages as
+/// the swapped ones, or the maximum number of semaphores per set as the
+/// system-wide maximum: numbers that stay plausible and that nobody can tell
+/// are wrong by looking at them.
+#[cfg(test)]
+mod info_layout_tests {
+    use super::*;
+    use core::mem::{align_of, offset_of, size_of};
+
+    /// `struct seminfo`, `include/uapi/linux/sem.h`: ten `int` in this order,
+    /// which `semctl_info` fills.
+    #[test]
+    fn struct_seminfo_is_ten_ints_in_the_headers_order() {
+        assert_eq!(size_of::<SemInfo>(), 40);
+        assert_eq!(align_of::<SemInfo>(), 4);
+        assert_eq!(offset_of!(SemInfo, semmap), 0);
+        assert_eq!(offset_of!(SemInfo, semmni), 4);
+        assert_eq!(offset_of!(SemInfo, semmns), 8);
+        assert_eq!(offset_of!(SemInfo, semmnu), 12);
+        assert_eq!(offset_of!(SemInfo, semmsl), 16);
+        assert_eq!(offset_of!(SemInfo, semopm), 20);
+        assert_eq!(offset_of!(SemInfo, semume), 24);
+        assert_eq!(offset_of!(SemInfo, semusz), 28);
+        assert_eq!(offset_of!(SemInfo, semvmx), 32);
+        assert_eq!(offset_of!(SemInfo, semaem), 36);
+    }
+
+    /// `struct msginfo`, `include/uapi/linux/msg.h`: seven `int` and then an
+    /// `unsigned short`, which is why the record is thirty bytes of fields in
+    /// thirty-two bytes of struct.
+    #[test]
+    fn struct_msginfo_is_seven_ints_and_then_a_short() {
+        assert_eq!(size_of::<MsgInfo>(), 32);
+        assert_eq!(align_of::<MsgInfo>(), 4);
+        assert_eq!(offset_of!(MsgInfo, msgpool), 0);
+        assert_eq!(offset_of!(MsgInfo, msgmap), 4);
+        assert_eq!(offset_of!(MsgInfo, msgmax), 8);
+        assert_eq!(offset_of!(MsgInfo, msgmnb), 12);
+        assert_eq!(offset_of!(MsgInfo, msgmni), 16);
+        assert_eq!(offset_of!(MsgInfo, msgssz), 20);
+        assert_eq!(offset_of!(MsgInfo, msgtot), 24);
+        assert_eq!(offset_of!(MsgInfo, msgseg), 28);
+        // Two bytes of the thirty-two are the tail padding after the short.
+        assert_eq!(offset_of!(MsgInfo, msgseg) + 2, 30);
+    }
+
+    /// `struct shm_info`, `include/uapi/linux/shm.h`: an `int` and then five
+    /// `__kernel_ulong_t`. The four bytes after `used_ids` are padding C puts
+    /// in exactly where Rust does, which is the only reason forty-eight bytes
+    /// is the right answer for six fields.
+    #[test]
+    fn struct_shm_info_is_an_int_then_five_words_past_its_padding() {
+        assert_eq!(size_of::<ShmInfo>(), 48);
+        assert_eq!(align_of::<ShmInfo>(), 8);
+        assert_eq!(offset_of!(ShmInfo, used_ids), 0);
+        assert_eq!(offset_of!(ShmInfo, shm_tot), 8);
+        assert_eq!(offset_of!(ShmInfo, shm_rss), 16);
+        assert_eq!(offset_of!(ShmInfo, shm_swp), 24);
+        assert_eq!(offset_of!(ShmInfo, swap_attempts), 32);
+        assert_eq!(offset_of!(ShmInfo, swap_successes), 40);
+    }
+
+    /// `struct shminfo64`, `include/uapi/linux/shm.h`: five
+    /// `__kernel_ulong_t` and then four more the header spells out one by one
+    /// as `__unused1..4`, which this struct keeps as one array of the same
+    /// width and count.
+    #[test]
+    fn struct_shminfo64_is_five_words_and_four_unused_ones() {
+        assert_eq!(size_of::<ShmInfo64>(), 72);
+        assert_eq!(align_of::<ShmInfo64>(), 8);
+        assert_eq!(offset_of!(ShmInfo64, shmmax), 0);
+        assert_eq!(offset_of!(ShmInfo64, shmmin), 8);
+        assert_eq!(offset_of!(ShmInfo64, shmmni), 16);
+        assert_eq!(offset_of!(ShmInfo64, shmseg), 24);
+        assert_eq!(offset_of!(ShmInfo64, shmall), 32);
+        assert_eq!(offset_of!(ShmInfo64, unused), 40);
+        assert_eq!(size_of::<[usize; 4]>(), 32);
+        assert_eq!(
+            size_of::<ShmInfo64>() - offset_of!(ShmInfo64, unused),
+            32,
+            "the four unused words are the whole tail"
+        );
     }
 }

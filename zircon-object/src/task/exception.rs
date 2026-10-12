@@ -1298,3 +1298,43 @@ mod tests {
         );
     }
 }
+
+/// The layout of the exception context, which only exists for the host
+/// architecture: `ExceptionContextInner` is written out once per architecture
+/// behind a `cfg_if`, so a mutant of the aarch64 or riscv64 form cannot be
+/// measured from here and a test of it could not be validated. x86_64 is the
+/// one this module pins.
+#[cfg(all(test, target_arch = "x86_64"))]
+mod exception_context_layout_tests {
+    use super::*;
+    use core::mem::{align_of, offset_of, size_of};
+
+    /// `vector`, `err_code` and `cr2` are three `u64` in a row, so any two of
+    /// them trade places without a word of complaint: a page fault would
+    /// report the faulting address as the error code. The size test next door
+    /// cannot see it, because it only checks that the report agrees with
+    /// itself: `size_of::<ExceptionReportV1>()` against
+    /// `size_of::<ExceptionHeader>() + size_of::<ExceptionContextInner>()`
+    /// holds for any layout, since a field added to the inner struct changes
+    /// both sides of it.
+    #[test]
+    fn the_x86_64_data_is_vector_then_error_code_then_cr2() {
+        assert_eq!(size_of::<ExceptionContextInner>(), 24);
+        assert_eq!(offset_of!(ExceptionContextInner, vector), 0);
+        assert_eq!(offset_of!(ExceptionContextInner, err_code), 8);
+        assert_eq!(offset_of!(ExceptionContextInner, cr2), 16);
+    }
+
+    /// The synthetic pair is what a policy exception carries, and the two are
+    /// adjacent `u32`s: swapping them hands a debugger the data as the code,
+    /// so the `ZX_EXCP_POLICY_CODE_` value it reads is whatever the kernel
+    /// meant as the extra word.
+    #[test]
+    fn the_synthetic_code_comes_before_the_synthetic_data() {
+        assert_eq!(size_of::<ExceptionContext>(), 32);
+        assert_eq!(align_of::<ExceptionContext>(), 8);
+        assert_eq!(offset_of!(ExceptionContext, arch), 0);
+        assert_eq!(offset_of!(ExceptionContext, synth_code), 24);
+        assert_eq!(offset_of!(ExceptionContext, synth_data), 28);
+    }
+}

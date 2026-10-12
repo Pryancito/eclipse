@@ -280,6 +280,12 @@ pub struct ShmidDs {
     pub lpid: u32,
     /// number of current attaches
     pub nattch: usize,
+    /// `__unused4` and `__unused5` of `shmid64_ds`, the reserved tail that
+    /// makes this struct the 112 bytes a libc hands to `shmctl`. Same story
+    /// as [`SemidDs`](crate::ipc::SemidDs): without them `IPC_STAT` wrote 96
+    /// bytes into a 112-byte buffer.
+    __unused4: usize,
+    __unused5: usize,
 }
 
 /// shared memory Identifier for process
@@ -402,6 +408,8 @@ impl ShmIdentifier {
                 cpid,
                 lpid: 0,
                 nattch: 0,
+                __unused4: 0,
+                __unused5: 0,
             }),
         }));
         // insert to global map — but never a private segment: it has no name,
@@ -1374,5 +1382,50 @@ mod shm_size_tests {
         let made = get(KEY, PAGE_SIZE + 1, CREAT | 0o666).unwrap();
         assert_eq!(made.lock().segsz(), PAGE_SIZE + 1);
         assert!(Arc::ptr_eq(&made, &get(KEY, 0, 0o666).unwrap()));
+    }
+}
+
+/// The wire layout of [`ShmidDs`], Linux's `struct shmid64_ds`.
+///
+/// `shm_segsz` is a `size_t` and the three timestamps are `__kernel_long_t`,
+/// all four the same width here, so the size can trade places with a
+/// timestamp without rustc noticing. Numbers from
+/// `arch/x86/include/uapi/asm/shmbuf.h`.
+#[cfg(test)]
+mod shmid_layout_tests {
+    use super::ShmidDs;
+    use core::mem::{align_of, offset_of, size_of};
+
+    #[test]
+    fn shmid64_ds_is_one_hundred_and_twelve_bytes() {
+        assert_eq!(size_of::<ShmidDs>(), 112);
+        assert_eq!(align_of::<ShmidDs>(), 8);
+        assert_eq!(offset_of!(ShmidDs, perm), 0);
+    }
+
+    #[test]
+    fn the_size_comes_first_then_attach_detach_change() {
+        assert_eq!(offset_of!(ShmidDs, segsz), 48);
+        assert_eq!(offset_of!(ShmidDs, atime), 56);
+        assert_eq!(offset_of!(ShmidDs, dtime), 64);
+        assert_eq!(offset_of!(ShmidDs, ctime), 72);
+    }
+
+    #[test]
+    fn the_creator_pid_comes_before_the_last_operator_pid() {
+        assert_eq!(offset_of!(ShmidDs, cpid), 80);
+        assert_eq!(offset_of!(ShmidDs, lpid), 84);
+        assert_eq!(offset_of!(ShmidDs, nattch), 88);
+        assert_eq!(offset_of!(ShmidDs, __unused4), 96);
+        assert_eq!(offset_of!(ShmidDs, __unused5), 104);
+    }
+
+    #[test]
+    fn a_default_shmid_ds_leaves_the_reserved_tail_zero() {
+        // `IPC_STAT` copies the struct out byte for byte, so a non-zero
+        // reserved word would be kernel state handed to userspace.
+        let ds = ShmidDs::default();
+        assert_eq!(ds.__unused4, 0);
+        assert_eq!(ds.__unused5, 0);
     }
 }

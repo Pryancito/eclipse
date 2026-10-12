@@ -2787,3 +2787,102 @@ mod benches {
         });
     }
 }
+
+#[cfg(test)]
+mod cap_user_data_layout_tests {
+    use super::*;
+    use core::mem::{align_of, offset_of, size_of};
+
+    /// `CapUserData` is `struct __user_cap_data_struct`, which `capget`
+    /// writes into the caller's buffer and `capset` reads out of it. Linux
+    /// spells it
+    ///
+    /// ```text
+    /// struct __user_cap_data_struct {
+    ///         __u32 effective;
+    ///         __u32 permitted;
+    ///         __u32 inheritable;
+    /// };
+    /// ```
+    ///
+    /// Three `u32` in a row, and the three sets mean very different things:
+    /// trading `effective` and `permitted` would report as already held every
+    /// capability the process is merely allowed to raise, and `capset` would
+    /// raise the ones it only meant to keep available.
+    #[test]
+    fn user_cap_data_struct_is_three_words_of_thirty_two_bits() {
+        assert_eq!(size_of::<CapUserData>(), 12);
+        assert_eq!(align_of::<CapUserData>(), 4);
+        assert_eq!(offset_of!(CapUserData, effective), 0);
+        assert_eq!(offset_of!(CapUserData, permitted), 4);
+        assert_eq!(offset_of!(CapUserData, inheritable), 8);
+    }
+
+    /// The twelve bytes as the three sets write them, read back: this notices
+    /// two sets trading places even where their offsets are not read one by
+    /// one.
+    #[test]
+    #[allow(unsafe_code)]
+    fn the_twelve_bytes_are_the_sets_that_wrote_them() {
+        let data = CapUserData {
+            effective: 0xaaaa_0001,
+            permitted: 0xbbbb_0002,
+            inheritable: 0xcccc_0003,
+        };
+        let bytes: [u8; 12] =
+            unsafe { core::ptr::read_unaligned(&data as *const _ as *const [u8; 12]) };
+        assert_eq!(&bytes[0..4], &0xaaaa_0001u32.to_le_bytes());
+        assert_eq!(&bytes[4..8], &0xbbbb_0002u32.to_le_bytes());
+        assert_eq!(&bytes[8..12], &0xcccc_0003u32.to_le_bytes());
+    }
+}
+#[cfg(test)]
+mod sysinfo_layout_tests {
+    //! `struct sysinfo` as `sysinfo(2)` hands it to userspace.
+    //!
+    //! `free`, `top` and `htop` read this out of a buffer they sized
+    //! themselves, field by field, and nothing here pinned any of it: not
+    //! the size, not the order. Measured over the crate's whole suite, the
+    //! six swaps its same-typed neighbours allow all survived -- and a swap
+    //! of `totalram` and `freeram` makes `free` report the used memory as
+    //! the total.
+    //!
+    //! Against `include/uapi/linux/sysinfo.h`, on a 64-bit arch, which is
+    //! every arch this kernel builds for: `__kernel_ulong_t` is eight bytes
+    //! throughout.
+
+    use super::*;
+    use core::mem::{align_of, offset_of, size_of};
+
+    /// The uapi has two padding fields this declaration leaves out: an
+    /// explicit `__u16 pad` after `procs`, and a `char _f[]` tail sized so
+    /// the struct comes out the same total. On a 64-bit arch the tail is
+    /// `20 - 2*8 - 4` bytes long, which is none, and the `pad` sits exactly
+    /// where Rust puts the padding it needs to align the `u64` that follows
+    /// -- so the two layouts agree byte for byte. That agreement is what is
+    /// checked here rather than assumed.
+    #[test]
+    fn sysinfo_is_the_uapi_struct_sysinfo_field_by_field() {
+        assert_eq!(size_of::<SysInfo>(), 112);
+        assert_eq!(align_of::<SysInfo>(), 8);
+        assert_eq!(offset_of!(SysInfo, uptime), 0);
+        // The three load averages, eight bytes each.
+        assert_eq!(offset_of!(SysInfo, loads), 8);
+        assert_eq!(offset_of!(SysInfo, totalram), 32);
+        assert_eq!(offset_of!(SysInfo, freeram), 40);
+        assert_eq!(offset_of!(SysInfo, sharedram), 48);
+        assert_eq!(offset_of!(SysInfo, bufferram), 56);
+        assert_eq!(offset_of!(SysInfo, totalswap), 64);
+        assert_eq!(offset_of!(SysInfo, freeswap), 72);
+        assert_eq!(offset_of!(SysInfo, procs), 80);
+        // Bytes 82..88 are the uapi's explicit `pad` and the alignment
+        // padding behind it.
+        assert_eq!(offset_of!(SysInfo, totalhigh), 88);
+        assert_eq!(offset_of!(SysInfo, freehigh), 96);
+        assert_eq!(offset_of!(SysInfo, mem_unit), 104);
+        // And bytes 108..112 are the tail padding that rounds the struct up
+        // to its eight-byte alignment, which is where the uapi's `_f` would
+        // start if it were not empty here.
+        assert_eq!(offset_of!(SysInfo, mem_unit) + 4 + 4, 112);
+    }
+}

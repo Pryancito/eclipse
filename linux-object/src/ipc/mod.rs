@@ -912,3 +912,46 @@ mod ipc_access_tests {
         assert!(!read_only.may_access(OWNER, OWNER_GROUP, &[], IPC_R | IPC_W));
     }
 }
+
+/// The wire layout of [`IpcPerm`], which is Linux's `struct ipc64_perm` and
+/// the first 48 bytes of the three `*_ds` structs that `IPC_STAT` copies out.
+///
+/// Nothing pinned this. Every field is read and written by name, so swapping
+/// two adjacent `u32`s -- `uid` for `gid`, `cuid` for `cgid` -- compiles
+/// cleanly, passes every behaviour test in this crate, and quietly answers a
+/// different question to `ipcs` and to every libc. Numbers from
+/// `include/uapi/asm-generic/ipcbuf.h`.
+#[cfg(test)]
+mod ipc_perm_layout_tests {
+    use super::IpcPerm;
+    use core::mem::{align_of, offset_of, size_of};
+
+    #[test]
+    fn ipc64_perm_is_forty_eight_bytes_aligned_to_eight() {
+        assert_eq!(size_of::<IpcPerm>(), 48);
+        assert_eq!(align_of::<IpcPerm>(), 8);
+    }
+
+    #[test]
+    fn the_key_and_the_four_credentials_come_before_the_mode() {
+        assert_eq!(offset_of!(IpcPerm, key), 0);
+        assert_eq!(offset_of!(IpcPerm, uid), 4);
+        assert_eq!(offset_of!(IpcPerm, gid), 8);
+        assert_eq!(offset_of!(IpcPerm, cuid), 12);
+        assert_eq!(offset_of!(IpcPerm, cgid), 16);
+        assert_eq!(offset_of!(IpcPerm, mode), 20);
+    }
+
+    #[test]
+    fn the_sequence_number_covers_both_of_linuxs_shorts() {
+        // `ipc64_perm` carries `unsigned short seq; unsigned short __pad2;`
+        // at 24 and 26, and its `__pad1` is empty on x86_64 because
+        // `__kernel_mode_t` is already four bytes wide. A little-endian `u32`
+        // at 24 is those two: a sequence number below 65536 lands in bytes 24
+        // and 25 and zeroes 26 and 27, which is what a zero `__pad2` is. The
+        // two words after it are `__unused1` and `__unused2`.
+        assert_eq!(offset_of!(IpcPerm, __seq), 24);
+        assert_eq!(offset_of!(IpcPerm, __pad1), 32);
+        assert_eq!(offset_of!(IpcPerm, __pad2), 40);
+    }
+}

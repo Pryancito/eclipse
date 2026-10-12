@@ -144,6 +144,50 @@ struct Aarch64GeneralRegs {
     tpidr: usize,
 }
 
+/// `zx_thread_state_general_regs_t` as aarch64 defines it, which is what a
+/// debugger reads and writes through `zx_thread_read_state`.
+///
+/// This struct is not assembled field by field from a buffer: `read_state`
+/// builds it by name and hands the whole thing to `write_struct`, which casts
+/// the caller's bytes to this type and assigns. So every slot the debugger
+/// parses is this declaration's field order, and swapping two neighbours --
+/// all five tails are `usize` -- compiles clean and moves the bytes without
+/// anything in the kernel disagreeing with itself.
+///
+/// It goes in as a compile-time assertion rather than a test because the whole
+/// block is behind `target_arch = "aarch64"`: no `cargo test` on an x86_64 or
+/// riscv host compiles these lines, so a test here would never run, and a
+/// mutant here comes back alive without anyone having looked at it.
+#[cfg(target_arch = "aarch64")]
+const _: () = {
+    assert!(offset_of!(Aarch64GeneralRegs, r) == 0, "x0..x29 come first");
+    // The thirty general registers are x0..x29; x30 is the link register and
+    // has its own slot, which is why `read_state` copies `regs.x30` into `lr`
+    // instead of into `r[30]`.
+    assert!(
+        offset_of!(Aarch64GeneralRegs, lr) == 30 * 8,
+        "lr is x30 and follows the thirty"
+    );
+    assert!(offset_of!(Aarch64GeneralRegs, sp) == 31 * 8, "then sp");
+    assert!(offset_of!(Aarch64GeneralRegs, pc) == 32 * 8, "then pc");
+    assert!(offset_of!(Aarch64GeneralRegs, cpsr) == 33 * 8, "then cpsr");
+    assert!(
+        offset_of!(Aarch64GeneralRegs, tpidr) == 34 * 8,
+        "and tpidr last"
+    );
+    // The size is the count `zx_thread_read_state` answers and the length
+    // `write_struct` checks the caller's buffer against, so a slot added
+    // without the ABI moving would be a short read rather than a build error.
+    assert!(
+        size_of::<Aarch64GeneralRegs>() == 35 * 8,
+        "thirty-five words, no padding"
+    );
+    assert!(align_of::<Aarch64GeneralRegs>() == 8);
+};
+
+#[cfg(target_arch = "aarch64")]
+use core::mem::{align_of, offset_of, size_of};
+
 trait BufExt {
     fn read_struct<T>(&self) -> ZxResult<T>;
     fn write_struct<T: Copy>(&mut self, value: &T) -> ZxResult<usize>;

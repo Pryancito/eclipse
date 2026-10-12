@@ -732,3 +732,122 @@ mod blocking_read_tests {
         assert_eq!(reader.lock_linux().sigwait.val(), 0);
     }
 }
+
+#[cfg(test)]
+mod siginfo_layout_tests {
+    //! Which arm of the `siginfo_t` union a signal carries, which is what
+    //! decides the fields `signalfd_record` is allowed to fill. The three
+    //! boundaries of `si_code` are the whole decision, and the records the
+    //! suite builds only ever land well inside the range.
+
+    use super::*;
+
+    /// `si_code` **strictly** between `SI_USER` (0) and `SI_KERNEL` (0x80)
+    /// means the kernel stamped it, and only then does the union belong to
+    /// the signal. The range is open at both ends, as it is in Linux's own
+    /// `siginfo_layout`: a `SIGCHLD` that came from `kill(2)` carries a
+    /// sender and not a child, and one stamped `SI_KERNEL` itself carries
+    /// neither. Read a sender's `SIGCHLD` as a `_sigchld` and `ssi_status`
+    /// comes out of bytes nobody wrote, which a shell reads as an exit code.
+    #[test]
+    fn the_range_the_kernel_stamps_is_open_at_both_ends() {
+        let chld = LinuxSignal::SIGCHLD as i32;
+        assert_eq!(
+            siginfo_layout(chld, 1),
+            SiginfoLayout::Chld,
+            "CLD_EXITED is the bottom of the range"
+        );
+        assert_eq!(
+            siginfo_layout(chld, 0x7f),
+            SiginfoLayout::Chld,
+            "one below SI_KERNEL is still inside"
+        );
+        assert_eq!(
+            siginfo_layout(chld, 0),
+            SiginfoLayout::Kill,
+            "SI_USER is a sender, not a child"
+        );
+        assert_eq!(
+            siginfo_layout(chld, 0x80),
+            SiginfoLayout::Kill,
+            "SI_KERNEL is the first code outside the range"
+        );
+    }
+
+    /// The five signals whose union is `_sigfault`: userspace reads
+    /// `ssi_addr` for those and for nothing else. A `SIGQUIT` or a `SIGABRT`
+    /// is a plain kill however the kernel stamped it, and filling `ssi_addr`
+    /// for one of them hands an event loop a fault address it invented.
+    #[test]
+    fn five_signals_carry_an_address_and_no_others_do() {
+        for sig in [
+            LinuxSignal::SIGSEGV,
+            LinuxSignal::SIGBUS,
+            LinuxSignal::SIGILL,
+            LinuxSignal::SIGFPE,
+            LinuxSignal::SIGTRAP,
+        ] {
+            assert_eq!(
+                siginfo_layout(sig as i32, 1),
+                SiginfoLayout::Fault,
+                "{:?} faults at an address",
+                sig
+            );
+        }
+        for sig in [
+            LinuxSignal::SIGQUIT,
+            LinuxSignal::SIGABRT,
+            LinuxSignal::SIGINT,
+            LinuxSignal::SIGUSR1,
+            LinuxSignal::SIGALRM,
+            LinuxSignal::SIGPIPE,
+        ] {
+            assert_eq!(
+                siginfo_layout(sig as i32, 1),
+                SiginfoLayout::Kill,
+                "{:?} carries no address",
+                sig
+            );
+        }
+    }
+
+    /// `SI_TIMER` is the one negative code with a union of its own: a POSIX
+    /// timer's expiry carries the timer id and the overrun count. Every other
+    /// negative code is `_rt`, a sender and the `sigval` they queued, and
+    /// `SI_USER` is not negative at all. Reading a `_timer` as an `_rt` is
+    /// the bug this file already had: the timer id came out as `ssi_pid`, so
+    /// an event loop read a signal from a process that does not exist.
+    #[test]
+    fn a_timer_is_the_only_negative_code_with_a_union_of_its_own() {
+        let alrm = LinuxSignal::SIGALRM as i32;
+        assert_eq!(siginfo_layout(alrm, -2), SiginfoLayout::Timer, "SI_TIMER");
+        assert_eq!(siginfo_layout(alrm, -1), SiginfoLayout::Rt, "SI_QUEUE");
+        assert_eq!(siginfo_layout(alrm, -3), SiginfoLayout::Rt, "SI_MESGQ");
+        assert_eq!(siginfo_layout(alrm, -4), SiginfoLayout::Rt, "SI_ASYNCIO");
+        assert_eq!(siginfo_layout(alrm, -6), SiginfoLayout::Rt, "SI_TKILL");
+        assert_eq!(
+            siginfo_layout(alrm, 0),
+            SiginfoLayout::Kill,
+            "SI_USER queued no value: it is not negative"
+        );
+    }
+
+    /// The signal number alone never decides the union, and the code is
+    /// asked first. The same `SIGSEGV` is a fault report from the kernel, a
+    /// plain kill from `kill(2)`, a queued value from `sigqueue(3)` and a
+    /// timer expiry from a timer armed with it.
+    #[test]
+    fn the_signal_number_alone_never_decides_the_union() {
+        let segv = LinuxSignal::SIGSEGV as i32;
+        assert_eq!(siginfo_layout(segv, 1), SiginfoLayout::Fault, "SEGV_MAPERR");
+        assert_eq!(siginfo_layout(segv, 0), SiginfoLayout::Kill, "kill(2)");
+        assert_eq!(siginfo_layout(segv, -1), SiginfoLayout::Rt, "sigqueue(3)");
+        assert_eq!(siginfo_layout(segv, -2), SiginfoLayout::Timer, "a timer");
+        let chld = LinuxSignal::SIGCHLD as i32;
+        assert_eq!(
+            siginfo_layout(chld, -1),
+            SiginfoLayout::Rt,
+            "a queued SIGCHLD is the sender's value, not a child"
+        );
+    }
+}

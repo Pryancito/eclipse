@@ -208,6 +208,11 @@ mod regs;
 /// phys>>4`); writing `phys>>12` directly hangs the GPU.
 mod gmmu;
 
+/// Bitmap VRAM allocator for the BAR1 aperture; own file for the size
+/// ceiling, no logic change.
+mod vram_alloc;
+use vram_alloc::NvidiaVramAllocator;
+
 /// Coherent-sysmem structures for the Turing copy-engine bring-up (the verified
 /// memory plan). All allocated via `DmaRegion::alloc_coherent` (page-aligned,
 /// zeroed, UC). Built and dumped read-only at `/proc/gpudbg` for hand
@@ -883,6 +888,10 @@ pub struct NvidiaGpu {
     /// because every other nouveau-uAPI state here is keyed by pid too
     /// (`nouveau_pid_ctx`); cleared in `nouveau_release_process`.
     nouveau_uvmm: Mutex<Vec<NouveauUvmm>>,
+    /// NVIF device objects, `(pid, cookie)`: what a `NEW` of `NV_DEVICE`
+    /// on route 0 created (`nouveau_abi16_obj_new(DEVICE)`), which is the
+    /// only object a `MTHD` may name and what a route-0 `DEL` removes.
+    nouveau_nvif_devices: Mutex<Vec<(u64, u64)>>,
     /// Per-process GPU context assignment: `(owner_pid, ctx_idx, h_vas,
     /// h_notifier)`. The compositor (context 0) is NOT tracked here. A GL
     /// client's context is built on its FIRST GPU touch -- `VM_BIND` or
@@ -955,82 +964,6 @@ pub struct NvidiaGpu {
     /// boot to bring the GPU's MSI delivery online across the SEC2-resume
     /// window (the Linux-faithful interrupt path). Set once, after construction.
     msi_vector: AtomicUsize,
-}
-
-/// Simple bitmap-based VRAM allocator for BAR1 aperture (4KB page granularity)
-struct NvidiaVramAllocator {
-    base_phys: u64,
-    total_size: u64,
-    bitmap: Vec<u64>,
-}
-
-impl NvidiaVramAllocator {
-    fn new(base_phys: u64, total_size: u64) -> Self {
-        let num_pages = (total_size / 4096) as usize;
-        let num_u64s = num_pages.div_ceil(64);
-        Self {
-            base_phys,
-            total_size,
-            bitmap: alloc::vec![0; num_u64s],
-        }
-    }
-
-    /// Unused (kept for a future purely-Rust-side allocation need): the
-    /// nouveau-uAPI `GEM_NEW` handler (`nvidia.rs` `ioctl`) allocates
-    /// through the real RM heap instead (`nvidia_rm_sys::rm_init::
-    /// gem_alloc`) so it shares RM's own VRAM bookkeeping rather than
-    /// carving up the same physical range out-of-band with a second,
-    /// independent allocator.
-    #[allow(dead_code)]
-    fn _alloc(&mut self, size: usize, align: usize) -> Option<u64> {
-        let num_pages = size.div_ceil(4096);
-        let align_pages = (align.max(4096) / 4096).max(1);
-        let total_bits = (self.total_size / 4096) as usize;
-
-        let mut count = 0;
-        let mut start_bit = 0;
-
-        for bit in 0..total_bits {
-            let uidx = bit / 64;
-            let ubit = bit % 64;
-            let is_free = (self.bitmap[uidx] & (1 << ubit)) == 0;
-
-            if is_free {
-                if count == 0 {
-                    if bit % align_pages != 0 {
-                        continue;
-                    }
-                    start_bit = bit;
-                }
-                count += 1;
-                if count >= num_pages {
-                    for i in 0..num_pages {
-                        let b = start_bit + i;
-                        self.bitmap[b / 64] |= 1 << (b % 64);
-                    }
-                    return Some(self.base_phys + (start_bit as u64 * 4096));
-                }
-            } else {
-                count = 0;
-            }
-        }
-        None
-    }
-
-    fn free(&mut self, phys_addr: u64, size: usize) {
-        let offset = phys_addr.saturating_sub(self.base_phys);
-        if offset >= self.total_size {
-            return;
-        }
-        let start_bit = (offset / 4096) as usize;
-        let num_pages = size.div_ceil(4096);
-        for i in 0..num_pages {
-            let b = start_bit + i;
-            if b / 64 < self.bitmap.len() {
-                self.bitmap[b / 64] &= !(1 << (b % 64));
-            }
-        }
-    }
 }
 
 /// Last outcome of the HDMI/DP audio enable, for `/proc/gpusnd`.
@@ -1341,6 +1274,7 @@ impl NvidiaGpu {
             nouveau_gem_handle_end: gem_handle_slice.end(),
             nouveau_vm_mappings: Mutex::new(Vec::new()),
             nouveau_uvmm: Mutex::new(Vec::new()),
+            nouveau_nvif_devices: Mutex::new(Vec::new()),
             nouveau_pid_ctx: Mutex::new(Vec::new()),
             nouveau_fast: Mutex::new(
                 (0..super::nouveau_uapi::MAX_CTX)
@@ -8592,6 +8526,7 @@ impl DrmScheme for NvidiaGpu {
         // Its uvmm goes with it (`nouveau_uvmm_fini` from the file's
         // postclose): a recycled pid starts over at `VM_INIT`.
         self.nouveau_uvmm.lock().retain(|u| u.pid != pid);
+        self.nouveau_nvif_devices.lock().retain(|d| d.0 != pid);
         // A process going away is one event sure to follow every zombie
         // context (below): the ones that are due get their teardown first,
         // and one still wearing this very pid (recycled) is re-keyed, so
@@ -12083,6 +12018,18 @@ impl NvidiaGpu {
         let hdr = unsafe { core::ptr::read_unaligned(arg as *const nv::NvifIoctlV0) };
         let body = arg + HDR;
         let body_len = size - HDR;
+        // `nouveau_abi16_ioctl`: the header's version is 0 and its route
+        // is 0x00 (the client's own objects: the device) or 0xff (a
+        // channel's, named by `token`), checked before the type is looked
+        // at; an unknown type is EINVAL, like an unknown ioctl argument.
+        if hdr.version != 0 || (hdr.route != 0 && hdr.route != 0xff) {
+            log::warn!(
+                "[nouveau-uapi] NVIF: header version={:#04x} route={:#04x} -> EINVAL",
+                hdr.version,
+                hdr.route
+            );
+            return Err(nv::EINVAL);
+        }
 
         match hdr.type_ {
             nv::NVIF_IOCTL_V0_NEW => {
@@ -12090,7 +12037,24 @@ impl NvidiaGpu {
                     return Err(nv::EINVAL);
                 }
                 let new = unsafe { core::ptr::read_unaligned(body as *const nv::NvifIoctlNewV0) };
-                if new.oclass == nv::NVIF_CLASS_NV_DEVICE {
+                if new.version != 0 {
+                    return Err(nv::EINVAL);
+                }
+                // The route says what is being made (`nouveau_abi16_ioctl_new`):
+                // on route 0 only the device object, under the client
+                // (`object` 0) and of class NV_DEVICE; on route 0xff an
+                // engine object on the channel `token` names. The class
+                // alone decided here, so a device NEW on a channel's route,
+                // or one hung under another object, went through.
+                if hdr.route == 0 {
+                    if hdr.object != 0 || new.oclass != nv::NVIF_CLASS_NV_DEVICE {
+                        log::warn!(
+                            "[nouveau-uapi] NVIF NEW on route 0: object={:#x} oclass={:#06x} is not the device under the client -> EINVAL",
+                            hdr.object,
+                            new.oclass
+                        );
+                        return Err(nv::EINVAL);
+                    }
                     // The NEW body is followed by class data -- `nv_device_v0`
                     // for NV_DEVICE, whose `device` selects which GPU the
                     // client wants (mesa passes ~0 = "client default", i.e.
@@ -12121,6 +12085,10 @@ impl NvidiaGpu {
                         "[nouveau-uapi] NVIF NEW NV_DEVICE (token={:#x}) -- device object accepted",
                         new.token
                     );
+                    let mut devs = self.nouveau_nvif_devices.lock();
+                    if !devs.contains(&(owner_pid, new.object)) {
+                        devs.push((owner_pid, new.object));
+                    }
                 } else if new.oclass == 0 {
                     // Mesa only reaches this if SCLASS gave it nothing usable.
                     log::warn!("[nouveau-uapi] NVIF NEW with oclass=0 -- rejecting");
@@ -12239,14 +12207,41 @@ impl NvidiaGpu {
                     return Err(nv::EINVAL);
                 }
                 let mthd = unsafe { core::ptr::read_unaligned(body as *const nv::NvifIoctlMthdV0) };
+                // `nouveau_abi16_ioctl_mthd`: route 0, on a device object
+                // of the caller's, the one method there is, a body of
+                // exactly the reply's size, and a version-0 reply
+                // template; anything else is EINVAL (an unknown method
+                // was ENOSYS here, and any object, any route and any
+                // longer body went through).
+                if hdr.route != 0 {
+                    return Err(nv::EINVAL);
+                }
+                if !self
+                    .nouveau_nvif_devices
+                    .lock()
+                    .contains(&(owner_pid, hdr.object))
+                {
+                    log::warn!(
+                        "[nouveau-uapi] NVIF MTHD: object={:#x} is not a device object of pid={} -> EINVAL",
+                        hdr.object,
+                        owner_pid
+                    );
+                    return Err(nv::EINVAL);
+                }
                 if mthd.method != nv::NV_DEVICE_V0_INFO {
                     log::warn!(
-                        "[nouveau-uapi] NVIF MTHD: method {:#04x} not implemented",
+                        "[nouveau-uapi] NVIF MTHD: method {:#04x} is not NV_DEVICE_V0_INFO -> EINVAL",
                         mthd.method
                     );
-                    return Err(nv::ENOSYS);
+                    return Err(nv::EINVAL);
                 }
-                if body_len - MB < core::mem::size_of::<nv::NvDeviceInfoV0>() {
+                if body_len - MB != core::mem::size_of::<nv::NvDeviceInfoV0>() {
+                    return Err(nv::EINVAL);
+                }
+                let asked_version =
+                    unsafe { core::ptr::read_unaligned((body + MB) as *const nv::NvDeviceInfoV0) }
+                        .version;
+                if asked_version != 0 {
                     return Err(nv::EINVAL);
                 }
                 // Report the board's REAL VRAM size. GEM_NEW honours a VRAM-only
@@ -12436,6 +12431,14 @@ impl NvidiaGpu {
                 // pointer, equal values across two Mesa processes are
                 // possible, and an unscoped removal would free another live
                 // client's class object (see `class_object_remove`).
+                // `nouveau_abi16_ioctl_del`: route 0 and no body, else
+                // EINVAL; an object nobody made is a no-op.
+                if hdr.route != 0 || body_len != 0 {
+                    return Err(nv::EINVAL);
+                }
+                self.nouveau_nvif_devices
+                    .lock()
+                    .retain(|d| *d != (owner_pid, hdr.object));
                 if let Some(h_object) = nv::class_object_remove(hdr.object, owner_pid) {
                     if let Some(device_instance) = *self.rm_device_instance.lock() {
                         let status = nvidia_rm_sys::rm_init::class_free(device_instance, h_object);
@@ -12453,10 +12456,10 @@ impl NvidiaGpu {
 
             other => {
                 log::warn!(
-                    "[nouveau-uapi] NVIF: type {:#04x} not implemented -- returning ENOSYS",
+                    "[nouveau-uapi] NVIF: type {:#04x} is not one of SCLASS/NEW/DEL/MTHD -> EINVAL",
                     other
                 );
-                Err(nv::ENOSYS)
+                Err(nv::EINVAL)
             }
         }
     }
@@ -12912,15 +12915,24 @@ impl NvidiaGpu {
                     // Only the channel's own process may free it: freeing the
                     // compositor's channel 0 from a client made its next EXEC
                     // fail EINVAL.
+                    // `nouveau_abi16_ioctl_channel_free` looks the id up
+                    // in the FILE's channel list (`nouveau_abi16_chan`):
+                    // a freed, never-allocated or another client's channel
+                    // is ENOENT, like EXEC's, not EINVAL (which libdrm's
+                    // `nouveau_object_del` reads as "bad arguments").
                     let Some(pos) = chans.iter().position(|c| {
                         c.id == req.channel && (owner_pid == 0 || c.owner_pid == owner_pid)
                     }) else {
-                        log::warn!(
-                            "[nouveau-uapi] CHANNEL_FREE: no such channel {} (for pid={})",
+                        // `debug!`, not `warn!`: `nouveau_abi16_ioctl_channel_free`
+                        // answers ENOENT and writes nothing to the log, and a
+                        // client that frees idempotently or retries would turn
+                        // a warning here into noise. The errno is the report.
+                        log::debug!(
+                            "[nouveau-uapi] CHANNEL_FREE: no such channel {} (for pid={}) -> ENOENT",
                             req.channel,
                             owner_pid
                         );
-                        return Err(nv::EINVAL);
+                        return Err(nv::ENOENT);
                     };
                     let c = chans.remove(pos);
                     (c.rm_backed, c.id)

@@ -782,6 +782,86 @@ pub trait ElfExt {
     ) -> Result<(), &'static str>;
 }
 
+/// The ELF relocation types this loader applies, spelled and numbered as
+/// `elf/elf.h` spells and numbers them.
+///
+/// They used to be declared inside `relocate`'s body, where no test could
+/// name them -- and only the three x86_64 types the tests build images for
+/// were pinned at all, by accident, through the write each one makes. The
+/// other seven are numbers nothing here can check by running anything: a
+/// wrong `R_AARCH64_RELATIVE` would relocate every PIE binary on aarch64 to
+/// the wrong address, and this host cannot boot aarch64.
+///
+/// Symbol-resolving types, which write `S + A`. `R_X86_64_64` is a direct
+/// 64-bit write, the `GLOB_DAT` pair create a GOT entry and the `JUMP_SLOT`
+/// pair a PLT entry.
+const R_X86_64_64: u32 = 1;
+/// See [`R_X86_64_64`].
+const R_X86_64_GLOB_DAT: u32 = 6;
+/// See [`R_X86_64_64`].
+const R_X86_64_JUMP_SLOT: u32 = 7;
+/// See [`R_X86_64_64`].
+const R_RISCV_64: u32 = 2;
+/// See [`R_X86_64_64`]. 0x401, written in decimal because decimal is the base
+/// `elf.h` writes the aarch64 block in.
+const R_AARCH64_GLOB_DAT: u32 = 1025;
+/// See [`R_AARCH64_GLOB_DAT`]. 0x402.
+const R_AARCH64_JUMP_SLOT: u32 = 1026;
+
+/// Base-relative types, which write `B + A`: the load base plus the addend,
+/// with no symbol involved. Nearly every entry of a PIE binary's `.rela.dyn`
+/// is one of these, so an arch missing from this set does not fail loudly --
+/// it loads a binary whose every internal pointer is left unrelocated.
+const R_X86_64_RELATIVE: u32 = 8;
+/// See [`R_X86_64_RELATIVE`].
+const R_RISCV_RELATIVE: u32 = 3;
+/// See [`R_X86_64_RELATIVE`]. 0x403.
+const R_AARCH64_RELATIVE: u32 = 1027;
+
+/// `R_X86_64_IRELATIVE`: the value to write is not a fixed address but the
+/// RETURN VALUE of calling a resolver function at `base + addend` (an IFUNC).
+///
+/// glibc's own dynamic linker (`ld-linux-x86-64.so.2`) uses CPU-feature
+/// dispatched routines (optimized memcpy/memset/strlen etc.) even internally,
+/// so a real glibc interpreter's `.rela.plt` legitimately carries these.
+/// Collected and resolved in a batch after the main relocation loop (see
+/// `resolve_irelative_x86_64`), because resolving one requires actually
+/// EXECUTING the resolver, which the per-entry loop has no business doing
+/// mid-scan. Only the x86_64 trap plumbing to do that exists, so on every
+/// other arch the type is classified and then skipped.
+const R_X86_64_IRELATIVE: u32 = 37;
+
+/// What `relocate` must do with one relocation type. The three it applies are
+/// not variations on one another: each writes a different value, so a type
+/// classified into the wrong one writes a plausible word to a real address.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RelocKind {
+    /// Write `S + A`: the symbol's address plus the addend.
+    Symbol,
+    /// Write `B + A`: the load base plus the addend.
+    BaseRelative,
+    /// Call a resolver at `B + A` and write what it returns.
+    Irelative,
+    /// Not a type this loader applies. Logged and skipped, never a panic: one
+    /// user program must not be able to take the kernel down.
+    Unknown,
+}
+
+/// Classify one relocation type. Arch-independent on purpose: the arms are
+/// not `cfg`-gated, so an aarch64 or riscv64 image handed to this loader is
+/// relocated correctly whatever the loader itself is running on, and a host
+/// test can reach every one of the ten numbers.
+#[inline]
+fn reloc_kind(ty: u32) -> RelocKind {
+    match ty {
+        R_X86_64_64 | R_X86_64_GLOB_DAT | R_X86_64_JUMP_SLOT | R_RISCV_64 | R_AARCH64_GLOB_DAT
+        | R_AARCH64_JUMP_SLOT => RelocKind::Symbol,
+        R_X86_64_RELATIVE | R_RISCV_RELATIVE | R_AARCH64_RELATIVE => RelocKind::BaseRelative,
+        R_X86_64_IRELATIVE => RelocKind::Irelative,
+        _ => RelocKind::Unknown,
+    }
+}
+
 /// Where a relocation writes: `base + r_offset`, or nothing when that address
 /// does not exist.
 ///
@@ -913,36 +993,8 @@ impl ElfExt for ElfFile<'_> {
         vmar: Arc<VmAddressRegion>,
         scratch_vmar: &Arc<VmAddressRegion>,
     ) -> Result<(), &'static str> {
-        // Symbol-resolving relocations (write `S + A`).
-        // x86_64
-        const REL_GOT: u32 = 6; // R_X86_64_GLOB_DAT
-        const REL_PLT: u32 = 7; // R_X86_64_JUMP_SLOT
-        const R_X86_64_64: u32 = 1;
-        // riscv64
-        const R_RISCV_64: u32 = 2;
-        // aarch64
-        const R_AARCH64_GLOBAL_DATA: u32 = 0x401;
-        const R_AARCH64_JUMP_SLOT: u32 = 0x402;
-
-        // Base-relative relocations (write `B + A`).
-        // x86_64
-        const REL_RELATIVE: u32 = 8; // R_X86_64_RELATIVE
-                                     // riscv64
-        const R_RISCV_RELATIVE: u32 = 3;
-        // aarch64
-        const R_AARCH64_RELATIVE: u32 = 0x403;
-
-        // R_X86_64_IRELATIVE: the value to write is not a fixed address but the
-        // RETURN VALUE of calling a resolver function at `base + addend` (an
-        // IFUNC). glibc's own dynamic linker (`ld-linux-x86-64.so.2`) uses
-        // CPU-feature-dispatched routines (optimized memcpy/memset/strlen etc.)
-        // even internally, so a real glibc interpreter's `.rela.plt` legitimately
-        // carries these. Collected here and resolved in a batch after the main
-        // relocation loop (see the call to `resolve_irelative_x86_64` below) —
-        // resolving one requires actually EXECUTING the resolver, which this
-        // per-entry loop has no business doing mid-scan.
-        #[cfg(target_arch = "x86_64")]
-        const R_X86_64_IRELATIVE: u32 = 37;
+        // The types themselves, and which of the three things each one
+        // asks for, are `reloc_kind` and the constants above it.
         #[cfg(target_arch = "x86_64")]
         let mut irelative: alloc::vec::Vec<(usize, usize)> = alloc::vec::Vec::new();
 
@@ -1006,13 +1058,8 @@ impl ElfExt for ElfFile<'_> {
             };
             found_any = true;
             for entry in entries.iter() {
-                match entry.get_type() {
-                    REL_GOT
-                    | REL_PLT
-                    | R_X86_64_64
-                    | R_RISCV_64
-                    | R_AARCH64_GLOBAL_DATA
-                    | R_AARCH64_JUMP_SLOT => {
+                match reloc_kind(entry.get_type()) {
+                    RelocKind::Symbol => {
                         let dynsym = match dynsym {
                             Some(dynsym) => dynsym,
                             None => {
@@ -1054,7 +1101,7 @@ impl ElfExt for ElfFile<'_> {
                         trace!("GOT write: {:#x} @ {:#x}", value, addr);
                         write_word(&mut cached, addr, value)?;
                     }
-                    REL_RELATIVE | R_RISCV_RELATIVE | R_AARCH64_RELATIVE => {
+                    RelocKind::BaseRelative => {
                         // `B + A`, same split as above: the value may wrap,
                         // the address may not.
                         let value = base.wrapping_add(entry.get_addend() as usize);
@@ -1062,12 +1109,9 @@ impl ElfExt for ElfFile<'_> {
                         trace!("RELATIVE write: {:#x} @ {:#x}", value, addr);
                         write_word(&mut cached, addr, value)?;
                     }
-                    // Unsupported relocation type (e.g. TLS relocations). Log and
-                    // skip rather than `unimplemented!()`, which would panic the
-                    // whole kernel because of one user program.
-                    other => {
+                    RelocKind::Irelative => {
                         #[cfg(target_arch = "x86_64")]
-                        if other == R_X86_64_IRELATIVE {
+                        {
                             let got_addr = reloc_addr(base, entry.get_offset())?;
                             // The resolver is CALLED, so unlike a plain value
                             // it has to be an address that exists; the scratch
@@ -1076,9 +1120,23 @@ impl ElfExt for ElfFile<'_> {
                             irelative.push((got_addr, resolver_addr));
                             continue;
                         }
+                        // Nowhere else can run a resolver, so the entry is
+                        // skipped like any type this loader does not apply.
+                        #[cfg(not(target_arch = "x86_64"))]
                         warn!(
                             "relocate: skipping unsupported relocation type {} in {}",
-                            other, sec_name
+                            entry.get_type(),
+                            sec_name
+                        );
+                    }
+                    // Unsupported relocation type (e.g. TLS relocations). Log
+                    // and skip rather than `unimplemented!()`, which would
+                    // panic the whole kernel because of one user program.
+                    RelocKind::Unknown => {
+                        warn!(
+                            "relocate: skipping unsupported relocation type {} in {}",
+                            entry.get_type(),
+                            sec_name
                         );
                     }
                 }
@@ -1114,6 +1172,55 @@ impl ElfExt for ElfFile<'_> {
             Err(".rela.dyn not found")
         }
     }
+}
+
+/// The return address an IRELATIVE resolver is made to come back to.
+///
+/// Deliberately unmapped, canonical, and cheap to recognise: `ret` popping
+/// this into RIP takes an immediate instruction-fetch `#PF` at EXACTLY this
+/// address, which is how a resolver's return is detected.
+///
+/// It must be **non-zero**: a NULL-derived bug elsewhere in the resolver
+/// could coincidentally jump to 0, and the fault would then be read as a
+/// clean return and whatever happened to be in RAX written into a live GOT
+/// slot. It must also lie in the **first page**, which is the one page no
+/// image is ever mapped over: `linux-object`'s loader reserves
+/// `[0, PIE_LOAD_BASE)` as a low-address guard before it maps a PIE, and a
+/// non-PIE's absolute vaddrs start far above it. Move this into a mapped,
+/// executable page and every resolver in the batch returns into real code
+/// instead of faulting, which is not a crash but the IFUNC path silently
+/// never working again -- the symptom this whole function exists to fix.
+///
+/// It lived inside the function body, where nothing could name it and no
+/// test could reach it: the function resolves relocations by *executing*
+/// user code, so there is no test to write against the function itself.
+#[cfg(target_arch = "x86_64")]
+const IRELATIVE_SENTINEL_RETURN: usize = 0x8;
+
+/// Is this page fault the resolver returning, rather than the resolver
+/// crashing?
+///
+/// The address must match exactly and the fault must be an **instruction
+/// fetch**. Both halves carry weight. A range instead of an equality would
+/// read a wild jump to a nearby low address as a clean return; dropping the
+/// `EXECUTE` test would read a resolver that *dereferenced* the sentinel --
+/// a plausible null-ish pointer bug -- as a clean return. Either one writes
+/// a value the resolver never returned into a live GOT slot, which is the
+/// one outcome the fail-closed contract exists to prevent.
+#[cfg(target_arch = "x86_64")]
+fn is_irelative_sentinel_return(vaddr: usize, flags: MMUFlags) -> bool {
+    vaddr == IRELATIVE_SENTINEL_RETURN && flags.contains(MMUFlags::EXECUTE)
+}
+
+/// Where the sentinel return address is seeded in the one-page scratch stack.
+///
+/// `ret` reads the word AT the stack pointer, so the seeded word has to be
+/// the last one that fits inside the page: one word below its top. Seeding at
+/// the top itself writes the eight bytes that follow the page, which is
+/// either a refused write or somebody else's memory.
+#[cfg(target_arch = "x86_64")]
+fn irelative_scratch_sp(scratch: usize) -> usize {
+    scratch + PAGE_SIZE - core::mem::size_of::<usize>()
 }
 
 /// Resolve a batch of `R_X86_64_IRELATIVE` relocations by actually EXECUTING
@@ -1158,12 +1265,6 @@ fn resolve_irelative_x86_64(
 ) -> Result<alloc::vec::Vec<(usize, usize)>, &'static str> {
     use kernel_hal::context::{TrapReason, UserContext, UserContextField};
 
-    // Deliberately unmapped, canonical, and cheap to recognise: `ret` popping
-    // this into RIP takes an immediate instruction-fetch #PF at EXACTLY this
-    // address, which is how a resolver's return is detected. Address 0 is
-    // avoided (a NULL-derived bug elsewhere could coincidentally target it).
-    const SENTINEL_RETURN: usize = 0x8;
-
     // A scratch stack: this runs before the process has a real stack (that is
     // allocated by the caller AFTER this relocation pass), so borrow one page
     // from the interpreter's own VMAR for the duration of this call, then give
@@ -1178,13 +1279,12 @@ fn resolve_irelative_x86_64(
             MMUFlags::READ | MMUFlags::WRITE | MMUFlags::USER,
         )
         .map_err(|_| "IRELATIVE: failed to map scratch stack")?;
-    let scratch_top = scratch + PAGE_SIZE;
-    let sp = scratch_top - core::mem::size_of::<usize>();
+    let sp = irelative_scratch_sp(scratch);
     let unmap_scratch = || {
         let _ = vmar.unmap(scratch, PAGE_SIZE);
     };
     if vmar
-        .write_memory(sp, &SENTINEL_RETURN.to_ne_bytes())
+        .write_memory(sp, &IRELATIVE_SENTINEL_RETURN.to_ne_bytes())
         .is_err()
     {
         unmap_scratch();
@@ -1213,7 +1313,7 @@ fn resolve_irelative_x86_64(
                     continue;
                 }
                 TrapReason::PageFault(vaddr, flags)
-                    if vaddr == SENTINEL_RETURN && flags.contains(MMUFlags::EXECUTE) =>
+                    if is_irelative_sentinel_return(vaddr, flags) =>
                 {
                     resolved.push((got_addr, ctx.get_field(UserContextField::ReturnValue)));
                     break;
@@ -2289,12 +2389,11 @@ mod tests {
     const SHT_RELA: u32 = 4;
     const SHT_DYNSYM: u32 = 11;
 
-    /// Relocation types, as `relocate` spells them. The first three write
-    /// `S + A`, the fourth `B + A`, and the last is one no arm names.
-    const R_X86_64_64: u32 = 1;
-    const R_X86_64_GLOB_DAT: u32 = 6;
-    const R_X86_64_JUMP_SLOT: u32 = 7;
-    const R_X86_64_RELATIVE: u32 = 8;
+    /// A relocation type no arm names, so that a test can hand the loader one
+    /// it must skip. The four it DOES name now come from module scope: this
+    /// module used to carry its own copies of those four literals, which
+    /// agreed with production's by luck and let `R_X86_64_64` be renumbered
+    /// with every test still passing.
     const R_X86_64_TPOFF64: u32 = 18;
 
     /// One entry of a 64-bit symbol or relocation table.
@@ -2768,5 +2867,207 @@ mod tests {
 
         assert_eq!(word_at(&vmar, 0x40), vmar.addr() + 0x11);
         assert_eq!(word_at(&vmar, 0x48), vmar.addr() + 0x22);
+    }
+}
+
+#[cfg(test)]
+mod reloc_type_tests {
+    //! The ten relocation numbers, which used to live inside `relocate`'s
+    //! body where nothing could name them.
+    //!
+    //! Only three of them were pinned, and only as a side effect of the write
+    //! each one makes; the five belonging to aarch64 and riscv64 were numbers
+    //! nothing here could check by running anything, and this host cannot
+    //! boot either arch. Every number below is written out from `elf/elf.h`,
+    //! and every call passes the raw number rather than the constant, so that
+    //! two of them swapping places is a failure and not a rename.
+    //!
+    //! What is NOT tested here is that no two of the ten share a number, and
+    //! on purpose: all ten appear as patterns of one `match` in `reloc_kind`,
+    //! so a collision is an unreachable pattern, and this crate denies
+    //! warnings. Mutating `R_RISCV_64` to 3 does not fail a test, it fails to
+    //! compile -- a stronger guarantee than any assertion could give, and one
+    //! that would be worth replacing with a test only if that `match` ever
+    //! became a chain of `if`s.
+
+    use super::*;
+
+    /// `R_X86_64_64` is the one that shows why a test can be insensitive by
+    /// construction: the only test that fed the loader type 1 asserts that
+    /// NOTHING was written (an undefined symbol is left to the dynamic
+    /// linker), and a type classified as unknown also writes nothing. A test
+    /// that asserts an absence cannot pin the number that chose the branch.
+    #[test]
+    fn the_relocation_types_are_the_numbers_glibc_elf_h_gives() {
+        for (name, actual, expected) in [
+            ("R_X86_64_64", R_X86_64_64, 1),
+            ("R_RISCV_64", R_RISCV_64, 2),
+            ("R_RISCV_RELATIVE", R_RISCV_RELATIVE, 3),
+            ("R_X86_64_GLOB_DAT", R_X86_64_GLOB_DAT, 6),
+            ("R_X86_64_JUMP_SLOT", R_X86_64_JUMP_SLOT, 7),
+            ("R_X86_64_RELATIVE", R_X86_64_RELATIVE, 8),
+            ("R_X86_64_IRELATIVE", R_X86_64_IRELATIVE, 37),
+            ("R_AARCH64_GLOB_DAT", R_AARCH64_GLOB_DAT, 1025),
+            ("R_AARCH64_JUMP_SLOT", R_AARCH64_JUMP_SLOT, 1026),
+            ("R_AARCH64_RELATIVE", R_AARCH64_RELATIVE, 1027),
+        ] {
+            assert_eq!(actual, expected, "{}", name);
+        }
+    }
+
+    #[test]
+    fn every_symbol_resolving_type_is_classified_as_one() {
+        // x86_64: direct 64-bit, GOT entry, PLT entry. riscv64: direct
+        // 64-bit. aarch64: GOT entry, PLT entry.
+        for ty in [1u32, 6, 7, 2, 1025, 1026] {
+            assert_eq!(reloc_kind(ty), RelocKind::Symbol, "type {}", ty);
+        }
+    }
+
+    /// The one that costs on an arch nobody here can boot: nearly every entry
+    /// of a PIE binary's `.rela.dyn` is base-relative, so an arch dropped
+    /// from this class does not fail loudly. It loads a binary whose every
+    /// internal pointer is left unrelocated.
+    #[test]
+    fn every_base_relative_type_is_classified_as_one() {
+        for ty in [8u32, 3, 1027] {
+            assert_eq!(reloc_kind(ty), RelocKind::BaseRelative, "type {}", ty);
+        }
+    }
+
+    #[test]
+    fn the_ifunc_type_is_its_own_kind_and_neither_of_the_other_two() {
+        assert_eq!(reloc_kind(37), RelocKind::Irelative);
+        // Writing `B + A` for one would put the ADDRESS OF THE RESOLVER in
+        // the GOT slot instead of what the resolver returns, so every call
+        // through that slot would re-enter the resolver as if it were the
+        // function it selects.
+        assert_ne!(reloc_kind(37), RelocKind::BaseRelative);
+        assert_ne!(reloc_kind(37), RelocKind::Symbol);
+    }
+
+    /// A type this loader does not apply must never be mistaken for one it
+    /// does: the two classes it could fall into both WRITE A WORD, through an
+    /// address the file chose.
+    #[test]
+    fn a_type_this_loader_does_not_apply_is_never_mistaken_for_one_it_does() {
+        // 0 is `R_*_NONE` on all three. 4, 5, 18, 36 and 38 are x86_64 types
+        // this loader has no answer for (PLT32, COPY, TPOFF64, TLSDESC,
+        // RELATIVE64), two of them either side of IRELATIVE. 1024 and 1028
+        // are the aarch64 numbers either side of the three it does name.
+        for ty in [0u32, 4, 5, 18, 36, 38, 1024, 1028] {
+            assert_eq!(reloc_kind(ty), RelocKind::Unknown, "type {}", ty);
+        }
+    }
+}
+
+#[cfg(all(test, target_arch = "x86_64"))]
+mod irelative_sentinel_tests {
+    use super::*;
+
+    /// The sentinel is not null, and it lives in the first page.
+    ///
+    /// Both halves are load-bearing and neither is visible from the function
+    /// that uses them: it resolves relocations by *executing* user code, so
+    /// there is no test to write against the function itself. Null would let
+    /// a resolver's own NULL-derived bug look like a clean return; a sentinel
+    /// outside the first page can fall inside a mapped image, and then no
+    /// resolver ever faults and the whole batch is abandoned on the first
+    /// entry -- the IFUNC path silently never working again, which is the
+    /// symptom this code exists to cure.
+    #[test]
+    fn the_sentinel_is_not_null_and_sits_in_the_page_no_image_covers() {
+        assert_ne!(
+            IRELATIVE_SENTINEL_RETURN, 0,
+            "a resolver that jumps through a null pointer must not look like a clean return"
+        );
+        assert!(
+            IRELATIVE_SENTINEL_RETURN < PAGE_SIZE,
+            "the first page is the one page no image is mapped over"
+        );
+        assert_eq!(IRELATIVE_SENTINEL_RETURN, 0x8);
+    }
+
+    /// A clean return is this address AND an instruction fetch, both.
+    #[test]
+    fn a_clean_return_is_the_exact_address_and_an_instruction_fetch() {
+        assert!(is_irelative_sentinel_return(
+            IRELATIVE_SENTINEL_RETURN,
+            MMUFlags::EXECUTE
+        ));
+        // The real fault carries the rest of the access bits too.
+        assert!(is_irelative_sentinel_return(
+            IRELATIVE_SENTINEL_RETURN,
+            MMUFlags::READ | MMUFlags::EXECUTE | MMUFlags::USER
+        ));
+    }
+
+    /// A fault next door to the sentinel is a crash, not a return.
+    ///
+    /// A resolver that jumps through a small bogus value lands near zero, not
+    /// on the sentinel. Read as a return, its RAX -- whatever it happened to
+    /// hold -- goes into a live GOT slot, and the next call through that slot
+    /// jumps to it.
+    #[test]
+    fn a_fault_at_a_neighbouring_address_is_not_a_return() {
+        // `wrapping_sub` so that this test, and not the compiler, is what
+        // reports a sentinel moved to zero: `0 - 1` is a const-evaluation
+        // overflow, and a build that fails names the arithmetic here instead
+        // of the invariant above.
+        for vaddr in [
+            0,
+            1,
+            IRELATIVE_SENTINEL_RETURN.wrapping_sub(1),
+            IRELATIVE_SENTINEL_RETURN + 1,
+            PAGE_SIZE,
+            usize::MAX,
+        ] {
+            assert!(
+                !is_irelative_sentinel_return(vaddr, MMUFlags::EXECUTE),
+                "{:#x} is not the sentinel",
+                vaddr
+            );
+        }
+    }
+
+    /// A resolver that DEREFERENCED the sentinel has not returned either.
+    #[test]
+    fn a_read_or_a_write_of_the_sentinel_is_not_a_return() {
+        for flags in [
+            MMUFlags::empty(),
+            MMUFlags::READ,
+            MMUFlags::WRITE,
+            MMUFlags::READ | MMUFlags::WRITE | MMUFlags::USER,
+        ] {
+            assert!(
+                !is_irelative_sentinel_return(IRELATIVE_SENTINEL_RETURN, flags),
+                "a {:?} fault is the resolver touching the address, not returning to it",
+                flags
+            );
+        }
+    }
+
+    /// The sentinel is seeded in the last word that fits inside the page.
+    ///
+    /// `ret` reads the word AT the stack pointer, so it has to be a word that
+    /// is actually inside the scratch page. Seeded at the top instead, the
+    /// eight bytes written are the ones after the page.
+    #[test]
+    fn the_sentinel_is_seeded_in_the_last_word_that_fits_in_the_page() {
+        let word = core::mem::size_of::<usize>();
+        for scratch in [0x1000, 0x4000, 0x7fff_ffff_f000] {
+            let sp = irelative_scratch_sp(scratch);
+            assert!(sp >= scratch, "inside the page, not before it");
+            assert!(
+                sp + word <= scratch + PAGE_SIZE,
+                "the whole word has to fit inside the page"
+            );
+            assert_eq!(
+                sp + word,
+                scratch + PAGE_SIZE,
+                "and it is the LAST word that fits, so a push has room below it"
+            );
+            assert_eq!(sp % word, 0, "a word-aligned stack pointer");
+        }
     }
 }

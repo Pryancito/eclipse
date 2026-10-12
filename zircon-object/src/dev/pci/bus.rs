@@ -1362,3 +1362,73 @@ mod pci_bus_driver_tests {
         assert!(!Arc::ptr_eq(&stale, &fresh));
     }
 }
+
+/// The wire layout of [`PcieDeviceInfo`], Zircon's `zx_pcie_device_info_t`,
+/// which `zx_pci_get_nth_device` copies into the caller's buffer.
+///
+/// Nothing pinned it. Two `u16`s, then seven `u8`s and a pad: swapping
+/// `vendor_id` with `device_id`, or `bus_id` with `dev_id`, compiles cleanly
+/// and survives every test in this crate, and a userspace driver that matches
+/// on vendor and device would then bind to the wrong hardware. Field order and
+/// widths per `zircon/system/public/zircon/syscalls/pci.h`.
+#[cfg(test)]
+mod pcie_device_info_layout_tests {
+    use super::PcieDeviceInfo;
+    use core::mem::{align_of, offset_of, size_of};
+
+    #[test]
+    fn zx_pcie_device_info_t_is_twelve_bytes() {
+        assert_eq!(size_of::<PcieDeviceInfo>(), 12);
+        assert_eq!(align_of::<PcieDeviceInfo>(), 2);
+    }
+
+    #[test]
+    fn the_two_ids_are_sixteen_bits_each_and_the_vendor_comes_first() {
+        assert_eq!(offset_of!(PcieDeviceInfo, vendor_id), 0);
+        assert_eq!(offset_of!(PcieDeviceInfo, device_id), 2);
+    }
+
+    #[test]
+    fn the_class_triple_comes_before_the_revision() {
+        assert_eq!(offset_of!(PcieDeviceInfo, base_class), 4);
+        assert_eq!(offset_of!(PcieDeviceInfo, sub_class), 5);
+        assert_eq!(offset_of!(PcieDeviceInfo, program_interface), 6);
+        assert_eq!(offset_of!(PcieDeviceInfo, revision_id), 7);
+    }
+
+    #[test]
+    fn the_address_is_bus_then_device_then_function() {
+        // The three bytes a `bb:dd.f` address is written from, in the order it
+        // is written. Swapping any two of them names a different slot.
+        assert_eq!(offset_of!(PcieDeviceInfo, bus_id), 8);
+        assert_eq!(offset_of!(PcieDeviceInfo, dev_id), 9);
+        assert_eq!(offset_of!(PcieDeviceInfo, func_id), 10);
+        assert_eq!(offset_of!(PcieDeviceInfo, _padding1), 11);
+    }
+
+    /// The same twelve bytes read back, the way `signal/port_packet.rs` checks
+    /// its packet. An offset test says where a field is; this says the bytes a
+    /// caller gets mean what we think they mean.
+    #[test]
+    #[allow(unsafe_code)]
+    fn the_twelve_bytes_are_the_fields_that_wrote_them() {
+        let info = PcieDeviceInfo {
+            vendor_id: 0x10de,
+            device_id: 0x1f06,
+            base_class: 0x03,
+            sub_class: 0x00,
+            program_interface: 0x00,
+            revision_id: 0xa1,
+            bus_id: 0x01,
+            dev_id: 0x00,
+            func_id: 0x00,
+            _padding1: 0,
+        };
+        let bytes: [u8; 12] =
+            unsafe { core::ptr::read_unaligned(&info as *const _ as *const [u8; 12]) };
+        // Little-endian, so the low byte of each id comes first.
+        assert_eq!(&bytes[0..4], &[0xde, 0x10, 0x06, 0x1f]);
+        assert_eq!(&bytes[4..8], &[0x03, 0x00, 0x00, 0xa1]);
+        assert_eq!(&bytes[8..12], &[0x01, 0x00, 0x00, 0x00]);
+    }
+}

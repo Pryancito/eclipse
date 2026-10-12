@@ -286,3 +286,30 @@ mod tests {
         assert_eq!((info.pmo_count, info.quarantine_count), (0, 0));
     }
 }
+
+/// The wire layout of [`BtiInfo`], Zircon's `zx_info_bti_t`, which
+/// `zx_object_get_info(ZX_INFO_BTI)` copies out.
+///
+/// Four `u64`s with nothing between them, so any two can trade places and the
+/// test above still passes: it reads the two counts by name, and a caller
+/// would then read the quarantine count as the pin count. Field order per
+/// `zircon/system/public/zircon/syscalls/object.h`.
+#[cfg(test)]
+mod bti_info_layout_tests {
+    use super::BtiInfo;
+    use core::mem::{align_of, offset_of, size_of};
+
+    #[test]
+    fn zx_info_bti_t_is_four_words() {
+        assert_eq!(size_of::<BtiInfo>(), 32);
+        assert_eq!(align_of::<BtiInfo>(), 8);
+    }
+
+    #[test]
+    fn the_two_sizes_come_before_the_two_counts() {
+        assert_eq!(offset_of!(BtiInfo, minimum_contiguity), 0);
+        assert_eq!(offset_of!(BtiInfo, aspace_size), 8);
+        assert_eq!(offset_of!(BtiInfo, pmo_count), 16);
+        assert_eq!(offset_of!(BtiInfo, quarantine_count), 24);
+    }
+}
