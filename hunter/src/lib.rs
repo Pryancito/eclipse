@@ -23,8 +23,16 @@
 //! `Report` / `Enforce`) and the control plane can be sealed tighten-only.
 
 #![no_std]
+// `#[bench]` and `test::Bencher` are libtest's, and still unstable. The
+// benches live in `#[cfg(test)]` modules beside the code they measure --
+// `heuristics` and `policy` keep their hot-path helpers private, so a
+// `benches/` target would not see one of them. Gated on `test` so a kernel
+// build never asks for the feature.
+#![cfg_attr(test, feature(test))]
 
 extern crate alloc;
+#[cfg(test)]
+extern crate test;
 #[macro_use]
 extern crate log;
 
@@ -982,5 +990,166 @@ mod lifecycle_tests {
             event_log::render().matches("security subsystem v").count(),
             1
         );
+    }
+}
+
+#[cfg(test)]
+mod benches {
+    //! The security gate every syscall passes through, before its handler
+    //! runs.
+    //!
+    //! [`check_syscall`] is called from the dispatch in `linux-syscall`
+    //! unconditionally, for every syscall of every process, and nothing had
+    //! ever measured it. It is two hooks: the per-process whitelist
+    //! ([`policy::is_syscall_allowed`]) and the behavioural detector
+    //! ([`heuristics::on_syscall`]), each with its own early-out, so what it
+    //! costs depends entirely on the stance the system is in -- and the
+    //! stance is not a per-process setting. The rows below walk the three
+    //! that a running desktop can actually be in:
+    //!
+    //! - the default (`Enforce` whitelists, nobody has registered one,
+    //!   `HUNTERANOMALY` unset), which is what every syscall pays today;
+    //! - the same with the syscall domain turned off, which is the floor;
+    //! - the default with **one** process whitelisted, which is not that
+    //!   process's bill: [`policy::POLICY_COUNT`] is a single global counter,
+    //!   so the first registration anywhere takes the lock-free fast path
+    //!   away from every other process on the machine.
+    //!
+    //! Every row black-boxes its inputs, and the state each one needs is
+    //! installed under the same `test_globals` lock the unit tests use --
+    //! hunter's stance is global, and `cargo test` runs a `#[bench]` once
+    //! each, so a row that changed the mode without the lock would be a race
+    //! against the suite.
+
+    use super::*;
+    use alloc::vec;
+    use test::{black_box, Bencher};
+
+    /// An ordinary syscall: `read` on x86_64. Nothing hunter classifies.
+    const ORDINARY: u32 = 0;
+
+    /// The default stance, restored so a row measures the shipped
+    /// configuration and not whatever the row before it left behind.
+    fn default_stance() {
+        policy::reset_for_test();
+        heuristics::set_anomaly_detection(false);
+        heuristics::set_privileged_deny(false);
+    }
+
+    /// **The row.** What every syscall of every process pays in the stance
+    /// Eclipse boots in: `Enforce`, no whitelist registered anywhere,
+    /// `HUNTERANOMALY` unset.
+    ///
+    /// Both hooks take their early-out here, so this is three atomic loads
+    /// and the `classify` chain -- hold it against
+    /// `the_gate_with_the_syscall_domain_off` below, which keeps the second
+    /// hook and drops the first.
+    #[bench]
+    fn the_gate_in_the_default_stance(b: &mut Bencher) {
+        let _g = test_globals::lock();
+        default_stance();
+        let args = [0usize; 6];
+        b.iter(|| {
+            black_box(check_syscall(
+                black_box(1),
+                black_box(ORDINARY),
+                black_box(&args),
+            ))
+        });
+    }
+
+    /// `HUNTER=off`: the whitelist hook returns on its first load. The
+    /// detector hook still runs, because its switch is a different one --
+    /// which is the point of the row: turning the policy domain off does not
+    /// turn the gate off.
+    #[bench]
+    fn the_gate_with_the_syscall_domain_off(b: &mut Bencher) {
+        let _g = test_globals::lock();
+        default_stance();
+        policy::set_syscall_mode(Mode::Off);
+        let args = [0usize; 6];
+        b.iter(|| {
+            black_box(check_syscall(
+                black_box(1),
+                black_box(ORDINARY),
+                black_box(&args),
+            ))
+        });
+        default_stance();
+    }
+
+    /// The same default stance, with a whitelist registered for **one**
+    /// unrelated pid.
+    ///
+    /// `POLICY_COUNT` is global, so this is what the rest of the machine
+    /// starts paying the moment anything is sandboxed: the fast path is gone
+    /// and every syscall of every process takes `GLOBAL_POLICIES.lock()` --
+    /// an IRQ-off spin lock, one for the whole system -- to look its pid up
+    /// in a map it is not in. Uncontended here, which is the best case it
+    /// has; on an SMP machine the same line is being taken by every other
+    /// CPU at the same time.
+    #[bench]
+    fn the_gate_once_any_process_is_whitelisted(b: &mut Bencher) {
+        let _g = test_globals::lock();
+        default_stance();
+        // A pid that is not the caller's: the registration is what matters,
+        // not whose it is.
+        policy::register_policy(999_001, vec![ORDINARY]);
+        let args = [0usize; 6];
+        b.iter(|| {
+            black_box(check_syscall(
+                black_box(1),
+                black_box(ORDINARY),
+                black_box(&args),
+            ))
+        });
+        policy::remove_policy(999_001);
+        default_stance();
+    }
+
+    /// The caller's own whitelist hit: the map lookup plus the
+    /// `binary_search` of the allowed list. Two syscalls wide, so this is the
+    /// search's floor rather than its shape.
+    #[bench]
+    fn the_gate_for_a_whitelisted_caller(b: &mut Bencher) {
+        let _g = test_globals::lock();
+        default_stance();
+        policy::register_policy(1, vec![ORDINARY, 1]);
+        let args = [0usize; 6];
+        b.iter(|| {
+            black_box(check_syscall(
+                black_box(1),
+                black_box(ORDINARY),
+                black_box(&args),
+            ))
+        });
+        policy::remove_policy(1);
+        default_stance();
+    }
+
+    /// A control: a function of the gate's shape -- three machine words in,
+    /// a `Result<(), SecurityViolation>` out -- that decides nothing.
+    ///
+    /// The rows above are an out-of-line call returning a one-byte enum in a
+    /// register, and that call is not free. Without this row, the floor it
+    /// sits on would be read as the gate's cost.
+    #[bench]
+    fn the_gate_shaped_control(b: &mut Bencher) {
+        #[inline(never)]
+        fn decides_nothing(
+            _pid: u64,
+            _num: u32,
+            _args: &[usize; 6],
+        ) -> Result<(), SecurityViolation> {
+            Ok(())
+        }
+        let args = [0usize; 6];
+        b.iter(|| {
+            black_box(decides_nothing(
+                black_box(1),
+                black_box(ORDINARY),
+                black_box(&args),
+            ))
+        });
     }
 }
