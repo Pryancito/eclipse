@@ -2813,7 +2813,19 @@ pub fn export_handle_for(
     // NO_SHARE record is kept apart from it: a VRAM-only object has no
     // mapping entry, and its export said ENOENT where Linux says EPERM.
     if zcore_drivers::scheme::gem_mmap::no_share(handle_id, pid) {
-        return Err(ExportRefusal::NotShareable);
+        // The record is the object's, and the object is ONE card's: through
+        // another card's node the handle is not the file's at all
+        // (`drm_gem_object_lookup(file_priv, handle)` runs before
+        // `nouveau_gem_prime_export` gets to refuse), so ENOENT comes before
+        // EPERM. Without a node table there is no node to be wrong about,
+        // and the record alone decides.
+        let known_here = driver_for_minor(minor)
+            .is_none_or(|d| !matches!(d.gem_aperture(handle_id, pid), GemAperture::Unknown));
+        return Err(if known_here {
+            ExportRefusal::NotShareable
+        } else {
+            ExportRefusal::NotFound
+        });
     }
     let Some((phys_addr, size)) = zcore_drivers::scheme::gem_mmap::lookup_for(handle_id, pid)
     else {
@@ -3166,6 +3178,15 @@ fn unresolved_backing_reason(handle_id: u32, pid: u64, minor: u32) -> Unresolved
     unresolved_backing_from(driver.map(|d| d.gem_aperture(handle_id, pid)))
 }
 
+/// [`unresolved_backing_reason`] for the frame path: the card that
+/// `create_fb` builds the framebuffer on is the display driver's
+/// ([`get_display_driver`]), not `card0`'s (the primary is the last probed,
+/// the compute card on a two-card box, which knows none of the swapchain's
+/// objects). Asked as the kernel, like the frame path itself.
+fn unresolved_scanout_backing_reason(handle_id: u32) -> UnresolvedBacking {
+    unresolved_backing_from(get_display_driver().map(|d| d.gem_aperture(handle_id, 0)))
+}
+
 /// The judgement itself, under the driver lookup so a test can make one.
 ///
 /// `Sysmem` lands on the generic line on purpose: the driver saying there IS
@@ -3267,10 +3288,12 @@ pub fn create_fb_with_layout(
             // "not in dumb table nor nouveau GEM" about a VRAM GEM is a lie,
             // and it is the lie a Vulkan swapchain gets, because NVK renders
             // into device memory.
-            // The frame path is `card0`'s, and the resolver above already
-            // refused the handle on the caller's behalf: ask as the kernel,
-            // so the line says what the object IS.
-            match unresolved_backing_reason(handle_id, 0, NodeMinors::new(0).card()) {
+            // The frame path is the display card's (the one `create_fb`
+            // builds the framebuffer on; `card0` is the primary, which on a
+            // two-card box is the compute one), and the resolver above
+            // already refused the handle on the caller's behalf: ask as the
+            // kernel, so the line says what the object IS.
+            match unresolved_scanout_backing_reason(handle_id) {
                 UnresolvedBacking::Vram => warn!(
                     "[drm] create_fb (ADDFB2): handle={:#x} is a VRAM-only GEM -- it exists, but \
                      it has no host physical address (the RM refuses gem_map_cpu for ADDR_FBMEM: \
