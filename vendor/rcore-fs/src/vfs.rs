@@ -310,11 +310,36 @@ pub struct Metadata {
     pub rdev: usize, // (major << 8) | minor
 }
 
+/// A timestamp, and part of an on-disk format.
+///
+/// `repr(C)` is load-bearing: SFS puts three of these inside every
+/// `DiskINode`, which goes to the block device as raw bytes, so the order of
+/// these two fields is the format a filesystem image is written in.
+/// `repr(Rust)` is free to reorder them -- it happens to put `sec` first
+/// today -- and nothing would notice an image that stopped being readable.
+#[repr(C)]
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Hash)]
 pub struct Timespec {
     pub sec: i64,
     pub nsec: i32,
 }
+
+/// Sixteen bytes: a signed second, a nanosecond, and four bytes of tail
+/// padding to the eight-byte alignment the second needs. This is what three
+/// of the hundred and twenty-eight bytes of an SFS inode are made of, so it
+/// is checked here, by the definition, rather than only where it is used.
+const _: () = {
+    assert!(core::mem::size_of::<Timespec>() == 16);
+    assert!(core::mem::align_of::<Timespec>() == 8);
+    assert!(
+        core::mem::offset_of!(Timespec, sec) == 0,
+        "the second first"
+    );
+    assert!(
+        core::mem::offset_of!(Timespec, nsec) == 8,
+        "then the nanosecond"
+    );
+};
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum FileType {
