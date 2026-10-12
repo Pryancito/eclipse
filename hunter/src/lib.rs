@@ -1010,10 +1010,13 @@ mod benches {
     //! - the default (`Enforce` whitelists, nobody has registered one,
     //!   `HUNTERANOMALY` unset), which is what every syscall pays today;
     //! - the same with the syscall domain turned off, which is the floor;
-    //! - the default with **one** process whitelisted, which is not that
-    //!   process's bill: [`policy::POLICY_COUNT`] is a single global counter,
-    //!   so the first registration anywhere takes the lock-free fast path
-    //!   away from every other process on the machine.
+    //! - the default with **one** process whitelisted, which used not to be
+    //!   that process's bill: the whitelist count was a single global
+    //!   counter, so the first registration anywhere took the lock-free fast
+    //!   path away from every other process on the machine. The registry is
+    //!   sharded by pid now, so that row sits back on the default one and is
+    //!   kept here to keep it there -- `policy::benches` has the rows that
+    //!   take it apart, contended ones included.
     //!
     //! Every row black-boxes its inputs, and the state each one needs is
     //! installed under the same `test_globals` lock the unit tests use --

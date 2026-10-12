@@ -34,8 +34,15 @@ use crate::event_log::{record, Severity};
 /// number buys is the share of processes that keep the lock-free path once
 /// *something* on the machine is sandboxed. A single map had none -- the
 /// first whitelist registered anywhere put every syscall of every process
-/// through one IRQ-off spin lock, which is the cliff this removes. The cost
-/// is 64 counters and 64 empty `BTreeMap`s, a few hundred bytes.
+/// through one IRQ-off spin lock, which is the cliff this removes.
+///
+/// The cost is 64 counters and 64 empty maps: **4.5 KiB**, measured and not
+/// guessed. A `TicketMutex` is five `AtomicUsize` -- two for the ticket and
+/// three carrying the holder's file, length and line for the deadlock
+/// reporter -- plus the 24-byte `BTreeMap`, so 64 bytes a shard, 4096 for
+/// the array and 512 more for the counters. (An earlier version of this
+/// comment said "a few hundred bytes", counting the maps and forgetting the
+/// locks around them: off by ten.)
 const POLICY_SHARDS: usize = 64;
 
 /// How many of the mixed pid's top bits name the shard. Derived, not written:
@@ -1274,6 +1281,44 @@ mod syscall_whitelist_tests {
         assert_eq!(is_syscall_allowed(83, 999), Err(true));
     }
 
+    /// The same promise for a process that shares the sandboxed one's shard,
+    /// which is the arm that **takes the lock** and misses the map.
+    ///
+    /// Its own test because sharding quietly took that arm's coverage away:
+    /// the test above picks pids 83 and 84, and they used to be the same map
+    /// but now hash to shards 18 and 58, so 84 answers from the lock-free
+    /// path and never reaches `None => Ok(())` at all. Turning that arm into
+    /// a denial passed all 187 tests. What it would do on a real machine is
+    /// deny **every syscall** of an innocent process that happened to land
+    /// in a sandboxed process's shard -- one in sixty-four of them.
+    ///
+    /// Found by Copilot on #1855, not by the mutation batch: the batch
+    /// mutated what the change touched, and this is coverage the change
+    /// took away somewhere else.
+    #[test]
+    fn a_process_sharing_a_sandboxed_shard_is_still_allowed_everything() {
+        let _g = start();
+        let (sandboxed, innocent) = two_pids_sharing_a_shard(94_000);
+        register_policy(sandboxed, alloc::vec![1]);
+        assert_ne!(
+            POLICY_COUNTS[policy_shard(innocent)].load(Ordering::Acquire),
+            0,
+            "this test is pointless unless the innocent pid's shard is the \
+             occupied one"
+        );
+
+        assert!(
+            is_syscall_allowed(innocent, 999).is_ok(),
+            "a process with no whitelist was refused a syscall because it \
+             shares a shard with a sandboxed one"
+        );
+        assert_eq!(
+            is_syscall_allowed(sandboxed, 999),
+            Err(true),
+            "and the sandboxed one in the same shard is still checked"
+        );
+    }
+
     /// Two pids that land in the **same** shard, and two that land in
     /// different ones. The sharding is what these tests are about, so they
     /// pick their pids by asking [`policy_shard`] rather than hoping.
@@ -1754,8 +1799,11 @@ mod benches {
     use core::sync::atomic::AtomicBool;
     use test::{black_box, Bencher};
 
-    /// The syscall number the rows ask about; never on any whitelist here, so
-    /// no row is measuring a binary search that finds something.
+    /// The syscall number the rows ask about. Not on a whitelist in the
+    /// unsandboxed rows, so none of those is measuring a binary search that
+    /// finds something; `the_gate_for_the_sandboxed_process_itself` does
+    /// whitelist it on purpose, because a hit is what the sandboxed process
+    /// actually pays.
     const ORDINARY: u32 = 60;
 
     /// Whitelisted for the duration of a row. Its shard is the one that keeps
