@@ -2621,3 +2621,28 @@ mod command_number_tests {
         }
     }
 }
+#[cfg(test)]
+mod sembuf_layout_tests {
+    //! `struct sembuf` as `semop(2)` reads it from userspace.
+    //!
+    //! `semop` takes an array of these straight from the caller, so the
+    //! offsets are what decides which short is the semaphore number, which
+    //! is the operation and which is the flags. Swapping `op` and `flags`
+    //! compiles clean and turns every `SEM_UNDO` into an operation of
+    //! +0x1000 on the semaphore. Nothing pinned it.
+    //!
+    //! Against `include/uapi/linux/sem.h`.
+
+    use super::*;
+    use core::mem::{align_of, offset_of, size_of};
+
+    #[test]
+    fn sembuf_is_the_three_shorts_of_the_sysv_struct_sembuf() {
+        assert_eq!(size_of::<SemBuf>(), 6);
+        assert_eq!(align_of::<SemBuf>(), 2);
+        assert_eq!(offset_of!(SemBuf, num), 0);
+        assert_eq!(offset_of!(SemBuf, op), 2);
+        assert_eq!(offset_of!(SemBuf, flags), 4);
+        assert_eq!(offset_of!(SemBuf, flags) + 2, 6);
+    }
+}

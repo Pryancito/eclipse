@@ -2836,3 +2836,53 @@ mod cap_user_data_layout_tests {
         assert_eq!(&bytes[8..12], &0xcccc_0003u32.to_le_bytes());
     }
 }
+#[cfg(test)]
+mod sysinfo_layout_tests {
+    //! `struct sysinfo` as `sysinfo(2)` hands it to userspace.
+    //!
+    //! `free`, `top` and `htop` read this out of a buffer they sized
+    //! themselves, field by field, and nothing here pinned any of it: not
+    //! the size, not the order. Measured over the crate's whole suite, the
+    //! six swaps its same-typed neighbours allow all survived -- and a swap
+    //! of `totalram` and `freeram` makes `free` report the used memory as
+    //! the total.
+    //!
+    //! Against `include/uapi/linux/sysinfo.h`, on a 64-bit arch, which is
+    //! every arch this kernel builds for: `__kernel_ulong_t` is eight bytes
+    //! throughout.
+
+    use super::*;
+    use core::mem::{align_of, offset_of, size_of};
+
+    /// The uapi has two padding fields this declaration leaves out: an
+    /// explicit `__u16 pad` after `procs`, and a `char _f[]` tail sized so
+    /// the struct comes out the same total. On a 64-bit arch the tail is
+    /// `20 - 2*8 - 4` bytes long, which is none, and the `pad` sits exactly
+    /// where Rust puts the padding it needs to align the `u64` that follows
+    /// -- so the two layouts agree byte for byte. That agreement is what is
+    /// checked here rather than assumed.
+    #[test]
+    fn sysinfo_is_the_uapi_struct_sysinfo_field_by_field() {
+        assert_eq!(size_of::<SysInfo>(), 112);
+        assert_eq!(align_of::<SysInfo>(), 8);
+        assert_eq!(offset_of!(SysInfo, uptime), 0);
+        // The three load averages, eight bytes each.
+        assert_eq!(offset_of!(SysInfo, loads), 8);
+        assert_eq!(offset_of!(SysInfo, totalram), 32);
+        assert_eq!(offset_of!(SysInfo, freeram), 40);
+        assert_eq!(offset_of!(SysInfo, sharedram), 48);
+        assert_eq!(offset_of!(SysInfo, bufferram), 56);
+        assert_eq!(offset_of!(SysInfo, totalswap), 64);
+        assert_eq!(offset_of!(SysInfo, freeswap), 72);
+        assert_eq!(offset_of!(SysInfo, procs), 80);
+        // Bytes 82..88 are the uapi's explicit `pad` and the alignment
+        // padding behind it.
+        assert_eq!(offset_of!(SysInfo, totalhigh), 88);
+        assert_eq!(offset_of!(SysInfo, freehigh), 96);
+        assert_eq!(offset_of!(SysInfo, mem_unit), 104);
+        // And bytes 108..112 are the tail padding that rounds the struct up
+        // to its eight-byte alignment, which is where the uapi's `_f` would
+        // start if it were not empty here.
+        assert_eq!(offset_of!(SysInfo, mem_unit) + 4 + 4, 112);
+    }
+}

@@ -2137,3 +2137,39 @@ mod vt_layout_tests {
         assert_eq!(offset_of!(VtStat, v_state), 4);
     }
 }
+#[cfg(test)]
+mod kbentry_layout_tests {
+    //! `struct kbentry` as `KDGKBENT` hands one keymap cell back.
+    //!
+    //! The table and the index come first, one byte each and the same type,
+    //! so swapping them compiles clean -- and nothing whatever notices,
+    //! because no code reads this struct. The handler lives in `stdio.rs`
+    //! and writes the three fields out by hand, off the raw pointer:
+    //!
+    //! ```text
+    //! let (table, index) = unsafe { (*p, *p.add(1)) };
+    //! unsafe { *(p.add(2) as *mut u16) = value };
+    //! ```
+    //!
+    //! So this declaration is documentation that the compiler cannot check
+    //! against its only reader, and the two can drift apart in silence. What
+    //! the test below pins is the 0, the 1 and the 2 of those two lines --
+    //! against the struct, and both against `include/uapi/linux/kd.h`.
+    //!
+    //! The four structures of this file that `TCGETS`, `TIOCGICOUNT`,
+    //! `VT_GETMODE` and `VT_GETSTATE` copy got their layout pinned earlier;
+    //! this one was left out.
+
+    use super::*;
+    use core::mem::{align_of, offset_of, size_of};
+
+    #[test]
+    fn kbentry_is_the_table_the_index_and_then_the_value() {
+        assert_eq!(size_of::<KbEntry>(), 4);
+        assert_eq!(align_of::<KbEntry>(), 2);
+        assert_eq!(offset_of!(KbEntry, kb_table), 0);
+        assert_eq!(offset_of!(KbEntry, kb_index), 1);
+        assert_eq!(offset_of!(KbEntry, kb_value), 2);
+        assert_eq!(offset_of!(KbEntry, kb_value) + 2, 4);
+    }
+}

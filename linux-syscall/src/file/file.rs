@@ -144,6 +144,9 @@ mod ioctl_number_tests;
 #[cfg(test)]
 mod sync_file_range_tests;
 
+#[cfg(test)]
+mod wire_layout_tests;
+
 /// Whether an `EINVAL` from the file's own ioctl handler should be reported
 /// as `ENOTTY`: the request is in the `0x54xx` terminal block and is not one
 /// of the file ioctls that block also carries.
