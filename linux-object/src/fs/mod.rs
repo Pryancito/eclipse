@@ -1032,6 +1032,27 @@ impl From<FileDesc> for i32 {
     }
 }
 
+#[cfg(test)]
+mod abi_number_tests;
+
+/// Character major of the input core, and the minor `/dev/input/eventN`
+/// starts at (`Documentation/admin-guide/devices.txt`).
+///
+/// The input core gives each device type 32 minors: `jsN` at 0, `mouseN` at
+/// 32, the unified `mice` at 63, and the event queues from 64 up. So the
+/// base is not a free choice: one minor lower is `mice`, and a node named
+/// `c13:63` would be the unified mouse rather than `event0`.
+///
+/// These numbers are also written in `sysfs.rs`, which builds the
+/// `/sys/class/input` tree from them, and they have to agree: udev records
+/// and sysfs nodes naming different devices is exactly how labwc's libinput
+/// backend came to find zero input devices with the tree fully populated.
+/// They used to be declared inside `create_root_fs`'s body, where no test
+/// could see them.
+const EVDEV_MAJOR: usize = 13;
+/// See [`EVDEV_MAJOR`].
+const EVDEV_EVENT_MINOR_BASE: usize = 64;
+
 /// create root filesystem, mount DevFS and RamFS
 pub fn create_root_fs(rootfs: Arc<dyn FileSystem>) -> Arc<dyn INode> {
     warn!("[boot] create_root_fs: begin");
@@ -1537,9 +1558,6 @@ pub fn create_root_fs(rootfs: Arc<dyn FileSystem>) -> Arc<dyn INode> {
                 .create("udev", FileType::Dir, 0o755)
                 .and_then(|udev| udev.create("data", FileType::Dir, 0o755));
             if let Ok(data_dir) = data_dir {
-                // Matches EVDEV_MAJOR / EVDEV_EVENT_MINOR_BASE in `sysfs.rs`.
-                const EVDEV_MAJOR: usize = 13;
-                const EVDEV_EVENT_MINOR_BASE: usize = 64;
                 for (id, dev) in devs.iter().enumerate() {
                     // libinput's `evdev_configure_device` ignores any device
                     // tagged only `ID_INPUT` with no subtype ("not tagged as
