@@ -10,6 +10,63 @@
 //!
 //! Tested in `process/fd_alloc_tests.rs` and measured in
 //! `benches/process.rs`.
+//!
+//! ## `next_fd`, the lower bound on the lowest free descriptor
+//!
+//! Linux keeps the same thing (`files_struct::next_fd`) for the same reason:
+//! `alloc_fd` must return the lowest free number, and finding it by probing
+//! upwards from zero costs one lookup per descriptor the process already
+//! holds. That is paid on every `open`, `dup`, `pipe`, `socket` and `accept`,
+//! so filling a table is quadratic in its size -- 10.9 ns on an empty table
+//! and 26.7 **micro**seconds at eight thousand open descriptors, one `accept`
+//! of a server's steady state (`fd_alloc_of_*`).
+//!
+//! **The invariant is one-sided and that is deliberate**: the bound is only
+//! ever allowed to be at or BELOW the lowest free descriptor. Too low merely
+//! costs the probes it saved; too high would hand out a number that is not
+//! the lowest free one, which is a visible ABI difference -- a shell writes
+//! `exec 3<file` and then talks about fd 3. So every removal lowers it
+//! ([`LinuxProcessInner::note_fd_freed`]) and nothing raises it except
+//! walking over descriptors found to be occupied.
+//!
+//! ## `epoll_fds`, which descriptors are an epoll
+//!
+//! `epoll_forget_plan` runs on every `close(2)` and used to find the epolls
+//! by cloning and downcasting EVERY entry of the table -- an atomic increment
+//! and a vtable check per open descriptor, on a path a program takes once per
+//! file it reads. That is 114 microseconds for one close at eight thousand
+//! open descriptors (`close_and_reopen_of_8192`), and the great majority of
+//! processes have no epoll at all to find.
+//!
+//! This invariant is **exact and not one-sided**: these are EXACTLY the
+//! descriptors whose file is an epoll. One missing is an epoll a close fails
+//! to tell; one left over is a plan built for an epoll that is not there.
+//!
+//! ## `holders`, how many descriptors hold each description
+//!
+//! It answers the one question a close has to ask before it tells an epoll
+//! anything: is the description I just closed still held by some surviving
+//! descriptor of mine? Linux drops an epoll entry from `__fput`, when the
+//! LAST reference goes, so a `dup` of a watched descriptor keeps its entry
+//! alive through the close of the original. Asking it by walking `files` and
+//! comparing pointers made a close linear in the table all over again once
+//! any epoll was open: 65.7 microseconds at eight thousand open descriptors
+//! (`close_and_reopen_watched_of_8192`), and a `close_range` of k descriptors
+//! over a table of n was k*n comparisons.
+//!
+//! The address is kept as a **number** and not as a pointer: it is an
+//! identity and never dereferenced, and a raw pointer in the struct would
+//! make the whole process object not `Send`. And it is a safe key **because
+//! the table holds a strong reference to everything it counts**: nothing
+//! counted here can be freed, so no address in the map can be reused by a
+//! different description while it is in it. The count reaching zero and the
+//! entry leaving are the same event, which is what lets
+//! [`LinuxProcessInner::holds_description`] be a plain `contains_key`.
+//!
+//! All three are kept in step by the same two hooks,
+//! [`LinuxProcessInner::note_fd_inserted`] and
+//! [`LinuxProcessInner::note_fd_freed`]: the two places a descriptor appears
+//! in or leaves `files`.
 
 use super::*;
 

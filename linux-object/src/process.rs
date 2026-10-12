@@ -1218,68 +1218,17 @@ struct LinuxProcessInner {
     /// Opened files
     files: HashMap<FileDesc, Arc<dyn FileLike>>,
     /// How many descriptors of this table hold each open file description,
-    /// keyed by the description's address.
-    ///
-    /// It answers the one question a close has to ask before it tells an
-    /// epoll anything: is the description I just closed still held by some
-    /// surviving descriptor of mine? Linux drops an epoll entry from `__fput`,
-    /// when the LAST reference goes, so a `dup` of a watched descriptor keeps
-    /// its entry alive through the close of the original.
-    ///
-    /// Asking it by walking `files` and comparing pointers made a close linear
-    /// in the table all over again once any epoll was open: 65.7 microseconds
-    /// at eight thousand open descriptors (`benches/process.rs`,
-    /// `close_and_reopen_watched_of_8192`), and a `close_range` of k
-    /// descriptors over a table of n was k*n comparisons.
-    ///
-    /// The address is kept as a NUMBER and not as a pointer: it is an
-    /// identity and never dereferenced, and a raw pointer in here would make
-    /// the whole process object not `Send`.
-    ///
-    /// The address is a safe key BECAUSE the table holds a strong reference to
-    /// everything it counts: nothing counted here can be freed, so no address
-    /// in this map can be reused by a different description while it is in it.
-    /// The count reaching zero and the entry leaving are the same event.
-    ///
-    /// Kept in step by the same two hooks as `epoll_fds`, and checked against
-    /// the table itself in `process/fd_alloc_tests.rs`.
+    /// keyed by the description's address as a NUMBER. See
+    /// [`fd_table`][mod@self::fd_table] for what it is for, why the address
+    /// is a safe key, and the invariant.
     holders: HashMap<usize, usize>,
     /// The descriptors of this table whose open file description is an
-    /// `epoll`, so that a close can ask them to forget what it closed without
-    /// walking the table to find them.
-    ///
-    /// `epoll_forget_plan` runs on every `close(2)` and used to find the
-    /// epolls by cloning and downcasting EVERY entry -- an atomic increment
-    /// and a vtable check per open descriptor, on a path a program takes once
-    /// per file it reads. That is 114 microseconds for one close at eight
-    /// thousand open descriptors (`benches/process.rs`,
-    /// `close_and_reopen_of_8192`), and the great majority of processes have
-    /// no epoll at all to find.
-    ///
-    /// Kept in step by [`Self::note_fd_inserted`] and
-    /// [`Self::note_fd_freed`], the two places a descriptor appears in or
-    /// leaves `files`. The invariant is exact and not one-sided: these are
-    /// EXACTLY the descriptors whose file is an epoll, which
-    /// `process/fd_alloc_tests.rs` checks against the table itself.
+    /// `epoll`. See [`fd_table`][mod@self::fd_table].
     epoll_fds: HashSet<FileDesc>,
-    /// A LOWER BOUND on the lowest free descriptor, which is what
-    /// [`Self::get_free_fd_from`] starts its search at instead of zero.
-    ///
-    /// Linux keeps the same thing (`files_struct::next_fd`) for the same
-    /// reason: `alloc_fd` must return the lowest free number, and finding it
-    /// by probing upwards from zero costs one lookup per descriptor the
-    /// process already holds. That is paid on every `open`, `dup`, `pipe`,
-    /// `socket` and `accept`, so filling a table is quadratic in its size --
-    /// measured here at 10.9 ns on an empty table and 26.7 **micro**seconds
-    /// at eight thousand open descriptors, one `accept` of a server's
-    /// steady state (`benches/process.rs`, `fd_alloc_of_*`).
-    ///
-    /// The invariant is one-sided and that is deliberate: this is only ever
-    /// allowed to be at or BELOW the lowest free descriptor. Too low merely
-    /// costs the probes it saved; too high would hand out a number that is
-    /// not the lowest free one, which is a visible ABI difference. So every
-    /// removal lowers it ([`Self::note_fd_freed`]) and nothing raises it
-    /// except walking over descriptors found to be occupied.
+    /// A LOWER BOUND on the lowest free descriptor, which is where
+    /// `get_free_fd_from` starts its search instead of zero. The bound is
+    /// ONE-SIDED, and that is load-bearing: see
+    /// [`fd_table`][mod@self::fd_table].
     next_fd: usize,
     /// Per-descriptor `FD_CLOEXEC` state — the set of fds the next `execve`
     /// must close. POSIX makes this a property of the DESCRIPTOR, not the open
