@@ -147,6 +147,9 @@ mod sync_file_range_tests;
 #[cfg(test)]
 mod wire_layout_tests;
 
+#[cfg(test)]
+mod drm_ioctl_layout_tests;
+
 /// Whether an `EINVAL` from the file's own ioctl handler should be reported
 /// as `ENOTTY`: the request is in the `0x54xx` terminal block and is not one
 /// of the file ioctls that block also carries.
@@ -1354,20 +1357,7 @@ impl Syscall<'_> {
 
         const PRIME_HANDLE_TO_FD: u32 = nr::PRIME_HANDLE_TO_FD.0; // DRM_IOWR(0x2d, drm_prime_handle)
         const PRIME_FD_TO_HANDLE: u32 = nr::PRIME_FD_TO_HANDLE.0; // DRM_IOWR(0x2e, drm_prime_handle)
-        const MODE_CREATE_LEASE: u32 = 0xC6; // DRM_IOWR(0xc6, drm_mode_create_lease)
-
-        // struct drm_mode_create_lease {
-        //   __u64 object_ids; __u32 object_count; __u32 flags;
-        //   __u32 lessee_id;  __s32 fd; }
-        #[repr(C)]
-        #[derive(Clone, Copy, Default)]
-        struct DrmModeCreateLease {
-            object_ids: u64,
-            object_count: u32,
-            flags: u32,
-            lessee_id: u32,
-            fd: i32,
-        }
+        const MODE_CREATE_LEASE: u32 = nr::MODE_CREATE_LEASE.0; // DRM_IOWR(0xc6, drm_mode_create_lease)
 
         // The fd really has to be a DRM node. Dispatching on the request number
         // alone meant `PRIME_HANDLE_TO_FD` on ANY fd reached the export path,
@@ -1623,16 +1613,6 @@ impl Syscall<'_> {
             return Ok(None);
         }
 
-        // struct drm_syncobj_handle { __u32 handle; __u32 flags; __s32 fd; __u32 pad; }
-        #[repr(C)]
-        #[derive(Clone, Copy, Default)]
-        struct DrmSyncobjHandle {
-            handle: u32,
-            flags: u32,
-            fd: i32,
-            pad: u32,
-        }
-
         let proc = self.linux_process();
         let mut ptr = UserInOutPtr::<DrmSyncobjHandle>::from(arg1);
         let mut h = match ptr.read() {
@@ -1865,18 +1845,6 @@ impl Syscall<'_> {
     fn sys_sync_file_merge(&self, file: &Arc<dyn FileLike>, arg1: usize) -> SysResult {
         use linux_object::fs::SyncobjHandle;
 
-        // struct sync_merge_data { char name[32]; __s32 fd2; __s32 fence;
-        //                          __u32 flags; __u32 pad; }
-        #[repr(C)]
-        #[derive(Clone, Copy)]
-        struct SyncMergeData {
-            name: [u8; 32],
-            fd2: i32,
-            fence: i32,
-            flags: u32,
-            pad: u32,
-        }
-
         let Some(first) = file.downcast_ref::<SyncobjHandle>() else {
             return Err(LxError::ENOTTY);
         };
@@ -1928,25 +1896,22 @@ impl Syscall<'_> {
         arg1: usize,
     ) -> Result<Option<usize>, LxError> {
         // NR + type only; the encoded struct size is not part of the match.
-        // The caller (`sys_ioctl`) has already checked it is at least the 24
-        // bytes read below.
-        if !linux_object::fs::devfs::drm_scheme::is_drm_ioctl_nr(request as u32, 0xCF, 24) {
+        // Both halves of the pair come from the dispatch table `sys_ioctl`
+        // already decided with: a second copy written out here would refuse
+        // in silence -- `Ok(None)`, which falls through to nouveau dispatch --
+        // anything the table had let in. The byte count in that table is the
+        // size of `DrmSyncobjEventfd`, which is what this method parses;
+        // `drm_ioctl_layout_tests` holds the two together.
+        let (eventfd_nr, eventfd_min) = linux_object::fs::devfs::drm_scheme::nr::SYNCOBJ_EVENTFD;
+        if !linux_object::fs::devfs::drm_scheme::is_drm_ioctl_nr(
+            request as u32,
+            eventfd_nr,
+            eventfd_min,
+        ) {
             return Ok(None);
         }
         if !kernel_hal::drivers::nouveau_uapi_enabled() {
             return Ok(None);
-        }
-
-        // struct drm_syncobj_eventfd {
-        //   __u32 handle; __u32 flags; __u64 point; __s32 fd; __u32 pad; }
-        #[repr(C)]
-        #[derive(Clone, Copy, Default)]
-        struct DrmSyncobjEventfd {
-            handle: u32,
-            flags: u32,
-            point: u64,
-            fd: i32,
-            pad: u32,
         }
 
         let ptr = UserInPtr::<DrmSyncobjEventfd>::from(arg1);
@@ -3518,6 +3483,76 @@ mod truncate_type_tests {
 /// tree has lost ioctls before.
 pub(crate) fn is_sync_ioc_merge(cmd: u32) -> bool {
     (cmd >> 8) & 0xff == 0x3e && cmd & 0xff == 3
+}
+
+/// `struct sync_merge_data` (`<linux/sync_file.h>`), what `SYNC_IOC_MERGE`
+/// reads and writes back: `char name[32]; __s32 fd2; __s32 fence;
+/// __u32 flags; __u32 pad;`.
+///
+/// It lives here, and not inside `Syscall::sys_sync_file_merge` where it was
+/// declared, because the order of these fields is the ABI and a struct local
+/// to a function body cannot be named by a test. The layout is pinned in
+/// `drm_ioctl_layout_tests`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct SyncMergeData {
+    /// The name Linux gives the merged fence. Carried for its 32 bytes and
+    /// handed straight back: this tree does not keep fence names.
+    name: [u8; 32],
+    fd2: i32,
+    fence: i32,
+    flags: u32,
+    pad: u32,
+}
+
+/// `struct drm_mode_create_lease` (`drm.h`), the argument of
+/// `DRM_IOCTL_MODE_CREATE_LEASE`: `__u64 object_ids; __u32 object_count;
+/// __u32 flags; __u32 lessee_id; __s32 fd;`.
+///
+/// Here rather than inside `Syscall::sys_drm_prime` for the reason
+/// [`SyncMergeData`] gives.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct DrmModeCreateLease {
+    object_ids: u64,
+    object_count: u32,
+    flags: u32,
+    lessee_id: u32,
+    fd: i32,
+}
+
+/// `struct drm_syncobj_handle` (`drm.h`), the argument of both syncobj fd
+/// ioctls: `__u32 handle; __u32 flags; __s32 fd; __u32 pad;`.
+///
+/// These 16 bytes are the frozen prefix. The UABI struct is append-only and
+/// newer kernels grew a tail, which is why `Syscall::sys_drm_syncobj_fd`
+/// matches on the ioctl nr and type and never on the size it encodes -- and
+/// why what has to be written down is that the prefix is these four words in
+/// this order. Here rather than inside that method for the reason
+/// [`SyncMergeData`] gives.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct DrmSyncobjHandle {
+    handle: u32,
+    flags: u32,
+    fd: i32,
+    pad: u32,
+}
+
+/// `struct drm_syncobj_eventfd` (`drm.h`), the argument of
+/// `DRM_IOCTL_SYNCOBJ_EVENTFD`: `__u32 handle; __u32 flags; __u64 point;
+/// __s32 fd; __u32 pad;`.
+///
+/// Here rather than inside `Syscall::sys_drm_syncobj_eventfd` for the reason
+/// [`SyncMergeData`] gives.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct DrmSyncobjEventfd {
+    handle: u32,
+    flags: u32,
+    point: u64,
+    fd: i32,
+    pad: u32,
 }
 
 /// The one flag `SYNCOBJ_HANDLE_TO_FD` and `SYNCOBJ_FD_TO_HANDLE` know:
