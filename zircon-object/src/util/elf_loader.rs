@@ -782,6 +782,86 @@ pub trait ElfExt {
     ) -> Result<(), &'static str>;
 }
 
+/// The ELF relocation types this loader applies, spelled and numbered as
+/// `elf/elf.h` spells and numbers them.
+///
+/// They used to be declared inside `relocate`'s body, where no test could
+/// name them -- and only the three x86_64 types the tests build images for
+/// were pinned at all, by accident, through the write each one makes. The
+/// other seven are numbers nothing here can check by running anything: a
+/// wrong `R_AARCH64_RELATIVE` would relocate every PIE binary on aarch64 to
+/// the wrong address, and this host cannot boot aarch64.
+///
+/// Symbol-resolving types, which write `S + A`. `R_X86_64_64` is a direct
+/// 64-bit write, the `GLOB_DAT` pair create a GOT entry and the `JUMP_SLOT`
+/// pair a PLT entry.
+const R_X86_64_64: u32 = 1;
+/// See [`R_X86_64_64`].
+const R_X86_64_GLOB_DAT: u32 = 6;
+/// See [`R_X86_64_64`].
+const R_X86_64_JUMP_SLOT: u32 = 7;
+/// See [`R_X86_64_64`].
+const R_RISCV_64: u32 = 2;
+/// See [`R_X86_64_64`]. 0x401, written in decimal because decimal is the base
+/// `elf.h` writes the aarch64 block in.
+const R_AARCH64_GLOB_DAT: u32 = 1025;
+/// See [`R_AARCH64_GLOB_DAT`]. 0x402.
+const R_AARCH64_JUMP_SLOT: u32 = 1026;
+
+/// Base-relative types, which write `B + A`: the load base plus the addend,
+/// with no symbol involved. Nearly every entry of a PIE binary's `.rela.dyn`
+/// is one of these, so an arch missing from this set does not fail loudly --
+/// it loads a binary whose every internal pointer is left unrelocated.
+const R_X86_64_RELATIVE: u32 = 8;
+/// See [`R_X86_64_RELATIVE`].
+const R_RISCV_RELATIVE: u32 = 3;
+/// See [`R_X86_64_RELATIVE`]. 0x403.
+const R_AARCH64_RELATIVE: u32 = 1027;
+
+/// `R_X86_64_IRELATIVE`: the value to write is not a fixed address but the
+/// RETURN VALUE of calling a resolver function at `base + addend` (an IFUNC).
+///
+/// glibc's own dynamic linker (`ld-linux-x86-64.so.2`) uses CPU-feature
+/// dispatched routines (optimized memcpy/memset/strlen etc.) even internally,
+/// so a real glibc interpreter's `.rela.plt` legitimately carries these.
+/// Collected and resolved in a batch after the main relocation loop (see
+/// `resolve_irelative_x86_64`), because resolving one requires actually
+/// EXECUTING the resolver, which the per-entry loop has no business doing
+/// mid-scan. Only the x86_64 trap plumbing to do that exists, so on every
+/// other arch the type is classified and then skipped.
+const R_X86_64_IRELATIVE: u32 = 37;
+
+/// What `relocate` must do with one relocation type. The three it applies are
+/// not variations on one another: each writes a different value, so a type
+/// classified into the wrong one writes a plausible word to a real address.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RelocKind {
+    /// Write `S + A`: the symbol's address plus the addend.
+    Symbol,
+    /// Write `B + A`: the load base plus the addend.
+    BaseRelative,
+    /// Call a resolver at `B + A` and write what it returns.
+    Irelative,
+    /// Not a type this loader applies. Logged and skipped, never a panic: one
+    /// user program must not be able to take the kernel down.
+    Unknown,
+}
+
+/// Classify one relocation type. Arch-independent on purpose: the arms are
+/// not `cfg`-gated, so an aarch64 or riscv64 image handed to this loader is
+/// relocated correctly whatever the loader itself is running on, and a host
+/// test can reach every one of the ten numbers.
+#[inline]
+fn reloc_kind(ty: u32) -> RelocKind {
+    match ty {
+        R_X86_64_64 | R_X86_64_GLOB_DAT | R_X86_64_JUMP_SLOT | R_RISCV_64 | R_AARCH64_GLOB_DAT
+        | R_AARCH64_JUMP_SLOT => RelocKind::Symbol,
+        R_X86_64_RELATIVE | R_RISCV_RELATIVE | R_AARCH64_RELATIVE => RelocKind::BaseRelative,
+        R_X86_64_IRELATIVE => RelocKind::Irelative,
+        _ => RelocKind::Unknown,
+    }
+}
+
 /// Where a relocation writes: `base + r_offset`, or nothing when that address
 /// does not exist.
 ///
@@ -913,36 +993,8 @@ impl ElfExt for ElfFile<'_> {
         vmar: Arc<VmAddressRegion>,
         scratch_vmar: &Arc<VmAddressRegion>,
     ) -> Result<(), &'static str> {
-        // Symbol-resolving relocations (write `S + A`).
-        // x86_64
-        const REL_GOT: u32 = 6; // R_X86_64_GLOB_DAT
-        const REL_PLT: u32 = 7; // R_X86_64_JUMP_SLOT
-        const R_X86_64_64: u32 = 1;
-        // riscv64
-        const R_RISCV_64: u32 = 2;
-        // aarch64
-        const R_AARCH64_GLOBAL_DATA: u32 = 0x401;
-        const R_AARCH64_JUMP_SLOT: u32 = 0x402;
-
-        // Base-relative relocations (write `B + A`).
-        // x86_64
-        const REL_RELATIVE: u32 = 8; // R_X86_64_RELATIVE
-                                     // riscv64
-        const R_RISCV_RELATIVE: u32 = 3;
-        // aarch64
-        const R_AARCH64_RELATIVE: u32 = 0x403;
-
-        // R_X86_64_IRELATIVE: the value to write is not a fixed address but the
-        // RETURN VALUE of calling a resolver function at `base + addend` (an
-        // IFUNC). glibc's own dynamic linker (`ld-linux-x86-64.so.2`) uses
-        // CPU-feature-dispatched routines (optimized memcpy/memset/strlen etc.)
-        // even internally, so a real glibc interpreter's `.rela.plt` legitimately
-        // carries these. Collected here and resolved in a batch after the main
-        // relocation loop (see the call to `resolve_irelative_x86_64` below) —
-        // resolving one requires actually EXECUTING the resolver, which this
-        // per-entry loop has no business doing mid-scan.
-        #[cfg(target_arch = "x86_64")]
-        const R_X86_64_IRELATIVE: u32 = 37;
+        // The types themselves, and which of the three things each one
+        // asks for, are `reloc_kind` and the constants above it.
         #[cfg(target_arch = "x86_64")]
         let mut irelative: alloc::vec::Vec<(usize, usize)> = alloc::vec::Vec::new();
 
@@ -1006,13 +1058,8 @@ impl ElfExt for ElfFile<'_> {
             };
             found_any = true;
             for entry in entries.iter() {
-                match entry.get_type() {
-                    REL_GOT
-                    | REL_PLT
-                    | R_X86_64_64
-                    | R_RISCV_64
-                    | R_AARCH64_GLOBAL_DATA
-                    | R_AARCH64_JUMP_SLOT => {
+                match reloc_kind(entry.get_type()) {
+                    RelocKind::Symbol => {
                         let dynsym = match dynsym {
                             Some(dynsym) => dynsym,
                             None => {
@@ -1054,7 +1101,7 @@ impl ElfExt for ElfFile<'_> {
                         trace!("GOT write: {:#x} @ {:#x}", value, addr);
                         write_word(&mut cached, addr, value)?;
                     }
-                    REL_RELATIVE | R_RISCV_RELATIVE | R_AARCH64_RELATIVE => {
+                    RelocKind::BaseRelative => {
                         // `B + A`, same split as above: the value may wrap,
                         // the address may not.
                         let value = base.wrapping_add(entry.get_addend() as usize);
@@ -1062,12 +1109,9 @@ impl ElfExt for ElfFile<'_> {
                         trace!("RELATIVE write: {:#x} @ {:#x}", value, addr);
                         write_word(&mut cached, addr, value)?;
                     }
-                    // Unsupported relocation type (e.g. TLS relocations). Log and
-                    // skip rather than `unimplemented!()`, which would panic the
-                    // whole kernel because of one user program.
-                    other => {
+                    RelocKind::Irelative => {
                         #[cfg(target_arch = "x86_64")]
-                        if other == R_X86_64_IRELATIVE {
+                        {
                             let got_addr = reloc_addr(base, entry.get_offset())?;
                             // The resolver is CALLED, so unlike a plain value
                             // it has to be an address that exists; the scratch
@@ -1076,9 +1120,23 @@ impl ElfExt for ElfFile<'_> {
                             irelative.push((got_addr, resolver_addr));
                             continue;
                         }
+                        // Nowhere else can run a resolver, so the entry is
+                        // skipped like any type this loader does not apply.
+                        #[cfg(not(target_arch = "x86_64"))]
                         warn!(
                             "relocate: skipping unsupported relocation type {} in {}",
-                            other, sec_name
+                            entry.get_type(),
+                            sec_name
+                        );
+                    }
+                    // Unsupported relocation type (e.g. TLS relocations). Log
+                    // and skip rather than `unimplemented!()`, which would
+                    // panic the whole kernel because of one user program.
+                    RelocKind::Unknown => {
+                        warn!(
+                            "relocate: skipping unsupported relocation type {} in {}",
+                            entry.get_type(),
+                            sec_name
                         );
                     }
                 }
@@ -2289,12 +2347,11 @@ mod tests {
     const SHT_RELA: u32 = 4;
     const SHT_DYNSYM: u32 = 11;
 
-    /// Relocation types, as `relocate` spells them. The first three write
-    /// `S + A`, the fourth `B + A`, and the last is one no arm names.
-    const R_X86_64_64: u32 = 1;
-    const R_X86_64_GLOB_DAT: u32 = 6;
-    const R_X86_64_JUMP_SLOT: u32 = 7;
-    const R_X86_64_RELATIVE: u32 = 8;
+    /// A relocation type no arm names, so that a test can hand the loader one
+    /// it must skip. The four it DOES name now come from module scope: this
+    /// module used to carry its own copies of those four literals, which
+    /// agreed with production's by luck and let `R_X86_64_64` be renumbered
+    /// with every test still passing.
     const R_X86_64_TPOFF64: u32 = 18;
 
     /// One entry of a 64-bit symbol or relocation table.
@@ -2768,5 +2825,96 @@ mod tests {
 
         assert_eq!(word_at(&vmar, 0x40), vmar.addr() + 0x11);
         assert_eq!(word_at(&vmar, 0x48), vmar.addr() + 0x22);
+    }
+}
+
+#[cfg(test)]
+mod reloc_type_tests {
+    //! The ten relocation numbers, which used to live inside `relocate`'s
+    //! body where nothing could name them.
+    //!
+    //! Only three of them were pinned, and only as a side effect of the write
+    //! each one makes; the five belonging to aarch64 and riscv64 were numbers
+    //! nothing here could check by running anything, and this host cannot
+    //! boot either arch. Every number below is written out from `elf/elf.h`,
+    //! and every call passes the raw number rather than the constant, so that
+    //! two of them swapping places is a failure and not a rename.
+    //!
+    //! What is NOT tested here is that no two of the ten share a number, and
+    //! on purpose: all ten appear as patterns of one `match` in `reloc_kind`,
+    //! so a collision is an unreachable pattern, and this crate denies
+    //! warnings. Mutating `R_RISCV_64` to 3 does not fail a test, it fails to
+    //! compile -- a stronger guarantee than any assertion could give, and one
+    //! that would be worth replacing with a test only if that `match` ever
+    //! became a chain of `if`s.
+
+    use super::*;
+
+    /// `R_X86_64_64` is the one that shows why a test can be insensitive by
+    /// construction: the only test that fed the loader type 1 asserts that
+    /// NOTHING was written (an undefined symbol is left to the dynamic
+    /// linker), and a type classified as unknown also writes nothing. A test
+    /// that asserts an absence cannot pin the number that chose the branch.
+    #[test]
+    fn the_relocation_types_are_the_numbers_glibc_elf_h_gives() {
+        for (name, actual, expected) in [
+            ("R_X86_64_64", R_X86_64_64, 1),
+            ("R_RISCV_64", R_RISCV_64, 2),
+            ("R_RISCV_RELATIVE", R_RISCV_RELATIVE, 3),
+            ("R_X86_64_GLOB_DAT", R_X86_64_GLOB_DAT, 6),
+            ("R_X86_64_JUMP_SLOT", R_X86_64_JUMP_SLOT, 7),
+            ("R_X86_64_RELATIVE", R_X86_64_RELATIVE, 8),
+            ("R_X86_64_IRELATIVE", R_X86_64_IRELATIVE, 37),
+            ("R_AARCH64_GLOB_DAT", R_AARCH64_GLOB_DAT, 1025),
+            ("R_AARCH64_JUMP_SLOT", R_AARCH64_JUMP_SLOT, 1026),
+            ("R_AARCH64_RELATIVE", R_AARCH64_RELATIVE, 1027),
+        ] {
+            assert_eq!(actual, expected, "{}", name);
+        }
+    }
+
+    #[test]
+    fn every_symbol_resolving_type_is_classified_as_one() {
+        // x86_64: direct 64-bit, GOT entry, PLT entry. riscv64: direct
+        // 64-bit. aarch64: GOT entry, PLT entry.
+        for ty in [1u32, 6, 7, 2, 1025, 1026] {
+            assert_eq!(reloc_kind(ty), RelocKind::Symbol, "type {}", ty);
+        }
+    }
+
+    /// The one that costs on an arch nobody here can boot: nearly every entry
+    /// of a PIE binary's `.rela.dyn` is base-relative, so an arch dropped
+    /// from this class does not fail loudly. It loads a binary whose every
+    /// internal pointer is left unrelocated.
+    #[test]
+    fn every_base_relative_type_is_classified_as_one() {
+        for ty in [8u32, 3, 1027] {
+            assert_eq!(reloc_kind(ty), RelocKind::BaseRelative, "type {}", ty);
+        }
+    }
+
+    #[test]
+    fn the_ifunc_type_is_its_own_kind_and_neither_of_the_other_two() {
+        assert_eq!(reloc_kind(37), RelocKind::Irelative);
+        // Writing `B + A` for one would put the ADDRESS OF THE RESOLVER in
+        // the GOT slot instead of what the resolver returns, so every call
+        // through that slot would re-enter the resolver as if it were the
+        // function it selects.
+        assert_ne!(reloc_kind(37), RelocKind::BaseRelative);
+        assert_ne!(reloc_kind(37), RelocKind::Symbol);
+    }
+
+    /// A type this loader does not apply must never be mistaken for one it
+    /// does: the two classes it could fall into both WRITE A WORD, through an
+    /// address the file chose.
+    #[test]
+    fn a_type_this_loader_does_not_apply_is_never_mistaken_for_one_it_does() {
+        // 0 is `R_*_NONE` on all three. 4, 5, 18, 36 and 38 are x86_64 types
+        // this loader has no answer for (PLT32, COPY, TPOFF64, TLSDESC,
+        // RELATIVE64), two of them either side of IRELATIVE. 1024 and 1028
+        // are the aarch64 numbers either side of the three it does name.
+        for ty in [0u32, 4, 5, 18, 36, 38, 1024, 1028] {
+            assert_eq!(reloc_kind(ty), RelocKind::Unknown, "type {}", ty);
+        }
     }
 }

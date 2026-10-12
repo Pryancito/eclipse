@@ -17,6 +17,43 @@ use {
 #[cfg(target_arch = "x86_64")]
 const FREEBSD_OSRELDATE: usize = 1_400_097;
 
+/// `e_ident[EI_OSABI]`: the eighth byte of the file -- `EI_MAG0..3`,
+/// `EI_CLASS`, `EI_DATA`, `EI_VERSION`, then this one -- and the value
+/// FreeBSD's toolchain stamps there, both from `sys/elf_common.h`.
+#[cfg(target_arch = "x86_64")]
+const EI_OSABI: usize = 7;
+#[cfg(target_arch = "x86_64")]
+const ELFOSABI_FREEBSD: u8 = 9;
+
+/// The vendor name a FreeBSD `PT_NOTE` carries: the fallback signal, for the
+/// binaries that leave `EI_OSABI` at `SYSV`.
+#[cfg(target_arch = "x86_64")]
+const FREEBSD_NOTE_NAME: &[u8] = b"FreeBSD";
+
+/// Whether the identification bytes say FreeBSD.
+///
+/// `data` is the head of the file `execve` was handed, which can be shorter
+/// than `EI_OSABI + 1`: indexing it rather than `get`ting it would panic the
+/// kernel from an unprivileged process.
+#[cfg(target_arch = "x86_64")]
+fn header_osabi_is_freebsd(data: &[u8]) -> bool {
+    data.get(EI_OSABI) == Some(&ELFOSABI_FREEBSD)
+}
+
+/// Whether one `PT_NOTE` segment's bytes carry the FreeBSD vendor name.
+#[cfg(target_arch = "x86_64")]
+fn segment_names_freebsd(seg: &[u8]) -> bool {
+    seg.windows(FREEBSD_NOTE_NAME.len())
+        .any(|w| w == FREEBSD_NOTE_NAME)
+}
+
+/// Where a PIE image's lowest mapping goes. The range below it is reserved
+/// with a guard sub-VMAR so the null page stays unmapped -- see the guard in
+/// [`LinuxElfLoader::load_impl`] for why that matters. The value is where
+/// `ld` puts a non-PIE x86-64 image, so PIE and non-PIE land at the same
+/// base.
+const PIE_LOAD_BASE: usize = 0x40_0000;
+
 /// Detect the ABI personality of an ELF image from its header and notes.
 ///
 /// The primary signal is `EI_OSABI == ELFOSABI_FREEBSD` (9), which FreeBSD's
@@ -28,8 +65,7 @@ const FREEBSD_OSRELDATE: usize = 1_400_097;
 fn detect_abi(data: &[u8], _elf: &ElfFile) -> Abi {
     #[cfg(target_arch = "x86_64")]
     {
-        const ELFOSABI_FREEBSD: u8 = 9;
-        if data.get(7) == Some(&ELFOSABI_FREEBSD) {
+        if header_osabi_is_freebsd(data) {
             return Abi::Freebsd;
         }
         for ph in _elf.program_iter() {
@@ -37,7 +73,7 @@ fn detect_abi(data: &[u8], _elf: &ElfFile) -> Abi {
                 let off = ph.offset() as usize;
                 let end = off.saturating_add(ph.file_size() as usize);
                 if let Some(seg) = data.get(off..end.min(data.len())) {
-                    if seg.windows(7).any(|w| w == b"FreeBSD") {
+                    if segment_names_freebsd(seg) {
                         return Abi::Freebsd;
                     }
                 }
@@ -430,7 +466,6 @@ impl LinuxElfLoader {
             // access below it faults, matching Linux's non-zero PIE load base.
             // A non-PIE (ET_EXEC) binary already carries high absolute vaddrs
             // (0x400000+ on x86-64), so it needs no bias and gets none.
-            const PIE_LOAD_BASE: usize = 0x40_0000;
             let is_pie = elf.header.pt2.type_().as_type() == xmas_elf::header::Type::SharedObject;
             if is_pie {
                 vmar.allocate_at(0, PIE_LOAD_BASE, VmarFlags::CAN_MAP_RXW, PAGE_SIZE)
@@ -2447,5 +2482,109 @@ mod stack_tests {
         let (bottom, top) = stack_placement(window_end, USER_STACK_PAGES);
         assert_eq!(top, window_end);
         assert_eq!(top - bottom, USER_STACK_SIZE as usize);
+    }
+}
+
+#[cfg(test)]
+mod abi_and_limits_tests {
+    //! The three numbers the loader reads out of a file or imposes on one,
+    //! and that nothing named: the byte that says "FreeBSD", how deep an
+    //! interpreter chain may go, and where a PIE image's lowest mapping
+    //! lands.
+    //!
+    //! All three lived inside a function body -- two as `const` declarations
+    //! in `detect_abi` and `load_impl`, one as an associated constant reached
+    //! through `Self` -- so no test could name them. A mutation run
+    //! renumbered every one and the crate's 2863 tests stayed green:
+    //! `ELFOSABI_FREEBSD` to 10, the `EI_OSABI` index to 8, the depth to 1
+    //! and the load base to 1 MiB.
+
+    use super::*;
+
+    /// Eight identification bytes, with `EI_OSABI` as the caller asks.
+    #[cfg(target_arch = "x86_64")]
+    fn ident(osabi: u8) -> [u8; 8] {
+        [0x7f, b'E', b'L', b'F', 2, 1, 1, osabi]
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn the_osabi_byte_is_the_eighth_and_freebsd_stamps_a_nine() {
+        // `sys/elf_common.h`: SYSV 0, HPUX 1, NETBSD 2, LINUX 3, ...,
+        // FREEBSD 9. A wrong number here loads a FreeBSD binary with the
+        // Linux personality, which means Linux syscall numbers for its
+        // syscalls.
+        assert!(header_osabi_is_freebsd(&ident(9)));
+        for other in [0u8, 1, 2, 3, 8, 10, 255] {
+            assert!(
+                !header_osabi_is_freebsd(&ident(other)),
+                "EI_OSABI {} read as FreeBSD",
+                other
+            );
+        }
+        // And it is that byte, not the one after it: `e_ident[8]` is
+        // EI_ABIVERSION, where a nine means something else entirely.
+        let mut at_abiversion = [0x7f, b'E', b'L', b'F', 2, 1, 1, 0, 9];
+        assert!(!header_osabi_is_freebsd(&at_abiversion));
+        at_abiversion[7] = 9;
+        assert!(header_osabi_is_freebsd(&at_abiversion));
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn a_file_too_short_to_hold_the_osabi_byte_is_not_freebsd() {
+        // `execve` hands the loader whatever the calling process chose.
+        // Indexing a seven-byte file at 7 is a kernel panic reachable by
+        // anyone, which is why the check `get`s the byte instead.
+        let full = ident(9);
+        for len in 0..full.len() {
+            assert!(
+                !header_osabi_is_freebsd(&full[..len]),
+                "{} bytes answered FreeBSD",
+                len
+            );
+        }
+        assert!(header_osabi_is_freebsd(&full));
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn the_note_vendor_name_is_the_seven_bytes_of_freebsd() {
+        // The fallback signal: a static binary whose EI_OSABI stayed SYSV but
+        // whose PT_NOTE names its vendor. The name is looked for anywhere in
+        // the segment because the note header's own fields come first.
+        assert_eq!(FREEBSD_NOTE_NAME, &b"FreeBSD"[..]);
+        assert!(segment_names_freebsd(b"FreeBSD"));
+        assert!(segment_names_freebsd(b"\x08\x00\x00\x00FreeBSD\x00"));
+        assert!(!segment_names_freebsd(b"NetBSD\x00"));
+        assert!(!segment_names_freebsd(b"GNU\x00"));
+        // A prefix of the name is not the name, and a segment shorter than it
+        // has no window to match at all.
+        assert!(!segment_names_freebsd(b"FreeBS"));
+        assert!(!segment_names_freebsd(b""));
+    }
+
+    #[test]
+    fn the_interpreter_chain_stops_at_the_depth_linux_stops_at() {
+        // `BINPRM_MAX_RECURSION`, `include/linux/binfmts.h`. It is what
+        // `load_impl` refuses to go past and, one level deeper, how far
+        // `preflight_interpreters` resolves -- so a chain that is too deep is
+        // the loader's error to report, with its own message, and not the
+        // preflight check's.
+        assert_eq!(LinuxElfLoader::MAX_INTERP_DEPTH, 4);
+    }
+
+    #[test]
+    fn the_pie_load_base_leaves_the_null_page_out_and_is_page_aligned() {
+        // The guard is `allocate_at(0, PIE_LOAD_BASE, .., PAGE_SIZE)`: a base
+        // of zero reserves nothing and the image lands on the null page, and
+        // a base that is not a whole number of pages is refused outright.
+        assert_ne!(PIE_LOAD_BASE, 0);
+        assert_eq!(PIE_LOAD_BASE % PAGE_SIZE, 0);
+        // Above the 64 KiB a Linux host keeps unmappable by default
+        // (`vm.mmap_min_addr`), and at the base `ld` gives a non-PIE x86-64
+        // image, so a PIE and a non-PIE binary load at the same address.
+        assert!(PIE_LOAD_BASE >= 0x1_0000);
+        assert_eq!(PIE_LOAD_BASE, 0x40_0000);
     }
 }

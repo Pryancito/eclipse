@@ -23,6 +23,16 @@ pub struct SemidDs {
     __pad2: usize,
     /// number of semaphores in set
     pub nsems: usize,
+    /// `__unused3` and `__unused4` of `semid64_ds`, the reserved tail that
+    /// makes this struct the 104 bytes a libc hands to `semctl`.
+    ///
+    /// They were missing, so the struct was 88 bytes and `IPC_STAT` wrote 88
+    /// into a 104-byte buffer, leaving the caller's last two words however it
+    /// found them. No libc reads them today -- which is why it went unnoticed
+    /// -- but a short copy into a userspace struct is a short copy, and
+    /// `IPC_SET` read 16 bytes fewer than Linux reads as well.
+    __unused3: usize,
+    __unused4: usize,
 }
 
 /// A System V semaphore set
@@ -342,6 +352,8 @@ impl SemArray {
                 nsems,
                 __pad1: 0,
                 __pad2: 0,
+                __unused3: 0,
+                __unused4: 0,
             }),
             sems: semaphores,
             semop_lock: Mutex::new(()),
@@ -982,5 +994,59 @@ pub(crate) mod test_globals {
     /// not a failure for the tests that follow, so step over the poison.
     pub(crate) fn lock() -> self::std::sync::MutexGuard<'static, ()> {
         LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+#[cfg(test)]
+mod limit_number_tests {
+    //! The two numbers this file enforces, against the literals
+    //! `include/uapi/linux/sem.h` gives.
+    //!
+    //! `SEMMSL` is already pinned from `linux-syscall`, which reports it
+    //! through `semctl(IPC_INFO)` and imports it from here; `SEMMNI` was a
+    //! hand-written copy there, and renumbered here it survived both suites.
+
+    use super::*;
+
+    #[test]
+    fn the_semaphore_limits_are_the_numbers_linux_defaults_to() {
+        // `#define SEMMNI 32000`, `#define SEMMSL 32000`.
+        assert_eq!(SEMMNI, 32000);
+        assert_eq!(SEMMSL, 32000);
+    }
+}
+
+/// The wire layout of [`SemidDs`], Linux's `struct semid64_ds`.
+///
+/// x86_64 does not use the `asm-generic` form: `arch/x86/include/uapi/asm/
+/// sembuf.h` keeps a reserved word between `sem_otime` and `sem_ctime` and
+/// another after `sem_ctime`, where the generic 64-bit struct has the two
+/// timestamps adjacent. Those are the `__pad1` and `__pad2` here, and getting
+/// them wrong moves `sem_nsems` -- the one field anybody reads.
+#[cfg(test)]
+mod semid_layout_tests {
+    use super::SemidDs;
+    use core::mem::{align_of, offset_of, size_of};
+
+    #[test]
+    fn semid64_ds_is_one_hundred_and_four_bytes() {
+        assert_eq!(size_of::<SemidDs>(), 104);
+        assert_eq!(align_of::<SemidDs>(), 8);
+        assert_eq!(offset_of!(SemidDs, perm), 0);
+    }
+
+    #[test]
+    fn the_pad_between_the_two_timestamps_is_not_optional() {
+        assert_eq!(offset_of!(SemidDs, otime), 48);
+        assert_eq!(offset_of!(SemidDs, __pad1), 56);
+        assert_eq!(offset_of!(SemidDs, ctime), 64);
+        assert_eq!(offset_of!(SemidDs, __pad2), 72);
+    }
+
+    #[test]
+    fn the_set_size_is_followed_by_two_reserved_words() {
+        assert_eq!(offset_of!(SemidDs, nsems), 80);
+        assert_eq!(offset_of!(SemidDs, __unused3), 88);
+        assert_eq!(offset_of!(SemidDs, __unused4), 96);
     }
 }

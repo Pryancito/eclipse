@@ -1373,3 +1373,80 @@ mod blocking_wait_tests {
         assert_eq!(queue.waiter_count(), 0);
     }
 }
+
+#[cfg(test)]
+mod limit_number_tests {
+    //! The three numbers this file enforces, against the literals
+    //! `include/uapi/linux/msg.h` gives.
+    //!
+    //! Every other test here builds its expectation FROM the constant
+    //! (`queue_of(MSGMNB)`, `for i in 0..MSGMNI`), which pins the behaviour
+    //! and not the number: renumbered, all three survived the whole suite. On
+    //! top of that they are the numbers `msgctl(IPC_INFO)` reports from
+    //! `linux-syscall`, and a limit reported but not enforced leaves a reader
+    //! no way to size itself.
+
+    use super::*;
+
+    #[test]
+    fn the_queue_limits_are_the_numbers_linux_defaults_to() {
+        // `#define MSGMAX 8192`, `#define MSGMNB 16384`, and MSGMNI 32000
+        // from Documentation/admin-guide/sysctl/kernel.rst.
+        assert_eq!(MSGMAX, 8192);
+        assert_eq!(MSGMNB, 16384);
+        assert_eq!(MSGMNI, 32000);
+        // And one message has to fit in an empty queue: with MSGMAX above
+        // MSGMNB a `msgsnd` of a legal size could never be queued at all.
+        assert!(MSGMAX <= MSGMNB);
+    }
+}
+
+/// The wire layout of [`MsqidDs`], Linux's `struct msqid64_ds`, which
+/// `msgctl(IPC_STAT)` copies out whole and `IPC_SET` reads back in.
+///
+/// The three timestamps are adjacent `usize`s, so are the three counters, and
+/// so are the two pids, so swapping any pair inside a group compiles and
+/// leaves `ipcs -q` reading the right type off the wrong field. Numbers from
+/// `arch/x86/include/uapi/asm/msgbuf.h`.
+#[cfg(test)]
+mod msqid_layout_tests {
+    use super::MsqidDs;
+    use crate::ipc::IpcPerm;
+    use core::mem::{align_of, offset_of, size_of};
+
+    #[test]
+    fn msqid64_ds_is_one_hundred_and_twenty_bytes() {
+        assert_eq!(size_of::<MsqidDs>(), 120);
+        assert_eq!(align_of::<MsqidDs>(), 8);
+        // The permissions are this struct's own first field, not a pointer to
+        // a copy of them, and they are the 48 bytes of `ipc64_perm`.
+        assert_eq!(offset_of!(MsqidDs, perm), 0);
+        assert_eq!(size_of::<IpcPerm>(), 48);
+    }
+
+    #[test]
+    fn the_timestamps_are_send_then_receive_then_change() {
+        assert_eq!(offset_of!(MsqidDs, stime), 48);
+        assert_eq!(offset_of!(MsqidDs, rtime), 56);
+        assert_eq!(offset_of!(MsqidDs, ctime), 64);
+    }
+
+    #[test]
+    fn the_counters_are_bytes_then_messages_then_capacity() {
+        assert_eq!(offset_of!(MsqidDs, cbytes), 72);
+        assert_eq!(offset_of!(MsqidDs, qnum), 80);
+        assert_eq!(offset_of!(MsqidDs, qbytes), 88);
+    }
+
+    #[test]
+    fn the_sender_pid_comes_before_the_receiver_pid() {
+        // `msg_lspid` and `msg_lrpid` are `__kernel_pid_t`, four bytes each,
+        // and they are the only pair in this struct narrower than a word.
+        assert_eq!(offset_of!(MsqidDs, lspid), 96);
+        assert_eq!(offset_of!(MsqidDs, lrpid), 100);
+        // `__unused4` and `__unused5`: the reserved tail. Shrinking it is the
+        // one mutation of this struct that rustc catches on its own, because
+        // the constructor spells the length out.
+        assert_eq!(offset_of!(MsqidDs, __unused), 104);
+    }
+}

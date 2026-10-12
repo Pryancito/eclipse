@@ -1088,8 +1088,17 @@ impl SemInfo {
     /// `include/uapi/linux/sem.h` defaults, as `semctl_info` fills them.
     /// `IPC_INFO` reports the limits alone; `SEM_INFO` puts the number of
     /// sets in `semusz` and of semaphores in `semaem`.
+    ///
+    /// The two limits a caller can actually hit come from the crate that
+    /// ENFORCES them, never from a copy here. A limit reported but not
+    /// enforced is the bug this pair already had once: `IPC_INFO` said 32000
+    /// and `semget` refused past 256, so PostgreSQL's sizing -- which reads
+    /// the limit and then asks for it -- was told yes and then no. `SEMMSL`
+    /// was fixed then; `SEMMNI` stayed a copy, and a mutation run showed why
+    /// that matters: renumbered in `linux-object`, the copy kept reporting
+    /// the old value and both suites stayed green.
     fn linux_limits(for_sem_info: bool, sets: usize, sems: usize) -> Self {
-        const SEMMNI: i32 = 32000;
+        const SEMMNI: i32 = linux_object::ipc::SEMMNI as i32;
         const SEMMSL: i32 = linux_object::ipc::SEMMSL as i32;
         let mut info = SemInfo {
             semmap: SEMMNI * SEMMSL,
@@ -1130,10 +1139,16 @@ impl MsgInfo {
     /// `include/uapi/linux/msg.h` defaults, as `msgctl_info` fills them.
     /// `MSG_INFO` puts the number of queues in `msgpool`, the bytes queued
     /// in `msgmap` and the messages in `msgtot`.
+    ///
+    /// The three limits come from the crate that enforces them, for the
+    /// reason [`SemInfo::linux_limits`] gives: `msgmni` bounds `msgget`,
+    /// `msgmax` bounds one `msgsnd` and `msgmnb` is the queue's capacity, and
+    /// a reader that is told one number and refused at another has no way to
+    /// size itself.
     fn linux_limits(for_msg_info: bool, queues: usize, bytes: usize, messages: usize) -> Self {
-        const MSGMNI: i32 = 32000;
-        const MSGMAX: i32 = 8192;
-        const MSGMNB: i32 = 16384;
+        const MSGMNI: i32 = linux_object::ipc::MSGMNI as i32;
+        const MSGMAX: i32 = linux_object::ipc::MSGMAX as i32;
+        const MSGMNB: i32 = linux_object::ipc::MSGMNB as i32;
         let mut info = MsgInfo {
             msgpool: MSGMNI * MSGMNB / 1024,
             msgmap: MSGMNB,
@@ -1822,6 +1837,33 @@ mod ipc_table_command_tests {
         let counts = MsgInfo::linux_limits(true, 2, 30, 3);
         assert_eq!((counts.msgpool, counts.msgmap, counts.msgtot), (2, 30, 3));
         assert_eq!(counts.msgseg, 0xffff);
+    }
+
+    /// `msgssz` and `msgseg`, the two fields of `struct msginfo` that
+    /// `msgctl_info` does not compute: `ipc/msg.c` writes `MSGSSZ` and
+    /// `MSGSEG` into them literally. A reader divides `msgpool` by the
+    /// segment size to get the segment count, so the pair has to be the one
+    /// Linux reports; nothing named `msgssz`, and halved it the suite stayed
+    /// green.
+    #[test]
+    fn the_segment_fields_of_msginfo_are_the_ones_linux_writes() {
+        let limits = MsgInfo::linux_limits(false, 0, 0, 0);
+        assert_eq!(limits.msgssz, 16);
+        assert_eq!(limits.msgseg, 0xffff);
+    }
+
+    /// The three totals of `struct seminfo`. `ipc/sem.c` fills `semmap`,
+    /// `semmns` and `semmnu` with `SEMMNS` -- the semaphores the whole system
+    /// allows, which Linux defines as `SEMMNI * SEMMSL` -- and `semume` with
+    /// `SEMMSL`. Only `semmsl` and `semmni` were named, so `semmap` could
+    /// have been either factor on its own.
+    #[test]
+    fn the_total_fields_of_seminfo_are_semmni_times_semmsl() {
+        let limits = SemInfo::linux_limits(false, 0, 0);
+        assert_eq!(limits.semmap, 32000 * 32000);
+        assert_eq!(limits.semmns, 32000 * 32000);
+        assert_eq!(limits.semmnu, 32000 * 32000);
+        assert_eq!(limits.semume, 32000);
     }
 }
 
