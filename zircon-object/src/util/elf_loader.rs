@@ -851,6 +851,7 @@ enum RelocKind {
 /// not `cfg`-gated, so an aarch64 or riscv64 image handed to this loader is
 /// relocated correctly whatever the loader itself is running on, and a host
 /// test can reach every one of the ten numbers.
+#[inline]
 fn reloc_kind(ty: u32) -> RelocKind {
     match ty {
         R_X86_64_64 | R_X86_64_GLOB_DAT | R_X86_64_JUMP_SLOT | R_RISCV_64 | R_AARCH64_GLOB_DAT
