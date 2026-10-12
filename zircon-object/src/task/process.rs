@@ -2645,6 +2645,7 @@ mod process_info_layout_tests {
 mod init_pid_tests {
     use super::*;
     use crate::object::KernelObject;
+    use crate::signal::Event;
 
     /// The init process is born as PID 1, and nothing else is.
     ///
@@ -2668,17 +2669,22 @@ mod init_pid_tests {
         assert_eq!(init.id(), 1);
     }
 
-    /// An ordinary process is never PID 1.
+    /// No ordinary object is ever handed the init koid.
     ///
-    /// `create_init_*` is the only path that forces the koid; every other
-    /// process takes the next one from the global counter, which starts above
-    /// it. A constructor that stopped forcing it would hand init whatever
-    /// number happened to be next.
+    /// `create_init_*` is the only path that forces a koid; everything else
+    /// takes the next one from the global counter, which starts above it. A
+    /// constructor that stopped forcing it would hand init whatever number
+    /// happened to be next.
+    ///
+    /// Asked of an `Event` rather than of a second process on purpose: a
+    /// `Process` holds a root VMAR, which with `aspace-separate` takes one of
+    /// only 127 hosted address-space windows, and this suite already runs at
+    /// the edge of that limit at 16 threads. The invariant is about the
+    /// counter, not about processes, so it can be asked for free.
     #[test]
-    fn an_ordinary_process_does_not_get_the_init_koid() {
-        let root_job = Job::root();
-        let proc = Process::create(&root_job, "not-init").expect("failed to create process");
-        assert_ne!(proc.id(), INIT_PID);
-        assert!(proc.id() > INIT_PID, "the counter starts above PID 1");
+    fn no_ordinary_object_is_handed_the_init_koid() {
+        let obj = Event::new();
+        assert_ne!(obj.id(), INIT_PID);
+        assert!(obj.id() > INIT_PID, "the counter starts above PID 1");
     }
 }
