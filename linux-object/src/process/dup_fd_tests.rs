@@ -20,12 +20,12 @@ use rcore_fs::vfs::{FsError, PollStatus, Timespec};
 
 /// An inode that remembers where each write landed, so a test can see the
 /// offset a second descriptor actually used.
-pub(super) struct Log {
+pub(crate) struct Log {
     writes: Mutex<Vec<(usize, usize)>>,
 }
 
 impl Log {
-    pub(super) fn new() -> Arc<Self> {
+    pub(crate) fn new() -> Arc<Self> {
         Arc::new(Log {
             writes: Mutex::new(Vec::new()),
         })
@@ -91,7 +91,7 @@ pub(super) fn a_process() -> LinuxProcess {
 }
 
 /// `sh -c 'prog >log'`: one open file description, opened for writing.
-pub(super) fn an_open_log(inode: Arc<Log>, flags: OpenFlags) -> Arc<dyn FileLike> {
+pub(crate) fn an_open_log(inode: Arc<Log>, flags: OpenFlags) -> Arc<dyn FileLike> {
     File::new(inode, flags, String::from("/var/log/prog.log"))
 }
 
