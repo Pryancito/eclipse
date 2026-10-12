@@ -90,9 +90,32 @@ impl LinuxProcessInner {
     /// Record that `fd` is no longer in `files`, so the next allocation can
     /// hand it back out. The one way the hint ever moves down one descriptor
     /// at a time.
-    pub(super) fn note_fd_freed(&mut self, fd: FileDesc) {
+    pub(super) fn note_fd_freed(&mut self, fd: FileDesc, file: &Arc<dyn FileLike>) {
         self.next_fd = self.next_fd.min(usize::from(fd));
         self.epoll_fds.remove(&fd);
+        let key = Self::description_key(file);
+        match self.holders.get_mut(&key) {
+            // The count reaching zero and the entry leaving are one event, so
+            // that `holds_description` is a plain `contains_key`.
+            Some(1) | None => {
+                self.holders.remove(&key);
+            }
+            Some(n) => *n -= 1,
+        }
+    }
+
+    /// Whether some descriptor of this table still holds `file`'s open file
+    /// description. `None` left in the map means nobody does.
+    pub(super) fn holds_description(&self, file: &Arc<dyn FileLike>) -> bool {
+        self.holders.contains_key(&Self::description_key(file))
+    }
+
+    /// The address of the open file description, which is what makes two
+    /// descriptors "the same open file". The `dyn` pointer is fat and its
+    /// vtable half is not part of the identity, so the cast to a thin pointer
+    /// is what the comparison wants, not a detail.
+    fn description_key(file: &Arc<dyn FileLike>) -> usize {
+        Arc::as_ptr(file) as *const () as usize
     }
 
     /// Record that `file` is about to go into `files` under `fd`. The other
@@ -111,6 +134,7 @@ impl LinuxProcessInner {
         } else {
             self.epoll_fds.remove(&fd);
         }
+        *self.holders.entry(Self::description_key(file)).or_insert(0) += 1;
     }
 
     /// Empty the descriptor table, returning what was in it so the caller can
@@ -125,6 +149,7 @@ impl LinuxProcessInner {
     pub(super) fn take_all_files(&mut self) -> HashMap<FileDesc, Arc<dyn FileLike>> {
         self.next_fd = 0;
         self.epoll_fds.clear();
+        self.holders.clear();
         core::mem::take(&mut self.files)
     }
 }

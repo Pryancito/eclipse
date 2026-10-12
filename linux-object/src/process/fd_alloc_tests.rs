@@ -712,3 +712,163 @@ mod a_close_tells_the_epolls {
         );
     }
 }
+
+/// How many descriptors hold each open file description, which is the one
+/// question a close asks before it tells an epoll anything.
+///
+/// Like `epoll_fds`, the invariant is exact, and every case checks the map
+/// against the TABLE rather than against what the test expects. The cases
+/// that matter are the ones where a descriptor and a description part company
+/// at different moments: a `dup` (one description, two numbers), and a `dup2`
+/// over a live descriptor, where one description loses a holder and another
+/// gains one under the SAME number.
+mod holders {
+    use super::*;
+    use alloc::collections::BTreeMap;
+
+    /// The count read off the table itself: address of the description ->
+    /// how many of its descriptors point at it.
+    fn counted_in_the_table(proc: &LinuxProcess) -> BTreeMap<usize, usize> {
+        let inner = proc.inner.lock();
+        let mut counts = BTreeMap::new();
+        for f in inner.files.values() {
+            *counts
+                .entry(Arc::as_ptr(f) as *const () as usize)
+                .or_insert(0) += 1;
+        }
+        counts
+    }
+
+    fn bookkeeping(proc: &LinuxProcess) -> BTreeMap<usize, usize> {
+        proc.inner
+            .lock()
+            .holders
+            .iter()
+            .map(|(k, v)| (*k, *v))
+            .collect()
+    }
+
+    fn assert_in_step(proc: &LinuxProcess, step: &str) {
+        assert_eq!(
+            bookkeeping(proc),
+            counted_in_the_table(proc),
+            "the holder counts and the table disagree after {}",
+            step
+        );
+    }
+
+    /// Distinct files: one holder each, and the map empties as they close.
+    #[test]
+    fn distinct_files_are_one_holder_each() {
+        let proc = a_process();
+        let fds = open_n(&proc, 4);
+        assert_eq!(bookkeeping(&proc).len(), 4);
+        assert!(bookkeeping(&proc).values().all(|n| *n == 1));
+        assert_in_step(&proc, "four distinct opens");
+
+        for fd in fds {
+            proc.close_file(fd).expect("it is open");
+        }
+        assert!(
+            bookkeeping(&proc).is_empty(),
+            "a description nobody holds must not stay in the map"
+        );
+    }
+
+    /// A `dup`: one description, two numbers, and it is still held after the
+    /// first of them closes. This is the rule epoll(7) is built on.
+    #[test]
+    fn a_dup_is_two_holders_of_one_description() {
+        let proc = a_process();
+        let file = an_open_log(Log::new(), OpenFlags::RDWR);
+        let first = proc.add_file(file.clone()).unwrap();
+        let second = proc.add_file_cloexec(file.clone(), false).unwrap();
+        assert_eq!(
+            bookkeeping(&proc).values().copied().collect::<Vec<_>>(),
+            vec![2]
+        );
+        assert_in_step(&proc, "a dup");
+
+        proc.close_file(first).expect("it is open");
+        assert!(
+            proc.inner.lock().holds_description(&file),
+            "the descriptor at {} still holds it",
+            usize::from(second)
+        );
+        assert_in_step(&proc, "closing one of the two");
+
+        proc.close_file(second).expect("it is open");
+        assert!(!proc.inner.lock().holds_description(&file));
+        assert_in_step(&proc, "closing the second");
+    }
+
+    /// `dup2` over a live descriptor: under one number, one description loses
+    /// its holder and another gains one. Counting only the insert would leave
+    /// the replaced description claimed for ever, and every epoll watching it
+    /// would keep an entry for a file nobody holds.
+    #[test]
+    fn a_dup2_moves_the_holder_from_one_description_to_the_other() {
+        let proc = a_process();
+        let replaced = an_open_log(Log::new(), OpenFlags::RDWR);
+        let fd = proc.add_file(replaced.clone()).unwrap();
+        let installed = an_open_log(Log::new(), OpenFlags::RDWR);
+
+        proc.replace_file(fd, installed.clone(), false)
+            .expect("dup2 onto an open descriptor");
+        {
+            let inner = proc.inner.lock();
+            assert!(
+                !inner.holds_description(&replaced),
+                "the replaced description is still claimed"
+            );
+            assert!(inner.holds_description(&installed));
+        }
+        assert_in_step(&proc, "a dup2 over a live descriptor");
+    }
+
+    /// `dup2(fd, fd)` -- Linux's no-op. The number keeps the same description,
+    /// so the count has to come out at one and not at zero or two.
+    #[test]
+    fn a_dup2_of_a_descriptor_onto_itself_leaves_one_holder() {
+        let proc = a_process();
+        let file = an_open_log(Log::new(), OpenFlags::RDWR);
+        let fd = proc.add_file(file.clone()).unwrap();
+        proc.replace_file(fd, file.clone(), false)
+            .expect("dup2(fd, fd)");
+        assert!(proc.inner.lock().holds_description(&file));
+        assert_in_step(&proc, "dup2 of a descriptor onto itself");
+        proc.close_file(fd).expect("it is open");
+        assert!(!proc.inner.lock().holds_description(&file));
+    }
+
+    /// The sweeps and `fork`, which are the paths that move many descriptors
+    /// at once. The child's table is a copy, so every description it holds is
+    /// held twice in total -- but each table counts only its OWN descriptors,
+    /// because an epoll of this process is told about this process's closes.
+    #[test]
+    fn the_sweeps_and_a_fork_keep_the_counts_in_step() {
+        let proc = a_process();
+        let shared = an_open_log(Log::new(), OpenFlags::RDWR);
+        proc.add_file(shared.clone()).unwrap();
+        proc.add_file_cloexec(shared.clone(), true).unwrap();
+        open_n(&proc, 4);
+
+        let child = proc.inner.lock().forked_child(0, 0, 0);
+        assert_eq!(
+            child.holders,
+            proc.inner.lock().holders,
+            "the child's table is a copy, so its counts are the parent's"
+        );
+
+        proc.remove_cloexec_files();
+        assert_in_step(&proc, "the execve sweep");
+        assert!(
+            proc.inner.lock().holds_description(&shared),
+            "the descriptor that was not close-on-exec still holds it"
+        );
+
+        proc.close_range(FileDesc::from(0), FileDesc::from(i32::MAX));
+        assert!(bookkeeping(&proc).is_empty());
+        assert_in_step(&proc, "closing everything");
+    }
+}

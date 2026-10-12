@@ -1217,6 +1217,33 @@ struct LinuxProcessInner {
     limits: RLimits,
     /// Opened files
     files: HashMap<FileDesc, Arc<dyn FileLike>>,
+    /// How many descriptors of this table hold each open file description,
+    /// keyed by the description's address.
+    ///
+    /// It answers the one question a close has to ask before it tells an
+    /// epoll anything: is the description I just closed still held by some
+    /// surviving descriptor of mine? Linux drops an epoll entry from `__fput`,
+    /// when the LAST reference goes, so a `dup` of a watched descriptor keeps
+    /// its entry alive through the close of the original.
+    ///
+    /// Asking it by walking `files` and comparing pointers made a close linear
+    /// in the table all over again once any epoll was open: 65.7 microseconds
+    /// at eight thousand open descriptors (`benches/process.rs`,
+    /// `close_and_reopen_watched_of_8192`), and a `close_range` of k
+    /// descriptors over a table of n was k*n comparisons.
+    ///
+    /// The address is kept as a NUMBER and not as a pointer: it is an
+    /// identity and never dereferenced, and a raw pointer in here would make
+    /// the whole process object not `Send`.
+    ///
+    /// The address is a safe key BECAUSE the table holds a strong reference to
+    /// everything it counts: nothing counted here can be freed, so no address
+    /// in this map can be reused by a different description while it is in it.
+    /// The count reaching zero and the entry leaving are the same event.
+    ///
+    /// Kept in step by the same two hooks as `epoll_fds`, and checked against
+    /// the table itself in `process/fd_alloc_tests.rs`.
+    holders: HashMap<usize, usize>,
     /// The descriptors of this table whose open file description is an
     /// `epoll`, so that a close can ask them to forget what it closed without
     /// walking the table to find them.
@@ -2080,6 +2107,15 @@ impl LinuxProcess {
         let old = {
             let mut inner = self.inner.lock();
             let old = inner.files.remove(&fd);
+            if let Some(f) = old.as_ref() {
+                // `dup2` does not free the NUMBER, but the description that
+                // was under it does lose a holder, and `note_fd_inserted`
+                // below puts the new one's bookkeeping back. Lowering
+                // `next_fd` to a number that is about to be occupied again
+                // only costs the probes the hint saved -- which is the whole
+                // point of that bound being one-sided.
+                inner.note_fd_freed(fd, f);
+            }
             // Net table size is unchanged (replace) or +1 (plain insert); apply the
             // same limit check as insert_file for the growth case.
             if old.is_none() && inner.files.len() >= inner.nofile() {
@@ -2684,9 +2720,10 @@ impl LinuxProcess {
         let (removed, forget) = {
             let mut inner = self.inner.lock();
             inner.cloexec_fds.remove(&fd);
-            let removed = inner.files.remove(&fd);
-            if removed.is_some() {
-                inner.note_fd_freed(fd);
+            let mut removed = None;
+            if let Some(f) = inner.files.remove(&fd) {
+                inner.note_fd_freed(fd, &f);
+                removed = Some(f);
             }
             let forget = removed
                 .as_ref()
@@ -2729,8 +2766,8 @@ impl LinuxProcess {
                 .filter_map(|fd| {
                     inner.cloexec_fds.remove(&fd);
                     let removed = inner.files.remove(&fd).map(|f| (fd, f));
-                    if removed.is_some() {
-                        inner.note_fd_freed(fd);
+                    if let Some((_, f)) = removed.as_ref() {
+                        inner.note_fd_freed(fd, f);
                     }
                     removed
                 })
@@ -3887,8 +3924,8 @@ impl LinuxProcess {
                 .into_iter()
                 .filter_map(|fd| {
                     let removed = inner.files.remove(&fd).map(|f| (fd, f));
-                    if removed.is_some() {
-                        inner.note_fd_freed(fd);
+                    if let Some((_, f)) = removed.as_ref() {
+                        inner.note_fd_freed(fd, f);
                     }
                     removed
                 })
@@ -4063,18 +4100,12 @@ impl LinuxProcessInner {
         let gone = if epolls.is_empty() {
             Vec::new()
         } else {
-            // The surviving descriptors' descriptions, by pointer, built once
-            // rather than re-walked for each closed descriptor: a
-            // `close_range` of k descriptors over a table of n was k*n
-            // comparisons.
-            let held: HashSet<*const ()> = self
-                .files
-                .values()
-                .map(|f| Arc::as_ptr(f) as *const ())
-                .collect();
+            // One lookup per closed descriptor. `closed` is already out of
+            // `files`, so its holders were already decremented: a description
+            // still in the map is one a surviving descriptor holds.
             closed
                 .into_iter()
-                .filter(|(_, file)| !held.contains(&(Arc::as_ptr(file) as *const ())))
+                .filter(|(_, file)| !self.holds_description(file))
                 .collect()
         };
         EpollForgetPlan { epolls, gone }
@@ -4312,6 +4343,7 @@ impl LinuxProcessInner {
             // and the same descriptors hold the same epolls.
             next_fd: self.next_fd,
             epoll_fds: self.epoll_fds.clone(),
+            holders: self.holders.clone(),
             // POSIX fork(2): the child gets its own COPY of each fd's
             // FD_CLOEXEC flag — later fcntl(F_SETFD) in either process
             // must not affect the other.
