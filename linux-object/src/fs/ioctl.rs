@@ -663,9 +663,15 @@ pub const FIONBIO: usize = 0x5421;
 /// pointer to `int`. A VFS-layer file ioctl like the three above, legal on
 /// pipes and sockets.
 pub const FIOASYNC: usize = 0x5452;
-/// Bytes still queued for this file, which `<asm-generic/ioctls.h>` puts at
-/// the very top of the `0x54xx` block -- the last number in it, so a range
-/// check over the block that means to include it has to be inclusive.
+/// The number of bytes allocated to this file, which Linux answers from the
+/// inode (`inode_get_bytes`) for a directory, a non-anonymous regular file
+/// or a symlink, and refuses with `ENOTTY` for anything else -- a pipe, a
+/// socket. It is NOT a queue length: the queue ioctls of this block are
+/// `FIONREAD`/`TIOCINQ` and `TIOCOUTQ`.
+///
+/// `<asm-generic/ioctls.h>` puts it at the very top of the `0x54xx` block,
+/// the last number in it, so a range check over the block that means to
+/// include it has to be inclusive.
 pub const FIOQSIZE: usize = 0x5460;
 
 // Queue / session ioctls (`<asm-generic/ioctls.h>`).
@@ -1802,7 +1808,7 @@ mod request_number_tests {
         // `FIOQSIZE` is the block's LAST number, which is what makes an
         // exclusive range over the block leave it out by one.
         assert_eq!(FIOASYNC, io(b'T', 0x52), "set or clear O_ASYNC");
-        assert_eq!(FIOQSIZE, io(b'T', 0x60), "bytes still queued");
+        assert_eq!(FIOQSIZE, io(b'T', 0x60), "bytes allocated to the file");
         assert_eq!(FIOQSIZE, 0x5460);
     }
 

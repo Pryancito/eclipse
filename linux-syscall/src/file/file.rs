@@ -126,11 +126,21 @@ mod ioctl_number_tests;
 /// leaves `FIOQSIZE` out by one, and then the exclusion below has nothing
 /// left to do for it.
 ///
-/// The six excluded requests are legal on pipes, sockets and regular files
-/// and are answered at the VFS layer above, so an `EINVAL` from one of them
-/// is the file's real answer and not "this is not a terminal". `TIOCOUTQ`
-/// (0x5411) is NOT among them: it is a question about a terminal's output
-/// queue and belongs to the block.
+/// The five excluded requests are legal on every kind of fd -- pipes,
+/// sockets, regular files -- and are answered at the VFS layer above, so an
+/// `EINVAL` from one of them is the file's real answer and not "this is not
+/// a terminal".
+///
+/// Two requests that look like they belong in that list do not.
+/// `TIOCOUTQ` (0x5411) is a question about a terminal's output queue, so it
+/// stays in the block. And [`FIOQSIZE`] is a VFS file ioctl, but not one
+/// that applies to every fd: Linux answers it only for a directory, a
+/// non-anonymous regular file or a symlink, and for anything else --- a
+/// pipe, a socket --- it returns `ENOTTY` itself (`fs/ioctl.c`,
+/// `do_vfs_ioctl`). So the block has to cover it, which is why the range
+/// ends `..=FIOQSIZE` and not `..`: the number is the last one in the
+/// block, and an exclusive bound would leave a pipe's `FIOQSIZE` answering
+/// `EINVAL` where Linux answers `ENOTTY`.
 ///
 /// Every number here is named rather than written out. This used to be a
 /// bare `matches!(request, 0x541B | 0x5421 | ...)` whose last arm was
@@ -138,10 +148,7 @@ mod ioctl_number_tests;
 /// the comment beside it called that arm `FIOQSIZE`, which is 0x5460.
 pub(crate) fn tty_block_wants_enotty(request: usize) -> bool {
     (0x5400..=FIOQSIZE).contains(&request)
-        && !matches!(
-            request,
-            FIONREAD | FIONBIO | FIONCLEX | FIOCLEX | FIOASYNC | FIOQSIZE
-        )
+        && !matches!(request, FIONREAD | FIONBIO | FIONCLEX | FIOCLEX | FIOASYNC)
 }
 
 impl Syscall<'_> {

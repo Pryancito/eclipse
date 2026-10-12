@@ -24,16 +24,20 @@ fn io(ty: u8, nr: u8) -> usize {
     ((ty as usize) << 8) | nr as usize
 }
 
-/// The six file ioctls of `<asm-generic/ioctls.h>`, which `do_vfs_ioctl`
-/// answers for every kind of fd. They sit inside the `0x54xx` terminal
+/// The five file ioctls of `<asm-generic/ioctls.h>` that `do_vfs_ioctl`
+/// answers for EVERY kind of fd. They sit inside the `0x54xx` terminal
 /// block but are not terminal questions.
+///
+/// `FIOQSIZE` is deliberately not one of them: it is a VFS file ioctl too,
+/// but Linux answers it only for a directory, a non-anonymous regular file
+/// or a symlink and returns `ENOTTY` for a pipe or a socket, so the
+/// normalisation has to cover it rather than exempt it.
 const FILE_IOCTLS: &[(&str, usize)] = &[
     ("FIONREAD", FIONREAD),
     ("FIONBIO", FIONBIO),
     ("FIONCLEX", FIONCLEX),
     ("FIOCLEX", FIOCLEX),
     ("FIOASYNC", FIOASYNC),
-    ("FIOQSIZE", FIOQSIZE),
 ];
 
 #[test]
@@ -44,7 +48,7 @@ fn the_file_ioctls_this_layer_serves_are_the_numbers_asm_generic_ioctls_h_gives(
     assert_eq!(FIONCLEX, 0x5450, "clear FD_CLOEXEC");
     assert_eq!(FIOCLEX, 0x5451, "set FD_CLOEXEC");
     assert_eq!(FIOASYNC, 0x5452, "set or clear O_ASYNC");
-    assert_eq!(FIOQSIZE, 0x5460, "bytes still queued for this file");
+    assert_eq!(FIOQSIZE, 0x5460, "bytes allocated to the file");
     // FIONCLEX and FIOCLEX are adjacent and in that order: swapped, every
     // `fcntl(FD_CLOEXEC)` done through the ioctl spelling does the opposite
     // of what it was asked, and an fd meant to be closed on exec is
@@ -125,6 +129,26 @@ fn a_terminal_request_inside_the_block_is_normalised_to_enotty() {
 }
 
 #[test]
+fn fioqsize_is_covered_by_the_block_and_not_exempt_from_it() {
+    // Linux answers `FIOQSIZE` from the inode for a directory, a
+    // non-anonymous regular file or a symlink, and returns `ENOTTY` for
+    // everything else (`fs/ioctl.c`, `do_vfs_ioctl`). So it is NOT one of
+    // the file ioctls that are legal on every fd, and a pipe or socket
+    // asking for it must not be left with the `EINVAL` an inode handler
+    // that does not know the request happens to give.
+    assert!(tty_block_wants_enotty(FIOQSIZE));
+    for (name, request) in FILE_IOCTLS {
+        assert_ne!(*request, FIOQSIZE, "{} is not FIOQSIZE", name);
+    }
+    // And this is what makes the range bound load-bearing: `FIOQSIZE` is
+    // the block's last number, so an exclusive `..` would leave it out and
+    // a pipe's `FIOQSIZE` would answer `EINVAL` where Linux answers
+    // `ENOTTY`.
+    assert_eq!(FIOQSIZE, 0x5460);
+    assert!(tty_block_wants_enotty(FIOQSIZE - 1));
+}
+
+#[test]
 fn nothing_outside_the_terminal_block_is_normalised() {
     // One below the first number and one above the last, plus the two
     // families that share the low byte but not the magic letter.
@@ -143,8 +167,8 @@ fn nothing_outside_the_terminal_block_is_normalised() {
             request
         );
     }
-    // And the bound is the block's last number, not one past it.
-    assert!(tty_block_wants_enotty(FIOQSIZE - 1));
+    // And the bound is the block's last number, which IS covered.
+    assert!(tty_block_wants_enotty(FIOQSIZE));
 }
 
 #[test]
