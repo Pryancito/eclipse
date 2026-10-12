@@ -17,11 +17,14 @@
 
 pub mod apps;
 pub mod draw;
+pub mod files;
 pub mod fill_guard;
 pub mod i18n;
 pub mod icons;
 pub mod keys;
+pub mod list;
 pub mod look;
+pub mod open;
 pub mod par;
 pub mod proc;
 pub mod sysinfo;

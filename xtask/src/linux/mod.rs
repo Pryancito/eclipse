@@ -590,7 +590,7 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
         // lunarbar: the native status/task bar (Rust, static musl). A two-bar
         // panel over wlr-layer-shell + wlr-foreign-toplevel-management, replacing
         // waybar and its GTK/D-Bus/gdk-pixbuf/fontconfig dependency chain.
-        let (lunarbar, lunarrun) = self.lunar_tools();
+        let (lunarbar, lunarrun, lunarfile) = self.lunar_tools();
         if lunarbar.is_file() {
             let _ = dir::rm(bin.join("lunarbar"));
             fs::copy(&lunarbar, bin.join("lunarbar")).unwrap();
@@ -608,6 +608,20 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
             fs::copy(&lunarrun, bin.join("lunarrun")).unwrap();
         } else {
             eprintln!("warning: lunarrun not built; Alt+Space will do nothing");
+        }
+
+        // lunarfile: the file browser behind Super+E, and -- through
+        // `--pick` -- the file chooser the rest of the system has never had.
+        // Dolphin, Nautilus and Thunar are all GTK/Qt applications with a
+        // gdk-pixbuf, fontconfig and theme-engine chain behind them; this is
+        // wlr-layer-shell and wl_shm, like its two siblings. Without it
+        // `eclipse-files` falls back to a shell in $HOME, which is what
+        // Super+E did before it existed.
+        if lunarfile.is_file() {
+            let _ = dir::rm(bin.join("lunarfile"));
+            fs::copy(&lunarfile, bin.join("lunarfile")).unwrap();
+        } else {
+            eprintln!("warning: lunarfile not built; Super+E falls back to a terminal");
         }
 
         // eclipse-dbusd: Eclipse's own D-Bus session bus (Rust, static musl).
@@ -3119,31 +3133,38 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
     }
 
     /// Cross-compile the `tools/lunarbar` package (Rust) as static musl
-    /// binaries and return both: the panel and `lunarrun`, the KRunner-style
-    /// launcher behind Alt+Space and Super+D. One cargo invocation builds the
-    /// two, since they share a library. Best-effort: if the build fails the
-    /// desktop falls back to waybar and the runner keybinds do nothing (their
-    /// wrapper says so in /tmp/lunarrun.log).
-    fn lunar_tools(&self) -> (PathBuf, PathBuf) {
+    /// binaries and return all three: the panel, `lunarrun` (the KRunner-style
+    /// launcher behind Alt+Space and Super+D) and `lunarfile` (the file
+    /// browser behind Super+E, and the file chooser `--pick` gives the rest of
+    /// the system). One cargo invocation builds them, since they share a
+    /// library. Best-effort: if the build fails the desktop falls back to
+    /// waybar, the runner keybinds do nothing (their wrapper says so in
+    /// /tmp/lunarrun.log) and `eclipse-files` falls back to a terminal.
+    fn lunar_tools(&self) -> (PathBuf, PathBuf, PathBuf) {
         let dir = PROJECT_DIR.join("tools").join("lunarbar");
         let triple = self.musl_rust_triple();
         let out = dir.join("target").join(triple).join("release");
         let executable = out.join("lunarbar");
         let runner = out.join("lunarrun");
+        let browser = out.join("lunarfile");
         // Rebuild when any source file is newer than the binaries. Every
         // module is listed: a stale entry here means a source change that
         // silently does not reach the image.
         let newest_src = [
             "src/main.rs",
             "src/bin/lunarrun.rs",
+            "src/bin/lunarfile.rs",
             "src/lib.rs",
             "src/apps.rs",
             "src/draw.rs",
             "src/fill_guard.rs",
+            "src/files.rs",
             "src/i18n.rs",
             "src/icons.rs",
             "src/keys.rs",
+            "src/list.rs",
             "src/look.rs",
+            "src/open.rs",
             "src/par.rs",
             "src/proc.rs",
             "src/sysinfo.rs",
@@ -3152,15 +3173,16 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
         .iter()
         .filter_map(|rel| fs::metadata(dir.join(rel)).ok()?.modified().ok())
         .max();
-        // BOTH must exist and be current: a tree built before lunarrun existed
-        // has an up-to-date lunarbar and no runner at all.
-        if let (Ok(bin_meta), Ok(run_meta), Some(src_mtime)) =
-            (fs::metadata(&executable), fs::metadata(&runner), newest_src)
-        {
-            if let (Ok(bin_mtime), Ok(run_mtime)) = (bin_meta.modified(), run_meta.modified()) {
-                if bin_mtime >= src_mtime && run_mtime >= src_mtime {
-                    return (executable, runner);
-                }
+        // ALL THREE must exist and be current: a tree built before lunarfile
+        // existed has an up-to-date lunarbar and lunarrun and no browser at
+        // all, and the stale-binary check would happily ship that.
+        let mtimes: Option<Vec<_>> = [&executable, &runner, &browser]
+            .iter()
+            .map(|p| fs::metadata(p).ok()?.modified().ok())
+            .collect();
+        if let (Some(bins), Some(src_mtime)) = (mtimes, newest_src) {
+            if bins.iter().all(|m| *m >= src_mtime) {
+                return (executable, runner, browser);
             }
         }
 
@@ -3184,9 +3206,9 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
         }
         let status = cargo.status();
         if !status.success() {
-            eprintln!("warning: lunarbar/lunarrun build failed; waybar fallback remains");
+            eprintln!("warning: lunarbar/lunarrun/lunarfile build failed; waybar fallback remains");
         }
-        (executable, runner)
+        (executable, runner, browser)
     }
 
     /// `/etc/asound.conf`. When PulseAudio is in the image, ALSA `default`
