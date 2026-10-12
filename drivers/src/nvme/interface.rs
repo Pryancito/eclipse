@@ -1859,3 +1859,43 @@ mod command_layout_tests {
         assert_eq!(core::mem::offset_of!(NvmeRWCommand, slba), 40);
     }
 }
+
+#[cfg(test)]
+mod completion_layout_tests {
+    use super::*;
+    use core::mem::{align_of, offset_of, size_of};
+
+    /// The completion queue entry the controller writes by DMA.
+    ///
+    /// The driver does not build this: the device does, at the offsets the
+    /// NVMe spec fixes, and the driver reads it out of a queue the device
+    /// owns. So nothing inside the driver can disagree with itself about the
+    /// order -- every read goes through the field name -- and the three
+    /// two-byte fields in the tail are all the same width. The size was
+    /// checked; sixteen bytes stay sixteen bytes however they are arranged.
+    ///
+    /// Getting it wrong is quiet in the worst way: `command_id` is how the
+    /// driver matches a completion to the request that is waiting for it, so a
+    /// swap hands each waiter somebody else's answer rather than failing.
+    #[test]
+    fn the_completion_entry_is_the_sixteen_bytes_of_the_nvme_spec() {
+        assert_eq!(size_of::<NvmeCompletion>(), 16);
+        assert_eq!(align_of::<NvmeCompletion>(), 8);
+        assert_eq!(offset_of!(NvmeCompletion, result), 0);
+        assert_eq!(offset_of!(NvmeCompletion, sq_head), 8);
+        assert_eq!(offset_of!(NvmeCompletion, sq_id), 10);
+        assert_eq!(offset_of!(NvmeCompletion, command_id), 12);
+        assert_eq!(offset_of!(NvmeCompletion, status), 14);
+    }
+
+    /// Dwords two and three of the entry: the queue bookkeeping and then the
+    /// identity and the verdict, four two-byte fields in eight bytes.
+    #[test]
+    fn the_last_two_dwords_are_four_halves_with_no_padding() {
+        assert_eq!(
+            size_of::<NvmeCompletion>() - offset_of!(NvmeCompletion, sq_head),
+            8
+        );
+        assert_eq!(offset_of!(NvmeCompletion, status) + 2, 16);
+    }
+}

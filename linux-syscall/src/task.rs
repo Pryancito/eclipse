@@ -3556,3 +3556,51 @@ mod setaffinity_migration_tests {
 
 #[cfg(test)]
 mod benches;
+
+/// `struct sched_attr`, field by field.
+///
+/// `sched_setattr(2)` reads these bytes out of the caller's memory and
+/// `sched_getattr(2)` writes them back, so the order of the fields is the ABI.
+/// The size was already checked against `SCHED_ATTR_SIZE_VER0`, and that is
+/// not the same thing: swapping two neighbours of the same width leaves the
+/// forty-eight bytes exactly as they were. Three such swaps survived the whole
+/// crate suite.
+#[cfg(test)]
+mod sched_attr_layout_tests {
+    use super::*;
+    use core::mem::{align_of, offset_of, size_of};
+
+    /// The worst of the three swaps is the first pair, because `size` is the
+    /// self-describing length `sys_sched_setattr` validates before it trusts
+    /// anything else: read the policy as the size, and the caller's
+    /// `SCHED_OTHER` becomes a forty-eight-byte claim of zero.
+    #[test]
+    fn struct_sched_attr_is_the_v0_forty_eight_byte_layout() {
+        assert_eq!(size_of::<SchedAttr>(), 48);
+        assert_eq!(size_of::<SchedAttr>(), SCHED_ATTR_SIZE_VER0);
+        assert_eq!(align_of::<SchedAttr>(), 8);
+        assert_eq!(offset_of!(SchedAttr, size), 0);
+        assert_eq!(offset_of!(SchedAttr, sched_policy), 4);
+        assert_eq!(offset_of!(SchedAttr, sched_flags), 8);
+        assert_eq!(offset_of!(SchedAttr, sched_nice), 16);
+        assert_eq!(offset_of!(SchedAttr, sched_priority), 20);
+        assert_eq!(offset_of!(SchedAttr, sched_runtime), 24);
+        assert_eq!(offset_of!(SchedAttr, sched_deadline), 32);
+        assert_eq!(offset_of!(SchedAttr, sched_period), 40);
+    }
+
+    /// The two four-byte fields sit in the eight bytes between `sched_flags`
+    /// and `sched_runtime` with no padding, which is why eight fields of
+    /// mixed width come to exactly six words.
+    #[test]
+    fn the_nice_and_the_priority_share_one_word_with_no_padding() {
+        assert_eq!(
+            offset_of!(SchedAttr, sched_priority) - offset_of!(SchedAttr, sched_nice),
+            4
+        );
+        assert_eq!(
+            offset_of!(SchedAttr, sched_runtime) - offset_of!(SchedAttr, sched_nice),
+            8
+        );
+    }
+}

@@ -2358,3 +2358,28 @@ mod pselect_sigset_arg_layout_tests {
         assert_eq!(offset_of!(PSelectSigsetArg, ss_len), 8);
     }
 }
+
+#[cfg(test)]
+mod pollfd_layout_tests {
+    use super::PollFd;
+    use core::mem::{align_of, offset_of, size_of};
+
+    /// `struct pollfd`: the descriptor, the mask the caller asks for, and the
+    /// mask the kernel answers with. The last two are the same width and sit
+    /// next to each other, so the eight bytes stay eight bytes if they trade
+    /// places -- and then `poll(2)` reads the caller's request out of the slot
+    /// it is supposed to write the answer into, and writes the answer over the
+    /// request. Every `poll` test in the crate passed with them swapped,
+    /// because the kernel stays consistent with itself: both sides go through
+    /// the field name.
+    #[test]
+    fn struct_pollfd_asks_in_one_mask_and_answers_in_the_next() {
+        assert_eq!(size_of::<PollFd>(), 8);
+        assert_eq!(align_of::<PollFd>(), 4);
+        assert_eq!(offset_of!(PollFd, fd), 0);
+        assert_eq!(offset_of!(PollFd, events), 4);
+        assert_eq!(offset_of!(PollFd, revents), 6);
+        // Two bytes each, and the answer comes after the question.
+        assert!(offset_of!(PollFd, revents) > offset_of!(PollFd, events));
+    }
+}
