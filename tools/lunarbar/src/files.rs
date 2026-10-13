@@ -154,7 +154,18 @@ pub fn read_dir_sorted(dir: &str) -> std::io::Result<Vec<Entry>> {
     let mut out = Vec::new();
     for item in std::fs::read_dir(Path::new(dir))? {
         let Ok(item) = item else { continue };
-        let name = item.file_name().to_string_lossy().into_owned();
+        // A name that is not UTF-8 is SKIPPED, not shown lossily. A Unix
+        // filename is bytes, and `to_string_lossy` would replace the bad ones
+        // with U+FFFD: the row would then name a file that does not exist
+        // (nothing could open it), and two different byte names could collapse
+        // into the same row -- so activating one would answer with the path of
+        // the other. Everything downstream of here is `String`, including the
+        // `--out` protocol and the portal's URIs, so showing such a name
+        // honestly would mean carrying bytes end to end. Until that is worth
+        // doing, a file left out is better than a file confused with another.
+        let Some(name) = item.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
         if name.is_empty() {
             continue;
         }
@@ -666,6 +677,39 @@ mod tests {
         // A directory that is not there is an error, not an empty listing: the
         // browser says so instead of showing a convincing empty folder.
         assert!(read_dir_sorted(base.join("no-existe").to_str().unwrap()).is_err());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_name_that_is_not_utf8_is_left_out_rather_than_shown_wrong() {
+        // A Unix filename is bytes. `to_string_lossy` would put U+FFFD where
+        // the bad bytes are, and the row would then name a path that does not
+        // exist: nothing could open it, and two different byte names collapse
+        // into the SAME row, so activating one answers with the other's path.
+        // Everything downstream is `String` -- `--out`, the portal's URIs --
+        // so the honest cheap answer is to leave such a name out.
+        use std::os::unix::ffi::OsStrExt;
+        let base = std::env::temp_dir().join(format!("lunarfile-raro-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::write(base.join("bueno.txt"), b"ok").unwrap();
+        // Two different names that lossy conversion would turn into one.
+        for bytes in [b"mal\xff.txt".as_slice(), b"mal\xfe.txt".as_slice()] {
+            let raw = std::ffi::OsStr::from_bytes(bytes);
+            std::fs::write(base.join(raw), b"x").unwrap();
+        }
+        // The filesystem under /tmp has to accept such a name for this to be a
+        // test of anything; where it does not, there is nothing to skip.
+        let on_disk = std::fs::read_dir(&base).unwrap().count();
+        if on_disk == 3 {
+            let v = read_dir_sorted(base.to_str().unwrap()).unwrap();
+            let names: Vec<&str> = v.iter().map(|e| e.name.as_str()).collect();
+            assert_eq!(names, ["bueno.txt"], "a name that is not UTF-8 got through");
+            // And nothing it kept carries the replacement character, which is
+            // what a lossy listing would be full of.
+            assert!(v.iter().all(|e| !e.name.contains('\u{fffd}')));
+        }
         let _ = std::fs::remove_dir_all(&base);
     }
 

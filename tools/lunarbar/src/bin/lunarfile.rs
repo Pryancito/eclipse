@@ -223,12 +223,26 @@ enum Action {
     Close,
     /// Enter / →: enter a directory, or open/answer with a file.
     Activate,
+    /// Enter in `--save`: answer with the name in the field.
+    ///
+    /// It cannot be `Activate`, and that is the whole bug it fixes: in a
+    /// populated directory something is always selected (`..` at the very
+    /// least), so an `Activate` Enter navigated or copied a name into the
+    /// field and the Save chooser **could never answer**. `→` still navigates,
+    /// and a click on a file still offers its name, which is what a Save
+    /// dialog does; Enter is the one key that means "this name, here".
+    Commit,
     /// ←: up one directory, whatever is in the field.
     Up,
     /// Backspace: a character off the field, or up one directory when the field
     /// is empty.
     Rub,
     Move(i32, Step),
+    /// Page Up / Page Down, in pages. How many rows that is cannot be decided
+    /// here: it is `rows_shown`, which the last frame measured against the
+    /// screen it actually got. Moving by the maximum on a short output jumped
+    /// fourteen rows in a list showing three.
+    Page(i32),
     /// Space in `--multiple`: mark or unmark the selected row.
     Mark,
     Type(char),
@@ -238,13 +252,14 @@ enum Action {
 fn key_action(key: u32, mode: Mode) -> Action {
     match key {
         KEY_ESC_WL => Action::Close,
+        KEY_ENTER_WL | KEY_KPENTER_WL if mode == Mode::Save => Action::Commit,
         KEY_ENTER_WL | KEY_KPENTER_WL | KEY_RIGHT_WL => Action::Activate,
         KEY_LEFT_WL => Action::Up,
         KEY_BACKSPACE_WL => Action::Rub,
         KEY_UP_WL => Action::Move(-1, Step::Wrap),
         KEY_DOWN_WL | KEY_TAB_WL => Action::Move(1, Step::Wrap),
-        KEY_PGUP_WL => Action::Move(-(MAX_ROWS as i32), Step::Clamp),
-        KEY_PGDN_WL => Action::Move(MAX_ROWS as i32, Step::Clamp),
+        KEY_PGUP_WL => Action::Page(-1),
+        KEY_PGDN_WL => Action::Page(1),
         k => match key_char(k) {
             // Space marks when marking is what Space is for. In every other
             // mode it is a character, because filenames have spaces in them and
@@ -276,6 +291,12 @@ struct State {
     map_len: usize,
     buffers: [Option<wl_buffer::WlBuffer>; BUFFERS],
     busy: [bool; BUFFERS],
+    /// A frame that could not be drawn because the compositor held both
+    /// buffers. `render` used to say "the next Release repaints" and nothing
+    /// did: the `Release` handler only cleared `busy`, so after a burst of
+    /// more than two updates the LAST one -- the keystroke the user is
+    /// looking at -- could stay invisible until the next event.
+    dirty: bool,
     next: usize,
     generation: u64,
     configured: bool,
@@ -475,6 +496,27 @@ impl State {
     }
 
     /// `--save`: the path the field names in this directory.
+    /// Enter in `--save`: the name in the field is the answer.
+    ///
+    /// With nothing typed there is nothing to save, and then Enter does what
+    /// it does everywhere else -- go into the directory under the cursor --
+    /// so that reaching a folder and typing a name is one uninterrupted
+    /// gesture. With a name typed, Enter always answers, whatever is selected:
+    /// a Save dialog that needed the selection cleared first could not be
+    /// driven at all.
+    fn commit(&mut self) {
+        if self.field.trim().is_empty() {
+            let sel = self.sel;
+            let into_dir = matches!(self.row(sel), Some(Row::Parent))
+                || self.entry(sel).map(|e| e.is_dir).unwrap_or(false);
+            if into_dir {
+                self.activate(sel);
+                return;
+            }
+        }
+        self.save_answer();
+    }
+
     fn save_answer(&mut self) {
         let name = self.field.trim();
         if name.is_empty() {
@@ -613,9 +655,31 @@ impl State {
         self.map_len = total;
         self.buffers = buffers;
         self.busy = [false, false];
+        // The frame that was owed belonged to the old pool, which is gone;
+        // the `render()` at the end of this function draws the new one.
+        self.dirty = false;
         self.next = 0;
         self.configured = true;
         self.render();
+    }
+
+    /// A buffer came back from the compositor.
+    ///
+    /// Returns whether a frame was owed, which is the whole decision: before
+    /// this existed `render` set `dirty` and nobody ever looked at it again,
+    /// so a frame dropped while both buffers were held stayed dropped and the
+    /// panel showed stale rows until the next key.
+    fn buffer_released(&mut self, i: usize, generation: u64) -> bool {
+        // A buffer of a previous pool: its index means nothing now.
+        if generation != self.generation || i >= BUFFERS {
+            return false;
+        }
+        self.busy[i] = false;
+        if !self.dirty {
+            return false;
+        }
+        self.render();
+        true
     }
 
     fn render(&mut self) {
@@ -625,13 +689,13 @@ impl State {
         let Some(surface) = self.surface.clone() else {
             return;
         };
-        let i = if !self.busy[self.next] {
-            self.next
-        } else if !self.busy[1 - self.next] {
-            1 - self.next
-        } else {
-            return; // both held by the compositor; the next Release repaints
+        let Some(i) = free_buffer(self.busy, self.next) else {
+            // Both held by the compositor. Remember that there is a frame
+            // owed; `buffer_released` draws it when one comes back.
+            self.dirty = true;
+            return;
         };
+        self.dirty = false;
         let (w, h) = (self.width as usize, self.height as usize);
         let frame_size = w * h * 4;
         let Some(mut cv) = Canvas::try_new(w, h) else {
@@ -974,9 +1038,8 @@ impl Dispatch<wl_buffer::WlBuffer, (usize, u64)> for State {
         _: &Connection,
         _: &QueueHandle<State>,
     ) {
-        if matches!(event, wl_buffer::Event::Release) && generation == st.generation && i < BUFFERS
-        {
-            st.busy[i] = false;
+        if matches!(event, wl_buffer::Event::Release) {
+            let _ = st.buffer_released(i, generation);
         }
     }
 }
@@ -1021,48 +1084,68 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for State {
         else {
             return;
         };
-        match key_action(key, st.mode) {
-            Action::Close => st.done = true,
-            Action::Activate => {
-                let sel = st.sel;
-                st.activate(sel);
-                st.render();
-            }
-            Action::Up => {
-                st.go_up();
-                st.render();
-            }
-            Action::Rub => {
-                // A character off the field, or -- with nothing left to rub
-                // out -- up one directory, which is what Backspace means in
-                // every file browser.
-                if st.field.is_empty() {
-                    st.go_up();
-                } else {
-                    st.field.pop();
-                    st.refilter();
-                }
-                st.render();
-            }
-            Action::Move(delta, step) => {
-                st.move_sel(delta, step);
-                st.render();
-            }
-            Action::Mark => {
-                let sel = st.sel;
-                st.toggle_mark(sel);
-                st.render();
-            }
-            Action::Type(c) => {
-                if st.field.chars().count() < MAX_FIELD {
-                    st.field.push(c);
-                    st.note.clear();
-                    st.refilter();
-                    st.render();
-                }
-            }
-            Action::Ignore => {}
+        apply(st, key_action(key, st.mode));
+    }
+}
+
+/// What a key does once it has been named.
+///
+/// Split out of the keyboard handler so that the tests can press keys without
+/// a compositor to deliver them: everything here goes through `State`, and
+/// `render` is a no-op until a surface is configured.
+fn apply(st: &mut State, action: Action) {
+    match action {
+        Action::Close => st.done = true,
+        Action::Activate => {
+            let sel = st.sel;
+            st.activate(sel);
+            st.render();
         }
+        Action::Commit => {
+            st.commit();
+            st.render();
+        }
+        Action::Up => {
+            st.go_up();
+            st.render();
+        }
+        Action::Rub => {
+            // A character off the field, or -- with nothing left to rub
+            // out -- up one directory, which is what Backspace means in
+            // every file browser.
+            if st.field.is_empty() {
+                st.go_up();
+            } else {
+                st.field.pop();
+                st.refilter();
+            }
+            st.render();
+        }
+        Action::Move(delta, step) => {
+            st.move_sel(delta, step);
+            st.render();
+        }
+        Action::Page(pages) => {
+            // One page is what the last frame drew, not what the panel can
+            // hold at most.
+            let delta = pages * st.rows_shown.max(1) as i32;
+            st.move_sel(delta, Step::Clamp);
+            st.render();
+        }
+        Action::Mark => {
+            let sel = st.sel;
+            st.toggle_mark(sel);
+            st.render();
+        }
+        Action::Type(c) => {
+            if st.field.chars().count() < MAX_FIELD {
+                st.field.push(c);
+                st.note.clear();
+                st.refilter();
+                st.render();
+            }
+        }
+        Action::Ignore => {}
     }
 }
 
@@ -1328,6 +1411,22 @@ fn usage() -> ! {
     std::process::exit(2)
 }
 
+/// The buffer a frame can be drawn into, or `None` while the compositor holds
+/// both of them.
+///
+/// `next` first so that the two buffers alternate: always drawing into the
+/// lowest free one would reuse the buffer just released while the other sits
+/// idle, which is single buffering with two allocations.
+fn free_buffer(busy: [bool; BUFFERS], next: usize) -> Option<usize> {
+    if !busy[next] {
+        Some(next)
+    } else if !busy[1 - next] {
+        Some(1 - next)
+    } else {
+        None
+    }
+}
+
 fn new_state(cli: &Cli) -> State {
     // ONE read of the look, not two: `eclipse-look` rewrites /etc/eclipse/look
     // when the user switches, and two calls could leave the palette from one
@@ -1350,6 +1449,7 @@ fn new_state(cli: &Cli) -> State {
         map_len: 0,
         buffers: [None, None],
         busy: [false, false],
+        dirty: false,
         next: 0,
         generation: 0,
         configured: false,
@@ -1645,25 +1745,30 @@ mod tests {
     fn the_navigation_keys_mean_the_same_thing_in_every_mode() {
         for m in [Mode::Browse, Mode::Open, Mode::OpenMany, Mode::Save] {
             assert_eq!(key_action(KEY_ESC_WL, m), Action::Close, "{m:?}");
-            assert_eq!(key_action(KEY_ENTER_WL, m), Action::Activate);
-            assert_eq!(key_action(KEY_KPENTER_WL, m), Action::Activate);
-            // → enters, ← goes up: the pair every file browser has.
+            // Enter is the one key that is NOT the same in every mode: in Save
+            // it commits the name in the field, because something is always
+            // selected in a populated directory and an Enter that navigated
+            // meant the Save chooser could never answer.
+            let enter = if m == Mode::Save {
+                Action::Commit
+            } else {
+                Action::Activate
+            };
+            assert_eq!(key_action(KEY_ENTER_WL, m), enter, "{m:?}");
+            assert_eq!(key_action(KEY_KPENTER_WL, m), enter, "{m:?}");
+            // → enters, ← goes up: the pair every file browser has, and in
+            // Save it is how you reach the folder you are saving into.
             assert_eq!(key_action(KEY_RIGHT_WL, m), Action::Activate);
             assert_eq!(key_action(KEY_LEFT_WL, m), Action::Up);
             assert_eq!(key_action(KEY_BACKSPACE_WL, m), Action::Rub);
             assert_eq!(key_action(KEY_UP_WL, m), Action::Move(-1, Step::Wrap));
             assert_eq!(key_action(KEY_DOWN_WL, m), Action::Move(1, Step::Wrap));
             assert_eq!(key_action(KEY_TAB_WL, m), Action::Move(1, Step::Wrap));
-            // Page keys CLAMP, like the launcher's: with `rem_euclid` a page
-            // from the first row lands in the middle of the list.
-            assert_eq!(
-                key_action(KEY_PGUP_WL, m),
-                Action::Move(-(MAX_ROWS as i32), Step::Clamp)
-            );
-            assert_eq!(
-                key_action(KEY_PGDN_WL, m),
-                Action::Move(MAX_ROWS as i32, Step::Clamp)
-            );
+            // A page is resolved against the rows the last frame actually
+            // drew, so the key table only says WHICH WAY. Moving by the
+            // maximum jumped fourteen rows in a list showing three.
+            assert_eq!(key_action(KEY_PGUP_WL, m), Action::Page(-1), "{m:?}");
+            assert_eq!(key_action(KEY_PGDN_WL, m), Action::Page(1), "{m:?}");
             // A letter types in every mode: it is the filter, or the filename.
             assert_eq!(key_action(33, m), Action::Type('f'));
             assert_eq!(key_action(52, m), Action::Type('.'));
@@ -1927,6 +2032,14 @@ mod tests {
         new_state(&c)
     }
 
+    /// The row a name is on, which is not its index in `entries`: directories
+    /// sort first and `..` takes row 0.
+    fn row_of(st: &State, name: &str) -> usize {
+        (0..st.rows.len())
+            .find(|r| st.entry(*r).map(|e| e.name == name).unwrap_or(false))
+            .unwrap()
+    }
+
     /// A little tree to walk: `<tmp>/base/{sub/{hondo/},a.txt,b.wav,.oculto}`.
     fn tree(tag: &str) -> String {
         let base = std::env::temp_dir().join(format!("lunarfile-{}-{tag}", std::process::id()));
@@ -2034,11 +2147,6 @@ mod tests {
     fn marking_takes_files_only_and_enter_falls_back_to_the_selection() {
         let base = tree("many");
         let mut st = state(Mode::OpenMany, &base);
-        let row_of = |st: &State, name: &str| {
-            (0..st.rows.len())
-                .find(|r| st.entry(*r).map(|e| e.name == name).unwrap_or(false))
-                .unwrap()
-        };
         // A directory in a multi-select is how a chooser ends up answering with
         // something the caller cannot open.
         let d = row_of(&st, "sub");
@@ -2099,6 +2207,155 @@ mod tests {
         assert!(st.picked.is_empty(), "a click answered the chooser");
         assert_eq!(st.field, "a.txt");
         assert!(!st.done);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn enter_in_save_mode_saves_what_was_typed_and_only_navigates_when_nothing_is() {
+        // The Save chooser was undriveable: Enter mapped to `activate`, and
+        // `activate` only answers when NO row is selected -- which in a
+        // directory with files in it never happens, because row 0 is always
+        // selected. So a portal's SaveFile could be typed into and never
+        // completed. Enter in Save is its own action now.
+        let base = tree("commit");
+        let mut st = state(Mode::Save, &base);
+        st.field = "nuevo.txt".into();
+        // Row 0 is `..`, i.e. exactly the selection that used to swallow Enter.
+        assert_eq!(st.row(0), Some(Row::Parent));
+        st.sel = 0;
+        apply(&mut st, key_action(KEY_ENTER_WL, Mode::Save));
+        assert!(st.done, "Enter did not complete the save");
+        assert_eq!(st.picked, vec![files::join_child(&base, "nuevo.txt")]);
+
+        // And with a name typed it answers in THIS directory whatever row the
+        // cursor happens to be on, including a directory.
+        let mut st = state(Mode::Save, &base);
+        st.field = "nuevo.txt".into();
+        st.sel = (0..st.rows.len())
+            .find(|r| st.entry(*r).map(|e| e.name == "sub").unwrap_or(false))
+            .unwrap();
+        apply(&mut st, Action::Commit);
+        assert_eq!(st.picked, vec![files::join_child(&base, "nuevo.txt")]);
+
+        // With an empty field there is nothing to save, so Enter means what it
+        // means everywhere else: go in. Typing the name afterwards is then one
+        // uninterrupted gesture.
+        let mut st = state(Mode::Save, &base);
+        let sub = (0..st.rows.len())
+            .find(|r| st.entry(*r).map(|e| e.name == "sub").unwrap_or(false))
+            .unwrap();
+        st.sel = sub;
+        apply(&mut st, Action::Commit);
+        assert!(!st.done, "an empty field answered the chooser");
+        assert_eq!(st.dir, files::join_child(&base, "sub"));
+        // `..` is the same gesture upwards.
+        st.sel = 0;
+        apply(&mut st, Action::Commit);
+        assert!(!st.done);
+        assert_eq!(st.dir, files::normalize_dir(&base));
+
+        // An empty field on a FILE is not a move and not an answer: it says so.
+        let mut st = state(Mode::Save, &base);
+        st.sel = row_of(&st, "a.txt");
+        apply(&mut st, Action::Commit);
+        assert!(!st.done);
+        assert!(st.picked.is_empty());
+        assert!(!st.note.is_empty(), "nothing told the user");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_page_is_the_rows_the_last_frame_drew_not_the_row_cap() {
+        // Paging by `MAX_ROWS` on an output that only fits a handful of rows
+        // jumps the cursor far past the screen, so PgDn behaves like End. The
+        // page is whatever the frame measured.
+        let base = tree("page");
+        let mut st = state(Mode::Browse, &base);
+        // More rows than any page, so neither direction clamps.
+        st.entries = (0..200)
+            .map(|n| Entry {
+                name: format!("f{n:03}.txt"),
+                is_dir: false,
+                size: 0,
+                link: false,
+            })
+            .collect();
+        st.refilter();
+        st.sel = 100;
+        st.top = 100;
+
+        for shown in [1usize, 7, 23] {
+            st.rows_shown = shown;
+            st.sel = 100;
+            apply(&mut st, Action::Page(1));
+            assert_eq!(st.sel, 100 + shown, "PgDn with {shown} rows on screen");
+            apply(&mut st, Action::Page(-1));
+            assert_eq!(st.sel, 100, "PgUp must undo PgDn");
+        }
+
+        // A frame that drew nothing yet must still move by one row rather than
+        // standing still: `rows_shown` is 0 before the first frame on a surface
+        // too short to draw, and a dead PgDn reads as a broken keyboard.
+        st.rows_shown = 0;
+        st.sel = 100;
+        apply(&mut st, Action::Page(1));
+        assert_eq!(st.sel, 101);
+
+        // And paging past the end stops at the end instead of wrapping to the
+        // top, which in a 200-row listing is the user losing their place.
+        st.rows_shown = 23;
+        st.sel = st.rows.len() - 2;
+        apply(&mut st, Action::Page(1));
+        assert_eq!(st.sel, st.rows.len() - 1);
+        st.sel = 1;
+        apply(&mut st, Action::Page(-1));
+        assert_eq!(st.sel, 0);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_frame_owed_while_both_buffers_are_held_is_drawn_when_one_comes_back() {
+        // `render` wrote `dirty` and nothing ever read it, so a frame dropped
+        // because the compositor held both buffers was dropped for good: the
+        // panel kept showing the previous rows until the next key happened to
+        // land. Here is the pair of decisions, without a compositor.
+        assert_eq!(free_buffer([false, false], 0), Some(0));
+        assert_eq!(free_buffer([false, false], 1), Some(1));
+        // The one just released, not the lowest free one: always picking 0
+        // would be single buffering with two allocations.
+        assert_eq!(free_buffer([true, false], 0), Some(1));
+        assert_eq!(free_buffer([false, true], 1), Some(0));
+        assert_eq!(
+            free_buffer([true, true], 0),
+            None,
+            "it drew into a held buffer"
+        );
+        assert_eq!(free_buffer([true, true], 1), None);
+
+        let base = tree("owed");
+        let mut st = state(Mode::Browse, &base);
+        st.busy = [true, true];
+        // With no frame owed a release is only bookkeeping.
+        assert!(!st.buffer_released(0, st.generation));
+        assert_eq!(st.busy, [false, true]);
+
+        // With one owed, it is the moment to draw it.
+        st.busy = [true, true];
+        st.dirty = true;
+        assert!(
+            st.buffer_released(1, st.generation),
+            "the owed frame was dropped for good"
+        );
+        assert_eq!(st.busy, [true, false]);
+
+        // A buffer of a pool that has been torn down carries an index into a
+        // pool that no longer exists: it must not clear anything.
+        st.busy = [true, true];
+        st.dirty = true;
+        assert!(!st.buffer_released(0, st.generation.wrapping_sub(1)));
+        assert_eq!(st.busy, [true, true], "a stale buffer freed a live one");
+        assert!(!st.buffer_released(BUFFERS, st.generation));
+        assert_eq!(st.busy, [true, true]);
         let _ = std::fs::remove_dir_all(&base);
     }
 

@@ -25,8 +25,11 @@
 /// programs, for the same reason `eclipse-terminal` is one: what is installed
 /// varies. `eclipse-edit` is the editor in a terminal (nano if the image has
 /// it, busybox `vi` otherwise — busybox always has `vi`, so that path cannot
-/// fail), and `firefox` is the image's only renderer of HTML, PDF, SVG and
-/// images, so a browser tab is the viewer.
+/// fail), and `eclipse-firefox` is the image's only renderer of HTML, PDF, SVG
+/// and images, so a browser tab is the viewer. The wrapper, never `firefox`
+/// itself: it is what picks software WebRender over NVK on the GPU-less path
+/// (plain `firefox` can draw a black window there) and what finds
+/// `firefox-esr` on an image that has only that.
 ///
 /// An entry naming a program that is not installed is not silently launched:
 /// `lunarfile` checks the command exists before spawning and says so on the
@@ -52,18 +55,18 @@ pub const BUILTIN: &[(&str, &str)] = &[
     ("service", "eclipse-edit %f"),
     ("desktop", "eclipse-edit %f"),
     // The web browser takes the web's formats.
-    ("html", "firefox %f"),
-    ("htm", "firefox %f"),
-    ("pdf", "firefox %f"),
-    ("svg", "firefox %f"),
-    ("xml", "firefox %f"),
+    ("html", "eclipse-firefox %f"),
+    ("htm", "eclipse-firefox %f"),
+    ("pdf", "eclipse-firefox %f"),
+    ("svg", "eclipse-firefox %f"),
+    ("xml", "eclipse-firefox %f"),
     // Images: Firefox again, there being no image viewer in the image.
-    ("png", "firefox %f"),
-    ("jpg", "firefox %f"),
-    ("jpeg", "firefox %f"),
-    ("gif", "firefox %f"),
-    ("bmp", "firefox %f"),
-    ("webp", "firefox %f"),
+    ("png", "eclipse-firefox %f"),
+    ("jpg", "eclipse-firefox %f"),
+    ("jpeg", "eclipse-firefox %f"),
+    ("gif", "eclipse-firefox %f"),
+    ("bmp", "eclipse-firefox %f"),
+    ("webp", "eclipse-firefox %f"),
     // Audio: wavplay is this tree's own player; mpg123 plays the boot chime.
     ("wav", "wavplay %f"),
     ("mp3", "mpg123 %f"),
@@ -200,8 +203,8 @@ mod tests {
             "eclipse-edit '/home/m/a.txt'"
         );
         assert_eq!(
-            open_command("/home/m/x'; reboot; '.txt", "firefox %f"),
-            r#"firefox '/home/m/x'\''; reboot; '\''.txt'"#
+            open_command("/home/m/x'; reboot; '.txt", "eclipse-firefox %f"),
+            r#"eclipse-firefox '/home/m/x'\''; reboot; '\''.txt'"#
         );
         // A template with no %f gets the path appended, which is what a
         // hand-written `/etc/eclipse/openers` line looks like.
@@ -264,7 +267,10 @@ vacio=
         assert_eq!(handler_for("Makefile", &[]), None);
         assert_eq!(handler_for(".bashrc", &[]), None);
         // Case does not matter on the way in either.
-        assert_eq!(handler_for("FOTO.JPG", &[]).as_deref(), Some("firefox %f"));
+        assert_eq!(
+            handler_for("FOTO.JPG", &[]).as_deref(),
+            Some("eclipse-firefox %f")
+        );
     }
 
     #[test]
@@ -284,26 +290,35 @@ vacio=
             assert!(cmd.contains("%f"), "{ext} -> {cmd} never gets the file");
             assert!(program_of(cmd).is_some(), "{ext} -> {cmd} names no program");
         }
-        // The three programs the table is allowed to name, so an entry pointing
+        // The four programs the table is allowed to name, so an entry pointing
         // at something this image does not ship is a visible line in the diff.
+        // `eclipse-firefox` and not `firefox`: every activation path in the
+        // image is required to go through that wrapper (see
+        // `xtask/src/linux/desktop.rs`), and bypassing it loses both the
+        // renderer choice and the ESR fallback.
         let progs: Vec<&str> = BUILTIN.iter().filter_map(|(_, c)| program_of(c)).collect();
         for p in &progs {
             assert!(
-                ["eclipse-edit", "firefox", "wavplay", "mpg123"].contains(p),
+                ["eclipse-edit", "eclipse-firefox", "wavplay", "mpg123"].contains(p),
                 "{p} is not one of the image's openers"
             );
         }
+        // And the browser is never named directly, whatever the extension.
+        assert!(
+            !progs.contains(&"firefox") && !progs.contains(&"firefox-esr"),
+            "una entrada se salta el envoltorio eclipse-firefox: {progs:?}"
+        );
     }
 
     #[test]
     fn the_program_of_a_template_is_its_first_word() {
-        assert_eq!(program_of("firefox %f"), Some("firefox"));
+        assert_eq!(program_of("eclipse-firefox %f"), Some("eclipse-firefox"));
         assert_eq!(program_of("  firefox   %f  "), Some("firefox"));
         assert_eq!(
             program_of("/usr/local/bin/eclipse-edit %f"),
             Some("/usr/local/bin/eclipse-edit")
         );
-        assert_eq!(program_of("firefox"), Some("firefox"));
+        assert_eq!(program_of("eclipse-firefox"), Some("eclipse-firefox"));
         // Nothing to run.
         assert_eq!(program_of(""), None);
         assert_eq!(program_of("   "), None);

@@ -2726,7 +2726,7 @@ const MENU_EN: &[u8] = br#"<?xml version="1.0" encoding="UTF-8"?>
   <menu id="root-menu" label="Eclipse OS">
     <item label="Run (Alt+Space)"><action name="Execute"><command>/usr/local/bin/eclipse-run</command></action></item>
     <item label="Terminal"><action name="Execute"><command>/usr/local/bin/eclipse-terminal</command></action></item>
-    <item label="Archivos"><action name="Execute"><command>/usr/local/bin/eclipse-files</command></action></item>
+    <item label="Files"><action name="Execute"><command>/usr/local/bin/eclipse-files</command></action></item>
     <item label="Firefox"><action name="Execute"><command>/usr/local/bin/eclipse-firefox</command></action></item>
     <item label="Editor (nano)"><action name="Execute"><command>/usr/local/bin/eclipse-terminal nano</command></action></item>
     <item label="Monitor (top)"><action name="Execute"><command>/usr/local/bin/eclipse-terminal top</command></action></item>
@@ -3725,6 +3725,45 @@ mod tests {
             );
         }
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The two menus must offer the same things, each in its own language.
+    ///
+    /// The explorer entry shipped labelled "Archivos" in both menus, so
+    /// switching the session to English left one Spanish word in the root
+    /// menu. The command list is the half that catches the next item added
+    /// to one menu and forgotten in the other.
+    #[test]
+    fn both_menus_offer_the_same_commands_each_in_its_own_language() {
+        fn commands(menu: &[u8]) -> Vec<String> {
+            let text = std::str::from_utf8(menu).unwrap();
+            text.split("<command>")
+                .skip(1)
+                .map(|rest| rest.split("</command>").next().unwrap().to_string())
+                .collect()
+        }
+        assert_eq!(
+            commands(MENU_ES),
+            commands(MENU_EN),
+            "an item added to one menu must be added to the other"
+        );
+
+        let en = std::str::from_utf8(MENU_EN).unwrap();
+        assert!(
+            en.contains(r#"<item label="Files">"#),
+            "the English menu must label the explorer in English"
+        );
+        for spanish in ["Archivos", "Ejecutar", "Salir de la sesion", "Teclado"] {
+            assert!(
+                !en.contains(spanish),
+                "the English menu still says {spanish:?}"
+            );
+        }
+        let es = std::str::from_utf8(MENU_ES).unwrap();
+        assert!(
+            es.contains(r#"<item label="Archivos">"#),
+            "the Spanish menu must keep its own label"
+        );
     }
 
     /// Autostart file is intentionally absent (clients come from init).
