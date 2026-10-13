@@ -84,3 +84,11 @@ required-features = ["mock-disk"]
 name = "process"
 harness = true
 required-features = ["mock-disk"]
+
+# The blocking IPC path: what half a pipe round trip costs in SOFTWARE, with
+# no scheduler and no context switch.
+#   cargo bench -p linux-object --bench ipc --features mock-disk
+[[bench]]
+name = "ipc"
+harness = true
+required-features = ["mock-disk"]
