@@ -824,9 +824,10 @@ pub(crate) fn note_wake_serviced(packed: u64) {
     let Some(waited) = now.checked_sub(published_ns) else {
         return;
     };
+    let bucket = wake_latency_bucket(waited);
     WAKE_LAT_COUNT.fetch_add(1, Ordering::Relaxed);
     WAKE_LAT_TOTAL_NS.fetch_add(waited, Ordering::Relaxed);
-    WAKE_LAT_HIST[wake_latency_bucket(waited)].fetch_add(1, Ordering::Relaxed);
+    WAKE_LAT_HIST[bucket].fetch_add(1, Ordering::Relaxed);
     if publisher == crate::arch::cpu_id() {
         WAKE_LAT_SAME_CPU.fetch_add(1, Ordering::Relaxed);
     } else {
@@ -836,6 +837,7 @@ pub(crate) fn note_wake_serviced(packed: u64) {
     let reason = entry_reason();
     WAKE_ENTRY_COUNT[reason].fetch_add(1, Ordering::Relaxed);
     WAKE_ENTRY_NS[reason].fetch_add(waited, Ordering::Relaxed);
+    WAKE_ENTRY_HIST[reason][bucket].fetch_add(1, Ordering::Relaxed);
 }
 
 /// `(samples, total ns, worst ns, serviced on the waker's own CPU, serviced
@@ -940,20 +942,46 @@ static WAKE_ENTRY_COUNT: [AtomicU64; WAKE_ENTRY_REASONS] =
 static WAKE_ENTRY_NS: [AtomicU64; WAKE_ENTRY_REASONS] =
     [const { AtomicU64::new(0) }; WAKE_ENTRY_REASONS];
 
-/// `(samples, total ns)` per entry reason, indexed by the `WAKE_ENTRY_*`
-/// constants.
+/// Each entry's own latency histogram, same buckets as [`WAKE_LAT_HIST`].
 ///
-/// The totals are there so each entry gets its own mean: "most wakes come out
-/// of a halt" and "the wakes that come out of a halt are the slow ones" are
-/// different findings, and a count alone cannot tell them apart.
-pub fn wake_entry_stats() -> ([u64; WAKE_ENTRY_REASONS], [u64; WAKE_ENTRY_REASONS]) {
+/// A mean per entry was the first thing this probe reported and it was the
+/// wrong statistic: with five samples in the top bucket out of 385, a handful
+/// of 80 ms stalls moved an entry's mean by hundreds of microseconds and the
+/// first reading of it said "wakes served after a poll take 1.7 ms", when most
+/// of them take tens of microseconds and a few take tens of milliseconds.
+/// Those are different claims with different fixes, so each entry carries its
+/// shape and the report quotes bands from it. The mean stays, as a mean.
+///
+/// 5 x 16 counters is 640 bytes of `.bss` and the write replaces the one
+/// `WAKE_LAT_HIST` already did -- the aggregate histogram is a sum of these
+/// rows, so nothing is counted twice and the sampled path pays nothing new.
+static WAKE_ENTRY_HIST: [[AtomicU64; WAKE_LATENCY_BUCKETS]; WAKE_ENTRY_REASONS] =
+    [const { [const { AtomicU64::new(0) }; WAKE_LATENCY_BUCKETS] }; WAKE_ENTRY_REASONS];
+
+/// `(samples, total ns, histogram)` per entry reason, indexed by the
+/// `WAKE_ENTRY_*` constants.
+///
+/// The per-entry histogram is the point: a count says how often an entry
+/// delivers a wake and a mean is dominated by whatever the longest stall of
+/// the run was, so neither answers "are the slow wakes the ones that came out
+/// of a halt?".
+#[allow(clippy::type_complexity)]
+pub fn wake_entry_stats() -> (
+    [u64; WAKE_ENTRY_REASONS],
+    [u64; WAKE_ENTRY_REASONS],
+    [[u64; WAKE_LATENCY_BUCKETS]; WAKE_ENTRY_REASONS],
+) {
     let mut counts = [0u64; WAKE_ENTRY_REASONS];
     let mut totals = [0u64; WAKE_ENTRY_REASONS];
+    let mut hist = [[0u64; WAKE_LATENCY_BUCKETS]; WAKE_ENTRY_REASONS];
     for i in 0..WAKE_ENTRY_REASONS {
         counts[i] = WAKE_ENTRY_COUNT[i].load(Ordering::Relaxed);
         totals[i] = WAKE_ENTRY_NS[i].load(Ordering::Relaxed);
+        for b in 0..WAKE_LATENCY_BUCKETS {
+            hist[i][b] = WAKE_ENTRY_HIST[i][b].load(Ordering::Relaxed);
+        }
     }
-    (counts, totals)
+    (counts, totals, hist)
 }
 
 /// HAL-registered function that sends a wake IPI to a logical CPU.
@@ -3957,10 +3985,10 @@ mod wake_latency_tests {
             51_000
         }
         let saved = NOW_NS_HOOK.swap(clock as usize, Ordering::SeqCst);
-        let (counts_before, ns_before) = wake_entry_stats();
+        let (counts_before, ns_before, hist_before) = wake_entry_stats();
         note_entry_reason(WAKE_ENTRY_HALT_EXIT);
         note_wake_serviced(pack_wake_stamp(crate::arch::cpu_id(), 1_000));
-        let (counts, ns) = wake_entry_stats();
+        let (counts, ns, hist) = wake_entry_stats();
         let halt = WAKE_ENTRY_HALT_EXIT as usize;
         assert_eq!(
             counts[halt],
@@ -3972,11 +4000,21 @@ mod wake_latency_tests {
             ns_before[halt] + 50_000,
             "the entry's total did not take this wake's wait"
         );
+        // And in the entry's own histogram, in the bucket its latency belongs
+        // to: the mean alone was the statistic that first read this probe
+        // wrong, so the shape is what the report quotes.
+        let bucket = wake_latency_bucket(50_000);
+        assert_eq!(
+            hist[halt][bucket],
+            hist_before[halt][bucket] + 1,
+            "the halt entry's histogram missed the sample in bucket {}",
+            bucket
+        );
         // And a different entry is a different bucket, not the same one again.
         let poll = WAKE_ENTRY_AFTER_POLL as usize;
         note_entry_reason(WAKE_ENTRY_AFTER_POLL);
         note_wake_serviced(pack_wake_stamp(crate::arch::cpu_id(), 1_000));
-        let (counts2, _) = wake_entry_stats();
+        let (counts2, _, _) = wake_entry_stats();
         assert_eq!(
             counts2[poll],
             counts_before[poll] + 1,
@@ -3999,17 +4037,53 @@ mod wake_latency_tests {
             1_000
         }
         let saved = NOW_NS_HOOK.swap(frozen as usize, Ordering::SeqCst);
-        let (counts_before, _) = wake_entry_stats();
+        let (counts_before, _, _) = wake_entry_stats();
         note_entry_reason(WAKE_ENTRY_HALT_EXIT);
         // Published "later" than the claim reads the clock: dropped.
         note_wake_serviced(pack_wake_stamp(0, 2_000));
         // And an unstamped slot, which is the common case.
         note_wake_serviced(0);
-        let (counts, _) = wake_entry_stats();
+        let (counts, _, _) = wake_entry_stats();
         assert_eq!(
             counts, counts_before,
             "a sample the latency probe dropped was still attributed"
         );
+        NOW_NS_HOOK.store(saved, Ordering::SeqCst);
+    }
+
+    /// The aggregate histogram is exactly the sum of the per-entry rows.
+    ///
+    /// The report computes its bands from the aggregate and its shares from
+    /// the entries, so a sample counted in one and not the other makes two
+    /// lines of the same report disagree -- and the reader has no way to tell
+    /// which of them is the measurement.
+    #[test]
+    fn the_aggregate_histogram_is_the_sum_of_the_entry_rows() {
+        let _g = super::resched_test_lock();
+        fn clock() -> u64 {
+            41_000
+        }
+        let saved = NOW_NS_HOOK.swap(clock as usize, Ordering::SeqCst);
+        note_entry_reason(WAKE_ENTRY_RESUMED);
+        note_wake_serviced(pack_wake_stamp(crate::arch::cpu_id(), 1_000));
+        let (_, _, per_entry) = wake_entry_stats();
+        let (count, _, _, _, _, aggregate) = wake_latency_stats();
+        for bucket in 0..WAKE_LATENCY_BUCKETS {
+            let summed: u64 = (0..WAKE_ENTRY_REASONS).map(|r| per_entry[r][bucket]).sum();
+            assert_eq!(
+                summed, aggregate[bucket],
+                "bucket {} disagrees: entries sum to {}, aggregate says {}",
+                bucket, summed, aggregate[bucket]
+            );
+        }
+        let total: u64 = (0..WAKE_ENTRY_REASONS)
+            .map(|r| per_entry[r].iter().sum::<u64>())
+            .sum();
+        assert_eq!(
+            total, count,
+            "the entries do not account for every counted sample"
+        );
+        note_entry_reason(WAKE_ENTRY_UNKNOWN);
         NOW_NS_HOOK.store(saved, Ordering::SeqCst);
     }
 
@@ -4024,11 +4098,11 @@ mod wake_latency_tests {
         }
         let saved = NOW_NS_HOOK.swap(clock as usize, Ordering::SeqCst);
         let cpu = crate::arch::cpu_id() as usize;
-        let (counts_before, _) = wake_entry_stats();
+        let (counts_before, _, _) = wake_entry_stats();
         ENTRY_REASON[cpu].store(200, Ordering::Relaxed);
         assert_eq!(entry_reason(), WAKE_ENTRY_UNKNOWN as usize);
         note_wake_serviced(pack_wake_stamp(crate::arch::cpu_id(), 1_000));
-        let (counts, _) = wake_entry_stats();
+        let (counts, _, _) = wake_entry_stats();
         let unknown = WAKE_ENTRY_UNKNOWN as usize;
         assert_eq!(
             counts[unknown],

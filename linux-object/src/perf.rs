@@ -1211,10 +1211,9 @@ pub fn kernel_report() -> String {
             // Each entry carries its own mean, because "most wakes come out of
             // a halt" and "the wakes out of a halt are the slow ones" are
             // different findings and a share alone cannot separate them.
-            let (entry_counts, entry_ns) = kernel_hal::kstats::wake_entry_stats();
+            let (entry_counts, entry_ns, entry_hist) = kernel_hal::kstats::wake_entry_stats();
             let entry_total: u64 = entry_counts.iter().sum();
             if entry_total > 0 {
-                let _ = write!(out, "  wake latency by entry:");
                 for (i, name) in [
                     "unknown",
                     "after a poll",
@@ -1228,16 +1227,49 @@ pub fn kernel_report() -> String {
                     if entry_counts[i] == 0 {
                         continue;
                     }
+                    let n = entry_counts[i];
+                    let row = &entry_hist[i];
+                    // The median by bucket, which is what the mean next to it
+                    // cannot say: five samples in the top bucket out of a few
+                    // hundred move a mean by hundreds of microseconds, so an
+                    // entry whose typical wake costs tens of microseconds and
+                    // whose worst costs tens of milliseconds reads as
+                    // uniformly slow. Quoted as the band it is, never as a
+                    // number the buckets cannot support.
+                    let mut seen = 0u64;
+                    let mut median = 0usize;
+                    for (b, c) in row.iter().enumerate() {
+                        seen += *c;
+                        if seen * 2 >= n {
+                            median = b;
+                            break;
+                        }
+                    }
+                    let over_ms: u64 = row[11..].iter().sum();
                     let _ = write!(
                         out,
-                        " {}={} ({:.1}%, mean {:.1} us)",
+                        "  wake latency, {}: {} samples ({:.1}%), median ",
                         name,
-                        entry_counts[i],
-                        entry_counts[i] as f64 * 100.0 / entry_total as f64,
-                        entry_ns[i] as f64 / entry_counts[i] as f64 / 1000.0
+                        n,
+                        n as f64 * 100.0 / entry_total as f64,
+                    );
+                    // The band written straight out rather than built as a
+                    // string: this runs on a kernel path and the three shapes
+                    // are the three the buckets have.
+                    if median == 0 {
+                        let _ = write!(out, "<1us");
+                    } else if median == kernel_hal::kstats::WAKE_LATENCY_BUCKETS - 1 {
+                        let _ = write!(out, ">=16ms");
+                    } else {
+                        let _ = write!(out, "{}-{}us", 1u64 << (median - 1), 1u64 << median);
+                    }
+                    let _ = writeln!(
+                        out,
+                        ", mean {:.1} us, {:.1}% over 1 ms",
+                        entry_ns[i] as f64 / n as f64 / 1000.0,
+                        over_ms as f64 * 100.0 / n as f64
                     );
                 }
-                let _ = writeln!(out);
             }
         }
     }

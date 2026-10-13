@@ -311,22 +311,38 @@ pub const WAKE_ENTRY_REASONS: usize = 5;
 #[cfg(target_os = "none")]
 const _: () = assert!(executor::WAKE_ENTRY_REASONS == WAKE_ENTRY_REASONS);
 
-/// `(samples, total ns)` per entry reason: how the CPU that serviced each
-/// sampled wake came to be looking at its run queue.
+/// `(samples, total ns, histogram)` per entry reason: how the CPU that
+/// serviced each sampled wake came to be looking at its run queue, and what
+/// the latencies of each entry look like. The per-entry histogram is the point
+/// -- a mean is dominated by the run's longest stall.
 ///
 /// Read against `wake latency`'s histogram, this is what says whether the wait
 /// was for an interrupt to end a halt or for a busy CPU to give up its turn.
 /// The order is the scheduler's `WAKE_ENTRY_*` constants: unknown, after a
 /// poll, halt skipped by the recheck, out of a halt, resumed.
 /// (libos has no scheduler of ours and reports zeros.)
+#[allow(clippy::type_complexity)]
 #[cfg(target_os = "none")]
-pub fn wake_entry_stats() -> ([u64; WAKE_ENTRY_REASONS], [u64; WAKE_ENTRY_REASONS]) {
+pub fn wake_entry_stats() -> (
+    [u64; WAKE_ENTRY_REASONS],
+    [u64; WAKE_ENTRY_REASONS],
+    [[u64; WAKE_LATENCY_BUCKETS]; WAKE_ENTRY_REASONS],
+) {
     executor::wake_entry_stats()
 }
 
+#[allow(clippy::type_complexity)]
 #[cfg(not(target_os = "none"))]
-pub fn wake_entry_stats() -> ([u64; WAKE_ENTRY_REASONS], [u64; WAKE_ENTRY_REASONS]) {
-    ([0; WAKE_ENTRY_REASONS], [0; WAKE_ENTRY_REASONS])
+pub fn wake_entry_stats() -> (
+    [u64; WAKE_ENTRY_REASONS],
+    [u64; WAKE_ENTRY_REASONS],
+    [[u64; WAKE_LATENCY_BUCKETS]; WAKE_ENTRY_REASONS],
+) {
+    (
+        [0; WAKE_ENTRY_REASONS],
+        [0; WAKE_ENTRY_REASONS],
+        [[0; WAKE_LATENCY_BUCKETS]; WAKE_ENTRY_REASONS],
+    )
 }
 
 /// Reschedule IPIs actually put on the wire since boot.
