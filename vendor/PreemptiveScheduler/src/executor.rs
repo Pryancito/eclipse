@@ -1940,6 +1940,11 @@ impl Executor {
         let mut _cr3_pin: Option<(Arc<Task>, usize)> = None;
         let mut polls_since_weak = 0u64;
         let mut barren_weak_turns = 0u32;
+        // Entry attribution (see `runtime::WAKE_ENTRY_RESUMED`): this CPU is
+        // about to look at its run queue having just arrived on this stack,
+        // which is neither "waited for an interrupt" nor "waited out someone
+        // else's turn".
+        crate::runtime::note_entry_reason(crate::runtime::WAKE_ENTRY_RESUMED);
         loop {
             // Balance pull: a CPU that always has exactly one local task never
             // hits the idle steal below, so a peer sitting on a backlog stays
@@ -1992,6 +1997,7 @@ impl Executor {
                 } else {
                     barren_weak_turns = barren_weak_turns.saturating_add(1);
                 }
+                crate::runtime::note_entry_reason(crate::runtime::WAKE_ENTRY_RESUMED);
                 continue;
             }
             // A reschedule request for this CPU means "look at your run queue
@@ -2124,6 +2130,9 @@ impl Executor {
                     }
                 };
                 polls_since_weak = polls_since_weak.saturating_add(1);
+                // The next scan is reached by a poll returning, so a wake it
+                // serves waited for a CPU that was busy running this task.
+                crate::runtime::note_entry_reason(crate::runtime::WAKE_ENTRY_AFTER_POLL);
                 if self.state.load(Ordering::Acquire) == ExecutorState::WEAK as u8 {
                     self.state
                         .store(ExecutorState::KILLED as u8, Ordering::Release);
@@ -2249,10 +2258,34 @@ impl Executor {
                     // `runtime::STEALABLE`. BEFORE the recheck below, so a wake
                     // that races either sets the bit again or is seen there.
                     crate::runtime::note_not_stealable(cpu);
-                    if !self.task_collection.has_ready() {
+                    if self.task_collection.has_ready() {
+                        // The wake landed in the check-then-halt window and
+                        // the recheck caught it: no interrupt was waited for.
+                        crate::runtime::note_entry_reason(crate::runtime::WAKE_ENTRY_SKIPPED_HALT);
+                    } else {
                         critical.set(false);
                         crate::arch::wait_for_interrupt();
                         critical.set(true);
+                        // Whatever this CPU serves next waited for an
+                        // interrupt to end the halt. Published AFTER the halt
+                        // returns, not before: a reason stored before `hlt`
+                        // would also be read by the claim that the recheck
+                        // above lets through on a later pass.
+                        //
+                        // And split by whether a kick was aimed here: a
+                        // request pending on the far side of the halt was
+                        // raised while this CPU was inside it, because the
+                        // branch above cleared it before the recheck and a
+                        // request that landed after the clear would have been
+                        // seen by the recheck instead of halting. Read before
+                        // anything else runs, since the scan below clears it.
+                        crate::runtime::note_entry_reason(
+                            if crate::runtime::resched_pending_for(cpu) {
+                                crate::runtime::WAKE_ENTRY_HALT_KICKED
+                            } else {
+                                crate::runtime::WAKE_ENTRY_HALT_TIMER
+                            },
+                        );
                     }
                     crate::runtime::set_cpu_sleeping(cpu, false);
                     if intr_was_on {

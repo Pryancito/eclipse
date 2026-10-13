@@ -97,6 +97,12 @@ hal_fn_impl! {
             executor::set_resched_ipi_sender(|cpu| {
                 crate::interrupt::send_wake_ipi(cpu);
             });
+            // And let it date its own wakes. The wake-to-run latency probe
+            // needs a monotonic clock, and the scheduler cannot reach the HAL
+            // for one; without this it records nothing at all, which is the
+            // right answer for a build that offered no clock and is why the
+            // probe does not fall back to a zero.
+            executor::set_now_ns_hook(|| crate::timer::timer_now().as_nanos() as u64);
             // Unmapped guard pages under coroutine stacks — must run after the
             // kernel page tables are pinned so install can punch 4K holes in
             // the BSS heap mapping (see `stack_guard`). Must also run *before*

@@ -151,6 +151,15 @@ fn primary_main(config: kernel_hal::KernelConfig) {
             executor::set_wakeup_preempt(false);
             klog_info!("Eclipse: wake-up preemption DISABLED (WAKEPREEMPT=0)");
         }
+        // The wake-to-run latency probe (`/proc/perf/kernel`'s `wake latency`
+        // line). Sampled one wake in sixteen, so it costs an external wake
+        // nothing measurable, but it is still a diagnostic and a measurement
+        // of the scheduler should be able to measure it with the probe out of
+        // the way.
+        if kernel_hal::cmdline::is_off(&options.cmdline, "WAKELAT") {
+            executor::set_wake_latency(false);
+            klog_info!("Eclipse: wake-to-run latency probe DISABLED (WAKELAT=0)");
+        }
         // Kernel fault containment (see `oops`). ON by default: a fault taken
         // while serving a process kills that process and the system carries on.
         // `PANICONOOPS=1` restores the immediate halt, which is what one wants

@@ -747,7 +747,35 @@ impl TaskCollection {
             for page_idx in 0..inner.pages.len() {
                 let (notified, voluntary, dropped, borrowed) = inner.pages[page_idx].peek_lanes();
                 let runnable = (notified | voluntary) & !dropped & !borrowed;
-                for subpage_idx in BitIter::from(runnable) {
+                if runnable == 0 {
+                    continue;
+                }
+                // The same split `has_ready` and `ready_num_for` have had
+                // since #1791, which this branch never got: `affine` is the
+                // lane of slots whose task carries a mask, so a runnable slot
+                // OUTSIDE it is allowed on every CPU, cannot be stranded and
+                // contributes nothing to the kick mask. One `and` answers for
+                // all of them, and only the masked ones are worth a `PinSlab`
+                // lookup and an `Arc` deref.
+                //
+                // It is not a micro-optimisation: this branch runs on every
+                // `schedule` as soon as ONE task anywhere in the collection is
+                // pinned (`inner.affine != 0`), and it ran a lookup per
+                // runnable bit. A pinned pipe round trip measured 992-1105 us
+                // against 451 unpinned, with nothing else differing.
+                //
+                // Both lanes are read under this collection's lock, which
+                // `insert` also needs, so the two cannot disagree.
+                let affine = inner.pages[page_idx].affine_bits();
+                let free = runnable & !affine;
+                Self::consider_bits(&mut urgent, free & notified, page_idx, cursor.urgent_next);
+                Self::consider_bits(
+                    &mut yielded,
+                    free & voluntary & !notified,
+                    page_idx,
+                    cursor.yielded_next,
+                );
+                for subpage_idx in BitIter::from(runnable & affine) {
                     let slot = page_idx * WAKER_PAGE_SIZE + subpage_idx;
                     let Some(task) = inner.slab.get(slot) else {
                         inner.pages[page_idx].clear(subpage_idx);
@@ -800,6 +828,16 @@ impl TaskCollection {
             return None;
         }
         page.mark_borrowed(subpage_idx, true);
+        // The claim end of the wake-to-run latency probe. Only the urgent lane
+        // is measured: a voluntary yield is a task giving up a CPU it had, so
+        // the interval between its self-wake and its next poll is not a wait
+        // for a CPU. The swap is unconditional anyway -- a yielded slot can
+        // carry a stamp from an earlier external wake, and leaving it there
+        // would date the NEXT claim from a wake two turns ago.
+        let stamp = page.take_wake_stamp(subpage_idx);
+        if !serve_yielded {
+            crate::runtime::note_wake_serviced(stamp);
+        }
         if serve_yielded {
             cursor.yielded_next = slot + 1;
             cursor.urgent_turns = 0;
@@ -814,6 +852,47 @@ impl TaskCollection {
             task,
             waker,
         ))
+    }
+
+    /// [`consider_slot`] for a whole page of candidates at once, in constant
+    /// time instead of one call per set bit.
+    ///
+    /// Removing the `PinSlab` lookup from the unmasked slots is only half the
+    /// saving: the walk itself is the other half, and on a queue of a thousand
+    /// tasks it is the larger one. The ordering `consider_slot` implements
+    /// needs at most two bits of any page -- the lowest at or after `next`
+    /// (which wins outright) and the lowest overall (which is the wrap-around
+    /// answer) -- so a mask and two `trailing_zeros` replace the walk. This is
+    /// the same reasoning as [`Self::bitmap_candidate`], which is why the
+    /// no-affinity path never had to walk bits either.
+    ///
+    /// The ordering itself lives in `consider_slot`, which re-reads `next` for
+    /// every candidate it is given. So the masks here are an economy and not a
+    /// correctness argument: proposing a candidate this function could have
+    /// filtered out cannot change the answer, only the work. That is worth
+    /// knowing before trusting a mutation that survives in the masks.
+    ///
+    /// [`consider_slot`]: Self::consider_slot
+    fn consider_bits(best: &mut Option<usize>, bits: u64, page_idx: usize, next: usize) {
+        if bits == 0 {
+            return;
+        }
+        let base = page_idx * WAKER_PAGE_SIZE;
+        // Bits of this page whose slot is at or after `next`. Wholly before
+        // it, none qualify; wholly after, all do.
+        let at_or_after = if next <= base {
+            bits
+        } else if next >= base + WAKER_PAGE_SIZE {
+            0
+        } else {
+            bits & (u64::MAX << (next - base))
+        };
+        if at_or_after != 0 {
+            Self::consider_slot(best, base + at_or_after.trailing_zeros() as usize, next);
+        }
+        // And the lowest bit of the page, which is the answer once the cursor
+        // has to wrap. Harmless when it is the same slot as above.
+        Self::consider_slot(best, base + bits.trailing_zeros() as usize, next);
     }
 
     fn consider_slot(best: &mut Option<usize>, slot: usize, next: usize) {
@@ -1612,6 +1691,102 @@ mod collection_tests {
     fn notified_back(waker: &Arc<WakerRef>) {
         waker.wake_by_ref();
         waker.mark_borrowed(false);
+    }
+
+    /// **La rama de afinidad reparte en el MISMO orden que la rapida.**
+    ///
+    /// Es la propiedad que se podia romper al dejar de recorrer bit a bit: el
+    /// orden de reparto lo fija el cursor (`consider_slot` prefiere el hueco
+    /// mas bajo que este en el cursor o despues, y si no hay, el mas bajo de
+    /// todos), y `consider_bits` lo calcula con mascaras en vez de visitando
+    /// cada bit. Si las dos no coinciden, una tarea fijada en cualquier parte
+    /// de la cola cambiaria el reparto de todas las demas, que es justo lo que
+    /// no puede pasar.
+    ///
+    /// Asi que se comparan: la misma cola sin nada fijado (camino rapido) y
+    /// con UNA tarea fijada a otra CPU (rama de afinidad), y la secuencia de
+    /// huecos repartidos tiene que ser la misma salvo la fijada, que no puede
+    /// correr aqui.
+    #[test]
+    fn la_rama_de_afinidad_reparte_en_el_mismo_orden_que_la_rapida() {
+        let _g = crate::runtime::resched_test_lock();
+
+        fn secuencia(tc: &Arc<TaskCollection>, vueltas: usize) -> Vec<usize> {
+            let mut salida = Vec::new();
+            for _ in 0..vueltas {
+                let Some((key, _t, waker)) = tc.take_task() else {
+                    break;
+                };
+                let (_, page_idx, subpage_idx) = unpack_key(key);
+                salida.push(page_idx * WAKER_PAGE_SIZE + subpage_idx);
+                cede(&waker);
+            }
+            salida
+        }
+
+        // Sin afinidad ninguna: el camino de `bitmap_candidate`, siete tareas
+        // en los huecos 0..6.
+        let libre = TaskCollection::new(0);
+        for _ in 0..7 {
+            libre.add_task(pending(), None);
+        }
+        let referencia = secuencia(&libre, 21);
+        assert_eq!(referencia.len(), 21, "la cola libre reparto tres vueltas");
+
+        // Las mismas siete, mas una octava fijada a la CPU 1 en el hueco 7.
+        // Eso basta para que `inner.affine != 0` y el reparto de las SIETE
+        // pase por la rama de afinidad.
+        let fijada = TaskCollection::new(0);
+        for _ in 0..7 {
+            fijada.add_task(pending(), None);
+        }
+        fijada.add_task(pending(), Some(Arc::new(AtomicU64::new(0b10))));
+        let obtenido = secuencia(&fijada, 21);
+
+        assert_eq!(
+            obtenido, referencia,
+            "la rama de afinidad reparte en otro orden que la rapida"
+        );
+        assert!(
+            !obtenido.contains(&7),
+            "ha repartido la tarea fijada a otra CPU"
+        );
+    }
+
+    /// Los bordes de `consider_bits`, que es donde una mascara mal construida
+    /// no se nota: el cursor dentro de la pagina, justo en su primer hueco,
+    /// una pagina entera por delante del cursor y otra entera por detras.
+    ///
+    /// El orden que tiene que salir es el de `consider_slot`: gana el hueco
+    /// mas bajo que este en el cursor o despues; si ninguno lo esta, el mas
+    /// bajo de todos (el cursor da la vuelta).
+    #[test]
+    fn consider_bits_respeta_el_orden_del_cursor_en_los_bordes() {
+        let caso = |bits: u64, page_idx: usize, next: usize| -> Option<usize> {
+            let mut best = None;
+            TaskCollection::consider_bits(&mut best, bits, page_idx, next);
+            best
+        };
+        let bits = (1 << 3) | (1 << 10) | (1 << 40);
+
+        // Cursor por detras de la pagina entera: gana el mas bajo.
+        assert_eq!(caso(bits, 1, 0), Some(64 + 3));
+        // Cursor dentro de la pagina: gana el primero a partir de ahi.
+        assert_eq!(caso(bits, 1, 64 + 4), Some(64 + 10));
+        assert_eq!(
+            caso(bits, 1, 64 + 10),
+            Some(64 + 10),
+            "el cursor es inclusivo"
+        );
+        assert_eq!(caso(bits, 1, 64 + 11), Some(64 + 40));
+        // Cursor pasada la pagina entera: ninguno esta en el cursor o despues,
+        // asi que da la vuelta al mas bajo.
+        assert_eq!(caso(bits, 1, 128), Some(64 + 3));
+        assert_eq!(caso(bits, 0, 64), Some(3));
+        // Sin bits no hay candidato, y no se pisa el que ya hubiera.
+        let mut best = Some(7);
+        TaskCollection::consider_bits(&mut best, 0, 3, 0);
+        assert_eq!(best, Some(7), "una pagina vacia no propone nada");
     }
 
     /// Two threads that do nothing but `sched_yield(2)` on one CPU share it
@@ -2734,6 +2909,46 @@ mod collection_tests {
         fn hand_out_a_task_and_take_it_back(b: &mut Bencher) {
             let _g = crate::runtime::resched_test_lock();
             let tc = queue_of(1);
+            b.iter(|| {
+                let (_key, _task, waker) = tc.take_task().unwrap();
+                cede(&waker);
+            });
+        }
+
+        /// The handout as it costs on a queue where ONE task is pinned, which
+        /// is what a single `sched_setaffinity` or an IRQ pool leaves behind:
+        /// `inner.affine != 0`, so `schedule` leaves the bitmap path and takes
+        /// the affinity branch for every handout, for every task on the queue.
+        ///
+        /// Read this against `hand_out_a_task_and_take_it_back`: the gap is
+        /// what one pinned task costs the other 1023, and the affine lane is
+        /// what closes it. The pinned task is not the one handed out -- it is
+        /// pinned to CPU 1 and this collection is CPU 0's -- so what is being
+        /// measured is purely the scan.
+        #[bench]
+        fn hand_out_a_task_with_one_pinned_task_among_a_thousand(b: &mut Bencher) {
+            let _g = crate::runtime::resched_test_lock();
+            let tc = queue_part_pinned(1024, 1);
+            b.iter(|| {
+                let (_key, _task, waker) = tc.take_task().unwrap();
+                cede(&waker);
+            });
+        }
+
+        /// The floor of the row above: every task pinned, so there is nothing
+        /// for the lane to skip and the branch really does fetch each runnable
+        /// bit. The two rows together say whether a slow handout is "the queue
+        /// is pinned" or "the scan is wasteful".
+        #[bench]
+        fn hand_out_a_task_with_a_thousand_pinned_tasks(b: &mut Bencher) {
+            let _g = crate::runtime::resched_test_lock();
+            let tc = TaskCollection::new(0);
+            // The first task may run here, so there is something to hand out;
+            // the other 1023 are pinned to CPU 1 and only make the scan long.
+            tc.add_task(pending(), Some(Arc::new(AtomicU64::new(0b11))));
+            for _ in 0..1023 {
+                tc.add_task(pending(), Some(Arc::new(AtomicU64::new(0b10))));
+            }
             b.iter(|| {
                 let (_key, _task, waker) = tc.take_task().unwrap();
                 cede(&waker);

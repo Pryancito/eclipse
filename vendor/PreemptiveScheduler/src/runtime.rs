@@ -6,7 +6,7 @@ use crate::context::Context;
 use crate::context::ContextData as Context;
 
 use alloc::{boxed::Box, sync::Arc, vec, vec::Vec};
-use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use core::{future::Future, pin::Pin};
 use spin::{Mutex, MutexGuard, Once};
 
@@ -629,8 +629,397 @@ fn note_weak_live(live: usize) {
     }
 }
 
+// ─── Wake-to-run latency: how long a runnable task waits for a CPU ─────────
+//
+// Every other probe in this crate measures a mechanism in isolation: handing a
+// task out of the queue is 92 ns, publishing an external wake is 15 ns, the
+// pre-halt recheck is 9. None of that explains a pipe round trip that costs
+// 186 us on real hardware against Linux's 6, and the layers above have been
+// ruled out by the same kind of measurement -- `linux-object`'s `benches/ipc`
+// puts the whole software half of that round trip, the signal wrapper
+// included, at 475 ns.
+//
+// So the time is not in the work. It is in the WAIT: between the moment a task
+// became runnable and the moment some CPU polled it. That interval is the one
+// thing nothing here could see, because its two ends live in different
+// modules, usually on different CPUs, and nothing travels between them but a
+// bit in a lane. This measures it, from the publish in
+// `WakerRef::wake_by_ref` to the claim in `TaskCollection::schedule`.
+//
+// What it is for is to tell three explanations apart, which no counter here
+// can today:
+//
+//  * the wake is serviced at once, and the 186 us is somewhere else entirely;
+//  * the wake waits for an interrupt, and the interrupt is a timer -- the
+//    LAPIC arm floor is 200 us, so a wait near 100 us on average is this one;
+//  * the wake waits for the running thread's RUN_TO_PARITY floor (750 us).
+//
+// The cost: a clock read on the publish and another on the claim, against a
+// ~15 ns wake. So it is SAMPLED -- one wake in `WAKE_SAMPLE_PERIOD` -- and the
+// decision is taken before the clock is read at all. A sampled wake is the one
+// that carries a stamp, so the claim side needs no sampling rule of its own:
+// an unstamped slot costs it one relaxed swap.
+
+/// Clock hook: absolute monotonic nanoseconds. The scheduler cannot call the
+/// HAL (that dependency runs the other way), so the HAL installs its clock
+/// here at boot exactly as it installs [`RESCHED_IPI_SENDER`].
+static NOW_NS_HOOK: AtomicUsize = AtomicUsize::new(0);
+
+/// Install the monotonic clock the latency probe reads. Without it the probe
+/// records nothing at all, which is the right answer for a build whose HAL
+/// never offered a clock -- never a zero latency, which would read as a
+/// scheduler that hands out CPUs instantly.
+pub fn set_now_ns_hook(f: fn() -> u64) {
+    NOW_NS_HOOK.store(f as usize, Ordering::Release);
+}
+
+/// The clock, or `None` when none is installed.
+#[inline]
+fn now_ns() -> Option<u64> {
+    // Judged before the jump, as the IPI sender is: this runs from the waker
+    // path, where a wild word would be an indirect call into nowhere.
+    let f = lock::fn_slot::live_fn(NOW_NS_HOOK.load(Ordering::Acquire))?;
+    // SAFETY: the word came from `set_now_ns_hook`, which only ever takes a
+    // `fn() -> u64`, and `live_fn` has judged it to be inside the kernel text.
+    let f: fn() -> u64 = unsafe { core::mem::transmute(f) };
+    Some(f())
+}
+
+/// One wake in this many is stamped. A power of two so the sampler is a mask.
+/// Public because a reader of [`wake_latency_stats`] cannot interpret the
+/// sample count without it, and a copy of the number in the printing code
+/// would drift from this one in silence.
+pub const WAKE_SAMPLE_PERIOD: u64 = 16;
+
+/// Master switch for the latency probe, settable from the kernel command line
+/// (`WAKELAT=0`). Off, the publish path does not even read the sampler.
+static WAKE_LATENCY: AtomicBool = AtomicBool::new(true);
+
+/// Enable/disable the wake-to-run latency probe.
+pub fn set_wake_latency(enabled: bool) {
+    WAKE_LATENCY.store(enabled, Ordering::Relaxed);
+}
+
+/// Whether the wake-to-run latency probe is enabled.
+pub fn wake_latency_enabled() -> bool {
+    WAKE_LATENCY.load(Ordering::Relaxed)
+}
+
+/// How many wakes have passed the publish path on each CPU, for the sampler.
+///
+/// Per CPU, and read-then-written rather than incremented atomically, for the
+/// reason the whole crate is shaped around: a `lock`-prefixed RMW on a word
+/// every CPU writes costs ~8 ns with no contention and hundreds under it, and
+/// this sits on EVERY external wake, which is itself only ~15 ns. A single
+/// global counter measured 11.9 ns for the declining path -- the probe would
+/// have been half the price of the thing it measures, and the same mistake
+/// `note_stealable` and the syscall ring (`TRACE_HEAD`, 313 ns with three
+/// threads alongside) were each rewritten to avoid.
+///
+/// A sampler does not need the count to be exact. Two wakes racing on one
+/// CPU's word can lose an increment; the only consequence is that this CPU
+/// samples one wake earlier or later than it would have, which no reading of
+/// a distribution depends on.
+static WAKE_SEEN: [AtomicU64; MAX_CORE_NUM] = [const { AtomicU64::new(0) }; MAX_CORE_NUM];
+
+/// Bits a packed stamp gives the clock; the rest carry the publishing CPU.
+const WAKE_STAMP_NS_BITS: u32 = 56;
+const WAKE_STAMP_NS_MASK: u64 = (1u64 << WAKE_STAMP_NS_BITS) - 1;
+
+/// Pack `(cpu, ns)` into one non-zero word for a slot's wake stamp.
+///
+/// Non-zero is a requirement, not a nicety: zero is the lane's "nothing to
+/// measure" value, so a clock that answers 0 (the first nanosecond of the
+/// boot, or a stub) must still pack to something a slot can hold. 56 bits of
+/// nanoseconds is 2.2 years of uptime, and the CPU goes in the rest because
+/// the claim side has no other way to tell a wake it serviced itself from one
+/// it was sent across the machine -- which is the difference between "the
+/// waker handed over its own CPU" and "an IPI had to travel".
+pub(crate) fn pack_wake_stamp(cpu: u8, ns: u64) -> u64 {
+    ((cpu as u64) << WAKE_STAMP_NS_BITS) | (ns & WAKE_STAMP_NS_MASK) | 1
+}
+
+/// `(cpu, ns)` back out of a packed stamp. The low bit is the one
+/// [`pack_wake_stamp`] forced, so it is not part of the clock.
+pub(crate) fn unpack_wake_stamp(packed: u64) -> (u8, u64) {
+    (
+        (packed >> WAKE_STAMP_NS_BITS) as u8,
+        packed & WAKE_STAMP_NS_MASK & !1,
+    )
+}
+
+/// The stamp this wake should carry, or `None` to leave the slot unstamped.
+///
+/// Called from the publish path on every external wake that is not deferred,
+/// so the order matters: the switch first (a relaxed load), then the sampler
+/// (one relaxed RMW), and only then the clock. A build with the probe off
+/// never reads either of the other two.
+#[inline]
+pub(crate) fn sample_wake_stamp() -> Option<u64> {
+    if !WAKE_LATENCY.load(Ordering::Relaxed) {
+        return None;
+    }
+    let cpu = crate::arch::cpu_id() as usize;
+    if cpu >= MAX_CORE_NUM {
+        return None;
+    }
+    let n = WAKE_SEEN[cpu].load(Ordering::Relaxed);
+    WAKE_SEEN[cpu].store(n.wrapping_add(1), Ordering::Relaxed);
+    if n % WAKE_SAMPLE_PERIOD != 0 {
+        return None;
+    }
+    let ns = now_ns()?;
+    Some(pack_wake_stamp(cpu as u8, ns))
+}
+
+/// Buckets of the latency histogram. Index 0 is "under a microsecond" and each
+/// one after it is a doubling from there, so bucket `i` is
+/// `[2^(i-1), 2^i)` microseconds and the last saturates at 2^14 us = 16.4 ms
+/// or more.
+pub const WAKE_LATENCY_BUCKETS: usize = 16;
+
+/// Which bucket a latency of `ns` falls in.
+///
+/// Pure, so the boundaries can be tested rather than read off a report. The
+/// first bucket is deliberately wide: a wake serviced in under a microsecond
+/// is a wake that did not wait, and splitting that further would only report
+/// the cost of the two clock reads.
+pub(crate) fn wake_latency_bucket(ns: u64) -> usize {
+    if ns < 1_000 {
+        return 0;
+    }
+    // `ilog2` of the latency in whole microseconds, plus one for the bucket
+    // that "under a microsecond" occupies. Saturating at the top bucket, which
+    // therefore reads as "at least 16 ms" and not as an exact band.
+    let us = ns / 1_000;
+    let step = 1 + us.ilog2() as usize;
+    step.min(WAKE_LATENCY_BUCKETS - 1)
+}
+
+static WAKE_LAT_COUNT: AtomicU64 = AtomicU64::new(0);
+static WAKE_LAT_TOTAL_NS: AtomicU64 = AtomicU64::new(0);
+static WAKE_LAT_MAX_NS: AtomicU64 = AtomicU64::new(0);
+/// Serviced by the CPU that published the wake: no IPI travelled, and the
+/// waker handed over a CPU it was holding anyway.
+static WAKE_LAT_SAME_CPU: AtomicU64 = AtomicU64::new(0);
+/// Serviced by a different CPU from the one that published the wake.
+static WAKE_LAT_CROSS_CPU: AtomicU64 = AtomicU64::new(0);
+static WAKE_LAT_HIST: [AtomicU64; WAKE_LATENCY_BUCKETS] =
+    [const { AtomicU64::new(0) }; WAKE_LATENCY_BUCKETS];
+
+/// A claim has just taken `packed` off a slot: record how long that wake
+/// waited. `0` means the slot was not sampled and this costs nothing.
+///
+/// A clock that went backwards over a migration (unsynchronised TSCs across
+/// the two CPUs) is DROPPED rather than clamped to zero: a zero would be
+/// counted in the "did not wait" bucket, which is the answer the whole probe
+/// exists to establish or refute.
+#[inline]
+pub(crate) fn note_wake_serviced(packed: u64) {
+    if packed == 0 {
+        return;
+    }
+    let (publisher, published_ns) = unpack_wake_stamp(packed);
+    let Some(now) = now_ns() else { return };
+    let Some(waited) = now.checked_sub(published_ns) else {
+        return;
+    };
+    let bucket = wake_latency_bucket(waited);
+    WAKE_LAT_COUNT.fetch_add(1, Ordering::Relaxed);
+    WAKE_LAT_TOTAL_NS.fetch_add(waited, Ordering::Relaxed);
+    WAKE_LAT_HIST[bucket].fetch_add(1, Ordering::Relaxed);
+    if publisher == crate::arch::cpu_id() {
+        WAKE_LAT_SAME_CPU.fetch_add(1, Ordering::Relaxed);
+    } else {
+        WAKE_LAT_CROSS_CPU.fetch_add(1, Ordering::Relaxed);
+    }
+    WAKE_LAT_MAX_NS.fetch_max(waited, Ordering::Relaxed);
+    let reason = entry_reason();
+    WAKE_ENTRY_COUNT[reason].fetch_add(1, Ordering::Relaxed);
+    WAKE_ENTRY_NS[reason].fetch_add(waited, Ordering::Relaxed);
+    WAKE_ENTRY_HIST[reason][bucket].fetch_add(1, Ordering::Relaxed);
+}
+
+/// `(samples, total ns, worst ns, serviced on the waker's own CPU, serviced
+/// across CPUs, histogram)` of the wake-to-run latency probe.
+///
+/// `samples` is one wake in [`WAKE_SAMPLE_PERIOD`], so it is not a wake count;
+/// the mean and the shape are what it is for.
+pub fn wake_latency_stats() -> (u64, u64, u64, u64, u64, [u64; WAKE_LATENCY_BUCKETS]) {
+    let mut hist = [0u64; WAKE_LATENCY_BUCKETS];
+    for (slot, counter) in hist.iter_mut().zip(WAKE_LAT_HIST.iter()) {
+        *slot = counter.load(Ordering::Relaxed);
+    }
+    (
+        WAKE_LAT_COUNT.load(Ordering::Relaxed),
+        WAKE_LAT_TOTAL_NS.load(Ordering::Relaxed),
+        WAKE_LAT_MAX_NS.load(Ordering::Relaxed),
+        WAKE_LAT_SAME_CPU.load(Ordering::Relaxed),
+        WAKE_LAT_CROSS_CPU.load(Ordering::Relaxed),
+        hist,
+    )
+}
+
+/// How a CPU came to be looking at its run queue, for the wake it then serves.
+///
+/// The latency histogram says a wake waits tens of microseconds; it cannot say
+/// *what* the wake was waiting for, and the two candidates want opposite
+/// fixes. Either the CPU was halted and the wake waited for an interrupt to
+/// end the halt --- then the timer's arming floor and the IPI path are what to
+/// attack --- or the CPU was busy and the wake waited for whatever it was
+/// running to give the CPU up, which is the preemption side (`RUN_TO_PARITY`,
+/// `BASE_SLICE_NS`). Attributing each serviced wake to the entry that
+/// delivered the CPU separates them, and costs one relaxed store per entry.
+///
+/// Values, as published by [`note_entry_reason`]:
+pub const WAKE_ENTRY_REASONS: usize = 6;
+/// No entry point has published a reason on this CPU yet, or the claim came
+/// from somewhere this crate does not instrument (a steal by a peer, the
+/// collection's own maintenance). Not an error: a bucket that is supposed to
+/// stay small, and says so if it does not.
+pub const WAKE_ENTRY_UNKNOWN: u8 = 0;
+/// The scan follows a task poll that has just returned. The wake waited for a
+/// CPU that was *busy*, so what it waited for is the length of someone else's
+/// turn --- a slice, or a poll that ran long.
+pub const WAKE_ENTRY_AFTER_POLL: u8 = 1;
+/// The scan follows the pre-halt recheck finding work: the CPU was on its way
+/// into `hlt` and the wake caught it in the window. The halt protocol doing
+/// exactly what it is for, and the cheapest way a wake can arrive.
+pub const WAKE_ENTRY_SKIPPED_HALT: u8 = 2;
+/// The scan follows `wait_for_interrupt` returning **with a reschedule
+/// request pending for this CPU**: a kick was aimed here, so the wake path
+/// did its job and the halt ended because of it.
+///
+/// The bit is the evidence, and it is sound in this direction: the empty
+/// branch clears the request before the pre-halt recheck, and a request that
+/// landed between the clear and the halt would have been seen by the recheck
+/// and the CPU would not have halted. So a bit set on the far side of the halt
+/// was raised while this CPU was in it -- and [`request_resched`] sets it
+/// before sending to a sleeping target, unconditionally.
+pub const WAKE_ENTRY_HALT_KICKED: u8 = 3;
+/// The scan follows `wait_for_interrupt` returning with **no** request
+/// pending: something other than a kick for this CPU ended the halt --- the
+/// 250 Hz tick, a device interrupt, a kick raised with wake-up preemption
+/// switched off (`WAKEPREEMPT=0` sends the IPI without the bit). The wake was
+/// already waiting and nothing came to fetch it, so it waited for whatever
+/// did arrive.
+///
+/// Telling this apart from a kicked halt exit is the whole reason the entries
+/// were split: the aggregate band "64-256 us" has been labelled
+/// "timer-serviced" by its shape alone since the probe was written, and this
+/// counts it instead of inferring it.
+pub const WAKE_ENTRY_HALT_TIMER: u8 = 5;
+/// The scan follows entering the loop or coming back from a stack switch
+/// (`sched_yield`, a weak-executor turn). Neither waiting for an interrupt nor
+/// waiting out a slice, so it is kept apart from both rather than folded into
+/// whichever looked closest.
+pub const WAKE_ENTRY_RESUMED: u8 = 4;
+
+/// The last entry reason published by each CPU.
+///
+/// Per CPU and a plain relaxed store, for the reason every counter in this
+/// file is: the write sits on the executor's loop, which runs on every poll,
+/// and an RMW on a shared word there would cost more than the whole wake path
+/// it is trying to describe (see [`WAKE_SEEN`]). A lost or stale value only
+/// mis-attributes one sampled wake out of [`WAKE_SAMPLE_PERIOD`].
+static ENTRY_REASON: [AtomicU8; MAX_CORE_NUM] =
+    [const { AtomicU8::new(WAKE_ENTRY_UNKNOWN) }; MAX_CORE_NUM];
+
+/// Publish how this CPU came to be about to look at its run queue.
+///
+/// Unconditional --- it does not test the probe's switch. The store is one
+/// relaxed byte to a line this CPU owns, which is cheaper than the load that
+/// would decide whether to do it, and keeping the value live means a report
+/// taken after the probe is switched on is not blind for its first turn.
+#[inline]
+pub fn note_entry_reason(reason: u8) {
+    let cpu = crate::arch::cpu_id() as usize;
+    if cpu < MAX_CORE_NUM {
+        ENTRY_REASON[cpu].store(reason, Ordering::Relaxed);
+    }
+}
+
+/// This CPU's last published entry reason.
+fn entry_reason() -> usize {
+    let cpu = crate::arch::cpu_id() as usize;
+    if cpu >= MAX_CORE_NUM {
+        return WAKE_ENTRY_UNKNOWN as usize;
+    }
+    let reason = ENTRY_REASON[cpu].load(Ordering::Relaxed) as usize;
+    // A value this crate did not publish reads as unknown rather than
+    // indexing out of the counters: the stats array is sized by the constant
+    // above, and a report must not be able to panic the kernel.
+    if reason < WAKE_ENTRY_REASONS {
+        reason
+    } else {
+        WAKE_ENTRY_UNKNOWN as usize
+    }
+}
+
+static WAKE_ENTRY_COUNT: [AtomicU64; WAKE_ENTRY_REASONS] =
+    [const { AtomicU64::new(0) }; WAKE_ENTRY_REASONS];
+static WAKE_ENTRY_NS: [AtomicU64; WAKE_ENTRY_REASONS] =
+    [const { AtomicU64::new(0) }; WAKE_ENTRY_REASONS];
+
+/// Each entry's own latency histogram, same buckets as [`WAKE_LAT_HIST`].
+///
+/// A mean per entry was the first thing this probe reported and it was the
+/// wrong statistic: with five samples in the top bucket out of 385, a handful
+/// of 80 ms stalls moved an entry's mean by hundreds of microseconds and the
+/// first reading of it said "wakes served after a poll take 1.7 ms", when most
+/// of them take tens of microseconds and a few take tens of milliseconds.
+/// Those are different claims with different fixes, so each entry carries its
+/// shape and the report quotes bands from it. The mean stays, as a mean.
+///
+/// 5 x 16 counters is 640 bytes of `.bss` and the write replaces the one
+/// `WAKE_LAT_HIST` already did -- the aggregate histogram is a sum of these
+/// rows, so nothing is counted twice and the sampled path pays nothing new.
+static WAKE_ENTRY_HIST: [[AtomicU64; WAKE_LATENCY_BUCKETS]; WAKE_ENTRY_REASONS] =
+    [const { [const { AtomicU64::new(0) }; WAKE_LATENCY_BUCKETS] }; WAKE_ENTRY_REASONS];
+
+/// `(samples, total ns, histogram)` per entry reason, indexed by the
+/// `WAKE_ENTRY_*` constants.
+///
+/// The per-entry histogram is the point: a count says how often an entry
+/// delivers a wake and a mean is dominated by whatever the longest stall of
+/// the run was, so neither answers "are the slow wakes the ones that came out
+/// of a halt?".
+#[allow(clippy::type_complexity)]
+pub fn wake_entry_stats() -> (
+    [u64; WAKE_ENTRY_REASONS],
+    [u64; WAKE_ENTRY_REASONS],
+    [[u64; WAKE_LATENCY_BUCKETS]; WAKE_ENTRY_REASONS],
+) {
+    let mut counts = [0u64; WAKE_ENTRY_REASONS];
+    let mut totals = [0u64; WAKE_ENTRY_REASONS];
+    let mut hist = [[0u64; WAKE_LATENCY_BUCKETS]; WAKE_ENTRY_REASONS];
+    for i in 0..WAKE_ENTRY_REASONS {
+        counts[i] = WAKE_ENTRY_COUNT[i].load(Ordering::Relaxed);
+        totals[i] = WAKE_ENTRY_NS[i].load(Ordering::Relaxed);
+        for b in 0..WAKE_LATENCY_BUCKETS {
+            hist[i][b] = WAKE_ENTRY_HIST[i][b].load(Ordering::Relaxed);
+        }
+    }
+    (counts, totals, hist)
+}
+
 /// HAL-registered function that sends a wake IPI to a logical CPU.
 static RESCHED_IPI_SENDER: AtomicUsize = AtomicUsize::new(0);
+
+/// Reschedule IPIs actually put on the wire, which no counter reported.
+///
+/// `RESCHED_REQUESTED`/`TAKEN`/`SUPPRESSED` describe the *request*, and a
+/// request is not a kick: `request_resched` sends one only for a sleeping
+/// target or on the 0->1 transition for a busy one, and never to itself. So a
+/// honoured ratio of 9% could mean either "most requests were raised where
+/// nothing consumes them" or "most kicks never went out", and the two call for
+/// opposite fixes. This separates them.
+static RESCHED_IPIS_SENT: AtomicU64 = AtomicU64::new(0);
+
+/// Reschedule IPIs actually sent since boot.
+pub fn resched_ipis_sent() -> u64 {
+    RESCHED_IPIS_SENT.load(Ordering::Relaxed)
+}
 
 /// Register the IPI sender used to kick halted CPUs on cross-CPU wakes.
 pub fn set_resched_ipi_sender(f: fn(usize)) {
@@ -659,6 +1048,7 @@ fn send_resched_ipi(owner: usize) {
         return;
     };
     let f: fn(usize) = unsafe { core::mem::transmute(f) };
+    RESCHED_IPIS_SENT.fetch_add(1, Ordering::Relaxed);
     f(owner);
 }
 
@@ -994,6 +1384,19 @@ pub fn take_need_resched() -> bool {
 /// order is peek, ask the thread, and only then take.
 pub fn need_resched_pending() -> bool {
     let cpu = crate::arch::cpu_id() as usize;
+    if cpu >= MAX_CORE_NUM {
+        return false;
+    }
+    NEED_RESCHED.load(Ordering::Relaxed) & (1u64 << cpu) != 0
+}
+
+/// Whether a reschedule request is pending for `cpu`, without consuming it.
+///
+/// For the entry attribution at the halt exit (see
+/// [`WAKE_ENTRY_HALT_KICKED`]): a plain relaxed load, and emphatically not a
+/// take --- the request still belongs to whoever raised it, and the scan that
+/// follows is what satisfies it.
+pub(crate) fn resched_pending_for(cpu: usize) -> bool {
     if cpu >= MAX_CORE_NUM {
         return false;
     }
@@ -3500,6 +3903,393 @@ mod stealable_tests {
 }
 
 #[cfg(test)]
+mod wake_latency_tests {
+    use super::*;
+
+    /// A stamp has to survive the round trip whatever the clock and the CPU,
+    /// and it has to be non-zero whatever they are -- zero is the lane's "no
+    /// measurement", so a stamp that packs to it would be read as an unsampled
+    /// slot and the wake would be re-stamped by the next one in its own run.
+    #[test]
+    fn a_stamp_packs_and_unpacks_and_is_never_zero() {
+        // The clock at zero is the case that forces the low bit: the first
+        // nanosecond of a boot, and what a stub clock answers.
+        for cpu in [0u8, 1, 7, 63, 255] {
+            for ns in [0u64, 1, 2, 999, 1_000, 1 << 20, (1u64 << 56) - 2] {
+                let packed = pack_wake_stamp(cpu, ns);
+                assert_ne!(packed, 0, "cpu={} ns={}", cpu, ns);
+                let (got_cpu, got_ns) = unpack_wake_stamp(packed);
+                assert_eq!(got_cpu, cpu, "cpu lost for ns={}", ns);
+                // The low bit is spent on being non-zero, so the clock comes
+                // back rounded down to an even nanosecond and never further.
+                assert!(got_ns == (ns & !1), "ns={} came back as {}", ns, got_ns);
+            }
+        }
+    }
+
+    /// The histogram's boundaries, as boundaries: everything under a
+    /// microsecond is "did not wait", and each bucket after it is a doubling.
+    /// The top bucket saturates, so a 10-second stall is counted and not lost.
+    #[test]
+    fn the_buckets_are_a_doubling_each_from_one_microsecond() {
+        assert_eq!(wake_latency_bucket(0), 0);
+        assert_eq!(wake_latency_bucket(999), 0);
+        assert_eq!(wake_latency_bucket(1_000), 1, "1 us opens bucket 1");
+        assert_eq!(wake_latency_bucket(1_999), 1);
+        assert_eq!(wake_latency_bucket(2_000), 2, "2 us opens bucket 2");
+        assert_eq!(wake_latency_bucket(3_999), 2);
+        assert_eq!(wake_latency_bucket(4_000), 3);
+        // The band that matters for the question this probe was built for: the
+        // LAPIC arm floor is 200 us, so a wake that waited for a timer lands
+        // here and nowhere else.
+        assert_eq!(wake_latency_bucket(100_000), 7, "100 us is in [64, 128) us");
+        assert_eq!(
+            wake_latency_bucket(200_000),
+            8,
+            "200 us is in [128, 256) us"
+        );
+        assert_eq!(
+            wake_latency_bucket(16_384_000),
+            WAKE_LATENCY_BUCKETS - 1,
+            "2^14 us opens the top bucket"
+        );
+        assert_eq!(
+            wake_latency_bucket(16_383_000),
+            WAKE_LATENCY_BUCKETS - 2,
+            "and one microsecond less does not"
+        );
+        assert_eq!(
+            wake_latency_bucket(10_000_000_000),
+            WAKE_LATENCY_BUCKETS - 1,
+            "a ten-second stall saturates, it does not wrap"
+        );
+        // Monotonic, which is the property a reader of the report relies on.
+        let mut last = 0;
+        for us in 1..5_000u64 {
+            let b = wake_latency_bucket(us * 1_000);
+            assert!(b >= last, "bucket went backwards at {} us", us);
+            last = b;
+        }
+    }
+
+    /// With no clock installed nothing is recorded. The alternative -- a
+    /// latency of zero -- would read as a scheduler that hands out a CPU the
+    /// instant a task becomes runnable, which is precisely the claim this
+    /// probe exists to test.
+    #[test]
+    fn with_no_clock_nothing_is_sampled() {
+        let _g = super::resched_test_lock();
+        let saved = NOW_NS_HOOK.swap(0, Ordering::SeqCst);
+        let before = WAKE_LAT_COUNT.load(Ordering::Relaxed);
+        // A stamp that would otherwise be recorded, offered with no clock to
+        // date it against.
+        note_wake_serviced(pack_wake_stamp(0, 1_000));
+        assert_eq!(
+            WAKE_LAT_COUNT.load(Ordering::Relaxed),
+            before,
+            "a sample was recorded with no clock to read"
+        );
+        assert!(
+            sample_wake_stamp().is_none(),
+            "a wake was stamped with no clock to read"
+        );
+        NOW_NS_HOOK.store(saved, Ordering::SeqCst);
+    }
+
+    /// An unstamped slot is the overwhelmingly common case (sampling keeps it
+    /// so), and it must cost the claim path nothing and record nothing.
+    #[test]
+    fn an_unstamped_slot_records_nothing() {
+        let _g = super::resched_test_lock();
+        let before = WAKE_LAT_COUNT.load(Ordering::Relaxed);
+        note_wake_serviced(0);
+        assert_eq!(WAKE_LAT_COUNT.load(Ordering::Relaxed), before);
+    }
+
+    /// Each serviced wake is filed under the entry that delivered the CPU,
+    /// with its own waited time. This is the split the probe was extended for:
+    /// a wake that waited for an interrupt and one that waited out someone
+    /// else's turn have the same latency and opposite fixes.
+    #[test]
+    fn a_serviced_wake_is_filed_under_the_entry_that_delivered_the_cpu() {
+        let _g = super::resched_test_lock();
+        fn clock() -> u64 {
+            51_000
+        }
+        let saved = NOW_NS_HOOK.swap(clock as usize, Ordering::SeqCst);
+        let (counts_before, ns_before, hist_before) = wake_entry_stats();
+        note_entry_reason(WAKE_ENTRY_HALT_KICKED);
+        note_wake_serviced(pack_wake_stamp(crate::arch::cpu_id(), 1_000));
+        let (counts, ns, hist) = wake_entry_stats();
+        let halt = WAKE_ENTRY_HALT_KICKED as usize;
+        assert_eq!(
+            counts[halt],
+            counts_before[halt] + 1,
+            "the wake was not filed under the halt it came out of"
+        );
+        assert_eq!(
+            ns[halt],
+            ns_before[halt] + 50_000,
+            "the entry's total did not take this wake's wait"
+        );
+        // And in the entry's own histogram, in the bucket its latency belongs
+        // to: the mean alone was the statistic that first read this probe
+        // wrong, so the shape is what the report quotes.
+        let bucket = wake_latency_bucket(50_000);
+        assert_eq!(
+            hist[halt][bucket],
+            hist_before[halt][bucket] + 1,
+            "the halt entry's histogram missed the sample in bucket {}",
+            bucket
+        );
+        // And a different entry is a different bucket, not the same one again.
+        let poll = WAKE_ENTRY_AFTER_POLL as usize;
+        note_entry_reason(WAKE_ENTRY_AFTER_POLL);
+        note_wake_serviced(pack_wake_stamp(crate::arch::cpu_id(), 1_000));
+        let (counts2, _, _) = wake_entry_stats();
+        assert_eq!(
+            counts2[poll],
+            counts_before[poll] + 1,
+            "a wake served after a poll was filed elsewhere"
+        );
+        assert_eq!(
+            counts2[halt], counts[halt],
+            "the halt bucket moved on a wake that did not come out of a halt"
+        );
+        NOW_NS_HOOK.store(saved, Ordering::SeqCst);
+    }
+
+    /// A sample the latency probe DROPS must not be attributed either, or the
+    /// two halves of the report stop adding up and the shares are computed
+    /// over a denominator the histogram does not share.
+    #[test]
+    fn a_dropped_sample_is_attributed_to_no_entry() {
+        let _g = super::resched_test_lock();
+        fn frozen() -> u64 {
+            1_000
+        }
+        let saved = NOW_NS_HOOK.swap(frozen as usize, Ordering::SeqCst);
+        let (counts_before, _, _) = wake_entry_stats();
+        note_entry_reason(WAKE_ENTRY_HALT_KICKED);
+        // Published "later" than the claim reads the clock: dropped.
+        note_wake_serviced(pack_wake_stamp(0, 2_000));
+        // And an unstamped slot, which is the common case.
+        note_wake_serviced(0);
+        let (counts, _, _) = wake_entry_stats();
+        assert_eq!(
+            counts, counts_before,
+            "a sample the latency probe dropped was still attributed"
+        );
+        NOW_NS_HOOK.store(saved, Ordering::SeqCst);
+    }
+
+    /// `resched_pending_for` peeks, it does not take: the request still
+    /// belongs to whoever raised it, and the scan that follows the halt exit
+    /// is what satisfies it. A take here would drop a request, and the woken
+    /// task would wait for the next interrupt -- the regression the request
+    /// exists to prevent.
+    #[test]
+    fn reading_the_kick_at_a_halt_exit_does_not_consume_it() {
+        let _g = super::resched_test_lock();
+        let cpu = crate::arch::cpu_id() as usize;
+        let saved = NEED_RESCHED.load(Ordering::Relaxed);
+        NEED_RESCHED.fetch_or(1u64 << cpu, Ordering::Relaxed);
+        assert!(resched_pending_for(cpu), "the kick was not seen");
+        assert!(
+            resched_pending_for(cpu),
+            "reading the kick consumed it, so the scan that follows will not"
+        );
+        assert!(
+            need_resched_pending(),
+            "the request the trap path reads was dropped by the peek"
+        );
+        clear_need_resched(cpu);
+        assert!(!resched_pending_for(cpu), "the clear did not clear it");
+        // A CPU id no mask can hold is false, not a shift past the word.
+        assert!(!resched_pending_for(MAX_CORE_NUM));
+        NEED_RESCHED.store(saved, Ordering::Relaxed);
+    }
+
+    /// The aggregate histogram is exactly the sum of the per-entry rows.
+    ///
+    /// The report computes its bands from the aggregate and its shares from
+    /// the entries, so a sample counted in one and not the other makes two
+    /// lines of the same report disagree -- and the reader has no way to tell
+    /// which of them is the measurement.
+    #[test]
+    fn the_aggregate_histogram_is_the_sum_of_the_entry_rows() {
+        let _g = super::resched_test_lock();
+        fn clock() -> u64 {
+            41_000
+        }
+        let saved = NOW_NS_HOOK.swap(clock as usize, Ordering::SeqCst);
+        note_entry_reason(WAKE_ENTRY_RESUMED);
+        note_wake_serviced(pack_wake_stamp(crate::arch::cpu_id(), 1_000));
+        let (_, _, per_entry) = wake_entry_stats();
+        let (count, _, _, _, _, aggregate) = wake_latency_stats();
+        for bucket in 0..WAKE_LATENCY_BUCKETS {
+            let summed: u64 = (0..WAKE_ENTRY_REASONS).map(|r| per_entry[r][bucket]).sum();
+            assert_eq!(
+                summed, aggregate[bucket],
+                "bucket {} disagrees: entries sum to {}, aggregate says {}",
+                bucket, summed, aggregate[bucket]
+            );
+        }
+        let total: u64 = (0..WAKE_ENTRY_REASONS)
+            .map(|r| per_entry[r].iter().sum::<u64>())
+            .sum();
+        assert_eq!(
+            total, count,
+            "the entries do not account for every counted sample"
+        );
+        note_entry_reason(WAKE_ENTRY_UNKNOWN);
+        NOW_NS_HOOK.store(saved, Ordering::SeqCst);
+    }
+
+    /// A reason this crate never published reads as unknown instead of
+    /// indexing past the counters. The report runs inside the kernel, on a
+    /// path a user can trigger, so it must not be able to panic it.
+    #[test]
+    fn an_entry_reason_this_crate_never_published_reads_as_unknown() {
+        let _g = super::resched_test_lock();
+        fn clock() -> u64 {
+            9_000
+        }
+        let saved = NOW_NS_HOOK.swap(clock as usize, Ordering::SeqCst);
+        let cpu = crate::arch::cpu_id() as usize;
+        let (counts_before, _, _) = wake_entry_stats();
+        ENTRY_REASON[cpu].store(200, Ordering::Relaxed);
+        assert_eq!(entry_reason(), WAKE_ENTRY_UNKNOWN as usize);
+        note_wake_serviced(pack_wake_stamp(crate::arch::cpu_id(), 1_000));
+        let (counts, _, _) = wake_entry_stats();
+        let unknown = WAKE_ENTRY_UNKNOWN as usize;
+        assert_eq!(
+            counts[unknown],
+            counts_before[unknown] + 1,
+            "a reason out of range was filed somewhere other than unknown"
+        );
+        note_entry_reason(WAKE_ENTRY_UNKNOWN);
+        NOW_NS_HOOK.store(saved, Ordering::SeqCst);
+    }
+
+    /// Every `WAKE_ENTRY_*` constant has a counter, and they are distinct.
+    /// The report indexes the arrays by them and labels them by position, so a
+    /// constant added without widening `WAKE_ENTRY_REASONS` would silently
+    /// file itself under another entry's name.
+    #[test]
+    fn every_entry_constant_has_its_own_slot() {
+        let all = [
+            WAKE_ENTRY_UNKNOWN,
+            WAKE_ENTRY_AFTER_POLL,
+            WAKE_ENTRY_SKIPPED_HALT,
+            WAKE_ENTRY_HALT_KICKED,
+            WAKE_ENTRY_RESUMED,
+            WAKE_ENTRY_HALT_TIMER,
+        ];
+        assert_eq!(all.len(), WAKE_ENTRY_REASONS, "a reason without a counter");
+        for (i, r) in all.iter().enumerate() {
+            assert_eq!(*r as usize, i, "the constants are not the array order");
+        }
+    }
+
+    /// A clock that went backwards between the two CPUs is dropped, not
+    /// clamped: a clamped sample would be counted as "did not wait".
+    #[test]
+    fn a_backwards_clock_is_dropped_not_counted_as_instant() {
+        let _g = super::resched_test_lock();
+        fn frozen() -> u64 {
+            1_000
+        }
+        let saved = NOW_NS_HOOK.swap(frozen as usize, Ordering::SeqCst);
+        let text = lock::fn_slot::text_range();
+        let before = WAKE_LAT_COUNT.load(Ordering::Relaxed);
+        let instant_before = WAKE_LAT_HIST[0].load(Ordering::Relaxed);
+        // Published "later" than the claim reads the clock.
+        note_wake_serviced(pack_wake_stamp(0, 2_000));
+        assert_eq!(
+            WAKE_LAT_COUNT.load(Ordering::Relaxed),
+            before,
+            "a backwards sample was recorded"
+        );
+        assert_eq!(
+            WAKE_LAT_HIST[0].load(Ordering::Relaxed),
+            instant_before,
+            "a backwards sample was filed as an instant wake"
+        );
+        NOW_NS_HOOK.store(saved, Ordering::SeqCst);
+        let _ = text;
+    }
+
+    /// The whole measurement, end to end, with a clock the test drives: a
+    /// stamp taken at one reading and serviced at another is counted once,
+    /// in the bucket its latency belongs to, with the waited time added.
+    #[test]
+    fn a_serviced_wake_is_counted_in_its_own_bucket() {
+        let _g = super::resched_test_lock();
+        /// 300 us after the publish: the band a wake that waited for a timer
+        /// would land in.
+        fn clock() -> u64 {
+            301_000
+        }
+        let saved = NOW_NS_HOOK.swap(clock as usize, Ordering::SeqCst);
+        let (count_before, total_before, _, same_before, _, hist_before) = wake_latency_stats();
+        note_wake_serviced(pack_wake_stamp(crate::arch::cpu_id(), 1_000));
+        let (count, total, worst, same, _cross, hist) = wake_latency_stats();
+        assert_eq!(count, count_before + 1);
+        assert_eq!(total, total_before + 300_000);
+        assert!(worst >= 300_000);
+        assert_eq!(
+            same,
+            same_before + 1,
+            "the publishing CPU was this one, so it is not a cross-CPU wake"
+        );
+        let bucket = wake_latency_bucket(300_000);
+        assert_eq!(
+            hist[bucket],
+            hist_before[bucket] + 1,
+            "the sample did not land in bucket {}",
+            bucket
+        );
+        NOW_NS_HOOK.store(saved, Ordering::SeqCst);
+    }
+
+    /// The switch is the first thing the publish path reads, so a build with
+    /// the probe off stamps nothing however the sampler and the clock stand.
+    #[test]
+    fn the_switch_turns_the_whole_probe_off() {
+        let _g = super::resched_test_lock();
+        fn clock() -> u64 {
+            7_000
+        }
+        let saved = NOW_NS_HOOK.swap(clock as usize, Ordering::SeqCst);
+        let was = wake_latency_enabled();
+        set_wake_latency(false);
+        // Every residue of the sampler's period, so this cannot pass by
+        // landing on an unsampled turn.
+        for _ in 0..(WAKE_SAMPLE_PERIOD * 2) {
+            assert!(sample_wake_stamp().is_none(), "stamped with the probe off");
+        }
+        set_wake_latency(true);
+        // And on, one turn in `WAKE_SAMPLE_PERIOD` is stamped -- asserted as
+        // "at least one of a period's worth", because the counter is global
+        // and another test may have advanced it.
+        let mut stamped = 0;
+        for _ in 0..WAKE_SAMPLE_PERIOD {
+            if sample_wake_stamp().is_some() {
+                stamped += 1;
+            }
+        }
+        assert_eq!(
+            stamped, 1,
+            "exactly one wake in a period of {} must be stamped",
+            WAKE_SAMPLE_PERIOD
+        );
+        set_wake_latency(was);
+        NOW_NS_HOOK.store(saved, Ordering::SeqCst);
+    }
+}
+
+#[cfg(test)]
 mod resched_tests {
     use super::*;
 
@@ -4472,6 +5262,57 @@ mod benches {
     fn peek_at_a_reschedule_request(b: &mut Bencher) {
         let _g = resched_test_lock();
         b.iter(|| need_resched_pending());
+    }
+
+    // ── the wake-to-run latency probe's own bill ───────────────────────────
+
+    /// The publish side on an UNSAMPLED wake, which is 15 of every 16: one
+    /// relaxed load of the switch and one relaxed RMW of the sampler. This is
+    /// the figure that matters, because it is what the probe adds to a ~15 ns
+    /// external wake in the steady state.
+    #[bench]
+    fn decline_to_stamp_an_unsampled_wake(b: &mut Bencher) {
+        let _g = resched_test_lock();
+        // The row is the DECLINING path, which is 15 turns in 16, so the
+        // sampled turn has to be kept out of it: with a period of 16 it would
+        // otherwise contribute a clock read to one iteration in sixteen and
+        // the figure would be an average of two different paths. Parking this
+        // CPU's counter one past a sampled turn is not enough on its own --
+        // `b.iter` runs many turns -- so the clock is removed instead, which
+        // makes the sampled turn return `None` after the same two reads the
+        // declining one pays.
+        let saved = NOW_NS_HOOK.swap(0, Ordering::SeqCst);
+        b.iter(|| black_box(sample_wake_stamp()));
+        NOW_NS_HOOK.store(saved, Ordering::SeqCst);
+    }
+
+    /// The claim side on an unsampled slot, the same 15 in 16: the whole cost
+    /// is the branch on a word the caller already had to swap out of the slot.
+    #[bench]
+    fn service_an_unstamped_slot(b: &mut Bencher) {
+        let _g = resched_test_lock();
+        b.iter(|| note_wake_serviced(black_box(0)));
+    }
+
+    /// The claim side on a slot that WAS sampled: a clock read, the bucket
+    /// arithmetic and five relaxed counters. Paid once per sampled wake.
+    #[bench]
+    fn record_a_sampled_wake(b: &mut Bencher) {
+        let _g = resched_test_lock();
+        fn clock() -> u64 {
+            1_000_000
+        }
+        let saved = NOW_NS_HOOK.swap(clock as usize, Ordering::SeqCst);
+        let stamp = pack_wake_stamp(crate::arch::cpu_id(), 1_000);
+        b.iter(|| note_wake_serviced(black_box(stamp)));
+        NOW_NS_HOOK.store(saved, Ordering::SeqCst);
+    }
+
+    /// The bucket arithmetic alone, over an input the compiler cannot fold:
+    /// what the row above pays for deciding where a sample goes.
+    #[bench]
+    fn choose_a_histogram_bucket(b: &mut Bencher) {
+        b.iter(|| black_box(wake_latency_bucket(black_box(187_000))));
     }
 
     /// The request actually being consumed: the relaxed pre-check fails, so

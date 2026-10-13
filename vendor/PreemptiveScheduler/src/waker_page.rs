@@ -116,6 +116,30 @@ pub struct WakerPage {
     /// whether there is one -- so nothing can change a slot's answer while it
     /// is occupied.
     affine: AtomicU64SC,
+    /// When an external wake was published for each slot, for the wake-to-run
+    /// latency probe: the clock at publish time packed with the publishing
+    /// CPU (see [`crate::runtime::pack_wake_stamp`]), or `0` for "nothing to
+    /// measure here".
+    ///
+    /// Why a slot needs its own word. The question the probe exists to answer
+    /// is how long a task that became runnable waited before anybody polled
+    /// it, and the two ends of that interval are in different modules on
+    /// (usually) different CPUs: the publish is [`WakerRef::wake_by_ref`] and
+    /// the service is `TaskCollection::schedule` claiming the bit. Nothing
+    /// else is carried between them -- the lanes are bitmaps, and the `Task`
+    /// is not in hand at publish time -- so the timestamp travels in the one
+    /// place both ends can name, which is the slot.
+    ///
+    /// Only the FIRST wake of a run is stamped ([`stamp_wake`] stores into a
+    /// zero word only): a burst of wakes for one slot is one wait, and
+    /// overwriting would report the last wake's age instead of the first's,
+    /// which is the age the waiter actually experienced. Sampling keeps the
+    /// cost off most wakes -- an external wake is ~15 ns and a clock read is
+    /// ~10 -- so the decision not to stamp is taken by the caller, before the
+    /// clock is read at all.
+    ///
+    /// [`stamp_wake`]: Self::stamp_wake
+    wake_stamp: [AtomicU64; WAKER_PAGE_SIZE],
     /// Logical CPU whose [`TaskCollection`](crate::task_collection::TaskCollection)
     /// owns this page. A cross-CPU wake targets this CPU's run queue; if it is
     /// halted, `wake_by_ref` sends it a reschedule IPI so the wake is honoured
@@ -132,6 +156,7 @@ impl WakerPage {
             dropped: AtomicU64SC::new(0),
             borrowed: AtomicU64SC::new(0),
             affine: AtomicU64SC::new(0),
+            wake_stamp: [const { AtomicU64::new(0) }; WAKER_PAGE_SIZE],
             owner_cpu,
         }
     }
@@ -158,6 +183,10 @@ impl WakerPage {
         self.dropped.fetch_and(!(1 << idx));
         self.borrowed.fetch_and(!(1 << idx));
         self.affine.fetch_and(!(1 << idx));
+        // Same reasoning as `affine` above: a reused slot must inherit nothing
+        // from its last occupant. A stale stamp here would be reported as one
+        // enormous wake latency belonging to a task that no longer exists.
+        self.wake_stamp[idx].store(0, Ordering::Relaxed);
     }
 
     /// Record that the task now in slot `idx` carries an affinity mask.
@@ -177,6 +206,31 @@ impl WakerPage {
     #[inline]
     pub fn affine_bits(&self) -> u64 {
         self.affine.load()
+    }
+
+    /// Stamp slot `idx` with `packed` for the wake-to-run latency probe, but
+    /// only if it is not already stamped.
+    ///
+    /// "Only if" is the whole contract: see the [`wake_stamp`] lane. `packed`
+    /// must be non-zero, which [`crate::runtime::pack_wake_stamp`] guarantees,
+    /// or the stamp would read as "no measurement" and the slot would be
+    /// stamped again by the next wake of the same run.
+    ///
+    /// [`wake_stamp`]: Self::wake_stamp
+    #[inline]
+    pub(crate) fn stamp_wake(&self, idx: usize, packed: u64) {
+        debug_assert!(idx < WAKER_PAGE_SIZE);
+        debug_assert_ne!(packed, 0, "a zero stamp reads as no measurement");
+        let _ =
+            self.wake_stamp[idx].compare_exchange(0, packed, Ordering::Relaxed, Ordering::Relaxed);
+    }
+
+    /// Take slot `idx`'s wake stamp, leaving it unstamped. `0` when there was
+    /// nothing to measure.
+    #[inline]
+    pub(crate) fn take_wake_stamp(&self, idx: usize) -> u64 {
+        debug_assert!(idx < WAKER_PAGE_SIZE);
+        self.wake_stamp[idx].swap(0, Ordering::Relaxed)
     }
 
     pub fn mark_dropped(&self, idx: usize) {
@@ -397,7 +451,8 @@ impl WakerPage {
         // self.completed.fetch_and(mask);
         self.dropped.fetch_and(mask);
         self.borrowed.fetch_and(mask);
-        self.affine.fetch_and(mask)
+        self.affine.fetch_and(mask);
+        self.wake_stamp[idx].store(0, Ordering::Relaxed)
     }
 
     pub fn make_waker(self: &Arc<Self>, idx: usize, dropped: &Arc<AtomicBool>) -> WakerRef {
@@ -500,6 +555,13 @@ impl WakerRef {
             // the executor's publish-sleeping-then-recheck sequence so a wake
             // can never fall between its final queue check and the halt.
             self.page.notify(self.idx);
+            // After the notify, so the stamp can never be older than the
+            // publish it dates, and only for a wake that is NOT deferred: a
+            // borrowed task already owns a CPU, so the interval this probe
+            // measures (runnable but nobody polling) does not start here.
+            if let Some(packed) = crate::runtime::sample_wake_stamp() {
+                self.page.stamp_wake(self.idx, packed);
+            }
             if in_flight {
                 crate::runtime::maybe_send_resched_ipi(self.page.owner_cpu);
             } else {
@@ -1256,6 +1318,46 @@ mod waker_page_tests {
     ///    paired row that pays the transition every time.
     ///  * **Test profile.** `debug_assert!(offset < 64)` is in every figure
     ///    here and in none of the kernel's.
+    /// El sello de despertar se CONSUME al servirlo, y solo lo pone el primer
+    /// despertar de una tanda.
+    ///
+    /// Las dos mitades son la misma propiedad vista desde cada punta. Si
+    /// `take_wake_stamp` leyera sin limpiar, el siguiente reparto del mismo
+    /// hueco volveria a cobrar el sello viejo: una espera contada dos veces, y
+    /// la segunda con el reloj de otro momento, o sea una latencia inventada.
+    /// Si `stamp_wake` pisara el sello existente, el que se mediria seria el
+    /// ULTIMO despertar y no la espera entera, que es lo que se busca.
+    #[test]
+    fn el_sello_de_despertar_se_consume_al_servirlo() {
+        let page = WakerPage::new(0);
+        let primero = crate::runtime::pack_wake_stamp(0, 4_000);
+        let segundo = crate::runtime::pack_wake_stamp(0, 9_000);
+
+        page.stamp_wake(3, primero);
+        // Segundo despertar de la misma tanda: no pisa al primero.
+        page.stamp_wake(3, segundo);
+        assert_eq!(
+            page.take_wake_stamp(3),
+            primero,
+            "lo que se mide es la espera entera, desde el primer despertar"
+        );
+        // Y una vez servido no queda nada que volver a cobrar.
+        assert_eq!(
+            page.take_wake_stamp(3),
+            0,
+            "un sello servido dos veces es una latencia inventada"
+        );
+
+        // Un hueco reutilizado no hereda el sello del anterior ocupante, por
+        // ninguno de los dos caminos que lo reciclan.
+        page.stamp_wake(3, primero);
+        page.initialize(3);
+        assert_eq!(page.take_wake_stamp(3), 0, "initialize limpia el sello");
+        page.stamp_wake(3, primero);
+        page.clear(3);
+        assert_eq!(page.take_wake_stamp(3), 0, "clear limpia el sello");
+    }
+
     #[cfg(test)]
     mod benches {
         use super::*;

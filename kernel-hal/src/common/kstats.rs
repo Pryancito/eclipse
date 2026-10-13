@@ -252,6 +252,118 @@ pub fn poison_bound_stats() -> (usize, usize, usize) {
     (0, 0, 0)
 }
 
+/// How long a task that became runnable waited before any CPU polled it:
+/// `(samples, total ns, worst ns, serviced on the waker's own CPU, serviced
+/// across CPUs, histogram)`.
+///
+/// This is the one interval no other counter here could see. Every mechanism
+/// the scheduler owns has been measured in isolation and is tens of
+/// nanoseconds -- handing a task out of the queue is 92 ns, publishing an
+/// external wake 15 -- and `linux-object`'s `benches/ipc` puts the whole
+/// software half of a pipe round trip at 475 ns. A round trip that costs
+/// 186 us on real hardware is therefore nearly all WAIT, and this says how
+/// much of it and in what shape: a distribution clustered under a microsecond
+/// means the wait is elsewhere, one clustered in the 64-256 us bands means the
+/// wake is being serviced by a timer (the LAPIC arm floor is 200 us), and one
+/// in the millisecond bands means it is waiting out a timeslice.
+///
+/// `samples` is one wake in sixteen, not a wake count: the probe is sampled
+/// because an external wake is ~15 ns and a clock read is ~10. The switch is
+/// `WAKELAT=0`.
+/// (libos has no scheduler of ours and reports zeros.)
+/// Buckets in [`wake_latency_stats`]'s histogram. Index 0 is "under a
+/// microsecond" and each one after it is a doubling from there.
+///
+/// Spelled here as well as in the scheduler because the scheduler crate is a
+/// bare-metal-only dependency and the libos build of this module has to name
+/// the same width for its zeros. The `const` assertion below is what keeps the
+/// two from drifting: a divergence is a build error, not a report whose
+/// columns silently stop lining up.
+pub const WAKE_LATENCY_BUCKETS: usize = 16;
+
+/// How many wakes there are per sample in [`wake_latency_stats`]. Spelled and
+/// asserted here for the same reason as the bucket count: whoever prints the
+/// sample count has to be able to say what it is a sample of.
+pub const WAKE_SAMPLE_PERIOD: u64 = 16;
+
+#[cfg(target_os = "none")]
+const _: () = assert!(executor::WAKE_LATENCY_BUCKETS == WAKE_LATENCY_BUCKETS);
+
+#[cfg(target_os = "none")]
+const _: () = assert!(executor::WAKE_SAMPLE_PERIOD == WAKE_SAMPLE_PERIOD);
+
+#[cfg(target_os = "none")]
+pub fn wake_latency_stats() -> (u64, u64, u64, u64, u64, [u64; WAKE_LATENCY_BUCKETS]) {
+    executor::wake_latency_stats()
+}
+
+#[cfg(not(target_os = "none"))]
+pub fn wake_latency_stats() -> (u64, u64, u64, u64, u64, [u64; WAKE_LATENCY_BUCKETS]) {
+    (0, 0, 0, 0, 0, [0; WAKE_LATENCY_BUCKETS])
+}
+
+/// Entry reasons in [`wake_entry_stats`], one per `WAKE_ENTRY_*` index.
+///
+/// Spelled and asserted here for the same reason as the bucket count above:
+/// the libos build has to name the same width for its zeros.
+pub const WAKE_ENTRY_REASONS: usize = 6;
+
+#[cfg(target_os = "none")]
+const _: () = assert!(executor::WAKE_ENTRY_REASONS == WAKE_ENTRY_REASONS);
+
+/// `(samples, total ns, histogram)` per entry reason: how the CPU that
+/// serviced each sampled wake came to be looking at its run queue, and what
+/// the latencies of each entry look like. The per-entry histogram is the point
+/// -- a mean is dominated by the run's longest stall.
+///
+/// Read against `wake latency`'s histogram, this is what says whether the wait
+/// was for an interrupt to end a halt or for a busy CPU to give up its turn.
+/// The order is the scheduler's `WAKE_ENTRY_*` constants: unknown, after a
+/// poll, halt skipped by the recheck, out of a halt with a kick aimed at this
+/// CPU, resumed, out of a halt with no kick (so the tick or a device IRQ ended
+/// it and the wake was merely waiting for whatever arrived).
+/// (libos has no scheduler of ours and reports zeros.)
+#[allow(clippy::type_complexity)]
+#[cfg(target_os = "none")]
+pub fn wake_entry_stats() -> (
+    [u64; WAKE_ENTRY_REASONS],
+    [u64; WAKE_ENTRY_REASONS],
+    [[u64; WAKE_LATENCY_BUCKETS]; WAKE_ENTRY_REASONS],
+) {
+    executor::wake_entry_stats()
+}
+
+#[allow(clippy::type_complexity)]
+#[cfg(not(target_os = "none"))]
+pub fn wake_entry_stats() -> (
+    [u64; WAKE_ENTRY_REASONS],
+    [u64; WAKE_ENTRY_REASONS],
+    [[u64; WAKE_LATENCY_BUCKETS]; WAKE_ENTRY_REASONS],
+) {
+    (
+        [0; WAKE_ENTRY_REASONS],
+        [0; WAKE_ENTRY_REASONS],
+        [[0; WAKE_LATENCY_BUCKETS]; WAKE_ENTRY_REASONS],
+    )
+}
+
+/// Reschedule IPIs actually put on the wire since boot.
+///
+/// Read next to `wakeup preempt`'s requests and honoured count: a request is
+/// not a kick, so a low honoured ratio means either "the requests were raised
+/// where nothing consumes them" or "the kicks never went out", and those call
+/// for opposite fixes.
+/// (libos has no scheduler of ours and reports zero.)
+#[cfg(target_os = "none")]
+pub fn resched_ipis_sent() -> u64 {
+    executor::resched_ipis_sent()
+}
+
+#[cfg(not(target_os = "none"))]
+pub fn resched_ipis_sent() -> u64 {
+    0
+}
+
 /// `(deadline timer enabled, wake-up preemption enabled)`.
 ///
 /// Both are boot switches (`TIMERDEADLINE=0` / `WAKEPREEMPT=0`). Reporting them

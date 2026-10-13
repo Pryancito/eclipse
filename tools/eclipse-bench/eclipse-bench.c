@@ -6499,6 +6499,27 @@ int main(int argc, char **argv) {
             row("[kernel]", "wakeup preempt honoured",
                 kstat_field(g_kstat_b, "wakeup preempt:", 3), "%",
                 "kernel-side twin of wake late loaded/idle");
+            // Wake-to-run: how long a task that became runnable waited for a
+            // CPU, measured inside the scheduler over THIS window. The mean is
+            // a window mean (total/samples deltas), not the since-boot mean on
+            // the report line, because a boot's worth of idle wakes would
+            // drown out the round trips just driven. Two of these per round
+            // trip, so a mean near half the round trip says the round trip IS
+            // this wait; a mean under a microsecond says it is elsewhere.
+            {
+                double ds = kstat_delta("wake latency:", 0);
+                double dt = kstat_delta("wake latency:", 1);
+                row("[kernel]", "wake-to-run, this window",
+                    (ds > 0 && dt >= 0) ? dt / ds : NA, "ns",
+                    "two per round trip; linux: ~1000-3000");
+                double dsame = kstat_delta("wake latency:", 4);
+                row("[kernel]", "wakes on the waker's CPU",
+                    (ds > 0 && dsame >= 0) ? dsame * 100.0 / ds : NA, "%",
+                    "the rest crossed CPUs");
+                row("[kernel]", "wake-to-run worst, boot",
+                    kstat_field(g_kstat_b, "wake latency:", 3), "us",
+                    "since boot, not this window");
+            }
         }
         printf("  these counters are the kernel's own view of the same events.\n");
         printf("  They need /proc/perf/kernel, so on Linux they are n/a and the\n");

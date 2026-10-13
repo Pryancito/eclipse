@@ -1119,6 +1119,160 @@ pub fn kernel_report() -> String {
             pct,
             suppressed
         );
+        // A request is not a kick: `request_resched` sends an IPI only for a
+        // sleeping target or on the 0->1 transition for a busy one, and never
+        // to itself. Without this number a low honoured ratio cannot be told
+        // apart from a low kick rate, and the two call for opposite fixes.
+        let _ = writeln!(
+            out,
+            "  resched IPIs sent: {} ({:.0}/s)",
+            kernel_hal::kstats::resched_ipis_sent(),
+            rate(kernel_hal::kstats::resched_ipis_sent())
+        );
+    }
+    // How long a task that became runnable waited for a CPU. The one interval
+    // no other line here can see: both ends of it are in the scheduler, on
+    // (usually) different CPUs, and every mechanism between them has already
+    // been measured in isolation at tens of nanoseconds. So if a pipe round
+    // trip costs 186 us, this is where it is, and the SHAPE says what it is
+    // waiting for -- under a microsecond means the wait is elsewhere, the
+    // 64-256 us bands mean a timer is servicing the wake (the LAPIC arm floor
+    // is 200 us), the millisecond bands mean it is waiting out a timeslice.
+    {
+        let (samples, total_ns, worst_ns, same_cpu, cross_cpu, hist) =
+            kernel_hal::kstats::wake_latency_stats();
+        if samples == 0 {
+            let _ = writeln!(
+                out,
+                "wake latency:   no samples (probe off with WAKELAT=0, or no clock installed)"
+            );
+        } else {
+            let mean_us = total_ns as f64 / samples as f64 / 1000.0;
+            let _ = writeln!(
+                out,
+                "wake latency: {} samples, {} ns total, mean {:.1} us, \
+                 worst {:.1} us, {} same-CPU, {} cross-CPU \
+                 (one wake in {} sampled)",
+                samples,
+                total_ns,
+                mean_us,
+                worst_ns as f64 / 1000.0,
+                same_cpu,
+                cross_cpu,
+                kernel_hal::kstats::WAKE_SAMPLE_PERIOD
+            );
+            // The three bands that answer the question directly, so the shape
+            // is readable without counting buckets by eye: a wake serviced at
+            // once, a wake serviced by the LAPIC timer (its arm floor is
+            // 200 us, so the wait lands in 64-256 us), and a wake that waited
+            // out a timeslice. Bands, not buckets, because these three are the
+            // three candidate explanations and nothing in between tells them
+            // apart. Fixed indices: bucket i is [2^(i-1), 2^i) us.
+            let band = |range: core::ops::Range<usize>| -> f64 {
+                let n: u64 = hist[range].iter().sum();
+                n as f64 * 100.0 / samples as f64
+            };
+            let _ = writeln!(
+                out,
+                "  wake latency bands: {:.1}% under 1 us, {:.1}% in 64-256 us \
+                 (timer-serviced), {:.1}% over 1 ms (waiting out a slice)",
+                band(0..1),
+                band(7..9),
+                band(11..kernel_hal::kstats::WAKE_LATENCY_BUCKETS)
+            );
+            // Then the buckets that have anything in them, labelled by their
+            // lower bound. A histogram printed in full is sixteen columns of
+            // zeros around the two that matter.
+            let _ = write!(out, "  wake latency histogram:");
+            let mut shown = 0;
+            for (i, n) in hist.iter().enumerate() {
+                if *n == 0 {
+                    continue;
+                }
+                shown += 1;
+                if i == 0 {
+                    let _ = write!(out, " <1us={}", n);
+                } else if i == hist.len() - 1 {
+                    let _ = write!(out, " >=16ms={}", n);
+                } else {
+                    let _ = write!(out, " {}us={}", 1u64 << (i - 1), n);
+                }
+            }
+            if shown == 0 {
+                let _ = write!(out, " (none)");
+            }
+            let _ = writeln!(out);
+            // What delivered the CPU to each serviced wake. The histogram says
+            // how long wakes wait; this says what they were waiting FOR, and
+            // the two answers want opposite fixes: "out of halt" points at the
+            // timer's arming floor and the IPI path, "after a poll" at
+            // preemption (`RUN_TO_PARITY`, `BASE_SLICE_NS`).
+            //
+            // Each entry carries its own mean, because "most wakes come out of
+            // a halt" and "the wakes out of a halt are the slow ones" are
+            // different findings and a share alone cannot separate them.
+            let (entry_counts, entry_ns, entry_hist) = kernel_hal::kstats::wake_entry_stats();
+            let entry_total: u64 = entry_counts.iter().sum();
+            if entry_total > 0 {
+                for (i, name) in [
+                    "unknown",
+                    "after a poll",
+                    "halt skipped",
+                    "out of halt, kicked",
+                    "resumed",
+                    "out of halt, not kicked",
+                ]
+                .iter()
+                .enumerate()
+                {
+                    if entry_counts[i] == 0 {
+                        continue;
+                    }
+                    let n = entry_counts[i];
+                    let row = &entry_hist[i];
+                    // The median by bucket, which is what the mean next to it
+                    // cannot say: five samples in the top bucket out of a few
+                    // hundred move a mean by hundreds of microseconds, so an
+                    // entry whose typical wake costs tens of microseconds and
+                    // whose worst costs tens of milliseconds reads as
+                    // uniformly slow. Quoted as the band it is, never as a
+                    // number the buckets cannot support.
+                    let mut seen = 0u64;
+                    let mut median = 0usize;
+                    for (b, c) in row.iter().enumerate() {
+                        seen += *c;
+                        if seen * 2 >= n {
+                            median = b;
+                            break;
+                        }
+                    }
+                    let over_ms: u64 = row[11..].iter().sum();
+                    let _ = write!(
+                        out,
+                        "  wake latency, {}: {} samples ({:.1}%), median ",
+                        name,
+                        n,
+                        n as f64 * 100.0 / entry_total as f64,
+                    );
+                    // The band written straight out rather than built as a
+                    // string: this runs on a kernel path and the three shapes
+                    // are the three the buckets have.
+                    if median == 0 {
+                        let _ = write!(out, "<1us");
+                    } else if median == kernel_hal::kstats::WAKE_LATENCY_BUCKETS - 1 {
+                        let _ = write!(out, ">=16ms");
+                    } else {
+                        let _ = write!(out, "{}-{}us", 1u64 << (median - 1), 1u64 << median);
+                    }
+                    let _ = writeln!(
+                        out,
+                        ", mean {:.1} us, {:.1}% over 1 ms",
+                        entry_ns[i] as f64 / n as f64 / 1000.0,
+                        over_ms as f64 * 100.0 / n as f64
+                    );
+                }
+            }
+        }
     }
     // The slice credit: time threads spent frozen off the CPU as a weak-executor
     // frame, which the absolute slice deadline used to charge against their
