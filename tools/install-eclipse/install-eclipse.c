@@ -1180,8 +1180,28 @@ static int prompt_table(struct config *cfg, int running_on_efi) {
         return 0;
     }
 
-    enum table_mode suggested = running_on_efi ? TABLE_GPT : TABLE_MBR;
+    /* Eclipse arranca ÚNICAMENTE por UEFI: su único cargador es rboot, que
+     * es un `BootX64.efi`, y el MBR que escribe este instalador lleva la
+     * tabla y la firma 0x55AA pero NINGÚN código de arranque, porque no hay
+     * cargador de BIOS en todo el árbol. Recomendar MBR por haber arrancado
+     * el medio en legacy -- que es lo que se hacía -- deja un disco que el
+     * firmware no ofrece arrancar, y el usuario lo descubre al reiniciar.
+     *
+     * La sugerencia es GPT/UEFI siempre. Cuando el entorno no es EFI, lo que
+     * hay que cambiar es el modo del firmware, no la tabla de particiones. */
+    enum table_mode suggested = TABLE_GPT;
     log("Entorno de arranque detectado: %s", running_on_efi ? "EFI/UEFI" : "BIOS/Legacy");
+    if (!running_on_efi) {
+        log(COLOR_YELLOW COLOR_BOLD
+            "AVISO: Eclipse arranca únicamente por UEFI; no existe un cargador para BIOS."
+            COLOR_RESET);
+        log(COLOR_YELLOW
+            "  Arranque el medio de instalación en modo UEFI (desactive CSM/Legacy en el"
+            COLOR_RESET);
+        log(COLOR_YELLOW
+            "  firmware) o el disco instalado no aparecerá como opción de arranque."
+            COLOR_RESET);
+    }
     log("Se recomienda %s.", table_label(suggested));
 
     if (cfg->auto_yes) {
@@ -1210,6 +1230,16 @@ static int prompt_table(struct config *cfg, int running_on_efi) {
         } else {
             cfg->table = suggested;
         }
+    }
+
+    if (cfg->table == TABLE_MBR) {
+        /* La partición 1 se marca de tipo 0xEF (EFI System), así que un
+         * firmware en modo UEFI puede arrancar este disco; muchos lo hacen,
+         * pero no todos, y en modo BIOS no arranca ninguno. */
+        log(COLOR_YELLOW COLOR_BOLD
+            "AVISO: con MBR el disco sólo arranca si el firmware está en modo UEFI y acepta"
+            COLOR_RESET);
+        log(COLOR_YELLOW "  una ESP en MBR. GPT/UEFI es lo seguro." COLOR_RESET);
     }
     return 0;
 }
