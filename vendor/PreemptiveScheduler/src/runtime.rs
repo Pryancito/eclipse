@@ -6,7 +6,7 @@ use crate::context::Context;
 use crate::context::ContextData as Context;
 
 use alloc::{boxed::Box, sync::Arc, vec, vec::Vec};
-use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use core::{future::Future, pin::Pin};
 use spin::{Mutex, MutexGuard, Once};
 
@@ -833,6 +833,9 @@ pub(crate) fn note_wake_serviced(packed: u64) {
         WAKE_LAT_CROSS_CPU.fetch_add(1, Ordering::Relaxed);
     }
     WAKE_LAT_MAX_NS.fetch_max(waited, Ordering::Relaxed);
+    let reason = entry_reason();
+    WAKE_ENTRY_COUNT[reason].fetch_add(1, Ordering::Relaxed);
+    WAKE_ENTRY_NS[reason].fetch_add(waited, Ordering::Relaxed);
 }
 
 /// `(samples, total ns, worst ns, serviced on the waker's own CPU, serviced
@@ -853,6 +856,104 @@ pub fn wake_latency_stats() -> (u64, u64, u64, u64, u64, [u64; WAKE_LATENCY_BUCK
         WAKE_LAT_CROSS_CPU.load(Ordering::Relaxed),
         hist,
     )
+}
+
+/// How a CPU came to be looking at its run queue, for the wake it then serves.
+///
+/// The latency histogram says a wake waits tens of microseconds; it cannot say
+/// *what* the wake was waiting for, and the two candidates want opposite
+/// fixes. Either the CPU was halted and the wake waited for an interrupt to
+/// end the halt --- then the timer's arming floor and the IPI path are what to
+/// attack --- or the CPU was busy and the wake waited for whatever it was
+/// running to give the CPU up, which is the preemption side (`RUN_TO_PARITY`,
+/// `BASE_SLICE_NS`). Attributing each serviced wake to the entry that
+/// delivered the CPU separates them, and costs one relaxed store per entry.
+///
+/// Values, as published by [`note_entry_reason`]:
+pub const WAKE_ENTRY_REASONS: usize = 5;
+/// No entry point has published a reason on this CPU yet, or the claim came
+/// from somewhere this crate does not instrument (a steal by a peer, the
+/// collection's own maintenance). Not an error: a bucket that is supposed to
+/// stay small, and says so if it does not.
+pub const WAKE_ENTRY_UNKNOWN: u8 = 0;
+/// The scan follows a task poll that has just returned. The wake waited for a
+/// CPU that was *busy*, so what it waited for is the length of someone else's
+/// turn --- a slice, or a poll that ran long.
+pub const WAKE_ENTRY_AFTER_POLL: u8 = 1;
+/// The scan follows the pre-halt recheck finding work: the CPU was on its way
+/// into `hlt` and the wake caught it in the window. The halt protocol doing
+/// exactly what it is for, and the cheapest way a wake can arrive.
+pub const WAKE_ENTRY_SKIPPED_HALT: u8 = 2;
+/// The scan follows `wait_for_interrupt` returning: the CPU was halted and the
+/// wake waited for an interrupt. This is the bucket whose size decides whether
+/// the next thing to look at is the timer and the IPI, or the slice.
+pub const WAKE_ENTRY_HALT_EXIT: u8 = 3;
+/// The scan follows entering the loop or coming back from a stack switch
+/// (`sched_yield`, a weak-executor turn). Neither waiting for an interrupt nor
+/// waiting out a slice, so it is kept apart from both rather than folded into
+/// whichever looked closest.
+pub const WAKE_ENTRY_RESUMED: u8 = 4;
+
+/// The last entry reason published by each CPU.
+///
+/// Per CPU and a plain relaxed store, for the reason every counter in this
+/// file is: the write sits on the executor's loop, which runs on every poll,
+/// and an RMW on a shared word there would cost more than the whole wake path
+/// it is trying to describe (see [`WAKE_SEEN`]). A lost or stale value only
+/// mis-attributes one sampled wake out of [`WAKE_SAMPLE_PERIOD`].
+static ENTRY_REASON: [AtomicU8; MAX_CORE_NUM] =
+    [const { AtomicU8::new(WAKE_ENTRY_UNKNOWN) }; MAX_CORE_NUM];
+
+/// Publish how this CPU came to be about to look at its run queue.
+///
+/// Unconditional --- it does not test the probe's switch. The store is one
+/// relaxed byte to a line this CPU owns, which is cheaper than the load that
+/// would decide whether to do it, and keeping the value live means a report
+/// taken after the probe is switched on is not blind for its first turn.
+#[inline]
+pub fn note_entry_reason(reason: u8) {
+    let cpu = crate::arch::cpu_id() as usize;
+    if cpu < MAX_CORE_NUM {
+        ENTRY_REASON[cpu].store(reason, Ordering::Relaxed);
+    }
+}
+
+/// This CPU's last published entry reason.
+fn entry_reason() -> usize {
+    let cpu = crate::arch::cpu_id() as usize;
+    if cpu >= MAX_CORE_NUM {
+        return WAKE_ENTRY_UNKNOWN as usize;
+    }
+    let reason = ENTRY_REASON[cpu].load(Ordering::Relaxed) as usize;
+    // A value this crate did not publish reads as unknown rather than
+    // indexing out of the counters: the stats array is sized by the constant
+    // above, and a report must not be able to panic the kernel.
+    if reason < WAKE_ENTRY_REASONS {
+        reason
+    } else {
+        WAKE_ENTRY_UNKNOWN as usize
+    }
+}
+
+static WAKE_ENTRY_COUNT: [AtomicU64; WAKE_ENTRY_REASONS] =
+    [const { AtomicU64::new(0) }; WAKE_ENTRY_REASONS];
+static WAKE_ENTRY_NS: [AtomicU64; WAKE_ENTRY_REASONS] =
+    [const { AtomicU64::new(0) }; WAKE_ENTRY_REASONS];
+
+/// `(samples, total ns)` per entry reason, indexed by the `WAKE_ENTRY_*`
+/// constants.
+///
+/// The totals are there so each entry gets its own mean: "most wakes come out
+/// of a halt" and "the wakes that come out of a halt are the slow ones" are
+/// different findings, and a count alone cannot tell them apart.
+pub fn wake_entry_stats() -> ([u64; WAKE_ENTRY_REASONS], [u64; WAKE_ENTRY_REASONS]) {
+    let mut counts = [0u64; WAKE_ENTRY_REASONS];
+    let mut totals = [0u64; WAKE_ENTRY_REASONS];
+    for i in 0..WAKE_ENTRY_REASONS {
+        counts[i] = WAKE_ENTRY_COUNT[i].load(Ordering::Relaxed);
+        totals[i] = WAKE_ENTRY_NS[i].load(Ordering::Relaxed);
+    }
+    (counts, totals)
 }
 
 /// HAL-registered function that sends a wake IPI to a logical CPU.
@@ -3843,6 +3944,118 @@ mod wake_latency_tests {
         let before = WAKE_LAT_COUNT.load(Ordering::Relaxed);
         note_wake_serviced(0);
         assert_eq!(WAKE_LAT_COUNT.load(Ordering::Relaxed), before);
+    }
+
+    /// Each serviced wake is filed under the entry that delivered the CPU,
+    /// with its own waited time. This is the split the probe was extended for:
+    /// a wake that waited for an interrupt and one that waited out someone
+    /// else's turn have the same latency and opposite fixes.
+    #[test]
+    fn a_serviced_wake_is_filed_under_the_entry_that_delivered_the_cpu() {
+        let _g = super::resched_test_lock();
+        fn clock() -> u64 {
+            51_000
+        }
+        let saved = NOW_NS_HOOK.swap(clock as usize, Ordering::SeqCst);
+        let (counts_before, ns_before) = wake_entry_stats();
+        note_entry_reason(WAKE_ENTRY_HALT_EXIT);
+        note_wake_serviced(pack_wake_stamp(crate::arch::cpu_id(), 1_000));
+        let (counts, ns) = wake_entry_stats();
+        let halt = WAKE_ENTRY_HALT_EXIT as usize;
+        assert_eq!(
+            counts[halt],
+            counts_before[halt] + 1,
+            "the wake was not filed under the halt it came out of"
+        );
+        assert_eq!(
+            ns[halt],
+            ns_before[halt] + 50_000,
+            "the entry's total did not take this wake's wait"
+        );
+        // And a different entry is a different bucket, not the same one again.
+        let poll = WAKE_ENTRY_AFTER_POLL as usize;
+        note_entry_reason(WAKE_ENTRY_AFTER_POLL);
+        note_wake_serviced(pack_wake_stamp(crate::arch::cpu_id(), 1_000));
+        let (counts2, _) = wake_entry_stats();
+        assert_eq!(
+            counts2[poll],
+            counts_before[poll] + 1,
+            "a wake served after a poll was filed elsewhere"
+        );
+        assert_eq!(
+            counts2[halt], counts[halt],
+            "the halt bucket moved on a wake that did not come out of a halt"
+        );
+        NOW_NS_HOOK.store(saved, Ordering::SeqCst);
+    }
+
+    /// A sample the latency probe DROPS must not be attributed either, or the
+    /// two halves of the report stop adding up and the shares are computed
+    /// over a denominator the histogram does not share.
+    #[test]
+    fn a_dropped_sample_is_attributed_to_no_entry() {
+        let _g = super::resched_test_lock();
+        fn frozen() -> u64 {
+            1_000
+        }
+        let saved = NOW_NS_HOOK.swap(frozen as usize, Ordering::SeqCst);
+        let (counts_before, _) = wake_entry_stats();
+        note_entry_reason(WAKE_ENTRY_HALT_EXIT);
+        // Published "later" than the claim reads the clock: dropped.
+        note_wake_serviced(pack_wake_stamp(0, 2_000));
+        // And an unstamped slot, which is the common case.
+        note_wake_serviced(0);
+        let (counts, _) = wake_entry_stats();
+        assert_eq!(
+            counts, counts_before,
+            "a sample the latency probe dropped was still attributed"
+        );
+        NOW_NS_HOOK.store(saved, Ordering::SeqCst);
+    }
+
+    /// A reason this crate never published reads as unknown instead of
+    /// indexing past the counters. The report runs inside the kernel, on a
+    /// path a user can trigger, so it must not be able to panic it.
+    #[test]
+    fn an_entry_reason_this_crate_never_published_reads_as_unknown() {
+        let _g = super::resched_test_lock();
+        fn clock() -> u64 {
+            9_000
+        }
+        let saved = NOW_NS_HOOK.swap(clock as usize, Ordering::SeqCst);
+        let cpu = crate::arch::cpu_id() as usize;
+        let (counts_before, _) = wake_entry_stats();
+        ENTRY_REASON[cpu].store(200, Ordering::Relaxed);
+        assert_eq!(entry_reason(), WAKE_ENTRY_UNKNOWN as usize);
+        note_wake_serviced(pack_wake_stamp(crate::arch::cpu_id(), 1_000));
+        let (counts, _) = wake_entry_stats();
+        let unknown = WAKE_ENTRY_UNKNOWN as usize;
+        assert_eq!(
+            counts[unknown],
+            counts_before[unknown] + 1,
+            "a reason out of range was filed somewhere other than unknown"
+        );
+        note_entry_reason(WAKE_ENTRY_UNKNOWN);
+        NOW_NS_HOOK.store(saved, Ordering::SeqCst);
+    }
+
+    /// Every `WAKE_ENTRY_*` constant has a counter, and they are distinct.
+    /// The report indexes the arrays by them and labels them by position, so a
+    /// constant added without widening `WAKE_ENTRY_REASONS` would silently
+    /// file itself under another entry's name.
+    #[test]
+    fn every_entry_constant_has_its_own_slot() {
+        let all = [
+            WAKE_ENTRY_UNKNOWN,
+            WAKE_ENTRY_AFTER_POLL,
+            WAKE_ENTRY_SKIPPED_HALT,
+            WAKE_ENTRY_HALT_EXIT,
+            WAKE_ENTRY_RESUMED,
+        ];
+        assert_eq!(all.len(), WAKE_ENTRY_REASONS, "a reason without a counter");
+        for (i, r) in all.iter().enumerate() {
+            assert_eq!(*r as usize, i, "the constants are not the array order");
+        }
     }
 
     /// A clock that went backwards between the two CPUs is dropped, not

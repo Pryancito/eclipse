@@ -302,6 +302,33 @@ pub fn wake_latency_stats() -> (u64, u64, u64, u64, u64, [u64; WAKE_LATENCY_BUCK
     (0, 0, 0, 0, 0, [0; WAKE_LATENCY_BUCKETS])
 }
 
+/// Entry reasons in [`wake_entry_stats`], one per `WAKE_ENTRY_*` index.
+///
+/// Spelled and asserted here for the same reason as the bucket count above:
+/// the libos build has to name the same width for its zeros.
+pub const WAKE_ENTRY_REASONS: usize = 5;
+
+#[cfg(target_os = "none")]
+const _: () = assert!(executor::WAKE_ENTRY_REASONS == WAKE_ENTRY_REASONS);
+
+/// `(samples, total ns)` per entry reason: how the CPU that serviced each
+/// sampled wake came to be looking at its run queue.
+///
+/// Read against `wake latency`'s histogram, this is what says whether the wait
+/// was for an interrupt to end a halt or for a busy CPU to give up its turn.
+/// The order is the scheduler's `WAKE_ENTRY_*` constants: unknown, after a
+/// poll, halt skipped by the recheck, out of a halt, resumed.
+/// (libos has no scheduler of ours and reports zeros.)
+#[cfg(target_os = "none")]
+pub fn wake_entry_stats() -> ([u64; WAKE_ENTRY_REASONS], [u64; WAKE_ENTRY_REASONS]) {
+    executor::wake_entry_stats()
+}
+
+#[cfg(not(target_os = "none"))]
+pub fn wake_entry_stats() -> ([u64; WAKE_ENTRY_REASONS], [u64; WAKE_ENTRY_REASONS]) {
+    ([0; WAKE_ENTRY_REASONS], [0; WAKE_ENTRY_REASONS])
+}
+
 /// Reschedule IPIs actually put on the wire since boot.
 ///
 /// Read next to `wakeup preempt`'s requests and honoured count: a request is

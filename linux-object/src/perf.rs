@@ -1202,6 +1202,43 @@ pub fn kernel_report() -> String {
                 let _ = write!(out, " (none)");
             }
             let _ = writeln!(out);
+            // What delivered the CPU to each serviced wake. The histogram says
+            // how long wakes wait; this says what they were waiting FOR, and
+            // the two answers want opposite fixes: "out of halt" points at the
+            // timer's arming floor and the IPI path, "after a poll" at
+            // preemption (`RUN_TO_PARITY`, `BASE_SLICE_NS`).
+            //
+            // Each entry carries its own mean, because "most wakes come out of
+            // a halt" and "the wakes out of a halt are the slow ones" are
+            // different findings and a share alone cannot separate them.
+            let (entry_counts, entry_ns) = kernel_hal::kstats::wake_entry_stats();
+            let entry_total: u64 = entry_counts.iter().sum();
+            if entry_total > 0 {
+                let _ = write!(out, "  wake latency by entry:");
+                for (i, name) in [
+                    "unknown",
+                    "after a poll",
+                    "halt skipped",
+                    "out of halt",
+                    "resumed",
+                ]
+                .iter()
+                .enumerate()
+                {
+                    if entry_counts[i] == 0 {
+                        continue;
+                    }
+                    let _ = write!(
+                        out,
+                        " {}={} ({:.1}%, mean {:.1} us)",
+                        name,
+                        entry_counts[i],
+                        entry_counts[i] as f64 * 100.0 / entry_total as f64,
+                        entry_ns[i] as f64 / entry_counts[i] as f64 / 1000.0
+                    );
+                }
+                let _ = writeln!(out);
+            }
         }
     }
     // The slice credit: time threads spent frozen off the CPU as a weak-executor
