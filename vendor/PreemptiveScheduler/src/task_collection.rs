@@ -1819,7 +1819,10 @@ mod collection_tests {
         // in a page we can no longer name, so the CPU stays awake and the
         // corruption reaches the log through the takers instead of wedging a
         // core on a queue nobody can read.
-        assert!(inner.has_ready(), "a collection we cannot read is not grounds to halt");
+        assert!(
+            inner.has_ready(),
+            "a collection we cannot read is not grounds to halt"
+        );
     }
 
     /// The paths with nowhere to put a `None` still say what happened instead
@@ -2075,7 +2078,10 @@ mod collection_tests {
         );
         {
             let mut inner = tc.get_mut_inner(DEFAULT_PRIORITY);
-            assert_ne!(inner.affine, 0, "the mask is what keeps us off the shortcut");
+            assert_ne!(
+                inner.affine, 0,
+                "the mask is what keeps us off the shortcut"
+            );
             // Out of the slab without anyone putting its bit out.
             inner.slab.remove(0);
             let (notified, _, dropped, borrowed) = inner.pages[0].peek_lanes();
@@ -2090,7 +2096,10 @@ mod collection_tests {
                 "the orphan bit is still published and still marked affine"
             );
         }
-        assert!(tc.has_ready(), "an unresolvable wake is not grounds to halt");
+        assert!(
+            tc.has_ready(),
+            "an unresolvable wake is not grounds to halt"
+        );
     }
 
     /// A claim that comes back empty hands out nothing.
