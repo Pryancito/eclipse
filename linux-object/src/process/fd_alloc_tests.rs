@@ -421,6 +421,41 @@ fn both_ways_round_the_range_find_the_same_descriptors() {
     }
 }
 
+/// A range that starts BELOW zero finds the same descriptors whichever way
+/// round it is walked, which is the one case where the two disagreed.
+///
+/// The range walk counted in `usize`, where a negative `first` is about 2^64,
+/// so `[-1, 1]` came out EMPTY -- while the table walk, which compares
+/// descriptors, still found 0 and 1 in it. Which of the two runs is decided
+/// by the size of the table, so the answer changed with how many files the
+/// process happened to have open: that is what makes this worth a test of its
+/// own rather than a note. Found by Copilot on #1856.
+///
+/// The syscall cannot ask for this (`close_range_action` answers `EINVAL`
+/// when the raw arguments run backwards), so the caller it protects is an
+/// in-kernel one.
+#[test]
+fn a_range_that_starts_below_zero_finds_the_same_descriptors_both_ways() {
+    // Two tables, chosen so that the SAME range takes a different branch in
+    // each: the range `[-1, 1]` is three numbers wide, so a table with three
+    // or more descriptors open takes the range walk and a smaller one takes
+    // the table walk.
+    let wide = a_process();
+    open_n(&wide, 8);
+    let narrow = a_process();
+    open_n(&narrow, 2);
+    for (proc, what) in [(&wide, "the range walk"), (&narrow, "the table walk")] {
+        let inner = proc.inner.lock();
+        let mut got: Vec<i32> = inner
+            .open_fds_in_range(FileDesc::from(-1), FileDesc::from(1))
+            .iter()
+            .map(|fd| i32::from(*fd))
+            .collect();
+        got.sort_unstable();
+        assert_eq!(got, vec![0, 1], "{what}");
+    }
+}
+
 /// An empty range (`last` below `first`) is not a sweep of everything, which
 /// is what a width computed without a floor would turn it into.
 #[test]
