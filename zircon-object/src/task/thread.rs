@@ -1,8 +1,17 @@
+mod published_state;
+/// That the word the return path reads is never wrong; see the module notes.
+#[cfg(test)]
+mod published_state_tests;
 mod thread_state;
 
 /// Lo que un hilo de calculo paga en cada tick; ver las notas del modulo.
 #[cfg(test)]
 mod sched_benches;
+
+/// Lo que el retorno de cada syscall paga por preguntar el estado del hilo;
+/// ver las notas del modulo.
+#[cfg(test)]
+mod return_path_benches;
 
 pub use self::thread_state::ThreadStateKind;
 
@@ -545,6 +554,10 @@ pub struct Thread {
     /// See [`Thread::record_ext_birth`].
     ext_born: [AtomicUsize; 2],
     inner: Mutex<ThreadInner>,
+    /// The answer of [`ThreadInner::state`], published outside the lock so
+    /// that the return path of every syscall does not have to take it three
+    /// times. See [`published_state`].
+    state_published: AtomicU32,
     exceptionate: Arc<Exceptionate>,
     /// CPU affinity mask: bit `i` set means this thread may run on logical
     /// CPU `i`. Shared with the scheduler (handed to `spawn_with_affinity`)
@@ -743,6 +756,9 @@ impl Thread {
                 context: Some(Box::new(UserContext::new())),
                 ..Default::default()
             }),
+            // `ThreadInner::state` of a newborn thread, with a context and no
+            // suspensions, is its own `state` field, i.e. `New`.
+            state_published: AtomicU32::new(ThreadState::New as u32),
             affinity: Arc::new(AtomicU64::new(u64::MAX)),
             sched: SchedAttr::default(),
             current_syscall: AtomicU32::new(0),
@@ -815,7 +831,7 @@ impl Thread {
     where
         F: FnOnce(&mut UserContext) -> T,
     {
-        let mut inner = self.inner.lock();
+        let mut inner = self.lock_inner();
         if let Some(ctx) = inner.context.as_mut() {
             Ok(f(ctx))
         } else {
@@ -825,20 +841,19 @@ impl Thread {
 
     /// Backup current user context before calling signal handler
     pub fn backup_context(&self, context: UserContext, siginfo: usize, uctx: usize) {
-        let mut inner = self.inner.lock();
+        let mut inner = self.lock_inner();
         inner.backup_context(context, siginfo, uctx);
     }
 
     /// Fetch the context backup
     pub fn fetch_backup_context(&self) -> Option<(UserContext, usize, usize)> {
-        let mut inner = self.inner.lock();
+        let mut inner = self.lock_inner();
         inner.context_before.take()
     }
 
     /// Start execution on the thread.
     pub fn start(self: &Arc<Self>, thread_fn: ThreadFn) -> ZxResult {
-        self.inner
-            .lock()
+        self.lock_inner()
             .change_state(ThreadState::Running, &self.base);
         let current = CurrentThread(self.clone());
         let future = thread_fn(current);
@@ -1132,7 +1147,7 @@ impl Thread {
         // interrupts off. A woken task that reaches back for `inner` -- reading
         // its state, or terminating -- is a CPU that does not come back.
         let (waker, killer) = {
-            let mut inner = self.inner.lock();
+            let mut inner = self.lock_inner();
             if inner.state == ThreadState::Dead {
                 return;
             }
@@ -1159,7 +1174,7 @@ impl Thread {
 
     /// Read one aspect of thread state.
     pub fn read_state(&self, kind: ThreadStateKind, buf: &mut [u8]) -> ZxResult<usize> {
-        let inner = self.inner.lock();
+        let inner = self.lock_inner();
         let state = inner.state();
         if state != ThreadState::BlockedException && state != ThreadState::Suspended {
             if inner.exception.is_some() {
@@ -1173,7 +1188,7 @@ impl Thread {
 
     /// Write one aspect of thread state.
     pub fn write_state(&self, kind: ThreadStateKind, buf: &[u8]) -> ZxResult {
-        let mut inner = self.inner.lock();
+        let mut inner = self.lock_inner();
         let state = inner.state();
         if state != ThreadState::BlockedException && state != ThreadState::Suspended {
             if inner.exception.is_some() {
@@ -1187,7 +1202,7 @@ impl Thread {
 
     /// Get the thread's information.
     pub fn get_thread_info(&self) -> ThreadInfo {
-        let inner = self.inner.lock();
+        let inner = self.lock_inner();
         ThreadInfo {
             state: inner.state() as u32,
             wait_exception_channel_type: inner
@@ -1204,7 +1219,7 @@ impl Thread {
 
     /// Get the thread's exception report.
     pub fn get_thread_exception_info(&self) -> ZxResult<ExceptionReport> {
-        let inner = self.inner.lock();
+        let inner = self.lock_inner();
         if inner.state() != ThreadState::BlockedException {
             return Err(ZxError::BAD_STATE);
         }
@@ -1234,11 +1249,6 @@ impl Thread {
             0 => None,
             n => Some(n - 1),
         }
-    }
-
-    /// Get the thread state.
-    pub fn state(&self) -> ThreadState {
-        self.inner.lock().state()
     }
 
     /// Mark this thread blocked in a syscall, or running again.
@@ -1273,7 +1283,7 @@ impl Thread {
     /// Returns whether it actually changed anything, so the caller knows
     /// whether it owes an unmark.
     pub fn set_blocked(&self, blocked: bool) -> bool {
-        let mut inner = self.inner.lock();
+        let mut inner = self.lock_inner();
         let (from, to) = if blocked {
             (ThreadState::Running, ThreadState::Blocked)
         } else {
@@ -1340,22 +1350,22 @@ impl Thread {
 
     /// Set this thread as the first thread of a process.
     pub(super) fn set_first_thread(&self) {
-        self.inner.lock().first_thread = true;
+        self.lock_inner().first_thread = true;
     }
 
     /// Whether this thread is the first thread of a process.
     pub fn is_first_thread(&self) -> bool {
-        self.inner.lock().first_thread
+        self.lock_inner().first_thread
     }
 
     /// Get the thread's flags.
     pub fn flags(&self) -> ThreadFlag {
-        self.inner.lock().flags
+        self.lock_inner().flags
     }
 
     /// Apply `f` to the thread's flags.
     pub fn update_flags(&self, f: impl FnOnce(&mut ThreadFlag)) {
-        f(&mut self.inner.lock().flags)
+        f(&mut self.lock_inner().flags)
     }
 
     /// Terminate the current running thread.
@@ -1369,8 +1379,7 @@ impl Thread {
     /// come back. The process side let go too, so neither order exists now.
     fn terminate(&self) {
         self.exceptionate.shutdown();
-        self.inner
-            .lock()
+        self.lock_inner()
             .change_state(ThreadState::Dead, &self.base);
         // Credit this thread's CPU time to the process before the thread
         // disappears from its list, so process-level accounting
@@ -1403,7 +1412,7 @@ impl Thread {
     /// like this there is no way to ask whether `stop` wakes with `inner` held.
     #[cfg(test)]
     pub fn set_waker_for_test(&self, waker: core::task::Waker) {
-        self.inner.lock().waker = Some(waker);
+        self.lock_inner().waker = Some(waker);
     }
 }
 
@@ -1413,14 +1422,14 @@ impl Task for Thread {
     }
 
     fn suspend(&self) {
-        let mut inner = self.inner.lock();
+        let mut inner = self.lock_inner();
         inner.suspend_count += 1;
         let state = inner.state;
         inner.change_state(state, &self.base);
     }
 
     fn resume(&self) {
-        let mut inner = self.inner.lock();
+        let mut inner = self.lock_inner();
         // A resume with no suspend behind it used to be an `assert_ne!`, which
         // is a kernel panic. It is reachable: `Process::suspend` counts on
         // every thread the process holds at that moment and `Process::resume`
@@ -1496,7 +1505,7 @@ impl CurrentThread {
             type Output = Box<UserContext>;
 
             fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
-                let mut inner = self.thread.inner.lock();
+                let mut inner = self.thread.lock_inner();
                 if inner.state() != ThreadState::Suspended {
                     // resume:  return the context token from thread object
                     // There is no need to call change_state here
@@ -1516,7 +1525,7 @@ impl CurrentThread {
 
     /// The thread ends running and takes back the context.
     pub fn put_context(&self, context: Box<UserContext>) {
-        let mut inner = self.inner.lock();
+        let mut inner = self.lock_inner();
         inner.context = Some(context);
         // Re-running `change_state` with the state it already has is not a
         // no-op in general: `ThreadInner::state()` reports `Suspended` only once
@@ -1549,7 +1558,7 @@ impl CurrentThread {
         FT: IntoResult<T>,
     {
         let (old_state, killed) = {
-            let mut inner = self.inner.lock();
+            let mut inner = self.lock_inner();
             if inner.state() == ThreadState::Dying {
                 return Err(ZxError::STOP);
             }
@@ -1573,7 +1582,7 @@ impl CurrentThread {
                 _ = kernel_hal::thread::sleep_until(deadline).fuse() => Err(ZxError::TIMED_OUT),
             }
         };
-        let mut inner = self.inner.lock();
+        let mut inner = self.lock_inner();
         inner.killer = None;
         if inner.state() == ThreadState::Dying {
             return ret;
@@ -1586,7 +1595,7 @@ impl CurrentThread {
     /// Create an exception on this thread and wait for the handling.
     pub async fn handle_exception(&self, type_: ExceptionType) {
         let exception = {
-            let mut inner = self.inner.lock();
+            let mut inner = self.lock_inner();
             let cx = if !type_.is_synth() {
                 inner.context.as_ref().map(|cx| cx.as_ref())
             } else {
@@ -1620,7 +1629,7 @@ impl CurrentThread {
             .await
             .ok();
         }
-        self.inner.lock().exception = None;
+        self.lock_inner().exception = None;
     }
 
     /// Run a blocking task when the thread is exited itself and dying.
@@ -1632,7 +1641,7 @@ impl CurrentThread {
         FT: IntoResult<T>,
     {
         let killed = {
-            let mut inner = self.inner.lock();
+            let mut inner = self.lock_inner();
             if inner.killed {
                 return Err(ZxError::STOP);
             }
@@ -3201,7 +3210,7 @@ mod state_and_accounting_tests {
     fn a_suspended_thread_still_reports_what_stopped_it() {
         let t = a_thread();
         {
-            let mut inner = t.inner.lock();
+            let mut inner = t.lock_inner();
             inner.suspend_count = 1;
             inner.state = ThreadState::BlockedException;
         }
@@ -3211,21 +3220,21 @@ mod state_and_accounting_tests {
             "a suspend hid the exception the thread is stopped in"
         );
 
-        t.inner.lock().state = ThreadState::BlockedChannel;
+        t.lock_inner().state = ThreadState::BlockedChannel;
         assert_eq!(
             t.state(),
             ThreadState::Suspended,
             "a plain blocked thread under a suspend reports the suspend"
         );
 
-        t.inner.lock().state = ThreadState::Dying;
+        t.lock_inner().state = ThreadState::Dying;
         assert_eq!(
             t.state(),
             ThreadState::Dying,
             "a dying thread outranks the suspend over it"
         );
 
-        t.inner.lock().suspend_count = 0;
+        t.lock_inner().suspend_count = 0;
         assert_eq!(t.state(), ThreadState::Dying);
     }
 
@@ -3234,7 +3243,7 @@ mod state_and_accounting_tests {
     #[test]
     fn a_thread_with_no_context_is_never_reported_suspended() {
         let t = a_thread();
-        let mut inner = t.inner.lock();
+        let mut inner = t.lock_inner();
         inner.suspend_count = 3;
         inner.state = ThreadState::Running;
         inner.context = None;
@@ -3248,7 +3257,7 @@ mod state_and_accounting_tests {
     fn every_transition_leaves_exactly_the_signals_that_still_hold() {
         let t = a_thread();
 
-        t.inner.lock().change_state(ThreadState::Running, &t.base);
+        t.lock_inner().change_state(ThreadState::Running, &t.base);
         let s = t.base.signal();
         assert!(s.contains(Signal::THREAD_RUNNING));
         assert!(!s.contains(Signal::THREAD_SUSPENDED));
@@ -3273,7 +3282,7 @@ mod state_and_accounting_tests {
             "a resumed thread still looked suspended to anyone waiting"
         );
 
-        t.inner.lock().change_state(ThreadState::Dead, &t.base);
+        t.lock_inner().change_state(ThreadState::Dead, &t.base);
         let s = t.base.signal();
         assert!(s.contains(Signal::THREAD_TERMINATED));
         assert!(!s.contains(Signal::THREAD_RUNNING));
@@ -3287,10 +3296,10 @@ mod state_and_accounting_tests {
     #[test]
     fn a_dying_thread_publishes_none_of_the_three_signals() {
         let t = a_thread();
-        t.inner.lock().change_state(ThreadState::Dead, &t.base);
+        t.lock_inner().change_state(ThreadState::Dead, &t.base);
         assert!(t.base.signal().contains(Signal::THREAD_TERMINATED));
 
-        t.inner.lock().change_state(ThreadState::Dying, &t.base);
+        t.lock_inner().change_state(ThreadState::Dying, &t.base);
         let s = t.base.signal();
         assert!(
             !s.contains(Signal::THREAD_TERMINATED),
@@ -3312,9 +3321,9 @@ mod state_and_accounting_tests {
     #[test]
     fn the_generic_blocked_marker_defers_to_every_more_specific_state() {
         let t = a_thread();
-        t.inner.lock().state = ThreadState::Running;
+        t.lock_inner().state = ThreadState::Running;
         assert!(t.set_blocked(true), "a running thread blocks");
-        assert_eq!(t.inner.lock().state, ThreadState::Blocked);
+        assert_eq!(t.lock_inner().state, ThreadState::Blocked);
 
         assert!(
             !t.set_blocked(true),
@@ -3322,7 +3331,7 @@ mod state_and_accounting_tests {
         );
 
         assert!(t.set_blocked(false), "and the generic block comes back");
-        assert_eq!(t.inner.lock().state, ThreadState::Running);
+        assert_eq!(t.lock_inner().state, ThreadState::Running);
 
         for specific in [
             ThreadState::BlockedFutex,
@@ -3333,7 +3342,7 @@ mod state_and_accounting_tests {
             ThreadState::New,
             ThreadState::Suspended,
         ] {
-            t.inner.lock().state = specific;
+            t.lock_inner().state = specific;
             assert!(
                 !t.set_blocked(true),
                 "{:?} was overwritten by the generic blocked marker",
@@ -3344,7 +3353,7 @@ mod state_and_accounting_tests {
                 "{:?} was resurrected into Running by an unblock",
                 specific
             );
-            assert_eq!(t.inner.lock().state, specific, "{:?} moved", specific);
+            assert_eq!(t.lock_inner().state, specific, "{:?} moved", specific);
         }
     }
 
