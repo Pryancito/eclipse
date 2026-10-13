@@ -378,6 +378,20 @@ const DEFAULT_PACKAGES: &[&str] = &[
     // an id-and-class scan (`devices/`, `vendor`, `device`, `class`) are the
     // ones the kernel's `/sys/bus/pci` already publishes for libdrm.
     "pciutils-libs",
+    // ── The image viewer ────────────────────────────────────────────────────
+    // Until this was here, lunarfile's opener table pointed every image format
+    // at `eclipse-firefox`: a PNG opened a browser tab, with the whole engine
+    // behind it, to show one picture. swayimg is a Wayland image viewer of
+    // roughly the shape of this tree's own clients (wl_shm, no toolkit), and
+    // its decoders come from libraries the image already carries for other
+    // reasons -- libpng, libjpeg-turbo and librsvg are all in this closure
+    // already. The `eclipse-view` wrapper (desktop.rs) is what the table names,
+    // so an image built without this package still opens images in the browser.
+    //
+    // It has no X11 backend: on the X session the wrapper's browser fallback is
+    // what runs, which is why the wrapper checks WAYLAND_DISPLAY rather than
+    // just `command -v`.
+    "swayimg",
 ];
 
 /// Whether the build is running as root (euid 0), via `id -u` — no extra crate
@@ -2135,6 +2149,28 @@ mod tests {
             assert!(
                 DEFAULT_PACKAGES.contains(&p),
                 "{p} is part of the shipped Freedoom stack"
+            );
+        }
+    }
+
+    /// The image viewer has to be in the shipped set and reach the live root,
+    /// because the alternative is what the opener table used to do: a PNG
+    /// opened a whole browser tab. `usr/bin` is where the binary lands.
+    #[test]
+    fn the_image_ships_an_image_viewer() {
+        assert!(
+            DEFAULT_PACKAGES.contains(&"swayimg"),
+            "the opener table points images at eclipse-view, whose first choice \
+             is swayimg; without the package every image falls back to Firefox"
+        );
+        assert!(X_TREES.contains(&"usr/bin"), "the binary lands in usr/bin");
+        assert!(LIVE_TREES.contains(&"usr/bin"));
+        // Its decoders are libraries the image already carries, so adding the
+        // viewer does not add a decoder stack of its own.
+        for lib in ["libpng", "librsvg"] {
+            assert!(
+                DEFAULT_PACKAGES.contains(&lib),
+                "{lib} is part of what decodes an image here"
             );
         }
     }

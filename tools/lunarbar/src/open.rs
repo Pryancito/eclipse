@@ -21,15 +21,17 @@
 
 /// What the built-in table opens, by lower-cased extension.
 ///
-/// Two commands carry most of it, and both are image wrappers rather than
+/// Three commands carry most of it, and all three are wrappers rather than
 /// programs, for the same reason `eclipse-terminal` is one: what is installed
 /// varies. `eclipse-edit` is the editor in a terminal (nano if the image has
 /// it, busybox `vi` otherwise — busybox always has `vi`, so that path cannot
-/// fail), and `eclipse-firefox` is the image's only renderer of HTML, PDF, SVG
-/// and images, so a browser tab is the viewer. The wrapper, never `firefox`
-/// itself: it is what picks software WebRender over NVK on the GPU-less path
-/// (plain `firefox` can draw a black window there) and what finds
-/// `firefox-esr` on an image that has only that.
+/// fail). `eclipse-view` is the image viewer: swayimg on the Wayland session,
+/// and the browser anywhere else, because swayimg has no X11 backend. And
+/// `eclipse-firefox` renders HTML, PDF and SVG, and is what every image used
+/// to open in before there was a viewer in the image. The wrapper, never
+/// `firefox` itself: it is what picks software WebRender over NVK on the
+/// GPU-less path (plain `firefox` can draw a black window there) and what
+/// finds `firefox-esr` on an image that has only that.
 ///
 /// An entry naming a program that is not installed is not silently launched:
 /// `lunarfile` checks the command exists before spawning and says so on the
@@ -60,13 +62,21 @@ pub const BUILTIN: &[(&str, &str)] = &[
     ("pdf", "eclipse-firefox %f"),
     ("svg", "eclipse-firefox %f"),
     ("xml", "eclipse-firefox %f"),
-    // Images: Firefox again, there being no image viewer in the image.
-    ("png", "eclipse-firefox %f"),
-    ("jpg", "eclipse-firefox %f"),
-    ("jpeg", "eclipse-firefox %f"),
-    ("gif", "eclipse-firefox %f"),
-    ("bmp", "eclipse-firefox %f"),
-    ("webp", "eclipse-firefox %f"),
+    // Images: the viewer wrapper, which is swayimg on the Wayland session and
+    // the browser anywhere else. A picture used to open a whole browser tab.
+    ("png", "eclipse-view %f"),
+    ("jpg", "eclipse-view %f"),
+    ("jpeg", "eclipse-view %f"),
+    ("gif", "eclipse-view %f"),
+    ("bmp", "eclipse-view %f"),
+    ("webp", "eclipse-view %f"),
+    // The formats swayimg decodes that the browser also renders, so the
+    // wrapper's fallback covers them too: AVIF and the TIFF/PNM family.
+    ("avif", "eclipse-view %f"),
+    ("tif", "eclipse-view %f"),
+    ("tiff", "eclipse-view %f"),
+    ("ico", "eclipse-view %f"),
+    ("pnm", "eclipse-view %f"),
     // Audio: wavplay is this tree's own player; mpg123 plays the boot chime.
     ("wav", "wavplay %f"),
     ("mp3", "mpg123 %f"),
@@ -269,7 +279,7 @@ vacio=
         // Case does not matter on the way in either.
         assert_eq!(
             handler_for("FOTO.JPG", &[]).as_deref(),
-            Some("eclipse-firefox %f")
+            Some("eclipse-view %f")
         );
     }
 
@@ -290,24 +300,42 @@ vacio=
             assert!(cmd.contains("%f"), "{ext} -> {cmd} never gets the file");
             assert!(program_of(cmd).is_some(), "{ext} -> {cmd} names no program");
         }
-        // The four programs the table is allowed to name, so an entry pointing
+        // The five programs the table is allowed to name, so an entry pointing
         // at something this image does not ship is a visible line in the diff.
-        // `eclipse-firefox` and not `firefox`: every activation path in the
-        // image is required to go through that wrapper (see
-        // `xtask/src/linux/desktop.rs`), and bypassing it loses both the
-        // renderer choice and the ESR fallback.
+        // `eclipse-firefox` and not `firefox`, `eclipse-view` and not
+        // `swayimg`: every activation path in the image is required to go
+        // through a wrapper (see `xtask/src/linux/desktop.rs`), and bypassing
+        // one loses what the wrapper is for -- the renderer choice and the ESR
+        // fallback for the browser, and for the viewer the fact that swayimg
+        // has no X11 backend and nothing to show without a Wayland display.
         let progs: Vec<&str> = BUILTIN.iter().filter_map(|(_, c)| program_of(c)).collect();
         for p in &progs {
             assert!(
-                ["eclipse-edit", "eclipse-firefox", "wavplay", "mpg123"].contains(p),
+                [
+                    "eclipse-edit",
+                    "eclipse-firefox",
+                    "eclipse-view",
+                    "wavplay",
+                    "mpg123"
+                ]
+                .contains(p),
                 "{p} is not one of the image's openers"
             );
         }
-        // And the browser is never named directly, whatever the extension.
-        assert!(
-            !progs.contains(&"firefox") && !progs.contains(&"firefox-esr"),
-            "una entrada se salta el envoltorio eclipse-firefox: {progs:?}"
-        );
+        // And neither the browser nor the viewer is ever named directly,
+        // whatever the extension.
+        for direct in ["firefox", "firefox-esr", "swayimg", "imv"] {
+            assert!(
+                !progs.contains(&direct),
+                "una entrada se salta su envoltorio nombrando {direct}: {progs:?}"
+            );
+        }
+        // Every image format goes to the viewer, not to the browser: a picture
+        // opening a browser tab is what this wrapper exists to stop.
+        for ext in ["png", "jpg", "jpeg", "gif", "bmp", "webp", "avif"] {
+            let cmd = BUILTIN.iter().find(|(e, _)| *e == ext).expect(ext).1;
+            assert_eq!(program_of(cmd), Some("eclipse-view"), "{ext} -> {cmd}");
+        }
     }
 
     #[test]
