@@ -281,6 +281,9 @@ fn a_forked_child_sees_its_parent_hole() {
             root_inode: parent.root_inode().clone(),
             parent: Mutex::new(Weak::default()),
             vt: 0,
+            // A fresh child: nothing is pending at the process level and it is
+            // not job-stopped, so the mirror the exit path reads starts empty,
+            // exactly as both real constructors leave it.
             exit_path: Default::default(),
             perf: crate::perf::ProcPerf::new(),
             futexes: Default::default(),

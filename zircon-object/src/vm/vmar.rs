@@ -324,8 +324,13 @@ mod aspace_window {
     pub const SIZE: usize = 0x1_0000_0000;
     #[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
     pub const BASE: usize = 0x2_0000_0000;
+    /// 64 GiB apiece. It was a TiB, which left only 127 windows, and the test
+    /// suites had crept to within one process of that wall: one more test
+    /// holding a process alive took `linux-object` from green to 75 failures,
+    /// every one of them the assert below. A hosted process maps a few
+    /// megabytes near the bottom of its window, never a terabyte.
     #[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
-    pub const SIZE: usize = 0x100_0000_0000;
+    pub const SIZE: usize = 0x10_0000_0000;
 
     /// The first window index whose base the host would refuse.
     ///

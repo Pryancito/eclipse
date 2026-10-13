@@ -323,6 +323,79 @@ fn comm_from_path(path: &str) -> &str {
     path.rsplit('/').next().unwrap_or(path)
 }
 
+/// Proof that `execve` has run out of ways to refuse its caller.
+///
+/// One of these is built by [`execve_preflight`] -- the LAST check of
+/// `sys_execve` that can come back as an ordinary errno -- and demanded by
+/// [`de_thread`], the FIRST step of the same syscall that cannot be undone.
+/// Since the checks run in sequence, holding one is proof that all of them
+/// passed, and `de_thread` moved back above any of them would not compile:
+/// there would be nothing to build this from yet.
+///
+/// It is a type and not a comment because the order was wrong for as long as
+/// this function existed and read as correct either way. The two halves are
+/// hundreds of lines apart, both are spelled as plain statements, and the
+/// cost of getting it backwards is not visible anywhere near the mistake --
+/// it is a program that answers `ENOENT` with its thread group already gone.
+#[must_use]
+struct ExecPreflight(());
+
+/// Walk the shebang interpreter chain of the image `execve` is about to run,
+/// while the caller is still whole.
+///
+/// `head` is the first bytes of the file, `root_inode` the process's root for
+/// resolving an interpreter path. Takes no process and no thread on purpose:
+/// what it can reach is the whole of what makes it safe to run before
+/// [`de_thread`], so the signature is the guarantee and not the comment.
+fn execve_preflight(
+    head: &[u8],
+    syscall_entry: VirtAddr,
+    root_inode: &Arc<dyn rcore_fs::vfs::INode>,
+) -> LxResult<ExecPreflight> {
+    LinuxElfLoader {
+        syscall_entry,
+        stack_pages: USER_STACK_PAGES,
+        root_inode: root_inode.clone(),
+        // Preflight walks the shebang chain and builds no stack, so there is
+        // no aux vector to be right about here -- and there could not be one
+        // yet: the set-user-ID transition that decides it has not happened.
+        identity: Default::default(),
+    }
+    .preflight_interpreters(head)?;
+    Ok(ExecPreflight(()))
+}
+
+/// Mark every thread of `proc` except `me` as dying, and hand them back so
+/// their deaths can be waited for.
+///
+/// Split out of [`de_thread`] because this half is where the caller is picked
+/// out of the list, and picking the wrong one means `execve` kills the thread
+/// that asked for it.
+fn kill_siblings(proc: &Arc<Process>, me: KoID) -> Vec<Arc<Thread>> {
+    let mut siblings = Vec::new();
+    for t in proc.threads() {
+        if t.id() == me {
+            continue;
+        }
+        zircon_object::task::Task::kill(t.as_ref());
+        siblings.push(t);
+    }
+    siblings
+}
+
+/// Linux's `de_thread()`: `execve` leaves the calling thread alone in its
+/// process before the address space is replaced.
+///
+/// Waits for each sibling to actually be gone, not merely to be marked: the
+/// loader is about to remap, and a sibling still walking the old page tables
+/// is the fault this exists to prevent.
+async fn de_thread(proc: &Arc<Process>, me: KoID, _past_every_check: &ExecPreflight) {
+    for t in kill_siblings(proc, me) {
+        let obj: Arc<dyn KernelObject> = t;
+        obj.wait_signal(Signal::THREAD_TERMINATED).await;
+    }
+}
+
 /// The signal the parent is to get when this child exits, out of a legacy
 /// `clone` flags word.
 ///
@@ -1259,28 +1332,6 @@ impl Syscall<'_> {
             warn!("execve: argv[0] is empty for path {:?}", path_str);
         }
 
-        // POSIX/Linux: execve in a multithreaded process kills every other
-        // thread in the group before the address space is replaced. Leaving
-        // them alive ran the old RIP/stack against the new image. Wait until
-        // they are gone: otherwise the loader remaps while a sibling still
-        // walks the old page tables.
-        {
-            let proc = self.zircon_process();
-            let me = self.thread.id();
-            let mut siblings = alloc::vec::Vec::new();
-            for t in proc.threads() {
-                if t.id() == me {
-                    continue;
-                }
-                zircon_object::task::Task::kill(t.as_ref());
-                siblings.push(t);
-            }
-            for t in siblings {
-                let obj: Arc<dyn KernelObject> = t;
-                obj.wait_signal(Signal::THREAD_TERMINATED).await;
-            }
-        }
-
         // Read program file
         let proc = self.linux_process();
         // ROOT-CAUSE FIX for the "intermittent" kernel corruption (see
@@ -1351,21 +1402,30 @@ impl Syscall<'_> {
         // ordinary ENOENT and the shell reports "not found" instead of the
         // process dying on the instruction after the syscall. Linux draws the
         // same line: the `bprm` is fully built before `begin_new_exec` commits.
-        {
+        let past_every_check = {
             let mut head = [0u8; 512];
             let n = inode.read_at(0, &mut head).unwrap_or(0);
-            LinuxElfLoader {
-                syscall_entry: self.syscall_entry,
-                stack_pages: USER_STACK_PAGES,
-                root_inode: proc.root_inode().clone(),
-                // Preflight walks the shebang chain and builds no stack, so
-                // there is no aux vector to be right about here -- and there
-                // could not be one yet: the set-user-ID transition that
-                // decides it has not happened.
-                identity: Default::default(),
-            }
-            .preflight_interpreters(&head[..n])?;
-        }
+            execve_preflight(&head[..n], self.syscall_entry, proc.root_inode())?
+        };
+
+        // POSIX/Linux: execve in a multithreaded process kills every other
+        // thread in the group before the address space is replaced. Leaving
+        // them alive ran the old RIP/stack against the new image. Wait until
+        // they are gone: otherwise the loader remaps while a sibling still
+        // walks the old page tables.
+        //
+        // HERE, and not at the top of this function, which is where it used to
+        // be -- above the path lookup, the execute-permission check, the
+        // `noexec` verdict and the shebang walk. Every one of those four is an
+        // ordinary errno this function hands straight back to the caller, and
+        // all four used to be answered by a process that had already lost every
+        // thread but this one. `execve("/does/not/exist")` from anything
+        // threaded -- a JVM, a `tokio` server, a supervisor exec'ing a binary
+        // its config names wrongly -- came back ENOENT to a program that was no
+        // longer the program that asked. Linux calls `de_thread()` from
+        // `begin_new_exec()`, after the `bprm` is built, for this reason; see
+        // [`ExecPreflight`], which is what makes the order hold.
+        de_thread(self.zircon_process(), self.thread.id(), &past_every_check).await;
 
         proc.remove_cloexec_files();
         // POSIX: caught signals are reset to their default disposition across
@@ -2862,6 +2922,8 @@ pub(crate) fn clone3_to_clone(words: [u64; 8]) -> LxResult<Clone3Args> {
 #[cfg(test)]
 mod abi_tests;
 
+#[cfg(test)]
+mod exec_order_tests;
 #[cfg(test)]
 mod exit_signal_tests;
 #[cfg(test)]
