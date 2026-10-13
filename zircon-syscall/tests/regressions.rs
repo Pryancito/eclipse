@@ -881,6 +881,76 @@ fn process_read_memory_reads_past_one_kernel_buffer_in_order() {
     });
 }
 
+/// `zx_thread_raise_exception` existed only as a syscall number: it answered
+/// `NOT_SUPPORTED` for everything, which hung `UserExceptionsTest.Delivered`
+/// in the core suite -- the test's main thread waits on the exception channel
+/// for an exception the call could never raise, so the whole run sat there
+/// until the 90 s timeout killed it.
+///
+/// These are the three rejections, all `INVALID_ARGS`, each against a request
+/// that is otherwise valid so a blanket rejection cannot pass: the job
+/// debugger is the only target, `ZX_EXCP_USER` the only type, and the context
+/// is not optional. Nobody listening is **not** one of them, and that half is
+/// covered where the exception itself lives, by
+/// `zircon_object`'s `a_user_exception_nobody_listens_to_leaves_the_process_alone`:
+/// it cannot be asserted from one poll here, because the successful path
+/// parks the thread in `BlockedException` and comes back `Pending`.
+///
+/// It goes through `Syscall::syscall` rather than calling the method, so the
+/// number the dispatcher routes on is part of what is tested: the whole bug
+/// was a number with nothing behind it.
+#[test]
+fn raising_a_user_exception_rejects_only_what_zircon_rejects() {
+    const RAISE_EXCEPTION: u32 = 167;
+    const JOB_DEBUGGER: usize = 1;
+    const EXCP_USER: usize = 0x309 | 0x8000;
+    const FATAL_PAGE_FAULT: usize = 0x108;
+
+    with_test_thread(|ct| {
+        let mut sc = Syscall {
+            thread: &ct,
+            thread_fn: finish_thread,
+        };
+        let context = map_user_memory(&ct);
+        let mut raise = |target: usize, type_: usize, ctx: usize| {
+            let mut f = Box::pin(sc.syscall(RAISE_EXCEPTION, [target, type_, ctx, 0, 0, 0, 0, 0]));
+            f.as_mut().poll(&mut Context::from_waker(Waker::noop()))
+        };
+        let rejected = Poll::Ready(ZxError::INVALID_ARGS as isize);
+        assert_eq!(
+            raise(0, EXCP_USER, context),
+            rejected,
+            "target 0 is not the job debugger"
+        );
+        assert_eq!(
+            raise(JOB_DEBUGGER, FATAL_PAGE_FAULT, context),
+            rejected,
+            "a fault type is not ZX_EXCP_USER"
+        );
+        // The null context. This one case cannot be pinned by mutation from
+        // here: dropping the explicit null check leaves the behaviour
+        // unchanged, because address 0 is not mapped in this process either,
+        // so `validate_user_range` rejects it anyway. The check is kept
+        // regardless -- Zircon requires a non-null context whether or not the
+        // caller happens to have page zero mapped, and mapping page zero to
+        // tell the two apart is its own hazard.
+        assert_eq!(
+            raise(JOB_DEBUGGER, EXCP_USER, 0),
+            rejected,
+            "the context is not optional"
+        );
+        // Unmapped, but not null: the two words are read out of the caller's
+        // own space or not at all, and the check that says so is not the null
+        // one.
+        assert_eq!(
+            raise(JOB_DEBUGGER, EXCP_USER, context + 0x4000_0000),
+            rejected,
+            "a context outside the caller's mappings"
+        );
+        Box::pin(async move { drop(ct) })
+    });
+}
+
 /// Handle / type errors must win over options, kind, buffer, and rights-bits
 /// validation. Several syscalls used to answer INVALID_ARGS / ACCESS_DENIED
 /// for a bad or wrong-typed handle when the caller also passed a bad argument.

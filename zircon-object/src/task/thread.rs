@@ -1632,6 +1632,33 @@ impl CurrentThread {
         self.lock_inner().exception = None;
     }
 
+    /// Raise a user-generated exception on this thread and wait for the
+    /// handling, which is what `zx_thread_raise_exception` does.
+    ///
+    /// It goes through [`CurrentThread::blocking_run`] like any other
+    /// exception, so a thread parked here is in `BlockedException` and can
+    /// still be killed. The two words are the caller's, and no trap frame is
+    /// read: there isn't one, because nothing trapped.
+    pub async fn raise_user_exception(&self, synth_code: u32, synth_data: u32) {
+        let exception = {
+            let mut inner = self.lock_inner();
+            let exception = Exception::new_user(&self.0, synth_code, synth_data);
+            inner.exception = Some(exception.clone());
+            exception
+        };
+        let future = exception.handle();
+        pin_mut!(future);
+        self.blocking_run(
+            future,
+            ThreadState::BlockedException,
+            Duration::from_nanos(u64::MAX),
+            None,
+        )
+        .await
+        .ok();
+        self.lock_inner().exception = None;
+    }
+
     /// Run a blocking task when the thread is exited itself and dying.
     ///
     /// The task will stop running if and once the thread is killed.

@@ -59,6 +59,51 @@ impl Syscall<'_> {
         )
     }
 
+    /// Raise a user-generated exception on the calling thread.
+    ///
+    /// Nothing has gone wrong: the thread is reporting something of its own to
+    /// whoever is debugging its job, which is what a C runtime does to tell a
+    /// debugger about a failed assertion before it decides whether to die.
+    ///
+    /// The three ways this can be rejected are all `INVALID_ARGS`, and all of
+    /// them were previously reachable only as `NOT_SUPPORTED`, because the
+    /// call did not exist: the job debugger is the only target the call names,
+    /// `ZX_EXCP_USER` the only type it accepts, and the context is not
+    /// optional. Nobody listening is **not** one of them -- delivering a
+    /// synthetic exception to an empty chain is success, and in particular it
+    /// must not kill the process.
+    pub async fn sys_thread_raise_exception(
+        &self,
+        target: u32,
+        type_: u32,
+        context: UserInPtr<u32>,
+    ) -> ZxResult {
+        info!(
+            "thread.raise_exception: target={:#x}, type={:#x}, context={:#x?}",
+            target, type_, context
+        );
+        if target != ZX_EXCEPTION_TARGET_JOB_DEBUGGER
+            || type_ != ExceptionType::User as u32
+            || context.is_null()
+        {
+            return Err(ZxError::INVALID_ARGS);
+        }
+        // The whole struct has to be the caller's own readable memory before a
+        // word of it is read, exactly as the futex word is checked: reading
+        // any other address would fault as the kernel, with no fixup behind
+        // it.
+        crate::user_memory::validate_user_range(
+            self.thread.proc(),
+            context.as_addr(),
+            EXCEPTION_CONTEXT_SIZE,
+            kernel_hal::MMUFlags::READ,
+        )?;
+        let synth = UserInPtr::<u32>::from(context.as_addr() + EXCEPTION_CONTEXT_SYNTH_OFFSET)
+            .read_array(2)?;
+        self.thread.raise_user_exception(synth[0], synth[1]).await;
+        Ok(())
+    }
+
     /// Create a handle for the exception's thread.
     ///    
     /// The exception handle out will be filled with a new handle to the exception thread.  
@@ -91,6 +136,10 @@ impl Syscall<'_> {
         install_handle(proc, exception.get_process_handle()?, &mut out)
     }
 }
+
+/// `ZX_EXCEPTION_TARGET_JOB_DEBUGGER`, the only target
+/// `zx_thread_raise_exception` takes.
+const ZX_EXCEPTION_TARGET_JOB_DEBUGGER: u32 = 1;
 
 numeric_enum! {
     #[repr(u32)]

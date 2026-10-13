@@ -165,6 +165,21 @@ cfg_if::cfg_if! {
     }
 }
 
+/// The size of a `zx_exception_context_t`.
+///
+/// `zx_thread_raise_exception` takes one, and the caller's whole struct has to
+/// be readable before any of it is read.
+pub const EXCEPTION_CONTEXT_SIZE: usize = core::mem::size_of::<ExceptionContext>();
+
+/// Where `synth_code` starts inside a `zx_exception_context_t`, with
+/// `synth_data` in the word right after it.
+///
+/// The syscall layer reads those two words and nothing else, but the layout of
+/// that struct lives in this file -- and differs by architecture -- so the
+/// offset is published from here instead of being spelled out again there.
+pub const EXCEPTION_CONTEXT_SYNTH_OFFSET: usize =
+    core::mem::offset_of!(ExceptionContext, synth_code);
+
 impl ExceptionContext {
     fn from_user_context(ctx: &UserContext) -> Self {
         let fault_vaddr = if let TrapReason::PageFault(vaddr, _) = ctx.trap_reason() {
@@ -229,6 +244,24 @@ impl ExceptionReport {
         }
     }
 
+    /// A report for an exception the thread raised itself.
+    ///
+    /// There is no trap frame behind it, so the architectural half stays zero
+    /// and the two synthetic words are the caller's.
+    fn new_user(synth_code: u32, synth_data: u32) -> Self {
+        ExceptionReport {
+            header: ExceptionHeader {
+                type_: ExceptionType::User,
+                size: core::mem::size_of::<ExceptionReport>() as u32,
+            },
+            context: ExceptionContext {
+                arch: Default::default(),
+                synth_code,
+                synth_data,
+            },
+        }
+    }
+
     pub(super) fn as_v1(&self) -> ExceptionReportV1 {
         ExceptionReportV1 {
             header: ExceptionHeader {
@@ -257,6 +290,11 @@ pub enum ExceptionType {
     ThreadExiting = 0x8108,
     PolicyError = 0x8208,
     ProcessStarting = 0x8308,
+    /// `ZX_EXCP_USER`: raised by the thread itself through
+    /// `zx_thread_raise_exception`, not by anything that went wrong. It is the
+    /// only type that call accepts, and the only one whose `synth_code` and
+    /// `synth_data` come from user space instead of from a trap frame.
+    User = 0x8309,
 }
 
 impl ExceptionType {
@@ -402,6 +440,24 @@ impl Exception {
         })
     }
 
+    /// Create an `Exception` the thread raised on itself.
+    ///
+    /// `synth_code` and `synth_data` are the caller's `zx_exception_context_t`
+    /// words, passed through untouched; nothing else about the thread is read,
+    /// because there is no trap frame to read.
+    pub(super) fn new_user(thread: &Arc<Thread>, synth_code: u32, synth_data: u32) -> Arc<Self> {
+        Arc::new(Exception {
+            thread: thread.clone(),
+            type_: ExceptionType::User,
+            report: ExceptionReport::new_user(synth_code, synth_data),
+            inner: Mutex::new(ExceptionInner {
+                current_channel_type: ExceptionChannelType::None,
+                handled: false,
+                second_chance: false,
+            }),
+        })
+    }
+
     /// Handle the exception.
     ///
     /// Note that it's possible that this may returns before exception was send to any exception channel.
@@ -414,6 +470,15 @@ impl Exception {
             }
             ExceptionType::ThreadStarting | ExceptionType::ThreadExiting => {
                 self.handle_with(Some(self.thread.proc().debug_exceptionate()), false)
+                    .await
+            }
+            // A user-raised exception goes up the job debugger chain and stops
+            // at the first debugger that takes it, the same shape as
+            // `ProcessStarting`. It never reaches the process or thread
+            // channels: `zx_thread_raise_exception` only names the job
+            // debugger as a target.
+            ExceptionType::User => {
+                self.handle_with(JobDebuggerIterator::new(self.thread.proc().job()), true)
                     .await
             }
             _ => {
@@ -568,7 +633,13 @@ impl<'a> Iterator for ExceptionateIterator<'a> {
     }
 }
 
-/// This is only used by ProcessStarting exceptions
+/// Walks the job debugger exceptionates: the process's own job first, then
+/// its parent, and so on up to the root job.
+///
+/// Used by `ProcessStarting` and by `User` (`zx_thread_raise_exception`), the
+/// two types whose only handler is a job debugger. Both pass `first_only =
+/// true`, so delivery stops at the nearest job that has a debugger attached;
+/// jobs without one are skipped rather than ending the walk.
 struct JobDebuggerIterator {
     job: Option<Arc<Job>>,
 }
@@ -640,6 +711,85 @@ mod tests {
         for (actual, expected) in actual.iter().zip(expected.iter()) {
             assert!(Arc::ptr_eq(&actual, expected));
         }
+    }
+
+    /// `ZX_EXCP_USER` is `ZX_EXCP_SYNTH_BASE | 0x309`, and getting that number
+    /// wrong is invisible from inside the kernel: the call would just reject
+    /// every request as `INVALID_ARGS`, which looks exactly like a caller
+    /// passing the wrong type.
+    #[test]
+    fn the_user_exception_type_is_the_number_zircon_publishes() {
+        assert_eq!(ExceptionType::User as u32, 0x309 | 0x8000);
+    }
+
+    /// And it has to read as synthetic, because that is the single bit that
+    /// decides a user-raised exception nobody listens to does not kill the
+    /// process.
+    #[test]
+    fn a_user_exception_is_synthetic_and_an_architectural_one_is_not() {
+        assert!(ExceptionType::User.is_synth());
+        assert!(!ExceptionType::FatalPageFault.is_synth());
+    }
+
+    /// The caller's two words reach the report untouched, and the
+    /// architectural half stays zero: there was no trap, so there is nothing
+    /// to put there. Reporting a stale or borrowed trap frame here would hand
+    /// a debugger a fault address for something that never faulted.
+    #[test]
+    fn a_user_report_carries_the_callers_words_and_no_trap_frame() {
+        let report = ExceptionReport::new_user(0x1234_5678, 0x9abc_def0);
+        assert_eq!(report.header.type_, ExceptionType::User);
+        assert_eq!(report.context.synth_code, 0x1234_5678);
+        assert_eq!(report.context.synth_data, 0x9abc_def0);
+        assert_eq!(report.context.arch, Default::default());
+    }
+
+    /// The syscall layer reads those two words by offset, out of a struct
+    /// whose layout lives here and differs by architecture. If the offset ever
+    /// stops pointing at `synth_code`, the call silently reports whatever word
+    /// is there instead, so it is pinned to the struct itself rather than to a
+    /// number.
+    ///
+    /// `exception_context_layout_tests` next door pins the same offsets to
+    /// their x86_64 values; this one pins the two *published* constants to the
+    /// struct on every architecture, which is what the reader of them needs.
+    #[test]
+    fn the_published_offset_points_at_the_two_synthetic_words() {
+        assert_eq!(
+            EXCEPTION_CONTEXT_SYNTH_OFFSET,
+            core::mem::size_of::<ExceptionContextInner>()
+        );
+        assert_eq!(
+            EXCEPTION_CONTEXT_SIZE,
+            EXCEPTION_CONTEXT_SYNTH_OFFSET + 2 * core::mem::size_of::<u32>()
+        );
+        assert_eq!(
+            core::mem::offset_of!(ExceptionContext, synth_data),
+            EXCEPTION_CONTEXT_SYNTH_OFFSET + core::mem::size_of::<u32>()
+        );
+    }
+
+    /// Nobody listening is success. A `zx_thread_raise_exception` with no
+    /// debugger anywhere up the job tree returns `ZX_OK` and leaves the
+    /// process alone: the C runtime reports a failed assertion this way and
+    /// then decides for itself whether to die, so killing it here would turn
+    /// a diagnostic into a crash.
+    ///
+    /// The control for this one is
+    /// [`only_an_unhandled_hardware_fault_kills_the_process`], which fails if
+    /// `handle()` ever stops killing anything at all.
+    #[async_std::test]
+    async fn a_user_exception_nobody_listens_to_leaves_the_process_alone() {
+        let thread = a_thread();
+        let proc = thread.proc().clone();
+
+        Exception::new_user(&thread, 1, 2).handle().await;
+
+        assert_ne!(
+            proc.status(),
+            Status::Exited(TASK_RETCODE_SYSCALL_KILL),
+            "a user-raised exception nobody listened to killed the process"
+        );
     }
 
     #[test]
@@ -1269,6 +1419,39 @@ mod tests {
     /// Nothing caught it because `first_only` only shows up when the first
     /// handler *declines*, and every other test here has the first handler
     /// take the exception.
+    /// A user-raised exception is for whoever is debugging the job, and for
+    /// nobody else. Sending it down the ordinary chain instead would hand a
+    /// process- or thread-level handler an exception it never registered to
+    /// see, and in Zircon those handlers can resume or discard a thread.
+    #[async_std::test]
+    async fn a_user_exception_goes_to_the_job_debugger_and_nowhere_else() {
+        let job = Job::root().create_child().unwrap();
+        let proc = Process::create(&job, "proc").unwrap();
+        let thread = Thread::create(&proc, "thread").unwrap();
+
+        let debugger = Arc::new(Mutex::new(false));
+        let by_process = Arc::new(Mutex::new(false));
+        let by_thread = Arc::new(Mutex::new(false));
+        // None of the three handles it, so every one of them that is offered
+        // the exception at all records that it was.
+        let first = a_handler(&job.debug_exceptionate(), false, debugger.clone());
+        let second = a_handler(&proc.exceptionate(), false, by_process.clone());
+        let third = a_handler(&thread.exceptionate(), false, by_thread.clone());
+
+        Exception::new_user(&thread, 1, 2).handle().await;
+
+        job.debug_exceptionate().shutdown();
+        proc.exceptionate().shutdown();
+        thread.exceptionate().shutdown();
+        first.await;
+        second.await;
+        third.await;
+
+        assert!(*debugger.lock(), "the job debugger never got it");
+        assert!(!*by_process.lock(), "a process handler was offered it");
+        assert!(!*by_thread.lock(), "a thread handler was offered it");
+    }
+
     #[async_std::test]
     async fn only_the_nearest_job_debugger_hears_a_process_starting() {
         let parent_job = Job::root().create_child().unwrap();
