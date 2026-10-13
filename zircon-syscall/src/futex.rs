@@ -24,6 +24,47 @@ pub(crate) fn check_futex_word(
 }
 
 impl Syscall<'_> {
+    /// Resolve the `new_futex_owner` handle of a `zx_futex_wait` or a
+    /// `zx_futex_requeue`.
+    ///
+    /// Zircon validates the owner at the syscall boundary, and two of its rules
+    /// are ones the futex object cannot see from its queue:
+    ///
+    /// * the owner may not be the very thread that is about to block on the futex
+    ///   (`caller`), and
+    /// * the owner must have STARTED.
+    ///
+    /// A thread that has already DIED is a legal owner -- the core tests ask for a
+    /// *successful* `zx_futex_wait` (it times out) and a successful
+    /// `zx_futex_requeue` with a dead thread -- so the predicate is
+    /// `ThreadState::New`, "created but never started", and not "not running".
+    ///
+    /// Both rules were missing, and that is not a wrong error code: the cases
+    /// `FutexTest.WaitInvalidOwner` asks about carry `ZX_TIME_INFINITE`, so an
+    /// accepted wait is a thread that never comes back. The `zircon-core` suite
+    /// stopped dead there, with 207 cases green behind it.
+    ///
+    /// `caller` is `None` on the requeue side on purpose: the suite proves the
+    /// started rule for both calls, and says nothing about a requeue naming its
+    /// own thread, so that case stays exactly as it was.
+    fn new_futex_owner(
+        &self,
+        handle: HandleValue,
+        caller: Option<&Arc<Thread>>,
+    ) -> ZxResult<Option<Arc<Thread>>> {
+        if handle == INVALID_HANDLE {
+            return Ok(None);
+        }
+        let owner = self.thread.proc().get_object::<Thread>(handle)?;
+        if caller.is_some_and(|caller| Arc::ptr_eq(caller, &owner)) {
+            return Err(ZxError::INVALID_ARGS);
+        }
+        if owner.state() == ThreadState::New {
+            return Err(ZxError::INVALID_ARGS);
+        }
+        Ok(Some(owner))
+    }
+
     /// Wait on a futex.
     ///
     /// This system call function atomically verifies that `value_ptr` still contains the value `current_value`
@@ -47,12 +88,9 @@ impl Syscall<'_> {
         check_futex_word(proc, &value_ptr, kernel_hal::MMUFlags::READ)?;
         let value = value_ptr.as_ref();
         let futex = proc.get_futex(value);
-        let new_owner = if new_futex_owner == INVALID_HANDLE {
-            None
-        } else {
-            Some(proc.get_object::<Thread>(new_futex_owner)?)
-        };
-        let future = futex.wait_with_owner(current_value, Some(self.thread.inner()), new_owner);
+        let caller = self.thread.inner();
+        let new_owner = self.new_futex_owner(new_futex_owner, Some(&caller))?;
+        let future = futex.wait_with_owner(current_value, Some(caller), new_owner);
         let _: () = self
             .thread
             .blocking_run(future, ThreadState::BlockedFutex, deadline.into(), None)
@@ -88,11 +126,7 @@ impl Syscall<'_> {
         if value_ptr.as_addr() == requeue_ptr.as_addr() {
             return Err(ZxError::INVALID_ARGS);
         }
-        let new_requeue_owner = if new_requeue_owner == INVALID_HANDLE {
-            None
-        } else {
-            Some(proc.get_object::<Thread>(new_requeue_owner)?)
-        };
+        let new_requeue_owner = self.new_futex_owner(new_requeue_owner, None)?;
         let wake_futex = proc.get_futex(value);
         let requeue_futex = proc.get_futex(requeue);
         wake_futex.requeue(
