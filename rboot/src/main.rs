@@ -21,14 +21,14 @@ use alloc::vec::Vec;
 use core::arch::asm;
 use log::warn;
 use rboot::config::{self, Resolution};
-use rboot::{cmdline, fb, frames, logo, page_table, progress, video, BootInfo, GraphicInfo};
+use rboot::{cmdline, esp, fb, frames, logo, page_table, progress, video, BootInfo, GraphicInfo};
 use uefi::proto::console::gop::{GraphicsOutput, ModeInfo, PixelFormat};
 use uefi::proto::media::file::*;
 use uefi::proto::media::fs::SimpleFileSystem;
 use uefi::proto::unsafe_protocol;
 use uefi::table::boot::*;
 use uefi::table::cfg::{ACPI2_GUID, SMBIOS_GUID};
-use uefi::{prelude::*, CStr16};
+use uefi::{cstr16, prelude::*, CStr16};
 use x86_64::registers::control::*;
 use x86_64::structures::paging::*;
 use x86_64::{PhysAddr, VirtAddr};
@@ -355,25 +355,133 @@ fn exit_boot_services_raw(
     panic!("ExitBootServices failed: {:?}", last);
 }
 
+/// How many names a failed open may print from the directory that should
+/// have held the file. This panic lands on a screen with no scrollback.
+const MAX_LISTED: usize = 16;
+
+/// Open a file off the ESP, or die saying exactly which one was missing.
+///
+/// This used to be `.expect("failed to open file")`, and that was the whole
+/// report: a bare `NOT_FOUND` on a screen with not one path on it, from a
+/// loader that opens three different files (`rboot.conf`, the kernel ELF and
+/// the initramfs) and would not say which of the three it was. Since the
+/// answer is almost always "it is called something else" or "that copy never
+/// reached the disk", the panic now carries the path that was asked for *and*
+/// what the directory that should have held it actually contains.
 fn open_file(bs: &BootServices, path: &str) -> RegularFile {
-    //info!("opening file: {}", path);
+    let handle = match try_open(bs, path) {
+        Ok(handle) => handle,
+        Err(status) => panic!(
+            "failed to open {}: {:?}; {}",
+            path,
+            status,
+            list_dir(bs, esp::parent_dir(path))
+        ),
+    };
+    match handle.into_type().expect("failed to into_type") {
+        FileType::Regular(regular) => regular,
+        FileType::Dir(_) => panic!("{} is a directory, not a file", path),
+    }
+}
+
+/// Open the root of the boot volume.
+///
+/// The filesystem `ScopedProtocol` is dropped on return, exactly as
+/// `open_file` has always done: the handle it opened stays valid.
+fn open_volume(bs: &BootServices) -> Directory {
     let fs_handle = bs
         .get_handle_for_protocol::<SimpleFileSystem>()
         .expect("failed to get FileSystem handle");
     let mut fs = bs
         .open_protocol_exclusive::<SimpleFileSystem>(fs_handle)
         .expect("failed to open FileSystem protocol");
-    let mut buf = [0u16; 256];
-    let path = CStr16::from_str_with_buf(path, &mut buf).expect("failed to convert path to ucs-2");
-    let mut root = fs.open_volume().expect("failed to open volume");
-    let handle = root
-        .open(path, FileMode::Read, FileAttribute::empty())
-        .expect("failed to open file");
+    fs.open_volume().expect("failed to open volume")
+}
 
-    match handle.into_type().expect("failed to into_type") {
-        FileType::Regular(regular) => regular,
-        _ => panic!("Invalid file type"),
+/// `root.open(path)` with the raw `Status` as its error, so the caller that
+/// panics can print it.
+fn try_open(bs: &BootServices, path: &str) -> Result<FileHandle, Status> {
+    let mut root = open_volume(bs);
+    let mut buf = [0u16; 256];
+    // A path that does not fit in UCS-2 (or holds an impossible character)
+    // is not a missing file: it is a mistyped line of `rboot.conf`, and it
+    // gets named as such instead of dying without saying which one.
+    let path = CStr16::from_str_with_buf(path, &mut buf).map_err(|_| Status::INVALID_PARAMETER)?;
+    root.open(path, FileMode::Read, FileAttribute::empty())
+        .map_err(|e| e.status())
+}
+
+/// What `dir` actually holds, to go with a failed open.
+///
+/// It never fails: if the directory itself cannot be opened, that *is* the
+/// answer (the copy never landed, or the mounted ESP is not the one you
+/// think it is).
+fn list_dir(bs: &BootServices, dir: &str) -> alloc::string::String {
+    use core::fmt::Write;
+
+    // `FileInfo` requires 8-byte alignment and `read_entry` asserts on it,
+    // so the buffer cannot be a plain `[u8; N]`.
+    #[repr(align(8))]
+    struct Aligned([u8; 512]);
+
+    let mut out = alloc::string::String::new();
+    let mut root = open_volume(bs);
+    let mut opened;
+    let dir_handle: &mut Directory = if dir == "\\" {
+        &mut root
+    } else {
+        let mut buf = [0u16; 256];
+        let Ok(path) = CStr16::from_str_with_buf(dir, &mut buf) else {
+            return out;
+        };
+        match root.open(path, FileMode::Read, FileAttribute::empty()) {
+            Ok(handle) => match handle.into_type() {
+                Ok(FileType::Dir(d)) => {
+                    opened = d;
+                    &mut opened
+                }
+                _ => {
+                    let _ = write!(out, "{} is not a directory", dir);
+                    return out;
+                }
+            },
+            Err(e) => {
+                let _ = write!(out, "{} is not there either: {:?}", dir, e.status());
+                return out;
+            }
+        }
+    };
+
+    let _ = write!(out, "{} holds:", dir);
+    let mut buf = Aligned([0u8; 512]);
+    let mut listed = 0usize;
+    loop {
+        match dir_handle.read_entry(&mut buf.0) {
+            Ok(None) => break,
+            Ok(Some(info)) => {
+                let name = info.file_name();
+                if name == cstr16!(".") || name == cstr16!("..") {
+                    continue;
+                }
+                if listed == MAX_LISTED {
+                    let _ = write!(out, " ...");
+                    break;
+                }
+                let _ = write!(out, " {} ({} B)", name, info.file_size());
+                listed += 1;
+            }
+            // A name that does not fit the buffer leaves the directory
+            // un-advanced, so stop here: half a listing says plenty.
+            Err(_) => {
+                let _ = write!(out, " ...");
+                break;
+            }
+        }
     }
+    if listed == 0 {
+        let _ = write!(out, " nothing");
+    }
+    out
 }
 
 fn load_file(bs: &BootServices, file: &mut RegularFile) -> &'static mut [u8] {
