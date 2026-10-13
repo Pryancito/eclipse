@@ -36,7 +36,9 @@ use zircon_object::{
 
 /// The file-descriptor table's allocator and its two range sweeps.
 mod census;
+mod orphan_group;
 pub use census::*;
+pub use orphan_group::*;
 mod fd_table;
 
 pub use rcore_fs::vfs::FsInfo;
@@ -343,8 +345,16 @@ impl ProcessExt for Process {
                 if let Some(proc) = weak_proc.upgrade() {
                     // Reparent any still-live children to INIT before tearing
                     // this process down, so they are not stranded on a dead
-                    // parent that will never `wait` for them.
+                    // parent that will never `wait` for them. And then the
+                    // other half of what POSIX asks of a death: a stopped job
+                    // whose last relative outside its own group has just gone
+                    // would stay stopped for ever, because nothing is left
+                    // that could continue it, so the kernel owes it a SIGHUP
+                    // and a SIGCONT. The groups to ask about are read before
+                    // the handover, while the children are still in hand.
+                    let orphan_candidates = groups_this_death_could_orphan(&proc);
                     reparent_live_children_to_init(&proc);
+                    wake_orphaned_stopped_groups(&orphan_candidates);
                     // Record locks die with the process (same as the
                     // fork path below; see `record_lock::release_owner`).
                     crate::fs::record_lock::release_owner(proc.id());
@@ -703,7 +713,12 @@ impl ProcessExt for Process {
                         Status::Exited(code) => code,
                         _ => 0,
                     };
+                    // The same two halves as in `create_linux` above: the
+                    // handover, and then the SIGHUP + SIGCONT a stopped job
+                    // with nobody left to continue it is owed.
+                    let orphan_candidates = groups_this_death_could_orphan(&child);
                     reparent_live_children_to_init(&child);
+                    wake_orphaned_stopped_groups(&orphan_candidates);
                     // POSIX record locks die with the process, eagerly: the
                     // lazy liveness prune in `record_lock` cannot tell a dead
                     // owner from a recycled pid (see `release_owner`).
@@ -4614,10 +4629,27 @@ pub fn send_signal_to_pgrp(pgid: usize, signal: LinuxSignal) -> LxResult<()> {
 /// and send it the Linux `SIGCHLD` a handler or signalfd waits for, unless
 /// its `sigaction` said `SA_NOCLDSTOP` (`do_notify_parent_cldstop`).
 fn notify_parent_child_state(child: &Arc<Process>) {
-    let parent = child.try_linux().and_then(|lp| lp.parent());
+    let parent = child
+        .try_linux()
+        .and_then(|lp| lp.parent())
+        // A parent that has already exited is told nothing, and the guard is
+        // not only tidiness: this runs from inside a signal callback, and
+        // `signal_callbacks.retain` holds the object's own base lock while it
+        // calls them. So a notification aimed back at the process whose death
+        // is being processed is that lock taken twice on one CPU, with
+        // interrupts off -- a CPU that does not come back. It is reachable
+        // from `wake_orphaned_stopped_groups`, which continues a stopped group
+        // whose members' parent is the process now dying.
+        .filter(|parent| !matches!(parent.status(), Status::Exited(_)));
     let parent = match parent {
         Some(p) => p,
-        None => match ROOT_JOB.find_process(INIT_PID) {
+        // And the same filter on the fallback, for the same reason: when it
+        // is INIT that is dying, INIT is the process whose base lock this is
+        // already running under.
+        None => match ROOT_JOB
+            .find_process(INIT_PID)
+            .filter(|init| !matches!(init.status(), Status::Exited(_)))
+        {
             Some(p) => p,
             None => return,
         },
@@ -5929,6 +5961,9 @@ mod dying_process_tests;
 
 #[cfg(test)]
 mod census_tests;
+
+#[cfg(test)]
+mod orphan_group_tests;
 #[cfg(test)]
 mod socket_fd_tests;
 
