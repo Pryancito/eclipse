@@ -2365,7 +2365,14 @@ mod elf_bounds_tests {
             let elf = ElfFile::new(&image).unwrap();
             let vmar = VmAddressRegion::new_root();
             vmar.load_from_elf(&elf).unwrap();
-            vmar.find_mapping(base).unwrap().get_flags(base).unwrap()
+            // `load_from_elf` maps at `p_vaddr` as an OFFSET INTO the VMAR
+            // (`map_at`), while `find_mapping`/`get_flags` take an absolute
+            // address. The two agree only while the root VMAR starts at 0,
+            // which is the build without `aspace-separate`; with it every
+            // root gets a window of its own and this looked up an address
+            // nothing was ever mapped at.
+            let at = vmar.addr() + base;
+            vmar.find_mapping(at).unwrap().get_flags(at).unwrap()
         };
         let user = MMUFlags::USER;
         assert_eq!(flags_of(4), user | MMUFlags::READ);
