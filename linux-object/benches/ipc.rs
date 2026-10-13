@@ -57,6 +57,7 @@
 
 extern crate test;
 
+use linux_object::error::LxError;
 use linux_object::fs::{File, FileLike, OpenFlags, Pipe};
 use rcore_fs::vfs::INode;
 use std::future::Future;
@@ -128,7 +129,15 @@ fn pipe_write_at_one_byte(b: &mut Bencher) {
         for _ in 0..64 {
             w.write_at(0, black_box(&[0xa5u8])).unwrap();
         }
-        black_box(r.read_at(0, &mut sink).unwrap())
+        // Asserted, not assumed: a short read would leave bytes behind every
+        // iteration, and the row would quietly stop being "a write into a pipe
+        // with room" and become a measurement of back-pressure.
+        let n = r.read_at(0, &mut sink).unwrap();
+        assert_eq!(
+            n, 64,
+            "the sink is as big as the burst, so one read drains it"
+        );
+        black_box(n)
     });
 }
 
@@ -266,11 +275,18 @@ fn file_read_nonblocking_eagain_then_data(b: &mut Bencher) {
     b.iter(|| {
         let mut buf = [0u8; 1];
         let mut again = FileLike::read(&*reader, black_box(&mut buf));
-        let eagain = match Pin::new(&mut again).poll(&mut cx) {
-            Poll::Ready(r) => r.is_err(),
+        let answer = match Pin::new(&mut again).poll(&mut cx) {
+            Poll::Ready(r) => r,
             Poll::Pending => unreachable!("a non-blocking read never parks"),
         };
-        assert!(eagain, "an empty non-blocking pipe must answer EAGAIN");
+        // The specific error, not merely "an error": any other failure here
+        // would take a different path out of `File::read` and this row is the
+        // control the parking rows are compared against.
+        assert_eq!(
+            answer,
+            Err(LxError::EAGAIN),
+            "an empty non-blocking pipe must answer EAGAIN"
+        );
         drop(again);
         FileLike::write(&*writer, black_box(&[0xa5u8])).unwrap();
         let mut fut = FileLike::read(&*reader, black_box(&mut buf));
@@ -331,7 +347,14 @@ fn a_current_linux_thread() -> Arc<zircon_object::task::Thread> {
 fn with_current_linux_thread<R>(body: impl FnOnce(&Arc<zircon_object::task::Thread>) -> R) -> R {
     async_std::task::block_on(async move {
         let thread = a_current_linux_thread();
-        body(&thread)
+        let out = body(&thread);
+        // Hand the registration back. On the host it lives in an async-std
+        // task local, so this task's copy dies with the task -- but a row that
+        // leaves a thread registered reads as deliberate to the next person,
+        // and the rows that must run WITHOUT one would then be measuring
+        // something else entirely.
+        kernel_hal::thread::set_current_thread(None);
+        out
     })
 }
 
