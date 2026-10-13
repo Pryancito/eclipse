@@ -800,6 +800,16 @@ impl TaskCollection {
             return None;
         }
         page.mark_borrowed(subpage_idx, true);
+        // The claim end of the wake-to-run latency probe. Only the urgent lane
+        // is measured: a voluntary yield is a task giving up a CPU it had, so
+        // the interval between its self-wake and its next poll is not a wait
+        // for a CPU. The swap is unconditional anyway -- a yielded slot can
+        // carry a stamp from an earlier external wake, and leaving it there
+        // would date the NEXT claim from a wake two turns ago.
+        let stamp = page.take_wake_stamp(subpage_idx);
+        if !serve_yielded {
+            crate::runtime::note_wake_serviced(stamp);
+        }
         if serve_yielded {
             cursor.yielded_next = slot + 1;
             cursor.urgent_turns = 0;

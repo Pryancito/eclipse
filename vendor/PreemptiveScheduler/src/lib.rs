@@ -74,11 +74,12 @@ pub use runtime::{
     current_executor_abandonable, current_stack_top_looks_null, current_task_abandonable,
     end_voluntary_yield, fault_sp_abandonable, handle_timeout, heap_smash_suspected,
     irq_on_idle_executor, irq_should_skip_dyn_dispatch, irq_should_skip_heavy_work,
-    need_resched_pending, note_heap_smash_suspected, run_until_idle, runnable_task_count,
-    sched_steal_stats, sched_weak_stats, sched_yield, set_idle_callback, set_resched_ipi_sender,
-    set_wakeup_preempt, spawn, spawn_with_affinity, stack_high_water, take_need_resched,
-    wakeup_preempt_enabled, wakeup_preempt_stats, warm_runtimes, FaultStackAttr, StackAttrHit,
-    StackPtrRegion,
+    need_resched_pending, note_heap_smash_suspected, resched_ipis_sent, run_until_idle,
+    runnable_task_count, sched_steal_stats, sched_weak_stats, sched_yield, set_idle_callback,
+    set_now_ns_hook, set_resched_ipi_sender, set_wake_latency, set_wakeup_preempt, spawn,
+    spawn_with_affinity, stack_high_water, take_need_resched, wake_latency_enabled,
+    wake_latency_stats, wakeup_preempt_enabled, wakeup_preempt_stats, warm_runtimes,
+    FaultStackAttr, StackAttrHit, StackPtrRegion, WAKE_LATENCY_BUCKETS, WAKE_SAMPLE_PERIOD,
 };
 
 #[doc(hidden)]
