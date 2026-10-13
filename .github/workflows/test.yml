@@ -290,6 +290,13 @@ jobs:
           # orders, the match-rule parser and what each rule selects, name
           # ownership with its replacement queue, and the client handshake
           # against a daemon started on a real socket in the same process.
+          # Since the portal (`eclipse-portald`) is the SECOND BINARY of this
+          # same package, the bare form also runs it: the `a{sv}`/`ay`
+          # marshalling the portals use everywhere, the FileChooser logic, and
+          # an integration test that starts a bus and a portal and drives a
+          # whole OpenFile through them with a stand-in chooser. That one needs
+          # /bin/sh (it is what unquotes the command line, and what the quoting
+          # is tested against) and nothing else.
           cargo test --manifest-path tools/eclipse-dbusd/Cargo.toml
           # The kernel binary crate itself. Its `[[bin]]` section carried
           # `test = false`, so no job in this file ever compiled it as a test

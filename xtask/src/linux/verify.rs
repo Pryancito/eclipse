@@ -849,22 +849,24 @@ mod cableado_tests {
         }
     }
 
-    /// Las 21 caches de artefactos de `mod.rs` tienen que seguir pasando por
+    /// Las 22 caches de artefactos tienen que seguir pasando por
     /// `cached_for_target`. Perder una no falla nada: simplemente esa
     /// herramienta vuelve a poder llegar a la rootfs con el arco del build
-    /// anterior, que es el fallo que vino a tapar. Y el autor de la numero 22
+    /// anterior, que es el fallo que vino a tapar. Y el autor de la numero 23
     /// no tiene por que saber que la puerta existe, asi que la cuenta se
     /// comprueba aqui en vez de confiar en que se acuerde.
+    ///
+    /// Se leen DOS ficheros: una cache que se mude a un modulo hermano
+    /// (`portal.rs` se llevo la de `eclipse-dbusd`) saldria de la cuenta sin
+    /// que nada lo dijera, que es justo el agujero que esto tapa.
     #[test]
     fn toda_cache_de_artefacto_pasa_por_la_puerta_del_arco() {
-        let src = std::fs::read_to_string(
-            crate::PROJECT_DIR
-                .join("xtask")
-                .join("src")
-                .join("linux")
-                .join("mod.rs"),
-        )
-        .unwrap();
+        let linux = crate::PROJECT_DIR.join("xtask").join("src").join("linux");
+        let src: String = ["mod.rs", "portal.rs"]
+            .iter()
+            .map(|f| std::fs::read_to_string(linux.join(f)).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n");
 
         // Las que comparan contra un `source` suelto.
         let mut sin_puerta = Vec::new();
@@ -888,8 +890,8 @@ mod cableado_tests {
         // este numero.
         let puertas = src.matches("self.cached_for_target(").count();
         assert_eq!(
-            puertas, 21,
-            "las puertas del arco eran 21 y ahora son {puertas}: si has añadido \
+            puertas, 22,
+            "las puertas del arco eran 22 y ahora son {puertas}: si has añadido \
              una cache con la suya, sube el numero; si has quitado una puerta, no"
         );
     }

@@ -143,6 +143,8 @@ const MAX_ROWS: usize = 14;
 /// A field is not a document: 256 characters is longer than any filename Linux
 /// allows (255 bytes) and the cap exists so holding a key cannot grow a String
 /// without bound.
+/// The longest header drawn, in characters. The rest of the line is the path.
+const MAX_TITLE: usize = 28;
 const MAX_FIELD: usize = 256;
 
 /// The size column, in characters, plus the gap before it.
@@ -287,6 +289,8 @@ struct State {
     openers: Vec<(String, String)>,
     /// Show dotfiles whatever the field says.
     always_hidden: bool,
+    /// The header, when the caller gave one.
+    title: Option<String>,
 
     dir: String,
     entries: Vec<Entry>,
@@ -760,13 +764,20 @@ fn draw_browser(
 
     // ── the path header ──
     let head_y = py + PAD;
-    let title = match st.mode {
-        Mode::Save => "Guardar en",
-        Mode::Browse => "Archivos",
-        _ => "Elegir archivo",
-    };
-    cv.text_bold(title, px + PAD, head_y + 2, p.accent);
-    let title_w = Canvas::text_width(title) + COL_GAP;
+    // The title can come from an application through the portal, so its length
+    // is not ours to trust: the header shares its line with the path, and a
+    // 500-character title would leave the path nowhere to go (`path_room` has a
+    // floor, so what gets pushed off the panel is the path).
+    let title = files::elide_middle(
+        st.title.as_deref().unwrap_or(match st.mode {
+            Mode::Save => "Guardar en",
+            Mode::Browse => "Archivos",
+            _ => "Elegir archivo",
+        }),
+        MAX_TITLE,
+    );
+    cv.text_bold(&title, px + PAD, head_y + 2, p.accent);
+    let title_w = Canvas::text_width(&title) + COL_GAP;
     let path_room = ((inner - title_w) / GLYPH_W).max(8) as usize;
     cv.text(
         &files::elide_middle(&st.dir, path_room),
@@ -1202,6 +1213,10 @@ struct Cli {
     /// `--save NAME`: the name the field starts with.
     name: Option<String>,
     out: Option<String>,
+    /// `--title TEXT`: what the header says, instead of the mode's own word.
+    /// The portal passes the title the application wrote, already translated,
+    /// so the dialog says what Firefox asked for rather than "Elegir archivo".
+    title: Option<String>,
     hidden: bool,
     dump: Option<String>,
 }
@@ -1242,6 +1257,12 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Result<Cli, String> {
                 cli.dir = Some(
                     args.next_if(|n| !n.starts_with('-'))
                         .ok_or("--dir needs a DIR")?,
+                )
+            }
+            "--title" => {
+                cli.title = Some(
+                    args.next_if(|n| !n.starts_with('-'))
+                        .ok_or("--title needs TEXT")?,
                 )
             }
             "--out" => {
@@ -1289,12 +1310,13 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Result<Cli, String> {
 fn usage() -> ! {
     eprintln!(
         "usage: lunarfile [DIR] [--pick [--multiple | --save NAME]] [--out FILE]\n\
-         \x20              [--hidden] [--dump PATH:WxH]\n\
+         \x20              [--title TEXT] [--hidden] [--dump PATH:WxH]\n\
          \n\
          \x20 (no args)      browse $HOME; Enter opens a file with its handler\n\
          \x20 --pick         choose a file: its path is printed on Enter\n\
          \x20 --multiple     choose several; Space marks, one path per line\n\
          \x20 --save NAME    choose where to save; prints <dir>/<name>\n\
+         \x20 --title TEXT   the header, instead of the mode's own word\n\
          \x20 --out FILE     write the answer to FILE instead of stdout\n\
          \x20 --dir DIR      start here instead of $HOME\n\
          \x20 --hidden       show dotfiles (a filter starting with `.` also does)\n\
@@ -1337,6 +1359,7 @@ fn new_state(cli: &Cli) -> State {
         out: cli.out.clone(),
         openers: open::load_openers(),
         always_hidden: cli.hidden,
+        title: cli.title.clone(),
         dir: String::from("/"),
         entries: Vec::new(),
         note: String::new(),
@@ -1549,7 +1572,7 @@ mod tests {
         // `--out --hidden` is a forgotten filename, and writing the chooser's
         // answer to a file called `--hidden` helps nobody. Same for every other
         // flag with a value, which is the bug `lunarrun --dump` had.
-        for f in ["--out", "--dir", "--save", "--dump"] {
+        for f in ["--out", "--dir", "--save", "--dump", "--title"] {
             assert!(cli(&[f]).is_err(), "{f} alone");
             assert!(cli(&[f, "--hidden"]).is_err(), "{f} ate a flag");
             // And the flag after it is still parsed.
@@ -1563,6 +1586,36 @@ mod tests {
         assert_eq!(
             cli(&["--dump", "/tmp/a:8x8"]).unwrap().dump.as_deref(),
             Some("/tmp/a:8x8")
+        );
+    }
+
+    #[test]
+    fn the_title_is_the_callers_and_it_is_bounded() {
+        // The portal passes the title the APPLICATION wrote ("Abrir archivo"
+        // from Firefox, already translated), so the dialog says what was asked
+        // for rather than the mode's own word.
+        assert_eq!(
+            cli(&["--pick", "--title", "Abrir archivo"])
+                .unwrap()
+                .title
+                .as_deref(),
+            Some("Abrir archivo")
+        );
+        // It is an option, and asking for a title does not make a chooser.
+        assert_eq!(cli(&["--title", "Archivos"]).unwrap().mode(), Mode::Browse);
+        assert_eq!(cli(&[]).unwrap().title, None);
+        // And it is not ours to trust for length: the header shares its line
+        // with the path, which has a floor, so a long title would push the path
+        // off the panel rather than wrap.
+        let long = "x".repeat(500);
+        assert_eq!(
+            files::elide_middle(&long, MAX_TITLE).chars().count(),
+            MAX_TITLE
+        );
+        // A title that fits is drawn as it is.
+        assert_eq!(
+            files::elide_middle("Abrir archivo", MAX_TITLE),
+            "Abrir archivo"
         );
     }
 

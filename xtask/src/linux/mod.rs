@@ -3,6 +3,7 @@ mod desktop;
 mod image;
 pub(crate) mod nvidia_firmware;
 mod opencv;
+mod portal;
 mod test;
 mod verify;
 mod xorg;
@@ -156,10 +157,14 @@ impl LinuxRootfs {
                 let _ = dir::rm(bin.join("eclipse-sdl-probe"));
                 let _ = fs::copy(&sdl_probe, bin.join("eclipse-sdl-probe"));
             }
-            let dbusd = self.eclipse_dbusd();
+            let (dbusd, portald) = self.eclipse_dbusd();
             if dbusd.is_file() {
                 let _ = dir::rm(bin.join("eclipse-dbusd"));
                 let _ = fs::copy(&dbusd, bin.join("eclipse-dbusd"));
+            }
+            if portald.is_file() {
+                let _ = dir::rm(bin.join("eclipse-portald"));
+                let _ = fs::copy(&portald, bin.join("eclipse-portald"));
             }
             self.install_thread_tests(&dir);
             // INIT (PID 1): the Eclipse-native Rust init by default, with busybox
@@ -630,12 +635,21 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
         // package mirror in reach still gets a session bus -- which is what
         // SDL_Init(), GtkApplication and every RequestName-based single-
         // instance check need before they will run at all.
-        let dbusd = self.eclipse_dbusd();
+        let (dbusd, portald) = self.eclipse_dbusd();
         if dbusd.is_file() {
             let _ = dir::rm(bin.join("eclipse-dbusd"));
             fs::copy(&dbusd, bin.join("eclipse-dbusd")).unwrap();
         } else {
             eprintln!("warning: eclipse-dbusd not built; the session bus needs the dbus package");
+        }
+
+        // eclipse-portald: the XDG desktop portal, so that an application
+        // whose "Open file" is a D-Bus call gets a dialog at all.
+        if portald.is_file() {
+            let _ = dir::rm(bin.join("eclipse-portald"));
+            fs::copy(&portald, bin.join("eclipse-portald")).unwrap();
+        } else {
+            eprintln!("warning: eclipse-portald not built; there will be no file-chooser portal");
         }
 
         // wavplay: minimal OSS player for the HDA audio driver (`/dev/dsp*`).
@@ -1189,6 +1203,11 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
               # SDL_Init: with no daemon the connect is refused at once and\n\
               # apps carry on.\n\
               export DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/0/bus\n\
+              # GTK's file dialog is a portal call when GTK_USE_PORTAL=1. The\n\
+              # stamp appears when eclipse-portald owns the name, so the var\n\
+              # follows a portal that really serves. No wait here (the labwc\n\
+              # wrapper has one): a login shell runs long after boot.\n\
+              [ -e /run/user/0/eclipse-portal.ready ] && export GTK_USE_PORTAL=1\n\
               # wlroots' libinput backend aborts the whole compositor if it\n\
               # enumerates zero input devices ('libinput initialization failed,\n\
               # no input devices'). Without a running udevd to tag devices,\n\
@@ -2951,6 +2970,8 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
               exit 127\n",
         )
         .unwrap();
+        portal::write_wrapper(localbin);
+
         // D-Bus SYSTEM bus. PulseAudio runs `--system` (user-mode pulse
         // refuses uid 0), and in that mode its main.c connects to the system
         // bus. There was none, so every boot logged
@@ -3076,60 +3097,6 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
               exit 127\n",
         )
         .unwrap();
-    }
-
-    /// Cross-compile `tools/eclipse-dbusd` (Rust) as a static, non-PIE musl
-    /// binary and return its path. Best-effort, like every other tool here: a
-    /// failed build just means the image relies on Alpine's `dbus-daemon`.
-    fn eclipse_dbusd(&self) -> PathBuf {
-        let dir = PROJECT_DIR.join("tools").join("eclipse-dbusd");
-        let triple = self.musl_rust_triple();
-        let executable = dir
-            .join("target")
-            .join(triple)
-            .join("release")
-            .join("eclipse-dbusd");
-        let newest_src = [
-            "src/main.rs",
-            "src/bus.rs",
-            "src/message.rs",
-            "src/client.rs",
-            "Cargo.toml",
-        ]
-        .iter()
-        .filter_map(|rel| fs::metadata(dir.join(rel)).ok()?.modified().ok())
-        .max();
-        if let (Ok(bin_meta), Some(src_mtime)) = (fs::metadata(&executable), newest_src) {
-            if let Ok(bin_mtime) = bin_meta.modified() {
-                if bin_mtime >= src_mtime && self.cached_for_target(&executable) {
-                    return executable;
-                }
-            }
-        }
-
-        println!("Compiling eclipse-dbusd (Rust, {triple})...");
-        let _ = Ext::new("rustup")
-            .arg("target")
-            .arg("add")
-            .arg(triple)
-            .status();
-        let mut cargo = Ext::new("cargo");
-        cargo
-            .current_dir(&dir)
-            .arg("build")
-            .arg("--release")
-            .arg("--target")
-            .arg(triple);
-        // Static non-PIE, plus the cross linker when the host's `cc` cannot
-        // link this target at all: see `cross_build_env`.
-        for (k, v) in self.cross_build_env() {
-            cargo.env(k, v);
-        }
-        let status = cargo.status();
-        if !status.success() {
-            eprintln!("warning: eclipse-dbusd build failed; only dbus-daemon can serve the bus");
-        }
-        executable
     }
 
     /// Cross-compile the `tools/lunarbar` package (Rust) as static musl
@@ -3845,6 +3812,8 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
               log = /tmp/dbus.log\n",
         )
         .unwrap();
+
+        portal::write_service(svc_dir);
 
         // D-Bus system bus, on libdbus's compiled-in default address. A second
         // bus, independent of the session one above; see eclipse-dbus-system
@@ -6091,6 +6060,8 @@ mod rootfs_plumbing_tests {
             ),
             ("ntpd", "respawn", "/usr/local/bin/eclipse-ntpd", "udhcpc"),
             ("oopslog", "respawn", "/usr/local/bin/eclipse-oopslog", ""),
+            // No `after`: `requires = dbus` implies it (#1744).
+            ("portal", "respawn", "/usr/local/bin/eclipse-portal", ""),
             (
                 "pulseaudio",
                 "respawn",
@@ -6209,7 +6180,14 @@ mod rootfs_plumbing_tests {
                 let Some((_, body)) = all.iter().find(|(s, _)| *s == n) else {
                     continue;
                 };
-                for dep in field(body, "after").unwrap_or_default().split_whitespace() {
+                // `requires` implies `after` (#1744): naming only the
+                // requirement orders the service just as firmly.
+                let deps = format!(
+                    "{} {}",
+                    field(body, "after").unwrap_or_default(),
+                    field(body, "requires").unwrap_or_default()
+                );
+                for dep in deps.split_whitespace() {
                     if !out.iter().any(|d| d == dep) {
                         out.push(dep.to_string());
                         todo.push(dep.to_string());
@@ -6369,6 +6347,8 @@ mod rootfs_plumbing_tests {
             "dbus-system",
             "ntpd",
             "oopslog",
+            // A bus service, not a session one: Xorg has GTK apps too.
+            "portal",
             "pulseaudio",
             "udhcpc",
         ];
