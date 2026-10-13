@@ -632,7 +632,18 @@ async fn run_user(thread: CurrentThread) {
         if let Some(lp) = thread.proc().try_linux() {
             lp.pull_shared_pending_into(&thread.inner());
         }
-        let pending_signal = thread.inner().lock_linux().handle_signal();
+        // `has_deliverable_signal` reads a word published outside the
+        // thread's lock, so the overwhelmingly common "nothing pending"
+        // return pays a relaxed load instead of a downcast, an integrity
+        // check and a mutex (11.3 ns against 0.6; see
+        // `linux_object::thread::LinuxThreadExt`). When it says there is
+        // something, the lock is taken and `handle_signal` decides, exactly
+        // as before -- the word is a filter, never the decision.
+        let pending_signal = if thread.inner().has_deliverable_signal() {
+            thread.inner().lock_linux().handle_signal()
+        } else {
+            None
+        };
         if let Some((signal, sigmask)) = pending_signal {
             ctx = handle_signal(&thread, ctx, signal, sigmask);
         }
