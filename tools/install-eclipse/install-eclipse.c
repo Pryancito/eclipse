@@ -181,6 +181,7 @@ static int command_exists(const char *name);
 static int run_command_logged(const char *cmd, int dry_run);
 static int run_command_capture_token(const char *cmd, char *out, size_t out_size);
 static int verify_sha256_file(const char *image_path);
+static void clear_progress_line(int last_pct);
 
 typedef struct {
     uint32_t state[8];
@@ -360,21 +361,45 @@ static ssize_t disk_pread_all(int fd, void *buf, size_t len, uint64_t offset) {
 }
 
 static int sha256_file_path(const char *path, char *hex_out) {
-    uint8_t buf[4096];
+    uint8_t buf[65536];
     sha256_ctx ctx;
     uint8_t digest[32];
     FILE *fp;
     size_t nread;
+    uint64_t done = 0;
+    off_t file_size = 0;
+    int last_pct = -1;
 
     fp = fopen(path, "rb");
     if (fp == NULL) {
         return -1;
     }
 
+    /* Las imágenes son de cientos de MiB y esto se recorre entero antes de
+     * tocar el disco: sin porcentaje, el instalador parece colgado desde
+     * antes de empezar a escribir. */
+    struct stat st;
+    if (stat(path, &st) == 0) {
+        file_size = st.st_size;
+    }
+
     sha256_init(&ctx);
     while ((nread = fread(buf, 1, sizeof(buf), fp)) > 0) {
         sha256_update(&ctx, buf, nread);
+        done += (uint64_t)nread;
+        if (file_size > 0) {
+            int pct = (int)((done * 100) / (uint64_t)file_size);
+            if (pct > 100) {
+                pct = 100;
+            }
+            if (pct > last_pct) {
+                fprintf(stdout, "\rVerificando %s: %d%%...", disk_basename(path), pct);
+                fflush(stdout);
+                last_pct = pct;
+            }
+        }
     }
+    clear_progress_line(last_pct);
     if (ferror(fp)) {
         fclose(fp);
         return -1;
@@ -1830,6 +1855,14 @@ static int write_gpt_partition_table(const char *disk_path, const struct partiti
     return -1;
 }
 
+/* Borra la línea de progreso `\r` si se llegó a pintar alguna. */
+static void clear_progress_line(int last_pct) {
+    if (last_pct >= 0) {
+        fprintf(stdout, "\r\x1b[K");
+        fflush(stdout);
+    }
+}
+
 static int decompress_gz_to_path(const char *gz_path, const char *out_path, int dry_run) {
     uint8_t buf[4096];
     gzFile gz;
@@ -1865,10 +1898,7 @@ static int decompress_gz_to_path(const char *gz_path, const char *out_path, int 
     for (;;) {
         int nread = gzread(gz, buf, sizeof(buf));
         if (nread < 0) {
-            if (last_pct >= 0) {
-                fprintf(stdout, "\r\x1b[K");
-                fflush(stdout);
-            }
+            clear_progress_line(last_pct);
             log(COLOR_RED COLOR_BOLD "ERROR: Descompresión de %s falló (%s)." COLOR_RESET,
                 gz_path, gzerror(gz, NULL));
             close(out_fd);
@@ -1881,10 +1911,7 @@ static int decompress_gz_to_path(const char *gz_path, const char *out_path, int 
 
         ssize_t nwritten = write(out_fd, buf, (size_t)nread);
         if (nwritten < 0 || (size_t)nwritten != (size_t)nread) {
-            if (last_pct >= 0) {
-                fprintf(stdout, "\r\x1b[K");
-                fflush(stdout);
-            }
+            clear_progress_line(last_pct);
             log(COLOR_RED COLOR_BOLD "ERROR: Escritura en %s falló (%s)." COLOR_RESET,
                 out_path, strerror(errno));
             close(out_fd);
@@ -1909,10 +1936,7 @@ static int decompress_gz_to_path(const char *gz_path, const char *out_path, int 
         }
     }
 
-    if (last_pct >= 0) {
-        fprintf(stdout, "\r\x1b[K");
-        fflush(stdout);
-    }
+    clear_progress_line(last_pct);
 
     if (fsync(out_fd) != 0) {
         log(COLOR_YELLOW "ADVERTENCIA: fsync en %s: %s" COLOR_RESET, out_path, strerror(errno));
@@ -1927,12 +1951,32 @@ static int decompress_gz_to_path(const char *gz_path, const char *out_path, int 
     return 0;
 }
 
+/* Trozo con el que se descomprime y escribe una imagen de partición.
+ *
+ * Eran 4 KiB, y eso son 262.144 vueltas de gzread + pwrite para el GiB de
+ * la partición EFI, sin una sola línea en pantalla mientras tanto: el paso
+ * "[2/3] Escribiendo partición EFI (1 GB)..." se queda ahí quieto el rato
+ * que tarde el medio, que en un USB lento son muchos minutos, y lo único
+ * que se mueve en la pantalla son los respawns del init. Eso no se
+ * distingue de un cuelgue, y un instalador que parece colgado se reinicia
+ * a mano a mitad de la escritura: medio sistema en el disco, y un rboot
+ * que al arrancar no encuentra lo que debía estar en la ESP. */
+#define IMG_CHUNK (1024U * 1024U)
+
+/* Reserva para `IMG_CHUNK`, con vuelta atrás si no hay heap: lo que no
+ * puede pasar es que la instalación muera por no poder reservar. */
+#define IMG_CHUNK_FALLBACK 65536U
+
 static int write_gz_image_to_disk(const char *gz_path, const char *disk_path, uint64_t start_sector, int dry_run) {
-    uint8_t buf[4096];
+    uint8_t fallback_buf[IMG_CHUNK_FALLBACK];
+    uint8_t *buf;
+    size_t chunk;
     gzFile gz;
     uint64_t offset;
     size_t total = 0;
     int disk_fd;
+    off_t gz_size = 0;
+    int last_pct = -1;
 
     if (dry_run) {
         log(COLOR_YELLOW "[dry-run] gzip -dc %s -> %s @ sector %" PRIu64 COLOR_RESET,
@@ -1940,9 +1984,24 @@ static int write_gz_image_to_disk(const char *gz_path, const char *disk_path, ui
         return 0;
     }
 
+    buf = malloc(IMG_CHUNK);
+    chunk = IMG_CHUNK;
+    if (buf == NULL) {
+        buf = fallback_buf;
+        chunk = sizeof(fallback_buf);
+    }
+
+    struct stat gz_st;
+    if (stat(gz_path, &gz_st) == 0) {
+        gz_size = gz_st.st_size;
+    }
+
     gz = gzopen(gz_path, "rb");
     if (gz == NULL) {
         log(COLOR_RED COLOR_BOLD "ERROR: No se pudo abrir %s para descompresión." COLOR_RESET, gz_path);
+        if (buf != fallback_buf) {
+            free(buf);
+        }
         return -1;
     }
 
@@ -1951,17 +2010,24 @@ static int write_gz_image_to_disk(const char *gz_path, const char *disk_path, ui
         log(COLOR_RED COLOR_BOLD "ERROR: No se pudo abrir %s para escritura (%s)." COLOR_RESET,
             disk_path, strerror(errno));
         gzclose(gz);
+        if (buf != fallback_buf) {
+            free(buf);
+        }
         return -1;
     }
 
     offset = start_sector * SECTOR_SIZE;
     for (;;) {
-        int nread = gzread(gz, buf, sizeof(buf));
+        int nread = gzread(gz, buf, (unsigned)chunk);
         if (nread < 0) {
+            clear_progress_line(last_pct);
             log(COLOR_RED COLOR_BOLD "ERROR: Descompresión de %s falló (%s)." COLOR_RESET,
                 gz_path, gzerror(gz, NULL));
             close(disk_fd);
             gzclose(gz);
+            if (buf != fallback_buf) {
+                free(buf);
+            }
             return -1;
         }
         if (nread == 0) {
@@ -1969,15 +2035,44 @@ static int write_gz_image_to_disk(const char *gz_path, const char *disk_path, ui
         }
 
         if (disk_pwrite_all(disk_fd, buf, (size_t)nread, offset) != nread) {
+            clear_progress_line(last_pct);
             log(COLOR_RED COLOR_BOLD "ERROR: Escritura en %s @ %" PRIu64 " falló (%s)." COLOR_RESET,
                 disk_path, offset, strerror(errno));
             close(disk_fd);
             gzclose(gz);
+            if (buf != fallback_buf) {
+                free(buf);
+            }
             return -1;
         }
 
         offset += (uint64_t)nread;
         total += (size_t)nread;
+
+        /* El porcentaje va sobre el fichero .gz consumido, no sobre los
+         * bytes escritos: el tamaño descomprimido no se conoce de antemano
+         * (el ISIZE del trailer es módulo 4 GiB). */
+        if (gz_size > 0) {
+            z_off_t curr = gzoffset(gz);
+            if (curr >= 0) {
+                int pct = (int)((curr * 100) / gz_size);
+                if (pct > 100) {
+                    pct = 100;
+                }
+                if (pct > last_pct) {
+                    fprintf(stdout, "\rEscribiendo %s en %s: %d%% (%llu MiB)...",
+                            disk_basename(gz_path), disk_basename(disk_path), pct,
+                            (unsigned long long)(total / MIB));
+                    fflush(stdout);
+                    last_pct = pct;
+                }
+            }
+        }
+    }
+
+    clear_progress_line(last_pct);
+    if (buf != fallback_buf) {
+        free(buf);
     }
 
     if (fsync(disk_fd) != 0) {

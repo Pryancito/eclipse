@@ -13,6 +13,7 @@ mod errors;
 #[cfg(test)]
 mod features;
 mod linux;
+mod sha256;
 #[cfg(test)]
 mod tamano;
 mod variant;
