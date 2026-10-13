@@ -1039,6 +1039,30 @@ fn write_kde_helpers(rootfs: &Path) {
     .unwrap();
     fs::set_permissions(&show, fs::Permissions::from_mode(0o755)).unwrap();
 
+    let clip = localbin.join("eclipse-clipboard");
+    fs::write(
+        &clip,
+        b"#!/bin/sh\n\
+          # Eclipse OS: Super+V, the clipboard history (lunarclip --pick).\n\
+          # Toggling like eclipse-run: a second press closes the overlay\n\
+          # instead of stacking a second one on top of it.\n\
+          #\n\
+          # Matched by its full command line and NOT by the bare program\n\
+          # name: the daemon that owns the clipboard is this same binary\n\
+          # (`lunarclip --watch`), so killing by name would kill it too -- and\n\
+          # on Wayland the selection belongs to the process offering it, so\n\
+          # that one keypress would empty the clipboard and lose the history\n\
+          # nobody had saved yet.\n\
+          LOG=/tmp/lunarclip.log\n\
+          if pkill -f 'lunarclip --pick' 2>/dev/null; then exit 0; fi\n\
+          command -v lunarclip >/dev/null 2>&1 || {\n\
+          \x20 echo \"[$(date '+%H:%M:%S')] lunarclip missing\" >>\"$LOG\"; exit 127\n\
+          }\n\
+          exec lunarclip --pick >>\"$LOG\" 2>&1\n",
+    )
+    .unwrap();
+    fs::set_permissions(&clip, fs::Permissions::from_mode(0o755)).unwrap();
+
     let files = localbin.join("eclipse-files");
     fs::write(
         &files,
@@ -2605,6 +2629,11 @@ fn write_labwc_rc(rootfs: &Path) {
          failing that the best console file manager installed, or a shell in
          $HOME. -->
     <keybind key="W-E"><action name="Execute"><command>/usr/local/bin/eclipse-files</command></action></keybind>
+    <!-- Super+V: the clipboard history, like every other desktop's. Wayland
+         gives the selection to the client that copied, so without a manager
+         closing that window empties the clipboard; eclipse-clipboard opens
+         lunarclip's picker over the daemon that keeps it. -->
+    <keybind key="W-V"><action name="Execute"><command>/usr/local/bin/eclipse-clipboard</command></action></keybind>
     <!-- Super+D: show desktop. labwc has no such action on every release, so
          this minimises (or restores) every window through
          wlr-foreign-toplevel-management instead, which is version-proof. -->
@@ -2702,6 +2731,7 @@ const MENU_ES: &[u8] = br#"<?xml version="1.0" encoding="UTF-8"?>
     <item label="Ejecutar (Alt+Espacio)"><action name="Execute"><command>/usr/local/bin/eclipse-run</command></action></item>
     <item label="Terminal"><action name="Execute"><command>/usr/local/bin/eclipse-terminal</command></action></item>
     <item label="Archivos"><action name="Execute"><command>/usr/local/bin/eclipse-files</command></action></item>
+    <item label="Portapapeles (Super+V)"><action name="Execute"><command>/usr/local/bin/eclipse-clipboard</command></action></item>
     <item label="Firefox"><action name="Execute"><command>/usr/local/bin/eclipse-firefox</command></action></item>
     <item label="Editor (nano)"><action name="Execute"><command>/usr/local/bin/eclipse-terminal nano</command></action></item>
     <item label="Monitor (top)"><action name="Execute"><command>/usr/local/bin/eclipse-terminal top</command></action></item>
@@ -2727,6 +2757,7 @@ const MENU_EN: &[u8] = br#"<?xml version="1.0" encoding="UTF-8"?>
     <item label="Run (Alt+Space)"><action name="Execute"><command>/usr/local/bin/eclipse-run</command></action></item>
     <item label="Terminal"><action name="Execute"><command>/usr/local/bin/eclipse-terminal</command></action></item>
     <item label="Files"><action name="Execute"><command>/usr/local/bin/eclipse-files</command></action></item>
+    <item label="Clipboard (Super+V)"><action name="Execute"><command>/usr/local/bin/eclipse-clipboard</command></action></item>
     <item label="Firefox"><action name="Execute"><command>/usr/local/bin/eclipse-firefox</command></action></item>
     <item label="Editor (nano)"><action name="Execute"><command>/usr/local/bin/eclipse-terminal nano</command></action></item>
     <item label="Monitor (top)"><action name="Execute"><command>/usr/local/bin/eclipse-terminal top</command></action></item>
@@ -5110,6 +5141,7 @@ mod tests {
         let want: &[(&str, &[&str])] = &[
             ("eclipse-run", &["A-space", "A-F2", "C-A-Delete"]),
             ("eclipse-files", &["W-E"]),
+            ("eclipse-clipboard", &["W-V"]),
             ("eclipse-showdesktop", &["W-D"]),
             ("eclipse-terminal", &["W-Return", "A-Return", "C-A-T"]),
         ];
@@ -5150,6 +5182,24 @@ mod tests {
             run.contains("pkill -x lunarrun") && run.contains("exit 0"),
             "a second press stacks another launcher instead of closing it:\n{run}"
         );
+        let clip = fs::read_to_string(bin.join("eclipse-clipboard")).unwrap();
+        assert!(
+            clip.contains("pkill -f 'lunarclip --pick'") && clip.contains("exit 0"),
+            "a second Super+V stacks another picker instead of closing it:\n{clip}"
+        );
+        // The one way this wrapper can do real damage: `lunarclip --watch` is
+        // the same binary, so a match by name alone kills the daemon -- and
+        // with it the selection, which on Wayland lives in the process that
+        // offers it. One keypress would empty the clipboard.
+        assert!(
+            !clip.contains("pkill -x lunarclip"),
+            "Super+V kills the clipboard daemon it depends on:\n{clip}"
+        );
+        assert!(
+            clip.contains("exec lunarclip --pick"),
+            "Super+V does not open the history:\n{clip}"
+        );
+
         let show = fs::read_to_string(bin.join("eclipse-showdesktop")).unwrap();
         assert!(
             show.contains("lunarrun --toggle-desktop"),

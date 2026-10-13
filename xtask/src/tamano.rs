@@ -54,7 +54,12 @@ const PASADOS: &[(&str, usize)] = &[
     ("linux-object/src/fs/devfs/drm.rs", 8500),
     ("drivers/src/usb/xhci_hid.rs", 7750),
     ("drivers/src/net/e1000e.rs", 7500),
-    ("xtask/src/linux/mod.rs", 7500),
+    // 7750: lunarclip (el portapapeles) trajo aqui su servicio, su wrapper y
+    // su fila en los inventarios, y el fichero se paso a 7562. Partirlo es la
+    // tanda que dice el comentario de arriba -- tiene un `mod
+    // rootfs_plumbing_tests` de primer nivel enorme -- y no se hace a la vez
+    // que entra una aplicacion nueva.
+    ("xtask/src/linux/mod.rs", 7750),
     ("linux-object/src/fs/devfs/drm_scheme.rs", 6750),
     ("linux-object/src/fs/procfs.rs", 6500),
     ("linux-object/src/process.rs", 6000),
