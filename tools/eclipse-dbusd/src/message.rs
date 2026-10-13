@@ -312,10 +312,27 @@ pub enum Arg {
     Sig(String),
     /// `as`
     StrArray(Vec<String>),
+    /// `ay` — a byte array. The XDG portals carry FILESYSTEM PATHS in one
+    /// (`current_folder`, `current_file`), NUL-terminated, precisely because a
+    /// path is not guaranteed to be UTF-8 and a `s` would have to be. Reading
+    /// it is what lets the portal open the dialog in the folder the client
+    /// asked for.
+    ByteArray(Vec<u8>),
     /// `a{ss}` — the shape `UpdateActivationEnvironment` takes, kept so a
     /// caller can build one without another marshaller.
     #[allow(dead_code)]
     DictSS(Vec<(String, String)>),
+    /// `a{sv}` — "a dictionary of options", the shape every XDG desktop portal
+    /// method takes and every `Response` signal carries back. It is also what
+    /// `org.freedesktop.DBus.Properties.GetAll` returns. Both halves are
+    /// implemented (read and write): a portal that could only write one would
+    /// not be able to read the options GTK sends it.
+    ///
+    /// The values are stored **unwrapped**: the `v` of each entry is put on by
+    /// the writer and taken off by the reader, so `("version", Arg::U32(3))` is
+    /// the version property and `("version", Arg::Variant(..))` would be a
+    /// variant inside a variant, which is a different (and wrong) message.
+    DictSV(Vec<(String, Arg)>),
     /// A variant wrapping one of the above.
     Variant(Box<Arg>),
     /// Anything the reader met but does not model. The signature is kept so a
@@ -333,7 +350,9 @@ impl Arg {
             Arg::Path(_) => out.push('o'),
             Arg::Sig(_) => out.push('g'),
             Arg::StrArray(_) => out.push_str("as"),
+            Arg::ByteArray(_) => out.push_str("ay"),
             Arg::DictSS(_) => out.push_str("a{ss}"),
+            Arg::DictSV(_) => out.push_str("a{sv}"),
             Arg::Variant(_) => out.push('v'),
             Arg::Other(s) => out.push_str(s),
         }
@@ -359,6 +378,16 @@ impl Arg {
                 let n = w.len() - start;
                 w.patch_u32(len_at, n as u32);
             }
+            Arg::ByteArray(bytes) => {
+                // ARRAY of BYTE: the length word, then the bytes with no
+                // padding of their own (BYTE is 1-aligned).
+                w.align(4);
+                let len_at = w.reserve_u32();
+                let start = w.len();
+                w.raw(bytes);
+                let n = w.len() - start;
+                w.patch_u32(len_at, n as u32);
+            }
             Arg::DictSS(items) => {
                 w.align(4);
                 let len_at = w.reserve_u32();
@@ -368,6 +397,19 @@ impl Arg {
                     w.align(8);
                     w.put_string(k);
                     w.put_string(v);
+                }
+                let n = w.len() - start;
+                w.patch_u32(len_at, n as u32);
+            }
+            Arg::DictSV(items) => {
+                w.align(4);
+                let len_at = w.reserve_u32();
+                w.align(8); // DICT_ENTRY
+                let start = w.len();
+                for (k, v) in items {
+                    w.align(8);
+                    w.put_string(k);
+                    v.write_variant(w);
                 }
                 let n = w.len() - start;
                 w.patch_u32(len_at, n as u32);
@@ -458,7 +500,39 @@ fn read_one(r: &mut Reader, sig: &[u8], i: &mut usize) -> Option<Arg> {
                 *i += 1;
                 return Some(Arg::StrArray(items));
             }
-            // Not a string array: skip the whole thing and the element type.
+            if elem == b'y' {
+                // `ay`: the bytes as they lie. A path arrives this way.
+                let bytes = r.bytes(end)?;
+                *i += 1;
+                return Some(Arg::ByteArray(bytes));
+            }
+            if elem == b'{'
+                && sig.get(*i + 1) == Some(&b's')
+                && sig.get(*i + 2) == Some(&b'v')
+                && sig.get(*i + 3) == Some(&b'}')
+            {
+                // `a{sv}`: each entry is a STRUCT-aligned pair of a STRING key
+                // and a VARIANT. A value this reader cannot model comes back as
+                // `Arg::Other`, which is still a KEY that was present -- a
+                // portal has to be able to say "the client sent `filters` and I
+                // did not understand it" rather than lose the entry.
+                let mut items = Vec::new();
+                while r.pos() < end {
+                    r.align(8);
+                    if r.pos() >= end {
+                        break;
+                    }
+                    let k = r.string()?;
+                    let vs = r.signature()?;
+                    let vb = vs.as_bytes();
+                    let mut j = 0;
+                    let v = read_one(r, vb, &mut j)?;
+                    items.push((k, v));
+                }
+                *i += 4; // `{sv}`
+                return Some(Arg::DictSV(items));
+            }
+            // Not a string array nor a{sv}: skip it whole, and the element type.
             r.seek(end);
             skip_type(sig, i);
             let mut s = String::from("a");
@@ -537,6 +611,11 @@ pub struct Writer {
     endian: u8,
 }
 
+// `len` with no `is_empty`: a `Writer` is a buffer that only grows, and the
+// one caller wants the POSITION, to measure an array's bytes. The lint began
+// firing when this module became a library's (for `eclipse-portald`), not
+// because anything changed here.
+#[allow(clippy::len_without_is_empty)]
 impl Writer {
     pub fn new(endian: u8) -> Self {
         Writer {
@@ -639,6 +718,13 @@ impl<'a> Reader<'a> {
         } else {
             u32::from_be_bytes(a)
         })
+    }
+    /// The bytes from the current position up to `end`, which must not be
+    /// past the buffer. Used for `ay`, whose elements carry no padding.
+    pub fn bytes(&mut self, end: usize) -> Option<Vec<u8>> {
+        let b = self.buf.get(self.pos..end)?.to_vec();
+        self.seek(end);
+        Some(b)
     }
     pub fn string(&mut self) -> Option<String> {
         let n = self.u32()? as usize;
@@ -1602,5 +1688,313 @@ mod tests {
             let r = MatchRule::parse(text);
             assert_eq!(r.matches(&m, ":1.1", &[]), want, "{text}");
         }
+    }
+
+    #[test]
+    fn an_option_dictionary_survives_the_round_trip() {
+        // `a{sv}` is the shape every portal method takes. Each entry is a
+        // STRING key and a VARIANT, so the values do not have to agree on a
+        // type: GTK sends `multiple` as a boolean next to `current_name` as a
+        // string in the same call.
+        let mut m = Message::method_call(
+            "org.freedesktop.portal.Desktop",
+            "/org/freedesktop/portal/desktop",
+            "org.freedesktop.portal.FileChooser",
+            "OpenFile",
+        );
+        m.serial = 11;
+        let opts = vec![
+            ("handle_token".to_string(), Arg::Str("abc123".into())),
+            ("multiple".to_string(), Arg::Bool(true)),
+            ("directory".to_string(), Arg::Bool(false)),
+            ("accept_label".to_string(), Arg::Str("Abrir".into())),
+            (
+                "current_folder".to_string(),
+                Arg::StrArray(vec!["/root".into()]),
+            ),
+            ("flavour".to_string(), Arg::Byte(7)),
+            ("where".to_string(), Arg::Path("/org/a".into())),
+            ("shape".to_string(), Arg::Sig("a{sv}".into())),
+            ("count".to_string(), Arg::U32(3)),
+        ];
+        m.set_body(&[Arg::DictSV(opts.clone())]);
+        assert_eq!(m.signature.as_deref(), Some("a{sv}"));
+        let got = roundtrip(&m);
+        assert_eq!(got.signature.as_deref(), Some("a{sv}"));
+        assert_eq!(got.args(), vec![Arg::DictSV(opts)]);
+    }
+
+    #[test]
+    fn an_empty_option_dictionary_is_still_an_option_dictionary() {
+        // `OpenFile` with no options at all is legal, and the empty array must
+        // not come back as "no argument": the signature still promises one, so
+        // a reader that returned nothing would read the NEXT argument here.
+        let mut m = Message::signal("/", "org.example", "E");
+        m.serial = 1;
+        m.set_body(&[Arg::DictSV(Vec::new()), Arg::Str("despues".into())]);
+        let got = roundtrip(&m);
+        assert_eq!(got.signature.as_deref(), Some("a{sv}s"));
+        assert_eq!(
+            got.args(),
+            vec![Arg::DictSV(Vec::new()), Arg::Str("despues".into())]
+        );
+    }
+
+    #[test]
+    fn what_follows_an_option_dictionary_is_read_at_the_right_offset() {
+        // The reader has to step the SIGNATURE index past all four bytes of
+        // `{sv}`, not one: the argument after the dictionary is the proof. This
+        // is `(s parent_window, s title, a{sv} options)` turned inside out --
+        // every portal reply and `Response` signal puts the dictionary last,
+        // but `Properties.GetAll` is answered with one and the daemon's own
+        // replies append to it.
+        let mut m = Message::method_call("a.b", "/", "a.b", "C");
+        m.serial = 2;
+        m.set_body(&[
+            Arg::DictSV(vec![("k".into(), Arg::U32(1))]),
+            Arg::Str("cola".into()),
+            Arg::U32(0xfeed),
+        ]);
+        let got = roundtrip(&m);
+        assert_eq!(got.signature.as_deref(), Some("a{sv}su"));
+        assert_eq!(
+            got.args(),
+            vec![
+                Arg::DictSV(vec![("k".into(), Arg::U32(1))]),
+                Arg::Str("cola".into()),
+                Arg::U32(0xfeed)
+            ]
+        );
+    }
+
+    #[test]
+    fn a_portal_open_file_call_reads_back_as_it_was_sent() {
+        // The exact body GTK puts on the wire: `ssa{sv}`.
+        let mut m = Message::method_call(
+            "org.freedesktop.portal.Desktop",
+            "/org/freedesktop/portal/desktop",
+            "org.freedesktop.portal.FileChooser",
+            "OpenFile",
+        );
+        m.serial = 5;
+        m.set_body(&[
+            Arg::Str(String::new()), // parent_window, empty when unknown
+            Arg::Str("Abrir archivo".into()),
+            Arg::DictSV(vec![
+                ("handle_token".into(), Arg::Str("gtk1".into())),
+                ("multiple".into(), Arg::Bool(false)),
+            ]),
+        ]);
+        let got = roundtrip(&m);
+        assert_eq!(got.signature.as_deref(), Some("ssa{sv}"));
+        let args = got.args();
+        assert_eq!(args.len(), 3, "{args:?}");
+        assert_eq!(args[1], Arg::Str("Abrir archivo".into()));
+        match &args[2] {
+            Arg::DictSV(items) => {
+                assert_eq!(items[0].0, "handle_token");
+                assert_eq!(items[1].1, Arg::Bool(false));
+            }
+            other => panic!("las opciones no son a{{sv}}: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_response_signal_carries_its_uris_back() {
+        // `Response(u response, a{sv} results)`, where `uris` is an `as` INSIDE
+        // the variant. That nesting -- an array inside a variant inside an
+        // array of dict entries -- is the one the portal depends on, and the
+        // only place the writer and the reader have to agree about alignment
+        // twice over.
+        let mut m = Message::signal(
+            "/org/freedesktop/portal/desktop/request/_1_17/gtk1",
+            "org.freedesktop.portal.Request",
+            "Response",
+        );
+        m.serial = 8;
+        let uris = vec![
+            "file:///root/a.txt".to_string(),
+            "file:///root/mis%20cosas/b.png".to_string(),
+        ];
+        m.set_body(&[
+            Arg::U32(0),
+            Arg::DictSV(vec![("uris".into(), Arg::StrArray(uris.clone()))]),
+        ]);
+        let got = roundtrip(&m);
+        assert_eq!(got.signature.as_deref(), Some("ua{sv}"));
+        assert_eq!(
+            got.args(),
+            vec![
+                Arg::U32(0),
+                Arg::DictSV(vec![("uris".into(), Arg::StrArray(uris))])
+            ]
+        );
+    }
+
+    #[test]
+    fn an_option_this_reader_cannot_model_still_keeps_its_key() {
+        // GTK sends `filters` as `a(sa(us))`, which this reader does not walk.
+        // Losing the VALUE is fine -- the portal ignores filters today -- but
+        // losing the ENTRY is not: the backend has to be able to tell that the
+        // client asked for something it is not honouring, and every option
+        // AFTER the unknown one must still arrive.
+        let mut m = Message::signal("/", "org.example", "E");
+        m.serial = 1;
+        m.set_body(&[Arg::DictSV(vec![
+            ("filters".into(), Arg::Other("a(s)".into())),
+            ("multiple".into(), Arg::Bool(true)),
+        ])]);
+        // `Other` is written as an empty `g` variant (see `write_variant`), so
+        // what comes back is the key with a signature value, not the original
+        // type -- but it comes back.
+        let got = roundtrip(&m);
+        match got.args().first() {
+            Some(Arg::DictSV(items)) => {
+                assert_eq!(items.len(), 2, "se perdio una entrada: {items:?}");
+                assert_eq!(items[0].0, "filters");
+                assert_eq!(items[1], ("multiple".to_string(), Arg::Bool(true)));
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn every_dictionary_entry_starts_on_its_eight_byte_boundary() {
+        // A DICT_ENTRY is a STRUCT: 8-aligned, and the padding between two
+        // entries is NOT counted in the array's length word. A writer that
+        // skipped it produces a body no other D-Bus library can read, which
+        // shows up as GTK dropping the connection rather than as a wrong value.
+        let mut m = Message::signal("/", "org.example", "E");
+        m.endian = b'l';
+        m.serial = 1;
+        // Keys of one byte and byte values, so every entry is 1 + 4 + 1 + 1
+        // (key) + 3 (variant `y`) = well short of 8: without the padding the
+        // second entry would start at an odd offset.
+        m.set_body(&[Arg::DictSV(vec![
+            ("a".into(), Arg::Byte(1)),
+            ("b".into(), Arg::Byte(2)),
+        ])]);
+        // The length word, then the entries: entry 0 at 8, entry 1 at 16.
+        let n = u32::from_le_bytes([m.body[0], m.body[1], m.body[2], m.body[3]]) as usize;
+        assert_eq!(
+            m.body.len(),
+            8 + n,
+            "la longitud no cuenta solo los elementos"
+        );
+        assert_eq!(&m.body[8..12], &[1, 0, 0, 0], "la clave no empieza en 8");
+        // Entry 0 runs 8..18: the key (4 + "a\0" = 8..14) and the variant
+        // (`g` "y" = 14..17, then the byte at 17). Entry 1 therefore starts at
+        // 24 and not at 18, and those six bytes of padding are the whole point.
+        assert_eq!(&m.body[12..14], b"a\0");
+        assert_eq!(&m.body[14..17], b"\x01y\0", "la firma de la variante");
+        assert_eq!(m.body[17], 1, "el valor de la primera entrada");
+        assert_eq!(&m.body[18..24], &[0, 0, 0, 0, 0, 0], "falta el relleno");
+        assert_eq!(
+            &m.body[24..28],
+            &[1, 0, 0, 0],
+            "la segunda entrada no esta en 24"
+        );
+        assert_eq!(&m.body[28..30], b"b\0");
+        assert_eq!(m.body[33], 2, "el valor de la segunda entrada");
+        // And it reads back, which is what the alignment is for.
+        assert_eq!(
+            roundtrip(&m).args(),
+            vec![Arg::DictSV(vec![
+                ("a".into(), Arg::Byte(1)),
+                ("b".into(), Arg::Byte(2))
+            ])]
+        );
+    }
+
+    #[test]
+    fn a_byte_array_carries_a_path_through_unchanged() {
+        // `ay` is how the portals carry a filesystem path (`current_folder`),
+        // NUL included, because a path need not be UTF-8. The bytes have to
+        // arrive exactly: one lost NUL is a different path.
+        let bodies: &[Vec<Arg>] = &[
+            vec![Arg::ByteArray(b"/root/mis cosas\0".to_vec())],
+            vec![Arg::ByteArray(Vec::new())],
+            vec![Arg::ByteArray(vec![0xff, 0xfe, 0x00])],
+            // After a UINT32 the position is 4-aligned and NOT 8-aligned,
+            // which is the only place a wrong alignment on the array's length
+            // word can show: four bytes of padding there would be read as a
+            // length of zero and the path would come back empty.
+            vec![
+                Arg::U32(7),
+                Arg::ByteArray(b"/root\0".to_vec()),
+                Arg::Str("cola".into()),
+            ],
+            // And inside the options dictionary, which is how it really
+            // arrives.
+            vec![Arg::DictSV(vec![
+                ("current_folder".into(), Arg::ByteArray(b"/tmp\0".to_vec())),
+                ("multiple".into(), Arg::Bool(true)),
+            ])],
+        ];
+        for args in bodies {
+            let mut m = Message::signal("/", "org.example", "E");
+            m.serial = 1;
+            m.set_body(args);
+            assert_eq!(&roundtrip(&m).args(), args, "{args:?}");
+        }
+        // The signature is the one the specification gives it.
+        let mut m = Message::signal("/", "org.example", "E");
+        m.set_body(&[Arg::ByteArray(vec![1])]);
+        assert_eq!(m.signature.as_deref(), Some("ay"));
+    }
+
+    #[test]
+    fn a_truncated_option_dictionary_is_dropped_and_not_invented() {
+        // The body is whatever a client put on the socket. A dictionary whose
+        // last entry is cut short must not come back as an entry with a made-up
+        // value: the daemon would then act on a key the client never finished
+        // sending. What it returns is what it had, which is how the rest of
+        // this reader behaves (`args` stops the walk and keeps the prefix).
+        let mut m = Message::signal("/", "org.example", "E");
+        m.serial = 1;
+        m.set_body(&[Arg::DictSV(vec![
+            ("a".into(), Arg::U32(1)),
+            ("b".into(), Arg::U32(2)),
+        ])]);
+        let whole = m.args();
+        // Cut one byte at a time off the end: no panic, and never an entry
+        // claiming a value that is not there.
+        for cut in 1..m.body.len() {
+            let mut t = m.clone();
+            t.body.truncate(m.body.len() - cut);
+            let args = t.args();
+            match args.first() {
+                None => {}
+                Some(Arg::DictSV(d)) => {
+                    assert!(d.len() <= 2, "invento entradas: {d:?}");
+                    for (k, v) in d {
+                        assert!(k == "a" || k == "b", "clave inventada {k:?}");
+                        assert!(
+                            matches!(v, Arg::U32(1) | Arg::U32(2)),
+                            "valor inventado para {k}: {v:?}"
+                        );
+                    }
+                }
+                other => panic!("corte {cut}: {other:?}"),
+            }
+        }
+        // And the whole thing still reads whole, so the loop above was not
+        // passing because nothing parses.
+        assert_eq!(whole.len(), 1);
+    }
+
+    #[test]
+    fn an_option_dictionary_in_the_other_byte_order_reads_the_same() {
+        // The bus forwards a body in the SENDER's byte order, so a big-endian
+        // client's options have to be read as they were written.
+        let mut m = Message::method_call("a.b", "/", "a.b", "C");
+        m.endian = b'B';
+        m.serial = 3;
+        let opts = vec![
+            ("n".to_string(), Arg::U32(0x0a0b_0c0d)),
+            ("s".to_string(), Arg::Str("eñe".into())),
+        ];
+        m.set_body(&[Arg::DictSV(opts.clone())]);
+        assert_eq!(roundtrip(&m).args(), vec![Arg::DictSV(opts)]);
     }
 }

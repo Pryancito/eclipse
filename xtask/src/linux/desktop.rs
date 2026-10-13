@@ -3104,6 +3104,32 @@ fn write_labwc_wrapper(rootfs: &Path) {
           # `dbus-daemon --session --address=unix:path=$XDG_RUNTIME_DIR/bus`\n\
           # started later is picked up by every new client automatically.\n\
           : \"${DBUS_SESSION_BUS_ADDRESS:=unix:path=/run/user/0/bus}\"; export DBUS_SESSION_BUS_ADDRESS\n\
+          # GTK's \"Open file\" is a D-Bus call to the desktop portal when\n\
+          # GTK_USE_PORTAL=1, and nothing but that var turns it on outside a\n\
+          # sandbox. It is set only when a portal is actually SERVING: the\n\
+          # stamp file appears when eclipse-portald has taken\n\
+          # org.freedesktop.portal.Desktop (see /usr/local/bin/eclipse-portal).\n\
+          # Pointing GTK at a portal that is not there would skip the dialog it\n\
+          # has of its own and gain nothing.\n\
+          PORTAL_READY=\"$XDG_RUNTIME_DIR/eclipse-portal.ready\"\n\
+          if [ ! -e \"$PORTAL_READY\" ]; then\n\
+          \x20 # Installed means starting: the same init starts the portal and\n\
+          \x20 # this session, so an absent stamp this early is a race and not\n\
+          \x20 # an answer. Three seconds at most, and only when there is\n\
+          \x20 # something to wait for.\n\
+          \x20 if [ -x /bin/eclipse-portald ] || [ -x /usr/local/bin/eclipse-portald ]; then\n\
+          \x20 \x20 i=0\n\
+          \x20 \x20 while [ \"$i\" -lt 3 ] && [ ! -e \"$PORTAL_READY\" ]; do\n\
+          \x20 \x20 \x20 sleep 1\n\
+          \x20 \x20 \x20 i=$((i+1))\n\
+          \x20 \x20 done\n\
+          \x20 fi\n\
+          fi\n\
+          if [ -e \"$PORTAL_READY\" ]; then\n\
+          \x20 GTK_USE_PORTAL=1; export GTK_USE_PORTAL\n\
+          else\n\
+          \x20 echo \"[labwc] sin portal: el dialogo de archivos lo pone cada aplicacion\" >&2\n\
+          fi\n\
           # Backends: DRM for output + libinput for evdev. Naming them keeps\n\
           # wlroots off the headless/X11 autodetect fallbacks when no parent\n\
           # display exists.\n\
@@ -4062,6 +4088,67 @@ mod tests {
             wrapper.contains("QT_QUICK_BACKEND:=software"),
             "Qt Quick must fall back to its software raster on the pixman session"
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// GTK's file dialog is a portal call only when `GTK_USE_PORTAL=1`, and
+    /// the var is this session's decision. Exporting it with no portal on the
+    /// bus is the one way to make things WORSE than having no portal at all:
+    /// the application skips the dialog it has of its own. So the wrapper sets
+    /// it only when the stamp says a portal is serving, and the guard is run
+    /// here -- as the shipped text, not as a copy of it -- in both states.
+    #[test]
+    fn gtk_is_only_pointed_at_a_portal_that_is_really_serving() {
+        let dir = std::env::temp_dir().join(format!(
+            "eclipse-portalenv-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        write_labwc_wrapper(&dir);
+        let wrapper = fs::read_to_string(dir.join("usr/local/bin/labwc")).unwrap();
+        // The var is never exported outside the test: a single unconditional
+        // line anywhere in the wrapper would undo the whole guard.
+        assert_eq!(
+            wrapper.matches("export GTK_USE_PORTAL").count(),
+            1,
+            "{wrapper}"
+        );
+        assert!(!wrapper.contains("GTK_USE_PORTAL=1; export GTK_USE_PORTAL\n          if"));
+        // The wait is bounded and only happens when there is something to wait
+        // for; an unbounded one would hang the session on a broken portal.
+        assert!(wrapper.contains("\"$i\" -lt 3"), "{wrapper}");
+        assert!(wrapper.contains("-x /bin/eclipse-portald"), "{wrapper}");
+
+        // Now run the guard itself, sliced out of what is shipped.
+        let from = wrapper.find("PORTAL_READY=").expect("el guardia");
+        let tail = &wrapper[from..];
+        let to = tail.find("sin portal").expect("la rama sin portal");
+        let to = to + tail[to..].find("\nfi\n").expect("el fi final") + 4;
+        let guard = &tail[..to];
+        let run = |stamp: bool| -> String {
+            let home = dir.join(if stamp { "con" } else { "sin" });
+            let _ = fs::create_dir_all(&home);
+            if stamp {
+                fs::write(home.join("eclipse-portal.ready"), "x").unwrap();
+            }
+            let script = format!(
+                "XDG_RUNTIME_DIR={}\n{guard}\nprintf '%s' \"${{GTK_USE_PORTAL-sin}}\"\n",
+                home.display()
+            );
+            let out = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(&script)
+                .output()
+                .expect("sh");
+            String::from_utf8_lossy(&out.stdout).to_string()
+        };
+        assert_eq!(run(true), "1", "con portal, GTK tiene que usarlo");
+        assert_eq!(run(false), "sin", "sin portal, GTK usa su propio dialogo");
         let _ = fs::remove_dir_all(&dir);
     }
 
