@@ -1101,6 +1101,45 @@ fn write_kde_helpers(rootfs: &Path) {
     )
     .unwrap();
     fs::set_permissions(&edit, fs::Permissions::from_mode(0o755)).unwrap();
+
+    write_view_wrapper(&localbin);
+}
+
+/// The image viewer lunarfile's opener table points at.
+///
+/// swayimg when the image has it -- a Wayland client of about the same shape as
+/// this tree's own clients (wl_shm, no toolkit), so it opens in a fraction of
+/// the time and memory a browser tab takes -- and `eclipse-firefox` otherwise,
+/// which is what the table named for every image format before swayimg was in
+/// the default package set.
+///
+/// The Wayland check is not decoration: swayimg has no X11 backend, so with no
+/// `WAYLAND_DISPLAY` it exits with "failed to open display" and the user sees a
+/// file that opened into nothing. On the X session that fallback is the browser,
+/// which is the one viewer that works on both.
+fn write_view_wrapper(localbin: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let view = localbin.join("eclipse-view");
+    fs::write(
+        &view,
+        b"#!/bin/sh\n\
+          # Eclipse OS: open an image in a viewer.\n\
+          # Named by /etc/eclipse/openers and by lunarfile's built-in table.\n\
+          if [ -n \"$WAYLAND_DISPLAY\" ]; then\n\
+          \x20 for v in swayimg imv; do\n\
+          \x20   if command -v \"$v\" >/dev/null 2>&1; then\n\
+          \x20     exec \"$v\" \"$@\"\n\
+          \x20   fi\n\
+          \x20 done\n\
+          fi\n\
+          # No Wayland display, or no viewer installed: the browser renders\n\
+          # every one of these formats and is the only viewer that also works\n\
+          # on the X session.\n\
+          exec /usr/local/bin/eclipse-firefox \"$@\"\n",
+    )
+    .unwrap();
+    fs::set_permissions(&view, fs::Permissions::from_mode(0o755)).unwrap();
 }
 
 /// The `.desktop` entry for the file browser, so it is in lunarbar's launcher
@@ -5183,6 +5222,45 @@ mod tests {
             .unwrap()
             .0;
         assert_eq!(eds.split_whitespace().last(), Some("vi"), "{edit}");
+        // The viewer the opener table names: swayimg on the Wayland session,
+        // and the browser anywhere else. The display check is the point --
+        // swayimg has no X11 backend, so on the X session `command -v` alone
+        // would hand it a file it cannot show.
+        let view = fs::read_to_string(bin.join("eclipse-view")).unwrap();
+        let vs = view
+            .split_once("for v in ")
+            .expect("the viewer list is gone")
+            .1
+            .split_once(';')
+            .unwrap()
+            .0;
+        assert_eq!(
+            vs.split_whitespace().next(),
+            Some("swayimg"),
+            "the viewer in the image is no longer tried first: {vs:?}"
+        );
+        assert!(
+            view.find("WAYLAND_DISPLAY").unwrap() < view.find("for v in ").unwrap(),
+            "the viewers are tried without checking for a Wayland display:\n{view}"
+        );
+        assert!(
+            view.trim_end().ends_with("eclipse-firefox \"$@\""),
+            "the last resort must be the browser, the one viewer X also has:\n{view}"
+        );
+        // Through the wrapper, never the browser itself.
+        assert!(
+            !view.contains(" firefox ") && !view.contains("exec firefox"),
+            "{view}"
+        );
+        // And it must parse as sh, like every other wrapper here.
+        if let Ok(status) = std::process::Command::new("sh")
+            .arg("-n")
+            .arg(bin.join("eclipse-view"))
+            .status()
+        {
+            assert!(status.success(), "eclipse-view does not parse as sh");
+        }
+
         let list = files
             .split_once("for fm in ")
             .expect("the file manager list is gone")
