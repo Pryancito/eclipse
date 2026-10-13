@@ -156,6 +156,54 @@ fn a_stopped_job_whose_shell_dies_is_continued() {
     );
 }
 
+/// The SIGHUP is the other half of the pair and it is not decoration: the
+/// SIGCONT only gets the job running again, and a job that comes back from a
+/// Ctrl-Z with its terminal's owner gone and no hangup to show for it has been
+/// told nothing at all. POSIX names both signals and Linux sends both.
+#[test]
+fn the_job_is_told_about_the_hangup_and_not_only_resumed() {
+    let shell = a_process(46_603);
+    shell.linux().become_session_leader(shell.id());
+    let job = Process::fork_from(&shell).unwrap();
+    let job_thread = Thread::create_linux(&job).unwrap();
+    job.linux().set_pgid_raw(job.id());
+    job.linux().job_stop(&job, LinuxSignal::SIGTSTP as u8);
+
+    shell.exit(0);
+
+    assert!(
+        job_thread
+            .lock_linux()
+            .signals
+            .contains(LinuxSignal::SIGHUP),
+        "resumed without ever being told why"
+    );
+}
+
+/// The same thing when the process that dies is itself a forked child, which
+/// is every shell in the system: `eclipse-init` forks them, so a shell's own
+/// death runs the OTHER termination callback -- the one `fork_from` installs,
+/// not the one `create_linux` does. Both have to sweep, and only one of them
+/// being wired is a bug that shows up in the only case that ever happens.
+#[test]
+fn a_forked_shell_dying_wakes_its_job_too() {
+    let login = a_process(46_604);
+    login.linux().become_session_leader(login.id());
+    let shell = Process::fork_from(&login).unwrap();
+    Thread::create_linux(&shell).unwrap();
+    let job = Process::fork_from(&shell).unwrap();
+    Thread::create_linux(&job).unwrap();
+    job.linux().set_pgid_raw(job.id());
+    job.linux().job_stop(&job, LinuxSignal::SIGTSTP as u8);
+
+    shell.exit(0);
+
+    assert!(
+        !job.linux().is_job_stopped(),
+        "the shell `init` forked is the one whose death this really is"
+    );
+}
+
 /// The other side of the same event: a job whose shell is still alive is left
 /// exactly where it is. A kernel that woke every stopped group on any exit
 /// would resume every suspended job in the system the first time a background
