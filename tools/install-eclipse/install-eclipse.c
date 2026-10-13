@@ -1174,39 +1174,69 @@ static int prompt_layout(struct config *cfg) {
     return 0;
 }
 
+/* Eclipse arranca ÚNICAMENTE por UEFI: su único cargador es rboot, que es un
+ * `BootX64.efi`, y el MBR que escribe este instalador lleva la tabla y la
+ * firma 0x55AA pero NINGÚN código de arranque, porque no hay cargador de BIOS
+ * en todo el árbol. Recomendar MBR por haber arrancado el medio en legacy --
+ * que es lo que se hacía -- deja un disco que el firmware no ofrece arrancar,
+ * y el usuario lo descubre al reiniciar.
+ *
+ * Esto se imprime SIEMPRE, antes de mirar si la tabla venía de la línea de
+ * órdenes: `--gpt` en una máquina arrancada en legacy instala un disco que
+ * esa máquina no va a ofrecer arrancar, y ése es justo el caso en el que el
+ * aviso hace falta. Lo que hay que cambiar es el modo del firmware, no la
+ * tabla de particiones. */
+static void warn_boot_environment(int running_on_efi) {
+    log("Entorno de arranque detectado: %s", running_on_efi ? "EFI/UEFI" : "BIOS/Legacy");
+    if (running_on_efi) {
+        return;
+    }
+    log(COLOR_YELLOW COLOR_BOLD
+        "AVISO: Eclipse arranca únicamente por UEFI; no existe un cargador para BIOS."
+        COLOR_RESET);
+    log(COLOR_YELLOW
+        "  Arranque el medio de instalación en modo UEFI (desactive CSM/Legacy en el"
+        COLOR_RESET);
+    log(COLOR_YELLOW
+        "  firmware) o el disco instalado no aparecerá como opción de arranque."
+        COLOR_RESET);
+}
+
+/* El aviso de MBR va en TODA salida de `prompt_table` -- la de `--mbr`, la de
+ * `--yes` y la del menú -- porque el disco que queda es el mismo en los tres
+ * casos. */
+static void warn_if_mbr(enum table_mode table) {
+    if (table != TABLE_MBR) {
+        return;
+    }
+    /* La partición 1 se marca de tipo 0xEF (EFI System), así que un firmware
+     * en modo UEFI puede arrancar este disco; muchos lo hacen, pero no todos,
+     * y en modo BIOS no arranca ninguno. */
+    log(COLOR_YELLOW COLOR_BOLD
+        "AVISO: con MBR el disco sólo arranca si el firmware está en modo UEFI y acepta"
+        COLOR_RESET);
+    log(COLOR_YELLOW "  una ESP en MBR. GPT/UEFI es lo seguro." COLOR_RESET);
+}
+
 static int prompt_table(struct config *cfg, int running_on_efi) {
+    warn_boot_environment(running_on_efi);
+
     if (cfg->table_set) {
         log("Tabla de particiones preseleccionada por CLI: %s", table_label(cfg->table));
+        warn_if_mbr(cfg->table);
         return 0;
     }
 
-    /* Eclipse arranca ÚNICAMENTE por UEFI: su único cargador es rboot, que
-     * es un `BootX64.efi`, y el MBR que escribe este instalador lleva la
-     * tabla y la firma 0x55AA pero NINGÚN código de arranque, porque no hay
-     * cargador de BIOS en todo el árbol. Recomendar MBR por haber arrancado
-     * el medio en legacy -- que es lo que se hacía -- deja un disco que el
-     * firmware no ofrece arrancar, y el usuario lo descubre al reiniciar.
-     *
-     * La sugerencia es GPT/UEFI siempre. Cuando el entorno no es EFI, lo que
-     * hay que cambiar es el modo del firmware, no la tabla de particiones. */
+    /* La sugerencia es GPT/UEFI siempre, haya arrancado el medio como haya
+     * arrancado: es la única tabla con la que el disco instalado aparece como
+     * opción de arranque. */
     enum table_mode suggested = TABLE_GPT;
-    log("Entorno de arranque detectado: %s", running_on_efi ? "EFI/UEFI" : "BIOS/Legacy");
-    if (!running_on_efi) {
-        log(COLOR_YELLOW COLOR_BOLD
-            "AVISO: Eclipse arranca únicamente por UEFI; no existe un cargador para BIOS."
-            COLOR_RESET);
-        log(COLOR_YELLOW
-            "  Arranque el medio de instalación en modo UEFI (desactive CSM/Legacy en el"
-            COLOR_RESET);
-        log(COLOR_YELLOW
-            "  firmware) o el disco instalado no aparecerá como opción de arranque."
-            COLOR_RESET);
-    }
     log("Se recomienda %s.", table_label(suggested));
 
     if (cfg->auto_yes) {
         cfg->table = suggested;
         log("--yes activo: usando tabla sugerida (%s).", table_label(cfg->table));
+        warn_if_mbr(cfg->table);
         return 0;
     }
 
@@ -1217,6 +1247,7 @@ static int prompt_table(struct config *cfg, int running_on_efi) {
     log("Opción recomendada [%d]:", suggested == TABLE_MBR ? 1 : 2);
     if (safe_flush_input(input, sizeof(input)) != 0 || input[0] == '\0') {
         cfg->table = suggested;
+        warn_if_mbr(cfg->table);
         return 0;
     }
 
@@ -1232,15 +1263,7 @@ static int prompt_table(struct config *cfg, int running_on_efi) {
         }
     }
 
-    if (cfg->table == TABLE_MBR) {
-        /* La partición 1 se marca de tipo 0xEF (EFI System), así que un
-         * firmware en modo UEFI puede arrancar este disco; muchos lo hacen,
-         * pero no todos, y en modo BIOS no arranca ninguno. */
-        log(COLOR_YELLOW COLOR_BOLD
-            "AVISO: con MBR el disco sólo arranca si el firmware está en modo UEFI y acepta"
-            COLOR_RESET);
-        log(COLOR_YELLOW "  una ESP en MBR. GPT/UEFI es lo seguro." COLOR_RESET);
-    }
+    warn_if_mbr(cfg->table);
     return 0;
 }
 
@@ -1720,7 +1743,11 @@ static int write_gpt_partition_table_native(const char *disk_path, const struct 
         entries[i].last_lba = end_lba;
         entries[i].attributes = 0;
         {
-            uint16_t part_name[36];
+            /* A cero antes de rellenar: `utf16le_name` termina en el NUL y
+             * deja el resto como esté, y lo que había aquí era basura de la
+             * pila que se copiaba tal cual a los 72 bytes del nombre de la
+             * partición en la tabla. */
+            uint16_t part_name[36] = {0};
             utf16le_name(parts[i].name, part_name);
             memcpy(entries[i].name, part_name, sizeof(part_name));
         }

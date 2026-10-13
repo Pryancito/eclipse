@@ -78,7 +78,7 @@ mod ino {
     pub const DEV_CHAR: usize = 21;
     pub const POWER: usize = 22;
     pub const FIRMWARE: usize = 24;
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     pub const FIRMWARE_EFI: usize = 25;
 
     /// Plus the device's index on the bus.
@@ -293,14 +293,17 @@ impl INode for SysRootINode {
 struct SysFirmwareDirINode;
 
 impl SysFirmwareDirINode {
-    /// On x86_64 the only loader in this tree is rboot, which is a UEFI
-    /// application: if this kernel is running at all, it was booted by UEFI,
-    /// so `efi/` is always here. The other architectures boot through their
-    /// own loaders and get an empty `/sys/firmware`, which is the truthful
+    /// Both loaders in this tree are UEFI applications -- rboot
+    /// (`BootX64.efi`) on x86_64 and the prebuilt rayboot
+    /// (`bootaa64.efi`, staged by `cargo image` and run under
+    /// `QEMU_EFI.fd`) on aarch64 -- so on either architecture a running
+    /// kernel was booted by UEFI and `efi/` is always here. riscv64 is
+    /// booted by QEMU itself (`-kernel` + `-initrd`) with no firmware in
+    /// the middle, and gets an empty `/sys/firmware`, which is the truthful
     /// answer rather than a guess.
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     const ENTRIES: &'static [&'static str] = &["efi"];
-    #[cfg(not(target_arch = "x86_64"))]
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     const ENTRIES: &'static [&'static str] = &[];
 }
 
@@ -332,7 +335,7 @@ impl INode for SysFirmwareDirINode {
         match name {
             "." => Ok(Arc::new(SysFirmwareDirINode)),
             ".." => Ok(SYS_ROOT.clone()),
-            #[cfg(target_arch = "x86_64")]
+            #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
             "efi" => Ok(Arc::new(SysFirmwareEfiDirINode)),
             _ => Err(FsError::EntryNotFound),
         }
@@ -347,21 +350,21 @@ impl INode for SysFirmwareDirINode {
 /// Linux puts the firmware's tables and the variable store under here. What
 /// is worth exposing is what callers actually read: the directory's own
 /// existence, and `fw_platform_size`, which says whether the firmware is the
-/// 64-bit or the 32-bit flavour (rboot is built for `x86_64-unknown-uefi`,
-/// so it is always 64). `efivars/` is deliberately absent: an empty variable
+/// 64-bit or the 32-bit flavour (both loaders are 64-bit UEFI
+/// applications, so it is always 64). `efivars/` is deliberately absent: an empty variable
 /// store would read as "UEFI with no boot entries", which is worse than not
 /// offering it.
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 struct SysFirmwareEfiDirINode;
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 impl SysFirmwareEfiDirINode {
     fn entries() -> [&'static str; 1] {
         ["fw_platform_size"]
     }
 }
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 impl INode for SysFirmwareEfiDirINode {
     fn read_at(&self, _offset: usize, _buf: &mut [u8]) -> Result<usize> {
         Ok(0)
@@ -3754,14 +3757,15 @@ mod tree_tests {
     #[test]
     fn el_arranque_por_uefi_se_anuncia_en_sys_firmware_efi() {
         // Lo que mira todo instalador para decidir la tabla de particiones.
-        // En x86_64 el unico cargador del arbol es rboot, que es UEFI, asi
-        // que esto tiene que estar; sin ello `install-eclipse` recomienda
-        // MBR/BIOS y escribe un disco que la BIOS no ofrece arrancar.
+        // Los dos cargadores del arbol son aplicaciones UEFI -- rboot en
+        // x86_64 y rayboot en aarch64 -- asi que en las dos esto tiene que
+        // estar; sin ello `install-eclipse` recomienda MBR/BIOS y escribe un
+        // disco que el firmware no ofrece arrancar.
         let _bus = test_bus::with(vec![]);
         let firmware = SYS_ROOT.lookup_follow("firmware", 4).unwrap();
         let listed = listing(&firmware);
 
-        if cfg!(target_arch = "x86_64") {
+        if cfg!(any(target_arch = "x86_64", target_arch = "aarch64")) {
             assert!(listed.contains(&String::from("efi")), "{:?}", listed);
             let efi = SYS_ROOT.lookup_follow("firmware/efi", 4).unwrap();
             assert_eq!(efi.metadata().unwrap().type_, FileType::Dir);
@@ -3770,9 +3774,9 @@ mod tree_tests {
                 .unwrap();
             assert_eq!(contents(&size), b"64\n");
         } else {
-            // Las otras arquitecturas no arrancan por UEFI: el directorio
-            // existe vacio, que es la respuesta honesta, no un `efi` de
-            // mentira.
+            // riscv64 no arranca por UEFI (lo carga QEMU con `-kernel`):
+            // el directorio existe vacio, que es la respuesta honesta, no un
+            // `efi` de mentira.
             assert!(!listed.contains(&String::from("efi")), "{:?}", listed);
             assert!(SYS_ROOT.lookup_follow("firmware/efi", 4).is_err());
         }
