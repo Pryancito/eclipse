@@ -6,6 +6,8 @@
 //! in a six-thousand-line file.
 
 use super::*;
+use core::sync::atomic::AtomicBool;
+use kernel_hal::sync::MutexGuard;
 
 /// The answers the return to user mode needs, readable without a lock.
 ///
@@ -60,16 +62,20 @@ use super::*;
 pub(super) struct ExitPathSummary {
     /// `shared_pending.val()`: nonzero means "take the lock and look".
     pub(super) shared_pending_bits: AtomicU64,
-    /// `job_stopped`, as a byte because there is no `AtomicBool` in the
-    /// imports here and a byte compares the same.
-    pub(super) job_stopped: AtomicU64,
+    /// `job_stopped`: a stopped process must not be re-entered.
+    ///
+    /// An `AtomicBool`, which is what the field is. The first version of
+    /// this said "a byte, because there is no `AtomicBool` in the imports
+    /// here" -- which was not a reason, it was a missing `use`, and Copilot
+    /// said so.
+    pub(super) job_stopped: AtomicBool,
 }
 
 impl Default for ExitPathSummary {
     fn default() -> Self {
         Self {
             shared_pending_bits: AtomicU64::new(0),
-            job_stopped: AtomicU64::new(0),
+            job_stopped: AtomicBool::new(false),
         }
     }
 }
@@ -77,18 +83,24 @@ impl Default for ExitPathSummary {
 impl LinuxProcess {
     /// Re-publishes the two words the return to user mode reads.
     ///
-    /// Call it from every mutator of `shared_pending` or `job_stopped`,
-    /// **while still holding the guard**: the stores happen under the lock so
-    /// two concurrent mutators cannot leave the mirror disagreeing with the
-    /// field. See [`ExitPathSummary`] for the invariant and why both words
-    /// are refreshed together.
-    pub(super) fn refresh_exit_path(&self, inner: &LinuxProcessInner) {
+    /// Call it from every mutator of `shared_pending` or `job_stopped`.
+    ///
+    /// It takes the **guard**, not the data behind it, so "while still
+    /// holding the lock" is not a sentence a caller has to read: a caller
+    /// that has released the lock has nothing to pass. The first version
+    /// took `&LinuxProcessInner`, where a deref coercion made the guard fit
+    /// and the invariant was a comment; Copilot pointed that out.
+    ///
+    /// The stores happen under the lock so two concurrent mutators cannot
+    /// leave the mirror disagreeing with the field. See [`ExitPathSummary`]
+    /// for the invariant and why both words are refreshed together.
+    pub(super) fn refresh_exit_path(&self, inner: &MutexGuard<'_, LinuxProcessInner>) {
         self.exit_path
             .shared_pending_bits
             .store(inner.shared_pending.val(), Ordering::Release);
         self.exit_path
             .job_stopped
-            .store(inner.job_stopped as u64, Ordering::Release);
+            .store(inner.job_stopped, Ordering::Release);
     }
 
     /// True while this process is job-control stopped.
@@ -96,6 +108,6 @@ impl LinuxProcess {
     /// Read from the lock-free mirror: this is on the return path of every
     /// syscall. See [`ExitPathSummary`].
     pub fn is_job_stopped(&self) -> bool {
-        self.exit_path.job_stopped.load(Ordering::Acquire) != 0
+        self.exit_path.job_stopped.load(Ordering::Acquire)
     }
 }

@@ -123,15 +123,24 @@ fn with_n_others_on_the_process_lock(
         let proc = proc.clone();
         threads.push(stdthread::spawn(move || {
             let lp = proc.linux();
-            while !stop.load(core::sync::atomic::Ordering::Relaxed) {
+            // `Acquire`/`Release` on the stop flag, not `Relaxed`: a
+            // relaxed load in a spin loop has no forward-progress
+            // guarantee under the memory model, so nothing promises this
+            // thread ever observes the store and `join()` below could in
+            // principle wait forever. It costs nothing here -- the flag is
+            // read once per 256 measured calls.
+            while !stop.load(core::sync::atomic::Ordering::Acquire) {
                 for _ in 0..256 {
                     black_box(lp.personality());
                 }
+                // Tell the core this is a spin, so it stops speculating
+                // down a loop whose exit comes from another CPU.
+                core::hint::spin_loop();
             }
         }));
     }
     b.iter(&mut body);
-    stop.store(true, core::sync::atomic::Ordering::Relaxed);
+    stop.store(true, core::sync::atomic::Ordering::Release);
     for t in threads {
         let _ = t.join();
     }

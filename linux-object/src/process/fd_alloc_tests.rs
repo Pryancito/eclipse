@@ -281,6 +281,7 @@ fn a_forked_child_sees_its_parent_hole() {
             root_inode: parent.root_inode().clone(),
             parent: Mutex::new(Weak::default()),
             vt: 0,
+            exit_path: Default::default(),
             perf: crate::perf::ProcPerf::new(),
             futexes: Default::default(),
             itimers: Default::default(),
