@@ -220,6 +220,42 @@ pub fn vdso_tsc_base() -> u64 {
     TSC_BASE.load(Ordering::Relaxed)
 }
 
+/// The TSC→ns scale as the pair of `u32`s the **Zircon** vDSO divides by,
+/// and the frequency its `zx_ticks_per_second` returns.
+///
+/// Not a second computation of the rate: it is the *same* multiplier
+/// [`vdso_tsc_mult`] reports, respelt. `tsc_cal::ns_mult` keeps that
+/// multiplier even precisely so that this respelling is exact —
+/// `(ticks * mult) >> 32` and `ticks * (mult / 2) / 2^31` are then the same
+/// number for every `ticks`, so the kernel clock and the Zircon vDSO cannot
+/// part company at a fixed rate the way an independently derived `1e9 / hz`
+/// ratio would.
+///
+/// Answers `None` whenever [`vdso_tsc_mult`] does — same invariant-TSC
+/// predicate, same requirement that a base has been latched — so a caller
+/// cannot publish one clock's rate under the other's rules. Also `None` when
+/// the numerator will not fit a `u32`, which is a TSC below ~0.5 GHz: the
+/// vDSO loads these into `u32` fields and a truncated scale divides wrong.
+pub fn vdso_tsc_ratio() -> Option<(u32, u32, u64)> {
+    // Same predicate as the multiplier, base included: a scale without a
+    // latched base is the days-ahead clock of #1613 all over again.
+    let mult = vdso_tsc_mult()?;
+    // `ns_mult` clears the low bit, so the halving below is exact. Asserting
+    // it here rather than trusting it: an odd multiplier arriving from a
+    // future change must cost the page, not the clock's correctness.
+    if mult % 2 != 0 {
+        return None;
+    }
+    let numerator = mult / 2;
+    if numerator == 0 || numerator > u32::MAX as u64 {
+        return None;
+    }
+    // 2^31, which is the one denominator that makes the halving exact. Never
+    // zero, which is the one value the Zircon vDSO answers with `ud2`.
+    const DENOMINATOR: u32 = 1 << 31;
+    Some((numerator as u32, DENOMINATOR, super::cpu::tsc_hz()))
+}
+
 /// Set by `VDSOFORCE=1` on the kernel command line: treat the TSC as usable by
 /// userspace even though CPUID does not say it is invariant.
 ///

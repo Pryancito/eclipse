@@ -258,6 +258,42 @@ pub fn run_userboot(zbi: impl AsRef<[u8]>, cmdline: &str) -> Arc<Process> {
     // linking itself against the vDSO because the entry the hash table found
     // no longer compared equal to the name it was looking for.
     vdso_vmo.write(vdso_constants_offset, &constants).unwrap();
+    // `DATA_CONSTANTS` is not the only page the kernel owes the vDSO:
+    // `DATA_TIME_VALUES` holds the ticks-to-monotonic transformation that
+    // `zx_clock_get_monotonic` applies **in userspace**, without a syscall.
+    // The prebuilt blob ships it filled with `0xDEADBEEFDEADBEEF` -- Zircon's
+    // "the kernel must write this" marker -- and nothing here ever wrote it,
+    // so every program computed its own time from that marker: the clock read
+    // `0xDEADBEEFDEADBEEF` plus the elapsed ticks, while the kernel's own
+    // `timer_now()` answered correctly. Userspace and kernel were on two
+    // different clocks, which is why a futex wait with a deadline could return
+    // before its deadline had passed.
+    //
+    // Every field of the page the blob reads, found by disassembling
+    // `prebuilt/zircon/x64/libzircon.so` and grepping the result for each
+    // reference to the symbol, so that none is left on the marker:
+    //
+    // - `+0x08` (u64): the counter's frequency. `_zx_ticks_per_second` is a
+    //   single `mov` out of this word and a `ret`, so leaving it unwritten
+    //   hands every caller `0xDEADBEEFDEADBEEF` ticks per second.
+    // - `+0x10` (u64): added to the raw counter on the **boot** timeline, by
+    //   `_zx_ticks_get_boot` and `_zx_clock_get_boot`. Eclipse never
+    //   suspends, so the boot and monotonic timelines are the same clock and
+    //   this takes the same offset as `+0x18`.
+    // - `+0x18` (u64): added to the raw `rdtscp` on the monotonic timeline.
+    //   It is also read twice around the `rdtscp`, before and after, and the
+    //   sequence retried if it changed, so it doubles as the seqlock guarding
+    //   the rest.
+    // - `+0x20` (u32): numerator of the ticks-to-nanoseconds scale.
+    // - `+0x24` (u32): denominator. The vDSO tests this one and executes
+    //   `ud2` when it is zero, which is how a page of zeros here kills
+    //   `userboot` with an invalid opcode instead of a wrong time.
+    //
+    // `vdso.time_values=off` leaves the page as the blob shipped it, which is
+    // the behaviour every build before this one had.
+    if !kernel_hal::cmdline::is_off(cmdline, "vdso.time_values") {
+        write_vdso_time_values(vdso, &vdso_vmo);
+    }
     // Any VMO whose name starts with "vdso/" is a vDSO variant; the first one
     // is the one userboot maps into the programs it launches.
     vdso_vmo.set_name("vdso/stable");
@@ -587,5 +623,64 @@ fn syscall_args(ctx: &UserContext) -> [usize; 8] {
         } else {
             unimplemented!()
         }
+    }
+}
+
+/// Fill the vDSO's `DATA_TIME_VALUES` page so userspace computes the same
+/// monotonic clock the kernel does. See the call site for the layout and for
+/// what shipping it unwritten did.
+///
+/// Writing nothing is always the safe outcome: the page then keeps the blob's
+/// own contents, so a missing symbol or an unusable TSC ratio costs the old
+/// behaviour rather than a wrong clock.
+#[allow(unused_variables)]
+fn write_vdso_time_values(vdso: &[u8], vdso_vmo: &Arc<VmObject>) {
+    #[cfg(all(target_arch = "x86_64", not(feature = "libos")))]
+    {
+        /// Offsets within `DATA_TIME_VALUES`. See the call site for what each
+        /// one is and which vDSO entry point reads it.
+        const OFF_TICKS_PER_SECOND: usize = 0x08;
+        const OFF_BOOT_OFFSET: usize = 0x10;
+        const OFF_TICKS_OFFSET: usize = 0x18;
+        const OFF_NUMERATOR: usize = 0x20;
+        const OFF_DENOMINATOR: usize = 0x24;
+
+        let Some((numerator, denominator, ticks_per_second)) = kernel_hal::timer::vdso_tsc_ratio()
+        else {
+            warn!("vdso: no usable TSC ratio; leaving DATA_TIME_VALUES as shipped");
+            return;
+        };
+        // The kernel's own monotonic time is `(tsc - base) * num / den`; the
+        // vDSO adds instead of subtracting, so what goes on the page is the
+        // negation. Wrapping is the point, not an accident: the vDSO adds the
+        // two as machine words and the sum is the small positive tick count.
+        let offset = 0u64.wrapping_sub(kernel_hal::timer::vdso_tsc_base());
+        let elf = ElfFile::new(vdso).unwrap();
+        let Some(base) = elf.get_symbol_address("DATA_TIME_VALUES") else {
+            warn!("vdso: no DATA_TIME_VALUES symbol; leaving the clock as shipped");
+            return;
+        };
+        let base = base as usize;
+        // The monotonic offset goes down last of all: it is the seqlock, so
+        // publishing it is what tells the vDSO the rest is already in place.
+        vdso_vmo
+            .write(base + OFF_TICKS_PER_SECOND, &ticks_per_second.to_ne_bytes())
+            .unwrap();
+        vdso_vmo
+            .write(base + OFF_DENOMINATOR, &denominator.to_ne_bytes())
+            .unwrap();
+        vdso_vmo
+            .write(base + OFF_NUMERATOR, &numerator.to_ne_bytes())
+            .unwrap();
+        vdso_vmo
+            .write(base + OFF_BOOT_OFFSET, &offset.to_ne_bytes())
+            .unwrap();
+        vdso_vmo
+            .write(base + OFF_TICKS_OFFSET, &offset.to_ne_bytes())
+            .unwrap();
+        info!(
+            "vdso: time values set (offset={:#x}, {}/{} ns per tick, {} ticks/s)",
+            offset, numerator, denominator, ticks_per_second
+        );
     }
 }
