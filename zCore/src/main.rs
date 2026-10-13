@@ -242,6 +242,19 @@ fn primary_main(config: kernel_hal::KernelConfig) {
         // `PERFSAMPLE=1` times every syscall and makes the columns exact,
         // which is the A/B against this.
         // Lives in linux-object, which a zircon-only kernel does not link.
+        // `SYSCALLBANKS=off` collapses `/proc/syscalls`'s per-CPU histogram
+        // banks onto one row, which is how the table behaved before the
+        // banks existed. It is here to be the A/B: a `COUNTS[num]` shared by
+        // every CPU making the same syscall benched at 8.5 ns alone, 32.6 ns
+        // with two CPUs on it, 50.3 with three and ~90 with four, so what
+        // the banks buy is whatever that contention is on real hardware --
+        // and the host this was written on has one logical CPU, so it cannot
+        // say. Default ON.
+        #[cfg(feature = "linux")]
+        if kernel_hal::cmdline::is_off(&options.cmdline, "SYSCALLBANKS") {
+            linux_object::syscall_stats::set_banks_enabled(false);
+            klog_info!("Eclipse: /proc/syscalls per-CPU banks OFF (SYSCALLBANKS=off)");
+        }
         #[cfg(feature = "linux")]
         if let Some(n) = kernel_hal::cmdline::value(&options.cmdline, "PERFSAMPLE")
             .and_then(kernel_hal::cmdline::parse_number)
@@ -710,6 +723,21 @@ fn primary_main(config: kernel_hal::KernelConfig) {
             if kernel_hal::cmdline::flag(&options.cmdline, "drm.atomic") {
                 linux_object::fs::devfs::drm::set_atomic_enabled(true);
                 klog_info!("Eclipse: DRM atomic modesetting ENABLED (drm.atomic)");
+            }
+            // Sincronizacion implicita en los buffers que un proceso presta
+            // a otro, ENCENDIDA por defecto: un EXEC espera a lo que el dueno
+            // del buffer tenga en vuelo antes de leerlo, que es lo que en
+            // Linux hace el `dma_resv` del objeto. Sin ella, un compositor que
+            // muestrea el frame recien dibujado de un cliente no esperaba a
+            // nadie salvo que ambos hablasen `linux-drm-syncobj-v1`, y el
+            // frame salia a medio pintar. `nvidia.implicit_sync=off` vuelve al
+            // comportamiento anterior sin recompilar.
+            if kernel_hal::cmdline::is_off(&options.cmdline, "nvidia.implicit_sync") {
+                kernel_hal::drivers::set_implicit_sync_enabled(false);
+                klog_info!(
+                    "Eclipse: nvidia.implicit_sync=off -- un EXEC solo espera los syncobj que \
+                     nombra su cliente (puede salir un frame a medio dibujar)"
+                );
             }
             // Pre-present fence wait, ON by default: a legacy SETCRTC /
             // PAGE_FLIP waits for the GPU to finish writing the buffer before

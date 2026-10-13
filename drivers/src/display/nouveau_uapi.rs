@@ -2261,6 +2261,7 @@ pub(super) fn format_exec_profile() -> alloc::string::String {
         EXEC_LEGACY_FENCE_US.load(Ordering::Relaxed),
     );
     let _ = writeln!(s, "[gpudbg]  {}", crate::scheme::syncobj::stats_line());
+    let _ = writeln!(s, "{}", super::nvidia::implicit_sync::profile_line());
     // Before the ioctl table, because it is the line that explains a table
     // full of small numbers: the driver's profile starts timing when the
     // dispatch starts, which is after the pre-wait has already let go.

@@ -211,6 +211,14 @@ mod gmmu;
 /// Bitmap VRAM allocator for the BAR1 aperture; own file for the size
 /// ceiling, no logic change.
 mod vram_alloc;
+
+/// Implicit synchronisation: the dependency a submission has on work ANOTHER
+/// process still has in flight against a buffer it lent us. The nouveau uAPI
+/// `EXEC` carries only the syncobjs its client names, so without this a
+/// compositor sampling a client's just-rendered frame waited for nothing at
+/// all unless both sides spoke `linux-drm-syncobj-v1`. Own file for the size
+/// ceiling; the hatch is `nvidia.implicit_sync=off`.
+pub(super) mod implicit_sync;
 use vram_alloc::NvidiaVramAllocator;
 
 /// Coherent-sysmem structures for the Turing copy-engine bring-up (the verified
@@ -13817,6 +13825,10 @@ impl NvidiaGpu {
                         );
                     }
                 }
+                // Nothing this process submits may read a buffer another
+                // process is still writing: the dependency Linux takes from
+                // the buffer's `dma_resv`, which this driver does not have.
+                implicit_sync::wait_for_foreign_producers(self, ctx_idx, owner_pid);
                 // Direct-submit path (default): GP entries + GPPut + doorbell
                 // written by the kernel itself, fence resolved lazily by the
                 // syncobj layer. Falls through to the RM per-submit path only

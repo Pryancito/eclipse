@@ -1010,10 +1010,13 @@ mod benches {
     //! - the default (`Enforce` whitelists, nobody has registered one,
     //!   `HUNTERANOMALY` unset), which is what every syscall pays today;
     //! - the same with the syscall domain turned off, which is the floor;
-    //! - the default with **one** process whitelisted, which is not that
-    //!   process's bill: [`policy::POLICY_COUNT`] is a single global counter,
-    //!   so the first registration anywhere takes the lock-free fast path
-    //!   away from every other process on the machine.
+    //! - the default with **one** process whitelisted, which used not to be
+    //!   that process's bill: the whitelist count was a single global
+    //!   counter, so the first registration anywhere took the lock-free fast
+    //!   path away from every other process on the machine. The registry is
+    //!   sharded by pid now, so that row sits back on the default one and is
+    //!   kept here to keep it there -- `policy::benches` has the rows that
+    //!   take it apart, contended ones included.
     //!
     //! Every row black-boxes its inputs, and the state each one needs is
     //! installed under the same `test_globals` lock the unit tests use --
@@ -1081,13 +1084,16 @@ mod benches {
     /// The same default stance, with a whitelist registered for **one**
     /// unrelated pid.
     ///
-    /// `POLICY_COUNT` is global, so this is what the rest of the machine
-    /// starts paying the moment anything is sandboxed: the fast path is gone
-    /// and every syscall of every process takes `GLOBAL_POLICIES.lock()` --
-    /// an IRQ-off spin lock, one for the whole system -- to look its pid up
-    /// in a map it is not in. Uncontended here, which is the best case it
-    /// has; on an SMP machine the same line is being taken by every other
-    /// CPU at the same time.
+    /// This used to be the cliff: the whitelist count was **machine-wide**,
+    /// so the fast path went away the moment anything was sandboxed and
+    /// every syscall of every process took one IRQ-off spin lock to look its
+    /// pid up in a map it was not in. 6.15 ns became 14.23 ns here, and
+    /// uncontended is the best case a single global lock ever has.
+    ///
+    /// The registry is sharded by pid now, so this row sits back on
+    /// `the_gate_in_the_default_stance` (6.01 against 5.89) and is here to
+    /// keep it there. `policy::benches` has the rows that take the cliff
+    /// apart, contended ones included.
     #[bench]
     fn the_gate_once_any_process_is_whitelisted(b: &mut Bencher) {
         let _g = test_globals::lock();
