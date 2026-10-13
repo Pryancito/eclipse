@@ -3,6 +3,7 @@ mod desktop;
 mod image;
 pub(crate) mod nvidia_firmware;
 mod opencv;
+mod portal;
 mod test;
 mod verify;
 mod xorg;
@@ -156,10 +157,14 @@ impl LinuxRootfs {
                 let _ = dir::rm(bin.join("eclipse-sdl-probe"));
                 let _ = fs::copy(&sdl_probe, bin.join("eclipse-sdl-probe"));
             }
-            let dbusd = self.eclipse_dbusd();
+            let (dbusd, portald) = self.eclipse_dbusd();
             if dbusd.is_file() {
                 let _ = dir::rm(bin.join("eclipse-dbusd"));
                 let _ = fs::copy(&dbusd, bin.join("eclipse-dbusd"));
+            }
+            if portald.is_file() {
+                let _ = dir::rm(bin.join("eclipse-portald"));
+                let _ = fs::copy(&portald, bin.join("eclipse-portald"));
             }
             self.install_thread_tests(&dir);
             // INIT (PID 1): the Eclipse-native Rust init by default, with busybox
@@ -590,7 +595,7 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
         // lunarbar: the native status/task bar (Rust, static musl). A two-bar
         // panel over wlr-layer-shell + wlr-foreign-toplevel-management, replacing
         // waybar and its GTK/D-Bus/gdk-pixbuf/fontconfig dependency chain.
-        let (lunarbar, lunarrun) = self.lunar_tools();
+        let (lunarbar, lunarrun, lunarfile) = self.lunar_tools();
         if lunarbar.is_file() {
             let _ = dir::rm(bin.join("lunarbar"));
             fs::copy(&lunarbar, bin.join("lunarbar")).unwrap();
@@ -610,18 +615,41 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
             eprintln!("warning: lunarrun not built; Alt+Space will do nothing");
         }
 
+        // lunarfile: the file browser behind Super+E, and -- through
+        // `--pick` -- the file chooser the rest of the system has never had.
+        // Dolphin, Nautilus and Thunar are all GTK/Qt applications with a
+        // gdk-pixbuf, fontconfig and theme-engine chain behind them; this is
+        // wlr-layer-shell and wl_shm, like its two siblings. Without it
+        // `eclipse-files` falls back to a shell in $HOME, which is what
+        // Super+E did before it existed.
+        if lunarfile.is_file() {
+            let _ = dir::rm(bin.join("lunarfile"));
+            fs::copy(&lunarfile, bin.join("lunarfile")).unwrap();
+        } else {
+            eprintln!("warning: lunarfile not built; Super+E falls back to a terminal");
+        }
+
         // eclipse-dbusd: Eclipse's own D-Bus session bus (Rust, static musl).
         // The `eclipse-dbus` wrapper prefers Alpine's dbus-daemon when the
         // image has it and falls back to this, so an image built with no
         // package mirror in reach still gets a session bus -- which is what
         // SDL_Init(), GtkApplication and every RequestName-based single-
         // instance check need before they will run at all.
-        let dbusd = self.eclipse_dbusd();
+        let (dbusd, portald) = self.eclipse_dbusd();
         if dbusd.is_file() {
             let _ = dir::rm(bin.join("eclipse-dbusd"));
             fs::copy(&dbusd, bin.join("eclipse-dbusd")).unwrap();
         } else {
             eprintln!("warning: eclipse-dbusd not built; the session bus needs the dbus package");
+        }
+
+        // eclipse-portald: the XDG desktop portal, so that an application
+        // whose "Open file" is a D-Bus call gets a dialog at all.
+        if portald.is_file() {
+            let _ = dir::rm(bin.join("eclipse-portald"));
+            fs::copy(&portald, bin.join("eclipse-portald")).unwrap();
+        } else {
+            eprintln!("warning: eclipse-portald not built; there will be no file-chooser portal");
         }
 
         // wavplay: minimal OSS player for the HDA audio driver (`/dev/dsp*`).
@@ -1175,6 +1203,11 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
               # SDL_Init: with no daemon the connect is refused at once and\n\
               # apps carry on.\n\
               export DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/0/bus\n\
+              # GTK's file dialog is a portal call when GTK_USE_PORTAL=1. The\n\
+              # stamp appears when eclipse-portald owns the name, so the var\n\
+              # follows a portal that really serves. No wait here (the labwc\n\
+              # wrapper has one): a login shell runs long after boot.\n\
+              [ -e /run/user/0/eclipse-portal.ready ] && export GTK_USE_PORTAL=1\n\
               # wlroots' libinput backend aborts the whole compositor if it\n\
               # enumerates zero input devices ('libinput initialization failed,\n\
               # no input devices'). Without a running udevd to tag devices,\n\
@@ -2937,6 +2970,8 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
               exit 127\n",
         )
         .unwrap();
+        portal::write_wrapper(localbin);
+
         // D-Bus SYSTEM bus. PulseAudio runs `--system` (user-mode pulse
         // refuses uid 0), and in that mode its main.c connects to the system
         // bus. There was none, so every boot logged
@@ -3064,86 +3099,39 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
         .unwrap();
     }
 
-    /// Cross-compile `tools/eclipse-dbusd` (Rust) as a static, non-PIE musl
-    /// binary and return its path. Best-effort, like every other tool here: a
-    /// failed build just means the image relies on Alpine's `dbus-daemon`.
-    fn eclipse_dbusd(&self) -> PathBuf {
-        let dir = PROJECT_DIR.join("tools").join("eclipse-dbusd");
-        let triple = self.musl_rust_triple();
-        let executable = dir
-            .join("target")
-            .join(triple)
-            .join("release")
-            .join("eclipse-dbusd");
-        let newest_src = [
-            "src/main.rs",
-            "src/bus.rs",
-            "src/message.rs",
-            "src/client.rs",
-            "Cargo.toml",
-        ]
-        .iter()
-        .filter_map(|rel| fs::metadata(dir.join(rel)).ok()?.modified().ok())
-        .max();
-        if let (Ok(bin_meta), Some(src_mtime)) = (fs::metadata(&executable), newest_src) {
-            if let Ok(bin_mtime) = bin_meta.modified() {
-                if bin_mtime >= src_mtime && self.cached_for_target(&executable) {
-                    return executable;
-                }
-            }
-        }
-
-        println!("Compiling eclipse-dbusd (Rust, {triple})...");
-        let _ = Ext::new("rustup")
-            .arg("target")
-            .arg("add")
-            .arg(triple)
-            .status();
-        let mut cargo = Ext::new("cargo");
-        cargo
-            .current_dir(&dir)
-            .arg("build")
-            .arg("--release")
-            .arg("--target")
-            .arg(triple);
-        // Static non-PIE, plus the cross linker when the host's `cc` cannot
-        // link this target at all: see `cross_build_env`.
-        for (k, v) in self.cross_build_env() {
-            cargo.env(k, v);
-        }
-        let status = cargo.status();
-        if !status.success() {
-            eprintln!("warning: eclipse-dbusd build failed; only dbus-daemon can serve the bus");
-        }
-        executable
-    }
-
     /// Cross-compile the `tools/lunarbar` package (Rust) as static musl
-    /// binaries and return both: the panel and `lunarrun`, the KRunner-style
-    /// launcher behind Alt+Space and Super+D. One cargo invocation builds the
-    /// two, since they share a library. Best-effort: if the build fails the
-    /// desktop falls back to waybar and the runner keybinds do nothing (their
-    /// wrapper says so in /tmp/lunarrun.log).
-    fn lunar_tools(&self) -> (PathBuf, PathBuf) {
+    /// binaries and return all three: the panel, `lunarrun` (the KRunner-style
+    /// launcher behind Alt+Space and Super+D) and `lunarfile` (the file
+    /// browser behind Super+E, and the file chooser `--pick` gives the rest of
+    /// the system). One cargo invocation builds them, since they share a
+    /// library. Best-effort: if the build fails the desktop falls back to
+    /// waybar, the runner keybinds do nothing (their wrapper says so in
+    /// /tmp/lunarrun.log) and `eclipse-files` falls back to a terminal.
+    fn lunar_tools(&self) -> (PathBuf, PathBuf, PathBuf) {
         let dir = PROJECT_DIR.join("tools").join("lunarbar");
         let triple = self.musl_rust_triple();
         let out = dir.join("target").join(triple).join("release");
         let executable = out.join("lunarbar");
         let runner = out.join("lunarrun");
+        let browser = out.join("lunarfile");
         // Rebuild when any source file is newer than the binaries. Every
         // module is listed: a stale entry here means a source change that
         // silently does not reach the image.
         let newest_src = [
             "src/main.rs",
             "src/bin/lunarrun.rs",
+            "src/bin/lunarfile.rs",
             "src/lib.rs",
             "src/apps.rs",
             "src/draw.rs",
             "src/fill_guard.rs",
+            "src/files.rs",
             "src/i18n.rs",
             "src/icons.rs",
             "src/keys.rs",
+            "src/list.rs",
             "src/look.rs",
+            "src/open.rs",
             "src/par.rs",
             "src/proc.rs",
             "src/sysinfo.rs",
@@ -3152,15 +3140,16 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
         .iter()
         .filter_map(|rel| fs::metadata(dir.join(rel)).ok()?.modified().ok())
         .max();
-        // BOTH must exist and be current: a tree built before lunarrun existed
-        // has an up-to-date lunarbar and no runner at all.
-        if let (Ok(bin_meta), Ok(run_meta), Some(src_mtime)) =
-            (fs::metadata(&executable), fs::metadata(&runner), newest_src)
-        {
-            if let (Ok(bin_mtime), Ok(run_mtime)) = (bin_meta.modified(), run_meta.modified()) {
-                if bin_mtime >= src_mtime && run_mtime >= src_mtime {
-                    return (executable, runner);
-                }
+        // ALL THREE must exist and be current: a tree built before lunarfile
+        // existed has an up-to-date lunarbar and lunarrun and no browser at
+        // all, and the stale-binary check would happily ship that.
+        let mtimes: Option<Vec<_>> = [&executable, &runner, &browser]
+            .iter()
+            .map(|p| fs::metadata(p).ok()?.modified().ok())
+            .collect();
+        if let (Some(bins), Some(src_mtime)) = (mtimes, newest_src) {
+            if bins.iter().all(|m| *m >= src_mtime) {
+                return (executable, runner, browser);
             }
         }
 
@@ -3184,9 +3173,9 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
         }
         let status = cargo.status();
         if !status.success() {
-            eprintln!("warning: lunarbar/lunarrun build failed; waybar fallback remains");
+            eprintln!("warning: lunarbar/lunarrun/lunarfile build failed; waybar fallback remains");
         }
-        (executable, runner)
+        (executable, runner, browser)
     }
 
     /// `/etc/asound.conf`. When PulseAudio is in the image, ALSA `default`
@@ -3823,6 +3812,8 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
               log = /tmp/dbus.log\n",
         )
         .unwrap();
+
+        portal::write_service(svc_dir);
 
         // D-Bus system bus, on libdbus's compiled-in default address. A second
         // bus, independent of the session one above; see eclipse-dbus-system
@@ -6069,6 +6060,8 @@ mod rootfs_plumbing_tests {
             ),
             ("ntpd", "respawn", "/usr/local/bin/eclipse-ntpd", "udhcpc"),
             ("oopslog", "respawn", "/usr/local/bin/eclipse-oopslog", ""),
+            // No `after`: `requires = dbus` implies it (#1744).
+            ("portal", "respawn", "/usr/local/bin/eclipse-portal", ""),
             (
                 "pulseaudio",
                 "respawn",
@@ -6187,7 +6180,14 @@ mod rootfs_plumbing_tests {
                 let Some((_, body)) = all.iter().find(|(s, _)| *s == n) else {
                     continue;
                 };
-                for dep in field(body, "after").unwrap_or_default().split_whitespace() {
+                // `requires` implies `after` (#1744): naming only the
+                // requirement orders the service just as firmly.
+                let deps = format!(
+                    "{} {}",
+                    field(body, "after").unwrap_or_default(),
+                    field(body, "requires").unwrap_or_default()
+                );
+                for dep in deps.split_whitespace() {
                     if !out.iter().any(|d| d == dep) {
                         out.push(dep.to_string());
                         todo.push(dep.to_string());
@@ -6347,6 +6347,8 @@ mod rootfs_plumbing_tests {
             "dbus-system",
             "ntpd",
             "oopslog",
+            // A bus service, not a session one: Xorg has GTK apps too.
+            "portal",
             "pulseaudio",
             "udhcpc",
         ];

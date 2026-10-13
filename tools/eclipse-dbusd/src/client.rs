@@ -6,7 +6,7 @@
 //! would break — `connect`, `SO_PEERCRED`-backed EXTERNAL auth, and reading a
 //! stream of framed messages back.
 
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::time::{Duration, Instant};
 
@@ -120,6 +120,73 @@ impl Client {
             }
             self.fill()?;
         }
+    }
+
+    /// Wait up to `within` for the next message. `Ok(None)` means the time
+    /// ran out with nothing on the wire, which for a daemon is not an error:
+    /// it is the moment to look at everything else it is doing (here, whether
+    /// the file dialog it launched has finished).
+    ///
+    /// A whole message already in the buffer is returned without touching the
+    /// socket at all, because one `read` can bring several: polling the socket
+    /// first would leave the second message sitting there until the NEXT
+    /// message arrived, which for a bus that can go quiet for minutes is a
+    /// reply the client never gets.
+    pub fn poll(&mut self, within: Duration) -> Result<Option<Message>, String> {
+        if let Some((m, used)) = Message::decode(&self.buf)? {
+            self.buf.drain(..used);
+            return Ok(Some(m));
+        }
+        self.sock
+            .set_read_timeout(Some(within))
+            .map_err(|e| e.to_string())?;
+        let mut chunk = [0u8; 4096];
+        let got = self.sock.read(&mut chunk);
+        // Put the long timeout back, so a later `call` keeps its own bound
+        // rather than inheriting this poll's few milliseconds.
+        let _ = self.sock.set_read_timeout(Some(TIMEOUT));
+        match got {
+            Ok(0) => Err("the bus closed the connection".into()),
+            Ok(n) => {
+                self.buf.extend_from_slice(&chunk[..n]);
+                match Message::decode(&self.buf)? {
+                    Some((m, used)) => {
+                        self.buf.drain(..used);
+                        Ok(Some(m))
+                    }
+                    // A partial message: not an error and not a message yet.
+                    None => Ok(None),
+                }
+            }
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) =>
+            {
+                Ok(None)
+            }
+            Err(e) => Err(format!("read: {e}")),
+        }
+    }
+
+    /// Take a well-known name, refusing to queue behind an existing owner.
+    /// `true` when this connection is now the primary owner.
+    ///
+    /// `DO_NOT_QUEUE` is the flag that matters: a portal that queued would sit
+    /// there owning nothing while every client talked to the other portal, and
+    /// would silently become the owner later, in the middle of a session.
+    pub fn request_name(&mut self, name: &str) -> Result<bool, String> {
+        const DO_NOT_QUEUE: u32 = 4;
+        const PRIMARY_OWNER: u32 = 1;
+        let r = self.call(
+            "org.freedesktop.DBus",
+            "/org/freedesktop/DBus",
+            "org.freedesktop.DBus",
+            "RequestName",
+            &[Arg::Str(name.to_string()), Arg::U32(DO_NOT_QUEUE)],
+        )?;
+        Ok(matches!(r.args().first(), Some(Arg::U32(PRIMARY_OWNER))))
     }
 
     /// Send one message, assigning it the next serial. Returns that serial.

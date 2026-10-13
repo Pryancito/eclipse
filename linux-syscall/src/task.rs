@@ -323,6 +323,17 @@ fn comm_from_path(path: &str) -> &str {
     path.rsplit('/').next().unwrap_or(path)
 }
 
+/// The signal the parent is to get when this child exits, out of a legacy
+/// `clone` flags word.
+///
+/// `CSIGNAL` is the low byte of that word (`clone(2)`), and `clone3` carries
+/// the same number in its own field with the same meaning -- including `0`,
+/// which means send nothing at all. The flags live in the same word as the
+/// signal, so this is the only place that separates them.
+fn exit_signal_of_clone(flags: usize) -> u8 {
+    (flags & 0xff) as u8
+}
+
 /// The `pid` argument of `setpgid`/`getpgid`/`getsid`: `0` means the caller.
 ///
 /// `pid_t` is SIGNED, and `find_task_by_vpid` can only ever fail on a negative
@@ -520,6 +531,7 @@ impl Syscall<'_> {
         newsp: usize,
         newtls: usize,
         ctid: ChildTidRequest,
+        exit_signal: u8,
     ) -> LxResult<(Arc<Process>, KoID)> {
         info!("fork: newsp={:#x} newtls={:#x}", newsp, newtls);
         let new_proc = Process::fork_from(self.zircon_process())?;
@@ -527,7 +539,7 @@ impl Syscall<'_> {
         if !path.is_empty() {
             new_proc.set_name(comm_from_path(&path));
         }
-        let tid = self.start_forked_thread(&new_proc, newsp, newtls, ctid)?;
+        let tid = self.start_forked_thread(&new_proc, newsp, newtls, ctid, exit_signal)?;
         info!("fork: {} -> {}", self.zircon_process().id(), new_proc.id());
         Ok((new_proc, tid))
     }
@@ -537,13 +549,14 @@ impl Syscall<'_> {
         newsp: usize,
         newtls: usize,
         ctid: ChildTidRequest,
+        exit_signal: u8,
     ) -> LxResult<(Arc<Process>, KoID)> {
         info!("vfork: newsp={:#x} newtls={:#x}", newsp, newtls);
         // A real vfork shares the parent's address space until execve or exit. The VMAR
         // implementation cannot replace a shared address space on execve, so use a copy
         // here while retaining vfork's parent-suspension semantics.
         let new_proc = Process::fork_from(self.zircon_process())?;
-        let tid = self.start_forked_thread(&new_proc, newsp, newtls, ctid)?;
+        let tid = self.start_forked_thread(&new_proc, newsp, newtls, ctid, exit_signal)?;
 
         let new_proc_obj: Arc<dyn KernelObject> = new_proc.clone();
         info!(
@@ -572,6 +585,7 @@ impl Syscall<'_> {
         newsp: usize,
         newtls: usize,
         ctid: ChildTidRequest,
+        exit_signal: u8,
     ) -> LxResult<KoID> {
         // What the child thread takes from this one -- the signal mask above
         // all, which a `fork` inherits (sigprocmask(2)). `false`: a fork does
@@ -602,25 +616,51 @@ impl Syscall<'_> {
         }
         new_thread.with_context(|ctx| *ctx = new_ctx)?;
         publish_child_tid(&new_thread, ctid);
-        new_thread.start(self.thread_fn)?;
+        // Everything below this line and above `start` is "what the child has
+        // to be holding before it can execute an instruction", and it is in
+        // the same function as the `start` on purpose: each of these used to
+        // be done somewhere the child was already running by the time it
+        // happened.
+        new_proc.linux().set_exit_signal(exit_signal);
         // hunter: inherit the parent's syscall whitelist into the child so a
         // process cannot shed its policy merely by forking, and seed a fresh
         // anomaly window for the new pid.
+        //
+        // BEFORE `start`, and that is the whole point: a pid with no
+        // whitelist registered is permissive (`is_syscall_allowed` answers
+        // `Ok` on a map miss), so every instant the child is runnable without
+        // its inherited policy is an instant in which it may make a syscall
+        // the policy forbids. Started first, that window is real on any
+        // machine with a second CPU to run the child on -- and on one CPU
+        // too, if the parent is preempted here. Linux installs the child's
+        // credentials and seccomp filters in `copy_process`, before
+        // `wake_up_new_task`, for the same reason.
         hunter::task_fork(self.zircon_process().id(), new_proc.id());
+        new_thread.start(self.thread_fn)?;
         Ok(new_thread.id())
     }
 
     /// `sys_fork` creates a child process.
     pub fn sys_fork(&self, newsp: usize, newtls: usize) -> SysResult {
-        self.fork_impl(newsp, newtls, ChildTidRequest::none())
-            .map(|(proc, _)| proc.id() as usize)
+        self.fork_impl(
+            newsp,
+            newtls,
+            ChildTidRequest::none(),
+            linux_object::signal::Signal::SIGCHLD as u8,
+        )
+        .map(|(proc, _)| proc.id() as usize)
     }
 
     /// `sys_vfork` creates a child process and blocks the parent until the child terminates or execs.
     pub async fn sys_vfork(&self, newsp: usize, newtls: usize) -> SysResult {
-        self.vfork_impl(newsp, newtls, ChildTidRequest::none())
-            .await
-            .map(|(proc, _)| proc.id() as usize)
+        self.vfork_impl(
+            newsp,
+            newtls,
+            ChildTidRequest::none(),
+            linux_object::signal::Signal::SIGCHLD as u8,
+        )
+        .await
+        .map(|(proc, _)| proc.id() as usize)
     }
 
     /// `sys_clone` create a new thread in the current process.
@@ -728,16 +768,26 @@ impl Syscall<'_> {
             // (musl fixes its own `tid` up with gettid() after the clone,
             // which is why nothing in the base image noticed.)
             let ctid = ChildTidRequest::from_clone(clone_flags, child_tid);
+            // CSIGNAL (low 8 bits of the legacy flags word): the signal the
+            // parent gets when this child exits, 0 meaning send nothing
+            // (clone3). It is handed to the fork so that it is in place
+            // BEFORE the child can run: it used to be stored on the way back,
+            // after the child was already started, and a child that exited in
+            // that window died under the default (`SIGCHLD`) instead of what
+            // the caller asked for. A `clone(... | SIGUSR1)` whose child
+            // raced it got a `SIGCHLD` its handler was not waiting for and
+            // left a zombie nobody reaped; a `clone3` with `exit_signal = 0`
+            // got a signal it had explicitly asked not to get -- which also
+            // decides, in `child_death_policy`, whether the zombie is left at
+            // all.
+            let exit_signal = exit_signal_of_clone(flags);
             let (process, tid) = if clone_flags.contains(CloneFlags::VFORK) {
                 info!("sys_clone: dispatching to sys_vfork for flags {:#x}", flags);
-                self.vfork_impl(newsp, tls, ctid).await?
+                self.vfork_impl(newsp, tls, ctid, exit_signal).await?
             } else {
                 info!("sys_clone: dispatching to sys_fork for flags {:#x}", flags);
-                self.fork_impl(newsp, tls, ctid)?
+                self.fork_impl(newsp, tls, ctid, exit_signal)?
             };
-            // CSIGNAL (low 8 bits of the legacy flags word): signal the parent
-            // gets when this child exits. 0 means send nothing (clone3).
-            process.linux().set_exit_signal((flags & 0xff) as u8);
             let pid = process.id() as usize;
             // In the parent, once the child exists (Linux writes it before the
             // child runs, but from the same clone_process, i.e. in the same
@@ -1218,16 +1268,12 @@ impl Syscall<'_> {
             let proc = self.zircon_process();
             let me = self.thread.id();
             let mut siblings = alloc::vec::Vec::new();
-            for tid in proc.thread_ids() {
-                if tid == me {
+            for t in proc.threads() {
+                if t.id() == me {
                     continue;
                 }
-                if let Ok(obj) = proc.get_child(tid) {
-                    if let Ok(t) = obj.downcast_arc::<Thread>() {
-                        zircon_object::task::Task::kill(t.as_ref());
-                        siblings.push(t);
-                    }
-                }
+                zircon_object::task::Task::kill(t.as_ref());
+                siblings.push(t);
             }
             for t in siblings {
                 let obj: Arc<dyn KernelObject> = t;
@@ -1571,8 +1617,7 @@ impl Syscall<'_> {
             }
         }
         let proc = zircon_object::task::ROOT_JOB.find_process(id)?;
-        let first = *proc.thread_ids().first()?;
-        proc.get_child(first).ok()?.downcast_arc::<Thread>().ok()
+        proc.threads().first().cloned()
     }
 
     /// `sched_setaffinity` sets the CPU affinity mask of the thread `pid`.
@@ -1979,15 +2024,6 @@ impl Syscall<'_> {
         Ok(0)
     }
 
-    /// Every live thread of `proc`.
-    fn threads_of(proc: &Arc<Process>) -> Vec<Arc<Thread>> {
-        proc.thread_ids()
-            .into_iter()
-            .filter_map(|id| proc.get_child(id).ok())
-            .filter_map(|obj| obj.downcast_arc::<Thread>().ok())
-            .collect()
-    }
-
     /// The tasks a `setpriority`/`getpriority` `which`/`who` pair names.
     ///
     /// The `which`/`who` pair is resolved by [`prio_target`]; this only does
@@ -2015,12 +2051,12 @@ impl Syscall<'_> {
             PrioTarget::Group(pgid) => linux_object::process::all_live_processes()
                 .iter()
                 .filter(|p| linux_object::process::effective_pgid(p) == pgid)
-                .flat_map(Self::threads_of)
+                .flat_map(|p| p.threads())
                 .collect(),
             PrioTarget::User(uid) => linux_object::process::all_live_processes()
                 .iter()
                 .filter(|p| p.try_linux().map(|lp| lp.uid()) == Some(uid))
-                .flat_map(Self::threads_of)
+                .flat_map(|p| p.threads())
                 .collect(),
         };
         if targets.is_empty() {
@@ -2826,6 +2862,8 @@ pub(crate) fn clone3_to_clone(words: [u64; 8]) -> LxResult<Clone3Args> {
 #[cfg(test)]
 mod abi_tests;
 
+#[cfg(test)]
+mod exit_signal_tests;
 #[cfg(test)]
 mod fork_child_tid_tests;
 

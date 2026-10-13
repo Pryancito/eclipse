@@ -9,9 +9,20 @@ description = "Eclipse OS session message bus (D-Bus daemon)"
 # on its own by `xtask` (see `LinuxRootfs::eclipse_dbusd`).
 [workspace]
 
+[lib]
+name = "eclipse_dbusd"
+path = "src/lib.rs"
+
 [[bin]]
 name = "eclipse-dbusd"
 path = "src/main.rs"
+
+# The XDG desktop portal backend. Second binary of this package rather than a
+# crate of its own: it speaks D-Bus, so it wants `message` and `client`, and a
+# separate crate would mean a second marshaller to keep in step with the first.
+[[bin]]
+name = "eclipse-portald"
+path = "src/bin/eclipse-portald.rs"
 
 [dependencies]
 libc = "0.2"

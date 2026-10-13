@@ -52,6 +52,7 @@ pub fn install(rootfs: &Path) {
     // package landed.
     write_freedoom_wrapper(rootfs);
     write_freedoom_desktop_entries(rootfs);
+    write_files_desktop_entry(rootfs);
     write_xorg_config(rootfs);
     write_xfce_defaults(rootfs);
     write_fallback_icons(rootfs);
@@ -1042,10 +1043,30 @@ fn write_kde_helpers(rootfs: &Path) {
     fs::write(
         &files,
         b"#!/bin/sh\n\
-          # Eclipse OS: KDE's Super+E (file manager). Dolphin needs Qt + KF6,\n\
-          # neither of which is in this image, so run the best file manager\n\
-          # that IS installed inside a terminal; failing that, a shell in the\n\
-          # home directory, which is what the key is really for.\n\
+          # Eclipse OS: KDE's Super+E (file manager), and the `--pick` file\n\
+          # chooser the rest of the system calls.\n\
+          #\n\
+          # lunarfile is Eclipse's own browser (wlr-layer-shell + wl_shm, one\n\
+          # static binary). Dolphin, Nautilus and Thunar are all GTK/Qt\n\
+          # applications with a gdk-pixbuf/fontconfig/theme-engine chain\n\
+          # behind them, so none of them is in this image. Every argument is\n\
+          # passed straight through, which is what makes this the chooser as\n\
+          # well as the browser: `eclipse-files --pick --out /tmp/a` is a\n\
+          # caller asking for a path.\n\
+          #\n\
+          # The console file managers stay as a fallback for an image built\n\
+          # before lunarfile existed, or one whose build of it failed.\n\
+          if command -v lunarfile >/dev/null 2>&1; then\n\
+          \x20 exec lunarfile \"$@\"\n\
+          fi\n\
+          # Only the browser has a fallback: a chooser that opened a shell\n\
+          # would leave its caller waiting for a path that never comes, so\n\
+          # `--pick` fails outright instead.\n\
+          case \" $* \" in\n\
+          \x20 *\" --pick \"*|*\" --save \"*|*\" --multiple \"*)\n\
+          \x20   echo 'eclipse-files: no file chooser (lunarfile missing)' >&2\n\
+          \x20   exit 1 ;;\n\
+          esac\n\
           DIR=\"${1:-${HOME:-/root}}\"\n\
           for fm in mc nnn lf ranger vifm; do\n\
           \x20 if command -v \"$fm\" >/dev/null 2>&1; then\n\
@@ -1056,6 +1077,60 @@ fn write_kde_helpers(rootfs: &Path) {
     )
     .unwrap();
     fs::set_permissions(&files, fs::Permissions::from_mode(0o755)).unwrap();
+
+    // The editor lunarfile's built-in opener table points at for text, source
+    // and configuration files. nano when the image has it (it is what the
+    // labwc menu offers), busybox `vi` otherwise -- and busybox ALWAYS has
+    // `vi`, so this wrapper cannot fail to find an editor, which is the whole
+    // reason the opener table names it rather than naming an editor directly.
+    let edit = localbin.join("eclipse-edit");
+    fs::write(
+        &edit,
+        b"#!/bin/sh\n\
+          # Eclipse OS: open a file in a text editor, in a terminal window.\n\
+          # Named by /etc/eclipse/openers and by lunarfile's built-in table.\n\
+          for ed in nano vi; do\n\
+          \x20 if command -v \"$ed\" >/dev/null 2>&1; then\n\
+          \x20   exec /usr/local/bin/eclipse-terminal \"$ed\" \"$@\"\n\
+          \x20 fi\n\
+          done\n\
+          # busybox always provides `vi`, so this line means no busybox and no\n\
+          # editor at all.\n\
+          echo 'eclipse-edit: no editor found' >&2\n\
+          exit 127\n",
+    )
+    .unwrap();
+    fs::set_permissions(&edit, fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+/// The `.desktop` entry for the file browser, so it is in lunarbar's launcher
+/// menu and findable from lunarrun by name — the two places a user looks for
+/// an application on this desktop.
+///
+/// `Exec` is the wrapper and not `lunarfile` itself: the wrapper is what falls
+/// back when the binary is missing, and an entry pointing straight at the
+/// binary would be a dead row on an image whose build of it failed. `TryExec`
+/// names the wrapper for the same reason — it is always there.
+fn write_files_desktop_entry(rootfs: &Path) {
+    let dir = rootfs.join("root/.local/share/applications");
+    let _ = fs::create_dir_all(&dir);
+    fs::write(
+        dir.join("eclipse-files.desktop"),
+        "[Desktop Entry]\n\
+         Version=1.0\n\
+         Type=Application\n\
+         Name=Archivos\n\
+         GenericName=File Manager\n\
+         Comment=Explorador de archivos de Eclipse OS (lunarfile)\n\
+         Exec=/usr/local/bin/eclipse-files\n\
+         TryExec=/usr/local/bin/eclipse-files\n\
+         Terminal=false\n\
+         Icon=system-file-manager\n\
+         Categories=System;FileTools;FileManager;\n\
+         MimeType=inode/directory;\n\
+         StartupNotify=false\n",
+    )
+    .unwrap();
 }
 
 fn write_x11_prepare(rootfs: &Path) {
@@ -2526,8 +2601,9 @@ fn write_labwc_rc(rootfs: &Path) {
     <keybind key="A-F2"><action name="Execute"><command>/usr/local/bin/eclipse-run</command></action></keybind>
     <keybind key="C-A-Delete"><action name="Execute"><command>/usr/local/bin/eclipse-run</command></action></keybind>
     <!-- Super+E: KDE's file manager key. No Dolphin here (Qt/KF6 are not in
-         the image), so eclipse-files opens the best text file manager
-         installed, or a shell in $HOME. -->
+         the image), so eclipse-files opens lunarfile, Eclipse's own browser;
+         failing that the best console file manager installed, or a shell in
+         $HOME. -->
     <keybind key="W-E"><action name="Execute"><command>/usr/local/bin/eclipse-files</command></action></keybind>
     <!-- Super+D: show desktop. labwc has no such action on every release, so
          this minimises (or restores) every window through
@@ -2625,6 +2701,7 @@ const MENU_ES: &[u8] = br#"<?xml version="1.0" encoding="UTF-8"?>
   <menu id="root-menu" label="Eclipse OS">
     <item label="Ejecutar (Alt+Espacio)"><action name="Execute"><command>/usr/local/bin/eclipse-run</command></action></item>
     <item label="Terminal"><action name="Execute"><command>/usr/local/bin/eclipse-terminal</command></action></item>
+    <item label="Archivos"><action name="Execute"><command>/usr/local/bin/eclipse-files</command></action></item>
     <item label="Firefox"><action name="Execute"><command>/usr/local/bin/eclipse-firefox</command></action></item>
     <item label="Editor (nano)"><action name="Execute"><command>/usr/local/bin/eclipse-terminal nano</command></action></item>
     <item label="Monitor (top)"><action name="Execute"><command>/usr/local/bin/eclipse-terminal top</command></action></item>
@@ -2649,6 +2726,7 @@ const MENU_EN: &[u8] = br#"<?xml version="1.0" encoding="UTF-8"?>
   <menu id="root-menu" label="Eclipse OS">
     <item label="Run (Alt+Space)"><action name="Execute"><command>/usr/local/bin/eclipse-run</command></action></item>
     <item label="Terminal"><action name="Execute"><command>/usr/local/bin/eclipse-terminal</command></action></item>
+    <item label="Files"><action name="Execute"><command>/usr/local/bin/eclipse-files</command></action></item>
     <item label="Firefox"><action name="Execute"><command>/usr/local/bin/eclipse-firefox</command></action></item>
     <item label="Editor (nano)"><action name="Execute"><command>/usr/local/bin/eclipse-terminal nano</command></action></item>
     <item label="Monitor (top)"><action name="Execute"><command>/usr/local/bin/eclipse-terminal top</command></action></item>
@@ -3026,6 +3104,32 @@ fn write_labwc_wrapper(rootfs: &Path) {
           # `dbus-daemon --session --address=unix:path=$XDG_RUNTIME_DIR/bus`\n\
           # started later is picked up by every new client automatically.\n\
           : \"${DBUS_SESSION_BUS_ADDRESS:=unix:path=/run/user/0/bus}\"; export DBUS_SESSION_BUS_ADDRESS\n\
+          # GTK's \"Open file\" is a D-Bus call to the desktop portal when\n\
+          # GTK_USE_PORTAL=1, and nothing but that var turns it on outside a\n\
+          # sandbox. It is set only when a portal is actually SERVING: the\n\
+          # stamp file appears when eclipse-portald has taken\n\
+          # org.freedesktop.portal.Desktop (see /usr/local/bin/eclipse-portal).\n\
+          # Pointing GTK at a portal that is not there would skip the dialog it\n\
+          # has of its own and gain nothing.\n\
+          PORTAL_READY=\"$XDG_RUNTIME_DIR/eclipse-portal.ready\"\n\
+          if [ ! -e \"$PORTAL_READY\" ]; then\n\
+          \x20 # Installed means starting: the same init starts the portal and\n\
+          \x20 # this session, so an absent stamp this early is a race and not\n\
+          \x20 # an answer. Three seconds at most, and only when there is\n\
+          \x20 # something to wait for.\n\
+          \x20 if [ -x /bin/eclipse-portald ] || [ -x /usr/local/bin/eclipse-portald ]; then\n\
+          \x20 \x20 i=0\n\
+          \x20 \x20 while [ \"$i\" -lt 3 ] && [ ! -e \"$PORTAL_READY\" ]; do\n\
+          \x20 \x20 \x20 sleep 1\n\
+          \x20 \x20 \x20 i=$((i+1))\n\
+          \x20 \x20 done\n\
+          \x20 fi\n\
+          fi\n\
+          if [ -e \"$PORTAL_READY\" ]; then\n\
+          \x20 GTK_USE_PORTAL=1; export GTK_USE_PORTAL\n\
+          else\n\
+          \x20 echo \"[labwc] sin portal: el dialogo de archivos lo pone cada aplicacion\" >&2\n\
+          fi\n\
           # Backends: DRM for output + libinput for evdev. Naming them keeps\n\
           # wlroots off the headless/X11 autodetect fallbacks when no parent\n\
           # display exists.\n\
@@ -3411,6 +3515,35 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn the_file_browser_has_a_menu_entry_that_points_at_the_wrapper() {
+        // Through the wrapper, never at `lunarfile` itself: the wrapper is what
+        // falls back when the binary is missing, so an entry naming the binary
+        // would be a dead row on an image whose build of it failed.
+        let dir = std::env::temp_dir().join(format!("eclipse-fileent-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        write_files_desktop_entry(&dir);
+        let e =
+            fs::read_to_string(dir.join("root/.local/share/applications/eclipse-files.desktop"))
+                .unwrap();
+        assert!(e.starts_with("[Desktop Entry]\n"), "{e}");
+        assert!(e.contains("\nExec=/usr/local/bin/eclipse-files\n"), "{e}");
+        assert!(
+            e.contains("\nTryExec=/usr/local/bin/eclipse-files\n"),
+            "{e}"
+        );
+        assert!(!e.contains("Exec=lunarfile"), "{e}");
+        // `apps::parse_desktop_text` only keeps Type=Application entries that
+        // are not NoDisplay, so a missing Type is a row that never appears.
+        assert!(
+            e.contains("\nType=Application\n") && !e.contains("NoDisplay"),
+            "{e}"
+        );
+        assert!(e.contains("\nMimeType=inode/directory;\n"), "{e}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     /// The `.desktop` override only shadows the packaged entry when it has
     /// the SAME id, and `firefox` ships `firefox.desktop` with icons named
     /// `firefox`. An override called `firefox-esr.desktop` on a rapid-release
@@ -3592,6 +3725,45 @@ mod tests {
             );
         }
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The two menus must offer the same things, each in its own language.
+    ///
+    /// The explorer entry shipped labelled "Archivos" in both menus, so
+    /// switching the session to English left one Spanish word in the root
+    /// menu. The command list is the half that catches the next item added
+    /// to one menu and forgotten in the other.
+    #[test]
+    fn both_menus_offer_the_same_commands_each_in_its_own_language() {
+        fn commands(menu: &[u8]) -> Vec<String> {
+            let text = std::str::from_utf8(menu).unwrap();
+            text.split("<command>")
+                .skip(1)
+                .map(|rest| rest.split("</command>").next().unwrap().to_string())
+                .collect()
+        }
+        assert_eq!(
+            commands(MENU_ES),
+            commands(MENU_EN),
+            "an item added to one menu must be added to the other"
+        );
+
+        let en = std::str::from_utf8(MENU_EN).unwrap();
+        assert!(
+            en.contains(r#"<item label="Files">"#),
+            "the English menu must label the explorer in English"
+        );
+        for spanish in ["Archivos", "Ejecutar", "Salir de la sesion", "Teclado"] {
+            assert!(
+                !en.contains(spanish),
+                "the English menu still says {spanish:?}"
+            );
+        }
+        let es = std::str::from_utf8(MENU_ES).unwrap();
+        assert!(
+            es.contains(r#"<item label="Archivos">"#),
+            "the Spanish menu must keep its own label"
+        );
     }
 
     /// Autostart file is intentionally absent (clients come from init).
@@ -3955,6 +4127,67 @@ mod tests {
             wrapper.contains("QT_QUICK_BACKEND:=software"),
             "Qt Quick must fall back to its software raster on the pixman session"
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// GTK's file dialog is a portal call only when `GTK_USE_PORTAL=1`, and
+    /// the var is this session's decision. Exporting it with no portal on the
+    /// bus is the one way to make things WORSE than having no portal at all:
+    /// the application skips the dialog it has of its own. So the wrapper sets
+    /// it only when the stamp says a portal is serving, and the guard is run
+    /// here -- as the shipped text, not as a copy of it -- in both states.
+    #[test]
+    fn gtk_is_only_pointed_at_a_portal_that_is_really_serving() {
+        let dir = std::env::temp_dir().join(format!(
+            "eclipse-portalenv-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        write_labwc_wrapper(&dir);
+        let wrapper = fs::read_to_string(dir.join("usr/local/bin/labwc")).unwrap();
+        // The var is never exported outside the test: a single unconditional
+        // line anywhere in the wrapper would undo the whole guard.
+        assert_eq!(
+            wrapper.matches("export GTK_USE_PORTAL").count(),
+            1,
+            "{wrapper}"
+        );
+        assert!(!wrapper.contains("GTK_USE_PORTAL=1; export GTK_USE_PORTAL\n          if"));
+        // The wait is bounded and only happens when there is something to wait
+        // for; an unbounded one would hang the session on a broken portal.
+        assert!(wrapper.contains("\"$i\" -lt 3"), "{wrapper}");
+        assert!(wrapper.contains("-x /bin/eclipse-portald"), "{wrapper}");
+
+        // Now run the guard itself, sliced out of what is shipped.
+        let from = wrapper.find("PORTAL_READY=").expect("el guardia");
+        let tail = &wrapper[from..];
+        let to = tail.find("sin portal").expect("la rama sin portal");
+        let to = to + tail[to..].find("\nfi\n").expect("el fi final") + 4;
+        let guard = &tail[..to];
+        let run = |stamp: bool| -> String {
+            let home = dir.join(if stamp { "con" } else { "sin" });
+            let _ = fs::create_dir_all(&home);
+            if stamp {
+                fs::write(home.join("eclipse-portal.ready"), "x").unwrap();
+            }
+            let script = format!(
+                "XDG_RUNTIME_DIR={}\n{guard}\nprintf '%s' \"${{GTK_USE_PORTAL-sin}}\"\n",
+                home.display()
+            );
+            let out = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(&script)
+                .output()
+                .expect("sh");
+            String::from_utf8_lossy(&out.stdout).to_string()
+        };
+        assert_eq!(run(true), "1", "con portal, GTK tiene que usarlo");
+        assert_eq!(run(false), "sin", "sin portal, GTK usa su propio dialogo");
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -4923,6 +5156,33 @@ mod tests {
             "Super+D does not toggle the desktop, it opens the launcher:\n{show}"
         );
         let files = fs::read_to_string(bin.join("eclipse-files")).unwrap();
+        // lunarfile FIRST, and every argument passed through: that is what
+        // makes Super+E and the `--pick` chooser the same wrapper.
+        assert!(
+            files.contains("exec lunarfile \"$@\""),
+            "Super+E no longer opens Eclipse's own browser:\n{files}"
+        );
+        assert!(
+            files.find("lunarfile").unwrap() < files.find("for fm in ").unwrap(),
+            "the console fallback is tried before lunarfile:\n{files}"
+        );
+        // A chooser has no fallback: opening a shell would leave the caller
+        // waiting for a path that never comes.
+        assert!(
+            files.contains("--pick") && files.contains("exit 1"),
+            "{files}"
+        );
+        // The editor the opener table names must always find an editor:
+        // busybox always has `vi`, which is why it is the last one tried.
+        let edit = fs::read_to_string(bin.join("eclipse-edit")).unwrap();
+        let eds = edit
+            .split_once("for ed in ")
+            .unwrap()
+            .1
+            .split_once(';')
+            .unwrap()
+            .0;
+        assert_eq!(eds.split_whitespace().last(), Some("vi"), "{edit}");
         let list = files
             .split_once("for fm in ")
             .expect("the file manager list is gone")

@@ -1253,13 +1253,7 @@ fn timespec_to_duration(ts: TimeSpec) -> Duration {
 /// getrusage(2)/times(2); kernel-side time is accounted per-syscall by
 /// `linux_object::perf` and reported as stime.
 fn process_user_time_ns(proc: &alloc::sync::Arc<zircon_object::task::Process>) -> u64 {
-    let live: u64 = proc
-        .thread_ids()
-        .into_iter()
-        .filter_map(|tid| proc.get_child(tid).ok())
-        .filter_map(|obj| obj.downcast_arc::<Thread>().ok())
-        .map(|t| t.get_time())
-        .sum();
+    let live: u64 = proc.threads().iter().map(|t| t.get_time()).sum();
     live + proc.dead_threads_time()
 }
 

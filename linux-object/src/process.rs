@@ -34,6 +34,11 @@ use zircon_object::{
     ZxError, ZxResult,
 };
 
+/// The file-descriptor table's allocator and its two range sweeps.
+mod census;
+pub use census::*;
+mod fd_table;
+
 pub use rcore_fs::vfs::FsInfo;
 
 /// Process extension for linux
@@ -372,7 +377,7 @@ impl ProcessExt for Process {
                         let dropped = {
                             let futexes = core::mem::take(&mut *lp.futexes.lock());
                             let mut inner = lp.inner.lock();
-                            let files = core::mem::take(&mut inner.files);
+                            let files = inner.take_all_files();
                             inner.cloexec_fds.clear();
                             inner.semaphores = Default::default();
                             let shm = core::mem::take(&mut inner.shm_identifiers);
@@ -728,7 +733,7 @@ impl ProcessExt for Process {
                         let dropped = {
                             let futexes = core::mem::take(&mut *lp.futexes.lock());
                             let mut inner = lp.inner.lock();
-                            let files = core::mem::take(&mut inner.files);
+                            let files = inner.take_all_files();
                             inner.cloexec_fds.clear();
                             inner.semaphores = Default::default();
                             let shm = core::mem::take(&mut inner.shm_identifiers);
@@ -755,6 +760,10 @@ impl ProcessExt for Process {
                                     child.id(),
                                     exit_code,
                                     child_cpu(&child),
+                                    // Read while the child object is still
+                                    // here: nothing can answer for its group
+                                    // once it is gone.
+                                    effective_pgid(&child),
                                 );
                             }
                             if !policy.notify {
@@ -882,10 +891,6 @@ pub const WAIT_STATUS_CONTINUED: i32 = 0xffff;
 /// Zircon user signal used to wake threads parked in a job-control stop.
 const JOB_CONTINUE_SIGNAL: Signal = Signal::USER_SIGNAL_1;
 
-/// A reaped child's zombie record as carried through reparenting: its pid and
-/// the `(exit_code, cpu_usage)` pair kept until the reaper collects it.
-type ReapedChild = (KoID, (i64, ChildCpu));
-
 /// Read an exited child's final CPU usage off its still-live object.
 fn child_cpu(child: &Arc<Process>) -> ChildCpu {
     ChildCpu {
@@ -918,7 +923,7 @@ pub async fn wait_child_interest(
         {
             let mut inner = proc.linux().inner.lock();
             if interest.exited {
-                if let Some(&(code, cpu)) = inner.reaped_children.get(&pid) {
+                if let Some(&ReapedChild { code, cpu, .. }) = inner.reaped_children.get(&pid) {
                     if reap {
                         inner.reaped_children.remove(&pid);
                         inner.add_children_cpu(cpu);
@@ -1001,6 +1006,10 @@ pub async fn wait_child_any_interest(
                     .children
                     .iter()
                     .any(|(_, c)| effective_pgid(c) == want)
+                    || inner
+                        .reaped_children
+                        .values()
+                        .any(|entry| entry.pgid == want)
             } else {
                 !inner.children.is_empty() || !inner.reaped_children.is_empty()
             };
@@ -1030,9 +1039,16 @@ fn scan_waitable_children(
     pgid: Option<KoID>,
 ) -> Option<LxResult<(KoID, ExitCode, ChildCpu)>> {
     let mut inner = proc.linux().inner.lock();
-    if interest.exited && pgid.is_none() {
-        if let Some((pid, (code, cpu))) = inner.reaped_children.iter().next().map(|(&p, &c)| (p, c))
-        {
+    if interest.exited {
+        // A group wait takes the first recorded exit OF THAT GROUP; a plain
+        // one takes any. The pgid is the child's at death, which is the one a
+        // zombie keeps.
+        let found = inner
+            .reaped_children
+            .iter()
+            .find(|(_, entry)| pgid.map(|want| entry.pgid == want).unwrap_or(true))
+            .map(|(&p, &entry)| (p, entry));
+        if let Some((pid, ReapedChild { code, cpu, .. })) = found {
             if reap {
                 inner.reaped_children.remove(&pid);
                 inner.add_children_cpu(cpu);
@@ -1224,6 +1240,19 @@ struct LinuxProcessInner {
     limits: RLimits,
     /// Opened files
     files: HashMap<FileDesc, Arc<dyn FileLike>>,
+    /// How many descriptors of this table hold each open file description,
+    /// keyed by the description's address as a NUMBER. See
+    /// [`fd_table`][mod@self::fd_table] for what it is for, why the address
+    /// is a safe key, and the invariant.
+    holders: HashMap<usize, usize>,
+    /// The descriptors of this table whose open file description is an
+    /// `epoll`. See [`fd_table`][mod@self::fd_table].
+    epoll_fds: HashSet<FileDesc>,
+    /// A LOWER BOUND on the lowest free descriptor, which is where
+    /// `get_free_fd_from` starts its search instead of zero. The bound is
+    /// ONE-SIDED, and that is load-bearing: see
+    /// [`fd_table`][mod@self::fd_table].
+    next_fd: usize,
     /// Per-descriptor `FD_CLOEXEC` state — the set of fds the next `execve`
     /// must close. POSIX makes this a property of the DESCRIPTOR, not the open
     /// file description: `fork` copies it per-process and plain `dup` clears it
@@ -1243,8 +1272,16 @@ struct LinuxProcessInner {
     /// Child processes
     children: HashMap<KoID, Arc<Process>>,
     /// Exit codes and final CPU usage for children already detached (freed
-    /// `Arc<Process>` at exit).
-    reaped_children: HashMap<KoID, (i64, ChildCpu)>,
+    /// `Arc<Process>` at exit), with the process group each one died in.
+    ///
+    /// The pgid is here because a zombie keeps it in Linux, and
+    /// `waitpid(-pgid)` and `waitid(P_PGID)` ask for a group. Without it
+    /// those two could only ever see LIVE children -- and
+    /// [`Self::record_child_exit`] takes the child out of `children` as it
+    /// records the exit, so a group wait for a child that had already exited
+    /// answered `ECHILD` and the status was never collected by anyone. That
+    /// is how a shell waits for a whole pipeline.
+    reaped_children: HashMap<KoID, ReapedChild>,
     /// Pids `wait*` already collected from the live `Exited` path (no zombie
     /// left). [`Self::record_child_exit`] must not re-insert those, or a
     /// second `wait` would collect the same child again.
@@ -1634,7 +1671,7 @@ impl LinuxProcess {
 
     /// Drop the live child handle and keep only the exit code (plus the
     /// child's final CPU usage, for the reaper's rusage) for a future `wait`.
-    pub fn record_child_exit(&self, child_id: KoID, exit_code: i64, cpu: ChildCpu) {
+    pub fn record_child_exit(&self, child_id: KoID, exit_code: i64, cpu: ChildCpu, pgid: KoID) {
         let mut inner = self.inner.lock();
         inner.children.remove(&child_id);
         // A concurrent `wait*` can collect the live `Exited` child before
@@ -1643,7 +1680,14 @@ impl LinuxProcess {
         if inner.waited_without_zombie.remove(&child_id) {
             return;
         }
-        inner.reaped_children.insert(child_id, (exit_code, cpu));
+        inner.reaped_children.insert(
+            child_id,
+            ReapedChild {
+                code: exit_code,
+                cpu,
+                pgid,
+            },
+        );
     }
 
     /// Drop a dead child without keeping anything for `wait*`: the reaper
@@ -1980,7 +2024,7 @@ impl LinuxProcess {
     /// See [`opened_cloexec`] for why those cannot let the flag be read off
     /// the object.
     pub fn add_file_cloexec(&self, file: Arc<dyn FileLike>, cloexec: bool) -> LxResult<FileDesc> {
-        let inner = self.inner.lock();
+        let mut inner = self.inner.lock();
         let fd = inner.get_free_fd();
         self.insert_file(inner, fd, file, cloexec)
     }
@@ -1994,7 +2038,7 @@ impl LinuxProcess {
         cloexec: bool,
         start: usize,
     ) -> LxResult<FileDesc> {
-        let inner = self.inner.lock();
+        let mut inner = self.inner.lock();
         let fd = inner.get_free_fd_from(start);
         self.insert_file(inner, fd, file, cloexec)
     }
@@ -2018,10 +2062,12 @@ impl LinuxProcess {
     /// hold 24 sockets (1000..=1023) and no more.
     pub fn add_socket(&self, file: Arc<dyn FileLike>) -> LxResult<FileDesc> {
         let cloexec = opened_cloexec(&file);
-        let inner = self.inner.lock();
-        let fd = socket_fd(inner.get_free_fd_from(SOCKET_FD), inner.nofile(), || {
-            inner.get_free_fd()
-        });
+        let mut inner = self.inner.lock();
+        // Both halves are read out before the fallback closure, which needs
+        // the guard mutably now that the search keeps a hint.
+        let preferred = inner.get_free_fd_from(SOCKET_FD);
+        let nofile = inner.nofile();
+        let fd = socket_fd(preferred, nofile, || inner.get_free_fd());
         self.insert_file(inner, fd, file, cloexec)
     }
 
@@ -2054,6 +2100,15 @@ impl LinuxProcess {
         let old = {
             let mut inner = self.inner.lock();
             let old = inner.files.remove(&fd);
+            if let Some(f) = old.as_ref() {
+                // `dup2` does not free the NUMBER, but the description that
+                // was under it does lose a holder, and `note_fd_inserted`
+                // below puts the new one's bookkeeping back. Lowering
+                // `next_fd` to a number that is about to be occupied again
+                // only costs the probes the hint saved -- which is the whole
+                // point of that bound being one-sided.
+                inner.note_fd_freed(fd, f);
+            }
             // Net table size is unchanged (replace) or +1 (plain insert); apply the
             // same limit check as insert_file for the growth case.
             if old.is_none() && inner.files.len() >= inner.nofile() {
@@ -2064,6 +2119,7 @@ impl LinuxProcess {
             } else {
                 inner.cloexec_fds.remove(&fd);
             }
+            inner.note_fd_inserted(fd, &file);
             inner.files.insert(fd, file);
             // `dup2` onto an open descriptor closes it, and closing it tells
             // the epolls, like `close` does. Planned after the insert so the
@@ -2100,6 +2156,7 @@ impl LinuxProcess {
         } else {
             inner.cloexec_fds.remove(&fd);
         }
+        inner.note_fd_inserted(fd, &file);
         inner.files.insert(fd, file);
         Ok(fd)
     }
@@ -2656,7 +2713,11 @@ impl LinuxProcess {
         let (removed, forget) = {
             let mut inner = self.inner.lock();
             inner.cloexec_fds.remove(&fd);
-            let removed = inner.files.remove(&fd);
+            let mut removed = None;
+            if let Some(f) = inner.files.remove(&fd) {
+                inner.note_fd_freed(fd, &f);
+                removed = Some(f);
+            }
             let forget = removed
                 .as_ref()
                 .map(|f| inner.epoll_forget_plan(vec![(fd, f.clone())]));
@@ -2680,12 +2741,7 @@ impl LinuxProcess {
     /// stay open and usable and only disappear at the next `execve`.
     pub fn set_range_cloexec(&self, first: FileDesc, last: FileDesc) {
         let mut inner = self.inner.lock();
-        let fds: Vec<_> = inner
-            .files
-            .keys()
-            .filter(|&&fd| fd >= first && fd <= last)
-            .cloned()
-            .collect();
+        let fds = inner.open_fds_in_range(first, last);
         for fd in fds {
             inner.cloexec_fds.insert(fd);
         }
@@ -2697,17 +2753,16 @@ impl LinuxProcess {
         // released — see `close_file` for the re-entrancy deadlock this avoids.
         let (removed, forget): (Vec<(FileDesc, Arc<dyn FileLike>)>, _) = {
             let mut inner = self.inner.lock();
-            let fds: Vec<_> = inner
-                .files
-                .keys()
-                .filter(|&&fd| fd >= first && fd <= last)
-                .cloned()
-                .collect();
+            let fds = inner.open_fds_in_range(first, last);
             let removed: Vec<_> = fds
                 .into_iter()
                 .filter_map(|fd| {
                     inner.cloexec_fds.remove(&fd);
-                    inner.files.remove(&fd).map(|f| (fd, f))
+                    let removed = inner.files.remove(&fd).map(|f| (fd, f));
+                    if let Some((_, f)) = removed.as_ref() {
+                        inner.note_fd_freed(fd, f);
+                    }
+                    removed
                 })
                 .collect();
             let forget = inner.epoll_forget_plan(removed.clone());
@@ -3876,7 +3931,13 @@ impl LinuxProcess {
             let close_fds = inner.cloexec_fds.drain().collect::<Vec<_>>();
             let removed: RemovedFds = close_fds
                 .into_iter()
-                .filter_map(|fd| inner.files.remove(&fd).map(|f| (fd, f)))
+                .filter_map(|fd| {
+                    let removed = inner.files.remove(&fd).map(|f| (fd, f));
+                    if let Some((_, f)) = removed.as_ref() {
+                        inner.note_fd_freed(fd, f);
+                    }
+                    removed
+                })
                 .collect();
             let forget = inner.epoll_forget_plan(removed.clone());
             (removed, forget, inner.execute_path.clone())
@@ -4031,17 +4092,29 @@ impl LinuxProcessInner {
     ///
     /// `closed` must already be out of `files`.
     fn epoll_forget_plan(&self, closed: Vec<(FileDesc, Arc<dyn FileLike>)>) -> EpollForgetPlan {
+        if self.epoll_fds.is_empty() {
+            // The common case, and the reason the set exists: nothing to tell,
+            // and nothing walked to find that out.
+            return EpollForgetPlan {
+                epolls: Vec::new(),
+                gone: Vec::new(),
+            };
+        }
         let epolls: Vec<Arc<crate::fs::Epoll>> = self
-            .files
-            .values()
+            .epoll_fds
+            .iter()
+            .filter_map(|fd| self.files.get(fd))
             .filter_map(|f| f.clone().downcast_arc::<crate::fs::Epoll>().ok())
             .collect();
         let gone = if epolls.is_empty() {
             Vec::new()
         } else {
+            // One lookup per closed descriptor. `closed` is already out of
+            // `files`, so its holders were already decremented: a description
+            // still in the map is one a surviving descriptor holds.
             closed
                 .into_iter()
-                .filter(|(_, file)| !self.files.values().any(|f| Arc::ptr_eq(f, file)))
+                .filter(|(_, file)| !self.holds_description(file))
                 .collect()
         };
         EpollForgetPlan { epolls, gone }
@@ -4274,6 +4347,12 @@ impl LinuxProcessInner {
             environ: self.environ.clone(),
             current_working_directory: self.current_working_directory.clone(),
             files: self.files.clone(),
+            // The child's table is a copy of the parent's, so the parent's
+            // lower bound on its lowest free descriptor holds for it too --
+            // and the same descriptors hold the same epolls.
+            next_fd: self.next_fd,
+            epoll_fds: self.epoll_fds.clone(),
+            holders: self.holders.clone(),
             // POSIX fork(2): the child gets its own COPY of each fd's
             // FD_CLOEXEC flag — later fcntl(F_SETFD) in either process
             // must not affect the other.
@@ -4376,17 +4455,6 @@ impl LinuxProcessInner {
     fn add_children_cpu(&mut self, cpu: ChildCpu) {
         self.children_utime_ns += cpu.utime_ns;
         self.children_stime_ns += cpu.stime_ns;
-    }
-
-    fn get_free_fd(&self) -> FileDesc {
-        self.get_free_fd_from(0)
-    }
-
-    fn get_free_fd_from(&self, start: usize) -> FileDesc {
-        (start..)
-            .map(|i| i.into())
-            .find(|fd| !self.files.contains_key(fd))
-            .unwrap()
     }
 }
 
@@ -4587,6 +4655,19 @@ fn parent_wants_sigchld_for_stops(parent: &Arc<Process>) -> bool {
         .unwrap_or(false)
 }
 
+/// A child that has exited and whose `Arc<Process>` is gone: everything a
+/// `wait*` still has to be able to report about it.
+#[derive(Debug, Clone, Copy)]
+struct ReapedChild {
+    /// The raw exit code, as `wait_status_exited` turns it into a status word.
+    code: i64,
+    /// Its final CPU usage, for `RUSAGE_CHILDREN`.
+    cpu: ChildCpu,
+    /// The process group it died in, which is what `waitpid(-pgid)` matches
+    /// against. A zombie keeps its pgid in Linux.
+    pgid: KoID,
+}
+
 /// What a reaper's `SIGCHLD` disposition says to do with a child that just
 /// died: `do_notify_parent`'s `autoreap`, and whether the signal is sent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4778,20 +4859,6 @@ pub fn setsid_verdict(caller_pid: KoID, live_pgids: &[KoID]) -> LxResult<()> {
     Ok(())
 }
 
-/// The effective process group of every live process, for [`setsid_verdict`].
-pub fn live_effective_pgids() -> Vec<KoID> {
-    all_live_processes().iter().map(effective_pgid).collect()
-}
-
-/// `getpgid`: the effective process-group id of process `pid`.
-pub fn get_process_pgid(pid: KoID) -> LxResult<KoID> {
-    let proc = all_live_processes()
-        .into_iter()
-        .find(|p| p.id() == pid)
-        .ok_or(LxError::ESRCH)?;
-    Ok(effective_pgid(&proc))
-}
-
 /// This process's effective session id: its raw sid, or its own pid when the
 /// raw value is unset (`0`).
 pub fn effective_sid(proc: &Arc<Process>) -> KoID {
@@ -4802,15 +4869,6 @@ pub fn effective_sid(proc: &Arc<Process>) -> KoID {
     } else {
         raw
     }
-}
-
-/// `getsid`: the effective session id of process `pid`.
-pub fn get_process_sid(pid: KoID) -> LxResult<KoID> {
-    let proc = all_live_processes()
-        .into_iter()
-        .find(|p| p.id() == pid)
-        .ok_or(LxError::ESRCH)?;
-    Ok(effective_sid(&proc))
 }
 
 pub fn check_and_deliver_tty_interrupt() -> LxResult<()> {
@@ -4824,38 +4882,6 @@ pub fn check_and_deliver_tty_interrupt() -> LxResult<()> {
         return Err(LxError::EINTR);
     }
     check_signals()
-}
-
-fn collect_live_processes(job: &Arc<Job>, out: &mut Vec<Arc<Process>>) {
-    for id in job.process_ids() {
-        if let Some(proc) = job.find_process(id) {
-            if !matches!(proc.status(), Status::Exited(_)) {
-                out.push(proc);
-            }
-        }
-    }
-    for child_id in job.children_ids() {
-        if let Ok(child) = job.get_child(child_id) {
-            if let Ok(child_job) = child.downcast_arc::<Job>() {
-                collect_live_processes(&child_job, out);
-            }
-        }
-    }
-}
-
-/// All non-exited processes in the root job tree.
-pub fn all_live_processes() -> Vec<Arc<Process>> {
-    let mut processes = Vec::new();
-    collect_live_processes(&ROOT_JOB, &mut processes);
-    processes
-}
-
-/// The process `pid` names, exited or not.
-///
-/// `find_task_by_vpid()`: the lookup a syscall that takes a pid does before
-/// it can ask anything else about it.
-pub fn find_process(pid: KoID) -> Option<Arc<Process>> {
-    ROOT_JOB.find_process(pid)
 }
 
 /// The monotonic clock now, in nanoseconds: what a process's birth is
@@ -5017,7 +5043,7 @@ fn reparent_live_children_to_init(dying: &Arc<Process>) {
         Some(lp) => lp,
         None => return,
     };
-    let (orphans, zombies): (Vec<Arc<Process>>, Vec<ReapedChild>) = {
+    let (orphans, zombies): (Vec<Arc<Process>>, Vec<(KoID, ReapedChild)>) = {
         let mut inner = dying_linux.inner.lock();
         let live_ids: Vec<KoID> = inner
             .children
@@ -5174,14 +5200,10 @@ pub fn set_signal_action_in(process: &Arc<Process>, signal: LinuxSignal, action:
         inner.shared_pending_info.remove(&(signal as u8));
         lp.refresh_exit_path(&inner);
     }
-    for tid in process.thread_ids() {
-        if let Ok(thread) = process.get_child(tid) {
-            if let Ok(thread) = thread.downcast_arc::<Thread>() {
-                if let Some(mut lt) = thread.try_lock_linux() {
-                    if lt.signals.contains(signal) {
-                        lt.take_siginfo(signal);
-                    }
-                }
+    for thread in process.threads() {
+        if let Some(mut lt) = thread.try_lock_linux() {
+            if lt.signals.contains(signal) {
+                lt.take_siginfo(signal);
             }
         }
     }
@@ -5668,13 +5690,9 @@ pub fn pending_after_send(mut pending: Sigset, signal: LinuxSignal) -> Sigset {
 /// [`complete_signal_for_job_control`].
 pub fn prepare_signal(process: &Arc<Process>, signal: LinuxSignal) {
     use crate::thread::ThreadExt;
-    for tid in process.thread_ids() {
-        if let Ok(thread_obj) = process.get_child(tid) {
-            if let Ok(thread) = thread_obj.downcast_arc::<Thread>() {
-                if let Some(mut lt) = thread.try_lock_linux() {
-                    lt.signals = pending_after_send(lt.signals, signal);
-                }
-            }
+    for thread in process.threads() {
+        if let Some(mut lt) = thread.try_lock_linux() {
+            lt.signals = pending_after_send(lt.signals, signal);
         }
     }
 }
@@ -5722,41 +5740,37 @@ pub fn send_signal_to_process_with_info(
                 sname
             );
         }
-        let tids = process.thread_ids();
+        let threads = process.threads();
         prepare_signal(&process, signal);
         // Prefer a thread that has the signal *unblocked* — it can act on it
         // right away — and deliver there.
         let mut first: Option<Arc<Thread>> = None;
-        for tid in tids {
-            if let Ok(thread_obj) = process.get_child(tid) {
-                if let Ok(thread) = thread_obj.downcast_arc::<Thread>() {
-                    // Peek without holding the guard across a move of `thread`.
-                    let delivered = if let Some(mut lt) = thread.try_lock_linux() {
-                        // `wants_signal()`: unblocked, or parked in
-                        // `rt_sigtimedwait` for exactly this signal.
-                        if lt.wants_signal(signal) {
-                            lt.queue_signal(signal, info);
-                            true
-                        } else {
-                            false
-                        }
-                    } else {
-                        // Lock held (e.g. PID 1 in waitpid): queue below rather
-                        // than dropping the signal — that drop is why lunarbar's
-                        // `kill 1` did nothing.
-                        false
-                    };
-                    if delivered {
-                        wake_signal_sleeper(&thread);
-                        // Wake waitpid(-1): PID 1 blocks on this zircon bit.
-                        process.signal_set(Signal::SIGCHLD);
-                        wake_for_job_control(&process, signal);
-                        return Ok(());
-                    }
-                    if first.is_none() {
-                        first = Some(thread);
-                    }
+        for thread in threads {
+            // Peek without holding the guard across a move of `thread`.
+            let delivered = if let Some(mut lt) = thread.try_lock_linux() {
+                // `wants_signal()`: unblocked, or parked in
+                // `rt_sigtimedwait` for exactly this signal.
+                if lt.wants_signal(signal) {
+                    lt.queue_signal(signal, info);
+                    true
+                } else {
+                    false
                 }
+            } else {
+                // Lock held (e.g. PID 1 in waitpid): queue below rather
+                // than dropping the signal — that drop is why lunarbar's
+                // `kill 1` did nothing.
+                false
+            };
+            if delivered {
+                wake_signal_sleeper(&thread);
+                // Wake waitpid(-1): PID 1 blocks on this zircon bit.
+                process.signal_set(Signal::SIGCHLD);
+                wake_for_job_control(&process, signal);
+                return Ok(());
+            }
+            if first.is_none() {
+                first = Some(thread);
             }
         }
         // Every thread has the signal blocked: it must still become *pending*
@@ -5769,12 +5783,8 @@ pub fn send_signal_to_process_with_info(
                 lp.queue_shared_signal(signal, info);
             }
             // Wake every sleeper: any thread may be the one that pulls next.
-            for tid in process.thread_ids() {
-                if let Ok(thread_obj) = process.get_child(tid) {
-                    if let Ok(t) = thread_obj.downcast_arc::<Thread>() {
-                        wake_signal_sleeper(&t);
-                    }
-                }
+            for t in process.threads() {
+                wake_signal_sleeper(&t);
             }
         }
         // Pulse even when every thread had the Linux signal blocked: waitpid
@@ -5918,7 +5928,15 @@ mod session_and_group_tests;
 mod dying_process_tests;
 
 #[cfg(test)]
+mod census_tests;
+#[cfg(test)]
 mod socket_fd_tests;
+
+#[cfg(test)]
+mod fd_alloc_tests;
+
+#[cfg(test)]
+mod wait_decision_tests;
 
 #[cfg(test)]
 mod rlimit_layout_tests {
