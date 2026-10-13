@@ -12,6 +12,8 @@ pub mod cmdline;
 #[cfg(any(feature = "boot-ui", test))]
 pub mod config;
 #[cfg(any(feature = "boot-ui", test))]
+pub mod esp;
+#[cfg(any(feature = "boot-ui", test))]
 pub mod fb;
 #[cfg(any(feature = "boot-ui", test))]
 pub mod frames;
