@@ -633,7 +633,13 @@ impl<'a> Iterator for ExceptionateIterator<'a> {
     }
 }
 
-/// This is only used by ProcessStarting exceptions
+/// Walks the job debugger exceptionates: the process's own job first, then
+/// its parent, and so on up to the root job.
+///
+/// Used by `ProcessStarting` and by `User` (`zx_thread_raise_exception`), the
+/// two types whose only handler is a job debugger. Both pass `first_only =
+/// true`, so delivery stops at the nearest job that has a debugger attached;
+/// jobs without one are skipped rather than ending the walk.
 struct JobDebuggerIterator {
     job: Option<Arc<Job>>,
 }
