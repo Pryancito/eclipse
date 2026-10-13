@@ -1266,6 +1266,32 @@ mod collection_tests {
             TaskCollection::bitmap_candidate(&mut inner, 0, false),
             Some(0)
         );
+
+        // Lo de arriba lo decide `notify`, que al publicar la urgencia APAGA
+        // el bit de cesion: el hueco 0 sale de la via voluntaria y el barrido
+        // ni lo mira. Pero los dos bits si pueden estar encendidos a la vez,
+        // y por el camino de siempre: la urgencia llega mientras un ejecutor
+        // tiene la tarea (`notify` sobre un hueco prestado, que se queda
+        // publicado y diferido) y despues la tarea cede ella misma, que es
+        // `mark_yielded` y no apaga nada. Ahi el que decide es el `& !notified`
+        // del barrido, y servir ese hueco como cesion es servirlo detras de
+        // todas las urgencias teniendo una pendiente.
+        page.mark_yielded(0);
+        assert_eq!(
+            page.peek_lanes().0 & 1,
+            1,
+            "la urgencia del hueco 0 sigue publicada"
+        );
+        assert_eq!(page.peek_lanes().1 & 1, 1, "y ademas ha cedido");
+        assert_eq!(
+            TaskCollection::bitmap_candidate(&mut inner, 0, true),
+            Some(1),
+            "el hueco 0 esta en las dos vias: es una urgencia, no una cesion"
+        );
+        assert_eq!(
+            TaskCollection::bitmap_candidate(&mut inner, 0, false),
+            Some(0)
+        );
     }
 
     /// Un bit puesto sobre un hueco que ya no esta en el slab se limpia por el
@@ -1787,6 +1813,13 @@ mod collection_tests {
         inner.future_collections.clear();
         assert!(inner.queue(DEFAULT_PRIORITY).is_none());
         assert_eq!(inner.ready_num(), None);
+        // `has_ready` is the one of these that cannot answer "nothing": it is
+        // the last thing the executor asks before `wait_for_interrupt`, and
+        // there is no timer backstop in that idle path. A wake may be sitting
+        // in a page we can no longer name, so the CPU stays awake and the
+        // corruption reaches the log through the takers instead of wedging a
+        // core on a queue nobody can read.
+        assert!(inner.has_ready(), "a collection we cannot read is not grounds to halt");
     }
 
     /// The paths with nowhere to put a `None` still say what happened instead
@@ -1989,6 +2022,126 @@ mod collection_tests {
             0,
             "the mark outlived the task that earned it"
         );
+    }
+
+    /// `has_ready` is read with interrupts off in the instant before
+    /// `wait_for_interrupt`, and a wake that lands on a slot some executor is
+    /// already polling is not work for this CPU: both takers *defer* a
+    /// borrowed slot (they re-publish the bit and report nothing). Answering
+    /// "yes" here makes the CPU skip the halt, drain nothing and come straight
+    /// back round -- a spin for as long as the other CPU holds the borrow,
+    /// which under work stealing is a whole poll. The shortcut this collection
+    /// takes when no task carries a mask reads the page lanes itself, so it
+    /// has to mask `borrowed` out exactly as the per-slot path below it does.
+    #[test]
+    fn a_wake_on_a_task_being_polled_is_not_work_to_skip_the_halt_for() {
+        let _g = crate::runtime::resched_test_lock();
+        let tc = TaskCollection::new(0);
+        tc.add_task(pending(), None);
+        let (_key, _task, waker) = tc.take_task().expect("a fresh task is runnable");
+        assert_eq!(
+            tc.get_mut_inner(DEFAULT_PRIORITY).affine,
+            0,
+            "no task here carries a mask, so this is the shortcut's own path"
+        );
+        assert!(!tc.has_ready(), "the only task is checked out");
+        // An external wake arriving mid-poll: published on the lane, and
+        // deferred by whoever drains it next.
+        waker.wake_by_ref();
+        assert!(
+            !tc.has_ready(),
+            "a deferred wake is not work this CPU can act on yet"
+        );
+        // Handing the slot back is what makes it work again.
+        waker.mark_borrowed(false);
+        assert!(tc.has_ready(), "the released slot carries the wake");
+    }
+
+    /// A runnable bit the collection cannot resolve to a task must not let the
+    /// CPU halt either. The slot is gone from the slab with its lane bit still
+    /// up -- the state `bitmap_candidate` clears as it walks past it -- so for
+    /// one pass `has_ready` has a published wake and no task to ask
+    /// `allowed_on`. Conservative is the only safe answer here for the same
+    /// reason as the smashed header above: nothing else will look again.
+    #[test]
+    fn a_runnable_bit_with_no_task_behind_it_keeps_the_cpu_awake() {
+        let tc = TaskCollection::new(0);
+        // A mask takes `has_ready` off its no-mask shortcut and onto the
+        // per-slot path, which is the one that fetches the task.
+        tc.add_task(pending(), pinned_elsewhere());
+        assert!(
+            !tc.has_ready(),
+            "while the task is there it is pinned elsewhere and not ours"
+        );
+        {
+            let mut inner = tc.get_mut_inner(DEFAULT_PRIORITY);
+            assert_ne!(inner.affine, 0, "the mask is what keeps us off the shortcut");
+            // Out of the slab without anyone putting its bit out.
+            inner.slab.remove(0);
+            let (notified, _, dropped, borrowed) = inner.pages[0].peek_lanes();
+            assert_eq!(
+                (
+                    notified & 1,
+                    dropped & 1,
+                    borrowed & 1,
+                    inner.pages[0].affine_bits() & 1
+                ),
+                (1, 0, 0, 1),
+                "the orphan bit is still published and still marked affine"
+            );
+        }
+        assert!(tc.has_ready(), "an unresolvable wake is not grounds to halt");
+    }
+
+    /// A claim that comes back empty hands out nothing.
+    ///
+    /// The lanes are read and the slot chosen under this collection's lock,
+    /// but `notify`, `mark_dropped` and a peer's own claim all write them
+    /// without it, so between choosing a slot and claiming its bit the bit can
+    /// be gone. `reclaim_notified`/`reclaim_yielded` say so by reporting 0,
+    /// and "nothing ready" is the only safe answer: handing the task over
+    /// anyway polls a future whose wake another CPU has already consumed, and
+    /// marks a slot `borrowed` on behalf of an executor that was never given
+    /// it -- a slot no release will ever come back for, which every later
+    /// reader then masks out as work in flight.
+    ///
+    /// See `waker_page::steal_next_reclaim` for why the race is injected at
+    /// the page and not here.
+    #[test]
+    fn a_slot_whose_bit_a_peer_took_first_is_not_handed_out() {
+        let tc = TaskCollection::new(0);
+        tc.add_task(pending(), None);
+        let waker = tc
+            .get_mut_inner(DEFAULT_PRIORITY)
+            .slab
+            .get(0)
+            .expect("the task is in the slab")
+            .waker()
+            .clone();
+
+        crate::waker_page::steal_next_reclaim();
+        assert!(
+            tc.take_task().is_none(),
+            "the bit was gone, so there was nothing to hand out"
+        );
+        {
+            let inner = tc.get_mut_inner(DEFAULT_PRIORITY);
+            let (notified, yielded, _, borrowed) = inner.pages[0].peek_lanes();
+            assert_eq!(
+                borrowed & 1,
+                0,
+                "a slot nobody was handed must not be left checked out"
+            );
+            assert_eq!(
+                (notified & 1, yielded & 1),
+                (0, 0),
+                "the winning peer's claim consumed the bit"
+            );
+        }
+        // And the task itself is untouched: the next wake serves it normally.
+        let _g = crate::runtime::resched_test_lock();
+        waker.wake_by_ref();
+        assert!(tc.take_task().is_some(), "the task survived the lost race");
     }
 
     #[test]

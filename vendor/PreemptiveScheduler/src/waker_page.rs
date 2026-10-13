@@ -123,6 +123,42 @@ pub struct WakerPage {
     pub(crate) owner_cpu: u8,
 }
 
+/// Test-only: make the next `reclaim_notified`/`reclaim_yielded` on any page
+/// report that the bit was already gone.
+///
+/// Both reclaims report 0 when the lane bit is no longer theirs to take: a
+/// peer claimed it, or the slot was retired, between the lane read that chose
+/// the slot and the claim itself. `TaskCollection::schedule` makes both of
+/// those calls under the collection lock, but `notify`, `mark_dropped` and a
+/// peer's own claim all write the lanes *without* it, so there is a real
+/// window and no instant a single-threaded test can wedge itself into. This
+/// is the page telling the one truth it would tell in that race, which leaves
+/// `schedule`'s reaction to it as the thing under test rather than a replica
+/// of it.
+///
+/// It is a one-shot and disarms itself on the next reclaim, so nothing has to
+/// be put back. In a build that is not the test build `reclaim_stolen` is
+/// `false` and the branch folds away.
+#[cfg(test)]
+pub(crate) fn steal_next_reclaim() {
+    STEAL_NEXT_RECLAIM.store(true, Ordering::SeqCst);
+}
+
+#[cfg(test)]
+static STEAL_NEXT_RECLAIM: AtomicBool = AtomicBool::new(false);
+
+#[cfg(test)]
+#[inline]
+fn reclaim_stolen() -> bool {
+    STEAL_NEXT_RECLAIM.swap(false, Ordering::SeqCst)
+}
+
+#[cfg(not(test))]
+#[inline(always)]
+fn reclaim_stolen() -> bool {
+    false
+}
+
 impl WakerPage {
     pub fn new_inner(owner_cpu: u8) -> Self {
         WakerPage {
@@ -303,6 +339,10 @@ impl WakerPage {
         if mask == 0 {
             return 0;
         }
+        if reclaim_stolen() {
+            self.notified.fetch_and(!mask);
+            return 0;
+        }
         let raw = self.notified.fetch_and_prev(!mask) & mask;
         let dropped = self.dropped.load();
         let borrowed = self.borrowed.load();
@@ -316,6 +356,10 @@ impl WakerPage {
     /// The voluntary-yield twin of [`reclaim_notified`](Self::reclaim_notified).
     pub fn reclaim_yielded(&self, mask: u64) -> u64 {
         if mask == 0 {
+            return 0;
+        }
+        if reclaim_stolen() {
+            self.yielded.fetch_and(!mask);
             return 0;
         }
         let raw = self.yielded.fetch_and_prev(!mask) & mask;
@@ -643,6 +687,39 @@ mod waker_page_tests {
     /// es saber cuales estaban puestos: el `fetch_and` de al lado tira el
     /// valor anterior, y quien reclama un hueco tiene que distinguir «lo
     /// reclame yo» de «ya no estaba».
+    /// `has_notified` es la forma de pagina de `TaskCollection::has_ready`, y
+    /// hoy no la llama nadie: lo que fija esto es que la respuesta que daria
+    /// el dia que alguien la use sea la misma que da el reparto. Y el reparto
+    /// sirve las DOS vias --- `schedule` elige entre `notified` y
+    /// `voluntary` ---, asi que una pagina cuyo unico bit esta en la via de
+    /// cesion si tiene trabajo. Contestar «aqui no hay nada» en ese estado es
+    /// dejar que la CPU se duerma encima de un hilo que acaba de ceder, y
+    /// hasta el siguiente tic periodico (250 Hz, o sea 4 ms) no vuelve a
+    /// mirarlo nadie.
+    #[test]
+    fn la_cesion_voluntaria_tambien_cuenta_en_la_pregunta_de_la_pagina() {
+        let page = WakerPage::new_inner(0);
+        page.initialize(7);
+        assert!(page.has_notified(), "un hueco recien repartido es trabajo");
+        assert_eq!(page.take_notified(), 1 << 7);
+        assert!(!page.has_notified(), "y drenado no queda nada");
+
+        page.mark_yielded(7);
+        assert!(
+            page.has_notified(),
+            "una cesion voluntaria es trabajo igual: `schedule` la reparte"
+        );
+
+        // Y lo que la tapa la tapa en las dos vias por igual, que es la otra
+        // mitad de la pregunta: un bit publicado no es trabajo si la tarea
+        // esta en manos de un ejecutor o ya no existe.
+        page.mark_borrowed(7, true);
+        assert!(!page.has_notified(), "la tiene un ejecutor");
+        page.mark_borrowed(7, false);
+        page.mark_dropped(7);
+        assert!(!page.has_notified(), "la tarea ya no existe");
+    }
+
     #[test]
     fn taking_bits_out_of_a_lane_reports_which_were_there() {
         let lane = AtomicU64SC::new(0b1010);
@@ -1064,6 +1141,28 @@ mod waker_page_tests {
         // handed to an executor, whichever lane its wake was sitting in.
         assert_eq!(p.reclaim_notified(parked), 1 << 9);
         assert_eq!(p.peek().0, 0);
+    }
+
+    /// The urgent twin of the test below it, which had no test of its own.
+    ///
+    /// The asymmetry mattered: the lane an external wake lands in is
+    /// `notified`, so this is the reclaim on the path a sleeper's timer takes,
+    /// and dropping the bit here is the "left the task asleep forever" the
+    /// comment in `take_notified` is about. A voluntary yield that goes
+    /// missing costs a timeslice; an external wake that goes missing is a task
+    /// nothing will ever wake again.
+    #[test]
+    fn an_urgent_wake_for_a_borrowed_slot_is_deferred_and_not_dropped() {
+        let p = page();
+        let parked = (1 << 9) | (1 << 40);
+        p.park_notified(parked);
+        p.mark_borrowed(40, true);
+        assert_eq!(p.reclaim_notified(parked), 1 << 9);
+        assert_eq!(p.peek().0, 1 << 40, "the deferred wake was thrown away");
+        // And it survives to the pass after the borrow goes away, which is the
+        // whole point of re-publishing it.
+        p.mark_borrowed(40, false);
+        assert_eq!(p.reclaim_notified(1 << 40), 1 << 40);
     }
 
     #[test]
