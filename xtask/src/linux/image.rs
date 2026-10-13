@@ -554,6 +554,19 @@ impl super::LinuxRootfs {
             fs::copy(&target_btrfs_gz, live_boot.join("rootfs.btrfs.gz")).unwrap();
             fs::copy(&target_home_gz, live_boot.join("home.btrfs.gz")).unwrap();
 
+            // The installer checks each payload against `<name>.sha256`
+            // before it writes a byte to the disk. Nobody ever wrote those
+            // files, so every install printed "No existe
+            // boot/efi.img.gz.sha256; se omite verificación SHA-256 previa"
+            // and then wrote a payload it had not looked at. They are hashed
+            // here, from the very copies that ship.
+            for name in BOOT_PAYLOADS {
+                let payload = live_boot.join(name);
+                println!("Hashing {name}...");
+                crate::sha256::write_sidecar(&payload)
+                    .unwrap_or_else(|e| panic!("Failed to write {name}.sha256: {e}"));
+            }
+
             // 5d. ISO installer SFS: LIVE_KEEP + GSP + payloads, no desktop.
             // `make iso` copies this to the El Torito ESP as initramfs.img so
             // the live session is console + install-eclipse; the desktop is
