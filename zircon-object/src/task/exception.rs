@@ -743,6 +743,10 @@ mod tests {
     /// stops pointing at `synth_code`, the call silently reports whatever word
     /// is there instead, so it is pinned to the struct itself rather than to a
     /// number.
+    ///
+    /// `exception_context_layout_tests` next door pins the same offsets to
+    /// their x86_64 values; this one pins the two *published* constants to the
+    /// struct on every architecture, which is what the reader of them needs.
     #[test]
     fn the_published_offset_points_at_the_two_synthetic_words() {
         assert_eq!(
@@ -1409,6 +1413,39 @@ mod tests {
     /// Nothing caught it because `first_only` only shows up when the first
     /// handler *declines*, and every other test here has the first handler
     /// take the exception.
+    /// A user-raised exception is for whoever is debugging the job, and for
+    /// nobody else. Sending it down the ordinary chain instead would hand a
+    /// process- or thread-level handler an exception it never registered to
+    /// see, and in Zircon those handlers can resume or discard a thread.
+    #[async_std::test]
+    async fn a_user_exception_goes_to_the_job_debugger_and_nowhere_else() {
+        let job = Job::root().create_child().unwrap();
+        let proc = Process::create(&job, "proc").unwrap();
+        let thread = Thread::create(&proc, "thread").unwrap();
+
+        let debugger = Arc::new(Mutex::new(false));
+        let by_process = Arc::new(Mutex::new(false));
+        let by_thread = Arc::new(Mutex::new(false));
+        // None of the three handles it, so every one of them that is offered
+        // the exception at all records that it was.
+        let first = a_handler(&job.debug_exceptionate(), false, debugger.clone());
+        let second = a_handler(&proc.exceptionate(), false, by_process.clone());
+        let third = a_handler(&thread.exceptionate(), false, by_thread.clone());
+
+        Exception::new_user(&thread, 1, 2).handle().await;
+
+        job.debug_exceptionate().shutdown();
+        proc.exceptionate().shutdown();
+        thread.exceptionate().shutdown();
+        first.await;
+        second.await;
+        third.await;
+
+        assert!(*debugger.lock(), "the job debugger never got it");
+        assert!(!*by_process.lock(), "a process handler was offered it");
+        assert!(!*by_thread.lock(), "a thread handler was offered it");
+    }
+
     #[async_std::test]
     async fn only_the_nearest_job_debugger_hears_a_process_starting() {
         let parent_job = Job::root().create_child().unwrap();
