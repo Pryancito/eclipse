@@ -1,6 +1,6 @@
 //! Shared internals of Eclipse OS's native desktop clients.
 //!
-//! Two binaries live on top of this library, and both exist for the same
+//! Four binaries live on top of this library, and they all exist for the same
 //! reason: everything off-the-shelf in this space is a GTK or Qt application
 //! that registers on the session D-Bus at startup, and Eclipse OS has no
 //! session bus (see `DBUS_SESSION_BUS_ADDRESS` in the labwc session
@@ -10,12 +10,19 @@
 //! - `lunarbar` — the panel (taskbar, clock, indicators, app menu).
 //! - `lunarrun` — the KRunner stand-in: a centred search overlay, plus
 //!   `--toggle-desktop` (KDE's Super+D) over wlr-foreign-toplevel-management.
+//! - `lunarfile` — the file browser behind Super+E, and the `--pick` chooser
+//!   the XDG portal shows.
+//! - `lunarclip` — the clipboard manager over wlr-data-control: the daemon
+//!   that keeps a copy alive after the window that made it closes, and the
+//!   Super+V history picker.
 //!
-//! Both are single static musl binaries over wlr-layer-shell + wl_shm with
-//! their own bitmap font and /proc readers: no GTK, no D-Bus, no gdk-pixbuf,
-//! no fontconfig, no locale.
+//! All of them are single static musl binaries with their own bitmap font and
+//! /proc readers — the first three over wlr-layer-shell + wl_shm, the last
+//! over wlr-data-control: no GTK, no D-Bus, no gdk-pixbuf, no fontconfig, no
+//! locale.
 
 pub mod apps;
+pub mod clip;
 pub mod draw;
 pub mod files;
 pub mod fill_guard;
