@@ -82,6 +82,7 @@ pub(super) fn a_process() -> LinuxProcess {
         root_inode: Log::new(),
         parent: Mutex::new(Weak::default()),
         vt: 0,
+        exit_path: Default::default(),
         perf: crate::perf::ProcPerf::new(),
         futexes: Default::default(),
         itimers: Default::default(),
