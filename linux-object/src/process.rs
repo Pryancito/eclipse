@@ -609,6 +609,7 @@ impl ProcessExt for Process {
             root_inode: linux_parent.root_inode.clone(),
             parent: Mutex::new(Arc::downgrade(parent)),
             vt: linux_parent.vt,
+            exit_path: ExitPathSummary::default(),
             perf: crate::perf::ProcPerf::new(),
             futexes: Default::default(),
             itimers: Default::default(),
@@ -1153,6 +1154,11 @@ pub struct LinuxProcess {
     vt: usize,
     /// Inner
     inner: Mutex<LinuxProcessInner>,
+    /// Lock-free mirror of the two fields of [`LinuxProcessInner`] that the
+    /// **return to user mode** reads on every syscall.
+    ///
+    /// See [`ExitPathSummary`].
+    exit_path: ExitPathSummary,
     /// Per-process syscall accounting (surfaced at `/proc/<pid>/perf`).
     perf: crate::perf::ProcPerf,
     /// The process's futex objects, keyed by the address of their word.
@@ -1741,6 +1747,7 @@ impl LinuxProcess {
             root_inode,
             parent: Mutex::new(Weak::default()),
             vt,
+            exit_path: ExitPathSummary::default(),
             perf: crate::perf::ProcPerf::new(),
             futexes: Default::default(),
             itimers: Default::default(),
@@ -1823,11 +1830,6 @@ impl LinuxProcess {
         inner.pgid = pid;
     }
 
-    /// True while this process is job-control stopped.
-    pub fn is_job_stopped(&self) -> bool {
-        self.inner.lock().job_stopped
-    }
-
     /// Enter a job-control stop caused by `sig`. Notifies the parent with
     /// `SIGCHLD` so a `wait*` with `WSTOPPED` can collect it. Idempotent if
     /// already stopped.
@@ -1841,6 +1843,7 @@ impl LinuxProcess {
             inner.job_stop_sig = sig;
             inner.job_stop_pending = true;
             inner.job_continued_pending = false;
+            self.refresh_exit_path(&inner);
         }
         notify_parent_child_state(proc);
     }
@@ -1848,7 +1851,12 @@ impl LinuxProcess {
     /// Leave a job-control stop (`SIGCONT`). Wakes parked threads and notifies
     /// the parent for `WCONTINUED`. Returns whether the process was stopped.
     pub fn job_continue(&self, proc: &Arc<Process>) -> bool {
-        let was_stopped = self.inner.lock().leave_stop(true);
+        let was_stopped = {
+            let mut inner = self.inner.lock();
+            let was = inner.leave_stop(true);
+            self.refresh_exit_path(&inner);
+            was
+        };
         proc.signal_set(JOB_CONTINUE_SIGNAL);
         if was_stopped {
             notify_parent_child_state(proc);
@@ -1865,7 +1873,11 @@ impl LinuxProcess {
     /// process is not continuing, and a parent in `wait(WCONTINUED)` must not
     /// be told that it did.
     pub fn job_wake_to_die(&self, proc: &Arc<Process>) {
-        self.inner.lock().leave_stop(false);
+        {
+            let mut inner = self.inner.lock();
+            inner.leave_stop(false);
+            self.refresh_exit_path(&inner);
+        }
         proc.signal_set(JOB_CONTINUE_SIGNAL);
     }
 
@@ -3852,6 +3864,7 @@ impl LinuxProcess {
                 .entry(signal as u8)
                 .or_insert(info);
         }
+        self.refresh_exit_path(&inner);
     }
 
     /// Process-directed signals not yet pulled onto any thread (`shared_pending`).
@@ -3867,6 +3880,14 @@ impl LinuxProcess {
     /// [`check_signals_of`]'s discard path).
     pub fn pull_shared_pending_into(&self, thread: &Arc<Thread>) {
         use crate::thread::ThreadExt;
+        // The return to user mode calls this on EVERY syscall of EVERY
+        // thread, and the answer is almost always "nothing is pending". Ask
+        // the lock-free mirror first: without this, the two locks below are
+        // taken a few million times a second to read an empty `Sigset`. See
+        // [`ExitPathSummary`].
+        if self.exit_path.shared_pending_bits.load(Ordering::Acquire) == 0 {
+            return;
+        }
         let Some(mut lt) = thread.try_lock_linux() else {
             return;
         };
@@ -3876,6 +3897,12 @@ impl LinuxProcess {
     /// Same as [`Self::pull_shared_pending_into`] when the caller already holds
     /// the thread's Linux lock (signalfd / mask updates).
     pub fn pull_shared_pending_locked(&self, lt: &mut crate::thread::LinuxThread) {
+        // Same mirror, same reason: the mask-change and signalfd callers are
+        // not the hot path, but this is also where the hot path lands once
+        // the mirror says there is something to look at.
+        if self.exit_path.shared_pending_bits.load(Ordering::Acquire) == 0 {
+            return;
+        }
         let mut inner = self.inner.lock();
         if inner.shared_pending.is_empty() {
             return;
@@ -3889,6 +3916,7 @@ impl LinuxProcess {
                 lt.queue_signal(sig, info);
             }
         }
+        self.refresh_exit_path(&inner);
     }
 
     /// Close file that FD_CLOEXEC is set
@@ -5170,6 +5198,7 @@ pub fn set_signal_action_in(process: &Arc<Process>, signal: LinuxSignal, action:
         let mut inner = lp.inner.lock();
         inner.shared_pending.remove(signal);
         inner.shared_pending_info.remove(&(signal as u8));
+        lp.refresh_exit_path(&inner);
     }
     for tid in process.thread_ids() {
         if let Ok(thread) = process.get_child(tid) {
@@ -5804,6 +5833,15 @@ fn wake_for_job_control(process: &Arc<Process>, signal: LinuxSignal) {
         SendEffect::Stop | SendEffect::None => {}
     }
 }
+
+mod exit_path;
+use exit_path::ExitPathSummary;
+
+#[cfg(test)]
+mod exit_path_benches;
+
+#[cfg(test)]
+mod exit_path_summary_tests;
 
 #[cfg(test)]
 mod fork_inheritance_tests;
