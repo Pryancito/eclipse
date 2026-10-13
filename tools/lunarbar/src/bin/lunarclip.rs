@@ -839,6 +839,10 @@ fn watch(cli: &Cli) -> ! {
             eprintln!("lunarclip: se perdio la conexion con el compositor");
             break;
         }
+        // The clients the poll found ready, BY FILE DESCRIPTOR. The accept
+        // below changes how many clients there are, so a position in `pfds` is
+        // not a position in `clients` by the time it is used.
+        let ready = ready_fds(&pfds, POLL_FIXED);
         if pfds[1].revents & libc::POLLIN != 0 {
             while let Ok((sock, _)) = listener.accept() {
                 let _ = sock.set_nonblocking(true);
@@ -854,9 +858,11 @@ fn watch(cli: &Cli) -> ! {
             }
         }
         // In reverse, so removing a client does not shift the index of one not
-        // yet looked at.
+        // yet looked at. A client accepted just above is not in `ready` and is
+        // read on the next turn of the loop: its bytes are waiting in the
+        // socket, so the very next poll reports it readable with nothing lost.
         for i in (0..clients.len()).rev() {
-            if pfds[i + 2].revents & (libc::POLLIN | libc::POLLHUP) == 0 {
+            if !ready.contains(&clients[i].sock.as_raw_fd()) {
                 continue;
             }
             if !serve_client(&mut clients[i], &mut st, &qh) {
@@ -866,6 +872,33 @@ fn watch(cli: &Cli) -> ! {
     }
     let _ = std::fs::remove_file(&sock_path);
     std::process::exit(1)
+}
+
+/// The entries of the daemon's poll set that are not clients: the compositor's
+/// connection and the listening socket, in that order.
+const POLL_FIXED: usize = 2;
+
+/// The descriptors `poll` reported something on, skipping the first `fixed`
+/// entries.
+///
+/// By descriptor and not by position, which is the whole point. The accept loop
+/// runs *after* the poll and pushes whatever connected, so by the time the
+/// client list is walked it is longer than the poll set was — and indexing
+/// `pfds[i + 2]` with the new length aborted the daemon on the first connection
+/// anybody ever made to it ("len is 2 but the index is 2"). With
+/// `panic = "abort"` that is not a message in a log, it is the clipboard gone
+/// for the rest of the session, and eclipse-init respawning it into the same
+/// crash on the next `lunarclip --check`.
+///
+/// Matching by descriptor is also immune to the other half of the problem: a
+/// client removed mid-walk shifts every index after it, and nothing about that
+/// is visible at the point where the index is used.
+fn ready_fds(pfds: &[libc::pollfd], fixed: usize) -> Vec<i32> {
+    pfds.iter()
+        .skip(fixed)
+        .filter(|p| p.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0)
+        .map(|p| p.fd)
+        .collect()
 }
 
 /// Read what a client sent, answer every complete request in it, and say
@@ -2404,6 +2437,74 @@ mod tests {
             assert!(row0 >= py, "{w}x{h}");
             assert!((1..=MAX_ROWS).contains(&rows), "{w}x{h}: {rows}");
         }
+    }
+
+    /// A pollfd as the daemon builds them.
+    fn pfd(fd: i32, revents: i16) -> libc::pollfd {
+        libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents,
+        }
+    }
+
+    #[test]
+    fn the_poll_answer_names_client_descriptors_and_never_the_fixed_two() {
+        // The first two entries are the compositor and the listening socket.
+        // Returning either of them as a "client" would have the daemon read a
+        // request off its own Wayland connection.
+        let pfds = [
+            pfd(3, libc::POLLIN),
+            pfd(4, libc::POLLIN),
+            pfd(42, libc::POLLIN),
+            pfd(43, 0),
+            pfd(44, libc::POLLHUP),
+        ];
+        assert_eq!(ready_fds(&pfds, POLL_FIXED), vec![42, 44]);
+        // Nothing ready is nothing to serve, not "all of them".
+        let quiet = [pfd(3, 0), pfd(4, 0), pfd(42, 0)];
+        assert!(ready_fds(&quiet, POLL_FIXED).is_empty());
+    }
+
+    #[test]
+    fn a_client_accepted_this_round_is_not_looked_up_in_the_poll_set() {
+        // THE CRASH lunarclip shipped with: the poll ran with no clients, so
+        // `pfds` had two entries; the accept pushed the first connection ever
+        // made to the daemon; and the walk indexed `pfds[0 + 2]` -- "len is 2
+        // but the index is 2". With `panic = "abort"` that killed the daemon,
+        // which means every `lunarclip --check`, `--list`, `--pick` or `--copy`
+        // emptied the clipboard and left eclipse-init respawning into the same
+        // abort.
+        let pfds = [pfd(3, 0), pfd(4, libc::POLLIN)];
+        let ready = ready_fds(&pfds, POLL_FIXED);
+        // The listener was the one that was ready, and it is not a client.
+        assert!(ready.is_empty());
+        // The walk over the grown client list finds nothing to do and, above
+        // all, indexes nothing: the new client is read on the next poll.
+        let accepted = [77];
+        let served: Vec<i32> = accepted
+            .iter()
+            .copied()
+            .filter(|fd| ready.contains(fd))
+            .collect();
+        assert!(served.is_empty());
+    }
+
+    #[test]
+    fn an_old_client_is_served_while_a_new_one_waits_its_turn() {
+        // One client was in the poll set and spoke; another connected in the
+        // same round. Exactly the first is served, and by ITS descriptor, so a
+        // removal earlier in the walk cannot hand the next iteration somebody
+        // else's `revents`.
+        let pfds = [pfd(3, 0), pfd(4, libc::POLLIN), pfd(42, libc::POLLIN)];
+        let ready = ready_fds(&pfds, POLL_FIXED);
+        let clients = [42, 77];
+        let served: Vec<i32> = clients
+            .iter()
+            .copied()
+            .filter(|fd| ready.contains(fd))
+            .collect();
+        assert_eq!(served, vec![42]);
     }
 
     #[test]

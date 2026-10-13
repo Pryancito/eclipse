@@ -446,9 +446,14 @@ pub fn parse_req(buf: &[u8]) -> ReqParse {
         return ReqParse::Bad;
     };
     let line = line.trim_end_matches('\r');
-    // Every `used` below counts from the ORIGINAL buffer, blank lines
-    // included, because that is what the caller advances by.
-    let used = blanks + nl + 1;
+    // TWO offsets, and keeping them apart is the whole of the bug this once
+    // had: `line_end` is inside `buf`, which has already had its blank lines
+    // cut off, while `used` counts from the ORIGINAL buffer because that is
+    // what the caller advances by. Slicing `buf` by `used` reads past the end
+    // of the line -- and with a payload that had not arrived yet it indexed
+    // past the end of the buffer outright.
+    let line_end = nl + 1;
+    let used = blanks + line_end;
     let (verb, arg) = match line.split_once(' ') {
         Some((v, a)) => (v, a.trim()),
         None => (line, ""),
@@ -461,7 +466,7 @@ pub fn parse_req(buf: &[u8]) -> ReqParse {
             Err(_) => ReqParse::Bad,
         },
         "COPY" => {
-            let rest = &buf[used..];
+            let rest = &buf[line_end..];
             let Some(head) = rest.strip_prefix(b"@") else {
                 // The `@` has not arrived yet; `Bad` would drop a client whose
                 // write was split across two packets.
@@ -879,6 +884,44 @@ mod tests {
     #[test]
     fn a_request_split_across_packets_is_incomplete_and_not_bad() {
         let full = encode_req(&Req::Copy("un texto".to_string()));
+        for cut in 1..full.len() - 1 {
+            assert_eq!(
+                parse_req(&full[..cut]),
+                ReqParse::Incomplete,
+                "cut at {cut} should wait for more"
+            );
+        }
+    }
+
+    #[test]
+    fn a_copy_behind_a_blank_line_parses_like_any_other() {
+        // The blank line is the trailing newline of the COPY before it, so
+        // this is simply two copies down one connection. The offsets inside
+        // the COPY arm are relative to the line, not to the original buffer,
+        // and mixing the two both mis-sliced the payload and could index past
+        // the end of a buffer whose payload had not arrived yet.
+        let one = encode_req(&Req::Copy("hola".to_string()));
+        let two = encode_req(&Req::Copy("adios".to_string()));
+        let mut buf = one.clone();
+        buf.extend_from_slice(&two);
+        let ReqParse::Done(first, used) = parse_req(&buf) else {
+            panic!("the first COPY did not parse");
+        };
+        assert_eq!(first, Req::Copy("hola".to_string()));
+        let rest = &buf[used..];
+        assert!(rest.starts_with(b"\n"), "the blank line is still there");
+        assert_eq!(
+            parse_req(rest),
+            ReqParse::Done(Req::Copy("adios".to_string()), rest.len() - 1)
+        );
+    }
+
+    #[test]
+    fn a_copy_behind_a_blank_line_split_anywhere_waits_instead_of_panicking() {
+        // Byte by byte, which is what a socket is allowed to do. The cut right
+        // after `\nCOPY\n` is the one that indexed past the end of the buffer.
+        let mut full = vec![b'\n'];
+        full.extend_from_slice(&encode_req(&Req::Copy("un texto".to_string())));
         for cut in 1..full.len() - 1 {
             assert_eq!(
                 parse_req(&full[..cut]),
