@@ -108,6 +108,7 @@ jobs:
           cargo bench -p linux-object --bench vfs --features mock-disk --no-run
           cargo bench -p linux-object --bench signal --features mock-disk --no-run
           cargo bench -p linux-object --bench process --features mock-disk --no-run
+          cargo bench -p linux-object --bench process_census --features mock-disk --no-run
           # `linux-object`'s syscall-accounting rows are not a `benches/`
           # target either: `ProcPerf::record` is private to `perf`, and the
           # contention rows need the statics themselves.

@@ -35,6 +35,8 @@ use zircon_object::{
 };
 
 /// The file-descriptor table's allocator and its two range sweeps.
+mod census;
+pub use census::*;
 mod fd_table;
 
 pub use rcore_fs::vfs::FsInfo;
@@ -4829,20 +4831,6 @@ pub fn setsid_verdict(caller_pid: KoID, live_pgids: &[KoID]) -> LxResult<()> {
     Ok(())
 }
 
-/// The effective process group of every live process, for [`setsid_verdict`].
-pub fn live_effective_pgids() -> Vec<KoID> {
-    all_live_processes().iter().map(effective_pgid).collect()
-}
-
-/// `getpgid`: the effective process-group id of process `pid`.
-pub fn get_process_pgid(pid: KoID) -> LxResult<KoID> {
-    let proc = all_live_processes()
-        .into_iter()
-        .find(|p| p.id() == pid)
-        .ok_or(LxError::ESRCH)?;
-    Ok(effective_pgid(&proc))
-}
-
 /// This process's effective session id: its raw sid, or its own pid when the
 /// raw value is unset (`0`).
 pub fn effective_sid(proc: &Arc<Process>) -> KoID {
@@ -4853,15 +4841,6 @@ pub fn effective_sid(proc: &Arc<Process>) -> KoID {
     } else {
         raw
     }
-}
-
-/// `getsid`: the effective session id of process `pid`.
-pub fn get_process_sid(pid: KoID) -> LxResult<KoID> {
-    let proc = all_live_processes()
-        .into_iter()
-        .find(|p| p.id() == pid)
-        .ok_or(LxError::ESRCH)?;
-    Ok(effective_sid(&proc))
 }
 
 pub fn check_and_deliver_tty_interrupt() -> LxResult<()> {
@@ -4875,38 +4854,6 @@ pub fn check_and_deliver_tty_interrupt() -> LxResult<()> {
         return Err(LxError::EINTR);
     }
     check_signals()
-}
-
-fn collect_live_processes(job: &Arc<Job>, out: &mut Vec<Arc<Process>>) {
-    for id in job.process_ids() {
-        if let Some(proc) = job.find_process(id) {
-            if !matches!(proc.status(), Status::Exited(_)) {
-                out.push(proc);
-            }
-        }
-    }
-    for child_id in job.children_ids() {
-        if let Ok(child) = job.get_child(child_id) {
-            if let Ok(child_job) = child.downcast_arc::<Job>() {
-                collect_live_processes(&child_job, out);
-            }
-        }
-    }
-}
-
-/// All non-exited processes in the root job tree.
-pub fn all_live_processes() -> Vec<Arc<Process>> {
-    let mut processes = Vec::new();
-    collect_live_processes(&ROOT_JOB, &mut processes);
-    processes
-}
-
-/// The process `pid` names, exited or not.
-///
-/// `find_task_by_vpid()`: the lookup a syscall that takes a pid does before
-/// it can ask anything else about it.
-pub fn find_process(pid: KoID) -> Option<Arc<Process>> {
-    ROOT_JOB.find_process(pid)
 }
 
 /// The monotonic clock now, in nanoseconds: what a process's birth is
@@ -5958,6 +5905,8 @@ mod session_and_group_tests;
 #[cfg(test)]
 mod dying_process_tests;
 
+#[cfg(test)]
+mod census_tests;
 #[cfg(test)]
 mod socket_fd_tests;
 
