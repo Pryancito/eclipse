@@ -120,8 +120,10 @@ pub(crate) fn extensible_tail_is_empty(tail: &[u8]) -> bool {
 /// cannot satisfy it, Rust calls `alloc_error`, which panics — so one
 /// process's ordinary read took the whole kernel down:
 ///
-///     [PANIC] cpu=10 ... memory allocation of 24576 bytes failed
-///       <linux_syscall::Syscall>::sys_read::{closure#0}
+/// ```text
+/// [PANIC] cpu=10 ... memory allocation of 24576 bytes failed
+///   <linux_syscall::Syscall>::sys_read::{closure#0}
+/// ```
 ///
 /// A user-sized allocation must never be able to do that; Linux returns
 /// ENOMEM for exactly this case. `try_reserve_exact` fails instead of

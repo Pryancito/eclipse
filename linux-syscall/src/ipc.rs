@@ -84,9 +84,11 @@ enum ShmatPlace {
 /// MIT-SHM attached the right segment was the first build where an X client
 /// got as far as writing into it:
 ///
-///     unhandled page fault @ 0x11937000(WRITE | USER)
-///         [anon+0x0 in map 0x11937000-0x1199b000]: ACCESS_DENIED,
-///         proc=glxgears pc=... [libgallium.so+0x7e0859] -> SIGSEGV
+/// ```text
+/// unhandled page fault @ 0x11937000(WRITE | USER)
+///     [anon+0x0 in map 0x11937000-0x1199b000]: ACCESS_DENIED,
+///     proc=glxgears pc=... [libgallium.so+0x7e0859] -> SIGSEGV
+/// ```
 ///
 /// `rep stos` zeroing the freshly attached 400 KiB image, from `glxgears`
 /// and `eglgears_x11` alike, at the first byte.

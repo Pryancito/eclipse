@@ -41,8 +41,10 @@ impl Syscall<'_> {
     /// through `%gs:`, and sets the base with `arch_prctl(ARCH_SET_GS, ..)`.
     /// It does not fall back when that fails:
     ///
-    ///     wasm_rt_syscall_set_segue_base error: Invalid argument
-    ///     Redirecting call to abort() to mozalloc_abort
+    /// ```text
+    /// wasm_rt_syscall_set_segue_base error: Invalid argument
+    /// Redirecting call to abort() to mozalloc_abort
+    /// ```
     ///
     /// which is how Firefox died here while only `ARCH_SET_FS` was answered.
     pub fn sys_arch_prctl(&mut self, code: i32, addr: usize) -> SysResult {
