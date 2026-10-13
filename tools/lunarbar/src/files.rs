@@ -24,6 +24,9 @@ pub struct Entry {
     /// the link (a link to a directory opens like one), so this is the only
     /// thing that distinguishes the two.
     pub link: bool,
+    /// Last modification, in seconds since the epoch, when the filesystem
+    /// said. Shown in the browser's date column by `short_date`.
+    pub mtime: Option<i64>,
 }
 
 /// How many characters of a name are ever kept. A directory entry can be 255
@@ -176,6 +179,10 @@ pub fn read_dir_sorted(dir: &str) -> std::io::Result<Vec<Entry>> {
             is_dir: md.as_ref().map(|m| m.is_dir()).unwrap_or(false),
             size: md.as_ref().map(|m| m.len()).unwrap_or(0),
             link,
+            mtime: md
+                .as_ref()
+                .map(std::os::unix::fs::MetadataExt::mtime)
+                .filter(|t| *t > 0),
         });
     }
     sort_entries(&mut out);
@@ -271,6 +278,213 @@ pub fn default_dir(home: Option<&str>) -> String {
     }
 }
 
+// ── dates ────────────────────────────────────────────────────────────────────
+
+const MONTHS: [&str; 12] = [
+    "ene", "feb", "mar", "abr", "may", "jun", "jul", "ago", "sep", "oct", "nov", "dic",
+];
+
+/// The widest thing `short_date` returns, in characters (`28 sep 2025`).
+pub const DATE_CHARS: usize = 11;
+
+/// `(year, month 1-12, day)` of a count of days since 1970-01-01.
+///
+/// Howard Hinnant's `civil_from_days`, because there is no calendar in `std`
+/// and pulling `chrono` into a static binary for one column is not worth it.
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    (y, m, d)
+}
+
+/// A modification time as a file manager's date column shows it, relative to
+/// `now`, both in seconds since the epoch and read in a zone `offset` seconds
+/// east of UTC: `hoy 10:40`, `ayer 18:03`, `3 oct`, or `28 sep 2025` once it is
+/// another year. Never wider than `DATE_CHARS`.
+///
+/// A time in the future (a clock that was wrong when the file was written) is
+/// shown as a plain date rather than as "hoy", which would be a lie.
+pub fn short_date(mtime: i64, now: i64, offset: i64) -> String {
+    let local = |t: i64| t.saturating_add(offset);
+    let (t, n) = (local(mtime), local(now));
+    let (day, today) = (t.div_euclid(86_400), n.div_euclid(86_400));
+    let secs = t.rem_euclid(86_400);
+    let (y, m, d) = civil_from_days(day);
+    let (ny, _, _) = civil_from_days(today);
+    let hm = format!("{:02}:{:02}", secs / 3600, secs / 60 % 60);
+    if mtime <= now && day == today {
+        format!("hoy {hm}")
+    } else if mtime <= now && day + 1 == today {
+        format!("ayer {hm}")
+    } else if y == ny {
+        format!("{d} {}", MONTHS[(m - 1) as usize])
+    } else {
+        format!("{d} {} {y}", MONTHS[(m - 1) as usize])
+    }
+}
+
+/// Seconds east of UTC of the local zone at `t`, from the C library's own
+/// reading of `TZ` and `/etc/localtime`; 0 when it cannot say.
+pub fn local_offset(t: i64) -> i64 {
+    let tt = t as libc::time_t;
+    // SAFETY: `localtime_r` writes only into the `tm` it is handed, and an
+    // all-zero `tm` is a valid value of that plain C struct.
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    let ok = unsafe { !libc::localtime_r(&tt, &mut tm).is_null() };
+    if ok {
+        tm.tm_gmtoff
+    } else {
+        0
+    }
+}
+
+/// Now, in seconds since the epoch.
+pub fn now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+// ── kinds ────────────────────────────────────────────────────────────────────
+
+/// What sort of file a name is, which is all the browser's icon says about it:
+/// one colour per kind, so a folder of photos and a folder of tarballs look
+/// different at a glance without an icon theme to ask.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kind {
+    Image,
+    Document,
+    Archive,
+    /// Disk images: `.iso`, `.img`.
+    Disk,
+    Media,
+    /// Scripts and source code.
+    Code,
+    Other,
+}
+
+pub fn kind_of(name: &str) -> Kind {
+    let Some(ext) = crate::open::extension_of(name) else {
+        return Kind::Other;
+    };
+    match ext.as_str() {
+        "png" | "jpg" | "jpeg" | "gif" | "webp" | "svg" | "bmp" | "ico" | "tif" | "tiff" => {
+            Kind::Image
+        }
+        "pdf" | "txt" | "md" | "odt" | "ods" | "odp" | "doc" | "docx" | "xls" | "xlsx" | "ppt"
+        | "pptx" | "rtf" | "csv" | "epub" => Kind::Document,
+        "zip" | "tar" | "gz" | "tgz" | "bz2" | "xz" | "zst" | "7z" | "rar" | "deb" | "rpm" => {
+            Kind::Archive
+        }
+        "iso" | "img" | "qcow2" | "vdi" | "raw" => Kind::Disk,
+        "mp3" | "ogg" | "opus" | "flac" | "wav" | "m4a" | "mp4" | "mkv" | "webm" | "avi"
+        | "mov" => Kind::Media,
+        "sh" | "py" | "rs" | "c" | "h" | "js" | "ts" | "json" | "toml" | "yaml" | "yml"
+        | "conf" | "ini" | "html" | "css" => Kind::Code,
+        _ => Kind::Other,
+    }
+}
+
+// ── places ───────────────────────────────────────────────────────────────────
+
+/// One entry of the browser's places rail: a name to show and where it goes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Place {
+    pub label: String,
+    pub path: String,
+}
+
+/// The most places the rail lists. A machine with forty USB sticks mounted
+/// gets the first few, not a rail taller than the screen.
+pub const MAX_PLACES: usize = 10;
+
+/// The usual folders under a home, in the order they are listed, each with
+/// the names it goes by: the Spanish one this image creates and the English
+/// one an imported home will have.
+const XDG_PLACES: [(&str, &[&str]); 4] = [
+    ("Documentos", &["Documentos", "Documents"]),
+    ("Descargas", &["Descargas", "Downloads"]),
+    ("Imágenes", &["Imágenes", "Imagenes", "Pictures"]),
+    ("Música", &["Música", "Musica", "Music"]),
+];
+
+fn is_dir(p: &str) -> bool {
+    std::fs::metadata(p).map(|m| m.is_dir()).unwrap_or(false)
+}
+
+/// The places rail for `home`: the home itself, the usual folders under it
+/// that exist, the root, and whatever is mounted under `mount_bases`.
+///
+/// A mount point is a directory that is not empty: `/mnt` with nothing
+/// mounted on it is an empty directory, and a rail entry that opens onto
+/// nothing is one the user learns to distrust.
+pub fn places_in(home: &str, mount_bases: &[&str]) -> Vec<Place> {
+    let mut out = Vec::new();
+    if home != "/" {
+        out.push(Place {
+            label: "Inicio".into(),
+            path: home.to_string(),
+        });
+        for (label, names) in XDG_PLACES {
+            if let Some(path) = names
+                .iter()
+                .map(|n| join_child(home, n))
+                .find(|p| is_dir(p))
+            {
+                out.push(Place {
+                    label: label.into(),
+                    path,
+                });
+            }
+        }
+    }
+    out.push(Place {
+        label: "Raíz /".into(),
+        path: "/".into(),
+    });
+    for base in mount_bases {
+        let Ok(rd) = std::fs::read_dir(base) else {
+            continue;
+        };
+        let mut found: Vec<Place> = rd
+            .flatten()
+            .filter_map(|e| {
+                let name = e.file_name().to_str()?.to_string();
+                let path = join_child(base, &name);
+                let full = std::fs::read_dir(&path).ok()?.next().is_some();
+                (is_dir(&path) && full).then_some(Place { label: name, path })
+            })
+            .collect();
+        found.sort_by(|a, b| a.label.cmp(&b.label));
+        out.extend(found);
+    }
+    out.truncate(MAX_PLACES);
+    out
+}
+
+/// `places_in` for this session: `$HOME`, and the mounts under `/media`,
+/// `/run/media/$USER` and `/mnt`.
+pub fn places(home: Option<&str>, user: Option<&str>) -> Vec<Place> {
+    let home = default_dir(home);
+    let run_media = user
+        .filter(|u| !u.is_empty() && !u.contains('/'))
+        .map(|u| format!("/run/media/{u}"));
+    let mut bases = vec!["/media"];
+    if let Some(r) = run_media.as_deref() {
+        bases.push(r);
+    }
+    bases.push("/mnt");
+    places_in(&home, &bases)
+}
+
 // ── tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -283,6 +497,7 @@ mod tests {
             is_dir: true,
             size: 0,
             link: false,
+            mtime: None,
         }
     }
 
@@ -292,6 +507,7 @@ mod tests {
             is_dir: false,
             size,
             link: false,
+            mtime: None,
         }
     }
 
@@ -724,5 +940,79 @@ mod tests {
         // A legal Linux name is 255 bytes, so the ceiling has to clear it or
         // ordinary files come back with their names cut.
         const { assert!(MAX_NAME_CHARS >= 255) };
+    }
+
+    // ── dates, kinds, places ─────────────────────────────────────────────────
+
+    #[test]
+    fn a_date_is_relative_to_today_and_never_wider_than_its_column() {
+        // 2026-10-13 12:00:00 UTC.
+        let now = 1_791_892_800;
+        assert_eq!(short_date(now - 3600, now, 0), "hoy 11:00");
+        assert_eq!(short_date(now - 86_400, now, 0), "ayer 12:00");
+        assert_eq!(short_date(now - 10 * 86_400, now, 0), "3 oct");
+        assert_eq!(short_date(now - 400 * 86_400, now, 0), "8 sep 2025");
+        // The zone moves the day boundary: 23:30 UTC on the 12th is already
+        // the 13th two hours east.
+        let late = now - 12 * 3600 - 1800;
+        assert_eq!(short_date(late, now, 0), "ayer 23:30");
+        assert_eq!(short_date(late, now, 7200), "hoy 01:30");
+        // A file from the future is not "hoy".
+        assert_eq!(short_date(now + 60, now, 0), "13 oct");
+        // The epoch, leap days and far-off years all land in the column.
+        assert_eq!(short_date(0, now, 0), "1 ene 1970");
+        assert_eq!(short_date(951_782_400, now, 0), "29 feb 2000");
+        for t in [0, 1, 951_782_400, now - 1, now, now + 1, 253_402_300_799] {
+            let s = short_date(t, now, 3600);
+            assert!(s.chars().count() <= DATE_CHARS, "{t}: {s}");
+        }
+    }
+
+    #[test]
+    fn a_kind_is_read_off_the_extension_whatever_its_case() {
+        assert_eq!(kind_of("foto.JPG"), Kind::Image);
+        assert_eq!(kind_of("informe.pdf"), Kind::Document);
+        assert_eq!(kind_of("backup.tar.zst"), Kind::Archive);
+        assert_eq!(kind_of("eclipse.iso"), Kind::Disk);
+        assert_eq!(kind_of("arrancar.sh"), Kind::Code);
+        assert_eq!(kind_of("tema.flac"), Kind::Media);
+        assert_eq!(kind_of(".bashrc"), Kind::Other);
+        assert_eq!(kind_of("LEEME"), Kind::Other);
+    }
+
+    #[test]
+    fn the_places_are_home_its_folders_the_root_and_what_is_mounted() {
+        let base = std::env::temp_dir().join(format!("lunarbar-places-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let home = base.join("home");
+        let media = base.join("media");
+        std::fs::create_dir_all(home.join("Documentos")).unwrap();
+        // The English name counts when the Spanish one is not there.
+        std::fs::create_dir_all(home.join("Downloads")).unwrap();
+        std::fs::create_dir_all(media.join("USB").join("fotos")).unwrap();
+        // An empty mount point is nothing mounted.
+        std::fs::create_dir_all(media.join("vacio")).unwrap();
+        let (home, media) = (home.to_str().unwrap(), media.to_str().unwrap());
+
+        let got = places_in(home, &[media, "/no/existe"]);
+        let labels: Vec<&str> = got.iter().map(|p| p.label.as_str()).collect();
+        assert_eq!(
+            labels,
+            ["Inicio", "Documentos", "Descargas", "Raíz /", "USB"]
+        );
+        assert_eq!(got[2].path, join_child(home, "Downloads"));
+        assert_eq!(got[4].path, join_child(media, "USB"));
+
+        // No home is no home entries, but the root is always there.
+        let got = places_in("/", &[]);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].path, "/");
+
+        // And the rail is bounded however much is mounted.
+        for n in 0..(MAX_PLACES + 5) {
+            std::fs::create_dir_all(Path::new(media).join(format!("m{n:02}/x"))).unwrap();
+        }
+        assert_eq!(places_in(home, &[media]).len(), MAX_PLACES);
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

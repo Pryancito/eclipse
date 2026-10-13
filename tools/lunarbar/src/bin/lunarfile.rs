@@ -17,11 +17,16 @@
 //! - default: a centred browser. ↑/↓ or Tab to move, Enter or → to enter a
 //!   directory (or open a file with `open::handler_for`), ← or Backspace to go
 //!   up, type to filter, a filter starting with `.` reveals dotfiles, Esc
-//!   closes. Clicking outside closes it.
+//!   closes. Clicking outside closes it. A rail of places (home, its usual
+//!   folders, `/`, what is mounted) sits left of the list on a wide enough
+//!   panel; each row shows its size and modification date, and a file's icon
+//!   is coloured by kind.
 //! - `--pick`: the same browser as a **file chooser**. Enter on a file prints
 //!   its path and exits 0; Esc exits 1 having printed nothing. `--multiple`
 //!   marks with Space and prints one path per line; `--save NAME` turns the
-//!   field into a filename and prints the path it would be saved to. `--out F`
+//!   field into a filename and prints the path it would be saved to; a name
+//!   that already exists takes a second Enter. The choosers also have Cancel
+//!   and Abrir/Guardar buttons in the footer. `--out F`
 //!   writes the answer to `F` instead of stdout, which is what a caller that
 //!   launched this from a keybind or a D-Bus service can actually read.
 //! - `--dump PATH:WxH`: render the browser to a raw ARGB8888 file and exit, for
@@ -74,8 +79,18 @@ struct Palette {
     dim: Rgb,
     accent: Rgb,
     sel: Rgb,
+    /// Text on a selected row. Not always `text`: KDE selects with its light
+    /// accent, and white on `#3daee9` is 2.3:1, which nobody can read.
+    sel_text: Rgb,
+    /// Text on an accent fill (the primary button, the mode chip).
+    on_accent: Rgb,
     border: Rgb,
 }
+
+/// The overwrite warning, the same amber in every look: it has to read as
+/// "careful" against all three panels and as nothing like the accent.
+const WARN: Rgb = (0xe0, 0xa8, 0x5e);
+const ON_WARN: Rgb = (0x1a, 0x10, 0x06);
 
 const PAL_KDE: Palette = Palette {
     scrim: (0x0d, 0x0f, 0x11),
@@ -86,6 +101,8 @@ const PAL_KDE: Palette = Palette {
     dim: (0x7f, 0x8c, 0x8d),
     accent: (0x3d, 0xae, 0xe9),
     sel: (0x3d, 0xae, 0xe9),
+    sel_text: (0x0d, 0x14, 0x18),
+    on_accent: (0x0d, 0x14, 0x18),
     border: (0x4d, 0x4d, 0x4d),
 };
 
@@ -98,6 +115,8 @@ const PAL_ECLIPSE: Palette = Palette {
     dim: (0x6d, 0x7f, 0xa3),
     accent: (0x6e, 0xa8, 0xff),
     sel: (0x1f, 0x3a, 0x63),
+    sel_text: (0xff, 0xff, 0xff),
+    on_accent: (0x0b, 0x12, 0x20),
     border: (0x27, 0x5a, 0x9e),
 };
 
@@ -110,6 +129,8 @@ const PAL_WIN11: Palette = Palette {
     dim: (0xc5, 0xc5, 0xc5),
     accent: (0x00, 0x78, 0xd4),
     sel: (0x00, 0x78, 0xd4),
+    sel_text: (0xff, 0xff, 0xff),
+    on_accent: (0xff, 0xff, 0xff),
     border: (0x3d, 0x3d, 0x3d),
 };
 
@@ -134,6 +155,17 @@ const PAD: i32 = 10;
 /// Two lines: the key hints and whatever the last action had to say.
 const FOOT_H: i32 = 40;
 const ICON: i32 = 20;
+/// The column titles above the rows (Nombre / Tamaño / Modificado). Dropped
+/// on a panel too short to also show a few rows: see `cols_h`.
+const COLS_H: i32 = 18;
+/// The places rail, on a panel wide enough to give it up: see `rail_w`.
+const RAIL_W: i32 = 168;
+const RAIL_MIN_PANEL: i32 = 620;
+const PLACE_H: i32 = 28;
+/// The checkbox column `--multiple` puts in front of every row.
+const CHECK_W: i32 = 20;
+/// The footer's buttons in the choosers.
+const BTN_H: i32 = 28;
 
 /// Rows visible at once. More than the launcher's eight, because a directory is
 /// longer than a filtered application list and scrolling a file browser one row
@@ -150,6 +182,10 @@ const MAX_FIELD: usize = 256;
 /// The size column, in characters, plus the gap before it.
 const SIZE_COL: i32 = 9;
 const COL_GAP: i32 = 16;
+/// The date column, in characters: `files::short_date` is never wider.
+const DATE_COL: i32 = files::DATE_CHARS as i32;
+/// The narrowest a name may get before the date column is dropped for it.
+const NAME_MIN: i32 = 16;
 
 // ── what the browser is for ──────────────────────────────────────────────────
 
@@ -272,6 +308,33 @@ fn key_action(key: u32, mode: Mode) -> Action {
     }
 }
 
+/// The footer's buttons, which only the choosers have: a chooser opened from
+/// an application is driven with the mouse as often as with the keyboard, and
+/// a pointer-only user had no way to say "this one" or "never mind".
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Button {
+    Cancel,
+    /// Abrir / Guardar / Reemplazar: what Enter would do.
+    Primary,
+}
+
+type Rect = (i32, i32, i32, i32);
+
+/// Where one frame put everything a click can land on, handed back by
+/// `draw_browser` as one value so that hit testing is never told one frame's
+/// geometry and another frame's row count.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct Frame {
+    panel: Rect,
+    /// The list column. Rows are hittable only inside it, not under the rail.
+    list: Rect,
+    row0_y: i32,
+    rows_shown: usize,
+    /// One rect per place the rail drew, in `State::places` order.
+    places: Vec<Rect>,
+    buttons: Vec<(Rect, Button)>,
+}
+
 // ── state ────────────────────────────────────────────────────────────────────
 
 struct State {
@@ -325,11 +388,21 @@ struct State {
     /// What `--pick` will print. Set by `answer`, which also ends the loop.
     picked: Vec<String>,
 
+    /// The places rail, read once at start.
+    places: Vec<files::Place>,
+    /// `--save`: the existing file Enter has already been warned about, so the
+    /// next Enter on the same name replaces it. Anything typed, or a move,
+    /// disarms it.
+    confirm: Option<String>,
+
     sel: usize,
     top: usize,
     hover: Option<usize>,
     ptr: (f64, f64),
-    panel: (i32, i32, i32, i32),
+    panel: Rect,
+    list_rect: Rect,
+    place_rects: Vec<Rect>,
+    buttons: Vec<(Rect, Button)>,
     row0_y: i32,
     /// How many rows the LAST frame actually drew, which on a short output is
     /// fewer than `MAX_ROWS`. Hit testing and the wheel both have to use this
@@ -352,6 +425,7 @@ impl State {
                 self.dir = dir;
                 self.entries = entries;
                 self.note.clear();
+                self.confirm = None;
                 // The field is a filter of THIS directory, so it does not
                 // survive the move -- except in Save, where it is the filename
                 // the user is still typing.
@@ -485,10 +559,13 @@ impl State {
             // Clicking an existing file in Save puts its name in the field
             // (overwrite that one), rather than answering behind the user's
             // back with a path they only pointed at.
+            // The click is the user pointing at THAT file, so the warning is
+            // given and armed at once: one Enter replaces it.
             Mode::Save => {
-                if let Some(e) = self.entry(row) {
-                    self.field = e.name.clone();
-                    self.note = String::from("Intro para guardar aquí");
+                if let Some(name) = self.entry(row).map(|e| e.name.clone()) {
+                    self.note = format!("{name} ya existe: Intro para reemplazarlo");
+                    self.field = name;
+                    self.confirm = Some(path);
                     self.refilter();
                 }
             }
@@ -524,7 +601,46 @@ impl State {
             return;
         }
         let path = files::join_child(&self.dir, name);
+        // An existing file is replaced only on a second Enter. A Save dialog
+        // that overwrote `informe.pdf` because the user typed the name of the
+        // one already there is how a week of work goes.
+        match std::fs::metadata(&path) {
+            Ok(m) if m.is_dir() => {
+                self.note = format!("{name} es una carpeta: -> para entrar");
+                return;
+            }
+            Ok(_) if self.confirm.as_deref() != Some(path.as_str()) => {
+                self.note = format!("{name} ya existe: Intro otra vez para reemplazarlo");
+                self.confirm = Some(path);
+                return;
+            }
+            _ => {}
+        }
         self.answer(vec![path]);
+    }
+
+    /// Is the next Enter going to replace an existing file?
+    fn armed(&self) -> bool {
+        self.mode == Mode::Save && self.confirm.is_some()
+    }
+
+    /// A click on a place in the rail.
+    fn go_place(&mut self, i: usize) {
+        if let Some(path) = self.places.get(i).map(|p| p.path.clone()) {
+            self.chdir(&path);
+        }
+    }
+
+    /// A click on one of the footer's buttons.
+    fn press(&mut self, b: Button) {
+        match b {
+            Button::Cancel => self.done = true,
+            Button::Primary if self.mode == Mode::Save => self.commit(),
+            Button::Primary => {
+                let sel = self.sel;
+                self.activate(sel);
+            }
+        }
     }
 
     fn toggle_mark(&mut self, row: usize) {
@@ -715,10 +831,8 @@ impl State {
         let Some(mut cv) = Canvas::try_new(w, h) else {
             return;
         };
-        let (panel, row0, fits) = draw_browser(&mut cv, w, h, self);
-        self.panel = panel;
-        self.row0_y = row0;
-        self.rows_shown = fits;
+        let f = draw_browser(&mut cv, w, h, self);
+        self.take_frame(f);
         let data: &mut [u8] =
             unsafe { std::slice::from_raw_parts_mut(self.map.add(i * frame_size), frame_size) };
         if !cv.blit_argb(data) {
@@ -733,9 +847,30 @@ impl State {
         }
     }
 
+    /// Keep what the frame just drawn says a click can land on.
+    fn take_frame(&mut self, f: Frame) {
+        self.panel = f.panel;
+        self.list_rect = f.list;
+        self.row0_y = f.row0_y;
+        self.rows_shown = f.rows_shown;
+        self.place_rects = f.places;
+        self.buttons = f.buttons;
+    }
+
+    fn button_at(&self, x: f64, y: f64) -> Option<Button> {
+        self.buttons
+            .iter()
+            .find(|(r, _)| inside_rect(*r, x, y))
+            .map(|(_, b)| *b)
+    }
+
+    fn place_at(&self, x: f64, y: f64) -> Option<usize> {
+        self.place_rects.iter().position(|r| inside_rect(*r, x, y))
+    }
+
     fn row_at(&self, x: f64, y: f64) -> Option<usize> {
         row_at_geom(
-            self.panel,
+            self.list_rect,
             self.row0_y,
             ROW_H,
             self.rows_shown,
@@ -791,7 +926,7 @@ fn panel_rect(w: i32, h: i32, rows: usize) -> (i32, i32, i32, i32) {
     let roomy = PANEL_W.min(w - 96).max(MIN_PANEL_W);
     let pw = roomy.min(w.max(1));
     let shown = rows.clamp(1, MAX_ROWS) as i32;
-    let want = PAD + HEAD_H + FIELD_H + PAD + shown * ROW_H + FOOT_H + PAD;
+    let want = PAD + HEAD_H + FIELD_H + PAD + COLS_H + shown * ROW_H + FOOT_H + PAD;
     // A short output caps the height, so the panel never hangs off an edge.
     let ph = want.min((h - 48).max(PAD * 2 + HEAD_H + FIELD_H + ROW_H + FOOT_H));
     let ph = ph.min(h.max(1));
@@ -800,19 +935,51 @@ fn panel_rect(w: i32, h: i32, rows: usize) -> (i32, i32, i32, i32) {
     (px, py, pw, ph)
 }
 
+/// The column titles' height in a panel of height `ph`: there when a few rows
+/// still fit under them, gone when they would cost the only row on screen.
+fn cols_h(ph: i32) -> i32 {
+    let bare = PAD + HEAD_H + FIELD_H + PAD + FOOT_H + PAD;
+    if ph - bare - COLS_H >= 3 * ROW_H {
+        COLS_H
+    } else {
+        0
+    }
+}
+
 /// How many rows actually fit in a panel of height `ph`, which on a short
 /// output is fewer than `MAX_ROWS`.
 fn rows_fitting(ph: i32) -> usize {
-    let room = ph - (PAD + HEAD_H + FIELD_H + PAD + FOOT_H + PAD);
+    let room = ph - (PAD + HEAD_H + FIELD_H + PAD + cols_h(ph) + FOOT_H + PAD);
     if room < ROW_H {
         return 1;
     }
     ((room / ROW_H) as usize).min(MAX_ROWS)
 }
 
-/// How many characters of a name fit beside the size column.
-fn name_chars(avail: i32) -> usize {
-    let room = avail - (SIZE_COL * GLYPH_W) - COL_GAP;
+/// The places rail's width in a panel `pw` wide: none on a narrow one, where
+/// the names would be what paid for it.
+fn rail_w(pw: i32) -> i32 {
+    if pw >= RAIL_MIN_PANEL {
+        RAIL_W
+    } else {
+        0
+    }
+}
+
+/// Does a list column `avail` px wide (after the icon) show the date column?
+fn shows_dates(avail: i32) -> bool {
+    avail - (SIZE_COL + DATE_COL) * GLYPH_W - 2 * COL_GAP >= NAME_MIN * GLYPH_W
+}
+
+/// How many characters of a name fit beside the size column, and beside the
+/// date column too when `dates`.
+fn name_chars(avail: i32, dates: bool) -> usize {
+    let date = if dates {
+        DATE_COL * GLYPH_W + COL_GAP
+    } else {
+        0
+    };
+    let room = avail - (SIZE_COL * GLYPH_W) - COL_GAP - date;
     if room > 0 {
         ((room / GLYPH_W).max(1)) as usize
     } else {
@@ -820,16 +987,56 @@ fn name_chars(avail: i32) -> usize {
     }
 }
 
-/// Paint the scrim and the centred browser. Returns the panel rect, the y of
-/// the first row and how many rows were drawn — the three things hit testing
-/// needs, handed back together so it cannot be told one frame's geometry and
-/// another frame's row count.
-fn draw_browser(
-    cv: &mut Canvas,
-    w: usize,
-    h: usize,
-    st: &State,
-) -> ((i32, i32, i32, i32), i32, usize) {
+/// The colour of a file's icon: one per kind, the same in every look, chosen
+/// to read on all three dark panels.
+fn kind_color(kind: files::Kind, p: &Palette) -> Rgb {
+    match kind {
+        files::Kind::Image => (0x4f, 0xb5, 0xa5),
+        files::Kind::Document => (0xe0, 0x87, 0x5e),
+        files::Kind::Archive => (0xd6, 0xb2, 0x5c),
+        files::Kind::Disk => (0xb4, 0x8c, 0xf0),
+        files::Kind::Media => (0xe0, 0x7a, 0xb0),
+        files::Kind::Code => (0x8f, 0xd1, 0x8a),
+        files::Kind::Other => p.dim,
+    }
+}
+
+/// A folder: a tab and a body. Drawn rather than themed, because the icon
+/// cache only has application icons and a directory has no .desktop entry.
+fn folder_icon(cv: &mut Canvas, x: i32, y: i32, s: i32, c: Rgb) {
+    let body_h = s * 3 / 4;
+    cv.round_rect(x, y + s - body_h - 2, s * 2 / 5, 4, 2, c);
+    cv.round_rect(x, y + s - body_h, s, body_h, 3, c);
+}
+
+/// A file: a page, upright, in its kind's colour.
+fn file_icon(cv: &mut Canvas, x: i32, y: i32, s: i32, c: Rgb) {
+    cv.round_rect(x + s / 6, y, s - s / 3, s, 3, c);
+}
+
+/// What the header chip says, in the modes that answer a caller.
+fn mode_chip(mode: Mode) -> Option<&'static str> {
+    match mode {
+        Mode::Browse => None,
+        Mode::Open | Mode::OpenMany => Some("SELECTOR"),
+        Mode::Save => Some("GUARDAR"),
+    }
+}
+
+/// The primary button's label: what Enter would do right now.
+fn primary_label(st: &State) -> String {
+    match st.mode {
+        Mode::Browse => String::new(),
+        Mode::Open => "Abrir".into(),
+        Mode::OpenMany if st.marked.is_empty() => "Abrir".into(),
+        Mode::OpenMany => format!("Abrir {}", st.marked.len()),
+        Mode::Save if st.armed() => "Reemplazar".into(),
+        Mode::Save => "Guardar".into(),
+    }
+}
+
+/// Paint the scrim and the centred browser, and say where everything went.
+fn draw_browser(cv: &mut Canvas, w: usize, h: usize, st: &State) -> Frame {
     let p = st.pal;
     cv.fill_rect_a(0, 0, w as i32, h as i32, p.scrim, p.scrim_a);
 
@@ -839,9 +1046,19 @@ fn draw_browser(
     cv.round_rect_a(px, py, pw, ph, 8, p.panel, panel_a);
 
     let inner = pw - PAD * 2;
+    let foot_y = py + ph - FOOT_H;
 
-    // ── the path header ──
+    // ── the header: [chip] title  path ──
     let head_y = py + PAD;
+    let mut hx = px + PAD;
+    if let Some(chip) = mode_chip(st.mode) {
+        let cw = Canvas::text_width(chip) + 12;
+        if cw * 3 < inner {
+            cv.round_rect(hx, head_y - 1, cw, GLYPH_H + 6, 4, p.accent);
+            cv.text_bold(chip, hx + 6, head_y + 2, p.on_accent);
+            hx += cw + 10;
+        }
+    }
     // The title can come from an application through the portal, so its length
     // is not ours to trust: the header shares its line with the path, and a
     // 500-character title would leave the path nowhere to go (`path_room` has a
@@ -854,36 +1071,110 @@ fn draw_browser(
         }),
         MAX_TITLE,
     );
-    cv.text_bold(&title, px + PAD, head_y + 2, p.accent);
+    let title_c = if st.mode == Mode::Browse {
+        p.accent
+    } else {
+        p.text
+    };
+    cv.text_bold(&title, hx, head_y + 2, title_c);
     let title_w = Canvas::text_width(&title) + COL_GAP;
-    let path_room = ((inner - title_w) / GLYPH_W).max(8) as usize;
+    let path_room = ((px + PAD + inner - hx - title_w) / GLYPH_W).max(8) as usize;
     cv.text(
         &files::elide_middle(&st.dir, path_room),
-        px + PAD + title_w,
+        hx + title_w,
         head_y + 2,
-        p.text,
+        p.dim,
     );
     cv.hline(px + PAD, head_y + HEAD_H - 6, inner, p.border, 0.8);
 
-    // ── the field ──
-    let field_y = head_y + HEAD_H;
-    cv.round_rect(px + PAD, field_y, inner, FIELD_H - 6, 6, p.field);
+    // ── the places rail ──
+    let body_y = head_y + HEAD_H;
+    let rail = rail_w(pw);
+    let mut places = Vec::new();
+    if rail > 0 {
+        let rx = px + PAD;
+        let rw = rail - 12;
+        cv.text("Lugares", rx + 8, body_y + 2, p.dim);
+        let mut y = body_y + GLYPH_H + 10;
+        let chars = ((rw - 16 - 14 - 8) / GLYPH_W).max(1) as usize;
+        for pl in &st.places {
+            // Only what fits is drawn, and only what is drawn is clickable.
+            if y + PLACE_H > foot_y - 4 {
+                break;
+            }
+            let here = pl.path == st.dir;
+            if here {
+                cv.round_rect_a(rx, y, rw, PLACE_H - 2, 5, p.sel, 0.95);
+            }
+            let (ic, tc) = if here {
+                (p.sel_text, p.sel_text)
+            } else {
+                (p.accent, p.text)
+            };
+            folder_icon(cv, rx + 8, y + (PLACE_H - 2 - 14) / 2, 14, ic);
+            let ty = y + (PLACE_H - 2 - GLYPH_H) / 2;
+            cv.text(&files::elide_middle(&pl.label, chars), rx + 30, ty, tc);
+            places.push((rx, y, rw, PLACE_H - 2));
+            y += PLACE_H;
+        }
+        cv.fill_rect_a(
+            px + PAD + rail - 6,
+            body_y,
+            1,
+            foot_y - body_y - 6,
+            p.border,
+            0.8,
+        );
+    }
+
+    // ── the list column: field, column titles, rows ──
+    let lx = px + PAD + rail;
+    let lw = inner - rail;
+
+    let field_y = body_y;
+    let field_c = if st.armed() { WARN } else { p.border };
+    cv.round_rect(lx, field_y, lw, FIELD_H - 6, 6, field_c);
+    cv.round_rect(lx + 1, field_y + 1, lw - 2, FIELD_H - 8, 5, p.field);
     let label = if st.mode == Mode::Save {
         "Nombre:"
     } else {
         "Filtro:"
     };
     let ty = field_y + (FIELD_H - 6 - GLYPH_H) / 2;
-    cv.text(label, px + PAD + 8, ty, p.dim);
-    let lw = Canvas::text_width(label) + 8;
+    cv.text(label, lx + 8, ty, p.dim);
+    let lbw = Canvas::text_width(label) + 8;
     // A caret, so an empty field reads as one waiting for typing rather than as
     // a disabled control.
-    let shown = files::elide_middle(&st.field, ((inner - lw - 24) / GLYPH_W).max(4) as usize);
-    let tw = cv.text(&shown, px + PAD + 8 + lw, ty, p.text);
-    cv.fill_rect_a(px + PAD + 8 + lw + tw + 2, ty, 2, GLYPH_H, p.accent, 0.9);
+    let shown = files::elide_middle(&st.field, ((lw - lbw - 24) / GLYPH_W).max(4) as usize);
+    let tw = cv.text(&shown, lx + 8 + lbw, ty, p.text);
+    cv.fill_rect_a(lx + 8 + lbw + tw + 2, ty, 2, GLYPH_H, p.accent, 0.9);
 
-    // ── the rows ──
-    let row0_y = field_y + FIELD_H - 6 + PAD;
+    let check = if st.mode == Mode::OpenMany {
+        CHECK_W
+    } else {
+        0
+    };
+    let ix = lx + 6 + check;
+    let name_x = ix + ICON + 8;
+    let avail = lw - (ICON + 14) - check;
+    let dates = shows_dates(avail);
+    let date_x = lx + lw - 8 - DATE_COL * GLYPH_W;
+    let size_r = if dates { date_x - COL_GAP } else { lx + lw - 8 };
+
+    let cols = cols_h(ph);
+    let row0_y = field_y + FIELD_H - 6 + PAD + cols;
+    if cols > 0 {
+        let cy = row0_y - cols;
+        cv.text("Nombre", name_x, cy, p.dim);
+        let tam = "Tamaño";
+        cv.text(tam, size_r - Canvas::text_width(tam), cy, p.dim);
+        if dates {
+            cv.text("Modificado", date_x, cy, p.dim);
+        }
+    }
+
+    let now = files::now_secs();
+    let offset = files::local_offset(now);
     let fits = rows_fitting(ph);
     let shown = st.rows.len().min(st.top + fits);
     for (n, row) in (st.top..shown).enumerate() {
@@ -891,89 +1182,139 @@ fn draw_browser(
         let selected = row == st.sel;
         let hovered = st.hover == Some(row);
         if selected {
-            cv.round_rect_a(px + PAD, y, inner, ROW_H - 2, 5, p.sel, 0.95);
+            cv.round_rect_a(lx, y, lw, ROW_H - 2, 5, p.sel, 0.95);
         } else if hovered {
-            cv.round_rect_a(px + PAD, y, inner, ROW_H - 2, 5, p.field, 0.9);
+            cv.round_rect_a(lx, y, lw, ROW_H - 2, 5, p.field, 0.9);
         }
+        let (tc, dc) = if selected {
+            (p.sel_text, p.sel_text)
+        } else {
+            (p.text, p.dim)
+        };
         let ty = y + (ROW_H - 2 - GLYPH_H) / 2;
-        let ix = px + PAD + 6;
+        let iy = y + (ROW_H - 2 - (ICON - 4)) / 2;
         match st.rows[row] {
             Row::Parent => {
                 // A left-pointing triangle, which is also what ← does.
-                cv.triangle_h(ix + 2, y + (ROW_H - ICON) / 2 + 4, ICON - 8, true, p.accent);
-                cv.text("..", ix + ICON + 8, ty, p.text);
+                let c = if selected { p.sel_text } else { p.accent };
+                cv.triangle_h(ix + 2, y + (ROW_H - ICON) / 2 + 4, ICON - 8, true, c);
+                cv.text("..", name_x, ty, tc);
             }
             Row::Entry(i) => {
                 let Some(e) = st.entries.get(i) else { continue };
-                let marked = st
-                    .marked
-                    .iter()
-                    .any(|m| *m == files::join_child(&st.dir, &e.name));
-                // A folder is a filled disc-topped block and a file a plain
-                // one; drawn rather than themed, because the icon cache only
-                // has application icons and a directory has no .desktop entry.
-                let icon_c = if e.is_dir { p.accent } else { p.dim };
-                cv.round_rect(
-                    ix + 4,
-                    y + (ROW_H - ICON) / 2 + 3,
-                    ICON - 8,
-                    ICON - 7,
-                    3,
-                    icon_c,
-                );
-                if marked {
-                    cv.badge(
-                        ix + 2,
-                        y + (ROW_H - ICON) / 2 + 1,
-                        10,
-                        'x',
-                        p.accent,
-                        p.panel,
-                    );
+                if check > 0 && !e.is_dir {
+                    let marked = st
+                        .marked
+                        .iter()
+                        .any(|m| *m == files::join_child(&st.dir, &e.name));
+                    let cy = y + (ROW_H - 2 - 14) / 2;
+                    if marked {
+                        cv.badge(lx + 6, cy, 14, 'x', p.accent, p.on_accent);
+                    } else {
+                        cv.round_rect(lx + 6, cy, 14, 14, 3, dc);
+                        let inside = if selected { p.sel } else { p.panel };
+                        cv.round_rect(lx + 8, cy + 2, 10, 10, 2, inside);
+                    }
                 }
-                let avail = inner - (ICON + 14);
-                let max = name_chars(avail);
-                let mut name = files::elide_middle(&e.name, max);
+                if e.is_dir {
+                    let c = if selected { p.sel_text } else { p.accent };
+                    folder_icon(cv, ix + 2, iy, ICON - 4, c);
+                } else {
+                    let c = kind_color(files::kind_of(&e.name), p);
+                    file_icon(cv, ix + 2, iy, ICON - 4, c);
+                }
+                let mut name = files::elide_middle(&e.name, name_chars(avail, dates));
                 if e.link {
                     name.push('@');
                 }
-                cv.text(&name, ix + ICON + 8, ty, p.text);
-                // The size column, right-aligned against the panel's edge. A
-                // directory has no meaningful one.
+                cv.text(&name, name_x, ty, tc);
+                // The size column, right-aligned. A directory has no
+                // meaningful one.
                 let size = if e.is_dir {
                     String::from("--")
                 } else {
                     files::human_size(e.size)
                 };
                 let sw = Canvas::text_width(&size);
-                cv.text(&size, px + pw - PAD - 8 - sw, ty, p.dim);
+                cv.text(&size, size_r - sw, ty, dc);
+                if dates {
+                    if let Some(t) = e.mtime {
+                        cv.text(&files::short_date(t, now, offset), date_x, ty, dc);
+                    }
+                }
             }
         }
     }
 
-    // ── the footer ──
-    let foot_y = py + ph - FOOT_H;
+    // ── the footer: hints and status on the left, buttons on the right ──
     cv.hline(px + PAD, foot_y, inner, p.border, 0.8);
+    let mut buttons = Vec::new();
+    let mut text_r = px + PAD + inner;
+    if st.mode.is_pick() {
+        let primary = primary_label(st);
+        let pw_ = Canvas::text_width(&primary) + 28;
+        let cancel = "Cancelar";
+        let cw = Canvas::text_width(cancel) + 28;
+        let by = foot_y + (FOOT_H - BTN_H) / 2 + 1;
+        let bx = px + PAD + inner - pw_;
+        let cx = bx - 8 - cw;
+        // Only when the hints keep room to be read beside them.
+        if cx - (px + PAD) >= 24 * GLYPH_W {
+            let (fill, on) = if st.armed() {
+                (WARN, ON_WARN)
+            } else {
+                (p.accent, p.on_accent)
+            };
+            let bty = by + (BTN_H - GLYPH_H) / 2;
+            cv.round_rect(bx, by, pw_, BTN_H, 6, fill);
+            cv.text_bold(&primary, bx + 14, bty, on);
+            cv.round_rect(cx, by, cw, BTN_H, 6, p.border);
+            cv.round_rect(cx + 1, by + 1, cw - 2, BTN_H - 2, 5, p.panel);
+            cv.text(cancel, cx + 14, bty, p.text);
+            buttons.push(((cx, by, cw, BTN_H), Button::Cancel));
+            buttons.push(((bx, by, pw_, BTN_H), Button::Primary));
+            text_r = cx - 12;
+        }
+    }
+    let text_chars = ((text_r - (px + PAD + 4)) / GLYPH_W).max(8) as usize;
     let hint = match st.mode {
         Mode::Save => "Intro guardar  Esc cancelar  <- subir  . ocultos",
         Mode::OpenMany => "Espacio marcar  Intro aceptar  Esc cancelar  <- subir",
         Mode::Open => "Intro elegir  Esc cancelar  <- subir  . ocultos",
         Mode::Browse => "Intro abrir  Esc cerrar  <- subir  . ocultos",
     };
-    cv.text(hint, px + PAD + 4, foot_y + 4, p.dim);
+    cv.text(
+        &files::elide_middle(hint, text_chars),
+        px + PAD + 4,
+        foot_y + 4,
+        p.dim,
+    );
     // The second line is the last thing that went wrong, or the count.
     let status = if !st.note.is_empty() {
-        files::elide_middle(&st.note, (inner / GLYPH_W).max(8) as usize)
+        files::elide_middle(&st.note, text_chars)
     } else if st.mode == Mode::OpenMany && !st.marked.is_empty() {
         format!("{} marcados", st.marked.len())
     } else {
         let files_n = st.rows.iter().filter(|r| !matches!(r, Row::Parent)).count();
         format!("{files_n} elementos")
     };
-    let c = if st.note.is_empty() { p.dim } else { p.accent };
+    let c = if st.armed() {
+        WARN
+    } else if st.note.is_empty() {
+        p.dim
+    } else {
+        p.accent
+    };
     cv.text(&status, px + PAD + 4, foot_y + 4 + GLYPH_H + 2, c);
 
-    ((px, py, pw, ph), row0_y, fits)
+    Frame {
+        panel: (px, py, pw, ph),
+        list: (lx, py, lw, ph),
+        row0_y,
+        rows_shown: fits,
+        places,
+        buttons,
+    }
 }
 
 // ── wayland plumbing ─────────────────────────────────────────────────────────
@@ -1131,6 +1472,7 @@ fn apply(st: &mut State, action: Action) {
                 st.go_up();
             } else {
                 st.field.pop();
+                st.confirm = None;
                 st.refilter();
             }
             st.render();
@@ -1155,6 +1497,7 @@ fn apply(st: &mut State, action: Action) {
             if st.field.chars().count() < MAX_FIELD {
                 st.field.push(c);
                 st.note.clear();
+                st.confirm = None;
                 st.refilter();
                 st.render();
             }
@@ -1206,7 +1549,13 @@ impl Dispatch<wl_pointer::WlPointer, ()> for State {
                     return;
                 }
                 let (x, y) = st.ptr;
-                if let Some(row) = st.row_at(x, y) {
+                if let Some(b) = st.button_at(x, y) {
+                    st.press(b);
+                    st.render();
+                } else if let Some(i) = st.place_at(x, y) {
+                    st.go_place(i);
+                    st.render();
+                } else if let Some(row) = st.row_at(x, y) {
                     // A click selects AND activates: one click is what a user
                     // does to a row in a chooser, and a double-click protocol
                     // needs a clock this client does not keep.
@@ -1231,7 +1580,7 @@ impl Dispatch<wl_pointer::WlPointer, ()> for State {
                     st.top = top;
                     let (x, y) = st.ptr;
                     st.hover = row_at_geom(
-                        st.panel,
+                        st.list_rect,
                         st.row0_y,
                         ROW_H,
                         st.rows_shown,
@@ -1465,11 +1814,19 @@ fn new_state(cli: &Cli) -> State {
         rows: Vec::new(),
         marked: Vec::new(),
         picked: Vec::new(),
+        places: files::places(
+            std::env::var("HOME").ok().as_deref(),
+            std::env::var("USER").ok().as_deref(),
+        ),
+        confirm: None,
         sel: 0,
         top: 0,
         hover: None,
         ptr: (-1.0, -1.0),
         panel: (0, 0, 0, 0),
+        list_rect: (0, 0, 0, 0),
+        place_rects: Vec::new(),
+        buttons: Vec::new(),
         row0_y: 0,
         rows_shown: MAX_ROWS,
         scroll_acc: 0.0,
@@ -1545,7 +1902,7 @@ fn main() {
             eprintln!("lunarfile: cannot allocate a {w}x{h} canvas");
             std::process::exit(1);
         };
-        let (_, _, _) = draw_browser(&mut cv, w, h, &st);
+        let _ = draw_browser(&mut cv, w, h, &st);
         let mut buf = vec![0u8; w * h * 4];
         if !cv.blit_argb(&mut buf) {
             eprintln!("lunarfile: blit failed");
@@ -1794,6 +2151,7 @@ mod tests {
             is_dir: true,
             size: 0,
             link: false,
+            mtime: None,
         }
     }
     fn file_e(name: &str) -> Entry {
@@ -1802,6 +2160,7 @@ mod tests {
             is_dir: false,
             size: 7,
             link: false,
+            mtime: None,
         }
     }
 
@@ -1909,7 +2268,8 @@ mod tests {
             let fits = rows_fitting(ph);
             assert!(fits >= 1, "{h} fits no rows at all");
             assert!(fits <= MAX_ROWS, "{h} fits {fits}, past the cap");
-            let used = PAD + HEAD_H + FIELD_H + PAD + fits as i32 * ROW_H + FOOT_H + PAD;
+            let used =
+                PAD + HEAD_H + FIELD_H + PAD + cols_h(ph) + fits as i32 * ROW_H + FOOT_H + PAD;
             assert!(used <= ph.max(used), "{h}: {used} drawn into {ph}");
         }
         // A roomy panel fits the cap exactly.
@@ -1921,17 +2281,34 @@ mod tests {
     fn a_name_is_never_charged_for_a_size_column_that_is_not_drawn() {
         // The same trap `lunarrun`'s row layout had: charging the name for a
         // column the row is too narrow to draw leaves it one character.
-        assert!(name_chars(800) > name_chars(400));
+        assert!(name_chars(800, false) > name_chars(400, false));
         for avail in [0, 1, 20, 60, 100, 200, 400, 800, 4000] {
-            let n = name_chars(avail);
-            assert!(n >= 1, "{avail} px left no room for a single character");
+            for dates in [false, true] {
+                let n = name_chars(avail, dates);
+                assert!(n >= 1, "{avail} px left no room for a single character");
+            }
         }
         // With room for both, the name gets what is left after the size column.
-        let wide = name_chars(800);
+        let wide = name_chars(800, false);
         assert!(
             (wide as i32) * GLYPH_W <= 800 - SIZE_COL * GLYPH_W - COL_GAP + GLYPH_W,
             "the name overlaps the size column"
         );
+        // And after the date column as well when that is drawn.
+        let dated = name_chars(800, true);
+        assert!(
+            (dated as i32) * GLYPH_W
+                <= 800 - (SIZE_COL + DATE_COL) * GLYPH_W - 2 * COL_GAP + GLYPH_W,
+            "the name overlaps the date column"
+        );
+        // The date column is only drawn where the name keeps its minimum.
+        assert!(!shows_dates(300));
+        assert!(shows_dates(600));
+        for avail in [0, 100, 300, 400, 500, 600, 800] {
+            if shows_dates(avail) {
+                assert!(name_chars(avail, true) as i32 >= NAME_MIN, "{avail}");
+            }
+        }
     }
 
     // ── the --dump spec ──────────────────────────────────────────────────────
@@ -2279,6 +2656,7 @@ mod tests {
                 is_dir: false,
                 size: 0,
                 link: false,
+                mtime: None,
             })
             .collect();
         st.refilter();
@@ -2450,14 +2828,14 @@ mod tests {
         // A short output, where the panel cannot fit the row cap.
         let (w, h) = (1280usize, 300usize);
         let mut cv = Canvas::new(w, h);
-        let ((px, py, pw, ph), row0, fits) = draw_browser(&mut cv, w, h, &st);
-        st.panel = (px, py, pw, ph);
-        st.row0_y = row0;
-        st.rows_shown = fits;
+        let f = draw_browser(&mut cv, w, h, &st);
+        st.take_frame(f.clone());
+        let (row0, fits) = (f.row0_y, f.rows_shown);
+        let (lx, _, lw, _) = f.list;
         assert!(fits < MAX_ROWS, "this output must be too short for the cap");
         assert!(st.rows.len() > fits, "and the listing must overflow it");
 
-        let x = (px + pw / 2) as f64;
+        let x = (lx + lw / 2) as f64;
         // Every drawn row is hittable, in its own band.
         for n in 0..fits {
             let y = (row0 + n as i32 * ROW_H + ROW_H / 2) as f64;
@@ -2490,7 +2868,15 @@ mod tests {
                 (3840, 160),
             ] {
                 let mut cv = Canvas::new(w, h);
-                let ((px, py, pw, ph), row0, fits) = draw_browser(&mut cv, w, h, &st);
+                let f = draw_browser(&mut cv, w, h, &st);
+                let ((px, py, pw, ph), row0, fits) = (f.panel, f.row0_y, f.rows_shown);
+                // Every place and button drawn is inside the panel.
+                for r in f.places.iter().chain(f.buttons.iter().map(|(r, _)| r)) {
+                    assert!(
+                        r.0 >= px && r.1 >= py && r.0 + r.2 <= px + pw && r.1 + r.3 <= py + ph,
+                        "{mode:?} {w}x{h}: {r:?} outside the panel"
+                    );
+                }
                 assert!(
                     (1..=MAX_ROWS).contains(&fits),
                     "{mode:?} {w}x{h}: {fits} rows"
@@ -2509,5 +2895,165 @@ mod tests {
             }
         }
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // ── the design: rail, buttons, overwrite, contrast ───────────────────────
+
+    /// A frame drawn at 1280x720, kept the way `render` keeps it.
+    fn draw(st: &mut State) -> Frame {
+        let mut cv = Canvas::new(1280, 720);
+        let f = draw_browser(&mut cv, 1280, 720, st);
+        st.take_frame(f.clone());
+        f
+    }
+
+    fn centre(r: Rect) -> (f64, f64) {
+        ((r.0 + r.2 / 2) as f64, (r.1 + r.3 / 2) as f64)
+    }
+
+    #[test]
+    fn saving_over_an_existing_file_takes_a_second_enter() {
+        let base = tree("overwrite");
+        let mut st = state(Mode::Save, &base);
+        st.field = "a.txt".into();
+        apply(&mut st, Action::Commit);
+        assert!(!st.done, "one Enter replaced an existing file");
+        assert!(st.armed());
+        assert!(st.note.contains("ya existe"), "{}", st.note);
+        assert_eq!(primary_label(&st), "Reemplazar");
+        apply(&mut st, Action::Commit);
+        assert!(st.done);
+        assert_eq!(st.picked, vec![files::join_child(&base, "a.txt")]);
+
+        // Typing disarms it: the warning was about a name no longer there.
+        let mut st = state(Mode::Save, &base);
+        st.field = "a.tx".into();
+        apply(&mut st, Action::Type('t'));
+        apply(&mut st, Action::Commit);
+        apply(&mut st, Action::Rub);
+        apply(&mut st, Action::Type('t'));
+        assert!(!st.armed());
+        apply(&mut st, Action::Commit);
+        assert!(!st.done, "an edit kept the overwrite armed");
+
+        // Clicking the file is pointing at it: armed at once, one Enter.
+        let mut st = state(Mode::Save, &base);
+        let row = row_of(&st, "a.txt");
+        st.activate(row);
+        assert!(st.armed());
+        apply(&mut st, Action::Commit);
+        assert_eq!(st.picked, vec![files::join_child(&base, "a.txt")]);
+
+        // A directory's name is not a file to save as.
+        let mut st = state(Mode::Save, &base);
+        st.field = "sub".into();
+        apply(&mut st, Action::Commit);
+        apply(&mut st, Action::Commit);
+        assert!(!st.done, "saved over a directory");
+        assert!(st.note.contains("carpeta"), "{}", st.note);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_click_on_a_place_goes_there_and_rows_are_not_under_the_rail() {
+        let base = tree("rail");
+        let mut st = state(Mode::Browse, &base);
+        st.places = vec![
+            files::Place {
+                label: "Inicio".into(),
+                path: base.clone(),
+            },
+            files::Place {
+                label: "sub".into(),
+                path: files::join_child(&base, "sub"),
+            },
+        ];
+        let f = draw(&mut st);
+        assert_eq!(f.places.len(), 2, "every place fits a 720-line panel");
+        let (lx, ..) = f.list;
+        assert!(
+            f.places.iter().all(|r| r.0 + r.2 <= lx),
+            "the rail overlaps the list"
+        );
+        // Under the rail, at a row's height, is no row.
+        let (x, _) = centre(f.places[0]);
+        let y = (f.row0_y + ROW_H / 2) as f64;
+        assert_eq!(st.row_at(x, y), None);
+
+        let (x, y) = centre(f.places[1]);
+        assert_eq!(st.place_at(x, y), Some(1));
+        st.go_place(1);
+        assert_eq!(st.dir, files::join_child(&base, "sub"));
+
+        // A narrow panel has no rail, and the rows take the whole width.
+        let mut cv = Canvas::new(500, 720);
+        let f = draw_browser(&mut cv, 500, 720, &st);
+        assert!(f.places.is_empty());
+        assert_eq!(f.list.0, f.panel.0 + PAD);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn only_the_choosers_have_buttons_and_they_do_what_their_keys_do() {
+        let base = tree("buttons");
+        let mut st = state(Mode::Browse, &base);
+        assert!(draw(&mut st).buttons.is_empty());
+
+        // Cancel is Esc: a chooser that answers nothing.
+        let mut st = state(Mode::Open, &base);
+        let f = draw(&mut st);
+        let kinds: Vec<Button> = f.buttons.iter().map(|(_, b)| *b).collect();
+        assert_eq!(kinds, [Button::Cancel, Button::Primary]);
+        let (x, y) = centre(f.buttons[0].0);
+        assert_eq!(st.button_at(x, y), Some(Button::Cancel));
+        st.press(Button::Cancel);
+        assert!(st.done && st.picked.is_empty());
+
+        // The primary is Enter on the selection.
+        let mut st = state(Mode::Open, &base);
+        st.sel = row_of(&st, "a.txt");
+        st.press(Button::Primary);
+        assert_eq!(st.picked, vec![files::join_child(&base, "a.txt")]);
+
+        // And in `--multiple` it counts what is marked.
+        let mut st = state(Mode::OpenMany, &base);
+        st.sel = row_of(&st, "a.txt");
+        apply(&mut st, Action::Mark);
+        assert_eq!(primary_label(&st), "Abrir 1");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// WCAG relative luminance of an sRGB colour.
+    fn luminance((r, g, b): Rgb) -> f64 {
+        let ch = |c: u8| {
+            let c = f64::from(c) / 255.0;
+            if c <= 0.039_28 {
+                c / 12.92
+            } else {
+                ((c + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * ch(r) + 0.7152 * ch(g) + 0.0722 * ch(b)
+    }
+
+    fn contrast(a: Rgb, b: Rgb) -> f64 {
+        let (x, y) = (luminance(a), luminance(b));
+        (x.max(y) + 0.05) / (x.min(y) + 0.05)
+    }
+
+    #[test]
+    fn a_selected_row_and_a_button_are_readable_in_every_look() {
+        // KDE selected with its light accent and white text: 2.3:1.
+        for (name, p) in [
+            ("kde", &PAL_KDE),
+            ("eclipse", &PAL_ECLIPSE),
+            ("win11", &PAL_WIN11),
+        ] {
+            let sel = contrast(p.sel_text, p.sel);
+            assert!(sel >= 4.5, "{name}: selected row {sel:.2}:1");
+            let btn = contrast(p.on_accent, p.accent);
+            assert!(btn >= 4.5, "{name}: primary button {btn:.2}:1");
+        }
+        assert!(contrast(ON_WARN, WARN) >= 4.5);
     }
 }
