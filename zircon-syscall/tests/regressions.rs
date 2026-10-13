@@ -881,6 +881,74 @@ fn process_read_memory_reads_past_one_kernel_buffer_in_order() {
     });
 }
 
+/// `zx_thread_raise_exception` existed only as a syscall number: it answered
+/// `NOT_SUPPORTED` for everything, which hung `UserExceptionsTest.Delivered`
+/// in the core suite -- the test's main thread waits on the exception channel
+/// for an exception the call could never raise, so the whole run sat there
+/// until the 90 s timeout killed it.
+///
+/// These are the three rejections, all `INVALID_ARGS`, each checked against a
+/// request that is otherwise valid so a blanket rejection cannot pass: the job
+/// debugger is the only target, `ZX_EXCP_USER` the only type, and the context
+/// is not optional.
+#[test]
+fn raising_a_user_exception_rejects_only_what_zircon_rejects() {
+    const JOB_DEBUGGER: u32 = 1;
+    const EXCP_USER: u32 = 0x309 | 0x8000;
+
+    with_test_thread(|ct| {
+        Box::pin(async move {
+            {
+                let sc = Syscall {
+                    thread: &ct,
+                    thread_fn: finish_thread,
+                };
+                let context = map_user_memory(&ct);
+                assert_eq!(
+                    sc.sys_thread_raise_exception(0, EXCP_USER, context.into())
+                        .await,
+                    Err(ZxError::INVALID_ARGS),
+                    "target 0 is not the job debugger"
+                );
+                assert_eq!(
+                    sc.sys_thread_raise_exception(JOB_DEBUGGER, 0x108, context.into())
+                        .await,
+                    Err(ZxError::INVALID_ARGS),
+                    "a fault type is not ZX_EXCP_USER"
+                );
+                assert_eq!(
+                    sc.sys_thread_raise_exception(JOB_DEBUGGER, EXCP_USER, 0usize.into())
+                        .await,
+                    Err(ZxError::INVALID_ARGS),
+                    "the context is not optional"
+                );
+                // Unmapped, but not null: the words are read out of the
+                // caller's own space or not at all, and the check that says so
+                // is not the null one.
+                assert_eq!(
+                    sc.sys_thread_raise_exception(
+                        JOB_DEBUGGER,
+                        EXCP_USER,
+                        (context + 0x4000_0000).into()
+                    )
+                    .await,
+                    Err(ZxError::INVALID_ARGS),
+                    "a context outside the caller's mappings"
+                );
+                // And the request that is right succeeds with nobody listening
+                // up the job tree: in Zircon that is `ZX_OK`, not an error.
+                assert_eq!(
+                    sc.sys_thread_raise_exception(JOB_DEBUGGER, EXCP_USER, context.into())
+                        .await,
+                    Ok(()),
+                    "a valid request with no debugger anywhere"
+                );
+            }
+            drop(ct)
+        })
+    });
+}
+
 /// Handle / type errors must win over options, kind, buffer, and rights-bits
 /// validation. Several syscalls used to answer INVALID_ARGS / ACCESS_DENIED
 /// for a bad or wrong-typed handle when the caller also passed a bad argument.
