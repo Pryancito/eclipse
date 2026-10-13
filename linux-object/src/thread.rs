@@ -7,6 +7,7 @@ use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU64, Ordering};
 use kernel_hal::context::{UserContext, UserContextField};
 use kernel_hal::sync::{Mutex, MutexGuard};
 use kernel_hal::user::{Out, UserInPtr, UserOutPtr, UserPtr};
@@ -24,13 +25,21 @@ pub trait ThreadExt {
     /// [`LinuxThread::child_of`].
     fn create_linux_with(proc: &Arc<Process>, linux: LinuxThread) -> ZxResult<Arc<Self>>;
     /// lock and get Linux thread
-    fn lock_linux(&self) -> MutexGuard<'_, LinuxThread>;
+    fn lock_linux(&self) -> LinuxThreadGuard<'_>;
     /// Like [`lock_linux`](Self::lock_linux) but returns `None` instead of
     /// panicking when the extension is not a `Mutex<LinuxThread>`. Use this when
     /// walking another process's threads (signal delivery, enumeration): a
     /// thread observed mid-teardown during SMP churn must be skipped, not bring
     /// down the kernel.
-    fn try_lock_linux(&self) -> Option<MutexGuard<'_, LinuxThread>>;
+    fn try_lock_linux(&self) -> Option<LinuxThreadGuard<'_>>;
+    /// Whether [`LinuxThread::handle_signal`] would deliver something,
+    /// answered **without taking the thread's lock**.
+    ///
+    /// The return to user mode asks this on every syscall of every thread;
+    /// see [`LinuxThreadExt`] for what it costs to ask it the other way.
+    /// A thread whose ext is not a Linux one (or is being torn down) reads
+    /// as "nothing", which is what the old code did with `try_lock_linux`.
+    fn has_deliverable_signal(&self) -> bool;
     /// Set pointer to thread ID.
     fn set_tid_address(&self, tidptr: UserOutPtr<i32>);
     /// The word `set_tid_address` (or `CLONE_CHILD_CLEARTID`) registered:
@@ -98,13 +107,116 @@ fn thread_ext_data_word_overwritten(thread: &Thread) -> ! {
     )
 }
 
+/// The Linux side of a thread: its state behind its own lock, plus the one
+/// question the **return to user mode** asks about it, published outside.
+///
+/// `run_user` calls `handle_signal` on every syscall return of every thread,
+/// and the answer is "nothing to deliver" on all but a handful of returns in
+/// a program's life. Measured on the host
+/// (`process::exit_path_benches::the_thread_lock`), that question cost
+/// 11.3 ns, of which the body is 1.6:
+///
+/// ```text
+/// handle_signal_through_the_thread_lock      11.31
+/// handle_signal_with_the_lock_already_held    1.58
+/// lock_linux_and_drop                        11.05
+///   the_downcast_alone                        1.83
+///   the_drift_check_alone                     0.63
+///   an_uncontended_mutex_lock                 6.53
+/// ```
+///
+/// So nine of those eleven nanoseconds are the *asking*, not the answer, and
+/// a thread's lock is uncontended by construction -- this is a fixed toll on
+/// every syscall, not a contention problem.
+///
+/// [`deliverable`][Self::deliverable] is that answer, as a word any CPU can
+/// read without taking anything. What makes it safe is not a promise that
+/// each mutator refreshes it -- `signals` is a public field with writers in
+/// three files -- but **where** the refresh lives: it is the `Drop` of
+/// [`LinuxThreadGuard`], the only way to reach the state at all. Every
+/// mutation path holds that guard, so republishing happens on the way out
+/// whether the mutator remembered or not, and it happens **before** the
+/// mutex is released, because fields drop after the `Drop::drop` body. A
+/// panic inside a mutator still unwinds through it.
+///
+/// A reader without the lock can see a value one store old, never one that
+/// was never true: the same window Linux has with `TIF_SIGPENDING`, and the
+/// one this path already had, since the check happens on the next return to
+/// user mode either way.
+pub struct LinuxThreadExt {
+    /// `signals & !signal_mask`: nonzero means `handle_signal` has
+    /// something. Written only by [`LinuxThreadGuard::drop`].
+    deliverable: AtomicU64,
+    /// The state itself.
+    inner: Mutex<LinuxThread>,
+}
+
+impl LinuxThreadExt {
+    /// Wraps `linux`, publishing what it starts out with.
+    ///
+    /// No production path creates a thread with a signal already pending --
+    /// [`LinuxThread::child_of`] carries the mask over and leaves `signals`
+    /// empty, as `clone(2)` does -- so storing a plain zero here would
+    /// behave identically, and a mutation that does exactly that passes all
+    /// 3012 tests: it is an **equivalent** mutant, and no unit test can
+    /// catch it. It derives the word from the state anyway, because the day
+    /// a new flag makes a child inherit a pending signal, a hardcoded zero
+    /// publishes a lie and this does not.
+    pub fn new(linux: LinuxThread) -> Self {
+        let deliverable = AtomicU64::new(linux.deliverable_signals());
+        Self {
+            deliverable,
+            inner: Mutex::new(linux),
+        }
+    }
+
+    /// What the return to user mode reads, taking no lock.
+    pub fn deliverable(&self) -> u64 {
+        self.deliverable.load(Ordering::Acquire)
+    }
+}
+
+/// A locked [`LinuxThread`] that republishes
+/// [`LinuxThreadExt::deliverable`] when it is dropped.
+///
+/// Derefs to `LinuxThread`, so it is used exactly like the `MutexGuard` it
+/// replaced. The point of the type is its `Drop`: see [`LinuxThreadExt`].
+pub struct LinuxThreadGuard<'a> {
+    guard: MutexGuard<'a, LinuxThread>,
+    ext: &'a LinuxThreadExt,
+}
+
+impl core::ops::Deref for LinuxThreadGuard<'_> {
+    type Target = LinuxThread;
+    fn deref(&self) -> &LinuxThread {
+        &self.guard
+    }
+}
+
+impl core::ops::DerefMut for LinuxThreadGuard<'_> {
+    fn deref_mut(&mut self) -> &mut LinuxThread {
+        &mut self.guard
+    }
+}
+
+impl Drop for LinuxThreadGuard<'_> {
+    fn drop(&mut self) {
+        // Still holding the lock: `self.guard` is a field, and fields are
+        // dropped after this body runs. A reader that sees this store has
+        // seen a value that was true at the moment the lock was released.
+        self.ext
+            .deliverable
+            .store(self.guard.deliverable_signals(), Ordering::Release);
+    }
+}
+
 impl ThreadExt for Thread {
     fn create_linux(proc: &Arc<Process>) -> ZxResult<Arc<Self>> {
         Self::create_linux_with(proc, LinuxThread::initial())
     }
 
     fn create_linux_with(proc: &Arc<Process>, linux: LinuxThread) -> ZxResult<Arc<Self>> {
-        let linux_thread = Mutex::new(linux);
+        let linux_thread = LinuxThreadExt::new(linux);
         // The thread-group leader (the process's first/main thread) must have a
         // TID equal to the process PID, just like Linux. Userspace relies on
         // this: e.g. winit's `is_main_thread()` panics unless gettid()==getpid()
@@ -122,13 +234,13 @@ impl ThreadExt for Thread {
         Thread::create_with_ext_id(proc, "", linux_thread, leader_id)
     }
 
-    fn lock_linux(&self) -> MutexGuard<'_, LinuxThread> {
+    fn lock_linux(&self) -> LinuxThreadGuard<'_> {
         // See Process::linux(): a failed downcast means a non-Linux thread
         // leaked into a Linux-only path or the ext Box was corrupted. Identify
         // the thread/process so the panic names the culprit.
         let m = self
             .ext()
-            .downcast_ref::<Mutex<LinuxThread>>()
+            .downcast_ref::<LinuxThreadExt>()
             .unwrap_or_else(|| {
                 // Same evidence as Process::linux(): the fat pointer now, the
                 // fat pointer at construction, and the guards either side of
@@ -141,7 +253,7 @@ impl ThreadExt for Thread {
                 // fails and then immediately succeeds saw an inconsistent read,
                 // not a different type. Carry on with the value we can now see
                 // is correct rather than killing the kernel, and log it.
-                if let Some(m) = self.ext().downcast_ref::<Mutex<LinuxThread>>() {
+                if let Some(m) = self.ext().downcast_ref::<LinuxThreadExt>() {
                     error!(
                         "[ext-glitch] Thread::lock_linux(): tid={} pid={} name={:?} downcast \
                          failed then SUCCEEDED on retry -- ext read inconsistently. \
@@ -169,8 +281,8 @@ impl ThreadExt for Thread {
                     data,
                     vtable,
                     vt,
-                    core::mem::size_of::<Mutex<LinuxThread>>(),
-                    core::mem::align_of::<Mutex<LinuxThread>>(),
+                    core::mem::size_of::<LinuxThreadExt>(),
+                    core::mem::align_of::<LinuxThreadExt>(),
                     born_data,
                     born_vtable,
                     match (born_data == data, born_vtable == vtable) {
@@ -193,17 +305,29 @@ impl ThreadExt for Thread {
         if self.ext_drift().data_moved() {
             thread_ext_data_word_overwritten(self);
         }
-        m.lock()
+        LinuxThreadGuard {
+            guard: m.inner.lock(),
+            ext: m,
+        }
     }
 
-    fn try_lock_linux(&self) -> Option<MutexGuard<'_, LinuxThread>> {
-        let m = self.ext().downcast_ref::<Mutex<LinuxThread>>()?;
+    fn has_deliverable_signal(&self) -> bool {
+        self.ext()
+            .downcast_ref::<LinuxThreadExt>()
+            .is_some_and(|m| m.deliverable() != 0)
+    }
+
+    fn try_lock_linux(&self) -> Option<LinuxThreadGuard<'_>> {
+        let m = self.ext().downcast_ref::<LinuxThreadExt>()?;
         // Not a `None` case: the ext IS a Mutex<LinuxThread>, its address is
         // what moved, and answering "no Linux thread" would hide the write.
         if self.ext_drift().data_moved() {
             thread_ext_data_word_overwritten(self);
         }
-        Some(m.lock())
+        Some(LinuxThreadGuard {
+            guard: m.inner.lock(),
+            ext: m,
+        })
     }
 
     /// Set pointer to thread ID.
@@ -973,6 +1097,19 @@ impl LinuxThread {
         info
     }
 
+    /// The signals this thread would take **right now**: pending and not
+    /// blocked. Zero means [`Self::handle_signal`] would answer `None`.
+    ///
+    /// This is the one question the return to user mode asks, and the whole
+    /// of what [`LinuxThreadExt::deliverable`] publishes. It is derived from
+    /// the same two fields `handle_signal` consults, and from nothing else,
+    /// so the two cannot drift apart: a signal that becomes deliverable
+    /// without this word changing would have to be deliverable without
+    /// `handle_signal` seeing it either.
+    pub fn deliverable_signals(&self) -> u64 {
+        self.signals.mask_with(&self.signal_mask).val()
+    }
+
     pub fn handle_signal(&mut self) -> Option<(Signal, Sigset)> {
         // The mask decides, and nothing else: a signal a handler blocked is
         // not in `mask_with`, and the signal being handled blocks itself
@@ -993,6 +1130,9 @@ impl LinuxThread {
         Some((signal, restore_mask))
     }
 }
+
+#[cfg(test)]
+mod deliverable_mirror_tests;
 
 #[cfg(test)]
 mod signal_delivery_tests {

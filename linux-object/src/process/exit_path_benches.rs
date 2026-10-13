@@ -248,3 +248,108 @@ fn the_shaped_control(b: &mut Bencher) {
         black_box(&lp);
     });
 }
+
+/// What is left: where the 11 ns of `handle_signal` go.
+///
+/// `lock_linux()` is not just a lock. It is `ext()` -> a `downcast_ref` on a
+/// `Box<dyn Any>` (a vtable-word compare), then an integrity question about
+/// the data word (`ext_drift().data_moved()`, which exists to catch the
+/// corruption hunted in `[ext-glitch]`), and only then `Mutex::lock`. These
+/// rows say which of the three the syscall return is paying for, so a
+/// change aims at the right one.
+mod the_thread_lock {
+    use super::*;
+    use kernel_hal::sync::Mutex;
+
+    /// The whole of question 2, as the return path calls it.
+    #[bench]
+    fn handle_signal_through_the_thread_lock(b: &mut Bencher) {
+        let (_proc, thread) = a_running_process(77_020);
+        b.iter(|| black_box(thread.lock_linux().handle_signal()));
+    }
+
+    /// The body alone, with the guard taken once outside the loop. The
+    /// difference against the row above is the whole of `lock_linux`.
+    #[bench]
+    fn handle_signal_with_the_lock_already_held(b: &mut Bencher) {
+        let (_proc, thread) = a_running_process(77_021);
+        let mut guard = thread.lock_linux();
+        b.iter(|| black_box(guard.handle_signal()));
+    }
+
+    /// Taking and dropping the guard, and nothing else.
+    #[bench]
+    fn lock_linux_and_drop(b: &mut Bencher) {
+        let (_proc, thread) = a_running_process(77_022);
+        b.iter(|| {
+            black_box(&*thread.lock_linux());
+        });
+    }
+
+    /// The `downcast_ref` on its own: one vtable-word compare.
+    #[bench]
+    fn the_downcast_alone(b: &mut Bencher) {
+        let (_proc, thread) = a_running_process(77_023);
+        b.iter(|| {
+            black_box(
+                thread
+                    .ext()
+                    .downcast_ref::<Mutex<crate::thread::LinuxThread>>()
+                    .is_some(),
+            )
+        });
+    }
+
+    /// The integrity question on its own: two word compares.
+    #[bench]
+    fn the_drift_check_alone(b: &mut Bencher) {
+        let (_proc, thread) = a_running_process(77_024);
+        b.iter(|| black_box(thread.ext_drift().data_moved()));
+    }
+
+    /// `Mutex::lock` on its own, on a mutex nobody else wants.
+    #[bench]
+    fn an_uncontended_mutex_lock(b: &mut Bencher) {
+        let m = Mutex::new(0u64);
+        b.iter(|| {
+            black_box(*m.lock());
+        });
+    }
+}
+
+/// The whole prologue as `run_user` asks it **now**: the two process words
+/// from the summary, and the thread's from the one published outside its
+/// lock. Compare against `the_whole_prologue_of_a_return_to_user`, which
+/// still asks question 2 the old way.
+#[bench]
+fn the_whole_prologue_as_the_return_path_asks_it(b: &mut Bencher) {
+    let (proc, thread) = a_running_process(77_030);
+    let lp = proc.linux();
+    b.iter(|| {
+        lp.pull_shared_pending_into(black_box(&thread));
+        if thread.has_deliverable_signal() {
+            black_box(thread.lock_linux().handle_signal());
+        }
+        black_box(lp.is_job_stopped())
+    });
+}
+
+/// Question 2 alone, the lock-free way.
+#[bench]
+fn has_deliverable_signal_with_nothing_pending(b: &mut Bencher) {
+    let (_proc, thread) = a_running_process(77_031);
+    b.iter(|| black_box(thread.has_deliverable_signal()));
+}
+
+/// And with a signal actually pending. The reader itself is the same load
+/// either way -- this row is here to say so, since a word that answered
+/// faster when it was zero would be a branch predicted on the common case
+/// rather than a measurement.
+#[bench]
+fn has_deliverable_signal_with_one_pending(b: &mut Bencher) {
+    let (_proc, thread) = a_running_process(77_032);
+    thread
+        .lock_linux()
+        .queue_signal(crate::signal::Signal::SIGWINCH, None);
+    b.iter(|| black_box(thread.has_deliverable_signal()));
+}
