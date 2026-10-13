@@ -5200,14 +5200,10 @@ pub fn set_signal_action_in(process: &Arc<Process>, signal: LinuxSignal, action:
         inner.shared_pending_info.remove(&(signal as u8));
         lp.refresh_exit_path(&inner);
     }
-    for tid in process.thread_ids() {
-        if let Ok(thread) = process.get_child(tid) {
-            if let Ok(thread) = thread.downcast_arc::<Thread>() {
-                if let Some(mut lt) = thread.try_lock_linux() {
-                    if lt.signals.contains(signal) {
-                        lt.take_siginfo(signal);
-                    }
-                }
+    for thread in process.threads() {
+        if let Some(mut lt) = thread.try_lock_linux() {
+            if lt.signals.contains(signal) {
+                lt.take_siginfo(signal);
             }
         }
     }
@@ -5694,13 +5690,9 @@ pub fn pending_after_send(mut pending: Sigset, signal: LinuxSignal) -> Sigset {
 /// [`complete_signal_for_job_control`].
 pub fn prepare_signal(process: &Arc<Process>, signal: LinuxSignal) {
     use crate::thread::ThreadExt;
-    for tid in process.thread_ids() {
-        if let Ok(thread_obj) = process.get_child(tid) {
-            if let Ok(thread) = thread_obj.downcast_arc::<Thread>() {
-                if let Some(mut lt) = thread.try_lock_linux() {
-                    lt.signals = pending_after_send(lt.signals, signal);
-                }
-            }
+    for thread in process.threads() {
+        if let Some(mut lt) = thread.try_lock_linux() {
+            lt.signals = pending_after_send(lt.signals, signal);
         }
     }
 }
@@ -5748,41 +5740,37 @@ pub fn send_signal_to_process_with_info(
                 sname
             );
         }
-        let tids = process.thread_ids();
+        let threads = process.threads();
         prepare_signal(&process, signal);
         // Prefer a thread that has the signal *unblocked* — it can act on it
         // right away — and deliver there.
         let mut first: Option<Arc<Thread>> = None;
-        for tid in tids {
-            if let Ok(thread_obj) = process.get_child(tid) {
-                if let Ok(thread) = thread_obj.downcast_arc::<Thread>() {
-                    // Peek without holding the guard across a move of `thread`.
-                    let delivered = if let Some(mut lt) = thread.try_lock_linux() {
-                        // `wants_signal()`: unblocked, or parked in
-                        // `rt_sigtimedwait` for exactly this signal.
-                        if lt.wants_signal(signal) {
-                            lt.queue_signal(signal, info);
-                            true
-                        } else {
-                            false
-                        }
-                    } else {
-                        // Lock held (e.g. PID 1 in waitpid): queue below rather
-                        // than dropping the signal — that drop is why lunarbar's
-                        // `kill 1` did nothing.
-                        false
-                    };
-                    if delivered {
-                        wake_signal_sleeper(&thread);
-                        // Wake waitpid(-1): PID 1 blocks on this zircon bit.
-                        process.signal_set(Signal::SIGCHLD);
-                        wake_for_job_control(&process, signal);
-                        return Ok(());
-                    }
-                    if first.is_none() {
-                        first = Some(thread);
-                    }
+        for thread in threads {
+            // Peek without holding the guard across a move of `thread`.
+            let delivered = if let Some(mut lt) = thread.try_lock_linux() {
+                // `wants_signal()`: unblocked, or parked in
+                // `rt_sigtimedwait` for exactly this signal.
+                if lt.wants_signal(signal) {
+                    lt.queue_signal(signal, info);
+                    true
+                } else {
+                    false
                 }
+            } else {
+                // Lock held (e.g. PID 1 in waitpid): queue below rather
+                // than dropping the signal — that drop is why lunarbar's
+                // `kill 1` did nothing.
+                false
+            };
+            if delivered {
+                wake_signal_sleeper(&thread);
+                // Wake waitpid(-1): PID 1 blocks on this zircon bit.
+                process.signal_set(Signal::SIGCHLD);
+                wake_for_job_control(&process, signal);
+                return Ok(());
+            }
+            if first.is_none() {
+                first = Some(thread);
             }
         }
         // Every thread has the signal blocked: it must still become *pending*
@@ -5795,12 +5783,8 @@ pub fn send_signal_to_process_with_info(
                 lp.queue_shared_signal(signal, info);
             }
             // Wake every sleeper: any thread may be the one that pulls next.
-            for tid in process.thread_ids() {
-                if let Ok(thread_obj) = process.get_child(tid) {
-                    if let Ok(t) = thread_obj.downcast_arc::<Thread>() {
-                        wake_signal_sleeper(&t);
-                    }
-                }
+            for t in process.threads() {
+                wake_signal_sleeper(&t);
             }
         }
         // Pulse even when every thread had the Linux signal blocked: waitpid

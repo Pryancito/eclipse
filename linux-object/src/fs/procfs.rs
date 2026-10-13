@@ -277,13 +277,8 @@ fn proc_pid_threads(proc: &Process) -> String {
     use crate::thread::ThreadExt;
     use core::fmt::Write;
     let mut out = String::from("# tid state (name) syscall\n");
-    for tid in proc.thread_ids() {
-        let Ok(obj) = proc.get_child(tid) else {
-            continue;
-        };
-        let Ok(thread) = obj.downcast_arc::<Thread>() else {
-            continue;
-        };
+    for thread in proc.threads() {
+        let tid = thread.id();
         let state = thread_state_char(thread.state());
         // try_lock: a thread tearing down may hold its own lock, and a /proc
         // read must never block on it.
@@ -344,8 +339,7 @@ fn proc_ppid(proc: &Process) -> u64 {
 /// The first (leader) thread of a process, if any, for reporting its
 /// scheduling attributes.
 fn proc_first_thread(proc: &Process) -> Option<Arc<Thread>> {
-    let id = *proc.thread_ids().first()?;
-    proc.get_child(id).ok()?.downcast_arc::<Thread>().ok()
+    proc.threads().first().cloned()
 }
 
 fn proc_pid_stat(proc: &Process) -> String {
@@ -456,13 +450,9 @@ fn proc_task_stat(proc: &Process, thread: Option<&Arc<Thread>>) -> String {
         None => {
             let mut u = proc.dead_threads_time();
             let mut s = proc.dead_threads_sys_time();
-            for tid in proc.thread_ids() {
-                if let Ok(child) = proc.get_child(tid) {
-                    if let Ok(t) = child.downcast_arc::<Thread>() {
-                        u += t.get_time();
-                        s += t.get_sys_time();
-                    }
-                }
+            for t in proc.threads() {
+                u += t.get_time();
+                s += t.get_sys_time();
             }
             (u, s)
         }

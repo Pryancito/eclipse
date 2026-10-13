@@ -62,6 +62,7 @@ cargo bench -p linux-object --bench process_census --features mock-disk --no-run
 cargo bench -p linux-object --lib --features mock-disk --no-run
 cargo bench -p zircon-object --bench vm --features libos,aspace-separate --no-run
 cargo bench -p zircon-object --bench futex --features libos,aspace-separate --no-run
+cargo bench -p zircon-object --bench task --features libos,aspace-separate --no-run
 cargo bench -p linux-syscall --no-run
 cargo bench -p kernel-hal --no-run
 cargo bench -p zcore-drivers --features graphic,virtio,xhci-usb-hid --no-run

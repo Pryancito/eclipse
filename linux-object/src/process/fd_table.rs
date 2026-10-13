@@ -117,6 +117,14 @@ impl LinuxProcessInner {
     ///
     /// Either way the answer is the same set, and the order is not promised
     /// by either (`files` is a hash map); nothing downstream depends on one.
+    ///
+    /// Both halves count in `i32`, which is what a descriptor IS. Counting
+    /// the range in `usize` is what made the two halves disagree: a negative
+    /// `first` converts to about 2^64 there, so the range walk came out
+    /// EMPTY while the table walk -- which compares descriptors -- still
+    /// found 0 and 1 in `[-1, 1]`. Which of the two runs is decided by the
+    /// size of the table, so that disagreement is an answer that changes
+    /// with how many files the process happens to have open.
     pub(super) fn open_fds_in_range(&self, first: FileDesc, last: FileDesc) -> Vec<FileDesc> {
         // The width is read off the i32 the descriptor actually is, not off
         // the `usize` it converts to: a negative number widens to about 2^64
@@ -131,7 +139,7 @@ impl LinuxProcessInner {
             _ => return Vec::new(),
         };
         if width <= self.files.len() {
-            (usize::from(first)..=usize::from(last))
+            (i32::from(first)..=i32::from(last))
                 .map(FileDesc::from)
                 .filter(|fd| self.files.contains_key(fd))
                 .collect()
