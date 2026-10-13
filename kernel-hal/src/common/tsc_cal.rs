@@ -180,8 +180,20 @@ pub fn verdict(provisional: u64, measured: u64) -> Verdict {
 /// Built from Hz and not from truncated MHz, so a 3.312 GHz TSC is not paced
 /// as if it were 3.000 GHz, and returned as one number both the kernel clock
 /// and the vDSO scale by — two spellings of this division is two clocks.
+///
+/// **Always even**, and that is the whole reason the low bit is cleared. The
+/// Zircon vDSO does not take a Q32 multiplier: it divides by a pair of `u32`s,
+/// and `mult / 2^32` is only expressible as such a pair when `mult` is even
+/// (`mult / 2` over `2^31`, both of which fit). An odd multiplier would leave
+/// that reader no choice but a *second* spelling of this division — an exact
+/// `1e9 / hz` ratio, which is not this value and parts company with it at a
+/// fixed rate — which is the "two clocks on one machine" the one-number shape
+/// exists to prevent. Clearing the bit costs one part in 2^32 of rate, below
+/// the truncation already inherent here, and is what makes
+/// `(cycles * mult) >> 32` and `cycles * (mult / 2) / 2^31` the same number
+/// for every `cycles` rather than merely nearly the same.
 pub fn ns_mult(hz: u64) -> u64 {
-    ((1_000_000_000u128 << 32) / hz.max(1) as u128) as u64
+    (((1_000_000_000u128 << 32) / hz.max(1) as u128) as u64) & !1
 }
 
 /// Monotonic nanoseconds since `base` for a raw counter reading of `cycle`.
@@ -243,6 +255,38 @@ mod tests {
         assert_eq!(ns_mult(1_000_000_000), 1u64 << 32);
         // And zero is not a frequency to divide by.
         assert_eq!(ns_mult(0), ns_mult(1));
+    }
+
+    /// The multiplier is even, so the `u32` ratio the Zircon vDSO divides by
+    /// is the *same* scale as the kernel's shift and not a second spelling of
+    /// it.
+    ///
+    /// Checked by value rather than by construction, over frequencies whose
+    /// exact multiplier is odd and over spans long enough for a rate
+    /// difference of one part in 2^32 to show: a day of a 3.7 GHz counter is
+    /// where an exact `1e9 / hz` ratio parts company with this scale by 66 us.
+    #[test]
+    fn the_multiplier_is_even_so_one_scale_serves_both_readers() {
+        for hz in [
+            1_000_000_000u64,
+            2_000_000_000,
+            2_999_999_999,
+            3_312_000_000,
+            3_700_000_001,
+        ] {
+            let mult = ns_mult(hz);
+            assert_eq!(mult % 2, 0, "{} Hz dio un multiplicador impar", hz);
+            let (num, den) = (mult / 2, 1u128 << 31);
+            for cycles in [1u64, 1_000, hz, hz * 86_400] {
+                let shifted = mono_ns(cycles, 0, mult);
+                let divided = (cycles as u128 * num as u128 / den) as u64;
+                assert_eq!(
+                    shifted, divided,
+                    "{} Hz, {} ciclos: el turno dio {} y la razon {}",
+                    hz, cycles, shifted, divided
+                );
+            }
+        }
     }
 
     /// The bug this base exists for, in the arithmetic that had it.

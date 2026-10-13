@@ -269,13 +269,22 @@ pub fn run_userboot(zbi: impl AsRef<[u8]>, cmdline: &str) -> Arc<Process> {
     // different clocks, which is why a futex wait with a deadline could return
     // before its deadline had passed.
     //
-    // The three fields, from disassembling `_zx_clock_get_monotonic` in
-    // `prebuilt/zircon/x64/libzircon.so`:
+    // Every field of the page the blob reads, found by disassembling
+    // `prebuilt/zircon/x64/libzircon.so` and grepping the result for each
+    // reference to the symbol, so that none is left on the marker:
     //
-    // - `+0x18` (u64): added to the raw `rdtscp`. It is also read twice around
-    //   the `rdtscp`, before and after, and the sequence retried if it
-    //   changed, so it doubles as the seqlock guarding the other two.
-    // - `+0x20` (u32): numerator of the ticks-to-nanoseconds ratio.
+    // - `+0x08` (u64): the counter's frequency. `_zx_ticks_per_second` is a
+    //   single `mov` out of this word and a `ret`, so leaving it unwritten
+    //   hands every caller `0xDEADBEEFDEADBEEF` ticks per second.
+    // - `+0x10` (u64): added to the raw counter on the **boot** timeline, by
+    //   `_zx_ticks_get_boot` and `_zx_clock_get_boot`. Eclipse never
+    //   suspends, so the boot and monotonic timelines are the same clock and
+    //   this takes the same offset as `+0x18`.
+    // - `+0x18` (u64): added to the raw `rdtscp` on the monotonic timeline.
+    //   It is also read twice around the `rdtscp`, before and after, and the
+    //   sequence retried if it changed, so it doubles as the seqlock guarding
+    //   the rest.
+    // - `+0x20` (u32): numerator of the ticks-to-nanoseconds scale.
     // - `+0x24` (u32): denominator. The vDSO tests this one and executes
     //   `ud2` when it is zero, which is how a page of zeros here kills
     //   `userboot` with an invalid opcode instead of a wrong time.
@@ -628,12 +637,16 @@ fn syscall_args(ctx: &UserContext) -> [usize; 8] {
 fn write_vdso_time_values(vdso: &[u8], vdso_vmo: &Arc<VmObject>) {
     #[cfg(all(target_arch = "x86_64", not(feature = "libos")))]
     {
-        /// Offsets within `DATA_TIME_VALUES`, in the order the vDSO reads them.
+        /// Offsets within `DATA_TIME_VALUES`. See the call site for what each
+        /// one is and which vDSO entry point reads it.
+        const OFF_TICKS_PER_SECOND: usize = 0x08;
+        const OFF_BOOT_OFFSET: usize = 0x10;
         const OFF_TICKS_OFFSET: usize = 0x18;
         const OFF_NUMERATOR: usize = 0x20;
         const OFF_DENOMINATOR: usize = 0x24;
 
-        let Some((numerator, denominator)) = kernel_hal::timer::vdso_tsc_ratio() else {
+        let Some((numerator, denominator, ticks_per_second)) = kernel_hal::timer::vdso_tsc_ratio()
+        else {
             warn!("vdso: no usable TSC ratio; leaving DATA_TIME_VALUES as shipped");
             return;
         };
@@ -648,9 +661,11 @@ fn write_vdso_time_values(vdso: &[u8], vdso_vmo: &Arc<VmObject>) {
             return;
         };
         let base = base as usize;
-        // The denominator goes down before the offset does: the offset is the
-        // seqlock, so publishing it last is what tells the vDSO the other two
-        // are already in place.
+        // The monotonic offset goes down last of all: it is the seqlock, so
+        // publishing it is what tells the vDSO the rest is already in place.
+        vdso_vmo
+            .write(base + OFF_TICKS_PER_SECOND, &ticks_per_second.to_ne_bytes())
+            .unwrap();
         vdso_vmo
             .write(base + OFF_DENOMINATOR, &denominator.to_ne_bytes())
             .unwrap();
@@ -658,11 +673,14 @@ fn write_vdso_time_values(vdso: &[u8], vdso_vmo: &Arc<VmObject>) {
             .write(base + OFF_NUMERATOR, &numerator.to_ne_bytes())
             .unwrap();
         vdso_vmo
+            .write(base + OFF_BOOT_OFFSET, &offset.to_ne_bytes())
+            .unwrap();
+        vdso_vmo
             .write(base + OFF_TICKS_OFFSET, &offset.to_ne_bytes())
             .unwrap();
         info!(
-            "vdso: time values set (offset={:#x}, {}/{} ns per tick)",
-            offset, numerator, denominator
+            "vdso: time values set (offset={:#x}, {}/{} ns per tick, {} ticks/s)",
+            offset, numerator, denominator, ticks_per_second
         );
     }
 }

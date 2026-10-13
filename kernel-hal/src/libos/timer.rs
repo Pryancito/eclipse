@@ -79,9 +79,9 @@ pub fn vdso_tsc_mult() -> Option<u64> {
     None
 }
 
-/// TSC→ns ratio for the Zircon vDSO (libos: same reason as
+/// TSC→ns scale and frequency for the Zircon vDSO (libos: same reason as
 /// [`vdso_tsc_mult`] — there is no vDSO page of ours to fill).
-pub fn vdso_tsc_ratio() -> Option<(u32, u32)> {
+pub fn vdso_tsc_ratio() -> Option<(u32, u32, u64)> {
     None
 }
 

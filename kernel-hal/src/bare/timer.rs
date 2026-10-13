@@ -564,12 +564,13 @@ pub fn vdso_tsc_mult() -> Option<u64> {
     }
 }
 
-/// The same rate as [`vdso_tsc_mult`], expressed as the numerator/denominator
-/// pair the Zircon vDSO divides by instead of multiplying.
+/// The same scale as [`vdso_tsc_mult`], respelt as the numerator/denominator
+/// pair the Zircon vDSO divides by, plus the counter's frequency in Hz, which
+/// is what that vDSO's `zx_ticks_per_second` hands back verbatim.
 ///
 /// Answers `None` exactly when `vdso_tsc_mult` does, so a caller cannot
 /// publish one clock's rate under the other's rules.
-pub fn vdso_tsc_ratio() -> Option<(u32, u32)> {
+pub fn vdso_tsc_ratio() -> Option<(u32, u32, u64)> {
     #[cfg(target_arch = "x86_64")]
     {
         super::arch::timer::vdso_tsc_ratio()
