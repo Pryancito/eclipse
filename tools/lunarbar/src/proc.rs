@@ -9,6 +9,27 @@ use std::os::fd::{FromRawFd, OwnedFd};
 /// clients used to declare their own.
 pub const BUFFERS: usize = 2;
 
+/// The buffer a frame can be drawn into, or `None` while the compositor holds
+/// every one of them.
+///
+/// `next` first so that the buffers alternate: always drawing into the lowest
+/// free one would reuse the buffer just released while the other sits idle,
+/// which is single buffering with two allocations.
+///
+/// **`None` is a frame OWED, not a frame skipped.** A client that returns here
+/// and forgets leaves the surface showing the previous contents until something
+/// else happens to redraw it, which on a keystroke-driven overlay is the next
+/// keystroke. The caller has to remember and redraw when a buffer comes back.
+pub fn free_buffer(busy: [bool; BUFFERS], next: usize) -> Option<usize> {
+    if !busy[next] {
+        Some(next)
+    } else if !busy[1 - next] {
+        Some(1 - next)
+    } else {
+        None
+    }
+}
+
 /// The sizes one `wl_shm` pool of [`BUFFERS`] ARGB8888 frames needs.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct PoolGeometry {
@@ -133,6 +154,19 @@ pub fn spawn_detached(cmd: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_frame_goes_into_the_buffer_the_compositor_handed_back() {
+        assert_eq!(free_buffer([false, false], 0), Some(0));
+        assert_eq!(free_buffer([false, false], 1), Some(1));
+        // The one just released, not the lowest free one: always answering 0
+        // would be single buffering with two allocations.
+        assert_eq!(free_buffer([true, false], 0), Some(1));
+        assert_eq!(free_buffer([false, true], 1), Some(0));
+        // And drawing into a buffer the compositor is still reading is a tear.
+        assert_eq!(free_buffer([true, true], 0), None);
+        assert_eq!(free_buffer([true, true], 1), None);
+    }
 
     #[test]
     fn a_pool_is_sized_the_way_wl_shm_reads_it() {

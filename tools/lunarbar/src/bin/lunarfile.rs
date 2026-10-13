@@ -47,7 +47,7 @@ use lunarbar::keys::{
 use lunarbar::list::{inside_rect, move_selection, row_at_geom, scroll_top, Step};
 use lunarbar::look::Look;
 use lunarbar::open;
-use lunarbar::proc::{self, map_shm_pool, spawn_detached, BUFFERS};
+use lunarbar::proc::{self, free_buffer, map_shm_pool, spawn_detached, BUFFERS};
 use wayland_client::{
     protocol::{
         wl_buffer, wl_compositor, wl_keyboard, wl_output, wl_pointer, wl_registry, wl_seat, wl_shm,
@@ -654,13 +654,31 @@ impl State {
         self.map = map;
         self.map_len = total;
         self.buffers = buffers;
-        self.busy = [false, false];
-        // The frame that was owed belonged to the old pool, which is gone;
-        // the `render()` at the end of this function draws the new one.
-        self.dirty = false;
-        self.next = 0;
+        self.pool_replaced();
         self.configured = true;
         self.render();
+    }
+
+    /// The buffer this frame goes into, booking the debt when there is none.
+    ///
+    /// The two halves have to move together: `None` here means the frame is
+    /// owed, and `buffer_released` is the only thing that pays it. Taking a
+    /// buffer without clearing `dirty` would leave a debt that is paid twice.
+    fn claim_buffer(&mut self) -> Option<usize> {
+        let i = free_buffer(self.busy, self.next);
+        self.dirty = i.is_none();
+        i
+    }
+
+    /// A new `wl_shm` pool replaced the old one.
+    ///
+    /// The frame that was owed belonged to the pool that just went away, and
+    /// the indices in `busy` point into the new buffers, so both are reset
+    /// together; the caller draws the first frame of the new pool.
+    fn pool_replaced(&mut self) {
+        self.busy = [false; BUFFERS];
+        self.dirty = false;
+        self.next = 0;
     }
 
     /// A buffer came back from the compositor.
@@ -689,13 +707,9 @@ impl State {
         let Some(surface) = self.surface.clone() else {
             return;
         };
-        let Some(i) = free_buffer(self.busy, self.next) else {
-            // Both held by the compositor. Remember that there is a frame
-            // owed; `buffer_released` draws it when one comes back.
-            self.dirty = true;
+        let Some(i) = self.claim_buffer() else {
             return;
         };
-        self.dirty = false;
         let (w, h) = (self.width as usize, self.height as usize);
         let frame_size = w * h * 4;
         let Some(mut cv) = Canvas::try_new(w, h) else {
@@ -1409,22 +1423,6 @@ fn usage() -> ! {
          env: ECLIPSE_LOOK=kde|eclipse|win11"
     );
     std::process::exit(2)
-}
-
-/// The buffer a frame can be drawn into, or `None` while the compositor holds
-/// both of them.
-///
-/// `next` first so that the two buffers alternate: always drawing into the
-/// lowest free one would reuse the buffer just released while the other sits
-/// idle, which is single buffering with two allocations.
-fn free_buffer(busy: [bool; BUFFERS], next: usize) -> Option<usize> {
-    if !busy[next] {
-        Some(next)
-    } else if !busy[1 - next] {
-        Some(1 - next)
-    } else {
-        None
-    }
 }
 
 fn new_state(cli: &Cli) -> State {
@@ -2248,6 +2246,9 @@ mod tests {
         apply(&mut st, Action::Commit);
         assert!(!st.done, "an empty field answered the chooser");
         assert_eq!(st.dir, files::join_child(&base, "sub"));
+        // And only that: moving in must not also run the save and leave the
+        // "type a name" warning on a panel the user has just walked into.
+        assert!(st.note.is_empty(), "{}", st.note);
         // `..` is the same gesture upwards.
         st.sel = 0;
         apply(&mut st, Action::Commit);
@@ -2356,6 +2357,29 @@ mod tests {
         assert_eq!(st.busy, [true, true], "a stale buffer freed a live one");
         assert!(!st.buffer_released(BUFFERS, st.generation));
         assert_eq!(st.busy, [true, true]);
+
+        // Claiming is the other half: it books the debt when there is no
+        // buffer, and clears it when there is.
+        st.busy = [true, true];
+        st.dirty = false;
+        assert_eq!(st.claim_buffer(), None);
+        assert!(st.dirty, "the frame was dropped without being remembered");
+        st.busy = [true, false];
+        assert_eq!(st.claim_buffer(), Some(1));
+        assert!(!st.dirty, "a drawn frame is not still owed");
+
+        // A new pool: the owed frame belonged to the old one, and the indices
+        // in `busy` point into buffers that no longer exist.
+        st.busy = [true, true];
+        st.dirty = true;
+        st.next = 1;
+        st.pool_replaced();
+        assert_eq!(st.busy, [false, false]);
+        assert!(
+            !st.dirty,
+            "a debt from the old pool survived into the new one"
+        );
+        assert_eq!(st.next, 0);
         let _ = std::fs::remove_dir_all(&base);
     }
 

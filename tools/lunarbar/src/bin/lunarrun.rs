@@ -361,7 +361,7 @@ fn key_action(key: u32) -> Action {
 // ── state ────────────────────────────────────────────────────────────────────
 
 /// The crate's one double-buffer count; see `proc::BUFFERS`.
-use lunarbar::proc::BUFFERS;
+use lunarbar::proc::{free_buffer, BUFFERS};
 
 struct State {
     compositor: Option<wl_compositor::WlCompositor>,
@@ -381,6 +381,10 @@ struct State {
     map_len: usize,
     buffers: [Option<wl_buffer::WlBuffer>; BUFFERS],
     busy: [bool; BUFFERS],
+    /// A frame was owed when the compositor held both buffers; the next
+    /// `Release` draws it. Without it the dropped frame stayed dropped and the
+    /// overlay showed the previous filter until the next keystroke.
+    dirty: bool,
     next: usize,
     generation: u64,
     configured: bool,
@@ -544,10 +548,51 @@ impl State {
         self.map = map;
         self.map_len = total;
         self.buffers = buffers;
-        self.busy = [false, false];
-        self.next = 0;
+        self.pool_replaced();
         self.configured = true;
         self.render();
+    }
+
+    /// The buffer this frame goes into, booking the debt when there is none.
+    ///
+    /// The two halves have to move together: `None` here means the frame is
+    /// owed, and `buffer_released` is the only thing that pays it. Taking a
+    /// buffer without clearing `dirty` would leave a debt that is paid twice.
+    fn claim_buffer(&mut self) -> Option<usize> {
+        let i = free_buffer(self.busy, self.next);
+        self.dirty = i.is_none();
+        i
+    }
+
+    /// A new `wl_shm` pool replaced the old one.
+    ///
+    /// The frame that was owed belonged to the pool that just went away, and
+    /// the indices in `busy` point into the new buffers, so both are reset
+    /// together; the caller draws the first frame of the new pool.
+    fn pool_replaced(&mut self) {
+        self.busy = [false; BUFFERS];
+        self.dirty = false;
+        self.next = 0;
+    }
+
+    /// A buffer came back from the compositor.
+    ///
+    /// Returns whether a frame was owed, which is the whole decision: `render`
+    /// used to give up with a comment saying the next `Release` would repaint,
+    /// and no `Release` ever did, so a frame dropped while both buffers were
+    /// held stayed dropped -- the overlay kept showing the previous filter
+    /// until the user pressed another key.
+    fn buffer_released(&mut self, i: usize, generation: u64) -> bool {
+        // Ignore releases for a retired pool: `i` indexes the CURRENT buffers.
+        if generation != self.generation || i >= BUFFERS {
+            return false;
+        }
+        self.busy[i] = false;
+        if !self.dirty {
+            return false;
+        }
+        self.render();
+        true
     }
 
     fn render(&mut self) {
@@ -557,12 +602,8 @@ impl State {
         let (Some(surface), Some(_)) = (self.surface.clone(), self.layer.as_ref()) else {
             return;
         };
-        let i = if !self.busy[self.next] {
-            self.next
-        } else if !self.busy[1 - self.next] {
-            1 - self.next
-        } else {
-            return; // both held by the compositor; the next Release repaints
+        let Some(i) = self.claim_buffer() else {
+            return;
         };
         let (w, h) = (self.width as usize, self.height as usize);
         let frame_size = w * h * 4;
@@ -947,10 +988,8 @@ impl Dispatch<wl_buffer::WlBuffer, (usize, u64)> for State {
         _: &Connection,
         _: &QueueHandle<State>,
     ) {
-        // Ignore releases for a retired pool: `i` indexes the CURRENT buffers.
-        if matches!(event, wl_buffer::Event::Release) && generation == st.generation && i < BUFFERS
-        {
-            st.busy[i] = false;
+        if matches!(event, wl_buffer::Event::Release) {
+            let _ = st.buffer_released(i, generation);
         }
     }
 }
@@ -1265,6 +1304,7 @@ fn new_state(toggle_desktop: bool) -> State {
         map_len: 0,
         buffers: [None, None],
         busy: [false, false],
+        dirty: false,
         next: 0,
         generation: 0,
         configured: false,
@@ -1451,6 +1491,64 @@ mod tests {
     }
 
     // ── the selection ────────────────────────────────────────────────────────
+
+    // ── the frame that was owed ──────────────────────────────────────────────
+
+    #[test]
+    fn a_frame_owed_while_both_buffers_are_held_is_drawn_when_one_comes_back() {
+        // `render` gave up with a comment saying the next `Release` would
+        // repaint, and the `Release` only cleared `busy`: the dropped frame
+        // stayed dropped, so the overlay kept showing the previous filter
+        // until the user pressed another key. Here is the decision, without a
+        // compositor to deliver it.
+        let mut st = new_state(false);
+        st.busy = [true, true];
+        // With nothing owed a release is only bookkeeping.
+        assert!(!st.buffer_released(0, st.generation));
+        assert_eq!(st.busy, [false, true]);
+
+        // With a frame owed, this is the moment to draw it.
+        st.busy = [true, true];
+        st.dirty = true;
+        assert!(
+            st.buffer_released(1, st.generation),
+            "the owed frame was dropped for good"
+        );
+        assert_eq!(st.busy, [true, false]);
+
+        // A buffer of a pool that has been torn down carries an index into a
+        // pool that no longer exists: it must not clear anything.
+        st.busy = [true, true];
+        st.dirty = true;
+        assert!(!st.buffer_released(0, st.generation.wrapping_sub(1)));
+        assert_eq!(st.busy, [true, true], "a stale buffer freed a live one");
+        assert!(!st.buffer_released(BUFFERS, st.generation));
+        assert_eq!(st.busy, [true, true]);
+
+        // Claiming is the other half: it books the debt when there is no
+        // buffer, and clears it when there is. Booking without clearing would
+        // leave a debt that gets paid twice.
+        st.busy = [true, true];
+        st.dirty = false;
+        assert_eq!(st.claim_buffer(), None);
+        assert!(st.dirty, "the frame was dropped without being remembered");
+        st.busy = [true, false];
+        assert_eq!(st.claim_buffer(), Some(1));
+        assert!(!st.dirty, "a drawn frame is not still owed");
+
+        // A new pool: the owed frame belonged to the old one, and the indices
+        // in `busy` point into buffers that no longer exist.
+        st.busy = [true, true];
+        st.dirty = true;
+        st.next = 1;
+        st.pool_replaced();
+        assert_eq!(st.busy, [false, false]);
+        assert!(
+            !st.dirty,
+            "a debt from the old pool survived into the new one"
+        );
+        assert_eq!(st.next, 0);
+    }
 
     // ── the --dump spec ──────────────────────────────────────────────────────
 
