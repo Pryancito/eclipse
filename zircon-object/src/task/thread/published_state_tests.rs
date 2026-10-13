@@ -296,3 +296,27 @@ fn the_transition_start_makes_publishes_running() {
     assert_eq!(t.state(), ThreadState::Running);
     assert_published_agrees(&t, "start's transition");
 }
+
+/// A thread that is dying and suspended at the same time has to report
+/// `Dying`, which is the first arm of the derivation's priority order
+/// (`Dying > Exception > Suspend > Blocked`). `run_user` leaves its loop on
+/// that answer, so a `Suspended` here is a thread that was killed and never
+/// dies.
+///
+/// The mutation batch is what asked for this one: taking `Dying` out of the
+/// derivation's chain survived every other test in this file, because nothing
+/// here had ever suspended a thread and then killed it.
+#[test]
+fn a_dying_thread_that_is_also_suspended_still_publishes_dying() {
+    let t = a_thread();
+    t.lock_inner().change_state(ThreadState::Running, &t.base);
+    t.suspend();
+    assert_eq!(t.state(), ThreadState::Suspended);
+    t.kill();
+    assert_eq!(
+        t.state(),
+        ThreadState::Dying,
+        "the suspension is hiding the kill, and the thread never leaves run_user"
+    );
+    assert_published_agrees(&t, "a kill over a suspension");
+}

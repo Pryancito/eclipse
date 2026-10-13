@@ -84,6 +84,20 @@
 //! corrupt, and the slow path gives the right answer. A new state that
 //! somebody adds and forgets to list in `from_raw` falls through there too: it
 //! ends up slow, not wrong.
+//!
+//! # The two mutants that survive, and why they are equivalent
+//!
+//! Of fifteen deliberate breakages, twelve fall to a named test. The two that
+//! do not change no answer any test can ask for:
+//!
+//! * relaxing the load's `Acquire` to `Relaxed`. The ordering is what pairs
+//!   with the `Release` of the publication, and on x86 both compile to the
+//!   same instruction; what it buys is on a weaker machine (this kernel also
+//!   builds for aarch64 and riscv64), where a reader could otherwise see the
+//!   word without the writes that preceded it. No host test can observe it.
+//! * making `state()` take the lock even when the word IS a state. That is
+//!   the old behaviour: the same answer, only paying what this module exists
+//!   to stop paying. A test that caught it would be a test of the benches.
 
 use super::*;
 use core::ops::{Deref, DerefMut};
