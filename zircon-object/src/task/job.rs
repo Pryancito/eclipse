@@ -274,6 +274,30 @@ impl Job {
         total
     }
 
+    /// The member Processes themselves, under ONE lock.
+    ///
+    /// [`process_ids`](Self::process_ids) followed by
+    /// [`find_process`](Self::find_process) per id is the same answer for a
+    /// quadratic price: `find_process` scans `processes` linearly and takes
+    /// the lock again for each one, so a walk of a job with `n` members costs
+    /// `n` locks and `n^2/2` comparisons. Anything that wants every member
+    /// wants this.
+    pub fn processes(&self) -> Vec<Arc<Process>> {
+        self.inner.lock().processes.clone()
+    }
+
+    /// The child Jobs themselves, under ONE lock, for the same reason
+    /// [`processes`](Self::processes) exists: `children_ids` followed by
+    /// `get_child` per id is a linear scan of `children` per child.
+    pub fn children(&self) -> Vec<Arc<Self>> {
+        self.inner
+            .lock()
+            .children
+            .iter()
+            .filter_map(|j| j.upgrade())
+            .collect()
+    }
+
     /// Get KoIDs of children Jobs.
     pub fn children_ids(&self) -> Vec<KoID> {
         self.inner
