@@ -9,7 +9,7 @@ use zircon_object::{
     ipc::Channel,
     object::{Handle, Rights},
     signal::Event,
-    task::{CurrentThread, Job, Process, Thread, ThreadFn},
+    task::{CurrentThread, Job, Process, Thread, ThreadFn, ThreadState},
     vm::{VmObject, PAGE_SIZE},
     ZxError,
 };
@@ -1073,11 +1073,27 @@ fn futex_wait_refuses_the_owners_zircon_refuses() {
         let myself = ct
             .proc()
             .add_handle(Handle::new(ct.inner(), Rights::DEFAULT_THREAD));
-        let departed = Thread::create(ct.proc(), "departed").unwrap();
-        departed.start(finish_thread).unwrap();
+        // `Thread::start` only marks the thread `Running` and spawns its
+        // future, so reading the state straight after it gives `Running`,
+        // measured: the executor turns it into `Dead` a few milliseconds
+        // later. Without waiting here the last case below would be asking
+        // about a *running* owner while claiming to ask about a dead one.
+        let departed_thread = Thread::create(ct.proc(), "departed").unwrap();
+        departed_thread.start(finish_thread).unwrap();
+        for _ in 0..1000 {
+            if departed_thread.state() == ThreadState::Dead {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(
+            departed_thread.state(),
+            ThreadState::Dead,
+            "the owner never died, so the case below would prove nothing"
+        );
         let departed = ct
             .proc()
-            .add_handle(Handle::new(departed, Rights::DEFAULT_THREAD));
+            .add_handle(Handle::new(departed_thread, Rights::DEFAULT_THREAD));
         let mut sc = Syscall {
             thread: &ct,
             thread_fn: finish_thread,
@@ -1110,6 +1126,26 @@ fn futex_wait_refuses_the_owners_zircon_refuses() {
             Poll::Pending,
             "a thread that has died IS a legal owner, so this one waits"
         );
+
+        // The requeue side shares the same owner check, and `FUTEX_WAIT`
+        // above does not reach it: without these two the rule could be
+        // dropped from `zx_futex_requeue` alone and every assertion here
+        // would still pass, with `FutexTest.RequeueInvalidOwner` failing
+        // again. `requeue_ptr` only names the other queue, so a second word
+        // four bytes along is all it needs.
+        let requeue =
+            |owner: u32| sc.sys_futex_requeue(base.into(), 1, 42, (base + 4).into(), 1, owner);
+        assert_eq!(
+            requeue(unstarted),
+            Err(ZxError::INVALID_ARGS),
+            "a requeue owner that has never started"
+        );
+        assert_eq!(
+            requeue(event),
+            Err(ZxError::WRONG_TYPE),
+            "a requeue owner that is not a thread"
+        );
+        assert_eq!(requeue(departed), Ok(()), "a dead requeue owner is legal");
         Box::pin(async move { drop(ct) })
     });
 }
