@@ -38,6 +38,23 @@ pub(crate) struct LinuxRootfs(Arch, Variant);
 /// beside its `libc.a` and nothing is imported.
 const STATIC_RUSTFLAGS: &str = "-C relocation-model=static -C target-feature=+crt-static";
 
+/// The four binaries `tools/lunarbar` builds, as paths in its target directory.
+///
+/// A struct and not a tuple: four paths of the same type in one return value
+/// are four chances to copy the launcher over the file browser, and the day a
+/// fifth binary joins them the struct is the thing that will not compile
+/// quietly in the wrong order.
+struct LunarTools {
+    /// The panel.
+    bar: PathBuf,
+    /// The launcher behind Alt+Space and Super+D.
+    run: PathBuf,
+    /// The file browser behind Super+E, and its `--pick` chooser.
+    file: PathBuf,
+    /// The clipboard daemon and its Super+V history picker.
+    clip: PathBuf,
+}
+
 impl LinuxRootfs {
     /// 生成指定架构的 linux rootfs 操作对象。The `desktop` variant, i.e. the
     /// historical behaviour.
@@ -595,7 +612,12 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
         // lunarbar: the native status/task bar (Rust, static musl). A two-bar
         // panel over wlr-layer-shell + wlr-foreign-toplevel-management, replacing
         // waybar and its GTK/D-Bus/gdk-pixbuf/fontconfig dependency chain.
-        let (lunarbar, lunarrun, lunarfile) = self.lunar_tools();
+        let LunarTools {
+            bar: lunarbar,
+            run: lunarrun,
+            file: lunarfile,
+            clip: lunarclip,
+        } = self.lunar_tools();
         if lunarbar.is_file() {
             let _ = dir::rm(bin.join("lunarbar"));
             fs::copy(&lunarbar, bin.join("lunarbar")).unwrap();
@@ -627,6 +649,20 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
             fs::copy(&lunarfile, bin.join("lunarfile")).unwrap();
         } else {
             eprintln!("warning: lunarfile not built; Super+E falls back to a terminal");
+        }
+
+        // lunarclip: the clipboard manager (the daemon behind
+        // `lunarclip.service`) and the Super+V history picker. On Wayland the
+        // selection belongs to the client that copied, so closing the window
+        // you copied from empties the clipboard; a manager over
+        // wlr-data-control is the only thing that fixes that, and Alpine's
+        // answer (wl-clipboard + clipman + wofi) is a Go program plus a GTK
+        // launcher that wants the session bus.
+        if lunarclip.is_file() {
+            let _ = dir::rm(bin.join("lunarclip"));
+            fs::copy(&lunarclip, bin.join("lunarclip")).unwrap();
+        } else {
+            eprintln!("warning: lunarclip not built; there is no clipboard history");
         }
 
         // eclipse-dbusd: Eclipse's own D-Bus session bus (Rust, static musl).
@@ -3100,20 +3136,23 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
     }
 
     /// Cross-compile the `tools/lunarbar` package (Rust) as static musl
-    /// binaries and return all three: the panel, `lunarrun` (the KRunner-style
-    /// launcher behind Alt+Space and Super+D) and `lunarfile` (the file
-    /// browser behind Super+E, and the file chooser `--pick` gives the rest of
-    /// the system). One cargo invocation builds them, since they share a
-    /// library. Best-effort: if the build fails the desktop falls back to
-    /// waybar, the runner keybinds do nothing (their wrapper says so in
-    /// /tmp/lunarrun.log) and `eclipse-files` falls back to a terminal.
-    fn lunar_tools(&self) -> (PathBuf, PathBuf, PathBuf) {
+    /// binaries and return all four: the panel, `lunarrun` (the KRunner-style
+    /// launcher behind Alt+Space and Super+D), `lunarfile` (the file browser
+    /// behind Super+E, and the file chooser `--pick` gives the rest of the
+    /// system) and `lunarclip` (the clipboard manager and its Super+V
+    /// history). One cargo invocation builds them, since they share a library.
+    /// Best-effort: if the build fails the desktop falls back to waybar, the
+    /// runner keybinds do nothing (their wrapper says so in
+    /// /tmp/lunarrun.log), `eclipse-files` falls back to a terminal and there
+    /// is no clipboard history.
+    fn lunar_tools(&self) -> LunarTools {
         let dir = PROJECT_DIR.join("tools").join("lunarbar");
         let triple = self.musl_rust_triple();
         let out = dir.join("target").join(triple).join("release");
         let executable = out.join("lunarbar");
         let runner = out.join("lunarrun");
         let browser = out.join("lunarfile");
+        let clipboard = out.join("lunarclip");
         // Rebuild when any source file is newer than the binaries. Every
         // module is listed: a stale entry here means a source change that
         // silently does not reach the image.
@@ -3121,8 +3160,10 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
             "src/main.rs",
             "src/bin/lunarrun.rs",
             "src/bin/lunarfile.rs",
+            "src/bin/lunarclip.rs",
             "src/lib.rs",
             "src/apps.rs",
+            "src/clip.rs",
             "src/draw.rs",
             "src/fill_guard.rs",
             "src/files.rs",
@@ -3140,16 +3181,22 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
         .iter()
         .filter_map(|rel| fs::metadata(dir.join(rel)).ok()?.modified().ok())
         .max();
-        // ALL THREE must exist and be current: a tree built before lunarfile
-        // existed has an up-to-date lunarbar and lunarrun and no browser at
-        // all, and the stale-binary check would happily ship that.
-        let mtimes: Option<Vec<_>> = [&executable, &runner, &browser]
+        // ALL FOUR must exist and be current: a tree built before lunarclip
+        // existed has an up-to-date lunarbar, lunarrun and lunarfile and no
+        // clipboard at all, and the stale-binary check would happily ship
+        // that. (That is exactly what happened the day lunarfile arrived.)
+        let mtimes: Option<Vec<_>> = [&executable, &runner, &browser, &clipboard]
             .iter()
             .map(|p| fs::metadata(p).ok()?.modified().ok())
             .collect();
         if let (Some(bins), Some(src_mtime)) = (mtimes, newest_src) {
             if bins.iter().all(|m| *m >= src_mtime) {
-                return (executable, runner, browser);
+                return LunarTools {
+                    bar: executable,
+                    run: runner,
+                    file: browser,
+                    clip: clipboard,
+                };
             }
         }
 
@@ -3173,9 +3220,16 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
         }
         let status = cargo.status();
         if !status.success() {
-            eprintln!("warning: lunarbar/lunarrun/lunarfile build failed; waybar fallback remains");
+            eprintln!(
+                "warning: lunarbar/lunarrun/lunarfile/lunarclip build failed; waybar fallback remains"
+            );
         }
-        (executable, runner, browser)
+        LunarTools {
+            bar: executable,
+            run: runner,
+            file: browser,
+            clip: clipboard,
+        }
     }
 
     /// `/etc/asound.conf`. When PulseAudio is in the image, ALSA `default`
@@ -3917,6 +3971,22 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
         )
         .unwrap();
 
+        // The clipboard manager. `respawn` like the other two clients: it has
+        // to be alive for the whole session, because on Wayland the selection
+        // belongs to the process offering it — a daemon that died takes the
+        // clipboard with it the moment the application that copied exits.
+        fs::write(
+            svc_dir.join("lunarclip.service"),
+            b"# Clipboard manager + history (wlr-data-control). See eclipse-lunarclip.\n\
+              exec = /usr/local/bin/eclipse-lunarclip\n\
+              type = respawn\n\
+              after = labwc\n\
+              requires = labwc\n\
+              wait_socket = /run/user/0/wayland-0\n\
+              desktop = labwc\n",
+        )
+        .unwrap();
+
         // Load the X keymap into Xwayland once the compositor is up. Wayland
         // clients compile their own keymap; the X server does not, so without
         // this X11 clients (xterm) type nothing. `oneshot`: apply once and
@@ -4299,6 +4369,33 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
         .unwrap();
 
         fs::write(
+            localbin.join("eclipse-lunarclip"),
+            format!(
+                "#!/bin/sh\n\
+                 # Eclipse OS: clipboard manager for eclipse-init.\n\
+                 # Wayland has no clipboard of its own: the selection is the\n\
+                 # client that copied, and it dies with it. This is what keeps\n\
+                 # a copy alive after its window closes, and what feeds the\n\
+                 # Super+V history.\n\
+                 LOG=/tmp/lunarclip.log\n\
+                 exec >>\"$LOG\" 2>&1\n\
+                 {wait}\
+                 command -v lunarclip >/dev/null 2>&1 || {{ echo 'eclipse-lunarclip: lunarclip missing'; sleep 5; exit 127; }}\n\
+                 echo \"[eclipse-lunarclip] WAYLAND_DISPLAY=$WAYLAND_DISPLAY\"\n\
+                 # --check first, into the same log: when the clipboard does\n\
+                 # not work the first question is always whether the\n\
+                 # compositor has wlr-data-control at all, and the answer\n\
+                 # being in the log is the difference between reading one file\n\
+                 # and reproducing the session.\n\
+                 lunarclip --check || true\n\
+                 exec lunarclip --watch\n",
+                wait = wait_wayland
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+
+        fs::write(
             localbin.join("eclipse-xorg"),
             b"#!/bin/sh\n\
               # Eclipse OS: start the Xorg session (fbdev on /dev/fb0) for\n\
@@ -4357,6 +4454,7 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
                 "eclipse-xorg",
                 "eclipse-lunarbg",
                 "eclipse-lunarbar",
+                "eclipse-lunarclip",
                 "eclipse-boot-sound",
                 "eclipse-boot-sound-play",
                 "eclipse-pulseaudio",
@@ -6058,6 +6156,12 @@ mod rootfs_plumbing_tests {
                 "/usr/local/bin/eclipse-lunarbg",
                 "labwc",
             ),
+            (
+                "lunarclip",
+                "respawn",
+                "/usr/local/bin/eclipse-lunarclip",
+                "labwc",
+            ),
             ("ntpd", "respawn", "/usr/local/bin/eclipse-ntpd", "udhcpc"),
             ("oopslog", "respawn", "/usr/local/bin/eclipse-oopslog", ""),
             // No `after`: `requires = dbus` implies it (#1744).
@@ -6337,6 +6441,7 @@ mod rootfs_plumbing_tests {
             "labwc",
             "lunarbar",
             "lunarbg",
+            "lunarclip",
             "seatd",
             "xkbmap",
         ];
