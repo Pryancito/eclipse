@@ -114,19 +114,28 @@ impl Drop for InterruptGuard {
     }
 }
 
+// `tt` and not `stmt`. A `stmt` fragment carries its own terminator, so the
+// `;` the caller wrote after each statement matched as a second, empty one and
+// every use of these macros emitted a `redundant_semicolons` warning per line
+// of its body -- nine of them across this crate, on every build of the kernel.
+// Raw token trees paste the body into the block unchanged, which is all either
+// macro ever wanted: the work is done by the guard above them, whose `Drop` is
+// what restores the caller's interrupt state however the body leaves (fall
+// through, `return`, `?`, or a panic). It also lets a body end in an
+// expression and be worth it, which `stmt` could not.
 #[macro_export]
 macro_rules! run_with_intr_saved_on {
-    ($($statements:stmt)*) => {{
+    ($($body:tt)*) => {{
         let _interrupt_guard = $crate::InterruptGuard::new(true);
-        $($statements)*
+        $($body)*
     }};
 }
 
 #[macro_export]
 macro_rules! run_with_intr_saved_off {
-    ($($statements:stmt)*) => {{
+    ($($body:tt)*) => {{
         let _interrupt_guard = $crate::InterruptGuard::new(false);
-        $($statements)*
+        $($body)*
     }};
 }
 

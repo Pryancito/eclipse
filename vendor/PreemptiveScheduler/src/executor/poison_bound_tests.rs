@@ -91,7 +91,7 @@ fn the_poison_lands_at_the_top_of_the_region_where_the_frames_are() {
     }
     let _g = with_dirty_depth_hook(Some(one_page));
     let mut buf = block(4);
-    let base = buf.as_ptr() as usize;
+    let base = buf.as_mut_ptr() as usize;
     let size = buf.len() * 8;
     // SAFETY: `[base, base + size)` es el buffer vivo de este test.
     unsafe { poison_usable_region_bounded(base, size) };
@@ -127,7 +127,7 @@ fn a_bound_of_the_whole_region_poisons_every_word() {
     }
     let _g = with_dirty_depth_hook(Some(everything));
     let mut buf = block(3);
-    let base = buf.as_ptr() as usize;
+    let base = buf.as_mut_ptr() as usize;
     let size = buf.len() * 8;
     // SAFETY: como arriba.
     unsafe { poison_usable_region_bounded(base, size) };
@@ -147,8 +147,8 @@ fn the_bounded_poison_writes_what_the_unbounded_one_writes() {
     let size = bounded.len() * 8;
     // SAFETY: los dos son buffers vivos y exclusivos de este test.
     unsafe {
-        poison_usable_region_bounded(bounded.as_ptr() as usize, size);
-        let top = whole.as_ptr() as usize + size - 2 * PAGE_SIZE;
+        poison_usable_region_bounded(bounded.as_mut_ptr() as usize, size);
+        let top = whole.as_mut_ptr() as usize + size - 2 * PAGE_SIZE;
         poison_usable_region(top, 2 * PAGE_SIZE);
     }
     assert_eq!(bounded, whole);
@@ -187,7 +187,7 @@ fn nothing_dirty_poisons_nothing() {
     let size = 8 * PAGE_SIZE;
     assert_eq!(poison_bound(0x1000, size), 0);
     let mut buf = block(2);
-    let base = buf.as_ptr() as usize;
+    let base = buf.as_mut_ptr() as usize;
     let n = buf.len() * 8;
     // SAFETY: como arriba.
     unsafe { poison_usable_region_bounded(base, n) };
@@ -214,7 +214,7 @@ fn a_hook_that_answers_more_than_the_region_is_clamped_not_believed() {
     let pages = buf.len() * 8 / PAGE_SIZE;
     let region = pages * PAGE_SIZE;
     buf.extend_from_slice(&[CLEAN; 4]);
-    let base = buf.as_ptr() as usize;
+    let base = buf.as_mut_ptr() as usize;
     // SAFETY: `[base, base + region)` cae dentro de `buf`, que es mas grande.
     unsafe { poison_usable_region_bounded(base, region) };
     assert_eq!(
@@ -258,7 +258,7 @@ fn the_counters_tell_a_bounded_block_from_a_whole_one() {
     }
     let _g = with_dirty_depth_hook(Some(one_page));
     let mut buf = block(4);
-    let base = buf.as_ptr() as usize;
+    let base = buf.as_mut_ptr() as usize;
     let size = buf.len() * 8;
     let before = super::poison_bound_counts();
     // SAFETY: como arriba.
