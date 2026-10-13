@@ -963,6 +963,38 @@ mod lifecycle_tests {
         heuristics::forget(parent);
     }
 
+    /// The window the ORDER of the fork path has to close: until the hook
+    /// runs, the child's pid has no whitelist, and a pid with no whitelist is
+    /// allowed everything.
+    ///
+    /// That is deliberate and right (the map miss is how an unsandboxed
+    /// process stays unsandboxed), which is exactly why the hook has to run
+    /// before the child can execute an instruction. `start_forked_thread`
+    /// used to start the child's thread first and inherit afterwards, so on
+    /// any machine with a second CPU -- or on one CPU with the parent
+    /// preempted in between -- the child could make a syscall its parent's
+    /// whitelist forbids. Linux installs the child's credentials and seccomp
+    /// filters in `copy_process`, before `wake_up_new_task`, for this reason.
+    #[test]
+    fn a_child_is_allowed_everything_until_the_fork_hook_has_run() {
+        let _g = crate::test_globals::lock();
+        policy::reset_for_test();
+        let (parent, child) = (8_104u64, 8_105u64);
+        policy::set_syscall_mode(policy::Mode::Enforce);
+        policy::register_policy(parent, vec![60]);
+        assert!(
+            policy::is_syscall_allowed(child, 101).is_ok(),
+            "a pid with no whitelist is permissive, which is the window"
+        );
+        task_fork(parent, child);
+        assert!(
+            policy::is_syscall_allowed(child, 101).is_err(),
+            "and the hook is what closes it"
+        );
+        heuristics::forget(child);
+        heuristics::forget(parent);
+    }
+
     #[test]
     fn a_process_that_exits_leaves_no_wx_intervals_behind() {
         // Pids are recycled: an interval left behind is one the next process
