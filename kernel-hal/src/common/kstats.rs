@@ -306,7 +306,7 @@ pub fn wake_latency_stats() -> (u64, u64, u64, u64, u64, [u64; WAKE_LATENCY_BUCK
 ///
 /// Spelled and asserted here for the same reason as the bucket count above:
 /// the libos build has to name the same width for its zeros.
-pub const WAKE_ENTRY_REASONS: usize = 5;
+pub const WAKE_ENTRY_REASONS: usize = 6;
 
 #[cfg(target_os = "none")]
 const _: () = assert!(executor::WAKE_ENTRY_REASONS == WAKE_ENTRY_REASONS);
@@ -319,7 +319,9 @@ const _: () = assert!(executor::WAKE_ENTRY_REASONS == WAKE_ENTRY_REASONS);
 /// Read against `wake latency`'s histogram, this is what says whether the wait
 /// was for an interrupt to end a halt or for a busy CPU to give up its turn.
 /// The order is the scheduler's `WAKE_ENTRY_*` constants: unknown, after a
-/// poll, halt skipped by the recheck, out of a halt, resumed.
+/// poll, halt skipped by the recheck, out of a halt with a kick aimed at this
+/// CPU, resumed, out of a halt with no kick (so the tick or a device IRQ ended
+/// it and the wake was merely waiting for whatever arrived).
 /// (libos has no scheduler of ours and reports zeros.)
 #[allow(clippy::type_complexity)]
 #[cfg(target_os = "none")]

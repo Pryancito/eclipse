@@ -2271,7 +2271,21 @@ impl Executor {
                         // returns, not before: a reason stored before `hlt`
                         // would also be read by the claim that the recheck
                         // above lets through on a later pass.
-                        crate::runtime::note_entry_reason(crate::runtime::WAKE_ENTRY_HALT_EXIT);
+                        //
+                        // And split by whether a kick was aimed here: a
+                        // request pending on the far side of the halt was
+                        // raised while this CPU was inside it, because the
+                        // branch above cleared it before the recheck and a
+                        // request that landed after the clear would have been
+                        // seen by the recheck instead of halting. Read before
+                        // anything else runs, since the scan below clears it.
+                        crate::runtime::note_entry_reason(
+                            if crate::runtime::resched_pending_for(cpu) {
+                                crate::runtime::WAKE_ENTRY_HALT_KICKED
+                            } else {
+                                crate::runtime::WAKE_ENTRY_HALT_TIMER
+                            },
+                        );
                     }
                     crate::runtime::set_cpu_sleeping(cpu, false);
                     if intr_was_on {

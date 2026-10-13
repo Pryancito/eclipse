@@ -1218,8 +1218,9 @@ pub fn kernel_report() -> String {
                     "unknown",
                     "after a poll",
                     "halt skipped",
-                    "out of halt",
+                    "out of halt, kicked",
                     "resumed",
+                    "out of halt, not kicked",
                 ]
                 .iter()
                 .enumerate()

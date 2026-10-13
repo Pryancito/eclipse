@@ -872,7 +872,7 @@ pub fn wake_latency_stats() -> (u64, u64, u64, u64, u64, [u64; WAKE_LATENCY_BUCK
 /// delivered the CPU separates them, and costs one relaxed store per entry.
 ///
 /// Values, as published by [`note_entry_reason`]:
-pub const WAKE_ENTRY_REASONS: usize = 5;
+pub const WAKE_ENTRY_REASONS: usize = 6;
 /// No entry point has published a reason on this CPU yet, or the claim came
 /// from somewhere this crate does not instrument (a steal by a peer, the
 /// collection's own maintenance). Not an error: a bucket that is supposed to
@@ -886,10 +886,29 @@ pub const WAKE_ENTRY_AFTER_POLL: u8 = 1;
 /// into `hlt` and the wake caught it in the window. The halt protocol doing
 /// exactly what it is for, and the cheapest way a wake can arrive.
 pub const WAKE_ENTRY_SKIPPED_HALT: u8 = 2;
-/// The scan follows `wait_for_interrupt` returning: the CPU was halted and the
-/// wake waited for an interrupt. This is the bucket whose size decides whether
-/// the next thing to look at is the timer and the IPI, or the slice.
-pub const WAKE_ENTRY_HALT_EXIT: u8 = 3;
+/// The scan follows `wait_for_interrupt` returning **with a reschedule
+/// request pending for this CPU**: a kick was aimed here, so the wake path
+/// did its job and the halt ended because of it.
+///
+/// The bit is the evidence, and it is sound in this direction: the empty
+/// branch clears the request before the pre-halt recheck, and a request that
+/// landed between the clear and the halt would have been seen by the recheck
+/// and the CPU would not have halted. So a bit set on the far side of the halt
+/// was raised while this CPU was in it -- and [`request_resched`] sets it
+/// before sending to a sleeping target, unconditionally.
+pub const WAKE_ENTRY_HALT_KICKED: u8 = 3;
+/// The scan follows `wait_for_interrupt` returning with **no** request
+/// pending: something other than a kick for this CPU ended the halt --- the
+/// 250 Hz tick, a device interrupt, a kick raised with wake-up preemption
+/// switched off (`WAKEPREEMPT=0` sends the IPI without the bit). The wake was
+/// already waiting and nothing came to fetch it, so it waited for whatever
+/// did arrive.
+///
+/// Telling this apart from a kicked halt exit is the whole reason the entries
+/// were split: the aggregate band "64-256 us" has been labelled
+/// "timer-serviced" by its shape alone since the probe was written, and this
+/// counts it instead of inferring it.
+pub const WAKE_ENTRY_HALT_TIMER: u8 = 5;
 /// The scan follows entering the loop or coming back from a stack switch
 /// (`sched_yield`, a weak-executor turn). Neither waiting for an interrupt nor
 /// waiting out a slice, so it is kept apart from both rather than folded into
@@ -1365,6 +1384,19 @@ pub fn take_need_resched() -> bool {
 /// order is peek, ask the thread, and only then take.
 pub fn need_resched_pending() -> bool {
     let cpu = crate::arch::cpu_id() as usize;
+    if cpu >= MAX_CORE_NUM {
+        return false;
+    }
+    NEED_RESCHED.load(Ordering::Relaxed) & (1u64 << cpu) != 0
+}
+
+/// Whether a reschedule request is pending for `cpu`, without consuming it.
+///
+/// For the entry attribution at the halt exit (see
+/// [`WAKE_ENTRY_HALT_KICKED`]): a plain relaxed load, and emphatically not a
+/// take --- the request still belongs to whoever raised it, and the scan that
+/// follows is what satisfies it.
+pub(crate) fn resched_pending_for(cpu: usize) -> bool {
     if cpu >= MAX_CORE_NUM {
         return false;
     }
@@ -3986,10 +4018,10 @@ mod wake_latency_tests {
         }
         let saved = NOW_NS_HOOK.swap(clock as usize, Ordering::SeqCst);
         let (counts_before, ns_before, hist_before) = wake_entry_stats();
-        note_entry_reason(WAKE_ENTRY_HALT_EXIT);
+        note_entry_reason(WAKE_ENTRY_HALT_KICKED);
         note_wake_serviced(pack_wake_stamp(crate::arch::cpu_id(), 1_000));
         let (counts, ns, hist) = wake_entry_stats();
-        let halt = WAKE_ENTRY_HALT_EXIT as usize;
+        let halt = WAKE_ENTRY_HALT_KICKED as usize;
         assert_eq!(
             counts[halt],
             counts_before[halt] + 1,
@@ -4038,7 +4070,7 @@ mod wake_latency_tests {
         }
         let saved = NOW_NS_HOOK.swap(frozen as usize, Ordering::SeqCst);
         let (counts_before, _, _) = wake_entry_stats();
-        note_entry_reason(WAKE_ENTRY_HALT_EXIT);
+        note_entry_reason(WAKE_ENTRY_HALT_KICKED);
         // Published "later" than the claim reads the clock: dropped.
         note_wake_serviced(pack_wake_stamp(0, 2_000));
         // And an unstamped slot, which is the common case.
@@ -4049,6 +4081,33 @@ mod wake_latency_tests {
             "a sample the latency probe dropped was still attributed"
         );
         NOW_NS_HOOK.store(saved, Ordering::SeqCst);
+    }
+
+    /// `resched_pending_for` peeks, it does not take: the request still
+    /// belongs to whoever raised it, and the scan that follows the halt exit
+    /// is what satisfies it. A take here would drop a request, and the woken
+    /// task would wait for the next interrupt -- the regression the request
+    /// exists to prevent.
+    #[test]
+    fn reading_the_kick_at_a_halt_exit_does_not_consume_it() {
+        let _g = super::resched_test_lock();
+        let cpu = crate::arch::cpu_id() as usize;
+        let saved = NEED_RESCHED.load(Ordering::Relaxed);
+        NEED_RESCHED.fetch_or(1u64 << cpu, Ordering::Relaxed);
+        assert!(resched_pending_for(cpu), "the kick was not seen");
+        assert!(
+            resched_pending_for(cpu),
+            "reading the kick consumed it, so the scan that follows will not"
+        );
+        assert!(
+            need_resched_pending(),
+            "the request the trap path reads was dropped by the peek"
+        );
+        clear_need_resched(cpu);
+        assert!(!resched_pending_for(cpu), "the clear did not clear it");
+        // A CPU id no mask can hold is false, not a shift past the word.
+        assert!(!resched_pending_for(MAX_CORE_NUM));
+        NEED_RESCHED.store(saved, Ordering::Relaxed);
     }
 
     /// The aggregate histogram is exactly the sum of the per-entry rows.
@@ -4123,8 +4182,9 @@ mod wake_latency_tests {
             WAKE_ENTRY_UNKNOWN,
             WAKE_ENTRY_AFTER_POLL,
             WAKE_ENTRY_SKIPPED_HALT,
-            WAKE_ENTRY_HALT_EXIT,
+            WAKE_ENTRY_HALT_KICKED,
             WAKE_ENTRY_RESUMED,
+            WAKE_ENTRY_HALT_TIMER,
         ];
         assert_eq!(all.len(), WAKE_ENTRY_REASONS, "a reason without a counter");
         for (i, r) in all.iter().enumerate() {

@@ -80,8 +80,8 @@ pub use runtime::{
     spawn_with_affinity, stack_high_water, take_need_resched, wake_entry_stats,
     wake_latency_enabled, wake_latency_stats, wakeup_preempt_enabled, wakeup_preempt_stats,
     warm_runtimes, FaultStackAttr, StackAttrHit, StackPtrRegion, WAKE_ENTRY_AFTER_POLL,
-    WAKE_ENTRY_HALT_EXIT, WAKE_ENTRY_REASONS, WAKE_ENTRY_RESUMED, WAKE_ENTRY_SKIPPED_HALT,
-    WAKE_ENTRY_UNKNOWN, WAKE_LATENCY_BUCKETS, WAKE_SAMPLE_PERIOD,
+    WAKE_ENTRY_HALT_KICKED, WAKE_ENTRY_HALT_TIMER, WAKE_ENTRY_REASONS, WAKE_ENTRY_RESUMED,
+    WAKE_ENTRY_SKIPPED_HALT, WAKE_ENTRY_UNKNOWN, WAKE_LATENCY_BUCKETS, WAKE_SAMPLE_PERIOD,
 };
 
 #[doc(hidden)]
