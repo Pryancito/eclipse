@@ -138,6 +138,22 @@ jobs:
           cargo test -p linux-syscall --lib -- --test-threads=1
           cargo test -p kernel-hal --lib -- --test-threads=1
           cargo test -p hunter --lib -- --test-threads=1
+          # The DOC tests of the same crates. Every `cargo test` line in this
+          # file says `--lib`, so rustdoc had never collected a single doc
+          # comment here -- and three of them did not compile: a block of log
+          # output indented four spaces inside a `///` is a Rust code block to
+          # CommonMark, so `wasm_rt_syscall_set_segue_base error: Invalid
+          # argument` was being fed to the compiler as a statement. Nothing
+          # noticed because CI never ran it and `cargo test -p linux-syscall`
+          # (what a contributor runs) was red on master for as long as those
+          # comments had been there. Pasted output goes in a ```text fence;
+          # this is the line that says so. Cheap: these five collect twelve
+          # doc tests between them.
+          cargo test -p linux-object --doc --features mock-disk
+          cargo test -p linux-syscall --doc
+          cargo test -p kernel-hal --doc
+          cargo test -p hunter --doc
+          cargo test -p zircon-object --doc --features libos,aspace-separate,elf
           # The OS side of the vendored NVIDIA RM: 6500 lines of the interface
           # the RM calls into, in the workspace but named by no job here, so
           # nothing it answers had ever been executed anywhere but on a real
