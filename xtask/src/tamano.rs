@@ -39,8 +39,8 @@ const AJENOS: &[&str] = &["vendor/", "smoltcp/", "nvidia-rm-sys/vendor/"];
 /// Los que ya pasaban el techo el 9-oct-2026, con el techo propio de cada uno
 /// (su tamaño de ese día redondeado al siguiente múltiplo de 250).
 ///
-/// `xtask/src/linux/desktop.rs` **salió de aquí** el 13-oct y no puede volver:
-/// su entrada avisaba de que estaba a cinco líneas del techo y por tanto
+/// `xtask/src/linux/desktop.rs` **salió de aquí** el 13-oct-2026 y no puede
+/// volver: su entrada avisaba de que estaba a cinco líneas del techo y por tanto
 /// «bloqueando al siguiente que lo toque por algo que no es suyo», y es lo que
 /// pasó — el visor de imágenes lo dejó en 6013 y el rojo salía en todos los
 /// PRs del árbol. Sacar su `mod tests` a `desktop/tests.rs` lo dejó en 3912
@@ -48,9 +48,10 @@ const AJENOS: &[&str] = &["vendor/", "smoltcp/", "nvidia-rm-sys/vendor/"];
 /// comentario nombraba.
 ///
 /// Antes de subir un número: mirar si el fichero tiene un `#[cfg(test)] mod X
-/// { ... }` de primer nivel. Si lo tiene, sale a `X/mod.rs` sin tocar una
-/// línea de producción y lo más probable es que el fichero baje del techo
-/// general y salga de esta lista. Eso es lo que le pasó a
+/// { ... }` de primer nivel. Si lo tiene, sale a su propio fichero sin tocar
+/// una línea de producción —un `mod X;` lo lee igual de `X.rs` que de
+/// `X/mod.rs`— y lo más probable es que el fichero baje del techo general y
+/// salga de esta lista. Eso es lo que le pasó a
 /// `tools/eclipse-init/src/main.rs` el mismo día que entró este test: creció
 /// 280 líneas, este test las vio, y partirlo lo dejó en 3.313.
 const PASADOS: &[(&str, usize)] = &[
