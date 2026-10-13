@@ -220,6 +220,40 @@ pub fn vdso_tsc_base() -> u64 {
     TSC_BASE.load(Ordering::Relaxed)
 }
 
+/// The TSC→ns ratio as the pair of `u32`s the **Zircon** vDSO wants, reduced
+/// so both halves fit: `mono_ns = (tsc + offset) * numerator / denominator`.
+///
+/// The Linux personality takes the same rate as a Q32 multiplier through
+/// [`vdso_tsc_mult`]; Zircon's vDSO divides instead, so it needs the ratio
+/// itself. Both are gated on the same question — is this counter fit for
+/// userspace to read directly — so they answer `None` together and a caller
+/// cannot publish one clock's rate under the other's rules.
+///
+/// `None` also when either half will not fit a `u32`, because the vDSO loads
+/// them into `u32` fields and a truncated ratio divides wrong.
+pub fn vdso_tsc_ratio() -> Option<(u32, u32)> {
+    // Same predicate as the multiplier, base included: a ratio without a
+    // latched base is the days-ahead clock of #1613 all over again.
+    vdso_tsc_mult()?;
+    let hz = super::cpu::tsc_hz();
+    let g = gcd(1_000_000_000, hz);
+    let num = 1_000_000_000u64 / g;
+    let den = hz / g;
+    // A zero denominator is the one value the Zircon vDSO answers with `ud2`.
+    if num == 0 || den == 0 || num > u32::MAX as u64 || den > u32::MAX as u64 {
+        return None;
+    }
+    Some((num as u32, den as u32))
+}
+
+const fn gcd(a: u64, b: u64) -> u64 {
+    if b == 0 {
+        a
+    } else {
+        gcd(b, a % b)
+    }
+}
+
 /// Set by `VDSOFORCE=1` on the kernel command line: treat the TSC as usable by
 /// userspace even though CPUID does not say it is invariant.
 ///

@@ -79,6 +79,12 @@ pub fn vdso_tsc_mult() -> Option<u64> {
     None
 }
 
+/// TSC→ns ratio for the Zircon vDSO (libos: same reason as
+/// [`vdso_tsc_mult`] — there is no vDSO page of ours to fill).
+pub fn vdso_tsc_ratio() -> Option<(u32, u32)> {
+    None
+}
+
 /// This boot's TSC time zero (libos: no vDSO, and no TSC of our own to base).
 pub fn vdso_tsc_base() -> u64 {
     0
