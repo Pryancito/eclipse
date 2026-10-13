@@ -1218,16 +1218,12 @@ impl Syscall<'_> {
             let proc = self.zircon_process();
             let me = self.thread.id();
             let mut siblings = alloc::vec::Vec::new();
-            for tid in proc.thread_ids() {
-                if tid == me {
+            for t in proc.threads() {
+                if t.id() == me {
                     continue;
                 }
-                if let Ok(obj) = proc.get_child(tid) {
-                    if let Ok(t) = obj.downcast_arc::<Thread>() {
-                        zircon_object::task::Task::kill(t.as_ref());
-                        siblings.push(t);
-                    }
-                }
+                zircon_object::task::Task::kill(t.as_ref());
+                siblings.push(t);
             }
             for t in siblings {
                 let obj: Arc<dyn KernelObject> = t;
@@ -1571,8 +1567,7 @@ impl Syscall<'_> {
             }
         }
         let proc = zircon_object::task::ROOT_JOB.find_process(id)?;
-        let first = *proc.thread_ids().first()?;
-        proc.get_child(first).ok()?.downcast_arc::<Thread>().ok()
+        proc.threads().first().cloned()
     }
 
     /// `sched_setaffinity` sets the CPU affinity mask of the thread `pid`.
@@ -1979,15 +1974,6 @@ impl Syscall<'_> {
         Ok(0)
     }
 
-    /// Every live thread of `proc`.
-    fn threads_of(proc: &Arc<Process>) -> Vec<Arc<Thread>> {
-        proc.thread_ids()
-            .into_iter()
-            .filter_map(|id| proc.get_child(id).ok())
-            .filter_map(|obj| obj.downcast_arc::<Thread>().ok())
-            .collect()
-    }
-
     /// The tasks a `setpriority`/`getpriority` `which`/`who` pair names.
     ///
     /// The `which`/`who` pair is resolved by [`prio_target`]; this only does
@@ -2015,12 +2001,12 @@ impl Syscall<'_> {
             PrioTarget::Group(pgid) => linux_object::process::all_live_processes()
                 .iter()
                 .filter(|p| linux_object::process::effective_pgid(p) == pgid)
-                .flat_map(Self::threads_of)
+                .flat_map(|p| p.threads())
                 .collect(),
             PrioTarget::User(uid) => linux_object::process::all_live_processes()
                 .iter()
                 .filter(|p| p.try_linux().map(|lp| lp.uid()) == Some(uid))
-                .flat_map(Self::threads_of)
+                .flat_map(|p| p.threads())
                 .collect(),
         };
         if targets.is_empty() {

@@ -1221,6 +1221,19 @@ impl Process {
         self.inner.lock().threads.iter().map(|t| t.id()).collect()
     }
 
+    /// The Threads themselves, under ONE lock.
+    ///
+    /// [`thread_ids`](Self::thread_ids) followed by `get_child` per id is the
+    /// same answer for a quadratic price: `get_child` scans `threads`
+    /// linearly and takes the lock again for each one, so walking a process
+    /// with `t` threads costs `t` locks and `t^2/2` comparisons. Anything
+    /// that wants every thread -- choosing which one a signal goes to, adding
+    /// up the process's CPU time, killing the siblings on `exit_group`, the
+    /// `/proc` files -- wants this.
+    pub fn threads(&self) -> Vec<Arc<Thread>> {
+        self.inner.lock().threads.clone()
+    }
+
     /// Sum of per-thread `ZX_INFO_TASK_RUNTIME` for this process.
     pub fn get_runtime_info(&self) -> crate::task::TaskRuntimeInfo {
         let mut total = crate::task::TaskRuntimeInfo::default();
@@ -2690,5 +2703,118 @@ mod init_pid_tests {
         let obj = Event::new();
         assert_ne!(obj.id(), INIT_PID);
         assert!(obj.id() > INIT_PID, "the counter starts above PID 1");
+    }
+}
+
+/// Asking a process for its threads, which eight walks in the two Linux
+/// crates do on paths a program hits constantly.
+///
+/// Those eight -- choosing which thread a signal goes to, marking a signal
+/// pending on all of them, waking the sleepers, clearing a siginfo on
+/// `sigaction`, adding up the process's CPU time for `times(2)`, killing the
+/// siblings on `execve`, and two `/proc` files -- all asked for the thread
+/// IDS and then looked each one up, which is a linear scan of the very list
+/// the ids came from plus a lock per thread. [`Process::threads`] is that
+/// answer under one lock; what these tests pin is that it IS the same answer.
+///
+/// The order is part of it, and not decoration: the signal path walks the
+/// threads in order and delivers to the first one that has the signal
+/// unblocked, so a different order is a different thread taking the signal.
+#[cfg(test)]
+mod threads_walk_tests {
+    use super::*;
+    use crate::object::KernelObject;
+
+    fn a_process_with(n: usize) -> (Arc<Process>, Vec<Arc<Thread>>) {
+        let proc = Process::create(&Job::root(), "walk").unwrap();
+        let threads = (0..n)
+            .map(|_| Thread::create(&proc, "walk").unwrap())
+            .collect();
+        (proc, threads)
+    }
+
+    /// Break the `Process` <-> `Thread` reference cycle so the process (and
+    /// with it its root VMAR) is actually freed when the test ends.
+    ///
+    /// Without this the process outlives the test and keeps its hosted
+    /// address-space window, and this binary has exactly as many windows as
+    /// it has room for: one test that leaks one process makes an unrelated
+    /// `vmar` test fail with "out of hosted address-space windows". So every
+    /// test here ends by letting go, and a test that takes a process apart on
+    /// purpose says so by calling this itself.
+    fn release(proc: &Arc<Process>) {
+        for t in proc.threads() {
+            proc.remove_thread(t.id());
+        }
+    }
+
+    /// The same list, in the same order, as the id-then-lookup walk.
+    #[test]
+    fn it_is_the_same_threads_in_the_same_order_as_looking_each_id_up() {
+        let (proc, _keep) = a_process_with(8);
+        let by_id: Vec<KoID> = proc
+            .thread_ids()
+            .into_iter()
+            .filter_map(|id| proc.get_child(id).ok())
+            .map(|obj| obj.id())
+            .collect();
+        let direct: Vec<KoID> = proc.threads().iter().map(|t| t.id()).collect();
+        release(&proc);
+        assert_eq!(direct, by_id);
+        assert_eq!(direct.len(), 8);
+    }
+
+    /// And that order is the order they were created in.
+    #[test]
+    fn the_order_is_the_order_they_were_made_in() {
+        let (proc, made) = a_process_with(4);
+        let want: Vec<KoID> = made.iter().map(|t| t.id()).collect();
+        let got: Vec<KoID> = proc.threads().iter().map(|t| t.id()).collect();
+        release(&proc);
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn a_process_with_no_threads_has_an_empty_list() {
+        let proc = Process::create(&Job::root(), "walk").unwrap();
+        assert!(proc.threads().is_empty());
+    }
+
+    /// A thread taken out of the process is out of both answers.
+    #[test]
+    fn a_removed_thread_is_in_neither_answer() {
+        let (proc, made) = a_process_with(3);
+        let gone = made[1].id();
+        proc.remove_thread(gone);
+        let left: Vec<KoID> = proc.threads().iter().map(|t| t.id()).collect();
+        let by_id = proc.thread_ids();
+        release(&proc);
+        assert_eq!(left, vec![made[0].id(), made[2].id()]);
+        assert_eq!(by_id, left);
+    }
+
+    /// The one way the two answers are NOT the same, and it is the point:
+    /// this one hands out strong references, so every thread it listed is
+    /// still there to be used. The id-then-lookup walk could be overtaken
+    /// between the two steps -- a thread that died in the gap was silently
+    /// dropped from the walk, and one born in it was never in the ids -- so
+    /// what it returned was not a snapshot of anything.
+    #[test]
+    fn the_threads_it_lists_stay_usable_even_once_the_process_has_let_go() {
+        let (proc, made) = a_process_with(2);
+        let listed = proc.threads();
+        for t in &made {
+            proc.remove_thread(t.id());
+        }
+        assert!(proc.thread_ids().is_empty(), "the process has let go");
+        assert!(
+            proc.get_child(made[0].id()).is_err(),
+            "and the lookup can no longer find them"
+        );
+        assert_eq!(
+            listed.iter().map(|t| t.id()).collect::<Vec<_>>(),
+            made.iter().map(|t| t.id()).collect::<Vec<_>>(),
+            "the list taken before is still whole and still usable"
+        );
     }
 }

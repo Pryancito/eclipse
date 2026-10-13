@@ -58,3 +58,8 @@ required-features = ["libos", "aspace-separate"]
 name = "futex"
 harness = true
 required-features = ["libos", "aspace-separate"]
+
+[[bench]]
+name = "task"
+harness = true
+required-features = ["libos", "aspace-separate"]

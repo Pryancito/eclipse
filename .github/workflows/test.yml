@@ -115,6 +115,7 @@ jobs:
           cargo bench -p linux-object --lib --features mock-disk --no-run
           cargo bench -p zircon-object --bench vm --features libos,aspace-separate --no-run
           cargo bench -p zircon-object --bench futex --features libos,aspace-separate --no-run
+          cargo bench -p zircon-object --bench task --features libos,aspace-separate --no-run
           # `linux-syscall`'s benches are not a `benches/` target: every
           # submodule of that crate is private, so they live in `#[cfg(test)]`
           # modules beside the syscalls and build with the lib. Same for
