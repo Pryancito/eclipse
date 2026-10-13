@@ -1976,6 +1976,8 @@ static int write_gz_image_to_disk(const char *gz_path, const char *disk_path, ui
     size_t total = 0;
     int disk_fd;
     off_t gz_size = 0;
+    uint64_t unc_size = 0;
+    int have_unc;
     int last_pct = -1;
 
     if (dry_run) {
@@ -1983,6 +1985,19 @@ static int write_gz_image_to_disk(const char *gz_path, const char *disk_path, ui
             gz_path, disk_path, start_sector);
         return 0;
     }
+
+    /* El denominador tiene que ser el tamaño DESCOMPRIMIDO, no el .gz leído.
+     * efi.img es una FAT32 del tamaño de la partición con unos cientos de
+     * MiB de datos y el resto a ceros, y esos ceros no ocupan casi nada
+     * comprimidos: medido sobre el .gz, el contador llega al 99 % con un
+     * cuarto de la imagen escrita y ahí se queda clavado los minutos que
+     * tarde en escribir el resto. O sea, justo el "parece colgado" que
+     * esto venía a quitar, pero ahora con un 99 % delante.
+     *
+     * El ISIZE del trailer es módulo 4 GiB, así que en cuanto lo escrito lo
+     * supera deja de valer y se vuelve al .gz consumido, que al menos no
+     * retrocede. */
+    have_unc = (gzip_uncompressed_size(gz_path, &unc_size) == 0 && unc_size > 0);
 
     buf = malloc(IMG_CHUNK);
     chunk = IMG_CHUNK;
@@ -2049,23 +2064,28 @@ static int write_gz_image_to_disk(const char *gz_path, const char *disk_path, ui
         offset += (uint64_t)nread;
         total += (size_t)nread;
 
-        /* El porcentaje va sobre el fichero .gz consumido, no sobre los
-         * bytes escritos: el tamaño descomprimido no se conoce de antemano
-         * (el ISIZE del trailer es módulo 4 GiB). */
-        if (gz_size > 0) {
-            z_off_t curr = gzoffset(gz);
-            if (curr >= 0) {
-                int pct = (int)((curr * 100) / gz_size);
-                if (pct > 100) {
-                    pct = 100;
+        if (have_unc && total > unc_size) {
+            have_unc = 0;
+        }
+        {
+            int pct = -1;
+            if (have_unc) {
+                pct = (int)(((uint64_t)total * 100) / unc_size);
+            } else if (gz_size > 0) {
+                z_off_t curr = gzoffset(gz);
+                if (curr >= 0) {
+                    pct = (int)((curr * 100) / gz_size);
                 }
-                if (pct > last_pct) {
-                    fprintf(stdout, "\rEscribiendo %s en %s: %d%% (%llu MiB)...",
-                            disk_basename(gz_path), disk_basename(disk_path), pct,
-                            (unsigned long long)(total / MIB));
-                    fflush(stdout);
-                    last_pct = pct;
-                }
+            }
+            if (pct > 100) {
+                pct = 100;
+            }
+            if (pct > last_pct) {
+                fprintf(stdout, "\rEscribiendo %s en %s: %d%% (%llu MiB)...",
+                        disk_basename(gz_path), disk_basename(disk_path), pct,
+                        (unsigned long long)(total / MIB));
+                fflush(stdout);
+                last_pct = pct;
             }
         }
     }
@@ -2075,9 +2095,16 @@ static int write_gz_image_to_disk(const char *gz_path, const char *disk_path, ui
         free(buf);
     }
 
+    /* El fsync de cientos de MiB es otro silencio largo, y cae justo cuando
+     * la barra acaba de llegar al 100 %. */
+    fprintf(stdout, "\rSincronizando %s (%llu MiB)...", disk_basename(disk_path),
+            (unsigned long long)(total / MIB));
+    fflush(stdout);
     if (fsync(disk_fd) != 0) {
+        clear_progress_line(0);
         log(COLOR_YELLOW "ADVERTENCIA: fsync en %s: %s" COLOR_RESET, disk_path, strerror(errno));
     }
+    clear_progress_line(0);
     close(disk_fd);
     if (gzclose(gz) != Z_OK) {
         log(COLOR_RED COLOR_BOLD "ERROR: Cierre de %s falló." COLOR_RESET, gz_path);
