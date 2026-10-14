@@ -189,10 +189,27 @@ impl LinuxProcessInner {
     /// file is an epoll.
     ///
     /// Call it BEFORE the insert, with the file that is going in. It has to
-    /// remove as well as add, because `dup2` installs a descriptor over one
-    /// that is already open: an epoll replaced by an ordinary file would
-    /// otherwise leave its number in the set, and every later close would
-    /// then build a plan for an epoll that is not there.
+    /// remove as well as add: an epoll replaced by an ordinary file under the
+    /// same number would otherwise leave that number in the set, and every
+    /// later close would then build a plan for an epoll that is not there.
+    ///
+    /// The caller that needs the removal is not `dup2`, which this comment
+    /// used to name: `LinuxProcess::replace_file` frees the old entry
+    /// (`note_fd_freed`, which takes the number out of the set) before it
+    /// inserts the new one. It is `insert_file` over a number that is
+    /// ALREADY open, and the only way in is `LinuxProcess::add_file_at`:
+    /// that one hands `insert_file` a number the caller chose and nothing
+    /// checks that it is free, so a `HashMap::insert` quietly drops whatever
+    /// was there. This `else` is what keeps `epoll_fds` straight when it
+    /// does; the `holders` count of the dropped description is NOT kept
+    /// straight, because no `note_fd_freed` runs for it, so a caller that
+    /// installs over a live number leaks a holder. `add_file_at` has no
+    /// caller outside the tests today -- whoever gives it one should use
+    /// `replace_file` instead, which is dup2's path and frees first.
+    ///
+    /// A mutation run removed this `else` and left the whole crate green,
+    /// which is what sent somebody looking for the caller the comment
+    /// claimed.
     pub(super) fn note_fd_inserted(&mut self, fd: FileDesc, file: &Arc<dyn FileLike>) {
         if file.clone().downcast_arc::<crate::fs::Epoll>().is_ok() {
             self.epoll_fds.insert(fd);
