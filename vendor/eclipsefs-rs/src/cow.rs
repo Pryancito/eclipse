@@ -28,7 +28,9 @@ use crate::device::BlockDevice;
 use crate::format::{
     FileKind, BLOCK_SIZE, GROUP_BLOCKS, MAX_NAME_LEN, MAX_SYMLINK_LEN, MIN_GROUP_BLOCKS,
 };
-use crate::fs::{CheckReport, DirEntry, FsStat, InodeStat, ScrubReport, SubvolInfo, COMMIT_OPS};
+use crate::fs::{
+    CheckReport, CompSize, DirEntry, FsStat, InodeStat, ScrubReport, SubvolInfo, COMMIT_OPS,
+};
 use crate::journal::{JournalArea, Overlay};
 use crate::space::{metadata_reserve, BlockSpace, RangeSet, RefMap};
 use crate::v3::write_home;
@@ -50,6 +52,18 @@ struct Ext {
     blocks: u64,
     /// Reserved by `fallocate`, not written yet (reads as zeros).
     prealloc: bool,
+    /// Compressed: `pblk` is where the extent starts and `lblk` maps to
+    /// this block of what it holds.
+    z: Option<Zext>,
+}
+
+/// The compressed extent behind an [`Ext`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Zext {
+    algo: Compression,
+    disk_blocks: u64,
+    ram_blocks: u64,
+    offset: u64,
 }
 
 impl Ext {
@@ -58,6 +72,31 @@ impl Ext {
             FileExtent::Prealloc { disk: pblk, blocks }.encode()
         } else {
             FileExtent::Reg { disk: pblk, blocks }.encode()
+        }
+    }
+
+    /// The item for file blocks `from..to` of this extent.
+    fn piece(&self, from: u64, to: u64) -> Vec<u8> {
+        match self.z {
+            None => Self::item(self.pblk + (from - self.lblk), to - from, self.prealloc),
+            Some(z) => FileExtent::Comp(Comp {
+                algo: z.algo,
+                disk: self.pblk,
+                disk_blocks: z.disk_blocks,
+                ram_blocks: z.ram_blocks,
+                offset: z.offset + (from - self.lblk),
+                blocks: to - from,
+            })
+            .encode(),
+        }
+    }
+
+    /// Disk block right after the data of file block `lb - 1` (a goal for
+    /// the blocks of `lb`).
+    fn next_disk(&self, lb: u64) -> u64 {
+        match self.z {
+            None => self.pblk + (lb - self.lblk),
+            Some(z) => self.pblk + z.disk_blocks,
         }
     }
 }
@@ -89,6 +128,13 @@ pub struct CowFs {
     nested: bool,
     pending_ops: u32,
     clock: Option<fn() -> (u64, u32)>,
+    /// `compress=`: what new data of every file is compressed with.
+    compress: Option<Compression>,
+    /// The last compressed extent read: its first block and contents.
+    zcache: Option<(u64, Vec<u8>)>,
+    /// File blocks of compressed files written uncompressed by this
+    /// transaction, by (subvolume, inode).
+    zpending: BTreeMap<(u64, u64), RangeSet>,
 }
 
 fn check_name(name: &str) -> Result<&[u8]> {
@@ -123,9 +169,6 @@ fn permit(bad: bool) -> Result<()> {
         Ok(())
     }
 }
-
-/// Flags a new inode takes from its directory (as on btrfs).
-const FL_INHERITED: u32 = FL_NOCOW | FL_COMPR | FL_NOCOMP;
 
 fn stat_of(ino: u64, i: &InodeItem) -> InodeStat {
     InodeStat {
@@ -243,6 +286,9 @@ impl CowFs {
             nested: false,
             pending_ops: 0,
             clock: None,
+            compress: None,
+            zcache: None,
+            zpending: BTreeMap::new(),
             sb,
         };
         if fs.sb.free_blocks != free {
@@ -325,6 +371,7 @@ impl CowFs {
     /// Commit the open transaction.
     fn flush(&mut self) -> Result<()> {
         self.pending_ops = 0;
+        self.compress_pending()?;
         let changed = self.st.dirty_count() > 0
             || self.sp.refs_dirty
             || self.sp.alloc.deferred_blocks() > 0
@@ -629,7 +676,7 @@ impl CowFs {
         match self.get(Self::ext_key(ino, 0))? {
             Some(d) => match FileExtent::decode(&d)? {
                 FileExtent::Inline(v) => Ok(Some(v)),
-                FileExtent::Reg { .. } | FileExtent::Prealloc { .. } => Ok(None),
+                _ => Ok(None),
             },
             None => Ok(None),
         }
@@ -652,9 +699,20 @@ impl CowFs {
         let hi = Key::new(ino, EXTENT_DATA, to * BS - 1);
         items.extend(self.st.range(&self.fs_root, &lo, &hi, usize::MAX)?);
         for (k, d) in items {
-            let (disk, blocks, prealloc) = match FileExtent::decode(&d)? {
-                FileExtent::Reg { disk, blocks } => (disk, blocks, false),
-                FileExtent::Prealloc { disk, blocks } => (disk, blocks, true),
+            let (disk, blocks, prealloc, z) = match FileExtent::decode(&d)? {
+                FileExtent::Reg { disk, blocks } => (disk, blocks, false, None),
+                FileExtent::Prealloc { disk, blocks } => (disk, blocks, true, None),
+                FileExtent::Comp(c) => (
+                    c.disk,
+                    c.blocks,
+                    false,
+                    Some(Zext {
+                        algo: c.algo,
+                        disk_blocks: c.disk_blocks,
+                        ram_blocks: c.ram_blocks,
+                        offset: c.offset,
+                    }),
+                ),
                 FileExtent::Inline(_) => continue,
             };
             {
@@ -666,6 +724,7 @@ impl CowFs {
                     pblk: disk,
                     blocks,
                     prealloc,
+                    z,
                 };
                 if e.lblk + e.blocks > from && e.lblk < to {
                     out.push(e);
@@ -703,7 +762,8 @@ impl CowFs {
         // Extend the previous extent when the new blocks continue it.
         if lblk > 0 {
             if let Some(prev) = self.extents(ino, lblk - 1, lblk)?.first().copied() {
-                if prev.lblk + prev.blocks == lblk
+                if prev.z.is_none()
+                    && prev.lblk + prev.blocks == lblk
                     && prev.pblk + prev.blocks == pblk
                     && prev.prealloc == prealloc
                     && prev.blocks + n <= MAX_EXTENT_BLOCKS
@@ -728,22 +788,67 @@ impl CowFs {
             let key = Self::ext_key(ino, e.lblk);
             let end = e.lblk + e.blocks;
             if e.lblk < from {
-                self.upsert(key, Ext::item(e.pblk, from - e.lblk, e.prealloc))?;
+                self.upsert(key, e.piece(e.lblk, from))?;
             } else {
                 self.delete(key)?;
             }
             if end > to {
-                self.insert(
-                    Self::ext_key(ino, to),
-                    Ext::item(e.pblk + (to - e.lblk), end - to, e.prealloc),
-                )?;
+                self.insert(Self::ext_key(ino, to), e.piece(to, end))?;
             }
             let s = e.lblk.max(from);
             let t = end.min(to);
-            self.sp_decref(e.pblk + (s - e.lblk), t - s)?;
+            match e.z {
+                None => self.sp_decref(e.pblk + (s - e.lblk), t - s)?,
+                // Every piece of a compressed extent owns all its blocks.
+                Some(z) => match (e.lblk < from, end > to) {
+                    (false, false) => self.sp_decref(e.pblk, z.disk_blocks)?,
+                    (true, true) => {
+                        crate::btree::Space::incref(&mut self.sp, e.pblk, z.disk_blocks)?
+                    }
+                    _ => {}
+                },
+            }
             inode.nbytes = inode.nbytes.saturating_sub((t - s) * BS);
         }
         Ok(())
+    }
+
+    /// A goal for the disk blocks of file block `lb`: right after those of
+    /// the block before it.
+    fn goal(&mut self, ino: u64, lb: u64) -> Result<Option<u64>> {
+        if lb == 0 {
+            return Ok(None);
+        }
+        Ok(self
+            .extents(ino, lb - 1, lb)?
+            .first()
+            .map(|e| e.next_disk(lb)))
+    }
+
+    /// Everything the compressed extent at disk block `pblk` holds.
+    fn unpacked(&mut self, pblk: u64, z: Zext) -> Result<&[u8]> {
+        if !matches!(&self.zcache, Some((p, _)) if *p == pblk) {
+            let mut disk = vec![0u8; (z.disk_blocks * BS) as usize];
+            self.raw.read_at(pblk * BS, &mut disk)?;
+            self.verify(pblk, &disk)?;
+            let ram = crate::compress::unpack(z.algo, &disk, (z.ram_blocks * BS) as usize)?;
+            self.zcache = Some((pblk, ram));
+        }
+        match &self.zcache {
+            Some((_, ram)) if ram.len() as u64 == z.ram_blocks * BS => Ok(ram),
+            _ => Err(Error::Corrupt("compressed extent")),
+        }
+    }
+
+    /// What new data of `inode` is compressed with, if anything.
+    fn compression_for(&self, inode: &InodeItem) -> Option<Compression> {
+        let f = inode.flags as u32;
+        if f & (FL_NOCOW | FL_NOCOMP) != 0 {
+            return None;
+        }
+        inode_compression(inode)
+            .or(self.compress)
+            .or((f & FL_COMPR != 0).then_some(Compression::Zlib))
     }
 
     fn sp_decref(&mut self, start: u64, len: u64) -> Result<()> {
@@ -766,6 +871,13 @@ impl CowFs {
             }
             let s = (e.lblk * BS).max(off);
             let t = ((e.lblk + e.blocks) * BS).min(end);
+            if let Some(z) = e.z {
+                let ram = self.unpacked(e.pblk, z)?;
+                let at = (z.offset * BS + (s - e.lblk * BS)) as usize;
+                buf[(s - off) as usize..(t - off) as usize]
+                    .copy_from_slice(&ram[at..at + (t - s) as usize]);
+                continue;
+            }
             let mut pos = s;
             while pos < t {
                 // Whole blocks, a bounded number at a time.
@@ -840,6 +952,22 @@ impl CowFs {
         off: u64,
         data: &[u8],
     ) -> Result<usize> {
+        // Blocks freed before may be rewritten below.
+        self.zcache = None;
+        match self.compression_for(inode) {
+            Some(algo) => self.write_compressed(ino, inode, off, data, algo),
+            None => self.write_plain(ino, inode, off, data),
+        }
+    }
+
+    /// [`write_extents`](Self::write_extents) without compression.
+    fn write_plain(
+        &mut self,
+        ino: u64,
+        inode: &mut InodeItem,
+        off: u64,
+        data: &[u8],
+    ) -> Result<usize> {
         let end = off + data.len() as u64;
         let mut lb = off / BS;
         let last = end.div_ceil(BS);
@@ -861,6 +989,7 @@ impl CowFs {
                     let p = e.pblk + (lb - e.lblk);
                     let n = run_end - lb;
                     let mine = !e.prealloc
+                        && e.z.is_none()
                         && (self.sp.private_fresh(p, n)
                             || nocow
                                 && (p..p + n).all(|b| self.sp.refs.get(b) == 1)
@@ -882,13 +1011,7 @@ impl CowFs {
                 Some(p) => (p, n),
                 None => {
                     // New blocks, next to the file's previous ones.
-                    let goal = if lb > 0 {
-                        self.extents(ino, lb - 1, lb)?
-                            .first()
-                            .map(|e| e.pblk + (lb - e.lblk))
-                    } else {
-                        None
-                    };
+                    let goal = self.goal(ino, lb)?;
                     match self.sp.alloc_data(goal, n) {
                         Some(r) => r,
                         None => break,
@@ -926,6 +1049,200 @@ impl CowFs {
             inode.size = written_to;
         }
         Ok((written_to - off) as usize)
+    }
+
+    /// [`write_extents`](Self::write_extents) for a file whose data is
+    /// compressed. Runs of [`ZCHUNK`] whole blocks become compressed
+    /// extents right away; smaller pieces are written as they are and
+    /// compressed together when the transaction commits
+    /// ([`compress_pending`](Self::compress_pending)), so a file written a
+    /// little at a time still ends up in large compressed extents.
+    fn write_compressed(
+        &mut self,
+        ino: u64,
+        inode: &mut InodeItem,
+        off: u64,
+        data: &[u8],
+        algo: Compression,
+    ) -> Result<usize> {
+        let end = off + data.len() as u64;
+        let first = off.div_ceil(BS);
+        let mut pos = off;
+        if end / BS >= first + ZCHUNK {
+            if first * BS > off {
+                let head = &data[..(first * BS - off) as usize];
+                let n = self.write_plain(ino, inode, off, head)?;
+                self.pend(ino, off, n);
+                if n < head.len() {
+                    return Ok(n);
+                }
+            }
+            let mut lb = first;
+            while end / BS >= lb + ZCHUNK {
+                let at = (lb * BS - off) as usize;
+                let chunk = &data[at..at + (ZCHUNK * BS) as usize];
+                if !self.write_packed(ino, inode, lb, chunk, algo)? {
+                    // Incompressible: as it is.
+                    let n = self.write_plain(ino, inode, lb * BS, chunk).or_else(|e| {
+                        if e == Error::NoSpace {
+                            Ok(0)
+                        } else {
+                            Err(e)
+                        }
+                    })?;
+                    if n < chunk.len() {
+                        return Ok(at + n);
+                    }
+                }
+                lb += ZCHUNK;
+            }
+            pos = lb * BS;
+        }
+        if pos < end {
+            let rest = &data[(pos - off) as usize..];
+            let n = match self.write_plain(ino, inode, pos, rest) {
+                Ok(n) => n,
+                Err(Error::NoSpace) if pos > off => 0,
+                Err(e) => return Err(e),
+            };
+            self.pend(ino, pos, n);
+            pos += n as u64;
+        }
+        if pos > inode.size {
+            inode.size = pos;
+        }
+        Ok((pos - off) as usize)
+    }
+
+    /// Remember file bytes `off..off+n` of `ino` for compression at commit.
+    fn pend(&mut self, ino: u64, off: u64, n: usize) {
+        if n > 0 {
+            let s = off / BS;
+            let t = (off + n as u64).div_ceil(BS);
+            self.zpending
+                .entry((self.subvol, ino))
+                .or_default()
+                .insert(s, t - s);
+        }
+    }
+
+    /// Store `data` (whole blocks) at file block `lb` as one compressed
+    /// extent; false when it does not compress or finds no room.
+    fn write_packed(
+        &mut self,
+        ino: u64,
+        inode: &mut InodeItem,
+        lb: u64,
+        data: &[u8],
+        algo: Compression,
+    ) -> Result<bool> {
+        let Some(p) = crate::compress::pack(algo, data) else {
+            return Ok(false);
+        };
+        let need = p.len() as u64 / BS;
+        let goal = self.goal(ino, lb)?;
+        let Some(pb) = self.sp.alloc_data_run(goal, need) else {
+            return Ok(false);
+        };
+        self.zcache = None;
+        self.raw.write_at(pb * BS, &p)?;
+        for (i, block) in p.chunks(BS as usize).enumerate() {
+            self.sp.csums.insert(pb + i as u64, Some(crc32c(block)));
+        }
+        let n = data.len() as u64 / BS;
+        self.unmap(ino, inode, lb, lb + n)?;
+        let item = FileExtent::Comp(Comp {
+            algo,
+            disk: pb,
+            disk_blocks: need,
+            ram_blocks: n,
+            offset: 0,
+            blocks: n,
+        });
+        self.insert(Self::ext_key(ino, lb), item.encode())?;
+        inode.nbytes += n * BS;
+        inode.size = inode.size.max((lb + n) * BS);
+        Ok(true)
+    }
+
+    /// Compress what small writes left uncompressed in this transaction:
+    /// runs of blocks still mapped by this transaction's own unshared
+    /// blocks, [`ZCHUNK`] at a time.
+    fn compress_pending(&mut self) -> Result<()> {
+        if self.zpending.is_empty() || self.read_only {
+            return Ok(());
+        }
+        let pending = core::mem::take(&mut self.zpending);
+        let cur = self.subvol;
+        for ((sv, ino), ranges) in pending {
+            self.enter(sv)?;
+            let Ok(mut inode) = self.inode(ino) else {
+                continue;
+            };
+            let Some(algo) = self.compression_for(&inode) else {
+                continue;
+            };
+            let before = inode.clone();
+            let blocks = inode.size.div_ceil(BS);
+            for (s, l) in ranges.iter() {
+                // Up to the file's chunk grid, then whole chunks, so that
+                // appends line up with the extents before them.
+                let mut lb = s;
+                while lb < (s + l).min(blocks) {
+                    let next = ((lb / ZCHUNK + 1) * ZCHUNK).min(blocks);
+                    if next - lb >= 2 {
+                        self.compact(ino, &mut inode, lb, next - lb, algo)?;
+                    }
+                    lb = next;
+                }
+            }
+            if inode != before {
+                self.put_inode(ino, inode)?;
+            }
+        }
+        self.enter(cur)
+    }
+
+    /// Rewrite file blocks `lb..lb+n` as one compressed extent if they are
+    /// all mapped by unshared blocks of this transaction (or compressed
+    /// extents it wrote) and compress.
+    fn compact(
+        &mut self,
+        ino: u64,
+        inode: &mut InodeItem,
+        lb: u64,
+        n: u64,
+        algo: Compression,
+    ) -> Result<()> {
+        let mut covered = 0;
+        let mut plain = false;
+        for e in self.extents(ino, lb, lb + n)? {
+            if e.prealloc {
+                return Ok(());
+            }
+            let s = e.lblk.max(lb);
+            let t = (e.lblk + e.blocks).min(lb + n);
+            let fresh = match e.z {
+                None => {
+                    plain = true;
+                    self.sp.private_fresh(e.pblk + (s - e.lblk), t - s)
+                }
+                Some(z) => self.sp.private_fresh(e.pblk, z.disk_blocks),
+            };
+            if !fresh {
+                return Ok(());
+            }
+            covered += t - s;
+        }
+        if covered != n || !plain {
+            return Ok(());
+        }
+        let mut buf = vec![0u8; (n * BS) as usize];
+        self.read_blocks(ino, lb * BS, &mut buf)?;
+        let size = inode.size;
+        self.write_packed(ino, inode, lb, &buf, algo)?;
+        inode.size = size;
+        Ok(())
     }
 
     /// Move an inline file into a regular block.
@@ -1122,6 +1439,7 @@ impl CowFs {
 
     /// Delete an inode and everything it owns.
     fn purge(&mut self, ino: u64) -> Result<()> {
+        self.zpending.remove(&(self.subvol, ino));
         let items = self.st.range(
             &self.fs_root,
             &Key::new(ino, 0, 0),
@@ -1263,7 +1581,7 @@ impl CowFs {
         i.rdev = rdev;
         i.parent = dir;
         if matches!(kind, FileKind::Regular | FileKind::Dir) {
-            i.flags = d.flags & FL_INHERITED as u64;
+            i.flags = d.flags & FL_INHERITED;
         }
         self.insert(Key::new(ino, INODE_ITEM, 0), i.encode())?;
         self.fs_item.next_ino += 1;
@@ -1824,6 +2142,7 @@ impl CowFs {
             return Err(Error::NotEmpty);
         }
         self.remove_entry(dir, name)?;
+        self.zpending.retain(|&(sv, _), _| sv != id);
         let (root, _) = match self.subvols.remove(&id) {
             Some(t) => t,
             None => {
@@ -2016,6 +2335,12 @@ impl CowFs {
             if from >= to {
                 continue;
             }
+            if let Some(z) = e.z {
+                crate::btree::Space::incref(&mut self.sp, e.pblk, z.disk_blocks)?;
+                self.insert(Self::ext_key(ino, d0 + (from - s0)), e.piece(from, to))?;
+                inode.nbytes += (to - from) * BS;
+                continue;
+            }
             let p = e.pblk + (from - e.lblk);
             crate::btree::Space::incref(&mut self.sp, p, to - from)?;
             self.set_mapping(ino, inode, d0 + (from - s0), to - from, p)?;
@@ -2176,10 +2501,89 @@ impl CowFs {
         {
             return Err(Error::Invalid);
         }
+        // No-COW data is never compressed.
+        if flags & FL_NOCOW != 0 && (flags & FL_COMPR != 0 || inode_compression(&i).is_some()) {
+            return Err(Error::Invalid);
+        }
         i.flags = (i.flags & !(FL_SETTABLE as u64)) | flags as u64;
         i.ctime = self.now();
         self.put_inode(ino, i)?;
         self.commit()
+    }
+
+    // -----------------------------------------------------------------------
+    // Compression
+    // -----------------------------------------------------------------------
+
+    /// `compress=`: compress new data of every file (unless marked no-COW
+    /// or no-compression) with `algo`, until unmounted.
+    pub fn set_mount_compression(&mut self, algo: Option<Compression>) {
+        self.compress = algo;
+    }
+
+    pub fn mount_compression(&self) -> Option<Compression> {
+        self.compress
+    }
+
+    /// The compression property of `h` (`btrfs property get compression`).
+    pub fn compression(&mut self, h: u64) -> Result<Option<Compression>> {
+        let ino = self.at(h)?;
+        Ok(inode_compression(&self.inode(ino)?))
+    }
+
+    /// Compress new data of `h` (files created in it too, for a directory)
+    /// with `algo`, or stop doing so. Data already written stays as it is.
+    pub fn set_compression(&mut self, h: u64, algo: Option<Compression>) -> Result<()> {
+        let ino = self.at_rw(h)?;
+        self.writable()?;
+        let mut i = self.inode(ino)?;
+        permit(frozen(&i))?;
+        if algo.is_some() && i.flags & FL_NOCOW as u64 != 0 {
+            return Err(Error::Invalid);
+        }
+        set_inode_compression(&mut i, algo);
+        i.flags &= !((FL_COMPR | FL_NOCOMP) as u64);
+        if algo.is_some() {
+            i.flags |= FL_COMPR as u64;
+        }
+        i.ctime = self.now();
+        self.put_inode(ino, i)?;
+        self.commit()
+    }
+
+    /// Disk and file bytes of `h`'s data (`compsize`): each extent counted
+    /// once however many pieces of it the file maps.
+    pub fn compsize(&mut self, h: u64) -> Result<CompSize> {
+        let ino = self.at(h)?;
+        self.inode(ino)?;
+        let mut out = CompSize::default();
+        let mut seen = BTreeSet::new();
+        for (_, d) in self.st.range(
+            &self.fs_root,
+            &Key::new(ino, EXTENT_DATA, 0),
+            &Key::new(ino, EXTENT_DATA, u64::MAX),
+            usize::MAX,
+        )? {
+            match FileExtent::decode(&d)? {
+                FileExtent::Reg { blocks, .. } => {
+                    out.disk_bytes += blocks * BS;
+                    out.uncompressed_bytes += blocks * BS;
+                }
+                FileExtent::Comp(c) => {
+                    out.compressed_extents += 1;
+                    if seen.insert(c.disk) {
+                        out.disk_bytes += c.disk_blocks * BS;
+                        out.uncompressed_bytes += c.ram_blocks * BS;
+                    }
+                }
+                FileExtent::Inline(v) => {
+                    out.disk_bytes += v.len() as u64;
+                    out.uncompressed_bytes += v.len() as u64;
+                }
+                FileExtent::Prealloc { .. } => {}
+            }
+        }
+        Ok(out)
     }
 
     // -----------------------------------------------------------------------
@@ -2275,13 +2679,7 @@ impl CowFs {
                 .min()
                 .unwrap_or(chunk_end)
                 .min(chunk_end);
-            let goal = if lb > 0 {
-                self.extents(ino, lb - 1, lb)?
-                    .first()
-                    .map(|e| e.pblk + (lb - e.lblk))
-            } else {
-                None
-            };
+            let goal = self.goal(ino, lb)?;
             let (p, n) = self
                 .sp
                 .alloc_data(goal, hole_end - lb)
@@ -2498,7 +2896,10 @@ impl CowFs {
                     for (k, d) in &items {
                         if let Some((s, l)) = extent_of(k, d) {
                             own(&mut owners, total, s, l)?;
-                            if matches!(FileExtent::decode(d)?, FileExtent::Reg { .. }) {
+                            if matches!(
+                                FileExtent::decode(d)?,
+                                FileExtent::Reg { .. } | FileExtent::Comp(_)
+                            ) {
                                 data.insert(s, l);
                             }
                         }
@@ -2653,6 +3054,15 @@ impl CowFs {
                         }
                         *bytes.entry(k.objectid).or_default() += v.len() as u64;
                     }
+                    FileExtent::Comp(c) => {
+                        regs.push((k.objectid, c.disk, c.disk_blocks));
+                        let end = last_ext_end.entry(k.objectid).or_default();
+                        if k.offset % BS != 0 || k.offset / BS < *end {
+                            return Err(Error::Corrupt("fsck: overlapping extents"));
+                        }
+                        *end = k.offset / BS + c.blocks;
+                        *bytes.entry(k.objectid).or_default() += c.blocks * BS;
+                    }
                     FileExtent::Prealloc { blocks, .. } => {
                         let end = last_ext_end.entry(k.objectid).or_default();
                         if k.offset % BS != 0 || k.offset / BS < *end {
@@ -2789,7 +3199,10 @@ impl CowFs {
                 Body::Leaf(items) => {
                     for (k, d) in &items {
                         if let Some((s, l)) = extent_of(k, d) {
-                            if matches!(FileExtent::decode(d), Ok(FileExtent::Reg { .. })) {
+                            if matches!(
+                                FileExtent::decode(d),
+                                Ok(FileExtent::Reg { .. } | FileExtent::Comp(_))
+                            ) {
                                 data.insert(s, l);
                             }
                         } else if k.ty == ROOT_ITEM {

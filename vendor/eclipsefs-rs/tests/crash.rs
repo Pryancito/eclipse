@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex};
 
 use common::*;
 use eclipsefs::device::BlockDevice;
-use eclipsefs::{mkfs, EclipseFS, Error, FileKind};
+use eclipsefs::{mkfs, Compression, EclipseFS, Error, FileKind};
 
 #[derive(Clone)]
 enum Event {
@@ -167,6 +167,11 @@ fn workload(seed: u64, ops: usize, size: usize, format: Mkfs, cow: bool) -> Run 
     let rec = Recorder::new(base.clone());
     let mut fs = EclipseFS::mount(rec.clone(), false).unwrap();
     fs.set_clock(clock);
+    // Some v0.4 runs compress everything (seeds 1 mod 4).
+    if cow && seed % 4 == 1 {
+        let algo = Compression::ALL[(seed / 4 % 3) as usize];
+        fs.set_mount_compression(Some(algo)).unwrap();
+    }
     let root = fs.root_ino();
     let mut rng = Lcg(seed);
     let mut states = vec![hash(&snapshot(&mut fs))];
@@ -320,6 +325,23 @@ fn workload(seed: u64, ops: usize, size: usize, format: Mkfs, cow: bool) -> Run 
             fallocs,
             xattrs
         );
+        if seed % 4 == 1 {
+            fs.sync().unwrap();
+            let mut stack = vec![root];
+            let mut extents = 0;
+            while let Some(d) = stack.pop() {
+                for e in fs.readdir(d).unwrap() {
+                    match e.kind {
+                        FileKind::Dir => stack.push(e.ino),
+                        FileKind::Regular => {
+                            extents += fs.compsize(e.ino).unwrap().compressed_extents
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            assert!(extents > 0, "nothing was compressed");
+        }
     }
     drop(fs);
     let log = rec.log.lock().unwrap().clone();
@@ -401,6 +423,11 @@ fn crash_at_every_point_of_a_workload() {
 #[test]
 fn crash_at_every_point_of_a_v3_workload() {
     crash_everywhere(1, 250, mkfs::format_v3, false);
+}
+
+#[test]
+fn crash_at_every_point_of_a_zstd_workload() {
+    crash_everywhere(9, 250, mkfs::format, true);
 }
 
 #[test]

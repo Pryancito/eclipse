@@ -248,6 +248,16 @@ impl BlockSpace {
         Some(r)
     }
 
+    /// Exactly `n` contiguous data blocks, near `goal` if possible.
+    pub fn alloc_data_run(&mut self, goal: Option<u64>, n: u64) -> Option<u64> {
+        if self.alloc.free_blocks().checked_sub(self.reserve)? < n {
+            return None;
+        }
+        let r = self.alloc.allocate_run(goal, n)?;
+        self.fresh.insert(r, n);
+        Some(r)
+    }
+
     /// Whether `start..start+len` was allocated by this transaction and has
     /// a single owner, so it can be rewritten in place.
     pub fn private_fresh(&self, start: u64, len: u64) -> bool {

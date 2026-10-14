@@ -58,7 +58,9 @@ Paso 1 de la paridad con btrfs. Todo vive en árboles B+ copy-on-write
   un bloque dañado da `Corrupt("data checksum")` (EIO), sin afectar al resto
   del archivo. `EclipseFS::scrub()` lee del disco cada nodo y cada bloque de
   datos y devuelve los dañados; `check()` exige que cada bloque de datos
-  tenga checksum. En x86_64 el CRC32C usa la instrucción SSE4.2.
+  tenga checksum. En x86_64 el CRC32C usa la instrucción `crc32` de SSE4.2,
+  con ensamblador en línea para que también compile en el target soft-float
+  del kernel.
 - Confirmación: nodos nuevos → `sync` → superbloque y mapas de bits juntos por
   el journal. Tras un corte de luz se ve el estado viejo o el nuevo entero,
   **contenido de archivos incluido** (sobrescrituras y truncados a mitad de
@@ -95,6 +97,20 @@ Paso 1 de la paridad con btrfs. Todo vive en árboles B+ copy-on-write
   (libera los bloques enteros y escribe ceros en los bordes) y `ZERO_RANGE`.
   Lo reservado son extents `PREALLOC`, que se leen como ceros hasta que se
   escriben.
+- **Compresión** (fase 5): zlib (como btrfs), LZ4 y zstd, en `no_std`
+  (`miniz_oxide`, `lz4_flex`, `ruzstd`). Se activa con la opción de montaje
+  `set_mount_compression` (`compress=`, no se guarda en disco), con la
+  propiedad por archivo `set_compression` (heredada por lo que se crea en un
+  directorio) o con `chattr +c` (`FL_COMPR`, zlib). No-COW y `FL_NOCOMP`
+  la desactivan. Un extent comprimido guarda hasta 128 KiB de archivo
+  (`EXT_COMPRESSED`: algoritmo, bloques en disco, bloques de archivo y el
+  trozo que mapea); solo se guarda comprimido si ahorra al menos un bloque.
+  Las escrituras de 128 KiB se comprimen al momento; las pequeñas se
+  escriben tal cual y se comprimen juntas al confirmar la transacción, así
+  un archivo escrito poco a poco también acaba comprimido. Los checksums
+  cubren los bloques comprimidos, los snapshots y reflinks comparten extents
+  comprimidos (también trozos de ellos) y `compsize` da bytes en disco y sin
+  comprimir.
 - `EclipseFS::mount` detecta la versión: las imágenes v0.3 siguen montando con
   su driver (`v3.rs`). `mkfs::format_v3` sigue disponible.
 
@@ -135,7 +151,7 @@ grupo k (32768 bloques = 128 MiB)
 2. ~~Checksums de datos y scrub~~ (la reparación llega con DUP/RAID en la fase 7).
 3. ~~Subvolúmenes, snapshots rw/ro, reflinks y dedupe~~.
 4. ~~xattrs/ACL, atributos (inmutable, append, nocow), fallocate y huecos~~.
-5. Compresión zlib, lz4 y zstd.
+5. ~~Compresión zlib, lz4 y zstd~~.
 6. send/receive incremental y cuotas.
 7. Multidispositivo (DUP, RAID0/1/10), añadir/quitar, balance y encoger.
 8. ioctls del kernel e imágenes del instalador con EclipseFS.
@@ -172,6 +188,12 @@ cargo test --release -p eclipsefs --features std
   checksums), fallocate en todos sus modos y extents reservados a través de
   snapshots y reflinks. La carga de crash también hace fallocate y xattrs, y
   los xattrs forman parte del estado que se compara.
+- `tests/compress.rs`: los tres algoritmos ahorran espacio y se leen sin la
+  opción de montaje, datos incompresibles, propiedad por archivo y herencia,
+  `chattr +c`/`+m`, escrituras pequeñas y entre confirmaciones, sobrescrituras
+  y truncados dentro de un extent, snapshots y reflinks de trozos, bloques
+  comprimidos dañados y disco lleno. Dos cargas de crash comprimen todo (zlib
+  y zstd), incluida la compactación al confirmar.
 - Los tests que dependen del formato corren en las dos versiones (`*_v3`).
 - `tests/performance.rs`: las mismas cargas sobre EclipseFS y btrfs, con tiempo
   y bytes leídos/escritos en el dispositivo. `scripts/eclipsefs-bench.sh` las

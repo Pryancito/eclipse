@@ -16,6 +16,7 @@ use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 
+use crate::compress::Compression;
 use crate::cow::CowFs;
 use crate::device::BlockDevice;
 use crate::format::{FileKind, BLOCK_SIZE, MAGIC};
@@ -49,6 +50,15 @@ pub struct InodeStat {
     pub atime: (u64, u32),
     pub mtime: (u64, u32),
     pub ctime: (u64, u32),
+}
+
+/// How much a file's data takes on disk (see [`EclipseFS::compsize`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CompSize {
+    pub disk_bytes: u64,
+    pub uncompressed_bytes: u64,
+    /// Pieces of compressed extents the file maps.
+    pub compressed_extents: u64,
 }
 
 /// statfs-style numbers.
@@ -400,6 +410,29 @@ impl EclipseFS {
     /// hole (`PUNCH_HOLE | KEEP_SIZE`) or zero a range (`ZERO_RANGE`).
     pub fn fallocate(&mut self, ino: u64, mode: u32, offset: u64, len: u64) -> Result<()> {
         self.cow()?.fallocate(ino, mode, offset, len)
+    }
+
+    /// `compress=` mount option: compress new data of every file (not the
+    /// no-COW or no-compression ones) with `algo`. Not stored on disk.
+    pub fn set_mount_compression(&mut self, algo: Option<Compression>) -> Result<()> {
+        self.cow()?.set_mount_compression(algo);
+        Ok(())
+    }
+
+    /// Compression property of `ino` (`btrfs property get ... compression`).
+    pub fn compression(&mut self, ino: u64) -> Result<Option<Compression>> {
+        self.cow()?.compression(ino)
+    }
+
+    /// Compress new data of `ino` with `algo` (or stop); a directory passes
+    /// it on to files created in it.
+    pub fn set_compression(&mut self, ino: u64, algo: Option<Compression>) -> Result<()> {
+        self.cow()?.set_compression(ino, algo)
+    }
+
+    /// Disk and file bytes of a file's data (as `compsize` reports).
+    pub fn compsize(&mut self, ino: u64) -> Result<CompSize> {
+        self.cow()?.compsize(ino)
     }
 
     /// Read every tree node and data block from the device and verify its

@@ -168,6 +168,23 @@ impl AllocationGroup {
         Some((start, len))
     }
 
+    /// `n` contiguous free blocks at or after `from` (first fit).
+    pub fn allocate_run(&mut self, from: u64, n: u64) -> Option<u64> {
+        if self.free_blocks < n || n == 0 {
+            return None;
+        }
+        let mut off = from.min(self.block_count);
+        while let Some(start) = self.next_free(off) {
+            let len = self.run_len(start, n);
+            if len == n {
+                self.set_range(start, n, true);
+                return Some(start);
+            }
+            off = start + len;
+        }
+        None
+    }
+
     /// Free `len` blocks at group-relative `off`, refusing a double free.
     pub fn free(&mut self, off: u64, len: u64) -> Result<()> {
         if off + len > self.block_count || off < 2 {
@@ -274,6 +291,29 @@ impl BlockAllocator {
             if let Some((off, len)) = g.allocate(from, max) {
                 self.cursor = gi;
                 return Some((g.start_block + off, len));
+            }
+        }
+        None
+    }
+
+    /// Exactly `n` contiguous blocks, after `goal` if possible.
+    pub fn allocate_run(&mut self, goal: Option<u64>, n: u64) -> Option<u64> {
+        let groups = self.groups.len();
+        let (first, from) = match goal {
+            Some(g) if ((g / GROUP_BLOCKS) as usize) < groups => {
+                ((g / GROUP_BLOCKS) as usize, g % GROUP_BLOCKS)
+            }
+            _ => (self.cursor.min(groups.max(1) - 1), 0),
+        };
+        // The goal's group from the goal on, every other group, then the
+        // start of the goal's group.
+        for i in 0..=groups {
+            let gi = (first + i) % groups.max(1);
+            let g = self.groups.get_mut(gi)?;
+            let from = if i == 0 { from } else { 0 };
+            if let Some(off) = g.allocate_run(from, n) {
+                self.cursor = gi;
+                return Some(g.start_block + off);
             }
         }
         None

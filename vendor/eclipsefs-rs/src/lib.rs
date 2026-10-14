@@ -29,6 +29,7 @@ extern crate log;
 
 pub mod blocks;
 pub mod btree;
+pub mod compress;
 pub mod cow;
 pub mod cowfmt;
 pub mod crc;
@@ -41,9 +42,12 @@ pub mod mkfs;
 pub mod space;
 pub mod v3;
 
+pub use compress::Compression;
 pub use device::BlockDevice;
 pub use format::FileKind;
-pub use fs::{CheckReport, DirEntry, EclipseFS, FsStat, InodeStat, ScrubReport, SubvolInfo};
+pub use fs::{
+    CheckReport, CompSize, DirEntry, EclipseFS, FsStat, InodeStat, ScrubReport, SubvolInfo,
+};
 
 /// Version of the on-disk format new filesystems get (v0.4.0).
 pub const ECLIPSEFS_VERSION: u32 = cowfmt::VERSION4;

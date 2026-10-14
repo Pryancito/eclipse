@@ -113,17 +113,40 @@ mod hw {
     }
 
     /// Raw (not inverted) CRC32C state over `data`.
-    #[target_feature(enable = "sse4.2")]
+    ///
+    /// Inline assembly instead of the SSE4.2 intrinsics: those need the
+    /// `sse4.2` target feature, which soft-float kernel targets (like
+    /// zCore's, `-sse`) cannot enable, while `crc32` only uses
+    /// general-purpose registers.
+    ///
+    /// # Safety
+    ///
+    /// The CPU must support SSE4.2 ([`available`]).
     pub unsafe fn update(crc: u32, data: &[u8]) -> u32 {
-        use core::arch::x86_64::{_mm_crc32_u64, _mm_crc32_u8};
         let (chunks, rest) = data.as_chunks::<8>();
         let mut c = crc as u64;
         for ch in chunks {
-            c = _mm_crc32_u64(c, u64::from_le_bytes(*ch));
+            // SAFETY: the caller checked for SSE4.2.
+            unsafe {
+                core::arch::asm!(
+                    "crc32 {c}, {v}",
+                    c = inout(reg) c,
+                    v = in(reg) u64::from_le_bytes(*ch),
+                    options(pure, nomem, nostack, preserves_flags),
+                );
+            }
         }
         let mut c = c as u32;
         for &b in rest {
-            c = _mm_crc32_u8(c, b);
+            // SAFETY: as above.
+            unsafe {
+                core::arch::asm!(
+                    "crc32 {c:e}, {v}",
+                    c = inout(reg) c,
+                    v = in(reg_byte) b,
+                    options(pure, nomem, nostack, preserves_flags),
+                );
+            }
         }
         c
     }

@@ -31,6 +31,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::btree::{Key, Root};
+pub use crate::compress::{Compression, ZCHUNK};
 use crate::crc::{crc32, crc32c};
 use crate::format::{
     le16, le32, le64, put32, put64, FileKind, BLOCK_SIZE, GROUP_BLOCKS, MAGIC, MIN_GROUP_BLOCKS,
@@ -333,8 +334,12 @@ pub const EXT_INLINE: u8 = 0;
 pub const EXT_REG: u8 = 1;
 /// Allocated by `fallocate`, never written: reads as zeros, no checksums.
 pub const EXT_PREALLOC: u8 = 2;
+/// Compressed: `disk_blocks` blocks at `disk` hold `ram_blocks` file
+/// blocks; the item maps `blocks` of them from `offset` on.
+pub const EXT_COMPRESSED: u8 = 3;
 const EXT_HDR: usize = 8;
 const EXT_REG_SIZE: usize = 24;
+const EXT_COMP_SIZE: usize = 48;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FileExtent {
@@ -344,6 +349,21 @@ pub enum FileExtent {
     Reg { disk: u64, blocks: u64 },
     /// Same, reserved by `fallocate` and not written yet (reads as zeros).
     Prealloc { disk: u64, blocks: u64 },
+    /// File blocks `offset..offset+blocks` of a compressed extent.
+    Comp(Comp),
+}
+
+/// Where a compressed piece of a file lives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Comp {
+    pub algo: Compression,
+    pub disk: u64,
+    pub disk_blocks: u64,
+    /// File blocks the whole extent holds.
+    pub ram_blocks: u64,
+    /// First of them this item maps, and how many.
+    pub offset: u64,
+    pub blocks: u64,
 }
 
 impl FileExtent {
@@ -366,6 +386,17 @@ impl FileExtent {
                 put64(&mut b, 16, *blocks);
                 b
             }
+            FileExtent::Comp(c) => {
+                let mut b = vec![0u8; EXT_COMP_SIZE];
+                b[0] = EXT_COMPRESSED;
+                b[1] = c.algo.to_disk();
+                put64(&mut b, 8, c.disk);
+                put64(&mut b, 16, c.disk_blocks);
+                put64(&mut b, 24, c.ram_blocks);
+                put64(&mut b, 32, c.offset);
+                put64(&mut b, 40, c.blocks);
+                b
+            }
         }
     }
 
@@ -386,17 +417,42 @@ impl FileExtent {
                     FileExtent::Prealloc { disk, blocks }
                 })
             }
+            Some(&EXT_COMPRESSED) if b.len() == EXT_COMP_SIZE => {
+                let c = Comp {
+                    algo: Compression::from_disk(b[1])
+                        .ok_or(Error::Corrupt("compression algorithm"))?,
+                    disk: le64(b, 8),
+                    disk_blocks: le64(b, 16),
+                    ram_blocks: le64(b, 24),
+                    offset: le64(b, 32),
+                    blocks: le64(b, 40),
+                };
+                if c.disk_blocks == 0
+                    || c.disk_blocks >= c.ram_blocks
+                    || c.ram_blocks > ZCHUNK
+                    || c.blocks == 0
+                    || c.offset + c.blocks > c.ram_blocks
+                {
+                    return Err(Error::Corrupt("compressed extent item"));
+                }
+                Ok(FileExtent::Comp(c))
+            }
             _ => Err(Error::Corrupt("file extent item")),
         }
     }
 }
 
 /// Data blocks an item references (for reference counting).
+/// A compressed piece references every block of its extent.
 pub fn extent_of(k: &Key, d: &[u8]) -> Option<(u64, u64)> {
-    if k.ty != EXTENT_DATA || d.len() != EXT_REG_SIZE || !matches!(d[0], EXT_REG | EXT_PREALLOC) {
+    if k.ty != EXTENT_DATA {
         return None;
     }
-    Some((le64(d, 8), le64(d, 16)))
+    match (d.first(), d.len()) {
+        (Some(&(EXT_REG | EXT_PREALLOC)), EXT_REG_SIZE)
+        | (Some(&EXT_COMPRESSED), EXT_COMP_SIZE) => Some((le64(d, 8), le64(d, 16))),
+        _ => None,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -556,6 +612,24 @@ pub const FL_NOCOW: u32 = 0x0080_0000;
 /// Flags `set_flags` accepts.
 pub const FL_SETTABLE: u32 =
     FL_SYNC | FL_IMMUTABLE | FL_APPEND | FL_NODUMP | FL_NOATIME | FL_COMPR | FL_NOCOMP | FL_NOCOW;
+
+/// Bits of `InodeItem::flags` past the Linux ones: the algorithm new data
+/// of the inode is compressed with (`btrfs property set ... compression`).
+const ZALGO_SHIFT: u32 = 32;
+const ZALGO_MASK: u64 = 0xFF << ZALGO_SHIFT;
+
+/// Flags a new inode takes from its directory (as on btrfs), compression
+/// property included.
+pub const FL_INHERITED: u64 = (FL_NOCOW | FL_COMPR | FL_NOCOMP) as u64 | ZALGO_MASK;
+
+pub fn inode_compression(i: &InodeItem) -> Option<Compression> {
+    Compression::from_disk(((i.flags & ZALGO_MASK) >> ZALGO_SHIFT) as u8)
+}
+
+pub fn set_inode_compression(i: &mut InodeItem, algo: Option<Compression>) {
+    let v = algo.map_or(0, |a| a.to_disk() as u64);
+    i.flags = (i.flags & !ZALGO_MASK) | v << ZALGO_SHIFT;
+}
 
 // ---------------------------------------------------------------------------
 // Extended attributes
