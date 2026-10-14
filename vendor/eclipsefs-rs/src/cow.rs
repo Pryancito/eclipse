@@ -1156,19 +1156,38 @@ impl CowFs {
     /// Read file bytes `off..off+buf.len()` (no size check; holes are 0),
     /// verifying the checksum of every block read.
     fn read_blocks(&mut self, ino: u64, off: u64, buf: &mut [u8]) -> Result<()> {
-        buf.fill(0);
+        if buf.is_empty() {
+            return Ok(());
+        }
+        // No-COW files have no checksums (as on btrfs).
+        let sums = self.inode(ino)?.flags & FL_NOCOW as u64 == 0;
+        self.read_blocks_with(ino, sums, off, buf)
+    }
+
+    /// [`read_blocks`](Self::read_blocks) for a caller that already has the
+    /// inode: `sums` says whether its blocks carry checksums.
+    fn read_blocks_with(&mut self, ino: u64, sums: bool, off: u64, buf: &mut [u8]) -> Result<()> {
         if buf.is_empty() {
             return Ok(());
         }
         let end = off + buf.len() as u64;
-        // No-COW files have no checksums (as on btrfs).
-        let sums = self.inode(ino)?.flags & FL_NOCOW as u64 == 0;
+        // Extents come in file order and do not overlap, so only the gaps
+        // between them (holes, preallocated space) are zeroed, not the
+        // whole buffer before it is read over.
+        let mut zeroed_to = off;
         for e in self.extents(ino, off / BS, end.div_ceil(BS))? {
             if e.prealloc {
                 continue;
             }
             let s = (e.lblk * BS).max(off);
             let t = ((e.lblk + e.blocks) * BS).min(end);
+            if s >= t {
+                continue;
+            }
+            if s > zeroed_to {
+                buf[(zeroed_to - off) as usize..(s - off) as usize].fill(0);
+            }
+            zeroed_to = zeroed_to.max(t);
             if let Some(z) = e.z {
                 let ram = self.unpacked(e.pblk, z)?;
                 let at = (z.offset * BS + (s - e.lblk * BS)) as usize;
@@ -1195,6 +1214,9 @@ impl CowFs {
                 }
                 pos = upto;
             }
+        }
+        if zeroed_to < end {
+            buf[(zeroed_to - off) as usize..].fill(0);
         }
         Ok(())
     }
@@ -2119,14 +2141,20 @@ impl CowFs {
             return Ok(0);
         }
         let n = (buf.len() as u64).min(i.size - offset) as usize;
-        if let Some(v) = self.inline_data(ino)? {
-            let o = offset as usize;
-            let avail = v.len().saturating_sub(o).min(n);
-            buf[..avail].copy_from_slice(&v[o..o + avail]);
-            buf[avail..n].fill(0);
-            return Ok(n);
+        // Inline data never outgrows INLINE_MAX (writes and truncates move
+        // it to extents first, and fsck checks it), so a larger file has
+        // none and its read skips that lookup.
+        if i.size <= INLINE_MAX as u64 {
+            if let Some(v) = self.inline_data(ino)? {
+                let o = offset as usize;
+                let avail = v.len().saturating_sub(o).min(n);
+                buf[..avail].copy_from_slice(&v[o..o + avail]);
+                buf[avail..n].fill(0);
+                return Ok(n);
+            }
         }
-        self.read_blocks(ino, offset, &mut buf[..n])?;
+        let sums = i.flags & FL_NOCOW as u64 == 0;
+        self.read_blocks_with(ino, sums, offset, &mut buf[..n])?;
         Ok(n)
     }
 
@@ -3643,6 +3671,9 @@ impl CowFs {
                     FileExtent::Inline(v) => {
                         if k.offset != 0 {
                             return Err(Error::Corrupt("fsck: inline extent offset"));
+                        }
+                        if v.len() > INLINE_MAX {
+                            return Err(Error::Corrupt("fsck: inline extent too large"));
                         }
                         *bytes.entry(k.objectid).or_default() += v.len() as u64;
                     }

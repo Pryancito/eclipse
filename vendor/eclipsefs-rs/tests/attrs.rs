@@ -692,3 +692,34 @@ fn preallocated_extents_survive_snapshots_and_clones() {
     fs.unlink(root, "clone").unwrap();
     clean(&mut fs);
 }
+
+/// A read fills every byte of the caller's buffer: data from extents and
+/// zeros for holes, preallocated blocks and the unaligned edges, even when
+/// the buffer held something else before (reads zero only the gaps).
+#[test]
+fn reads_overwrite_a_dirty_buffer_with_holes_and_preallocated_zeros() {
+    let (disk, mut fs) = fresh(16 * MIB);
+    let root = fs.root_ino();
+    let f = fs.create(root, "sparse", FileKind::Regular, 0o644, 0).unwrap();
+    let a = random(3 * BLOCK, 1);
+    let b = random(BLOCK + 100, 2);
+    // data | hole | prealloc | data | hole up to the size
+    write_all(&mut fs, f, 0, &a);
+    fs.fallocate(f, FALLOC_FL_KEEP_SIZE, (6 * BLOCK) as u64, (2 * BLOCK) as u64)
+        .unwrap();
+    write_all(&mut fs, f, (9 * BLOCK + 7) as u64, &b);
+    fs.truncate(f, (14 * BLOCK) as u64).unwrap();
+    let mut want = vec![0u8; 14 * BLOCK];
+    want[..a.len()].copy_from_slice(&a);
+    want[9 * BLOCK + 7..9 * BLOCK + 7 + b.len()].copy_from_slice(&b);
+    let mut fs = remount(&disk, fs);
+    let mut rng = Lcg(9);
+    for _ in 0..200 {
+        let off = rng.below(want.len() as u64) as usize;
+        let len = 1 + rng.below((want.len() - off) as u64) as usize;
+        let mut buf = vec![0xA5u8; len];
+        assert_eq!(fs.read(f, off as u64, &mut buf).unwrap(), len);
+        assert_eq!(buf, want[off..off + len], "read {off}+{len}");
+    }
+    clean(&mut fs);
+}
