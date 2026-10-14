@@ -664,3 +664,128 @@ mod which_child {
         );
     }
 }
+
+/// The zombie bookkeeping: `reaped_children`, and the mark that keeps a
+/// late death notify from writing a second record for a child somebody
+/// already collected.
+///
+/// Three lines implement it -- the `waited_without_zombie` insert in
+/// [`claim_exited_child`], the early return it drives in
+/// [`LinuxProcess::record_child_exit`], and the `reaped_children` removal in
+/// [`LinuxProcess::forget_child`] -- and a mutation run found that breaking
+/// any of the three left all 3098 tests of this crate green. What each one
+/// prevents is a pid reaped TWICE: `waitpid` answering a second time for a
+/// child the caller already buried, which a shell reads as a job that
+/// finished twice.
+///
+/// The window is the same one [`what_a_wait_collects`] builds by hand: a
+/// child that has exited and whose `PROCESS_TERMINATED` callback has not run
+/// yet. The helper below asserts its own precondition, because a helper that
+/// silently started WITH a zombie record would send every test in here down
+/// the recorded-exit path and they would all still pass.
+mod the_zombie_bookkeeping {
+    use super::*;
+
+    /// A child that has exited and that nothing has recorded yet.
+    fn exited_in_the_window(parent: &Arc<Process>, code: i64) -> Arc<Process> {
+        extern crate std;
+        let child = Process::fork_from(parent).unwrap();
+        child.exit(code);
+        // `exit` runs the death notify straight away here, so undo both
+        // halves of it: drop the record it wrote, and put the child back on
+        // the list it took it off. That is the state one instant earlier,
+        // not a state the kernel never has.
+        parent.linux().forget_child(child.id());
+        assert!(
+            async_std::task::block_on(wait_child(parent, child.id(), true, false)).is_err(),
+            "the window has to START with no record, or nothing below is testing the live path"
+        );
+        parent
+            .linux()
+            .inner
+            .lock()
+            .children
+            .insert(child.id(), child.clone());
+        child
+    }
+
+    /// A reaping wait took the live exit; the notify arrives afterwards. The
+    /// mark is what tells it the child is already buried.
+    #[test]
+    fn a_wait_that_collected_a_live_exit_leaves_no_zombie_behind() {
+        extern crate std;
+        let parent = a_parent(93_551);
+        let child = exited_in_the_window(&parent, 3);
+        let (pid, status, _) =
+            scan_waitable_children(&parent, true, WaitInterest::EXITED_ONLY, None)
+                .expect("the exited child is collectable")
+                .expect("and this waiter won the claim");
+        assert_eq!(pid, child.id());
+        assert_eq!(status, wait_status_exited(3));
+        parent.linux().record_child_exit(
+            child.id(),
+            3,
+            ChildCpu::default(),
+            effective_pgid(&child),
+        );
+        assert!(
+            scan_waitable_children(&parent, true, WaitInterest::EXITED_ONLY, None).is_none(),
+            "a second record for a collected child is a pid reaped twice"
+        );
+        assert_eq!(
+            async_std::task::block_on(wait_child(&parent, child.id(), true, true)).err(),
+            Some(LxError::ECHILD),
+            "and `waitpid` on it says there is no such child any more"
+        );
+    }
+
+    /// `WNOWAIT` consumed nothing, so the notify still owes a zombie: the
+    /// mark belongs to waiters that REAPED, not to every one that looked.
+    /// The other direction of the test above, and the one that fails if the
+    /// mark is made unconditional.
+    #[test]
+    fn a_peek_that_reaped_nothing_still_leaves_the_exit_to_be_collected() {
+        let parent = a_parent(93_552);
+        let child = exited_in_the_window(&parent, 7);
+        let (pid, _, _) = scan_waitable_children(&parent, false, WaitInterest::EXITED_ONLY, None)
+            .expect("a peek sees the exit")
+            .expect("and reports it");
+        assert_eq!(pid, child.id());
+        // The notify takes the child off the list and leaves the record, so
+        // from here the only thing that can answer is the record itself.
+        parent.linux().record_child_exit(
+            child.id(),
+            7,
+            ChildCpu::default(),
+            effective_pgid(&child),
+        );
+        let (again, status, _) =
+            scan_waitable_children(&parent, true, WaitInterest::EXITED_ONLY, None)
+                .expect("the peek left it for a real wait")
+                .expect("which collects it");
+        assert_eq!((again, status), (child.id(), wait_status_exited(7)));
+    }
+
+    /// `SIGCHLD` ignored (or `SA_NOCLDWAIT`): the child is released outright,
+    /// and a `wait` for it ends `ECHILD`, which is what POSIX says. Leaving
+    /// the record behind hands the caller a status for a child the kernel
+    /// already let go.
+    #[test]
+    fn forgetting_a_child_leaves_nothing_for_a_later_wait() {
+        extern crate std;
+        let parent = a_parent(93_553);
+        parent
+            .linux()
+            .record_child_exit(424_251, 5, ChildCpu::default(), 93_553);
+        parent.linux().forget_child(424_251);
+        assert!(
+            scan_waitable_children(&parent, true, WaitInterest::EXITED_ONLY, None).is_none(),
+            "the child was released, so there is nothing to collect"
+        );
+        assert_eq!(
+            async_std::task::block_on(wait_child(&parent, 424_251, true, true)).err(),
+            Some(LxError::ECHILD),
+            "a wait for a released child ends ECHILD, not with its status"
+        );
+    }
+}
