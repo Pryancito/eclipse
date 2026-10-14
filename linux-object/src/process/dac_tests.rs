@@ -225,3 +225,152 @@ fn setreuid_with_nothing_to_do_leaves_the_saved_id_alone() {
         "setting the effective id back to the real one is not a new identity"
     );
 }
+
+/// The creation mask: which of the bits a program asks for when it creates
+/// something actually land.
+///
+/// `apply_umask` is the whole of it, and it is on the `open(O_CREAT)`,
+/// `mkdir`, `mknod` and `O_TMPFILE` paths -- every way a process makes a
+/// file. A mutation run replaced its body with `mode`, so the mask was
+/// ignored outright, and all 3109 tests of the crate stayed green: a
+/// `open(path, O_CREAT, 0o666)` under the default `0o022` would have landed
+/// a **world-writable** file where it must land `0o644`.
+///
+/// `set_umask`'s own `& 0o777` had no test either: `umask(2)` takes an int
+/// and only nine bits of it are a mask.
+mod the_creation_mask {
+    use crate::process::LinuxProcess;
+    use rcore_fs_ramfs::RamFS;
+
+    fn a_process_with_umask(mask: u16) -> LinuxProcess {
+        let proc = LinuxProcess::new(RamFS::new(), 0);
+        proc.set_umask(mask);
+        proc
+    }
+
+    /// The default `0o022`: the group and other write bits are the ones the
+    /// mask takes away, and nothing else moves.
+    #[test]
+    fn the_umask_bits_are_the_ones_that_do_not_land() {
+        let proc = a_process_with_umask(0o022);
+        assert_eq!(
+            proc.apply_umask(0o666),
+            0o644,
+            "a file asking for rw-rw-rw-"
+        );
+        assert_eq!(
+            proc.apply_umask(0o777),
+            0o755,
+            "a directory asking for rwxrwxrwx"
+        );
+    }
+
+    /// A mask of zero grants exactly what was asked, which is the case that
+    /// makes the test above about the MASK and not about the constant.
+    #[test]
+    fn a_mask_of_zero_lands_what_was_asked() {
+        let proc = a_process_with_umask(0);
+        assert_eq!(proc.apply_umask(0o666), 0o666);
+        assert_eq!(proc.apply_umask(0o777), 0o777);
+    }
+
+    /// The mask only ever takes bits AWAY: whatever it is and whatever is
+    /// asked for, the answer is a subset of the request and shares no bit
+    /// with the mask. A mask that granted a bit nobody asked for would be a
+    /// file more open than the program that made it ever said.
+    #[test]
+    fn the_mask_can_only_take_bits_away() {
+        for mask in [0u16, 0o002, 0o022, 0o077, 0o777, 0o027] {
+            let proc = a_process_with_umask(mask);
+            for asked in [0o000u16, 0o600, 0o644, 0o666, 0o700, 0o755, 0o777] {
+                let landed = proc.apply_umask(asked);
+                assert_eq!(landed & !asked, 0, "mask {mask:o} added a bit to {asked:o}");
+                assert_eq!(landed & mask, 0, "mask {mask:o} left one of its own bits");
+            }
+        }
+    }
+
+    /// `umask(2)` returns the PREVIOUS mask -- a program reads its own mask
+    /// by setting it and putting it back -- and keeps only the nine
+    /// permission bits of what it is given.
+    #[test]
+    fn setting_the_mask_answers_with_the_old_one_and_keeps_nine_bits() {
+        let proc = a_process_with_umask(0o022);
+        assert_eq!(proc.set_umask(0o077), 0o022, "the previous mask");
+        assert_eq!(proc.umask(), 0o077);
+        // Everything above the bottom nine bits is not a mask: the type bits
+        // of a mode would otherwise sit in it and take permissions away
+        // from every file the process went on to create.
+        assert_eq!(proc.set_umask(0o17777), 0o077);
+        assert_eq!(proc.umask(), 0o777);
+    }
+}
+
+/// What it takes to change what is IN a directory -- create a file, remove
+/// one, rename one -- as opposed to reading the directory itself.
+///
+/// Linux asks `may_delete`/`may_create` for `MAY_WRITE | MAY_EXEC` on the
+/// parent, and both halves matter. Write without search is a directory whose
+/// names you may not resolve, so you may not name an entry to remove either;
+/// search without write is the ordinary case of a directory you can walk
+/// through and not modify (`/usr/bin` for everybody). A check that asked for
+/// only one of the two would let a process mutate a directory it has no
+/// business reaching into, which is the permissive direction.
+///
+/// These go through a real inode rather than [`LinuxProcess::access_verdict`]
+/// because what is being pinned is the pair of bits the CALLER asks for: a
+/// mutation run dropped `ACCESS_EXEC` from `check_directory_write` and the
+/// whole crate stayed green.
+mod the_right_to_change_a_directory {
+    use crate::error::LxError;
+    use crate::process::LinuxProcess;
+    use alloc::sync::Arc;
+    use rcore_fs::vfs::{FileSystem, FileType, INode};
+    use rcore_fs_ramfs::RamFS;
+
+    /// A directory of `mode`, owned by uid 1000, and a process that is that
+    /// user -- not root, which `CAP_DAC_OVERRIDE` would carry past every bit
+    /// here.
+    fn a_directory_owned_by_the_caller(mode: u16) -> (LinuxProcess, Arc<dyn INode>) {
+        let dir: Arc<dyn INode> = RamFS::new()
+            .root_inode()
+            .create("d", FileType::Dir, u32::from(mode))
+            .unwrap();
+        let mut meta = dir.metadata().unwrap();
+        meta.uid = 1000;
+        meta.mode = mode;
+        dir.set_metadata(&meta).unwrap();
+
+        let proc = super::super::dup_fd_tests::a_process();
+        proc.set_resuid(1000, 1000, 1000).unwrap();
+        (proc, dir)
+    }
+
+    #[test]
+    fn write_and_search_together_are_enough() {
+        let (proc, dir) = a_directory_owned_by_the_caller(0o300);
+        assert_eq!(proc.check_directory_write(&dir), Ok(()));
+    }
+
+    /// Write without search. This is the one the mutation survived.
+    #[test]
+    fn write_without_search_is_not_enough() {
+        let (proc, dir) = a_directory_owned_by_the_caller(0o200);
+        assert_eq!(
+            proc.check_directory_write(&dir),
+            Err(LxError::EACCES),
+            "a directory whose names cannot be resolved was reported writable"
+        );
+    }
+
+    /// And search without write is the ordinary read-only directory.
+    #[test]
+    fn search_without_write_is_not_enough() {
+        let (proc, dir) = a_directory_owned_by_the_caller(0o500);
+        assert_eq!(
+            proc.check_directory_write(&dir),
+            Err(LxError::EACCES),
+            "a directory the caller may only walk through was reported writable"
+        );
+    }
+}

@@ -594,8 +594,17 @@ mod endpoint_tests {
     }
 
     /// Idle ICMP must answer `FIONREAD` with 0, not fall through to ENOTTY.
+    ///
+    /// The lock and the drain are not decoration, they are what makes "idle"
+    /// mean anything: the ICMP receive queue is ONE queue for the whole
+    /// kernel, so a neighbour test that queues an echo reply makes this
+    /// socket's `FIONREAD` answer that reply's length. Without them this test
+    /// failed about one parallel run in three, naming a socket that was never
+    /// the problem.
     #[test]
     fn an_idle_icmp_socket_reports_zero_bytes_readable() {
+        let _g = crate::net::NET_TEST_LOCK.lock();
+        while icmp_rx::pop_for(false, None).is_some() {}
         let s = IcmpSocketState::new(false).unwrap();
         assert_eq!(FileLike::readable_bytes(&s), Some(0));
     }

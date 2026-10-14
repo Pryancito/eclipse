@@ -2643,6 +2643,15 @@ mod shared_vmo_registry_tests {
     use rcore_fs::vfs::{FileSystem, FsError, Metadata, PollStatus};
     use rcore_fs_ramfs::RamFS;
 
+    /// Serializes the four tests of this module. They share ONE registry, and
+    /// two of their assertions are about global state: `writes_under_lock`
+    /// counts "somebody held the registry lock", which in a parallel run is
+    /// as easily a neighbour test as the code under test, and a `take_prunable`
+    /// from one test evicts the entry another one just registered. Between
+    /// them they failed about one parallel run in three, always naming
+    /// whichever test lost the race rather than anything that was broken.
+    static REGISTRY_TEST_LOCK: lock::Mutex<()> = lock::Mutex::new(());
+
     /// What the probe saw, kept by the test: the probe inode itself must die
     /// with the registry entry, so it cannot hold the counters.
     #[derive(Default)]
@@ -2732,6 +2741,7 @@ mod shared_vmo_registry_tests {
     /// writer's `munmap`, which is what the wl_keyboard keymap depends on.
     #[test]
     fn eviction_writes_the_dirty_cache_back_to_the_file() {
+        let _g = REGISTRY_TEST_LOCK.lock();
         let (node, wrapper, probe) = probe_file(b"old content, to be overwritten..");
         register_dirty_cache(wrapper, b"NEW");
 
@@ -2757,6 +2767,7 @@ mod shared_vmo_registry_tests {
     /// off.
     #[test]
     fn eviction_writeback_runs_with_the_registry_lock_down() {
+        let _g = REGISTRY_TEST_LOCK.lock();
         let (_node, wrapper, probe) = probe_file(b"old content, to be overwritten..");
         register_dirty_cache(wrapper, b"NEW");
 
@@ -2779,18 +2790,22 @@ mod shared_vmo_registry_tests {
     /// lock.
     #[test]
     fn take_prunable_keeps_live_entries_and_hands_dead_ones_out_alive() {
+        let _g = REGISTRY_TEST_LOCK.lock();
         let (_live_node, live, _) = probe_file(b"still mapped");
         let live_vmo = inode_cache_vmo(&live, "live", 12, 0, PAGE_SIZE, false)
             .expect("the cache vmo should have been created");
 
-        let (_dead_node, dead, _) = probe_file(b"nobody holds this");
+        let (_dead_node, dead, dead_probe) = probe_file(b"nobody holds this");
         register_dirty_cache(dead, b"Z");
 
         let evicted = {
             let mut registry = SHARED_FILE_VMOS.lock();
             take_prunable(&mut registry)
         };
-        assert_eq!(evicted.len(), 1, "exactly the dead entry should be taken");
+        // What is asserted is IDENTITY, not how many rows the registry had:
+        // another module's test may have left a dead entry of its own in it,
+        // and a count would make this test about that instead.
+        assert!(!evicted.is_empty(), "nothing was taken at all");
         for (vmo, _, _) in &evicted {
             assert_eq!(
                 Arc::strong_count(vmo),
@@ -2799,6 +2814,15 @@ mod shared_vmo_registry_tests {
             );
         }
         finish_eviction(evicted);
+
+        // That THIS test's dead entry is one of the taken ones, asserted
+        // through its own probe: the writeback of an evicted entry goes to
+        // its inode, so a write the probe saw is that entry having been
+        // evicted and no other.
+        assert!(
+            dead_probe.writes.load(Ordering::SeqCst) > 0,
+            "the dead entry of this test was not among the ones taken"
+        );
 
         // The live one is untouched and still registered.
         assert!(

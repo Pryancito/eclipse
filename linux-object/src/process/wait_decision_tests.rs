@@ -789,3 +789,102 @@ mod the_zombie_bookkeeping {
         );
     }
 }
+
+/// What a stop leaves for `wait*` when something OTHER than a plain
+/// `SIGCONT` ends it: a kill, or a second stop signal.
+///
+/// Both lines these pin are stated in the code they test and neither had a
+/// test: a mutation run flipped [`LinuxProcess::job_wake_to_die`]'s
+/// `leave_stop(false)` to `true` and dropped
+/// [`LinuxProcess::job_stop`]'s idempotence guard, and all 3101 tests of the
+/// crate stayed green. What a shell sees of either is a line it prints:
+/// "Continued" for a job that was killed, or "Stopped" twice for one
+/// Ctrl-Z.
+mod a_stop_that_is_broken_or_repeated {
+    use super::*;
+
+    const STOPS: WaitInterest = WaitInterest {
+        exited: true,
+        stopped: true,
+        continued: false,
+    };
+    const CONTINUES: WaitInterest = WaitInterest {
+        exited: true,
+        stopped: false,
+        continued: true,
+    };
+
+    /// `job_wake_to_die` breaks the stop so the parked thread can run the
+    /// default SIGKILL action. It is not a continue, and a parent in
+    /// `wait(WCONTINUED)` must not be told that the process resumed: it did
+    /// not, it died.
+    #[test]
+    fn a_stop_broken_to_kill_the_process_is_not_a_continue() {
+        let proc = a_parent(93_561);
+        proc.linux().job_stop(&proc, LinuxSignal::SIGTSTP as u8);
+        proc.linux().job_wake_to_die(&proc);
+        assert_eq!(
+            proc.linux().take_wait_notification(CONTINUES, true),
+            None,
+            "the process was killed, not resumed"
+        );
+        // And the stop it was in is gone with it: there is nothing left to
+        // report about a process on its way out.
+        assert_eq!(proc.linux().take_wait_notification(STOPS, true), None);
+    }
+
+    /// The same for a stop that NOBODY collected first, which is the order a
+    /// `kill -9` on a Ctrl-Z'd job actually takes: the stop is still pending
+    /// when the kill arrives.
+    #[test]
+    fn a_kill_over_an_uncollected_stop_reports_neither() {
+        let proc = a_parent(93_562);
+        proc.linux().job_stop(&proc, LinuxSignal::SIGSTOP as u8);
+        assert_eq!(
+            proc.linux().take_wait_notification(STOPS, false),
+            Some(wait_status_stopped(LinuxSignal::SIGSTOP as u8)),
+            "the stop is pending, and the peek leaves it pending"
+        );
+        proc.linux().job_wake_to_die(&proc);
+        let both = WaitInterest {
+            exited: true,
+            stopped: true,
+            continued: true,
+        };
+        assert_eq!(
+            proc.linux().take_wait_notification(both, true),
+            None,
+            "neither a stop nor a continue survives the wake-to-die"
+        );
+    }
+
+    /// A second stop signal to a process that is ALREADY stopped changes
+    /// nothing: `job_stop` returns early. Without that, the stop goes
+    /// pending again and the parent is told a second time about one Ctrl-Z
+    /// -- a shell prints "Stopped" twice for a job that stopped once.
+    #[test]
+    fn a_second_stop_signal_does_not_report_the_stop_twice() {
+        let proc = a_parent(93_563);
+        proc.linux().job_stop(&proc, LinuxSignal::SIGTSTP as u8);
+        assert_eq!(
+            proc.linux().take_wait_notification(STOPS, true),
+            Some(wait_status_stopped(LinuxSignal::SIGTSTP as u8))
+        );
+        proc.linux().job_stop(&proc, LinuxSignal::SIGSTOP as u8);
+        assert_eq!(
+            proc.linux().take_wait_notification(STOPS, true),
+            None,
+            "it was already stopped, so there is no new stop to report"
+        );
+        // And the signal of the collected stop is not rewritten by the
+        // second one either: a `wait` that had not collected it yet would
+        // otherwise report SIGSTOP for a Ctrl-Z.
+        proc.linux().job_continue(&proc);
+        proc.linux().job_stop(&proc, LinuxSignal::SIGTSTP as u8);
+        assert_eq!(
+            proc.linux().take_wait_notification(STOPS, true),
+            Some(wait_status_stopped(LinuxSignal::SIGTSTP as u8)),
+            "a stop AFTER a continue is a new stop and does report"
+        );
+    }
+}

@@ -189,10 +189,31 @@ impl LinuxProcessInner {
     /// file is an epoll.
     ///
     /// Call it BEFORE the insert, with the file that is going in. It has to
-    /// remove as well as add, because `dup2` installs a descriptor over one
-    /// that is already open: an epoll replaced by an ordinary file would
-    /// otherwise leave its number in the set, and every later close would
-    /// then build a plan for an epoll that is not there.
+    /// remove as well as add: an epoll replaced by an ordinary file under the
+    /// same number would otherwise leave that number in the set, and every
+    /// later close would then build a plan for an epoll that is not there.
+    ///
+    /// The caller that needs the removal is not `dup2`, which this comment
+    /// used to name: `LinuxProcess::replace_file` frees the old entry
+    /// (`note_fd_freed`, which takes the number out of the set) before it
+    /// inserts the new one. It is `insert_file` over a number that is
+    /// ALREADY open -- a `HashMap::insert` that quietly drops whatever was
+    /// there -- and this `else` is what keeps `epoll_fds` straight if that
+    /// ever happens. What it cannot keep straight is the `holders` count of
+    /// the description that was dropped, because no `note_fd_freed` runs for
+    /// it: that count stays, so `holds_description` answers "still held"
+    /// forever and the close that should have told the epolls never does.
+    ///
+    /// The one way in was `LinuxProcess::add_file_at`, which handed
+    /// `insert_file` a number the caller chose with nothing checking that it
+    /// was free. It now goes through `replace_file`, which frees first, so no
+    /// path in the crate reaches `insert_file` over a live number today --
+    /// and a new one that does would leak a holder, which is why this `else`
+    /// stays and says so.
+    ///
+    /// A mutation run removed this `else` and left the whole crate green,
+    /// which is what sent somebody looking for the caller the comment
+    /// claimed.
     pub(super) fn note_fd_inserted(&mut self, fd: FileDesc, file: &Arc<dyn FileLike>) {
         if file.clone().downcast_arc::<crate::fs::Epoll>().is_ok() {
             self.epoll_fds.insert(fd);

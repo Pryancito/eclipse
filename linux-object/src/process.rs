@@ -2087,10 +2087,29 @@ impl LinuxProcess {
     }
 
     /// Add a file to the file descriptor table at given `fd`.
+    ///
+    /// The NUMBER comes from the caller and nothing promises it is free, so
+    /// this goes through [`Self::replace_file`] rather than straight to
+    /// `insert_file`. A plain `HashMap::insert` over a live entry drops the
+    /// file that was there without freeing its bookkeeping: the dropped
+    /// description keeps the `holders` count this insert did not take away,
+    /// so `holds_description` says it is still held forever and the close
+    /// that would have told the epolls about it never does. Going through
+    /// `replace_file` is the same single lock acquisition and frees first,
+    /// which is what `dup2` does with a caller-chosen number.
+    ///
+    /// The one check `replace_file` does not make is the limit on the number
+    /// itself: `insert_file` refuses an fd at or past `RLIMIT_NOFILE`, and a
+    /// number the caller chose is exactly the case that needs it, so it is
+    /// made here.
     pub fn add_file_at(&self, fd: FileDesc, file: Arc<dyn FileLike>) -> LxResult<FileDesc> {
+        let nofile = self.inner.lock().nofile();
+        if usize::from(fd) >= nofile {
+            return Err(LxError::EMFILE);
+        }
         let cloexec = opened_cloexec(&file);
-        let inner = self.inner.lock();
-        self.insert_file(inner, fd, file, cloexec)
+        self.replace_file(fd, file, cloexec)?;
+        Ok(fd)
     }
 
     /// Atomically replace the file at `fd` (Linux dup2 semantics): the old
