@@ -249,6 +249,21 @@ impl AllocationGroup {
         Ok(())
     }
 
+    /// Mark `off..off+len` (group-relative) in use, whatever part of it
+    /// already is.
+    pub fn mark_used(&mut self, off: u64, len: u64) {
+        for o in off..(off + len).min(self.block_count) {
+            if !self.is_used(o) {
+                self.set_range(o, 1, true);
+            }
+        }
+    }
+
+    /// Have the bitmap written with the next commit.
+    pub fn mark_dirty(&mut self) {
+        self.dirty = true;
+    }
+
     /// Shrink the (last) group to `new_count` blocks, all of whose blocks
     /// past that must be free.
     pub fn shrink(&mut self, new_count: u64) -> Result<()> {

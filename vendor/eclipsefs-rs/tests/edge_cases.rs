@@ -661,9 +661,15 @@ fn check_reports_damage_on((disk, mut fs): (std::sync::Arc<MemDisk>, EclipseFS))
     bm[200] |= 1;
     disk.write_at(4096, &bm).unwrap();
     let mut fs = EclipseFS::mount(disk.clone(), true).unwrap();
+    // v0.4 keeps checksums of the bitmaps (and repairs them in memory).
+    let v4 = u32::from_le_bytes(buf[12..16].try_into().unwrap()) >> 16 == 4;
     assert_eq!(
         fs.check().unwrap_err(),
-        Error::Corrupt("fsck: block marked used but unowned")
+        Error::Corrupt(if v4 {
+            "fsck: bitmap checksum"
+        } else {
+            "fsck: block marked used but unowned"
+        })
     );
 }
 

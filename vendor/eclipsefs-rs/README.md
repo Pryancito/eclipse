@@ -238,6 +238,17 @@ Con esto EclipseFS tiene todo lo de btrfs. Lo siguiente ya es propio.
   mantiene (`FEAT_FIXED_SIZE`: el montaje ya no crece hasta el
   dispositivo) hasta un `resize` a `max`. Kernel: `BTRFS_IOC_RESIZE`
   (`[devid:][+|-]tamaño[kmgtpe]` o `max`).
+- **Checksums de los mapas de bits del asignador** (`FEAT_BITMAP_CSUM`):
+  el bloque de bitmap de cada grupo no tiene sitio para un checksum, así
+  que el CRC32C de cada uno va en una tabla del grupo 0 a la que apunta el
+  superbloque, escrita por el journal junto con los bitmaps. Al montar se
+  comprueba cada bitmap; uno que no cuadra (o un bloque de la tabla dañado)
+  se toma de la otra copia en un volumen espejado, o se reconstruye desde
+  los árboles (cabeceras de grupo, journal, mapa de chunks, la tabla,
+  nodos y extents), así un bitmap dañado nunca entrega un bloque en uso.
+  En solo lectura la reparación queda en memoria. Los sistemas de archivos
+  creados antes reciben la tabla en su siguiente commit, y fsck comprueba
+  la tabla frente a cada bitmap.
 - TRIM/discard queda pendiente: los drivers de disco del kernel todavía no
   tienen discard.
 
@@ -322,6 +333,11 @@ cargo test --release -p eclipsefs --features std
   nodos en la cola, sin sitio, con snapshots, reflinks, compresión y
   cuotas (la compartición se mantiene), volúmenes y una prueba aleatoria.
   La carga de crash también desfragmenta y redimensiona.
+- `tests/bitmap_sums.rs`: la tabla en un sistema nuevo y en uno anterior,
+  bitmaps con bits cambiados (reconstruidos desde los árboles, también con
+  la cabecera marcada libre), un bloque de la tabla dañado, montaje de
+  solo lectura sin escrituras, la tabla al día tras cada commit, al crecer
+  y al encoger, y en RAID1 la copia buena reescribe la mala.
 - Los tests que dependen del formato corren en las dos versiones (`*_v3`).
 - `tests/performance.rs`: las mismas cargas sobre EclipseFS y btrfs, con tiempo
   y bytes leídos/escritos en el dispositivo. `scripts/eclipsefs-bench.sh` las

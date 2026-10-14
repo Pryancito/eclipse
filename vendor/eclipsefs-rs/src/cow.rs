@@ -49,6 +49,7 @@ const DEFRAG_WINDOW: u64 = WRITE_CHUNK;
 /// Commit early once this many tree nodes wait to be written.
 const DIRTY_NODES_LIMIT: usize = 4096;
 
+mod bitmap_sums;
 mod resize;
 mod send;
 mod volume_ops;
@@ -149,6 +150,12 @@ pub struct CowFs {
     /// File blocks of compressed files written uncompressed by this
     /// transaction, by (subvolume, inode).
     zpending: BTreeMap<(u64, u64), RangeSet>,
+    /// CRC32C of every group's bitmap as last written (0 for holes).
+    bitmap_sums: Vec<u32>,
+    /// Blocks of the checksum table to write with the next commit.
+    sums_dirty: BTreeSet<usize>,
+    /// The table is to be (re)written even if nothing else changed.
+    sums_pending: bool,
 }
 
 /// File blocks among `from..to` that `exts` map.
@@ -208,33 +215,61 @@ fn stat_of(ino: u64, i: &InodeItem) -> InodeStat {
     }
 }
 
-fn read_groups(dev: &dyn BlockDevice, total: u64) -> Result<Vec<AllocationGroup>> {
+/// One group's bitmap as read: the group (a blank one when the block does
+/// not decode and `lenient`), and the CRC32C of the block (`None` then).
+fn read_group(
+    dev: &dyn BlockDevice,
+    id: u64,
+    count: u64,
+    buf: &mut [u8],
+    lenient: bool,
+) -> Result<(AllocationGroup, Option<u32>)> {
+    dev.read_at((id * GROUP_BLOCKS + 1) * BS, buf)?;
+    match AllocationGroup::from_bytes(id as u32, count, buf) {
+        Ok(g) => Ok((g, Some(crc32c(buf)))),
+        Err(_) if lenient => Ok((AllocationGroup::new(id as u32, count), None)),
+        Err(e) => Err(e),
+    }
+}
+
+/// Groups of a filesystem that is not a volume, and their bitmaps' CRCs.
+fn read_groups(
+    dev: &dyn BlockDevice,
+    total: u64,
+    lenient: bool,
+) -> Result<(Vec<AllocationGroup>, Vec<Option<u32>>)> {
     let n = total.div_ceil(GROUP_BLOCKS);
     let last = total - (n - 1) * GROUP_BLOCKS;
     let mut buf = vec![0u8; BS as usize];
-    let mut groups = Vec::with_capacity(n as usize);
+    let (mut groups, mut crcs) = (Vec::new(), Vec::new());
     for i in 0..n {
         let count = if i + 1 == n { last } else { GROUP_BLOCKS };
-        dev.read_at((i * GROUP_BLOCKS + 1) * BS, &mut buf)?;
-        groups.push(AllocationGroup::from_bytes(i as u32, count, &buf)?);
+        let (g, c) = read_group(dev, i, count, &mut buf, lenient)?;
+        groups.push(g);
+        crcs.push(c);
     }
-    Ok(groups)
+    Ok((groups, crcs))
 }
 
 /// Groups of a volume: one per chunk, holes where there is none.
-fn read_volume_groups(dev: &dyn BlockDevice, map: &ChunkMap) -> Result<Vec<AllocationGroup>> {
-    let mut groups = Vec::new();
+fn read_volume_groups(
+    dev: &dyn BlockDevice,
+    map: &ChunkMap,
+    lenient: bool,
+) -> Result<(Vec<AllocationGroup>, Vec<Option<u32>>)> {
+    let (mut groups, mut crcs) = (Vec::new(), Vec::new());
     let mut buf = vec![0u8; BS as usize];
     for (&g, c) in &map.chunks {
         while (groups.len() as u64) < g {
             groups.push(AllocationGroup::hole(groups.len() as u32));
+            crcs.push(Some(0));
         }
-        dev.read_at((g * GROUP_BLOCKS + 1) * BS, &mut buf)?;
-        let mut grp = AllocationGroup::from_bytes(g as u32, c.blocks, &buf)?;
+        let (mut grp, crc) = read_group(dev, g, c.blocks, &mut buf, lenient)?;
         grp.kind = c.kind;
         groups.push(grp);
+        crcs.push(crc);
     }
-    Ok(groups)
+    Ok((groups, crcs))
 }
 
 /// Whether every block of `c` keeps a copy off the `missing` devices.
@@ -384,9 +419,12 @@ impl CowFs {
         if vol.is_none() && sb.total_blocks > raw.size() / BS {
             return Err(Error::Corrupt("filesystem larger than device"));
         }
-        let groups = match &vol {
-            Some(v) => read_volume_groups(&*dev, &v.map())?,
-            None => read_groups(&*dev, sb.total_blocks)?,
+        // With checksums, a bitmap that does not even decode is repaired
+        // below like any other bad one.
+        let lenient = sb.bitmap_sums.is_some();
+        let (groups, crcs) = match &vol {
+            Some(v) => read_volume_groups(&*dev, &v.map(), lenient)?,
+            None => read_groups(&*dev, sb.total_blocks, lenient)?,
         };
         let mut alloc = BlockAllocator::new(groups);
         alloc.set_deferred_frees(true);
@@ -420,7 +458,6 @@ impl CowFs {
             entries.push((k.objectid, len, count));
         }
         let refs = RefMap::from_entries(entries)?;
-        let free = alloc.free_blocks();
         let mut sp = BlockSpace::new(alloc, refs.clone());
         if let Some(vs) = &sb.vol {
             sp.vol = vol.clone();
@@ -450,8 +487,13 @@ impl CowFs {
             compress: None,
             zcache: None,
             zpending: BTreeMap::new(),
+            bitmap_sums: Vec::new(),
+            sums_dirty: BTreeSet::new(),
+            sums_pending: false,
             sb,
         };
+        fs.load_bitmap_sums(crcs)?;
+        let free = fs.sp.alloc.free_blocks();
         if fs.sb.free_blocks != free {
             debug!(
                 "eclipsefs: superblock says {} free blocks, bitmaps {}",
@@ -554,6 +596,7 @@ impl CowFs {
             || self.sp.alloc.groups().iter().any(|g| g.is_dirty())
             || !self.dev.is_empty()
             || self.sp.chunks_dirty
+            || self.sums_pending
             || self.items_changed()?;
         if !changed {
             return Ok(());
@@ -613,22 +656,28 @@ impl CowFs {
         let nodes = self.st.take_dirty();
         write_home(&*self.raw, &nodes)?;
         self.raw.sync()?;
-        // Superblock and bitmaps, atomically through the journal.
+        // Superblock, bitmaps and their checksums, atomically through the
+        // journal.
+        self.place_bitmap_sums()?;
         self.sp.alloc.release_deferred()?;
         self.sp.committed();
         self.sb.root = self.root_tree;
         self.sb.generation = gen;
         self.sb.free_blocks = self.sp.alloc.free_blocks();
-        for g in self
-            .sp
-            .alloc
-            .groups_mut()
-            .iter_mut()
-            .filter(|g| g.is_dirty())
-        {
-            self.dev.write_at(g.bitmap_block() * BS, &g.to_bytes())?;
+        for (i, g) in self.sp.alloc.groups_mut().iter_mut().enumerate() {
+            if !g.is_dirty() {
+                continue;
+            }
+            let bytes = g.to_bytes();
+            self.dev.write_at(g.bitmap_block() * BS, &bytes)?;
             g.clear_dirty();
+            let c = if g.is_hole() { 0 } else { crc32c(&bytes) };
+            if self.bitmap_sums[i] != c {
+                self.bitmap_sums[i] = c;
+                self.sums_dirty.insert(i / SUMS_PER_BLOCK);
+            }
         }
+        self.write_bitmap_sums()?;
         self.dev.write_at(0, &self.sb.encode())?;
         let blocks = self.dev.take();
         let raw = self.raw.clone();
@@ -3696,6 +3745,10 @@ impl CowFs {
             own(&mut owners, total, g.start_block, 2)?;
         }
         own(&mut owners, total, self.journal.start, self.journal.blocks)?;
+        if let Some((at, n)) = self.sb.bitmap_sums {
+            own(&mut owners, total, at, n as u64)?;
+        }
+        self.check_bitmap_sums()?;
         if let Some(v) = self.vol.clone() {
             let map = v.map();
             map.check()?;
@@ -4318,9 +4371,22 @@ pub(crate) fn format(
     )?;
     let nodes = st.take_dirty();
     write_home(dev, &nodes)?;
-    let alloc = sp.alloc;
+    let mut alloc = sp.alloc;
+    let n = alloc.groups().len();
+    let need = n.div_ceil(SUMS_PER_BLOCK).max(1) as u64;
+    let bitmap_sums = alloc.groups_mut()[0]
+        .allocate_run(2, need)
+        .map(|at| (at, need as u32));
+    let mut sums = Vec::with_capacity(n);
     for g in alloc.groups() {
-        dev.write_at(g.bitmap_block() * BS, &g.to_bytes())?;
+        let bytes = g.to_bytes();
+        dev.write_at(g.bitmap_block() * BS, &bytes)?;
+        sums.push(crc32c(&bytes));
+    }
+    if let Some((at, _)) = bitmap_sums {
+        for (k, part) in sums.chunks(SUMS_PER_BLOCK).enumerate() {
+            dev.write_at((at + k as u64) * BS, &encode_sums_block(part))?;
+        }
     }
     let sb = SuperV4 {
         total_blocks: total,
@@ -4335,6 +4401,7 @@ pub(crate) fn format(
         journal_blocks: journal.blocks as u32,
         default_subvol: FS_TREE,
         vol: None,
+        bitmap_sums,
     };
     let enc = sb.encode();
     for g in alloc.groups().iter().skip(1) {

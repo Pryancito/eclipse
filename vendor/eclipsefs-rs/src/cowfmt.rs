@@ -14,6 +14,8 @@
 //! 192 device id         196 devices               200 chunk map block
 //! 208 chunk map bytes   212 data profile          213 metadata profile
 //! 216 group 0's chunk (kind, profile, stripes, blocks, 4 x (device, block))
+//! with FEAT_BITMAP_CSUM:
+//! 288 bitmap checksum table block                 296 its length in blocks
 //! 508 crc32c of bytes 0..508
 //! ```
 //!
@@ -110,6 +112,35 @@ pub const FEAT_VOLUME: u64 = 2;
 /// Superblock feature: the size was set by a resize, so mounting does not
 /// grow the filesystem to its device(s).
 pub const FEAT_FIXED_SIZE: u64 = 4;
+/// Superblock feature: the allocator bitmaps have checksums, in a table in
+/// group 0 ([`SuperV4::bitmap_sums`]).
+pub const FEAT_BITMAP_CSUM: u64 = 8;
+
+/// Bitmap checksums per block of the table: the last 4 bytes are the
+/// CRC32C of the rest.
+pub const SUMS_PER_BLOCK: usize = (BLOCK_SIZE as usize - 4) / 4;
+
+/// One block of the bitmap checksum table, from up to [`SUMS_PER_BLOCK`]
+/// checksums.
+pub fn encode_sums_block(sums: &[u32]) -> Vec<u8> {
+    let mut b = vec![0u8; BLOCK_SIZE as usize];
+    for (i, &c) in sums.iter().take(SUMS_PER_BLOCK).enumerate() {
+        put32(&mut b, i * 4, c);
+    }
+    let c = crc32c(&b[..SUMS_PER_BLOCK * 4]);
+    put32(&mut b, SUMS_PER_BLOCK * 4, c);
+    b
+}
+
+/// The checksums of one table block, or `None` if the block is damaged.
+pub fn decode_sums_block(b: &[u8]) -> Option<Vec<u32>> {
+    if b.len() < BLOCK_SIZE as usize
+        || crc32c(&b[..SUMS_PER_BLOCK * 4]) != le32(b, SUMS_PER_BLOCK * 4)
+    {
+        return None;
+    }
+    Some((0..SUMS_PER_BLOCK).map(|i| le32(b, i * 4)).collect())
+}
 
 /// The superblock image `b` as device `devid` keeps it (anything that is
 /// not a volume superblock is written as it is).
@@ -160,6 +191,9 @@ pub struct SuperV4 {
     pub journal_blocks: u32,
     pub default_subvol: u64,
     pub vol: Option<VolumeSb>,
+    /// With [`FEAT_BITMAP_CSUM`]: first block of the bitmap checksum table
+    /// (in group 0) and its length in blocks.
+    pub bitmap_sums: Option<(u64, u32)>,
 }
 
 impl SuperV4 {
@@ -195,6 +229,14 @@ impl SuperV4 {
                 self.features | FEAT_VOLUME
             }
             None => self.features & !FEAT_VOLUME,
+        };
+        let features = match self.bitmap_sums {
+            Some((at, n)) => {
+                put64(&mut b, 288, at);
+                put32(&mut b, 296, n);
+                features | FEAT_BITMAP_CSUM
+            }
+            None => features & !FEAT_BITMAP_CSUM,
         };
         put64(&mut b, 56, features);
         let c = crc32c(&b[..SB_CRC]);
@@ -235,8 +277,16 @@ impl SuperV4 {
             journal_blocks: le32(b, 176),
             default_subvol: le64(b, 184),
             vol: None,
+            bitmap_sums: None,
         };
         let mut sb = sb;
+        if sb.features & FEAT_BITMAP_CSUM != 0 {
+            let (at, n) = (le64(b, 288), le32(b, 296));
+            if n == 0 || at < 2 || at + n as u64 > sb.total_blocks.min(GROUP_BLOCKS) {
+                return Err(Error::Corrupt("bitmap checksum table location"));
+            }
+            sb.bitmap_sums = Some((at, n));
+        }
         if sb.features & FEAT_VOLUME != 0 {
             sb.vol = Some(VolumeSb {
                 devid: le32(b, 192),
@@ -965,6 +1015,7 @@ mod tests {
             journal_blocks: 64,
             default_subvol: FS_TREE,
             vol: None,
+            bitmap_sums: None,
         }
     }
 

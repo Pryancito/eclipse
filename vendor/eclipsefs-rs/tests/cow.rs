@@ -47,7 +47,8 @@ fn used_blocks(disk: &MemDisk) -> BTreeSet<u64> {
         .collect()
 }
 
-/// Blocks a commit may rewrite in place: superblock, bitmap, journal.
+/// Blocks a commit may rewrite in place (through the journal): superblock,
+/// bitmap, bitmap checksums, journal.
 fn allowed(disk: &MemDisk) -> BTreeSet<u64> {
     let mut sb = vec![0u8; 4096];
     disk.read_at(0, &mut sb).unwrap();
@@ -56,6 +57,12 @@ fn allowed(disk: &MemDisk) -> BTreeSet<u64> {
     let mut a: BTreeSet<u64> = (js..js + jb).collect();
     a.insert(0);
     a.insert(1);
+    let features = u64::from_le_bytes(sb[56..64].try_into().unwrap());
+    if features & eclipsefs::cowfmt::FEAT_BITMAP_CSUM != 0 {
+        let at = u64::from_le_bytes(sb[288..296].try_into().unwrap());
+        let n = u32::from_le_bytes(sb[296..300].try_into().unwrap()) as u64;
+        a.extend(at..at + n);
+    }
     a
 }
 
