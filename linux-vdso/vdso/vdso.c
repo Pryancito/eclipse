@@ -20,10 +20,21 @@
 // `__vdsosym("LINUX_2.6", "__vdso_clock_gettime")` (musl/src/internal/vdso.c).
 // Two details of that lookup shape this file:
 //
-//  * It skips version checking entirely when the image has no `DT_VERDEF`
-//    (`if (!verdef) versym = 0;`), so no symbol-version script is needed
-//    despite the "LINUX_2.6" it asks for.
 //  * It needs `DT_SYMTAB`, `DT_STRTAB` and one of `DT_HASH` / `DT_GNU_HASH`.
+//  * It compares the version it asks for against `DT_VERDEF`, and skips the
+//    comparison entirely when the image defines no versions (`if (!verdef)
+//    versym = 0;`).
+//
+// That second shortcut is why this image shipped for a long time with no
+// symbol-version script at all. It no longer does, and the reason is a reader
+// that is not a C library: the Go runtime parses the vDSO itself, and
+// `runtime.vdsoFindVersion` dereferences `info.verdef` without checking it for
+// null — because on Linux a vDSO that parses at all defines `LINUX_2.6`.
+// Against an image without one it read address 0x2 in `sysargs`, before any
+// signal handler exists, so every Go program on Eclipse died with a bare
+// "Segmentation fault" and no output at all. `vdso.lds` defines the version
+// now, exactly as Linux's own `vdso.lds.S` does, and both readers are happy:
+// Go matches it, and musl asks for precisely that name.
 //
 // And on the return path, musl treats any error except `-EINVAL` as "the vDSO
 // could not answer" and falls through to the real syscall:

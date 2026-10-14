@@ -66,6 +66,9 @@ const DT_SONAME: u64 = 14;
 const DT_HASH: u64 = 4;
 const DT_GNU_HASH: u64 = 0x6fff_fef5;
 const DT_VERDEF: u64 = 0x6fff_fffc;
+const DT_VERSYM: u64 = 0x6fff_fff0;
+const DT_STRTAB: u64 = 5;
+const DT_SYMTAB: u64 = 6;
 const DT_RELRSZ: u64 = 35;
 const DT_RELR: u64 = 36;
 
@@ -98,6 +101,10 @@ fn u64at(b: &[u8], off: usize) -> u64 {
     let mut v = [0u8; 8];
     v.copy_from_slice(&b[off..off + 8]);
     u64::from_le_bytes(v)
+}
+
+fn put16(b: &mut [u8], off: usize, v: u16) {
+    b[off..off + 2].copy_from_slice(&v.to_le_bytes());
 }
 
 fn put32(b: &mut [u8], off: usize, v: u32) {
@@ -181,6 +188,47 @@ fn dyn_slot(b: &[u8], tag: u64) -> usize {
         i += 16;
     }
     panic!("la imagen no tiene la etiqueta dinamica {:#x}", tag);
+}
+
+/// The value of the `.dynamic` entry carrying `tag`.
+fn dyn_val(b: &[u8], tag: u64) -> u64 {
+    u64at(b, dyn_slot(b, tag) + 8)
+}
+
+/// A virtual address as a file offset. The image has one `PT_LOAD` at 0/0, so
+/// the two coincide; this says so in one place rather than at each use.
+fn at_vaddr(b: &[u8], vaddr: u64) -> usize {
+    let load = phdr(b, PT_LOAD);
+    (vaddr as i64 + u64at(b, load + P_OFFSET) as i64 - u64at(b, load + 16) as i64) as usize
+}
+
+/// The `.dynsym` index of `want`, which is what indexes `DT_VERSYM`.
+fn dynsym_index(b: &[u8], want: &str) -> usize {
+    let symtab = at_vaddr(b, dyn_val(b, DT_SYMTAB));
+    let strtab = at_vaddr(b, dyn_val(b, DT_STRTAB));
+    let nsym = u32at(b, at_vaddr(b, dyn_val(b, DT_HASH)) + 4) as usize;
+    (0..nsym)
+        .find(|i| name_at(b, strtab + u32at(b, symtab + i * 24) as usize) == want)
+        .unwrap_or_else(|| panic!("la imagen no exporta {:?} en .dynsym", want))
+}
+
+/// The first non-base definition in the `DT_VERDEF` chain: its own offset, and
+/// the offset of its name inside `.dynstr`.
+fn dynstr_of_version(b: &[u8]) -> (usize, usize) {
+    let strtab = at_vaddr(b, dyn_val(b, DT_STRTAB));
+    let mut def = at_vaddr(b, dyn_val(b, DT_VERDEF));
+    loop {
+        if u16at(b, def + 2) & 1 == 0 {
+            let aux = def + u32at(b, def + 12) as usize;
+            return (def, strtab + u32at(b, aux) as usize);
+        }
+        let next = u32at(b, def + 16) as usize;
+        assert!(
+            next != 0,
+            "la cadena DT_VERDEF solo tiene la definicion base"
+        );
+        def += next;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -430,15 +478,67 @@ fn an_image_with_neither_hash_table_is_refused() {
     });
 }
 
-/// musl skips version checking entirely when there is no `DT_VERDEF`, which is
-/// the only reason this image needs no version script. A `DT_VERDEF` appearing
-/// turns every lookup into a failed comparison against "LINUX_2.6".
+/// The version table is what keeps the Go runtime alive: `vdsoFindVersion`
+/// dereferences `info.verdef` with no nil check, so an image without a
+/// `DT_VERDEF` kills every Go program at `sysargs`, before any signal handler
+/// exists. musl would not have minded -- it skips the comparison exactly when
+/// there is no table -- which is how the image shipped without one for so long.
 #[test]
-fn a_version_definition_table_is_refused() {
-    refuses("DT_VERDEF presente", |img| {
-        let slot = dyn_slot(img, DT_SONAME);
-        put64(img, slot, DT_VERDEF);
-        put64(img, slot + 8, 0x100);
+fn an_image_without_a_version_definition_table_is_refused() {
+    refuses("falta DT_VERDEF", |img| {
+        let slot = dyn_slot(img, DT_VERDEF);
+        put64(img, slot, DT_SONAME);
+    });
+}
+
+/// `DT_VERSYM` is the other half: the table says which definition each symbol
+/// carries. Without it Go has nothing to compare the version against, and musl
+/// stops filtering by version at all.
+#[test]
+fn an_image_without_a_version_symbol_table_is_refused() {
+    refuses("falta DT_VERSYM", |img| {
+        let slot = dyn_slot(img, DT_VERSYM);
+        put64(img, slot, DT_SONAME);
+    });
+}
+
+/// A version table that exists but names something else leaves Go with
+/// `version == -1`, which matches no symbol. It costs musl its lookup too, but
+/// the Go check runs first because it can say which reader broke and why.
+#[test]
+fn a_version_by_another_name_is_refused() {
+    refuses("no encuentra la version LINUX_2.6", |img| {
+        // The name is in `.dynstr`; rewriting it in place keeps every offset
+        // valid and changes only what the chain is called.
+        let (_, name) = dynstr_of_version(img);
+        img[name..name + 9].copy_from_slice(b"LINUX_9.9");
+    });
+}
+
+/// `Elf64_Verdef.vd_hash` is the half of the comparison musl never makes: its
+/// `checkver` matches on the name alone, while Go requires the hash to match
+/// too. A definition with a stale or zeroed hash therefore resolves for the
+/// libc and leaves Go with `version == -1`, which matches no symbol — exactly
+/// the kind of image that would pass if only one of the two algorithms ran.
+#[test]
+fn a_version_with_the_wrong_hash_is_refused() {
+    refuses("no encuentra la version LINUX_2.6", |img| {
+        let (def, _) = dynstr_of_version(img);
+        put32(img, def + 8, 0); // vd_hash
+    });
+}
+
+/// And a symbol tagged with a version index that is not LINUX_2.6's. Index 1 is
+/// the base definition, which carries `VER_FLG_BASE`, so no symbol may name it
+/// and neither reader will match one that does.
+#[test]
+fn a_symbol_tagged_with_another_version_is_refused() {
+    refuses("Go descartaria el simbolo", |img| {
+        let versym = at_vaddr(img, dyn_val(img, DT_VERSYM));
+        let i = dynsym_index(img, "__vdso_clock_gettime");
+        // Index 1 is the base definition (the soname), which carries
+        // VER_FLG_BASE and so is never a symbol's version.
+        put16(img, versym + i * 2, 1);
     });
 }
 
