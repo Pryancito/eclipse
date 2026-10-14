@@ -195,9 +195,11 @@ mod hw {
 }
 
 /// Reflected polynomial of CRC32C.
+#[cfg(target_arch = "x86_64")]
 const POLY_C: u32 = 0x82F6_3B78;
 
 /// `a * b mod P` for CRC32C states (reflected: bit 31 is x^0).
+#[cfg(target_arch = "x86_64")]
 const fn mulmod(a: u32, b: u32) -> u32 {
     let (mut m, mut b, mut p) = (1u32 << 31, b, 0u32);
     while m != 0 {
@@ -215,7 +217,8 @@ const fn mulmod(a: u32, b: u32) -> u32 {
 }
 
 /// x^(8n) mod P: a raw CRC32C state followed by `n` zero bytes is the
-/// state times this.
+/// state times this. Only the instruction path joins streams.
+#[cfg(target_arch = "x86_64")]
 const fn x8n(n: u64) -> u32 {
     let (mut p, mut sq, mut k) = (1u32 << 31, 1u32 << 23, n);
     // sq walks x^8, x^16, x^32, ...
