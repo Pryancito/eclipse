@@ -305,3 +305,72 @@ mod the_creation_mask {
         assert_eq!(proc.umask(), 0o777);
     }
 }
+
+/// What it takes to change what is IN a directory -- create a file, remove
+/// one, rename one -- as opposed to reading the directory itself.
+///
+/// Linux asks `may_delete`/`may_create` for `MAY_WRITE | MAY_EXEC` on the
+/// parent, and both halves matter. Write without search is a directory whose
+/// names you may not resolve, so you may not name an entry to remove either;
+/// search without write is the ordinary case of a directory you can walk
+/// through and not modify (`/usr/bin` for everybody). A check that asked for
+/// only one of the two would let a process mutate a directory it has no
+/// business reaching into, which is the permissive direction.
+///
+/// These go through a real inode rather than [`LinuxProcess::access_verdict`]
+/// because what is being pinned is the pair of bits the CALLER asks for: a
+/// mutation run dropped `ACCESS_EXEC` from `check_directory_write` and the
+/// whole crate stayed green.
+mod the_right_to_change_a_directory {
+    use crate::error::LxError;
+    use crate::process::LinuxProcess;
+    use alloc::sync::Arc;
+    use rcore_fs::vfs::{FileSystem, FileType, INode};
+    use rcore_fs_ramfs::RamFS;
+
+    /// A directory of `mode`, owned by uid 1000, and a process that is that
+    /// user -- not root, which `CAP_DAC_OVERRIDE` would carry past every bit
+    /// here.
+    fn a_directory_owned_by_the_caller(mode: u16) -> (LinuxProcess, Arc<dyn INode>) {
+        let dir: Arc<dyn INode> = RamFS::new()
+            .root_inode()
+            .create("d", FileType::Dir, u32::from(mode))
+            .unwrap();
+        let mut meta = dir.metadata().unwrap();
+        meta.uid = 1000;
+        meta.mode = mode;
+        dir.set_metadata(&meta).unwrap();
+
+        let proc = super::super::dup_fd_tests::a_process();
+        proc.set_resuid(1000, 1000, 1000).unwrap();
+        (proc, dir)
+    }
+
+    #[test]
+    fn write_and_search_together_are_enough() {
+        let (proc, dir) = a_directory_owned_by_the_caller(0o300);
+        assert_eq!(proc.check_directory_write(&dir), Ok(()));
+    }
+
+    /// Write without search. This is the one the mutation survived.
+    #[test]
+    fn write_without_search_is_not_enough() {
+        let (proc, dir) = a_directory_owned_by_the_caller(0o200);
+        assert_eq!(
+            proc.check_directory_write(&dir),
+            Err(LxError::EACCES),
+            "a directory whose names cannot be resolved was reported writable"
+        );
+    }
+
+    /// And search without write is the ordinary read-only directory.
+    #[test]
+    fn search_without_write_is_not_enough() {
+        let (proc, dir) = a_directory_owned_by_the_caller(0o500);
+        assert_eq!(
+            proc.check_directory_write(&dir),
+            Err(LxError::EACCES),
+            "a directory the caller may only walk through was reported writable"
+        );
+    }
+}
