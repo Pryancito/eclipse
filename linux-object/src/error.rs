@@ -99,6 +99,9 @@ pub enum LxError {
     ENOMSG = 42,
     /// Identifier removed
     EIDRM = 43,
+    /// Invalid request descriptor -- `FS_IOC_FIEMAP` with a flag the
+    /// filesystem does not know (`fiemap_prep`).
+    EBADR = 53,
     /// No data available (e.g. no such extended attribute)
     ENODATA = 61,
     /// Timer expired -- the errno `drm_syncobj_wait` returns on timeout, which
@@ -160,6 +163,7 @@ impl fmt::Display for LxError {
             EINTR => "Interrupted system call",
             EIO => "I/O error",
             ENXIO => "No such device or address",
+            EBADR => "Invalid request descriptor",
             E2BIG => "Argument list too long",
             ENOEXEC => "Exec format error",
             EBADF => "Bad file number",
@@ -353,6 +357,7 @@ mod errno_tests {
             (LxError::EINTR, 4),
             (LxError::EIO, 5),
             (LxError::ENXIO, 6),
+            (LxError::EBADR, 53),
             (LxError::EBADF, 9),
             (LxError::EAGAIN, 11),
             (LxError::ENOMEM, 12),

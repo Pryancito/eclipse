@@ -49,7 +49,7 @@ pub use device::BlockDevice;
 pub use format::FileKind;
 pub use fs::{
     probe, BalanceReport, CheckReport, ChunkInfo, CompSize, DeviceInfo, DeviceProbe, DirEntry,
-    EclipseFS, FsStat, InodeStat, QgroupInfo, ScrubReport, SubvolInfo,
+    EclipseFS, FileMapping, FsStat, InodeStat, QgroupInfo, ScrubReport, SubvolInfo,
 };
 pub use volume::{ChunkKind, Profile};
 

@@ -2934,6 +2934,122 @@ impl CowFs {
 
     /// Disk and file bytes of `h`'s data (`compsize`): each extent counted
     /// once however many pieces of it the file maps.
+    /// Data pieces of the file with handle `h` (see
+    /// [`EclipseFS::fiemap`](crate::EclipseFS::fiemap)).
+    pub fn fiemap(&mut self, h: u64, start: u64, len: u64) -> Result<Vec<crate::fs::FileMapping>> {
+        use crate::fs::*;
+        let ino = self.at(h)?;
+        let inode = self.inode(ino)?;
+        if inode.kind() == FileKind::Dir {
+            return Err(Error::IsDir);
+        }
+        let mut out = Vec::new();
+        let end = start.saturating_add(len);
+        if len == 0 || start >= inode.size {
+            return Ok(out);
+        }
+        if inode.size <= INLINE_MAX as u64 {
+            if let Some(v) = self.inline_data(ino)? {
+                out.push(FileMapping {
+                    logical: 0,
+                    physical: 0,
+                    length: v.len() as u64,
+                    flags: FIEMAP_EXTENT_DATA_INLINE
+                        | FIEMAP_EXTENT_NOT_ALIGNED
+                        | FIEMAP_EXTENT_LAST,
+                });
+                return Ok(out);
+            }
+        }
+        let last_blk = inode.size.div_ceil(BS);
+        let exts = self.extents(ino, start / BS, end.div_ceil(BS).min(last_blk))?;
+        for e in exts {
+            let mut flags = 0;
+            if e.prealloc {
+                flags |= FIEMAP_EXTENT_UNWRITTEN;
+            }
+            let (physical, disk_blocks) = match e.z {
+                Some(z) => {
+                    flags |= FIEMAP_EXTENT_ENCODED;
+                    (e.pblk * BS, z.disk_blocks)
+                }
+                None => (e.pblk * BS, e.blocks),
+            };
+            let shared = (e.pblk..e.pblk + disk_blocks).any(|b| self.sp.refs.get(b) > 1)
+                || self
+                    .st
+                    .path_shared(&self.sp, &self.fs_root, &Self::ext_key(ino, e.lblk))?;
+            if shared {
+                flags |= FIEMAP_EXTENT_SHARED;
+            }
+            out.push(FileMapping {
+                logical: e.lblk * BS,
+                physical,
+                length: e.blocks * BS,
+                flags,
+            });
+        }
+        // LAST goes on the piece that ends the file's mapped data, which
+        // the range asked for may not reach.
+        if let Some(m) = out.last_mut() {
+            let tail = self.extents(ino, m.logical / BS + m.length / BS, last_blk.max(1))?;
+            if tail.is_empty() {
+                m.flags |= FIEMAP_EXTENT_LAST;
+            }
+        }
+        Ok(out)
+    }
+
+    /// Data pieces at or after byte `off` of inode `ino`, as `(start, end)`
+    /// byte ranges clipped to the size; preallocated space is a hole.
+    fn data_ranges_from(&mut self, ino: u64, off: u64) -> Result<(u64, Vec<(u64, u64)>)> {
+        let inode = self.inode(ino)?;
+        if inode.kind() == FileKind::Dir {
+            return Err(Error::IsDir);
+        }
+        let size = inode.size;
+        if off >= size {
+            return Ok((size, Vec::new()));
+        }
+        if size <= INLINE_MAX as u64 && self.inline_data(ino)?.is_some() {
+            return Ok((size, alloc::vec![(0, size)]));
+        }
+        let mut out: Vec<(u64, u64)> = Vec::new();
+        for e in self.extents(ino, off / BS, size.div_ceil(BS))? {
+            if e.prealloc {
+                continue;
+            }
+            let s = (e.lblk * BS).max(off);
+            let t = ((e.lblk + e.blocks) * BS).min(size);
+            if s >= t {
+                continue;
+            }
+            match out.last_mut() {
+                Some(last) if last.1 == s => last.1 = t,
+                _ => out.push((s, t)),
+            }
+        }
+        Ok((size, out))
+    }
+
+    pub fn seek_data(&mut self, h: u64, off: u64) -> Result<Option<u64>> {
+        let ino = self.at(h)?;
+        let (_, ranges) = self.data_ranges_from(ino, off)?;
+        Ok(ranges.first().map(|&(s, _)| s.max(off)))
+    }
+
+    pub fn seek_hole(&mut self, h: u64, off: u64) -> Result<Option<u64>> {
+        let ino = self.at(h)?;
+        let (size, ranges) = self.data_ranges_from(ino, off)?;
+        if off >= size {
+            return Ok(None);
+        }
+        Ok(Some(match ranges.first() {
+            Some(&(s, t)) if s <= off => t,
+            _ => off,
+        }))
+    }
+
     pub fn compsize(&mut self, h: u64) -> Result<CompSize> {
         let ino = self.at(h)?;
         self.inode(ino)?;

@@ -700,13 +700,20 @@ fn preallocated_extents_survive_snapshots_and_clones() {
 fn reads_overwrite_a_dirty_buffer_with_holes_and_preallocated_zeros() {
     let (disk, mut fs) = fresh(16 * MIB);
     let root = fs.root_ino();
-    let f = fs.create(root, "sparse", FileKind::Regular, 0o644, 0).unwrap();
+    let f = fs
+        .create(root, "sparse", FileKind::Regular, 0o644, 0)
+        .unwrap();
     let a = random(3 * BLOCK, 1);
     let b = random(BLOCK + 100, 2);
     // data | hole | prealloc | data | hole up to the size
     write_all(&mut fs, f, 0, &a);
-    fs.fallocate(f, FALLOC_FL_KEEP_SIZE, (6 * BLOCK) as u64, (2 * BLOCK) as u64)
-        .unwrap();
+    fs.fallocate(
+        f,
+        FALLOC_FL_KEEP_SIZE,
+        (6 * BLOCK) as u64,
+        (2 * BLOCK) as u64,
+    )
+    .unwrap();
     write_all(&mut fs, f, (9 * BLOCK + 7) as u64, &b);
     fs.truncate(f, (14 * BLOCK) as u64).unwrap();
     let mut want = vec![0u8; 14 * BLOCK];

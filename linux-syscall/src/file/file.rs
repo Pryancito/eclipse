@@ -85,6 +85,25 @@ impl Staging {
     }
 }
 
+/// SEEK_DATA (3) and SEEK_HOLE (4) on a filesystem that cannot tell holes
+/// from data, as `generic_file_llseek_size` answers them: the whole file
+/// is data and the end of file is the only hole.
+fn seek_data_hole_generic(
+    size: u64,
+    whence: usize,
+    offset: i64,
+) -> linux_object::error::LxResult<u64> {
+    const SEEK_DATA: usize = 3;
+    if offset < 0 || offset as u64 >= size {
+        return Err(LxError::ENXIO);
+    }
+    Ok(if whence == SEEK_DATA {
+        offset as u64
+    } else {
+        size
+    })
+}
+
 /// `lseek(2)`'s `whence`, which the syscall declares `int` and this tree read
 /// as a `u8`.
 ///
@@ -800,6 +819,19 @@ impl Syscall<'_> {
     /// repositions the offset of the open file associated with the file descriptor fd
     /// to the argument offset according to the directive whence
     pub fn sys_lseek(&self, fd: FileDesc, offset: i64, whence: usize) -> SysResult {
+        const SEEK_DATA: usize = 3;
+        const SEEK_HOLE: usize = 4;
+        if whence == SEEK_DATA || whence == SEEK_HOLE {
+            let proc = self.linux_process();
+            let file_like = proc.get_file_like(fd)?;
+            let file = file_like.downcast_ref::<File>().ok_or(LxError::EINVAL)?;
+            let pos = match linux_object::fs::eclipsefs_seek(file, whence, offset) {
+                Some(r) => r?,
+                None => seek_data_hole_generic(file.metadata()?.size as u64, whence, offset)?,
+            };
+            file.seek(SeekFrom::Start(pos))?;
+            return Ok(pos as usize);
+        }
         let pos = seek_from(whence, offset)?;
         info!("lseek: fd={:?}, pos={:?}", fd, pos);
 
@@ -3478,10 +3510,23 @@ mod seek_and_access_tests {
         // position quietly moved to `offset`.
         assert_eq!(seek(0x100, 42).err(), Some(LxError::EINVAL));
         assert_eq!(seek(0x102, 42).err(), Some(LxError::EINVAL));
-        // SEEK_DATA and SEEK_HOLE are not implemented; they must say so rather
-        // than land on one of the three above.
+        // SEEK_DATA and SEEK_HOLE never land on one of the three above
+        // (`sys_lseek` answers them before it gets here).
         assert_eq!(seek(3, 0).err(), Some(LxError::EINVAL));
         assert_eq!(seek(4, 0).err(), Some(LxError::EINVAL));
+    }
+
+    #[test]
+    fn seek_data_and_hole_on_a_filesystem_without_holes() {
+        const DATA: usize = 3;
+        const HOLE: usize = 4;
+        assert_eq!(seek_data_hole_generic(100, DATA, 0), Ok(0));
+        assert_eq!(seek_data_hole_generic(100, DATA, 42), Ok(42));
+        assert_eq!(seek_data_hole_generic(100, HOLE, 42), Ok(100));
+        assert_eq!(seek_data_hole_generic(100, DATA, 100), Err(LxError::ENXIO));
+        assert_eq!(seek_data_hole_generic(100, HOLE, 100), Err(LxError::ENXIO));
+        assert_eq!(seek_data_hole_generic(100, DATA, -1), Err(LxError::ENXIO));
+        assert_eq!(seek_data_hole_generic(0, HOLE, 0), Err(LxError::ENXIO));
         assert_eq!(seek(usize::MAX, 0).err(), Some(LxError::EINVAL));
     }
 

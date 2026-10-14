@@ -1,13 +1,15 @@
 //! What an EclipseFS mount offers past `read`/`write`: the filesystem ioctls
 //! (with the numbers and argument layouts of Linux and btrfs, so `chattr`,
 //! `cp --reflink`, `duperemove` and btrfs-progs speak to it unchanged),
-//! extended attributes, `fallocate` and reflinked `copy_file_range`.
+//! extended attributes, `fallocate`, reflinked `copy_file_range` and
+//! `lseek(SEEK_DATA/SEEK_HOLE)` from the real extents.
 //!
 //! | ioctl | does |
 //! |---|---|
 //! | `FS_IOC_GETFLAGS`/`SETFLAGS` | `lsattr`/`chattr` (immutable, append, no-COW, ...) |
 //! | `FICLONE`/`FICLONERANGE` | reflink: the destination shares the source's blocks |
 //! | `FIDEDUPERANGE` | share the blocks of ranges that hold the same bytes |
+//! | `FS_IOC_FIEMAP` | `filefrag`: the file's extents (unwritten, compressed, shared, inline) |
 //! | `BTRFS_IOC_SUBVOL_CREATE(_V2)` | new subvolume |
 //! | `BTRFS_IOC_SNAP_CREATE(_V2)` | snapshot (`BTRFS_SUBVOL_RDONLY` for a read-only one) |
 //! | `BTRFS_IOC_SNAP_DESTROY(_V2)` | delete a subvolume by name |
@@ -65,6 +67,7 @@ const FS_IOC32_SETFLAGS: u32 = 0x4004_6602;
 const FICLONE: u32 = 0x4004_9409;
 const FICLONERANGE: u32 = 0x4020_940d;
 const FIDEDUPERANGE: u32 = 0xc018_9436;
+const FS_IOC_FIEMAP: u32 = 0xc020_660b;
 
 // btrfs (`include/uapi/linux/btrfs.h`).
 const BTRFS_IOC_SNAP_CREATE: u32 = 0x5000_9401;
@@ -137,6 +140,14 @@ const BTRFS_SEND_FLAG_VERSION: u64 = 1 << 3;
 
 const FILE_DEDUPE_RANGE_SAME: i32 = 0;
 const FILE_DEDUPE_RANGE_DIFFERS: i32 = 1;
+
+/// `struct fiemap`: the header, then `fm_extent_count` extents.
+const FIEMAP_HEADER: usize = 32;
+const FIEMAP_EXTENT: usize = 56;
+/// The most extents one call fills (Linux bounds it by what the caller's
+/// buffer holds; this bounds what the kernel allocates for it).
+const FIEMAP_MAX_EXTENTS: usize = 1 << 16;
+const FIEMAP_FLAG_SYNC: u32 = 0x1;
 
 const CAP_FOWNER: u32 = 3;
 const CAP_LINUX_IMMUTABLE: u32 = 9;
@@ -239,6 +250,7 @@ pub(crate) fn is_fs_ioctl(cmd: u32) -> bool {
             | FICLONE
             | FICLONERANGE
             | FIDEDUPERANGE
+            | FS_IOC_FIEMAP
             | BTRFS_IOC_SNAP_CREATE
             | BTRFS_IOC_SYNC
             | BTRFS_IOC_ADD_DEV
@@ -308,6 +320,19 @@ impl<'a> Target<'a> {
     /// Copy the argument in from user memory (as its size in `cmd` says),
     /// run the ioctl, and copy it back out for the ones that return data.
     fn user_ioctl(&self, cmd: u32, arg: usize, ctx: &dyn FsIoctlContext) -> LxResult<usize> {
+        if cmd == FS_IOC_FIEMAP {
+            // The header goes back to the caller even when the call fails
+            // (the flags it did not understand, for EBADR).
+            let head = UserInPtr::<u8>::from(arg).read_array(FIEMAP_HEADER)?;
+            let count = (get32(&head, 24) as usize).min(FIEMAP_MAX_EXTENTS);
+            let mut buf = vec![0u8; FIEMAP_HEADER + FIEMAP_EXTENT * count];
+            buf[..FIEMAP_HEADER].copy_from_slice(&head);
+            let ret = self.fiemap(&mut buf);
+            let mapped = get32(&buf, 20) as usize;
+            let out = FIEMAP_HEADER + FIEMAP_EXTENT * mapped.min(count);
+            UserOutPtr::<u8>::from(arg).write_array(&buf[..out])?;
+            return ret;
+        }
         let mut buf = match cmd {
             // The argument is the source descriptor itself.
             FICLONE => (arg as i32).to_le_bytes().to_vec(),
@@ -332,6 +357,51 @@ impl<'a> Target<'a> {
             UserOutPtr::<u8>::from(arg).write_array(&buf)?;
         }
         Ok(ret)
+    }
+
+    /// `FS_IOC_FIEMAP` on `buf` (a `struct fiemap` with room for
+    /// `fm_extent_count` extents): fills `fm_mapped_extents` and the
+    /// extents, or with no room only counts them.
+    pub(crate) fn fiemap(&self, buf: &mut [u8]) -> LxResult<usize> {
+        let start = get64(buf, 0);
+        let len = get64(buf, 8);
+        let flags = get32(buf, 16);
+        let room = (buf.len() - FIEMAP_HEADER) / FIEMAP_EXTENT;
+        put32(buf, 20, 0);
+        if flags & !FIEMAP_FLAG_SYNC != 0 {
+            put32(buf, 16, flags & !FIEMAP_FLAG_SYNC);
+            return Err(LxError::EBADR);
+        }
+        if len == 0 {
+            return Err(LxError::EINVAL);
+        }
+        // Data still in the page cache is mapped once written back.
+        if let Ok(st) = self.stat(self.ino) {
+            cache_flush(&self.file.inode(), 0, st.size as usize);
+        }
+        if flags & FIEMAP_FLAG_SYNC != 0 {
+            self.with(|fs| fs.sync())?;
+        }
+        let map = match self.with(|fs| fs.fiemap(self.ino, start, len)) {
+            // A directory has no data to map (btrfs answers the same).
+            Err(LxError::EISDIR) => Vec::new(),
+            r => r?,
+        };
+        if room == 0 {
+            put32(buf, 20, map.len() as u32);
+            return Ok(0);
+        }
+        for (i, m) in map.iter().take(room).enumerate() {
+            let at = FIEMAP_HEADER + i * FIEMAP_EXTENT;
+            let e = &mut buf[at..at + FIEMAP_EXTENT];
+            e.fill(0);
+            put64(e, 0, m.logical);
+            put64(e, 8, m.physical);
+            put64(e, 16, m.length);
+            put32(e, 40, m.flags);
+        }
+        put32(buf, 20, map.len().min(room) as u32);
+        Ok(0)
     }
 
     fn with<R>(&self, f: impl FnOnce(&mut EclipseFS) -> eclipsefs::Result<R>) -> LxResult<R> {
@@ -445,6 +515,7 @@ impl<'a> Target<'a> {
         ctx: &dyn FsIoctlContext,
     ) -> LxResult<usize> {
         match cmd {
+            FS_IOC_FIEMAP => return self.fiemap(buf),
             FS_IOC_GETFLAGS | FS_IOC32_GETFLAGS => {
                 let flags = self.with(|fs| fs.get_flags(self.ino))?;
                 put32(buf, 0, flags);
@@ -1224,6 +1295,30 @@ pub fn eclipsefs_fallocate(file: &File, mode: u32, offset: u64, len: u64) -> Opt
 
 /// `copy_file_range(2)` as a reflink, when both files are on the same
 /// EclipseFS mount and the offsets are block-aligned (as btrfs does it).
+/// `lseek(SEEK_DATA)` (3) or `lseek(SEEK_HOLE)` (4) on a file of an
+/// EclipseFS mount: the new position, from the file's real extents.
+/// `None` when `file` is on another filesystem.
+pub fn eclipsefs_seek(file: &File, whence: usize, offset: i64) -> Option<LxResult<u64>> {
+    const SEEK_DATA: usize = 3;
+    let target = Target::of(file)?;
+    Some((|| {
+        let size = target.regular(target.ino)?.size;
+        // Like `generic_file_llseek_size`: an offset at or past the end
+        // (or negative, read as unsigned) is ENXIO.
+        if offset < 0 || offset as u64 >= size {
+            return Err(LxError::ENXIO);
+        }
+        cache_flush(&file.inode(), 0, size as usize);
+        let off = offset as u64;
+        let found = if whence == SEEK_DATA {
+            target.with(|fs| fs.seek_data(target.ino, off))?
+        } else {
+            target.with(|fs| fs.seek_hole(target.ino, off))?
+        };
+        found.ok_or(LxError::ENXIO)
+    })())
+}
+
 /// Copies at most `len` bytes and returns how many: whole blocks, or up to
 /// the end of `src`. `None` when a reflink does not apply, and then the
 /// caller copies the bytes.
@@ -1411,6 +1506,7 @@ mod tests {
         assert_eq!(FICLONE, ioc(W, 0x94, 9, 4));
         assert_eq!(FICLONERANGE, ioc(W, 0x94, 13, 32));
         assert_eq!(FIDEDUPERANGE, ioc(R | W, 0x94, 54, 24));
+        assert_eq!(FS_IOC_FIEMAP, ioc(R | W, b'f' as u32, 11, 32));
         assert_eq!(BTRFS_IOC_SNAP_CREATE_V2, ioc(W, 0x94, 23, 4096));
         assert_eq!(BTRFS_IOC_SUBVOL_CREATE_V2, ioc(W, 0x94, 24, 4096));
         assert_eq!(BTRFS_IOC_START_SYNC, ioc(R, 0x94, 24, 8));
@@ -2125,6 +2221,131 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(inode.metadata().unwrap().size, 2 << 20);
+    }
+
+    /// `struct fiemap` asking for `count` extents of `start..start+len`.
+    fn fiemap_args(start: u64, len: u64, flags: u32, count: u32) -> Vec<u8> {
+        let mut b = vec![0u8; FIEMAP_HEADER + FIEMAP_EXTENT * count as usize];
+        put64(&mut b, 0, start);
+        put64(&mut b, 8, len);
+        put32(&mut b, 16, flags);
+        put32(&mut b, 24, count);
+        b
+    }
+
+    /// The extents a FIEMAP answer holds, as (logical, length, flags).
+    fn fiemap_extents(b: &[u8]) -> Vec<(u64, u64, u32)> {
+        (0..get32(b, 20) as usize)
+            .map(|i| {
+                let e = &b[FIEMAP_HEADER + i * FIEMAP_EXTENT..];
+                (get64(e, 0), get64(e, 16), get32(e, 40))
+            })
+            .collect()
+    }
+
+    /// data [0,256K) | hole | data [512K,768K), size 1 MiB.
+    fn sparse_file(fs: &Arc<EclipseMountFs>) -> Arc<dyn INode> {
+        let f = file_with(&fs.root_inode(), "sparse", &pattern(256 << 10, 1));
+        assert_eq!(
+            f.write_at(512 << 10, &pattern(256 << 10, 2)).unwrap(),
+            256 << 10
+        );
+        f.resize(1 << 20).unwrap();
+        fs.sync().unwrap();
+        f
+    }
+
+    #[test]
+    fn fiemap_maps_the_data_and_counts_with_no_room() {
+        const LAST: u32 = 0x1;
+        const SHARED: u32 = 0x2000;
+        let disk = formatted(32 << 20);
+        let fs = mount(&disk);
+        let ctx = Ctx::root();
+        let f = sparse_file(&fs);
+        let fd = ctx.open(f.clone(), OpenFlags::RDONLY);
+        let mut b = fiemap_args(0, u64::MAX, 0, 16);
+        ctx.ioctl(fd, FS_IOC_FIEMAP, &mut b).unwrap();
+        let ext = fiemap_extents(&b);
+        let spans: Vec<_> = ext
+            .iter()
+            .map(|&(l, n, _)| (l >> 10, (l + n) >> 10))
+            .collect();
+        // Writes may land in more than one extent; together they cover the
+        // two data ranges exactly.
+        let mut merged: Vec<(u64, u64)> = Vec::new();
+        for (s, t) in spans {
+            match merged.last_mut() {
+                Some(m) if m.1 == s => m.1 = t,
+                _ => merged.push((s, t)),
+            }
+        }
+        assert_eq!(merged, [(0, 256), (512, 768)]);
+        assert_eq!(ext.last().unwrap().2 & LAST, LAST);
+        assert!(ext.iter().all(|e| e.2 & SHARED == 0));
+        // No room: only the count comes back.
+        let mut c = fiemap_args(0, u64::MAX, 0, 0);
+        ctx.ioctl(fd, FS_IOC_FIEMAP, &mut c).unwrap();
+        assert_eq!(get32(&c, 20) as usize, ext.len());
+        // Room for one: the first extent, without LAST unless it is.
+        let mut one = fiemap_args(0, u64::MAX, 0, 1);
+        ctx.ioctl(fd, FS_IOC_FIEMAP, &mut one).unwrap();
+        assert_eq!(fiemap_extents(&one), ext[..1]);
+        // A reflinked copy shares its blocks.
+        let g = file_with(&fs.root_inode(), "copy", b"");
+        let gfd = ctx.open(g, OpenFlags::RDWR);
+        let mut arg = (fd as i32).to_le_bytes().to_vec();
+        ctx.ioctl(gfd, FICLONE, &mut arg).unwrap();
+        let mut b = fiemap_args(0, u64::MAX, 1, 16);
+        ctx.ioctl(gfd, FS_IOC_FIEMAP, &mut b).unwrap();
+        assert!(fiemap_extents(&b).iter().all(|e| e.2 & SHARED != 0));
+    }
+
+    #[test]
+    fn fiemap_refuses_unknown_flags_and_an_empty_range() {
+        let disk = formatted(16 << 20);
+        let fs = mount(&disk);
+        let ctx = Ctx::root();
+        let fd = ctx.open(file_with(&fs.root_inode(), "f", b"x"), OpenFlags::RDONLY);
+        // FIEMAP_FLAG_XATTR (2) is not supported: EBADR, and fm_flags says
+        // which flags were not understood.
+        let mut b = fiemap_args(0, u64::MAX, 0x3, 4);
+        assert_eq!(ctx.ioctl(fd, FS_IOC_FIEMAP, &mut b), Err(LxError::EBADR));
+        assert_eq!(get32(&b, 16), 0x2);
+        let mut b = fiemap_args(0, 0, 0, 4);
+        assert_eq!(ctx.ioctl(fd, FS_IOC_FIEMAP, &mut b), Err(LxError::EINVAL));
+        // Inline data: one piece, flagged as such.
+        let mut b = fiemap_args(0, u64::MAX, 0, 4);
+        ctx.ioctl(fd, FS_IOC_FIEMAP, &mut b).unwrap();
+        assert_eq!(fiemap_extents(&b), [(0, 1, 0x1 | 0x100 | 0x200)]);
+        // A directory maps nothing.
+        let dfd = ctx.open(fs.root_inode(), OpenFlags::RDONLY);
+        let mut b = fiemap_args(0, u64::MAX, 0, 4);
+        ctx.ioctl(dfd, FS_IOC_FIEMAP, &mut b).unwrap();
+        assert_eq!(get32(&b, 20), 0);
+    }
+
+    #[test]
+    fn seek_data_and_seek_hole_follow_the_extents() {
+        const DATA: usize = 3;
+        const HOLE: usize = 4;
+        let disk = formatted(32 << 20);
+        let fs = mount(&disk);
+        let f = sparse_file(&fs);
+        let file = File::new(f.clone(), OpenFlags::RDONLY, String::from("/efs-test/f"));
+        let seek = |w, off: i64| eclipsefs_seek(&file, w, off).unwrap();
+        assert_eq!(seek(DATA, 0), Ok(0));
+        assert_eq!(seek(HOLE, 0), Ok(256 << 10));
+        assert_eq!(seek(DATA, 300 << 10), Ok(512 << 10));
+        assert_eq!(seek(HOLE, 600 << 10), Ok(768 << 10));
+        // Only a hole after the last data, and nothing at or past the end.
+        assert_eq!(seek(DATA, 800 << 10), Err(LxError::ENXIO));
+        assert_eq!(seek(HOLE, 800 << 10), Ok(800 << 10));
+        assert_eq!(seek(DATA, 1 << 20), Err(LxError::ENXIO));
+        assert_eq!(seek(HOLE, -1), Err(LxError::ENXIO));
+        // Data written through the page cache counts before it is synced.
+        assert_eq!(f.write_at(300 << 10, b"late").unwrap(), 4);
+        assert_eq!(seek(DATA, 260 << 10), Ok(300 << 10 & !4095));
     }
 
     #[test]

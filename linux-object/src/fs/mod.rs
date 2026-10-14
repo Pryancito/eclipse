@@ -141,8 +141,8 @@ use sysfs::SysFS;
 
 pub use dmabuf::DmaBuf;
 pub use eclipsefs_ioctl::{
-    eclipsefs_copy_reflink, eclipsefs_fallocate, eclipsefs_ioctl, eclipsefs_xattr, FsIoctlContext,
-    XattrReply, XattrRequest, EFS_IOC_RECEIVE,
+    eclipsefs_copy_reflink, eclipsefs_fallocate, eclipsefs_ioctl, eclipsefs_seek, eclipsefs_xattr,
+    FsIoctlContext, XattrReply, XattrRequest, EFS_IOC_RECEIVE,
 };
 pub use epoll::{Epoll, EpollEvent};
 

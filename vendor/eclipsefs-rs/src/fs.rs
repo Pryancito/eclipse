@@ -62,6 +62,33 @@ pub struct CompSize {
     pub compressed_extents: u64,
 }
 
+/// One mapped piece of a file (see [`EclipseFS::fiemap`]), as
+/// `FS_IOC_FIEMAP` reports it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FileMapping {
+    /// Byte offset in the file.
+    pub logical: u64,
+    /// Byte address on the filesystem's (logical) disk space; 0 for inline
+    /// data, which lives in the tree.
+    pub physical: u64,
+    pub length: u64,
+    /// `FIEMAP_EXTENT_*` bits.
+    pub flags: u32,
+}
+
+/// `FIEMAP_EXTENT_LAST`: the last piece of the file.
+pub const FIEMAP_EXTENT_LAST: u32 = 0x1;
+/// `FIEMAP_EXTENT_ENCODED`: compressed on disk.
+pub const FIEMAP_EXTENT_ENCODED: u32 = 0x8;
+/// `FIEMAP_EXTENT_NOT_ALIGNED`: not block aligned (inline data).
+pub const FIEMAP_EXTENT_NOT_ALIGNED: u32 = 0x100;
+/// `FIEMAP_EXTENT_DATA_INLINE`: stored with the metadata.
+pub const FIEMAP_EXTENT_DATA_INLINE: u32 = 0x200;
+/// `FIEMAP_EXTENT_UNWRITTEN`: preallocated, reads as zeros.
+pub const FIEMAP_EXTENT_UNWRITTEN: u32 = 0x800;
+/// `FIEMAP_EXTENT_SHARED`: shared with a snapshot or a reflink.
+pub const FIEMAP_EXTENT_SHARED: u32 = 0x2000;
+
 /// One device of the filesystem (see [`EclipseFS::devices`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DeviceInfo {
@@ -599,6 +626,25 @@ impl EclipseFS {
     /// it on to files created in it.
     pub fn set_compression(&mut self, ino: u64, algo: Option<Compression>) -> Result<()> {
         self.cow()?.set_compression(ino, algo)
+    }
+
+    /// The pieces of file `ino` that overlap bytes `start..start+len`, in
+    /// file order (`FS_IOC_FIEMAP`, `filefrag`). Holes are left out;
+    /// preallocated space is reported as unwritten.
+    pub fn fiemap(&mut self, ino: u64, start: u64, len: u64) -> Result<Vec<FileMapping>> {
+        self.cow()?.fiemap(ino, start, len)
+    }
+
+    /// `lseek(SEEK_DATA)`: the first offset at or after `off` that holds
+    /// data, or `None` when only holes (or preallocated space) follow.
+    pub fn seek_data(&mut self, ino: u64, off: u64) -> Result<Option<u64>> {
+        self.cow()?.seek_data(ino, off)
+    }
+
+    /// `lseek(SEEK_HOLE)`: the first offset at or after `off` in a hole;
+    /// the end of the file counts as one. `None` when `off` is past the end.
+    pub fn seek_hole(&mut self, ino: u64, off: u64) -> Result<Option<u64>> {
+        self.cow()?.seek_hole(ino, off)
     }
 
     /// Disk and file bytes of a file's data (as `compsize` reports).

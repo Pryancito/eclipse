@@ -89,6 +89,9 @@ pub fn lx_to_freebsd(err: LxError) -> i32 {
         // pass-through would report a symlink loop for an expired timer.
         // `ETIMEDOUT` is the one a FreeBSD program tests for.
         LxError::ETIME => bsd::ETIMEDOUT,
+        // FreeBSD has no `EBADR` (FIEMAP's "unknown flag"); the request is
+        // invalid either way.
+        LxError::EBADR => bsd::EINVAL,
         LxError::EOVERFLOW => bsd::EOVERFLOW,
         // FreeBSD has no `EBADFD` ("the descriptor is fine, the object behind
         // it is not"). Its number over there is `ENOLCK`. `EBADF` would be
@@ -169,6 +172,7 @@ mod tests {
         LxError::EIDRM,
         LxError::ENODATA,
         LxError::ETIME,
+        LxError::EBADR,
         LxError::EBADFD,
         LxError::EOVERFLOW,
         LxError::ENOTSOCK,
@@ -246,7 +250,7 @@ mod tests {
     }
 
     /// A hand-written table of sixty-odd rows earns exactly one kind of
-    /// mistake: two unrelated errors typed onto one number. Only the three
+    /// mistake: two unrelated errors typed onto one number. Only the ones
     /// that have no FreeBSD peer are allowed to share.
     #[test]
     fn only_the_errors_without_a_peer_share_a_number() {
@@ -259,6 +263,7 @@ mod tests {
                     (LxError::EUNDEF, LxError::EINVAL)
                         | (LxError::EUNDEF, LxError::EBADFD)
                         | (LxError::EINVAL, LxError::EBADFD)
+                        | (LxError::EUNDEF, LxError::EBADR)
                         | (LxError::ETIMEDOUT, LxError::ETIME)
                         | (LxError::ETIME, LxError::ETIMEDOUT)
                 );
