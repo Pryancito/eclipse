@@ -138,7 +138,6 @@ fn sync_file_range_writes_back(flags: usize) -> LxResult<bool> {
     Ok(flags != 0)
 }
 
-
 /// What an EclipseFS ioctl needs from the calling process: its descriptors,
 /// its view of the tree and its credentials.
 struct FsIoctlCtx<'a> {
@@ -1154,8 +1153,10 @@ impl Syscall<'_> {
 
         // Two files of one EclipseFS mount at block-aligned offsets: share
         // the blocks (a reflink, as btrfs does here) instead of copying them.
-        if let (Some(src), Some(dst)) = (in_file.downcast_ref::<File>(), out_file.downcast_ref::<File>())
-        {
+        if let (Some(src), Some(dst)) = (
+            in_file.downcast_ref::<File>(),
+            out_file.downcast_ref::<File>(),
+        ) {
             if src.flags().readable() && dst.flags().writable() {
                 let src_pos = match read_offset {
                     Some(off) => off,
@@ -2219,8 +2220,7 @@ impl Syscall<'_> {
         // or a device path, which only the process can resolve.
         if let Some(file) = file_like.downcast_ref::<File>() {
             let ctx = FsIoctlCtx { proc };
-            if let Some(res) = linux_object::fs::eclipsefs_ioctl(file, request as u32, arg1, &ctx)
-            {
+            if let Some(res) = linux_object::fs::eclipsefs_ioctl(file, request as u32, arg1, &ctx) {
                 return res;
             }
         }

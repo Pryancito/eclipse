@@ -1241,7 +1241,7 @@ pub fn eclipsefs_copy_reflink(
     }
     let src_size = target.regular(src_ino).ok()?.size;
     target.regular(target.ino).ok()?;
-    if src_off >= src_size || src_off % BLOCK != 0 || dst_off % BLOCK != 0 {
+    if src_off >= src_size || !src_off.is_multiple_of(BLOCK) || !dst_off.is_multiple_of(BLOCK) {
         return None;
     }
     let mut n = len.min(src_size - src_off);

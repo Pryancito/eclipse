@@ -1,12 +1,12 @@
 mod btrfs_image;
-mod eclipsefs_image;
-mod tree_image;
 mod desktop;
+mod eclipsefs_image;
 mod image;
 pub(crate) mod nvidia_firmware;
 mod opencv;
 mod portal;
 mod test;
+mod tree_image;
 mod verify;
 mod xorg;
 
@@ -350,7 +350,11 @@ impl LinuxRootfs {
         // /etc/fstab — placeholders sustituidos por install-eclipse (sin mount
         // syscall en btrfs; EclipseFS lleva checksum de los datos, asi que alli
         // el instalador lo reescribe montando la particion).
-        fs::write(etc.join("fstab"), Self::fstab_template(image::DiskFs::from_env())).unwrap();
+        fs::write(
+            etc.join("fstab"),
+            Self::fstab_template(image::DiskFs::from_env()),
+        )
+        .unwrap();
 
         // 拷贝 libc.so
         let from = musl
