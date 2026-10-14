@@ -399,6 +399,21 @@ impl Store {
         Ok(())
     }
 
+    /// The node at `bytenr` as it is on the device, bypassing the cache
+    /// (for scrub; the caller commits first so nothing is dirty).
+    pub fn read_disk(&self, bytenr: u64, level: u8, gen: Option<u64>) -> Result<Node> {
+        if bytenr < 2 || bytenr >= self.total_blocks {
+            return Err(Error::Corrupt("tree pointer out of range"));
+        }
+        let mut buf = vec![0u8; BS];
+        self.dev.read_at(bytenr * BLOCK_SIZE, &mut buf)?;
+        let node = Node::decode(&buf, bytenr, &self.fsid)?;
+        if node.level != level || gen.is_some_and(|g| g != node.gen) {
+            return Err(Error::Corrupt("tree node level or generation"));
+        }
+        Ok(node)
+    }
+
     /// The node at `bytenr` (for checks and tests).
     pub fn node(&mut self, bytenr: u64, level: u8, gen: Option<u64>) -> Result<&Node> {
         self.load(bytenr, level, gen)?;

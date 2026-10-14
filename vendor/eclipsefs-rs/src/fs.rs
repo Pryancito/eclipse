@@ -68,6 +68,25 @@ pub struct CheckReport {
     pub blocks_used: u64,
 }
 
+/// What [`EclipseFS::scrub`] read and what failed verification.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ScrubReport {
+    /// Tree nodes read (each once, however many trees share it).
+    pub tree_nodes: u64,
+    /// File data blocks read.
+    pub data_blocks: u64,
+    /// Nodes whose checksum, header or place in the tree is wrong.
+    pub bad_tree_nodes: Vec<u64>,
+    /// Data blocks whose contents do not match their checksum.
+    pub bad_data_blocks: Vec<u64>,
+}
+
+impl ScrubReport {
+    pub fn is_clean(&self) -> bool {
+        self.bad_tree_nodes.is_empty() && self.bad_data_blocks.is_empty()
+    }
+}
+
 enum Driver {
     V3(EclipseFsV3),
     V4(CowFs),
@@ -250,5 +269,15 @@ impl EclipseFS {
     /// writable mount.
     pub fn check(&mut self) -> Result<CheckReport> {
         dispatch!(self, fs => fs.check())
+    }
+
+    /// Read every tree node and data block from the device and verify its
+    /// checksum (btrfs scrub, without repair: there is no second copy yet).
+    /// Commits first on a writable mount. Needs format v0.4.
+    pub fn scrub(&mut self) -> Result<ScrubReport> {
+        match &mut self.driver {
+            Driver::V3(_) => Err(Error::Unsupported("scrub needs format v0.4")),
+            Driver::V4(fs) => fs.scrub(),
+        }
     }
 }

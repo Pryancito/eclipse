@@ -22,7 +22,10 @@
 //!   `(ino, INODE_ITEM, 0)`, `(ino, INODE_REF, hash(dir, index))` per name,
 //!   `(ino, EXTENT_DATA, file offset)` per extent, and per directory
 //!   `(dir, DIR_ITEM, hash(name))` for lookups and `(dir, DIR_INDEX, n)` for
-//!   readdir in creation order.
+//!   readdir in creation order;
+//! - checksum tree (7): `(first block of a bucket, CSUM_ITEM, 0)` -> the
+//!   CRC32C of every data block in use among the bucket's
+//!   [`CSUM_BUCKET`] blocks (a presence bitmap, then the checksums).
 
 use alloc::vec;
 use alloc::vec::Vec;
@@ -43,6 +46,8 @@ pub const ROOT_TREE: u64 = 1;
 pub const REFS_TREE: u64 = 2;
 /// The default subvolume (same number as btrfs's FS_TREE).
 pub const FS_TREE: u64 = 5;
+/// Checksums of file data, by disk block (btrfs's CSUM_TREE number).
+pub const CSUM_TREE: u64 = 7;
 /// First inode number of every subvolume: its root directory.
 pub const FIRST_INO: u64 = 256;
 
@@ -52,6 +57,7 @@ pub const XATTR_ITEM: u8 = 24;
 pub const DIR_ITEM: u8 = 84;
 pub const DIR_INDEX: u8 = 96;
 pub const EXTENT_DATA: u8 = 108;
+pub const CSUM_ITEM: u8 = 128;
 pub const ROOT_ITEM: u8 = 132;
 pub const REF_ITEM: u8 = 200;
 
@@ -490,9 +496,112 @@ pub fn decode_ref(b: &[u8]) -> Result<(u64, u32)> {
     Ok((le64(b, 0), le32(b, 8)))
 }
 
+// ---------------------------------------------------------------------------
+// Data checksums
+// ---------------------------------------------------------------------------
+
+/// Data blocks per checksum item.
+pub const CSUM_BUCKET: u64 = 256;
+const CSUM_MAP: usize = CSUM_BUCKET as usize / 8;
+
+/// The checksums of one bucket of [`CSUM_BUCKET`] disk blocks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CsumBucket(pub Vec<Option<u32>>);
+
+impl Default for CsumBucket {
+    fn default() -> Self {
+        Self(vec![None; CSUM_BUCKET as usize])
+    }
+}
+
+impl CsumBucket {
+    pub fn is_empty(&self) -> bool {
+        self.0.iter().all(Option::is_none)
+    }
+
+    /// Presence bitmap, then a CRC32C per block up to the last present one.
+    pub fn encode(&self) -> Vec<u8> {
+        let n = self
+            .0
+            .iter()
+            .rposition(Option::is_some)
+            .map_or(0, |i| i + 1);
+        let mut b = vec![0u8; CSUM_MAP + 4 * n];
+        for (i, c) in self.0[..n].iter().enumerate() {
+            if let Some(c) = c {
+                b[i / 8] |= 1 << (i % 8);
+                put32(&mut b, CSUM_MAP + 4 * i, *c);
+            }
+        }
+        b
+    }
+
+    /// The checksum of block `i` of an encoded bucket, without decoding
+    /// the rest of it.
+    pub fn lookup(b: &[u8], i: usize) -> Result<Option<u32>> {
+        if b.len() < CSUM_MAP || i >= CSUM_BUCKET as usize {
+            return Err(Error::Corrupt("checksum item"));
+        }
+        if b[i / 8] & (1 << (i % 8)) == 0 {
+            return Ok(None);
+        }
+        if CSUM_MAP + 4 * i + 4 > b.len() {
+            return Err(Error::Corrupt("checksum item"));
+        }
+        Ok(Some(le32(b, CSUM_MAP + 4 * i)))
+    }
+
+    pub fn decode(b: &[u8]) -> Result<Self> {
+        if b.len() < CSUM_MAP || !(b.len() - CSUM_MAP).is_multiple_of(4) {
+            return Err(Error::Corrupt("checksum item"));
+        }
+        let n = (b.len() - CSUM_MAP) / 4;
+        if n > CSUM_BUCKET as usize {
+            return Err(Error::Corrupt("checksum item"));
+        }
+        let mut out = Self::default();
+        for i in 0..CSUM_BUCKET as usize {
+            if b[i / 8] & (1 << (i % 8)) != 0 {
+                if i >= n {
+                    return Err(Error::Corrupt("checksum item"));
+                }
+                out.0[i] = Some(le32(b, CSUM_MAP + 4 * i));
+            }
+        }
+        Ok(out)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn checksum_buckets_round_trip() {
+        let mut c = CsumBucket::default();
+        assert!(c.is_empty());
+        assert_eq!(c.encode().len(), 32);
+        c.0[0] = Some(7);
+        c.0[9] = Some(0xDEAD_BEEF);
+        c.0[255] = Some(0);
+        let e = c.encode();
+        assert_eq!(e.len(), 32 + 4 * 256);
+        assert_eq!(CsumBucket::decode(&e).unwrap(), c);
+        c.0[255] = None;
+        let e = c.encode();
+        assert_eq!(e.len(), 32 + 4 * 10);
+        assert_eq!(CsumBucket::decode(&e).unwrap(), c);
+        assert_eq!(CsumBucket::lookup(&e, 9).unwrap(), Some(0xDEAD_BEEF));
+        assert_eq!(CsumBucket::lookup(&e, 8).unwrap(), None);
+        assert_eq!(CsumBucket::lookup(&e, 200).unwrap(), None);
+        assert!(CsumBucket::lookup(&e, 256).is_err());
+        // A present bit past the stored checksums, or a ragged length.
+        let mut bad = e.clone();
+        bad[20] = 1;
+        assert!(CsumBucket::decode(&bad).is_err());
+        assert!(CsumBucket::decode(&e[..33]).is_err());
+        assert!(CsumBucket::decode(&[0; 10]).is_err());
+    }
 
     fn sb() -> SuperV4 {
         SuperV4 {

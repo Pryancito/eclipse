@@ -589,7 +589,8 @@ fn space_freed_by_an_open_transaction_is_reused_after_commit() {
     let root = fs.root_ino();
     let f = fs.create(root, "big", FileKind::Regular, 0o644, 0).unwrap();
     let free = fs.fsinfo().total_bytes - fs.fsinfo().bytes_used;
-    let data = vec![1u8; free as usize - 64 * 1024];
+    // Leave room for the metadata reserve and the checksum tree.
+    let data = vec![1u8; free as usize - 128 * 1024];
     write_all(&mut fs, f, 0, &data);
     fs.unlink(root, "big").unwrap();
     // The device is nearly full on disk until the unlink commits; the next
@@ -774,6 +775,9 @@ fn random_operations_on((disk, mut fs): (std::sync::Arc<MemDisk>, EclipseFS)) {
     }
     let mut fs = remount(&disk, fs);
     check(&mut fs, &dirs, &model);
+    if fs.format_version() == 4 {
+        assert!(fs.scrub().unwrap().is_clean());
+    }
 
     // Removing everything gives back every block except the ones the
     // directories grew into (they keep their tombstones until compacted).

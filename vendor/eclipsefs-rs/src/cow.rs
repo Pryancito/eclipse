@@ -23,13 +23,14 @@ use alloc::vec::Vec;
 use crate::blocks::{AllocationGroup, BlockAllocator};
 use crate::btree::{Body, Key, Root, Store, MAX_ITEM};
 use crate::cowfmt::*;
+use crate::crc::crc32c;
 use crate::device::BlockDevice;
 use crate::format::{
     FileKind, BLOCK_SIZE, GROUP_BLOCKS, MAX_NAME_LEN, MAX_SYMLINK_LEN, MIN_GROUP_BLOCKS,
 };
-use crate::fs::{CheckReport, DirEntry, FsStat, InodeStat, COMMIT_OPS};
+use crate::fs::{CheckReport, DirEntry, FsStat, InodeStat, ScrubReport, COMMIT_OPS};
 use crate::journal::{JournalArea, Overlay};
-use crate::space::{metadata_reserve, BlockSpace, RefMap};
+use crate::space::{metadata_reserve, BlockSpace, RangeSet, RefMap};
 use crate::v3::write_home;
 use crate::{Error, Result};
 
@@ -60,6 +61,8 @@ pub struct CowFs {
     st: Store,
     root_tree: Root,
     refs_root: Root,
+    /// Checksums of file data.
+    csum_root: Root,
     /// Reference counts as last written to the reference tree.
     refs_on_disk: RefMap,
     subvol: u64,
@@ -168,6 +171,7 @@ impl CowFs {
         let subvol = sb.default_subvol;
         let fs_item = item(&mut st, subvol)?;
         let refs_root = refs_item.root;
+        let csum_root = item(&mut st, CSUM_TREE)?.root;
         let mut entries = Vec::new();
         for (k, d) in st.range(&refs_root, &Key::MIN, &Key::MAX, usize::MAX)? {
             if k.ty != REF_ITEM {
@@ -186,6 +190,7 @@ impl CowFs {
             st,
             root_tree,
             refs_root,
+            csum_root,
             refs_on_disk: refs,
             subvol,
             fs_root: fs_item.root,
@@ -284,6 +289,8 @@ impl CowFs {
         if !changed {
             return Ok(());
         }
+        // Data checksums into the checksum tree.
+        self.store_csums()?;
         // Reference counts into the reference tree.
         if self.sp.refs_dirty {
             let old: BTreeMap<u64, (u64, u32)> = self
@@ -327,19 +334,8 @@ impl CowFs {
                 v,
             )?;
         }
-        let refs_key = Key::new(REFS_TREE, ROOT_ITEM, 0);
-        let refs_item = RootItem::decode(
-            &self
-                .st
-                .get(&self.root_tree, &refs_key)?
-                .ok_or(Error::Corrupt("missing tree"))?,
-        )?;
-        if refs_item.root != self.refs_root {
-            let mut it = refs_item;
-            it.root = self.refs_root;
-            self.st
-                .update(&mut self.sp, &mut self.root_tree, refs_key, it.encode())?;
-        }
+        self.store_root(REFS_TREE, self.refs_root)?;
+        self.store_root(CSUM_TREE, self.csum_root)?;
         // New nodes first, made durable before the superblock points at them.
         let nodes = self.st.take_dirty();
         write_home(&*self.raw, &nodes)?;
@@ -387,6 +383,103 @@ impl CowFs {
             }
         }
         r
+    }
+
+    /// Point the root tree's item for tree `id` at `root` if it moved.
+    fn store_root(&mut self, id: u64, root: Root) -> Result<()> {
+        let key = Key::new(id, ROOT_ITEM, 0);
+        let mut it = RootItem::decode(
+            &self
+                .st
+                .get(&self.root_tree, &key)?
+                .ok_or(Error::Corrupt("missing tree"))?,
+        )?;
+        if it.root != root {
+            it.root = root;
+            self.st
+                .update(&mut self.sp, &mut self.root_tree, key, it.encode())?;
+        }
+        Ok(())
+    }
+
+    /// Move the pending checksum changes into the checksum tree, one item
+    /// per bucket of blocks.
+    fn store_csums(&mut self) -> Result<()> {
+        if self.sp.csums.is_empty() {
+            return Ok(());
+        }
+        let pending: Vec<(u64, Option<u32>)> =
+            self.sp.csums.iter().map(|(&b, &c)| (b, c)).collect();
+        let mut i = 0;
+        while i < pending.len() {
+            let bucket = pending[i].0 / CSUM_BUCKET * CSUM_BUCKET;
+            let key = Key::new(bucket, CSUM_ITEM, 0);
+            let old = self.st.get(&self.csum_root, &key)?;
+            let mut cb = match &old {
+                Some(d) => CsumBucket::decode(d)?,
+                None => CsumBucket::default(),
+            };
+            while i < pending.len() && pending[i].0 < bucket + CSUM_BUCKET {
+                cb.0[(pending[i].0 - bucket) as usize] = pending[i].1;
+                i += 1;
+            }
+            if cb.is_empty() {
+                if old.is_some() {
+                    self.st.delete(&mut self.sp, &mut self.csum_root, key)?;
+                }
+            } else {
+                self.st
+                    .upsert(&mut self.sp, &mut self.csum_root, key, cb.encode())?;
+            }
+        }
+        self.sp.csums.clear();
+        Ok(())
+    }
+
+    /// Checksums of disk blocks `start..start+n` (`None`: none recorded).
+    fn csums(&mut self, start: u64, n: u64) -> Result<Vec<Option<u32>>> {
+        let mut out = vec![None; n as usize];
+        if n == 0 {
+            return Ok(out);
+        }
+        let mut bucket = start / CSUM_BUCKET * CSUM_BUCKET;
+        while bucket < start + n {
+            if let Some(d) = self
+                .st
+                .get(&self.csum_root, &Key::new(bucket, CSUM_ITEM, 0))?
+            {
+                let from = start.max(bucket);
+                let to = (start + n).min(bucket + CSUM_BUCKET);
+                for b in from..to {
+                    out[(b - start) as usize] = CsumBucket::lookup(&d, (b - bucket) as usize)?;
+                }
+            }
+            bucket += CSUM_BUCKET;
+        }
+        for (&b, &c) in self.sp.csums.range(start..start + n) {
+            out[(b - start) as usize] = c;
+        }
+        Ok(out)
+    }
+
+    /// Check whole blocks read from disk block `pblk` on.
+    fn verify(&mut self, pblk: u64, data: &[u8]) -> Result<()> {
+        let n = data.len() as u64 / BS;
+        for (i, c) in self.csums(pblk, n)?.into_iter().enumerate() {
+            let block = &data[i * BS as usize..(i + 1) * BS as usize];
+            match c {
+                Some(c) if crc32c(block) == c => {}
+                Some(_) => {
+                    warn!(
+                        "eclipsefs: data checksum mismatch at block {}",
+                        pblk + i as u64
+                    );
+                    return Err(Error::Corrupt("data checksum"));
+                }
+                None => return Err(Error::Corrupt("missing data checksum")),
+            }
+        }
+        Ok(())
     }
 
     pub fn sync(&mut self) -> Result<()> {
@@ -611,7 +704,8 @@ impl CowFs {
         crate::btree::Space::decref_data(&mut self.sp, start, len)
     }
 
-    /// Read file bytes `off..off+buf.len()` (no size check; holes are 0).
+    /// Read file bytes `off..off+buf.len()` (no size check; holes are 0),
+    /// verifying the checksum of every block read.
     fn read_blocks(&mut self, ino: u64, off: u64, buf: &mut [u8]) -> Result<()> {
         buf.fill(0);
         if buf.is_empty() {
@@ -621,13 +715,65 @@ impl CowFs {
         for e in self.extents(ino, off / BS, end.div_ceil(BS))? {
             let s = (e.lblk * BS).max(off);
             let t = ((e.lblk + e.blocks) * BS).min(end);
-            if s < t {
-                let disk = e.pblk * BS + (s - e.lblk * BS);
-                self.raw
-                    .read_at(disk, &mut buf[(s - off) as usize..(t - off) as usize])?;
+            let mut pos = s;
+            while pos < t {
+                // Whole blocks, a bounded number at a time.
+                let b0 = pos / BS;
+                let b1 = t.div_ceil(BS).min(b0 + WRITE_CHUNK);
+                let upto = (b1 * BS).min(t);
+                let p0 = e.pblk + (b0 - e.lblk);
+                let dst = &mut buf[(pos - off) as usize..(upto - off) as usize];
+                if pos.is_multiple_of(BS) && upto.is_multiple_of(BS) {
+                    self.raw.read_at(p0 * BS, dst)?;
+                    self.verify(p0, dst)?;
+                } else {
+                    let mut tmp = vec![0u8; ((b1 - b0) * BS) as usize];
+                    self.raw.read_at(p0 * BS, &mut tmp)?;
+                    self.verify(p0, &tmp)?;
+                    let o = (pos - b0 * BS) as usize;
+                    let len = dst.len();
+                    dst.copy_from_slice(&tmp[o..o + len]);
+                }
+                pos = upto;
             }
         }
         Ok(())
+    }
+
+    /// The new contents of file blocks `lb..lb+got` for a write of `data`
+    /// at `off`: the data where it covers them, the old contents (or zeros)
+    /// of the partly written blocks at the edges.
+    fn fill_blocks(
+        &mut self,
+        ino: u64,
+        lb: u64,
+        got: u64,
+        off: u64,
+        data: &[u8],
+    ) -> Result<Vec<u8>> {
+        let end = off + data.len() as u64;
+        let bstart = lb * BS;
+        let bend = (lb + got) * BS;
+        let mut buf = vec![0u8; (got * BS) as usize];
+        let s = off.max(bstart);
+        let t = end.min(bend);
+        if s > bstart {
+            let mut head = vec![0u8; BS as usize];
+            self.read_blocks(ino, bstart, &mut head)?;
+            buf[..BS as usize].copy_from_slice(&head);
+        }
+        if t < bend {
+            let at = bend - BS;
+            if at >= bstart + if s > bstart { BS } else { 0 } || got == 1 && s == bstart {
+                let mut tail = vec![0u8; BS as usize];
+                self.read_blocks(ino, at, &mut tail)?;
+                let o = (at - bstart) as usize;
+                buf[o..o + BS as usize].copy_from_slice(&tail);
+            }
+        }
+        buf[(s - bstart) as usize..(t - bstart) as usize]
+            .copy_from_slice(&data[(s - off) as usize..(t - off) as usize]);
+        Ok(buf)
     }
 
     /// Write `data` at `off` into regular (non-inline) storage, copy on
@@ -682,29 +828,22 @@ impl CowFs {
                 }
             };
             // Contents of the blocks: data where the write covers them, the
-            // old contents (or zeros) at the edges.
-            let bstart = lb * BS;
-            let bend = (lb + got) * BS;
-            let mut buf = vec![0u8; (got * BS) as usize];
-            let s = off.max(bstart);
-            let t = end.min(bend);
-            if s > bstart {
-                let mut head = vec![0u8; BS as usize];
-                self.read_blocks(ino, bstart, &mut head)?;
-                buf[..BS as usize].copy_from_slice(&head);
-            }
-            if t < bend {
-                let at = bend - BS;
-                if at >= bstart + if s > bstart { BS } else { 0 } || got == 1 && s == bstart {
-                    let mut tail = vec![0u8; BS as usize];
-                    self.read_blocks(ino, at, &mut tail)?;
-                    let o = (at - bstart) as usize;
-                    buf[o..o + BS as usize].copy_from_slice(&tail);
+            // old contents (or zeros) at the edges. If the old contents
+            // cannot be read, the new blocks go back.
+            let buf = match self.fill_blocks(ino, lb, got, off, data) {
+                Ok(b) => b,
+                Err(e) => {
+                    if in_place.is_none() {
+                        self.sp_decref(pblk, got)?;
+                    }
+                    return Err(e);
                 }
-            }
-            buf[(s - bstart) as usize..(t - bstart) as usize]
-                .copy_from_slice(&data[(s - off) as usize..(t - off) as usize]);
+            };
+            let t = end.min((lb + got) * BS);
             self.raw.write_at(pblk * BS, &buf)?;
+            for (i, block) in buf.chunks(BS as usize).enumerate() {
+                self.sp.csums.insert(pblk + i as u64, Some(crc32c(block)));
+            }
             if in_place.is_none() {
                 self.set_mapping(ino, inode, lb, got, pblk)?;
             }
@@ -1354,6 +1493,8 @@ impl CowFs {
             .iter()
             .map(|r| (r.bytenr, r.level, Some(r.gen)))
             .collect();
+        let mut data = RangeSet::default();
+        let mut summed = RangeSet::default();
         while let Some((b, level, gen)) = stack.pop() {
             if own(&mut owners, total, b, 1)? > 1 {
                 continue;
@@ -1369,10 +1510,22 @@ impl CowFs {
                     for (k, d) in &items {
                         if let Some((s, l)) = extent_of(k, d) {
                             own(&mut owners, total, s, l)?;
+                            data.insert(s, l);
+                        }
+                        if k.ty == CSUM_ITEM {
+                            for (i, c) in CsumBucket::decode(d)?.0.into_iter().enumerate() {
+                                if c.is_some() {
+                                    summed.insert(k.objectid + i as u64, 1);
+                                }
+                            }
                         }
                     }
                 }
             }
+        }
+        // Every data block in use has a checksum, and nothing else does.
+        if summed != data {
+            return Err(Error::Corrupt("fsck: data checksums"));
         }
         for b in 0..total {
             let seen = owners.get(&b).copied().unwrap_or(0);
@@ -1530,6 +1683,84 @@ impl CowFs {
     }
 }
 
+impl CowFs {
+    /// See [`EclipseFS::scrub`](crate::EclipseFS::scrub).
+    pub fn scrub(&mut self) -> Result<ScrubReport> {
+        if !self.read_only {
+            self.flush()?;
+        }
+        let mut r = ScrubReport::default();
+        let mut seen = BTreeSet::new();
+        let mut data = RangeSet::default();
+        let root = self.root_tree;
+        let mut stack = vec![(root.bytenr, root.level, Some(root.gen))];
+        while let Some((b, level, gen)) = stack.pop() {
+            if !seen.insert(b) {
+                continue;
+            }
+            r.tree_nodes += 1;
+            let node = match self.st.read_disk(b, level, gen) {
+                Ok(n) => n,
+                Err(Error::Io) => return Err(Error::Io),
+                Err(_) => {
+                    r.bad_tree_nodes.push(b);
+                    continue;
+                }
+            };
+            match node.body {
+                Body::Internal(ptrs) => {
+                    for p in ptrs {
+                        stack.push((p.bytenr, level - 1, Some(p.gen)));
+                    }
+                }
+                Body::Leaf(items) => {
+                    for (k, d) in &items {
+                        if let Some((s, l)) = extent_of(k, d) {
+                            data.insert(s, l);
+                        } else if k.ty == ROOT_ITEM {
+                            if let Ok(it) = RootItem::decode(d) {
+                                stack.push((it.root.bytenr, it.root.level, Some(it.root.gen)));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let mut buf = vec![0u8; (CSUM_BUCKET * BS) as usize];
+        for (start, len) in data.iter() {
+            let mut b = start;
+            while b < start + len {
+                let n = (start + len - b).min(CSUM_BUCKET - b % CSUM_BUCKET);
+                let chunk = &mut buf[..(n * BS) as usize];
+                self.raw.read_at(b * BS, chunk)?;
+                r.data_blocks += n;
+                match self.csums(b, n) {
+                    Ok(sums) => {
+                        for (i, c) in sums.into_iter().enumerate() {
+                            let block = &chunk[i * BS as usize..(i + 1) * BS as usize];
+                            if c != Some(crc32c(block)) {
+                                r.bad_data_blocks.push(b + i as u64);
+                            }
+                        }
+                    }
+                    Err(Error::Io) => return Err(Error::Io),
+                    // The checksums themselves are unreadable.
+                    Err(_) => r.bad_data_blocks.extend(b..b + n),
+                }
+                b += n;
+            }
+        }
+        if !r.is_clean() {
+            warn!(
+                "eclipsefs: scrub found {} bad tree nodes and {} bad data blocks",
+                r.bad_tree_nodes.len(),
+                r.bad_data_blocks.len()
+            );
+        }
+        Ok(r)
+    }
+}
+
 impl Drop for CowFs {
     fn drop(&mut self) {
         if !self.read_only {
@@ -1558,6 +1789,7 @@ pub(crate) fn format(
     let mut st = Store::new(null, uuid, gen, total, extent_of);
     let mut root_tree = st.create(&mut sp, ROOT_TREE, 0)?;
     let refs_root = st.create(&mut sp, REFS_TREE, 0)?;
+    let csum_root = st.create(&mut sp, CSUM_TREE, 0)?;
     let mut fs_root = st.create(&mut sp, FS_TREE, 0)?;
     let mut dir = InodeItem::new(FileKind::Dir, 0o755, now, gen);
     dir.parent = FIRST_INO;
@@ -1583,6 +1815,12 @@ pub(crate) fn format(
         &mut root_tree,
         Key::new(REFS_TREE, ROOT_ITEM, 0),
         item(refs_root, 0, 0).encode(),
+    )?;
+    st.insert(
+        &mut sp,
+        &mut root_tree,
+        Key::new(CSUM_TREE, ROOT_ITEM, 0),
+        item(csum_root, 0, 0).encode(),
     )?;
     st.insert(
         &mut sp,

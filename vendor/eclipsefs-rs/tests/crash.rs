@@ -252,6 +252,10 @@ fn verify(run: &Run, image: Vec<u8>, cut: usize) {
         .unwrap_or_else(|e| panic!("mount after crash at {}: {:?}", cut, e));
     fs.check()
         .unwrap_or_else(|e| panic!("check after crash at {}: {:?}", cut, e));
+    if fs.format_version() == 4 {
+        let r = fs.scrub().unwrap();
+        assert!(r.is_clean(), "scrub after crash at {}: {:?}", cut, r);
+    }
     let h = hash(&snapshot(&mut fs));
     let durable = run
         .syncs

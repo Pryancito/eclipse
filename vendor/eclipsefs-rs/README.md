@@ -53,6 +53,12 @@ Paso 1 de la paridad con btrfs. Todo vive en árboles B+ copy-on-write
 - **Contadores de referencias perezosos** (Rodeh, como btrfs): copiar un nodo
   compartido incrementa a sus hijos; es la base de snapshots y reflinks.
 - Archivos de hasta 1 KiB dentro del árbol (extent en línea).
+- **Checksums de datos** (fase 2): árbol de checksums (7) con el CRC32C de
+  cada bloque de datos, en ítems de 256 bloques. Toda lectura se verifica y
+  un bloque dañado da `Corrupt("data checksum")` (EIO), sin afectar al resto
+  del archivo. `EclipseFS::scrub()` lee del disco cada nodo y cada bloque de
+  datos y devuelve los dañados; `check()` exige que cada bloque de datos
+  tenga checksum. En x86_64 el CRC32C usa la instrucción SSE4.2.
 - Confirmación: nodos nuevos → `sync` → superbloque y mapas de bits juntos por
   el journal. Tras un corte de luz se ve el estado viejo o el nuevo entero,
   **contenido de archivos incluido** (sobrescrituras y truncados a mitad de
@@ -96,7 +102,7 @@ grupo k (32768 bloques = 128 MiB)
 ## Próximos pasos (paridad con btrfs)
 
 1. ~~Núcleo CoW: árbol B+, refcounts, datos nunca sobrescritos~~ (v0.4).
-2. Checksums de datos y scrub.
+2. ~~Checksums de datos y scrub~~ (la reparación llega con DUP/RAID en la fase 7).
 3. Subvolúmenes, snapshots rw/ro, reflinks y dedupe.
 4. xattrs/ACL, atributos (inmutable, append, nocow), fallocate y huecos.
 5. Compresión zlib, lz4 y zstd.
@@ -124,6 +130,9 @@ cargo test --release -p eclipsefs --features std
   `check()` y mostrar el estado tras alguna operación completa. En v0.4 la
   carga incluye sobrescrituras y truncados sin alinear; en v0.3, solo
   añadidos.
+- `tests/csum.rs`: bits podridos en datos y en nodos, detectados al leer y
+  por `scrub`; los checksums siguen a sobrescrituras, truncados y borrados.
+  Los tests de crash también pasan `scrub` en cada imagen.
 - Los tests que dependen del formato corren en las dos versiones (`*_v3`).
 - `tests/performance.rs`: las mismas cargas sobre EclipseFS y btrfs, con tiempo
   y bytes leídos/escritos en el dispositivo. `scripts/eclipsefs-bench.sh` las

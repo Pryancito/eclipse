@@ -208,6 +208,9 @@ pub struct BlockSpace {
     /// Free blocks file data may not take, so that tree updates (which
     /// allocate as they copy) still find room on a full device.
     pub reserve: u64,
+    /// Data checksum changes not yet in the checksum tree: the CRC32C of a
+    /// block just written, or `None` for a data block just freed.
+    pub csums: BTreeMap<u64, Option<u32>>,
 }
 
 /// Blocks kept back for metadata on a filesystem of `total` blocks: 1/64 of
@@ -225,6 +228,7 @@ impl BlockSpace {
             fresh: RangeSet::default(),
             meta_goal: 0,
             reserve: 0,
+            csums: BTreeMap::new(),
         }
     }
 
@@ -317,6 +321,9 @@ impl Space for BlockSpace {
         }
         for (s, l) in self.refs.add(start, len, -1) {
             self.free(s, l)?;
+            for b in s..s + l {
+                self.csums.insert(b, None);
+            }
         }
         Ok(())
     }

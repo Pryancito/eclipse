@@ -79,7 +79,58 @@ pub fn crc32c(data: &[u8]) -> u32 {
 }
 
 /// Continue a CRC32C: `crc32c_update(crc32c(a), b) == crc32c(a ++ b)`.
+/// Uses the SSE4.2 `crc32` instruction when the CPU has it (it works on
+/// general-purpose registers, so it is fine in the kernel too).
 pub fn crc32c_update(crc: u32, data: &[u8]) -> u32 {
+    #[cfg(target_arch = "x86_64")]
+    if hw::available() {
+        // SAFETY: the CPU reports SSE4.2.
+        return !unsafe { hw::update(!crc, data) };
+    }
+    crc32c_table(crc, data)
+}
+
+#[cfg(target_arch = "x86_64")]
+mod hw {
+    use core::sync::atomic::{AtomicU8, Ordering};
+
+    /// 0: not probed yet, 1: SSE4.2, 2: none.
+    static SSE42: AtomicU8 = AtomicU8::new(0);
+
+    pub fn available() -> bool {
+        match SSE42.load(Ordering::Relaxed) {
+            1 => true,
+            2 => false,
+            _ => {
+                #[allow(unused_unsafe)]
+                // SAFETY: CPUID leaf 1 exists on every x86_64 CPU.
+                let ecx = unsafe { core::arch::x86_64::__cpuid(1) }.ecx;
+                let yes = ecx & (1 << 20) != 0;
+                SSE42.store(if yes { 1 } else { 2 }, Ordering::Relaxed);
+                yes
+            }
+        }
+    }
+
+    /// Raw (not inverted) CRC32C state over `data`.
+    #[target_feature(enable = "sse4.2")]
+    pub unsafe fn update(crc: u32, data: &[u8]) -> u32 {
+        use core::arch::x86_64::{_mm_crc32_u64, _mm_crc32_u8};
+        let (chunks, rest) = data.as_chunks::<8>();
+        let mut c = crc as u64;
+        for ch in chunks {
+            c = _mm_crc32_u64(c, u64::from_le_bytes(*ch));
+        }
+        let mut c = c as u32;
+        for &b in rest {
+            c = _mm_crc32_u8(c, b);
+        }
+        c
+    }
+}
+
+/// Table-driven CRC32C (slice-by-8), for CPUs without an instruction.
+pub fn crc32c_table(crc: u32, data: &[u8]) -> u32 {
     let t = &C_TABLES;
     let mut crc = !crc;
     let (chunks, rest) = data.as_chunks::<8>();
@@ -103,7 +154,19 @@ pub fn crc32c_update(crc: u32, data: &[u8]) -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{crc32, crc32_update, crc32c, crc32c_update};
+    use super::{crc32, crc32_update, crc32c, crc32c_table, crc32c_update};
+
+    #[test]
+    fn crc32c_instruction_matches_the_tables() {
+        let data: alloc::vec::Vec<u8> = (0..10_000u32).map(|i| (i * 31 + i / 7) as u8).collect();
+        for len in [0, 1, 7, 8, 9, 63, 4096, 10_000] {
+            for start in [0, 1, 3] {
+                let d = &data[start..len.max(start)];
+                assert_eq!(crc32c_update(0x1234, d), crc32c_table(0x1234, d));
+                assert_eq!(crc32c(d), crc32c_table(0, d));
+            }
+        }
+    }
 
     #[test]
     fn crc32c_known_vectors() {
