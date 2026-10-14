@@ -3,15 +3,22 @@
 //! Same shape as `btrfs_mount`: the crate is a `&mut self` filesystem behind
 //! one lock, the VFS inodes are `(fs, ino)` pairs, and the block device is the
 //! very `DevAdapter` btrfs uses, so both get the same chunking and retries.
+//!
+//! Mount options (`-o`): `compress=zlib|lz4|zstd|no` (and `compress-force=`),
+//! `subvol=<path>` / `subvolid=<id>` for the subvolume to show as `/`,
+//! `degraded` to mount a volume with devices missing, and `device=<dev>` to
+//! name a member of a volume. A volume's other members are also found by
+//! scanning every block device the kernel registered, as `btrfs device
+//! scan` does. The filesystem ioctls (chattr, reflink, snapshots, quotas,
+//! scrub, devices) are in `eclipsefs_ioctl`.
 
 use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::any::Any;
-use core::convert::TryInto;
 
-use eclipsefs::{EclipseFS, Error as EfsError, FileKind};
+use eclipsefs::{Compression, EclipseFS, Error as EfsError, FileKind};
 use lock::Mutex;
 use rcore_fs::vfs::{
     FileSystem, FileType, FsError, FsInfo, INode, Metadata, PollStatus, Result, Timespec,
@@ -52,26 +59,177 @@ fn wall_clock() -> (u64, u32) {
 type Listing = Arc<Vec<(String, u64)>>;
 
 pub struct EclipseMountFs {
-    inner: Mutex<EclipseFS>,
+    pub(crate) inner: Mutex<EclipseFS>,
+    /// Mounted read-only: the ioctls that change anything refuse (EROFS).
+    pub(crate) read_only: bool,
+    /// What `/` of this mount is: the default subvolume's root directory,
+    /// or the one `subvol=`/`subvolid=` named.
+    root: u64,
     this: Mutex<Weak<Self>>,
     /// Directory listings by inode, so `getdents` over a big directory is not
     /// one full listing per entry. Dropped on any change to that directory.
     dir_cache: Mutex<BTreeMap<u64, Listing>>,
 }
 
+/// Block devices the kernel found at boot, by name (`sda2`), for the
+/// device scan that puts a volume together and for `device=`.
+static BLOCK_DEVICES: Mutex<Vec<(String, Arc<dyn BlockScheme>)>> = Mutex::new(Vec::new());
+
+/// Remember a block device for the volume scan (see [`BLOCK_DEVICES`]).
+pub(crate) fn register_block_device(name: &str, block: Arc<dyn BlockScheme>) {
+    let mut devs = BLOCK_DEVICES.lock();
+    devs.retain(|(n, _)| n != name);
+    devs.push((String::from(name), block));
+}
+
+/// Forget a block device that went away.
+#[cfg(test)]
+pub(crate) fn forget_block_device(name: &str) {
+    BLOCK_DEVICES.lock().retain(|(n, _)| n != name);
+}
+
+/// The EclipseFS `-o` options this adapter understands.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct EfsOptions {
+    /// `compress=`: `Some(None)` is `compress=no`.
+    pub compress: Option<Option<Compression>>,
+    pub degraded: bool,
+    /// `device=` names, basename only (`/dev/sdb1` -> `sdb1`).
+    pub devices: Vec<String>,
+    pub subvol: Option<String>,
+    pub subvolid: Option<u64>,
+}
+
+impl EfsOptions {
+    /// Read the comma-separated `data` of mount(2). Options of the generic
+    /// layer (`ro`, `noatime`, ...) are left to it; an EclipseFS option with
+    /// a bad value is an error, as on btrfs.
+    pub(crate) fn parse(data: &str) -> Result<Self> {
+        let mut o = Self::default();
+        for opt in data.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+            let (key, value) = match opt.split_once('=') {
+                Some((k, v)) => (k, Some(v)),
+                None => (opt, None),
+            };
+            match (key, value) {
+                ("compress" | "compress-force", None) => {
+                    o.compress = Some(Some(Compression::Zlib));
+                }
+                ("compress" | "compress-force", Some(v)) => {
+                    // btrfs accepts a level after a colon (`zstd:3`).
+                    let algo = v.split(':').next().unwrap_or("");
+                    o.compress = Some(match algo {
+                        "no" | "none" => None,
+                        name => Some(Compression::from_name(name).ok_or(FsError::InvalidParam)?),
+                    });
+                }
+                ("degraded", None) => o.degraded = true,
+                ("device", Some(v)) if !v.is_empty() => {
+                    let name = v.rsplit('/').next().unwrap_or(v);
+                    o.devices.push(String::from(name));
+                }
+                ("subvol", Some(v)) => o.subvol = Some(String::from(v)),
+                ("subvolid", Some(v)) => {
+                    o.subvolid = Some(v.parse().map_err(|_| FsError::InvalidParam)?);
+                }
+                ("device" | "subvol" | "subvolid", _) => return Err(FsError::InvalidParam),
+                _ => {}
+            }
+        }
+        Ok(o)
+    }
+}
+
+fn adapter(backend: &MountBackend) -> Result<Arc<dyn eclipsefs::BlockDevice>> {
+    let size = backend_size(backend)?;
+    let device = device_from_backend(backend)?;
+    Ok(Arc::new(DevAdapter::new(device, size)))
+}
+
+/// The other members of the volume `main` belongs to: the `device=` ones
+/// first, then every registered block device whose superblock carries the
+/// same filesystem uuid, one per device id.
+fn volume_members(
+    main: &Arc<dyn eclipsefs::BlockDevice>,
+    probe: &eclipsefs::DeviceProbe,
+    opts: &EfsOptions,
+) -> Vec<Arc<dyn eclipsefs::BlockDevice>> {
+    let registered: Vec<(String, Arc<dyn BlockScheme>)> = BLOCK_DEVICES.lock().clone();
+    let named = opts
+        .devices
+        .iter()
+        .filter_map(|want| registered.iter().find(|(n, _)| n == want));
+    let rest = registered.iter().filter(|(n, _)| !opts.devices.contains(n));
+    let mut ids = alloc::vec![probe.devid];
+    let mut devs = alloc::vec![main.clone()];
+    for (name, block) in named.chain(rest) {
+        if !probe_eclipsefs_superblock(block) {
+            continue;
+        }
+        let Ok(dev) = adapter(&MountBackend::Block(block.clone())) else {
+            continue;
+        };
+        match eclipsefs::probe(&*dev) {
+            Ok(p) if p.uuid == probe.uuid && !ids.contains(&p.devid) => {
+                warn!(
+                    "eclipsefs: device {} of the volume is /dev/{}",
+                    p.devid, name
+                );
+                ids.push(p.devid);
+                devs.push(dev);
+            }
+            _ => {}
+        }
+    }
+    devs
+}
+
 impl EclipseMountFs {
+    #[cfg(test)]
     pub fn open(backend: &MountBackend, read_only: bool) -> Result<Arc<Self>> {
+        Self::open_with(backend, read_only, &EfsOptions::default())
+    }
+
+    pub(crate) fn open_with(
+        backend: &MountBackend,
+        read_only: bool,
+        opts: &EfsOptions,
+    ) -> Result<Arc<Self>> {
         let size = backend_size(backend)?;
-        let device = device_from_backend(backend)?;
-        let adapter: Arc<dyn eclipsefs::BlockDevice> = Arc::new(DevAdapter::new(device, size));
+        let adapter = adapter(backend)?;
         warn!(
             "eclipsefs: mounting, device size = {:#x} ({} MiB), read_only={}",
             size,
             size / (1024 * 1024),
             read_only
         );
-        let mut fs = EclipseFS::mount(adapter, read_only).map_err(map_err)?;
+        let probe = eclipsefs::probe(&*adapter).map_err(map_err)?;
+        let mut fs = if probe.num_devices > 1 || opts.degraded {
+            let devs = volume_members(&adapter, &probe, opts);
+            warn!(
+                "eclipsefs: volume of {} devices, {} found{}",
+                probe.num_devices,
+                devs.len(),
+                if opts.degraded { " (degraded)" } else { "" }
+            );
+            if devs.len() < probe.num_devices as usize && !opts.degraded {
+                warn!("eclipsefs: devices of the volume are missing; mount -o degraded to use it");
+                return Err(FsError::InvalidParam);
+            }
+            if opts.degraded {
+                EclipseFS::mount_degraded(devs, read_only)
+            } else {
+                EclipseFS::mount_devices(devs, read_only)
+            }
+        } else {
+            EclipseFS::mount(adapter, read_only)
+        }
+        .map_err(map_err)?;
         fs.set_clock(wall_clock);
+        if let Some(algo) = opts.compress {
+            fs.set_mount_compression(algo).map_err(map_err)?;
+        }
+        let root = mount_root(&mut fs, opts)?;
         if !read_only {
             match fs.grow_to_device() {
                 Ok(true) => warn!("eclipsefs: filesystem expanded to device size"),
@@ -81,6 +239,8 @@ impl EclipseMountFs {
         }
         let arc = Arc::new(Self {
             inner: Mutex::new(fs),
+            read_only,
+            root,
             this: Mutex::new(Weak::new()),
             dir_cache: Mutex::new(BTreeMap::new()),
         });
@@ -88,7 +248,7 @@ impl EclipseMountFs {
         Ok(arc)
     }
 
-    fn inode(&self, ino: u64) -> Arc<EclipseMountINode> {
+    pub(crate) fn inode(&self, ino: u64) -> Arc<EclipseMountINode> {
         Arc::new(EclipseMountINode {
             fs: self.this.lock().upgrade().expect("EclipseMountFs dropped"),
             ino,
@@ -105,9 +265,33 @@ impl EclipseMountFs {
         Ok(entries)
     }
 
-    fn invalidate_dir(&self, dir: u64) {
+    pub(crate) fn invalidate_dir(&self, dir: u64) {
         self.dir_cache.lock().remove(&dir);
     }
+}
+
+/// The directory `subvol=`/`subvolid=` name, or the default subvolume's
+/// root. `subvol=` is a path from the top subvolume (id 5), as on btrfs.
+fn mount_root(fs: &mut EclipseFS, opts: &EfsOptions) -> Result<u64> {
+    use eclipsefs::cowfmt::{handle, FIRST_INO, FS_TREE};
+    let mut root = match opts.subvolid {
+        Some(id) => handle(id, FIRST_INO),
+        None if opts.subvol.is_some() => handle(FS_TREE, FIRST_INO),
+        None => return Ok(fs.root_ino()),
+    };
+    if fs.format_version() < 4 {
+        return Err(FsError::NotSupported);
+    }
+    if let Some(path) = &opts.subvol {
+        for name in path.split('/').filter(|c| !c.is_empty() && *c != ".") {
+            root = fs.lookup(root, name).map_err(map_err)?;
+        }
+    }
+    let st = fs.stat(root).map_err(map_err)?;
+    if st.kind != FileKind::Dir {
+        return Err(FsError::NotDir);
+    }
+    Ok(root)
 }
 
 impl FileSystem for EclipseMountFs {
@@ -116,8 +300,7 @@ impl FileSystem for EclipseMountFs {
     }
 
     fn root_inode(&self) -> Arc<dyn INode> {
-        let root = self.inner.lock().root_ino();
-        self.inode(root)
+        self.inode(self.root)
     }
 
     fn info(&self) -> FsInfo {
@@ -137,9 +320,9 @@ impl FileSystem for EclipseMountFs {
     }
 }
 
-struct EclipseMountINode {
-    fs: Arc<EclipseMountFs>,
-    ino: u64,
+pub(crate) struct EclipseMountINode {
+    pub(crate) fs: Arc<EclipseMountFs>,
+    pub(crate) ino: u64,
 }
 
 fn vfs_type(kind: FileKind) -> FileType {
@@ -370,41 +553,84 @@ impl INode for EclipseMountINode {
     }
 }
 
-/// Open a mount backend as an EclipseFS filesystem.
-pub fn open_eclipsefs(backend: &MountBackend, read_only: bool) -> Result<Arc<dyn FileSystem>> {
-    EclipseMountFs::open(backend, read_only).map(|fs| fs as Arc<dyn FileSystem>)
+/// Open a mount backend as an EclipseFS filesystem, with the `-o` options
+/// in `data` (see the module documentation).
+pub fn open_eclipsefs(
+    backend: &MountBackend,
+    read_only: bool,
+    data: &str,
+) -> Result<Arc<dyn FileSystem>> {
+    let opts = EfsOptions::parse(data)?;
+    EclipseMountFs::open_with(backend, read_only, &opts).map(|fs| fs as Arc<dyn FileSystem>)
 }
 
 /// Cheap pre-mount probe: does the backing device start with an EclipseFS
-/// superblock of a version this kernel reads, no larger than the device?
+/// superblock of a version this kernel reads, that fits on the device? A
+/// member of a volume only needs room for its own superblock: the chunk map
+/// places the rest.
 pub(crate) fn probe_eclipsefs_superblock(block: &Arc<dyn BlockScheme>) -> bool {
     #[repr(align(4096))]
-    struct SectorBuf([u8; 512]);
-    let mut sb = SectorBuf([0u8; 512]);
-    if block.read_block(0, &mut sb.0).is_err() {
-        return false;
+    struct SuperBuf([u8; 4096]);
+    let mut sb = SuperBuf([0u8; 4096]);
+    for (i, sector) in sb.0.chunks_mut(512).enumerate() {
+        if block.read_block(i, sector).is_err() {
+            return false;
+        }
+        if i == 0 && &sector[0..9] != eclipsefs::format::MAGIC {
+            return false;
+        }
     }
-    if &sb.0[0..9] != eclipsefs::format::MAGIC {
-        return false;
-    }
-    let version = u32::from_le_bytes(sb.0[12..16].try_into().unwrap());
-    let total_blocks = u64::from_le_bytes(sb.0[24..32].try_into().unwrap());
     let device_bytes = block.block_count() as u64 * 512;
-    eclipsefs::format::is_supported_version(version)
-        && total_blocks > 0
-        && total_blocks.saturating_mul(eclipsefs::format::BLOCK_SIZE) <= device_bytes
+    let dev = SuperblockDev {
+        block: &sb.0,
+        size: device_bytes,
+    };
+    match eclipsefs::probe(&dev) {
+        Ok(p) => p.min_device_bytes > 0 && p.min_device_bytes <= device_bytes,
+        Err(_) => false,
+    }
+}
+
+/// The first block of a device, as a `BlockDevice` for `eclipsefs::probe`.
+struct SuperblockDev<'a> {
+    block: &'a [u8],
+    size: u64,
+}
+
+impl eclipsefs::BlockDevice for SuperblockDev<'_> {
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> eclipsefs::Result<()> {
+        let start = offset as usize;
+        let src = self
+            .block
+            .get(start..start + buf.len())
+            .ok_or(EfsError::Io)?;
+        buf.copy_from_slice(src);
+        Ok(())
+    }
+
+    fn write_at(&self, _offset: u64, _buf: &[u8]) -> eclipsefs::Result<()> {
+        Err(EfsError::Io)
+    }
+
+    fn sync(&self) -> eclipsefs::Result<()> {
+        Ok(())
+    }
+
+    fn size(&self) -> u64 {
+        self.size
+    }
 }
 
 #[cfg(test)]
-mod tests {
-    //! The adapter end to end on a RAM disk: format, mount through the same
-    //! `MountBackend` the kernel uses, and drive it through `INode`.
+pub(crate) mod testdisk {
+    //! RAM disks with an EclipseFS on them, for the tests of this adapter
+    //! and of `eclipsefs_ioctl`.
 
     use super::*;
     use alloc::vec;
 
-    struct RamDisk {
-        bytes: Mutex<Vec<u8>>,
+    pub(crate) struct RamDisk {
+        pub(crate) bytes: Mutex<Vec<u8>>,
     }
 
     impl zcore_drivers::scheme::Scheme for RamDisk {
@@ -441,7 +667,7 @@ mod tests {
     }
 
     /// `mkfs` straight into the disk's bytes.
-    struct Formatter(Arc<RamDisk>);
+    pub(crate) struct Formatter(pub(crate) Arc<RamDisk>);
 
     impl eclipsefs::BlockDevice for Formatter {
         fn read_at(&self, offset: u64, buf: &mut [u8]) -> eclipsefs::Result<()> {
@@ -464,11 +690,11 @@ mod tests {
         }
     }
 
-    fn formatted(bytes: usize) -> Arc<RamDisk> {
+    pub(crate) fn formatted(bytes: usize) -> Arc<RamDisk> {
         formatted_with(bytes, eclipsefs::mkfs::format)
     }
 
-    fn formatted_with(
+    pub(crate) fn formatted_with(
         bytes: usize,
         format: fn(
             &dyn eclipsefs::BlockDevice,
@@ -489,6 +715,21 @@ mod tests {
         format(&Formatter(disk.clone()), &opts).unwrap();
         disk
     }
+
+    pub(crate) fn blank(bytes: usize) -> Arc<RamDisk> {
+        Arc::new(RamDisk {
+            bytes: Mutex::new(vec![0u8; bytes]),
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! The adapter end to end on a RAM disk: format, mount through the same
+    //! `MountBackend` the kernel uses, and drive it through `INode`.
+
+    use super::testdisk::*;
+    use super::*;
 
     #[test]
     fn older_v3_images_are_recognised_and_mount() {

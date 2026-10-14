@@ -486,6 +486,11 @@ impl EclipseFsV3 {
         self.clock = Some(clock);
     }
 
+    /// Bumped on every superblock write.
+    pub fn generation(&self) -> u64 {
+        self.sb.generation
+    }
+
     pub fn label(&self) -> String {
         String::from_utf8_lossy(self.sb.label()).into_owned()
     }

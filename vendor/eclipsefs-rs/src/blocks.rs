@@ -731,11 +731,15 @@ mod tests {
         assert_eq!(a.total_blocks(), 200);
         let (d, _) = a.allocate_for(None, 10, Some(ChunkKind::Data)).unwrap();
         assert_eq!(d / GROUP_BLOCKS, 2);
-        let (m, _) = a.allocate_for(Some(d), 10, Some(ChunkKind::Metadata)).unwrap();
+        let (m, _) = a
+            .allocate_for(Some(d), 10, Some(ChunkKind::Metadata))
+            .unwrap();
         assert_eq!(m / GROUP_BLOCKS, 0);
         assert_eq!(a.free_in(ChunkKind::Data), 88);
         assert_eq!(a.free_in(ChunkKind::Metadata), 88);
-        assert!(a.allocate_run_for(None, 89, Some(ChunkKind::Data)).is_none());
+        assert!(a
+            .allocate_run_for(None, 89, Some(ChunkKind::Data))
+            .is_none());
         // Frees past the old sum of group sizes are fine (logical space).
         a.set_deferred_frees(true);
         a.free(d, 10).unwrap();

@@ -4,6 +4,7 @@ mod block_mount;
 mod btrfs_mount;
 pub mod devfs;
 mod dmabuf;
+mod eclipsefs_ioctl;
 mod eclipsefs_mount;
 mod epoll;
 /// System-wide `epoll_wait(2)` usage counters, for `/proc/perf/kernel`.
@@ -139,6 +140,10 @@ use pseudo::Pseudo;
 use sysfs::SysFS;
 
 pub use dmabuf::DmaBuf;
+pub use eclipsefs_ioctl::{
+    eclipsefs_copy_reflink, eclipsefs_fallocate, eclipsefs_ioctl, eclipsefs_xattr, FsIoctlContext,
+    XattrReply, XattrRequest, EFS_IOC_RECEIVE,
+};
 pub use epoll::{Epoll, EpollEvent};
 
 /// If `f` is a DRM-related fd (a /dev/dri device File, a PRIME dma-buf, or
@@ -699,6 +704,13 @@ fn normalize_mount_target(path: &str) -> String {
 /// before this existed; callers with a `cwd` should make it absolute first.
 pub fn path_is_nosuid(path: &str) -> bool {
     mount_flag_at(path, |s| s.is_nosuid())
+}
+
+/// Whether `path` lives on a mount that is read-only now (`MS_RDONLY`, or a
+/// remount to it): `mnt_want_write()`, which the ioctls that change a
+/// filesystem answer `EROFS` for.
+pub fn path_is_read_only(path: &str) -> bool {
+    mount_flag_at(path, |s| s.is_read_only())
 }
 
 /// Whether `execve` must refuse an image at `path`: `path_noexec()`, which
@@ -1456,6 +1468,7 @@ pub fn create_root_fs(rootfs: Arc<dyn FileSystem>) -> Arc<dyn INode> {
         if let Err(e) = devfs_root.add(&fname, dev) {
             warn!("failed to mknod /dev/{}: {:?}", &fname, e);
         } else {
+            eclipsefs_mount::register_block_device(&fname, block.clone());
             block_candidates.push((fname.clone(), dev_dyn));
         }
 
@@ -1479,6 +1492,7 @@ pub fn create_root_fs(rootfs: Arc<dyn FileSystem>) -> Arc<dyn INode> {
                 start_block,
                 block_count,
             ));
+            eclipsefs_mount::register_block_device(&part_name, partition_driver.clone());
             let part_dev_index = base_index + part_num;
             let part = Arc::new(devfs::BlockDev::new(
                 part_dev_index,
@@ -1826,7 +1840,7 @@ fn open_block_root(inode: Arc<dyn INode>) -> Option<(Arc<dyn FileSystem>, &'stat
         // A loop file has no cheap probe; it has always been btrfs.
         block_mount::MountBackend::File(_) => "btrfs",
     };
-    let fs = mount_ops::open_filesystem(backend, fstype, false).ok()?;
+    let fs = mount_ops::open_filesystem(backend, fstype, false, "").ok()?;
     Some((fs, fstype))
 }
 
@@ -2028,6 +2042,7 @@ fn mount_fstab(root: &Arc<MNode>) {
                             backend,
                             fstype_parsed,
                             mount_state::flags_read_only(flags, options),
+                            options,
                         ) {
                             Ok(f) => f,
                             Err(e) => {

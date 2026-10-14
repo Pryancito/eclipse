@@ -138,6 +138,31 @@ fn sync_file_range_writes_back(flags: usize) -> LxResult<bool> {
     Ok(flags != 0)
 }
 
+
+/// What an EclipseFS ioctl needs from the calling process: its descriptors,
+/// its view of the tree and its credentials.
+struct FsIoctlCtx<'a> {
+    proc: &'a LinuxProcess,
+}
+
+impl linux_object::fs::FsIoctlContext for FsIoctlCtx<'_> {
+    fn file(&self, fd: i32) -> LxResult<Arc<File>> {
+        self.proc.get_file(FileDesc::from(fd))
+    }
+
+    fn lookup(&self, path: &str) -> LxResult<Arc<dyn INode>> {
+        self.proc.lookup_inode(path)
+    }
+
+    fn capable(&self, cap: u32) -> bool {
+        linux_object::process::has_capability(self.proc.euid(), cap)
+    }
+
+    fn euid(&self) -> u32 {
+        self.proc.euid()
+    }
+}
+
 #[cfg(test)]
 mod ioctl_number_tests;
 
@@ -1030,6 +1055,16 @@ impl Syscall<'_> {
             _ => return Err(LxError::ENODEV),
         };
         let end = offset.checked_add(len).ok_or(LxError::EFBIG)?;
+        // EclipseFS has an extent map: real preallocation, and a punched
+        // hole that gives its blocks back instead of a write of zeros.
+        if resizable {
+            if let Some(res) =
+                linux_object::fs::eclipsefs_fallocate(&file, mode as u32, offset as u64, len as u64)
+            {
+                res?;
+                return Ok(0);
+            }
+        }
         let keep_size = match op {
             FallocateOp::Allocate { keep_size } | FallocateOp::ZeroRange { keep_size } => keep_size,
         };
@@ -1117,6 +1152,43 @@ impl Syscall<'_> {
             None
         };
 
+        // Two files of one EclipseFS mount at block-aligned offsets: share
+        // the blocks (a reflink, as btrfs does here) instead of copying them.
+        if let (Some(src), Some(dst)) = (in_file.downcast_ref::<File>(), out_file.downcast_ref::<File>())
+        {
+            if src.flags().readable() && dst.flags().writable() {
+                let src_pos = match read_offset {
+                    Some(off) => off,
+                    None => src.seek(SeekFrom::Current(0))?,
+                };
+                let dst_pos = match write_offset {
+                    Some(off) => off,
+                    None => dst.seek(SeekFrom::Current(0))?,
+                };
+                if let Some(res) = linux_object::fs::eclipsefs_copy_reflink(
+                    src,
+                    src_pos,
+                    dst,
+                    dst_pos,
+                    count as u64,
+                ) {
+                    let n = res?;
+                    match read_offset {
+                        Some(_) => in_offset.write(src_pos + n)?,
+                        None => {
+                            src.seek(SeekFrom::Start(src_pos + n))?;
+                        }
+                    }
+                    match write_offset {
+                        Some(_) => out_offset.write(dst_pos + n)?,
+                        None => {
+                            dst.seek(SeekFrom::Start(dst_pos + n))?;
+                        }
+                    }
+                    return Ok(n as usize);
+                }
+            }
+        }
         let waits = self.waits_for_room(&out_file);
         let copied = copy_range(&in_file, read_offset, &out_file, write_offset, count, waits)
             .await
@@ -2140,6 +2212,16 @@ impl Syscall<'_> {
                 {
                     dev.present_fence_sleep(request as u32, arg1).await?;
                 }
+            }
+        }
+        // The filesystem ioctls of an EclipseFS mount (chattr, reflink,
+        // snapshots, quotas, scrub, devices): some carry another descriptor
+        // or a device path, which only the process can resolve.
+        if let Some(file) = file_like.downcast_ref::<File>() {
+            let ctx = FsIoctlCtx { proc };
+            if let Some(res) = linux_object::fs::eclipsefs_ioctl(file, request as u32, arg1, &ctx)
+            {
+                return res;
             }
         }
         // File ioctls served at the VFS layer, como en Linux (fs/ioctl.c

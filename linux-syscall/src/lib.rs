@@ -727,20 +727,28 @@ impl Syscall<'_> {
             Sys::GETRANDOM => self.sys_getrandom(a0.into(), a1, a2 as u32),
             Sys::STATX => self.sys_statx(a0.into(), a1.into(), a2, a3 as u32, a4.into()),
 
-            // Extended attributes: this kernel's filesystems do not keep
-            // them, and answering from here, by syscall name, kept busybox
-            // init's probing off the console. But `fs/xattr.c` reads the
-            // name and the flags and looks the file up BEFORE the filesystem
-            // answers, and these arms did none of it: a missing path was
-            // ENODATA, a closed fd was 0. `sys_xattr` makes those checks and
-            // then gives the same four answers.
-            Sys::GETXATTR => {
-                self.sys_xattr(XattrOp::Get, XattrTarget::Path(a0.into(), true), a1.into())
+            // Extended attributes: `sys_xattr` makes the checks `fs/xattr.c`
+            // makes before the filesystem answers (the name, the flags, the
+            // file), then asks EclipseFS, the one filesystem here that keeps
+            // them; every other one gives the answers of a filesystem
+            // without attributes.
+            Sys::GETXATTR => self.sys_xattr(
+                XattrOp::Get,
+                XattrTarget::Path(a0.into(), true),
+                a1.into(),
+                a2,
+                a3,
+            ),
+            Sys::LGETXATTR => self.sys_xattr(
+                XattrOp::Get,
+                XattrTarget::Path(a0.into(), false),
+                a1.into(),
+                a2,
+                a3,
+            ),
+            Sys::FGETXATTR => {
+                self.sys_xattr(XattrOp::Get, XattrTarget::Fd(a0.into()), a1.into(), a2, a3)
             }
-            Sys::LGETXATTR => {
-                self.sys_xattr(XattrOp::Get, XattrTarget::Path(a0.into(), false), a1.into())
-            }
-            Sys::FGETXATTR => self.sys_xattr(XattrOp::Get, XattrTarget::Fd(a0.into()), a1.into()),
             Sys::SETXATTR => self.sys_xattr(
                 XattrOp::Set {
                     size: a3,
@@ -748,6 +756,8 @@ impl Syscall<'_> {
                 },
                 XattrTarget::Path(a0.into(), true),
                 a1.into(),
+                a2,
+                a3,
             ),
             Sys::LSETXATTR => self.sys_xattr(
                 XattrOp::Set {
@@ -756,6 +766,8 @@ impl Syscall<'_> {
                 },
                 XattrTarget::Path(a0.into(), false),
                 a1.into(),
+                a2,
+                a3,
             ),
             Sys::FSETXATTR => self.sys_xattr(
                 XattrOp::Set {
@@ -764,28 +776,44 @@ impl Syscall<'_> {
                 },
                 XattrTarget::Fd(a0.into()),
                 a1.into(),
+                a2,
+                a3,
             ),
-            Sys::LISTXATTR => {
-                self.sys_xattr(XattrOp::List, XattrTarget::Path(a0.into(), true), a1.into())
-            }
+            // `listxattr(path, list, size)`: no name; the list buffer is the
+            // second argument.
+            Sys::LISTXATTR => self.sys_xattr(
+                XattrOp::List,
+                XattrTarget::Path(a0.into(), true),
+                0.into(),
+                a1,
+                a2,
+            ),
             Sys::LLISTXATTR => self.sys_xattr(
                 XattrOp::List,
                 XattrTarget::Path(a0.into(), false),
-                a1.into(),
+                0.into(),
+                a1,
+                a2,
             ),
-            Sys::FLISTXATTR => self.sys_xattr(XattrOp::List, XattrTarget::Fd(a0.into()), a1.into()),
+            Sys::FLISTXATTR => {
+                self.sys_xattr(XattrOp::List, XattrTarget::Fd(a0.into()), 0.into(), a1, a2)
+            }
             Sys::REMOVEXATTR => self.sys_xattr(
                 XattrOp::Remove,
                 XattrTarget::Path(a0.into(), true),
                 a1.into(),
+                0,
+                0,
             ),
             Sys::LREMOVEXATTR => self.sys_xattr(
                 XattrOp::Remove,
                 XattrTarget::Path(a0.into(), false),
                 a1.into(),
+                0,
+                0,
             ),
             Sys::FREMOVEXATTR => {
-                self.sys_xattr(XattrOp::Remove, XattrTarget::Fd(a0.into()), a1.into())
+                self.sys_xattr(XattrOp::Remove, XattrTarget::Fd(a0.into()), a1.into(), 0, 0)
             }
 
             // kernel module

@@ -693,3 +693,53 @@ fn power_cuts_while_devices_come_and_go() {
     }
     assert!(checked > 250);
 }
+
+#[test]
+fn probe_tells_which_device_of_which_volume_without_mounting() {
+    let d = disks(3, 32 * MIB);
+    let mut fs = make(&d, Profile::Raid1, Profile::Raid1);
+    let uuid = fs.uuid();
+    fill(&mut fs, 2, 50_000, 3);
+    let gen = {
+        fs.sync().unwrap();
+        fs.generation()
+    };
+    drop(fs);
+    let mut ids: Vec<u32> = d
+        .iter()
+        .map(|disk| {
+            let p = eclipsefs::probe(&**disk).unwrap();
+            assert_eq!(p.uuid, uuid);
+            assert_eq!(p.num_devices, 3);
+            assert_eq!(p.generation, gen);
+            assert_eq!(p.label, "eclipse");
+            assert_eq!(p.version, eclipsefs::ECLIPSEFS_VERSION);
+            // A member holds its own superblock; the chunk map places the rest.
+            assert!(p.min_device_bytes <= 4096);
+            p.devid
+        })
+        .collect();
+    ids.sort();
+    assert_eq!(ids, [1, 2, 3]);
+
+    // One device: all of the filesystem has to fit on it.
+    let one = MemDisk::new(16 * MIB);
+    mkfs::format(&*one, &opts()).unwrap();
+    let p = eclipsefs::probe(&*one).unwrap();
+    assert_eq!((p.devid, p.num_devices), (1, 1));
+    assert_eq!(p.min_device_bytes, 16 * MIB as u64);
+
+    // The older layout, a blank disk and a damaged superblock.
+    let old = MemDisk::new(16 * MIB);
+    mkfs::format_v3(&*old, &opts()).unwrap();
+    assert_eq!(eclipsefs::probe(&*old).unwrap().version >> 16, 3);
+    assert_eq!(
+        eclipsefs::probe(&*MemDisk::new(MIB)).unwrap_err(),
+        Error::BadSuperblock
+    );
+    let mut sb = vec![0u8; 4096];
+    one.read_at(0, &mut sb).unwrap();
+    sb[100] ^= 0xff;
+    one.write_at(0, &sb).unwrap();
+    assert!(matches!(eclipsefs::probe(&*one), Err(Error::Corrupt(_))));
+}

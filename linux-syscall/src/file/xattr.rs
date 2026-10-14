@@ -1,9 +1,9 @@
 //! The extended-attribute syscalls: `getxattr`, `setxattr`, `listxattr`,
 //! `removexattr` and their `l*` and `f*` forms.
 //!
-//! None of this kernel's filesystems keeps extended attributes, so the
-//! twelve used to be answered from the dispatcher without reading a single
-//! argument: `listxattr` was 0, `getxattr` and `removexattr` `ENODATA`,
+//! EclipseFS keeps extended attributes (`linux_object::fs::eclipsefs_xattr`);
+//! every other filesystem here answers as one without them. The twelve used
+//! to be answered from the dispatcher without reading a single argument: `listxattr` was 0, `getxattr` and `removexattr` `ENODATA`,
 //! `setxattr` `EOPNOTSUPP`. That is the right answer for a file that exists,
 //! asked with a name that is one. `fs/xattr.c` reads the name and the flags
 //! first, then looks the file up, and only then asks the filesystem, so
@@ -12,6 +12,8 @@
 //! `XATTR_SIZE_MAX` is `E2BIG`. Here all four were the filesystem's answer.
 
 use super::*;
+use alloc::string::String;
+use linux_object::fs::{XattrReply, XattrRequest};
 
 /// `XATTR_NAME_MAX` (`include/uapi/linux/limits.h`): the longest attribute
 /// name, without its NUL.
@@ -83,12 +85,15 @@ pub(crate) fn xattr_answer(op: XattrOp) -> SysResult {
 
 impl Syscall<'_> {
     /// The twelve `*xattr` syscalls: the checks `fs/xattr.c` makes before it
-    /// asks the filesystem, then the answer of a filesystem that keeps none.
+    /// asks the filesystem, then the filesystem's answer. `buf` and `size`
+    /// are the value (get, set) or the list (list) buffer.
     pub(crate) fn sys_xattr(
         &self,
         op: XattrOp,
         target: XattrTarget,
         name: UserInPtr<u8>,
+        buf: usize,
+        size: usize,
     ) -> SysResult {
         let name = if op == XattrOp::List {
             None
@@ -98,16 +103,71 @@ impl Syscall<'_> {
         info!("xattr: op={:?}, target={:?}, name={:?}", op, target, name);
         xattr_precheck(op, name)?;
         let proc = self.linux_process();
-        match target {
+        let (inode, path) = match target {
             XattrTarget::Path(path, follow) => {
-                proc.lookup_inode_at(FileDesc::CWD, path.as_c_str()?, follow)?;
+                let path = path.as_c_str()?;
+                let inode = proc.lookup_inode_at(FileDesc::CWD, path, follow)?;
+                let path = if path.starts_with('/') {
+                    String::from(path)
+                } else {
+                    format!("{}/{}", proc.current_working_directory(), path)
+                };
+                (Some(inode), path)
             }
             XattrTarget::Fd(fd) => {
-                proc.get_file_like(fd)?;
+                let file = proc.get_file_like(fd)?;
+                match file.downcast_ref::<File>() {
+                    Some(file) => (Some(file.inode()), file.path().clone()),
+                    None => (None, String::new()),
+                }
             }
+        };
+        let Some(inode) = inode else {
+            return xattr_answer(op);
+        };
+        let value;
+        let request = match (op, name) {
+            (XattrOp::Get, Some(name)) => XattrRequest::Get(name),
+            (XattrOp::Set { flags, .. }, Some(name)) => {
+                value = UserInPtr::<u8>::from(buf).read_array(size)?;
+                XattrRequest::Set {
+                    name,
+                    value: &value,
+                    flags: flags as u32,
+                }
+            }
+            (XattrOp::Remove, Some(name)) => XattrRequest::Remove(name),
+            _ => XattrRequest::List,
+        };
+        let euid = proc.euid();
+        let admin = linux_object::process::has_capability(euid, CAP_SYS_ADMIN);
+        match linux_object::fs::eclipsefs_xattr(&inode, &path, request, euid, admin) {
+            None => xattr_answer(op),
+            Some(reply) => match reply? {
+                XattrReply::Value(bytes) | XattrReply::Names(bytes) => {
+                    xattr_copy_out(&bytes, buf, size)
+                }
+                XattrReply::Done => Ok(0),
+            },
         }
-        xattr_answer(op)
     }
+}
+
+/// `CAP_SYS_ADMIN`, which `trusted.*` attributes need.
+const CAP_SYS_ADMIN: u32 = 21;
+
+/// What `getxattr` and `listxattr` return: with `size` 0 only the length
+/// the value or list needs, `ERANGE` when the buffer is too small for it,
+/// else the bytes copied.
+fn xattr_copy_out(bytes: &[u8], buf: usize, size: usize) -> SysResult {
+    if size == 0 {
+        return Ok(bytes.len());
+    }
+    if size < bytes.len() {
+        return Err(LxError::ERANGE);
+    }
+    UserOutPtr::<u8>::from(buf).write_array(bytes)?;
+    Ok(bytes.len())
 }
 
 #[cfg(test)]

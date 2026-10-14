@@ -633,6 +633,75 @@ pub(crate) fn cache_overlay_write(inode: &Arc<dyn INode>, offset: usize, buf: &[
     }
 }
 
+/// `[offset, offset + len)` of the file changed underneath the page cache
+/// (a reflink, a punched hole, a deduplicated range): load every committed
+/// page there again from the inode, so mappings and `read(2)` see what the
+/// file now holds. Uncommitted pages fill from the inode anyway.
+pub(crate) fn cache_reload(inode: &Arc<dyn INode>, offset: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
+    let Some(vmo) = cache_vmo_of(inode) else {
+        return;
+    };
+    let end = offset.saturating_add(len).min(vmo.len());
+    let mut page = alloc::vec![0u8; PAGE_SIZE];
+    let mut at = offset / PAGE_SIZE * PAGE_SIZE;
+    while at < end {
+        if vmo.committed_paddr(at / PAGE_SIZE).is_some() {
+            page.fill(0);
+            let mut done = 0;
+            while done < PAGE_SIZE {
+                match inode.read_at(at + done, &mut page[done..]) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => done += n,
+                }
+            }
+            let _ = vmo.write(at, &page);
+        }
+        at += PAGE_SIZE;
+    }
+}
+
+/// Before the filesystem reads `[offset, offset + len)` of the file on its
+/// own (to share its blocks with another file, or compare them): write back
+/// every committed page there that differs from the inode, which only a
+/// store through a `MAP_SHARED` mapping can have made. Pages that match
+/// are left alone, so an unchanged page does not lose its sharing.
+pub(crate) fn cache_flush(inode: &Arc<dyn INode>, offset: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
+    let Some(vmo) = cache_vmo_of(inode) else {
+        return;
+    };
+    let size = match inode.metadata() {
+        Ok(m) => m.size,
+        Err(_) => return,
+    };
+    let end = offset.saturating_add(len).min(vmo.len()).min(size);
+    let mut cached = alloc::vec![0u8; PAGE_SIZE];
+    let mut on_disk = alloc::vec![0u8; PAGE_SIZE];
+    let mut at = offset / PAGE_SIZE * PAGE_SIZE;
+    while at < end {
+        if vmo.committed_paddr(at / PAGE_SIZE).is_some() {
+            let n = PAGE_SIZE.min(size - at);
+            on_disk[..n].fill(0);
+            let mut done = 0;
+            while done < n {
+                match inode.read_at(at + done, &mut on_disk[done..n]) {
+                    Ok(0) | Err(_) => break,
+                    Ok(k) => done += k,
+                }
+            }
+            if vmo.read(at, &mut cached[..n]).is_ok() && cached[..n] != on_disk[..n] {
+                let _ = inode.write_at(at, &cached[..n]);
+            }
+        }
+        at += PAGE_SIZE;
+    }
+}
+
 /// The file was resized to `new_len` (ftruncate, O_TRUNC, truncate): drop
 /// every cached page past the new end, and zero the tail of the last kept
 /// page, exactly as the inode does. Otherwise the cache kept serving the old

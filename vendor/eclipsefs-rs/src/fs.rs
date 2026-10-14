@@ -172,6 +172,76 @@ pub struct SubvolInfo {
     pub received_uuid: [u8; 16],
 }
 
+/// What the superblock at the start of a device says, read without
+/// mounting (what `blkid` and `btrfs device scan` look at).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeviceProbe {
+    /// Full on-disk format version (`0x0004_0000` for v0.4).
+    pub version: u32,
+    pub uuid: [u8; 16],
+    pub label: String,
+    /// This device's id in its volume (1 on a filesystem of one device).
+    pub devid: u32,
+    /// Devices the volume is made of.
+    pub num_devices: u32,
+    /// Generation of the last commit this device saw.
+    pub generation: u64,
+    /// Bytes of the filesystem this one device must hold: all of it on a
+    /// single device, only its own superblock in a volume (whose chunks
+    /// the chunk map places).
+    pub min_device_bytes: u64,
+}
+
+/// Read the superblock of `dev` (see [`DeviceProbe`]). `BadSuperblock` if
+/// it holds no EclipseFS, `Unsupported` for a format this crate cannot
+/// mount, `Corrupt` if the checksum is wrong.
+pub fn probe(dev: &dyn BlockDevice) -> Result<DeviceProbe> {
+    if dev.size() < BLOCK_SIZE {
+        return Err(Error::BadSuperblock);
+    }
+    let mut buf = vec![0u8; BLOCK_SIZE as usize];
+    dev.read_at(0, &mut buf)?;
+    if &buf[0..9] != MAGIC {
+        return Err(Error::BadSuperblock);
+    }
+    let version = u32::from_le_bytes([buf[12], buf[13], buf[14], buf[15]]);
+    let label = |l: &[u8]| {
+        let end = l.iter().position(|&c| c == 0).unwrap_or(l.len());
+        String::from_utf8_lossy(&l[..end]).into_owned()
+    };
+    match version >> 16 {
+        3 => {
+            let sb = crate::format::Superblock::decode(&buf)?;
+            Ok(DeviceProbe {
+                version: sb.version,
+                uuid: sb.uuid,
+                label: label(&sb.label),
+                devid: 1,
+                num_devices: 1,
+                generation: sb.generation,
+                min_device_bytes: sb.total_blocks * BLOCK_SIZE,
+            })
+        }
+        4 => {
+            let sb = crate::cowfmt::SuperV4::decode(&buf)?;
+            let (devid, num_devices, min) = match &sb.vol {
+                Some(v) => (v.devid, v.num_devices, BLOCK_SIZE),
+                None => (1, 1, sb.total_blocks * BLOCK_SIZE),
+            };
+            Ok(DeviceProbe {
+                version,
+                uuid: sb.uuid,
+                label: label(&sb.label),
+                devid,
+                num_devices,
+                generation: sb.generation,
+                min_device_bytes: min,
+            })
+        }
+        _ => Err(Error::Unsupported("EclipseFS format version")),
+    }
+}
+
 // One per mounted filesystem: the size difference does not matter.
 #[allow(clippy::large_enum_variant)]
 enum Driver {
@@ -255,6 +325,14 @@ impl EclipseFS {
         Ok(Self {
             driver: Driver::V4(CowFs::mount_devices(devs, read_only, degraded)?),
         })
+    }
+
+    /// Generation of the last committed transaction (btrfs `transid`).
+    pub fn generation(&self) -> u64 {
+        match &self.driver {
+            Driver::V3(f) => f.generation(),
+            Driver::V4(f) => f.generation(),
+        }
     }
 
     /// Major format version of the mounted image (3 or 4).
