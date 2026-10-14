@@ -10,3 +10,7 @@ std = []
 
 [dependencies]
 log = "0.4"
+
+[dev-dependencies]
+# Only for tests/performance.rs, which runs every workload on both drivers.
+btrfs = { path = "../btrfs-rs", features = ["std"] }

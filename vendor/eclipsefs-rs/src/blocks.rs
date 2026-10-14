@@ -335,4 +335,169 @@ mod tests {
         assert_eq!(back.free_blocks, 200 - 9);
         assert!(!back.is_used(150));
     }
+
+    #[test]
+    fn runs_cross_word_boundaries() {
+        let mut g = AllocationGroup::new(0, 1000);
+        // Blocks 2..60 used, so the first free run starts at 60 and must
+        // continue through bit 63 into the next words.
+        assert_eq!(g.allocate(0, 58), Some((2, 58)));
+        assert_eq!(g.allocate(0, 200), Some((60, 200)));
+        assert_eq!(g.free_blocks, 1000 - 260);
+    }
+
+    #[test]
+    fn a_run_stops_at_the_first_used_block() {
+        let mut g = AllocationGroup::new(0, 1000);
+        g.allocate(0, 98).unwrap(); // 2..100
+        g.free(50, 10).unwrap();
+        assert_eq!(g.allocate(0, 100), Some((50, 10)));
+    }
+
+    #[test]
+    fn search_wraps_around_to_the_start() {
+        let mut g = AllocationGroup::new(0, 100);
+        g.allocate(0, 98).unwrap();
+        g.free(5, 1).unwrap();
+        assert_eq!(g.allocate(90, 4), Some((5, 1)));
+        assert_eq!(g.allocate(0, 4), None);
+    }
+
+    #[test]
+    fn zero_request_allocates_nothing() {
+        let mut g = AllocationGroup::new(0, 100);
+        assert_eq!(g.allocate(0, 0), None);
+        assert_eq!(g.free_blocks, 98);
+    }
+
+    #[test]
+    fn the_tail_past_a_short_group_is_never_handed_out() {
+        let mut g = AllocationGroup::new(0, 70);
+        let (s, n) = g.allocate(0, 1000).unwrap();
+        assert_eq!((s, n), (2, 68));
+        assert_eq!(g.allocate(0, 1), None);
+        assert!(g.free(70, 1).is_err());
+    }
+
+    #[test]
+    fn a_full_group_is_exactly_one_bitmap_block() {
+        let g = AllocationGroup::new(0, GROUP_BLOCKS);
+        assert_eq!(g.to_bytes().len(), BLOCK_SIZE as usize);
+        assert_eq!(g.free_blocks, GROUP_BLOCKS - 2);
+        assert_eq!(g.bitmap_block(), 1);
+        let g7 = AllocationGroup::new(7, 100);
+        assert_eq!(g7.start_block, 7 * GROUP_BLOCKS);
+        assert_eq!(g7.bitmap_block(), 7 * GROUP_BLOCKS + 1);
+    }
+
+    #[test]
+    fn from_bytes_refuses_free_header_blocks_and_short_input() {
+        let g = AllocationGroup::new(0, 100);
+        let mut b = g.to_bytes();
+        b[0] &= !0b10;
+        assert!(AllocationGroup::from_bytes(0, 100, &b).is_err());
+        assert!(AllocationGroup::from_bytes(0, 100, &b[..100]).is_err());
+    }
+
+    #[test]
+    fn from_bytes_masks_a_tail_left_free_on_disk() {
+        let mut b = vec![0u8; BLOCK_SIZE as usize];
+        b[0] = 0b11;
+        let g = AllocationGroup::from_bytes(0, 100, &b).unwrap();
+        assert_eq!(g.free_blocks, 98);
+    }
+
+    #[test]
+    fn dirty_tracking() {
+        let mut g = AllocationGroup::new(0, 100);
+        assert!(g.is_dirty());
+        g.clear_dirty();
+        g.allocate(0, 1).unwrap();
+        assert!(g.is_dirty());
+        g.clear_dirty();
+        let back = AllocationGroup::from_bytes(0, 100, &g.to_bytes()).unwrap();
+        assert!(!back.is_dirty());
+    }
+
+    #[test]
+    fn extend_never_passes_a_whole_group_and_never_shrinks() {
+        let mut g = AllocationGroup::new(0, 100);
+        g.extend(50);
+        assert_eq!(g.block_count, 100);
+        g.extend(GROUP_BLOCKS * 3);
+        assert_eq!(g.block_count, GROUP_BLOCKS);
+        assert_eq!(g.free_blocks, GROUP_BLOCKS - 2);
+    }
+
+    #[test]
+    fn freeing_a_range_that_spans_groups() {
+        let mut a = BlockAllocator::new(vec![
+            AllocationGroup::new(0, GROUP_BLOCKS),
+            AllocationGroup::new(1, GROUP_BLOCKS),
+        ]);
+        // Use the tail of group 0 and the start of group 1 (after its header).
+        let (s0, n0) = a.allocate(Some(GROUP_BLOCKS - 10), 10).unwrap();
+        assert_eq!((s0, n0), (GROUP_BLOCKS - 10, 10));
+        assert!(a.is_used(GROUP_BLOCKS));
+        assert!(a.is_used(GROUP_BLOCKS + 1));
+        let before = a.free_blocks();
+        a.free(s0, n0).unwrap();
+        assert_eq!(a.free_blocks(), before + 10);
+        // Freeing over a header block is corruption.
+        assert!(a.free(GROUP_BLOCKS - 1, 3).is_err());
+    }
+
+    #[test]
+    fn goal_past_the_end_falls_back_to_the_cursor() {
+        let mut a = BlockAllocator::new(vec![AllocationGroup::new(0, 100)]);
+        assert_eq!(a.allocate(Some(1 << 40), 3), Some((2, 3)));
+        assert!(a.is_used(1 << 40), "blocks past the end count as used");
+        assert!(a.free(1 << 40, 1).is_err());
+    }
+
+    #[test]
+    fn empty_allocator() {
+        let mut a = BlockAllocator::default();
+        assert_eq!(a.allocate(None, 1), None);
+        assert_eq!(a.free_blocks(), 0);
+        assert_eq!(a.total_blocks(), 0);
+    }
+
+    #[test]
+    fn cursor_keeps_new_files_in_the_group_last_used() {
+        let mut a = BlockAllocator::new(vec![
+            AllocationGroup::new(0, 100),
+            AllocationGroup::new(1, 100),
+        ]);
+        let (s, _) = a.allocate(Some(GROUP_BLOCKS + 50), 1).unwrap();
+        assert_eq!(s, GROUP_BLOCKS + 50);
+        let (t, _) = a.allocate(None, 1).unwrap();
+        assert_eq!(t / GROUP_BLOCKS, 1, "goal-less allocation stays in group 1");
+    }
+
+    #[test]
+    fn allocations_never_overlap() {
+        let mut a = BlockAllocator::new(vec![AllocationGroup::new(0, 4000)]);
+        let mut seen = alloc::collections::BTreeSet::new();
+        let mut seed = 9u64;
+        let mut live = Vec::new();
+        for i in 0..2000 {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            if i % 3 == 2 && !live.is_empty() {
+                let (s, n): (u64, u64) = live.swap_remove((seed >> 33) as usize % live.len());
+                a.free(s, n).unwrap();
+                for b in s..s + n {
+                    seen.remove(&b);
+                }
+                continue;
+            }
+            if let Some((s, n)) = a.allocate(Some((seed >> 40) % 4000), 1 + (seed >> 50) % 8) {
+                for b in s..s + n {
+                    assert!(seen.insert(b), "block {} handed out twice", b);
+                }
+                live.push((s, n));
+            }
+        }
+        assert_eq!(a.free_blocks(), 3998 - seen.len() as u64);
+    }
 }

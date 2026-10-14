@@ -45,4 +45,46 @@ mod tests {
             0x414F_A339
         );
     }
+
+    #[test]
+    fn every_single_bit_flip_changes_the_checksum() {
+        let data: alloc::vec::Vec<u8> = (0..256u32).map(|i| (i * 31) as u8).collect();
+        let base = crc32(&data);
+        for byte in 0..data.len() {
+            for bit in 0..8 {
+                let mut d = data.clone();
+                d[byte] ^= 1 << bit;
+                assert_ne!(crc32(&d), base, "flip at {}:{}", byte, bit);
+            }
+        }
+    }
+
+    #[test]
+    fn swapped_bytes_are_detected() {
+        assert_ne!(crc32(b"ab"), crc32(b"ba"));
+        assert_ne!(crc32(&[0u8; 4096]), crc32(&[0u8; 4095]));
+    }
+
+    #[test]
+    fn matches_the_bitwise_reference_from_eclipsefs_lib() {
+        // The loop eclipsefs-lib's `EclipseFSHeader::calculate_crc32` used.
+        fn slow(data: &[u8]) -> u32 {
+            let mut crc: u32 = 0xFFFF_FFFF;
+            for &b in data {
+                crc ^= b as u32;
+                for _ in 0..8 {
+                    crc = if crc & 1 != 0 {
+                        (crc >> 1) ^ 0xEDB8_8320
+                    } else {
+                        crc >> 1
+                    };
+                }
+            }
+            crc ^ 0xFFFF_FFFF
+        }
+        for len in [0usize, 1, 7, 64, 1000, 4096] {
+            let d: alloc::vec::Vec<u8> = (0..len).map(|i| (i * 13 + 5) as u8).collect();
+            assert_eq!(crc32(&d), slow(&d), "len {}", len);
+        }
+    }
 }

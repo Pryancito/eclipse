@@ -769,6 +769,7 @@ checksum = "9404d41caa1aa659f7be44d5a902e318c0672900822fe9ca41d9e38c14b52332"
 name = "eclipsefs"
 version = "0.3.0"
 dependencies = [
+ "btrfs",
  "log",
 ]
 

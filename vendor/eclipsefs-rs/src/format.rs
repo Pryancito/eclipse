@@ -598,4 +598,241 @@ mod tests {
         assert_eq!(p[2].off, 15 + 16);
         assert!(parse_dirents(&data[..data.len() - 1]).is_err());
     }
+
+    #[test]
+    fn file_kinds_roundtrip_through_mode_and_disk() {
+        use FileKind::*;
+        for k in [Regular, Dir, Symlink, CharDevice, BlockDevice, Fifo, Socket] {
+            assert_eq!(FileKind::from_mode(k.mode_bits() | 0o644), k);
+            assert_eq!(FileKind::from_disk(k.to_disk()), Some(k));
+        }
+        assert_eq!(FileKind::from_disk(0), None);
+        assert_eq!(FileKind::from_disk(8), None);
+        assert_eq!(FileKind::from_mode(0o644), Regular);
+        // eclipsefs-lib's NodeKind values.
+        assert_eq!(
+            (Regular.to_disk(), Dir.to_disk(), Symlink.to_disk()),
+            (1, 2, 3)
+        );
+    }
+
+    #[test]
+    fn a_newer_major_version_is_refused_a_newer_minor_is_not() {
+        let mut s = sb();
+        s.version = 0x0004_0000;
+        assert_eq!(
+            Superblock::decode(&s.encode()).unwrap_err(),
+            Error::Unsupported("EclipseFS format version")
+        );
+        s.version = 0x0003_0007;
+        assert!(Superblock::decode(&s.encode()).is_ok());
+        // The old in-memory v0.2 images are not this format.
+        s.version = 0x0002_0000;
+        assert!(Superblock::decode(&s.encode()).is_err());
+    }
+
+    #[test]
+    fn foreign_geometry_is_refused() {
+        for f in [
+            |s: &mut Superblock| s.block_size = 512,
+            |s: &mut Superblock| s.group_blocks = 1000,
+            |s: &mut Superblock| s.inode_size = 128,
+        ] {
+            let mut s = sb();
+            f(&mut s);
+            assert!(matches!(
+                Superblock::decode(&s.encode()),
+                Err(Error::Unsupported(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn nonsense_counters_are_corruption() {
+        for f in [
+            |s: &mut Superblock| s.total_blocks = 3,
+            |s: &mut Superblock| s.root_ino = 0,
+            |s: &mut Superblock| s.next_ino = 1,
+        ] {
+            let mut s = sb();
+            f(&mut s);
+            assert!(matches!(
+                Superblock::decode(&s.encode()),
+                Err(Error::Corrupt(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn short_buffers_are_not_a_superblock() {
+        assert_eq!(
+            Superblock::decode(&[0u8; 10]).unwrap_err(),
+            Error::BadSuperblock
+        );
+        assert_eq!(
+            Superblock::decode(&sb().encode()[..400]).unwrap_err(),
+            Error::BadSuperblock
+        );
+    }
+
+    #[test]
+    fn label_stops_at_the_first_nul() {
+        let mut s = sb();
+        s.label[..7].copy_from_slice(b"ECLIPSE");
+        assert_eq!(s.label(), b"ECLIPSE");
+        s.label = [b'x'; 64];
+        assert_eq!(s.label().len(), 64);
+    }
+
+    #[test]
+    fn group_geometry() {
+        let mut s = sb();
+        s.total_blocks = GROUP_BLOCKS;
+        assert_eq!(s.groups(), (1, GROUP_BLOCKS));
+        s.total_blocks = GROUP_BLOCKS + 100;
+        assert_eq!(s.groups(), (2, 100));
+        s.total_blocks = 3 * GROUP_BLOCKS;
+        assert_eq!(s.groups(), (3, GROUP_BLOCKS));
+    }
+
+    #[test]
+    fn every_inode_field_survives() {
+        let mut i = Inode::new(FileKind::BlockDevice, 0o660, (1, 2));
+        i.uid = 1000;
+        i.gid = 6;
+        i.nlink = 3;
+        i.size = u64::MAX - 1;
+        i.nbytes = 12345 * 4096;
+        i.rdev = 0x0803;
+        i.atime = (u64::MAX, 999_999_999);
+        i.mtime = (5, 6);
+        i.ctime = (7, 8);
+        i.parent = 77;
+        i.chain = vec![555];
+        let (b, overflow, _) = Inode::decode(&i.encode()).unwrap().unwrap();
+        assert_eq!(overflow, 555);
+        assert_eq!(b.kind, FileKind::BlockDevice);
+        assert_eq!(b.mode, S_IFBLK | 0o660);
+        assert_eq!((b.uid, b.gid, b.nlink), (1000, 6, 3));
+        assert_eq!(
+            (b.size, b.nbytes, b.rdev),
+            (u64::MAX - 1, 12345 * 4096, 0x0803)
+        );
+        assert_eq!(
+            (b.atime, b.mtime, b.ctime),
+            ((u64::MAX, 999_999_999), (5, 6), (7, 8))
+        );
+        assert_eq!(b.parent, 77);
+    }
+
+    #[test]
+    fn only_six_extents_live_in_the_record() {
+        let mut i = Inode::new(FileKind::Regular, 0o644, (0, 0));
+        for n in 0..9u64 {
+            i.extents
+                .add_extent(Extent::new(n * 2, 100 + n * 10, 1))
+                .unwrap();
+        }
+        let (b, _, count) = Inode::decode(&i.encode()).unwrap().unwrap();
+        assert_eq!(count, 9);
+        assert_eq!(b.extents.extent_count(), INLINE_EXTENTS);
+        assert_eq!(b.extents.extents(), &i.extents.extents()[..INLINE_EXTENTS]);
+    }
+
+    #[test]
+    fn the_inline_area_holds_152_bytes() {
+        let mut i = Inode::new(FileKind::Symlink, 0o777, (0, 0));
+        i.flags = INODE_FLAG_INLINE;
+        i.inline = vec![b'z'; INLINE_LEN];
+        i.size = INLINE_LEN as u64;
+        let (b, _, _) = Inode::decode(&i.encode()).unwrap().unwrap();
+        assert_eq!(b.inline.len(), INLINE_LEN);
+        // A size claiming more than fits is corruption, not an overflow.
+        let mut rec = i.encode();
+        rec[24..32].copy_from_slice(&(INLINE_LEN as u64 + 1).to_le_bytes());
+        let crc = crc32(&rec[..INODE_SIZE - 4]);
+        rec[INODE_SIZE - 4..].copy_from_slice(&crc.to_le_bytes());
+        assert!(Inode::decode(&rec).is_err());
+    }
+
+    #[test]
+    fn unknown_inode_kind_is_corruption() {
+        let mut rec = Inode::new(FileKind::Regular, 0o644, (0, 0)).encode();
+        rec[0] = 42;
+        let crc = crc32(&rec[..INODE_SIZE - 4]);
+        rec[INODE_SIZE - 4..].copy_from_slice(&crc.to_le_bytes());
+        assert_eq!(
+            Inode::decode(&rec).unwrap_err(),
+            Error::Corrupt("inode kind")
+        );
+    }
+
+    #[test]
+    fn overlapping_extents_in_a_record_are_corruption() {
+        let mut i = Inode::new(FileKind::Regular, 0o644, (0, 0));
+        i.extents.add_extent(Extent::new(0, 100, 5)).unwrap();
+        i.extents.add_extent(Extent::new(10, 300, 5)).unwrap();
+        let mut rec = i.encode();
+        // Second extent's logical start: 96 + 24.
+        rec[120..128].copy_from_slice(&2u64.to_le_bytes());
+        let crc = crc32(&rec[..INODE_SIZE - 4]);
+        rec[INODE_SIZE - 4..].copy_from_slice(&crc.to_le_bytes());
+        assert!(Inode::decode(&rec).is_err());
+    }
+
+    #[test]
+    fn extent_blocks_reject_tampering() {
+        let ext = vec![Extent::new(0, 9, 1)];
+        let mut b = encode_extent_block(5, 0, &ext);
+        assert!(decode_extent_block(5, &b).is_ok());
+        b[100] ^= 1;
+        assert_eq!(
+            decode_extent_block(5, &b).unwrap_err(),
+            Error::Corrupt("extent block checksum")
+        );
+        let mut c = encode_extent_block(5, 0, &ext);
+        c[0] = 0;
+        assert!(decode_extent_block(5, &c).is_err());
+        let mut d = encode_extent_block(5, 0, &ext);
+        d[4..8].copy_from_slice(&(EXTENTS_PER_BLOCK as u32 + 1).to_le_bytes());
+        assert!(decode_extent_block(5, &d).is_err());
+        assert_eq!(EXTENTS_PER_BLOCK, 169);
+    }
+
+    #[test]
+    fn empty_extent_block() {
+        let b = encode_extent_block(3, 0, &[]);
+        assert_eq!(decode_extent_block(3, &b).unwrap(), (0, vec![]));
+    }
+
+    #[test]
+    fn dirent_with_the_longest_name() {
+        let name = [b'n'; MAX_NAME_LEN];
+        let d = encode_dirent(1 << 50, FileKind::Fifo, &name);
+        assert_eq!(d.len(), DIRENT_HDR + MAX_NAME_LEN);
+        let p = parse_dirents(&d).unwrap();
+        assert_eq!(p[0].ino, 1 << 50);
+        assert_eq!(p[0].kind, Some(FileKind::Fifo));
+        assert_eq!(p[0].name.len(), MAX_NAME_LEN);
+    }
+
+    #[test]
+    fn malformed_dirents_are_corruption() {
+        // rec_len shorter than its own header.
+        let mut d = encode_dirent(4, FileKind::Regular, b"a");
+        d[8..10].copy_from_slice(&3u16.to_le_bytes());
+        assert!(parse_dirents(&d).is_err());
+        // A live entry with an unknown kind.
+        let mut d = encode_dirent(4, FileKind::Regular, b"a");
+        d[10] = 99;
+        assert!(parse_dirents(&d).is_err());
+        // A live entry with an empty name.
+        let d = encode_dirent(4, FileKind::Regular, b"");
+        assert!(parse_dirents(&d).is_err());
+        // A trailing fragment.
+        let mut d = encode_dirent(4, FileKind::Regular, b"a");
+        d.extend_from_slice(&[0, 0, 0]);
+        assert!(parse_dirents(&d).is_err());
+        assert!(parse_dirents(&[]).unwrap().is_empty());
+    }
 }

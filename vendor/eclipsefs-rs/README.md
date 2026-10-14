@@ -59,8 +59,17 @@ Journal (consistencia ante cortes), copy-on-write y snapshots, compresión,
 checksums de datos y directorios indexados: las piezas de v0.2/v0.3 que aún no
 están portadas.
 
-## Tests
+## Tests y benchmarks
 
 ```sh
 cargo test --release -p eclipsefs --features std
 ```
+
+- Tests de unidad en cada módulo (`crc`, `extent`, `blocks`, `format`, `fs`).
+- `tests/integration.rs` y `tests/edge_cases.rs`: la API pública de punta a
+  punta, límites del formato (extents en línea y en cadena, symlinks en línea,
+  cachés), validación de argumentos, contabilidad de espacio y una prueba
+  aleatoria contra un modelo en memoria con remontajes.
+- `tests/performance.rs`: las mismas cargas sobre EclipseFS y btrfs, con tiempo
+  y bytes leídos/escritos en el dispositivo. `scripts/eclipsefs-bench.sh` las
+  ejecuta en release; `ECLIPSEFS_BENCH_SCALE=4` las agranda.

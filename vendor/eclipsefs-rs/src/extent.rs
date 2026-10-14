@@ -295,4 +295,164 @@ mod tests {
         assert_eq!(Extent::decode(&b), e);
         assert!(Extent::decode(&b).is_unwritten());
     }
+
+    #[test]
+    fn empty_tree_answers_nothing() {
+        let t = ExtentTree::new();
+        assert!(t.is_empty());
+        assert_eq!(t.lookup(0), None);
+        assert_eq!(t.next_start_after(0), None);
+        assert_eq!(t.goal_for(5), None);
+        assert_eq!(t.total_blocks(), 0);
+        assert_eq!(t.stats(), ExtentStats::default());
+    }
+
+    #[test]
+    fn lookup_at_extent_edges() {
+        let mut t = ExtentTree::new();
+        t.add_extent(Extent::new(10, 500, 5)).unwrap();
+        assert_eq!(t.lookup(9), None);
+        assert_eq!(t.lookup(10), Some((500, 5)));
+        assert_eq!(t.lookup(14), Some((504, 1)));
+        assert_eq!(t.lookup(15), None);
+        assert_eq!(t.logical_to_physical(12), Some(502));
+        assert_eq!(t.find_extent(14).unwrap().logical_block, 10);
+    }
+
+    #[test]
+    fn next_start_skips_the_extent_containing_the_block() {
+        let mut t = ExtentTree::new();
+        t.add_extent(Extent::new(0, 100, 4)).unwrap();
+        t.add_extent(Extent::new(8, 200, 4)).unwrap();
+        t.add_extent(Extent::new(20, 300, 4)).unwrap();
+        assert_eq!(t.next_start_after(0), Some(8));
+        assert_eq!(t.next_start_after(5), Some(8));
+        assert_eq!(t.next_start_after(8), Some(20));
+        assert_eq!(t.next_start_after(19), Some(20));
+        assert_eq!(t.next_start_after(25), None);
+    }
+
+    #[test]
+    fn goal_follows_the_previous_extent_across_a_hole() {
+        let mut t = ExtentTree::new();
+        t.add_extent(Extent::new(0, 100, 4)).unwrap();
+        assert_eq!(t.goal_for(4), Some(104));
+        assert_eq!(t.goal_for(10), Some(110));
+        t.add_extent(Extent::new(50, 900, 1)).unwrap();
+        assert_eq!(t.goal_for(51), Some(901));
+        assert_eq!(t.goal_for(20), Some(120));
+    }
+
+    #[test]
+    fn flags_prevent_merging() {
+        let mut t = ExtentTree::new();
+        t.add_extent(Extent::new(0, 100, 4)).unwrap();
+        let mut e = Extent::new(4, 104, 4);
+        e.flags = EXTENT_FLAG_COMPRESSED;
+        t.add_extent(e).unwrap();
+        assert_eq!(t.extent_count(), 2);
+        let mut f = Extent::new(8, 108, 2);
+        f.flags = EXTENT_FLAG_COMPRESSED;
+        t.add_extent(f).unwrap();
+        assert_eq!(t.extent_count(), 2);
+        assert_eq!(t.extents()[1].length, 6);
+    }
+
+    #[test]
+    fn merging_stops_at_the_maximum_length() {
+        let mut t = ExtentTree::new();
+        t.add_extent(Extent::new(0, 0, u32::MAX)).unwrap();
+        t.add_extent(Extent::new(u32::MAX as u64, u32::MAX as u64, 1))
+            .unwrap();
+        assert_eq!(t.extent_count(), 2);
+        assert_eq!(t.total_blocks(), u32::MAX as u64 + 1);
+    }
+
+    #[test]
+    fn merge_with_successor_only() {
+        let mut t = ExtentTree::new();
+        t.add_extent(Extent::new(10, 110, 5)).unwrap();
+        t.add_extent(Extent::new(5, 105, 5)).unwrap();
+        assert_eq!(t.extents(), &[Extent::new(5, 105, 10)]);
+    }
+
+    #[test]
+    fn zero_length_and_bad_lists_are_refused() {
+        let mut t = ExtentTree::new();
+        assert_eq!(t.add_extent(Extent::new(0, 1, 0)), Err(Error::Invalid));
+        assert!(ExtentTree::from_extents(alloc::vec![Extent::new(0, 1, 0)]).is_err());
+        assert!(ExtentTree::from_extents(alloc::vec![
+            Extent::new(0, 1, 5),
+            Extent::new(4, 100, 1)
+        ])
+        .is_err());
+        let ok =
+            ExtentTree::from_extents(alloc::vec![Extent::new(0, 1, 5), Extent::new(5, 100, 1)])
+                .unwrap();
+        assert_eq!(ok.extent_count(), 2);
+    }
+
+    #[test]
+    fn truncate_on_exact_boundaries() {
+        let mut t = ExtentTree::new();
+        t.add_extent(Extent::new(0, 100, 10)).unwrap();
+        t.add_extent(Extent::new(10, 500, 10)).unwrap();
+        assert_eq!(t.truncate_from(10), alloc::vec![(500, 10)]);
+        assert_eq!(t.extents(), &[Extent::new(0, 100, 10)]);
+        assert!(t.truncate_from(100).is_empty());
+        assert_eq!(t.truncate_from(9), alloc::vec![(109, 1)]);
+        assert_eq!(t.total_blocks(), 9);
+    }
+
+    #[test]
+    fn truncate_into_a_hole() {
+        let mut t = ExtentTree::new();
+        t.add_extent(Extent::new(0, 100, 2)).unwrap();
+        t.add_extent(Extent::new(10, 300, 2)).unwrap();
+        assert_eq!(t.truncate_from(5), alloc::vec![(300, 2)]);
+        assert_eq!(t.extent_count(), 1);
+    }
+
+    #[test]
+    fn stats_report_the_largest_run() {
+        let mut t = ExtentTree::new();
+        t.add_extent(Extent::new(0, 100, 3)).unwrap();
+        t.add_extent(Extent::new(10, 300, 7)).unwrap();
+        t.add_extent(Extent::new(30, 900, 2)).unwrap();
+        let s = t.stats();
+        assert_eq!(s.extent_count, 3);
+        assert_eq!(s.total_blocks, 12);
+        assert_eq!(s.largest_extent, 7);
+    }
+
+    #[test]
+    fn many_random_inserts_stay_sorted_and_disjoint() {
+        let mut t = ExtentTree::new();
+        let mut seed = 42u64;
+        let mut slots: alloc::vec::Vec<u64> = (0..500).collect();
+        for i in (1..slots.len()).rev() {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            slots.swap(i, (seed >> 33) as usize % (i + 1));
+        }
+        for &s in &slots {
+            t.add_extent(Extent::new(s * 2, 10_000 + s * 3, 2)).unwrap();
+        }
+        let e = t.extents();
+        assert_eq!(e.len(), 500);
+        assert!(e
+            .windows(2)
+            .all(|w| w[0].logical_end() <= w[1].logical_block));
+        for s in 0..500 {
+            assert_eq!(t.lookup(s * 2 + 1), Some((10_000 + s * 3 + 1, 1)));
+        }
+    }
+
+    #[test]
+    fn decode_ignores_the_padding() {
+        let mut b = [0xFFu8; EXTENT_DISK_SIZE];
+        Extent::new(1, 2, 3).encode(&mut b);
+        assert_eq!(&b[22..], &[0, 0]);
+        b[22] = 0x77;
+        assert_eq!(Extent::decode(&b), Extent::new(1, 2, 3));
+    }
 }

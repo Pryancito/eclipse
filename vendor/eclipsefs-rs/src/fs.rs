@@ -1193,3 +1193,314 @@ impl EclipseFS {
         r
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use core::cell::RefCell;
+
+    /// Device whose fresh contents are 0xA5, so missed zero-filling shows up.
+    struct MemDev(RefCell<Vec<u8>>);
+
+    // Tests run each device on one thread.
+    unsafe impl Sync for MemDev {}
+    unsafe impl Send for MemDev {}
+
+    impl MemDev {
+        fn new(blocks: u64) -> Self {
+            Self(RefCell::new(vec![0xA5; (blocks * BLOCK_SIZE) as usize]))
+        }
+        fn writes_to(&self, block: u64) -> Vec<u8> {
+            let d = self.0.borrow();
+            let at = (block * BLOCK_SIZE) as usize;
+            d[at..at + BLOCK_SIZE as usize].to_vec()
+        }
+    }
+
+    impl BlockDevice for MemDev {
+        fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<()> {
+            let d = self.0.borrow();
+            let o = offset as usize;
+            let s = d.get(o..o + buf.len()).ok_or(Error::Io)?;
+            buf.copy_from_slice(s);
+            Ok(())
+        }
+        fn write_at(&self, offset: u64, buf: &[u8]) -> Result<()> {
+            let mut d = self.0.borrow_mut();
+            let o = offset as usize;
+            d.get_mut(o..o + buf.len())
+                .ok_or(Error::Io)?
+                .copy_from_slice(buf);
+            Ok(())
+        }
+        fn sync(&self) -> Result<()> {
+            Ok(())
+        }
+        fn size(&self) -> u64 {
+            self.0.borrow().len() as u64
+        }
+    }
+
+    fn setup(blocks: u64) -> (MemDev, BlockAllocator, Inode) {
+        let dev = MemDev::new(blocks);
+        let alloc = BlockAllocator::new(vec![AllocationGroup::new(0, blocks)]);
+        (dev, alloc, Inode::new(FileKind::Regular, 0o644, (0, 0)))
+    }
+
+    fn read_vec(dev: &MemDev, inode: &Inode, off: u64, len: usize) -> Vec<u8> {
+        let mut buf = vec![0xCC; len];
+        let n = read_data(dev, inode, off, &mut buf).unwrap();
+        buf.truncate(n);
+        buf
+    }
+
+    #[test]
+    fn zero_spans_several_buffers() {
+        let dev = MemDev::new(80);
+        let len = ZEROS.len() as u64 * 2 + 10;
+        zero(&dev, 3, len).unwrap();
+        let d = dev.0.borrow();
+        assert_eq!(d[2], 0xA5);
+        assert!(d[3..3 + len as usize].iter().all(|&b| b == 0));
+        assert_eq!(d[3 + len as usize], 0xA5);
+    }
+
+    #[test]
+    fn unaligned_write_zero_fills_fresh_blocks() {
+        let (dev, mut alloc, mut inode) = setup(64);
+        assert_eq!(
+            write_data(&dev, &mut alloc, &mut inode, 100, b"hi").unwrap(),
+            2
+        );
+        assert_eq!(inode.size, 102);
+        assert_eq!(inode.nbytes, BLOCK_SIZE);
+        let (phys, _) = inode.extents.lookup(0).unwrap();
+        let blk = dev.writes_to(phys);
+        assert!(blk[..100].iter().all(|&b| b == 0));
+        assert_eq!(&blk[100..102], b"hi");
+        assert!(blk[102..].iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn sequential_writes_extend_one_extent() {
+        let (dev, mut alloc, mut inode) = setup(256);
+        for i in 0..10u64 {
+            let data = vec![i as u8; BLOCK_SIZE as usize];
+            write_data(&dev, &mut alloc, &mut inode, i * BLOCK_SIZE, &data).unwrap();
+        }
+        assert_eq!(inode.extents.extents().len(), 1);
+        assert_eq!(inode.size, 10 * BLOCK_SIZE);
+        let back = read_vec(&dev, &inode, 0, 10 * BLOCK_SIZE as usize);
+        for i in 0..10 {
+            let s = (i * BLOCK_SIZE) as usize;
+            assert!(back[s..s + BLOCK_SIZE as usize]
+                .iter()
+                .all(|&b| b == i as u8));
+        }
+    }
+
+    #[test]
+    fn holes_read_as_zero_and_are_filled_in_place() {
+        let (dev, mut alloc, mut inode) = setup(64);
+        write_data(&dev, &mut alloc, &mut inode, 0, &[1; 10]).unwrap();
+        write_data(&dev, &mut alloc, &mut inode, 3 * BLOCK_SIZE, &[3; 10]).unwrap();
+        assert_eq!(inode.nbytes, 2 * BLOCK_SIZE);
+        let mid = read_vec(&dev, &inode, BLOCK_SIZE - 5, 20);
+        assert_eq!(&mid[..5], &[0; 5]);
+        assert_eq!(&mid[5..], &[0; 15]);
+        // A write spanning the hole and the mapped block after it fills the
+        // hole only up to the next extent.
+        let data = vec![7u8; (2 * BLOCK_SIZE + 4) as usize];
+        write_data(&dev, &mut alloc, &mut inode, BLOCK_SIZE, &data).unwrap();
+        assert_eq!(inode.nbytes, 4 * BLOCK_SIZE);
+        let all = read_vec(&dev, &inode, 0, inode.size as usize);
+        assert_eq!(&all[..10], &[1; 10]);
+        assert!(all[10..BLOCK_SIZE as usize].iter().all(|&b| b == 0));
+        assert!(all[BLOCK_SIZE as usize..(3 * BLOCK_SIZE + 4) as usize]
+            .iter()
+            .all(|&b| b == 7));
+        assert_eq!(&all[(3 * BLOCK_SIZE + 4) as usize..], &[3; 6]);
+    }
+
+    #[test]
+    fn reads_clamp_to_size() {
+        let (dev, mut alloc, mut inode) = setup(64);
+        write_data(&dev, &mut alloc, &mut inode, 0, b"abcdef").unwrap();
+        assert_eq!(read_vec(&dev, &inode, 4, 100), b"ef");
+        assert_eq!(read_vec(&dev, &inode, 6, 100), b"");
+        assert_eq!(read_vec(&dev, &inode, u64::MAX, 100), b"");
+    }
+
+    #[test]
+    fn inline_reads_and_truncates() {
+        let dev = MemDev::new(8);
+        let mut inode = Inode::new(FileKind::Symlink, 0o777, (0, 0));
+        inode.flags |= INODE_FLAG_INLINE;
+        inode.inline = b"target".to_vec();
+        inode.size = 6;
+        assert_eq!(read_vec(&dev, &inode, 2, 10), b"rget");
+        let mut alloc = BlockAllocator::new(vec![AllocationGroup::new(0, 8)]);
+        truncate_inode(&dev, &mut alloc, &mut inode, 3).unwrap();
+        assert_eq!(read_vec(&dev, &inode, 0, 10), b"tar");
+        truncate_inode(&dev, &mut alloc, &mut inode, 5).unwrap();
+        assert_eq!(read_vec(&dev, &inode, 0, 10), b"tar\0\0");
+        assert_eq!(inode.nbytes, 5);
+    }
+
+    #[test]
+    fn full_device_gives_short_write_then_no_space() {
+        // 64 blocks, two taken by the superblock and the bitmap.
+        let (dev, mut alloc, mut inode) = setup(64);
+        let data = vec![9u8; (100 * BLOCK_SIZE) as usize];
+        let n = write_data(&dev, &mut alloc, &mut inode, 0, &data).unwrap();
+        assert_eq!(n as u64, 62 * BLOCK_SIZE);
+        assert_eq!(alloc.free_blocks(), 0);
+        assert!(matches!(
+            write_data(&dev, &mut alloc, &mut inode, n as u64, &data),
+            Err(Error::NoSpace)
+        ));
+        // Overwriting mapped blocks needs no space.
+        assert_eq!(
+            write_data(&dev, &mut alloc, &mut inode, 0, b"x").unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn write_overflowing_offsets_is_invalid() {
+        let (dev, mut alloc, mut inode) = setup(64);
+        assert!(matches!(
+            write_data(&dev, &mut alloc, &mut inode, u64::MAX, b"ab"),
+            Err(Error::Invalid)
+        ));
+        assert_eq!(
+            write_data(&dev, &mut alloc, &mut inode, u64::MAX, b"").unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn extend_zeroed_allocates_zeros() {
+        let (dev, mut alloc, mut inode) = setup(128);
+        extend_zeroed(&dev, &mut alloc, &mut inode, 5 * BLOCK_SIZE + 1).unwrap();
+        assert_eq!(inode.size, 5 * BLOCK_SIZE + 1);
+        assert_eq!(inode.nbytes, 6 * BLOCK_SIZE);
+        let (phys, run) = inode.extents.lookup(0).unwrap();
+        assert_eq!(run, 6);
+        for b in phys..phys + 6 {
+            assert!(dev.writes_to(b).iter().all(|&x| x == 0));
+        }
+        let (dev, mut alloc, mut inode) = setup(64);
+        assert!(matches!(
+            extend_zeroed(&dev, &mut alloc, &mut inode, 100 * BLOCK_SIZE),
+            Err(Error::NoSpace)
+        ));
+    }
+
+    #[test]
+    fn truncate_frees_whole_blocks_and_zeroes_the_tail() {
+        let (dev, mut alloc, mut inode) = setup(64);
+        let free0 = alloc.free_blocks();
+        write_data(&dev, &mut alloc, &mut inode, 0, &[0xFF; 3 * 4096]).unwrap();
+        assert_eq!(alloc.free_blocks(), free0 - 3);
+        truncate_inode(&dev, &mut alloc, &mut inode, 4097).unwrap();
+        assert_eq!(alloc.free_blocks(), free0 - 2);
+        assert_eq!(inode.nbytes, 2 * BLOCK_SIZE);
+        assert!(inode.extents_dirty);
+        let (p, _) = inode.extents.lookup(1).unwrap();
+        let blk = dev.writes_to(p);
+        assert_eq!(blk[0], 0xFF);
+        assert!(blk[1..].iter().all(|&b| b == 0));
+        // Growing is sparse.
+        truncate_inode(&dev, &mut alloc, &mut inode, 1 << 20).unwrap();
+        assert_eq!(alloc.free_blocks(), free0 - 2);
+        assert_eq!(inode.size, 1 << 20);
+        truncate_inode(&dev, &mut alloc, &mut inode, 0).unwrap();
+        assert_eq!(alloc.free_blocks(), free0);
+        assert_eq!(inode.nbytes, 0);
+    }
+
+    fn fragmented(n: u64) -> (MemDev, BlockAllocator, Inode) {
+        let (dev, mut alloc, mut inode) = setup(4 * n + 64);
+        for i in 0..n {
+            write_data(&dev, &mut alloc, &mut inode, 2 * i * BLOCK_SIZE, &[i as u8]).unwrap();
+        }
+        assert_eq!(inode.extents.extents().len() as u64, n);
+        (dev, alloc, inode)
+    }
+
+    #[test]
+    fn chain_is_empty_while_extents_fit_inline() {
+        let (dev, mut alloc, mut inode) = fragmented(INLINE_EXTENTS as u64);
+        write_chain(&dev, &mut alloc, 7, &mut inode).unwrap();
+        assert!(inode.chain.is_empty());
+        assert!(!inode.extents_dirty);
+    }
+
+    #[test]
+    fn chain_round_trips_and_replaces_old_blocks() {
+        let n = (INLINE_EXTENTS + 2 * EXTENTS_PER_BLOCK + 1) as u64;
+        let (dev, mut alloc, mut inode) = fragmented(n);
+        let free = alloc.free_blocks();
+        write_chain(&dev, &mut alloc, 7, &mut inode).unwrap();
+        assert_eq!(inode.chain.len(), 3);
+        assert_eq!(alloc.free_blocks(), free - 3);
+
+        let rec = inode.encode();
+        let (mut back, next, count) = Inode::decode(&rec).unwrap().unwrap();
+        assert_eq!(next, inode.chain[0]);
+        assert_eq!(count as u64, n);
+        load_chain(&dev, 7, alloc.total_blocks(), next, count, &mut back).unwrap();
+        assert_eq!(back.extents.extents(), inode.extents.extents());
+        assert_eq!(back.chain, inode.chain);
+
+        // Wrong owner is rejected.
+        let (mut other, _, _) = Inode::decode(&rec).unwrap().unwrap();
+        assert!(load_chain(&dev, 8, alloc.total_blocks(), next, count, &mut other).is_err());
+        // Out-of-range pointer is rejected.
+        let (mut other, _, _) = Inode::decode(&rec).unwrap().unwrap();
+        assert!(load_chain(&dev, 7, next, next, count, &mut other).is_err());
+        // Count mismatch is rejected.
+        let (mut other, _, _) = Inode::decode(&rec).unwrap().unwrap();
+        assert!(load_chain(&dev, 7, alloc.total_blocks(), next, count - 1, &mut other).is_err());
+
+        // Shrinking the file shrinks the chain and frees the old blocks.
+        truncate_inode(&dev, &mut alloc, &mut inode, 2 * BLOCK_SIZE * 10).unwrap();
+        write_chain(&dev, &mut alloc, 7, &mut inode).unwrap();
+        assert_eq!(inode.chain.len(), 1);
+    }
+
+    #[test]
+    fn chain_allocation_failure_keeps_the_old_chain() {
+        let n = (INLINE_EXTENTS + EXTENTS_PER_BLOCK) as u64;
+        let (dev, mut alloc, mut inode) = fragmented(n);
+        write_chain(&dev, &mut alloc, 7, &mut inode).unwrap();
+        let old = inode.chain.clone();
+        // Fill the device and add one more extent so a second block is needed.
+        while alloc.allocate(None, MAX_EXTENT_BLOCKS).is_some() {}
+        inode
+            .extents
+            .add_extent(Extent::new(1 << 20, old[0] + 2, 1))
+            .unwrap();
+        let free = alloc.free_blocks();
+        assert!(matches!(
+            write_chain(&dev, &mut alloc, 7, &mut inode),
+            Err(Error::NoSpace)
+        ));
+        assert_eq!(inode.chain, old);
+        assert_eq!(alloc.free_blocks(), free);
+    }
+
+    #[test]
+    fn names() {
+        assert!(check_name("a").is_ok());
+        assert!(check_name(&"n".repeat(MAX_NAME_LEN)).is_ok());
+        assert!(check_name(&"n".repeat(MAX_NAME_LEN + 1)).is_err());
+        assert!(check_name("ñandú").is_ok());
+        for bad in ["", ".", "..", "a/b", "/", "a\0b"] {
+            assert!(check_name(bad).is_err(), "{:?}", bad);
+        }
+        assert!(check_name("...").is_ok());
+        assert!(check_name(".hidden").is_ok());
+    }
+}
