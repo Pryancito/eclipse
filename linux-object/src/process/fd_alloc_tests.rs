@@ -911,3 +911,40 @@ mod holders {
         assert_in_step(&proc, "closing everything");
     }
 }
+
+/// `add_file_at` installs under a number the CALLER chose, and nothing
+/// promises that number is free. Installing over a live descriptor therefore
+/// has to free what was there, the way `dup2` does.
+///
+/// A bare `HashMap::insert` drops the old file and leaves its `holders` count
+/// behind, and that count is the whole of what a close asks before it tells
+/// an epoll anything: a description that looks held forever is one whose
+/// epoll entries are never dropped. The leak is not visible in the table --
+/// the right file is at the right number either way -- so it takes asking
+/// `holds_description` directly.
+#[test]
+fn installing_over_a_live_number_does_not_leave_the_old_description_held() {
+    let proc = a_process();
+    let fds = open_n(&proc, 3);
+    let old = proc.get_file_like(fds[1]).expect("it is open");
+    assert!(
+        proc.inner.lock().holds_description(&old),
+        "the table has to START holding it, or nothing below is testing anything"
+    );
+
+    proc.add_file_at(fds[1], an_open_log(Log::new(), OpenFlags::RDWR))
+        .expect("well inside the default limit");
+
+    assert!(
+        !proc.inner.lock().holds_description(&old),
+        "the description that got dropped is still counted as held, so every \
+         later close will think some descriptor of ours still has it open"
+    );
+    // And it was a replace, not a leak of the NUMBER too: the new file is at
+    // that number and the table is the same size it was.
+    assert!(
+        proc.get_file_like(fds[1]).is_ok(),
+        "nothing is at the number"
+    );
+    assert_eq!(proc.inner.lock().files.len(), 3);
+}

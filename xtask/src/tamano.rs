@@ -54,6 +54,15 @@ const AJENOS: &[&str] = &["vendor/", "smoltcp/", "nvidia-rm-sys/vendor/"];
 /// salga de esta lista. Eso es lo que le pasó a
 /// `tools/eclipse-init/src/main.rs` el mismo día que entró este test: creció
 /// 280 líneas, este test las vio, y partirlo lo dejó en 3.313.
+/// **`linux-object/src/process.rs`, subido a 6250 el 14-oct-2026**: el #1886
+/// metio 131 lineas de produccion y lo dejo en 6129 sobre un techo de 6000,
+/// o sea MASTER ROJO en este test para todo el mundo. Sube al siguiente
+/// multiplo de 250, que es la regla de arriba, y no a la cifra del dia. Pero
+/// es el fichero que mas veces ha tocado su techo: lo que toca es partirlo, y
+/// aqui ya no vale lo de sacar un `#[cfg(test)] mod` de primer nivel porque
+/// sus tests viven todos en ficheros aparte desde hace tandas. Lo que queda
+/// dentro y es un tema entero son las credenciales (`setuid`/`setgid`/
+/// `setgroups` y sus comprobaciones) y el control de trabajos.
 const PASADOS: &[(&str, usize)] = &[
     ("drivers/src/display/nvidia.rs", 15000),
     (
@@ -71,15 +80,7 @@ const PASADOS: &[(&str, usize)] = &[
     ("xtask/src/linux/mod.rs", 7750),
     ("linux-object/src/fs/devfs/drm_scheme.rs", 6750),
     ("linux-object/src/fs/procfs.rs", 6500),
-    // 6250: el #1886 metio 131 lineas de produccion y dejo el fichero en
-    // 6129 sobre un techo de 6000, o sea MASTER ROJO en este test para todo
-    // el mundo. Sube al siguiente multiplo de 250, que es la regla de arriba,
-    // y no a la cifra del dia. Pero este es el fichero que mas veces ha
-    // tocado este techo: lo que toca es partirlo, y ya no vale lo de sacar un
-    // `#[cfg(test)] mod` de primer nivel porque sus tests viven todos en
-    // ficheros aparte desde hace tandas. Lo que queda dentro y es un tema
-    // entero son las credenciales (`setuid`/`setgid`/`setgroups` y sus
-    // comprobaciones) y el control de trabajos.
+    // Subido el 14-oct; lo que toca es partirlo, ver arriba.
     ("linux-object/src/process.rs", 6250),
     ("zircon-object/src/vm/vmar.rs", 5500),
     ("drivers/src/scheme/syncobj.rs", 5500),
