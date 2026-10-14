@@ -153,3 +153,77 @@ fn default_terminating_signals_interrupt_waits() {
         );
     }
 }
+
+/// The throttle on the `[wait]` trace, which is the whole of what keeps a
+/// storm of `EINTR` from pushing the rest of the kernel log out of the ring
+/// buffer. A capture from real hardware held 118461 of these lines inside a
+/// 2-second window and nothing else from the preceding 17 minutes.
+mod wait_trace_throttle {
+    use super::super::{wait_trace_is_due, WAIT_TRACE_MIN_GAP_NS};
+
+    /// `last == 0` is "never printed", and a one-off failure -- the case the
+    /// trace was written for, a compositor dying on a single `epoll_wait`
+    /// error -- has to reach the log on its first and only line.
+    #[test]
+    fn first_line_always_prints() {
+        assert!(wait_trace_is_due(0, 0, WAIT_TRACE_MIN_GAP_NS));
+        assert!(wait_trace_is_due(1, 0, WAIT_TRACE_MIN_GAP_NS));
+        assert!(wait_trace_is_due(u64::MAX, 0, WAIT_TRACE_MIN_GAP_NS));
+    }
+
+    /// Inside the gap: suppressed. This is the 59000-lines-per-second case,
+    /// and the only test here that fails if the throttle is removed outright.
+    #[test]
+    fn inside_the_gap_is_suppressed() {
+        let last = 1_000_000_000;
+        assert!(!wait_trace_is_due(last, last, WAIT_TRACE_MIN_GAP_NS));
+        assert!(!wait_trace_is_due(last + 1, last, WAIT_TRACE_MIN_GAP_NS));
+        // 17us apart, the interval the firefox capture ran at.
+        assert!(!wait_trace_is_due(
+            last + 17_000,
+            last,
+            WAIT_TRACE_MIN_GAP_NS
+        ));
+        assert!(!wait_trace_is_due(
+            last + WAIT_TRACE_MIN_GAP_NS - 1,
+            last,
+            WAIT_TRACE_MIN_GAP_NS
+        ));
+    }
+
+    /// Exactly at the gap prints. A `>` instead of `>=` makes the gap
+    /// unreachable on a clock whose tick lands on it, which on a coarse
+    /// monotonic source is every tick.
+    #[test]
+    fn exactly_at_the_gap_prints() {
+        let last = 1_000_000_000;
+        assert!(wait_trace_is_due(
+            last + WAIT_TRACE_MIN_GAP_NS,
+            last,
+            WAIT_TRACE_MIN_GAP_NS
+        ));
+        assert!(wait_trace_is_due(
+            last + WAIT_TRACE_MIN_GAP_NS + 1,
+            last,
+            WAIT_TRACE_MIN_GAP_NS
+        ));
+    }
+
+    /// A clock that went backwards must print, not go quiet. With a bare
+    /// `now - last` the subtraction wraps to a number no gap can exceed, so
+    /// the trace would stay silent until the clock caught up -- and the one
+    /// thing this kernel's monotonic clock has already been seen to do is
+    /// hand out a base it had not set yet.
+    #[test]
+    fn clock_going_backwards_prints() {
+        assert!(wait_trace_is_due(5, 1_000_000_000, WAIT_TRACE_MIN_GAP_NS));
+        assert!(wait_trace_is_due(0, 1, WAIT_TRACE_MIN_GAP_NS));
+    }
+
+    /// The configured gap is the one the caller uses, and it is the value the
+    /// rate of the log depends on: 100ms, i.e. at most ten lines a second.
+    #[test]
+    fn configured_gap_is_a_tenth_of_a_second() {
+        assert_eq!(WAIT_TRACE_MIN_GAP_NS, 100_000_000);
+    }
+}

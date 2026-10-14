@@ -5634,14 +5634,143 @@ pub fn trace_direct_kill(target: &Arc<Process>, sender: &Arc<Process>) {
     );
 }
 
+/// How often [`trace_wait_error`] may print, in nanoseconds. 100ms keeps a
+/// storm at ~10 lines/s -- dense enough to read the rate off the timestamps,
+/// cheap enough that it cannot own the ring buffer or the UART.
+const WAIT_TRACE_MIN_GAP_NS: u64 = 100_000_000;
+
+/// Whether [`trace_wait_error`] may print now, given the monotonic `now`, the
+/// `last` time it printed (`0` = never) and the minimum `gap` between lines.
+///
+/// Split out from its caller because the caller cannot be tested: it reads a
+/// clock, takes a thread lock and writes the UART. This is the whole of the
+/// decision, and the two edges that matter are the ones a storm rides through
+/// if they are wrong -- `now == last + gap` must print (a `>` here turns the
+/// gap into "never, by one nanosecond" on a coarse clock), and a clock that
+/// went BACKWARDS must print rather than wrap `now - last` into a number
+/// larger than any gap and silence the trace until the clock catches up.
+fn wait_trace_is_due(now: u64, last: u64, gap: u64) -> bool {
+    // Never printed: due, whatever the clock says.
+    if last == 0 {
+        return true;
+    }
+    match now.checked_sub(last) {
+        Some(elapsed) => elapsed >= gap,
+        // Clock went backwards.
+        None => true,
+    }
+}
+
 /// Trace an error returned by a blocking wait (`poll`, `ppoll`, `epoll_wait`).
 /// libwayland treats ANY `epoll_wait` failure, EINTR included, as fatal and
 /// a compositor then leaves `wl_display_run` without a word; foot logs
 /// "failed to poll" and exits the same way. Knowing the errno and the victim
 /// is the only way to tell such an exit from a deliberate one.
+///
+/// THROTTLED, and that is not cosmetic. This line sits in the return path of
+/// `poll`/`epoll_wait`, so its rate is whatever rate the caller re-enters the
+/// syscall at -- and a process that takes `EINTR` and immediately waits again
+/// re-enters it as fast as the CPU allows. A capture from real hardware held
+/// 118461 of these lines inside a 2-second window (~59000/s, two firefox
+/// threads taking `EINTR` in a tight loop); the flood pushed ~17 minutes of
+/// kernel log out of the ring buffer, so the only thing the dmesg could no
+/// longer show was what had led up to it. An unthrottled trace that destroys
+/// the evidence it was added to collect is worse than no trace.
+///
+/// So: at most one line per [`WAIT_TRACE_MIN_GAP`], carrying the number of
+/// lines dropped since the last one. The count is the part that matters --
+/// "(+58847 suppressed)" is how a livelock tells itself apart from the
+/// one-off failure this trace was written for, which is why the suppressed
+/// ones are counted rather than merely skipped. The gate is global, not
+/// per-(call, errno, pid): a flood alternating between two threads, which is
+/// exactly what the capture above was, walks straight through a dedup keyed
+/// on the signature. A genuinely rare failure still prints at once, since the
+/// gap has long since elapsed when it happens.
 pub fn trace_wait_error(call: &str, err: crate::error::LxError) {
+    use core::sync::atomic::{AtomicU64, Ordering};
+    /// Monotonic ns of the last line printed. `0` means "never", which is also
+    /// what the clock reads for the first few instants after boot; printing one
+    /// extra line there is harmless.
+    static LAST_NS: AtomicU64 = AtomicU64::new(0);
+    /// Lines dropped since the last one printed.
+    static SUPPRESSED: AtomicU64 = AtomicU64::new(0);
+
+    let now = kernel_hal::timer::timer_now().as_nanos() as u64;
+    let last = LAST_NS.load(Ordering::Relaxed);
+    if !wait_trace_is_due(now, last, WAIT_TRACE_MIN_GAP_NS) {
+        SUPPRESSED.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+    // Relaxed, and deliberately not a compare-exchange loop: two CPUs racing
+    // here print two lines, which is the whole cost of being wrong. A trace in
+    // a syscall return path does not get to take a lock.
+    LAST_NS.store(now, Ordering::Relaxed);
+    let dropped = SUPPRESSED.swap(0, Ordering::Relaxed);
     let (pid, name) = current_process_pid_name();
-    zcore_drivers::klog_warn!("[wait] {}() -> {:?} for pid {} ({})", call, err, pid, name);
+    // `EINTR` without the signal behind it names no culprit: the capture above
+    // is 118461 lines that say "a signal interrupted this" 59000 times a second
+    // and never once say WHICH, so the next step after reading it is still to
+    // ask the machine's owner to go and find out. The set is read only on the
+    // lines that print, so it costs nothing on the suppressed ones.
+    let pending = if err == crate::error::LxError::EINTR {
+        pending_deliverable_mask()
+    } else {
+        0
+    };
+    match (dropped, pending) {
+        (0, 0) => {
+            zcore_drivers::klog_warn!("[wait] {}() -> {:?} for pid {} ({})", call, err, pid, name)
+        }
+        (0, p) => zcore_drivers::klog_warn!(
+            "[wait] {}() -> {:?} for pid {} ({}) pending={:#x}",
+            call,
+            err,
+            pid,
+            name,
+            p
+        ),
+        (d, 0) => zcore_drivers::klog_warn!(
+            "[wait] {}() -> {:?} for pid {} ({}) (+{} suppressed)",
+            call,
+            err,
+            pid,
+            name,
+            d
+        ),
+        (d, p) => zcore_drivers::klog_warn!(
+            "[wait] {}() -> {:?} for pid {} ({}) pending={:#x} (+{} suppressed)",
+            call,
+            err,
+            pid,
+            name,
+            p,
+            d
+        ),
+    }
+}
+
+/// The current thread's pending-and-unblocked signal set, as the raw word, or
+/// `0` when it cannot be read without blocking.
+///
+/// `try_lock_linux`, never `lock_linux`: this runs from a syscall return path
+/// that may already be inside the object layer, and a trace does not get to
+/// wait on a lock (the deadlock [`trace_name`] documents is the same shape).
+/// A contended read answers `0`, i.e. "not known", which prints no `pending=`.
+fn pending_deliverable_mask() -> u64 {
+    let Some(arc) = kernel_hal::thread::get_current_thread() else {
+        return 0;
+    };
+    let Ok(thread) = arc.downcast::<Thread>() else {
+        return 0;
+    };
+    use crate::thread::ThreadExt;
+    // `let`, not a `match` in tail position: the guard borrows `thread`, and a
+    // tail-position temporary outlives the block's own locals (E0597). As a
+    // named local declared after `thread` it is dropped before it.
+    let Some(lt) = thread.try_lock_linux() else {
+        return 0;
+    };
+    lt.signals.mask_with(&lt.signal_mask()).val()
 }
 
 #[cfg(test)]

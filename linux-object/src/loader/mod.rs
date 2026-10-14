@@ -1224,15 +1224,17 @@ mod elf_bounds_tests {
         });
         assert_eq!(check_elf_bounds(&elf.build()), Ok(()));
 
-        // Its offset still has to be inside the file: `get_shstr_table` slices
-        // `input[sh_offset..]` before anything has looked at the type.
+        // And its offset may sit past the end of the file, which is what the
+        // Go linker emits for `.noptrbss` in every static binary: a section
+        // with no bytes in the file has no bytes to locate in it, and `execve`
+        // on Linux never reads the section table at all.
         let elf = Elf::new().shdr(Shdr {
             sh_type: SHT_NOBITS,
             offset: 0x1000,
             size: 0,
             ..Default::default()
         });
-        assert_eq!(check_elf_bounds(&elf.build()), Err(ZxError::INVALID_ARGS));
+        assert_eq!(check_elf_bounds(&elf.build()), Ok(()));
     }
 
     /// `e_shstrndx` names the section holding every other section's name, and
