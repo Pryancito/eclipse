@@ -48,6 +48,18 @@ struct Ext {
     /// First disk block.
     pblk: u64,
     blocks: u64,
+    /// Reserved by `fallocate`, not written yet (reads as zeros).
+    prealloc: bool,
+}
+
+impl Ext {
+    fn item(pblk: u64, blocks: u64, prealloc: bool) -> Vec<u8> {
+        if prealloc {
+            FileExtent::Prealloc { disk: pblk, blocks }.encode()
+        } else {
+            FileExtent::Reg { disk: pblk, blocks }.encode()
+        }
+    }
 }
 
 /// A mounted v0.4 filesystem.
@@ -89,6 +101,31 @@ fn check_name(name: &str) -> Result<&[u8]> {
     }
     Ok(b)
 }
+
+/// What an immutable or append-only inode refuses (EPERM on Linux; the
+/// btrfs-compatible error set has no such variant).
+const NOT_PERMITTED: Error = Error::Unsupported("immutable or append-only inode");
+
+fn immutable(i: &InodeItem) -> bool {
+    i.flags & FL_IMMUTABLE as u64 != 0
+}
+
+/// Immutable or append-only: no renames, unlinks or attribute changes.
+fn frozen(i: &InodeItem) -> bool {
+    i.flags & (FL_IMMUTABLE | FL_APPEND) as u64 != 0
+}
+
+/// Fail with [`NOT_PERMITTED`] when `bad`.
+fn permit(bad: bool) -> Result<()> {
+    if bad {
+        Err(NOT_PERMITTED)
+    } else {
+        Ok(())
+    }
+}
+
+/// Flags a new inode takes from its directory (as on btrfs).
+const FL_INHERITED: u32 = FL_NOCOW | FL_COMPR | FL_NOCOMP;
 
 fn stat_of(ino: u64, i: &InodeItem) -> InodeStat {
     InodeStat {
@@ -592,7 +629,7 @@ impl CowFs {
         match self.get(Self::ext_key(ino, 0))? {
             Some(d) => match FileExtent::decode(&d)? {
                 FileExtent::Inline(v) => Ok(Some(v)),
-                FileExtent::Reg { .. } => Ok(None),
+                FileExtent::Reg { .. } | FileExtent::Prealloc { .. } => Ok(None),
             },
             None => Ok(None),
         }
@@ -615,7 +652,12 @@ impl CowFs {
         let hi = Key::new(ino, EXTENT_DATA, to * BS - 1);
         items.extend(self.st.range(&self.fs_root, &lo, &hi, usize::MAX)?);
         for (k, d) in items {
-            if let FileExtent::Reg { disk, blocks } = FileExtent::decode(&d)? {
+            let (disk, blocks, prealloc) = match FileExtent::decode(&d)? {
+                FileExtent::Reg { disk, blocks } => (disk, blocks, false),
+                FileExtent::Prealloc { disk, blocks } => (disk, blocks, true),
+                FileExtent::Inline(_) => continue,
+            };
+            {
                 if k.offset % BS != 0 {
                     return Err(Error::Corrupt("unaligned file extent"));
                 }
@@ -623,6 +665,7 @@ impl CowFs {
                     lblk: k.offset / BS,
                     pblk: disk,
                     blocks,
+                    prealloc,
                 };
                 if e.lblk + e.blocks > from && e.lblk < to {
                     out.push(e);
@@ -642,35 +685,39 @@ impl CowFs {
         n: u64,
         pblk: u64,
     ) -> Result<()> {
+        self.map(ino, inode, lblk, n, pblk, false)
+    }
+
+    /// [`set_mapping`](Self::set_mapping) for a regular or a preallocated
+    /// extent.
+    fn map(
+        &mut self,
+        ino: u64,
+        inode: &mut InodeItem,
+        lblk: u64,
+        n: u64,
+        pblk: u64,
+        prealloc: bool,
+    ) -> Result<()> {
         self.unmap(ino, inode, lblk, lblk + n)?;
         // Extend the previous extent when the new blocks continue it.
         if lblk > 0 {
             if let Some(prev) = self.extents(ino, lblk - 1, lblk)?.first().copied() {
                 if prev.lblk + prev.blocks == lblk
                     && prev.pblk + prev.blocks == pblk
+                    && prev.prealloc == prealloc
                     && prev.blocks + n <= MAX_EXTENT_BLOCKS
                 {
                     self.upsert(
                         Self::ext_key(ino, prev.lblk),
-                        FileExtent::Reg {
-                            disk: prev.pblk,
-                            blocks: prev.blocks + n,
-                        }
-                        .encode(),
+                        Ext::item(prev.pblk, prev.blocks + n, prealloc),
                     )?;
                     inode.nbytes += n * BS;
                     return Ok(());
                 }
             }
         }
-        self.insert(
-            Self::ext_key(ino, lblk),
-            FileExtent::Reg {
-                disk: pblk,
-                blocks: n,
-            }
-            .encode(),
-        )?;
+        self.insert(Self::ext_key(ino, lblk), Ext::item(pblk, n, prealloc))?;
         inode.nbytes += n * BS;
         Ok(())
     }
@@ -681,25 +728,14 @@ impl CowFs {
             let key = Self::ext_key(ino, e.lblk);
             let end = e.lblk + e.blocks;
             if e.lblk < from {
-                self.upsert(
-                    key,
-                    FileExtent::Reg {
-                        disk: e.pblk,
-                        blocks: from - e.lblk,
-                    }
-                    .encode(),
-                )?;
+                self.upsert(key, Ext::item(e.pblk, from - e.lblk, e.prealloc))?;
             } else {
                 self.delete(key)?;
             }
             if end > to {
                 self.insert(
                     Self::ext_key(ino, to),
-                    FileExtent::Reg {
-                        disk: e.pblk + (to - e.lblk),
-                        blocks: end - to,
-                    }
-                    .encode(),
+                    Ext::item(e.pblk + (to - e.lblk), end - to, e.prealloc),
                 )?;
             }
             let s = e.lblk.max(from);
@@ -722,7 +758,12 @@ impl CowFs {
             return Ok(());
         }
         let end = off + buf.len() as u64;
+        // No-COW files have no checksums (as on btrfs).
+        let sums = self.inode(ino)?.flags & FL_NOCOW as u64 == 0;
         for e in self.extents(ino, off / BS, end.div_ceil(BS))? {
+            if e.prealloc {
+                continue;
+            }
             let s = (e.lblk * BS).max(off);
             let t = ((e.lblk + e.blocks) * BS).min(end);
             let mut pos = s;
@@ -735,11 +776,15 @@ impl CowFs {
                 let dst = &mut buf[(pos - off) as usize..(upto - off) as usize];
                 if pos.is_multiple_of(BS) && upto.is_multiple_of(BS) {
                     self.raw.read_at(p0 * BS, dst)?;
-                    self.verify(p0, dst)?;
+                    if sums {
+                        self.verify(p0, dst)?;
+                    }
                 } else {
                     let mut tmp = vec![0u8; ((b1 - b0) * BS) as usize];
                     self.raw.read_at(p0 * BS, &mut tmp)?;
-                    self.verify(p0, &tmp)?;
+                    if sums {
+                        self.verify(p0, &tmp)?;
+                    }
                     let o = (pos - b0 * BS) as usize;
                     let len = dst.len();
                     dst.copy_from_slice(&tmp[o..o + len]);
@@ -799,6 +844,9 @@ impl CowFs {
         let mut lb = off / BS;
         let last = end.div_ceil(BS);
         let mut written_to = off;
+        // No-COW files rewrite their own unshared blocks in place and keep
+        // no checksums (btrfs's nodatacow).
+        let nocow = inode.flags & FL_NOCOW as u64 != 0;
         while lb < last {
             let chunk_end = (lb + WRITE_CHUNK).min(last);
             let exts = self.extents(ino, lb, chunk_end)?;
@@ -811,7 +859,17 @@ impl CowFs {
                 Some(e) => {
                     let run_end = (e.lblk + e.blocks).min(chunk_end);
                     let p = e.pblk + (lb - e.lblk);
-                    (run_end, self.sp.private_fresh(p, run_end - lb).then_some(p))
+                    let n = run_end - lb;
+                    let mine = !e.prealloc
+                        && (self.sp.private_fresh(p, n)
+                            || nocow
+                                && (p..p + n).all(|b| self.sp.refs.get(b) == 1)
+                                && !self.st.path_shared(
+                                    &self.sp,
+                                    &self.fs_root,
+                                    &Self::ext_key(ino, e.lblk),
+                                )?);
+                    (run_end, mine.then_some(p))
                 }
                 None => {
                     // A hole up to the next extent.
@@ -852,7 +910,8 @@ impl CowFs {
             let t = end.min((lb + got) * BS);
             self.raw.write_at(pblk * BS, &buf)?;
             for (i, block) in buf.chunks(BS as usize).enumerate() {
-                self.sp.csums.insert(pblk + i as u64, Some(crc32c(block)));
+                let c = (!nocow).then(|| crc32c(block));
+                self.sp.csums.insert(pblk + i as u64, c);
             }
             if in_place.is_none() {
                 self.set_mapping(ino, inode, lb, got, pblk)?;
@@ -1134,6 +1193,7 @@ impl CowFs {
     ) -> Result<()> {
         self.writable()?;
         let mut i = self.inode(ino)?;
+        permit(frozen(&i))?;
         if let Some(m) = mode {
             i.mode = (i.mode & 0o170000) | (m & 0o7777);
         }
@@ -1196,10 +1256,15 @@ impl CowFs {
         if self.dir_lookup(dir, name)?.is_some() {
             return Err(Error::Exists);
         }
+        let d = self.inode(dir)?;
+        permit(immutable(&d))?;
         let ino = self.fs_item.next_ino;
         let mut i = InodeItem::new(kind, mode, self.now(), self.st.gen);
         i.rdev = rdev;
         i.parent = dir;
+        if matches!(kind, FileKind::Regular | FileKind::Dir) {
+            i.flags = d.flags & FL_INHERITED as u64;
+        }
         self.insert(Key::new(ino, INODE_ITEM, 0), i.encode())?;
         self.fs_item.next_ino += 1;
         self.fs_item.inode_count += 1;
@@ -1244,9 +1309,11 @@ impl CowFs {
 
     fn write_symlink_l(&mut self, ino: u64, offset: u64, data: &[u8]) -> Result<usize> {
         self.writable()?;
-        if self.inode(ino)?.kind() != FileKind::Symlink {
+        let i = self.inode(ino)?;
+        if i.kind() != FileKind::Symlink {
             return Err(Error::Invalid);
         }
+        permit(frozen(&i))?;
         let end = (offset as usize)
             .checked_add(data.len())
             .filter(|&e| e <= MAX_SYMLINK_LEN)
@@ -1305,6 +1372,7 @@ impl CowFs {
         if self.dir_lookup(dir, name)?.is_some() {
             return Err(Error::Exists);
         }
+        permit(frozen(&i) || immutable(&self.inode(dir)?))?;
         self.add_entry(dir, name, ino, i.kind())?;
         i.nlink += 1;
         i.ctime = self.now();
@@ -1316,6 +1384,7 @@ impl CowFs {
         let name = check_name(name)?;
         self.writable()?;
         let e = self.dir_lookup(dir, name)?.ok_or(Error::NotFound)?;
+        permit(frozen(&self.inode(dir)?) || frozen(&self.inode(e.ino)?))?;
         if e.kind == FileKind::Dir && !self.dir_is_empty(e.ino)? {
             return Err(Error::NotEmpty);
         }
@@ -1340,6 +1409,11 @@ impl CowFs {
         }
         let is_dir = e.kind == FileKind::Dir;
         let moving_subvol = is_link(e.ino);
+        permit(
+            frozen(&self.inode(old_dir)?)
+                || frozen(&self.inode(new_dir)?)
+                || !moving_subvol && frozen(&self.inode(e.ino)?),
+        )?;
         if self.inode(new_dir)?.kind() != FileKind::Dir {
             return Err(Error::NotDir);
         }
@@ -1363,6 +1437,7 @@ impl CowFs {
                 // Replacing a subvolume takes deleting it.
                 return Err(Error::NotEmpty);
             }
+            permit(frozen(&self.inode(existing.ino)?))?;
             match (is_dir, existing.kind == FileKind::Dir) {
                 (true, false) => return Err(Error::NotDir),
                 (false, true) => return Err(Error::IsDir),
@@ -1441,6 +1516,8 @@ impl CowFs {
         offset
             .checked_add(data.len() as u64)
             .ok_or(Error::Invalid)?;
+        // Append-only files only grow at the end.
+        permit(immutable(&i) || frozen(&i) && offset != i.size)?;
         let r = self.write_data(ino, &mut i, offset, data);
         if r.is_ok() {
             let now = self.now();
@@ -1463,6 +1540,7 @@ impl CowFs {
             FileKind::Regular => {}
             _ => return Err(Error::Invalid),
         }
+        permit(frozen(&i))?;
         if i.size == new_size {
             return Ok(());
         }
@@ -1623,6 +1701,7 @@ impl CowFs {
         if self.dir_lookup(d, name)?.is_some() {
             return Err(Error::Exists);
         }
+        permit(immutable(&self.inode(d)?))?;
         Ok((d, name))
     }
 
@@ -1731,6 +1810,7 @@ impl CowFs {
         if !is_link(e.ino) {
             return Err(Error::Invalid);
         }
+        permit(frozen(&self.inode(d)?))?;
         self.drop_subvol(d, name, split(e.ino).0)
     }
 
@@ -1879,6 +1959,11 @@ impl CowFs {
             FileKind::Dir => return Err(Error::IsDir),
             _ => return Err(Error::Invalid),
         }
+        permit(frozen(&di))?;
+        // Checksummed and no-COW files cannot share blocks (as on btrfs).
+        if (di.flags ^ si.flags) & FL_NOCOW as u64 != 0 {
+            return Err(Error::Invalid);
+        }
         // A partial last block only at the end of both files.
         if len % BS != 0 && (s_end != si.size || d_end < di.size) {
             return Err(Error::Invalid);
@@ -1924,7 +2009,8 @@ impl CowFs {
             self.uninline(ino, inode)?;
         }
         self.unmap(ino, inode, d0, d0 + blocks)?;
-        for e in exts {
+        // Preallocated ranges stay holes: they read as zeros either way.
+        for e in exts.iter().filter(|e| !e.prealloc) {
             let from = e.lblk.max(s0);
             let to = (e.lblk + e.blocks).min(s0 + blocks);
             if from >= to {
@@ -1958,6 +2044,252 @@ impl CowFs {
             return Ok(0);
         }
         self.clone_range(src, src_off, dst, dst_off, len)
+    }
+
+    // -----------------------------------------------------------------------
+    // Extended attributes
+    // -----------------------------------------------------------------------
+
+    fn check_xattr_name(name: &str) -> Result<&[u8]> {
+        let b = name.as_bytes();
+        if b.is_empty() || b.len() > XATTR_NAME_MAX || b.contains(&0) {
+            return Err(Error::Invalid);
+        }
+        if !XATTR_PREFIXES
+            .iter()
+            .any(|p| name.len() > p.len() && name.starts_with(p))
+        {
+            return Err(Error::Unsupported("xattr namespace"));
+        }
+        Ok(b)
+    }
+
+    fn xattr_list(&mut self, ino: u64, name: &[u8]) -> Result<(Key, Xattrs)> {
+        let key = Key::new(ino, XATTR_ITEM, name_hash(name));
+        let list = match self.get(key)? {
+            Some(d) => decode_xattrs(&d)?,
+            None => Vec::new(),
+        };
+        Ok((key, list))
+    }
+
+    pub fn get_xattr(&mut self, h: u64, name: &str) -> Result<Vec<u8>> {
+        let n = Self::check_xattr_name(name)?;
+        let ino = self.at(h)?;
+        self.inode(ino)?;
+        let (_, list) = self.xattr_list(ino, n)?;
+        list.into_iter()
+            .find(|(k, _)| k == n)
+            .map(|(_, v)| v)
+            .ok_or(Error::NotFound)
+    }
+
+    pub fn list_xattrs(&mut self, h: u64) -> Result<Vec<String>> {
+        let ino = self.at(h)?;
+        self.inode(ino)?;
+        let mut out = Vec::new();
+        for (_, d) in self.st.range(
+            &self.fs_root,
+            &Key::new(ino, XATTR_ITEM, 0),
+            &Key::new(ino, XATTR_ITEM, u64::MAX),
+            usize::MAX,
+        )? {
+            for (n, _) in decode_xattrs(&d)? {
+                out.push(String::from_utf8(n).map_err(|_| Error::Corrupt("xattr name"))?);
+            }
+        }
+        out.sort();
+        Ok(out)
+    }
+
+    pub fn set_xattr(&mut self, h: u64, name: &str, value: &[u8], flags: u32) -> Result<()> {
+        let n = Self::check_xattr_name(name)?;
+        if flags & !(XATTR_CREATE | XATTR_REPLACE) != 0 || value.len() > XATTR_SIZE_MAX {
+            return Err(Error::Invalid);
+        }
+        let ino = self.at_rw(h)?;
+        self.writable()?;
+        let mut i = self.inode(ino)?;
+        permit(frozen(&i))?;
+        let (key, mut list) = self.xattr_list(ino, n)?;
+        match list.iter().position(|(k, _)| k == n) {
+            Some(_) if flags & XATTR_CREATE != 0 => return Err(Error::Exists),
+            Some(p) => list[p].1 = value.to_vec(),
+            None if flags & XATTR_REPLACE != 0 => return Err(Error::NotFound),
+            None => list.push((n.to_vec(), value.to_vec())),
+        }
+        let v = encode_xattrs(&list);
+        if v.len() > MAX_ITEM {
+            // Too large for a tree leaf (E2BIG).
+            return Err(Error::NoSpace);
+        }
+        self.upsert(key, v)?;
+        i.ctime = self.now();
+        self.put_inode(ino, i)?;
+        self.commit()
+    }
+
+    pub fn remove_xattr(&mut self, h: u64, name: &str) -> Result<()> {
+        let n = Self::check_xattr_name(name)?;
+        let ino = self.at_rw(h)?;
+        self.writable()?;
+        let mut i = self.inode(ino)?;
+        permit(frozen(&i))?;
+        let (key, mut list) = self.xattr_list(ino, n)?;
+        let p = list
+            .iter()
+            .position(|(k, _)| k == n)
+            .ok_or(Error::NotFound)?;
+        list.remove(p);
+        if list.is_empty() {
+            self.delete(key)?;
+        } else {
+            self.upsert(key, encode_xattrs(&list))?;
+        }
+        i.ctime = self.now();
+        self.put_inode(ino, i)?;
+        self.commit()
+    }
+
+    // -----------------------------------------------------------------------
+    // Inode flags (chattr)
+    // -----------------------------------------------------------------------
+
+    pub fn get_flags(&mut self, h: u64) -> Result<u32> {
+        let ino = self.at(h)?;
+        Ok(self.inode(ino)?.flags as u32 & FL_SETTABLE)
+    }
+
+    pub fn set_flags(&mut self, h: u64, flags: u32) -> Result<()> {
+        if flags & !FL_SETTABLE != 0 || flags & FL_COMPR != 0 && flags & FL_NOCOMP != 0 {
+            return Err(Error::Invalid);
+        }
+        let ino = self.at_rw(h)?;
+        self.writable()?;
+        let mut i = self.inode(ino)?;
+        let old = i.flags as u32;
+        // No-COW only changes on an empty file (its blocks would otherwise
+        // be half checksummed); directories pass it on to new files.
+        if (old ^ flags) & FL_NOCOW != 0
+            && i.kind() == FileKind::Regular
+            && (i.size > 0 || i.nbytes > 0)
+        {
+            return Err(Error::Invalid);
+        }
+        i.flags = (i.flags & !(FL_SETTABLE as u64)) | flags as u64;
+        i.ctime = self.now();
+        self.put_inode(ino, i)?;
+        self.commit()
+    }
+
+    // -----------------------------------------------------------------------
+    // fallocate
+    // -----------------------------------------------------------------------
+
+    pub fn fallocate(&mut self, h: u64, mode: u32, offset: u64, len: u64) -> Result<()> {
+        if mode & !(FALLOC_FL_KEEP_SIZE | FALLOC_FL_PUNCH_HOLE | FALLOC_FL_ZERO_RANGE) != 0 {
+            return Err(Error::Unsupported("fallocate mode"));
+        }
+        let punch = mode & FALLOC_FL_PUNCH_HOLE != 0;
+        let zero = mode & FALLOC_FL_ZERO_RANGE != 0;
+        let keep = mode & FALLOC_FL_KEEP_SIZE != 0;
+        if len == 0 || punch && (!keep || zero) {
+            return Err(Error::Invalid);
+        }
+        let end = offset.checked_add(len).ok_or(Error::Invalid)?;
+        let ino = self.at_rw(h)?;
+        self.writable()?;
+        let mut i = self.inode(ino)?;
+        match i.kind() {
+            FileKind::Regular => {}
+            FileKind::Dir => return Err(Error::IsDir),
+            _ => return Err(Error::Invalid),
+        }
+        permit(frozen(&i))?;
+        let r = (|| {
+            if self.inline_data(ino)?.is_some() {
+                self.uninline(ino, &mut i)?;
+            }
+            if punch || zero {
+                self.punch(ino, &mut i, offset, end)?;
+            }
+            if !punch {
+                self.preallocate(ino, &mut i, offset, end)?;
+                if !keep && end > i.size {
+                    i.size = end;
+                }
+            }
+            Ok(())
+        })();
+        let now = self.now();
+        i.mtime = now;
+        i.ctime = now;
+        self.put_inode(ino, i)?;
+        self.commit()?;
+        r
+    }
+
+    /// Make bytes `off..end` (within the file) read as zeros, giving back
+    /// the whole blocks among them.
+    fn punch(&mut self, ino: u64, i: &mut InodeItem, off: u64, end: u64) -> Result<()> {
+        let end = end.min(i.size);
+        if off >= end {
+            return Ok(());
+        }
+        let first = off.div_ceil(BS);
+        let last = end / BS;
+        let size = i.size;
+        // Partial blocks at the edges get zeros written.
+        let head_end = (first * BS).min(end);
+        if off < head_end {
+            let z = vec![0u8; (head_end - off) as usize];
+            self.write_extents(ino, i, off, &z)?;
+        }
+        let tail_start = (last * BS).max(head_end);
+        if tail_start < end {
+            let z = vec![0u8; (end - tail_start) as usize];
+            self.write_extents(ino, i, tail_start, &z)?;
+        }
+        i.size = size;
+        if first < last {
+            self.unmap(ino, i, first, last)?;
+        }
+        Ok(())
+    }
+
+    /// Reserve blocks for the holes among file blocks covering `off..end`.
+    fn preallocate(&mut self, ino: u64, i: &mut InodeItem, off: u64, end: u64) -> Result<()> {
+        let mut lb = off / BS;
+        let last = end.div_ceil(BS);
+        while lb < last {
+            let chunk_end = (lb + WRITE_CHUNK).min(last);
+            let exts = self.extents(ino, lb, chunk_end)?;
+            if let Some(e) = exts.iter().find(|e| e.lblk <= lb && lb < e.lblk + e.blocks) {
+                lb = e.lblk + e.blocks;
+                continue;
+            }
+            let hole_end = exts
+                .iter()
+                .map(|e| e.lblk)
+                .filter(|&s| s > lb)
+                .min()
+                .unwrap_or(chunk_end)
+                .min(chunk_end);
+            let goal = if lb > 0 {
+                self.extents(ino, lb - 1, lb)?
+                    .first()
+                    .map(|e| e.pblk + (lb - e.lblk))
+            } else {
+                None
+            };
+            let (p, n) = self
+                .sp
+                .alloc_data(goal, hole_end - lb)
+                .ok_or(Error::NoSpace)?;
+            self.map(ino, i, lb, n, p, true)?;
+            lb += n;
+        }
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -2059,6 +2391,7 @@ impl CowFs {
             if is_link(e.ino) {
                 // rmdir of a subvolume: only when it is empty.
                 self.writable()?;
+                permit(frozen(&self.inode(d)?))?;
                 let (id, _) = split(e.ino);
                 let parent = self.subvol;
                 self.enter(id)?;
@@ -2165,7 +2498,9 @@ impl CowFs {
                     for (k, d) in &items {
                         if let Some((s, l)) = extent_of(k, d) {
                             own(&mut owners, total, s, l)?;
-                            data.insert(s, l);
+                            if matches!(FileExtent::decode(d)?, FileExtent::Reg { .. }) {
+                                data.insert(s, l);
+                            }
                         }
                         if k.ty == CSUM_ITEM {
                             for (i, c) in CsumBucket::decode(d)?.0.into_iter().enumerate() {
@@ -2178,8 +2513,8 @@ impl CowFs {
                 }
             }
         }
-        // Every data block in use has a checksum, and nothing else does.
-        if summed != data {
+        // Only written data blocks have checksums.
+        if !summed.is_subset(&data) {
             return Err(Error::Corrupt("fsck: data checksums"));
         }
         for b in 0..total {
@@ -2206,7 +2541,11 @@ impl CowFs {
         let mut links = BTreeSet::new();
         let subvols = self.root_items()?;
         for (id, item) in &subvols {
-            let (n, d, l) = self.check_subvol(item)?;
+            let (n, d, l, need) = self.check_subvol(item)?;
+            // Every block written to a file that keeps checksums has one.
+            if !need.is_subset(&summed) {
+                return Err(Error::Corrupt("fsck: data checksums"));
+            }
             inode_total += n;
             dir_total += d;
             for (dir, index, name, target) in l {
@@ -2247,11 +2586,12 @@ impl CowFs {
     fn check_subvol(
         &mut self,
         item: &RootItem,
-    ) -> Result<(u64, u64, Vec<(u64, u64, Vec<u8>, u64)>)> {
+    ) -> Result<(u64, u64, Vec<(u64, u64, Vec<u8>, u64)>, RangeSet)> {
         let items = self
             .st
             .range(&item.root, &Key::MIN, &Key::MAX, usize::MAX)?;
         let mut links = Vec::new();
+        let mut regs = Vec::new();
         let mut inodes: BTreeMap<u64, InodeItem> = BTreeMap::new();
         let mut names: BTreeMap<u64, u32> = BTreeMap::new();
         let mut refs: BTreeMap<u64, u32> = BTreeMap::new();
@@ -2260,6 +2600,7 @@ impl CowFs {
         let mut index_names: BTreeSet<(u64, u64, Vec<u8>, u64)> = BTreeSet::new();
         let mut item_names: BTreeSet<(u64, u64, Vec<u8>, u64)> = BTreeSet::new();
         let mut last_ext_end: BTreeMap<u64, u64> = BTreeMap::new();
+        let mut xattr_owners: BTreeSet<u64> = BTreeSet::new();
         for (k, d) in &items {
             match k.ty {
                 INODE_ITEM => {
@@ -2297,13 +2638,22 @@ impl CowFs {
                     index_names.insert((k.objectid, k.offset, e.name, e.ino));
                 }
                 EXTENT_DATA => match FileExtent::decode(d)? {
+                    FileExtent::Reg { disk, blocks } => {
+                        regs.push((k.objectid, disk, blocks));
+                        let end = last_ext_end.entry(k.objectid).or_default();
+                        if k.offset % BS != 0 || k.offset / BS < *end {
+                            return Err(Error::Corrupt("fsck: overlapping extents"));
+                        }
+                        *end = k.offset / BS + blocks;
+                        *bytes.entry(k.objectid).or_default() += blocks * BS;
+                    }
                     FileExtent::Inline(v) => {
                         if k.offset != 0 {
                             return Err(Error::Corrupt("fsck: inline extent offset"));
                         }
                         *bytes.entry(k.objectid).or_default() += v.len() as u64;
                     }
-                    FileExtent::Reg { blocks, .. } => {
+                    FileExtent::Prealloc { blocks, .. } => {
                         let end = last_ext_end.entry(k.objectid).or_default();
                         if k.offset % BS != 0 || k.offset / BS < *end {
                             return Err(Error::Corrupt("fsck: overlapping extents"));
@@ -2312,11 +2662,21 @@ impl CowFs {
                         *bytes.entry(k.objectid).or_default() += blocks * BS;
                     }
                 },
+                XATTR_ITEM => {
+                    let list = decode_xattrs(d)?;
+                    if list.is_empty() || list.iter().any(|(n, _)| name_hash(n) != k.offset) {
+                        return Err(Error::Corrupt("fsck: xattr item"));
+                    }
+                    xattr_owners.insert(k.objectid);
+                }
                 _ => return Err(Error::Corrupt("fsck: unknown item")),
             }
         }
         if index_names != item_names {
             return Err(Error::Corrupt("fsck: name indexes differ"));
+        }
+        if xattr_owners.iter().any(|o| !inodes.contains_key(o)) {
+            return Err(Error::Corrupt("fsck: xattr of a missing inode"));
         }
         let root = item.root_dir;
         for (&ino, i) in &inodes {
@@ -2386,7 +2746,13 @@ impl CowFs {
         if !inodes.contains_key(&root) {
             return Err(Error::Corrupt("fsck: root"));
         }
-        Ok((inodes.len() as u64, dirs.len() as u64, links))
+        let mut need = RangeSet::default();
+        for (ino, disk, blocks) in regs {
+            if inodes[&ino].flags & FL_NOCOW as u64 == 0 {
+                need.insert(disk, blocks);
+            }
+        }
+        Ok((inodes.len() as u64, dirs.len() as u64, links, need))
     }
 }
 
@@ -2423,7 +2789,9 @@ impl CowFs {
                 Body::Leaf(items) => {
                     for (k, d) in &items {
                         if let Some((s, l)) = extent_of(k, d) {
-                            data.insert(s, l);
+                            if matches!(FileExtent::decode(d), Ok(FileExtent::Reg { .. })) {
+                                data.insert(s, l);
+                            }
                         } else if k.ty == ROOT_ITEM {
                             if let Ok(it) = RootItem::decode(d) {
                                 stack.push((it.root.bytenr, it.root.level, Some(it.root.gen)));
@@ -2445,7 +2813,8 @@ impl CowFs {
                     Ok(sums) => {
                         for (i, c) in sums.into_iter().enumerate() {
                             let block = &chunk[i * BS as usize..(i + 1) * BS as usize];
-                            if c != Some(crc32c(block)) {
+                            // No-COW files keep no checksums.
+                            if c.is_some_and(|c| c != crc32c(block)) {
                                 r.bad_data_blocks.push(b + i as u64);
                             }
                         }

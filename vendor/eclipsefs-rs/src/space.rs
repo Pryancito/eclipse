@@ -81,6 +81,11 @@ impl RangeSet {
         self.0.clear();
     }
 
+    /// Whether every block of `self` is in `other`.
+    pub fn is_subset(&self, other: &RangeSet) -> bool {
+        self.iter().all(|(s, l)| other.covers(s, l))
+    }
+
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
     }

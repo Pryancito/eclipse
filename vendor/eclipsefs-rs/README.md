@@ -78,6 +78,23 @@ Paso 1 de la paridad con btrfs. Todo vive en árboles B+ copy-on-write
 - **Reflinks y dedupe**: `clone_range` (`FICLONERANGE`, también entre
   subvolúmenes) y `dedupe_range` (`FIDEDUPERANGE`, solo si los bytes son
   iguales); los bloques quedan compartidos hasta que uno de los dos escribe.
+- **Atributos extendidos** (fase 4): `get_xattr`, `set_xattr` (con
+  `XATTR_CREATE`/`XATTR_REPLACE`), `list_xattrs` y `remove_xattr` en los
+  espacios `user.`, `trusted.`, `security.` y `system.`; las ACL POSIX se
+  guardan como `system.posix_acl_access`/`_default`, igual que en btrfs. Los
+  atributos con el mismo hash de nombre comparten un `XATTR_ITEM`, y un ítem
+  cabe en una hoja (unos 1,9 KiB; más da `NoSpace`, el E2BIG de Linux).
+- **Atributos de inodo** (`chattr`, `get_flags`/`set_flags` con los valores
+  `FS_*_FL` de Linux): inmutable (nada cambia, ni nombre ni xattrs),
+  append-only (solo escrituras al final), no-COW, compresión, `noatime`,
+  `nodump` y `sync`. No-COW, compresión y no-compresión se heredan del
+  directorio. Un archivo no-COW se sobrescribe en el sitio y no lleva
+  checksums, salvo los bloques que comparte con un snapshot o reflink, que se
+  copian; solo se puede cambiar con el archivo vacío.
+- **fallocate**: reservar bloques (con o sin `KEEP_SIZE`), `PUNCH_HOLE`
+  (libera los bloques enteros y escribe ceros en los bordes) y `ZERO_RANGE`.
+  Lo reservado son extents `PREALLOC`, que se leen como ceros hasta que se
+  escriben.
 - `EclipseFS::mount` detecta la versión: las imágenes v0.3 siguen montando con
   su driver (`v3.rs`). `mkfs::format_v3` sigue disponible.
 
@@ -117,7 +134,7 @@ grupo k (32768 bloques = 128 MiB)
 1. ~~Núcleo CoW: árbol B+, refcounts, datos nunca sobrescritos~~ (v0.4).
 2. ~~Checksums de datos y scrub~~ (la reparación llega con DUP/RAID en la fase 7).
 3. ~~Subvolúmenes, snapshots rw/ro, reflinks y dedupe~~.
-4. xattrs/ACL, atributos (inmutable, append, nocow), fallocate y huecos.
+4. ~~xattrs/ACL, atributos (inmutable, append, nocow), fallocate y huecos~~.
 5. Compresión zlib, lz4 y zstd.
 6. send/receive incremental y cuotas.
 7. Multidispositivo (DUP, RAID0/1/10), añadir/quitar, balance y encoger.
@@ -150,6 +167,11 @@ cargo test --release -p eclipsefs --features std
   snapshots de solo lectura y anidados, subvolumen por defecto, reflinks y
   dedupe. La carga de los tests de crash incluye snapshots, borrado de
   snapshots y reflinks.
+- `tests/attrs.rs`: xattrs y ACL, límites de nombres y valores, flags
+  inmutable/append/no-COW (incluida la escritura en el sitio y la falta de
+  checksums), fallocate en todos sus modos y extents reservados a través de
+  snapshots y reflinks. La carga de crash también hace fallocate y xattrs, y
+  los xattrs forman parte del estado que se compara.
 - Los tests que dependen del formato corren en las dos versiones (`*_v3`).
 - `tests/performance.rs`: las mismas cargas sobre EclipseFS y btrfs, con tiempo
   y bytes leídos/escritos en el dispositivo. `scripts/eclipsefs-bench.sh` las

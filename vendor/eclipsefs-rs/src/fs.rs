@@ -365,6 +365,43 @@ impl EclipseFS {
         self.cow()?.dedupe_range(src, src_off, dst, dst_off, len)
     }
 
+    /// Value of extended attribute `name` (`user.`, `trusted.`, `security.`
+    /// or `system.` namespace; POSIX ACLs are `system.posix_acl_*`).
+    pub fn get_xattr(&mut self, ino: u64, name: &str) -> Result<Vec<u8>> {
+        self.cow()?.get_xattr(ino, name)
+    }
+
+    /// Names of every extended attribute of `ino`, sorted.
+    pub fn list_xattrs(&mut self, ino: u64) -> Result<Vec<String>> {
+        self.cow()?.list_xattrs(ino)
+    }
+
+    /// Set an extended attribute; `flags` is `XATTR_CREATE`, `XATTR_REPLACE`
+    /// or 0, as in setxattr(2).
+    pub fn set_xattr(&mut self, ino: u64, name: &str, value: &[u8], flags: u32) -> Result<()> {
+        self.cow()?.set_xattr(ino, name, value, flags)
+    }
+
+    pub fn remove_xattr(&mut self, ino: u64, name: &str) -> Result<()> {
+        self.cow()?.remove_xattr(ino, name)
+    }
+
+    /// Inode flags (`FS_IOC_GETFLAGS`, Linux `FS_*_FL` values).
+    pub fn get_flags(&mut self, ino: u64) -> Result<u32> {
+        self.cow()?.get_flags(ino)
+    }
+
+    /// `FS_IOC_SETFLAGS` (chattr): immutable, append-only, no-COW, ...
+    pub fn set_flags(&mut self, ino: u64, flags: u32) -> Result<()> {
+        self.cow()?.set_flags(ino, flags)
+    }
+
+    /// fallocate(2): reserve blocks (`0` or `FALLOC_FL_KEEP_SIZE`), punch a
+    /// hole (`PUNCH_HOLE | KEEP_SIZE`) or zero a range (`ZERO_RANGE`).
+    pub fn fallocate(&mut self, ino: u64, mode: u32, offset: u64, len: u64) -> Result<()> {
+        self.cow()?.fallocate(ino, mode, offset, len)
+    }
+
     /// Read every tree node and data block from the device and verify its
     /// checksum (btrfs scrub, without repair: there is no second copy yet).
     /// Commits first on a writable mount. Needs format v0.4.

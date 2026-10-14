@@ -98,7 +98,8 @@ impl BlockDevice for Image {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum Node {
     Dir,
-    File(Vec<u8>),
+    /// Contents and extended attributes (v0.4).
+    File(Vec<u8>, Vec<(String, Vec<u8>)>),
     Link(Vec<u8>),
 }
 
@@ -123,7 +124,19 @@ fn snapshot(fs: &mut EclipseFS) -> State {
                     Node::Dir
                 }
                 FileKind::Symlink => Node::Link(fs.read_link(e.ino).unwrap()),
-                _ => Node::File(read_all(fs, e.ino)),
+                _ => {
+                    let attrs = match fs.list_xattrs(e.ino) {
+                        Ok(names) => names
+                            .into_iter()
+                            .map(|n| {
+                                let v = fs.get_xattr(e.ino, &n).unwrap();
+                                (n, v)
+                            })
+                            .collect(),
+                        Err(_) => Vec::new(),
+                    };
+                    Node::File(read_all(fs, e.ino), attrs)
+                }
             };
             out.insert(p, node);
         }
@@ -163,11 +176,11 @@ fn workload(seed: u64, ops: usize, size: usize, format: Mkfs, cow: bool) -> Run 
     let mut done = 0;
     // Successful snapshots and reflinks (v0.4), so the run is known to
     // exercise them.
-    let (mut snaps, mut clones) = (0, 0);
+    let (mut snaps, mut clones, mut fallocs, mut xattrs) = (0, 0, 0, 0);
     while done < ops {
         let d = dirs[rng.below(dirs.len() as u64) as usize];
         let name = format!("e{}", rng.below(12));
-        let ok = match rng.below(if cow { 17 } else { 14 }) {
+        let ok = match rng.below(if cow { 19 } else { 14 }) {
             0 | 1 => fs.create(d, &name, FileKind::Regular, 0o644, 0).is_ok(),
             2 => match fs.create(d, &name, FileKind::Dir, 0o755, 0) {
                 Ok(ino) => {
@@ -223,7 +236,8 @@ fn workload(seed: u64, ops: usize, size: usize, format: Mkfs, cow: bool) -> Run 
                 syncs.push((rec.events(), done));
                 false
             }
-            // v0.4 only: snapshots of everything, reflinks, deleting snapshots.
+            // v0.4 only: snapshots of everything, reflinks, deleting snapshots,
+            // fallocate and extended attributes.
             14 => {
                 let name = format!("snap{}", rng.below(3));
                 let ok = fs.snapshot(root, root, &name, rng.below(2) == 0).is_ok();
@@ -252,10 +266,42 @@ fn workload(seed: u64, ops: usize, size: usize, format: Mkfs, cow: bool) -> Run 
                 }
             }
             15 => false,
-            _ => {
+            16 => {
                 let name = format!("snap{}", rng.below(3));
                 fs.delete_subvolume(root, &name).is_ok()
             }
+            17 => match fs.lookup(d, &name) {
+                // Preallocate, punch or zero a range, maybe past the end.
+                Ok(ino) if fs.stat(ino).unwrap().kind == FileKind::Regular => {
+                    let size = fs.stat(ino).unwrap().size;
+                    let mode = [0, 1, 3, 0x10, 0x11][rng.below(5) as usize];
+                    let off = rng.below(size + 20_000);
+                    let len = 1 + rng.below(40_000);
+                    let ok = fs.fallocate(ino, mode, off, len).is_ok();
+                    fallocs += usize::from(ok);
+                    ok
+                }
+                _ => false,
+            },
+            _ if !files.is_empty() => {
+                // Extended attributes on a file that was written to.
+                let (fd, fname) = files[rng.below(files.len() as u64) as usize].clone();
+                match fs.lookup(fd, &fname) {
+                    Ok(ino) if fs.stat(ino).unwrap().kind == FileKind::Regular => {
+                        let key = format!("user.k{}", rng.below(4));
+                        if rng.below(4) == 0 {
+                            fs.remove_xattr(ino, &key).is_ok()
+                        } else {
+                            let v = vec![rng.below(256) as u8; rng.below(600) as usize];
+                            let ok = fs.set_xattr(ino, &key, &v, 0).is_ok();
+                            xattrs += usize::from(ok);
+                            ok
+                        }
+                    }
+                    _ => false,
+                }
+            }
+            _ => false,
         };
         // Directories that were removed or moved under a removed one are
         // simply never chosen successfully again.
@@ -267,10 +313,12 @@ fn workload(seed: u64, ops: usize, size: usize, format: Mkfs, cow: bool) -> Run 
     }
     if cow {
         assert!(
-            snaps > 0 && clones > 0,
-            "{} snapshots, {} clones",
+            snaps > 0 && clones > 0 && fallocs > 0 && xattrs > 0,
+            "{} snapshots, {} clones, {} fallocates, {} xattrs",
             snaps,
-            clones
+            clones,
+            fallocs,
+            xattrs
         );
     }
     drop(fs);

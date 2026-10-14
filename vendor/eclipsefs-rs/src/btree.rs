@@ -535,6 +535,30 @@ impl Store {
         }
     }
 
+    /// Whether any node on the way from `root` to the leaf holding `key`
+    /// has more than one owner (the leaf's items are then shared with
+    /// another tree, whatever their own counts say).
+    pub fn path_shared(&mut self, sp: &dyn Space, root: &Root, key: &Key) -> Result<bool> {
+        let mut b = root.bytenr;
+        let mut level = root.level;
+        let mut gen = None;
+        loop {
+            if sp.refs(b) > 1 {
+                return Ok(true);
+            }
+            self.load(b, level, gen)?;
+            match &self.cache[&b].body {
+                Body::Leaf(_) => return Ok(false),
+                Body::Internal(ptrs) => {
+                    let i = ptrs.partition_point(|p| p.key <= *key).max(1);
+                    b = ptrs[i - 1].bytenr;
+                    gen = Some(ptrs[i - 1].gen);
+                    level -= 1;
+                }
+            }
+        }
+    }
+
     /// Items with `lo <= key <= hi`, in order, at most `limit` of them.
     pub fn range(
         &mut self,

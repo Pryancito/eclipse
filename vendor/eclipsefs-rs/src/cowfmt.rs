@@ -331,6 +331,8 @@ impl InodeItem {
 
 pub const EXT_INLINE: u8 = 0;
 pub const EXT_REG: u8 = 1;
+/// Allocated by `fallocate`, never written: reads as zeros, no checksums.
+pub const EXT_PREALLOC: u8 = 2;
 const EXT_HDR: usize = 8;
 const EXT_REG_SIZE: usize = 24;
 
@@ -340,6 +342,8 @@ pub enum FileExtent {
     Inline(Vec<u8>),
     /// `blocks` blocks at `disk`, mapped at the item's file offset.
     Reg { disk: u64, blocks: u64 },
+    /// Same, reserved by `fallocate` and not written yet (reads as zeros).
+    Prealloc { disk: u64, blocks: u64 },
 }
 
 impl FileExtent {
@@ -351,9 +355,13 @@ impl FileExtent {
                 b[EXT_HDR..].copy_from_slice(d);
                 b
             }
-            FileExtent::Reg { disk, blocks } => {
+            FileExtent::Reg { disk, blocks } | FileExtent::Prealloc { disk, blocks } => {
                 let mut b = vec![0u8; EXT_REG_SIZE];
-                b[0] = EXT_REG;
+                b[0] = if matches!(self, FileExtent::Reg { .. }) {
+                    EXT_REG
+                } else {
+                    EXT_PREALLOC
+                };
                 put64(&mut b, 8, *disk);
                 put64(&mut b, 16, *blocks);
                 b
@@ -366,14 +374,16 @@ impl FileExtent {
             Some(&EXT_INLINE) if b.len() >= EXT_HDR && b[1] == 0 => {
                 Ok(FileExtent::Inline(b[EXT_HDR..].to_vec()))
             }
-            Some(&EXT_REG) if b.len() == EXT_REG_SIZE && b[1] == 0 => {
+            Some(&t @ (EXT_REG | EXT_PREALLOC)) if b.len() == EXT_REG_SIZE && b[1] == 0 => {
                 let blocks = le64(b, 16);
                 if blocks == 0 || blocks > MAX_EXTENT_BLOCKS {
                     return Err(Error::Corrupt("file extent length"));
                 }
-                Ok(FileExtent::Reg {
-                    disk: le64(b, 8),
-                    blocks,
+                let disk = le64(b, 8);
+                Ok(if t == EXT_REG {
+                    FileExtent::Reg { disk, blocks }
+                } else {
+                    FileExtent::Prealloc { disk, blocks }
                 })
             }
             _ => Err(Error::Corrupt("file extent item")),
@@ -383,7 +393,7 @@ impl FileExtent {
 
 /// Data blocks an item references (for reference counting).
 pub fn extent_of(k: &Key, d: &[u8]) -> Option<(u64, u64)> {
-    if k.ty != EXTENT_DATA || d.len() != EXT_REG_SIZE || d[0] != EXT_REG {
+    if k.ty != EXTENT_DATA || d.len() != EXT_REG_SIZE || !matches!(d[0], EXT_REG | EXT_PREALLOC) {
         return None;
     }
     Some((le64(d, 8), le64(d, 16)))
@@ -532,6 +542,79 @@ pub fn decode_ref(b: &[u8]) -> Result<(u64, u32)> {
 }
 
 // ---------------------------------------------------------------------------
+// Inode flags (the values of Linux's FS_IOC_GETFLAGS / chattr)
+// ---------------------------------------------------------------------------
+
+pub const FL_SYNC: u32 = 0x0000_0008;
+pub const FL_IMMUTABLE: u32 = 0x0000_0010;
+pub const FL_APPEND: u32 = 0x0000_0020;
+pub const FL_NODUMP: u32 = 0x0000_0040;
+pub const FL_NOATIME: u32 = 0x0000_0080;
+pub const FL_COMPR: u32 = 0x0000_0004;
+pub const FL_NOCOMP: u32 = 0x0000_0400;
+pub const FL_NOCOW: u32 = 0x0080_0000;
+/// Flags `set_flags` accepts.
+pub const FL_SETTABLE: u32 =
+    FL_SYNC | FL_IMMUTABLE | FL_APPEND | FL_NODUMP | FL_NOATIME | FL_COMPR | FL_NOCOMP | FL_NOCOW;
+
+// ---------------------------------------------------------------------------
+// Extended attributes
+// ---------------------------------------------------------------------------
+
+/// Longest attribute name (Linux's XATTR_NAME_MAX).
+pub const XATTR_NAME_MAX: usize = 255;
+/// Largest attribute value (Linux's XATTR_SIZE_MAX); a value must also fit
+/// in a tree leaf with the other attributes sharing its name hash.
+pub const XATTR_SIZE_MAX: usize = 65536;
+/// `set_xattr` flags (Linux's values).
+pub const XATTR_CREATE: u32 = 1;
+pub const XATTR_REPLACE: u32 = 2;
+/// `fallocate` modes (Linux's values).
+pub const FALLOC_FL_KEEP_SIZE: u32 = 0x01;
+pub const FALLOC_FL_PUNCH_HOLE: u32 = 0x02;
+pub const FALLOC_FL_ZERO_RANGE: u32 = 0x10;
+/// Namespaces an attribute name must start with.
+pub const XATTR_PREFIXES: [&str; 4] = ["user.", "trusted.", "security.", "system."];
+
+/// `(ino, XATTR_ITEM, hash(name))` -> every attribute of `ino` whose name
+/// has that hash: [name len u16 | value len u16 | name | value]...
+pub fn encode_xattrs(list: &[(Vec<u8>, Vec<u8>)]) -> Vec<u8> {
+    let mut b = Vec::new();
+    for (n, v) in list {
+        b.extend_from_slice(&(n.len() as u16).to_le_bytes());
+        b.extend_from_slice(&(v.len() as u16).to_le_bytes());
+        b.extend_from_slice(n);
+        b.extend_from_slice(v);
+    }
+    b
+}
+
+/// (name, value) pairs of one xattr item.
+pub type Xattrs = Vec<(Vec<u8>, Vec<u8>)>;
+
+pub fn decode_xattrs(b: &[u8]) -> Result<Xattrs> {
+    let mut out = Vec::new();
+    let mut p = 0;
+    while p < b.len() {
+        if p + 4 > b.len() {
+            return Err(Error::Corrupt("xattr item"));
+        }
+        let n = le16(b, p) as usize;
+        let v = le16(b, p + 2) as usize;
+        let end = p + 4 + n + v;
+        if n == 0 || end > b.len() {
+            return Err(Error::Corrupt("xattr item"));
+        }
+        out.push((b[p + 4..p + 4 + n].to_vec(), b[p + 4 + n..end].to_vec()));
+        p = end;
+    }
+    if out.is_empty() {
+        return Err(Error::Corrupt("empty xattr item"));
+    }
+    Ok(out)
+}
+
+// ---------------------------------------------------------------------------
 // Data checksums
 // ---------------------------------------------------------------------------
 
@@ -610,6 +693,36 @@ impl CsumBucket {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn xattr_items_round_trip() {
+        let list = vec![
+            (b"user.a".to_vec(), b"1".to_vec()),
+            (b"security.selinux".to_vec(), Vec::new()),
+        ];
+        let e = encode_xattrs(&list);
+        assert_eq!(decode_xattrs(&e).unwrap(), list);
+        assert!(decode_xattrs(&e[..e.len() - 1]).is_err());
+        assert!(decode_xattrs(&[]).is_err());
+        assert!(decode_xattrs(&[0, 0, 1, 0, 9]).is_err());
+    }
+
+    #[test]
+    fn prealloc_extents_round_trip() {
+        let e = FileExtent::Prealloc {
+            disk: 77,
+            blocks: 3,
+        };
+        let b = e.encode();
+        assert_eq!(FileExtent::decode(&b).unwrap(), e);
+        assert_eq!(extent_of(&Key::new(300, EXTENT_DATA, 0), &b), Some((77, 3)));
+        let r = FileExtent::Reg {
+            disk: 77,
+            blocks: 3,
+        }
+        .encode();
+        assert_ne!(b, r);
+    }
 
     #[test]
     fn checksum_buckets_round_trip() {
