@@ -71,7 +71,16 @@ const PASADOS: &[(&str, usize)] = &[
     ("xtask/src/linux/mod.rs", 7750),
     ("linux-object/src/fs/devfs/drm_scheme.rs", 6750),
     ("linux-object/src/fs/procfs.rs", 6500),
-    ("linux-object/src/process.rs", 6000),
+    // 6250: el #1886 metio 131 lineas de produccion y dejo el fichero en
+    // 6129 sobre un techo de 6000, o sea MASTER ROJO en este test para todo
+    // el mundo. Sube al siguiente multiplo de 250, que es la regla de arriba,
+    // y no a la cifra del dia. Pero este es el fichero que mas veces ha
+    // tocado este techo: lo que toca es partirlo, y ya no vale lo de sacar un
+    // `#[cfg(test)] mod` de primer nivel porque sus tests viven todos en
+    // ficheros aparte desde hace tandas. Lo que queda dentro y es un tema
+    // entero son las credenciales (`setuid`/`setgid`/`setgroups` y sus
+    // comprobaciones) y el control de trabajos.
+    ("linux-object/src/process.rs", 6250),
     ("zircon-object/src/vm/vmar.rs", 5500),
     ("drivers/src/scheme/syncobj.rs", 5500),
     ("tools/lunarbar/src/main.rs", 5250),
