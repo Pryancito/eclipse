@@ -37,8 +37,29 @@ static const char *resolve_image_path(const char *path);
 #define UPD_EFI_MNT     "/tmp/eclipse-upd-efi"
 #define UPD_ROOT_MNT    "/tmp/eclipse-upd-root"
 #define EFI_IMAGE_GZ    resolve_image_path("/boot/efi.img.gz")
-#define ROOTFS_IMAGE_GZ resolve_image_path("/boot/rootfs.btrfs.gz")
-#define HOME_IMAGE_GZ   resolve_image_path("/boot/home.btrfs.gz")
+int struct_file_exists(const char *path);
+
+/* Sistema de archivos de ROOT/HOME: el que traiga el medio de instalación.
+ * btrfs por defecto; EclipseFS si la build se hizo con ROOTFS_FS=eclipsefs. */
+static int disk_fs_is_eclipsefs(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        cached = struct_file_exists(resolve_image_path("/boot/rootfs.eclipsefs.gz")) &&
+                 !struct_file_exists(resolve_image_path("/boot/rootfs.btrfs.gz"));
+    }
+    return cached;
+}
+
+static const char *disk_fs(void) {
+    return disk_fs_is_eclipsefs() ? "eclipsefs" : "btrfs";
+}
+
+#define ROOTFS_IMAGE_GZ resolve_image_path(disk_fs_is_eclipsefs() \
+                                           ? "/boot/rootfs.eclipsefs.gz" \
+                                           : "/boot/rootfs.btrfs.gz")
+#define HOME_IMAGE_GZ   resolve_image_path(disk_fs_is_eclipsefs() \
+                                           ? "/boot/home.eclipsefs.gz" \
+                                           : "/boot/home.btrfs.gz")
 
 #define INST_ROOT_MNT   "/tmp/eclipse-inst-root"
 
@@ -2687,10 +2708,10 @@ static int write_fstab_file(const char *path, const char *efi_dev, const char *r
 
     fprintf(f, "# /etc/fstab - generado por install-eclipse\n");
     fprintf(f, "# <dispositivo>  <punto de montaje>  <tipo>  <opciones>       <dump>  <pass>\n");
-    fprintf(f, "%-20s  /                  btrfs   defaults          0  1\n", root_dev);
+    fprintf(f, "%-20s  /                  %-7s defaults          0  1\n", root_dev, disk_fs());
     fprintf(f, "%-20s  /boot/efi          vfat    defaults,noatime  0  0\n", efi_dev);
     if (layout == LAYOUT_ADVANCED && home_dev[0] != '\0') {
-        fprintf(f, "%-20s  /home              btrfs   defaults          0  0\n", home_dev);
+        fprintf(f, "%-20s  /home              %-7s defaults          0  0\n", home_dev, disk_fs());
     }
     if (layout == LAYOUT_ADVANCED && swap_dev[0] != '\0') {
         fprintf(f, "%-20s  none               swap    sw                0  0\n", swap_dev);
@@ -2712,8 +2733,8 @@ static int write_fstab_via_mount(const char *root_dev, const char *efi_dev,
     if (shell_mkdir_p(INST_ROOT_MNT, dry_run) != 0) {
         return -1;
     }
-    /* ROOT instalado: btrfs (único FS de disco soportado). */
-    if (shell_mount(root_dev, INST_ROOT_MNT, "btrfs", 0, dry_run) != 0) {
+    /* ROOT instalado: btrfs o EclipseFS, según el payload del medio. */
+    if (shell_mount(root_dev, INST_ROOT_MNT, disk_fs(), 0, dry_run) != 0) {
         return -1;
     }
 
@@ -2847,8 +2868,8 @@ static int write_fstab_to_root(const char *disk_path, const struct partition_pla
             return -1;
         }
 
-        log(COLOR_GREEN "[4/5] Formateando partición HOME (btrfs)..." COLOR_RESET);
-        /* Se vuelca una plantilla btrfs vacía generada en build; el kernel la
+        log(COLOR_GREEN "[4/5] Formateando partición HOME (%s)..." COLOR_RESET, disk_fs());
+        /* Se vuelca una plantilla btrfs/EclipseFS vacía generada en build; el kernel la
          * expande a toda la partición en el primer montaje. */
         if (!struct_file_exists(HOME_IMAGE_GZ)) {
             log(COLOR_YELLOW
@@ -2867,6 +2888,14 @@ static int write_fstab_to_root(const char *disk_path, const struct partition_pla
     }
 
     log(COLOR_GREEN "Actualizando /etc/fstab en la partición ROOT..." COLOR_RESET);
+    /* EclipseFS verifica checksums de nodos y datos: un parche en bruto lo
+     * corrompería, así que fstab se escribe siempre montando la partición. */
+    if (disk_fs_is_eclipsefs()) {
+        if (layout == LAYOUT_ADVANCED && part_count >= 4) {
+            return write_fstab_via_mount(root_dev, efi_dev, home_dev, swap_dev, layout, dry_run);
+        }
+        return write_fstab_via_mount(root_dev, efi_dev, "", "", LAYOUT_SIMPLE, dry_run);
+    }
     /* Parche en bruto primero: no depende de mount(2) y evita bloqueos en Eclipse OS. */
     if (layout == LAYOUT_ADVANCED && part_count >= 4) {
         if (patch_fstab_on_block_device(root_dev, efi_dev, root_dev, home_dev, swap_dev,
@@ -2891,13 +2920,14 @@ static int write_fstab_to_root(const char *disk_path, const struct partition_pla
  * lo escrito esté en disco. */
 static int resize_root_to_partition(const char *root_dev, int dry_run) {
     if (dry_run) {
-        log(COLOR_YELLOW "[dry-run] ROOT (btrfs) se expandirá en el primer montaje." COLOR_RESET);
+        log(COLOR_YELLOW "[dry-run] ROOT (%s) se expandirá en el primer montaje." COLOR_RESET,
+            disk_fs());
         return 0;
     }
     sync();
     log(COLOR_GREEN
-        "ROOT (btrfs, %s) se expandirá a toda la partición en el primer arranque." COLOR_RESET,
-        root_dev);
+        "ROOT (%s, %s) se expandirá a toda la partición en el primer arranque." COLOR_RESET,
+        disk_fs(), root_dev);
     return 0;
 }
 
@@ -3147,7 +3177,9 @@ static int run_upgrade(const char *disk_path, int dry_run) {
         if (shell_mkdir_p(UPD_ROOT_MNT, dry_run) != 0) {
             return -1;
         }
-        if (shell_mount(root_dev, UPD_ROOT_MNT, "btrfs", 0, dry_run) != 0) {
+        /* El ROOT ya instalado puede ser btrfs o EclipseFS: se prueban ambos. */
+        if (shell_mount(root_dev, UPD_ROOT_MNT, "btrfs", 0, dry_run) != 0 &&
+            shell_mount(root_dev, UPD_ROOT_MNT, "eclipsefs", 0, dry_run) != 0) {
             log(COLOR_RED COLOR_BOLD "ERROR: No se pudo montar la partición ROOT (%s) para la descompresión." COLOR_RESET, root_dev);
             return -1;
         }
