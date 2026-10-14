@@ -14,8 +14,9 @@ use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex};
 
 use common::*;
+use eclipsefs::cowfmt::FL_ENCRYPT;
 use eclipsefs::device::BlockDevice;
-use eclipsefs::{mkfs, Compression, EclipseFS, Error, FileKind};
+use eclipsefs::{mkfs, Compression, EclipseFS, EncryptionPolicy, Error, FileKind};
 
 #[derive(Clone)]
 enum Event {
@@ -97,13 +98,33 @@ impl BlockDevice for Image {
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum Node {
-    Dir,
+    /// Whether it is encrypted.
+    Dir(bool),
     /// Contents and extended attributes (v0.4).
     File(Vec<u8>, Vec<(String, Vec<u8>)>),
     Link(Vec<u8>),
 }
 
 type State = BTreeMap<String, Node>;
+
+/// Master key of the encrypted directories the v0.4 workloads make.
+const KEY: [u8; 32] = [0x5A; 32];
+
+fn random(buf: &mut [u8]) {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    for b in buf {
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        *b = (n.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 56) as u8;
+    }
+}
+
+/// With the key, so that encrypted directories show their names.
+fn unlock(fs: &mut EclipseFS) {
+    if fs.format_version() == 4 {
+        fs.set_random(random);
+        fs.add_encryption_key(&KEY).unwrap();
+    }
+}
 
 fn hash(s: &State) -> u64 {
     let mut h = DefaultHasher::new();
@@ -121,7 +142,8 @@ fn snapshot(fs: &mut EclipseFS) -> State {
             let node = match e.kind {
                 FileKind::Dir => {
                     stack.push((e.ino, p.clone()));
-                    Node::Dir
+                    let flags = fs.get_flags(e.ino).unwrap_or(0);
+                    Node::Dir(flags & FL_ENCRYPT != 0)
                 }
                 FileKind::Symlink => Node::Link(fs.read_link(e.ino).unwrap()),
                 _ => {
@@ -167,6 +189,12 @@ fn workload(seed: u64, ops: usize, size: usize, format: Mkfs, cow: bool) -> Run 
     let rec = Recorder::new(base.clone());
     let mut fs = EclipseFS::mount(rec.clone(), false).unwrap();
     fs.set_clock(clock);
+    unlock(&mut fs);
+    let key_id = if cow {
+        fs.add_encryption_key(&KEY).unwrap()
+    } else {
+        [0; 16]
+    };
     // Odd v0.4 seeds keep quota counters (fsck checks them after every
     // crash).
     if cow && seed % 2 == 1 {
@@ -188,6 +216,8 @@ fn workload(seed: u64, ops: usize, size: usize, format: Mkfs, cow: bool) -> Run 
     // exercise them.
     let (mut snaps, mut clones, mut fallocs, mut xattrs, mut defrags, mut resizes) =
         (0, 0, 0, 0, 0, 0);
+    let mut vaults = 0;
+    let mut vault_rng = Lcg(seed ^ 0x5EED);
     while done < ops {
         let d = dirs[rng.below(dirs.len() as u64) as usize];
         let name = format!("e{}", rng.below(12));
@@ -196,6 +226,16 @@ fn workload(seed: u64, ops: usize, size: usize, format: Mkfs, cow: bool) -> Run 
             2 => match fs.create(d, &name, FileKind::Dir, 0o755, 0) {
                 Ok(ino) => {
                     dirs.push(ino);
+                    // Encrypt a few of them (a second operation), so that
+                    // most of the tree stays open to reflinks. Drawn apart
+                    // so the rest of the run is the same as without them.
+                    if cow && vaults < 3 && vault_rng.below(2) == 0 {
+                        done += 1;
+                        states.push(hash(&snapshot(&mut fs)));
+                        fs.set_encryption_policy(ino, &EncryptionPolicy::new(key_id))
+                            .unwrap();
+                        vaults += 1;
+                    }
                     true
                 }
                 Err(_) => false,
@@ -353,14 +393,22 @@ fn workload(seed: u64, ops: usize, size: usize, format: Mkfs, cow: bool) -> Run 
     // Long enough runs are sure to have done each kind of change.
     if cow && ops >= 100 {
         assert!(
-            snaps > 0 && clones > 0 && fallocs > 0 && xattrs > 0 && defrags > 0 && resizes > 0,
-            "{} snapshots, {} clones, {} fallocates, {} xattrs, {} defrags, {} resizes",
+            snaps > 0
+                && clones > 0
+                && fallocs > 0
+                && xattrs > 0
+                && defrags > 0
+                && resizes > 0
+                && vaults > 0,
+            "{} snapshots, {} clones, {} fallocates, {} xattrs, {} defrags, {} resizes, \
+             {} encrypted directories",
             snaps,
             clones,
             fallocs,
             xattrs,
             defrags,
-            resizes
+            resizes,
+            vaults
         );
         if seed % 4 == 1 {
             fs.sync().unwrap();
@@ -407,6 +455,8 @@ fn verify(run: &Run, image: Vec<u8>, cut: usize) {
         let r = fs.scrub().unwrap();
         assert!(r.is_clean(), "scrub after crash at {}: {:?}", cut, r);
     }
+    // Checked and scrubbed without the key; read with it.
+    unlock(&mut fs);
     let h = hash(&snapshot(&mut fs));
     let durable = run
         .syncs
@@ -561,10 +611,12 @@ fn read_only_mount_sees_the_journal_without_writing() {
     let dev = Arc::new(Image(Mutex::new(image)));
     let mut ro = EclipseFS::mount(dev.clone(), true).unwrap();
     ro.check().unwrap();
+    unlock(&mut ro);
     let ro_state = snapshot(&mut ro);
     drop(ro);
     assert!(*dev.0.lock().unwrap() == before, "read-only mount wrote");
     let mut rw = EclipseFS::mount(dev, false).unwrap();
+    unlock(&mut rw);
     assert_eq!(snapshot(&mut rw), ro_state);
     rw.check().unwrap();
 }

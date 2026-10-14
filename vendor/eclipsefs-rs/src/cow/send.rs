@@ -211,6 +211,9 @@ impl CowFs {
         for (k, old, new) in items {
             let c = changes.entry(k.objectid);
             match k.ty {
+                // The stream carries plaintext, which needs the keys, and
+                // a receiving side has no way to keep the policy.
+                ENC_CONTEXT => return Err(Error::Unsupported("sending encrypted files")),
                 INODE_ITEM => {
                     let c = c.or_default();
                     c.created = old.is_none();
@@ -593,6 +596,8 @@ impl CowFs {
                 }
                 i.size = 0;
                 i.nbytes = 0;
+                // Streams never carry encrypted files.
+                i.flags &= !(FL_ENCRYPT as u64);
                 self.insert(Key::new(ino, INODE_ITEM, 0), i.encode())?;
                 self.fs_item.inode_count += 1;
                 self.fs_item.next_ino = self.fs_item.next_ino.max(ino + 1);
@@ -723,7 +728,15 @@ impl CowFs {
                     self.truncate_data(ino, &mut i, new.size)?;
                 }
                 let nbytes = i.nbytes;
-                self.put_inode(ino, InodeItem { nbytes, ..new })?;
+                let flags = new.flags & !(FL_ENCRYPT as u64);
+                self.put_inode(
+                    ino,
+                    InodeItem {
+                        nbytes,
+                        flags,
+                        ..new
+                    },
+                )?;
             }
             _ => return Err(BAD),
         }

@@ -50,6 +50,9 @@ const DEFRAG_WINDOW: u64 = WRITE_CHUNK;
 const DIRTY_NODES_LIMIT: usize = 4096;
 
 mod bitmap_sums;
+mod encrypt;
+
+pub use encrypt::EncryptionPolicy;
 mod resize;
 mod send;
 mod volume_ops;
@@ -156,6 +159,9 @@ pub struct CowFs {
     sums_dirty: BTreeSet<usize>,
     /// The table is to be (re)written even if nothing else changed.
     sums_pending: bool,
+    /// Encryption keys (memory only) and the source of nonces.
+    keyring: encrypt::Keyring,
+    random: Option<fn(&mut [u8])>,
 }
 
 /// File blocks among `from..to` that `exts` map.
@@ -490,6 +496,8 @@ impl CowFs {
             bitmap_sums: Vec::new(),
             sums_dirty: BTreeSet::new(),
             sums_pending: false,
+            keyring: Default::default(),
+            random: None,
             sb,
         };
         fs.load_bitmap_sums(crcs)?;
@@ -1208,7 +1216,7 @@ impl CowFs {
     /// What new data of `inode` is compressed with, if anything.
     fn compression_for(&self, inode: &InodeItem) -> Option<Compression> {
         let f = inode.flags as u32;
-        if f & (FL_NOCOW | FL_NOCOMP) != 0 {
+        if f & (FL_NOCOW | FL_NOCOMP | FL_ENCRYPT) != 0 {
             return None;
         }
         inode_compression(inode)
@@ -1227,13 +1235,23 @@ impl CowFs {
             return Ok(());
         }
         // No-COW files have no checksums (as on btrfs).
-        let sums = self.inode(ino)?.flags & FL_NOCOW as u64 == 0;
-        self.read_blocks_with(ino, sums, off, buf)
+        let i = self.inode(ino)?;
+        let sums = i.flags & FL_NOCOW as u64 == 0;
+        let keys = self.file_keys(ino, &i)?;
+        self.read_blocks_with(ino, sums, keys.as_deref(), off, buf)
     }
 
     /// [`read_blocks`](Self::read_blocks) for a caller that already has the
-    /// inode: `sums` says whether its blocks carry checksums.
-    fn read_blocks_with(&mut self, ino: u64, sums: bool, off: u64, buf: &mut [u8]) -> Result<()> {
+    /// inode: `sums` says whether its blocks carry checksums, `keys` decrypt
+    /// them.
+    fn read_blocks_with(
+        &mut self,
+        ino: u64,
+        sums: bool,
+        keys: Option<&crate::crypt::FileKeys>,
+        off: u64,
+        buf: &mut [u8],
+    ) -> Result<()> {
         if buf.is_empty() {
             return Ok(());
         }
@@ -1272,9 +1290,15 @@ impl CowFs {
                 let dst = &mut buf[(pos - off) as usize..(upto - off) as usize];
                 if pos.is_multiple_of(BS) && upto.is_multiple_of(BS) {
                     self.read_data(p0, dst, sums)?;
+                    if let Some(k) = keys {
+                        k.decrypt_blocks(b0, dst, BS as usize);
+                    }
                 } else {
                     let mut tmp = vec![0u8; ((b1 - b0) * BS) as usize];
                     self.read_data(p0, &mut tmp, sums)?;
+                    if let Some(k) = keys {
+                        k.decrypt_blocks(b0, &mut tmp, BS as usize);
+                    }
                     let o = (pos - b0 * BS) as usize;
                     let len = dst.len();
                     dst.copy_from_slice(&tmp[o..o + len]);
@@ -1356,6 +1380,7 @@ impl CowFs {
         // No-COW files rewrite their own unshared blocks in place and keep
         // no checksums (btrfs's nodatacow).
         let nocow = inode.flags & FL_NOCOW as u64 != 0;
+        let keys = self.file_keys(ino, inode)?;
         while lb < last {
             let chunk_end = (lb + WRITE_CHUNK).min(last);
             let exts = self.extents(ino, lb, chunk_end)?;
@@ -1402,7 +1427,7 @@ impl CowFs {
             // Contents of the blocks: data where the write covers them, the
             // old contents (or zeros) at the edges. If the old contents
             // cannot be read, the new blocks go back.
-            let buf = match self.fill_blocks(ino, lb, got, off, data) {
+            let mut buf = match self.fill_blocks(ino, lb, got, off, data) {
                 Ok(b) => b,
                 Err(e) => {
                     if in_place.is_none() {
@@ -1412,6 +1437,9 @@ impl CowFs {
                 }
             };
             let t = end.min((lb + got) * BS);
+            if let Some(k) = &keys {
+                k.encrypt_blocks(lb, &mut buf, BS as usize);
+            }
             self.raw.write_at(pblk * BS, &buf)?;
             for (i, block) in buf.chunks(BS as usize).enumerate() {
                 let c = (!nocow).then(|| crc32c(block));
@@ -1666,7 +1694,10 @@ impl CowFs {
     ) -> Result<usize> {
         let end = off.checked_add(data.len() as u64).ok_or(Error::Invalid)?;
         let inline = self.inline_data(ino)?;
-        let small = end <= INLINE_MAX as u64 && inode.size <= INLINE_MAX as u64;
+        // Encrypted data only goes to blocks, where XTS covers it.
+        let small = end <= INLINE_MAX as u64
+            && inode.size <= INLINE_MAX as u64
+            && inode.flags & FL_ENCRYPT as u64 == 0;
         if small && (inline.is_some() || !self.has_extents(ino)?) {
             let mut v = inline.unwrap_or_default();
             v.resize(inode.size as usize, 0);
@@ -1843,6 +1874,7 @@ impl CowFs {
     /// Delete an inode and everything it owns.
     fn purge(&mut self, ino: u64) -> Result<()> {
         self.zpending.remove(&(self.subvol, ino));
+        self.keyring.forget(self.subvol, Some(ino));
         let items = self.st.range(
             &self.fs_root,
             &Key::new(ino, 0, 0),
@@ -1940,10 +1972,17 @@ impl CowFs {
     }
 
     fn lookup_l(&mut self, dir: u64, name: &str) -> Result<u64> {
-        Ok(self
-            .dir_lookup(dir, name.as_bytes())?
-            .ok_or(Error::NotFound)?
-            .ino)
+        if self.sb.features & FEAT_ENCRYPT == 0 {
+            return Ok(self
+                .dir_lookup(dir, name.as_bytes())?
+                .ok_or(Error::NotFound)?
+                .ino);
+        }
+        let name = match self.disk_name(dir, name, encrypt::NameUse::Find) {
+            Err(Error::Invalid) => return Err(Error::NotFound),
+            n => n?,
+        };
+        Ok(self.dir_lookup(dir, &name)?.ok_or(Error::NotFound)?.ino)
     }
 
     fn readdir_l(&mut self, dir: u64) -> Result<Vec<DirEntry>> {
@@ -1956,12 +1995,17 @@ impl CowFs {
             &Key::new(dir, DIR_INDEX, u64::MAX),
             usize::MAX,
         )?;
+        let shower = self.name_shower(dir)?;
         let mut out = Vec::with_capacity(items.len());
         for (_, d) in items {
             let e = decode_pair(&d)?;
+            let name = match &shower {
+                None => e.name,
+                Some(keys) => encrypt::shown_name(keys.as_deref(), &e.name)?,
+            };
             out.push(DirEntry {
                 ino: e.ino,
-                name: String::from_utf8(e.name).map_err(|_| Error::Corrupt("entry name"))?,
+                name: String::from_utf8(name).map_err(|_| Error::Corrupt("entry name"))?,
                 kind: e.kind,
             });
         }
@@ -1976,7 +2020,8 @@ impl CowFs {
         mode: u32,
         rdev: u64,
     ) -> Result<u64> {
-        let name = check_name(name)?;
+        let name = self.disk_name(dir, name, encrypt::NameUse::Create)?;
+        let name = &name[..];
         self.writable()?;
         if self.dir_lookup(dir, name)?.is_some() {
             return Err(Error::Exists);
@@ -1990,6 +2035,7 @@ impl CowFs {
         if matches!(kind, FileKind::Regular | FileKind::Dir) {
             i.flags = d.flags & FL_INHERITED;
         }
+        self.inherit_encryption(dir, &d, ino, &mut i)?;
         self.insert(Key::new(ino, INODE_ITEM, 0), i.encode())?;
         self.fs_item.next_ino += 1;
         self.fs_item.inode_count += 1;
@@ -2088,12 +2134,14 @@ impl CowFs {
     }
 
     fn link_l(&mut self, dir: u64, name: &str, ino: u64) -> Result<()> {
-        let name = check_name(name)?;
+        let name = self.disk_name(dir, name, encrypt::NameUse::Create)?;
+        let name = &name[..];
         self.writable()?;
         let mut i = self.inode(ino)?;
         if i.kind() == FileKind::Dir {
             return Err(Error::IsDir);
         }
+        self.may_link_into(dir, ino)?;
         if self.dir_lookup(dir, name)?.is_some() {
             return Err(Error::Exists);
         }
@@ -2106,7 +2154,8 @@ impl CowFs {
     }
 
     fn unlink_l(&mut self, dir: u64, name: &str) -> Result<()> {
-        let name = check_name(name)?;
+        let name = self.disk_name(dir, name, encrypt::NameUse::Find)?;
+        let name = &name[..];
         self.writable()?;
         let e = self.dir_lookup(dir, name)?.ok_or(Error::NotFound)?;
         permit(frozen(&self.inode(dir)?) || frozen(&self.inode(e.ino)?))?;
@@ -2125,13 +2174,16 @@ impl CowFs {
         new_dir: u64,
         new_name: &str,
     ) -> Result<()> {
-        let old_name = check_name(old_name)?;
-        let new_name = check_name(new_name)?;
+        let old_name = self.disk_name(old_dir, old_name, encrypt::NameUse::Find)?;
+        let old_name = &old_name[..];
+        let new_name = self.disk_name(new_dir, new_name, encrypt::NameUse::Create)?;
+        let new_name = &new_name[..];
         self.writable()?;
         let e = self.dir_lookup(old_dir, old_name)?.ok_or(Error::NotFound)?;
         if old_dir == new_dir && old_name == new_name {
             return Ok(());
         }
+        self.may_link_into(new_dir, e.ino)?;
         let is_dir = e.kind == FileKind::Dir;
         let moving_subvol = is_link(e.ino);
         permit(
@@ -2221,7 +2273,8 @@ impl CowFs {
             }
         }
         let sums = i.flags & FL_NOCOW as u64 == 0;
-        self.read_blocks_with(ino, sums, offset, &mut buf[..n])?;
+        let keys = self.file_keys(ino, i)?;
+        self.read_blocks_with(ino, sums, keys.as_deref(), offset, &mut buf[..n])?;
         Ok(n)
     }
 
@@ -2432,6 +2485,9 @@ impl CowFs {
         let name = check_name(name)?;
         let d = self.at_rw(dir)?;
         self.writable()?;
+        if self.inode(d)?.flags & FL_ENCRYPT as u64 != 0 {
+            return Err(Error::Unsupported("subvolume in an encrypted directory"));
+        }
         if self.dir_lookup(d, name)?.is_some() {
             return Err(Error::Exists);
         }
@@ -2567,6 +2623,7 @@ impl CowFs {
         }
         self.remove_entry(dir, name)?;
         self.zpending.retain(|&(sv, _), _| sv != id);
+        self.keyring.forget(id, None);
         let (root, _) = match self.subvols.remove(&id) {
             Some(t) => t,
             None => {
@@ -2717,6 +2774,9 @@ impl CowFs {
             _ => return Err(Error::Invalid),
         }
         permit(frozen(&di))?;
+        // Encrypted blocks only decrypt in their own file, at their place.
+        self.refuse_encrypted(&si)?;
+        self.refuse_encrypted(&di)?;
         // Checksummed and no-COW files cannot share blocks (as on btrfs).
         if (di.flags ^ si.flags) & FL_NOCOW as u64 != 0 {
             return Err(Error::Invalid);
@@ -2930,10 +2990,13 @@ impl CowFs {
 
     pub fn get_flags(&mut self, h: u64) -> Result<u32> {
         let ino = self.at(h)?;
-        Ok(self.inode(ino)?.flags as u32 & FL_SETTABLE)
+        Ok(self.inode(ino)?.flags as u32 & (FL_SETTABLE | FL_ENCRYPT))
     }
 
     pub fn set_flags(&mut self, h: u64, flags: u32) -> Result<()> {
+        // Shown by `get_flags` but only a policy sets it: ignored, as on
+        // Linux, so `chattr` can hand back what it read.
+        let flags = flags & !FL_ENCRYPT;
         if flags & !FL_SETTABLE != 0 || flags & FL_COMPR != 0 && flags & FL_NOCOMP != 0 {
             return Err(Error::Invalid);
         }
@@ -3153,9 +3216,10 @@ impl CowFs {
         }
         let mut inode = self.inode(ino)?;
         let before = inode.clone();
-        // No-COW data is never compressed.
+        // No-COW and encrypted data is never compressed.
         let nocow = inode.flags & FL_NOCOW as u64 != 0;
-        let compress = compress.filter(|_| !nocow);
+        let keys = self.file_keys(ino, &inode)?;
+        let compress = compress.filter(|_| !nocow && keys.is_none());
         let threshold = match threshold {
             0 => DEFRAG_THRESHOLD,
             t => t,
@@ -3234,7 +3298,10 @@ impl CowFs {
             if rest > 0 {
                 let goal = self.goal(ino, lb + done)?;
                 if let Some(pb) = self.sp.alloc_data_run(goal, rest) {
-                    let data = &buf[(done * BS) as usize..];
+                    let data = &mut buf[(done * BS) as usize..];
+                    if let Some(k) = &keys {
+                        k.encrypt_blocks(lb + done, data, BS as usize);
+                    }
                     self.raw.write_at(pb * BS, data)?;
                     for (i, block) in data.chunks(BS as usize).enumerate() {
                         let c = (!nocow).then(|| crc32c(block));
@@ -3947,10 +4014,19 @@ impl CowFs {
         let mut item_names: BTreeSet<(u64, u64, Vec<u8>, u64)> = BTreeSet::new();
         let mut last_ext_end: BTreeMap<u64, u64> = BTreeMap::new();
         let mut xattr_owners: BTreeSet<u64> = BTreeSet::new();
+        let mut contexts: BTreeMap<u64, Vec<u8>> = BTreeMap::new();
+        // Inodes with inline or compressed data.
+        let mut packed: BTreeSet<u64> = BTreeSet::new();
         for (k, d) in &items {
             match k.ty {
                 INODE_ITEM => {
                     inodes.insert(k.objectid, InodeItem::decode(d)?);
+                }
+                ENC_CONTEXT => {
+                    if k.offset != 0 {
+                        return Err(Error::Corrupt("fsck: encryption context key"));
+                    }
+                    contexts.insert(k.objectid, d.clone());
                 }
                 INODE_REF => {
                     *refs.entry(k.objectid).or_default() += 1;
@@ -4000,9 +4076,11 @@ impl CowFs {
                         if v.len() > INLINE_MAX {
                             return Err(Error::Corrupt("fsck: inline extent too large"));
                         }
+                        packed.insert(k.objectid);
                         *bytes.entry(k.objectid).or_default() += v.len() as u64;
                     }
                     FileExtent::Comp(c) => {
+                        packed.insert(k.objectid);
                         regs.push((k.objectid, c.disk, c.disk_blocks));
                         let end = last_ext_end.entry(k.objectid).or_default();
                         if k.offset % BS != 0 || k.offset / BS < *end {
@@ -4103,6 +4181,12 @@ impl CowFs {
         }
         if inodes.len() as u64 != item.inode_count {
             return Err(Error::Corrupt("fsck: inode count"));
+        }
+        if !contexts.is_empty() || inodes.values().any(|i| i.flags & FL_ENCRYPT as u64 != 0) {
+            if self.sb.features & FEAT_ENCRYPT == 0 {
+                return Err(Error::Corrupt("fsck: encryption without the feature"));
+            }
+            encrypt::check(&inodes, &contexts, &packed, &index_names)?;
         }
         if !inodes.contains_key(&root) {
             return Err(Error::Corrupt("fsck: root"));

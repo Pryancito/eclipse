@@ -14,7 +14,18 @@ log = "0.4"
 miniz_oxide = { version = "0.9", default-features = false, features = ["with-alloc"] }
 lz4_flex = { version = "0.11", default-features = false, features = ["safe-encode", "safe-decode", "checked-decode"] }
 ruzstd = { version = "0.8", default-features = false }
+# Encryption (fscrypt-style policies): AES-256-XTS for contents and
+# AES-256-CTS-CBC for names, keys derived with HKDF-SHA512. `aes` is
+# vendored so soft-float kernel targets get the software implementation;
+# `force-soft` keeps SHA-NI (SSE registers) out of the kernel too.
+aes = { path = "../aes" }
+sha2 = { version = "0.10", default-features = false, features = ["force-soft"] }
+hmac = { version = "0.12", default-features = false }
+hkdf = { version = "0.12", default-features = false }
 
 [dev-dependencies]
 # Only for tests/performance.rs, which runs every workload on both drivers.
 btrfs = { path = "../btrfs-rs", features = ["std"] }
+# Independent implementations the encryption modes are checked against.
+xts-mode = "0.5"
+cts = "0.6"

@@ -17,6 +17,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::compress::Compression;
+use crate::cow::EncryptionPolicy;
 use crate::cow::{CowFs, SendStats};
 use crate::device::BlockDevice;
 use crate::format::{FileKind, BLOCK_SIZE, MAGIC};
@@ -667,6 +668,53 @@ impl EclipseFS {
     /// Disk and file bytes of a file's data (as `compsize` reports).
     pub fn compsize(&mut self, ino: u64) -> Result<CompSize> {
         self.cow()?.compsize(ino)
+    }
+
+    /// Source of random bytes for encryption nonces (the kernel's RNG).
+    /// Without one, no encrypted inode can be created.
+    pub fn set_random(&mut self, random: fn(&mut [u8])) {
+        if let Driver::V4(fs) = &mut self.driver {
+            fs.set_random(random);
+        }
+    }
+
+    /// Add an encryption master key (16 to 64 bytes) for this mount;
+    /// returns its identifier (`FS_IOC_ADD_ENCRYPTION_KEY`).
+    pub fn add_encryption_key(&mut self, key: &[u8]) -> Result<[u8; 16]> {
+        self.cow()?.add_encryption_key(key)
+    }
+
+    /// Forget a master key and every key derived from it
+    /// (`FS_IOC_REMOVE_ENCRYPTION_KEY`).
+    pub fn remove_encryption_key(&mut self, id: &[u8; 16]) -> Result<()> {
+        self.cow()?.remove_encryption_key(id)
+    }
+
+    /// Whether master key `id` has been added
+    /// (`FS_IOC_GET_ENCRYPTION_KEY_STATUS`).
+    pub fn encryption_key_present(&mut self, id: &[u8; 16]) -> Result<bool> {
+        Ok(self.cow()?.encryption_key_present(id))
+    }
+
+    /// Encrypt empty directory `dir` with `policy`, whose key must have
+    /// been added (`FS_IOC_SET_ENCRYPTION_POLICY`). What is created under
+    /// it inherits the policy.
+    pub fn set_encryption_policy(&mut self, dir: u64, policy: &EncryptionPolicy) -> Result<()> {
+        self.cow()?.set_encryption_policy(dir, policy)
+    }
+
+    /// The policy of `ino`, if it is encrypted
+    /// (`FS_IOC_GET_ENCRYPTION_POLICY_EX`).
+    pub fn encryption_policy(&mut self, ino: u64) -> Result<Option<EncryptionPolicy>> {
+        match &mut self.driver {
+            Driver::V3(_) => Ok(None),
+            Driver::V4(fs) => fs.encryption_policy(ino),
+        }
+    }
+
+    /// The nonce of encrypted inode `ino` (`FS_IOC_GET_ENCRYPTION_NONCE`).
+    pub fn encryption_nonce(&mut self, ino: u64) -> Result<[u8; 16]> {
+        self.cow()?.encryption_nonce(ino)
     }
 
     /// `btrfs filesystem resize [devid:]size|max`: device `devid` (1 on

@@ -26,6 +26,9 @@
 //! | `BTRFS_IOC_BALANCE_V2` | balance, with `convert` to another profile |
 //! | `BTRFS_IOC_SEND` | send stream of a read-only snapshot into a file |
 //! | `EFS_IOC_RECEIVE` | receive such a stream into a directory (EclipseFS's own) |
+//! | `FS_IOC_SET_ENCRYPTION_POLICY`, `GET_ENCRYPTION_POLICY(_EX)` | fscrypt v2 policy of an empty directory |
+//! | `FS_IOC_ADD_ENCRYPTION_KEY`, `REMOVE_ENCRYPTION_KEY(_ALL_USERS)` | master keys (`fscrypt unlock`/`lock`) |
+//! | `FS_IOC_GET_ENCRYPTION_KEY_STATUS`, `GET_ENCRYPTION_NONCE` | `fscrypt status` |
 //!
 //! The send stream is EclipseFS's format, not btrfs's, so it is received
 //! with `EFS_IOC_RECEIVE` rather than by `btrfs receive`; and the stream
@@ -50,7 +53,7 @@ use alloc::vec::Vec;
 use core::convert::TryInto;
 
 use eclipsefs::cowfmt::{handle, split, FIRST_INO, FS_TREE};
-use eclipsefs::{Compression, EclipseFS, Error as EfsError, FileKind, Profile};
+use eclipsefs::{Compression, EclipseFS, EncryptionPolicy, Error as EfsError, FileKind, Profile};
 use kernel_hal::user::{UserInPtr, UserOutPtr};
 use rcore_fs::vfs::INode;
 
@@ -70,6 +73,30 @@ const FICLONE: u32 = 0x4004_9409;
 const FICLONERANGE: u32 = 0x4020_940d;
 const FIDEDUPERANGE: u32 = 0xc018_9436;
 const FS_IOC_FIEMAP: u32 = 0xc020_660b;
+
+// fscrypt (`include/uapi/linux/fscrypt.h`). Only v2 policies (key
+// identifiers): v1 policies and keyring keys are deprecated on Linux.
+const FS_IOC_SET_ENCRYPTION_POLICY: u32 = 0x800c_6613;
+const FS_IOC_GET_ENCRYPTION_POLICY: u32 = 0x400c_6615;
+const FS_IOC_GET_ENCRYPTION_POLICY_EX: u32 = 0xc009_6616;
+const FS_IOC_ADD_ENCRYPTION_KEY: u32 = 0xc050_6617;
+const FS_IOC_REMOVE_ENCRYPTION_KEY: u32 = 0xc040_6618;
+const FS_IOC_REMOVE_ENCRYPTION_KEY_ALL_USERS: u32 = 0xc040_6619;
+const FS_IOC_GET_ENCRYPTION_KEY_STATUS: u32 = 0xc080_661a;
+const FS_IOC_GET_ENCRYPTION_NONCE: u32 = 0x8010_661b;
+
+const FSCRYPT_POLICY_V2: u8 = 2;
+/// `struct fscrypt_policy_v2`.
+const FSCRYPT_POLICY_V2_SIZE: usize = 24;
+const FSCRYPT_KEY_SPEC_TYPE_IDENTIFIER: u32 = 2;
+/// `struct fscrypt_key_specifier`.
+const FSCRYPT_KEY_SPEC: usize = 40;
+/// `struct fscrypt_add_key_arg` before the raw key.
+const FSCRYPT_ADD_KEY_ARG: usize = 80;
+const FSCRYPT_MAX_KEY_SIZE: usize = 64;
+const FSCRYPT_KEY_STATUS_ABSENT: u32 = 1;
+const FSCRYPT_KEY_STATUS_PRESENT: u32 = 2;
+const FSCRYPT_KEY_STATUS_FLAG_ADDED_BY_SELF: u32 = 1;
 
 // btrfs (`include/uapi/linux/btrfs.h`).
 const BTRFS_IOC_SNAP_CREATE: u32 = 0x5000_9401;
@@ -195,6 +222,7 @@ fn errno(e: EfsError) -> LxError {
         EfsError::NotEmpty => LxError::ENOTEMPTY,
         EfsError::NoSpace => LxError::ENOSPC,
         EfsError::Invalid => LxError::EINVAL,
+        EfsError::NoKey => LxError::ENOKEY,
     }
 }
 
@@ -316,6 +344,14 @@ pub(crate) fn is_fs_ioctl(cmd: u32) -> bool {
             | BTRFS_IOC_GET_SUBVOL_INFO
             | BTRFS_IOC_SNAP_DESTROY_V2
             | EFS_IOC_RECEIVE
+            | FS_IOC_SET_ENCRYPTION_POLICY
+            | FS_IOC_GET_ENCRYPTION_POLICY
+            | FS_IOC_GET_ENCRYPTION_POLICY_EX
+            | FS_IOC_ADD_ENCRYPTION_KEY
+            | FS_IOC_REMOVE_ENCRYPTION_KEY
+            | FS_IOC_REMOVE_ENCRYPTION_KEY_ALL_USERS
+            | FS_IOC_GET_ENCRYPTION_KEY_STATUS
+            | FS_IOC_GET_ENCRYPTION_NONCE
     )
 }
 
@@ -373,6 +409,32 @@ impl<'a> Target<'a> {
             FS_IOC_GETFLAGS | FS_IOC_SETFLAGS | FS_IOC32_GETFLAGS | FS_IOC32_SETFLAGS => {
                 UserInPtr::<u8>::from(arg).read_array(4)?
             }
+            // The version byte says which policy struct follows (the
+            // number carries the size of the v1 one).
+            FS_IOC_SET_ENCRYPTION_POLICY => {
+                let version = UserInPtr::<u8>::from(arg).read_array(1)?[0];
+                let size = if version == FSCRYPT_POLICY_V2 {
+                    FSCRYPT_POLICY_V2_SIZE
+                } else {
+                    12
+                };
+                UserInPtr::<u8>::from(arg).read_array(size)?
+            }
+            // The size the caller has room for, then that room.
+            FS_IOC_GET_ENCRYPTION_POLICY_EX => {
+                let head = UserInPtr::<u8>::from(arg).read_array(8)?;
+                let room = (get64(&head, 0) as usize).min(FSCRYPT_POLICY_V2_SIZE);
+                UserInPtr::<u8>::from(arg).read_array(8 + room)?
+            }
+            // The raw key follows the struct.
+            FS_IOC_ADD_ENCRYPTION_KEY => {
+                let head = UserInPtr::<u8>::from(arg).read_array(FSCRYPT_ADD_KEY_ARG)?;
+                let raw = get32(&head, 40) as usize;
+                if raw > FSCRYPT_MAX_KEY_SIZE {
+                    return Err(LxError::EINVAL);
+                }
+                UserInPtr::<u8>::from(arg).read_array(FSCRYPT_ADD_KEY_ARG + raw)?
+            }
             // A header and `dest_count` entries after it.
             FIDEDUPERANGE => {
                 let head = UserInPtr::<u8>::from(arg).read_array(24)?;
@@ -385,11 +447,135 @@ impl<'a> Target<'a> {
             }
         };
         let ret = self.ioctl(cmd, &mut buf, ctx)?;
-        let returns_data = cmd >> 30 & 2 != 0 && cmd != FICLONE;
-        if returns_data && !buf.is_empty() {
-            UserOutPtr::<u8>::from(arg).write_array(&buf)?;
+        // SET_ENCRYPTION_POLICY is `_IOR` but only reads; the raw key goes
+        // back to nobody.
+        let returns_data =
+            cmd >> 30 & 2 != 0 && cmd != FICLONE && cmd != FS_IOC_SET_ENCRYPTION_POLICY;
+        let out = if cmd == FS_IOC_ADD_ENCRYPTION_KEY {
+            &buf[..FSCRYPT_ADD_KEY_ARG]
+        } else {
+            &buf[..]
+        };
+        if returns_data && !out.is_empty() {
+            UserOutPtr::<u8>::from(arg).write_array(out)?;
+        }
+        if cmd == FS_IOC_ADD_ENCRYPTION_KEY {
+            buf.fill(0);
         }
         Ok(ret)
+    }
+
+    /// The fscrypt ioctls, with `buf` laid out as `fscrypt.h` lays out
+    /// their structs.
+    fn fscrypt(&self, cmd: u32, buf: &mut [u8], ctx: &dyn FsIoctlContext) -> LxResult<usize> {
+        match cmd {
+            FS_IOC_SET_ENCRYPTION_POLICY => {
+                if buf.first() != Some(&FSCRYPT_POLICY_V2) || buf.len() < FSCRYPT_POLICY_V2_SIZE {
+                    // v1 policies (master key descriptors) are not supported.
+                    return Err(LxError::EINVAL);
+                }
+                if buf[4..8] != [0; 4] {
+                    return Err(LxError::EINVAL);
+                }
+                let policy = EncryptionPolicy {
+                    contents_mode: buf[1],
+                    filenames_mode: buf[2],
+                    flags: buf[3],
+                    key_id: buf[8..24].try_into().unwrap(),
+                };
+                // `inode_owner_or_capable`, else EACCES as fscrypt says.
+                self.owner(ctx).map_err(|_| LxError::EACCES)?;
+                self.want_write()?;
+                self.with(|fs| fs.set_encryption_policy(self.ino, &policy))?;
+            }
+            FS_IOC_GET_ENCRYPTION_POLICY => {
+                // The v1 call cannot return a v2 policy.
+                return match self.with(|fs| fs.encryption_policy(self.ino))? {
+                    Some(_) => Err(LxError::EINVAL),
+                    None => Err(LxError::ENODATA),
+                };
+            }
+            FS_IOC_GET_ENCRYPTION_POLICY_EX => {
+                let p = self
+                    .with(|fs| fs.encryption_policy(self.ino))?
+                    .ok_or(LxError::ENODATA)?;
+                if buf.len() < 8 + FSCRYPT_POLICY_V2_SIZE {
+                    return Err(LxError::EOVERFLOW);
+                }
+                put64(buf, 0, FSCRYPT_POLICY_V2_SIZE as u64);
+                let out = &mut buf[8..8 + FSCRYPT_POLICY_V2_SIZE];
+                out.fill(0);
+                out[0] = FSCRYPT_POLICY_V2;
+                out[1] = p.contents_mode;
+                out[2] = p.filenames_mode;
+                out[3] = p.flags;
+                out[8..24].copy_from_slice(&p.key_id);
+            }
+            FS_IOC_ADD_ENCRYPTION_KEY => {
+                // A raw key named by its identifier; keyring keys
+                // (`key_id`) and v1 descriptors are not supported.
+                if get32(buf, 0) != FSCRYPT_KEY_SPEC_TYPE_IDENTIFIER
+                    || get32(buf, 4) != 0
+                    || get32(buf, 44) != 0
+                    || buf[48..FSCRYPT_ADD_KEY_ARG].iter().any(|&b| b != 0)
+                {
+                    return Err(LxError::EINVAL);
+                }
+                let raw = get32(buf, 40) as usize;
+                let id = self.with(|fs| {
+                    fs.add_encryption_key(&buf[FSCRYPT_ADD_KEY_ARG..FSCRYPT_ADD_KEY_ARG + raw])
+                })?;
+                buf[8..FSCRYPT_KEY_SPEC].fill(0);
+                buf[8..24].copy_from_slice(&id);
+                self.fs.invalidate_all_dirs();
+            }
+            FS_IOC_REMOVE_ENCRYPTION_KEY | FS_IOC_REMOVE_ENCRYPTION_KEY_ALL_USERS => {
+                if cmd == FS_IOC_REMOVE_ENCRYPTION_KEY_ALL_USERS {
+                    Self::admin(ctx).map_err(|_| LxError::EACCES)?;
+                }
+                let id = Self::key_identifier(buf)?;
+                if buf[FSCRYPT_KEY_SPEC..].iter().any(|&b| b != 0) {
+                    return Err(LxError::EINVAL);
+                }
+                match self.with(|fs| fs.remove_encryption_key(&id)) {
+                    Err(LxError::ENOENT) => return Err(LxError::ENOKEY),
+                    r => r?,
+                }
+                // `removal_status_flags`: every file let go of the key.
+                put32(buf, FSCRYPT_KEY_SPEC, 0);
+                self.fs.invalidate_all_dirs();
+            }
+            FS_IOC_GET_ENCRYPTION_KEY_STATUS => {
+                let id = Self::key_identifier(buf)?;
+                let present = self.with(|fs| fs.encryption_key_present(&id))?;
+                buf[64..].fill(0);
+                if present {
+                    put32(buf, 64, FSCRYPT_KEY_STATUS_PRESENT);
+                    put32(buf, 68, FSCRYPT_KEY_STATUS_FLAG_ADDED_BY_SELF);
+                    put32(buf, 72, 1);
+                } else {
+                    put32(buf, 64, FSCRYPT_KEY_STATUS_ABSENT);
+                }
+            }
+            FS_IOC_GET_ENCRYPTION_NONCE => {
+                let nonce = match self.with(|fs| fs.encryption_nonce(self.ino)) {
+                    Err(LxError::ENOENT) => return Err(LxError::ENODATA),
+                    r => r?,
+                };
+                buf[..16].copy_from_slice(&nonce);
+            }
+            _ => unreachable!(),
+        }
+        Ok(0)
+    }
+
+    /// The identifier in the `struct fscrypt_key_specifier` at the start of
+    /// `buf` (a v1 descriptor is `EINVAL`).
+    fn key_identifier(buf: &[u8]) -> LxResult<[u8; 16]> {
+        if get32(buf, 0) != FSCRYPT_KEY_SPEC_TYPE_IDENTIFIER || get32(buf, 4) != 0 {
+            return Err(LxError::EINVAL);
+        }
+        Ok(buf[8..24].try_into().unwrap())
     }
 
     /// `FS_IOC_FIEMAP` on `buf` (a `struct fiemap` with room for
@@ -574,6 +760,14 @@ impl<'a> Target<'a> {
                 self.clone_from(&src, get64(buf, 8), get64(buf, 16), get64(buf, 24))?;
             }
             FIDEDUPERANGE => self.dedupe(buf, ctx)?,
+            FS_IOC_SET_ENCRYPTION_POLICY
+            | FS_IOC_GET_ENCRYPTION_POLICY
+            | FS_IOC_GET_ENCRYPTION_POLICY_EX
+            | FS_IOC_ADD_ENCRYPTION_KEY
+            | FS_IOC_REMOVE_ENCRYPTION_KEY
+            | FS_IOC_REMOVE_ENCRYPTION_KEY_ALL_USERS
+            | FS_IOC_GET_ENCRYPTION_KEY_STATUS
+            | FS_IOC_GET_ENCRYPTION_NONCE => return self.fscrypt(cmd, buf, ctx),
             BTRFS_IOC_DEFRAG => self.defrag(None, ctx)?,
             BTRFS_IOC_DEFRAG_RANGE => self.defrag(Some(buf), ctx)?,
             BTRFS_IOC_SYNC | BTRFS_IOC_WAIT_SYNC => self.with(|fs| fs.sync())?,
@@ -2985,5 +3179,233 @@ mod tests {
             ctx.ioctl(top, BTRFS_IOC_BALANCE_V2, &mut bal),
             Err(LxError::EINVAL)
         );
+    }
+
+    /// `struct fscrypt_key_specifier` naming key `id`.
+    fn key_spec(id: &[u8; 16], size: usize) -> Vec<u8> {
+        let mut b = vec![0u8; size];
+        put32(&mut b, 0, FSCRYPT_KEY_SPEC_TYPE_IDENTIFIER);
+        b[8..24].copy_from_slice(id);
+        b
+    }
+
+    /// `FS_IOC_ADD_ENCRYPTION_KEY` with raw key `key`; the identifier.
+    fn add_key(ctx: &Ctx, fd: i32, key: &[u8]) -> LxResult<[u8; 16]> {
+        let mut b = vec![0u8; FSCRYPT_ADD_KEY_ARG + key.len()];
+        put32(&mut b, 0, FSCRYPT_KEY_SPEC_TYPE_IDENTIFIER);
+        put32(&mut b, 40, key.len() as u32);
+        b[FSCRYPT_ADD_KEY_ARG..].copy_from_slice(key);
+        ctx.ioctl(fd, FS_IOC_ADD_ENCRYPTION_KEY, &mut b)?;
+        Ok(b[8..24].try_into().unwrap())
+    }
+
+    /// `struct fscrypt_policy_v2` (AES-256-XTS, AES-256-CTS, 32-byte
+    /// name padding).
+    fn policy_v2(id: &[u8; 16]) -> Vec<u8> {
+        let mut b = vec![0u8; FSCRYPT_POLICY_V2_SIZE];
+        b[..4].copy_from_slice(&[FSCRYPT_POLICY_V2, 1, 4, 3]);
+        b[8..24].copy_from_slice(id);
+        b
+    }
+
+    fn key_status(ctx: &Ctx, fd: i32, id: &[u8; 16]) -> u32 {
+        let mut b = key_spec(id, 128);
+        ctx.ioctl(fd, FS_IOC_GET_ENCRYPTION_KEY_STATUS, &mut b)
+            .unwrap();
+        get32(&b, 64)
+    }
+
+    #[test]
+    fn the_fscrypt_numbers_are_the_ones_linux_uses() {
+        const fn ioc(dir: u32, nr: u32, size: u32) -> u32 {
+            dir << 30 | size << 16 | (b'f' as u32) << 8 | nr
+        }
+        const W: u32 = 1;
+        const R: u32 = 2;
+        assert_eq!(FS_IOC_SET_ENCRYPTION_POLICY, ioc(R, 19, 12));
+        assert_eq!(FS_IOC_GET_ENCRYPTION_POLICY, ioc(W, 21, 12));
+        assert_eq!(FS_IOC_GET_ENCRYPTION_POLICY_EX, ioc(R | W, 22, 9));
+        assert_eq!(FS_IOC_ADD_ENCRYPTION_KEY, ioc(R | W, 23, 80));
+        assert_eq!(FS_IOC_REMOVE_ENCRYPTION_KEY, ioc(R | W, 24, 64));
+        assert_eq!(FS_IOC_REMOVE_ENCRYPTION_KEY_ALL_USERS, ioc(R | W, 25, 64));
+        assert_eq!(FS_IOC_GET_ENCRYPTION_KEY_STATUS, ioc(R | W, 26, 128));
+        assert_eq!(FS_IOC_GET_ENCRYPTION_NONCE, ioc(R, 27, 16));
+        assert_eq!(LxError::ENOKEY as isize, 126);
+    }
+
+    #[test]
+    fn an_encrypted_directory_locks_and_unlocks_like_fscrypt() {
+        let disk = formatted(16 << 20);
+        let fs = mount(&disk);
+        let root = fs.root_inode();
+        let ctx = Ctx::root();
+        let top = ctx.open(root.clone(), OpenFlags::RDONLY);
+        let key = [0x33u8; 64];
+        let id = add_key(&ctx, top, &key).unwrap();
+        assert_eq!(key_status(&ctx, top, &id), FSCRYPT_KEY_STATUS_PRESENT);
+
+        let vault = root.create("vault", FileType::Dir, 0o700).unwrap();
+        let vfd = ctx.open(vault.clone(), OpenFlags::RDONLY);
+        ctx.ioctl(vfd, FS_IOC_SET_ENCRYPTION_POLICY, &mut policy_v2(&id))
+            .unwrap();
+        let mut ex = vec![0u8; 8 + FSCRYPT_POLICY_V2_SIZE];
+        put64(&mut ex, 0, FSCRYPT_POLICY_V2_SIZE as u64);
+        ctx.ioctl(vfd, FS_IOC_GET_ENCRYPTION_POLICY_EX, &mut ex)
+            .unwrap();
+        assert_eq!(get64(&ex, 0), FSCRYPT_POLICY_V2_SIZE as u64);
+        assert_eq!(ex[8..], policy_v2(&id)[..]);
+        // The old call cannot describe a v2 policy.
+        assert_eq!(
+            ctx.ioctl(vfd, FS_IOC_GET_ENCRYPTION_POLICY, &mut [0u8; 12]),
+            Err(LxError::EINVAL)
+        );
+        let mut flags = [0u8; 4];
+        ctx.ioctl(vfd, FS_IOC_GETFLAGS, &mut flags).unwrap();
+        assert_ne!(u32::from_le_bytes(flags) & 0x800, 0);
+
+        let data = pattern(20_000, 7);
+        let f = file_with(&vault, "secret.txt", &data);
+        let ffd = ctx.open(f.clone(), OpenFlags::RDONLY);
+        let mut nonce = [0u8; 16];
+        ctx.ioctl(ffd, FS_IOC_GET_ENCRYPTION_NONCE, &mut nonce)
+            .unwrap();
+        let mut dir_nonce = [0u8; 16];
+        ctx.ioctl(vfd, FS_IOC_GET_ENCRYPTION_NONCE, &mut dir_nonce)
+            .unwrap();
+        assert_ne!(nonce, dir_nonce);
+        assert_eq!(names(&vault), ["secret.txt"]);
+
+        // Lock: names become no-key names, the data and new names need the
+        // key.
+        let mut rm = key_spec(&id, 64);
+        ctx.ioctl(top, FS_IOC_REMOVE_ENCRYPTION_KEY, &mut rm)
+            .unwrap();
+        assert_eq!(get32(&rm, 40), 0);
+        assert_eq!(key_status(&ctx, top, &id), FSCRYPT_KEY_STATUS_ABSENT);
+        let hidden = names(&vault);
+        assert_eq!(hidden.len(), 1);
+        assert_ne!(hidden[0], "secret.txt");
+        assert!(vault.find(&hidden[0]).is_ok());
+        let mut buf = [0u8; 16];
+        assert_eq!(f.read_at(0, &mut buf), Err(FsError::NoKey));
+        assert_eq!(
+            vault.create("new", FileType::File, 0o644).err(),
+            Some(FsError::NoKey)
+        );
+        assert_eq!(
+            LxError::from(FsError::NoKey),
+            LxError::ENOKEY,
+            "userspace sees ENOKEY"
+        );
+        assert_eq!(
+            ctx.ioctl(top, FS_IOC_REMOVE_ENCRYPTION_KEY, &mut key_spec(&id, 64)),
+            Err(LxError::ENOKEY)
+        );
+
+        // Unlock: everything is back.
+        assert_eq!(add_key(&ctx, top, &key).unwrap(), id);
+        assert_eq!(names(&vault), ["secret.txt"]);
+        assert_eq!(read_all(&vault.find("secret.txt").unwrap()), data);
+        fs.sync().unwrap();
+        drop(fs);
+        // A new mount starts locked.
+        let fs = mount(&disk);
+        let vault = fs.root_inode().find("vault").unwrap();
+        assert!(vault.find("secret.txt").is_err());
+    }
+
+    #[test]
+    fn fscrypt_ioctls_refuse_what_linux_refuses() {
+        let disk = formatted(16 << 20);
+        let fs = mount(&disk);
+        let root = fs.root_inode();
+        let ctx = Ctx::root();
+        let top = ctx.open(root.clone(), OpenFlags::RDONLY);
+        let id = add_key(&ctx, top, &[0x44u8; 32]).unwrap();
+        // Keys too short, from a keyring, or named by a v1 descriptor.
+        assert_eq!(add_key(&ctx, top, &[1u8; 8]), Err(LxError::EINVAL));
+        let mut b = vec![0u8; FSCRYPT_ADD_KEY_ARG + 32];
+        put32(&mut b, 0, FSCRYPT_KEY_SPEC_TYPE_IDENTIFIER);
+        put32(&mut b, 40, 32);
+        put32(&mut b, 44, 1234);
+        assert_eq!(
+            ctx.ioctl(top, FS_IOC_ADD_ENCRYPTION_KEY, &mut b),
+            Err(LxError::EINVAL)
+        );
+        let mut v1 = key_spec(&id, 64);
+        put32(&mut v1, 0, 1);
+        assert_eq!(
+            ctx.ioctl(top, FS_IOC_REMOVE_ENCRYPTION_KEY, &mut v1),
+            Err(LxError::EINVAL)
+        );
+
+        // Plain inodes have no policy and no nonce.
+        let mut ex = vec![0u8; 8 + FSCRYPT_POLICY_V2_SIZE];
+        put64(&mut ex, 0, FSCRYPT_POLICY_V2_SIZE as u64);
+        assert_eq!(
+            ctx.ioctl(top, FS_IOC_GET_ENCRYPTION_POLICY_EX, &mut ex),
+            Err(LxError::ENODATA)
+        );
+        assert_eq!(
+            ctx.ioctl(top, FS_IOC_GET_ENCRYPTION_NONCE, &mut [0u8; 16]),
+            Err(LxError::ENODATA)
+        );
+
+        // A v1 policy, a full directory, a file, a missing key, a stranger.
+        let full = root.create("full", FileType::Dir, 0o755).unwrap();
+        file_with(&full, "x", b"");
+        let full = ctx.open(full, OpenFlags::RDONLY);
+        let mut v1 = vec![0u8; 12];
+        v1[1] = 1;
+        v1[2] = 4;
+        assert_eq!(
+            ctx.ioctl(full, FS_IOC_SET_ENCRYPTION_POLICY, &mut v1),
+            Err(LxError::EINVAL)
+        );
+        assert_eq!(
+            ctx.ioctl(full, FS_IOC_SET_ENCRYPTION_POLICY, &mut policy_v2(&id)),
+            Err(LxError::ENOTEMPTY)
+        );
+        let f = ctx.open(file_with(&root, "f", b""), OpenFlags::RDONLY);
+        assert_eq!(
+            ctx.ioctl(f, FS_IOC_SET_ENCRYPTION_POLICY, &mut policy_v2(&id)),
+            Err(LxError::ENOTDIR)
+        );
+        let empty = root.create("empty", FileType::Dir, 0o777).unwrap();
+        let efd = ctx.open(empty.clone(), OpenFlags::RDONLY);
+        assert_eq!(
+            ctx.ioctl(efd, FS_IOC_SET_ENCRYPTION_POLICY, &mut policy_v2(&[9; 16])),
+            Err(LxError::ENOKEY)
+        );
+        let stranger = Ctx::as_user(1000);
+        let sfd = stranger.open(empty.clone(), OpenFlags::RDONLY);
+        assert_eq!(
+            stranger.ioctl(sfd, FS_IOC_SET_ENCRYPTION_POLICY, &mut policy_v2(&id)),
+            Err(LxError::EACCES)
+        );
+        assert_eq!(
+            stranger.ioctl(
+                sfd,
+                FS_IOC_REMOVE_ENCRYPTION_KEY_ALL_USERS,
+                &mut key_spec(&id, 64)
+            ),
+            Err(LxError::EACCES)
+        );
+        // Once set, the same policy is fine and another one is EEXIST.
+        ctx.ioctl(efd, FS_IOC_SET_ENCRYPTION_POLICY, &mut policy_v2(&id))
+            .unwrap();
+        ctx.ioctl(efd, FS_IOC_SET_ENCRYPTION_POLICY, &mut policy_v2(&id))
+            .unwrap();
+        let other = add_key(&ctx, top, &[0x55u8; 32]).unwrap();
+        assert_eq!(
+            ctx.ioctl(efd, FS_IOC_SET_ENCRYPTION_POLICY, &mut policy_v2(&other)),
+            Err(LxError::EEXIST)
+        );
+        ctx.ioctl(
+            top,
+            FS_IOC_REMOVE_ENCRYPTION_KEY_ALL_USERS,
+            &mut key_spec(&id, 64),
+        )
+        .unwrap();
     }
 }

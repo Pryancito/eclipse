@@ -47,6 +47,7 @@ fn map_err(e: EfsError) -> FsError {
         EfsError::NotEmpty => FsError::DirNotEmpty,
         EfsError::NoSpace => FsError::NoDeviceSpace,
         EfsError::Invalid => FsError::InvalidParam,
+        EfsError::NoKey => FsError::NoKey,
     }
 }
 
@@ -226,6 +227,8 @@ impl EclipseMountFs {
         }
         .map_err(map_err)?;
         fs.set_clock(wall_clock);
+        // Nonces of encrypted inodes.
+        fs.set_random(kernel_hal::rand::fill_random);
         if let Some(algo) = opts.compress {
             fs.set_mount_compression(algo).map_err(map_err)?;
         }
@@ -263,6 +266,10 @@ impl EclipseMountFs {
         let entries: Listing = Arc::new(entries.into_iter().map(|e| (e.name, e.ino)).collect());
         self.dir_cache.lock().insert(dir, entries.clone());
         Ok(entries)
+    }
+
+    pub(crate) fn invalidate_all_dirs(&self) {
+        self.dir_cache.lock().clear();
     }
 
     pub(crate) fn invalidate_dir(&self, dir: u64) {

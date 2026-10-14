@@ -148,6 +148,9 @@ pub enum LxError {
     EADDRNOTAVAIL = 99,
     /// Message too long
     EMSGSIZE = 90,
+    /// Required key not available -- an encrypted file or directory whose
+    /// key has not been added (fscrypt).
+    ENOKEY = 126,
     /// Operation already in progress
     EALREADY = 114,
 }
@@ -221,6 +224,7 @@ impl fmt::Display for LxError {
             EADDRNOTAVAIL => "Cannot assign requested address",
             EMSGSIZE => "Message too long",
             EALREADY => "Operation already in progress",
+            ENOKEY => "Required key not available",
             _ => "Unknown error",
         };
         write!(f, "{}", explain)
@@ -323,6 +327,7 @@ impl From<&FsError> for LxError {
             FsError::BadState => LxError::EBADFD,
             FsError::Broken => LxError::EPIPE,
             FsError::NoSuchDeviceOrAddress => LxError::ENXIO,
+            FsError::NoKey => LxError::ENOKEY,
         }
     }
 }
@@ -391,6 +396,7 @@ mod errno_tests {
             (LxError::ECONNREFUSED, 111),
             (LxError::EALREADY, 114),
             (LxError::EINPROGRESS, 115),
+            (LxError::ENOKEY, 126),
         ] {
             assert_eq!(err as isize, n, "{:?}", err);
         }
@@ -442,6 +448,7 @@ mod errno_tests {
             (FsError::BadState, LxError::EBADFD),
             (FsError::Broken, LxError::EPIPE),
             (FsError::NoSuchDeviceOrAddress, LxError::ENXIO),
+            (FsError::NoKey, LxError::ENOKEY),
         ] {
             let name = alloc::format!("{:?}", fs);
             // Both impls, on the same value: the borrowing one is what an

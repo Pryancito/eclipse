@@ -249,6 +249,30 @@ Con esto EclipseFS tiene todo lo de btrfs. Lo siguiente ya es propio.
   En solo lectura la reparación queda en memoria. Los sistemas de archivos
   creados antes reciben la tabla en su siguiente commit, y fsck comprueba
   la tabla frente a cada bitmap.
+- **CRC32C en tres flujos**: con la instrucción `crc32`, cada bloque se
+  reparte en tres trozos que se calculan a la vez y se juntan con
+  multiplicaciones módulo el polinomio (constantes calculadas en tiempo de
+  compilación). Un bloque de 4 KiB pasa de 524 ns a 246 ns, y la lectura
+  aleatoria queda a la par con btrfs, que no comprueba los checksums de
+  datos al leer.
+- **Cifrado por directorio** (`FEAT_ENCRYPT`, como fscrypt v2 en ext4 y
+  f2fs): `set_encryption_policy(dir, &EncryptionPolicy::new(id))` cifra un
+  directorio vacío y todo lo que se cree debajo hereda la política con un
+  nonce propio. Contenido en AES-256-XTS (el tweak es el número de bloque),
+  nombres en AES-256-CTS-CBC rellenos a 32 bytes, y claves por archivo con
+  HKDF-SHA512 de la clave maestra y el nonce, con el mismo formato de
+  contexto que Linux (`fscrypt_context_v2`, item `ENC_CONTEXT`). Las claves
+  maestras viven solo en memoria (`add_encryption_key` devuelve su
+  identificador, `remove_encryption_key` las olvida con las derivadas).
+  Sin la clave, el directorio se lista con nombres sin clave (base64url del
+  cifrado, con SHA-256 de la cola en los nombres largos) que sirven para
+  buscar y borrar; leer, escribir o crear da `NoKey` (`ENOKEY`). Los
+  archivos cifrados nunca van en línea ni comprimidos, los symlinks guardan
+  el destino cifrado, y reflink, dedupe y send se niegan (compartir bloques
+  entre claves distintas o enviar texto claro); un subvolumen no puede ir
+  dentro de un directorio cifrado. fsck y scrub funcionan sin la clave.
+  `aes` va en `vendor/aes` con AES-NI solo si el objetivo tiene SSE2,
+  porque el kernel se compila sin coma flotante.
 - TRIM/discard queda pendiente: los drivers de disco del kernel todavía no
   tienen discard.
 
@@ -264,6 +288,11 @@ Con esto EclipseFS tiene todo lo de btrfs. Lo siguiente ya es propio.
   subvolúmenes y snapshots, subvolumen por defecto, `INO_LOOKUP`, `FS_INFO`,
   `DEV_INFO`, scrub, cuotas, `ADD_DEV`/`RM_DEV`/`DEV_REPLACE`, `BALANCE_V2`,
   `SEND`, `FS_IOC_FIEMAP`, `DEFRAG`/`DEFRAG_RANGE` y `RESIZE`.
+- Las ioctls de fscrypt con políticas v2 (`SET_ENCRYPTION_POLICY`,
+  `GET_ENCRYPTION_POLICY(_EX)`, `ADD_ENCRYPTION_KEY`,
+  `REMOVE_ENCRYPTION_KEY(_ALL_USERS)`, `GET_ENCRYPTION_KEY_STATUS`,
+  `GET_ENCRYPTION_NONCE`), así que la herramienta `fscrypt` y
+  `fscryptctl` sirven tal cual; los nonces salen del RNG del kernel.
 - xattrs (`getxattr` y familia; `btrfs.compression` como en btrfs),
   `fallocate` y `copy_file_range` con reflink.
 - Imágenes del instalador: `make iso ROOTFS_FS=eclipsefs` genera
@@ -338,6 +367,15 @@ cargo test --release -p eclipsefs --features std
   la cabecera marcada libre), un bloque de la tabla dañado, montaje de
   solo lectura sin escrituras, la tabla al día tras cada commit, al crecer
   y al encoger, y en RAID1 la copia buena reescribe la mala.
+- `tests/encrypt.rs`: políticas (directorio vacío, clave presente, la misma
+  otra vez), herencia con nonces distintos, que ni el contenido ni los
+  nombres aparezcan en claro en el disco, remontajes, nombres sin clave
+  (largos incluidos) para buscar y borrar, `NoKey` al leer, escribir o
+  crear, quitar y volver a poner la clave, symlinks, truncados sin
+  alinear, huecos, defrag, compresión que no se aplica, snapshots,
+  renombres y enlaces entre políticas, y lo que se niega. La carga de crash
+  cifra algunos directorios y comprueba cada imagen sin la clave y lee con
+  ella.
 - Los tests que dependen del formato corren en las dos versiones (`*_v3`).
 - `tests/performance.rs`: las mismas cargas sobre EclipseFS y btrfs, con tiempo
   y bytes leídos/escritos en el dispositivo. `scripts/eclipsefs-bench.sh` las

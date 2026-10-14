@@ -94,6 +94,9 @@ pub fn is_link(ino: u64) -> bool {
 pub const INODE_ITEM: u8 = 1;
 pub const INODE_REF: u8 = 12;
 pub const XATTR_ITEM: u8 = 24;
+/// `(inode, ENC_CONTEXT, 0)` -> the encryption context of an encrypted
+/// inode (`fscrypt_context_v2` layout: policy and a 16-byte nonce).
+pub const ENC_CONTEXT: u8 = 26;
 pub const DIR_ITEM: u8 = 84;
 pub const DIR_INDEX: u8 = 96;
 pub const EXTENT_DATA: u8 = 108;
@@ -115,6 +118,8 @@ pub const FEAT_FIXED_SIZE: u64 = 4;
 /// Superblock feature: the allocator bitmaps have checksums, in a table in
 /// group 0 ([`SuperV4::bitmap_sums`]).
 pub const FEAT_BITMAP_CSUM: u64 = 8;
+/// Superblock feature: some directory has an encryption policy.
+pub const FEAT_ENCRYPT: u64 = 16;
 
 /// Bitmap checksums per block of the table: the last 4 bytes are the
 /// CRC32C of the rest.
@@ -781,6 +786,9 @@ pub const FL_NOATIME: u32 = 0x0000_0080;
 pub const FL_COMPR: u32 = 0x0000_0004;
 pub const FL_NOCOMP: u32 = 0x0000_0400;
 pub const FL_NOCOW: u32 = 0x0080_0000;
+/// Encrypted inode (`FS_ENCRYPT_FL`): set from the directory's policy,
+/// never by `set_flags`.
+pub const FL_ENCRYPT: u32 = 0x0000_0800;
 /// Flags `set_flags` accepts.
 pub const FL_SETTABLE: u32 =
     FL_SYNC | FL_IMMUTABLE | FL_APPEND | FL_NODUMP | FL_NOATIME | FL_COMPR | FL_NOCOMP | FL_NOCOW;

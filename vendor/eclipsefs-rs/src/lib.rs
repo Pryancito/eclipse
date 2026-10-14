@@ -33,6 +33,7 @@ pub mod compress;
 pub mod cow;
 pub mod cowfmt;
 pub mod crc;
+pub mod crypt;
 pub mod device;
 pub mod extent;
 pub mod format;
@@ -44,7 +45,7 @@ pub mod v3;
 pub mod volume;
 
 pub use compress::Compression;
-pub use cow::SendStats;
+pub use cow::{EncryptionPolicy, SendStats};
 pub use device::BlockDevice;
 pub use format::FileKind;
 pub use fs::{
@@ -81,6 +82,9 @@ pub enum Error {
     NoSpace,
     /// Invalid argument (name too long, bad offset, ...).
     Invalid,
+    /// The encryption key of the file or directory has not been added
+    /// (`ENOKEY`).
+    NoKey,
 }
 
 pub type Result<T> = core::result::Result<T, Error>;

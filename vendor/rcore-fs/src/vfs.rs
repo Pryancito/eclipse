@@ -426,6 +426,9 @@ pub enum FsError {
     /// E_NXIO (6): the node exists but has no device behind it for this
     /// operation -- `read(2)` on a playback-only `/dev/dsp`, as on Linux.
     NoSuchDeviceOrAddress,
+    /// E_NOKEY (126): the file or directory is encrypted and its key has not
+    /// been added (fscrypt).
+    NoKey,
 }
 
 impl fmt::Display for FsError {

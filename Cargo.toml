@@ -58,6 +58,9 @@ exclude = [
     "vendor/kernel-sync",
     "vendor/trapframe",
     "smoltcp",
+    # AES for EclipseFS encryption: crates.io aes 0.8.4 with AES-NI limited
+    # to targets with SSE (see its Cargo.toml).
+    "vendor/aes",
 ]
 
 [patch."https://github.com/DeathWish5/PreemptiveScheduler"]
