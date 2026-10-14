@@ -43,10 +43,12 @@ pub mod space;
 pub mod v3;
 
 pub use compress::Compression;
+pub use cow::SendStats;
 pub use device::BlockDevice;
 pub use format::FileKind;
 pub use fs::{
-    CheckReport, CompSize, DirEntry, EclipseFS, FsStat, InodeStat, ScrubReport, SubvolInfo,
+    CheckReport, CompSize, DirEntry, EclipseFS, FsStat, InodeStat, QgroupInfo, ScrubReport,
+    SubvolInfo,
 };
 
 /// Version of the on-disk format new filesystems get (v0.4.0).

@@ -369,3 +369,21 @@ fn v3_has_no_subvolumes() {
         Err(Error::Unsupported("needs format v0.4"))
     );
 }
+
+#[test]
+fn a_read_only_flag_change_alone_is_committed() {
+    let (disk, mut fs) = fresh(16 * MIB);
+    let root = fs.root_ino();
+    let sv = fs.create_subvolume(root, "home").unwrap();
+    let id = fs.subvolume_of(sv);
+    fs.sync().unwrap();
+    fs.set_subvolume_read_only(id, true).unwrap();
+    fs.sync().unwrap();
+    let mut fs = remount(&disk, fs);
+    let list = fs.list_subvolumes().unwrap();
+    assert!(list.iter().find(|s| s.id == id).unwrap().read_only);
+    assert_eq!(
+        fs.create(sv, "x", FileKind::Regular, 0o644, 0).unwrap_err(),
+        RO
+    );
+}

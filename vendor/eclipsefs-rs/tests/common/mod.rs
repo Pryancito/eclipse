@@ -25,6 +25,13 @@ impl MemDisk {
         self.data.lock().unwrap().resize(size, 0xA5);
     }
 
+    /// A copy of the disk as it is now (what a power cut would leave).
+    pub fn copy(&self) -> Arc<Self> {
+        Arc::new(Self {
+            data: Mutex::new(self.data.lock().unwrap().clone()),
+        })
+    }
+
     pub fn poke(&self, at: usize, val: u8) {
         self.data.lock().unwrap()[at] ^= val;
     }

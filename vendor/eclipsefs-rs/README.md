@@ -111,6 +111,27 @@ Paso 1 de la paridad con btrfs. Todo vive en árboles B+ copy-on-write
   cubren los bloques comprimidos, los snapshots y reflinks comparten extents
   comprimidos (también trozos de ellos) y `compsize` da bytes en disco y sin
   comprimir.
+- **send/receive** (fase 6): `send(snap, padre, salida)` escribe un
+  snapshot de solo lectura como flujo (`EFSSEND1`: cabecera y comandos
+  con CRC32C cada uno), entero o, con un snapshot padre, solo los cambios:
+  `Store::diff` salta los subárboles que ambos comparten y los datos se
+  afinan bloque a bloque. Los reflinks dentro del snapshot viajan como
+  `CLONE`, y se envían xattrs, flags, huecos y extents reservados.
+  `receive(dir, entrada)` construye un subvolumen oculto, lo pasa por el
+  fsck y solo entonces lo nombra, de solo lectura y con `received_uuid`; un
+  flujo cortado o dañado no deja nada (y un corte de luz a mitad se limpia
+  al montar). Un incremental exige que el padre se haya recibido antes
+  (por su UUID), como en btrfs.
+- **Cuotas** (fase 6): `quota_enable`/`quota_disable`/`quota_rescan`
+  (bit `FEAT_QUOTA` del superbloque). Con las cuotas activas cada
+  subvolumen lleva en su `ROOT_ITEM` los bytes de archivo que referencia,
+  al día en cada transacción y comprobado por el fsck.
+  `set_qgroup_limit(id, límite)` hace que las escrituras, `fallocate` y
+  reflinks que lo superarían fallen con `NoSpace` (EDQUOT); reescribir lo
+  que ya existe siempre se puede. `qgroup_show` da, por subvolumen, el
+  contador, el límite, los bytes en disco que referencia y los exclusivos
+  (que ningún otro subvolumen comparte). Un snapshot empieza con el mismo
+  contador y sin límite.
 - `EclipseFS::mount` detecta la versión: las imágenes v0.3 siguen montando con
   su driver (`v3.rs`). `mkfs::format_v3` sigue disponible.
 
@@ -152,7 +173,7 @@ grupo k (32768 bloques = 128 MiB)
 3. ~~Subvolúmenes, snapshots rw/ro, reflinks y dedupe~~.
 4. ~~xattrs/ACL, atributos (inmutable, append, nocow), fallocate y huecos~~.
 5. ~~Compresión zlib, lz4 y zstd~~.
-6. send/receive incremental y cuotas.
+6. ~~send/receive incremental y cuotas~~.
 7. Multidispositivo (DUP, RAID0/1/10), añadir/quitar, balance y encoger.
 8. ioctls del kernel e imágenes del instalador con EclipseFS.
 
@@ -194,6 +215,17 @@ cargo test --release -p eclipsefs --features std
   y truncados dentro de un extent, snapshots y reflinks de trozos, bloques
   comprimidos dañados y disco lleno. Dos cargas de crash comprimen todo (zlib
   y zstd), incluida la compactación al confirmar.
+- `tests/send.rs`: flujos completos e incrementales entre dos sistemas de
+  archivos (contenido, metadatos, xattrs, flags, enlaces, renombres,
+  reflinks como clones, compresión), padres equivocados o ausentes, flujos
+  cortados o con bits cambiados al azar, cortes de luz a mitad de un
+  receive, y rondas aleatorias de incrementales que deben dejar ambos
+  lados iguales.
+- `tests/quota.rs`: el contador frente a un recuento tras cada tipo de
+  cambio, límites (escrituras, fallocate, reflinks), snapshots y bytes
+  exclusivos, desactivar y reactivar, archivos comprimidos y subvolúmenes
+  recibidos. Las cargas de crash con semilla impar llevan las cuotas
+  activas, así el fsck comprueba los contadores tras cada corte.
 - Los tests que dependen del formato corren en las dos versiones (`*_v3`).
 - `tests/performance.rs`: las mismas cargas sobre EclipseFS y btrfs, con tiempo
   y bytes leídos/escritos en el dispositivo. `scripts/eclipsefs-bench.sh` las

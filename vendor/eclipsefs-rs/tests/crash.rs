@@ -167,6 +167,11 @@ fn workload(seed: u64, ops: usize, size: usize, format: Mkfs, cow: bool) -> Run 
     let rec = Recorder::new(base.clone());
     let mut fs = EclipseFS::mount(rec.clone(), false).unwrap();
     fs.set_clock(clock);
+    // Odd v0.4 seeds keep quota counters (fsck checks them after every
+    // crash).
+    if cow && seed % 2 == 1 {
+        fs.quota_enable().unwrap();
+    }
     // Some v0.4 runs compress everything (seeds 1 mod 4).
     if cow && seed % 4 == 1 {
         let algo = Compression::ALL[(seed / 4 % 3) as usize];

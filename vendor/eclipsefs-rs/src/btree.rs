@@ -250,7 +250,7 @@ impl Node {
 }
 
 /// Where a tree starts.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Root {
     pub bytenr: u64,
     pub level: u8,
@@ -643,6 +643,119 @@ impl Store {
                     return Err(Error::Corrupt("tree level"));
                 }
                 self.walk_rec(p.bytenr, level - 1, Some(p.gen), visit)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Items that differ between trees `a` and `b`, in key order, as
+    /// (key, value in `a`, value in `b`). Subtrees the two share (a
+    /// snapshot and its source) are skipped without being read.
+    #[allow(clippy::type_complexity)]
+    pub fn diff(
+        &mut self,
+        a: &Root,
+        b: &Root,
+    ) -> Result<Vec<(Key, Option<Vec<u8>>, Option<Vec<u8>>)>> {
+        // Every node of `b`, from its internal nodes alone.
+        let mut in_b = BTreeSet::new();
+        self.pointers(b.bytenr, b.level, None, &mut in_b)?;
+        // `a`'s items outside the nodes it shares with `b`, and those nodes.
+        let mut shared = BTreeSet::new();
+        let mut items_a = Vec::new();
+        self.collect(a.bytenr, a.level, None, &in_b, &mut shared, &mut items_a)?;
+        let mut items_b = Vec::new();
+        self.collect(
+            b.bytenr,
+            b.level,
+            None,
+            &shared,
+            &mut BTreeSet::new(),
+            &mut items_b,
+        )?;
+        // Both lists are sorted: merge them.
+        let mut out = Vec::new();
+        let mut ia = items_a.into_iter().peekable();
+        let mut ib = items_b.into_iter().peekable();
+        loop {
+            match (ia.peek(), ib.peek()) {
+                (None, None) => break,
+                (Some(_), None) => {
+                    let (k, v) = ia.next().unwrap();
+                    out.push((k, Some(v), None));
+                }
+                (None, Some(_)) => {
+                    let (k, v) = ib.next().unwrap();
+                    out.push((k, None, Some(v)));
+                }
+                (Some((ka, _)), Some((kb, _))) => {
+                    if ka < kb {
+                        let (k, v) = ia.next().unwrap();
+                        out.push((k, Some(v), None));
+                    } else if kb < ka {
+                        let (k, v) = ib.next().unwrap();
+                        out.push((k, None, Some(v)));
+                    } else {
+                        let (k, va) = ia.next().unwrap();
+                        let (_, vb) = ib.next().unwrap();
+                        if va != vb {
+                            out.push((k, Some(va), Some(vb)));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Blocks of the node at `b` and everything under it, reading only
+    /// internal nodes.
+    fn pointers(
+        &mut self,
+        b: u64,
+        level: u8,
+        gen: Option<u64>,
+        out: &mut BTreeSet<u64>,
+    ) -> Result<()> {
+        out.insert(b);
+        if level == 0 {
+            return Ok(());
+        }
+        self.load(b, level, gen)?;
+        let Body::Internal(ptrs) = self.cache[&b].body.clone() else {
+            return Err(Error::Corrupt("tree level"));
+        };
+        for p in ptrs {
+            self.pointers(p.bytenr, level - 1, Some(p.gen), out)?;
+        }
+        Ok(())
+    }
+
+    /// Items under the node at `b`, in key order, except under the nodes
+    /// in `skip` (which go to `skipped`).
+    fn collect(
+        &mut self,
+        b: u64,
+        level: u8,
+        gen: Option<u64>,
+        skip: &BTreeSet<u64>,
+        skipped: &mut BTreeSet<u64>,
+        out: &mut Vec<(Key, Vec<u8>)>,
+    ) -> Result<()> {
+        if skip.contains(&b) {
+            skipped.insert(b);
+            return Ok(());
+        }
+        self.load(b, level, gen)?;
+        match self.cache[&b].body.clone() {
+            Body::Leaf(items) => out.extend(items),
+            Body::Internal(ptrs) => {
+                if level == 0 {
+                    return Err(Error::Corrupt("tree level"));
+                }
+                for p in ptrs {
+                    self.collect(p.bytenr, level - 1, Some(p.gen), skip, skipped, out)?;
+                }
             }
         }
         Ok(())

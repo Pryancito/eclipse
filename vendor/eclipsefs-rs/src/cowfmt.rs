@@ -59,7 +59,7 @@ pub const MAX_SUBVOL: u64 = (1 << (64 - SUBVOL_SHIFT)) - 1;
 /// plain `ino` for the top subvolume (5), so its handles are its inode
 /// numbers.
 pub const SUBVOL_SHIFT: u32 = 40;
-const INO_MASK: u64 = (1 << SUBVOL_SHIFT) - 1;
+pub const INO_MASK: u64 = (1 << SUBVOL_SHIFT) - 1;
 
 /// The handle of inode `ino` of subvolume `subvol`.
 pub fn handle(subvol: u64, ino: u64) -> u64 {
@@ -96,6 +96,10 @@ pub const ROOT_ITEM: u8 = 132;
 /// directory entry naming it there (directory, index, name).
 pub const ROOT_BACKREF: u8 = 144;
 pub const REF_ITEM: u8 = 200;
+
+/// Superblock feature: quotas are on, every subvolume's `referenced`
+/// counter is kept (and checked by fsck).
+pub const FEAT_QUOTA: u64 = 1;
 
 /// Largest file kept inside its extent item.
 pub const INLINE_MAX: usize = 1024;
@@ -527,11 +531,13 @@ pub fn decode_pair(b: &[u8]) -> Result<DirEnt> {
 // Tree roots and reference counts
 // ---------------------------------------------------------------------------
 
-pub const ROOT_ITEM_SIZE: usize = 96;
+pub const ROOT_ITEM_SIZE: usize = 168;
 /// Read-only subvolume or snapshot.
 pub const ROOT_FLAG_RDONLY: u64 = 1;
+/// Being received: not named anywhere yet, dropped at mount if left over.
+pub const ROOT_FLAG_RECEIVING: u64 = 2;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RootItem {
     pub root: Root,
     pub next_ino: u64,
@@ -543,6 +549,17 @@ pub struct RootItem {
     pub parent: u64,
     /// Generation it was snapshotted at.
     pub parent_gen: u64,
+    pub uuid: [u8; 16],
+    /// UUID of the subvolume this one is a snapshot of.
+    pub parent_uuid: [u8; 16],
+    /// UUID of the subvolume a `receive` made this one from (zero if none).
+    pub received_uuid: [u8; 16],
+    /// When it was received.
+    pub rtime: (u64, u32),
+    /// Quota: most file bytes the subvolume may reference (0: no limit).
+    pub limit: u64,
+    /// File bytes the subvolume references, kept while quotas are on.
+    pub referenced: u64,
 }
 
 impl RootItem {
@@ -559,6 +576,13 @@ impl RootItem {
         put32(&mut b, 64, self.otime.1);
         put64(&mut b, 72, self.parent);
         put64(&mut b, 80, self.parent_gen);
+        b[88..104].copy_from_slice(&self.uuid);
+        b[104..120].copy_from_slice(&self.parent_uuid);
+        b[120..136].copy_from_slice(&self.received_uuid);
+        put64(&mut b, 136, self.rtime.0);
+        put32(&mut b, 144, self.rtime.1);
+        put64(&mut b, 152, self.limit);
+        put64(&mut b, 160, self.referenced);
         b
     }
 
@@ -579,8 +603,38 @@ impl RootItem {
             otime: (le64(b, 56), le32(b, 64)),
             parent: le64(b, 72),
             parent_gen: le64(b, 80),
+            uuid: b[88..104].try_into().unwrap(),
+            parent_uuid: b[104..120].try_into().unwrap(),
+            received_uuid: b[120..136].try_into().unwrap(),
+            rtime: (le64(b, 136), le32(b, 144)),
+            limit: le64(b, 152),
+            referenced: le64(b, 160),
         })
     }
+}
+
+/// A UUID for subvolume `id` made at generation `gen` and time `now` on
+/// the filesystem `fs` (unique per filesystem and moment; no randomness
+/// is needed).
+pub fn subvol_uuid(fs: &[u8; 16], id: u64, gen: u64, now: (u64, u32)) -> [u8; 16] {
+    fn mix(mut z: u64) -> u64 {
+        z = z.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+    let a = u64::from_le_bytes(fs[..8].try_into().unwrap());
+    let b = u64::from_le_bytes(fs[8..].try_into().unwrap());
+    let t = now.0 ^ ((now.1 as u64) << 32).rotate_left(17);
+    let h1 = mix(a ^ mix(id ^ mix(gen ^ mix(t))));
+    let h2 = mix(b ^ mix(h1 ^ mix(id.rotate_left(29) ^ gen)));
+    let mut out = [0u8; 16];
+    out[..8].copy_from_slice(&h1.to_le_bytes());
+    out[8..].copy_from_slice(&h2.to_le_bytes());
+    // RFC 4122 version 4 / variant bits, so tools show it as a UUID.
+    out[6] = (out[6] & 0x0F) | 0x40;
+    out[8] = (out[8] & 0x3F) | 0x80;
+    out
 }
 
 pub fn encode_ref(len: u64, count: u32) -> Vec<u8> {
@@ -926,6 +980,12 @@ mod tests {
             otime: (1, 1),
             parent: 5,
             parent_gen: 3,
+            uuid: [1; 16],
+            parent_uuid: [2; 16],
+            received_uuid: [3; 16],
+            rtime: (9, 8),
+            limit: 1 << 30,
+            referenced: 12345,
         };
         assert_eq!(RootItem::decode(&r.encode()).unwrap(), r);
         assert_eq!(decode_ref(&encode_ref(8, 3)).unwrap(), (8, 3));

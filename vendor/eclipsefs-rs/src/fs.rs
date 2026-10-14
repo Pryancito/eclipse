@@ -17,7 +17,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::compress::Compression;
-use crate::cow::CowFs;
+use crate::cow::{CowFs, SendStats};
 use crate::device::BlockDevice;
 use crate::format::{FileKind, BLOCK_SIZE, MAGIC};
 use crate::v3::EclipseFsV3;
@@ -59,6 +59,21 @@ pub struct CompSize {
     pub uncompressed_bytes: u64,
     /// Pieces of compressed extents the file maps.
     pub compressed_extents: u64,
+}
+
+/// One subvolume's quota group (see [`EclipseFS::qgroup_show`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct QgroupInfo {
+    /// Subvolume id.
+    pub id: u64,
+    /// File bytes its files hold (what the limit applies to).
+    pub referenced: u64,
+    /// Most `referenced` may grow to.
+    pub limit: Option<u64>,
+    /// Data bytes on disk its files point at.
+    pub disk_referenced: u64,
+    /// Of those, the ones no other subvolume points at.
+    pub exclusive: u64,
 }
 
 /// statfs-style numbers.
@@ -114,6 +129,11 @@ pub struct SubvolInfo {
     /// Generation the snapshot was taken at.
     pub snapshot_gen: u64,
     pub created: (u64, u32),
+    pub uuid: [u8; 16],
+    /// UUID of the subvolume it is a snapshot of (zero if none).
+    pub parent_uuid: [u8; 16],
+    /// UUID of the subvolume a `receive` made it from (zero if none).
+    pub received_uuid: [u8; 16],
 }
 
 enum Driver {
@@ -433,6 +453,67 @@ impl EclipseFS {
     /// Disk and file bytes of a file's data (as `compsize` reports).
     pub fn compsize(&mut self, ino: u64) -> Result<CompSize> {
         self.cow()?.compsize(ino)
+    }
+
+    /// Whether quotas are on.
+    pub fn quota_enabled(&self) -> bool {
+        match &self.driver {
+            Driver::V4(c) => c.quota_enabled(),
+            Driver::V3(_) => false,
+        }
+    }
+
+    /// `btrfs quota enable`: count the file bytes of every subvolume from
+    /// now on, so limits can apply.
+    pub fn quota_enable(&mut self) -> Result<()> {
+        self.cow()?.quota_enable()
+    }
+
+    /// `btrfs quota disable`: stop counting; limits stop applying.
+    pub fn quota_disable(&mut self) -> Result<()> {
+        self.cow()?.quota_disable()
+    }
+
+    /// `btrfs quota rescan`: recount every subvolume.
+    pub fn quota_rescan(&mut self) -> Result<()> {
+        self.cow()?.quota_rescan()
+    }
+
+    /// `btrfs qgroup limit`: most file bytes subvolume `id` may hold
+    /// (`None`: no limit). Writes past it fail with `NoSpace` (EDQUOT).
+    pub fn set_qgroup_limit(&mut self, id: u64, limit: Option<u64>) -> Result<()> {
+        self.cow()?.set_qgroup_limit(id, limit)
+    }
+
+    /// `btrfs qgroup show`: every subvolume's counter, limit and disk use.
+    pub fn qgroup_show(&mut self) -> Result<Vec<QgroupInfo>> {
+        self.cow()?.qgroup_show()
+    }
+
+    /// btrfs send: write the read-only snapshot whose root directory is
+    /// `snap` to `out` as a stream, in full or (with `parent`, an older
+    /// read-only snapshot) as the changes since `parent`. Reflinks inside
+    /// the snapshot are sent as clones.
+    pub fn send(
+        &mut self,
+        snap: u64,
+        parent: Option<u64>,
+        out: &mut dyn FnMut(&[u8]) -> Result<()>,
+    ) -> Result<SendStats> {
+        self.cow()?.send(snap, parent, out)
+    }
+
+    /// btrfs receive: make a read-only subvolume in `dir` from a stream
+    /// [`send`](Self::send) wrote, read with `input` (which fills the
+    /// buffer it is given). An incremental stream needs its parent
+    /// received before. Nothing is left behind if the stream is cut or
+    /// damaged. Returns the new subvolume's root directory.
+    pub fn receive(
+        &mut self,
+        dir: u64,
+        input: &mut dyn FnMut(&mut [u8]) -> Result<()>,
+    ) -> Result<u64> {
+        self.cow()?.receive(dir, input)
     }
 
     /// Read every tree node and data block from the device and verify its

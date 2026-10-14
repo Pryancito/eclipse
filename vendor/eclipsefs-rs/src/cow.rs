@@ -21,7 +21,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::blocks::{AllocationGroup, BlockAllocator};
-use crate::btree::{Body, Key, Root, Store, MAX_ITEM};
+use crate::btree::{Body, Key, Op, Root, Store, MAX_ITEM};
 use crate::cowfmt::*;
 use crate::crc::crc32c;
 use crate::device::BlockDevice;
@@ -29,7 +29,8 @@ use crate::format::{
     FileKind, BLOCK_SIZE, GROUP_BLOCKS, MAX_NAME_LEN, MAX_SYMLINK_LEN, MIN_GROUP_BLOCKS,
 };
 use crate::fs::{
-    CheckReport, CompSize, DirEntry, FsStat, InodeStat, ScrubReport, SubvolInfo, COMMIT_OPS,
+    CheckReport, CompSize, DirEntry, FsStat, InodeStat, QgroupInfo, ScrubReport, SubvolInfo,
+    COMMIT_OPS,
 };
 use crate::journal::{JournalArea, Overlay};
 use crate::space::{metadata_reserve, BlockSpace, RangeSet, RefMap};
@@ -41,6 +42,9 @@ const BS: u64 = BLOCK_SIZE;
 const WRITE_CHUNK: u64 = 2048;
 /// Commit early once this many tree nodes wait to be written.
 const DIRTY_NODES_LIMIT: usize = 4096;
+
+mod send;
+pub use send::{ReceiveSource, SendSink, SendStats};
 
 /// One file extent as the write and read paths see it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -135,6 +139,13 @@ pub struct CowFs {
     /// File blocks of compressed files written uncompressed by this
     /// transaction, by (subvolume, inode).
     zpending: BTreeMap<(u64, u64), RangeSet>,
+}
+
+/// File blocks among `from..to` that `exts` map.
+fn covered(exts: &[Ext], from: u64, to: u64) -> u64 {
+    exts.iter()
+        .map(|e| (e.lblk + e.blocks).min(to).saturating_sub(e.lblk.max(from)))
+        .sum()
 }
 
 fn check_name(name: &str) -> Result<&[u8]> {
@@ -303,6 +314,9 @@ impl CowFs {
         if fs.inode(root_dir)?.kind() != FileKind::Dir {
             return Err(Error::Corrupt("root is not a directory"));
         }
+        if !read_only {
+            fs.drop_unfinished_receives()?;
+        }
         Ok(fs)
     }
 
@@ -376,7 +390,8 @@ impl CowFs {
             || self.sp.refs_dirty
             || self.sp.alloc.deferred_blocks() > 0
             || self.sp.alloc.groups().iter().any(|g| g.is_dirty())
-            || !self.dev.is_empty();
+            || !self.dev.is_empty()
+            || self.items_changed()?;
         if !changed {
             return Ok(());
         }
@@ -477,6 +492,20 @@ impl CowFs {
             }
         }
         r
+    }
+
+    /// Whether a subvolume's item in memory (flags, quota counter...)
+    /// differs from the root tree's.
+    fn items_changed(&mut self) -> Result<bool> {
+        let mut items = vec![(self.subvol, self.fs_item.clone())];
+        items.extend(self.subvols.iter().map(|(&id, (_, it))| (id, it.clone())));
+        for (id, it) in items {
+            let on_disk = self.st.get(&self.root_tree, &Key::new(id, ROOT_ITEM, 0))?;
+            if on_disk.map(|d| RootItem::decode(&d)).transpose()?.as_ref() != Some(&it) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// Point the root tree's item for tree `id` at `root` if it moved.
@@ -655,12 +684,19 @@ impl CowFs {
 
     fn put_inode(&mut self, ino: u64, mut i: InodeItem) -> Result<()> {
         i.seq += 1;
-        self.st.update(
+        let nbytes = i.nbytes;
+        let old = self.st.modify(
             &mut self.sp,
             &mut self.fs_root,
             Key::new(ino, INODE_ITEM, 0),
-            i.encode(),
-        )
+            Op::Update(i.encode()),
+        )?;
+        if self.quota_on() {
+            let was = InodeItem::decode(&old.ok_or(Error::NotFound)?)?.nbytes;
+            let r = &mut self.fs_item.referenced;
+            *r = r.saturating_add(nbytes).saturating_sub(was);
+        }
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -1353,11 +1389,33 @@ impl CowFs {
     /// or, for a subvolume, the handle of its root (no `INODE_REF` then:
     /// the root tree's backref names it).
     fn add_entry(&mut self, dir: u64, name: &[u8], ino: u64, kind: FileKind) -> Result<u64> {
+        self.add_entry_at(dir, name, ino, kind, None)
+    }
+
+    /// [`add_entry`](Self::add_entry) at a given directory index (for
+    /// `receive`), or the next free one.
+    fn add_entry_at(
+        &mut self,
+        dir: u64,
+        name: &[u8],
+        ino: u64,
+        kind: FileKind,
+        at: Option<u64>,
+    ) -> Result<u64> {
         let mut d = self.inode(dir)?;
         if d.kind() != FileKind::Dir {
             return Err(Error::NotDir);
         }
-        let index = d.dir_next;
+        let index = match at {
+            Some(i) if (2..u64::MAX).contains(&i) => {
+                if self.get(Key::new(dir, DIR_INDEX, i))?.is_some() {
+                    return Err(Error::Exists);
+                }
+                i
+            }
+            Some(_) => return Err(Error::Invalid),
+            None => d.dir_next,
+        };
         let hkey = Key::new(dir, DIR_ITEM, name_hash(name));
         let mut list = match self.get(hkey)? {
             Some(v) => decode_dir_item(&v)?,
@@ -1388,7 +1446,7 @@ impl CowFs {
             )?;
         }
         let now = self.now();
-        d.dir_next += 1;
+        d.dir_next = d.dir_next.max(index + 1);
         d.size += 2 * name.len() as u64;
         d.mtime = now;
         d.ctime = now;
@@ -1450,6 +1508,10 @@ impl CowFs {
             // The item goes first: copying a leaf shared with a snapshot
             // adds the owners its extents are then released from.
             self.delete(k)?;
+            if k.ty == INODE_ITEM && self.quota_on() {
+                let r = &mut self.fs_item.referenced;
+                *r = r.saturating_sub(InodeItem::decode(&d)?.nbytes);
+            }
             if let Some((s, l)) = extent_of(&k, &d) {
                 self.sp_decref(s, l)?;
             }
@@ -1836,6 +1898,9 @@ impl CowFs {
             .ok_or(Error::Invalid)?;
         // Append-only files only grow at the end.
         permit(immutable(&i) || frozen(&i) && offset != i.size)?;
+        let (from, to) = (offset / BS, (offset + data.len() as u64).div_ceil(BS));
+        let holes = to - from - self.mapped(ino, from, to)?;
+        self.charge(holes)?;
         let r = self.write_data(ino, &mut i, offset, data);
         if r.is_ok() {
             let now = self.now();
@@ -2045,6 +2110,8 @@ impl CowFs {
             otime: now,
             parent: 0,
             parent_gen: 0,
+            uuid: subvol_uuid(&self.sb.uuid, id, self.st.gen, now),
+            ..Default::default()
         };
         self.st.insert(
             &mut self.sp,
@@ -2077,6 +2144,12 @@ impl CowFs {
         item.otime = self.now();
         item.parent = src_sv;
         item.parent_gen = self.sb.generation;
+        item.parent_uuid = item.uuid;
+        item.uuid = subvol_uuid(&self.sb.uuid, id, self.st.gen, item.otime);
+        item.received_uuid = [0; 16];
+        item.rtime = (0, 0);
+        // Same counter (same files), no limit of its own.
+        item.limit = 0;
         self.st.insert(
             &mut self.sp,
             &mut self.root_tree,
@@ -2168,20 +2241,28 @@ impl CowFs {
         self.commit()
     }
 
-    pub fn list_subvolumes(&mut self) -> Result<Vec<SubvolInfo>> {
-        // Items of the subvolumes touched since the last commit are newer
-        // than the root tree's.
+    /// Every subvolume's item as it is now: the root tree's, or newer for
+    /// the subvolumes touched since the last commit.
+    fn current_root_items(&mut self) -> Result<BTreeMap<u64, RootItem>> {
         let mut items: BTreeMap<u64, RootItem> = self.root_items()?.into_iter().collect();
         items.insert(self.subvol, self.fs_item.clone());
         for (&id, (_, it)) in &self.subvols {
             items.insert(id, it.clone());
         }
+        Ok(items)
+    }
+
+    pub fn list_subvolumes(&mut self) -> Result<Vec<SubvolInfo>> {
+        let items = self.current_root_items()?;
         let mut back: BTreeMap<u64, (u64, DirEnt)> = BTreeMap::new();
         for (id, p, e) in self.backrefs()? {
             back.insert(id, (p, e));
         }
         let mut out = Vec::new();
         for (id, it) in items {
+            if it.flags & ROOT_FLAG_RECEIVING != 0 {
+                continue;
+            }
             let (parent, dir, name) = match back.remove(&id) {
                 Some((p, e)) => (
                     p,
@@ -2200,6 +2281,9 @@ impl CowFs {
                 snapshot_of: it.parent,
                 snapshot_gen: it.parent_gen,
                 created: it.otime,
+                uuid: it.uuid,
+                parent_uuid: it.parent_uuid,
+                received_uuid: it.received_uuid,
             });
         }
         Ok(out)
@@ -2215,6 +2299,9 @@ impl CowFs {
             self.fs_item.flags |= ROOT_FLAG_RDONLY;
         } else {
             self.fs_item.flags &= !ROOT_FLAG_RDONLY;
+            // Changed from here on: no longer what was received (btrfs
+            // clears it too, so later incremental streams are refused).
+            self.fs_item.received_uuid = [0; 16];
         }
         self.commit()
     }
@@ -2287,6 +2374,16 @@ impl CowFs {
         if len % BS != 0 && (s_end != si.size || d_end < di.size) {
             return Err(Error::Invalid);
         }
+        // New to the destination: blocks the source maps over its holes,
+        // at most.
+        let s0 = src_off / BS;
+        let shared = match inline {
+            Some(_) => blocks,
+            None => covered(&exts, s0, s0 + blocks),
+        };
+        let d0 = dst_off / BS;
+        let holes = blocks - self.mapped(d_ino, d0, d0 + blocks)?;
+        self.charge(shared.min(holes))?;
         let r = match inline {
             Some(mut v) => {
                 v.resize(si.size as usize, 0);
@@ -2587,6 +2684,182 @@ impl CowFs {
     }
 
     // -----------------------------------------------------------------------
+    // Quotas
+    // -----------------------------------------------------------------------
+
+    fn quota_on(&self) -> bool {
+        self.sb.features & FEAT_QUOTA != 0
+    }
+
+    /// File blocks among `from..to` of `ino` that something maps.
+    fn mapped(&mut self, ino: u64, from: u64, to: u64) -> Result<u64> {
+        let exts = self.extents(ino, from, to)?;
+        Ok(covered(&exts, from, to))
+    }
+
+    /// Refuse adding `blocks` file blocks to the current subvolume if
+    /// that takes it past its limit (EDQUOT, as `NoSpace`).
+    fn charge(&mut self, blocks: u64) -> Result<()> {
+        let it = &self.fs_item;
+        if self.quota_on()
+            && it.limit != 0
+            && blocks > 0
+            && it.referenced.saturating_add(blocks * BS) > it.limit
+        {
+            return Err(Error::NoSpace);
+        }
+        Ok(())
+    }
+
+    pub fn quota_enabled(&self) -> bool {
+        self.quota_on()
+    }
+
+    /// Turn quotas on (`btrfs quota enable`): every subvolume's counter is
+    /// recounted and kept from here on.
+    pub fn quota_enable(&mut self) -> Result<()> {
+        self.writable()?;
+        self.sb.features |= FEAT_QUOTA;
+        self.quota_rescan_items()?;
+        self.dev.write_at(0, &self.sb.encode())?;
+        self.flush()
+    }
+
+    /// Turn quotas off: counters stop being kept and limits stop applying
+    /// (they are kept for the next `quota_enable`).
+    pub fn quota_disable(&mut self) -> Result<()> {
+        self.writable()?;
+        self.sb.features &= !FEAT_QUOTA;
+        self.dev.write_at(0, &self.sb.encode())?;
+        self.flush()
+    }
+
+    /// Recount every subvolume (`btrfs quota rescan`).
+    pub fn quota_rescan(&mut self) -> Result<()> {
+        self.writable()?;
+        if !self.quota_on() {
+            return Err(Error::Unsupported("quotas are off"));
+        }
+        self.quota_rescan_items()?;
+        self.flush()
+    }
+
+    fn quota_rescan_items(&mut self) -> Result<()> {
+        let here = self.subvol;
+        let ids: Vec<u64> = self.current_root_items()?.into_keys().collect();
+        for id in ids {
+            self.enter(id)?;
+            let mut total = 0u64;
+            for (k, d) in self.st.range(
+                &self.fs_root,
+                &Key::new(0, INODE_ITEM, 0),
+                &Key::MAX,
+                usize::MAX,
+            )? {
+                if k.ty == INODE_ITEM {
+                    total += InodeItem::decode(&d)?.nbytes;
+                }
+            }
+            self.fs_item.referenced = total;
+        }
+        self.enter(here)
+    }
+
+    /// Most file bytes subvolume `id` may reference, or no limit
+    /// (`btrfs qgroup limit`). Quotas must be on.
+    pub fn set_qgroup_limit(&mut self, id: u64, limit: Option<u64>) -> Result<()> {
+        self.writable()?;
+        if !self.quota_on() {
+            return Err(Error::Unsupported("quotas are off"));
+        }
+        if limit == Some(0) {
+            return Err(Error::Invalid);
+        }
+        self.enter(id)?;
+        if self.fs_item.flags & ROOT_FLAG_RECEIVING != 0 {
+            return Err(Error::NotFound);
+        }
+        self.fs_item.limit = limit.unwrap_or(0);
+        self.dev.write_at(0, &self.sb.encode())?;
+        self.flush()
+    }
+
+    /// Every subvolume's quota group (`btrfs qgroup show`): its counter
+    /// and limit, and the data blocks it references on disk, alone or
+    /// shared with other subvolumes.
+    pub fn qgroup_show(&mut self) -> Result<Vec<QgroupInfo>> {
+        if !self.quota_on() {
+            return Err(Error::Unsupported("quotas are off"));
+        }
+        let items = self.current_root_items()?;
+        // Data blocks each subvolume references: (start, +1 / -1, id).
+        let mut edges: Vec<(u64, i8, u64)> = Vec::new();
+        let mut out = Vec::new();
+        for (&id, it) in &items {
+            if it.flags & ROOT_FLAG_RECEIVING != 0 {
+                continue;
+            }
+            let root = if id == self.subvol {
+                self.fs_root
+            } else {
+                match self.subvols.get(&id) {
+                    Some((r, _)) => *r,
+                    None => it.root,
+                }
+            };
+            let mut ranges = RangeSet::default();
+            for (k, d) in self
+                .st
+                .range(&root, &Key::new(0, 0, 0), &Key::MAX, usize::MAX)?
+            {
+                if k.ty != EXTENT_DATA {
+                    continue;
+                }
+                if let Some((s, l)) = extent_of(&k, &d) {
+                    ranges.insert(s, l);
+                }
+            }
+            let mut disk = 0;
+            for (s, l) in ranges.iter() {
+                disk += l * BS;
+                edges.push((s, 1, id));
+                edges.push((s + l, -1, id));
+            }
+            out.push(QgroupInfo {
+                id,
+                referenced: it.referenced,
+                limit: (it.limit != 0).then_some(it.limit),
+                disk_referenced: disk,
+                exclusive: 0,
+            });
+        }
+        // Sweep: a stretch only one subvolume references is exclusive.
+        edges.sort_unstable();
+        let mut active: BTreeMap<u64, u32> = BTreeMap::new();
+        let mut excl: BTreeMap<u64, u64> = BTreeMap::new();
+        let mut at = 0;
+        for (pos, d, id) in edges {
+            if active.len() == 1 {
+                let only = *active.keys().next().unwrap();
+                *excl.entry(only).or_default() += (pos - at) * BS;
+            }
+            at = pos;
+            if d > 0 {
+                *active.entry(id).or_default() += 1;
+            } else if let Some(c) = active.get_mut(&id) {
+                *c -= 1;
+                if *c == 0 {
+                    active.remove(&id);
+                }
+            }
+        }
+        for q in &mut out {
+            q.exclusive = excl.get(&q.id).copied().unwrap_or(0);
+        }
+        Ok(out)
+    }
+
+    // -----------------------------------------------------------------------
     // fallocate
     // -----------------------------------------------------------------------
 
@@ -2610,6 +2883,11 @@ impl CowFs {
             _ => return Err(Error::Invalid),
         }
         permit(frozen(&i))?;
+        if !punch {
+            let (from, to) = (offset / BS, end.div_ceil(BS));
+            let holes = to - from - self.mapped(ino, from, to)?;
+            self.charge(holes)?;
+        }
         let r = (|| {
             if self.inline_data(ino)?.is_some() {
                 self.uninline(ino, &mut i)?;
@@ -2942,6 +3220,10 @@ impl CowFs {
         let mut links = BTreeSet::new();
         let subvols = self.root_items()?;
         for (id, item) in &subvols {
+            if item.flags & ROOT_FLAG_RECEIVING != 0 {
+                // Half received: checked when the receive ends.
+                continue;
+            }
             let (n, d, l, need) = self.check_subvol(item)?;
             // Every block written to a file that keeps checksums has one.
             if !need.is_subset(&summed) {
@@ -2962,9 +3244,10 @@ impl CowFs {
                 "fsck: subvolume entries and backrefs differ",
             ));
         }
-        for (id, _) in &subvols {
+        for (id, item) in &subvols {
             let named = backs.iter().filter(|b| b.0 == *id).count();
-            if named != usize::from(*id != FS_TREE) {
+            let receiving = item.flags & ROOT_FLAG_RECEIVING != 0;
+            if named != usize::from(*id != FS_TREE && !receiving) {
                 return Err(Error::Corrupt("fsck: subvolume not named once"));
             }
         }
@@ -3124,6 +3407,9 @@ impl CowFs {
             if !inodes.contains_key(&ino) {
                 return Err(Error::Corrupt("fsck: extent of a free inode"));
             }
+        }
+        if self.quota_on() && inodes.values().map(|i| i.nbytes).sum::<u64>() != item.referenced {
+            return Err(Error::Corrupt("fsck: quota counter"));
         }
         let dirs: Vec<u64> = inodes
             .iter()
@@ -3297,6 +3583,7 @@ pub(crate) fn format(
         otime: now,
         parent: 0,
         parent_gen: 0,
+        ..Default::default()
     };
     // The root tree's own changes below do not move the other roots.
     st.insert(
@@ -3315,7 +3602,11 @@ pub(crate) fn format(
         &mut sp,
         &mut root_tree,
         Key::new(FS_TREE, ROOT_ITEM, 0),
-        item(fs_root, FIRST_INO + 1, 1).encode(),
+        RootItem {
+            uuid: subvol_uuid(&uuid, FS_TREE, gen, now),
+            ..item(fs_root, FIRST_INO + 1, 1)
+        }
+        .encode(),
     )?;
     let nodes = st.take_dirty();
     write_home(dev, &nodes)?;

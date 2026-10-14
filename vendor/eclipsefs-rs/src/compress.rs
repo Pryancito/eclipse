@@ -155,7 +155,11 @@ mod tests {
             for blocks in [2, 3, 17, 32] {
                 let d = text(blocks);
                 let p = pack(algo, &d).unwrap();
-                assert!(p.len() < d.len() && p.len().is_multiple_of(BS), "{:?}", algo);
+                assert!(
+                    p.len() < d.len() && p.len().is_multiple_of(BS),
+                    "{:?}",
+                    algo
+                );
                 assert_eq!(unpack(algo, &p, d.len()).unwrap(), d, "{:?}", algo);
             }
             let zeros = vec![0u8; 32 * BS];
