@@ -513,8 +513,14 @@ fn reset_mount_table() {
     MOUNT_TABLE.lock().clear();
 }
 
+/// True for a root pivoted onto an installed block-device filesystem
+/// (EclipseFS, the default, or btrfs) rather than the boot medium.
+fn is_installed_block_root(root_fstype: &str) -> bool {
+    matches!(root_fstype, "eclipsefs" | "btrfs")
+}
+
 /// Resolve a top-level mount directory on the pivoted block-device root
-/// (btrfs/ext2) without `MNode::find` overlay/metadata overhead (VBox disk
+/// (EclipseFS/btrfs) without `MNode::find` overlay/metadata overhead (VBox disk
 /// boot).
 fn boot_resolve_mount_dir(
     rootfs: &Arc<MountFS>,
@@ -539,7 +545,7 @@ fn resolve_mount_dir(
     name: &str,
     mode: u32,
 ) -> Arc<MNode> {
-    if root_fstype == "btrfs" {
+    if is_installed_block_root(root_fstype) {
         boot_resolve_mount_dir(rootfs, root, name, mode)
     } else {
         root.find(true, name).unwrap_or_else(|_| {
@@ -1652,9 +1658,9 @@ pub fn create_root_fs(rootfs: Arc<dyn FileSystem>) -> Arc<dyn INode> {
     mount_ramfs_at(&root, "var/lib/pulse", "/var/lib/pulse");
 
     // Ensure /var/run exists. Skip while pivoting onto an installed block
-    // root (btrfs/ext2): scanning /var during early boot has stalled some
-    // VBox/VDI setups, and /run is already a dedicated tmpfs mount above.
-    if root_fstype != "btrfs" {
+    // root (EclipseFS/btrfs): scanning /var during early boot has stalled
+    // some VBox/VDI setups, and /run is already a dedicated tmpfs mount above.
+    if !is_installed_block_root(root_fstype) {
         if let Ok(var) = root.find(true, "var") {
             if var.find(true, "run").is_err() {
                 var.create("run", FileType::Dir, 0o755).ok();
@@ -1719,15 +1725,16 @@ pub fn create_root_fs(rootfs: Arc<dyn FileSystem>) -> Arc<dyn INode> {
 }
 
 /// Choose the real root filesystem, pivoting from the boot medium onto an
-/// installed btrfs (or legacy ext2) ROOT partition when one is available.
+/// installed EclipseFS (the default) or btrfs ROOT partition when one is
+/// available.
 ///
 /// Resolution order:
 /// 1. `ROOT=<dev>` on the kernel command line (e.g. `ROOT=/dev/sda2`) when it
-///    resolves to a real btrfs/ext2 device — a deterministic, explicit pivot.
+///    resolves to a real EclipseFS/btrfs device — a deterministic, explicit pivot.
 /// 2. The root (`/`) entry of the boot medium's `/etc/fstab`, when it names a
 ///    real, resolvable device.
-/// 3. Auto-detection: the first partition block device that passes the btrfs
-///    or ext2 superblock probe and mounts cleanly (typically `/dev/sda2` on an
+/// 3. Auto-detection: the first partition block device that passes the
+///    EclipseFS or btrfs superblock probe and mounts cleanly (typically `/dev/sda2` on an
 ///    AHCI install with EFI on `sda1`).  We intentionally avoid walking
 ///    installed root directories here — that has stalled some VBox/VDI
 ///    setups.
@@ -1751,7 +1758,7 @@ fn determine_real_root(
                 return Some((fs, String::from(dev), fstype));
             }
             warn!(
-                "create_root_fs: ROOT={} no es un btrfs/EclipseFS montable",
+                "create_root_fs: ROOT={} no es un EclipseFS/btrfs montable",
                 dev
             );
         } else {
@@ -1768,7 +1775,7 @@ fn determine_real_root(
         return Some(res);
     }
 
-    // 3. First mountable btrfs/ext2 partition (vfat EFI on sda1 fails the
+    // 3. First mountable EclipseFS/btrfs partition (vfat EFI on sda1 fails the
     //    probes).
     for (name, inode) in root_mount_candidates(candidates) {
         warn!("[boot] determine_real_root: probe /dev/{}", name);
@@ -1823,22 +1830,28 @@ fn lookup_candidate(candidates: &[(String, Arc<dyn INode>)], dev: &str) -> Optio
 }
 
 /// Open a block-device (or loop file) inode as a root filesystem, if possible:
-/// btrfs (the installed default) or EclipseFS. ext2 was removed.
+/// EclipseFS (the installed default) or btrfs. ext2 was removed.
 /// Returns the filesystem together with its fstype name.
 fn open_block_root(inode: Arc<dyn INode>) -> Option<(Arc<dyn FileSystem>, &'static str)> {
     let backend = block_mount::MountBackend::from_inode(inode).ok()?;
     let fstype = match &backend {
         block_mount::MountBackend::Block(block) => {
-            if btrfs_mount::probe_btrfs_superblock(block) {
-                "btrfs"
-            } else if eclipsefs_mount::probe_eclipsefs_superblock(block) {
+            if eclipsefs_mount::probe_eclipsefs_superblock(block) {
                 "eclipsefs"
+            } else if btrfs_mount::probe_btrfs_superblock(block) {
+                "btrfs"
             } else {
                 return None;
             }
         }
-        // A loop file has no cheap probe; it has always been btrfs.
-        block_mount::MountBackend::File(_) => "btrfs",
+        // A loop file has no cheap probe: try EclipseFS, then btrfs.
+        block_mount::MountBackend::File(file) => {
+            return ["eclipsefs", "btrfs"].iter().copied().find_map(|fstype| {
+                let backend = block_mount::MountBackend::File(file.clone());
+                let fs = mount_ops::open_filesystem(backend, fstype, false, "").ok()?;
+                Some((fs, fstype))
+            });
+        }
     };
     let fs = mount_ops::open_filesystem(backend, fstype, false, "").ok()?;
     Some((fs, fstype))

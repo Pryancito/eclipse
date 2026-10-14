@@ -40,11 +40,12 @@ static const char *resolve_image_path(const char *path);
 int struct_file_exists(const char *path);
 
 /* Sistema de archivos de ROOT/HOME: el que traiga el medio de instalación.
- * btrfs por defecto; EclipseFS si la build se hizo con ROOTFS_FS=eclipsefs. */
+ * EclipseFS por defecto; btrfs solo si el medio trae únicamente el payload
+ * btrfs (build hecha con ROOTFS_FS=btrfs). */
 static int disk_fs_is_eclipsefs(void) {
     static int cached = -1;
     if (cached < 0) {
-        cached = struct_file_exists(resolve_image_path("/boot/rootfs.eclipsefs.gz")) &&
+        cached = struct_file_exists(resolve_image_path("/boot/rootfs.eclipsefs.gz")) ||
                  !struct_file_exists(resolve_image_path("/boot/rootfs.btrfs.gz"));
     }
     return cached;
@@ -2914,7 +2915,7 @@ static int write_fstab_to_root(const char *disk_path, const struct partition_pla
     return write_fstab_via_mount(root_dev, efi_dev, "", "", LAYOUT_SIMPLE, dry_run);
 }
 
-/* Con btrfs no hay que expandir ROOT en el instalador: el kernel de Eclipse
+/* Con EclipseFS o btrfs no hay que expandir ROOT en el instalador: el kernel de Eclipse
  * detecta en el primer montaje que la partición es mayor que el sistema de
  * archivos y lo expande automáticamente (grow_to_device). Sólo aseguramos que
  * lo escrito esté en disco. */
@@ -3177,9 +3178,9 @@ static int run_upgrade(const char *disk_path, int dry_run) {
         if (shell_mkdir_p(UPD_ROOT_MNT, dry_run) != 0) {
             return -1;
         }
-        /* El ROOT ya instalado puede ser btrfs o EclipseFS: se prueban ambos. */
-        if (shell_mount(root_dev, UPD_ROOT_MNT, "btrfs", 0, dry_run) != 0 &&
-            shell_mount(root_dev, UPD_ROOT_MNT, "eclipsefs", 0, dry_run) != 0) {
+        /* El ROOT ya instalado puede ser EclipseFS o btrfs: se prueban ambos. */
+        if (shell_mount(root_dev, UPD_ROOT_MNT, "eclipsefs", 0, dry_run) != 0 &&
+            shell_mount(root_dev, UPD_ROOT_MNT, "btrfs", 0, dry_run) != 0) {
             log(COLOR_RED COLOR_BOLD "ERROR: No se pudo montar la partición ROOT (%s) para la descompresión." COLOR_RESET, root_dev);
             return -1;
         }
@@ -3520,7 +3521,7 @@ int main(int argc, char **argv) {
             return 1;
         }
 
-        /* ROOT es btrfs: el kernel lo expandirá a toda la partición en el
+        /* ROOT es EclipseFS o btrfs: el kernel lo expandirá a toda la partición en el
          * primer montaje; aquí sólo se sincroniza lo escrito. */
         {
             char grow_root_dev[160];
