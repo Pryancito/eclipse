@@ -239,7 +239,7 @@ fn checkver(img: &[u8], verdef: usize, vsym: u16, vername: &[u8], strtab: usize)
 
 /// musl's `count_syms_gnu`: a GNU hash table records no symbol count, so the
 /// highest bucket's chain is walked to its terminator to recover one.
-fn count_syms_gnu(img: &[u8], gh: usize) -> Option<usize> {
+pub(crate) fn count_syms_gnu(img: &[u8], gh: usize) -> Option<usize> {
     let nbuckets = u32le(img, gh)? as usize;
     let symoffset = u32le(img, gh.checked_add(4)?)? as usize;
     let bloom_size = u32le(img, gh.checked_add(8)?)? as usize;

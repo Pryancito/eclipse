@@ -20,7 +20,7 @@
 // `__vdsosym("LINUX_2.6", "__vdso_clock_gettime")` (musl/src/internal/vdso.c).
 // Two details of that lookup shape this file:
 //
-//  * It needs `DT_SYMTAB`, `DT_STRTAB` and `DT_HASH`.
+//  * It needs `DT_SYMTAB`, `DT_STRTAB` and one of `DT_HASH` / `DT_GNU_HASH`.
 //  * It compares the version it asks for against `DT_VERDEF`, and skips the
 //    comparison entirely when the image defines no versions (`if (!verdef)
 //    versym = 0;`).

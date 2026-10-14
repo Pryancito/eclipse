@@ -470,7 +470,7 @@ fn a_segment_longer_than_the_file_is_refused_by_name() {
 
 #[test]
 fn an_image_with_neither_hash_table_is_refused() {
-    refuses("falta DT_HASH", |img| {
+    refuses("falta DT_HASH y DT_GNU_HASH", |img| {
         for tag in [DT_HASH, DT_GNU_HASH] {
             let slot = dyn_slot(img, tag);
             put64(img, slot, DT_SONAME);
@@ -512,6 +512,19 @@ fn a_version_by_another_name_is_refused() {
         // valid and changes only what the chain is called.
         let (_, name) = dynstr_of_version(img);
         img[name..name + 9].copy_from_slice(b"LINUX_9.9");
+    });
+}
+
+/// `Elf64_Verdef.vd_hash` is the half of the comparison musl never makes: its
+/// `checkver` matches on the name alone, while Go requires the hash to match
+/// too. A definition with a stale or zeroed hash therefore resolves for the
+/// libc and leaves Go with `version == -1`, which matches no symbol — exactly
+/// the kind of image that would pass if only one of the two algorithms ran.
+#[test]
+fn a_version_with_the_wrong_hash_is_refused() {
+    refuses("no encuentra la version LINUX_2.6", |img| {
+        let (def, _) = dynstr_of_version(img);
+        put32(img, def + 8, 0); // vd_hash
     });
 }
 

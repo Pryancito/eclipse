@@ -270,20 +270,51 @@ pub(crate) fn meta_source(
 // ELF verification
 // ---------------------------------------------------------------------------
 
+/// The classic ELF hash, which is what a `Elf64_Verdef.vd_hash` carries.
+///
+/// Computed rather than written down: the constant the Go runtime compares
+/// against is `0x3ae75f6`, and a number copied here would say nothing about
+/// where it comes from. The assertion in [`go_version_index`] pins the two
+/// together.
+fn elf_hash(name: &str) -> u32 {
+    let mut h: u32 = 0;
+    for b in name.bytes() {
+        h = (h << 4).wrapping_add(b as u32);
+        let g = h & 0xf000_0000;
+        if g != 0 {
+            h ^= g >> 24;
+        }
+        h &= !g;
+    }
+    h
+}
+
 /// `runtime.vdsoFindVersion`: the index of the LINUX_2.6 definition in the
 /// `DT_VERDEF` chain, or `None` if the chain does not define it.
 ///
 /// Deliberately not shared with `elf.rs`: that file is musl, this is Go, and
 /// the whole point of running both is that they are two readings of the same
-/// bytes.
+/// bytes. The difference that matters here is `vd_hash`: musl's `checkver`
+/// never looks at it, while Go requires it to match *as well as* the name
+/// (`if def.vd_hash == ver.verHash && ver.version == ...`). A definition with a
+/// stale or zeroed hash therefore resolves for the libc and leaves Go with
+/// `version == -1`, which matches no symbol at all.
 fn go_version_index(img: &[u8], verdef: usize, strtab: usize) -> Option<u16> {
+    let want = elf_hash("LINUX_2.6");
+    assert_eq!(
+        want, 0x3ae_75f6,
+        "el hash ELF de LINUX_2.6 no es el que lleva el runtime de Go \
+         (runtime.vdsoLinuxVersion)"
+    );
     let mut def = verdef;
     loop {
         let flags = u16le(img, def + 2);
         if flags & 1 == 0 {
             // VER_FLG_BASE clear: a real version, not the soname.
             let aux = def + u32le(img, def + 12) as usize;
-            if cstr(img, strtab + u32le(img, aux) as usize) == "LINUX_2.6" {
+            if u32le(img, def + 8) == want
+                && cstr(img, strtab + u32le(img, aux) as usize) == "LINUX_2.6"
+            {
                 return Some(u16le(img, def + 4) & 0x7fff);
             }
         }
@@ -405,17 +436,22 @@ pub(crate) fn verify(img: &[u8]) -> Verified {
     // offset, which is what lets the checks below index `img` directly.
     let strtab = *tags.get(&DT_STRTAB).expect("falta DT_STRTAB") as usize;
     let symtab = *tags.get(&DT_SYMTAB).expect("falta DT_SYMTAB") as usize;
-    // musl reads DT_HASH and nothing else (`if (!strings || !syms || !hashtab)
-    // return 0;`), and it is also the only table that states how many symbols
-    // there are, which is what lets both verifications below walk `.dynsym` by
-    // index. DT_GNU_HASH is a bonus for readers that prefer it -- the Go
-    // runtime is one -- and `--hash-style=both` emits both.
-    let hash = *tags
-        .get(&DT_HASH)
-        .expect("falta DT_HASH: musl no encontraria ningun simbolo (es la unica tabla que mira)")
-        as usize;
-    let _ = DT_GNU_HASH;
-    let nsym = u32le(img, hash + 4) as usize;
+    assert!(
+        tags.contains_key(&DT_HASH) || tags.contains_key(&DT_GNU_HASH),
+        "falta DT_HASH y DT_GNU_HASH: musl no encontraria ningun simbolo"
+    );
+    // How many symbols `.dynsym` holds, which is what lets the Go half below
+    // walk it by index. Neither the dynamic section nor `.dynsym` itself says,
+    // so it comes out of whichever hash table is there, by musl's own two
+    // rules: `nchain` from the classic table, or `count_syms_gnu` from the GNU
+    // one. The second arm borrows the crate's implementation rather than
+    // growing a third copy of it.
+    let nsym = match (tags.get(&DT_HASH), tags.get(&DT_GNU_HASH)) {
+        (Some(&h), _) => u32le(img, h as usize + 4) as usize,
+        (None, Some(&gh)) => elf::count_syms_gnu(img, gh as usize)
+            .expect("DT_GNU_HASH ilegible: no se puede contar .dynsym"),
+        (None, None) => unreachable!("lo acaba de comprobar el assert de arriba"),
+    };
 
     // The version table is NOT optional, and the reason is the Go runtime.
     //
