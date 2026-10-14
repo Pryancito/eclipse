@@ -225,3 +225,83 @@ fn setreuid_with_nothing_to_do_leaves_the_saved_id_alone() {
         "setting the effective id back to the real one is not a new identity"
     );
 }
+
+/// The creation mask: which of the bits a program asks for when it creates
+/// something actually land.
+///
+/// `apply_umask` is the whole of it, and it is on the `open(O_CREAT)`,
+/// `mkdir`, `mknod` and `O_TMPFILE` paths -- every way a process makes a
+/// file. A mutation run replaced its body with `mode`, so the mask was
+/// ignored outright, and all 3109 tests of the crate stayed green: a
+/// `open(path, O_CREAT, 0o666)` under the default `0o022` would have landed
+/// a **world-writable** file where it must land `0o644`.
+///
+/// `set_umask`'s own `& 0o777` had no test either: `umask(2)` takes an int
+/// and only nine bits of it are a mask.
+mod the_creation_mask {
+    use crate::process::LinuxProcess;
+    use rcore_fs_ramfs::RamFS;
+
+    fn a_process_with_umask(mask: u16) -> LinuxProcess {
+        let proc = LinuxProcess::new(RamFS::new(), 0);
+        proc.set_umask(mask);
+        proc
+    }
+
+    /// The default `0o022`: the group and other write bits are the ones the
+    /// mask takes away, and nothing else moves.
+    #[test]
+    fn the_umask_bits_are_the_ones_that_do_not_land() {
+        let proc = a_process_with_umask(0o022);
+        assert_eq!(
+            proc.apply_umask(0o666),
+            0o644,
+            "a file asking for rw-rw-rw-"
+        );
+        assert_eq!(
+            proc.apply_umask(0o777),
+            0o755,
+            "a directory asking for rwxrwxrwx"
+        );
+    }
+
+    /// A mask of zero grants exactly what was asked, which is the case that
+    /// makes the test above about the MASK and not about the constant.
+    #[test]
+    fn a_mask_of_zero_lands_what_was_asked() {
+        let proc = a_process_with_umask(0);
+        assert_eq!(proc.apply_umask(0o666), 0o666);
+        assert_eq!(proc.apply_umask(0o777), 0o777);
+    }
+
+    /// The mask only ever takes bits AWAY: whatever it is and whatever is
+    /// asked for, the answer is a subset of the request and shares no bit
+    /// with the mask. A mask that granted a bit nobody asked for would be a
+    /// file more open than the program that made it ever said.
+    #[test]
+    fn the_mask_can_only_take_bits_away() {
+        for mask in [0u16, 0o002, 0o022, 0o077, 0o777, 0o027] {
+            let proc = a_process_with_umask(mask);
+            for asked in [0o000u16, 0o600, 0o644, 0o666, 0o700, 0o755, 0o777] {
+                let landed = proc.apply_umask(asked);
+                assert_eq!(landed & !asked, 0, "mask {mask:o} added a bit to {asked:o}");
+                assert_eq!(landed & mask, 0, "mask {mask:o} left one of its own bits");
+            }
+        }
+    }
+
+    /// `umask(2)` returns the PREVIOUS mask -- a program reads its own mask
+    /// by setting it and putting it back -- and keeps only the nine
+    /// permission bits of what it is given.
+    #[test]
+    fn setting_the_mask_answers_with_the_old_one_and_keeps_nine_bits() {
+        let proc = a_process_with_umask(0o022);
+        assert_eq!(proc.set_umask(0o077), 0o022, "the previous mask");
+        assert_eq!(proc.umask(), 0o077);
+        // Everything above the bottom nine bits is not a mask: the type bits
+        // of a mode would otherwise sit in it and take permissions away
+        // from every file the process went on to create.
+        assert_eq!(proc.set_umask(0o17777), 0o077);
+        assert_eq!(proc.umask(), 0o777);
+    }
+}
