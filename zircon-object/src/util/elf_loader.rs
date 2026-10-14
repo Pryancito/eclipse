@@ -182,16 +182,25 @@ pub fn check_elf_bounds(data: &[u8]) -> ZxResult {
     let (sh_type_at, sh_offset_at, sh_size_at) = layout.section_fields;
     for entry in sh_table.entries() {
         check_aligned(base.wrapping_add(entry), layout.entry_align)?;
-        let offset = read_le(data, entry + sh_offset_at, layout.offset_width);
-        // `get_shstr_table` slices `input[sh_offset..]` whatever the section
-        // type says, so the offset has to be inside the file even for a
-        // section that stores no bytes.
-        check_range_fits(offset, 0, file_len)?;
         // `.bss` and friends are declared in the file but not stored in it, so
-        // their size says nothing about it.
+        // NEITHER their size NOR their offset says anything about it. The Go
+        // linker is the one that makes this matter: it gives `.noptrbss` a
+        // file offset past the end of the image (1573024 in a 1441976-byte
+        // binary), which is legal -- a `SHT_NOBITS` section has no bytes to
+        // locate -- and which Linux never looks at, because `execve` reads
+        // program headers and ignores the section table outright. Requiring
+        // the offset to be inside the file refused every static Go binary with
+        // `elf: cannot parse ...: INVALID_ARGS`.
+        //
+        // Nothing in this kernel slices by `sh_offset` without a bound of its
+        // own: `section_bytes` returns `&[]` for `SHT_NOBITS` before it looks
+        // at the offset, and `section_data` hands a section to the parser only
+        // once its type is the one asked for. So this check was the belt on
+        // top of the braces, and the belt was the wrong size.
         if read_le(data, entry + sh_type_at, 4) == SHT_NOBITS {
             continue;
         }
+        let offset = read_le(data, entry + sh_offset_at, layout.offset_width);
         let size = read_le(data, entry + sh_size_at, layout.offset_width);
         check_range_fits(offset, size, file_len)?;
     }
@@ -1793,7 +1802,7 @@ mod tests {
     }
 
     #[test]
-    fn a_section_that_stores_no_bytes_is_measured_by_its_offset_alone() {
+    fn a_section_that_stores_no_bytes_is_not_measured_against_the_file() {
         // `.bss` describes memory, not the file: its size says nothing about
         // how many bytes are there.
         let mut img = Image::elf64();
@@ -1805,14 +1814,17 @@ mod tests {
     }
 
     #[test]
-    fn a_section_that_stores_no_bytes_still_needs_its_offset_inside_the_file() {
-        // `get_shstr_table` slices `input[sh_offset..]` whatever the type says.
+    fn a_section_that_stores_no_bytes_may_sit_past_the_end_of_the_file() {
+        // The shape of every static Go binary: the linker puts `.noptrbss` at
+        // a file offset beyond the image, because a section with no bytes in
+        // the file has nothing to locate there. Linux never reads the section
+        // table on `execve` at all; refusing this refused every Go program.
         let mut img = Image::elf64();
         img.shoff(64);
         img.shnum(1);
         img.section_header(64, 0, SHT_NOBITS_U32, 129, 0);
         img.shown(128);
-        assert_eq!(check_elf_bounds(img.bytes()), refused());
+        assert_eq!(check_elf_bounds(img.bytes()), Ok(()));
     }
 
     /// An image with three sections: the null one, the name table, and a
