@@ -87,6 +87,25 @@ impl ScrubReport {
     }
 }
 
+/// One subvolume or snapshot, from [`EclipseFS::list_subvolumes`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubvolInfo {
+    pub id: u64,
+    /// Handle of its root directory.
+    pub root: u64,
+    /// Subvolume holding the entry that names it (0 for the top one).
+    pub parent: u64,
+    /// Handle of the directory holding that entry (0 for the top one).
+    pub dir: u64,
+    pub name: String,
+    pub read_only: bool,
+    /// Subvolume it is a snapshot of (0 if none).
+    pub snapshot_of: u64,
+    /// Generation the snapshot was taken at.
+    pub snapshot_gen: u64,
+    pub created: (u64, u32),
+}
+
 enum Driver {
     V3(EclipseFsV3),
     V4(CowFs),
@@ -269,6 +288,81 @@ impl EclipseFS {
     /// writable mount.
     pub fn check(&mut self) -> Result<CheckReport> {
         dispatch!(self, fs => fs.check())
+    }
+
+    fn cow(&mut self) -> Result<&mut CowFs> {
+        match &mut self.driver {
+            Driver::V3(_) => Err(Error::Unsupported("needs format v0.4")),
+            Driver::V4(fs) => Ok(fs),
+        }
+    }
+
+    /// New empty subvolume named `name` in `dir`; returns its root
+    /// directory (btrfs `subvolume create`).
+    pub fn create_subvolume(&mut self, dir: u64, name: &str) -> Result<u64> {
+        self.cow()?.create_subvolume(dir, name)
+    }
+
+    /// Snapshot of the subvolume whose root directory is `src`, named `name`
+    /// in `dir`; returns its root directory. It shares every block with the
+    /// source until either changes. Subvolumes nested in the source are not
+    /// part of it (as on btrfs).
+    pub fn snapshot(&mut self, src: u64, dir: u64, name: &str, read_only: bool) -> Result<u64> {
+        self.cow()?.snapshot(src, dir, name, read_only)
+    }
+
+    /// Delete the subvolume named `name` in `dir`, whatever it holds (but
+    /// not while other subvolumes are nested in it).
+    pub fn delete_subvolume(&mut self, dir: u64, name: &str) -> Result<()> {
+        self.cow()?.delete_subvolume(dir, name)
+    }
+
+    /// Id of the subvolume inode `ino` lives in (5 for the top one).
+    pub fn subvolume_of(&self, ino: u64) -> u64 {
+        crate::cowfmt::split(ino).0
+    }
+
+    pub fn list_subvolumes(&mut self) -> Result<Vec<SubvolInfo>> {
+        self.cow()?.list_subvolumes()
+    }
+
+    /// Make subvolume `id` read-only or writable again.
+    pub fn set_subvolume_read_only(&mut self, id: u64, read_only: bool) -> Result<()> {
+        self.cow()?.set_subvolume_read_only(id, read_only)
+    }
+
+    /// Subvolume mounted as `/` from the next mount on.
+    pub fn set_default_subvolume(&mut self, id: u64) -> Result<()> {
+        self.cow()?.set_default_subvolume(id)
+    }
+
+    /// Make `dst` share the blocks of `src` (reflink, `FICLONERANGE`).
+    /// Offsets are block-aligned; `len` is too unless the range ends at the
+    /// end of `src` (0 means up to there). Works across subvolumes. Returns
+    /// the bytes cloned.
+    pub fn clone_range(
+        &mut self,
+        src: u64,
+        src_off: u64,
+        dst: u64,
+        dst_off: u64,
+        len: u64,
+    ) -> Result<u64> {
+        self.cow()?.clone_range(src, src_off, dst, dst_off, len)
+    }
+
+    /// `FIDEDUPERANGE`: if the two ranges hold the same bytes, make `dst`
+    /// share the blocks of `src`. Returns the bytes deduplicated (0 if
+    /// they differ), at most 16 MiB per call.
+    pub fn dedupe_range(
+        &mut self,
+        src: u64,
+        src_off: u64,
+        dst: u64,
+        dst_off: u64,
+        len: u64,
+    ) -> Result<u64> {
+        self.cow()?.dedupe_range(src, src_off, dst, dst_off, len)
     }
 
     /// Read every tree node and data block from the device and verify its

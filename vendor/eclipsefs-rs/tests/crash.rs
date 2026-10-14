@@ -161,10 +161,13 @@ fn workload(seed: u64, ops: usize, size: usize, format: Mkfs, cow: bool) -> Run 
     let mut dirs = vec![root];
     let mut files: Vec<(u64, String)> = Vec::new();
     let mut done = 0;
+    // Successful snapshots and reflinks (v0.4), so the run is known to
+    // exercise them.
+    let (mut snaps, mut clones) = (0, 0);
     while done < ops {
         let d = dirs[rng.below(dirs.len() as u64) as usize];
         let name = format!("e{}", rng.below(12));
-        let ok = match rng.below(14) {
+        let ok = match rng.below(if cow { 17 } else { 14 }) {
             0 | 1 => fs.create(d, &name, FileKind::Regular, 0o644, 0).is_ok(),
             2 => match fs.create(d, &name, FileKind::Dir, 0o755, 0) {
                 Ok(ino) => {
@@ -215,10 +218,43 @@ fn workload(seed: u64, ops: usize, size: usize, format: Mkfs, cow: bool) -> Run 
                 }
                 _ => false,
             },
-            _ => {
+            13 => {
                 fs.sync().unwrap();
                 syncs.push((rec.events(), done));
                 false
+            }
+            // v0.4 only: snapshots of everything, reflinks, deleting snapshots.
+            14 => {
+                let name = format!("snap{}", rng.below(3));
+                let ok = fs.snapshot(root, root, &name, rng.below(2) == 0).is_ok();
+                snaps += usize::from(ok);
+                ok
+            }
+            15 if !files.is_empty() => {
+                // Reflink a file that was written to over another name in
+                // its directory, creating the target first.
+                let (sd, sname) = files[rng.below(files.len() as u64) as usize].clone();
+                let nn = format!("e{}", rng.below(12));
+                let regular =
+                    |fs: &mut EclipseFS, x: u64| fs.stat(x).unwrap().kind == FileKind::Regular;
+                match (fs.lookup(sd, &sname), fs.lookup(sd, &nn)) {
+                    (Ok(src), Ok(dst))
+                        if src != dst && regular(&mut fs, src) && regular(&mut fs, dst) =>
+                    {
+                        // Whole blocks, so any target size works.
+                        let len = fs.stat(src).unwrap().size / 4096 * 4096;
+                        let ok = len > 0 && fs.clone_range(src, 0, dst, 0, len).is_ok();
+                        clones += usize::from(ok);
+                        ok
+                    }
+                    (Ok(_), Err(_)) => fs.create(sd, &nn, FileKind::Regular, 0o644, 0).is_ok(),
+                    _ => false,
+                }
+            }
+            15 => false,
+            _ => {
+                let name = format!("snap{}", rng.below(3));
+                fs.delete_subvolume(root, &name).is_ok()
             }
         };
         // Directories that were removed or moved under a removed one are
@@ -228,6 +264,14 @@ fn workload(seed: u64, ops: usize, size: usize, format: Mkfs, cow: bool) -> Run 
             done += 1;
             states.push(hash(&snapshot(&mut fs)));
         }
+    }
+    if cow {
+        assert!(
+            snaps > 0 && clones > 0,
+            "{} snapshots, {} clones",
+            snaps,
+            clones
+        );
     }
     drop(fs);
     let log = rec.log.lock().unwrap().clone();

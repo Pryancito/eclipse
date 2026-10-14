@@ -50,6 +50,38 @@ pub const FS_TREE: u64 = 5;
 pub const CSUM_TREE: u64 = 7;
 /// First inode number of every subvolume: its root directory.
 pub const FIRST_INO: u64 = 256;
+/// Subvolumes and snapshots created later get ids from here on.
+pub const FIRST_SUBVOL: u64 = 256;
+/// Largest subvolume id (it has to fit in the top bits of a handle).
+pub const MAX_SUBVOL: u64 = (1 << (64 - SUBVOL_SHIFT)) - 1;
+/// Inode handles carry the subvolume above this bit: `id << 40 | ino`, and
+/// plain `ino` for the top subvolume (5), so its handles are its inode
+/// numbers.
+pub const SUBVOL_SHIFT: u32 = 40;
+const INO_MASK: u64 = (1 << SUBVOL_SHIFT) - 1;
+
+/// The handle of inode `ino` of subvolume `subvol`.
+pub fn handle(subvol: u64, ino: u64) -> u64 {
+    if subvol == FS_TREE {
+        ino
+    } else {
+        (subvol << SUBVOL_SHIFT) | ino
+    }
+}
+
+/// (subvolume, inode) of a handle.
+pub fn split(h: u64) -> (u64, u64) {
+    match h >> SUBVOL_SHIFT {
+        0 => (FS_TREE, h),
+        sv => (sv, h & INO_MASK),
+    }
+}
+
+/// Whether a directory entry's target is another subvolume (a handle, not
+/// a local inode number).
+pub fn is_link(ino: u64) -> bool {
+    ino > INO_MASK
+}
 
 pub const INODE_ITEM: u8 = 1;
 pub const INODE_REF: u8 = 12;
@@ -59,6 +91,9 @@ pub const DIR_INDEX: u8 = 96;
 pub const EXTENT_DATA: u8 = 108;
 pub const CSUM_ITEM: u8 = 128;
 pub const ROOT_ITEM: u8 = 132;
+/// `(subvolume, ROOT_BACKREF, parent subvolume)` in the root tree -> the
+/// directory entry naming it there (directory, index, name).
+pub const ROOT_BACKREF: u8 = 144;
 pub const REF_ITEM: u8 = 200;
 
 /// Largest file kept inside its extent item.

@@ -43,7 +43,7 @@ pub mod v3;
 
 pub use device::BlockDevice;
 pub use format::FileKind;
-pub use fs::{CheckReport, DirEntry, EclipseFS, FsStat, InodeStat, ScrubReport};
+pub use fs::{CheckReport, DirEntry, EclipseFS, FsStat, InodeStat, ScrubReport, SubvolInfo};
 
 /// Version of the on-disk format new filesystems get (v0.4.0).
 pub const ECLIPSEFS_VERSION: u32 = cowfmt::VERSION4;

@@ -65,6 +65,19 @@ Paso 1 de la paridad con btrfs. Todo vive en árboles B+ copy-on-write
   bloque también).
 - Espacio reservado para metadatos (1/64 del disco), así un disco lleno da
   `ENOSPC` en los datos sin dejar el árbol a medias.
+- **Subvolúmenes y snapshots** (fase 3): `create_subvolume`,
+  `snapshot(src, dir, nombre, solo_lectura)`, `delete_subvolume`,
+  `list_subvolumes`, `set_subvolume_read_only` y `set_default_subvolume`
+  (el que se monta como `/`). Cada subvolumen es un árbol con sus propios
+  inodos; aparece como un directorio y el árbol raíz guarda un backref
+  (`ROOT_BACKREF`) con su nombre. Un snapshot comparte la raíz del árbol
+  (cuesta unos pocos nodos) y cada lado copia solo lo que cambia. Como en
+  btrfs, los subvolúmenes anidados no entran en el snapshot y no se puede
+  enlazar ni renombrar entre subvolúmenes. Los números de inodo de la API son
+  *handles*: `id << 40 | inodo`, y el inodo tal cual en el subvolumen 5.
+- **Reflinks y dedupe**: `clone_range` (`FICLONERANGE`, también entre
+  subvolúmenes) y `dedupe_range` (`FIDEDUPERANGE`, solo si los bytes son
+  iguales); los bloques quedan compartidos hasta que uno de los dos escribe.
 - `EclipseFS::mount` detecta la versión: las imágenes v0.3 siguen montando con
   su driver (`v3.rs`). `mkfs::format_v3` sigue disponible.
 
@@ -103,7 +116,7 @@ grupo k (32768 bloques = 128 MiB)
 
 1. ~~Núcleo CoW: árbol B+, refcounts, datos nunca sobrescritos~~ (v0.4).
 2. ~~Checksums de datos y scrub~~ (la reparación llega con DUP/RAID en la fase 7).
-3. Subvolúmenes, snapshots rw/ro, reflinks y dedupe.
+3. ~~Subvolúmenes, snapshots rw/ro, reflinks y dedupe~~.
 4. xattrs/ACL, atributos (inmutable, append, nocow), fallocate y huecos.
 5. Compresión zlib, lz4 y zstd.
 6. send/receive incremental y cuotas.
@@ -133,6 +146,10 @@ cargo test --release -p eclipsefs --features std
 - `tests/csum.rs`: bits podridos en datos y en nodos, detectados al leer y
   por `scrub`; los checksums siguen a sobrescrituras, truncados y borrados.
   Los tests de crash también pasan `scrub` en cada imagen.
+- `tests/subvol.rs`: subvolúmenes, snapshots aislados en ambos sentidos,
+  snapshots de solo lectura y anidados, subvolumen por defecto, reflinks y
+  dedupe. La carga de los tests de crash incluye snapshots, borrado de
+  snapshots y reflinks.
 - Los tests que dependen del formato corren en las dos versiones (`*_v3`).
 - `tests/performance.rs`: las mismas cargas sobre EclipseFS y btrfs, con tiempo
   y bytes leídos/escritos en el dispositivo. `scripts/eclipsefs-bench.sh` las
