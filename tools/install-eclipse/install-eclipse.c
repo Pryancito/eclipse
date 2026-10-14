@@ -1174,19 +1174,69 @@ static int prompt_layout(struct config *cfg) {
     return 0;
 }
 
+/* Eclipse arranca ÚNICAMENTE por UEFI: su único cargador es rboot, que es un
+ * `BootX64.efi`, y el MBR que escribe este instalador lleva la tabla y la
+ * firma 0x55AA pero NINGÚN código de arranque, porque no hay cargador de BIOS
+ * en todo el árbol. Recomendar MBR por haber arrancado el medio en legacy --
+ * que es lo que se hacía -- deja un disco que el firmware no ofrece arrancar,
+ * y el usuario lo descubre al reiniciar.
+ *
+ * Esto se imprime SIEMPRE, antes de mirar si la tabla venía de la línea de
+ * órdenes: `--gpt` en una máquina arrancada en legacy instala un disco que
+ * esa máquina no va a ofrecer arrancar, y ése es justo el caso en el que el
+ * aviso hace falta. Lo que hay que cambiar es el modo del firmware, no la
+ * tabla de particiones. */
+static void warn_boot_environment(int running_on_efi) {
+    log("Entorno de arranque detectado: %s", running_on_efi ? "EFI/UEFI" : "BIOS/Legacy");
+    if (running_on_efi) {
+        return;
+    }
+    log(COLOR_YELLOW COLOR_BOLD
+        "AVISO: Eclipse arranca únicamente por UEFI; no existe un cargador para BIOS."
+        COLOR_RESET);
+    log(COLOR_YELLOW
+        "  Arranque el medio de instalación en modo UEFI (desactive CSM/Legacy en el"
+        COLOR_RESET);
+    log(COLOR_YELLOW
+        "  firmware) o el disco instalado no aparecerá como opción de arranque."
+        COLOR_RESET);
+}
+
+/* El aviso de MBR va en TODA salida de `prompt_table` -- la de `--mbr`, la de
+ * `--yes` y la del menú -- porque el disco que queda es el mismo en los tres
+ * casos. */
+static void warn_if_mbr(enum table_mode table) {
+    if (table != TABLE_MBR) {
+        return;
+    }
+    /* La partición 1 se marca de tipo 0xEF (EFI System), así que un firmware
+     * en modo UEFI puede arrancar este disco; muchos lo hacen, pero no todos,
+     * y en modo BIOS no arranca ninguno. */
+    log(COLOR_YELLOW COLOR_BOLD
+        "AVISO: con MBR el disco sólo arranca si el firmware está en modo UEFI y acepta"
+        COLOR_RESET);
+    log(COLOR_YELLOW "  una ESP en MBR. GPT/UEFI es lo seguro." COLOR_RESET);
+}
+
 static int prompt_table(struct config *cfg, int running_on_efi) {
+    warn_boot_environment(running_on_efi);
+
     if (cfg->table_set) {
         log("Tabla de particiones preseleccionada por CLI: %s", table_label(cfg->table));
+        warn_if_mbr(cfg->table);
         return 0;
     }
 
-    enum table_mode suggested = running_on_efi ? TABLE_GPT : TABLE_MBR;
-    log("Entorno de arranque detectado: %s", running_on_efi ? "EFI/UEFI" : "BIOS/Legacy");
+    /* La sugerencia es GPT/UEFI siempre, haya arrancado el medio como haya
+     * arrancado: es la única tabla con la que el disco instalado aparece como
+     * opción de arranque. */
+    enum table_mode suggested = TABLE_GPT;
     log("Se recomienda %s.", table_label(suggested));
 
     if (cfg->auto_yes) {
         cfg->table = suggested;
         log("--yes activo: usando tabla sugerida (%s).", table_label(cfg->table));
+        warn_if_mbr(cfg->table);
         return 0;
     }
 
@@ -1197,6 +1247,7 @@ static int prompt_table(struct config *cfg, int running_on_efi) {
     log("Opción recomendada [%d]:", suggested == TABLE_MBR ? 1 : 2);
     if (safe_flush_input(input, sizeof(input)) != 0 || input[0] == '\0') {
         cfg->table = suggested;
+        warn_if_mbr(cfg->table);
         return 0;
     }
 
@@ -1211,6 +1262,8 @@ static int prompt_table(struct config *cfg, int running_on_efi) {
             cfg->table = suggested;
         }
     }
+
+    warn_if_mbr(cfg->table);
     return 0;
 }
 
@@ -1690,7 +1743,11 @@ static int write_gpt_partition_table_native(const char *disk_path, const struct 
         entries[i].last_lba = end_lba;
         entries[i].attributes = 0;
         {
-            uint16_t part_name[36];
+            /* A cero antes de rellenar: `utf16le_name` termina en el NUL y
+             * deja el resto como esté, y lo que había aquí era basura de la
+             * pila que se copiaba tal cual a los 72 bytes del nombre de la
+             * partición en la tabla. */
+            uint16_t part_name[36] = {0};
             utf16le_name(parts[i].name, part_name);
             memcpy(entries[i].name, part_name, sizeof(part_name));
         }
@@ -2923,6 +2980,137 @@ static int find_mount_device(const char *mountpoint, char *dev_out, size_t dev_s
     return found;
 }
 
+/* Lo que se imprime cuando falta un payload.
+ *
+ * El mensaje de antes era una linea con la ruta y nada mas, y la causa real
+ * casi nunca es que el fichero se haya perdido: es que el instalador se esta
+ * corriendo DESDE EL SISTEMA YA INSTALADO en vez de desde el medio live. Los
+ * tres payloads viajan solo en el initramfs del medio (xtask los copia a
+ * `live_root/boot` y la raiz instalada se deja limpia a proposito), asi que
+ * dentro de un Eclipse instalado no hay con que instalar y nunca lo habra.
+ *
+ * Misma leccion que el NOT_FOUND mudo de rboot: con la ruta Y el listado del
+ * directorio, la respuesta sale de la propia pantalla. */
+/* Lista en `out` los puntos de montaje que viven en particiones de `disk_path`.
+ *
+ * Nadie quiere instalar encima del medio del que acaba de arrancar, y el aviso
+ * de «dispositivo extraíble» que ya había no distingue un pendrive cualquiera
+ * del pendrive QUE ESTÁS USANDO: se dice que sí sin pensarlo, la instalación
+ * se come la sesión live, y lo que queda es un medio que ya no instala nada.
+ *
+ * Se compara por prefijo (`/dev/sda` contra `/dev/sda1`) porque es como se
+ * nombran las particiones de un disco, y el /proc/mounts del kernel ya da el
+ * dispositivo de cada montaje. */
+static int mountpoints_on_disk(const char *disk_path, char *out, size_t out_size) {
+    FILE *fp;
+    char line[1024];
+    size_t disk_len;
+    int n = 0;
+
+    if (out != NULL && out_size > 0) {
+        out[0] = '\0';
+    }
+    if (disk_path == NULL) {
+        return 0;
+    }
+    disk_len = strlen(disk_path);
+    fp = fopen("/proc/mounts", "r");
+    if (fp == NULL) {
+        return 0;
+    }
+    while (fgets(line, sizeof(line), fp) != NULL) {
+        char src[256];
+        char tgt[256];
+        if (sscanf(line, "%255s %255s", src, tgt) != 2) {
+            continue;
+        }
+        if (strncmp(src, disk_path, disk_len) != 0) {
+            continue;
+        }
+        /* `/dev/sda` contra `/dev/sdb1`: el prefijo coincide sólo si lo que
+         * sigue es el número de partición, o nada. */
+        if (src[disk_len] != '\0' && (src[disk_len] < '0' || src[disk_len] > '9')) {
+            continue;
+        }
+        n++;
+        if (out != NULL && out_size > 0) {
+            size_t usado = strlen(out);
+            /* Con precisión explícita: así el compilador ve que lo que se
+             * añade cabe, y no hay aviso de truncado en cada vuelta. */
+            snprintf(out + usado, out_size - usado, "%s%.63s en %.95s",
+                     (usado > 0) ? ", " : "", src, tgt);
+        }
+    }
+    fclose(fp);
+    return n;
+}
+
+static void report_missing_payload(const char *path) {
+    char dir[256];
+    const char *slash;
+    char root_dev[160];
+    DIR *d;
+
+    log(COLOR_RED COLOR_BOLD "ERROR: No se encontró %s" COLOR_RESET, path);
+
+    slash = strrchr(path, '/');
+    if (slash == NULL || slash == path) {
+        snprintf(dir, sizeof(dir), "/");
+    } else {
+        size_t len = (size_t)(slash - path);
+        if (len >= sizeof(dir)) {
+            len = sizeof(dir) - 1;
+        }
+        memcpy(dir, path, len);
+        dir[len] = '\0';
+    }
+
+    d = opendir(dir);
+    if (d == NULL) {
+        log("  %s no se puede leer (%s).", dir, strerror(errno));
+    } else {
+        struct dirent *e;
+        char linea[512];
+        int n = 0;
+
+        snprintf(linea, sizeof(linea), "  %s contiene:", dir);
+        while ((e = readdir(d)) != NULL) {
+            size_t usado;
+            if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0) {
+                continue;
+            }
+            n++;
+            if (n > 16) {
+                continue;
+            }
+            usado = strlen(linea);
+            snprintf(linea + usado, sizeof(linea) - usado, " %s", e->d_name);
+        }
+        closedir(d);
+        if (n == 0) {
+            log("  %s está vacío.", dir);
+        } else {
+            log("%s%s", linea, (n > 16) ? " ..." : "");
+        }
+    }
+
+    /* La raiz de un medio live es el propio initramfs, que no sale de
+     * /proc/mounts como un /dev/... Si ahi hay un dispositivo de bloques, se
+     * esta corriendo desde un sistema instalado. */
+    if (find_mount_device("/", root_dev, sizeof(root_dev)) == 0 &&
+        strncmp(root_dev, "/dev/", 5) == 0) {
+        log(COLOR_YELLOW COLOR_BOLD
+            "AVISO: la raíz (/) es %s, o sea un Eclipse YA INSTALADO, no el medio live."
+            COLOR_RESET, root_dev);
+        log(COLOR_YELLOW
+            "  Las imágenes de instalación viajan sólo dentro del medio de instalación;"
+            COLOR_RESET);
+        log(COLOR_YELLOW
+            "  la raíz instalada se deja sin ellas a propósito. Arranque el USB o el ISO."
+            COLOR_RESET);
+    }
+}
+
 static int run_upgrade(const char *disk_path, int dry_run) {
     struct discovered_partitions parts;
     char efi_dev[160];
@@ -2950,7 +3138,8 @@ static int run_upgrade(const char *disk_path, int dry_run) {
         src_mnt = "/boot/efi-staging";
     } else {
         if (!struct_file_exists(EFI_IMAGE_GZ)) {
-            log(COLOR_RED COLOR_BOLD "ERROR: No se encontró %s (fuente del bootloader/kernel)." COLOR_RESET, EFI_IMAGE_GZ);
+            report_missing_payload(EFI_IMAGE_GZ);
+            log("  Es la fuente del cargador y del kernel: sin ella no hay actualización.");
             return -1;
         }
 
@@ -3159,6 +3348,32 @@ int main(int argc, char **argv) {
         log(COLOR_GREEN "Modo actualización: copia selectiva de archivos (sin dd ni reparticionado)." COLOR_RESET);
     }
 
+    {
+        char en_uso[512];
+        if (mountpoints_on_disk(cfg.disk_path, en_uso, sizeof(en_uso)) > 0) {
+            log(COLOR_RED COLOR_BOLD
+                "ADVERTENCIA: %s es el medio del que ha arrancado: %s."
+                COLOR_RESET, cfg.disk_path, en_uso);
+            log(COLOR_YELLOW
+                "  Instalar aquí se lleva por delante la sesión live, y el medio deja de"
+                COLOR_RESET);
+            log(COLOR_YELLOW
+                "  servir para instalar. Lo normal es elegir el disco interno."
+                COLOR_RESET);
+            if (cfg.auto_yes) {
+                log(COLOR_RED COLOR_BOLD
+                    "ERROR: con --yes no se instala sobre el propio medio de arranque."
+                    COLOR_RESET);
+                log("  Indique otro disco con --disk.");
+                return 2;
+            }
+            if (!ask_yes_no("¿Instalar de todos modos sobre el medio de arranque? (y/N):", 0, 0)) {
+                log("Instalación cancelada por el usuario.");
+                return 2;
+            }
+        }
+    }
+
     int removable = is_removable_disk(cfg.disk_path);
     if (removable) {
         log(COLOR_YELLOW COLOR_BOLD "ADVERTENCIA: %s es un dispositivo extraíble (/sys/block/.../removable=1)." COLOR_RESET,
@@ -3175,11 +3390,11 @@ int main(int argc, char **argv) {
 
     if (cfg.mode == MODE_NEW) {
         if (!struct_file_exists(EFI_IMAGE_GZ)) {
-            log(COLOR_RED COLOR_BOLD "ERROR: No se encontró %s" COLOR_RESET, EFI_IMAGE_GZ);
+            report_missing_payload(EFI_IMAGE_GZ);
             return 1;
         }
         if (!struct_file_exists(ROOTFS_IMAGE_GZ)) {
-            log(COLOR_RED COLOR_BOLD "ERROR: No se encontró %s" COLOR_RESET, ROOTFS_IMAGE_GZ);
+            report_missing_payload(ROOTFS_IMAGE_GZ);
             return 1;
         }
         if (verify_sha256_file(EFI_IMAGE_GZ) != 0) {
@@ -3190,7 +3405,7 @@ int main(int argc, char **argv) {
         }
     } else {
         if (!struct_file_exists(EFI_IMAGE_GZ)) {
-            log(COLOR_RED COLOR_BOLD "ERROR: No se encontró %s" COLOR_RESET, EFI_IMAGE_GZ);
+            report_missing_payload(EFI_IMAGE_GZ);
             return 1;
         }
         if (verify_sha256_file(EFI_IMAGE_GZ) != 0) {

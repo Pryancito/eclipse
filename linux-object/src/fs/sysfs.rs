@@ -77,6 +77,9 @@ mod ino {
     pub const DEV: usize = 20;
     pub const DEV_CHAR: usize = 21;
     pub const POWER: usize = 22;
+    pub const FIRMWARE: usize = 24;
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    pub const FIRMWARE_EFI: usize = 25;
 
     /// Plus the device's index on the bus.
     pub const PCI_DEV: usize = 0x1000;
@@ -221,8 +224,10 @@ fn block_size_sectors(index: usize) -> Option<usize> {
 struct SysRootINode;
 
 impl SysRootINode {
-    fn entries() -> [&'static str; 6] {
-        ["class", "block", "bus", "dev", "devices", "power"]
+    fn entries() -> [&'static str; 7] {
+        [
+            "class", "block", "bus", "dev", "devices", "power", "firmware",
+        ]
     }
 }
 
@@ -265,10 +270,133 @@ impl INode for SysRootINode {
             "dev" => Ok(Arc::new(SysDevDirINode)),
             "devices" => Ok(Arc::new(SysDevicesDirINode)),
             "power" => Ok(Arc::new(SysPowerDirINode)),
+            "firmware" => Ok(Arc::new(SysFirmwareDirINode)),
             _ => Err(FsError::EntryNotFound),
         }
     }
 
+    fn get_entry(&self, id: usize) -> Result<String> {
+        nth_entry(id, &Self::entries())
+    }
+}
+
+/// `/sys/firmware`: how the machine was booted.
+///
+/// Every installer on earth asks this directory one question -- "is there an
+/// `efi/` in here?" -- and partitions the disk accordingly. Eclipse had no
+/// `/sys/firmware` at all, so the answer was always "no", and
+/// `install-eclipse` recommended an MBR/BIOS layout on a machine that had
+/// just been booted by UEFI and can only ever be booted by UEFI. The disk it
+/// wrote had no BIOS boot code to run (rboot is a `BootX64.efi`, there is no
+/// BIOS loader anywhere in this tree), so the firmware offered no way to boot
+/// it.
+struct SysFirmwareDirINode;
+
+impl SysFirmwareDirINode {
+    /// Both loaders in this tree are UEFI applications -- rboot
+    /// (`BootX64.efi`) on x86_64 and the prebuilt rayboot
+    /// (`bootaa64.efi`, staged by `cargo image` and run under
+    /// `QEMU_EFI.fd`) on aarch64 -- so on either architecture a running
+    /// kernel was booted by UEFI and `efi/` is always here. riscv64 is
+    /// booted by QEMU itself (`-kernel` + `-initrd`) with no firmware in
+    /// the middle, and gets an empty `/sys/firmware`, which is the truthful
+    /// answer rather than a guess.
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    const ENTRIES: &'static [&'static str] = &["efi"];
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    const ENTRIES: &'static [&'static str] = &[];
+}
+
+impl INode for SysFirmwareDirINode {
+    fn read_at(&self, _offset: usize, _buf: &mut [u8]) -> Result<usize> {
+        Ok(0)
+    }
+    fn write_at(&self, _offset: usize, _buf: &[u8]) -> Result<usize> {
+        Err(FsError::NotSupported)
+    }
+    fn poll(&self) -> Result<PollStatus> {
+        Ok(PollStatus {
+            read: true,
+            write: false,
+            error: false,
+            hangup: false,
+        })
+    }
+    fn metadata(&self) -> Result<Metadata> {
+        Ok(dir_metadata(ino::FIRMWARE))
+    }
+    fn as_any_ref(&self) -> &dyn Any {
+        self
+    }
+    fn fs(&self) -> Arc<dyn FileSystem> {
+        Arc::new(SysFS)
+    }
+    fn find(&self, name: &str) -> Result<Arc<dyn INode>> {
+        match name {
+            "." => Ok(Arc::new(SysFirmwareDirINode)),
+            ".." => Ok(SYS_ROOT.clone()),
+            #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+            "efi" => Ok(Arc::new(SysFirmwareEfiDirINode)),
+            _ => Err(FsError::EntryNotFound),
+        }
+    }
+    fn get_entry(&self, id: usize) -> Result<String> {
+        nth_entry(id, Self::ENTRIES)
+    }
+}
+
+/// `/sys/firmware/efi`: booted by UEFI.
+///
+/// Linux puts the firmware's tables and the variable store under here. What
+/// is worth exposing is what callers actually read: the directory's own
+/// existence, and `fw_platform_size`, which says whether the firmware is the
+/// 64-bit or the 32-bit flavour (both loaders are 64-bit UEFI
+/// applications, so it is always 64). `efivars/` is deliberately absent: an empty variable
+/// store would read as "UEFI with no boot entries", which is worse than not
+/// offering it.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+struct SysFirmwareEfiDirINode;
+
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+impl SysFirmwareEfiDirINode {
+    fn entries() -> [&'static str; 1] {
+        ["fw_platform_size"]
+    }
+}
+
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+impl INode for SysFirmwareEfiDirINode {
+    fn read_at(&self, _offset: usize, _buf: &mut [u8]) -> Result<usize> {
+        Ok(0)
+    }
+    fn write_at(&self, _offset: usize, _buf: &[u8]) -> Result<usize> {
+        Err(FsError::NotSupported)
+    }
+    fn poll(&self) -> Result<PollStatus> {
+        Ok(PollStatus {
+            read: true,
+            write: false,
+            error: false,
+            hangup: false,
+        })
+    }
+    fn metadata(&self) -> Result<Metadata> {
+        Ok(dir_metadata(ino::FIRMWARE_EFI))
+    }
+    fn as_any_ref(&self) -> &dyn Any {
+        self
+    }
+    fn fs(&self) -> Arc<dyn FileSystem> {
+        Arc::new(SysFS)
+    }
+    fn find(&self, name: &str) -> Result<Arc<dyn INode>> {
+        match name {
+            "." => Ok(Arc::new(SysFirmwareEfiDirINode)),
+            ".." => Ok(Arc::new(SysFirmwareDirINode)),
+            "fw_platform_size" => Ok(Arc::new(Pseudo::new("64\n", FileType::File))),
+            _ => Err(FsError::EntryNotFound),
+        }
+    }
     fn get_entry(&self, id: usize) -> Result<String> {
         nth_entry(id, &Self::entries())
     }
@@ -3624,6 +3752,34 @@ mod tree_tests {
         assert_eq!(block_index_by_name("sda"), Some(0));
         assert_eq!(block_index_by_name("sdaa"), Some(26));
         assert_eq!(block_index_by_name("sdaaa"), None);
+    }
+
+    #[test]
+    fn el_arranque_por_uefi_se_anuncia_en_sys_firmware_efi() {
+        // Lo que mira todo instalador para decidir la tabla de particiones.
+        // Los dos cargadores del arbol son aplicaciones UEFI -- rboot en
+        // x86_64 y rayboot en aarch64 -- asi que en las dos esto tiene que
+        // estar; sin ello `install-eclipse` recomienda MBR/BIOS y escribe un
+        // disco que el firmware no ofrece arrancar.
+        let _bus = test_bus::with(vec![]);
+        let firmware = SYS_ROOT.lookup_follow("firmware", 4).unwrap();
+        let listed = listing(&firmware);
+
+        if cfg!(any(target_arch = "x86_64", target_arch = "aarch64")) {
+            assert!(listed.contains(&String::from("efi")), "{:?}", listed);
+            let efi = SYS_ROOT.lookup_follow("firmware/efi", 4).unwrap();
+            assert_eq!(efi.metadata().unwrap().type_, FileType::Dir);
+            let size = SYS_ROOT
+                .lookup_follow("firmware/efi/fw_platform_size", 4)
+                .unwrap();
+            assert_eq!(contents(&size), b"64\n");
+        } else {
+            // riscv64 no arranca por UEFI (lo carga QEMU con `-kernel`):
+            // el directorio existe vacio, que es la respuesta honesta, no un
+            // `efi` de mentira.
+            assert!(!listed.contains(&String::from("efi")), "{:?}", listed);
+            assert!(SYS_ROOT.lookup_follow("firmware/efi", 4).is_err());
+        }
     }
 
     #[test]
