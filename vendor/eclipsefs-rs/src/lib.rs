@@ -1,23 +1,18 @@
 //! EclipseFS filesystem driver (no_std + alloc).
 //!
 //! The on-disk successor of `eclipsefs-lib` from eclipse-old (v0.3.0), rebuilt
-//! as a block-device filesystem that can be mounted read/write as a root:
+//! as a block-device filesystem that can be mounted read/write as a root.
 //!
-//! - **Extent-based files** (ext4/XFS): every file maps logical blocks to
-//!   physical runs through an [`extent::ExtentTree`]; six extents live in the
-//!   inode, the rest in a checksummed overflow chain.
-//! - **Allocation groups** (XFS): the device is split into groups of
-//!   [`format::GROUP_BLOCKS`] blocks, each with its own free-space bitmap and a
-//!   backup superblock, so growing the filesystem is adding groups.
-//! - **Goal-directed allocation**: a file's next blocks are searched for right
-//!   after its previous ones, which keeps sequential files in one extent.
-//! - **Checksums** (CRC32) on the superblock, every inode record and every
-//!   extent block.
-//! - **Metadata journal** ([`journal`]): every operation survives a crash
-//!   whole or not at all; file data is written before the metadata that
-//!   points at it.
-//! - Inline symlink targets, sparse files, hard links, rename with
-//!   directory-cycle checks and auto-grow to the device size.
+//! New filesystems use format v0.4 ([`cow`]): btrfs-style copy-on-write B+
+//! trees ([`btree`]) keyed by `(objectid, type, offset)`, with lazy
+//! reference counts ([`space`]) so trees and extents can be shared, CRC32C
+//! on every node, small files inline in the tree, and atomic commits:
+//! neither metadata nor file data is overwritten once committed, so a crash
+//! leaves the previous or the next state, file contents included.
+//!
+//! Images in the older v0.3 format ([`v3`]: extent-mapped inode table,
+//! allocation-group bitmaps, metadata journal, in-place updates) still
+//! mount; [`EclipseFS`] picks the driver from the superblock.
 //!
 //! The public API ([`EclipseFS`], [`BlockDevice`], [`mkfs`], [`Error`],
 //! [`FileKind`], [`InodeStat`], [`DirEntry`], [`FsStat`]) mirrors the one the
@@ -33,6 +28,9 @@ extern crate alloc;
 extern crate log;
 
 pub mod blocks;
+pub mod btree;
+pub mod cow;
+pub mod cowfmt;
 pub mod crc;
 pub mod device;
 pub mod extent;
@@ -40,13 +38,15 @@ pub mod format;
 pub mod fs;
 pub mod journal;
 pub mod mkfs;
+pub mod space;
+pub mod v3;
 
 pub use device::BlockDevice;
 pub use format::FileKind;
 pub use fs::{CheckReport, DirEntry, EclipseFS, FsStat, InodeStat};
 
-/// Version of the on-disk format and of this driver (v0.3.0).
-pub const ECLIPSEFS_VERSION: u32 = format::VERSION;
+/// Version of the on-disk format new filesystems get (v0.4.0).
+pub const ECLIPSEFS_VERSION: u32 = cowfmt::VERSION4;
 
 /// Crate-wide error type (same variants as `btrfs::Error`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

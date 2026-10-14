@@ -35,9 +35,19 @@ fn mkfs_rejects_tiny_devices_and_long_labels() {
 
 #[test]
 fn small_devices_format_and_work() {
-    // 64 blocks is one group but leaves no room for the inode table.
+    // On v0.3, 64 blocks is one group but leaves no room for the inode
+    // table; v0.4 has no inode table and fits.
     let disk = MemDisk::new(64 * BLOCK);
-    assert!(matches!(mkfs::format(&*disk, &opts()), Err(Error::NoSpace)));
+    assert!(matches!(
+        mkfs::format_v3(&*disk, &opts()),
+        Err(Error::NoSpace)
+    ));
+    mkfs::format(&*disk, &opts()).unwrap();
+    let mut fs = EclipseFS::mount(disk, false).unwrap();
+    let root = fs.root_ino();
+    let f = fs.create(root, "f", FileKind::Regular, 0o644, 0).unwrap();
+    write_all(&mut fs, f, 0, &[7; 3 * BLOCK]);
+    fs.check().unwrap();
     let (_disk, mut fs) = fresh(MIB);
     let root = fs.root_ino();
     let f = fs.create(root, "f", FileKind::Regular, 0o644, 0).unwrap();
@@ -313,25 +323,40 @@ fn symlink_targets_are_validated() {
 
 #[test]
 fn symlink_inline_boundary() {
-    let (disk, mut fs) = fresh(8 * MIB);
+    // v0.4 keeps up to 1024 bytes inside the tree, v0.3 152 in the inode.
+    symlink_inline_boundary_at(fresh(8 * MIB), 1024);
+}
+
+#[test]
+fn symlink_inline_boundary_v3() {
+    symlink_inline_boundary_at(fresh_v3(8 * MIB), 152);
+}
+
+fn symlink_inline_boundary_at((disk, mut fs): (std::sync::Arc<MemDisk>, EclipseFS), limit: usize) {
     let root = fs.root_ino();
-    let a = fs.symlink(root, "a", &[b'a'; 152]).unwrap();
-    let b = fs.symlink(root, "b", &[b'b'; 153]).unwrap();
-    assert_eq!(fs.stat(a).unwrap().nbytes, 152);
+    let a = fs.symlink(root, "a", &vec![b'a'; limit]).unwrap();
+    let b = fs.symlink(root, "b", &vec![b'b'; limit + 1]).unwrap();
+    assert_eq!(fs.stat(a).unwrap().nbytes, limit as u64);
     assert_eq!(fs.stat(b).unwrap().nbytes, BLOCK as u64);
+    fs.sync().unwrap();
     let base = used(&fs);
-    // Growing an inline target past 152 bytes moves it to a block.
-    fs.write_symlink(a, 152, b"!").unwrap();
+    // Growing an inline target past the limit moves it to a block.
+    fs.write_symlink(a, limit as u64, b"!").unwrap();
     assert_eq!(fs.stat(a).unwrap().nbytes, BLOCK as u64);
-    assert_eq!(used(&fs), base + BLOCK as u64);
     let mut fs = remount(&disk, fs);
-    let mut want = vec![b'a'; 152];
+    if fs.format_version() == 3 {
+        assert_eq!(used(&fs), base + BLOCK as u64);
+    }
+    let mut want = vec![b'a'; limit];
     want.push(b'!');
     assert_eq!(fs.read_link(a).unwrap(), want);
-    assert_eq!(fs.read_link(b).unwrap(), vec![b'b'; 153]);
+    assert_eq!(fs.read_link(b).unwrap(), vec![b'b'; limit + 1]);
     fs.unlink(root, "a").unwrap();
     fs.unlink(root, "b").unwrap();
-    assert_eq!(used(&fs), base - BLOCK as u64);
+    if fs.format_version() == 3 {
+        assert_eq!(used(&fs), base - BLOCK as u64);
+    }
+    fs.check().unwrap();
 }
 
 #[test]
@@ -579,7 +604,7 @@ fn space_freed_by_an_open_transaction_is_reused_after_commit() {
 #[test]
 fn images_without_a_journal_are_updated_in_place() {
     let disk = MemDisk::new(8 * MIB);
-    mkfs::format(&*disk, &opts()).unwrap();
+    mkfs::format_v3(&*disk, &opts()).unwrap();
     // Turn it into a pre-journal (v0.3.0) superblock.
     let mut buf = vec![0u8; 4096];
     disk.read_at(0, &mut buf).unwrap();
@@ -607,7 +632,15 @@ fn images_without_a_journal_are_updated_in_place() {
 
 #[test]
 fn check_reports_damage() {
-    let (disk, mut fs) = fresh(8 * MIB);
+    check_reports_damage_on(fresh(8 * MIB));
+}
+
+#[test]
+fn check_reports_damage_v3() {
+    check_reports_damage_on(fresh_v3(8 * MIB));
+}
+
+fn check_reports_damage_on((disk, mut fs): (std::sync::Arc<MemDisk>, EclipseFS)) {
     let root = fs.root_ino();
     let f = fs.create(root, "f", FileKind::Regular, 0o644, 0).unwrap();
     write_all(&mut fs, f, 0, &pattern(3 * BLOCK, 1));
@@ -619,7 +652,7 @@ fn check_reports_damage() {
     // what follows, then mark a free block used in group 0's bitmap.
     let mut buf = vec![0u8; 4096];
     disk.read_at(0, &mut buf).unwrap();
-    let jstart = Superblock::decode(&buf).unwrap().journal_start;
+    let jstart = journal_start(&buf);
     disk.write_at(jstart * 4096, &[0u8; 4096]).unwrap();
     let mut bm = vec![0u8; 4096];
     disk.read_at(4096, &mut bm).unwrap();
@@ -643,7 +676,15 @@ struct Model {
 
 #[test]
 fn random_operations_match_a_model() {
-    let (disk, mut fs) = fresh(32 * MIB);
+    random_operations_on(fresh(32 * MIB));
+}
+
+#[test]
+fn random_operations_match_a_model_v3() {
+    random_operations_on(fresh_v3(32 * MIB));
+}
+
+fn random_operations_on((disk, mut fs): (std::sync::Arc<MemDisk>, EclipseFS)) {
     let root = fs.root_ino();
     let mut dirs = vec![root];
     for i in 0..3 {
@@ -739,9 +780,21 @@ fn random_operations_match_a_model() {
     for (d, name) in model.files.keys() {
         fs.unlink(dirs[*d], name).unwrap();
     }
-    let dir_bytes: u64 = dirs.iter().map(|&d| fs.stat(d).unwrap().nbytes).sum();
-    let root_before = BLOCK as u64; // root already held the dirN entries
-    assert!(used(&fs) <= base + dir_bytes - root_before);
+    if fs.format_version() == 3 {
+        let dir_bytes: u64 = dirs.iter().map(|&d| fs.stat(d).unwrap().nbytes).sum();
+        let root_before = BLOCK as u64; // root already held the dirN entries
+        assert!(used(&fs) <= base + dir_bytes - root_before);
+    } else {
+        // Every file block is back; the trees hold the same items as at the
+        // start (in at most a few more nodes until the next merges).
+        fs.sync().unwrap();
+        assert!(
+            used(&fs) <= base + 8 * BLOCK as u64,
+            "{} vs {}",
+            used(&fs),
+            base
+        );
+    }
     let left = used(&fs);
     let mut fs = remount(&disk, fs);
     assert_eq!(used(&fs), left);

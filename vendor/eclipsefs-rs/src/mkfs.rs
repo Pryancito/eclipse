@@ -6,8 +6,8 @@ use alloc::vec::Vec;
 use crate::blocks::{AllocationGroup, BlockAllocator};
 use crate::device::BlockDevice;
 use crate::format::*;
-use crate::fs::{extend_zeroed, write_chain, write_data, zero, ITABLE_GROW};
 use crate::journal::JournalArea;
+use crate::v3::{extend_zeroed, write_chain, write_data, zero, ITABLE_GROW};
 use crate::{Error, Result};
 
 /// Same fields as `btrfs::mkfs::MkfsOptions`, so callers can switch crates
@@ -38,8 +38,9 @@ pub fn journal_blocks(total: u64) -> u64 {
         .max(MIN_JOURNAL_BLOCKS as u64)
 }
 
-/// Format the whole device.
-pub fn format(dev: &dyn BlockDevice, opts: &MkfsOptions) -> Result<()> {
+/// Common to both formats: allocation groups over the whole device, stale
+/// signatures wiped, and an empty journal right after group 0's bitmap.
+fn layout(dev: &dyn BlockDevice, opts: &MkfsOptions) -> Result<(u64, BlockAllocator, u64, u64)> {
     if opts.label.len() >= 64 {
         return Err(Error::Invalid);
     }
@@ -77,6 +78,36 @@ pub fn format(dev: &dyn BlockDevice, opts: &MkfsOptions) -> Result<()> {
         blocks: jblocks,
     }
     .invalidate(dev)?;
+    Ok((total, alloc, jstart, jblocks))
+}
+
+fn label_bytes(opts: &MkfsOptions) -> [u8; 64] {
+    let mut label = [0u8; 64];
+    label[..opts.label.len()].copy_from_slice(opts.label.as_bytes());
+    label
+}
+
+/// Format the whole device (copy-on-write v0.4).
+pub fn format(dev: &dyn BlockDevice, opts: &MkfsOptions) -> Result<()> {
+    let (total, alloc, jstart, jblocks) = layout(dev, opts)?;
+    crate::cow::format(
+        dev,
+        alloc,
+        total,
+        JournalArea {
+            start: jstart,
+            blocks: jblocks,
+        },
+        label_bytes(opts),
+        opts.fsid,
+        opts.now,
+    )
+}
+
+/// Format the whole device with the older v0.3 layout (in-place updates
+/// under a metadata journal). Kept for compatibility tests and tools.
+pub fn format_v3(dev: &dyn BlockDevice, opts: &MkfsOptions) -> Result<()> {
+    let (total, mut alloc, jstart, jblocks) = layout(dev, opts)?;
     let mut itable = Inode::new(FileKind::Regular, 0o600, opts.now);
     extend_zeroed(dev, &mut alloc, &mut itable, ITABLE_GROW)?;
 
@@ -98,8 +129,7 @@ pub fn format(dev: &dyn BlockDevice, opts: &MkfsOptions) -> Result<()> {
         write_chain(dev, &mut alloc, ITABLE_INO, &mut itable)?;
     }
 
-    let mut label = [0u8; 64];
-    label[..opts.label.len()].copy_from_slice(opts.label.as_bytes());
+    let label = label_bytes(opts);
     let sb = Superblock {
         version: VERSION,
         block_size: BLOCK_SIZE as u32,

@@ -127,3 +127,19 @@ impl Lcg {
         self.next() % n
     }
 }
+
+/// Same as [`fresh`] with the older v0.3 format.
+pub fn fresh_v3(size: usize) -> (Arc<MemDisk>, EclipseFS) {
+    let disk = MemDisk::new(size);
+    mkfs::format_v3(&*disk, &opts()).unwrap();
+    let mut fs = EclipseFS::mount(disk.clone(), false).unwrap();
+    fs.set_clock(clock);
+    (disk, fs)
+}
+
+/// First block of the journal, from a superblock of either format.
+pub fn journal_start(sb: &[u8]) -> u64 {
+    let version = u32::from_le_bytes(sb[12..16].try_into().unwrap());
+    let at = if version >> 16 == 4 { 168 } else { 432 };
+    u64::from_le_bytes(sb[at..at + 8].try_into().unwrap())
+}

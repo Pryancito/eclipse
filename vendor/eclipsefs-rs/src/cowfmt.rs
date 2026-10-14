@@ -1,0 +1,612 @@
+//! On-disk records of the copy-on-write format (v0.4).
+//!
+//! Superblock (block 0, backups at block 0 of every other group):
+//!
+//! ```text
+//! 0   "ECLIPSEFS"       12  version 0x0004_0000   16  block size
+//! 20  group blocks      24  total blocks          32  free blocks
+//! 40  generation        48  created (s)           56  feature flags
+//! 64  uuid [16]         80  label [64]
+//! 144 root tree block   152 root tree level       160 root tree generation
+//! 168 journal start     176 journal blocks        180 checksum type
+//! 184 default subvolume
+//! 508 crc32c of bytes 0..508
+//! ```
+//!
+//! Trees and item keys `(objectid, type, offset)`:
+//!
+//! - root tree (1): `(tree id, ROOT_ITEM, 0)` for every other tree;
+//! - reference tree (2): `(first block, REF_ITEM, 0)` -> length, count, for
+//!   blocks shared by more than one owner;
+//! - one tree per subvolume (the default one is 5), with per inode:
+//!   `(ino, INODE_ITEM, 0)`, `(ino, INODE_REF, hash(dir, index))` per name,
+//!   `(ino, EXTENT_DATA, file offset)` per extent, and per directory
+//!   `(dir, DIR_ITEM, hash(name))` for lookups and `(dir, DIR_INDEX, n)` for
+//!   readdir in creation order.
+
+use alloc::vec;
+use alloc::vec::Vec;
+
+use crate::btree::{Key, Root};
+use crate::crc::{crc32, crc32c};
+use crate::format::{
+    le16, le32, le64, put32, put64, FileKind, BLOCK_SIZE, GROUP_BLOCKS, MAGIC, MIN_GROUP_BLOCKS,
+    MIN_JOURNAL_BLOCKS,
+};
+use crate::{Error, Result};
+
+pub const VERSION4: u32 = 0x0004_0000;
+pub const CSUM_CRC32C: u8 = 1;
+const SB_CRC: usize = 508;
+
+pub const ROOT_TREE: u64 = 1;
+pub const REFS_TREE: u64 = 2;
+/// The default subvolume (same number as btrfs's FS_TREE).
+pub const FS_TREE: u64 = 5;
+/// First inode number of every subvolume: its root directory.
+pub const FIRST_INO: u64 = 256;
+
+pub const INODE_ITEM: u8 = 1;
+pub const INODE_REF: u8 = 12;
+pub const XATTR_ITEM: u8 = 24;
+pub const DIR_ITEM: u8 = 84;
+pub const DIR_INDEX: u8 = 96;
+pub const EXTENT_DATA: u8 = 108;
+pub const ROOT_ITEM: u8 = 132;
+pub const REF_ITEM: u8 = 200;
+
+/// Largest file kept inside its extent item.
+pub const INLINE_MAX: usize = 1024;
+/// Longest extent item (128 MiB).
+pub const MAX_EXTENT_BLOCKS: u64 = GROUP_BLOCKS;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SuperV4 {
+    pub total_blocks: u64,
+    pub free_blocks: u64,
+    pub generation: u64,
+    pub created: u64,
+    pub features: u64,
+    pub uuid: [u8; 16],
+    pub label: [u8; 64],
+    pub root: Root,
+    pub journal_start: u64,
+    pub journal_blocks: u32,
+    pub default_subvol: u64,
+}
+
+impl SuperV4 {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut b = vec![0u8; BLOCK_SIZE as usize];
+        b[0..9].copy_from_slice(MAGIC);
+        put32(&mut b, 12, VERSION4);
+        put32(&mut b, 16, BLOCK_SIZE as u32);
+        put32(&mut b, 20, GROUP_BLOCKS as u32);
+        put64(&mut b, 24, self.total_blocks);
+        put64(&mut b, 32, self.free_blocks);
+        put64(&mut b, 40, self.generation);
+        put64(&mut b, 48, self.created);
+        put64(&mut b, 56, self.features);
+        b[64..80].copy_from_slice(&self.uuid);
+        b[80..144].copy_from_slice(&self.label);
+        put64(&mut b, 144, self.root.bytenr);
+        b[152] = self.root.level;
+        put64(&mut b, 160, self.root.gen);
+        put64(&mut b, 168, self.journal_start);
+        put32(&mut b, 176, self.journal_blocks);
+        b[180] = CSUM_CRC32C;
+        put64(&mut b, 184, self.default_subvol);
+        let c = crc32c(&b[..SB_CRC]);
+        put32(&mut b, SB_CRC, c);
+        b
+    }
+
+    pub fn decode(b: &[u8]) -> Result<Self> {
+        if b.len() < BLOCK_SIZE as usize || &b[0..9] != MAGIC {
+            return Err(Error::BadSuperblock);
+        }
+        if le32(b, 12) >> 16 != VERSION4 >> 16 {
+            return Err(Error::Unsupported("EclipseFS format version"));
+        }
+        if crc32c(&b[..SB_CRC]) != le32(b, SB_CRC) {
+            return Err(Error::Corrupt("superblock checksum"));
+        }
+        if le32(b, 16) as u64 != BLOCK_SIZE || le32(b, 20) as u64 != GROUP_BLOCKS {
+            return Err(Error::Unsupported("EclipseFS geometry"));
+        }
+        if b[180] != CSUM_CRC32C {
+            return Err(Error::Unsupported("EclipseFS checksum type"));
+        }
+        let sb = Self {
+            total_blocks: le64(b, 24),
+            free_blocks: le64(b, 32),
+            generation: le64(b, 40),
+            created: le64(b, 48),
+            features: le64(b, 56),
+            uuid: b[64..80].try_into().unwrap(),
+            label: b[80..144].try_into().unwrap(),
+            root: Root {
+                bytenr: le64(b, 144),
+                level: b[152],
+                gen: le64(b, 160),
+            },
+            journal_start: le64(b, 168),
+            journal_blocks: le32(b, 176),
+            default_subvol: le64(b, 184),
+        };
+        if sb.total_blocks < MIN_GROUP_BLOCKS
+            || sb.root.bytenr >= sb.total_blocks
+            || sb.root.gen > sb.generation
+        {
+            return Err(Error::Corrupt("superblock fields"));
+        }
+        if sb.journal_blocks < MIN_JOURNAL_BLOCKS
+            || sb.journal_start < 2
+            || sb.journal_start + sb.journal_blocks as u64 > sb.total_blocks.min(GROUP_BLOCKS)
+        {
+            return Err(Error::Corrupt("journal location"));
+        }
+        Ok(sb)
+    }
+
+    pub fn label(&self) -> &[u8] {
+        let end = self.label.iter().position(|&c| c == 0).unwrap_or(64);
+        &self.label[..end]
+    }
+
+    pub fn groups(&self) -> (usize, u64) {
+        let n = self.total_blocks.div_ceil(GROUP_BLOCKS);
+        (n as usize, self.total_blocks - (n - 1) * GROUP_BLOCKS)
+    }
+}
+
+/// 64-bit hash of a directory entry name (lookup key of DIR_ITEM).
+pub fn name_hash(name: &[u8]) -> u64 {
+    (crc32c(name) as u64) | ((crc32(name) as u64) << 32)
+}
+
+/// Key offset of an INODE_REF: one item per (directory, index) name.
+pub fn ref_hash(dir: u64, index: u64) -> u64 {
+    let mut b = [0u8; 16];
+    b[..8].copy_from_slice(&dir.to_le_bytes());
+    b[8..].copy_from_slice(&index.to_le_bytes());
+    name_hash(&b)
+}
+
+// ---------------------------------------------------------------------------
+// Inode
+// ---------------------------------------------------------------------------
+
+pub const INODE_ITEM_SIZE: usize = 128;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InodeItem {
+    pub mode: u32,
+    pub uid: u32,
+    pub gid: u32,
+    pub nlink: u32,
+    pub size: u64,
+    pub nbytes: u64,
+    pub rdev: u64,
+    pub flags: u64,
+    /// Transaction that created the inode.
+    pub generation: u64,
+    /// Containing directory (for directories, the target of `..`).
+    pub parent: u64,
+    /// Next DIR_INDEX number (directories).
+    pub dir_next: u64,
+    pub atime: (u64, u32),
+    pub mtime: (u64, u32),
+    pub ctime: (u64, u32),
+    /// Creation time.
+    pub otime: (u64, u32),
+    /// Bumped on every change.
+    pub seq: u64,
+}
+
+impl InodeItem {
+    pub fn new(kind: FileKind, mode: u32, now: (u64, u32), generation: u64) -> Self {
+        Self {
+            mode: kind.mode_bits() | (mode & 0o7777),
+            uid: 0,
+            gid: 0,
+            nlink: if kind == FileKind::Dir { 2 } else { 1 },
+            size: 0,
+            nbytes: 0,
+            rdev: 0,
+            flags: 0,
+            generation,
+            parent: 0,
+            dir_next: 2,
+            atime: now,
+            mtime: now,
+            ctime: now,
+            otime: now,
+            seq: 0,
+        }
+    }
+
+    pub fn kind(&self) -> FileKind {
+        FileKind::from_mode(self.mode)
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        let mut b = vec![0u8; INODE_ITEM_SIZE];
+        put32(&mut b, 0, self.mode);
+        put32(&mut b, 4, self.uid);
+        put32(&mut b, 8, self.gid);
+        put32(&mut b, 12, self.nlink);
+        put64(&mut b, 16, self.size);
+        put64(&mut b, 24, self.nbytes);
+        put64(&mut b, 32, self.rdev);
+        put64(&mut b, 40, self.flags);
+        put64(&mut b, 48, self.generation);
+        put64(&mut b, 56, self.parent);
+        put64(&mut b, 64, self.dir_next);
+        put64(&mut b, 72, self.atime.0);
+        put32(&mut b, 80, self.atime.1);
+        put32(&mut b, 84, self.mtime.1);
+        put64(&mut b, 88, self.mtime.0);
+        put64(&mut b, 96, self.ctime.0);
+        put32(&mut b, 104, self.ctime.1);
+        put32(&mut b, 108, self.otime.1);
+        put64(&mut b, 112, self.otime.0);
+        put64(&mut b, 120, self.seq);
+        b
+    }
+
+    pub fn decode(b: &[u8]) -> Result<Self> {
+        if b.len() != INODE_ITEM_SIZE {
+            return Err(Error::Corrupt("inode item size"));
+        }
+        let i = Self {
+            mode: le32(b, 0),
+            uid: le32(b, 4),
+            gid: le32(b, 8),
+            nlink: le32(b, 12),
+            size: le64(b, 16),
+            nbytes: le64(b, 24),
+            rdev: le64(b, 32),
+            flags: le64(b, 40),
+            generation: le64(b, 48),
+            parent: le64(b, 56),
+            dir_next: le64(b, 64),
+            atime: (le64(b, 72), le32(b, 80)),
+            mtime: (le64(b, 88), le32(b, 84)),
+            ctime: (le64(b, 96), le32(b, 104)),
+            otime: (le64(b, 112), le32(b, 108)),
+            seq: le64(b, 120),
+        };
+        if FileKind::from_disk(i.kind().to_disk()).is_none() || i.mode & 0o170000 == 0 {
+            return Err(Error::Corrupt("inode mode"));
+        }
+        Ok(i)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// File extents
+// ---------------------------------------------------------------------------
+
+pub const EXT_INLINE: u8 = 0;
+pub const EXT_REG: u8 = 1;
+const EXT_HDR: usize = 8;
+const EXT_REG_SIZE: usize = 24;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FileExtent {
+    /// The file's bytes, inside the item (only at offset 0).
+    Inline(Vec<u8>),
+    /// `blocks` blocks at `disk`, mapped at the item's file offset.
+    Reg { disk: u64, blocks: u64 },
+}
+
+impl FileExtent {
+    pub fn encode(&self) -> Vec<u8> {
+        match self {
+            FileExtent::Inline(d) => {
+                let mut b = vec![0u8; EXT_HDR + d.len()];
+                b[0] = EXT_INLINE;
+                b[EXT_HDR..].copy_from_slice(d);
+                b
+            }
+            FileExtent::Reg { disk, blocks } => {
+                let mut b = vec![0u8; EXT_REG_SIZE];
+                b[0] = EXT_REG;
+                put64(&mut b, 8, *disk);
+                put64(&mut b, 16, *blocks);
+                b
+            }
+        }
+    }
+
+    pub fn decode(b: &[u8]) -> Result<Self> {
+        match b.first() {
+            Some(&EXT_INLINE) if b.len() >= EXT_HDR && b[1] == 0 => {
+                Ok(FileExtent::Inline(b[EXT_HDR..].to_vec()))
+            }
+            Some(&EXT_REG) if b.len() == EXT_REG_SIZE && b[1] == 0 => {
+                let blocks = le64(b, 16);
+                if blocks == 0 || blocks > MAX_EXTENT_BLOCKS {
+                    return Err(Error::Corrupt("file extent length"));
+                }
+                Ok(FileExtent::Reg {
+                    disk: le64(b, 8),
+                    blocks,
+                })
+            }
+            _ => Err(Error::Corrupt("file extent item")),
+        }
+    }
+}
+
+/// Data blocks an item references (for reference counting).
+pub fn extent_of(k: &Key, d: &[u8]) -> Option<(u64, u64)> {
+    if k.ty != EXTENT_DATA || d.len() != EXT_REG_SIZE || d[0] != EXT_REG {
+        return None;
+    }
+    Some((le64(d, 8), le64(d, 16)))
+}
+
+// ---------------------------------------------------------------------------
+// Directory entries and names
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirEnt {
+    pub ino: u64,
+    pub index: u64,
+    pub kind: FileKind,
+    pub name: Vec<u8>,
+}
+
+/// Encode a DIR_ITEM value (every name with this hash).
+pub fn encode_dir_item(list: &[DirEnt]) -> Vec<u8> {
+    let mut b = Vec::new();
+    for e in list {
+        b.extend_from_slice(&e.ino.to_le_bytes());
+        b.extend_from_slice(&e.index.to_le_bytes());
+        b.push(e.kind.to_disk());
+        b.extend_from_slice(&(e.name.len() as u16).to_le_bytes());
+        b.extend_from_slice(&e.name);
+    }
+    b
+}
+
+pub fn decode_dir_item(b: &[u8]) -> Result<Vec<DirEnt>> {
+    let mut out = Vec::new();
+    let mut at = 0;
+    while at < b.len() {
+        if b.len() - at < 19 {
+            return Err(Error::Corrupt("directory item"));
+        }
+        let n = le16(b, at + 17) as usize;
+        let kind = FileKind::from_disk(b[at + 16]).ok_or(Error::Corrupt("directory item kind"))?;
+        if n == 0 || b.len() - at - 19 < n {
+            return Err(Error::Corrupt("directory item name"));
+        }
+        out.push(DirEnt {
+            ino: le64(b, at),
+            index: le64(b, at + 8),
+            kind,
+            name: b[at + 19..at + 19 + n].to_vec(),
+        });
+        at += 19 + n;
+    }
+    Ok(out)
+}
+
+/// DIR_INDEX value and INODE_REF value share a layout: `(u64, u64, kind,
+/// name)`. For DIR_INDEX the numbers are (child ino, 0); for INODE_REF
+/// (directory, index).
+pub fn encode_pair(a: u64, b: u64, kind: FileKind, name: &[u8]) -> Vec<u8> {
+    encode_dir_item(&[DirEnt {
+        ino: a,
+        index: b,
+        kind,
+        name: name.to_vec(),
+    }])
+}
+
+pub fn decode_pair(b: &[u8]) -> Result<DirEnt> {
+    let mut l = decode_dir_item(b)?;
+    if l.len() != 1 {
+        return Err(Error::Corrupt("name item"));
+    }
+    Ok(l.pop().unwrap())
+}
+
+// ---------------------------------------------------------------------------
+// Tree roots and reference counts
+// ---------------------------------------------------------------------------
+
+pub const ROOT_ITEM_SIZE: usize = 96;
+/// Read-only subvolume or snapshot.
+pub const ROOT_FLAG_RDONLY: u64 = 1;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RootItem {
+    pub root: Root,
+    pub next_ino: u64,
+    pub inode_count: u64,
+    pub root_dir: u64,
+    pub flags: u64,
+    pub otime: (u64, u32),
+    /// Subvolume this one is a snapshot of (0 if none).
+    pub parent: u64,
+    /// Generation it was snapshotted at.
+    pub parent_gen: u64,
+}
+
+impl RootItem {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut b = vec![0u8; ROOT_ITEM_SIZE];
+        put64(&mut b, 0, self.root.bytenr);
+        b[8] = self.root.level;
+        put64(&mut b, 16, self.root.gen);
+        put64(&mut b, 24, self.next_ino);
+        put64(&mut b, 32, self.inode_count);
+        put64(&mut b, 40, self.root_dir);
+        put64(&mut b, 48, self.flags);
+        put64(&mut b, 56, self.otime.0);
+        put32(&mut b, 64, self.otime.1);
+        put64(&mut b, 72, self.parent);
+        put64(&mut b, 80, self.parent_gen);
+        b
+    }
+
+    pub fn decode(b: &[u8]) -> Result<Self> {
+        if b.len() != ROOT_ITEM_SIZE {
+            return Err(Error::Corrupt("root item"));
+        }
+        Ok(Self {
+            root: Root {
+                bytenr: le64(b, 0),
+                level: b[8],
+                gen: le64(b, 16),
+            },
+            next_ino: le64(b, 24),
+            inode_count: le64(b, 32),
+            root_dir: le64(b, 40),
+            flags: le64(b, 48),
+            otime: (le64(b, 56), le32(b, 64)),
+            parent: le64(b, 72),
+            parent_gen: le64(b, 80),
+        })
+    }
+}
+
+pub fn encode_ref(len: u64, count: u32) -> Vec<u8> {
+    let mut b = vec![0u8; 12];
+    put64(&mut b, 0, len);
+    put32(&mut b, 8, count);
+    b
+}
+
+pub fn decode_ref(b: &[u8]) -> Result<(u64, u32)> {
+    if b.len() != 12 {
+        return Err(Error::Corrupt("reference item"));
+    }
+    Ok((le64(b, 0), le32(b, 8)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sb() -> SuperV4 {
+        SuperV4 {
+            total_blocks: 1000,
+            free_blocks: 900,
+            generation: 7,
+            created: 1,
+            features: 0,
+            uuid: [4; 16],
+            label: [0; 64],
+            root: Root {
+                bytenr: 30,
+                level: 1,
+                gen: 7,
+            },
+            journal_start: 2,
+            journal_blocks: 64,
+            default_subvol: FS_TREE,
+        }
+    }
+
+    #[test]
+    fn superblock_roundtrip_and_checks() {
+        let b = sb().encode();
+        assert_eq!(SuperV4::decode(&b).unwrap(), sb());
+        for at in [0usize, 13, 30, 100, 150, 170, 507, 508] {
+            let mut c = b.clone();
+            c[at] ^= 1;
+            assert!(SuperV4::decode(&c).is_err(), "byte {}", at);
+        }
+        let mut bad = sb();
+        bad.root.gen = 8;
+        assert!(SuperV4::decode(&bad.encode()).is_err());
+        let mut bad = sb();
+        bad.journal_start = 990;
+        assert!(SuperV4::decode(&bad.encode()).is_err());
+    }
+
+    #[test]
+    fn items_roundtrip() {
+        let mut i = InodeItem::new(FileKind::Dir, 0o755, (5, 6), 3);
+        i.size = 77;
+        i.rdev = 9;
+        i.otime = (1, 2);
+        assert_eq!(InodeItem::decode(&i.encode()).unwrap(), i);
+        assert_eq!(i.kind(), FileKind::Dir);
+        assert!(InodeItem::decode(&[0u8; INODE_ITEM_SIZE]).is_err());
+        assert!(InodeItem::decode(&[0u8; 10]).is_err());
+
+        for e in [
+            FileExtent::Inline(vec![1, 2, 3]),
+            FileExtent::Inline(vec![]),
+            FileExtent::Reg {
+                disk: 99,
+                blocks: 5,
+            },
+        ] {
+            assert_eq!(FileExtent::decode(&e.encode()).unwrap(), e);
+        }
+        assert!(FileExtent::decode(&FileExtent::Reg { disk: 1, blocks: 0 }.encode()).is_err());
+        assert!(FileExtent::decode(&[7]).is_err());
+        let k = Key::new(300, EXTENT_DATA, 0);
+        assert_eq!(
+            extent_of(&k, &FileExtent::Reg { disk: 9, blocks: 2 }.encode()),
+            Some((9, 2))
+        );
+        assert_eq!(
+            extent_of(&k, &FileExtent::Inline(vec![0; 24]).encode()),
+            None
+        );
+
+        let list = vec![
+            DirEnt {
+                ino: 300,
+                index: 2,
+                kind: FileKind::Regular,
+                name: b"a".to_vec(),
+            },
+            DirEnt {
+                ino: 301,
+                index: 3,
+                kind: FileKind::Symlink,
+                name: vec![b'x'; 255],
+            },
+        ];
+        assert_eq!(decode_dir_item(&encode_dir_item(&list)).unwrap(), list);
+        let enc = encode_dir_item(&list);
+        assert!(decode_dir_item(&enc[..enc.len() - 1]).is_err());
+
+        let r = RootItem {
+            root: Root {
+                bytenr: 5,
+                level: 2,
+                gen: 4,
+            },
+            next_ino: 400,
+            inode_count: 3,
+            root_dir: FIRST_INO,
+            flags: ROOT_FLAG_RDONLY,
+            otime: (1, 1),
+            parent: 5,
+            parent_gen: 3,
+        };
+        assert_eq!(RootItem::decode(&r.encode()).unwrap(), r);
+        assert_eq!(decode_ref(&encode_ref(8, 3)).unwrap(), (8, 3));
+    }
+
+    #[test]
+    fn hashes_spread() {
+        assert_ne!(name_hash(b"a"), name_hash(b"b"));
+        assert_ne!(ref_hash(1, 2), ref_hash(2, 1));
+        let mut seen = alloc::collections::BTreeSet::new();
+        for i in 0..10000u32 {
+            assert!(seen.insert(name_hash(&i.to_le_bytes())));
+        }
+    }
+}

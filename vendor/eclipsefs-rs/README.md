@@ -1,6 +1,6 @@
 # EclipseFS (`vendor/eclipsefs-rs`)
 
-Sistema de archivos en disco de Eclipse, portado desde `eclipsefs-lib` (v0.3.0)
+Sistema de archivos en disco de Eclipse (formato v0.4), portado desde `eclipsefs-lib` (v0.3.0)
 de [eclipse-old](https://github.com/Pryancito/eclipse-old/tree/main/eclipsefs-lib)
 para el kernel nuevo. Es `no_std` + `alloc` y expone **la misma interfaz que
 `vendor/btrfs-rs`**, de modo que el kernel y `xtask` pueden usar uno u otro
@@ -35,7 +35,36 @@ Se conserva: la firma `ECLIPSEFS`, CRC32, el inodo raíz 1, los tipos de nodo
 1/2/3, los **extents** (`extent.rs`) y los **grupos de asignación** con mapa de
 bits (`blocks.rs`), ahora sin límites y persistidos en disco.
 
-Formato v0.3 (bloques de 4 KiB, todo little-endian):
+## Formato v0.4: copy-on-write (lo que crea `mkfs::format`)
+
+Paso 1 de la paridad con btrfs. Todo vive en árboles B+ copy-on-write
+(`btree.rs`), con claves `(objectid, tipo, offset)` como btrfs:
+
+- **Árbol raíz** (`ROOT_ITEM` de cada árbol), **árbol de referencias**
+  (contadores ≥ 2, `REF_ITEM`) y **árbol del sistema de archivos** (subvolumen
+  5: `INODE_ITEM`, `INODE_REF`, `DIR_ITEM` por hash, `DIR_INDEX` por orden,
+  `EXTENT_DATA`, `XATTR`).
+- Nodos de 4 KiB con cabecera `EFSN` y CRC32C; hojas con ítems empaquetados
+  desde el final.
+- **Nada confirmado se sobrescribe**: ni metadatos ni datos. Una escritura va a
+  bloques nuevos y el árbol se actualiza para apuntarlos; los bloques viejos se
+  liberan al confirmar la transacción. Solo los bloques creados por la
+  transacción abierta se reescriben en el sitio.
+- **Contadores de referencias perezosos** (Rodeh, como btrfs): copiar un nodo
+  compartido incrementa a sus hijos; es la base de snapshots y reflinks.
+- Archivos de hasta 1 KiB dentro del árbol (extent en línea).
+- Confirmación: nodos nuevos → `sync` → superbloque y mapas de bits juntos por
+  el journal. Tras un corte de luz se ve el estado viejo o el nuevo entero,
+  **contenido de archivos incluido** (sobrescrituras y truncados a mitad de
+  bloque también).
+- Espacio reservado para metadatos (1/64 del disco), así un disco lleno da
+  `ENOSPC` en los datos sin dejar el árbol a medias.
+- `EclipseFS::mount` detecta la versión: las imágenes v0.3 siguen montando con
+  su driver (`v3.rs`). `mkfs::format_v3` sigue disponible.
+
+## Formato v0.3 (in situ con journal)
+
+Bloques de 4 KiB, todo little-endian:
 
 ```text
 grupo k (32768 bloques = 128 MiB)
@@ -64,11 +93,16 @@ grupo k (32768 bloques = 128 MiB)
   rename con detección de ciclos, compactación de directorios y crecimiento
   automático al tamaño de la partición.
 
-## Próximos pasos
+## Próximos pasos (paridad con btrfs)
 
-Copy-on-write y snapshots, compresión,
-checksums de datos y directorios indexados: las piezas de v0.2/v0.3 que aún no
-están portadas.
+1. ~~Núcleo CoW: árbol B+, refcounts, datos nunca sobrescritos~~ (v0.4).
+2. Checksums de datos y scrub.
+3. Subvolúmenes, snapshots rw/ro, reflinks y dedupe.
+4. xattrs/ACL, atributos (inmutable, append, nocow), fallocate y huecos.
+5. Compresión zlib, lz4 y zstd.
+6. send/receive incremental y cuotas.
+7. Multidispositivo (DUP, RAID0/1/10), añadir/quitar, balance y encoger.
+8. ioctls del kernel e imágenes del instalador con EclipseFS.
 
 ## Tests y benchmarks
 
@@ -76,14 +110,21 @@ están portadas.
 cargo test --release -p eclipsefs --features std
 ```
 
-- Tests de unidad en cada módulo (`crc`, `extent`, `blocks`, `format`, `fs`).
+- Tests de unidad en cada módulo (`crc`, `extent`, `blocks`, `format`,
+  `btree`, `space`, `cowfmt`, `v3`), incluido un árbol B+ contra un modelo.
+- `tests/cow.rs`: ningún bloque confirmado se reescribe entre dos
+  confirmaciones, sobrescrituras de todas las formas, archivos en línea y
+  compatibilidad con imágenes v0.3.
 - `tests/integration.rs` y `tests/edge_cases.rs`: la API pública de punta a
   punta, límites del formato (extents en línea y en cadena, symlinks en línea,
   cachés), validación de argumentos, contabilidad de espacio y una prueba
   aleatoria contra un modelo en memoria con remontajes.
 - `tests/crash.rs`: cortes de luz simulados en cada punto de escritura (y con
   pérdidas arbitrarias de lo no sincronizado); cada imagen debe montar, pasar
-  `check()` y mostrar el estado tras alguna operación completa.
+  `check()` y mostrar el estado tras alguna operación completa. En v0.4 la
+  carga incluye sobrescrituras y truncados sin alinear; en v0.3, solo
+  añadidos.
+- Los tests que dependen del formato corren en las dos versiones (`*_v3`).
 - `tests/performance.rs`: las mismas cargas sobre EclipseFS y btrfs, con tiempo
   y bytes leídos/escritos en el dispositivo. `scripts/eclipsefs-bench.sh` las
   ejecuta en release; `ECLIPSEFS_BENCH_SCALE=4` las agranda.

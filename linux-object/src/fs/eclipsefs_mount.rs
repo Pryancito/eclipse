@@ -390,7 +390,7 @@ pub(crate) fn probe_eclipsefs_superblock(block: &Arc<dyn BlockScheme>) -> bool {
     let version = u32::from_le_bytes(sb.0[12..16].try_into().unwrap());
     let total_blocks = u64::from_le_bytes(sb.0[24..32].try_into().unwrap());
     let device_bytes = block.block_count() as u64 * 512;
-    version >> 16 == eclipsefs::format::VERSION_MAJOR
+    eclipsefs::format::is_supported_version(version)
         && total_blocks > 0
         && total_blocks.saturating_mul(eclipsefs::format::BLOCK_SIZE) <= device_bytes
 }
@@ -465,6 +465,16 @@ mod tests {
     }
 
     fn formatted(bytes: usize) -> Arc<RamDisk> {
+        formatted_with(bytes, eclipsefs::mkfs::format)
+    }
+
+    fn formatted_with(
+        bytes: usize,
+        format: fn(
+            &dyn eclipsefs::BlockDevice,
+            &eclipsefs::mkfs::MkfsOptions,
+        ) -> eclipsefs::Result<()>,
+    ) -> Arc<RamDisk> {
         let disk = Arc::new(RamDisk {
             bytes: Mutex::new(vec![0u8; bytes]),
         });
@@ -476,8 +486,33 @@ mod tests {
             subvol_uuid: [0; 16],
             now: (1_700_000_000, 0),
         };
-        eclipsefs::mkfs::format(&Formatter(disk.clone()), &opts).unwrap();
+        format(&Formatter(disk.clone()), &opts).unwrap();
         disk
+    }
+
+    #[test]
+    fn older_v3_images_are_recognised_and_mount() {
+        let disk = formatted_with(8 * 1024 * 1024, eclipsefs::mkfs::format_v3);
+        let dev: Arc<dyn BlockScheme> = disk.clone();
+        assert!(probe_eclipsefs_superblock(&dev));
+        {
+            let fs = EclipseMountFs::open(&MountBackend::Block(disk.clone()), false).unwrap();
+            let f = fs
+                .root_inode()
+                .create("old", FileType::File, 0o644)
+                .unwrap();
+            assert_eq!(f.write_at(0, b"v0.3").unwrap(), 4);
+            fs.sync().unwrap();
+        }
+        let fs = EclipseMountFs::open(&MountBackend::Block(disk), false).unwrap();
+        let mut back = [0u8; 8];
+        let n = fs
+            .root_inode()
+            .find("old")
+            .unwrap()
+            .read_at(0, &mut back)
+            .unwrap();
+        assert_eq!(&back[..n], b"v0.3");
     }
 
     #[test]

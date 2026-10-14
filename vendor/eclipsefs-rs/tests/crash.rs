@@ -9,7 +9,7 @@
 mod common;
 
 use std::collections::hash_map::DefaultHasher;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex};
 
@@ -140,12 +140,15 @@ struct Run {
     syncs: Vec<(usize, usize)>,
 }
 
-/// Random namespace and append workload. Writes only extend files and
-/// truncates are block-aligned: in-place overwrites of file data are not
-/// atomic in ordered mode, by design.
-fn workload(seed: u64, ops: usize, size: usize) -> Run {
+type Mkfs = fn(&dyn BlockDevice, &mkfs::MkfsOptions) -> eclipsefs::Result<()>;
+
+/// Random namespace and data workload. With `cow` (v0.4) writes land
+/// anywhere in a file and truncates cut mid-block, since copy-on-write
+/// makes those atomic too; on v0.3 writes only extend files and truncates
+/// are block-aligned (in-place overwrites are not atomic in ordered mode).
+fn workload(seed: u64, ops: usize, size: usize, format: Mkfs, cow: bool) -> Run {
     let disk = MemDisk::new(size);
-    mkfs::format(&*disk, &opts()).unwrap();
+    format(&*disk, &opts()).unwrap();
     let mut base = vec![0u8; size];
     disk.read_at(0, &mut base).unwrap();
     let rec = Recorder::new(base.clone());
@@ -174,7 +177,8 @@ fn workload(seed: u64, ops: usize, size: usize) -> Run {
                 Ok(ino) if fs.stat(ino).unwrap().kind == FileKind::Regular => {
                     let size = fs.stat(ino).unwrap().size;
                     let len = 1 + rng.below(30_000) as usize;
-                    let n = fs.write(ino, size, &pattern(len, done)).unwrap();
+                    let at = if cow { rng.below(size + 1) } else { size };
+                    let n = fs.write(ino, at, &pattern(len, done)).unwrap();
                     assert_eq!(n, len);
                     files.push((d, name));
                     true
@@ -184,7 +188,12 @@ fn workload(seed: u64, ops: usize, size: usize) -> Run {
             7 => match fs.lookup(d, &name) {
                 Ok(ino) if fs.stat(ino).unwrap().kind == FileKind::Regular => {
                     let size = fs.stat(ino).unwrap().size;
-                    fs.truncate(ino, (size / 2) / 4096 * 4096).unwrap();
+                    let to = if cow {
+                        rng.below(size + 5000)
+                    } else {
+                        (size / 2) / 4096 * 4096
+                    };
+                    fs.truncate(ino, to).unwrap();
                     true
                 }
                 _ => false,
@@ -274,8 +283,8 @@ fn verify(run: &Run, image: Vec<u8>, cut: usize) {
     fs.check().unwrap();
 }
 
-fn crash_everywhere(seed: u64, ops: usize) {
-    let run = workload(seed, ops, 16 * MIB);
+fn crash_everywhere(seed: u64, ops: usize, format: Mkfs, cow: bool) {
+    let run = workload(seed, ops, 16 * MIB, format, cow);
     let mut image = run.base.clone();
     let n = run.log.len();
     let stride = (n / 400).max(1);
@@ -290,17 +299,31 @@ fn crash_everywhere(seed: u64, ops: usize) {
 
 #[test]
 fn crash_at_every_point_of_a_workload() {
-    crash_everywhere(1, 250);
+    crash_everywhere(1, 250, mkfs::format, true);
+}
+
+#[test]
+fn crash_at_every_point_of_a_v3_workload() {
+    crash_everywhere(1, 250, mkfs::format_v3, false);
 }
 
 #[test]
 fn crash_at_every_point_of_another_workload() {
-    crash_everywhere(0xDEAD_BEEF, 250);
+    crash_everywhere(0xDEAD_BEEF, 250, mkfs::format, true);
 }
 
 #[test]
 fn crash_loses_an_arbitrary_part_of_the_unsynced_writes() {
-    let run = workload(7, 200, 16 * MIB);
+    lose_unsynced_writes(mkfs::format, true);
+}
+
+#[test]
+fn crash_loses_an_arbitrary_part_of_the_unsynced_writes_v3() {
+    lose_unsynced_writes(mkfs::format_v3, false);
+}
+
+fn lose_unsynced_writes(format: Mkfs, cow: bool) {
+    let run = workload(7, 200, 16 * MIB, format, cow);
     let mut rng = Lcg(99);
     let syncs: Vec<usize> = run
         .log
@@ -342,7 +365,7 @@ fn torn_journal_header_is_ignored() {
     drop(fs);
     let mut sb = vec![0u8; 4096];
     disk.read_at(0, &mut sb).unwrap();
-    let jstart = u64::from_le_bytes(sb[432..440].try_into().unwrap()) as usize;
+    let jstart = journal_start(&sb) as usize;
     for off in [0usize, 30, 4096 + 5, 8192 + 100] {
         disk.poke(jstart * 4096 + off, 0x40);
         let mut fs = EclipseFS::mount(disk.clone(), true).unwrap();
@@ -355,13 +378,13 @@ fn torn_journal_header_is_ignored() {
 
 #[test]
 fn read_only_mount_sees_the_journal_without_writing() {
-    let run = workload(3, 60, 8 * MIB);
+    let run = workload(3, 60, 8 * MIB, mkfs::format, true);
     // Stop right after the last journal header write: the transaction is
     // committed but not yet home.
     let mut image = run.base.clone();
     let mut sb = vec![0u8; 4096];
     sb.copy_from_slice(&run.base[..4096]);
-    let jstart = u64::from_le_bytes(sb[432..440].try_into().unwrap());
+    let jstart = journal_start(&sb);
     let mut cut = 0;
     for (i, ev) in run.log.iter().enumerate() {
         if let Event::Write(off, _) = ev {
@@ -390,9 +413,20 @@ fn read_only_mount_sees_the_journal_without_writing() {
 fn transactions_larger_than_the_journal_still_recover() {
     // A tiny disk has a 64-block journal; growing the inode table (64
     // blocks) and a big directory compaction do not fit in it.
-    let disk = MemDisk::new(2 * MIB);
-    mkfs::format(&*disk, &opts()).unwrap();
-    let mut base = vec![0u8; 2 * MIB];
+    big_transactions(2 * MIB, mkfs::format_v3);
+}
+
+#[test]
+fn big_directories_recover_from_a_crash() {
+    // On v0.4 only bitmaps go through the journal; this is a crash test of
+    // many tree splits and merges.
+    big_transactions(8 * MIB, mkfs::format);
+}
+
+fn big_transactions(size: usize, format: Mkfs) {
+    let disk = MemDisk::new(size);
+    format(&*disk, &opts()).unwrap();
+    let mut base = vec![0u8; size];
     disk.read_at(0, &mut base).unwrap();
     let rec = Recorder::new(base.clone());
     let mut fs = EclipseFS::mount(rec.clone(), false).unwrap();

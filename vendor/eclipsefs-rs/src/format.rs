@@ -29,6 +29,11 @@ pub const MAGIC: &[u8; 9] = b"ECLIPSEFS";
 pub const VERSION: u32 = 0x0003_0000;
 pub const VERSION_MAJOR: u32 = VERSION >> 16;
 
+/// Whether this driver mounts images with format `version` (v0.3 and v0.4).
+pub fn is_supported_version(version: u32) -> bool {
+    matches!(version >> 16, 3 | 4)
+}
+
 pub const BLOCK_SIZE: u64 = 4096;
 /// Blocks per allocation group: one bitmap block's worth of bits.
 pub const GROUP_BLOCKS: u64 = BLOCK_SIZE * 8;
@@ -129,22 +134,22 @@ impl FileKind {
     }
 }
 
-fn le64(b: &[u8], off: usize) -> u64 {
+pub(crate) fn le64(b: &[u8], off: usize) -> u64 {
     u64::from_le_bytes(b[off..off + 8].try_into().unwrap())
 }
-fn le32(b: &[u8], off: usize) -> u32 {
+pub(crate) fn le32(b: &[u8], off: usize) -> u32 {
     u32::from_le_bytes(b[off..off + 4].try_into().unwrap())
 }
-fn le16(b: &[u8], off: usize) -> u16 {
+pub(crate) fn le16(b: &[u8], off: usize) -> u16 {
     u16::from_le_bytes(b[off..off + 2].try_into().unwrap())
 }
-fn put64(b: &mut [u8], off: usize, v: u64) {
+pub(crate) fn put64(b: &mut [u8], off: usize, v: u64) {
     b[off..off + 8].copy_from_slice(&v.to_le_bytes());
 }
-fn put32(b: &mut [u8], off: usize, v: u32) {
+pub(crate) fn put32(b: &mut [u8], off: usize, v: u32) {
     b[off..off + 4].copy_from_slice(&v.to_le_bytes());
 }
-fn put16(b: &mut [u8], off: usize, v: u16) {
+pub(crate) fn put16(b: &mut [u8], off: usize, v: u16) {
     b[off..off + 2].copy_from_slice(&v.to_le_bytes());
 }
 

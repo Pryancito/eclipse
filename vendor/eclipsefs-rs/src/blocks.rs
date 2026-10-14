@@ -297,7 +297,9 @@ impl BlockAllocator {
         Ok(())
     }
 
-    fn free_now(&mut self, start: u64, len: u64) -> Result<()> {
+    /// Free right away even when frees are held back: for blocks allocated
+    /// by the open transaction, which no committed state references.
+    pub fn free_now(&mut self, start: u64, len: u64) -> Result<()> {
         let mut start = start;
         let mut len = len;
         while len > 0 {

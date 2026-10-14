@@ -126,8 +126,9 @@ fn empty_filesystem_mounts() {
     assert_eq!(fs.label(), "eclipse");
     let info = fs.fsinfo();
     assert_eq!(info.total_bytes, 8 * MIB as u64);
-    // Inode table (256 KiB) and journal (256 KiB on a small disk).
-    assert!(info.bytes_used < 600 * 1024, "{:?}", info);
+    // Journal (256 KiB on a small disk), group headers and three tree nodes.
+    assert!(info.bytes_used < 300 * 1024, "{:?}", info);
+    assert_eq!(fs.format_version(), 4);
 }
 
 #[test]
@@ -378,9 +379,25 @@ fn full_device_gives_partial_writes_then_enospc() {
         .create(root, "fill", FileKind::Regular, 0o644, 0)
         .unwrap();
     let data = pattern(4 * MIB, 7);
-    let n = fs.write(f, 0, &data).unwrap();
+    let mut n = fs.write(f, 0, &data).unwrap();
     assert!(n > 0 && n < data.len(), "n = {}", n);
-    assert_eq!(fs.write(f, n as u64, &data[n..]), Err(Error::NoSpace));
+    // Committing frees the blocks old tree nodes held, so a retry can
+    // still place a little more (as on btrfs); it runs dry quickly.
+    let mut tries = 0;
+    loop {
+        match fs.write(f, n as u64, &data[n..]) {
+            Ok(m) => {
+                assert!(m > 0 && n + m < data.len());
+                n += m;
+            }
+            Err(e) => {
+                assert_eq!(e, Error::NoSpace);
+                break;
+            }
+        }
+        tries += 1;
+        assert!(tries < 8, "never ran out of space");
+    }
     let mut fs = remount(&disk, fs);
     assert_eq!(read_all(&mut fs, f), &data[..n]);
     // Space comes back.
@@ -521,6 +538,26 @@ fn read_only_mount_refuses_changes() {
     fs.sync().unwrap();
 }
 
+fn victim(disk: &Arc<MemDisk>) -> u64 {
+    let mut fs = EclipseFS::mount(disk.clone(), false).unwrap();
+    let root = fs.root_ino();
+    let ino = fs
+        .create(root, "victim", FileKind::Regular, 0o644, 0)
+        .unwrap();
+    fs.sync().unwrap();
+    ino
+}
+
+fn superblock_damage_is_detected(disk: &Arc<MemDisk>) {
+    // Flip a bit in the superblock's label.
+    disk.poke(110, 1);
+    assert!(matches!(
+        EclipseFS::mount(disk.clone(), false),
+        Err(Error::Corrupt(_))
+    ));
+    disk.poke(110, 1);
+}
+
 #[test]
 fn corruption_is_detected() {
     let disk = MemDisk::new(8 * MIB);
@@ -529,35 +566,49 @@ fn corruption_is_detected() {
         Err(Error::BadSuperblock)
     ));
     mkfs::format(&*disk, &opts()).unwrap();
-    let ino;
-    {
-        let mut fs = EclipseFS::mount(disk.clone(), false).unwrap();
-        let root = fs.root_ino();
-        ino = fs
-            .create(root, "victim", FileKind::Regular, 0o644, 0)
-            .unwrap();
-        fs.sync().unwrap();
+    let ino = victim(&disk);
+    superblock_damage_is_detected(&disk);
+    // Flip a bit in the tree leaf that holds the victim's items (the only
+    // node naming it), next to the name.
+    let mut image = vec![0u8; 8 * MIB];
+    disk.read_at(0, &mut image).unwrap();
+    let leaf = image
+        .chunks(4096)
+        .position(|b| &b[..4] == b"EFSN" && b.windows(6).any(|w| w == b"victim"))
+        .expect("leaf naming the victim");
+    let at = image[leaf * 4096..(leaf + 1) * 4096]
+        .windows(6)
+        .position(|w| w == b"victim")
+        .unwrap();
+    disk.poke(leaf * 4096 + at, 4);
+    // On a filesystem this small the root directory shares the leaf, so the
+    // mount itself may already refuse it.
+    match EclipseFS::mount(disk.clone(), false) {
+        Err(e) => assert_eq!(e, Error::Corrupt("tree node checksum")),
+        Ok(mut fs) => {
+            assert!(matches!(fs.stat(ino), Err(Error::Corrupt(_))));
+            assert!(fs.check().is_err());
+        }
     }
-    // Flip a bit in the superblock's label.
-    disk.poke(110, 1);
-    assert!(matches!(
-        EclipseFS::mount(disk.clone(), false),
-        Err(Error::Corrupt(_))
-    ));
-    disk.poke(110, 1);
+}
+
+#[test]
+fn corruption_is_detected_v3() {
+    let disk = MemDisk::new(8 * MIB);
+    mkfs::format_v3(&*disk, &opts()).unwrap();
+    let ino = victim(&disk);
+    superblock_damage_is_detected(&disk);
     // Find the victim's inode record through the inode table's first extent
     // and flip a bit in its size.
-    let mut fs = EclipseFS::mount(disk.clone(), false).unwrap();
     let mut sb = vec![0u8; 4096];
     disk.read_at(0, &mut sb).unwrap();
     let itable_first_phys = u64::from_le_bytes(sb[168 + 96 + 8..168 + 96 + 16].try_into().unwrap());
-    drop(fs);
     // The last transaction is still in the journal and would repair the
     // record on mount: drop it first.
     let jstart = u64::from_le_bytes(sb[432..440].try_into().unwrap());
     disk.write_at(jstart * 4096, &[0u8; 4096]).unwrap();
     disk.poke((itable_first_phys * 4096 + ino * 256 + 25) as usize, 4);
-    fs = EclipseFS::mount(disk.clone(), false).unwrap();
+    let mut fs = EclipseFS::mount(disk.clone(), false).unwrap();
     assert!(matches!(fs.stat(ino), Err(Error::Corrupt(_))));
 }
 
