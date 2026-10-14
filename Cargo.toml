@@ -39,6 +39,9 @@ members = [
     # `zircon-object`, so it was built on every kernel build and **no `cargo
     # test`, `cargo fmt` or `cargo clippy` line in the tree ever named it**.
     "vendor/region-allocator",
+    # EclipseFS: the on-disk filesystem ported from eclipse-old's
+    # `eclipsefs-lib`, with the same interface as `vendor/btrfs-rs`.
+    "vendor/eclipsefs-rs",
     "hunter",
     # Host-testable cmdline parsers extracted from zCore (binary stays test=false).
     "zcore-boot-opts",
@@ -55,6 +58,9 @@ exclude = [
     "vendor/kernel-sync",
     "vendor/trapframe",
     "smoltcp",
+    # AES for EclipseFS encryption: crates.io aes 0.8.4 with AES-NI limited
+    # to targets with SSE (see its Cargo.toml).
+    "vendor/aes",
 ]
 
 [patch."https://github.com/DeathWish5/PreemptiveScheduler"]

@@ -99,6 +99,9 @@ pub enum LxError {
     ENOMSG = 42,
     /// Identifier removed
     EIDRM = 43,
+    /// Invalid request descriptor -- `FS_IOC_FIEMAP` with a flag the
+    /// filesystem does not know (`fiemap_prep`).
+    EBADR = 53,
     /// No data available (e.g. no such extended attribute)
     ENODATA = 61,
     /// Timer expired -- the errno `drm_syncobj_wait` returns on timeout, which
@@ -145,6 +148,9 @@ pub enum LxError {
     EADDRNOTAVAIL = 99,
     /// Message too long
     EMSGSIZE = 90,
+    /// Required key not available -- an encrypted file or directory whose
+    /// key has not been added (fscrypt).
+    ENOKEY = 126,
     /// Operation already in progress
     EALREADY = 114,
 }
@@ -160,6 +166,7 @@ impl fmt::Display for LxError {
             EINTR => "Interrupted system call",
             EIO => "I/O error",
             ENXIO => "No such device or address",
+            EBADR => "Invalid request descriptor",
             E2BIG => "Argument list too long",
             ENOEXEC => "Exec format error",
             EBADF => "Bad file number",
@@ -217,6 +224,7 @@ impl fmt::Display for LxError {
             EADDRNOTAVAIL => "Cannot assign requested address",
             EMSGSIZE => "Message too long",
             EALREADY => "Operation already in progress",
+            ENOKEY => "Required key not available",
             _ => "Unknown error",
         };
         write!(f, "{}", explain)
@@ -319,6 +327,7 @@ impl From<&FsError> for LxError {
             FsError::BadState => LxError::EBADFD,
             FsError::Broken => LxError::EPIPE,
             FsError::NoSuchDeviceOrAddress => LxError::ENXIO,
+            FsError::NoKey => LxError::ENOKEY,
         }
     }
 }
@@ -353,6 +362,7 @@ mod errno_tests {
             (LxError::EINTR, 4),
             (LxError::EIO, 5),
             (LxError::ENXIO, 6),
+            (LxError::EBADR, 53),
             (LxError::EBADF, 9),
             (LxError::EAGAIN, 11),
             (LxError::ENOMEM, 12),
@@ -386,6 +396,7 @@ mod errno_tests {
             (LxError::ECONNREFUSED, 111),
             (LxError::EALREADY, 114),
             (LxError::EINPROGRESS, 115),
+            (LxError::ENOKEY, 126),
         ] {
             assert_eq!(err as isize, n, "{:?}", err);
         }
@@ -437,6 +448,7 @@ mod errno_tests {
             (FsError::BadState, LxError::EBADFD),
             (FsError::Broken, LxError::EPIPE),
             (FsError::NoSuchDeviceOrAddress, LxError::ENXIO),
+            (FsError::NoKey, LxError::ENOKEY),
         ] {
             let name = alloc::format!("{:?}", fs);
             // Both impls, on the same value: the borrowing one is what an

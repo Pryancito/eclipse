@@ -35,6 +35,7 @@ cargo test -p hunter --lib -- --test-threads=1
 cargo test -p nvidia-rm-sys -- --test-threads=1
 cargo test -p rcore-fs --features std
 cargo test --release -p btrfs --features std
+cargo test --release -p eclipsefs --features std
 cargo test -p rcore-fs-sfs --features std
 cargo test -p rcore-fs-mountfs --lib
 cargo test -p rcore-fs-ramfs --lib

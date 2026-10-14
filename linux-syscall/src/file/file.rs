@@ -85,6 +85,25 @@ impl Staging {
     }
 }
 
+/// SEEK_DATA (3) and SEEK_HOLE (4) on a filesystem that cannot tell holes
+/// from data, as `generic_file_llseek_size` answers them: the whole file
+/// is data and the end of file is the only hole.
+fn seek_data_hole_generic(
+    size: u64,
+    whence: usize,
+    offset: i64,
+) -> linux_object::error::LxResult<u64> {
+    const SEEK_DATA: usize = 3;
+    if offset < 0 || offset as u64 >= size {
+        return Err(LxError::ENXIO);
+    }
+    Ok(if whence == SEEK_DATA {
+        offset as u64
+    } else {
+        size
+    })
+}
+
 /// `lseek(2)`'s `whence`, which the syscall declares `int` and this tree read
 /// as a `u8`.
 ///
@@ -136,6 +155,30 @@ fn sync_file_range_writes_back(flags: usize) -> LxResult<bool> {
         return Err(LxError::EINVAL);
     }
     Ok(flags != 0)
+}
+
+/// What an EclipseFS ioctl needs from the calling process: its descriptors,
+/// its view of the tree and its credentials.
+struct FsIoctlCtx<'a> {
+    proc: &'a LinuxProcess,
+}
+
+impl linux_object::fs::FsIoctlContext for FsIoctlCtx<'_> {
+    fn file(&self, fd: i32) -> LxResult<Arc<File>> {
+        self.proc.get_file(FileDesc::from(fd))
+    }
+
+    fn lookup(&self, path: &str) -> LxResult<Arc<dyn INode>> {
+        self.proc.lookup_inode(path)
+    }
+
+    fn capable(&self, cap: u32) -> bool {
+        linux_object::process::has_capability(self.proc.euid(), cap)
+    }
+
+    fn euid(&self) -> u32 {
+        self.proc.euid()
+    }
 }
 
 #[cfg(test)]
@@ -776,6 +819,19 @@ impl Syscall<'_> {
     /// repositions the offset of the open file associated with the file descriptor fd
     /// to the argument offset according to the directive whence
     pub fn sys_lseek(&self, fd: FileDesc, offset: i64, whence: usize) -> SysResult {
+        const SEEK_DATA: usize = 3;
+        const SEEK_HOLE: usize = 4;
+        if whence == SEEK_DATA || whence == SEEK_HOLE {
+            let proc = self.linux_process();
+            let file_like = proc.get_file_like(fd)?;
+            let file = file_like.downcast_ref::<File>().ok_or(LxError::EINVAL)?;
+            let pos = match linux_object::fs::eclipsefs_seek(file, whence, offset) {
+                Some(r) => r?,
+                None => seek_data_hole_generic(file.metadata()?.size as u64, whence, offset)?,
+            };
+            file.seek(SeekFrom::Start(pos))?;
+            return Ok(pos as usize);
+        }
         let pos = seek_from(whence, offset)?;
         info!("lseek: fd={:?}, pos={:?}", fd, pos);
 
@@ -1030,6 +1086,16 @@ impl Syscall<'_> {
             _ => return Err(LxError::ENODEV),
         };
         let end = offset.checked_add(len).ok_or(LxError::EFBIG)?;
+        // EclipseFS has an extent map: real preallocation, and a punched
+        // hole that gives its blocks back instead of a write of zeros.
+        if resizable {
+            if let Some(res) =
+                linux_object::fs::eclipsefs_fallocate(&file, mode as u32, offset as u64, len as u64)
+            {
+                res?;
+                return Ok(0);
+            }
+        }
         let keep_size = match op {
             FallocateOp::Allocate { keep_size } | FallocateOp::ZeroRange { keep_size } => keep_size,
         };
@@ -1117,6 +1183,45 @@ impl Syscall<'_> {
             None
         };
 
+        // Two files of one EclipseFS mount at block-aligned offsets: share
+        // the blocks (a reflink, as btrfs does here) instead of copying them.
+        if let (Some(src), Some(dst)) = (
+            in_file.downcast_ref::<File>(),
+            out_file.downcast_ref::<File>(),
+        ) {
+            if src.flags().readable() && dst.flags().writable() {
+                let src_pos = match read_offset {
+                    Some(off) => off,
+                    None => src.seek(SeekFrom::Current(0))?,
+                };
+                let dst_pos = match write_offset {
+                    Some(off) => off,
+                    None => dst.seek(SeekFrom::Current(0))?,
+                };
+                if let Some(res) = linux_object::fs::eclipsefs_copy_reflink(
+                    src,
+                    src_pos,
+                    dst,
+                    dst_pos,
+                    count as u64,
+                ) {
+                    let n = res?;
+                    match read_offset {
+                        Some(_) => in_offset.write(src_pos + n)?,
+                        None => {
+                            src.seek(SeekFrom::Start(src_pos + n))?;
+                        }
+                    }
+                    match write_offset {
+                        Some(_) => out_offset.write(dst_pos + n)?,
+                        None => {
+                            dst.seek(SeekFrom::Start(dst_pos + n))?;
+                        }
+                    }
+                    return Ok(n as usize);
+                }
+            }
+        }
         let waits = self.waits_for_room(&out_file);
         let copied = copy_range(&in_file, read_offset, &out_file, write_offset, count, waits)
             .await
@@ -2140,6 +2245,15 @@ impl Syscall<'_> {
                 {
                     dev.present_fence_sleep(request as u32, arg1).await?;
                 }
+            }
+        }
+        // The filesystem ioctls of an EclipseFS mount (chattr, reflink,
+        // snapshots, quotas, scrub, devices): some carry another descriptor
+        // or a device path, which only the process can resolve.
+        if let Some(file) = file_like.downcast_ref::<File>() {
+            let ctx = FsIoctlCtx { proc };
+            if let Some(res) = linux_object::fs::eclipsefs_ioctl(file, request as u32, arg1, &ctx) {
+                return res;
             }
         }
         // File ioctls served at the VFS layer, como en Linux (fs/ioctl.c
@@ -3357,75 +3471,7 @@ mod pipe_size_tests {
 /// `whence` seeked to the offset instead of erroring, and a bad `mode` became
 /// F_OK, which is the one answer a permission probe must never invent.
 #[cfg(test)]
-mod seek_and_access_tests {
-    use super::*;
-
-    /// `SeekFrom` does not implement `PartialEq`, so compare by shape.
-    fn seek(whence: usize, offset: i64) -> Result<SeekFrom, LxError> {
-        seek_from(whence, offset)
-    }
-
-    #[test]
-    fn the_three_whences_translate() {
-        assert!(matches!(seek(0, 42), Ok(SeekFrom::Start(42))));
-        assert!(matches!(seek(1, -42), Ok(SeekFrom::Current(-42))));
-        assert!(matches!(seek(2, -42), Ok(SeekFrom::End(-42))));
-    }
-
-    #[test]
-    fn a_relative_seek_may_be_negative() {
-        // SEEK_CUR and SEEK_END are relative, so Linux checks the *resulting*
-        // position, not the argument. Rejecting these would break every
-        // `lseek(fd, -n, SEEK_END)`, which is how a reader finds a trailer.
-        assert!(matches!(seek(1, i64::MIN), Ok(SeekFrom::Current(i64::MIN))));
-        assert!(matches!(seek(2, -1), Ok(SeekFrom::End(-1))));
-    }
-
-    #[test]
-    fn an_absolute_seek_may_not_be_negative() {
-        // `vfs_setpos()` answers EINVAL. Read as `offset as u64` it became a
-        // position near 2^64, which leaves the syscall looking like an errno.
-        assert_eq!(seek(0, -1).err(), Some(LxError::EINVAL));
-        assert_eq!(seek(0, i64::MIN).err(), Some(LxError::EINVAL));
-        assert!(matches!(seek(0, 0), Ok(SeekFrom::Start(0))));
-    }
-
-    #[test]
-    fn an_unknown_whence_is_rejected_instead_of_truncated() {
-        // 0x100 has low byte 0, so it used to mean SEEK_SET and the file
-        // position quietly moved to `offset`.
-        assert_eq!(seek(0x100, 42).err(), Some(LxError::EINVAL));
-        assert_eq!(seek(0x102, 42).err(), Some(LxError::EINVAL));
-        // SEEK_DATA and SEEK_HOLE are not implemented; they must say so rather
-        // than land on one of the three above.
-        assert_eq!(seek(3, 0).err(), Some(LxError::EINVAL));
-        assert_eq!(seek(4, 0).err(), Some(LxError::EINVAL));
-        assert_eq!(seek(usize::MAX, 0).err(), Some(LxError::EINVAL));
-    }
-
-    #[test]
-    fn the_access_modes_pass_through() {
-        // R_OK | W_OK | X_OK and every combination below them, F_OK included.
-        for mode in 0..=0o7usize {
-            assert_eq!(
-                Syscall::access_mode(mode),
-                Ok(mode as u16),
-                "mode {:o}",
-                mode
-            );
-        }
-    }
-
-    #[test]
-    fn a_mode_outside_rwx_is_rejected_instead_of_masked() {
-        // `do_faccessat()`: `if (mode & ~S_IRWXO) return -EINVAL;`. Masked
-        // instead, `access(path, 8)` asked F_OK and answered "yes, you may"
-        // for any file that merely exists.
-        assert_eq!(Syscall::access_mode(0o10), Err(LxError::EINVAL));
-        assert_eq!(Syscall::access_mode(0o17), Err(LxError::EINVAL));
-        assert_eq!(Syscall::access_mode(usize::MAX), Err(LxError::EINVAL));
-    }
-}
+mod seek_and_access_tests;
 
 #[cfg(test)]
 mod truncate_type_tests {

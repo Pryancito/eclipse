@@ -1,16 +1,16 @@
 //! Generación de imágenes btrfs (rootfs y plantilla de HOME) usando el
 //! crate `btrfs` del propio árbol — sin depender de btrfs-progs en el host.
 
+use super::tree_image::{populate, Node, TreeFs};
 use btrfs::device::{BlockDevice, FileDevice};
 use btrfs::{mkfs, Btrfs, FileKind};
 use rand::RngCore;
 use std::fs;
-use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-fn random_uuid() -> [u8; 16] {
+pub(super) fn random_uuid() -> [u8; 16] {
     let mut u = [0u8; 16];
     rand::thread_rng().fill_bytes(&mut u);
     // Bits de versión (4) y variante RFC 4122, como uuidgen.
@@ -56,97 +56,42 @@ pub fn make_btrfs_image(image: &Path, size: u64, label: &str, rootdir: Option<&P
     fs.sync().expect("sync de la imagen btrfs falló");
 }
 
-fn populate(fs: &mut Btrfs, dir_ino: u64, dir: &Path) {
-    let mut entries: Vec<_> = fs::read_dir(dir)
-        .unwrap_or_else(|e| panic!("read_dir {:?}: {}", dir, e))
-        .map(|e| e.unwrap())
-        .collect();
-    entries.sort_by_key(|e| e.file_name());
-    for entry in entries {
-        let name = entry.file_name();
-        let path = entry.path();
-        // btrfs stores names as bytes, but this driver's API takes `&str`. A
-        // name that is not UTF-8 used to abort with a message that did not say
-        // which file, in a build that walks tens of thousands of them.
-        let name = name
-            .to_str()
-            .unwrap_or_else(|| panic!("nombre de archivo no UTF-8: {:?}", path));
-        let meta = fs::symlink_metadata(&path).unwrap();
-        let mode = meta.permissions().mode() & 0o7777;
-        if meta.file_type().is_symlink() {
-            let target = fs::read_link(&path).unwrap();
-            let target = target
-                .as_os_str()
-                .to_str()
-                .expect("destino de symlink no UTF-8");
-            fs.symlink(dir_ino, name, target.as_bytes())
-                .unwrap_or_else(|e| panic!("symlink {:?}: {:?}", path, e));
-        } else if meta.is_dir() {
-            let ino = fs
-                .create(dir_ino, name, FileKind::Dir, mode, 0)
-                .unwrap_or_else(|e| panic!("mkdir {:?}: {:?}", path, e));
-            populate(fs, ino, &path);
-        } else if meta.is_file() {
-            let ino = fs
-                .create(dir_ino, name, FileKind::Regular, mode, 0)
-                .unwrap_or_else(|e| panic!("create {:?}: {:?}", path, e));
-            let data = fs::read(&path).unwrap();
-            let mut off = 0u64;
-            for chunk in data.chunks(1024 * 1024) {
-                // `Btrfs::write` does a POSIX-style PARTIAL write when the
-                // image runs out of space: it returns `Ok(n)` with `n` short of
-                // the slice. Advancing by `chunk.len()` regardless loses the
-                // tail of this chunk and shifts every later one forward, so the
-                // file ends up the right size with the wrong contents and the
-                // build says nothing. Write what is left until it is all in, and
-                // treat a write that makes no progress as the disk-full it is.
-                let mut done = 0usize;
-                while done < chunk.len() {
-                    let n = fs
-                        .write(ino, off + done as u64, &chunk[done..])
-                        .unwrap_or_else(|e| {
-                            panic!("write {:?} @ {}: {:?}", path, off + done as u64, e)
-                        });
-                    assert!(
-                        n > 0,
-                        "write {:?} @ {} no avanzo: la imagen btrfs es demasiado pequena \
-                         ({} bytes del fichero sin escribir)",
-                        path,
-                        off + done as u64,
-                        data.len() as u64 - off - done as u64,
-                    );
-                    done += n;
-                }
-                off += chunk.len() as u64;
-            }
-        } else {
-            // Nodos de dispositivo / FIFOs en el rootfs de build: poco
-            // habituales; se preservan con su rdev.
-            let kind = if meta.file_type().is_fifo() {
-                FileKind::Fifo
-            } else if meta.file_type().is_block_device() {
-                FileKind::BlockDevice
-            } else if meta.file_type().is_char_device() {
-                FileKind::CharDevice
-            } else {
-                // Sockets and anything else with no btrfs equivalent. Saying so
-                // is the point: the installed system will not have it, and this
-                // used to be the one branch that left no trace at all.
-                eprintln!(
-                    "warning: {} no se puede representar en btrfs y no entra en la imagen",
-                    path.display()
-                );
-                continue;
-            };
-            fs.create(dir_ino, name, kind, mode, meta.rdev())
-                .unwrap_or_else(|e| panic!("mknod {:?}: {:?}", path, e));
-        }
+impl TreeFs for Btrfs {
+    const NAME: &'static str = "btrfs";
+
+    fn create(
+        &mut self,
+        dir: u64,
+        name: &str,
+        kind: Node,
+        mode: u32,
+        rdev: u64,
+    ) -> Result<u64, String> {
+        let kind = match kind {
+            Node::Dir => FileKind::Dir,
+            Node::File => FileKind::Regular,
+            Node::Fifo => FileKind::Fifo,
+            Node::BlockDevice => FileKind::BlockDevice,
+            Node::CharDevice => FileKind::CharDevice,
+        };
+        Btrfs::create(self, dir, name, kind, mode, rdev).map_err(|e| format!("{e:?}"))
+    }
+
+    fn symlink(&mut self, dir: u64, name: &str, target: &[u8]) -> Result<(), String> {
+        Btrfs::symlink(self, dir, name, target)
+            .map(|_| ())
+            .map_err(|e| format!("{e:?}"))
+    }
+
+    fn write(&mut self, ino: u64, offset: u64, data: &[u8]) -> Result<usize, String> {
+        Btrfs::write(self, ino, offset, data).map_err(|e| format!("{e:?}"))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::{FileTypeExt, PermissionsExt};
     use std::process::Command;
 
     /// Un directorio propio por test: la suite corre en paralelo dentro de un

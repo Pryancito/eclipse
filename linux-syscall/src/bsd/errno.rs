@@ -22,9 +22,10 @@ use linux_object::error::LxError;
 
 /// Map an [`LxError`] to the FreeBSD `errno` a FreeBSD binary expects.
 ///
-/// Three errors have no peer on FreeBSD and say so here rather than landing
-/// on a number that means something else: `ETIME` (a timer that expired)
-/// answers `ETIMEDOUT`, and `EUNDEF` and `EBADFD` answer `EINVAL`.
+/// Errors with no peer on FreeBSD say so here rather than landing on a
+/// number that means something else: `ETIME` (a timer that expired) answers
+/// `ETIMEDOUT`, `EUNDEF`, `EBADFD` and `EBADR` answer `EINVAL`, and `ENOKEY`
+/// answers `EACCES`.
 pub fn lx_to_freebsd(err: LxError) -> i32 {
     match err {
         // Not an error number on either system. It reaches here only from a
@@ -89,6 +90,13 @@ pub fn lx_to_freebsd(err: LxError) -> i32 {
         // pass-through would report a symlink loop for an expired timer.
         // `ETIMEDOUT` is the one a FreeBSD program tests for.
         LxError::ETIME => bsd::ETIMEDOUT,
+        // FreeBSD has no `EBADR` (FIEMAP's "unknown flag"); the request is
+        // invalid either way.
+        LxError::EBADR => bsd::EINVAL,
+        // FreeBSD has no `ENOKEY` (an encrypted file whose key is not
+        // there) and no fscrypt; what the program meets is a file it may
+        // not read.
+        LxError::ENOKEY => bsd::EACCES,
         LxError::EOVERFLOW => bsd::EOVERFLOW,
         // FreeBSD has no `EBADFD` ("the descriptor is fine, the object behind
         // it is not"). Its number over there is `ENOLCK`. `EBADF` would be
@@ -169,6 +177,7 @@ mod tests {
         LxError::EIDRM,
         LxError::ENODATA,
         LxError::ETIME,
+        LxError::EBADR,
         LxError::EBADFD,
         LxError::EOVERFLOW,
         LxError::ENOTSOCK,
@@ -188,6 +197,7 @@ mod tests {
         LxError::EADDRNOTAVAIL,
         LxError::EMSGSIZE,
         LxError::EALREADY,
+        LxError::ENOKEY,
     ];
 
     #[test]
@@ -229,6 +239,7 @@ mod tests {
         // number that means something else over there.
         assert_eq!(lx_to_freebsd(LxError::ETIME), 60); // ETIMEDOUT
         assert_eq!(lx_to_freebsd(LxError::EBADFD), 22); // EINVAL
+        assert_eq!(lx_to_freebsd(LxError::ENOKEY), 13); // EACCES
     }
 
     #[test]
@@ -246,7 +257,7 @@ mod tests {
     }
 
     /// A hand-written table of sixty-odd rows earns exactly one kind of
-    /// mistake: two unrelated errors typed onto one number. Only the three
+    /// mistake: two unrelated errors typed onto one number. Only the ones
     /// that have no FreeBSD peer are allowed to share.
     #[test]
     fn only_the_errors_without_a_peer_share_a_number() {
@@ -259,6 +270,8 @@ mod tests {
                     (LxError::EUNDEF, LxError::EINVAL)
                         | (LxError::EUNDEF, LxError::EBADFD)
                         | (LxError::EINVAL, LxError::EBADFD)
+                        | (LxError::EUNDEF, LxError::EBADR)
+                        | (LxError::EACCES, LxError::ENOKEY)
                         | (LxError::ETIMEDOUT, LxError::ETIME)
                         | (LxError::ETIME, LxError::ETIMEDOUT)
                 );

@@ -100,7 +100,7 @@ other-test:
 # build image from rootfs
 image: rootfs
 ifeq ($(XTASK), 1)
-	cargo image --arch $(ARCH) --variant $(VARIANT)
+	ECLIPSE_ROOTFS_FS=$(ROOTFS_FS) cargo image --arch $(ARCH) --variant $(VARIANT)
 else ifeq ($(ARCH), riscv64)
 	@echo building riscv.img
 	@rcore-fs-fuse zCore/riscv64.img rootfs/riscv zip
@@ -208,8 +208,12 @@ AARCH64_BOOT_DIR := $(AARCH64_DISK)/EFI/Boot
 # target does not touch Boot.json -- only `run` and `debugrun` do.
 ISO_CMDLINE_AARCH64 := LOG=$(LOG):TERM=xterm-256color:console.shell=true:virtcon.disable=true:ROOTPROC=/bin/busybox?sh:desktop=none:renderer=auto
 EFI_GZ := $(ARTIFACTS)/efi$(VARIANT_SUFFIX).img.gz
-ROOTFS_GZ := $(ARTIFACTS)/rootfs$(VARIANT_SUFFIX).btrfs.gz
-HOME_GZ := $(ARTIFACTS)/home$(VARIANT_SUFFIX).btrfs.gz
+# Filesystem of the installed ROOT/HOME: btrfs (default) or eclipsefs. It is
+# the payloads' extension, and install-eclipse picks the filesystem from which
+# payload the ISO carries.
+ROOTFS_FS ?= btrfs
+ROOTFS_GZ := $(ARTIFACTS)/rootfs$(VARIANT_SUFFIX).$(ROOTFS_FS).gz
+HOME_GZ := $(ARTIFACTS)/home$(VARIANT_SUFFIX).$(ROOTFS_FS).gz
 
 # The ESP that every distribution image is cut from, built for THIS variant.
 #
@@ -253,10 +257,12 @@ ifeq ($(ARCH), x86_64)
 	@mkdir -p "$(ISO_STAGING)/boot"
 	@cp -f "$(ESP_IMG)" "$(ISO_STAGING)/boot/efi.img"
 	@# Los payloads van con su NOMBRE DE SIEMPRE dentro de la ISO:
-	@# install-eclipse busca /boot/rootfs.btrfs.gz, no el nombre de la variante.
+	@# install-eclipse busca /boot/rootfs.<fs>.gz, no el nombre de la variante,
+	@# y elige el FS según cuál encuentre: se borra el del otro FS.
 	@cp -f "$(EFI_GZ)" "$(ISO_STAGING)/boot/efi.img.gz"
-	@cp -f "$(ROOTFS_GZ)" "$(ISO_STAGING)/boot/rootfs.btrfs.gz"
-	@cp -f "$(HOME_GZ)" "$(ISO_STAGING)/boot/home.btrfs.gz"
+	@rm -f "$(ISO_STAGING)"/boot/rootfs.*.gz "$(ISO_STAGING)"/boot/home.*.gz
+	@cp -f "$(ROOTFS_GZ)" "$(ISO_STAGING)/boot/rootfs.$(ROOTFS_FS).gz"
+	@cp -f "$(HOME_GZ)" "$(ISO_STAGING)/boot/home.$(ROOTFS_FS).gz"
 	@xorriso -as mkisofs \
 		-R -J -V "ECLIPSE" \
 		-publisher "Eclipse $(VARIANT) $(ARCH)" \

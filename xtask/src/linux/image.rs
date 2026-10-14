@@ -28,8 +28,62 @@ fn efi_fat_size_for(initramfs_bytes: u64, zcore_bytes: u64, boot_bytes: u64) -> 
     EFI_PARTITION_BYTES
 }
 
-/// Installer payloads staged under the rootfs `/boot` for the live installer.
-const BOOT_PAYLOADS: [&str; 3] = ["efi.img.gz", "rootfs.btrfs.gz", "home.btrfs.gz"];
+/// Filesystem of the installed system's ROOT and HOME images: btrfs unless
+/// the build is run with `ECLIPSE_ROOTFS_FS=eclipsefs`. Its name is also the
+/// payloads' extension (`rootfs.btrfs.gz`, `rootfs.eclipsefs.gz`) and the
+/// type in fstab, and the installer picks the filesystem from which payload
+/// the medium carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DiskFs {
+    Btrfs,
+    EclipseFs,
+}
+
+impl DiskFs {
+    pub(crate) const ALL: [DiskFs; 2] = [DiskFs::Btrfs, DiskFs::EclipseFs];
+
+    pub(crate) fn from_env() -> Self {
+        match std::env::var("ECLIPSE_ROOTFS_FS").as_deref() {
+            Err(_) | Ok("") | Ok("btrfs") => DiskFs::Btrfs,
+            Ok("eclipsefs") => DiskFs::EclipseFs,
+            Ok(other) => panic!("ECLIPSE_ROOTFS_FS={other}: se esperaba btrfs o eclipsefs"),
+        }
+    }
+
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            DiskFs::Btrfs => "btrfs",
+            DiskFs::EclipseFs => "eclipsefs",
+        }
+    }
+
+    fn make_image(self, image: &Path, size: u64, label: &str, rootdir: Option<&Path>) {
+        match self {
+            DiskFs::Btrfs => super::btrfs_image::make_btrfs_image(image, size, label, rootdir),
+            DiskFs::EclipseFs => {
+                super::eclipsefs_image::make_eclipsefs_image(image, size, label, rootdir)
+            }
+        }
+    }
+}
+
+/// Installer payloads staged under the rootfs `/boot` for the live installer,
+/// for disk images of filesystem `fs`.
+fn boot_payloads(fs: DiskFs) -> [String; 3] {
+    [
+        String::from("efi.img.gz"),
+        format!("rootfs.{}.gz", fs.name()),
+        format!("home.{}.gz", fs.name()),
+    ]
+}
+
+/// Every payload any build may have staged, to clear them all.
+fn all_boot_payloads() -> Vec<String> {
+    let mut all: Vec<String> = DiskFs::ALL.into_iter().flat_map(boot_payloads).collect();
+    all.sort();
+    all.dedup();
+    all
+}
 
 /// Recursively sum the size (in bytes) of regular files under `path`.
 fn dir_size(path: &Path) -> u64 {
@@ -325,7 +379,7 @@ impl super::LinuxRootfs {
             // failed) build. `make(false)` never clears the rootfs, so without
             // this the base initramfs / rootfs.btrfs below would be polluted
             // with stale efi.img.gz / *.btrfs.gz and overflow their images.
-            for name in BOOT_PAYLOADS {
+            for name in all_boot_payloads() {
                 let _ = fs::remove_file(boot_dir.join(name));
             }
 
@@ -503,56 +557,58 @@ impl super::LinuxRootfs {
             // *after* the ISO installer SFS is fused, so Mesa never lands in
             // the ISO initramfs.
 
-            // 5. Build rootfs.btrfs from the FULL rootfs (the installed system's
-            // real root, reached by pivot). Size it to the actual rootfs with
-            // generous headroom.
-            println!("Building rootfs.btrfs...");
-            let btrfs_img = self.artifact("rootfs", "btrfs");
-            let rootfs_btrfs_size = std::cmp::max(
+            // 5. Build the ROOT image (btrfs, or EclipseFS with
+            // ECLIPSE_ROOTFS_FS=eclipsefs) from the FULL rootfs (the installed
+            // system's real root, reached by pivot). Size it to the actual
+            // rootfs with generous headroom.
+            let disk_fs = DiskFs::from_env();
+            let ext = disk_fs.name();
+            println!("Building rootfs.{ext}...");
+            let root_img = self.artifact("rootfs", ext);
+            let rootfs_img_size = std::cmp::max(
                 96 * 1024 * 1024u64,
                 padded_image_size(dir_size(&rootfs_path), 3, 5, 32),
             );
-            super::btrfs_image::make_btrfs_image(
-                &btrfs_img,
-                rootfs_btrfs_size,
-                "ECLIPSE",
-                Some(&rootfs_path),
-            );
+            disk_fs.make_image(&root_img, rootfs_img_size, "ECLIPSE", Some(&rootfs_path));
 
-            println!("Compressing rootfs.btrfs -> rootfs.btrfs.gz...");
-            let target_btrfs_gz = self.artifact("rootfs", "btrfs.gz");
+            println!("Compressing rootfs.{ext} -> rootfs.{ext}.gz...");
+            let target_root_gz = self.artifact("rootfs", &format!("{ext}.gz"));
             let status = std::process::Command::new("gzip")
                 .arg("-c")
-                .arg(&btrfs_img)
-                .stdout(fs::File::create(&target_btrfs_gz).unwrap())
+                .arg(&root_img)
+                .stdout(fs::File::create(&target_root_gz).unwrap())
                 .status()
                 .unwrap();
-            assert!(status.success(), "Failed to compress rootfs.btrfs");
+            assert!(status.success(), "Failed to compress rootfs.{ext}");
 
-            // 5b. Empty btrfs template used by the installer to format HOME
+            // 5b. Empty template used by the installer to format HOME
             // (written raw onto the partition; the kernel auto-expands it).
-            println!("Building home.btrfs template...");
-            let home_img = self.artifact("home", "btrfs");
-            super::btrfs_image::make_btrfs_image(&home_img, 32 * 1024 * 1024, "HOME", None);
-            let target_home_gz = self.artifact("home", "btrfs.gz");
+            println!("Building home.{ext} template...");
+            let home_img = self.artifact("home", ext);
+            disk_fs.make_image(&home_img, 32 * 1024 * 1024, "HOME", None);
+            let target_home_gz = self.artifact("home", &format!("{ext}.gz"));
             let status = std::process::Command::new("gzip")
                 .arg("-c")
                 .arg(&home_img)
                 .stdout(fs::File::create(&target_home_gz).unwrap())
                 .status()
                 .unwrap();
-            assert!(status.success(), "Failed to compress home.btrfs");
+            assert!(status.success(), "Failed to compress home.{ext}");
 
             // 5c. Stage the payloads in the MINIMAL live root's /boot so the
             // live installer (which runs from this very initramfs) can find
-            // them. They go into live_root — never the full rootfs — so
-            // rootfs.btrfs.gz above is not polluted with the installer's own
+            // them. They go into live_root — never the full rootfs — so the
+            // ROOT image above is not polluted with the installer's own
             // payloads.
             let live_boot = live_root.join("boot");
             fs::create_dir_all(&live_boot).unwrap();
+            for name in all_boot_payloads() {
+                let _ = fs::remove_file(live_boot.join(&name));
+                let _ = fs::remove_file(live_boot.join(format!("{name}.sha256")));
+            }
             fs::copy(&target_efi_gz, live_boot.join("efi.img.gz")).unwrap();
-            fs::copy(&target_btrfs_gz, live_boot.join("rootfs.btrfs.gz")).unwrap();
-            fs::copy(&target_home_gz, live_boot.join("home.btrfs.gz")).unwrap();
+            fs::copy(&target_root_gz, live_boot.join(format!("rootfs.{ext}.gz"))).unwrap();
+            fs::copy(&target_home_gz, live_boot.join(format!("home.{ext}.gz"))).unwrap();
 
             // The installer checks each payload against `<name>.sha256`
             // before it writes a byte to the disk. Nobody ever wrote those
@@ -560,8 +616,8 @@ impl super::LinuxRootfs {
             // boot/efi.img.gz.sha256; se omite verificación SHA-256 previa"
             // and then wrote a payload it had not looked at. They are hashed
             // here, from the very copies that ship.
-            for name in BOOT_PAYLOADS {
-                let payload = live_boot.join(name);
+            for name in boot_payloads(disk_fs) {
+                let payload = live_boot.join(&name);
                 println!("Hashing {name}...");
                 crate::sha256::write_sidecar(&payload)
                     .unwrap_or_else(|e| panic!("Failed to write {name}.sha256: {e}"));
@@ -1007,11 +1063,27 @@ mod image_size_tests {
     /// agree, and a duplicate would mean one of them is never staged.
     #[test]
     fn the_boot_payloads_are_distinct_gz_names() {
-        let mut seen = std::collections::BTreeSet::new();
-        for name in BOOT_PAYLOADS {
-            assert!(seen.insert(name), "{name} is listed twice");
-            assert!(name.ends_with(".gz"), "{name} is written out compressed");
-            assert!(!name.contains('/'), "{name} is staged flat into /boot");
+        for disk_fs in DiskFs::ALL {
+            let mut seen = std::collections::BTreeSet::new();
+            for name in boot_payloads(disk_fs) {
+                assert!(name.ends_with(".gz"), "{name} is written out compressed");
+                assert!(!name.contains('/'), "{name} is staged flat into /boot");
+                assert!(seen.insert(name.clone()), "{name} is listed twice");
+            }
+        }
+        // The two filesystems share only the EFI image, and the clean-up
+        // list has all five.
+        assert_eq!(all_boot_payloads().len(), 5);
+    }
+
+    /// btrfs unless the build asks for EclipseFS, and a typo is an error,
+    /// not a silent btrfs.
+    #[test]
+    fn the_disk_filesystem_is_btrfs_unless_asked_for() {
+        assert_eq!(DiskFs::Btrfs.name(), "btrfs");
+        assert_eq!(DiskFs::EclipseFs.name(), "eclipsefs");
+        if std::env::var("ECLIPSE_ROOTFS_FS").is_err() {
+            assert_eq!(DiskFs::from_env(), DiskFs::Btrfs);
         }
     }
 
@@ -1087,7 +1159,7 @@ mod image_size_tests {
         let installer =
             fs::read_to_string(PROJECT_DIR.join("tools/install-eclipse/install-eclipse.c"))
                 .unwrap();
-        for name in BOOT_PAYLOADS {
+        for name in DiskFs::ALL.into_iter().flat_map(boot_payloads) {
             assert!(
                 installer.contains(&format!("/boot/{name}")),
                 "the installer does not open /boot/{name}"

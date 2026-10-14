@@ -1,10 +1,12 @@
 mod btrfs_image;
 mod desktop;
+mod eclipsefs_image;
 mod image;
 pub(crate) mod nvidia_firmware;
 mod opencv;
 mod portal;
 mod test;
+mod tree_image;
 mod verify;
 mod xorg;
 
@@ -345,15 +347,12 @@ impl LinuxRootfs {
         Self::write_pulse_conf(&dir);
         Self::ensure_pulse_accounts(&dir);
 
-        // /etc/fstab — placeholders sustituidos por install-eclipse (sin mount syscall)
+        // /etc/fstab — placeholders sustituidos por install-eclipse (sin mount
+        // syscall en btrfs; EclipseFS lleva checksum de los datos, asi que alli
+        // el instalador lo reescribe montando la particion).
         fs::write(
             etc.join("fstab"),
-            b"# /etc/fstab - generado por install-eclipse\n\
-# <dispositivo>      <punto de montaje>  <tipo>  <opciones>       <dump>  <pass>\n\
-__ECLIPSE_ROOT_DEV__  /                  btrfs   defaults          0  1\n\
-__ECLIPSE_EFI_DEV___  /boot/efi          vfat    defaults,noatime  0  0\n\
-__ECLIPSE_HOME_DEV__  /home              btrfs   defaults          0  0\n\
-__ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
+            Self::fstab_template(image::DiskFs::from_env()),
         )
         .unwrap();
 
@@ -3237,6 +3236,21 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n",
     /// daemon. The kernel PCM stays available as `eclipse_hw` / `hw:0,0` for
     /// the Pulse sink itself and for diagnostics. Without the plugin, `default`
     /// stays direct `hw:0,0` (the old single-client path).
+    /// The `/etc/fstab` the installed system starts from: the installer
+    /// fills in the devices. The disk lines say which filesystem the images
+    /// are (`fs`); their columns are the ones `install-eclipse` looks for.
+    fn fstab_template(fs: image::DiskFs) -> String {
+        let t = format!("{:<7} ", fs.name());
+        format!(
+            "# /etc/fstab - generado por install-eclipse\n\
+# <dispositivo>      <punto de montaje>  <tipo>  <opciones>       <dump>  <pass>\n\
+__ECLIPSE_ROOT_DEV__  /                  {t}defaults          0  1\n\
+__ECLIPSE_EFI_DEV___  /boot/efi          vfat    defaults,noatime  0  0\n\
+__ECLIPSE_HOME_DEV__  /home              {t}defaults          0  0\n\
+__ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n"
+        )
+    }
+
     fn write_asound_conf(rootfs: &Path) {
         let etc = rootfs.join("etc");
         let _ = fs::create_dir_all(&etc);
@@ -5007,6 +5021,49 @@ mod var_run_tests {
         assert_eq!(fs::read_link(&link).unwrap(), Path::new("../run"));
 
         let _ = fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod fstab_template_tests {
+    use super::*;
+
+    /// The btrfs template is patched in place by `install-eclipse`, which
+    /// looks for each line exactly as its `FSTAB_TEMPLATE_LINE_*` says: a
+    /// column moved by one space and the installed system boots with a
+    /// placeholder for a device.
+    #[test]
+    fn the_btrfs_template_has_the_lines_the_installer_patches() {
+        let installer =
+            fs::read_to_string(PROJECT_DIR.join("tools/install-eclipse/install-eclipse.c"))
+                .unwrap();
+        let template = LinuxRootfs::fstab_template(image::DiskFs::Btrfs);
+        let mut found = 0;
+        for line in installer.lines() {
+            let Some(rest) = line.strip_prefix("#define FSTAB_TEMPLATE_LINE_") else {
+                continue;
+            };
+            let quoted = rest.split('"').nth(1).unwrap();
+            assert!(
+                template.lines().any(|l| l == quoted),
+                "the template has no line {quoted:?}"
+            );
+            found += 1;
+        }
+        assert_eq!(found, 4, "ROOT, EFI, HOME and SWAP");
+    }
+
+    /// With EclipseFS images, the disk lines say so (the installer rewrites
+    /// the file by mounting the partition, so only the type matters).
+    #[test]
+    fn the_eclipsefs_template_names_eclipsefs_for_root_and_home() {
+        let template = LinuxRootfs::fstab_template(image::DiskFs::EclipseFs);
+        let types: Vec<&str> = template
+            .lines()
+            .filter(|l| !l.starts_with('#'))
+            .map(|l| l.split_whitespace().nth(2).unwrap())
+            .collect();
+        assert_eq!(types, ["eclipsefs", "vfat", "eclipsefs", "swap"]);
     }
 }
 
