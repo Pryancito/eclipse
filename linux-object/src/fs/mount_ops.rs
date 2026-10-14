@@ -13,6 +13,7 @@ use crate::process::LinuxProcess;
 
 use super::block_mount::MountBackend;
 use super::btrfs_mount::open_btrfs;
+use super::eclipsefs_mount::open_eclipsefs;
 use super::fat_mount::open_fat;
 use super::flagged_fs::wrap_fs;
 use super::mount_state::{
@@ -83,6 +84,8 @@ pub(crate) fn parse_fstype(fstype: &str) -> LxResult<&'static str> {
     }
     if fstype.eq_ignore_ascii_case("btrfs") {
         Ok("btrfs")
+    } else if fstype.eq_ignore_ascii_case("eclipsefs") {
+        Ok("eclipsefs")
     } else if fstype.eq_ignore_ascii_case("vfat")
         || fstype.eq_ignore_ascii_case("fat")
         || fstype.eq_ignore_ascii_case("fat32")
@@ -102,6 +105,7 @@ pub(crate) fn open_filesystem(
 ) -> LxResult<Arc<dyn FileSystem>> {
     match fstype {
         "btrfs" => open_btrfs(&backend, read_only).map_err(LxError::from),
+        "eclipsefs" => open_eclipsefs(&backend, read_only).map_err(LxError::from),
         "vfat" => open_fat(&backend)
             .map(|fs| fs as Arc<dyn FileSystem>)
             .map_err(LxError::from),
@@ -323,6 +327,8 @@ mod tests {
     fn the_filesystem_names_userland_uses_all_reach_the_same_driver() {
         assert_eq!(parse_fstype("btrfs"), Ok("btrfs"));
         assert_eq!(parse_fstype("BTRFS"), Ok("btrfs"));
+        assert_eq!(parse_fstype("eclipsefs"), Ok("eclipsefs"));
+        assert_eq!(parse_fstype("EclipseFS"), Ok("eclipsefs"));
         // `mount -t vfat`, `-t msdos` and what a fstab or a udisks helper
         // writes: five spellings, one driver.
         for name in ["vfat", "fat", "fat32", "fat16", "msdos", "MSDOS", "FAT32"] {

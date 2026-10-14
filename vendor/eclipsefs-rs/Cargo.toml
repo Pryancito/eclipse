@@ -1,0 +1,12 @@
+[package]
+name = "eclipsefs"
+version = "0.3.0"
+edition = "2021"
+description = "EclipseFS on-disk filesystem (no_std): read/write driver and mkfs, with the same interface the kernel uses from the `btrfs` crate"
+
+[features]
+default = []
+std = []
+
+[dependencies]
+log = "0.4"

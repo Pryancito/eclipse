@@ -17,8 +17,10 @@ use zcore_drivers::scheme::BlockScheme;
 
 use super::block_mount::{backend_size, device_from_backend, MountBackend};
 
-/// Adapter: rcore-fs `Device` (+ explicit size) → `btrfs::BlockDevice`.
-struct DevAdapter {
+/// Adapter: rcore-fs `Device` (+ explicit size) → `btrfs::BlockDevice`, and
+/// `eclipsefs::BlockDevice` too (see `eclipsefs_mount`): both crates take the
+/// same byte-addressed contract, so they share the chunking and retry policy.
+pub(super) struct DevAdapter {
     inner: Arc<dyn rcore_fs::dev::Device>,
     size: u64,
     /// Adaptive cap on a single backend transfer. Starts at `IO_CHUNK_BYTES`
@@ -51,6 +53,14 @@ const IO_CHUNK_BYTES: usize = 128 * 1024;
 const IO_MIN_BYTES: usize = 512;
 
 impl DevAdapter {
+    pub(super) fn new(inner: Arc<dyn rcore_fs::dev::Device>, size: u64) -> Self {
+        Self {
+            inner,
+            size,
+            max_xfer: AtomicUsize::new(IO_CHUNK_BYTES),
+        }
+    }
+
     /// The `usize` start of `[offset, offset + len)`, or `Err` when that is not
     /// a range this device has. Both directions ask the same question:
     /// `write_at` used to ask it and go ahead anyway, and `read_at` never asked
@@ -179,6 +189,24 @@ impl btrfs::BlockDevice for DevAdapter {
     }
 }
 
+impl eclipsefs::BlockDevice for DevAdapter {
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> eclipsefs::Result<()> {
+        btrfs::BlockDevice::read_at(self, offset, buf).map_err(|_| eclipsefs::Error::Io)
+    }
+
+    fn write_at(&self, offset: u64, buf: &[u8]) -> eclipsefs::Result<()> {
+        btrfs::BlockDevice::write_at(self, offset, buf).map_err(|_| eclipsefs::Error::Io)
+    }
+
+    fn sync(&self) -> eclipsefs::Result<()> {
+        btrfs::BlockDevice::sync(self).map_err(|_| eclipsefs::Error::Io)
+    }
+
+    fn size(&self) -> u64 {
+        self.size
+    }
+}
+
 fn map_err(e: BtrfsError) -> FsError {
     match e {
         BtrfsError::Io => FsError::DeviceError,
@@ -278,11 +306,7 @@ impl BtrfsMountFs {
     pub fn open(backend: &MountBackend, read_only: bool) -> Result<Arc<Self>> {
         let size = backend_size(backend)?;
         let device = device_from_backend(backend)?;
-        let adapter: Arc<dyn btrfs::BlockDevice> = Arc::new(DevAdapter {
-            inner: device,
-            size,
-            max_xfer: AtomicUsize::new(IO_CHUNK_BYTES),
-        });
+        let adapter: Arc<dyn btrfs::BlockDevice> = Arc::new(DevAdapter::new(device, size));
         warn!(
             "btrfs: mounting, device size = {:#x} ({} MiB), read_only={}",
             size,

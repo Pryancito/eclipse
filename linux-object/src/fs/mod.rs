@@ -4,6 +4,7 @@ mod block_mount;
 mod btrfs_mount;
 pub mod devfs;
 mod dmabuf;
+mod eclipsefs_mount;
 mod epoll;
 /// System-wide `epoll_wait(2)` usage counters, for `/proc/perf/kernel`.
 pub use epoll::stats as epoll_stats;
@@ -1735,7 +1736,10 @@ fn determine_real_root(
                 info!("create_root_fs: root via ROOT={} ({})", dev, fstype);
                 return Some((fs, String::from(dev), fstype));
             }
-            warn!("create_root_fs: ROOT={} no es un btrfs/ext2 montable", dev);
+            warn!(
+                "create_root_fs: ROOT={} no es un btrfs/EclipseFS montable",
+                dev
+            );
         } else {
             info!(
                 "create_root_fs: ROOT={} sin resolver; se intenta fstab/auto-detección",
@@ -1804,18 +1808,26 @@ fn lookup_candidate(candidates: &[(String, Arc<dyn INode>)], dev: &str) -> Optio
         .map(|(_, i)| i.clone())
 }
 
-/// Open a block-device (or loop file) inode as a btrfs filesystem, if possible.
-/// btrfs is the only on-disk root filesystem Eclipse supports; ext2 was removed.
+/// Open a block-device (or loop file) inode as a root filesystem, if possible:
+/// btrfs (the installed default) or EclipseFS. ext2 was removed.
 /// Returns the filesystem together with its fstype name.
 fn open_block_root(inode: Arc<dyn INode>) -> Option<(Arc<dyn FileSystem>, &'static str)> {
     let backend = block_mount::MountBackend::from_inode(inode).ok()?;
-    if let block_mount::MountBackend::Block(block) = &backend {
-        if !btrfs_mount::probe_btrfs_superblock(block) {
-            return None;
+    let fstype = match &backend {
+        block_mount::MountBackend::Block(block) => {
+            if btrfs_mount::probe_btrfs_superblock(block) {
+                "btrfs"
+            } else if eclipsefs_mount::probe_eclipsefs_superblock(block) {
+                "eclipsefs"
+            } else {
+                return None;
+            }
         }
-    }
-    let fs = mount_ops::open_filesystem(backend, "btrfs", false).ok()?;
-    Some((fs, "btrfs"))
+        // A loop file has no cheap probe; it has always been btrfs.
+        block_mount::MountBackend::File(_) => "btrfs",
+    };
+    let fs = mount_ops::open_filesystem(backend, fstype, false).ok()?;
+    Some((fs, fstype))
 }
 
 /// Open the root declared by the `/` entry of the boot medium's fstab, when
@@ -1838,9 +1850,9 @@ fn root_fs_from_fstab(
         if parts.len() < 3 || parts[1] != "/" {
             continue;
         }
-        // Only btrfs block-device roots can be mounted here.
+        // Only btrfs and EclipseFS block-device roots can be mounted here.
         let fstype = mount_ops::parse_fstype(parts[2]).ok()?;
-        if fstype != "btrfs" {
+        if fstype != "btrfs" && fstype != "eclipsefs" {
             return None;
         }
         let inode = lookup_candidate(candidates, parts[0])?;

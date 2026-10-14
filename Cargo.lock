@@ -766,6 +766,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9404d41caa1aa659f7be44d5a902e318c0672900822fe9ca41d9e38c14b52332"
 
 [[package]]
+name = "eclipsefs"
+version = "0.3.0"
+dependencies = [
+ "log",
+]
+
+[[package]]
 name = "either"
 version = "1.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1322,6 +1329,7 @@ dependencies = [
  "cfg-if 1.0.0",
  "delegate",
  "downcast-rs",
+ "eclipsefs",
  "fatfs",
  "futures",
  "hashbrown",
