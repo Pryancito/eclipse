@@ -123,8 +123,43 @@ mod hw {
     ///
     /// The CPU must support SSE4.2 ([`available`]).
     pub unsafe fn update(crc: u32, data: &[u8]) -> u32 {
+        // Three independent streams hide the instruction's latency (it
+        // takes three cycles but one can start every cycle): every block
+        // of 3 x STREAM bytes is three CRCs at once, joined by shifting.
+        let mut c = crc;
+        let mut data = data;
+        while data.len() >= 3 * STREAM {
+            let (a, rest) = data.split_at(STREAM);
+            let (b, rest) = rest.split_at(STREAM);
+            let (d, rest) = rest.split_at(STREAM);
+            let (a, b, d) = (
+                a.as_chunks::<8>().0,
+                b.as_chunks::<8>().0,
+                d.as_chunks::<8>().0,
+            );
+            let (mut x, mut y, mut z) = (c as u64, 0u64, 0u64);
+            for i in 0..STREAM / 8 {
+                // SAFETY: the caller checked for SSE4.2.
+                unsafe {
+                    core::arch::asm!(
+                        "crc32 {x}, {u}",
+                        "crc32 {y}, {v}",
+                        "crc32 {z}, {w}",
+                        x = inout(reg) x,
+                        y = inout(reg) y,
+                        z = inout(reg) z,
+                        u = in(reg) u64::from_le_bytes(a[i]),
+                        v = in(reg) u64::from_le_bytes(b[i]),
+                        w = in(reg) u64::from_le_bytes(d[i]),
+                        options(pure, nomem, nostack, preserves_flags),
+                    );
+                }
+            }
+            c = super::mulmod(SHIFT_2, x as u32) ^ super::mulmod(SHIFT_1, y as u32) ^ z as u32;
+            data = rest;
+        }
         let (chunks, rest) = data.as_chunks::<8>();
-        let mut c = crc as u64;
+        let mut c = c as u64;
         for ch in chunks {
             // SAFETY: the caller checked for SSE4.2.
             unsafe {
@@ -150,6 +185,48 @@ mod hw {
         }
         c
     }
+
+    /// Bytes per stream: three of them fill a 4 KiB block but 16 bytes.
+    const STREAM: usize = 1360;
+    /// x^(8 * STREAM) and x^(16 * STREAM) mod P: what the first two streams
+    /// are shifted by to join the third.
+    const SHIFT_1: u32 = super::x8n(STREAM as u64);
+    const SHIFT_2: u32 = super::x8n(2 * STREAM as u64);
+}
+
+/// Reflected polynomial of CRC32C.
+const POLY_C: u32 = 0x82F6_3B78;
+
+/// `a * b mod P` for CRC32C states (reflected: bit 31 is x^0).
+const fn mulmod(a: u32, b: u32) -> u32 {
+    let (mut m, mut b, mut p) = (1u32 << 31, b, 0u32);
+    while m != 0 {
+        if a & m != 0 {
+            p ^= b;
+        }
+        b = if b & 1 != 0 {
+            (b >> 1) ^ POLY_C
+        } else {
+            b >> 1
+        };
+        m >>= 1;
+    }
+    p
+}
+
+/// x^(8n) mod P: a raw CRC32C state followed by `n` zero bytes is the
+/// state times this.
+const fn x8n(n: u64) -> u32 {
+    let (mut p, mut sq, mut k) = (1u32 << 31, 1u32 << 23, n);
+    // sq walks x^8, x^16, x^32, ...
+    while k != 0 {
+        if k & 1 != 0 {
+            p = mulmod(p, sq);
+        }
+        sq = mulmod(sq, sq);
+        k >>= 1;
+    }
+    p
 }
 
 /// Table-driven CRC32C (slice-by-8), for CPUs without an instruction.
@@ -187,6 +264,21 @@ mod tests {
                 let d = &data[start..len.max(start)];
                 assert_eq!(crc32c_update(0x1234, d), crc32c_table(0x1234, d));
                 assert_eq!(crc32c(d), crc32c_table(0, d));
+            }
+        }
+    }
+
+    #[test]
+    fn crc32c_streams_join_at_every_length() {
+        let data: alloc::vec::Vec<u8> = (0..20_000u32).map(|i| (i * 97 + i / 13) as u8).collect();
+        for len in [4079, 4080, 4081, 4096, 8160, 8192 + 7, 12_241, 20_000] {
+            for start in [0, 5] {
+                let d = &data[start..len];
+                assert_eq!(
+                    crc32c_update(0xDEAD_BEEF, d),
+                    crc32c_table(0xDEAD_BEEF, d),
+                    "len {len}"
+                );
             }
         }
     }
