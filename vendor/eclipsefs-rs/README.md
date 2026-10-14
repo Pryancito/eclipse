@@ -204,7 +204,28 @@ grupo k (32768 bloques = 128 MiB)
 5. ~~Compresión zlib, lz4 y zstd~~.
 6. ~~send/receive incremental y cuotas~~.
 7. ~~Multidispositivo (DUP, RAID0/1/10/1C3/1C4), añadir/quitar/reemplazar y balance~~.
-8. ioctls del kernel e imágenes del instalador con EclipseFS.
+8. ~~ioctls del kernel e imágenes del instalador con EclipseFS~~.
+
+Con esto EclipseFS tiene todo lo de btrfs. Lo siguiente ya es propio.
+
+## En el kernel (fase 8)
+
+- `mount -t eclipsefs` entiende `compress=`, `compress-force=`, `degraded`,
+  `device=`, `subvol=` y `subvolid=`. Busca los demás dispositivos del
+  volumen entre los discos registrados (`eclipsefs::probe`, sin montar).
+- ioctls con los números de Linux/btrfs (`linux-object/src/fs/eclipsefs_ioctl.rs`),
+  así que `chattr`, `cp --reflink`, `btrfs subvolume|filesystem|device|scrub|balance|qgroup|send`
+  funcionan sin cambios. Todas menos receive, que va por `EFS_IOC_RECEIVE`.
+  Incluye `FS_IOC_GETFLAGS`/`SETFLAGS`, `FICLONE`/`FICLONERANGE`, `FIDEDUPERANGE`,
+  subvolúmenes y snapshots, subvolumen por defecto, `INO_LOOKUP`, `FS_INFO`,
+  `DEV_INFO`, scrub, cuotas, `ADD_DEV`/`RM_DEV`/`DEV_REPLACE`, `BALANCE_V2`
+  y `SEND`.
+- xattrs (`getxattr` y familia; `btrfs.compression` como en btrfs),
+  `fallocate` y `copy_file_range` con reflink.
+- Imágenes del instalador: `make iso ROOTFS_FS=eclipsefs` genera
+  `rootfs.eclipsefs.gz`/`home.eclipsefs.gz` con este crate, e
+  `install-eclipse` usa el FS del payload que lleve el medio. btrfs sigue
+  siendo el valor por defecto.
 
 ## Tests y benchmarks
 

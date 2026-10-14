@@ -20,8 +20,14 @@ pub(super) enum Node {
 pub(super) trait TreeFs {
     /// Como se llama en los mensajes ("btrfs", "eclipsefs").
     const NAME: &'static str;
-    fn create(&mut self, dir: u64, name: &str, kind: Node, mode: u32, rdev: u64)
-        -> Result<u64, String>;
+    fn create(
+        &mut self,
+        dir: u64,
+        name: &str,
+        kind: Node,
+        mode: u32,
+        rdev: u64,
+    ) -> Result<u64, String>;
     fn symlink(&mut self, dir: u64, name: &str, target: &[u8]) -> Result<(), String>;
     /// Escritura POSIX: puede quedarse corta si la imagen se llena.
     fn write(&mut self, ino: u64, offset: u64, data: &[u8]) -> Result<usize, String>;

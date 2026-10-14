@@ -1,8 +1,8 @@
 //! Generación de imágenes btrfs (rootfs y plantilla de HOME) usando el
 //! crate `btrfs` del propio árbol — sin depender de btrfs-progs en el host.
 
-use btrfs::device::{BlockDevice, FileDevice};
 use super::tree_image::{populate, Node, TreeFs};
+use btrfs::device::{BlockDevice, FileDevice};
 use btrfs::{mkfs, Btrfs, FileKind};
 use rand::RngCore;
 use std::fs;
@@ -59,7 +59,14 @@ pub fn make_btrfs_image(image: &Path, size: u64, label: &str, rootdir: Option<&P
 impl TreeFs for Btrfs {
     const NAME: &'static str = "btrfs";
 
-    fn create(&mut self, dir: u64, name: &str, kind: Node, mode: u32, rdev: u64) -> Result<u64, String> {
+    fn create(
+        &mut self,
+        dir: u64,
+        name: &str,
+        kind: Node,
+        mode: u32,
+        rdev: u64,
+    ) -> Result<u64, String> {
         let kind = match kind {
             Node::Dir => FileKind::Dir,
             Node::File => FileKind::Regular,
