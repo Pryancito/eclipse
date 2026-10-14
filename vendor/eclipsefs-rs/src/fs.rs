@@ -21,6 +21,7 @@ use crate::cow::{CowFs, SendStats};
 use crate::device::BlockDevice;
 use crate::format::{FileKind, BLOCK_SIZE, MAGIC};
 use crate::v3::EclipseFsV3;
+use crate::volume::{ChunkKind, Profile};
 use crate::{Error, Result};
 
 /// Operations grouped into one transaction at most (unless `sync` or the
@@ -59,6 +60,39 @@ pub struct CompSize {
     pub uncompressed_bytes: u64,
     /// Pieces of compressed extents the file maps.
     pub compressed_extents: u64,
+}
+
+/// One device of the filesystem (see [`EclipseFS::devices`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeviceInfo {
+    pub devid: u32,
+    pub size_bytes: u64,
+    /// Bytes chunks take on it.
+    pub allocated_bytes: u64,
+    /// False when mounted degraded without it.
+    pub present: bool,
+}
+
+/// One chunk of the logical space (see [`EclipseFS::chunks`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChunkInfo {
+    /// First logical byte.
+    pub logical: u64,
+    pub kind: ChunkKind,
+    pub profile: Profile,
+    pub size_bytes: u64,
+    pub used_bytes: u64,
+    /// Where each stripe starts: device and byte offset.
+    pub stripes: Vec<(u32, u64)>,
+}
+
+/// What [`EclipseFS::balance`] did.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BalanceReport {
+    /// Chunks copied to a new place (and profile).
+    pub relocated: u64,
+    /// Empty chunks given back to the devices.
+    pub freed: u64,
 }
 
 /// One subvolume's quota group (see [`EclipseFS::qgroup_show`]).
@@ -104,6 +138,8 @@ pub struct ScrubReport {
     pub bad_tree_nodes: Vec<u64>,
     /// Data blocks whose contents do not match their checksum.
     pub bad_data_blocks: Vec<u64>,
+    /// Bad copies rewritten from a good one (volumes with DUP or RAID).
+    pub repaired: u64,
 }
 
 impl ScrubReport {
@@ -136,6 +172,8 @@ pub struct SubvolInfo {
     pub received_uuid: [u8; 16],
 }
 
+// One per mounted filesystem: the size difference does not matter.
+#[allow(clippy::large_enum_variant)]
 enum Driver {
     V3(EclipseFsV3),
     V4(CowFs),
@@ -182,6 +220,41 @@ impl EclipseFS {
             _ => return Err(Error::Unsupported("EclipseFS format version")),
         };
         Ok(Self { driver })
+    }
+
+    /// Mount a filesystem made of several devices (given in any order),
+    /// as `mount -o device=...` does for btrfs. A single device works too.
+    pub fn mount_devices(devs: Vec<Arc<dyn BlockDevice>>, read_only: bool) -> Result<Self> {
+        Self::mount_volume(devs, read_only, false)
+    }
+
+    /// [`mount_devices`](Self::mount_devices) with devices missing
+    /// (`-o degraded`): works while every block keeps a copy on the
+    /// devices given. Writes go to the copies that are there; new chunks
+    /// stay off the missing devices.
+    pub fn mount_degraded(devs: Vec<Arc<dyn BlockDevice>>, read_only: bool) -> Result<Self> {
+        Self::mount_volume(devs, read_only, true)
+    }
+
+    fn mount_volume(
+        devs: Vec<Arc<dyn BlockDevice>>,
+        read_only: bool,
+        degraded: bool,
+    ) -> Result<Self> {
+        if devs.len() == 1 && !degraded {
+            return Self::mount(devs[0].clone(), read_only);
+        }
+        let mut buf = vec![0u8; BLOCK_SIZE as usize];
+        for d in &devs {
+            d.read_at(0, &mut buf)?;
+            let version = u32::from_le_bytes([buf[12], buf[13], buf[14], buf[15]]);
+            if &buf[0..9] != MAGIC || version >> 16 != 4 {
+                return Err(Error::BadSuperblock);
+            }
+        }
+        Ok(Self {
+            driver: Driver::V4(CowFs::mount_devices(devs, read_only, degraded)?),
+        })
     }
 
     /// Major format version of the mounted image (3 or 4).
@@ -453,6 +526,60 @@ impl EclipseFS {
     /// Disk and file bytes of a file's data (as `compsize` reports).
     pub fn compsize(&mut self, ino: u64) -> Result<CompSize> {
         self.cow()?.compsize(ino)
+    }
+
+    /// `btrfs device add`: one more device; new chunks may use it at
+    /// once, [`balance`](Self::balance) moves old ones. Returns its id.
+    /// A filesystem on one device becomes a volume (nothing moves).
+    pub fn add_device(&mut self, dev: Arc<dyn BlockDevice>) -> Result<u32> {
+        self.cow()?.add_device(dev)
+    }
+
+    /// `btrfs device remove`: move every chunk off device `devid` (which
+    /// may be missing) and drop it; its superblock is wiped.
+    pub fn remove_device(&mut self, devid: u32) -> Result<()> {
+        self.cow()?.remove_device(devid)
+    }
+
+    /// `btrfs replace`: `new` takes the place of device `devid` (which may
+    /// be missing). Returns the new device's id.
+    pub fn replace_device(&mut self, devid: u32, new: Arc<dyn BlockDevice>) -> Result<u32> {
+        self.cow()?.replace_device(devid, new)
+    }
+
+    /// `btrfs balance` (with `-dconvert`/`-mconvert` when given): rewrite
+    /// every chunk with the data and metadata profiles, giving empty
+    /// chunks back and spreading the rest over every device.
+    pub fn balance(
+        &mut self,
+        data: Option<Profile>,
+        meta: Option<Profile>,
+    ) -> Result<BalanceReport> {
+        self.cow()?.balance(data, meta)
+    }
+
+    /// Profiles of new data and metadata chunks.
+    pub fn profiles(&self) -> (Profile, Profile) {
+        match &self.driver {
+            Driver::V4(c) => c.profiles(),
+            Driver::V3(_) => (Profile::Single, Profile::Single),
+        }
+    }
+
+    /// `btrfs device usage`: every device of the filesystem.
+    pub fn devices(&self) -> Vec<DeviceInfo> {
+        match &self.driver {
+            Driver::V4(c) => c.devices(),
+            Driver::V3(_) => Vec::new(),
+        }
+    }
+
+    /// Every chunk: logical range, kind, profile, use and stripes.
+    pub fn chunks(&self) -> Vec<ChunkInfo> {
+        match &self.driver {
+            Driver::V4(c) => c.chunks(),
+            Driver::V3(_) => Vec::new(),
+        }
     }
 
     /// Whether quotas are on.

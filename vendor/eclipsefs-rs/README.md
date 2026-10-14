@@ -132,6 +132,35 @@ Paso 1 de la paridad con btrfs. Todo vive en árboles B+ copy-on-write
   contador, el límite, los bytes en disco que referencia y los exclusivos
   (que ningún otro subvolumen comparte). Un snapshot empieza con el mismo
   contador y sin límite.
+- **Varios dispositivos** (fase 7, bit `FEAT_VOLUME`, `volume.rs`): el
+  espacio lógico se reparte en *chunks* (los grupos de 128 MiB del
+  asignador), cada uno de datos, de metadatos o mixto, con su perfil:
+  `single`, `dup`, `raid0`, `raid1`, `raid10`, `raid1c3` y `raid1c4`
+  (RAID5/6 no, btrfs tampoco los da por estables). El bloque 0 de cada
+  dispositivo lleva una copia del superbloque con su id y el mapeo del
+  grupo 0, que guarda el journal y el mapa de chunks (con CRC32C), así
+  que cualquier dispositivo basta para encontrar el resto. Los chunks se
+  crean al hacer falta (de un octavo del dispositivo más pequeño, hasta
+  128 MiB).
+  - `mkfs::format_devices(devs, opts, datos, metadatos)`,
+    `EclipseFS::mount_devices` y `mount_degraded` (monta si cada bloque
+    conserva una copia; un dispositivo que vuelve tras perderse commits se
+    resincroniza al montar).
+  - Al leer, una copia que no cuadra con su checksum (o con la generación
+    del nodo) se sustituye por otra y se reescribe; `scrub` lee todas las
+    copias y repara las malas (`ScrubReport::repaired`).
+  - `add_device`, `remove_device` (también uno perdido), `replace_device`
+    y `balance(datos, metadatos)` (convierte perfiles, libera chunks vacíos
+    y reparte entre dispositivos). Mover un chunk copia sus bloques en uso
+    a sitio nuevo, conserva las copias que pueden quedarse y no reutiliza
+    el sitio viejo hasta que la confirmación está en disco: un corte de luz
+    deja una disposición u otra entera.
+  - `devices()`, `chunks()` y `profiles()` (como `btrfs fi usage`).
+  - Un sistema de archivos de un dispositivo se convierte en volumen al
+    primer `add_device` o `balance`, sin mover nada; sus grupos quedan
+    mixtos y siguen el perfil de metadatos. El grupo 0 nunca va en
+    franjas (con `raid0`/`raid10` va en `raid1`). Los mapas de bits del
+    asignador no llevan checksum, así que de ellos se lee la primera copia.
 - `EclipseFS::mount` detecta la versión: las imágenes v0.3 siguen montando con
   su driver (`v3.rs`). `mkfs::format_v3` sigue disponible.
 
@@ -174,7 +203,7 @@ grupo k (32768 bloques = 128 MiB)
 4. ~~xattrs/ACL, atributos (inmutable, append, nocow), fallocate y huecos~~.
 5. ~~Compresión zlib, lz4 y zstd~~.
 6. ~~send/receive incremental y cuotas~~.
-7. Multidispositivo (DUP, RAID0/1/10), añadir/quitar, balance y encoger.
+7. ~~Multidispositivo (DUP, RAID0/1/10/1C3/1C4), añadir/quitar/reemplazar y balance~~.
 8. ioctls del kernel e imágenes del instalador con EclipseFS.
 
 ## Tests y benchmarks
@@ -226,6 +255,13 @@ cargo test --release -p eclipsefs --features std
   exclusivos, desactivar y reactivar, archivos comprimidos y subvolúmenes
   recibidos. Las cargas de crash con semilla impar llevan las cuotas
   activas, así el fsck comprueba los contadores tras cada corte.
+- `tests/volume.rs`: los siete perfiles sobre cuatro dispositivos,
+  dispositivos perdidos (montaje degradado y qué perfiles lo permiten),
+  bloques podridos en una copia y en todas (reparación al leer y en
+  scrub, datos y metadatos), crecer de un dispositivo a RAID1, quitar,
+  reemplazar uno perdido, resincronizar uno que vuelve, balance con
+  conversión y chunks vacíos, disco lleno, y cortes de luz en cada punto
+  de una carga que añade y quita dispositivos y convierte perfiles.
 - Los tests que dependen del formato corren en las dos versiones (`*_v3`).
 - `tests/performance.rs`: las mismas cargas sobre EclipseFS y btrfs, con tiempo
   y bytes leídos/escritos en el dispositivo. `scripts/eclipsefs-bench.sh` las

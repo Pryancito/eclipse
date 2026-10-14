@@ -1,6 +1,7 @@
 //! Create an empty EclipseFS on a block device.
 
 use alloc::string::String;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use crate::blocks::{AllocationGroup, BlockAllocator};
@@ -8,6 +9,7 @@ use crate::device::BlockDevice;
 use crate::format::*;
 use crate::journal::JournalArea;
 use crate::v3::{extend_zeroed, write_chain, write_data, zero, ITABLE_GROW};
+use crate::volume::Profile;
 use crate::{Error, Result};
 
 /// Same fields as `btrfs::mkfs::MkfsOptions`, so callers can switch crates
@@ -106,6 +108,51 @@ pub fn format(dev: &dyn BlockDevice, opts: &MkfsOptions) -> Result<()> {
 
 /// Format the whole device with the older v0.3 layout (in-place updates
 /// under a metadata journal). Kept for compatibility tests and tools.
+/// Make a filesystem over several devices (`mkfs.btrfs -d PROFILE -m
+/// PROFILE dev...`): group 0 (journal, chunk map, first trees) on the
+/// first device, then every device added and group 0 converted to the
+/// metadata profile; data chunks are made as data comes.
+pub fn format_devices(
+    devs: &[Arc<dyn BlockDevice>],
+    opts: &MkfsOptions,
+    data: Profile,
+    meta: Profile,
+) -> Result<()> {
+    let first = devs.first().ok_or(Error::Invalid)?;
+    if data.min_devices() > devs.len() || meta.min_devices() > devs.len() {
+        return Err(Error::Unsupported("not enough devices for that profile"));
+    }
+    // Group 0 holds metadata only: a slice of the first device.
+    let size = first.size() / BLOCK_SIZE;
+    let sys = (size / 16).clamp(1024, GROUP_BLOCKS).min(size);
+    format(&Prefix(first.clone(), sys * BLOCK_SIZE), opts)?;
+    let mut fs = crate::cow::CowFs::mount(first.clone(), false)?;
+    fs.make_volume_metadata()?;
+    for d in &devs[1..] {
+        fs.add_device(d.clone())?;
+    }
+    fs.balance(Some(data), Some(meta))?;
+    fs.sync()
+}
+
+/// The first `.1` bytes of a device.
+struct Prefix(Arc<dyn BlockDevice>, u64);
+
+impl BlockDevice for Prefix {
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<()> {
+        self.0.read_at(offset, buf)
+    }
+    fn write_at(&self, offset: u64, buf: &[u8]) -> Result<()> {
+        self.0.write_at(offset, buf)
+    }
+    fn sync(&self) -> Result<()> {
+        self.0.sync()
+    }
+    fn size(&self) -> u64 {
+        self.1.min(self.0.size())
+    }
+}
+
 pub fn format_v3(dev: &dyn BlockDevice, opts: &MkfsOptions) -> Result<()> {
     let (total, mut alloc, jstart, jblocks) = layout(dev, opts)?;
     let mut itable = Inode::new(FileKind::Regular, 0o600, opts.now);

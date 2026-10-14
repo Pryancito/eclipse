@@ -54,7 +54,7 @@ pub type Block = (u64, Vec<u8>);
 /// Minimal lock for the overlay map: the filesystem is used behind the
 /// caller's own lock, so this never actually contends; it only makes the
 /// overlay `Sync` without `std`.
-struct Spin<T> {
+pub(crate) struct Spin<T> {
     locked: AtomicBool,
     value: UnsafeCell<T>,
 }
@@ -64,14 +64,14 @@ unsafe impl<T: Send> Sync for Spin<T> {}
 unsafe impl<T: Send> Send for Spin<T> {}
 
 impl<T> Spin<T> {
-    fn new(value: T) -> Self {
+    pub(crate) fn new(value: T) -> Self {
         Self {
             locked: AtomicBool::new(false),
             value: UnsafeCell::new(value),
         }
     }
 
-    fn with<R>(&self, f: impl FnOnce(&mut T) -> R) -> R {
+    pub(crate) fn with<R>(&self, f: impl FnOnce(&mut T) -> R) -> R {
         while self
             .locked
             .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)

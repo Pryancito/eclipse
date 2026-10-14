@@ -9,10 +9,13 @@
 //! ones are on disk.
 
 use alloc::collections::BTreeMap;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use crate::blocks::BlockAllocator;
+use crate::blocks::{AllocationGroup, BlockAllocator};
 use crate::btree::Space;
+use crate::format::GROUP_BLOCKS;
+use crate::volume::{Chunk, ChunkKind, Profile, Volume, MIN_CHUNK};
 use crate::{Error, Result};
 
 /// Set of block ranges (start -> length), merged when adjacent.
@@ -216,6 +219,15 @@ pub struct BlockSpace {
     /// Data checksum changes not yet in the checksum tree: the CRC32C of a
     /// block just written, or `None` for a data block just freed.
     pub csums: BTreeMap<u64, Option<u32>>,
+    /// The volume, when there is one: data and metadata come from chunks
+    /// of their own kind, and new chunks are made when those fill up.
+    pub vol: Option<Arc<Volume>>,
+    /// Profiles of new data and metadata chunks.
+    pub profiles: (Profile, Profile),
+    /// Devices new chunks must stay off (being removed).
+    pub avoid: Vec<u32>,
+    /// The chunk map changed since the last commit.
+    pub chunks_dirty: bool,
 }
 
 /// Blocks kept back for metadata on a filesystem of `total` blocks: 1/64 of
@@ -234,28 +246,114 @@ impl BlockSpace {
             meta_goal: 0,
             reserve: 0,
             csums: BTreeMap::new(),
+            vol: None,
+            profiles: (Profile::Single, Profile::Single),
+            avoid: Vec::new(),
+            chunks_dirty: false,
         }
+    }
+
+    /// Free blocks file data may take now.
+    fn data_room(&self) -> u64 {
+        if self.vol.is_none() {
+            return self.alloc.free_blocks().saturating_sub(self.reserve);
+        }
+        // Metadata chunks hold the reserve first; mixed groups the rest.
+        let need = self
+            .reserve
+            .saturating_sub(self.alloc.free_in(ChunkKind::Metadata));
+        self.alloc.free_in(ChunkKind::Data)
+            + self.alloc.free_in(ChunkKind::Mixed).saturating_sub(need)
+    }
+
+    fn data_kind(&self) -> Option<ChunkKind> {
+        self.vol.as_ref().map(|_| ChunkKind::Data)
     }
 
     /// Up to `max` contiguous data blocks near `goal`.
     pub fn alloc_data(&mut self, goal: Option<u64>, max: u64) -> Option<(u64, u64)> {
-        let room = self.alloc.free_blocks().checked_sub(self.reserve)?;
-        if room == 0 {
-            return None;
+        for attempt in 0..2 {
+            let room = self.data_room();
+            if room > 0 {
+                let kind = self.data_kind();
+                if let Some(r) = self.alloc.allocate_for(goal, max.min(room), kind) {
+                    self.fresh.insert(r.0, r.1);
+                    return Some(r);
+                }
+            }
+            if attempt == 0 && !self.grow(ChunkKind::Data) {
+                break;
+            }
         }
-        let r = self.alloc.allocate(goal, max.min(room))?;
-        self.fresh.insert(r.0, r.1);
-        Some(r)
+        None
     }
 
     /// Exactly `n` contiguous data blocks, near `goal` if possible.
     pub fn alloc_data_run(&mut self, goal: Option<u64>, n: u64) -> Option<u64> {
-        if self.alloc.free_blocks().checked_sub(self.reserve)? < n {
-            return None;
+        for attempt in 0..2 {
+            if self.data_room() >= n {
+                let kind = self.data_kind();
+                if let Some(r) = self.alloc.allocate_run_for(goal, n, kind) {
+                    self.fresh.insert(r, n);
+                    return Some(r);
+                }
+            }
+            if attempt == 0 && (n > GROUP_BLOCKS / 2 || !self.grow(ChunkKind::Data)) {
+                break;
+            }
         }
-        let r = self.alloc.allocate_run(goal, n)?;
-        self.fresh.insert(r, n);
-        Some(r)
+        None
+    }
+
+    /// Free blocks metadata may take.
+    pub fn meta_free(&self) -> u64 {
+        self.alloc.free_in(ChunkKind::Metadata) + self.alloc.free_in(ChunkKind::Mixed)
+    }
+
+    /// Make a new chunk for `kind` (volumes only). False if there is no
+    /// room on the devices, or (for data) if that would leave metadata
+    /// without its reserve.
+    pub fn grow(&mut self, kind: ChunkKind) -> bool {
+        let Some(vol) = self.vol.clone() else {
+            return false;
+        };
+        if kind == ChunkKind::Data
+            && self.meta_free() < self.reserve
+            && !self.grow(ChunkKind::Metadata)
+        {
+            return false;
+        }
+        let profile = match kind {
+            ChunkKind::Data => self.profiles.0,
+            _ => self.profiles.1,
+        };
+        let held = vol.held();
+        let avoid = self.avoid.clone();
+        let made = vol.with_map(|m| {
+            // Chunks of an eighth of the smallest device (at most a group).
+            let small = m.devices.values().copied().min().unwrap_or(0);
+            let want = (small / 8).clamp(MIN_CHUNK, GROUP_BLOCKS);
+            let (blocks, stripes) = m.place(profile, want, &avoid, &held)?;
+            let g = m.free_group();
+            m.chunks.insert(
+                g,
+                Chunk {
+                    kind,
+                    profile,
+                    blocks,
+                    stripes,
+                },
+            );
+            Some((g, blocks))
+        });
+        let Some((g, blocks)) = made else {
+            return false;
+        };
+        let mut grp = AllocationGroup::new(g as u32, blocks);
+        grp.kind = kind;
+        self.alloc.set_group(grp);
+        self.chunks_dirty = true;
+        true
     }
 
     /// Whether `start..start+len` was allocated by this transaction and has
@@ -299,7 +397,17 @@ impl Space for BlockSpace {
         } else {
             goal
         };
-        let (b, _) = self.alloc.allocate(Some(goal), 1).ok_or(Error::NoSpace)?;
+        let kind = self.vol.as_ref().map(|_| ChunkKind::Metadata);
+        let b = match self.alloc.allocate_for(Some(goal), 1, kind) {
+            Some((b, _)) => b,
+            None if self.grow(ChunkKind::Metadata) => {
+                self.alloc
+                    .allocate_for(Some(goal), 1, kind)
+                    .ok_or(Error::NoSpace)?
+                    .0
+            }
+            None => return Err(Error::NoSpace),
+        };
         self.fresh.insert(b, 1);
         self.meta_goal = b + 1;
         Ok(b)

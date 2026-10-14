@@ -41,15 +41,17 @@ pub mod journal;
 pub mod mkfs;
 pub mod space;
 pub mod v3;
+pub mod volume;
 
 pub use compress::Compression;
 pub use cow::SendStats;
 pub use device::BlockDevice;
 pub use format::FileKind;
 pub use fs::{
-    CheckReport, CompSize, DirEntry, EclipseFS, FsStat, InodeStat, QgroupInfo, ScrubReport,
-    SubvolInfo,
+    BalanceReport, CheckReport, ChunkInfo, CompSize, DeviceInfo, DirEntry, EclipseFS, FsStat,
+    InodeStat, QgroupInfo, ScrubReport, SubvolInfo,
 };
+pub use volume::{ChunkKind, Profile};
 
 /// Version of the on-disk format new filesystems get (v0.4.0).
 pub const ECLIPSEFS_VERSION: u32 = cowfmt::VERSION4;

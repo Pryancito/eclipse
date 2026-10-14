@@ -21,7 +21,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::blocks::{AllocationGroup, BlockAllocator};
-use crate::btree::{Body, Key, Op, Root, Store, MAX_ITEM};
+use crate::btree::{Body, Key, Node, Op, Root, Store, MAX_ITEM};
 use crate::cowfmt::*;
 use crate::crc::crc32c;
 use crate::device::BlockDevice;
@@ -29,12 +29,13 @@ use crate::format::{
     FileKind, BLOCK_SIZE, GROUP_BLOCKS, MAX_NAME_LEN, MAX_SYMLINK_LEN, MIN_GROUP_BLOCKS,
 };
 use crate::fs::{
-    CheckReport, CompSize, DirEntry, FsStat, InodeStat, QgroupInfo, ScrubReport, SubvolInfo,
-    COMMIT_OPS,
+    BalanceReport, CheckReport, ChunkInfo, CompSize, DeviceInfo, DirEntry, FsStat, InodeStat,
+    QgroupInfo, ScrubReport, SubvolInfo, COMMIT_OPS,
 };
 use crate::journal::{JournalArea, Overlay};
 use crate::space::{metadata_reserve, BlockSpace, RangeSet, RefMap};
 use crate::v3::write_home;
+use crate::volume::{Chunk, ChunkKind, ChunkMap, Profile, Stripe, Volume, DEV_RESERVED, MIN_CHUNK};
 use crate::{Error, Result};
 
 const BS: u64 = BLOCK_SIZE;
@@ -44,6 +45,7 @@ const WRITE_CHUNK: u64 = 2048;
 const DIRTY_NODES_LIMIT: usize = 4096;
 
 mod send;
+mod volume_ops;
 pub use send::{ReceiveSource, SendSink, SendStats};
 
 /// One file extent as the write and read paths see it.
@@ -110,6 +112,8 @@ pub struct CowFs {
     /// Superblock and bitmaps, through the journal.
     dev: Arc<Overlay>,
     raw: Arc<dyn BlockDevice>,
+    /// `raw` as a volume, when the filesystem is one.
+    vol: Option<Arc<Volume>>,
     journal: JournalArea,
     sb: SuperV4,
     sp: BlockSpace,
@@ -211,16 +215,91 @@ fn read_groups(dev: &dyn BlockDevice, total: u64) -> Result<Vec<AllocationGroup>
     Ok(groups)
 }
 
+/// Groups of a volume: one per chunk, holes where there is none.
+fn read_volume_groups(dev: &dyn BlockDevice, map: &ChunkMap) -> Result<Vec<AllocationGroup>> {
+    let mut groups = Vec::new();
+    let mut buf = vec![0u8; BS as usize];
+    for (&g, c) in &map.chunks {
+        while (groups.len() as u64) < g {
+            groups.push(AllocationGroup::hole(groups.len() as u32));
+        }
+        dev.read_at((g * GROUP_BLOCKS + 1) * BS, &mut buf)?;
+        let mut grp = AllocationGroup::from_bytes(g as u32, c.blocks, &buf)?;
+        grp.kind = c.kind;
+        groups.push(grp);
+    }
+    Ok(groups)
+}
+
+/// Whether every block of `c` keeps a copy off the `missing` devices.
+fn readable(c: &Chunk, missing: &[u32]) -> bool {
+    let up = |s: &Stripe| !missing.contains(&s.devid);
+    match c.profile {
+        Profile::Raid0 => c.stripes.iter().all(up),
+        Profile::Raid10 => c.stripes.chunks(2).all(|p| p.iter().any(up)),
+        _ => c.stripes.iter().any(up),
+    }
+}
+
 impl CowFs {
     // -----------------------------------------------------------------------
     // Mount and transactions
     // -----------------------------------------------------------------------
 
     pub fn mount(raw: Arc<dyn BlockDevice>, read_only: bool) -> Result<Self> {
+        Self::mount_devices(vec![raw], read_only, false)
+    }
+
+    /// Mount a filesystem from its devices (any order). A volume with
+    /// devices missing mounts only `degraded`, and only while every chunk
+    /// still has a copy of each block.
+    pub fn mount_devices(
+        devs: Vec<Arc<dyn BlockDevice>>,
+        read_only: bool,
+        degraded: bool,
+    ) -> Result<Self> {
         let mut buf = vec![0u8; BS as usize];
-        raw.read_at(0, &mut buf)?;
-        let home = SuperV4::decode(&buf)?;
-        if home.total_blocks > raw.size() / BS {
+        let mut sbs = Vec::new();
+        for d in &devs {
+            d.read_at(0, &mut buf)?;
+            sbs.push(SuperV4::decode(&buf)?);
+        }
+        if sbs.is_empty() {
+            return Err(Error::Invalid);
+        }
+        let (raw, vol, home): (Arc<dyn BlockDevice>, Option<Arc<Volume>>, SuperV4) =
+            if sbs[0].vol.is_none() {
+                if devs.len() != 1 {
+                    return Err(Error::Invalid);
+                }
+                (devs[0].clone(), None, sbs.remove(0))
+            } else {
+                let uuid = sbs[0].uuid;
+                let mut by_id: BTreeMap<u32, Arc<dyn BlockDevice>> = BTreeMap::new();
+                for (d, sb) in devs.iter().zip(&sbs) {
+                    let v = sb.vol.as_ref().ok_or(Error::Invalid)?;
+                    if sb.uuid != uuid || by_id.insert(v.devid, d.clone()).is_some() {
+                        return Err(Error::Invalid);
+                    }
+                }
+                let newest = sbs.iter().map(|s| s.generation).max().unwrap_or(0);
+                let stale: Vec<u32> = sbs
+                    .iter()
+                    .filter(|s| s.generation < newest)
+                    .filter_map(|s| s.vol.as_ref().map(|v| v.devid))
+                    .collect();
+                let home = sbs
+                    .into_iter()
+                    .max_by_key(|s| s.generation)
+                    .ok_or(Error::Invalid)?;
+                let sys = home.vol.as_ref().ok_or(Error::Invalid)?.sys.clone();
+                let mut map = ChunkMap::default();
+                map.chunks.insert(0, sys);
+                let vol = Arc::new(Volume::new(by_id, map, sb_for_device));
+                vol.set_stale(stale);
+                (vol.clone(), Some(vol), home)
+            };
+        if vol.is_none() && home.total_blocks > raw.size() / BS {
             return Err(Error::Corrupt("filesystem larger than device"));
         }
         let journal = JournalArea {
@@ -228,26 +307,82 @@ impl CowFs {
             blocks: home.journal_blocks as u64,
         };
         let dev = Arc::new(Overlay::new(raw.clone()));
-        if let Some((seq, blocks)) = journal.read(&*raw, &home.uuid, home.total_blocks)? {
-            debug!(
-                "eclipsefs: replaying transaction {} ({} blocks)",
-                seq,
-                blocks.len()
-            );
-            for (b, data) in blocks {
-                dev.insert(b, data);
+        let replayed = match journal.read(&*raw, &home.uuid, home.total_blocks)? {
+            Some((seq, blocks)) => {
+                debug!(
+                    "eclipsefs: replaying transaction {} ({} blocks)",
+                    seq,
+                    blocks.len()
+                );
+                for (b, data) in blocks {
+                    dev.insert(b, data);
+                }
+                true
             }
-            if !read_only {
-                write_home(&*raw, &dev.take())?;
-                raw.sync()?;
-            }
-        }
+            None => false,
+        };
         dev.read_at(0, &mut buf)?;
         let sb = SuperV4::decode(&buf)?;
-        if sb.total_blocks > raw.size() / BS {
+        let mut missing = Vec::new();
+        if let Some(v) = &vol {
+            let vs = sb.vol.as_ref().ok_or(Error::Corrupt("volume superblock"))?;
+            v.with_map(|m| {
+                m.chunks.clear();
+                m.chunks.insert(0, vs.sys.clone());
+            });
+            let mut mb = vec![0u8; vs.chunk_map_len as usize];
+            dev.read_at(vs.chunk_map * BS, &mut mb)?;
+            let mut map = ChunkMap::decode(&mb);
+            // A bad copy: try the others (unless it came from the journal).
+            for k in 0..vs.sys.profile.copies() {
+                if map.is_ok() || dev.contains(vs.chunk_map) {
+                    break;
+                }
+                if v.read_copy(vs.chunk_map * BS, &mut mb, k).is_ok() {
+                    map = ChunkMap::decode(&mb);
+                }
+            }
+            let map = map?;
+            if map.chunks.get(&0) != Some(&vs.sys) {
+                return Err(Error::Corrupt("system chunk"));
+            }
+            for id in v.present() {
+                if !map.devices.contains_key(&id) {
+                    // Added or removed by a transaction that did not
+                    // commit, or removed since: not part of it now.
+                    warn!("eclipsefs: device {} is not in the volume, ignored", id);
+                    v.detach(id);
+                }
+            }
+            missing = map
+                .devices
+                .keys()
+                .copied()
+                .filter(|&d| v.device(d).is_none())
+                .collect();
+            if !missing.is_empty() {
+                if !degraded {
+                    return Err(Error::Unsupported("devices missing (mount degraded)"));
+                }
+                if !map.chunks.values().all(|c| readable(c, &missing)) {
+                    return Err(Error::Unsupported("too many devices missing"));
+                }
+                warn!("eclipsefs: mounted degraded, devices {:?} missing", missing);
+            }
+            v.with_map(|m| *m = map);
+        }
+        if replayed && !read_only {
+            write_home(&*raw, &dev.take())?;
+            raw.sync()?;
+        }
+        if vol.is_none() && sb.total_blocks > raw.size() / BS {
             return Err(Error::Corrupt("filesystem larger than device"));
         }
-        let mut alloc = BlockAllocator::new(read_groups(&*dev, sb.total_blocks)?);
+        let groups = match &vol {
+            Some(v) => read_volume_groups(&*dev, &v.map())?,
+            None => read_groups(&*dev, sb.total_blocks)?,
+        };
+        let mut alloc = BlockAllocator::new(groups);
         alloc.set_deferred_frees(true);
         let mut st = Store::new(
             raw.clone(),
@@ -256,6 +391,8 @@ impl CowFs {
             sb.total_blocks,
             extent_of,
         );
+        st.mirrors = vol.clone();
+        st.repair = !read_only;
         let root_tree = sb.root;
         let item = |st: &mut Store, id: u64| -> Result<RootItem> {
             let d = st
@@ -278,11 +415,18 @@ impl CowFs {
         }
         let refs = RefMap::from_entries(entries)?;
         let free = alloc.free_blocks();
+        let mut sp = BlockSpace::new(alloc, refs.clone());
+        if let Some(vs) = &sb.vol {
+            sp.vol = vol.clone();
+            sp.profiles = (vs.data_profile, vs.meta_profile);
+            sp.avoid = missing;
+        }
         let mut fs = Self {
             dev,
             raw,
+            vol,
             journal,
-            sp: BlockSpace::new(alloc, refs.clone()),
+            sp,
             st,
             root_tree,
             refs_root,
@@ -315,6 +459,7 @@ impl CowFs {
             return Err(Error::Corrupt("root is not a directory"));
         }
         if !read_only {
+            fs.resync_stale()?;
             fs.drop_unfinished_receives()?;
         }
         Ok(fs)
@@ -337,7 +482,18 @@ impl CowFs {
     }
 
     pub fn fsinfo(&self) -> FsStat {
-        let total = self.sp.alloc.total_blocks();
+        let mut total = self.sp.alloc.total_blocks();
+        if let Some(v) = &self.vol {
+            // Room for more data chunks, at the data profile's cost.
+            let map = v.map();
+            let free: u64 = map
+                .unallocated(&v.held())
+                .iter()
+                .filter(|(d, _)| !self.sp.avoid.contains(d))
+                .map(|(_, n)| n)
+                .sum();
+            total += free / self.sp.profiles.0.copies() as u64;
+        }
         FsStat {
             block_size: BS,
             total_bytes: total * BS,
@@ -391,6 +547,7 @@ impl CowFs {
             || self.sp.alloc.deferred_blocks() > 0
             || self.sp.alloc.groups().iter().any(|g| g.is_dirty())
             || !self.dev.is_empty()
+            || self.sp.chunks_dirty
             || self.items_changed()?;
         if !changed {
             return Ok(());
@@ -428,6 +585,7 @@ impl CowFs {
             }
             self.refs_on_disk = self.sp.refs.clone();
         }
+        self.store_chunk_map()?;
         // Tree roots into the root tree.
         let gen = self.st.gen;
         self.fs_item.root = self.fs_root;
@@ -490,8 +648,65 @@ impl CowFs {
                     self.dev.insert(b, data);
                 }
             }
+        } else if let Some(v) = &self.vol {
+            // Chunks moved away from are no longer the committed state.
+            v.release();
         }
         r
+    }
+
+    /// The chunk map into group 0 (through the journal, with the
+    /// superblock that points at it).
+    fn store_chunk_map(&mut self) -> Result<()> {
+        let Some(vol) = self.vol.clone() else {
+            return Ok(());
+        };
+        let end = self.sp.alloc.end();
+        self.sb.total_blocks = end;
+        self.st.total_blocks = end;
+        if !self.sp.chunks_dirty {
+            return Ok(());
+        }
+        let map = vol.map();
+        let mut bytes = map.encode();
+        let need = (bytes.len() as u64).div_ceil(BS);
+        let (old, old_n) = {
+            let vs = self
+                .sb
+                .vol
+                .as_ref()
+                .ok_or(Error::Corrupt("volume superblock"))?;
+            (vs.chunk_map, (vs.chunk_map_len as u64).div_ceil(BS))
+        };
+        let mut at = old;
+        if need != old_n {
+            at = self.sp.alloc.groups_mut()[0]
+                .allocate_run(2, need)
+                .ok_or(Error::NoSpace)?;
+            if old_n > 0 {
+                self.sp.alloc.free(old, old_n)?;
+            }
+        }
+        let len = bytes.len() as u32;
+        bytes.resize((need * BS) as usize, 0);
+        self.dev.write_at(at * BS, &bytes)?;
+        let vs = self
+            .sb
+            .vol
+            .as_mut()
+            .ok_or(Error::Corrupt("volume superblock"))?;
+        vs.chunk_map = at;
+        vs.chunk_map_len = len;
+        vs.num_devices = map.devices.len() as u32;
+        vs.sys = map
+            .chunks
+            .get(&0)
+            .ok_or(Error::Corrupt("system chunk"))?
+            .clone();
+        vs.data_profile = self.sp.profiles.0;
+        vs.meta_profile = self.sp.profiles.1;
+        self.sp.chunks_dirty = false;
+        Ok(())
     }
 
     /// Whether a subvolume's item in memory (flags, quota counter...)
@@ -614,6 +829,9 @@ impl CowFs {
 
     pub fn grow_to_device(&mut self) -> Result<bool> {
         self.writable()?;
+        if let Some(v) = self.vol.clone() {
+            return self.grow_volume(&v);
+        }
         let new_total = self.raw.size() / BS;
         let old_total = self.sb.total_blocks;
         if new_total <= old_total {
@@ -861,12 +1079,56 @@ impl CowFs {
             .map(|e| e.next_disk(lb)))
     }
 
+    /// Read disk blocks from `pblk` on into `buf`, verifying them against
+    /// their checksums if `sums`; on a volume a block that fails comes
+    /// from another copy, and the bad copies are rewritten.
+    fn read_data(&mut self, pblk: u64, buf: &mut [u8], sums: bool) -> Result<()> {
+        self.raw.read_at(pblk * BS, buf)?;
+        if !sums {
+            return Ok(());
+        }
+        let err = match self.verify(pblk, buf) {
+            Ok(()) => return Ok(()),
+            Err(e) => e,
+        };
+        let Some(vol) = self.vol.clone() else {
+            return Err(err);
+        };
+        let want = self.csums(pblk, buf.len() as u64 / BS)?;
+        for (i, c) in want.into_iter().enumerate() {
+            let blk = &mut buf[i * BS as usize..(i + 1) * BS as usize];
+            let Some(c) = c else { continue };
+            if crc32c(blk) == c {
+                continue;
+            }
+            let b = pblk + i as u64;
+            let mut good = None;
+            let mut bad = Vec::new();
+            let mut img = vec![0u8; BS as usize];
+            for k in 0..vol.copies(b) {
+                let ok = vol.read_copy(b * BS, &mut img, k).is_ok() && crc32c(&img) == c;
+                if !ok {
+                    bad.push(k);
+                } else if good.is_none() {
+                    good = Some(img.clone());
+                }
+            }
+            let good = good.ok_or(err)?;
+            blk.copy_from_slice(&good);
+            if !self.read_only {
+                for k in bad {
+                    let _ = vol.write_copy(b * BS, &good, k);
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Everything the compressed extent at disk block `pblk` holds.
     fn unpacked(&mut self, pblk: u64, z: Zext) -> Result<&[u8]> {
         if !matches!(&self.zcache, Some((p, _)) if *p == pblk) {
             let mut disk = vec![0u8; (z.disk_blocks * BS) as usize];
-            self.raw.read_at(pblk * BS, &mut disk)?;
-            self.verify(pblk, &disk)?;
+            self.read_data(pblk, &mut disk, true)?;
             let ram = crate::compress::unpack(z.algo, &disk, (z.ram_blocks * BS) as usize)?;
             self.zcache = Some((pblk, ram));
         }
@@ -923,16 +1185,10 @@ impl CowFs {
                 let p0 = e.pblk + (b0 - e.lblk);
                 let dst = &mut buf[(pos - off) as usize..(upto - off) as usize];
                 if pos.is_multiple_of(BS) && upto.is_multiple_of(BS) {
-                    self.raw.read_at(p0 * BS, dst)?;
-                    if sums {
-                        self.verify(p0, dst)?;
-                    }
+                    self.read_data(p0, dst, sums)?;
                 } else {
                     let mut tmp = vec![0u8; ((b1 - b0) * BS) as usize];
-                    self.raw.read_at(p0 * BS, &mut tmp)?;
-                    if sums {
-                        self.verify(p0, &tmp)?;
-                    }
+                    self.read_data(p0, &mut tmp, sums)?;
                     let o = (pos - b0 * BS) as usize;
                     let len = dst.len();
                     dst.copy_from_slice(&tmp[o..o + len]);
@@ -3136,10 +3392,50 @@ impl CowFs {
             }
             Ok(first)
         }
-        for g in self.sp.alloc.groups() {
+        for g in self.sp.alloc.groups().iter().filter(|g| !g.is_hole()) {
             own(&mut owners, total, g.start_block, 2)?;
         }
         own(&mut owners, total, self.journal.start, self.journal.blocks)?;
+        if let Some(v) = self.vol.clone() {
+            let map = v.map();
+            map.check()?;
+            let vs = self
+                .sb
+                .vol
+                .as_ref()
+                .ok_or(Error::Corrupt("fsck: volume superblock"))?;
+            if map.chunks.get(&0) != Some(&vs.sys) || vs.num_devices as usize != map.devices.len() {
+                return Err(Error::Corrupt("fsck: system chunk"));
+            }
+            own(
+                &mut owners,
+                total,
+                vs.chunk_map,
+                (vs.chunk_map_len as u64).div_ceil(BS),
+            )?;
+            if vs.chunk_map + (vs.chunk_map_len as u64).div_ceil(BS) > vs.sys.blocks {
+                return Err(Error::Corrupt("fsck: chunk map outside group 0"));
+            }
+            let mut ok = map.chunks.len()
+                == self
+                    .sp
+                    .alloc
+                    .groups()
+                    .iter()
+                    .filter(|g| !g.is_hole())
+                    .count();
+            for (&g, c) in &map.chunks {
+                ok &= self
+                    .sp
+                    .alloc
+                    .groups()
+                    .get(g as usize)
+                    .is_some_and(|grp| grp.block_count == c.blocks && grp.kind == c.kind);
+            }
+            if !ok {
+                return Err(Error::Corrupt("fsck: chunks and groups disagree"));
+            }
+        }
         // Trees: a node shared by several parents is counted once per parent
         // and walked once.
         let mut roots = vec![self.root_tree];
@@ -3196,7 +3492,20 @@ impl CowFs {
         if !summed.is_subset(&data) {
             return Err(Error::Corrupt("fsck: data checksums"));
         }
-        for b in 0..total {
+        let ranges: Vec<(u64, u64)> = self
+            .sp
+            .alloc
+            .groups()
+            .iter()
+            .map(|g| (g.start_block, g.start_block + g.block_count))
+            .collect();
+        if owners.keys().any(|b| {
+            let g = self.sp.alloc.groups().get((b / GROUP_BLOCKS) as usize);
+            g.is_none_or(|g| b % GROUP_BLOCKS >= g.block_count)
+        }) {
+            return Err(Error::Corrupt("fsck: block outside every chunk"));
+        }
+        for b in ranges.into_iter().flat_map(|(s, e)| s..e) {
             let seen = owners.get(&b).copied().unwrap_or(0);
             if (seen > 0) != self.sp.alloc.is_used(b) {
                 return Err(Error::Corrupt(if seen > 0 {
@@ -3468,7 +3777,7 @@ impl CowFs {
                 continue;
             }
             r.tree_nodes += 1;
-            let node = match self.st.read_disk(b, level, gen) {
+            let node = match self.scrub_node(b, level, gen, &mut r.repaired) {
                 Ok(n) => n,
                 Err(Error::Io) => return Err(Error::Io),
                 Err(_) => {
@@ -3506,10 +3815,20 @@ impl CowFs {
             while b < start + len {
                 let n = (start + len - b).min(CSUM_BUCKET - b % CSUM_BUCKET);
                 let chunk = &mut buf[..(n * BS) as usize];
-                self.raw.read_at(b * BS, chunk)?;
                 r.data_blocks += n;
-                match self.csums(b, n) {
-                    Ok(sums) => {
+                let sums = match self.csums(b, n) {
+                    Ok(sums) => sums,
+                    Err(Error::Io) => return Err(Error::Io),
+                    // The checksums themselves are unreadable.
+                    Err(_) => {
+                        r.bad_data_blocks.extend(b..b + n);
+                        b += n;
+                        continue;
+                    }
+                };
+                match self.vol.clone() {
+                    None => {
+                        self.raw.read_at(b * BS, chunk)?;
                         for (i, c) in sums.into_iter().enumerate() {
                             let block = &chunk[i * BS as usize..(i + 1) * BS as usize];
                             // No-COW files keep no checksums.
@@ -3518,9 +3837,13 @@ impl CowFs {
                             }
                         }
                     }
-                    Err(Error::Io) => return Err(Error::Io),
-                    // The checksums themselves are unreadable.
-                    Err(_) => r.bad_data_blocks.extend(b..b + n),
+                    Some(vol) => {
+                        let (bad, fixed) = self.scrub_copies(&vol, b, chunk, |i, img| {
+                            sums[i].is_none_or(|c| c == crc32c(img))
+                        })?;
+                        r.bad_data_blocks.extend(bad);
+                        r.repaired += fixed;
+                    }
                 }
                 b += n;
             }
@@ -3533,6 +3856,88 @@ impl CowFs {
             );
         }
         Ok(r)
+    }
+}
+
+impl CowFs {
+    /// A tree node as scrub sees it: on a volume every copy is read, the
+    /// bad ones are rewritten from a good one (counted in `repaired`).
+    fn scrub_node(
+        &mut self,
+        b: u64,
+        level: u8,
+        gen: Option<u64>,
+        repaired: &mut u64,
+    ) -> Result<Node> {
+        let Some(vol) = self.vol.clone() else {
+            return self.st.read_disk(b, level, gen);
+        };
+        let mut img = vec![0u8; BS as usize];
+        let mut node = None;
+        let (bad, fixed) = self.scrub_copies(&vol, b, &mut img, |_, d| {
+            match self.st.check_node(d, b, level, gen) {
+                Ok(n) => {
+                    node.get_or_insert(n);
+                    true
+                }
+                Err(_) => false,
+            }
+        })?;
+        *repaired += fixed;
+        match node {
+            Some(n) if bad.is_empty() => Ok(n),
+            _ => Err(Error::Corrupt("tree node")),
+        }
+    }
+
+    /// Read every copy of blocks `b..` (as many as `buf` holds), judging
+    /// each block image with `good(index, image)`; bad copies of a block
+    /// with a good one are rewritten (unless mounted read-only) and `buf`
+    /// gets the good images. Returns the blocks with no good copy and the
+    /// copies rewritten.
+    fn scrub_copies(
+        &self,
+        vol: &Volume,
+        b: u64,
+        buf: &mut [u8],
+        mut good: impl FnMut(usize, &[u8]) -> bool,
+    ) -> Result<(Vec<u64>, u64)> {
+        let bs = BS as usize;
+        let n = buf.len() / bs;
+        let copies = vol.copies(b).max(1);
+        let mut imgs = Vec::with_capacity(copies);
+        for k in 0..copies {
+            let mut img = vec![0u8; buf.len()];
+            let ok = vol.read_copy(b * BS, &mut img, k).is_ok();
+            imgs.push(ok.then_some(img));
+        }
+        let mut bad_blocks = Vec::new();
+        let mut fixed = 0;
+        for i in 0..n {
+            let r = i * bs..(i + 1) * bs;
+            let verdict: Vec<bool> = imgs
+                .iter()
+                .map(|img| img.as_ref().is_some_and(|img| good(i, &img[r.clone()])))
+                .collect();
+            let Some(k) = verdict.iter().position(|&v| v) else {
+                bad_blocks.push(b + i as u64);
+                continue;
+            };
+            let img = imgs[k]
+                .as_ref()
+                .map(|img| img[r.clone()].to_vec())
+                .unwrap_or_default();
+            buf[r.clone()].copy_from_slice(&img);
+            for (j, ok) in verdict.iter().enumerate() {
+                if !ok && !self.read_only && vol.write_copy((b + i as u64) * BS, &img, j).is_ok() {
+                    fixed += 1;
+                }
+            }
+        }
+        if fixed > 0 {
+            vol.sync()?;
+        }
+        Ok((bad_blocks, fixed))
     }
 }
 
@@ -3626,6 +4031,7 @@ pub(crate) fn format(
         journal_start: journal.start,
         journal_blocks: journal.blocks as u32,
         default_subvol: FS_TREE,
+        vol: None,
     };
     let enc = sb.encode();
     for g in alloc.groups().iter().skip(1) {

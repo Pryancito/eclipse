@@ -14,6 +14,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::format::{BLOCK_SIZE, GROUP_BLOCKS};
+use crate::volume::ChunkKind;
 use crate::{Error, Result};
 
 const WORDS: usize = (GROUP_BLOCKS / 64) as usize;
@@ -25,6 +26,8 @@ pub struct AllocationGroup {
     pub start_block: u64,
     pub block_count: u64,
     pub free_blocks: u64,
+    /// What its blocks may hold (volumes keep data and metadata apart).
+    pub kind: ChunkKind,
     bitmap: Vec<u64>,
     dirty: bool,
 }
@@ -38,6 +41,7 @@ impl AllocationGroup {
             start_block: id as u64 * GROUP_BLOCKS,
             block_count,
             free_blocks: block_count,
+            kind: ChunkKind::Mixed,
             bitmap: vec![0; WORDS],
             dirty: true,
         };
@@ -59,6 +63,7 @@ impl AllocationGroup {
             start_block: id as u64 * GROUP_BLOCKS,
             block_count,
             free_blocks: 0,
+            kind: ChunkKind::Mixed,
             bitmap,
             dirty: false,
         };
@@ -68,6 +73,41 @@ impl AllocationGroup {
         }
         g.free_blocks = g.count_free();
         Ok(g)
+    }
+
+    /// Runs of blocks in use: (group-relative start, length).
+    pub fn used_runs(&self) -> Vec<(u64, u64)> {
+        let mut out = Vec::new();
+        let mut off = 0;
+        while off < self.block_count {
+            if !self.is_used(off) {
+                off += 1;
+                continue;
+            }
+            let start = off;
+            while off < self.block_count && self.is_used(off) {
+                off += 1;
+            }
+            out.push((start, off - start));
+        }
+        out
+    }
+
+    /// A group of the logical space with no chunk behind it.
+    pub fn hole(id: u32) -> Self {
+        Self {
+            id,
+            start_block: id as u64 * GROUP_BLOCKS,
+            block_count: 0,
+            free_blocks: 0,
+            kind: ChunkKind::Mixed,
+            bitmap: vec![u64::MAX; WORDS],
+            dirty: false,
+        }
+    }
+
+    pub fn is_hole(&self) -> bool {
+        self.block_count == 0
     }
 
     pub fn to_bytes(&self) -> Vec<u8> {
@@ -274,6 +314,17 @@ impl BlockAllocator {
     /// Allocate up to `max` contiguous blocks as close to block `goal` as
     /// possible. Returns `(first block, count)`; `None` when the device is full.
     pub fn allocate(&mut self, goal: Option<u64>, max: u64) -> Option<(u64, u64)> {
+        self.allocate_for(goal, max, None)
+    }
+
+    /// [`allocate`](Self::allocate) from groups that serve `kind` (any
+    /// group if `None`).
+    pub fn allocate_for(
+        &mut self,
+        goal: Option<u64>,
+        max: u64,
+        kind: Option<ChunkKind>,
+    ) -> Option<(u64, u64)> {
         let n = self.groups.len();
         if n == 0 {
             return None;
@@ -287,6 +338,9 @@ impl BlockAllocator {
         for i in 0..n {
             let gi = (first + i) % n;
             let g = &mut self.groups[gi];
+            if kind.is_some_and(|k| !g.kind.serves(k)) {
+                continue;
+            }
             let from = if i == 0 { from } else { 0 };
             if let Some((off, len)) = g.allocate(from, max) {
                 self.cursor = gi;
@@ -298,6 +352,16 @@ impl BlockAllocator {
 
     /// Exactly `n` contiguous blocks, after `goal` if possible.
     pub fn allocate_run(&mut self, goal: Option<u64>, n: u64) -> Option<u64> {
+        self.allocate_run_for(goal, n, None)
+    }
+
+    /// [`allocate_run`](Self::allocate_run) from groups that serve `kind`.
+    pub fn allocate_run_for(
+        &mut self,
+        goal: Option<u64>,
+        n: u64,
+        kind: Option<ChunkKind>,
+    ) -> Option<u64> {
         let groups = self.groups.len();
         let (first, from) = match goal {
             Some(g) if ((g / GROUP_BLOCKS) as usize) < groups => {
@@ -310,6 +374,9 @@ impl BlockAllocator {
         for i in 0..=groups {
             let gi = (first + i) % groups.max(1);
             let g = self.groups.get_mut(gi)?;
+            if kind.is_some_and(|k| !g.kind.serves(k)) {
+                continue;
+            }
             let from = if i == 0 { from } else { 0 };
             if let Some(off) = g.allocate_run(from, n) {
                 self.cursor = gi;
@@ -319,6 +386,36 @@ impl BlockAllocator {
         None
     }
 
+    /// Free blocks in groups of exactly `kind`.
+    pub fn free_in(&self, kind: ChunkKind) -> u64 {
+        self.groups
+            .iter()
+            .filter(|g| g.kind == kind)
+            .map(|g| g.free_blocks)
+            .sum()
+    }
+
+    /// Put `g` at its place (`g.id`), with holes before it if needed.
+    pub fn set_group(&mut self, g: AllocationGroup) {
+        let i = g.id as usize;
+        while self.groups.len() <= i {
+            let id = self.groups.len() as u32;
+            self.groups.push(AllocationGroup::hole(id));
+        }
+        self.groups[i] = g;
+        while self.groups.last().is_some_and(|g| g.is_hole()) {
+            self.groups.pop();
+        }
+    }
+
+    /// End of the last group (in blocks).
+    pub fn end(&self) -> u64 {
+        self.groups
+            .last()
+            .map(|g| g.start_block + g.block_count)
+            .unwrap_or(0)
+    }
+
     /// Free `len` blocks starting at absolute block `start` (or queue them,
     /// see [`set_deferred_frees`](Self::set_deferred_frees)).
     pub fn free(&mut self, start: u64, len: u64) -> Result<()> {
@@ -326,7 +423,7 @@ impl BlockAllocator {
             return self.free_now(start, len);
         }
         let end = start.checked_add(len).ok_or(Error::Corrupt("free range"))?;
-        if (start..end).any(|b| !self.is_used(b)) || end > self.total_blocks() {
+        if (start..end).any(|b| !self.is_used(b)) || end > self.end() {
             return Err(Error::Corrupt("double free"));
         }
         if self.deferred.iter().any(|&(s, l)| start < s + l && s < end) {
@@ -617,5 +714,36 @@ mod tests {
             }
         }
         assert_eq!(a.free_blocks(), 3998 - seen.len() as u64);
+    }
+
+    #[test]
+    fn kinds_keep_data_and_metadata_apart() {
+        let mut meta = AllocationGroup::new(0, 100);
+        meta.kind = ChunkKind::Metadata;
+        let mut data = AllocationGroup::new(2, 100);
+        data.kind = ChunkKind::Data;
+        let mut a = BlockAllocator::new(vec![meta]);
+        a.set_group(data);
+        // Group 1 is a hole: nothing there, everything in it "used".
+        assert_eq!(a.groups().len(), 3);
+        assert!(a.groups()[1].is_hole() && a.is_used(GROUP_BLOCKS + 5));
+        assert_eq!(a.end(), 2 * GROUP_BLOCKS + 100);
+        assert_eq!(a.total_blocks(), 200);
+        let (d, _) = a.allocate_for(None, 10, Some(ChunkKind::Data)).unwrap();
+        assert_eq!(d / GROUP_BLOCKS, 2);
+        let (m, _) = a.allocate_for(Some(d), 10, Some(ChunkKind::Metadata)).unwrap();
+        assert_eq!(m / GROUP_BLOCKS, 0);
+        assert_eq!(a.free_in(ChunkKind::Data), 88);
+        assert_eq!(a.free_in(ChunkKind::Metadata), 88);
+        assert!(a.allocate_run_for(None, 89, Some(ChunkKind::Data)).is_none());
+        // Frees past the old sum of group sizes are fine (logical space).
+        a.set_deferred_frees(true);
+        a.free(d, 10).unwrap();
+        a.release_deferred().unwrap();
+        assert_eq!(a.free_in(ChunkKind::Data), 98);
+        assert_eq!(a.groups()[2].used_runs(), vec![(0, 2)]);
+        // Dropping the last group trims the holes before it.
+        a.set_group(AllocationGroup::hole(2));
+        assert_eq!(a.groups().len(), 1);
     }
 }

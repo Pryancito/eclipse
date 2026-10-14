@@ -32,6 +32,7 @@ use alloc::vec::Vec;
 use crate::crc::crc32c;
 use crate::device::BlockDevice;
 use crate::format::{le32, le64, put32, put64, BLOCK_SIZE};
+use crate::volume::Volume;
 use crate::{Error, Result};
 
 const BS: usize = BLOCK_SIZE as usize;
@@ -311,6 +312,10 @@ pub struct Store {
     /// Nodes created in this transaction (written at commit).
     dirty: BTreeSet<u64>,
     extent_of: ExtentOf,
+    /// Copies to fall back on when a node fails to verify (volumes), and
+    /// whether to write the good copy back over the bad ones.
+    pub mirrors: Option<Arc<Volume>>,
+    pub repair: bool,
 }
 
 impl Store {
@@ -329,7 +334,63 @@ impl Store {
             cache: BTreeMap::new(),
             dirty: BTreeSet::new(),
             extent_of,
+            mirrors: None,
+            repair: false,
         }
+    }
+
+    /// Read nodes through `dev` from now on.
+    pub fn set_device(&mut self, dev: Arc<dyn BlockDevice>) {
+        self.dev = dev;
+    }
+
+    /// The node at `bytenr` from the device, checked against what points at
+    /// it; on a volume, from another copy if this one is bad (repairing
+    /// the bad ones if allowed).
+    fn read_node(&self, bytenr: u64, level: u8, gen: Option<u64>) -> Result<Node> {
+        let check = |buf: &[u8]| -> Result<Node> {
+            let node = Node::decode(buf, bytenr, &self.fsid)?;
+            if node.level != level || gen.is_some_and(|g| g != node.gen) {
+                return Err(Error::Corrupt("tree node level or generation"));
+            }
+            Ok(node)
+        };
+        let mut buf = vec![0u8; BS];
+        let first = self
+            .dev
+            .read_at(bytenr * BLOCK_SIZE, &mut buf)
+            .and_then(|_| check(&buf));
+        let (err, vol) = match (first, &self.mirrors) {
+            (Ok(n), _) => return Ok(n),
+            (Err(e), None) => return Err(e),
+            (Err(e), Some(v)) => (e, v),
+        };
+        let mut good = None;
+        let mut bad = Vec::new();
+        for k in 0..vol.copies(bytenr) {
+            let mut img = vec![0u8; BS];
+            match vol
+                .read_copy(bytenr * BLOCK_SIZE, &mut img, k)
+                .and_then(|_| check(&img))
+            {
+                Ok(n) if good.is_none() => good = Some((n, img)),
+                Ok(_) => {}
+                Err(_) => bad.push(k),
+            }
+        }
+        let (node, img) = good.ok_or(err)?;
+        warn!(
+            "eclipsefs: tree node {} bad in {} cop{}, read from another",
+            bytenr,
+            bad.len(),
+            if bad.len() == 1 { "y" } else { "ies" }
+        );
+        if self.repair {
+            for k in bad {
+                let _ = vol.write_copy(bytenr * BLOCK_SIZE, &img, k);
+            }
+        }
+        Ok(node)
     }
 
     /// Nodes waiting to be written.
@@ -387,9 +448,7 @@ impl Store {
             if self.cache.len() > CACHE_NODES * 2 {
                 self.trim();
             }
-            let mut buf = vec![0u8; BS];
-            self.dev.read_at(bytenr * BLOCK_SIZE, &mut buf)?;
-            let node = Node::decode(&buf, bytenr, &self.fsid)?;
+            let node = self.read_node(bytenr, level, gen)?;
             self.cache.insert(bytenr, node);
         }
         let node = &self.cache[&bytenr];
@@ -397,6 +456,19 @@ impl Store {
             return Err(Error::Corrupt("tree node level or generation"));
         }
         Ok(())
+    }
+
+    /// Decode the image of the node at `bytenr` and check it against what
+    /// points at it.
+    pub fn check_node(&self, img: &[u8], bytenr: u64, level: u8, gen: Option<u64>) -> Result<Node> {
+        if bytenr < 2 || bytenr >= self.total_blocks {
+            return Err(Error::Corrupt("tree pointer out of range"));
+        }
+        let node = Node::decode(img, bytenr, &self.fsid)?;
+        if node.level != level || gen.is_some_and(|g| g != node.gen) {
+            return Err(Error::Corrupt("tree node level or generation"));
+        }
+        Ok(node)
     }
 
     /// The node at `bytenr` as it is on the device, bypassing the cache

@@ -10,6 +10,10 @@
 //! 144 root tree block   152 root tree level       160 root tree generation
 //! 168 journal start     176 journal blocks        180 checksum type
 //! 184 default subvolume
+//! with FEAT_VOLUME (see [`crate::volume`]):
+//! 192 device id         196 devices               200 chunk map block
+//! 208 chunk map bytes   212 data profile          213 metadata profile
+//! 216 group 0's chunk (kind, profile, stripes, blocks, 4 x (device, block))
 //! 508 crc32c of bytes 0..508
 //! ```
 //!
@@ -37,6 +41,7 @@ use crate::format::{
     le16, le32, le64, put32, put64, FileKind, BLOCK_SIZE, GROUP_BLOCKS, MAGIC, MIN_GROUP_BLOCKS,
     MIN_JOURNAL_BLOCKS,
 };
+use crate::volume::{Chunk, Profile};
 use crate::{Error, Result};
 
 pub const VERSION4: u32 = 0x0004_0000;
@@ -100,6 +105,38 @@ pub const REF_ITEM: u8 = 200;
 /// Superblock feature: quotas are on, every subvolume's `referenced`
 /// counter is kept (and checked by fsck).
 pub const FEAT_QUOTA: u64 = 1;
+/// Superblock feature: a volume (chunk map, maybe several devices).
+pub const FEAT_VOLUME: u64 = 2;
+
+/// The superblock image `b` as device `devid` keeps it (anything that is
+/// not a volume superblock is written as it is).
+pub fn sb_for_device(b: &[u8], devid: u32) -> Vec<u8> {
+    match SuperV4::decode(b) {
+        Ok(mut sb) if sb.vol.is_some() => {
+            if let Some(v) = sb.vol.as_mut() {
+                v.devid = devid;
+            }
+            sb.encode()
+        }
+        _ => b.to_vec(),
+    }
+}
+
+/// What the superblock of a volume adds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VolumeSb {
+    /// The device this copy of the superblock is on.
+    pub devid: u32,
+    pub num_devices: u32,
+    /// First block of the chunk map (in group 0) and its length in bytes.
+    pub chunk_map: u64,
+    pub chunk_map_len: u32,
+    /// Profiles new chunks get.
+    pub data_profile: Profile,
+    pub meta_profile: Profile,
+    /// Group 0: journal, chunk map, the start of everything.
+    pub sys: Chunk,
+}
 
 /// Largest file kept inside its extent item.
 pub const INLINE_MAX: usize = 1024;
@@ -119,6 +156,7 @@ pub struct SuperV4 {
     pub journal_start: u64,
     pub journal_blocks: u32,
     pub default_subvol: u64,
+    pub vol: Option<VolumeSb>,
 }
 
 impl SuperV4 {
@@ -142,6 +180,20 @@ impl SuperV4 {
         put32(&mut b, 176, self.journal_blocks);
         b[180] = CSUM_CRC32C;
         put64(&mut b, 184, self.default_subvol);
+        let features = match &self.vol {
+            Some(v) => {
+                put32(&mut b, 192, v.devid);
+                put32(&mut b, 196, v.num_devices);
+                put64(&mut b, 200, v.chunk_map);
+                put32(&mut b, 208, v.chunk_map_len);
+                b[212] = v.data_profile.id();
+                b[213] = v.meta_profile.id();
+                v.sys.encode_sys(&mut b[216..280]);
+                self.features | FEAT_VOLUME
+            }
+            None => self.features & !FEAT_VOLUME,
+        };
+        put64(&mut b, 56, features);
         let c = crc32c(&b[..SB_CRC]);
         put32(&mut b, SB_CRC, c);
         b
@@ -179,7 +231,20 @@ impl SuperV4 {
             journal_start: le64(b, 168),
             journal_blocks: le32(b, 176),
             default_subvol: le64(b, 184),
+            vol: None,
         };
+        let mut sb = sb;
+        if sb.features & FEAT_VOLUME != 0 {
+            sb.vol = Some(VolumeSb {
+                devid: le32(b, 192),
+                num_devices: le32(b, 196),
+                chunk_map: le64(b, 200),
+                chunk_map_len: le32(b, 208),
+                data_profile: Profile::from_id(b[212])?,
+                meta_profile: Profile::from_id(b[213])?,
+                sys: Chunk::decode_sys(&b[216..280])?,
+            });
+        }
         if sb.total_blocks < MIN_GROUP_BLOCKS
             || sb.root.bytenr >= sb.total_blocks
             || sb.root.gen > sb.generation
@@ -896,6 +961,7 @@ mod tests {
             journal_start: 2,
             journal_blocks: 64,
             default_subvol: FS_TREE,
+            vol: None,
         }
     }
 
