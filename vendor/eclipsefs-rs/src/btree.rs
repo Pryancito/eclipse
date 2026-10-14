@@ -562,6 +562,79 @@ impl Store {
         Ok(())
     }
 
+    /// Copy every node of the tree that `moving` picks, with the path
+    /// above it, as a change under it would: top-down, so a shared node is
+    /// copied for this tree only and stays shared below the copy. Returns
+    /// whether anything was copied.
+    pub fn relocate(
+        &mut self,
+        sp: &mut dyn Space,
+        root: &mut Root,
+        moving: &dyn Fn(u64) -> bool,
+    ) -> Result<bool> {
+        let mut need = BTreeSet::new();
+        if !self.mark_moving(root.bytenr, root.level, None, moving, &mut need)? {
+            return Ok(false);
+        }
+        let new = self.cow(sp, root.bytenr, root.level)?;
+        root.bytenr = new;
+        root.gen = self.gen;
+        self.relocate_below(sp, new, root.level, &need)?;
+        Ok(true)
+    }
+
+    /// Put in `need` every node at or below `b` that moves or has one that
+    /// does below it.
+    fn mark_moving(
+        &mut self,
+        b: u64,
+        level: u8,
+        gen: Option<u64>,
+        moving: &dyn Fn(u64) -> bool,
+        need: &mut BTreeSet<u64>,
+    ) -> Result<bool> {
+        self.load(b, level, gen)?;
+        let mut any = moving(b);
+        if let Body::Internal(ptrs) = &self.cache[&b].body {
+            if level == 0 {
+                return Err(Error::Corrupt("tree level"));
+            }
+            for p in ptrs.clone() {
+                any |= self.mark_moving(p.bytenr, level - 1, Some(p.gen), moving, need)?;
+            }
+        }
+        if any {
+            need.insert(b);
+        }
+        Ok(any)
+    }
+
+    fn relocate_below(
+        &mut self,
+        sp: &mut dyn Space,
+        b: u64,
+        level: u8,
+        need: &BTreeSet<u64>,
+    ) -> Result<()> {
+        let ptrs = match &self.cache[&b].body {
+            Body::Internal(ptrs) => ptrs.clone(),
+            Body::Leaf(_) => return Ok(()),
+        };
+        for (i, p) in ptrs.iter().enumerate() {
+            if !need.contains(&p.bytenr) {
+                continue;
+            }
+            let child = self.cow(sp, p.bytenr, level - 1)?;
+            let gen = self.gen;
+            if let Body::Internal(ptrs) = &mut self.cache.get_mut(&b).unwrap().body {
+                ptrs[i].bytenr = child;
+                ptrs[i].gen = gen;
+            }
+            self.relocate_below(sp, child, level - 1, need)?;
+        }
+        Ok(())
+    }
+
     /// One more owner of a whole tree (taking a snapshot of it).
     pub fn share(&mut self, sp: &mut dyn Space, root: Root) -> Result<()> {
         sp.incref(root.bytenr, 1)

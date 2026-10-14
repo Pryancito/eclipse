@@ -479,6 +479,11 @@ impl ChunkMap {
         if size > at {
             out.push((at, size - at));
         }
+        // A device made smaller may still have chunks past its new end.
+        out.retain_mut(|e| {
+            e.1 = e.1.min(size.saturating_sub(e.0));
+            e.1 > 0
+        });
         out
     }
 

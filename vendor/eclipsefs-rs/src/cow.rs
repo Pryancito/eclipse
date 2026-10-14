@@ -49,6 +49,7 @@ const DEFRAG_WINDOW: u64 = WRITE_CHUNK;
 /// Commit early once this many tree nodes wait to be written.
 const DIRTY_NODES_LIMIT: usize = 4096;
 
+mod resize;
 mod send;
 mod volume_ops;
 pub use send::{ReceiveSource, SendSink, SendStats};
@@ -832,12 +833,25 @@ impl CowFs {
         self.raw.sync()
     }
 
+    /// Take in what the device(s) grew by, unless a resize fixed the size.
     pub fn grow_to_device(&mut self) -> Result<bool> {
         self.writable()?;
+        if self.sb.features & FEAT_FIXED_SIZE != 0 {
+            return Ok(false);
+        }
         if let Some(v) = self.vol.clone() {
             return self.grow_volume(&v);
         }
-        let new_total = self.raw.size() / BS;
+        let changed = self.grow_single(self.raw.size() / BS)?;
+        if changed {
+            self.flush()?;
+        }
+        Ok(changed)
+    }
+
+    /// Extend the logical space of a filesystem that is not a volume to
+    /// `new_total` blocks (left uncommitted).
+    fn grow_single(&mut self, new_total: u64) -> Result<bool> {
         let old_total = self.sb.total_blocks;
         if new_total <= old_total {
             return Ok(false);
@@ -871,7 +885,6 @@ impl CowFs {
         for gi in first_new..self.sp.alloc.groups().len() {
             self.dev.write_at(gi as u64 * GROUP_BLOCKS * BS, &backup)?;
         }
-        self.flush()?;
         Ok(true)
     }
 

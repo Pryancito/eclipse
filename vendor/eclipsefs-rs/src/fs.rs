@@ -669,6 +669,16 @@ impl EclipseFS {
         self.cow()?.compsize(ino)
     }
 
+    /// `btrfs filesystem resize [devid:]size|max`: device `devid` (1 on
+    /// a filesystem that is not a volume) becomes `size` bytes, or all of
+    /// the device for `None`. Shrinking moves whatever is past the new end
+    /// below it first (`NoSpace` if it does not fit). A size given stays
+    /// over remounts; `None` lets mounting grow with the device again.
+    /// Returns the new size in bytes.
+    pub fn resize(&mut self, devid: u32, size: Option<u64>) -> Result<u64> {
+        self.cow()?.resize(devid, size)
+    }
+
     /// `btrfs device add`: one more device; new chunks may use it at
     /// once, [`balance`](Self::balance) moves old ones. Returns its id.
     /// A filesystem on one device becomes a volume (nothing moves).

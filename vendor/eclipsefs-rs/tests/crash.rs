@@ -186,11 +186,12 @@ fn workload(seed: u64, ops: usize, size: usize, format: Mkfs, cow: bool) -> Run 
     let mut done = 0;
     // Successful snapshots and reflinks (v0.4), so the run is known to
     // exercise them.
-    let (mut snaps, mut clones, mut fallocs, mut xattrs, mut defrags) = (0, 0, 0, 0, 0);
+    let (mut snaps, mut clones, mut fallocs, mut xattrs, mut defrags, mut resizes) =
+        (0, 0, 0, 0, 0, 0);
     while done < ops {
         let d = dirs[rng.below(dirs.len() as u64) as usize];
         let name = format!("e{}", rng.below(12));
-        let ok = match rng.below(if cow { 20 } else { 14 }) {
+        let ok = match rng.below(if cow { 21 } else { 14 }) {
             0 | 1 => fs.create(d, &name, FileKind::Regular, 0o644, 0).is_ok(),
             2 => match fs.create(d, &name, FileKind::Dir, 0o755, 0) {
                 Ok(ino) => {
@@ -311,6 +312,16 @@ fn workload(seed: u64, ops: usize, size: usize, format: Mkfs, cow: bool) -> Run 
                     _ => false,
                 }
             }
+            19 => {
+                // Shrink (moving what is past the new end) or grow back.
+                let to = match rng.below(3) {
+                    0 => None,
+                    _ => Some((size as u64 * 5 / 8 + rng.below(size as u64 * 3 / 8)) / 4096 * 4096),
+                };
+                let ok = fs.resize(1, to).is_ok();
+                resizes += usize::from(ok);
+                ok
+            }
             _ if !files.is_empty() => {
                 // Extended attributes on a file that was written to.
                 let (fd, fname) = files[rng.below(files.len() as u64) as usize].clone();
@@ -339,15 +350,17 @@ fn workload(seed: u64, ops: usize, size: usize, format: Mkfs, cow: bool) -> Run 
             states.push(hash(&snapshot(&mut fs)));
         }
     }
-    if cow {
+    // Long enough runs are sure to have done each kind of change.
+    if cow && ops >= 100 {
         assert!(
-            snaps > 0 && clones > 0 && fallocs > 0 && xattrs > 0 && defrags > 0,
-            "{} snapshots, {} clones, {} fallocates, {} xattrs, {} defrags",
+            snaps > 0 && clones > 0 && fallocs > 0 && xattrs > 0 && defrags > 0 && resizes > 0,
+            "{} snapshots, {} clones, {} fallocates, {} xattrs, {} defrags, {} resizes",
             snaps,
             clones,
             fallocs,
             xattrs,
-            defrags
+            defrags,
+            resizes
         );
         if seed % 4 == 1 {
             fs.sync().unwrap();

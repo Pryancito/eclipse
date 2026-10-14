@@ -30,6 +30,8 @@ pub struct AllocationGroup {
     pub kind: ChunkKind,
     bitmap: Vec<u64>,
     dirty: bool,
+    /// Blocks from here on are not handed out (being emptied by a resize).
+    fence: u64,
 }
 
 impl AllocationGroup {
@@ -44,6 +46,7 @@ impl AllocationGroup {
             kind: ChunkKind::Mixed,
             bitmap: vec![0; WORDS],
             dirty: true,
+            fence: u64::MAX,
         };
         g.mark_tail_used();
         g.set_range(0, 2, true);
@@ -66,6 +69,7 @@ impl AllocationGroup {
             kind: ChunkKind::Mixed,
             bitmap,
             dirty: false,
+            fence: u64::MAX,
         };
         g.mark_tail_used();
         if !g.is_used(0) || !g.is_used(1) {
@@ -103,6 +107,7 @@ impl AllocationGroup {
             kind: ChunkKind::Mixed,
             bitmap: vec![u64::MAX; WORDS],
             dirty: false,
+            fence: u64::MAX,
         }
     }
 
@@ -163,25 +168,32 @@ impl AllocationGroup {
         self.dirty = true;
     }
 
+    /// End of the blocks allocations may take.
+    fn alloc_end(&self) -> u64 {
+        self.block_count.min(self.fence)
+    }
+
     /// First free block at or after `from` (group-relative).
     fn next_free(&self, from: u64) -> Option<u64> {
+        let end = self.alloc_end();
         let mut off = from;
-        while off < self.block_count {
+        while off < end {
             let w = self.bitmap[(off / 64) as usize] | ((1u64 << (off % 64)) - 1);
             if w == u64::MAX {
                 off = (off / 64 + 1) * 64;
                 continue;
             }
             let found = (off / 64) * 64 + (!w).trailing_zeros() as u64;
-            return (found < self.block_count).then_some(found);
+            return (found < end).then_some(found);
         }
         None
     }
 
     /// Length of the free run starting at `off`, capped at `max`.
     fn run_len(&self, off: u64, max: u64) -> u64 {
+        let end = self.alloc_end();
         let mut len = 0;
-        while len < max && off + len < self.block_count && !self.is_used(off + len) {
+        while len < max && off + len < end && !self.is_used(off + len) {
             if (off + len).is_multiple_of(64)
                 && max - len >= 64
                 && self.bitmap[((off + len) / 64) as usize] == 0
@@ -234,6 +246,22 @@ impl AllocationGroup {
             return Err(Error::Corrupt("double free"));
         }
         self.set_range(off, len, false);
+        Ok(())
+    }
+
+    /// Shrink the (last) group to `new_count` blocks, all of whose blocks
+    /// past that must be free.
+    pub fn shrink(&mut self, new_count: u64) -> Result<()> {
+        if new_count >= self.block_count {
+            return Ok(());
+        }
+        if new_count < 2 || (new_count..self.block_count).any(|o| self.is_used(o)) {
+            return Err(Error::Invalid);
+        }
+        let old = self.block_count;
+        // Past the end reads as "in use", as for a short group.
+        self.set_range(new_count, old - new_count, true);
+        self.block_count = new_count;
         Ok(())
     }
 
@@ -384,6 +412,23 @@ impl BlockAllocator {
             }
         }
         None
+    }
+
+    /// Hand out nothing in `from..to` until [`unfence`](Self::unfence).
+    /// The range must reach the end of every group it starts in.
+    pub fn fence(&mut self, from: u64, to: u64) {
+        for g in self.groups.iter_mut() {
+            let end = g.start_block + GROUP_BLOCKS;
+            if end > from && g.start_block < to {
+                g.fence = g.fence.min(from.saturating_sub(g.start_block));
+            }
+        }
+    }
+
+    pub fn unfence(&mut self) {
+        for g in self.groups.iter_mut() {
+            g.fence = u64::MAX;
+        }
     }
 
     /// Free blocks in groups of exactly `kind`.

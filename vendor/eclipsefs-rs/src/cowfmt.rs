@@ -107,6 +107,9 @@ pub const REF_ITEM: u8 = 200;
 pub const FEAT_QUOTA: u64 = 1;
 /// Superblock feature: a volume (chunk map, maybe several devices).
 pub const FEAT_VOLUME: u64 = 2;
+/// Superblock feature: the size was set by a resize, so mounting does not
+/// grow the filesystem to its device(s).
+pub const FEAT_FIXED_SIZE: u64 = 4;
 
 /// The superblock image `b` as device `devid` keeps it (anything that is
 /// not a volume superblock is written as it is).

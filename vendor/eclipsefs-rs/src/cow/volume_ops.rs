@@ -100,7 +100,7 @@ impl CowFs {
 
     /// Before copying chunks: fix every bad copy that has a good one, so
     /// the copies made are of good blocks.
-    fn prepare_moves(&mut self, vol: &Volume) -> Result<()> {
+    pub(super) fn prepare_moves(&mut self, vol: &Volume) -> Result<()> {
         if vol.map().chunks.values().any(|c| c.profile.copies() > 1) {
             let r = self.scrub()?;
             if !r.is_clean() {
@@ -111,7 +111,7 @@ impl CowFs {
     }
 
     /// Copy group `g` to new stripes with `profile` and switch to them.
-    fn relocate(&mut self, g: u64, profile: Profile) -> Result<()> {
+    pub(super) fn relocate(&mut self, g: u64, profile: Profile) -> Result<()> {
         self.flush()?;
         let vol = self.vol.clone().ok_or(Error::Invalid)?;
         let old = vol
@@ -136,6 +136,14 @@ impl CowFs {
             blocks: old.blocks,
             stripes,
         };
+        self.switch_chunk(g, &old, new)
+    }
+
+    /// Copy the used blocks of group `g` from layout `old` to `new` and
+    /// switch to it; the old stripes stay untouched until that commits.
+    pub(super) fn switch_chunk(&mut self, g: u64, old: &Chunk, new: Chunk) -> Result<()> {
+        self.flush()?;
+        let vol = self.vol.clone().ok_or(Error::Invalid)?;
         let runs = self
             .sp
             .alloc
@@ -144,7 +152,7 @@ impl CowFs {
             .ok_or(Error::Corrupt("chunk without a group"))?
             .used_runs();
         for (start, n) in runs {
-            vol.copy_between(&old, &new, start, n)?;
+            vol.copy_between(old, &new, start, n)?;
         }
         vol.sync()?;
         let len = old.stripe_len();
@@ -157,7 +165,7 @@ impl CowFs {
     }
 
     /// Give an empty chunk's space back to its devices.
-    fn drop_chunk(&mut self, g: u64) -> Result<()> {
+    pub(super) fn drop_chunk(&mut self, g: u64) -> Result<()> {
         let vol = self.vol.clone().ok_or(Error::Invalid)?;
         let Some(old) = vol.with_map(|m| m.chunks.remove(&g)) else {
             return Ok(());
@@ -365,7 +373,7 @@ impl CowFs {
         let Some(vol) = &self.vol else {
             return vec![DeviceInfo {
                 devid: 1,
-                size_bytes: self.raw.size(),
+                size_bytes: self.sb.total_blocks * BS,
                 allocated_bytes: self.sp.alloc.total_blocks() * BS,
                 present: true,
             }];

@@ -22,6 +22,7 @@
 //! | `BTRFS_IOC_SCRUB` | verify (and repair from another copy) every block |
 //! | `BTRFS_IOC_QUOTA_CTL`, `QUOTA_RESCAN(_STATUS/_WAIT)`, `QGROUP_LIMIT` | quotas |
 //! | `BTRFS_IOC_ADD_DEV`, `RM_DEV(_V2)`, `DEV_REPLACE` | devices of a volume |
+//! | `BTRFS_IOC_RESIZE` | `btrfs filesystem resize`: grow, or shrink moving what is past the end |
 //! | `BTRFS_IOC_BALANCE_V2` | balance, with `convert` to another profile |
 //! | `BTRFS_IOC_SEND` | send stream of a read-only snapshot into a file |
 //! | `EFS_IOC_RECEIVE` | receive such a stream into a directory (EclipseFS's own) |
@@ -73,6 +74,7 @@ const FS_IOC_FIEMAP: u32 = 0xc020_660b;
 // btrfs (`include/uapi/linux/btrfs.h`).
 const BTRFS_IOC_SNAP_CREATE: u32 = 0x5000_9401;
 const BTRFS_IOC_DEFRAG: u32 = 0x5000_9402;
+const BTRFS_IOC_RESIZE: u32 = 0x5000_9403;
 const BTRFS_IOC_SYNC: u32 = 0x0000_9408;
 const BTRFS_IOC_ADD_DEV: u32 = 0x5000_940a;
 const BTRFS_IOC_RM_DEV: u32 = 0x5000_940b;
@@ -236,6 +238,26 @@ fn subvol_name(b: &[u8], at: usize, max: usize) -> LxResult<&str> {
     Ok(name)
 }
 
+/// A byte count as the kernel's `memparse` reads it: digits and an optional
+/// `k`/`m`/`g`/`t`/`p`/`e` suffix in powers of 1024. `None` for anything
+/// else, an overflow or zero.
+fn memparse(s: &str) -> Option<u64> {
+    let digits = s.bytes().take_while(u8::is_ascii_digit).count();
+    let n: u64 = s[..digits].parse().ok()?;
+    let shift = match s[digits..].to_ascii_lowercase().as_str() {
+        "" => 0,
+        "k" => 10,
+        "m" => 20,
+        "g" => 30,
+        "t" => 40,
+        "p" => 50,
+        "e" => 60,
+        _ => return None,
+    };
+    let v = n.checked_mul(1 << shift)?;
+    (v > 0).then_some(v)
+}
+
 fn put_cstr(b: &mut [u8], at: usize, max: usize, s: &str) -> LxResult<()> {
     if s.len() >= max {
         return Err(LxError::ENAMETOOLONG);
@@ -259,6 +281,7 @@ pub(crate) fn is_fs_ioctl(cmd: u32) -> bool {
             | FS_IOC_FIEMAP
             | BTRFS_IOC_SNAP_CREATE
             | BTRFS_IOC_DEFRAG
+            | BTRFS_IOC_RESIZE
             | BTRFS_IOC_DEFRAG_RANGE
             | BTRFS_IOC_SYNC
             | BTRFS_IOC_ADD_DEV
@@ -682,6 +705,11 @@ impl<'a> Target<'a> {
                     self.with(|fs| fs.set_qgroup_limit(id, limit))?;
                 }
             }
+            BTRFS_IOC_RESIZE => {
+                Self::admin(ctx)?;
+                self.want_write()?;
+                self.resize(cstr(buf, 8, 4088)?)?;
+            }
             BTRFS_IOC_ADD_DEV => {
                 Self::admin(ctx)?;
                 self.want_write()?;
@@ -795,6 +823,42 @@ impl<'a> Target<'a> {
             self.with(|fs| fs.sync())?;
         }
         Ok(())
+    }
+
+    /// `BTRFS_IOC_RESIZE` with what `btrfs filesystem resize` passes:
+    /// `[devid:]size`, the size being `max`, bytes with an optional
+    /// `k`/`m`/`g`/`t`/`p`/`e` (powers of 1024), or such an amount after
+    /// `+` or `-` to add to or take from the device's current size.
+    fn resize(&self, arg: &str) -> LxResult<()> {
+        let (devid, spec) = match arg.split_once(':') {
+            Some((d, s)) => (d.parse::<u32>().map_err(|_| LxError::EINVAL)?, s),
+            None => (1, arg),
+        };
+        let size = if spec == "max" {
+            None
+        } else {
+            let (sign, amount) = match spec.as_bytes().first() {
+                Some(b'+') => (1, &spec[1..]),
+                Some(b'-') => (-1, &spec[1..]),
+                _ => (0, spec),
+            };
+            let n = memparse(amount).ok_or(LxError::EINVAL)?;
+            let cur = self
+                .devices()
+                .iter()
+                .find(|d| d.devid == devid)
+                .ok_or(LxError::ENODEV)?
+                .size_bytes;
+            Some(match sign {
+                1 => cur.checked_add(n).ok_or(LxError::EINVAL)?,
+                -1 => cur.checked_sub(n).ok_or(LxError::EINVAL)?,
+                _ => n,
+            })
+        };
+        match self.with(|fs| fs.resize(devid, size)) {
+            Err(LxError::ENOENT) => Err(LxError::ENODEV),
+            r => r.map(|_| ()),
+        }
     }
 
     fn dedupe(&self, buf: &mut [u8], ctx: &dyn FsIoctlContext) -> LxResult<()> {
@@ -1572,6 +1636,7 @@ mod tests {
         assert_eq!(FIDEDUPERANGE, ioc(R | W, 0x94, 54, 24));
         assert_eq!(FS_IOC_FIEMAP, ioc(R | W, b'f' as u32, 11, 32));
         assert_eq!(BTRFS_IOC_DEFRAG, ioc(W, 0x94, 2, 4096));
+        assert_eq!(BTRFS_IOC_RESIZE, ioc(W, 0x94, 3, 4096));
         assert_eq!(BTRFS_IOC_DEFRAG_RANGE, ioc(W, 0x94, 16, 48));
         assert_eq!(BTRFS_IOC_SNAP_CREATE_V2, ioc(W, 0x94, 23, 4096));
         assert_eq!(BTRFS_IOC_SUBVOL_CREATE_V2, ioc(W, 0x94, 24, 4096));
@@ -2450,6 +2515,81 @@ mod tests {
         ctx.ioctl(fd, BTRFS_IOC_DEFRAG, &mut []).unwrap();
         assert_eq!(read_all(&a), want);
         assert_eq!(extent_count(&ctx, fd), 1);
+    }
+
+    #[test]
+    fn memparse_reads_sizes_as_btrfs_progs_writes_them() {
+        assert_eq!(memparse("4096"), Some(4096));
+        assert_eq!(memparse("8m"), Some(8 << 20));
+        assert_eq!(memparse("2G"), Some(2 << 30));
+        assert_eq!(memparse("1e"), Some(1 << 60));
+        assert_eq!(memparse("0"), None);
+        assert_eq!(memparse(""), None);
+        assert_eq!(memparse("12x"), None);
+        assert_eq!(memparse("m"), None);
+        assert_eq!(memparse("99999999999e"), None);
+    }
+
+    #[test]
+    fn resize_shrinks_grows_and_reads_relative_sizes() {
+        let disk = formatted(32 << 20);
+        let fs = mount(&disk);
+        let data = pattern(3 << 20, 4);
+        let f = file_with(&fs.root_inode(), "f", &data);
+        let ctx = Ctx::root();
+        let fd = ctx.open(fs.root_inode(), OpenFlags::RDONLY);
+        let size = || fs.inner.lock().fsinfo().total_bytes;
+        ctx.ioctl(fd, BTRFS_IOC_RESIZE, &mut vol_args(0, "-8m"))
+            .unwrap();
+        assert_eq!(size(), 24 << 20);
+        ctx.ioctl(fd, BTRFS_IOC_RESIZE, &mut vol_args(0, "1:+4m"))
+            .unwrap();
+        assert_eq!(size(), 28 << 20);
+        ctx.ioctl(fd, BTRFS_IOC_RESIZE, &mut vol_args(0, "16m"))
+            .unwrap();
+        assert_eq!(size(), 16 << 20);
+        ctx.ioctl(fd, BTRFS_IOC_RESIZE, &mut vol_args(0, "max"))
+            .unwrap();
+        assert_eq!(size(), 32 << 20);
+        assert_eq!(read_all(&f), data);
+        fs.inner.lock().check().unwrap();
+    }
+
+    #[test]
+    fn resize_refuses_bad_sizes_devices_and_users() {
+        let disk = formatted(16 << 20);
+        let fs = mount(&disk);
+        let ctx = Ctx::root();
+        let fd = ctx.open(fs.root_inode(), OpenFlags::RDONLY);
+        for bad in ["", "big", "1:", "x:8m", "64m", "-64m"] {
+            assert_eq!(
+                ctx.ioctl(fd, BTRFS_IOC_RESIZE, &mut vol_args(0, bad)),
+                Err(LxError::EINVAL),
+                "{bad}"
+            );
+        }
+        assert_eq!(
+            ctx.ioctl(fd, BTRFS_IOC_RESIZE, &mut vol_args(0, "7:8m")),
+            Err(LxError::ENODEV)
+        );
+        assert_eq!(
+            ctx.ioctl(fd, BTRFS_IOC_RESIZE, &mut vol_args(0, "7:max")),
+            Err(LxError::ENODEV)
+        );
+        let user = Ctx::as_user(1000);
+        let ufd = user.open(fs.root_inode(), OpenFlags::RDONLY);
+        assert_eq!(
+            user.ioctl(ufd, BTRFS_IOC_RESIZE, &mut vol_args(0, "8m")),
+            Err(LxError::EPERM)
+        );
+        // Too full to shrink that far.
+        file_with(&fs.root_inode(), "big", &pattern(12 << 20, 1));
+        fs.sync().unwrap();
+        assert_eq!(
+            ctx.ioctl(fd, BTRFS_IOC_RESIZE, &mut vol_args(0, "8m")),
+            Err(LxError::ENOSPC)
+        );
+        assert_eq!(fs.inner.lock().fsinfo().total_bytes, 16 << 20);
     }
 
     #[test]
