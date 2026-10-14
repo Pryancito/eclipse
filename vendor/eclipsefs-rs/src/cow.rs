@@ -41,6 +41,11 @@ use crate::{Error, Result};
 const BS: u64 = BLOCK_SIZE;
 /// Blocks handled per step of a large write (bounds the buffer).
 const WRITE_CHUNK: u64 = 2048;
+/// Extents at least this long are left alone by [`CowFs::defrag`] (btrfs's
+/// default `extent_thresh`).
+const DEFRAG_THRESHOLD: u64 = 32 << 20;
+/// Most blocks [`CowFs::defrag`] moves to one new run.
+const DEFRAG_WINDOW: u64 = WRITE_CHUNK;
 /// Commit early once this many tree nodes wait to be written.
 const DIRTY_NODES_LIMIT: usize = 4096;
 
@@ -3048,6 +3053,144 @@ impl CowFs {
             Some(&(s, t)) if s <= off => t,
             _ => off,
         }))
+    }
+
+    /// `btrfs filesystem defragment`: rewrite the fragmented data of file
+    /// bytes `start..start+len` into contiguous extents. Runs of adjacent
+    /// extents smaller than `threshold` bytes (0: 32 MiB) that are not one
+    /// after the other on disk move to one new run; with `compress`, every
+    /// extent not already compressed that way is rewritten compressed.
+    /// Like btrfs, rewritten data stops being shared with snapshots and
+    /// clones. Holes and preallocated space stay as they are. Returns the
+    /// bytes rewritten.
+    pub fn defrag(
+        &mut self,
+        h: u64,
+        start: u64,
+        len: u64,
+        threshold: u64,
+        compress: Option<Compression>,
+    ) -> Result<u64> {
+        let ino = self.at_rw(h)?;
+        self.writable()?;
+        let inode = self.inode(ino)?;
+        match inode.kind() {
+            // btrfs defragments the metadata of a directory; the trees here
+            // are rewritten whole on every change, so there is nothing to do.
+            FileKind::Dir => return Ok(0),
+            FileKind::Regular => {}
+            _ => return Err(Error::Invalid),
+        }
+        permit(immutable(&inode))?;
+        if len == 0 || start >= inode.size || self.inline_data(ino)?.is_some() {
+            return Ok(0);
+        }
+        // Small writes waiting to be compressed settle first.
+        if !self.nested {
+            self.flush()?;
+        }
+        let mut inode = self.inode(ino)?;
+        let before = inode.clone();
+        // No-COW data is never compressed.
+        let nocow = inode.flags & FL_NOCOW as u64 != 0;
+        let compress = compress.filter(|_| !nocow);
+        let threshold = match threshold {
+            0 => DEFRAG_THRESHOLD,
+            t => t,
+        }
+        .div_ceil(BS)
+        .max(1);
+        let first = start / BS;
+        let last = start
+            .saturating_add(len)
+            .div_ceil(BS)
+            .min(inode.size.div_ceil(BS));
+        let wanted = |e: &Ext| match (compress, e.z) {
+            _ if e.prealloc => false,
+            (Some(algo), z) => z.map(|z| z.algo) != Some(algo),
+            (None, z) => z.is_none() && e.blocks < threshold,
+        };
+        // Windows of adjacent extents worth rewriting, as (first block,
+        // blocks, pieces on disk).
+        let mut windows: Vec<(u64, u64, u64)> = Vec::new();
+        let mut prev: Option<Ext> = None;
+        for mut e in self.extents(ino, first, last)? {
+            // Clip to the range asked for.
+            if e.lblk < first {
+                let cut = first - e.lblk;
+                if e.z.is_none() {
+                    e.pblk += cut;
+                }
+                e.lblk = first;
+                e.blocks -= cut;
+            }
+            e.blocks = e.blocks.min(last - e.lblk);
+            if !wanted(&e) {
+                prev = None;
+                continue;
+            }
+            let after = prev.map(|p| p.lblk + p.blocks == e.lblk).unwrap_or(false);
+            let joined = after
+                && prev.map(|p| p.z.is_none() && e.z.is_none() && p.pblk + p.blocks == e.pblk)
+                    == Some(true);
+            match windows.last_mut() {
+                Some(w) if after && w.1 + e.blocks <= DEFRAG_WINDOW => {
+                    w.1 += e.blocks;
+                    if !joined {
+                        w.2 += 1;
+                    }
+                }
+                _ => windows.push((e.lblk, e.blocks, 1)),
+            }
+            prev = Some(e);
+        }
+        let mut rewritten = 0;
+        for (lb, n, pieces) in windows {
+            if compress.is_none() && pieces < 2 {
+                continue;
+            }
+            let mut buf = vec![0u8; (n * BS) as usize];
+            self.read_blocks(ino, lb * BS, &mut buf)?;
+            self.zcache = None;
+            let mut done = 0;
+            if let Some(algo) = compress {
+                // Chunks of up to ZCHUNK blocks; a single block does not
+                // shrink by compressing.
+                while n - done >= 2 {
+                    let c = ZCHUNK.min(n - done);
+                    let at = (done * BS) as usize;
+                    let chunk = &buf[at..at + (c * BS) as usize];
+                    if !self.write_packed(ino, &mut inode, lb + done, chunk, algo)? {
+                        break;
+                    }
+                    done += c;
+                }
+            }
+            // The rest, as one run; when no run that long is free the data
+            // stays where it is.
+            let rest = n - done;
+            if rest > 0 {
+                let goal = self.goal(ino, lb + done)?;
+                if let Some(pb) = self.sp.alloc_data_run(goal, rest) {
+                    let data = &buf[(done * BS) as usize..];
+                    self.raw.write_at(pb * BS, data)?;
+                    for (i, block) in data.chunks(BS as usize).enumerate() {
+                        let c = (!nocow).then(|| crc32c(block));
+                        self.sp.csums.insert(pb + i as u64, c);
+                    }
+                    self.set_mapping(ino, &mut inode, lb + done, rest, pb)?;
+                    done = n;
+                }
+            }
+            rewritten += done * BS;
+        }
+        // Rewriting keeps the size; compressed pieces must not stretch it.
+        inode.size = before.size;
+        if inode != before {
+            self.put_inode(ino, inode)?;
+        }
+        self.commit()?;
+        Ok(rewritten)
     }
 
     pub fn compsize(&mut self, h: u64) -> Result<CompSize> {

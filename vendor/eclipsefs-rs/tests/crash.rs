@@ -186,11 +186,11 @@ fn workload(seed: u64, ops: usize, size: usize, format: Mkfs, cow: bool) -> Run 
     let mut done = 0;
     // Successful snapshots and reflinks (v0.4), so the run is known to
     // exercise them.
-    let (mut snaps, mut clones, mut fallocs, mut xattrs) = (0, 0, 0, 0);
+    let (mut snaps, mut clones, mut fallocs, mut xattrs, mut defrags) = (0, 0, 0, 0, 0);
     while done < ops {
         let d = dirs[rng.below(dirs.len() as u64) as usize];
         let name = format!("e{}", rng.below(12));
-        let ok = match rng.below(if cow { 19 } else { 14 }) {
+        let ok = match rng.below(if cow { 20 } else { 14 }) {
             0 | 1 => fs.create(d, &name, FileKind::Regular, 0o644, 0).is_ok(),
             2 => match fs.create(d, &name, FileKind::Dir, 0o755, 0) {
                 Ok(ino) => {
@@ -293,6 +293,24 @@ fn workload(seed: u64, ops: usize, size: usize, format: Mkfs, cow: bool) -> Run 
                 }
                 _ => false,
             },
+            18 if !files.is_empty() => {
+                // Defragment (sometimes compressing) part of a written file.
+                let (fd, fname) = files[rng.below(files.len() as u64) as usize].clone();
+                match fs.lookup(fd, &fname) {
+                    Ok(ino) if fs.stat(ino).unwrap().kind == FileKind::Regular => {
+                        let start = rng.below(40_000);
+                        let len = 1 + rng.below(80_000);
+                        let algo = match rng.below(3) {
+                            0 => Some(Compression::ALL[rng.below(3) as usize]),
+                            _ => None,
+                        };
+                        let ok = fs.defrag(ino, start, len, 0, algo).is_ok();
+                        defrags += usize::from(ok);
+                        ok
+                    }
+                    _ => false,
+                }
+            }
             _ if !files.is_empty() => {
                 // Extended attributes on a file that was written to.
                 let (fd, fname) = files[rng.below(files.len() as u64) as usize].clone();
@@ -323,12 +341,13 @@ fn workload(seed: u64, ops: usize, size: usize, format: Mkfs, cow: bool) -> Run 
     }
     if cow {
         assert!(
-            snaps > 0 && clones > 0 && fallocs > 0 && xattrs > 0,
-            "{} snapshots, {} clones, {} fallocates, {} xattrs",
+            snaps > 0 && clones > 0 && fallocs > 0 && xattrs > 0 && defrags > 0,
+            "{} snapshots, {} clones, {} fallocates, {} xattrs, {} defrags",
             snaps,
             clones,
             fallocs,
-            xattrs
+            xattrs,
+            defrags
         );
         if seed % 4 == 1 {
             fs.sync().unwrap();
@@ -506,7 +525,7 @@ fn torn_journal_header_is_ignored() {
 
 #[test]
 fn read_only_mount_sees_the_journal_without_writing() {
-    let run = workload(3, 60, 8 * MIB, mkfs::format, true);
+    let run = workload(7, 60, 8 * MIB, mkfs::format, true);
     // Stop right after the last journal header write: the transaction is
     // committed but not yet home.
     let mut image = run.base.clone();

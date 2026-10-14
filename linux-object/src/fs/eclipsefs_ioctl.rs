@@ -10,6 +10,7 @@
 //! | `FICLONE`/`FICLONERANGE` | reflink: the destination shares the source's blocks |
 //! | `FIDEDUPERANGE` | share the blocks of ranges that hold the same bytes |
 //! | `FS_IOC_FIEMAP` | `filefrag`: the file's extents (unwritten, compressed, shared, inline) |
+//! | `BTRFS_IOC_DEFRAG`, `DEFRAG_RANGE` | `btrfs filesystem defragment [-c]`: contiguous (or recompressed) data |
 //! | `BTRFS_IOC_SUBVOL_CREATE(_V2)` | new subvolume |
 //! | `BTRFS_IOC_SNAP_CREATE(_V2)` | snapshot (`BTRFS_SUBVOL_RDONLY` for a read-only one) |
 //! | `BTRFS_IOC_SNAP_DESTROY(_V2)` | delete a subvolume by name |
@@ -71,6 +72,7 @@ const FS_IOC_FIEMAP: u32 = 0xc020_660b;
 
 // btrfs (`include/uapi/linux/btrfs.h`).
 const BTRFS_IOC_SNAP_CREATE: u32 = 0x5000_9401;
+const BTRFS_IOC_DEFRAG: u32 = 0x5000_9402;
 const BTRFS_IOC_SYNC: u32 = 0x0000_9408;
 const BTRFS_IOC_ADD_DEV: u32 = 0x5000_940a;
 const BTRFS_IOC_RM_DEV: u32 = 0x5000_940b;
@@ -78,6 +80,7 @@ const BTRFS_IOC_SUBVOL_CREATE: u32 = 0x5000_940e;
 const BTRFS_IOC_SNAP_DESTROY: u32 = 0x5000_940f;
 const BTRFS_IOC_INO_LOOKUP: u32 = 0xd000_9412;
 const BTRFS_IOC_DEFAULT_SUBVOL: u32 = 0x4008_9413;
+const BTRFS_IOC_DEFRAG_RANGE: u32 = 0x4030_9410;
 const BTRFS_IOC_WAIT_SYNC: u32 = 0x4008_9416;
 const BTRFS_IOC_SNAP_CREATE_V2: u32 = 0x5000_9417;
 const BTRFS_IOC_START_SYNC: u32 = 0x8008_9418;
@@ -134,6 +137,9 @@ const BTRFS_BLOCK_GROUP_RAID10: u64 = 1 << 6;
 const BTRFS_BLOCK_GROUP_RAID1C3: u64 = 1 << 9;
 const BTRFS_BLOCK_GROUP_RAID1C4: u64 = 1 << 10;
 const BTRFS_AVAIL_ALLOC_BIT_SINGLE: u64 = 1 << 48;
+
+const BTRFS_DEFRAG_RANGE_COMPRESS: u64 = 1 << 0;
+const BTRFS_DEFRAG_RANGE_START_IO: u64 = 1 << 1;
 
 const BTRFS_QGROUP_LIMIT_MAX_RFER: u64 = 1 << 0;
 const BTRFS_SEND_FLAG_VERSION: u64 = 1 << 3;
@@ -252,6 +258,8 @@ pub(crate) fn is_fs_ioctl(cmd: u32) -> bool {
             | FIDEDUPERANGE
             | FS_IOC_FIEMAP
             | BTRFS_IOC_SNAP_CREATE
+            | BTRFS_IOC_DEFRAG
+            | BTRFS_IOC_DEFRAG_RANGE
             | BTRFS_IOC_SYNC
             | BTRFS_IOC_ADD_DEV
             | BTRFS_IOC_RM_DEV
@@ -334,6 +342,8 @@ impl<'a> Target<'a> {
             return ret;
         }
         let mut buf = match cmd {
+            // Its argument is not read (often NULL).
+            BTRFS_IOC_DEFRAG => Vec::new(),
             // The argument is the source descriptor itself.
             FICLONE => (arg as i32).to_le_bytes().to_vec(),
             // An `int`, whatever `long` in the number says (as Linux reads it).
@@ -541,6 +551,8 @@ impl<'a> Target<'a> {
                 self.clone_from(&src, get64(buf, 8), get64(buf, 16), get64(buf, 24))?;
             }
             FIDEDUPERANGE => self.dedupe(buf, ctx)?,
+            BTRFS_IOC_DEFRAG => self.defrag(None, ctx)?,
+            BTRFS_IOC_DEFRAG_RANGE => self.defrag(Some(buf), ctx)?,
             BTRFS_IOC_SYNC | BTRFS_IOC_WAIT_SYNC => self.with(|fs| fs.sync())?,
             BTRFS_IOC_START_SYNC => {
                 let gen = self.with(|fs| fs.sync().map(|_| fs.generation()))?;
@@ -733,6 +745,58 @@ impl<'a> Target<'a> {
     }
 
     /// `FIDEDUPERANGE`, called on the source.
+    /// `BTRFS_IOC_DEFRAG` (the whole file) and `BTRFS_IOC_DEFRAG_RANGE`
+    /// (`struct btrfs_ioctl_defrag_range_args`), as `btrfs filesystem
+    /// defragment [-c]` calls them. A file must be open for writing, or
+    /// its owner's, or the caller `CAP_SYS_ADMIN`; a directory (btrfs
+    /// defragments its metadata, which here is rewritten on every change)
+    /// needs `CAP_SYS_ADMIN` and has nothing to do.
+    fn defrag(&self, range: Option<&[u8]>, ctx: &dyn FsIoctlContext) -> LxResult<()> {
+        self.want_write()?;
+        let st = self.stat(self.ino)?;
+        match st.kind {
+            FileKind::Dir => return Self::admin(ctx),
+            FileKind::Regular => {}
+            _ => return Err(LxError::EINVAL),
+        }
+        if !self.file.flags().writable() && !ctx.capable(CAP_SYS_ADMIN) {
+            self.owner(ctx)?;
+        }
+        let (mut start, mut len, mut threshold, mut compress, mut sync) =
+            (0, u64::MAX, 0, None, false);
+        if let Some(b) = range {
+            let flags = get64(b, 16);
+            if flags & !(BTRFS_DEFRAG_RANGE_COMPRESS | BTRFS_DEFRAG_RANGE_START_IO) != 0 {
+                return Err(LxError::EOPNOTSUPP);
+            }
+            start = get64(b, 0);
+            // A length of 0 (or one past the largest offset) runs to the end.
+            len = match get64(b, 8) {
+                0 => u64::MAX,
+                n => n,
+            };
+            threshold = get32(b, 24) as u64;
+            if flags & BTRFS_DEFRAG_RANGE_COMPRESS != 0 {
+                // btrfs's numbers; zlib by default, and LZ4 stands in for LZO.
+                compress = Some(match get32(b, 28) {
+                    0 | 1 => Compression::Zlib,
+                    2 => Compression::Lz4,
+                    3 => Compression::Zstd,
+                    _ => return Err(LxError::EINVAL),
+                });
+            }
+            sync = flags & BTRFS_DEFRAG_RANGE_START_IO != 0;
+        }
+        // What the page cache holds is defragmented with the rest. The
+        // bytes do not change, so nothing cached needs reloading after.
+        cache_flush(&self.file.inode(), 0, st.size as usize);
+        self.with(|fs| fs.defrag(self.ino, start, len, threshold, compress))?;
+        if sync {
+            self.with(|fs| fs.sync())?;
+        }
+        Ok(())
+    }
+
     fn dedupe(&self, buf: &mut [u8], ctx: &dyn FsIoctlContext) -> LxResult<()> {
         let src_off = get64(buf, 0);
         let len = get64(buf, 8);
@@ -1507,6 +1571,8 @@ mod tests {
         assert_eq!(FICLONERANGE, ioc(W, 0x94, 13, 32));
         assert_eq!(FIDEDUPERANGE, ioc(R | W, 0x94, 54, 24));
         assert_eq!(FS_IOC_FIEMAP, ioc(R | W, b'f' as u32, 11, 32));
+        assert_eq!(BTRFS_IOC_DEFRAG, ioc(W, 0x94, 2, 4096));
+        assert_eq!(BTRFS_IOC_DEFRAG_RANGE, ioc(W, 0x94, 16, 48));
         assert_eq!(BTRFS_IOC_SNAP_CREATE_V2, ioc(W, 0x94, 23, 4096));
         assert_eq!(BTRFS_IOC_SUBVOL_CREATE_V2, ioc(W, 0x94, 24, 4096));
         assert_eq!(BTRFS_IOC_START_SYNC, ioc(R, 0x94, 24, 8));
@@ -2253,6 +2319,137 @@ mod tests {
         f.resize(1 << 20).unwrap();
         fs.sync().unwrap();
         f
+    }
+
+    /// Two files written a block at a time, in turns and in separate
+    /// transactions, so each one's blocks alternate with the other's.
+    fn fragmented_pair(fs: &Arc<EclipseMountFs>, blocks: usize) -> [Arc<dyn INode>; 2] {
+        let root = fs.root_inode();
+        let a = file_with(&root, "a", b"");
+        let b = file_with(&root, "b", b"");
+        for i in 0..blocks {
+            let at = i * BLOCK as usize;
+            a.write_at(at, &pattern(BLOCK as usize, i as u8)).unwrap();
+            b.write_at(at, &pattern(BLOCK as usize, i as u8 ^ 0x80))
+                .unwrap();
+            fs.sync().unwrap();
+        }
+        [a, b]
+    }
+
+    fn defrag_range_args(start: u64, len: u64, flags: u64, thresh: u32, algo: u32) -> Vec<u8> {
+        let mut b = vec![0u8; 48];
+        put64(&mut b, 0, start);
+        put64(&mut b, 8, len);
+        put64(&mut b, 16, flags);
+        put32(&mut b, 24, thresh);
+        put32(&mut b, 28, algo);
+        b
+    }
+
+    fn extent_count(ctx: &Ctx, fd: i32) -> usize {
+        let mut b = fiemap_args(0, u64::MAX, 0, 64);
+        ctx.ioctl(fd, FS_IOC_FIEMAP, &mut b).unwrap();
+        fiemap_extents(&b).len()
+    }
+
+    #[test]
+    fn defrag_makes_a_fragmented_file_one_extent() {
+        let disk = formatted(32 << 20);
+        let fs = mount(&disk);
+        let [a, _] = fragmented_pair(&fs, 16);
+        let data = read_all(&a);
+        let ctx = Ctx::root();
+        let fd = ctx.open(a.clone(), OpenFlags::RDWR);
+        assert_eq!(extent_count(&ctx, fd), 16);
+        ctx.ioctl(fd, BTRFS_IOC_DEFRAG, &mut []).unwrap();
+        assert_eq!(extent_count(&ctx, fd), 1);
+        assert_eq!(read_all(&a), data);
+        fs.inner.lock().check().unwrap();
+    }
+
+    #[test]
+    fn defrag_range_compresses_and_honours_the_range() {
+        const ENCODED: u32 = 0x8;
+        let disk = formatted(32 << 20);
+        let fs = mount(&disk);
+        let [a, b] = fragmented_pair(&fs, 16);
+        let ctx = Ctx::root();
+        let fa = ctx.open(a.clone(), OpenFlags::RDWR);
+        // Blocks 4..8 only: three runs remain around the new one.
+        let mut r = defrag_range_args(4 * BLOCK, 4 * BLOCK, 0, 0, 0);
+        ctx.ioctl(fa, BTRFS_IOC_DEFRAG_RANGE, &mut r).unwrap();
+        assert_eq!(extent_count(&ctx, fa), 4 + 1 + 8);
+        // `-c zstd` over the whole file (len 0 runs to the end).
+        let fb = ctx.open(b.clone(), OpenFlags::RDWR);
+        let data = read_all(&b);
+        let mut r = defrag_range_args(
+            0,
+            0,
+            BTRFS_DEFRAG_RANGE_COMPRESS | BTRFS_DEFRAG_RANGE_START_IO,
+            0,
+            3,
+        );
+        ctx.ioctl(fb, BTRFS_IOC_DEFRAG_RANGE, &mut r).unwrap();
+        let mut m = fiemap_args(0, u64::MAX, 0, 64);
+        ctx.ioctl(fb, FS_IOC_FIEMAP, &mut m).unwrap();
+        assert!(fiemap_extents(&m).iter().all(|e| e.2 & ENCODED != 0));
+        assert_eq!(read_all(&b), data);
+        fs.inner.lock().check().unwrap();
+    }
+
+    #[test]
+    fn defrag_refuses_bad_arguments_and_strangers() {
+        let disk = formatted(16 << 20);
+        let fs = mount(&disk);
+        let [a, _] = fragmented_pair(&fs, 2);
+        let ctx = Ctx::root();
+        let fd = ctx.open(a.clone(), OpenFlags::RDWR);
+        let mut r = defrag_range_args(0, 0, 1 << 5, 0, 0);
+        assert_eq!(
+            ctx.ioctl(fd, BTRFS_IOC_DEFRAG_RANGE, &mut r),
+            Err(LxError::EOPNOTSUPP)
+        );
+        let mut r = defrag_range_args(0, 0, BTRFS_DEFRAG_RANGE_COMPRESS, 0, 9);
+        assert_eq!(
+            ctx.ioctl(fd, BTRFS_IOC_DEFRAG_RANGE, &mut r),
+            Err(LxError::EINVAL)
+        );
+        // Someone else, with the file open only for reading.
+        let user = Ctx::as_user(1000);
+        let ro = user.open(a.clone(), OpenFlags::RDONLY);
+        assert_eq!(
+            user.ioctl(ro, BTRFS_IOC_DEFRAG, &mut []),
+            Err(LxError::EPERM)
+        );
+        // A directory: CAP_SYS_ADMIN, and nothing to do.
+        let dfd = user.open(fs.root_inode(), OpenFlags::RDONLY);
+        assert_eq!(
+            user.ioctl(dfd, BTRFS_IOC_DEFRAG, &mut []),
+            Err(LxError::EPERM)
+        );
+        let dfd = ctx.open(fs.root_inode(), OpenFlags::RDONLY);
+        ctx.ioctl(dfd, BTRFS_IOC_DEFRAG, &mut []).unwrap();
+    }
+
+    #[test]
+    fn defrag_writes_back_the_page_cache_first() {
+        let disk = formatted(32 << 20);
+        let fs = mount(&disk);
+        let [a, _] = fragmented_pair(&fs, 8);
+        let ctx = Ctx::root();
+        let fd = ctx.open(a.clone(), OpenFlags::RDWR);
+        // A write through the descriptor that may still sit in the cache.
+        let file = ctx.fd(fd);
+        file.write_at(BLOCK, &[0xee; 100]).unwrap();
+        let want = {
+            let mut v = read_all(&a);
+            v[BLOCK as usize..BLOCK as usize + 100].fill(0xee);
+            v
+        };
+        ctx.ioctl(fd, BTRFS_IOC_DEFRAG, &mut []).unwrap();
+        assert_eq!(read_all(&a), want);
+        assert_eq!(extent_count(&ctx, fd), 1);
     }
 
     #[test]

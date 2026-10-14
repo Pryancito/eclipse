@@ -647,6 +647,23 @@ impl EclipseFS {
         self.cow()?.seek_hole(ino, off)
     }
 
+    /// `btrfs filesystem defragment` of file bytes `start..start+len`:
+    /// fragmented runs of extents shorter than `threshold` bytes (0 for
+    /// the 32 MiB default) move to one contiguous run each; with
+    /// `compress`, the data is rewritten compressed that way. Rewritten
+    /// data is no longer shared with snapshots or clones. Returns the
+    /// bytes rewritten.
+    pub fn defrag(
+        &mut self,
+        ino: u64,
+        start: u64,
+        len: u64,
+        threshold: u64,
+        compress: Option<Compression>,
+    ) -> Result<u64> {
+        self.cow()?.defrag(ino, start, len, threshold, compress)
+    }
+
     /// Disk and file bytes of a file's data (as `compsize` reports).
     pub fn compsize(&mut self, ino: u64) -> Result<CompSize> {
         self.cow()?.compsize(ino)
