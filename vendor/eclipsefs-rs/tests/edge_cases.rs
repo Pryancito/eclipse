@@ -7,6 +7,9 @@ mod common;
 use std::collections::BTreeMap;
 
 use common::*;
+use eclipsefs::device::BlockDevice;
+use eclipsefs::format::Superblock;
+use eclipsefs::fs::COMMIT_OPS;
 use eclipsefs::{mkfs, EclipseFS, Error, FileKind};
 
 fn used(fs: &EclipseFS) -> u64 {
@@ -503,6 +506,9 @@ fn many_files_and_directories_beyond_the_caches() {
         let f = fs.lookup(dir, "f0").unwrap();
         assert_eq!(read_all(&mut fs, f), format!("{}", d).as_bytes());
     }
+    let report = fs.check().unwrap();
+    assert_eq!(report.inodes, 1 + 300 + 300 * 15);
+    assert_eq!(report.directories, 301);
 }
 
 #[test]
@@ -518,6 +524,113 @@ fn create_fails_cleanly_when_the_name_exists() {
     assert!(matches!(fs.symlink(root, "x", b"t"), Err(Error::Exists)));
     assert_eq!(used(&fs), base);
     assert_eq!(fs.readdir(root).unwrap().len(), 1);
+}
+
+// --- journal ----------------------------------------------------------------
+
+fn visible_on_disk(disk: &std::sync::Arc<MemDisk>, name: &str) -> bool {
+    // A second, read-only mount sees what is on the device (and in the
+    // journal), not what the first mount holds in memory.
+    let mut ro = EclipseFS::mount(disk.clone(), true).unwrap();
+    let root = ro.root_ino();
+    ro.lookup(root, name).is_ok()
+}
+
+#[test]
+fn operations_are_grouped_until_sync() {
+    let (disk, mut fs) = fresh(8 * MIB);
+    let root = fs.root_ino();
+    fs.create(root, "a", FileKind::Regular, 0o644, 0).unwrap();
+    assert!(!visible_on_disk(&disk, "a"));
+    fs.sync().unwrap();
+    assert!(visible_on_disk(&disk, "a"));
+    // Enough operations commit on their own.
+    for i in 0..COMMIT_OPS {
+        fs.create(root, &format!("n{}", i), FileKind::Regular, 0o644, 0)
+            .unwrap();
+    }
+    assert!(visible_on_disk(&disk, "n0"));
+    fs.create(root, "late", FileKind::Regular, 0o644, 0)
+        .unwrap();
+    assert!(!visible_on_disk(&disk, "late"));
+    // Unmounting commits too.
+    drop(fs);
+    assert!(visible_on_disk(&disk, "late"));
+}
+
+#[test]
+fn space_freed_by_an_open_transaction_is_reused_after_commit() {
+    let (_disk, mut fs) = fresh(4 * MIB);
+    let root = fs.root_ino();
+    let f = fs.create(root, "big", FileKind::Regular, 0o644, 0).unwrap();
+    let free = fs.fsinfo().total_bytes - fs.fsinfo().bytes_used;
+    let data = vec![1u8; free as usize - 64 * 1024];
+    write_all(&mut fs, f, 0, &data);
+    fs.unlink(root, "big").unwrap();
+    // The device is nearly full on disk until the unlink commits; the next
+    // write commits it first instead of failing.
+    let g = fs
+        .create(root, "again", FileKind::Regular, 0o644, 0)
+        .unwrap();
+    write_all(&mut fs, g, 0, &data);
+    fs.check().unwrap();
+}
+
+#[test]
+fn images_without_a_journal_are_updated_in_place() {
+    let disk = MemDisk::new(8 * MIB);
+    mkfs::format(&*disk, &opts()).unwrap();
+    // Turn it into a pre-journal (v0.3.0) superblock.
+    let mut buf = vec![0u8; 4096];
+    disk.read_at(0, &mut buf).unwrap();
+    let mut sb = Superblock::decode(&buf).unwrap();
+    sb.flags = 0;
+    sb.journal_start = 0;
+    sb.journal_blocks = 0;
+    disk.write_at(0, &sb.encode()).unwrap();
+
+    let mut fs = EclipseFS::mount(disk.clone(), false).unwrap();
+    let root = fs.root_ino();
+    let f = fs.create(root, "f", FileKind::Regular, 0o644, 0).unwrap();
+    // Without a journal every operation goes home at once.
+    assert!(visible_on_disk(&disk, "f"));
+    write_all(&mut fs, f, 0, &pattern(50_000, 5));
+    fs.unlink(root, "f").unwrap();
+    let g = fs.create(root, "g", FileKind::Regular, 0o644, 0).unwrap();
+    write_all(&mut fs, g, 0, b"old format");
+    drop(fs);
+    let mut fs = EclipseFS::mount(disk.clone(), false).unwrap();
+    assert_eq!(read_all(&mut fs, g), b"old format");
+    disk.read_at(0, &mut buf).unwrap();
+    assert!(!Superblock::decode(&buf).unwrap().has_journal());
+}
+
+#[test]
+fn check_reports_damage() {
+    let (disk, mut fs) = fresh(8 * MIB);
+    let root = fs.root_ino();
+    let f = fs.create(root, "f", FileKind::Regular, 0o644, 0).unwrap();
+    write_all(&mut fs, f, 0, &pattern(3 * BLOCK, 1));
+    let clean = fs.check().unwrap();
+    assert_eq!(clean.inodes, 2);
+    assert_eq!(clean.directories, 1);
+    drop(fs);
+    // Drop the last transaction from the journal so mount does not repair
+    // what follows, then mark a free block used in group 0's bitmap.
+    let mut buf = vec![0u8; 4096];
+    disk.read_at(0, &mut buf).unwrap();
+    let jstart = Superblock::decode(&buf).unwrap().journal_start;
+    disk.write_at(jstart * 4096, &[0u8; 4096]).unwrap();
+    let mut bm = vec![0u8; 4096];
+    disk.read_at(4096, &mut bm).unwrap();
+    assert_eq!(bm[200] & 1, 0);
+    bm[200] |= 1;
+    disk.write_at(4096, &bm).unwrap();
+    let mut fs = EclipseFS::mount(disk.clone(), true).unwrap();
+    assert_eq!(
+        fs.check().unwrap_err(),
+        Error::Corrupt("fsck: block marked used but unowned")
+    );
 }
 
 // --- randomized model check -----------------------------------------------
@@ -630,8 +743,9 @@ fn random_operations_match_a_model() {
     let root_before = BLOCK as u64; // root already held the dirN entries
     assert!(used(&fs) <= base + dir_bytes - root_before);
     let left = used(&fs);
-    let fs = remount(&disk, fs);
+    let mut fs = remount(&disk, fs);
     assert_eq!(used(&fs), left);
+    fs.check().unwrap();
 }
 
 fn check(fs: &mut EclipseFS, dirs: &[u64], model: &Model) {

@@ -41,9 +41,20 @@ Formato v0.3 (bloques de 4 KiB, todo little-endian):
 grupo k (32768 bloques = 128 MiB)
   bloque 0   superbloque (primario en el grupo 0, copia en los demás)
   bloque 1   mapa de bits del grupo (1 = en uso)
-  bloque 2.. datos, directorios, tabla de inodos, bloques de extents
+  bloque 2.. (grupo 0) journal
+  resto      datos, directorios, tabla de inodos, bloques de extents
 ```
 
+- **Journal de metadatos** (bit `SB_FLAG_JOURNAL` del superbloque, área
+  contigua tras el mapa de bits del grupo 0, 1/256 del disco entre 64 y 4096
+  bloques). Cada operación se aplica entera o no se aplica tras un corte de
+  luz. Los datos de archivo van directos al disco antes que los metadatos que
+  los apuntan (modo "ordered" de ext4). Las operaciones se agrupan en una
+  transacción hasta `sync`, 64 operaciones o media capacidad del journal; al
+  montar se rejuega la última transacción válida (CRC32). Las imágenes v0.3
+  sin journal siguen montando y se escriben en el sitio como antes.
+- `EclipseFS::check()`: fsck sin reparación (bloques con un único dueño,
+  mapas de bits, contadores de enlaces, alcanzabilidad).
 - Inodos de 256 bytes con CRC32 en un archivo-tabla mapeado por extents; el
   registro de la tabla vive en el superbloque.
 - Seis extents dentro del inodo; el resto en una cadena de bloques con CRC32.
@@ -55,7 +66,7 @@ grupo k (32768 bloques = 128 MiB)
 
 ## Próximos pasos
 
-Journal (consistencia ante cortes), copy-on-write y snapshots, compresión,
+Copy-on-write y snapshots, compresión,
 checksums de datos y directorios indexados: las piezas de v0.2/v0.3 que aún no
 están portadas.
 
@@ -70,6 +81,9 @@ cargo test --release -p eclipsefs --features std
   punta, límites del formato (extents en línea y en cadena, symlinks en línea,
   cachés), validación de argumentos, contabilidad de espacio y una prueba
   aleatoria contra un modelo en memoria con remontajes.
+- `tests/crash.rs`: cortes de luz simulados en cada punto de escritura (y con
+  pérdidas arbitrarias de lo no sincronizado); cada imagen debe montar, pasar
+  `check()` y mostrar el estado tras alguna operación completa.
 - `tests/performance.rs`: las mismas cargas sobre EclipseFS y btrfs, con tiempo
   y bytes leídos/escritos en el dispositivo. `scripts/eclipsefs-bench.sh` las
   ejecuta en release; `ECLIPSEFS_BENCH_SCALE=4` las agranda.

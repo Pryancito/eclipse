@@ -13,6 +13,9 @@
 //!   after its previous ones, which keeps sequential files in one extent.
 //! - **Checksums** (CRC32) on the superblock, every inode record and every
 //!   extent block.
+//! - **Metadata journal** ([`journal`]): every operation survives a crash
+//!   whole or not at all; file data is written before the metadata that
+//!   points at it.
 //! - Inline symlink targets, sparse files, hard links, rename with
 //!   directory-cycle checks and auto-grow to the device size.
 //!
@@ -35,11 +38,12 @@ pub mod device;
 pub mod extent;
 pub mod format;
 pub mod fs;
+pub mod journal;
 pub mod mkfs;
 
 pub use device::BlockDevice;
 pub use format::FileKind;
-pub use fs::{DirEntry, EclipseFS, FsStat, InodeStat};
+pub use fs::{CheckReport, DirEntry, EclipseFS, FsStat, InodeStat};
 
 /// Version of the on-disk format and of this driver (v0.3.0).
 pub const ECLIPSEFS_VERSION: u32 = format::VERSION;

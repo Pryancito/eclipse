@@ -25,16 +25,31 @@ static TABLE: [u32; 256] = make_table();
 
 /// CRC32 of `data`.
 pub fn crc32(data: &[u8]) -> u32 {
-    let mut crc = 0xFFFF_FFFFu32;
+    crc32_update(0, data)
+}
+
+/// Continue a CRC32: `crc32_update(crc32(a), b) == crc32(a ++ b)`.
+pub fn crc32_update(crc: u32, data: &[u8]) -> u32 {
+    let mut crc = !crc;
     for &b in data {
         crc = TABLE[((crc ^ b as u32) & 0xFF) as usize] ^ (crc >> 8);
     }
-    crc ^ 0xFFFF_FFFF
+    !crc
 }
 
 #[cfg(test)]
 mod tests {
-    use super::crc32;
+    use super::{crc32, crc32_update};
+
+    #[test]
+    fn incremental_matches_one_shot() {
+        let data: alloc::vec::Vec<u8> = (0..1000u32).map(|i| (i * 31) as u8).collect();
+        for cut in [0, 1, 7, 500, 999, 1000] {
+            let (a, b) = data.split_at(cut);
+            assert_eq!(crc32_update(crc32(a), b), crc32(&data));
+        }
+        assert_eq!(crc32_update(0, b""), 0);
+    }
 
     #[test]
     fn known_vectors() {

@@ -154,6 +154,17 @@ fn put16(b: &mut [u8], off: usize, v: u16) {
 
 const SB_ITABLE: usize = 168;
 const SB_CRC: usize = SB_ITABLE + INODE_SIZE;
+/// Journal location, present when `SB_FLAG_JOURNAL` is set. Images written
+/// before the journal existed have zeros here and no flag.
+const SB_JOURNAL_START: usize = 432;
+const SB_JOURNAL_BLOCKS: usize = 440;
+/// Second checksum, over everything up to it (the first one included).
+const SB_CRC2: usize = 444;
+
+/// Superblock flag: the filesystem has a metadata journal.
+pub const SB_FLAG_JOURNAL: u32 = 0x1;
+/// Smallest journal mkfs creates and mount accepts.
+pub const MIN_JOURNAL_BLOCKS: u32 = 8;
 
 /// The superblock, at block 0 (and copied to block 0 of every other group).
 #[derive(Debug, Clone)]
@@ -177,6 +188,9 @@ pub struct Superblock {
     pub label: [u8; 64],
     /// Raw inode record of the inode table file.
     pub itable: [u8; INODE_SIZE],
+    /// First block and length of the journal (zero without `SB_FLAG_JOURNAL`).
+    pub journal_start: u64,
+    pub journal_blocks: u32,
 }
 
 impl Superblock {
@@ -200,11 +214,21 @@ impl Superblock {
         b[SB_ITABLE..SB_CRC].copy_from_slice(&self.itable);
         let crc = crc32(&b[..SB_CRC]);
         put32(&mut b, SB_CRC, crc);
+        if self.flags & SB_FLAG_JOURNAL != 0 {
+            put64(&mut b, SB_JOURNAL_START, self.journal_start);
+            put32(&mut b, SB_JOURNAL_BLOCKS, self.journal_blocks);
+            let crc = crc32(&b[..SB_CRC2]);
+            put32(&mut b, SB_CRC2, crc);
+        }
         b
     }
 
+    pub fn has_journal(&self) -> bool {
+        self.flags & SB_FLAG_JOURNAL != 0
+    }
+
     pub fn decode(b: &[u8]) -> Result<Self> {
-        if b.len() < SB_CRC + 4 || &b[0..9] != MAGIC {
+        if b.len() < SB_CRC2 + 4 || &b[0..9] != MAGIC {
             return Err(Error::BadSuperblock);
         }
         if crc32(&b[..SB_CRC]) != le32(b, SB_CRC) {
@@ -230,6 +254,8 @@ impl Superblock {
             uuid: b[88..104].try_into().unwrap(),
             label: b[104..168].try_into().unwrap(),
             itable: b[SB_ITABLE..SB_CRC].try_into().unwrap(),
+            journal_start: 0,
+            journal_blocks: 0,
         };
         if sb.block_size as u64 != BLOCK_SIZE
             || sb.group_blocks as u64 != GROUP_BLOCKS
@@ -239,6 +265,20 @@ impl Superblock {
         }
         if sb.total_blocks < MIN_GROUP_BLOCKS || sb.root_ino == 0 || sb.next_ino <= sb.root_ino {
             return Err(Error::Corrupt("superblock fields"));
+        }
+        let mut sb = sb;
+        if sb.has_journal() {
+            if crc32(&b[..SB_CRC2]) != le32(b, SB_CRC2) {
+                return Err(Error::Corrupt("superblock checksum"));
+            }
+            sb.journal_start = le64(b, SB_JOURNAL_START);
+            sb.journal_blocks = le32(b, SB_JOURNAL_BLOCKS);
+            if sb.journal_blocks < MIN_JOURNAL_BLOCKS
+                || sb.journal_start < 2
+                || sb.journal_start + sb.journal_blocks as u64 > sb.total_blocks.min(GROUP_BLOCKS)
+            {
+                return Err(Error::Corrupt("journal location"));
+            }
         }
         Ok(sb)
     }
@@ -524,6 +564,8 @@ mod tests {
             uuid: [7; 16],
             label: [0; 64],
             itable: [0; INODE_SIZE],
+            journal_start: 0,
+            journal_blocks: 0,
         }
     }
 
@@ -540,6 +582,45 @@ mod tests {
         );
         b[0] = b'X';
         assert_eq!(Superblock::decode(&b).unwrap_err(), Error::BadSuperblock);
+    }
+
+    #[test]
+    fn superblock_journal_fields() {
+        let mut j = sb();
+        j.flags |= SB_FLAG_JOURNAL;
+        j.journal_start = 2;
+        j.journal_blocks = 64;
+        let mut b = j.encode();
+        let back = Superblock::decode(&b).unwrap();
+        assert!(back.has_journal());
+        assert_eq!((back.journal_start, back.journal_blocks), (2, 64));
+        // The journal fields have their own checksum.
+        b[SB_JOURNAL_BLOCKS] ^= 1;
+        assert_eq!(
+            Superblock::decode(&b).unwrap_err(),
+            Error::Corrupt("superblock checksum")
+        );
+        // Without the flag the fields are neither written nor read.
+        let plain = sb().encode();
+        assert!(plain[SB_JOURNAL_START..SB_CRC2 + 4].iter().all(|&x| x == 0));
+        assert!(!Superblock::decode(&plain).unwrap().has_journal());
+    }
+
+    #[test]
+    fn superblock_journal_location_is_checked() {
+        for (start, blocks) in [(0, 64), (1, 64), (2, 4), (990, 64), (2, 2000)] {
+            let mut j = sb();
+            j.flags |= SB_FLAG_JOURNAL;
+            j.journal_start = start;
+            j.journal_blocks = blocks;
+            assert_eq!(
+                Superblock::decode(&j.encode()).unwrap_err(),
+                Error::Corrupt("journal location"),
+                "{} {}",
+                start,
+                blocks
+            );
+        }
     }
 
     #[test]

@@ -3,10 +3,14 @@
 //! The method set is the one the kernel's mount adapter and `xtask` call on
 //! `btrfs::Btrfs`, with the same argument and error conventions: inode
 //! numbers are `u64`, writes are POSIX-style partial on a full device, and
-//! every mutating call is committed (bitmaps + superblock) before it returns.
+//! every mutating call is applied as a whole or not at all after a crash.
 //!
-//! Metadata is updated in place (no journal yet): an inode record, a bitmap
-//! block and the superblock are each one checksummed write.
+//! Metadata changes collect in a [`journal::Overlay`](crate::journal) and are
+//! committed through the journal in groups of operations (on `sync`, when
+//! the overlay grows past half the journal, or every [`COMMIT_OPS`]
+//! operations). File data goes straight to the device ahead of the metadata
+//! that points at it. Images formatted before the journal existed are
+//! updated in place after every operation, as before.
 
 use alloc::collections::BTreeMap;
 use alloc::string::String;
@@ -18,7 +22,12 @@ use crate::blocks::{AllocationGroup, BlockAllocator};
 use crate::device::BlockDevice;
 use crate::extent::{Extent, MAX_EXTENT_BLOCKS};
 use crate::format::*;
+use crate::journal::{JournalArea, Overlay};
 use crate::{Error, Result};
+
+/// Operations grouped into one journal transaction at most (unless `sync`
+/// or the journal's size commits earlier).
+pub const COMMIT_OPS: u32 = 64;
 
 /// The inode table grows by this many bytes at a time (1024 inodes).
 pub(crate) const ITABLE_GROW: u64 = 64 * BLOCK_SIZE;
@@ -85,7 +94,14 @@ struct DirCache {
 }
 
 pub struct EclipseFS {
-    dev: Arc<dyn BlockDevice>,
+    /// Metadata view of the device: uncommitted blocks first.
+    dev: Arc<Overlay>,
+    journal: Option<JournalArea>,
+    /// Operations in the open transaction.
+    pending_ops: u32,
+    /// Set while one public call is built out of another (`symlink` calls
+    /// `create`), so the inner one does not commit half of the outer.
+    nested: bool,
     sb: Superblock,
     /// The inode table file (its record lives in the superblock).
     itable: Inode,
@@ -100,6 +116,29 @@ pub struct EclipseFS {
 // ---------------------------------------------------------------------------
 // Block-level helpers shared with mkfs
 // ---------------------------------------------------------------------------
+
+/// Write committed block images to their home locations, one device write
+/// per run of consecutive blocks.
+pub(crate) fn write_home(dev: &dyn BlockDevice, blocks: &[(u64, Vec<u8>)]) -> Result<()> {
+    let mut i = 0;
+    while i < blocks.len() {
+        let mut j = i + 1;
+        while j < blocks.len() && blocks[j].0 == blocks[j - 1].0 + 1 && j - i < 256 {
+            j += 1;
+        }
+        if j == i + 1 {
+            dev.write_at(blocks[i].0 * BLOCK_SIZE, &blocks[i].1)?;
+        } else {
+            let mut run = Vec::with_capacity((j - i) * BLOCK_SIZE as usize);
+            for (_, d) in &blocks[i..j] {
+                run.extend_from_slice(d);
+            }
+            dev.write_at(blocks[i].0 * BLOCK_SIZE, &run)?;
+        }
+        i = j;
+    }
+    Ok(())
+}
 
 /// Write `len` zero bytes at device byte `at`.
 pub(crate) fn zero(dev: &dyn BlockDevice, at: u64, len: u64) -> Result<()> {
@@ -389,10 +428,37 @@ fn stat_of(ino: u64, i: &Inode) -> InodeStat {
 // ---------------------------------------------------------------------------
 
 impl EclipseFS {
-    pub fn mount(dev: Arc<dyn BlockDevice>, read_only: bool) -> Result<Self> {
+    pub fn mount(raw: Arc<dyn BlockDevice>, read_only: bool) -> Result<Self> {
         let mut buf = vec![0u8; BLOCK_SIZE as usize];
-        if dev.size() < BLOCK_SIZE {
+        if raw.size() < BLOCK_SIZE {
             return Err(Error::BadSuperblock);
+        }
+        raw.read_at(0, &mut buf)?;
+        let home = Superblock::decode(&buf)?;
+        if home.total_blocks > raw.size() / BLOCK_SIZE {
+            return Err(Error::Corrupt("filesystem larger than device"));
+        }
+        let dev = Arc::new(Overlay::new(raw.clone()));
+        let journal = home.has_journal().then_some(JournalArea {
+            start: home.journal_start,
+            blocks: home.journal_blocks as u64,
+        });
+        if let Some(j) = journal {
+            if let Some((seq, blocks)) = j.read(&*raw, &home.uuid, home.total_blocks)? {
+                debug!(
+                    "eclipsefs: replaying journal transaction {} ({} blocks)",
+                    seq,
+                    blocks.len()
+                );
+                for (b, data) in blocks {
+                    dev.insert(b, data);
+                }
+                if !read_only {
+                    // Write it home now; a read-only mount keeps it in memory.
+                    write_home(&*raw, &dev.take())?;
+                    raw.sync()?;
+                }
+            }
         }
         dev.read_at(0, &mut buf)?;
         let sb = Superblock::decode(&buf)?;
@@ -416,11 +482,16 @@ impl EclipseFS {
             count,
             &mut itable,
         )?;
+        let mut alloc = BlockAllocator::new(groups);
+        alloc.set_deferred_frees(journal.is_some());
         let mut fs = Self {
             dev,
+            journal,
+            pending_ops: 0,
+            nested: false,
             sb,
             itable,
-            alloc: BlockAllocator::new(groups),
+            alloc,
             inodes: BTreeMap::new(),
             dirs: BTreeMap::new(),
             read_only,
@@ -474,7 +545,8 @@ impl EclipseFS {
         FsStat {
             block_size: BLOCK_SIZE,
             total_bytes: total * BLOCK_SIZE,
-            bytes_used: (total - self.alloc.free_blocks()) * BLOCK_SIZE,
+            bytes_used: (total - self.alloc.free_blocks() - self.alloc.deferred_blocks())
+                * BLOCK_SIZE,
         }
     }
 
@@ -482,15 +554,25 @@ impl EclipseFS {
         self.clock.map(|c| c()).unwrap_or((0, 0))
     }
 
-    fn writable(&self) -> Result<()> {
+    /// Start of every mutating call.
+    fn writable(&mut self) -> Result<()> {
         if self.read_only {
             return Err(Error::Unsupported("read-only filesystem"));
+        }
+        // Space freed by the open transaction is not reusable until it
+        // commits; commit early when that space is what is missing.
+        let deferred = self.alloc.deferred_blocks();
+        if deferred > 0
+            && !self.nested
+            && self.alloc.free_blocks() < deferred.max(self.alloc.total_blocks() / 16)
+        {
+            self.flush()?;
         }
         Ok(())
     }
 
-    /// Write out dirty bitmaps and, if it changed, the superblock.
-    fn commit(&mut self) -> Result<()> {
+    /// Queue the dirty bitmaps and, if it changed, the superblock.
+    fn write_meta(&mut self) -> Result<()> {
         for g in self.alloc.groups_mut().iter_mut().filter(|g| g.is_dirty()) {
             self.dev
                 .write_at(g.bitmap_block() * BLOCK_SIZE, &g.to_bytes())?;
@@ -505,6 +587,69 @@ impl EclipseFS {
         Ok(())
     }
 
+    /// Commit the open transaction: journal it, then write it home.
+    fn flush(&mut self) -> Result<()> {
+        if self.alloc.deferred_blocks() > 0 {
+            self.alloc.release_deferred()?;
+        }
+        // Each transaction carries an exact free-block count.
+        if self.sb.free_blocks != self.alloc.free_blocks() {
+            self.sb_dirty = true;
+        }
+        self.write_meta()?;
+        self.pending_ops = 0;
+        if self.dev.is_empty() {
+            return Ok(());
+        }
+        let blocks = self.dev.take();
+        let raw = self.dev.inner().clone();
+        let r = match self.journal {
+            Some(j) if j.fits(blocks.len()) => j
+                .write(&*raw, &self.sb.uuid, self.sb.generation, &blocks)
+                .and_then(|_| raw.sync())
+                .and_then(|_| write_home(&*raw, &blocks))
+                .and_then(|_| raw.sync()),
+            Some(j) => {
+                warn!(
+                    "eclipsefs: transaction of {} blocks exceeds the journal, writing in place",
+                    blocks.len()
+                );
+                j.invalidate(&*raw)
+                    .and_then(|_| raw.sync())
+                    .and_then(|_| write_home(&*raw, &blocks))
+                    .and_then(|_| raw.sync())
+            }
+            None => write_home(&*raw, &blocks),
+        };
+        if r.is_err() {
+            // Keep the changes visible; the next commit retries them.
+            for (b, data) in blocks {
+                if !self.dev.contains(b) {
+                    self.dev.insert(b, data);
+                }
+            }
+        }
+        r
+    }
+
+    /// End of every mutating call: queue its metadata and commit the
+    /// transaction if it is due.
+    fn commit(&mut self) -> Result<()> {
+        self.write_meta()?;
+        if self.nested {
+            return Ok(());
+        }
+        self.pending_ops += 1;
+        let due = match self.journal {
+            None => true,
+            Some(j) => self.pending_ops >= COMMIT_OPS || self.dev.len() * 2 >= j.capacity(),
+        };
+        if due {
+            self.flush()?;
+        }
+        Ok(())
+    }
+
     pub fn sync(&mut self) -> Result<()> {
         if !self.read_only {
             // Keep the free-block count in the superblock honest for tools
@@ -512,7 +657,7 @@ impl EclipseFS {
             if self.sb.free_blocks != self.alloc.free_blocks() {
                 self.sb_dirty = true;
             }
-            self.commit()?;
+            self.flush()?;
         }
         self.dev.sync()
     }
@@ -551,12 +696,12 @@ impl EclipseFS {
         }
         self.sb.total_blocks = total;
         self.sb_dirty = true;
-        self.commit()?;
         let backup = self.sb.encode();
         for gi in first_new..self.alloc.groups().len() {
             self.dev
                 .write_at(gi as u64 * GROUP_BLOCKS * BLOCK_SIZE, &backup)?;
         }
+        self.commit()?;
         Ok(true)
     }
 
@@ -929,7 +1074,17 @@ impl EclipseFS {
         if target.is_empty() || target.len() > MAX_SYMLINK_LEN {
             return Err(Error::Invalid);
         }
-        let ino = self.create(dir, name, FileKind::Symlink, 0o777, 0)?;
+        // One transaction for the inode and its target.
+        self.nested = true;
+        let ino = self.create(dir, name, FileKind::Symlink, 0o777, 0);
+        self.nested = false;
+        let ino = match ino {
+            Ok(ino) => ino,
+            Err(e) => {
+                self.commit()?;
+                return Err(e);
+            }
+        };
         let mut inode = self.take(ino)?;
         let r = self.set_link_target(&mut inode, target);
         self.put(ino, inode)?;
@@ -1159,7 +1314,9 @@ impl EclipseFS {
             .checked_add(data.len() as u64)
             .ok_or(Error::Invalid)?;
         let mut inode = self.take(ino)?;
-        let r = write_data(&*self.dev, &mut self.alloc, &mut inode, offset, data);
+        // File data bypasses the overlay (ordered mode).
+        let raw = self.dev.inner().clone();
+        let r = write_data(&*raw, &mut self.alloc, &mut inode, offset, data);
         if r.is_ok() {
             let now = self.now();
             inode.mtime = now;
@@ -1184,13 +1341,185 @@ impl EclipseFS {
             return Ok(());
         }
         let mut inode = self.take(ino)?;
-        let r = truncate_inode(&*self.dev, &mut self.alloc, &mut inode, new_size);
+        let raw = self.dev.inner().clone();
+        let r = truncate_inode(&*raw, &mut self.alloc, &mut inode, new_size);
         let now = self.now();
         inode.mtime = now;
         inode.ctime = now;
         self.put(ino, inode)?;
         self.commit()?;
         r
+    }
+}
+
+/// What [`EclipseFS::check`] found in a consistent filesystem.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CheckReport {
+    pub inodes: u64,
+    pub directories: u64,
+    /// Blocks in use, all accounted for.
+    pub blocks_used: u64,
+}
+
+impl EclipseFS {
+    /// Full consistency check (fsck without repair). Commits the open
+    /// transaction first on a writable mount. Verifies that every block in
+    /// use belongs to exactly one owner (group headers, journal, inode table,
+    /// an inode's extents or extent chain) and that the bitmaps agree, that
+    /// every live inode is reachable with the right link count and parent,
+    /// and the superblock counters. The first problem is returned as
+    /// `Error::Corrupt`.
+    pub fn check(&mut self) -> Result<CheckReport> {
+        if !self.read_only {
+            self.flush()?;
+        }
+        let total = self.sb.total_blocks;
+        let mut owned = vec![0u64; total.div_ceil(64) as usize];
+        let mut count = 0u64;
+        let mut mark = |start: u64, len: u64| -> Result<()> {
+            for b in start
+                ..start
+                    .checked_add(len)
+                    .ok_or(Error::Corrupt("fsck: extent"))?
+            {
+                if b >= total {
+                    return Err(Error::Corrupt("fsck: block past the end"));
+                }
+                let (w, bit) = ((b / 64) as usize, b % 64);
+                if owned[w] & (1 << bit) != 0 {
+                    return Err(Error::Corrupt("fsck: block used twice"));
+                }
+                owned[w] |= 1 << bit;
+                count += 1;
+            }
+            Ok(())
+        };
+        for g in self.alloc.groups() {
+            mark(g.start_block, 2)?;
+        }
+        if let Some(j) = self.journal {
+            mark(j.start, j.blocks)?;
+        }
+        fn mark_inode(mark: &mut impl FnMut(u64, u64) -> Result<()>, inode: &Inode) -> Result<()> {
+            if inode.is_inline() {
+                if inode.inline.len() as u64 != inode.size || inode.nbytes != inode.size {
+                    return Err(Error::Corrupt("fsck: inline size"));
+                }
+                return Ok(());
+            }
+            let mut blocks = 0;
+            for e in inode.extents.extents() {
+                mark(e.physical_block, e.length as u64)?;
+                blocks += e.length as u64;
+            }
+            for &b in &inode.chain {
+                mark(b, 1)?;
+            }
+            if blocks * BLOCK_SIZE != inode.nbytes {
+                return Err(Error::Corrupt("fsck: nbytes"));
+            }
+            Ok(())
+        }
+        mark_inode(&mut mark, &self.itable)?;
+
+        // Live inodes, with what each one needs to see from directories.
+        let mut live: BTreeMap<u64, (FileKind, u32, u64)> = BTreeMap::new();
+        for ino in ROOT_INO..self.sb.next_ino {
+            match self.inode(ino) {
+                Ok(i) => {
+                    let i = i.clone();
+                    mark_inode(&mut mark, &i)?;
+                    live.insert(ino, (i.kind, i.nlink, i.parent));
+                }
+                Err(Error::NotFound) => {}
+                Err(e) => return Err(e),
+            }
+        }
+        if live.len() as u64 != self.sb.inode_count {
+            return Err(Error::Corrupt("fsck: inode count"));
+        }
+        let root = self.sb.root_ino;
+        if live.get(&root).map(|l| l.0) != Some(FileKind::Dir) {
+            return Err(Error::Corrupt("fsck: root"));
+        }
+        let mut names: BTreeMap<u64, u32> = BTreeMap::new();
+        let mut subdirs: BTreeMap<u64, u32> = BTreeMap::new();
+        let dirs: Vec<u64> = live
+            .iter()
+            .filter(|(_, l)| l.0 == FileKind::Dir)
+            .map(|(&i, _)| i)
+            .collect();
+        for &d in &dirs {
+            for e in self.readdir(d)? {
+                let Some(&(kind, _, parent)) = live.get(&e.ino) else {
+                    return Err(Error::Corrupt("fsck: entry for a free inode"));
+                };
+                if kind != e.kind {
+                    return Err(Error::Corrupt("fsck: entry kind"));
+                }
+                *names.entry(e.ino).or_default() += 1;
+                if kind == FileKind::Dir {
+                    if parent != d {
+                        return Err(Error::Corrupt("fsck: directory parent"));
+                    }
+                    *subdirs.entry(d).or_default() += 1;
+                }
+            }
+        }
+        for (&ino, &(kind, nlink, _)) in &live {
+            let refs = names.get(&ino).copied().unwrap_or(0);
+            let ok = if kind == FileKind::Dir {
+                refs == u32::from(ino != root)
+                    && nlink == 2 + subdirs.get(&ino).copied().unwrap_or(0)
+            } else {
+                refs > 0 && nlink == refs
+            };
+            if !ok {
+                return Err(Error::Corrupt("fsck: link count"));
+            }
+        }
+        // Every directory reaches the root (no detached cycles).
+        for &d in &dirs {
+            let mut cur = d;
+            let mut steps = 0;
+            while cur != root {
+                cur = live[&cur].2;
+                steps += 1;
+                if steps > dirs.len() {
+                    return Err(Error::Corrupt("fsck: directory cycle"));
+                }
+            }
+        }
+
+        for b in 0..total {
+            let mine = owned[(b / 64) as usize] & (1 << (b % 64)) != 0;
+            if mine != self.alloc.is_used(b) {
+                return Err(Error::Corrupt(if mine {
+                    "fsck: block in use marked free"
+                } else {
+                    "fsck: block marked used but unowned"
+                }));
+            }
+        }
+        if !self.read_only && self.sb.free_blocks != self.alloc.free_blocks() {
+            return Err(Error::Corrupt("fsck: free block count"));
+        }
+        Ok(CheckReport {
+            inodes: live.len() as u64,
+            directories: dirs.len() as u64,
+            blocks_used: count,
+        })
+    }
+}
+
+impl Drop for EclipseFS {
+    /// Commit what is still open, like an unmount would.
+    fn drop(&mut self) {
+        if !self.read_only {
+            if let Err(e) = self.flush().and_then(|_| self.dev.inner().sync()) {
+                warn!("eclipsefs: commit on unmount failed: {:?}", e);
+            }
+        }
     }
 }
 

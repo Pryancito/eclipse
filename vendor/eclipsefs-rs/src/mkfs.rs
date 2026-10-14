@@ -7,6 +7,7 @@ use crate::blocks::{AllocationGroup, BlockAllocator};
 use crate::device::BlockDevice;
 use crate::format::*;
 use crate::fs::{extend_zeroed, write_chain, write_data, zero, ITABLE_GROW};
+use crate::journal::JournalArea;
 use crate::{Error, Result};
 
 /// Same fields as `btrfs::mkfs::MkfsOptions`, so callers can switch crates
@@ -26,6 +27,16 @@ pub struct MkfsOptions {
 /// Signatures of other filesystems that would make a probe mistake the
 /// formatted device for them: the btrfs superblock and its first mirror.
 const STALE_SIGNATURES: [u64; 2] = [0x1_0000, 0x400_0000];
+
+/// Journal size for a filesystem of `total` blocks: 1/256 of it (16 MiB per
+/// 4 GiB), at least 64 blocks and at most 4096, and never more than a
+/// quarter of a tiny device.
+pub fn journal_blocks(total: u64) -> u64 {
+    (total / 256)
+        .clamp(64, 4096)
+        .min(total / 4)
+        .max(MIN_JOURNAL_BLOCKS as u64)
+}
 
 /// Format the whole device.
 pub fn format(dev: &dyn BlockDevice, opts: &MkfsOptions) -> Result<()> {
@@ -55,6 +66,17 @@ pub fn format(dev: &dyn BlockDevice, opts: &MkfsOptions) -> Result<()> {
     }
 
     let mut alloc = BlockAllocator::new(groups);
+    // The journal sits right after group 0's bitmap, in one piece.
+    let jblocks = journal_blocks(total);
+    let jstart = match alloc.allocate(Some(2), jblocks) {
+        Some((s, n)) if n == jblocks => s,
+        _ => return Err(Error::NoSpace),
+    };
+    JournalArea {
+        start: jstart,
+        blocks: jblocks,
+    }
+    .invalidate(dev)?;
     let mut itable = Inode::new(FileKind::Regular, 0o600, opts.now);
     extend_zeroed(dev, &mut alloc, &mut itable, ITABLE_GROW)?;
 
@@ -89,11 +111,13 @@ pub fn format(dev: &dyn BlockDevice, opts: &MkfsOptions) -> Result<()> {
         root_ino: ROOT_INO,
         generation: 1,
         created: opts.now.0,
-        flags: 0,
+        flags: SB_FLAG_JOURNAL,
         inode_size: INODE_SIZE as u32,
         uuid: opts.fsid,
         label,
         itable: itable.encode(),
+        journal_start: jstart,
+        journal_blocks: jblocks as u32,
     };
     for g in alloc.groups() {
         dev.write_at(g.bitmap_block() * BLOCK_SIZE, &g.to_bytes())?;

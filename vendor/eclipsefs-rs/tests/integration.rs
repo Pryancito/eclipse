@@ -126,7 +126,8 @@ fn empty_filesystem_mounts() {
     assert_eq!(fs.label(), "eclipse");
     let info = fs.fsinfo();
     assert_eq!(info.total_bytes, 8 * MIB as u64);
-    assert!(info.bytes_used < 512 * 1024, "{:?}", info);
+    // Inode table (256 KiB) and journal (256 KiB on a small disk).
+    assert!(info.bytes_used < 600 * 1024, "{:?}", info);
 }
 
 #[test]
@@ -551,6 +552,10 @@ fn corruption_is_detected() {
     disk.read_at(0, &mut sb).unwrap();
     let itable_first_phys = u64::from_le_bytes(sb[168 + 96 + 8..168 + 96 + 16].try_into().unwrap());
     drop(fs);
+    // The last transaction is still in the journal and would repair the
+    // record on mount: drop it first.
+    let jstart = u64::from_le_bytes(sb[432..440].try_into().unwrap());
+    disk.write_at(jstart * 4096, &[0u8; 4096]).unwrap();
     disk.poke((itable_first_phys * 4096 + ino * 256 + 25) as usize, 4);
     fs = EclipseFS::mount(disk.clone(), false).unwrap();
     assert!(matches!(fs.stat(ino), Err(Error::Corrupt(_))));

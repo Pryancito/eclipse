@@ -199,11 +199,43 @@ pub struct BlockAllocator {
     /// Group of the last allocation, where the next goal-less search starts
     /// (round-robin as in eclipsefs-lib, without resetting to group 0).
     cursor: usize,
+    /// Frees held back until the current transaction commits (journaled
+    /// mounts): a block freed by an uncommitted transaction is still in use
+    /// as far as the disk knows, so it must not be reused yet.
+    defer: bool,
+    deferred: Vec<(u64, u64)>,
+    deferred_blocks: u64,
 }
 
 impl BlockAllocator {
     pub fn new(groups: Vec<AllocationGroup>) -> Self {
-        Self { groups, cursor: 0 }
+        Self {
+            groups,
+            cursor: 0,
+            defer: false,
+            deferred: Vec::new(),
+            deferred_blocks: 0,
+        }
+    }
+
+    /// Hold frees back until [`release_deferred`](Self::release_deferred).
+    pub fn set_deferred_frees(&mut self, on: bool) {
+        self.defer = on;
+    }
+
+    /// Blocks freed but not yet reusable.
+    pub fn deferred_blocks(&self) -> u64 {
+        self.deferred_blocks
+    }
+
+    /// Apply the frees held back so far.
+    pub fn release_deferred(&mut self) -> Result<()> {
+        let list = core::mem::take(&mut self.deferred);
+        self.deferred_blocks = 0;
+        for (start, len) in list {
+            self.free_now(start, len)?;
+        }
+        Ok(())
     }
 
     pub fn groups(&self) -> &[AllocationGroup] {
@@ -247,8 +279,25 @@ impl BlockAllocator {
         None
     }
 
-    /// Free `len` blocks starting at absolute block `start`.
+    /// Free `len` blocks starting at absolute block `start` (or queue them,
+    /// see [`set_deferred_frees`](Self::set_deferred_frees)).
     pub fn free(&mut self, start: u64, len: u64) -> Result<()> {
+        if !self.defer {
+            return self.free_now(start, len);
+        }
+        let end = start.checked_add(len).ok_or(Error::Corrupt("free range"))?;
+        if (start..end).any(|b| !self.is_used(b)) || end > self.total_blocks() {
+            return Err(Error::Corrupt("double free"));
+        }
+        if self.deferred.iter().any(|&(s, l)| start < s + l && s < end) {
+            return Err(Error::Corrupt("double free"));
+        }
+        self.deferred.push((start, len));
+        self.deferred_blocks += len;
+        Ok(())
+    }
+
+    fn free_now(&mut self, start: u64, len: u64) -> Result<()> {
         let mut start = start;
         let mut len = len;
         while len > 0 {
@@ -278,6 +327,33 @@ impl BlockAllocator {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn deferred_frees_are_not_reused_until_released() {
+        let mut a = BlockAllocator::new(vec![AllocationGroup::new(0, 20)]);
+        assert_eq!(a.allocate(None, 18), Some((2, 18)));
+        a.set_deferred_frees(true);
+        a.free(5, 3).unwrap();
+        a.free(10, 1).unwrap();
+        assert_eq!(a.deferred_blocks(), 4);
+        assert_eq!(a.free_blocks(), 0);
+        assert_eq!(a.allocate(None, 1), None);
+        // Freeing a held-back block again, or a free one, is refused.
+        assert!(a.free(6, 1).is_err());
+        assert!(a.free(4, 2).is_err());
+        a.release_deferred().unwrap();
+        assert_eq!(a.deferred_blocks(), 0);
+        assert_eq!(a.free_blocks(), 4);
+        assert_eq!(a.allocate(Some(5), 10), Some((5, 3)));
+        // Released blocks are really free now: freeing them is a double free.
+        assert!(a.free(10, 1).is_err());
+        // Turning deferral off frees immediately.
+        assert_eq!(a.allocate(Some(10), 1), Some((10, 1)));
+        a.set_deferred_frees(false);
+        a.free(10, 1).unwrap();
+        assert_eq!(a.free_blocks(), 1);
+        assert_eq!(a.deferred_blocks(), 0);
+    }
 
     #[test]
     fn header_blocks_are_reserved() {
