@@ -208,10 +208,10 @@ AARCH64_BOOT_DIR := $(AARCH64_DISK)/EFI/Boot
 # target does not touch Boot.json -- only `run` and `debugrun` do.
 ISO_CMDLINE_AARCH64 := LOG=$(LOG):TERM=xterm-256color:console.shell=true:virtcon.disable=true:ROOTPROC=/bin/busybox?sh:desktop=none:renderer=auto
 EFI_GZ := $(ARTIFACTS)/efi$(VARIANT_SUFFIX).img.gz
-# Filesystem of the installed ROOT/HOME: btrfs (default) or eclipsefs. It is
+# Filesystem of the installed ROOT/HOME: eclipsefs (default) or btrfs. It is
 # the payloads' extension, and install-eclipse picks the filesystem from which
 # payload the ISO carries.
-ROOTFS_FS ?= btrfs
+ROOTFS_FS ?= eclipsefs
 ROOTFS_GZ := $(ARTIFACTS)/rootfs$(VARIANT_SUFFIX).$(ROOTFS_FS).gz
 HOME_GZ := $(ARTIFACTS)/home$(VARIANT_SUFFIX).$(ROOTFS_FS).gz
 

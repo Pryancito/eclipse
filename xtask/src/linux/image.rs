@@ -28,8 +28,8 @@ fn efi_fat_size_for(initramfs_bytes: u64, zcore_bytes: u64, boot_bytes: u64) -> 
     EFI_PARTITION_BYTES
 }
 
-/// Filesystem of the installed system's ROOT and HOME images: btrfs unless
-/// the build is run with `ECLIPSE_ROOTFS_FS=eclipsefs`. Its name is also the
+/// Filesystem of the installed system's ROOT and HOME images: EclipseFS
+/// unless the build is run with `ECLIPSE_ROOTFS_FS=btrfs`. Its name is also the
 /// payloads' extension (`rootfs.btrfs.gz`, `rootfs.eclipsefs.gz`) and the
 /// type in fstab, and the installer picks the filesystem from which payload
 /// the medium carries.
@@ -44,9 +44,9 @@ impl DiskFs {
 
     pub(crate) fn from_env() -> Self {
         match std::env::var("ECLIPSE_ROOTFS_FS").as_deref() {
-            Err(_) | Ok("") | Ok("btrfs") => DiskFs::Btrfs,
-            Ok("eclipsefs") => DiskFs::EclipseFs,
-            Ok(other) => panic!("ECLIPSE_ROOTFS_FS={other}: se esperaba btrfs o eclipsefs"),
+            Err(_) | Ok("") | Ok("eclipsefs") => DiskFs::EclipseFs,
+            Ok("btrfs") => DiskFs::Btrfs,
+            Ok(other) => panic!("ECLIPSE_ROOTFS_FS={other}: se esperaba eclipsefs o btrfs"),
         }
     }
 
@@ -1076,14 +1076,14 @@ mod image_size_tests {
         assert_eq!(all_boot_payloads().len(), 5);
     }
 
-    /// btrfs unless the build asks for EclipseFS, and a typo is an error,
-    /// not a silent btrfs.
+    /// EclipseFS unless the build asks for btrfs, and a typo is an error,
+    /// not a silent EclipseFS.
     #[test]
-    fn the_disk_filesystem_is_btrfs_unless_asked_for() {
+    fn the_disk_filesystem_is_eclipsefs_unless_asked_for() {
         assert_eq!(DiskFs::Btrfs.name(), "btrfs");
         assert_eq!(DiskFs::EclipseFs.name(), "eclipsefs");
         if std::env::var("ECLIPSE_ROOTFS_FS").is_err() {
-            assert_eq!(DiskFs::from_env(), DiskFs::Btrfs);
+            assert_eq!(DiskFs::from_env(), DiskFs::EclipseFs);
         }
     }
 

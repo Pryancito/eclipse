@@ -1,7 +1,6 @@
 //! Imagenes EclipseFS (rootfs y plantilla de HOME) con el crate `eclipsefs`
-//! del propio arbol, como `btrfs_image` hace las btrfs. Se eligen con
-//! `ECLIPSE_ROOTFS_FS=eclipsefs` (ver `DiskFs`); btrfs sigue siendo lo que se
-//! instala por defecto.
+//! del propio arbol, como `btrfs_image` hace las btrfs. Es lo que se instala
+//! por defecto (ver `DiskFs`); `ECLIPSE_ROOTFS_FS=btrfs` vuelve a btrfs.
 
 use super::tree_image::{populate, Node, TreeFs};
 use eclipsefs::device::{BlockDevice, FileDevice};
