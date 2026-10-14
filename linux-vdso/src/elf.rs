@@ -26,8 +26,24 @@ const DT_HASH: u64 = 4;
 const DT_STRTAB: u64 = 5;
 const DT_SYMTAB: u64 = 6;
 const DT_GNU_HASH: u64 = 0x6fff_fef5;
+const DT_VERSYM: u64 = 0x6fff_fff0;
+const DT_VERDEF: u64 = 0x6fff_fffc;
 
 const SYM_SIZE: usize = 24;
+/// `Elf64_Verdef`: vd_version, vd_flags, vd_ndx, vd_cnt, vd_hash, vd_aux,
+/// vd_next.
+const VERDEF_FLAGS: usize = 2;
+const VERDEF_NDX: usize = 4;
+const VERDEF_AUX: usize = 12;
+const VERDEF_NEXT: usize = 16;
+/// `VER_FLG_BASE`: the definition of the object itself (its soname), which is
+/// never the version of a symbol.
+const VER_FLG_BASE: u16 = 1;
+
+/// The symbol version this image defines, and the one every caller asks for:
+/// musl passes it literally (`__vdsosym("LINUX_2.6", ...)`) and the Go runtime
+/// looks it up by hash in the `DT_VERDEF` chain.
+pub const VERNAME: &[u8] = b"LINUX_2.6";
 
 /// `OK_TYPES` in musl: NOTYPE(0), OBJECT(1), FUNC(2), COMMON(5).
 const OK_TYPES: u32 = (1 << 0) | (1 << 1) | (1 << 2) | (1 << 5);
@@ -76,12 +92,20 @@ fn name_eq(b: &[u8], off: usize, want: &[u8]) -> bool {
 /// not been mapped anywhere yet from this function's point of view; add the
 /// mapping base to get what musl would return.
 ///
-/// The version argument musl takes ("LINUX_2.6") has no counterpart here: musl
-/// skips version checking entirely for images without a `DT_VERDEF`
-/// (`if (!verdef) versym = 0;`), and the build script asserts this image has
-/// none. Adding one later would silently break every lookup, which is why that
-/// assertion exists.
+/// Looks the symbol up under [`VERNAME`], the version the real musl asks for.
 pub fn vdsosym(img: &[u8], want: &[u8]) -> Option<u64> {
+    vdsosym_ver(img, VERNAME, want)
+}
+
+/// As [`vdsosym`], with the version name spelled out.
+///
+/// musl takes it as its first argument and compares it against the `DT_VERDEF`
+/// entry named by the symbol's `DT_VERSYM` index — unless the image defines no
+/// versions at all, in which case it drops the check (`if (!verdef) versym =
+/// 0;`). Both halves are implemented here, because this image used to rely on
+/// that shortcut and no longer does: it defines `LINUX_2.6` so that the Go
+/// runtime, which has no such shortcut, can parse it at all.
+pub fn vdsosym_ver(img: &[u8], vername: &[u8], want: &[u8]) -> Option<u64> {
     // musl: `base = (size_t)eh + ph->p_offset - ph->p_vaddr` for each PT_LOAD,
     // keeping the last. This image is built with exactly one PT_LOAD at 0/0 so
     // the bias is zero, but compute it the same way rather than assuming — if
@@ -118,6 +142,8 @@ pub fn vdsosym(img: &[u8], want: &[u8]) -> Option<u64> {
     let mut symtab = None;
     let mut hash = None;
     let mut gnu_hash = None;
+    let mut versym = None;
+    let mut verdef = None;
     let mut d = dyn_off?;
     loop {
         let tag = u64le(img, d)?;
@@ -128,11 +154,21 @@ pub fn vdsosym(img: &[u8], want: &[u8]) -> Option<u64> {
             DT_SYMTAB => symtab = Some(at(val)?),
             DT_HASH => hash = Some(at(val)?),
             DT_GNU_HASH => gnu_hash = Some(at(val)?),
+            DT_VERSYM => versym = Some(at(val)?),
+            DT_VERDEF => verdef = Some(at(val)?),
             _ => {}
         }
         d = d.checked_add(16)?;
     }
     let (strtab, symtab) = (strtab?, symtab?);
+    // musl: `if (!verdef) versym = 0;`.
+    let verdef = match verdef {
+        Some(v) => v,
+        None => {
+            versym = None;
+            0
+        }
+    };
 
     // musl: `if (hashtab) nsym = hashtab[1]; else if (ghashtab) nsym =
     // count_syms_gnu(ghashtab);` — either table is enough, and this image
@@ -159,9 +195,46 @@ pub fn vdsosym(img: &[u8], want: &[u8]) -> Option<u64> {
         if !name_eq(img, name, want) {
             continue;
         }
+        if let Some(vs) = versym {
+            let vsym = u16le(img, vs.checked_add(i.checked_mul(2)?)?)?;
+            if !checkver(img, verdef, vsym, vername, strtab) {
+                continue;
+            }
+        }
         return u64le(img, sym.checked_add(8)?);
     }
     None
+}
+
+/// musl's `checkver`: walks the `DT_VERDEF` chain for the definition whose
+/// index is the symbol's `DT_VERSYM` entry, and compares its name.
+///
+/// A symbol whose version is not in the chain does not match, which is what
+/// musl's "run off the end of the list" arm amounts to.
+fn checkver(img: &[u8], verdef: usize, vsym: u16, vername: &[u8], strtab: usize) -> bool {
+    // `vd_next` is non-zero on every link but the last, so `def` strictly
+    // increases and the walk runs off the end of the image — where `u16le`
+    // answers `None` — rather than around a cycle a hand-written image could
+    // otherwise spin in forever.
+    let walk = || -> Option<bool> {
+        let vsym = vsym & 0x7fff;
+        let mut def = verdef;
+        loop {
+            let flags = u16le(img, def.checked_add(VERDEF_FLAGS)?)?;
+            let ndx = u16le(img, def.checked_add(VERDEF_NDX)?)?;
+            if flags & VER_FLG_BASE == 0 && (ndx & 0x7fff) == vsym {
+                // `Elf64_Verdaux.vda_name`, an offset into the string table.
+                let aux = def.checked_add(u32le(img, def.checked_add(VERDEF_AUX)?)? as usize)?;
+                let name = strtab.checked_add(u32le(img, aux)? as usize)?;
+                return Some(name_eq(img, name, vername));
+            }
+            match u32le(img, def.checked_add(VERDEF_NEXT)?)? {
+                0 => return Some(false),
+                next => def = def.checked_add(next as usize)?,
+            }
+        }
+    };
+    walk().unwrap_or(false)
 }
 
 /// musl's `count_syms_gnu`: a GNU hash table records no symbol count, so the
@@ -203,12 +276,14 @@ mod tests {
 
     use super::*;
 
-    const IMG_LEN: usize = 512;
+    const IMG_LEN: usize = 1024;
     const PHOFF: usize = 0x40;
     const DYN: usize = 0x100;
-    const HASH: usize = 0x140;
-    const SYMTAB: usize = 0x160;
-    const STRTAB: usize = 0x1c0;
+    const HASH: usize = 0x180;
+    const SYMTAB: usize = 0x1a0;
+    const STRTAB: usize = 0x200;
+    const VERSYM: usize = 0x240;
+    const VERDEF: usize = 0x260;
     /// The one real symbol; index 1, because index 0 is the null entry.
     const SYM1: usize = SYMTAB + SYM_SIZE;
 
@@ -255,7 +330,55 @@ mod tests {
 
         b[STRTAB] = 0; // the empty name every strtab starts with
         b[STRTAB + 1..STRTAB + 8].copy_from_slice(b"tictac\0");
+        b[STRTAB + 8..STRTAB + 18].copy_from_slice(b"LINUX_2.6\0");
+        b[STRTAB + 18..STRTAB + 24].copy_from_slice(b"libby\0");
         b
+    }
+
+    /// Offset of `"LINUX_2.6"` and of `"libby"` inside the string table, as the
+    /// `vda_name` of a version definition records them.
+    const VERNAME_OFF: u32 = 8;
+    const BASENAME_OFF: u32 = 18;
+
+    /// The same image, now carrying the version tables the real one has:
+    /// a `DT_VERDEF` chain of the base definition (index 1, `VER_FLG_BASE`)
+    /// followed by `LINUX_2.6` (index 2), and a `DT_VERSYM` that tags the one
+    /// real symbol with index 2.
+    ///
+    /// This is the shape a linker produces from a `VERSION { LINUX_2.6 {...} }`
+    /// script, which is what `vdso.lds` now has — so these tests cover the
+    /// arm of the lookup the shipped image actually takes.
+    fn versioned_image() -> [u8; IMG_LEN] {
+        let mut b = image();
+
+        // Two more dynamic tags; DT_NULL moves along to make room.
+        put64(&mut b, DYN + 48, DT_VERSYM);
+        put64(&mut b, DYN + 56, VERSYM as u64);
+        put64(&mut b, DYN + 64, DT_VERDEF);
+        put64(&mut b, DYN + 72, VERDEF as u64);
+        put64(&mut b, DYN + 80, DT_NULL);
+
+        put16(&mut b, VERSYM, 0); // symbol 0, the null entry
+        put16(&mut b, VERSYM + 2, 2); // symbol 1 is a LINUX_2.6 symbol
+
+        verdef(&mut b, VERDEF, VER_FLG_BASE, 1, BASENAME_OFF, 28);
+        verdef(&mut b, VERDEF + 28, 0, 2, VERNAME_OFF, 0);
+        b
+    }
+
+    /// Writes one `Elf64_Verdef` plus the single `Elf64_Verdaux` that names it,
+    /// laid out the way a linker lays them out: the aux record follows its
+    /// definition, and `vd_next` is the distance to the next definition.
+    fn verdef(b: &mut [u8], at: usize, flags: u16, ndx: u16, name: u32, next: u32) {
+        put16(b, at, 1); // vd_version
+        put16(b, at + VERDEF_FLAGS, flags);
+        put16(b, at + VERDEF_NDX, ndx);
+        put16(b, at + 6, 1); // vd_cnt: one aux record
+        put32(b, at + 8, 0); // vd_hash, which musl does not read
+        put32(b, at + VERDEF_AUX, 20);
+        put32(b, at + VERDEF_NEXT, next);
+        put32(b, at + 20, name); // vda_name
+        put32(b, at + 24, 0); // vda_next
     }
 
     fn put16(b: &mut [u8], off: usize, v: u16) {
@@ -271,6 +394,60 @@ mod tests {
     #[test]
     fn a_well_formed_image_gives_up_the_symbol_it_exports() {
         assert_eq!(vdsosym(&image(), b"tictac"), Some(0x1234));
+    }
+
+    #[test]
+    fn a_versioned_image_gives_up_the_symbol_under_the_version_it_defines() {
+        assert_eq!(vdsosym(&versioned_image(), b"tictac"), Some(0x1234));
+    }
+
+    #[test]
+    fn a_versioned_image_withholds_the_symbol_from_another_version() {
+        // What musl does with an image whose versions it does not recognise:
+        // resolve nothing, and take the syscall.
+        assert_eq!(
+            vdsosym_ver(&versioned_image(), b"LINUX_9.9", b"tictac"),
+            None
+        );
+    }
+
+    #[test]
+    fn a_symbol_tagged_with_the_base_definition_is_not_a_match() {
+        // Index 1 is the object's own name, flagged VER_FLG_BASE, which musl
+        // skips while walking the chain — so a symbol claiming it matches
+        // nothing at all rather than matching the soname.
+        let mut b = versioned_image();
+        put16(&mut b, VERSYM + 2, 1);
+        assert_eq!(vdsosym(&b, b"tictac"), None);
+    }
+
+    #[test]
+    fn a_symbol_tagged_with_an_index_no_definition_carries_is_not_a_match() {
+        let mut b = versioned_image();
+        put16(&mut b, VERSYM + 2, 7);
+        assert_eq!(vdsosym(&b, b"tictac"), None);
+    }
+
+    /// musl's `if (!verdef) versym = 0;`: with nothing to compare against, the
+    /// comparison is dropped rather than failed. This is the arm the image took
+    /// before it defined a version, and the one that left the Go runtime
+    /// dereferencing a null `info.verdef`.
+    #[test]
+    fn without_a_definition_table_the_version_tags_are_ignored() {
+        let mut b = versioned_image();
+        put64(&mut b, DYN + 64, DT_NULL); // drop DT_VERDEF, keep DT_VERSYM
+        assert_eq!(vdsosym_ver(&b, b"LINUX_9.9", b"tictac"), Some(0x1234));
+    }
+
+    /// A chain whose `vd_next` points back at itself must end the walk, not
+    /// spin in it. Nothing a linker emits looks like this; an image handed to
+    /// the kernel from anywhere else might.
+    #[test]
+    fn a_definition_chain_that_loops_does_not_hang() {
+        let mut b = versioned_image();
+        put16(&mut b, VERSYM + 2, 9); // an index the chain does not carry
+        put32(&mut b, VERDEF + 28 + VERDEF_NEXT, 0); // ... and the chain ends
+        assert_eq!(vdsosym(&b, b"tictac"), None);
     }
 
     #[test]

@@ -270,6 +270,38 @@ pub(crate) fn meta_source(
 // ELF verification
 // ---------------------------------------------------------------------------
 
+/// `runtime.vdsoFindVersion`: the index of the LINUX_2.6 definition in the
+/// `DT_VERDEF` chain, or `None` if the chain does not define it.
+///
+/// Deliberately not shared with `elf.rs`: that file is musl, this is Go, and
+/// the whole point of running both is that they are two readings of the same
+/// bytes.
+fn go_version_index(img: &[u8], verdef: usize, strtab: usize) -> Option<u16> {
+    let mut def = verdef;
+    loop {
+        let flags = u16le(img, def + 2);
+        if flags & 1 == 0 {
+            // VER_FLG_BASE clear: a real version, not the soname.
+            let aux = def + u32le(img, def + 12) as usize;
+            if cstr(img, strtab + u32le(img, aux) as usize) == "LINUX_2.6" {
+                return Some(u16le(img, def + 4) & 0x7fff);
+            }
+        }
+        match u32le(img, def + 16) {
+            0 => return None,
+            next => def += next as usize,
+        }
+    }
+}
+
+/// The index of `name` in `.dynsym`, which is what indexes `DT_VERSYM`.
+///
+/// `nsym` is `DT_HASH`'s `nchain`, the only count of the symbol table either
+/// algorithm has: the dynamic section does not carry one.
+fn sym_index(img: &[u8], symtab: usize, strtab: usize, nsym: usize, name: &str) -> Option<usize> {
+    (0..nsym).find(|i| cstr(img, strtab + u32le(img, symtab + i * 24) as usize) == name)
+}
+
 fn u16le(b: &[u8], off: usize) -> u16 {
     u16::from_le_bytes([b[off], b[off + 1]])
 }
@@ -373,21 +405,37 @@ pub(crate) fn verify(img: &[u8]) -> Verified {
     // offset, which is what lets the checks below index `img` directly.
     let strtab = *tags.get(&DT_STRTAB).expect("falta DT_STRTAB") as usize;
     let symtab = *tags.get(&DT_SYMTAB).expect("falta DT_SYMTAB") as usize;
-    assert!(
-        tags.contains_key(&DT_HASH) || tags.contains_key(&DT_GNU_HASH),
-        "falta DT_HASH y DT_GNU_HASH: musl no encontraria ningun simbolo"
-    );
+    // musl reads DT_HASH and nothing else (`if (!strings || !syms || !hashtab)
+    // return 0;`), and it is also the only table that states how many symbols
+    // there are, which is what lets both verifications below walk `.dynsym` by
+    // index. DT_GNU_HASH is a bonus for readers that prefer it -- the Go
+    // runtime is one -- and `--hash-style=both` emits both.
+    let hash = *tags
+        .get(&DT_HASH)
+        .expect("falta DT_HASH: musl no encontraria ningun simbolo (es la unica tabla que mira)")
+        as usize;
+    let _ = DT_GNU_HASH;
+    let nsym = u32le(img, hash + 4) as usize;
 
-    // musl skips version checking outright when there is no DT_VERDEF, which is
-    // why this image needs no version script despite musl asking for
-    // "LINUX_2.6". If a DT_VERDEF ever appears, that shortcut stops applying
-    // and every lookup starts failing the version comparison.
-    assert!(
-        !tags.contains_key(&DT_VERDEF),
-        "DT_VERDEF presente: musl dejaria de ignorar las versiones y \
-         __vdsosym fallaria salvo que se defina la version LINUX_2.6"
-    );
-    let _ = DT_VERSYM;
+    // The version table is NOT optional, and the reason is the Go runtime.
+    //
+    // musl skips version checking outright when there is no DT_VERDEF, so this
+    // image got away without one for a long time. `runtime.vdsoFindVersion`
+    // has no such arm: it does `def := info.verdef` and dereferences
+    // `def.vd_flags` straight away, because on Linux a vDSO that parses at all
+    // defines LINUX_2.6. Against an image without one it read address 0x2
+    // inside `sysargs`, before the runtime installs any signal handler -- so
+    // every Go program on Eclipse died with a bare "Segmentation fault". The
+    // version is defined in `vdso.lds` now, and both halves are checked below:
+    // musl's lookup (which no longer skips the comparison) and Go's.
+    let verdef = *tags.get(&DT_VERDEF).expect(
+        "falta DT_VERDEF: el runtime de Go desreferencia info.verdef sin \
+         comprobar si es nulo y cualquier programa Go segfallaria al arrancar",
+    ) as usize;
+    let versym = *tags.get(&DT_VERSYM).expect(
+        "falta DT_VERSYM: sin el, Go no puede comprobar la version de cada \
+         simbolo y musl deja de filtrar por version",
+    ) as usize;
 
     for (tag, name) in [
         (DT_RELA, "DT_RELA"),
@@ -486,6 +534,33 @@ pub(crate) fn verify(img: &[u8]) -> Verified {
         data_offset
     );
 
+    // Go's algorithm first, because its failure is the fatal one. musl treats
+    // "no usable vDSO" as a reason to take the syscall, so an image it cannot
+    // read is merely slow; the Go runtime dereferences `info.verdef` with no
+    // nil check and dies in `sysargs`, before it has a signal handler. The
+    // checks: LINUX_2.6 is in the DT_VERDEF chain, and every symbol Go wants
+    // carries that definition's index in DT_VERSYM.
+    //
+    // A wrong name or a wrong index would also cost musl its lookup, so the two
+    // blocks overlap -- but only this one can say *which* reader was broken and
+    // how, and only this one notices at all when the table is missing entirely,
+    // which is the case that segfaults.
+    let ndx = go_version_index(img, verdef, strtab).expect(
+        "el algoritmo de Go no encuentra la version LINUX_2.6 en DT_VERDEF; \
+         sin ella vdsoParseSymbols rechaza todos los simbolos",
+    );
+    for name in REQUIRED_SYMBOLS {
+        let i = sym_index(img, symtab, strtab, nsym, name)
+            .unwrap_or_else(|| panic!("{:?} no esta en .dynsym", name));
+        let v = u16le(img, versym + i * 2) & 0x7fff;
+        assert_eq!(
+            v, ndx,
+            "{:?} lleva el indice de version {} y LINUX_2.6 es el {}: \
+             Go descartaria el simbolo",
+            name, v, ndx
+        );
+    }
+
     // The payoff: musl's own algorithm, run here. Everything above narrows down
     // *why* a lookup might fail; this says whether it does.
     let _ = (strtab, symtab);
@@ -506,7 +581,7 @@ pub(crate) fn verify(img: &[u8]) -> Verified {
 
     println!(
         "cargo:warning=linux-vdso: {} bytes mapeables, _vdso_data en {:#x}, \
-         {} simbolos verificados con el algoritmo de musl",
+         {} simbolos verificados con los algoritmos de musl y de Go",
         filesz,
         data_offset,
         REQUIRED_SYMBOLS.len()

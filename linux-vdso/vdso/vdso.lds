@@ -76,3 +76,37 @@ PHDRS
     text    PT_LOAD    FILEHDR PHDRS FLAGS(5);   /* PF_R | PF_X */
     dynamic PT_DYNAMIC FLAGS(4);                 /* PF_R        */
 }
+
+/*
+ * The symbol version every C library and language runtime asks this image for.
+ *
+ * musl skips version checking outright when the image has no `DT_VERDEF`
+ * (`if (!verdef) versym = 0;`), so for a long time this file defined no
+ * versions at all and the lookup worked by that shortcut. The Go runtime does
+ * not take it: `runtime.vdsoFindVersion` does
+ *
+ *     def := info.verdef
+ *     for { if def.vd_flags&_VER_FLG_BASE == 0 { ... } ... }
+ *
+ * with no nil check, because on Linux a vDSO that parses at all always defines
+ * `LINUX_2.6`. Against an image without one it dereferenced address 0x2 inside
+ * `sysargs`, before the runtime has installed any signal handler — so EVERY Go
+ * program on Eclipse died with a bare "Segmentation fault" and no output.
+ *
+ * Defining the version is what Linux itself does (arch/x86/entry/vdso/
+ * vdso.lds.S), and it satisfies both: Go finds `LINUX_2.6` and matches every
+ * symbol's `.gnu.version` entry against it, and musl stops skipping the check
+ * but asks for exactly this name, so it matches too. `build.rs` now requires
+ * `DT_VERDEF` and `DT_VERSYM` and re-runs both algorithms over the result.
+ */
+VERSION
+{
+    LINUX_2.6 {
+    global:
+        __vdso_clock_gettime;
+        __vdso_gettimeofday;
+        __vdso_time;
+        __vdso_getcpu;
+    local: *;
+    };
+}
