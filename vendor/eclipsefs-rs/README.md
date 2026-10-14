@@ -208,6 +208,39 @@ grupo k (32768 bloques = 128 MiB)
 
 Con esto EclipseFS tiene todo lo de btrfs. Lo siguiente ya es propio.
 
+## Mejoras tras la paridad
+
+- **Lecturas más rápidas**: solo se ponen a cero los huecos entre extents y
+  el inodo se busca una vez por lectura. En lectura aleatoria de 4 KiB
+  EclipseFS pasa de ~20 % más lento que btrfs a más rápido (callgrind:
+  142 M instrucciones frente a 189 M).
+- **FIEMAP y SEEK_DATA/SEEK_HOLE**: `fiemap(ino, inicio, largo)` da los
+  extents (`FileMapping`, con las banderas de Linux: en línea, reservado,
+  comprimido, compartido, último) y `seek_data`/`seek_hole` saltan huecos
+  y espacio reservado. En el kernel: `FS_IOC_FIEMAP` (`filefrag`) y
+  `lseek(SEEK_DATA/SEEK_HOLE)`, con una respuesta genérica (todo datos) en
+  los demás sistemas de archivos.
+- **Desfragmentar y recomprimir** (`btrfs filesystem defragment [-c]`):
+  `defrag(ino, inicio, largo, umbral, compresión)` junta en un solo extent
+  contiguo cada racha de extents pequeños que no están seguidos en disco, o
+  los reescribe comprimidos. Huecos y espacio reservado se quedan; lo
+  reescrito deja de compartirse, como en btrfs. Kernel:
+  `BTRFS_IOC_DEFRAG` y `BTRFS_IOC_DEFRAG_RANGE`.
+- **Redimensionar en caliente** (`btrfs filesystem resize`):
+  `resize(devid, tamaño)` crece hasta un tamaño o hasta el dispositivo
+  (`None`), y **encoge**: primero vacía lo que se corta. El asignador deja
+  de dar bloques de esa zona, los nodos se copian de arriba abajo
+  (`Store::relocate`, así un nodo compartido con un snapshot sigue
+  compartido debajo) y cada bloque de datos se copia una sola vez y todas
+  sus referencias (snapshots, reflinks, extents comprimidos) pasan a la
+  copia. En un volumen, los chunks que quedan fuera se mueven dentro si
+  caben y si no se vacían y se eliminan. Un tamaño puesto a mano se
+  mantiene (`FEAT_FIXED_SIZE`: el montaje ya no crece hasta el
+  dispositivo) hasta un `resize` a `max`. Kernel: `BTRFS_IOC_RESIZE`
+  (`[devid:][+|-]tamaño[kmgtpe]` o `max`).
+- TRIM/discard queda pendiente: los drivers de disco del kernel todavía no
+  tienen discard.
+
 ## En el kernel (fase 8)
 
 - `mount -t eclipsefs` entiende `compress=`, `compress-force=`, `degraded`,
@@ -218,8 +251,8 @@ Con esto EclipseFS tiene todo lo de btrfs. Lo siguiente ya es propio.
   funcionan sin cambios. Todas menos receive, que va por `EFS_IOC_RECEIVE`.
   Incluye `FS_IOC_GETFLAGS`/`SETFLAGS`, `FICLONE`/`FICLONERANGE`, `FIDEDUPERANGE`,
   subvolúmenes y snapshots, subvolumen por defecto, `INO_LOOKUP`, `FS_INFO`,
-  `DEV_INFO`, scrub, cuotas, `ADD_DEV`/`RM_DEV`/`DEV_REPLACE`, `BALANCE_V2`
-  y `SEND`.
+  `DEV_INFO`, scrub, cuotas, `ADD_DEV`/`RM_DEV`/`DEV_REPLACE`, `BALANCE_V2`,
+  `SEND`, `FS_IOC_FIEMAP`, `DEFRAG`/`DEFRAG_RANGE` y `RESIZE`.
 - xattrs (`getxattr` y familia; `btrfs.compression` como en btrfs),
   `fallocate` y `copy_file_range` con reflink.
 - Imágenes del instalador: `make iso ROOTFS_FS=eclipsefs` genera
@@ -283,6 +316,12 @@ cargo test --release -p eclipsefs --features std
   reemplazar uno perdido, resincronizar uno que vuelve, balance con
   conversión y chunks vacíos, disco lleno, y cortes de luz en cada punto
   de una carga que añade y quita dispositivos y convierte perfiles.
+- `tests/mapping.rs`, `tests/defrag.rs` y `tests/resize.rs`: FIEMAP y
+  SEEK frente a un modelo; defrag con huecos, reservas, umbral, rangos,
+  compresión, no-COW y snapshots; resize creciendo, encogiendo con datos y
+  nodos en la cola, sin sitio, con snapshots, reflinks, compresión y
+  cuotas (la compartición se mantiene), volúmenes y una prueba aleatoria.
+  La carga de crash también desfragmenta y redimensiona.
 - Los tests que dependen del formato corren en las dos versiones (`*_v3`).
 - `tests/performance.rs`: las mismas cargas sobre EclipseFS y btrfs, con tiempo
   y bytes leídos/escritos en el dispositivo. `scripts/eclipsefs-bench.sh` las
