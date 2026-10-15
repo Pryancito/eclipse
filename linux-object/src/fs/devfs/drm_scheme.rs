@@ -344,6 +344,10 @@ impl DrmDev {
         };
         let deadline = core::time::Duration::from_micros(deadline_us);
         let mut acct = PreWaitAccount::new(zcore_drivers::scheme::prewait::Kind::SyncobjWait);
+        // Recorded only once the first probe has failed and we are really
+        // going to park: `PreWaitAccount` counts this wait when it ENDS, and
+        // one that never ends is counted nowhere. See `crate::sync::stall`.
+        let mut stall = None;
         loop {
             // No `poll_pending()` in front of this. It takes the syncobj
             // table lock and runs `resolve_locked` -- and so does
@@ -368,6 +372,16 @@ impl DrmDev {
                     return Ok(());
                 }
                 None => {
+                    if stall.is_none() {
+                        stall = crate::sync::stall::register(
+                            crate::sync::stall::Kind::SyncobjWait,
+                            handles.first().copied().unwrap_or(0) as u64,
+                            points
+                                .as_deref()
+                                .and_then(|p| p.first().copied())
+                                .unwrap_or(0) as i64,
+                        );
+                    }
                     // If the absolute deadline is already behind `timer_now`,
                     // wait_ready should have returned Timeout; the helper still
                     // refuses to sleep past it if the clocks disagree slightly.

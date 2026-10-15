@@ -11,3 +11,4 @@ pub use self::semaphore::*;
 mod event_bus;
 mod semaphore;
 pub mod shared_futex;
+pub mod stall;

@@ -547,15 +547,17 @@ impl Syscall<'_> {
         // processes share, so it cannot be served from the per-process table.
         // See `linux_object::sync::shared_futex` for why this is what every GL
         // application under Xwayland hangs on when it is missing.
-        let futex = match (op & FUTEX_PRIVATE_FLAG == 0)
+        let (futex, shared) = match (op & FUTEX_PRIVATE_FLAG == 0)
             .then(|| self.shared_futex(uaddr))
             .flatten()
         {
-            Some(futex) => futex,
-            None => self
-                .linux_process()
-                .get_futex(uaddr)
-                .ok_or(LxError::EINVAL)?,
+            Some(futex) => (futex, true),
+            None => (
+                self.linux_process()
+                    .get_futex(uaddr)
+                    .ok_or(LxError::EINVAL)?,
+                false,
+            ),
         };
         match cmd {
             // ── Priority-inheritance lock ops: LOCK_PI / LOCK_PI2 / TRYLOCK_PI ──
@@ -795,6 +797,23 @@ impl Syscall<'_> {
                     }
                 };
                 pin_mut!(raced);
+                // Registered for as long as the park lasts, and only here --
+                // past the `value_eq` short-circuit, so the uncontended and
+                // lost-the-cmpxchg cases (every hot `pthread_mutex_lock`) pay
+                // nothing. A futex that never returns is otherwise recorded
+                // nowhere at all: see `linux_object::sync::stall`. Whether the
+                // word is SHARED is the part that matters, because a shared
+                // one is the libxshmfence handshake every GL application under
+                // Xwayland parks in.
+                let _stall = linux_object::sync::stall::register(
+                    if shared {
+                        linux_object::sync::stall::Kind::FutexShared
+                    } else {
+                        linux_object::sync::stall::Kind::FutexPrivate
+                    },
+                    uaddr as u64,
+                    val as i32 as i64,
+                );
                 let res: ZxResult = self
                     .thread
                     .blocking_run(

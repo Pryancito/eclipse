@@ -19,7 +19,7 @@ mod present;
 use present::proc_present_content;
 use smoltcp::wire::{IpAddress, IpCidr};
 
-const PROC_ROOT_STATIC: [&str; 56] = [
+const PROC_ROOT_STATIC: [&str; 57] = [
     "net",
     "present",
     "oops",
@@ -42,6 +42,7 @@ const PROC_ROOT_STATIC: [&str; 56] = [
     "hunter",
     "filesystems",
     "gpudbg",
+    "stalls",
     "gpustep2",
     "gpustep3",
     "gpustep4",
@@ -792,6 +793,7 @@ impl INode for ProcRootINode {
             "hunter" => Ok(PROC_HUNTER.clone()),
             "filesystems" => Ok(PROC_FILESYSTEMS.clone()),
             "gpudbg" => Ok(PROC_GPUDBG.clone()),
+            "stalls" => Ok(PROC_STALLS.clone()),
             "present" => Ok(PROC_PRESENT.clone()),
             "oops" => Ok(PROC_OOPS.clone()),
             "gpustep2" => Ok(PROC_GPUSTEP2.clone()),
@@ -3075,6 +3077,26 @@ fn proc_oops_content() -> String {
         return String::from("# no contained kernel faults since boot\n");
     }
     String::from_utf8_lossy(&bytes).into_owned()
+}
+
+// A block of its own, not a line in the one above: `lazy_static!` expands
+// recursively, one level per entry, and that block is already at the macro
+// recursion limit -- one more entry in it fails to compile.
+lazy_static! {
+    /// `/proc/stalls` — the blocking waits outstanding RIGHT NOW, longest
+    /// first. Every other wait counter in the kernel is recorded when the wait
+    /// ends, so the one case that matters -- a wait that never ends, which is
+    /// what a frozen window is -- appears in none of them. See
+    /// `crate::sync::stall`.
+    static ref PROC_STALLS: Arc<dyn INode> = Arc::new(ProcSeqINode {
+        inode: 144,
+        generate: proc_stalls_content,
+    });
+}
+
+/// `/proc/stalls`: see [`crate::sync::stall`].
+fn proc_stalls_content() -> String {
+    crate::sync::stall::render()
 }
 
 fn proc_gpudbg_content() -> String {

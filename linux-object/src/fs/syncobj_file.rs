@@ -649,10 +649,22 @@ impl FileLike for SyncobjHandle {
     }
 
     async fn async_poll(&self, events: PollEvents) -> LxResult<PollStatus> {
+        // Registered the first time round the loop that actually sleeps, so a
+        // fence already signaled pays nothing: `crate::sync::stall` explains
+        // why a wait that never returns needs recording up front rather than
+        // on the way out.
+        let mut stall = None;
         loop {
             let status = self.poll(events)?;
             if !events.wants_read() || status.read {
                 return Ok(status);
+            }
+            if stall.is_none() {
+                stall = crate::sync::stall::register(
+                    crate::sync::stall::Kind::SyncFilePoll,
+                    self.handle as u64,
+                    self.sync_file_point.unwrap_or(0) as i64,
+                );
             }
             // Keep the HW-fence poller armed while we sleep on the EventBus:
             // a pure `wait_for_event` only returns when READABLE is published,

@@ -805,6 +805,18 @@ fn primary_main(config: kernel_hal::KernelConfig) {
                      las bandas de 16 filas que el panel ya tiene"
                 );
             }
+            // The stall table is ON by default: it only records a wait that
+            // was going to park anyway, and what it buys is the one thing no
+            // other counter here can say -- which wait a frozen window is
+            // parked in, named in `dmesg` without anyone having to catch it
+            // live. `stalls=off` turns it off.
+            if kernel_hal::cmdline::is_off(&options.cmdline, "stalls") {
+                linux_object::sync::stall::set_enabled(false);
+                klog_info!(
+                    "Eclipse: stalls=off -- una espera que no vuelve no sale en \
+                     ningun contador ni en /proc/stalls"
+                );
+            }
             // Present repair is ON by default: GLES2/llvmpipe sessions (what
             // `renderer=auto` still picks on QEMU/VirtualBox) hand the kernel a
             // buffer whose tiles are still arriving, and there is no fence to
