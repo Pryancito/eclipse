@@ -62,7 +62,15 @@ trap_from_user:
 end_trap_from_kernel:
     mv a0, sp               # first arg is TrapFrame
     la ra, trap_return      # set return address
-    j trap_handler
+    # `j trap_handler` assembles to JAL, whose immediate reaches only +-1 MiB.
+    # `trap_handler` lives in the kernel, not in this crate, so the distance
+    # grows with the kernel's `.text`: once it passed 1 MiB the link failed
+    # outright with "relocation R_RISCV_JAL out of range ... references
+    # 'trap_handler'". `tail` assembles to auipc+jalr, which is PC-relative
+    # over +-2 GiB, so the jump no longer depends on how big the kernel is.
+    # It clobbers t1, which is already saved in the trap frame above and is
+    # caller-saved as far as `trap_handler` is concerned.
+    tail trap_handler
 
 end_trap_from_user:
     # load callee-saved registers
