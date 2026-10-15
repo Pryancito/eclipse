@@ -8932,11 +8932,17 @@ impl NvidiaGpu {
                 return Err(nv::EINVAL);
             }
         }
-        if op.op != nv::VM_BIND_OP_MAP || op.handle == 0 {
+        if op.op != nv::VM_BIND_OP_MAP {
             return Ok(());
         }
         // Only a holder may bind the object into its VAS: binding another
-        // process's buffer is a GPU read/write of it.
+        // process's buffer is a GPU read/write of it. Handle 0 names no
+        // object (`drm_gem_object_lookup` in `nouveau_uvmm_bind_job_submit`
+        // misses it like any other): ENOENT, whatever the range holds. It
+        // used to skip this lookup and be applied as an unmap of the range
+        // -- a shape no client sends Linux (NVK unbinds with UNMAP, and its
+        // sparse regions are MAP with the SPARSE flag, refused above), so a
+        // stray handle took a live mapping with it instead of an error.
         let obj_size = {
             let gem = self.nouveau_gem.lock();
             let Some(obj) = gem
@@ -9079,26 +9085,10 @@ impl NvidiaGpu {
         // first, and a map the RM then refuses cannot put the old one back.
         match op.op {
             nv::VM_BIND_OP_MAP => {
-                // MAP with handle=0 is how Mesa spells "unmap this range but
-                // keep the VA reservation" (nvkmd_nouveau_va_unbind builds
-                // exactly this op). Resolving handle 0 against the GEM table
-                // used to ENOENT it -- another unmap shape that never
-                // worked. It is a range unmap; treat it as one.
-                if op.handle == 0 {
-                    self.drain_vm_mappings(
-                        &alloc::format!("VM_BIND MAP-nothing VA={:#x}+{:#x}", op.addr, op.range),
-                        |m| {
-                            m.owner_pid == owner_pid
-                                && m.va < op.addr.wrapping_add(op.range)
-                                && op.addr < m.va.wrapping_add(m.size)
-                        },
-                        true,
-                    );
-                    return Ok(());
-                }
                 // The holder check and the window check ran in
-                // `vm_bind_check_op`; the lookup here is for `h_memory`, and
-                // an object that went away in between is ENOENT.
+                // `vm_bind_check_op` (handle 0 included: no object, ENOENT);
+                // the lookup here is for `h_memory`, and an object that went
+                // away in between is ENOENT.
                 let h_memory = {
                     let gem = self.nouveau_gem.lock();
                     let Some(obj) = gem

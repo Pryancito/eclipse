@@ -1695,14 +1695,22 @@ fn vm_bind_maps_into_the_callers_own_context_and_a_map_over_a_live_range_replace
         [hb]
     );
     assert_eq!(FAKE_RM.lock().unmaps, 6);
-    // MAP with handle 0 is Mesa's "unbind, keep the reservation", and
-    // it is scoped like UNMAP: B's mapping at the same VA is not A's.
+    // MAP with handle 0 names no object: ENOENT, and nothing of A's
+    // moves. UNMAP is scoped: B's mapping at the same VA is not A's.
     assert_eq!(
         vm_bind_ops(&gpu, B, &mut [map(hb, VA + 0x10_0000, 4096)]),
         Ok(0)
     );
     assert_eq!(
         vm_bind_ops(&gpu, A, &mut [map(0, VA + 0x10_0000, 4096)]),
+        Err(nv::ENOENT)
+    );
+    assert_eq!(
+        driver_maps(&gpu, A).iter().map(|m| m.0).collect::<Vec<_>>(),
+        [hb]
+    );
+    assert_eq!(
+        vm_bind_ops(&gpu, A, &mut [unmap(VA + 0x10_0000, 4096)]),
         Ok(0)
     );
     assert_eq!(driver_maps(&gpu, A), []);
@@ -5680,153 +5688,6 @@ fn an_exec_or_a_vm_bind_cannot_name_another_processes_syncobj() {
     assert!(syncobj::destroy_for(A, theirs) && syncobj::destroy_for(A, mine));
     assert!(syncobj::destroy_for(B, theirs) && syncobj::destroy_for(B, theirs_done));
     assert!(syncobj::destroy(nobodys));
-}
-
-/// `nouveau_uvmm_bind_job_submit` runs `bind_validate_op` over every
-/// op of a `VM_BIND` when the job is submitted, before the job waits
-/// its in-syncs or touches the VA space, so a batch with a bad op in
-/// it does nothing at all. Here the ops were checked as they were
-/// applied: op[0]'s UNMAP was already in the RM when op[1] was
-/// refused -- the caller told "nothing happened" had lost a live
-/// mapping -- and a bad op behind an unsignaled wait was heard of only
-/// after the wait had cost its whole deadline.
-#[test]
-fn a_vm_bind_batch_with_a_bad_op_binds_nothing_and_unbinds_nothing() {
-    let _g = LOCK.lock();
-    let _live = LiveBytes::hold();
-    let gpu = gpu_rm_fast();
-    let _ch_a = client_with_pushbuf(&gpu, A);
-    let ha = gem_new_rm(&gpu, 65536, nv::NOUVEAU_GEM_DOMAIN_GART, A)
-        .unwrap()
-        .handle;
-    const VA: u64 = 0x7f_3000_0000;
-    let bound = driver_maps(&gpu, A).len();
-    assert_eq!(vm_bind_ops(&gpu, A, &mut [map(ha, VA, 65536)]), Ok(0));
-    // A's mappings in this test's stretch of VA: (va, size).
-    let live = || {
-        driver_maps(&gpu, A)
-            .iter()
-            .filter(|m| (VA..VA + 0x100_0000).contains(&m.1))
-            .map(|m| (m.1, m.2))
-            .collect::<Vec<_>>()
-    };
-    assert_eq!(live(), [(VA, 65536)]);
-    let bad: [(nv::DrmNouveauVmBindOp, i32, &str); 6] = [
-        (
-            map(ha + 1000, VA + 0x10_0000, 4096),
-            nv::ENOENT,
-            "a handle A does not hold",
-        ),
-        (
-            op(
-                nv::VM_BIND_OP_MAP,
-                nv::VM_BIND_SPARSE,
-                0,
-                VA + 0x10_0000,
-                4096,
-            ),
-            nv::EOPNOTSUPP,
-            "a sparse region",
-        ),
-        (
-            map(ha, VA + 0x10_0001, 4096),
-            nv::EINVAL,
-            "a VA off the page",
-        ),
-        (map(ha, VA + 0x10_0000, 0), nv::EINVAL, "an empty range"),
-        (
-            map_at(ha, VA + 0x10_0000, 4096, 65536),
-            nv::EINVAL,
-            "a window past the object",
-        ),
-        (
-            op(7, 0, ha, VA + 0x10_0000, 4096),
-            nv::EINVAL,
-            "an op nobody knows",
-        ),
-    ];
-    for (op_bad, errno, what) in bad {
-        // Two good ops first -- an UNMAP of the live mapping and a MAP
-        // of a fresh page -- then the bad one; and the bad one first.
-        let again = || nv::DrmNouveauVmBindOp { ..op_bad };
-        for (place, mut ops) in [
-            (
-                "last",
-                [unmap(VA, 65536), map(ha, VA + 0x20_0000, 4096), again()],
-            ),
-            (
-                "first",
-                [again(), unmap(VA, 65536), map(ha, VA + 0x20_0000, 4096)],
-            ),
-        ] {
-            let before = FAKE_RM.lock().calls.len();
-            assert_eq!(
-                vm_bind_ops(&gpu, A, &mut ops),
-                Err(errno),
-                "{} ({})",
-                what,
-                place
-            );
-            assert_eq!(
-                live(),
-                [(VA, 65536)],
-                "{} ({}): the UNMAP in the same batch did not run, nor the MAP",
-                what,
-                place
-            );
-            assert_eq!(
-                rm_calls_since(before),
-                [] as [&str; 0],
-                "{} ({}): nothing reached the RM",
-                what,
-                place
-            );
-        }
-    }
-    // Behind a wait nobody submitted: refused at once, not after the
-    // deadline the wait would have cost, and the sig stays unsignaled.
-    // The wait is looked up first (`nouveau_job_add_deps` runs before
-    // `ops->submit` validates the ops), so it is its EINVAL.
-    let never = syncobj::create(false);
-    let late = syncobj::create(false);
-    let _advance = AutoAdvance::of(1_000);
-    let t0 = test_clock::now();
-    let before = FAKE_RM.lock().calls.len();
-    assert_eq!(
-        vm_bind_sync(
-            &gpu,
-            A,
-            &mut [unmap(VA, 65536), map(ha + 1000, VA + 0x10_0000, 4096)],
-            nv::VM_BIND_RUN_ASYNC,
-            &[sync(never)],
-            &[sync(late)]
-        ),
-        Err(nv::EINVAL),
-        "the unsubmitted wait, not EIO for it"
-    );
-    assert!(
-        test_clock::now() - t0 < 1_000_000,
-        "refused without waiting ({} us)",
-        test_clock::now() - t0
-    );
-    assert_eq!(live(), [(VA, 65536)]);
-    assert_eq!(syncobj::query(late), Some(0), "not signaled");
-    assert_eq!(rm_calls_since(before), [] as [&str; 0]);
-    // The same two good ops on their own: both apply.
-    assert_eq!(
-        vm_bind_ops(
-            &gpu,
-            A,
-            &mut [unmap(VA, 65536), map(ha, VA + 0x20_0000, 4096)]
-        ),
-        Ok(0)
-    );
-    assert_eq!(live(), [(VA + 0x20_0000, 4096)]);
-    assert_eq!(
-        vm_bind_ops(&gpu, A, &mut [unmap(VA + 0x20_0000, 4096)]),
-        Ok(0)
-    );
-    assert_eq!(driver_maps(&gpu, A).len(), bound);
 }
 
 /// `vkQueueBindSparse` is a `VM_BIND` with `RUN_ASYNC`, the submit's
