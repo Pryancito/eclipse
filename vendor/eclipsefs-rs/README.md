@@ -380,3 +380,8 @@ cargo test --release -p eclipsefs --features std
 - `tests/performance.rs`: las mismas cargas sobre EclipseFS y btrfs, con tiempo
   y bytes leídos/escritos en el dispositivo. `scripts/eclipsefs-bench.sh` las
   ejecuta en release; `ECLIPSEFS_BENCH_SCALE=4` las agranda.
+- `scripts/eclipsefs-linux-bench.sh` (como root): EclipseFS contra los
+  sistemas de archivos del kernel Linux (ext4, xfs, btrfs) con fio y tar,
+  cada uno en una imagen del mismo tamaño en un dispositivo loop. EclipseFS se
+  monta con `tools/eclipsefs-fuse`; la fila `ext4-fuse` (ext4 detrás de
+  bindfs) mide lo que cuesta FUSE por sí solo.

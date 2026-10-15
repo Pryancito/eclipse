@@ -1,0 +1,18 @@
+[package]
+name = "eclipsefs-fuse"
+version = "0.1.0"
+edition = "2021"
+description = "Mounts an EclipseFS image on Linux through FUSE, so Linux benchmarks (fio) can compare it with ext4/xfs/btrfs"
+publish = false
+
+# Host-only tool: kept out of the kernel workspace so its dependencies never
+# reach the kernel build.
+[workspace]
+
+[dependencies]
+eclipsefs = { path = "../../vendor/eclipsefs-rs", features = ["std"] }
+fuser = { version = "0.15", default-features = false, features = ["abi-7-31"] }
+libc = "0.2"
+
+[profile.release]
+debug = false
