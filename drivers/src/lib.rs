@@ -66,6 +66,18 @@ pub mod nvme;
 pub mod prelude;
 pub mod scheme;
 pub mod sync;
+/// The one lock a test takes when it drives a process-wide global: the
+/// syncobj `TABLE` and its link counters, the reservation table, the
+/// `gem_mmap` registry, the nouveau uAPI switch. `scheme::syncobj`,
+/// `scheme::resv` and `display::nvidia::nouveau_bookkeeping_tests` each
+/// used to serialise themselves behind a lock of their own, and a
+/// `cargo test` with more than one thread ran the three families side by
+/// side: one wiped the table under another, five failures in a bundle one
+/// run in three (CI's `--test-threads=1` never sees it).
+#[cfg(test)]
+pub(crate) mod test_globals {
+    pub(crate) static LOCK: lock::Mutex<()> = lock::Mutex::new(());
+}
 pub mod uart;
 pub mod utils;
 

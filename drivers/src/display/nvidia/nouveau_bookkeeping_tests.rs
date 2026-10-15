@@ -9,9 +9,9 @@ extern crate std;
 use super::super::nouveau_uapi as nv;
 use super::*;
 use core::mem::size_of;
-use lock::Mutex as TestMutex;
 
-pub(super) static LOCK: TestMutex<()> = TestMutex::new(());
+/// See `crate::test_globals`: shared with the syncobj and resv tests.
+pub(super) use crate::test_globals::LOCK;
 
 const A: u64 = 66_001;
 const B: u64 = 66_002;

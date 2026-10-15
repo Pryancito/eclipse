@@ -2458,9 +2458,16 @@ mod tests {
     /// its own clock forward would time out another test's pending fences.
     /// Serialise them. (CI runs with `--test-threads=1`, which hides exactly
     /// this class of coupling, so the lock is not optional here.)
-    fn test_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    ///
+    /// The lock is `crate::test_globals::LOCK`, shared with `resv` and the
+    /// nouveau bookkeeping tests, not a private one: those put fences in
+    /// this same `TABLE` under locks of their own, so with three locks the
+    /// families ran side by side and one wiped the table under another --
+    /// `links_now() == 0` here, `resv::count` of a closed buffer there,
+    /// five failures in a bundle one run in three. Each test takes the one
+    /// lock once, so there is no order to invert.
+    fn test_lock() -> lock::MutexGuard<'static, ()> {
+        crate::test_globals::LOCK.lock()
     }
 
     /// The CPU-side wait hands the table back between its looks.
