@@ -9352,3 +9352,7 @@ mod vm_bind_tests;
 /// The EXEC arms (waits, sigs, the job's deps): same harness, own file,
 /// same reason.
 mod exec_tests;
+
+/// The buffer's reservation (imported fences, ring probes): same harness,
+/// own file, same reason.
+mod resv_tests;

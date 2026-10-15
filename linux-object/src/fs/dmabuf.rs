@@ -116,6 +116,48 @@ impl DmaBuf {
     pub fn vmo(&self) -> Arc<VmObject> {
         self.vmo.clone()
     }
+
+    /// `DMA_BUF_IOCTL_EXPORT_SYNC_FILE`: a `sync_file` that is ready once
+    /// everything a **writer** (`write`) or a **reader** of the buffer has
+    /// to wait for is done -- `dma_resv_get_singleton` of the buffer's
+    /// reservation, as a `dma_fence_array`. That is the GPU work its
+    /// driver still has queued on it ([`super::devfs::drm::queued_fences`])
+    /// and the fences userspace imported onto it, of the usage the access
+    /// has to respect ([`zcore_drivers::scheme::resv::fences`]). A buffer
+    /// nobody is touching gives a `sync_file` that is signaled already
+    /// (Linux: the stub fence). The fd is close-on-exec, as
+    /// `get_unused_fd_flags(O_CLOEXEC)` makes it.
+    ///
+    /// This is how Xwayland fences its copy of a window it cannot flip
+    /// (`xwl_glamor_get_fence`), and how Mesa's WSI, without
+    /// `linux-drm-syncobj-v1`, learns when the compositor is done reading a
+    /// swapchain image before rendering into it again. The ioctl was
+    /// `ENOTTY`, so both went without and read or wrote the buffer whenever
+    /// they liked.
+    pub fn export_sync_file(&self, write: bool) -> Arc<SyncobjHandle> {
+        let hw = match self.nouveau_handle {
+            Some(handle) => super::devfs::drm::queued_fences(handle),
+            None => alloc::vec::Vec::new(),
+        };
+        let deps = zcore_drivers::scheme::resv::fences(self.phys_addr, write);
+        let carrier = zcore_drivers::scheme::syncobj::bundle_fence(&hw, &deps);
+        SyncobjHandle::new_sync_file(carrier, 1)
+    }
+
+    /// `DMA_BUF_IOCTL_IMPORT_SYNC_FILE`: put the fence of a `sync_file` on
+    /// the buffer, as a write into it when `write` (`dma_resv_add_fence`
+    /// with `DMA_RESV_USAGE_WRITE`, else `_READ`), for its implicit-sync
+    /// consumers to wait for: `GEM_CPU_PREP`, a scanout of it, and the next
+    /// [`Self::export_sync_file`]. `fence` has to be a `sync_file`
+    /// (`sync_file_get_fence` on a syncobj fd, or any other, finds no fence:
+    /// EINVAL), and its syncobj still live.
+    pub fn import_sync_file(&self, write: bool, fence: &SyncobjHandle) -> LxResult {
+        let point = fence.sync_file_point.ok_or(LxError::EINVAL)?;
+        if !zcore_drivers::scheme::resv::add_fence(self.phys_addr, fence.handle, point, write) {
+            return Err(LxError::EINVAL);
+        }
+        Ok(())
+    }
 }
 
 impl Drop for DmaBuf {
@@ -142,6 +184,29 @@ const DMA_BUF_SYNC_END: u64 = 4;
 const DMA_BUF_SYNC_VALID_FLAGS_MASK: u64 = DMA_BUF_SYNC_RW | DMA_BUF_SYNC_END;
 /// `DMA_BUF_NAME_LEN`.
 const DMA_BUF_NAME_LEN: usize = 32;
+/// `DMA_BUF_SYNC_WRITE`.
+const DMA_BUF_SYNC_WRITE: u64 = 2;
+/// `DMA_BUF_IOCTL_EXPORT_SYNC_FILE`: `_IOWR('b', 2, struct
+/// dma_buf_export_sync_file)`, a `__u32 flags` in and a `__s32 fd` out.
+pub const DMA_BUF_IOCTL_EXPORT_SYNC_FILE: u32 = 0xc008_6202;
+/// `DMA_BUF_IOCTL_IMPORT_SYNC_FILE`: `_IOW('b', 3, struct
+/// dma_buf_import_sync_file)`, the same two words, both in.
+pub const DMA_BUF_IOCTL_IMPORT_SYNC_FILE: u32 = 0x4008_6203;
+
+/// The `flags` of `DMA_BUF_IOCTL_EXPORT_SYNC_FILE` and `IMPORT_SYNC_FILE`,
+/// checked first as `dma_buf_export_sync_file` / `dma_buf_import_sync_file`
+/// check them: only `DMA_BUF_SYNC_READ` and `DMA_BUF_SYNC_WRITE` (EINVAL for
+/// any other bit, `SYNC_END` included), and at least one of them. Says
+/// whether the access is a **write**: the usage of the fence an import puts
+/// on the buffer, and what an export has to wait for (`dma_resv_usage_rw`:
+/// a reader waits for the writes, a writer for everything).
+pub fn sync_file_usage(flags: u32) -> LxResult<bool> {
+    let flags = u64::from(flags);
+    if flags & !DMA_BUF_SYNC_RW != 0 || flags & DMA_BUF_SYNC_RW == 0 {
+        return Err(LxError::EINVAL);
+    }
+    Ok(flags & DMA_BUF_SYNC_WRITE != 0)
+}
 
 #[async_trait]
 impl FileLike for DmaBuf {
@@ -617,6 +682,135 @@ mod fops_tests {
             d.ioctl(0x4008_6209, &flags as *const u64 as usize, 0, 0),
             Err(LxError::ENOTTY),
             "an ioctl the dma-buf does not have"
+        );
+    }
+}
+
+#[cfg(test)]
+mod sync_file_tests {
+    //! `DMA_BUF_IOCTL_EXPORT_SYNC_FILE` / `IMPORT_SYNC_FILE`: the fences a
+    //! client puts on a buffer for its implicit-sync users, and the
+    //! `sync_file` it reads back before touching the buffer itself. Both
+    //! were `ENOTTY`.
+
+    use super::super::devfs::drm_scheme::DRM_RDWR;
+    use super::*;
+    use zcore_drivers::scheme::{resv, syncobj};
+    use zircon_object::vm::VmObject;
+
+    /// A generic (dumb) dma-buf over its own physical range: no driver ring
+    /// behind it, so what it carries is exactly what was imported.
+    fn dmabuf_at(phys: u64) -> Arc<DmaBuf> {
+        DmaBuf::from_prime(1, phys, 4096, VmObject::new_paged(1), DRM_RDWR)
+    }
+
+    fn ready(f: &SyncobjHandle) -> bool {
+        syncobj::query(f.handle).is_some_and(|p| p >= f.sync_file_point.unwrap())
+    }
+
+    /// The flags are read first and as Linux reads them: READ, WRITE or
+    /// both, nothing else, and the word says whether the access writes.
+    #[test]
+    fn the_flags_name_a_read_or_a_write_and_nothing_else() {
+        assert_eq!(sync_file_usage(1), Ok(false), "READ");
+        assert_eq!(sync_file_usage(2), Ok(true), "WRITE");
+        assert_eq!(sync_file_usage(3), Ok(true), "both is a write");
+        assert_eq!(sync_file_usage(0), Err(LxError::EINVAL), "no direction");
+        assert_eq!(
+            sync_file_usage(4),
+            Err(LxError::EINVAL),
+            "SYNC_END is not a direction"
+        );
+        assert_eq!(
+            sync_file_usage(4 | 1),
+            Err(LxError::EINVAL),
+            "nor next to one"
+        );
+        assert_eq!(
+            sync_file_usage(8 | 2),
+            Err(LxError::EINVAL),
+            "an undefined bit"
+        );
+        assert_eq!(sync_file_usage(1 << 31), Err(LxError::EINVAL));
+    }
+
+    /// An import puts the fence on the buffer with the usage its flags
+    /// say; an export gives a `sync_file` that waits for what that access
+    /// has to wait for: a reader for the writes only, a writer for every
+    /// fence; and a buffer nobody fenced exports one that is ready at once.
+    #[test]
+    fn an_export_waits_for_what_was_imported_by_usage() {
+        let phys = 0x8_0000_0000;
+        let d = dmabuf_at(phys);
+        let idle = d.export_sync_file(false);
+        assert_eq!(
+            idle.sync_file_point,
+            Some(1),
+            "a sync_file, not a syncobj fd"
+        );
+        assert!(ready(&idle), "nothing to wait for: the stub fence");
+        assert_eq!(idle.flags(), OpenFlags::RDWR | OpenFlags::CLOEXEC);
+
+        let reader = syncobj::create(false);
+        let writer = syncobj::create(false);
+        let read_fence = SyncobjHandle::new_sync_file(reader, 1);
+        let write_fence = SyncobjHandle::new_sync_file(writer, 1);
+        assert_eq!(d.import_sync_file(false, &read_fence), Ok(()));
+        assert_eq!(resv::count(phys), 1);
+        let after_read = d.export_sync_file(false);
+        assert!(ready(&after_read), "a reader does not wait for a read");
+        let writer_after_read = d.export_sync_file(true);
+        assert!(!ready(&writer_after_read), "a writer waits for the read");
+        assert_eq!(d.import_sync_file(true, &write_fence), Ok(()));
+        assert_eq!(resv::count(phys), 2);
+        let reader_after_write = d.export_sync_file(false);
+        assert!(!ready(&reader_after_write), "a reader waits for the write");
+        assert!(syncobj::signal(writer));
+        assert!(ready(&reader_after_write));
+        assert!(!ready(&writer_after_read), "the read is still in flight");
+        assert!(syncobj::signal(reader));
+        assert!(ready(&writer_after_read));
+        assert_eq!(resv::count(phys), 0, "signaled fences leave the buffer");
+        // The imported fence is the one of export time: a reset of its
+        // syncobj afterwards does not put it back in flight.
+        assert!(syncobj::reset(writer));
+        assert!(ready(&d.export_sync_file(true)));
+        syncobj::destroy(reader);
+        syncobj::destroy(writer);
+    }
+
+    /// `sync_file_get_fence`: only a `sync_file` fd carries a fence. A
+    /// syncobj fd (`SYNCOBJ_HANDLE_TO_FD` without the flag) is EINVAL and
+    /// puts nothing on the buffer, and so is a `sync_file` whose syncobj is
+    /// gone. Buffers do not see each other's fences.
+    #[test]
+    fn only_a_sync_file_can_be_imported_and_buffers_are_apart() {
+        let (a, b) = (0x8_1000_0000, 0x8_2000_0000);
+        let da = dmabuf_at(a);
+        let db = dmabuf_at(b);
+        let s = syncobj::create(false);
+        assert!(syncobj::add_ref(s));
+        let as_syncobj = SyncobjHandle::new(s);
+        assert_eq!(da.import_sync_file(true, &as_syncobj), Err(LxError::EINVAL));
+        assert_eq!(resv::count(a), 0);
+        let fence = SyncobjHandle::new_sync_file(s, 1);
+        assert_eq!(da.import_sync_file(true, &fence), Ok(()));
+        assert_eq!(resv::count(a), 1);
+        assert_eq!(resv::count(b), 0);
+        assert!(
+            ready(&db.export_sync_file(true)),
+            "the other buffer is free"
+        );
+        assert!(!ready(&da.export_sync_file(false)));
+        // A sync_file whose syncobj went away has no fence to give.
+        drop(as_syncobj);
+        assert!(syncobj::destroy(s));
+        assert_eq!(syncobj::query(s), None);
+        assert_eq!(da.import_sync_file(true, &fence), Err(LxError::EINVAL));
+        assert_eq!(
+            resv::count(a),
+            0,
+            "and the fence already on the buffer was released with its source"
         );
     }
 }

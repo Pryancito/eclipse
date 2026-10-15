@@ -580,6 +580,12 @@ impl DrmDev {
             return Ok(());
         }
         let fences = drm::scanout_render_fence(fb_id);
+        // And what a client put on the buffer by name with
+        // `DMA_BUF_IOCTL_IMPORT_SYNC_FILE` (its render fence, under Xwayland
+        // or a WSI without `linux-drm-syncobj-v1`): the writes on the
+        // buffer's reservation, as `drm_gem_plane_helper_prepare_fb` takes
+        // them. Nothing waited for those either -- the ioctl did not exist.
+        let deps = drm::scanout_resv_fences(fb_id);
         let n = FENCE_PRESENTS
             .fetch_add(1, Ordering::Relaxed)
             .saturating_add(1);
@@ -599,7 +605,7 @@ impl DrmDev {
         // GPU still writing the buffer is not waited for at all. Whether that is
         // what happens on a real desktop is a question about a real machine, so
         // the number goes in the log.
-        if fences.is_empty() {
+        if fences.is_empty() && deps.is_empty() {
             FENCE_PRESENTS_NO_FENCE.fetch_add(1, Ordering::Relaxed);
             if report {
                 log::info!(
@@ -617,12 +623,19 @@ impl DrmDev {
         let deadline = waited_from + core::time::Duration::from_micros(PRESENT_FENCE_TIMEOUT_US);
         let mut acct = PreWaitAccount::new(zcore_drivers::scheme::prewait::Kind::PresentFence);
         loop {
+            if !deps.is_empty() {
+                let _ = zcore_drivers::scheme::syncobj::poll_pending();
+            }
             // `hw_fences_landed`, not `fences.iter().all(hw_fence_landed)`:
             // one read per landing zone, not one per fence. A buffer two
             // submits of one ring wrote carries two fences at the SAME
             // semaphore word, and this loop takes the list again on every
             // probe.
-            if zcore_drivers::scheme::syncobj::hw_fences_landed(&fences) {
+            if zcore_drivers::scheme::syncobj::hw_fences_landed(&fences)
+                && deps.iter().all(|&(handle, point)| {
+                    zcore_drivers::scheme::syncobj::query(handle).is_none_or(|p| p >= point)
+                })
+            {
                 FENCE_PRESENTS_LANDED.fetch_add(1, Ordering::Relaxed);
                 FENCE_WAIT_US_TOTAL.fetch_add(
                     kernel_hal::timer::timer_now()
@@ -638,7 +651,7 @@ impl DrmDev {
                         kernel_hal::timer::timer_now()
                             .saturating_sub(waited_from)
                             .as_micros(),
-                        fences.len()
+                        fences.len() + deps.len()
                     );
                 }
                 return Ok(());
@@ -657,7 +670,7 @@ impl DrmDev {
                         "[drm] present fence: fb {} ({} fence(s)) did not land within {} us; \
                          presenting anyway (frame may tear){}",
                         fb_id,
-                        fences.len(),
+                        fences.len() + deps.len(),
                         PRESENT_FENCE_TIMEOUT_US,
                         if n + 1 == MAX_TIMEOUT_REPORTS {
                             " -- further present-fence timeouts will not be reported"

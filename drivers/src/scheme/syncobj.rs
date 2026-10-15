@@ -1949,6 +1949,61 @@ pub fn merge_fences(fences: &[(u32, u64)]) -> u32 {
     handle
 }
 
+/// A hardware fence outside the table, as a driver hands it to
+/// [`bundle_fence`]: the GPU has passed it once it has written `>= payload`
+/// into the u32 at `fence_va` (the same word [`attach_hw_fence`] takes).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HwFence {
+    /// Kernel VA of the fence landing zone.
+    pub fence_va: usize,
+    /// The same semaphore in the producer channel's GPU VA space, 0 if
+    /// unknown.
+    pub fence_gpu_va: u64,
+    pub payload: u32,
+    /// The channel the fence was issued on.
+    pub ctx_idx: u32,
+}
+
+/// `DMA_BUF_IOCTL_EXPORT_SYNC_FILE`: one syncobj whose point 1 is reached
+/// once every hardware fence in `hw` has landed and every `(syncobj, point)`
+/// of `deps` is reached -- the `dma_fence_array` that
+/// `dma_resv_get_singleton` builds out of a buffer's reservation, for a
+/// `sync_file` to carry. `hw` is what the driver says is still queued on the
+/// buffer ([`crate::scheme::drm::DrmScheme::queued_fences`]); `deps` what
+/// userspace imported onto it ([`crate::scheme::resv::fences`]). Signaled at
+/// once when both are empty, or already past.
+///
+/// Each hardware fence gets a binary syncobj of its own, attached and then
+/// destroyed: one in flight stays in the table as an orphan for as long as
+/// the merge names it ([`destroy`]'s orphan rule), so nothing has to own it,
+/// and one that has landed already is simply not a dependency. The one
+/// reference of the merged object is the caller's to `destroy`.
+pub fn bundle_fence(hw: &[HwFence], deps: &[(u32, u64)]) -> u32 {
+    let mut sources: Vec<(u32, u64)> = Vec::with_capacity(hw.len() + deps.len());
+    let mut own: Vec<u32> = Vec::with_capacity(hw.len());
+    for f in hw {
+        let carrier = create(false);
+        // The handle is fresh: this cannot fail.
+        attach_hw_fence(
+            carrier,
+            1,
+            f.fence_va,
+            f.fence_gpu_va,
+            f.payload,
+            f.ctx_idx,
+            true,
+        );
+        own.push(carrier);
+        sources.push((carrier, 1));
+    }
+    sources.extend_from_slice(deps);
+    let merged = merge_fences(&sources);
+    for carrier in own {
+        destroy(carrier);
+    }
+    merged
+}
+
 /// Resets a syncobj to point 0 (`SYNCOBJ_RESET`). Returns `false` if
 /// `handle` is unknown. Drops any pending hardware fence it carried (the
 /// fence is replaced, as in Linux).
@@ -5190,6 +5245,72 @@ mod tests {
         }
         assert!(destroy_for(4242, mine));
         assert!(destroy_for(4343, theirs));
+    }
+    /// [`bundle_fence`] is the `dma_fence_array` of an
+    /// `EXPORT_SYNC_FILE`: signaled at once with nothing to wait for, and
+    /// otherwise only once every hardware fence has landed and every
+    /// imported fence is reached, in any order. The per-fence carriers are
+    /// nobody's: they live as orphans while the merge names them and go
+    /// once it is done with them.
+    #[test]
+    fn a_bundle_is_reached_once_every_hardware_fence_and_every_import_is() {
+        let _g = test_lock();
+        arm_hooks();
+        assert_eq!(
+            query(bundle_fence(&[], &[])),
+            Some(1),
+            "nothing to wait for"
+        );
+        let mut first = Landing::new();
+        let mut second = Landing::new();
+        let landed = Landing::new();
+        let import = create(false);
+        let hw = |l: &Landing, payload: u32, ctx_idx: u32| HwFence {
+            fence_va: l.va(),
+            fence_gpu_va: 0,
+            payload,
+            ctx_idx,
+        };
+        // A fence that has landed already is not a dependency.
+        let past = bundle_fence(&[hw(&landed, 0, 0)], &[]);
+        assert_eq!(query(past), Some(1));
+        let objects_before = TABLE.lock().objects.len();
+        let b = bundle_fence(&[hw(&first, 1, 1), hw(&second, 7, 2)], &[(import, 1)]);
+        assert_eq!(query(b), Some(0));
+        assert_eq!(
+            TABLE.lock().objects.len(),
+            objects_before + 3,
+            "the merge and its two orphaned carriers"
+        );
+        assert_eq!(pending_now(), 2, "both hardware fences in flight");
+        // The second ring passes first, then the first, then the import:
+        // the order does not matter and nothing is reached early.
+        second.land(7);
+        assert_eq!(query(b), Some(0), "one ring still busy");
+        first.land(1);
+        assert_eq!(query(b), Some(0), "both rings passed, the import has not");
+        assert!(signal(import));
+        assert_eq!(query(b), Some(1));
+        assert_eq!(pending_now(), 0);
+        assert_eq!(
+            TABLE.lock().objects.len(),
+            objects_before + 1,
+            "the carriers were collected; only the merge is left"
+        );
+        // And the other order, on a bundle of its own: the import reached
+        // while the ring has not passed its fence.
+        let mut third = Landing::new();
+        let import2 = create(false);
+        let b2 = bundle_fence(&[hw(&third, 1, 3)], &[(import2, 1)]);
+        assert!(signal(import2));
+        assert_eq!(query(b2), Some(0), "the ring has not passed");
+        third.land(1);
+        assert_eq!(query(b2), Some(1));
+        destroy(b2);
+        destroy(import2);
+        destroy(b);
+        destroy(past);
+        destroy(import);
     }
 }
 

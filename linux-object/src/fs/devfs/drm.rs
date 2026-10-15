@@ -1642,6 +1642,40 @@ pub fn cpu_prep_fences(gem_handle: u32, owner_pid: u64) -> Vec<(usize, u32)> {
         .collect()
 }
 
+/// The GPU work still queued on `gem_handle`, from every registered driver
+/// (`DrmScheme::queued_fences`, the same fan-out as
+/// [`scanout_render_fence`] and for the same two-GPU reason): what
+/// `DMA_BUF_IOCTL_EXPORT_SYNC_FILE` puts in the `sync_file` beside the
+/// fences userspace imported. A dumb buffer, or a handle no driver knows,
+/// has none.
+pub fn queued_fences(gem_handle: u32) -> Vec<zcore_drivers::scheme::syncobj::HwFence> {
+    let drivers = DRM_STATE.lock().drivers.clone();
+    drivers
+        .iter()
+        .flat_map(|d| d.queued_fences(gem_handle))
+        .collect()
+}
+
+/// The fences userspace imported onto the buffer behind `fb_id`
+/// (`DMA_BUF_IOCTL_IMPORT_SYNC_FILE`) that a scanout of it has to wait for:
+/// the writes, as `drm_gem_plane_helper_prepare_fb` takes
+/// `dma_resv_get_singleton(resv, DMA_RESV_USAGE_WRITE)`. Each as `(syncobj,
+/// point)`; empty for an unknown framebuffer or a buffer nobody fenced.
+/// Not behind [`flip_fence_enabled`]: that hatch is about the driver's own
+/// ring probes, and these are fences a client asked for by name.
+pub fn scanout_resv_fences(fb_id: u32) -> Vec<(u32, u64)> {
+    let phys = DRM_STATE
+        .lock()
+        .framebuffers
+        .iter()
+        .find(|f| f.id == fb_id)
+        .map(|f| f.phys_addr);
+    match phys {
+        Some(phys) => zcore_drivers::scheme::resv::fences(phys, false),
+        None => Vec::new(),
+    }
+}
+
 /// Per-open DRM file state (Linux `struct drm_file`).
 ///
 /// `ATOMIC_CLIENT` and the readable event queue belong to the fd that

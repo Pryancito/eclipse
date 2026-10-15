@@ -266,6 +266,21 @@ pub trait DrmScheme: Scheme {
         Vec::new()
     }
 
+    /// The GPU work that may still be reading or writing `gem_handle`, as
+    /// hardware fences a `sync_file` can carry: what
+    /// `DMA_BUF_IOCTL_EXPORT_SYNC_FILE` hands a client that is about to use
+    /// the buffer and has to wait for its other users first (an X server
+    /// about to copy a window, Mesa's WSI before it renders into a
+    /// swapchain image again). Linux reads them off the buffer's
+    /// reservation object; the nouveau `EXEC` carries no buffer list, so the
+    /// same conservative answer as [`Self::render_fence_for_scanout`] and
+    /// `GEM_CPU_PREP`: the idle probe of every ring whose owner holds or
+    /// maps the buffer. Empty when the driver does not know the handle or
+    /// nothing is queued. Default: none.
+    fn queued_fences(&self, _gem_handle: u32) -> alloc::vec::Vec<crate::scheme::syncobj::HwFence> {
+        alloc::vec::Vec::new()
+    }
+
     /// Retrieve the raw 128-byte EDID for a connector, if available.
     fn get_connector_edid(&self, _id: u32) -> Option<[u8; 128]> {
         None
