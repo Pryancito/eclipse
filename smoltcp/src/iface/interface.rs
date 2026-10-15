@@ -1874,6 +1874,23 @@ impl<'a> InterfaceInner<'a> {
             return Ok(*addr);
         }
 
+        // 127.0.0.0/8 and `::1` name this host (RFC 1122 section 3.2.1.3), so
+        // a packet addressed there must never go out on a link -- not even to
+        // the default gateway, which is what the lookup below would otherwise
+        // return for it. The interface that *owns* the loopback network
+        // answered above, in `in_same_network`.
+        //
+        // This matters here and not only in theory: zCore drives one socket
+        // set from every interface in turn (`poll_ifaces`), real NICs first
+        // and the loopback last. Without this an Ethernet interface with a
+        // default route takes a loopback socket's segment, hands it to the
+        // gateway and marks the segment sent; the loopback interface, polled
+        // right after, finds nothing left to send, and every connection to
+        // 127.0.0.1 hangs for as long as the machine has a default route.
+        if addr.is_loopback() {
+            return Err(Error::Unaddressable);
+        }
+
         // Route via a router.
         match self.routes.lookup(addr, timestamp) {
             Some(router_addr) => Ok(router_addr),
@@ -2111,9 +2128,103 @@ mod test {
     use crate::iface::NeighborCache;
     use crate::phy::{ChecksumCapabilities, Loopback};
     use crate::socket::SocketSet;
-    #[cfg(feature = "proto-igmp")]
     use crate::time::Instant;
     use crate::{Error, Result};
+
+    /// A loopback destination never leaves the host, whatever the routing
+    /// table says.
+    ///
+    /// RFC 1122 section 3.2.1.3 requires it, and a stack that drives one
+    /// socket set from several interfaces needs it to be true per interface:
+    /// the first interface asked to route a 127.0.0.1 segment must refuse it,
+    /// so the one that owns 127.0.0.0/8 still gets its turn.
+    #[cfg(all(feature = "medium-ethernet", feature = "proto-ipv4"))]
+    #[test]
+    fn a_loopback_destination_is_never_routed_off_an_interface_that_is_not_the_loopback() {
+        let now = Instant::from_millis(0);
+        let mut routes = Routes::new(BTreeMap::new());
+        routes
+            .add_default_ipv4_route(Ipv4Address::new(10, 0, 2, 2))
+            .unwrap();
+        // A v6 default route too, so `::1` is refused on its own account and
+        // not merely because the table had nothing to offer it.
+        #[cfg(feature = "proto-ipv6")]
+        routes
+            .add_default_ipv6_route(Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 2))
+            .unwrap();
+        let iface = InterfaceBuilder::new(Loopback::new(Medium::Ethernet))
+            .ethernet_addr(EthernetAddress([2, 0, 0, 0, 0, 1]))
+            .neighbor_cache(NeighborCache::new(BTreeMap::new()))
+            .ip_addrs([
+                IpCidr::new(IpAddress::v4(10, 0, 2, 15), 24),
+                #[cfg(feature = "proto-ipv6")]
+                IpCidr::new(IpAddress::v6(0xfe80, 0, 0, 0, 0, 0, 0, 1), 64),
+            ])
+            .routes(routes)
+            .finalize();
+
+        assert_eq!(
+            iface.inner.route(&IpAddress::v4(127, 0, 0, 1), now),
+            Err(Error::Unaddressable),
+            "the default route must not swallow 127.0.0.1"
+        );
+        #[cfg(feature = "proto-ipv6")]
+        assert_eq!(
+            iface.inner.route(&IpAddress::v6(0, 0, 0, 0, 0, 0, 0, 1), now),
+            Err(Error::Unaddressable),
+            "nor ::1, which the v6 default route would otherwise claim"
+        );
+        #[cfg(feature = "proto-ipv6")]
+        assert_eq!(
+            iface
+                .inner
+                .route(&IpAddress::v6(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1), now),
+            Ok(IpAddress::v6(0xfe80, 0, 0, 0, 0, 0, 0, 2)),
+            "and that v6 default route still works for everything else"
+        );
+        assert_eq!(
+            iface.inner.route(&IpAddress::v4(93, 184, 216, 34), now),
+            Ok(IpAddress::v4(10, 0, 2, 2)),
+            "every other off-link address still goes to the gateway"
+        );
+        assert_eq!(
+            iface.inner.route(&IpAddress::v4(10, 0, 2, 7), now),
+            Ok(IpAddress::v4(10, 0, 2, 7)),
+            "and its own subnet is still direct"
+        );
+    }
+
+    /// The interface that owns 127.0.0.0/8 routes the whole range directly --
+    /// 127.0.0.1 and any other address in it, which is what `lo` does on
+    /// Linux. The refusal above must not reach it.
+    #[cfg(all(feature = "medium-ip", feature = "proto-ipv4"))]
+    #[test]
+    fn the_loopback_interface_still_routes_its_own_network_directly() {
+        let now = Instant::from_millis(0);
+        let iface = InterfaceBuilder::new(Loopback::new(Medium::Ip))
+            .ip_addrs([
+                IpCidr::new(IpAddress::v4(127, 0, 0, 1), 8),
+                #[cfg(feature = "proto-ipv6")]
+                IpCidr::new(IpAddress::v6(0, 0, 0, 0, 0, 0, 0, 1), 128),
+            ])
+            .routes(Routes::new(BTreeMap::new()))
+            .finalize();
+
+        assert_eq!(
+            iface.inner.route(&IpAddress::v4(127, 0, 0, 1), now),
+            Ok(IpAddress::v4(127, 0, 0, 1))
+        );
+        assert_eq!(
+            iface.inner.route(&IpAddress::v4(127, 0, 0, 53), now),
+            Ok(IpAddress::v4(127, 0, 0, 53)),
+            "the whole /8 is this host, not just .1"
+        );
+        #[cfg(feature = "proto-ipv6")]
+        assert_eq!(
+            iface.inner.route(&IpAddress::v6(0, 0, 0, 0, 0, 0, 0, 1), now),
+            Ok(IpAddress::v6(0, 0, 0, 0, 0, 0, 0, 1))
+        );
+    }
 
     #[allow(unused)]
     fn fill_slice(s: &mut [u8], val: u8) {

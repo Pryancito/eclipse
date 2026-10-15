@@ -155,6 +155,21 @@ impl Address {
         }
     }
 
+    /// Query whether the address names the local host (127.0.0.0/8, or `::1`).
+    ///
+    /// RFC 1122 section 3.2.1.3 calls this the "internal host loopback
+    /// address": a datagram addressed there must never leave the host, and a
+    /// host must never forward one it receives on a real link.
+    pub fn is_loopback(&self) -> bool {
+        match *self {
+            Address::Unspecified => false,
+            #[cfg(feature = "proto-ipv4")]
+            Address::Ipv4(addr) => addr.is_loopback(),
+            #[cfg(feature = "proto-ipv6")]
+            Address::Ipv6(addr) => addr.is_loopback(),
+        }
+    }
+
     /// Query whether the address falls into the "unspecified" range.
     pub fn is_unspecified(&self) -> bool {
         match *self {

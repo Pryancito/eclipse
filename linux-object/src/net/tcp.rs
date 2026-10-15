@@ -1612,10 +1612,11 @@ mod port_tests {
 
     use super::*;
     use alloc::collections::BTreeMap;
-    use smoltcp::iface::{Interface, InterfaceBuilder, Routes};
+    use smoltcp::iface::{Interface, InterfaceBuilder, NeighborCache, Routes};
     use smoltcp::phy::{Loopback, Medium};
     use smoltcp::time::Instant;
     use smoltcp::wire::IpCidr;
+    use zcore_drivers::scheme::NetStats;
 
     use crate::net::NET_TEST_LOCK as LOCK;
 
@@ -1666,6 +1667,31 @@ mod port_tests {
             .ip_addrs([IpCidr::new(IpAddress::v4(127, 0, 0, 1), 8)])
             .routes(Routes::new(BTreeMap::new()))
             .finalize()
+    }
+
+    /// An Ethernet interface with its own subnet and a default gateway, the
+    /// shape every real NIC has once DHCP has run.
+    ///
+    /// Built on the driver's own `LoopbackDevice` rather than smoltcp's, for
+    /// its `tx_packets` counter: what the tests below need to know is whether
+    /// anything was put on the wire, and that counter is the only honest
+    /// answer -- a socket's state can look right for the wrong reason.
+    fn ethernet_with_default_route(
+        stats: Arc<Mutex<NetStats>>,
+    ) -> Interface<'static, zcore_drivers::net::LoopbackDevice> {
+        let mut routes = Routes::new(BTreeMap::new());
+        routes
+            .add_default_ipv4_route(Ipv4Address::new(10, 0, 2, 2))
+            .unwrap();
+        InterfaceBuilder::new(zcore_drivers::net::LoopbackDevice::new(
+            Medium::Ethernet,
+            stats,
+        ))
+        .ethernet_addr(smoltcp::wire::EthernetAddress([2, 0, 0, 0, 0, 1]))
+        .neighbor_cache(NeighborCache::new(BTreeMap::new()))
+        .ip_addrs([IpCidr::new(IpAddress::v4(10, 0, 2, 15), 24)])
+        .routes(routes)
+        .finalize()
     }
 
     /// Move whatever is queued through the loopback.
@@ -1930,6 +1956,82 @@ mod port_tests {
             Socket::bind(&strict, lo(port)),
             Err(LxError::EADDRINUSE),
             "without it the established child still holds the port"
+        );
+    }
+
+    /// A loopback segment must never be handed to a real NIC.
+    ///
+    /// zCore drives ONE smoltcp socket set from every interface in turn
+    /// (`poll_ifaces`), real NICs first and the loopback last. An Ethernet
+    /// interface with a default route used to accept a segment addressed to
+    /// 127.0.0.1, resolve the gateway for it and mark it sent; the loopback
+    /// interface, polled right after, found nothing left to send. The effect
+    /// on a real machine was that every connection to a server on 127.0.0.1
+    /// hung for as long as the box had a default route -- which is to say,
+    /// whenever it had working networking. `ollama` was the report: its CLI
+    /// could not reach its own daemon.
+    #[test]
+    fn a_nic_with_a_default_route_does_not_take_a_loopback_segment() {
+        let _g = LOCK.lock();
+        let mut lo_if = loopback();
+        let stats = Arc::new(Mutex::new(NetStats::default()));
+        let mut nic = ethernet_with_default_route(stats.clone());
+
+        let server = sock();
+        assert_eq!(Socket::bind(&server, lo(41077)), Ok(0));
+        assert_eq!(Socket::listen(&server), Ok(0));
+        let client = sock();
+        assert_eq!(connect(&client, lo(41077)), Err(LxError::EINPROGRESS));
+
+        // The NIC goes first, exactly as `get_net_device` orders them.
+        {
+            let sets = get_sockets();
+            let mut sets = sets.lock();
+            for ms in 0..16 {
+                let _ = nic.poll(&mut sets, Instant::from_millis(ms));
+                let _ = lo_if.poll(&mut sets, Instant::from_millis(ms));
+            }
+        }
+        assert_eq!(
+            state_of(&client),
+            TcpState::Established,
+            "the NIC took the segment and 127.0.0.1 never heard the SYN"
+        );
+        // Nothing left the NIC. The socket state alone would not say so: the
+        // loopback could have carried a retransmission after the NIC ate the
+        // first segment, and the test would still pass.
+        assert_eq!(
+            stats.lock().tx_packets,
+            0,
+            "a segment for 127.0.0.1 was put on the wire"
+        );
+    }
+
+    /// The same NIC still routes an off-host address through its gateway, so
+    /// the guard above refuses loopback and nothing else.
+    #[test]
+    fn the_same_nic_still_routes_an_address_that_is_not_this_host() {
+        let _g = LOCK.lock();
+        let stats = Arc::new(Mutex::new(NetStats::default()));
+        let mut nic = ethernet_with_default_route(stats.clone());
+        let client = sock();
+        assert_eq!(
+            connect(
+                &client,
+                Endpoint::Ip(ep(IpAddress::v4(93, 184, 216, 34), 80))
+            ),
+            Err(LxError::EINPROGRESS)
+        );
+        {
+            let sets = get_sockets();
+            let mut sets = sets.lock();
+            for ms in 0..4 {
+                let _ = nic.poll(&mut sets, Instant::from_millis(ms));
+            }
+        }
+        assert!(
+            stats.lock().tx_packets > 0,
+            "the NIC should have ARPed for its gateway"
         );
     }
 
