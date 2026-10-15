@@ -708,3 +708,64 @@ fn every_syncobj_ioctl_refuses_the_flags_and_padding_linux_refuses() {
     destroy(&c, s);
     destroy(&c, t);
 }
+
+/// The sleep the syscall runs ahead of the arm (`syncobj_wait_sleep`)
+/// makes the same refusal: without WAIT_FOR_SUBMIT or WAIT_AVAILABLE, a
+/// handle with no fence is not parked on, so the arm's EINVAL comes at
+/// once and not after the deadline (and a fence signaled during that
+/// park cannot turn the refusal into a success). With WAIT_FOR_SUBMIT
+/// the same request does park, to the deadline.
+#[test]
+fn the_sleep_ahead_of_the_arm_does_not_park_on_a_handle_without_a_fence() {
+    use core::time::Duration;
+    let _serialised = drm::test_globals::lock();
+    let _hook = crate::fs::syncobj_eventfd::hardware_fence_tests::TEST_SERIAL.lock();
+    let _on = NouveauOn::new();
+    let c = Client::open(0);
+    let fresh = create(&c, false);
+    let handles = [fresh];
+    let sleep = |flags: u32, deadline: Duration| {
+        let now = kernel_hal::timer::timer_now();
+        let req = DrmSyncobjWait {
+            handles: handles.as_ptr() as u64,
+            timeout_nsec: (now + deadline).as_nanos() as i64,
+            count_handles: 1,
+            flags,
+            first_signaled: 0,
+            pad: 0,
+        };
+        async_std::task::block_on(c.dev().syncobj_wait_sleep(
+            DRM_IOCTL_SYNCOBJ_WAIT,
+            &req as *const DrmSyncobjWait as usize,
+        ))
+        .expect("the sleeper");
+        kernel_hal::timer::timer_now() - now
+    };
+    assert!(
+        sleep(0, Duration::from_millis(400)) < Duration::from_millis(200),
+        "EINVAL is not slept on"
+    );
+    assert!(
+        sleep(
+            DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT,
+            Duration::from_millis(60)
+        ) >= Duration::from_millis(50),
+        "waiting for the submit parks to the deadline"
+    );
+    // The arm agrees, with the same future deadline.
+    let now = kernel_hal::timer::timer_now();
+    let mut req = DrmSyncobjWait {
+        handles: handles.as_ptr() as u64,
+        timeout_nsec: (now + Duration::from_millis(400)).as_nanos() as i64,
+        count_handles: 1,
+        flags: 0,
+        first_signaled: 0,
+        pad: 0,
+    };
+    assert_eq!(
+        c.ioctl(DRM_IOCTL_SYNCOBJ_WAIT, &mut req),
+        Err(FsError::InvalidParam)
+    );
+    assert!(kernel_hal::timer::timer_now() - now < Duration::from_millis(200));
+    destroy(&c, fresh);
+}
