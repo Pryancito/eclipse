@@ -1,4 +1,5 @@
 pub mod blockdev;
+pub mod blockhotplug;
 pub mod drm;
 pub mod drm_scheme;
 pub mod drm_trail;

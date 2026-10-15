@@ -1441,27 +1441,14 @@ pub fn create_root_fs(rootfs: Arc<dyn FileSystem>) -> Arc<dyn INode> {
     );
     for (i, block) in blocks.iter().enumerate() {
         let name = block.name();
-        let fname = if name.starts_with("nvme") {
-            let nvme_idx = blocks[..i]
-                .iter()
-                .filter(|b| b.name().starts_with("nvme"))
-                .count();
-            format!("nvme{}n1", nvme_idx)
-        } else if name.starts_with("virtio") {
-            let virtio_idx = blocks[..i]
-                .iter()
-                .filter(|b| b.name().starts_with("virtio"))
-                .count();
-            let name_char = (b'a' + (virtio_idx % 26) as u8) as char;
-            format!("vd{}", name_char)
-        } else {
-            let other_idx = blocks[..i]
-                .iter()
-                .filter(|b| !b.name().starts_with("nvme") && !b.name().starts_with("virtio"))
-                .count();
-            let name_char = (b'a' + (other_idx % 26) as u8) as char;
-            format!("sd{}", name_char)
-        };
+        // Un solo sitio decide el nombre, compartido con `/sys/block` y con el
+        // camino de hotplug: tres copias de esta cuenta habían empezado a decir
+        // cosas distintas a partir de 26 discos.
+        let names_before: Vec<&str> = blocks[..i].iter().map(|b| b.name()).collect();
+        let fname = devfs::blockdev::disk_node_name(&names_before, name);
+        // Que el hotplug sepa que esta letra está cogida, y no se la dé luego a
+        // un pendrive por encima de este disco.
+        devfs::blockhotplug::note_boot_disk(&fname);
 
         // Use i * 16 as the base index for minor numbers to leave room for partitions
         let base_index = i * 16;
@@ -1487,11 +1474,7 @@ pub fn create_root_fs(rootfs: Arc<dyn FileSystem>) -> Arc<dyn INode> {
         );
         for (part_idx, &(start_block, block_count)) in partitions.iter().enumerate() {
             let part_num = part_idx + 1;
-            let part_name = if fname.starts_with("nvme") {
-                format!("{}p{}", fname, part_num)
-            } else {
-                format!("{}{}", fname, part_num)
-            };
+            let part_name = devfs::blockdev::partition_node_name(&fname, part_num);
             let partition_driver = Arc::new(devfs::blockdev::PartitionBlock::new(
                 block.clone(),
                 format!("{}-part{}", name, part_num),
@@ -1517,6 +1500,14 @@ pub fn create_root_fs(rootfs: Arc<dyn FileSystem>) -> Arc<dyn INode> {
             }
         }
     }
+
+    // A partir de aquí, un disco que llegue se entera `/dev`. Se engancha
+    // después del recorrido de arriba a propósito: los nodos de los discos que
+    // ya estaban puestos existen, así que ninguno se anuncia dos veces y el
+    // primer aviso que llegue es de verdad una novedad. Un pendrive enchufado
+    // antes de este punto queda dado de alta en `kernel-hal` y sin nodo, que
+    // es el agujero que esto cierra.
+    devfs::blockhotplug::install();
 
     // Decide the real root filesystem: pivot from the boot medium onto an
     // installed btrfs/ext2 ROOT partition when one is available, otherwise
@@ -3403,11 +3394,7 @@ pub fn rescan_partitions(
     if let Some(devfs_root) = DEVFS_ROOT.lock().as_ref() {
         // First, remove existing partition nodes (e.g. sda1..=sda15)
         for part_num in 1..=15 {
-            let part_name = if fname.starts_with("nvme") {
-                format!("{}p{}", fname, part_num)
-            } else {
-                format!("{}{}", fname, part_num)
-            };
+            let part_name = devfs::blockdev::partition_node_name(fname, part_num);
             let _ = devfs_root.remove(&part_name);
         }
 
@@ -3415,11 +3402,7 @@ pub fn rescan_partitions(
         let partitions = devfs::blockdev::scan_partitions(block);
         for (part_idx, &(start_block, block_count)) in partitions.iter().enumerate() {
             let part_num = part_idx + 1;
-            let part_name = if fname.starts_with("nvme") {
-                format!("{}p{}", fname, part_num)
-            } else {
-                format!("{}{}", fname, part_num)
-            };
+            let part_name = devfs::blockdev::partition_node_name(fname, part_num);
             let partition_driver = Arc::new(devfs::blockdev::PartitionBlock::new(
                 block.clone(),
                 format!("{}-part{}", fname, part_num),

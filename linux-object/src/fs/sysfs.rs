@@ -164,48 +164,18 @@ fn dir_metadata(inode: usize) -> Metadata {
 /// `/sys/block/sda/size`, a partition table, a mount -- landed on disk zero.
 /// Twenty-seven disks is a lot for a desk and nothing for the kind of box
 /// that gets an HBA.
-fn disk_suffix(mut index: usize) -> String {
-    let mut out = [0u8; 8];
-    let mut at = out.len();
-    loop {
-        at -= 1;
-        out[at] = b'a' + (index % 26) as u8;
-        match (index / 26).checked_sub(1) {
-            Some(next) => index = next,
-            None => break,
-        }
-        if at == 0 {
-            break;
-        }
-    }
-    String::from_utf8_lossy(&out[at..]).into_owned()
-}
-
 fn list_block_devices() -> Vec<String> {
+    // El nombre lo decide `devfs::blockdev`, no esta función: era la otra copia
+    // de la misma cuenta, y las dos habían dejado de coincidir a partir de 26
+    // discos (`/dev` volvía a `sda`, aquí seguía a `aa`).
     let blocks = drivers::all_block().as_vec();
     let mut names = Vec::new();
     for (i, block) in blocks.iter().enumerate() {
-        let name = block.name();
-        let fname = if name.starts_with("nvme") {
-            let nvme_idx = blocks[..i]
-                .iter()
-                .filter(|b| b.name().starts_with("nvme"))
-                .count();
-            format!("nvme{}n1", nvme_idx)
-        } else if name.starts_with("virtio") {
-            let virtio_idx = blocks[..i]
-                .iter()
-                .filter(|b| b.name().starts_with("virtio"))
-                .count();
-            format!("vd{}", disk_suffix(virtio_idx))
-        } else {
-            let other_idx = blocks[..i]
-                .iter()
-                .filter(|b| !b.name().starts_with("nvme") && !b.name().starts_with("virtio"))
-                .count();
-            format!("sd{}", disk_suffix(other_idx))
-        };
-        names.push(fname);
+        let before: Vec<&str> = blocks[..i].iter().map(|b| b.name()).collect();
+        names.push(crate::fs::devfs::blockdev::disk_node_name(
+            &before,
+            block.name(),
+        ));
     }
     names
 }
