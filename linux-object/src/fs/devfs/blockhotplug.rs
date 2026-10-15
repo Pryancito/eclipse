@@ -34,7 +34,9 @@ use kernel_hal::sync::Mutex;
 use lazy_static::lazy_static;
 use zcore_drivers::scheme::BlockScheme;
 
-use super::blockdev::{disk_node_name, partition_node_name, BlockDev};
+use super::blockdev::{
+    disk_node_name, partition_node_name, BlockDev, MAX_PARTITIONS, MINORS_PER_DISK,
+};
 
 lazy_static! {
     /// Discos por atender: `true` si llegó, `false` si se fue.
@@ -76,9 +78,12 @@ const PENDING_CAP: usize = 32;
 /// se le dio y su índice base de minor.
 type HotDisk = (Arc<dyn BlockScheme>, String, usize);
 
-/// Cuántas particiones se barren al dar de baja un disco. Es el mismo tope
-/// que usa `rescan_partitions` al crearlas, y el de Linux para un disco MBR.
-const MAX_PARTS: usize = 15;
+/// Cuántas particiones se barren al dar de baja un disco.
+///
+/// Es el mismo tope con el que se crean, y por eso viene de `blockdev` en vez
+/// de estar escrito aquí: un barrido más corto que la creación deja nodos
+/// colgando de un disco que ya no está.
+const MAX_PARTS: usize = MAX_PARTITIONS;
 
 /// Coge la primera ranura libre para `name`, o la que ya tenía. Devuelve su
 /// número, que es de donde sale el minor.
@@ -111,15 +116,69 @@ fn release_slot(slots: &mut [Option<String>], name: &str) {
     }
 }
 
+/// Apunta un disco en el registro de identidades. Devuelve `false` si ya
+/// estaba, sin tocar nada.
+///
+/// Aparte y sobre un vector cualquiera por lo mismo que [`claim_slot`]: el de
+/// verdad es un `static` compartido, y un test que lo tocara estorbaría a los
+/// que corren a su lado.
+fn record_disk(
+    created: &mut Vec<HotDisk>,
+    block: &Arc<dyn BlockScheme>,
+    name: &str,
+    base_index: usize,
+) -> bool {
+    if created.iter().any(|(b, _, _)| Arc::ptr_eq(b, block)) {
+        return false;
+    }
+    created.push((block.clone(), name.to_string(), base_index));
+    true
+}
+
+/// El nombre que se le dio a este disco, buscándolo por identidad.
+///
+/// Por el puntero del `Arc` y no por el nombre del driver: dos pendrives del
+/// mismo modelo lo repiten.
+fn name_of(created: &[HotDisk], block: &Arc<dyn BlockScheme>) -> Option<String> {
+    created
+        .iter()
+        .find(|(b, _, _)| Arc::ptr_eq(b, block))
+        .map(|(_, n, _)| n.clone())
+}
+
+/// Saca a este disco del registro y devuelve lo que se apuntó de él.
+fn take_disk(created: &mut Vec<HotDisk>, block: &Arc<dyn BlockScheme>) -> Option<HotDisk> {
+    let pos = created.iter().position(|(b, _, _)| Arc::ptr_eq(b, block))?;
+    Some(created.remove(pos))
+}
+
 /// Los nombres ocupados ahora mismo.
 fn occupied(slots: &[Option<String>]) -> Vec<&str> {
     slots.iter().filter_map(|s| s.as_deref()).collect()
 }
 
-/// Apunta el nombre que creó el recorrido del arranque, para no dárselo luego
-/// a un disco en caliente.
-pub fn note_boot_disk(name: &str) {
+/// Apunta un disco que ya estaba puesto al arrancar: su nombre, para no
+/// dárselo luego a un disco en caliente, y su identidad, para poder quitarle
+/// los nodos si se va.
+///
+/// Las dos mitades hacen falta. Con sólo el nombre, desenchufar un pendrive
+/// que estuviera puesto al encender no borraba nada: `remove_nodes` busca por
+/// identidad en [`CREATED`], no lo encontraba y se volvía sin tocar `/dev`,
+/// dejando los nodos puestos, la ranura cogida y al mismo pendrive otra letra
+/// al volver a enchufarlo.
+pub fn note_boot_disk(name: &str, block: &Arc<dyn BlockScheme>, base_index: usize) {
     claim_slot(&mut SLOTS.lock(), name);
+    record_disk(&mut CREATED.lock(), block, name, base_index);
+}
+
+/// El nombre con el que se dio de alta este disco, si fue este módulo quien
+/// lo nombró.
+///
+/// Lo usa `/sys/block`, que hasta ahora derivaba el nombre de la posición en
+/// `all_block()`: esa lista se compacta al desenchufar, así que después de un
+/// enchufe y un desenchufe decía un nombre y `/dev` otro, para el mismo disco.
+pub fn recorded_name(block: &Arc<dyn BlockScheme>) -> Option<String> {
+    name_of(&CREATED.lock(), block)
 }
 
 /// El nombre libre que le toca a un disco, por la convención de Linux.
@@ -176,11 +235,7 @@ fn observe(block: &Arc<dyn BlockScheme>, arrived: bool) {
 ///
 /// Hace E/S: sólo desde la tarea.
 fn add_nodes(block: Arc<dyn BlockScheme>) {
-    if CREATED
-        .lock()
-        .iter()
-        .any(|(b, _, _)| Arc::ptr_eq(b, &block))
-    {
+    if name_of(&CREATED.lock(), &block).is_some() {
         // Dos avisos de alta del mismo disco sin baja por medio. No es un
         // error --un sondeo puede repetirse-- pero crear el nodo dos veces sí.
         return;
@@ -191,9 +246,10 @@ fn add_nodes(block: Arc<dyn BlockScheme>) {
         let slot = claim_slot(&mut slots, &n);
         (n, slot)
     };
-    // Un hueco de 16 minors por ranura, como en el arranque, para que caben
-    // las 15 particiones.
-    let base_index = slot * 16;
+    // El mismo hueco por ranura que en el arranque, para que caban las
+    // particiones. La relación entre los dos números se comprueba al compilar,
+    // donde están declarados.
+    let base_index = slot * MINORS_PER_DISK;
 
     // El `Arc` se saca del cerrojo antes de tocar devfs: `lookup_virtual_fs`
     // coge este mismo cerrojo en cada acceso a `/dev`, y no hay razón para
@@ -211,9 +267,12 @@ fn add_nodes(block: Arc<dyn BlockScheme>) {
         return;
     }
     warn!("[hotplug] /dev/{} dado de alta ({})", name, block.name());
-    CREATED
-        .lock()
-        .push((block.clone(), name.clone(), base_index));
+    // El mismo registro que apunta el recorrido del arranque. `volume_members`
+    // busca los miembros de un volumen EclipseFS aquí y en ningún otro sitio,
+    // así que un volumen de varios discos enchufados en caliente no se montaba
+    // --faltaban dispositivos-- aunque sus nodos de `/dev` existieran.
+    crate::fs::eclipsefs_mount::register_block_device(&name, block.clone());
+    record_disk(&mut CREATED.lock(), &block, &name, base_index);
 
     // Y aquí la E/S: leer el MBR y la cabecera GPT. Lo que se monta de un
     // pendrive es casi siempre la partición, no el disco entero, así que sin
@@ -229,15 +288,10 @@ fn add_nodes(block: Arc<dyn BlockScheme>) {
 
 /// Quita los nodos de un disco que se fue, y deja libre su ranura.
 fn remove_nodes(block: &Arc<dyn BlockScheme>) {
-    let found = {
-        let mut created = CREATED.lock();
-        created
-            .iter()
-            .position(|(b, _, _)| Arc::ptr_eq(b, block))
-            .map(|pos| created.remove(pos))
-    };
+    let found = take_disk(&mut CREATED.lock(), block);
     let Some((_, name, _)) = found else {
-        // Un disco del arranque, o uno cuya alta nunca llegó a hacerse.
+        // Un disco cuya alta nunca llegó a hacerse. Los del arranque sí están
+        // aquí: los apunta `note_boot_disk`.
         return;
     };
     if let Some(root) = crate::fs::DEVFS_ROOT.lock().clone() {
@@ -245,13 +299,19 @@ fn remove_nodes(block: &Arc<dyn BlockScheme>) {
         // la entrada de la lista de dispositivos: nada nuevo puede abrirlas
         // mientras se retira el disco de debajo.
         for part_num in 1..=MAX_PARTS {
-            let _ = root.remove(&partition_node_name(&name, part_num));
+            let part_name = partition_node_name(&name, part_num);
+            let _ = root.remove(&part_name);
+            crate::fs::eclipsefs_mount::forget_block_device(&part_name);
         }
         match root.remove(&name) {
             Ok(()) => warn!("[hotplug] /dev/{} dado de baja", name),
             Err(e) => warn!("[hotplug] no se pudo quitar /dev/{}: {:?}", name, e),
         }
     }
+    // Y fuera del registro de EclipseFS, pase lo que pase con el nodo: el
+    // nombre vuelve a estar libre un momento después, y dejar aquí el driver
+    // del disco que se fue se lo daría al siguiente que lo use.
+    crate::fs::eclipsefs_mount::forget_block_device(&name);
     // La ranura se libera aunque el borrado falle: dejarla cogida gastaría una
     // letra y 16 minors por cada enchufe de la sesión.
     release_slot(&mut SLOTS.lock(), &name);
@@ -299,6 +359,18 @@ impl Future for BlockHotplugFuture {
 /// que ya estaban puestos existen: así un disco del arranque no se anuncia dos
 /// veces, y el primer aviso que llega es de verdad una novedad.
 pub fn install() {
+    // Los cuatro `static` se tocan aquí, desde contexto de tarea, antes de que
+    // `observe` pueda correr. Son `lazy_static`, o sea que la primera vez que
+    // se toca uno se construye, y la construcción se guarda con un cerrojo de
+    // giro. Dejar la primera para el aviso tiene dos finales malos: el `Vec`
+    // de la cola pediría su memoria en contexto de interrupción, y si la
+    // interrupción cayera encima de la tarea que está a medio construirlo, el
+    // aviso giraría esperando a quien acaba de interrumpir, en esa misma CPU,
+    // sin que nadie pueda acabar nunca.
+    drop(PENDING.lock());
+    drop(WAKER.lock());
+    drop(CREATED.lock());
+    drop(SLOTS.lock());
     kernel_hal::drivers::install_block_hotplug_observer(observe);
     kernel_hal::thread::spawn(BlockHotplugFuture);
 }
@@ -306,9 +378,81 @@ pub fn install() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use zcore_drivers::{scheme::Scheme, DeviceError, DeviceResult};
 
     fn slots(v: &[Option<&str>]) -> Vec<Option<String>> {
         v.iter().map(|x| x.map(|n| n.to_string())).collect()
+    }
+
+    /// Un disco de mentira, sólo para tener identidades distintas: lo que se
+    /// prueba aquí es el registro, que no lee ni escribe un sector.
+    struct Plug(&'static str);
+
+    impl Scheme for Plug {
+        fn name(&self) -> &str {
+            self.0
+        }
+    }
+
+    impl BlockScheme for Plug {
+        fn read_block(&self, _id: usize, _buf: &mut [u8]) -> DeviceResult {
+            Err(DeviceError::NotSupported)
+        }
+        fn write_block(&self, _id: usize, _buf: &[u8]) -> DeviceResult {
+            Err(DeviceError::NotSupported)
+        }
+        fn flush(&self) -> DeviceResult {
+            Ok(())
+        }
+        fn block_count(&self) -> usize {
+            0
+        }
+    }
+
+    fn plug(name: &'static str) -> Arc<dyn BlockScheme> {
+        Arc::new(Plug(name))
+    }
+
+    /// Lo que hacía que desenchufar un disco del arranque no borrara nada:
+    /// `note_boot_disk` apuntaba la letra y no el disco, así que la baja
+    /// buscaba por identidad y no encontraba a quién quitar.
+    #[test]
+    fn un_disco_apuntado_se_encuentra_por_identidad() {
+        let mut created = Vec::new();
+        let a = plug("usbdisk-1");
+        let b = plug("usbdisk-1");
+        assert!(record_disk(&mut created, &a, "sda", 0));
+        assert_eq!(name_of(&created, &a).as_deref(), Some("sda"));
+        // Mismo nombre de driver, otro disco: dos pendrives del mismo modelo.
+        assert_eq!(name_of(&created, &b), None);
+    }
+
+    #[test]
+    fn apuntar_dos_veces_el_mismo_disco_no_lo_duplica() {
+        let mut created = Vec::new();
+        let a = plug("usbdisk-1");
+        assert!(record_disk(&mut created, &a, "sda", 0));
+        assert!(!record_disk(&mut created, &a, "sdb", 16));
+        assert_eq!(created.len(), 1);
+        // Y se queda con el primer nombre, que es el que tiene nodo en `/dev`.
+        assert_eq!(name_of(&created, &a).as_deref(), Some("sda"));
+    }
+
+    /// La baja devuelve el nombre y el índice base con los que se dio de alta:
+    /// de ahí salen los nodos que hay que borrar.
+    #[test]
+    fn la_baja_devuelve_lo_que_se_apunto_en_el_alta() {
+        let mut created = Vec::new();
+        let a = plug("usbdisk-1");
+        let b = plug("usbdisk-2");
+        record_disk(&mut created, &a, "sda", 0);
+        record_disk(&mut created, &b, "sdb", 16);
+        let (_, name, base) = take_disk(&mut created, &b).expect("estaba apuntado");
+        assert_eq!(name, "sdb");
+        assert_eq!(base, 16);
+        // Y el otro sigue donde estaba.
+        assert_eq!(name_of(&created, &a).as_deref(), Some("sda"));
+        assert!(take_disk(&mut created, &b).is_none());
     }
 
     #[test]

@@ -1735,6 +1735,27 @@ pub fn disk_node_name(names_before: &[&str], own_name: &str) -> alloc::string::S
     }
 }
 
+/// Cuántas particiones de un disco llegan a tener nodo.
+///
+/// No es una preferencia: el minor de la partición `n` es `base + n`, y cada
+/// disco tiene reservado un hueco de dieciséis minors. La decimosexta
+/// partición caería sobre el minor base del disco siguiente, y el barrido que
+/// borra los nodos al desenchufar llega hasta aquí. `scan_partitions` sí sabe
+/// leer más (hasta 512 entradas GPT), así que el tope tiene que estar en un
+/// solo sitio y aplicarse igual al crear, al re-escanear y al borrar.
+pub const MAX_PARTITIONS: usize = 15;
+
+/// El hueco de minors que tiene reservado cada disco: su minor base es
+/// `ranura * MINORS_PER_DISK`, y el de su partición `n` es `base + n`.
+pub const MINORS_PER_DISK: usize = 16;
+
+// Las dos constantes de arriba son una sola decisión, así que se comprueban
+// juntas y al compilar: subir el número de particiones sin ensanchar el hueco
+// haría que la última cayera sobre el minor base del disco siguiente, y un
+// `/dev/sdb` y un `/dev/sda16` apuntando al mismo minor son el mismo
+// dispositivo para cualquier cosa que mire el `st_rdev`.
+const _: () = assert!(MAX_PARTITIONS < MINORS_PER_DISK);
+
 /// El nombre de la partición `n` (desde 1) de un disco ya nombrado.
 ///
 /// `nvme` mete una `p` por medio (`nvme0n1p1`); el resto pega el número

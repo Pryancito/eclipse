@@ -168,9 +168,23 @@ fn list_block_devices() -> Vec<String> {
     // El nombre lo decide `devfs::blockdev`, no esta función: era la otra copia
     // de la misma cuenta, y las dos habían dejado de coincidir a partir de 26
     // discos (`/dev` volvía a `sda`, aquí seguía a `aa`).
+    //
+    // Y compartir la fórmula no basta, porque lo que se le da de comer es
+    // distinto: aquí la posición en `all_block()`, que se compacta cuando un
+    // disco se desenchufa, y en `/dev` un nombre que se queda quieto mientras
+    // el disco esté. Con discos A, B y C puestos, quitando B y enchufando D,
+    // esta función decía que C era `sdb` cuando `/dev/sdb` era D. Quien casa
+    // los metadatos de `/sys/block` con un nodo de `/dev` --`lsblk`, un
+    // instalador, una regla de udev-- se llevaba el disco equivocado. Así que
+    // el nombre se pregunta por identidad a quien lo asignó, y la fórmula
+    // queda sólo para un disco que nadie apuntó.
     let blocks = drivers::all_block().as_vec();
     let mut names = Vec::new();
     for (i, block) in blocks.iter().enumerate() {
+        if let Some(name) = crate::fs::devfs::blockhotplug::recorded_name(block) {
+            names.push(name);
+            continue;
+        }
         let before: Vec<&str> = blocks[..i].iter().map(|b| b.name()).collect();
         names.push(crate::fs::devfs::blockdev::disk_node_name(
             &before,

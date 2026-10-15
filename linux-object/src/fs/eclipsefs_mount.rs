@@ -84,7 +84,11 @@ pub(crate) fn register_block_device(name: &str, block: Arc<dyn BlockScheme>) {
 }
 
 /// Forget a block device that went away.
-#[cfg(test)]
+///
+/// A hot-plugged disk leaves on its own, and the name it had goes back into
+/// circulation: leaving its entry here would hand the next disk to carry that
+/// name a driver for the one that is gone, and `volume_members` searches only
+/// this registry.
 pub(crate) fn forget_block_device(name: &str) {
     BLOCK_DEVICES.lock().retain(|(n, _)| n != name);
 }
