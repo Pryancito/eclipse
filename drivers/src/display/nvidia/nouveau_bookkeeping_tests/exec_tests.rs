@@ -181,3 +181,41 @@ fn an_exec_or_vm_bind_wait_on_a_point_nobody_submitted_is_einval_before_anything
     }
     gpu.nouveau_release_process(A);
 }
+
+/// `without_fence` resolves the pending list (a read of every in-flight
+/// fence's landing zone) under the table lock. Asked once per wait, a full
+/// EXEC paid one resolution per wait where one answers the whole list, and
+/// the answer (the first wait without a fence, in order) is the same.
+#[test]
+fn the_waits_of_an_exec_are_looked_up_in_one_resolution_of_the_table() {
+    let _g = LOCK.lock();
+    let _live = LiveBytes::hold();
+    let gpu = gpu_rm();
+    let ch = client_with_pushbuf(&gpu, A);
+    let done = syncobj::create(true);
+    let never = syncobj::create(false);
+    let out = syncobj::create(false);
+    // `NVKMD_NOUVEAU_MAX_SYNCS`, the most NVK batches into one EXEC and the
+    // cap the ioctl enforces (`MAX_EXEC_SYNC`).
+    let full = 256;
+    let mut waits: Vec<nv::DrmNouveauSync> = (1..full).map(|_| sync(done)).collect();
+    waits.push(sync(never));
+    assert_eq!(waits.len(), full);
+    let before = syncobj::RESOLVE_WALKS.load(Ordering::Relaxed);
+    assert_eq!(
+        exec(&gpu, A, ch, &[push(PUSH_VA, 16)], &waits, &[sync(out)]),
+        Err(nv::EINVAL),
+        "the last wait, behind {} that pass",
+        full - 1
+    );
+    assert_eq!(
+        syncobj::RESOLVE_WALKS.load(Ordering::Relaxed) - before,
+        1,
+        "one resolution for {full} waits"
+    );
+    assert_eq!(syncobj::query(out), Some(0), "nothing signaled");
+    for s in [done, never, out] {
+        assert!(syncobj::destroy(s));
+    }
+    gpu.nouveau_release_process(A);
+}
