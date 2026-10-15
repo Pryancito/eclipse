@@ -2018,9 +2018,9 @@ impl Syscall<'_> {
         let Some(second) = second.downcast_ref::<SyncobjHandle>() else {
             return Err(LxError::ENOENT);
         };
-        let Some(merged) = first.merge(second) else {
-            return Err(LxError::ENOENT);
-        };
+        // ENOTTY on a syncobj fd (it has no ioctl), ENOENT when `fd2` is not
+        // a sync_file; the name goes on the new fence for `FILE_INFO`.
+        let merged = first.merge(second, &data.name)?;
         let fd = proc.add_file(merged)?;
         // Bounded, LOG=error-visible trace: the first merges of a boot are the
         // GLX client's second round of acquires, the step that used to fail.

@@ -32,12 +32,42 @@
 //! do the same, and must publish [`Event::READABLE`] so `sys_poll`'s
 //! `subscribe_readiness` wakes the moment the point lands rather than on a
 //! timer tick (or never).
+//!
+//! # The rest of the fd
+//!
+//! Both fds are anonymous inodes opened with flags 0 (`anon_inode_getfile`
+//! in `sync_file_alloc` and `drm_syncobj_handle_to_fd`): `O_RDONLY`, no
+//! `FMODE_PREAD`/`FMODE_PWRITE`, and a `file_operations` with no `read` or
+//! `write`. So `read(2)` is `EINVAL` (`FMODE_READ` without
+//! `FMODE_CAN_READ`), `write(2)` is `EBADF` (no `FMODE_WRITE`), `pread`
+//! and `pwrite` are `ESPIPE`, and `lseek` is `ESPIPE`. They used to answer
+//! `ENOSYS` to all three, and to report `O_RDWR`.
+//!
+//! A **syncobj** fd (`drm_syncobj_file_fops`) has only `release`: `poll(2)`
+//! reports it always readable and writable (`DEFAULT_POLLMASK`, since it has
+//! no poll operation, which also makes `epoll_ctl` refuse it with `EPERM`)
+//! and every ioctl is `ENOTTY`, `SYNC_IOC_MERGE` included.
+//! Polling one used to say "never ready", which is what a
+//! `poll(fd, POLLIN, -1)` on the wrong kind of fd hung on.
+//!
+//! A **sync_file** fd (`sync_file_fops`) has `poll` and three ioctls:
+//! `SYNC_IOC_MERGE` (the syscall layer, which has the fd table), and here
+//! `SYNC_IOC_FILE_INFO` and `SYNC_IOC_SET_DEADLINE`, which did not exist.
+//! `FILE_INFO` is how libsync's `sync_file_info()` and Mesa's `sync_wait`
+//! fallback learn a fence's status without polling, and how the name
+//! `SYNC_IOC_MERGE` gave a fence is read back; `SET_DEADLINE` is Mesa's
+//! `vk_sync_set_deadline` hint on a swapchain fence. A fence here is one
+//! syncobj point, so `FILE_INFO` reports one fence, driver `eclipse`,
+//! timeline `syncobj`, and a timestamp of when this kernel first saw it
+//! signaled; the status of a fence the GPU never wrote (the syncobj's
+//! timeout, nouveau's killed channel) is `-ENODEV`, as
+//! `nouveau_fence_context_kill` sets it.
 
 use super::*;
 use crate::sync::{Event, EventBus};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use lock::Mutex;
 use zircon_object::object::*;
 
@@ -64,6 +94,13 @@ pub struct SyncobjHandle {
     /// Wakes `sys_poll` subscribers when the fence becomes ready.
     eventbus: Arc<Mutex<EventBus>>,
     flags: Mutex<OpenFlags>,
+    /// The name `SYNC_IOC_MERGE` gave this sync_file (`user_name`), NUL
+    /// terminated; all zero when it has none, and `FILE_INFO` then reports
+    /// the generated `driver-timeline<context>-<seqno>` name.
+    user_name: [u8; 32],
+    /// When this kernel first saw the fence signaled, in ns of the monotonic
+    /// clock; 0 while it has not (`dma_fence_timestamp`).
+    signaled_at_ns: AtomicU64,
 }
 
 /// One live sync_file that is still waiting for its point. Dropped once
@@ -80,6 +117,69 @@ lazy_static::lazy_static! {
 }
 static WAITER_COUNT: AtomicUsize = AtomicUsize::new(0);
 
+/// `SYNC_IOC_FILE_INFO`: `_IOWR('>', 4, struct sync_file_info)`.
+pub const SYNC_IOC_FILE_INFO: u32 = 0xc038_3e04;
+/// `SYNC_IOC_SET_DEADLINE`: `_IOW('>', 5, struct sync_set_deadline)`.
+pub const SYNC_IOC_SET_DEADLINE: u32 = 0x4010_3e05;
+
+/// `struct sync_file_info` (`<linux/sync_file.h>`).
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct SyncFileInfo {
+    name: [u8; 32],
+    status: i32,
+    flags: u32,
+    num_fences: u32,
+    pad: u32,
+    sync_fence_info: u64,
+}
+
+/// `struct sync_fence_info`: one entry of the array `sync_fence_info`
+/// points at.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct SyncFenceInfo {
+    obj_name: [u8; 32],
+    driver_name: [u8; 32],
+    status: i32,
+    flags: u32,
+    timestamp_ns: u64,
+}
+
+/// `struct sync_set_deadline`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct SyncSetDeadline {
+    deadline_ns: u64,
+    pad: u64,
+}
+
+const _: () = assert!(core::mem::size_of::<SyncFileInfo>() == 0x38);
+const _: () = assert!(core::mem::size_of::<SyncFenceInfo>() == 80);
+const _: () = assert!(core::mem::size_of::<SyncSetDeadline>() == 0x10);
+
+/// `dma_fence_get_status` of the one fence a sync_file here wraps: 0 while
+/// it is in flight, 1 once signaled, and the error of a fence that was
+/// signaled by giving up on it. That is the syncobj's timeout, which is
+/// what nouveau's killed channel is to its fences: `-ENODEV`.
+pub(crate) fn fence_status(signaled: bool, timed_out: bool) -> i32 {
+    if !signaled {
+        0
+    } else if timed_out {
+        -(LxError::ENODEV as i32)
+    } else {
+        1
+    }
+}
+
+/// `strscpy` into a fixed buffer: whatever fits with its NUL.
+fn cstr<const N: usize>(s: &[u8]) -> [u8; N] {
+    let mut out = [0u8; N];
+    let n = s.iter().position(|&b| b == 0).unwrap_or(s.len()).min(N - 1);
+    out[..n].copy_from_slice(&s[..n]);
+    out
+}
+
 impl_kobject!(SyncobjHandle);
 
 impl SyncobjHandle {
@@ -90,12 +190,20 @@ impl SyncobjHandle {
             sync_file_point: None,
             signaled: Arc::new(AtomicBool::new(false)),
             eventbus: EventBus::new(),
-            flags: Mutex::new(OpenFlags::RDWR | OpenFlags::CLOEXEC),
+            flags: Mutex::new(OpenFlags::RDONLY | OpenFlags::CLOEXEC),
+            user_name: [0; 32],
+            signaled_at_ns: AtomicU64::new(0),
         })
     }
 
     /// A `sync_file` fd: the fence "`handle` reaches `point`".
     pub fn new_sync_file(handle: u32, point: u64) -> Arc<Self> {
+        Self::new_sync_file_named(handle, point, [0; 32])
+    }
+
+    /// [`Self::new_sync_file`] with the name `SYNC_IOC_MERGE` gives the
+    /// fence it makes.
+    pub fn new_sync_file_named(handle: u32, point: u64, user_name: [u8; 32]) -> Arc<Self> {
         // If the snapshot is already satisfied at export time (the common
         // case on the software path: EXEC signals its syncobjs before
         // returning), latch ready immediately so the first `sync_wait(fd, 0)`
@@ -125,7 +233,9 @@ impl SyncobjHandle {
             sync_file_point: Some(point),
             signaled,
             eventbus,
-            flags: Mutex::new(OpenFlags::RDWR | OpenFlags::CLOEXEC),
+            flags: Mutex::new(OpenFlags::RDONLY | OpenFlags::CLOEXEC),
+            user_name,
+            signaled_at_ns: AtomicU64::new(if already { now_ns() } else { 0 }),
         })
     }
 
@@ -171,19 +281,105 @@ impl SyncobjHandle {
     /// killed the GLX swapchain: `zink: swapchain killed`, then
     /// `GLXBadCurrentWindow` from the `glXSwapBuffers` fallback, with nothing
     /// in dmesg because the client's error print is compiled out.
-    pub fn merge(&self, other: &SyncobjHandle) -> Option<Arc<Self>> {
-        let a = self.sync_file_point?;
-        let b = other.sync_file_point?;
+    ///
+    /// The errors are `sync_file_ioctl_merge`'s: a syncobj fd has no ioctl
+    /// at all (`drm_syncobj_file_fops`), so on one this is `ENOTTY`; an
+    /// `fd2` that is not a sync_file is `ENOENT` (`sync_file_fdget`). `name`
+    /// is the `sync_merge_data` name, kept for `SYNC_IOC_FILE_INFO`.
+    pub fn merge(&self, other: &SyncobjHandle, name: &[u8; 32]) -> LxResult<Arc<Self>> {
+        let a = self.sync_file_point.ok_or(LxError::ENOTTY)?;
+        let b = other.sync_file_point.ok_or(LxError::ENOENT)?;
         let merged =
             zcore_drivers::scheme::syncobj::merge_fences(&[(self.handle, a), (other.handle, b)]);
         // The merged syncobj's one reference belongs to this fd.
-        Some(Self::new_sync_file(merged, 1))
+        Ok(Self::new_sync_file_named(merged, 1, cstr(name)))
+    }
+
+    /// `sync_file_get_name`: the merge's name, else
+    /// `driver-timeline<context>-<seqno>` with the syncobj as the timeline
+    /// and its handle as the fence context.
+    fn name(&self) -> [u8; 32] {
+        if self.user_name[0] != 0 {
+            return self.user_name;
+        }
+        let point = self.sync_file_point.unwrap_or(0);
+        cstr(alloc::format!("eclipse-syncobj{}-{}", self.handle, point).as_bytes())
+    }
+
+    /// `dma_fence_timestamp` of a signaled fence: when this kernel first saw
+    /// it so, latched on the first look after it was.
+    fn signaled_at(&self) -> u64 {
+        let seen = self.signaled_at_ns.load(Ordering::Acquire);
+        if seen != 0 {
+            return seen;
+        }
+        let now = now_ns();
+        match self
+            .signaled_at_ns
+            .compare_exchange(0, now, Ordering::AcqRel, Ordering::Acquire)
+        {
+            Ok(_) => now,
+            Err(first) => first,
+        }
+    }
+
+    /// `SYNC_IOC_FILE_INFO`.
+    fn file_info(&self, arg: usize) -> LxResult<usize> {
+        let Some(point) = self.sync_file_point else {
+            return Err(LxError::ENOTTY);
+        };
+        if !kernel_hal::user::user_range_ok(arg, core::mem::size_of::<SyncFileInfo>()) {
+            return Err(LxError::EFAULT);
+        }
+        let mut info = unsafe { core::ptr::read_unaligned(arg as *const SyncFileInfo) };
+        if info.flags != 0 || info.pad != 0 {
+            return Err(LxError::EINVAL);
+        }
+        let signaled = self.fence_ready();
+        let timed_out = signaled
+            && zcore_drivers::scheme::syncobj::reached_by_timeout(&[self.handle], Some(&[point]));
+        let status = fence_status(signaled, timed_out);
+        // `num_fences == 0` asks for the summary only; otherwise the caller
+        // has room for at least our one fence (fewer than there are would be
+        // EINVAL), and the array is written before the summary, as in Linux.
+        if info.num_fences != 0 {
+            let entry = SyncFenceInfo {
+                obj_name: cstr(b"syncobj"),
+                driver_name: cstr(b"eclipse"),
+                status,
+                flags: 0,
+                timestamp_ns: if signaled { self.signaled_at() } else { 0 },
+            };
+            let dst = info.sync_fence_info as usize;
+            if !kernel_hal::user::user_range_ok(dst, core::mem::size_of::<SyncFenceInfo>()) {
+                return Err(LxError::EFAULT);
+            }
+            unsafe { core::ptr::write_unaligned(dst as *mut SyncFenceInfo, entry) };
+        }
+        info.name = self.name();
+        info.status = status;
+        info.num_fences = 1;
+        unsafe { core::ptr::write_unaligned(arg as *mut SyncFileInfo, info) };
+        Ok(0)
+    }
+
+    /// `SYNC_IOC_SET_DEADLINE`: `dma_fence_set_deadline` is a hint no fence
+    /// here acts on, so the struct is checked and dropped.
+    fn set_deadline(&self, arg: usize) -> LxResult<usize> {
+        if !kernel_hal::user::user_range_ok(arg, core::mem::size_of::<SyncSetDeadline>()) {
+            return Err(LxError::EFAULT);
+        }
+        let ts = unsafe { core::ptr::read_unaligned(arg as *const SyncSetDeadline) };
+        if ts.pad != 0 {
+            return Err(LxError::EINVAL);
+        }
+        Ok(0)
     }
 
     /// Whether this fd should report `POLLIN` (sync_file fence reached).
     fn fence_ready(&self) -> bool {
         let Some(point) = self.sync_file_point else {
-            // Opaque syncobj fds are not polled by Mesa's sync_wait path.
+            // A syncobj fd names no fence; `poll` answers for it itself.
             return false;
         };
         if self.signaled.load(Ordering::Acquire) {
@@ -215,6 +411,10 @@ impl SyncobjHandle {
             self.eventbus.lock().set(Event::READABLE);
         }
     }
+}
+
+fn now_ns() -> u64 {
+    kernel_hal::timer::timer_now().as_nanos() as u64
 }
 
 fn register_waiter(
@@ -373,6 +573,8 @@ impl Drop for SyncobjHandle {
 
 #[async_trait]
 impl FileLike for SyncobjHandle {
+    /// An anonymous inode opened with flags 0: `O_RDONLY`, on an fd that
+    /// `get_unused_fd_flags(O_CLOEXEC)` gave.
     fn flags(&self) -> OpenFlags {
         *self.flags.lock()
     }
@@ -385,28 +587,38 @@ impl FileLike for SyncobjHandle {
         Ok(())
     }
 
-    // Linux `drm_syncobj_file_fops` / `sync_file_fops` have no `.read`/`.write`
-    // — vfs returns `-EINVAL`, not `-ENOSYS`.
+    /// `FMODE_READ` without `FMODE_CAN_READ`: no read operation.
     async fn read(&self, _buf: &mut [u8]) -> LxResult<usize> {
         Err(LxError::EINVAL)
     }
 
+    /// No `FMODE_WRITE` at all.
     fn write(&self, _buf: &[u8]) -> LxResult<usize> {
-        Err(LxError::EINVAL)
+        Err(LxError::EBADF)
     }
 
+    /// No `FMODE_PREAD`: `ksys_pread64` does not get as far as the read.
     async fn read_at(&self, _offset: u64, _buf: &mut [u8]) -> LxResult<usize> {
-        Err(LxError::EINVAL)
+        Err(LxError::ESPIPE)
     }
 
+    /// No `FMODE_PWRITE` either: `ksys_pwrite64` stops the same way.
     fn write_at(&self, _offset: u64, _buf: &[u8]) -> LxResult<usize> {
-        Err(LxError::EINVAL)
+        Err(LxError::ESPIPE)
     }
 
     /// Match Linux `sync_file_poll`: `POLLIN` once the wrapped fence is
-    /// signaled. Opaque syncobj fds stay never-ready (Mesa does not poll them
-    /// via `sync_wait`).
+    /// signaled. A syncobj fd has no poll operation, so `poll(2)` reports it
+    /// always readable and writable (`DEFAULT_POLLMASK`).
     fn poll(&self, _events: PollEvents) -> LxResult<PollStatus> {
+        if self.sync_file_point.is_none() {
+            return Ok(PollStatus {
+                read: true,
+                write: true,
+                error: false,
+                hangup: false,
+            });
+        }
         let ready = self.fence_ready();
         Ok(PollStatus {
             read: ready,
@@ -414,6 +626,26 @@ impl FileLike for SyncobjHandle {
             error: false,
             hangup: false,
         })
+    }
+
+    /// `file_can_poll`: a syncobj fd has no poll operation, so `epoll_ctl`
+    /// refuses it with `EPERM`; `poll(2)` reports it always ready instead.
+    fn can_epoll(&self) -> bool {
+        self.sync_file_point.is_some()
+    }
+
+    /// `sync_file_ioctl`, minus `SYNC_IOC_MERGE`, which needs the fd table
+    /// and is dispatched by the syscall layer before this. A syncobj fd has
+    /// no ioctl operation at all.
+    fn ioctl(&self, request: usize, arg1: usize, _arg2: usize, _arg3: usize) -> LxResult<usize> {
+        if self.sync_file_point.is_none() {
+            return Err(LxError::ENOTTY);
+        }
+        match request as u32 {
+            SYNC_IOC_FILE_INFO => self.file_info(arg1),
+            SYNC_IOC_SET_DEADLINE => self.set_deadline(arg1),
+            _ => Err(LxError::ENOTTY),
+        }
     }
 
     async fn async_poll(&self, events: PollEvents) -> LxResult<PollStatus> {
@@ -480,16 +712,19 @@ impl FileLike for SyncobjHandle {
 mod sync_file_poll_tests {
     use super::*;
 
-    /// `read`/`write` on a syncobj fd must be `-EINVAL`, not `-ENOSYS`:
-    /// Linux syncobj/sync_file fops have no read/write ops.
+    /// `read`/`write` on a syncobj fd must never be `-ENOSYS`: Linux
+    /// syncobj/sync_file fops have no read/write ops, so the vfs answers
+    /// for them (`EINVAL` for the read of an `O_RDONLY` file with no read
+    /// op, `EBADF` for a write without `FMODE_WRITE`, `ESPIPE` for a pread
+    /// without `FMODE_PREAD`; see `fops_tests`).
     #[test]
-    fn read_write_on_syncobj_are_einval_not_enosys() {
+    fn read_write_on_syncobj_are_the_vfs_errnos_not_enosys() {
         use async_std::task::block_on;
         let fd = SyncobjHandle::new(0);
         let mut buf = [0u8; 8];
         assert_eq!(block_on(fd.read(&mut buf)), Err(LxError::EINVAL));
-        assert_eq!(fd.write(&[0u8; 8]), Err(LxError::EINVAL));
-        assert_eq!(block_on(fd.read_at(0, &mut buf)), Err(LxError::EINVAL));
+        assert_eq!(fd.write(&[0u8; 8]), Err(LxError::EBADF));
+        assert_eq!(block_on(fd.read_at(0, &mut buf)), Err(LxError::ESPIPE));
     }
 
     /// `fcntl(F_SETFL, O_NONBLOCK)` on a syncobj/sync_file fd used to return
@@ -611,7 +846,7 @@ mod sync_file_poll_tests {
         assert!(zcore_drivers::scheme::syncobj::add_ref(b));
         let fa = SyncobjHandle::new_sync_file(a, 2);
         let fb = SyncobjHandle::new_sync_file(b, 1);
-        let m = fa.merge(&fb).expect("two sync_files merge");
+        let m = fa.merge(&fb, &[0; 32]).expect("two sync_files merge");
         assert!(!m.poll(PollEvents::IN).expect("poll").read);
         assert!(zcore_drivers::scheme::syncobj::timeline_signal(a, 2));
         wake_ready_waiters();
@@ -644,7 +879,7 @@ mod sync_file_poll_tests {
         assert!(so::add_ref(b));
         let fa = SyncobjHandle::new_sync_file(a, 1);
         let fb = SyncobjHandle::new_sync_file(b, 1);
-        let m = fa.merge(&fb).expect("merge");
+        let m = fa.merge(&fb, &[0; 32]).expect("merge");
         let sem = so::create(false);
         assert!(so::import_snapshot(sem, m.handle, 1));
         drop(m);
@@ -660,19 +895,247 @@ mod sync_file_poll_tests {
         assert!(so::destroy(b));
     }
 
-    /// An opaque syncobj fd is the object, not a fence: it does not merge.
+    /// A syncobj fd is the object, not a fence: it has no ioctl, so a merge
+    /// on it is `ENOTTY`, and as the second operand of a sync_file's merge
+    /// it is not a sync_file, `ENOENT`. Its poll is `DEFAULT_POLLMASK`, a
+    /// sync_file's is `POLLIN` when signaled and never `POLLOUT`.
     #[test]
-    fn an_opaque_syncobj_fd_does_not_merge() {
+    fn an_opaque_syncobj_fd_is_always_ready_and_has_no_ioctl() {
         let a = zcore_drivers::scheme::syncobj::create(false);
         assert!(zcore_drivers::scheme::syncobj::add_ref(a));
         assert!(zcore_drivers::scheme::syncobj::add_ref(a));
         let opaque = SyncobjHandle::new(a);
         let fence = SyncobjHandle::new_sync_file(a, 1);
-        assert!(opaque.merge(&fence).is_none());
-        assert!(fence.merge(&opaque).is_none());
+        assert_eq!(opaque.merge(&fence, &[0; 32]).err(), Some(LxError::ENOTTY));
+        assert_eq!(fence.merge(&opaque, &[0; 32]).err(), Some(LxError::ENOENT));
+        let status = opaque.poll(PollEvents::IN).expect("poll");
+        assert!(status.read && status.write && !status.error && !status.hangup);
+        assert!(!opaque.can_epoll(), "no poll operation: epoll_ctl is EPERM");
+        let status = fence.poll(PollEvents::IN).expect("poll");
+        assert!(!status.read && !status.write);
+        assert!(fence.can_epoll());
+        let mut info = SyncFileInfo {
+            name: [0; 32],
+            status: 0,
+            flags: 0,
+            num_fences: 0,
+            pad: 0,
+            sync_fence_info: 0,
+        };
+        let arg = &mut info as *mut SyncFileInfo as usize;
+        assert_eq!(
+            opaque.ioctl(SYNC_IOC_FILE_INFO as usize, arg, 0, 0),
+            Err(LxError::ENOTTY)
+        );
+        let ts = SyncSetDeadline {
+            deadline_ns: 1,
+            pad: 0,
+        };
+        assert_eq!(
+            opaque.ioctl(
+                SYNC_IOC_SET_DEADLINE as usize,
+                &ts as *const SyncSetDeadline as usize,
+                0,
+                0
+            ),
+            Err(LxError::ENOTTY)
+        );
+        assert!(zcore_drivers::scheme::syncobj::signal(a));
+        let status = fence.poll(PollEvents::IN).expect("poll");
+        assert!(status.read && !status.write);
         drop(opaque);
         drop(fence);
         assert!(zcore_drivers::scheme::syncobj::destroy(a));
+    }
+
+    /// Both fds are `O_RDONLY` anonymous inodes with no read or write
+    /// operation: `read` is EINVAL, `write` EBADF, `pread`/`pwrite` and
+    /// `lseek` ESPIPE. They answered ENOSYS and claimed `O_RDWR`.
+    #[test]
+    fn the_fds_are_read_only_anon_files_with_no_read_or_write() {
+        use async_std::task::block_on;
+        let a = zcore_drivers::scheme::syncobj::create(true);
+        assert!(zcore_drivers::scheme::syncobj::add_ref(a));
+        assert!(zcore_drivers::scheme::syncobj::add_ref(a));
+        let opaque = SyncobjHandle::new(a);
+        let fence = SyncobjHandle::new_sync_file(a, 1);
+        for fd in [&opaque, &fence] {
+            assert_eq!(fd.flags(), OpenFlags::RDONLY | OpenFlags::CLOEXEC);
+            assert!(fd.flags().readable() && !fd.flags().writable());
+            assert!(fd.flags().close_on_exec());
+            let mut buf = [0u8; 8];
+            assert_eq!(block_on(fd.read(&mut buf)), Err(LxError::EINVAL));
+            assert_eq!(fd.write(&buf), Err(LxError::EBADF));
+            assert_eq!(block_on(fd.read_at(0, &mut buf)), Err(LxError::ESPIPE));
+            assert_eq!(fd.write_at(0, &buf), Err(LxError::ESPIPE));
+            assert_eq!(fd.seek(SeekFrom::Start(0)), Err(LxError::ESPIPE));
+        }
+        drop(opaque);
+        drop(fence);
+        assert!(zcore_drivers::scheme::syncobj::destroy(a));
+    }
+
+    /// `SYNC_IOC_FILE_INFO`: the summary alone with `num_fences == 0`, the
+    /// one fence when there is room for it, its status and timestamp before
+    /// and after signaling, the generated name, and the EINVAL/EFAULT of
+    /// `sync_file_ioctl_fence_info`.
+    #[test]
+    fn file_info_reports_the_one_fence_its_status_and_its_name() {
+        let a = zcore_drivers::scheme::syncobj::create(false);
+        assert!(zcore_drivers::scheme::syncobj::add_ref(a));
+        let fence = SyncobjHandle::new_sync_file(a, 1);
+        let blank = SyncFileInfo {
+            name: [0; 32],
+            status: 0,
+            flags: 0,
+            num_fences: 0,
+            pad: 0,
+            sync_fence_info: 0,
+        };
+        let mut info = blank;
+        let arg = &mut info as *mut SyncFileInfo as usize;
+        assert_eq!(fence.ioctl(SYNC_IOC_FILE_INFO as usize, arg, 0, 0), Ok(0));
+        assert_eq!(info.status, 0, "in flight");
+        assert_eq!(
+            info.num_fences, 1,
+            "one fence, counted even when not asked for"
+        );
+        let expected = alloc::format!("eclipse-syncobj{}-1", a);
+        assert_eq!(&info.name[..expected.len()], expected.as_bytes());
+        assert_eq!(info.name[expected.len()], 0);
+
+        let mut entry = SyncFenceInfo {
+            obj_name: [0xff; 32],
+            driver_name: [0xff; 32],
+            status: 7,
+            flags: 7,
+            timestamp_ns: 7,
+        };
+        let mut info = SyncFileInfo {
+            num_fences: 1,
+            sync_fence_info: &mut entry as *mut SyncFenceInfo as u64,
+            ..blank
+        };
+        let arg = &mut info as *mut SyncFileInfo as usize;
+        assert_eq!(fence.ioctl(SYNC_IOC_FILE_INFO as usize, arg, 0, 0), Ok(0));
+        assert_eq!(info.status, 0);
+        assert_eq!(info.num_fences, 1);
+        assert_eq!(&entry.obj_name[..8], b"syncobj\0");
+        assert_eq!(&entry.driver_name[..8], b"eclipse\0");
+        assert_eq!(entry.status, 0);
+        assert_eq!(entry.flags, 0);
+        assert_eq!(entry.timestamp_ns, 0, "unsignaled: no timestamp");
+
+        assert!(zcore_drivers::scheme::syncobj::signal(a));
+        wake_ready_waiters();
+        assert_eq!(fence.ioctl(SYNC_IOC_FILE_INFO as usize, arg, 0, 0), Ok(0));
+        assert_eq!(info.status, 1, "signaled");
+        assert_eq!(entry.status, 1);
+        assert_ne!(entry.timestamp_ns, 0, "signaled: when it was seen so");
+        let first = entry.timestamp_ns;
+        assert_eq!(fence.ioctl(SYNC_IOC_FILE_INFO as usize, arg, 0, 0), Ok(0));
+        assert_eq!(entry.timestamp_ns, first, "the timestamp is latched");
+
+        // The refusals: flags, pad, no room at the fence pointer, no struct.
+        let mut bad = SyncFileInfo { flags: 1, ..blank };
+        let arg = &mut bad as *mut SyncFileInfo as usize;
+        assert_eq!(
+            fence.ioctl(SYNC_IOC_FILE_INFO as usize, arg, 0, 0),
+            Err(LxError::EINVAL)
+        );
+        let mut bad = SyncFileInfo { pad: 1, ..blank };
+        let arg = &mut bad as *mut SyncFileInfo as usize;
+        assert_eq!(
+            fence.ioctl(SYNC_IOC_FILE_INFO as usize, arg, 0, 0),
+            Err(LxError::EINVAL)
+        );
+        let mut bad = SyncFileInfo {
+            num_fences: 1,
+            sync_fence_info: 0,
+            ..blank
+        };
+        let arg = &mut bad as *mut SyncFileInfo as usize;
+        assert_eq!(
+            fence.ioctl(SYNC_IOC_FILE_INFO as usize, arg, 0, 0),
+            Err(LxError::EFAULT)
+        );
+        assert_eq!(bad.num_fences, 1, "nothing written back on EFAULT");
+        assert_eq!(
+            fence.ioctl(SYNC_IOC_FILE_INFO as usize, 0, 0, 0),
+            Err(LxError::EFAULT)
+        );
+        // Not a sync_file ioctl: ENOTTY, not ENOSYS (DMA_BUF_IOCTL_SYNC).
+        let flags = 3u64;
+        assert_eq!(
+            fence.ioctl(0x4008_6200, &flags as *const u64 as usize, 0, 0),
+            Err(LxError::ENOTTY)
+        );
+        drop(fence);
+        assert!(zcore_drivers::scheme::syncobj::destroy(a));
+    }
+
+    /// The name `SYNC_IOC_MERGE` gives a fence is what `FILE_INFO` reports
+    /// (cut to 31 bytes and NUL terminated, as `strscpy` does), and
+    /// `SET_DEADLINE` takes its struct and refuses a pad.
+    #[test]
+    fn a_merge_carries_its_name_and_set_deadline_takes_only_the_struct() {
+        let a = zcore_drivers::scheme::syncobj::create(true);
+        let b = zcore_drivers::scheme::syncobj::create(true);
+        assert!(zcore_drivers::scheme::syncobj::add_ref(a));
+        assert!(zcore_drivers::scheme::syncobj::add_ref(b));
+        let fa = SyncobjHandle::new_sync_file(a, 1);
+        let fb = SyncobjHandle::new_sync_file(b, 1);
+        let mut name = [b'x'; 32];
+        name[..9].copy_from_slice(b"swapchain");
+        let m = fa.merge(&fb, &name).expect("merge");
+        let mut info = SyncFileInfo {
+            name: [0; 32],
+            status: 0,
+            flags: 0,
+            num_fences: 0,
+            pad: 0,
+            sync_fence_info: 0,
+        };
+        let arg = &mut info as *mut SyncFileInfo as usize;
+        assert_eq!(m.ioctl(SYNC_IOC_FILE_INFO as usize, arg, 0, 0), Ok(0));
+        assert_eq!(&info.name[..31], &name[..31], "31 bytes of the name");
+        assert_eq!(info.name[31], 0, "and the NUL strscpy puts");
+        assert_eq!(info.status, 1, "both sources were signaled");
+
+        let ts = SyncSetDeadline {
+            deadline_ns: 1_000_000,
+            pad: 0,
+        };
+        let arg = &ts as *const SyncSetDeadline as usize;
+        assert_eq!(m.ioctl(SYNC_IOC_SET_DEADLINE as usize, arg, 0, 0), Ok(0));
+        let ts = SyncSetDeadline {
+            deadline_ns: 1_000_000,
+            pad: 1,
+        };
+        let arg = &ts as *const SyncSetDeadline as usize;
+        assert_eq!(
+            m.ioctl(SYNC_IOC_SET_DEADLINE as usize, arg, 0, 0),
+            Err(LxError::EINVAL)
+        );
+        assert_eq!(
+            m.ioctl(SYNC_IOC_SET_DEADLINE as usize, 0, 0, 0),
+            Err(LxError::EFAULT)
+        );
+        drop(m);
+        drop(fa);
+        drop(fb);
+        assert!(zcore_drivers::scheme::syncobj::destroy(a));
+        assert!(zcore_drivers::scheme::syncobj::destroy(b));
+    }
+
+    /// `dma_fence_get_status`: 0 in flight, 1 signaled, and the error of a
+    /// fence the GPU never wrote (`-ENODEV`, nouveau's killed channel).
+    #[test]
+    fn fence_status_is_dma_fence_get_status() {
+        assert_eq!(fence_status(false, false), 0);
+        assert_eq!(fence_status(false, true), 0, "not signaled: no error yet");
+        assert_eq!(fence_status(true, false), 1);
+        assert_eq!(fence_status(true, true), -19);
     }
 
     #[test]
