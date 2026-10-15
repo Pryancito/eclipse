@@ -18,6 +18,12 @@ impl Client {
         }
     }
 
+    /// The device the open is on: for the async sleepers the syscall runs
+    /// ahead of `io_control` (`syncobj_wait_sleep` and the like).
+    pub(super) fn dev(&self) -> &DrmDev {
+        &self.dev
+    }
+
     /// `drmIoctl(fd, request, &arg)`.
     pub(super) fn ioctl<T>(&self, request: u32, arg: &mut T) -> Result<usize> {
         drm_ioctl(&self.dev, request, arg as *mut T as usize)

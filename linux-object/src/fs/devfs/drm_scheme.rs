@@ -321,6 +321,19 @@ impl DrmDev {
         else {
             return Ok(());
         };
+        // The refusal the arm makes before it waits is not slept on either:
+        // without WAIT_FOR_SUBMIT or WAIT_AVAILABLE, a point with no fence
+        // (`drm_syncobj_array_wait_timeout`, EINVAL). Linux answers at once;
+        // this parked on it to the deadline, so the arm's EINVAL came after
+        // the whole timeout (NVK's deadline is INT64_MAX: a WAIT_ALL on a
+        // binary syncobj fresh from CREATE or RESET hung the caller for
+        // good), and a signal landing meanwhile turned it into a success.
+        if flags & (DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT | DRM_SYNCOBJ_WAIT_FLAGS_WAIT_AVAILABLE)
+            == 0
+            && zcore_drivers::scheme::syncobj::without_fence(&handles, points.as_deref()).is_some()
+        {
+            return Ok(());
+        }
         let deadline_us = (timeout_nsec.max(0) as u64) / 1000;
         let wait_all = flags & DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL != 0;
         let available_only = flags & DRM_SYNCOBJ_WAIT_FLAGS_WAIT_AVAILABLE != 0;
