@@ -3823,11 +3823,34 @@ fn nouveau_syncs_ok(
         owner_pid,
         waits.iter().chain(sigs.iter()).map(|s| s.handle),
     );
+    // `nouveau_job_add_deps` looks a wait up with
+    // `drm_syncobj_find_fence(.., flags 0)`: a point nobody submitted -- a
+    // binary syncobj with no fence (fresh, or RESET), a timeline point past
+    // its chain -- is EINVAL when the job is built, before the sigs are
+    // prepared, the ops checked or anything waited for. This ran such a
+    // wait to its deadline and answered EIO, the code for a fence that
+    // exists and never landed. ONE take of the lock for all the waits, like
+    // the handles: `without_fence` resolves the pending list under it (a
+    // read of every in-flight fence's landing zone), and asked per wait
+    // that was one full resolution each, 256 for a full EXEC. The first
+    // wait without a fence, in list order, is where the walk below stops.
+    let point = |s: &nv::DrmNouveauSync| {
+        if s.flags & nv::SYNC_TYPE_MASK == nv::SYNC_TIMELINE_SYNCOBJ {
+            s.timeline_value
+        } else {
+            1
+        }
+    };
+    let points: Vec<u64> = waits.iter().map(point).collect();
+    let handles: Vec<u32> = waits.iter().map(|s| s.handle).collect();
+    let first_unsubmitted = (!waits.is_empty())
+        .then(|| crate::scheme::syncobj::without_fence(&handles, Some(&points)))
+        .flatten();
     for (list, unknown_type, side, is_wait) in [
         (waits, nv::EOPNOTSUPP, "wait", true),
         (sigs, nv::EINVAL, "sig", false),
     ] {
-        for s in list {
+        for (i, s) in list.iter().enumerate() {
             if !known(s) {
                 crate::klog_warn!(
                     "[nouveau-uapi] {}: {} syncobj handle={} has an unknown sync type (flags={:#x}) -- nothing done pid={}",
@@ -3849,30 +3872,15 @@ fn nouveau_syncs_ok(
                 );
                 return Err(nv::ENOENT);
             }
-            // `nouveau_job_add_deps` looks a wait up with
-            // `drm_syncobj_find_fence(.., flags 0)`: a point nobody
-            // submitted -- a binary syncobj with no fence (fresh, or
-            // RESET), a timeline point past its chain -- is EINVAL when
-            // the job is built, before the sigs are prepared, the ops
-            // checked or anything waited for. This ran such a wait to
-            // its deadline and answered EIO, the code for a fence that
-            // exists and never landed.
-            if is_wait {
-                let point = if s.flags & nv::SYNC_TYPE_MASK == nv::SYNC_TIMELINE_SYNCOBJ {
-                    s.timeline_value
-                } else {
-                    1
-                };
-                if crate::scheme::syncobj::without_fence(&[s.handle], Some(&[point])).is_some() {
-                    crate::klog_warn!(
-                        "[nouveau-uapi] {}: wait syncobj handle={} point={} has no fence to wait for (nothing submitted it) -- nothing done (EINVAL) pid={}",
-                        what,
-                        s.handle,
-                        point,
-                        owner_pid
-                    );
-                    return Err(nv::EINVAL);
-                }
+            if is_wait && first_unsubmitted == Some(i) {
+                crate::klog_warn!(
+                    "[nouveau-uapi] {}: wait syncobj handle={} point={} has no fence to wait for (nothing submitted it) -- nothing done (EINVAL) pid={}",
+                    what,
+                    s.handle,
+                    points[i],
+                    owner_pid
+                );
+                return Err(nv::EINVAL);
             }
         }
     }

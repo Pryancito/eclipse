@@ -464,6 +464,13 @@ static ANY_LINKS: AtomicBool = AtomicBool::new(false);
 #[cfg(test)]
 static LINK_WALKS: AtomicUsize = AtomicUsize::new(0);
 
+/// How many times [`resolve_locked`] ran: one per lookup that has to know
+/// what landed. Test-only, the same seam as [`LINK_WALKS`]: EXEC's wait
+/// validation asked once per wait (256 for a full EXEC) where one
+/// resolution answers the whole list.
+#[cfg(test)]
+pub static RESOLVE_WALKS: AtomicUsize = AtomicUsize::new(0);
+
 /// A pending fence older than this is a hung ring. Same bound the driver's
 /// old synchronous poll used, so the behaviour on a GPU hang is unchanged:
 /// the context is latched wedged (via the timeout hook) and the waiter is
@@ -785,6 +792,8 @@ impl Deferred {
 /// tells the driver, which latches the context wedged so the client's next
 /// submit fails honestly). Returns the upcalls to make after unlocking.
 fn resolve_locked(table: &mut SyncobjTable) -> Deferred {
+    #[cfg(test)]
+    RESOLVE_WALKS.fetch_add(1, Ordering::Relaxed);
     let mut out = Deferred::default();
     // What each landing zone READ the first time this call looked at it, so
     // neither the passes below nor two fences sharing a zone ask the same
