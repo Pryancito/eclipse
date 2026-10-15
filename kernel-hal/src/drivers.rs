@@ -191,16 +191,72 @@ pub fn remove_device_hosted(dev: &Device) -> bool {
     DEVICES.remove_device(dev)
 }
 
+/// Told that a block device arrived (`true`) or went away (`false`).
+///
+/// The second hole of the hot-plug path, and a mirror of the first: being in
+/// `DEVICES` is not the same as having a node under `/dev`, and the code that
+/// makes those nodes lives in `linux-object`, which depends on this crate and
+/// not the other way round. So this crate holds the hole and `linux-object`
+/// fills it in `create_root_fs`, once the nodes it makes at boot are already
+/// there -- which is also what keeps a disk from being announced twice.
+pub type BlockHotplugObserver = fn(&Arc<dyn BlockScheme>, bool);
+
+static BLOCK_OBSERVER: crate::sync::Mutex<Option<BlockHotplugObserver>> =
+    crate::sync::Mutex::new(None);
+
+/// Let the filesystem layer hear about block devices that come and go.
+///
+/// Installed at the end of the boot-time device scan, so the nodes made there
+/// are not announced again. A hot-plugged disk that arrives before this runs is
+/// in `DEVICES` with nothing under `/dev`: visible in `/sys/block`, which
+/// recomputes its listing on every read, and not openable. That gap is exactly
+/// what this closes.
+pub fn install_block_hotplug_observer(f: BlockHotplugObserver) {
+    let mut g = BLOCK_OBSERVER.lock();
+    if g.is_some() {
+        warn!("[hotplug] el observador de bloque ya estaba puesto; se reemplaza");
+    }
+    *g = Some(f);
+}
+
+/// Notifies the observer with **no lock of ours held**.
+///
+/// Deliberately not called from inside `add_device`: what the observer does
+/// with a new disk ends in block reads (a partition scan), and holding the
+/// device-list lock across those chains it to the controller's own lock, which
+/// is taken from an interrupt handler. The observer's side of the bargain is
+/// the same: it may only queue, never do the I/O here, because this runs in the
+/// context of whoever noticed the device -- for USB, a timer tick.
+fn notify_block_observer(dev: &Device, arrived: bool) {
+    let Device::Block(b) = dev else {
+        return;
+    };
+    let f = *BLOCK_OBSERVER.lock();
+    if let Some(f) = f {
+        f(b, arrived);
+    }
+}
+
 /// Register a device that appeared after the bus probe, and unregister it when
 /// it goes away. Installed into `zcore_drivers::hotplug` by
 /// [`install_hotplug_sink`]; a driver never calls these directly, because the
 /// dependency runs this way round (`kernel-hal` -> `zcore_drivers`).
 fn add_device_hotplug(dev: Device) {
-    DEVICES.add_device(dev)
+    // In the list first: the observer is allowed to look the device up by the
+    // same name everything else uses, and that name comes from its position in
+    // `all_block()`.
+    DEVICES.add_device(dev.clone());
+    notify_block_observer(&dev, true);
 }
 
 /// See [`add_device_hotplug`]. Matches by identity, not by value.
 fn remove_device_hotplug(dev: &Device) -> bool {
+    // Told first, so the filesystem layer has the departure queued before the
+    // entry is gone. It only queues, though, so the node does outlive the list
+    // entry by however long the task takes to run: a `/dev/sdX` opened in that
+    // window is a live `Arc` whose reads answer `NotReady`, which is what an
+    // unplugged disk should say anyway.
+    notify_block_observer(dev, false);
     DEVICES.remove_device(dev)
 }
 

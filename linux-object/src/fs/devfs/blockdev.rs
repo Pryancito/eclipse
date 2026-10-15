@@ -1680,3 +1680,125 @@ mod tests {
         assert!(scan_partitions(&disk.into_scheme()).is_empty());
     }
 }
+
+/// El sufijo de letras de un disco por su posición: 0 -> `a`, 25 -> `z`,
+/// 26 -> `aa`.
+///
+/// Vivía duplicado en `sysfs` y en `create_root_fs`, y las dos copias **no
+/// decían lo mismo**: la de `/dev` era `b'a' + i % 26`, que con 27 discos
+/// vuelve a `sda` y choca con el primero, mientras la de `/sys` seguía a `aa`.
+/// Una sola copia, aquí, es lo que impide que `/dev` y `/sys` nombren distinto
+/// al mismo disco.
+pub fn disk_suffix(mut index: usize) -> alloc::string::String {
+    let mut out = [0u8; 8];
+    let mut at = out.len();
+    loop {
+        at -= 1;
+        out[at] = b'a' + (index % 26) as u8;
+        match (index / 26).checked_sub(1) {
+            Some(next) => index = next,
+            None => break,
+        }
+        if at == 0 {
+            break;
+        }
+    }
+    alloc::string::String::from_utf8_lossy(&out[at..]).into_owned()
+}
+
+/// El nombre que le toca en `/dev` al disco que está en la posición `i` de
+/// `all_block()`, por la convención de Linux.
+///
+/// La posición es la que manda, no el nombre del driver: `nvme` y `virtio`
+/// cuentan cada uno por su cuenta (`nvme0n1`, `vda`) y todo lo demás --AHCI,
+/// un pendrive USB-- es `sd` + letra. Es la misma cuenta que hace `/sys/block`,
+/// y por eso la hacen las dos llamando aquí.
+pub fn disk_node_name(names_before: &[&str], own_name: &str) -> alloc::string::String {
+    if own_name.starts_with("nvme") {
+        let idx = names_before
+            .iter()
+            .filter(|n| n.starts_with("nvme"))
+            .count();
+        alloc::format!("nvme{}n1", idx)
+    } else if own_name.starts_with("virtio") {
+        let idx = names_before
+            .iter()
+            .filter(|n| n.starts_with("virtio"))
+            .count();
+        alloc::format!("vd{}", disk_suffix(idx))
+    } else {
+        let idx = names_before
+            .iter()
+            .filter(|n| !n.starts_with("nvme") && !n.starts_with("virtio"))
+            .count();
+        alloc::format!("sd{}", disk_suffix(idx))
+    }
+}
+
+/// Cuántas particiones de un disco llegan a tener nodo.
+///
+/// No es una preferencia: el minor de la partición `n` es `base + n`, y cada
+/// disco tiene reservado un hueco de dieciséis minors. La decimosexta
+/// partición caería sobre el minor base del disco siguiente, y el barrido que
+/// borra los nodos al desenchufar llega hasta aquí. `scan_partitions` sí sabe
+/// leer más (hasta 512 entradas GPT), así que el tope tiene que estar en un
+/// solo sitio y aplicarse igual al crear, al re-escanear y al borrar.
+pub const MAX_PARTITIONS: usize = 15;
+
+/// El hueco de minors que tiene reservado cada disco: su minor base es
+/// `ranura * MINORS_PER_DISK`, y el de su partición `n` es `base + n`.
+pub const MINORS_PER_DISK: usize = 16;
+
+// Las dos constantes de arriba son una sola decisión, así que se comprueban
+// juntas y al compilar: subir el número de particiones sin ensanchar el hueco
+// haría que la última cayera sobre el minor base del disco siguiente, y un
+// `/dev/sdb` y un `/dev/sda16` apuntando al mismo minor son el mismo
+// dispositivo para cualquier cosa que mire el `st_rdev`.
+const _: () = assert!(MAX_PARTITIONS < MINORS_PER_DISK);
+
+/// El nombre de la partición `n` (desde 1) de un disco ya nombrado.
+///
+/// `nvme` mete una `p` por medio (`nvme0n1p1`); el resto pega el número
+/// (`sda1`). Un pendrive cae en el segundo caso.
+pub fn partition_node_name(disk: &str, part_num: usize) -> alloc::string::String {
+    if disk.starts_with("nvme") {
+        alloc::format!("{}p{}", disk, part_num)
+    } else {
+        alloc::format!("{}{}", disk, part_num)
+    }
+}
+
+#[cfg(test)]
+mod naming_tests {
+    use super::*;
+
+    #[test]
+    fn el_sufijo_pasa_de_la_z_a_la_aa_en_vez_de_volver_a_la_a() {
+        assert_eq!(disk_suffix(0), "a");
+        assert_eq!(disk_suffix(25), "z");
+        // Lo que hacía la copia de `/dev`: `b'a' + 26 % 26` = `a`, el nombre
+        // del primer disco otra vez.
+        assert_eq!(disk_suffix(26), "aa");
+        assert_eq!(disk_suffix(27), "ab");
+    }
+
+    #[test]
+    fn cada_familia_cuenta_por_su_cuenta() {
+        assert_eq!(disk_node_name(&[], "nvme0"), "nvme0n1");
+        assert_eq!(disk_node_name(&["nvme0"], "nvme1"), "nvme1n1");
+        assert_eq!(disk_node_name(&[], "virtio-blk"), "vda");
+        assert_eq!(disk_node_name(&["virtio-blk"], "virtio-blk"), "vdb");
+        assert_eq!(disk_node_name(&[], "ahci"), "sda");
+        // Un pendrive detrás de un disco NVMe sigue siendo el primer `sd`: las
+        // familias no se estorban.
+        assert_eq!(disk_node_name(&["nvme0"], "usbdisk-1"), "sda");
+        assert_eq!(disk_node_name(&["nvme0", "ahci"], "usbdisk-1"), "sdb");
+    }
+
+    #[test]
+    fn la_particion_lleva_p_solo_en_nvme() {
+        assert_eq!(partition_node_name("sda", 1), "sda1");
+        assert_eq!(partition_node_name("vdb", 2), "vdb2");
+        assert_eq!(partition_node_name("nvme0n1", 1), "nvme0n1p1");
+    }
+}

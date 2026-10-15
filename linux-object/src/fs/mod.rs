@@ -1441,30 +1441,18 @@ pub fn create_root_fs(rootfs: Arc<dyn FileSystem>) -> Arc<dyn INode> {
     );
     for (i, block) in blocks.iter().enumerate() {
         let name = block.name();
-        let fname = if name.starts_with("nvme") {
-            let nvme_idx = blocks[..i]
-                .iter()
-                .filter(|b| b.name().starts_with("nvme"))
-                .count();
-            format!("nvme{}n1", nvme_idx)
-        } else if name.starts_with("virtio") {
-            let virtio_idx = blocks[..i]
-                .iter()
-                .filter(|b| b.name().starts_with("virtio"))
-                .count();
-            let name_char = (b'a' + (virtio_idx % 26) as u8) as char;
-            format!("vd{}", name_char)
-        } else {
-            let other_idx = blocks[..i]
-                .iter()
-                .filter(|b| !b.name().starts_with("nvme") && !b.name().starts_with("virtio"))
-                .count();
-            let name_char = (b'a' + (other_idx % 26) as u8) as char;
-            format!("sd{}", name_char)
-        };
-
-        // Use i * 16 as the base index for minor numbers to leave room for partitions
-        let base_index = i * 16;
+        // Un solo sitio decide el nombre, compartido con `/sys/block` y con el
+        // camino de hotplug: tres copias de esta cuenta habían empezado a decir
+        // cosas distintas a partir de 26 discos.
+        let names_before: Vec<&str> = blocks[..i].iter().map(|b| b.name()).collect();
+        let fname = devfs::blockdev::disk_node_name(&names_before, name);
+        // Use i * MINORS_PER_DISK as the base index for minor numbers to leave
+        // room for partitions
+        let base_index = i * devfs::blockdev::MINORS_PER_DISK;
+        // Que el hotplug sepa que esta letra está cogida, y no se la dé luego a
+        // un pendrive por encima de este disco; y que sepa cuál es este disco,
+        // para poder quitarle los nodos si resulta ser extraíble y se va.
+        devfs::blockhotplug::note_boot_disk(&fname, block, base_index);
         let dev = Arc::new(devfs::BlockDev::new(
             base_index,
             block.clone(),
@@ -1485,13 +1473,21 @@ pub fn create_root_fs(rootfs: Arc<dyn FileSystem>) -> Arc<dyn INode> {
             fname,
             partitions.len()
         );
-        for (part_idx, &(start_block, block_count)) in partitions.iter().enumerate() {
+        if partitions.len() > devfs::blockdev::MAX_PARTITIONS {
+            warn!(
+                "[boot] /dev/{}: {} particiones, sólo las {} primeras tienen nodo",
+                fname,
+                partitions.len(),
+                devfs::blockdev::MAX_PARTITIONS
+            );
+        }
+        for (part_idx, &(start_block, block_count)) in partitions
+            .iter()
+            .take(devfs::blockdev::MAX_PARTITIONS)
+            .enumerate()
+        {
             let part_num = part_idx + 1;
-            let part_name = if fname.starts_with("nvme") {
-                format!("{}p{}", fname, part_num)
-            } else {
-                format!("{}{}", fname, part_num)
-            };
+            let part_name = devfs::blockdev::partition_node_name(&fname, part_num);
             let partition_driver = Arc::new(devfs::blockdev::PartitionBlock::new(
                 block.clone(),
                 format!("{}-part{}", name, part_num),
@@ -1517,6 +1513,14 @@ pub fn create_root_fs(rootfs: Arc<dyn FileSystem>) -> Arc<dyn INode> {
             }
         }
     }
+
+    // A partir de aquí, un disco que llegue se entera `/dev`. Se engancha
+    // después del recorrido de arriba a propósito: los nodos de los discos que
+    // ya estaban puestos existen, así que ninguno se anuncia dos veces y el
+    // primer aviso que llegue es de verdad una novedad. Un pendrive enchufado
+    // antes de este punto queda dado de alta en `kernel-hal` y sin nodo, que
+    // es el agujero que esto cierra.
+    devfs::blockhotplug::install();
 
     // Decide the real root filesystem: pivot from the boot medium onto an
     // installed btrfs/ext2 ROOT partition when one is available, otherwise
@@ -3402,24 +3406,32 @@ pub fn rescan_partitions(
 ) -> LxResult<()> {
     if let Some(devfs_root) = DEVFS_ROOT.lock().as_ref() {
         // First, remove existing partition nodes (e.g. sda1..=sda15)
-        for part_num in 1..=15 {
-            let part_name = if fname.starts_with("nvme") {
-                format!("{}p{}", fname, part_num)
-            } else {
-                format!("{}{}", fname, part_num)
-            };
+        for part_num in 1..=devfs::blockdev::MAX_PARTITIONS {
+            let part_name = devfs::blockdev::partition_node_name(fname, part_num);
             let _ = devfs_root.remove(&part_name);
+            eclipsefs_mount::forget_block_device(&part_name);
         }
 
-        // Now, scan partitions
+        // Now, scan partitions. `scan_partitions` lee hasta 512 entradas GPT,
+        // pero el minor de la partición `n` es `base_index + n` y cada disco
+        // tiene reservadas dieciséis: la decimosexta caería sobre el minor base
+        // del disco siguiente, y el barrido de arriba no la borraría nunca.
         let partitions = devfs::blockdev::scan_partitions(block);
-        for (part_idx, &(start_block, block_count)) in partitions.iter().enumerate() {
+        if partitions.len() > devfs::blockdev::MAX_PARTITIONS {
+            warn!(
+                "/dev/{}: {} particiones, sólo las {} primeras tienen nodo",
+                fname,
+                partitions.len(),
+                devfs::blockdev::MAX_PARTITIONS
+            );
+        }
+        for (part_idx, &(start_block, block_count)) in partitions
+            .iter()
+            .take(devfs::blockdev::MAX_PARTITIONS)
+            .enumerate()
+        {
             let part_num = part_idx + 1;
-            let part_name = if fname.starts_with("nvme") {
-                format!("{}p{}", fname, part_num)
-            } else {
-                format!("{}{}", fname, part_num)
-            };
+            let part_name = devfs::blockdev::partition_node_name(fname, part_num);
             let partition_driver = Arc::new(devfs::blockdev::PartitionBlock::new(
                 block.clone(),
                 format!("{}-part{}", fname, part_num),
@@ -3427,6 +3439,11 @@ pub fn rescan_partitions(
                 block_count,
             ));
             let part_dev_index = base_index + part_num;
+            // El mismo registro que apunta el recorrido del arranque: sin esto,
+            // una partición que apareciera en un re-escaneo (un `BLKRRPART`, o
+            // un disco enchufado en caliente) no la encontraba `volume_members`
+            // y el volumen EclipseFS que viviera en ella no se podía montar.
+            eclipsefs_mount::register_block_device(&part_name, partition_driver.clone());
             if let Err(e) = devfs_root.add(
                 &part_name,
                 Arc::new(devfs::BlockDev::new(
