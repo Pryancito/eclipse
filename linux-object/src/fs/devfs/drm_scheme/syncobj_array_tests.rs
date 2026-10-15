@@ -183,10 +183,16 @@ fn the_array_ioctls_take_more_than_sixty_four_handles() {
         Ok(0)
     );
     // RESET all: nothing is signaled any more, whichever is asked.
+    // RESET all: no fence any more, so a plain wait is EINVAL and one
+    // that waits for a submit runs to its deadline, whichever is asked.
     assert_eq!(array(&c, DRM_IOCTL_SYNCOBJ_RESET, &handles), Ok(0));
-    assert_eq!(wait(&c, &handles, 0), Err(FsError::TimedOut));
+    assert_eq!(wait(&c, &handles, 0), Err(FsError::InvalidParam));
     assert_eq!(
-        wait(&c, &handles[N - 1..], 0),
+        wait(
+            &c,
+            &handles[N - 1..],
+            DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT
+        ),
         Err(FsError::TimedOut),
         "the hundredth was reset too"
     );
@@ -218,6 +224,16 @@ fn the_array_ioctls_take_more_than_sixty_four_handles() {
     let sixes = alloc::vec![6u64; N];
     assert_eq!(
         timeline_wait(&c, &handles, &sixes, DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL),
+        Err(FsError::InvalidParam),
+        "nobody submitted 6"
+    );
+    assert_eq!(
+        timeline_wait(
+            &c,
+            &handles,
+            &sixes,
+            DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL | DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT
+        ),
         Err(FsError::TimedOut)
     );
     // Only the last one at 6: found at its index, not at one of the 64.
@@ -230,12 +246,125 @@ fn the_array_ioctls_take_more_than_sixty_four_handles() {
         ),
         Ok(0)
     );
+    // WAIT_ANY still needs WAIT_FOR_SUBMIT here: the other 99 have no
+    // fence at 6, and without the flag that is EINVAL, not a poll.
     assert_eq!(
         timeline_wait(&c, &handles, &sixes, 0),
+        Err(FsError::InvalidParam)
+    );
+    assert_eq!(
+        timeline_wait(&c, &handles, &sixes, DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT),
         Ok(N as u32 - 1),
         "first_signaled"
     );
     for h in handles {
+        destroy(&c, h);
+    }
+}
+
+/// `drm_syncobj_array_wait_timeout`: without WAIT_FOR_SUBMIT or
+/// WAIT_AVAILABLE, a handle that has no fence for its point is EINVAL
+/// at once -- a binary syncobj fresh from CREATE or after RESET, a
+/// timeline point nobody has submitted -- for every handle of the
+/// array, WAIT_ANY included; a fence that exists and has not landed
+/// runs to the deadline (ETIME). Both used to run to the deadline.
+#[test]
+fn a_wait_without_wait_for_submit_on_a_handle_without_a_fence_is_einval() {
+    let _serialised = drm::test_globals::lock();
+    let _hook = crate::fs::syncobj_eventfd::hardware_fence_tests::TEST_SERIAL.lock();
+    let _on = NouveauOn::new();
+    let c = Client::open(0);
+    let fresh = create(&c, false);
+    let done = create(&c, true);
+    assert_eq!(wait(&c, &[fresh], 0), Err(FsError::InvalidParam));
+    assert_eq!(
+        wait(&c, &[fresh], DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT),
+        Err(FsError::TimedOut),
+        "waiting for the submit runs to the deadline"
+    );
+    assert_eq!(wait(&c, &[done], 0), Ok(0));
+    assert_eq!(
+        wait(&c, &[done, fresh], 0),
+        Err(FsError::InvalidParam),
+        "checked for every handle, even with one already signaled"
+    );
+    assert_eq!(
+        wait(&c, &[done, fresh], DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT),
+        Ok(0)
+    );
+    // A fence in flight is not a missing one.
+    let landing_zone: u32 = 0;
+    assert!(zcore_drivers::scheme::syncobj::attach_hw_fence(
+        fresh,
+        1,
+        &landing_zone as *const u32 as usize,
+        0,
+        1,
+        0,
+        true,
+    ));
+    assert_eq!(wait(&c, &[fresh], 0), Err(FsError::TimedOut));
+    assert_eq!(array(&c, DRM_IOCTL_SYNCOBJ_SIGNAL, &[fresh]), Ok(0));
+    assert_eq!(wait(&c, &[fresh], 0), Ok(0));
+    assert_eq!(array(&c, DRM_IOCTL_SYNCOBJ_RESET, &[fresh]), Ok(0));
+    assert_eq!(
+        wait(&c, &[fresh], 0),
+        Err(FsError::InvalidParam),
+        "RESET drops the fence"
+    );
+    // A timeline: the chain has to reach the point, signaled or not.
+    let tl = create(&c, false);
+    assert_eq!(
+        timeline_wait(&c, &[tl], &[0], 0),
+        Err(FsError::InvalidParam),
+        "point 0 asks for the last fence, and there is none"
+    );
+    assert_eq!(
+        timeline_array(&c, DRM_IOCTL_SYNCOBJ_TIMELINE_SIGNAL, &[tl], &mut [5]),
+        Ok(0)
+    );
+    assert_eq!(timeline_wait(&c, &[tl], &[0], 0), Ok(0));
+    assert_eq!(timeline_wait(&c, &[tl], &[3], 0), Ok(0));
+    assert_eq!(timeline_wait(&c, &[tl], &[5], 0), Ok(0));
+    assert_eq!(
+        timeline_wait(&c, &[tl], &[6], 0),
+        Err(FsError::InvalidParam)
+    );
+    assert_eq!(
+        timeline_wait(&c, &[tl], &[6], DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT),
+        Err(FsError::TimedOut)
+    );
+    assert_eq!(
+        timeline_wait(&c, &[tl], &[6], DRM_SYNCOBJ_WAIT_FLAGS_WAIT_AVAILABLE),
+        Err(FsError::TimedOut)
+    );
+    assert_eq!(
+        timeline_wait(&c, &[done, tl], &[1, 6], 0),
+        Err(FsError::InvalidParam),
+        "the second handle has nothing at 6"
+    );
+    // Submitted but not landed at 7: a fence, so ETIME, and WAIT_AVAILABLE
+    // is satisfied by the submit alone.
+    assert!(zcore_drivers::scheme::syncobj::attach_hw_fence(
+        tl,
+        7,
+        &landing_zone as *const u32 as usize,
+        0,
+        1,
+        0,
+        false,
+    ));
+    assert_eq!(timeline_wait(&c, &[tl], &[6], 0), Err(FsError::TimedOut));
+    assert_eq!(timeline_wait(&c, &[tl], &[7], 0), Err(FsError::TimedOut));
+    assert_eq!(
+        timeline_wait(&c, &[tl], &[7], DRM_SYNCOBJ_WAIT_FLAGS_WAIT_AVAILABLE),
+        Ok(0)
+    );
+    assert_eq!(
+        timeline_wait(&c, &[tl], &[8], 0),
+        Err(FsError::InvalidParam)
+    );
+    for h in [fresh, done, tl] {
         destroy(&c, h);
     }
 }
