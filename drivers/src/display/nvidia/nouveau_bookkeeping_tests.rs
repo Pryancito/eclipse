@@ -8525,9 +8525,12 @@ fn a_zombie_whose_consumer_never_moves_is_freed_after_the_fence_timeout() {
 /// - The compositor is one thread: while it is inside an ioctl it serves
 ///   nothing, so an ioctl that waits is time the client's buffers stay
 ///   held. That is the coupling `vblank_mode=0` at 60 fps was made of.
+///
+/// The surfaceflip globals these drive (`SERIAL` over there) sit behind
+/// the same `crate::test_globals::LOCK` every test here takes, so one
+/// `LOCK.lock()` covers them: taking it twice would be a self-deadlock.
 mod glxgears_vblank_mode {
     use super::super::rm_host_shims::{reset_fake_hwflip, FAKE_HWFLIP};
-    use super::super::surfaceflip_tests::SERIAL;
     use super::*;
     use crate::nvme::nvme_queue::test_clock;
     use crate::scheme::syncobj;
@@ -9064,7 +9067,6 @@ mod glxgears_vblank_mode {
     #[test]
     fn a_parked_wait_walks_the_pending_fences_once_a_look_and_not_twice() {
         let _g = LOCK.lock();
-        let _s = SERIAL.lock();
         let _live = LiveBytes::hold();
 
         let run = |resolve: Resolve| {
@@ -9179,7 +9181,6 @@ mod glxgears_vblank_mode {
     #[test]
     fn the_fence_poll_tick_and_not_the_gpu_was_setting_the_frame_rate() {
         let _g = LOCK.lock();
-        let _s = SERIAL.lock();
         let _live = LiveBytes::hold();
 
         let rate = |poll: Poll| {
@@ -9240,7 +9241,6 @@ mod glxgears_vblank_mode {
     #[test]
     fn glxgears_with_vblank_mode_0_runs_at_the_speed_of_the_gpu_not_of_the_panel() {
         let _g = LOCK.lock();
-        let _s = SERIAL.lock();
         let _live = LiveBytes::hold();
         let gpu = desktop_gpu();
         let mut d = Desktop::new(&gpu, Swap::Immediate);
@@ -9280,7 +9280,6 @@ mod glxgears_vblank_mode {
     #[test]
     fn glxgears_with_vblank_mode_1_runs_at_exactly_the_refresh() {
         let _g = LOCK.lock();
-        let _s = SERIAL.lock();
         let _live = LiveBytes::hold();
         let gpu = desktop_gpu();
         let mut d = Desktop::new(&gpu, Swap::Vsync);
@@ -9299,7 +9298,6 @@ mod glxgears_vblank_mode {
     #[test]
     fn the_client_never_draws_into_a_buffer_the_compositor_is_still_reading() {
         let _g = LOCK.lock();
-        let _s = SERIAL.lock();
         let _live = LiveBytes::hold();
         let gpu = desktop_gpu();
         let mut d = Desktop::new(&gpu, Swap::Immediate);
@@ -9325,7 +9323,6 @@ mod glxgears_vblank_mode {
     #[test]
     fn a_frame_reaches_the_compositor_only_once_the_gpu_has_drawn_it() {
         let _g = LOCK.lock();
-        let _s = SERIAL.lock();
         let _live = LiveBytes::hold();
         let gpu = desktop_gpu();
         let mut d = Desktop::new(&gpu, Swap::Immediate);

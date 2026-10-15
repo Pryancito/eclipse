@@ -6,8 +6,9 @@ use crate::scheme::drm::DrmScheme;
 
 /// The fixture below writes process-wide state (the boot framebuffer,
 /// the opt-in flag, the ladder latch and its counters), so the tests
-/// take turns.
-pub(super) static SERIAL: lock::Mutex<()> = lock::Mutex::new(());
+/// take turns -- behind `crate::test_globals::LOCK`, since `set_enabled`
+/// and the boot-fb record are globals the bookkeeping tests drive too.
+pub(super) use crate::test_globals::LOCK as SERIAL;
 
 pub(super) const FB: u32 = 7;
 pub(super) const H_MEMORY: u32 = 0x1234;
