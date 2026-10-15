@@ -1492,22 +1492,43 @@ pub fn pending_hw_fences(handle: u32, point: u64) -> alloc::vec::Vec<(usize, u64
     r
 }
 
+/// Whether `handle` carries a fence for `target` (`drm_syncobj_find_fence`
+/// with no `WAIT_FOR_SUBMIT`): its counter is there, a hardware fence for
+/// the point is in flight, or a link promises it -- an imported `sync_file`
+/// is a fence of its own in Linux, whatever its source has done since, so
+/// a link counts whether or not the source is submitted (the difference
+/// with [`submitted_locked`], which follows the link to its source).
+fn has_fence_locked(table: &SyncobjTable, handle: u32, target: u64) -> bool {
+    effective_point(table, handle, LINK_DEPTH).is_some_and(|p| p >= target)
+        || table
+            .pending
+            .iter()
+            .any(|f| f.handle == handle && f.point >= target)
+        || table
+            .objects
+            .iter()
+            .find(|o| o.handle == handle)
+            .is_some_and(|o| o.links_to(target).is_some())
+}
+
 /// `drm_syncobj_array_wait_timeout` without `WAIT_FOR_SUBMIT` or
-/// `WAIT_AVAILABLE`: before anything is waited for, every handle must
-/// carry a fence for its point -- a binary syncobj any at all (there is
-/// none after `CREATE` without `SIGNALED`, or after `RESET`), a timeline
-/// one whose chain reaches the point, signaled or still in flight
+/// `WAIT_AVAILABLE`, and `drm_syncobj_find_fence` with flags 0 as
+/// `nouveau_job_add_deps` looks an EXEC's or a VM_BIND's waits up: before
+/// anything is waited for, every handle must carry a fence for its point
+/// -- a binary syncobj any at all (there is none after `CREATE` without
+/// `SIGNALED`, or after `RESET`), a timeline one whose chain reaches the
+/// point, signaled, still in flight or imported
 /// (`dma_fence_chain_find_seqno`). The index of the first handle without
 /// one, which the ioctl answers with EINVAL at once; a wait that simply
-/// ran to its deadline on such a handle (as this did) is ETIME, the code
-/// for "the fence exists and has not signaled".
+/// ran to its deadline on such a handle (as this did) is ETIME or EIO,
+/// the codes for "the fence exists and has not signaled".
 pub fn without_fence(handles: &[u32], points: Option<&[u64]>) -> Option<usize> {
     let (r, deferred) = {
         let mut table = TABLE.lock();
         let d = resolve_locked(&mut table);
         let r = handles.iter().enumerate().find_map(|(i, &h)| {
             let target = points.map(|p| p[i]).unwrap_or(1).max(1);
-            (!submitted_locked(&table, h, target, LINK_DEPTH)).then_some(i)
+            (!has_fence_locked(&table, h, target)).then_some(i)
         });
         (r, d)
     };
