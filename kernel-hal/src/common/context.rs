@@ -763,7 +763,9 @@ impl UserContext {
                     // the kernel), then service a shootdown the peer escalated
                     // to an NMI because no maskable IPI could land. Both are
                     // NMI-safe: no locks, no allocation, nothing printed.
-                    crate::kstats::note_nmi_rip(self.0.general.rip as u64);
+                    // No frame pointer: this NMI interrupted ring 3, and a
+                    // user `rbp` is not a chain the banner may walk.
+                    crate::kstats::note_nmi_rip(self.0.general.rip as u64, 0);
                     crate::common::ipi::tlb_shootdown_ack_nmi();
                     self.dbg_validate_user_ctx("after NMI from user");
                 }

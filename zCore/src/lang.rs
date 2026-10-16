@@ -159,6 +159,79 @@ pub(crate) fn sym_is_diagnosing(sym: &str) -> bool {
     NEEDLES.iter().any(|n| sym.contains(n))
 }
 
+/// How many of a HOLDER's callers the banner prints under its `is now at`
+/// line.
+///
+/// Three is what separates the two causes this banner cannot otherwise tell
+/// apart. A heap `dealloc` reached from `eclipsefs`'s write is three frames
+/// from the lock's acquire site; a `dealloc` that is merely the top of a
+/// convoy is not. Beyond three the chain stops discriminating and starts
+/// spending the verdict's budget -- see [`BANNER_BYTES`].
+pub(crate) const HOLDER_CHAIN_FRAMES: usize = 3;
+
+/// Walk a frame-pointer chain and collect up to `out.len()` return addresses.
+///
+/// Pure, so the whole of it is testable on the host: `read` fetches one qword,
+/// `stack_ok` says whether an address may be read as a stack qword at all, and
+/// `text_ok` says whether a word is a return address worth printing. The
+/// bare-metal caller passes a volatile read and the `kaddr` predicates; a test
+/// passes a synthetic stack.
+///
+/// The chain being walked belongs to ANOTHER cpu -- a wedged one, which is why
+/// its frames are stable enough to read -- so every step is guarded and the
+/// walk gives up rather than chase a word it cannot vouch for:
+///
+///  * `rbp` must be a readable stack qword, or there is nothing to read;
+///  * frames grow downward, so a `next` that does not increase is corrupt and
+///    would otherwise be a loop the painter never leaves;
+///  * a return address outside the kernel's text is not a caller, and
+///    printing it would invite `addr2line` on a number that means nothing.
+///
+/// Returns how many entries of `out` were filled.
+pub(crate) fn walk_frame_chain(
+    mut rbp: u64,
+    read: impl Fn(u64) -> u64,
+    stack_ok: impl Fn(u64) -> bool,
+    text_ok: impl Fn(u64) -> bool,
+    out: &mut [u64],
+) -> usize {
+    let mut n = 0;
+    while n < out.len() {
+        if !stack_ok(rbp) || !stack_ok(rbp + 8) {
+            break;
+        }
+        let next = read(rbp);
+        let ret = read(rbp + 8);
+        if !text_ok(ret) {
+            break;
+        }
+        out[n] = ret;
+        n += 1;
+        if next <= rbp {
+            break; // stack grows down; a non-increasing frame is corrupt
+        }
+        rbp = next;
+    }
+    n
+}
+
+/// [`walk_frame_chain`] over a wedged peer's real stack, with the kernel's own
+/// guards. Zero frames whenever the NMI brought back no usable frame pointer
+/// (it never landed, or it landed in ring 3).
+#[cfg(target_arch = "x86_64")]
+fn holder_chain(rbp: u64, out: &mut [u64; HOLDER_CHAIN_FRAMES]) -> usize {
+    if rbp == 0 {
+        return 0;
+    }
+    walk_frame_chain(
+        rbp,
+        |a| unsafe { core::ptr::read_volatile(a as *const u64) },
+        kernel_hal::kaddr::is_kernel_stack_qword,
+        kernel_hal::kaddr::is_kernel_text,
+        out,
+    )
+}
+
 /// How many bytes a banner may occupy. A stack buffer, because the panic
 /// handler must not allocate (the panic may BE an OOM) and must not depend on
 /// any lock.
@@ -618,6 +691,18 @@ fn dl_paint() {
                 c,
                 kernel_hal::ksyms::Addr(rip)
             );
+            // …and who called it. The top frame alone reads the same whether
+            // the holder is merely slow down there or wedged under a second
+            // lock; the chain is what the reader acts on. Same NMI that
+            // brought back the RIP, so no extra broadcast.
+            #[cfg(target_arch = "x86_64")]
+            {
+                let mut frames = [0u64; HOLDER_CHAIN_FRAMES];
+                let n = holder_chain(kernel_hal::kstats::nmi_rbp(c), &mut frames);
+                for ret in frames.iter().take(n) {
+                    let _ = write!(b, "\n   called from {}", kernel_hal::ksyms::Addr(*ret));
+                }
+            }
         } else {
             // No NMI landed: either that cpu is gone (halted, triple-faulted,
             // never started) or NMIs are blocked on it. Both are findings.
@@ -1745,12 +1830,78 @@ mod tests {
         // The slot table is what the banner is chiefly for: DL_SLOTS lines of a
         // path and a number, ~70 bytes each.
         let slot_table = DL_SLOTS * 70;
+        // Two HOLDERs are printed, and each may carry HOLDER_CHAIN_FRAMES
+        // `called from` lines. They are croppable, but cropping them is how
+        // the banner stops answering the question it was grown to answer, so
+        // they are budgeted like everything else.
+        let mut chain = StackBuf::new();
+        let _ = write!(
+            chain,
+            "\n   called from {}",
+            kernel_hal::ksyms::Addr(0xffff_ff00_0007_3bf2u64)
+        );
+        let chains = 2 * HOLDER_CHAIN_FRAMES * chain.valid_str().len();
+        assert_eq!(chain.dropped(), 0, "the measurement itself was cut");
         assert!(
-            MAX_NONACKER_LINES * line + slot_table + VERDICT_RESERVE <= BANNER_BYTES,
-            "{} non-acker lines of {line} B plus the slot table ({slot_table} B) \
-             and the verdict ({VERDICT_RESERVE} B) do not fit in {BANNER_BYTES} B",
+            MAX_NONACKER_LINES * line + slot_table + chains + VERDICT_RESERVE <= BANNER_BYTES,
+            "{} non-acker lines of {line} B plus the slot table ({slot_table} B), \
+             the holder chains ({chains} B) and the verdict ({VERDICT_RESERVE} B) \
+             do not fit in {BANNER_BYTES} B",
             MAX_NONACKER_LINES
         );
+    }
+
+    /// The guards are the whole of [`walk_frame_chain`]: it reads another
+    /// cpu's stack, and the cpu it reads is wedged, not stopped. A chain that
+    /// points back at itself used to be the painter's own hang.
+    #[test]
+    fn a_frame_chain_is_walked_only_as_far_as_it_can_be_vouched_for() {
+        const STACK: u64 = 0xffff_ff00_0010_0000;
+        const TEXT: u64 = 0xffff_ff00_0007_0000;
+        let stack_ok = |a: u64| a >= 0xffff_8000_0000_0000 && a % 8 == 0;
+        let text_ok = |a: u64| (TEXT..TEXT + 0x1000).contains(&a);
+
+        // Three frames, each pointing at the next one up the stack.
+        let frames = |a: u64| match a {
+            x if x == STACK => STACK + 0x100,
+            x if x == STACK + 8 => TEXT + 0x10,
+            x if x == STACK + 0x100 => STACK + 0x200,
+            x if x == STACK + 0x108 => TEXT + 0x20,
+            x if x == STACK + 0x200 => STACK + 0x300,
+            x if x == STACK + 0x208 => TEXT + 0x30,
+            _ => 0,
+        };
+        let mut out = [0u64; 4];
+        assert_eq!(walk_frame_chain(STACK, frames, stack_ok, text_ok, &mut out), 3);
+        assert_eq!(&out[..3], &[TEXT + 0x10, TEXT + 0x20, TEXT + 0x30]);
+
+        // The cap is the caller's slice, not the chain's length.
+        let mut two = [0u64; 2];
+        assert_eq!(walk_frame_chain(STACK, frames, stack_ok, text_ok, &mut two), 2);
+
+        // A frame pointing at itself is a loop; the frame it names is still a
+        // real caller, so it is reported and the walk then stops.
+        let selfloop = |a: u64| match a {
+            x if x == STACK => STACK,
+            x if x == STACK + 8 => TEXT + 0x10,
+            _ => 0,
+        };
+        let mut out = [0u64; 4];
+        assert_eq!(
+            walk_frame_chain(STACK, selfloop, stack_ok, text_ok, &mut out),
+            1,
+            "un marco que se apunta a si mismo tiene que cortar el paseo"
+        );
+
+        // A return address that is not kernel text is not a caller: nothing is
+        // printed rather than a number `addr2line` cannot place.
+        let junk = |a: u64| if a == STACK + 8 { 0x4142 } else { STACK + 0x100 };
+        let mut out = [0u64; 4];
+        assert_eq!(walk_frame_chain(STACK, junk, stack_ok, text_ok, &mut out), 0);
+
+        // No frame pointer at all (the NMI landed in ring 3, or never landed).
+        let mut out = [0u64; 4];
+        assert_eq!(walk_frame_chain(0, frames, stack_ok, text_ok, &mut out), 0);
     }
 
     /// What the serial re-emit guard is keyed on, now that it is not keyed on

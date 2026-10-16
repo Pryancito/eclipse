@@ -888,7 +888,12 @@ pub extern "C" fn trap_handler(tf: &mut TrapFrame) {
     // delivered even to a core spinning with interrupts disabled. Record the
     // interrupted RIP and return — do NOT fall through to the GernelFault panic.
     if tf.trap_num == 2 {
-        crate::kstats::note_nmi_rip(tf.rip as u64);
+        // The frame pointer goes with the RIP: one frame cannot tell "slow
+        // under the lock" from "wedged under the lock", and the deadlock
+        // banner walks this chain to print the holder's callers. Only from
+        // ring 0 -- a user `rbp` is not a chain this kernel walks.
+        let rbp = if tf.cs & 3 == 0 { tf.rbp as u64 } else { 0 };
+        crate::kstats::note_nmi_rip(tf.rip as u64, rbp);
         // If a peer escalated to NMI because this CPU was starving its TLB
         // shootdown (wedged IRQs-off or lost in a fault so no 0xf3 IPI landed),
         // service the queue now — the NMI reached us where a maskable IPI could
