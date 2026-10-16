@@ -231,6 +231,46 @@ fn the_resume_address_gate_falls_back_to_the_early_boot_text_range() {
     );
 }
 
+/// Y el rango a medio publicar, que es el caso que la puerta NO tenia.
+///
+/// `lock::fn_slot::text_range()` son dos palabras que el HAL escribe por
+/// separado, asi que entre el arranque y el final hay estados en los que una
+/// esta puesta y la otra no, o en los que las dos estan pero al reves. La
+/// condicion es `lo != 0 && hi > lo` precisamente por eso: cualquier par que
+/// no sea un rango de verdad vuelve al rango de arranque, que si lo es.
+///
+/// El test de arriba solo pasa `(0, 0)`, donde las dos mitades de la `&&` son
+/// falsas a la vez y da igual como esten unidas: con `||` en su lugar el
+/// resultado es el mismo y la mutacion sobrevive. Los pares de aqui son los
+/// que las separan. Un rango invertido aceptado no contiene NADA, asi que la
+/// puerta contestaria «esta rip no es del nucleo» para todas: el abandono de
+/// pila del `oops` se declararia imposible justo cuando hace falta.
+#[test]
+#[cfg(target_arch = "x86_64")]
+fn a_half_published_text_range_falls_back_instead_of_being_believed() {
+    let inside = KERNEL_TEXT.start + 0x10;
+    // Las dos mitades, cada una por su lado.
+    assert!(
+        resume_address_in_text(inside, (0, 0x1000)),
+        "un final sin principio se creyo como rango"
+    );
+    assert!(
+        resume_address_in_text(inside, (0x2000, 0)),
+        "un principio sin final se creyo como rango"
+    );
+    // Y el par invertido, que si se acepta no contiene ninguna direccion.
+    assert!(
+        resume_address_in_text(inside, (0x2000, 0x1000)),
+        "un rango invertido se creyo, y asi NINGUNA rip es del nucleo"
+    );
+    // Un rango de verdad si manda, y entonces el de arranque no cuenta.
+    assert!(resume_address_in_text(0x1500, (0x1000, 0x2000)));
+    assert!(
+        !resume_address_in_text(inside, (0x1000, 0x2000)),
+        "con el rango publicado, el de arranque ya no es la respuesta"
+    );
+}
+
 /// Las dos puertas de robo, con el runtime sin construir: no hay victima
 /// posible y lo que no puede pasar es que entren a buscarla.
 #[test]
@@ -747,4 +787,106 @@ fn the_abandon_entry_points_refuse_without_a_runtime() {
     assert!(!unsafe { abandon_current_task() });
     assert!(!unsafe { abandon_executor_for_sp(current_sp()) });
     assert!(!unsafe { abandon_executor_for_sp(0) });
+}
+
+/// Las guardas `cpu >= MAX_CORE_NUM` que protegen un ARRAY POR CPU, probadas
+/// en el id que las rompe.
+///
+/// Hay trece de estas guardas en `runtime.rs` y no todas son lo mismo. Ocho
+/// siguen con un `GLOBAL_RUNTIME.try_lock_cpu(cpu)`, que comprueba el rango
+/// por su cuenta y contesta `None` para cualquier id de mas: ahi la guarda es
+/// una economia y quitarla no cambia la respuesta (de hecho un mutante que la
+/// convierte en `>` SOBREVIVE, y es equivalente de verdad). Las cinco de aqui
+/// son las otras: detras de la guarda hay un `ARRAY[cpu]` o un `1u64 << cpu`,
+/// y con `cpu == MAX_CORE_NUM` eso es un indice fuera del array o un
+/// desplazamiento mas ancho que la palabra -- un panico del nucleo en el
+/// camino de la trampa, no una respuesta equivocada.
+///
+/// Ninguna la tenia: las sondas de arriba usan `NO_DENSE_ID` contra las que
+/// pasan por `try_lock_cpu`, y estas cinco leen su CPU de `cpu_id()`, que en
+/// el anfitrion vale 0 salvo que alguien la preste. `MAX_CORE_NUM` es el id
+/// que importa, porque es el PRIMERO que no cabe: con el, `>=` y `>` se
+/// separan y `lock::current_cpu_id()` ya devuelve 255 para una CPU sin id
+/// logico denso, asi que el caso no es hipotetico.
+#[cfg(test)]
+mod per_cpu_array_bounds_tests {
+    use super::*;
+
+    /// El primer id que no cabe en ningun array por CPU de este fichero.
+    const FIRST_ID_THAT_DOES_NOT_FIT: u8 = MAX_CORE_NUM as u8;
+
+    /// `REBALANCE_TICK[cpu]`, en el camino del poll.
+    #[test]
+    fn the_rebalance_cadence_counts_nothing_for_a_cpu_with_no_slot() {
+        let _lock = resched_test_lock();
+        let _cpu = AsCpu::new(FIRST_ID_THAT_DOES_NOT_FIT);
+        assert!(
+            !rebalance_due(),
+            "una CPU sin hueco no tiene contador de poll que adelantar"
+        );
+    }
+
+    /// `WAKE_SEEN[cpu]`, en el camino de la publicacion de un wake.
+    ///
+    /// Con la sonda APAGADA la funcion sale antes de la guarda, asi que este
+    /// test la enciende: si no, pasaria sin haber llegado a mirar el id.
+    #[test]
+    fn the_wake_sampler_stamps_nothing_for_a_cpu_with_no_slot() {
+        let _lock = resched_test_lock();
+        let was = wake_latency_enabled();
+        set_wake_latency(true);
+        let _cpu = AsCpu::new(FIRST_ID_THAT_DOES_NOT_FIT);
+        // Un periodo entero del muestreador, para que no pase por haber
+        // caido en una vuelta que no se muestrea.
+        for _ in 0..WAKE_SAMPLE_PERIOD {
+            assert!(
+                sample_wake_stamp().is_none(),
+                "se sello un wake con el contador por CPU fuera de rango"
+            );
+        }
+        set_wake_latency(was);
+    }
+
+    /// `ENTRY_REASON[cpu]`, escrito en el despertar del `hlt` y leido al
+    /// atribuir la entrada.
+    #[test]
+    fn the_entry_reason_is_neither_stored_nor_read_for_a_cpu_with_no_slot() {
+        let _lock = resched_test_lock();
+        let _cpu = AsCpu::new(FIRST_ID_THAT_DOES_NOT_FIT);
+        note_entry_reason(WAKE_ENTRY_HALT_KICKED);
+        assert_eq!(
+            entry_reason(),
+            WAKE_ENTRY_UNKNOWN as usize,
+            "una CPU sin hueco no tiene fila de atribucion"
+        );
+    }
+
+    /// `1u64 << cpu` en las dos caras del `need_resched`: la que lo consume y
+    /// la que solo lo mira. Un desplazamiento de 64 sobre un `u64` no es un
+    /// cero, es un panico en depuracion y basura en release.
+    #[test]
+    fn the_reschedule_lane_is_empty_for_a_cpu_with_no_slot() {
+        let _lock = resched_test_lock();
+        let saved = NEED_RESCHED.load(Ordering::SeqCst);
+        // Con TODOS los bits puestos: lo que se comprueba es que el id no
+        // llega al desplazamiento, no que la palabra estuviera a cero.
+        NEED_RESCHED.store(u64::MAX, Ordering::SeqCst);
+        {
+            let _cpu = AsCpu::new(FIRST_ID_THAT_DOES_NOT_FIT);
+            assert!(
+                !need_resched_pending(),
+                "se leyo un bit de replanificacion para una CPU sin cola"
+            );
+            assert!(
+                !take_need_resched(),
+                "se consumio un bit de replanificacion para una CPU sin cola"
+            );
+        }
+        assert_eq!(
+            NEED_RESCHED.load(Ordering::SeqCst),
+            u64::MAX,
+            "la toma de una CPU sin hueco borro el bit de otra"
+        );
+        NEED_RESCHED.store(saved, Ordering::SeqCst);
+    }
 }

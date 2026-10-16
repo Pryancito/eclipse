@@ -2928,6 +2928,8 @@ mod exec_order_tests;
 mod exit_signal_tests;
 #[cfg(test)]
 mod fork_child_tid_tests;
+#[cfg(test)]
+mod sched_validate_tests;
 
 #[cfg(test)]
 mod pdeathsig_tests {
