@@ -802,6 +802,12 @@ impl LinuxThread {
         let siginfo = unsafe { &*(siginfo_ptr as *const SigInfo) };
         let user_ctx = unsafe { &*(uctx_ptr as *const SignalUserContext) };
         let check = unmodified_check(siginfo, &self.handling_info, user_ctx);
+        // This gate decides one log line and nothing else -- see the
+        // tolerance note below -- so the mutation that turns it into
+        // `check == 0` is an equivalent one for any test that does not
+        // capture the log, and it survives on purpose. What the tests pin is
+        // the WORD: `unmodified_check`'s bits, one per field, since the bit
+        // positions are the whole of what a reader of that line can use.
         if check != 0 {
             error!("unsupported signal fields : {:b}", check);
             trace!("uctx = {:x?}", *user_ctx);
@@ -2511,5 +2517,82 @@ mod siginfo_tests {
         let mut doctored = delivered;
         doctored.errno = 3;
         assert_eq!(unmodified_check(&doctored, &t.handling_info, &uctx) & 1, 1);
+    }
+
+    /// And one bit per field, in the positions the log line names.
+    ///
+    /// `error!("unsupported signal fields : {:b}")` is the whole output of
+    /// this function -- it gates nothing, the comment next to it says so --
+    /// so the bit positions ARE the contract: whoever reads `1000` in a log
+    /// has to be able to look up which field moved. Only bit 0 was tested;
+    /// the other four mutants (each `!=` and the `check != 0` gate) survived,
+    /// so every bit of that word could have shifted without a test noticing.
+    ///
+    /// `uc_stack` and `uc_mcontext` are deliberately NOT compared (the kernel
+    /// fills them and `sigreturn` honours what the handler left), so bits 3
+    /// and 5 do not exist, and this asserts that too: a frame that changes
+    /// only those two is still "unmodified", which is the regression that
+    /// used to log on every single signal.
+    #[test]
+    fn each_ucontext_field_the_check_watches_has_its_own_bit() {
+        let t = LinuxThread::initial();
+        let delivered = t.handling_info;
+        let clean = SignalUserContext::default();
+        assert_eq!(
+            unmodified_check(&delivered, &t.handling_info, &clean),
+            0,
+            "an untouched frame was reported as modified"
+        );
+
+        let ctx = SignalUserContext {
+            flags: 1,
+            ..Default::default()
+        };
+        assert_eq!(unmodified_check(&delivered, &t.handling_info, &ctx), 1 << 1);
+
+        let ctx = SignalUserContext {
+            link: 0x1000,
+            ..Default::default()
+        };
+        assert_eq!(unmodified_check(&delivered, &t.handling_info, &ctx), 1 << 2);
+
+        let mut pad = [0u64; 15];
+        pad[14] = 7;
+        let ctx = SignalUserContext {
+            _pad: pad,
+            ..Default::default()
+        };
+        assert_eq!(unmodified_check(&delivered, &t.handling_info, &ctx), 1 << 4);
+
+        // The two the kernel fills: no bit, and no log.
+        let mut ctx = SignalUserContext {
+            stack: SignalStack {
+                sp: 0x4000,
+                size: 0x2000,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        ctx.context.set_pc(0x5000);
+        assert_eq!(
+            unmodified_check(&delivered, &t.handling_info, &ctx),
+            0,
+            "the fields sigreturn honours were counted as unsupported"
+        );
+    }
+
+    /// The FPU save area, which is the x86_64 frame's own tail.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn a_changed_fpu_save_area_gets_the_top_bit() {
+        let t = LinuxThread::initial();
+        let ctx = SignalUserContext {
+            fpregs_mem: crate::signal::FpregsMem::scribbled(),
+            ..Default::default()
+        };
+        assert_eq!(
+            unmodified_check(&t.handling_info, &t.handling_info, &ctx),
+            1 << 6
+        );
     }
 }
