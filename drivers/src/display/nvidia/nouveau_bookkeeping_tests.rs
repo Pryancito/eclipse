@@ -9421,3 +9421,7 @@ mod exec_tests;
 /// The buffer's reservation (imported fences, ring probes): same harness,
 /// own file, same reason.
 mod resv_tests;
+
+/// The GEM_PUSHBUF arm (the nvc0 Gallium path): same harness, own file,
+/// same reason.
+mod pushbuf_tests;

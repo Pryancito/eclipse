@@ -1295,6 +1295,23 @@ pub(super) struct DrmNouveauGemPushbufPush {
     pub length: u64,
 }
 
+/// The caps of `nouveau_gem_ioctl_pushbuf` on one request (`nouveau_drm.h`):
+/// more pushes, buffers or relocs than these is EINVAL before anything is
+/// copied from the client.
+pub(super) const NOUVEAU_GEM_MAX_BUFFERS: u32 = 1024;
+pub(super) const NOUVEAU_GEM_MAX_RELOCS: u32 = 1024;
+pub(super) const NOUVEAU_GEM_MAX_PUSH: u32 = 512;
+
+/// `nouveau_gem_ioctl_pushbuf`'s count checks, in its order (push, buffers,
+/// relocs); only asked once `nr_push` is not 0, which is a request with
+/// nothing to submit.
+#[inline]
+pub(super) const fn pushbuf_counts_ok(nr_push: u32, nr_buffers: u32, nr_relocs: u32) -> bool {
+    nr_push <= NOUVEAU_GEM_MAX_PUSH
+        && nr_buffers <= NOUVEAU_GEM_MAX_BUFFERS
+        && nr_relocs <= NOUVEAU_GEM_MAX_RELOCS
+}
+
 #[repr(C)]
 #[allow(dead_code)]
 pub(super) struct DrmNouveauGemPushbuf {
@@ -2795,6 +2812,18 @@ mod gl_client_abi_tests {
             "a uvmm client's kind is its own"
         );
         assert_eq!(gem_reported_kind(0x0e, 12, false), 0x0e);
+    }
+
+    /// `nouveau_gem_ioctl_pushbuf` caps a request at 512 pushes, 1024
+    /// buffers and 1024 relocs (`NOUVEAU_GEM_MAX_*`), each on its own.
+    #[test]
+    fn a_pushbuf_request_is_capped_at_512_pushes_and_1024_buffers_and_relocs() {
+        assert!(pushbuf_counts_ok(1, 0, 0));
+        assert!(pushbuf_counts_ok(512, 1024, 1024), "the caps themselves");
+        assert!(!pushbuf_counts_ok(513, 0, 0), "one push too many");
+        assert!(!pushbuf_counts_ok(1, 1025, 0), "one buffer too many");
+        assert!(!pushbuf_counts_ok(1, 0, 1025), "one reloc too many");
+        assert!(!pushbuf_counts_ok(u32::MAX, u32::MAX, u32::MAX));
     }
 
     #[test]
