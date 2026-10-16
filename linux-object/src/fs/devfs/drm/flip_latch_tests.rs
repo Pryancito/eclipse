@@ -27,6 +27,8 @@ fn queue_one(file: &Arc<DrmFileState>) {
         crtc_id: SYNTH_CRTC_ID,
         user_data: 0xF11D,
         file: Arc::downgrade(file),
+        event: true,
+        out_fence: None,
     });
 }
 
@@ -127,6 +129,8 @@ fn a_flushed_flip_whose_file_is_gone_leaves_the_population_too() {
             crtc_id: SYNTH_CRTC_ID,
             user_data: 0xF11D,
             file: Weak::new(),
+            event: true,
+            out_fence: None,
         });
     }
     flush_pending_flip_completions();
@@ -301,7 +305,15 @@ fn an_atomic_commit_that_lands_mid_delivery_waits_for_it_too() {
     // `drm_atomic_crtc_check` does. This is a frame on a running output.
     let was_active = core::mem::replace(&mut DRM_STATE.lock().atomic.active, true);
     let (answer, first_completion_was_on_the_fd) = race_against_delivery(&file, |file| {
-        atomic_commit(&AtomicUpdate::default(), false, false, true, 0xA70, file)
+        atomic_commit(
+            &AtomicUpdate::default(),
+            false,
+            false,
+            true,
+            0xA70,
+            file,
+            None,
+        )
     });
     DRM_STATE.lock().atomic.active = was_active;
     assert_eq!(
@@ -351,7 +363,15 @@ fn a_commit_without_an_event_does_not_wait_for_the_delivery() {
     leave_one_mid_delivery(&file);
 
     assert_eq!(
-        atomic_commit(&AtomicUpdate::default(), false, false, false, 0, &file),
+        atomic_commit(
+            &AtomicUpdate::default(),
+            false,
+            false,
+            false,
+            0,
+            &file,
+            None
+        ),
         Ok(())
     );
     assert!(
@@ -360,6 +380,252 @@ fn a_commit_without_an_event_does_not_wait_for_the_delivery() {
     );
     assert!(!file.has_events());
     finish_delivery(&file);
+    reset();
+}
+
+/// `OUT_FENCE_PTR`: the fence of a commit signals when its completion
+/// is delivered -- with the event, if one was asked for; alone if not
+/// (`drm_send_event_helper` signals `e->fence`, then looks at
+/// `file_priv`); and still if the drm_file is gone by then. It used to
+/// be a fence signaled at creation, and a compositor that released the
+/// previous buffer on it did so while that buffer was still on screen.
+#[test]
+fn an_out_fence_signals_when_the_completion_is_delivered_event_or_not() {
+    use zcore_drivers::scheme::syncobj;
+    let _serialised = super::test_globals::lock();
+    reset();
+
+    // No event asked for: the fence signals, nothing reaches the fd,
+    // and the flip leaves the population.
+    let file = DrmFileState::new();
+    let fence = syncobj::create(false);
+    {
+        let mut q = PENDING_DRM_TIMERS.lock();
+        FLIPS_IN_FLIGHT.fetch_add(1, Ordering::AcqRel);
+        FLIP_EVENT_PENDING.store(true, Ordering::Release);
+        q.push_back(PendingDrmTimer::Flip {
+            crtc_id: SYNTH_CRTC_ID,
+            user_data: 0,
+            file: Arc::downgrade(&file),
+            event: false,
+            out_fence: Some(fence),
+        });
+    }
+    assert_eq!(syncobj::query(fence), Some(0), "not before the delivery");
+    flush_pending_flip_completions();
+    assert_eq!(syncobj::query(fence), Some(1), "the fence did not signal");
+    assert!(!file.has_events(), "no event was asked for");
+    assert_eq!(FLIPS_IN_FLIGHT.load(Ordering::Acquire), 0);
+    assert!(!FLIP_EVENT_PENDING.load(Ordering::Acquire));
+    syncobj::destroy(fence);
+
+    // Event and fence, from the timer: both.
+    let fence = syncobj::create(false);
+    {
+        let mut q = PENDING_DRM_TIMERS.lock();
+        FLIPS_IN_FLIGHT.fetch_add(1, Ordering::AcqRel);
+        FLIP_EVENT_PENDING.store(true, Ordering::Release);
+        q.push_back(PendingDrmTimer::Flip {
+            crtc_id: SYNTH_CRTC_ID,
+            user_data: 0xF11D,
+            file: Arc::downgrade(&file),
+            event: true,
+            out_fence: Some(fence),
+        });
+    }
+    deliver_pending_drm_timer();
+    assert_eq!(syncobj::query(fence), Some(1));
+    assert!(file.has_events(), "the completion did not reach the fd");
+    assert_eq!(FLIPS_IN_FLIGHT.load(Ordering::Acquire), 0);
+    syncobj::destroy(fence);
+
+    // The drm_file closed before the delivery: the fence is somebody
+    // else's to wait on (its sync_file may have been handed out) and
+    // signals all the same.
+    let fence = syncobj::create(false);
+    {
+        let mut q = PENDING_DRM_TIMERS.lock();
+        FLIPS_IN_FLIGHT.fetch_add(1, Ordering::AcqRel);
+        FLIP_EVENT_PENDING.store(true, Ordering::Release);
+        q.push_back(PendingDrmTimer::Flip {
+            crtc_id: SYNTH_CRTC_ID,
+            user_data: 0,
+            file: Weak::new(),
+            event: true,
+            out_fence: Some(fence),
+        });
+    }
+    flush_pending_flip_completions();
+    assert_eq!(syncobj::query(fence), Some(1), "the fence of a closed file");
+    assert_eq!(FLIPS_IN_FLIGHT.load(Ordering::Acquire), 0);
+    syncobj::destroy(fence);
+    reset();
+}
+
+/// The drm_file closing takes its queued completions with it
+/// (`cancel_pending_timers_for_file`); the out-fence of one signals then
+/// rather than never, as Linux's would at the flip it belongs to.
+#[test]
+fn closing_the_drm_file_signals_the_out_fence_of_its_dropped_completion() {
+    use zcore_drivers::scheme::syncobj;
+    let _serialised = super::test_globals::lock();
+    reset();
+    let file = DrmFileState::new();
+    let fence = syncobj::create(false);
+    {
+        let mut q = PENDING_DRM_TIMERS.lock();
+        FLIPS_IN_FLIGHT.fetch_add(1, Ordering::AcqRel);
+        FLIP_EVENT_PENDING.store(true, Ordering::Release);
+        q.push_back(PendingDrmTimer::Flip {
+            crtc_id: SYNTH_CRTC_ID,
+            user_data: 0,
+            file: Arc::downgrade(&file),
+            event: false,
+            out_fence: Some(fence),
+        });
+    }
+    drop(file);
+    assert!(
+        PENDING_DRM_TIMERS.lock().is_empty(),
+        "the job went with the file"
+    );
+    assert_eq!(syncobj::query(fence), Some(1), "the fence never signaled");
+    assert_eq!(FLIPS_IN_FLIGHT.load(Ordering::Acquire), 0);
+    syncobj::destroy(fence);
+    reset();
+}
+
+/// An atomic commit with an out-fence and no event owes the CRTC a
+/// completion all the same: it is paced to the vblank like an event, it
+/// puts no event on the fd, and it is refused on a CRTC that is off and
+/// stays off, as `drm_atomic_crtc_check` refuses the event the fence
+/// hangs off.
+#[test]
+fn a_commit_with_only_an_out_fence_owes_a_completion_but_no_event() {
+    use zcore_drivers::scheme::syncobj;
+    let _serialised = super::test_globals::lock();
+    reset();
+    let file = DrmFileState::new();
+
+    let was_active = core::mem::replace(&mut DRM_STATE.lock().atomic.active, false);
+    let fence = syncobj::create(false);
+    assert_eq!(
+        atomic_commit(
+            &AtomicUpdate::default(),
+            false,
+            false,
+            false,
+            0,
+            &file,
+            Some(fence)
+        ),
+        Err(AtomicError::Invalid),
+        "an out-fence on a dark CRTC was accepted"
+    );
+    assert_eq!(FLIPS_IN_FLIGHT.load(Ordering::Acquire), 0);
+    assert_eq!(syncobj::query(fence), Some(0));
+
+    // The next vblank slot is in the future as of now, so the completion
+    // waits for it instead of being delivered on the spot (see
+    // `arm_coalesced_drm_timer_locked`).
+    DRM_STATE.lock().next_vblank = kernel_hal::timer::timer_now();
+    DRM_STATE.lock().atomic.active = true;
+    assert_eq!(
+        atomic_commit(
+            &AtomicUpdate::default(),
+            false,
+            false,
+            false,
+            0,
+            &file,
+            Some(fence)
+        ),
+        Ok(())
+    );
+    DRM_STATE.lock().atomic.active = was_active;
+    assert_eq!(
+        FLIPS_IN_FLIGHT.load(Ordering::Acquire),
+        1,
+        "no completion was owed"
+    );
+    assert!(PENDING_DRM_TIMERS.lock().iter().any(|j| matches!(
+        j,
+        PendingDrmTimer::Flip {
+            event: false,
+            out_fence: Some(h),
+            ..
+        } if *h == fence
+    )));
+    assert_eq!(syncobj::query(fence), Some(0), "signaled before the vblank");
+    flush_pending_flip_completions();
+    assert_eq!(syncobj::query(fence), Some(1));
+    assert!(!file.has_events(), "an event nobody asked for");
+    let_the_armed_timer_fire();
+    syncobj::destroy(fence);
+    reset();
+}
+
+/// The legacy `PAGE_FLIP` path goes through the same scheduling with an
+/// event and no fence: its completion still reaches the fd.
+#[test]
+fn the_legacy_flip_event_still_reaches_the_fd() {
+    let _serialised = super::test_globals::lock();
+    reset();
+    let file = DrmFileState::new();
+    DRM_STATE.lock().next_vblank = kernel_hal::timer::timer_now();
+    schedule_flip_event(SYNTH_CRTC_ID, 0xF11D, &file);
+    assert!(PENDING_DRM_TIMERS.lock().iter().any(|j| matches!(
+        j,
+        PendingDrmTimer::Flip {
+            event: true,
+            out_fence: None,
+            user_data: 0xF11D,
+            ..
+        }
+    )));
+    flush_pending_flip_completions();
+    assert!(
+        file.has_events(),
+        "the legacy completion did not reach the fd"
+    );
+    assert_eq!(FLIPS_IN_FLIGHT.load(Ordering::Acquire), 0);
+    let_the_armed_timer_fire();
+    reset();
+}
+
+/// A commit with only an out-fence lands mid-delivery like one with an
+/// event, and waits for that delivery the same way: its completion is
+/// the next one on the CRTC, so it must not overtake the one in flight.
+#[test]
+fn a_commit_with_only_an_out_fence_waits_for_a_delivery_in_progress_too() {
+    use zcore_drivers::scheme::syncobj;
+    let _serialised = super::test_globals::lock();
+    reset();
+    let file = DrmFileState::new();
+    leave_one_mid_delivery(&file);
+
+    let was_active = core::mem::replace(&mut DRM_STATE.lock().atomic.active, true);
+    let fence = syncobj::create(false);
+    let (answer, first_completion_was_on_the_fd) = race_against_delivery(&file, move |file| {
+        atomic_commit(
+            &AtomicUpdate::default(),
+            false,
+            false,
+            false,
+            0,
+            file,
+            Some(fence),
+        )
+    });
+    DRM_STATE.lock().atomic.active = was_active;
+    assert_eq!(answer, Ok(()));
+    assert!(
+        first_completion_was_on_the_fd,
+        "the commit went ahead before the completion reached the fd"
+    );
+    assert_eq!(FLIPS_IN_FLIGHT.load(Ordering::Acquire), 1);
+    let_the_armed_timer_fire();
+    syncobj::destroy(fence);
     reset();
 }
 

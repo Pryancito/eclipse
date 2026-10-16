@@ -600,17 +600,20 @@ fn a_null_out_fence_pointer_is_staged_and_a_bad_one_is_refused() {
     );
     assert_eq!(upd.out_fence_ptr, Some(0));
 
-    // A real address of the right size passes the check.
-    let slot = 0i32;
+    // A real address of the right size passes the check, and reads `-1`
+    // from that moment (`put_user(-1, fence_ptr)`): the slot is never
+    // left as the client had it.
+    let mut slot = 0x5A5A_5A5Ai32;
     let mut upd = drm::AtomicUpdate::default();
     assert_eq!(
         atomic_stage_on(
             &mut upd,
             AtomicObject::Crtc,
             PROP_OUT_FENCE_PTR,
-            &slot as *const i32 as u64,
+            &mut slot as *mut i32 as u64,
         ),
         Ok(()),
     );
-    assert_eq!(upd.out_fence_ptr, Some(&slot as *const i32 as u64));
+    assert_eq!(upd.out_fence_ptr, Some(&mut slot as *mut i32 as u64));
+    assert_eq!(slot, -1, "staging the property writes -1 into the slot");
 }

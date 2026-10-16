@@ -211,9 +211,12 @@ fn a_value_the_property_cannot_take_is_refused_at_the_property_not_by_the_commit
             "{} was not refused as an invalid value",
             what,
         );
+        // The fence pointer came first in the list, and staging it is
+        // what writes the `-1` (`put_user(-1, fence_ptr)`); the refusal
+        // of the next property leaves that in place, and no fd.
         assert_eq!(
-            slot, UNWRITTEN,
-            "{}: the commit never ran, so the fence slot must be left alone",
+            slot, -1,
+            "{}: the fence slot must read -1 from the staging of OUT_FENCE_PTR",
             what,
         );
     }
@@ -239,9 +242,11 @@ fn a_value_the_property_cannot_take_is_refused_at_the_property_not_by_the_commit
             "{} was not refused as a property the object does not have",
             what,
         );
+        // Same as above: the `-1` is the staging of OUT_FENCE_PTR, which
+        // came first; the refused property wrote nothing.
         assert_eq!(
-            slot, UNWRITTEN,
-            "{}: the fence slot must be left alone",
+            slot, -1,
+            "{}: the fence slot must read -1 from the staging of OUT_FENCE_PTR",
             what
         );
     }
@@ -309,12 +314,10 @@ fn a_test_only_commit_writes_minus_one_and_presents_nothing() {
 
     // What this pins is that the slot IS written, with `-1`. That it is `-1`
     // *rather than a real fd* is not separable here and no sharper test will
-    // separate it: installing the signaled stub needs a current thread with
-    // a Linux fd table, and a hosted test has neither, so
-    // `try_signaled_out_fence_fd` returns `None` and the success leg writes
-    // `-1` too. Swapping the two legs therefore survives this module by
-    // construction; the leg that is checkable is checked above and in
-    // `a_failed_commit_still_writes_minus_one_into_the_out_fence_slot`.
+    // separate it: the fd needs a current thread with a Linux fd table,
+    // and a hosted test has neither, so `reserve_out_fence` makes no fence
+    // and the success leg leaves the `-1` too. What the fence does once
+    // there is one is `drm.rs`'s `out_fence_tests`.
     assert_eq!(slot, -1, "TEST_ONLY did not write the fence slot");
     assert!(
         (0..8).all(|y| (0..32).all(|x| screen.pixel(x, y) == kms_emu::UNTOUCHED)),
@@ -327,7 +330,7 @@ fn a_test_only_commit_writes_minus_one_and_presents_nothing() {
 /// one case where not writing is right: no commit was attempted, so there is
 /// no fence to describe -- and `-1` would look like "committed, no fence".
 #[test]
-fn a_rejected_property_aborts_before_the_fence_is_written() {
+fn the_slot_reads_minus_one_from_the_property_on_even_if_the_request_is_then_refused() {
     let (_screen, c) = atomic_client(32, 8);
     let mut slot: i32 = UNWRITTEN;
     // The fence pointer is staged first, then an unknown property id.
@@ -343,9 +346,21 @@ fn a_rejected_property_aborts_before_the_fence_is_written() {
         "an unknown property was staged"
     );
     assert_eq!(
-        slot, UNWRITTEN,
-        "a commit that never ran handed the client a fence"
+        slot, -1,
+        "the slot was left as the client had it: the property wrote nothing"
     );
+
+    // The other order: the walk stops at the unknown property before it
+    // reaches the fence pointer, so nothing is written.
+    let mut slot: i32 = UNWRITTEN;
+    let req = Request::new(
+        &[drm::SYNTH_CRTC_ID],
+        &[2],
+        &[0xDEAD, PROP_OUT_FENCE_PTR],
+        &[0, &mut slot as *mut i32 as u64],
+    );
+    assert!(commit(&c, &req, 0).is_err());
+    assert_eq!(slot, UNWRITTEN, "a property the walk never reached wrote");
 }
 
 /// A NULL out-fence pointer is legal and writes nothing. libdrm passes NULL

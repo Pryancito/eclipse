@@ -2788,6 +2788,13 @@ impl DrmDev {
                     upd.mode_blob,
                     upd.active
                 );
+                // `prepare_signaling`: the out-fence and its fd exist before
+                // the commit runs, and a TEST_ONLY commit makes none.
+                let out_fence_ptr = upd.out_fence_ptr.filter(|&ptr| ptr != 0);
+                let out_fence = match out_fence_ptr {
+                    Some(_) if !test_only => reserve_out_fence()?,
+                    _ => None,
+                };
                 let commit = drm::atomic_commit(
                     &upd,
                     test_only,
@@ -2795,15 +2802,18 @@ impl DrmDev {
                     want_event,
                     req.user_data,
                     &self.file,
+                    out_fence.as_ref().map(|f| f.handle),
                 );
-                // OUT_FENCE_PTR writeback: Linux writes -1 on TEST_ONLY/failure
-                // and a sync_file fd on success. Real out-fences need HW flip
-                // completion; we install a signaled stub when possible.
-                if let Some(ptr) = upd.out_fence_ptr {
-                    if commit.is_err() || test_only {
-                        let _ = write_out_fence_ptr(ptr, true);
+                // `complete_signaling`: the fd is the client's once the
+                // commit went through, and goes back otherwise, the slot
+                // keeping the `-1` the staging wrote (as it does after a
+                // TEST_ONLY commit). The fd used to be a fence signaled at
+                // creation, installed after the commit.
+                if let (Some(ptr), Some(fence)) = (out_fence_ptr, out_fence) {
+                    if commit.is_ok() {
+                        write_out_fence_slot(ptr, fence.fd);
                     } else {
-                        write_out_fence_ptr(ptr, false)?;
+                        fence.put_back();
                     }
                 }
                 commit.map_err(|e| match e {
@@ -5944,10 +5954,16 @@ fn atomic_stage_on(
             PROP_ACTIVE => upd.active = Some(value != 0),
             PROP_MODE_ID => upd.mode_blob = Some(value as u32),
             // OUT_FENCE_PTR: userspace pointer that must receive an i32 fd.
-            // NULL is ignored; non-null is staged for writeback after commit.
+            // NULL is ignored; a non-null one gets `-1` written into it as
+            // it is staged (`put_user(-1, fence_ptr)` in
+            // `drm_atomic_crtc_set_property`), so a request refused further
+            // down its property list, or a commit that fails, never leaves
+            // the client's slot as it was; the fd replaces it once the
+            // commit went through. This wrote nothing until the commit.
             PROP_OUT_FENCE_PTR => {
                 if value != 0 {
                     ucheck(value as usize, core::mem::size_of::<i32>())?;
+                    write_out_fence_slot(value, -1);
                 }
                 upd.out_fence_ptr = Some(value);
             }
@@ -5968,49 +5984,73 @@ fn atomic_stage_on(
     Ok(())
 }
 
-/// Install a already-signaled sync_file into the caller's fd table, or `None`
-/// if the process/context cannot allocate one. Used as an OUT_FENCE_PTR stub:
-/// real out-fences need HW flip completion; a signaled fd keeps clients from
-/// waiting forever or SIGBUS-ing on an uninitialized pointer.
-fn try_signaled_out_fence_fd() -> Option<i32> {
+/// The fence of a commit's `OUT_FENCE_PTR`, set up before the commit runs as
+/// `prepare_signaling` / `setup_out_fence` do: a fresh, unsignaled syncobj
+/// behind a `sync_file` on an fd of the caller's table
+/// (`get_unused_fd_flags(O_CLOEXEC)` + `sync_file_create`), so a table with
+/// no room refuses the commit before it touches anything. The commit's
+/// completion signals it (`drm::complete_flip`, at the vblank the flip
+/// lands on): the new frame is being scanned out and the previous buffer
+/// is free, which is what a compositor that paces its frames on the fence,
+/// or hands it to a client as the release of its buffer, waits for. This
+/// was a fence signaled at creation, so whoever released a buffer on it
+/// did so while that buffer was still on screen.
+struct OutFence {
+    /// The syncobj the sync_file wraps; the sync_file owns it.
+    handle: u32,
+    fd: i32,
+    /// The process whose table holds `fd`, to put it back if the commit
+    /// fails.
+    proc: Arc<zircon_object::task::Process>,
+}
+
+/// `None` when there is no current Linux process to hold the fd: nothing
+/// the kernel does reaches here without one, and a hosted test's commit
+/// then carries no out-fence and its slot keeps the `-1` staging wrote.
+fn reserve_out_fence() -> Result<Option<OutFence>> {
     use crate::fs::SyncobjHandle;
     use crate::process::ProcessExt;
     use zircon_object::task::Thread;
 
-    let thread = kernel_hal::thread::get_current_thread()?
-        .downcast::<Thread>()
-        .ok()?;
-    let linux = thread.proc().try_linux()?;
-    let handle = zcore_drivers::scheme::syncobj::create(true);
+    let Some(thread) =
+        kernel_hal::thread::get_current_thread().and_then(|t| t.downcast::<Thread>().ok())
+    else {
+        return Ok(None);
+    };
+    let proc = thread.proc().clone();
+    let Some(linux) = proc.try_linux() else {
+        return Ok(None);
+    };
+    let handle = zcore_drivers::scheme::syncobj::create(false);
+    // The sync_file owns the syncobj: a table that refuses it drops the file,
+    // and the file's drop releases the syncobj.
     let file = SyncobjHandle::new_sync_file(handle, 1);
-    match linux.add_file(file) {
-        Ok(fd) => Some(i32::from(fd)),
-        Err(_) => {
-            let _ = zcore_drivers::scheme::syncobj::destroy(handle);
-            None
+    // `get_unused_fd_flags` says EMFILE; `FsError` has no such code, and
+    // none of its others means anything to an atomic client.
+    let fd = linux.add_file(file).map_err(|_| FsError::BadState)?;
+    Ok(Some(OutFence {
+        handle,
+        fd: i32::from(fd),
+        proc,
+    }))
+}
+
+impl OutFence {
+    /// `complete_signaling` without `install_fds`: the commit failed, the fd
+    /// goes back and the sync_file with it.
+    fn put_back(self) {
+        use crate::process::ProcessExt;
+        if let Some(linux) = self.proc.try_linux() {
+            let _ = linux.close_file(crate::fs::FileDesc::from(self.fd));
         }
     }
 }
 
-/// Write OUT_FENCE_PTR: TEST_ONLY / missing syncobj path → `-1`; otherwise a
-/// signaled sync_file fd. Comment in callers: real out-fences need HW flip
-/// completion.
-fn write_out_fence_ptr(ptr: u64, test_only: bool) -> Result<()> {
-    if ptr == 0 {
-        return Ok(());
-    }
-    ucheck(ptr as usize, core::mem::size_of::<i32>())?;
-    // Real out-fences need HW flip completion; until then prefer an
-    // already-signaled sync_file so explicit-sync clients can proceed, else -1.
-    let fd = if test_only {
-        -1
-    } else {
-        try_signaled_out_fence_fd().unwrap_or(-1)
-    };
+/// `put_user` into the client's `OUT_FENCE_PTR` slot, checked by the staging.
+fn write_out_fence_slot(ptr: u64, fd: i32) {
     unsafe {
         *(ptr as *mut i32) = fd;
     }
-    Ok(())
 }
 
 /// Per-boot budget for the `[drm-wsi]` klog traces. klog writes SYNCHRONOUSLY

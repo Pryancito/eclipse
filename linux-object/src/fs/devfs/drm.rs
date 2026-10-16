@@ -1226,228 +1226,17 @@ pub(crate) fn repair_rounds_for_test() -> u32 {
     REPAIR_ROUNDS_RUN.load(Ordering::Relaxed)
 }
 
-/// Rows the probe samples: every 4th one, every pixel within it.
-///
-/// Along a row it reads every pixel, because a single changed pixel is a real
-/// answer and a strided read could step over a one-pixel-wide comb. Across rows
-/// it samples, because a torn frame is never one row -- a rasteriser hands over
-/// tiles, so the smallest thing this is looking for is tens of rows tall.
-const PROBE_ROW_STEP: usize = 4;
-
-/// Width in pixels of one probe band.
-///
-/// Both software rasterisers under this desktop hand over rectangular tiles 64
-/// pixels wide, so a band this wide either *is* a tile column or is a whole
-/// number of them. That is what makes the mask in the report worth printing: a
-/// comb of stale tiles lights up a scattered *subset* of bands, while a plain
-/// tear -- the compositor overwriting the frame it already handed over -- lights
-/// up a contiguous run. A scalar checksum cannot tell those two apart, and they
-/// do not have the same cause or the same fix.
-const PROBE_BAND_PX: usize = 64;
-
-/// Bands the mask tracks: 32 * 64 = 2048 px, past both 1920- and 1600-wide
-/// panels. A window wider than that folds its right-hand columns into the last
-/// band instead of dropping them -- a mask that silently stopped describing part
-/// of the window would be worse than a coarse last band, because the reader
-/// cannot see which of the two they are looking at.
-const PROBE_MAX_BANDS: usize = 32;
-
-/// FNV-1a's 64-bit basis and prime. Wrapping on purpose: this is a hash, and a
-/// debug build must not panic on the overflow that is the whole mechanism.
-const PROBE_FNV_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
-const PROBE_FNV_PRIME: u64 = 0x100_0000_01b3;
-
-/// How many bands a window `w` pixels wide covers, never zero and never past
-/// [`PROBE_MAX_BANDS`].
-fn probe_band_count(w: u32) -> usize {
-    ((w as usize).saturating_add(PROBE_BAND_PX - 1) / PROBE_BAND_PX).clamp(1, PROBE_MAX_BANDS)
-}
-
-/// Where the source buffer is fully transparent black, gathered in the same
-/// pass as the band checksums.
-///
-/// This exists for the one question a photograph of the screen cannot answer.
-/// Black rectangles on the desktop have two completely different causes, and
-/// they call for work in opposite places: either the kernel is failing to copy
-/// pixels that the compositor did draw, or the compositor handed over a buffer
-/// it never finished drawing and the kernel copied the zeros faithfully. The
-/// band mask does not separate them -- a region that is black in BOTH reads
-/// never differs, so it does not set a bit -- and neither does the cost line.
-/// The count and the box do: if the black on screen sits where the source was
-/// already zero, the kernel is exonerated and the search moves upstream.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-struct ZeroExtent {
-    /// Sampled pixels that were exactly `0x0000_0000`.
-    zeros: usize,
-    /// Sampled pixels in total, so `zeros` can be read as a fraction.
-    sampled: usize,
-    /// Window-relative bounding box of the zero pixels. Meaningless while
-    /// `zeros` is 0, which is why [`ZeroExtent::bbox`] is the only reader.
-    min_x: u32,
-    max_x: u32,
-    min_y: u32,
-    max_y: u32,
-}
-
-impl ZeroExtent {
-    /// Nothing seen yet. The box starts inverted so the first `note` sets both
-    /// ends of both axes without a special case.
-    fn empty() -> Self {
-        Self {
-            zeros: 0,
-            sampled: 0,
-            min_x: u32::MAX,
-            max_x: 0,
-            min_y: u32::MAX,
-            max_y: 0,
-        }
-    }
-
-    /// Record one zero pixel at window-relative `(x, y)`.
-    fn note(&mut self, x: u32, y: u32) {
-        self.zeros = self.zeros.saturating_add(1);
-        self.min_x = self.min_x.min(x);
-        self.max_x = self.max_x.max(x);
-        self.min_y = self.min_y.min(y);
-        self.max_y = self.max_y.max(y);
-    }
-
-    /// `(x, y, w, h)` of the zero pixels, window-relative, or `None` when there
-    /// were none. The box is inclusive of both ends, hence the `+ 1`: a single
-    /// zero pixel is a 1x1 box, not a 0x0 one.
-    fn bbox(&self) -> Option<(u32, u32, u32, u32)> {
-        (self.zeros > 0).then(|| {
-            (
-                self.min_x,
-                self.min_y,
-                self.max_x.saturating_sub(self.min_x).saturating_add(1),
-                self.max_y.saturating_sub(self.min_y).saturating_add(1),
-            )
-        })
-    }
-}
-
-/// One probe read: a checksum per 64-pixel column band of the window.
-struct ProbeBands {
-    /// Bands past `n` are never touched, so they hold [`PROBE_FNV_BASIS`] in
-    /// every read and compare equal.
-    bands: [u64; PROBE_MAX_BANDS],
-    /// Bands the window actually covered.
-    n: usize,
-    /// Where this read found the source already black. See [`ZeroExtent`].
-    zero: ZeroExtent,
-}
-
-impl ProbeBands {
-    /// One number for the whole window, which is all the changed/unchanged
-    /// decision needs.
-    ///
-    /// `n` is deliberately NOT folded in. It looks like it should be -- two reads
-    /// that disagreed about the window's width must not come out equal -- but the
-    /// band array already separates them: band `n` holds [`PROBE_FNV_BASIS`] in
-    /// the narrower read and a real hash of its pixels in the wider one, and
-    /// those differ even when every pixel is black. Folding `n` as well was a
-    /// mutation that could not be killed by anything the probe can actually do
-    /// (the two reads bracketing a blit are always the same width), so it is
-    /// gone, and the property it was standing in for is pinned on the bands
-    /// where it really lives.
-    fn fold(&self) -> u64 {
-        let mut acc = PROBE_FNV_BASIS;
-        for b in self.bands.iter() {
-            acc ^= *b;
-            acc = acc.wrapping_mul(PROBE_FNV_PRIME);
-        }
-        acc
-    }
-
-    /// Bit `i` set means band `i` -- source columns `x + 64*i ..= x + 64*i + 63`
-    /// -- reads differently in the two passes.
-    fn diff_mask(&self, other: &ProbeBands) -> u32 {
-        let mut mask = 0u32;
-        for i in 0..PROBE_MAX_BANDS {
-            if self.bands[i] != other.bands[i] {
-                mask |= 1u32 << i;
-            }
-        }
-        mask
-    }
-}
-
-/// Per-band order-dependent checksums of the `(x, y, w, h)` window of `pixels`,
-/// sampling every `row_step`-th row and every pixel within it.
-///
-/// Order-dependent matters: two frames can hold the same pixels in different
-/// places (a scrolled list, a window dragged by a pixel) and a sum or an XOR
-/// would call those equal. FNV-1a gives that for nothing -- each pixel is
-/// multiplied into the accumulator in turn, so the sequence is what is hashed,
-/// not the multiset. This used to fold the row and column in as well, which was
-/// two extra multiplies per pixel on a per-frame path buying nothing the chain
-/// did not already provide; the mutation that removed it could not be killed,
-/// and the honest resolution was to remove it here too.
-///
-/// `stride_px` of 0, an empty window, or a window whose first sampled row is
-/// already past the end of `pixels` all give `None`: there is nothing to
-/// compare, which is not the same answer as "these two match".
-fn probe_bands(
-    pixels: &[u32],
-    stride_px: usize,
-    x: u32,
-    y: u32,
-    w: u32,
-    h: u32,
-    row_step: usize,
-) -> Option<ProbeBands> {
-    if stride_px == 0 || w == 0 || h == 0 || row_step == 0 {
-        return None;
-    }
-    let n = probe_band_count(w);
-    let mut bands = [PROBE_FNV_BASIS; PROBE_MAX_BANDS];
-    let mut zero = ZeroExtent::empty();
-    // Rows, not pixels -- `zero.sampled` beside it counts pixels, and the two
-    // being one word apart with the same name is how a later reader divides by
-    // the wrong thing.
-    let mut sampled_rows = 0usize;
-    let mut r = 0usize;
-    while r < h as usize {
-        let off = (y as usize)
-            .saturating_add(r)
-            .saturating_mul(stride_px)
-            .saturating_add(x as usize);
-        let end = off.saturating_add(w as usize);
-        if end > pixels.len() {
-            break;
-        }
-        for (c, px) in pixels[off..end].iter().enumerate() {
-            // `min(n - 1)`: the columns past the mask's reach fold into the last
-            // band rather than running off the array.
-            let b = (c / PROBE_BAND_PX).min(n - 1);
-            bands[b] ^= *px as u64;
-            bands[b] = bands[b].wrapping_mul(PROBE_FNV_PRIME);
-            if *px == 0 {
-                // Window-relative, and `r` not `y + r`, because the window's own
-                // origin is already in the reported line: a box relative to the
-                // window is what lines up with what the eye sees on screen.
-                zero.note(c as u32, r as u32);
-            }
-        }
-        zero.sampled = zero.sampled.saturating_add(end.saturating_sub(off));
-        sampled_rows += 1;
-        r += row_step;
-    }
-    (sampled_rows > 0).then_some(ProbeBands { bands, n, zero })
-}
-
-/// Whether the two reads bracketing a blit say somebody else was writing the
-/// window while the kernel copied it.
-///
-/// `after` is an `Option` because the second read can fail to produce an answer
-/// at all -- the framebuffer shrank, the mapping went away -- and that counts as
-/// changed. "I could not tell" must never come out as "the compositor is in the
-/// clear": this whole flag exists to decide who is responsible, and a wrong
-/// acquittal sends the search back to the code that has already been walked.
-fn probe_says_changed(before: u64, after: Option<u64>) -> bool {
-    after != Some(before)
-}
+/// The present probe (band checksums, the black extent); own file for the
+/// size ceiling, no logic change.
+mod present_probe;
+use present_probe::{
+    probe_bands, probe_says_changed, ProbeBands, PROBE_BAND_PX, PROBE_FNV_BASIS, PROBE_FNV_PRIME,
+    PROBE_MAX_BANDS, PROBE_ROW_STEP,
+};
+// Only `present_probe_tests` names this, through `use super::*`
+// (`PROBE_MAX_BANDS` stays above: `present_counters` sizes its statics by it).
+#[cfg(test)]
+use present_probe::probe_band_count;
 
 /// How many probe mismatches have OCCURRED, which is not the same as how many
 /// got a line: [`probe_report_decision`] stops writing after
@@ -6373,6 +6162,17 @@ enum PendingDrmTimer {
         user_data: u64,
         /// Deliver onto this open's event queue (Weak so close can Drop).
         file: Weak<DrmFileState>,
+        /// The request carried `DRM_MODE_PAGE_FLIP_EVENT`: the completion
+        /// goes on the fd. A commit with only an `OUT_FENCE_PTR` owes the
+        /// CRTC the same completion (`prepare_signaling` creates the
+        /// `drm_pending_vblank_event` for either) but no event: its
+        /// `file_priv` stays NULL.
+        event: bool,
+        /// The syncobj behind the commit's `OUT_FENCE_PTR` sync_file, if
+        /// any: signaled when the completion is delivered, whether or not
+        /// the fd is still open (`drm_send_event_helper` signals `e->fence`
+        /// before it looks at `file_priv`).
+        out_fence: Option<u32>,
     },
     // `seq` is intentionally not stored: we recompute it from `vblank_seq_now()`
     // at delivery time so the event carries the sequence that actually just
@@ -6442,14 +6242,9 @@ fn deliver_pending_drm_timer() {
                 crtc_id,
                 user_data,
                 file,
-            } => {
-                if let Some(file) = file.upgrade() {
-                    queue_flip_event(&file, crtc_id, user_data);
-                } else {
-                    // drm_file closed before delivery — drop the event.
-                    flip_in_flight_done();
-                }
-            }
+                event,
+                out_fence,
+            } => complete_flip(crtc_id, user_data, file, event, out_fence),
             PendingDrmTimer::Vblank {
                 signal,
                 due_seq,
@@ -6508,6 +6303,20 @@ fn arm_coalesced_drm_timer(pending: PendingDrmTimer) {
 static LAST_FLIP_PID: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 fn schedule_flip_event(crtc_id: u32, user_data: u64, file: &Arc<DrmFileState>) {
+    schedule_flip_completion(crtc_id, user_data, file, true, None);
+}
+
+/// [`schedule_flip_event`] for a commit that may owe its completion to an
+/// out-fence as well as, or instead of, an event on the fd: `event` is
+/// whether the request carried `DRM_MODE_PAGE_FLIP_EVENT`, `out_fence` the
+/// syncobj its `OUT_FENCE_PTR` sync_file wraps.
+fn schedule_flip_completion(
+    crtc_id: u32,
+    user_data: u64,
+    file: &Arc<DrmFileState>,
+    event: bool,
+    out_fence: Option<u32>,
+) {
     // Set FLIP_EVENT_PENDING and push the job INSIDE the same lock acquisition
     // as arm_coalesced_drm_timer, so that flush_pending_flip_completions can
     // never observe FLIP_EVENT_PENDING = true with an empty queue on SMP. Without
@@ -6527,9 +6336,39 @@ fn schedule_flip_event(crtc_id: u32, user_data: u64, file: &Arc<DrmFileState>) {
             crtc_id,
             user_data,
             file: Arc::downgrade(file),
+            event,
+            out_fence,
         });
     }
     arm_coalesced_drm_timer_locked();
+}
+
+/// One flip's completion, `drm_send_event_helper`: the out-fence signals
+/// first, then the event goes on the fd when one was asked for and the fd is
+/// still open, and either way the flip leaves the in-flight population.
+fn complete_flip(
+    crtc_id: u32,
+    user_data: u64,
+    file: Weak<DrmFileState>,
+    event: bool,
+    out_fence: Option<u32>,
+) {
+    if let Some(handle) = out_fence {
+        // The syncobj is the sync_file's: closed already, there is nobody
+        // to tell.
+        let _ = zcore_drivers::scheme::syncobj::signal(handle);
+    }
+    match (event, file.upgrade()) {
+        (true, Some(file)) => queue_flip_event(&file, crtc_id, user_data),
+        // No event owed, or the drm_file closed before delivery: the event
+        // is dropped, and the flip leaves the in-flight population like any
+        // other. Clearing the latch alone here left the count one too high
+        // for good: from then on no delivery was ever the last one, the
+        // latch never cleared after a real flip, and the next PAGE_FLIP spun
+        // `settle_outstanding_flip` out into the EBUSY wlroots escalates
+        // into an output teardown.
+        _ => flip_in_flight_done(),
+    }
 }
 
 /// Deliver every queued page-flip completion to the card fd *now* instead of
@@ -6543,17 +6382,13 @@ fn schedule_flip_event(crtc_id: u32, user_data: u64, file: &Arc<DrmFileState>) {
 /// dropped or overwritten completion, so no stale `wl_listener` free in labwc.
 /// Pending vblank-wait jobs keep their own pacing and stay queued.
 pub(crate) fn flush_pending_flip_completions() {
-    let flips: Vec<(u32, u64, Weak<DrmFileState>)> = {
+    let flips: Vec<PendingDrmTimer> = {
         let mut q = PENDING_DRM_TIMERS.lock();
         let mut kept = VecDeque::with_capacity(q.len());
         let mut flips = Vec::new();
         while let Some(job) = q.pop_front() {
             match job {
-                PendingDrmTimer::Flip {
-                    crtc_id,
-                    user_data,
-                    file,
-                } => flips.push((crtc_id, user_data, file)),
+                flip @ PendingDrmTimer::Flip { .. } => flips.push(flip),
                 other => kept.push_back(other),
             }
         }
@@ -6562,18 +6397,16 @@ pub(crate) fn flush_pending_flip_completions() {
     };
     // queue_flip_event locks the file's event queue and clears FLIP_EVENT_PENDING;
     // the PENDING_DRM_TIMERS guard above is already dropped, so no nested lock.
-    for (crtc_id, user_data, file) in flips {
-        if let Some(file) = file.upgrade() {
-            queue_flip_event(&file, crtc_id, user_data);
-        } else {
-            // drm_file closed before delivery: the event is dropped, and the
-            // flip leaves the in-flight population like any other, as the
-            // timer's deliverer does. Clearing the latch alone here left the
-            // count one too high for good: from then on no delivery was ever
-            // the last one, the latch never cleared after a real flip, and
-            // the next PAGE_FLIP spun `settle_outstanding_flip` out into the
-            // EBUSY wlroots escalates into an output teardown.
-            flip_in_flight_done();
+    for job in flips {
+        if let PendingDrmTimer::Flip {
+            crtc_id,
+            user_data,
+            file,
+            event,
+            out_fence,
+        } = job
+        {
+            complete_flip(crtc_id, user_data, file, event, out_fence);
         }
     }
 }
@@ -6684,6 +6517,12 @@ pub fn cancel_pending_events() {
 /// Drain timer jobs that target a closing drm_file (by raw pointer identity).
 fn cancel_pending_timers_for_file(file_ptr: *const DrmFileState) {
     let mut cleared_flip = 0usize;
+    // The out-fences of the completions dropped here. Linux keeps the event
+    // (`drm_events_release` only forgets its `file_priv`) and signals its
+    // fence when the CRTC completes; this drops the completion with the
+    // file, so the fence signals now rather than never: its sync_file may
+    // be in another process's hands (a release fence handed to a client).
+    let mut orphaned_fences = Vec::new();
     {
         let mut q = PENDING_DRM_TIMERS.lock();
         q.retain(|job| {
@@ -6692,14 +6531,18 @@ fn cancel_pending_timers_for_file(file_ptr: *const DrmFileState) {
                 PendingDrmTimer::Vblank { file, .. } => file.as_ptr(),
             };
             if core::ptr::eq(job_ptr, file_ptr) {
-                if matches!(job, PendingDrmTimer::Flip { .. }) {
+                if let PendingDrmTimer::Flip { out_fence, .. } = job {
                     cleared_flip += 1;
+                    orphaned_fences.extend(*out_fence);
                 }
                 false
             } else {
                 true
             }
         });
+    }
+    for handle in orphaned_fences {
+        let _ = zcore_drivers::scheme::syncobj::signal(handle);
     }
     for _ in 0..cleared_flip {
         flip_in_flight_done();
@@ -7315,8 +7158,13 @@ pub fn atomic_commit(
     want_event: bool,
     user_data: u64,
     file: &Arc<DrmFileState>,
+    out_fence: Option<u32>,
 ) -> Result<(), AtomicError> {
     let (cur, _) = atomic_snapshot();
+    // `prepare_signaling` creates the CRTC's completion for an event and for
+    // an out-fence alike: a commit with either owes one, and the check
+    // below and the settle before the commit go by that, not by the event.
+    let completion = want_event || out_fence.is_some();
 
     // --- Check phase (no state touched) ---
     // [swapchain-diag] Every rejection below is logged at error! so it is
@@ -7382,11 +7230,13 @@ pub fn atomic_commit(
     // rate. Turning the pipe on or off in the same commit is fine (one of
     // the two states is active). A TEST_ONLY commit carries no event on
     // Linux, and the ioctl arm refuses the TEST_ONLY|EVENT pair before it
-    // gets here, so `want_event` alone is the whole condition.
+    // gets here, so `completion` alone is the whole condition -- and an
+    // `OUT_FENCE_PTR` on such a CRTC is refused the same way, since the
+    // event it hangs off is what the check sees.
     let ends_active = upd.active.unwrap_or(cur.active);
-    if want_event && !ends_active && !cur.active {
+    if completion && !ends_active && !cur.active {
         log::error!(
-            "[drm] ATOMIC reject: PAGE_FLIP_EVENT requested on a CRTC that is off and stays off"
+            "[drm] ATOMIC reject: PAGE_FLIP_EVENT or OUT_FENCE_PTR on a CRTC that is off and stays off"
         );
         return Err(AtomicError::Invalid);
     }
@@ -7457,7 +7307,7 @@ pub fn atomic_commit(
     // and [`settle_outstanding_flip`], which also waits out a completion the
     // timer is delivering on another CPU at this very moment; EBUSY is left
     // for a delivery that never finishes.
-    if want_event && !settle_outstanding_flip() {
+    if completion && !settle_outstanding_flip() {
         return Err(AtomicError::Busy);
     }
 
@@ -7576,12 +7426,14 @@ pub fn atomic_commit(
         _ => {}
     }
 
-    if want_event {
-        // One event per CRTC in the commit; the pipeline has exactly one.
-        // Paced to the synthetic vblank (not delivered now) for the same
-        // anti-spin reason as the legacy page-flip path. Busy was checked
-        // above before present.
-        schedule_flip_event(SYNTH_CRTC_ID, user_data, file);
+    if completion {
+        // One completion per CRTC in the commit; the pipeline has exactly
+        // one. Paced to the synthetic vblank (not delivered now) for the
+        // same anti-spin reason as the legacy page-flip path, and that is
+        // when the out-fence signals: the new frame is being scanned out
+        // and the previous buffer is free. Busy was checked above before
+        // present.
+        schedule_flip_completion(SYNTH_CRTC_ID, user_data, file, want_event, out_fence);
     }
     Ok(())
 }
