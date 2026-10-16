@@ -473,6 +473,31 @@ fn dl_recorded_sites() -> usize {
 }
 
 /// Rebuild and paint the banner from all recorded slots.
+/// Does the verdict `dl_paint` is about to print say that a fault or panic was
+/// already reported, and that THIS banner is only its consequence?
+///
+/// It mirrors the branch order of the verdict chain, and that order is the
+/// whole point: `diagnosing_cpu` can be set on a run whose verdict is
+/// shootdown starvation, and there nothing has been printed to preserve.
+/// Reading the flag on its own would suppress the one banner that is itself
+/// the finding.
+pub(crate) fn verdict_follows_a_printed_fault(
+    self_deadlock: bool,
+    shootdown: bool,
+    diagnosing: bool,
+) -> bool {
+    if self_deadlock {
+        // "A fault or panic was taken inside that critical section and the
+        // handler came back in" -- the re-entry is the bug, and its report is
+        // what is underneath.
+        true
+    } else if shootdown {
+        false
+    } else {
+        diagnosing
+    }
+}
+
 fn dl_paint() {
     use core::fmt::Write;
     use core::sync::atomic::Ordering;
@@ -724,9 +749,9 @@ fn dl_paint() {
     // is the line a reader acts on, so it gets the bytes held back for it.
     b.release_reserve();
     // One-line verdict so the on-screen (no-serial) capture is self-diagnosing.
-    if let Some(cpu) =
-        self_deadlock_cpu(&holder_keys[..holder_keys_n], &waiter_keys[..waiter_keys_n])
-    {
+    let self_deadlock =
+        self_deadlock_cpu(&holder_keys[..holder_keys_n], &waiter_keys[..waiter_keys_n]);
+    if let Some(cpu) = self_deadlock {
         let _ = write!(
             b,
             "\nDIAG: self-deadlock on cpu{} -- it HOLDS the lock it is waiting \
@@ -783,7 +808,27 @@ fn dl_paint() {
         let _ = write!(b, "\n[{} B of this report did not fit]", cut);
     }
     let valid = b.valid_str();
-    kernel_hal::console::panic_banner(valid);
+    // Whether this report is a CONSEQUENCE of a fault some cpu has already
+    // printed -- the verdicts that end in "Diagnose that fault." and "the
+    // re-entry is the bug".
+    //
+    // When it is, this banner must not reach the framebuffer. The glass is
+    // the only artifact a real machine gives back, the stop-screen writes
+    // over whatever is under it, and what is under it here is the very fault
+    // the verdict is pointing at. A capture from 16-oct-2026 lost exactly
+    // that: an `alloc_error` panic on cpu0 inside `eclipsefs_mount.rs:512`,
+    // whose header named `lang.rs:111` and the size that could not be
+    // allocated, came back as `KEDEADLOCK` and `mecpu=1` -- the banner drawn
+    // through it, one glyph cell at a time. Four copies of a report that says
+    // "this is not the bug" cost the reader the line that was.
+    //
+    // Serial still gets the whole thing: it scrolls, so nothing is destroyed
+    // there, and a headless run has nothing else.
+    let consequence_of_a_fault = verdict_follows_a_printed_fault(
+        self_deadlock.is_some(),
+        shootdown_head,
+        diagnosing_cpu.is_some(),
+    );
     // …and to the serial console, which is the only one anybody watching a
     // headless run can see.
     //
@@ -828,6 +873,17 @@ fn dl_paint() {
             .compare_exchange(prev, sites, Ordering::SeqCst, Ordering::SeqCst)
             .is_ok()
     {
+        // The framebuffer repaint is now behind this same gate, not run on
+        // every call. It used to repaint unconditionally, so a convoy of
+        // waiters drew the banner once per cpu that piled up -- the capture
+        // above came back with four near-identical copies, each one more of
+        // the screen spent on the same report. The gate loses nothing: the
+        // reason the repaint exists at all is that the first paint happens
+        // before the waiter has snapshotted the HOLDER, and gaining that is
+        // gaining a site.
+        if !consequence_of_a_fault {
+            kernel_hal::console::panic_banner(valid);
+        }
         kernel_hal::console::serial_write_fmt_spin(format_args!("\n[{}]\n", valid));
     }
 }
@@ -1624,6 +1680,51 @@ mod tests {
             "zcore::handler::handle_syscall",
         ] {
             assert!(!sym_is_diagnosing(sym), "{} read as the fault path", sym);
+        }
+    }
+
+    /// The banner rasterizes over whatever is on the glass, so on the one
+    /// verdict that says "diagnose the fault printed above it" the paint has
+    /// to be skipped: a capture from 16-oct-2026 came back with that very
+    /// fault report -- an `alloc_error` naming the size that could not be
+    /// allocated -- overwritten by four copies of this banner.
+    #[test]
+    fn the_banner_stays_off_the_glass_when_it_is_only_a_consequence() {
+        assert!(verdict_follows_a_printed_fault(false, false, true));
+        assert!(verdict_follows_a_printed_fault(true, false, false));
+    }
+
+    /// Shootdown starvation is a finding in its own right: nothing was printed
+    /// underneath it, and the `diagnosing` flag can be set on that run anyway
+    /// (a holder answering the NMI from inside a fault path it will return
+    /// from). Reading the flag alone would blank the screen on the one banner
+    /// that IS the report.
+    #[test]
+    fn a_shootdown_verdict_is_painted_even_with_a_diagnosing_holder() {
+        assert!(!verdict_follows_a_printed_fault(false, true, true));
+        assert!(!verdict_follows_a_printed_fault(false, true, false));
+    }
+
+    /// The open verdict ("either AB-BA or a holder stuck inside its own
+    /// critical section") is the common case and has to reach a machine with
+    /// no serial.
+    #[test]
+    fn an_ordinary_deadlock_is_still_painted() {
+        assert!(!verdict_follows_a_printed_fault(false, false, false));
+    }
+
+    /// Self-deadlock wins over the rest, as it does in the verdict chain.
+    #[test]
+    fn a_self_deadlock_follows_a_fault_whatever_else_is_set() {
+        for shootdown in [false, true] {
+            for diagnosing in [false, true] {
+                assert!(
+                    verdict_follows_a_printed_fault(true, shootdown, diagnosing),
+                    "self-deadlock + {} + {} read as its own finding",
+                    shootdown,
+                    diagnosing
+                );
+            }
         }
     }
 
