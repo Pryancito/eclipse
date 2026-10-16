@@ -1814,40 +1814,19 @@ impl Syscall<'_> {
     fn sys_sync_file_merge(&self, file: &Arc<dyn FileLike>, arg1: usize) -> SysResult {
         use linux_object::fs::SyncobjHandle;
 
+        // A syncobj fd has no ioctl at all (`drm_syncobj_file_fops`), and no
+        // other file knows this one.
         let Some(first) = file.downcast_ref::<SyncobjHandle>() else {
             return Err(LxError::ENOTTY);
         };
         let mut ptr = UserInOutPtr::<SyncMergeData>::from(arg1);
         let mut data = ptr.read()?;
-        if data.flags != 0 || data.pad != 0 {
-            return Err(LxError::EINVAL);
-        }
-        let proc = self.linux_process();
-        let second = proc.get_file_like(FileDesc::from(data.fd2 as usize))?;
-        let Some(second) = second.downcast_ref::<SyncobjHandle>() else {
-            return Err(LxError::ENOENT);
-        };
-        // ENOTTY on a syncobj fd (it has no ioctl), ENOENT when `fd2` is not
-        // a sync_file; the name goes on the new fence for `FILE_INFO`.
-        let merged = first.merge(second, &data.name)?;
-        let fd = proc.add_file(merged)?;
-        // Bounded, LOG=error-visible trace: the first merges of a boot are the
-        // GLX client's second round of acquires, the step that used to fail.
-        {
-            static MERGE_TRACE_BUDGET: core::sync::atomic::AtomicU32 =
-                core::sync::atomic::AtomicU32::new(0);
-            let n = MERGE_TRACE_BUDGET.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-            if n < 8 {
-                kernel_hal::klog_info!(
-                    "[drm] SYNC_IOC_MERGE #{} pid={} fd2={} -> fd={}",
-                    n + 1,
-                    self.zircon_process().id(),
-                    data.fd2,
-                    i32::from(fd),
-                );
-            }
-        }
-        data.fence = i32::from(fd);
+        sync_file_merge_op(
+            self.linux_process(),
+            self.zircon_process().id(),
+            first,
+            &mut data,
+        )?;
         ptr.write(data)?;
         Ok(0)
     }
@@ -3409,15 +3388,16 @@ pub(crate) fn is_sync_ioc_merge(cmd: u32) -> bool {
 /// to a function body cannot be named by a test. The layout is pinned in
 /// `drm_ioctl_layout_tests`.
 #[repr(C)]
-#[derive(Clone, Copy)]
-struct SyncMergeData {
-    /// The name Linux gives the merged fence. Carried for its 32 bytes and
-    /// handed straight back: this tree does not keep fence names.
-    name: [u8; 32],
-    fd2: i32,
-    fence: i32,
-    flags: u32,
-    pad: u32,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SyncMergeData {
+    /// The name Linux gives the merged fence, cut at 31 bytes and
+    /// NUL-terminated by `sync_file_merge_op` before it is used and written
+    /// back, as `data.name[sizeof(data.name) - 1] = '\0'` does.
+    pub name: [u8; 32],
+    pub fd2: i32,
+    pub fence: i32,
+    pub flags: u32,
+    pub pad: u32,
 }
 
 /// `struct drm_mode_create_lease` (`drm.h`), the argument of
@@ -3517,6 +3497,59 @@ pub(crate) fn syncobj_fd_missing_handle_errno(handle_to_fd: bool, sync_file: boo
     } else {
         LxError::ENOENT
     }
+}
+
+/// `sync_file_ioctl_merge` after the copy from userspace, on the caller's
+/// fd table `proc` as process `pid`: `first` is the sync_file the ioctl was
+/// issued on, `data.fd2` the other one, and `data.fence` comes back as the
+/// new fd, close-on-exec, of a sync_file that is ready once both are.
+///
+/// Its errors, in its order: `flags` or `pad` set is EINVAL; then
+/// `sync_file_fdget(fd2)`, which is empty for an fd that names no file as
+/// much as for a file that is not a sync_file (a syncobj fd included), is
+/// ENOENT. The first of those used to come back as the fd table's EBADF.
+/// The name is cut at 31 bytes and NUL-terminated before it is used and
+/// written back, as `data.name[sizeof(data.name) - 1] = '\0'` does.
+pub(crate) fn sync_file_merge_op(
+    proc: &LinuxProcess,
+    pid: KoID,
+    first: &linux_object::fs::SyncobjHandle,
+    data: &mut SyncMergeData,
+) -> LxResult {
+    use linux_object::fs::SyncobjHandle;
+
+    if data.flags != 0 || data.pad != 0 {
+        return Err(LxError::EINVAL);
+    }
+    let second = proc
+        .get_file_like(FileDesc::from(data.fd2 as usize))
+        .map_err(|_| LxError::ENOENT)?;
+    let Some(second) = second.downcast_ref::<SyncobjHandle>() else {
+        return Err(LxError::ENOENT);
+    };
+    data.name[31] = 0;
+    // ENOTTY on a syncobj fd (it has no ioctl), ENOENT when `fd2` is not
+    // a sync_file; the name goes on the new fence for `FILE_INFO`.
+    let merged = first.merge(second, &data.name)?;
+    let fd = proc.add_file(merged)?;
+    // Bounded, LOG=error-visible trace: the first merges of a boot are the
+    // GLX client's second round of acquires, the step that used to fail.
+    {
+        static MERGE_TRACE_BUDGET: core::sync::atomic::AtomicU32 =
+            core::sync::atomic::AtomicU32::new(0);
+        let n = MERGE_TRACE_BUDGET.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        if n < 8 {
+            kernel_hal::klog_info!(
+                "[drm] SYNC_IOC_MERGE #{} pid={} fd2={} -> fd={}",
+                n + 1,
+                pid,
+                data.fd2,
+                i32::from(fd),
+            );
+        }
+    }
+    data.fence = i32::from(fd);
+    Ok(())
 }
 
 /// `SYNCOBJ_HANDLE_TO_FD` / `SYNCOBJ_FD_TO_HANDLE` after the argument check,
@@ -3952,6 +3985,9 @@ mod syncobj_fd_table_tests {
         gone(mine);
     }
 }
+
+#[cfg(test)]
+mod sync_file_merge_table_tests;
 
 #[cfg(test)]
 mod sync_file_ioctl_tests;
