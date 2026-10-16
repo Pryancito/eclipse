@@ -746,6 +746,19 @@ impl TaskCollection {
             let mut kick_mask = 0u64;
             for page_idx in 0..inner.pages.len() {
                 let (notified, voluntary, dropped, borrowed) = inner.pages[page_idx].peek_lanes();
+                // Like the masks in `consider_bits`, this one is an economy
+                // and not the rule: everything it feeds is filtered again by
+                // `& notified` or `& voluntary` below, and whatever comes out
+                // of all that is still only a CANDIDATE -- the claim at the
+                // end of this function asks `reclaim_*`, which is what
+                // actually refuses a dropped or borrowed slot. So a mutation
+                // of `runnable` survives the suite because it changes how
+                // many slots are looked at and nothing else. Worth knowing
+                // before reading a surviving mutant here as a missing test:
+                // the ones that are NOT economies are the lane each slot is
+                // claimed FROM (a slot claimed from the wrong lane is never
+                // handed out again) and the quota comparison, and both have
+                // their own test.
                 let runnable = (notified | voluntary) & !dropped & !borrowed;
                 if runnable == 0 {
                     continue;
@@ -1499,6 +1512,137 @@ mod collection_tests {
         peer.join().unwrap();
     }
 
+    /// A task pinned to a CPU that MAY run it is not stranded work.
+    ///
+    /// The other three tests on the stranded mark all pin a task away from
+    /// the asking CPU, so each one checks that the mark goes UP. Nothing
+    /// checked that it stays down: `stranded` and the kick are decided by
+    /// one condition, and a condition that answers "yes" for every pinned
+    /// task leaves a CPU with perfectly runnable work asking the rest of the
+    /// machine to come and rescue it, with an IPI per pass.
+    #[test]
+    fn a_pinned_task_this_cpu_may_run_is_not_stranded_work() {
+        let _g = crate::runtime::resched_test_lock();
+        crate::runtime::clear_stranded_for_test();
+        let previous = crate::arch::set_cpu_id_for_test(LONE_CPU);
+        let tc = TaskCollection::new(LONE_CPU);
+        let key = tc.add_task(pending(), Some(Arc::new(AtomicU64::new(LONE_BIT))));
+        let (got, _, waker) = tc
+            .take_task()
+            .expect("a task pinned to this very CPU was refused");
+        assert_eq!(got, key);
+        assert_eq!(
+            crate::runtime::stranded_mask_for_test() & LONE_BIT,
+            0,
+            "the queue asked to be rescued from work it can run itself"
+        );
+        waker.mark_borrowed(false);
+        crate::arch::set_cpu_id_for_test(previous);
+    }
+
+    /// A sleeping task does not hide a runnable one from the pinned branch.
+    ///
+    /// The per-bit walk builds its own `runnable` set, and what it proposes
+    /// is then claimed with `reclaim_*`, which refuses a slot that is not
+    /// really published. So a walk that proposes too much does not hand out
+    /// a sleeping task -- it hands out NOTHING: the claim fails, `schedule`
+    /// returns `None`, and a queue with runnable work reports itself empty
+    /// to the executor about to halt. One pinned task anywhere in the queue
+    /// is all it takes to be in this branch.
+    #[test]
+    fn a_sleeping_task_does_not_hide_a_runnable_one_in_the_pinned_branch() {
+        let _g = crate::runtime::resched_test_lock();
+        let tc = TaskCollection::new(0);
+        // Allowed everywhere: here only to put the queue in the pinned branch.
+        tc.add_task(pending(), Some(Arc::new(AtomicU64::new(u64::MAX))));
+        let _sleeper = tc.add_task(pending(), None);
+        let awake = tc.add_task(pending(), None);
+        drain(&tc);
+        let page = tc.get_mut_inner(DEFAULT_PRIORITY).pages[0].clone();
+        page.notify(unpack_key(awake).2);
+        let (key, _, waker) = tc
+            .take_task()
+            .expect("the queue reported itself empty with a woken task in it");
+        assert_eq!(key, awake, "a task nobody woke was handed out");
+        waker.mark_borrowed(false);
+    }
+
+    /// A pinned task that cedes the CPU gets it back.
+    ///
+    /// The pinned walk decides which lane a slot is in by reading the two
+    /// lane words, and then claims the slot from THAT lane. Reading the
+    /// wrong one is not a mis-ordering: the claim comes back empty, every
+    /// later pass picks the same slot and fails the same way, and the task
+    /// is never polled again. The existing pinned-lane tests all pin the
+    /// task away from the asking CPU, where it is refused on purpose.
+    #[test]
+    fn a_pinned_task_that_cedes_the_cpu_is_handed_out_again() {
+        let _g = crate::runtime::resched_test_lock();
+        let tc = TaskCollection::new(0);
+        let key = tc.add_task(pending(), Some(Arc::new(AtomicU64::new(u64::MAX))));
+        let (first, _, waker) = tc.take_task().expect("a task this CPU may run was refused");
+        assert_eq!(first, key);
+        cede(&waker);
+        assert_eq!(
+            tc.take_task()
+                .expect("the volunteer never came back: its yield was claimed from the wrong lane")
+                .0,
+            key
+        );
+    }
+
+    /// The voluntary quota, asked of the branch that runs once anything in
+    /// the queue is pinned.
+    ///
+    /// `schedule` has two shapes -- a bitmap fast path and a per-bit walk
+    /// for queues holding a pinned task -- and each carries its own copy of
+    /// the quota comparison. The test below exercises the fast path only, so
+    /// the second copy was free to be off by one; and `urgent_turns`
+    /// saturates AT the quota, so a copy that asks for strictly more than it
+    /// is never satisfied: the volunteer waits behind the urgent lane for
+    /// ever, on any CPU whose queue happens to hold one pinned task.
+    #[test]
+    fn the_voluntary_quota_holds_in_the_pinned_branch_too() {
+        let _g = crate::runtime::resched_test_lock();
+        crate::runtime::clear_stranded_for_test();
+        let tc = TaskCollection::new(0);
+        // Allowed here, so it neither strands the queue nor kicks anyone; it
+        // is here to make `inner.affine` non-zero, which is the whole of what
+        // chooses the branch under test. It sleeps through the rest.
+        tc.add_task(pending(), Some(Arc::new(AtomicU64::new(u64::MAX))));
+        let hog = tc.add_task(pending(), None);
+        let yielder = tc.add_task(pending(), None);
+        drain(&tc);
+        let page = tc.get_mut_inner(DEFAULT_PRIORITY).pages[0].clone();
+        page.notify(unpack_key(hog).2);
+        page.mark_yielded(unpack_key(yielder).2);
+        let mut served_on = None;
+        for turn in 1..=4 * (URGENT_QUOTA + 1) {
+            let (key, _, waker) = tc
+                .take_task()
+                .expect("the queue stopped handing work out entirely");
+            if key == yielder {
+                served_on = Some(turn);
+                cede(&waker);
+                break;
+            }
+            assert_eq!(key, hog, "a sleeping task was handed out");
+            waker.wake_by_ref();
+            waker.mark_borrowed(false);
+        }
+        // Not an exact turn: the cursor's quota counter is shared across
+        // calls, so the drain above leaves it part-way through. What has to
+        // hold is that the volunteer IS served, and within the quota.
+        let served_on = served_on
+            .expect("the volunteer was never served: the urgent lane kept the CPU for ever");
+        assert!(
+            served_on <= URGENT_QUOTA + 1,
+            "the volunteer waited {} turns behind a quota of {}",
+            served_on,
+            URGENT_QUOTA
+        );
+    }
+
     #[test]
     fn continuous_urgent_work_gives_each_voluntary_yielder_bounded_service() {
         let _g = crate::runtime::resched_test_lock();
@@ -1697,9 +1841,26 @@ mod collection_tests {
         while let Some((key, _task, waker)) = tc.take_task() {
             keys.push(key);
             waker.mark_borrowed(false);
+            assert!(
+                keys.len() <= DRAIN_CAP,
+                "the queue never empties: take_task kept handing work out ({} hand-outs)",
+                keys.len()
+            );
         }
         keys
     }
+
+    /// How many hand-outs a drain is allowed before it is called a bug.
+    ///
+    /// Every drain in these tests empties a queue of at most a few dozen
+    /// tasks, so this is nowhere near a limit on anything legitimate. It is
+    /// here because a collection that hands a task out and leaves its wake
+    /// published turns every "drain until empty" into a loop that never
+    /// ends, and **a test that spins does not fail**: it stops the whole run
+    /// with no name attached, which is the one verdict neither CI nor a
+    /// mutation pass can read. Asserting instead turns that into the test
+    /// that was going to fail anyway.
+    const DRAIN_CAP: usize = 4096;
 
     // ── can a task that ceded the CPU be held off forever? ────────────────
 
@@ -2415,7 +2576,7 @@ mod collection_tests {
         // generator's dropped branch, which is the removal that matters.
         let (_, p, sub) = unpack_key(pinned);
         tc.get_mut_inner(DEFAULT_PRIORITY).pages[p].mark_dropped(sub);
-        while tc.take_task().is_some() {}
+        drain(&tc);
         assert_eq!(tc.get_mut_inner(DEFAULT_PRIORITY).affine, 0);
         assert_eq!(tc.task_num(), 1);
         assert_eq!(tc.ready_num_for(0), tc.ready_num());
@@ -2503,12 +2664,18 @@ mod collection_tests {
         let dying = tc.add_task(pending(), None);
         let living = tc.add_task(pending(), None);
         let mut wakers = Vec::new();
+        let mut handouts = 0usize;
         while let Some((key, _t, w)) = tc.take_task() {
             if key == dying {
                 w.drop_by_ref();
             } else {
                 wakers.push((key, w));
             }
+            handouts += 1;
+            assert!(
+                handouts <= DRAIN_CAP,
+                "the queue never empties (see DRAIN_CAP)"
+            );
         }
         for (_k, w) in &wakers {
             w.mark_borrowed(false);
