@@ -302,10 +302,7 @@ impl Socket for UdpSocketState {
                     );
                 }
             }
-            if let Err(e) = crate::process::check_and_deliver_tty_interrupt() {
-                return (Err(e), Endpoint::Ip(IpEndpoint::UNSPECIFIED));
-            }
-            // Also honor non-TTY signals (SIGTERM/SIGALRM/...) so a blocked
+            // Honor signals (the terminal's SIGINT, SIGTERM, SIGALRM...) so a blocked
             // recvfrom returns EINTR, matching the icmp socket path.
             if let Err(e) = crate::process::check_signals() {
                 return (Err(e), Endpoint::Ip(IpEndpoint::UNSPECIFIED));
@@ -379,10 +376,7 @@ impl Socket for UdpSocketState {
                     );
                 }
             }
-            if let Err(e) = crate::process::check_and_deliver_tty_interrupt() {
-                return (Err(e), Endpoint::Ip(IpEndpoint::UNSPECIFIED));
-            }
-            // Also honor non-TTY signals (SIGTERM/SIGALRM/...) so a blocked
+            // Honor signals (the terminal's SIGINT, SIGTERM, SIGALRM...) so a blocked
             // recvfrom returns EINTR, matching the icmp socket path.
             if let Err(e) = crate::process::check_signals() {
                 return (Err(e), Endpoint::Ip(IpEndpoint::UNSPECIFIED));

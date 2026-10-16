@@ -760,7 +760,6 @@ impl Syscall<'_> {
         req: UserInPtr<TimeSpec>,
         rem: UserOutPtr<TimeSpec>,
     ) -> SysResult {
-        let _ = self.maybe_handle_tty_intr()?;
         info!(
             "clock_nanosleep: clockid={}, flags={:#x}, req={:?}, rem={:?}",
             clockid, flags, req, rem

@@ -427,7 +427,6 @@ impl Syscall<'_> {
         nfds: usize,
         timeout_msecs: isize,
     ) -> SysResult {
-        let _ = self.maybe_handle_tty_intr()?;
         // `nfds > RLIMIT_NOFILE` is EINVAL before the array is touched.
         let nfds = poll_nfds(nfds, self.linux_process().file_limit().cur)?;
         let mut polls = ufds.read_array(nfds)?;
@@ -821,7 +820,6 @@ impl Syscall<'_> {
         err: UserInOutPtr<u32>,
         mut timeout: UserInOutPtr<TimeVal>,
     ) -> SysResult {
-        let _ = self.maybe_handle_tty_intr()?;
         info!(
             "select: nfds: {}, read: {:?}, write: {:?}, err: {:?}, timeout: {:?}",
             nfds, read, write, err, timeout

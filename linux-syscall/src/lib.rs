@@ -208,34 +208,6 @@ pub struct Syscall<'a> {
 }
 
 impl Syscall<'_> {
-    /// Handle terminal-generated Ctrl+C (SIGINT) in a uniform way.
-    ///
-    /// This is intentionally centralized so we don't sprinkle per-program hacks.
-    fn maybe_handle_tty_intr(&mut self) -> SysResult {
-        // Cheap relaxed-style peek first: the latch is empty on the
-        // overwhelming majority of syscalls, and a plain load avoids the
-        // `lock xchg` on x86 / locked CAS on aarch64/riscv that the swap in
-        // `ctrl_c_pending_take` would otherwise issue per syscall.
-        if !linux_object::fs::stdio::ctrl_c_pending_peek() {
-            return Ok(0);
-        }
-        // Race-safe: another syscall may have claimed the latch between the
-        // peek and the swap.
-        let Some(intr) = linux_object::fs::stdio::ctrl_c_pending_take() else {
-            return Ok(0);
-        };
-        // Only when the keystroke handler could not signal the group itself:
-        // it already did whenever the VT had one, and delivering again is how
-        // a single Ctrl-C came to raise two `SIGINT`s. The VT comes from the
-        // latch, because the keystroke may not have arrived on the one on
-        // screen.
-        // Do not use sys_kill(-pgid): pgid==1 becomes kill(-1) ("every process") on Linux.
-        if intr.signal_owed {
-            linux_object::process::deliver_sigint_for_vt(Some(intr.vt));
-        }
-        Err(LxError::EINTR)
-    }
-
     /// [ext-watch] Verify that this thread's and its process's `ext` fat
     /// pointers still read as they did at construction.
     ///
@@ -301,9 +273,6 @@ impl Syscall<'_> {
 
     /// syscall entry function
     pub async fn syscall(&mut self, num: u32, args: [usize; 6]) -> isize {
-        if let Err(err) = self.maybe_handle_tty_intr() {
-            return -(err as isize);
-        }
         let pid = self.zircon_process().id();
         if let Err(_err) = hunter::check_syscall(pid, num, &args) {
             return -(linux_object::error::LxError::EPERM as isize);

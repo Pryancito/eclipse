@@ -134,10 +134,7 @@ impl Socket for RawSocketState {
     async fn read(&self, data: &mut [u8]) -> (SysResult, Endpoint) {
         loop {
             drain_net_poll(4);
-            if let Err(e) = crate::process::check_and_deliver_tty_interrupt() {
-                return (Err(e), Endpoint::Ip(IpEndpoint::UNSPECIFIED));
-            }
-            // Also honor non-TTY signals (SIGTERM/SIGALRM/...) so a blocked raw
+            // Honor signals (the terminal's SIGINT, SIGTERM, SIGALRM...) so a blocked raw
             // recv returns EINTR, matching the icmp socket path.
             if let Err(e) = crate::process::check_signals() {
                 return (Err(e), Endpoint::Ip(IpEndpoint::UNSPECIFIED));

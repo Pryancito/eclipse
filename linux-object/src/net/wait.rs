@@ -7,10 +7,7 @@ use core::time::Duration;
 
 use kernel_hal::timer_waker::{self, TimerWakerSlot};
 
-use super::{
-    clear_io_wait_wakers, clear_io_wait_wakers_hid, register_io_wait_wakers,
-    register_io_wait_wakers_hid, retain_io_wait_wakers, retain_io_wait_wakers_hid,
-};
+use super::{clear_io_wait_wakers_hid, register_io_wait_wakers_hid, retain_io_wait_wakers_hid};
 
 /// Fallback timer when no IRQ wakes a multiplex wait (poll/epoll/select).
 pub const IO_WAIT_TICK_MS: u64 = 4;
@@ -25,74 +22,6 @@ pub const IO_WAIT_TICK_MS: u64 = 4;
 /// second per parked process into 10, while bounding any wiring bug to
 /// 100 ms of added latency instead of a hang.
 pub const IO_WAIT_COVERED_TICK_MS: u64 = 100;
-
-/// Resolves when Ctrl+C is pending, NET RX wakers fire, or deadline.
-pub struct NetOrTtyWait {
-    deadline: Duration,
-    armed: bool,
-    timer: Option<TimerWakerSlot>,
-    watch_net: bool,
-    watch_interactive: bool,
-    io_waker: Option<core::task::Waker>,
-}
-
-impl NetOrTtyWait {
-    pub fn new_after_ms(ms: u64) -> Self {
-        Self {
-            deadline: kernel_hal::timer::timer_now() + Duration::from_millis(ms),
-            armed: false,
-            timer: None,
-            watch_net: true,
-            watch_interactive: true,
-            io_waker: None,
-        }
-    }
-}
-
-impl Drop for NetOrTtyWait {
-    fn drop(&mut self) {
-        timer_waker::kill_timer_waker(&mut self.timer);
-        if let Some(w) = self.io_waker.take() {
-            clear_io_wait_wakers(&w, self.watch_net, self.watch_interactive);
-        }
-    }
-}
-
-impl Future for NetOrTtyWait {
-    type Output = ();
-
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        if crate::fs::stdio::ctrl_c_pending_peek() {
-            timer_waker::kill_timer_waker(&mut self.timer);
-            if let Some(w) = self.io_waker.take() {
-                clear_io_wait_wakers(&w, self.watch_net, self.watch_interactive);
-            }
-            return Poll::Ready(());
-        }
-        if kernel_hal::timer::timer_now() >= self.deadline {
-            timer_waker::kill_timer_waker(&mut self.timer);
-            if let Some(w) = self.io_waker.take() {
-                clear_io_wait_wakers(&w, self.watch_net, self.watch_interactive);
-            } else {
-                clear_io_wait_wakers(cx.waker(), self.watch_net, self.watch_interactive);
-            }
-            return Poll::Ready(());
-        }
-        if self.armed {
-            retain_io_wait_wakers(cx.waker(), self.watch_net, self.watch_interactive);
-            timer_waker::kill_timer_waker(&mut self.timer);
-            clear_io_wait_wakers(cx.waker(), self.watch_net, self.watch_interactive);
-            self.io_waker = None;
-            return Poll::Ready(());
-        }
-        register_io_wait_wakers(cx.waker(), self.watch_net, self.watch_interactive);
-        self.io_waker = Some(cx.waker().clone());
-        let dl = self.deadline;
-        timer_waker::ensure_timer_waker(&mut self.timer, dl, cx);
-        self.armed = true;
-        Poll::Pending
-    }
-}
 
 /// One sleep cycle in epoll/poll: wake on NET/TTY IRQ or fallback timer.
 pub struct IoMultiplexWait {

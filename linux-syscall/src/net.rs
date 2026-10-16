@@ -957,7 +957,6 @@ impl Syscall<'_> {
         src_addr: UserOutPtr<SockAddr>,
         addrlen: UserInOutPtr<u32>,
     ) -> SysResult {
-        let _ = self.maybe_handle_tty_intr()?;
         linux_object::process::check_signals()?;
         info!(
             "sys_recvfrom: sockfd:{}, buffer:{:?}, length:{}, flags:{} , src_addr:{:?}, addrlen:{:?}",
