@@ -246,9 +246,17 @@ pub mod inflight {
         CURRENT.store(packed | 1 << 63, Ordering::Relaxed);
     }
 
-    /// The command finished, one way or another.
-    pub fn end(timed_out: bool) {
+    /// The command finished, one way or another, at `now_us`.
+    ///
+    /// The time it took is added to the ring, so a reader that arrives later
+    /// can say how much of the last few seconds the disk was actually working
+    /// -- which the single instant [`current`] reports cannot.
+    pub fn end(now_us: u64, timed_out: bool) {
+        let started = current().map(|(_, _, since)| since);
         CURRENT.store(0, Ordering::Relaxed);
+        if let Some(start) = started {
+            add_span(start, now_us);
+        }
         if timed_out {
             TIMEOUTS.fetch_add(1, Ordering::Relaxed);
         }
@@ -285,6 +293,66 @@ pub mod inflight {
     /// reader that has no other way to ask the driver's timer.
     pub fn now_us() -> u64 {
         unsafe { crate::bus::drivers_timer_now_as_micros() }
+    }
+
+    /// How many whole seconds of history the ring keeps. Two more than the
+    /// eight the deadlock detector waits, so the banner's window is never
+    /// clipped by the second that is still being filled.
+    pub const RING_SECS: u64 = 16;
+
+    /// Microseconds the disk spent working, and commands completed, in each
+    /// of the last [`RING_SECS`] seconds. Each word is `(second << 32) |
+    /// value`, so a slot that belongs to an older lap of the ring reads as
+    /// stale instead of as a huge number, and no reader needs a lock.
+    static BUSY_US: [AtomicU64; RING_SECS as usize] =
+        [const { AtomicU64::new(0) }; RING_SECS as usize];
+    static DONE: [AtomicU64; RING_SECS as usize] = [const { AtomicU64::new(0) }; RING_SECS as usize];
+
+    fn bump(table: &[AtomicU64; RING_SECS as usize], sec: u64, amount: u64) {
+        let slot = &table[(sec % RING_SECS) as usize];
+        let v = slot.load(Ordering::Relaxed);
+        let carried = if v >> 32 == sec { v & 0xFFFF_FFFF } else { 0 };
+        slot.store((sec << 32) | (carried + amount).min(0xFFFF_FFFF), Ordering::Relaxed);
+    }
+
+    /// Record that the disk was busy from `start_us` to `end_us`.
+    ///
+    /// The time is split across the seconds it spans rather than dumped on
+    /// the one it ended in: a single ten-second command would otherwise make
+    /// one second of the ring claim ten seconds of work.
+    pub fn add_span(start_us: u64, end_us: u64) {
+        let end = end_us.max(start_us);
+        let last = end / 1_000_000;
+        // A span older than the ring can only overwrite its own earlier
+        // seconds; keep the tail that still fits.
+        let first = (start_us / 1_000_000).max(last.saturating_sub(RING_SECS - 1));
+        for sec in first..=last {
+            let lo = (sec * 1_000_000).max(start_us);
+            let hi = ((sec + 1) * 1_000_000).min(end);
+            bump(&BUSY_US, sec, hi.saturating_sub(lo));
+        }
+        bump(&DONE, last, 1);
+    }
+
+    /// Microseconds the disk was busy, and commands it completed, over the
+    /// `secs` seconds ending at `now_us`. Clamped to the ring's length.
+    pub fn busy_over_last(secs: u64, now_us: u64) -> (u64, u64) {
+        let now_sec = now_us / 1_000_000;
+        let oldest = now_sec.saturating_sub(secs.clamp(1, RING_SECS) - 1);
+        let mut busy = 0;
+        let mut done = 0;
+        for sec in oldest..=now_sec {
+            let i = (sec % RING_SECS) as usize;
+            let b = BUSY_US[i].load(Ordering::Relaxed);
+            if b >> 32 == sec {
+                busy += b & 0xFFFF_FFFF;
+            }
+            let d = DONE[i].load(Ordering::Relaxed);
+            if d >> 32 == sec {
+                done += d & 0xFFFF_FFFF;
+            }
+        }
+        (busy, done)
     }
 }
 
@@ -651,11 +719,11 @@ impl AhciPort {
                 timeout_us / 1000,
                 tfd, ssts, serr, is, ci
             );
-            inflight::end(true);
+            inflight::end(inflight::now_us(), true);
             self.reset_port();
             return Err(DeviceError::IoError);
         }
-        inflight::end(false);
+        inflight::end(inflight::now_us(), false);
 
         let is_now = self.read_reg(PORT_IS);
         let tfd_err = self.read_reg(PORT_TFD) & ATA_DEV_ERR as u32 != 0;
@@ -2488,18 +2556,50 @@ mod inflight_tests {
         // port in the first microsecond of the boot must not read as nothing.
         inflight::begin(0, Kind::Read, 0);
         assert_eq!(inflight::current(), Some((0, Kind::Read, 0)));
-        inflight::end(false);
+        inflight::end(1, false);
         assert_eq!(inflight::current(), None);
 
         // The counters separate a disk that is slow from one that is failing,
         // so only a command that burned its whole timeout counts as a timeout.
         let (t0, r0) = inflight::counters();
         inflight::begin(0, Kind::Read, 10);
-        inflight::end(false);
+        inflight::end(20, false);
         assert_eq!(inflight::counters(), (t0, r0));
         inflight::begin(0, Kind::Read, 20);
-        inflight::end(true);
+        inflight::end(30, true);
         inflight::note_retry();
         assert_eq!(inflight::counters(), (t0 + 1, r0 + 1));
+
+        // The ring. Seconds far from everything the assertions above touched,
+        // so one lap of the ring cannot carry another test's microseconds in.
+        let s = 1_000 * inflight::RING_SECS; // a whole number of laps
+        let us = |sec: u64, off: u64| sec * 1_000_000 + off;
+
+        // Two commands inside one second add up, and the second they belong
+        // to is the one the reader asks for.
+        inflight::add_span(us(s, 10), us(s, 1_010));
+        inflight::add_span(us(s, 2_000), us(s, 5_000));
+        assert_eq!(inflight::busy_over_last(1, us(s, 999_999)), (4_000, 2));
+
+        // A command that straddles a second is split, not charged whole to
+        // the second it ended in: a ten-second command must never make one
+        // second of the ring claim ten seconds of work.
+        inflight::add_span(us(s + 1, 900_000), us(s + 3, 400_000));
+        assert_eq!(inflight::busy_over_last(1, us(s + 1, 999_999)), (100_000, 0));
+        assert_eq!(inflight::busy_over_last(1, us(s + 2, 999_999)), (1_000_000, 0));
+        assert_eq!(inflight::busy_over_last(1, us(s + 3, 500_000)), (400_000, 1));
+        // And summed over the window the banner uses, it is back to its real
+        // length, plus the 4 ms of the second before it.
+        assert_eq!(
+            inflight::busy_over_last(8, us(s + 3, 500_000)),
+            (1_504_000, 3)
+        );
+
+        // A slot from an older lap is stale, not a huge number: one full lap
+        // later the same slots must read as empty.
+        assert_eq!(
+            inflight::busy_over_last(8, us(s + 3 + inflight::RING_SECS, 500_000)),
+            (0, 0)
+        );
     }
 }

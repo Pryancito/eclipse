@@ -1660,3 +1660,11 @@ pub fn disk_inflight() -> (Option<(u8, &'static str, u64)>, u64, u64) {
     let (timeouts, retries) = inflight::counters();
     (cur, timeouts, retries)
 }
+
+/// Microseconds the disk was busy, and commands it finished, over the `secs`
+/// seconds just gone. "No command in flight" is one instant and says nothing
+/// about the eight seconds a waiter has just spent; this does.
+pub fn disk_busy_over_last(secs: u64) -> (u64, u64) {
+    use zcore_drivers::ata::ahci::inflight;
+    inflight::busy_over_last(secs, inflight::now_us())
+}
