@@ -2486,8 +2486,8 @@ fn exec_needs_the_callers_own_rm_channel_and_a_well_formed_request() {
     let too_many: Vec<_> = (0..65).map(|_| push(PUSH_VA, 16)).collect();
     assert_eq!(
         exec(&gpu, A, ch, &too_many, &[], &[]),
-        Err(nv::EOPNOTSUPP),
-        "65 pushes"
+        Err(nv::EINVAL),
+        "65 pushes: over the advertised maximum, EINVAL as over Linux's"
     );
     let mut r = nv::DrmNouveauExec {
         channel: ch,
@@ -2505,7 +2505,11 @@ fn exec_needs_the_callers_own_rm_channel_and_a_well_formed_request() {
     );
     r.push_ptr = p.as_ptr() as u64;
     r.wait_count = 1;
-    assert_eq!(exec_raw(&gpu, A, &mut r), Err(nv::EOPNOTSUPP), "null waits");
+    assert_eq!(
+        exec_raw(&gpu, A, &mut r),
+        Err(nv::EFAULT),
+        "null waits: `u_memcpya` faults, whatever the count"
+    );
     // One more than NVK's batch (256) of real, satisfied syncs: a cap
     // that let them through would submit, not crash.
     let ready = syncobj::create(true);
@@ -2516,7 +2520,7 @@ fn exec_needs_the_callers_own_rm_channel_and_a_well_formed_request() {
     r.wait_count = 0;
     r.wait_ptr = 0;
     r.sig_count = 1;
-    assert_eq!(exec_raw(&gpu, A, &mut r), Err(nv::EOPNOTSUPP), "null sigs");
+    assert_eq!(exec_raw(&gpu, A, &mut r), Err(nv::EFAULT), "null sigs");
     r.sig_count = 257;
     r.sig_ptr = many_syncs.as_ptr() as u64;
     assert_eq!(exec_raw(&gpu, A, &mut r), Err(nv::EOPNOTSUPP), "257 sigs");
