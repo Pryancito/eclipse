@@ -3734,7 +3734,7 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n"
         // boot services: DHCP, the seat manager and the labwc session.
         let svc_dir = rootfs.join("etc").join("eclipse").join("services");
         let _ = fs::create_dir_all(&svc_dir);
-        Self::write_init_services(&svc_dir);
+        Self::write_init_services(&svc_dir, self.1.has_desktop());
 
         // The startup chime's asset, which a oneshot below plays.
         let share = rootfs.join("usr").join("share").join("eclipse");
@@ -3769,7 +3769,15 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n"
         // depending on which of the two commands ran last.
         Self::write_desktop_session(rootfs, self.1.default_session());
 
-        println!("Installed eclipse-init as PID 1 with udhcpc, dbus, seatd, labwc, xorg, pulseaudio and boot-sound services.");
+        println!(
+            "Installed eclipse-init as PID 1 with udhcpc, dbus, seatd, labwc, xorg{} and \
+             boot-sound services.",
+            if self.1.has_desktop() {
+                ", pulseaudio"
+            } else {
+                " (no pulseaudio: the minimal variant installs no apk closure)"
+            }
+        );
         true
     }
 
@@ -3784,7 +3792,17 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n"
     /// every key has to be one `tools/eclipse-init` parses -- an unknown key is
     /// a gate that silently does not exist -- and the `desktop =` column is
     /// what decides which of the two sessions each service belongs to.
-    fn write_init_services(svc_dir: &Path) {
+    ///
+    /// `has_desktop` is the variant: `desktop =` is the column that keeps a
+    /// session's services out of a minimal image, and it only works for
+    /// services that belong to a session. A service whose binary comes from the
+    /// apk closure but is session-agnostic -- `pulseaudio` is the one -- has no
+    /// value to put in that column and would be written into an image that
+    /// installs no apk closure at all, where `eclipse-init` then burns its 20
+    /// starts and 162 seconds of console on a binary that is not there. So the
+    /// variant is a parameter, and the table itself is what leaves such a row
+    /// out.
+    fn write_init_services(svc_dir: &Path, has_desktop: bool) {
         fs::write(
             svc_dir.join("example.service.txt"),
             b"# Eclipse init service file. Copy to '<name>.service' to enable.\n\
@@ -4041,15 +4059,28 @@ __ECLIPSE_SWAP_DEV__  none               swap    sw                0  0\n"
         // never appears). Pulse loads the ALSA sink after its socket, and
         // `eclipse-boot-sound` already polls for a PCM; a missing card just
         // means no sink, not a delayed desktop.
-        fs::write(
-            svc_dir.join("pulseaudio.service"),
-            b"# PulseAudio sound server (system instance). See eclipse-pulseaudio.\n\
-              exec = /usr/local/bin/eclipse-pulseaudio\n\
-              type = respawn\n\
-              after = dbus-system\n\
-              log = /tmp/pulseaudio.log\n",
-        )
-        .unwrap();
+        //
+        // Session-agnostic is exactly why this row needs the variable above
+        // instead of a `desktop =` line: `pulseaudio` belongs to neither
+        // session, so no value in that column describes it, and the binary it
+        // execs comes from the apk closure that `install_desktop_stack`
+        // installs only for `desktop`. Written into a minimal image it is a row
+        // that can never start -- `eclipse-pulseaudio: pulseaudio not
+        // installed`, 20 times, 8 seconds apart, 162 seconds of console before
+        // `CRASH_START_LIMIT` gives up on it. The two services that name it
+        // (`boot-sound`, `boot-sound-xorg`) are both `desktop =`-guarded, so
+        // leaving it out here strands no `requires =`.
+        if has_desktop {
+            fs::write(
+                svc_dir.join("pulseaudio.service"),
+                b"# PulseAudio sound server (system instance). See eclipse-pulseaudio.\n\
+                  exec = /usr/local/bin/eclipse-pulseaudio\n\
+                  type = respawn\n\
+                  after = dbus-system\n\
+                  log = /tmp/pulseaudio.log\n",
+            )
+            .unwrap();
+        }
 
         // Boot chime: play once after the session is up so NVIDIA HDMI audio
         // (ELD/SET_HDMI_ENABLE) has had a DRM query. Oneshot wrapper forks
@@ -6027,7 +6058,7 @@ mod rootfs_plumbing_tests {
         let localbin = rootfs.join("usr/local/bin");
         fs::create_dir_all(&svc).unwrap();
         fs::create_dir_all(&localbin).unwrap();
-        LinuxRootfs::write_init_services(&svc);
+        LinuxRootfs::write_init_services(&svc, true);
         // `eclipse-ntpd` is one of the programs the table execs and the only
         // one of them `write_ntp` writes, so the same rootfs needs it here for
         // the same reason `make` writes it there.
@@ -6531,6 +6562,58 @@ mod rootfs_plumbing_tests {
                 field(&body, "desktop"),
                 want,
                 "{name} is in the wrong session"
+            );
+        }
+    }
+
+    /// The minimal variant installs no apk closure, so a row whose `exec =`
+    /// comes out of that closure can never start there. `desktop =` cannot
+    /// express it -- `pulseaudio` belongs to neither session -- so the table
+    /// leaves the row out, and this is the assertion that says so.
+    ///
+    /// Written as the pair it is: the same row IS in the desktop table. A test
+    /// that only checked the absence would also pass with the row deleted for
+    /// everyone, which is the opposite of the fix.
+    #[test]
+    fn the_minimal_table_has_no_service_the_apk_closure_would_have_to_supply() {
+        let desktop = scratch("svc-desktop").join("etc/eclipse/services");
+        let minimal = scratch("svc-minimal").join("etc/eclipse/services");
+        fs::create_dir_all(&desktop).unwrap();
+        fs::create_dir_all(&minimal).unwrap();
+        LinuxRootfs::write_init_services(&desktop, true);
+        LinuxRootfs::write_init_services(&minimal, false);
+
+        assert!(
+            desktop.join("pulseaudio.service").is_file(),
+            "the desktop table lost pulseaudio.service, which is where it belongs"
+        );
+        assert!(
+            !minimal.join("pulseaudio.service").is_file(),
+            "the minimal image installs no apk closure, so pulseaudio.service is 20 \
+             starts and 162 s of console on a binary that is not there"
+        );
+
+        // And nothing left in the minimal table may still need it: a
+        // `requires =` naming a service that does not exist is a dependency
+        // that can never be met. The two that name it (`boot-sound`,
+        // `boot-sound-xorg`) are `desktop =`-guarded, so `eclipse-init`
+        // discards them before the dependency is ever read -- which is the
+        // reason this removal is safe, and the reason it has to be checked
+        // rather than assumed.
+        for entry in fs::read_dir(&minimal).unwrap().flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if !name.ends_with(".service") {
+                continue;
+            }
+            let body = fs::read_to_string(entry.path()).unwrap();
+            let needs_pulse = ["requires", "after"].iter().any(|key| {
+                field(&body, key)
+                    .is_some_and(|v| v.split_whitespace().any(|dep| dep == "pulseaudio"))
+            });
+            assert!(
+                !needs_pulse || field(&body, "desktop").is_some(),
+                "{name} depends on pulseaudio and is not session-guarded, so in a \
+                 minimal image it waits for a service that is not written"
             );
         }
     }

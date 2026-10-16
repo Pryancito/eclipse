@@ -594,7 +594,7 @@ mod tests {
         let localbin = src.join("usr/local/bin");
         fs::create_dir_all(&svc_dir).unwrap();
         fs::create_dir_all(&localbin).unwrap();
-        LinuxRootfs::write_init_services(&svc_dir);
+        LinuxRootfs::write_init_services(&svc_dir, true);
         LinuxRootfs::write_ntp(&src);
         LinuxRootfs::write_init_wrappers(&localbin, &svc_dir);
         // Los tres que escribe `desktop.rs` (labwc, gtk-caches, xkbmap) no los
