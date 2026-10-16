@@ -1510,7 +1510,29 @@ impl CurrentThread {
                     // resume:  return the context token from thread object
                     // There is no need to call change_state here
                     // since take away the context of a non-suspended thread won't change it's state
-                    Poll::Ready(inner.context.take().unwrap())
+                    match inner.context.take() {
+                        Some(context) => Poll::Ready(context),
+                        None => {
+                            // Reachable, and a kernel bug when it happens:
+                            // `ThreadInner::state()` reports the raw state
+                            // whenever the context is away, so "not Suspended"
+                            // does NOT imply the context is here. It means
+                            // whoever last took it never handed it back with
+                            // `put_context`. Panic out of the lock: panicking
+                            // while holding the thread's inner lock makes the
+                            // panic uncontainable and halts the whole machine
+                            // (`[oops] kernel panic NOT contained`), and the
+                            // message is all the next reader gets.
+                            let id = self.thread.base.id;
+                            let state = inner.state;
+                            let suspend_count = inner.suspend_count;
+                            drop(inner);
+                            panic!(
+                                "thread {} entered wait_for_run with no saved context                                  (state {:?}, suspend_count {})",
+                                id, state, suspend_count
+                            );
+                        }
+                    }
                 } else {
                     // suspend: put waker into the thread object
                     inner.waker = Some(cx.waker().clone());
@@ -3275,6 +3297,46 @@ mod state_and_accounting_tests {
         inner.state = ThreadState::Running;
         inner.context = None;
         assert_eq!(inner.state(), ThreadState::Running);
+    }
+
+    /// `wait_for_run` takes the context away, and the only thing that makes the
+    /// thread runnable again is a `put_context` handing it back.
+    ///
+    /// Every round of `run_user` that enters user mode does that. The Linux
+    /// job-control stop is the one path that goes round the loop WITHOUT
+    /// entering user mode (SIGTSTP/SIGTTIN/SIGTTOU park the thread and
+    /// `continue`), and it must park the context all the same: without it the
+    /// registers are dropped on the floor and the next `wait_for_run` finds
+    /// nothing to hand out.
+    #[test]
+    fn a_context_parked_without_running_is_handed_out_again() {
+        let t = a_thread();
+        {
+            let mut inner = t.lock_inner();
+            inner.context = Some(Box::new(UserContext::default()));
+            inner.state = ThreadState::Running;
+        }
+        let current = CurrentThread(t.clone());
+
+        let ctx = current
+            .wait_for_run()
+            .now_or_never()
+            .expect("a runnable thread hands out its context at once");
+        assert!(
+            t.lock_inner().context.is_none(),
+            "the context is away while the thread runs"
+        );
+
+        // What the job-control stop does: hand it straight back, never having
+        // entered user mode.
+        current.put_context(ctx);
+        assert!(t.lock_inner().context.is_some());
+
+        let ctx = current
+            .wait_for_run()
+            .now_or_never()
+            .expect("a parked context is handed out again, not lost");
+        current.put_context(ctx);
     }
 
     /// Each transition publishes the signal set `zx_object_wait_one` is

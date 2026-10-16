@@ -657,6 +657,18 @@ async fn run_user(thread: CurrentThread) {
             .map(|lp| lp.is_job_stopped())
             .unwrap_or(false)
         {
+            // Park the context back on the thread BEFORE stopping. This path is
+            // the only one that goes round the loop to `wait_for_run` again
+            // without entering user mode, and `wait_for_run` took the context
+            // away at the top of the iteration: dropping `ctx` here loses the
+            // thread's whole register state, and the next `wait_for_run` finds
+            // `context == None` and panics on the `unwrap` -- with the thread's
+            // inner lock held, so the panic cannot be contained and the machine
+            // halts. Parking it is also what makes the stopped thread
+            // observable: `/proc/<pid>/stat`, a debugger and `zx_task_suspend`
+            // all read the saved context, and a thread stopped by SIGTSTP/
+            // SIGTTIN/SIGTTOU can sit here for as long as the job is stopped.
+            thread.put_context(ctx);
             linux_object::process::wait_while_job_stopped(thread.proc()).await;
             if thread.state() == ThreadState::Dying {
                 break;
