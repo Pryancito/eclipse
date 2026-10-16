@@ -52,6 +52,27 @@ pub const MAX_LEVEL: u8 = 8;
 /// Clean nodes kept decoded in memory.
 const CACHE_NODES: usize = 8192;
 
+/// Most nodes one [`Store::trim`] may drop.
+///
+/// `trim` used to take the cache from its high-water mark straight down to
+/// `CACHE_NODES * 3 / 4`, which from the trigger in [`Store::load`] is 10 240
+/// nodes in one call. A node is a decoded leaf whose every item owns its own
+/// `Vec<u8>`, so that sweep is on the order of a *million* `dealloc`s -- and
+/// `EclipseMountFs` holds its mount lock, a ticket spinlock taken with
+/// interrupts off, across the whole of it. A capture from real hardware
+/// (16-oct-2026, build `d5b176be0f`) caught exactly that: the holder of
+/// `eclipsefs_mount.rs:512` spinning in
+/// `TicketMutex<Heap<32>>::lock` inside `dealloc`, called from
+/// `trim` <- `load` <- `range_rec`, with three other cores piled up in
+/// `stat`, and the kernel's >8 s deadlock detector firing on it. The same
+/// boot's `[heap-pressure]` line read `32B x 1064172` live -- the burst and
+/// the blocks it frees are the same million.
+///
+/// Bounding the sweep makes the cache converge over successive loads instead
+/// of in one stall. A load inserts at most one node and may drop this many,
+/// so the cache still cannot run away past [`CACHE_NODES`].
+const TRIM_BATCH: usize = 64;
+
 /// Item key, ordered by objectid, then type, then offset.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Key {
@@ -309,6 +330,16 @@ pub struct Store {
     /// Blocks past this are corrupt pointers.
     pub total_blocks: u64,
     cache: BTreeMap<u64, Node>,
+    /// Where the next bounded [`Store::trim`] resumes its sweep.
+    ///
+    /// Without it a bounded trim would take the first `TRIM_BATCH` clean keys
+    /// of the map every time, i.e. always the lowest block numbers -- which in
+    /// a tree are the oldest-allocated nodes, the ones nearest the root and
+    /// the likeliest to be wanted on the very next descent. Evicting them on
+    /// every load and reading them straight back is a thrash the unbounded
+    /// sweep never had, because it ran rarely. Resuming where the last sweep
+    /// stopped, and wrapping, spreads eviction over the whole cache instead.
+    trim_cursor: u64,
     /// Nodes created in this transaction (written at commit).
     dirty: BTreeSet<u64>,
     extent_of: ExtentOf,
@@ -332,6 +363,7 @@ impl Store {
             gen,
             total_blocks,
             cache: BTreeMap::new(),
+            trim_cursor: 0,
             dirty: BTreeSet::new(),
             extent_of,
             mirrors: None,
@@ -412,17 +444,45 @@ impl Store {
         out
     }
 
+    /// Drop up to [`TRIM_BATCH`] clean nodes, resuming the sweep where the
+    /// last call left off.
+    ///
+    /// Cheap enough to call on every load: under [`CACHE_NODES`] it is one
+    /// length comparison. Over it, the work -- and the `dealloc`s it causes
+    /// under the mount's interrupts-off spinlock -- is bounded, which is the
+    /// whole point (see [`TRIM_BATCH`]).
     fn trim(&mut self) {
         if self.cache.len() <= CACHE_NODES {
             return;
         }
-        let clean: Vec<u64> = self
+        let want = (self.cache.len() - CACHE_NODES * 3 / 4).min(TRIM_BATCH);
+        let cursor = self.trim_cursor;
+        let dirty = &self.dirty;
+        let mut clean: Vec<u64> = self
             .cache
-            .keys()
-            .copied()
-            .filter(|b| !self.dirty.contains(b))
-            .take(self.cache.len() - CACHE_NODES * 3 / 4)
+            .range(cursor..)
+            .map(|(&b, _)| b)
+            .filter(|b| !dirty.contains(b))
+            .take(want)
             .collect();
+        // Wrap: the tail from the cursor on may hold fewer than `want` clean
+        // nodes (or none, once the cursor has passed the last key), and a
+        // sweep that stopped there would leave the cache over its budget for
+        // ever with the cursor never advancing.
+        if clean.len() < want {
+            let rest = want - clean.len();
+            clean.extend(
+                self.cache
+                    .range(..cursor)
+                    .map(|(&b, _)| b)
+                    .filter(|b| !dirty.contains(b))
+                    .take(rest),
+            );
+        }
+        // Past the last key dropped, so the next sweep carries on rather than
+        // re-walking what is already gone. Nothing dropped means every node
+        // from here on is dirty: start over from the beginning next time.
+        self.trim_cursor = clean.last().map_or(0, |b| b.saturating_add(1));
         for b in clean {
             self.cache.remove(&b);
         }
@@ -445,9 +505,11 @@ impl Store {
             if bytenr < 2 || bytenr >= self.total_blocks {
                 return Err(Error::Corrupt("tree pointer out of range"));
             }
-            if self.cache.len() > CACHE_NODES * 2 {
-                self.trim();
-            }
+            // Unconditional, and no longer only past twice the budget: the
+            // sweep is bounded now, so it has to run often enough to keep up
+            // with the inserts below. It costs one comparison while the cache
+            // is within budget.
+            self.trim();
             let node = self.read_node(bytenr, level, gen)?;
             self.cache.insert(bytenr, node);
         }
@@ -1340,6 +1402,146 @@ mod tests {
         let mut sp = TestSpace::default();
         let root = st.create(&mut sp, 5, 0).unwrap();
         (st, sp, root)
+    }
+
+    /// A store whose cache holds `n` synthetic clean nodes, keyed 1..=n.
+    fn store_with_cached_nodes(n: u64) -> Store {
+        let dev = Arc::new(Ram(UnsafeCell::new(vec![0u8; BS])));
+        let mut st = Store::new(dev, [9; 16], 1, n + 1, |_, _| None);
+        for b in 1..=n {
+            st.cache.insert(b, Node::empty_leaf(5, 1));
+        }
+        st
+    }
+
+    /// The sweep is bounded, because the whole of it runs under the mount's
+    /// interrupts-off spinlock. An unbounded one took the cache from twice
+    /// the budget down to three quarters of it in one call -- 10 240 nodes,
+    /// a million `dealloc`s -- and wedged the machine for longer than the
+    /// kernel's 8 s deadlock detector will wait.
+    #[test]
+    fn one_trim_drops_at_most_a_batch() {
+        let n = (CACHE_NODES * 2) as u64;
+        let mut st = store_with_cached_nodes(n);
+        st.trim();
+        assert_eq!(
+            st.cache.len(),
+            n as usize - TRIM_BATCH,
+            "un solo barrido no puede soltar mas de un lote"
+        );
+        // Under the budget it is a comparison and nothing else.
+        let mut small = store_with_cached_nodes(CACHE_NODES as u64);
+        small.trim();
+        assert_eq!(small.cache.len(), CACHE_NODES);
+        assert_eq!(small.trim_cursor, 0, "no barrio nada, no movio el cursor");
+    }
+
+    /// Successive sweeps move on instead of re-taking the lowest keys, which
+    /// in a tree are the oldest nodes -- nearest the root, and the first
+    /// wanted again on the next descent.
+    #[test]
+    fn successive_trims_sweep_forward_instead_of_eating_the_lowest_keys() {
+        let n = (CACHE_NODES * 2) as u64;
+        let mut st = store_with_cached_nodes(n);
+        st.trim();
+        let first = TRIM_BATCH as u64 + 1;
+        assert_eq!(
+            st.cache.keys().next().copied(),
+            Some(first),
+            "el primer barrido se lleva el primer lote de claves"
+        );
+        assert_eq!(st.trim_cursor, first);
+        st.trim();
+        // The second sweep took the NEXT batch, so the keys just below the
+        // first cursor are still gone and the ones above it have now gone too.
+        assert_eq!(st.cache.len(), n as usize - 2 * TRIM_BATCH);
+        assert_eq!(st.trim_cursor, 2 * TRIM_BATCH as u64 + 1);
+        assert!(st.cache.contains_key(&(2 * TRIM_BATCH as u64 + 1)));
+    }
+
+    /// Bounding the sweep must not stop it getting the cache back inside its
+    /// budget; it only spreads the same work over more calls.
+    #[test]
+    fn repeated_trims_bring_the_cache_back_within_budget() {
+        let n = (CACHE_NODES * 2) as u64;
+        let mut st = store_with_cached_nodes(n);
+        let mut sweeps = 0;
+        while st.cache.len() > CACHE_NODES && sweeps < 10_000 {
+            st.trim();
+            sweeps += 1;
+        }
+        assert!(
+            st.cache.len() <= CACHE_NODES,
+            "la cache se quedo en {} nodos tras {} barridos",
+            st.cache.len(),
+            sweeps
+        );
+    }
+
+    /// Once the cursor is past the last key, a sweep that did not wrap would
+    /// find nothing above it, drop nothing, and leave the cache over budget
+    /// for ever.
+    #[test]
+    fn a_cursor_past_the_last_key_wraps_instead_of_sweeping_nothing() {
+        let n = (CACHE_NODES * 2) as u64;
+        let mut st = store_with_cached_nodes(n);
+        st.trim_cursor = n + 1_000;
+        st.trim();
+        assert_eq!(
+            st.cache.len(),
+            n as usize - TRIM_BATCH,
+            "con el cursor pasado del final no barrio nada"
+        );
+        assert_eq!(st.cache.keys().next().copied(), Some(TRIM_BATCH as u64 + 1));
+        assert_eq!(st.trim_cursor, TRIM_BATCH as u64 + 1);
+    }
+
+    /// The tail from the cursor on can hold *some* clean nodes but fewer than
+    /// a batch; the sweep then finishes the batch from the beginning rather
+    /// than coming up short every time.
+    #[test]
+    fn a_short_tail_is_completed_from_the_start_of_the_cache() {
+        let n = (CACHE_NODES * 2) as u64;
+        let mut st = store_with_cached_nodes(n);
+        let tail = (TRIM_BATCH / 4) as u64;
+        st.trim_cursor = n - tail + 1;
+        st.trim();
+        assert_eq!(
+            st.cache.len(),
+            n as usize - TRIM_BATCH,
+            "la cola corta no se completo desde el principio"
+        );
+        // The tail went, and so did the first keys, enough to make a batch.
+        assert!(!st.cache.contains_key(&n));
+        assert!(!st.cache.contains_key(&1));
+        assert!(st.cache.contains_key(&(TRIM_BATCH as u64 - tail + 1)));
+    }
+
+    /// A dirty node is unwritten data: dropping it loses the transaction. The
+    /// bound must not turn "skip the dirty ones" into "stop at the first
+    /// dirty one".
+    #[test]
+    fn a_dirty_node_is_never_dropped_however_the_sweep_lands_on_it() {
+        let n = (CACHE_NODES * 2) as u64;
+        let mut st = store_with_cached_nodes(n);
+        // Every key the first sweep would otherwise take.
+        for b in 1..=(TRIM_BATCH as u64) {
+            st.dirty.insert(b);
+        }
+        st.trim();
+        for b in 1..=(TRIM_BATCH as u64) {
+            assert!(st.cache.contains_key(&b), "solto el nodo sucio {}", b);
+        }
+        assert_eq!(st.cache.len(), n as usize - TRIM_BATCH);
+
+        // All dirty: nothing may be dropped, and the sweep must not wedge.
+        let mut all = store_with_cached_nodes((CACHE_NODES * 2) as u64);
+        for b in 1..=(CACHE_NODES as u64 * 2) {
+            all.dirty.insert(b);
+        }
+        all.trim();
+        assert_eq!(all.cache.len(), CACHE_NODES * 2);
+        assert_eq!(all.trim_cursor, 0, "sin nada que soltar, vuelve al principio");
     }
 
     fn val(i: u64, len: usize) -> Vec<u8> {
