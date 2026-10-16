@@ -167,6 +167,15 @@ const MODE_SET_GID: u16 = 0o2000;
 const MODE_EXEC_GRP: u16 = 0o0010;
 const MODE_STICKY: u16 = 0o1000;
 
+/// `include/linux/sched/coredump.h`: the three values of a process's
+/// dumpability. `SUID_DUMP_DISABLE` is what Linux's `suid_dumpable` sysctl
+/// defaults to, and what a privilege-raising exec therefore leaves behind;
+/// `SUID_DUMP_USER` is the ordinary state and the only one that lets another
+/// process of the same user look inside this one.
+pub const SUID_DUMP_DISABLE: u8 = 0;
+/// See [`SUID_DUMP_DISABLE`].
+pub const SUID_DUMP_USER: u8 = 1;
+
 #[derive(Clone, Debug)]
 pub struct Credentials {
     pub ruid: u32,
@@ -1952,7 +1961,7 @@ impl LinuxProcess {
     /// Dumpable attribute (`prctl(PR_GET_DUMPABLE)`); defaults to
     /// `SUID_DUMP_USER` (1) like Linux.
     pub fn dumpable(&self) -> u8 {
-        self.inner.lock().dumpable.unwrap_or(1)
+        self.inner.lock().dumpable.unwrap_or(SUID_DUMP_USER)
     }
 
     /// Set the dumpable attribute (0, 1 or 2).
@@ -2304,11 +2313,21 @@ impl LinuxProcess {
     /// `check_prlimit_permission()` compares `current == task` and leaves a
     /// sibling thread to the ids.
     ///
-    /// Linux has a seventh test after these: a target that dropped privileges
-    /// and became non-dumpable is out of reach even for an id match. There is
-    /// no `dumpable` flag in this kernel, so it is not written here -- and
-    /// that omission is the permissive direction, which is why it is written
-    /// down.
+    /// Linux has a seventh test after these, and it is the last thing
+    /// `__ptrace_may_access()` does:
+    ///
+    /// ```c
+    /// mm = task->mm;
+    /// if (mm && ((get_dumpable(mm) != SUID_DUMP_USER) &&
+    ///            !ptrace_has_cap(mm->user_ns, mode)))
+    ///         return -EPERM;
+    /// ```
+    ///
+    /// `target_dumpable` is that `get_dumpable(mm)`. An id match is not
+    /// enough for a target that made itself non-dumpable: only the
+    /// capability goes past it. The thread-group answer above is still
+    /// unconditional, because Linux's `if (same_thread_group(task, current))
+    /// return 0;` returns before this check rather than jumping to it.
     ///
     /// Which capability is named cannot be tested: [`has_capability`] asks only
     /// whether the effective uid is root, so `CAP_SYS_PTRACE` and
@@ -2319,12 +2338,15 @@ impl LinuxProcess {
         caller: &Credentials,
         target: &Credentials,
         same_thread_group: bool,
+        target_dumpable: u8,
     ) -> bool {
         if same_thread_group {
             return true;
         }
-        holds_every_id_of(caller.ruid, caller.rgid, target)
-            || has_capability(caller.euid, CAP_SYS_PTRACE)
+        if has_capability(caller.euid, CAP_SYS_PTRACE) {
+            return true;
+        }
+        holds_every_id_of(caller.ruid, caller.rgid, target) && target_dumpable == SUID_DUMP_USER
     }
 
     /// Whether `caller` may READ what `target` is doing: its environment, its
@@ -2347,16 +2369,24 @@ impl LinuxProcess {
     /// [`Self::may_attach_to`] and this one answer differently for the same
     /// credentials, and reading somebody's environment is not taking their
     /// open files.
+    ///
+    /// `target_dumpable` means what it means in [`Self::may_attach_to`], and
+    /// is asked here for the same reason: a process that hardened itself
+    /// with `prctl(PR_SET_DUMPABLE, 0)` keeps its `/proc/<pid>/` out of
+    /// everything but the capability.
     pub fn may_read_process_innards(
         caller: &Credentials,
         target: &Credentials,
         same_thread_group: bool,
+        target_dumpable: u8,
     ) -> bool {
         if same_thread_group {
             return true;
         }
-        holds_every_id_of(caller.fsuid, caller.fsgid, target)
-            || has_capability(caller.euid, CAP_SYS_PTRACE)
+        if has_capability(caller.euid, CAP_SYS_PTRACE) {
+            return true;
+        }
+        holds_every_id_of(caller.fsuid, caller.fsgid, target) && target_dumpable == SUID_DUMP_USER
     }
 
     /// The three rules `do_prlimit` applies to a new limit, and the fourth
@@ -3691,8 +3721,12 @@ impl LinuxProcess {
             inner.credentials.fsuid = uid;
             // `commit_creds()` treats a move of `fsuid` alone exactly like a
             // `set*id`: `if (!uid_eq(new->fsuid, old->fsuid) || ...)
-            // set_dumpable(task->mm, suid_dumpable);`.
+            // set_dumpable(task->mm, suid_dumpable); task->pdeath_signal =
+            // 0;`. This is the one id path that does not go through
+            // `note_id_change`, so it carries the three lines itself.
             inner.sugid = true;
+            inner.dumpable = Some(SUID_DUMP_DISABLE);
+            inner.pdeathsig = 0;
         }
         c.fsuid
     }
@@ -3710,6 +3744,8 @@ impl LinuxProcess {
         {
             inner.credentials.fsgid = gid;
             inner.sugid = true;
+            inner.dumpable = Some(SUID_DUMP_DISABLE);
+            inner.pdeathsig = 0;
         }
         c.fsgid
     }
@@ -4201,14 +4237,12 @@ impl LinuxProcessInner {
         if may_suid && !self.no_new_privs {
             if (mode & MODE_SET_UID) != 0 {
                 self.credentials.euid = uid;
-                self.credentials.suid = uid;
             }
             // `(mode & (S_ISGID | S_IXGRP)) == (S_ISGID | S_IXGRP)`: a
             // set-group-ID bit on a file the group cannot execute is not a
             // set-group-ID program at all.
             if (mode & (MODE_SET_GID | MODE_EXEC_GRP)) == (MODE_SET_GID | MODE_EXEC_GRP) {
                 self.credentials.egid = gid;
-                self.credentials.sgid = gid;
             }
         }
 
@@ -4226,9 +4260,26 @@ impl LinuxProcessInner {
 
         // `cap_bprm_creds_from_file()` ends with
         // `new->suid = new->fsuid = new->euid; new->sgid = new->fsgid =
-        // new->egid;`. This path latches its own taint below instead of going
-        // through `note_id_change`, so it asks for the line itself.
+        // new->egid;`, and execve(2) in POSIX says the same thing in words:
+        // the saved set-user-ID of the new process image is the EFFECTIVE
+        // user id of the new process image. Unconditionally -- which is the
+        // half that was missing here, because `follow_effective_ids` brings
+        // only the FILESYSTEM ids home.
+        //
+        // Left out, an image with no set-user-ID bit anywhere in sight
+        // inherited the saved ids of the program that exec'd it, and the
+        // saved id is an escape hatch by design: a set-user-ID root program
+        // that drops to the user with `setresuid(1000, 1000, 0)` keeps uid 0
+        // saved so it can come back. Handed on across the exec, the ordinary
+        // shell it then runs holds that hatch too, and `setid_allowed`
+        // accepts the SAVED id by name, so a plain `setuid(0)` in that shell
+        // is root. The two lines below are where POSIX closes it.
+        //
+        // This path latches its own taint below instead of going through
+        // `note_id_change`, so it asks for the filesystem line itself.
         self.follow_effective_ids();
+        self.credentials.suid = self.credentials.euid;
+        self.credentials.sgid = self.credentials.egid;
 
         // `do_execve()` asks the same three questions to decide FreeBSD's
         // `P_SUGID`: `setsugid(p)` when the image granted an id, and
@@ -4265,6 +4316,46 @@ impl LinuxProcessInner {
         self.follow_effective_ids();
         if self.ids() != before {
             self.sugid = true;
+        }
+
+        // `commit_creds()`:
+        //
+        //     if (!uid_eq(old->euid, new->euid) ||
+        //         !gid_eq(old->egid, new->egid) ||
+        //         !uid_eq(old->fsuid, new->fsuid) ||
+        //         !gid_eq(old->fsgid, new->fsgid) ||
+        //         !cred_cap_issubset(old, new)) {
+        //             if (task->mm)
+        //                     set_dumpable(task->mm, suid_dumpable);
+        //             task->pdeath_signal = 0;
+        //             ...
+        //     }
+        //
+        // Four of the six ids, not all of them: moving the SAVED id alone
+        // grants nothing and reveals nothing, so `setresuid(-1, -1, 0)` is
+        // not one of these.
+        //
+        // The filesystem pair is asked about here and not below, because in
+        // this kernel it cannot be the term that decides: the only call that
+        // moves a filesystem id away from its effective one is `setfsuid`
+        // (`set_fsuid`/`set_fsgid`), which carries these same two lines
+        // itself, and nothing puts a process back to dumpable except an
+        // exec -- after which the two are equal again. Asking it anyway
+        // would be a term no test can distinguish; the condition is written
+        // as the two comparisons that can.
+        //
+        // What it buys is the half of dumpability that has nothing to do
+        // with `execve`: a set-user-ID root program that drops to the user
+        // with `setuid(1000)` is still holding, in memory it has not
+        // cleared, whatever it did while it was root. Linux shuts the door
+        // at the moment the ids move, and the user who started it cannot
+        // read it afterwards. And the death signal goes with it for the
+        // reason it goes on a privileged exec: the parent chose it while
+        // this process was still somebody the parent could order about.
+        let [_, old_euid, _, _, old_egid, _] = before;
+        if old_euid != self.credentials.euid || old_egid != self.credentials.egid {
+            self.dumpable = Some(SUID_DUMP_DISABLE);
+            self.pdeathsig = 0;
         }
     }
 
@@ -4353,6 +4444,38 @@ impl LinuxProcessInner {
         // `cap_bprm_creds_from_file`: `SECBIT_KEEP_CAPS` does not survive an
         // exec, privileged or not.
         self.keep_caps = false;
+
+        // `begin_new_exec()`, under the comment "Figure out dumpability":
+        //
+        //     if (bprm->interp_flags & BINPRM_FLAGS_ENFORCE_NONDUMP ||
+        //         !(uid_eq(current_euid(), current_uid()) &&
+        //           gid_eq(current_egid(), current_gid())))
+        //             set_dumpable(current->mm, suid_dumpable);
+        //     else
+        //             set_dumpable(current->mm, SUID_DUMP_USER);
+        //
+        // The condition is NOT `secureexec`: it is the narrower question of
+        // whether the image now runs as somebody other than whoever asked
+        // for it, so it is asked of the credentials and not of the argument.
+        // `suid_dumpable` is a sysctl this kernel does not have, left at the
+        // 0 it ships with.
+        //
+        // Both directions matter. A set-user-ID image that stayed dumpable
+        // lets the unprivileged user who started it read the memory of a
+        // process running as root (`may_attach_to`, `/proc/<pid>/maps`,
+        // `pidfd_getfd`); and an ordinary image that inherited a 0 from a
+        // program that had hardened itself with `prctl(PR_SET_DUMPABLE, 0)`
+        // would be out of reach of the debugger of the very user who owns
+        // it, which is the direction that makes `gdb` refuse to attach.
+        self.dumpable = Some(
+            if self.credentials.euid != self.credentials.ruid
+                || self.credentials.egid != self.credentials.rgid
+            {
+                SUID_DUMP_DISABLE
+            } else {
+                SUID_DUMP_USER
+            },
+        );
 
         // Left alone on purpose, because execve(2) and friends say so: the
         // file table (minus close-on-exec, done by `remove_cloexec_files`),
@@ -6015,6 +6138,9 @@ mod exec_reset_tests;
 
 #[cfg(test)]
 mod sugid_tests;
+
+#[cfg(test)]
+mod dumpable_tests;
 
 #[cfg(test)]
 mod capability_tests;

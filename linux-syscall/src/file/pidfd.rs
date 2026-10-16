@@ -168,6 +168,7 @@ impl Syscall<'_> {
             &caller.credentials(),
             &target_linux.credentials(),
             target_proc.id() == self.zircon_process().id(),
+            target_linux.dumpable(),
         ) {
             return Err(LxError::EPERM);
         }

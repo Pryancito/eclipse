@@ -1878,12 +1878,18 @@ mod tests {
             _ => 0,
         };
         let mut out = [0u64; 4];
-        assert_eq!(walk_frame_chain(STACK, frames, stack_ok, text_ok, &mut out), 3);
+        assert_eq!(
+            walk_frame_chain(STACK, frames, stack_ok, text_ok, &mut out),
+            3
+        );
         assert_eq!(&out[..3], &[TEXT + 0x10, TEXT + 0x20, TEXT + 0x30]);
 
         // The cap is the caller's slice, not the chain's length.
         let mut two = [0u64; 2];
-        assert_eq!(walk_frame_chain(STACK, frames, stack_ok, text_ok, &mut two), 2);
+        assert_eq!(
+            walk_frame_chain(STACK, frames, stack_ok, text_ok, &mut two),
+            2
+        );
 
         // A frame pointing at itself is a loop; the frame it names is still a
         // real caller, so it is reported and the walk then stops.
@@ -1901,9 +1907,18 @@ mod tests {
 
         // A return address that is not kernel text is not a caller: nothing is
         // printed rather than a number `addr2line` cannot place.
-        let junk = |a: u64| if a == STACK + 8 { 0x4142 } else { STACK + 0x100 };
+        let junk = |a: u64| {
+            if a == STACK + 8 {
+                0x4142
+            } else {
+                STACK + 0x100
+            }
+        };
         let mut out = [0u64; 4];
-        assert_eq!(walk_frame_chain(STACK, junk, stack_ok, text_ok, &mut out), 0);
+        assert_eq!(
+            walk_frame_chain(STACK, junk, stack_ok, text_ok, &mut out),
+            0
+        );
 
         // No frame pointer at all (the NMI landed in ring 3, or never landed).
         let mut out = [0u64; 4];
