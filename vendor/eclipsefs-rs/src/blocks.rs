@@ -10,6 +10,7 @@
 //! blocks, 16 MiB, for the whole filesystem); here every group carries a full
 //! bitmap block and the allocator holds them all in memory (8 KiB per GiB).
 
+use alloc::collections::BTreeMap;
 use alloc::vec;
 use alloc::vec::Vec;
 
@@ -303,7 +304,14 @@ pub struct BlockAllocator {
     /// mounts): a block freed by an uncommitted transaction is still in use
     /// as far as the disk knows, so it must not be reused yet.
     defer: bool,
-    deferred: Vec<(u64, u64)>,
+    /// Held-back ranges, keyed by their first block. A map and not a list:
+    /// every `free` has to prove the range does not overlap one already in
+    /// here, and scanning a list for that made deleting a large file
+    /// quadratic -- a real machine wedged for eight seconds in this very
+    /// function, purging a multi-GB file whose millions of extents each
+    /// walked every free before it. Ordered by start, with no two ranges
+    /// overlapping, the proof is the two neighbours of `start`.
+    deferred: BTreeMap<u64, u64>,
     deferred_blocks: u64,
 }
 
@@ -313,7 +321,7 @@ impl BlockAllocator {
             groups,
             cursor: 0,
             defer: false,
-            deferred: Vec::new(),
+            deferred: BTreeMap::new(),
             deferred_blocks: 0,
         }
     }
@@ -478,6 +486,22 @@ impl BlockAllocator {
 
     /// Free `len` blocks starting at absolute block `start` (or queue them,
     /// see [`set_deferred_frees`](Self::set_deferred_frees)).
+    /// Does `start..end` touch a range already held back?
+    ///
+    /// The held-back ranges never overlap each other -- this check is what
+    /// keeps them from it -- so only two of them can reach into `start..end`:
+    /// the last one starting at or before `start`, and the first one starting
+    /// after it. Everything else starts too early to reach that far, or too
+    /// late to start inside.
+    fn overlaps_deferred(&self, start: u64, end: u64) -> bool {
+        if let Some((&s, &l)) = self.deferred.range(..=start).next_back() {
+            if start < s + l {
+                return true;
+            }
+        }
+        matches!(self.deferred.range(start..).next(), Some((&s, _)) if s < end)
+    }
+
     pub fn free(&mut self, start: u64, len: u64) -> Result<()> {
         if !self.defer {
             return self.free_now(start, len);
@@ -486,10 +510,10 @@ impl BlockAllocator {
         if (start..end).any(|b| !self.is_used(b)) || end > self.end() {
             return Err(Error::Corrupt("double free"));
         }
-        if self.deferred.iter().any(|&(s, l)| start < s + l && s < end) {
+        if self.overlaps_deferred(start, end) {
             return Err(Error::Corrupt("double free"));
         }
-        self.deferred.push((start, len));
+        self.deferred.insert(start, len);
         self.deferred_blocks += len;
         Ok(())
     }
@@ -552,6 +576,93 @@ mod tests {
         a.free(10, 1).unwrap();
         assert_eq!(a.free_blocks(), 1);
         assert_eq!(a.deferred_blocks(), 0);
+    }
+
+    /// The held-back ranges are checked against the two neighbours of the new
+    /// one, not against all of them, so every shape an overlap can take has to
+    /// be one of those two: one that starts before and reaches in, one that
+    /// starts inside, one that contains the new range whole, and the same
+    /// range twice.
+    #[test]
+    fn every_shape_of_overlap_with_a_held_back_range_is_refused() {
+        for (s, l) in [(35u64, 10u64), (45, 10), (20, 40), (40, 10)] {
+            let mut a = BlockAllocator::new(vec![AllocationGroup::new(0, 100)]);
+            while a.allocate(None, 98).is_some() {}
+            a.set_deferred_frees(true);
+            a.free(40, 10).unwrap();
+            assert!(
+                a.free(s, l).is_err(),
+                "{}..{} was allowed next to 40..50",
+                s,
+                s + l
+            );
+        }
+    }
+
+    /// And a range that only touches one end of a held-back one is not an
+    /// overlap: a check written off the neighbours is as easy to make too
+    /// strict as too lax, and refusing these would leak blocks.
+    #[test]
+    fn a_range_that_merely_abuts_a_held_back_one_is_allowed() {
+        let mut a = BlockAllocator::new(vec![AllocationGroup::new(0, 100)]);
+        while a.allocate(None, 98).is_some() {}
+        a.set_deferred_frees(true);
+        a.free(40, 10).unwrap();
+        a.free(30, 10).unwrap();
+        a.free(50, 10).unwrap();
+        assert_eq!(a.deferred_blocks(), 30);
+        a.release_deferred().unwrap();
+        assert_eq!(a.free_blocks(), 30);
+    }
+
+    /// Held back in whatever order they arrive, released as one run of
+    /// blocks: the map that makes the overlap check cheap also reorders them,
+    /// and `free_now` must not care.
+    #[test]
+    fn frees_held_back_out_of_order_all_come_back() {
+        let mut a = BlockAllocator::new(vec![AllocationGroup::new(0, 100)]);
+        while a.allocate(None, 98).is_some() {}
+        a.set_deferred_frees(true);
+        for start in [80u64, 10, 50, 30, 70, 20] {
+            a.free(start, 5).unwrap();
+        }
+        assert_eq!(a.deferred_blocks(), 30);
+        assert_eq!(a.free_blocks(), 0);
+        a.release_deferred().unwrap();
+        assert_eq!(a.free_blocks(), 30);
+        for start in [80u64, 10, 50, 30, 70, 20] {
+            assert!(!a.is_used(start), "block {} did not come back", start);
+        }
+    }
+
+    /// Purging a large file frees extents by the million, and every one of
+    /// them used to walk the whole list of the frees before it. This is the
+    /// same shape at a size a quadratic check cannot finish: with the list it
+    /// is ~5e9 comparisons, which is what wedged a real machine for the eight
+    /// seconds the deadlock detector waits.
+    #[test]
+    fn a_hundred_thousand_held_back_frees_do_not_walk_each_other() {
+        const GROUPS: u64 = 13;
+        let mut a = BlockAllocator::new(
+            (0..GROUPS as u32)
+                .map(|id| AllocationGroup::new(id, GROUP_BLOCKS))
+                .collect(),
+        );
+        while a.allocate(None, 4096).is_some() {}
+        a.set_deferred_frees(true);
+        let mut freed = 0;
+        // Two blocks every four, skipping the two header blocks of each
+        // group, which are never free to begin with.
+        for g in 0..GROUPS {
+            for start in (g * GROUP_BLOCKS + 4..(g + 1) * GROUP_BLOCKS).step_by(4) {
+                a.free(start, 2).unwrap();
+                freed += 2;
+            }
+        }
+        assert!(freed > 100_000, "only {} blocks freed", freed);
+        assert_eq!(a.deferred_blocks(), freed);
+        a.release_deferred().unwrap();
+        assert_eq!(a.free_blocks(), freed);
     }
 
     #[test]
