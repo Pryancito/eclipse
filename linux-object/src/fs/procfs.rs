@@ -157,6 +157,7 @@ fn may_read_innards_between(caller: Option<&Arc<Process>>, target: &Arc<Process>
         &caller_linux.credentials(),
         &target_linux.credentials(),
         false,
+        target_linux.dumpable(),
     )
 }
 

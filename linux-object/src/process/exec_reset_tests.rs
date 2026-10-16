@@ -394,6 +394,143 @@ fn an_ordinary_user_in_no_supplementary_group_is_not_secure_either() {
     assert_eq!(inner.credentials.egid, 1000);
 }
 
+// --- Dumpability is decided again at every exec -------------------------
+
+#[test]
+fn a_privilege_raising_exec_leaves_the_image_non_dumpable() {
+    // `begin_new_exec()`: "Figure out dumpability". Left dumpable, the
+    // unprivileged user who started a set-user-ID root program can read
+    // the memory of a process running as root -- its `/proc/<pid>/maps`,
+    // and through `pidfd_getfd` its open files.
+    let mut inner = a_process_about_to_exec();
+    assert!(inner.apply_exec_ids_from_a_normal_mount(0o4755, ROOT_UID, 1000));
+    inner.reset_for_exec(true);
+    assert_eq!(inner.dumpable, Some(SUID_DUMP_DISABLE));
+}
+
+#[test]
+fn an_ordinary_exec_makes_the_image_dumpable_again() {
+    // The other direction of the same `else`, and the one a program
+    // notices: a shell that had hardened itself with
+    // `prctl(PR_SET_DUMPABLE, 0)` must not hand that down to every
+    // command it runs, or the user cannot attach a debugger to anything
+    // they started from it.
+    let mut inner = a_process_about_to_exec();
+    inner.dumpable = Some(SUID_DUMP_DISABLE);
+    assert!(!inner.apply_exec_ids_from_a_normal_mount(0o0755, ROOT_UID, ROOT_UID));
+    inner.reset_for_exec(false);
+    assert_eq!(inner.dumpable, Some(SUID_DUMP_USER));
+}
+
+#[test]
+fn a_setgid_image_is_as_unreadable_as_a_setuid_one() {
+    // `!(uid_eq(...) && gid_eq(...))`: the condition asks about the group
+    // pair as well, and a version that only compared the user ids left
+    // every set-group-ID program readable by whoever started it -- a
+    // `mail` or `tty` program whose memory holds somebody else's data.
+    let mut inner = a_process_about_to_exec();
+    assert!(inner.apply_exec_ids_from_a_normal_mount(0o2755, 1000, 0));
+    assert_eq!(inner.credentials.euid, 1000, "the user half did not move");
+    inner.reset_for_exec(true);
+    assert_eq!(inner.dumpable, Some(SUID_DUMP_DISABLE));
+}
+
+#[test]
+fn the_ids_decide_it_and_not_the_secureexec_argument() {
+    // `secureexec` is the wider question: an exec is secure when the ids
+    // MOVED, while dumpability asks only whether the image now runs as
+    // somebody other than who asked for it. A process that was already
+    // set-user-ID root and execs an ordinary image is secure and ALSO
+    // non-dumpable; one whose effective ids match its real ones is
+    // neither, whatever the argument says.
+    let mut inner = a_process_already_setuid_root();
+    assert!(inner.apply_exec_ids_from_a_normal_mount(0o0755, ROOT_UID, ROOT_UID));
+    inner.reset_for_exec(true);
+    assert_eq!(
+        inner.dumpable,
+        Some(SUID_DUMP_DISABLE),
+        "euid is still root"
+    );
+
+    let mut inner = a_process_about_to_exec();
+    inner.reset_for_exec(true);
+    assert_eq!(
+        inner.dumpable,
+        Some(SUID_DUMP_USER),
+        "nothing to hide from the user who owns every one of its ids"
+    );
+}
+
+// --- The saved ids do not survive the exec ------------------------------
+//
+// execve(2), POSIX: "the saved set-user-ID of the new process image shall
+// be set to the effective user ID of the new process image", and
+// `cap_bprm_creds_from_file()` ends with the line that does it. It is not
+// conditional on any bit of the image, which is exactly what makes it easy
+// to leave out: with no set-user-ID bit in sight there seems to be nothing
+// to do.
+
+#[test]
+fn an_exec_drops_the_saved_user_id_the_old_image_was_keeping() {
+    // The process every set-user-ID root program becomes while it does its
+    // unprivileged work: `setresuid(1000, 1000, 0)`, which keeps uid 0
+    // SAVED on purpose so it can come back. Then it execs an ordinary
+    // image. Carried over, the saved id is a door left open in a program
+    // that was never privileged, and `setid_allowed` opens it by name.
+    let mut inner = a_process_about_to_exec();
+    inner.credentials.suid = ROOT_UID;
+    assert!(
+        !inner.apply_exec_ids_from_a_normal_mount(0o0755, ROOT_UID, ROOT_UID),
+        "the fixture must not be raising anything, or this is a test about setuid bits"
+    );
+    assert_eq!(
+        inner.credentials.suid, 1000,
+        "the image it just loaded can call setuid(0) and be root"
+    );
+    assert!(
+        !LinuxProcess::setid_allowed(inner.credentials.ruid, inner.credentials.suid, ROOT_UID),
+        "setuid(0) from the new image is still accepted"
+    );
+}
+
+#[test]
+fn an_exec_drops_the_saved_group_id_the_old_image_was_keeping() {
+    // The same door, one field over. A set-group-ID `mail` program that
+    // drops its group to serve a user keeps the group saved, and the
+    // image it execs must not be able to ask for it back.
+    let mut inner = a_process_about_to_exec();
+    inner.credentials.sgid = 0;
+    inner.apply_exec_ids_from_a_normal_mount(0o0755, ROOT_UID, ROOT_UID);
+    assert_eq!(
+        inner.credentials.sgid, 1000,
+        "the image it just loaded can call setgid(0) and be in group 0"
+    );
+}
+
+#[test]
+fn even_an_exec_that_grants_nothing_because_of_nosuid_drops_them() {
+    // The two gates are `bprm_fill_uid()`'s, and this line is not in
+    // `bprm_fill_uid()`: `cap_bprm_creds_from_file()` runs it whatever the
+    // mount or `no_new_privs` said. A `nosuid` mount is there to grant
+    // LESS, so it cannot be the one case that leaves the hatch open.
+    for (may_suid, no_new_privs) in [(false, false), (true, true)] {
+        let mut inner = a_process_about_to_exec();
+        inner.no_new_privs = no_new_privs;
+        inner.credentials.suid = ROOT_UID;
+        inner.apply_exec_ids(0o4755, ROOT_UID, ROOT_UID, may_suid);
+        assert_eq!(
+            inner.credentials.euid, 1000,
+            "may_suid={} no_new_privs={}: the bit was honoured after all",
+            may_suid, no_new_privs
+        );
+        assert_eq!(
+            inner.credentials.suid, 1000,
+            "may_suid={} no_new_privs={}",
+            may_suid, no_new_privs
+        );
+    }
+}
+
 // --- The aux-vector identity block --------------------------------------
 
 #[test]
