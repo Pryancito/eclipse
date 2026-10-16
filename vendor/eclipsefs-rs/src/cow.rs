@@ -52,6 +52,10 @@ const DIRTY_NODES_LIMIT: usize = 4096;
 /// item it owns, and a multi-GB file has millions of them, so the list they
 /// are read into is the allocation that matters, not the work.
 const PURGE_BATCH: usize = 1024;
+/// File extents read in one step by whatever walks a range that may span a
+/// whole file (truncate, `lseek(SEEK_DATA)`, FIEMAP, reflinks, defrag); see
+/// [`CowFs::extents_upto`].
+const EXTENT_BATCH: usize = 1024;
 
 /// The smallest key greater than `k`, or `None` when `k` is [`Key::MAX`].
 ///
@@ -824,36 +828,65 @@ impl CowFs {
     }
 
     /// Move the pending checksum changes into the checksum tree, one item
-    /// per bucket of blocks.
+    /// per bucket of blocks: first the frees, then what was written after.
+    ///
+    /// Neither list is copied out whole: a transaction that deleted a file
+    /// of tens of GB holds millions of freed blocks, and the copy alone was
+    /// a contiguous allocation of tens of MiB.
     fn store_csums(&mut self) -> Result<()> {
-        if self.sp.csums.is_empty() {
-            return Ok(());
-        }
-        let pending: Vec<(u64, Option<u32>)> =
-            self.sp.csums.iter().map(|(&b, &c)| (b, c)).collect();
-        let mut i = 0;
-        while i < pending.len() {
-            let bucket = pending[i].0 / CSUM_BUCKET * CSUM_BUCKET;
-            let key = Key::new(bucket, CSUM_ITEM, 0);
-            let old = self.st.get(&self.csum_root, &key)?;
-            let mut cb = match &old {
-                Some(d) => CsumBucket::decode(d)?,
-                None => CsumBucket::default(),
-            };
-            while i < pending.len() && pending[i].0 < bucket + CSUM_BUCKET {
-                cb.0[(pending[i].0 - bucket) as usize] = pending[i].1;
-                i += 1;
+        let freed = core::mem::take(&mut self.sp.csums_freed);
+        for (start, len) in freed.iter() {
+            let end = start + len;
+            let mut bucket = start / CSUM_BUCKET * CSUM_BUCKET;
+            while bucket < end {
+                let from = start.max(bucket);
+                let to = end.min(bucket + CSUM_BUCKET);
+                self.edit_csum_bucket(bucket, |cb| {
+                    for b in from..to {
+                        cb.0[(b - bucket) as usize] = None;
+                    }
+                })?;
+                bucket += CSUM_BUCKET;
             }
-            if cb.is_empty() {
-                if old.is_some() {
-                    self.st.delete(&mut self.sp, &mut self.csum_root, key)?;
+        }
+        while let Some(&first) = self.sp.csums.keys().next() {
+            let bucket = first / CSUM_BUCKET * CSUM_BUCKET;
+            let pending: Vec<(u64, Option<u32>)> = self
+                .sp
+                .csums
+                .range(bucket..bucket + CSUM_BUCKET)
+                .map(|(&b, &c)| (b, c))
+                .collect();
+            self.edit_csum_bucket(bucket, |cb| {
+                for &(b, c) in &pending {
+                    cb.0[(b - bucket) as usize] = c;
                 }
-            } else {
-                self.st
-                    .upsert(&mut self.sp, &mut self.csum_root, key, cb.encode())?;
+            })?;
+            for (b, _) in pending {
+                self.sp.csums.remove(&b);
             }
         }
-        self.sp.csums.clear();
+        Ok(())
+    }
+
+    /// Change the checksum item of the bucket starting at disk block
+    /// `bucket` (deleting it once empty).
+    fn edit_csum_bucket(&mut self, bucket: u64, f: impl FnOnce(&mut CsumBucket)) -> Result<()> {
+        let key = Key::new(bucket, CSUM_ITEM, 0);
+        let old = self.st.get(&self.csum_root, &key)?;
+        let mut cb = match &old {
+            Some(d) => CsumBucket::decode(d)?,
+            None => CsumBucket::default(),
+        };
+        f(&mut cb);
+        if cb.is_empty() {
+            if old.is_some() {
+                self.st.delete(&mut self.sp, &mut self.csum_root, key)?;
+            }
+        } else {
+            self.st
+                .upsert(&mut self.sp, &mut self.csum_root, key, cb.encode())?;
+        }
         Ok(())
     }
 
@@ -876,6 +909,11 @@ impl CowFs {
                 }
             }
             bucket += CSUM_BUCKET;
+        }
+        for (s, l) in self.sp.csums_freed.within(start, start + n) {
+            for b in s..s + l {
+                out[(b - start) as usize] = None;
+            }
         }
         for (&b, &c) in self.sp.csums.range(start..start + n) {
             out[(b - start) as usize] = c;
@@ -1032,22 +1070,35 @@ impl CowFs {
     }
 
     /// Regular extents overlapping file blocks `from..to`.
+    ///
+    /// Only for ranges known to be short (a write chunk, a block or two):
+    /// the whole list is held at once. Anything that may span a whole file
+    /// goes through [`extents_upto`](Self::extents_upto) a batch at a time.
     fn extents(&mut self, ino: u64, from: u64, to: u64) -> Result<Vec<Ext>> {
+        self.extents_upto(ino, from, to, usize::MAX)
+    }
+
+    /// The first extents overlapping file blocks `from..to`, in order: the
+    /// one that starts before `from` (if it reaches it) and at most `limit`
+    /// after it. Empty only when nothing in `from..to` is mapped.
+    ///
+    /// Callers walk a large range by asking again from the end of the last
+    /// extent returned. A file of tens of GB has over a million extent
+    /// items, 48 bytes each plus their data, so reading them all at once is
+    /// a contiguous allocation of tens of MiB on the kernel heap. A real
+    /// machine died on `memory allocation of 53785440 bytes failed`
+    /// handling an 88 GB file.
+    fn extents_upto(&mut self, ino: u64, from: u64, to: u64, limit: usize) -> Result<Vec<Ext>> {
         let mut out = Vec::new();
         if from >= to {
             return Ok(out);
         }
         let first = self.st.seek_le(&self.fs_root, &Self::ext_key(ino, from))?;
-        let mut items = Vec::new();
-        if let Some((k, d)) = first {
-            if k.objectid == ino && k.ty == EXTENT_DATA {
-                items.push((k, d));
-            }
-        }
+        let first = first.filter(|(k, _)| k.objectid == ino && k.ty == EXTENT_DATA);
         let lo = Key::new(ino, EXTENT_DATA, from * BS + 1);
         let hi = Key::new(ino, EXTENT_DATA, to * BS - 1);
-        items.extend(self.st.range(&self.fs_root, &lo, &hi, usize::MAX)?);
-        for (k, d) in items {
+        let rest = self.st.range(&self.fs_root, &lo, &hi, limit)?;
+        for (k, d) in first.into_iter().chain(rest) {
             let (disk, blocks, prealloc, z) = match FileExtent::decode(&d)? {
                 FileExtent::Reg { disk, blocks } => (disk, blocks, false, None),
                 FileExtent::Prealloc { disk, blocks } => (disk, blocks, true, None),
@@ -1132,8 +1183,32 @@ impl CowFs {
     }
 
     /// Remove the mapping of file blocks `from..to`.
+    ///
+    /// A batch of [`EXTENT_BATCH`] extents at a time: truncating a large
+    /// file walks every extent it has. What a batch handles is gone from
+    /// `from..` (or cut to end at `from`) when the next one is read.
     fn unmap(&mut self, ino: u64, inode: &mut InodeItem, from: u64, to: u64) -> Result<()> {
-        for e in self.extents(ino, from, to)? {
+        let mut cur = from;
+        while cur < to {
+            let batch = self.extents_upto(ino, cur, to, EXTENT_BATCH)?;
+            let Some(last) = batch.last() else {
+                break;
+            };
+            cur = last.lblk + last.blocks;
+            self.unmap_batch(ino, inode, from, to, batch)?;
+        }
+        Ok(())
+    }
+
+    fn unmap_batch(
+        &mut self,
+        ino: u64,
+        inode: &mut InodeItem,
+        from: u64,
+        to: u64,
+        batch: Vec<Ext>,
+    ) -> Result<()> {
+        for e in batch {
             let key = Self::ext_key(ino, e.lblk);
             let end = e.lblk + e.blocks;
             if e.lblk < from {
@@ -2804,9 +2879,11 @@ impl CowFs {
             return Err(Error::Invalid);
         }
         let inline = self.inline_data(s_ino)?;
-        let exts = match inline {
-            Some(_) => Vec::new(),
-            None => self.extents(s_ino, src_off / BS, src_off / BS + blocks)?,
+        let s0 = src_off / BS;
+        // What the source maps, counted while its subvolume is entered.
+        let shared = match inline {
+            Some(_) => blocks,
+            None => self.mapped(s_ino, s0, s0 + blocks)?,
         };
         let d_ino = self.at_rw(dst)?;
         self.writable()?;
@@ -2830,11 +2907,6 @@ impl CowFs {
         }
         // New to the destination: blocks the source maps over its holes,
         // at most.
-        let s0 = src_off / BS;
-        let shared = match inline {
-            Some(_) => blocks,
-            None => covered(&exts, s0, s0 + blocks),
-        };
         let d0 = dst_off / BS;
         let holes = blocks - self.mapped(d_ino, d0, d0 + blocks)?;
         self.charge(shared.min(holes))?;
@@ -2851,7 +2923,10 @@ impl CowFs {
                         }
                     })
             }
-            None => self.share_extents(d_ino, &mut di, &exts, src_off / BS, dst_off / BS, blocks),
+            None => {
+                let src = (split(src).0, s_ino);
+                self.share_extents(d_ino, &mut di, src, s0, d0, blocks)
+            }
         };
         if r.is_ok() {
             di.size = di.size.max(d_end);
@@ -2864,13 +2939,19 @@ impl CowFs {
         r.map(|_| len)
     }
 
-    /// Map file blocks `d0..d0+blocks` of `ino` to the blocks `exts` map
-    /// at `s0..`, as one more owner of them (holes stay holes).
+    /// Map file blocks `d0..d0+blocks` of `ino` (in the current subvolume)
+    /// to the blocks that file `src` (`(subvolume, inode)`) maps at `s0..`,
+    /// as one more owner of them (holes stay holes). The ranges do not
+    /// overlap.
+    ///
+    /// The source extents are read a batch at a time, each with the source
+    /// subvolume entered: a reflinked copy of a large file (`cp`, through
+    /// `copy_file_range`) covers all of them.
     fn share_extents(
         &mut self,
         ino: u64,
         inode: &mut InodeItem,
-        exts: &[Ext],
+        src: (u64, u64),
         s0: u64,
         d0: u64,
         blocks: u64,
@@ -2879,6 +2960,31 @@ impl CowFs {
             self.uninline(ino, inode)?;
         }
         self.unmap(ino, inode, d0, d0 + blocks)?;
+        let dst_sv = self.subvol;
+        let mut cur = s0;
+        while cur < s0 + blocks {
+            self.enter(src.0)?;
+            let batch = self.extents_upto(src.1, cur, s0 + blocks, EXTENT_BATCH);
+            self.enter(dst_sv)?;
+            let batch = batch?;
+            let Some(last) = batch.last() else {
+                break;
+            };
+            cur = last.lblk + last.blocks;
+            self.share_batch(ino, inode, &batch, s0, d0, blocks)?;
+        }
+        Ok(())
+    }
+
+    fn share_batch(
+        &mut self,
+        ino: u64,
+        inode: &mut InodeItem,
+        exts: &[Ext],
+        s0: u64,
+        d0: u64,
+        blocks: u64,
+    ) -> Result<()> {
         // Preallocated ranges stay holes: they read as zeros either way.
         for e in exts.iter().filter(|e| !e.prealloc) {
             let from = e.lblk.max(s0);
@@ -3135,8 +3241,35 @@ impl CowFs {
             }
         }
         let last_blk = inode.size.div_ceil(BS);
-        let exts = self.extents(ino, start / BS, end.div_ceil(BS).min(last_blk))?;
-        for e in exts {
+        let to = end.div_ceil(BS).min(last_blk);
+        let mut cur = start / BS;
+        while cur < to {
+            let batch = self.extents_upto(ino, cur, to, EXTENT_BATCH)?;
+            let Some(last) = batch.last() else {
+                break;
+            };
+            cur = last.lblk + last.blocks;
+            self.fiemap_batch(ino, batch, &mut out)?;
+        }
+        // LAST goes on the piece that ends the file's mapped data, which
+        // the range asked for may not reach.
+        if let Some(m) = out.last_mut() {
+            let from = m.logical / BS + m.length / BS;
+            if self.extents_upto(ino, from, last_blk.max(1), 1)?.is_empty() {
+                m.flags |= FIEMAP_EXTENT_LAST;
+            }
+        }
+        Ok(out)
+    }
+
+    fn fiemap_batch(
+        &mut self,
+        ino: u64,
+        batch: Vec<Ext>,
+        out: &mut Vec<crate::fs::FileMapping>,
+    ) -> Result<()> {
+        use crate::fs::*;
+        for e in batch {
             let mut flags = 0;
             if e.prealloc {
                 flags |= FIEMAP_EXTENT_UNWRITTEN;
@@ -3162,63 +3295,73 @@ impl CowFs {
                 flags,
             });
         }
-        // LAST goes on the piece that ends the file's mapped data, which
-        // the range asked for may not reach.
-        if let Some(m) = out.last_mut() {
-            let tail = self.extents(ino, m.logical / BS + m.length / BS, last_blk.max(1))?;
-            if tail.is_empty() {
-                m.flags |= FIEMAP_EXTENT_LAST;
-            }
-        }
-        Ok(out)
+        Ok(())
     }
 
-    /// Data pieces at or after byte `off` of inode `ino`, as `(start, end)`
-    /// byte ranges clipped to the size; preallocated space is a hole.
-    fn data_ranges_from(&mut self, ino: u64, off: u64) -> Result<(u64, Vec<(u64, u64)>)> {
+    /// The first data piece at or after byte `off` of inode `ino`, as a
+    /// `(start, end)` byte range clipped to the size (adjacent extents
+    /// joined), with the size; preallocated space is a hole.
+    ///
+    /// Reads extents a batch at a time and stops at the first gap after the
+    /// piece: `lseek(SEEK_DATA/SEEK_HOLE)` on a large file used to read
+    /// every extent from `off` to the end on each call.
+    fn first_data_range(&mut self, ino: u64, off: u64) -> Result<(u64, Option<(u64, u64)>)> {
         let inode = self.inode(ino)?;
         if inode.kind() == FileKind::Dir {
             return Err(Error::IsDir);
         }
         let size = inode.size;
         if off >= size {
-            return Ok((size, Vec::new()));
+            return Ok((size, None));
         }
         if size <= INLINE_MAX as u64 && self.inline_data(ino)?.is_some() {
-            return Ok((size, alloc::vec![(0, size)]));
+            return Ok((size, Some((0, size))));
         }
-        let mut out: Vec<(u64, u64)> = Vec::new();
-        for e in self.extents(ino, off / BS, size.div_ceil(BS))? {
-            if e.prealloc {
-                continue;
-            }
-            let s = (e.lblk * BS).max(off);
-            let t = ((e.lblk + e.blocks) * BS).min(size);
-            if s >= t {
-                continue;
-            }
-            match out.last_mut() {
-                Some(last) if last.1 == s => last.1 = t,
-                _ => out.push((s, t)),
+        let last_blk = size.div_ceil(BS);
+        let mut found: Option<(u64, u64)> = None;
+        let mut cur = off / BS;
+        while cur < last_blk {
+            let batch = self.extents_upto(ino, cur, last_blk, EXTENT_BATCH)?;
+            let Some(last) = batch.last() else {
+                break;
+            };
+            cur = last.lblk + last.blocks;
+            for e in batch {
+                if e.prealloc {
+                    if found.is_some() {
+                        return Ok((size, found));
+                    }
+                    continue;
+                }
+                let s = (e.lblk * BS).max(off);
+                let t = ((e.lblk + e.blocks) * BS).min(size);
+                if s >= t {
+                    continue;
+                }
+                match &mut found {
+                    None => found = Some((s, t)),
+                    Some(r) if r.1 == s => r.1 = t,
+                    Some(_) => return Ok((size, found)),
+                }
             }
         }
-        Ok((size, out))
+        Ok((size, found))
     }
 
     pub fn seek_data(&mut self, h: u64, off: u64) -> Result<Option<u64>> {
         let ino = self.at(h)?;
-        let (_, ranges) = self.data_ranges_from(ino, off)?;
-        Ok(ranges.first().map(|&(s, _)| s.max(off)))
+        let (_, first) = self.first_data_range(ino, off)?;
+        Ok(first.map(|(s, _)| s.max(off)))
     }
 
     pub fn seek_hole(&mut self, h: u64, off: u64) -> Result<Option<u64>> {
         let ino = self.at(h)?;
-        let (size, ranges) = self.data_ranges_from(ino, off)?;
+        let (size, first) = self.first_data_range(ino, off)?;
         if off >= size {
             return Ok(None);
         }
-        Ok(Some(match ranges.first() {
-            Some(&(s, t)) if s <= off => t,
+        Ok(Some(match first {
+            Some((s, t)) if s <= off => t,
             _ => off,
         }))
     }
@@ -3280,81 +3423,102 @@ impl CowFs {
             (None, z) => z.is_none() && e.blocks < threshold,
         };
         // Windows of adjacent extents worth rewriting, as (first block,
-        // blocks, pieces on disk).
+        // blocks, pieces on disk). The extents are read a batch at a time
+        // and the windows a batch closes are rewritten before the next one
+        // is read; the last stays open, as the next batch may extend it.
         let mut windows: Vec<(u64, u64, u64)> = Vec::new();
         let mut prev: Option<Ext> = None;
-        for mut e in self.extents(ino, first, last)? {
-            // Clip to the range asked for.
-            if e.lblk < first {
-                let cut = first - e.lblk;
-                if e.z.is_none() {
-                    e.pblk += cut;
-                }
-                e.lblk = first;
-                e.blocks -= cut;
-            }
-            e.blocks = e.blocks.min(last - e.lblk);
-            if !wanted(&e) {
-                prev = None;
-                continue;
-            }
-            let after = prev.map(|p| p.lblk + p.blocks == e.lblk).unwrap_or(false);
-            let joined = after
-                && prev.map(|p| p.z.is_none() && e.z.is_none() && p.pblk + p.blocks == e.pblk)
-                    == Some(true);
-            match windows.last_mut() {
-                Some(w) if after && w.1 + e.blocks <= DEFRAG_WINDOW => {
-                    w.1 += e.blocks;
-                    if !joined {
-                        w.2 += 1;
-                    }
-                }
-                _ => windows.push((e.lblk, e.blocks, 1)),
-            }
-            prev = Some(e);
-        }
         let mut rewritten = 0;
-        for (lb, n, pieces) in windows {
-            if compress.is_none() && pieces < 2 {
-                continue;
+        let mut cur = first;
+        loop {
+            let batch = if cur < last {
+                self.extents_upto(ino, cur, last, EXTENT_BATCH)?
+            } else {
+                Vec::new()
+            };
+            let scanned = batch.is_empty();
+            if let Some(e) = batch.last() {
+                cur = e.lblk + e.blocks;
             }
-            let mut buf = vec![0u8; (n * BS) as usize];
-            self.read_blocks(ino, lb * BS, &mut buf)?;
-            self.zcache = None;
-            let mut done = 0;
-            if let Some(algo) = compress {
-                // Chunks of up to ZCHUNK blocks; a single block does not
-                // shrink by compressing.
-                while n - done >= 2 {
-                    let c = ZCHUNK.min(n - done);
-                    let at = (done * BS) as usize;
-                    let chunk = &buf[at..at + (c * BS) as usize];
-                    if !self.write_packed(ino, &mut inode, lb + done, chunk, algo)? {
-                        break;
+            for mut e in batch {
+                // Clip to the range asked for.
+                if e.lblk < first {
+                    let cut = first - e.lblk;
+                    if e.z.is_none() {
+                        e.pblk += cut;
                     }
-                    done += c;
+                    e.lblk = first;
+                    e.blocks -= cut;
                 }
-            }
-            // The rest, as one run; when no run that long is free the data
-            // stays where it is.
-            let rest = n - done;
-            if rest > 0 {
-                let goal = self.goal(ino, lb + done)?;
-                if let Some(pb) = self.sp.alloc_data_run(goal, rest) {
-                    let data = &mut buf[(done * BS) as usize..];
-                    if let Some(k) = &keys {
-                        k.encrypt_blocks(lb + done, data, BS as usize);
-                    }
-                    self.raw.write_at(pb * BS, data)?;
-                    for (i, block) in data.chunks(BS as usize).enumerate() {
-                        let c = (!nocow).then(|| crc32c(block));
-                        self.sp.csums.insert(pb + i as u64, c);
-                    }
-                    self.set_mapping(ino, &mut inode, lb + done, rest, pb)?;
-                    done = n;
+                e.blocks = e.blocks.min(last - e.lblk);
+                if !wanted(&e) {
+                    prev = None;
+                    continue;
                 }
+                let after = prev.map(|p| p.lblk + p.blocks == e.lblk).unwrap_or(false);
+                let joined = after
+                    && prev.map(|p| p.z.is_none() && e.z.is_none() && p.pblk + p.blocks == e.pblk)
+                        == Some(true);
+                match windows.last_mut() {
+                    Some(w) if after && w.1 + e.blocks <= DEFRAG_WINDOW => {
+                        w.1 += e.blocks;
+                        if !joined {
+                            w.2 += 1;
+                        }
+                    }
+                    _ => windows.push((e.lblk, e.blocks, 1)),
+                }
+                prev = Some(e);
             }
-            rewritten += done * BS;
+            let open = usize::from(!scanned);
+            let ready: Vec<_> = windows
+                .drain(..windows.len().saturating_sub(open))
+                .collect();
+            for (lb, n, pieces) in ready {
+                if compress.is_none() && pieces < 2 {
+                    continue;
+                }
+                let mut buf = vec![0u8; (n * BS) as usize];
+                self.read_blocks(ino, lb * BS, &mut buf)?;
+                self.zcache = None;
+                let mut done = 0;
+                if let Some(algo) = compress {
+                    // Chunks of up to ZCHUNK blocks; a single block does not
+                    // shrink by compressing.
+                    while n - done >= 2 {
+                        let c = ZCHUNK.min(n - done);
+                        let at = (done * BS) as usize;
+                        let chunk = &buf[at..at + (c * BS) as usize];
+                        if !self.write_packed(ino, &mut inode, lb + done, chunk, algo)? {
+                            break;
+                        }
+                        done += c;
+                    }
+                }
+                // The rest, as one run; when no run that long is free the data
+                // stays where it is.
+                let rest = n - done;
+                if rest > 0 {
+                    let goal = self.goal(ino, lb + done)?;
+                    if let Some(pb) = self.sp.alloc_data_run(goal, rest) {
+                        let data = &mut buf[(done * BS) as usize..];
+                        if let Some(k) = &keys {
+                            k.encrypt_blocks(lb + done, data, BS as usize);
+                        }
+                        self.raw.write_at(pb * BS, data)?;
+                        for (i, block) in data.chunks(BS as usize).enumerate() {
+                            let c = (!nocow).then(|| crc32c(block));
+                            self.sp.csums.insert(pb + i as u64, c);
+                        }
+                        self.set_mapping(ino, &mut inode, lb + done, rest, pb)?;
+                        done = n;
+                    }
+                }
+                rewritten += done * BS;
+            }
+            if scanned {
+                break;
+            }
         }
         // Rewriting keeps the size; compressed pieces must not stretch it.
         inode.size = before.size;
@@ -3370,32 +3534,44 @@ impl CowFs {
         self.inode(ino)?;
         let mut out = CompSize::default();
         let mut seen = BTreeSet::new();
-        for (_, d) in self.st.range(
-            &self.fs_root,
-            &Key::new(ino, EXTENT_DATA, 0),
-            &Key::new(ino, EXTENT_DATA, u64::MAX),
-            usize::MAX,
-        )? {
-            match FileExtent::decode(&d)? {
-                FileExtent::Reg { blocks, .. } => {
-                    out.disk_bytes += blocks * BS;
-                    out.uncompressed_bytes += blocks * BS;
-                }
-                FileExtent::Comp(c) => {
-                    out.compressed_extents += 1;
-                    if seen.insert(c.disk) {
-                        out.disk_bytes += c.disk_blocks * BS;
-                        out.uncompressed_bytes += c.ram_blocks * BS;
-                    }
-                }
-                FileExtent::Inline(v) => {
-                    out.disk_bytes += v.len() as u64;
-                    out.uncompressed_bytes += v.len() as u64;
-                }
-                FileExtent::Prealloc { .. } => {}
+        let hi = Key::new(ino, EXTENT_DATA, u64::MAX);
+        let mut lo = Key::new(ino, EXTENT_DATA, 0);
+        loop {
+            let items = self.st.range(&self.fs_root, &lo, &hi, EXTENT_BATCH)?;
+            let Some(last) = items.last().map(|(k, _)| *k) else {
+                break;
+            };
+            for (_, d) in items {
+                Self::compsize_item(&mut out, &mut seen, &d)?;
+            }
+            match key_after(&last) {
+                Some(next) => lo = next,
+                None => break,
             }
         }
         Ok(out)
+    }
+
+    fn compsize_item(out: &mut CompSize, seen: &mut BTreeSet<u64>, d: &[u8]) -> Result<()> {
+        match FileExtent::decode(d)? {
+            FileExtent::Reg { blocks, .. } => {
+                out.disk_bytes += blocks * BS;
+                out.uncompressed_bytes += blocks * BS;
+            }
+            FileExtent::Comp(c) => {
+                out.compressed_extents += 1;
+                if seen.insert(c.disk) {
+                    out.disk_bytes += c.disk_blocks * BS;
+                    out.uncompressed_bytes += c.ram_blocks * BS;
+                }
+            }
+            FileExtent::Inline(v) => {
+                out.disk_bytes += v.len() as u64;
+                out.uncompressed_bytes += v.len() as u64;
+            }
+            FileExtent::Prealloc { .. } => {}
+        }
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -3408,8 +3584,17 @@ impl CowFs {
 
     /// File blocks among `from..to` of `ino` that something maps.
     fn mapped(&mut self, ino: u64, from: u64, to: u64) -> Result<u64> {
-        let exts = self.extents(ino, from, to)?;
-        Ok(covered(&exts, from, to))
+        let mut n = 0;
+        let mut cur = from;
+        while cur < to {
+            let batch = self.extents_upto(ino, cur, to, EXTENT_BATCH)?;
+            let Some(last) = batch.last() else {
+                break;
+            };
+            n += covered(&batch, cur, to);
+            cur = last.lblk + last.blocks;
+        }
+        Ok(n)
     }
 
     /// Refuse adding `blocks` file blocks to the current subvolume if

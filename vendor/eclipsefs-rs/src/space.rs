@@ -96,6 +96,21 @@ impl RangeSet {
     pub fn iter(&self) -> impl Iterator<Item = (u64, u64)> + '_ {
         self.0.iter().map(|(&s, &l)| (s, l))
     }
+
+    /// The parts of the set inside `start..end`, in order.
+    pub fn within(&self, start: u64, end: u64) -> impl Iterator<Item = (u64, u64)> + '_ {
+        let before = self
+            .0
+            .range(..start)
+            .next_back()
+            .filter(|(&s, &l)| s + l > start);
+        before
+            .into_iter()
+            .chain(self.0.range(start..end))
+            .map(move |(&s, &l)| (s.max(start), (s + l).min(end)))
+            .filter(|&(s, e)| s < e)
+            .map(|(s, e)| (s, e - s))
+    }
 }
 
 /// Reference counts of shared ranges: start -> (length, count >= 2).
@@ -217,8 +232,14 @@ pub struct BlockSpace {
     /// allocate as they copy) still find room on a full device.
     pub reserve: u64,
     /// Data checksum changes not yet in the checksum tree: the CRC32C of a
-    /// block just written, or `None` for a data block just freed.
+    /// block just written (`None`: written without one, no-COW).
     pub csums: BTreeMap<u64, Option<u32>>,
+    /// Data blocks freed by the open transaction, whose checksums go away
+    /// when it commits; [`csums`](Self::csums) entries written after the
+    /// free win. Kept as ranges: deleting or truncating a file of tens of
+    /// GB frees millions of blocks in one call, and an entry per block was
+    /// hundreds of MiB of kernel heap.
+    pub csums_freed: RangeSet,
     /// The volume, when there is one: data and metadata come from chunks
     /// of their own kind, and new chunks are made when those fill up.
     pub vol: Option<Arc<Volume>>,
@@ -246,6 +267,7 @@ impl BlockSpace {
             meta_goal: 0,
             reserve: 0,
             csums: BTreeMap::new(),
+            csums_freed: RangeSet::default(),
             vol: None,
             profiles: (Profile::Single, Profile::Single),
             avoid: Vec::new(),
@@ -444,9 +466,10 @@ impl Space for BlockSpace {
         }
         for (s, l) in self.refs.add(start, len, -1) {
             self.free(s, l)?;
-            for b in s..s + l {
-                self.csums.insert(b, None);
+            while let Some((&b, _)) = self.csums.range(s..s + l).next() {
+                self.csums.remove(&b);
             }
+            self.csums_freed.insert(s, l);
         }
         Ok(())
     }

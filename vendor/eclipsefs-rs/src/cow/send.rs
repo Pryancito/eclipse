@@ -651,8 +651,7 @@ impl CowFs {
                 if self.inline_data(ino)?.is_some() {
                     self.uninline(ino, &mut i)?;
                 }
-                let exts = self.extents(src, s0, s0 + n)?;
-                self.share_extents(ino, &mut i, &exts, s0, d0, n)?;
+                self.share_extents(ino, &mut i, (self.subvol, src), s0, d0, n)?;
                 i.size = i.size.max(off + len);
                 self.put_inode(ino, i)?;
             }
