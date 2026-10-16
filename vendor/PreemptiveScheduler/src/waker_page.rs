@@ -917,6 +917,49 @@ mod waker_page_tests {
         assert_eq!(p.take_yielded(), 1 << 2);
     }
 
+    /// The deferral must cover ONLY the borrowed bits.
+    ///
+    /// Every test above has one bit in the lane, and with one bit the mask
+    /// that defers it and the mask of everything in the lane are the same
+    /// word -- so a deferral written as "put the whole drain back" passes
+    /// all of them. What it does with two bits is hand one out AND leave it
+    /// published, so the task is polled again, and again: the drain never
+    /// empties and the suite stops making progress instead of failing. A
+    /// hang is the one verdict a mutation run cannot read, which is why the
+    /// two-bit case is written down.
+    #[test]
+    fn a_deferral_does_not_republish_the_wake_it_just_handed_out() {
+        let p = page();
+        p.notify(1);
+        p.notify(2);
+        p.mark_borrowed(2, true);
+        assert_eq!(
+            p.take_notified(),
+            1 << 1,
+            "the free wake was not handed out"
+        );
+        assert_eq!(
+            p.peek_lanes().0,
+            1 << 2,
+            "the wake it handed out stayed published, so that task is polled for ever"
+        );
+    }
+
+    /// The voluntary lane's half of the same rule.
+    #[test]
+    fn the_yielded_lane_defers_only_the_borrowed_bit_either() {
+        let p = page();
+        p.mark_yielded(5);
+        p.mark_yielded(6);
+        p.mark_borrowed(6, true);
+        assert_eq!(p.take_yielded(), 1 << 5);
+        assert_eq!(
+            p.peek_lanes().1,
+            1 << 6,
+            "the yield it handed out stayed published"
+        );
+    }
+
     #[test]
     fn a_wake_for_a_completed_task_is_discarded_by_both_lanes() {
         let p = page();
@@ -1191,6 +1234,30 @@ mod waker_page_tests {
         p.notify(12);
         assert_eq!(p.reclaim_notified(parked), parked);
         assert_eq!(p.peek().0, 1 << 12, "a newer wake was swallowed");
+    }
+
+    /// The voluntary twin of the test above, which had no test of its own.
+    ///
+    /// `reclaim_yielded` is the claim, not a scan: what it returns is handed
+    /// to an executor. Asking for a bit the lane does not hold has to come
+    /// back empty-handed, or the cursor polls a task nobody woke -- and the
+    /// slot it polls is whichever one the cursor happened to name, so the
+    /// damage is not even confined to a task that is sleeping on purpose.
+    #[test]
+    fn reclaiming_a_yield_takes_back_only_what_the_lane_still_holds() {
+        let p = page();
+        p.mark_yielded(9);
+        let asked = (1 << 9) | (1 << 40);
+        assert_eq!(
+            p.reclaim_yielded(asked),
+            1 << 9,
+            "it claimed slot 40, whose yield was never published"
+        );
+        // And the same rule the urgent lane follows about a newer arrival.
+        p.mark_yielded(12);
+        p.mark_yielded(40);
+        assert_eq!(p.reclaim_yielded(1 << 40), 1 << 40);
+        assert_eq!(p.peek_lanes().1, 1 << 12, "a newer yield was swallowed");
     }
 
     #[test]

@@ -256,7 +256,15 @@ fn no_wake_is_lost_when_wakers_race_the_poll_they_interrupt() {
     // come out of it; a slot that does not is a task that would never be
     // polled again.
     let mut drained = 0u64;
-    loop {
+    // Bounded on purpose. Nothing is borrowed here, so every pass must take
+    // what is in the lane and leave it empty: one pass per slot is already
+    // far more than this can need. An unbounded `loop` does not FAIL when
+    // the lane refuses to empty -- it spins for ever, and the whole run
+    // stops making progress instead of reporting the very thing the last
+    // assertion below is about. That is not hypothetical: a deferral that
+    // re-published the wakes it had just handed out left this loop turning
+    // and took the suite down with no failing test to name it.
+    for _ in 0..=SLOTS {
         let taken = page.take_notified();
         if taken == 0 {
             break;
@@ -428,8 +436,19 @@ fn a_task_is_never_checked_out_to_two_executors_at_once() {
 
     // Let the cursor finish retiring whatever is still marked dropped, the
     // way the owning CPU's next pass does.
+    // Bounded for the reason `task_collection`'s `DRAIN_CAP` is: a queue that
+    // hands a task out and leaves its wake published makes this spin for
+    // ever, and a test that spins stops the run instead of failing it.
+    let mut handouts = 0usize;
     while let Some((_key, _task, waker)) = tc.take_task() {
         waker.mark_borrowed(false);
+        handouts += 1;
+        assert!(
+            handouts <= 16 * TASKS,
+            "the queue never empties: {} hand-outs for {} tasks",
+            handouts,
+            TASKS
+        );
     }
     let gone = retired.load(Ordering::SeqCst);
     assert!(gone > 0, "no poll ever completed, so nothing was retired");
