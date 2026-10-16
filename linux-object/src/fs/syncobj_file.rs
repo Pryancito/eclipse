@@ -101,6 +101,20 @@ pub struct SyncobjHandle {
     /// When this kernel first saw the fence signaled, in ns of the monotonic
     /// clock; 0 while it has not (`dma_fence_timestamp`).
     signaled_at_ns: AtomicU64,
+    /// A merge's fences, as `dma_fence_unwrap_merge` keeps them: the inputs
+    /// (unwrapped, so a merge of a merge lists the leaves) that were still
+    /// pending when it was made, one per syncobj (the later point), in
+    /// syncobj order. Empty for a plain sync_file, a syncobj fd, and a merge
+    /// of fences all signaled (Linux's private stub: one signaled fence, the
+    /// merge's own point here). `SYNC_IOC_FILE_INFO` counts and lists them.
+    parts: Vec<MergedPart>,
+}
+
+/// One fence of a merged sync_file, with its own `dma_fence_timestamp`.
+struct MergedPart {
+    handle: u32,
+    point: u64,
+    signaled_at_ns: AtomicU64,
 }
 
 /// One live sync_file that is still waiting for its point. Dropped once
@@ -172,6 +186,20 @@ pub(crate) fn fence_status(signaled: bool, timed_out: bool) -> i32 {
     }
 }
 
+/// The first time a fence was seen signaled, latched on that first look:
+/// `dma_fence_timestamp`, for a fence this kernel only observes.
+fn latch_now(seen_at: &AtomicU64) -> u64 {
+    let seen = seen_at.load(Ordering::Acquire);
+    if seen != 0 {
+        return seen;
+    }
+    let now = now_ns();
+    match seen_at.compare_exchange(0, now, Ordering::AcqRel, Ordering::Acquire) {
+        Ok(_) => now,
+        Err(first) => first,
+    }
+}
+
 /// `strscpy` into a fixed buffer: whatever fits with its NUL.
 fn cstr<const N: usize>(s: &[u8]) -> [u8; N] {
     let mut out = [0u8; N];
@@ -193,6 +221,7 @@ impl SyncobjHandle {
             flags: Mutex::new(OpenFlags::RDONLY | OpenFlags::CLOEXEC),
             user_name: [0; 32],
             signaled_at_ns: AtomicU64::new(0),
+            parts: Vec::new(),
         })
     }
 
@@ -204,6 +233,16 @@ impl SyncobjHandle {
     /// [`Self::new_sync_file`] with the name `SYNC_IOC_MERGE` gives the
     /// fence it makes.
     pub fn new_sync_file_named(handle: u32, point: u64, user_name: [u8; 32]) -> Arc<Self> {
+        Self::new_sync_file_merged(handle, point, user_name, Vec::new())
+    }
+
+    /// [`Self::new_sync_file_named`] with the fences a merge is made of.
+    fn new_sync_file_merged(
+        handle: u32,
+        point: u64,
+        user_name: [u8; 32],
+        parts: Vec<MergedPart>,
+    ) -> Arc<Self> {
         // If the snapshot is already satisfied at export time (the common
         // case on the software path: EXEC signals its syncobjs before
         // returning), latch ready immediately so the first `sync_wait(fd, 0)`
@@ -236,6 +275,7 @@ impl SyncobjHandle {
             flags: Mutex::new(OpenFlags::RDONLY | OpenFlags::CLOEXEC),
             user_name,
             signaled_at_ns: AtomicU64::new(if already { now_ns() } else { 0 }),
+            parts,
         })
     }
 
@@ -291,8 +331,48 @@ impl SyncobjHandle {
         let b = other.sync_file_point.ok_or(LxError::ENOENT)?;
         let merged =
             zcore_drivers::scheme::syncobj::merge_fences(&[(self.handle, a), (other.handle, b)]);
+        // What the merge is made of, the way `dma_fence_unwrap_merge` keeps
+        // it: every leaf of both inputs (a merge unwraps to its own parts),
+        // the ones already signaled dropped, two points of one syncobj (one
+        // context) folded into the later, ordered by syncobj. Nothing
+        // pending leaves the merge with its own, signaled, point: the
+        // private stub. That is what `SYNC_IOC_FILE_INFO` counts and
+        // lists; it used to count one fence whatever a merge was made of.
+        let mut parts: Vec<(u32, u64)> = Vec::new();
+        for (handle, point) in self.fences().into_iter().chain(other.fences()) {
+            let reached = zcore_drivers::scheme::syncobj::query(handle)
+                .map(|p| p >= point)
+                .unwrap_or(false);
+            if reached {
+                continue;
+            }
+            match parts.iter_mut().find(|(h, _)| *h == handle) {
+                Some((_, p)) => *p = (*p).max(point),
+                None => parts.push((handle, point)),
+            }
+        }
+        parts.sort_unstable_by_key(|&(handle, _)| handle);
+        let parts = parts
+            .into_iter()
+            .map(|(handle, point)| MergedPart {
+                handle,
+                point,
+                signaled_at_ns: AtomicU64::new(0),
+            })
+            .collect();
         // The merged syncobj's one reference belongs to this fd.
-        Ok(Self::new_sync_file_named(merged, 1, cstr(name)))
+        Ok(Self::new_sync_file_merged(merged, 1, cstr(name), parts))
+    }
+
+    /// The fences this sync_file wraps (`dma_fence_unwrap_for_each`): a
+    /// merge's parts, else the one fence the fd names; none for a syncobj fd.
+    fn fences(&self) -> Vec<(u32, u64)> {
+        if !self.parts.is_empty() {
+            return self.parts.iter().map(|p| (p.handle, p.point)).collect();
+        }
+        self.sync_file_point
+            .map(|point| alloc::vec![(self.handle, point)])
+            .unwrap_or_default()
     }
 
     /// `sync_file_get_name`: the merge's name, else
@@ -309,18 +389,7 @@ impl SyncobjHandle {
     /// `dma_fence_timestamp` of a signaled fence: when this kernel first saw
     /// it so, latched on the first look after it was.
     fn signaled_at(&self) -> u64 {
-        let seen = self.signaled_at_ns.load(Ordering::Acquire);
-        if seen != 0 {
-            return seen;
-        }
-        let now = now_ns();
-        match self
-            .signaled_at_ns
-            .compare_exchange(0, now, Ordering::AcqRel, Ordering::Acquire)
-        {
-            Ok(_) => now,
-            Err(first) => first,
-        }
+        latch_now(&self.signaled_at_ns)
     }
 
     /// `SYNC_IOC_FILE_INFO`.
@@ -335,30 +404,73 @@ impl SyncobjHandle {
         if info.flags != 0 || info.pad != 0 {
             return Err(LxError::EINVAL);
         }
-        let signaled = self.fence_ready();
-        let timed_out = signaled
-            && zcore_drivers::scheme::syncobj::reached_by_timeout(&[self.handle], Some(&[point]));
-        let status = fence_status(signaled, timed_out);
-        // `num_fences == 0` asks for the summary only; otherwise the caller
-        // has room for at least our one fence (fewer than there are would be
-        // EINVAL), and the array is written before the summary, as in Linux.
-        if info.num_fences != 0 {
-            let entry = SyncFenceInfo {
+        // The fences, each with its status: the merge's parts, or the one
+        // fence the fd names. The summary is Linux's fold over them: 1 only
+        // once every one is signaled, else the first that is pending (0) or
+        // failed (an errno).
+        let ready = self.fence_ready();
+        let _ = zcore_drivers::scheme::syncobj::poll_pending();
+        let mut entries: Vec<SyncFenceInfo> = Vec::with_capacity(self.parts.len().max(1));
+        if self.parts.is_empty() {
+            let timed_out = ready
+                && zcore_drivers::scheme::syncobj::reached_by_timeout(
+                    &[self.handle],
+                    Some(&[point]),
+                );
+            entries.push(SyncFenceInfo {
                 obj_name: cstr(b"syncobj"),
                 driver_name: cstr(b"eclipse"),
-                status,
+                status: fence_status(ready, timed_out),
                 flags: 0,
-                timestamp_ns: if signaled { self.signaled_at() } else { 0 },
-            };
+                timestamp_ns: if ready { self.signaled_at() } else { 0 },
+            });
+        } else {
+            for part in &self.parts {
+                let signaled = ready
+                    || zcore_drivers::scheme::syncobj::query(part.handle)
+                        .map(|p| p >= part.point)
+                        .unwrap_or(false);
+                let timed_out = signaled
+                    && zcore_drivers::scheme::syncobj::reached_by_timeout(
+                        &[part.handle],
+                        Some(&[part.point]),
+                    );
+                entries.push(SyncFenceInfo {
+                    obj_name: cstr(b"syncobj"),
+                    driver_name: cstr(b"eclipse"),
+                    status: fence_status(signaled, timed_out),
+                    flags: 0,
+                    timestamp_ns: if signaled {
+                        latch_now(&part.signaled_at_ns)
+                    } else {
+                        0
+                    },
+                });
+            }
+        }
+        let status = entries
+            .iter()
+            .map(|e| e.status)
+            .fold(1, |acc, s| if acc <= 0 { acc } else { s });
+        // `num_fences == 0` asks for the summary only; otherwise the caller
+        // has room for every fence there is (fewer is EINVAL), and the array
+        // is written before the summary, as in Linux.
+        if info.num_fences != 0 {
+            if (info.num_fences as usize) < entries.len() {
+                return Err(LxError::EINVAL);
+            }
             let dst = info.sync_fence_info as usize;
-            if !kernel_hal::user::user_range_ok(dst, core::mem::size_of::<SyncFenceInfo>()) {
+            let size = core::mem::size_of::<SyncFenceInfo>() * entries.len();
+            if !kernel_hal::user::user_range_ok(dst, size) {
                 return Err(LxError::EFAULT);
             }
-            unsafe { core::ptr::write_unaligned(dst as *mut SyncFenceInfo, entry) };
+            for (i, entry) in entries.iter().enumerate() {
+                unsafe { core::ptr::write_unaligned((dst as *mut SyncFenceInfo).add(i), *entry) };
+            }
         }
         info.name = self.name();
         info.status = status;
-        info.num_fences = 1;
+        info.num_fences = entries.len() as u32;
         unsafe { core::ptr::write_unaligned(arg as *mut SyncFileInfo, info) };
         Ok(0)
     }
@@ -1138,6 +1250,141 @@ mod sync_file_poll_tests {
         drop(fb);
         assert!(zcore_drivers::scheme::syncobj::destroy(a));
         assert!(zcore_drivers::scheme::syncobj::destroy(b));
+    }
+
+    /// `SYNC_IOC_FILE_INFO` of a merge lists what `dma_fence_unwrap_merge`
+    /// kept: the leaves of both inputs still pending when it was made, two
+    /// points of one syncobj folded into the later, in syncobj order; a
+    /// merge of signaled fences is one signaled fence; `num_fences` below
+    /// the count is EINVAL; each entry has its own status and timestamp,
+    /// and the summary is 1 only once every one is.
+    #[test]
+    fn file_info_of_a_merge_lists_the_fences_that_were_pending_when_it_was_made() {
+        use zcore_drivers::scheme::syncobj as so;
+        fn info_of(
+            f: &SyncobjHandle,
+            room: u32,
+            entries: &mut [SyncFenceInfo],
+        ) -> (LxResult<usize>, SyncFileInfo) {
+            let mut info = SyncFileInfo {
+                name: [0; 32],
+                status: 0,
+                flags: 0,
+                num_fences: room,
+                pad: 0,
+                sync_fence_info: entries.as_mut_ptr() as u64,
+            };
+            let arg = &mut info as *mut SyncFileInfo as usize;
+            (f.ioctl(SYNC_IOC_FILE_INFO as usize, arg, 0, 0), info)
+        }
+        let untouched = SyncFenceInfo {
+            obj_name: [0xff; 32],
+            driver_name: [0xff; 32],
+            status: 7,
+            flags: 7,
+            timestamp_ns: 7,
+        };
+        let a = so::create(false);
+        let b = so::create(false);
+        let c = so::create(true);
+        let d = so::create(false);
+        for h in [a, a, b, c, c, d] {
+            assert!(so::add_ref(h));
+        }
+        let fa = SyncobjHandle::new_sync_file(a, 2);
+        let fa1 = SyncobjHandle::new_sync_file(a, 1);
+        let fb = SyncobjHandle::new_sync_file(b, 1);
+        let fc = SyncobjHandle::new_sync_file(c, 1);
+        let fc2 = SyncobjHandle::new_sync_file(c, 1);
+        let fd = SyncobjHandle::new_sync_file(d, 1);
+        let (ia, ib) = if a < b { (0, 1) } else { (1, 0) };
+        let mut entries = [untouched; 4];
+
+        // Two pending fences: two entries, in syncobj order whichever
+        // input came first.
+        let m = fb.merge(&fa, &[0; 32]).expect("merge");
+        let (r, info) = info_of(&m, 0, &mut entries);
+        assert_eq!(r, Ok(0));
+        assert_eq!(
+            (info.num_fences, info.status),
+            (2, 0),
+            "counted, not listed"
+        );
+        assert_eq!(entries[0].status, 7, "nothing written with no room asked");
+        assert_eq!(
+            info_of(&m, 1, &mut entries).0,
+            Err(LxError::EINVAL),
+            "room for one of two"
+        );
+        let (r, info) = info_of(&m, 2, &mut entries);
+        assert_eq!(r, Ok(0), "room for exactly two");
+        assert_eq!((info.num_fences, info.status), (2, 0));
+        assert_eq!((entries[0].status, entries[1].status), (0, 0));
+        assert_eq!((entries[0].timestamp_ns, entries[1].timestamp_ns), (0, 0));
+        assert_eq!(entries[2].status, 7, "nothing written past the count");
+        // Two points of one syncobj: the later, once.
+        let same = fa.merge(&fa1, &[0; 32]).expect("merge");
+        assert_eq!(info_of(&same, 0, &mut entries).1.num_fences, 1);
+        // An input already signaled is dropped; none pending is the stub.
+        let with_c = fa.merge(&fc, &[0; 32]).expect("merge");
+        assert_eq!(info_of(&with_c, 0, &mut entries).1.num_fences, 1);
+        let stub = fc.merge(&fc2, &[0; 32]).expect("merge");
+        let (r, info) = info_of(&stub, 4, &mut entries);
+        assert_eq!(r, Ok(0));
+        assert_eq!((info.num_fences, info.status), (1, 1), "one signaled fence");
+        assert_eq!(entries[0].status, 1);
+        // A merge of a merge lists the leaves.
+        let nested = m.merge(&fd, &[0; 32]).expect("merge");
+        let (r, info) = info_of(&nested, 4, &mut entries);
+        assert_eq!(r, Ok(0));
+        assert_eq!((info.num_fences, info.status), (3, 0));
+        assert_eq!(entries[3].status, 7);
+
+        // Each entry follows its own fence; the summary waits for all.
+        assert!(so::timeline_signal(a, 1));
+        wake_ready_waiters();
+        assert_eq!(
+            info_of(&same, 0, &mut entries).1.status,
+            0,
+            "the later point"
+        );
+        assert_eq!(info_of(&m, 0, &mut entries).1.status, 0);
+        assert!(so::timeline_signal(a, 2));
+        wake_ready_waiters();
+        let (r, info) = info_of(&m, 4, &mut entries);
+        assert_eq!(r, Ok(0));
+        assert_eq!((info.num_fences, info.status), (2, 0), "one of two");
+        assert_eq!((entries[ia].status, entries[ib].status), (1, 0));
+        assert_ne!(entries[ia].timestamp_ns, 0);
+        assert_eq!(entries[ib].timestamp_ns, 0);
+        let first = entries[ia].timestamp_ns;
+        assert!(so::timeline_signal(b, 1));
+        wake_ready_waiters();
+        let (r, info) = info_of(&m, 4, &mut entries);
+        assert_eq!(r, Ok(0));
+        assert_eq!((info.num_fences, info.status), (2, 1), "both");
+        assert_eq!((entries[ia].status, entries[ib].status), (1, 1));
+        assert_eq!(entries[ia].timestamp_ns, first, "latched");
+        assert_ne!(entries[ib].timestamp_ns, 0);
+        assert_eq!(info_of(&nested, 0, &mut entries).1.status, 0, "d pending");
+        assert!(so::timeline_signal(d, 1));
+        wake_ready_waiters();
+        assert_eq!(info_of(&nested, 0, &mut entries).1.status, 1);
+
+        drop(nested);
+        drop(stub);
+        drop(with_c);
+        drop(same);
+        drop(m);
+        drop(fd);
+        drop(fc2);
+        drop(fc);
+        drop(fb);
+        drop(fa1);
+        drop(fa);
+        for h in [a, b, c, d] {
+            assert!(so::destroy(h));
+        }
     }
 
     /// `dma_fence_get_status`: 0 in flight, 1 signaled, and the error of a
