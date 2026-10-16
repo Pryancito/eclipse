@@ -109,7 +109,20 @@ fn pause_returns_eintr_the_moment_a_caught_signal_arrives() {
     );
     usr1_later(proc.id(), Duration::from_millis(50));
     let start = std::time::Instant::now();
-    let e = async_std::task::block_on(wait_for_signal(&thread));
+    // `wait_for_signal` has no deadline of its own: it is `pause(2)`, and
+    // `pause` returns only when a signal arrives. So the wait needs a bound
+    // HERE, or a park that never wakes is not a failing test, it is a test
+    // that spins -- no name in the output, no verdict, and the whole run of
+    // the suite lost. It happened: the mutation that turns the `||` of
+    // `wants_signal` into `&&` makes no signal wanted, and this was the one
+    // test of the four that hung instead of failing (its sibling below
+    // already passes a deadline, and falls in its own second). Three seconds
+    // is the same margin that sibling uses, against a signal sent at 50 ms.
+    let e = async_std::task::block_on(async_std::future::timeout(
+        Duration::from_secs(3),
+        wait_for_signal(&thread),
+    ))
+    .expect("pause never woke: no signal was ever delivered to the parked thread");
     assert_eq!(e, LxError::EINTR);
     assert!(
         start.elapsed() < Duration::from_secs(1),

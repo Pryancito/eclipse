@@ -37,6 +37,20 @@ pub mod x86_64 {
         }
     }
 
+    #[cfg(test)]
+    impl FpregsMem {
+        /// A save area that is not the zeroed one, for the test that asks
+        /// whether `unmodified_check` notices the FPU area changing. The
+        /// field is private and there is no other way to build a non-default
+        /// one; nothing about the comparison itself is bypassed, since that
+        /// compares the whole struct.
+        pub(crate) fn scribbled() -> Self {
+            let mut mem = [0usize; 64];
+            mem[63] = 1;
+            Self { mem }
+        }
+    }
+
     /// See musl struct __ucontext
     #[repr(C)]
     #[derive(Clone, Default, Debug)]
