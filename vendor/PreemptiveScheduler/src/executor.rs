@@ -3682,22 +3682,45 @@ mod stack_registry_tests {
             let old = BASE;
             let replacement = BASE + ALLOC_SIZE * 2;
             stack_reg_insert(old);
+            // La precondicion se comprueba AQUI, antes de que haya un hilo al
+            // otro lado de una barrera. Estaba dentro del `remover` como un
+            // `assert!` sobre su propio `compare_exchange`, y un panico ahi
+            // es un hilo que nunca llega a su `wait()`: el hilo principal se
+            // queda en `cleared.wait()` para siempre y el test no falla, se
+            // CUELGA. No hay nombre de test en la salida, no hay veredicto, y
+            // la vuelta entera de la suite se pierde -- lo mismo que hacian
+            // los cuatro drenajes sin tope del #1911, por otro camino.
+            // Encontrado con la mutacion que convierte el `!= 0` de
+            // `stack_reg_insert` en `== 0`: entonces la insercion de arriba no
+            // entra, el CAS del `remover` no encaja, y esto colgaba.
+            assert_eq!(
+                STACK_REG_BASE[0].load(Ordering::SeqCst),
+                old,
+                "la insercion no dejo la base en el hueco 0, asi que el \
+                 interleaving que este test reproduce no puede ocurrir"
+            );
             let cleared = std::sync::Arc::new(std::sync::Barrier::new(2));
             let resume = std::sync::Arc::new(std::sync::Barrier::new(2));
             let peer_cleared = cleared.clone();
             let peer_resume = resume.clone();
             let remover = std::thread::spawn(move || {
-                assert!(STACK_REG_BASE[0]
+                // El veredicto sale por el `join`, no por un panico entre dos
+                // barreras.
+                let took = STACK_REG_BASE[0]
                     .compare_exchange(old, 0, Ordering::AcqRel, Ordering::Relaxed)
-                    .is_ok());
+                    .is_ok();
                 peer_cleared.wait();
                 peer_resume.wait();
                 stack_reg_occ_clear(0);
+                took
             });
             cleared.wait();
             stack_reg_insert(replacement);
             resume.wait();
-            remover.join().unwrap();
+            assert!(
+                remover.join().unwrap(),
+                "el removedor no se llevo la base que acababa de entrar"
+            );
             assert!(!bit_of(0));
             assert_eq!(
                 alloc_overlaps_live_stack(replacement + 4096, 8),
