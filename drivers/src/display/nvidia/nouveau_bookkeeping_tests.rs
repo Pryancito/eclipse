@@ -1839,7 +1839,7 @@ fn vm_bind_maps_into_the_callers_own_context_and_a_map_over_a_live_range_replace
         Err(nv::EOPNOTSUPP),
         "sparse regions"
     );
-    assert_eq!(vm_bind_ops(&gpu, A, &mut []), Err(nv::EINVAL), "no ops");
+    assert_eq!(vm_bind_ops(&gpu, A, &mut []), Ok(0), "no ops: an empty job");
     let mut many: Vec<_> = (0..4097).map(|_| map(ha, VA, 4096)).collect();
     assert_eq!(
         vm_bind_ops(&gpu, A, &mut many),
@@ -2368,8 +2368,8 @@ fn vm_bind_and_exec_answer_enosys_until_the_client_ran_vm_init() {
             pid,
         )
     };
-    // An empty synchronous request: EINVAL once past the gates, so a
-    // gate that lets it through shows as EINVAL rather than as a bind.
+    // An empty synchronous request: 0 once past the gates (an empty
+    // job), so a gate that lets it through shows as 0, never as a bind.
     let bind = |pid: u64| {
         let mut r = nv::DrmNouveauVmBind {
             op_count: 0,
@@ -5841,7 +5841,7 @@ fn a_sparse_bind_waits_its_semaphores_and_signals_its_fence_like_vkqueuebindspar
     assert_eq!(driver_maps(&gpu, A).len(), bound);
     assert_eq!(syncobj::query(done), Some(0));
     assert_eq!(rm_calls_since(before), [] as [&str; 0]);
-    // An op list with no pointer is EINVAL, not a fault.
+    // An op list with no pointer is a fault (`u_memcpya`).
     let mut r = nv::DrmNouveauVmBind {
         op_count: 1,
         flags: nv::VM_BIND_RUN_ASYNC,
@@ -5853,7 +5853,7 @@ fn a_sparse_bind_waits_its_semaphores_and_signals_its_fence_like_vkqueuebindspar
     };
     assert_eq!(
         call(&gpu, wr::<nv::DrmNouveauVmBind>(nv::NR_VM_BIND), &mut r, A),
-        Err(nv::EINVAL),
+        Err(nv::EFAULT),
         "ops with no pointer"
     );
     // The sparse submit: two waits already satisfied, the bind, and a

@@ -12930,11 +12930,14 @@ impl NvidiaGpu {
                     );
                     return Err(nv::EOPNOTSUPP);
                 }
+                // A request with nothing in it is a job that does nothing:
+                // `nouveau_uvmm_bind_job_init` takes an empty op list,
+                // `nouveau_job_submit` runs it and it returns 0. Refusing
+                // it (EINVAL) was this driver's invention. A count with no
+                // array is a fault, below, like the sync lists: Linux
+                // copies every list first (`u_memcpya`, EFAULT).
                 if req.op_count == 0 && req.wait_count == 0 && req.sig_count == 0 {
-                    return Err(nv::EINVAL);
-                }
-                if req.op_count > 0 && req.op_ptr == 0 {
-                    return Err(nv::EINVAL);
+                    return Ok(0);
                 }
                 let Some(device_instance) = *self.rm_device_instance.lock() else {
                     crate::klog_warn!("[nouveau-uapi] VM_BIND: GPU not attached to the RM yet");
