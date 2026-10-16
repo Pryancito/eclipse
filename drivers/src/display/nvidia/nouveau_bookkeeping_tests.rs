@@ -1305,6 +1305,16 @@ fn gem_new_rm(
     domain: u32,
     pid: u64,
 ) -> Result<nv::DrmNouveauGemInfo, i32> {
+    gem_new_rm_tiled(gpu, size, domain, 0, pid)
+}
+
+fn gem_new_rm_tiled(
+    gpu: &NvidiaGpu,
+    size: u64,
+    domain: u32,
+    tile_flags: u32,
+    pid: u64,
+) -> Result<nv::DrmNouveauGemInfo, i32> {
     let mut r = nv::DrmNouveauGemNew {
         info: nv::DrmNouveauGemInfo {
             handle: 0,
@@ -1313,12 +1323,82 @@ fn gem_new_rm(
             offset: 0,
             map_handle: 0,
             tile_mode: 0,
-            tile_flags: 0,
+            tile_flags,
         },
         channel_hint: 0,
         align: 0,
     };
     call(gpu, wr::<nv::DrmNouveauGemNew>(nv::NR_GEM_NEW), &mut r, pid).map(|_| r.info)
+}
+
+/// `nouveau_bo_fixup_align` / `nouveau_gem_info`: the object is as big
+/// as its GPU page (4 KiB host-backed; 64 KiB or 2 MiB in VRAM once the
+/// request fills one), that size is what the RM allocates, what the
+/// quotas count, what the mmap registry covers and what `GEM_NEW` and
+/// `GEM_INFO` report; and `tile_flags` comes back as NONCONTIG | kind,
+/// the kind being the uncompressed pair on a 4 KiB page. This allocated
+/// and reported the request byte for byte, `tile_flags` verbatim.
+#[test]
+fn with_the_rm_gem_new_rounds_the_size_to_the_gpu_page_and_reports_the_kind_it_programs() {
+    let _g = LOCK.lock();
+    let live = LiveBytes::hold();
+    let gpu = gpu_rm();
+    let gart = nv::NOUVEAU_GEM_DOMAIN_GART;
+    let vram = nv::NOUVEAU_GEM_DOMAIN_VRAM;
+
+    let small = gem_new_rm_tiled(&gpu, 100, gart, 0x00ff_08ff, A).unwrap();
+    assert_eq!(small.size, 4096, "a host page");
+    assert_eq!(
+        small.tile_flags, 0x0608,
+        "NONCONTIG kept, kind 0x08 uncompressed to 0x06 on 4 KiB pages, the rest gone"
+    );
+    let h = FAKE_RM.lock().gems[0].0;
+    assert_eq!(
+        FAKE_RM.lock().gems[0],
+        (h, 4096, true),
+        "allocated at that size"
+    );
+    assert_eq!(
+        crate::scheme::gem_mmap::lookup(small.handle).map(|(_, len)| len),
+        Some(4096),
+        "and registered at it"
+    );
+    assert_eq!(live.delta(), 4096, "and counted at it");
+    assert_eq!(
+        gem_info(&gpu, small.handle, A).map(|i| (i.size, i.tile_flags)),
+        Ok((4096, 0x0608)),
+        "GEM_INFO says the same"
+    );
+
+    // VRAM: the page the request fills.
+    let big = gem_new_rm_tiled(&gpu, 3 * MIB, vram, 0x0800, A).unwrap();
+    assert_eq!(big.size, 4 * MIB, "2 MiB pages");
+    assert_eq!(big.tile_flags, 0x0800, "compression stays on a 2 MiB page");
+    assert_eq!(FAKE_RM.lock().gems[1].1, 4 * MIB);
+    let mid = gem_new_rm_tiled(&gpu, 65537, vram, 0x0800, A).unwrap();
+    assert_eq!(mid.size, 131072, "64 KiB pages");
+    assert_eq!(mid.tile_flags, 0x0800);
+    let tiny = gem_new_rm_tiled(&gpu, 4096, vram, 0x0800, A).unwrap();
+    assert_eq!(tiny.size, 4096);
+    assert_eq!(tiny.tile_flags, 0x0600, "no compression on a 4 KiB page");
+    // GART|VRAM is host-backed here: host pages.
+    let both = gem_new_rm_tiled(&gpu, 100_000, gart | vram, 0, A).unwrap();
+    assert_eq!(both.size, 102_400);
+    assert_eq!(both.tile_flags, 0);
+    assert_eq!(
+        live.delta(),
+        4096 + 4 * MIB as i64 + 131072 + 4096 + 102_400
+    );
+    for h in [
+        small.handle,
+        big.handle,
+        mid.handle,
+        tiny.handle,
+        both.handle,
+    ] {
+        assert!(gpu.nouveau_gem_close(h, A));
+    }
+    assert_eq!(live.delta(), 0, "and given back at that size");
 }
 
 fn op(op: u32, flags: u32, handle: u32, addr: u64, range: u64) -> nv::DrmNouveauVmBindOp {
@@ -1517,9 +1597,11 @@ fn with_the_rm_gem_new_registers_what_is_cpu_mappable_and_close_gives_the_memory
     assert_eq!(both.domain, nv::NOUVEAU_GEM_DOMAIN_GART);
     assert_ne!(both.map_handle, 0);
     // VRAM-only is DEVICE_LOCAL: no host PA is ever published for it.
+    // 3 MiB of VRAM fills a 2 MiB page, so the object is 4 MiB
+    // (`nouveau_bo_fixup_align`).
     let vram = gem_new_rm(&gpu, 3 * MIB, nv::NOUVEAU_GEM_DOMAIN_VRAM, A).unwrap();
     let h_vram = FAKE_RM.lock().gems[2].0;
-    assert_eq!(FAKE_RM.lock().gems[2], (h_vram, 3 * MIB, false));
+    assert_eq!(FAKE_RM.lock().gems[2], (h_vram, 4 * MIB, false));
     assert_eq!(
         (vram.domain, vram.map_handle),
         (nv::NOUVEAU_GEM_DOMAIN_VRAM, 0)
@@ -1534,10 +1616,10 @@ fn with_the_rm_gem_new_registers_what_is_cpu_mappable_and_close_gives_the_memory
         Some(fake_fbmem_offset(h_vram)),
         "its FBMEM offset, for scanout by offset"
     );
-    assert_eq!(getparam(&gpu, nv::NOUVEAU_GETPARAM_VRAM_USED), Ok(3 * MIB));
+    assert_eq!(getparam(&gpu, nv::NOUVEAU_GETPARAM_VRAM_USED), Ok(4 * MIB));
     assert_eq!(
         _live.delta(),
-        65536 + 4096 + 3 * MIB as i64,
+        65536 + 4096 + 4 * MIB as i64,
         "every byte the RM holds is counted against the quotas"
     );
     assert_eq!(

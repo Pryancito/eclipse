@@ -14107,11 +14107,27 @@ impl NvidiaGpu {
                     );
                     return Err(nv::EINVAL);
                 }
+                // `nouveau_bo_alloc` / `nouveau_bo_fixup_align`: the object is
+                // as big as the GPU page it ends up on -- 4 KiB for anything
+                // host-backed, and 64 KiB or 2 MiB for VRAM once the request
+                // reaches that size -- and that is the size `GEM_NEW` and
+                // `GEM_INFO` report and the one the memory is allocated and
+                // accounted at. A compressible kind on 4 KiB pages, which
+                // carry no compression, is programmed and reported as its
+                // uncompressed pair, and the reported `tile_flags` is
+                // NONCONTIG | kind << 8, nothing else. This allocated and
+                // reported the request as it came.
+                let page_shift = nv::gem_page_shift(req.info.size, sysmem);
+                let size = nv::gem_alloc_size(req.info.size, page_shift);
+                let tile_flags = nv::gem_reported_tile_flags(
+                    req.info.tile_flags,
+                    nv::gem_reported_kind(kind, page_shift),
+                );
                 // Quotas before gem_alloc: one BO, per-pid live, and global live.
-                if req.info.size > GEM_NEW_MAX_SINGLE {
+                if size > GEM_NEW_MAX_SINGLE {
                     crate::klog_warn!(
                         "[nouveau-uapi] GEM_NEW: size={} exceeds single-alloc cap {} MiB (pid={})",
-                        req.info.size,
+                        size,
                         GEM_NEW_MAX_SINGLE / (1024 * 1024),
                         owner_pid
                     );
@@ -14130,22 +14146,22 @@ impl NvidiaGpu {
                         .filter(|o| o.owner_pid == owner_pid)
                         .map(|o| o.size)
                         .sum();
-                    if pid_live.saturating_add(req.info.size) > GEM_NEW_MAX_PER_PID {
+                    if pid_live.saturating_add(size) > GEM_NEW_MAX_PER_PID {
                         crate::klog_warn!(
                             "[nouveau-uapi] GEM_NEW: per-pid quota hit (pid={} live={} + {} > {} GiB)",
                             owner_pid,
                             pid_live,
-                            req.info.size,
+                            size,
                             GEM_NEW_MAX_PER_PID / (1024 * 1024 * 1024)
                         );
                         return Err(nv::ENOMEM);
                     }
                     let global_live = NOUVEAU_GEM_BYTES.load(Ordering::Relaxed);
-                    if global_live.saturating_add(req.info.size) > global_cap {
+                    if global_live.saturating_add(size) > global_cap {
                         crate::klog_warn!(
                             "[nouveau-uapi] GEM_NEW: global quota hit (live={} + {} > cap={} MiB, vram={} MiB)",
                             global_live,
-                            req.info.size,
+                            size,
                             global_cap / (1024 * 1024),
                             self.effective_vram_mb()
                         );
@@ -14166,34 +14182,32 @@ impl NvidiaGpu {
                     );
                     return Err(nv::ENOMEM);
                 };
-                let alloc =
-                    match nvidia_rm_sys::rm_init::gem_alloc(device_instance, req.info.size, sysmem)
-                    {
-                        Ok(a) if a.alloc_status == 0 => a,
-                        Ok(a) => {
-                            crate::klog_warn!(
+                let alloc = match nvidia_rm_sys::rm_init::gem_alloc(device_instance, size, sysmem) {
+                    Ok(a) if a.alloc_status == 0 => a,
+                    Ok(a) => {
+                        crate::klog_warn!(
                             "[nouveau-uapi] GEM_NEW: RM alloc failed ({}), size={} status={:#x}",
                             if sysmem { "sysmem/GART" } else { "vidmem/VRAM" },
-                            req.info.size,
+                            size,
                             a.alloc_status
                         );
-                            return Err(nv::ENOMEM);
-                        }
-                        Err(status) => {
-                            crate::klog_warn!(
-                                "[nouveau-uapi] GEM_NEW: gem_alloc ({}) failed, NV_STATUS={:#x}",
-                                if sysmem { "sysmem/GART" } else { "vidmem/VRAM" },
-                                status
-                            );
-                            return Err(nv::ENOMEM);
-                        }
-                    };
+                        return Err(nv::ENOMEM);
+                    }
+                    Err(status) => {
+                        crate::klog_warn!(
+                            "[nouveau-uapi] GEM_NEW: gem_alloc ({}) failed, NV_STATUS={:#x}",
+                            if sysmem { "sysmem/GART" } else { "vidmem/VRAM" },
+                            status
+                        );
+                        return Err(nv::ENOMEM);
+                    }
+                };
                 if !sysmem {
                     static FIRST_VRAM_GEM: AtomicBool = AtomicBool::new(false);
                     if !FIRST_VRAM_GEM.swap(true, Ordering::Relaxed) {
                         crate::klog_info!(
                             "[nouveau-uapi] GEM_NEW: first VRAM-only LOCAL alloc size={} hMemory={:#010x}",
-                            req.info.size,
+                            size,
                             alloc.h_memory
                         );
                     }
@@ -14239,7 +14253,7 @@ impl NvidiaGpu {
                     None
                 };
                 let map_handle = if let Some(pa) = phys_addr {
-                    crate::scheme::gem_mmap::register(handle, pa, req.info.size, owner_pid);
+                    crate::scheme::gem_mmap::register(handle, pa, size, owner_pid);
                     (handle as u64) << 12
                 } else {
                     0
@@ -14259,7 +14273,7 @@ impl NvidiaGpu {
                     handle,
                     h_memory: alloc.h_memory,
                     owner_pid,
-                    size: req.info.size,
+                    size,
                     phys_addr,
                     vram_offset,
                     domain: used_domain,
@@ -14268,9 +14282,9 @@ impl NvidiaGpu {
                     // programmed (or refused) at VM_BIND time, which is where
                     // the new uAPI carries it.
                     tile_mode: req.info.tile_mode,
-                    tile_flags: req.info.tile_flags,
+                    tile_flags,
                 });
-                NOUVEAU_GEM_BYTES.fetch_add(req.info.size, Ordering::Relaxed);
+                NOUVEAU_GEM_BYTES.fetch_add(size, Ordering::Relaxed);
                 // Feed the /proc/gpudbg memory summary. `req.info.domain` is
                 // still the client's REQUEST here (overwritten to the domain
                 // actually used a few lines below); phys_addr.is_some() means a
@@ -14283,6 +14297,8 @@ impl NvidiaGpu {
                     !sysmem,
                 );
                 req.info.handle = handle;
+                req.info.size = size;
+                req.info.tile_flags = tile_flags;
                 // Report the domain actually used, not the one requested:
                 // mesa reads this back to decide where the object lives.
                 req.info.domain = used_domain;
