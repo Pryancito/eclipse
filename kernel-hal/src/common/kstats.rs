@@ -758,11 +758,31 @@ pub fn dump_last_tick_rips() {
 /// unlike the last-tick RIP, which freezes one tick *before* the spin begins.
 static NMI_RIP_PERCPU: [AtomicU64; MAX_CORE_NUM] = [const { AtomicU64::new(0) }; MAX_CORE_NUM];
 
+/// [diag] Per-CPU frame pointer captured by the NMI handler, alongside
+/// [`NMI_RIP_PERCPU`].
+///
+/// The RIP alone names one frame, and one frame is not enough to tell the two
+/// causes of this banner apart. A capture from real hardware had
+/// `HOLDER cpu9 is now at <..LockedHeap<32>..>::dealloc+0x831` while holding
+/// `eclipsefs_mount.rs:421` -- which reads the same whether the heap is merely
+/// slow under that lock or the holder is wedged somewhere underneath it. The
+/// caller chain is what says which, and the NMI handler has the frame pointer
+/// in its trap frame, so it costs one more store to keep it.
+///
+/// Zero when the NMI interrupted ring 3: a user frame pointer is not a chain
+/// this kernel may walk, and [`nmi_rbp`]'s readers must see "no chain" rather
+/// than a user address that happens to look canonical.
+static NMI_RBP_PERCPU: [AtomicU64; MAX_CORE_NUM] = [const { AtomicU64::new(0) }; MAX_CORE_NUM];
+
 /// [diag] Record the interrupted RIP from the NMI handler (current CPU).
-pub fn note_nmi_rip(rip: u64) {
+///
+/// `rbp` is the interrupted frame pointer when the NMI landed in the kernel,
+/// and 0 when it landed in userspace (see [`NMI_RBP_PERCPU`]).
+pub fn note_nmi_rip(rip: u64, rbp: u64) {
     let cpu = crate::cpu::cpu_id() as usize;
     if cpu < MAX_CORE_NUM {
         NMI_RIP_PERCPU[cpu].store(rip, Relaxed);
+        NMI_RBP_PERCPU[cpu].store(rbp, Relaxed);
     }
 }
 
@@ -1064,6 +1084,18 @@ pub fn nmi_rips() -> Vec<(u16, u64)> {
 pub fn nmi_rip(cpu: usize) -> u64 {
     if cpu < MAX_CORE_NUM {
         NMI_RIP_PERCPU[cpu].load(Relaxed)
+    } else {
+        0
+    }
+}
+
+/// [diag] Non-allocating single-CPU read of the frame pointer captured by the
+/// last NMI broadcast, the companion of [`nmi_rip`]. Returns 0 when that CPU
+/// never took the NMI, was in userspace when it did, or is out of range --
+/// in every one of those cases there is no kernel chain to walk.
+pub fn nmi_rbp(cpu: usize) -> u64 {
+    if cpu < MAX_CORE_NUM {
+        NMI_RBP_PERCPU[cpu].load(Relaxed)
     } else {
         0
     }
@@ -1785,6 +1817,19 @@ mod tests {
         // because the allocator may be one of the wedged locks, agrees.
         assert_eq!(nmi_rip(3), 0xffff_8000_0001_0000);
         assert_eq!(nmi_rip(4), 0);
+        // The frame pointer rides in its own slot, indexed the same way. A
+        // zero there means "no chain to walk" -- the NMI landed in ring 3, or
+        // never landed -- and the banner must not read it as an address.
+        for s in NMI_RBP_PERCPU.iter() {
+            s.store(0, Relaxed);
+        }
+        NMI_RBP_PERCPU[3].store(0xffff_8000_0002_0000, Relaxed);
+        assert_eq!(nmi_rbp(3), 0xffff_8000_0002_0000);
+        assert_eq!(nmi_rbp(4), 0);
+        assert_eq!(nmi_rbp(MAX_CORE_NUM), 0);
+        for s in NMI_RBP_PERCPU.iter() {
+            s.store(0, Relaxed);
+        }
         for s in NMI_RIP_PERCPU.iter() {
             s.store(0, Relaxed);
         }
