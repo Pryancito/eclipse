@@ -595,7 +595,10 @@ impl Syscall<'_> {
             if self.linux_process().is_zombie_child(pid) {
                 return Ok(());
             }
-            return Err(LxError::ESRCH);
+            // A thread id names its process, as on Linux; see
+            // `process_of_thread` for why that is every `kill(gettid())`.
+            let process = linux_object::process::process_of_thread(pid).ok_or(LxError::ESRCH)?;
+            return self.signal_one_process(cx, &process);
         };
         self.signal_one_process(cx, &process)
     }
@@ -864,7 +867,12 @@ impl Syscall<'_> {
         if !may_queue_siginfo(user.code.0, pid as i64 == self.zircon_process().id() as i64) {
             return Err(LxError::EPERM);
         }
-        let process = ROOT_JOB.find_process(pid as KoID).ok_or(LxError::ESRCH)?;
+        // `kill_proc_info()` looks the pid up as `kill(2)` does: a thread id
+        // names its process.
+        let process = ROOT_JOB
+            .find_process(pid as KoID)
+            .or_else(|| linux_object::process::process_of_thread(pid as KoID))
+            .ok_or(LxError::ESRCH)?;
         // `kill_proc_info()`, the same one `kill(2)` walks into: the
         // credentials, then the delivery -- including the refusal to end init
         // from another process, which this syscall used to bypass by calling

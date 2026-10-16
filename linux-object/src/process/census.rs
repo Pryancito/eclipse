@@ -50,6 +50,29 @@ pub fn get_process_sid(pid: KoID) -> LxResult<KoID> {
     Ok(effective_sid(&find_live_process(pid)?))
 }
 
+/// The live process thread `tid` belongs to.
+///
+/// `kill(2)` takes a pid, and on Linux a pid is a TID: `kill_pid_info()`
+/// finds the task with `pid_task(pid, PIDTYPE_PID)` and signals its whole
+/// thread group, so `kill(gettid(), sig)` from any thread reaches its own
+/// process. Here only the leader's id is its process's id (`create_linux`
+/// hands it the pid); every other thread's id is one no process has, so a
+/// lookup that only knew pids answered `ESRCH` when a worker thread named
+/// itself -- or when anybody probed a worker's tid with `kill(tid, 0)`.
+///
+/// It walks the census, so it belongs on the path where the pid named no
+/// process, not in front of it.
+pub fn process_of_thread(tid: KoID) -> Option<Arc<Process>> {
+    process_of_thread_in(&ROOT_JOB, tid)
+}
+
+/// [`process_of_thread`] over one job's subtree, for the tests.
+pub fn process_of_thread_in(job: &Arc<Job>, tid: KoID) -> Option<Arc<Process>> {
+    all_live_processes_in(job)
+        .into_iter()
+        .find(|proc| proc.thread_ids().contains(&tid))
+}
+
 /// The live members of `job` and of every job under it, appended to `out`.
 ///
 /// It asks each job for its members and its children DIRECTLY

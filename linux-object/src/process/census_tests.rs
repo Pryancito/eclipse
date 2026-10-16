@@ -190,3 +190,59 @@ mod the_one_process_a_pid_names {
         );
     }
 }
+
+mod the_process_a_thread_id_names {
+    use super::*;
+
+    #[test]
+    fn a_secondary_thread_names_its_process() {
+        let job = a_job();
+        let proc = a_process_in(&job, 94_180);
+        let second = Thread::create_linux(&proc).unwrap();
+        let found = process_of_thread_in(&job, second.id()).expect("no process for the thread");
+        assert_eq!(found.id(), proc.id());
+    }
+
+    /// The leader already shares the pid, so `find_process` answers for it
+    /// and this lookup never gets asked; what it must not do is claim the
+    /// pid belongs to somebody else.
+    #[test]
+    fn the_leader_is_found_by_its_pid_and_names_its_own_process() {
+        let job = a_job();
+        let proc = a_process_in(&job, 94_181);
+        assert_eq!(proc.thread_ids()[0], proc.id());
+        assert_eq!(
+            process_of_thread_in(&job, proc.id()).map(|p| p.id()),
+            Some(proc.id())
+        );
+    }
+
+    #[test]
+    fn a_thread_of_another_process_names_that_process() {
+        let job = a_job();
+        let mine = a_process_in(&job, 94_182);
+        let theirs = a_process_in(&job, 94_185);
+        let worker = Thread::create_linux(&theirs).unwrap();
+        assert_eq!(
+            process_of_thread_in(&job, worker.id()).map(|p| p.id()),
+            Some(theirs.id())
+        );
+        assert_ne!(theirs.id(), mine.id());
+    }
+
+    #[test]
+    fn an_id_nobody_has_names_no_process() {
+        let job = a_job();
+        a_process_in(&job, 94_183);
+        assert!(process_of_thread_in(&job, 94_189).is_none());
+    }
+
+    #[test]
+    fn a_thread_of_an_exited_process_names_nothing() {
+        let job = a_job();
+        let proc = a_process_in(&job, 94_184);
+        let first = proc.thread_ids()[0];
+        proc.exit(0);
+        assert!(process_of_thread_in(&job, first).is_none());
+    }
+}
