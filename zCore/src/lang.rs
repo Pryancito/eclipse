@@ -167,6 +167,11 @@ pub(crate) fn sym_is_diagnosing(sym: &str) -> bool {
 /// from the lock's acquire site; a `dealloc` that is merely the top of a
 /// convoy is not. Beyond three the chain stops discriminating and starts
 /// spending the verdict's budget -- see [`BANNER_BYTES`].
+///
+/// Only the x86_64 banner walks a chain (the NMI probe that captures the
+/// frame pointer is x86_64's), so on the other architectures this and
+/// [`walk_frame_chain`] would be dead code and the build denies warnings.
+#[cfg(any(target_arch = "x86_64", test))]
 pub(crate) const HOLDER_CHAIN_FRAMES: usize = 3;
 
 /// Walk a frame-pointer chain and collect up to `out.len()` return addresses.
@@ -188,6 +193,7 @@ pub(crate) const HOLDER_CHAIN_FRAMES: usize = 3;
 ///    printing it would invite `addr2line` on a number that means nothing.
 ///
 /// Returns how many entries of `out` were filled.
+#[cfg(any(target_arch = "x86_64", test))]
 pub(crate) fn walk_frame_chain(
     mut rbp: u64,
     read: impl Fn(u64) -> u64,
