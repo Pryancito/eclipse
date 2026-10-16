@@ -184,6 +184,16 @@ lazy_static::lazy_static! {
     static ref NO_SHARE: Mutex<Vec<(u32, u64)>> = Mutex::new(Vec::new());
 }
 
+/// Forgets every mapping and every NO_SHARE record, for
+/// `crate::test_globals::LOCK`: a handle a test never closed would otherwise
+/// keep its holders, and `register` of the same handle by the next test
+/// keeps existing holders by design.
+#[cfg(test)]
+pub(crate) fn reset_for_tests() {
+    MAPPINGS.lock().clear();
+    NO_SHARE.lock().clear();
+}
+
 /// How many distinct GEM objects have had their host physical address handed
 /// out, and their total bytes.
 ///
@@ -606,6 +616,7 @@ mod one_pass_lookup_tests {
     /// pid-0 arm that is decided without the table at all.
     #[test]
     fn one_pass_answers_what_the_two_passes_did() {
+        let _g = crate::test_globals::LOCK.lock();
         /// The arrangement the old code made, spelled out: ownership first
         /// through `holds`, then the range through `lookup`.
         fn two_passes(handle: u32, pid: u64) -> Option<(u64, u64)> {
@@ -676,6 +687,7 @@ mod xwayland_chain_tests {
     /// making it.
     #[test]
     fn a_buffer_survives_the_client_xwayland_compositor_chain() {
+        let _g = crate::test_globals::LOCK.lock();
         let handle = DRIVER_HANDLE_BASE + 0x10_0001;
         let phys = 0x4_0000_0000;
         register(handle, phys, 0x10_0000, CLIENT);
@@ -716,6 +728,7 @@ mod xwayland_chain_tests {
     /// still holding references to it.
     #[test]
     fn the_client_exiting_does_not_pull_the_buffer_from_xwayland() {
+        let _g = crate::test_globals::LOCK.lock();
         let handle = DRIVER_HANDLE_BASE + 0x10_0002;
         let phys = 0x4_0010_0000;
         register(handle, phys, 0x10_0000, CLIENT);
@@ -750,6 +763,7 @@ mod xwayland_chain_tests {
     /// imported it gets nothing, even while three others hold it.
     #[test]
     fn a_process_that_never_imported_cannot_reach_the_buffer() {
+        let _g = crate::test_globals::LOCK.lock();
         let handle = DRIVER_HANDLE_BASE + 0x10_0003;
         register(handle, 0x4_0020_0000, 0x10_0000, CLIENT);
         add_ref(handle, XWAYLAND);
@@ -776,6 +790,7 @@ mod xwayland_chain_tests {
     /// the Wayland case is one more chance to free it too early.
     #[test]
     fn the_buffer_is_freed_only_after_the_last_hop_closes_it() {
+        let _g = crate::test_globals::LOCK.lock();
         let handle = DRIVER_HANDLE_BASE + 0x10_0004;
         register(handle, 0x4_0030_0000, 0x10_0000, CLIENT);
         add_ref(handle, XWAYLAND);
@@ -803,6 +818,7 @@ mod xwayland_chain_tests {
     /// the importer and the whole DRI3 chain collapses.
     #[test]
     fn a_dmabuf_keeps_the_buffer_alive_after_the_exporter_closes() {
+        let _g = crate::test_globals::LOCK.lock();
         let handle = DRIVER_HANDLE_BASE + 0x10_0005;
         let phys = 0x4_0040_0000;
         register(handle, phys, 0x10_0000, CLIENT);
@@ -1146,6 +1162,7 @@ mod no_share_record_tests {
     /// unregistering the mapping does not touch it.
     #[test]
     fn a_no_share_record_outlives_the_mapping_and_belongs_to_its_owner() {
+        let _g = crate::test_globals::LOCK.lock();
         const VRAM: u32 = 0xbffe_0001;
         const GART: u32 = 0xbffe_0002;
         // Pids of this test's own: 77_001 is the bench module's, whose rows

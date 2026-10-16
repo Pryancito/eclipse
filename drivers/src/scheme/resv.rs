@@ -48,6 +48,12 @@ lazy_static::lazy_static! {
     static ref RESV: Mutex<Vec<Entry>> = Mutex::new(Vec::new());
 }
 
+/// Drops every reservation, for `crate::test_globals::LOCK`.
+#[cfg(test)]
+pub(crate) fn reset_for_tests() {
+    RESV.lock().clear();
+}
+
 /// `dma_resv_add_fence`: the buffer at `phys` now carries the fence "`src`
 /// reaches `point`", as a write into it when `write`. Returns `false` when
 /// `src` is not a live syncobj.
@@ -156,7 +162,7 @@ mod tests {
 
     /// `crate::test_globals::LOCK`: the fences go in the syncobj `TABLE`
     /// that `scheme::syncobj`'s tests sweep, under the lock they hold.
-    fn lock() -> lock::MutexGuard<'static, ()> {
+    fn lock() -> crate::test_globals::Guard {
         crate::test_globals::LOCK.lock()
     }
 
