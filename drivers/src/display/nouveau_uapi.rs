@@ -1527,8 +1527,8 @@ pub(super) struct NvifIoctlMthdV0 {
 #[derive(Debug, Clone, Copy)]
 pub(super) struct NvifIoctlSclassV0 {
     pub version: u8,
-    /// IN: how many entries the caller has room for (mesa passes 16).
-    /// OUT: how many we filled.
+    /// IN: how many entries follow (mesa passes 16, libdrm probes with 0).
+    /// OUT: how many classes the channel has, whether or not they fit.
     pub count: u8,
     pub pad02: [u8; 6],
 }
@@ -1621,10 +1621,6 @@ pub(super) const MAX_CHANNELS: usize = 64;
 /// lazy (one per live client pid, freed on process exit), so this is a cap.
 /// Must stay <= 32: the `CTX_WEDGED` latch is a u32 bitmask (ctx_idx < 32).
 pub(super) const MAX_CTX: u32 = 32;
-
-/// How many class slots mesa offers in an `SCLASS` call
-/// (`NOUVEAU_WS_CONTEXT_MAX_CLASSES`).
-pub(super) const NVIF_SCLASS_MAX: usize = 16;
 
 // --- Engine classes advertised through SCLASS -------------------------------
 //
