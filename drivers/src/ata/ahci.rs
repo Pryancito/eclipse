@@ -306,13 +306,17 @@ pub mod inflight {
     /// stale instead of as a huge number, and no reader needs a lock.
     static BUSY_US: [AtomicU64; RING_SECS as usize] =
         [const { AtomicU64::new(0) }; RING_SECS as usize];
-    static DONE: [AtomicU64; RING_SECS as usize] = [const { AtomicU64::new(0) }; RING_SECS as usize];
+    static DONE: [AtomicU64; RING_SECS as usize] =
+        [const { AtomicU64::new(0) }; RING_SECS as usize];
 
     fn bump(table: &[AtomicU64; RING_SECS as usize], sec: u64, amount: u64) {
         let slot = &table[(sec % RING_SECS) as usize];
         let v = slot.load(Ordering::Relaxed);
         let carried = if v >> 32 == sec { v & 0xFFFF_FFFF } else { 0 };
-        slot.store((sec << 32) | (carried + amount).min(0xFFFF_FFFF), Ordering::Relaxed);
+        slot.store(
+            (sec << 32) | (carried + amount).min(0xFFFF_FFFF),
+            Ordering::Relaxed,
+        );
     }
 
     /// Record that the disk was busy from `start_us` to `end_us`.
@@ -2585,9 +2589,18 @@ mod inflight_tests {
         // the second it ended in: a ten-second command must never make one
         // second of the ring claim ten seconds of work.
         inflight::add_span(us(s + 1, 900_000), us(s + 3, 400_000));
-        assert_eq!(inflight::busy_over_last(1, us(s + 1, 999_999)), (100_000, 0));
-        assert_eq!(inflight::busy_over_last(1, us(s + 2, 999_999)), (1_000_000, 0));
-        assert_eq!(inflight::busy_over_last(1, us(s + 3, 500_000)), (400_000, 1));
+        assert_eq!(
+            inflight::busy_over_last(1, us(s + 1, 999_999)),
+            (100_000, 0)
+        );
+        assert_eq!(
+            inflight::busy_over_last(1, us(s + 2, 999_999)),
+            (1_000_000, 0)
+        );
+        assert_eq!(
+            inflight::busy_over_last(1, us(s + 3, 500_000)),
+            (400_000, 1)
+        );
         // And summed over the window the banner uses, it is back to its real
         // length, plus the 4 ms of the second before it.
         assert_eq!(
