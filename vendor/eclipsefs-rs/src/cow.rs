@@ -48,6 +48,26 @@ const DEFRAG_THRESHOLD: u64 = 32 << 20;
 const DEFRAG_WINDOW: u64 = WRITE_CHUNK;
 /// Commit early once this many tree nodes wait to be written.
 const DIRTY_NODES_LIMIT: usize = 4096;
+/// Items [`CowFs::purge`] reads in one step. Deleting an inode visits every
+/// item it owns, and a multi-GB file has millions of them, so the list they
+/// are read into is the allocation that matters, not the work.
+const PURGE_BATCH: usize = 1024;
+
+/// The smallest key greater than `k`, or `None` when `k` is [`Key::MAX`].
+///
+/// Keys order by `(objectid, ty, offset)`, so stepping carries from the
+/// offset up, exactly as the comparison reads them.
+fn key_after(k: &Key) -> Option<Key> {
+    if k.offset != u64::MAX {
+        Some(Key::new(k.objectid, k.ty, k.offset + 1))
+    } else if k.ty != u8::MAX {
+        Some(Key::new(k.objectid, k.ty + 1, 0))
+    } else if k.objectid != u64::MAX {
+        Some(Key::new(k.objectid + 1, 0, 0))
+    } else {
+        None
+    }
+}
 
 mod bitmap_sums;
 mod encrypt;
@@ -1872,25 +1892,48 @@ impl CowFs {
     }
 
     /// Delete an inode and everything it owns.
+    ///
+    /// A batch at a time, and never the whole item list at once. Every item of
+    /// the inode is an `(Key, Vec<u8>)` -- 48 bytes plus its data -- and a
+    /// multi-GB file has millions of extents, so asking for all of them meant
+    /// asking the allocator for one contiguous slab of tens of MiB. A capture
+    /// from a real machine died on exactly that: `memory allocation of
+    /// 100663296 bytes failed` (96 MiB, 2^21 items) inside `unlink`, and
+    /// because the mount holds its spinlock with interrupts off across the
+    /// whole call, the panic took the lock with it and the box wedged. The
+    /// total work is the same either way; only the peak differs.
+    ///
+    /// The window re-opens at the successor of the last key handled rather
+    /// than at the same `lo`: the items just deleted are gone from the tree,
+    /// so re-reading from `lo` would also terminate, but only as long as every
+    /// `delete` really removes its key. Advancing makes the loop finite
+    /// whatever `delete` does.
     fn purge(&mut self, ino: u64) -> Result<()> {
         self.zpending.remove(&(self.subvol, ino));
         self.keyring.forget(self.subvol, Some(ino));
-        let items = self.st.range(
-            &self.fs_root,
-            &Key::new(ino, 0, 0),
-            &Key::new(ino, u8::MAX, u64::MAX),
-            usize::MAX,
-        )?;
-        for (k, d) in items {
-            // The item goes first: copying a leaf shared with a snapshot
-            // adds the owners its extents are then released from.
-            self.delete(k)?;
-            if k.ty == INODE_ITEM && self.quota_on() {
-                let r = &mut self.fs_item.referenced;
-                *r = r.saturating_sub(InodeItem::decode(&d)?.nbytes);
+        let hi = Key::new(ino, u8::MAX, u64::MAX);
+        let mut lo = Key::new(ino, 0, 0);
+        loop {
+            let items = self.st.range(&self.fs_root, &lo, &hi, PURGE_BATCH)?;
+            let Some(last) = items.last().map(|(k, _)| *k) else {
+                break;
+            };
+            for (k, d) in items {
+                // The item goes first: copying a leaf shared with a snapshot
+                // adds the owners its extents are then released from.
+                self.delete(k)?;
+                if k.ty == INODE_ITEM && self.quota_on() {
+                    let r = &mut self.fs_item.referenced;
+                    *r = r.saturating_sub(InodeItem::decode(&d)?.nbytes);
+                }
+                if let Some((s, l)) = extent_of(&k, &d) {
+                    self.sp_decref(s, l)?;
+                }
             }
-            if let Some((s, l)) = extent_of(&k, &d) {
-                self.sp_decref(s, l)?;
+            match key_after(&last) {
+                Some(next) => lo = next,
+                // `last` was Key::MAX: nothing can follow it.
+                None => break,
             }
         }
         self.fs_item.inode_count = self.fs_item.inode_count.saturating_sub(1);
@@ -4511,5 +4554,58 @@ impl BlockDevice for NullDev {
     }
     fn size(&self) -> u64 {
         self.0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `purge` re-opens its window at the successor of the last key it
+    /// handled, so the step has to be the SMALLEST key above it: skip one and
+    /// an item of the inode survives the delete.
+    #[test]
+    fn the_key_after_one_is_the_next_one_there_is() {
+        assert_eq!(key_after(&Key::new(7, 3, 9)), Some(Key::new(7, 3, 10)));
+    }
+
+    /// Keys compare by `(objectid, ty, offset)`, so a full offset carries into
+    /// the type and a full type into the objectid. Stepping the offset alone
+    /// would loop on the same key for ever.
+    #[test]
+    fn a_full_field_carries_into_the_one_that_outranks_it() {
+        assert_eq!(
+            key_after(&Key::new(7, 3, u64::MAX)),
+            Some(Key::new(7, 4, 0))
+        );
+        assert_eq!(
+            key_after(&Key::new(7, u8::MAX, u64::MAX)),
+            Some(Key::new(8, 0, 0))
+        );
+    }
+
+    /// Nothing follows the largest key, and the caller has to stop rather than
+    /// wrap round to the smallest one and start again.
+    #[test]
+    fn the_largest_key_has_no_successor() {
+        assert_eq!(key_after(&Key::MAX), None);
+    }
+
+    /// The step is only useful if it really is a step: whatever the fields
+    /// hold, the successor sorts above its key, and asking twice gives the
+    /// same answer.
+    #[test]
+    fn every_successor_sorts_straight_above_its_key() {
+        for k in [
+            Key::MIN,
+            Key::new(0, 0, u64::MAX),
+            Key::new(1, 200, 5),
+            Key::new(u64::MAX, u8::MAX, 0),
+            Key::new(u64::MAX, 0, u64::MAX),
+        ] {
+            let next = key_after(&k).expect("not the largest key");
+            assert!(next > k, "{:?} is not above {:?}", next, k);
+            assert_eq!(key_after(&k), Some(next));
+        }
     }
 }

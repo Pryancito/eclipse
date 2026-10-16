@@ -1541,7 +1541,10 @@ mod tests {
         }
         all.trim();
         assert_eq!(all.cache.len(), CACHE_NODES * 2);
-        assert_eq!(all.trim_cursor, 0, "sin nada que soltar, vuelve al principio");
+        assert_eq!(
+            all.trim_cursor, 0,
+            "sin nada que soltar, vuelve al principio"
+        );
     }
 
     fn val(i: u64, len: usize) -> Vec<u8> {

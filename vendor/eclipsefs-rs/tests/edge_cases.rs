@@ -835,3 +835,44 @@ fn check(fs: &mut EclipseFS, dirs: &[u64], model: &Model) {
         assert!(got == *data, "{}/{} differs", d, name);
     }
 }
+
+/// Deleting an inode used to read every item it owns into one list, so a file
+/// with millions of extents asked the allocator for a slab tens of MiB wide --
+/// which is how a real machine came back with `memory allocation of 100663296
+/// bytes failed` inside `unlink`. `purge` now walks the items a batch at a
+/// time, and a batch loop is a place to drop items: this writes a file with
+/// comfortably more extents than one batch holds and checks the inode and all
+/// of its space are gone, not just the first batch of it.
+#[test]
+fn a_file_with_more_extents_than_one_purge_batch_is_deleted_whole() {
+    let (_disk, mut fs) = fresh(64 * MIB);
+    let root = fs.root_ino();
+    let before = fs.fsinfo().bytes_used;
+    let f = fs
+        .create(root, "many", FileKind::Regular, 0o644, 0)
+        .unwrap();
+    // One block written every other block: each one is an extent of its own.
+    // `PURGE_BATCH` is 1024, so this spans several batches and ends part-way
+    // through the last.
+    let block = vec![7u8; 4096];
+    for i in 0..1500u64 {
+        write_all(&mut fs, f, i * 8192, &block);
+    }
+    assert!(fs.fsinfo().bytes_used > before + 1500 * 4096);
+    fs.unlink(root, "many").unwrap();
+    assert!(matches!(fs.lookup(root, "many"), Err(Error::NotFound)));
+    // `check` walks the tree against the allocation bitmap, so a batch left
+    // undeleted shows up as items pointing at blocks, and one deleted without
+    // its extent released shows up as blocks nothing points at.
+    fs.check().unwrap();
+    // And the space really came back. Not to the byte: the tree grew a few
+    // nodes to hold 1500 extents and keeps them. Against the 6 MiB the file
+    // held, a batch left behind is nowhere near this margin.
+    let after = fs.fsinfo().bytes_used;
+    assert!(
+        after <= before + 64 * 1024,
+        "{} bytes still held after the unlink (was {} before the file)",
+        after,
+        before
+    );
+}
