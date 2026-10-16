@@ -154,12 +154,10 @@ mod tests {
 
     use super::*;
 
-    lazy_static::lazy_static! {
-        static ref LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    }
-
-    fn lock() -> std::sync::MutexGuard<'static, ()> {
-        LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    /// `crate::test_globals::LOCK`: the fences go in the syncobj `TABLE`
+    /// that `scheme::syncobj`'s tests sweep, under the lock they hold.
+    fn lock() -> lock::MutexGuard<'static, ()> {
+        crate::test_globals::LOCK.lock()
     }
 
     /// A reader waits for the writes only, a writer for everything, and a

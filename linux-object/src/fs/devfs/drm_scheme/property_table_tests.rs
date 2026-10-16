@@ -542,6 +542,39 @@ fn the_in_fence_sentinel_is_accepted_without_being_staged() {
         Ok(()),
     );
     assert_eq!(upd.in_fence_fd, Some(7));
+    // `drm_atomic_plane_set_property`: a state that holds a fence takes
+    // no second IN_FENCE_FD, not even the sentinel; the last one used to
+    // win, and -1 to keep it.
+    assert_eq!(
+        atomic_stage_on(&mut upd, AtomicObject::Plane, PROP_IN_FENCE_FD, 9),
+        Err(FsError::InvalidParam),
+    );
+    assert_eq!(
+        atomic_stage_on(
+            &mut upd,
+            AtomicObject::Plane,
+            PROP_IN_FENCE_FD,
+            -1i64 as u64
+        ),
+        Err(FsError::InvalidParam),
+    );
+    assert_eq!(upd.in_fence_fd, Some(7), "the first fence stays");
+    // The sentinel holds no fence, so a real fd after it is fine.
+    let mut upd = drm::AtomicUpdate::default();
+    assert_eq!(
+        atomic_stage_on(
+            &mut upd,
+            AtomicObject::Plane,
+            PROP_IN_FENCE_FD,
+            -1i64 as u64
+        ),
+        Ok(()),
+    );
+    assert_eq!(
+        atomic_stage_on(&mut upd, AtomicObject::Plane, PROP_IN_FENCE_FD, 7),
+        Ok(()),
+    );
+    assert_eq!(upd.in_fence_fd, Some(7));
 
     for bad in [-2i64, -1000, i32::MIN as i64] {
         let mut upd = drm::AtomicUpdate::default();

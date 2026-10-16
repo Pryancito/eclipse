@@ -871,8 +871,8 @@ mod benches {
     use test::{black_box, Bencher};
 
     /// These rows write `MAPPINGS`, which is process-wide, so they take turns
-    /// with each other.
-    static SERIAL: lock::Mutex<()> = lock::Mutex::new(());
+    /// with each other and with every test that drives it.
+    use crate::test_globals::LOCK as SERIAL;
 
     /// A handle range of this module's own, clear of every test's.
     const BASE: u32 = DRIVER_HANDLE_BASE + 0x0100_0000;
@@ -1190,8 +1190,9 @@ mod host_pa_counter_tests {
     /// them again, so two of them overlapping would see each other's bytes in
     /// their own delta. They take turns.
     fn alone_with_the_counters<R>(body: impl FnOnce() -> R) -> R {
-        static TURNSTILE: Mutex<()> = Mutex::new(());
-        let _guard = TURNSTILE.lock();
+        // The nouveau bookkeeping tests hand out host PAs too, under this
+        // same lock, so a delta read here is not theirs.
+        let _guard = crate::test_globals::LOCK.lock();
         body()
     }
 
