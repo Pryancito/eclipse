@@ -443,7 +443,11 @@ fn getparam_enumerates_the_gpu_without_the_rm() {
         Ok(256 * MIB),
         "the BAR1 aperture, not the board's VRAM"
     );
-    assert_eq!(getparam(&gpu, nv::NOUVEAU_GETPARAM_AGP_SIZE), Ok(0));
+    assert_eq!(
+        getparam(&gpu, nv::NOUVEAU_GETPARAM_AGP_SIZE),
+        Ok(512 << 40),
+        "the GART budget: the client VMM's 49-bit limit on a PCIe board"
+    );
     assert_eq!(
         getparam(&gpu, nv::NOUVEAU_GETPARAM_CHIPSET_ID),
         Ok(0x162),

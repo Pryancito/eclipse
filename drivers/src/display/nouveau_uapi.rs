@@ -1185,6 +1185,16 @@ pub(super) struct DrmNouveauVmInit {
     pub kernel_managed_size: u64,
 }
 
+/// `drm->gem.gart_available` on a PCIe board (`nouveau_ttm_init`: no AGP
+/// bridge, so `drm->client.vmm.vmm.limit`): the limit of the client's
+/// unmanaged VMM, which on GP100 and later spans 49 bits (`nvkm_vmm_ctor`:
+/// the 47-bit top page plus the 2 bits of its directory, `gp100_vmm.page`),
+/// 512 TiB. It is what `GETPARAM AGP_SIZE` answers and what `GEM_PUSHBUF`
+/// writes back in `gart_available`, less the GART the kernel pins (its
+/// channels' push buffers), which this driver does not count, as
+/// `FB_SIZE` does not count the VRAM it pins.
+pub(super) const NOUVEAU_GART_AVAILABLE: u64 = 1 << 49;
+
 /// One past the last GPU VA a client's uvmm may span: `NOUVEAU_VA_SPACE_END`
 /// (`1 << NOUVEAU_VA_SPACE_BITS`, 47) in `nouveau_uvmm.c`. `VM_INIT` refuses
 /// a kernel-managed range that overflows or ends past it with EINVAL.
@@ -2824,6 +2834,15 @@ mod gl_client_abi_tests {
         assert!(!pushbuf_counts_ok(1, 1025, 0), "one buffer too many");
         assert!(!pushbuf_counts_ok(1, 0, 1025), "one reloc too many");
         assert!(!pushbuf_counts_ok(u32::MAX, u32::MAX, u32::MAX));
+    }
+
+    /// The GART budget of a PCIe board is the client VMM's 49-bit limit,
+    /// not the 47-bit uvmm range and not 0.
+    #[test]
+    fn the_gart_budget_is_the_49_bit_client_vmm() {
+        assert_eq!(NOUVEAU_GART_AVAILABLE, 512 << 40, "512 TiB");
+        assert_eq!(NOUVEAU_GART_AVAILABLE, 1 << (47 + 2));
+        assert!(NOUVEAU_GART_AVAILABLE > NOUVEAU_VA_SPACE_END);
     }
 
     #[test]

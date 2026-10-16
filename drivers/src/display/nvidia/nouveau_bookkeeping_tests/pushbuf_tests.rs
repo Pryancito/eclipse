@@ -57,7 +57,12 @@ fn gem_pushbuf_checks_what_linux_checks_before_it_submits() {
     assert_eq!(pushbuf(&gpu, &mut r, A), Ok(0));
     assert_eq!((r.suffix0, r.suffix1), (0, 0), "an indirect-buffer channel");
     assert_eq!(r.vram_available, 8192 * MIB, "GETPARAM FB_SIZE's number");
-    assert_eq!(r.gart_available, 0, "GETPARAM AGP_SIZE's number");
+    assert_eq!(
+        r.gart_available,
+        getparam(&gpu, nv::NOUVEAU_GETPARAM_AGP_SIZE).unwrap(),
+        "GETPARAM AGP_SIZE's number"
+    );
+    assert_eq!(r.gart_available, 512 << 40);
 
     // The channel has to be the caller's.
     let mut r = pushbuf_req(c + 7, 0, 0, 0, 0);
