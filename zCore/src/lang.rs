@@ -977,6 +977,40 @@ pub(crate) fn release_panic_guard() {
     PANIC_DEPTH.store(0, Ordering::SeqCst);
 }
 
+/// Write the panic header -- who panicked, which build, where, and what it
+/// said -- into `b`.
+///
+/// Shared by the two places that print it, which is the point: the stop-screen
+/// banner at the top of the handler and the reprint at the very bottom, after
+/// the backtrace. A reader comparing the top of a photograph with the bottom
+/// has to see the same line, not two that drifted apart.
+///
+/// `cpu` and `message` are taken by `Display` rather than by their concrete
+/// types: `cpu_id()` is a `u8` on bare metal and a `usize` under libos, and
+/// `PanicInfo::message` hands back a `PanicMessage`, not the `Arguments` it
+/// used to be. Naming any one of those here would tie this to one build.
+pub(crate) fn write_panic_header(
+    b: &mut StackBuf,
+    cpu: impl core::fmt::Display,
+    build: &str,
+    loc: Option<(&str, u32)>,
+    message: impl core::fmt::Display,
+) {
+    use core::fmt::Write;
+    match loc {
+        Some((file, line)) => {
+            let _ = write!(
+                b,
+                "KERNEL PANIC cpu={} [build {}] {}:{}\n{}",
+                cpu, build, file, line, message
+            );
+        }
+        None => {
+            let _ = write!(b, "KERNEL PANIC cpu={} [build {}]\n{}", cpu, build, message);
+        }
+    }
+}
+
 /// Stop this CPU for good. The halt tail of the panic handler, shared with the
 /// short paths so they cannot drift apart.
 #[cfg(not(test))]
@@ -1072,30 +1106,17 @@ fn panic(info: &PanicInfo) -> ! {
     // handler mid-print left the screen frozen half-line with the real panic
     // visible only on serial). This banner cannot.
     {
-        use core::fmt::Write;
         let mut b = StackBuf::new();
         // The build id, for the same reason the deadlock banner carries one: a
         // stale build booted after a fix landed reads exactly like the fix not
         // working, and a photographed stop screen is all anybody has.
-        if let Some(loc) = info.location() {
-            let _ = write!(
-                b,
-                "KERNEL PANIC cpu={} [build {}] {}:{}\n{}",
-                kernel_hal::cpu::cpu_id(),
-                env!("ECLIPSE_BUILD_ID"),
-                loc.file(),
-                loc.line(),
-                info.message()
-            );
-        } else {
-            let _ = write!(
-                b,
-                "KERNEL PANIC cpu={} [build {}]\n{}",
-                kernel_hal::cpu::cpu_id(),
-                env!("ECLIPSE_BUILD_ID"),
-                info.message()
-            );
-        }
+        write_panic_header(
+            &mut b,
+            kernel_hal::cpu::cpu_id(),
+            env!("ECLIPSE_BUILD_ID"),
+            info.location().map(|l| (l.file(), l.line())),
+            info.message(),
+        );
         kernel_hal::console::panic_banner(b.valid_str());
     }
 
@@ -1229,6 +1250,40 @@ fn panic(info: &PanicInfo) -> ! {
         );
         kernel_hal::console::serial_write_fmt_spin(summary);
         kernel_hal::console::graphic_console_write_fmt_spin(summary);
+    }
+
+    // The panic message itself, printed again as the last thing on the glass.
+    //
+    // The framebuffer console does not scroll: it clears and restarts at the
+    // top when it fills (see the comment above the backtrace). The handler
+    // prints the message first and up to 32 frames after it, so on a deep
+    // stack the backtrace wipes the message -- and the stop-screen banner
+    // rasterized at the top of this function is painted over by the same text
+    // console. A photographed screen then carries a tail of return addresses
+    // and nothing that says what panicked or on which build: one came back
+    // from a real machine showing six frames of the generic syscall spine and
+    // no message at all. The `[exception]` line above is printed last for this
+    // reason already; the message needs it just as much, and more, because a
+    // `panic!` that took no CPU exception leaves that line unprinted.
+    //
+    // Also recorded in the oops ring. The handler never wrote there, so a
+    // panic `oops::try_contain` goes on to contain -- the machine survives and
+    // the screen scrolls away -- left nothing behind in `/proc/oops` or
+    // `/var/log/oops.log` either. `record` is a lock-free byte ring and
+    // allocates nothing, so it is safe on this path.
+    {
+        let mut b = StackBuf::new();
+        write_panic_header(
+            &mut b,
+            kernel_hal::cpu::cpu_id(),
+            env!("ECLIPSE_BUILD_ID"),
+            info.location().map(|l| (l.file(), l.line())),
+            info.message(),
+        );
+        let tail = format_args!("\n{}\n", b.valid_str());
+        kernel_hal::console::serial_write_fmt_spin(tail);
+        kernel_hal::console::graphic_console_write_fmt_spin(tail);
+        kernel_hal::oops_log::record(tail);
     }
 
     // How many kernel faults this boot has already survived. A panic arriving
@@ -1436,6 +1491,46 @@ mod tests {
     #[test]
     fn the_reporting_cpu_is_one_the_bitmap_can_hold() {
         assert!(panicking_cpu() < 64 || panicking_cpu() == lock::cpuid::NO_CPU as usize);
+    }
+
+    // ── The panic header ────────────────────────────────────────────────────
+
+    /// What a photograph of a halted machine has to carry. The handler writes
+    /// this twice -- the stop-screen banner at the top, the reprint after the
+    /// backtrace -- precisely because the first copy can be wiped off the
+    /// glass, so every field has to be in the one string both of them build.
+    #[test]
+    fn the_panic_header_names_the_cpu_the_build_the_site_and_the_message() {
+        let mut b = StackBuf::new();
+        write_panic_header(
+            &mut b,
+            3,
+            "abc1234",
+            Some(("zCore/src/memory.rs", 42)),
+            format_args!("assertion failed: {}", "frames.is_empty()"),
+        );
+        let s = b.valid_str();
+        assert!(s.contains("cpu=3"), "{s}");
+        assert!(s.contains("[build abc1234]"), "{s}");
+        assert!(s.contains("zCore/src/memory.rs:42"), "{s}");
+        assert!(s.contains("assertion failed: frames.is_empty()"), "{s}");
+        assert_eq!(b.dropped(), 0);
+    }
+
+    /// `PanicInfo::location` is an `Option`, and the arm that has no location
+    /// still has to carry the message: a panic from a context the compiler
+    /// could not place is exactly the one nobody can guess at from the
+    /// backtrace alone.
+    #[test]
+    fn the_panic_header_without_a_location_still_carries_build_and_message() {
+        let mut b = StackBuf::new();
+        write_panic_header(&mut b, 0, "abc1234", None, format_args!("out of memory"));
+        let s = b.valid_str();
+        assert!(s.contains("cpu=0"), "{s}");
+        assert!(s.contains("[build abc1234]"), "{s}");
+        assert!(s.contains("out of memory"), "{s}");
+        // No stray separator left behind by the missing site.
+        assert!(!s.contains("::"), "{s}");
     }
 
     // ── The banner buffer ───────────────────────────────────────────────────
