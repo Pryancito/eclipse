@@ -182,6 +182,112 @@ const DIRECT_MAX_BYTES: usize = PRDT_MAX * 4096;
 // 28-bit DMA commands carry an 8-bit sector count (0 means 256; we stay at 255).
 const LBA28_MAX_SECTORS: usize = 255;
 
+/// What the disk is doing right now, for whoever is looking at a wedged
+/// machine.
+///
+/// A command issued from under the filesystem's lock runs with interrupts off
+/// and can legitimately take ten seconds ([`CMD_TIMEOUT_US`]), eight times
+/// over ([`RW_RETRIES`]). That looks exactly like a software deadlock from the
+/// outside -- the deadlock banner fires after eight seconds either way -- and
+/// nothing on the screen said which it was. These three words do: a command in
+/// flight, and for how long.
+pub mod inflight {
+    use core::sync::atomic::{AtomicU64, Ordering};
+
+    /// Packed `(start_us << 16) | (port << 8) | kind`, or 0 for "nothing in
+    /// flight". One word so the reader -- which runs from inside a stuck
+    /// machine, possibly from an NMI -- takes no lock and sees no torn pair.
+    static CURRENT: AtomicU64 = AtomicU64::new(0);
+    /// Commands that burned their whole timeout, and retries issued, since
+    /// boot. A disk that is merely slow and one that is failing look the same
+    /// in a single snapshot; these tell them apart.
+    static TIMEOUTS: AtomicU64 = AtomicU64::new(0);
+    static RETRIES: AtomicU64 = AtomicU64::new(0);
+
+    /// What the command is, for the one word there is room for on screen.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub enum Kind {
+        Read = 1,
+        Write = 2,
+        Flush = 3,
+        Other = 4,
+    }
+
+    impl Kind {
+        pub fn as_str(self) -> &'static str {
+            match self {
+                Kind::Read => "READ",
+                Kind::Write => "WRITE",
+                Kind::Flush => "FLUSH",
+                Kind::Other => "cmd",
+            }
+        }
+
+        fn from_code(c: u8) -> Kind {
+            match c {
+                1 => Kind::Read,
+                2 => Kind::Write,
+                3 => Kind::Flush,
+                _ => Kind::Other,
+            }
+        }
+    }
+
+    /// A command is in flight on `port`, since `start_us`.
+    ///
+    /// `start_us` is truncated to 48 bits, which is 8.9 years of microseconds:
+    /// the subtraction against a full-width `now` is done by the reader, so
+    /// the only cost of the truncation is a wrong answer on a machine that has
+    /// been up that long.
+    pub fn begin(port: u8, kind: Kind, start_us: u64) {
+        let packed = (start_us << 16) | ((port as u64) << 8) | kind as u64;
+        // Never 0: that is the "nothing in flight" value, and a command issued
+        // in the first microsecond of the first port would otherwise vanish.
+        CURRENT.store(packed | 1 << 63, Ordering::Relaxed);
+    }
+
+    /// The command finished, one way or another.
+    pub fn end(timed_out: bool) {
+        CURRENT.store(0, Ordering::Relaxed);
+        if timed_out {
+            TIMEOUTS.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// A command is being re-issued after a failure.
+    pub fn note_retry() {
+        RETRIES.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The command in flight as `(port, kind, start_us)`, if there is one.
+    pub fn current() -> Option<(u8, Kind, u64)> {
+        let v = CURRENT.load(Ordering::Relaxed);
+        if v == 0 {
+            return None;
+        }
+        let v = v & !(1 << 63);
+        Some((
+            (v >> 8) as u8,
+            Kind::from_code(v as u8),
+            (v >> 16) & ((1 << 48) - 1),
+        ))
+    }
+
+    /// Commands that timed out, and retries issued, since boot.
+    pub fn counters() -> (u64, u64) {
+        (
+            TIMEOUTS.load(Ordering::Relaxed),
+            RETRIES.load(Ordering::Relaxed),
+        )
+    }
+
+    /// Microseconds since boot by the same clock [`begin`] is given, for a
+    /// reader that has no other way to ask the driver's timer.
+    pub fn now_us() -> u64 {
+        unsafe { crate::bus::drivers_timer_now_as_micros() }
+    }
+}
+
 /// Busy-wait for `us` microseconds using the TSC-based driver timer.
 #[inline]
 fn udelay(us: u64) {
@@ -504,13 +610,16 @@ impl AhciPort {
         self.start_engine();
     }
 
-    fn exec_cmd(&self, slot: u32) -> DeviceResult {
-        self.exec_cmd_with_timeout(slot, CMD_TIMEOUT_US)
+    fn exec_cmd_with_timeout(&self, slot: u32, timeout_us: u64) -> DeviceResult {
+        self.exec_cmd_kind(slot, timeout_us, inflight::Kind::Other)
     }
 
-    fn exec_cmd_with_timeout(&self, slot: u32, timeout_us: u64) -> DeviceResult {
+    /// `kind` is only ever read off a wedged machine's screen; it does not
+    /// change what is issued.
+    fn exec_cmd_kind(&self, slot: u32, timeout_us: u64, kind: inflight::Kind) -> DeviceResult {
         fence(Ordering::SeqCst);
         self.write_reg(PORT_IS, 0xFFFF_FFFF);
+        inflight::begin(self.port_idx as u8, kind, inflight::now_us());
         self.write_reg(PORT_CI, 1 << slot);
 
         if !wait_until(timeout_us, || {
@@ -542,9 +651,11 @@ impl AhciPort {
                 timeout_us / 1000,
                 tfd, ssts, serr, is, ci
             );
+            inflight::end(true);
             self.reset_port();
             return Err(DeviceError::IoError);
         }
+        inflight::end(false);
 
         let is_now = self.read_reg(PORT_IS);
         let tfd_err = self.read_reg(PORT_TFD) & ATA_DEV_ERR as u32 != 0;
@@ -639,7 +750,12 @@ impl AhciPort {
             clflush_range(phys_to_virt(phys as usize), len);
         }
 
-        let mut res = self.exec_cmd(slot);
+        let kind = if write {
+            inflight::Kind::Write
+        } else {
+            inflight::Kind::Read
+        };
+        let mut res = self.exec_cmd_kind(slot, CMD_TIMEOUT_US, kind);
         let mut attempt = 1u32;
         while res.is_err() && attempt < RW_RETRIES {
             attempt += 1;
@@ -676,7 +792,8 @@ impl AhciPort {
                 RW_RETRIES,
                 lba,
             );
-            res = self.exec_cmd(slot);
+            inflight::note_retry();
+            res = self.exec_cmd_kind(slot, CMD_TIMEOUT_US, kind);
         }
         // Verify the byte count the HBA actually transferred (CommandHeader
         // PRDBC), like libata does. A command can clear CI with no error bit yet
@@ -766,13 +883,14 @@ impl AhciPort {
             clflush_range(self.ct_virt, core::mem::size_of::<CommandTable>());
             clflush_range(self.cl_virt, core::mem::size_of::<CommandHeader>());
 
-            match self.exec_cmd_with_timeout(0, FLUSH_TIMEOUT_US) {
+            match self.exec_cmd_kind(0, FLUSH_TIMEOUT_US, inflight::Kind::Flush) {
                 Ok(()) => return Ok(()),
                 Err(e) => {
                     // exec_cmd already reset the port on failure. Re-issuing the
                     // same (idempotent) FLUSH after a short settle recovers a
                     // single transient SATA hiccup instead of failing the fsync.
                     if attempt < RW_RETRIES {
+                        inflight::note_retry();
                         crate::klog_err!(
                             "[AHCI] port {} retrying flush (attempt {}/{})",
                             self.port_idx,
@@ -2346,5 +2464,42 @@ mod header_layout_tests {
     fn the_table_strides_are_the_two_sizes_times_their_counts() {
         assert_eq!(size_of::<CommandHeader>() * 32, 1024);
         assert_eq!(0x80 + PRDT_MAX * size_of::<PrdEntry>(), 1024);
+    }
+}
+
+#[cfg(test)]
+mod inflight_tests {
+    use super::inflight::{self, Kind};
+
+    /// One test, not four: the record is a global, so two of them running at
+    /// once would read each other's command and the failure would land on
+    /// whichever got there second.
+    #[test]
+    fn the_record_of_the_command_in_flight() {
+        // Everything is packed into one word, so the three fields have to come
+        // back out as they went in -- a port read off a wedged machine's
+        // screen is only useful if it is the right port.
+        inflight::begin(3, Kind::Write, 1_234_567);
+        assert_eq!(inflight::current(), Some((3, Kind::Write, 1_234_567)));
+        inflight::begin(31, Kind::Flush, 0);
+        assert_eq!(inflight::current(), Some((31, Kind::Flush, 0)));
+
+        // Zero means "nothing in flight", so the first command of the first
+        // port in the first microsecond of the boot must not read as nothing.
+        inflight::begin(0, Kind::Read, 0);
+        assert_eq!(inflight::current(), Some((0, Kind::Read, 0)));
+        inflight::end(false);
+        assert_eq!(inflight::current(), None);
+
+        // The counters separate a disk that is slow from one that is failing,
+        // so only a command that burned its whole timeout counts as a timeout.
+        let (t0, r0) = inflight::counters();
+        inflight::begin(0, Kind::Read, 10);
+        inflight::end(false);
+        assert_eq!(inflight::counters(), (t0, r0));
+        inflight::begin(0, Kind::Read, 20);
+        inflight::end(true);
+        inflight::note_retry();
+        assert_eq!(inflight::counters(), (t0 + 1, r0 + 1));
     }
 }

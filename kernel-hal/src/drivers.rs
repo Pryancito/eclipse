@@ -1643,3 +1643,20 @@ mod registry_tests {
         }
     }
 }
+
+/// What the disk is doing right now: `(port, what, microseconds so far)` for a
+/// command in flight, plus the commands that have timed out and the retries
+/// issued since boot.
+///
+/// For the deadlock banner, which has no other way to tell a machine wedged in
+/// software from one waiting on a disk command that is allowed to take ten
+/// seconds. Reads two atomics and takes no lock, so it is safe from inside a
+/// stuck critical section.
+pub fn disk_inflight() -> (Option<(u8, &'static str, u64)>, u64, u64) {
+    use zcore_drivers::ata::ahci::inflight;
+    let now = inflight::now_us();
+    let cur = inflight::current()
+        .map(|(port, kind, since)| (port, kind.as_str(), now.saturating_sub(since)));
+    let (timeouts, retries) = inflight::counters();
+    (cur, timeouts, retries)
+}

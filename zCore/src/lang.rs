@@ -745,6 +745,34 @@ fn dl_paint() {
             );
         }
     }
+    // What the disk is doing, which is the other half of the question the
+    // verdict asks. A command issued from under the filesystem's lock runs
+    // with interrupts off and is allowed ten seconds, eight times over, so a
+    // disk that is merely slow produces this banner with nothing wrong in the
+    // software at all. One line says which: a command in flight and for how
+    // long, plus the timeouts and retries behind it.
+    {
+        let (cur, timeouts, retries) = kernel_hal::drivers::disk_inflight();
+        match cur {
+            Some((port, what, us)) => {
+                let _ = write!(
+                    b,
+                    "\nDISK: {} in flight on port {} for {} ms",
+                    what,
+                    port,
+                    us / 1000
+                );
+            }
+            None => {
+                let _ = write!(b, "\nDISK: no command in flight");
+            }
+        }
+        let _ = write!(
+            b,
+            " ({} timeouts, {} retries since boot)",
+            timeouts, retries
+        );
+    }
     // Everything above was allowed to be cut; what follows is not. The verdict
     // is the line a reader acts on, so it gets the bytes held back for it.
     b.release_reserve();
