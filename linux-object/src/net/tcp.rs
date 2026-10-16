@@ -450,10 +450,7 @@ impl Socket for TcpSocketState {
                     );
                 }
             }
-            if let Err(e) = crate::process::check_and_deliver_tty_interrupt() {
-                return (Err(e), Endpoint::Ip(IpEndpoint::UNSPECIFIED));
-            }
-            // Also honor non-TTY signals (SIGTERM/SIGALRM/...) so a blocked
+            // Honor signals (the terminal's SIGINT, SIGTERM, SIGALRM...) so a blocked
             // recv returns EINTR, matching the udp/raw/icmp socket paths.
             if let Err(e) = crate::process::check_signals() {
                 return (Err(e), Endpoint::Ip(IpEndpoint::UNSPECIFIED));
@@ -519,7 +516,7 @@ impl Socket for TcpSocketState {
                     );
                 }
             }
-            if let Err(e) = crate::process::check_and_deliver_tty_interrupt() {
+            if let Err(e) = crate::process::check_signals() {
                 return (Err(e), Endpoint::Ip(IpEndpoint::UNSPECIFIED));
             }
             // Park on the RX IRQ waker with an adaptive fallback — see read().

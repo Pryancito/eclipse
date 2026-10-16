@@ -235,9 +235,6 @@ impl Socket for IcmpSocketState {
                 }
             }
 
-            if let Err(e) = crate::process::check_and_deliver_tty_interrupt() {
-                return (Err(e), Endpoint::Ip(IpEndpoint::UNSPECIFIED));
-            }
             if let Err(e) = crate::process::check_signals() {
                 return (Err(e), Endpoint::Ip(IpEndpoint::UNSPECIFIED));
             }

@@ -115,11 +115,6 @@ impl Syscall<'_> {
     /// result. Called by the trap handler when the faulting process's
     /// personality is FreeBSD.
     pub async fn bsd_syscall(&mut self, num: usize, args: [usize; 6]) -> BsdRet {
-        // Terminal Ctrl-C is delivered the same way as on the Linux path.
-        if self.maybe_handle_tty_intr().is_err() {
-            return BsdRet::err(consts::errno::EINTR);
-        }
-
         // syscall(2) / __syscall(2): the real number is the first argument and
         // the rest shift down. amd64 rarely needs more than five args this way,
         // so the sixth is dropped (documented limitation).
