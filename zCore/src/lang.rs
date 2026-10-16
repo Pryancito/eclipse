@@ -772,6 +772,16 @@ fn dl_paint() {
             " ({} timeouts, {} retries since boot)",
             timeouts, retries
         );
+        // What the instant above cannot say: whether the eight seconds the
+        // waiter has just spent were the disk working or the CPU. A holder
+        // that was never waiting on the disk leaves this near zero.
+        let (busy_us, done) = kernel_hal::drivers::disk_busy_over_last(8);
+        let _ = write!(
+            b,
+            "\nDISK: busy {} ms of the last 8 s over {} commands",
+            busy_us / 1000,
+            done
+        );
     }
     // Everything above was allowed to be cut; what follows is not. The verdict
     // is the line a reader acts on, so it gets the bytes held back for it.
