@@ -987,6 +987,34 @@ pub(super) const fn vm_bind_pte_kind(flags: u32) -> u32 {
     flags & VM_BIND_PTE_KIND_MASK
 }
 
+/// `tu102_mmu_kind` (`nvkm/subdev/mmu/tu102.c`): the MMU's kind table on
+/// Turing, indexed by the kind byte of a `tile_flags`. An entry equal to the
+/// table's invalid kind (0x07) is a kind the MMU does not have, and so is
+/// any kind past the table (`nvif_mmu_kind_valid`); `nouveau_bo_alloc`
+/// answers EINVAL to either before the object exists. 0x08..=0x0e are the
+/// compressible kinds, which the table maps to their uncompressed pair.
+pub(super) const TU102_MMU_KIND: [u8; 16] = [
+    0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, // 0x00
+    0x06, 0x06, 0x02, 0x01, 0x03, 0x04, 0x05, 0x07,
+];
+pub(super) const TU102_MMU_KIND_INVALID: u8 = 0x07;
+
+/// `nvif_mmu_kind_valid` against [`TU102_MMU_KIND`]: kind 0 is always
+/// fine; any other must be in the table and not its invalid entry.
+#[inline]
+pub(super) const fn mmu_kind_valid(kind: u32) -> bool {
+    kind == 0
+        || ((kind as usize) < TU102_MMU_KIND.len()
+            && TU102_MMU_KIND[kind as usize] != TU102_MMU_KIND_INVALID)
+}
+
+/// The kind byte of a `tile_flags` (`(tile_flags & 0x0000ff00) >> 8`,
+/// Fermi and later).
+#[inline]
+pub(super) const fn tile_flags_kind(tile_flags: u32) -> u32 {
+    (tile_flags >> 8) & 0xff
+}
+
 #[inline]
 pub(super) const fn pte_kind_is_supported(kind: u32) -> bool {
     // The Turing UNCOMPRESSED kind set (tu102 dev_mmu.h): PITCH (0x00), the
@@ -2586,6 +2614,29 @@ mod gl_client_abi_tests {
     /// still choose another kind --- refusing it at `VM_BIND` instead left the
     /// surface unmapped and hung the channel on the first draw that used it,
     /// with no MMU fault to point at it (seen on the RTX with kind `0x01`).
+    /// `nvif_mmu_kind_valid` on the Turing table: 0x00..=0x06 and the
+    /// compressible 0x08..=0x0e exist, 0x07 and 0x0f are the table's
+    /// invalid entries, and nothing past the 16 entries does. The kind is
+    /// the second byte of `tile_flags`.
+    #[test]
+    fn the_turing_mmu_kind_table_says_which_kinds_exist() {
+        for kind in (0x00u32..=0x06).chain(0x08..=0x0e) {
+            assert!(mmu_kind_valid(kind), "kind {:#04x} is in the table", kind);
+        }
+        assert!(!mmu_kind_valid(0x07), "0x07 is the invalid entry");
+        assert!(!mmu_kind_valid(0x0f), "0x0f maps to the invalid entry");
+        for kind in 0x10u32..=0xff {
+            assert!(
+                !mmu_kind_valid(kind),
+                "kind {:#04x} is past the table",
+                kind
+            );
+        }
+        assert_eq!(tile_flags_kind(0x0000_0600), 0x06);
+        assert_eq!(tile_flags_kind(0x00ff_07ff), 0x07, "the second byte only");
+        assert_eq!(tile_flags_kind(0), 0);
+    }
+
     #[test]
     fn the_supported_tile_kinds_are_exactly_the_uncompressed_turing_set() {
         for kind in 0x00u32..=0x06 {

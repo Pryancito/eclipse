@@ -456,6 +456,19 @@ static PENDING_COUNT: AtomicUsize = AtomicUsize::new(0);
 /// needs no bookkeeping here.
 static ANY_LINKS: AtomicBool = AtomicBool::new(false);
 
+/// Empties the table and the two mirrors outside it, for
+/// `crate::test_globals::LOCK`: every test starts from no objects, no
+/// pending hardware fence and no link.
+#[cfg(test)]
+pub(crate) fn reset_for_tests() {
+    let mut table = TABLE.lock();
+    table.objects.clear();
+    table.pending.clear();
+    table.errored.clear();
+    PENDING_COUNT.store(0, Ordering::Relaxed);
+    ANY_LINKS.store(false, Ordering::Relaxed);
+}
+
 /// Times [`resolve_links_locked`] got PAST [`ANY_LINKS`] and walked the object
 /// list. The seam sits below what the tests check -- the walk still happens,
 /// it is only counted -- so a test can tell "the fast path held" from "the
@@ -2466,7 +2479,7 @@ mod tests {
     /// `links_now() == 0` here, `resv::count` of a closed buffer there,
     /// five failures in a bundle one run in three. Each test takes the one
     /// lock once, so there is no order to invert.
-    fn test_lock() -> lock::MutexGuard<'static, ()> {
+    fn test_lock() -> crate::test_globals::Guard {
         crate::test_globals::LOCK.lock()
     }
 

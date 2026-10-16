@@ -51,6 +51,16 @@ fn getparam(gpu: &NvidiaGpu, param: u64) -> Result<u64, i32> {
 }
 
 fn gem_new(gpu: &NvidiaGpu, size: u64, domain: u32, pid: u64) -> Result<usize, i32> {
+    gem_new_tiled(gpu, size, domain, 0, pid)
+}
+
+fn gem_new_tiled(
+    gpu: &NvidiaGpu,
+    size: u64,
+    domain: u32,
+    tile_flags: u32,
+    pid: u64,
+) -> Result<usize, i32> {
     let mut r = nv::DrmNouveauGemNew {
         info: nv::DrmNouveauGemInfo {
             handle: 0,
@@ -59,12 +69,58 @@ fn gem_new(gpu: &NvidiaGpu, size: u64, domain: u32, pid: u64) -> Result<usize, i
             offset: 0,
             map_handle: 0,
             tile_mode: 0,
-            tile_flags: 0,
+            tile_flags,
         },
         channel_hint: 0,
         align: 0,
     };
     call(gpu, wr::<nv::DrmNouveauGemNew>(nv::NR_GEM_NEW), &mut r, pid)
+}
+
+/// `nouveau_bo_alloc` refuses a `tile_flags` kind the MMU does not have
+/// (EINVAL, `nvif_mmu_kind_valid`) before anything is allocated: 0x07
+/// and 0x0f, the invalid entries of the Turing table, and any kind past
+/// it. A kind in the table, compressible or not, goes on to the RM
+/// (ENODEV here, where there is none) as before. This accepted any
+/// byte. The size is looked at first, as there.
+#[test]
+fn gem_new_refuses_a_tile_kind_the_mmu_does_not_have_before_the_rm() {
+    let _g = LOCK.lock();
+    let _live = LiveBytes::hold();
+    let gpu = gpu();
+    let gart = nv::NOUVEAU_GEM_DOMAIN_GART;
+    let next = gpu.nouveau_gem_next_handle.load(Ordering::Relaxed);
+    for kind in [0x07u32, 0x0f, 0x10, 0x80, 0xff] {
+        assert_eq!(
+            gem_new_tiled(&gpu, 4096, gart, kind << 8, A),
+            Err(nv::EINVAL),
+            "kind {:#04x} is not in the Turing MMU kind table",
+            kind
+        );
+    }
+    assert_eq!(
+        gpu.nouveau_gem_next_handle.load(Ordering::Relaxed),
+        next,
+        "a refused kind burnt a handle"
+    );
+    for kind in [0x00u32, 0x01, 0x06, 0x08, 0x0e] {
+        assert_eq!(
+            gem_new_tiled(&gpu, 4096, gart, kind << 8, A),
+            Err(nv::ENODEV),
+            "kind {:#04x} is in the table and must reach the RM",
+            kind
+        );
+    }
+    // The other bits of `tile_flags` are not the kind.
+    assert_eq!(
+        gem_new_tiled(&gpu, 4096, gart, 0x00ff_06ff, A),
+        Err(nv::ENODEV)
+    );
+    assert_eq!(
+        gem_new_tiled(&gpu, 0, gart, 0x0700, A),
+        Err(nv::EINVAL),
+        "size first"
+    );
 }
 
 fn gem_info(gpu: &NvidiaGpu, handle: u32, pid: u64) -> Result<nv::DrmNouveauGemInfo, i32> {

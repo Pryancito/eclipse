@@ -76,7 +76,34 @@ pub mod sync;
 /// run in three (CI's `--test-threads=1` never sees it).
 #[cfg(test)]
 pub(crate) mod test_globals {
-    pub(crate) static LOCK: lock::Mutex<()> = lock::Mutex::new(());
+    // The one lock every test that touches the crate's global tables
+    // takes: the syncobj `TABLE`, the GEM mapping registry, the
+    // reservations, the surfaceflip counters. Taking it also EMPTIES those
+    // tables: a test that left an object or a mapping behind (a `create`
+    // without its `destroy`, a GEM handle never closed) used to poison
+    // whichever test took the lock next, and which one that was depended
+    // on the thread interleaving, so the resv + syncobj cascade came and
+    // went between runs of the same tree. Every test builds its own state
+    // after taking the lock, so starting from empty tables costs none of
+    // them anything, and a leak stays the leaking test's problem alone.
+    static INNER: lock::Mutex<()> = lock::Mutex::new(());
+
+    pub(crate) struct TestLock;
+
+    pub(crate) static LOCK: TestLock = TestLock;
+
+    /// Held for the test's whole body; the tables are not touched on release.
+    pub(crate) struct Guard(#[allow(dead_code)] lock::MutexGuard<'static, ()>);
+
+    impl TestLock {
+        pub(crate) fn lock(&self) -> Guard {
+            let g = INNER.lock();
+            crate::scheme::syncobj::reset_for_tests();
+            crate::scheme::gem_mmap::reset_for_tests();
+            crate::scheme::resv::reset_for_tests();
+            Guard(g)
+        }
+    }
 }
 pub mod uart;
 pub mod utils;
