@@ -14501,12 +14501,26 @@ impl NvidiaGpu {
             nv::NR_GEM_PUSHBUF => {
                 // The submission path of the classic **nvc0 Gallium** driver
                 // (Mesa OpenGL for Turing) -- the one the shipped image uses.
-                // Real submission is a hardware-validated follow-up (it needs
-                // GART-domain GEM, the 3D class bound to the channel, and
-                // relocation handling), so this milestone PARSES and LOGS the
-                // whole request, then honestly returns EOPNOTSUPP. The dump is
-                // the anatomy needed to build real submission: how many buffers
-                // (and their domains), relocs, and pushes Mesa hands us per call.
+                // Real submission is a hardware-validated follow-up, so this
+                // milestone PARSES and LOGS the whole request, then honestly
+                // returns EOPNOTSUPP. The dump is the anatomy needed to build
+                // real submission: how many buffers (and their domains),
+                // relocs, and pushes Mesa hands us per call.
+                //
+                // What it still needs is TWO things, not the three this
+                // comment used to list: each listed BO mapped into the
+                // channel's GPU VAS so a push has a VA (the `eclipse_rm_vm_bind_map`
+                // mechanic, driven from here instead of from VM_BIND), and
+                // reloc resolution to patch those VAs into the pushbuffer
+                // words. The ring submission itself already exists
+                // (`eclipse_rm_exec_submit`, which EXEC drives). **The 3D
+                // class is NOT missing**: `eclipse_rm_init.c` allocates
+                // TURING_A (0xc597) on every channel it builds -- step17's
+                // stage 7b for the ctx-0 fallback channel and ctx_alloc's
+                // stage 10b for each per-process context -- because a channel
+                // without a graphics object wedges FECS mid-RESTORE on the
+                // first 3D SET_OBJECT. Listing it as a blocker here sent an
+                // audit of whether Eclipse has hardware 3D down the wrong path.
                 let pb = unsafe { &mut *(arg as *mut nv::DrmNouveauGemPushbuf) };
                 // What `nouveau_gem_ioctl_pushbuf` checks before it submits
                 // anything, in its order: a client with a uvmm (`VM_INIT`)
