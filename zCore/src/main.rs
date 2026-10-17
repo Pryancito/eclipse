@@ -910,6 +910,18 @@ fn primary_main(config: kernel_hal::KernelConfig) {
                     "Eclipse: nvidia.console_gsp -- console GPU GSP on-demand bring-up ENABLED"
                 );
             }
+            // A VRAM GEM_NEW object gets a CPU mapping through BAR1 instead of
+            // coming back with map_handle=0. Default off because it publishes a
+            // host address derived from BAR1's base plus the object's FBMEM
+            // offset, and that arithmetic assumes BAR1 is a linear window onto
+            // VRAM at offset 0 -- true of TU10x in the RM's default setup, not
+            // verified on every board.
+            if kernel_hal::cmdline::flag(&options.cmdline, "nvidia.gem_vram_bar1") {
+                kernel_hal::drivers::set_gem_vram_bar1_enabled(true);
+                klog_info!(
+                    "Eclipse: nvidia.gem_vram_bar1 -- VRAM GEM objects CPU-mapped through BAR1"
+                );
+            }
             kernel_hal::console::early_progress_bar(95);
 
             // Whose exit takes the system down: INIT (PID 1) if present, else

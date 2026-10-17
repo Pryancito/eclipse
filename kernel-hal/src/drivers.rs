@@ -364,6 +364,16 @@ pub fn set_nouveau_uapi_enabled(v: bool) {
     zcore_drivers::display::set_nouveau_uapi_enabled(v);
 }
 
+/// Lets a VRAM `GEM_NEW` object be CPU-mapped through the BAR1 aperture
+/// (`nvidia.gem_vram_bar1`). Default off: see
+/// `drivers/src/display/nvidia/vram_bar1.rs`.
+#[cfg(target_arch = "x86_64")]
+pub fn set_gem_vram_bar1_enabled(v: bool) {
+    zcore_drivers::display::set_gem_vram_bar1_enabled(v);
+}
+#[cfg(not(target_arch = "x86_64"))]
+pub fn set_gem_vram_bar1_enabled(_v: bool) {}
+
 /// Enables on-demand console-GPU GSP bring-up (`nvidia.console_gsp`). Default off.
 #[cfg(target_arch = "x86_64")]
 pub fn set_console_gsp_enabled(v: bool) {
