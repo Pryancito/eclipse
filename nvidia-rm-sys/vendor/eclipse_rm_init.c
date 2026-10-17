@@ -8503,9 +8503,21 @@ NV_STATUS eclipse_rm_vm_bind_map(NvU32 gpuInstance, NvU32 ctxIdx, NvU32 hMemory,
      * garbage" split: depth surfaces ask for the UNCOMPRESSED Z kinds
      * (Z16=0x01, S8Z24=0x03), which the Rust layer misclassified as
      * "compressed" and silently stripped to the generic kind. A genuinely
-     * COMPRESSIBLE kind (0x8..0xF -- this driver has no comptag allocator) is
-     * converted to its uncompressed pair by the RM's own HAL
-     * (memmgrGetUncompressedKind_TU102): correct bytes, no comptags needed.
+     * COMPRESSIBLE kind (0x8..0xF) is converted to its uncompressed pair by
+     * the RM's own HAL (memmgrGetUncompressedKind_TU102): correct bytes, no
+     * comptags programmed.
+     *
+     * That downgrade is a CHOICE, not a limitation, and this is the one place
+     * that makes it. On Turing there is no comptag allocator to lack: the line
+     * is a slice of the surface's physical address
+     * (memmgrDetermineComptag_TU102 = 1 + physAddr[35:16]), and if a
+     * compressible kind reached memdescSetPteKind unchanged, the Map below
+     * would reach kgmmuFieldSetKindCompTags, which derives the line itself via
+     * bPhysBasedComptags. What stops it is the allocation preconditions
+     * (scrub-on-free, a 64 KiB page in VRAM, one of the two one-to-one modes)
+     * and the fact that getting a kind wrong here does not return an error --
+     * it hands the engine someone else's compression state. The long version
+     * is at pte_kind_is_supported in drivers/src/display/nouveau_uapi.rs.
      * PITCH (0) keeps the memdesc default -- nothing to program.
      *
      * The memdesc is the GEM object's: the kind sticks for later maps of the

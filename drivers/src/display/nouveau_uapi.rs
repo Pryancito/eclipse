@@ -493,8 +493,9 @@ pub(super) fn record_ioctl_err(pid: u64, request: u32, errno: i32) {
 // this driver's own shortcuts create, and survives the client's exit so the
 // terminal user runs the app, then `cat /proc/gpudbg` reads the verdict:
 //
-//  * Compressed PTE kind in play. Sysmem-backed BOs here have no
-//    comptag/compression support, so only pitch (0x00) and generic-uncompressed
+//  * Compressed PTE kind in play. A sysmem-backed BO has no comptag line at
+//    all -- compression lives in the L2 tag store -- so only pitch (0x00) and
+//    generic-uncompressed
 //    (0x06) are byte-exact. GEM_NEW rejects a compressed kind that arrives as an
 //    explicit `tile_flags` at allocation time; but a kind that reaches VM_BIND
 //    is MAPPED UNCOMPRESSED (refusing it there hangs the channel -- see
@@ -739,8 +740,9 @@ pub(super) fn format_client_mem() -> alloc::string::String {
     );
     // Distinct PTE kinds seen. 0x00 (pitch) and 0x06 (generic) are byte-exact
     // for this driver's sysmem-backed BOs; ANY other value needs comptags we do
-    // not program -- rejected at GEM_NEW when requested via tile_flags, else
-    // mapped uncompressed at VM_BIND (a hang-free but byte-inexact fallback).
+    // not program YET -- rejected at GEM_NEW when requested via tile_flags,
+    // else mapped uncompressed at VM_BIND (a hang-free but byte-inexact
+    // fallback). "Yet", not "cannot": see `pte_kind_is_supported`.
     let mut kinds = alloc::string::String::new();
     for k in 0u32..256 {
         if KINDS_SEEN[(k >> 6) as usize].load(Ordering::Relaxed) & (1u64 << (k & 63)) != 0 {
@@ -1103,8 +1105,33 @@ pub(super) const fn pte_kind_is_supported(kind: u32) -> bool {
     // Z/S family Z16/S8/S8Z24/ZF32_X24S8/Z24S8 (0x01..0x05) and
     // GENERIC_MEMORY (0x06). All of these are programmed into the PTEs
     // verbatim -- none needs comptags. 0x07 is INVALID and 0x08..0x0F are the
-    // COMPRESSIBLE kinds (handled separately: converted to their uncompressed
-    // pair, since this driver has no comptag allocator).
+    // COMPRESSIBLE kinds, handled separately: converted to their uncompressed
+    // pair, because this driver does not program comptags YET.
+    //
+    // "Yet", and not "has no comptag allocator", which is what this said and
+    // several other places still said until this was checked. On Turing there
+    // is no comptag allocator to lack -- the line is not allocated from a pool,
+    // it is a slice of the surface's own physical address. The RM's Turing HAL
+    // is one line, `memmgrDetermineComptag_TU102`:
+    //
+    //     1 + DRF_VAL64(_MMU, _PTE_COMPTAGLINE, _BITS_FROM_SPA, physAddr)
+    //
+    // with `NV_MMU_PTE_COMPTAGLINE_BITS_FROM_SPA` = `35:16` (tu102
+    // `dev_fb_addendum.h`), i.e. `1 + ((pa >> 16) & 0xF_FFFF)`. Nothing to
+    // allocate, account for or free; `kmemsysAllocComprResources` on this path
+    // allocates no tags either. That `>> 16` is also why a compressed surface
+    // needs a 64 KiB page rather than a 4 KiB one: one line covers 64 KiB.
+    //
+    // What is actually missing is three things, none of them an allocator:
+    // `eclipse_rm_vm_bind_map` downgrades the kind before the map (so the RM
+    // never reaches `kgmmuFieldSetKindCompTags`, which would derive the line
+    // itself via `bPhysBasedComptags`); the GPU has to be in one of the two
+    // one-to-one comptag modes with scrub-on-free on and, for one-to-one,
+    // `memmgrUseVasForCeMemoryOps`; and the surface has to have been allocated
+    // compressible in VRAM. The reason none of that is done here is that a
+    // wrong kind does not return an error -- it hands the engine another
+    // surface's compression state, and mishandling kinds here has already hung
+    // the channel on the first draw with no MMU fault to point at.
     kind <= PTE_KIND_GENERIC
 }
 
@@ -2709,8 +2736,9 @@ mod gl_client_abi_tests {
     /// (PITCH, the Z/S family Z16/S8/S8Z24/ZF32_X24S8/Z24S8, and
     /// GENERIC_MEMORY, per tu102's `dev_mmu.h`): all of those go into the PTEs
     /// verbatim and need no compression tags. `0x07` is INVALID and
-    /// `0x08..=0x0f` are the COMPRESSIBLE kinds, which this driver cannot
-    /// program because it has no comptag allocator.
+    /// `0x08..=0x0f` are the COMPRESSIBLE kinds, which this driver does not
+    /// program yet -- see `pte_kind_is_supported` for why "no comptag
+    /// allocator" is the wrong reason.
     ///
     /// Where the line is drawn matters in both directions. Too strict and a
     /// depth surface NVK is entitled to allocate gets refused; too loose and a
@@ -2870,7 +2898,8 @@ mod gl_client_abi_tests {
         for kind in 0x08u32..=0xff {
             assert!(
                 !pte_kind_is_supported(kind),
-                "tile kind {:#04x} needs comptags, which this driver has none of",
+                "tile kind {:#04x} needs comptags, which this driver does not \
+                 program yet",
                 kind,
             );
         }

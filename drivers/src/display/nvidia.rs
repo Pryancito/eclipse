@@ -8773,9 +8773,15 @@ impl NvidiaGpu {
         //  * 0x08..=0x0F -- the COMPRESSIBLE kinds -- are passed through and
         //    converted to their uncompressed pair by the RM's own HAL
         //    (memmgrGetUncompressedKind_TU102) on the C side: correct bytes,
-        //    no comptags needed (this driver has no comptag allocator), and
-        //    the Z/S identity of the kind is PRESERVED (Z16_COMPRESSIBLE ->
-        //    Z16), unlike the old blanket generic downgrade.
+        //    no comptags programmed, and the Z/S identity of the kind is
+        //    PRESERVED (Z16_COMPRESSIBLE -> Z16), unlike the old blanket
+        //    generic downgrade. The reason is NOT that a comptag allocator is
+        //    missing -- on Turing there is none to have, because the comptag
+        //    line is a slice of the surface's physical address rather than
+        //    something allocated (`memmgrDetermineComptag_TU102` =
+        //    `1 + physAddr[35:16]`). See `pte_kind_is_supported` in
+        //    `nouveau_uapi.rs` for the derivation and the three things that
+        //    are actually missing.
         //  * anything else (0x07 = INVALID, or out of table) -- mapped with
         //    the RM default (pitch/generic), loudly.
         //
@@ -14123,9 +14129,11 @@ impl NvidiaGpu {
                 // nothing and risked failing a LIVE GPU client's allocation
                 // (a compositor surface such as lunarbg's wallpaper) that today
                 // renders fine mapped-uncompressed. A compressed kind is still
-                // mapped uncompressed at VM_BIND (the anti-hang fallback); the
-                // real fix for a genuinely-compressed surface is comptag/PLC
-                // support. `record_gem_new` still notes the kind for
+                // mapped uncompressed at VM_BIND (the anti-hang fallback);
+                // honouring it means letting the RM derive the comptag line
+                // from the physical address, which needs no allocator -- see
+                // `pte_kind_is_supported` in `nouveau_uapi.rs`.
+                // `record_gem_new` still notes the kind for
                 // /proc/gpudbg.
                 // Honour VRAM-only as true LOCAL (`NV01_MEMORY_LOCAL_USER`).
                 // GART, or GART|VRAM (NVK DEVICE_LOCAL|HOST_VISIBLE maps to
