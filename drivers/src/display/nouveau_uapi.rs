@@ -14,30 +14,33 @@
 //! `linux-object/src/fs/devfs/drm.rs` reimplements the generic DRM/KMS UAPI
 //! (see `docs/README-drm.md`).
 //!
-//! # Scope of THIS milestone -- read before extending
+//! # Scope -- read before extending
 //!
-//! This was written in a sandbox with no NVIDIA GPU, no `/dev/kvm`, and no
-//! QEMU at all -- nothing here has run against real hardware. To keep that
-//! honest, every operation either:
-//!   (a) reuses an already hardware-exercised entry point verbatim
-//!       (`nvidia_rm_sys::rm_init::step16`/`step17`, the same calls
-//!       `/proc/gpustep16`/`gpustep17` make), or
-//!   (b) is pure bookkeeping with no hardware/register access at all
-//!       (the GEM handle table, the VRAM bitmap allocator -- which already
-//!       existed as dead code, see `NvidiaVramAllocator`), or
-//!   (c) is explicitly refused with `EOPNOTSUPP`/`ENOSYS` and a log line,
-//!       never silently faked.
+//! `docs/README-nouveau-uapi.md` carries the ioctl-by-ioctl status table and
+//! is the authority; this is the summary. The original milestone was written
+//! in a sandbox with no NVIDIA GPU, so every operation still either reuses an
+//! already hardware-exercised entry point, is pure bookkeeping with no
+//! hardware access, or is refused with `EOPNOTSUPP`/`ENOSYS` and a log line --
+//! never silently faked.
 //!
-//! Concretely implemented: GETPARAM, CHANNEL_ALLOC/FREE (exactly one
-//! channel, backed by the existing step16+step17 ladder), GEM_NEW/INFO/
-//! CPU_PREP/CPU_FINI (VRAM domain only), VM_INIT. Deliberately refused with
-//! `EOPNOTSUPP`: VM_BIND, EXEC -- submitting an arbitrary, Mesa-built
-//! command buffer needs a new general-purpose submission path in
-//! `nvidia-rm-sys` (today's `step18`/`step19` submit one hardcoded,
-//! hand-authored kernel each, not arbitrary content) and a real GPU-VA
-//! binding path. That is real, scoped follow-up work, not something to fake
-//! here. See `docs/README-nouveau-uapi.md` for the full ioctl-by-ioctl
-//! status table and what to test first on real hardware.
+//! Implemented against the RM: GETPARAM; CHANNEL_ALLOC/FREE (a GPU context
+//! **per client process**, `ensure_ctx_for_pid`, not the single step16+step17
+//! channel this module started with); GEM_NEW/INFO/CPU_PREP/CPU_FINI (VRAM and
+//! GART accepted, both backed by CPU-visible sysmem -- real VRAM is not
+//! CPU-mappable without a BAR1 path); VM_INIT; and the submission uAPI NVK
+//! actually uses, **VM_BIND and EXEC**, through `eclipse_rm_vm_bind_map`/
+//! `eclipse_rm_exec_submit` in `nvidia-rm-sys/vendor/eclipse_rm_init.c`, which
+//! generalise `step17`'s VA-reserve-and-map and `step18`'s GP-entry ring
+//! mechanics to a caller-chosen handle, address and pushbuffer.
+//!
+//! Still refused, each for a reason the table gives: `GEM_PUSHBUF` -- the
+//! ioctl the classic nvc0 Gallium driver submits OpenGL through -- validates
+//! and dumps the request and then answers `EOPNOTSUPP`, because real
+//! submission needs the 3D class (`TURING_A` 0xc597) bound to the channel
+//! (`CHANNEL_ALLOC` binds the compute class 0xc5c0 today), GART-domain GEM,
+//! and reloc resolution. `SVM_INIT`/`SVM_BIND` are out of scope, and
+//! `GET_ZCULL_INFO` answers `ENOSYS` by design. So hardware GL arrives as
+//! zink-on-NVK (GL on Vulkan), not through nvc0.
 //!
 //! Entirely opt-in via `nvidia.nouveau_uapi` on the kernel cmdline
 //! (`set_enabled`, called from `zCore/src/main.rs`). Disabled by default:
@@ -1211,7 +1214,7 @@ pub(super) const NOUVEAU_GART_AVAILABLE: u64 = 1 << 49;
 pub(super) const NOUVEAU_VA_SPACE_END: u64 = 1 << 47;
 
 #[repr(C)]
-#[allow(dead_code)] // fields read for validation only in this milestone (VM_BIND itself is EOPNOTSUPP)
+#[allow(dead_code)] // not every field is read: `addr`/`range`/`handle`/`bo_offset` drive the map, the rest is validated
 pub(super) struct DrmNouveauVmBindOp {
     pub op: u32,
     pub flags: u32,
