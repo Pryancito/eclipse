@@ -64,6 +64,72 @@ fn patch_ksyms(kernel_elf: &Path) {
     }
 }
 
+/// Where the stripped copy goes: beside the kernel, like the `zcore.bin` that
+/// `BuildConfig::bin` writes.
+///
+/// It must never come out equal to its input. objcopy with the same path for
+/// input and output truncates the file it is reading, so the build tree's own
+/// kernel -- the one the addr2line crash-hunt workflow needs, and the one
+/// `zCore/Makefile` strips its own ESP copy from afterwards -- would be
+/// destroyed by the image build, which is not a failure that announces itself.
+fn esp_kernel_path(kernel_elf: &Path) -> std::path::PathBuf {
+    kernel_elf.with_extension("esp.elf")
+}
+
+/// Strips debug info off a copy of the kernel for the ESP the installer writes
+/// to disk, returning the path to copy into `efi.img`.
+///
+/// `zCore/Makefile` already does this for the ESP the ISO boots from, and says
+/// why: rboot reads the WHOLE kernel file through the UEFI FAT driver at
+/// 50-200 MB/s, so the debug info is not free weight sitting on disk, it is
+/// read on every boot. On the current tree the installed kernel is 192 MB of
+/// which 163 MiB is `.debug_*` -- between 1 and 4 seconds of every boot of the
+/// installed system, forever, to load bytes nothing on that machine reads.
+///
+/// `--strip-debug`, not `--strip-all`: it keeps `.symtab`, and it keeps the
+/// `.ksyms` table `patch_ksyms` just wrote, so a crash report on the installed
+/// system still names functions. What goes is DWARF -- line numbers and
+/// variables for a debugger, which needs the full ELF from the build tree
+/// anyway, and that one stays untouched at `target/x86_64/release/zcore`.
+///
+/// Returns the unstripped path when no objcopy is available: the same
+/// fallback, and the same notice, as the Makefile's.
+fn strip_kernel_for_esp(kernel_elf: &Path) -> std::path::PathBuf {
+    let stripped = esp_kernel_path(kernel_elf);
+    for tool in ["rust-objcopy", "objcopy"] {
+        let status = std::process::Command::new(tool)
+            .arg("--strip-debug")
+            .arg(kernel_elf)
+            .arg(&stripped)
+            .status();
+        match status {
+            Ok(s) if s.success() => {
+                println!(
+                    "Stripped kernel for the installed ESP with {tool}: {} -> {} MiB",
+                    fs::metadata(kernel_elf)
+                        .map(|m| m.len() / (1024 * 1024))
+                        .unwrap_or(0),
+                    fs::metadata(&stripped)
+                        .map(|m| m.len() / (1024 * 1024))
+                        .unwrap_or(0),
+                );
+                return stripped;
+            }
+            // Tool present but unhappy: say so and try the next one. A
+            // half-written output would be worse than the fat ELF.
+            Ok(s) => {
+                let _ = fs::remove_file(&stripped);
+                eprintln!("warning: {tool} --strip-debug exited with {s}");
+            }
+            Err(_) => {}
+        }
+    }
+    eprintln!(
+        "warning: no objcopy found; the installed ESP gets the unstripped kernel (slower rboot load on every boot)"
+    );
+    kernel_elf.to_path_buf()
+}
+
 /// Filesystem of the installed system's ROOT and HOME images: EclipseFS
 /// unless the build is run with `ECLIPSE_ROOTFS_FS=btrfs`. Its name is also the
 /// payloads' extension (`rootfs.btrfs.gz`, `rootfs.eclipsefs.gz`) and the
@@ -517,7 +583,10 @@ impl super::LinuxRootfs {
 
             let rboot_efi = rboot_dir.join("target/x86_64-unknown-uefi/release/rboot.efi");
             let rboot_conf = PROJECT_DIR.join("zCore/rboot.conf");
-            let zcore_elf = PROJECT_DIR.join("target/x86_64/release/zcore");
+            // The STRIPPED copy goes on the installed ESP; the full ELF stays
+            // in the build tree for addr2line. Sized and copied from here on,
+            // so `efi_fat_size_for` below measures what actually gets written.
+            let zcore_elf = strip_kernel_for_esp(&PROJECT_DIR.join("target/x86_64/release/zcore"));
 
             // 4. Build efi.img (FAT32)
             let initramfs_len = fs::metadata(&initramfs_img).unwrap().len();
@@ -997,6 +1066,34 @@ mod image_size_tests {
             qemu_live_image_size(payload) as u64,
             payload + payload / 8 + 256 * MIB
         );
+    }
+
+    /// objcopy reading and writing one path truncates it, so the stripped copy
+    /// must land somewhere else than the kernel it is made from. If these ever
+    /// came out equal, `cargo image` would strip the build tree's kernel in
+    /// place and take the full-ELF addr2line workflow with it, silently.
+    #[test]
+    fn the_stripped_esp_kernel_never_lands_on_the_kernel_it_came_from() {
+        for input in [
+            "target/x86_64/release/zcore",
+            "/abs/target/x86_64/release/zcore",
+            "zcore.elf",
+            "weird.name.zcore",
+        ] {
+            let input = std::path::Path::new(input);
+            let out = super::esp_kernel_path(input);
+            assert_ne!(
+                out,
+                input,
+                "esp_kernel_path({}) returned its own input; objcopy would truncate it",
+                input.display()
+            );
+            assert_eq!(
+                out.parent(),
+                input.parent(),
+                "the stripped copy belongs beside the kernel"
+            );
+        }
     }
 
     /// `patch_ksyms` degrades to a warning when the script is not there, which
