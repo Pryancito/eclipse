@@ -28,6 +28,42 @@ fn efi_fat_size_for(initramfs_bytes: u64, zcore_bytes: u64, boot_bytes: u64) -> 
     EFI_PARTITION_BYTES
 }
 
+/// Runs `tools/gen_ksyms.py` over a freshly linked kernel so its reserved
+/// `.ksyms` section carries the real symbol table instead of the 0xff filler
+/// the linker leaves there.
+///
+/// The script patches the section in place -- the reservation is fixed-size, so
+/// nothing shifts and no relink is needed -- and is deliberately best-effort:
+/// it exits 0 with a warning when `nm`/`objcopy` are missing or the kernel has
+/// no `.ksyms` reservation. A kernel without the table still boots and still
+/// reports; it just prints bare addresses. So a failure here is reported and
+/// the image build carries on, which is also what `zCore/Makefile` does with
+/// its `|| true`.
+fn patch_ksyms(kernel_elf: &Path) {
+    let script = PROJECT_DIR.join("tools/gen_ksyms.py");
+    if !script.is_file() {
+        eprintln!(
+            "warning: {} is missing; the installed ESP's kernel keeps bare addresses in crash reports",
+            script.display()
+        );
+        return;
+    }
+    println!("Patching .ksyms into {}...", kernel_elf.display());
+    match std::process::Command::new("python3")
+        .arg(&script)
+        .arg(kernel_elf)
+        .status()
+    {
+        Ok(s) if s.success() => {}
+        Ok(s) => eprintln!(
+            "warning: gen_ksyms.py exited with {s}; the installed ESP's kernel keeps bare addresses in crash reports"
+        ),
+        Err(e) => eprintln!(
+            "warning: could not run gen_ksyms.py ({e}); the installed ESP's kernel keeps bare addresses in crash reports"
+        ),
+    }
+}
+
 /// Filesystem of the installed system's ROOT and HOME images: EclipseFS
 /// unless the build is run with `ECLIPSE_ROOTFS_FS=btrfs`. Its name is also the
 /// payloads' extension (`rootfs.btrfs.gz`, `rootfs.eclipsefs.gz`) and the
@@ -445,6 +481,26 @@ impl super::LinuxRootfs {
                 debug: false,
             });
             build_config.invoke(os_xtask_utils::Cargo::build);
+
+            // Patch the in-kernel symbol table into the image we are about to
+            // bake into `efi.img`, the ESP the installer writes to disk.
+            //
+            // `zCore/Makefile`'s own `kernel` target does this right after its
+            // `cargo build`, so the ISO's live kernel has the table. This build
+            // does not go through that target, and `make iso` runs `image`
+            // BEFORE `esp-for-variant`: the bytes copied into `efi.img` below
+            // were the ones cargo had just linked, with `.ksyms` still at its
+            // 0xff reservation filler. The installed system therefore booted a
+            // kernel whose crash reports printed bare addresses, while the
+            // live kernel on the same ISO named functions -- and nothing said
+            // so, because an unpatched kernel boots and reports perfectly, it
+            // just reports worse. Patch here too, before the copy.
+            //
+            // Best-effort, exactly like the Makefile's `|| true`: a missing
+            // python3 or a kernel without the `.ksyms` reservation must not
+            // fail the image build, which is why the script's own exit code
+            // is only reported, never asserted on.
+            patch_ksyms(&PROJECT_DIR.join("target/x86_64/release/zcore"));
 
             // 3. Bootstrap initramfs for the installed ESP. Snapshot NOW, while
             // live_root is still LIVE_KEEP + GSP only — no desktop, no LLVM,
@@ -940,6 +996,24 @@ mod image_size_tests {
         assert_eq!(
             qemu_live_image_size(payload) as u64,
             payload + payload / 8 + 256 * MIB
+        );
+    }
+
+    /// `patch_ksyms` degrades to a warning when the script is not there, which
+    /// is the right call at build time -- a kernel with no symbol table still
+    /// boots. But it means a rename or a move of `tools/gen_ksyms.py` would
+    /// quietly take the installed system's crash reports back to bare
+    /// addresses, with one warning line in a build log nobody reads. The path
+    /// is written out in two places (here and `zCore/Makefile`'s `kernel`
+    /// target), so pin it.
+    #[test]
+    fn the_ksyms_script_is_where_patch_ksyms_looks_for_it() {
+        let script = super::PROJECT_DIR.join("tools/gen_ksyms.py");
+        assert!(
+            script.is_file(),
+            "patch_ksyms() looks for {}, and without it the kernel baked into \
+             efi.img keeps bare addresses in its crash reports",
+            script.display()
         );
     }
 
