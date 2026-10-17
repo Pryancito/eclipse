@@ -215,6 +215,11 @@ mod gmmu;
 /// ceiling, no logic change.
 mod vram_alloc;
 
+/// CPU-mapping a VRAM `GEM_NEW` object through the BAR1 aperture: the
+/// arithmetic and the bounds check, own file for the size ceiling. The hatch
+/// is `nvidia.gem_vram_bar1`, default off.
+pub(super) mod vram_bar1;
+
 /// Implicit synchronisation: the dependency a submission has on work ANOTHER
 /// process still has in flight against a buffer it lent us. The nouveau uAPI
 /// `EXEC` carries only the syncobjs its client names, so without this a
@@ -14290,16 +14295,28 @@ impl NvidiaGpu {
                 } else {
                     None
                 };
-                // VRAM FBMEM offset (AT_GPU) for future CE/scanout; never
-                // published as a host PA (see gem_map_cpu FBMEM refusal).
-                // TODO: if AT_GPU lookup fails on some boards, this stays
-                // None and the VRAM GEM remains usable for VM_BIND/EXEC
-                // without scanout-by-offset.
+                // VRAM FBMEM offset (AT_GPU) for CE/scanout, and -- with
+                // `nvidia.gem_vram_bar1` -- for the object's CPU mapping. The
+                // offset itself is still never published as a host PA: BAR1's
+                // base is added to it and the result is bounds-checked against
+                // the aperture, which is what `vram_bar1` is for. If the AT_GPU
+                // lookup fails this stays None and the VRAM GEM remains usable
+                // for VM_BIND/EXEC without a CPU mapping or scanout-by-offset.
                 let vram_offset = if !sysmem {
                     nvidia_rm_sys::rm_init::gem_fbmem_offset(device_instance, alloc.h_memory).ok()
                 } else {
                     None
                 };
+                let phys_addr = phys_addr.or_else(|| {
+                    vram_bar1::cpu_mapping_for_vram_gem(
+                        sysmem,
+                        self.bar1_phys,
+                        self.info.fb_size as u64,
+                        vram_offset,
+                        size,
+                        handle,
+                    )
+                });
                 let map_handle = if let Some(pa) = phys_addr {
                     crate::scheme::gem_mmap::register(handle, pa, size, owner_pid);
                     (handle as u64) << 12
@@ -14501,12 +14518,26 @@ impl NvidiaGpu {
             nv::NR_GEM_PUSHBUF => {
                 // The submission path of the classic **nvc0 Gallium** driver
                 // (Mesa OpenGL for Turing) -- the one the shipped image uses.
-                // Real submission is a hardware-validated follow-up (it needs
-                // GART-domain GEM, the 3D class bound to the channel, and
-                // relocation handling), so this milestone PARSES and LOGS the
-                // whole request, then honestly returns EOPNOTSUPP. The dump is
-                // the anatomy needed to build real submission: how many buffers
-                // (and their domains), relocs, and pushes Mesa hands us per call.
+                // Real submission is a hardware-validated follow-up, so this
+                // milestone PARSES and LOGS the whole request, then honestly
+                // returns EOPNOTSUPP. The dump is the anatomy needed to build
+                // real submission: how many buffers (and their domains),
+                // relocs, and pushes Mesa hands us per call.
+                //
+                // What it still needs is TWO things, not the three this
+                // comment used to list: each listed BO mapped into the
+                // channel's GPU VAS so a push has a VA (the `eclipse_rm_vm_bind_map`
+                // mechanic, driven from here instead of from VM_BIND), and
+                // reloc resolution to patch those VAs into the pushbuffer
+                // words. The ring submission itself already exists
+                // (`eclipse_rm_exec_submit`, which EXEC drives). **The 3D
+                // class is NOT missing**: `eclipse_rm_init.c` allocates
+                // TURING_A (0xc597) on every channel it builds -- step17's
+                // stage 7b for the ctx-0 fallback channel and ctx_alloc's
+                // stage 10b for each per-process context -- because a channel
+                // without a graphics object wedges FECS mid-RESTORE on the
+                // first 3D SET_OBJECT. Listing it as a blocker here sent an
+                // audit of whether Eclipse has hardware 3D down the wrong path.
                 let pb = unsafe { &mut *(arg as *mut nv::DrmNouveauGemPushbuf) };
                 // What `nouveau_gem_ioctl_pushbuf` checks before it submits
                 // anything, in its order: a client with a uvmm (`VM_INIT`)
