@@ -1729,6 +1729,7 @@ impl DrmDev {
                 // set the vblank pacing to a fallback and answered done, and
                 // -1 was looked up as an fb id.
                 let mut fb_id = req.fb_id;
+                let mut active_area = None;
                 if req.mode_valid != 0 {
                     if fb_id == u32::MAX {
                         fb_id = drm::get_crtc(req.crtc_id).map_or(0, |c| c.fb_id);
@@ -1749,6 +1750,7 @@ impl DrmDev {
                     {
                         return Err(FsError::NoDeviceSpace);
                     }
+                    active_area = Some((w, h));
                 }
                 if req.count_connectors > 0 {
                     if req.mode_valid == 0 || fb_id == 0 {
@@ -1767,11 +1769,19 @@ impl DrmDev {
                         }
                     }
                 }
-                if req.mode_valid != 0 {
+                if let Some(area) = active_area {
                     drm::set_vblank_period_from_modeinfo(&req.mode);
                     if let Err(e) = drm::present_now_checked(fb_id, req.crtc_id, None) {
                         present_failed("SETCRTC", fb_id, req.crtc_id, e)?;
                     }
+                    // `__drm_atomic_helper_set_config`: the mode, ACTIVE and
+                    // the primary plane's rectangles are this call's to
+                    // write, and `GETCRTC`, `GETPLANE` and every atomic
+                    // property read them back. The ioctl has answered 0 by
+                    // here (a present failure the line above swallowed is
+                    // still a config the client was told is set), so the
+                    // readback agrees with the caller.
+                    drm::legacy_set_config(&req.mode, area, (req.x, req.y));
                 } else {
                     // `drm_mode_setcrtc` without a mode turns the pipe off
                     // (`set_config` with `.mode = NULL`), and only looks the
@@ -1791,6 +1801,12 @@ impl DrmDev {
                     drm::set_crtc_blanked(true);
                     drm::set_crtc_fb(req.crtc_id, 0);
                     drm::set_crtc_enabled(false);
+                    // And the atomic half of the same state: MODE_ID = 0 and
+                    // ACTIVE = 0 (`crtc_state->active = false` and the mode
+                    // set to NULL). Only the legacy flags went off, so an
+                    // atomic client starting after this read a mode and an
+                    // active CRTC the legacy readback said were gone.
+                    drm::legacy_pipe_off();
                 }
                 Ok(0)
             }
@@ -1986,6 +2002,15 @@ impl DrmDev {
                     if let Err(e) = drm::present_now_checked(req.fb_id, req.crtc_id, None) {
                         present_failed("SETPLANE", req.fb_id, req.crtc_id, e)?;
                     }
+                    // `drm_atomic_helper_update_plane`: the plane state is
+                    // the request's eight rectangles, which `GETCRTC` (x/y
+                    // from `src_x`/`src_y`) and the plane's properties read
+                    // back. Nothing was written, so the readback kept the
+                    // previous commit's rectangles.
+                    drm::legacy_update_plane(
+                        (req.crtc_x, req.crtc_y, req.crtc_w, req.crtc_h),
+                        (req.src_x, req.src_y, req.src_w, req.src_h),
+                    );
                 }
                 Ok(0)
             }
@@ -2657,8 +2682,10 @@ impl DrmDev {
                     // pipeline has) only while `crtc_state->enable` -- a
                     // CRTC that `SETCRTC` disabled or whose scanout fb was
                     // removed has neither, whatever the panel can do. DPMS
-                    // off keeps both. Compositors read this back to seed
-                    // their initial output state.
+                    // off keeps both. `x`/`y` are the primary plane's
+                    // `src_x >> 16`/`src_y >> 16` (see `drm::get_crtc`).
+                    // Compositors read this back to seed their initial
+                    // output state.
                     let enabled = drm::crtc_enabled();
                     crtc_res.fb_id = if enabled { crtc.fb_id } else { 0 };
                     crtc_res.x = crtc.x;
@@ -6588,6 +6615,9 @@ mod plane_state_check_tests;
 
 #[cfg(test)]
 mod crtc_routing_check_tests;
+
+#[cfg(test)]
+mod legacy_state_readback_tests;
 
 #[cfg(test)]
 mod trail_tests;
