@@ -30,6 +30,10 @@ en este kernel ha pasado de maneras que ningun test de syscalls ve:
    `pause()` no se paraba **nunca**, y el `waitpid(WUNTRACED)` del padre, el
    de una shell que espera para escribir «Stopped», se quedaba esperando con
    el.
+6. Matar un hilo no lo despertaba si dormia en `pause`, `nanosleep`, un `read`
+   o un `waitpid`: un `execve` desde un segundo hilo esperaba para siempre a
+   que muriera su hermano en `pause()`, y un proceso que salia con un hilo
+   dormido se recogia pero nunca se desmontaba, y su memoria no volvia.
 
 ## Compilar
 
@@ -71,3 +75,4 @@ FAIL solo en Eclipse es un fallo de Eclipse.
 | `inherit` | lo que pasa por `fork` (manejadores, mascara y pila alternativa; ni señales pendientes ni alarma) y por `execve` (mascara, pendientes, alarma y `SIG_IGN`; los manejadores vuelven a `SIG_DFL` y la pila alternativa se va). La mitad del `execve` la cuenta la propia sonda relanzada con `--exec-report` |
 | `wait` | lo que cuentan `waitid` y `waitpid`: una salida con `WNOWAIT` y luego recogida; una muerte por SIGTERM (`CLD_KILLED`); una parada de un hijo en `pause()` y una continuacion, cada una contada una vez; `waitid(P_PGID, 0)`, que es el grupo propio; `SA_NOCLDSTOP`; `exit()` desde un segundo hilo, que acaba con todo el proceso; y `execve()` desde un segundo hilo, cuya imagen nueva toma el pid como tid |
 | `stop` | una parada llega a un proceso metido en una syscall que espera (`nanosleep`, `read`, `sigsuspend`) y la syscall sigue cuando se le continua: el `read` lee, sin `EINTR`, y el `sigsuspend` sigue esperando su señal y al volver deja la mascara de antes |
+| `teardown` | un proceso que sale (`exit_group`) con un segundo hilo dormido en `pause`, `read`, `nanosleep` o `waitpid` ya no tiene ese hilo cuando se le recoge: un mutex robusto compartido que el hilo tenia cogido vuelve con `EOWNERDEAD`. `/proc/meminfo` no sirve para esto ni en Linux, que a veces enseña tarde unos cientos de MiB liberados |
