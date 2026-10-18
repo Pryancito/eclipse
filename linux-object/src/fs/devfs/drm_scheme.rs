@@ -2132,13 +2132,78 @@ impl DrmDev {
                 }
                 Ok(0)
             }
-            DRM_IOCTL_MODE_LIST_LESSEES => {
-                // No leases exist; report an empty list. The struct's first u32
-                // is `count_lessees` — zero it so the client copies out none.
+            DRM_IOCTL_MODE_CREATE_LEASE => {
+                // `drm_mode_create_lease_ioctl` up to the fd, which the
+                // syscall layer installs: a `DRM_MASTER` ioctl (EACCES), a
+                // flag other than the fd's own is EINVAL, the object list is
+                // read (EFAULT) and validated (`lease_objects`), and the
+                // lessee gets its id. Every caller got an unrestricted dup
+                // of the fd as lessee 1, whatever it asked for.
+                if !drm::is_master(self.minor, self.file_owner()) {
+                    return Err(FsError::NoPermission);
+                }
+                let req = unsafe { *(data as *const DrmModeCreateLease) };
+                if req.flags & !(O_CLOEXEC | O_NONBLOCK) != 0 {
+                    return Err(FsError::InvalidParam);
+                }
+                let objects = if req.object_count == 0 {
+                    alloc::vec::Vec::new()
+                } else {
+                    let count = req.object_count as usize;
+                    ucheck_n::<u32>(req.object_ids as usize, count)?;
+                    let ids =
+                        unsafe { core::slice::from_raw_parts(req.object_ids as *const u32, count) };
+                    lease_objects(ids, self.file.universal_planes())?
+                };
+                let lessee_id = drm::lease_create(self.minor, objects);
                 unsafe {
-                    *(data as *mut u32) = 0;
+                    (*(data as *mut DrmModeCreateLease)).lessee_id = lessee_id;
                 }
                 Ok(0)
+            }
+            DRM_IOCTL_MODE_LIST_LESSEES => {
+                // `drm_mode_list_lessees_ioctl`: `DRM_MASTER` (EACCES), `pad`
+                // EINVAL, then the lessees still holding objects, as many as
+                // the caller made room for, and the total in `count_lessees`.
+                // The answer was a constant zero.
+                if !drm::is_master(self.minor, self.file_owner()) {
+                    return Err(FsError::NoPermission);
+                }
+                let req = unsafe { *(data as *const DrmModeListLessees) };
+                if req.pad != 0 {
+                    return Err(FsError::InvalidParam);
+                }
+                let ids = drm::lessees(self.minor);
+                let fill = ids.len().min(req.count_lessees as usize);
+                if fill > 0 {
+                    ucheck_n::<u32>(req.lessees_ptr as usize, fill)?;
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(
+                            ids.as_ptr(),
+                            req.lessees_ptr as *mut u32,
+                            fill,
+                        );
+                    }
+                }
+                unsafe {
+                    (*(data as *mut DrmModeListLessees)).count_lessees = ids.len() as u32;
+                }
+                Ok(0)
+            }
+            DRM_IOCTL_MODE_REVOKE_LEASE => {
+                // `drm_mode_revoke_lease_ioctl`: `DRM_MASTER` (EACCES), a
+                // lessee this node's master does not have is ENOENT, and a
+                // revoked lease is emptied, not removed. Was an unknown core
+                // number (EINVAL).
+                if !drm::is_master(self.minor, self.file_owner()) {
+                    return Err(FsError::NoPermission);
+                }
+                let lessee_id = unsafe { *(data as *const u32) };
+                if drm::lease_revoke(self.minor, lessee_id) {
+                    Ok(0)
+                } else {
+                    Err(FsError::EntryNotFound)
+                }
             }
             DRM_IOCTL_MODE_OBJ_SETPROPERTY => {
                 let req = unsafe { *(data as *const DrmModeObjSetProperty) };
@@ -3885,9 +3950,16 @@ const DRM_IOCTL_MODE_DIRTYFB: u32 = 0xC01864B1;
 // has no gamma hardware, so accept both as no-ops.
 const DRM_IOCTL_MODE_GETGAMMA: u32 = 0xC02064A4;
 const DRM_IOCTL_MODE_SETGAMMA: u32 = 0xC02064A5;
-// Lease enumeration (`struct drm_mode_list_lessees`, 16 bytes). Xorg probes it
-// while taking DRM master; there are never any leases here, so report zero.
+// Leases (`drm_lease.c`), all `DRM_MASTER` ioctls. `CREATE_LEASE` (`struct
+// drm_mode_create_lease`, 24 bytes) is validated and given its lessee id
+// here and its fd by `sys_drm_prime`; `LIST_LESSEES` (`struct
+// drm_mode_list_lessees`, 16 bytes) is what Xorg probes while taking the
+// master; `REVOKE_LEASE` (`struct drm_mode_revoke_lease`, 4 bytes) empties
+// one. `GET_LEASE` is not implemented: it answers for the lessee's own file,
+// which here is a second descriptor of the lessor's.
+const DRM_IOCTL_MODE_CREATE_LEASE: u32 = 0xC01864C6;
 const DRM_IOCTL_MODE_LIST_LESSEES: u32 = 0xC01064C7;
+const DRM_IOCTL_MODE_REVOKE_LEASE: u32 = 0x400464C9;
 // Interface-version handshake (`drmSetInterfaceVersion`). The Xorg
 // modesetting driver issues it right after open; ENOTTY fails its probe.
 const DRM_IOCTL_SET_VERSION: u32 = 0xC0106407;
@@ -5071,6 +5143,32 @@ struct DrmModeFbDirtyCmd {
     clips_ptr: u64,
 }
 
+/// `struct drm_mode_create_lease` (24 bytes). `lessee_id` is written here,
+/// `fd` by the syscall layer, which installs it.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+struct DrmModeCreateLease {
+    object_ids: u64,
+    object_count: u32,
+    flags: u32,
+    lessee_id: u32,
+    fd: i32,
+}
+
+/// `struct drm_mode_list_lessees` (16 bytes).
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+struct DrmModeListLessees {
+    count_lessees: u32,
+    pad: u32,
+    lessees_ptr: u64,
+}
+
+/// The `flags` `drm_mode_create_lease_ioctl` accepts: the ones
+/// `get_unused_fd_flags` takes for the lessee's fd.
+const O_NONBLOCK: u32 = 0o4000;
+const O_CLOEXEC: u32 = 0o2000000;
+
 /// `struct drm_clip_rect` (8 bytes) — one element of the array `clips_ptr`
 /// points to. `x2`/`y2` are exclusive, i.e. the rect covers `[x1, x2) x [y1, y2)`.
 #[repr(C)]
@@ -5200,88 +5298,7 @@ struct Modeline {
     flags: u32,
 }
 
-impl Modeline {
-    /// The nominal mode: `w`x`h` at 60 Hz with fixed porches.
-    ///
-    /// A software framebuffer never programs CRT timings, so these are made up
-    /// — but they must be *valid*: `hdisplay < hsync_start < hsync_end <
-    /// htotal` (and the vertical analogue). The previous +10%/+5% blanking put
-    /// `hsync_end > htotal` at 1366×768, which is MODE_H_ILLEGAL; compositors
-    /// that recompute refresh from the porches then advertised ~55–59 Hz
-    /// instead of 60.
-    fn synthetic(w: u32, h: u32) -> Self {
-        let hdisplay = w as u16;
-        let vdisplay = h as u16;
-        // Fixed porches, always strictly increasing for any GOP-sized mode.
-        let hsync_start = hdisplay.saturating_add(48);
-        let hsync_end = hsync_start.saturating_add(32);
-        let htotal = hsync_end.saturating_add(80);
-        let vsync_start = vdisplay.saturating_add(3);
-        let vsync_end = vsync_start.saturating_add(6);
-        let vtotal = vsync_end.saturating_add(32);
-        Self {
-            clock_khz: clock_khz_for_refresh_mhz(htotal as u32, vtotal as u32, 60_000),
-            hdisplay,
-            hsync_start,
-            hsync_end,
-            htotal,
-            vdisplay,
-            vsync_start,
-            vsync_end,
-            vtotal,
-            vrefresh: 60,
-            // -hsync/-vsync. Made up like the rest, and nothing programs it:
-            // the sync generator is already running, set by firmware.
-            flags: DRM_MODE_FLAG_NHSYNC | DRM_MODE_FLAG_NVSYNC,
-        }
-    }
-
-    /// The panel's own timing, from the preferred detailed timing of its EDID.
-    ///
-    /// `None` unless every number survives the trip into a `u16` and the mode
-    /// states a refresh, because the fallback is the nominal mode above and
-    /// that is strictly better than an illegal one: wlroots handed a mode
-    /// whose sync runs past its total drops the output rather than picking
-    /// another, and the desktop lands on the text console.
-    fn from_panel(t: &edid::DetailedTiming) -> Option<Self> {
-        let vrefresh = t.refresh_hz();
-        if !t.is_valid() || vrefresh == 0 {
-            return None;
-        }
-        // The uAPI field is 16 bits; a monitor that states more is not a
-        // monitor this can describe, so fall back rather than truncate.
-        let fit = |v: u32| (v <= u16::MAX as u32).then_some(v as u16);
-        let mut flags = 0;
-        if t.separate_sync {
-            flags |= if t.hsync_positive {
-                DRM_MODE_FLAG_PHSYNC
-            } else {
-                DRM_MODE_FLAG_NHSYNC
-            };
-            flags |= if t.vsync_positive {
-                DRM_MODE_FLAG_PVSYNC
-            } else {
-                DRM_MODE_FLAG_NVSYNC
-            };
-        }
-        if t.interlaced {
-            flags |= DRM_MODE_FLAG_INTERLACE;
-        }
-        Some(Self {
-            clock_khz: t.clock_khz,
-            hdisplay: fit(t.hdisplay)?,
-            hsync_start: fit(t.hsync_start)?,
-            hsync_end: fit(t.hsync_end)?,
-            htotal: fit(t.htotal)?,
-            vdisplay: fit(t.vdisplay)?,
-            vsync_start: fit(t.vsync_start)?,
-            vsync_end: fit(t.vsync_end)?,
-            vtotal: fit(t.vtotal)?,
-            vrefresh,
-            flags,
-        })
-    }
-}
+mod modeline;
 
 /// The native timing of the monitor firmware read at boot, if it stated one.
 fn panel_timing() -> Option<edid::DetailedTiming> {
@@ -5451,6 +5468,85 @@ fn find_mode_object(
         return None;
     }
     Some((kind, props))
+}
+
+/// `drm_mode_object_find(dev, file, id, DRM_MODE_OBJECT_ANY)`, the type
+/// alone: what [`find_mode_object`] answers without building the property
+/// lists, for a caller that only wants to know what `obj_id` is.
+fn mode_object_kind(obj_id: u32) -> Option<u32> {
+    if drm::get_plane(obj_id).is_some() {
+        Some(DRM_MODE_OBJECT_PLANE)
+    } else if drm::get_crtc(obj_id).is_some() {
+        Some(DRM_MODE_OBJECT_CRTC)
+    } else if drm::get_connector(obj_id).is_some() {
+        Some(DRM_MODE_OBJECT_CONNECTOR)
+    } else if obj_id == drm::SYNTH_ENCODER_ID {
+        Some(DRM_MODE_OBJECT_ENCODER)
+    } else {
+        None
+    }
+}
+
+/// `fill_object_idr` + `validate_lease`: the object ids a lease over `ids`
+/// holds, or why it cannot. Every id has to name an object (ENOENT) of a
+/// type a lease can hold (`drm_mode_object_lease_required`: CRTC, connector
+/// or plane; EINVAL for an encoder), the set has to hold at least one CRTC
+/// and one connector, and a plane too when the lessor asked for universal
+/// planes (EINVAL). Without universal planes each CRTC brings its primary
+/// and cursor planes along (`crtc->primary`, `crtc->cursor`: here the
+/// primary and cursor planes whose `possible_crtcs` has the CRTC's bit), and
+/// an id that lands in the set twice is the `idr_alloc` collision, ENOSPC.
+fn lease_objects(ids: &[u32], universal_planes: bool) -> Result<alloc::vec::Vec<u32>> {
+    let mut kinds = alloc::vec::Vec::with_capacity(ids.len());
+    for &id in ids {
+        let kind = mode_object_kind(id).ok_or(FsError::EntryNotFound)?;
+        if !matches!(
+            kind,
+            DRM_MODE_OBJECT_CRTC | DRM_MODE_OBJECT_CONNECTOR | DRM_MODE_OBJECT_PLANE
+        ) {
+            return Err(FsError::InvalidParam);
+        }
+        kinds.push(kind);
+    }
+    if !kinds.contains(&DRM_MODE_OBJECT_CRTC) || !kinds.contains(&DRM_MODE_OBJECT_CONNECTOR) {
+        return Err(FsError::InvalidParam);
+    }
+    if universal_planes && !kinds.contains(&DRM_MODE_OBJECT_PLANE) {
+        return Err(FsError::InvalidParam);
+    }
+    let (crtcs, planes) = if universal_planes {
+        (alloc::vec::Vec::new(), alloc::vec::Vec::new())
+    } else {
+        let planes: alloc::vec::Vec<_> = drm::get_planes()
+            .into_iter()
+            .filter_map(drm::get_plane)
+            .collect();
+        (drm::get_resources().1, planes)
+    };
+    let mut leased = alloc::vec::Vec::with_capacity(ids.len());
+    let mut add = |id: u32| -> Result<()> {
+        if leased.contains(&id) {
+            return Err(FsError::NoDeviceSpace);
+        }
+        leased.push(id);
+        Ok(())
+    };
+    for (&id, &kind) in ids.iter().zip(&kinds) {
+        add(id)?;
+        if kind != DRM_MODE_OBJECT_CRTC {
+            continue;
+        }
+        let Some(index) = crtcs.iter().position(|&c| c == id) else {
+            continue;
+        };
+        for plane in planes
+            .iter()
+            .filter(|p| p.possible_crtcs & (1 << index) != 0 && matches!(p.plane_type, 1 | 2))
+        {
+            add(plane.id)?;
+        }
+    }
+    Ok(leased)
 }
 
 /// An id list the way `drm_mode_getresources` and `drm_mode_getplane_res`
@@ -6354,90 +6450,7 @@ fn drm_ioctl_reconciled(
     Ok(ret)
 }
 
-impl INode for DrmDev {
-    fn read_at(&self, _offset: usize, buf: &mut [u8]) -> Result<usize> {
-        // Deliver queued DRM events (page-flip completions). When none are
-        // pending report `Again` so a non-blocking reader gets EAGAIN and an
-        // epoll/poll waiter re-checks on the next tick.
-        match self.file.read_events(buf) {
-            drm::EventRead::Read(n) => Ok(n),
-            drm::EventRead::Empty => Err(FsError::Again),
-            // A buffer the first event does not fit in: `drm_read()` puts
-            // the event back and returns what it has read so far, which is
-            // 0 -- not EAGAIN (a livelock: the queue is non-empty, so
-            // READABLE stays set and a blocking reader's wait resolves
-            // instantly, over and over) and not EINVAL, which this answered
-            // and `drmHandleEvent` reports as a failed read.
-            drm::EventRead::TooSmall => Ok(0),
-        }
-    }
-
-    fn write_at(&self, _offset: usize, _buf: &[u8]) -> Result<usize> {
-        // The DRM file operations have no `.write`, so `vfs_write` refuses
-        // with EINVAL. This swallowed the bytes and reported them written.
-        Err(FsError::InvalidParam)
-    }
-
-    fn poll(&self) -> Result<PollStatus> {
-        Ok(PollStatus {
-            // Linux `drm_poll`: POLLIN when the event queue is non-empty;
-            // never POLLOUT (the chardev is not writable).
-            read: self.file.has_events(),
-            write: false,
-            error: false,
-            hangup: false,
-        })
-    }
-
-    fn async_poll<'a>(
-        &'a self,
-    ) -> Pin<Box<dyn Future<Output = Result<PollStatus>> + Send + Sync + 'a>> {
-        // Lightweight waiter: do not nest an `async move { loop { ... } }`
-        // state machine. Poll/epoll already use sync `poll()`; this path is
-        // for blocking reads and any leftover async_poll callers.
-        let bus = self.file.eventbus();
-        Box::pin(DrmEventWait {
-            dev: self,
-            bus,
-            sub_id: None,
-        })
-    }
-
-    fn metadata(&self) -> Result<Metadata> {
-        Ok(Metadata {
-            dev: 1,
-            inode: self.inode_id,
-            size: 0,
-            blk_size: 0,
-            blocks: 0,
-            atime: Timespec { sec: 0, nsec: 0 },
-            mtime: Timespec { sec: 0, nsec: 0 },
-            ctime: Timespec { sec: 0, nsec: 0 },
-            type_: FileType::CharDevice,
-            // Render nodes are world-rw on Linux (udev's `uaccess`/render
-            // group; Alpine's mdev ships 0666), so report the same. NOTE this
-            // is fidelity, not a functional fix: nothing in this kernel
-            // enforces `Metadata::mode` on open (its only consumers are
-            // stat/statx), so 0o660 was never actually blocking NVK's
-            // `open(renderD128, O_RDWR)`. It will start mattering the day a
-            // permission model lands. The primary node keeps 0660 (it is the
-            // privileged KMS device).
-            mode: if self.minor >= 128 { 0o666 } else { 0o660 },
-            nlinks: 1,
-            uid: 0,
-            gid: 0,
-            rdev: make_rdev(0xe2, self.minor as usize), // 226 is DRM major
-        })
-    }
-
-    fn io_control(&self, cmd: u32, data: usize) -> Result<usize> {
-        drm_ioctl(self, cmd, data)
-    }
-
-    fn as_any_ref(&self) -> &dyn Any {
-        self
-    }
-}
+mod drm_inode;
 
 /// What a failed present costs the ioctl that asked for it.
 ///
@@ -6628,6 +6641,9 @@ mod syncobj_array_tests;
 
 #[cfg(test)]
 mod addfb2_validation_tests;
+
+#[cfg(test)]
+mod lease_tests;
 
 #[cfg(test)]
 mod trail_tests;

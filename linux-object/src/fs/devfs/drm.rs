@@ -1761,6 +1761,86 @@ pub fn auth_magic(minor: u32, magic: u32) -> bool {
     state.magics.len() != before
 }
 
+/// One `drm_master` a `CREATE_LEASE` made: its `lessee_id` in the lessor's
+/// `lessee_idr` and its `leases` idr, the object ids it may touch.
+struct DrmLease {
+    minor: u32,
+    lessee_id: u32,
+    objects: Vec<u32>,
+}
+
+/// `drm_lease_create`: a lessee under `minor`'s master holding `objects`,
+/// with the lowest free `lessee_id` from 1 (`idr_alloc(&lessor->lessee_idr,
+/// .., 1, 0, ..)`). Every lease was told it was lessee 1, and none was
+/// recorded, so `LIST_LESSEES` never listed one and `REVOKE_LEASE` had
+/// nothing to find.
+///
+/// A lease here lives for the rest of the boot: the lessee's fd is a
+/// second descriptor of the lessor's own open (see the `CREATE_LEASE` arm of
+/// `sys_drm_prime`), so nothing tells its close from the lessor's, and
+/// Linux keeps a revoked lessee until its file goes anyway. The leases are
+/// per node, not per master: a compositor that drops the master and a
+/// successor that takes it see the same list, where Linux would give the
+/// successor a fresh `drm_master` with none.
+pub fn lease_create(minor: u32, objects: Vec<u32>) -> u32 {
+    let mut state = DRM_STATE.lock();
+    let mut lessee_id = 1;
+    while state
+        .leases
+        .iter()
+        .any(|l| l.minor == minor && l.lessee_id == lessee_id)
+    {
+        lessee_id += 1;
+    }
+    state.leases.push(DrmLease {
+        minor,
+        lessee_id,
+        objects,
+    });
+    lessee_id
+}
+
+/// Forget a lease `lease_create` just made whose fd could not be installed
+/// (`get_unused_fd_flags` failing before `drm_lease_create` runs: Linux
+/// never creates it).
+pub fn lease_drop(minor: u32, lessee_id: u32) {
+    DRM_STATE
+        .lock()
+        .leases
+        .retain(|l| !(l.minor == minor && l.lessee_id == lessee_id));
+}
+
+/// `drm_mode_list_lessees_ioctl`'s walk: the lessee ids under `minor`'s
+/// master whose lease still holds objects (`!idr_is_empty(&lessee->leases)`:
+/// an empty lease, and a revoked one, is not listed), in creation order.
+pub fn lessees(minor: u32) -> Vec<u32> {
+    DRM_STATE
+        .lock()
+        .leases
+        .iter()
+        .filter(|l| l.minor == minor && !l.objects.is_empty())
+        .map(|l| l.lessee_id)
+        .collect()
+}
+
+/// `drm_mode_revoke_lease_ioctl`: `false` when `minor`'s master has no
+/// lessee `lessee_id` (ENOENT); otherwise the lease loses every object
+/// (`_drm_lease_revoke`) and stays, so revoking it again is a no-op.
+pub fn lease_revoke(minor: u32, lessee_id: u32) -> bool {
+    let mut state = DRM_STATE.lock();
+    match state
+        .leases
+        .iter_mut()
+        .find(|l| l.minor == minor && l.lessee_id == lessee_id)
+    {
+        Some(lease) => {
+            lease.objects.clear();
+            true
+        }
+        None => false,
+    }
+}
+
 /// `drm_master_release` + the file's magic: everything the device kept
 /// about a closed open.
 fn master_release(minor: u32, file: usize) {
@@ -1918,6 +1998,10 @@ struct DrmState {
     magics: Vec<(u32, u32, usize)>,
     /// `drm_getmagic`'s idr: magics start at 1.
     next_magic: u32,
+    /// `drm_master.lessee_idr` of every node's master: the leases
+    /// `CREATE_LEASE` made, each with the object ids it holds. See
+    /// [`lease_create`].
+    leases: Vec<DrmLease>,
     /// Software-KMS state mirrored back to atomic clients (see
     /// [`AtomicKmsState`]).
     atomic: AtomicKmsState,
@@ -2079,6 +2163,7 @@ lazy_static::lazy_static! {
         masters: Vec::new(),
         magics: Vec::new(),
         next_magic: 1,
+        leases: Vec::new(),
         atomic: AtomicKmsState::default(),
     });
     /// Shared CPU-mmap VMOs for nouveau-uAPI GEM handles. Without this,
