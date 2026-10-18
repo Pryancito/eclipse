@@ -73,6 +73,23 @@ pub fn process_of_thread_in(job: &Arc<Job>, tid: KoID) -> Option<Arc<Process>> {
         .find(|proc| proc.thread_ids().contains(&tid))
 }
 
+/// The live thread `tid` names, anywhere on the machine, with its process.
+///
+/// `tkill(2)` is `find_task_by_vpid(tid)`: a tid is looked up across the
+/// whole system, not inside the caller's process, and only then judged by
+/// `check_kill_permission()`. Like [`process_of_thread`] it walks the census,
+/// so it is for the call that did not find the tid at home.
+pub fn find_thread(tid: KoID) -> Option<(Arc<Process>, Arc<Thread>)> {
+    find_thread_in(&ROOT_JOB, tid)
+}
+
+/// [`find_thread`] over one job's subtree, for the tests.
+pub fn find_thread_in(job: &Arc<Job>, tid: KoID) -> Option<(Arc<Process>, Arc<Thread>)> {
+    let proc = process_of_thread_in(job, tid)?;
+    let thread = proc.get_child(tid).ok()?.downcast_arc::<Thread>().ok()?;
+    Some((proc, thread))
+}
+
 /// The live members of `job` and of every job under it, appended to `out`.
 ///
 /// It asks each job for its members and its children DIRECTLY

@@ -38,13 +38,15 @@
 //! a weak one to the `Futex` itself, so it prunes rather than growing one
 //! entry per distinct word for the life of the machine.
 
+use crate::process::ProcessExt;
 use alloc::collections::BTreeMap;
 use alloc::sync::{Arc, Weak};
 use core::sync::atomic::AtomicI32;
 use kernel_hal::sync::Mutex;
-use zircon_object::object::KoID;
+use zircon_object::object::{KernelObject, KoID};
 use zircon_object::signal::Futex;
-use zircon_object::vm::VmObject;
+use zircon_object::task::Process;
+use zircon_object::vm::{MMUFlags, VmAddressRegion, VmObject, PAGE_SIZE};
 
 /// "Inode + offset": the backing object's koid and the byte offset of the
 /// futex word inside it.
@@ -81,6 +83,90 @@ pub fn intern(key: SharedKey, vmo: Arc<VmObject>, word: &'static AtomicI32) -> A
     futex
 }
 
+/// The `Futex` a process-shared futex word names, or `None` when this
+/// word is not shared and the per-process table is the right home for it.
+///
+/// Keyed by the pair Linux spells "inode + offset" -- the backing
+/// `VmObject`'s koid and the byte offset of the word inside it -- so two
+/// processes that map the same object at different addresses reach one
+/// queue. The word itself is reached through the kernel's linear map of the
+/// physical frame, never through either process's virtual address: the
+/// `Futex` outlives any one address space, and the process doing the
+/// `FUTEX_WAKE` is generally not the one that created it.
+///
+/// Every failure here is a `None` that falls back to the per-process
+/// table, which is exactly the behaviour this kernel had before.
+pub fn shared_futex_at(vmar: &Arc<VmAddressRegion>, uaddr: usize) -> Option<Arc<Futex>> {
+    if uaddr == 0 || !uaddr.is_multiple_of(core::mem::align_of::<AtomicI32>()) {
+        return None;
+    }
+    // A second descent for the address the bounds check just walked to, and
+    // a third lock to read the mapping's VMO -- all so the common answer can
+    // be "no". Counted so the next bench run says what that costs.
+    let found = vmar
+        .find_mapping(uaddr)
+        .and_then(|mapping| mapping.vmo_and_offset(uaddr).map(|vo| (mapping, vo)));
+    let Some((mapping, (vmo, offset))) = found else {
+        kernel_hal::kstats::note_futex_shared_probe(1, false);
+        return None;
+    };
+    // A PRIVATE mapping keeps the per-process table even without the
+    // private flag: nobody else can observe that word, and sharing a queue
+    // across a copy-on-write split would be wrong.
+    if !vmo.is_shared_object() {
+        kernel_hal::kstats::note_futex_shared_probe(1, false);
+        return None;
+    }
+    kernel_hal::kstats::note_futex_shared_probe(1, true);
+    // Force the page resident before translating: a lazily mapped word has
+    // no page-table entry yet, and `query_vaddr` would simply fail. ONLY
+    // then: a read fault on a page that is already there re-installs it
+    // read-only (the copy-on-write rule of `VmMapping::handle_page_fault`),
+    // so asking unconditionally took WRITE away from the caller's own page on
+    // every shared futex call -- a TLB flush here and a write fault on its
+    // next store, for every `xshmfence` wait and wake of a GL client.
+    //
+    // Asked of the page, and the word found inside it below: the bare-metal
+    // page table adds the offset itself, but the libos one only answers for
+    // a page boundary (`debug_assert!(is_aligned(vaddr))`, and the frame's
+    // base without the offset in a release build), so a word anywhere but at
+    // the start of its page was never found on the host.
+    let in_page = uaddr & (PAGE_SIZE - 1);
+    if vmar.get_vaddr_flags(uaddr - in_page).is_err() {
+        let _ = vmar.handle_page_fault(uaddr, MMUFlags::READ);
+    }
+    let (page, flags, _) = mapping.query_vaddr(uaddr - in_page).ok()?;
+    // Empty flags mean "present in the tables with no permissions", which
+    // is how a guard page looks; there is nothing readable there.
+    if flags.is_empty() {
+        return None;
+    }
+    let kvaddr = kernel_hal::mem::phys_to_virt(page + in_page);
+    if kvaddr == 0 {
+        return None;
+    }
+    // Safe: `kvaddr` is the kernel's own linear-map address of a resident,
+    // 4-byte-aligned frame the table now holds an `Arc<VmObject>` on, so
+    // it stays mapped and owned for as long as the `Futex` can be reached.
+    let word: &'static AtomicI32 = unsafe { &*(kvaddr as *const AtomicI32) };
+    Some(intern((vmo.id(), offset), vmo, word))
+}
+
+/// The `Futex` a futex operation WITHOUT `FUTEX_PRIVATE_FLAG` on `uaddr`
+/// reaches in `proc`: the shared one when the word lives in a shared object,
+/// the per-process one otherwise.
+///
+/// The two wakes the kernel issues on its own when a thread dies are of this
+/// kind. Linux's `handle_futex_death` (a robust lock the dead thread still
+/// held) and the `clear_child_tid` wake in `mm_release` both pass shared
+/// flags, so a waiter in ANOTHER process -- a `PTHREAD_PROCESS_SHARED`
+/// robust mutex in a `MAP_SHARED` page, the very case robust lists exist
+/// for -- is queued on the shared futex, and a wake sent to the dead
+/// thread's per-process table reaches nobody.
+pub fn futex_for_shared_op(proc: &Process, uaddr: usize) -> Option<Arc<Futex>> {
+    shared_futex_at(&proc.vmar(), uaddr).or_else(|| proc.linux().get_futex(uaddr))
+}
+
 /// How many entries the table currently holds, live and not yet reclaimed.
 #[cfg(test)]
 pub fn len() -> usize {
@@ -95,26 +181,60 @@ pub fn clear_for_test() {
 }
 
 #[cfg(test)]
+extern crate std;
+
+/// `SHARED_FUTEXES` is process-wide and cargo runs a crate's tests in
+/// threads, so `clear_for_test` in one test wipes the table another is
+/// counting. Every test that interns a word or clears the table takes this
+/// first, in this file or elsewhere in the crate.
+///
+/// CI runs with `--test-threads=1` and therefore never sees it; on a
+/// developer's machine it failed about one run in eight, in
+/// `an_entry_is_reclaimed_once_nobody_holds_the_futex`, with a length of 2
+/// where it wanted 1 -- which reads as a real regression in the interning
+/// and is not one.
+#[cfg(test)]
+pub(crate) fn serialised_for_test() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    // A test that panics while holding this poisons it; the tests that
+    // follow are not at fault, so step over the poison.
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// A one-page `MAP_SHARED | MAP_ANONYMOUS` object mapped read-write into
+/// `vmar`, for the tests that need a word a shared futex can name. Returns the
+/// object, the user address of the page and the frame's own address in the
+/// host, which is where the test reads and writes the word.
+///
+/// The user address space of a hosted test starts at 0 and the libos page
+/// table is a `MAP_FIXED` of the frame at the user address, so the page is
+/// mapped over one this function allocates and leaks: anywhere else it would
+/// land on whatever the host keeps there. The mapping must never be undone
+/// for the same reason, so callers leak the VMAR's process as well.
+#[cfg(test)]
+pub(crate) fn map_shared_page_for_test(
+    vmar: &Arc<VmAddressRegion>,
+) -> (Arc<VmObject>, usize, usize) {
+    let vmo = VmObject::new_paged(1);
+    vmo.set_share_on_fork();
+    vmo.commit(0, PAGE_SIZE).unwrap();
+    let frame = kernel_hal::mem::phys_to_virt(vmo.committed_paddr(0).unwrap());
+    let page = core::alloc::Layout::from_size_align(PAGE_SIZE, PAGE_SIZE).unwrap();
+    let user = unsafe { std::alloc::alloc_zeroed(page) } as usize;
+    let rw = MMUFlags::READ | MMUFlags::WRITE | MMUFlags::USER;
+    vmar.map_at(user - vmar.addr(), vmo.clone(), 0, PAGE_SIZE, rw)
+        .unwrap();
+    (vmo, user, frame)
+}
+
+#[cfg(test)]
 mod tests {
     extern crate std;
     use super::*;
     use alloc::boxed::Box;
 
-    /// `SHARED_FUTEXES` is process-wide and cargo runs a crate's tests in
-    /// threads, so `clear_for_test` in one test wipes the table another is
-    /// counting. Every test here takes this first.
-    ///
-    /// CI runs with `--test-threads=1` and therefore never sees it; on a
-    /// developer's machine it failed about one run in eight, in
-    /// `an_entry_is_reclaimed_once_nobody_holds_the_futex`, with a length of 2
-    /// where it wanted 1 -- which reads as a real regression in the interning
-    /// and is not one.
-    static LOCK: self::std::sync::Mutex<()> = self::std::sync::Mutex::new(());
-
     fn serialised() -> self::std::sync::MutexGuard<'static, ()> {
-        // A test that panics while holding this poisons it; the tests that
-        // follow are not at fault, so step over the poison.
-        LOCK.lock().unwrap_or_else(|e| e.into_inner())
+        serialised_for_test()
     }
 
     fn leaked_word() -> &'static AtomicI32 {
@@ -218,5 +338,34 @@ mod tests {
             "a dead entry must be replaced, not upgraded"
         );
         assert_eq!(len(), 1, "and replaced in place, not accumulated");
+    }
+
+    #[test]
+    fn naming_a_shared_word_leaves_its_page_writable() {
+        let _serialised = serialised();
+        let vmar = VmAddressRegion::new_root();
+        let (_vmo, user, frame) = map_shared_page_for_test(&vmar);
+        let writable = |vmar: &Arc<VmAddressRegion>| {
+            vmar.get_vaddr_flags(user)
+                .unwrap()
+                .contains(MMUFlags::WRITE)
+        };
+        assert!(writable(&vmar));
+        unsafe {
+            (*((frame + 0x24) as *const AtomicI32))
+                .store(0x1234, core::sync::atomic::Ordering::SeqCst)
+        };
+        let futex = shared_futex_at(&vmar, user + 0x24).expect("a shared word");
+        assert!(
+            writable(&vmar),
+            "a futex call took WRITE away from the caller's page: its next store \
+             to the word faults"
+        );
+        assert_eq!(
+            futex.load(),
+            0x1234,
+            "the futex must sit on the word asked for, not on the start of its page"
+        );
+        core::mem::forget(vmar);
     }
 }

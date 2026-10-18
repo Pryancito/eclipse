@@ -1,8 +1,8 @@
 //! Linux Thread
 
 use crate::error::SysResult;
-use crate::process::ProcessExt;
 use crate::signal::{SigInfo, Signal, SignalStack, SignalUserContext, Sigset};
+use crate::sync::shared_futex;
 use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -59,6 +59,20 @@ pub trait ThreadExt {
 pub trait CurrentThreadExt {
     /// exit linux thread
     fn exit_linux(&self, exit_code: i32);
+    /// Release every robust lock this thread still holds, and forget the list
+    /// that named them.
+    ///
+    /// Linux does this for EVERY task on its way out, whatever ends it
+    /// (`do_exit` -> `exit_mm` -> `futex_exit_release`), and for a task that
+    /// `execve`s (`exec_mm_release` -> `futex_exec_release`). The thread's
+    /// own `exit(2)` is only one of those ways: `exit_group`, a fatal signal
+    /// and the sibling `execve` kills are the others, and they are how a
+    /// PROCESS dies -- which is the death a robust lock exists to survive.
+    ///
+    /// Must run on the dying thread itself, with its address space still in
+    /// place: the list is walked through user pointers. Calling it again is a
+    /// no-op, because the list is taken, not read.
+    fn release_robust_locks(&self);
 }
 
 /// The `Thread::ext` fat pointer's DATA word has been overwritten, and the
@@ -359,77 +373,86 @@ impl ThreadExt for Thread {
     }
 }
 
-/// Release every robust lock a dying thread still holds.
-trait RobustExit {
-    fn release_robust_locks(&self);
-}
-
-impl RobustExit for CurrentThread {
-    fn release_robust_locks(&self) {
-        let (head_addr, len) = {
-            let linux = self.lock_linux();
-            (linux.robust_list.as_addr(), linux.robust_list_len)
-        };
-        // A length other than the struct's own is what `set_robust_list`
-        // refuses, so it can only be the never-registered zero.
-        if head_addr == 0 || len != core::mem::size_of::<RobustList>() {
+/// [`CurrentThreadExt::release_robust_locks`], for a `Thread` a host test can
+/// build: the walk only needs the thread's id, its list and its process.
+fn release_robust_locks_of(thread: &Thread) {
+    // Taken, not read: Linux's `futex_cleanup` clears `tsk->robust_list`
+    // once it has walked it, so the walk happens once per thread however
+    // many of the death paths reach here. `exit(2)` releases first and then
+    // falls out of the run loop, which releases again.
+    let (head_addr, len) = {
+        // `try_`: a thread with no Linux extension holds no robust locks.
+        let Some(mut linux) = thread.try_lock_linux() else {
             return;
+        };
+        let taken = (linux.robust_list.as_addr(), linux.robust_list_len);
+        linux.robust_list = 0.into();
+        linux.robust_list_len = 0;
+        taken
+    };
+    // A length other than the struct's own is what `set_robust_list`
+    // refuses, so it can only be the never-registered zero.
+    if head_addr == 0 || len != core::mem::size_of::<RobustList>() {
+        return;
+    }
+    // Every read here is a `get_user` on the dying thread's own address
+    // space, in kernel mode. The list head lives in the thread's TLS and
+    // the entries in mutexes it just held, so the pages are normally
+    // resident -- but "normally" is not enough on a path that runs at
+    // every thread exit, and this kernel does not recover from a fault
+    // taken on a raw access (see the `clear_child_tid` code below, which
+    // faults its page in for the same reason). So: inside the process's
+    // own mappings, and faulted in first.
+    let vmar = thread.proc().vmar();
+    let held = walk_robust_list(head_addr, |addr| {
+        if !addr.is_multiple_of(core::mem::align_of::<usize>()) {
+            return None;
         }
-        // Every read here is a `get_user` on the dying thread's own address
-        // space, in kernel mode. The list head lives in the thread's TLS and
-        // the entries in mutexes it just held, so the pages are normally
-        // resident -- but "normally" is not enough on a path that runs at
-        // every thread exit, and this kernel does not recover from a fault
-        // taken on a raw access (see the `clear_child_tid` code below, which
-        // faults its page in for the same reason). So: inside the process's
-        // own mappings, and faulted in first.
-        let vmar = self.proc().vmar();
-        let held = walk_robust_list(head_addr, |addr| {
-            if !addr.is_multiple_of(core::mem::align_of::<usize>()) {
+        #[cfg(target_os = "none")]
+        {
+            if !vmar.contains(addr) {
                 return None;
             }
-            #[cfg(target_os = "none")]
+            let present = vmar.get_vaddr_flags(addr).is_ok();
+            if !present
+                && vmar
+                    .handle_page_fault(addr, kernel_hal::MMUFlags::USER)
+                    .is_err()
             {
-                if !vmar.contains(addr) {
-                    return None;
-                }
-                let present = vmar.get_vaddr_flags(addr).is_ok();
-                if !present
-                    && vmar
-                        .handle_page_fault(addr, kernel_hal::MMUFlags::USER)
-                        .is_err()
-                {
-                    return None;
-                }
+                return None;
             }
-            let word: UserInPtr<usize> = addr.into();
-            word.read().ok()
-        });
-        drop(vmar);
-        if held.is_empty() {
-            return;
         }
-        let tid = self.id() as i32;
-        let proc = self.proc();
-        for lock in held {
-            let Some(futex) = proc.linux().get_futex(lock.addr) else {
-                continue;
-            };
-            // Retry on a lost race, as Linux's `handle_futex_death` does: the
-            // word can still change under us while this thread is dying.
-            loop {
-                let uval = futex.load();
-                match robust_death_action(uval, tid, lock.pi) {
-                    RobustDeath::NotOurs => break,
-                    RobustDeath::Died { new_value, wake } => {
-                        if futex.compare_exchange(uval, new_value).is_err() {
-                            continue;
-                        }
-                        if wake {
-                            futex.wake(1);
-                        }
-                        break;
+        let word: UserInPtr<usize> = addr.into();
+        word.read().ok()
+    });
+    drop(vmar);
+    if held.is_empty() {
+        return;
+    }
+    let tid = thread.id() as i32;
+    let proc = thread.proc();
+    for lock in held {
+        // Linux's `handle_futex_death` wakes with shared flags, so this is
+        // the queue a waiter in another process sleeps on when the lock is
+        // a process-shared one in shared memory. The per-process table it
+        // used to wake is a queue nobody in that process was on.
+        let Some(futex) = shared_futex::futex_for_shared_op(proc, lock.addr) else {
+            continue;
+        };
+        // Retry on a lost race, as Linux's `handle_futex_death` does: the
+        // word can still change under us while this thread is dying.
+        loop {
+            let uval = futex.load();
+            match robust_death_action(uval, tid, lock.pi) {
+                RobustDeath::NotOurs => break,
+                RobustDeath::Died { new_value, wake } => {
+                    if futex.compare_exchange(uval, new_value).is_err() {
+                        continue;
                     }
+                    if wake {
+                        futex.wake(1);
+                    }
+                    break;
                 }
             }
         }
@@ -437,6 +460,10 @@ impl RobustExit for CurrentThread {
 }
 
 impl CurrentThreadExt for CurrentThread {
+    fn release_robust_locks(&self) {
+        release_robust_locks_of(self);
+    }
+
     /// Exit current thread for Linux.
     fn exit_linux(&self, exit_code: i32) {
         // Linux's `mm_release` does this first, before the `clear_child_tid`
@@ -474,7 +501,9 @@ impl CurrentThreadExt for CurrentThread {
                             )
                             .is_ok();
                     if mapped && clear_child_tid.write(0).is_ok() {
-                        if let Some(futex) = self.proc().linux().get_futex(vaddr) {
+                        // `mm_release` wakes with shared flags too: see
+                        // `futex_for_shared_op`.
+                        if let Some(futex) = shared_futex::futex_for_shared_op(self.proc(), vaddr) {
                             futex.wake(1);
                         }
                     }
@@ -493,7 +522,7 @@ impl CurrentThreadExt for CurrentThread {
                 // here rather than in the test.
                 if clear_child_tid.write(0).is_ok() {
                     let uaddr = clear_child_tid.as_addr();
-                    if let Some(futex) = self.proc().linux().get_futex(uaddr) {
+                    if let Some(futex) = shared_futex::futex_for_shared_op(self.proc(), uaddr) {
                         futex.wake(1);
                     }
                 }
@@ -1139,6 +1168,8 @@ impl LinuxThread {
 
 #[cfg(test)]
 mod deliverable_mirror_tests;
+#[cfg(test)]
+mod robust_exit_tests;
 
 #[cfg(test)]
 mod signal_delivery_tests {

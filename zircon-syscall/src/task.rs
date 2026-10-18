@@ -222,15 +222,18 @@ impl Syscall<'_> {
         if thread.proc().status() != Status::Running {
             return Err(ZxError::BAD_STATE);
         }
-        thread.with_context(|ctx| {
-            ctx.setup_uspace(entry, stack, &[arg1, arg2, 0]);
-            // Match process startup: every Zircon thread can use FP/vector
-            // state. AArch64 bare metal enables it on the first access trap.
-            #[cfg(not(all(target_arch = "aarch64", not(feature = "libos"))))]
-            ctx.enable_extended_state();
-        })?;
-        thread.start(self.thread_fn)?;
-        Ok(())
+        // One step, so a thread that has already started is refused before
+        // its registers are touched. See `Thread::start_with`.
+        thread.start_with(
+            |ctx| {
+                ctx.setup_uspace(entry, stack, &[arg1, arg2, 0]);
+                // Match process startup: every Zircon thread can use FP/vector
+                // state. AArch64 bare metal enables it on the first access trap.
+                #[cfg(not(all(target_arch = "aarch64", not(feature = "libos"))))]
+                ctx.enable_extended_state();
+            },
+            self.thread_fn,
+        )
     }
 
     /// Starts a thread and initializes the architecture TLS and ABI registers.
@@ -254,15 +257,16 @@ impl Syscall<'_> {
         if thread.proc().status() != Status::Running {
             return Err(ZxError::BAD_STATE);
         }
-        thread.with_context(|ctx| {
-            ctx.setup_uspace(entry, stack, &[arg1, arg2, 0]);
-            ctx.set_field(UserContextField::ThreadPointer, tp);
-            ctx.set_field(UserContextField::AbiRegister, abi_reg);
-            #[cfg(not(all(target_arch = "aarch64", not(feature = "libos"))))]
-            ctx.enable_extended_state();
-        })?;
-        thread.start(self.thread_fn)?;
-        Ok(())
+        thread.start_with(
+            |ctx| {
+                ctx.setup_uspace(entry, stack, &[arg1, arg2, 0]);
+                ctx.set_field(UserContextField::ThreadPointer, tp);
+                ctx.set_field(UserContextField::AbiRegister, abi_reg);
+                #[cfg(not(all(target_arch = "aarch64", not(feature = "libos"))))]
+                ctx.enable_extended_state();
+            },
+            self.thread_fn,
+        )
     }
 
     /// Yields execution to another runnable thread.

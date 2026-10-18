@@ -1426,6 +1426,12 @@ impl Syscall<'_> {
         // `begin_new_exec()`, after the `bprm` is built, for this reason; see
         // [`ExecPreflight`], which is what makes the order hold.
         de_thread(self.zircon_process(), self.thread.id(), &past_every_check).await;
+        // `exec_mm_release()` -> `futex_exec_release()`: a robust lock this
+        // thread holds in memory another process shares outlives the image
+        // that took it, and nobody in the new one knows to unlock it. Before
+        // `vmar.clear()` below, while the list's addresses still mean
+        // something; `reset_for_exec` then finds it already forgotten.
+        self.thread.release_robust_locks();
 
         proc.remove_cloexec_files();
         // POSIX: caught signals are reset to their default disposition across

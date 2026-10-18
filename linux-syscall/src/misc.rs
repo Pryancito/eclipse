@@ -438,68 +438,9 @@ impl Syscall<'_> {
 
     /// The `Futex` a process-shared futex word names, or `None` when this
     /// word is not shared and the per-process table is the right home for it.
-    ///
-    /// Keyed by the pair Linux spells "inode + offset" -- the backing
-    /// `VmObject`'s koid and the byte offset of the word inside it -- so two
-    /// processes that map the same object at different addresses reach one
-    /// queue. The word itself is reached through the kernel's linear map of
-    /// the physical frame, never through either process's virtual address: the
-    /// `Futex` outlives any one address space, and the process doing the
-    /// `FUTEX_WAKE` is generally not the one that created it.
-    ///
-    /// Every failure here is a `None` that falls back to the per-process
-    /// table, which is exactly the behaviour this kernel had before.
-    #[allow(unsafe_code)]
+    /// See [`linux_object::sync::shared_futex::shared_futex_at`].
     fn shared_futex(&self, uaddr: usize) -> Option<Arc<zircon_object::signal::Futex>> {
-        use core::sync::atomic::AtomicI32;
-        use zircon_object::object::KernelObject;
-        use zircon_object::vm::MMUFlags;
-
-        if uaddr == 0 || !uaddr.is_multiple_of(core::mem::align_of::<AtomicI32>()) {
-            return None;
-        }
-        let vmar = self.zircon_process().vmar();
-        // A second descent for the address the bounds check just walked to, and
-        // a third lock to read the mapping's VMO -- all so the common answer can
-        // be "no". Counted so the next bench run says what that costs.
-        let found = vmar
-            .find_mapping(uaddr)
-            .and_then(|mapping| mapping.vmo_and_offset(uaddr).map(|vo| (mapping, vo)));
-        let Some((mapping, (vmo, offset))) = found else {
-            kernel_hal::kstats::note_futex_shared_probe(1, false);
-            return None;
-        };
-        let _ = &mapping;
-        // A PRIVATE mapping keeps the per-process table even without the
-        // private flag: nobody else can observe that word, and sharing a queue
-        // across a copy-on-write split would be wrong.
-        if !vmo.is_shared_object() {
-            kernel_hal::kstats::note_futex_shared_probe(1, false);
-            return None;
-        }
-        kernel_hal::kstats::note_futex_shared_probe(1, true);
-        // Force the page resident before translating: a lazily mapped word has
-        // no page-table entry yet, and `query_vaddr` would simply fail.
-        let _ = vmar.handle_page_fault(uaddr, MMUFlags::READ);
-        let (paddr, flags, _) = mapping.query_vaddr(uaddr).ok()?;
-        // Empty flags mean "present in the tables with no permissions", which
-        // is how a guard page looks; there is nothing readable there.
-        if flags.is_empty() {
-            return None;
-        }
-        let kvaddr = kernel_hal::mem::phys_to_virt(paddr);
-        if kvaddr == 0 {
-            return None;
-        }
-        // Safe: `kvaddr` is the kernel's own linear-map address of a resident,
-        // 4-byte-aligned frame the table now holds an `Arc<VmObject>` on, so
-        // it stays mapped and owned for as long as the `Futex` can be reached.
-        let word: &'static AtomicI32 = unsafe { &*(kvaddr as *const AtomicI32) };
-        Some(linux_object::sync::shared_futex::intern(
-            (vmo.id(), offset),
-            vmo,
-            word,
-        ))
+        linux_object::sync::shared_futex::shared_futex_at(&self.zircon_process().vmar(), uaddr)
     }
 
     /// provides a method for waiting until a certain condition becomes true.
