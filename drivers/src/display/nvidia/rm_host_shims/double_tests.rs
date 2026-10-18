@@ -43,7 +43,7 @@ fn gem(size: u64, sysmem: bool) -> u32 {
 fn bind(ctx: u32, h: u32, va: u64, size: u64) -> VmBind {
     let mut out = zeroed::<VmBind>();
     assert_eq!(
-        eclipse_rm_vm_bind_map(0, ctx, h, size, va, 0, 0, &mut out),
+        eclipse_rm_vm_bind_map(0, ctx, h, size, va, 0, 0, 0, &mut out),
         NV_OK
     );
     out
@@ -786,7 +786,7 @@ fn the_address_space_of_a_context_is_its_own_bindings_with_the_kind_asked_for() 
     let h = gem(0x1000, true);
     let mut out = zeroed::<VmBind>();
     assert_eq!(
-        eclipse_rm_vm_bind_map(0, 1, h, 0x1000, 0xc0_0000, 0, 0x06, &mut out),
+        eclipse_rm_vm_bind_map(0, 1, h, 0x1000, 0xc0_0000, 0, 0x06, 0, &mut out),
         NV_OK
     );
     bind(2, h, 0xc1_0000, 0x1000);

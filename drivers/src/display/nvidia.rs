@@ -220,6 +220,20 @@ mod vram_alloc;
 /// is `nvidia.gem_vram_bar1`, default off.
 pub(super) mod vram_bar1;
 
+mod comptag_caps;
+/// Honouring a compressed PTE kind instead of downgrading it, hatch
+/// `nvidia.gem_comptags`, default off; and the one RM call behind it, split
+/// off so `comptags` stays FFI-free and host-testable. Own files for the size
+/// ceiling.
+pub(super) mod comptags;
+
+/// Real `GEM_PUSHBUF` submission for the classic nvc0 (OpenGL) driver: the
+/// reloc arithmetic and range checks, hatch `nvidia.gem_pushbuf`, default
+/// off; and the mapping/stores/ring calls behind it, split off so `pushbuf`
+/// stays FFI-free and host-testable. Own files for the size ceiling.
+pub(super) mod pushbuf;
+mod pushbuf_submit;
+
 /// Implicit synchronisation: the dependency a submission has on work ANOTHER
 /// process still has in flight against a buffer it lent us. The nouveau uAPI
 /// `EXEC` carries only the syncobjs its client names, so without this a
@@ -8512,6 +8526,9 @@ impl NvidiaGpu {
                         va,
                         bo_offset,
                         pte_kind,
+                        // No GEM record here, so the placement is unknown
+                        // and a compressed kind always downgrades, as before.
+                        false,
                     )
                     .ok()
                 })
@@ -8828,11 +8845,17 @@ impl NvidiaGpu {
         // first, and a map the RM then refuses cannot put the old one back.
         match op.op {
             nv::VM_BIND_OP_MAP => {
+                // Asked for once: static after state load, and a game binds
+                // dozens of surfaces a second.
+                comptag_caps::ensure_read_once(device_instance);
                 // The holder check and the window check ran in
                 // `vm_bind_check_op` (handle 0 included: no object, ENOENT);
                 // the lookup here is for `h_memory`, and an object that went
-                // away in between is ENOENT.
-                let h_memory = {
+                // away in between is ENOENT. The placement comes out of the
+                // SAME lock: the compressed-kind decision reads the object's
+                // domain and page-rounded size, and reading those separately
+                // would race a concurrent GEM_FREE.
+                let (h_memory, honour_compressed) = {
                     let gem = self.nouveau_gem.lock();
                     let Some(obj) = gem
                         .iter()
@@ -8840,7 +8863,7 @@ impl NvidiaGpu {
                     else {
                         return Err(nv::ENOENT);
                     };
-                    obj.h_memory
+                    (obj.h_memory, comptags::honour_for_bind(rm_pte_kind, obj))
                 };
                 // REPLACE semantics, like Linux's gpuvm: a MAP over an
                 // already-mapped range unmaps the old mapping first instead
@@ -8895,6 +8918,7 @@ impl NvidiaGpu {
                     op.addr,
                     op.bo_offset,
                     rm_pte_kind,
+                    honour_compressed,
                 );
                 let rm_narration = nvidia_rm_sys::os_interface::capture_take();
                 let replay_rm = |narration: Option<alloc::string::String>| {
@@ -9118,17 +9142,25 @@ impl NvidiaGpu {
                 return;
             }
         };
-        let bind =
-            match rm::vm_bind_map(device_instance, 0, alloc.h_memory, TEST_SIZE, TEST_VA, 0, 0) {
-                Ok(b) if b.map_status == 0 => b,
-                _ => {
-                    crate::klog_warn!(
-                        "[nouveau-uapi] SELFTEST: VM_BIND of the test page failed -- cannot run"
-                    );
-                    rm::gem_free(device_instance, alloc.h_memory);
-                    return;
-                }
-            };
+        let bind = match rm::vm_bind_map(
+            device_instance,
+            0,
+            alloc.h_memory,
+            TEST_SIZE,
+            TEST_VA,
+            0,
+            0,
+            false,
+        ) {
+            Ok(b) if b.map_status == 0 => b,
+            _ => {
+                crate::klog_warn!(
+                    "[nouveau-uapi] SELFTEST: VM_BIND of the test page failed -- cannot run"
+                );
+                rm::gem_free(device_instance, alloc.h_memory);
+                return;
+            }
+        };
         let base = crate::bus::phys_to_virt(pa as usize);
         let sem_va = TEST_VA + SEM_OFF;
         unsafe {
@@ -14526,26 +14558,27 @@ impl NvidiaGpu {
             nv::NR_GEM_PUSHBUF => {
                 // The submission path of the classic **nvc0 Gallium** driver
                 // (Mesa OpenGL for Turing) -- the one the shipped image uses.
-                // Real submission is a hardware-validated follow-up, so this
-                // milestone PARSES and LOGS the whole request, then honestly
-                // returns EOPNOTSUPP. The dump is the anatomy needed to build
-                // real submission: how many buffers (and their domains),
-                // relocs, and pushes Mesa hands us per call.
+                // It PARSES and LOGS the whole request either way; with
+                // `nvidia.gem_pushbuf` it then submits for real, and without
+                // it returns EOPNOTSUPP as it always did. The dump is the
+                // anatomy of a submission: how many buffers (and their
+                // domains), relocs, and pushes Mesa hands us per call.
                 //
-                // What it still needs is TWO things, not the three this
-                // comment used to list: each listed BO mapped into the
-                // channel's GPU VAS so a push has a VA (the `eclipse_rm_vm_bind_map`
-                // mechanic, driven from here instead of from VM_BIND), and
-                // reloc resolution to patch those VAs into the pushbuffer
-                // words. The ring submission itself already exists
-                // (`eclipse_rm_exec_submit`, which EXEC drives). **The 3D
-                // class is NOT missing**: `eclipse_rm_init.c` allocates
-                // TURING_A (0xc597) on every channel it builds -- step17's
-                // stage 7b for the ctx-0 fallback channel and ctx_alloc's
-                // stage 10b for each per-process context -- because a channel
-                // without a graphics object wedges FECS mid-RESTORE on the
-                // first 3D SET_OBJECT. Listing it as a blocker here sent an
-                // audit of whether Eclipse has hardware 3D down the wrong path.
+                // The two things it used to be missing are in
+                // `pushbuf_submit.rs`: each listed BO mapped into the
+                // channel's GPU VAS so a push has a VA (the
+                // `eclipse_rm_vm_bind_map` mechanic, driven from here instead
+                // of from VM_BIND), and reloc resolution to patch those VAs
+                // into the pushbuffer words. The ring submission itself
+                // already existed (`eclipse_rm_exec_submit`, which EXEC
+                // drives). **The 3D class was never missing**:
+                // `eclipse_rm_init.c` allocates TURING_A (0xc597) on every
+                // channel it builds -- step17's stage 7b for the ctx-0
+                // fallback channel and ctx_alloc's stage 10b for each
+                // per-process context -- because a channel without a
+                // graphics object wedges FECS mid-RESTORE on the first 3D
+                // SET_OBJECT. Listing it as a blocker here sent an audit of
+                // whether Eclipse has hardware 3D down the wrong path.
                 let pb = unsafe { &mut *(arg as *mut nv::DrmNouveauGemPushbuf) };
                 // What `nouveau_gem_ioctl_pushbuf` checks before it submits
                 // anything, in its order: a client with a uvmm (`VM_INIT`)
@@ -14681,13 +14714,22 @@ impl NvidiaGpu {
                         );
                     }
                 }
-                log::warn!(
-                    "[nouveau-uapi] GEM_PUSHBUF: not submitted (real submission needs \
-                     GART GEM + 3D class + relocs -- follow-up); returning EOPNOTSUPP"
-                );
+                if !pushbuf::enabled() {
+                    log::warn!(
+                        "[nouveau-uapi] GEM_PUSHBUF: not submitted (nvidia.gem_pushbuf is \
+                         off); returning EOPNOTSUPP"
+                    );
+                    pb.suffix0 = 0;
+                    pb.suffix1 = 0;
+                    return Err(nv::EOPNOTSUPP);
+                }
+                // Real submission, from here down. Every failure writes the
+                // suffixes first, like every error past the copy in
+                // `nouveau_gem_ioctl_pushbuf`.
+                let submitted = self.gem_pushbuf_submit(pb, all_pushes, owner_pid);
                 pb.suffix0 = 0;
                 pb.suffix1 = 0;
-                Err(nv::EOPNOTSUPP)
+                submitted.map(|()| 0)
             }
 
             nv::NR_NVIF => self.nouveau_nvif(arg, size as usize, owner_pid),

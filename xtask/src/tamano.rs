@@ -64,7 +64,15 @@ const AJENOS: &[&str] = &["vendor/", "smoltcp/", "nvidia-rm-sys/vendor/"];
 /// dentro y es un tema entero son las credenciales (`setuid`/`setgid`/
 /// `setgroups` y sus comprobaciones) y el control de trabajos.
 const PASADOS: &[(&str, usize)] = &[
-    ("drivers/src/display/nvidia.rs", 15000),
+    // 15250: subido el 18-oct-2026 por la tanda de comptags, que añade dos
+    // declaraciones de modulo y la decision de si se honra un kind comprimido
+    // en el lookup de VM_BIND -- 17 lineas sobre un techo que estaba a 6 de
+    // distancia. Las dos partes gordas (la aritmetica y la llamada al RM) ya
+    // salieron a `nvidia/comptags.rs` y `nvidia/comptag_caps.rs`, asi que esto
+    // es lo que no se puede sacar: el sitio donde se decide. **Lo que toca es
+    // partir el fichero**, como dice el comentario de arriba, y no es la tanda
+    // que mete una escotilla nueva.
+    ("drivers/src/display/nvidia.rs", 15250),
     (
         "drivers/src/display/nvidia/nouveau_bookkeeping_tests.rs",
         9500,

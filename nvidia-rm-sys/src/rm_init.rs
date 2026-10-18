@@ -2094,6 +2094,7 @@ extern "C" {
         requested_va: u64,
         bo_offset: u64,
         pte_kind: NvU32,
+        honour_compressed_kind: NvU32,
         out: *mut VmBind,
     ) -> NV_STATUS;
     fn eclipse_rm_vm_bind_unmap(
@@ -2108,6 +2109,12 @@ extern "C" {
 /// `requested_va`, generalizing `step17`'s items 3+4. `ctx_idx` 0 is the
 /// compositor's singleton VAS (`step16`); `ctx_idx >= 1` is a GL client's own
 /// VAS from [`ctx_alloc`]. Requires that context's VAS allocated first.
+///
+/// `honour_compressed_kind` false (the default everywhere) lets the C glue
+/// downgrade a compressible kind to its uncompressed pair. True asks for the
+/// kind to reach the PTEs as given, so the RM derives the comptag line from
+/// the physical address -- only sound on a GPU whose [`comptag_caps`] say so,
+/// which is why the decision is the caller's and not this function's.
 pub fn vm_bind_map(
     device_instance: u32,
     ctx_idx: u32,
@@ -2116,6 +2123,7 @@ pub fn vm_bind_map(
     requested_va: u64,
     bo_offset: u64,
     pte_kind: u32,
+    honour_compressed_kind: bool,
 ) -> Result<VmBind, NV_STATUS> {
     let _gate = RmGate::lock();
     let mut out = VmBind {
@@ -2133,6 +2141,7 @@ pub fn vm_bind_map(
             requested_va,
             bo_offset,
             pte_kind,
+            u32::from(honour_compressed_kind),
             &mut out,
         )
     };
@@ -2429,6 +2438,29 @@ extern "C" {
         h_memory: NvU32,
         p_offset: *mut NvU64,
     ) -> NV_STATUS;
+    fn eclipse_rm_comptag_caps(gpu_instance: NvU32, p_out: *mut RmComptagCaps) -> NV_STATUS;
+}
+
+/// What the GPU reports about comptags, field for field `EclipseRmComptagCaps`
+/// in `eclipse_rm_init.c`. Every field is 0 or 1 except `compr_page_shift`.
+///
+/// This is reported rather than reduced to a verdict on purpose: there are
+/// THREE comptag modes, not two. One-to-one and raw are the ones in which the
+/// line is derived from the physical address, and the RM's own asserts accept
+/// only those; one-to-four exists and is neither. So a caller that sees
+/// `one_to_four` must refuse rather than fall through to "not one-to-one,
+/// therefore raw", and `/proc` can say which mode a board is actually in.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RmComptagCaps {
+    pub one_to_one: u32,
+    pub one_to_four: u32,
+    pub raw_mode: u32,
+    pub compbit_backing_off: u32,
+    pub post_l2_off: u32,
+    pub scrub_on_free: u32,
+    pub vas_for_ce: u32,
+    pub compr_page_shift: u32,
 }
 
 /// Map a producer fence semaphore into the consumer VAS for HW ACQUIRE.
@@ -2457,6 +2489,19 @@ pub fn map_peer_fence_sem(
         Some(consumer_va)
     } else {
         None
+    }
+}
+
+/// The GPU's comptag configuration, read from `kmemsysGetStaticConfig` and the
+/// memory manager. Read-only: allocates nothing and changes no state.
+pub fn comptag_caps(device_instance: u32) -> Result<RmComptagCaps, NV_STATUS> {
+    let _gate = RmGate::lock();
+    let mut caps = RmComptagCaps::default();
+    let status = unsafe { eclipse_rm_comptag_caps(device_instance, &mut caps) };
+    if status == NV_OK {
+        Ok(caps)
+    } else {
+        Err(status)
     }
 }
 

@@ -596,8 +596,8 @@ extern "C" fn eclipse_rm_step8(_a0: u32, _a1: *mut u8) -> u32 {
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, Ordering};
 use nvidia_rm_sys::rm_init::{
-    CtxAlloc, ExecFast, ExecSignal, ExecSubmit, GemAlloc, GemMapCpu, GrAlloc, GrChannel, VmBind,
-    ADDR_SYSMEM,
+    CtxAlloc, ExecFast, ExecSignal, ExecSubmit, GemAlloc, GemMapCpu, GrAlloc, GrChannel,
+    RmComptagCaps, VmBind, ADDR_SYSMEM,
 };
 
 const NV_OK: u32 = 0;
@@ -978,6 +978,20 @@ extern "C" fn eclipse_rm_gem_free(_inst: u32, h_memory: u32) -> u32 {
         }
     }
 }
+/// Succeeds with every capability clear, which is the "query worked, this GPU
+/// is in no mode we understand" case. Deliberately not a plausible Turing: a
+/// double that claimed one-to-one would make `may_honour_compressed_kind`
+/// return true across the host suite and quietly turn a behaviour change on in
+/// tests that are about something else. A test that wants the permissive case
+/// sets it through `comptags::set_caps`, which is where that decision belongs.
+#[no_mangle]
+extern "C" fn eclipse_rm_comptag_caps(_inst: u32, out: *mut RmComptagCaps) -> u32 {
+    let mut f = FAKE_RM.lock();
+    f.calls.push("comptag_caps");
+    unsafe { *out = RmComptagCaps::default() };
+    NV_OK
+}
+
 #[no_mangle]
 extern "C" fn eclipse_rm_vm_bind_map(
     _inst: u32,
@@ -987,6 +1001,7 @@ extern "C" fn eclipse_rm_vm_bind_map(
     requested_va: u64,
     bo_offset: u64,
     pte_kind: u32,
+    _honour_compressed_kind: u32,
     out: *mut VmBind,
 ) -> u32 {
     let mut f = FAKE_RM.lock();

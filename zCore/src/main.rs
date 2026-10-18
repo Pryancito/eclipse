@@ -916,6 +916,27 @@ fn primary_main(config: kernel_hal::KernelConfig) {
             // offset, and that arithmetic assumes BAR1 is a linear window onto
             // VRAM at offset 0 -- true of TU10x in the RM's default setup, not
             // verified on every board.
+            // A compressed PTE kind reaches the page tables instead of being
+            // swapped for its uncompressed pair, so the RM derives the comptag
+            // line from the surface's physical address. Default off, and the
+            // driver refuses it anyway unless the GPU reports a comptag mode
+            // where that derivation holds -- there is a third mode where it
+            // does not.
+            if kernel_hal::cmdline::flag(&options.cmdline, "nvidia.gem_comptags") {
+                kernel_hal::drivers::set_gem_comptags_enabled(true);
+                klog_info!(
+                    "Eclipse: nvidia.gem_comptags -- VM_BIND honours compressed PTE kinds"
+                );
+            }
+            // The classic nvc0 (OpenGL) submission path actually submits,
+            // instead of parsing the request and returning EOPNOTSUPP: every
+            // listed buffer is mapped into the channel's VAS, the relocs are
+            // patched, and each push goes to the ring. Default off because no
+            // method stream from this path has run on real hardware yet.
+            if kernel_hal::cmdline::flag(&options.cmdline, "nvidia.gem_pushbuf") {
+                kernel_hal::drivers::set_gem_pushbuf_enabled(true);
+                klog_info!("Eclipse: nvidia.gem_pushbuf -- GEM_PUSHBUF submits for real");
+            }
             if kernel_hal::cmdline::flag(&options.cmdline, "nvidia.gem_vram_bar1") {
                 kernel_hal::drivers::set_gem_vram_bar1_enabled(true);
                 klog_info!(

@@ -37,12 +37,21 @@ pub use nouveau_uapi::{
 };
 #[cfg(target_arch = "x86_64")]
 pub use nouveau_uapi::{enabled as nouveau_uapi_enabled, set_enabled as set_nouveau_uapi_enabled};
+/// Honouring a compressed PTE kind at `VM_BIND` (`nvidia.gem_comptags`),
+/// reached from `zCore`'s cmdline parsing by way of `kernel_hal::drivers`.
+#[cfg(target_arch = "x86_64")]
+pub use nvidia::comptags::set_enabled as set_gem_comptags_enabled;
 /// The implicit-sync hatch (`nvidia.implicit_sync=off`), for `zCore`'s
 /// cmdline parsing by way of `kernel_hal::drivers`.
 #[cfg(target_arch = "x86_64")]
 pub use nvidia::implicit_sync::{
     enabled as implicit_sync_enabled, set_enabled as set_implicit_sync_enabled,
 };
+/// Real `GEM_PUSHBUF` submission for the classic nvc0 OpenGL driver
+/// (`nvidia.gem_pushbuf`), reached from `zCore`'s cmdline parsing by way of
+/// `kernel_hal::drivers`.
+#[cfg(target_arch = "x86_64")]
+pub use nvidia::pushbuf::set_enabled as set_gem_pushbuf_enabled;
 /// CPU-mapping a VRAM `GEM_NEW` object through BAR1 (`nvidia.gem_vram_bar1`),
 /// reached from `zCore`'s cmdline parsing by way of `kernel_hal::drivers`.
 #[cfg(target_arch = "x86_64")]

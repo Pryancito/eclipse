@@ -90,6 +90,7 @@
 #include "class/cl0002.h"      /* NV01_CONTEXT_DMA (display ctxdmas) */
 #include "mem_mgr/mem.h"       /* Memory / memGetByHandle */
 #include "gpu/mem_mgr/heap.h"  /* HEAP_OWNER_RM_CLIENT_GENERIC */
+#include "gpu/mem_sys/kern_mem_sys.h" /* kmemsysGetStaticConfig: modos de comptag */
 #include "g_hal_register.h"
 /* Step 10 (CE memset/copy + readback verify) */
 #include "gpu/mem_mgr/mem_mgr.h"
@@ -8352,7 +8353,7 @@ typedef struct EclipseVmBind
  * one hardcoded channel buffer. */
 NV_STATUS eclipse_rm_vm_bind_map(NvU32 gpuInstance, NvU32 ctxIdx, NvU32 hMemory, NvU64 size,
                                   NvU64 requestedVA, NvU64 boOffset, NvU32 pteKind,
-                                  EclipseVmBind *pOut)
+                                  NvU32 bHonourCompressedKind, EclipseVmBind *pOut)
 {
     OBJGPU *pGpu;
     RM_API *pRmApi;
@@ -8507,8 +8508,13 @@ NV_STATUS eclipse_rm_vm_bind_map(NvU32 gpuInstance, NvU32 ctxIdx, NvU32 hMemory,
      * the RM's own HAL (memmgrGetUncompressedKind_TU102): correct bytes, no
      * comptags programmed.
      *
-     * That downgrade is a CHOICE, not a limitation, and this is the one place
-     * that makes it. On Turing there is no comptag allocator to lack: the line
+     * That downgrade is a CHOICE, not a limitation, this is the one place that
+     * makes it, and bHonourCompressedKind is how the caller declines it. The
+     * DEFAULT IS TO DOWNGRADE: the Rust layer passes 1 only behind
+     * nvidia.gem_comptags and only once eclipse_rm_comptag_caps says this GPU
+     * derives the line from the physical address. Passing 1 on a GPU in the
+     * one-to-FOUR mode, or with the compbit backing disabled, would hand the
+     * engine a line that describes other bytes. On Turing there is no comptag allocator to lack: the line
      * is a slice of the surface's physical address
      * (memmgrDetermineComptag_TU102 = 1 + physAddr[35:16]), and if a
      * compressible kind reached memdescSetPteKind unchanged, the Map below
@@ -8527,7 +8533,8 @@ NV_STATUS eclipse_rm_vm_bind_map(NvU32 gpuInstance, NvU32 ctxIdx, NvU32 hMemory,
         MemoryManager *pMemoryManager = GPU_GET_MEMORY_MANAGER(pGpu);
         Memory *pMemory = NULL;
         NvU32 kind = pteKind;
-        if (memmgrIsKind_HAL(pMemoryManager, FB_IS_KIND_COMPRESSIBLE, kind))
+        if (!bHonourCompressedKind &&
+            memmgrIsKind_HAL(pMemoryManager, FB_IS_KIND_COMPRESSIBLE, kind))
         {
             kind = memmgrGetUncompressedKind_HAL(pGpu, pMemoryManager, kind, NV_FALSE);
         }
@@ -10602,6 +10609,102 @@ NV_STATUS eclipse_rm_gem_fbmem_offset(NvU32 gpuInstance, NvU32 hMemory, NvU64 *p
             status = NV_ERR_NOT_SUPPORTED;
         else
             *pOffset = memdescGetPhysAddr(pMemDesc, AT_GPU, 0);
+    }
+
+    rmapiLockRelease();
+    gpumgrThreadDisableExpandedGpuVisibility();
+    threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
+    return status;
+}
+
+/*
+ * What this GPU reports about comptags, so the Rust side can decide whether a
+ * compressed PTE kind may be honoured instead of guessing.
+ *
+ * Why a query and not a constant: the comptag line on Turing is not allocated
+ * from a pool, it is a slice of the surface's physical address
+ * (memmgrDetermineComptag_TU102 = 1 + physAddr[35:16]), but that is only true
+ * in the two ONE-TO-ONE modes. There is a third mode, one-to-FOUR
+ * (bUseOneToFourComptagLineAllocation), where it is not, and the RM's own
+ * asserts in kgmmuFieldSetKindCompTags and kmemsysAllocComprResources accept
+ * only one-to-one or raw. So "Turing, therefore physically-derived" is an
+ * inference this file must not make on the Rust layer's behalf -- it reports
+ * what the GPU says and lets the caller refuse what it does not understand.
+ *
+ * Read-only: no allocation, no mapping, no state change. Safe to call at any
+ * time after GR alloc, and it reports the whole picture rather than a verdict
+ * so that /proc can print why compression is off on a given board.
+ */
+typedef struct EclipseRmComptagCaps
+{
+    NvU32 oneToOne;          /* bOneToOneComptagLineAllocation */
+    NvU32 oneToFour;         /* bUseOneToFourComptagLineAllocation */
+    NvU32 rawMode;           /* bUseRawModeComptaglineAllocation */
+    NvU32 compbitBackingOff; /* bDisableCompbitBacking */
+    NvU32 postL2Off;         /* bDisablePostL2Compression */
+    NvU32 scrubOnFree;       /* memmgrIsScrubOnFreeEnabled */
+    NvU32 vasForCe;          /* memmgrUseVasForCeMemoryOps */
+    NvU32 comprPageShift;    /* log2(comprPageSize); 16 on Turing */
+} EclipseRmComptagCaps;
+
+NV_STATUS eclipse_rm_comptag_caps(NvU32 gpuInstance, EclipseRmComptagCaps *pOut)
+{
+    OBJGPU *pGpu;
+    NV_STATUS status;
+    THREAD_STATE_NODE threadState;
+    MemoryManager *pMemoryManager = NULL;
+    const MEMORY_SYSTEM_STATIC_CONFIG *pCfg = NULL;
+
+    if (pOut == NULL)
+        return NV_ERR_INVALID_ARGUMENT;
+    portMemSet(pOut, 0, sizeof(*pOut));
+
+    if (!g_grAllocDone)
+        return NV_ERR_INVALID_STATE;
+
+    threadStateInit(&threadState, THREAD_STATE_FLAGS_NONE);
+    status = gpumgrThreadEnableExpandedGpuVisibility();
+    if (status != NV_OK)
+    {
+        threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
+        return status;
+    }
+    pGpu = gpumgrGetGpu(gpuInstance);
+    if (pGpu == NULL)
+    {
+        gpumgrThreadDisableExpandedGpuVisibility();
+        threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
+        return NV_ERR_INVALID_ARGUMENT;
+    }
+    status = rmapiLockAcquire(API_LOCK_FLAGS_NONE, RM_LOCK_MODULES_INIT);
+    if (status != NV_OK)
+    {
+        gpumgrThreadDisableExpandedGpuVisibility();
+        threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
+        return status;
+    }
+
+    pMemoryManager = GPU_GET_MEMORY_MANAGER(pGpu);
+    pCfg = kmemsysGetStaticConfig(pGpu, GPU_GET_KERNEL_MEMORY_SYSTEM(pGpu));
+    if (pMemoryManager == NULL || pCfg == NULL)
+    {
+        status = NV_ERR_INVALID_STATE;
+    }
+    else
+    {
+        pOut->oneToOne          = pCfg->bOneToOneComptagLineAllocation ? 1 : 0;
+        pOut->oneToFour         = pCfg->bUseOneToFourComptagLineAllocation ? 1 : 0;
+        pOut->rawMode           = pCfg->bUseRawModeComptaglineAllocation ? 1 : 0;
+        pOut->compbitBackingOff = pCfg->bDisableCompbitBacking ? 1 : 0;
+        pOut->postL2Off         = pCfg->bDisablePostL2Compression ? 1 : 0;
+        pOut->scrubOnFree       = memmgrIsScrubOnFreeEnabled(pMemoryManager) ? 1 : 0;
+        pOut->vasForCe          = memmgrUseVasForCeMemoryOps(pMemoryManager) ? 1 : 0;
+        pOut->comprPageShift    = pCfg->comprPageShift;
+        nv_printf(0, "[eclipse-rm-trace] comptag caps: 1:1=%u 1:4=%u raw=%u "
+                     "compbit_off=%u postL2_off=%u scrub=%u vas_ce=%u shift=%u\n",
+                  pOut->oneToOne, pOut->oneToFour, pOut->rawMode,
+                  pOut->compbitBackingOff, pOut->postL2Off,
+                  pOut->scrubOnFree, pOut->vasForCe, pOut->comprPageShift);
     }
 
     rmapiLockRelease();
