@@ -2877,10 +2877,14 @@ impl DrmDev {
                 if req.pad != 0 {
                     return Err(FsError::InvalidParam);
                 }
+                // `drm_syncobj_destroy`: `idr_remove` on the caller's own
+                // table, and a handle that is not there (never created,
+                // destroyed already, another file's) is EINVAL, not the
+                // ENOENT of `drm_syncobj_find`. This said ENOENT.
                 if zcore_drivers::scheme::syncobj::destroy_for(drm::current_pid(), req.handle) {
                     Ok(0)
                 } else {
-                    Err(FsError::EntryNotFound)
+                    Err(FsError::InvalidParam)
                 }
             }
 
