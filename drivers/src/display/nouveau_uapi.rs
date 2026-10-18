@@ -143,13 +143,18 @@ pub(super) fn chan_notifier_pa_cached() -> Option<u64> {
     }
 }
 
-/// NVIF subchannel objects that are backed by REAL RM class objects on a
-/// process's RM channel, keyed by `(channel_token, nvif_object_token, rm_handle,
-/// owner_pid)`. The channel token is the id CHANNEL_ALLOC handed back (and
-/// mesa echoes as NVIF `token`); draining by channel on `CHANNEL_FREE` reaps
-/// the throwaway-enumeration leak (NEW without DEL) without touching another
-/// live channel's classes.
-static CLASS_OBJECTS: lock::Mutex<alloc::vec::Vec<(u64, u64, u32, u64)>> =
+/// Engine-class objects on a process's channel, keyed by `(channel_token,
+/// object_token, rm_handle, owner_pid, abi16)`. The channel token is the id
+/// CHANNEL_ALLOC handed back (and mesa echoes as NVIF `token`); draining by
+/// channel on `CHANNEL_FREE` reaps the throwaway-enumeration leak (NEW without
+/// DEL) without touching another live channel's classes. `abi16` marks an
+/// object made by the abi16 `GROBJ_ALLOC` rather than by NVIF NEW: Linux keeps
+/// the two on separate lists (`chan->notifiers` and `abi16->objects`), so
+/// `GPUOBJ_FREE` finds only the former and NVIF DEL only the latter. An NVIF
+/// object is recorded only when it is backed by a REAL RM class object; an
+/// abi16 one always is, with `rm_handle` 0 when there is no RM behind it, so
+/// `GPUOBJ_FREE` can tell it from a handle never allocated (ENOENT).
+static CLASS_OBJECTS: lock::Mutex<alloc::vec::Vec<(u64, u64, u32, u64, bool)>> =
     lock::Mutex::new(alloc::vec::Vec::new());
 
 pub(super) fn class_object_insert(
@@ -160,7 +165,26 @@ pub(super) fn class_object_insert(
 ) {
     CLASS_OBJECTS
         .lock()
-        .push((channel_token, object_token, rm_handle, owner_pid));
+        .push((channel_token, object_token, rm_handle, owner_pid, false));
+}
+
+/// An abi16 `GROBJ_ALLOC` object: `handle` is the 32-bit one the client chose.
+pub(super) fn abi16_object_insert(channel_token: u64, handle: u32, rm_handle: u32, owner_pid: u64) {
+    CLASS_OBJECTS
+        .lock()
+        .push((channel_token, handle as u64, rm_handle, owner_pid, true));
+}
+
+/// `GPUOBJ_FREE`'s lookup: the abi16 object `handle` of `channel_token`, the
+/// caller's, removed; its RM handle (0 when it had none). An NVIF object of the
+/// same cookie is not found (`chan->notifiers` does not list it).
+pub(super) fn abi16_object_remove(channel_token: u64, handle: u32, owner_pid: u64) -> Option<u32> {
+    let mut t = CLASS_OBJECTS.lock();
+    t.iter()
+        .position(|(ch, obj, _, pid, abi16)| {
+            *abi16 && *ch == channel_token && *obj == handle as u64 && *pid == owner_pid
+        })
+        .map(|i| t.remove(i).2)
 }
 
 /// Removes and returns the RM handle for `object_token`, if it was RM-backed —
@@ -175,7 +199,7 @@ pub(super) fn class_object_insert(
 pub(super) fn class_object_remove(object_token: u64, owner_pid: u64) -> Option<u32> {
     let mut t = CLASS_OBJECTS.lock();
     t.iter()
-        .position(|(_, obj, _, pid)| *obj == object_token && *pid == owner_pid)
+        .position(|(_, obj, _, pid, abi16)| !*abi16 && *obj == object_token && *pid == owner_pid)
         .map(|i| t.remove(i).2)
 }
 
@@ -190,8 +214,11 @@ pub(super) fn class_objects_drain_channel(
     let mut i = 0;
     while i < t.len() {
         if t[i].0 == channel_token && t[i].3 == owner_pid {
-            let (_ch, token, h, _) = t.remove(i);
-            out.push((token, h));
+            let (_ch, token, h, _, _) = t.remove(i);
+            // An abi16 object without an RM handle has nothing to free.
+            if h != 0 {
+                out.push((token, h));
+            }
         } else {
             i += 1;
         }
@@ -207,8 +234,10 @@ pub(super) fn class_objects_drain_pid(pid: u64) -> alloc::vec::Vec<(u64, u32)> {
     let mut i = 0;
     while i < t.len() {
         if t[i].3 == pid {
-            let (_ch, token, h, _) = t.remove(i);
-            out.push((token, h));
+            let (_ch, token, h, _, _) = t.remove(i);
+            if h != 0 {
+                out.push((token, h));
+            }
         } else {
             i += 1;
         }
@@ -791,6 +820,12 @@ const DRM_COMMAND_BASE: u32 = 0x40;
 const DRM_NOUVEAU_GETPARAM: u32 = 0x00;
 const DRM_NOUVEAU_CHANNEL_ALLOC: u32 = 0x02;
 const DRM_NOUVEAU_CHANNEL_FREE: u32 = 0x03;
+/// The abi16 object ioctls of a libdrm without NVIF (`nouveau_object_new`
+/// / `_del` when `drm->nvif` is false): marked deprecated in the uapi header,
+/// still dispatched by `nouveau_drm.c`.
+const DRM_NOUVEAU_GROBJ_ALLOC: u32 = 0x04;
+const DRM_NOUVEAU_NOTIFIEROBJ_ALLOC: u32 = 0x05;
+const DRM_NOUVEAU_GPUOBJ_FREE: u32 = 0x06;
 const DRM_NOUVEAU_NVIF: u32 = 0x07;
 const DRM_NOUVEAU_VM_INIT: u32 = 0x10;
 const DRM_NOUVEAU_VM_BIND: u32 = 0x11;
@@ -878,9 +913,9 @@ pub fn nouveau_ioctl_name(nr: u32) -> &'static str {
         0x01 => "SETPARAM(deprecated)",
         DRM_NOUVEAU_CHANNEL_ALLOC => "CHANNEL_ALLOC",
         DRM_NOUVEAU_CHANNEL_FREE => "CHANNEL_FREE",
-        0x04 => "GROBJ_ALLOC(deprecated)",
-        0x05 => "NOTIFIEROBJ_ALLOC(deprecated)",
-        0x06 => "GPUOBJ_FREE(deprecated)",
+        DRM_NOUVEAU_GROBJ_ALLOC => "GROBJ_ALLOC",
+        DRM_NOUVEAU_NOTIFIEROBJ_ALLOC => "NOTIFIEROBJ_ALLOC",
+        DRM_NOUVEAU_GPUOBJ_FREE => "GPUOBJ_FREE",
         0x07 => "NVIF",
         0x08 => "SVM_INIT",
         0x09 => "SVM_BIND",
@@ -1177,6 +1212,29 @@ pub(super) struct DrmNouveauChannelAlloc {
 #[repr(C)]
 pub(super) struct DrmNouveauChannelFree {
     pub channel: i32,
+}
+
+/// `drm_nouveau_grobj_alloc`: gone from the uapi header, kept in the kernel's
+/// own `nouveau_abi16.h` with the ioctl that still takes it.
+#[repr(C)]
+pub(super) struct DrmNouveauGrobjAlloc {
+    pub channel: i32,
+    pub handle: u32,
+    pub class: i32,
+}
+
+#[repr(C)]
+pub(super) struct DrmNouveauNotifierobjAlloc {
+    pub channel: u32,
+    pub handle: u32,
+    pub size: u32,
+    pub offset: u32,
+}
+
+#[repr(C)]
+pub(super) struct DrmNouveauGpuobjFree {
+    pub channel: i32,
+    pub handle: u32,
 }
 
 #[repr(C)]
@@ -1705,6 +1763,9 @@ pub(super) fn min_payload_for_nr(nr: u32) -> Option<usize> {
         NR_GETPARAM => size_of::<DrmNouveauGetparam>(),
         NR_CHANNEL_ALLOC => size_of::<DrmNouveauChannelAlloc>(),
         NR_CHANNEL_FREE => size_of::<DrmNouveauChannelFree>(),
+        NR_GROBJ_ALLOC => size_of::<DrmNouveauGrobjAlloc>(),
+        NR_NOTIFIEROBJ_ALLOC => size_of::<DrmNouveauNotifierobjAlloc>(),
+        NR_GPUOBJ_FREE => size_of::<DrmNouveauGpuobjFree>(),
         NR_VM_INIT => size_of::<DrmNouveauVmInit>(),
         NR_VM_BIND => size_of::<DrmNouveauVmBind>(),
         NR_EXEC => size_of::<DrmNouveauExec>(),
@@ -2057,6 +2118,9 @@ mod pbdma_map_tests {
 pub(super) const NR_GETPARAM: u32 = DRM_COMMAND_BASE + DRM_NOUVEAU_GETPARAM;
 pub(super) const NR_CHANNEL_ALLOC: u32 = DRM_COMMAND_BASE + DRM_NOUVEAU_CHANNEL_ALLOC;
 pub(super) const NR_CHANNEL_FREE: u32 = DRM_COMMAND_BASE + DRM_NOUVEAU_CHANNEL_FREE;
+pub(super) const NR_GROBJ_ALLOC: u32 = DRM_COMMAND_BASE + DRM_NOUVEAU_GROBJ_ALLOC;
+pub(super) const NR_NOTIFIEROBJ_ALLOC: u32 = DRM_COMMAND_BASE + DRM_NOUVEAU_NOTIFIEROBJ_ALLOC;
+pub(super) const NR_GPUOBJ_FREE: u32 = DRM_COMMAND_BASE + DRM_NOUVEAU_GPUOBJ_FREE;
 pub(super) const NR_NVIF: u32 = DRM_COMMAND_BASE + DRM_NOUVEAU_NVIF;
 pub(super) const NR_VM_INIT: u32 = DRM_COMMAND_BASE + DRM_NOUVEAU_VM_INIT;
 pub(super) const NR_VM_BIND: u32 = DRM_COMMAND_BASE + DRM_NOUVEAU_VM_BIND;
@@ -2571,6 +2635,9 @@ mod gl_client_abi_tests {
             ("GETPARAM", NR_GETPARAM, 0x40 + 0x00),
             ("CHANNEL_ALLOC", NR_CHANNEL_ALLOC, 0x40 + 0x02),
             ("CHANNEL_FREE", NR_CHANNEL_FREE, 0x40 + 0x03),
+            ("GROBJ_ALLOC", NR_GROBJ_ALLOC, 0x40 + 0x04),
+            ("NOTIFIEROBJ_ALLOC", NR_NOTIFIEROBJ_ALLOC, 0x40 + 0x05),
+            ("GPUOBJ_FREE", NR_GPUOBJ_FREE, 0x40 + 0x06),
             ("NVIF", NR_NVIF, 0x40 + 0x07),
             (
                 "SVM_INIT is 0x08 and SVM_BIND 0x09: not ours",
@@ -2669,6 +2736,12 @@ mod gl_client_abi_tests {
             (NR_GETPARAM, size_of::<DrmNouveauGetparam>()),
             (NR_CHANNEL_ALLOC, size_of::<DrmNouveauChannelAlloc>()),
             (NR_CHANNEL_FREE, size_of::<DrmNouveauChannelFree>()),
+            (NR_GROBJ_ALLOC, size_of::<DrmNouveauGrobjAlloc>()),
+            (
+                NR_NOTIFIEROBJ_ALLOC,
+                size_of::<DrmNouveauNotifierobjAlloc>(),
+            ),
+            (NR_GPUOBJ_FREE, size_of::<DrmNouveauGpuobjFree>()),
             (NR_VM_INIT, size_of::<DrmNouveauVmInit>()),
             (NR_VM_BIND, size_of::<DrmNouveauVmBind>()),
             (NR_EXEC, size_of::<DrmNouveauExec>()),

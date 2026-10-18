@@ -217,3 +217,120 @@ fn nvif_reads_the_header_and_the_bodies_as_nouveau_abi16_ioctl_does() {
         Err(nv::EINVAL)
     );
 }
+
+/// The abi16 object ioctls of a libdrm without NVIF, still in nouveau's
+/// table and answered as `nouveau_abi16.c` does: `NOTIFIEROBJ_ALLOC` is
+/// EINVAL on Fermi and later before the channel is looked at;
+/// `GROBJ_ALLOC` refuses handle ~0 (EINVAL), a channel that is not the
+/// caller's (ENOENT), the old software and video identifiers that map to
+/// no class of this channel and a class of 0 (EINVAL), and otherwise
+/// makes the engine object an NVIF NEW would; `GPUOBJ_FREE` refuses a
+/// channel that is not the caller's (EINVAL, this one) and a handle that
+/// is not an abi16 object of it (ENOENT) -- an NVIF object is on another
+/// list, and an NVIF DEL does not reach an abi16 one. All three were
+/// ENOSYS, "unhandled".
+#[test]
+fn the_abi16_object_ioctls_answer_as_nouveau_abi16_does() {
+    let _g = LOCK.lock();
+    let gpu = gpu();
+    let grobj = |channel: i32, handle: u32, class: i32, pid: u64| {
+        let mut r = nv::DrmNouveauGrobjAlloc {
+            channel,
+            handle,
+            class,
+        };
+        call(
+            &gpu,
+            wr::<nv::DrmNouveauGrobjAlloc>(nv::NR_GROBJ_ALLOC),
+            &mut r,
+            pid,
+        )
+    };
+    let ntfy = |channel: u32, pid: u64| {
+        let mut r = nv::DrmNouveauNotifierobjAlloc {
+            channel,
+            handle: 0x1234,
+            size: 4096,
+            offset: 0,
+        };
+        call(
+            &gpu,
+            wr::<nv::DrmNouveauNotifierobjAlloc>(nv::NR_NOTIFIEROBJ_ALLOC),
+            &mut r,
+            pid,
+        )
+    };
+    let free = |channel: i32, handle: u32, pid: u64| {
+        let mut r = nv::DrmNouveauGpuobjFree { channel, handle };
+        call(
+            &gpu,
+            wr::<nv::DrmNouveauGpuobjFree>(nv::NR_GPUOBJ_FREE),
+            &mut r,
+            pid,
+        )
+    };
+    let einval = Err(nv::EINVAL);
+    let enoent = Err(nv::ENOENT);
+
+    assert_eq!(
+        grobj(0, u32::MAX, 0xc597, A),
+        einval,
+        "handle ~0, before the channel"
+    );
+    assert_eq!(
+        grobj(0, 0xbeef, 0xc597, A),
+        enoent,
+        "no channel: ENOENT here, not NVIF NEW's EINVAL"
+    );
+    assert_eq!(free(0, 0xbeef, A), einval, "no channel: EINVAL here");
+    assert_eq!(
+        ntfy(0, A),
+        einval,
+        "Fermi and later: EINVAL without looking"
+    );
+
+    assert_eq!(channel_alloc(&gpu, A).unwrap().channel, 0);
+    assert_eq!(ntfy(0, A), einval, "with a channel too");
+    assert_eq!(grobj(0, 0xbeef, 0, A), einval, "class 0");
+    assert_eq!(
+        grobj(0, 0xbeef, 0x506e, A),
+        einval,
+        "no software class on Turing"
+    );
+    assert_eq!(grobj(0, 0xbeef, 0x90b1, A), einval, "nor a video one");
+    assert_eq!(
+        grobj(0, 0xbeef, 0xc597, B),
+        enoent,
+        "A's channel is not B's"
+    );
+    assert_eq!(grobj(3, 0xbeef, 0xc597, A), enoent);
+    assert_eq!(grobj(0, 0xbeef, 0xc597, A), Ok(0));
+
+    assert_eq!(free(3, 0xbeef, A), einval);
+    assert_eq!(free(0, 0xbeef, B), einval, "A's channel is not B's");
+    assert_eq!(free(0, 0x1234, A), enoent, "never made");
+    // An NVIF object is not on GPUOBJ_FREE's list, and an NVIF DEL does
+    // not find a GROBJ one (a no-op there, as for anything it did not
+    // make).
+    assert_eq!(subchan_new(0, 0xc597, 0x1000).send(&gpu, A), Ok(0));
+    assert_eq!(free(0, 0x1000, A), enoent, "an NVIF object");
+    assert_eq!(
+        Nvif::new(nv::NVIF_IOCTL_V0_DEL, 0, 0, 0xbeef, HDR).send(&gpu, A),
+        Ok(0)
+    );
+    // The lookup is per channel: the same handle on another channel of
+    // the caller's is not it.
+    let second = channel_alloc(&gpu, A).unwrap().channel;
+    assert_ne!(second, 0);
+    assert_eq!(free(second, 0xbeef, A), enoent, "another channel of A's");
+    assert_eq!(channel_free(&gpu, second, A), Ok(0));
+    assert_eq!(free(0, 0xbeef, A), Ok(0), "still there after the NVIF DEL");
+    assert_eq!(free(0, 0xbeef, A), enoent, "twice");
+    // CHANNEL_FREE takes the channel's abi16 objects with it.
+    assert_eq!(grobj(0, 0xf00d, 0xc5c0, A), Ok(0));
+    assert_eq!(channel_free(&gpu, 0, A), Ok(0));
+    assert_eq!(grobj(0, 0xbeef, 0xc597, A), enoent, "freed");
+    assert_eq!(channel_alloc(&gpu, A).unwrap().channel, 0);
+    assert_eq!(free(0, 0xf00d, A), enoent, "went with the channel");
+    assert_eq!(channel_free(&gpu, 0, A), Ok(0));
+}
