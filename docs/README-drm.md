@@ -95,8 +95,8 @@ Leyenda: ✅ implementado · 🟡 parcial / no-op deliberado · ❌ no implement
 | ioctl | Estado | Notas |
 |---|---|---|
 | `DRM_IOCTL_VERSION` | ✅ | nombre `zcore`, versión 1.0.0 (`nouveau` 1.4.0 con el uAPI nouveau, `eclipse-compute` 0.1.0 en el nodo de cómputo); longitudes `strlen` sin NUL, como `drm_copy_field` |
-| `DRM_IOCTL_GET_UNIQUE` | 🟡 | `zcore-gpu` (no es un *busid* parseable `pci:…`) |
-| `DRM_IOCTL_SET_VERSION` | ✅ | interfaz 1.4 y la versión del driver que da VERSION; valida el par pedido (major y minor) como `drm_setversion` (lo usa Xorg/modesetting) |
+| `DRM_IOCTL_GET_UNIQUE` | ✅ | el *busid* del master como `drm_getunique`: vacío (longitud 0) hasta que `SET_VERSION` pide la interfaz 1.1 o posterior (`drm_set_busid`), luego `pci:DDDD:BB:SS.F` del dispositivo PCI que nombra el enlace `device` del nodo en sysfs (`drm_pci_set_busid`; `zcore-gpu` para un nodo sin PCI detrás); copia solo si cabe entero, sin NUL, y un `unique_len` con puntero nulo es EFAULT. Se va con el master (`DROP_MASTER` o cierre). Xorg lo parsea para encontrar el `pci_device` del nodo y elegir la GPU primaria |
+| `DRM_IOCTL_SET_VERSION` | ✅ | interfaz 1.4 y la versión del driver que da VERSION; valida el par pedido (major y minor) como `drm_setversion` (lo usa Xorg/modesetting); una interfaz 1.1+ aceptada fija el *busid* que da GET_UNIQUE |
 | `DRM_IOCTL_GET_MAGIC` / `AUTH_MAGIC` | ✅ | magic por fichero, minted una vez; `AUTH_MAGIC` solo desde el master (EACCES), de un magic de ese nodo (EINVAL) y una sola vez; autentica al dueño del magic (`drm_file.authenticated`, que también tiene quien toma el master y todo `open` de root, como en `drm_file_alloc`) |
 | `DRM_IOCTL_SET_MASTER` / `DROP_MASTER` | ✅ | un master por nodo: el primer `open` lo toma (`drm_master_open`), `SET_MASTER` con otro fichero como master es EBUSY, `DROP_MASTER` sin serlo es EINVAL; se suelta al cerrar el fd; conmuta la consola de texto del kernel (KD_GRAPHICS/KD_TEXT) |
 | `DRM_IOCTL_GET_CLIENT` / `GET_STATS` / `FINISH` / `SET_UNIQUE` / `BLOCK` / `UNBLOCK` / `ADD_DRAW` / `RM_DRAW` / `UPDATE_DRAW` / `MODE_ATTACHMODE` / `MODE_DETACHMODE` | ✅ | los huecos de `drm_ioctl.c`: `GET_CLIENT` solo responde `idx == 0` (con `auth` = `authenticated`, el pid del que llama, `uid` = *overflowuid* y magic/iocs a 0; otro idx es EINVAL, lo que para la enumeración de libva), `GET_STATS` pone la struct a cero, `FINISH` es un no-op `DRM_AUTH` (EACCES sin autenticar), `SET_UNIQUE` es `drm_invalid_op` y `BLOCK`…`UPDATE_DRAW` no-ops, todos `DRM_ROOT_ONLY` (EACCES sin `CAP_SYS_ADMIN`; el master no se exige, ver más abajo), `ATTACHMODE`/`DETACHMODE` no-ops |
@@ -287,9 +287,6 @@ Detalles:
 
 ## Huecos conocidos y justificación
 
-- **`GET_UNIQUE` no devuelve un busid `pci:…`**. libdrm moderno deriva el bus
-  del sysfs (`/sys/class/drm/card0/device`), que sí está; solo afectaría a
-  clientes legacy que parseen el *busid*.
 - **Gamma/CTM/HDR**: sin LUTs (`gamma_size=0`, sin `GAMMA_LUT`/`CTM`); el
   *scanout* software no las aplica. Consecuencia visible: gammastep, la luz
   nocturna y la gamma de RandR no hacen nada.

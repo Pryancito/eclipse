@@ -1790,7 +1790,27 @@ pub fn drop_master(minor: u32, file: usize) -> bool {
     let mut state = DRM_STATE.lock();
     let before = state.masters.len();
     state.masters.retain(|&(m, f)| !(m == minor && f == file));
-    state.masters.len() != before
+    let dropped = state.masters.len() != before;
+    if dropped {
+        state.busid.retain(|&m| m != minor);
+    }
+    dropped
+}
+
+/// `drm_set_busid`: `SET_VERSION` asking for interface 1.1 or later gives
+/// the master its bus id (`drm_pci_set_busid`), which [`busid_set`] then
+/// reports to `GET_UNIQUE`.
+pub fn set_busid(minor: u32) {
+    let mut state = DRM_STATE.lock();
+    if !state.busid.contains(&minor) {
+        state.busid.push(minor);
+    }
+}
+
+/// Whether `minor`'s master has a bus id for `GET_UNIQUE` to report; see
+/// [`DrmState::busid`].
+pub fn busid_set(minor: u32) -> bool {
+    DRM_STATE.lock().busid.contains(&minor)
 }
 
 /// Linux's `drm_device` identity for a `/dev/dri` minor: `card{n}` and
@@ -1911,7 +1931,11 @@ pub fn lease_revoke(minor: u32, lessee_id: u32) -> bool {
 /// about a closed open.
 fn master_release(minor: u32, file: usize) {
     let mut state = DRM_STATE.lock();
+    let before = state.masters.len();
     state.masters.retain(|&(m, f)| !(m == minor && f == file));
+    if state.masters.len() != before {
+        state.busid.retain(|&m| m != minor);
+    }
     state.magics.retain(|&(_, _, f)| f != file);
     state
         .authenticated
@@ -2074,6 +2098,14 @@ struct DrmState {
     /// always authenticated"); gone with the file. What `GET_CLIENT`
     /// reports and the `DRM_AUTH` ioctls require.
     authenticated: Vec<(u32, usize)>,
+    /// `drm_master.unique` as a flag: the minors whose master has its bus
+    /// id. Only `drm_set_busid` sets it, from `SET_VERSION` with interface
+    /// 1.1 or later, so `GET_UNIQUE` is empty (`unique_len` 0) until then;
+    /// the string itself is the node's sysfs PCI identity, read when asked.
+    /// Gone with the master: Linux frees `unique` with the `drm_master`,
+    /// which an open that still holds it keeps past `DROP_MASTER`; the
+    /// device has one master here, so its bus id goes when the master does.
+    busid: Vec<u32>,
     /// `drm_master.lessee_idr` of every node's master: the leases
     /// `CREATE_LEASE` made, each with the object ids it holds. See
     /// [`lease_create`].
@@ -2240,6 +2272,7 @@ lazy_static::lazy_static! {
         magics: Vec::new(),
         next_magic: 1,
         authenticated: Vec::new(),
+        busid: Vec::new(),
         leases: Vec::new(),
         atomic: AtomicKmsState::default(),
     });
