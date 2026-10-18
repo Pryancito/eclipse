@@ -177,6 +177,22 @@ fn cancelling_clears_the_latch_and_never_underflows() {
 
 /// The window as the timer IRQ leaves it on another CPU: queued, drained,
 /// not yet posted. [`finish_delivery`] is the other half.
+/// An active CRTC with a mode, as a flip finds it: the check phase
+/// refuses an event, and ACTIVE itself, on a CRTC with no mode.
+fn pretend_active() -> (bool, u32) {
+    let mut st = DRM_STATE.lock();
+    (
+        core::mem::replace(&mut st.atomic.active, true),
+        core::mem::replace(&mut st.atomic.mode_blob_id, 1),
+    )
+}
+
+fn restore_active((active, mode_blob_id): (bool, u32)) {
+    let mut st = DRM_STATE.lock();
+    st.atomic.active = active;
+    st.atomic.mode_blob_id = mode_blob_id;
+}
+
 fn leave_one_mid_delivery(file: &Arc<DrmFileState>) {
     queue_one(file);
     let drained: Vec<PendingDrmTimer> = PENDING_DRM_TIMERS.lock().drain(..).collect();
@@ -303,7 +319,7 @@ fn an_atomic_commit_that_lands_mid_delivery_waits_for_it_too() {
     // An event is only owed on a CRTC that is (or becomes) active: the
     // check phase refuses one on a pipe that is off and stays off, as
     // `drm_atomic_crtc_check` does. This is a frame on a running output.
-    let was_active = core::mem::replace(&mut DRM_STATE.lock().atomic.active, true);
+    let was_active = pretend_active();
     let (answer, first_completion_was_on_the_fd) = race_against_delivery(&file, |file| {
         atomic_commit(
             &AtomicUpdate::default(),
@@ -315,7 +331,7 @@ fn an_atomic_commit_that_lands_mid_delivery_waits_for_it_too() {
             None,
         )
     });
-    DRM_STATE.lock().atomic.active = was_active;
+    restore_active(was_active);
     assert_eq!(
         answer,
         Ok(()),
@@ -507,7 +523,13 @@ fn a_commit_with_only_an_out_fence_owes_a_completion_but_no_event() {
     reset();
     let file = DrmFileState::new();
 
-    let was_active = core::mem::replace(&mut DRM_STATE.lock().atomic.active, false);
+    let was_active = {
+        let mut st = DRM_STATE.lock();
+        (
+            core::mem::replace(&mut st.atomic.active, false),
+            st.atomic.mode_blob_id,
+        )
+    };
     let fence = syncobj::create(false);
     assert_eq!(
         atomic_commit(
@@ -529,7 +551,7 @@ fn a_commit_with_only_an_out_fence_owes_a_completion_but_no_event() {
     // waits for it instead of being delivered on the spot (see
     // `arm_coalesced_drm_timer_locked`).
     DRM_STATE.lock().next_vblank = kernel_hal::timer::timer_now();
-    DRM_STATE.lock().atomic.active = true;
+    pretend_active();
     assert_eq!(
         atomic_commit(
             &AtomicUpdate::default(),
@@ -542,7 +564,7 @@ fn a_commit_with_only_an_out_fence_owes_a_completion_but_no_event() {
         ),
         Ok(())
     );
-    DRM_STATE.lock().atomic.active = was_active;
+    restore_active(was_active);
     assert_eq!(
         FLIPS_IN_FLIGHT.load(Ordering::Acquire),
         1,
@@ -604,7 +626,7 @@ fn a_commit_with_only_an_out_fence_waits_for_a_delivery_in_progress_too() {
     let file = DrmFileState::new();
     leave_one_mid_delivery(&file);
 
-    let was_active = core::mem::replace(&mut DRM_STATE.lock().atomic.active, true);
+    let was_active = pretend_active();
     let fence = syncobj::create(false);
     let (answer, first_completion_was_on_the_fd) = race_against_delivery(&file, move |file| {
         atomic_commit(
@@ -617,7 +639,7 @@ fn a_commit_with_only_an_out_fence_waits_for_a_delivery_in_progress_too() {
             Some(fence),
         )
     });
-    DRM_STATE.lock().atomic.active = was_active;
+    restore_active(was_active);
     assert_eq!(answer, Ok(()));
     assert!(
         first_completion_was_on_the_fd,

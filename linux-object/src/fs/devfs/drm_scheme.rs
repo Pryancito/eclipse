@@ -5778,8 +5778,17 @@ fn connector_props(connector_id: u32, atomic: bool) -> alloc::vec::Vec<(u32, u64
         props.push((PROP_EDID, edid_blob_id(connector_id) as u64));
     }
     if atomic {
+        // `connector_state->crtc`: the connector stays routed to the CRTC
+        // while the CRTC has a mode committed, active or not (ACTIVE = 0 and
+        // DPMS off keep the routing; only unsetting the mode, with the
+        // connector's CRTC_ID = 0 in the same commit, clears it). This read
+        // ACTIVE.
         let (st, _) = drm::atomic_snapshot();
-        let crtc = if st.active { drm::SYNTH_CRTC_ID } else { 0 };
+        let crtc = if st.mode_blob_id != 0 {
+            drm::SYNTH_CRTC_ID
+        } else {
+            0
+        };
         props.push((PROP_CRTC_ID, crtc as u64));
     }
     props
@@ -6576,6 +6585,9 @@ mod setproperty_commit_tests;
 
 #[cfg(test)]
 mod plane_state_check_tests;
+
+#[cfg(test)]
+mod crtc_routing_check_tests;
 
 #[cfg(test)]
 mod trail_tests;

@@ -193,6 +193,14 @@ en los tres objetos, blobs de modo (`CREATEPROPBLOB`/`MODE_ID`) y
   EINVAL, como en Linux).
 - `ALLOW_MODESET` es obligatorio para cambios de `MODE_ID`/`ACTIVE`
   ("requires full modeset").
+- El CRTC y su conector van juntos, sobre el estado en el que el commit
+  **deja** al CRTC (`drm_atomic_helper_check_modeset`, "enabled/connectors
+  mismatch"): un modo se pone con el `CRTC_ID` del conector en el mismo commit
+  y se quita con él a 0; un modo sin conector, un conector sin modo o un
+  `CRTC_ID = 0` del conector con el modo puesto son EINVAL. `ACTIVE` sin modo
+  en el estado resultante es EINVAL sea `ACTIVE` o `MODE_ID = 0` lo que el
+  commit nombre (`drm_atomic_crtc_check`, "active without enabled"). El
+  `CRTC_ID` del conector se relee mientras hay modo, activo o no.
 - `PAGE_FLIP_EVENT` encola un `DRM_EVENT_FLIP_COMPLETE` por CRTC del commit.
 - `PAGE_FLIP_ASYNC` se rechaza (las *caps* async son 0).
 - Objeto/propiedad desconocidos → ENOENT; un valor que la propiedad no

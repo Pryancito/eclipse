@@ -7228,6 +7228,46 @@ pub fn atomic_commit(
         }
     }
 
+    // `drm_atomic_crtc_check` and `drm_atomic_helper_check_modeset` judge the
+    // CRTC's resulting state too. ACTIVE without a mode ("active without
+    // enabled") is EINVAL whichever of the two this commit names: MODE_ID = 0
+    // alone on an active CRTC was accepted here and left it active with no
+    // mode. And `crtc_state->enable` must agree with the connectors routed
+    // to the CRTC ("enabled/connectors mismatch"): a mode is set with the
+    // connector's CRTC_ID in the same commit and unset with it, which every
+    // compositor does and this never asked for -- the connector's CRTC_ID
+    // was only checked to name the CRTC and then dropped.
+    let ends_with_mode = match upd.mode_blob {
+        Some(b) => b != 0,
+        None => cur.mode_blob_id != 0,
+    };
+    let ends_active = upd.active.unwrap_or(cur.active);
+    if ends_active && !ends_with_mode {
+        log::error!(
+            "[drm] ATOMIC reject (test_only={}): active without enabled (upd.active={:?} upd.mode_blob={:?} cur.mode_blob_id={:#x})",
+            test_only, upd.active, upd.mode_blob, cur.mode_blob_id
+        );
+        return Err(AtomicError::Invalid);
+    }
+    // The routing follows the mode the atomic state holds (a screen with no
+    // atomic mode committed yet has none routed, whatever the legacy CRTC
+    // state says), the same reading `connector_props` gives back.
+    let cur_conn_crtc = if cur.mode_blob_id != 0 {
+        SYNTH_CRTC_ID
+    } else {
+        0
+    };
+    let new_conn_crtc = upd.connector_crtc_id.unwrap_or(cur_conn_crtc);
+    if ends_with_mode != (new_conn_crtc != 0) {
+        log::error!(
+            "[drm] ATOMIC reject (test_only={}): enabled/connectors mismatch (mode {} connector CRTC_ID {:#x})",
+            test_only,
+            if ends_with_mode { "set" } else { "unset" },
+            new_conn_crtc
+        );
+        return Err(AtomicError::Invalid);
+    }
+
     let active_change = upd.active.map(|a| a != cur.active).unwrap_or(false);
     // "requesting event but off" (`drm_atomic_crtc_check`): an event on a
     // CRTC that is off and stays off is refused, on purpose -- Linux's
@@ -7243,7 +7283,6 @@ pub fn atomic_commit(
     // gets here, so `completion` alone is the whole condition -- and an
     // `OUT_FENCE_PTR` on such a CRTC is refused the same way, since the
     // event it hangs off is what the check sees.
-    let ends_active = upd.active.unwrap_or(cur.active);
     if completion && !ends_active && !cur.active {
         log::error!(
             "[drm] ATOMIC reject: PAGE_FLIP_EVENT or OUT_FENCE_PTR on a CRTC that is off and stays off"
@@ -7261,19 +7300,6 @@ pub fn atomic_commit(
         );
         return Err(AtomicError::Invalid);
     }
-    // ACTIVE=1 needs a mode (committed now or earlier).
-    let ends_with_mode = match upd.mode_blob {
-        Some(b) => b != 0,
-        None => cur.mode_blob_id != 0,
-    };
-    if upd.active == Some(true) && !ends_with_mode {
-        log::error!(
-            "[drm] ATOMIC reject (test_only={}): ACTIVE=1 but no mode set (upd.mode_blob={:?} cur.mode_blob_id={:#x})",
-            test_only, upd.mode_blob, cur.mode_blob_id
-        );
-        return Err(AtomicError::Invalid);
-    }
-
     if test_only {
         return Ok(());
     }

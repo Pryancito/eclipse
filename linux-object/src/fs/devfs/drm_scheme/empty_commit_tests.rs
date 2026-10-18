@@ -56,10 +56,10 @@ fn an_empty_commit_is_fine_unless_it_asks_for_an_event() {
     c.ioctl(DRM_IOCTL_MODE_CREATEPROPBLOB, &mut blob)
         .expect("CREATEPROPBLOB");
     let on_crtc = Request::new(
-        &[drm::SYNTH_CRTC_ID],
-        &[2],
-        &[PROP_MODE_ID, PROP_ACTIVE],
-        &[u64::from(blob.blob_id), 1],
+        &[drm::SYNTH_CRTC_ID, drm::SYNTH_CONNECTOR_ID],
+        &[2, 1],
+        &[PROP_MODE_ID, PROP_ACTIVE, PROP_CRTC_ID],
+        &[u64::from(blob.blob_id), 1, drm::SYNTH_CRTC_ID as u64],
     );
     assert_eq!(
         commit(
