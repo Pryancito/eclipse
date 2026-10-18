@@ -635,6 +635,8 @@ struct ThreadInner {
     first_thread: bool,
     /// Should The ThreadExiting exception do not block this thread
     killed: bool,
+    /// Whether `start` has handed this thread a body. See `Thread::start_with`.
+    started: bool,
     flags: ThreadFlag,
 }
 
@@ -853,8 +855,43 @@ impl Thread {
 
     /// Start execution on the thread.
     pub fn start(self: &Arc<Self>, thread_fn: ThreadFn) -> ZxResult {
-        self.lock_inner()
-            .change_state(ThreadState::Running, &self.base);
+        self.start_with(|_| {}, thread_fn)
+    }
+
+    /// Set up the thread's registers with `setup` and start it, as one step.
+    ///
+    /// A thread starts once: `BAD_STATE` for every start after the first, as in
+    /// Zircon. A second start used to spawn a second body for the same thread,
+    /// and two bodies share one context: whichever lost the race for it found
+    /// `None` in `wait_for_run` and panicked the kernel. `zx_thread_start` on a
+    /// SUSPENDED thread got that far, since a suspended thread keeps its
+    /// context at home -- and its registers were rewritten on the way in, which
+    /// is why `setup` runs here, behind the same check, and not before it.
+    ///
+    /// A thread killed before it ever ran stays `Dying`. Its body is still
+    /// spawned, because leaving through that body is the only way a thread
+    /// gets out of its process's list; the run loops check for `Dying` before
+    /// they enter user mode, so it leaves without running a user instruction.
+    /// It used to be stamped `Running` here, which undid the kill: a thread
+    /// that `clone` had created but not yet started when `exit_group` came
+    /// through ran user code in a process that had already exited, and that
+    /// its parent may already have reaped.
+    pub fn start_with(
+        self: &Arc<Self>,
+        setup: impl FnOnce(&mut UserContext),
+        thread_fn: ThreadFn,
+    ) -> ZxResult {
+        {
+            let mut inner = self.lock_inner();
+            if inner.started {
+                return Err(ZxError::BAD_STATE);
+            }
+            setup(inner.context.as_mut().ok_or(ZxError::BAD_STATE)?);
+            inner.started = true;
+            if inner.state == ThreadState::New {
+                inner.change_state(ThreadState::Running, &self.base);
+            }
+        }
         let current = CurrentThread(self.clone());
         let future = thread_fn(current);
         kernel_hal::thread::spawn_with_affinity(
@@ -1128,8 +1165,10 @@ impl Thread {
         arg2: usize,
         thread_fn: ThreadFn,
     ) -> ZxResult {
-        self.with_context(|ctx| ctx.setup_uspace(entry, stack, &[arg1, arg2, 0]))?;
-        self.start(thread_fn)
+        self.start_with(
+            |ctx| ctx.setup_uspace(entry, stack, &[arg1, arg2, 0]),
+            thread_fn,
+        )
     }
 
     /// Stop the thread. Internal implementation of `exit` and `kill`.
@@ -1974,6 +2013,7 @@ mod tests {
     use super::*;
     use crate::object::*;
     use crate::task::*;
+    use kernel_hal::context::UserContextField;
     use kernel_hal::timer::timer_now;
 
     /// A waker that answers one question: was the thread's own lock free when
@@ -2183,6 +2223,11 @@ mod tests {
             )
             .await;
         assert_eq!(result.err(), Some(ZxError::TIMED_OUT));
+        assert_eq!(
+            thread.state(),
+            ThreadState::New,
+            "the wait is over and the thread still reports it is waiting"
+        );
 
         let cancel_token = proc.get_cancel_token(handle_value).unwrap();
         let future = object.wait_signal(Signal::READABLE);
@@ -2213,6 +2258,7 @@ mod tests {
             )
             .await;
         assert_eq!(result.err(), Some(ZxError::CANCELED));
+        assert_eq!(thread.state(), ThreadState::New);
     }
 
     #[test]
@@ -2308,8 +2354,88 @@ mod tests {
             let _context = thread.wait_for_run().await;
             assert!(timer_now() - time >= Duration::from_millis(20));
         }
-        let thread: Arc<dyn KernelObject> = thread;
-        thread.wait_signal(Signal::THREAD_TERMINATED).await;
+        terminated(&thread).await;
+    }
+
+    /// Wait for `thread` to terminate, with a bound.
+    ///
+    /// A thread's whole body runs in a task of its own, so a body that panics
+    /// or never gets its context back never terminates, and an unbounded wait
+    /// turned that into a suite that hung -- no test named, no verdict -- while
+    /// the tests that DID see the fault had already failed by name. Four
+    /// mutations of the suspend/resume path did exactly that to `wait_for_run`.
+    /// Bounded, the same faults fail by name.
+    async fn terminated(thread: &Arc<Thread>) {
+        let object: Arc<dyn KernelObject> = thread.clone();
+        async_std::future::timeout(
+            Duration::from_secs(3),
+            object.wait_signal(Signal::THREAD_TERMINATED),
+        )
+        .await
+        .expect("the thread never terminated: its body panicked or never ran");
+    }
+
+    /// A thread starts once. A suspended thread keeps its context at home, so
+    /// `zx_thread_start` on one used to get all the way through: its registers
+    /// rewritten, and a second body spawned for it, which on resume found the
+    /// context already taken by the first and panicked the kernel.
+    #[async_std::test]
+    async fn a_thread_starts_once_even_while_it_is_suspended() {
+        async fn body(thread: CurrentThread) {
+            let cx = thread.wait_for_run().await;
+            thread.put_context(cx);
+        }
+        async fn second_body(_: CurrentThread) {
+            panic!("a second body ran for the same thread");
+        }
+        let proc = Process::create(&Job::root(), "proc").expect("failed to create process");
+        let thread = Thread::create(&proc, "thread").expect("failed to create thread");
+        thread.suspend();
+        thread.start(|thread| Box::pin(body(thread))).unwrap();
+        assert_eq!(thread.state(), ThreadState::Suspended);
+
+        let second = thread.start_with(
+            |ctx| ctx.set_field(UserContextField::InstrPointer, 0xdead),
+            |thread| Box::pin(second_body(thread)),
+        );
+
+        assert_eq!(second.err(), Some(ZxError::BAD_STATE));
+        assert_ne!(
+            thread.with_context(|ctx| ctx.get_field(UserContextField::InstrPointer)),
+            Ok(0xdead),
+            "the refused start rewrote the registers anyway"
+        );
+        thread.resume();
+        terminated(&thread).await;
+    }
+
+    /// A thread killed before it starts is still dying when it does. `clone`
+    /// creates the thread and starts it a few steps later, and an `exit_group`
+    /// in between kills it; the start used to stamp it `Running` over that, so
+    /// it ran user code in a process that had already exited.
+    #[async_std::test]
+    async fn a_thread_killed_before_it_starts_never_reaches_user_mode() {
+        static REACHED_USER_MODE: AtomicBool = AtomicBool::new(false);
+        // What `run_user` does first, in both loaders: take the context, and
+        // leave without entering user mode if the thread is dying.
+        async fn run_user(thread: CurrentThread) {
+            let _cx = thread.wait_for_run().await;
+            if thread.state() != ThreadState::Dying {
+                REACHED_USER_MODE.store(true, Ordering::SeqCst);
+            }
+        }
+        let proc = Process::create(&Job::root(), "proc").expect("failed to create process");
+        let thread = Thread::create(&proc, "thread").expect("failed to create thread");
+        proc.exit(9);
+
+        thread.start(|thread| Box::pin(run_user(thread))).unwrap();
+
+        terminated(&thread).await;
+        assert!(
+            !REACHED_USER_MODE.load(Ordering::SeqCst),
+            "the start undid the kill"
+        );
+        assert_eq!(proc.exit_code(), Some(9));
     }
 
     #[test]
@@ -2946,6 +3072,43 @@ mod sched_tests {
         );
     }
 
+    /// The wake that was denied gets a timer for when the floor ends, and only
+    /// a thread the floor applies to gets one: `SCHED_IDLE` is never denied,
+    /// and `SCHED_FIFO` has no slice for a floor to sit in.
+    #[test]
+    fn only_a_thread_the_floor_applies_to_gets_a_floor_end() {
+        let just_started = |t: &Thread| {
+            let now = kernel_hal::timer::timer_now().as_nanos() as u64;
+            t.sched
+                .slice_end_ns
+                .store(now.saturating_add(t.timeslice_ns()), Ordering::Relaxed);
+        };
+        let fair = a_thread();
+        just_started(&fair);
+        assert!(
+            fair.sched_wake_preempt_floor_end().is_some(),
+            "al hilo justo se le deniega el despertar y nadie le pone temporizador"
+        );
+
+        let idle = a_thread();
+        idle.set_sched(SCHED_IDLE, 0, 0);
+        just_started(&idle);
+        assert_eq!(
+            idle.sched_wake_preempt_floor_end(),
+            None,
+            "a SCHED_IDLE nunca se le deniega nada"
+        );
+
+        let fifo = a_thread();
+        fifo.set_sched(SCHED_FIFO, 0, 50);
+        just_started(&fifo);
+        assert_eq!(
+            fifo.sched_wake_preempt_floor_end(),
+            None,
+            "SCHED_FIFO no tiene slice"
+        );
+    }
+
     #[test]
     fn a_poll_that_never_parked_does_not_help_itself_to_a_fresh_slice() {
         let t = a_thread();
@@ -3240,6 +3403,7 @@ mod sched_tests {
 #[cfg(test)]
 mod state_and_accounting_tests {
     use super::*;
+    use crate::object::KernelObject;
     use crate::task::*;
 
     fn a_thread() -> Arc<Thread> {
@@ -3297,6 +3461,79 @@ mod state_and_accounting_tests {
         inner.state = ThreadState::Running;
         inner.context = None;
         assert_eq!(inner.state(), ThreadState::Running);
+    }
+
+    /// A suspend that lands while the thread is out in user mode shows when
+    /// the context comes back, which is the moment the thread really stops:
+    /// `put_context` flips the signals then. Its shortcut for the plain
+    /// running case must not swallow that one.
+    #[test]
+    fn a_suspend_taken_while_running_shows_when_the_context_comes_back() {
+        let t = CurrentThread(a_thread());
+        let cx = t
+            .lock_inner()
+            .context
+            .take()
+            .expect("a new thread has its context");
+        t.lock_inner().change_state(ThreadState::Running, &t.base);
+        t.suspend();
+        assert!(
+            t.signal().contains(Signal::THREAD_RUNNING),
+            "still in user mode: nothing has stopped yet"
+        );
+
+        t.put_context(cx);
+
+        assert!(
+            t.signal().contains(Signal::THREAD_SUSPENDED),
+            "the thread stopped and its waiters were never told"
+        );
+        assert!(!t.signal().contains(Signal::THREAD_RUNNING));
+    }
+
+    /// A dying thread is neither running nor suspended, and its signals say
+    /// so: a debugger waiting for THREAD_SUSPENDED must not take a thread
+    /// being killed for one it may inspect.
+    #[test]
+    fn a_dying_thread_drops_the_running_and_suspended_signals() {
+        let t = a_thread();
+        t.suspend();
+        assert!(t.signal().contains(Signal::THREAD_SUSPENDED));
+
+        t.kill();
+
+        assert_eq!(t.state(), ThreadState::Dying);
+        assert!(
+            !t.signal().intersects(
+                Signal::THREAD_RUNNING | Signal::THREAD_SUSPENDED | Signal::THREAD_TERMINATED
+            ),
+            "{:?}",
+            t.signal()
+        );
+    }
+
+    /// Only a thread stopped in an exception has a report to hand out, which
+    /// is what `ZX_INFO_THREAD_EXCEPTION_REPORT` reads.
+    #[test]
+    fn only_a_thread_stopped_in_an_exception_has_a_report_to_give() {
+        let t = a_thread();
+        t.lock_inner().exception = Some(Exception::new(&t, ExceptionType::ThreadStarting, None));
+        assert_eq!(
+            t.get_thread_exception_info().err(),
+            Some(ZxError::BAD_STATE),
+            "the thread is not stopped in it"
+        );
+
+        t.lock_inner().state = ThreadState::BlockedException;
+        assert!(t.get_thread_exception_info().is_ok());
+    }
+
+    /// The guards around `ext` read intact on a thread nothing has written
+    /// over. A report that called every thread smashed would bury the one
+    /// that is.
+    #[test]
+    fn a_fresh_thread_reports_both_ext_guards_intact() {
+        assert_eq!(a_thread().ext_canaries(), (true, true));
     }
 
     /// `wait_for_run` takes the context away, and the only thing that makes the

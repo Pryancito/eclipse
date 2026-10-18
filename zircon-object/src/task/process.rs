@@ -611,15 +611,17 @@ impl Process {
             handle_value = arg1.map_or(INVALID_HANDLE, |handle| inner.add_handle(handle));
         }
         thread.set_first_thread();
-        let setup = thread.with_context(|ctx| {
-            ctx.setup_uspace(entry, stack, &[handle_value as usize, arg2, 0]);
-            // AArch64 bare-metal enables extended state on the first hardware
-            // access trap. Hosted execution cannot trap it lazily, while the
-            // current RISC-V and x86-64 Fuchsia images require it at startup.
-            #[cfg(not(all(target_arch = "aarch64", not(feature = "libos"))))]
-            ctx.enable_extended_state();
-        });
-        let res = setup.and_then(|_| thread.start(thread_fn));
+        let res = thread.start_with(
+            |ctx| {
+                ctx.setup_uspace(entry, stack, &[handle_value as usize, arg2, 0]);
+                // AArch64 bare-metal enables extended state on the first hardware
+                // access trap. Hosted execution cannot trap it lazily, while the
+                // current RISC-V and x86-64 Fuchsia images require it at startup.
+                #[cfg(not(all(target_arch = "aarch64", not(feature = "libos"))))]
+                ctx.enable_extended_state();
+            },
+            thread_fn,
+        );
         if res.is_err() && handle_value != INVALID_HANDLE {
             self.inner.lock().remove_handle(handle_value).ok();
         }
@@ -2196,6 +2198,12 @@ mod tests {
             "puntero desalineado"
         );
         assert!(!vec_header_looks_live(0x71, 3, 3, 8), "puntero imposible");
+        // A full one, which is every thread list at 4, 8, 16... threads: a
+        // `Vec` that grew by pushes doubles its capacity only when it is full.
+        assert!(
+            vec_header_looks_live(0xffff_8000_0040_0000, 4, 4, 8),
+            "un Vec lleno es un Vec vivo"
+        );
         assert!(
             !vec_header_looks_live(0xffff_8000_0040_0000, 1, usize::MAX, 8),
             "una capacidad que nunca fue una capacidad"
@@ -2426,6 +2434,98 @@ mod ext_and_lifecycle_tests {
         proc.exit(7);
         assert_eq!(proc.exit_code(), Some(5));
         assert_eq!(proc.get_info().return_code, 5);
+    }
+
+    /// When the last thread leaves a process nobody called `exit` on, the
+    /// process exits with the code that thread said it was exiting with, or 0
+    /// if none did. Two threads calling `_exit` at once can each see the other
+    /// still there, so neither calls `exit`, and this is the only place the
+    /// code gets on file.
+    #[test]
+    fn the_last_thread_out_leaves_the_hinted_code_or_zero() {
+        let quiet = proc();
+        Thread::create(&quiet, "only")
+            .expect("failed to create thread")
+            .terminate_abandoned();
+        assert_eq!(quiet.exit_code(), Some(0), "nothing was hinted");
+
+        let hinted = proc();
+        let first = Thread::create(&hinted, "first").expect("failed to create thread");
+        let last = Thread::create(&hinted, "last").expect("failed to create thread");
+        hinted.hint_exit_code(3);
+        first.terminate_abandoned();
+        assert_eq!(hinted.exit_code(), None, "a thread is still in it");
+        last.terminate_abandoned();
+        assert_eq!(hinted.exit_code(), Some(3));
+    }
+
+    /// The first thread's first argument is the handle `zx_process_start` gave
+    /// the process, so that handle has to be in the process when the thread
+    /// runs. A start that fails runs nothing that could ever close it, so there
+    /// it is taken back out.
+    #[async_std::test]
+    async fn the_first_handle_is_kept_by_a_start_and_taken_back_by_a_failed_one() {
+        async fn body(thread: CurrentThread) {
+            let cx = thread.wait_for_run().await;
+            thread.put_context(cx);
+        }
+        async fn terminated(thread: &Arc<Thread>) {
+            let object: Arc<dyn KernelObject> = thread.clone();
+            async_std::future::timeout(
+                core::time::Duration::from_secs(3),
+                object.wait_signal(Signal::THREAD_TERMINATED),
+            )
+            .await
+            .expect("the thread never terminated");
+        }
+
+        let started = proc();
+        let thread = Thread::create(&started, "first").expect("failed to create thread");
+        let arg = Event::new();
+        // Suspended, so the body cannot run to the end -- the process exiting
+        // and closing its handles -- before they are counted.
+        thread.suspend();
+        started
+            .start(
+                &thread,
+                1,
+                4,
+                Some(Handle::new(arg.clone(), Rights::DEFAULT_EVENT)),
+                0,
+                |thread| Box::pin(body(thread)),
+            )
+            .expect("failed to start the process");
+        assert_eq!(
+            started.count_handles_to(arg.id()),
+            1,
+            "the first argument names a handle the process does not have"
+        );
+        thread.resume();
+        terminated(&thread).await;
+
+        // A thread that has already started is the one way to make the start
+        // fail after the handle went in.
+        let refused = proc();
+        let thread = Thread::create(&refused, "first").expect("failed to create thread");
+        thread.suspend();
+        thread.start(|thread| Box::pin(body(thread))).unwrap();
+        let arg = Event::new();
+        let res = refused.start(
+            &thread,
+            1,
+            4,
+            Some(Handle::new(arg.clone(), Rights::DEFAULT_EVENT)),
+            0,
+            |thread| Box::pin(body(thread)),
+        );
+        assert_eq!(res.err(), Some(ZxError::BAD_STATE));
+        assert_eq!(
+            refused.count_handles_to(arg.id()),
+            0,
+            "a failed start left its handle behind"
+        );
+        thread.resume();
+        terminated(&thread).await;
     }
 
     /// Termination is published when the status is, not when the last thread
