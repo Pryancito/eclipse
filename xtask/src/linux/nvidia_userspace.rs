@@ -1,8 +1,10 @@
 //! NVIDIA's own userspace for the vendored RM: `nvidia-smi`, NVML
 //! (`libnvidia-ml`) and the CUDA driver (`libcuda` and its PTX JIT), with the
 //! glibc runtime they need. They are the real clients of `/dev/nvidiactl`
-//! (the `nvidia.nvidiactl` hatch). Only with `ECLIPSE_NVIDIA_USERSPACE=1`;
-//! without it the rootfs does not change.
+//! (the `nvidia.nvidiactl` hatch). Installed unless the build is run with
+//! `ECLIPSE_NVIDIA_USERSPACE=0`, which also takes out NVIDIA's files an earlier
+//! build left in the rootfs. They never reach the QEMU live root, where there
+//! is no NVIDIA GPU for them.
 //!
 //! # The version must match the vendored RM exactly
 //!
@@ -43,8 +45,19 @@ use std::{
 
 use crate::PROJECT_DIR;
 
-/// The environment variable that asks for it.
+/// The environment variable that turns it off (`0`, `off`, `no` or `false`).
 pub(super) const HATCH: &str = "ECLIPSE_NVIDIA_USERSPACE";
+
+/// Whether this build installs it.
+pub(super) fn wanted() -> bool {
+    wanted_by(std::env::var(HATCH).ok().as_deref())
+}
+
+/// On unless `value`, the variable's, is one of the off spellings the other
+/// build switches take.
+fn wanted_by(value: Option<&str>) -> bool {
+    !value.is_some_and(super::xorg::knob_off)
+}
 
 const POOL: &str = "https://archive.ubuntu.com/ubuntu/pool";
 
@@ -410,13 +423,38 @@ fn install_staged(
     Ok(())
 }
 
+/// Takes NVIDIA's files and links out of `root`, and says how many there were.
+/// The glibc stays: it is small, and the loader may be another stack's.
+fn remove_with(root: &Path, plan: &Plan) -> usize {
+    plan.nvidia
+        .iter()
+        .flat_map(|(_, takes)| takes.iter().map(|take| take.to.as_str()))
+        .chain(plan.links.iter().map(|(link, _)| link.as_str()))
+        .filter(|path| fs::remove_file(root.join(path)).is_ok())
+        .count()
+}
+
+/// `remove_with` for this RM's version, saying why when anything goes.
+pub(super) fn remove(root: &Path, why: &str) {
+    let Some(version) = super::nvidia_firmware::pinned_rm_version() else {
+        return;
+    };
+    let removed = remove_with(root, &plan(&version));
+    if removed > 0 {
+        println!(
+            "  {}: took out NVIDIA's userspace ({removed} files): {why}",
+            root.display()
+        );
+    }
+}
+
 /// Best-effort, like the GSP firmware: a failure is reported and the build
 /// goes on without NVIDIA's userspace.
 pub(super) fn install(rootfs: &Path) {
     let Some(version) = super::nvidia_firmware::pinned_rm_version() else {
         eprintln!(
-            "warning: {HATCH}: no NVIDIA_VERSION in the submodule's version.mk; \
-             no NVIDIA userspace"
+            "warning: no NVIDIA_VERSION in the submodule's version.mk, so no NVIDIA \
+             userspace"
         );
         return;
     };
@@ -425,8 +463,9 @@ pub(super) fn install(rootfs: &Path) {
     match install_with(rootfs, &cache, &version, &plan(&version), &download) {
         Ok(()) => println!("  done"),
         Err(why) => eprintln!(
-            "warning: {HATCH}: {why}; the image has no NVIDIA userspace. A machine \
-             that cannot reach {POOL} can be given the packages in {}",
+            "warning: NVIDIA userspace: {why}; the image has none. A machine that \
+             cannot reach {POOL} can be given the packages in {}, and {HATCH}=0 \
+             leaves them out",
             cache.display()
         ),
     }
