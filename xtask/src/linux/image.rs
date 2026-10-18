@@ -477,9 +477,13 @@ impl super::LinuxRootfs {
             // lib/firmware entirely).
             super::nvidia_firmware::install(&rootfs_path);
             // NVIDIA's own userspace (nvidia-smi, NVML, libcuda) and the glibc
-            // it runs on, for /dev/nvidiactl: only when asked for.
-            if std::env::var(super::nvidia_userspace::HATCH).as_deref() == Ok("1") {
+            // it runs on, for /dev/nvidiactl, unless ECLIPSE_NVIDIA_USERSPACE=0.
+            // Off also takes out what an earlier build put here, since the
+            // rootfs is never cleared.
+            if super::nvidia_userspace::wanted() {
                 super::nvidia_userspace::install(&rootfs_path);
+            } else {
+                super::nvidia_userspace::remove(&rootfs_path, "ECLIPSE_NVIDIA_USERSPACE is off");
             }
 
             // Remove any installer payloads left over from a previous (possibly
@@ -778,6 +782,10 @@ impl super::LinuxRootfs {
             // Mesa even if an earlier desktop build left something behind.
             if self.variant().has_desktop() {
                 super::xorg::copy_into_live(&rootfs_path, &live_root);
+                // That copies usr/lib and usr/bin whole, NVIDIA's userspace
+                // with them, and QEMU has no NVIDIA GPU for it: libcuda and
+                // its PTX JIT alone are 130 MiB of RAM initramfs.
+                super::nvidia_userspace::remove(&live_root, "QEMU has no NVIDIA GPU");
             } else {
                 println!("minimal variant: not copying the desktop into the live root");
             }

@@ -141,7 +141,7 @@ Leyenda: ✅ implementado · 🟡 parcial / no-op deliberado · ❌ no implement
 | `DRM_IOCTL_MODE_PAGE_FLIP` | ✅ | *scanout*; `DRM_EVENT_FLIP_COMPLETE` (con `crtc_id` y la secuencia de vblank) solo con `PAGE_FLIP_EVENT`; `ASYNC`/`TARGET_*`/flags desconocidos → EINVAL, fb desconocido → ENOENT |
 | `DRM_IOCTL_MODE_OBJ_GETPROPERTIES` | ✅ | tabla de propiedades por objeto; las propiedades `DRM_MODE_PROP_ATOMIC` solo se muestran a clientes atómicos (mismo filtrado que Linux) |
 | `DRM_IOCTL_MODE_GETPROPERTY` | ✅ | metadatos completos: flags, nombre, rangos/enums/tipo de objeto |
-| `DRM_IOCTL_MODE_OBJ_SETPROPERTY` / `SETPROPERTY` | 🟡 | **DPMS sí actúa**: cualquier valor distinto de "On" apaga el CRTC (pantalla en negro y se dejan de repintar el cursor y el daño), y la propiedad se relee con el valor puesto. El resto se acepta como no-op |
+| `DRM_IOCTL_MODE_OBJ_SETPROPERTY` / `SETPROPERTY` | ✅ | **DPMS sí actúa**: cualquier valor distinto de "On" apaga el CRTC (pantalla en negro y se dejan de repintar el cursor y el daño), y la propiedad se relee con el valor puesto. El resto es `set_property_atomic` como en `drm_mode_obj_set_property_ioctl`: con `drm.atomic` un commit atómico de esa sola propiedad, sin evento y sin `ALLOW_MODESET` (un `FB_ID` en el plano primario es un flip; `ACTIVE`/`MODE_ID` que cambian el estado son EINVAL; un `OUT_FENCE_PTR` escribe -1 y no hay fence, que sólo la hace el ioctl ATOMIC); sin `drm.atomic` es `set_property_legacy`, y este KMS no tiene `set_property` más que para DPMS: EINVAL |
 | `DRM_IOCTL_MODE_GETPROPBLOB` | ✅ | EDID + blobs del almacén de propiedades. Como `drm_mode_getblob_ioctl`: los bytes se copian sólo si `length` es **exactamente** la del blob (el patrón de dos llamadas de `drmModeGetPropertyBlob`), con EFAULT si el puntero no vale; `length` vuelve siempre con la del blob |
 | `DRM_IOCTL_MODE_CREATEPROPBLOB` / `DESTROYPROPBLOB` | ✅ | almacén de blobs; `length` 0 (o más de 64 KiB, tope local) EINVAL antes de mirar el puntero, y un puntero nulo o inválido con longitud EFAULT (`copy_from_user`), no EINVAL; destruir un blob del kernel da EACCES (Linux: EPERM) |
 | `DRM_IOCTL_MODE_CURSOR` / `CURSOR2` | ✅ | cursor compuesto por el kernel sobre cada frame (`set_cursor_bo`/`move_cursor`); sin flag o con uno desconocido → EINVAL antes de buscar el CRTC (ENOENT), como `drm_mode_cursor_common`; un handle con ancho o alto 0, o más de 64×64 (el tamaño anunciado en las *caps*) → EINVAL; solo el handle 0 esconde el puntero |
@@ -200,6 +200,19 @@ en los tres objetos, blobs de modo (`CREATEPROPBLOB`/`MODE_ID`) y
   `drm_property_change_valid_get`: un `FB_ID`/`CRTC_ID` que no nombra nada o
   supera 32 bits, un `MODE_ID`/`FB_DAMAGE_CLIPS` sin blob, un rango o enum
   fuera de lo anunciado (`IN_FENCE_FD` es `[-1, INT_MAX]`).
+- La comprobación del plano (`drm_atomic_plane_check`) mira el estado en el
+  que el commit **deja** al plano, no sólo lo que el commit nombra: CRTC y FB
+  los dos puestos o los dos quitados (un `FB_ID = 0` o un `CRTC_ID = 0` a
+  solas es EINVAL y no aplica nada; el plano se apaga y se enciende con los
+  dos en el mismo commit), el rectángulo fuente en 16.16 dentro del fb con el
+  que acaba (`src_w > ancho << 16 || src_x > (ancho << 16) - src_w`, un borde
+  fraccionario cuenta) → **ENOSPC**, y cada clip de `FB_DAMAGE_CLIPS` un
+  rectángulo real desde el origen (EINVAL; el borde lejano se compara con el
+  tamaño del fb **desplazado 16 bits**, como hace Linux, así que un clip que
+  se pasa en píxeles se acepta y se recorta al presentar); un blob de clips
+  que no es un número entero de rectángulos es EINVAL al escenificar. En un
+  plano que acaba apagado no se mira nada más. Sin ERANGE para las
+  coordenadas de CRTC desbordadas: no hay errno para él en `FsError`.
 - El commit de un `FB_ID` hace el *scanout* (mismo blit que la ruta legacy).
 
 **Cómo activarlo**: es estrictamente **opt-in** mientras la ruta legacy siga
