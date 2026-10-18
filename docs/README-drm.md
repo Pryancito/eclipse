@@ -107,7 +107,7 @@ Leyenda: ✅ implementado · 🟡 parcial / no-op deliberado · ❌ no implement
 
 | ioctl | Estado | Notas |
 |---|---|---|
-| `DRM_IOCTL_MODE_CREATE_DUMB` | ✅ | memoria física contigua vía VMO; *pitch* = `ceil(bpp/8) * width` alineado a 64 B; ancho, alto o bpp a 0 son EINVAL como en `drm_mode_create_dumb`. El `mmap` comparte el VMO del buffer (cacheado, WB): el mapeo y cada framebuffer construido sobre el handle mantienen la memoria viva tras `DESTROY_DUMB`, como el refcount de `drm_gem_object` |
+| `DRM_IOCTL_MODE_CREATE_DUMB` | ✅ | memoria física contigua vía VMO; *pitch* = `ceil(bpp/8) * width` alineado a 64 B; `size` = `pitch * height` redondeado a página, como todo `dumb_create` (un objeto GEM son páginas enteras); ancho, alto o bpp a 0 son EINVAL como en `drm_mode_create_dumb`. El `mmap` comparte el VMO del buffer (cacheado, WB): el mapeo y cada framebuffer construido sobre el handle mantienen la memoria viva tras `DESTROY_DUMB`, como el refcount de `drm_gem_object` |
 | `DRM_IOCTL_MODE_MAP_DUMB` | ✅ | *offset* = `handle << 12`; `mmap` mapea el VMO físico |
 | `DRM_IOCTL_MODE_DESTROY_DUMB` | ✅ | |
 | `DRM_IOCTL_GEM_CLOSE` | ✅ | |
@@ -131,7 +131,7 @@ Leyenda: ✅ implementado · 🟡 parcial / no-op deliberado · ❌ no implement
 | ioctl | Estado | Notas |
 |---|---|---|
 | `DRM_IOCTL_MODE_GETRESOURCES` | ✅ | 1 CRTC + 1 connector + 1 encoder sintéticos |
-| `DRM_IOCTL_MODE_GETCRTC` / `SETCRTC` | ✅ | `SETCRTC` con modo hace *scanout* del fb; sin modo apaga el CRTC y quita el modo (el fb que nombre se ignora, como `drm_mode_setcrtc`); `GETCRTC` devuelve el modo actual (`mode_valid=1`) solo mientras el CRTC tiene modo (`crtc_state->enable`): tras un `SETCRTC` sin modo o un `RMFB` del fb en pantalla responde `mode_valid=0` y `fb_id=0` hasta el siguiente modeset; DPMS off no lo quita |
+| `DRM_IOCTL_MODE_GETCRTC` / `SETCRTC` | ✅ | `SETCRTC` con modo hace *scanout* del fb; sin modo apaga el CRTC y quita el modo (el fb que nombre se ignora, como `drm_mode_setcrtc`); `GETCRTC` devuelve el modo actual (`mode_valid=1`) solo mientras el CRTC tiene modo (`crtc_state->enable`): tras un `SETCRTC` sin modo o un `RMFB` del fb en pantalla responde `mode_valid=0` y `fb_id=0` hasta el siguiente modeset; DPMS off no lo quita El modo pasa por `drm_mode_validate_basic`: una bandera fuera de `DRM_MODE_FLAG_ALL` (`BCAST`, `PIXMUX`, bits por encima del campo de aspecto) o un layout 3D más allá de `SIDE_BY_SIDE_HALF` son EINVAL |
 | `DRM_IOCTL_MODE_GETENCODER` | ✅ | encoder `VIRTUAL`, `possible_crtcs=1`; `crtc_id=0` mientras el CRTC no tiene modo |
 | `DRM_IOCTL_MODE_GETCONNECTOR` | ✅ | 1 modo = resolución nativa (preferido); propiedades estándar (ver abajo); `encoder_id=0` mientras el CRTC no tiene modo |
 | `DRM_IOCTL_MODE_GETPLANERESOURCES` | ✅ | 1 plano primario |

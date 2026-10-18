@@ -1398,6 +1398,12 @@ impl DrmDev {
                         size64 = pitch64.saturating_mul(info.height as u64);
                     }
                 }
+                // The object is whole pages (`drm_gem_object_init` insists on
+                // it), and every `dumb_create` reports that: `size` is
+                // `pitch * height` rounded up to a page. It was the raw
+                // product.
+                let page = zircon_object::vm::PAGE_SIZE as u64;
+                let size64 = size64.saturating_add(page - 1) & !(page - 1);
                 if pitch64 == 0
                     || pitch64 > u32::MAX as u64
                     || size64 == 0
@@ -5328,11 +5334,25 @@ fn panel_timing_in(block: &[u8], len: u32) -> Option<edid::DetailedTiming> {
 /// turns into the synthetic vblank period every `WAIT_VBLANK` and every flip
 /// completion is timed against. Saying 60 to a 144 Hz panel throws away more
 /// than half of its scanouts.
-/// `DRM_MODE_FLAG_PIC_AR_MASK` is bits 19..=23 of `drm_mode_modeinfo.flags`;
+/// `DRM_MODE_FLAG_PIC_AR_MASK` is bits 19..=22 of `drm_mode_modeinfo.flags`;
 /// `drm_mode_convert_umode` knows the codes 0 (none) to 4 (256:135) and
 /// refuses the rest.
 const DRM_MODE_FLAG_PIC_AR_SHIFT: u32 = 19;
 const DRM_MODE_FLAG_PIC_AR_MAX: u32 = 4;
+const DRM_MODE_FLAG_PIC_AR_MASK: u32 = 0x0F << DRM_MODE_FLAG_PIC_AR_SHIFT;
+const DRM_MODE_FLAG_DBLCLK: u32 = 1 << 12;
+const DRM_MODE_FLAG_CLKDIV2: u32 = 1 << 13;
+const DRM_MODE_FLAG_3D_MASK: u32 = 0x1f << 14;
+/// `DRM_MODE_FLAG_3D_SIDE_BY_SIDE_HALF`, the last 3D layout the kernel
+/// defines (`DRM_MODE_FLAG_3D_MAX`).
+const DRM_MODE_FLAG_3D_MAX: u32 = 8 << 14;
+/// `DRM_MODE_FLAG_ALL`: the flags `drm_mode_validate_basic` lets through,
+/// the sync polarities and scan flags (bits 0..=9), `DBLCLK`, `CLKDIV2`
+/// and the 3D field. `BCAST` and `PIXMUX` (bits 10 and 11, deprecated) and
+/// every bit past the aspect-ratio field are outside it, and
+/// `drm_mode_convert_umode` clears the aspect-ratio bits before the check.
+const DRM_MODE_FLAG_ALL: u32 =
+    0x3FF | DRM_MODE_FLAG_DBLCLK | DRM_MODE_FLAG_CLKDIV2 | DRM_MODE_FLAG_3D_MASK;
 
 /// `drm_mode_validate_basic`, on a `struct drm_mode_modeinfo` as the ioctl
 /// carries it, plus the aspect-ratio code check of `drm_mode_convert_umode`:
@@ -5345,7 +5365,16 @@ fn modeinfo_active_area(m: &[u8; 68]) -> Option<(u32, u32)> {
     let (vdisplay, vsync_start, vsync_end, vtotal) =
         (u16_at(14), u16_at(16), u16_at(18), u16_at(20));
     let flags = u32::from_ne_bytes([m[28], m[29], m[30], m[31]]);
-    if (flags >> DRM_MODE_FLAG_PIC_AR_SHIFT) & 0x1f > DRM_MODE_FLAG_PIC_AR_MAX {
+    if (flags & DRM_MODE_FLAG_PIC_AR_MASK) >> DRM_MODE_FLAG_PIC_AR_SHIFT > DRM_MODE_FLAG_PIC_AR_MAX
+    {
+        return None;
+    }
+    // A flag the kernel does not define (`BCAST`, `PIXMUX`, anything past the
+    // aspect-ratio field) or a 3D layout past the last one it defines is
+    // `MODE_BAD`. Both went through: the flags were only read for their
+    // aspect-ratio code.
+    let flags = flags & !DRM_MODE_FLAG_PIC_AR_MASK;
+    if flags & !DRM_MODE_FLAG_ALL != 0 || flags & DRM_MODE_FLAG_3D_MASK > DRM_MODE_FLAG_3D_MAX {
         return None;
     }
     if clock == 0 {
