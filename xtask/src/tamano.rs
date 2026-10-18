@@ -100,7 +100,6 @@ const PASADOS: &[(&str, usize)] = &[
         "linux-object/src/fs/devfs/drm_scheme/kms_scanout_tests.rs",
         4750,
     ),
-    ("nvidia-rm-sys/src/os_boundary.rs", 4250),
 ];
 
 /// Las líneas de un fichero, contadas como las cuenta `wc -l` salvo en la

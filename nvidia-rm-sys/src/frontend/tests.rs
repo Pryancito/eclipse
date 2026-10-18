@@ -252,6 +252,22 @@ fn hosted_escapes_are_refused() {
     assert_eq!(gpu_id(0), u32::MAX);
 }
 
+/// `RmFreeUnusedClients`: after the open's clients, the close frees every OS
+/// event registered on that open, and none registered on another.
+#[test]
+fn a_close_frees_the_os_events_registered_on_it() {
+    const CLIENT: u32 = 0xc1d0_1001;
+    let _t = turnstile();
+    assert_eq!(events::alloc_os_event(CLIENT, 0x00e2_0001, 7), NV_OK);
+    assert_eq!(events::alloc_os_event(CLIENT, 0x00e2_0002, 8), NV_OK);
+    release(0x00e2_0001);
+    assert_eq!(
+        events::free_os_event(CLIENT, 7),
+        events::NV_ERR_INVALID_EVENT
+    );
+    assert_eq!(events::free_os_event(CLIENT, 8), NV_OK);
+}
+
 #[test]
 fn a_hosted_build_agrees_with_its_own_layout() {
     assert_eq!(layout_mismatch(), None);
@@ -263,7 +279,7 @@ fn a_hosted_build_agrees_with_its_own_layout() {
 fn the_mapping_record_has_the_c_layout() {
     assert_eq!(core::mem::size_of::<RawMmapContext>(), 40);
     assert_eq!(
-        LAYOUT[9],
+        LAYOUT[13],
         (
             "EclipseRmMmapContext",
             core::mem::size_of::<RawMmapContext>()

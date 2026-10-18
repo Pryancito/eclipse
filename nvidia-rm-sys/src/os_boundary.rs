@@ -445,11 +445,7 @@ pub extern "C" fn osDeleteRecordForCrashLog(arg0: *mut c_void) {
     let _ = arg0;
 }
 
-#[no_mangle]
-pub extern "C" fn osDereferenceObjectCount(pEvent: *mut c_void) -> NV_STATUS {
-    let _ = pEvent;
-    NV_ERR_NOT_SUPPORTED
-}
+// osDereferenceObjectCount: real impl in frontend/events.rs.
 
 #[no_mangle]
 pub extern "C" fn osDestroyNanoTimer(pArg1: *mut c_void, pArg2: *mut c_void) -> NV_STATUS {
@@ -1474,41 +1470,8 @@ pub extern "C" fn osErrorLogV(
     core::ptr::null_mut()
 }
 
-#[no_mangle]
-pub extern "C" fn osEventNotification(
-    arg0: *mut c_void,
-    arg1: *mut c_void,
-    arg2: NvU32,
-    arg3: *mut c_void,
-    arg4: NvU32,
-) -> NV_STATUS {
-    let _ = arg0;
-    let _ = arg1;
-    let _ = arg2;
-    let _ = arg3;
-    let _ = arg4;
-    NV_ERR_NOT_SUPPORTED
-}
-
-#[no_mangle]
-pub extern "C" fn osEventNotificationWithInfo(
-    arg0: *mut c_void,
-    arg1: *mut c_void,
-    arg2: NvU32,
-    arg3: NvU32,
-    arg4: NvU16,
-    arg5: *mut c_void,
-    arg6: NvU32,
-) -> NV_STATUS {
-    let _ = arg0;
-    let _ = arg1;
-    let _ = arg2;
-    let _ = arg3;
-    let _ = arg4;
-    let _ = arg5;
-    let _ = arg6;
-    NV_ERR_NOT_SUPPORTED
-}
+// osEventNotification and osEventNotificationWithInfo: real impls in
+// vendor/eclipse_rm_frontend.c.
 
 /// Clears the pid before refusing, like the twin.
 #[no_mangle]
@@ -2263,31 +2226,8 @@ pub extern "C" fn osModifyGpuSwStatePersistence(arg0: *mut c_void, arg1: NvBool)
     let _ = arg1;
 }
 
-/// Real contract (g_os_nvoc.h:307): `NV_STATUS OSNotifyEvent(OBJGPU *,
-/// PEVENTNOTIFICATION, NvU32, NvU32, NV_STATUS)` -- FIVE parameters, NV_STATUS
-/// return. The auto-stub this replaced declared SIX parameters and a
-/// `*mut c_void` NULL return: on SysV the NULL read back as NV_OK (masking
-/// every delivery "success"), and the callee read a 6th argument register the
-/// C callers (kernel_gsp.c:496, event.c:613, timer.c:475) never set. Eclipse
-/// has no userspace event-delivery infrastructure (everything is polled), so
-/// honestly report NV_OK as a deliberate no-op with the CORRECT ABI -- the
-/// behavior is unchanged, the type lie is gone. Wiring real delivery (GSP
-/// async error events -> a client notifier) is a known follow-up.
-#[no_mangle]
-pub extern "C" fn osNotifyEvent(
-    pGpu: *mut c_void,
-    pNotifyEvent: *mut c_void,
-    notifyIndex: NvU32,
-    info32: NvU32,
-    status: NV_STATUS,
-) -> NV_STATUS {
-    let _ = pGpu;
-    let _ = pNotifyEvent;
-    let _ = notifyIndex;
-    let _ = info32;
-    let _ = status;
-    NV_OK
-}
+// osNotifyEvent: real impl in vendor/eclipse_rm_frontend.c, which keeps the
+// NV_OK this stub always answered.
 
 #[no_mangle]
 pub extern "C" fn osNumaAddGpuMemory(
@@ -2328,25 +2268,7 @@ pub extern "C" fn osNumaRemoveGpuMemory(
     let _ = numaNodeId;
 }
 
-#[no_mangle]
-pub extern "C" fn osObjectEventNotification(
-    arg0: *mut c_void,
-    arg1: *mut c_void,
-    arg2: NvU32,
-    arg3: *mut c_void,
-    arg4: NvU32,
-    arg5: *mut c_void,
-    arg6: NvU32,
-) -> NV_STATUS {
-    let _ = arg0;
-    let _ = arg1;
-    let _ = arg2;
-    let _ = arg3;
-    let _ = arg4;
-    let _ = arg5;
-    let _ = arg6;
-    NV_ERR_NOT_SUPPORTED
-}
+// osObjectEventNotification: real impl in vendor/eclipse_rm_frontend.c.
 
 #[no_mangle]
 pub extern "C" fn osOfflinePageAtAddress(address: NvU64) -> NV_STATUS {
@@ -2627,12 +2549,7 @@ pub extern "C" fn osRmCapUnregister(ppOsRmCaps: *mut *mut c_void) {
 // in vendor/eclipse_rm_init.c where the generated g_hal_register.h
 // inline registration functions are reachable from C.
 
-#[no_mangle]
-pub extern "C" fn osSetEvent(arg0: *mut c_void, arg1: *mut c_void) -> NvU32 {
-    let _ = arg0;
-    let _ = arg1;
-    0
-}
+// osSetEvent: real impl in frontend/events.rs.
 
 #[no_mangle]
 pub extern "C" fn osSpinLoop() {
@@ -2843,17 +2760,7 @@ pub extern "C" fn osUnrefGpuAccessNeeded(pOsGpuInfo: *mut c_void) {
     let _ = pOsGpuInfo;
 }
 
-#[no_mangle]
-pub extern "C" fn osUserHandleToKernelPtr(
-    hClient: NvU32,
-    Handle: *mut c_void,
-    pHandle: *mut c_void,
-) -> NV_STATUS {
-    let _ = hClient;
-    let _ = Handle;
-    let _ = pHandle;
-    NV_ERR_NOT_SUPPORTED
-}
+// osUserHandleToKernelPtr: real impl in frontend/events.rs.
 
 #[no_mangle]
 pub extern "C" fn osValidateClientTokens(arg1: *mut c_void, arg2: *mut c_void) -> NV_STATUS {

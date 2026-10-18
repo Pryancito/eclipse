@@ -1433,6 +1433,11 @@ impl FileLike for File {
         if let Some(pipe) = inode.downcast_ref::<super::pipe::Pipe>() {
             return Some(pipe.subscribe_readiness(events, waker));
         }
+        // An NVIDIA open waiting for an OS event the RM posts to it.
+        #[cfg(target_arch = "x86_64")]
+        if let Some(nvidia) = inode.downcast_ref::<super::devfs::NvidiaOpen>() {
+            return Some(nvidia.subscribe_readiness(events, waker));
+        }
         if let Some(master) = inode.downcast_ref::<super::pty::PtyMaster>() {
             return Some(master.subscribe_readiness(events, waker));
         }

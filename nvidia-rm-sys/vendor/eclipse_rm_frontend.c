@@ -24,15 +24,20 @@
  * kernel side attaches it to the file the client will mmap (see
  * "User mappings" below).
  *
+ * And os.c's walk over an object's event notifications (osNotifyEvent and
+ * the osEventNotification family), which hands each OS event that fires to
+ * the registration the client made for it (see "OS events" below).
+ *
  * What is NOT here yet, and answers NV_ERR_NOT_SUPPORTED (which the kernel
  * side turns into EINVAL, like an unknown escape on Linux): RM_ALLOC_MEMORY
- * and RM_VID_HEAP_CONTROL (OS descriptors: pinning user pages), the OS
- * events (ALLOC_OS_EVENT, GET_EVENT_DATA), and the two controls that carry a
- * device fd inside their parameters (NV00FD_CTRL_CMD_ATTACH_GPU,
- * NV00E0_CTRL_CMD_EXPORT_MEM). The nv.c-level escapes (CARD_INFO,
- * CHECK_VERSION_STR, ATTACH_GPUS_TO_FD, REGISTER_FD, ...) are not RM calls on
- * Linux either and live on the Rust side (linux-object/src/fs/devfs/
- * nvidia.rs).
+ * and RM_VID_HEAP_CONTROL (OS descriptors: pinning user pages), and the two
+ * controls that carry a device fd inside their parameters
+ * (NV00FD_CTRL_CMD_ATTACH_GPU, NV00E0_CTRL_CMD_EXPORT_MEM). The nv.c-level
+ * escapes (CARD_INFO, CHECK_VERSION_STR, ATTACH_GPUS_TO_FD, REGISTER_FD, ...)
+ * are not RM calls on Linux either and live on the Rust side
+ * (linux-object/src/fs/devfs/nvidia.rs), and so do the three OS-event
+ * escapes, which rm_ioctl serves before RmIoctl without entering the RM
+ * core (ALLOC_OS_EVENT, FREE_OS_EVENT, RM_GET_EVENT_DATA).
  *
  * Two departures from Linux, both forced by how Eclipse brings the RM up:
  *
@@ -59,6 +64,7 @@
 #include "class/cl0000.h"      /* NV01_ROOT, NV01_ROOT_CLIENT */
 #include "class/cl0001.h"      /* NV01_ROOT_NON_PRIV */
 #include "class/cl0005.h"      /* NV01_EVENT */
+#include "class/cl90cd.h"      /* NV_EVENT_BUFFER_BIND */
 #include "ctrl/ctrl0000/ctrl0000gpu.h" /* NV0000_CTRL_GPU_INVALID_ID */
 #include "ctrl/ctrl00fd.h"     /* NV00FD_CTRL_CMD_ATTACH_GPU */
 #include "ctrl/ctrl00e0.h"     /* NV00E0_CTRL_CMD_EXPORT_MEM */
@@ -71,10 +77,16 @@
 #include "gpu/mem_mgr/rm_page_size.h"
 #include "mem_mgr/mem.h"
 #include "rmapi/rs_utils.h"
+#include "rmapi/event.h"       /* EVENTNOTIFICATION */
 #include "nv-unix-nvos-params-wrappers.h" /* nv_ioctl_nvos33_parameters_with_fd */
 #include "eclipse_rm_mem.h"
 
 extern RsServer g_resServ;
+
+/* frontend/events.rs: the OS-event registrations (see "OS events" below). */
+void eclipse_rm_frontend_post_event(NvP64 event, NvHandle hEvent, NvU32 notifyIndex,
+                                    NvU32 info32, NvU16 info16, NvU32 bDataValid);
+void rm_client_free_os_events(NvHandle client);
 
 /*
  * User mappings.
@@ -605,6 +617,13 @@ static NV_STATUS _eclipse_rm_frontend_dispatch(
             ECLIPSE_CTL_DEVICE_ONLY(bCtl);
 
             Nv01FreeWithSecInfo(pApi, secInfo);
+
+            if (pApi->status == NV_OK &&
+                pApi->hObjectOld == pApi->hRoot)
+            {
+                rm_client_free_os_events(pApi->hRoot);
+            }
+
             break;
         }
 
@@ -735,6 +754,161 @@ static NV_STATUS _eclipse_rm_frontend_dispatch(
     rmStatus = NV_OK;
 done:
     return rmStatus;
+}
+
+/*
+ * OS events.
+ *
+ * A client registers an fd of its own with ALLOC_OS_EVENT and then
+ * allocates an NV01_EVENT_OS_EVENT whose data is that fd number;
+ * osUserHandleToKernelPtr trades the number for the registration, which the
+ * RM keeps in the notification's Data. The registrations and the queue each
+ * fd keeps are Rust's (frontend/events.rs and the kernel side). What is here
+ * is os.c's half: the walk over an object's notifications, which decides
+ * which of them an RM event reaches and with what, and hands each OS event
+ * that fires to eclipse_rm_frontend_post_event. That looks the registration
+ * up and queues the event, or drops it if the client has freed it.
+ *
+ * Linux also runs the kernel callbacks from here (NV01_EVENT_KERNEL_CALLBACK
+ * and _EX). This port never has, and the RM registers some of its own on
+ * every boot (mem_mgr.c, mem_utils.c, kern_disp.c), so running them now
+ * would change what the RM does with the hatch off. They are still not run.
+ *
+ * The RM calls these with the RM gate held (frontend.rs), like everything
+ * else in it.
+ */
+
+/*
+ * osNotifyEvent (os.c). Answers NV_OK whatever the notification's type:
+ * that is what this port always answered, and timer.c, kernel_gsp.c and
+ * event.c act on it. Linux answers NV_ERR_GENERIC for a type it does not
+ * know.
+ */
+NV_STATUS osNotifyEvent(
+    OBJGPU             *pGpu,
+    PEVENTNOTIFICATION  NotifyEvent,
+    NvU32               Method,
+    NvU32               Data,
+    NV_STATUS           Status
+)
+{
+    (void) pGpu;
+    (void) Method;
+    (void) Data;
+    (void) Status;
+
+    if ((NotifyEvent != NULL) && (NotifyEvent->NotifyType == NV01_EVENT_OS_EVENT))
+    {
+        eclipse_rm_frontend_post_event(NotifyEvent->Data,
+                                       NotifyEvent->hEvent,
+                                       NotifyEvent->NotifyIndex,
+                                       0, 0,
+                                       NotifyEvent->bEventDataRequired);
+    }
+
+    return NV_OK;
+}
+
+/* osEventNotificationWithInfo (os.c). */
+NV_STATUS osEventNotificationWithInfo
+(
+    OBJGPU   *pGpu,
+    PEVENTNOTIFICATION pNotifyEvent,
+    NvU32 notifyIndex,
+    NvU32 info32,
+    NvU16 info16,
+    void * pEventData,
+    NvU32 eventDataSize
+)
+{
+    (void) pGpu;
+    (void) pEventData;
+    (void) eventDataSize;
+
+    // walk this object's event list and find any matches for this specific notify
+    for (; pNotifyEvent; pNotifyEvent = pNotifyEvent->Next)
+    {
+        // notifyIndex must match if request isn't for all
+        if ((notifyIndex != OS_EVENT_NOTIFICATION_INDEX_ALL) &&
+            (pNotifyEvent->NotifyIndex != notifyIndex))
+        {
+            continue;
+        }
+
+        switch (pNotifyEvent->NotifyType)
+        {
+            case NV_EVENT_BUFFER_BIND:
+            case NV01_EVENT_WIN32_EVENT:
+            {
+                eclipse_rm_frontend_post_event(pNotifyEvent->Data,
+                                               pNotifyEvent->hEvent,
+                                               pNotifyEvent->NotifyIndex,
+                                               info32, info16,
+                                               pNotifyEvent->bEventDataRequired);
+                break;
+            }
+
+            default:
+                break;
+        }
+    }
+
+    return NV_OK;
+}
+
+/* osEventNotification (os.c). */
+NV_STATUS osEventNotification
+(
+    OBJGPU   *pGpu,
+    PEVENTNOTIFICATION pNotifyEvent,
+    NvU32 notifyIndex,
+    void * pEventData,
+    NvU32 eventDataSize
+)
+{
+    return osEventNotificationWithInfo(pGpu, pNotifyEvent, notifyIndex, 0, 0,
+                                       pEventData, eventDataSize);
+}
+
+/* osObjectEventNotification (os.c). */
+NV_STATUS osObjectEventNotification
+(
+    NvHandle            hClient,
+    NvHandle            hObject,
+    NvU32               hClass,
+    PEVENTNOTIFICATION  pNotifyEvent,
+    NvU32               notifyIndex,
+    void                *pEventData,
+    NvU32               eventDataSize
+)
+{
+    (void) hClient;
+    (void) hObject;
+    (void) hClass;
+    (void) pEventData;
+    (void) eventDataSize;
+
+    // walk this object's event list and find any matches for this specific notify
+    for (; pNotifyEvent; pNotifyEvent = pNotifyEvent->Next)
+    {
+        // notifyIndex must match if request isn't for all
+        if ((notifyIndex != OS_EVENT_NOTIFICATION_INDEX_ALL) &&
+            (pNotifyEvent->NotifyIndex != notifyIndex))
+        {
+            continue;
+        }
+
+        if (pNotifyEvent->NotifyType == NV01_EVENT_OS_EVENT)
+        {
+            eclipse_rm_frontend_post_event(pNotifyEvent->Data,
+                                           pNotifyEvent->hEvent,
+                                           pNotifyEvent->NotifyIndex,
+                                           0, 0,
+                                           pNotifyEvent->bEventDataRequired);
+        }
+    }
+
+    return NV_OK;
 }
 
 /* The security info of a user-mode client's call, as RmIoctl builds it. */
@@ -944,9 +1118,9 @@ NvU32 eclipse_rm_frontend_gpu_instance(void *pGpu)
 
 /*
  * sizeof() of the nv-ioctl.h payloads the Rust side lays out by hand (and
- * the offset of the one field it reads from RM_MAP_MEMORY's, and the size of
- * the mapping record it shares with this file), in the order of `LAYOUT`
- * (frontend.rs). The kernel side compares them
+ * the offset of the one field it reads from RM_MAP_MEMORY's, the event
+ * RM_GET_EVENT_DATA copies out, and the size of the mapping record it shares
+ * with this file), in the order of `LAYOUT` (frontend.rs). The kernel side compares them
  * with its own `size_of` before serving the first ioctl, so a header that
  * moves under a re-pinned submodule refuses the front end instead of
  * writing the wrong bytes back to a client.
@@ -964,7 +1138,11 @@ NvU32 eclipse_rm_frontend_layout(NvU32 which)
         case 6: return sizeof(nv_ioctl_status_code_t);
         case 7: return sizeof(nv_ioctl_nvos33_parameters_with_fd);
         case 8: return (NvU32) NV_OFFSETOF(nv_ioctl_nvos33_parameters_with_fd, fd);
-        case 9: return sizeof(EclipseRmMmapContext);
+        case 9: return sizeof(nv_ioctl_alloc_os_event_t);
+        case 10: return sizeof(nv_ioctl_free_os_event_t);
+        case 11: return sizeof(NVOS41_PARAMETERS);
+        case 12: return sizeof(NvUnixEvent);
+        case 13: return sizeof(EclipseRmMmapContext);
         default: return 0;
     }
 }

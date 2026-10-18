@@ -16,13 +16,14 @@
 //! - every failure is EINVAL unless nv.c answers something else.
 //!
 //! Served here: CARD_INFO, CHECK_VERSION_STR, SYS_PARAMS, ATTACH_GPUS_TO_FD,
-//! WAIT_OPEN_COMPLETE, STATUS_CODE and REGISTER_FD. Served by the RM
-//! (`nvidia-rm-sys/vendor/eclipse_rm_frontend.c`): RM_ALLOC, RM_FREE,
+//! WAIT_OPEN_COMPLETE, STATUS_CODE, REGISTER_FD and the OS events
+//! (ALLOC_OS_EVENT, FREE_OS_EVENT, RM_GET_EVENT_DATA, and `poll`). Served by
+//! the RM (`nvidia-rm-sys/vendor/eclipse_rm_frontend.c`): RM_ALLOC, RM_FREE,
 //! RM_CONTROL, RM_DUP_OBJECT, RM_SHARE, RM_MAP_MEMORY and RM_UNMAP_MEMORY.
 //! Everything else answers EINVAL and is logged the first time each escape
-//! is seen: the OS events, RM_ALLOC_MEMORY, VID_HEAP_CONTROL, the NUMA and
-//! dma-buf escapes. `nvidia-smi` is what this much is for; CUDA needs those,
-//! and `/dev/nvidia-uvm` besides.
+//! is seen: RM_ALLOC_MEMORY, VID_HEAP_CONTROL, the NUMA and dma-buf escapes.
+//! `nvidia-smi` is what this much is for; CUDA needs those, and
+//! `/dev/nvidia-uvm` besides.
 //!
 //! A mapping is made in two steps, as on Linux. RM_MAP_MEMORY has the RM map
 //! the memory and records the result on the open the client names in the
@@ -30,6 +31,15 @@
 //! open at offset 0, and gets exactly what was recorded (`nvidia_mmap`). An
 //! open holds one mapping for as long as it lives, which is why libnvidia
 //! opens a fresh file for each.
+//!
+//! So does an OS event. The client registers an open with ALLOC_OS_EVENT,
+//! issued on that open and naming its own fd number for it, and binds an
+//! `NV01_EVENT_OS_EVENT` in the RM to that number. What the RM posts to it
+//! is queued on that open ([`post_event`], `nv_post_event`): it polls
+//! readable, and RM_GET_EVENT_DATA reads the queue back. The registrations
+//! are `nvidia_rm_sys::frontend::events`. The RM here is polled, so an event
+//! fires only inside some RM call (a control that triggers one, or an RPC
+//! that drains one the GSP queued); none arrives on an interrupt.
 //!
 //! The ioctl arrives from `sys_ioctl` (linux-syscall), not from
 //! `INode::io_control`: it needs the caller's fd table (REGISTER_FD names a
@@ -41,11 +51,13 @@
 //! minor, so `/dev/nvidia<N>` is the same GPU on every boot, but opening it
 //! is EIO, which is what a failed `rm_init_adapter` gives on Linux.
 
+use alloc::collections::{BTreeMap, VecDeque};
 use alloc::format;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::any::Any;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::task::Waker;
 
 use kernel_hal::user::{UserInPtr, UserOutPtr};
 use kernel_hal::CachePolicy;
@@ -56,6 +68,8 @@ use zcore_drivers::display::nvctl;
 use zircon_object::vm::{pages, VmObject, PAGE_SIZE};
 
 use crate::error::{LxError, LxResult};
+use crate::fs::{poll_events_to_bus_mask, PollEvents};
+use crate::sync::{subscribe_readiness_on, Event, EventBus, ReadinessSub};
 
 /// `NV_MAJOR_DEVICE_NUMBER`.
 pub const MAJOR: usize = 195;
@@ -71,10 +85,13 @@ pub mod esc {
     pub const RM_ALLOC: u32 = 0x2B;
     pub const RM_DUP_OBJECT: u32 = 0x34;
     pub const RM_SHARE: u32 = 0x35;
+    pub const RM_GET_EVENT_DATA: u32 = 0x52;
     pub const RM_MAP_MEMORY: u32 = 0x4E;
     pub const RM_UNMAP_MEMORY: u32 = 0x4F;
     pub const CARD_INFO: u32 = 200;
     pub const REGISTER_FD: u32 = 201;
+    pub const ALLOC_OS_EVENT: u32 = 206;
+    pub const FREE_OS_EVENT: u32 = 207;
     pub const STATUS_CODE: u32 = 209;
     pub const CHECK_VERSION_STR: u32 = 210;
     pub const IOCTL_XFER_CMD: u32 = 211;
@@ -99,7 +116,13 @@ const STATUS_CODE_SIZE: usize = 12;
 /// open to record the mapping on.
 const MAP_MEMORY_SIZE: usize = 56;
 const MAP_MEMORY_FD: usize = 48;
-const SIZES: [usize; 9] = [
+/// `nv_ioctl_alloc_os_event_t` and `nv_ioctl_free_os_event_t`: `hClient`,
+/// `hDevice`, `fd`, `Status`.
+const ALLOC_OS_EVENT_SIZE: usize = 16;
+const FREE_OS_EVENT_SIZE: usize = 16;
+/// `NVOS41_PARAMETERS`: `pEvent`, `MoreEvents`, `status`.
+const GET_EVENT_DATA_SIZE: usize = 16;
+const SIZES: [usize; 13] = [
     XFER_SIZE,
     CARD_INFO_SIZE,
     RM_API_VERSION_SIZE,
@@ -109,12 +132,24 @@ const SIZES: [usize; 9] = [
     STATUS_CODE_SIZE,
     MAP_MEMORY_SIZE,
     MAP_MEMORY_FD,
+    ALLOC_OS_EVENT_SIZE,
+    FREE_OS_EVENT_SIZE,
+    GET_EVENT_DATA_SIZE,
+    nvctl::UnixEvent::SIZE,
 ];
 
+/// The most events queued on one open that nobody has read. Linux queues
+/// until an atomic allocation fails and then drops the event without a
+/// wake-up; here the queue stops at this, the same way.
+const MAX_QUEUED_EVENTS: usize = 1024;
+
 const NV_OK: u32 = 0;
+/// What `os_memcpy_to_user` answers when the copy faults.
+const NV_ERR_INVALID_ADDRESS: u32 = 0x1E;
 const NV_ERR_INVALID_ARGUMENT: u32 = 0x1F;
 const NV_ERR_NOT_READY: u32 = 0x55;
 const NV_ERR_NOT_SUPPORTED: u32 = 0x56;
+const NV_ERR_OPERATING_SYSTEM: u32 = 0x59;
 const PCI_VENDOR_NVIDIA: u16 = 0x10de;
 
 /// `_IOC_NR` and `_IOC_SIZE`: all `nvidia_ioctl` reads of the command.
@@ -269,6 +304,90 @@ pub struct NvidiaOpen {
     node: Node,
     inode_id: usize,
     state: Mutex<OpenState>,
+    events: Arc<OpenEvents>,
+}
+
+/// The OS events queued on one open: `nvlfp`'s `event_data_head`,
+/// `dataless_event_pending` and `waitqueue`.
+#[derive(Default)]
+struct OpenEvents {
+    queue: Mutex<EventQueue>,
+    /// READABLE exactly while [`OpenEvents::ready`] would answer yes.
+    bus: Arc<Mutex<EventBus>>,
+}
+
+#[derive(Default)]
+struct EventQueue {
+    /// The events with data, oldest first.
+    data: VecDeque<nvctl::UnixEvent>,
+    /// An event without data came since the last `poll` that reported one.
+    dataless: bool,
+}
+
+impl EventQueue {
+    fn ready(&self) -> bool {
+        !self.data.is_empty() || self.dataless
+    }
+}
+
+impl OpenEvents {
+    /// `nv_post_event`: an event with data is queued, one without is
+    /// remembered, and pollers wake. One past [`MAX_QUEUED_EVENTS`] is
+    /// dropped, and wakes nobody.
+    fn post(&self, event: Option<nvctl::UnixEvent>) {
+        let mut queue = self.queue.lock();
+        match event {
+            Some(_) if queue.data.len() >= MAX_QUEUED_EVENTS => {
+                dropped_event();
+                return;
+            }
+            Some(event) => queue.data.push_back(event),
+            None => queue.dataless = true,
+        }
+        self.bus.lock().set(Event::READABLE);
+    }
+
+    /// `nvidia_poll`: readable while there is an event to report, and
+    /// reporting an event without data consumes it.
+    fn poll(&self) -> bool {
+        let mut queue = self.queue.lock();
+        let ready = queue.ready();
+        queue.dataless = false;
+        self.settle(&queue);
+        ready
+    }
+
+    /// `nv_get_event`: the oldest event with data, and whether another one
+    /// follows. An event without data is not one, and stays for `poll`.
+    fn take(&self) -> Option<(nvctl::UnixEvent, bool)> {
+        let mut queue = self.queue.lock();
+        let event = queue.data.pop_front()?;
+        self.settle(&queue);
+        Some((event, !queue.data.is_empty()))
+    }
+
+    /// Keep the bus's READABLE on exactly while `queue` has something to
+    /// report: a poller parked on a flag left on would wake for nothing, over
+    /// and over.
+    fn settle(&self, queue: &EventQueue) {
+        if !queue.ready() {
+            self.bus.lock().clear(Event::READABLE);
+        }
+    }
+}
+
+/// The opens an OS event can be posted to, by their `clientOSInfo`: every
+/// open that has issued an ALLOC_OS_EVENT and is still open. [`post_event`]
+/// finds the queue here rather than following the token back to the open.
+static EVENT_OPENS: Mutex<BTreeMap<usize, Arc<OpenEvents>>> = Mutex::new(BTreeMap::new());
+
+/// `nv_post_event`, as the RM's registrations hand it an event for the open
+/// `os_info`. An open that has closed takes nothing.
+fn post_event(os_info: usize, event: Option<nvctl::UnixEvent>) {
+    let events = EVENT_OPENS.lock().get(&os_info).cloned();
+    if let Some(events) = events {
+        events.post(event);
+    }
 }
 
 #[derive(Default)]
@@ -289,6 +408,7 @@ impl NvidiaOpen {
             node,
             inode_id,
             state: Mutex::new(OpenState::default()),
+            events: Arc::new(OpenEvents::default()),
         }
     }
 
@@ -407,11 +527,54 @@ impl NvidiaOpen {
                 escape_result(nr, nvctl::rm_escape(nr, payload, &self.rm_caller(caller)))
             }
             esc::RM_MAP_MEMORY => self.map_memory(payload, caller),
+            esc::ALLOC_OS_EVENT | esc::FREE_OS_EVENT | esc::RM_GET_EVENT_DATA => {
+                if !nvctl::rm_up() {
+                    no_rm_yet();
+                    return Err(LxError::EINVAL);
+                }
+                self.os_event(nr, payload)
+            }
             _ => {
                 not_served(nr);
                 Err(LxError::EINVAL)
             }
         }
+    }
+
+    /// The three OS-event escapes, which `rm_ioctl` serves before `RmIoctl`
+    /// and outside the RM core: a payload of the wrong size is EINVAL, and
+    /// otherwise the answer is in the payload's status. Like Linux, any open
+    /// takes them, control or GPU.
+    fn os_event(&self, nr: u32, payload: &mut [u8]) -> LxResult<()> {
+        match nr {
+            esc::ALLOC_OS_EVENT => {
+                if payload.len() != ALLOC_OS_EVENT_SIZE {
+                    return Err(LxError::EINVAL);
+                }
+                // Reachable before the RM can know about the registration,
+                // so no event posted to it is ever lost.
+                EVENT_OPENS
+                    .lock()
+                    .insert(self.os_info(), self.events.clone());
+                let status =
+                    nvctl::alloc_os_event(u32_at(payload, 0), self.os_info(), u32_at(payload, 8));
+                put_u32(payload, 12, status);
+            }
+            esc::FREE_OS_EVENT => {
+                if payload.len() != FREE_OS_EVENT_SIZE {
+                    return Err(LxError::EINVAL);
+                }
+                let status = nvctl::free_os_event(u32_at(payload, 0), u32_at(payload, 8));
+                put_u32(payload, 12, status);
+            }
+            _ => {
+                if payload.len() != GET_EVENT_DATA_SIZE {
+                    return Err(LxError::EINVAL);
+                }
+                get_event_data(payload, &self.events);
+            }
+        }
+        Ok(())
     }
 
     /// Who the RM is told is calling.
@@ -521,8 +684,18 @@ impl NvidiaOpen {
     }
 }
 
+impl NvidiaOpen {
+    /// Park a poller until there is an OS event to report on this open.
+    pub fn subscribe_readiness(&self, events: PollEvents, waker: &Waker) -> ReadinessSub {
+        subscribe_readiness_on(&self.events.bus, poll_events_to_bus_mask(events), waker)
+    }
+}
+
 impl Drop for NvidiaOpen {
     fn drop(&mut self) {
+        // Out of reach of a post first: the RM's registrations still name
+        // this open until `release` frees them.
+        EVENT_OPENS.lock().remove(&self.os_info());
         nvctl::release(self.os_info());
     }
 }
@@ -536,9 +709,14 @@ impl INode for NvidiaOpen {
         Err(FsError::InvalidParam)
     }
 
-    /// No OS events yet, so nothing ever becomes readable.
+    /// `nvidia_poll`: readable while an OS event is queued here. Linux
+    /// reports `POLLPRI` with `POLLIN`; nothing here reports `POLLPRI`, so a
+    /// client that polls for it alone is never told.
     fn poll(&self) -> Result<PollStatus> {
-        Ok(PollStatus::default())
+        Ok(PollStatus {
+            read: self.events.poll(),
+            ..PollStatus::default()
+        })
     }
 
     fn metadata(&self) -> Result<Metadata> {
@@ -553,6 +731,38 @@ impl INode for NvidiaOpen {
 
     fn as_any_ref(&self) -> &dyn Any {
         self
+    }
+}
+
+/// NV_ESC_RM_GET_EVENT_DATA (`get_os_event_data`): the oldest event queued
+/// on the open, copied out to the payload's `pEvent`, and whether another
+/// follows. An empty queue answers `NV_ERR_OPERATING_SYSTEM` and leaves
+/// `MoreEvents` as it came; an event that cannot be copied out is lost, as
+/// on Linux, which takes it off the queue first.
+fn get_event_data(payload: &mut [u8], events: &OpenEvents) {
+    let status = match events.take() {
+        None => NV_ERR_OPERATING_SYSTEM,
+        Some((event, more)) => {
+            put_u32(payload, 8, more as u32);
+            match UserOutPtr::<u8>::from(u64_at(payload, 0) as usize).write_array(&event.to_bytes())
+            {
+                Ok(()) => NV_OK,
+                Err(_) => NV_ERR_INVALID_ADDRESS,
+            }
+        }
+    };
+    put_u32(payload, 12, status);
+}
+
+/// One log line the first time an open's queue is full and an event is
+/// dropped: a client that registered for events and never reads them.
+fn dropped_event() {
+    static SAID: AtomicBool = AtomicBool::new(false);
+    if !SAID.swap(true, Ordering::Relaxed) {
+        warn!(
+            "[nvidiactl] {} OS events queued on one open and none read: dropping",
+            MAX_QUEUED_EVENTS
+        );
     }
 }
 
@@ -795,6 +1005,7 @@ pub fn create_nodes(root: &Arc<DevINode>) {
         return;
     }
     nvctl::set_user_range_validator(kernel_hal::user::user_range_ok);
+    nvctl::set_event_sink(post_event);
     if let Err(e) = root.add("nvidiactl", Arc::new(NvidiaDev::new(Node::Ctl))) {
         warn!("[nvidiactl] failed to mknod /dev/nvidiactl: {:?}", e);
         return;
