@@ -18,6 +18,9 @@
 //     with SIGTERM or SIGUSR1 whose parent exited sent it to init, which
 //     reboots or halts on those; and an orphan's death was routed from the
 //     parent it was FORKED from, not the one that adopted it.
+//   * a SIGSTOP (or Ctrl-Z's SIGTSTP) to a process blocked in a syscall did
+//     not stop it until the syscall returned by itself -- never, for a child
+//     in `pause()` -- and its parent's `waitpid(WUNTRACED)` waited with it.
 //
 // Every section states what Linux does and checks it, printing the numbers
 // whether it passes or fails. Each section runs in a child of its own, so a
@@ -50,6 +53,10 @@
 //              child to be reaped again, `P_PGID` 0 as the caller's group,
 //              `SA_NOCLDSTOP`; and a process ended or exec'd from a thread
 //              that is not its first.
+//   stop       a stop reaches a process blocked in a syscall -- `nanosleep`,
+//              `read`, `sigsuspend` -- and the syscall goes on once it is
+//              continued: the read reads, the sigsuspend waits for its signal
+//              and puts the old mask back.
 //
 // Build:  make                 (x86_64-linux-musl-gcc -O2 -static)
 // Run:    ./signal-probe [--only SECTION]
@@ -829,6 +836,96 @@ static void sec_wait(void) {
           st);
 }
 
+// ------------------------------------------------------------------- stop
+
+// Stop `c` and see the stop, continue it and see the continue: 0 if both
+// were seen. A kernel that does not stop a process blocked in a syscall
+// hangs in the first waitpid, and the section's alarm says so.
+static int stop_and_continue(pid_t c) {
+    int st = 0;
+    kill(c, SIGSTOP);
+    if (waitpid(c, &st, WUNTRACED) != c || !WIFSTOPPED(st)) return -1;
+    kill(c, SIGCONT);
+    if (waitpid(c, &st, WCONTINUED) != c || !WIFCONTINUED(st)) return -1;
+    return 0;
+}
+
+static void sec_stop(void) {
+    int st = 0;
+
+    // A child asleep in nanosleep stops (Ctrl-Z on `sleep 100`).
+    pid_t c = fork();
+    if (c == 0) {
+        sleep(30);
+        _exit(0);
+    }
+    sleep_ms(50);
+    int seen = stop_and_continue(c);
+    check(seen == 0, "a sleeping child stops", "%s",
+          seen ? "the stop or the continue was not reported" : "stopped and continued");
+    kill(c, SIGKILL);
+    waitpid(c, &st, 0);
+
+    // A read stopped and continued goes on reading: Linux makes it again
+    // (-ERESTARTSYS, and no handler ran), so the program never sees EINTR.
+    int p[2];
+    if (pipe(p) != 0) {
+        check(0, "pipe", "%s", strerror(errno));
+        return;
+    }
+    c = fork();
+    if (c == 0) {
+        close(p[1]);
+        char ch = 0;
+        ssize_t n = read(p[0], &ch, 1);
+        _exit(n == 1 && ch == 'x' ? 0 : n < 0 && errno == EINTR ? 2 : 3);
+    }
+    close(p[0]);
+    sleep_ms(50);
+    seen = stop_and_continue(c);
+    if (write(p[1], "x", 1) != 1) check(0, "write to the pipe", "%s", strerror(errno));
+    close(p[1]);
+    waitpid(c, &st, 0);
+    check(seen == 0 && WIFEXITED(st) && WEXITSTATUS(st) == 0, "a read goes on past a stop", "%s",
+          seen                                      ? "the stop or the continue was not reported"
+          : !WIFEXITED(st)                          ? "the child died"
+          : WEXITSTATUS(st) == 2                    ? "the read came back EINTR"
+          : WEXITSTATUS(st) == 3                    ? "the read came back with something else"
+                                                    : "it read the byte");
+
+    // A sigsuspend stopped and continued is still waiting, under its own
+    // mask; when the signal it waits for comes, the handler runs and the
+    // mask from before the call is back.
+    install(SIGUSR1, usr1_counts, 0);
+    c = fork();
+    if (c == 0) {
+        sigset_t block, during, after;
+        sigemptyset(&block);
+        sigaddset(&block, SIGUSR1);
+        sigprocmask(SIG_BLOCK, &block, NULL);
+        sigemptyset(&during);
+        g_usr1_runs = 0;
+        int r = sigsuspend(&during);
+        int e = errno;
+        sigprocmask(SIG_BLOCK, NULL, &after);
+        if (g_usr1_runs != 1) _exit(5);
+        if (!sigismember(&after, SIGUSR1)) _exit(4);
+        _exit(r == -1 && e == EINTR ? 0 : 6);
+    }
+    sleep_ms(50);
+    seen = stop_and_continue(c);
+    sleep_ms(50);
+    kill(c, SIGUSR1);
+    waitpid(c, &st, 0);
+    check(seen == 0 && WIFEXITED(st) && WEXITSTATUS(st) == 0, "a sigsuspend outlasts a stop", "%s",
+          seen                   ? "the stop or the continue was not reported"
+          : !WIFEXITED(st)       ? "the child died"
+          : WEXITSTATUS(st) == 5 ? "it returned without the handler running"
+          : WEXITSTATUS(st) == 4 ? "the mask from before the call was not put back"
+          : WEXITSTATUS(st) == 6 ? "it did not return EINTR"
+                                 : "handler ran, mask back");
+}
+
 // ------------------------------------------------------------------- main
 
 static const struct {
@@ -845,6 +942,7 @@ static const struct {
     {"orphan", "an orphan's death tells its adopter, with SIGCHLD", sec_orphan},
     {"inherit", "what fork and execve hand down", sec_inherit},
     {"wait", "what waitid and waitpid report", sec_wait},
+    {"stop", "a stop reaches a process blocked in a syscall", sec_stop},
 };
 
 int main(int argc, char **argv) {
