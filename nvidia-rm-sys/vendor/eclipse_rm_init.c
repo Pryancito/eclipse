@@ -829,9 +829,10 @@ NV_STATUS osPackageRegistry(
  * `portSafeAddU64((NvUPtr)pGpu->deviceMappings[0].gpuNvAddr, offset, pAddress)`
  * -- and Eclipse populates deviceMappings[0].gpuNvAddr with bar0_virt via
  * GPUATTACHARG.regBaseAddr (gpu_mgr.c:1783), so the same one-liner is fully
- * real here. User-privilege mappings (osMapPciMemoryUser on Linux) have no
- * Eclipse equivalent -- no userspace can reach RM yet -- so that branch
- * returns NV_ERR_NOT_SUPPORTED instead of pretending.
+ * real here. A user-privilege mapping is os.c's too: the bus address of
+ * the register window, through osMapPciMemoryUser (eclipse_rm_frontend.c),
+ * which answers only while a user-mode client's call is in flight and
+ * otherwise keeps answering NV_ERR_NOT_SUPPORTED.
  */
 NV_STATUS osMapGPU(
     OBJGPU        *pGpu,
@@ -844,10 +845,6 @@ NV_STATUS osMapGPU(
 )
 {
     NV_STATUS rmStatus = NV_OK;
-
-    (void)length;
-    (void)Protect;
-    (void)pPriv;
 
     if (pGpu == NULL || pAddress == NULL)
         return NV_ERR_INVALID_ARGUMENT;
@@ -866,7 +863,21 @@ NV_STATUS osMapGPU(
     }
     else
     {
-        rmStatus = NV_ERR_NOT_SUPPORTED;
+        RmPhysAddr busAddress;
+        if (!portSafeAddU64(pGpu->busInfo.gpuPhysAddr, offset, &busAddress))
+        {
+            rmStatus = NV_ERR_INVALID_LIMIT;
+        }
+        else
+        {
+            rmStatus = osMapPciMemoryUser(pGpu->pOsGpuInfo,
+                                          busAddress,
+                                          length,
+                                          Protect,
+                                          pAddress,
+                                          pPriv,
+                                          NV_FALSE);
+        }
     }
 
     return rmStatus;
@@ -882,9 +893,11 @@ void osUnmapGPU(
 {
     /*
      * Kernel mappings from osMapGPU above are windows into the persistent
-     * BAR0 map -- nothing to unmap, exactly like the real driver (os.c:1322
-     * only unmaps for privLevel < RS_PRIV_LEVEL_KERNEL, which osMapGPU here
-     * never grants).
+     * BAR0 map -- nothing to unmap, exactly like the real driver. A user
+     * mapping (os.c:1322 unmaps only those, through osUnmapPciMemoryUser)
+     * left nothing behind either: osMapPciMemoryUser handed the client a
+     * bus address to record and mmap, and the client's own mapping of it
+     * lives until the client unmaps it, as a vma does on Linux.
      */
     (void)pOsGpuInfo;
     (void)privLevel;

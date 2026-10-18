@@ -18,10 +18,19 @@
 //             to a process holding the GPU's node open), and from the
 //             subdevice the name, the UUID and the memory size -- one
 //             `nvidia-smi -L` line.
+//   map       the two mappings every CUDA context makes, the way libcuda
+//             makes them: RM_MAP_MEMORY recorded on a fresh fd, then mmap
+//             of that fd at offset 0, then RM_UNMAP_MEMORY.
+//               sysmem    64 KiB of NV01_MEMORY_SYSTEM, on a fresh
+//                         /dev/nvidiactl: a pattern written and read back.
+//               usermode  TURING_USERMODE_A, BAR0's user page, on a fresh
+//                         /dev/nvidia<minor>: the GPU timer read twice
+//                         must move forward.
 //   free      RM_FREE of the client: everything under it goes.
 //
-// Needs the kernel booted with `nvidia.nvidiactl`. Read-only: it allocates RM
-// objects and frees them, and touches no engine.
+// Needs the kernel booted with `nvidia.nvidiactl`. Read-only as far as the
+// GPU goes: it allocates RM objects and frees them, writes only the system
+// memory it allocated, reads the GPU's timer, and touches no engine.
 //
 // Build: static musl, like the other probes (xtask does it; by hand:
 //   x86_64-linux-musl-gcc -static -O2 -o nvctl-probe nvctl-probe.c).
@@ -33,6 +42,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <sys/mman.h>
+#include <time.h>
 #include <unistd.h>
 
 // nv-ioctl-numbers.h / nv_escape.h
@@ -43,6 +54,8 @@
 #define NV_ESC_RM_FREE 0x29
 #define NV_ESC_RM_CONTROL 0x2A
 #define NV_ESC_RM_ALLOC 0x2B
+#define NV_ESC_RM_MAP_MEMORY 0x4E
+#define NV_ESC_RM_UNMAP_MEMORY 0x4F
 
 // classes and controls (class/, ctrl/)
 #define NV01_ROOT_CLIENT 0x41
@@ -56,6 +69,14 @@
 #define NV2080_CTRL_FB_INFO_INDEX_RAM_SIZE 7
 #define NV_DEVICE_ALLOCATION_VAMODE_MULTIPLE_VASPACES 2
 #define NV0000_CTRL_GPU_INVALID_ID 0xffffffffu
+#define NV01_MEMORY_SYSTEM 0x3e
+#define TURING_USERMODE_A 0xc461
+#define NVC361_NV_USERMODE__SIZE 0x10000
+#define NVC361_TIME_0 0x80
+#define NVC361_TIME_1 0x84
+// NVOS32_ATTR_*: 4 KiB pages (24:23), in system memory (26:25), cached (31:29)
+#define NVOS32_ATTR_SYSMEM_4K_CACHED ((1u << 23) | (1u << 25) | (1u << 29))
+#define NVOS32_TYPE_IMAGE 0
 
 #define NV_MAX_DEVICES 32
 
@@ -119,6 +140,41 @@ typedef struct {
 } NV2080_ALLOC_PARAMETERS;
 
 typedef struct {
+  uint32_t owner, type, flags, width, height;
+  int32_t pitch;
+  uint32_t attr, attr2, format, comprCovg, zcullCovg;
+  uint64_t rangeLo __attribute__((aligned(8)));
+  uint64_t rangeHi __attribute__((aligned(8)));
+  uint64_t size __attribute__((aligned(8)));
+  uint64_t alignment __attribute__((aligned(8)));
+  uint64_t offset __attribute__((aligned(8)));
+  uint64_t limit __attribute__((aligned(8)));
+  uint64_t address __attribute__((aligned(8)));
+  uint32_t ctagOffset, hVASpace, internalflags, tag;
+  int32_t numaNode;
+} NV_MEMORY_ALLOCATION_PARAMS;
+
+typedef struct {
+  uint32_t hClient, hDevice, hMemory;
+  uint64_t offset __attribute__((aligned(8)));
+  uint64_t length __attribute__((aligned(8)));
+  uint64_t pLinearAddress __attribute__((aligned(8)));
+  uint32_t status, flags;
+} NVOS33_PARAMETERS;
+
+// nv-unix-nvos-params-wrappers.h: the fd the mapping is recorded on.
+typedef struct {
+  NVOS33_PARAMETERS params;
+  int fd;
+} nv_ioctl_nvos33_parameters_with_fd;
+
+typedef struct {
+  uint32_t hClient, hDevice, hMemory;
+  uint64_t pLinearAddress __attribute__((aligned(8)));
+  uint32_t status, flags;
+} NVOS34_PARAMETERS;
+
+typedef struct {
   uint32_t gpuId, gpuFlags, deviceInstance, subDeviceInstance, sliStatus, boardId, gpuInstance;
   int32_t numaId;
 } NV0000_CTRL_GPU_GET_ID_INFO_V2_PARAMS;
@@ -151,6 +207,10 @@ _Static_assert(sizeof(NVOS21_PARAMETERS) == 32, "NVOS21_PARAMETERS");
 _Static_assert(sizeof(NVOS00_PARAMETERS) == 16, "NVOS00_PARAMETERS");
 _Static_assert(sizeof(NVOS54_PARAMETERS) == 32, "NVOS54_PARAMETERS");
 _Static_assert(sizeof(NV0080_ALLOC_PARAMETERS) == 56, "NV0080_ALLOC_PARAMETERS");
+_Static_assert(sizeof(NV_MEMORY_ALLOCATION_PARAMS) == 128, "NV_MEMORY_ALLOCATION_PARAMS");
+_Static_assert(sizeof(nv_ioctl_nvos33_parameters_with_fd) == 56,
+               "nv_ioctl_nvos33_parameters_with_fd");
+_Static_assert(sizeof(NVOS34_PARAMETERS) == 32, "NVOS34_PARAMETERS");
 
 #define NV_IOWR(nr, size) _IOC(_IOC_READ | _IOC_WRITE, NV_IOCTL_MAGIC, (nr), (size))
 
@@ -223,6 +283,148 @@ static int rm_control(int ctl, uint32_t client, uint32_t object, uint32_t cmd, v
   return 0;
 }
 
+// RM_MAP_MEMORY of `memory`, recorded on `fd`, then the mmap of `fd` that
+// takes it: the address, with the RM's address in *linear, or NULL with the
+// failure printed (and the RM's mapping undone, if there was one).
+static void *rm_map(int ctl, int fd, uint32_t client, uint32_t device, uint32_t memory,
+                    uint64_t length, uint64_t *linear, const char *what) {
+  nv_ioctl_nvos33_parameters_with_fd p = {
+      .params = {.hClient = client, .hDevice = device, .hMemory = memory, .length = length},
+      .fd = fd};
+  char detail[96];
+  int err = nv_ioctl(ctl, NV_ESC_RM_MAP_MEMORY, &p, sizeof p);
+  if (err) {
+    snprintf(detail, sizeof detail, "RM_MAP_MEMORY ioctl: %s", strerror(err));
+    fail(what, detail);
+    return NULL;
+  }
+  if (p.params.status) {
+    snprintf(detail, sizeof detail, "RM_MAP_MEMORY: %s", rm_status(p.params.status));
+    fail(what, detail);
+    return NULL;
+  }
+  *linear = p.params.pLinearAddress;
+  void *va = mmap(NULL, length, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+  if (va == MAP_FAILED) {
+    snprintf(detail, sizeof detail, "mmap: %s", strerror(errno));
+    fail(what, detail);
+    NVOS34_PARAMETERS u = {.hClient = client, .hDevice = device, .hMemory = memory,
+                           .pLinearAddress = *linear};
+    nv_ioctl(ctl, NV_ESC_RM_UNMAP_MEMORY, &u, sizeof u);
+    return NULL;
+  }
+  return va;
+}
+
+static void rm_unmap(int ctl, uint32_t client, uint32_t device, uint32_t memory, uint64_t linear,
+                     const char *what) {
+  NVOS34_PARAMETERS u = {.hClient = client, .hDevice = device, .hMemory = memory,
+                         .pLinearAddress = linear};
+  char detail[96];
+  int err = nv_ioctl(ctl, NV_ESC_RM_UNMAP_MEMORY, &u, sizeof u);
+  if (err) {
+    snprintf(detail, sizeof detail, "RM_UNMAP_MEMORY ioctl: %s", strerror(err));
+    fail(what, detail);
+  } else if (u.status) {
+    snprintf(detail, sizeof detail, "RM_UNMAP_MEMORY: %s", rm_status(u.status));
+    fail(what, detail);
+  }
+}
+
+static void rm_free(int ctl, uint32_t client, uint32_t parent, uint32_t object) {
+  NVOS00_PARAMETERS f = {.hRoot = client, .hObjectParent = parent, .hObjectOld = object};
+  nv_ioctl(ctl, NV_ESC_RM_FREE, &f, sizeof f);
+}
+
+// A pattern through a mapping of 64 KiB of the client's own system memory.
+static void probe_sysmem(int ctl, uint32_t client, uint32_t device) {
+  const uint64_t size = 0x10000;
+  char detail[160];
+  NV_MEMORY_ALLOCATION_PARAMS mp = {.owner = client, .type = NVOS32_TYPE_IMAGE,
+                                    .attr = NVOS32_ATTR_SYSMEM_4K_CACHED, .size = size};
+  uint32_t memory = 0;
+  if (rm_alloc(ctl, client, device, NV01_MEMORY_SYSTEM, &mp, sizeof mp, &memory,
+               "NV01_MEMORY_SYSTEM"))
+    return;
+  ok("NV01_MEMORY_SYSTEM, 64 KiB");
+  int fd = open("/dev/nvidiactl", O_RDWR | O_CLOEXEC);
+  if (fd < 0) {
+    snprintf(detail, sizeof detail, "open: %s", strerror(errno));
+    fail("sysmem /dev/nvidiactl", detail);
+    rm_free(ctl, client, device, memory);
+    return;
+  }
+  uint64_t linear = 0;
+  volatile uint32_t *va = rm_map(ctl, fd, client, device, memory, size, &linear, "sysmem");
+  if (va) {
+    size_t n = size / sizeof *va, bad = 0;
+    for (size_t i = 0; i < n; i++)
+      va[i] = 0x5eed0000u ^ (uint32_t)i;
+    for (size_t i = 0; i < n; i++)
+      bad += va[i] != (0x5eed0000u ^ (uint32_t)i);
+    if (bad) {
+      snprintf(detail, sizeof detail, "%zu of %zu words read back wrong", bad, n);
+      fail("sysmem pattern", detail);
+    } else {
+      snprintf(detail, sizeof detail, "sysmem at %#llx: mapped, written and read back",
+               (unsigned long long)linear);
+      ok(detail);
+    }
+    munmap((void *)va, size);
+    rm_unmap(ctl, client, device, memory, linear, "sysmem");
+  }
+  close(fd);
+  rm_free(ctl, client, device, memory);
+}
+
+static uint64_t gpu_time(volatile uint32_t *regs) {
+  uint32_t hi, lo;
+  do {
+    hi = regs[NVC361_TIME_1 / 4];
+    lo = regs[NVC361_TIME_0 / 4];
+  } while (hi != regs[NVC361_TIME_1 / 4]);
+  return (uint64_t)hi << 32 | lo;
+}
+
+// The GPU timer, through a mapping of the subdevice's usermode page in BAR0.
+static void probe_usermode(int ctl, uint32_t client, uint32_t subdevice, const char *path) {
+  char detail[160];
+  uint32_t usermode = 0;
+  if (rm_alloc(ctl, client, subdevice, TURING_USERMODE_A, NULL, 0, &usermode,
+               "TURING_USERMODE_A"))
+    return;
+  ok("TURING_USERMODE_A");
+  int fd = open(path, O_RDWR | O_CLOEXEC);
+  if (fd < 0) {
+    snprintf(detail, sizeof detail, "open: %s", strerror(errno));
+    fail("usermode node", detail);
+    rm_free(ctl, client, subdevice, usermode);
+    return;
+  }
+  uint64_t linear = 0;
+  volatile uint32_t *regs =
+      rm_map(ctl, fd, client, subdevice, usermode, NVC361_NV_USERMODE__SIZE, &linear, "usermode");
+  if (regs) {
+    uint64_t t0 = gpu_time(regs);
+    struct timespec ms = {0, 1000000};
+    nanosleep(&ms, NULL);
+    uint64_t t1 = gpu_time(regs);
+    if (t1 > t0) {
+      snprintf(detail, sizeof detail, "usermode at %#llx: the GPU timer moved %llu ns in 1 ms",
+               (unsigned long long)linear, (unsigned long long)(t1 - t0));
+      ok(detail);
+    } else {
+      snprintf(detail, sizeof detail, "the GPU timer read %#llx then %#llx",
+               (unsigned long long)t0, (unsigned long long)t1);
+      fail("usermode timer", detail);
+    }
+    munmap((void *)regs, NVC361_NV_USERMODE__SIZE);
+    rm_unmap(ctl, client, subdevice, usermode, linear, "usermode");
+  }
+  close(fd);
+  rm_free(ctl, client, subdevice, usermode);
+}
+
 static void probe_gpu(int ctl, uint32_t client, const nv_ioctl_card_info_t *card, int index) {
   char path[32], detail[160];
   snprintf(path, sizeof path, "/dev/nvidia%u", card->minor_number);
@@ -287,7 +489,9 @@ static void probe_gpu(int ctl, uint32_t client, const nv_ioctl_card_info_t *card
          have_gid ? (char *)gid.data : "?");
   if (have_fb)
     printf(", %u MiB", fb.fbInfoList[0].data / 1024);
-  printf("\n");
+  printf("\n\n  [map]\n");
+  probe_sysmem(ctl, client, device);
+  probe_usermode(ctl, client, subdevice, path);
   close(fd);
 }
 
