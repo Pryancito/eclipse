@@ -756,7 +756,14 @@ impl Syscall<'_> {
             "sigreturn: thread {} returns from handling the signal",
             self.thread.id()
         );
-        let (old_ctx, siginfo_ptr, uctx_ptr) = match self.thread.fetch_backup_context() {
+        // The frame this `sigreturn` returns from is the one its stack
+        // pointer is at, as in Linux: with handlers nested, or left with
+        // `siglongjmp`, the most recent frame need not be it.
+        let sp = self
+            .thread
+            .with_context(|ctx| ctx.get_field(kernel_hal::context::UserContextField::StackPointer))
+            .map_err(|_| LxError::EINVAL)?;
+        let (old_ctx, siginfo_ptr, uctx_ptr) = match self.thread.fetch_backup_context(sp) {
             Some(v) => v,
             None => return Err(LxError::EINVAL),
         };

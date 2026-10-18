@@ -688,6 +688,9 @@ impl Syscall<'_> {
             g.rflags &= !1;
         }
         new_thread.with_context(|ctx| *ctx = new_ctx)?;
+        // A child forked inside a signal handler has the handler's frame in
+        // its copy of the stack, and returns from it.
+        new_thread.inherit_backup_contexts(self.thread);
         publish_child_tid(&new_thread, ctid);
         // Everything below this line and above `start` is "what the child has
         // to be holding before it can execute an instruction", and it is in
@@ -1522,6 +1525,7 @@ impl Syscall<'_> {
         if let Some(mut lt) = self.thread.try_lock_linux() {
             lt.reset_for_exec();
         }
+        self.thread.forget_backup_contexts();
         // hunter: a new image is now in place — re-apply any default syscall
         // whitelist and reset the anomaly window so a benign-then-malicious
         // exec cannot launder accumulated detection state.
