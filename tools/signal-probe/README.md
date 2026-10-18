@@ -1,0 +1,59 @@
+# signal-probe
+
+Sonda de **integridad** de la entrega de señales de Eclipse OS: si una señal
+devuelve el programa a donde estaba, como estaba. Un binario estatico de musl,
+sin dependencias, que se copia al rootfs y se corre desde la shell.
+
+## Por que existe
+
+Una señal es el unico sitio donde el kernel coge un programa en marcha, le hace
+ejecutar otro trozo de si mismo y tiene que dejarlo exactamente como estaba.
+Todas las llamadas que intervienen pueden devolver 0 con la vuelta mal hecha, y
+en este kernel ha pasado de maneras que ningun test de syscalls ve:
+
+1. El contexto que interrumpe una señal se guardaba en **una** ranura por hilo,
+   asi que una segunda señal dentro de un manejador pisaba la de la primera, y
+   el `sigreturn` del manejador de fuera fallaba con `EINVAL`. Un `sigreturn`
+   que falla **vuelve**, a lo que haya detras del trampolin de libc. (#1943)
+2. Un fallo despues de salir de un manejador con `siglongjmp` mataba el proceso
+   aunque tuviera su manejador de SIGSEGV puesto. (#1943)
+3. Un manejador que reescribia el `rip` guardado con una direccion no canonica
+   tumbaba **el kernel entero**: la CPU falla en la vuelta a modo usuario, en
+   el anillo 0. (#1943)
+
+## Compilar
+
+```sh
+make                       # x86_64-linux-musl-gcc -O2 -static
+make CC=musl-gcc
+make linux                 # el mismo fuente con el cc del host
+```
+
+`cargo xtask rootfs` / `image` ya la compila y la copia a `/bin/signal-probe`
+dentro de la imagen, igual que el resto de las sondas de `tools/`.
+
+## Correr
+
+```sh
+signal-probe [--only SECCION]
+```
+
+Salida: **0** si todo se cumple, **1** si algo falla, **2** si la linea de
+orden esta mal. Cada seccion corre en un hijo propio con una alarma de 20 s,
+asi que una seccion que mata su proceso o se cuelga sale como FAIL y las demas
+siguen.
+
+**Correrla tambien en Linux, en la misma maquina.** Todo lo que comprueba es
+algo que Linux cumple, asi que un FAIL en Linux es un fallo de la sonda y un
+FAIL solo en Eclipse es un fallo de Eclipse.
+
+## Las secciones
+
+| seccion | que comprueba |
+| --- | --- |
+| `nest` | un manejador interrumpido por otra señal vuelve a donde estaba, con sus registros vectoriales (`xmm8`), y el programa tambien |
+| `longjmp` | salir de un manejador con `siglongjmp` no impide que el siguiente fallo llegue a su manejador; tampoco un fallo dentro del manejador de otra señal |
+| `fork` | un hijo hecho con `fork` dentro de un manejador vuelve de ese manejador |
+| `restart` | con `SA_RESTART`, `read` y `wait4` se reanudan tras el manejador; `nanosleep` y `poll` dan `EINTR` igualmente, como en Linux |
+| `badrip` | un manejador que pone un `rip` no canonico en su `ucontext` le cuesta al proceso un SIGSEGV (`SI_KERNEL`) y nada mas. Solo x86_64 |
+| `ids` | el kernel rechaza lo que no puede cargar: un puntero de TLS fuera del espacio de usuario (`arch_prctl`, `clone(CLONE_SETTLS)`) y el pid `INT_MIN`, que no tiene negativo, en `waitpid` |

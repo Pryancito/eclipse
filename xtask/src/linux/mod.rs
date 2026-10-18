@@ -6,6 +6,7 @@ mod nvctl_probe;
 pub(crate) mod nvidia_firmware;
 mod opencv;
 mod portal;
+mod signal_probe;
 mod test;
 mod tree_image;
 mod verify;
@@ -151,6 +152,7 @@ impl LinuxRootfs {
             if clock_probe.is_file() {
                 let _ = fs::copy(&clock_probe, bin.join("clock-probe"));
             }
+            self.install_signal_probe(&musl, &bin);
             let firefox_probe = self.firefox_probe(&musl);
             if firefox_probe.is_file() {
                 let _ = fs::copy(&firefox_probe, bin.join("firefox-probe"));
@@ -744,6 +746,9 @@ impl LinuxRootfs {
             let _ = dir::rm(&dst);
             fs::copy(&clock_probe, &dst).unwrap();
         }
+
+        // signal-probe: whether a signal puts the program back as it found it.
+        self.install_signal_probe(&musl, &bin);
 
         // firefox-probe: the kernel interfaces Firefox depends on.
         let firefox_probe = self.firefox_probe(&musl);

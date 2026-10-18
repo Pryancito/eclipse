@@ -776,3 +776,204 @@ fn a_name_created_without_sync_survives_a_remount() -> Result<()> {
     std::mem::forget(sfs);
     Ok(())
 }
+
+/// Run `op` on `threads` threads released at once, `rounds` times over,
+/// each told which thread it is, and hand back every round's results. A thread that panics comes back as
+/// `None`: that is the kernel's `assert!` firing, in a test.
+fn race<T: Send + 'static>(
+    threads: usize,
+    rounds: usize,
+    setup: impl Fn(usize) -> Arc<dyn INode>,
+    op: impl Fn(&Arc<dyn INode>, usize) -> T + Send + Sync + 'static,
+) -> std::vec::Vec<std::vec::Vec<Option<T>>> {
+    let op = Arc::new(op);
+    (0..rounds)
+        .map(|round| {
+            let dir = setup(round);
+            let barrier = Arc::new(std::sync::Barrier::new(threads));
+            let handles: std::vec::Vec<_> = (0..threads)
+                .map(|thread| {
+                    let (dir, barrier, op) = (dir.clone(), barrier.clone(), op.clone());
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        op(&dir, thread)
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().ok()).collect()
+        })
+        .collect()
+}
+
+/// Two `mkdir` of one name at once: one of them makes it, the other is told
+/// it exists. It is the lock three of the boot scripts take around labwc's
+/// `environment` (`mkdir "$ENVF.lock"`), so a lock two of them both get is
+/// two read-modify-writes of one file at once -- and two `rmdir` of it.
+#[test]
+fn two_creates_of_one_name_at_once_make_one_entry() -> Result<()> {
+    let sfs = _create_new_sfs();
+    let root = sfs.root_inode();
+    let results = race(
+        4,
+        200,
+        |round| {
+            root.create(&format!("d{}", round), FileType::Dir, 0o755)
+                .unwrap()
+        },
+        |dir, _| dir.create("lock", FileType::Dir, 0o755).map(|_| ()),
+    );
+    for (round, results) in results.iter().enumerate() {
+        let made = results.iter().filter(|r| matches!(r, Some(Ok(())))).count();
+        assert_eq!(made, 1, "round {}: {:?}", round, results);
+        let dir = root.find(&format!("d{}", round))?;
+        let entries = dir.list()?;
+        let locks = entries.iter().filter(|e| e.as_str() == "lock").count();
+        assert_eq!(locks, 1, "round {}: {:?}", round, entries);
+    }
+    Ok(())
+}
+
+/// Two `rmdir` of one directory at once: one of them removes it, the other
+/// is told it is not there. Both used to find it, both took its two links
+/// away, and the second `nlinks_dec` fired the `nlinks > 0` assertion -- the
+/// kernel panic in `INodeImpl::nlinks_dec` (lib.rs) that the riscv64 libc
+/// test job dies of while init is starting.
+#[test]
+fn two_unlinks_of_one_directory_at_once_remove_it_once() -> Result<()> {
+    let sfs = _create_new_sfs();
+    let root = sfs.root_inode();
+    let results = race(
+        4,
+        200,
+        |round| {
+            let dir = root
+                .create(&format!("d{}", round), FileType::Dir, 0o755)
+                .unwrap();
+            dir.create("lock", FileType::Dir, 0o755).unwrap();
+            dir
+        },
+        |dir, _| dir.unlink("lock"),
+    );
+    for (round, results) in results.iter().enumerate() {
+        assert!(
+            results.iter().all(|r| r.is_some()),
+            "round {}: an unlink panicked: {:?}",
+            round,
+            results
+        );
+        let removed = results.iter().filter(|r| matches!(r, Some(Ok(())))).count();
+        assert_eq!(removed, 1, "round {}: {:?}", round, results);
+        let dir = root.find(&format!("d{}", round))?;
+        assert_eq!(
+            dir.metadata()?.nlinks,
+            2,
+            "round {}: the parent lost a link per unlink, not per directory",
+            round
+        );
+    }
+    Ok(())
+}
+
+/// The same for a file: two `unlink` of one name at once take one link.
+#[test]
+fn two_unlinks_of_one_file_at_once_take_one_link() -> Result<()> {
+    let sfs = _create_new_sfs();
+    let root = sfs.root_inode();
+    let results = race(
+        4,
+        200,
+        |round| {
+            let dir = root
+                .create(&format!("d{}", round), FileType::Dir, 0o755)
+                .unwrap();
+            let file = dir.create("f", FileType::File, 0o644).unwrap();
+            dir.link("g", &file).unwrap();
+            dir
+        },
+        |dir, _| dir.unlink("f"),
+    );
+    for (round, results) in results.iter().enumerate() {
+        assert!(results.iter().all(|r| r.is_some()), "round {}", round);
+        let removed = results.iter().filter(|r| matches!(r, Some(Ok(())))).count();
+        assert_eq!(removed, 1, "round {}: {:?}", round, results);
+        let dir = root.find(&format!("d{}", round))?;
+        assert_eq!(dir.find("g")?.metadata()?.nlinks, 1, "round {}", round);
+    }
+    Ok(())
+}
+
+/// Two `link` to one new name at once: one entry, one link more.
+#[test]
+fn two_links_to_one_name_at_once_make_one_entry() -> Result<()> {
+    let sfs = _create_new_sfs();
+    let root = sfs.root_inode();
+    let results = race(
+        4,
+        200,
+        |round| {
+            let dir = root
+                .create(&format!("d{}", round), FileType::Dir, 0o755)
+                .unwrap();
+            dir.create("f", FileType::File, 0o644).unwrap();
+            dir
+        },
+        |dir, _| {
+            let f = dir.find("f").unwrap();
+            dir.link("g", &f)
+        },
+    );
+    for (round, results) in results.iter().enumerate() {
+        let made = results.iter().filter(|r| matches!(r, Some(Ok(())))).count();
+        assert_eq!(made, 1, "round {}: {:?}", round, results);
+        let dir = root.find(&format!("d{}", round))?;
+        let entries = dir.list()?;
+        assert_eq!(
+            entries.iter().filter(|e| e.as_str() == "g").count(),
+            1,
+            "round {}: {:?}",
+            round,
+            entries
+        );
+        assert_eq!(dir.find("f")?.metadata()?.nlinks, 2, "round {}", round);
+    }
+    Ok(())
+}
+
+/// Two renames onto one existing name at once -- `mv "$tmp" "$ENVF"` from
+/// two writers whose lock was stolen. Each replaces the name once, so the
+/// file that was there loses its one link once, not once per rename.
+#[test]
+fn two_renames_onto_one_name_at_once_replace_it_once_each() -> Result<()> {
+    let sfs = _create_new_sfs();
+    let root = sfs.root_inode();
+    let results = race(
+        4,
+        200,
+        |round| {
+            let dir = root
+                .create(&format!("d{}", round), FileType::Dir, 0o755)
+                .unwrap();
+            dir.create("env", FileType::File, 0o644).unwrap();
+            for t in 0..4 {
+                dir.create(&format!("t{}", t), FileType::File, 0o644)
+                    .unwrap();
+            }
+            dir
+        },
+        |dir, thread| dir.move_(&format!("t{}", thread), dir, "env"),
+    );
+    for (round, results) in results.iter().enumerate() {
+        assert!(
+            results.iter().all(|r| matches!(r, Some(Ok(())))),
+            "round {}: {:?}",
+            round,
+            results
+        );
+        let dir = root.find(&format!("d{}", round))?;
+        let mut entries = dir.list()?;
+        entries.sort();
+        assert_eq!(entries, [".", "..", "env"], "round {}", round);
+        assert_eq!(dir.find("env")?.metadata()?.nlinks, 1, "round {}", round);
+    }
+    Ok(())
+}
