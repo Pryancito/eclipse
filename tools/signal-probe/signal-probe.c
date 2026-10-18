@@ -430,6 +430,9 @@ int main(int argc, char **argv) {
         fflush(stdout);
         pid_t pid = fork();
         if (pid == 0) {
+            // The count of THIS section: the child starts with the parent's
+            // running total, and handing that back would count it twice.
+            g_fail = 0;
             // A section that hangs is a FAIL, not a hung probe.
             alarm(20);
             SECTIONS[i].fn();
