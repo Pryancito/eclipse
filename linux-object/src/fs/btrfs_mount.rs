@@ -792,6 +792,13 @@ impl INode for BtrfsMountINode {
     }
 }
 
+/// Whether `inode` is one of a mounted btrfs. Its reads hold
+/// `BtrfsMountFs::inner`, an interrupts-off spinlock, across the device
+/// command, which is why `File` queues them first (`disk_read_gate`).
+pub(super) fn owns(inode: &dyn INode) -> bool {
+    inode.downcast_ref::<BtrfsMountINode>().is_some()
+}
+
 /// Open a mount backend as a btrfs filesystem.
 pub fn open_btrfs(backend: &MountBackend, read_only: bool) -> Result<Arc<dyn FileSystem>> {
     BtrfsMountFs::open(backend, read_only).map(|fs| fs as Arc<dyn FileSystem>)

@@ -950,6 +950,13 @@ impl INode for FatMountINode {
     }
 }
 
+/// Whether `inode` is one of a mounted FAT volume. Its reads hold
+/// `FatMountFs::inner`, an interrupts-off spinlock, across the device
+/// command, which is why `File` queues them first (`disk_read_gate`).
+pub(super) fn owns(inode: &dyn INode) -> bool {
+    inode.downcast_ref::<FatMountINode>().is_some()
+}
+
 pub fn open_fat(backend: &MountBackend) -> rcore_fs::vfs::Result<Arc<dyn VfsFileSystem>> {
     FatMountFs::open(backend).map(|fs| fs as Arc<dyn VfsFileSystem>)
 }
@@ -1051,6 +1058,67 @@ mod fat_tests {
 
     fn create_file(root: &Arc<dyn INode>, name: &str) -> Arc<dyn INode> {
         root.create(name, FileType::File, 0o644).unwrap()
+    }
+
+    /// A file on a FAT volume reads in turn (`file::disk_read_gate`): the
+    /// read holds the volume's lock across the device command.
+    #[test]
+    fn a_file_on_fat_reads_in_turn() {
+        let (_blk, fs) = mount_default();
+        let file = create_file(&fs.root_inode(), "turn.bin");
+        assert!(crate::fs::file::disk_read_gate(&file).is_some());
+    }
+
+    /// `read(2)` and `pread(2)` of such a file wait while another read has
+    /// the turn, and go ahead once it is handed back. `O_NONBLOCK` changes
+    /// nothing for a regular file, so it waits too.
+    #[test]
+    fn reading_a_file_on_fat_waits_for_the_turn() {
+        use crate::fs::{File, FileLike, OpenFlags};
+        use core::future::Future;
+        use core::task::{Context, Poll, Waker};
+
+        let (_blk, fs) = mount_default();
+        let inode = create_file(&fs.root_inode(), "turn.bin");
+        inode.write_at(0, b"turn").unwrap();
+        let gate = crate::fs::file::disk_read_gate(&inode).unwrap();
+        let mut cx = Context::from_waker(Waker::noop());
+        let take = |cx: &mut Context<'_>| match core::pin::pin!(gate.turn()).poll(cx) {
+            Poll::Ready(turn) => turn,
+            Poll::Pending => panic!("nobody else has the turn"),
+        };
+
+        for flags in [OpenFlags::RDONLY, OpenFlags::RDONLY | OpenFlags::NON_BLOCK] {
+            let file = File::new(inode.clone(), flags, String::from("/turn.bin"));
+
+            let mut buf = [0u8; 4];
+            let held = take(&mut cx);
+            {
+                let mut pread = file.read_at(0, &mut buf);
+                assert!(
+                    pread.as_mut().poll(&mut cx).is_pending(),
+                    "pread, {:?}",
+                    flags
+                );
+                drop(held);
+                assert!(matches!(pread.as_mut().poll(&mut cx), Poll::Ready(Ok(4))));
+            }
+            assert_eq!(&buf, b"turn");
+
+            let mut buf = [0u8; 4];
+            let held = take(&mut cx);
+            {
+                let mut read = file.read(&mut buf);
+                assert!(
+                    read.as_mut().poll(&mut cx).is_pending(),
+                    "read, {:?}",
+                    flags
+                );
+                drop(held);
+                assert!(matches!(read.as_mut().poll(&mut cx), Poll::Ready(Ok(4))));
+            }
+            assert_eq!(&buf, b"turn");
+        }
     }
 
     /// `resize()` grew the file by exactly one byte whatever you asked for:

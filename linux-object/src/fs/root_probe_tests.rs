@@ -80,3 +80,25 @@ fn only_installed_filesystems_count_as_an_installed_root() {
     assert!(!is_installed_block_root("rootfs"));
     assert!(!is_installed_block_root("sfs"));
 }
+
+/// Reads of a file on an installed root wait for their turn in a queue
+/// (`file::disk_read_gate`), the files of one filesystem in the same one; a
+/// file in RAM reads at once.
+#[test]
+fn files_of_an_installed_root_read_in_turn_and_files_in_ram_do_not() {
+    for (disk, want) in [
+        (formatted(16 * 1024 * 1024), "eclipsefs"),
+        (btrfs_disk(32 * 1024 * 1024), "btrfs"),
+    ] {
+        let (fs, fstype) = open_block_root(block_inode(disk)).expect(want);
+        assert_eq!(fstype, want);
+        let root = fs.root_inode();
+        let a = root.create("a", FileType::File, 0o644).unwrap();
+        let b = root.create("b", FileType::File, 0o644).unwrap();
+        let gate = file::disk_read_gate(&a).expect(want);
+        assert!(core::ptr::eq(gate, file::disk_read_gate(&b).unwrap()));
+    }
+    let ram = RamFS::new().root_inode();
+    let f = ram.create("a", FileType::File, 0o644).unwrap();
+    assert!(file::disk_read_gate(&f).is_none());
+}
