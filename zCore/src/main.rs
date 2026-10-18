@@ -928,6 +928,15 @@ fn primary_main(config: kernel_hal::KernelConfig) {
                     "Eclipse: nvidia.gem_comptags -- VM_BIND honours compressed PTE kinds"
                 );
             }
+            // The classic nvc0 (OpenGL) submission path actually submits,
+            // instead of parsing the request and returning EOPNOTSUPP: every
+            // listed buffer is mapped into the channel's VAS, the relocs are
+            // patched, and each push goes to the ring. Default off because no
+            // method stream from this path has run on real hardware yet.
+            if kernel_hal::cmdline::flag(&options.cmdline, "nvidia.gem_pushbuf") {
+                kernel_hal::drivers::set_gem_pushbuf_enabled(true);
+                klog_info!("Eclipse: nvidia.gem_pushbuf -- GEM_PUSHBUF submits for real");
+            }
             if kernel_hal::cmdline::flag(&options.cmdline, "nvidia.gem_vram_bar1") {
                 kernel_hal::drivers::set_gem_vram_bar1_enabled(true);
                 klog_info!(

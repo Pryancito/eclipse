@@ -375,6 +375,16 @@ pub fn set_gem_comptags_enabled(v: bool) {
 #[cfg(not(target_arch = "x86_64"))]
 pub fn set_gem_comptags_enabled(_v: bool) {}
 
+/// Lets `GEM_PUSHBUF` actually submit, instead of parsing the request and
+/// returning EOPNOTSUPP (`nvidia.gem_pushbuf`). Default off: see
+/// `drivers/src/display/nvidia/pushbuf.rs`.
+#[cfg(target_arch = "x86_64")]
+pub fn set_gem_pushbuf_enabled(v: bool) {
+    zcore_drivers::display::set_gem_pushbuf_enabled(v);
+}
+#[cfg(not(target_arch = "x86_64"))]
+pub fn set_gem_pushbuf_enabled(_v: bool) {}
+
 /// Lets a VRAM `GEM_NEW` object be CPU-mapped through the BAR1 aperture
 /// (`nvidia.gem_vram_bar1`). Default off: see
 /// `drivers/src/display/nvidia/vram_bar1.rs`.

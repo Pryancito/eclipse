@@ -227,6 +227,13 @@ mod comptag_caps;
 /// ceiling.
 pub(super) mod comptags;
 
+/// Real `GEM_PUSHBUF` submission for the classic nvc0 (OpenGL) driver: the
+/// reloc arithmetic and range checks, hatch `nvidia.gem_pushbuf`, default
+/// off; and the mapping/stores/ring calls behind it, split off so `pushbuf`
+/// stays FFI-free and host-testable. Own files for the size ceiling.
+pub(super) mod pushbuf;
+mod pushbuf_submit;
+
 /// Implicit synchronisation: the dependency a submission has on work ANOTHER
 /// process still has in flight against a buffer it lent us. The nouveau uAPI
 /// `EXEC` carries only the syncobjs its client names, so without this a
@@ -14551,26 +14558,27 @@ impl NvidiaGpu {
             nv::NR_GEM_PUSHBUF => {
                 // The submission path of the classic **nvc0 Gallium** driver
                 // (Mesa OpenGL for Turing) -- the one the shipped image uses.
-                // Real submission is a hardware-validated follow-up, so this
-                // milestone PARSES and LOGS the whole request, then honestly
-                // returns EOPNOTSUPP. The dump is the anatomy needed to build
-                // real submission: how many buffers (and their domains),
-                // relocs, and pushes Mesa hands us per call.
+                // It PARSES and LOGS the whole request either way; with
+                // `nvidia.gem_pushbuf` it then submits for real, and without
+                // it returns EOPNOTSUPP as it always did. The dump is the
+                // anatomy of a submission: how many buffers (and their
+                // domains), relocs, and pushes Mesa hands us per call.
                 //
-                // What it still needs is TWO things, not the three this
-                // comment used to list: each listed BO mapped into the
-                // channel's GPU VAS so a push has a VA (the `eclipse_rm_vm_bind_map`
-                // mechanic, driven from here instead of from VM_BIND), and
-                // reloc resolution to patch those VAs into the pushbuffer
-                // words. The ring submission itself already exists
-                // (`eclipse_rm_exec_submit`, which EXEC drives). **The 3D
-                // class is NOT missing**: `eclipse_rm_init.c` allocates
-                // TURING_A (0xc597) on every channel it builds -- step17's
-                // stage 7b for the ctx-0 fallback channel and ctx_alloc's
-                // stage 10b for each per-process context -- because a channel
-                // without a graphics object wedges FECS mid-RESTORE on the
-                // first 3D SET_OBJECT. Listing it as a blocker here sent an
-                // audit of whether Eclipse has hardware 3D down the wrong path.
+                // The two things it used to be missing are in
+                // `pushbuf_submit.rs`: each listed BO mapped into the
+                // channel's GPU VAS so a push has a VA (the
+                // `eclipse_rm_vm_bind_map` mechanic, driven from here instead
+                // of from VM_BIND), and reloc resolution to patch those VAs
+                // into the pushbuffer words. The ring submission itself
+                // already existed (`eclipse_rm_exec_submit`, which EXEC
+                // drives). **The 3D class was never missing**:
+                // `eclipse_rm_init.c` allocates TURING_A (0xc597) on every
+                // channel it builds -- step17's stage 7b for the ctx-0
+                // fallback channel and ctx_alloc's stage 10b for each
+                // per-process context -- because a channel without a
+                // graphics object wedges FECS mid-RESTORE on the first 3D
+                // SET_OBJECT. Listing it as a blocker here sent an audit of
+                // whether Eclipse has hardware 3D down the wrong path.
                 let pb = unsafe { &mut *(arg as *mut nv::DrmNouveauGemPushbuf) };
                 // What `nouveau_gem_ioctl_pushbuf` checks before it submits
                 // anything, in its order: a client with a uvmm (`VM_INIT`)
@@ -14706,13 +14714,22 @@ impl NvidiaGpu {
                         );
                     }
                 }
-                log::warn!(
-                    "[nouveau-uapi] GEM_PUSHBUF: not submitted (real submission needs \
-                     GART GEM + 3D class + relocs -- follow-up); returning EOPNOTSUPP"
-                );
+                if !pushbuf::enabled() {
+                    log::warn!(
+                        "[nouveau-uapi] GEM_PUSHBUF: not submitted (nvidia.gem_pushbuf is \
+                         off); returning EOPNOTSUPP"
+                    );
+                    pb.suffix0 = 0;
+                    pb.suffix1 = 0;
+                    return Err(nv::EOPNOTSUPP);
+                }
+                // Real submission, from here down. Every failure writes the
+                // suffixes first, like every error past the copy in
+                // `nouveau_gem_ioctl_pushbuf`.
+                let submitted = self.gem_pushbuf_submit(pb, all_pushes, owner_pid);
                 pb.suffix0 = 0;
                 pb.suffix1 = 0;
-                Err(nv::EOPNOTSUPP)
+                submitted.map(|()| 0)
             }
 
             nv::NR_NVIF => self.nouveau_nvif(arg, size as usize, owner_pid),
