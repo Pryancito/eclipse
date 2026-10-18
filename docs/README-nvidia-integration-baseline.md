@@ -132,12 +132,19 @@ de verdad y no publica mmap CPU. GART y `GART|VRAM` siguen en sysmem
 ## 2c) El userspace de NVIDIA (`nvidia-smi`, NVML, `libcuda`)
 
 Los clientes de verdad de `/dev/nvidiactl` (la escotilla `nvidia.nvidiactl`
-de la cmdline) son los binarios de NVIDIA. Se meten en la imagen solo si se
-piden:
+de la cmdline) son los binarios de NVIDIA. `cargo image --arch x86_64` los
+mete en la imagen sin pedirlos; para dejarlos fuera:
 
 ```sh
-ECLIPSE_NVIDIA_USERSPACE=1 cargo image --arch x86_64 --variant <variante>
+ECLIPSE_NVIDIA_USERSPACE=0 cargo image --arch x86_64 --variant <variante>
 ```
+
+Apagado también quita los que una construcción anterior dejó en la raíz,
+porque la raíz nunca se vacía. Van en la raíz instalada (`rootfs.btrfs.gz`) y
+nunca en la imagen que arranca QEMU: la de `minimal` no lleva `usr/lib` ni
+`usr/bin`, y de la de `desktop`, que los copia enteros, se quitan, porque QEMU
+no tiene GPU NVIDIA y `libcuda` con su JIT de PTX son 130 MiB de initramfs en
+RAM.
 
 Instala `/usr/bin/nvidia-smi` y, en `/usr/lib/x86_64-linux-gnu`,
 `libnvidia-ml`, `libcuda` y `libnvidia-ptxjitcompiler`, con sus enlaces de
@@ -155,8 +162,9 @@ antes que `/usr/lib`, donde están las de musl. Una raíz que ya trae su
 propio cargador glibc se queda con su glibc entera.
 
 Los paquetes quedan en `ignored/nvidia-userspace-cache`. En una máquina sin
-salida a `archive.ubuntu.com` basta con dejarlos ahí a mano. Para desempaquetar
-hace falta `tar` de GNU con `zstd`, y `sha256sum`.
+salida a `archive.ubuntu.com` basta con dejarlos ahí a mano; si no están, la
+construcción avisa y sigue sin ellos. Para desempaquetar hace falta `tar` de
+GNU con `zstd`, y `sha256sum`.
 
 Probarlo, arrancando con `nvidia.nvidiactl`:
 
@@ -168,8 +176,14 @@ dmesg | grep nvidiactl
 
 Sin GPU NVIDIA (QEMU) `nvidia-smi` dice «Failed to initialize NVML: GPU
 access blocked by the operating system»: no hay núcleo RM y las escapadas
-dan EINVAL. `libcuda` aún no puede pasar de `cuInit`, que necesita
-`/dev/nvidia-uvm`.
+dan EINVAL. Para verlo en QEMU hay que meter la raíz entera en su imagen a
+mano, antes de `make build`:
+
+```sh
+cargo xtask mk-sfs --dir rootfs/x86_64-minimal --image zCore/x86_64-minimal.img --size 629145600
+```
+
+`libcuda` aún no puede pasar de `cuInit`, que necesita `/dev/nvidia-uvm`.
 
 ## 3) Semántica de render node (despliegue seguro)
 

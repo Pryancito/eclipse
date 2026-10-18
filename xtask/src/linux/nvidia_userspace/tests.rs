@@ -74,6 +74,16 @@ fn deb(at: &Path, files: &[(&str, &[u8])]) {
 }
 
 #[test]
+fn it_is_on_unless_turned_off() {
+    for on in [None, Some("1"), Some("on"), Some("yes")] {
+        assert!(wanted_by(on), "{on:?}");
+    }
+    for off in ["0", "off", "no", "false", "", " OFF "] {
+        assert!(!wanted_by(Some(off)), "{off:?}");
+    }
+}
+
+#[test]
 fn a_deb_is_read_member_by_member() {
     let bytes = ar(&[
         ("debian-binary", b"2.0\n"),
@@ -214,7 +224,8 @@ fn the_plan_takes_this_versions_libraries_and_links_their_sonames() {
 }
 
 /// A small plan of the same shape: one pinned runtime package, and two
-/// release packages, one with a library and one with a program, and a link.
+/// release packages, one with two libraries and one with a program, and a
+/// link.
 struct Fixture {
     root: PathBuf,
     rootfs: PathBuf,
@@ -244,7 +255,10 @@ fn fixture(name: &str) -> Fixture {
     let release = source.join(RELEASE);
     deb(
         &release,
-        &[("usr/lib/x86_64-linux-gnu/libnvtest.so.580.178.04", b"nvml")],
+        &[
+            ("usr/lib/x86_64-linux-gnu/libnvtest.so.580.178.04", b"nvml"),
+            ("usr/lib/x86_64-linux-gnu/libnvjit.so.580.178.04", b"jit"),
+        ],
     );
     let utils = source.join(UTILS);
     deb(&utils, &[("usr/bin/nvtest", b"NVTEST 580.178.04 build")]);
@@ -270,7 +284,10 @@ fn fixture(name: &str) -> Fixture {
                     pool: "restricted/n/test".into(),
                     prefix: "nvtest-1_580.178.04-".into(),
                 },
-                vec![same("usr/lib/x86_64-linux-gnu/libnvtest.so.580.178.04")],
+                vec![
+                    same("usr/lib/x86_64-linux-gnu/libnvtest.so.580.178.04"),
+                    same("usr/lib/x86_64-linux-gnu/libnvjit.so.580.178.04"),
+                ],
             ),
             (
                 Deb::Release {
@@ -361,6 +378,11 @@ fn a_rootfs_gets_every_file_and_link() {
         f.read("usr/lib/x86_64-linux-gnu/libnvtest.so.1").as_deref(),
         Some("nvml"),
         "through the link"
+    );
+    assert_eq!(
+        f.read("usr/lib/x86_64-linux-gnu/libnvjit.so.580.178.04")
+            .as_deref(),
+        Some("jit")
     );
     assert_eq!(
         fs::read_link(f.rootfs.join("usr/lib/x86_64-linux-gnu/libnvtest.so.1")).unwrap(),
@@ -486,4 +508,37 @@ fn a_file_that_is_not_a_deb_is_refused() {
     fs::write(f.cache.join(RELEASE), b"<html>404</html>").unwrap();
     assert!(f.install(&offline).unwrap_err().contains("is not a .deb"));
     assert!(!f.installed());
+}
+
+#[test]
+fn removing_takes_nvidias_files_and_links_and_leaves_the_rest() {
+    let f = fixture("remove").cached();
+    assert_eq!(f.install(&offline), Ok(()));
+    fs::write(
+        f.rootfs.join("usr/lib/x86_64-linux-gnu/libother.so"),
+        b"other",
+    )
+    .unwrap();
+    assert_eq!(remove_with(&f.rootfs, &f.plan), 4);
+    for gone in [
+        "usr/lib/x86_64-linux-gnu/libnvtest.so.580.178.04",
+        "usr/lib/x86_64-linux-gnu/libnvjit.so.580.178.04",
+        "usr/lib/x86_64-linux-gnu/libnvtest.so.1",
+        "usr/bin/nvtest",
+    ] {
+        assert!(
+            fs::symlink_metadata(f.rootfs.join(gone)).is_err(),
+            "{gone} is still there"
+        );
+    }
+    assert_eq!(f.read(LOADER).as_deref(), Some("loader"));
+    assert_eq!(
+        f.read("usr/lib/x86_64-linux-gnu/libc.so.6").as_deref(),
+        Some("libc")
+    );
+    assert_eq!(
+        f.read("usr/lib/x86_64-linux-gnu/libother.so").as_deref(),
+        Some("other")
+    );
+    assert_eq!(remove_with(&f.rootfs, &f.plan), 0, "nothing left to take");
 }

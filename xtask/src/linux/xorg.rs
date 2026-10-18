@@ -413,7 +413,7 @@ fn running_as_root() -> bool {
 /// rather than a copy per knob: the two lists were identical, and a spelling
 /// added to one of them and not the other is a knob that answers differently
 /// from its twin for no reason a reader could find.
-fn knob_off(value: &str) -> bool {
+pub(super) fn knob_off(value: &str) -> bool {
     matches!(
         value.trim().to_ascii_lowercase().as_str(),
         "0" | "off" | "no" | "false" | ""
