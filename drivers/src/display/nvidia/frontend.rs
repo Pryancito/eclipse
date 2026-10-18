@@ -19,6 +19,9 @@ use super::{NvidiaGpu, NVIDIA_GPUS, RM_CORE_INIT_STATUS};
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, Ordering};
 
+pub use nvidia_rm_sys::frontend::events::{
+    alloc_os_event, free_os_event, set_event_sink, UnixEvent, NV_ERR_INVALID_EVENT,
+};
 pub use nvidia_rm_sys::frontend::{
     caching, copy_version, layout_mismatch, rm_version, set_user_range_validator, version_check,
     Caller, CpuCaching, MmapContext, MmapMemory, LAYOUT, NV_ERR_STATE_IN_USE, VERSION_CMD_QUERY,
@@ -73,7 +76,8 @@ pub fn map_unrecorded(payload: &mut [u8], caller: &Caller, why: NV_STATUS) {
 }
 
 /// `nvidia_rm_sys::frontend::release`. With no RM core no client was ever
-/// filed under anything, and the RM must not be entered to find that out.
+/// filed under anything, and no OS event registered (the kernel refuses
+/// ALLOC_OS_EVENT then), and the RM must not be entered to find that out.
 pub fn release(os_info: usize) {
     if rm_up() {
         nvidia_rm_sys::frontend::release(os_info);

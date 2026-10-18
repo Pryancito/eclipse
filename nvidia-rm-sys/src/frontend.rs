@@ -34,6 +34,8 @@
 use crate::types::*;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 
+pub mod events;
+
 /// `NV_RM_API_VERSION_STRING_LENGTH` (nv-ioctl.h).
 pub const VERSION_STRING_LENGTH: usize = 64;
 /// `NV_RM_API_VERSION_CMD_RELAXED` (nv-ioctl.h): compare up to the first `.`.
@@ -53,10 +55,12 @@ pub const NV_ERR_STATE_IN_USE: NV_STATUS = 0x0000_0063;
 pub const RM_MAP_MEMORY: u32 = 0x4E;
 
 /// The nv-ioctl.h payloads the kernel side lays out by hand, in the order
-/// `eclipse_rm_frontend_layout` answers them, then the offset of the one
-/// field it reads from RM_MAP_MEMORY's and the size of the mapping record
-/// this file shares with the C ([`RawMmapContext`]).
-pub const LAYOUT: [(&str, usize); 10] = [
+/// `eclipse_rm_frontend_layout` answers them: the offset of the one field it
+/// reads from RM_MAP_MEMORY's comes right after that payload, the OS events'
+/// payloads and the event they copy out ([`events::UnixEvent`]) after that,
+/// and last the size of the mapping record this file shares with the C
+/// ([`RawMmapContext`]).
+pub const LAYOUT: [(&str, usize); 14] = [
     ("nv_ioctl_xfer_t", 16),
     ("nv_ioctl_card_info_t", 72),
     ("nv_ioctl_rm_api_version_t", 72),
@@ -66,6 +70,10 @@ pub const LAYOUT: [(&str, usize); 10] = [
     ("nv_ioctl_status_code_t", 12),
     ("nv_ioctl_nvos33_parameters_with_fd", 56),
     ("nv_ioctl_nvos33_parameters_with_fd.fd", 48),
+    ("nv_ioctl_alloc_os_event_t", 16),
+    ("nv_ioctl_free_os_event_t", 16),
+    ("NVOS41_PARAMETERS", 16),
+    ("NvUnixEvent", events::UnixEvent::SIZE),
     ("EclipseRmMmapContext", 40),
 ];
 
@@ -487,7 +495,8 @@ unsafe fn unrecorded(payload: &mut [u8], caller: &Caller, why: NV_STATUS) {
 }
 
 /// The close of the `/dev/nvidiactl` open `os_info` names: every RM client
-/// filed under it is freed, with everything allocated under them.
+/// filed under it is freed, with everything allocated under them, and then
+/// every OS event registered on it, as `RmFreeUnusedClients` does.
 pub fn release(os_info: usize) {
     if os_info == 0 {
         return;
@@ -496,6 +505,7 @@ pub fn release(os_info: usize) {
     // to ask about: no GPU is open and nobody is an administrator.
     let _scope = CallScope::enter(0, false);
     unsafe { eclipse_rm_frontend_release(os_info as *mut c_void) };
+    events::free_open_events(os_info);
 }
 
 /// `NV_VERSION_STRING` of the RM this kernel carries, without its NUL, or
