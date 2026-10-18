@@ -18,6 +18,9 @@
 //     with SIGTERM or SIGUSR1 whose parent exited sent it to init, which
 //     reboots or halts on those; and an orphan's death was routed from the
 //     parent it was FORKED from, not the one that adopted it.
+//   * a SIGSTOP (or Ctrl-Z's SIGTSTP) to a process blocked in a syscall did
+//     not stop it until the syscall returned by itself -- never, for a child
+//     in `pause()` -- and its parent's `waitpid(WUNTRACED)` waited with it.
 //
 // Every section states what Linux does and checks it, printing the numbers
 // whether it passes or fails. Each section runs in a child of its own, so a
@@ -40,6 +43,20 @@
 //              signal its dead parent chose at clone(2), and wakes the
 //              adopter's `waitpid` even when a process in between volunteered
 //              as a subreaper after the adoption.
+//   inherit    what `fork` and `execve` hand down. A forked child keeps the
+//              handlers, the mask and the alternate stack, and starts with no
+//              pending signal and no alarm. An exec'd image keeps the mask,
+//              the pending signals, the alarm and what was ignored, and loses
+//              the handlers and the alternate stack.
+//   wait       what `waitid` and `waitpid` report: an exit, a death by
+//              signal, a stop and a continue (each once), `WNOWAIT` leaving the
+//              child to be reaped again, `P_PGID` 0 as the caller's group,
+//              `SA_NOCLDSTOP`; and a process ended or exec'd from a thread
+//              that is not its first.
+//   stop       a stop reaches a process blocked in a syscall -- `nanosleep`,
+//              `read`, `sigsuspend` -- and the syscall goes on once it is
+//              continued: the read reads, the sigsuspend waits for its signal
+//              and puts the old mask back.
 //
 // Build:  make                 (x86_64-linux-musl-gcc -O2 -static)
 // Run:    ./signal-probe [--only SECTION]
@@ -53,6 +70,7 @@
 #include <errno.h>
 #include <limits.h>
 #include <poll.h>
+#include <pthread.h>
 #include <sched.h>
 #include <setjmp.h>
 #include <signal.h>
@@ -548,6 +566,366 @@ static void sec_orphan(void) {
     alarm(20);
 }
 
+// ---------------------------------------------------------------- inherit
+
+// fork(2) and execve(2) each hand a process's signal state down by their own
+// rules, and each item is a separate line of kernel code that can be missed:
+//
+//                      fork child          execve'd image
+//   handlers           kept                reset to SIG_DFL (SIG_IGN stays)
+//   mask               kept                kept
+//   pending            empty               kept
+//   alarm              none                kept
+//   alternate stack    kept                gone
+//
+// The exec half is this same binary run again with --exec-report.
+
+static const char *g_self = "signal-probe";
+static char g_inherit_stack[65536];
+
+static void handler_noop(int sig, siginfo_t *si, void *uc) {
+    (void)sig, (void)si, (void)uc;
+}
+
+static int is_blocked(int sig) {
+    sigset_t cur;
+    sigprocmask(SIG_BLOCK, NULL, &cur);
+    return sigismember(&cur, sig);
+}
+
+static int is_pending(int sig) {
+    sigset_t p;
+    sigpending(&p);
+    return sigismember(&p, sig);
+}
+
+static void *disposition(int sig) {
+    struct sigaction sa;
+    sigaction(sig, NULL, &sa);
+    return (sa.sa_flags & SA_SIGINFO) ? (void *)sa.sa_sigaction : (void *)sa.sa_handler;
+}
+
+static const char *disposition_name(void *d) {
+    if (d == (void *)SIG_DFL) return "SIG_DFL";
+    if (d == (void *)SIG_IGN) return "SIG_IGN";
+    if (d == (void *)handler_noop) return "the handler";
+    return "something else";
+}
+
+// Runs in the image `sec_inherit` exec'd, and returns its failure count.
+static int exec_report(void) {
+    void *usr1 = disposition(SIGUSR1), *hup = disposition(SIGHUP);
+    check(usr1 == (void *)SIG_DFL, "exec: a caught signal is SIG_DFL", "%s",
+          disposition_name(usr1));
+    check(hup == (void *)SIG_IGN, "exec: an ignored one stays ignored", "%s",
+          disposition_name(hup));
+    check(is_blocked(SIGUSR2), "exec: the mask is kept", "SIGUSR2 %s",
+          is_blocked(SIGUSR2) ? "blocked" : "unblocked");
+    check(is_pending(SIGUSR2), "exec: a pending signal is kept", "SIGUSR2 %s",
+          is_pending(SIGUSR2) ? "pending" : "gone");
+    unsigned left = alarm(0);
+    check(left > 0 && left <= 100, "exec: the alarm is kept", "%u s left", left);
+    stack_t ss;
+    sigaltstack(NULL, &ss);
+    check(ss.ss_flags & SS_DISABLE, "exec: the alternate stack is gone", "ss_flags %#x",
+          (unsigned)ss.ss_flags);
+    return g_fail;
+}
+
+static void sec_inherit(void) {
+    install(SIGUSR1, handler_noop, 0);
+    signal(SIGHUP, SIG_IGN);
+    sigset_t set;
+    sigemptyset(&set);
+    sigaddset(&set, SIGUSR2);
+    sigprocmask(SIG_BLOCK, &set, NULL);
+    raise(SIGUSR2);  // blocked, so it stays pending
+    stack_t ss = {.ss_sp = g_inherit_stack, .ss_size = sizeof g_inherit_stack, .ss_flags = 0};
+    if (sigaltstack(&ss, NULL) != 0) check(0, "sigaltstack", "%s", strerror(errno));
+    alarm(100);  // in place of the section's 20 s guard, put back below
+
+    pid_t c = fork();
+    if (c == 0) {
+        g_fail = 0;
+        void *usr1 = disposition(SIGUSR1);
+        check(usr1 == (void *)handler_noop, "fork: the handler is kept", "%s",
+              disposition_name(usr1));
+        check(is_blocked(SIGUSR2), "fork: the mask is kept", "SIGUSR2 %s",
+              is_blocked(SIGUSR2) ? "blocked" : "unblocked");
+        check(!is_pending(SIGUSR2), "fork: nothing is pending", "SIGUSR2 %s",
+              is_pending(SIGUSR2) ? "pending" : "not pending");
+        unsigned left = alarm(0);
+        check(left == 0, "fork: no alarm", "%u s left", left);
+        stack_t cs;
+        sigaltstack(NULL, &cs);
+        check(!(cs.ss_flags & SS_DISABLE) && cs.ss_sp == g_inherit_stack,
+              "fork: the alternate stack is kept", "ss_flags %#x, %s", (unsigned)cs.ss_flags,
+              cs.ss_sp == g_inherit_stack ? "same stack" : "another stack");
+        _exit(g_fail > 100 ? 100 : g_fail);
+    }
+    int st = 0;
+    while (waitpid(c, &st, 0) == -1 && errno == EINTR) {
+    }
+    if (WIFEXITED(st))
+        g_fail += WEXITSTATUS(st);
+    else
+        check(0, "fork child", "died of signal %d", WIFSIGNALED(st) ? WTERMSIG(st) : 0);
+
+    c = fork();
+    if (c == 0) {
+        // The fork above took the pending signal and the alarm away: give
+        // this child both again, so the exec has something to keep.
+        raise(SIGUSR2);
+        alarm(100);
+        char *args[] = {(char *)g_self, "--exec-report", NULL};
+        execv("/proc/self/exe", args);
+        execvp(g_self, args);
+        _exit(101);
+    }
+    while (waitpid(c, &st, 0) == -1 && errno == EINTR) {
+    }
+    if (WIFEXITED(st) && WEXITSTATUS(st) == 101)
+        check(0, "exec of this probe", "neither /proc/self/exe nor %s could be exec'd", g_self);
+    else if (WIFEXITED(st))
+        g_fail += WEXITSTATUS(st);
+    else
+        check(0, "exec'd image", "died of signal %d", WIFSIGNALED(st) ? WTERMSIG(st) : 0);
+    alarm(20);
+}
+
+// ------------------------------------------------------------------- wait
+
+static volatile sig_atomic_t g_chld_runs;
+
+static void chld_counts(int sig, siginfo_t *si, void *uc) {
+    (void)sig, (void)si, (void)uc;
+    g_chld_runs++;
+}
+
+static pid_t child_that_exits(int code, long after_ms) {
+    pid_t c = fork();
+    if (c == 0) {
+        sleep_ms(after_ms);
+        _exit(code);
+    }
+    return c;
+}
+
+static void *thread_exits(void *arg) {
+    (void)arg;
+    exit(7);
+}
+
+static void *thread_execs(void *arg) {
+    (void)arg;
+    char *args[] = {(char *)g_self, "--exec-from-thread", NULL};
+    execv("/proc/self/exe", args);
+    execvp(g_self, args);
+    _exit(101);
+}
+
+// Runs in the image a non-first thread exec'd: the exec makes that thread
+// the process's first, so it takes the process's pid as its tid.
+static int exec_from_thread_report(void) {
+    long tid = syscall(SYS_gettid);
+    return tid == (long)getpid() ? 0 : 1;
+}
+
+static void sec_wait(void) {
+    install(SIGCHLD, chld_counts, SA_RESTART);
+
+    // An exit, through waitid and WNOWAIT, then reaped by waitpid.
+    pid_t c = child_that_exits(42, 0);
+    siginfo_t si;
+    memset(&si, 0, sizeof si);
+    int r = waitid(P_PID, (id_t)c, &si, WEXITED | WNOWAIT);
+    check(r == 0 && si.si_pid == c && si.si_code == CLD_EXITED && si.si_status == 42,
+          "waitid: an exit, WNOWAIT", "returned %d, si_pid %s, si_code %d, si_status %d", r,
+          si.si_pid == c ? "right" : "wrong", si.si_code, si.si_status);
+    int st = 0;
+    pid_t got = waitpid(c, &st, WNOHANG);
+    check(got == c && WIFEXITED(st) && WEXITSTATUS(st) == 42, "waitpid after WNOWAIT reaps it",
+          "returned %d, status %#x", (int)got, st);
+
+    // A death by signal.
+    c = fork();
+    if (c == 0) {
+        for (;;) pause();
+    }
+    sleep_ms(50);
+    kill(c, SIGTERM);
+    memset(&si, 0, sizeof si);
+    r = waitid(P_PID, (id_t)c, &si, WEXITED);
+    check(r == 0 && si.si_code == CLD_KILLED && si.si_status == SIGTERM, "waitid: killed by SIGTERM",
+          "returned %d, si_code %d (want %d), si_status %d", r, si.si_code, CLD_KILLED,
+          si.si_status);
+
+    // A stop and a continue, each reported once.
+    c = fork();
+    if (c == 0) {
+        for (;;) pause();
+    }
+    sleep_ms(50);
+    kill(c, SIGSTOP);
+    got = waitpid(c, &st, WUNTRACED);
+    check(got == c && WIFSTOPPED(st) && WSTOPSIG(st) == SIGSTOP, "waitpid: a stop",
+          "returned %d, status %#x", (int)got, st);
+    got = waitpid(c, &st, WUNTRACED | WNOHANG);
+    check(got == 0, "the stop is reported once", "a second waitpid returned %d", (int)got);
+    kill(c, SIGCONT);
+    sleep_ms(50);
+    got = waitpid(c, &st, WCONTINUED);
+    check(got == c && WIFCONTINUED(st), "waitpid: a continue", "returned %d, status %#x",
+          (int)got, st);
+    got = waitpid(c, &st, WCONTINUED | WNOHANG);
+    check(got == 0, "the continue is reported once", "a second waitpid returned %d", (int)got);
+    kill(c, SIGKILL);
+    waitpid(c, &st, 0);
+
+    // P_PGID with 0 is the caller's own group (Linux 5.4).
+    c = child_that_exits(3, 0);
+    memset(&si, 0, sizeof si);
+    r = waitid(P_PGID, 0, &si, WEXITED);
+    check(r == 0 && si.si_pid == c, "waitid(P_PGID, 0): our group", "returned %d (%s), si_pid %s",
+          r, r ? strerror(errno) : "ok", si.si_pid == c ? "the child" : "another");
+
+    // SA_NOCLDSTOP: a stop sends no SIGCHLD; the exit still does.
+    install(SIGCHLD, chld_counts, SA_RESTART | SA_NOCLDSTOP);
+    c = fork();
+    if (c == 0) {
+        for (;;) pause();
+    }
+    sleep_ms(50);
+    g_chld_runs = 0;
+    kill(c, SIGSTOP);
+    waitpid(c, &st, WUNTRACED);
+    sleep_ms(50);
+    int on_stop = g_chld_runs;
+    kill(c, SIGKILL);
+    waitpid(c, &st, 0);
+    sleep_ms(50);
+    check(on_stop == 0 && g_chld_runs >= 1, "SA_NOCLDSTOP: no SIGCHLD for a stop",
+          "%d on the stop, %d by the death", on_stop, (int)g_chld_runs);
+
+    // exit(3) from a thread that is not the first ends the whole process
+    // with that status.
+    c = fork();
+    if (c == 0) {
+        pthread_t t;
+        if (pthread_create(&t, NULL, thread_exits, NULL) != 0) _exit(98);
+        for (;;) pause();
+    }
+    got = waitpid(c, &st, 0);
+    check(got == c && WIFEXITED(st) && WEXITSTATUS(st) == 7, "exit() from a second thread",
+          "status %#x (want an exit with 7)", st);
+
+    // execve from a thread that is not the first: the new image runs in
+    // that thread, which takes the process's pid.
+    c = fork();
+    if (c == 0) {
+        pthread_t t;
+        if (pthread_create(&t, NULL, thread_execs, NULL) != 0) _exit(98);
+        for (;;) pause();
+    }
+    got = waitpid(c, &st, 0);
+    check(got == c && WIFEXITED(st) && WEXITSTATUS(st) == 0, "execve() from a second thread",
+          "%s (status %#x)",
+          WIFEXITED(st) && WEXITSTATUS(st) == 1     ? "the new image's tid is not the pid"
+          : WIFEXITED(st) && WEXITSTATUS(st) == 101 ? "the exec failed"
+                                                    : "the new image ran as tid == pid",
+          st);
+}
+
+// ------------------------------------------------------------------- stop
+
+// Stop `c` and see the stop, continue it and see the continue: 0 if both
+// were seen. A kernel that does not stop a process blocked in a syscall
+// hangs in the first waitpid, and the section's alarm says so.
+static int stop_and_continue(pid_t c) {
+    int st = 0;
+    kill(c, SIGSTOP);
+    if (waitpid(c, &st, WUNTRACED) != c || !WIFSTOPPED(st)) return -1;
+    kill(c, SIGCONT);
+    if (waitpid(c, &st, WCONTINUED) != c || !WIFCONTINUED(st)) return -1;
+    return 0;
+}
+
+static void sec_stop(void) {
+    int st = 0;
+
+    // A child asleep in nanosleep stops (Ctrl-Z on `sleep 100`).
+    pid_t c = fork();
+    if (c == 0) {
+        sleep(30);
+        _exit(0);
+    }
+    sleep_ms(50);
+    int seen = stop_and_continue(c);
+    check(seen == 0, "a sleeping child stops", "%s",
+          seen ? "the stop or the continue was not reported" : "stopped and continued");
+    kill(c, SIGKILL);
+    waitpid(c, &st, 0);
+
+    // A read stopped and continued goes on reading: Linux makes it again
+    // (-ERESTARTSYS, and no handler ran), so the program never sees EINTR.
+    int p[2];
+    if (pipe(p) != 0) {
+        check(0, "pipe", "%s", strerror(errno));
+        return;
+    }
+    c = fork();
+    if (c == 0) {
+        close(p[1]);
+        char ch = 0;
+        ssize_t n = read(p[0], &ch, 1);
+        _exit(n == 1 && ch == 'x' ? 0 : n < 0 && errno == EINTR ? 2 : 3);
+    }
+    close(p[0]);
+    sleep_ms(50);
+    seen = stop_and_continue(c);
+    if (write(p[1], "x", 1) != 1) check(0, "write to the pipe", "%s", strerror(errno));
+    close(p[1]);
+    waitpid(c, &st, 0);
+    check(seen == 0 && WIFEXITED(st) && WEXITSTATUS(st) == 0, "a read goes on past a stop", "%s",
+          seen                                      ? "the stop or the continue was not reported"
+          : !WIFEXITED(st)                          ? "the child died"
+          : WEXITSTATUS(st) == 2                    ? "the read came back EINTR"
+          : WEXITSTATUS(st) == 3                    ? "the read came back with something else"
+                                                    : "it read the byte");
+
+    // A sigsuspend stopped and continued is still waiting, under its own
+    // mask; when the signal it waits for comes, the handler runs and the
+    // mask from before the call is back.
+    install(SIGUSR1, usr1_counts, 0);
+    c = fork();
+    if (c == 0) {
+        sigset_t block, during, after;
+        sigemptyset(&block);
+        sigaddset(&block, SIGUSR1);
+        sigprocmask(SIG_BLOCK, &block, NULL);
+        sigemptyset(&during);
+        g_usr1_runs = 0;
+        int r = sigsuspend(&during);
+        int e = errno;
+        sigprocmask(SIG_BLOCK, NULL, &after);
+        if (g_usr1_runs != 1) _exit(5);
+        if (!sigismember(&after, SIGUSR1)) _exit(4);
+        _exit(r == -1 && e == EINTR ? 0 : 6);
+    }
+    sleep_ms(50);
+    seen = stop_and_continue(c);
+    sleep_ms(50);
+    kill(c, SIGUSR1);
+    waitpid(c, &st, 0);
+    check(seen == 0 && WIFEXITED(st) && WEXITSTATUS(st) == 0, "a sigsuspend outlasts a stop", "%s",
+          seen                   ? "the stop or the continue was not reported"
+          : !WIFEXITED(st)       ? "the child died"
+          : WEXITSTATUS(st) == 5 ? "it returned without the handler running"
+          : WEXITSTATUS(st) == 4 ? "the mask from before the call was not put back"
+          : WEXITSTATUS(st) == 6 ? "it did not return EINTR"
+                                 : "handler ran, mask back");
+}
+
 // ------------------------------------------------------------------- main
 
 static const struct {
@@ -562,10 +940,19 @@ static const struct {
     {"badrip", "a non-canonical rip from a handler is a SIGSEGV", sec_badrip},
     {"ids", "what the kernel must refuse", sec_ids},
     {"orphan", "an orphan's death tells its adopter, with SIGCHLD", sec_orphan},
+    {"inherit", "what fork and execve hand down", sec_inherit},
+    {"wait", "what waitid and waitpid report", sec_wait},
+    {"stop", "a stop reaches a process blocked in a syscall", sec_stop},
 };
 
 int main(int argc, char **argv) {
     const char *only = NULL;
+    if (argc > 0) g_self = argv[0];
+    if (argc == 2 && strcmp(argv[1], "--exec-report") == 0) {
+        setvbuf(stdout, NULL, _IOLBF, 0);
+        return exec_report();
+    }
+    if (argc == 2 && strcmp(argv[1], "--exec-from-thread") == 0) return exec_from_thread_report();
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--only") == 0 && i + 1 < argc) {
             only = argv[++i];

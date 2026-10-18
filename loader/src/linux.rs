@@ -683,7 +683,11 @@ async fn run_user(thread: CurrentThread) {
         }
 
         // run
-        interrupted = None;
+        //
+        // A syscall a stop cut short is made again now, if no handler has
+        // taken it in the meantime (`Interrupted::leave`); anything else left
+        // in the slot goes back to the program as the `EINTR` it is.
+        Interrupted::leave(&mut interrupted, &mut ctx);
         trace!(
             "go to user: tid = {} pc = {:x} sp = {:x}",
             thread.id(),
@@ -734,6 +738,23 @@ async fn run_user(thread: CurrentThread) {
     kernel_hal::thread::set_current_thread(None);
 }
 
+/// `handle_signal` is done with a signal it ran no handler for: the ones it
+/// ignores, the ones it stops on, a default `SIGCONT`, what init discards.
+///
+/// Nothing will `sigreturn`, so the mask an `rt_sigsuspend` or a `ppoll`
+/// left in `saved_sigmask` for the frame -- `sigmask`, which the dequeue
+/// already took -- goes back now (`restore_saved_sigmask()`), or the
+/// temporary mask of the call stays the thread's mask for good. And the
+/// syscall the signal cut short, if any, is made again.
+fn taken_without_handler(
+    thread: &CurrentThread,
+    sigmask: Sigset,
+    interrupted: &mut Option<Interrupted>,
+) {
+    thread.inner().lock_linux().taken_without_handler(sigmask);
+    Interrupted::no_handler_ran(interrupted);
+}
+
 fn handle_signal(
     thread: &CurrentThread,
     mut ctx: Box<UserContext>,
@@ -753,18 +774,28 @@ fn handle_signal(
                 lp.job_continue(proc);
             }
         }
-        thread.inner().lock_linux().handling_signal = None;
+        taken_without_handler(thread, sigmask, interrupted);
         return ctx;
     }
-    if signal == Signal::SIGSTOP
-        || (action.handler == SIG_DFL
-            && matches!(signal, Signal::SIGTSTP | Signal::SIGTTIN | Signal::SIGTTOU))
-    {
+    if linux_object::process::takes_job_stop(action.handler, signal) {
         let proc = thread.proc();
-        if let Some(lp) = proc.try_linux() {
-            lp.job_stop(proc, signal as u8);
+        if proc.id() == INIT_PID {
+            // `sig_task_ignored()`: SIGSTOP never reaches the global init,
+            // and a default-action stop never reaches a SIGNAL_UNKILLABLE
+            // task. A stopped init reaps nothing and reboots nothing.
+            warn!(
+                "signal {:?} for init (pid 1) would stop it; discarded (Linux semantics)",
+                signal
+            );
+        } else {
+            if let Some(lp) = proc.try_linux() {
+                lp.job_stop(proc, signal as u8);
+            }
         }
-        thread.inner().lock_linux().handling_signal = None;
+        // The syscall the stop woke, if it did, is made again once the
+        // process is continued: `check_signals` ended it only so that the
+        // stop could happen at all.
+        taken_without_handler(thread, sigmask, interrupted);
         return ctx;
     }
     if signal == Signal::SIGCONT {
@@ -773,7 +804,7 @@ fn handle_signal(
             lp.job_continue(proc);
         }
         if action.handler == SIG_DFL {
-            thread.inner().lock_linux().handling_signal = None;
+            taken_without_handler(thread, sigmask, interrupted);
             return ctx;
         }
         // Custom handler: fall through after resuming.
@@ -790,7 +821,7 @@ fn handle_signal(
                     signal,
                     thread.proc().id()
                 );
-                thread.inner().lock_linux().handling_signal = None;
+                taken_without_handler(thread, sigmask, interrupted);
                 return ctx;
             }
             _ => {}
@@ -805,7 +836,7 @@ fn handle_signal(
                 "signal {:?} for init (pid 1) has no handler; discarded (Linux semantics)",
                 signal
             );
-            thread.inner().lock_linux().handling_signal = None;
+            taken_without_handler(thread, sigmask, interrupted);
             return ctx;
         }
         // Resolve addresses back to "<file>+<offset>" through the process's own
@@ -1552,8 +1583,10 @@ fn syscall_num(ctx: &UserContext) -> usize {
     }
 }
 
-/// A syscall a signal cut short, which a handler installed with `SA_RESTART`
-/// makes again (`linux_syscall::restarts_after_handler` says which ones).
+/// A syscall a signal cut short, which is made again either by a handler
+/// installed with `SA_RESTART` (`linux_syscall::restarts_after_handler` says
+/// which ones) or by a job-control stop that ran no handler at all
+/// (`linux_syscall::restarts_after_stop`).
 ///
 /// What making it again takes is the two registers its `EINTR` overwrote or
 /// may have: the number, which shares `rax` with the result on x86_64, and
@@ -1563,6 +1596,13 @@ fn syscall_num(ctx: &UserContext) -> usize {
 struct Interrupted {
     num: usize,
     arg0: usize,
+    /// Whether a handler with `SA_RESTART` makes it again (`-ERESTARTSYS`).
+    /// The others -- `pause`, `poll`, a `futex` wait -- come back `EINTR`
+    /// from any handler, and are made again only past a stop.
+    by_handler: bool,
+    /// A signal that runs no handler -- a stop -- was taken over it, and no
+    /// handler since.
+    stopped: bool,
 }
 
 impl Interrupted {
@@ -1576,17 +1616,46 @@ impl Interrupted {
     /// and is one Linux restarts.
     fn after(num: usize, args: &[usize; 6], ret: usize) -> Option<Self> {
         let eintr = -(linux_object::error::LxError::EINTR as isize) as usize;
-        (ret == eintr && linux_syscall::restarts_after_handler(num as u32, args))
-            .then_some(Self { num, arg0: args[0] })
+        (ret == eintr && linux_syscall::restarts_after_stop(num as u32, args)).then(|| Self {
+            num,
+            arg0: args[0],
+            by_handler: linux_syscall::restarts_after_handler(num as u32, args),
+            stopped: false,
+        })
     }
 
     /// A handler is about to be entered over the syscall `slot` holds, if
     /// any: with `SA_RESTART` the syscall is made again when the handler
     /// returns, and without it, it stays cut short. Either way the slot is
-    /// spent.
+    /// spent -- a stop taken before the handler included: from here on it is
+    /// the handler that decides, as it is in Linux.
     fn enter_handler(slot: &mut Option<Self>, action: &SignalAction, ctx: &mut UserContext) {
         if let Some(call) = slot.take() {
-            if action.restarts_syscalls() {
+            if call.by_handler && action.restarts_syscalls() {
+                call.rewind(ctx);
+            }
+        }
+    }
+
+    /// A signal that runs no handler -- a stop, above all -- is being taken
+    /// over the syscall `slot` holds, if any. Linux makes a syscall again
+    /// when it was cut short and no handler is run for it (`-ERESTARTSYS`,
+    /// `-ERESTARTNOHAND` and the rest, in `arch_do_signal_or_restart`); for
+    /// a stop, the `EINTR` was only ever there to get the thread out of its
+    /// wait so that it could stop.
+    fn no_handler_ran(slot: &mut Option<Self>) {
+        if let Some(call) = slot {
+            call.stopped = true;
+        }
+    }
+
+    /// The thread is about to go back to user mode: the last moment for the
+    /// syscall `slot` holds. Made again if a signal with no handler was
+    /// taken over it and no handler since; otherwise the program gets its
+    /// `EINTR`.
+    fn leave(slot: &mut Option<Self>, ctx: &mut UserContext) {
+        if let Some(call) = slot.take() {
+            if call.stopped {
                 call.rewind(ctx);
             }
         }
@@ -2294,7 +2363,12 @@ mod syscall_restart_tests {
     fn a_read_cut_short_leaves_itself_to_make_again() {
         assert_eq!(
             Interrupted::after(READ, &ARGS, eintr()),
-            Some(Interrupted { num: READ, arg0: 3 })
+            Some(Interrupted {
+                num: READ,
+                arg0: 3,
+                by_handler: true,
+                stopped: false
+            })
         );
     }
 
@@ -2306,9 +2380,81 @@ mod syscall_restart_tests {
     }
 
     #[test]
-    fn a_poll_cut_short_is_not_made_again() {
-        // Linux answers EINTR from a poll whenever a handler ran.
+    fn a_poll_with_a_timeout_cut_short_is_not_made_again() {
+        // `ARGS[2]` is its timeout, and made again it would start over.
         assert_eq!(Interrupted::after(PPOLL, &ARGS, eintr()), None);
+    }
+
+    /// `ppoll(fds, 1, NULL, NULL)`: no timeout, so nothing to start over.
+    const UNTIMED: [usize; 6] = [0x7ff0_1000, 1, 0, 0, 0, 0];
+
+    #[test]
+    fn an_untimed_poll_a_handler_ran_over_comes_back_eintr_even_with_sa_restart() {
+        // Linux answers EINTR from a poll whenever a handler ran.
+        let mut ctx = read_cut_short();
+        let mut slot = Interrupted::after(PPOLL, &UNTIMED, eintr());
+        assert!(slot.is_some(), "a stop would make it again");
+        Interrupted::enter_handler(&mut slot, &handler(SignalActionFlags::RESTART), &mut ctx);
+        assert_eq!(
+            ctx.get_field(UserContextField::InstrPointer),
+            AT + Interrupted::SYSCALL_INSN_LEN
+        );
+        assert_eq!(slot, None);
+    }
+
+    #[test]
+    fn a_stop_makes_the_syscall_it_cut_short_again() {
+        // Ctrl-Z on a program in `read`, and `fg`: the read goes on, and
+        // the program never sees an EINTR it did not ask for.
+        let mut ctx = read_cut_short();
+        let mut slot = Interrupted::after(READ, &ARGS, eintr());
+        Interrupted::no_handler_ran(&mut slot);
+        Interrupted::leave(&mut slot, &mut ctx);
+        assert_eq!(ctx.get_field(UserContextField::InstrPointer), AT);
+        assert_eq!(syscall_num(&ctx), READ);
+        assert_eq!(syscall_args(&ctx), ARGS);
+        assert_eq!(slot, None);
+    }
+
+    #[test]
+    fn a_stop_makes_an_untimed_poll_again_too() {
+        // `-ERESTARTNOHAND`: with no handler, Linux makes it again. And
+        // `pause()` is this on aarch64 and riscv64, where musl has no pause.
+        let mut ctx = read_cut_short();
+        let mut slot = Interrupted::after(PPOLL, &UNTIMED, eintr());
+        Interrupted::no_handler_ran(&mut slot);
+        Interrupted::leave(&mut slot, &mut ctx);
+        assert_eq!(ctx.get_field(UserContextField::InstrPointer), AT);
+        assert_eq!(syscall_num(&ctx), PPOLL);
+    }
+
+    #[test]
+    fn with_no_stop_the_program_gets_its_eintr() {
+        let mut ctx = read_cut_short();
+        let mut slot = Interrupted::after(READ, &ARGS, eintr());
+        Interrupted::leave(&mut slot, &mut ctx);
+        assert_eq!(
+            ctx.get_field(UserContextField::InstrPointer),
+            AT + Interrupted::SYSCALL_INSN_LEN
+        );
+        assert_eq!(ctx.get_field(UserContextField::ReturnValue), eintr());
+        assert_eq!(slot, None, "the slot is spent on the way out");
+    }
+
+    #[test]
+    fn a_handler_after_the_stop_decides_as_it_would_have() {
+        // Stopped, then continued by a SIGCONT that has a handler without
+        // SA_RESTART: Linux runs the handler and the read is EINTR.
+        let mut ctx = read_cut_short();
+        let mut slot = Interrupted::after(READ, &ARGS, eintr());
+        Interrupted::no_handler_ran(&mut slot);
+        Interrupted::enter_handler(&mut slot, &handler(SignalActionFlags::SIGINFO), &mut ctx);
+        Interrupted::leave(&mut slot, &mut ctx);
+        assert_eq!(
+            ctx.get_field(UserContextField::InstrPointer),
+            AT + Interrupted::SYSCALL_INSN_LEN
+        );
+        assert_eq!(ctx.get_field(UserContextField::ReturnValue), eintr());
     }
 
     #[test]

@@ -25,6 +25,11 @@ en este kernel ha pasado de maneras que ningun test de syscalls ve:
    a init al morir, y eclipse-init reinicia o se apaga con esas. Y la muerte de
    un huerfano se avisaba a quien saliera de buscar desde el padre que lo **creo**,
    no al que lo adopto.
+5. Un `SIGSTOP` (o el `SIGTSTP` de Ctrl-Z) a un proceso metido en una syscall
+   que espera no lo paraba hasta que la syscall volvia sola: un hijo en
+   `pause()` no se paraba **nunca**, y el `waitpid(WUNTRACED)` del padre, el
+   de una shell que espera para escribir «Stopped», se quedaba esperando con
+   el.
 
 ## Compilar
 
@@ -63,3 +68,6 @@ FAIL solo en Eclipse es un fallo de Eclipse.
 | `badrip` | un manejador que pone un `rip` no canonico en su `ucontext` le cuesta al proceso un SIGSEGV (`SI_KERNEL`) y nada mas. Solo x86_64 |
 | `ids` | el kernel rechaza lo que no puede cargar: un puntero de TLS fuera del espacio de usuario (`arch_prctl`, `clone(CLONE_SETTLS)`) y el pid `INT_MIN`, que no tiene negativo, en `waitpid` |
 | `orphan` | la muerte de un huerfano avisa a quien lo **adopto**, con SIGCHLD aunque su padre muerto eligiera otra señal en `clone(2)`, y despierta el `waitpid` del adoptante aunque un proceso de en medio se haya hecho subreaper despues de la adopcion. La señal elegida es SIGWINCH, que init descarta, por si el subreaper no se cumpliera |
+| `inherit` | lo que pasa por `fork` (manejadores, mascara y pila alternativa; ni señales pendientes ni alarma) y por `execve` (mascara, pendientes, alarma y `SIG_IGN`; los manejadores vuelven a `SIG_DFL` y la pila alternativa se va). La mitad del `execve` la cuenta la propia sonda relanzada con `--exec-report` |
+| `wait` | lo que cuentan `waitid` y `waitpid`: una salida con `WNOWAIT` y luego recogida; una muerte por SIGTERM (`CLD_KILLED`); una parada de un hijo en `pause()` y una continuacion, cada una contada una vez; `waitid(P_PGID, 0)`, que es el grupo propio; `SA_NOCLDSTOP`; `exit()` desde un segundo hilo, que acaba con todo el proceso; y `execve()` desde un segundo hilo, cuya imagen nueva toma el pid como tid |
+| `stop` | una parada llega a un proceso metido en una syscall que espera (`nanosleep`, `read`, `sigsuspend`) y la syscall sigue cuando se le continua: el `read` lee, sin `EINTR`, y el `sigsuspend` sigue esperando su señal y al volver deja la mascara de antes |
