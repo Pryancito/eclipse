@@ -97,8 +97,9 @@ Leyenda: ✅ implementado · 🟡 parcial / no-op deliberado · ❌ no implement
 | `DRM_IOCTL_VERSION` | ✅ | nombre `zcore`, versión 1.0.0 (`nouveau` 1.4.0 con el uAPI nouveau, `eclipse-compute` 0.1.0 en el nodo de cómputo); longitudes `strlen` sin NUL, como `drm_copy_field` |
 | `DRM_IOCTL_GET_UNIQUE` | 🟡 | `zcore-gpu` (no es un *busid* parseable `pci:…`) |
 | `DRM_IOCTL_SET_VERSION` | ✅ | interfaz 1.4 y la versión del driver que da VERSION; valida el par pedido (major y minor) como `drm_setversion` (lo usa Xorg/modesetting) |
-| `DRM_IOCTL_GET_MAGIC` / `AUTH_MAGIC` | ✅ | magic por fichero, minted una vez; `AUTH_MAGIC` solo desde el master (EACCES), de un magic de ese nodo (EINVAL) y una sola vez |
+| `DRM_IOCTL_GET_MAGIC` / `AUTH_MAGIC` | ✅ | magic por fichero, minted una vez; `AUTH_MAGIC` solo desde el master (EACCES), de un magic de ese nodo (EINVAL) y una sola vez; autentica al dueño del magic (`drm_file.authenticated`, que también tiene quien toma el master y todo `open` de root, como en `drm_file_alloc`) |
 | `DRM_IOCTL_SET_MASTER` / `DROP_MASTER` | ✅ | un master por nodo: el primer `open` lo toma (`drm_master_open`), `SET_MASTER` con otro fichero como master es EBUSY, `DROP_MASTER` sin serlo es EINVAL; se suelta al cerrar el fd; conmuta la consola de texto del kernel (KD_GRAPHICS/KD_TEXT) |
+| `DRM_IOCTL_GET_CLIENT` / `GET_STATS` / `FINISH` / `SET_UNIQUE` / `BLOCK` / `UNBLOCK` / `ADD_DRAW` / `RM_DRAW` / `UPDATE_DRAW` / `MODE_ATTACHMODE` / `MODE_DETACHMODE` | ✅ | los huecos de `drm_ioctl.c`: `GET_CLIENT` solo responde `idx == 0` (con `auth` = `authenticated`, el pid del que llama, `uid` = *overflowuid* y magic/iocs a 0; otro idx es EINVAL, lo que para la enumeración de libva), `GET_STATS` pone la struct a cero, `FINISH` es un no-op `DRM_AUTH` (EACCES sin autenticar), `SET_UNIQUE` es `drm_invalid_op` y `BLOCK`…`UPDATE_DRAW` no-ops, todos `DRM_ROOT_ONLY` (EACCES sin `CAP_SYS_ADMIN`; el master no se exige, ver más abajo), `ATTACHMODE`/`DETACHMODE` no-ops |
 | `DRM_IOCTL_GET_CAP` | ✅ | ver tabla de *caps* |
 | `DRM_IOCTL_SET_CLIENT_CAP` | ✅ | `ATOMIC` según `drm.atomic` (ver sección atómico); `WRITEBACK` solo para clientes atómicos (EINVAL como Linux); resto aceptado |
 | `DRM_IOCTL_WAIT_VBLANK` | 🟡 | vblank sintético ~60 Hz. Modo evento: respeta `RELATIVE`/`ABSOLUTE`/`NEXTONMISS` y entrega `DRM_EVENT_VBLANK` cuando el contador alcanza la secuencia pedida (nunca antes del siguiente vblank). Modo bloqueante: espera de verdad, hasta el tope de 3 s de Linux (`sys_ioctl` duerme antes del arm síncrono; ver `README-async-ioctl-vblank.md`) |
@@ -107,7 +108,7 @@ Leyenda: ✅ implementado · 🟡 parcial / no-op deliberado · ❌ no implement
 
 | ioctl | Estado | Notas |
 |---|---|---|
-| `DRM_IOCTL_MODE_CREATE_DUMB` | ✅ | memoria física contigua vía VMO; *pitch* = `ceil(bpp/8) * width` alineado a 64 B; ancho, alto o bpp a 0 son EINVAL como en `drm_mode_create_dumb`. El `mmap` comparte el VMO del buffer (cacheado, WB): el mapeo y cada framebuffer construido sobre el handle mantienen la memoria viva tras `DESTROY_DUMB`, como el refcount de `drm_gem_object` |
+| `DRM_IOCTL_MODE_CREATE_DUMB` | ✅ | memoria física contigua vía VMO; *pitch* = `ceil(bpp/8) * width` alineado a 64 B; `size` = `pitch * height` redondeado a página, como todo `dumb_create` (un objeto GEM son páginas enteras); ancho, alto o bpp a 0 son EINVAL como en `drm_mode_create_dumb`. El `mmap` comparte el VMO del buffer (cacheado, WB): el mapeo y cada framebuffer construido sobre el handle mantienen la memoria viva tras `DESTROY_DUMB`, como el refcount de `drm_gem_object` |
 | `DRM_IOCTL_MODE_MAP_DUMB` | ✅ | *offset* = `handle << 12`; `mmap` mapea el VMO físico |
 | `DRM_IOCTL_MODE_DESTROY_DUMB` | ✅ | |
 | `DRM_IOCTL_GEM_CLOSE` | ✅ | |
@@ -131,7 +132,7 @@ Leyenda: ✅ implementado · 🟡 parcial / no-op deliberado · ❌ no implement
 | ioctl | Estado | Notas |
 |---|---|---|
 | `DRM_IOCTL_MODE_GETRESOURCES` | ✅ | 1 CRTC + 1 connector + 1 encoder sintéticos |
-| `DRM_IOCTL_MODE_GETCRTC` / `SETCRTC` | ✅ | `SETCRTC` con modo hace *scanout* del fb; sin modo apaga el CRTC y quita el modo (el fb que nombre se ignora, como `drm_mode_setcrtc`); `GETCRTC` devuelve el modo actual (`mode_valid=1`) solo mientras el CRTC tiene modo (`crtc_state->enable`): tras un `SETCRTC` sin modo o un `RMFB` del fb en pantalla responde `mode_valid=0` y `fb_id=0` hasta el siguiente modeset; DPMS off no lo quita |
+| `DRM_IOCTL_MODE_GETCRTC` / `SETCRTC` | ✅ | `SETCRTC` con modo hace *scanout* del fb; sin modo apaga el CRTC y quita el modo (el fb que nombre se ignora, como `drm_mode_setcrtc`); `GETCRTC` devuelve el modo actual (`mode_valid=1`) solo mientras el CRTC tiene modo (`crtc_state->enable`): tras un `SETCRTC` sin modo o un `RMFB` del fb en pantalla responde `mode_valid=0` y `fb_id=0` hasta el siguiente modeset; DPMS off no lo quita El modo pasa por `drm_mode_validate_basic`: una bandera fuera de `DRM_MODE_FLAG_ALL` (`BCAST`, `PIXMUX`, bits por encima del campo de aspecto) o un layout 3D más allá de `SIDE_BY_SIDE_HALF` son EINVAL |
 | `DRM_IOCTL_MODE_GETENCODER` | ✅ | encoder `VIRTUAL`, `possible_crtcs=1`; `crtc_id=0` mientras el CRTC no tiene modo |
 | `DRM_IOCTL_MODE_GETCONNECTOR` | ✅ | 1 modo = resolución nativa (preferido); propiedades estándar (ver abajo); `encoder_id=0` mientras el CRTC no tiene modo |
 | `DRM_IOCTL_MODE_GETPLANERESOURCES` | ✅ | 1 plano primario |

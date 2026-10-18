@@ -26,17 +26,25 @@
 //               usermode  TURING_USERMODE_A, BAR0's user page, on a fresh
 //                         /dev/nvidia<minor>: the GPU timer read twice
 //                         must move forward.
+//   event     an OS event, the way libnvidia-ml waits for one: a fresh
+//             /dev/nvidiactl registered with ALLOC_OS_EVENT, an
+//             NV01_EVENT_OS_EVENT on the subdevice bound to it, and the
+//             subdevice's software notifier armed and fired
+//             (EVENT_SET_NOTIFICATION, EVENT_SET_TRIGGER). The fd must poll
+//             readable, and RM_GET_EVENT_DATA must hand back that event.
 //   free      RM_FREE of the client: everything under it goes.
 //
 // Needs the kernel booted with `nvidia.nvidiactl`. Read-only as far as the
 // GPU goes: it allocates RM objects and frees them, writes only the system
-// memory it allocated, reads the GPU's timer, and touches no engine.
+// memory it allocated, reads the GPU's timer, fires the software notifier
+// it armed, and touches no engine.
 //
 // Build: static musl, like the other probes (xtask does it; by hand:
 //   x86_64-linux-musl-gcc -static -O2 -o nvctl-probe nvctl-probe.c).
 
 #include <errno.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -50,12 +58,15 @@
 #define NV_IOCTL_MAGIC 'F'
 #define NV_ESC_CARD_INFO 200
 #define NV_ESC_REGISTER_FD 201
+#define NV_ESC_ALLOC_OS_EVENT 206
+#define NV_ESC_FREE_OS_EVENT 207
 #define NV_ESC_CHECK_VERSION_STR 210
 #define NV_ESC_RM_FREE 0x29
 #define NV_ESC_RM_CONTROL 0x2A
 #define NV_ESC_RM_ALLOC 0x2B
 #define NV_ESC_RM_MAP_MEMORY 0x4E
 #define NV_ESC_RM_UNMAP_MEMORY 0x4F
+#define NV_ESC_RM_GET_EVENT_DATA 0x52
 
 // classes and controls (class/, ctrl/)
 #define NV01_ROOT_CLIENT 0x41
@@ -74,6 +85,11 @@
 #define NVC361_NV_USERMODE__SIZE 0x10000
 #define NVC361_TIME_0 0x80
 #define NVC361_TIME_1 0x84
+#define NV01_EVENT_OS_EVENT 0x79
+#define NV2080_NOTIFIERS_SW 0
+#define NV2080_CTRL_CMD_EVENT_SET_NOTIFICATION 0x20800301
+#define NV2080_CTRL_CMD_EVENT_SET_TRIGGER 0x20800302
+#define NV2080_CTRL_EVENT_SET_NOTIFICATION_ACTION_SINGLE 1
 // NVOS32_ATTR_*: 4 KiB pages (24:23), in system memory (26:25), cached (31:29)
 #define NVOS32_ATTR_SYSMEM_4K_CACHED ((1u << 23) | (1u << 25) | (1u << 29))
 #define NVOS32_TYPE_IMAGE 0
@@ -109,6 +125,11 @@ typedef struct {
 typedef struct {
   int ctl_fd;
 } nv_ioctl_register_fd_t;
+
+// nv_ioctl_alloc_os_event_t, and nv_ioctl_free_os_event_t, which is the same.
+typedef struct {
+  uint32_t hClient, hDevice, fd, Status;
+} nv_ioctl_alloc_os_event_t;
 
 // nvos.h
 typedef struct {
@@ -175,6 +196,22 @@ typedef struct {
 } NVOS34_PARAMETERS;
 
 typedef struct {
+  uint64_t pEvent __attribute__((aligned(8)));
+  uint32_t MoreEvents, status;
+} NVOS41_PARAMETERS;
+
+typedef struct {
+  uint32_t hObject, NotifyIndex, info32;
+  uint16_t info16;
+} NvUnixEvent;
+
+// cl0005.h
+typedef struct {
+  uint32_t hParentClient, hSrcResource, hClass, notifyIndex;
+  uint64_t data __attribute__((aligned(8)));
+} NV0005_ALLOC_PARAMETERS;
+
+typedef struct {
   uint32_t gpuId, gpuFlags, deviceInstance, subDeviceInstance, sliStatus, boardId, gpuInstance;
   int32_t numaId;
 } NV0000_CTRL_GPU_GET_ID_INFO_V2_PARAMS;
@@ -201,6 +238,13 @@ typedef struct {
   NV2080_CTRL_FB_INFO fbInfoList[128];
 } NV2080_CTRL_FB_GET_INFO_V2_PARAMS;
 
+typedef struct {
+  uint32_t event, action;
+  uint8_t bNotifyState;
+  uint32_t info32;
+  uint16_t info16;
+} NV2080_CTRL_EVENT_SET_NOTIFICATION_PARAMS;
+
 _Static_assert(sizeof(nv_ioctl_card_info_t) == 72, "nv_ioctl_card_info_t");
 _Static_assert(sizeof(nv_ioctl_rm_api_version_t) == 72, "nv_ioctl_rm_api_version_t");
 _Static_assert(sizeof(NVOS21_PARAMETERS) == 32, "NVOS21_PARAMETERS");
@@ -211,6 +255,12 @@ _Static_assert(sizeof(NV_MEMORY_ALLOCATION_PARAMS) == 128, "NV_MEMORY_ALLOCATION
 _Static_assert(sizeof(nv_ioctl_nvos33_parameters_with_fd) == 56,
                "nv_ioctl_nvos33_parameters_with_fd");
 _Static_assert(sizeof(NVOS34_PARAMETERS) == 32, "NVOS34_PARAMETERS");
+_Static_assert(sizeof(nv_ioctl_alloc_os_event_t) == 16, "nv_ioctl_alloc_os_event_t");
+_Static_assert(sizeof(NVOS41_PARAMETERS) == 16, "NVOS41_PARAMETERS");
+_Static_assert(sizeof(NvUnixEvent) == 16, "NvUnixEvent");
+_Static_assert(sizeof(NV0005_ALLOC_PARAMETERS) == 24, "NV0005_ALLOC_PARAMETERS");
+_Static_assert(sizeof(NV2080_CTRL_EVENT_SET_NOTIFICATION_PARAMS) == 20,
+               "NV2080_CTRL_EVENT_SET_NOTIFICATION_PARAMS");
 
 #define NV_IOWR(nr, size) _IOC(_IOC_READ | _IOC_WRITE, NV_IOCTL_MAGIC, (nr), (size))
 
@@ -237,9 +287,12 @@ static const char *rm_status(uint32_t s) {
   case 0x1f: return "NV_ERR_INVALID_ARGUMENT";
   case 0x22: return "NV_ERR_INVALID_CLASS";
   case 0x26: return "NV_ERR_INVALID_DEVICE";
+  case 0x28: return "NV_ERR_INVALID_EVENT";
   case 0x2c: return "NV_ERR_INVALID_OBJECT_HANDLE";
   case 0x40: return "NV_ERR_INVALID_STATE";
   case 0x56: return "NV_ERR_NOT_SUPPORTED";
+  case 0x57: return "NV_ERR_OBJECT_NOT_FOUND";
+  case 0x59: return "NV_ERR_OPERATING_SYSTEM";
   }
   snprintf(buf, sizeof buf, "RM status %#x", s);
   return buf;
@@ -425,6 +478,96 @@ static void probe_usermode(int ctl, uint32_t client, uint32_t subdevice, const c
   rm_free(ctl, client, subdevice, usermode);
 }
 
+// ALLOC_OS_EVENT or FREE_OS_EVENT of `efd` for the client: 0, or the
+// failure printed.
+static int os_event(int efd, unsigned nr, uint32_t client, uint32_t device, const char *what) {
+  nv_ioctl_alloc_os_event_t p = {.hClient = client, .hDevice = device, .fd = (uint32_t)efd};
+  char detail[96];
+  int err = nv_ioctl(efd, nr, &p, sizeof p);
+  if (err) {
+    snprintf(detail, sizeof detail, "ioctl: %s", strerror(err));
+    fail(what, detail);
+    return -1;
+  }
+  if (p.Status) {
+    fail(what, rm_status(p.Status));
+    return -1;
+  }
+  ok(what);
+  return 0;
+}
+
+// The event on `efd`: it must poll readable, and RM_GET_EVENT_DATA must hand
+// back the software notifier of event object `event`.
+static void read_event(int efd, uint32_t event) {
+  char detail[160];
+  struct pollfd pfd = {.fd = efd, .events = POLLIN | POLLPRI};
+  int n = poll(&pfd, 1, 1000);
+  if (n < 0) {
+    snprintf(detail, sizeof detail, "poll: %s", strerror(errno));
+    fail("poll", detail);
+  } else if (n == 0 || !(pfd.revents & POLLIN)) {
+    snprintf(detail, sizeof detail, "not readable within 1 s (revents %#x)", pfd.revents);
+    fail("poll", detail);
+  } else {
+    ok("poll: readable");
+  }
+  NvUnixEvent ue;
+  memset(&ue, 0xee, sizeof ue);
+  NVOS41_PARAMETERS g = {.pEvent = (uintptr_t)&ue};
+  int err = nv_ioctl(efd, NV_ESC_RM_GET_EVENT_DATA, &g, sizeof g);
+  if (err) {
+    snprintf(detail, sizeof detail, "ioctl: %s", strerror(err));
+    fail("RM_GET_EVENT_DATA", detail);
+  } else if (g.status) {
+    fail("RM_GET_EVENT_DATA", rm_status(g.status));
+  } else if (ue.hObject != event || ue.NotifyIndex != NV2080_NOTIFIERS_SW) {
+    snprintf(detail, sizeof detail, "hObject %#x NotifyIndex %u, not %#x %u", ue.hObject,
+             ue.NotifyIndex, event, NV2080_NOTIFIERS_SW);
+    fail("RM_GET_EVENT_DATA", detail);
+  } else {
+    snprintf(detail, sizeof detail, "RM_GET_EVENT_DATA: hObject %#x NotifyIndex %u MoreEvents %u",
+             ue.hObject, ue.NotifyIndex, g.MoreEvents);
+    ok(detail);
+  }
+}
+
+// An OS event on the subdevice's software notifier, fired by the probe
+// itself (see the top of the file).
+static void probe_event(int ctl, uint32_t client, uint32_t device, uint32_t subdevice) {
+  char detail[160];
+  int efd = open("/dev/nvidiactl", O_RDWR | O_CLOEXEC);
+  if (efd < 0) {
+    snprintf(detail, sizeof detail, "open: %s", strerror(errno));
+    fail("event fd", detail);
+    return;
+  }
+  if (os_event(efd, NV_ESC_ALLOC_OS_EVENT, client, device, "ALLOC_OS_EVENT")) {
+    close(efd);
+    return;
+  }
+  uint32_t event = 0;
+  NV0005_ALLOC_PARAMETERS ep = {.hParentClient = client, .hSrcResource = subdevice,
+                                .hClass = NV01_EVENT_OS_EVENT,
+                                .notifyIndex = NV2080_NOTIFIERS_SW, .data = (uint64_t)efd};
+  if (rm_alloc(ctl, client, subdevice, NV01_EVENT_OS_EVENT, &ep, sizeof ep, &event,
+               "NV01_EVENT_OS_EVENT") == 0) {
+    ok("NV01_EVENT_OS_EVENT");
+    NV2080_CTRL_EVENT_SET_NOTIFICATION_PARAMS sn = {
+        .event = NV2080_NOTIFIERS_SW, .action = NV2080_CTRL_EVENT_SET_NOTIFICATION_ACTION_SINGLE};
+    if (rm_control(ctl, client, subdevice, NV2080_CTRL_CMD_EVENT_SET_NOTIFICATION, &sn,
+                   sizeof sn, "EVENT_SET_NOTIFICATION") == 0 &&
+        rm_control(ctl, client, subdevice, NV2080_CTRL_CMD_EVENT_SET_TRIGGER, NULL, 0,
+                   "EVENT_SET_TRIGGER") == 0) {
+      ok("EVENT_SET_TRIGGER");
+      read_event(efd, event);
+    }
+    rm_free(ctl, client, subdevice, event);
+  }
+  os_event(efd, NV_ESC_FREE_OS_EVENT, client, device, "FREE_OS_EVENT");
+  close(efd);
+}
+
 static void probe_gpu(int ctl, uint32_t client, const nv_ioctl_card_info_t *card, int index) {
   char path[32], detail[160];
   snprintf(path, sizeof path, "/dev/nvidia%u", card->minor_number);
@@ -492,6 +635,8 @@ static void probe_gpu(int ctl, uint32_t client, const nv_ioctl_card_info_t *card
   printf("\n\n  [map]\n");
   probe_sysmem(ctl, client, device);
   probe_usermode(ctl, client, subdevice, path);
+  printf("\n  [event]\n");
+  probe_event(ctl, client, device, subdevice);
   close(fd);
 }
 

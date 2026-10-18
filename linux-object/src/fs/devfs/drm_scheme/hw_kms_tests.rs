@@ -1532,10 +1532,12 @@ fn gamma_ioctls_hold_the_caller_to_a_crtc_with_no_gamma_store() {
 /// With a mode, `drm_mode_setcrtc` looks the fb up (ENOENT; -1 is the
 /// fb already on the CRTC, EINVAL when there is none), refuses a mode
 /// `drm_mode_validate_basic` would not have (a zero clock, a zero active
-/// area, sync timings out of order) or an aspect-ratio code it does not
-/// define (EINVAL), and wants the active area at (x, y) inside the fb
+/// area, sync timings out of order, a flag outside `DRM_MODE_FLAG_ALL`, a
+/// 3D layout past the last one defined) or an aspect-ratio code it does
+/// not define (EINVAL), and wants the active area at (x, y) inside the fb
 /// (ENOSPC). None of it was read: a 64-wide mode on a 32-wide fb was
-/// scanned out, and a clockless mode was paced from a fallback.
+/// scanned out, and a clockless mode was paced from a fallback; the flags
+/// were read for their aspect-ratio code alone.
 #[test]
 fn setcrtc_wants_a_mode_that_is_one_and_an_fb_that_holds_it() {
     // The synthetic pipe: its CRTC reports exactly the fb the core has on
@@ -1654,16 +1656,29 @@ fn setcrtc_wants_a_mode_that_is_one_and_an_fb_that_holds_it() {
     let flags = u32::from_ne_bytes([good[28], good[29], good[30], good[31]]);
     m[28..32].copy_from_slice(&(flags | (5 << 19)).to_ne_bytes());
     assert_eq!(setcrtc(fb, 0, 0, m), einval, "aspect-ratio code 5");
+    for (bit, what) in [
+        (1 << 10, "BCAST: deprecated, outside DRM_MODE_FLAG_ALL"),
+        (1 << 11, "PIXMUX: likewise"),
+        (1 << 23, "the bit past the aspect-ratio field"),
+        (1 << 31, "the top bit"),
+        (9 << 14, "a 3D layout past SIDE_BY_SIDE_HALF"),
+    ] {
+        let mut m = good;
+        m[28..32].copy_from_slice(&(flags | bit).to_ne_bytes());
+        assert_eq!(setcrtc(fb, 0, 0, m), einval, "{}", what);
+    }
     assert_eq!(
         get_crtc_fb(&c, crtc),
         0,
         "a refused modeset presented anyway"
     );
 
-    // What passes: the fb that fits, with the last aspect-ratio code the
-    // kernel defines, and then -1 for the same fb again.
+    // What passes: the fb that fits, with the last aspect-ratio code and
+    // the last 3D layout the kernel defines and every flag in
+    // DRM_MODE_FLAG_ALL below them, and then -1 for the same fb again.
     let mut m = good;
-    m[28..32].copy_from_slice(&(flags | (4 << 19)).to_ne_bytes());
+    let all = 0x3FF | DRM_MODE_FLAG_DBLCLK | DRM_MODE_FLAG_CLKDIV2;
+    m[28..32].copy_from_slice(&(flags | all | (8 << 14) | (4 << 19)).to_ne_bytes());
     assert_eq!(setcrtc(fb, 0, 0, m), Ok(0));
     assert_eq!(get_crtc_fb(&c, crtc), fb);
     assert_eq!(
@@ -1741,9 +1756,10 @@ fn the_hardware_primary_plane_never_shows_the_drivers_own_fb_id() {
 
 /// `CURSOR` with a buffer: Linux wraps the handle in a framebuffer, so a
 /// handle the file does not hold is ENOENT and a buffer too small for
-/// `width x height` pixels is EINVAL. Both came back as success with the
-/// pointer quietly hidden, so a compositor whose cursor upload went
-/// wrong was never told. A buffer that fits keeps working.
+/// `width x height` pixels is EINVAL, measured against the object, which
+/// is whole pages. Both came back as success with the pointer quietly
+/// hidden, so a compositor whose cursor upload went wrong was never
+/// told. A buffer that fits keeps working.
 #[test]
 fn a_cursor_needs_a_handle_of_its_own_that_fits_the_image() {
     let screen = kms_emu::attach(32, 8);
@@ -1764,10 +1780,14 @@ fn a_cursor_needs_a_handle_of_its_own_that_fits_the_image() {
     };
     assert_eq!(cursor(BOGUS, 16, 16), Err(FsError::EntryNotFound));
 
-    // 16 rows of a 64-byte pitch: 1 KiB, room for 16x16 and not 64x64.
+    // 16 rows of a 64-byte pitch is 1 KiB of pixels, but the object is
+    // a whole page (as every dumb buffer is): room for 32x32 exactly,
+    // not for one more row, let alone 64x64.
     let small = c.create_dumb(16, 16);
+    assert_eq!(small.size, 4096);
     assert_eq!(cursor(small.handle, 64, 64), Err(FsError::InvalidParam));
-    assert_eq!(cursor(small.handle, 16, 17), Err(FsError::InvalidParam));
+    assert_eq!(cursor(small.handle, 32, 33), Err(FsError::InvalidParam));
+    assert_eq!(cursor(small.handle, 32, 32), Ok(0));
     assert_eq!(cursor(small.handle, 16, 16), Ok(0));
     // Hiding the cursor names no buffer and needs none.
     assert_eq!(cursor(0, 0, 0), Ok(0));

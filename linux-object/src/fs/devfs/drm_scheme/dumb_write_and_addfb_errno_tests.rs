@@ -17,7 +17,10 @@ fn destroypropblob_of_a_kernel_blob_is_eperm_to_userspace() {
 }
 
 #[test]
-fn get_client_zero_is_self_and_one_is_enoent() {
+fn get_client_zero_is_self_and_one_is_einval() {
+    // Under the lock this open takes the master, and the master is
+    // authenticated (`drm_new_set_master`).
+    let _serialised = drm::test_globals::lock();
     let c = Client::open(0);
     let mut client = DrmClient {
         idx: 0,
@@ -30,10 +33,11 @@ fn get_client_zero_is_self_and_one_is_enoent() {
     assert_eq!(c.ioctl(DRM_IOCTL_GET_CLIENT, &mut client), Ok(0));
     assert_eq!(client.auth, 1);
     assert_eq!(client.magic, 0);
+    // `drm_getclient`: any idx but 0 is EINVAL, what stops an enumerator.
     client.idx = 1;
     assert_eq!(
         c.ioctl(DRM_IOCTL_GET_CLIENT, &mut client),
-        Err(FsError::EntryNotFound)
+        Err(FsError::InvalidParam)
     );
 }
 
@@ -95,7 +99,9 @@ fn create_dumb_refuses_bpp_zero_and_honours_bpp_sixteen() {
         .expect("CREATE_DUMB bpp=16");
     // pitch = round_up(width * bpp/8, 64) = round_up(32, 64) = 64
     assert_eq!(bpp16.pitch, 64, "bpp=16 must not be inflated to 32");
-    assert_eq!(bpp16.size, 64 * 16);
+    // `nouveau_display_dumb_create` (and every `dumb_create`): `size =
+    // roundup(pitch * height, PAGE_SIZE)`, a GEM object is whole pages.
+    assert_eq!(bpp16.size, 4096, "PAGE_ALIGN(64 * 16)");
     assert_eq!(c.destroy_dumb(bpp16.handle), Ok(0));
 }
 

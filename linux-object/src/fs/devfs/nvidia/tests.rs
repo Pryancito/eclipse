@@ -683,3 +683,342 @@ fn only_a_read_only_grant_maps_read_only() {
     assert_eq!(record_mapping(Some(&open), ro, &instance_of), Ok(()));
     assert!(open.mmap_read_only());
 }
+
+// ---- OS events ----
+
+/// A waker that counts its wakes.
+struct Counter(core::sync::atomic::AtomicUsize);
+
+impl alloc::task::Wake for Counter {
+    fn wake(self: Arc<Self>) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+fn counting_waker() -> (Arc<Counter>, Waker) {
+    let counter = Arc::new(Counter(core::sync::atomic::AtomicUsize::new(0)));
+    (counter.clone(), Waker::from(counter))
+}
+
+fn unix_event(h_object: u32) -> nvctl::UnixEvent {
+    nvctl::UnixEvent {
+        h_object,
+        notify_index: 3,
+        info32: 0x1234_5678,
+        info16: 0x9abc,
+    }
+}
+
+/// `nv_ioctl_alloc_os_event_t` / `nv_ioctl_free_os_event_t`, with a status
+/// nothing answers.
+fn os_event_payload(client: u32, fd: u32) -> [u8; ALLOC_OS_EVENT_SIZE] {
+    let mut p = [0u8; ALLOC_OS_EVENT_SIZE];
+    put_u32(&mut p, 0, client);
+    put_u32(&mut p, 4, 0xd0d0_0001);
+    put_u32(&mut p, 8, fd);
+    put_u32(&mut p, 12, 0xffff_ffff);
+    p
+}
+
+/// `NVOS41_PARAMETERS` aimed at `to`, with `MoreEvents` and `status` set to
+/// what nothing answers.
+fn get_event_payload(to: usize) -> [u8; GET_EVENT_DATA_SIZE] {
+    let mut p = [0u8; GET_EVENT_DATA_SIZE];
+    put_u64(&mut p, 0, to as u64);
+    put_u32(&mut p, 8, 0xaaaa_aaaa);
+    put_u32(&mut p, 12, 0xffff_ffff);
+    p
+}
+
+/// RM_GET_EVENT_DATA on `events`: the status, `MoreEvents`, and what was
+/// copied out.
+fn read_event(events: &OpenEvents) -> (u32, u32, [u8; nvctl::UnixEvent::SIZE]) {
+    let mut out = [0xeeu8; nvctl::UnixEvent::SIZE];
+    let mut p = get_event_payload(out.as_mut_ptr() as usize);
+    get_event_data(&mut p, events);
+    (u32_at(&p, 12), u32_at(&p, 8), out)
+}
+
+fn readable(events: &OpenEvents) -> bool {
+    events.bus.lock().events().contains(Event::READABLE)
+}
+
+/// Like the other RM escapes, the three need the RM core, and with none
+/// they are refused as finding none rather than logged as not served.
+#[test]
+fn the_os_event_escapes_need_an_rm_core() {
+    for nr in [
+        esc::ALLOC_OS_EVENT,
+        esc::FREE_OS_EVENT,
+        esc::RM_GET_EVENT_DATA,
+    ] {
+        let mut p = [0u8; 16];
+        assert_eq!(ioctl_on(&ctl(), nr, &mut p), Err(LxError::EINVAL));
+        assert!(!logged_not_served(nr), "{:#x} is served", nr);
+    }
+}
+
+#[test]
+fn an_os_event_payload_of_another_size_is_einval() {
+    let open = ctl();
+    for nr in [
+        esc::ALLOC_OS_EVENT,
+        esc::FREE_OS_EVENT,
+        esc::RM_GET_EVENT_DATA,
+    ] {
+        for wrong in [12, 20] {
+            let mut p = vec![0x5au8; wrong];
+            assert_eq!(open.os_event(nr, &mut p), Err(LxError::EINVAL));
+            assert_eq!(p, vec![0x5au8; wrong], "{:#x} answers nothing", nr);
+        }
+    }
+}
+
+/// `allocate_os_event` and `free_os_event`: the answer is in the payload's
+/// `Status`, and the ioctl itself succeeds.
+#[test]
+fn alloc_and_free_answer_in_the_payload() {
+    const CLIENT: u32 = 0xc1e0_0001;
+    for open in [ctl(), gpu(0)] {
+        let fd = if open.is_ctl() { 7 } else { 8 };
+        let mut p = os_event_payload(CLIENT, fd);
+        assert_eq!(open.os_event(esc::ALLOC_OS_EVENT, &mut p), Ok(()));
+        assert_eq!(u32_at(&p, 12), NV_OK);
+        assert_eq!(&p[..12], &os_event_payload(CLIENT, fd)[..12]);
+        let mut p = os_event_payload(CLIENT, fd);
+        assert_eq!(open.os_event(esc::ALLOC_OS_EVENT, &mut p), Ok(()));
+        assert_eq!(u32_at(&p, 12), 0x1A, "NV_ERR_INSUFFICIENT_RESOURCES");
+        let mut p = os_event_payload(CLIENT, fd);
+        assert_eq!(open.os_event(esc::FREE_OS_EVENT, &mut p), Ok(()));
+        assert_eq!(u32_at(&p, 12), NV_OK);
+        let mut p = os_event_payload(CLIENT, fd);
+        assert_eq!(open.os_event(esc::FREE_OS_EVENT, &mut p), Ok(()));
+        assert_eq!(u32_at(&p, 12), nvctl::NV_ERR_INVALID_EVENT);
+    }
+}
+
+/// What the RM posts to an open that registered is what polls readable on
+/// it and what RM_GET_EVENT_DATA hands back, byte for byte.
+#[test]
+fn an_event_posted_to_an_open_is_read_back_from_it() {
+    const CLIENT: u32 = 0xc1e0_0002;
+    let open = ctl();
+    let mut p = os_event_payload(CLIENT, 7);
+    assert_eq!(open.os_event(esc::ALLOC_OS_EVENT, &mut p), Ok(()));
+    assert!(!open.poll().unwrap().read);
+
+    post_event(open.os_info(), Some(unix_event(0xbeef_0001)));
+    assert!(open.poll().unwrap().read);
+    assert!(
+        open.poll().unwrap().read,
+        "still there: polling reads nothing"
+    );
+
+    let mut out = [0xeeu8; nvctl::UnixEvent::SIZE];
+    let mut p = get_event_payload(out.as_mut_ptr() as usize);
+    assert_eq!(open.os_event(esc::RM_GET_EVENT_DATA, &mut p), Ok(()));
+    assert_eq!(u32_at(&p, 12), NV_OK);
+    assert_eq!(u32_at(&p, 8), 0, "no more");
+    assert_eq!(out, unix_event(0xbeef_0001).to_bytes());
+    assert!(!open.poll().unwrap().read);
+}
+
+/// With two opens registered, what is posted to each is read back from it
+/// and only from it.
+#[test]
+fn an_event_reaches_only_its_own_open() {
+    const CLIENT: u32 = 0xc1e0_0004;
+    let first = Arc::new(ctl());
+    let second = Arc::new(ctl());
+    for (open, fd) in [(&first, 7), (&second, 8)] {
+        let mut p = os_event_payload(CLIENT, fd);
+        assert_eq!(open.os_event(esc::ALLOC_OS_EVENT, &mut p), Ok(()));
+    }
+    post_event(first.os_info(), Some(unix_event(1)));
+    post_event(second.os_info(), Some(unix_event(2)));
+    assert_eq!(
+        read_event(&first.events),
+        (NV_OK, 0, unix_event(1).to_bytes())
+    );
+    assert_eq!(
+        read_event(&second.events),
+        (NV_OK, 0, unix_event(2).to_bytes())
+    );
+}
+
+/// An open that never issued ALLOC_OS_EVENT is not where any event goes.
+#[test]
+fn an_open_that_registered_nothing_takes_no_event() {
+    let open = gpu(0);
+    post_event(open.os_info(), Some(unix_event(1)));
+    post_event(open.os_info(), None);
+    assert!(!open.poll().unwrap().read);
+}
+
+/// The close takes the open out of reach before the RM frees what it
+/// registered. In an `Arc`, as every open is: the token is the open's
+/// address, and `drop(open)` of a bare value would move it first.
+#[test]
+fn a_closed_open_is_out_of_reach() {
+    const CLIENT: u32 = 0xc1e0_0003;
+    let open = Arc::new(ctl());
+    let mut p = os_event_payload(CLIENT, 7);
+    assert_eq!(open.os_event(esc::ALLOC_OS_EVENT, &mut p), Ok(()));
+    let events = open.events.clone();
+    let reachable = || EVENT_OPENS.lock().values().any(|e| Arc::ptr_eq(e, &events));
+    assert!(reachable());
+    drop(open);
+    assert!(!reachable());
+}
+
+#[test]
+fn more_events_says_whether_another_follows() {
+    let events = OpenEvents::default();
+    events.post(Some(unix_event(1)));
+    events.post(Some(unix_event(2)));
+    let (status, more, out) = read_event(&events);
+    assert_eq!((status, more), (NV_OK, 1));
+    assert_eq!(out, unix_event(1).to_bytes(), "oldest first");
+    let (status, more, out) = read_event(&events);
+    assert_eq!((status, more), (NV_OK, 0));
+    assert_eq!(out, unix_event(2).to_bytes());
+    assert!(!readable(&events), "nothing left to report");
+}
+
+/// `nv_get_event` on an empty queue: `NV_ERR_OPERATING_SYSTEM`, nothing
+/// copied out, `MoreEvents` as it came.
+#[test]
+fn an_empty_queue_answers_operating_system() {
+    let events = OpenEvents::default();
+    let (status, more, out) = read_event(&events);
+    assert_eq!(status, NV_ERR_OPERATING_SYSTEM);
+    assert_eq!(more, 0xaaaa_aaaa);
+    assert_eq!(out, [0xee; nvctl::UnixEvent::SIZE]);
+}
+
+/// An event without data is only ever seen by `poll`, once.
+#[test]
+fn an_event_without_data_polls_readable_once() {
+    let events = OpenEvents::default();
+    events.post(None);
+    assert!(readable(&events));
+    let (status, _, _) = read_event(&events);
+    assert_eq!(status, NV_ERR_OPERATING_SYSTEM, "it is not data");
+    assert!(readable(&events), "and reading does not consume it");
+    assert!(events.poll());
+    assert!(!events.poll(), "polling does");
+    assert!(!readable(&events));
+}
+
+/// Data and a dataless event at once: reporting the dataless one leaves the
+/// data, and reading the data leaves the dataless one.
+#[test]
+fn data_and_a_dataless_event_are_told_apart() {
+    let events = OpenEvents::default();
+    events.post(Some(unix_event(1)));
+    events.post(None);
+    assert!(events.poll());
+    assert!(events.poll(), "the data is still queued");
+    let (status, more, _) = read_event(&events);
+    assert_eq!((status, more), (NV_OK, 0));
+    assert!(!events.poll());
+
+    events.post(None);
+    events.post(Some(unix_event(2)));
+    let (status, more, _) = read_event(&events);
+    assert_eq!(
+        (status, more),
+        (NV_OK, 0),
+        "the dataless one is not more data"
+    );
+    assert!(readable(&events), "and it is still to be reported");
+    assert!(events.poll());
+    assert!(!readable(&events));
+}
+
+/// `get_os_event_data` takes the event off the queue before the copy, so
+/// one that cannot be copied out is gone.
+#[test]
+fn an_event_that_cannot_be_copied_out_is_lost() {
+    let events = OpenEvents::default();
+    events.post(Some(unix_event(1)));
+    events.post(Some(unix_event(2)));
+    let mut p = get_event_payload(0);
+    get_event_data(&mut p, &events);
+    assert_eq!(u32_at(&p, 12), NV_ERR_INVALID_ADDRESS);
+    assert_eq!(u32_at(&p, 8), 1, "MoreEvents is still told");
+    let (status, _, out) = read_event(&events);
+    assert_eq!(status, NV_OK);
+    assert_eq!(out, unix_event(2).to_bytes());
+}
+
+#[test]
+fn the_queue_stops_at_its_most() {
+    let events = OpenEvents::default();
+    for h in 0..MAX_QUEUED_EVENTS as u32 + 2 {
+        events.post(Some(unix_event(h)));
+    }
+    assert_eq!(events.queue.lock().data.len(), MAX_QUEUED_EVENTS);
+    let (_, _, out) = read_event(&events);
+    assert_eq!(
+        out,
+        unix_event(0).to_bytes(),
+        "the newest are the ones dropped"
+    );
+    events.post(Some(unix_event(0xffff)));
+    assert_eq!(events.queue.lock().data.len(), MAX_QUEUED_EVENTS);
+    assert_eq!(
+        events.queue.lock().data.back(),
+        Some(&unix_event(0xffff)),
+        "room again once one is read"
+    );
+}
+
+/// A poller parked on the open wakes when an event is posted, and one that
+/// parks while an event is waiting does not sleep through it.
+#[test]
+fn a_parked_poller_wakes_on_a_post() {
+    let open = gpu(0);
+    let (count, waker) = counting_waker();
+    let sub = open.subscribe_readiness(PollEvents::IN, &waker);
+    assert_eq!(count.0.load(Ordering::SeqCst), 0);
+    open.events.post(Some(unix_event(1)));
+    assert_eq!(count.0.load(Ordering::SeqCst), 1);
+    drop(sub);
+
+    let (count, waker) = counting_waker();
+    let _sub = open.subscribe_readiness(PollEvents::IN, &waker);
+    assert_eq!(count.0.load(Ordering::SeqCst), 1, "already readable");
+}
+
+/// Once there is nothing to report, a poller parks: the flag it parks on is
+/// off.
+#[test]
+fn nothing_left_to_report_lets_a_poller_park() {
+    let open = gpu(0);
+    open.events.post(Some(unix_event(1)));
+    let (status, _, _) = read_event(&open.events);
+    assert_eq!(status, NV_OK);
+    open.events.post(None);
+    assert!(open.poll().unwrap().read);
+    let (count, waker) = counting_waker();
+    let _sub = open.subscribe_readiness(PollEvents::IN, &waker);
+    assert_eq!(count.0.load(Ordering::SeqCst), 0);
+}
+
+/// `poll(2)` reaches the open through its `File`: readable once an event is
+/// queued, and a poller parks on the open's own flag instead of the short
+/// re-poll a node with none gets.
+#[test]
+fn poll_through_the_file_reaches_the_open() {
+    use crate::fs::{File, FileLike, OpenFlags};
+    let open = Arc::new(gpu(0));
+    let file = File::new(open.clone(), OpenFlags::RDWR, "/dev/nvidia0".into());
+    let (count, waker) = counting_waker();
+    let sub = file.subscribe_readiness(PollEvents::IN, &waker);
+    assert!(sub.is_some());
+    assert!(!file.poll(PollEvents::IN).unwrap().read);
+    open.events.post(None);
+    assert_eq!(count.0.load(Ordering::SeqCst), 1);
+    assert!(file.poll(PollEvents::IN).unwrap().read);
+}

@@ -4484,7 +4484,9 @@ fn removing_the_framebuffer_on_the_crtc_turns_it_off_and_closing_it_does_not() {
 /// past `U32_MAX - 8` (EINVAL), and sizes the buffer from the bpp asked
 /// for: `DIV_ROUND_UP(bpp, 8)` bytes per pixel. Here every bpp below 32
 /// became 32 -- a bpp of 0 got a 32-bit buffer, and a 16-bit request
-/// was sized and reported as 32-bit.
+/// was sized and reported as 32-bit. And the `size` every `dumb_create`
+/// reports is `pitch * height` rounded up to a page, because a GEM
+/// object is whole pages (`drm_gem_object_init`); it was the raw product.
 #[test]
 fn a_dumb_buffer_is_sized_by_the_bpp_asked_for_and_a_zero_is_refused() {
     let _serialised = drm::test_globals::lock();
@@ -4512,9 +4514,20 @@ fn a_dumb_buffer_is_sized_by_the_bpp_asked_for_and_a_zero_is_refused() {
     for (bpp, pitch) in [(32, 256), (16, 128), (8, 64), (24, 192), (12, 128), (1, 64)] {
         let (p, size, handle) = create(64, 4, bpp).expect("CREATE_DUMB");
         assert_eq!(p, pitch, "pitch for bpp {}", bpp);
-        assert_eq!(size, pitch as u64 * 4, "size for bpp {}", bpp);
+        assert_eq!(
+            size, 4096,
+            "size for bpp {}: a page, the object's unit",
+            bpp
+        );
         handles.push(handle);
     }
+    let (p, size, handle) = create(64, 40, 32).expect("CREATE_DUMB");
+    assert_eq!(
+        (p, size),
+        (256, 12288),
+        "10240 bytes of pixels, three pages"
+    );
+    handles.push(handle);
     for mut handle in handles {
         c.ioctl(DRM_IOCTL_MODE_DESTROY_DUMB, &mut handle)
             .expect("DESTROY_DUMB");
