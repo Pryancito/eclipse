@@ -2497,7 +2497,11 @@ impl DrmDev {
 
                     // Report exactly one encoder. wlroots calls this twice: once
                     // to learn the counts, then again with allocated arrays.
-                    if conn_res.encoders_ptr != 0 && conn_res.count_encoders >= 1 {
+                    // `drm_mode_getconnector` copies the encoders and the
+                    // modes only when the whole list fits, and then through
+                    // `put_user`/`copy_to_user`: room with a null array is
+                    // EFAULT, not a skip.
+                    if conn_res.count_encoders >= 1 {
                         ucheck_n::<u32>(conn_res.encoders_ptr as usize, 1)?;
                         unsafe {
                             *(conn_res.encoders_ptr as *mut u32) = drm::SYNTH_ENCODER_ID;
@@ -2507,7 +2511,7 @@ impl DrmDev {
 
                     // Report exactly one mode: the display's native resolution.
                     if let Some((w, h, _)) = drm::display_mode() {
-                        if conn_res.modes_ptr != 0 && conn_res.count_modes >= 1 {
+                        if conn_res.count_modes >= 1 {
                             let mode = make_modeinfo(w, h);
                             ucheck(conn_res.modes_ptr as usize, mode.len())?;
                             unsafe {
@@ -2654,7 +2658,9 @@ impl DrmDev {
                     // Advertise the formats the software scanout consumes, via
                     // the two-call pattern (count first, then fill).
                     const FORMATS: [u32; 2] = drm::SCANOUT_FORMATS;
-                    if res.format_type_ptr != 0 && res.count_format_types >= FORMATS.len() as u32 {
+                    // `drm_mode_getplane`: the formats are copied only when
+                    // they all fit, and room with a null array is EFAULT.
+                    if res.count_format_types >= FORMATS.len() as u32 {
                         ucheck_n::<u32>(res.format_type_ptr as usize, FORMATS.len())?;
                         unsafe {
                             core::ptr::copy_nonoverlapping(
@@ -5499,7 +5505,10 @@ fn lease_objects(ids: &[u32], universal_planes: bool) -> Result<alloc::vec::Vec<
 /// writes nothing (Linux would fault on it).
 fn fill_id_list(ptr: u64, room: u32, ids: &[u32]) -> Result<()> {
     let fill = ids.len().min(room as usize);
-    if ptr != 0 && fill > 0 {
+    // Room without an array is `put_user` on nothing: EFAULT, as in every
+    // list a KMS query fills (`drm_mode_getresources` and the rest). A
+    // null pointer used to be a silent skip, with the count still written.
+    if fill > 0 {
         ucheck_n::<u32>(ptr as usize, fill)?;
         unsafe {
             core::ptr::copy_nonoverlapping(ids.as_ptr(), ptr as *mut u32, fill);
@@ -5511,10 +5520,11 @@ fn fill_id_list(ptr: u64, room: u32, ids: &[u32]) -> Result<()> {
 /// A property list the way `drm_mode_object_get_properties` answers one
 /// (`*arg_count_props > count` per entry): the ids and values of the first
 /// `room` properties, and the caller reads the full length from the count
-/// written back. Both arrays are written, so both pointers must be non-null.
+/// written back. Both arrays are written, so with room either one being
+/// null is EFAULT (`put_user`), not a skip.
 fn fill_prop_list(props_ptr: u64, values_ptr: u64, room: u32, props: &[(u32, u64)]) -> Result<()> {
     let fill = props.len().min(room as usize);
-    if fill > 0 && props_ptr != 0 && values_ptr != 0 {
+    if fill > 0 {
         ucheck_n::<u32>(props_ptr as usize, fill)?;
         ucheck_n::<u64>(values_ptr as usize, fill)?;
         for (i, (pid, val)) in props.iter().take(fill).enumerate() {
@@ -6590,6 +6600,9 @@ mod lease_tests;
 
 #[cfg(test)]
 mod legacy_core_tests;
+
+#[cfg(test)]
+mod null_list_tests;
 
 #[cfg(test)]
 mod trail_tests;
