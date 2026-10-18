@@ -17,7 +17,7 @@ use core::{
 };
 
 use bitvec::prelude::*;
-use spin::RwLock;
+use spin::{Mutex, RwLock};
 
 use rcore_fs::{
     dev::Device,
@@ -433,6 +433,7 @@ impl INodeImpl {
     }
 
     pub fn link_inodeimpl(&self, name: &str, other: &Arc<INodeImpl>) -> vfs::Result<()> {
+        let _namespace = self.fs.namespace.lock();
         check_entry_name(name)?;
         let info = self.metadata()?;
         if info.type_ != vfs::FileType::Dir {
@@ -570,6 +571,7 @@ impl vfs::INode for INodeImpl {
         _mode: u32,
         data: usize,
     ) -> vfs::Result<Arc<dyn vfs::INode>> {
+        let _namespace = self.fs.namespace.lock();
         check_entry_name(name)?;
         let info = self.metadata()?;
         if info.type_ != vfs::FileType::Dir {
@@ -608,6 +610,7 @@ impl vfs::INode for INodeImpl {
     }
 
     fn link(&self, name: &str, other: &Arc<dyn INode>) -> vfs::Result<()> {
+        let _namespace = self.fs.namespace.lock();
         check_entry_name(name)?;
         let info = self.metadata()?;
         if info.type_ != vfs::FileType::Dir {
@@ -636,6 +639,7 @@ impl vfs::INode for INodeImpl {
         Ok(())
     }
     fn unlink(&self, name: &str) -> vfs::Result<()> {
+        let _namespace = self.fs.namespace.lock();
         let info = self.metadata()?;
         if info.type_ != vfs::FileType::Dir {
             return Err(FsError::NotDir);
@@ -672,6 +676,7 @@ impl vfs::INode for INodeImpl {
         Ok(())
     }
     fn move_(&self, old_name: &str, target: &Arc<dyn INode>, new_name: &str) -> vfs::Result<()> {
+        let _namespace = self.fs.namespace.lock();
         check_entry_name(new_name)?;
         if new_name == "." || new_name == ".." {
             return Err(FsError::InvalidParam);
@@ -881,6 +886,23 @@ pub struct SimpleFileSystem {
     self_ptr: Weak<SimpleFileSystem>,
     /// device inode
     device_inodes: RwLock<BTreeMap<usize, Arc<DeviceINode>>>,
+    /// Held across every change to a directory's entries, from the lookup
+    /// that decides a name is free (or is there) to the change that relies
+    /// on it.
+    ///
+    /// Without it two of them could both look before either changed
+    /// anything. Two `mkdir` of one name both found it free and both
+    /// appended an entry, so both callers "got" the directory; two `rmdir`
+    /// of one directory both found it and both took its links away, and the
+    /// second `nlinks_dec` failed its `nlinks > 0` assertion -- a kernel
+    /// panic. The boot scripts that run at once and serialize on `mkdir
+    /// "$ENVF.lock"` do exactly that, and it is how the riscv64 libc test
+    /// job died while init was starting.
+    ///
+    /// One lock for the whole filesystem rather than one per directory: a
+    /// `move_` changes two directories, and a filesystem-wide lock needs no
+    /// order to take them in. Lookups do not take it.
+    namespace: Mutex<()>,
 }
 
 impl SimpleFileSystem {
@@ -906,6 +928,7 @@ impl SimpleFileSystem {
             device,
             self_ptr: Weak::default(),
             device_inodes: RwLock::new(BTreeMap::new()),
+            namespace: Mutex::new(()),
         }
         .wrap())
     }
@@ -938,6 +961,7 @@ impl SimpleFileSystem {
             device,
             self_ptr: Weak::default(),
             device_inodes: RwLock::new(BTreeMap::new()),
+            namespace: Mutex::new(()),
         }
         .wrap();
 
