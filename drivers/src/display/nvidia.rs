@@ -220,6 +220,13 @@ mod vram_alloc;
 /// is `nvidia.gem_vram_bar1`, default off.
 pub(super) mod vram_bar1;
 
+mod comptag_caps;
+/// Honouring a compressed PTE kind instead of downgrading it, hatch
+/// `nvidia.gem_comptags`, default off; and the one RM call behind it, split
+/// off so `comptags` stays FFI-free and host-testable. Own files for the size
+/// ceiling.
+pub(super) mod comptags;
+
 /// Implicit synchronisation: the dependency a submission has on work ANOTHER
 /// process still has in flight against a buffer it lent us. The nouveau uAPI
 /// `EXEC` carries only the syncobjs its client names, so without this a
@@ -8512,6 +8519,9 @@ impl NvidiaGpu {
                         va,
                         bo_offset,
                         pte_kind,
+                        // No GEM record here, so the placement is unknown
+                        // and a compressed kind always downgrades, as before.
+                        false,
                     )
                     .ok()
                 })
@@ -8828,11 +8838,17 @@ impl NvidiaGpu {
         // first, and a map the RM then refuses cannot put the old one back.
         match op.op {
             nv::VM_BIND_OP_MAP => {
+                // Asked for once: static after state load, and a game binds
+                // dozens of surfaces a second.
+                comptag_caps::ensure_read_once(device_instance);
                 // The holder check and the window check ran in
                 // `vm_bind_check_op` (handle 0 included: no object, ENOENT);
                 // the lookup here is for `h_memory`, and an object that went
-                // away in between is ENOENT.
-                let h_memory = {
+                // away in between is ENOENT. The placement comes out of the
+                // SAME lock: the compressed-kind decision reads the object's
+                // domain and page-rounded size, and reading those separately
+                // would race a concurrent GEM_FREE.
+                let (h_memory, honour_compressed) = {
                     let gem = self.nouveau_gem.lock();
                     let Some(obj) = gem
                         .iter()
@@ -8840,7 +8856,7 @@ impl NvidiaGpu {
                     else {
                         return Err(nv::ENOENT);
                     };
-                    obj.h_memory
+                    (obj.h_memory, comptags::honour_for_bind(rm_pte_kind, obj))
                 };
                 // REPLACE semantics, like Linux's gpuvm: a MAP over an
                 // already-mapped range unmaps the old mapping first instead
@@ -8895,6 +8911,7 @@ impl NvidiaGpu {
                     op.addr,
                     op.bo_offset,
                     rm_pte_kind,
+                    honour_compressed,
                 );
                 let rm_narration = nvidia_rm_sys::os_interface::capture_take();
                 let replay_rm = |narration: Option<alloc::string::String>| {
@@ -9118,17 +9135,25 @@ impl NvidiaGpu {
                 return;
             }
         };
-        let bind =
-            match rm::vm_bind_map(device_instance, 0, alloc.h_memory, TEST_SIZE, TEST_VA, 0, 0) {
-                Ok(b) if b.map_status == 0 => b,
-                _ => {
-                    crate::klog_warn!(
-                        "[nouveau-uapi] SELFTEST: VM_BIND of the test page failed -- cannot run"
-                    );
-                    rm::gem_free(device_instance, alloc.h_memory);
-                    return;
-                }
-            };
+        let bind = match rm::vm_bind_map(
+            device_instance,
+            0,
+            alloc.h_memory,
+            TEST_SIZE,
+            TEST_VA,
+            0,
+            0,
+            false,
+        ) {
+            Ok(b) if b.map_status == 0 => b,
+            _ => {
+                crate::klog_warn!(
+                    "[nouveau-uapi] SELFTEST: VM_BIND of the test page failed -- cannot run"
+                );
+                rm::gem_free(device_instance, alloc.h_memory);
+                return;
+            }
+        };
         let base = crate::bus::phys_to_virt(pa as usize);
         let sem_va = TEST_VA + SEM_OFF;
         unsafe {
