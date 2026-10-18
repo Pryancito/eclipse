@@ -14,6 +14,8 @@ pub(crate) use fd::{anon_fd_flags, open_flags, ANON_CLOEXEC, ANON_NONBLOCK};
 mod file;
 pub(crate) use file::{after_write_error, sigpipe_due, AfterWriteError};
 mod mount;
+#[cfg(target_arch = "x86_64")]
+mod nvidia;
 mod pidfd;
 mod poll;
 mod splice;

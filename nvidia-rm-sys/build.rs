@@ -296,6 +296,11 @@ fn build_first_real_nvidia_file() {
     // replacing the no-op os_boundary.rs stubs -- backed by kernel-hal's
     // contiguous DMA frame allocator + physmap. See that file's header.
     build.file("vendor/eclipse_rm_mem.c");
+    // vendor/eclipse_rm_frontend.c: the RM half of /dev/nvidiactl -- the
+    // subset of escape.c's RmIoctl (RM_ALLOC/FREE/CONTROL/DUP/SHARE) that
+    // NVIDIA's user-mode driver needs, plus the client cleanup on close.
+    // See that file's header.
+    build.file("vendor/eclipse_rm_frontend.c");
     // A compiler ignores a `-I` that does not exist, without a word, so this list
     // can drift away from the tree and nothing says so until a header turns up
     // missing somewhere else entirely. The entries are harmless; the silence is
@@ -398,4 +403,5 @@ fn build_first_real_nvidia_file() {
     }
     println!("cargo:rerun-if-changed=src/srcs_mk.rs");
     println!("cargo:rerun-if-changed=vendor/eclipse_rm_mem.c");
+    println!("cargo:rerun-if-changed=vendor/eclipse_rm_frontend.c");
 }

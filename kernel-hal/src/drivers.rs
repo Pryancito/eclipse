@@ -395,6 +395,16 @@ pub fn set_gem_vram_bar1_enabled(v: bool) {
 #[cfg(not(target_arch = "x86_64"))]
 pub fn set_gem_vram_bar1_enabled(_v: bool) {}
 
+/// Creates `/dev/nvidiactl` and `/dev/nvidia<N>` for NVIDIA's own user-mode
+/// driver (`nvidia.nvidiactl`). Default off: see
+/// `linux-object/src/fs/devfs/nvidia.rs`.
+#[cfg(target_arch = "x86_64")]
+pub fn set_nvidiactl_enabled(v: bool) {
+    zcore_drivers::display::nvctl::set_enabled(v);
+}
+#[cfg(not(target_arch = "x86_64"))]
+pub fn set_nvidiactl_enabled(_v: bool) {}
+
 /// Enables on-demand console-GPU GSP bring-up (`nvidia.console_gsp`). Default off.
 #[cfg(target_arch = "x86_64")]
 pub fn set_console_gsp_enabled(v: bool) {

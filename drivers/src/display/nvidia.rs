@@ -234,6 +234,9 @@ pub(super) mod comptags;
 pub(super) mod pushbuf;
 mod pushbuf_submit;
 
+/// The GPU side of `/dev/nvidiactl` and `/dev/nvidia<N>` (hatch
+/// `nvidia.nvidiactl`, default off); own file for the size ceiling.
+pub mod frontend;
 /// Implicit synchronisation: the dependency a submission has on work ANOTHER
 /// process still has in flight against a buffer it lent us. The nouveau uAPI
 /// `EXEC` carries only the syncobjs its client names, so without this a

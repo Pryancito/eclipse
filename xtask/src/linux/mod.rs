@@ -2,6 +2,7 @@ mod btrfs_image;
 mod desktop;
 mod eclipsefs_image;
 mod image;
+mod nvctl_probe;
 pub(crate) mod nvidia_firmware;
 mod opencv;
 mod portal;
@@ -795,6 +796,9 @@ impl LinuxRootfs {
         } else {
             eprintln!("warning: ecl-compute not built; no userspace NVIDIA compute client");
         }
+
+        // nvctl-probe: `nvidia-smi -L` through /dev/nvidiactl, no NVIDIA library.
+        self.install_nvctl_probe(&musl, &bin);
 
         // ecl-vkcompute: SAXPY via Vulkan compute (NVK). Dynamic: musl static
         // cannot dlopen libvulkan.so.1.

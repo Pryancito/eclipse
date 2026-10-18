@@ -1377,6 +1377,10 @@ pub fn create_root_fs(rootfs: Arc<dyn FileSystem>) -> Arc<dyn INode> {
         // table, so they cannot drift apart. Unconditional, so sysfs is never
         // consulted against an empty table.
         devfs::drm::build_gpu_nodes();
+        // `/dev/nvidiactl` and `/dev/nvidia<N>`, for NVIDIA's own user-mode
+        // driver (`nvidia.nvidiactl`, default off).
+        #[cfg(target_arch = "x86_64")]
+        devfs::nvidia::create_nodes(&devfs_root);
         if have_drm || have_display {
             if let Ok(dri_dev) = devfs_root.add_dir("dri") {
                 if let Err(e) = dri_dev.add("card0", Arc::new(devfs::DrmDev::new(0))) {

@@ -2194,6 +2194,12 @@ impl Syscall<'_> {
         // matching. Without this the dispatch misses and the ioctl falls
         // through to ENOTTY ("Not a tty").
         let cmd = request as u32 as usize;
+        // `/dev/nvidiactl` and `/dev/nvidia<N>`: the fd table and the caller's
+        // credentials are part of the escape (see `nvidia.rs`).
+        #[cfg(target_arch = "x86_64")]
+        if let Some(ret) = self.sys_nvidia_ioctl(&file_like, request, arg1) {
+            return ret;
+        }
         let is_prime_or_lease = {
             use linux_object::fs::devfs::drm_scheme::{is_drm_ioctl_nr, nr};
             let c = cmd as u32;

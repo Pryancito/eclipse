@@ -937,6 +937,14 @@ fn primary_main(config: kernel_hal::KernelConfig) {
                 kernel_hal::drivers::set_gem_pushbuf_enabled(true);
                 klog_info!("Eclipse: nvidia.gem_pushbuf -- GEM_PUSHBUF submits for real");
             }
+            // The device files NVIDIA's own user-mode driver opens
+            // (libnvidia-ml, so `nvidia-smi`), over the RM this kernel
+            // carries. Default off: no NVIDIA user-mode driver has run on it
+            // on real hardware yet.
+            if kernel_hal::cmdline::flag(&options.cmdline, "nvidia.nvidiactl") {
+                kernel_hal::drivers::set_nvidiactl_enabled(true);
+                klog_info!("Eclipse: nvidia.nvidiactl -- /dev/nvidiactl and /dev/nvidia<N>");
+            }
             if kernel_hal::cmdline::flag(&options.cmdline, "nvidia.gem_vram_bar1") {
                 kernel_hal::drivers::set_gem_vram_bar1_enabled(true);
                 klog_info!(

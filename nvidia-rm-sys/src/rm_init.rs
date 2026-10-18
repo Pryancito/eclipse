@@ -57,10 +57,10 @@ pub(crate) fn gate_test_turnstile() -> std::sync::MutexGuard<'static, ()> {
     TURNSTILE.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-struct RmGate;
+pub(crate) struct RmGate;
 
 impl RmGate {
-    fn lock() -> RmGate {
+    pub(crate) fn lock() -> RmGate {
         use core::sync::atomic::Ordering;
         let mut spins = 0u32;
         while RM_CALL_GATE.swap(true, Ordering::Acquire) {
