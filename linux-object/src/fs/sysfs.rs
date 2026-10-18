@@ -1398,6 +1398,17 @@ fn drm_node_pci_index(minor: u32) -> Option<usize> {
     }
 }
 
+/// The bus id `GET_UNIQUE` reports for a DRM node once `SET_VERSION` has
+/// set it: `pci:DDDD:BB:SS.F` of the PCI device the node's sysfs `device`
+/// symlink names (`drm_pci_set_busid`), so the two agree, which is what
+/// Xorg's platform bus relies on (`platform_find_pci_info` parses this
+/// string to find the node's `pci_device`, and a node it cannot parse is
+/// never the primary GPU). `None` for a minor with no node.
+pub(crate) fn drm_node_busid(minor: u32) -> Option<String> {
+    let name = pci_bdf_name(drm_node_pci_index(minor)?)?;
+    Some(alloc::format!("pci:{}", name))
+}
+
 /// The DRM node minors whose sysfs identity lives under this PCI device, in
 /// `card` then `renderD` order per GPU.
 ///
@@ -2971,7 +2982,7 @@ fn scan_pci_devices() -> Vec<PciDevInfo> {
 /// The PCI bus the tests build `/sys` over, in place of the configuration
 /// ports.
 #[cfg(test)]
-mod test_bus {
+pub(crate) mod test_bus {
     extern crate std;
 
     use super::PciDevInfo;
@@ -2993,7 +3004,13 @@ mod test_bus {
         Bus { _guard: guard }
     }
 
-    pub(super) struct Bus {
+    /// [`with`] [`a_real_machine`], for a test elsewhere in the crate that
+    /// needs a node with a PCI identity (the bus type stays this module's).
+    pub(crate) fn real_machine() -> Bus {
+        with(a_real_machine())
+    }
+
+    pub(crate) struct Bus {
         _guard: self::std::sync::MutexGuard<'static, ()>,
     }
 
