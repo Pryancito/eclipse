@@ -68,7 +68,7 @@ fn submodule_dir() -> PathBuf {
 /// Reads `NVIDIA_VERSION = <x>` out of the submodule's `version.mk` -- the
 /// same file NVIDIA's own build and extraction script read, and the source of
 /// the `NV_VERSION_STRING` the RM will demand of the firmware at runtime.
-fn pinned_rm_version() -> Option<String> {
+pub(super) fn pinned_rm_version() -> Option<String> {
     let path = submodule_dir().join("version.mk");
     let text = fs::read_to_string(&path).ok()?;
     for line in text.lines() {

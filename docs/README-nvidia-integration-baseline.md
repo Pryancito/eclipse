@@ -129,6 +129,48 @@ de verdad y no publica mmap CPU. GART y `GART|VRAM` siguen en sysmem
 (HOST_VISIBLE). El wait del CE-present corre **fuera** de los locks RM y de
 `RmGate`; un fallo sigue latiendo `CE_PRESENT_WEDGED` y cae al blit CPU.
 
+## 2c) El userspace de NVIDIA (`nvidia-smi`, NVML, `libcuda`)
+
+Los clientes de verdad de `/dev/nvidiactl` (la escotilla `nvidia.nvidiactl`
+de la cmdline) son los binarios de NVIDIA. Se meten en la imagen solo si se
+piden:
+
+```sh
+ECLIPSE_NVIDIA_USERSPACE=1 cargo image --arch x86_64 --variant <variante>
+```
+
+Instala `/usr/bin/nvidia-smi` y, en `/usr/lib/x86_64-linux-gnu`,
+`libnvidia-ml`, `libcuda` y `libnvidia-ptxjitcompiler`, con sus enlaces de
+soname. Tienen que ser **de la misma versión exacta que el RM**: abren con
+`NV_ESC_CHECK_VERSION_STR` en modo estricto, así que la versión se lee del
+`version.mk` del submódulo, como la del firmware GSP.
+
+Salen del archivo de Ubuntu (`archive.ubuntu.com`, paquetes
+`libnvidia-compute-<rama>` y `nvidia-utils-<rama>`), que lleva los binarios
+de NVIDIA tal cual, los mismos del `.run`. Como son glibc y la imagen es
+musl, también se instala la glibc de Ubuntu 24.04 (`libc6` y `libgcc-s1`,
+fijados por nombre y SHA-256): el cargador en `/lib64/ld-linux-x86-64.so.2`
+y las bibliotecas en `/usr/lib/x86_64-linux-gnu`, que ese cargador mira
+antes que `/usr/lib`, donde están las de musl. Una raíz que ya trae su
+propio cargador glibc se queda con su glibc entera.
+
+Los paquetes quedan en `ignored/nvidia-userspace-cache`. En una máquina sin
+salida a `archive.ubuntu.com` basta con dejarlos ahí a mano. Para desempaquetar
+hace falta `tar` de GNU con `zstd`, y `sha256sum`.
+
+Probarlo, arrancando con `nvidia.nvidiactl`:
+
+```sh
+nvidia-smi
+nvidia-smi -L
+dmesg | grep nvidiactl
+```
+
+Sin GPU NVIDIA (QEMU) `nvidia-smi` dice «Failed to initialize NVML: GPU
+access blocked by the operating system»: no hay núcleo RM y las escapadas
+dan EINVAL. `libcuda` aún no puede pasar de `cuInit`, que necesita
+`/dev/nvidia-uvm`.
+
 ## 3) Semántica de render node (despliegue seguro)
 
 Por defecto, `renderD128` mantiene modo compatibilidad (observa y registra
