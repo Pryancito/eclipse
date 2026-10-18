@@ -415,22 +415,15 @@ pub extern "C" fn os_mem_copy(dst: *mut c_void, src: *const c_void, length: NvU3
     unsafe { core::ptr::copy(src as *const u8, dst as *mut u8, length as usize) };
     dst
 }
-/// STUB: no userspace address space to copy from/to yet.
+/// Copies only while a `/dev/nvidiactl` call is in flight, from the range
+/// the kernel accepted; refused otherwise (see `frontend`).
 #[no_mangle]
-pub extern "C" fn os_memcpy_from_user(
-    _to: *mut c_void,
-    _from: *const c_void,
-    _n: NvU32,
-) -> NV_STATUS {
-    NV_ERR_NOT_SUPPORTED
+pub extern "C" fn os_memcpy_from_user(to: *mut c_void, from: *const c_void, n: NvU32) -> NV_STATUS {
+    crate::frontend::copy_from_user(to as *mut u8, from as *const u8, n as usize)
 }
 #[no_mangle]
-pub extern "C" fn os_memcpy_to_user(
-    _to: *mut c_void,
-    _from: *const c_void,
-    _n: NvU32,
-) -> NV_STATUS {
-    NV_ERR_NOT_SUPPORTED
+pub extern "C" fn os_memcpy_to_user(to: *mut c_void, from: *const c_void, n: NvU32) -> NV_STATUS {
+    crate::frontend::copy_to_user(to as *mut u8, from as *const u8, n as usize)
 }
 #[no_mangle]
 pub extern "C" fn os_mem_set(dst: *mut c_void, value: NvU8, length: NvU32) -> *mut c_void {

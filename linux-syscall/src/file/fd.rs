@@ -49,6 +49,13 @@ impl ITimerSpec {
 }
 
 fn prepare_open_inode(inode: Arc<dyn INode>) -> LxResult<Arc<dyn INode>> {
+    // `/dev/nvidiactl` and `/dev/nvidia<N>`: every open is its own RM file
+    // (its clients are freed when it closes), and a GPU the RM never brought
+    // up does not open at all.
+    #[cfg(target_arch = "x86_64")]
+    if let Some(nv) = inode.downcast_ref::<linux_object::fs::devfs::NvidiaDev>() {
+        return nv.open_client().map_err(LxError::from);
+    }
     Ok(
         if inode
             .downcast_ref::<linux_object::fs::pty::PtmxINode>()

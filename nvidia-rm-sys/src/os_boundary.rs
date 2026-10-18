@@ -2074,13 +2074,20 @@ pub extern "C" fn osIovaUnmap(pIovaMapping: *mut c_void) {
 
 #[no_mangle]
 pub extern "C" fn osIsAdministrator() -> NvBool {
-    NV_FALSE
+    if crate::frontend::is_administrator() {
+        NV_TRUE
+    } else {
+        NV_FALSE
+    }
 }
 
 #[no_mangle]
 pub extern "C" fn osIsGpuAccessible(pGpu: *mut c_void) -> NvBool {
-    let _ = pGpu;
-    NV_FALSE
+    if crate::frontend::gpu_accessible(pGpu) {
+        NV_TRUE
+    } else {
+        NV_FALSE
+    }
 }
 
 #[no_mangle]
