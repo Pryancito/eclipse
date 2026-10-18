@@ -168,3 +168,27 @@ fn waitid_refuses_a_bit_outside_its_mask_too() {
         );
     }
 }
+
+// ---- the pid --------------------------------------------------------------
+
+/// "-INT_MIN is not defined": `kernel_wait4` answers `ESRCH` before it
+/// negates, and so does this. It used to negate, which is an overflow panic
+/// in a debug kernel -- reached by any process -- and a wrapped group id in
+/// a release one.
+#[test]
+fn int_min_is_esrch_not_a_negation() {
+    assert_eq!(wait4_target(i32::MIN), Err(LxError::ESRCH));
+    // Its neighbour is an ordinary group, the largest one there is.
+    assert_eq!(
+        wait4_target(i32::MIN + 1),
+        Ok(WaitTarget::Pgid(i32::MAX as KoID))
+    );
+}
+
+#[test]
+fn the_four_readings_of_a_pid() {
+    assert_eq!(wait4_target(-1), Ok(WaitTarget::AnyChild));
+    assert_eq!(wait4_target(0), Ok(WaitTarget::AnyChildInGroup));
+    assert_eq!(wait4_target(42), Ok(WaitTarget::Pid(42)));
+    assert_eq!(wait4_target(-42), Ok(WaitTarget::Pgid(42)));
+}

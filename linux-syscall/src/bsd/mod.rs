@@ -551,6 +551,12 @@ impl Syscall<'_> {
             AMD64_SET_FSBASE => {
                 let p = UserInPtr::<u64>::from(parms);
                 match p.read() {
+                    // `a64base < sv_maxuser`, or EINVAL: the base reaches
+                    // `wrmsr` on the way out, in ring 0, and a non-canonical
+                    // one is a #GP there (`user_base_settable`).
+                    Ok(base) if crate::misc::user_base_settable(base as usize).is_err() => {
+                        BsdRet::err(errno::lx_to_freebsd(LxError::EINVAL))
+                    }
                     Ok(base) => {
                         let _ = self.thread.with_context(|ctx| {
                             ctx.set_field(UserContextField::ThreadPointer, base as usize)

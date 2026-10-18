@@ -13,7 +13,7 @@ use linux_object::fs::{
     vfs::{FileSystem, INode},
     INodeExt,
 };
-use linux_object::thread::{CurrentThreadExt, ThreadExt};
+use linux_object::thread::{CurrentThreadExt, LinuxThread, ThreadExt};
 // `Abi` is only consumed by the x86_64-gated FreeBSD-personality paths; the
 // unconditional import broke riscv64/aarch64 builds (`deny(warnings)`).
 #[cfg(target_arch = "x86_64")]
@@ -1011,16 +1011,18 @@ fn handle_signal(
     let siginfo_ptr = sp;
     sp = push_stack(sp & !0xF, signal_context);
     let uctx_ptr = sp;
-    // backup current context
-    thread.backup_context(*ctx, siginfo_ptr, uctx_ptr);
-    // set user return address as `action.restorer`
-    cfg_if! {
-        if #[cfg(target_arch = "x86_64")] {
-            sp = push_stack::<usize>(sp & !0xF, action.restorer);
-        } else {
-            ctx.set_ra(action.restorer);
-        }
+    // The return address is `action.restorer`, libc's trampoline into
+    // `sigreturn`: on the stack on x86_64, in a register elsewhere.
+    #[cfg(target_arch = "x86_64")]
+    {
+        sp = push_stack::<usize>(sp & !0xF, action.restorer);
     }
+    // Save the interrupted context under the stack pointer its `sigreturn`
+    // will be made with, which is how that `sigreturn` finds it again when
+    // other handlers have been entered (and perhaps never left) since.
+    thread.backup_context(*ctx, siginfo_ptr, uctx_ptr, sigreturn_sp(sp));
+    #[cfg(not(target_arch = "x86_64"))]
+    ctx.set_ra(action.restorer);
     // set trapframe
     ctx.setup_uspace(
         action.handler,
@@ -1123,16 +1125,16 @@ fn dump_user_fault_context(
 ///
 /// A faulting instruction is re-executed when the thread returns to user mode.
 /// If the fault signal is merely queued but cannot actually be delivered — it is
-/// blocked by the signal mask, already pending (we are re-faulting on the same
-/// instruction), or a handler is already mid-flight — the thread loops on the
-/// same fault forever and starves every CPU (observed as a 0x9b SIGSEGV storm,
-/// ~71k faults, that hung the whole system under network load and stalled
-/// downloads like `apk update`).
+/// blocked by the signal mask or already pending (we are re-faulting on the
+/// same instruction) — the thread loops on the same fault forever and starves
+/// every CPU (observed as a 0x9b SIGSEGV storm, ~71k faults, that hung the
+/// whole system under network load and stalled downloads like `apk update`).
 ///
 /// Mirror Linux `force_sig`: in any of those un-deliverable cases, or when the
-/// disposition is the default/ignore action, terminate the process. Only a
-/// not-yet-faulted custom handler gets to run, exactly once — a fault inside it
-/// sets `handling_signal`, so the next fault terminates instead of looping.
+/// disposition is the default/ignore action, terminate the process. A custom
+/// handler gets to run, and a fault inside it finds its own signal blocked
+/// (`handler_mask`), so the next fault terminates instead of looping; see
+/// [`fault_signal_kills`].
 /// The exit code of a process a fault kills: a death by `signal`, which
 /// `wait` reports as `WIFSIGNALED`. `128 + signo` here was a shell's number,
 /// not a status word: `bash` printed nothing for a segfault and `system()`
@@ -1153,17 +1155,30 @@ fn page_fault_info(vaddr: usize, err: ZxError) -> SigInfo {
     SigInfo::fault(Signal::SIGSEGV, code, vaddr)
 }
 
+/// Whether the fault `signal` kills instead of reaching a handler:
+/// `force_sig_info_to_task()`'s test, blocked or ignored, plus the default
+/// action, which for these signals is death, and a copy already pending.
+///
+/// Being inside some handler is not on the list. It was, and that killed a
+/// process for any fault taken after a handler it had left with
+/// `siglongjmp` -- the frame is never returned from, so `handling_signal`
+/// stayed set for good: Ruby recovering from a stack overflow, anything that
+/// probes memory with a SIGSEGV handler, every timeout made of SIGALRM and a
+/// jump. And a fault inside a handler for another signal is delivered by
+/// Linux, nested. The loop the gate stood against cannot happen without it:
+/// a handler's own signal is blocked while it runs (`handler_mask`), so a
+/// SIGSEGV handler that faults again is caught by the mask.
+fn fault_signal_kills(linux: &LinuxThread, signal: Signal, handler: usize) -> bool {
+    linux.signal_mask().contains(signal)
+        || linux.signals.contains(signal)
+        || handler == SIG_DFL
+        || handler == SIG_IGN
+}
+
 fn force_fault_signal(thread: &CurrentThread, signal: Signal, info: SigInfo) {
     let action = thread.proc().linux().signal_action(signal);
     let inner = thread.inner();
-    let undeliverable = {
-        let linux = inner.lock_linux();
-        linux.signal_mask().contains(signal)
-            || linux.handling_signal.is_some()
-            || linux.signals.contains(signal)
-            || action.handler == SIG_DFL
-            || action.handler == SIG_IGN
-    };
+    let undeliverable = fault_signal_kills(&inner.lock_linux(), signal, action.handler);
     if undeliverable {
         // error!, not warn!, and for the same reason the sibling path above
         // spells out: this is a process DYING, and at `LOG=error` — what a
@@ -1193,6 +1208,18 @@ fn force_fault_signal(thread: &CurrentThread, signal: Signal, info: SigInfo) {
         unblock.insert(signal);
         linux.unblock_signals(&unblock);
         linux.queue_signal(signal, Some(info));
+    }
+}
+
+/// The stack pointer a handler entered with `handler_sp` makes its
+/// `sigreturn` with. On x86_64 the handler's `ret` has popped the restorer's
+/// address by then; elsewhere the return address was in a register and the
+/// stack is as the handler found it.
+fn sigreturn_sp(handler_sp: usize) -> usize {
+    if cfg!(target_arch = "x86_64") {
+        handler_sp + core::mem::size_of::<usize>()
+    } else {
+        handler_sp
     }
 }
 
@@ -1546,6 +1573,58 @@ mod fault_signal_tests {
             page_fault_info(0x1234_5000, ZxError::ACCESS_DENIED).code,
             SignalCode::SEGV_ACCERR
         );
+    }
+
+    /// Where a SIGSEGV handler is installed: any address but the two
+    /// dispositions.
+    const HANDLER: usize = 0x40_1000;
+
+    #[test]
+    fn a_fault_after_leaving_a_handler_with_siglongjmp_reaches_its_handler() {
+        // The SIGALRM handler jumped out instead of returning, so nothing ever
+        // cleared the in-handler mark, and SIGALRM is unblocked again because
+        // `siglongjmp` put the mask back. The probe that faults next is owed
+        // its SIGSEGV handler, not a death.
+        let mut t = LinuxThread::initial();
+        t.handling_signal = Some(Signal::SIGALRM as u32);
+        assert!(!fault_signal_kills(&t, Signal::SIGSEGV, HANDLER));
+    }
+
+    #[test]
+    fn a_fault_the_process_cannot_take_kills_it() {
+        let t = LinuxThread::initial();
+        assert!(fault_signal_kills(&t, Signal::SIGSEGV, SIG_DFL));
+        assert!(fault_signal_kills(&t, Signal::SIGSEGV, SIG_IGN));
+
+        let mut blocked = LinuxThread::initial();
+        let mut segv = Sigset::empty();
+        segv.insert(Signal::SIGSEGV);
+        blocked.block_signals(&segv);
+        assert!(
+            fault_signal_kills(&blocked, Signal::SIGSEGV, HANDLER),
+            "a fault inside the SIGSEGV handler itself, which blocks its own signal"
+        );
+        assert!(
+            !fault_signal_kills(&blocked, Signal::SIGBUS, HANDLER),
+            "another signal's mask decides nothing for this one"
+        );
+
+        let mut pending = LinuxThread::initial();
+        pending.queue_signal(Signal::SIGSEGV, None);
+        assert!(fault_signal_kills(&pending, Signal::SIGSEGV, HANDLER));
+    }
+
+    #[test]
+    fn the_sigreturn_stack_pointer_is_past_the_return_address_on_x86_64() {
+        // The handler starts with the restorer's address at its stack
+        // pointer, and its `ret` pops it on the way into `sigreturn`.
+        let handler_sp = 0x7fff_f000 - 8;
+        let expected = if cfg!(target_arch = "x86_64") {
+            0x7fff_f000
+        } else {
+            handler_sp
+        };
+        assert_eq!(sigreturn_sp(handler_sp), expected);
     }
 }
 

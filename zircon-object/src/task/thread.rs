@@ -2,6 +2,7 @@ mod published_state;
 /// That the word the return path reads is never wrong; see the module notes.
 #[cfg(test)]
 mod published_state_tests;
+mod signal_frames;
 mod thread_state;
 
 /// Lo que un hilo de calculo paga en cada tick; ver las notas del modulo.
@@ -29,6 +30,7 @@ use futures::{channel::oneshot::*, future::FutureExt, pin_mut, select_biased};
 use kernel_hal::context::UserContext;
 use kernel_hal::sync::Mutex;
 
+use self::signal_frames::SignalFrames;
 use self::thread_state::ContextAccessState;
 use super::process::{ext_drift, ExtDrift, EXT_CANARY};
 use super::{exception::*, Process, Task};
@@ -612,11 +614,9 @@ struct ThreadInner {
     /// It will be taken away when running this thread.
     context: Option<Box<UserContext>>,
 
-    /// Thread context before handling the signal,
-    /// (trapframe, siginfo_address, user_signal_ctx_address)
-    ///
-    /// It only works when executing signal handlers
-    context_before: Option<(UserContext, usize, usize)>,
+    /// The contexts saved before running each signal handler the thread is
+    /// inside, innermost last. See [`SignalFrames`].
+    signal_frames: SignalFrames,
 
     /// The number of existing `SuspendToken`.
     suspend_count: usize,
@@ -675,11 +675,6 @@ impl ThreadInner {
                 Signal::THREAD_RUNNING,
             ),
         }
-    }
-
-    /// Backup current context
-    fn backup_context(&mut self, context: UserContext, siginfo: usize, uctx: usize) {
-        self.context_before = Some((context, siginfo, uctx));
     }
 }
 
@@ -841,16 +836,38 @@ impl Thread {
         }
     }
 
-    /// Backup current user context before calling signal handler
-    pub fn backup_context(&self, context: UserContext, siginfo: usize, uctx: usize) {
+    /// Save the user context a signal handler interrupts, with the user
+    /// addresses of the frame's `siginfo_t` and `ucontext_t` and the stack
+    /// pointer the handler's `sigreturn` will be made with.
+    pub fn backup_context(
+        &self,
+        context: UserContext,
+        siginfo: usize,
+        uctx: usize,
+        return_sp: usize,
+    ) {
         let mut inner = self.lock_inner();
-        inner.backup_context(context, siginfo, uctx);
+        inner.signal_frames.push(context, siginfo, uctx, return_sp);
     }
 
-    /// Fetch the context backup
-    pub fn fetch_backup_context(&self) -> Option<(UserContext, usize, usize)> {
+    /// The context saved for the handler whose `sigreturn` is made with stack
+    /// pointer `sp`. See [`SignalFrames::take`].
+    pub fn fetch_backup_context(&self, sp: usize) -> Option<(UserContext, usize, usize)> {
         let mut inner = self.lock_inner();
-        inner.context_before.take()
+        inner.signal_frames.take(sp)
+    }
+
+    /// Give this thread the saved contexts of `parent`: a `fork` copies the
+    /// address space with the signal frames in it, so a child forked from
+    /// inside a handler returns from that handler as its parent would.
+    pub fn inherit_backup_contexts(&self, parent: &Thread) {
+        let frames = parent.lock_inner().signal_frames.clone();
+        self.lock_inner().signal_frames = frames;
+    }
+
+    /// Forget every saved context: `execve` replaced the image they belong to.
+    pub fn forget_backup_contexts(&self) {
+        self.lock_inner().signal_frames.clear();
     }
 
     /// Start execution on the thread.
