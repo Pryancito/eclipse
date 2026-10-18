@@ -160,6 +160,22 @@ impl DrmDev {
         Arc::as_ptr(&self.file) as usize
     }
 
+    /// `drm_ioctl_permit` for the hollowed legacy ioctls, in its order:
+    /// `DRM_ROOT_ONLY` wants `capable(CAP_SYS_ADMIN)` (EACCES), `DRM_AUTH`
+    /// wants an authenticated open or a render client (EACCES). `DRM_MASTER`
+    /// is not enforced on any ioctl here, and a render client's own
+    /// refusal (`!DRM_RENDER_ALLOW`) is observed, not enforced, at the top
+    /// of the dispatch.
+    fn legacy_permit(&self, root_only: bool) -> Result<()> {
+        if root_only && !drm::current_is_root() {
+            return Err(FsError::NoPermission);
+        }
+        if self.minor < 128 && !drm::is_authenticated(self.minor, self.file_owner()) {
+            return Err(FsError::NoPermission);
+        }
+        Ok(())
+    }
+
     /// `drm_mode_obj_set_property_ioctl`, which `SETPROPERTY` also goes
     /// through: the object, of the type the caller named (ENOENT); a
     /// property that object carries (EINVAL, and an encoder carries none);
@@ -1124,24 +1140,6 @@ impl DrmDev {
                 unsafe { *(data as *mut u32) = self.file.magic() };
                 Ok(0)
             }
-            DRM_IOCTL_GET_CLIENT => {
-                // `struct drm_client`: libva enumerates clients at init.
-                // Single-client stub: idx 0 is this open; anything else ENOENT.
-                // Linux's `drm_getclient` always reports `magic = 0` ("do not
-                // return authenticating magic index"). Returning 1 made a
-                // client AUTH_MAGIC a number nobody had minted — or, worse,
-                // spend the first real GET_MAGIC on this boot.
-                let c = unsafe { &mut *(data as *mut DrmClient) };
-                if c.idx != 0 {
-                    return Err(FsError::EntryNotFound);
-                }
-                c.auth = 1;
-                c.pid = drm::current_pid() as usize;
-                c.uid = 0;
-                c.magic = 0;
-                c.iocs = 0;
-                Ok(0)
-            }
             DRM_IOCTL_AUTH_MAGIC => {
                 // `DRM_MASTER` ioctl: only the master authenticates
                 // (EACCES), and only a magic a file of this device holds
@@ -1164,6 +1162,56 @@ impl DrmDev {
                     }
                     Err(FsError::InvalidParam)
                 }
+            }
+            DRM_IOCTL_GET_CLIENT => {
+                // `drm_getclient`, hollowed out: only `idx == 0` answers,
+                // and what it answers is this open's `authenticated` (which
+                // is what libva's `va_drm_is_authenticated` walks the list
+                // for), the caller's pid, `overflowuid`, and a zero magic
+                // and iocs. Any other idx is EINVAL, which is what stops
+                // an enumerator. This and the rest of the hollowed core
+                // ioctls were unknown numbers (ENOSYS).
+                let c = unsafe { &mut *(data as *mut DrmClient) };
+                if c.idx != 0 {
+                    return Err(FsError::InvalidParam);
+                }
+                c.auth = drm::is_authenticated(self.minor, self.file_owner()) as i32;
+                c.pid = drm::current_pid();
+                c.uid = OVERFLOW_UID;
+                c.magic = 0;
+                c.iocs = 0;
+                Ok(0)
+            }
+            DRM_IOCTL_GET_STATS => {
+                // `drm_getstats`: zeroes the struct "to prevent userspace
+                // from eating its stack garbage", nothing else.
+                unsafe { core::ptr::write_bytes(data as *mut u8, 0, DRM_STATS_SIZE) };
+                Ok(0)
+            }
+            DRM_IOCTL_FINISH => {
+                // `drm_noop` under `DRM_AUTH`.
+                self.legacy_permit(false)?;
+                Ok(0)
+            }
+            DRM_IOCTL_SET_UNIQUE => {
+                // `drm_invalid_op` under `DRM_AUTH | DRM_MASTER |
+                // DRM_ROOT_ONLY`: EACCES first, EINVAL for whoever passes.
+                self.legacy_permit(true)?;
+                Err(FsError::InvalidParam)
+            }
+            DRM_IOCTL_BLOCK
+            | DRM_IOCTL_UNBLOCK
+            | DRM_IOCTL_ADD_DRAW
+            | DRM_IOCTL_RM_DRAW
+            | DRM_IOCTL_UPDATE_DRAW => {
+                // `drm_noop` under `DRM_AUTH | DRM_MASTER | DRM_ROOT_ONLY`.
+                self.legacy_permit(true)?;
+                Ok(0)
+            }
+            DRM_IOCTL_MODE_ATTACHMODE | DRM_IOCTL_MODE_DETACHMODE => {
+                // `drm_noop` under `DRM_MASTER`, which the modeset ioctls
+                // do not enforce here (README-drm, "Leases").
+                Ok(0)
             }
             DRM_IOCTL_SET_MASTER => {
                 // `drm_setmaster_ioctl`: the master again is a no-op, another
@@ -3584,50 +3632,9 @@ fn next_poll_wake(now: Duration, deadline: Duration, tick: Duration) -> Option<D
     }
 }
 
-/// Accounts one pre-wait to [`zcore_drivers::scheme::prewait`], however the
-/// wait ends.
-///
-/// The five pre-waits park a thread BEFORE the driver is ever called, so none
-/// of that time appears in the driver's per-ioctl profile -- which starts
-/// timing at the dispatch, when the parking is already over. A frame that
-/// spends most of itself parked therefore reads, in `/proc/gpudbg`, as a
-/// table of small numbers and no account of where the frame went. This is
-/// what closes that gap on the machine that has the GPU.
-///
-/// It accounts on DROP because these functions return from several places --
-/// the request does not read, the condition is already met, the deadline
-/// passed -- and a `record` at each of them is a record missed the next time
-/// a return is added.
-struct PreWaitAccount {
-    kind: zcore_drivers::scheme::prewait::Kind,
-    start: Duration,
-    /// Times the loop woke, looked, and went back to sleep. Also what tells a
-    /// wait that parked from one that was satisfied on its first look, since
-    /// a coarse clock can read zero microseconds for a real park.
-    probes: u32,
-    timed_out: bool,
-}
-
-impl PreWaitAccount {
-    fn new(kind: zcore_drivers::scheme::prewait::Kind) -> Self {
-        Self {
-            kind,
-            start: kernel_hal::timer::timer_now(),
-            probes: 0,
-            timed_out: false,
-        }
-    }
-
-    /// One more turn of the poll loop.
-    fn probe(&mut self) {
-        self.probes = self.probes.saturating_add(1);
-    }
-
-    /// This wait is ending on its deadline, not on the thing it waited for.
-    fn timed_out(&mut self) {
-        self.timed_out = true;
-    }
-}
+mod pre_wait_account;
+use pre_wait_account::PreWaitAccount;
+use present_failed::{present_failed, PRESENT_FAIL_TRACED};
 
 /// The parked microseconds a pre-wait reports, from how long it was alive and
 /// how many times it looked.
@@ -3643,27 +3650,6 @@ fn pre_wait_parked_us(elapsed_us: u64, probes: u32) -> u64 {
         0
     } else {
         elapsed_us
-    }
-}
-
-impl Drop for PreWaitAccount {
-    fn drop(&mut self) {
-        // `as_micros` is a u128 and a plain `as u64` wraps. It takes a
-        // clock 584 000 years old to overflow honestly, but a timer that
-        // jumps does it in one read, and the counter is a sum: one wrapped
-        // value poisons the column for the rest of the boot.
-        let elapsed_us = core::convert::TryFrom::try_from(
-            kernel_hal::timer::timer_now()
-                .saturating_sub(self.start)
-                .as_micros(),
-        )
-        .unwrap_or(u64::MAX);
-        zcore_drivers::scheme::prewait::record(
-            self.kind,
-            pre_wait_parked_us(elapsed_us, self.probes),
-            self.probes,
-            self.timed_out,
-        );
     }
 }
 
@@ -3753,97 +3739,7 @@ pub const ATOMIC_IOCTL: u32 = DRM_IOCTL_MODE_ATOMIC;
 /// its modeset at ~8 Hz for minutes, and a console flood on a slow serial line
 /// has wedged spinlocks here before (see the EXEC dedup in `nouveau_uapi.rs`).
 const PRESENT_FAIL_TRACE_BUDGET: u32 = 8;
-static PRESENT_FAIL_TRACED: AtomicU32 = AtomicU32::new(0);
-
-/// Decide what a failed present means for the ioctl that asked for it, and say
-/// so on the console.
-///
-/// A modeset is a *configuration* operation: `drm_mode_setcrtc` binds a fb to a
-/// CRTC and programs a mode, and Linux fails it for a bad argument, never
-/// because a frame could not be copied. Answering `EIO` because the blit did
-/// not happen conflated the two, and wlroots' legacy backend reads that as the
-/// output being broken — it retries the whole modeset next frame, forever,
-/// never advancing to page-flips. The compositor log fills with
-///
-/// ```text
-/// [backend/drm/legacy.c:123] connector HDMI-A-1: Failed to set CRTC: I/O error
-/// ```
-///
-/// at frame rate while the kernel says nothing, because every reason inside the
-/// present path is a `warn!` and the rig boots at `LOG=error`. A single
-/// unpresentable frame took down the whole desktop.
-///
-/// So: a bad fb id keeps failing the ioctl, with the `ENOENT` Linux uses for it
-/// ("Unknown FB ID") rather than `EIO` — that one is a real client error, and
-/// the errno points at fb lifetime instead of at the bus. Everything else is
-/// reported and swallowed: the CRTC takes the binding it was asked for, the
-/// compositor keeps running, and the next present gets another chance. That is
-/// the same call `DIRTYFB` already makes a few arms down, for the same reason.
-fn present_failed(
-    op: &str,
-    fb_id: u32,
-    crtc_id: u32,
-    err: drm::PresentError,
-) -> core::result::Result<(), FsError> {
-    let n = PRESENT_FAIL_TRACED.fetch_add(1, Ordering::Relaxed);
-    if n < PRESENT_FAIL_TRACE_BUDGET {
-        // error!, not warn!: the rig boots at LOG=error, and this line is the
-        // one that says why the screen is black. The reasons underneath are
-        // warn!/klog and were invisible there.
-        //
-        // For a missing fb, say whether the id was one WE took away. A
-        // nouveau-backed fb dies with its GEM handle (Linux's never does,
-        // because there the fb holds its own reference), so "the client is
-        // presenting an id it never had" and "the client is presenting the id
-        // we pulled out from under it" both arrive here looking identical --
-        // and they have opposite fixes.
-        let taken_by = match err {
-            drm::PresentError::NoSuchFb => drm::fb_retired_reason(fb_id),
-            _ => None,
-        };
-        log::error!(
-            "[drm] {} fb={} crtc={} did not present: {}{}{}{}",
-            op,
-            fb_id,
-            crtc_id,
-            err.as_str(),
-            match taken_by {
-                Some(why) => alloc::format!(" (this fb was retired by {})", why.as_str()),
-                None => alloc::string::String::new(),
-            },
-            match err {
-                drm::PresentError::NoSuchFb => " -> ENOENT to caller",
-                _ => " -> reported OK to caller (the modeset stands; only this frame is lost)",
-            },
-            if n + 1 == PRESENT_FAIL_TRACE_BUDGET {
-                " [further present failures not traced]"
-            } else {
-                ""
-            },
-        );
-    }
-    match err {
-        drm::PresentError::NoSuchFb => Err(FsError::EntryNotFound),
-        // EINVAL, as `drm_mode_setcrtc` answers for a framebuffer no plane
-        // can scan out ("Invalid pixel format" / failed atomic check). The
-        // CRTC is deliberately NOT bound to it: unlike the two below, this
-        // framebuffer will never become presentable, so leaving `crtc_fb`
-        // naming it would make every later repaint try it again.
-        drm::PresentError::UnsupportedLayout => Err(FsError::InvalidParam),
-        drm::PresentError::NoDisplay | drm::PresentError::NoBacking => {
-            // We are about to answer 0, so the CRTC really is configured with
-            // this fb and `GETCRTC` has to say so. `present_now_checked` binds
-            // it on every path that succeeds and returns before binding on the
-            // ones that do not, which would otherwise leave the readback
-            // naming the previous frame's fb. Safe for both reasons that get
-            // here: every consumer of `crtc_fb` -- `repaint_for_cursor` and
-            // the next present -- re-checks the display and the fb's backing
-            // before it touches a pixel.
-            drm::set_crtc_fb(crtc_id, fb_id);
-            Ok(())
-        }
-    }
-}
+mod present_failed;
 
 /// True for any of the four `SYNCOBJ_WAIT` / `TIMELINE_WAIT` ioctl numbers
 /// (classic + deadline-sized). Used by `sys_ioctl` to run
@@ -3888,18 +3784,35 @@ fn is_syncobj_timeline_wait(cmd: u32) -> bool {
 // DRM IOCTL numbers (Linux x86_64)
 const DRM_IOCTL_VERSION: u32 = 0xC0406400;
 const DRM_IOCTL_GET_UNIQUE: u32 = 0xC0106401;
-const DRM_IOCTL_GET_MAGIC: u32 = 0xC0046402;
+const DRM_IOCTL_GET_MAGIC: u32 = 0x80046402;
 const DRM_IOCTL_AUTH_MAGIC: u32 = 0x40046411;
+// The core ioctls Linux keeps hollowed out for old tools (`drm_ioctl.c`):
+// `GET_CLIENT` and `GET_STATS` answer a fixed shape, `SET_UNIQUE` is
+// `drm_invalid_op`, the rest are `drm_noop` behind their permit flags.
+const DRM_IOCTL_GET_CLIENT: u32 = 0xC0286405;
+const DRM_IOCTL_GET_STATS: u32 = 0x80F86406;
+const DRM_IOCTL_SET_UNIQUE: u32 = 0x40106410;
+const DRM_IOCTL_BLOCK: u32 = 0xC0046412;
+const DRM_IOCTL_UNBLOCK: u32 = 0xC0046413;
+const DRM_IOCTL_ADD_DRAW: u32 = 0xC0046427;
+const DRM_IOCTL_RM_DRAW: u32 = 0xC0046428;
+const DRM_IOCTL_FINISH: u32 = 0x4008642C;
+const DRM_IOCTL_UPDATE_DRAW: u32 = 0x4018643F;
+/// `sizeof(struct drm_stats)` on a 64-bit kernel: what `GET_STATS` zeroes.
+const DRM_STATS_SIZE: usize = 248;
+/// `overflowuid`: the uid `drm_getclient` reports for every client.
+const OVERFLOW_UID: u64 = 65534;
 const DRM_IOCTL_GET_CAP: u32 = 0xC010640C;
 const DRM_IOCTL_SET_CLIENT_CAP: u32 = 0x4010640D;
 const DRM_IOCTL_GEM_CLOSE: u32 = 0x40086409;
-/// `struct drm_client` is 40 bytes on LP64 (`_IOWR('d', 0x0A, …)`).
-const DRM_IOCTL_GET_CLIENT: u32 = 0xC028640A;
 const DRM_IOCTL_SET_MASTER: u32 = 0x0000641E;
 const DRM_IOCTL_DROP_MASTER: u32 = 0x0000641F;
 
 const DRM_IOCTL_MODE_GETRESOURCES: u32 = 0xC04064A0;
 const DRM_IOCTL_MODE_GETCRTC: u32 = 0xC06864A1;
+/// `drm_noop` under `DRM_MASTER` (`struct drm_mode_mode_cmd`, 72 bytes).
+const DRM_IOCTL_MODE_ATTACHMODE: u32 = 0xC04864A8;
+const DRM_IOCTL_MODE_DETACHMODE: u32 = 0xC04864A9;
 const DRM_IOCTL_MODE_SETCRTC: u32 = 0xC06864A2;
 const DRM_IOCTL_MODE_GETENCODER: u32 = 0xC01464A6;
 const DRM_IOCTL_MODE_GETCONNECTOR: u32 = 0xC05064A7;
@@ -4636,6 +4549,19 @@ struct DrmUnique {
     unique: *mut u8,
 }
 
+/// `struct drm_client` (`DRM_IOCTL_GET_CLIENT`): `int idx; int auth;` and
+/// four `unsigned long`s.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+struct DrmClient {
+    idx: i32,
+    auth: i32,
+    pid: u64,
+    uid: u64,
+    magic: u64,
+    iocs: u64,
+}
+
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 struct DrmGetCap {
@@ -5219,18 +5145,6 @@ struct DrmModeCreateBlob {
     blob_id: u32,
 }
 
-/// `struct drm_client` (40 bytes on LP64).
-#[repr(C)]
-#[derive(Debug, Clone, Copy)]
-struct DrmClient {
-    idx: i32,
-    auth: i32,
-    pid: usize,
-    uid: usize,
-    magic: usize,
-    iocs: usize,
-}
-
 // Compile-time guards: each DRM ioctl number encodes `sizeof(struct)` in its
 // _IOC size field, so a wrong struct layout silently mismatches the ioctl and
 // the handler never fires. Assert the sizes that the constants above depend on.
@@ -5252,9 +5166,9 @@ const _: () = {
     assert!(size_of::<DrmModeFbDirtyCmd>() == 24); // DRM_IOCTL_MODE_DIRTYFB 0x..18..
     assert!(size_of::<DrmClipRect>() == 8); // drm_clip_rect, via DIRTYFB's clips_ptr
     assert!(size_of::<DrmSetVersion>() == 16); // DRM_IOCTL_SET_VERSION   0x..10..
+    assert!(size_of::<DrmClient>() == 40); // DRM_IOCTL_GET_CLIENT    0x..28..
     assert!(size_of::<DrmModeAtomic>() == 56); // DRM_IOCTL_MODE_ATOMIC   0x..38..
     assert!(size_of::<DrmModeCreateBlob>() == 16); // CREATEPROPBLOB      0x..10..
-    assert!(size_of::<DrmClient>() == 40); // DRM_IOCTL_GET_CLIENT     0x..28..
     assert!(size_of::<DrmSyncobjCreate>() == 8); // DRM_IOCTL_SYNCOBJ_CREATE   0x..08..
     assert!(size_of::<DrmSyncobjDestroy>() == 8); // DRM_IOCTL_SYNCOBJ_DESTROY  0x..08..
     assert!(size_of::<DrmSyncobjWait>() == 32); // DRM_IOCTL_SYNCOBJ_WAIT     0x..20..
@@ -6673,6 +6587,9 @@ mod addfb2_validation_tests;
 
 #[cfg(test)]
 mod lease_tests;
+
+#[cfg(test)]
+mod legacy_core_tests;
 
 #[cfg(test)]
 mod trail_tests;
