@@ -34,6 +34,7 @@
 #include "gpu/mem_mgr/mem_desc.h"
 #include "gpu/mem_mgr/rm_page_size.h"
 #include "nvport/nvport.h"
+#include "eclipse_rm_mem.h"
 
 /* Eclipse kernel-hal seams (kernel-hal/src/drivers.rs, all #[no_mangle]).
  * usize/PhysAddr/VirtAddr are all 64-bit on x86_64, matching NvU64. */
@@ -43,16 +44,11 @@ extern NvU64 drivers_phys_to_virt(NvU64 paddr);
 extern NvS32 drivers_dma_mark_uncached(NvU64 paddr, NvU64 pages);
 
 /*
- * memData handle: remembers the contiguous block behind a memdesc so
- * osFreePagesInternal can return it to the frame allocator and
- * osMapSystemMemory can recover its base directly (rather than re-deriving
- * it from a possibly IOMMU-translated PTE array).
+ * memData handle (EclipseSysmemAlloc, eclipse_rm_mem.h): remembers the
+ * contiguous block behind a memdesc so osFreePagesInternal can return it to
+ * the frame allocator and osMapSystemMemory can recover its base directly
+ * (rather than re-deriving it from a possibly IOMMU-translated PTE array).
  */
-typedef struct
-{
-    NvU64 physBase;   /* physical base of the contiguous block           */
-    NvU64 pageCount;  /* number of RM_PAGE_SIZE (4 KiB) pages allocated  */
-} EclipseSysmemAlloc;
 
 NV_STATUS osAllocPagesInternal(MEMORY_DESCRIPTOR *pMemDesc)
 {
@@ -109,6 +105,7 @@ NV_STATUS osAllocPagesInternal(MEMORY_DESCRIPTOR *pMemDesc)
     }
     pAlloc->physBase  = physBase;
     pAlloc->pageCount = pageCount;
+    pAlloc->cacheType = memdescGetCpuCacheAttrib(pMemDesc);
 
     memdescSetMemData(pMemDesc, pAlloc, NULL);
     return NV_OK;
@@ -152,16 +149,30 @@ NV_STATUS osMapSystemMemory(
         return NV_ERR_INVALID_ARGUMENT;
 
     /*
-     * Only kernel mappings are supported: every RM-internal sysmem
-     * allocation on the bring-up path maps with Kernel=NV_TRUE. A userspace
-     * mapping would need a client VMA Eclipse's RM has no consumer for yet.
+     * A user mapping exists only for a user-mode client's RM_MAP_MEMORY
+     * (eclipse_rm_frontend.c), and outside one this answers what it always
+     * did: every RM-internal allocation maps with Kernel=NV_TRUE.
      */
-    if (!Kernel)
+    if (!Kernel && !eclipse_rm_frontend_in_call())
         return NV_ERR_NOT_SUPPORTED;
 
     pAlloc = (EclipseSysmemAlloc *) memdescGetMemData(pRoot);
     if (pAlloc == NULL)
         return NV_ERR_INVALID_STATE;
+
+    /*
+     * nv_alloc_user_mapping (nv-usermap.c): the "address" handed to user
+     * space is the physical address of the byte asked for. It is not mapped
+     * by this; the client mmaps the file RM_MAP_MEMORY attached the mapping
+     * to, and RM_MAP_MEMORY finds the allocation again from this address
+     * (os_match_mmap_offset below).
+     */
+    if (!Kernel)
+    {
+        *ppAddress = (NvP64) (pAlloc->physBase + rootOffset + Offset);
+        *ppPrivate = NvP64_NULL;
+        return NV_OK;
+    }
 
     /* Eclipse maps all physical RAM in the kernel physmap, so a kernel VA is
      * just the physmap image of the block's physical base -- no per-mapping
@@ -191,4 +202,37 @@ void osUnmapSystemMemory(
     (void) Kernel;
     (void) pAddress;
     (void) pPrivate;
+}
+
+/*
+ * os_match_mmap_offset (os-usermap.c): which page of the allocation
+ * `pAllocPrivate` the page-aligned user address `offset` names, for
+ * RM_MAP_MEMORY to validate a system-memory mapping against the memory
+ * handle it was made for. The block is contiguous, so that is the page
+ * whose physical address it is.
+ */
+NV_STATUS os_match_mmap_offset(
+    void  *pAllocPrivate,
+    NvU64  offset,
+    NvU64 *pPageIndex
+)
+{
+    EclipseSysmemAlloc *pAlloc = (EclipseSysmemAlloc *) pAllocPrivate;
+    NvU64 index;
+
+    if ((pAlloc == NULL) || (pPageIndex == NULL))
+        return NV_ERR_OBJECT_NOT_FOUND;
+
+    /* Linux walks the page table for an exact match; on one contiguous
+     * block that is this arithmetic. */
+    if ((offset < pAlloc->physBase) ||
+        (((offset - pAlloc->physBase) % RM_PAGE_SIZE) != 0))
+        return NV_ERR_OBJECT_NOT_FOUND;
+
+    index = (offset - pAlloc->physBase) / RM_PAGE_SIZE;
+    if (index >= pAlloc->pageCount)
+        return NV_ERR_OBJECT_NOT_FOUND;
+
+    *pPageIndex = index;
+    return NV_OK;
 }

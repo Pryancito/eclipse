@@ -5,7 +5,8 @@
 //! REGISTER_FD names a fd, the RM asks whether the caller has a GPU's node
 //! open before it lets a client reach that GPU (`osIsGpuAccessible`), and an
 //! effective uid of 0 makes the caller `RS_PRIV_LEVEL_USER_ROOT`. Everything
-//! else is `linux_object::fs::devfs::nvidia`.
+//! else is `linux_object::fs::devfs::nvidia`, but for the one thing mmap
+//! needs to know here: whether the mapping is read-only.
 
 use super::*;
 use linux_object::fs::devfs::nvidia::{gpu_mask, NvCaller};
@@ -38,5 +39,18 @@ impl Syscall<'_> {
             open_of_fd: &open_of_fd,
         };
         Some(open.ioctl(request as u32, arg, &caller))
+    }
+
+    /// Whether `file_like` is an open of an NVIDIA node holding a mapping the
+    /// RM granted read-only, which mmap installs read-only whatever it was
+    /// asked for (see `NvidiaOpen::mmap_read_only`).
+    pub(crate) fn nvidia_mmap_read_only(file_like: &Arc<dyn FileLike>) -> bool {
+        let Some(file) = file_like.downcast_ref::<File>() else {
+            return false;
+        };
+        let inode = file.inode();
+        inode
+            .downcast_ref::<NvidiaOpen>()
+            .is_some_and(NvidiaOpen::mmap_read_only)
     }
 }

@@ -18,11 +18,18 @@
 //! Served here: CARD_INFO, CHECK_VERSION_STR, SYS_PARAMS, ATTACH_GPUS_TO_FD,
 //! WAIT_OPEN_COMPLETE, STATUS_CODE and REGISTER_FD. Served by the RM
 //! (`nvidia-rm-sys/vendor/eclipse_rm_frontend.c`): RM_ALLOC, RM_FREE,
-//! RM_CONTROL, RM_DUP_OBJECT and RM_SHARE. Everything else answers EINVAL
-//! and is logged the first time each escape is seen: RM_MAP_MEMORY and the
-//! `mmap` behind it, the OS events, RM_ALLOC_MEMORY, VID_HEAP_CONTROL, the
-//! NUMA and dma-buf escapes. `nvidia-smi` is what this much is for; CUDA
-//! needs those, and `/dev/nvidia-uvm` besides.
+//! RM_CONTROL, RM_DUP_OBJECT, RM_SHARE, RM_MAP_MEMORY and RM_UNMAP_MEMORY.
+//! Everything else answers EINVAL and is logged the first time each escape
+//! is seen: the OS events, RM_ALLOC_MEMORY, VID_HEAP_CONTROL, the NUMA and
+//! dma-buf escapes. `nvidia-smi` is what this much is for; CUDA needs those,
+//! and `/dev/nvidia-uvm` besides.
+//!
+//! A mapping is made in two steps, as on Linux. RM_MAP_MEMORY has the RM map
+//! the memory and records the result on the open the client names in the
+//! payload (`nv_add_mapping_context_to_file`); the client then mmaps that
+//! open at offset 0, and gets exactly what was recorded (`nvidia_mmap`). An
+//! open holds one mapping for as long as it lives, which is why libnvidia
+//! opens a fresh file for each.
 //!
 //! The ioctl arrives from `sys_ioctl` (linux-syscall), not from
 //! `INode::io_control`: it needs the caller's fd table (REGISTER_FD names a
@@ -41,10 +48,12 @@ use core::any::Any;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use kernel_hal::user::{UserInPtr, UserOutPtr};
+use kernel_hal::CachePolicy;
 use lock::Mutex;
 use rcore_fs::vfs::*;
 use rcore_fs_devfs::{DevFS, DevINode};
 use zcore_drivers::display::nvctl;
+use zircon_object::vm::{pages, VmObject, PAGE_SIZE};
 
 use crate::error::{LxError, LxResult};
 
@@ -62,6 +71,8 @@ pub mod esc {
     pub const RM_ALLOC: u32 = 0x2B;
     pub const RM_DUP_OBJECT: u32 = 0x34;
     pub const RM_SHARE: u32 = 0x35;
+    pub const RM_MAP_MEMORY: u32 = 0x4E;
+    pub const RM_UNMAP_MEMORY: u32 = 0x4F;
     pub const CARD_INFO: u32 = 200;
     pub const REGISTER_FD: u32 = 201;
     pub const STATUS_CODE: u32 = 209;
@@ -84,7 +95,11 @@ const SYS_PARAMS_SIZE: usize = 8;
 const REGISTER_FD_SIZE: usize = 4;
 const WAIT_OPEN_COMPLETE_SIZE: usize = 8;
 const STATUS_CODE_SIZE: usize = 12;
-const SIZES: [usize; 7] = [
+/// `nv_ioctl_nvos33_parameters_with_fd`, and where in it the client names the
+/// open to record the mapping on.
+const MAP_MEMORY_SIZE: usize = 56;
+const MAP_MEMORY_FD: usize = 48;
+const SIZES: [usize; 9] = [
     XFER_SIZE,
     CARD_INFO_SIZE,
     RM_API_VERSION_SIZE,
@@ -92,9 +107,12 @@ const SIZES: [usize; 7] = [
     REGISTER_FD_SIZE,
     WAIT_OPEN_COMPLETE_SIZE,
     STATUS_CODE_SIZE,
+    MAP_MEMORY_SIZE,
+    MAP_MEMORY_FD,
 ];
 
 const NV_OK: u32 = 0;
+const NV_ERR_INVALID_ARGUMENT: u32 = 0x1F;
 const NV_ERR_NOT_READY: u32 = 0x55;
 const NV_ERR_NOT_SUPPORTED: u32 = 0x56;
 const PCI_VENDOR_NVIDIA: u16 = 0x10de;
@@ -260,6 +278,9 @@ struct OpenState {
     /// REGISTER_FD's control open (`nvfp->ctl_nvfp`), held for as long as
     /// this open lives, as Linux holds `ctl_nvfp_priv`.
     ctl: Option<Arc<dyn INode>>,
+    /// The mapping an RM_MAP_MEMORY recorded on this open
+    /// (`nvlfp->mmap_context`), at most one, for as long as it lives.
+    mapping: Option<nvctl::MmapContext>,
 }
 
 impl NvidiaOpen {
@@ -373,31 +394,84 @@ impl NvidiaOpen {
                 }
                 self.register_fd(u32_at(payload, 0) as i32, caller)
             }
-            esc::RM_ALLOC | esc::RM_FREE | esc::RM_CONTROL | esc::RM_DUP_OBJECT | esc::RM_SHARE => {
+            esc::RM_ALLOC
+            | esc::RM_FREE
+            | esc::RM_CONTROL
+            | esc::RM_DUP_OBJECT
+            | esc::RM_SHARE
+            | esc::RM_UNMAP_MEMORY => {
                 if !nvctl::rm_up() {
                     no_rm_yet();
                     return Err(LxError::EINVAL);
                 }
-                let rm_caller = nvctl::Caller {
-                    os_info: self.os_info(),
-                    ctl: self.is_ctl(),
-                    admin: caller.admin,
-                    gpu_mask: (caller.gpu_mask)(),
-                };
-                match nvctl::rm_escape(nr, payload, &rm_caller) {
-                    NV_OK => Ok(()),
-                    NV_ERR_NOT_SUPPORTED => {
-                        not_served(nr);
-                        Err(LxError::EINVAL)
-                    }
-                    _ => Err(LxError::EINVAL),
-                }
+                escape_result(nr, nvctl::rm_escape(nr, payload, &self.rm_caller(caller)))
             }
+            esc::RM_MAP_MEMORY => self.map_memory(payload, caller),
             _ => {
                 not_served(nr);
                 Err(LxError::EINVAL)
             }
         }
+    }
+
+    /// Who the RM is told is calling.
+    fn rm_caller(&self, caller: &NvCaller) -> nvctl::Caller {
+        nvctl::Caller {
+            os_info: self.os_info(),
+            ctl: self.is_ctl(),
+            admin: caller.admin,
+            gpu_mask: (caller.gpu_mask)(),
+        }
+    }
+
+    /// NV_ESC_RM_MAP_MEMORY: the RM maps, and the mapping is recorded on the
+    /// open behind the payload's `fd`, or unmapped again with the reason as
+    /// the call's status. That open is looked up before the RM is entered,
+    /// so nothing of the fd table is ever taken under the RM gate.
+    fn map_memory(&self, payload: &mut [u8], caller: &NvCaller) -> LxResult<()> {
+        if !nvctl::rm_up() {
+            no_rm_yet();
+            return Err(LxError::EINVAL);
+        }
+        let target = if payload.len() == MAP_MEMORY_SIZE {
+            (caller.open_of_fd)(u32_at(payload, MAP_MEMORY_FD) as i32)
+        } else {
+            None
+        };
+        let rm_caller = self.rm_caller(caller);
+        let (status, mapping) = nvctl::rm_map_memory(payload, &rm_caller);
+        if let Some(mapping) = mapping {
+            let cards = nvctl::cards();
+            let instance_of = |minor: u32| cards.get(minor as usize).and_then(|c| c.instance);
+            if let Err(why) = record_mapping(target.as_deref(), mapping, &instance_of) {
+                nvctl::map_unrecorded(payload, &rm_caller, why);
+            }
+        }
+        escape_result(esc::RM_MAP_MEMORY, status)
+    }
+
+    /// `nvidia_mmap`: the mapping RM_MAP_MEMORY recorded on this open, as one
+    /// physical VMO of exactly the length asked for. An open with none was
+    /// never validated by the RM, and maps nothing.
+    pub fn get_vmo(&self, offset: usize, len: usize) -> LxResult<Arc<VmObject>> {
+        let Some(mapping) = self.state.lock().mapping else {
+            invalid_mmap();
+            return Err(LxError::EINVAL);
+        };
+        let (start, pages, policy) = mmap_window(&mapping, offset, len)?;
+        let vmo = VmObject::new_physical(start, pages);
+        // A VMO nobody has mapped yet always takes a policy; Linux answers a
+        // caching it cannot encode with ENXIO.
+        vmo.set_cache_policy(policy).map_err(|_| LxError::ENXIO)?;
+        Ok(vmo)
+    }
+
+    /// Whether the mapping recorded on this open is one the RM granted
+    /// read-only, which `nvidia_mmap` installs read-only however it was asked
+    /// for, and with no way back to writable (`VM_WRITE` and `VM_MAYWRITE`
+    /// cleared).
+    pub fn mmap_read_only(&self) -> bool {
+        self.state.lock().mapping.is_some_and(|m| !m.writable)
     }
 
     /// NV_ESC_ATTACH_GPUS_TO_FD: the GPUs this control open keeps attached.
@@ -479,6 +553,89 @@ impl INode for NvidiaOpen {
 
     fn as_any_ref(&self) -> &dyn Any {
         self
+    }
+}
+
+/// `rm_ioctl`'s answer for an RM escape: any status but NV_OK is EINVAL, as
+/// `nvidia_ioctl` maps it, and one the RM does not serve is logged.
+fn escape_result(nr: u32, status: u32) -> LxResult<()> {
+    match status {
+        NV_OK => Ok(()),
+        NV_ERR_NOT_SUPPORTED => {
+            not_served(nr);
+            Err(LxError::EINVAL)
+        }
+        _ => Err(LxError::EINVAL),
+    }
+}
+
+/// `nv_add_mapping_context_to_file`: `mapping` recorded on `target`, the
+/// open behind the fd RM_MAP_MEMORY named. It must be an NVIDIA open of the
+/// node the mapping is for -- `/dev/nvidiactl` for system memory
+/// (`nv_get_file_private` with `ctl`), the GPU's own `/dev/nvidia<N>` for an
+/// aperture (`NV_STATE_PTR(nvlfp->nvptr) != nv`) -- and hold no mapping
+/// yet. `instance_of` is the RM instance of the GPU behind a minor.
+fn record_mapping(
+    target: Option<&dyn INode>,
+    mapping: nvctl::MmapContext,
+    instance_of: &dyn Fn(u32) -> Option<u32>,
+) -> core::result::Result<(), u32> {
+    let open = target
+        .and_then(|t| t.downcast_ref::<NvidiaOpen>())
+        .ok_or(NV_ERR_INVALID_ARGUMENT)?;
+    let right_node = match open.node {
+        Node::Ctl => mapping.on_ctl(),
+        Node::Gpu(minor) => !mapping.on_ctl() && instance_of(minor) == Some(mapping.gpu_instance),
+    };
+    if !right_node {
+        return Err(NV_ERR_INVALID_ARGUMENT);
+    }
+    let mut state = open.state.lock();
+    if state.mapping.is_some() {
+        return Err(nvctl::NV_ERR_STATE_IN_USE);
+    }
+    state.mapping = Some(mapping);
+    Ok(())
+}
+
+/// `nvidia_mmap_helper`'s checks, and what they leave to map: the physical
+/// start, the pages and the caching. Only offset 0 maps (`vm_pgoff != 0` is
+/// EINVAL). An aperture maps its exact window and nothing else (ENXIO);
+/// system memory maps any length from its first page to the end of the
+/// allocation (ERANGE past that).
+fn mmap_window(
+    mapping: &nvctl::MmapContext,
+    offset: usize,
+    len: usize,
+) -> LxResult<(usize, usize, CachePolicy)> {
+    if offset != 0 || len == 0 {
+        return Err(LxError::EINVAL);
+    }
+    let len = pages(len) * PAGE_SIZE;
+    match mapping.memory {
+        nvctl::MmapMemory::System if len as u64 > mapping.size => return Err(LxError::ERANGE),
+        nvctl::MmapMemory::Registers | nvctl::MmapMemory::Framebuffer
+            if len as u64 != mapping.size =>
+        {
+            return Err(LxError::ENXIO)
+        }
+        _ => {}
+    }
+    let policy = match mapping.cpu_caching() {
+        nvctl::CpuCaching::WriteBack => CachePolicy::Cached,
+        nvctl::CpuCaching::WriteCombined => CachePolicy::WriteCombining,
+        nvctl::CpuCaching::Uncached => CachePolicy::Uncached,
+        nvctl::CpuCaching::UncachedDevice => CachePolicy::UncachedDevice,
+    };
+    Ok((mapping.start as usize, pages(len), policy))
+}
+
+/// One log line the first time an open with no mapping is mmapped: nvidia.ko's
+/// "invalid mmap", and the sign of a client that skipped RM_MAP_MEMORY.
+fn invalid_mmap() {
+    static SAID: AtomicBool = AtomicBool::new(false);
+    if !SAID.swap(true, Ordering::Relaxed) {
+        warn!("[nvidiactl] mmap of an open with no RM mapping recorded: EINVAL");
     }
 }
 
@@ -580,12 +737,14 @@ fn status_code(payload: &mut [u8], cards: &[nvctl::Card]) -> LxResult<()> {
     Ok(())
 }
 
+/// The escapes [`not_served`] has logged, one bit per `_IOC_NR`.
+static NOT_SERVED: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
 /// One log line the first time each escape this kernel does not serve is
 /// asked for: that line is what says which escape the next batch needs.
 fn not_served(nr: u32) {
-    static SEEN: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
     let bit = (nr & 0xff) as usize;
-    if SEEN[bit / 64].fetch_or(1 << (bit % 64), Ordering::Relaxed) & (1 << (bit % 64)) == 0 {
+    if NOT_SERVED[bit / 64].fetch_or(1 << (bit % 64), Ordering::Relaxed) & (1 << (bit % 64)) == 0 {
         warn!("[nvidiactl] escape {:#x} is not served yet: EINVAL", nr);
     }
 }
