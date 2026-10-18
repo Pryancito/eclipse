@@ -1615,6 +1615,10 @@ impl FileLike for File {
                 } else if let Some(drmdev) = inner.inode.downcast_ref::<DrmDev>() {
                     drmdev.get_vmo(offset, len).map_err(Into::into)
                 } else {
+                    #[cfg(target_arch = "x86_64")]
+                    if let Some(nvidia) = inner.inode.downcast_ref::<super::devfs::NvidiaOpen>() {
+                        return nvidia.get_vmo(offset, len);
+                    }
                     Err(LxError::ENOSYS)
                 }
             }

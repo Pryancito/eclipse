@@ -2171,41 +2171,13 @@ pub extern "C" fn osLockShouldToggleInterrupts(arg0: *mut c_void) -> NvBool {
 // gpuStateLoad crash on real hardware. Same bug family as the
 // osMapPciMemoryKernel64/Old fix below.
 
-/// `MemoryArea` (nv_memory_area.h): passed BY VALUE to
-/// osMapPciMemoryAreaUser -- 16 bytes, TWO SysV integer registers. The
-/// replaced stub declared a single pointer in its place, shifting every later
-/// parameter by one register.
-#[repr(C)]
-pub struct MemoryArea {
-    pub p_ranges: *mut c_void, // MemoryRange *pRanges
-    pub num_ranges: NvU64,
-}
-
-/// Real contract (g_os_nvoc.h:360): `NV_STATUS
-/// OSMapPciMemoryAreaUser(OS_GPU_INFO *, MemoryArea, NvU32, NvU32, NvP64 *,
-/// NvP64 *)`. The replaced stub also returned `*mut c_void` NULL -- a false
-/// NV_OK that let the discontiguous-BAR1 user-mapping path (mapping_cpu.c)
-/// publish a garbage CPU mapping from the never-written out-params. Same bug
-/// family as the osMapGPU / osMapPciMemoryKernel64 crashes documented above.
-/// Eclipse has no user-level PCI mapping path: fail HONESTLY so callers take
-/// their error path instead of dereferencing stack garbage.
-#[no_mangle]
-pub extern "C" fn osMapPciMemoryAreaUser(
-    p_os_gpu_info: *mut c_void,
-    mem_area: MemoryArea,
-    protect: NvU32,
-    mode_flag: NvU32,
-    p_address: *mut c_void,
-    p_priv: *mut c_void,
-) -> NV_STATUS {
-    let _ = p_os_gpu_info;
-    let _ = mem_area;
-    let _ = protect;
-    let _ = mode_flag;
-    let _ = p_address;
-    let _ = p_priv;
-    NV_ERR_NOT_SUPPORTED
-}
+// osMapPciMemoryAreaUser / osMapPciMemoryUser: real implementations in C
+// (vendor/eclipse_rm_frontend.c). The stubs that stood here took the place of
+// two auto-stubs that returned `*mut c_void` NULL -- a false NV_OK with the
+// address out-params never written, the bug family of the osMapGPU crash
+// above -- and failed honestly with NV_ERR_NOT_SUPPORTED, because no user
+// could reach the RM. A user-mode client now can (/dev/nvidiactl), and
+// outside one of its calls the C keeps answering NV_ERR_NOT_SUPPORTED.
 
 #[no_mangle]
 pub extern "C" fn osMapPciMemoryKernel64(
@@ -2256,34 +2228,6 @@ pub extern "C" fn osMapPciMemoryKernelOld(
     }
     unsafe { *pVirtualAddress = va };
     NV_OK
-}
-
-/// Real contract (g_os_nvoc.h:359): `NV_STATUS OSMapPciMemoryUser(OS_GPU_INFO
-/// *, RmPhysAddr, NvU64, NvU32, NvP64 *, NvP64 *, NvU32)`. The replaced stub
-/// returned `*mut c_void` NULL -- a false NV_OK with the address out-params
-/// never written, so the user-level USERD/BAR1 mapping paths
-/// (kernel_channel.c:4443, mem_desc.c:1913, mapping_cpu.c:514) would publish
-/// garbage pointers on "success". Exactly the bug family that crashed
-/// gpuStateLoad via osMapGPU (see the note above). Eclipse has no user-level
-/// PCI mapping: fail honestly.
-#[no_mangle]
-pub extern "C" fn osMapPciMemoryUser(
-    p_os_gpu_info: *mut c_void,
-    bus_address: NvU64,
-    length: NvU64,
-    protect: NvU32,
-    p_address: *mut c_void,
-    p_priv: *mut c_void,
-    mode_flag: NvU32,
-) -> NV_STATUS {
-    let _ = p_os_gpu_info;
-    let _ = bus_address;
-    let _ = length;
-    let _ = protect;
-    let _ = p_address;
-    let _ = p_priv;
-    let _ = mode_flag;
-    NV_ERR_NOT_SUPPORTED
 }
 
 // osMapSystemMemory: real impl in vendor/eclipse_rm_mem.c.

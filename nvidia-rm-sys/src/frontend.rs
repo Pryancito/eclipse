@@ -25,6 +25,12 @@
 //! - `osIsAdministrator` answers whether the caller's effective uid is 0
 //!   (Linux asks `capable(CAP_SYS_ADMIN)`). Outside a call it keeps
 //!   answering `NV_FALSE`.
+//!
+//! The C half keeps one more such state of its own: the user mappings
+//! (`osMapPciMemoryUser`, and `osMapSystemMemory` for a user) answer only
+//! while a call is in flight, which is what lets RM_MAP_MEMORY hand back a
+//! mapping ([`rm_map_memory`]) for the kernel to record on the file the
+//! client will mmap.
 use crate::types::*;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 
@@ -40,9 +46,17 @@ pub const VERSION_REPLY_RECOGNIZED: u32 = 1;
 /// `os_memcpy_from_user` answers when `copy_from_user` faults.
 pub const NV_ERR_INVALID_ADDRESS: NV_STATUS = 0x0000_001E;
 
+/// `NV_ERR_STATE_IN_USE` (nvstatuscodes.h): the file already holds a mapping.
+pub const NV_ERR_STATE_IN_USE: NV_STATUS = 0x0000_0063;
+
+/// `NV_ESC_RM_MAP_MEMORY` (nv_escape.h).
+pub const RM_MAP_MEMORY: u32 = 0x4E;
+
 /// The nv-ioctl.h payloads the kernel side lays out by hand, in the order
-/// `eclipse_rm_frontend_layout` answers them.
-pub const LAYOUT: [(&str, usize); 7] = [
+/// `eclipse_rm_frontend_layout` answers them, then the offset of the one
+/// field it reads from RM_MAP_MEMORY's and the size of the mapping record
+/// this file shares with the C ([`RawMmapContext`]).
+pub const LAYOUT: [(&str, usize); 10] = [
     ("nv_ioctl_xfer_t", 16),
     ("nv_ioctl_card_info_t", 72),
     ("nv_ioctl_rm_api_version_t", 72),
@@ -50,7 +64,144 @@ pub const LAYOUT: [(&str, usize); 7] = [
     ("nv_ioctl_register_fd_t", 4),
     ("nv_ioctl_wait_open_complete_t", 8),
     ("nv_ioctl_status_code_t", 12),
+    ("nv_ioctl_nvos33_parameters_with_fd", 56),
+    ("nv_ioctl_nvos33_parameters_with_fd.fd", 48),
+    ("EclipseRmMmapContext", 40),
 ];
+
+/// `EclipseRmMmapContext` (eclipse_rm_frontend.c): one mapping RM_MAP_MEMORY
+/// validated, as the C leaves it. [`MmapContext::from_raw`] reads it.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RawMmapContext {
+    pub valid: NvU32,
+    pub ctl: NvU32,
+    pub gpu_instance: NvU32,
+    pub memory_type: NvU32,
+    pub caching: NvU32,
+    pub prot: NvU32,
+    pub start: NvU64,
+    pub size: NvU64,
+}
+
+/// `NV_MEMORY_*` (nv_memory_type.h), the caching types a mapping can carry.
+pub mod caching {
+    pub const CACHED: u32 = 0;
+    pub const UNCACHED: u32 = 1;
+    pub const WRITECOMBINED: u32 = 2;
+    pub const WRITEBACK: u32 = 5;
+    pub const DEFAULT: u32 = 6;
+    pub const UNCACHED_WEAK: u32 = 7;
+}
+
+/// `NV_PROTECT_WRITEABLE` (nv_memory_type.h).
+const PROTECT_WRITEABLE: u32 = 2;
+const PAGE: u64 = 4096;
+
+/// What a mapping is of.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MmapMemory {
+    /// A client's system-memory allocation, recorded on `/dev/nvidiactl`.
+    System,
+    /// A window of a GPU's BAR0, recorded on that GPU's `/dev/nvidia<N>`.
+    Registers,
+    /// A window of a GPU's BAR1.
+    Framebuffer,
+}
+
+/// How the CPU is to reach a mapping (`nv_encode_caching`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CpuCaching {
+    WriteBack,
+    WriteCombined,
+    /// Uncached RAM.
+    Uncached,
+    /// Uncached device memory.
+    UncachedDevice,
+}
+
+/// One validated user mapping: what `nv_add_mapping_context_to_file`
+/// records on a file, and what `nvidia_mmap` then maps.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MmapContext {
+    pub memory: MmapMemory,
+    /// The GPU whose node an aperture mapping is recorded on.
+    pub gpu_instance: u32,
+    /// `NV_MEMORY_*`: the aperture's, or the allocation's.
+    pub caching: u32,
+    pub writable: bool,
+    /// First byte, page aligned.
+    pub start: u64,
+    /// Whole pages: exactly what an aperture mapping maps, and the most a
+    /// system one may.
+    pub size: u64,
+}
+
+impl MmapContext {
+    /// The C's record, if it holds a mapping and holds it whole: page
+    /// aligned, non-empty, inside the address space, and of a kind that
+    /// agrees with the node it is for. Anything else is not mapped.
+    pub fn from_raw(raw: &RawMmapContext) -> Option<MmapContext> {
+        if raw.valid == 0 {
+            return None;
+        }
+        let memory = match raw.memory_type {
+            0 => MmapMemory::System,
+            1 => MmapMemory::Registers,
+            2 => MmapMemory::Framebuffer,
+            _ => return None,
+        };
+        if (raw.ctl != 0) != (memory == MmapMemory::System) {
+            return None;
+        }
+        if raw.size == 0 || !raw.start.is_multiple_of(PAGE) || !raw.size.is_multiple_of(PAGE) {
+            return None;
+        }
+        raw.start.checked_add(raw.size)?;
+        Some(MmapContext {
+            memory,
+            gpu_instance: raw.gpu_instance,
+            caching: raw.caching,
+            writable: raw.prot & PROTECT_WRITEABLE != 0,
+            start: raw.start,
+            size: raw.size,
+        })
+    }
+
+    /// Whether it is recorded on `/dev/nvidiactl` rather than a GPU's node.
+    pub fn on_ctl(&self) -> bool {
+        self.memory == MmapMemory::System
+    }
+
+    /// `nvidia_mmap_helper`'s `nv_encode_caching`. Registers are always
+    /// uncached. The framebuffer is write-combined when the RM asks for that
+    /// or leaves it to the default, and uncached otherwise: what nvidia.ko
+    /// falls back to when a type is not allowed there (caching is never
+    /// allowed for a BAR).
+    ///
+    /// System memory departs from Linux. There the pages take the caching
+    /// the allocation asked for, and `nv_alloc_pages` changes the kernel's
+    /// own mapping of them to match. Eclipse's kernel mapping of an RM
+    /// allocation is write-back unless `osAllocPagesInternal` made it
+    /// uncached, so the client gets the same type the kernel has and the two
+    /// never disagree about the same page: uncached for an uncached
+    /// allocation, write-back for the rest. A write-combined request is
+    /// therefore write-back here, which orders stores more strongly, and
+    /// which the GPU sees anyway, PCIe reads of RAM being snooped.
+    pub fn cpu_caching(&self) -> CpuCaching {
+        match self.memory {
+            MmapMemory::Registers => CpuCaching::UncachedDevice,
+            MmapMemory::Framebuffer => match self.caching {
+                caching::DEFAULT | caching::WRITECOMBINED => CpuCaching::WriteCombined,
+                _ => CpuCaching::UncachedDevice,
+            },
+            MmapMemory::System => match self.caching {
+                caching::UNCACHED => CpuCaching::Uncached,
+                _ => CpuCaching::WriteBack,
+            },
+        }
+    }
+}
 
 #[cfg(target_os = "none")]
 extern "C" {
@@ -61,7 +212,15 @@ extern "C" {
         os_info: *mut c_void,
         ctl: NvU32,
         admin: NvU32,
+        mmap: *mut RawMmapContext,
     ) -> NV_STATUS;
+    fn eclipse_rm_frontend_map_unrecorded(
+        data: *mut c_void,
+        size: NvU32,
+        os_info: *mut c_void,
+        admin: NvU32,
+        why: NV_STATUS,
+    );
     fn eclipse_rm_frontend_release(os_info: *mut c_void);
     fn eclipse_rm_frontend_version() -> *const c_char;
     fn eclipse_rm_frontend_gpu_id(gpu_instance: NvU32) -> NvU32;
@@ -72,6 +231,8 @@ extern "C" {
 // Hosted builds compile no RM C (build.rs), so the front end has no RM to
 // reach: every escape is refused, nothing is ever filed under an open, and
 // no GPU exists. Same shape as the `eclipse_rm_edid` stand-in in rm_init.rs.
+// The tests can have RM_MAP_MEMORY answer with a record of their own, and
+// see what was unmapped, to check what this file does with the C's answer.
 #[cfg(not(target_os = "none"))]
 unsafe fn eclipse_rm_frontend_escape(
     _cmd: NvU32,
@@ -80,8 +241,24 @@ unsafe fn eclipse_rm_frontend_escape(
     _os_info: *mut c_void,
     _ctl: NvU32,
     _admin: NvU32,
+    _mmap: *mut RawMmapContext,
 ) -> NV_STATUS {
+    #[cfg(test)]
+    if let Some(status) = tests::stand_in_map(_mmap) {
+        return status;
+    }
     NV_ERR_NOT_SUPPORTED
+}
+#[cfg(not(target_os = "none"))]
+unsafe fn eclipse_rm_frontend_map_unrecorded(
+    _data: *mut c_void,
+    _size: NvU32,
+    _os_info: *mut c_void,
+    _admin: NvU32,
+    _why: NV_STATUS,
+) {
+    #[cfg(test)]
+    tests::stand_in_unmapped(_why);
 }
 #[cfg(not(target_os = "none"))]
 unsafe fn eclipse_rm_frontend_release(_os_info: *mut c_void) {}
@@ -250,8 +427,63 @@ pub fn rm_escape(cmd: u32, payload: &mut [u8], caller: &Caller) -> NV_STATUS {
             caller.os_info as *mut c_void,
             caller.ctl as NvU32,
             caller.admin as NvU32,
+            core::ptr::null_mut(),
         )
     }
+}
+
+/// RM_MAP_MEMORY, on the kernel copy of its payload: the escape's status,
+/// and the mapping to record on the file the client named, when the RM made
+/// one. The caller records it, or hands the payload to [`map_unrecorded`].
+///
+/// A record the C left that does not hold up ([`MmapContext::from_raw`]) is
+/// unmapped here, in the same call, and the client sees
+/// `NV_ERR_INVALID_STATE`.
+pub fn rm_map_memory(payload: &mut [u8], caller: &Caller) -> (NV_STATUS, Option<MmapContext>) {
+    if caller.os_info == 0 {
+        return (NV_ERR_INVALID_ARGUMENT, None);
+    }
+    let mut raw = RawMmapContext::default();
+    let _scope = CallScope::enter(caller.gpu_mask, caller.admin);
+    let status = unsafe {
+        eclipse_rm_frontend_escape(
+            RM_MAP_MEMORY,
+            payload.as_mut_ptr() as *mut c_void,
+            payload.len() as NvU32,
+            caller.os_info as *mut c_void,
+            caller.ctl as NvU32,
+            caller.admin as NvU32,
+            &mut raw,
+        )
+    };
+    let mapping = MmapContext::from_raw(&raw);
+    if raw.valid != 0 && mapping.is_none() {
+        unsafe { unrecorded(payload, caller, NV_ERR_INVALID_STATE) };
+    }
+    (status, mapping)
+}
+
+/// The kernel could not record the mapping [`rm_map_memory`] returned
+/// (`nv_add_mapping_context_to_file` failed with `why`): the RM unmaps it,
+/// and `why` becomes the call's status, as escape.c does.
+pub fn map_unrecorded(payload: &mut [u8], caller: &Caller, why: NV_STATUS) {
+    if caller.os_info == 0 {
+        return;
+    }
+    let _scope = CallScope::enter(caller.gpu_mask, caller.admin);
+    unsafe { unrecorded(payload, caller, why) };
+}
+
+/// # Safety
+/// The caller holds a [`CallScope`].
+unsafe fn unrecorded(payload: &mut [u8], caller: &Caller, why: NV_STATUS) {
+    eclipse_rm_frontend_map_unrecorded(
+        payload.as_mut_ptr() as *mut c_void,
+        payload.len() as NvU32,
+        caller.os_info as *mut c_void,
+        caller.admin as NvU32,
+        why,
+    )
 }
 
 /// The close of the `/dev/nvidiactl` open `os_info` names: every RM client

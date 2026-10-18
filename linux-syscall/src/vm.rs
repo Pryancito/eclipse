@@ -422,6 +422,15 @@ impl Syscall<'_> {
             // hunter::check_mprotect (Report mode by default) — it just isn't
             // enforced by capping the mapping here.
             let ceiling = MMUFlags::RXW | MMUFlags::USER;
+            // nv-mmap.c: a mapping the RM granted read-only (an NVIDIA open's)
+            // is installed read-only whatever was asked, and can never be
+            // made writable, so WRITE leaves the ceiling too.
+            #[cfg(target_arch = "x86_64")]
+            let (ceiling, prot) = if Self::nvidia_mmap_read_only(&file_like) {
+                (ceiling - MMUFlags::WRITE, prot - MmapProt::WRITE)
+            } else {
+                (ceiling, prot)
+            };
             // Map without committing the range up front (`map_range = false`):
             // the VMO returned by `get_vmo` is demand-paged from the file, so its
             // pages are read in on the faults that first touch them. Eagerly
@@ -508,7 +517,7 @@ impl Syscall<'_> {
                     );
                 })?
             };
-            hunter::record_mapping(pid, addr, len, want_write);
+            hunter::record_mapping(pid, addr, len, prot.contains(MmapProt::WRITE));
             verify_installed(&vmar, addr, len, "file");
             Ok(addr)
         }

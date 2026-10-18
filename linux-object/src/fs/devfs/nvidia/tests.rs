@@ -309,7 +309,7 @@ fn a_payload_nobody_can_read_is_efault() {
 #[test]
 fn escapes_not_served_are_einval() {
     for nr in [
-        0x4E, /* RM_MAP_MEMORY */
+        0x27, /* RM_ALLOC_MEMORY */
         206,  /* ALLOC_OS_EVENT */
         213, 0x99,
     ] {
@@ -321,12 +321,23 @@ fn escapes_not_served_are_einval() {
             nr
         );
     }
-    // Hosted there is no RM behind the RM escapes either.
-    let mut p = [0u8; 32];
-    assert_eq!(
-        ioctl_on(&ctl(), esc::RM_CONTROL, &mut p),
-        Err(LxError::EINVAL)
-    );
+    // Hosted there is no RM behind the RM escapes either, but they are
+    // served: refused for want of an RM, not logged as escapes to write.
+    for nr in [esc::RM_CONTROL, esc::RM_MAP_MEMORY, esc::RM_UNMAP_MEMORY] {
+        let mut p = [0u8; 56];
+        assert_eq!(
+            ioctl_on(&ctl(), nr, &mut p),
+            Err(LxError::EINVAL),
+            "{nr:#x}"
+        );
+        assert!(!logged_not_served(nr), "{:#x} is served", nr);
+    }
+    assert!(logged_not_served(0x27));
+}
+
+fn logged_not_served(nr: u32) -> bool {
+    let bit = (nr & 0xff) as usize;
+    NOT_SERVED[bit / 64].load(Ordering::Relaxed) & (1 << (bit % 64)) != 0
 }
 
 #[test]
@@ -455,4 +466,220 @@ fn the_nodes_are_195_255_and_195_n() {
 #[test]
 fn the_payload_sizes_agree_with_the_rm() {
     assert_eq!(sizes_mismatch(), None);
+}
+
+fn mapping(memory: nvctl::MmapMemory, gpu_instance: u32) -> nvctl::MmapContext {
+    nvctl::MmapContext {
+        memory,
+        gpu_instance,
+        caching: 0,
+        writable: true,
+        start: 0x1234_5000,
+        size: 0x4000,
+    }
+}
+
+fn system() -> nvctl::MmapContext {
+    mapping(nvctl::MmapMemory::System, u32::MAX)
+}
+
+fn registers(gpu_instance: u32) -> nvctl::MmapContext {
+    mapping(nvctl::MmapMemory::Registers, gpu_instance)
+}
+
+/// GPU 0 is RM instance 1, GPU 1 is instance 0, and GPU 2 was never brought
+/// up: no minor is its own instance, so a check that compared the two would
+/// be caught.
+fn instance_of(minor: u32) -> Option<u32> {
+    match minor {
+        0 => Some(1),
+        1 => Some(0),
+        _ => None,
+    }
+}
+
+fn recorded(open: &NvidiaOpen) -> Option<nvctl::MmapContext> {
+    open.state.lock().mapping
+}
+
+/// RM_MAP_MEMORY's mapping goes on the open the client named, and only on an
+/// NVIDIA open of the node it is for.
+#[test]
+fn a_mapping_is_recorded_on_the_open_it_is_for() {
+    let open = ctl();
+    assert_eq!(record_mapping(Some(&open), system(), &instance_of), Ok(()));
+    assert_eq!(recorded(&open), Some(system()));
+    let open = gpu(0);
+    assert_eq!(
+        record_mapping(Some(&open), registers(1), &instance_of),
+        Ok(())
+    );
+    assert_eq!(recorded(&open), Some(registers(1)));
+    let fb = mapping(nvctl::MmapMemory::Framebuffer, 0);
+    let open = gpu(1);
+    assert_eq!(record_mapping(Some(&open), fb, &instance_of), Ok(()));
+}
+
+#[test]
+fn a_mapping_for_another_node_is_not_recorded() {
+    assert_eq!(
+        record_mapping(None, system(), &instance_of),
+        Err(NV_ERR_INVALID_ARGUMENT),
+        "no such fd"
+    );
+    let not_an_open = NvidiaDev::new(Node::Ctl);
+    assert_eq!(
+        record_mapping(Some(&not_an_open), system(), &instance_of),
+        Err(NV_ERR_INVALID_ARGUMENT),
+        "the node itself, not an open of it"
+    );
+    let refusals = [
+        (gpu(0), system(), "system memory on a GPU node"),
+        (
+            gpu(0),
+            mapping(nvctl::MmapMemory::System, 1),
+            "system memory on a GPU node, even one naming its instance",
+        ),
+        (ctl(), registers(1), "an aperture on the control node"),
+        (gpu(0), registers(0), "another GPU's aperture"),
+        (gpu(1), registers(1), "another GPU's aperture"),
+        (gpu(2), registers(u32::MAX), "a GPU the RM never brought up"),
+    ];
+    for (open, m, what) in refusals {
+        assert_eq!(
+            record_mapping(Some(&open), m, &instance_of),
+            Err(NV_ERR_INVALID_ARGUMENT),
+            "{what}"
+        );
+        assert_eq!(recorded(&open), None, "{what}");
+    }
+}
+
+/// One open, one mapping: a second is refused and the first one stays.
+#[test]
+fn an_open_holds_one_mapping() {
+    let open = ctl();
+    assert_eq!(record_mapping(Some(&open), system(), &instance_of), Ok(()));
+    let mut other = system();
+    other.start = 0x9999_0000;
+    assert_eq!(
+        record_mapping(Some(&open), other, &instance_of),
+        Err(nvctl::NV_ERR_STATE_IN_USE)
+    );
+    assert_eq!(recorded(&open), Some(system()));
+}
+
+/// With no RM, RM_MAP_MEMORY is refused before the fd it names is looked up.
+#[test]
+fn a_map_with_no_rm_looks_nothing_up() {
+    let asked = core::cell::Cell::new(0);
+    let lookup = |_fd: i32| {
+        asked.set(asked.get() + 1);
+        None
+    };
+    let caller = caller_with_fd(&lookup);
+    let mut p = [0u8; MAP_MEMORY_SIZE];
+    assert_eq!(
+        ctl().ioctl(
+            iowr(esc::RM_MAP_MEMORY, MAP_MEMORY_SIZE),
+            p.as_mut_ptr() as usize,
+            &caller
+        ),
+        Err(LxError::EINVAL)
+    );
+    assert_eq!(asked.get(), 0);
+}
+
+#[test]
+fn only_offset_zero_of_a_mapping_maps() {
+    assert_eq!(mmap_window(&system(), 0x1000, 0x1000), Err(LxError::EINVAL));
+    assert_eq!(
+        mmap_window(&registers(0), 0x1000, 0x4000),
+        Err(LxError::EINVAL)
+    );
+    assert_eq!(mmap_window(&system(), 0, 0), Err(LxError::EINVAL));
+}
+
+/// An aperture maps its window exactly (ENXIO otherwise); system memory any
+/// length up to the end of the allocation (ERANGE past it).
+#[test]
+fn a_mapping_maps_its_own_length() {
+    let regs = registers(0);
+    assert_eq!(
+        mmap_window(&regs, 0, 0x4000),
+        Ok((0x1234_5000, 4, CachePolicy::UncachedDevice))
+    );
+    assert_eq!(
+        mmap_window(&regs, 0, 0x3001),
+        Ok((0x1234_5000, 4, CachePolicy::UncachedDevice)),
+        "a length is whole pages, as a vma's is"
+    );
+    assert_eq!(mmap_window(&regs, 0, 0x3000), Err(LxError::ENXIO));
+    assert_eq!(mmap_window(&regs, 0, 0x5000), Err(LxError::ENXIO));
+    let sys = system();
+    assert_eq!(
+        mmap_window(&sys, 0, 0x1000),
+        Ok((0x1234_5000, 1, CachePolicy::Cached))
+    );
+    assert_eq!(
+        mmap_window(&sys, 0, 0x4000),
+        Ok((0x1234_5000, 4, CachePolicy::Cached))
+    );
+    assert_eq!(
+        mmap_window(&sys, 0, 0x3001),
+        Ok((0x1234_5000, 4, CachePolicy::Cached))
+    );
+    assert_eq!(mmap_window(&sys, 0, 0x4001), Err(LxError::ERANGE));
+    assert_eq!(mmap_window(&sys, 0, 0x5000), Err(LxError::ERANGE));
+}
+
+#[test]
+fn a_mapping_maps_with_the_caching_its_memory_allows() {
+    let mut fb = mapping(nvctl::MmapMemory::Framebuffer, 0);
+    fb.caching = nvctl::caching::DEFAULT;
+    assert_eq!(
+        mmap_window(&fb, 0, 0x4000).map(|w| w.2),
+        Ok(CachePolicy::WriteCombining)
+    );
+    fb.caching = nvctl::caching::UNCACHED;
+    assert_eq!(
+        mmap_window(&fb, 0, 0x4000).map(|w| w.2),
+        Ok(CachePolicy::UncachedDevice)
+    );
+    let mut sys = system();
+    sys.caching = nvctl::caching::UNCACHED;
+    assert_eq!(
+        mmap_window(&sys, 0, 0x1000).map(|w| w.2),
+        Ok(CachePolicy::Uncached)
+    );
+}
+
+/// An open no RM_MAP_MEMORY was recorded on maps nothing ("invalid mmap").
+#[test]
+fn an_open_with_no_mapping_maps_nothing() {
+    assert_eq!(ctl().get_vmo(0, 0x1000).err(), Some(LxError::EINVAL));
+    assert_eq!(gpu(0).get_vmo(0, 0x1000).err(), Some(LxError::EINVAL));
+}
+
+#[test]
+fn a_recorded_mapping_is_one_physical_vmo_of_the_length_asked() {
+    let open = ctl();
+    assert_eq!(record_mapping(Some(&open), system(), &instance_of), Ok(()));
+    let vmo = open.get_vmo(0, 0x2000).unwrap();
+    assert_eq!(vmo.len(), 0x2000);
+    assert_eq!(vmo.cache_policy(), CachePolicy::Cached);
+    assert_eq!(open.get_vmo(0, 0x5000).err(), Some(LxError::ERANGE));
+}
+
+#[test]
+fn only_a_read_only_grant_maps_read_only() {
+    let open = ctl();
+    assert!(!open.mmap_read_only(), "no mapping");
+    assert_eq!(record_mapping(Some(&open), system(), &instance_of), Ok(()));
+    assert!(!open.mmap_read_only(), "writable");
+    let open = ctl();
+    let mut ro = system();
+    ro.writable = false;
+    assert_eq!(record_mapping(Some(&open), ro, &instance_of), Ok(()));
+    assert!(open.mmap_read_only());
 }

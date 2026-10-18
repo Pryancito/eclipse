@@ -1379,10 +1379,8 @@ pub extern "C" fn os_lookup_user_io_memory(
 pub extern "C" fn os_unlock_user_pages(_a: NvU64, _b: *mut c_void, _c: NvU32) -> NV_STATUS {
     NV_ERR_NOT_SUPPORTED
 }
-#[no_mangle]
-pub extern "C" fn os_match_mmap_offset(_a: *mut c_void, _b: NvU64, _c: *mut NvU64) -> NV_STATUS {
-    NV_ERR_NOT_SUPPORTED
-}
+// os_match_mmap_offset: real impl in vendor/eclipse_rm_mem.c, which knows
+// what an allocation's memData is.
 #[no_mangle]
 pub extern "C" fn os_get_smbios_header(_p_smbs_addr: *mut NvU64) -> NV_STATUS {
     NV_ERR_NOT_SUPPORTED

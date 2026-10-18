@@ -1,7 +1,9 @@
 extern crate std;
 
 use super::*;
+use std::cell::{Cell, RefCell};
 use std::sync::{Mutex, MutexGuard};
+use std::vec::Vec;
 
 /// `IN_CALL`, `CALLER_GPUS` and `USER_RANGE_OK` are process-globals and
 /// `cargo test` runs in parallel: every test that reads or sets them holds
@@ -9,6 +11,36 @@ use std::sync::{Mutex, MutexGuard};
 fn turnstile() -> MutexGuard<'static, ()> {
     static T: Mutex<()> = Mutex::new(());
     T.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+std::thread_local! {
+    /// What the hosted stand-in for the C answers this thread's next
+    /// RM_MAP_MEMORY with, and the status of every mapping it was told to
+    /// unmap.
+    static MAP_ANSWER: Cell<Option<(NV_STATUS, RawMmapContext)>> = const { Cell::new(None) };
+    static UNMAPPED: RefCell<Vec<NV_STATUS>> = const { RefCell::new(Vec::new()) };
+}
+
+/// The stand-in's RM_MAP_MEMORY, when a test set an answer.
+pub(super) fn stand_in_map(mmap: *mut RawMmapContext) -> Option<NV_STATUS> {
+    let (status, record) = MAP_ANSWER.with(|a| a.take())?;
+    if !mmap.is_null() {
+        // SAFETY: `rm_map_memory` passes its own record.
+        unsafe { *mmap = record };
+    }
+    Some(status)
+}
+
+pub(super) fn stand_in_unmapped(why: NV_STATUS) {
+    UNMAPPED.with(|u| u.borrow_mut().push(why));
+}
+
+fn answer_map(status: NV_STATUS, record: RawMmapContext) {
+    MAP_ANSWER.with(|a| a.set(Some((status, record))));
+}
+
+fn unmapped() -> Vec<NV_STATUS> {
+    UNMAPPED.with(|u| u.take())
 }
 
 fn version_of(s: &[u8]) -> [u8; VERSION_STRING_LENGTH] {
@@ -199,6 +231,7 @@ fn no_gpu_is_accessible_outside_a_call() {
 /// confused for another (a zero token is refused before the RM sees it).
 #[test]
 fn hosted_escapes_are_refused() {
+    let _t = turnstile();
     let mut payload = [0u8; 32];
     let caller = Caller {
         os_info: 0x1000,
@@ -222,4 +255,226 @@ fn hosted_escapes_are_refused() {
 #[test]
 fn a_hosted_build_agrees_with_its_own_layout() {
     assert_eq!(layout_mismatch(), None);
+}
+
+/// The record is laid out once in C and once here; the C side's `sizeof` is
+/// checked against `LAYOUT` at boot, and this checks ours against both.
+#[test]
+fn the_mapping_record_has_the_c_layout() {
+    assert_eq!(core::mem::size_of::<RawMmapContext>(), 40);
+    assert_eq!(
+        LAYOUT[9],
+        (
+            "EclipseRmMmapContext",
+            core::mem::size_of::<RawMmapContext>()
+        )
+    );
+    let raw = RawMmapContext::default();
+    let base = &raw as *const _ as usize;
+    assert_eq!(&raw.start as *const _ as usize - base, 24);
+    assert_eq!(&raw.size as *const _ as usize - base, 32);
+}
+
+fn system(start: u64, size: u64) -> RawMmapContext {
+    RawMmapContext {
+        valid: 1,
+        ctl: 1,
+        gpu_instance: u32::MAX,
+        memory_type: 0,
+        caching: caching::CACHED,
+        prot: 3,
+        start,
+        size,
+    }
+}
+
+fn aperture(memory_type: u32, caching: u32) -> RawMmapContext {
+    RawMmapContext {
+        valid: 1,
+        ctl: 0,
+        gpu_instance: 1,
+        memory_type,
+        caching,
+        prot: 3,
+        start: 0xd000_0000,
+        size: 0x10000,
+    }
+}
+
+#[test]
+fn a_whole_record_is_read_as_it_is() {
+    let m = MmapContext::from_raw(&system(0x1234_5000, 0x3000)).unwrap();
+    assert_eq!(m.memory, MmapMemory::System);
+    assert!(m.on_ctl());
+    assert!(m.writable);
+    assert_eq!((m.start, m.size), (0x1234_5000, 0x3000));
+    let m = MmapContext::from_raw(&aperture(1, caching::CACHED)).unwrap();
+    assert_eq!(m.memory, MmapMemory::Registers);
+    assert!(!m.on_ctl());
+    assert_eq!(m.gpu_instance, 1);
+    let m = MmapContext::from_raw(&aperture(2, caching::DEFAULT)).unwrap();
+    assert_eq!(m.memory, MmapMemory::Framebuffer);
+}
+
+/// Nothing to record, or a record that does not hold up, maps nothing.
+#[test]
+fn a_record_that_does_not_hold_up_is_not_a_mapping() {
+    assert_eq!(MmapContext::from_raw(&RawMmapContext::default()), None);
+    let mut r = system(0x1000, 0x1000);
+    r.valid = 0;
+    assert_eq!(MmapContext::from_raw(&r), None, "not valid");
+    let mut r = system(0x1000, 0x1000);
+    r.memory_type = 3;
+    assert_eq!(MmapContext::from_raw(&r), None, "an unknown kind");
+    assert_eq!(
+        MmapContext::from_raw(&aperture(3, caching::DEFAULT)),
+        None,
+        "an unknown kind, off the control node"
+    );
+    let mut r = system(0x1000, 0x1000);
+    r.ctl = 0;
+    assert_eq!(
+        MmapContext::from_raw(&r),
+        None,
+        "system memory off the control node"
+    );
+    let mut r = aperture(1, caching::CACHED);
+    r.ctl = 1;
+    assert_eq!(
+        MmapContext::from_raw(&r),
+        None,
+        "an aperture on the control node"
+    );
+    assert_eq!(
+        MmapContext::from_raw(&system(0x1001, 0x1000)),
+        None,
+        "unaligned start"
+    );
+    assert_eq!(
+        MmapContext::from_raw(&system(0x1000, 0x1800)),
+        None,
+        "a part page"
+    );
+    assert_eq!(MmapContext::from_raw(&system(0x1000, 0)), None, "empty");
+    assert_eq!(
+        MmapContext::from_raw(&system(u64::MAX - 0xfff, 0x2000)),
+        None,
+        "past the end of the address space"
+    );
+    assert!(MmapContext::from_raw(&system(u64::MAX - 0x1fff, 0x1000)).is_some());
+}
+
+#[test]
+fn only_the_writeable_bit_makes_a_mapping_writable() {
+    for (prot, writable) in [(0, false), (1, false), (2, true), (3, true)] {
+        let mut r = system(0x1000, 0x1000);
+        r.prot = prot;
+        assert_eq!(
+            MmapContext::from_raw(&r).unwrap().writable,
+            writable,
+            "prot {prot}"
+        );
+    }
+}
+
+/// `nv_encode_caching`, and the one place Eclipse departs from it: system
+/// memory takes the type the kernel's own mapping of it has.
+#[test]
+fn every_mapping_gets_the_caching_its_memory_allows() {
+    let all = [
+        caching::CACHED,
+        caching::UNCACHED,
+        caching::WRITECOMBINED,
+        caching::WRITEBACK,
+        caching::DEFAULT,
+        caching::UNCACHED_WEAK,
+    ];
+    for c in all {
+        let regs = MmapContext::from_raw(&aperture(1, c)).unwrap();
+        assert_eq!(
+            regs.cpu_caching(),
+            CpuCaching::UncachedDevice,
+            "registers, {c}"
+        );
+        let fb = MmapContext::from_raw(&aperture(2, c)).unwrap();
+        let want = match c {
+            caching::DEFAULT | caching::WRITECOMBINED => CpuCaching::WriteCombined,
+            _ => CpuCaching::UncachedDevice,
+        };
+        assert_eq!(fb.cpu_caching(), want, "framebuffer, {c}");
+        let mut r = system(0x1000, 0x1000);
+        r.caching = c;
+        let sys = MmapContext::from_raw(&r).unwrap();
+        let want = if c == caching::UNCACHED {
+            CpuCaching::Uncached
+        } else {
+            CpuCaching::WriteBack
+        };
+        assert_eq!(sys.cpu_caching(), want, "system, {c}");
+    }
+}
+
+/// Hosted builds have no RM to map anything with.
+#[test]
+fn hosted_maps_are_refused() {
+    let _t = turnstile();
+    let mut payload = [0u8; 56];
+    let caller = Caller {
+        os_info: 0x1000,
+        ctl: true,
+        admin: false,
+        gpu_mask: 1,
+    };
+    assert_eq!(
+        rm_map_memory(&mut payload, &caller),
+        (NV_ERR_NOT_SUPPORTED, None)
+    );
+    let nobody = Caller {
+        os_info: 0,
+        ..caller
+    };
+    assert_eq!(
+        rm_map_memory(&mut payload, &nobody),
+        (NV_ERR_INVALID_ARGUMENT, None)
+    );
+    map_unrecorded(&mut payload, &caller, NV_ERR_STATE_IN_USE);
+    assert_eq!(payload, [0u8; 56], "nothing reaches a payload with no RM");
+    assert_eq!(unmapped(), [NV_ERR_STATE_IN_USE]);
+    map_unrecorded(&mut payload, &nobody, NV_ERR_STATE_IN_USE);
+    assert_eq!(unmapped(), [], "a zero token reaches no RM");
+}
+
+/// What the C answers RM_MAP_MEMORY with is handed on only when its record
+/// holds up. One that does not is unmapped in the same call, with
+/// INVALID_STATE for the client, so no mapping is left that nothing
+/// records; no record at all is nothing to unmap.
+#[test]
+fn a_record_that_does_not_hold_up_is_unmapped_at_once() {
+    let _t = turnstile();
+    let mut payload = [0u8; 56];
+    let caller = Caller {
+        os_info: 0x1000,
+        ctl: true,
+        admin: false,
+        gpu_mask: 1,
+    };
+    let good = system(0x1000, 0x2000);
+    answer_map(NV_OK, good);
+    assert_eq!(
+        rm_map_memory(&mut payload, &caller),
+        (NV_OK, MmapContext::from_raw(&good))
+    );
+    assert_eq!(unmapped(), []);
+
+    let bad = RawMmapContext {
+        start: 0x1001,
+        ..good
+    };
+    answer_map(NV_OK, bad);
+    assert_eq!(rm_map_memory(&mut payload, &caller), (NV_OK, None));
+    assert_eq!(unmapped(), [NV_ERR_INVALID_STATE]);
+
+    answer_map(NV_OK, RawMmapContext::default());
+    assert_eq!(rm_map_memory(&mut payload, &caller), (NV_OK, None));
+    assert_eq!(unmapped(), []);
 }
