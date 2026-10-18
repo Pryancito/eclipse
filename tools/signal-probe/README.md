@@ -20,6 +20,11 @@ en este kernel ha pasado de maneras que ningun test de syscalls ve:
 3. Un manejador que reescribia el `rip` guardado con una direccion no canonica
    tumbaba **el kernel entero**: la CPU falla en la vuelta a modo usuario, en
    el anillo 0. (#1943)
+4. Un huerfano conservaba la señal de muerte que habia elegido su padre muerto,
+   asi que un hijo clonado con SIGTERM o SIGUSR1 cuyo padre salia se la mandaba
+   a init al morir, y eclipse-init reinicia o se apaga con esas. Y la muerte de
+   un huerfano se avisaba a quien saliera de buscar desde el padre que lo **creo**,
+   no al que lo adopto.
 
 ## Compilar
 
@@ -57,3 +62,4 @@ FAIL solo en Eclipse es un fallo de Eclipse.
 | `restart` | con `SA_RESTART`, `read` y `wait4` se reanudan tras el manejador; `nanosleep` y `poll` dan `EINTR` igualmente, como en Linux |
 | `badrip` | un manejador que pone un `rip` no canonico en su `ucontext` le cuesta al proceso un SIGSEGV (`SI_KERNEL`) y nada mas. Solo x86_64 |
 | `ids` | el kernel rechaza lo que no puede cargar: un puntero de TLS fuera del espacio de usuario (`arch_prctl`, `clone(CLONE_SETTLS)`) y el pid `INT_MIN`, que no tiene negativo, en `waitpid` |
+| `orphan` | la muerte de un huerfano avisa a quien lo **adopto**, con SIGCHLD aunque su padre muerto eligiera otra señal en `clone(2)`, y despierta el `waitpid` del adoptante aunque un proceso de en medio se haya hecho subreaper despues de la adopcion. La señal elegida es SIGWINCH, que init descarta, por si el subreaper no se cumpliera |

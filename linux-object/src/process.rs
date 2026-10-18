@@ -710,8 +710,9 @@ impl ProcessExt for Process {
         }
 
         // On termination: reparent this process's own still-live children to
-        // INIT, then notify whoever reaps *this* process — its real parent
-        // while alive, otherwise INIT (orphan reparenting). See `reaper_for` /
+        // INIT, then notify whoever reaps *this* process — its current parent
+        // (the adopter, after an adoption) while alive, otherwise INIT
+        // (orphan reparenting). See `reaper_for` /
         // `reparent_live_children_to_init`.
         let parent = parent.clone();
         let weak_proc = Arc::downgrade(&new_proc);
@@ -765,12 +766,31 @@ impl ProcessExt for Process {
                         };
                         drop(dropped);
                     }
-                    if let Some(reaper) = reaper_for(&parent) {
+                    // The parent it has NOW, which after an adoption is the
+                    // adopter. Working it out again from the parent it was
+                    // forked from walks that corpse's ancestors for a
+                    // subreaper, and a `PR_SET_CHILD_SUBREAPER` changed since
+                    // the adoption sends the zombie and the SIGCHLD to a
+                    // process that never had this child.
+                    let current_parent = child
+                        .try_linux()
+                        .and_then(|lp| lp.parent())
+                        .unwrap_or_else(|| parent.clone());
+                    if let Some(reaper) = reaper_for(&current_parent) {
                         if let Some(reaper_lp) = reaper.try_linux() {
-                            let exit_sig = child
-                                .try_linux()
-                                .map(|lp| lp.exit_signal())
-                                .unwrap_or(LinuxSignal::SIGCHLD as u8);
+                            // Only the parent that chose a signal gets it. A
+                            // child forked while its parent was dying was
+                            // adopted by nobody, so the adoption never put it
+                            // back to SIGCHLD, and the walk above found
+                            // somebody else to tell.
+                            let exit_sig = if reaper.id() == current_parent.id() {
+                                child
+                                    .try_linux()
+                                    .map(|lp| lp.exit_signal())
+                                    .unwrap_or(LinuxSignal::SIGCHLD as u8)
+                            } else {
+                                LinuxSignal::SIGCHLD as u8
+                            };
                             let policy = child_death_policy(reaper_lp, exit_sig);
                             // The zircon bit wakes a blocked `wait*` either
                             // way: with nothing left to collect it comes back
@@ -5194,9 +5214,20 @@ fn reparent_live_children_to_init(dying: &Arc<Process>) {
     };
     // Parent-death signals go out before the handover: the child asked to be
     // told when *this* parent dies, whoever adopts it afterwards.
+    //
+    // And the signal each orphan's own death sends goes back to SIGCHLD, as
+    // in Linux's `reparent_leader` ("We don't want people slaying init"):
+    // the dead parent chose it for itself. Kept, it let any unprivileged
+    // process clone a child with SIGTERM or SIGUSR1, exit, and have init
+    // (which reboots or halts on those) sent it with no permission check.
+    // Here and not under the adopter's lock below, which must not nest an
+    // orphan's.
     for orphan in &orphans {
         let sig = match orphan.try_linux() {
-            Some(lp) => lp.pdeathsig(),
+            Some(lp) => {
+                lp.set_exit_signal(LinuxSignal::SIGCHLD as u8);
+                lp.pdeathsig()
+            }
             None => 0,
         };
         if sig != 0 {
