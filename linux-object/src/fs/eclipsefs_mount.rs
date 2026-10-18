@@ -564,6 +564,13 @@ impl INode for EclipseMountINode {
     }
 }
 
+/// Whether `inode` is one of a mounted EclipseFS. Its reads hold
+/// `EclipseMountFs::inner`, an interrupts-off spinlock, across the device
+/// command, which is why `File` queues them first (`disk_read_gate`).
+pub(super) fn owns(inode: &dyn INode) -> bool {
+    inode.downcast_ref::<EclipseMountINode>().is_some()
+}
+
 /// Open a mount backend as an EclipseFS filesystem, with the `-o` options
 /// in `data` (see the module documentation).
 pub fn open_eclipsefs(

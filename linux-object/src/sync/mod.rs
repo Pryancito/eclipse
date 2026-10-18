@@ -7,8 +7,10 @@
 pub(crate) use self::event_bus::test_interrupt;
 pub use self::event_bus::*;
 pub use self::semaphore::*;
+pub use self::turn_gate::*;
 
 mod event_bus;
 mod semaphore;
 pub mod shared_futex;
 pub mod stall;
+mod turn_gate;

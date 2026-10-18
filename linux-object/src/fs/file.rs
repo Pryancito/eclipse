@@ -12,6 +12,7 @@ use zircon_object::vm::{pages, VmObject, PAGE_SIZE};
 
 use super::FileLike;
 use crate::error::{LxError, LxResult};
+use crate::sync::{TurnGate, TurnGuard};
 
 bitflags::bitflags! {
     /// File open flags
@@ -607,6 +608,43 @@ pub(crate) fn cache_overlay_read(inode: &Arc<dyn INode>, offset: usize, buf: &mu
         let s = (page * PAGE_SIZE).max(offset);
         let e = ((page + 1) * PAGE_SIZE).min(end);
         let _ = vmo.read(s, &mut buf[s - offset..e - offset]);
+    }
+}
+
+/// The queues reads of a disk filesystem wait in, one per filesystem (by its
+/// address; two that land on the same slot only share a queue).
+static DISK_READ_GATES: [TurnGate; 8] = [const { TurnGate::new() }; 8];
+
+/// The queue a read of `inode` waits in, when it is a file of a disk
+/// filesystem.
+///
+/// btrfs, EclipseFS and FAT serve a read under one lock for the whole
+/// filesystem, an interrupts-off spinlock held across the polled device
+/// command. Another thread reading the same filesystem meanwhile spins for
+/// that lock with interrupts off, so with as many readers as CPUs no CPU runs
+/// anything else: no timer, no input, no compositor. ollama's engine loads a
+/// model that way, one reader per CPU (`g.SetLimit(runtime.GOMAXPROCS(0))`
+/// in `ml/backend/ggml/ggml.go`), and qwen3 froze the machine for the whole
+/// load. Under QEMU with four CPUs, four threads reading one file on btrfs
+/// kept a 10 ms sleep waiting 5.2 s; one thread, 52 ms at worst. A read that
+/// waits here is a parked task instead, and the other CPUs stay free.
+pub(super) fn disk_read_gate(inode: &Arc<dyn INode>) -> Option<&'static TurnGate> {
+    let disk = super::btrfs_mount::owns(&**inode)
+        || super::eclipsefs_mount::owns(&**inode)
+        || super::fat_mount::owns(&**inode);
+    if !disk {
+        return None;
+    }
+    let fs = Arc::as_ptr(&inode.fs()) as *const () as usize;
+    Some(&DISK_READ_GATES[(fs >> 4) % DISK_READ_GATES.len()])
+}
+
+/// Wait for the turn to read `inode` (see [`disk_read_gate`]); a file that
+/// needs none gets `None` at once.
+async fn disk_read_turn(inode: &Arc<dyn INode>) -> Option<TurnGuard<'static>> {
+    match disk_read_gate(inode) {
+        Some(gate) => Some(gate.turn().await),
+        None => None,
     }
 }
 
@@ -1232,7 +1270,11 @@ impl FileLike for File {
         let len = if !flags.non_block() {
             // block
             loop {
-                match inode.read_at(offset as usize, buf) {
+                let read = {
+                    let _turn = disk_read_turn(&inode).await;
+                    inode.read_at(offset as usize, buf)
+                };
+                match read {
                     Ok(read_len) => break read_len,
                     Err(FsError::Again) => {
                         // DRM card fd: park on the shared eventbus directly.
@@ -1256,6 +1298,7 @@ impl FileLike for File {
                 }
             }
         } else {
+            let _turn = disk_read_turn(&inode).await;
             inode.read_at(offset as usize, buf)?
         };
         cache_overlay_read(&inode, offset as usize, &mut buf[..len]);
@@ -1304,7 +1347,11 @@ impl FileLike for File {
         if !flags.non_block() {
             // block
             loop {
-                match inode.read_at(offset as usize, buf) {
+                let read = {
+                    let _turn = disk_read_turn(&inode).await;
+                    inode.read_at(offset as usize, buf)
+                };
+                match read {
                     Ok(read_len) => {
                         cache_overlay_read(&inode, offset as usize, &mut buf[..read_len]);
                         return Ok(read_len);
@@ -1326,7 +1373,10 @@ impl FileLike for File {
                 }
             }
         }
-        let len = inode.read_at(offset as usize, buf)?;
+        let len = {
+            let _turn = disk_read_turn(&inode).await;
+            inode.read_at(offset as usize, buf)?
+        };
         cache_overlay_read(&inode, offset as usize, &mut buf[..len]);
         Ok(len)
     }
