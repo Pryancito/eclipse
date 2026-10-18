@@ -4,6 +4,7 @@ mod eclipsefs_image;
 mod image;
 mod nvctl_probe;
 pub(crate) mod nvidia_firmware;
+mod nvidia_userspace;
 mod opencv;
 mod portal;
 mod signal_probe;

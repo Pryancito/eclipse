@@ -476,6 +476,11 @@ impl super::LinuxRootfs {
             // minimal live/installer root built below (LIVE_KEEP omits
             // lib/firmware entirely).
             super::nvidia_firmware::install(&rootfs_path);
+            // NVIDIA's own userspace (nvidia-smi, NVML, libcuda) and the glibc
+            // it runs on, for /dev/nvidiactl: only when asked for.
+            if std::env::var(super::nvidia_userspace::HATCH).as_deref() == Ok("1") {
+                super::nvidia_userspace::install(&rootfs_path);
+            }
 
             // Remove any installer payloads left over from a previous (possibly
             // failed) build. `make(false)` never clears the rootfs, so without
