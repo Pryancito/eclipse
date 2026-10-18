@@ -246,3 +246,36 @@ mod the_process_a_thread_id_names {
         assert!(process_of_thread_in(&job, first).is_none());
     }
 }
+
+mod the_thread_a_tid_names {
+    use super::*;
+
+    /// What `tkill` at another process's thread needs: the thread itself,
+    /// and the process its permission is judged against.
+    #[test]
+    fn a_thread_of_another_process_is_found_with_its_process() {
+        let job = a_job();
+        let theirs = a_process_in(&job, 94_190);
+        let worker = Thread::create_linux(&theirs).unwrap();
+        let (proc, thread) = find_thread_in(&job, worker.id()).expect("thread not found");
+        assert_eq!(proc.id(), theirs.id());
+        assert_eq!(thread.id(), worker.id());
+    }
+
+    #[test]
+    fn an_id_no_thread_has_finds_nothing() {
+        let job = a_job();
+        a_process_in(&job, 94_191);
+        assert!(find_thread_in(&job, 94_199).is_none());
+    }
+
+    #[test]
+    fn a_thread_of_an_exited_process_is_not_found() {
+        let job = a_job();
+        let proc = a_process_in(&job, 94_192);
+        let worker = Thread::create_linux(&proc).unwrap();
+        let tid = worker.id();
+        proc.exit(0);
+        assert!(find_thread_in(&job, tid).is_none());
+    }
+}

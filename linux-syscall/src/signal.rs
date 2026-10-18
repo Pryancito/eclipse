@@ -681,34 +681,37 @@ impl Syscall<'_> {
             tid,
             signum
         );
-        let parent = self.zircon_process().clone();
-        match parent.get_child(tid) {
-            Ok(obj) => {
-                let thread: Arc<Thread> = match obj.downcast_arc() {
-                    Ok(t) => t,
-                    Err(_) => return Err(LxError::ESRCH),
-                };
-                // tkill(tid, 0) probes the thread and delivers nothing.
-                if let Some(signal) = signal {
-                    queue_signal_to_thread(
-                        &thread,
-                        signal,
-                        self.sent_by_me(signal, SignalCode::TKILL),
-                    );
-                }
-                Ok(0)
-            }
-            Err(_) => Err(LxError::ESRCH),
+        // `find_task_by_vpid(tid)`: anywhere on the machine, not only in the
+        // caller's own process, which is where it was looked for before --
+        // a `tkill` at another process's thread answered `ESRCH`. Home first,
+        // because that is where nearly every `tkill` points and it costs no
+        // census walk.
+        let own = self.zircon_process().clone();
+        let found = own
+            .get_child(tid)
+            .ok()
+            .and_then(|obj| obj.downcast_arc::<Thread>().ok())
+            .map(|thread| (own.clone(), thread))
+            .or_else(|| linux_object::process::find_thread(tid));
+        let Some((process, thread)) = found else {
+            return Err(LxError::ESRCH);
+        };
+        // `do_send_specific()` -> `check_kill_permission()`, as for `tgkill`;
+        // the caller's own threads always pass it.
+        self.may_signal_process(&self.kill_context(signal), &process)?;
+        // tkill(tid, 0) probes the thread and delivers nothing.
+        if let Some(signal) = signal {
+            queue_signal_to_thread(&thread, signal, self.sent_by_me(signal, SignalCode::TKILL));
         }
+        Ok(0)
     }
 
     /// Send a signal to a thread specified by tgid (i.e., process) and pid
     /// Note: the job of the target process should be the same as the calling thread
     ///
     /// This one reaches into ANOTHER process, so `check_kill_permission()`
-    /// applies exactly as it does to `kill(2)`. (`tkill(2)` next door does
-    /// not: it only ever looks inside the caller's own process, which is
-    /// narrower than Linux and needs no gate of its own.)
+    /// applies exactly as it does to `kill(2)` -- and to `tkill(2)` next door,
+    /// which reaches as far.
     pub fn sys_tgkill(&mut self, tgid: usize, tid: usize, signum: usize) -> SysResult {
         let tgid = single_task_id(tgid)?;
         let tid = single_task_id(tid)?;
@@ -864,7 +867,11 @@ impl Syscall<'_> {
             pid, signum, user.code.0
         );
         let pid = pid_arg(pid as isize);
-        if !may_queue_siginfo(user.code.0, pid as i64 == self.zircon_process().id() as i64) {
+        // `task_pid_vnr(current) != pid`: Linux compares against the CALLER'S
+        // TID, not its process id. For a leader the two are the same number;
+        // for any other thread, naming its own process with a forged code is
+        // refused, and naming its own tid is allowed.
+        if !may_queue_siginfo(user.code.0, pid as i64 == self.thread.id() as i64) {
             return Err(LxError::EPERM);
         }
         // `kill_proc_info()` looks the pid up as `kill(2)` does: a thread id
