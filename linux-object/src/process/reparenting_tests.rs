@@ -301,3 +301,202 @@ fn a_process_with_nothing_to_hand_over_leaves_the_adopter_alone() {
         "the adopter was woken for a handover that moved nothing"
     );
 }
+
+/// Whoever reaps a child is its parent when it dies, and after an adoption
+/// that is the adopter. The death notification worked it out again from
+/// the parent the child was FORKED from, walking that corpse's ancestors
+/// for a volunteer, and the walk only agrees with the adoption while
+/// nobody's `PR_SET_CHILD_SUBREAPER` has changed in between.
+///
+/// Here a process between the dead parent and the adopter volunteers after
+/// the adoption. The walk stops at it, so it was the one told: it got a
+/// zombie of a process that was never its child (its `wait(-1)` hands
+/// back a stranger's pid), and the real parent got no SIGCHLD, so a `wait`
+/// it is blocked in sleeps on with its child dead.
+#[test]
+fn an_adopted_orphan_dies_into_its_adopter_after_a_later_volunteer() {
+    let top = a_process(46_020);
+    top.linux().set_child_subreaper(true);
+    let mid = a_child_of(&top);
+    let parent = a_child_of(&mid);
+    let orphan = a_child_of(&parent);
+    parent.exit(0);
+    assert_eq!(ppid_of(&orphan), Some(top.id()), "adopted by the volunteer");
+
+    mid.linux().set_child_subreaper(true);
+    top.signal_clear(Signal::SIGCHLD);
+    orphan.exit(7);
+
+    assert!(
+        holds_zombie(&top, orphan.id()),
+        "the adopter, its parent, holds no exit status for it"
+    );
+    assert!(
+        !holds_child(&top, orphan.id()),
+        "the adopter still holds the dead child as a live one"
+    );
+    assert!(
+        !holds_zombie(&mid, orphan.id()),
+        "a process that never had it as a child was handed its zombie"
+    );
+    assert!(
+        top.signal().contains(Signal::SIGCHLD),
+        "the adopter was not woken, so a wait it is blocked in sleeps on"
+    );
+}
+
+/// The other direction: the adopter withdraws after the adoption. The walk
+/// from the dead parent now passes it by and climbs to a volunteer further
+/// up, but the orphan is still the adopter's child. Linux tells the
+/// parent whatever its flag says now: the flag decides who ADOPTS an
+/// orphan, not who is told of a child's death.
+#[test]
+fn an_adopted_orphan_dies_into_its_adopter_after_it_withdraws() {
+    let top = a_process(46_021);
+    top.linux().set_child_subreaper(true);
+    let mid = a_child_of(&top);
+    mid.linux().set_child_subreaper(true);
+    let parent = a_child_of(&mid);
+    let orphan = a_child_of(&parent);
+    parent.exit(0);
+    assert_eq!(ppid_of(&orphan), Some(mid.id()), "adopted by the nearest");
+
+    mid.linux().set_child_subreaper(false);
+    mid.signal_clear(Signal::SIGCHLD);
+    orphan.exit(7);
+
+    assert!(
+        holds_zombie(&mid, orphan.id()),
+        "the adopter, its parent, holds no exit status for it"
+    );
+    assert!(
+        !holds_zombie(&top, orphan.id()),
+        "a process that never had it as a child was handed its zombie"
+    );
+    assert!(
+        mid.signal().contains(Signal::SIGCHLD),
+        "the adopter was not woken, so a wait it is blocked in sleeps on"
+    );
+}
+
+/// And a child nobody adopted still dies into the parent it was forked
+/// from: reading the parent pointer must not change the plain case.
+#[test]
+fn a_child_that_was_never_adopted_dies_into_its_own_parent() {
+    let top = a_process(46_022);
+    top.linux().set_child_subreaper(true);
+    let parent = a_child_of(&top);
+    let child = a_child_of(&parent);
+    parent.signal_clear(Signal::SIGCHLD);
+
+    child.exit(3);
+
+    assert!(holds_zombie(&parent, child.id()));
+    assert!(!holds_zombie(&top, child.id()));
+    assert!(parent.signal().contains(Signal::SIGCHLD));
+}
+
+/// A child forked while its parent was dying was never filed under anyone
+/// (see the test at the top), and its parent pointer names the corpse. Its
+/// death has to walk past that corpse to the volunteer above it, or the
+/// exit status lands on a process that will never `wait` again.
+#[test]
+fn a_child_forked_from_a_dead_parent_dies_into_the_subreaper_above_it() {
+    let top = a_process(46_023);
+    top.linux().set_child_subreaper(true);
+    let dying = a_child_of(&top);
+    dying.exit(0);
+    let child = Process::fork_from(&dying).unwrap();
+    assert_eq!(ppid_of(&child), Some(dying.id()), "nobody adopted it");
+
+    child.exit(5);
+
+    assert!(
+        holds_zombie(&top, child.id()),
+        "the exit status went to the dead parent, where no wait will look"
+    );
+    assert!(!holds_zombie(&dying, child.id()));
+}
+
+/// `clone(2)` lets a parent pick the signal its child's death sends it, and
+/// an unprivileged one may pick any: it is only ever sent to itself. An
+/// adoption hands the child to a process that never chose it, so Linux
+/// puts it back to SIGCHLD there (`reparent_leader`: "We don't want people
+/// slaying init"). It was kept, so a child cloned with SIGUSR1 or SIGTERM
+/// whose parent then exits delivered that signal to init when it died --
+/// which eclipse-init reads as halt and reboot -- with no permission check
+/// at all, since a death notification is the kernel's own send.
+#[test]
+fn an_adopted_orphan_dies_with_sigchld_whatever_its_parent_chose() {
+    let top = a_process(46_024);
+    top.linux().set_child_subreaper(true);
+    let top_thread = Thread::create_linux(&top).unwrap();
+    let parent = a_child_of(&top);
+    let orphan = a_child_of(&parent);
+    orphan.linux().set_exit_signal(LinuxSignal::SIGUSR1 as u8);
+    parent.exit(0);
+    assert_eq!(ppid_of(&orphan), Some(top.id()), "adopted by the volunteer");
+    assert_eq!(
+        orphan.linux().exit_signal(),
+        LinuxSignal::SIGCHLD as u8,
+        "the adopter inherited the exit signal the dead parent chose"
+    );
+    top_thread.lock_linux().signals = Sigset::default();
+
+    orphan.exit(0);
+
+    let pending = top_thread.lock_linux().signals;
+    assert!(
+        !pending.contains(LinuxSignal::SIGUSR1),
+        "the adopter was sent the signal the dead parent chose"
+    );
+    assert!(
+        pending.contains(LinuxSignal::SIGCHLD),
+        "the adopter was not told its child died"
+    );
+}
+
+/// The parent that chose the signal still gets it: only an adoption resets
+/// the choice.
+#[test]
+fn a_child_dies_with_the_signal_its_own_parent_chose() {
+    let parent = a_process(46_025);
+    let parent_thread = Thread::create_linux(&parent).unwrap();
+    let child = a_child_of(&parent);
+    child.linux().set_exit_signal(LinuxSignal::SIGUSR1 as u8);
+    parent_thread.lock_linux().signals = Sigset::default();
+
+    child.exit(0);
+
+    let pending = parent_thread.lock_linux().signals;
+    assert!(pending.contains(LinuxSignal::SIGUSR1));
+    assert!(!pending.contains(LinuxSignal::SIGCHLD));
+}
+
+/// The same signal through the one door the adoption does not cover: a
+/// child forked while its parent was dying is filed under nobody, so
+/// nothing resets its choice, and its death walks past the corpse to the
+/// volunteer above it. That volunteer never chose the signal either.
+#[test]
+fn a_child_forked_from_a_dead_parent_dies_with_sigchld_whatever_was_chosen() {
+    let top = a_process(46_026);
+    top.linux().set_child_subreaper(true);
+    let top_thread = Thread::create_linux(&top).unwrap();
+    let dying = a_child_of(&top);
+    dying.exit(0);
+    let child = Process::fork_from(&dying).unwrap();
+    child.linux().set_exit_signal(LinuxSignal::SIGUSR1 as u8);
+    top_thread.lock_linux().signals = Sigset::default();
+
+    child.exit(0);
+
+    let pending = top_thread.lock_linux().signals;
+    assert!(
+        !pending.contains(LinuxSignal::SIGUSR1),
+        "a process that never chose the signal was sent it"
+    );
+    assert!(
+        pending.contains(LinuxSignal::SIGCHLD),
+        "the volunteer was not told the child died"
+    );
+}

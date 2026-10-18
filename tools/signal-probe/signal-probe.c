@@ -14,6 +14,10 @@
 //   * a handler that rewrote the saved `rip` to a non-canonical address took
 //     the whole kernel down: the CPU faults on the way back to user mode, in
 //     ring 0. (#1943)
+//   * an orphan kept the death signal its dead parent chose, so a child cloned
+//     with SIGTERM or SIGUSR1 whose parent exited sent it to init, which
+//     reboots or halts on those; and an orphan's death was routed from the
+//     parent it was FORKED from, not the one that adopted it.
 //
 // Every section states what Linux does and checks it, printing the numbers
 // whether it passes or fails. Each section runs in a child of its own, so a
@@ -32,6 +36,10 @@
 //   ids        the kernel refuses what it cannot load: a TLS pointer outside
 //              user space (`arch_prctl`, `clone(CLONE_SETTLS)`), and the pid
 //              INT_MIN, which has no negation, in `waitpid`.
+//   orphan     an orphan's death tells its ADOPTER, with SIGCHLD whatever
+//              signal its dead parent chose at clone(2), and wakes the
+//              adopter's `waitpid` even when a process in between volunteered
+//              as a subreaper after the adoption.
 //
 // Build:  make                 (x86_64-linux-musl-gcc -O2 -static)
 // Run:    ./signal-probe [--only SECTION]
@@ -53,6 +61,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/prctl.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
 #include <time.h>
@@ -396,6 +405,149 @@ static void sec_ids(void) {
           got < 0 ? strerror(errno) : "a child");
 }
 
+// ----------------------------------------------------------------- orphan
+
+// A child's death signals its parent with the signal that parent chose at
+// clone(2). An orphan's death signals its ADOPTER, and with SIGCHLD: Linux
+// puts the choice back when it reparents (`reparent_leader`, "We don't want
+// people slaying init"). The signal chosen here is SIGWINCH, which init
+// discards: if the subreaper did not hold, the orphan would go to init, and
+// eclipse-init reboots or halts on SIGTERM, SIGINT, SIGUSR1 and SIGUSR2.
+
+static volatile sig_atomic_t g_winch_runs, g_chld_for, g_watch_pid;
+
+static void winch_counts(int sig, siginfo_t *si, void *uc) {
+    (void)sig, (void)si, (void)uc;
+    g_winch_runs++;
+}
+
+static void chld_watches(int sig, siginfo_t *si, void *uc) {
+    (void)sig, (void)uc;
+    if (si->si_pid == g_watch_pid) g_chld_for++;
+}
+
+static void alarm_interrupts(int sig, siginfo_t *si, void *uc) {
+    (void)sig, (void)si, (void)uc;
+}
+
+static int send_pid(int fd, pid_t pid) {
+    return write(fd, &pid, sizeof pid) == (ssize_t)sizeof pid;
+}
+
+static pid_t recv_pid(int fd) {
+    pid_t pid;
+    return read(fd, &pid, sizeof pid) == (ssize_t)sizeof pid ? pid : -1;
+}
+
+// Fork a parent that clones one child with `exit_sig` as its death signal and
+// exits at once. The child waits until it has been adopted, then for one byte
+// on `go`, and exits. Returns the orphan's pid (its parent already reaped).
+static pid_t make_orphan(int exit_sig, int go) {
+    int p[2];
+    if (pipe(p) != 0) return -1;
+    pid_t parent = fork();
+    if (parent == 0) {
+        pid_t me = getpid();
+        long c = syscall(SYS_clone, (long)exit_sig, 0L, 0L, 0L, 0L);
+        if (c == 0) {
+            for (int i = 0; i < 400 && getppid() == me; i++) sleep_ms(5);
+            char b;
+            _exit(read(go, &b, 1) == 1 ? 0 : 3);
+        }
+        _exit(c > 0 && send_pid(p[1], (pid_t)c) ? 0 : 2);
+    }
+    close(p[1]);
+    pid_t orphan = recv_pid(p[0]);
+    close(p[0]);
+    waitpid(parent, NULL, 0);
+    return orphan;
+}
+
+static void sec_orphan(void) {
+    if (prctl(PR_SET_CHILD_SUBREAPER, 1L, 0L, 0L, 0L) != 0) {
+        skip("orphan checks", "PR_SET_CHILD_SUBREAPER refused: an orphan would go to init");
+        return;
+    }
+    install(SIGWINCH, winch_counts, SA_RESTART);
+    install(SIGCHLD, chld_watches, SA_RESTART);
+
+    // 1. The signal the dead parent chose stays with the dead parent.
+    int go[2];
+    if (pipe(go) != 0) {
+        check(0, "pipe", "%s", strerror(errno));
+        return;
+    }
+    g_winch_runs = 0;
+    g_chld_for = 0;
+    pid_t orphan = make_orphan(SIGWINCH, go[0]);
+    g_watch_pid = orphan;
+    if (write(go[1], "x", 1) != 1) check(0, "write", "%s", strerror(errno));
+    int st = 0;
+    pid_t got;
+    while ((got = waitpid(orphan, &st, 0)) == -1 && errno == EINTR) {
+    }
+    int e = errno;
+    sleep_ms(50);
+    check(got == orphan && orphan > 0, "we adopted the orphan and reaped it",
+          "waitpid returned %d for %d (%s)", (int)got, (int)orphan,
+          got < 0 ? strerror(e) : "the orphan");
+    check(g_winch_runs == 0, "not sent its dead parent's signal", "SIGWINCH came %d time(s)",
+          (int)g_winch_runs);
+    check(g_chld_for == 1, "sent SIGCHLD instead", "SIGCHLD for it came %d time(s)",
+          (int)g_chld_for);
+    close(go[0]);
+    close(go[1]);
+
+    // 2. A process between us and the dead parent volunteers AFTER we
+    //    adopted. The orphan is still ours: our blocked waitpid must wake,
+    //    and the volunteer must not be handed a zombie of a stranger.
+    int to_us[2], dead[2];
+    if (pipe(go) != 0 || pipe(to_us) != 0 || pipe(dead) != 0) {
+        check(0, "pipe", "%s", strerror(errno));
+        return;
+    }
+    pid_t mid = fork();
+    if (mid == 0) {
+        pid_t o = make_orphan(SIGCHLD, go[0]);
+        if (prctl(PR_SET_CHILD_SUBREAPER, 1L, 0L, 0L, 0L) != 0) _exit(4);
+        if (!send_pid(to_us[1], o)) _exit(5);
+        sleep_ms(300);  // so the adopter is asleep in waitpid first
+        if (write(go[1], "x", 1) != 1) _exit(6);
+        char b;
+        if (read(dead[0], &b, 1) != 1) _exit(7);
+        int s2;
+        errno = 0;
+        pid_t w = waitpid(-1, &s2, WNOHANG);
+        _exit(w == -1 && errno == ECHILD ? 0 : w > 0 ? 1 : 8);
+    }
+    orphan = recv_pid(to_us[0]);
+    g_watch_pid = orphan;
+    g_chld_for = 0;
+    install(SIGALRM, alarm_interrupts, 0);
+    alarm(3);
+    errno = 0;
+    got = waitpid(orphan, &st, 0);
+    e = errno;
+    alarm(0);
+    if (got != orphan) waitpid(orphan, &st, WNOHANG);
+    sleep_ms(50);
+    check(got == orphan, "a blocked waitpid woke when it died", "returned %d (%s)", (int)got,
+          got < 0 ? strerror(e) : "the orphan");
+    check(g_chld_for == 1, "and we were sent its SIGCHLD", "SIGCHLD for it came %d time(s)",
+          (int)g_chld_for);
+    if (write(dead[1], "x", 1) != 1) check(0, "write", "%s", strerror(errno));
+    int ms = 0;
+    waitpid(mid, &ms, 0);
+    int code = WIFEXITED(ms) ? WEXITSTATUS(ms) : -1;
+    check(code == 0, "the late volunteer got no stranger", "%s (exit %d)",
+          code == 0 ? "its waitpid(-1) said ECHILD"
+          : code == 1 ? "its waitpid(-1) returned the orphan, never its child"
+                      : "the volunteer itself failed",
+          code);
+    signal(SIGALRM, SIG_DFL);
+    alarm(20);
+}
+
 // ------------------------------------------------------------------- main
 
 static const struct {
@@ -409,6 +561,7 @@ static const struct {
     {"restart", "SA_RESTART: what Linux restarts and what it does not", sec_restart},
     {"badrip", "a non-canonical rip from a handler is a SIGSEGV", sec_badrip},
     {"ids", "what the kernel must refuse", sec_ids},
+    {"orphan", "an orphan's death tells its adopter, with SIGCHLD", sec_orphan},
 };
 
 int main(int argc, char **argv) {
