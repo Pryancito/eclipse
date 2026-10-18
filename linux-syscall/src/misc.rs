@@ -31,6 +31,24 @@ const ARCH_GET_FS: i32 = 0x1003;
 #[cfg(target_arch = "x86_64")]
 const ARCH_GET_GS: i32 = 0x1004;
 
+/// Whether `addr` may become a thread's FS or GS base: `EPERM` outside user
+/// space, as `do_arch_prctl_64` answers.
+///
+/// Both bases reach the CPU through `wrmsr` on the way back to user mode, and
+/// `wrmsr` to IA32_FS_BASE/IA32_GS_BASE raises #GP when the value is not
+/// canonical -- in kernel mode, on the exit path, where it is a kernel fault
+/// rather than a user one. `arch_prctl` is not the only way in: Linux's
+/// `copy_thread` runs a `CLONE_SETTLS` pointer through this same check.
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn user_base_settable(addr: usize) -> LxResult<()> {
+    use zircon_object::vm::{USER_ASPACE_BASE, USER_ASPACE_SIZE};
+    if addr < (USER_ASPACE_BASE + USER_ASPACE_SIZE) as usize {
+        Ok(())
+    } else {
+        Err(LxError::EPERM)
+    }
+}
+
 impl Syscall<'_> {
     #[cfg(target_arch = "x86_64")]
     /// set architecture-specific thread state
@@ -49,20 +67,7 @@ impl Syscall<'_> {
     /// which is how Firefox died here while only `ARCH_SET_FS` was answered.
     pub fn sys_arch_prctl(&mut self, code: i32, addr: usize) -> SysResult {
         use kernel_hal::context::UserContextField;
-        use zircon_object::vm::{USER_ASPACE_BASE, USER_ASPACE_SIZE};
-
-        // Both bases reach the CPU through `wrmsr` on the way back to user
-        // mode, and `wrmsr` to IA32_FS_BASE/IA32_GS_BASE raises #GP when the
-        // value is not canonical -- in kernel mode, on the exit path, where it
-        // is a kernel fault rather than a user one. Linux rejects the same
-        // addresses with EPERM before they can get that far.
-        let settable = |addr: usize| {
-            if addr < (USER_ASPACE_BASE + USER_ASPACE_SIZE) as usize {
-                Ok(())
-            } else {
-                Err(LxError::EPERM)
-            }
-        };
+        let settable = user_base_settable;
 
         match code {
             ARCH_SET_FS => {

@@ -643,6 +643,30 @@ impl TrapReason {
     }
 }
 
+/// The first register a return to ring 3 would load and the CPU refuses,
+/// with its value; `None` when all three can make the trip.
+///
+/// `rip`, `fsbase` and `gsbase` reach the processor on the way OUT of the
+/// kernel: the two bases through `wrmsr` in `syscall_return`, the
+/// instruction pointer through `iretq` -- or `sysretq`, which on Intel checks
+/// `rcx` before it drops to ring 3. Every one of them raises #GP when the
+/// address is not canonical, and raises it in ring 0, where this kernel has
+/// nothing to do with a #GP but panic. So a process that got a non-canonical
+/// value into any of the three took the machine down with it: the `rip` of a
+/// signal frame its handler rewrote before `sigreturn`, a handler address
+/// passed to `sigaction`, an ELF entry point, a `CLONE_SETTLS` pointer.
+///
+/// Canonical for 4-level paging, bits 63..47 all equal: this kernel does not
+/// turn on LA57, and user space ends far below 2^47 anyway.
+#[cfg(target_arch = "x86_64")]
+pub fn noncanonical_user_register(g: &GeneralRegs) -> Option<(&'static str, usize)> {
+    let canonical = |addr: usize| ((addr << 16) as isize >> 16) as usize == addr;
+    [("rip", g.rip), ("fsbase", g.fsbase), ("gsbase", g.gsbase)]
+        .iter()
+        .copied()
+        .find(|&(_, value)| !canonical(value))
+}
+
 /// User context saved on trap.
 #[repr(transparent)]
 #[derive(Clone, Copy)]
@@ -718,12 +742,36 @@ impl UserContext {
 
     pub fn enable_extended_state(&mut self) {}
 
+    /// Stands in for the trip to user mode when [`noncanonical_user_register`]
+    /// says the CPU would refuse it: the context comes back as though the
+    /// processor had raised #GP(0) in ring 3. That is what Linux makes of the
+    /// same state -- `fixup_bad_iret` hands the kernel's own #GP on the
+    /// `iretq` to the user -- and what the run loops already answer, Linux's
+    /// with `SIGSEGV`/`SI_KERNEL`. Returns whether it did.
+    #[cfg(target_arch = "x86_64")]
+    pub fn refuse_noncanonical_entry(&mut self) -> bool {
+        let Some((reg, value)) = noncanonical_user_register(&self.0.general) else {
+            return false;
+        };
+        warn!(
+            "not entering user mode: {} = {:#x} is not canonical; reporting #GP",
+            reg, value
+        );
+        self.0.trap_num = 13;
+        self.0.error_code = 0;
+        true
+    }
+
     /// Switch to user mode.
     pub fn enter_uspace(&mut self) {
         cfg_if! {
             if #[cfg(feature = "libos")] {
                 self.0.run_fncall()
             } else {
+                #[cfg(target_arch = "x86_64")]
+                if self.refuse_noncanonical_entry() {
+                    return;
+                }
                 self.dbg_validate_user_ctx("before enter_uspace");
                 // There used to be a `[rbpfix]` here that rewrote a user `rbp`
                 // found inside the kernel physmap window (0xffff_8000_...) on
@@ -1859,6 +1907,84 @@ mod tests {
                 TrapReason::PageFault(CR2, MMUFlags::READ)
             );
             assert_eq!(reads.get(), 1);
+        }
+
+        // ---- the trip back to ring 3 --------------------------------------
+
+        /// A context about to go back by `sysretq`, with every register the
+        /// check reads set to `value`.
+        fn returning_from_a_syscall_with(value: usize) -> UserContext {
+            let mut ctx = UserContext::new();
+            ctx.0.trap_num = 0x100;
+            // What the last page fault left: the syscall path does not
+            // clear it, and a #GP(0) has to.
+            ctx.0.error_code = 0x6;
+            let g = ctx.general_mut();
+            g.rip = value;
+            g.fsbase = value;
+            g.gsbase = value;
+            ctx
+        }
+
+        #[test]
+        fn both_canonical_halves_are_entered_and_the_hole_between_is_not() {
+            // Both edges of each half: the CPU takes all four. One in the
+            // upper half still faults, but in ring 3, as a page fault the
+            // run loop already turns into SIGSEGV.
+            for ok in [0, 0x7fff_ffff_ffff, 0xffff_8000_0000_0000, usize::MAX] {
+                let g = returning_from_a_syscall_with(ok).0.general;
+                assert_eq!(noncanonical_user_register(&g), None, "{ok:#x}");
+            }
+            for bad in [
+                0x0000_8000_0000_0000,
+                0x0001_0000_0000_0000,
+                0x8000_0000_0000_0000,
+                0xffff_7fff_ffff_ffff,
+            ] {
+                let g = returning_from_a_syscall_with(bad).0.general;
+                assert_eq!(noncanonical_user_register(&g), Some(("rip", bad)));
+            }
+        }
+
+        #[test]
+        fn each_of_the_three_registers_is_checked_on_its_own() {
+            const BAD: usize = 1 << 63;
+            let clean = returning_from_a_syscall_with(0x40_1000).0.general;
+            let with = |set: fn(&mut GeneralRegs)| {
+                let mut g = clean;
+                set(&mut g);
+                noncanonical_user_register(&g)
+            };
+            assert_eq!(with(|g| g.rip = BAD), Some(("rip", BAD)));
+            assert_eq!(with(|g| g.fsbase = BAD), Some(("fsbase", BAD)));
+            assert_eq!(with(|g| g.gsbase = BAD), Some(("gsbase", BAD)));
+            // Nothing else is the CPU's to refuse on the way out: a stack
+            // pointer off in the hole faults on the first push, in ring 3.
+            assert_eq!(with(|g| g.rsp = BAD), None);
+        }
+
+        #[test]
+        fn a_refused_entry_comes_back_as_a_general_protection_fault_from_user_mode() {
+            let mut ctx = returning_from_a_syscall_with(0x8000_0000_0000_0000);
+            let regs = ctx.0.general;
+            assert!(ctx.refuse_noncanonical_entry());
+            // The raw number first: a wrong one could be the page-fault
+            // vector, and decoding that reads `CR2`, which a host cannot.
+            assert_eq!(ctx.raw_trap_reason(), 13);
+            assert_eq!(ctx.trap_reason(), TrapReason::GernelFault(13));
+            assert_eq!(ctx.error_code(), 0);
+            // The registers are the evidence in the fault report, and the
+            // handler's own frame is built from them: left as they were.
+            assert_eq!(ctx.0.general, regs);
+        }
+
+        #[test]
+        fn a_canonical_context_is_entered_untouched() {
+            // Above all `trap_num`: 0x100 is what sends the return through
+            // `sysretq`, and every syscall in the system takes that path.
+            let mut ctx = returning_from_a_syscall_with(0x40_1000);
+            assert!(!ctx.refuse_noncanonical_entry());
+            assert_eq!(ctx.trap_reason(), TrapReason::Syscall);
         }
     }
 }

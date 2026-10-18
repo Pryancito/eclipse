@@ -802,6 +802,11 @@ impl Syscall<'_> {
         {
             return Err(LxError::EINVAL);
         }
+        // `copy_thread`: the new thread's FS base is held to `arch_prctl`'s
+        // rule. Unchecked, a pointer outside user space was only refused by
+        // the CPU, at the child's first `wrmsr` -- in ring 0.
+        #[cfg(target_arch = "x86_64")]
+        clone_tls_checked(clone_flags, newtls)?;
         // Fork-like clones: if the THREAD bit is not set, the caller wants a
         // new process. This covers SIGCHLD (0x11), VFORK|VM|SIGCHLD (0x4111)
         // and other combinations used by musl/glibc fork/posix_spawn/system().
@@ -1086,23 +1091,10 @@ impl Syscall<'_> {
         options: u32,
         rusage: UserOutPtr<RUsage>,
     ) -> SysResult {
-        #[derive(Debug)]
-        enum WaitTarget {
-            AnyChild,
-            AnyChildInGroup,
-            Pgid(KoID),
-            Pid(KoID),
-        }
         // Validated before anything else, as `kernel_wait4` does: a bit
         // outside its mask is EINVAL whatever `pid` names.
         let opts = wait4_options(options)?;
-        let target = match pid {
-            -1 => WaitTarget::AnyChild,
-            0 => WaitTarget::AnyChildInGroup,
-            p if p > 0 => WaitTarget::Pid(p as KoID),
-            // pid < -1: any child in process group |pid|.
-            p => WaitTarget::Pgid((-p) as KoID),
-        };
+        let target = wait4_target(pid)?;
         let WaitOptions {
             nohang,
             reap,
@@ -2992,6 +2984,8 @@ mod pdeathsig_tests {
 #[cfg(test)]
 mod clone3_tests;
 
+#[cfg(all(test, target_arch = "x86_64"))]
+mod clone_tls_tests;
 #[cfg(test)]
 mod wait_option_tests;
 
@@ -3747,6 +3741,43 @@ fn clone_shares_without_thread(f: CloneFlags) -> bool {
     !f.contains(CloneFlags::THREAD)
         && (f.intersects(UNSUPPORTED_CLONE_SHARE)
             || (f.contains(CloneFlags::VM) && !f.contains(CloneFlags::VFORK)))
+}
+
+/// `copy_thread` on x86_64: a `CLONE_SETTLS` pointer becomes the new
+/// thread's FS base, so it answers to `arch_prctl`'s rule
+/// ([`crate::misc::user_base_settable`]) and a refusal fails the whole
+/// clone. Without the flag the argument is not read at all.
+#[cfg(target_arch = "x86_64")]
+fn clone_tls_checked(f: CloneFlags, tls: usize) -> LxResult<()> {
+    if f.contains(CloneFlags::SETTLS) {
+        crate::misc::user_base_settable(tls)?;
+    }
+    Ok(())
+}
+
+/// Which children a `wait4` pid names.
+#[derive(Debug, PartialEq, Eq)]
+enum WaitTarget {
+    AnyChild,
+    AnyChildInGroup,
+    Pgid(KoID),
+    Pid(KoID),
+}
+
+/// `kernel_wait4`'s reading of its pid, after the options check.
+///
+/// "-INT_MIN is not defined", so Linux answers `ESRCH` before it negates.
+/// Here it was negated: an overflow panic in a debug kernel, reached by any
+/// process calling `waitpid(INT_MIN, ..)`, and in a release one a wrapped
+/// group id no child has, so `ECHILD`.
+fn wait4_target(pid: i32) -> LxResult<WaitTarget> {
+    Ok(match pid {
+        i32::MIN => return Err(LxError::ESRCH),
+        -1 => WaitTarget::AnyChild,
+        0 => WaitTarget::AnyChildInGroup,
+        p if p > 0 => WaitTarget::Pid(p as KoID),
+        p => WaitTarget::Pgid((-p) as KoID),
+    })
 }
 
 #[cfg(test)]
