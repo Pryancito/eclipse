@@ -236,13 +236,40 @@ impl DrmDev {
             drm::set_crtc_blanked(off);
             return Ok(0);
         }
+        // `drm_mode_obj_set_property_ioctl`: on an atomic driver every other
+        // property is `set_property_atomic`, a one-property atomic state
+        // committed at once (no event, and no ALLOW_MODESET, so a change
+        // that needs a modeset is the check's EINVAL); on a legacy driver it
+        // is `set_property_legacy`, the object's own `set_property`, which
+        // this KMS has for nothing but DPMS: EINVAL. This accepted every
+        // value as a no-op, so a legacy client that moved the primary
+        // plane's FB_ID here was told yes and kept scanning out the old one.
+        if !drm::atomic_enabled() || !drm::software_kms_active() {
+            log::debug!(
+                "[drm] OBJ_SETPROPERTY obj={} type={:#x} prop={} val={} -> EINVAL (legacy KMS has no set_property)",
+                obj_id,
+                kind,
+                prop_id,
+                value
+            );
+            return Err(FsError::InvalidParam);
+        }
+        let mut upd = drm::AtomicUpdate::default();
+        atomic_stage(&mut upd, obj_id, prop_id, value)?;
+        if let Some(fd) = upd.in_fence_fd {
+            in_fence_of_fd(fd)?;
+        }
+        // OUT_FENCE_PTR: `drm_atomic_crtc_set_property` writes the -1 (done
+        // in the staging) and the commit runs; `prepare_signaling`, which
+        // makes the fence, is the ATOMIC ioctl's alone, so none follows.
         log::debug!(
-            "[drm] OBJ_SETPROPERTY obj={} type={:#x} prop={} val={} (accepted, no-op)",
+            "[drm] OBJ_SETPROPERTY obj={} type={:#x} prop={} val={} -> one-property atomic commit",
             obj_id,
             kind,
             prop_id,
             value
         );
+        drm::atomic_commit(&upd, false, false, false, 0, &self.file, None).map_err(atomic_errno)?;
         Ok(0)
     }
 
@@ -2969,12 +2996,7 @@ impl DrmDev {
                         fence.put_back();
                     }
                 }
-                commit.map_err(|e| match e {
-                    drm::AtomicError::Invalid => FsError::InvalidParam,
-                    drm::AtomicError::NotFound => FsError::EntryNotFound,
-                    drm::AtomicError::Device => FsError::DeviceError,
-                    drm::AtomicError::Busy => FsError::Busy,
-                })?;
+                commit.map_err(atomic_errno)?;
                 Ok(0)
             }
             DRM_IOCTL_SYNCOBJ_CREATE => {
@@ -5926,6 +5948,16 @@ enum AtomicObject {
 
 /// Resolve an atomic request's object id to its kind, or `None` if no object
 /// of the pipeline carries that id.
+/// The errno of a refused or failed atomic commit.
+fn atomic_errno(e: drm::AtomicError) -> FsError {
+    match e {
+        drm::AtomicError::Invalid => FsError::InvalidParam,
+        drm::AtomicError::NotFound => FsError::EntryNotFound,
+        drm::AtomicError::Device => FsError::DeviceError,
+        drm::AtomicError::Busy => FsError::Busy,
+    }
+}
+
 fn atomic_object(obj_id: u32) -> Option<AtomicObject> {
     if drm::get_plane(obj_id).is_some() {
         Some(AtomicObject::Plane)
@@ -6064,13 +6096,19 @@ fn atomic_stage_on(
         },
         AtomicObject::Connector => match prop_id {
             PROP_CRTC_ID => upd.connector_crtc_id = Some(value as u32),
+            // link-status is writable (Linux creates it with no flags) but
+            // only the kernel ever moves it: `drm_atomic_connector_set_property`
+            // "never downgrades from GOOD to BAD on userspace's request", so
+            // the write is taken and changes nothing. This refused it EINVAL,
+            // so a compositor re-asserting GOOD after a link retrain was told
+            // its connector had no such property.
+            PROP_LINK_STATUS => {}
             // Properties the connector really has but that an atomic commit
-            // cannot set: EDID / link-status / non-desktop are immutable and
-            // were refused above; DPMS is legacy-only. Linux answers all
-            // four EINVAL -- `drm_mode_atomic_ioctl` looks the property up
-            // first and only then refuses it -- and ENOENT here would tell a
-            // compositor that enumerated the property that it has since
-            // vanished.
+            // cannot set: EDID / non-desktop are immutable and were refused
+            // above; DPMS is legacy-only. Linux answers all three EINVAL --
+            // `drm_mode_atomic_ioctl` looks the property up first and only
+            // then refuses it -- and ENOENT here would tell a compositor that
+            // enumerated the property that it has since vanished.
             _ => return Err(FsError::InvalidParam),
         },
     }
@@ -6146,119 +6184,10 @@ fn write_out_fence_slot(ptr: u64, fd: i32) {
     }
 }
 
-/// Per-boot budget for the `[drm-wsi]` klog traces. klog writes SYNCHRONOUSLY
-/// to the UART with no level filter; if any session process turns out to POLL
-/// the KMS query ioctls (rather than probing once at startup), an uncapped
-/// trace becomes a console storm -- and a klog storm has starved input on
-/// this kernel before (see the EXEC-failure dedup note in nouveau_uapi.rs).
-/// ~48 lines cover a full vulkaninfo VK_KHR_display probe sequence with room
-/// to spare; after that the tracer goes silent for the rest of the boot and
-/// says so once.
-/// The six KMS query ioctls Mesa's `wsi_display` issues, by the name a
-/// dmesg reader recognises. `None` for anything else.
-fn wsi_query_name(cmd: u32) -> Option<&'static str> {
-    match cmd {
-        DRM_IOCTL_MODE_GETRESOURCES => Some("GETRESOURCES"),
-        DRM_IOCTL_MODE_GETCONNECTOR => Some("GETCONNECTOR"),
-        DRM_IOCTL_MODE_GETENCODER => Some("GETENCODER"),
-        DRM_IOCTL_MODE_GETCRTC => Some("GETCRTC"),
-        DRM_IOCTL_MODE_GETPLANERESOURCES => Some("GETPLANERESOURCES"),
-        DRM_IOCTL_MODE_GETPLANE => Some("GETPLANE"),
-        _ => None,
-    }
-}
-
-/// The DRM object a KMS query asks about, for the refusal trace: `0` for the
-/// two that enumerate rather than name one (`GETRESOURCES`,
-/// `GETPLANERESOURCES`), since those carry no id at all.
-///
-/// The id is a different field in each struct -- `drm_mode_get_connector`
-/// puts `connector_id` after four pointers and three counts, `drm_mode_crtc`
-/// puts `crtc_id` second -- so this reads each one by name rather than
-/// assuming a common prefix, which would print a pointer as an id.
-#[allow(unsafe_code)]
-fn wsi_query_object_id(cmd: u32, data: usize) -> u32 {
-    unsafe {
-        match cmd {
-            DRM_IOCTL_MODE_GETCONNECTOR => (*(data as *const DrmModeGetConnector)).connector_id,
-            DRM_IOCTL_MODE_GETENCODER => (*(data as *const DrmModeGetEncoder)).encoder_id,
-            DRM_IOCTL_MODE_GETCRTC => (*(data as *const DrmModeGetCrtc)).crtc_id,
-            DRM_IOCTL_MODE_GETPLANE => (*(data as *const DrmModeGetPlane)).plane_id,
-            _ => 0,
-        }
-    }
-}
-
-/// Whether to klog this refusal of a KMS query. Separate from
-/// [`wsi_trace_take`] on purpose: a refusal is the one line worth a boot, and
-/// it must not be spent by the successes that precede it.
-///
-/// Deduped by `(nr, object id)` rather than merely counted, because libdrm
-/// retries (`drmModeGetConnector`'s `goto retry`) and a client that polls the
-/// KMS queries would otherwise repeat one refusal until the budget is gone.
-/// Each distinct refusal prints once; the table is small and fixed, so a
-/// client inventing ids cannot grow it -- past the last slot the channel
-/// simply stops, after saying so.
-fn wsi_fail_take(nr: u32, id: u32) -> bool {
-    use core::sync::atomic::{AtomicBool, AtomicU64};
-    static SEEN: [AtomicU64; WSI_FAIL_SLOTS] = [const { AtomicU64::new(0) }; WSI_FAIL_SLOTS];
-    static FULL_SAID: AtomicBool = AtomicBool::new(false);
-    wsi_fail_take_in(&SEEN, &FULL_SAID, nr, id)
-}
-
-/// How many distinct refusals one boot reports.
-const WSI_FAIL_SLOTS: usize = 16;
-
-/// [`wsi_fail_take`] over a caller-supplied table.
-///
-/// The seam is here, BELOW the global, rather than around the whole function:
-/// the kernel and a test run the identical claim-a-slot code, and a test gets
-/// its own table instead of competing for the one every other test in this
-/// binary is also filling through the dispatch wrapper.
-fn wsi_fail_take_in(
-    seen: &[core::sync::atomic::AtomicU64],
-    full_said: &core::sync::atomic::AtomicBool,
-    nr: u32,
-    id: u32,
-) -> bool {
-    use core::sync::atomic::Ordering;
-    // `(nr << 32) | id`, +1 so a zeroed slot reads as "empty" rather than as
-    // "GETRESOURCES on object 0" -- which is exactly the entry GETRESOURCES
-    // would claim, and the one refusal that needs no id to be worth printing.
-    let key = (((nr as u64) << 32) | id as u64) + 1;
-    for slot in seen.iter() {
-        match slot.compare_exchange(0, key, Ordering::Relaxed, Ordering::Relaxed) {
-            // Claimed an empty slot: first sight of this refusal.
-            Ok(_) => return true,
-            // Occupied. By this same refusal? Then it has been reported.
-            Err(prev) if prev == key => return false,
-            Err(_) => continue,
-        }
-    }
-    if !full_said.swap(true, Ordering::Relaxed) {
-        kernel_hal::klog_info!(
-            "[drm-wsi] {} distinct KMS-query refusals reported -- silencing the rest \
-             for this boot",
-            seen.len()
-        );
-    }
-    false
-}
-
-fn wsi_trace_take() -> bool {
-    use core::sync::atomic::{AtomicU32, Ordering};
-    static BUDGET: AtomicU32 = AtomicU32::new(0);
-    const MAX: u32 = 48;
-    let n = BUDGET.fetch_add(1, Ordering::Relaxed);
-    if n == MAX {
-        kernel_hal::klog_info!(
-            "[drm-wsi] trace budget ({} lines) exhausted -- silencing for this boot \
-             (something polls the KMS queries; capped to protect the console path)",
-            MAX
-        );
-    }
-    n < MAX
-}
+mod wsi_trace;
+#[cfg(test)]
+use wsi_trace::wsi_fail_take_in;
+use wsi_trace::{wsi_fail_take, wsi_query_name, wsi_query_object_id, wsi_trace_take};
 
 mod canonical_ioctl;
 use canonical_ioctl::canonical_drm_ioctl;
@@ -6628,6 +6557,9 @@ mod legacy_core_tests;
 
 #[cfg(test)]
 mod null_list_tests;
+
+#[cfg(test)]
+mod setproperty_commit_tests;
 
 #[cfg(test)]
 mod trail_tests;
