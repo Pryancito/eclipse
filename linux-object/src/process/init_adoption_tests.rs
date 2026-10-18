@@ -1,5 +1,5 @@
-//! INIT (pid 1) as the reaper of last resort, and as the one process the
-//! handover must leave alone.
+//! INIT (pid 1) as the reaper of last resort, as the one process the
+//! handover must leave alone, and as the one process a stop never reaches.
 //!
 //! **One test, on purpose.** `INIT_PID` is a single fixed pid in a shared
 //! `ROOT_JOB`, so only one test in the binary can own it; creating it
@@ -114,7 +114,27 @@ fn init_reaps_what_nobody_else_will_and_hands_over_nothing_itself() {
         "init's child was given another parent"
     );
 
-    // 5. Clean up, and on the way out the last question: with init exited,
+    // 5. And a stop never reaches init (`sig_task_ignored()`). Sent to it,
+    //    it neither ends a wait of init's -- which is how any other process
+    //    now gets stopped, and a stopped init reaps nothing and reboots
+    //    nothing -- nor stays pending under it. Asked here because this is
+    //    the one test that owns pid 1.
+    {
+        use crate::thread::ThreadExt;
+        let thread = Thread::create_linux(&init).unwrap();
+        send_signal_to_process(INIT_PID as usize, LinuxSignal::SIGSTOP).unwrap();
+        assert_eq!(
+            check_signals_of(&thread),
+            Ok(()),
+            "a stop woke a wait of init's"
+        );
+        assert!(
+            !thread.lock_linux().signals.contains(LinuxSignal::SIGSTOP),
+            "the stop was left pending in init"
+        );
+    }
+
+    // 6. Clean up, and on the way out the last question: with init exited,
     //    `live_init` is `None` again -- which is both what every other test
     //    in this binary was written against and, asked from inside the
     //    death itself, the only place that answer is not free.

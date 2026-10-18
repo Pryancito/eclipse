@@ -28,9 +28,17 @@
 //! an allow-list on purpose: restarting a call Linux answers `EINTR` turns a
 //! timeout into one that starts over (`poll`), or a `sigsuspend` into one that
 //! never returns.
+//!
+//! A job-control STOP is the other way a syscall is cut short, and it runs no
+//! handler at all. With no handler Linux makes every one of the first three
+//! again, so a program stopped with Ctrl-Z inside `read`, `pause` or
+//! `waitpid` and continued with `fg` never knows: [`restarts_after_stop`]
+//! says which of them can be made again here, which is the ones whose
+//! arguments still say the same thing the second time.
 
 use super::Sys;
 use core::convert::TryFrom;
+use linux_object::time::TIMER_ABSTIME;
 
 /// `fcntl` commands that wait for a lock: the only ones that can be cut
 /// short, and `-ERESTARTSYS` when they are (`fcntl_setlk`).
@@ -70,6 +78,63 @@ pub fn restarts_after_handler(num: u32, args: &[usize; 6]) -> bool {
         | Sys::SENDMSG
         | Sys::FLOCK => true,
         Sys::FCNTL => matches!(args[1], F_SETLKW | F_OFD_SETLKW),
+        _ => false,
+    }
+}
+
+/// `futex` operations, with the flags `FUTEX_CMD_MASK` takes off.
+const FUTEX_WAIT: usize = 0;
+const FUTEX_LOCK_PI: usize = 6;
+const FUTEX_WAIT_BITSET: usize = 9;
+const FUTEX_LOCK_PI2: usize = 13;
+/// `FUTEX_PRIVATE_FLAG | FUTEX_CLOCK_REALTIME`.
+const FUTEX_FLAGS: usize = 0x80 | 0x100;
+
+/// Whether syscall `num`, called with `args`, is made again when a
+/// job-control stop cut it short and the process has been continued, with
+/// no handler run in between.
+///
+/// Every call [`restarts_after_handler`] makes again, and on top of them the
+/// ones Linux answers `-ERESTARTNOHAND` or `-ERESTART_RESTARTBLOCK`, which
+/// only a handler turns into `EINTR`: `pause`, `rt_sigsuspend`, `poll`,
+/// `select`, a `futex` wait, `msgrcv`/`msgsnd`, `clock_nanosleep`. But only
+/// where making the call again with the same registers waits for what the
+/// first one did -- no timeout, or an absolute one. A relative timeout
+/// (`nanosleep`, a `poll` for 100 ms) would start over from the top, and
+/// Linux keeps the original end in `restart_block` for that; with nothing
+/// here to keep it in, those come back `EINTR` with what they were left
+/// (`nanosleep` writes `rem`), which every caller of them already handles,
+/// because any handler at all gets them the same answer.
+///
+/// `epoll_wait`, `rt_sigtimedwait`, `semop` are plain `-EINTR` in Linux, and
+/// signal(7) lists them as the calls a stop and a continue DO fail.
+pub fn restarts_after_stop(num: u32, args: &[usize; 6]) -> bool {
+    if restarts_after_handler(num, args) {
+        return true;
+    }
+    let Ok(sys) = Sys::try_from(num) else {
+        return false;
+    };
+    #[cfg(target_arch = "x86_64")]
+    match sys {
+        Sys::PAUSE => return true,
+        // A negative timeout is "forever".
+        Sys::POLL => return (args[2] as i32) < 0,
+        Sys::SELECT => return args[4] == 0,
+        _ => {}
+    }
+    match sys {
+        Sys::RT_SIGSUSPEND | Sys::MSGRCV | Sys::MSGSND => true,
+        // A null timeout is "forever".
+        Sys::PPOLL => args[2] == 0,
+        Sys::PSELECT6 => args[4] == 0,
+        Sys::CLOCK_NANOSLEEP => args[1] & TIMER_ABSTIME != 0,
+        Sys::FUTEX => match args[1] & !FUTEX_FLAGS {
+            // FUTEX_WAIT's timeout is the one relative one.
+            FUTEX_WAIT => args[3] == 0,
+            FUTEX_WAIT_BITSET | FUTEX_LOCK_PI | FUTEX_LOCK_PI2 => true,
+            _ => false,
+        },
         _ => false,
     }
 }
@@ -167,5 +232,114 @@ mod tests {
     #[test]
     fn a_number_that_is_no_syscall_is_not() {
         assert!(!restarts_after_handler(u32::MAX, &[0; 6]));
+        assert!(!restarts_after_stop(u32::MAX, &[0; 6]));
+    }
+
+    /// After a stop, made again with the registers it was first made with.
+    fn after_stop(sys: Sys, args: [usize; 6]) -> bool {
+        restarts_after_stop(sys as u32, &args)
+    }
+
+    #[test]
+    fn what_a_handler_makes_again_a_stop_makes_again_too() {
+        for num in 0..600u32 {
+            for args in [[0; 6], [3, F_SETLKW, 0, 0, 0, 0]] {
+                if restarts_after_handler(num, &args) {
+                    assert!(restarts_after_stop(num, &args), "syscall {}", num);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_wait_with_nowhere_to_go_but_a_handler_is_made_again_after_a_stop() {
+        // `-ERESTARTNOHAND`: EINTR from any handler, made again without one.
+        // A `sigsuspend` stopped and continued is still waiting for the
+        // signal it was waiting for.
+        for sys in [Sys::RT_SIGSUSPEND, Sys::MSGRCV, Sys::MSGSND] {
+            let num = sys as u32;
+            assert!(!restarts_after_handler(num, &[0; 6]), "syscall {}", num);
+            assert!(restarts_after_stop(num, &[0; 6]), "syscall {}", num);
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn so_is_pause_and_an_untimed_poll_or_select() {
+        assert!(after_stop(Sys::PAUSE, [0; 6]));
+        assert!(after_stop(
+            Sys::POLL,
+            [0x1000, 1, (-1i32) as u32 as usize, 0, 0, 0]
+        ));
+        assert!(
+            !after_stop(Sys::POLL, [0x1000, 1, 100, 0, 0, 0]),
+            "100 ms would start over"
+        );
+        assert!(
+            !after_stop(Sys::POLL, [0x1000, 1, 0, 0, 0, 0]),
+            "a 0 timeout never waits"
+        );
+        assert!(after_stop(Sys::SELECT, [4, 0x1000, 0, 0, 0, 0]));
+        assert!(!after_stop(Sys::SELECT, [4, 0x1000, 0, 0, 0x2000, 0]));
+    }
+
+    #[test]
+    fn a_poll_with_a_timeout_is_not_it_would_start_over() {
+        assert!(after_stop(Sys::PPOLL, [0x1000, 1, 0, 0, 0, 0]));
+        assert!(!after_stop(Sys::PPOLL, [0x1000, 1, 0x2000, 0, 0, 0]));
+        assert!(after_stop(Sys::PSELECT6, [4, 0x1000, 0, 0, 0, 0]));
+        assert!(!after_stop(Sys::PSELECT6, [4, 0x1000, 0, 0, 0x2000, 0]));
+    }
+
+    #[test]
+    fn a_sleep_is_made_again_only_to_an_absolute_end() {
+        assert!(after_stop(
+            Sys::CLOCK_NANOSLEEP,
+            [1, TIMER_ABSTIME, 0x1000, 0, 0, 0]
+        ));
+        assert!(!after_stop(
+            Sys::CLOCK_NANOSLEEP,
+            [1, 0, 0x1000, 0x2000, 0, 0]
+        ));
+        // A relative sleep comes back EINTR with `rem`, as from a handler.
+        assert!(!after_stop(Sys::NANOSLEEP, [0x1000, 0x2000, 0, 0, 0, 0]));
+    }
+
+    #[test]
+    fn a_futex_wait_is_made_again_unless_its_timeout_is_relative() {
+        let futex =
+            |op: usize, timeout: usize| after_stop(Sys::FUTEX, [0x1000, op, 0, timeout, 0, 0]);
+        let private = 0x80;
+        let realtime = 0x100;
+        assert!(futex(FUTEX_WAIT, 0));
+        assert!(futex(FUTEX_WAIT | private, 0));
+        assert!(
+            !futex(FUTEX_WAIT | private, 0x2000),
+            "FUTEX_WAIT's timeout is relative"
+        );
+        assert!(futex(FUTEX_WAIT_BITSET | private, 0x2000));
+        assert!(futex(FUTEX_WAIT_BITSET | private | realtime, 0x2000));
+        assert!(futex(FUTEX_LOCK_PI | private, 0x2000));
+        assert!(futex(FUTEX_LOCK_PI2, 0));
+        // Nothing to make again in a wake, a requeue, a trylock.
+        for op in [1, 3, 4, 7, 8, 10] {
+            assert!(!futex(op | private, 0), "op {}", op);
+        }
+    }
+
+    #[test]
+    fn what_linux_fails_after_a_stop_and_a_continue_is_not() {
+        // signal(7): "certain blocking interfaces can fail with the error
+        // EINTR after the process is stopped by one of the stop signals and
+        // then resumed via SIGCONT."
+        for sys in [
+            Sys::EPOLL_PWAIT,
+            Sys::RT_SIGTIMEDWAIT,
+            Sys::SEMTIMEDOP,
+            Sys::CONNECT,
+        ] {
+            let num = sys as u32;
+            assert!(!restarts_after_stop(num, &[0; 6]), "syscall {}", num);
+        }
     }
 }

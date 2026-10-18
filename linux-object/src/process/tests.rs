@@ -117,6 +117,58 @@ mod interruptible {
             took
         );
     }
+
+    /// `kill -STOP` on a process in `pause()`. The wait has to end, or the
+    /// stop never happens: `run_user` is the only place that stops a
+    /// process, and a thread gets there when its syscall returns. It used
+    /// to keep waiting, so the stop waited for whatever the syscall waited
+    /// for -- forever, for a `pause` -- and so did the parent's
+    /// `waitpid(WUNTRACED)`. The `EINTR` never reaches the program:
+    /// `run_user` makes the syscall again once the process is continued.
+    #[test]
+    fn a_stop_ends_a_wait_that_would_otherwise_never_return() {
+        let (proc, thread) = a_waiter(44_111);
+        signal_later(proc.id(), LinuxSignal::SIGSTOP, Duration::from_millis(50));
+        let (res, took) = wait_on(&thread, core::future::pending::<()>());
+        assert_eq!(res, Err(LxError::EINTR));
+        assert!(took < Duration::from_secs(2), "returned after {:?}", took);
+        assert!(
+            thread.lock_linux().signals.contains(LinuxSignal::SIGSTOP),
+            "the stop must still be there for run_user to take"
+        );
+    }
+
+    /// Ctrl-Z: the terminal's SIGTSTP, at its default action, is a stop.
+    #[test]
+    fn so_does_a_terminal_stop_left_at_its_default() {
+        let (proc, thread) = a_waiter(44_112);
+        signal_later(proc.id(), LinuxSignal::SIGTSTP, Duration::from_millis(50));
+        let (res, took) = wait_on(&thread, core::future::pending::<()>());
+        assert_eq!(res, Err(LxError::EINTR));
+        assert!(took < Duration::from_secs(2), "returned after {:?}", took);
+    }
+
+    /// A shell sets SIGTSTP to `SIG_IGN` so that Ctrl-Z cannot suspend it:
+    /// then it is no stop, and its wait goes on.
+    #[test]
+    fn a_terminal_stop_the_program_ignores_does_not() {
+        let (proc, thread) = a_waiter(44_113);
+        proc.linux().set_signal_action(
+            LinuxSignal::SIGTSTP,
+            SignalAction {
+                handler: crate::signal::SIG_IGN,
+                flags: SignalActionFlags::empty(),
+                restorer: 0,
+                mask: Default::default(),
+            },
+        );
+        signal_later(proc.id(), LinuxSignal::SIGTSTP, Duration::from_millis(20));
+        let (res, _took) = wait_on(&thread, async {
+            async_std::task::sleep(Duration::from_millis(150)).await;
+            7u32
+        });
+        assert_eq!(res, Ok(7), "an ignored SIGTSTP cut the wait short");
+    }
 }
 
 #[test]

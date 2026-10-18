@@ -1164,6 +1164,22 @@ impl LinuxThread {
         let restore_mask = self.saved_sigmask.take().unwrap_or(self.signal_mask);
         Some((signal, restore_mask))
     }
+
+    /// The signal [`Self::handle_signal`] returned was taken with NO handler
+    /// to run -- ignored, a stop, a default `SIGCONT` -- and `restore_mask`
+    /// is the mask it handed out with it.
+    ///
+    /// `handle_signal` claims `saved_sigmask` for the frame whatever the
+    /// signal turns out to be, and with no frame there is no `sigreturn` to
+    /// put it back: the temporary mask of an `rt_sigsuspend`, a `ppoll` or a
+    /// `pselect6` stayed the thread's mask for good. Linux puts it back the
+    /// moment it knows no handler will run (`restore_saved_sigmask()`). With
+    /// nothing saved, `restore_mask` is the mask already in place, and this
+    /// changes nothing.
+    pub fn taken_without_handler(&mut self, restore_mask: Sigset) {
+        self.handling_signal = None;
+        self.set_signal_mask(restore_mask);
+    }
 }
 
 #[cfg(test)]
@@ -1418,6 +1434,41 @@ mod signal_delivery_tests {
             !restore.contains(Signal::SIGCHLD),
             "the stale mask came back"
         );
+    }
+
+    #[test]
+    fn a_signal_with_no_handler_puts_the_saved_mask_back_at_once() {
+        // `sigsuspend(&temp)`, and the signal that ends it is a stop: no
+        // frame, so no `sigreturn` to reinstate the mask `handle_signal`
+        // took. Left alone, `temp` -- the mask the program wanted for the
+        // length of one call -- would be its mask from then on.
+        let mut t = thread();
+        let mut original = Sigset::empty();
+        original.insert(Signal::SIGUSR1);
+        t.saved_sigmask = Some(original);
+        t.signals.insert(Signal::SIGSTOP);
+
+        let (sig, restore) = t.handle_signal().unwrap();
+        assert_eq!(sig, Signal::SIGSTOP);
+        t.taken_without_handler(restore);
+        assert_eq!(
+            t.signal_mask().val(),
+            original.val(),
+            "the temporary mask stayed"
+        );
+        assert!(t.saved_sigmask.is_none());
+        assert_eq!(t.handling_signal, None);
+    }
+
+    #[test]
+    fn with_nothing_saved_it_leaves_the_mask_as_it_is() {
+        let mut t = thread();
+        t.block_signals(&one(Signal::SIGWINCH));
+        t.signals.insert(Signal::SIGCONT);
+        let before = t.signal_mask();
+        let (_, restore) = t.handle_signal().unwrap();
+        t.taken_without_handler(restore);
+        assert_eq!(t.signal_mask().val(), before.val());
     }
 
     #[test]

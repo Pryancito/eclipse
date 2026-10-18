@@ -5285,7 +5285,7 @@ fn signal_default_action_interrupts(sig: LinuxSignal) -> bool {
 /// Whether a pending signal that did NOT interrupt the syscall may also be
 /// thrown away.
 ///
-/// This is a **different question** from [`signal_interrupts_syscall`], and
+/// This is a **different question** from [`interrupts_syscall`], and
 /// the two were being answered with one predicate. Linux keeps them apart:
 ///
 /// - `sig_kernel_ignore()` -- SIGCONT, SIGCHLD, SIGWINCH, SIGURG -- is the
@@ -5300,18 +5300,14 @@ fn signal_default_action_interrupts(sig: LinuxSignal) -> bool {
 /// every idle desktop process -- had its pending SIGSTOP removed by the very
 /// loop that was waiting, and `kill -STOP` (or Ctrl-Z, or the SIGTTIN a
 /// background job gets for reading the terminal) did nothing at all. The bit
-/// now survives, so the stop happens when the syscall next returns.
+/// now survives, and [`pending_effect`] has the stop wake the syscall.
 ///
 /// A signal explicitly set to `SIG_IGN` is discardable whatever it is -- that
 /// covers SIGTSTP and friends when a shell has told the kernel to ignore
 /// them. SIGKILL cannot reach here: it interrupts.
-fn signal_is_discarded_when_pending(proc_linux: &LinuxProcess, sig: LinuxSignal) -> bool {
-    discards_when_pending(proc_linux.signal_action(sig).handler, sig)
-}
-
-/// [`signal_is_discarded_when_pending`] over a disposition rather than a
-/// process, so the rule can be compared against
-/// [`interrupts_syscall`] without one.
+///
+/// Over a disposition rather than a process, so the rule can be compared
+/// against [`interrupts_syscall`] without one.
 fn discards_when_pending(handler: usize, sig: LinuxSignal) -> bool {
     use crate::signal::{SIG_DFL, SIG_IGN};
     if handler == SIG_IGN {
@@ -5386,14 +5382,78 @@ fn signal_default_action_ignores(sig: LinuxSignal) -> bool {
     )
 }
 
+/// Whether taking `sig`, with `handler` as its action, puts the process into
+/// a job-control stop: SIGSTOP always (its action cannot be changed), and
+/// SIGTSTP, SIGTTIN and SIGTTOU while they are left at the default.
+///
+/// The loader's `handle_signal` stops on exactly this, and
+/// [`pending_effect`] wakes a blocking syscall on exactly this, so the two
+/// cannot disagree about which signals are stops.
+pub fn takes_job_stop(handler: usize, sig: LinuxSignal) -> bool {
+    sig == LinuxSignal::SIGSTOP
+        || (handler == crate::signal::SIG_DFL && STOP_SIGNALS.contains(&sig))
+}
+
+/// What a pending, unblocked signal does to the blocking syscall its thread
+/// is in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingEffect {
+    /// End the wait with `EINTR`. The signal stays pending, and `run_user`
+    /// acts on it on the way out.
+    Interrupt,
+    /// Nothing will ever act on it: drop it, so the wait does not wake on
+    /// the same stale bit for as long as it lasts.
+    Discard,
+    /// Leave it pending and keep waiting. Nothing answers this any more:
+    /// the last signals that did were the stops, and a stop left pending
+    /// under a wait is a stop that never happens.
+    Keep,
+}
+
+/// [`check_signals_of`]'s decision for one pending signal, over a disposition
+/// rather than a process. `init` says whether the thread belongs to PID 1.
+///
+/// A stop has to END the wait. It used to be [`PendingEffect::Keep`] --
+/// neither `EINTR`, which Linux never shows a program for a stop, nor
+/// discarded -- on the reading that the stop would happen "when the syscall
+/// next returns". A blocked syscall returns when what it waits for comes, so
+/// `kill -STOP` (or Ctrl-Z) on a process in `pause()` stopped nothing, ever,
+/// and on one in `sleep 100`, `read` of a pipe or `waitpid` stopped nothing
+/// until the sleep ran out, the data came or the child died; and the
+/// parent's `waitpid(WUNTRACED)` -- a shell's, waiting to print "Stopped" --
+/// waited all that time with it. Linux wakes the sleeper, stops it on the
+/// way out and makes the syscall again when it is continued
+/// (`-ERESTARTSYS` and its kin with no handler to run); `run_user` does the
+/// same with the `EINTR` this returns, so the program never sees it where
+/// Linux would not show it.
+///
+/// Except in init: `sig_task_ignored()` does not let SIGSTOP near the global
+/// init at all, nor a default-action stop near a `SIGNAL_UNKILLABLE` task,
+/// so for PID 1 a stop is dropped, not acted on.
+fn pending_effect(handler: usize, sig: LinuxSignal, init: bool) -> PendingEffect {
+    if takes_job_stop(handler, sig) {
+        return if init {
+            PendingEffect::Discard
+        } else {
+            PendingEffect::Interrupt
+        };
+    }
+    if interrupts_syscall(handler, sig) {
+        PendingEffect::Interrupt
+    } else if discards_when_pending(handler, sig) {
+        PendingEffect::Discard
+    } else {
+        PendingEffect::Keep
+    }
+}
+
 /// Whether a pending signal actually interrupts a blocking syscall.
 ///
 /// Linux only interrupts a syscall for a signal that will run a handler or
 /// terminate the process. A signal whose disposition is *ignore* — `SIG_IGN`,
-/// or `SIG_DFL` for a signal whose default action is ignore/stop (SIGCHLD,
-/// SIGURG, SIGWINCH, SIGCONT, and the job-control stops) — is discarded (or
-/// stops the process without EINTR) and must NOT wake a blocking syscall with
-/// `EINTR`.
+/// or `SIG_DFL` for a signal whose default action is ignore (SIGCHLD,
+/// SIGURG, SIGWINCH, SIGCONT) — is discarded and must NOT wake a blocking
+/// syscall with `EINTR`.
 ///
 /// Returning `EINTR` for these was the bug behind a compositor's libinput
 /// dispatch failing with "Interrupted system call": every time an autostart
@@ -5401,11 +5461,10 @@ fn signal_default_action_ignores(sig: LinuxSignal) -> bool {
 /// `ppoll`/`epoll_pwait` returned `EINTR`, which wlroots treats as a fatal
 /// dispatch error. The disposition list here mirrors the default-ignore set in
 /// `handle_signal` (loader/src/linux.rs) so the two agree on what is a no-op.
-fn signal_interrupts_syscall(proc_linux: &LinuxProcess, sig: LinuxSignal) -> bool {
-    interrupts_syscall(proc_linux.signal_action(sig).handler, sig)
-}
-
-/// [`signal_interrupts_syscall`] over a disposition rather than a process.
+///
+/// The stops are the other half of that sentence, and [`pending_effect`]
+/// answers for them: they do end the wait, because the stop cannot happen
+/// anywhere else.
 fn interrupts_syscall(handler: usize, sig: LinuxSignal) -> bool {
     use crate::signal::{SIG_DFL, SIG_IGN};
     if handler == SIG_IGN {
@@ -5481,11 +5540,13 @@ pub fn check_signals_of(thread: &Arc<Thread>) -> LxResult<()> {
                     Some(lp) => lp,
                     None => return Ok(()),
                 };
+                let init = proc.id() == INIT_PID;
                 let mut rest = pending;
                 let mut discard = Sigset::empty();
                 while let Some(sig) = rest.find_first_signal() {
                     rest.remove(sig);
-                    if signal_interrupts_syscall(proc_linux, sig) {
+                    let effect = pending_effect(proc_linux.signal_action(sig).handler, sig, init);
+                    if effect == PendingEffect::Interrupt {
                         return Err(LxError::EINTR);
                     }
                     // Linux discards an unblocked signal whose disposition is
@@ -5496,10 +5557,9 @@ pub fn check_signals_of(thread: &Arc<Thread>) -> LxResult<()> {
                     // here, every unrelated wake re-scans the same stale
                     // pending bit.
                     //
-                    // But only those: see
-                    // [`signal_is_discarded_when_pending`] for the four that
-                    // were being thrown away with them.
-                    if signal_is_discarded_when_pending(proc_linux, sig) {
+                    // But only those: see [`discards_when_pending`] for the
+                    // four that were being thrown away with them.
+                    if effect == PendingEffect::Discard {
                         discard.insert(sig);
                     }
                 }

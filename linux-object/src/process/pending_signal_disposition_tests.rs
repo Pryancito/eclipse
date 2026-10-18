@@ -17,6 +17,10 @@
 //!
 //! Both predicates are checked over a disposition rather than a process,
 //! which is what lets the two be laid side by side here.
+//!
+//! And then the four were left to sit: not dropped any more, but not
+//! waking the wait either, on the reading that the stop would happen when
+//! the syscall next returned. `pending_effect` is where they now end it.
 
 use super::*;
 use crate::signal::{SIG_DFL, SIG_IGN};
@@ -47,7 +51,7 @@ fn the_two_questions_differ_on_exactly_the_four_stop_signals() {
 }
 
 /// `kill -STOP` on a process sitting in `poll`. The stop itself happens
-/// when the syscall returns, in `handle_signal`; what this fixes is the
+/// in `handle_signal`, once the wait has ended; what this fixes is the
 /// bit being gone by then.
 #[test]
 fn a_pending_stop_signal_is_not_a_signal_to_throw_away() {
@@ -60,13 +64,124 @@ fn a_pending_stop_signal_is_not_a_signal_to_throw_away() {
     }
 }
 
-/// And it still does not raise EINTR, which is the half that was right:
-/// Linux restarts the syscall around a stop rather than failing it, and
-/// this kernel has no restart machinery to do that with.
+/// `interrupts_syscall` is the handler-or-kill question, and for a stop
+/// its answer is no. It is [`pending_effect`] that ends the wait for one.
 #[test]
-fn a_stop_signal_still_does_not_wake_the_syscall_with_eintr() {
+fn a_stop_signal_runs_no_handler_and_kills_nothing() {
     for sig in STOP_SIGNALS {
         assert!(!interrupts_syscall(SIG_DFL, sig), "{:?}", sig);
+    }
+}
+
+/// The finding of the second half, in one assertion: a pending signal
+/// either ends the wait or is dropped, whatever it is, whatever the
+/// program set it to, in init or anywhere else. The four stops at their
+/// default were the ones left to sit -- neither `EINTR` nor dropped -- and
+/// a stop left to sit under a wait is a stop that happens when the wait
+/// ends by itself: a `pause` never does, so `kill -STOP` on one stopped
+/// nothing and its parent's `waitpid(WUNTRACED)` never came back.
+#[test]
+fn no_pending_signal_is_left_to_sit_under_a_wait() {
+    for sig in every_signal() {
+        for handler in [SIG_DFL, SIG_IGN, CAUGHT] {
+            for init in [false, true] {
+                assert_ne!(
+                    pending_effect(handler, sig, init),
+                    PendingEffect::Keep,
+                    "{:?} with handler {:#x}, init {}",
+                    sig,
+                    handler,
+                    init
+                );
+            }
+        }
+    }
+}
+
+/// A stop ends the wait, so that `run_user` gets to stop the process. The
+/// signal is NOT dropped: the stop is what it is there for.
+#[test]
+fn a_stop_ends_the_wait_so_that_it_can_happen() {
+    for sig in STOP_SIGNALS {
+        assert_eq!(
+            pending_effect(SIG_DFL, sig, false),
+            PendingEffect::Interrupt,
+            "{:?}",
+            sig
+        );
+    }
+}
+
+/// `sig_task_ignored()`: SIGSTOP never reaches the global init, and a
+/// default-action stop never reaches a `SIGNAL_UNKILLABLE` task. Nothing
+/// would act on it, so it goes, and init's wait goes on.
+#[test]
+fn init_drops_a_stop_instead() {
+    for sig in STOP_SIGNALS {
+        assert_eq!(
+            pending_effect(SIG_DFL, sig, true),
+            PendingEffect::Discard,
+            "{:?}",
+            sig
+        );
+    }
+}
+
+/// A terminal stop the program ignores or catches is not a stop, in init
+/// or anywhere: ignored is dropped, caught ends the wait for the handler.
+#[test]
+fn a_terminal_stop_the_program_set_is_what_it_set_it_to() {
+    for sig in [
+        LinuxSignal::SIGTSTP,
+        LinuxSignal::SIGTTIN,
+        LinuxSignal::SIGTTOU,
+    ] {
+        for init in [false, true] {
+            assert_eq!(pending_effect(SIG_IGN, sig, init), PendingEffect::Discard);
+            assert_eq!(pending_effect(CAUGHT, sig, init), PendingEffect::Interrupt);
+        }
+    }
+}
+
+/// Being init changes the answer for the stops and for nothing else.
+#[test]
+fn init_is_like_anyone_for_every_other_signal() {
+    for sig in every_signal()
+        .into_iter()
+        .filter(|s| !STOP_SIGNALS.contains(s))
+    {
+        for handler in [SIG_DFL, SIG_IGN, CAUGHT] {
+            assert_eq!(
+                pending_effect(handler, sig, true),
+                pending_effect(handler, sig, false),
+                "{:?} with handler {:#x}",
+                sig,
+                handler
+            );
+        }
+    }
+}
+
+/// Which signals are stops, as the loader and the wait both read it.
+#[test]
+fn a_stop_is_sigstop_or_a_terminal_stop_at_its_default() {
+    for handler in [SIG_DFL, SIG_IGN, CAUGHT] {
+        assert!(takes_job_stop(handler, LinuxSignal::SIGSTOP));
+    }
+    for sig in [
+        LinuxSignal::SIGTSTP,
+        LinuxSignal::SIGTTIN,
+        LinuxSignal::SIGTTOU,
+    ] {
+        assert!(takes_job_stop(SIG_DFL, sig), "{:?}", sig);
+        assert!(!takes_job_stop(SIG_IGN, sig), "{:?}", sig);
+        assert!(!takes_job_stop(CAUGHT, sig), "{:?}", sig);
+    }
+    for sig in every_signal()
+        .into_iter()
+        .filter(|s| !STOP_SIGNALS.contains(s))
+    {
+        assert!(!takes_job_stop(SIG_DFL, sig), "{:?}", sig);
     }
 }
 
