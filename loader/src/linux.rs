@@ -712,6 +712,19 @@ async fn run_user(thread: CurrentThread) {
             break;
         }
     }
+    // Every way out of the loop above is this thread dying, and only one of
+    // those ways is its own `exit(2)`: `exit_group`, a fatal signal, an
+    // `execve` in a sibling and a kill from outside all end here without
+    // passing through `exit_linux`. Linux releases a dead task's robust locks
+    // on every one of them (`do_exit` -> `futex_exit_release`), and a process
+    // killed while holding a `PTHREAD_PROCESS_SHARED` robust mutex is the case
+    // those locks exist for: the waiter in the other process is owed
+    // `EOWNERDEAD`, not a lock nobody will ever unlock. The address space is
+    // still whole here -- `Process::terminate` clears it only once the last
+    // thread is gone, and `execve` waits for every sibling to be gone before
+    // it clears it -- and after an `exit(2)` the list is already taken, so
+    // this is a no-op.
+    thread.release_robust_locks();
     kernel_hal::thread::set_current_thread(None);
 }
 
