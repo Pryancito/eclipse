@@ -5955,6 +5955,7 @@ fn atomic_errno(e: drm::AtomicError) -> FsError {
         drm::AtomicError::NotFound => FsError::EntryNotFound,
         drm::AtomicError::Device => FsError::DeviceError,
         drm::AtomicError::Busy => FsError::Busy,
+        drm::AtomicError::NoSpace => FsError::NoDeviceSpace,
     }
 }
 
@@ -6069,7 +6070,19 @@ fn atomic_stage_on(
                     upd.in_fence_fd = Some(fd);
                 }
             }
-            PROP_FB_DAMAGE_CLIPS => upd.damage_clips = Some(value as u32),
+            // `drm_property_replace_blob_from_id` with `sizeof(struct
+            // drm_mode_rect)` as the element size: a blob that is not a whole
+            // number of rectangles is EINVAL here, before the commit sees it.
+            PROP_FB_DAMAGE_CLIPS => {
+                let blob_id = value as u32;
+                if blob_id != 0
+                    && !drm::get_blob(blob_id)
+                        .is_some_and(|d| d.len().is_multiple_of(drm::DRM_MODE_RECT_SIZE))
+                {
+                    return Err(FsError::InvalidParam);
+                }
+                upd.damage_clips = Some(blob_id);
+            }
             // "type" is immutable and was refused above; nothing else of the
             // plane's reaches here.
             _ => return Err(FsError::InvalidParam),
@@ -6560,6 +6573,9 @@ mod null_list_tests;
 
 #[cfg(test)]
 mod setproperty_commit_tests;
+
+#[cfg(test)]
+mod plane_state_check_tests;
 
 #[cfg(test)]
 mod trail_tests;

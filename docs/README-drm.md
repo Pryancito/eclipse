@@ -200,6 +200,19 @@ en los tres objetos, blobs de modo (`CREATEPROPBLOB`/`MODE_ID`) y
   `drm_property_change_valid_get`: un `FB_ID`/`CRTC_ID` que no nombra nada o
   supera 32 bits, un `MODE_ID`/`FB_DAMAGE_CLIPS` sin blob, un rango o enum
   fuera de lo anunciado (`IN_FENCE_FD` es `[-1, INT_MAX]`).
+- La comprobación del plano (`drm_atomic_plane_check`) mira el estado en el
+  que el commit **deja** al plano, no sólo lo que el commit nombra: CRTC y FB
+  los dos puestos o los dos quitados (un `FB_ID = 0` o un `CRTC_ID = 0` a
+  solas es EINVAL y no aplica nada; el plano se apaga y se enciende con los
+  dos en el mismo commit), el rectángulo fuente en 16.16 dentro del fb con el
+  que acaba (`src_w > ancho << 16 || src_x > (ancho << 16) - src_w`, un borde
+  fraccionario cuenta) → **ENOSPC**, y cada clip de `FB_DAMAGE_CLIPS` un
+  rectángulo real desde el origen (EINVAL; el borde lejano se compara con el
+  tamaño del fb **desplazado 16 bits**, como hace Linux, así que un clip que
+  se pasa en píxeles se acepta y se recorta al presentar); un blob de clips
+  que no es un número entero de rectángulos es EINVAL al escenificar. En un
+  plano que acaba apagado no se mira nada más. Sin ERANGE para las
+  coordenadas de CRTC desbordadas: no hay errno para él en `FsError`.
 - El commit de un `FB_ID` hace el *scanout* (mismo blit que la ruta legacy).
 
 **Cómo activarlo**: es estrictamente **opt-in** mientras la ruta legacy siga
