@@ -610,6 +610,10 @@ fn user_stack_backtrace(vmar: &Arc<VmAddressRegion>, sp: usize) -> Vec<String> {
 /// - return the context to the user thread
 async fn run_user(thread: CurrentThread) {
     kernel_hal::thread::set_current_thread(Some(thread.inner()));
+    // The syscall the last trap answered `EINTR`, while a handler with
+    // `SA_RESTART` can still make it again (`Interrupted`): only the delivery
+    // that follows it can, and it is dropped on the way into user mode.
+    let mut interrupted: Option<Interrupted> = None;
     loop {
         // wait
         let mut ctx = thread.wait_for_run().await;
@@ -645,7 +649,7 @@ async fn run_user(thread: CurrentThread) {
             None
         };
         if let Some((signal, sigmask)) = pending_signal {
-            ctx = handle_signal(&thread, ctx, signal, sigmask);
+            ctx = handle_signal(&thread, ctx, signal, sigmask, &mut interrupted);
         }
         if thread.state() == ThreadState::Dying {
             break;
@@ -679,6 +683,7 @@ async fn run_user(thread: CurrentThread) {
         }
 
         // run
+        interrupted = None;
         trace!(
             "go to user: tid = {} pc = {:x} sp = {:x}",
             thread.id(),
@@ -705,8 +710,9 @@ async fn run_user(thread: CurrentThread) {
         );
         trace!("ctx = {:#x?}", ctx);
         // handle trap/interrupt/syscall
-        if let Err(err) = MarkBlocked::new(&thread, handle_user_trap(&thread, ctx)).await {
-            thread.exit_linux(err as i32);
+        match MarkBlocked::new(&thread, handle_user_trap(&thread, ctx)).await {
+            Ok(cut_short) => interrupted = cut_short,
+            Err(err) => thread.exit_linux(err as i32),
         }
         if thread.state() == ThreadState::Dying {
             break;
@@ -733,6 +739,7 @@ fn handle_signal(
     mut ctx: Box<UserContext>,
     signal: Signal,
     sigmask: Sigset,
+    interrupted: &mut Option<Interrupted>,
 ) -> Box<UserContext> {
     let user_sp = ctx.get_field(UserContextField::StackPointer);
     let user_pc = ctx.get_field(UserContextField::InstrPointer);
@@ -945,6 +952,13 @@ fn handle_signal(
         .lock_linux()
         .signal_alternate_stack
         .take_for_frame();
+    // `SA_RESTART`: the syscall this signal cut short is made again when the
+    // handler returns, so the frame -- and the handler's `ucontext` -- carry
+    // the context of the syscall instruction about to be made, not of its
+    // `EINTR`. That is where Linux puts it too, and what musl's cancellation
+    // handler reads: a thread cancelled in a restarted `read` is at the
+    // syscall, inside `__cp_begin..__cp_end`, and is acted on there.
+    Interrupted::enter_handler(interrupted, &action, &mut ctx);
     let signal_context = SignalUserContext {
         stack: uc_stack,
         sig_mask: sigmask,
@@ -1246,7 +1260,12 @@ macro_rules! run_with_irq_enable {
     };
 }
 
-async fn handle_user_trap(thread: &CurrentThread, mut ctx: Box<UserContext>) -> ZxResult {
+/// Handle what brought the thread out of user mode. For a syscall cut short
+/// by a signal, `Some` with what it takes to make it again (`Interrupted`).
+async fn handle_user_trap(
+    thread: &CurrentThread,
+    mut ctx: Box<UserContext>,
+) -> ZxResult<Option<Interrupted>> {
     let reason = ctx.trap_reason();
     if let TrapReason::Syscall = reason {
         let num = syscall_num(&ctx);
@@ -1278,7 +1297,7 @@ async fn handle_user_trap(thread: &CurrentThread, mut ctx: Box<UserContext>) -> 
                     g.rflags &= !1; // clear carry: success
                 }
             })?;
-            return Ok(());
+            return Ok(None);
         }
         trace!("Syscall: {} {:x?}", num as u32, args);
         let ret = run_with_irq_enable! {
@@ -1286,13 +1305,13 @@ async fn handle_user_trap(thread: &CurrentThread, mut ctx: Box<UserContext>) -> 
         };
         trace!("Syscall ret: {} -> {:x}", num as u32, ret);
         thread.with_context(|ctx| ctx.set_field(UserContextField::ReturnValue, ret))?;
-        return Ok(());
+        return Ok(Interrupted::after(num, &args, ret));
     }
 
     thread.put_context(ctx);
 
     let pid = thread.proc().id();
-    match reason {
+    let handled: ZxResult = match reason {
         TrapReason::Interrupt(vector) => {
             kernel_hal::interrupt::handle_irq(vector);
             #[cfg(not(feature = "libos"))]
@@ -1481,7 +1500,8 @@ async fn handle_user_trap(thread: &CurrentThread, mut ctx: Box<UserContext>) -> 
             );
             Err(ZxError::NOT_SUPPORTED)
         }
-    }
+    };
+    handled.map(|()| None)
 }
 
 /// Map a CPU exception (trap) number to the appropriate Linux signal.
@@ -1528,6 +1548,72 @@ fn syscall_num(ctx: &UserContext) -> usize {
             regs.a7
         } else {
             unimplemented!()
+        }
+    }
+}
+
+/// A syscall a signal cut short, which a handler installed with `SA_RESTART`
+/// makes again (`linux_syscall::restarts_after_handler` says which ones).
+///
+/// What making it again takes is the two registers its `EINTR` overwrote or
+/// may have: the number, which shares `rax` with the result on x86_64, and
+/// the first argument, which shares `x0`/`a0` with it elsewhere. The other
+/// argument registers come back from a syscall as they went in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Interrupted {
+    num: usize,
+    arg0: usize,
+}
+
+impl Interrupted {
+    /// The length of the instruction a syscall is made with: `syscall` on
+    /// x86_64, `svc #0` and `ecall` elsewhere. The context a syscall returns
+    /// with is past it.
+    const SYSCALL_INSN_LEN: usize = if cfg!(target_arch = "x86_64") { 2 } else { 4 };
+
+    /// What syscall `num`, made with `args`, leaves to make again once it
+    /// has answered `ret`: something only if it was cut short by a signal,
+    /// and is one Linux restarts.
+    fn after(num: usize, args: &[usize; 6], ret: usize) -> Option<Self> {
+        let eintr = -(linux_object::error::LxError::EINTR as isize) as usize;
+        (ret == eintr && linux_syscall::restarts_after_handler(num as u32, args))
+            .then_some(Self { num, arg0: args[0] })
+    }
+
+    /// A handler is about to be entered over the syscall `slot` holds, if
+    /// any: with `SA_RESTART` the syscall is made again when the handler
+    /// returns, and without it, it stays cut short. Either way the slot is
+    /// spent.
+    fn enter_handler(slot: &mut Option<Self>, action: &SignalAction, ctx: &mut UserContext) {
+        if let Some(call) = slot.take() {
+            if action.restarts_syscalls() {
+                call.rewind(ctx);
+            }
+        }
+    }
+
+    /// Put `ctx` back on the syscall instruction, with the registers the
+    /// syscall was made with, so that returning to it makes it again.
+    fn rewind(self, ctx: &mut UserContext) {
+        let pc = ctx.get_field(UserContextField::InstrPointer);
+        ctx.set_field(
+            UserContextField::InstrPointer,
+            pc.wrapping_sub(Self::SYSCALL_INSN_LEN),
+        );
+        let regs = ctx.general_mut();
+        cfg_if! {
+            if #[cfg(target_arch = "x86_64")] {
+                regs.rax = self.num;
+            } else if #[cfg(target_arch = "aarch64")] {
+                regs.x8 = self.num;
+                regs.x0 = self.arg0;
+            } else if #[cfg(target_arch = "riscv64")] {
+                regs.a7 = self.num;
+                regs.a0 = self.arg0;
+            } else {
+                let _ = (regs, self.arg0);
+                unimplemented!()
+            }
         }
     }
 }
@@ -2140,5 +2226,142 @@ mod init_pid_and_backtrace_bounds_tests {
             "{} bytes of stack",
             BACKTRACE_SCAN_BYTES
         );
+    }
+}
+
+#[cfg(test)]
+mod syscall_restart_tests {
+    //! `SA_RESTART`: a syscall a signal cut short, made again when the
+    //! handler returns.
+
+    use super::*;
+    use linux_object::error::LxError;
+    use linux_object::signal::SignalActionFlags;
+
+    // The numbers differ between x86_64 and the generic table.
+    const READ: usize = if cfg!(target_arch = "x86_64") { 0 } else { 63 };
+    const PPOLL: usize = if cfg!(target_arch = "x86_64") {
+        271
+    } else {
+        73
+    };
+    const ARGS: [usize; 6] = [3, 0x7ff0_1000, 1, 0, 0, 0];
+    /// Where the syscall instruction is.
+    const AT: usize = 0x40_1000;
+
+    fn eintr() -> usize {
+        -(LxError::EINTR as isize) as usize
+    }
+
+    /// The context a `read(3, buf, 1)` comes back to user mode with when a
+    /// signal cuts it short: past its syscall instruction, with `EINTR` in
+    /// the return register.
+    fn read_cut_short() -> UserContext {
+        let mut ctx = UserContext::default();
+        {
+            let regs = ctx.general_mut();
+            cfg_if! {
+                if #[cfg(target_arch = "x86_64")] {
+                    regs.rax = READ;
+                    (regs.rdi, regs.rsi, regs.rdx) = (ARGS[0], ARGS[1], ARGS[2]);
+                } else if #[cfg(target_arch = "aarch64")] {
+                    regs.x8 = READ;
+                    (regs.x0, regs.x1, regs.x2) = (ARGS[0], ARGS[1], ARGS[2]);
+                } else if #[cfg(target_arch = "riscv64")] {
+                    regs.a7 = READ;
+                    (regs.a0, regs.a1, regs.a2) = (ARGS[0], ARGS[1], ARGS[2]);
+                }
+            }
+        }
+        ctx.set_field(
+            UserContextField::InstrPointer,
+            AT + Interrupted::SYSCALL_INSN_LEN,
+        );
+        ctx.set_field(UserContextField::ReturnValue, eintr());
+        ctx
+    }
+
+    fn handler(flags: SignalActionFlags) -> SignalAction {
+        SignalAction {
+            handler: 0x40_2000,
+            flags,
+            restorer: 0x40_3000,
+            mask: Sigset::empty(),
+        }
+    }
+
+    #[test]
+    fn a_read_cut_short_leaves_itself_to_make_again() {
+        assert_eq!(
+            Interrupted::after(READ, &ARGS, eintr()),
+            Some(Interrupted { num: READ, arg0: 3 })
+        );
+    }
+
+    #[test]
+    fn only_eintr_is_cut_short() {
+        assert_eq!(Interrupted::after(READ, &ARGS, 1), None, "it read a byte");
+        let eagain = -(LxError::EAGAIN as isize) as usize;
+        assert_eq!(Interrupted::after(READ, &ARGS, eagain), None);
+    }
+
+    #[test]
+    fn a_poll_cut_short_is_not_made_again() {
+        // Linux answers EINTR from a poll whenever a handler ran.
+        assert_eq!(Interrupted::after(PPOLL, &ARGS, eintr()), None);
+    }
+
+    #[test]
+    fn a_handler_with_sa_restart_goes_back_to_the_syscall_instruction() {
+        let mut ctx = read_cut_short();
+        let mut slot = Interrupted::after(READ, &ARGS, eintr());
+        Interrupted::enter_handler(
+            &mut slot,
+            &handler(SignalActionFlags::RESTART | SignalActionFlags::SIGINFO),
+            &mut ctx,
+        );
+        assert_eq!(ctx.get_field(UserContextField::InstrPointer), AT);
+        assert_eq!(
+            syscall_num(&ctx),
+            READ,
+            "the syscall number was left where EINTR put it"
+        );
+        assert_eq!(
+            syscall_args(&ctx),
+            ARGS,
+            "the first argument was left where EINTR put it"
+        );
+        assert_eq!(slot, None);
+    }
+
+    #[test]
+    fn a_handler_without_it_leaves_the_program_its_eintr() {
+        let mut ctx = read_cut_short();
+        let mut slot = Interrupted::after(READ, &ARGS, eintr());
+        Interrupted::enter_handler(&mut slot, &handler(SignalActionFlags::SIGINFO), &mut ctx);
+        assert_eq!(
+            ctx.get_field(UserContextField::InstrPointer),
+            AT + Interrupted::SYSCALL_INSN_LEN
+        );
+        assert_eq!(ctx.get_field(UserContextField::ReturnValue), eintr());
+        assert_eq!(slot, None, "a later handler could still restart it");
+    }
+
+    #[test]
+    fn a_handler_over_no_syscall_changes_nothing() {
+        let mut ctx = read_cut_short();
+        let mut slot = None;
+        Interrupted::enter_handler(&mut slot, &handler(SignalActionFlags::RESTART), &mut ctx);
+        assert_eq!(
+            ctx.get_field(UserContextField::InstrPointer),
+            AT + Interrupted::SYSCALL_INSN_LEN
+        );
+    }
+
+    #[test]
+    fn the_syscall_instruction_is_two_bytes_on_x86_64_and_four_elsewhere() {
+        // `0f 05`; `svc #0` and `ecall` are one 32-bit word.
+        let expected = if cfg!(target_arch = "x86_64") { 2 } else { 4 };
+        assert_eq!(Interrupted::SYSCALL_INSN_LEN, expected);
     }
 }

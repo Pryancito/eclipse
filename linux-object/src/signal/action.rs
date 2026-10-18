@@ -138,6 +138,13 @@ impl SignalAction {
     pub fn resets_to_default(&self) -> bool {
         self.flags.contains(SignalActionFlags::RESETHAND)
     }
+
+    /// Whether a syscall this action's signal cut short is made again when
+    /// the handler returns (`SA_RESTART`), for the syscalls Linux restarts at
+    /// all: `linux_syscall::restarts_after_handler` says which.
+    pub fn restarts_syscalls(&self) -> bool {
+        self.flags.contains(SignalActionFlags::RESTART)
+    }
 }
 
 /// The `_sifields` union of `siginfo_t`.
@@ -873,6 +880,27 @@ mod sigaction_tests {
         assert!(!a
             .handler_mask(Sigset::empty(), Signal::SIGSEGV)
             .contains(Signal::SIGSEGV));
+    }
+
+    #[test]
+    fn restart_is_the_flag_that_makes_a_cut_short_syscall_go_again() {
+        // What BSD-style `signal()` installs: glibc's and musl's both.
+        assert!(act(
+            SignalActionFlags::RESTART | SignalActionFlags::SIGINFO,
+            Sigset::empty()
+        )
+        .restarts_syscalls());
+        for flags in [
+            SignalActionFlags::empty(),
+            SignalActionFlags::RESETHAND | SignalActionFlags::NODEFER,
+            SignalActionFlags::SIGINFO | SignalActionFlags::ONSTACK,
+        ] {
+            assert!(
+                !act(flags, Sigset::empty()).restarts_syscalls(),
+                "{:?}",
+                flags
+            );
+        }
     }
 }
 

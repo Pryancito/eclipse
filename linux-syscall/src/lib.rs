@@ -47,6 +47,7 @@ use zircon_object::vm::VirtAddr;
 use self::consts::SyscallType as Sys;
 use self::file::poll_timeout_msecs;
 use self::file::{XattrOp, XattrTarget};
+pub use self::restart::restarts_after_handler;
 
 mod consts {
     // generated from syscall.h.in
@@ -192,6 +193,7 @@ mod ipc;
 mod misc;
 mod net;
 mod outparams;
+mod restart;
 mod signal;
 mod task;
 mod time;
