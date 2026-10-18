@@ -2000,29 +2000,30 @@ impl DrmDev {
                 const MAX_DIRTY_CLIPS: u32 = 256;
                 const MAX_DIRTY_SPANS: usize = 8;
                 let cmd = unsafe { *(data as *const DrmModeFbDirtyCmd) };
-                // `drm_mode_dirtyfb_ioctl`, in its order: a flag it does not
-                // define is EINVAL; the fb is looked up (ENOENT); a clip count
-                // without a pointer, or a pointer without a count, is EINVAL;
+                // `drm_mode_dirtyfb_ioctl`, in its order: the fb is looked up
+                // (ENOENT); a clip count without a pointer, or a pointer
+                // without a count, is EINVAL; the flags are MASKED to the two
+                // it defines (`flags = DRM_MODE_FB_DIRTY_FLAGS & r->flags`),
+                // so a bit it does not know is dropped, never refused;
                 // ANNOTATE_COPY clips come in (src, dst) pairs, so an odd
                 // count is EINVAL; more than DRM_MODE_FB_DIRTY_MAX_CLIPS is
                 // EINVAL. None of it was read: a flush of a framebuffer that
                 // does not exist, or with a clip list the kernel could not
-                // have read, was reported as done.
+                // have read, was reported as done. (And then an unknown bit
+                // was EINVAL, an answer Linux has never given here.)
                 const DRM_MODE_FB_DIRTY_ANNOTATE_COPY: u32 = 0x01;
                 const DRM_MODE_FB_DIRTY_ANNOTATE_FILL: u32 = 0x02;
+                const DRM_MODE_FB_DIRTY_FLAGS: u32 =
+                    DRM_MODE_FB_DIRTY_ANNOTATE_COPY | DRM_MODE_FB_DIRTY_ANNOTATE_FILL;
                 const DRM_MODE_FB_DIRTY_MAX_CLIPS: u32 = 256;
-                if cmd.flags & !(DRM_MODE_FB_DIRTY_ANNOTATE_COPY | DRM_MODE_FB_DIRTY_ANNOTATE_FILL)
-                    != 0
-                {
-                    return Err(FsError::InvalidParam);
-                }
                 if drm::get_fb(cmd.fb_id).is_none() {
                     return Err(FsError::EntryNotFound);
                 }
                 if (cmd.num_clips == 0) != (cmd.clips_ptr == 0) {
                     return Err(FsError::InvalidParam);
                 }
-                if cmd.flags & DRM_MODE_FB_DIRTY_ANNOTATE_COPY != 0 && cmd.num_clips % 2 != 0 {
+                let flags = cmd.flags & DRM_MODE_FB_DIRTY_FLAGS;
+                if flags & DRM_MODE_FB_DIRTY_ANNOTATE_COPY != 0 && cmd.num_clips % 2 != 0 {
                     return Err(FsError::InvalidParam);
                 }
                 if cmd.num_clips > DRM_MODE_FB_DIRTY_MAX_CLIPS {
@@ -2636,38 +2637,36 @@ impl DrmDev {
             }
             DRM_IOCTL_MODE_GETPROPBLOB => {
                 let res = unsafe { &mut *(data as *mut DrmModeGetBlob) };
+                // `drm_mode_getblob_ioctl`: the bytes go out only when the
+                // caller's `length` is EXACTLY the blob's (the two-call
+                // pattern of `drmModeGetPropertyBlob`: ask with 0, allocate
+                // that much, ask again), through `copy_to_user` (EFAULT),
+                // and `length` always comes back as the blob's. This filled
+                // any buffer at least as big, which Linux never does.
+                let copy_out = |res: &mut DrmModeGetBlob, bytes: &[u8]| -> Result<usize> {
+                    if res.length as usize == bytes.len() {
+                        ucheck(res.data as usize, bytes.len())?;
+                        unsafe {
+                            core::ptr::copy_nonoverlapping(
+                                bytes.as_ptr(),
+                                res.data as *mut u8,
+                                bytes.len(),
+                            );
+                        }
+                    }
+                    res.length = bytes.len() as u32;
+                    Ok(0)
+                };
                 // Property-blob store first (user MODE_ID blobs, the kernel's
                 // current-mode blob); EDID blobs keep their own reserved range
                 // of ids below it (see `edid_blob_id`).
                 if let Some(blob) = drm::get_blob(res.blob_id) {
-                    if res.data != 0 && res.length >= blob.len() as u32 {
-                        ucheck(res.data as usize, blob.len())?;
-                        unsafe {
-                            core::ptr::copy_nonoverlapping(
-                                blob.as_ptr(),
-                                res.data as *mut u8,
-                                blob.len(),
-                            );
-                        }
-                    }
-                    res.length = blob.len() as u32;
-                    return Ok(0);
+                    return copy_out(res, &blob);
                 }
                 let connector_id = connector_of_edid_blob(res.blob_id);
                 if let Some(conn_id) = connector_id {
                     if let Some(edid) = drm::get_connector_edid(conn_id) {
-                        if res.data != 0 && res.length >= edid.len() as u32 {
-                            ucheck(res.data as usize, edid.len())?;
-                            unsafe {
-                                core::ptr::copy_nonoverlapping(
-                                    edid.as_ptr(),
-                                    res.data as *mut u8,
-                                    edid.len(),
-                                );
-                            }
-                        }
-                        res.length = edid.len() as u32;
-                        Ok(0)
+                        copy_out(res, &edid)
                     } else {
                         // The connector has no EDID, so no blob carries this
                         // id: ENOENT, as `drm_property_lookup_blob` answers.
@@ -2681,9 +2680,13 @@ impl DrmDev {
             }
             DRM_IOCTL_MODE_CREATEPROPBLOB => {
                 let req = unsafe { &mut *(data as *mut DrmModeCreateBlob) };
-                // Linux: NULL data / zero length are EINVAL. Bound the copy —
-                // real blobs (modes, gamma LUTs) are at most a few KiB.
-                if req.data == 0 || req.length == 0 || req.length > 64 * 1024 {
+                // `drm_property_create_blob`: a zero length is EINVAL (and
+                // one past INT_MAX; the copy is bounded lower here, real
+                // blobs -- modes, gamma LUTs -- are at most a few KiB). The
+                // data pointer is not looked at before `copy_from_user`,
+                // which faults: a null pointer is EFAULT, not the EINVAL
+                // this answered.
+                if req.length == 0 || req.length > 64 * 1024 {
                     return Err(FsError::InvalidParam);
                 }
                 ucheck(req.data as usize, req.length as usize)?;

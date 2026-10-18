@@ -124,7 +124,7 @@ Leyenda: ✅ implementado · 🟡 parcial / no-op deliberado · ❌ no implement
 | `DRM_IOCTL_MODE_CLOSEFB` | ✅ | Linux 6.6+: suelta la referencia sin apagar el plano |
 | `DRM_IOCTL_MODE_GETFB` | ✅ | devuelve geometría + handle (cliente master único) |
 | `DRM_IOCTL_MODE_GETFB2` | ✅ | formato `XR24`, plano 0 |
-| `DRM_IOCTL_MODE_DIRTYFB` | ✅ | blitea la unión de los `drm_clip_rect` (sin *clips*, o si excede el límite, re-escanea todo); los bordes horizontales se expanden a líneas WC de 64 B para no manchar píxeles vecinos |
+| `DRM_IOCTL_MODE_DIRTYFB` | ✅ | blitea la unión de los `drm_clip_rect` (sin *clips*, o si excede el límite, re-escanea todo); los bordes horizontales se expanden a líneas WC de 64 B para no manchar píxeles vecinos. Las comprobaciones de `drm_mode_dirtyfb_ioctl` en su orden: fb desconocido ENOENT; cuenta sin puntero o puntero sin cuenta EINVAL; las banderas se **enmascaran** a `ANNOTATE_COPY \| ANNOTATE_FILL` (un bit que Linux no define se ignora, no es EINVAL); `ANNOTATE_COPY` con cuenta impar EINVAL; más de 256 clips EINVAL |
 
 ### KMS (modeset legacy)
 
@@ -141,8 +141,8 @@ Leyenda: ✅ implementado · 🟡 parcial / no-op deliberado · ❌ no implement
 | `DRM_IOCTL_MODE_OBJ_GETPROPERTIES` | ✅ | tabla de propiedades por objeto; las propiedades `DRM_MODE_PROP_ATOMIC` solo se muestran a clientes atómicos (mismo filtrado que Linux) |
 | `DRM_IOCTL_MODE_GETPROPERTY` | ✅ | metadatos completos: flags, nombre, rangos/enums/tipo de objeto |
 | `DRM_IOCTL_MODE_OBJ_SETPROPERTY` / `SETPROPERTY` | 🟡 | **DPMS sí actúa**: cualquier valor distinto de "On" apaga el CRTC (pantalla en negro y se dejan de repintar el cursor y el daño), y la propiedad se relee con el valor puesto. El resto se acepta como no-op |
-| `DRM_IOCTL_MODE_GETPROPBLOB` | ✅ | EDID + blobs del almacén de propiedades |
-| `DRM_IOCTL_MODE_CREATEPROPBLOB` / `DESTROYPROPBLOB` | ✅ | almacén de blobs; destruir un blob del kernel da EACCES (Linux: EPERM) |
+| `DRM_IOCTL_MODE_GETPROPBLOB` | ✅ | EDID + blobs del almacén de propiedades. Como `drm_mode_getblob_ioctl`: los bytes se copian sólo si `length` es **exactamente** la del blob (el patrón de dos llamadas de `drmModeGetPropertyBlob`), con EFAULT si el puntero no vale; `length` vuelve siempre con la del blob |
+| `DRM_IOCTL_MODE_CREATEPROPBLOB` / `DESTROYPROPBLOB` | ✅ | almacén de blobs; `length` 0 (o más de 64 KiB, tope local) EINVAL antes de mirar el puntero, y un puntero nulo o inválido con longitud EFAULT (`copy_from_user`), no EINVAL; destruir un blob del kernel da EACCES (Linux: EPERM) |
 | `DRM_IOCTL_MODE_CURSOR` / `CURSOR2` | ✅ | cursor compuesto por el kernel sobre cada frame (`set_cursor_bo`/`move_cursor`); sin flag o con uno desconocido → EINVAL antes de buscar el CRTC (ENOENT), como `drm_mode_cursor_common`; un handle con ancho o alto 0, o más de 64×64 (el tamaño anunciado en las *caps*) → EINVAL; solo el handle 0 esconde el puntero |
 | `DRM_IOCTL_MODE_ATOMIC` | ✅ | **opt-in** con `drm.atomic` (ver sección siguiente) |
 | `DRM_IOCTL_MODE_GETGAMMA` / `SETGAMMA` | 🟡 | aceptados como no-op (`gamma_size=0`, sin `GAMMA_LUT`); devolver ENOTTY provocaba una tormenta de SETGAMMA desde Xorg |

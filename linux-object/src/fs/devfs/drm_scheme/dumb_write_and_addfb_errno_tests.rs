@@ -37,8 +37,12 @@ fn get_client_zero_is_self_and_one_is_enoent() {
     );
 }
 
+/// `drm_mode_dirtyfb_ioctl` masks the flags to the two it defines
+/// (`flags = DRM_MODE_FB_DIRTY_FLAGS & r->flags`): a bit it does not know
+/// is dropped, never refused. (This test asked for EINVAL, an answer Linux
+/// has never given here.)
 #[test]
-fn dirtyfb_rejects_unknown_flags() {
+fn dirtyfb_ignores_a_flag_linux_does_not_define() {
     let _serialised = drm::test_globals::lock();
     let c = Client::open(0);
     let buf = c.create_dumb(16, 16);
@@ -50,10 +54,7 @@ fn dirtyfb_rejects_unknown_flags() {
         num_clips: 0,
         clips_ptr: 0,
     };
-    assert_eq!(
-        c.ioctl(DRM_IOCTL_MODE_DIRTYFB, &mut cmd),
-        Err(FsError::InvalidParam)
-    );
+    assert_eq!(c.ioctl(DRM_IOCTL_MODE_DIRTYFB, &mut cmd), Ok(0));
     assert_eq!(c.rmfb(fb), Ok(0));
     assert_eq!(c.destroy_dumb(buf.handle), Ok(0));
 }
