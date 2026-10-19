@@ -154,6 +154,14 @@
 //              process's, a thread's own, another thread's and another
 //              process's (`pthread_getcpuclockid`, `clock_getcpuclockid`);
 //              asleep it waits, an absolute expiry gone by fires at once.
+//   aslimit    RLIMIT_AS 4 MiB above VmSize: 2 MiB of mmap fit, 8 do not
+//              (ENOMEM), nor a 16 MiB malloc, a brk of 8 MiB, an mremap to
+//              16 MiB or an 8 MiB shmat; a MAP_FIXED over mapped pages and
+//              what munmap gave back fit.
+//   nproc      RLIMIT_NPROC holds a user of its own to 4 tasks: three
+//              children and then EAGAIN, for `fork` and `pthread_create`
+//              alike; a zombie counts until it is reaped; root, real or
+//              effective, forks at a limit of 0.
 //
 // Build:  make                 (x86_64-linux-musl-gcc -O2 -static)
 // Run:    ./signal-probe [--only SECTION]
@@ -183,6 +191,7 @@
 #include <sys/mman.h>
 #include <sys/prctl.h>
 #include <sys/resource.h>
+#include <sys/shm.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/time.h>
@@ -2381,6 +2390,235 @@ static void sec_cpuclock(void) {
     signal(SIGUSR2, SIG_DFL);
 }
 
+// ----------------------------------------------------------------- aslimit
+
+// `VmSize` of /proc/self/status in bytes, -1 if it is not there: what
+// RLIMIT_AS is measured against, in Linux `mm->total_vm`.
+static long vm_size(void) {
+    FILE *f = fopen("/proc/self/status", "r");
+    if (!f) return -1;
+    char line[256];
+    long kb = -1;
+    while (fgets(line, sizeof line, f) && sscanf(line, "VmSize: %ld kB", &kb) != 1) {
+    }
+    fclose(f);
+    return kb < 0 ? -1 : kb * 1024;
+}
+
+#define AS_MIB (1024L * 1024)
+
+static void *as_map(void *at, long len, int fixed) {
+    return mmap(at, (size_t)len, PROT_READ | PROT_WRITE,
+                MAP_PRIVATE | MAP_ANONYMOUS | (fixed ? MAP_FIXED : 0), -1, 0);
+}
+
+static void sec_aslimit(void) {
+    // Everything the checks need that could map memory is made first, then
+    // the soft limit goes to 4 MiB above what is mapped, the calls run with
+    // nothing printed in between, and the limit comes back before a line is
+    // written. The hard limit is never touched, so it can come back.
+    int shm = shmget(IPC_PRIVATE, (size_t)(8 * AS_MIB), IPC_CREAT | 0600);
+    struct rlimit was;
+    getrlimit(RLIMIT_AS, &was);
+    long size = vm_size();
+    if (size < 0 || was.rlim_cur != RLIM_INFINITY) {
+        check(0, "VmSize, and no RLIMIT_AS yet", "VmSize %ld, RLIMIT_AS %lu", size,
+              (unsigned long)was.rlim_cur);
+        if (shm >= 0) shmctl(shm, IPC_RMID, NULL);
+        return;
+    }
+    struct rlimit tight = {(rlim_t)(size + 4 * AS_MIB), was.rlim_max};
+    int set = setrlimit(RLIMIT_AS, &tight);
+
+    void *two = as_map(NULL, 2 * AS_MIB, 0);            // 2 MiB of room left
+    void *eight = as_map(NULL, 8 * AS_MIB, 0);          // no
+    int eight_errno = errno;
+    void *big = malloc((size_t)(16 * AS_MIB));          // no
+    long brk0 = syscall(SYS_brk, 0);
+    long brk_big = syscall(SYS_brk, brk0 + 8 * AS_MIB);  // no: the old break
+    long brk_small = syscall(SYS_brk, brk0 + 64 * 1024);
+    syscall(SYS_brk, brk0);
+    errno = 0;
+    void *grown = two == MAP_FAILED ? MAP_FAILED
+                                    : mremap(two, (size_t)(2 * AS_MIB), (size_t)(16 * AS_MIB),
+                                             MREMAP_MAYMOVE);
+    int grown_errno = errno;
+    // 1 MiB of room left: a MAP_FIXED of 2 MiB over the 2 already mapped
+    // adds nothing, so it fits; counted whole it would not.
+    void *fill = as_map(NULL, 1 * AS_MIB, 0);
+    void *over = two == MAP_FAILED ? MAP_FAILED : as_map(two, 2 * AS_MIB, 1);
+    // What munmap gives back can be mapped again.
+    if (two != MAP_FAILED) munmap(two, (size_t)(2 * AS_MIB));
+    void *again = as_map(NULL, 2 * AS_MIB, 0);
+    errno = 0;
+    void *att = shm >= 0 ? shmat(shm, NULL, 0) : (void *)-1;
+    int att_errno = errno;
+
+    setrlimit(RLIMIT_AS, &was);
+    void *after = as_map(NULL, 64 * AS_MIB, 0);
+
+    check(set == 0, "RLIMIT_AS: set 4 MiB above VmSize", "VmSize %ld kB", size / 1024);
+    check(two != MAP_FAILED, "RLIMIT_AS: 2 MiB of mmap in 4 of room", "%p", two);
+    check(eight == MAP_FAILED && eight_errno == ENOMEM, "RLIMIT_AS: 8 MiB of mmap, ENOMEM",
+          "%p errno %d", eight, eight == MAP_FAILED ? eight_errno : 0);
+    check(big == NULL, "RLIMIT_AS: malloc of 16 MiB is NULL", "%p", big);
+    check(brk_big == brk0 && brk_small == brk0 + 64 * 1024, "RLIMIT_AS: brk +8 MiB no, +64 KiB yes",
+          "+8 MiB moved it %+ld, +64 KiB %+ld", brk_big - brk0, brk_small - brk0);
+    check(grown == MAP_FAILED && grown_errno == ENOMEM, "RLIMIT_AS: mremap 2 to 16 MiB, ENOMEM",
+          "%p errno %d", grown, grown == MAP_FAILED ? grown_errno : 0);
+    check(over != MAP_FAILED, "RLIMIT_AS: MAP_FIXED over mapped pages", "%p (fill %p)", over,
+          fill);
+    check(again != MAP_FAILED, "RLIMIT_AS: what munmap freed maps again", "%p", again);
+    check(att == (void *)-1 && att_errno == ENOMEM, "RLIMIT_AS: shmat of 8 MiB, ENOMEM",
+          "%p errno %d", att, att == (void *)-1 ? att_errno : 0);
+    check(after != MAP_FAILED, "RLIMIT_AS: limit back, 64 MiB maps", "%p", after);
+
+    if (eight != MAP_FAILED) munmap(eight, (size_t)(8 * AS_MIB));
+    free(big);
+    if (grown != MAP_FAILED) munmap(grown, (size_t)(16 * AS_MIB));
+    if (fill != MAP_FAILED) munmap(fill, (size_t)AS_MIB);
+    if (again != MAP_FAILED) munmap(again, (size_t)(2 * AS_MIB));
+    if (att != (void *)-1) shmdt(att);
+    if (after != MAP_FAILED) munmap(after, (size_t)(64 * AS_MIB));
+    if (shm >= 0) shmctl(shm, IPC_RMID, NULL);
+}
+
+// ------------------------------------------------------------------ nproc
+
+// A uid nothing else on the machine runs as, so every task it has is one
+// this section made.
+#define NPROC_UID 45399
+
+static void *nproc_thread(void *arg) {
+    (void)arg;
+    return NULL;
+}
+
+// A child of the user that lives until the write end of `rel` is closed.
+static pid_t nproc_child(const int rel[2]) {
+    pid_t pid = fork();
+    if (pid == 0) {
+        char c;
+        close(rel[1]);
+        while (read(rel[0], &c, 1) == -1 && errno == EINTR) {
+        }
+        _exit(0);
+    }
+    return pid;
+}
+
+// Children until a fork fails, at most `max`; the failure's errno in `err`.
+static int nproc_fill(const int rel[2], pid_t *kids, int max, int *err) {
+    int n = 0;
+    *err = 0;
+    while (n < max) {
+        pid_t pid = nproc_child(rel);
+        if (pid < 0) {
+            *err = errno;
+            break;
+        }
+        kids[n++] = pid;
+    }
+    return n;
+}
+
+static void nproc_as_user(void) {
+    int rel[2];
+    if (pipe(rel) != 0) {
+        check(0, "RLIMIT_NPROC: a pipe", "errno %d", errno);
+        return;
+    }
+    // Soft 4 under a hard 6, set as root; then all three ids are the user's.
+    struct rlimit lim = {4, 6};
+    int set = setrlimit(RLIMIT_NPROC, &lim);
+    int became = setresuid(NPROC_UID, NPROC_UID, NPROC_UID);
+    pid_t kids[16];
+    int err;
+    // This process is one task, so three children make four.
+    int first = nproc_fill(rel, kids, 8, &err), n = first;
+    int full_err = err;
+    pthread_t t;
+    int thread_err = pthread_create(&t, NULL, nproc_thread, NULL);
+    if (thread_err == 0) pthread_join(t, NULL);
+    // A zombie is still a task until it is reaped.
+    pid_t zombie_fork = -1, reaped_fork = -1;
+    int zombie_err = 0;
+    if (n > 0) {
+        siginfo_t si;
+        kill(kids[0], SIGKILL);
+        waitid(P_PID, (id_t)kids[0], &si, WEXITED | WNOWAIT);
+        errno = 0;
+        zombie_fork = nproc_child(rel);
+        zombie_err = errno;
+        if (zombie_fork > 0) kids[n++] = zombie_fork;
+        waitpid(kids[0], NULL, 0);
+        kids[0] = -1;
+        reaped_fork = nproc_child(rel);
+        if (reaped_fork > 0) kids[n++] = reaped_fork;
+    }
+    // It is the soft limit that is held: raised to the hard one, two more.
+    lim.rlim_cur = 6;
+    int raised = setrlimit(RLIMIT_NPROC, &lim);
+    int more = nproc_fill(rel, kids + n, 4, &err);
+    n += more;
+
+    close(rel[1]);
+    close(rel[0]);
+    for (int i = 0; i < n; i++)
+        if (kids[i] > 0) waitpid(kids[i], NULL, 0);
+
+    check(set == 0 && became == 0, "RLIMIT_NPROC: 4 for a user of its own",
+          "setrlimit %d setresuid %d", set, became);
+    check(first == 3 && full_err == EAGAIN, "RLIMIT_NPROC: 3 children, then EAGAIN",
+          "%d children, then errno %d", first, full_err);
+    check(thread_err == EAGAIN, "RLIMIT_NPROC: a thread is a task too", "pthread_create %d",
+          thread_err);
+    check(zombie_fork < 0 && zombie_err == EAGAIN, "RLIMIT_NPROC: a zombie still counts",
+          "fork %d errno %d", (int)zombie_fork, zombie_err);
+    check(reaped_fork > 0, "RLIMIT_NPROC: reaped, its room is back", "fork %d",
+          (int)reaped_fork);
+    check(raised == 0 && more == 2 && err == EAGAIN, "RLIMIT_NPROC: soft raised to 6, two more",
+          "%d more, then errno %d", more, err);
+}
+
+// Whether a fork goes through with RLIMIT_NPROC at 0 and these three ids.
+static int nproc_exempt(uid_t ruid, uid_t euid) {
+    struct rlimit zero = {0, 0};
+    if (setrlimit(RLIMIT_NPROC, &zero) != 0 || setresuid(ruid, euid, euid) != 0) return -1;
+    pid_t pid = fork();
+    if (pid == 0) _exit(0);
+    if (pid > 0) waitpid(pid, NULL, 0);
+    return pid > 0;
+}
+
+static void sec_nproc(void) {
+    int st = 0;
+    pid_t pid = fork();
+    if (pid == 0) {
+        g_fail = 0;
+        nproc_as_user();
+        fflush(stdout);
+        _exit(g_fail > 100 ? 100 : g_fail);
+    }
+    waitpid(pid, &st, 0);
+    g_fail += WIFEXITED(st) ? WEXITSTATUS(st) : 1;
+
+    // Root, real or effective, is not held to it.
+    struct {
+        uid_t ruid, euid;
+        const char *what;
+    } exempt[] = {
+        {0, 0, "RLIMIT_NPROC: root forks at a limit of 0"},
+        {NPROC_UID, 0, "RLIMIT_NPROC: so does an effective root"},
+    };
+    for (size_t i = 0; i < sizeof exempt / sizeof exempt[0]; i++) {
+        pid = fork();
+        if (pid == 0) _exit(nproc_exempt(exempt[i].ruid, exempt[i].euid) == 1 ? 0 : 1);
+        waitpid(pid, &st, 0);
+        check(WIFEXITED(st) && WEXITSTATUS(st) == 0, exempt[i].what, "st=%#x", st);
+    }
+}
+
 // ------------------------------------------------------------------- main
 
 static const struct {
@@ -2407,6 +2645,8 @@ static const struct {
     {"fsize", "RLIMIT_FSIZE holds every write to a file, with SIGXFSZ", sec_fsize},
     {"cputimer", "ITIMER_VIRTUAL, ITIMER_PROF and RLIMIT_CPU count CPU time", sec_cputimer},
     {"cpuclock", "a timer_create timer on a CPU clock counts that clock", sec_cpuclock},
+    {"aslimit", "RLIMIT_AS holds mmap, brk, mremap and shmat", sec_aslimit},
+    {"nproc", "RLIMIT_NPROC holds fork and pthread_create", sec_nproc},
 };
 
 int main(int argc, char **argv) {

@@ -1711,8 +1711,8 @@ impl RLimits {
 ///
 /// One deliberate departure: `RLIMIT_NPROC` and `RLIMIT_SIGPENDING` are
 /// `{0, 0}` in Linux because `init` overwrites them from `max_threads` before
-/// any userspace runs. Nothing counts either here, so `RLIM_INFINITY` is the
-/// truth about this kernel where a literal zero would not be.
+/// any userspace runs. This kernel has no `max_threads` to take them from, so
+/// they start unlimited (`RLIMIT_NPROC` is held once somebody sets it).
 ///
 /// What a process used to get was [`RLimit::default`] -- 1024/1024 -- for the
 /// one limit that existed. The soft limit is unchanged; the hard one becomes

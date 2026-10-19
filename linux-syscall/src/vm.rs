@@ -4,7 +4,7 @@ use alloc::vec::Vec;
 use bitflags::bitflags;
 use linux_object::error::LxResult;
 use linux_object::loader::heap_base;
-use linux_object::process::{RLIMIT_DATA, RLIM_INFINITY};
+use linux_object::process::{RLIMIT_AS, RLIMIT_DATA, RLIM_INFINITY};
 use zircon_object::vm::{
     pages, round_down_pages, roundup_pages, MMUFlags, VmAddressRegion, VmObject, PAGE_SIZE,
     USER_ASPACE_BASE, USER_ASPACE_SIZE,
@@ -306,7 +306,11 @@ impl Syscall<'_> {
         // A hint is read under `aspace_lock` too, so the range it found free
         // is still free when the mapping goes in.
         let vmar_offset = mmap_offset(placement, addr, len, &vmar);
+        // What a `MAP_FIXED` replaces is not new to the address space, so
+        // `RLIMIT_AS` counts only the rest (`count_vma_pages_range()`).
+        let replaced = (placement == Placement::Fixed).then_some((addr, addr.saturating_add(len)));
         if flags.contains(MmapFlags::ANONYMOUS) {
+            self.as_rlimit_allows(&vmar, len, replaced)?;
             let vmo = VmObject::new_paged(pages(len));
             // MAP_SHARED | MAP_ANONYMOUS: the region must be one object shared
             // with every future child, not a per-process copy. Without the
@@ -355,6 +359,9 @@ impl Syscall<'_> {
         } else {
             let file_like = self.linux_process().get_file_like(fd)?;
             mmap_file_access(shared, want_write, file_like.flags())?;
+            // After the descriptor's own errors, as in Linux, where `EBADF`
+            // and `EACCES` come before `mmap_region()` looks at the limit.
+            self.as_rlimit_allows(&vmar, len, replaced)?;
             // MAP_SHARED must hand every mapper of the file the SAME VmObject
             // (stores propagate between processes — the wl_shm pixel path);
             // MAP_PRIVATE keeps the per-call demand-paged snapshot.
@@ -523,6 +530,47 @@ impl Syscall<'_> {
             verify_installed(&vmar, addr, len, "file");
             Ok(addr)
         }
+    }
+
+    /// `may_expand_vm()` for `RLIMIT_AS`: whether this address space can take
+    /// `grow` more bytes of mappings, net of the `[start, end)` that the same
+    /// call frees (a `MAP_FIXED` or `MREMAP_FIXED` over mapped pages).
+    ///
+    /// What is counted is every mapping whole, committed or not -- the
+    /// `VmSize` of `/proc/<pid>/status`, so a program that sizes its limit
+    /// from that line gets what it measured. Unlimited, the usual case, costs
+    /// one read of the limit; only a finite one walks the mappings.
+    pub(crate) fn may_expand_vm(
+        &self,
+        vmar: &Arc<VmAddressRegion>,
+        grow: usize,
+        freed: Option<(usize, usize)>,
+    ) -> bool {
+        let limit = self
+            .linux_process()
+            .rlimit(RLIMIT_AS, None, false)
+            .map(|l| l.cur)
+            .unwrap_or(RLIM_INFINITY);
+        if limit == RLIM_INFINITY {
+            return true;
+        }
+        let freed = freed.map_or(0, |(start, end)| vmar.mapped_bytes_in(start, end));
+        let mapped = vmar.mapped_bytes_in(0, usize::MAX) - freed;
+        within_as_rlimit(mapped, grow, limit)
+    }
+
+    /// [`Self::may_expand_vm`] as `mmap(2)` answers it: `ENOMEM`.
+    fn as_rlimit_allows(
+        &self,
+        vmar: &Arc<VmAddressRegion>,
+        len: usize,
+        replaced: Option<(usize, usize)>,
+    ) -> LxResult<()> {
+        if self.may_expand_vm(vmar, len, replaced) {
+            return Ok(());
+        }
+        info!("mmap: {:#x} more bytes would pass RLIMIT_AS", len);
+        Err(LxError::ENOMEM)
     }
 
     /// Change the location of the program break
@@ -705,6 +753,16 @@ impl Syscall<'_> {
         // problem; this keeps the batching and its failure mode both.
         let mut last_err = None;
         for size in [size, roundup_pages(want)] {
+            // `RLIMIT_AS` (`may_expand_vm()` in `do_brk_flags()`): a chunk
+            // the limit has no room for falls back to the exact amount, and
+            // that one failing keeps the old break.
+            if !self.may_expand_vm(&vmar, size, None) {
+                info!(
+                    "brk: {:#x} more bytes would pass RLIMIT_AS, keeping {:#x}",
+                    size, current_brk
+                );
+                continue;
+            }
             let vmo = VmObject::new_paged(pages(size));
             // `map_at` takes an offset into the VMAR, not an address:
             // `addr()` is 0 for a bare-metal user address space but not for
@@ -903,6 +961,20 @@ impl Syscall<'_> {
             .map(|f| f.contains(MMUFlags::WRITE))
             .unwrap_or(true);
         let fixed = at_new_addr.then_some(new_addr);
+        // `RLIMIT_AS` (`vma_to_resize()`): a grow adds `new_len - old_len`,
+        // and a move to a fixed address first frees what was mapped there.
+        // A destination over the old range is `EINVAL`, and `remap` says so.
+        let freed = fixed
+            .map(|to| (to, to.saturating_add(new_len)))
+            .filter(|&(to, end)| end <= old_addr || to >= old_addr + old_len);
+        if new_len > old_len && !self.may_expand_vm(&vmar, new_len - old_len, freed) {
+            info!(
+                "mremap: growing {:#x} by {:#x} would pass RLIMIT_AS",
+                old_addr,
+                new_len - old_len
+            );
+            return Err(LxError::ENOMEM);
+        }
         let ret = vmar
             .remap(old_addr, old_len, new_len, may_move, fixed)
             .map_err(|e| match e {
@@ -1774,6 +1846,16 @@ fn shrunk_brk(asked: usize, current: usize, pages_released: bool) -> usize {
 /// The failure Linux reports is not an errno the caller sees: `__do_sys_brk`
 /// jumps to `out`, which returns the OLD break, and that is how `brk` says no
 /// to everything.
+/// Whether an address space with `mapped` bytes in it stays within an
+/// `RLIMIT_AS` of `limit` after `grow` more. Linux counts pages and rounds
+/// the limit down to one (`mm->total_vm + npages > rlimit(RLIMIT_AS) >>
+/// PAGE_SHIFT` is the refusal), so the last partial page of a limit that is
+/// not a whole number of them is never usable.
+fn within_as_rlimit(mapped: usize, grow: usize, limit: u64) -> bool {
+    limit == RLIM_INFINITY
+        || (pages(mapped) as u64).saturating_add(pages(grow) as u64) <= limit / PAGE_SIZE as u64
+}
+
 fn brk_within_data_rlimit(new_brk: usize, heap_base: usize, rlimit_data: u64) -> bool {
     rlimit_data == RLIM_INFINITY || new_brk.saturating_sub(heap_base) as u64 <= rlimit_data
 }
@@ -1883,6 +1965,9 @@ fn mincore_residency(vmar: &Arc<VmAddressRegion>, addr: usize, pages: usize) -> 
     }
     Ok(residency)
 }
+
+#[cfg(test)]
+mod as_rlimit_tests;
 
 #[cfg(test)]
 mod mmap_offset_tests {
