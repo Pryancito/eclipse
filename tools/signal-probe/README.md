@@ -77,6 +77,10 @@ en este kernel ha pasado de maneras que ningun test de syscalls ve:
     que heredaba su pid, que moria de ella. La sonda `orphan` moria asi de
     SIGALRM dos o tres vueltas de cada treinta, mucho antes de su propia
     alarma de 20 s.
+19. El interprete de un `#!` solo podia ser un enlace simbolico a algo, no un
+    enlace a un enlace (el de un `PT_INTERP`, cuatro), asi que un guion cuyo
+    interprete pasa por `/etc/alternatives` daba `ELOOP`. Y un interprete que
+    nadie puede ejecutar corria igual.
 
 ## Compilar
 
@@ -120,6 +124,6 @@ FAIL solo en Eclipse es un fallo de Eclipse.
 | `stop` | una parada llega a un proceso metido en una syscall que espera (`nanosleep`, `read`, `sigsuspend`) y la syscall sigue cuando se le continua: el `read` lee, sin `EINTR`, y el `sigsuspend` sigue esperando su señal y al volver deja la mascara de antes |
 | `teardown` | un proceso que sale (`exit_group`) con un segundo hilo dormido en `pause`, `read`, `nanosleep`, `waitpid` o en el `vfork` de un hijo que no hace `exec` ya no tiene ese hilo cuando se le recoge: un mutex robusto compartido que el hilo tenia cogido vuelve con `EOWNERDEAD`. `/proc/meminfo` no sirve para esto ni en Linux, que a veces enseña tarde unos cientos de MiB liberados |
 | `spawn` | un hijo de `vfork` corre en la memoria de su padre: lo que escribe ahi lo lee el padre, asi que `posix_spawn` informa de un programa que no existe y de una accion de fichero que falla con `ENOENT`, y veinte `posix_spawn` de `sh -c 'exit 3'` seguidos devuelven cada uno su hijo con su estado |
-| `badexec` | un `execve` de lo que no es un programa vuelve, con el errno de Linux: `EACCES` sin bit de ejecucion, para un directorio o con un `PT_INTERP` que es un directorio; `ENOEXEC` para basura, un guion sin `#!`, un `#!` vacio o que nombra basura, y un ELF de otra maquina; `ENOENT` para un `#!` o un `PT_INTERP` que no existen; `EIO` para un `PT_INTERP` de 10 bytes y `ELIBBAD` para uno de 128 bytes de basura; cinco guiones encadenados corren y seis dan `ELOOP`. Y `sh -c` de un guion sin `#!` lo corre |
+| `badexec` | un `execve` de lo que no es un programa vuelve, con el errno de Linux: `EACCES` sin bit de ejecucion, para un directorio o con un `PT_INTERP` que es un directorio; `ENOEXEC` para basura, un guion sin `#!`, un `#!` vacio o que nombra basura, y un ELF de otra maquina; `ENOENT` para un `#!` o un `PT_INTERP` que no existen; `EIO` para un `PT_INTERP` de 10 bytes y `ELIBBAD` para uno de 128 bytes de basura; un `#!` o un `PT_INTERP` que nombran un fichero sin bit de ejecucion dan `EACCES`, y un `#!` que pasa por tres enlaces corre; cinco guiones encadenados corren y seis dan `ELOOP`. Y `sh -c` de un guion sin `#!` lo corre |
 | `sched` | lo que un hijo de `fork` y un hilo nuevo heredan del padre: el nice, la mascara de CPUs y la politica. Con `SCHED_RESET_ON_FORK` el padre la conserva y la informa (`sched_getscheduler`, `sched_getattr`) y el hijo nace sin ella: en `SCHED_OTHER` si el padre era de tiempo real, con nice 0 si el suyo era negativo y con el suyo si era positivo. Sin privilegio no se quita, `sched_setattr` no la acepta en la palabra de politica y `sched_getaffinity` quiere un buffer de `long` enteros. La seccion corre como root |
 | `image` | el programa esta por encima de la pagina nula y leer por un puntero nulo mata con SIGSEGV, se enlazara como se enlazara (estatico, static-pie, dinamico). Compilada con el musl de `cargo image` la sonda es static-pie, que es el caso que fallaba |

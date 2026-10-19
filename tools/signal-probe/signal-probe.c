@@ -60,6 +60,8 @@
 //   * a forked child and a new thread started at nice 0, on SCHED_OTHER and
 //     free to run on any CPU, whatever their parent had: `nice make` only
 //     reniced make. And SCHED_RESET_ON_FORK was accepted and thrown away.
+//   * a `#!` interpreter reached through two symbolic links was ELOOP (one
+//     was the most), and an interpreter nobody may execute still ran.
 //   * a static-pie -- what musl's `gcc -static` builds, this probe included
 //     -- was loaded at address 0, so a null pointer read its ELF header
 //     instead of faulting.
@@ -1476,6 +1478,31 @@ static void sec_badexec(void) {
     write_elf_with_interp("/tmp/bx-elf-other", "/no/such/ld.so", other);
     check_exec("/tmp/bx-elf-other", ENOEXEC, "an ELF for another machine: ENOEXEC");
 
+    // An interpreter is opened for execution like the program: one nobody
+    // may execute is EACCES before anything is read from it.
+    write_file("/tmp/bx-junk-rw", junk, sizeof junk, 0644);
+    write_file("/tmp/bx-rwinterp", "#!/tmp/bx-junk-rw\n", 18, 0755);
+    check_exec("/tmp/bx-rwinterp", EACCES, "#! naming no executable: EACCES");
+    write_elf_with_interp("/tmp/bx-elf-rw", "/tmp/bx-junk-rw", em);
+    check_exec("/tmp/bx-elf-rw", EACCES, "PT_INTERP of no executable: EACCES");
+
+    // And its path goes through links like any other path. The last one is
+    // called `sh`, because busybox picks what to be by the name it was run
+    // under, and an interpreter is run under the name in the `#!` line.
+    mkdir("/tmp/bx-links", 0755);
+    const char *links[][2] = {{"/bin/sh", "/tmp/bx-l1"}, {"/tmp/bx-l1", "/tmp/bx-l2"}, {"/tmp/bx-l2", "/tmp/bx-links/sh"}};
+    int linked_up = 1;
+    for (size_t i = 0; i < sizeof links / sizeof links[0] && linked_up; i++) {
+        unlink(links[i][1]);
+        linked_up = symlink(links[i][0], links[i][1]) == 0;
+    }
+    check(linked_up, "three links to /bin/sh", "%s", linked_up ? "" : strerror(errno));
+    write_file("/tmp/bx-linked", "#!/tmp/bx-links/sh\nexit 9\n", 26, 0755);
+    int linked = exec_status("/tmp/bx-linked");
+    check(WIFEXITED(linked) && WEXITSTATUS(linked) == 9, "#! through three links runs",
+          "st=%#x (exit %d, signal %d)", linked, WIFEXITED(linked) ? WEXITSTATUS(linked) : -1,
+          WIFSIGNALED(linked) ? WTERMSIG(linked) : 0);
+
     // Five scripts in front of /bin/sh run; six are ELOOP.
     for (int len = 5; len <= 6; len++) {
         char name[64], line[64];
@@ -1511,9 +1538,12 @@ static void sec_badexec(void) {
     const char *made[] = {
         "/tmp/bx-junk10",       "/tmp/bx-noshebang", "/tmp/bx-emptyshebang", "/tmp/bx-badinterp",
         "/tmp/bx-nointerp",     "/tmp/bx-junk128",   "/tmp/bx-elf-nointerp", "/tmp/bx-elf-junk",
-        "/tmp/bx-elf-short",    "/tmp/bx-elf-dir",   "/tmp/bx-elf-other",
+        "/tmp/bx-elf-short",    "/tmp/bx-elf-dir",   "/tmp/bx-elf-other",    "/tmp/bx-junk-rw",
+        "/tmp/bx-rwinterp",     "/tmp/bx-elf-rw",    "/tmp/bx-l1",           "/tmp/bx-l2",
+        "/tmp/bx-links/sh",     "/tmp/bx-linked",
     };
     for (size_t i = 0; i < sizeof made / sizeof made[0]; i++) unlink(made[i]);
+    rmdir("/tmp/bx-links");
 }
 
 // ------------------------------------------------------------------- sched

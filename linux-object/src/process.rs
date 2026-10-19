@@ -193,7 +193,7 @@ pub fn published_capabilities(euid: u32) -> u64 {
 const NO_ID: u32 = u32::MAX;
 const ACCESS_READ: u16 = 0o4;
 const ACCESS_WRITE: u16 = 0o2;
-const ACCESS_EXEC: u16 = 0o1;
+pub(crate) const ACCESS_EXEC: u16 = 0o1;
 const MODE_PERM_MASK: u16 = 0o7777;
 const MODE_SET_UID: u16 = 0o4000;
 const MODE_SET_GID: u16 = 0o2000;
@@ -3146,7 +3146,7 @@ impl LinuxProcess {
     /// may `creds` do `requested` (an `0o7` mask) to a file owned by
     /// `owner_uid:owner_gid` with mode `mode`? `use_effective` selects the
     /// effective ids (every normal path) or the real ones (`access(2)`).
-    fn access_verdict(
+    pub(crate) fn access_verdict(
         creds: &Credentials,
         owner_uid: u32,
         owner_gid: u32,
