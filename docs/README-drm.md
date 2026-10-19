@@ -121,7 +121,7 @@ Leyenda: ✅ implementado · 🟡 parcial / no-op deliberado · ❌ no implement
 | ioctl | Estado | Notas |
 |---|---|---|
 | `DRM_IOCTL_MODE_ADDFB` | ✅ | |
-| `DRM_IOCTL_MODE_ADDFB2` | ✅ | usa `handles[0]`/`pitches[0]` |
+| `DRM_IOCTL_MODE_ADDFB2` | ✅ | `framebuffer_check` en su orden para el único plano de aquí (XR24/AR24 lineales): flags fuera de `INTERLACED \| MODIFIERS` EINVAL, `MODIFIERS` EINVAL (sin soporte), formato desconocido o no escaneable EINVAL, anchura o altura 0 EINVAL, sin handle EINVAL, una fila de píxeles que no cabe en u32 o un plano cuyo último byte pasa de 4 GiB **ERANGE**, pitch menor que la fila EINVAL, modifier sin la bandera EINVAL; en los planos que el formato no tiene solo se mira el modifier (handle, pitch y offset solo cuentan bajo `MODIFIERS`). Local: `offsets[0]` debe ser 0 y no hay `max_width` (un fb mayor que el panel se recorta) |
 | `DRM_IOCTL_MODE_RMFB` | ✅ | apaga el CRTC que mostraba el fb, como `drm_framebuffer_remove` (la salida de proceso conserva la última imagen para la restauración de consola) |
 | `DRM_IOCTL_MODE_CLOSEFB` | ✅ | Linux 6.6+: suelta la referencia sin apagar el plano |
 | `DRM_IOCTL_MODE_GETFB` | ✅ | devuelve geometría + handle (cliente master único) |
@@ -347,7 +347,7 @@ esto no:
 | ~~`OUT_FENCE_PTR` devuelve una fence ya señalada, y el slot del cliente no se toca si el commit no llega a ejecutarse~~ | **Corregido:** la fence se señala al entregarse la completion del flip (`drm_send_event_helper`), haya evento o no y aunque el fd de DRM se haya cerrado; el slot recibe `-1` al escenificar la propiedad y el fd solo si el commit se ejecuta. Quien marque el ritmo de frames con ella, o la entregue a un cliente como release de su buffer, espera ahora a que el buffer anterior haya salido de pantalla |
 | El arm síncrono de `SYNCOBJ_WAIT` puede girar sin ceder la CPU | Una corrutina del kernel atascada; la máquina parece congelada |
 | Sin caché de dma-buf por objeto ni de handles PRIME por fichero | Tope GEM subido a 256; sigue sin dedup PRIME por fichero |
-| `ADDFB2` no valida formato, flags ni modifiers | Un modifier con tiling se acepta y se escanea como lineal: basura |
+| ~~`ADDFB2` no valida formato, flags ni modifiers~~ | **Corregido:** `framebuffer_check` entero (fila de la tabla de ioctls); un modifier con tiling es EINVAL |
 | El límite de clips de `DIRTYFB` es 64 donde Linux usa 256, y `ANNOTATE_COPY` no está | Cada frame con más daño cae al blit de pantalla completa por CPU |
 | Los ioctls `DRM_MASTER` no comprueban el master (que sí existe) | Todo ioctl `DRM_MASTER` lo puede emitir cualquiera |
 | `GET_CLIENT` no existe | libva da la inicialización por fallida: sin VA-API |

@@ -3,8 +3,9 @@
 //! `drm_internal_framebuffer_create` / `framebuffer_check` reject an
 //! unknown flag, a modifier without `DRM_MODE_FB_MODIFIERS`, a format no
 //! plane scans out, a zero dimension, a missing handle, a pitch shorter
-//! than a row, and anything on the planes the format does not have,
-//! every one of them EINVAL and none of them creating a framebuffer.
+//! than a row, and a modifier on a plane the format does not have,
+//! every one of them EINVAL and none of them creating a framebuffer; a
+//! row or a plane that does not fit a u32 is ERANGE.
 //! This arm used to look only at the handle and the pitch: a client
 //! probing formats got a framebuffer of `NV12` that scanned out as
 //! `XRGB8888`, and the test helper above registered `XRC4`, a fourcc
@@ -42,9 +43,16 @@ fn addfb2(client: &Client, cmd: &mut DrmModeFbCmd2) -> (Result<usize>, usize, us
 /// Every refusal is the same three things: EINVAL, no fb id written,
 /// and the framebuffer table untouched.
 #[track_caller]
-fn refused(client: &Client, mut cmd: DrmModeFbCmd2, what: &str) {
+fn refused(client: &Client, cmd: DrmModeFbCmd2, what: &str) {
+    refused_with(client, cmd, FsError::InvalidParam, what);
+}
+
+/// The same three things with the errno named: `framebuffer_check` has
+/// two ERANGE answers among its EINVALs.
+#[track_caller]
+fn refused_with(client: &Client, mut cmd: DrmModeFbCmd2, err: FsError, what: &str) {
     let (r, before, after) = addfb2(client, &mut cmd);
-    assert_eq!(r, Err(FsError::InvalidParam), "{what}: not EINVAL");
+    assert_eq!(r, Err(err), "{what}: wrong errno");
     assert_eq!(cmd.fb_id, 0, "{what}: an fb id came back with the error");
     assert_eq!(after, before, "{what}: a framebuffer was created anyway");
 }
@@ -348,11 +356,15 @@ fn a_block_linear_pitch_is_counted_in_blocks() {
     drm::set_scanout_modifiers_enabled(false);
 }
 
-/// A modifier without the flag, and anything at all on planes 1 to 3 of
-/// a one-plane format, are `framebuffer_check`'s "bad fb modifier" and
-/// "buffer object handle for plane N" refusals.
+/// A modifier without the flag, on plane 0 or on a plane the format
+/// does not have, is `framebuffer_check`'s "bad fb modifier". A handle,
+/// pitch or offset left on planes 1 to 3 is not refused: Linux looks at
+/// those only under `DRM_MODE_FB_MODIFIERS` ("pre-FB_MODIFIERS userspace
+/// didn't clear the structs properly"), and that flag is refused here.
+/// This refused the leftovers too, so a client reusing one
+/// `drm_mode_fb_cmd2` across formats lost its one-plane ones.
 #[test]
-fn a_modifier_or_a_second_plane_on_a_linear_one_plane_format_is_refused() {
+fn a_modifier_on_any_plane_is_refused_and_leftovers_on_unused_planes_are_not() {
     let _serialised = drm::test_globals::lock();
     let client = Client::open(0);
     let buf = client.create_dumb(64, 64);
@@ -366,18 +378,21 @@ fn a_modifier_or_a_second_plane_on_a_linear_one_plane_format_is_refused() {
     refused(&client, inv, "DRM_FORMAT_MOD_INVALID");
 
     for plane in 1..4 {
-        let mut h = cmd(&buf);
-        h.handles[plane] = buf.handle;
-        refused(&client, h, "a handle on an extra plane");
-        let mut p = cmd(&buf);
-        p.pitches[plane] = buf.pitch;
-        refused(&client, p, "a pitch on an extra plane");
-        let mut o = cmd(&buf);
-        o.offsets[plane] = 64;
-        refused(&client, o, "an offset on an extra plane");
         let mut m = cmd(&buf);
         m.modifier[plane] = 1;
         refused(&client, m, "a modifier on an extra plane");
+        let mut h = cmd(&buf);
+        h.handles[plane] = buf.handle;
+        let fb = accepted(&client, h, "a leftover handle on an extra plane");
+        assert_eq!(client.rmfb(fb), Ok(0));
+        let mut p = cmd(&buf);
+        p.pitches[plane] = buf.pitch;
+        let fb = accepted(&client, p, "a leftover pitch on an extra plane");
+        assert_eq!(client.rmfb(fb), Ok(0));
+        let mut o = cmd(&buf);
+        o.offsets[plane] = 64;
+        let fb = accepted(&client, o, "a leftover offset on an extra plane");
+        assert_eq!(client.rmfb(fb), Ok(0));
     }
 
     // What a real NV12 client sends: two planes, second handle and
@@ -418,14 +433,77 @@ fn plane_zero_needs_a_size_a_handle_a_full_pitch_and_no_offset() {
     let mut zero_pitch = cmd(&buf);
     zero_pitch.pitches[0] = 0;
     refused(&client, zero_pitch, "pitch 0");
+    // `framebuffer_check`: a row that does not fit a u32 is ERANGE
+    // (`min_pitch > UINT_MAX`), before the pitch is measured against
+    // it. Both of these were EINVAL.
     let mut wide = cmd(&buf);
     wide.width = u32::MAX;
-    refused(&client, wide, "a width whose row overflows u32");
+    refused_with(
+        &client,
+        wide,
+        FsError::OutOfRange,
+        "a width whose row does not fit a u32",
+    );
     // A width whose row, multiplied in u32, wraps to 64 bytes: the pitch
-    // comparison has to be done wider than the fields are.
+    // comparison has to be done wider than the fields are -- and the
+    // answer is the row's ERANGE, not the short pitch's EINVAL.
     let mut wrap = cmd(&buf);
     wrap.width = 0x4000_0010;
-    refused(&client, wrap, "a width whose row wraps to a short one");
+    refused_with(
+        &client,
+        wrap,
+        FsError::OutOfRange,
+        "a width whose row wraps to a short one",
+    );
+    // A plane whose last byte is past 4 GiB (`height * pitch + offset >
+    // UINT_MAX`): ERANGE too, where this left it to `create_fb`, which
+    // called the buffer too small. Exactly UINT_MAX fits the check, and
+    // then it IS the buffer that is too small.
+    let mut tall = cmd(&buf);
+    tall.height = 0x0100_0000;
+    refused_with(
+        &client,
+        tall,
+        FsError::OutOfRange,
+        "a plane whose last byte is past 4 GiB",
+    );
+    let mut tall_wide = cmd(&buf);
+    tall_wide.height = 2;
+    tall_wide.pitches[0] = u32::MAX;
+    refused_with(&client, tall_wide, FsError::OutOfRange, "two rows of 4 GiB");
+    // The plane is measured before the pitch: a short pitch on a plane
+    // past 4 GiB is still ERANGE, not the pitch's EINVAL.
+    let mut short_tall = cmd(&buf);
+    short_tall.pitches[0] = buf.width * 4 - 4;
+    short_tall.height = 0x0111_1111;
+    refused_with(
+        &client,
+        short_tall,
+        FsError::OutOfRange,
+        "a short pitch on a plane past 4 GiB",
+    );
+    // The offset counts toward the plane's end, before it is refused on
+    // its own (this tree's EINVAL for a non-zero `offsets[0]`).
+    let mut offset_end = cmd(&buf);
+    offset_end.height = 1;
+    offset_end.pitches[0] = u32::MAX - 60;
+    offset_end.offsets[0] = 64;
+    refused_with(
+        &client,
+        offset_end,
+        FsError::OutOfRange,
+        "an offset that pushes the plane's end past 4 GiB",
+    );
+    let mut edge = cmd(&buf);
+    edge.height = 1;
+    edge.pitches[0] = u32::MAX;
+    // (EINVAL, not ERANGE: it is the buffer's "bad geometry" answer, as
+    // `drm_gem_fb_size_check` gives it, not `framebuffer_check`'s.)
+    assert_eq!(
+        addfb2(&client, &mut edge).0,
+        Err(FsError::InvalidParam),
+        "a plane of exactly UINT_MAX bytes passes the check and fails on the buffer"
+    );
     let mut off = cmd(&buf);
     off.offsets[0] = 64;
     refused(&client, off, "an offset on plane 0");

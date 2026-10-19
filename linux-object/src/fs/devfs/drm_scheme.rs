@@ -4973,6 +4973,22 @@ fn addfb2_check(cmd: &DrmModeFbCmd2) -> Result<drm::ScanoutLayout> {
         }
         drm::ScanoutLayout::Linear
     };
+    // `framebuffer_check`, in its order: a row of 4-byte pixels that does
+    // not fit a u32 (`min_pitch > UINT_MAX`) and a plane whose last byte
+    // does not (`height * pitch + offset > UINT_MAX`) are ERANGE, and only
+    // then is a pitch shorter than the row EINVAL. The row was EINVAL and
+    // the plane was left to `create_fb`, which called the buffer too small.
+    // (Linux's `max_width` would refuse such widths first; this tree puts
+    // no ceiling on a framebuffer: GETRESOURCES advertises the panel's size
+    // and a bigger one is clipped.)
+    const UINT_MAX: u64 = u32::MAX as u64;
+    let min_pitch = u64::from(cmd.width) * 4;
+    if min_pitch > UINT_MAX {
+        return Err(FsError::OutOfRange);
+    }
+    if u64::from(cmd.height) * u64::from(cmd.pitches[0]) + u64::from(cmd.offsets[0]) > UINT_MAX {
+        return Err(FsError::OutOfRange);
+    }
     // "bad pitch": less than a row of pixels. (`create_fb` checks it against
     // the buffer as well.) For a block-linear surface the pitch is counted
     // in 64-byte BLOCKS, not bytes -- comparing it against a byte width
@@ -4981,15 +4997,24 @@ fn addfb2_check(cmd: &DrmModeFbCmd2) -> Result<drm::ScanoutLayout> {
         drm::ScanoutLayout::Linear => u64::from(cmd.pitches[0]),
         drm::ScanoutLayout::BlockLinear { .. } => u64::from(cmd.pitches[0]) * drm::GOB_WIDTH_BYTES,
     };
-    if pitch_bytes < u64::from(cmd.width) * 4 {
+    if pitch_bytes < min_pitch {
         return Err(FsError::InvalidParam);
     }
     if cmd.offsets[0] != 0 {
         return Err(FsError::InvalidParam);
     }
+    // The planes the format does not have: a modifier on one is EINVAL; a
+    // handle, pitch or offset there is looked at only under
+    // DRM_MODE_FB_MODIFIERS ("pre-FB_MODIFIERS userspace didn't clear the
+    // structs properly"), so without the flag they are left alone. This
+    // refused them whatever the flags, and with them a client that reuses
+    // one `drm_mode_fb_cmd2` across formats without zeroing the planes it
+    // stopped using.
     for i in 1..4 {
-        if cmd.handles[i] != 0 || cmd.pitches[i] != 0 || cmd.offsets[i] != 0 || cmd.modifier[i] != 0
-        {
+        if cmd.modifier[i] != 0 {
+            return Err(FsError::InvalidParam);
+        }
+        if have_modifier && (cmd.handles[i] != 0 || cmd.pitches[i] != 0 || cmd.offsets[i] != 0) {
             return Err(FsError::InvalidParam);
         }
     }
