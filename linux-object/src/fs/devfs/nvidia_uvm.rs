@@ -375,7 +375,7 @@ pub fn create_node(root: &Arc<DevINode>) {
     }
     if root.find("nvidiactl").is_err() {
         warn!(
-            "[nvidia-uvm] nvidia.uvm without /dev/nvidiactl (nvidia.nvidiactl): no /dev/nvidia-uvm"
+            "[nvidia-uvm] nvidia.uvm without /dev/nvidiactl (nvidia.cuda turns on both): no /dev/nvidia-uvm"
         );
         return;
     }

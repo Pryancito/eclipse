@@ -18,10 +18,11 @@
 // When a step fails on /dev/nvidia-uvm, `dmesg | grep nvidia-uvm` names the
 // call the kernel does not serve yet.
 //
-// Needs the kernel booted with `nvidia.nvidiactl` and `nvidia.uvm`. A glibc
-// program, like libcuda itself: it is built with the build machine's C
-// compiler, not musl, and runs on the glibc that comes with NVIDIA's
-// userspace. It reaches libcuda through dlopen, so it needs no CUDA headers.
+// Needs the kernel booted with `nvidia.cuda` (or with both `nvidia.nvidiactl`
+// and `nvidia.uvm`). A glibc program, like libcuda itself: it is built with
+// the build machine's C compiler, not musl, and runs on the glibc that comes
+// with NVIDIA's userspace. It reaches libcuda through dlopen, so it needs no
+// CUDA headers.
 #include <dlfcn.h>
 #include <stdio.h>
 

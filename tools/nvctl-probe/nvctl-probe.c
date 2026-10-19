@@ -34,10 +34,10 @@
 //             readable, and RM_GET_EVENT_DATA must hand back that event.
 //   free      RM_FREE of the client: everything under it goes.
 //
-// Needs the kernel booted with `nvidia.nvidiactl`. Read-only as far as the
-// GPU goes: it allocates RM objects and frees them, writes only the system
-// memory it allocated, reads the GPU's timer, fires the software notifier
-// it armed, and touches no engine.
+// Needs the kernel booted with `nvidia.cuda` or `nvidia.nvidiactl`.
+// Read-only as far as the GPU goes: it allocates RM objects and frees them,
+// writes only the system memory it allocated, reads the GPU's timer, fires
+// the software notifier it armed, and touches no engine.
 //
 // Build: static musl, like the other probes (xtask does it; by hand:
 //   x86_64-linux-musl-gcc -static -O2 -o nvctl-probe nvctl-probe.c).
@@ -644,7 +644,7 @@ int main(void) {
   printf("[version]\n");
   int ctl = open("/dev/nvidiactl", O_RDWR | O_CLOEXEC);
   if (ctl < 0) {
-    printf("  [FAIL] /dev/nvidiactl: %s (is the kernel booted with nvidia.nvidiactl?)\n",
+    printf("  [FAIL] /dev/nvidiactl: %s (is the kernel booted with nvidia.cuda?)\n",
            strerror(errno));
     return 1;
   }

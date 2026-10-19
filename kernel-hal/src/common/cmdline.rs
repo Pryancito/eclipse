@@ -109,6 +109,19 @@ pub fn is_off(cmdline: &str, key: &str) -> bool {
     value(cmdline, key).and_then(parse_bool) == Some(false)
 }
 
+/// Whether `key` is on, when it also belongs to a group that `umbrella` turns
+/// on in one go — `nvidia.cuda` for every switch CUDA needs.
+///
+/// The switch's own name still works on its own, and still wins: written
+/// `=0`, it stays off under the umbrella. That is what makes the umbrella
+/// safe to type when one of its parts is the suspect.
+pub fn grouped_flag(cmdline: &str, umbrella: &str, key: &str) -> bool {
+    if is_off(cmdline, key) {
+        return false;
+    }
+    flag(cmdline, key) || flag(cmdline, umbrella)
+}
+
 /// The CPU count `smp=` asks this boot to stop at, or `None` when the command
 /// line sets no ceiling and every CPU the firmware reports should come up.
 ///
@@ -384,6 +397,46 @@ mod tests {
         // switching on, in the other direction.
         assert!(!is_off("smp=offf", "smp"));
         assert!(!is_off("smp=banana", "smp"));
+    }
+
+    #[test]
+    fn an_umbrella_turns_on_every_switch_it_groups() {
+        let line = "LOG=error:nvidia.cuda:ROOT=/dev/sda2";
+        assert!(grouped_flag(line, "nvidia.cuda", "nvidia.nvidiactl"));
+        assert!(grouped_flag(line, "nvidia.cuda", "nvidia.uvm"));
+    }
+
+    #[test]
+    fn a_grouped_switch_still_works_by_its_own_name() {
+        let line = "LOG=error:nvidia.uvm";
+        assert!(grouped_flag(line, "nvidia.cuda", "nvidia.uvm"));
+        assert!(
+            !grouped_flag(line, "nvidia.cuda", "nvidia.nvidiactl"),
+            "naming one part turns on that part only"
+        );
+    }
+
+    #[test]
+    fn a_grouped_switch_turned_off_by_name_stays_off_under_its_umbrella() {
+        let line = "nvidia.cuda:nvidia.uvm=0";
+        assert!(!grouped_flag(line, "nvidia.cuda", "nvidia.uvm"));
+        assert!(grouped_flag(line, "nvidia.cuda", "nvidia.nvidiactl"));
+    }
+
+    #[test]
+    fn a_grouped_switch_is_off_with_no_umbrella_or_an_umbrella_turned_off() {
+        assert!(!grouped_flag(REAL, "nvidia.cuda", "nvidia.uvm"));
+        for umbrella in ["nvidia.cuda=0", "nvidia.cuda=off", "nvidia.cuda=banana"] {
+            assert!(
+                !grouped_flag(umbrella, "nvidia.cuda", "nvidia.uvm"),
+                "{}",
+                umbrella
+            );
+        }
+        assert!(
+            grouped_flag("nvidia.cuda=0:nvidia.uvm", "nvidia.cuda", "nvidia.uvm"),
+            "an umbrella turned off does not turn off what was named"
+        );
     }
 
     #[test]

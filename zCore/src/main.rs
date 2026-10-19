@@ -937,18 +937,28 @@ fn primary_main(config: kernel_hal::KernelConfig) {
                 kernel_hal::drivers::set_gem_pushbuf_enabled(true);
                 klog_info!("Eclipse: nvidia.gem_pushbuf -- GEM_PUSHBUF submits for real");
             }
+            // `nvidia.cuda` turns on every hatch below that CUDA needs, in
+            // one go; each one still works by its own name, and its own
+            // `=0` keeps it off under the umbrella.
+            if kernel_hal::cmdline::flag(&options.cmdline, "nvidia.cuda") {
+                klog_info!("Eclipse: nvidia.cuda -- nvidia.nvidiactl and nvidia.uvm");
+            }
             // The device files NVIDIA's own user-mode driver opens
             // (libnvidia-ml, so `nvidia-smi`), over the RM this kernel
             // carries. Default off: no NVIDIA user-mode driver has run on it
             // on real hardware yet.
-            if kernel_hal::cmdline::flag(&options.cmdline, "nvidia.nvidiactl") {
+            if kernel_hal::cmdline::grouped_flag(
+                &options.cmdline,
+                "nvidia.cuda",
+                "nvidia.nvidiactl",
+            ) {
                 kernel_hal::drivers::set_nvidiactl_enabled(true);
                 klog_info!("Eclipse: nvidia.nvidiactl -- /dev/nvidiactl and /dev/nvidia<N>");
             }
             // `/dev/nvidia-uvm`, without which CUDA's cuInit fails. Default
             // off: it serves only cuInit's three calls so far, and logs the
             // first of every other one CUDA makes.
-            if kernel_hal::cmdline::flag(&options.cmdline, "nvidia.uvm") {
+            if kernel_hal::cmdline::grouped_flag(&options.cmdline, "nvidia.cuda", "nvidia.uvm") {
                 kernel_hal::drivers::set_nvidia_uvm_enabled(true);
                 klog_info!("Eclipse: nvidia.uvm -- /dev/nvidia-uvm");
             }
