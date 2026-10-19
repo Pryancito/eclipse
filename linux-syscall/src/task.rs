@@ -340,15 +340,16 @@ fn comm_from_path(path: &str) -> &str {
 #[must_use]
 struct ExecPreflight(());
 
-/// Walk the shebang interpreter chain of the image `execve` is about to run,
-/// while the caller is still whole.
+/// Refuse, while the caller is still whole, every `execve` of `image` the
+/// loader would fail on for a reason in the files themselves: see
+/// [`LinuxElfLoader::preflight`].
 ///
-/// `head` is the first bytes of the file, `root_inode` the process's root for
+/// `image` is the file being executed, `root_inode` the process's root for
 /// resolving an interpreter path. Takes no process and no thread on purpose:
 /// what it can reach is the whole of what makes it safe to run before
 /// [`de_thread`], so the signature is the guarantee and not the comment.
 fn execve_preflight(
-    head: &[u8],
+    image: &Arc<dyn rcore_fs::vfs::INode>,
     syscall_entry: VirtAddr,
     root_inode: &Arc<dyn rcore_fs::vfs::INode>,
 ) -> LxResult<ExecPreflight> {
@@ -356,12 +357,12 @@ fn execve_preflight(
         syscall_entry,
         stack_pages: USER_STACK_PAGES,
         root_inode: root_inode.clone(),
-        // Preflight walks the shebang chain and builds no stack, so there is
-        // no aux vector to be right about here -- and there could not be one
-        // yet: the set-user-ID transition that decides it has not happened.
+        // Preflight reads headers and builds no stack, so there is no aux
+        // vector to be right about here -- and there could not be one yet:
+        // the set-user-ID transition that decides it has not happened.
         identity: Default::default(),
     }
-    .preflight_interpreters(head)?;
+    .preflight(image)?;
     Ok(ExecPreflight(()))
 }
 
@@ -1392,6 +1393,12 @@ impl Syscall<'_> {
         let inode = proc.lookup_inode(path_str)?;
         let metadata = inode.metadata()?;
         proc.check_access(&metadata, 0o1, true)?;
+        // `do_open_execat`: `if (!S_ISREG(...)) return -EACCES`. Root passes
+        // the execute check on any directory, so `execve("/tmp")` from root
+        // used to go on to the loader, which killed the caller over it.
+        if metadata.type_ != rcore_fs::vfs::FileType::File {
+            return Err(LxError::EACCES);
+        }
         // Both mount questions are asked of the same absolute path, because both
         // are decided by which mount it is on, and the path the caller named is
         // still in hand here.
@@ -1422,17 +1429,14 @@ impl Syscall<'_> {
         // Everything below `vmar.clear()` is past the point of no return: the
         // caller's address space is gone by then, so a failure after it cannot
         // be reported BACK to the caller -- the code that would receive the
-        // error is no longer mapped. Resolve the shebang interpreter chain
-        // here, while the caller is still whole, so the common failure (a
-        // script naming an interpreter that is not installed) comes back as an
-        // ordinary ENOENT and the shell reports "not found" instead of the
-        // process dying on the instruction after the syscall. Linux draws the
-        // same line: the `bprm` is fully built before `begin_new_exec` commits.
-        let past_every_check = {
-            let mut head = [0u8; 512];
-            let n = inode.read_at(0, &mut head).unwrap_or(0);
-            execve_preflight(&head[..n], self.syscall_entry, proc.root_inode())?
-        };
+        // error is no longer mapped. Check the image, its `#!` chain and its
+        // `PT_INTERP` here, while the caller is still whole, so a file that
+        // is not a program comes back as ENOEXEC, a missing interpreter as
+        // ENOENT, and the shell does what it does with those (runs the file
+        // as a script, prints "not found") instead of the process dying on
+        // the instruction after the syscall. Linux draws the same line: the
+        // `bprm` is fully built before `begin_new_exec` commits.
+        let past_every_check = execve_preflight(&inode, self.syscall_entry, proc.root_inode())?;
 
         // POSIX/Linux: execve in a multithreaded process kills every other
         // thread in the group before the address space is replaced. Leaving

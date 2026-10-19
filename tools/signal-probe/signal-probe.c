@@ -43,6 +43,10 @@
 //     before its `exec` or `_exit` the parent never saw: glibc's
 //     `posix_spawn` of a program that does not exist returned 0, because it
 //     hears about the failed `exec` through a word the child writes.
+//   * an `execve` of a file that is not a program killed the caller with
+//     SIGSEGV instead of returning: garbage, a script without `#!` (which a
+//     shell then runs itself, on ENOEXEC), a directory, a binary for another
+//     machine, a dynamic binary whose `PT_INTERP` is not installed.
 //
 // Every section states what Linux does and checks it, printing the numbers
 // whether it passes or fails. Each section runs in a child of its own, so a
@@ -90,6 +94,10 @@
 //              there the parent reads, so `posix_spawn` reports a program
 //              that does not exist and a file action that fails. And an
 //              `exec` from the child leaves the parent its program.
+//   badexec    an `execve` of what is not a program comes back with the errno
+//              Linux gives -- EACCES, ENOEXEC, ENOENT, EIO, ELIBBAD, ELOOP --
+//              to a caller still alive to read it, and `sh` runs a script
+//              that has no `#!` line.
 //
 // Build:  make                 (x86_64-linux-musl-gcc -O2 -static)
 // Run:    ./signal-probe [--only SECTION]
@@ -100,6 +108,7 @@
 // Eclipse is a bug in Eclipse.
 
 #define _GNU_SOURCE
+#include <elf.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
@@ -117,6 +126,7 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/prctl.h>
+#include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
 #include <time.h>
@@ -1243,6 +1253,144 @@ static void sec_spawn(void) {
         check(0, "posix_spawn: sh -c 'exit 3', 20 times", "%d exited 3, then %#x", good, last);
 }
 
+// ---------------------------------------------------------------- badexec
+
+static void write_file(const char *path, const void *bytes, size_t len, mode_t mode) {
+    unlink(path);
+    int fd = open(path, O_CREAT | O_TRUNC | O_WRONLY, mode);
+    if (fd < 0 || write(fd, bytes, len) != (ssize_t)len) printf("  (could not write %s)\n", path);
+    close(fd);
+}
+
+// A static ELF64 for `machine` with a PT_INTERP naming `interp`.
+static void write_elf_with_interp(const char *path, const char *interp, int machine) {
+    unsigned char buf[512];
+    memset(buf, 0, sizeof buf);
+    Elf64_Ehdr *eh = (Elf64_Ehdr *)buf;
+    memcpy(eh->e_ident, ELFMAG, SELFMAG);
+    eh->e_ident[EI_CLASS] = ELFCLASS64;
+    eh->e_ident[EI_DATA] = ELFDATA2LSB;
+    eh->e_ident[EI_VERSION] = EV_CURRENT;
+    eh->e_type = ET_EXEC;
+    eh->e_machine = machine;
+    eh->e_version = EV_CURRENT;
+    eh->e_entry = 0x400078;
+    eh->e_phoff = sizeof(Elf64_Ehdr);
+    eh->e_ehsize = sizeof(Elf64_Ehdr);
+    eh->e_phentsize = sizeof(Elf64_Phdr);
+    eh->e_phnum = 2;
+    Elf64_Phdr *ph = (Elf64_Phdr *)(buf + sizeof(Elf64_Ehdr));
+    size_t at = sizeof(Elf64_Ehdr) + 2 * sizeof(Elf64_Phdr);
+    size_t len = strlen(interp) + 1;
+    ph[0].p_type = PT_INTERP;
+    ph[0].p_offset = at;
+    ph[0].p_vaddr = 0x400000 + at;
+    ph[0].p_filesz = len;
+    ph[0].p_memsz = len;
+    ph[0].p_flags = PF_R;
+    ph[1].p_type = PT_LOAD;
+    ph[1].p_vaddr = 0x400000;
+    ph[1].p_filesz = at + len;
+    ph[1].p_memsz = at + len;
+    ph[1].p_flags = PF_R | PF_X;
+    ph[1].p_align = 0x1000;
+    memcpy(buf + at, interp, len);
+    write_file(path, buf, at + len, 0755);
+}
+
+// Exec `path` in a child; its exit status is 100 + the errno, or what the
+// program exits with if the exec worked.
+static int exec_status(const char *path) {
+    pid_t c = fork();
+    if (c == 0) {
+        char *av[] = {"x", NULL};
+        syscall(SYS_execve, path, av, environ);
+        _exit(100 + errno);
+    }
+    return status_of(c);
+}
+
+static void check_exec(const char *path, int want, const char *what) {
+    int st = exec_status(path);
+    check(WIFEXITED(st) && WEXITSTATUS(st) == 100 + want, what, "st=%#x (exit %d, signal %d)", st,
+          WIFEXITED(st) ? WEXITSTATUS(st) : -1, WIFSIGNALED(st) ? WTERMSIG(st) : 0);
+}
+
+static void sec_badexec(void) {
+#if defined(__x86_64__)
+    int em = EM_X86_64, other = EM_AARCH64;
+#elif defined(__aarch64__)
+    int em = EM_AARCH64, other = EM_X86_64;
+#else
+    int em = EM_RISCV, other = EM_X86_64;
+#endif
+    char junk[128];
+    memset(junk, 'z', sizeof junk);
+    write_file("/tmp/bx-junk10", "\x01\x02garbage\n", 10, 0644);
+    check_exec("/tmp/bx-junk10", EACCES, "no execute bit: EACCES");
+    chmod("/tmp/bx-junk10", 0755);
+    check_exec("/tmp/bx-junk10", ENOEXEC, "garbage: ENOEXEC");
+    check_exec("/tmp", EACCES, "a directory: EACCES");
+    write_file("/tmp/bx-noshebang", "exit 3\n", 7, 0755);
+    check_exec("/tmp/bx-noshebang", ENOEXEC, "a script without #!: ENOEXEC");
+    write_file("/tmp/bx-emptyshebang", "#!\n", 3, 0755);
+    check_exec("/tmp/bx-emptyshebang", ENOEXEC, "an empty #! line: ENOEXEC");
+    write_file("/tmp/bx-badinterp", "#!/tmp/bx-junk10\n", 17, 0755);
+    check_exec("/tmp/bx-badinterp", ENOEXEC, "#! naming garbage: ENOEXEC");
+    write_file("/tmp/bx-nointerp", "#!/no/such/sh\n", 14, 0755);
+    check_exec("/tmp/bx-nointerp", ENOENT, "#! naming nothing: ENOENT");
+    write_file("/tmp/bx-junk128", junk, sizeof junk, 0755);
+    write_elf_with_interp("/tmp/bx-elf-nointerp", "/no/such/ld.so", em);
+    check_exec("/tmp/bx-elf-nointerp", ENOENT, "PT_INTERP naming nothing: ENOENT");
+    write_elf_with_interp("/tmp/bx-elf-junk", "/tmp/bx-junk128", em);
+    check_exec("/tmp/bx-elf-junk", ELIBBAD, "PT_INTERP of garbage: ELIBBAD");
+    write_elf_with_interp("/tmp/bx-elf-short", "/tmp/bx-junk10", em);
+    check_exec("/tmp/bx-elf-short", EIO, "PT_INTERP of 10 bytes: EIO");
+    write_elf_with_interp("/tmp/bx-elf-dir", "/tmp", em);
+    check_exec("/tmp/bx-elf-dir", EACCES, "PT_INTERP a directory: EACCES");
+    write_elf_with_interp("/tmp/bx-elf-other", "/no/such/ld.so", other);
+    check_exec("/tmp/bx-elf-other", ENOEXEC, "an ELF for another machine: ENOEXEC");
+
+    // Five scripts in front of /bin/sh run; six are ELOOP.
+    for (int len = 5; len <= 6; len++) {
+        char name[64], line[64];
+        for (int i = 0; i < len; i++) {
+            snprintf(name, sizeof name, "/tmp/bx-chain%d", i);
+            if (i + 1 == len)
+                snprintf(line, sizeof line, "#!/bin/sh\nexit 7\n");
+            else
+                snprintf(line, sizeof line, "#!/tmp/bx-chain%d\n", i + 1);
+            write_file(name, line, strlen(line), 0755);
+        }
+        int st = exec_status("/tmp/bx-chain0");
+        int want = len == 5 ? 7 : 100 + ELOOP;
+        check(WIFEXITED(st) && WEXITSTATUS(st) == want,
+              len == 5 ? "five chained scripts run" : "six chained scripts: ELOOP", "st=%#x (exit %d, signal %d)",
+              st, WIFEXITED(st) ? WEXITSTATUS(st) : -1, WIFSIGNALED(st) ? WTERMSIG(st) : 0);
+        for (int i = 0; i < len; i++) {
+            snprintf(name, sizeof name, "/tmp/bx-chain%d", i);
+            unlink(name);
+        }
+    }
+
+    // What the errno is for: a shell runs a file the kernel answers with
+    // ENOEXEC as a script of its own.
+    pid_t c = fork();
+    if (c == 0) {
+        execl("/bin/sh", "sh", "-c", "/tmp/bx-noshebang", (char *)NULL);
+        _exit(127);
+    }
+    int st = status_of(c);
+    check(WIFEXITED(st) && WEXITSTATUS(st) == 3, "sh runs a script without #!", "st=%#x", st);
+
+    const char *made[] = {
+        "/tmp/bx-junk10",       "/tmp/bx-noshebang", "/tmp/bx-emptyshebang", "/tmp/bx-badinterp",
+        "/tmp/bx-nointerp",     "/tmp/bx-junk128",   "/tmp/bx-elf-nointerp", "/tmp/bx-elf-junk",
+        "/tmp/bx-elf-short",    "/tmp/bx-elf-dir",   "/tmp/bx-elf-other",
+    };
+    for (size_t i = 0; i < sizeof made / sizeof made[0]; i++) unlink(made[i]);
+}
+
 // ------------------------------------------------------------------- main
 
 static const struct {
@@ -1262,6 +1410,7 @@ static const struct {
     {"stop", "a stop reaches a process blocked in a syscall", sec_stop},
     {"teardown", "an exit ends every thread, whatever it waits in", sec_teardown},
     {"spawn", "a vfork child runs in its parent's memory", sec_spawn},
+    {"badexec", "a failed execve returns, with Linux's errno", sec_badexec},
 };
 
 int main(int argc, char **argv) {

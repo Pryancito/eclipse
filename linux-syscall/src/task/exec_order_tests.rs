@@ -44,12 +44,46 @@ fn a_process_with(pid: KoID, threads: usize) -> Arc<Process> {
     proc
 }
 
-/// A token, by the only route there is to one: a head that is not a script.
-/// Four zero bytes are not `#!`, which is the whole of what the preflight
-/// looks at before deciding there is no interpreter chain to walk.
+/// `e_machine` of this host, which is the machine the preflight asks for.
+#[cfg(target_arch = "x86_64")]
+const EM_HOST: u16 = 62;
+#[cfg(target_arch = "aarch64")]
+const EM_HOST: u16 = 183;
+#[cfg(target_arch = "riscv64")]
+const EM_HOST: u16 = 243;
+
+/// A file at `/name` in `proc`'s root holding `bytes`.
+fn a_file(proc: &Arc<Process>, name: &str, bytes: &[u8]) -> Arc<dyn rcore_fs::vfs::INode> {
+    let file = proc
+        .linux()
+        .root_inode()
+        .create(name, rcore_fs::vfs::FileType::File, 0o755)
+        .unwrap();
+    file.write_at(0, bytes).unwrap();
+    file
+}
+
+/// The smallest static program for this machine the preflight accepts: an
+/// ELF64 header and one `PT_LOAD` over the whole file.
+fn a_static_elf() -> Vec<u8> {
+    let mut v = vec![0u8; 64 + 56];
+    v[..7].copy_from_slice(b"\x7fELF\x02\x01\x01");
+    v[16..18].copy_from_slice(&2u16.to_le_bytes()); // ET_EXEC
+    v[18..20].copy_from_slice(&EM_HOST.to_le_bytes());
+    v[32..40].copy_from_slice(&64u64.to_le_bytes()); // e_phoff
+    v[54..56].copy_from_slice(&56u16.to_le_bytes()); // e_phentsize
+    v[56..58].copy_from_slice(&1u16.to_le_bytes()); // e_phnum
+    v[64..68].copy_from_slice(&1u32.to_le_bytes()); // PT_LOAD
+    v[96..104].copy_from_slice(&120u64.to_le_bytes()); // p_filesz
+    v
+}
+
+/// A token, by the only route there is to one: an image the preflight finds
+/// nothing wrong with.
 fn a_token(proc: &Arc<Process>) -> ExecPreflight {
-    execve_preflight(&[0u8; 4], 0, proc.linux().root_inode())
-        .expect("a head that is not a shebang has no interpreter to resolve")
+    let image = a_file(proc, "static", &a_static_elf());
+    execve_preflight(&image, 0, proc.linux().root_inode())
+        .expect("a static program for this machine has nothing to refuse")
 }
 
 /// The caller of `execve` is the one thread that comes out the other side.
@@ -163,11 +197,8 @@ fn a_shebang_naming_a_missing_interpreter_is_refused_and_costs_the_caller_nothin
     let proc = a_process_with(43_393, 3);
     let before = proc.thread_count();
 
-    let got = execve_preflight(
-        b"#!/nonexistent/interpreter\n",
-        0,
-        proc.linux().root_inode(),
-    );
+    let script = a_file(&proc, "script", b"#!/nonexistent/interpreter\n");
+    let got = execve_preflight(&script, 0, proc.linux().root_inode());
 
     assert!(
         got.is_err(),

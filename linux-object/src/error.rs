@@ -112,6 +112,9 @@ pub enum LxError {
     /// is not in a state that allows the operation. ALSA returns it from
     /// `writei`/`readi` on a stream that is neither prepared nor running.
     EBADFD = 77,
+    /// Accessing a corrupted shared library -- `execve` of an image whose
+    /// `PT_INTERP` names a file that is not an interpreter for this machine.
+    ELIBBAD = 80,
     /// Value too large for defined data type. `fcntl(2)`'s record locks
     /// return it when `l_whence` + `l_start` + `l_len` resolve to a range
     /// that will not fit an `off_t`.
@@ -207,6 +210,7 @@ impl fmt::Display for LxError {
             ENODATA => "No data available",
             ETIME => "Timer expired",
             EBADFD => "File descriptor in bad state",
+            ELIBBAD => "Accessing a corrupted shared library",
             ENOTSOCK => "Socket operation on non-socket",
             ENOPROTOOPT => "Protocol not available",
             EPROTONOSUPPORT => "Protocol not supported",
@@ -388,6 +392,7 @@ mod errno_tests {
             (LxError::ETIME, 62),
             (LxError::EOVERFLOW, 75),
             (LxError::EBADFD, 77),
+            (LxError::ELIBBAD, 80),
             (LxError::ENOTSOCK, 88),
             (LxError::ENOPROTOOPT, 92),
             (LxError::EPROTONOSUPPORT, 93),
