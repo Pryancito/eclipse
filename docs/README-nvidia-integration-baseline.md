@@ -188,14 +188,16 @@ cargo xtask mk-sfs --dir rootfs/x86_64-minimal --image zCore/x86_64-minimal.img 
 ```
 
 CUDA se prueba paso a paso con `cuda-probe`. Cuando un paso falla,
-`dmesg | grep nvidia` nombra la llamada de NVIDIA que el núcleo aún no sirve,
-con cualquier `LOG`. Arrancando además con `BOOTTRACE=cuda-probe`,
+`dmesg | grep -E 'nvidia|mmap'` nombra la llamada de NVIDIA que el núcleo aún
+no sirve, o el `mmap` que rechazó, con cualquier `LOG`: un
+`CUDA_ERROR_OUT_OF_MEMORY` (2) de `cuInit` es libcuda sin poder reservar su
+espacio de direcciones. Arrancando además con `BOOTTRACE=cuda-probe`,
 `/proc/bootprofile` lista cada llamada de `cuda-probe` que falló, con su
 errno: es lo que hay detrás de un `CUDA_ERROR_OPERATING_SYSTEM` (304).
 
 ```sh
 cuda-probe
-dmesg | grep nvidia
+dmesg | grep -E 'nvidia|mmap'
 grep -E 'FAIL| e[0-9]' /proc/bootprofile
 ```
 
