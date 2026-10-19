@@ -1192,6 +1192,109 @@ fn setplane_wants_a_crtc_the_plane_reaches_and_a_source_inside_the_fb() {
     c.destroy_dumb(buf.handle).expect("DESTROY_DUMB");
 }
 
+/// `__setplane_check`, "give drivers some help against integer
+/// overflows": `crtc_w` and `crtc_h` at most INT_MAX, and `crtc_x` at
+/// most `INT_MAX - crtc_w` (`crtc_y` likewise), else ERANGE; measured
+/// after the CRTC mask and before the source rectangle. Nothing read it:
+/// a width past INT_MAX, or an x that pushed the right edge past it, was
+/// presented and written into the plane state, which the CRTC_X / CRTC_W
+/// properties then read back outside their own ranges.
+#[test]
+fn setplane_refuses_a_crtc_rectangle_past_int_max_before_the_source_rectangle() {
+    let screen = kms_emu::attach(32, 8);
+    let _first = screen.attach_gpu(EmuGpu::hardware_kms("emu-gpu-0").with_ids(60, 61, 62));
+    let _second = screen.attach_gpu(EmuGpu::hardware_kms("emu-gpu-1").with_ids(70, 71, 72));
+    let c = Client::open(0);
+    let buf = c.create_dumb(32, 8);
+    paint(&buf, 0x0000_7777);
+    let fb = c.addfb2(&buf);
+    let (crtcs, _) = topology(&c);
+    let (front, back) = (crtcs[0], crtcs[1]);
+    let plane_of = |crtc: u32| crtc + 2;
+    let set_plane = |plane_id: u32, crtc_id: u32, rect: (i32, i32, u32, u32), src_w: u32| {
+        let mut req: DrmModeSetPlane = zeroed();
+        req.plane_id = plane_id;
+        req.crtc_id = crtc_id;
+        req.fb_id = fb;
+        (req.crtc_x, req.crtc_y, req.crtc_w, req.crtc_h) = rect;
+        req.src_w = src_w << 16;
+        req.src_h = 8 << 16;
+        c.ioctl(DRM_IOCTL_MODE_SETPLANE, &mut req)
+    };
+    let rect_in_state = || {
+        let st = drm::atomic_snapshot().0;
+        (st.crtc_x, st.crtc_y, st.crtc_w, st.crtc_h)
+    };
+    let erange = Err(FsError::OutOfRange);
+    const MAX: i32 = i32::MAX;
+
+    // A rectangle that fits, so the state has something to keep.
+    assert_eq!(set_plane(plane_of(front), front, (4, 2, 32, 8), 32), Ok(0));
+    assert_eq!(rect_in_state(), (4, 2, 32, 8));
+
+    for (rect, what) in [
+        ((0, 0, 1 << 31, 8), "a width past INT_MAX"),
+        ((0, 0, 32, 1 << 31), "a height past INT_MAX"),
+        (
+            (MAX, 0, 32, 8),
+            "an x that pushes the right edge past INT_MAX",
+        ),
+        (
+            (0, MAX - 7, 32, 8),
+            "a y that pushes the bottom edge past INT_MAX",
+        ),
+        (
+            (i32::MIN, 0, 1 << 31, 8),
+            "a width past INT_MAX, whatever x says",
+        ),
+    ] {
+        assert_eq!(
+            set_plane(plane_of(front), front, rect, 32),
+            erange,
+            "{}",
+            what
+        );
+        assert_eq!(
+            rect_in_state(),
+            (4, 2, 32, 8),
+            "{}: the plane state is untouched",
+            what
+        );
+    }
+    // Edges exactly at INT_MAX are in range, and a negative origin always is.
+    assert_eq!(
+        set_plane(plane_of(front), front, (MAX - 32, MAX - 8, 32, 8), 32),
+        Ok(0),
+        "right and bottom edges exactly at INT_MAX"
+    );
+    assert_eq!(rect_in_state(), (MAX - 32, MAX - 8, 32, 8));
+    assert_eq!(
+        set_plane(plane_of(front), front, (-40, -40, 32, 8), 32),
+        Ok(0),
+        "a negative origin"
+    );
+
+    // Measured after the CRTC mask and before the source rectangle.
+    assert_eq!(
+        set_plane(plane_of(back), back, (MAX, 0, 32, 8), 32),
+        Err(FsError::InvalidParam),
+        "a CRTC the plane's mask does not reach comes first"
+    );
+    assert_eq!(
+        set_plane(plane_of(front), front, (MAX, 0, 32, 8), 33),
+        erange,
+        "the source rectangle is measured after"
+    );
+    assert_eq!(
+        set_plane(plane_of(front), front, (0, 0, 32, 8), 33),
+        Err(FsError::NoDeviceSpace),
+        "and still counts on its own"
+    );
+
+    c.rmfb(fb).expect("RMFB");
+    c.destroy_dumb(buf.handle).expect("DESTROY_DUMB");
+}
+
 /// `drm_mode_page_flip_ioctl`, once the CRTC and the fb are found: the
 /// CRTC's mode has to fit in the new fb (`drm_crtc_check_viewport`,
 /// ENOSPC), and "page flip is not allowed to change frame buffer format"

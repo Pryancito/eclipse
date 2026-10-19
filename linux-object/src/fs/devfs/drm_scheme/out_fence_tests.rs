@@ -295,6 +295,81 @@ fn a_value_the_property_cannot_take_is_refused_at_the_property_not_by_the_commit
     c.destroy_dumb(buf.handle).expect("DESTROY_DUMB");
 }
 
+/// `drm_atomic_plane_check`, "give drivers some help against integer
+/// overflows": with a CRTC, `crtc_x + crtc_w` and `crtc_y + crtc_h` have
+/// to stay within `int` (`crtc_x > INT_MAX - crtc_w`), else ERANGE,
+/// measured before the source rectangle. CRTC_W and CRTC_H past INT_MAX
+/// already fail at the property; CRTC_X = INT_MAX with any width passed
+/// through here and was committed.
+#[test]
+fn a_crtc_rectangle_past_int_max_is_erange_before_the_source_rectangle() {
+    let (_screen, c) = atomic_client(32, 8);
+    let buf = c.create_dumb(32, 8);
+    let fb = c.addfb2(&buf);
+    let plane = drm::SYNTH_PLANE_ID;
+    let crtc = drm::SYNTH_CRTC_ID;
+    const MAX: u64 = i32::MAX as u64;
+    let plane_req = |x: u64, y: u64, src_w: u64| {
+        Request::new(
+            &[plane],
+            &[8],
+            &[
+                PROP_FB_ID,
+                PROP_CRTC_ID,
+                PROP_CRTC_X,
+                PROP_CRTC_Y,
+                PROP_CRTC_W,
+                PROP_CRTC_H,
+                PROP_SRC_W,
+                PROP_SRC_H,
+            ],
+            &[fb as u64, crtc as u64, x, y, 32, 8, src_w << 16, 8 << 16],
+        )
+    };
+    let test = |req: &Request| commit(&c, req, DRM_MODE_ATOMIC_TEST_ONLY);
+    let erange = Err(FsError::OutOfRange);
+
+    assert_eq!(
+        test(&plane_req(MAX, 0, 32)),
+        erange,
+        "an x that pushes the right edge past INT_MAX"
+    );
+    assert_eq!(
+        test(&plane_req(0, MAX - 7, 32)),
+        erange,
+        "a y that pushes the bottom edge past INT_MAX"
+    );
+    assert_eq!(
+        test(&plane_req(MAX, 0, 33)),
+        erange,
+        "measured before the source rectangle"
+    );
+    assert_eq!(
+        test(&plane_req(0, 0, 33)),
+        Err(FsError::NoDeviceSpace),
+        "which still counts on its own"
+    );
+    assert_eq!(
+        test(&plane_req(MAX - 32, MAX - 8, 32)),
+        Ok(0),
+        "right and bottom edges exactly at INT_MAX"
+    );
+
+    // The rectangle is the one the commit ends with: a width already in
+    // the state counts against an x that arrives alone.
+    drm::legacy_update_plane((0, 0, 32, 8), (0, 0, 32 << 16, 8 << 16));
+    let x_alone = Request::new(
+        &[plane],
+        &[3],
+        &[PROP_FB_ID, PROP_CRTC_ID, PROP_CRTC_X],
+        &[fb as u64, crtc as u64, MAX],
+    );
+    assert_eq!(test(&x_alone), erange, "the width in the state counts");
+
+    c.rmfb(fb).expect("RMFB");
+    c.destroy_dumb(buf.handle).expect("DESTROY_DUMB");
+}
+
 /// `TEST_ONLY` writes `-1` too: nothing was committed, so there is nothing
 /// to fence. Handing back a real (already signaled) fd here would leak one
 /// descriptor per `TEST_ONLY` probe, and wlroots probes on every output

@@ -429,6 +429,11 @@ pub enum FsError {
     /// E_NOKEY (126): the file or directory is encrypted and its key has not
     /// been added (fscrypt).
     NoKey,
+    /// E_RANGE (34): a value the operation cannot represent -- a plane's CRTC
+    /// rectangle past `INT_MAX` (`__setplane_check`, `drm_atomic_plane_check`:
+    /// "invalid CRTC coordinates"). NOT E_INVAL: Linux keeps the two apart
+    /// and a client that tells them apart is told which it was.
+    OutOfRange,
 }
 
 impl fmt::Display for FsError {

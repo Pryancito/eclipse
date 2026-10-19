@@ -2014,6 +2014,18 @@ impl DrmDev {
                     if index >= 32 || plane.possible_crtcs & (1 << index) == 0 {
                         return Err(FsError::InvalidParam);
                     }
+                    // "Give drivers some help against integer overflows"
+                    // (`__setplane_check`, ERANGE): `crtc_w` and `crtc_h`
+                    // within `int`, and `crtc_x + crtc_w`, `crtc_y + crtc_h`
+                    // too, measured before the source rectangle. Nothing
+                    // read it: a width past INT_MAX, or an x that pushed the
+                    // right edge past it, was presented and written into the
+                    // plane state, which the CRTC_X / CRTC_W properties then
+                    // read back outside their own ranges.
+                    if !drm::crtc_coords_in_range((req.crtc_x, req.crtc_y, req.crtc_w, req.crtc_h))
+                    {
+                        return Err(FsError::OutOfRange);
+                    }
                     if !drm::src_coords_fit(
                         fb.width,
                         fb.height,
@@ -6014,6 +6026,7 @@ fn atomic_errno(e: drm::AtomicError) -> FsError {
         drm::AtomicError::Device => FsError::DeviceError,
         drm::AtomicError::Busy => FsError::Busy,
         drm::AtomicError::NoSpace => FsError::NoDeviceSpace,
+        drm::AtomicError::Range => FsError::OutOfRange,
     }
 }
 

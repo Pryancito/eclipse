@@ -137,7 +137,7 @@ Leyenda: ✅ implementado · 🟡 parcial / no-op deliberado · ❌ no implement
 | `DRM_IOCTL_MODE_GETCONNECTOR` | ✅ | 1 modo = resolución nativa (preferido); propiedades estándar (ver abajo); `encoder_id=0` mientras el CRTC no tiene modo |
 | `DRM_IOCTL_MODE_GETPLANERESOURCES` | ✅ | 1 plano primario |
 | `DRM_IOCTL_MODE_GETPLANE` | ✅ | formatos `XR24`/`AR24`; `crtc_id` y `fb_id` son el CRTC y el framebuffer que el plano primario muestra (como `plane->state->crtc`/`->fb`): 0 y 0 con el CRTC apagado por `SETCRTC` sin modo o `RMFB` del scanout, sin cambio con DPMS off, y el fb sigue a cada flip; el id de fb propio del driver nunca sale |
-| `DRM_IOCTL_MODE_SETPLANE` | ✅ | equivale a *scanout* del fb (ruta primaria SW); escribe los ocho rectángulos del plano tal como llegan (`drm_atomic_helper_update_plane`), que `GETCRTC` (`x`/`y`) y las propiedades del plano leen después; con `fb_id=0` no hace nada (Linux desactiva el plano, y si es el primario cada driver decide si lo admite con el CRTC encendido) |
+| `DRM_IOCTL_MODE_SETPLANE` | ✅ | equivale a *scanout* del fb (ruta primaria SW); escribe los ocho rectángulos del plano tal como llegan (`drm_atomic_helper_update_plane`), que `GETCRTC` (`x`/`y`) y las propiedades del plano leen después; un rectángulo de CRTC que desborda `int` (`crtc_w`/`crtc_h` > INT_MAX, o `crtc_x + crtc_w` / `crtc_y + crtc_h` > INT_MAX) → **ERANGE**, tras la máscara de CRTCs y antes del rectángulo fuente (`__setplane_check`); con `fb_id=0` no hace nada (Linux desactiva el plano, y si es el primario cada driver decide si lo admite con el CRTC encendido) |
 | `DRM_IOCTL_MODE_PAGE_FLIP` | ✅ | *scanout*; `DRM_EVENT_FLIP_COMPLETE` (con `crtc_id` y la secuencia de vblank) solo con `PAGE_FLIP_EVENT`; `ASYNC`/`TARGET_*`/flags desconocidos → EINVAL, fb desconocido → ENOENT; el fb nuevo tiene que contener el rectángulo fuente del plano primario (`drm_framebuffer_check_src_coords` con `SRC_X/Y/W/H`, ENOSPC: un viewport desplazado por `SETCRTC`/`SETPLANE`/ATOMIC cuenta), y el modo sólo mide cuando el plano nunca se ha posicionado (aquí se puede empezar con un flip; Linux da EBUSY) |
 | `DRM_IOCTL_MODE_OBJ_GETPROPERTIES` | ✅ | tabla de propiedades por objeto; las propiedades `DRM_MODE_PROP_ATOMIC` solo se muestran a clientes atómicos (mismo filtrado que Linux) |
 | `DRM_IOCTL_MODE_GETPROPERTY` | ✅ | metadatos completos: flags, nombre, rangos/enums/tipo de objeto |
@@ -219,8 +219,10 @@ en los tres objetos, blobs de modo (`CREATEPROPBLOB`/`MODE_ID`) y
   tamaño del fb **desplazado 16 bits**, como hace Linux, así que un clip que
   se pasa en píxeles se acepta y se recorta al presentar); un blob de clips
   que no es un número entero de rectángulos es EINVAL al escenificar. En un
-  plano que acaba apagado no se mira nada más. Sin ERANGE para las
-  coordenadas de CRTC desbordadas: no hay errno para él en `FsError`.
+  plano que acaba apagado no se mira nada más. Un rectángulo de CRTC que
+  desborda `int` (`crtc_x + crtc_w` o `crtc_y + crtc_h` > INT_MAX; `crtc_w` y
+  `crtc_h` solos ya los para la propiedad) → **ERANGE** (`FsError::OutOfRange`),
+  antes del rectángulo fuente, como `drm_atomic_plane_check`.
 - El commit de un `FB_ID` hace el *scanout* (mismo blit que la ruta legacy).
 
 **Cómo activarlo**: es estrictamente **opt-in** mientras la ruta legacy siga
