@@ -136,7 +136,7 @@ Paso 1 de la paridad con btrfs. Todo vive en árboles B+ copy-on-write
   espacio lógico se reparte en *chunks* (los grupos de 128 MiB del
   asignador), cada uno de datos, de metadatos o mixto, con su perfil:
   `single`, `dup`, `raid0`, `raid1`, `raid10`, `raid1c3` y `raid1c4`
-  (RAID5/6 no, btrfs tampoco los da por estables). El bloque 0 de cada
+  (y `raid5`/`raid6`, ver «Mejoras tras la paridad»). El bloque 0 de cada
   dispositivo lleva una copia del superbloque con su id y el mapeo del
   grupo 0, que guarda el journal y el mapa de chunks (con CRC32C), así
   que cualquier dispositivo basta para encontrar el resto. Los chunks se
@@ -273,6 +273,51 @@ Con esto EclipseFS tiene todo lo de btrfs. Lo siguiente ya es propio.
   dentro de un directorio cifrado. fsck y scrub funcionan sin la clave.
   `aes` va en `vendor/aes` con AES-NI solo si el objetivo tiene SSE2,
   porque el kernel se compila sin coma flotante.
+- **RAID5 y RAID6 sin agujero de escritura** (`Profile::Raid5`/`Raid6`,
+  bit `FEAT_RAID56`, `raid56.rs`): cada fila tiene un bloque de 4 KiB por
+  dispositivo, `k` de datos más P (XOR) y, en RAID6, Q (Reed-Solomon en
+  GF(2^8), generador 2 y polinomio 0x11d como md y btrfs, con tablas y sin
+  SIMD porque el kernel es soft-float). La paridad rota de un dispositivo
+  a otro en cada fila. RAID5 aguanta un dispositivo perdido (mínimo 2) y
+  RAID6 dos (mínimo 3); `mount_degraded` lo comprueba chunk a chunk.
+  - **El agujero de escritura de btrfs no existe aquí**: en btrfs un corte
+    entre un bloque de datos y la paridad de su fila deja esa paridad mal
+    para los *otros* bloques de la fila, que se reconstruyen mal si luego
+    se pierde un disco. En EclipseFS el asignador solo da bloques de un
+    chunk con paridad en filas enteramente libres o que la transacción
+    abierta ya empezó (`blocks.rs`), así que nunca se escribe en una fila
+    con datos confirmados. Lo que un corte deja a medias son filas que
+    solo tenían bloques libres o sin confirmar, y la siguiente escritura
+    recalcula la paridad desde lo que hay en disco. La cola libre de una
+    fila que una transacción dejó a medias espera a que se libere la fila
+    entera. La única fila que se reescribe en su sitio, la del bitmap del
+    grupo, va por el journal. `tests/raid56.rs` corta la luz en cada punto
+    de una carga y monta sin cada uno de los discos: con la regla quitada
+    el test falla.
+  - Al leer, un bloque que falta o no cuadra con su checksum se
+    reconstruye de la fila: «copia» 1 con P, 2 con Q, y en RAID6 3.. con
+    cada otro bloque de la fila supuesto perdido también, así se arregla
+    un bloque podrido junto a un disco perdido. `scrub` comprueba cada
+    reconstrucción, así encuentra también P y Q malas, y reescribe lo que
+    falle (dato, P o Q). Un dispositivo que vuelve tras un montaje
+    degradado recibe su parte reconstruida.
+  - `balance` convierte entre cualquier perfil y RAID5/6 (el grupo 0 va en
+    `raid1`, o `raid1c3` con RAID6). Kernel: `BTRFS_BLOCK_GROUP_RAID5/6`
+    en `BALANCE_V2`.
+- **Niveles rápido y lento** (bit `FEAT_TIERS`, mapa de chunks v2), como
+  los targets de bcachefs: `set_device_tier(devid, Tier::Fast|Slow|Any)`,
+  `add_device_tier` o `mkfs::format_devices_tiered`. Con dispositivos de
+  los dos niveles, los metadatos y los datos nuevos van a chunks en los
+  rápidos mientras tengan sitio (si no, a cualquiera), y
+  `tier_migrate(todos)` lleva a los lentos los chunks de datos llenos (los
+  que ya no se están escribiendo; todos con `todos`) y a los rápidos los
+  de metadatos que no estén. Se mueven chunks enteros, así los bloques
+  lógicos y todas sus referencias (snapshots, reflinks) no cambian, y
+  `balance` deja cada chunk en su nivel. Un mapa sin niveles sigue en la
+  versión 1, legible por drivers anteriores. Kernel: `EFS_IOC_SET_TIER`,
+  `EFS_IOC_GET_TIER` y `EFS_IOC_TIER_MIGRATE`. Los archivos pequeños no
+  tienen trato aparte: van a los rápidos como todo dato nuevo y se mueven
+  con su chunk.
 - TRIM/discard queda pendiente: los drivers de disco del kernel todavía no
   tienen discard.
 
@@ -287,7 +332,9 @@ Con esto EclipseFS tiene todo lo de btrfs. Lo siguiente ya es propio.
   Incluye `FS_IOC_GETFLAGS`/`SETFLAGS`, `FICLONE`/`FICLONERANGE`, `FIDEDUPERANGE`,
   subvolúmenes y snapshots, subvolumen por defecto, `INO_LOOKUP`, `FS_INFO`,
   `DEV_INFO`, scrub, cuotas, `ADD_DEV`/`RM_DEV`/`DEV_REPLACE`, `BALANCE_V2`,
-  `SEND`, `FS_IOC_FIEMAP`, `DEFRAG`/`DEFRAG_RANGE` y `RESIZE`.
+  `SEND`, `FS_IOC_FIEMAP`, `DEFRAG`/`DEFRAG_RANGE` y `RESIZE`. Los
+  niveles de los dispositivos van por `EFS_IOC_SET_TIER`/`GET_TIER` y
+  `EFS_IOC_TIER_MIGRATE`.
 - Las ioctls de fscrypt con políticas v2 (`SET_ENCRYPTION_POLICY`,
   `GET_ENCRYPTION_POLICY(_EX)`, `ADD_ENCRYPTION_KEY`,
   `REMOVE_ENCRYPTION_KEY(_ALL_USERS)`, `GET_ENCRYPTION_KEY_STATUS`,
@@ -349,7 +396,20 @@ cargo test --release -p eclipsefs --features std
   exclusivos, desactivar y reactivar, archivos comprimidos y subvolúmenes
   recibidos. Las cargas de crash con semilla impar llevan las cuotas
   activas, así el fsck comprueba los contadores tras cada corte.
-- `tests/volume.rs`: los siete perfiles sobre cuatro dispositivos,
+- `tests/raid56.rs`: RAID5/6 con 2 a 6 dispositivos, cualquier disco (o
+  par, en RAID6) perdido, escrituras degradadas y el disco que vuelve,
+  bloques y paridad podridos (reparados al leer y en scrub), podredumbre
+  junto a un disco perdido, más daño del que la paridad cubre (se
+  informa), conversiones de ida y vuelta, mucho archivo pequeño creado y
+  borrado (el espacio vuelve) y cortes de luz en cada punto sin cada uno
+  de los discos (el agujero de escritura). En `volume.rs` hay además
+  pruebas de la aritmética, de la reconstrucción de cualquier uno o dos
+  bloques y de la E/S de filas.
+- `tests/tiering.rs`: metadatos y datos nuevos en el rápido, migración a
+  los lentos (todo o solo los chunks llenos), desbordar el rápido, RAID1
+  de metadatos en la pareja rápida, niveles puestos después y en
+  dispositivos añadidos, y niveles con RAID5.
+- `tests/volume.rs`: los nueve perfiles sobre cuatro dispositivos,
   dispositivos perdidos (montaje degradado y qué perfiles lo permiten),
   bloques podridos en una copia y en todas (reparación al leer y en
   scrub, datos y metadatos), crecer de un dispositivo a RAID1, quitar,

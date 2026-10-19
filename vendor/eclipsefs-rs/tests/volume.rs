@@ -98,9 +98,14 @@ fn every_profile_reads_back_after_a_remount() {
         same(&mut fs, &files);
         clean(&mut fs);
         for c in fs.chunks() {
-            if c.logical == 0 && p.striped() {
+            if c.logical == 0 && (p.striped() || p.parity() > 0) {
                 // Group 0 is mirrored instead.
-                assert_eq!(c.profile, Profile::Raid1);
+                let want = if p == Profile::Raid6 {
+                    Profile::Raid1c3
+                } else {
+                    Profile::Raid1
+                };
+                assert_eq!(c.profile, want);
                 continue;
             }
             assert_eq!(c.profile, p, "{:?}", c);
@@ -108,7 +113,11 @@ fn every_profile_reads_back_after_a_remount() {
                 Profile::Single => 1,
                 Profile::Dup | Profile::Raid1 => 2,
                 Profile::Raid1c3 => 3,
-                Profile::Raid1c4 | Profile::Raid0 | Profile::Raid10 => 4,
+                Profile::Raid1c4
+                | Profile::Raid0
+                | Profile::Raid10
+                | Profile::Raid5
+                | Profile::Raid6 => 4,
             };
             assert_eq!(c.stripes.len(), want, "{:?}", c);
         }

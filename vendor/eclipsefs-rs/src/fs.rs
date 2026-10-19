@@ -22,7 +22,7 @@ use crate::cow::{CowFs, SendStats};
 use crate::device::BlockDevice;
 use crate::format::{FileKind, BLOCK_SIZE, MAGIC};
 use crate::v3::EclipseFsV3;
-use crate::volume::{ChunkKind, Profile};
+use crate::volume::{ChunkKind, Profile, Tier};
 use crate::{Error, Result};
 
 /// Operations grouped into one transaction at most (unless `sync` or the
@@ -99,6 +99,8 @@ pub struct DeviceInfo {
     pub allocated_bytes: u64,
     /// False when mounted degraded without it.
     pub present: bool,
+    /// Fast or slow, for tiered placement.
+    pub tier: Tier,
 }
 
 /// One chunk of the logical space (see [`EclipseFS::chunks`]).
@@ -755,6 +757,35 @@ impl EclipseFS {
         meta: Option<Profile>,
     ) -> Result<BalanceReport> {
         self.cow()?.balance(data, meta)
+    }
+
+    /// Mark device `devid` fast (SSD) or slow (HDD), or neither. With both
+    /// kinds present, metadata and new data go to fast devices first.
+    pub fn set_device_tier(&mut self, devid: u32, tier: Tier) -> Result<()> {
+        self.cow()?.set_device_tier(devid, tier)
+    }
+
+    /// The tier of device `devid` ([`Tier::Any`] when it has none).
+    pub fn device_tier(&self, devid: u32) -> Tier {
+        match &self.driver {
+            Driver::V4(c) => c.device_tier(devid),
+            Driver::V3(_) => Tier::Any,
+        }
+    }
+
+    /// `btrfs device add` with a tier for the new device.
+    pub fn add_device_tier(&mut self, dev: Arc<dyn BlockDevice>, tier: Tier) -> Result<u32> {
+        let id = self.add_device(dev)?;
+        if tier != Tier::Any {
+            self.set_device_tier(id, tier)?;
+        }
+        Ok(id)
+    }
+
+    /// Move full data chunks from fast to slow devices and metadata chunks
+    /// to fast ones (every data chunk on a fast device with `all`).
+    pub fn tier_migrate(&mut self, all: bool) -> Result<BalanceReport> {
+        self.cow()?.tier_migrate(all)
     }
 
     /// Profiles of new data and metadata chunks.
