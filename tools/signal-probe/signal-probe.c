@@ -39,6 +39,10 @@
 //     handler, which Linux makes again, so glibc's `sem_wait` returned -1
 //     with no semaphore to a program that installed its handlers with
 //     `signal()`.
+//   * a `vfork` child ran in a COPY of its parent's memory, so what it wrote
+//     before its `exec` or `_exit` the parent never saw: glibc's
+//     `posix_spawn` of a program that does not exist returned 0, because it
+//     hears about the failed `exec` through a word the child writes.
 //
 // Every section states what Linux does and checks it, printing the numbers
 // whether it passes or fails. Each section runs in a child of its own, so a
@@ -82,6 +86,10 @@
 //              child that never execs -- has lost that thread by the time it
 //              is reaped: a robust mutex the thread held comes back
 //              EOWNERDEAD.
+//   spawn      a `vfork` child runs in its parent's memory: what it writes
+//              there the parent reads, so `posix_spawn` reports a program
+//              that does not exist and a file action that fails. And an
+//              `exec` from the child leaves the parent its program.
 //
 // Build:  make                 (x86_64-linux-musl-gcc -O2 -static)
 // Run:    ./signal-probe [--only SECTION]
@@ -93,6 +101,7 @@
 
 #define _GNU_SOURCE
 #include <errno.h>
+#include <fcntl.h>
 #include <limits.h>
 #include <poll.h>
 #include <pthread.h>
@@ -100,6 +109,7 @@
 #include <semaphore.h>
 #include <setjmp.h>
 #include <signal.h>
+#include <spawn.h>
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -1174,6 +1184,65 @@ static void sec_teardown(void) {
     }
 }
 
+// ------------------------------------------------------------------ spawn
+
+// The wait status of child `pid`, or -1.
+static int status_of(pid_t pid) {
+    int status;
+    return waitpid(pid, &status, 0) == pid ? status : -1;
+}
+
+static void sec_spawn(void) {
+    // vfork(2): the child runs in the parent's memory until it execs or
+    // exits, so what it writes there is what the parent reads.
+    volatile int word = 1;
+    pid_t pid = vfork();
+    if (pid == 0) {
+        word = 2;
+        _exit(0);
+    }
+    int status = pid > 0 ? status_of(pid) : -1;
+    check(pid > 0 && word == 2 && status == 0, "vfork: the child writes the parent's memory",
+          "the parent reads %d, child status %#x", (int)word, status);
+
+    // glibc's posix_spawn hears about a failed exec through a word its
+    // child writes in that memory; musl's, through a pipe.
+    pid_t child;
+    char *nothing[] = {"no-such-program", NULL};
+    int r = posix_spawn(&child, "/no/such/program", NULL, NULL, nothing, environ);
+    if (r == 0) status_of(child);
+    check(r == ENOENT, "posix_spawn: a missing program is ENOENT", "returned %d (%s)", r,
+          r ? strerror(r) : "a child");
+
+    char *sh[] = {"sh", "-c", "exit 3", NULL};
+    posix_spawn_file_actions_t fa;
+    posix_spawn_file_actions_init(&fa);
+    posix_spawn_file_actions_addopen(&fa, 3, "/no/such/file", O_RDONLY, 0);
+    r = posix_spawn(&child, "/bin/sh", &fa, NULL, sh, environ);
+    posix_spawn_file_actions_destroy(&fa);
+    if (r == 0) status_of(child);
+    check(r == ENOENT, "posix_spawn: a failed file action is ENOENT", "returned %d (%s)", r,
+          r ? strerror(r) : "a child");
+
+    // An exec in the child gives it memory of its own, and the parent comes
+    // back to its program every time.
+    enum { SPAWNS = 20 };
+    int good = 0, last = 0;
+    for (int i = 0; i < SPAWNS; i++) {
+        r = posix_spawn(&child, "/bin/sh", NULL, NULL, sh, environ);
+        status = r == 0 ? status_of(child) : -1;
+        if (!(WIFEXITED(status) && WEXITSTATUS(status) == 3)) {
+            last = r ? r : status;
+            break;
+        }
+        good++;
+    }
+    if (good == SPAWNS)
+        check(1, "posix_spawn: sh -c 'exit 3', 20 times", "all %d exited 3", SPAWNS);
+    else
+        check(0, "posix_spawn: sh -c 'exit 3', 20 times", "%d exited 3, then %#x", good, last);
+}
+
 // ------------------------------------------------------------------- main
 
 static const struct {
@@ -1192,6 +1261,7 @@ static const struct {
     {"wait", "what waitid and waitpid report", sec_wait},
     {"stop", "a stop reaches a process blocked in a syscall", sec_stop},
     {"teardown", "an exit ends every thread, whatever it waits in", sec_teardown},
+    {"spawn", "a vfork child runs in its parent's memory", sec_spawn},
 };
 
 int main(int argc, char **argv) {

@@ -626,18 +626,26 @@ impl Syscall<'_> {
         Ok((new_proc, tid))
     }
 
+    /// `shares_memory`: `CLONE_VM` came with the `CLONE_VFORK`, as it does
+    /// from `vfork(2)` and every libc's `posix_spawn`. The child then runs in
+    /// this process's address space until its `execve` gives it one of its
+    /// own, and what it writes there before that is what the parent reads:
+    /// glibc's `posix_spawn` learns of a failed `exec` that way. Without
+    /// `CLONE_VM` it gets a copy, as from `fork`, and the parent still waits.
     async fn vfork_impl(
         &self,
         newsp: usize,
         newtls: usize,
         ctid: ChildTidRequest,
         exit_signal: u8,
+        shares_memory: bool,
     ) -> LxResult<(Arc<Process>, KoID)> {
         info!("vfork: newsp={:#x} newtls={:#x}", newsp, newtls);
-        // A real vfork shares the parent's address space until execve or exit. The VMAR
-        // implementation cannot replace a shared address space on execve, so use a copy
-        // here while retaining vfork's parent-suspension semantics.
-        let new_proc = Process::fork_from(self.zircon_process())?;
+        let new_proc = if shares_memory {
+            Process::vfork_from(self.zircon_process())?
+        } else {
+            Process::fork_from(self.zircon_process())?
+        };
         let tid = self.start_forked_thread(&new_proc, newsp, newtls, ctid, exit_signal)?;
 
         let new_proc_obj: Arc<dyn KernelObject> = new_proc.clone();
@@ -652,8 +660,9 @@ impl Syscall<'_> {
         // a SIGKILL or a SIGTERM nobody catches ends the wait, and a parent
         // whose child never got as far as `exec` -- a `posix_spawn` whose
         // file action opens a FIFO nobody writes to -- can still be killed.
-        // The child goes on by itself (its address space is a copy) and the
-        // pid comes back as in Linux; the run loop carries the death out.
+        // The child goes on by itself, in an address space it keeps mapped
+        // for as long as it runs there, and the pid comes back as in Linux;
+        // the run loop carries the death out.
         let _ = killable_on(
             &self.thread.inner(),
             new_proc_obj.wait_signal(Signal::USER_SIGNAL_0 | Signal::PROCESS_TERMINATED),
@@ -667,10 +676,11 @@ impl Syscall<'_> {
     /// and the TID bookkeeping of `ctid` done BEFORE it runs a single user
     /// instruction. Returns the child's thread id.
     ///
-    /// The child's copy of the address space already exists (`fork_from`),
-    /// so `CLONE_CHILD_SETTID` cannot go through this thread's `UserOutPtr`:
-    /// that writes the parent's memory, which the child does not see. It is
-    /// written into the child's VMAR instead; see [`publish_child_tid`].
+    /// The child's address space already exists (a copy from `fork_from`,
+    /// or this one from `vfork_from`), so `CLONE_CHILD_SETTID` cannot go
+    /// through this thread's `UserOutPtr`: after a `fork` that writes the
+    /// parent's memory, which the child does not see. It is written into the
+    /// child's VMAR instead; see [`publish_child_tid`].
     fn start_forked_thread(
         &self,
         new_proc: &Arc<Process>,
@@ -684,8 +694,7 @@ impl Syscall<'_> {
         // not share the address space, so the alternate signal stack comes
         // across too. (For a vfork, Linux's rule is `(clone_flags &
         // (CLONE_VM|CLONE_VFORK)) == CLONE_VM`, and a vfork sets BOTH bits,
-        // so the stack comes across there just the same -- doubly right here,
-        // where the address space is copied anyway.)
+        // so the stack comes across there just the same.)
         let inherited = self.thread.lock_linux().forked_child();
         let new_thread = Thread::create_linux_with(new_proc, inherited)?;
         let mut new_ctx = self.thread.context_cloned()?;
@@ -753,6 +762,7 @@ impl Syscall<'_> {
             newtls,
             ChildTidRequest::none(),
             linux_object::signal::Signal::SIGCHLD as u8,
+            true,
         )
         .await
         .map(|(proc, _)| proc.id() as usize)
@@ -883,7 +893,9 @@ impl Syscall<'_> {
             let exit_signal = exit_signal_of_clone(flags);
             let (process, tid) = if clone_flags.contains(CloneFlags::VFORK) {
                 info!("sys_clone: dispatching to sys_vfork for flags {:#x}", flags);
-                self.vfork_impl(newsp, tls, ctid, exit_signal).await?
+                let shares_memory = clone_flags.contains(CloneFlags::VM);
+                self.vfork_impl(newsp, tls, ctid, exit_signal, shares_memory)
+                    .await?
             } else {
                 info!("sys_clone: dispatching to sys_fork for flags {:#x}", flags);
                 self.fork_impl(newsp, tls, ctid, exit_signal)?
@@ -1456,7 +1468,10 @@ impl Syscall<'_> {
         // 注意！即将销毁旧应用程序的用户空间，现在将必要的信息拷贝到内核！
         // Notice! About to destroy the user space of the old application, now copy the necessary information into kernel!
         let path_str = path_str.to_string();
-        let vmar = self.zircon_process().vmar();
+        // A `vfork` child runs in its parent's address space, and so does the
+        // parent while that child has not exec'd: the new image goes into one
+        // of this process's own, which leaves the other its program.
+        let vmar = self.zircon_process().own_address_space();
         let (load, privileged) = {
             // mmap_lock across the whole swap: tearing down the old image and
             // loading the new one is one layout mutation — a sibling thread's
@@ -2979,56 +2994,7 @@ mod fork_child_tid_tests;
 mod sched_validate_tests;
 
 #[cfg(test)]
-mod pdeathsig_tests {
-    use super::*;
-    use linux_object::signal::Signal as LinuxSignal;
-
-    #[test]
-    fn zero_disarms() {
-        assert_eq!(pdeathsig_from_arg(0), Ok(0));
-    }
-
-    #[test]
-    fn every_signal_is_latched_as_itself() {
-        for n in 1..=LinuxSignal::RTMAX {
-            assert_eq!(pdeathsig_from_arg(n), Ok(n as u8), "PR_SET_PDEATHSIG {}", n);
-        }
-    }
-
-    #[test]
-    fn a_number_above_nsig_is_rejected_not_truncated() {
-        // 265 & 0xff == 9: the child asked for a signal that does not exist and
-        // got SIGKILL on its parent's death.
-        assert_eq!(pdeathsig_from_arg(265), Err(LxError::EINVAL));
-        assert_eq!(pdeathsig_from_arg(65), Err(LxError::EINVAL));
-        assert_eq!(pdeathsig_from_arg(256), Err(LxError::EINVAL));
-    }
-
-    #[test]
-    fn prctl_does_not_truncate_to_int_the_way_kill_does() {
-        // prctl(2) declares arg2 `unsigned long`, so unlike kill(2) there is no
-        // 32-bit narrowing before `valid_signal()`: the high half makes the
-        // number out of range instead of disappearing.
-        assert_eq!(
-            pdeathsig_from_arg(0xdead_beef_0000_0009),
-            Err(LxError::EINVAL)
-        );
-        assert_eq!(pdeathsig_from_arg(0x1_0000_0000), Err(LxError::EINVAL));
-        // The same two words through kill(2)'s rule, for contrast.
-        assert_eq!(
-            LinuxSignal::from_syscall_arg(0xdead_beef_0000_0009),
-            Ok(Some(LinuxSignal::SIGKILL))
-        );
-        assert_eq!(LinuxSignal::from_syscall_arg(0x1_0000_0000), Ok(None));
-    }
-
-    #[test]
-    fn a_negative_argument_is_out_of_range() {
-        // prctl never sees it as negative; it sees a very large unsigned.
-        assert_eq!(pdeathsig_from_arg(usize::MAX), Err(LxError::EINVAL));
-        assert_eq!(pdeathsig_from_arg(-9i64 as usize), Err(LxError::EINVAL));
-    }
-}
+mod pdeathsig_tests;
 
 #[cfg(test)]
 mod clone3_tests;

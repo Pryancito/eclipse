@@ -64,6 +64,41 @@ pub trait ProcessExt {
     fn try_linux(&self) -> Option<&LinuxProcess>;
     /// fork from current linux process
     fn fork_from(parent: &Arc<Self>) -> ZxResult<Arc<Self>>;
+    /// [`fork_from`](Self::fork_from) for a `vfork` (`CLONE_VM |
+    /// CLONE_VFORK`): the child runs in `parent`'s address space, not a copy
+    /// of it, until its `execve` gives it one of its own.
+    fn vfork_from(parent: &Arc<Self>) -> ZxResult<Arc<Self>>;
+}
+
+/// What a new child process runs in.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ChildMemory {
+    /// A copy of the parent's address space: `fork`.
+    Copy,
+    /// The parent's own: `vfork`. glibc's `posix_spawn` and busybox's
+    /// `spawn()` learn that the child's `exec` failed from a word the child
+    /// writes in it, and with a copy the parent never saw it:
+    /// `posix_spawn("/no/such/file")` answered 0, for a child that died with
+    /// 127.
+    Parents,
+}
+
+/// What [`ProcessExt::fork_from`] and [`ProcessExt::vfork_from`] both do.
+trait NewChild {
+    fn new_child(parent: &Arc<Self>, memory: ChildMemory) -> ZxResult<Arc<Self>>;
+}
+
+/// Whether a `fork` of `parent` may batch its cross-CPU TLB shootdowns into
+/// one: only when nothing but the forking thread runs in its address space.
+/// That is the condition under which no other CPU can be executing there,
+/// and so the one under which the widened write-protect window cannot be
+/// observed -- see `VmAddressRegion::fork_from`. It is also the
+/// overwhelmingly common case: a shell, or anything that forks to exec,
+/// forks single-threaded. A multi-threaded parent keeps the per-mapping
+/// shootdown exactly as before, and so does a `vfork` child that forks
+/// before its `exec`: its parent's other threads run in the same memory.
+fn alone_in_its_address_space(parent: &Process) -> bool {
+    parent.thread_count() == 1 && !parent.shares_address_space()
 }
 
 const ROOT_UID: u32 = 0;
@@ -597,6 +632,16 @@ impl ProcessExt for Process {
     ///
     /// [Fork]: http://man7.org/linux/man-pages/man2/fork.2.html
     fn fork_from(parent: &Arc<Self>) -> ZxResult<Arc<Self>> {
+        Self::new_child(parent, ChildMemory::Copy)
+    }
+
+    fn vfork_from(parent: &Arc<Self>) -> ZxResult<Arc<Self>> {
+        Self::new_child(parent, ChildMemory::Parents)
+    }
+}
+
+impl NewChild for Process {
+    fn new_child(parent: &Arc<Self>, memory: ChildMemory) -> ZxResult<Arc<Self>> {
         let linux_parent = parent.linux();
         // mmap_lock, WRITE side: freeze the parent's address-space LAYOUT for
         // the entire fork — snapshot of the mapping list AND the whole copy
@@ -672,17 +717,22 @@ impl ProcessExt for Process {
         // The parent's address-space LAYOUT stays frozen across the copy
         // regardless: that is `aspace_lock`'s job, and it is still held.
         drop(linux_parent_inner);
-        let new_proc = Process::create_with_ext(&parent.job(), "", new_linux_proc)?;
-        // Batch the fork's cross-CPU TLB shootdowns into one, but only when
-        // the parent has a single thread. That is the condition under which no
-        // other CPU can be executing in the parent's address space, and so the
-        // one under which the widened write-protect window cannot be observed —
-        // see `VmAddressRegion::fork_from`. It is also the overwhelmingly common
-        // case: a shell, or anything that forks to exec, forks single-threaded.
-        // A multi-threaded parent keeps the per-mapping shootdown exactly as
-        // before.
-        let single_threaded = parent.thread_count() == 1;
-        new_proc.vmar().fork_from(&parent.vmar(), single_threaded)?;
+        let new_proc = match memory {
+            ChildMemory::Copy => {
+                let new_proc = Process::create_with_ext(&parent.job(), "", new_linux_proc)?;
+                let alone = alone_in_its_address_space(parent);
+                new_proc.vmar().fork_from(&parent.vmar(), alone)?;
+                new_proc
+            }
+            // Nothing to copy. The break and the rest of the layout the
+            // child's `LinuxProcess` keeps are a snapshot of the parent's, so
+            // a child that moved the break before its `execve` would leave
+            // the parent's behind; vfork(2) allows it only `execve` and
+            // `_exit`, and no libc's `posix_spawn` child calls anything else.
+            ChildMemory::Parents => {
+                Process::create_sharing_address_space(&parent.job(), "", parent, new_linux_proc)?
+            }
+        };
         // `create_with_ext` publishes the child into ROOT_JOB before its address
         // space exists and before it has any thread, so a concurrent kill can
         // terminate it inside this window. `set_status_running` refuses to
@@ -6373,6 +6423,8 @@ mod dying_thread_signal_tests;
 
 #[cfg(test)]
 mod killable_tests;
+#[cfg(test)]
+mod vfork_memory_tests;
 
 #[cfg(test)]
 mod interruptible_sleep_tests;
