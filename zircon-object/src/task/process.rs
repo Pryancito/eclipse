@@ -95,7 +95,8 @@ pub struct Process {
     _counter: CountHelper,
     job: Arc<Job>,
     policy: JobPolicy,
-    vmar: Arc<VmAddressRegion>,
+    /// The address space, and this process's hold on it. See [`Space`].
+    space: Mutex<Space>,
     /// Guard word immediately BEFORE `ext`. See [`EXT_CANARY`].
     canary_lo: u64,
     ext: Box<dyn Any + Send + Sync>,
@@ -132,6 +133,47 @@ pub struct Process {
     /// correlates the two tables, so nothing wanted them under one lock.
     futexes: Mutex<FutexTable>,
     inner: Mutex<ProcessInner>,
+}
+
+/// An address space, and the duty to unmap it: whoever lets go of its last
+/// `Arc` does. A process holds one for as long as it runs in it, and that is
+/// usually the only one. But a `vfork` child runs in its parent's until its
+/// `execve` or its exit -- Linux shares the `mm` -- and neither of the two
+/// may unmap it from under the other. glibc's `posix_spawn` and busybox's
+/// `spawn()` hear about a failed `exec` through a word the child writes in
+/// that memory, so the child has to write the parent's; a parent killed
+/// while it waits leaves the child running there; and the child's `_exit`
+/// leaves the parent the memory it is still running in.
+struct AddressSpace(Arc<VmAddressRegion>);
+
+impl Drop for AddressSpace {
+    fn drop(&mut self) {
+        let _ = self.0.clear();
+    }
+}
+
+/// What [`Process::vmar`] answers, and the hold that keeps it mapped: `None`
+/// once the process has terminated.
+struct Space {
+    vmar: Arc<VmAddressRegion>,
+    hold: Option<Arc<AddressSpace>>,
+}
+
+impl Space {
+    /// An address space of the process's own.
+    fn own(vmar: Arc<VmAddressRegion>) -> Self {
+        Space {
+            hold: Some(Arc::new(AddressSpace(vmar.clone()))),
+            vmar,
+        }
+    }
+
+    /// Whether some other process runs in it too.
+    fn is_shared(&self) -> bool {
+        self.hold
+            .as_ref()
+            .is_some_and(|hold| Arc::strong_count(hold) > 1)
+    }
 }
 
 impl_kobject!(Process
@@ -469,12 +511,13 @@ impl Process {
         vmar: Arc<VmAddressRegion>,
         ext: impl Any + Send + Sync,
     ) -> ZxResult<Arc<Self>> {
+        let space = Space::own(vmar);
         let proc = Arc::new(Process {
             base: KObjectBase::with_id(INIT_PID, name, Signal::default()),
             _counter: CountHelper::new(),
             job: job.clone(),
             policy: job.policy(),
-            vmar,
+            space: Mutex::new(space),
             canary_lo: EXT_CANARY,
             ext: Box::new(ext),
             canary_hi: EXT_CANARY,
@@ -507,7 +550,7 @@ impl Process {
             _counter: CountHelper::new(),
             job: job.clone(),
             policy: job.policy(),
-            vmar: VmAddressRegion::new_root(),
+            space: Mutex::new(Space::own(VmAddressRegion::new_root())),
             canary_lo: EXT_CANARY,
             ext: Box::new(ext),
             canary_hi: EXT_CANARY,
@@ -532,12 +575,42 @@ impl Process {
         vmar: Arc<VmAddressRegion>,
         ext: impl Any + Send + Sync,
     ) -> ZxResult<Arc<Self>> {
+        Self::create_in(job, name, Space::own(vmar), ext)
+    }
+
+    /// Create a new process that runs in `lender`'s address space until it
+    /// takes one of its own with [`Process::own_address_space`]: a `vfork`
+    /// child (`CLONE_VM | CLONE_VFORK`). Neither one's end unmaps it while
+    /// the other still runs in it. `BAD_STATE` once `lender` has terminated:
+    /// it has nothing left to lend.
+    pub fn create_sharing_address_space(
+        job: &Arc<Job>,
+        name: &str,
+        lender: &Process,
+        ext: impl Any + Send + Sync,
+    ) -> ZxResult<Arc<Self>> {
+        let space = {
+            let lent = lender.space.lock();
+            Space {
+                vmar: lent.vmar.clone(),
+                hold: Some(lent.hold.clone().ok_or(ZxError::BAD_STATE)?),
+            }
+        };
+        Self::create_in(job, name, space, ext)
+    }
+
+    fn create_in(
+        job: &Arc<Job>,
+        name: &str,
+        space: Space,
+        ext: impl Any + Send + Sync,
+    ) -> ZxResult<Arc<Self>> {
         let proc = Arc::new(Process {
             base: KObjectBase::with_name_pooled(name),
             _counter: CountHelper::new(),
             job: job.clone(),
             policy: job.policy(),
-            vmar,
+            space: Mutex::new(space),
             canary_lo: EXT_CANARY,
             ext: Box::new(ext),
             canary_hi: EXT_CANARY,
@@ -735,7 +808,13 @@ impl Process {
         // (HOLDER waits TLB ack for 8s). The clear path itself now drops the
         // VMAR lock before the shootdown; this call is just the CPU-side unmap
         // so GEM teardown below cannot free frames still in the page tables.
-        let _ = self.vmar.clear();
+        //
+        // Through the hold, and let go of with the lock released: the clear
+        // runs here when this was the last process in the address space, and
+        // waits for the last one when a `vfork` child or its parent is still
+        // running in it.
+        let hold = self.space.lock().hold.take();
+        drop(hold);
 
         self.base.signal_set(Signal::PROCESS_TERMINATED);
         self.exceptionate.shutdown();
@@ -878,7 +957,45 @@ impl Process {
 
     /// Get the `VmAddressRegion` of the process.
     pub fn vmar(&self) -> Arc<VmAddressRegion> {
-        self.vmar.clone()
+        self.space.lock().vmar.clone()
+    }
+
+    /// Whether another process runs in this one's address space too: a
+    /// `vfork` child that has not exec'd, or the parent it borrowed it from.
+    pub fn shares_address_space(&self) -> bool {
+        self.space.lock().is_shared()
+    }
+
+    /// The root of [`vmar`](Self::vmar)'s page table, which every poll of
+    /// one of this process's threads loads: without the `Arc` clone and
+    /// drop, two atomics on a line every thread of the process writes.
+    pub(super) fn user_table(&self) -> kernel_hal::PhysAddr {
+        self.space.lock().vmar.table_phys()
+    }
+
+    /// The address space an `execve` loads its new image into: this
+    /// process's own, as it is. One it shares -- a `vfork` child's, or the
+    /// parent's while that child has not exec'd -- is left to the other and
+    /// swapped for a new, empty one, which is what Linux's `exec_mmap()`
+    /// does with a shared `mm`. Clearing a shared one instead would unmap
+    /// the parent's program from under it.
+    ///
+    /// Called by a thread of this process, which goes back to user mode in
+    /// the new one: this CPU is switched to it here.
+    pub fn own_address_space(&self) -> Arc<VmAddressRegion> {
+        if !self.space.lock().is_shared() {
+            return self.vmar();
+        }
+        let vmar = VmAddressRegion::new_root();
+        let lent = {
+            let mut space = self.space.lock();
+            space.vmar = vmar.clone();
+            space.hold.replace(Arc::new(AddressSpace(vmar.clone())))
+        };
+        // The last hold unmaps, so let go with the lock released.
+        drop(lent);
+        super::thread::activate_user_paging(vmar.table_phys());
+        vmar
     }
 
     /// Get the job of the process.
@@ -1440,6 +1557,9 @@ pub struct ProcessInfo {
     pub debugger_attached: bool,
     pub padding1: [u8; 5],
 }
+
+#[cfg(test)]
+mod shared_space_tests;
 
 #[cfg(test)]
 mod tests {

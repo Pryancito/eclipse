@@ -64,6 +64,41 @@ pub trait ProcessExt {
     fn try_linux(&self) -> Option<&LinuxProcess>;
     /// fork from current linux process
     fn fork_from(parent: &Arc<Self>) -> ZxResult<Arc<Self>>;
+    /// [`fork_from`](Self::fork_from) for a `vfork` (`CLONE_VM |
+    /// CLONE_VFORK`): the child runs in `parent`'s address space, not a copy
+    /// of it, until its `execve` gives it one of its own.
+    fn vfork_from(parent: &Arc<Self>) -> ZxResult<Arc<Self>>;
+}
+
+/// What a new child process runs in.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ChildMemory {
+    /// A copy of the parent's address space: `fork`.
+    Copy,
+    /// The parent's own: `vfork`. glibc's `posix_spawn` and busybox's
+    /// `spawn()` learn that the child's `exec` failed from a word the child
+    /// writes in it, and with a copy the parent never saw it:
+    /// `posix_spawn("/no/such/file")` answered 0, for a child that died with
+    /// 127.
+    Parents,
+}
+
+/// What [`ProcessExt::fork_from`] and [`ProcessExt::vfork_from`] both do.
+trait NewChild {
+    fn new_child(parent: &Arc<Self>, memory: ChildMemory) -> ZxResult<Arc<Self>>;
+}
+
+/// Whether a `fork` of `parent` may batch its cross-CPU TLB shootdowns into
+/// one: only when nothing but the forking thread runs in its address space.
+/// That is the condition under which no other CPU can be executing there,
+/// and so the one under which the widened write-protect window cannot be
+/// observed -- see `VmAddressRegion::fork_from`. It is also the
+/// overwhelmingly common case: a shell, or anything that forks to exec,
+/// forks single-threaded. A multi-threaded parent keeps the per-mapping
+/// shootdown exactly as before, and so does a `vfork` child that forks
+/// before its `exec`: its parent's other threads run in the same memory.
+fn alone_in_its_address_space(parent: &Process) -> bool {
+    parent.thread_count() == 1 && !parent.shares_address_space()
 }
 
 const ROOT_UID: u32 = 0;
@@ -597,6 +632,16 @@ impl ProcessExt for Process {
     ///
     /// [Fork]: http://man7.org/linux/man-pages/man2/fork.2.html
     fn fork_from(parent: &Arc<Self>) -> ZxResult<Arc<Self>> {
+        Self::new_child(parent, ChildMemory::Copy)
+    }
+
+    fn vfork_from(parent: &Arc<Self>) -> ZxResult<Arc<Self>> {
+        Self::new_child(parent, ChildMemory::Parents)
+    }
+}
+
+impl NewChild for Process {
+    fn new_child(parent: &Arc<Self>, memory: ChildMemory) -> ZxResult<Arc<Self>> {
         let linux_parent = parent.linux();
         // mmap_lock, WRITE side: freeze the parent's address-space LAYOUT for
         // the entire fork — snapshot of the mapping list AND the whole copy
@@ -672,17 +717,22 @@ impl ProcessExt for Process {
         // The parent's address-space LAYOUT stays frozen across the copy
         // regardless: that is `aspace_lock`'s job, and it is still held.
         drop(linux_parent_inner);
-        let new_proc = Process::create_with_ext(&parent.job(), "", new_linux_proc)?;
-        // Batch the fork's cross-CPU TLB shootdowns into one, but only when
-        // the parent has a single thread. That is the condition under which no
-        // other CPU can be executing in the parent's address space, and so the
-        // one under which the widened write-protect window cannot be observed —
-        // see `VmAddressRegion::fork_from`. It is also the overwhelmingly common
-        // case: a shell, or anything that forks to exec, forks single-threaded.
-        // A multi-threaded parent keeps the per-mapping shootdown exactly as
-        // before.
-        let single_threaded = parent.thread_count() == 1;
-        new_proc.vmar().fork_from(&parent.vmar(), single_threaded)?;
+        let new_proc = match memory {
+            ChildMemory::Copy => {
+                let new_proc = Process::create_with_ext(&parent.job(), "", new_linux_proc)?;
+                let alone = alone_in_its_address_space(parent);
+                new_proc.vmar().fork_from(&parent.vmar(), alone)?;
+                new_proc
+            }
+            // Nothing to copy. The break and the rest of the layout the
+            // child's `LinuxProcess` keeps are a snapshot of the parent's, so
+            // a child that moved the break before its `execve` would leave
+            // the parent's behind; vfork(2) allows it only `execve` and
+            // `_exit`, and no libc's `posix_spawn` child calls anything else.
+            ChildMemory::Parents => {
+                Process::create_sharing_address_space(&parent.job(), "", parent, new_linux_proc)?
+            }
+        };
         // `create_with_ext` publishes the child into ROOT_JOB before its address
         // space exists and before it has any thread, so a concurrent kill can
         // terminate it inside this window. `set_status_running` refuses to
@@ -5723,6 +5773,66 @@ pub async fn interruptible_on<F: Future>(thread: &Arc<Thread>, future: F) -> LxR
     }
 }
 
+/// Whether `thread` is to die: it is on its way out (an `exit_group`, a
+/// SIGKILL, a sibling's `execve`), or an unblocked signal is pending that
+/// nobody catches and whose default action ends the process. Linux's
+/// `complete_signal()` turns such a signal into a group-wide SIGKILL the
+/// moment it is sent (`sig_fatal`), which is what `fatal_signal_pending()`
+/// -- and so every `TASK_KILLABLE` wait -- sees.
+pub fn fatal_signal_pending(thread: &Arc<Thread>) -> bool {
+    use crate::signal::SIG_DFL;
+    use crate::thread::ThreadExt;
+    if is_on_its_way_out(thread) {
+        return true;
+    }
+    let proc_linux = match thread.proc().try_linux() {
+        Some(lp) => lp,
+        None => return false,
+    };
+    // The thread's lock is let go before the disposition table's is taken,
+    // as in `check_signals_of`.
+    let pending = match thread.try_lock_linux() {
+        Some(linux_thread) => linux_thread.signals.mask_with(&linux_thread.signal_mask()),
+        None => return false,
+    };
+    let mut rest = pending;
+    while let Some(sig) = rest.find_first_signal() {
+        rest.remove(sig);
+        if proc_linux.signal_action(sig).handler == SIG_DFL && signal_default_action_interrupts(sig)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Run `future` until it is done or `thread` is to die
+/// ([`fatal_signal_pending`]): a `TASK_KILLABLE` wait. A signal that runs a
+/// handler does not end it -- the handler runs once the wait is over -- and
+/// a kill does. `None` when the kill won; carrying the death out is then the
+/// run loop's, on the way out of the syscall.
+///
+/// The future is dropped when the kill wins, so it must be one that can be
+/// abandoned, as for [`interruptible_on`].
+pub async fn killable_on<F: Future>(thread: &Arc<Thread>, future: F) -> Option<F::Output> {
+    futures::pin_mut!(future);
+    let killed = async {
+        let mut park = SignalPark::new(thread);
+        loop {
+            park.prepare();
+            if fatal_signal_pending(thread) {
+                return;
+            }
+            park.park(None).await;
+        }
+    };
+    futures::pin_mut!(killed);
+    match futures::future::select(future, killed).await {
+        futures::future::Either::Left((out, _)) => Some(out),
+        futures::future::Either::Right(((), _)) => None,
+    }
+}
+
 /// The parking half of an interruptible wait on a Linux thread: wake when a
 /// signal is queued to `thread` -- blocked or not, which is what a
 /// `sigtimedwait` on a blocked set needs -- or when a deadline passes.
@@ -6310,6 +6420,11 @@ mod kill_wakes_tests;
 
 #[cfg(test)]
 mod dying_thread_signal_tests;
+
+#[cfg(test)]
+mod killable_tests;
+#[cfg(test)]
+mod vfork_memory_tests;
 
 #[cfg(test)]
 mod interruptible_sleep_tests;
