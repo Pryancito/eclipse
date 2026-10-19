@@ -6983,6 +6983,52 @@ pub fn legacy_update_plane(crtc: (i32, i32, u32, u32), src: (u32, u32, u32, u32)
     (a.src_x, a.src_y, a.src_w, a.src_h) = src;
 }
 
+/// A DPMS write on the connector, as `drm_atomic_connector_commit_dpms`
+/// commits it on an atomic driver: anything but ON is OFF; with the connector
+/// routed to a CRTC (a mode set, the atomic `enable`) the CRTC's `active`
+/// becomes "a connector on it is ON" -- the one connector here -- and the
+/// state is committed, so DPMS off is `ACTIVE = 0` and DPMS on `ACTIVE = 1`
+/// with the plane's fb shown again; with no CRTC only the connector's own
+/// value changes. Only the blank moved here: `ACTIVE` read back 1 on a pipe
+/// DPMS had turned off, an atomic `ACTIVE = 1` after it was "no change" (no
+/// ALLOW_MODESET needed) and `ACTIVE = 0` a change, the reverse of Linux;
+/// and DPMS on left the panel black until the compositor's next frame.
+///
+/// The panel obeys the write whether or not a CRTC is routed: a DPMS off
+/// must be able to blank whatever the atomic state says (see
+/// [`set_crtc_blanked`]), and the console's boot mode is not in the atomic
+/// state, so "no CRTC" is also the plain legacy desktop before its first
+/// SETCRTC.
+pub fn connector_commit_dpms(on: bool) {
+    {
+        let mut state = DRM_STATE.lock();
+        if state.atomic.mode_blob_id != 0 {
+            state.atomic.active = on;
+        }
+    }
+    if on {
+        crtc_relight();
+    } else {
+        set_crtc_blanked(true);
+    }
+}
+
+/// A CRTC going active again shows its primary plane's fb: the commit tail
+/// (`drm_atomic_helper_commit_modeset_enables`) enables the CRTC and updates
+/// its planes from their state, so the frame the pipe had comes back
+/// without the client presenting it again. Un-blanking alone left the
+/// panel black (see [`set_crtc_blanked`]) until the next present, which a
+/// compositor with no damage to draw never sends. `false` when the plane's
+/// fb could not be presented; `true` with no fb to show.
+fn crtc_relight() -> bool {
+    let fb_id = crtc_fb();
+    if fb_id == 0 {
+        set_crtc_blanked(false);
+        return true;
+    }
+    present_now_checked(fb_id, SYNTH_CRTC_ID, None).is_ok()
+}
+
 /// Staged property updates parsed from one `DRM_IOCTL_MODE_ATOMIC` request
 /// against the synthetic (software-KMS) pipeline. `None` = property not in
 /// the request; object state not touched persists across commits, as the
@@ -7487,7 +7533,17 @@ pub fn atomic_commit(
                 return Err(AtomicError::Device);
             }
         }
-        _ => {}
+        // ACTIVE 0 -> 1 with no new fb: the CRTC comes back on with the fb
+        // its plane still holds (`drm_atomic_helper_commit_modeset_enables`).
+        // This un-blanked nothing, so a DPMS-style `ACTIVE = 1` left the
+        // panel black until the next frame.
+        _ => {
+            if upd.active == Some(true) && !rollback.0.active && !crtc_relight() {
+                restore_atomic_state(rollback);
+                set_crtc_enabled(enabled_before);
+                return Err(AtomicError::Device);
+            }
+        }
     }
 
     if completion {
