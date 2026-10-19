@@ -21,6 +21,13 @@
 //   * a SIGSTOP (or Ctrl-Z's SIGTSTP) to a process blocked in a syscall did
 //     not stop it until the syscall returned by itself -- never, for a child
 //     in `pause()` -- and its parent's `waitpid(WUNTRACED)` waited with it.
+//   * a kill did not wake a thread asleep in `pause`, `nanosleep`, `read` or
+//     `waitpid`: `execve` from a second thread waited for good for its
+//     sibling in `pause` to die, and a process that exited with a thread
+//     asleep was reaped but never torn down, its memory never given back.
+//   * the image an `execve` from a second thread started ran with that
+//     thread's tid, not the pid: `gettid() != getpid()` in what Linux makes
+//     the first thread, and `tgkill(pid, pid)` reached nobody.
 //
 // Every section states what Linux does and checks it, printing the numbers
 // whether it passes or fails. Each section runs in a child of its own, so a
@@ -57,6 +64,10 @@
 //              `read`, `sigsuspend` -- and the syscall goes on once it is
 //              continued: the read reads, the sigsuspend waits for its signal
 //              and puts the old mask back.
+//   teardown   a process that exits with a second thread asleep -- in
+//              `pause`, `read`, `nanosleep`, `waitpid` -- has lost that
+//              thread by the time it is reaped: a robust mutex the thread
+//              held comes back EOWNERDEAD.
 //
 // Build:  make                 (x86_64-linux-musl-gcc -O2 -static)
 // Run:    ./signal-probe [--only SECTION]
@@ -79,6 +90,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/prctl.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
@@ -718,17 +730,39 @@ static void *thread_exits(void *arg) {
 
 static void *thread_execs(void *arg) {
     (void)arg;
+    // The mask is per thread and kept across an exec: the new image has to
+    // find this one, not the first thread's.
+    sigset_t usr1;
+    sigemptyset(&usr1);
+    sigaddset(&usr1, SIGUSR1);
+    pthread_sigmask(SIG_BLOCK, &usr1, NULL);
     char *args[] = {(char *)g_self, "--exec-from-thread", NULL};
     execv("/proc/self/exe", args);
     execvp(g_self, args);
     _exit(101);
 }
 
+static volatile sig_atomic_t g_usr2_here;
+
+static void usr2_here(int sig, siginfo_t *si, void *uc) {
+    (void)sig, (void)si, (void)uc;
+    g_usr2_here = 1;
+}
+
 // Runs in the image a non-first thread exec'd: the exec makes that thread
-// the process's first, so it takes the process's pid as its tid.
+// the process's first (`de_thread()`), so it takes the process's pid as its
+// tid, keeps its own mask, and `tgkill(pid, pid)` reaches it. Exit 0 for all
+// of it; 1 the tid is not the pid, 2 the mask was lost, 3 the tgkill missed.
 static int exec_from_thread_report(void) {
     long tid = syscall(SYS_gettid);
-    return tid == (long)getpid() ? 0 : 1;
+    if (tid != (long)getpid()) return 1;
+    sigset_t now;
+    sigprocmask(SIG_BLOCK, NULL, &now);
+    if (!sigismember(&now, SIGUSR1)) return 2;
+    install(SIGUSR2, usr2_here, 0);
+    if (syscall(SYS_tgkill, (long)getpid(), (long)getpid(), SIGUSR2) != 0) return 3;
+    for (int i = 0; i < 100 && !g_usr2_here; i++) sleep_ms(1);
+    return g_usr2_here ? 0 : 3;
 }
 
 static void sec_wait(void) {
@@ -831,8 +865,10 @@ static void sec_wait(void) {
     check(got == c && WIFEXITED(st) && WEXITSTATUS(st) == 0, "execve() from a second thread",
           "%s (status %#x)",
           WIFEXITED(st) && WEXITSTATUS(st) == 1     ? "the new image's tid is not the pid"
+          : WIFEXITED(st) && WEXITSTATUS(st) == 2   ? "the exec'ing thread's mask was lost"
+          : WIFEXITED(st) && WEXITSTATUS(st) == 3   ? "tgkill(pid, pid) missed the new image"
           : WIFEXITED(st) && WEXITSTATUS(st) == 101 ? "the exec failed"
-                                                    : "the new image ran as tid == pid",
+                                                    : "tid == pid, its own mask, tgkill reaches it",
           st);
 }
 
@@ -926,6 +962,102 @@ static void sec_stop(void) {
                                  : "handler ran, mask back");
 }
 
+// --------------------------------------------------------------- teardown
+
+// Whether a thread of a process that has exited is really gone is something
+// no syscall answers, and /proc/meminfo is no use on Linux itself: a freed
+// 512 MiB shows up there late, now and then by a few hundred MiB. A robust
+// mutex is: the kernel hands it on as EOWNERDEAD when the thread that holds
+// it dies, and not before. The thread takes it in memory it shares with the
+// section, then goes to sleep. One mutex a check: a thread that outlives its
+// process holds its mutex for good.
+enum wait_kind { IN_PAUSE, IN_READ, IN_SLEEP, IN_WAITPID, WAIT_KINDS };
+static struct {
+    pthread_mutex_t m[WAIT_KINDS];
+    volatile int held;
+} *g_teardown;
+
+static const char *const WAIT_KIND[] = {"pause", "read", "nanosleep", "waitpid"};
+static int g_teardown_pipe[2];
+
+static void *waits_in(void *arg) {
+    char b;
+    int st;
+    enum wait_kind kind = (enum wait_kind)(long)arg;
+    pthread_mutex_lock(&g_teardown->m[kind]);
+    g_teardown->held = 1;
+    switch (kind) {
+    case IN_PAUSE:
+        for (;;) pause();
+    case IN_READ:
+        (void)!read(g_teardown_pipe[0], &b, 1);
+        break;
+    case IN_SLEEP:
+        sleep(60);
+        break;
+    case IN_WAITPID:
+        waitpid(-1, &st, 0);
+        break;
+    case WAIT_KINDS:
+        break;
+    }
+    return NULL;
+}
+
+// A child whose second thread takes the mutex and sleeps in `kind`, and which
+// then ends with exit_group. Once it is reaped, what taking the mutex says,
+// waiting up to two seconds: EOWNERDEAD if that thread died, ETIMEDOUT if it
+// is still there; -1 if the child itself failed.
+static int what_the_mutex_says_after(enum wait_kind kind) {
+    g_teardown->held = 0;
+    pid_t c = fork();
+    if (c == 0) {
+        // Something to wait for that outlives this process.
+        if (kind == IN_WAITPID && fork() == 0) {
+            sleep(3);
+            _exit(0);
+        }
+        pthread_t t;
+        if (pthread_create(&t, NULL, waits_in, (void *)(long)kind) != 0) _exit(98);
+        while (!g_teardown->held) sleep_ms(1);
+        sleep_ms(50);
+        _exit(0);  // exit_group: every thread goes with it
+    }
+    int st = 0;
+    if (waitpid(c, &st, 0) != c || !WIFEXITED(st) || WEXITSTATUS(st) != 0) return -1;
+    struct timespec until;
+    clock_gettime(CLOCK_REALTIME, &until);
+    until.tv_sec += 2;
+    return pthread_mutex_timedlock(&g_teardown->m[kind], &until);
+}
+
+static void sec_teardown(void) {
+    g_teardown = mmap(NULL, sizeof *g_teardown, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS,
+                      -1, 0);
+    // Made here, so that the read end the child's thread waits on has a write
+    // end that outlives the child: the child's own would close with its
+    // files, and that ends the read by itself.
+    if (g_teardown == MAP_FAILED || pipe(g_teardown_pipe) != 0) {
+        check(0, "teardown", "setting up: %s", strerror(errno));
+        return;
+    }
+    pthread_mutexattr_t a;
+    pthread_mutexattr_init(&a);
+    pthread_mutexattr_setpshared(&a, PTHREAD_PROCESS_SHARED);
+    pthread_mutexattr_setrobust(&a, PTHREAD_MUTEX_ROBUST);
+    for (int k = 0; k < WAIT_KINDS; k++) pthread_mutex_init(&g_teardown->m[k], &a);
+    for (int k = 0; k < WAIT_KINDS; k++) {
+        int r = what_the_mutex_says_after((enum wait_kind)k);
+        char what[64];
+        snprintf(what, sizeof what, "exit with a thread in %s", WAIT_KIND[k]);
+        check(r == EOWNERDEAD, what, "%s",
+              r == EOWNERDEAD  ? "the thread died with the process"
+              : r == ETIMEDOUT ? "the thread outlived its process's reap"
+              : r == -1        ? "the child failed"
+                               : strerror(r));
+    }
+}
+
 // ------------------------------------------------------------------- main
 
 static const struct {
@@ -943,6 +1075,7 @@ static const struct {
     {"inherit", "what fork and execve hand down", sec_inherit},
     {"wait", "what waitid and waitpid report", sec_wait},
     {"stop", "a stop reaches a process blocked in a syscall", sec_stop},
+    {"teardown", "an exit ends every thread, whatever it waits in", sec_teardown},
 };
 
 int main(int argc, char **argv) {

@@ -18,7 +18,7 @@ use alloc::{
 };
 use core::convert::TryFrom;
 use core::future::Future;
-use core::sync::atomic::{AtomicI32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use hashbrown::{HashMap, HashSet};
 use kernel_hal::sync::{Mutex, MutexGuard};
 use kernel_hal::VirtAddr;
@@ -1786,6 +1786,7 @@ impl LinuxProcess {
         files.insert(1.into(), stdout);
         files.insert(2.into(), stderr);
 
+        ensure_a_kill_wakes_the_waits();
         note_process_created();
         LinuxProcess {
             root_inode,
@@ -5587,6 +5588,42 @@ pub fn wake_signal_sleeper(thread: &Arc<Thread>) {
     thread.signal_set(SIGNAL_WAKE);
 }
 
+/// Whether `thread` is dying or dead: no signal reaches it again.
+fn is_on_its_way_out(thread: &Thread) -> bool {
+    use zircon_object::task::ThreadState;
+    matches!(thread.state(), ThreadState::Dying | ThreadState::Dead)
+}
+
+/// A thread that starts dying leaves the wait it is parked in, the way the
+/// SIGKILL `zap_other_threads()` sends each sibling wakes it
+/// (`signal_wake_up(t, 1)`): every interruptible wait here parks on
+/// [`SIGNAL_WAKE`], `waitpid` on the process's `SIGCHLD` bit, and both look
+/// at [`check_signals_of`], which answers `EINTR` for a dying thread. What
+/// [`Thread::stop`](zircon_object::task::Thread) wakes by itself is only a
+/// `blocking_run`, so a kill -- `execve`'s `de_thread`, `exit_group`, a fatal
+/// signal -- left a sibling in `pause`, `nanosleep` or `read` asleep for good:
+/// the `execve` waited on it forever, and the process it belonged to never
+/// let go of its address space.
+fn wake_the_dying(thread: &Thread) {
+    // A process with no Linux side has no Linux waits to end.
+    if thread.proc().try_linux().is_none() {
+        return;
+    }
+    thread.signal_set(SIGNAL_WAKE);
+    thread.proc().signal_set(Signal::SIGCHLD);
+}
+
+static KILL_WAKES_THE_WAITS: AtomicBool = AtomicBool::new(false);
+
+/// Put [`wake_the_dying`] in place, once, before the first Linux process
+/// exists: every Linux process descends from one made by
+/// [`LinuxProcess::with_root`], which is what calls this.
+fn ensure_a_kill_wakes_the_waits() {
+    if !KILL_WAKES_THE_WAITS.swap(true, Ordering::AcqRel) {
+        zircon_object::task::set_thread_kill_hook(wake_the_dying);
+    }
+}
+
 /// Sleep until `deadline`, or until a signal that would interrupt a syscall
 /// is pending on `thread`, whichever comes first: `TASK_INTERRUPTIBLE`, the
 /// sleep of `nanosleep(2)`, `clock_nanosleep(2)` and `pause(2)`. `Ok` at the
@@ -6100,6 +6137,13 @@ pub fn send_signal_to_process_with_info(
         // right away — and deliver there.
         let mut first: Option<Arc<Thread>> = None;
         for thread in threads {
+            // `wants_signal()` in Linux: never a thread on its way out
+            // (`PF_EXITING`). A dying thread takes no signal again, so one
+            // queued to it is lost -- the SIGTERM that should have ended the
+            // process, sent while a worker was in `pthread_exit`.
+            if is_on_its_way_out(&thread) {
+                continue;
+            }
             // Peek without holding the guard across a move of `thread`.
             let delivered = if let Some(mut lt) = thread.try_lock_linux() {
                 // `wants_signal()`: unblocked, or parked in
@@ -6260,6 +6304,12 @@ mod disposition_change_tests;
 
 #[cfg(test)]
 mod signal_park_tests;
+
+#[cfg(test)]
+mod kill_wakes_tests;
+
+#[cfg(test)]
+mod dying_thread_signal_tests;
 
 #[cfg(test)]
 mod interruptible_sleep_tests;

@@ -37,6 +37,27 @@ use super::{exception::*, Process, Task};
 use crate::object::{KObjectBase, KoID, Signal};
 use crate::{define_count_helper, impl_kobject, ZxError, ZxResult};
 
+/// A callback run once, when a thread starts dying, for the waits of crates
+/// this one cannot see.
+///
+/// [`Thread::stop`] wakes the two things this crate parks a thread on, its
+/// `waker` and the `killer` of a [`Thread::blocking_run`], and nothing else. A
+/// Linux thread in `pause`, `nanosleep`, a blocking `read` or `waitpid` is
+/// parked on a bit of its own object or of its process, which this crate
+/// knows nothing about, so a kill left it asleep: `execve` from a second
+/// thread waited for good for a sibling in `pause` to die, and a process that
+/// exited with a thread in `read` never got as far as `terminate`, so its
+/// address space was never let go.
+pub type ThreadKillHook = fn(&Thread);
+
+static THREAD_KILL_HOOK: Mutex<Option<ThreadKillHook>> = Mutex::new(None);
+
+/// Register the callback run when a thread starts dying. `linux-object` does,
+/// before its first process exists.
+pub fn set_thread_kill_hook(f: ThreadKillHook) {
+    *THREAD_KILL_HOOK.lock() = Some(f);
+}
+
 /// Runnable / computation entity
 ///
 /// ## SYNOPSIS
@@ -1202,7 +1223,7 @@ impl Thread {
         // woke the task with this thread's own spin lock still held, taken with
         // interrupts off. A woken task that reaches back for `inner` -- reading
         // its state, or terminating -- is a CPU that does not come back.
-        let (waker, killer) = {
+        let (waker, killer, now_dying) = {
             let mut inner = self.lock_inner();
             if inner.state == ThreadState::Dead {
                 return;
@@ -1212,11 +1233,11 @@ impl Thread {
             }
             if inner.state == ThreadState::Dying {
                 // Already dying: only the killer, and only for a kill.
-                (None, if killed { inner.killer.take() } else { None })
+                (None, if killed { inner.killer.take() } else { None }, false)
             } else {
                 inner.change_state(ThreadState::Dying, &self.base);
                 // For a blocking thread, the killer is what gets it out.
-                (inner.waker.take(), inner.killer.take())
+                (inner.waker.take(), inner.killer.take(), true)
             }
         };
         if let Some(waker) = waker {
@@ -1225,6 +1246,14 @@ impl Thread {
         if let Some(killer) = killer {
             // It's ok to ignore the error since the other end could be closed
             killer.send(()).ok();
+        }
+        if now_dying {
+            // Copied out, and the lock let go, before the call: the hook sets
+            // signals, and those run callbacks.
+            let hook = *THREAD_KILL_HOOK.lock();
+            if let Some(hook) = hook {
+                hook(self);
+            }
         }
     }
 
@@ -2490,6 +2519,49 @@ mod tests {
         first.suspend();
         first.resume();
         late.resume();
+    }
+
+    /// What the kill hook saw, one entry per call: the thread's id and its
+    /// state as the hook read it.
+    static KILLS_SEEN: Mutex<alloc::vec::Vec<(KoID, ThreadState)>> =
+        Mutex::new(alloc::vec::Vec::new());
+
+    fn record_kill(thread: &Thread) {
+        // `state()` takes the thread's own lock: a hook run under it never
+        // gets past this line.
+        let state = thread.state();
+        KILLS_SEEN.lock().push((thread.id(), state));
+    }
+
+    /// The hook runs once a death, on the way into `Dying`, with the thread's
+    /// lock let go: a second kill, or the exit that follows the kill, is the
+    /// same death.
+    #[test]
+    fn the_kill_hook_runs_once_a_death_with_the_thread_unlocked() {
+        extern crate std;
+        set_thread_kill_hook(record_kill);
+        let root_job = Job::root();
+        let proc = Process::create(&root_job, "proc").expect("failed to create process");
+        let thread = Thread::create(&proc, "thread").expect("failed to create thread");
+        let id = thread.id();
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            thread.kill();
+            thread.kill();
+            thread.stop(false);
+            let _ = tx.send(());
+        });
+        rx.recv_timeout(core::time::Duration::from_secs(3))
+            .expect("the kill never came back: the hook ran under the thread's lock");
+
+        let seen: alloc::vec::Vec<_> = KILLS_SEEN
+            .lock()
+            .iter()
+            .filter(|(t, _)| *t == id)
+            .cloned()
+            .collect();
+        assert_eq!(seen, [(id, ThreadState::Dying)]);
     }
 }
 
