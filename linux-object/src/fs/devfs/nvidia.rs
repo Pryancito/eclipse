@@ -759,7 +759,7 @@ fn get_event_data(payload: &mut [u8], events: &OpenEvents) {
 fn dropped_event() {
     static SAID: AtomicBool = AtomicBool::new(false);
     if !SAID.swap(true, Ordering::Relaxed) {
-        warn!(
+        zcore_drivers::klog_warn!(
             "[nvidiactl] {} OS events queued on one open and none read: dropping",
             MAX_QUEUED_EVENTS
         );
@@ -845,7 +845,9 @@ fn mmap_window(
 fn invalid_mmap() {
     static SAID: AtomicBool = AtomicBool::new(false);
     if !SAID.swap(true, Ordering::Relaxed) {
-        warn!("[nvidiactl] mmap of an open with no RM mapping recorded: EINVAL");
+        zcore_drivers::klog_warn!(
+            "[nvidiactl] mmap of an open with no RM mapping recorded: EINVAL"
+        );
     }
 }
 
@@ -899,7 +901,7 @@ fn check_version(payload: &mut [u8], rm: &[u8]) -> LxResult<()> {
     let ok = nvctl::version_check(u32_at(payload, 0), &mut version, rm);
     if !ok {
         let theirs = version.split(|&b| b == 0).next().unwrap_or(&[]);
-        warn!(
+        zcore_drivers::klog_warn!(
             "NVRM: API mismatch: the client has the version {}, but this kernel module has the \
              version {}. Please make sure that this kernel module and all NVIDIA driver \
              components have the same version.",
@@ -952,10 +954,13 @@ static NOT_SERVED: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 
 /// One log line the first time each escape this kernel does not serve is
 /// asked for: that line is what says which escape the next batch needs.
+/// Every line of this file but the layout check's `error!` goes to dmesg
+/// through klog, not `warn!`, which the `LOG=error` a real machine boots at
+/// filters out.
 fn not_served(nr: u32) {
     let bit = (nr & 0xff) as usize;
     if NOT_SERVED[bit / 64].fetch_or(1 << (bit % 64), Ordering::Relaxed) & (1 << (bit % 64)) == 0 {
-        warn!("[nvidiactl] escape {:#x} is not served yet: EINVAL", nr);
+        zcore_drivers::klog_warn!("[nvidiactl] escape {:#x} is not served yet: EINVAL", nr);
     }
 }
 
@@ -965,7 +970,9 @@ fn not_served(nr: u32) {
 fn no_rm_yet() {
     static SAID: AtomicBool = AtomicBool::new(false);
     if !SAID.swap(true, Ordering::Relaxed) {
-        warn!("[nvidiactl] no RM core yet (no NVIDIA GPU attached): RM escapes are EINVAL");
+        zcore_drivers::klog_warn!(
+            "[nvidiactl] no RM core yet (no NVIDIA GPU attached): RM escapes are EINVAL"
+        );
     }
 }
 
@@ -1007,18 +1014,18 @@ pub fn create_nodes(root: &Arc<DevINode>) {
     nvctl::set_user_range_validator(kernel_hal::user::user_range_ok);
     nvctl::set_event_sink(post_event);
     if let Err(e) = root.add("nvidiactl", Arc::new(NvidiaDev::new(Node::Ctl))) {
-        warn!("[nvidiactl] failed to mknod /dev/nvidiactl: {:?}", e);
+        zcore_drivers::klog_warn!("[nvidiactl] failed to mknod /dev/nvidiactl: {:?}", e);
         return;
     }
     let cards = nvctl::cards();
     for card in cards.iter().filter(|card| card.minor <= GPU_MINOR_MAX) {
         let name = format!("nvidia{}", card.minor);
         if let Err(e) = root.add(&name, Arc::new(NvidiaDev::new(Node::Gpu(card.minor)))) {
-            warn!("[nvidiactl] failed to mknod /dev/{}: {:?}", name, e);
+            zcore_drivers::klog_warn!("[nvidiactl] failed to mknod /dev/{}: {:?}", name, e);
         }
     }
     let ready = cards.iter().filter(|card| card.instance.is_some()).count();
-    warn!(
+    zcore_drivers::klog_warn!(
         "[nvidiactl] /dev/nvidiactl and {} GPU node(s), {} with the RM up (RM {})",
         cards.len(),
         ready,

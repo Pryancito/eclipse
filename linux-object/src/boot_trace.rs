@@ -21,8 +21,14 @@
 //! is already warm. The recorder here is deliberately the *first half* of that
 //! system, not throwaway instrumentation.
 //!
-//! Cost when disabled (the default): one relaxed atomic load per `openat`.
-//! Nothing else runs, nothing is allocated, until `BOOTTRACE=` arms it.
+//! It also records every other syscall of that process that fails, with its
+//! errno and what it was asked. That makes it the strace for a program that
+//! only reports that some OS call failed: `BOOTTRACE=cuda-probe` names the
+//! call behind libcuda's CUDA_ERROR_OPERATING_SYSTEM (304).
+//!
+//! Cost when disabled (the default): one relaxed atomic load per `openat` and
+//! per failed syscall. Nothing else runs, nothing is allocated, until
+//! `BOOTTRACE=` arms it.
 
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
@@ -78,12 +84,23 @@ enum Rec {
         dur_us: u64,
         detail: String,
     },
+    /// A syscall that failed, with its errno and what it was asked (`detail`).
+    /// A library that gives up on one says no more than that an OS call
+    /// failed -- libcuda's `cuInit` answers CUDA_ERROR_OPERATING_SYSTEM (304)
+    /// -- and this is the record that names the call. A failed open is a
+    /// [`Rec::Open`], with its path, not one of these.
+    Failed {
+        dt_us: u64,
+        num: u32,
+        errno: i32,
+        detail: String,
+    },
 }
 
 impl Rec {
     fn dt_us(&self) -> u64 {
         match self {
-            Rec::Open { dt_us, .. } | Rec::Slow { dt_us, .. } => *dt_us,
+            Rec::Open { dt_us, .. } | Rec::Slow { dt_us, .. } | Rec::Failed { dt_us, .. } => *dt_us,
         }
     }
 }
@@ -195,6 +212,28 @@ pub fn record_syscall(pid: u64, num: u32, dur_ns: u64, detail: impl FnOnce() -> 
     });
 }
 
+/// Record a syscall of the armed process that failed with `errno`, whatever
+/// it took. `detail` (what it was asked) runs only for that process. Called
+/// from the syscall dispatcher for every failure but an open's, which
+/// [`record_open`] records with its path.
+pub fn record_failure(pid: u64, num: u32, errno: i32, detail: impl FnOnce() -> String) {
+    if !enabled() {
+        return;
+    }
+    // As in `record_syscall`: nothing armed yet is no timeline to place it on.
+    let armed = ARMED_PID.load(Ordering::Relaxed);
+    if armed == 0 || armed != pid {
+        return;
+    }
+    let dt_us = elapsed_us();
+    push(Rec::Failed {
+        dt_us,
+        num,
+        errno,
+        detail: detail(),
+    });
+}
+
 fn elapsed_us() -> u64 {
     let t0 = T0_NS.load(Ordering::Relaxed);
     if t0 == 0 {
@@ -280,12 +319,13 @@ pub fn render() -> String {
     let recs = RECS.lock();
     let dropped = DROPPED.load(Ordering::Relaxed);
     let t0_uptime_ms = T0_UPTIME_NS.load(Ordering::Relaxed) / 1_000_000;
-    let (mut ok, mut miss, mut slow) = (0u32, 0u32, 0u32);
+    let (mut ok, mut miss, mut slow, mut failed) = (0u32, 0u32, 0u32, 0u32);
     for r in recs.iter() {
         match r {
             Rec::Open { result, .. } if *result >= 0 => ok += 1,
             Rec::Open { .. } => miss += 1,
             Rec::Slow { .. } => slow += 1,
+            Rec::Failed { .. } => failed += 1,
         }
     }
     let window_ms = recs
@@ -300,7 +340,7 @@ pub fn render() -> String {
     );
     let _ = writeln!(
         out,
-        "armed at {}.{:03}s uptime; window {:.1}ms; {} opens ({} ok, {} miss), {} slow syscalls (>{}ms){}",
+        "armed at {}.{:03}s uptime; window {:.1}ms; {} opens ({} ok, {} miss), {} slow syscalls (>{}ms), {} failed syscalls{}",
         t0_uptime_ms / 1000,
         t0_uptime_ms % 1000,
         window_ms,
@@ -309,6 +349,7 @@ pub fn render() -> String {
         miss,
         slow,
         SLOW_SYSCALL_US / 1000,
+        failed,
         if dropped > 0 {
             alloc::format!("; {dropped} DROPPED (log full at {MAX_RECS})")
         } else {
@@ -319,7 +360,8 @@ pub fn render() -> String {
         out,
         "a '*' marks a gap > 2ms since the previous event; SLOW lines are single \
          syscalls that themselves took >{}ms (the blocking waits inside the gaps \
-         with no file activity — first render, icon-theme init, GPU waits):",
+         with no file activity — first render, icon-theme init, GPU waits); \
+         FAIL lines are syscalls other than an open that failed, with the errno:",
         SLOW_SYSCALL_US / 1000
     );
     let _ = writeln!(out, "\n   time(ms)   d(ms)  res  path / syscall");
@@ -363,6 +405,24 @@ pub fn render() -> String {
                     stall,
                     crate::perf::name_of(*num),
                     *dur_us as f64 / 1000.0,
+                    if detail.is_empty() { "" } else { "  " },
+                    detail,
+                );
+            }
+            Rec::Failed {
+                dt_us,
+                num,
+                errno,
+                detail,
+            } => {
+                let _ = writeln!(
+                    out,
+                    "  {:>8.3} {:>7.2} {} FAIL {} e{}{}{}",
+                    *dt_us as f64 / 1000.0,
+                    gap_us as f64 / 1000.0,
+                    stall,
+                    crate::perf::name_of(*num),
+                    errno,
                     if detail.is_empty() { "" } else { "  " },
                     detail,
                 );
@@ -449,6 +509,18 @@ mod tests {
             .collect()
     }
 
+    fn failures() -> Vec<(u32, i32, String)> {
+        RECS.lock()
+            .iter()
+            .filter_map(|r| match r {
+                Rec::Failed {
+                    num, errno, detail, ..
+                } => Some((*num, *errno, detail.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
     fn stamps() -> Vec<u64> {
         RECS.lock().iter().map(|r| r.dt_us()).collect()
     }
@@ -475,9 +547,14 @@ mod tests {
             3,
         );
         record_syscall(PID, 9, SLOW_SYSCALL_US * 1000 * 2, || String::new());
+        record_failure(PID, 16, 22, || {
+            asked.store(true, Ordering::Relaxed);
+            String::new()
+        });
         assert!(!enabled());
         assert!(opens().is_empty(), "recorded with no target set");
         assert!(slows().is_empty(), "recorded with no target set");
+        assert!(failures().is_empty(), "recorded with no target set");
         assert!(
             !asked.load(Ordering::Relaxed),
             "paid for the comm string with tracing off"
@@ -653,6 +730,68 @@ mod tests {
         assert!(slows().is_empty(), "recorded another process's stall");
         record_syscall(PID, 11, slow, || String::new());
         assert_eq!(slows(), vec![11]);
+    }
+
+    #[test]
+    /// A failed call is recorded whatever it took, with its errno and what it
+    /// was asked, but only for the armed process: like a slow call, not
+    /// before anything armed and not for anyone else. What it was asked is
+    /// worked out only then, since every failing call on the machine comes
+    /// through here.
+    fn a_failure_is_recorded_only_for_the_armed_process() {
+        let _alone = alone_with_the_recorder();
+        set_target("cuda-probe");
+        let asked = AtomicBool::new(false);
+        let ask = || {
+            asked.store(true, Ordering::Relaxed);
+            String::new()
+        };
+        record_failure(0, 16, 22, ask);
+        record_failure(PID, 16, 22, ask);
+        assert!(failures().is_empty(), "recorded before anything armed");
+
+        open_as(PID, "cuda-probe", "/usr/lib/libcuda.so.1", 3);
+        record_failure(OTHER_PID, 16, 22, ask);
+        assert!(failures().is_empty(), "recorded another process's failure");
+        assert!(
+            !asked.load(Ordering::Relaxed),
+            "worked out the detail of a failure it does not record"
+        );
+        record_failure(PID, 16, 22, || "fd=3 cmd=0xc020462b".to_string());
+        assert_eq!(
+            failures(),
+            vec![(16, 22, "fd=3 cmd=0xc020462b".to_string())]
+        );
+    }
+
+    #[test]
+    /// The profile counts the failures and names each one: the call, its
+    /// errno and what it was asked, on the timeline beside the opens.
+    fn a_failure_is_counted_and_named_in_the_profile() {
+        let _alone = alone_with_the_recorder();
+        set_target("cuda-probe");
+        open_as(PID, "cuda-probe", "/usr/lib/libcuda.so.1", 3);
+        record_failure(PID, 16, 22, || "fd=3 cmd=0xc020462b".to_string());
+        let out = render();
+        assert!(out.contains("1 failed syscalls"), "{}", out);
+        let line = out
+            .lines()
+            .find(|l| l.contains(" e22"))
+            .unwrap_or_else(|| panic!("no line for the failure: {}", out));
+        assert!(
+            line.contains(" FAIL ")
+                && line.contains(&crate::perf::name_of(16))
+                && line.contains("cmd=0xc020462b"),
+            "{}",
+            line
+        );
+        assert!(
+            !out.split("--- preload list")
+                .nth(1)
+                .unwrap()
+                .contains("cmd="),
+            "a failure reached the preload list"
+        );
     }
 
     #[test]

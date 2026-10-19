@@ -187,7 +187,17 @@ mano, antes de `make build`:
 cargo xtask mk-sfs --dir rootfs/x86_64-minimal --image zCore/x86_64-minimal.img --size 629145600
 ```
 
-`libcuda` aún no puede pasar de `cuInit`, que necesita `/dev/nvidia-uvm`.
+CUDA se prueba paso a paso con `cuda-probe`. Cuando un paso falla,
+`dmesg | grep nvidia` nombra la llamada de NVIDIA que el núcleo aún no sirve,
+con cualquier `LOG`. Arrancando además con `BOOTTRACE=cuda-probe`,
+`/proc/bootprofile` lista cada llamada de `cuda-probe` que falló, con su
+errno: es lo que hay detrás de un `CUDA_ERROR_OPERATING_SYSTEM` (304).
+
+```sh
+cuda-probe
+dmesg | grep nvidia
+grep -E 'FAIL| e[0-9]' /proc/bootprofile
+```
 
 ## 3) Semántica de render node (despliegue seguro)
 

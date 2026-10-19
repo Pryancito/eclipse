@@ -356,10 +356,12 @@ fn name(cmd: u32) -> &'static str {
 static NOT_SERVED: Mutex<BTreeSet<u32>> = Mutex::new(BTreeSet::new());
 
 /// One log line the first time each command this kernel does not serve is
-/// asked for.
+/// asked for. Every line of this file goes to dmesg through klog, not
+/// `warn!`: a real machine boots at `LOG=error`, which filters `warn!` out,
+/// and this line is what says what the next batch needs.
 fn not_served(cmd: u32) {
     if NOT_SERVED.lock().insert(cmd) {
-        warn!(
+        zcore_drivers::klog_warn!(
             "[nvidia-uvm] {} ({}) is not served yet: ENOSYS",
             name(cmd),
             cmd
@@ -374,16 +376,18 @@ pub fn create_node(root: &Arc<DevINode>) {
         return;
     }
     if root.find("nvidiactl").is_err() {
-        warn!(
+        zcore_drivers::klog_warn!(
             "[nvidia-uvm] nvidia.uvm without /dev/nvidiactl (nvidia.cuda turns on both): no /dev/nvidia-uvm"
         );
         return;
     }
     if let Err(e) = root.add("nvidia-uvm", Arc::new(UvmDev::new())) {
-        warn!("[nvidia-uvm] failed to mknod /dev/nvidia-uvm: {:?}", e);
+        zcore_drivers::klog_warn!("[nvidia-uvm] failed to mknod /dev/nvidia-uvm: {:?}", e);
         return;
     }
-    warn!("[nvidia-uvm] /dev/nvidia-uvm: cuInit's three calls served, the rest logged");
+    zcore_drivers::klog_warn!(
+        "[nvidia-uvm] /dev/nvidia-uvm: cuInit's three calls served, the rest logged"
+    );
 }
 
 #[cfg(test)]
