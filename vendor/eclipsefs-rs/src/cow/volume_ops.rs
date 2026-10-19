@@ -9,6 +9,14 @@
 //! the new stripes, the map is switched, and the old stripes stay untouched
 //! (held) until the commit that switches the map is on disk, so a crash
 //! leaves either layout whole.
+//!
+//! Tiers: devices can be marked fast or slow ([`CowFs::set_device_tier`]).
+//! With both kinds there, metadata and new data go to chunks on the fast
+//! devices while they have room (falling back to any device), and
+//! [`CowFs::tier_migrate`] moves data chunks that have filled up (no longer
+//! being written) to the slow devices, metadata chunks to the fast ones.
+//! Whole chunks move, so their logical blocks, and every reference to
+//! them, stay as they are.
 
 use super::*;
 
@@ -101,7 +109,7 @@ impl CowFs {
     /// Before copying chunks: fix every bad copy that has a good one, so
     /// the copies made are of good blocks.
     pub(super) fn prepare_moves(&mut self, vol: &Volume) -> Result<()> {
-        if vol.map().chunks.values().any(|c| c.profile.copies() > 1) {
+        if vol.map().chunks.values().any(|c| c.profile.tolerates() > 0) {
             let r = self.scrub()?;
             if !r.is_clean() {
                 warn!("eclipsefs: moving chunks with unrecoverable blocks in them");
@@ -122,14 +130,32 @@ impl CowFs {
             .ok_or(Error::Corrupt("chunk"))?;
         let avoid = self.sp.avoid.clone();
         let held = vol.held();
-        // Group 0's chunk is described by the superblock: never striped.
+        // Group 0's chunk is described by the superblock: never striped,
+        // never parity (the same number of lost devices survived).
         let profile = match profile {
-            Profile::Raid0 | Profile::Raid10 if g == 0 => Profile::Raid1,
+            Profile::Raid0 | Profile::Raid10 | Profile::Raid5 if g == 0 => Profile::Raid1,
+            Profile::Raid6 if g == 0 => Profile::Raid1c3,
             p => p,
         };
-        let stripes = vol
-            .with_map(|m| m.place_moving(&old, profile, &avoid, &held))
-            .ok_or(Error::NoSpace)?;
+        // On a tiered volume a chunk stays on its tier; metadata, and
+        // data on both, go to the fast one.
+        let map = vol.map();
+        let tier = match (map.tiered(), map.chunk_tier(&old)) {
+            (false, _) => None,
+            (true, t) if old.kind == ChunkKind::Data && t != Tier::Any => Some(t),
+            (true, _) => Some(Tier::Fast),
+        };
+        let on_tier = tier.and_then(|t| {
+            let mut a = avoid.clone();
+            a.extend(map.off_tier(t));
+            map.place_moving(&old, profile, &a, &held)
+        });
+        let stripes = match on_tier {
+            Some(s) => s,
+            None => vol
+                .with_map(|m| m.place_moving(&old, profile, &avoid, &held))
+                .ok_or(Error::NoSpace)?,
+        };
         let new = Chunk {
             kind: old.kind,
             profile,
@@ -161,7 +187,110 @@ impl CowFs {
         }
         vol.with_map(|m| m.chunks.insert(g, new));
         self.sp.chunks_dirty = true;
+        self.refresh_layouts();
         self.flush()
+    }
+
+    /// Parity rows and tiers of the groups, and whether placement is
+    /// tiered, from the chunk map.
+    pub(super) fn refresh_layouts(&mut self) {
+        let Some(vol) = self.vol.clone() else {
+            self.sp.tiered = false;
+            return;
+        };
+        let map = vol.map();
+        self.sp.tiered = map.tiered();
+        for (&g, c) in &map.chunks {
+            let Some(grp) = self.sp.alloc.groups_mut().get_mut(g as usize) else {
+                continue;
+            };
+            let row = if c.profile.parity() > 0 {
+                c.data_cols() as u64
+            } else {
+                1
+            };
+            if grp.row() != row {
+                grp.set_row(row);
+            }
+            grp.tier = map.chunk_tier(c);
+        }
+    }
+
+    /// Mark device `devid` fast or slow (or neither). Placement looks at
+    /// tiers once there are both fast and slow devices; chunks already
+    /// made move with [`tier_migrate`](Self::tier_migrate).
+    pub fn set_device_tier(&mut self, devid: u32, tier: Tier) -> Result<()> {
+        self.writable()?;
+        let vol = self.ensure_volume()?;
+        if !vol.map().devices.contains_key(&devid) {
+            return Err(Error::NotFound);
+        }
+        vol.with_map(|m| m.set_tier(devid, tier));
+        self.sp.chunks_dirty = true;
+        self.refresh_layouts();
+        self.flush()
+    }
+
+    /// The tier of device `devid`.
+    pub fn device_tier(&self, devid: u32) -> Tier {
+        self.vol
+            .as_ref()
+            .map(|v| v.map().tier(devid))
+            .unwrap_or_default()
+    }
+
+    /// Move data chunks that are full (so no longer being written) off
+    /// the fast devices to the slow ones, and metadata chunks onto the
+    /// fast ones (bcachefs's background and metadata targets). With
+    /// `all`, every data chunk on a fast device moves, full or not.
+    /// Chunks with no room on their target tier stay where they are.
+    pub fn tier_migrate(&mut self, all: bool) -> Result<BalanceReport> {
+        self.writable()?;
+        let mut rep = BalanceReport::default();
+        let Some(vol) = self.vol.clone() else {
+            return Ok(rep);
+        };
+        if !vol.map().tiered() {
+            return Ok(rep);
+        }
+        self.flush()?;
+        for (g, old) in vol.map().chunks {
+            let map = vol.map();
+            let fast = old.stripes.iter().any(|s| map.tier(s.devid) == Tier::Fast);
+            let target = match old.kind {
+                ChunkKind::Data if fast => Tier::Slow,
+                ChunkKind::Data => continue,
+                _ if map.chunk_tier(&old) == Tier::Fast => continue,
+                _ => Tier::Fast,
+            };
+            if old.kind == ChunkKind::Data && !all {
+                let full = self
+                    .sp
+                    .alloc
+                    .groups()
+                    .get(g as usize)
+                    .is_some_and(|grp| grp.free_blocks * 8 < grp.block_count);
+                if !full {
+                    continue;
+                }
+            }
+            let mut avoid = self.sp.avoid.clone();
+            avoid.extend(map.off_tier(target));
+            let Some(stripes) = map.place_exact(old.profile, old.blocks, &avoid, &vol.held())
+            else {
+                continue;
+            };
+            let new = Chunk {
+                kind: old.kind,
+                profile: old.profile,
+                blocks: old.blocks,
+                stripes,
+            };
+            self.switch_chunk(g, &old, new)?;
+            rep.relocated += 1;
+        }
+        self.flush()?;
+        Ok(rep)
     }
 
     /// Give an empty chunk's space back to its devices.
@@ -253,7 +382,11 @@ impl CowFs {
             return Err(e);
         }
         let dev = vol.detach(devid);
-        vol.with_map(|m| m.devices.remove(&devid));
+        vol.with_map(|m| {
+            m.devices.remove(&devid);
+            m.tiers.remove(&devid);
+        });
+        self.refresh_layouts();
         self.sp.chunks_dirty = true;
         if let Err(e) = self.flush() {
             if let Some(dev) = dev {
@@ -376,6 +509,7 @@ impl CowFs {
                 size_bytes: self.sb.total_blocks * BS,
                 allocated_bytes: self.sp.alloc.total_blocks() * BS,
                 present: true,
+                tier: Tier::Any,
             }];
         };
         let map = vol.map();
@@ -388,6 +522,7 @@ impl CowFs {
                 size_bytes: size * BS,
                 allocated_bytes: (size - free.get(&id).copied().unwrap_or(0)) * BS,
                 present: vol.device(id).is_some(),
+                tier: map.tier(id),
             })
             .collect()
     }

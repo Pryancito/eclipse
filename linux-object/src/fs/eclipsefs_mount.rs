@@ -7,7 +7,13 @@
 //! Mount options (`-o`): `compress=zlib|lz4|zstd|no` (and `compress-force=`),
 //! `subvol=<path>` / `subvolid=<id>` for the subvolume to show as `/`,
 //! `degraded` to mount a volume with devices missing, and `device=<dev>` to
-//! name a member of a volume. A volume's other members are also found by
+//! name a member of a volume, and `commit=<secs>` for how often the open
+//! transaction commits (5 by default, as ext4; a kernel task does it, and
+//! `fsync` writes the file to the fsync log in between), and `repair` to
+//! put right what fsck finds before the filesystem is used (as `btrfs check
+//! --repair`; refused read-only, damage it cannot fix is logged and the
+//! mount goes on). A volume's other
+//! members are also found by
 //! scanning every block device the kernel registered, as `btrfs device
 //! scan` does. The filesystem ioctls (chattr, reflink, snapshots, quotas,
 //! scrub, devices) are in `eclipsefs_ioctl`.
@@ -18,8 +24,9 @@ use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::any::Any;
 
+use core::sync::atomic::{AtomicUsize, Ordering};
 use eclipsefs::{Compression, EclipseFS, Error as EfsError, FileKind};
-use lock::Mutex;
+use lock::{Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use rcore_fs::vfs::{
     FileSystem, FileType, FsError, FsInfo, INode, Metadata, PollStatus, Result, Timespec,
 };
@@ -56,11 +63,51 @@ fn wall_clock() -> (u64, u32) {
     (now.as_secs(), now.subsec_nanos())
 }
 
+/// The filesystem's lock: exclusive for everything ([`lock`](Self::lock)),
+/// shared for the reads that can run side by side
+/// ([`EclipseFS::read_shared`] through [`shared`](Self::shared)).
+///
+/// The `RwLock` underneath lets readers in while any reader is inside, so
+/// a steady stream of them would keep a writer spinning for ever. A writer
+/// that wants in says so first, and while one does, `shared` answers `None`
+/// and the reader queues for the exclusive lock behind it instead.
+pub(crate) struct FsLock {
+    fs: RwLock<EclipseFS>,
+    writers: AtomicUsize,
+}
+
+impl FsLock {
+    fn new(fs: EclipseFS) -> Self {
+        Self {
+            fs: RwLock::new(fs),
+            writers: AtomicUsize::new(0),
+        }
+    }
+
+    /// The filesystem, exclusively.
+    #[track_caller]
+    pub(crate) fn lock(&self) -> RwLockWriteGuard<'_, EclipseFS> {
+        self.writers.fetch_add(1, Ordering::SeqCst);
+        let g = self.fs.write();
+        self.writers.fetch_sub(1, Ordering::SeqCst);
+        g
+    }
+
+    /// The filesystem shared with other readers, unless a writer is waiting.
+    #[track_caller]
+    pub(crate) fn shared(&self) -> Option<RwLockReadGuard<'_, EclipseFS>> {
+        if self.writers.load(Ordering::SeqCst) != 0 {
+            return None;
+        }
+        Some(self.fs.read())
+    }
+}
+
 /// A directory's entries as `(name, ino)`, in on-disk order.
 type Listing = Arc<Vec<(String, u64)>>;
 
 pub struct EclipseMountFs {
-    pub(crate) inner: Mutex<EclipseFS>,
+    pub(crate) inner: FsLock,
     /// Mounted read-only: the ioctls that change anything refuse (EROFS).
     pub(crate) read_only: bool,
     /// What `/` of this mount is: the default subvolume's root directory,
@@ -103,7 +150,14 @@ pub(crate) struct EfsOptions {
     pub devices: Vec<String>,
     pub subvol: Option<String>,
     pub subvolid: Option<u64>,
+    /// `commit=`: seconds between commits.
+    pub commit: Option<u64>,
+    /// `repair`: run the offline repair at mount.
+    pub repair: bool,
 }
+
+/// Seconds between commits when `commit=` does not say (ext4's default).
+pub(crate) const DEFAULT_COMMIT_SECS: u64 = 5;
 
 impl EfsOptions {
     /// Read the comma-separated `data` of mount(2). Options of the generic
@@ -129,6 +183,7 @@ impl EfsOptions {
                     });
                 }
                 ("degraded", None) => o.degraded = true,
+                ("repair", None) => o.repair = true,
                 ("device", Some(v)) if !v.is_empty() => {
                     let name = v.rsplit('/').next().unwrap_or(v);
                     o.devices.push(String::from(name));
@@ -137,7 +192,14 @@ impl EfsOptions {
                 ("subvolid", Some(v)) => {
                     o.subvolid = Some(v.parse().map_err(|_| FsError::InvalidParam)?);
                 }
-                ("device" | "subvol" | "subvolid", _) => return Err(FsError::InvalidParam),
+                ("commit", Some(v)) => {
+                    // btrfs: 0 means the default.
+                    let secs: u64 = v.parse().map_err(|_| FsError::InvalidParam)?;
+                    o.commit = Some(if secs == 0 { DEFAULT_COMMIT_SECS } else { secs });
+                }
+                ("device" | "subvol" | "subvolid" | "commit" | "repair", _) => {
+                    return Err(FsError::InvalidParam)
+                }
                 _ => {}
             }
         }
@@ -236,8 +298,20 @@ impl EclipseMountFs {
         if let Some(algo) = opts.compress {
             fs.set_mount_compression(algo).map_err(map_err)?;
         }
+        if opts.repair {
+            if read_only {
+                warn!("eclipsefs: repair needs a read-write mount");
+                return Err(FsError::InvalidParam);
+            }
+            let r = fs.repair().map_err(map_err)?;
+            warn!("eclipsefs: repair: {:?}", r);
+            if let Some(why) = r.still_damaged {
+                warn!("eclipsefs: repair could not fix everything: {}", why);
+            }
+        }
         let root = mount_root(&mut fs, opts)?;
         if !read_only {
+            fs.set_commit_interval(Some(opts.commit.unwrap_or(DEFAULT_COMMIT_SECS)));
             match fs.grow_to_device() {
                 Ok(true) => warn!("eclipsefs: filesystem expanded to device size"),
                 Ok(false) => {}
@@ -245,14 +319,36 @@ impl EclipseMountFs {
             }
         }
         let arc = Arc::new(Self {
-            inner: Mutex::new(fs),
+            inner: FsLock::new(fs),
             read_only,
             root,
             this: Mutex::new(Weak::new()),
             dir_cache: Mutex::new(BTreeMap::new()),
         });
         *arc.this.lock() = Arc::downgrade(&arc);
+        #[cfg(not(test))]
+        if !read_only {
+            Self::start_committer(Arc::downgrade(&arc));
+        }
         Ok(arc)
+    }
+
+    /// The kernel task that commits the open transaction every `commit=`
+    /// seconds, so that operations do not (and an idle filesystem still
+    /// does). It ends with the mount.
+    #[cfg(not(test))]
+    fn start_committer(fs: Weak<Self>) {
+        kernel_hal::thread::spawn(async move {
+            loop {
+                let tick = kernel_hal::timer::timer_now() + core::time::Duration::from_secs(1);
+                kernel_hal::thread::sleep_until(tick).await;
+                let Some(fs) = fs.upgrade() else { break };
+                let r = fs.inner.lock().commit_if_due();
+                if let Err(e) = r {
+                    warn!("eclipsefs: periodic commit failed: {:?}", e);
+                }
+            }
+        });
     }
 
     pub(crate) fn inode(&self, ino: u64) -> Arc<EclipseMountINode> {
@@ -400,6 +496,20 @@ impl EclipseMountINode {
 
 impl INode for EclipseMountINode {
     fn read_at(&self, offset: usize, buf: &mut [u8]) -> Result<usize> {
+        // Shared first: a regular file whose read needs nothing the
+        // exclusive path has (see `EclipseFS::read_shared`).
+        if let Some(fs) = self.fs.inner.shared() {
+            if let Some(st) = fs.stat_shared(self.ino).map_err(map_err)? {
+                if st.kind == FileKind::Regular {
+                    if let Some(n) = fs
+                        .read_shared(self.ino, offset as u64, buf)
+                        .map_err(map_err)?
+                    {
+                        return Ok(n);
+                    }
+                }
+            }
+        }
         let mut fs = self.fs.inner.lock();
         let st = fs.stat(self.ino).map_err(map_err)?;
         match st.kind {
@@ -439,6 +549,11 @@ impl INode for EclipseMountINode {
     }
 
     fn metadata(&self) -> Result<Metadata> {
+        if let Some(fs) = self.fs.inner.shared() {
+            if let Some(st) = fs.stat_shared(self.ino).map_err(map_err)? {
+                return Ok(stat_to_metadata(&st));
+            }
+        }
         let st = self.fs.inner.lock().stat(self.ino).map_err(map_err)?;
         Ok(stat_to_metadata(&st))
     }
@@ -547,8 +662,10 @@ impl INode for EclipseMountINode {
             .map_err(map_err)
     }
 
+    /// `fsync`: the file alone through the fsync log when it can, a commit
+    /// otherwise (directories, new files, renames...).
     fn sync_all(&self) -> Result<()> {
-        self.fs.inner.lock().sync().map_err(map_err)
+        self.fs.inner.lock().fsync(self.ino).map_err(map_err)
     }
 
     fn sync_data(&self) -> Result<()> {
@@ -565,8 +682,9 @@ impl INode for EclipseMountINode {
 }
 
 /// Whether `inode` is one of a mounted EclipseFS. Its reads hold
-/// `EclipseMountFs::inner`, an interrupts-off spinlock, across the device
-/// command, which is why `File` queues them first (`disk_read_gate`).
+/// `EclipseMountFs::inner`, an interrupts-off spinlock (shared when they
+/// can), across the device command, which is why `File` queues them first
+/// (`disk_read_gate`, with a slot per CPU but one).
 pub(super) fn owns(inode: &dyn INode) -> bool {
     inode.downcast_ref::<EclipseMountINode>().is_some()
 }
@@ -831,5 +949,46 @@ mod tests {
         );
         assert!(matches!(etc.find("data"), Err(FsError::EntryNotFound)));
         root.unlink("etc").unwrap();
+    }
+
+    /// Reads take the lock shared and see what exclusive reads see; while a
+    /// writer waits they take it exclusively, behind the writer.
+    #[test]
+    fn reads_share_the_lock_and_give_way_to_a_waiting_writer() {
+        let disk = formatted(16 * 1024 * 1024);
+        let fs = EclipseMountFs::open(&MountBackend::Block(disk), false).unwrap();
+        let root = fs.root_inode();
+        let f = root.create("f", FileType::File, 0o644).unwrap();
+        let data: Vec<u8> = (0..70_000).map(|i| (i * 7 % 253) as u8).collect();
+        assert_eq!(f.write_at(0, &data).unwrap(), data.len());
+        let ino = f.downcast_ref::<EclipseMountINode>().unwrap().ino;
+        {
+            // Two readers at once.
+            let a = fs.inner.shared().unwrap();
+            let b = fs.inner.shared().unwrap();
+            let mut x = vec![0u8; 1000];
+            let mut y = vec![0u8; 1000];
+            assert_eq!(a.read_shared(ino, 5000, &mut x).unwrap(), Some(1000));
+            assert_eq!(b.read_shared(ino, 5000, &mut y).unwrap(), Some(1000));
+            assert_eq!((&x[..], &y[..]), (&data[5000..6000], &data[5000..6000]));
+        }
+        let mut back = vec![0u8; data.len() + 10];
+        assert_eq!(f.read_at(0, &mut back).unwrap(), data.len());
+        assert_eq!(&back[..data.len()], &data[..]);
+        assert_eq!(f.metadata().unwrap().size, data.len());
+        // A writer waiting: readers do not get in ahead of it.
+        fs.inner.writers.fetch_add(1, Ordering::SeqCst);
+        assert!(fs.inner.shared().is_none());
+        assert_eq!(f.read_at(100, &mut back[..10]).unwrap(), 10);
+        assert_eq!(&back[..10], &data[100..110]);
+        fs.inner.writers.fetch_sub(1, Ordering::SeqCst);
+        assert!(fs.inner.shared().is_some());
+        // Directories and symlinks still read through the exclusive path.
+        let l = root.create("l", FileType::SymLink, 0o777).unwrap();
+        l.write_at(0, b"target").unwrap();
+        let mut t = [0u8; 16];
+        let n = l.read_at(0, &mut t).unwrap();
+        assert_eq!(&t[..n], b"target");
+        assert!(matches!(root.read_at(0, &mut t), Err(FsError::IsDir)));
     }
 }

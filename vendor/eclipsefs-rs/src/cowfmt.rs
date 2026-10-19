@@ -29,6 +29,8 @@
 //!   `(ino, EXTENT_DATA, file offset)` per extent, and per directory
 //!   `(dir, DIR_ITEM, hash(name))` for lookups and `(dir, DIR_INDEX, n)` for
 //!   readdir in creation order;
+//! - root tree, object 8: `(8, EXTENT_DATA, 0)` -> the fsync log area, as a
+//!   preallocated extent;
 //! - checksum tree (7): `(first block of a bucket, CSUM_ITEM, 0)` -> the
 //!   CRC32C of every data block in use among the bucket's
 //!   [`CSUM_BUCKET`] blocks (a presence bitmap, then the checksums).
@@ -56,6 +58,9 @@ pub const REFS_TREE: u64 = 2;
 pub const FS_TREE: u64 = 5;
 /// Checksums of file data, by disk block (btrfs's CSUM_TREE number).
 pub const CSUM_TREE: u64 = 7;
+/// Root-tree object whose `(LOG_TREE, EXTENT_DATA, 0)` item is the fsync
+/// log area, a preallocated extent (see `cow::fsync_log`).
+pub const LOG_TREE: u64 = 8;
 /// First inode number of every subvolume: its root directory.
 pub const FIRST_INO: u64 = 256;
 /// Subvolumes and snapshots created later get ids from here on.
@@ -120,6 +125,10 @@ pub const FEAT_FIXED_SIZE: u64 = 4;
 pub const FEAT_BITMAP_CSUM: u64 = 8;
 /// Superblock feature: some directory has an encryption policy.
 pub const FEAT_ENCRYPT: u64 = 16;
+/// Chunks with RAID5/RAID6 parity (see [`crate::volume`]).
+pub const FEAT_RAID56: u64 = 1 << 8;
+/// Devices with a tier: the chunk map is version 2.
+pub const FEAT_TIERS: u64 = 1 << 9;
 
 /// Bitmap checksums per block of the table: the last 4 bytes are the
 /// CRC32C of the rest.

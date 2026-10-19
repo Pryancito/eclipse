@@ -15,7 +15,7 @@ use alloc::vec::Vec;
 use crate::blocks::{AllocationGroup, BlockAllocator};
 use crate::btree::Space;
 use crate::format::GROUP_BLOCKS;
-use crate::volume::{Chunk, ChunkKind, Profile, Volume, MIN_CHUNK};
+use crate::volume::{Chunk, ChunkKind, Profile, Tier, Volume, MIN_CHUNK};
 use crate::{Error, Result};
 
 /// Set of block ranges (start -> length), merged when adjacent.
@@ -249,6 +249,13 @@ pub struct BlockSpace {
     pub avoid: Vec<u32>,
     /// The chunk map changed since the last commit.
     pub chunks_dirty: bool,
+    /// Repair is running: a reference to blocks that are free or past the
+    /// end (a damaged extent in a leaf being copied) is ignored instead of
+    /// refused; repair drops such extents and recounts everything after.
+    pub lenient: bool,
+    /// The volume has fast and slow devices: metadata and new data go to
+    /// the fast ones first.
+    pub tiered: bool,
 }
 
 /// Blocks kept back for metadata on a filesystem of `total` blocks: 1/64 of
@@ -272,6 +279,21 @@ impl BlockSpace {
             profiles: (Profile::Single, Profile::Single),
             avoid: Vec::new(),
             chunks_dirty: false,
+            lenient: false,
+            tiered: false,
+        }
+    }
+
+    /// Whether `n` data blocks can be allocated now, making a data chunk
+    /// for them on a volume if needed.
+    pub fn ensure_data_room(&mut self, n: u64) -> bool {
+        loop {
+            if self.data_room() >= n {
+                return true;
+            }
+            if !self.grow(ChunkKind::Data) {
+                return false;
+            }
         }
     }
 
@@ -292,8 +314,29 @@ impl BlockSpace {
         self.vol.as_ref().map(|_| ChunkKind::Data)
     }
 
+    /// Where metadata and new data go first: the fast tier, when there is
+    /// one (bcachefs's metadata and foreground targets).
+    fn target(&self) -> Option<Tier> {
+        self.tiered.then_some(Tier::Fast)
+    }
+
     /// Up to `max` contiguous data blocks near `goal`.
     pub fn alloc_data(&mut self, goal: Option<u64>, max: u64) -> Option<(u64, u64)> {
+        if let Some(t) = self.target() {
+            for attempt in 0..2 {
+                let room = self.data_room();
+                if room > 0 {
+                    let kind = self.data_kind();
+                    if let Some(r) = self.alloc.allocate_tier(goal, max.min(room), kind, Some(t)) {
+                        self.fresh.insert(r.0, r.1);
+                        return Some(r);
+                    }
+                }
+                if attempt == 0 && !self.grow_on(ChunkKind::Data, Some(t)) {
+                    break;
+                }
+            }
+        }
         for attempt in 0..2 {
             let room = self.data_room();
             if room > 0 {
@@ -312,6 +355,21 @@ impl BlockSpace {
 
     /// Exactly `n` contiguous data blocks, near `goal` if possible.
     pub fn alloc_data_run(&mut self, goal: Option<u64>, n: u64) -> Option<u64> {
+        if let Some(t) = self.target() {
+            for attempt in 0..2 {
+                if self.data_room() >= n {
+                    let kind = self.data_kind();
+                    if let Some(r) = self.alloc.allocate_run_tier(goal, n, kind, Some(t)) {
+                        self.fresh.insert(r, n);
+                        return Some(r);
+                    }
+                }
+                if attempt == 0 && (n > GROUP_BLOCKS / 2 || !self.grow_on(ChunkKind::Data, Some(t)))
+                {
+                    break;
+                }
+            }
+        }
         for attempt in 0..2 {
             if self.data_room() >= n {
                 let kind = self.data_kind();
@@ -336,11 +394,17 @@ impl BlockSpace {
     /// room on the devices, or (for data) if that would leave metadata
     /// without its reserve.
     pub fn grow(&mut self, kind: ChunkKind) -> bool {
+        self.grow_on(kind, None)
+    }
+
+    /// [`grow`](Self::grow) with the chunk on devices of `tier` only.
+    pub fn grow_on(&mut self, kind: ChunkKind, tier: Option<Tier>) -> bool {
         let Some(vol) = self.vol.clone() else {
             return false;
         };
         if kind == ChunkKind::Data
             && self.meta_free() < self.reserve
+            && !self.grow_on(ChunkKind::Metadata, self.target())
             && !self.grow(ChunkKind::Metadata)
         {
             return false;
@@ -350,29 +414,38 @@ impl BlockSpace {
             _ => self.profiles.1,
         };
         let held = vol.held();
-        let avoid = self.avoid.clone();
+        let mut avoid = self.avoid.clone();
         let made = vol.with_map(|m| {
+            if let Some(t) = tier {
+                avoid.extend(m.off_tier(t));
+            }
             // Chunks of an eighth of the smallest device (at most a group).
             let small = m.devices.values().copied().min().unwrap_or(0);
             let want = (small / 8).clamp(MIN_CHUNK, GROUP_BLOCKS);
             let (blocks, stripes) = m.place(profile, want, &avoid, &held)?;
             let g = m.free_group();
-            m.chunks.insert(
-                g,
-                Chunk {
-                    kind,
-                    profile,
-                    blocks,
-                    stripes,
-                },
-            );
-            Some((g, blocks))
+            let c = Chunk {
+                kind,
+                profile,
+                blocks,
+                stripes,
+            };
+            let row = if profile.parity() > 0 {
+                c.data_cols() as u64
+            } else {
+                1
+            };
+            let t = m.chunk_tier(&c);
+            m.chunks.insert(g, c);
+            Some((g, blocks, row, t))
         });
-        let Some((g, blocks)) = made else {
+        let Some((g, blocks, row, t)) = made else {
             return false;
         };
         let mut grp = AllocationGroup::new(g as u32, blocks);
         grp.kind = kind;
+        grp.tier = t;
+        grp.set_row(row);
         self.alloc.set_group(grp);
         self.chunks_dirty = true;
         true
@@ -420,6 +493,17 @@ impl Space for BlockSpace {
             goal
         };
         let kind = self.vol.as_ref().map(|_| ChunkKind::Metadata);
+        if let Some(t) = self.target() {
+            let mut got = self.alloc.allocate_tier(Some(goal), 1, kind, Some(t));
+            if got.is_none() && self.grow_on(ChunkKind::Metadata, Some(t)) {
+                got = self.alloc.allocate_tier(Some(goal), 1, kind, Some(t));
+            }
+            if let Some((b, _)) = got {
+                self.fresh.insert(b, 1);
+                self.meta_goal = b + 1;
+                return Ok(b);
+            }
+        }
         let b = match self.alloc.allocate_for(Some(goal), 1, kind) {
             Some((b, _)) => b,
             None if self.grow(ChunkKind::Metadata) => {
@@ -440,7 +524,16 @@ impl Space for BlockSpace {
     }
 
     fn incref(&mut self, start: u64, len: u64) -> Result<()> {
-        if (start..start + len).any(|b| !self.alloc.is_used(b)) {
+        // Past the end first: a damaged length must not make this walk
+        // billions of blocks.
+        let bad = match start.checked_add(len) {
+            Some(end) if end <= self.alloc.end() => (start..end).any(|b| !self.alloc.is_used(b)),
+            _ => true,
+        };
+        if bad {
+            if self.lenient {
+                return Ok(());
+            }
             return Err(Error::Corrupt("reference to a free block"));
         }
         self.refs.add(start, len, 1);

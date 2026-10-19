@@ -122,7 +122,7 @@ pub(super) enum NameUse {
 pub(super) struct Keyring {
     masters: BTreeMap<[u8; KEY_ID_SIZE], Vec<u8>>,
     /// (subvolume, inode) -> keys, and the master key they come from.
-    files: BTreeMap<(u64, u64), (Arc<FileKeys>, [u8; KEY_ID_SIZE])>,
+    pub(super) files: BTreeMap<(u64, u64), (Arc<FileKeys>, [u8; KEY_ID_SIZE])>,
 }
 
 impl Keyring {

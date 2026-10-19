@@ -14,6 +14,33 @@
 //! | RAID10   | 2      | pairs, striped by 64 KiB| 4       |
 //! | RAID1C3  | 3      | 3 devices               | 3       |
 //! | RAID1C4  | 4      | 4 devices               | 4       |
+//! | RAID5    | 1 + P  | every device, 4 KiB     | 2       |
+//! | RAID6    | 1 + P+Q| every device, 4 KiB     | 3       |
+//!
+//! RAID5 and RAID6 chunks keep rows of `k` data blocks (one per device)
+//! plus P (XOR) and, for RAID6, Q (Reed-Solomon, see [`crate::raid56`]),
+//! rotating which device holds the parity from one row to the next. A row
+//! is one block on each device, at the same place, so `R` consecutive rows
+//! are `R` contiguous blocks on every device.
+//!
+//! **No write hole.** btrfs RAID5/6 can lose committed data when a crash
+//! lands between a data block and its row's parity: the parity no longer
+//! matches the *other* blocks of the row, which a later rebuild then gets
+//! wrong. EclipseFS never writes a row that holds committed data: the
+//! allocator ([`crate::blocks`]) hands out blocks of a parity chunk only
+//! from rows that are wholly free or that the open transaction already
+//! started, so every write lands in a row whose other blocks are free or
+//! uncommitted, both of which a crash discards anyway. The free tail of a
+//! row a transaction left half used waits until the whole row is freed.
+//! Writes compute parity from what the row holds on disk (reconstruct
+//! write), so a row left inconsistent by a crash is right again after its
+//! next write. The one row rewritten in place, holding the group's bitmap,
+//! goes through the journal, which rewrites it after a crash.
+//!
+//! Devices may be given a [`Tier`] (fast or slow): metadata and new data
+//! go to chunks on fast devices while they have room, and
+//! `tier_migrate` moves data chunks that are no longer being written to
+//! the slow ones (bcachefs's metadata, foreground and background targets).
 //!
 //! Block 0 of every device holds a copy of the superblock (with that
 //! device's id); the superblock also maps group 0, which holds the journal
@@ -59,10 +86,12 @@ pub enum Profile {
     Raid10,
     Raid1c3,
     Raid1c4,
+    Raid5,
+    Raid6,
 }
 
 impl Profile {
-    pub const ALL: [Profile; 7] = [
+    pub const ALL: [Profile; 9] = [
         Profile::Single,
         Profile::Dup,
         Profile::Raid0,
@@ -70,6 +99,8 @@ impl Profile {
         Profile::Raid10,
         Profile::Raid1c3,
         Profile::Raid1c4,
+        Profile::Raid5,
+        Profile::Raid6,
     ];
 
     pub fn id(self) -> u8 {
@@ -81,6 +112,8 @@ impl Profile {
             Profile::Raid10 => 4,
             Profile::Raid1c3 => 5,
             Profile::Raid1c4 => 6,
+            Profile::Raid5 => 7,
+            Profile::Raid6 => 8,
         }
     }
 
@@ -91,10 +124,11 @@ impl Profile {
             .ok_or(Error::Corrupt("chunk profile"))
     }
 
-    /// Copies of every block.
+    /// Whole copies of every block (parity profiles keep one, plus
+    /// parity).
     pub fn copies(self) -> usize {
         match self {
-            Profile::Single | Profile::Raid0 => 1,
+            Profile::Single | Profile::Raid0 | Profile::Raid5 | Profile::Raid6 => 1,
             Profile::Dup | Profile::Raid1 | Profile::Raid10 => 2,
             Profile::Raid1c3 => 3,
             Profile::Raid1c4 => 4,
@@ -105,8 +139,8 @@ impl Profile {
     pub fn min_devices(self) -> usize {
         match self {
             Profile::Single | Profile::Dup => 1,
-            Profile::Raid0 | Profile::Raid1 => 2,
-            Profile::Raid1c3 => 3,
+            Profile::Raid0 | Profile::Raid1 | Profile::Raid5 => 2,
+            Profile::Raid1c3 | Profile::Raid6 => 3,
             Profile::Raid10 | Profile::Raid1c4 => 4,
         }
     }
@@ -115,12 +149,34 @@ impl Profile {
     pub fn tolerates(self) -> usize {
         match self {
             Profile::Single | Profile::Raid0 => 0,
+            Profile::Raid5 | Profile::Raid6 => self.parity(),
             p => p.copies() - 1,
         }
     }
 
     pub fn striped(self) -> bool {
         matches!(self, Profile::Raid0 | Profile::Raid10)
+    }
+
+    /// Parity blocks per row: 1 for RAID5, 2 for RAID6, else 0.
+    pub fn parity(self) -> usize {
+        match self {
+            Profile::Raid5 => 1,
+            Profile::Raid6 => 2,
+            _ => 0,
+        }
+    }
+
+    /// Raw blocks a block of data takes on `n` devices, as a fraction
+    /// `(raw, data)`.
+    pub fn overhead(self, n: usize) -> (u64, u64) {
+        match self.parity() {
+            0 => (self.copies() as u64, 1),
+            p => {
+                let n = n.max(p + 1) as u64;
+                (n, n - p as u64)
+            }
+        }
     }
 
     pub fn name(self) -> &'static str {
@@ -132,6 +188,62 @@ impl Profile {
             Profile::Raid10 => "raid10",
             Profile::Raid1c3 => "raid1c3",
             Profile::Raid1c4 => "raid1c4",
+            Profile::Raid5 => "raid5",
+            Profile::Raid6 => "raid6",
+        }
+    }
+
+    /// The profile called `name` (as [`name`](Self::name) spells it).
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|p| p.name() == name)
+    }
+}
+
+/// How fast a device is, for tiered placement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub enum Tier {
+    /// Not tiered (the default): used for anything.
+    #[default]
+    Any,
+    /// SSD/NVMe: metadata, and new data until it is migrated.
+    Fast,
+    /// HDD: where data ends up.
+    Slow,
+}
+
+impl Tier {
+    pub fn id(self) -> u8 {
+        match self {
+            Tier::Any => 0,
+            Tier::Fast => 1,
+            Tier::Slow => 2,
+        }
+    }
+
+    pub fn from_id(id: u8) -> Result<Self> {
+        match id {
+            0 => Ok(Tier::Any),
+            1 => Ok(Tier::Fast),
+            2 => Ok(Tier::Slow),
+            _ => Err(Error::Corrupt("device tier")),
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Tier::Any => "none",
+            Tier::Fast => "fast",
+            Tier::Slow => "slow",
+        }
+    }
+
+    /// `fast`/`ssd`, `slow`/`hdd` or `none`/`any`.
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "fast" | "ssd" | "nvme" => Some(Tier::Fast),
+            "slow" | "hdd" | "rotational" => Some(Tier::Slow),
+            "none" | "any" => Some(Tier::Any),
+            _ => None,
         }
     }
 }
@@ -193,6 +305,9 @@ pub fn stripe_len(profile: Profile, blocks: u64, n: usize) -> u64 {
     match profile {
         Profile::Raid0 => units.div_ceil(n.max(1) as u64) * STRIPE_UNIT,
         Profile::Raid10 => units.div_ceil((n / 2).max(1) as u64) * STRIPE_UNIT,
+        Profile::Raid5 | Profile::Raid6 => {
+            blocks.div_ceil(n.saturating_sub(profile.parity()).max(1) as u64)
+        }
         _ => blocks,
     }
 }
@@ -200,6 +315,19 @@ pub fn stripe_len(profile: Profile, blocks: u64, n: usize) -> u64 {
 impl Chunk {
     pub fn stripe_len(&self) -> u64 {
         stripe_len(self.profile, self.blocks, self.stripes.len())
+    }
+
+    /// Data blocks per row of a parity chunk.
+    pub fn data_cols(&self) -> usize {
+        self.stripes.len() - self.profile.parity()
+    }
+
+    /// Stripe that holds column `col` of row `r` of a parity chunk:
+    /// columns `0..k` are data, then P, then Q, rotated by one stripe per
+    /// row so parity is spread over every device.
+    pub fn col_stripe(&self, r: u64, col: usize) -> usize {
+        let n = self.stripes.len();
+        (col + (r % n as u64) as usize) % n
     }
 
     /// Every copy of block `off` of the chunk, and how many blocks from
@@ -229,6 +357,13 @@ impl Chunk {
                     (STRIPE_UNIT - within).min(rest),
                 )
             }
+            Profile::Raid5 | Profile::Raid6 => {
+                // The data block only; its parity is the volume's business.
+                let k = self.data_cols() as u64;
+                let r = off / k;
+                let i = self.col_stripe(r, (off % k) as usize);
+                (vec![at(s[i], r)], 1)
+            }
             _ => (s.iter().map(|&st| at(st, off)).collect(), rest),
         }
     }
@@ -253,6 +388,8 @@ impl Chunk {
                 Profile::Raid1c4 => n == 4 && distinct,
                 Profile::Raid0 => n >= 2 && distinct,
                 Profile::Raid10 => n >= 4 && n.is_multiple_of(2) && distinct,
+                Profile::Raid5 => n >= 2 && distinct,
+                Profile::Raid6 => n >= 3 && distinct,
             }
     }
 
@@ -331,7 +468,7 @@ impl Chunk {
                 })
                 .collect(),
         };
-        if !c.valid() || c.profile.striped() {
+        if !c.valid() || c.profile.striped() || c.profile.parity() > 0 {
             return Err(Error::Corrupt("system chunk"));
         }
         Ok(c)
@@ -345,6 +482,8 @@ pub struct ChunkMap {
     pub devices: BTreeMap<u32, u64>,
     /// Group -> chunk.
     pub chunks: BTreeMap<u64, Chunk>,
+    /// Device id -> tier, for devices that have one (map version 2).
+    pub tiers: BTreeMap<u32, Tier>,
 }
 
 /// A physical range: device, first block, blocks.
@@ -354,17 +493,27 @@ pub type PhysRange = (u32, u64, u64);
 type DevRoom = (u64, u32, Vec<(u64, u64)>);
 
 impl ChunkMap {
-    /// `EFSCHMAP`, version, devices, chunks, CRC32C of everything before it.
+    /// `EFSCHMAP`, version, devices, (version 2: device tiers), chunks,
+    /// CRC32C of everything before it. Version 1 unless a device has a
+    /// tier, so maps without tiers stay readable by older drivers.
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::new();
         out.extend_from_slice(MAP_MAGIC);
-        out.extend_from_slice(&1u32.to_le_bytes());
+        let version: u32 = if self.tiers.is_empty() { 1 } else { 2 };
+        out.extend_from_slice(&version.to_le_bytes());
         out.extend_from_slice(&(self.devices.len() as u32).to_le_bytes());
         out.extend_from_slice(&(self.chunks.len() as u32).to_le_bytes());
         out.extend_from_slice(&[0; 4]);
         for (&id, &size) in &self.devices {
             out.extend_from_slice(&id.to_le_bytes());
             out.extend_from_slice(&size.to_le_bytes());
+        }
+        if version == 2 {
+            out.extend_from_slice(&(self.tiers.len() as u32).to_le_bytes());
+            for (&id, &t) in &self.tiers {
+                out.extend_from_slice(&id.to_le_bytes());
+                out.extend_from_slice(&[t.id(), 0, 0, 0]);
+            }
         }
         for (&g, c) in &self.chunks {
             out.extend_from_slice(&g.to_le_bytes());
@@ -376,9 +525,10 @@ impl ChunkMap {
     }
 
     pub fn decode(b: &[u8]) -> Result<Self> {
-        if b.len() < 28 || &b[0..8] != MAP_MAGIC || le32(b, 8) != 1 {
+        if b.len() < 28 || &b[0..8] != MAP_MAGIC || !(1..=2).contains(&le32(b, 8)) {
             return Err(Error::Corrupt("chunk map header"));
         }
+        let version = le32(b, 8);
         let ndev = le32(b, 12) as usize;
         let nchunk = le32(b, 16) as usize;
         let mut at = 24;
@@ -389,6 +539,24 @@ impl ChunkMap {
             }
             map.devices.insert(le32(b, at), le64(b, at + 4));
             at += 12;
+        }
+        if version == 2 {
+            if at + 4 > b.len() {
+                return Err(Error::Corrupt("chunk map length"));
+            }
+            let n = le32(b, at) as usize;
+            at += 4;
+            for _ in 0..n {
+                if at + 8 > b.len() {
+                    return Err(Error::Corrupt("chunk map length"));
+                }
+                let t = Tier::from_id(b[at + 4])?;
+                if b[at + 5..at + 8] != [0, 0, 0] || t == Tier::Any {
+                    return Err(Error::Corrupt("device tier"));
+                }
+                map.tiers.insert(le32(b, at), t);
+                at += 8;
+            }
         }
         for _ in 0..nchunk {
             if at + 8 > b.len() {
@@ -408,6 +576,9 @@ impl ChunkMap {
 
     /// Stripes inside their devices, never overlapping, devices known.
     pub fn check(&self) -> Result<()> {
+        if self.tiers.keys().any(|d| !self.devices.contains_key(d)) {
+            return Err(Error::Corrupt("tier of an unknown device"));
+        }
         let mut per_dev: BTreeMap<u32, Vec<(u64, u64)>> = BTreeMap::new();
         for c in self.chunks.values() {
             if !c.valid() {
@@ -441,6 +612,48 @@ impl ChunkMap {
             .next_back()
             .map(|(g, c)| g * GROUP_BLOCKS + c.blocks)
             .unwrap_or(0)
+    }
+
+    /// The tier of device `devid`.
+    pub fn tier(&self, devid: u32) -> Tier {
+        self.tiers.get(&devid).copied().unwrap_or_default()
+    }
+
+    /// Set (or, with [`Tier::Any`], clear) the tier of device `devid`.
+    pub fn set_tier(&mut self, devid: u32, tier: Tier) {
+        if tier == Tier::Any {
+            self.tiers.remove(&devid);
+        } else {
+            self.tiers.insert(devid, tier);
+        }
+    }
+
+    /// Whether both a fast and a slow device are there: only then does
+    /// placement look at tiers.
+    pub fn tiered(&self) -> bool {
+        self.tiers.values().any(|&t| t == Tier::Fast)
+            && self.tiers.values().any(|&t| t == Tier::Slow)
+    }
+
+    /// The tier a chunk is on: that of all its devices, or `Any` when they
+    /// differ.
+    pub fn chunk_tier(&self, c: &Chunk) -> Tier {
+        let mut it = c.stripes.iter().map(|s| self.tier(s.devid));
+        let first = it.next().unwrap_or_default();
+        if it.all(|t| t == first) {
+            first
+        } else {
+            Tier::Any
+        }
+    }
+
+    /// Devices not on `tier` (to give [`place`](Self::place) as `avoid`).
+    pub fn off_tier(&self, tier: Tier) -> Vec<u32> {
+        self.devices
+            .keys()
+            .copied()
+            .filter(|&d| self.tier(d) != tier)
+            .collect()
     }
 
     /// The first group with no chunk.
@@ -529,7 +742,11 @@ impl ChunkMap {
         held: &[PhysRange],
     ) -> Option<Vec<Stripe>> {
         let blocks = old.blocks;
-        if old.profile.striped() || profile.striped() {
+        if old.profile.striped()
+            || profile.striped()
+            || old.profile.parity() > 0
+            || profile.parity() > 0
+        {
             return self.place_exact(profile, blocks, avoid, held);
         }
         let want = profile.copies();
@@ -634,7 +851,7 @@ impl ChunkMap {
                     .collect();
                 (got.len() == want).then_some(got)
             }
-            Profile::Raid0 | Profile::Raid10 => {
+            Profile::Raid0 | Profile::Raid10 | Profile::Raid5 | Profile::Raid6 => {
                 let min = profile.min_devices();
                 let mut k = devs.len();
                 if profile == Profile::Raid10 {
@@ -758,7 +975,12 @@ impl Volume {
             m.chunks
                 .get(&(b / GROUP_BLOCKS))
                 .filter(|c| b % GROUP_BLOCKS < c.blocks)
-                .map(|c| c.profile.copies())
+                .map(|c| match c.profile {
+                    // Also every guess at which other data block of the
+                    // row is rotten (RAID6 decodes any two erasures).
+                    Profile::Raid6 => 2 + c.data_cols(),
+                    p => p.copies() + p.parity(),
+                })
                 .unwrap_or(0)
         })
     }
@@ -820,7 +1042,32 @@ impl Volume {
     }
 
     /// Read `buf` at `offset` from copy `k` of every block (no fallback).
+    /// In a parity chunk, copy 0 is the block as stored, copy 1 the block
+    /// rebuilt from the rest of its row and P, copy 2 (RAID6) rebuilt
+    /// without P either, and copies 3.. (RAID6) rebuilt as if one other
+    /// data block of the row were lost too (the first, second... other
+    /// one): with checksums above to tell which guess is right, that
+    /// rebuilds a rotten block next to a missing or rotten one.
     pub fn read_copy(&self, offset: u64, buf: &mut [u8], k: usize) -> Result<()> {
+        for (at, len, par) in self.segments(offset, buf.len()) {
+            let dst = &mut buf[at..at + len];
+            let pos = offset + at as u64;
+            match par {
+                Some((g, c)) => {
+                    let mode = if k == 0 {
+                        ReadMode::Direct
+                    } else {
+                        ReadMode::Rebuild(k)
+                    };
+                    self.parity_read_bytes(&c, pos - g * GROUP_BLOCKS * BS, dst, mode)?
+                }
+                None => self.plain_read_copy(pos, dst, k)?,
+            }
+        }
+        Ok(())
+    }
+
+    fn plain_read_copy(&self, offset: u64, buf: &mut [u8], k: usize) -> Result<()> {
         for p in self.pieces(offset, buf.len())? {
             let dst = &mut buf[p.at..p.at + p.len];
             if p.superblock {
@@ -833,8 +1080,28 @@ impl Volume {
         Ok(())
     }
 
-    /// Write `buf` at `offset` to copy `k` only (repairs).
+    /// Write `buf` at `offset` to copy `k` only (repairs). In a parity
+    /// chunk, copy 0 writes the data blocks as given and copy 1 (2)
+    /// rewrites P (Q) of their rows to match them.
     pub fn write_copy(&self, offset: u64, buf: &[u8], k: usize) -> Result<()> {
+        for (at, len, par) in self.segments(offset, buf.len()) {
+            let src = &buf[at..at + len];
+            let pos = offset + at as u64;
+            match par {
+                Some((g, c)) => {
+                    let rel = pos - g * GROUP_BLOCKS * BS;
+                    if !rel.is_multiple_of(BS) || !(len as u64).is_multiple_of(BS) {
+                        return Err(Error::Invalid);
+                    }
+                    self.parity_write_copy(&c, rel / BS, src, k)?
+                }
+                None => self.plain_write_copy(pos, src, k)?,
+            }
+        }
+        Ok(())
+    }
+
+    fn plain_write_copy(&self, offset: u64, buf: &[u8], k: usize) -> Result<()> {
         for p in self.pieces(offset, buf.len())? {
             if p.superblock {
                 continue;
@@ -850,6 +1117,9 @@ impl Volume {
     /// Copy blocks `start..start+n` of a group from its layout `from` to
     /// its layout `to`, as they read from the first copy that answers.
     pub fn copy_between(&self, from: &Chunk, to: &Chunk, start: u64, n: u64) -> Result<()> {
+        if from.profile.parity() > 0 || to.profile.parity() > 0 {
+            return self.copy_layouts(from, to, start, n);
+        }
         let mut off = start;
         let mut buf = Vec::new();
         while off < start + n {
@@ -895,6 +1165,9 @@ impl Volume {
     /// `start..start+n`, from a copy on a device that is not stale.
     /// Copies with no up-to-date twin are left as they are.
     pub fn resync(&self, c: &Chunk, start: u64, n: u64) -> Result<()> {
+        if c.profile.parity() > 0 {
+            return self.parity_resync(c, start, n);
+        }
         let stale = self.stale();
         let mut off = start;
         let mut buf = Vec::new();
@@ -930,6 +1203,46 @@ impl Volume {
 
 impl BlockDevice for Volume {
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<()> {
+        for (at, len, par) in self.segments(offset, buf.len()) {
+            let dst = &mut buf[at..at + len];
+            let pos = offset + at as u64;
+            match par {
+                Some((g, c)) => {
+                    self.parity_read_bytes(&c, pos - g * GROUP_BLOCKS * BS, dst, ReadMode::Normal)?
+                }
+                None => self.plain_read(pos, dst)?,
+            }
+        }
+        Ok(())
+    }
+
+    fn write_at(&self, offset: u64, buf: &[u8]) -> Result<()> {
+        for (at, len, par) in self.segments(offset, buf.len()) {
+            let src = &buf[at..at + len];
+            let pos = offset + at as u64;
+            match par {
+                Some((g, c)) => self.parity_write_bytes(&c, pos - g * GROUP_BLOCKS * BS, src)?,
+                None => self.plain_write(pos, src)?,
+            }
+        }
+        Ok(())
+    }
+
+    fn sync(&self) -> Result<()> {
+        let devs: Vec<Arc<dyn BlockDevice>> = self.devs.with(|d| d.values().cloned().collect());
+        for d in devs {
+            d.sync()?;
+        }
+        Ok(())
+    }
+
+    fn size(&self) -> u64 {
+        self.map.with(|m| m.end()) * BS
+    }
+}
+
+impl Volume {
+    fn plain_read(&self, offset: u64, buf: &mut [u8]) -> Result<()> {
         for p in self.pieces(offset, buf.len())? {
             let dst = &mut buf[p.at..p.at + p.len];
             if p.superblock {
@@ -952,7 +1265,7 @@ impl BlockDevice for Volume {
         Ok(())
     }
 
-    fn write_at(&self, offset: u64, buf: &[u8]) -> Result<()> {
+    fn plain_write(&self, offset: u64, buf: &[u8]) -> Result<()> {
         for p in self.pieces(offset, buf.len())? {
             let src = &buf[p.at..p.at + p.len];
             if p.superblock {
@@ -982,17 +1295,444 @@ impl BlockDevice for Volume {
         }
         Ok(())
     }
+}
 
-    fn sync(&self) -> Result<()> {
-        let devs: Vec<Arc<dyn BlockDevice>> = self.devs.with(|d| d.values().cloned().collect());
-        for d in devs {
-            d.sync()?;
+/// Rows of a parity chunk one step of an I/O handles (bounds its buffers).
+const ROW_BATCH: u64 = 64;
+
+/// How a parity read gets its blocks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReadMode {
+    /// As stored, rebuilt from parity where a device is missing or fails.
+    Normal,
+    /// As stored, or fail.
+    Direct,
+    /// Rebuilt from the rest of the row: with P (1), or with Q alone (2).
+    Rebuild(usize),
+}
+
+/// One row of a parity chunk: its columns (data, P, Q) and which of them
+/// could not be read.
+struct Row {
+    cols: Vec<Vec<u8>>,
+    lost: Vec<usize>,
+}
+
+/// Parts of an I/O: `(at, len, group and chunk)`, `None` outside parity
+/// chunks.
+type Segment = (usize, usize, Option<(u64, Chunk)>);
+
+impl Volume {
+    /// Parts of `offset..offset+len` (bytes), split where chunks change
+    /// between parity and not.
+    fn segments(&self, offset: u64, len: usize) -> Vec<Segment> {
+        let gbytes = GROUP_BLOCKS * BS;
+        let any = self
+            .map
+            .with(|m| m.chunks.values().any(|c| c.profile.parity() > 0));
+        if !any {
+            return vec![(0, len, None)];
+        }
+        let mut out: Vec<Segment> = Vec::new();
+        let mut at = 0usize;
+        while at < len {
+            let pos = offset + at as u64;
+            let g = pos / gbytes;
+            let n = ((gbytes - pos % gbytes) as usize).min(len - at);
+            let par = self
+                .map
+                .with(|m| m.chunks.get(&g).filter(|c| c.profile.parity() > 0).cloned());
+            match (out.last_mut(), par) {
+                (Some((_, l, None)), None) => *l += n,
+                (_, p) => out.push((at, n, p.map(|c| (g, c)))),
+            }
+            at += n;
+        }
+        out
+    }
+
+    /// Stripes of `c` not to read: missing devices, and stale ones while
+    /// parity can stand in for them.
+    fn parity_bad(&self, c: &Chunk) -> Vec<bool> {
+        let stale = self.stale();
+        let missing: Vec<bool> = c
+            .stripes
+            .iter()
+            .map(|s| self.device(s.devid).is_none())
+            .collect();
+        let with_stale: Vec<bool> = c
+            .stripes
+            .iter()
+            .zip(&missing)
+            .map(|(s, &m)| m || stale.contains(&s.devid))
+            .collect();
+        if with_stale.iter().filter(|&&b| b).count() <= c.profile.parity() {
+            with_stale
+        } else {
+            missing
+        }
+    }
+
+    /// Rows `r0..r0+rows` of stripe `s` (`None` if its device is bad or
+    /// the read fails).
+    fn stripe_rows(
+        &self,
+        c: &Chunk,
+        bad: &[bool],
+        s: usize,
+        r0: u64,
+        rows: u64,
+    ) -> Option<Vec<u8>> {
+        if bad[s] {
+            return None;
+        }
+        let st = c.stripes[s];
+        let d = self.device(st.devid)?;
+        let mut buf = vec![0u8; (rows * BS) as usize];
+        d.read_at((st.phys + r0) * BS, &mut buf).ok()?;
+        Some(buf)
+    }
+
+    /// Every column of row `r`, as read (lost ones zeroed).
+    fn read_row(&self, c: &Chunk, bad: &[bool], r: u64) -> Row {
+        let n = c.stripes.len();
+        let mut row = Row {
+            cols: Vec::with_capacity(n),
+            lost: Vec::new(),
+        };
+        for col in 0..n {
+            match self.stripe_rows(c, bad, c.col_stripe(r, col), r, 1) {
+                Some(b) => row.cols.push(b),
+                None => {
+                    row.cols.push(vec![0u8; BS as usize]);
+                    row.lost.push(col);
+                }
+            }
+        }
+        row
+    }
+
+    /// Bytes at chunk-relative `off` of parity chunk `c`.
+    fn parity_read_bytes(&self, c: &Chunk, off: u64, dst: &mut [u8], mode: ReadMode) -> Result<()> {
+        if off.is_multiple_of(BS) && (dst.len() as u64).is_multiple_of(BS) {
+            return self.parity_read(c, off / BS, dst, mode);
+        }
+        let first = off / BS;
+        let end = (off + dst.len() as u64).div_ceil(BS);
+        let mut tmp = vec![0u8; ((end - first) * BS) as usize];
+        self.parity_read(c, first, &mut tmp, mode)?;
+        let skip = (off - first * BS) as usize;
+        dst.copy_from_slice(&tmp[skip..skip + dst.len()]);
+        Ok(())
+    }
+
+    /// Whole blocks from block `b0` of parity chunk `c` into `dst`.
+    fn parity_read(&self, c: &Chunk, b0: u64, dst: &mut [u8], mode: ReadMode) -> Result<()> {
+        let k = c.data_cols() as u64;
+        let n = c.stripes.len();
+        let bs = BS as usize;
+        let end = b0 + dst.len() as u64 / BS;
+        if end > c.blocks {
+            return Err(Error::Corrupt("block in no chunk"));
+        }
+        let bad = self.parity_bad(c);
+        let mut b = b0;
+        while b < end {
+            let r0 = b / k;
+            let r1 = ((end - 1) / k).min(r0 + ROW_BATCH - 1);
+            let rows = r1 - r0 + 1;
+            let stop = ((r1 + 1) * k).min(end);
+            let mut bufs: Vec<Option<Option<Vec<u8>>>> = vec![None; n];
+            let mut direct = matches!(mode, ReadMode::Normal | ReadMode::Direct);
+            if direct {
+                for x in b..stop {
+                    let s = c.col_stripe(x / k, (x % k) as usize);
+                    if bufs[s].is_none() {
+                        bufs[s] = Some(self.stripe_rows(c, &bad, s, r0, rows));
+                    }
+                    let Some(Some(sb)) = &bufs[s] else {
+                        direct = false;
+                        break;
+                    };
+                    let i = (x / k - r0) as usize;
+                    let o = ((x - b0) as usize) * bs;
+                    dst[o..o + bs].copy_from_slice(&sb[i * bs..(i + 1) * bs]);
+                }
+                if !direct && mode == ReadMode::Direct {
+                    return Err(Error::Io);
+                }
+            }
+            if !direct {
+                for (s, slot) in bufs.iter_mut().enumerate() {
+                    if slot.is_none() {
+                        *slot = Some(self.stripe_rows(c, &bad, s, r0, rows));
+                    }
+                }
+                for x in b..stop {
+                    let r = x / k;
+                    let i = (r - r0) as usize;
+                    let col = (x % k) as usize;
+                    let mut row = Row {
+                        cols: Vec::with_capacity(n),
+                        lost: Vec::new(),
+                    };
+                    for cc in 0..n {
+                        match &bufs[c.col_stripe(r, cc)] {
+                            Some(Some(sb)) => row.cols.push(sb[i * bs..(i + 1) * bs].to_vec()),
+                            _ => {
+                                row.cols.push(vec![0u8; bs]);
+                                row.lost.push(cc);
+                            }
+                        }
+                    }
+                    let mut miss = row.lost.clone();
+                    if let ReadMode::Rebuild(m) = mode {
+                        miss.push(col);
+                        if m >= 2 && c.profile.parity() < 2 {
+                            return Err(Error::Invalid);
+                        }
+                        if m == 2 {
+                            miss.push(k as usize);
+                        } else if m >= 3 {
+                            let other = (0..k as usize)
+                                .filter(|&o| o != col)
+                                .nth(m - 3)
+                                .ok_or(Error::Invalid)?;
+                            miss.push(other);
+                        }
+                        miss.sort_unstable();
+                        miss.dedup();
+                    }
+                    if miss.contains(&col) {
+                        crate::raid56::recover(&mut row.cols, k as usize, &miss)?;
+                    }
+                    let o = ((x - b0) as usize) * bs;
+                    dst[o..o + bs].copy_from_slice(&row.cols[col]);
+                }
+            }
+            b = stop;
         }
         Ok(())
     }
 
-    fn size(&self) -> u64 {
-        self.map.with(|m| m.end()) * BS
+    /// Bytes at chunk-relative `off` of parity chunk `c`; a partial block
+    /// is merged with what it holds.
+    fn parity_write_bytes(&self, c: &Chunk, off: u64, src: &[u8]) -> Result<()> {
+        if off.is_multiple_of(BS) && (src.len() as u64).is_multiple_of(BS) {
+            return self.parity_write(c, off / BS, src);
+        }
+        let first = off / BS;
+        let end = (off + src.len() as u64).div_ceil(BS);
+        let mut tmp = vec![0u8; ((end - first) * BS) as usize];
+        self.parity_read(c, first, &mut tmp, ReadMode::Normal)?;
+        let skip = (off - first * BS) as usize;
+        tmp[skip..skip + src.len()].copy_from_slice(src);
+        self.parity_write(c, first, &tmp)
+    }
+
+    /// Recompute P (and Q) of `row` from its data columns.
+    fn regen(row: &mut Row, k: usize, parity: usize) {
+        let (data, par) = row.cols.split_at_mut(k);
+        let d: Vec<&[u8]> = data.iter().map(|b| &b[..]).collect();
+        let (p, q) = par.split_at_mut(1);
+        crate::raid56::gen(
+            &d,
+            &mut p[0],
+            q.first_mut().map(|q| &mut q[..]).filter(|_| parity == 2),
+        );
+    }
+
+    /// Whole blocks from block `b0` of parity chunk `c`, with their rows'
+    /// parity. Rows only partly written take the rest from the disk
+    /// (rebuilt from the old parity where a device is missing).
+    fn parity_write(&self, c: &Chunk, b0: u64, src: &[u8]) -> Result<()> {
+        let k = c.data_cols() as u64;
+        let n = c.stripes.len();
+        let parity = c.profile.parity();
+        let bs = BS as usize;
+        let end = b0 + src.len() as u64 / BS;
+        if end > c.blocks {
+            return Err(Error::Corrupt("block in no chunk"));
+        }
+        let bad = self.parity_bad(c);
+        let mut b = b0;
+        while b < end {
+            let r0 = b / k;
+            let r1 = ((end - 1) / k).min(r0 + ROW_BATCH - 1);
+            let rows = r1 - r0 + 1;
+            let stop = ((r1 + 1) * k).min(end);
+            let mut out: Vec<Vec<u8>> = vec![vec![0u8; rows as usize * bs]; n];
+            for r in r0..=r1 {
+                let (first, last) = (r * k, r * k + k);
+                let (lo, hi) = (first.max(b), last.min(stop));
+                let mut row = if lo == first && hi == last {
+                    Row {
+                        cols: vec![vec![0u8; bs]; n],
+                        lost: Vec::new(),
+                    }
+                } else {
+                    let mut row = self.read_row(c, &bad, r);
+                    let kept_lost = row
+                        .lost
+                        .iter()
+                        .any(|&col| col < k as usize && !(lo..hi).contains(&(first + col as u64)));
+                    if kept_lost {
+                        crate::raid56::recover(&mut row.cols, k as usize, &row.lost)?;
+                    }
+                    row
+                };
+                for x in lo..hi {
+                    let o = ((x - b0) as usize) * bs;
+                    row.cols[(x - first) as usize].copy_from_slice(&src[o..o + bs]);
+                }
+                Self::regen(&mut row, k as usize, parity);
+                let i = (r - r0) as usize;
+                for (col, data) in row.cols.iter().enumerate() {
+                    out[c.col_stripe(r, col)][i * bs..(i + 1) * bs].copy_from_slice(data);
+                }
+            }
+            let mut wrote = 0;
+            for (s, buf) in out.iter().enumerate() {
+                let st = c.stripes[s];
+                if let Some(d) = self.device(st.devid) {
+                    d.write_at((st.phys + r0) * BS, buf)?;
+                    wrote += 1;
+                }
+            }
+            if wrote + parity < n {
+                return Err(Error::Io);
+            }
+            b = stop;
+        }
+        Ok(())
+    }
+
+    /// Repair writes (see [`write_copy`](Self::write_copy)).
+    fn parity_write_copy(&self, c: &Chunk, b0: u64, src: &[u8], which: usize) -> Result<()> {
+        let k = c.data_cols() as u64;
+        let parity = c.profile.parity();
+        if which > parity {
+            // A guess (RAID6 copies 3..) has no place of its own.
+            return Err(Error::Unsupported("rebuilt copy"));
+        }
+        let bad = self.parity_bad(c);
+        for (i, img) in src.chunks(BS as usize).enumerate() {
+            let x = b0 + i as u64;
+            let (r, col) = (x / k, (x % k) as usize);
+            let (target, data) = if which == 0 {
+                (col, img.to_vec())
+            } else {
+                let target = k as usize + which - 1;
+                let mut row = self.read_row(c, &bad, r);
+                let mut miss = row.lost.clone();
+                miss.retain(|&m| m != col && m != target);
+                if !miss.is_empty() {
+                    miss.push(col);
+                    crate::raid56::recover(&mut row.cols, k as usize, &miss)?;
+                }
+                row.cols[col].copy_from_slice(img);
+                Self::regen(&mut row, k as usize, parity);
+                (target, row.cols.swap_remove(target))
+            };
+            let st = c.stripes[c.col_stripe(r, target)];
+            self.device(st.devid)
+                .ok_or(Error::Io)?
+                .write_at((st.phys + r) * BS, &data)?;
+        }
+        Ok(())
+    }
+
+    /// Blocks `start..start+n` of a group from layout `from` to layout
+    /// `to` when either keeps parity.
+    fn copy_layouts(&self, from: &Chunk, to: &Chunk, start: u64, n: u64) -> Result<()> {
+        let mut off = start;
+        let mut buf = Vec::new();
+        while off < start + n {
+            let run = (start + n - off).min(256);
+            buf.resize((run * BS) as usize, 0);
+            self.layout_read(from, off, &mut buf)?;
+            self.layout_write(to, off, &buf)?;
+            off += run;
+        }
+        Ok(())
+    }
+
+    /// Blocks from `off` of a chunk laid out as `c` (which need not be
+    /// the map's).
+    fn layout_read(&self, c: &Chunk, off: u64, buf: &mut [u8]) -> Result<()> {
+        if c.profile.parity() > 0 {
+            return self.parity_read(c, off, buf, ReadMode::Normal);
+        }
+        let stale = self.stale();
+        let mut done = 0u64;
+        let n = buf.len() as u64 / BS;
+        while done < n {
+            let (mut src, run) = c.locate(off + done);
+            let run = run.min(n - done);
+            src.sort_by_key(|s| stale.contains(&s.devid));
+            let dst = &mut buf[(done * BS) as usize..((done + run) * BS) as usize];
+            let ok = src.iter().any(|s| {
+                self.device(s.devid)
+                    .is_some_and(|d| d.read_at(s.phys * BS, dst).is_ok())
+            });
+            if !ok {
+                return Err(Error::Io);
+            }
+            done += run;
+        }
+        Ok(())
+    }
+
+    fn layout_write(&self, c: &Chunk, off: u64, buf: &[u8]) -> Result<()> {
+        if c.profile.parity() > 0 {
+            return self.parity_write(c, off, buf);
+        }
+        let mut done = 0u64;
+        let n = buf.len() as u64 / BS;
+        while done < n {
+            let (dst, run) = c.locate(off + done);
+            let run = run.min(n - done);
+            let src = &buf[(done * BS) as usize..((done + run) * BS) as usize];
+            for s in dst {
+                self.device(s.devid)
+                    .ok_or(Error::Io)?
+                    .write_at(s.phys * BS, src)?;
+            }
+            done += run;
+        }
+        Ok(())
+    }
+
+    /// Rebuild what stale devices hold of rows covering `start..start+n`
+    /// from the other devices.
+    fn parity_resync(&self, c: &Chunk, start: u64, n: u64) -> Result<()> {
+        if n == 0 {
+            return Ok(());
+        }
+        let stale = self.stale();
+        let k = c.data_cols() as u64;
+        let old: Vec<bool> = c
+            .stripes
+            .iter()
+            .map(|s| stale.contains(&s.devid) || self.device(s.devid).is_none())
+            .collect();
+        if !old.iter().any(|&o| o) {
+            return Ok(());
+        }
+        for r in start / k..=(start + n - 1) / k {
+            let mut row = self.read_row(c, &old, r);
+            if row.lost.len() > c.profile.parity() {
+                continue;
+            }
+            crate::raid56::recover(&mut row.cols, k as usize, &row.lost)?;
+            for &col in &row.lost {
+                let st = c.stripes[c.col_stripe(r, col)];
+                if let Some(d) = self.device(st.devid) {
+                    d.write_at((st.phys + r) * BS, &row.cols[col])?;
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1004,6 +1744,7 @@ mod tests {
         ChunkMap {
             devices: devs.iter().copied().collect(),
             chunks: BTreeMap::new(),
+            tiers: BTreeMap::new(),
         }
     }
 
@@ -1107,7 +1848,7 @@ mod tests {
         let c = o.chunks.values().next().unwrap().clone();
         o.chunks.insert(100, c);
         assert!(o.check().is_err());
-        assert_eq!(m.end(), 15 * GROUP_BLOCKS + 2000);
+        assert_eq!(m.end(), 24 * GROUP_BLOCKS + 2000);
         assert_eq!(m.free_group(), 1);
     }
 
@@ -1124,5 +1865,379 @@ mod tests {
         assert_eq!(Chunk::decode_sys(&b).unwrap(), c);
         b[2] = 5;
         assert!(Chunk::decode_sys(&b).is_err());
+    }
+
+    /// An in-memory device.
+    struct Mem(Spin<Vec<u8>>);
+
+    impl Mem {
+        fn new(blocks: u64) -> Arc<Self> {
+            Arc::new(Mem(Spin::new(vec![0u8; (blocks * BS) as usize])))
+        }
+        fn poke(&self, at: u64, v: u8) {
+            self.0.with(|d| d[at as usize] ^= v);
+        }
+    }
+
+    impl BlockDevice for Mem {
+        fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<()> {
+            self.0.with(|d| {
+                let o = offset as usize;
+                let src = d.get(o..o + buf.len()).ok_or(Error::Io)?;
+                buf.copy_from_slice(src);
+                Ok(())
+            })
+        }
+        fn write_at(&self, offset: u64, buf: &[u8]) -> Result<()> {
+            self.0.with(|d| {
+                let o = offset as usize;
+                d.get_mut(o..o + buf.len())
+                    .ok_or(Error::Io)?
+                    .copy_from_slice(buf);
+                Ok(())
+            })
+        }
+        fn sync(&self) -> Result<()> {
+            Ok(())
+        }
+        fn size(&self) -> u64 {
+            self.0.with(|d| d.len() as u64)
+        }
+    }
+
+    fn noop_sb(b: &[u8], _: u32) -> Vec<u8> {
+        b.to_vec()
+    }
+
+    /// A volume of `n` devices with group 1 a `p` chunk of `blocks`.
+    fn parity_volume(n: u32, p: Profile, blocks: u64) -> (Volume, Vec<Arc<Mem>>, Chunk) {
+        let size = 20_000;
+        let mut m = map(&(1..=n).map(|d| (d, size)).collect::<Vec<_>>());
+        m.chunks.insert(
+            0,
+            Chunk {
+                kind: ChunkKind::Metadata,
+                profile: Profile::Single,
+                blocks: 64,
+                stripes: vec![Stripe {
+                    devid: 1,
+                    phys: DEV_RESERVED,
+                }],
+            },
+        );
+        let held = [(1, DEV_RESERVED, 64)];
+        let (got, stripes) = m.place(p, blocks, &[], &held).unwrap();
+        assert_eq!(got, blocks);
+        let c = Chunk {
+            kind: ChunkKind::Data,
+            profile: p,
+            blocks,
+            stripes,
+        };
+        m.chunks.insert(1, c.clone());
+        m.check().unwrap();
+        let mems: Vec<Arc<Mem>> = (0..n).map(|_| Mem::new(size)).collect();
+        let devs = mems
+            .iter()
+            .enumerate()
+            .map(|(i, d)| (i as u32 + 1, d.clone() as Arc<dyn BlockDevice>))
+            .collect();
+        (Volume::new(devs, m, noop_sb), mems, c)
+    }
+
+    fn pattern(len: usize, seed: u32) -> Vec<u8> {
+        let mut x = seed.wrapping_mul(2654435761) | 1;
+        (0..len)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 17;
+                x ^= x << 5;
+                x as u8
+            })
+            .collect()
+    }
+
+    const G1: u64 = GROUP_BLOCKS * BS;
+
+    /// Every row's parity matches its data, as stored.
+    fn parity_consistent(v: &Volume, c: &Chunk) {
+        let k = c.data_cols();
+        let bad = vec![false; c.stripes.len()];
+        for r in 0..c.stripe_len() {
+            let row = v.read_row(c, &bad, r);
+            let mut p = vec![0u8; BS as usize];
+            let mut q = vec![0u8; BS as usize];
+            let d: Vec<&[u8]> = row.cols[..k].iter().map(|b| &b[..]).collect();
+            crate::raid56::gen(&d, &mut p, (c.profile.parity() == 2).then_some(&mut q[..]));
+            assert_eq!(row.cols[k], p, "P of row {}", r);
+            if c.profile.parity() == 2 {
+                assert_eq!(row.cols[k + 1], q, "Q of row {}", r);
+            }
+        }
+    }
+
+    #[test]
+    fn parity_chunks_place_and_locate() {
+        for (n, p) in [
+            (2, Profile::Raid5),
+            (4, Profile::Raid5),
+            (3, Profile::Raid6),
+            (5, Profile::Raid6),
+        ] {
+            let (_, _, c) = parity_volume(n, p, 1000);
+            assert_eq!(c.stripes.len(), n as usize);
+            assert_eq!(c.data_cols(), n as usize - p.parity());
+            assert_eq!(c.stripe_len(), 1000u64.div_ceil(c.data_cols() as u64));
+            // Every data block lands once, never on a parity column.
+            let mut seen = alloc::collections::BTreeSet::new();
+            for off in 0..c.blocks {
+                let (copies, run) = c.locate(off);
+                assert_eq!((copies.len(), run), (1, 1));
+                assert!(seen.insert((copies[0].devid, copies[0].phys)));
+            }
+            // Parity rotates over every device.
+            let k = c.data_cols();
+            let holders: alloc::collections::BTreeSet<usize> =
+                (0..n as u64).map(|r| c.col_stripe(r, k)).collect();
+            assert_eq!(holders.len(), n as usize);
+        }
+    }
+
+    #[test]
+    fn parity_writes_read_back_and_keep_rows_consistent() {
+        for (n, p) in [
+            (2, Profile::Raid5),
+            (3, Profile::Raid5),
+            (4, Profile::Raid6),
+            (6, Profile::Raid6),
+        ] {
+            let (v, _, c) = parity_volume(n, p, 700);
+            let mut model = pattern((700 * BS) as usize, n);
+            v.write_at(G1, &model).unwrap();
+            let mut back = vec![0u8; model.len()];
+            v.read_at(G1, &mut back).unwrap();
+            assert!(back == model, "{:?} on {}", p, n);
+            parity_consistent(&v, &c);
+            // Partial rows, unaligned bytes, single blocks.
+            for (i, (at, len)) in [
+                (5 * BS, BS),
+                (17 * BS + 100, 3 * BS),
+                (BS - 1, 2),
+                (99 * BS, 77 * BS),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let data = pattern(len as usize, 1000 + i as u32);
+                v.write_at(G1 + at, &data).unwrap();
+                model[at as usize..(at + len) as usize].copy_from_slice(&data);
+                let mut b = vec![0u8; len as usize];
+                v.read_at(G1 + at, &mut b).unwrap();
+                assert_eq!(b, data);
+            }
+            v.read_at(G1, &mut back).unwrap();
+            assert!(back == model);
+            parity_consistent(&v, &c);
+        }
+    }
+
+    #[test]
+    fn parity_survives_missing_devices() {
+        for (n, p) in [
+            (3, Profile::Raid5),
+            (4, Profile::Raid6),
+            (5, Profile::Raid6),
+        ] {
+            let (v, _, _) = parity_volume(n, p, 900);
+            let model = pattern((900 * BS) as usize, 7 + n);
+            v.write_at(G1, &model).unwrap();
+            let gone: Vec<u32> = (1..=p.parity() as u32).collect();
+            for &d in &gone {
+                v.detach(d);
+            }
+            let mut back = vec![0u8; model.len()];
+            v.read_at(G1, &mut back).unwrap();
+            assert!(back == model, "{:?} without {:?}", p, gone);
+            // Degraded writes still land (in parity) and read back.
+            let mut model = model;
+            let data = pattern(10 * BS as usize, 99);
+            v.write_at(G1 + 33 * BS, &data).unwrap();
+            model[(33 * BS) as usize..(43 * BS) as usize].copy_from_slice(&data);
+            v.read_at(G1, &mut back).unwrap();
+            assert!(back == model);
+            // One more missing device is too many.
+            v.detach(p.parity() as u32 + 1);
+            assert!(v.read_at(G1, &mut back).is_err());
+        }
+    }
+
+    #[test]
+    fn parity_copies_rebuild_and_repair() {
+        for (n, p) in [(4, Profile::Raid5), (5, Profile::Raid6)] {
+            let (v, mems, c) = parity_volume(n, p, 400);
+            let model = pattern((400 * BS) as usize, 3);
+            v.write_at(G1, &model).unwrap();
+            let blk = 41u64;
+            let want = &model[(blk * BS) as usize..((blk + 1) * BS) as usize];
+            let ways = if p == Profile::Raid6 {
+                2 + c.data_cols()
+            } else {
+                2
+            };
+            assert_eq!(v.copies(GROUP_BLOCKS + blk), ways);
+            // Rot the block where it is stored.
+            let (at, _) = c.locate(blk);
+            mems[at[0].devid as usize - 1].poke(at[0].phys * BS + 9, 0x40);
+            let mut img = vec![0u8; BS as usize];
+            v.read_copy(G1 + blk * BS, &mut img, 0).unwrap();
+            assert_ne!(img, want);
+            for k in 1..=p.parity() {
+                v.read_copy(G1 + blk * BS, &mut img, k).unwrap();
+                assert_eq!(img, want, "{:?} copy {}", p, k);
+            }
+            v.write_copy(G1 + blk * BS, want, 0).unwrap();
+            v.read_copy(G1 + blk * BS, &mut img, 0).unwrap();
+            assert_eq!(img, want);
+            parity_consistent(&v, &c);
+            // Rot P instead: copy 1 is wrong, the data and Q are fine.
+            let r = blk / c.data_cols() as u64;
+            let ps = c.stripes[c.col_stripe(r, c.data_cols())];
+            mems[ps.devid as usize - 1].poke((ps.phys + r) * BS + 3, 0x08);
+            v.read_copy(G1 + blk * BS, &mut img, 1).unwrap();
+            assert_ne!(img, want);
+            if p == Profile::Raid6 {
+                v.read_copy(G1 + blk * BS, &mut img, 2).unwrap();
+                assert_eq!(img, want);
+            }
+            v.write_copy(G1 + blk * BS, want, 1).unwrap();
+            v.read_copy(G1 + blk * BS, &mut img, 1).unwrap();
+            assert_eq!(img, want);
+            parity_consistent(&v, &c);
+            if p == Profile::Raid6 {
+                // Rot the block and a neighbour in its row: P alone cannot
+                // help, but one of the guesses can.
+                let k = c.data_cols() as u64;
+                let other = r * k + (blk + 1) % k;
+                for b in [blk, other] {
+                    let (at, _) = c.locate(b);
+                    mems[at[0].devid as usize - 1].poke(at[0].phys * BS + 1, 0x11);
+                }
+                let mut hits = 0;
+                for g in 1..ways {
+                    if v.read_copy(G1 + blk * BS, &mut img, g).is_ok() && img == want {
+                        hits += 1;
+                    }
+                }
+                assert_eq!(hits, 1);
+                assert!(v.write_copy(G1 + blk * BS, want, 3).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn layouts_convert_to_and_from_parity() {
+        let (v, _, c5) = parity_volume(4, Profile::Raid5, 300);
+        let model = pattern((300 * BS) as usize, 11);
+        v.write_at(G1, &model).unwrap();
+        let map = v.map();
+        let held: Vec<PhysRange> = c5
+            .stripes
+            .iter()
+            .map(|s| (s.devid, s.phys, c5.stripe_len()))
+            .chain([(1, DEV_RESERVED, 64)])
+            .collect();
+        let s6 = map.place_exact(Profile::Raid6, 300, &[], &held).unwrap();
+        let c6 = Chunk {
+            kind: ChunkKind::Data,
+            profile: Profile::Raid6,
+            blocks: 300,
+            stripes: s6,
+        };
+        v.copy_between(&c5, &c6, 0, 300).unwrap();
+        v.with_map(|m| m.chunks.insert(1, c6.clone()));
+        let mut back = vec![0u8; model.len()];
+        v.read_at(G1, &mut back).unwrap();
+        assert!(back == model);
+        parity_consistent(&v, &c6);
+        // And to RAID1.
+        let mut held2 = held.clone();
+        held2.extend(
+            c6.stripes
+                .iter()
+                .map(|s| (s.devid, s.phys, c6.stripe_len())),
+        );
+        let s1 = map.place_exact(Profile::Raid1, 300, &[], &held2).unwrap();
+        let c1 = Chunk {
+            kind: ChunkKind::Data,
+            profile: Profile::Raid1,
+            blocks: 300,
+            stripes: s1,
+        };
+        v.copy_between(&c6, &c1, 0, 300).unwrap();
+        v.with_map(|m| m.chunks.insert(1, c1));
+        v.read_at(G1, &mut back).unwrap();
+        assert!(back == model);
+    }
+
+    #[test]
+    fn stale_devices_resync_their_parity_columns() {
+        let (v, mems, c) = parity_volume(4, Profile::Raid6, 200);
+        let model = pattern((200 * BS) as usize, 5);
+        v.write_at(G1, &model).unwrap();
+        // Device 2 "missed" the writes: wipe what it holds.
+        let st = c.stripes.iter().find(|s| s.devid == 2).unwrap();
+        mems[1]
+            .write_at(st.phys * BS, &vec![0u8; (c.stripe_len() * BS) as usize])
+            .unwrap();
+        v.set_stale(vec![2]);
+        let mut back = vec![0u8; model.len()];
+        v.read_at(G1, &mut back).unwrap();
+        assert!(back == model, "stale device read as current");
+        v.resync(&c, 0, 200).unwrap();
+        v.set_stale(Vec::new());
+        parity_consistent(&v, &c);
+        v.read_at(G1, &mut back).unwrap();
+        assert!(back == model);
+    }
+
+    #[test]
+    fn tiers_round_trip_and_steer_placement() {
+        let mut m = map(&[(1, 50_000), (2, 50_000), (3, 50_000)]);
+        assert!(!m.tiered());
+        let v1 = m.encode();
+        assert_eq!(le32(&v1, 8), 1);
+        m.set_tier(1, Tier::Fast);
+        m.set_tier(2, Tier::Slow);
+        m.set_tier(3, Tier::Slow);
+        assert!(m.tiered());
+        let b = m.encode();
+        assert_eq!(le32(&b, 8), 2);
+        assert_eq!(ChunkMap::decode(&b).unwrap(), m);
+        for i in 0..b.len() {
+            let mut bad = b.clone();
+            bad[i] ^= 0x10;
+            assert!(ChunkMap::decode(&bad).is_err(), "byte {}", i);
+        }
+        let (_, s) = m
+            .place(Profile::Single, 1000, &m.off_tier(Tier::Fast), &[])
+            .unwrap();
+        assert_eq!(s[0].devid, 1);
+        let (_, s) = m
+            .place(Profile::Raid1, 1000, &m.off_tier(Tier::Slow), &[])
+            .unwrap();
+        let c = Chunk {
+            kind: ChunkKind::Data,
+            profile: Profile::Raid1,
+            blocks: 1000,
+            stripes: s,
+        };
+        assert_eq!(m.chunk_tier(&c), Tier::Slow);
+        // A tier of a device the map does not know is corrupt.
+        m.tiers.insert(9, Tier::Fast);
+        assert!(m.check().is_err());
+        m.set_tier(9, Tier::Any);
+        assert!(m.check().is_ok());
+        assert_eq!(Tier::from_name("ssd"), Some(Tier::Fast));
+        assert_eq!(Profile::from_name("raid6"), Some(Profile::Raid6));
     }
 }

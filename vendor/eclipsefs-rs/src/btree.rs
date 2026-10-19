@@ -32,6 +32,7 @@ use alloc::vec::Vec;
 use crate::crc::crc32c;
 use crate::device::BlockDevice;
 use crate::format::{le32, le64, put32, put64, BLOCK_SIZE};
+use crate::journal::Spin;
 use crate::volume::Volume;
 use crate::{Error, Result};
 
@@ -51,6 +52,9 @@ pub const MAX_ITEM: usize = LEAF_SPACE / 2 - LEAF_ITEM;
 pub const MAX_LEVEL: u8 = 8;
 /// Clean nodes kept decoded in memory.
 const CACHE_NODES: usize = 8192;
+
+/// Nodes the shared lookups ([`Store::get_shared`]) keep for themselves.
+const SHARED_NODES: usize = 512;
 
 /// Most nodes one [`Store::trim`] may drop.
 ///
@@ -347,6 +351,12 @@ pub struct Store {
     /// whether to write the good copy back over the bad ones.
     pub mirrors: Option<Arc<Volume>>,
     pub repair: bool,
+    /// Nodes read by the shared lookups, which take `&self` and so cannot
+    /// fill `cache`. Only committed nodes land here (a node of the open
+    /// transaction is dirty, and dirty nodes never leave `cache`), and each
+    /// is checked against the generation its parent points at before use:
+    /// a block freed and reused since holds a node of a later generation.
+    shared: Spin<BTreeMap<u64, Node>>,
 }
 
 impl Store {
@@ -368,6 +378,7 @@ impl Store {
             extent_of,
             mirrors: None,
             repair: false,
+            shared: Spin::new(BTreeMap::new()),
         }
     }
 
@@ -380,6 +391,16 @@ impl Store {
     /// it; on a volume, from another copy if this one is bad (repairing
     /// the bad ones if allowed).
     fn read_node(&self, bytenr: u64, level: u8, gen: Option<u64>) -> Result<Node> {
+        self.read_node_with(bytenr, level, gen, self.repair)
+    }
+
+    fn read_node_with(
+        &self,
+        bytenr: u64,
+        level: u8,
+        gen: Option<u64>,
+        repair: bool,
+    ) -> Result<Node> {
         let check = |buf: &[u8]| -> Result<Node> {
             let node = Node::decode(buf, bytenr, &self.fsid)?;
             if node.level != level || gen.is_some_and(|g| g != node.gen) {
@@ -417,7 +438,7 @@ impl Store {
             bad.len(),
             if bad.len() == 1 { "y" } else { "ies" }
         );
-        if self.repair {
+        if repair {
             for k in bad {
                 let _ = vol.write_copy(bytenr * BLOCK_SIZE, &img, k);
             }
@@ -486,6 +507,15 @@ impl Store {
         for b in clean {
             self.cache.remove(&b);
         }
+    }
+
+    /// Drop every cached node that is not waiting to be written, and the
+    /// shared side cache.
+    pub fn drop_clean(&mut self) {
+        let dirty = &self.dirty;
+        self.cache.retain(|b, _| dirty.contains(b));
+        self.trim_cursor = 0;
+        self.shared.with(|m| m.clear());
     }
 
     /// Create a tree with one empty leaf.
@@ -740,6 +770,163 @@ impl Store {
                 }
             }
         }
+    }
+
+    // -------------------------------------------------------------------
+    // Shared lookups: `&self`, for readers that run side by side
+    // -------------------------------------------------------------------
+
+    /// Run `f` on the node at `bytenr` without touching `cache`: from it if
+    /// it is there, else from the shared side cache or the device. Never
+    /// writes: a bad copy is read around, not repaired.
+    fn with_node_shared<R>(
+        &self,
+        bytenr: u64,
+        level: u8,
+        gen: Option<u64>,
+        f: impl FnOnce(&Node) -> Result<R>,
+    ) -> Result<R> {
+        let fits = |n: &Node| n.level == level && gen.is_none_or(|g| g == n.gen);
+        if let Some(n) = self.cache.get(&bytenr) {
+            if !fits(n) {
+                return Err(Error::Corrupt("tree node level or generation"));
+            }
+            return f(n);
+        }
+        if bytenr < 2 || bytenr >= self.total_blocks {
+            return Err(Error::Corrupt("tree pointer out of range"));
+        }
+        // A root has no parent to say its generation; it is read afresh.
+        if gen.is_some() {
+            let hit = self
+                .shared
+                .with(|m| m.get(&bytenr).filter(|n| fits(n)).cloned());
+            if let Some(n) = hit {
+                return f(&n);
+            }
+        }
+        let n = self.read_node_with(bytenr, level, gen, false)?;
+        let r = f(&n);
+        if gen.is_some() {
+            self.shared.with(|m| {
+                if m.len() >= SHARED_NODES {
+                    m.pop_first();
+                }
+                m.insert(bytenr, n);
+            });
+        }
+        r
+    }
+
+    /// [`get`](Self::get) through `&self`.
+    pub fn get_shared(&self, root: &Root, key: &Key) -> Result<Option<Vec<u8>>> {
+        Ok(self
+            .seek_le_shared(root, key)?
+            .filter(|(k, _)| k == key)
+            .map(|(_, d)| d))
+    }
+
+    /// [`seek_le`](Self::seek_le) through `&self`.
+    pub fn seek_le_shared(&self, root: &Root, key: &Key) -> Result<Option<(Key, Vec<u8>)>> {
+        enum Step {
+            Found(Option<(Key, Vec<u8>)>),
+            Down(u64, u64),
+        }
+        let mut b = root.bytenr;
+        let mut level = root.level;
+        let mut gen = None;
+        loop {
+            let step = self.with_node_shared(b, level, gen, |n| {
+                Ok(match &n.body {
+                    Body::Leaf(items) => {
+                        let i = items.partition_point(|(k, _)| k <= key);
+                        Step::Found((i > 0).then(|| items[i - 1].clone()))
+                    }
+                    Body::Internal(ptrs) => {
+                        let i = ptrs.partition_point(|p| p.key <= *key);
+                        if i == 0 {
+                            Step::Found(None)
+                        } else {
+                            Step::Down(ptrs[i - 1].bytenr, ptrs[i - 1].gen)
+                        }
+                    }
+                })
+            })?;
+            match step {
+                Step::Found(r) => return Ok(r),
+                Step::Down(nb, ng) => {
+                    if level == 0 {
+                        return Err(Error::Corrupt("tree node level or generation"));
+                    }
+                    b = nb;
+                    gen = Some(ng);
+                    level -= 1;
+                }
+            }
+        }
+    }
+
+    /// [`range`](Self::range) through `&self`.
+    pub fn range_shared(
+        &self,
+        root: &Root,
+        lo: &Key,
+        hi: &Key,
+        limit: usize,
+    ) -> Result<Vec<(Key, Vec<u8>)>> {
+        let mut out = Vec::new();
+        if lo <= hi && limit > 0 {
+            self.range_shared_rec(root.bytenr, root.level, None, lo, hi, limit, &mut out)?;
+        }
+        Ok(out)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn range_shared_rec(
+        &self,
+        b: u64,
+        level: u8,
+        gen: Option<u64>,
+        lo: &Key,
+        hi: &Key,
+        limit: usize,
+        out: &mut Vec<(Key, Vec<u8>)>,
+    ) -> Result<bool> {
+        let ptrs = self.with_node_shared(b, level, gen, |n| match &n.body {
+            Body::Leaf(items) => {
+                let start = items.partition_point(|(k, _)| k < lo);
+                for (k, d) in &items[start..] {
+                    if k > hi {
+                        return Ok(None);
+                    }
+                    out.push((*k, d.clone()));
+                    if out.len() >= limit {
+                        return Ok(None);
+                    }
+                }
+                Ok(Some(Vec::new()))
+            }
+            Body::Internal(ptrs) => {
+                let first = ptrs.partition_point(|p| p.key <= *lo).saturating_sub(1);
+                Ok(Some(ptrs[first..].to_vec()))
+            }
+        })?;
+        // `None`: done; an empty list: a leaf that ran out before `hi`.
+        let Some(ptrs) = ptrs else {
+            return Ok(true);
+        };
+        for p in ptrs {
+            if p.key > *hi {
+                return Ok(true);
+            }
+            if level == 0 {
+                return Err(Error::Corrupt("tree node level or generation"));
+            }
+            if self.range_shared_rec(p.bytenr, level - 1, Some(p.gen), lo, hi, limit, out)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// Whether any node on the way from `root` to the leaf holding `key`

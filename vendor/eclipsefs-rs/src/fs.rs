@@ -22,7 +22,7 @@ use crate::cow::{CowFs, SendStats};
 use crate::device::BlockDevice;
 use crate::format::{FileKind, BLOCK_SIZE, MAGIC};
 use crate::v3::EclipseFsV3;
-use crate::volume::{ChunkKind, Profile};
+use crate::volume::{ChunkKind, Profile, Tier};
 use crate::{Error, Result};
 
 /// Operations grouped into one transaction at most (unless `sync` or the
@@ -99,6 +99,8 @@ pub struct DeviceInfo {
     pub allocated_bytes: u64,
     /// False when mounted degraded without it.
     pub present: bool,
+    /// Fast or slow, for tiered placement.
+    pub tier: Tier,
 }
 
 /// One chunk of the logical space (see [`EclipseFS::chunks`]).
@@ -173,6 +175,65 @@ pub struct ScrubReport {
 impl ScrubReport {
     pub fn is_clean(&self) -> bool {
         self.bad_tree_nodes.is_empty() && self.bad_data_blocks.is_empty()
+    }
+}
+
+/// What [`EclipseFS::repair`] found and changed.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RepairReport {
+    /// The scrub repair starts with: bad copies rewritten from good ones,
+    /// and what has no good copy left.
+    pub scrub: ScrubReport,
+    /// Reference count ranges that were wrong (or missing, or extra).
+    pub refcounts_fixed: u64,
+    /// Blocks marked free while in use, or in use while nothing holds them.
+    pub bitmap_blocks_fixed: u64,
+    /// Items deleted: of inodes that do not exist, that do not decode, or
+    /// file extents that overlap, sit on metadata or belong to a special
+    /// file.
+    pub items_removed: u64,
+    /// Directory entries dropped (naming a missing inode, a second name of
+    /// a directory, a duplicate name).
+    pub entries_removed: u64,
+    /// `DIR_ITEM`, `INODE_REF` and `DIR_INDEX` items rewritten to agree.
+    pub entries_fixed: u64,
+    /// Inodes (and subvolume counters) whose link count, parent, size or
+    /// byte count was corrected.
+    pub inodes_fixed: u64,
+    /// Inodes linked into `lost+found` (no name left, or cut off by a
+    /// directory cycle).
+    pub lost_found: u64,
+    /// Data checksums dropped (no extent references the block) and
+    /// computed (a block that needs one had none).
+    pub csums_dropped: u64,
+    pub csums_added: u64,
+    /// Problems repair could not fix (orphans of an encrypted root, a
+    /// subvolume without its root directory).
+    pub unrepaired: u64,
+    /// What [`EclipseFS::check`] still reports after the repair (`None`:
+    /// the filesystem is consistent).
+    pub still_damaged: Option<&'static str>,
+}
+
+impl RepairReport {
+    /// Whether the repair changed anything.
+    pub fn changed(&self) -> bool {
+        self.scrub.repaired
+            + self.refcounts_fixed
+            + self.bitmap_blocks_fixed
+            + self.items_removed
+            + self.entries_removed
+            + self.entries_fixed
+            + self.inodes_fixed
+            + self.lost_found
+            + self.csums_dropped
+            + self.csums_added
+            > 0
+    }
+
+    /// Consistent after the repair, with every block readable.
+    pub fn is_clean(&self) -> bool {
+        self.still_damaged.is_none() && self.unrepaired == 0 && self.scrub.is_clean()
     }
 }
 
@@ -371,6 +432,14 @@ impl EclipseFS {
         }
     }
 
+    /// Forget clean cached metadata (v0.4; nothing on v0.3), so the next
+    /// reads come from the device.
+    pub fn drop_caches(&mut self) {
+        if let Driver::V4(fs) = &mut self.driver {
+            fs.drop_caches();
+        }
+    }
+
     /// Clock used for timestamps (seconds, nanoseconds since the epoch).
     pub fn set_clock(&mut self, clock: fn() -> (u64, u32)) {
         dispatch!(self, fs => fs.set_clock(clock))
@@ -403,6 +472,57 @@ impl EclipseFS {
     /// Commit everything and flush the device.
     pub fn sync(&mut self) -> Result<()> {
         dispatch!(self, fs => fs.sync())
+    }
+
+    /// Make file `ino` durable (`fsync`/`fdatasync`). On v0.4 a regular
+    /// file whose changes since the last commit are writes, truncates and
+    /// attribute changes gets one record in the fsync log and one device
+    /// flush; anything else commits, as [`sync`](Self::sync) does.
+    pub fn fsync(&mut self, ino: u64) -> Result<()> {
+        match &mut self.driver {
+            Driver::V3(fs) => fs.sync(),
+            Driver::V4(fs) => fs.fsync(ino),
+        }
+    }
+
+    /// Commit every `secs` seconds of the clock instead of every
+    /// [`COMMIT_OPS`] operations (v0.4; `None` restores the default). The
+    /// caller runs [`commit_if_due`](Self::commit_if_due) from a timer.
+    pub fn set_commit_interval(&mut self, secs: Option<u64>) {
+        if let Driver::V4(fs) = &mut self.driver {
+            fs.set_commit_interval(secs);
+        }
+    }
+
+    /// Commit if the commit interval has passed (and anything changed).
+    pub fn commit_if_due(&mut self) -> Result<bool> {
+        match &mut self.driver {
+            Driver::V3(fs) => fs.sync().map(|_| false),
+            Driver::V4(fs) => fs.commit_if_due(),
+        }
+    }
+
+    /// Whether [`write_atomic`](Self::write_atomic) works on `ino` (v0.4
+    /// regular files that are not no-COW).
+    pub fn atomic_write_supported(&mut self, ino: u64) -> Result<bool> {
+        match &mut self.driver {
+            Driver::V3(_) => Ok(false),
+            Driver::V4(fs) => fs.atomic_write_supported(ino),
+        }
+    }
+
+    /// `RWF_ATOMIC`: write all of `data` or nothing, untorn by a crash (at
+    /// most [`ATOMIC_WRITE_MAX`](crate::cow::ATOMIC_WRITE_MAX) bytes).
+    pub fn write_atomic(&mut self, ino: u64, offset: u64, data: &[u8]) -> Result<usize> {
+        self.cow()?.write_atomic(ino, offset, data)
+    }
+
+    /// fsync log records written since mount (0 on v0.3).
+    pub fn fsync_log_records(&self) -> u64 {
+        match &self.driver {
+            Driver::V3(_) => 0,
+            Driver::V4(fs) => fs.log_records(),
+        }
     }
 
     /// Grow the filesystem to the device's current size. `Ok(true)` if it grew.
@@ -483,6 +603,26 @@ impl EclipseFS {
 
     pub fn read(&mut self, ino: u64, offset: u64, buf: &mut [u8]) -> Result<usize> {
         dispatch!(self, fs => fs.read(ino, offset, buf))
+    }
+
+    /// [`read`](Self::read) through `&self`, so that readers holding the
+    /// filesystem shared run side by side. `Ok(None)`: this read needs the
+    /// exclusive path (v0.3, compressed extents, a block that fails its
+    /// checksum and wants repair; see `cow::shared`).
+    pub fn read_shared(&self, ino: u64, offset: u64, buf: &mut [u8]) -> Result<Option<usize>> {
+        match &self.driver {
+            Driver::V3(_) => Ok(None),
+            Driver::V4(fs) => fs.read_shared(ino, offset, buf),
+        }
+    }
+
+    /// [`stat`](Self::stat) through `&self`; `Ok(None)` as for
+    /// [`read_shared`](Self::read_shared).
+    pub fn stat_shared(&self, ino: u64) -> Result<Option<InodeStat>> {
+        match &self.driver {
+            Driver::V3(_) => Ok(None),
+            Driver::V4(fs) => fs.stat_shared(ino),
+        }
     }
 
     pub fn write(&mut self, ino: u64, offset: u64, data: &[u8]) -> Result<usize> {
@@ -757,6 +897,35 @@ impl EclipseFS {
         self.cow()?.balance(data, meta)
     }
 
+    /// Mark device `devid` fast (SSD) or slow (HDD), or neither. With both
+    /// kinds present, metadata and new data go to fast devices first.
+    pub fn set_device_tier(&mut self, devid: u32, tier: Tier) -> Result<()> {
+        self.cow()?.set_device_tier(devid, tier)
+    }
+
+    /// The tier of device `devid` ([`Tier::Any`] when it has none).
+    pub fn device_tier(&self, devid: u32) -> Tier {
+        match &self.driver {
+            Driver::V4(c) => c.device_tier(devid),
+            Driver::V3(_) => Tier::Any,
+        }
+    }
+
+    /// `btrfs device add` with a tier for the new device.
+    pub fn add_device_tier(&mut self, dev: Arc<dyn BlockDevice>, tier: Tier) -> Result<u32> {
+        let id = self.add_device(dev)?;
+        if tier != Tier::Any {
+            self.set_device_tier(id, tier)?;
+        }
+        Ok(id)
+    }
+
+    /// Move full data chunks from fast to slow devices and metadata chunks
+    /// to fast ones (every data chunk on a fast device with `all`).
+    pub fn tier_migrate(&mut self, all: bool) -> Result<BalanceReport> {
+        self.cow()?.tier_migrate(all)
+    }
+
     /// Profiles of new data and metadata chunks.
     pub fn profiles(&self) -> (Profile, Profile) {
         match &self.driver {
@@ -843,12 +1012,29 @@ impl EclipseFS {
     }
 
     /// Read every tree node and data block from the device and verify its
-    /// checksum (btrfs scrub, without repair: there is no second copy yet).
+    /// checksum (btrfs scrub). On a writable mount of a volume with DUP or
+    /// RAID copies, a bad copy is rewritten from a good one (counted in
+    /// [`ScrubReport::repaired`]); a block with no good copy is reported.
     /// Commits first on a writable mount. Needs format v0.4.
     pub fn scrub(&mut self) -> Result<ScrubReport> {
         match &mut self.driver {
             Driver::V3(_) => Err(Error::Unsupported("scrub needs format v0.4")),
             Driver::V4(fs) => fs.scrub(),
+        }
+    }
+
+    /// Repair what [`check`](Self::check) finds (`btrfs check --repair`,
+    /// `xfs_repair`), keeping every file it still can: scrub (copies from
+    /// mirrors), reference counts and bitmaps rebuilt from the trees, items
+    /// of missing inodes and bad entries dropped, name indexes rebuilt,
+    /// orphans linked into `lost+found` as `#<inode>`, counters recomputed,
+    /// stale checksums dropped and missing ones computed. Needs a writable
+    /// mount of format v0.4; changes go through normal commits, so a crash
+    /// leaves a consistent filesystem (run it again to finish).
+    pub fn repair(&mut self) -> Result<RepairReport> {
+        match &mut self.driver {
+            Driver::V3(_) => Err(Error::Unsupported("repair needs format v0.4")),
+            Driver::V4(fs) => fs.repair(),
         }
     }
 }

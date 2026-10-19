@@ -94,24 +94,38 @@ impl Syscall<'_> {
         let flags = at_flags(flags, STATX_FLAGS)?;
         let follow = !flags.contains(AtFlags::SYMLINK_NOFOLLOW);
         let proc = self.linux_process();
-        let meta = if flags.contains(AtFlags::EMPTY_PATH)
+        let (meta, inode) = if flags.contains(AtFlags::EMPTY_PATH)
             && (pathname.is_null() || pathname.as_c_str().map(|s| s.is_empty()).unwrap_or(false))
         {
             if dirfd == FileDesc::CWD {
-                proc.root_inode()
-                    .lookup(&proc.current_working_directory())?
-                    .metadata()?
+                let inode = proc
+                    .root_inode()
+                    .lookup(&proc.current_working_directory())?;
+                (inode.metadata()?, Some(inode))
             } else {
                 // AT_EMPTY_PATH names the descriptor itself, whatever kind it
                 // is — this is the path musl's `fstat` takes.
-                proc.get_file_like(dirfd)?.metadata()?
+                let file_like = proc.get_file_like(dirfd)?;
+                let inode = file_like
+                    .clone()
+                    .downcast_arc::<linux_object::fs::File>()
+                    .ok()
+                    .map(|f| f.inode());
+                (file_like.metadata()?, inode)
             }
         } else {
             let path = pathname.as_c_str()?;
-            proc.lookup_inode_at(dirfd, path, follow)?.metadata()?
+            let inode = proc.lookup_inode_at(dirfd, path, follow)?;
+            (inode.metadata()?, Some(inode))
         };
-
-        statxbuf.write(meta.into())?;
+        let mut x: Statx = meta.into();
+        if let Some(unit) = inode
+            .as_ref()
+            .and_then(linux_object::fs::eclipsefs_atomic_write_unit)
+        {
+            x.set_atomic_write_unit(unit);
+        }
+        statxbuf.write(x)?;
         Ok(0)
     }
 }
@@ -392,6 +406,10 @@ impl StatMode {
 }
 
 const STATX_BASIC_STATS: u32 = 0x07ff;
+/// `stx_atomic_write_unit_min`/`_max`/`_segments_max` are valid.
+const STATX_WRITE_ATOMIC: u32 = 0x0001_0000;
+/// The file can take `RWF_ATOMIC` writes.
+const STATX_ATTR_WRITE_ATOMIC: u64 = 0x0040_0000;
 
 /// timestamp structure for statx
 #[repr(C)]
@@ -453,6 +471,21 @@ pub struct Statx {
     pub __spare2: [u64; 14],
 }
 
+impl Statx {
+    /// The file takes `RWF_ATOMIC` writes of `min..=max` bytes, in one
+    /// segment. The fields sit in what this struct keeps as `__spare2`:
+    /// after `stx_mnt_id` (8 bytes), `stx_dio_mem_align` and
+    /// `stx_dio_offset_align` (4 each) and `stx_subvol` (8) come
+    /// `stx_atomic_write_unit_min`, `_max` and `_segments_max` (4 each).
+    pub fn set_atomic_write_unit(&mut self, (min, max): (u32, u32)) {
+        self.stx_mask |= STATX_WRITE_ATOMIC;
+        self.stx_attributes |= STATX_ATTR_WRITE_ATOMIC;
+        self.stx_attributes_mask |= STATX_ATTR_WRITE_ATOMIC;
+        self.__spare2[3] = min as u64 | (max as u64) << 32;
+        self.__spare2[4] = (self.__spare2[4] & !0xffff_ffff) | 1;
+    }
+}
+
 impl From<Metadata> for Statx {
     fn from(info: Metadata) -> Self {
         let dev_major = ((info.dev >> 8) & 0xfff) as u32;
@@ -506,6 +539,53 @@ impl From<Metadata> for Statx {
 mod abi_tests {
     use super::*;
     use core::mem::{align_of, offset_of, size_of};
+
+    #[test]
+    fn the_atomic_write_unit_lands_where_linux_reads_it() {
+        let t = StatxTimestamp {
+            tv_sec: 0,
+            tv_nsec: 0,
+            __reserved: 0,
+        };
+        let mut x = Statx {
+            stx_mask: 0,
+            stx_blksize: 0,
+            stx_attributes: 0,
+            stx_nlink: 0,
+            stx_uid: 0,
+            stx_gid: 0,
+            stx_mode: 0,
+            __spare0: [0; 1],
+            stx_ino: 0,
+            stx_size: 0,
+            stx_blocks: 0,
+            stx_attributes_mask: 0,
+            stx_atime: t,
+            stx_btime: t,
+            stx_ctime: t,
+            stx_mtime: t,
+            stx_rdev_major: 0,
+            stx_rdev_minor: 0,
+            stx_dev_major: 0,
+            stx_dev_minor: 0,
+            __spare2: [0; 14],
+        };
+        x.set_atomic_write_unit((4096, 1 << 20));
+        // `__spare2[i]` is the little-endian u64 at 0x90 + 8 * i.
+        let u32_at = |o: usize| {
+            let w = x.__spare2[(o - 0x90) / 8];
+            (w >> (8 * ((o - 0x90) % 8))) as u32
+        };
+        // stx_atomic_write_unit_min, _max, _segments_max (include/uapi/linux/stat.h).
+        assert_eq!(
+            (u32_at(0xa8), u32_at(0xac), u32_at(0xb0)),
+            (4096, 1 << 20, 1)
+        );
+        assert_eq!(x.stx_mask & 0x0001_0000, 0x0001_0000);
+        assert_eq!(x.stx_attributes & 0x0040_0000, 0x0040_0000);
+        assert_eq!(offset_of!(Statx, __spare2), 0x90);
+        assert_eq!(size_of::<Statx>(), 0x100);
+    }
 
     #[test]
     fn stat_layout_is_stable() {

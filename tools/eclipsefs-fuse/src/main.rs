@@ -5,8 +5,9 @@
 //! Linux kernel (ext4, xfs, btrfs) with the same tool (fio) and through the
 //! same VFS: `scripts/eclipsefs-linux-bench.sh` uses it. It is the same
 //! driver the Eclipse kernel uses (`linux-object/src/fs/eclipsefs_mount.rs`),
-//! with the same commit points: `fsync` and unmount commit the transaction,
-//! and a timer commits every `--commit` seconds (5, as ext4).
+//! with the same commit points: unmount and a timer every `--commit`
+//! seconds (5, as ext4) commit the transaction, and `fsync` writes the file
+//! to the fsync log (or commits, when the log cannot carry its changes).
 //!
 //! ```text
 //! eclipsefs-fuse [--mkfs] [--commit SECS] [--no-writeback-cache] DEVICE MOUNTPOINT
@@ -504,14 +505,13 @@ impl Filesystem for Fuse {
     fn fsync(
         &mut self,
         _req: &Request<'_>,
-        _ino: u64,
+        ino: u64,
         _fh: u64,
         _datasync: bool,
         reply: ReplyEmpty,
     ) {
-        // EclipseFS commits the whole transaction, as btrfs without a log
-        // tree would.
-        match self.fs.lock().unwrap().sync() {
+        let ino = self.ino(ino);
+        match self.fs.lock().unwrap().fsync(ino) {
             Ok(()) => reply.ok(),
             Err(e) => reply.error(errno(e)),
         }
@@ -678,15 +678,20 @@ fn main() {
         std::process::exit(1);
     });
     fs.set_clock(now);
+    if commit > 0 {
+        // Operations no longer commit every few dozen calls: the timer
+        // below does.
+        fs.set_commit_interval(Some(commit));
+    }
     let root = fs.root_ino();
     let fs = Arc::new(Mutex::new(fs));
 
     if commit > 0 {
         let fs = Arc::downgrade(&fs);
         std::thread::spawn(move || loop {
-            std::thread::sleep(Duration::from_secs(commit));
+            std::thread::sleep(Duration::from_secs(1));
             let Some(fs) = fs.upgrade() else { break };
-            let r = fs.lock().unwrap().sync();
+            let r = fs.lock().unwrap().commit_if_due();
             if let Err(e) = r {
                 eprintln!("eclipsefs-fuse: periodic commit failed: {:?}", e);
             }
