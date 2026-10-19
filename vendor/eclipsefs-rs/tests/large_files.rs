@@ -244,3 +244,23 @@ fn defrag_of_many_extents_rewrites_them_across_batches() {
     assert_eq!(read_all(&mut fs, f), expected(3 * N));
     fs.check().unwrap();
 }
+
+#[test]
+fn a_shared_read_across_many_extents_stays_in_bounded_memory() {
+    let (disk, mut fs) = fresh(DISK);
+    let (f, _) = fragmented(&mut fs);
+    let mut fs = remount(&disk, fs);
+    let len = 3 * N * B;
+    let mut buf = vec![0u8; len as usize];
+    let (n, peak) = largest_alloc(|| fs.read_shared(f, 0, &mut buf).unwrap());
+    assert_eq!(n, Some(len as usize));
+    assert!(buf == expected(3 * N), "shared read differs");
+    assert!(peak < MAX_ALLOC, "largest allocation {peak} bytes");
+    fs.drop_caches();
+    let (n, peak) = largest_alloc(|| {
+        fs.read_shared(f, B / 2, &mut buf[..B as usize * 300])
+            .unwrap()
+    });
+    assert_eq!(n, Some(B as usize * 300));
+    assert!(peak < MAX_ALLOC, "largest allocation {peak} bytes");
+}

@@ -4768,7 +4768,7 @@ const RWF_ATOMIC: usize = 0x40;
 /// `generic_atomic_write_valid`: a power-of-two length within the unit,
 /// at an offset aligned to it.
 fn atomic_write_valid(len: usize, pos: u64, min: usize, max: usize) -> bool {
-    len.is_power_of_two() && len >= min && len <= max && pos % len as u64 == 0
+    len.is_power_of_two() && len >= min && len <= max && pos.is_multiple_of(len as u64)
 }
 
 #[cfg(test)]

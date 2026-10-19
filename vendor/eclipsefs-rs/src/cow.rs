@@ -89,6 +89,7 @@ mod fsync_log;
 pub use encrypt::EncryptionPolicy;
 mod resize;
 mod send;
+mod shared;
 mod volume_ops;
 pub use send::{ReceiveSource, SendSink, SendStats};
 
@@ -579,6 +580,14 @@ impl CowFs {
             fs.drop_unfinished_receives()?;
         }
         Ok(fs)
+    }
+
+    /// Forget the cached tree nodes and decompressed data that are clean
+    /// (what `echo 3 > /proc/sys/vm/drop_caches` asks of Linux); the next
+    /// reads come from the device.
+    pub fn drop_caches(&mut self) {
+        self.st.drop_clean();
+        self.zcache = None;
     }
 
     pub fn set_clock(&mut self, clock: fn() -> (u64, u32)) {

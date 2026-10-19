@@ -263,8 +263,11 @@ impl LogReader {
     }
 }
 
+/// A logged range of file blocks (first, end) and the extents in it.
+type LoggedRange = (u64, u64, Vec<(u64, LogExt)>);
+
 /// A record as read: subvolume, inode, inode item, ranges with extents.
-type Record = (u64, u64, Vec<u8>, Vec<(u64, u64, Vec<(u64, LogExt)>)>);
+type Record = (u64, u64, Vec<u8>, Vec<LoggedRange>);
 
 impl CowFs {
     // -----------------------------------------------------------------------
@@ -619,7 +622,7 @@ impl CowFs {
         let mut item = vec![0u8; n];
         r.take(&mut item)?;
         InodeItem::decode(&item)?;
-        let mut ranges: Vec<(u64, u64, Vec<(u64, LogExt)>)> = Vec::new();
+        let mut ranges: Vec<LoggedRange> = Vec::new();
         loop {
             match r.u8()? {
                 TAG_END => break,

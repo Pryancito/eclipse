@@ -9,6 +9,10 @@
 //! CPU ends up either polling the disk or spinning for the lock, all with
 //! interrupts off. A [`TurnGate`] is the queue in front of such a section,
 //! where a waiter is a parked task and its CPU stays free for others.
+//!
+//! A section that several tasks may share (EclipseFS reads, which hold its
+//! lock shared) asks for its turn with [`TurnGate::turn_of`] and lets that
+//! many through at once, still parking the rest.
 
 use alloc::vec::Vec;
 use core::future::Future;
@@ -16,14 +20,15 @@ use core::pin::Pin;
 use core::task::{Context, Poll, Waker};
 use kernel_hal::sync::Mutex;
 
-/// Lets one task at a time through; the others wait parked.
+/// Lets one task at a time through (or a few, see [`TurnGate::turn_of`]);
+/// the others wait parked.
 pub struct TurnGate {
     state: Mutex<GateState>,
 }
 
 struct GateState {
-    /// A [`TurnGuard`] is alive.
-    taken: bool,
+    /// How many [`TurnGuard`]s are alive.
+    held: usize,
     /// Who asked while it was taken. All of them are woken when it is handed
     /// back and all but one find it taken again and ask again. Waking every
     /// waiter costs a few polls and keeps a turn from being lost when the
@@ -36,7 +41,7 @@ impl TurnGate {
     pub const fn new() -> Self {
         TurnGate {
             state: Mutex::new(GateState {
-                taken: false,
+                held: 0,
                 waiting: Vec::new(),
             }),
         }
@@ -44,7 +49,16 @@ impl TurnGate {
 
     /// Wait for this task's turn. The turn lasts as long as the guard.
     pub fn turn(&self) -> Turn<'_> {
-        Turn { gate: self }
+        self.turn_of(1)
+    }
+
+    /// Wait for a turn while fewer than `slots` (at least one) are held.
+    /// Everyone who asks a gate should give it the same `slots`.
+    pub fn turn_of(&self, slots: usize) -> Turn<'_> {
+        Turn {
+            gate: self,
+            slots: slots.max(1),
+        }
     }
 }
 
@@ -58,6 +72,7 @@ impl Default for TurnGate {
 #[must_use = "future does nothing unless polled/`await`-ed"]
 pub struct Turn<'a> {
     gate: &'a TurnGate,
+    slots: usize,
 }
 
 impl<'a> Future for Turn<'a> {
@@ -66,8 +81,8 @@ impl<'a> Future for Turn<'a> {
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<TurnGuard<'a>> {
         let gate = self.gate;
         let mut state = gate.state.lock();
-        if !state.taken {
-            state.taken = true;
+        if state.held < self.slots {
+            state.held += 1;
             return Poll::Ready(TurnGuard { gate });
         }
         if !state.waiting.iter().any(|w| w.will_wake(cx.waker())) {
@@ -86,7 +101,7 @@ impl Drop for TurnGuard<'_> {
     fn drop(&mut self) {
         let waiting = {
             let mut state = self.gate.state.lock();
-            state.taken = false;
+            state.held -= 1;
             core::mem::take(&mut state.waiting)
         };
         // Woken with the gate's lock released: a wake-up can take the
@@ -175,6 +190,36 @@ mod tests {
         drop(through);
         assert_eq!(woken(&cc), 2);
         assert!(poll(&mut c, &wc).is_ready());
+    }
+
+    /// A gate of three slots lets three through and parks the fourth until
+    /// one of them is done.
+    #[test]
+    fn a_gate_with_slots_lets_that_many_through() {
+        let gate = TurnGate::new();
+        let (_, w) = counter();
+        let held: Vec<_> = (0..3)
+            .map(|_| match poll(&mut gate.turn_of(3), &w) {
+                Poll::Ready(g) => g,
+                Poll::Pending => panic!("a free slot was refused"),
+            })
+            .collect();
+        let (cd, wd) = counter();
+        let mut fourth = gate.turn_of(3);
+        assert!(poll(&mut fourth, &wd).is_pending());
+        let mut held = held;
+        held.pop();
+        assert_eq!(woken(&cd), 1);
+        assert!(poll(&mut fourth, &wd).is_ready());
+    }
+
+    #[test]
+    fn zero_slots_means_one() {
+        let gate = TurnGate::new();
+        let (_, w) = counter();
+        let first = poll(&mut gate.turn_of(0), &w);
+        assert!(first.is_ready());
+        assert!(poll(&mut gate.turn_of(0), &w).is_pending());
     }
 
     /// A waiter that goes away without taking its turn -- its task was

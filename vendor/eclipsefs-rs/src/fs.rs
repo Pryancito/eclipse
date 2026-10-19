@@ -373,6 +373,14 @@ impl EclipseFS {
         }
     }
 
+    /// Forget clean cached metadata (v0.4; nothing on v0.3), so the next
+    /// reads come from the device.
+    pub fn drop_caches(&mut self) {
+        if let Driver::V4(fs) = &mut self.driver {
+            fs.drop_caches();
+        }
+    }
+
     /// Clock used for timestamps (seconds, nanoseconds since the epoch).
     pub fn set_clock(&mut self, clock: fn() -> (u64, u32)) {
         dispatch!(self, fs => fs.set_clock(clock))
@@ -536,6 +544,26 @@ impl EclipseFS {
 
     pub fn read(&mut self, ino: u64, offset: u64, buf: &mut [u8]) -> Result<usize> {
         dispatch!(self, fs => fs.read(ino, offset, buf))
+    }
+
+    /// [`read`](Self::read) through `&self`, so that readers holding the
+    /// filesystem shared run side by side. `Ok(None)`: this read needs the
+    /// exclusive path (v0.3, compressed extents, a block that fails its
+    /// checksum and wants repair; see `cow::shared`).
+    pub fn read_shared(&self, ino: u64, offset: u64, buf: &mut [u8]) -> Result<Option<usize>> {
+        match &self.driver {
+            Driver::V3(_) => Ok(None),
+            Driver::V4(fs) => fs.read_shared(ino, offset, buf),
+        }
+    }
+
+    /// [`stat`](Self::stat) through `&self`; `Ok(None)` as for
+    /// [`read_shared`](Self::read_shared).
+    pub fn stat_shared(&self, ino: u64) -> Result<Option<InodeStat>> {
+        match &self.driver {
+            Driver::V3(_) => Ok(None),
+            Driver::V4(fs) => fs.stat_shared(ino),
+        }
     }
 
     pub fn write(&mut self, ino: u64, offset: u64, data: &[u8]) -> Result<usize> {

@@ -690,7 +690,7 @@ fn crash_loses_an_arbitrary_part_of_the_writes_since_the_last_flush() {
             // order.
             let mut img = image.clone();
             for p in &pending {
-                if lcg(&mut x) % 2 == 0 {
+                if lcg(&mut x).is_multiple_of(2) {
                     apply(&mut img, p);
                 }
             }

@@ -21,8 +21,9 @@ use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::any::Any;
 
+use core::sync::atomic::{AtomicUsize, Ordering};
 use eclipsefs::{Compression, EclipseFS, Error as EfsError, FileKind};
-use lock::Mutex;
+use lock::{Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use rcore_fs::vfs::{
     FileSystem, FileType, FsError, FsInfo, INode, Metadata, PollStatus, Result, Timespec,
 };
@@ -59,11 +60,51 @@ fn wall_clock() -> (u64, u32) {
     (now.as_secs(), now.subsec_nanos())
 }
 
+/// The filesystem's lock: exclusive for everything ([`lock`](Self::lock)),
+/// shared for the reads that can run side by side
+/// ([`EclipseFS::read_shared`] through [`shared`](Self::shared)).
+///
+/// The `RwLock` underneath lets readers in while any reader is inside, so
+/// a steady stream of them would keep a writer spinning for ever. A writer
+/// that wants in says so first, and while one does, `shared` answers `None`
+/// and the reader queues for the exclusive lock behind it instead.
+pub(crate) struct FsLock {
+    fs: RwLock<EclipseFS>,
+    writers: AtomicUsize,
+}
+
+impl FsLock {
+    fn new(fs: EclipseFS) -> Self {
+        Self {
+            fs: RwLock::new(fs),
+            writers: AtomicUsize::new(0),
+        }
+    }
+
+    /// The filesystem, exclusively.
+    #[track_caller]
+    pub(crate) fn lock(&self) -> RwLockWriteGuard<'_, EclipseFS> {
+        self.writers.fetch_add(1, Ordering::SeqCst);
+        let g = self.fs.write();
+        self.writers.fetch_sub(1, Ordering::SeqCst);
+        g
+    }
+
+    /// The filesystem shared with other readers, unless a writer is waiting.
+    #[track_caller]
+    pub(crate) fn shared(&self) -> Option<RwLockReadGuard<'_, EclipseFS>> {
+        if self.writers.load(Ordering::SeqCst) != 0 {
+            return None;
+        }
+        Some(self.fs.read())
+    }
+}
+
 /// A directory's entries as `(name, ino)`, in on-disk order.
 type Listing = Arc<Vec<(String, u64)>>;
 
 pub struct EclipseMountFs {
-    pub(crate) inner: Mutex<EclipseFS>,
+    pub(crate) inner: FsLock,
     /// Mounted read-only: the ioctls that change anything refuse (EROFS).
     pub(crate) read_only: bool,
     /// What `/` of this mount is: the default subvolume's root directory,
@@ -261,7 +302,7 @@ impl EclipseMountFs {
             }
         }
         let arc = Arc::new(Self {
-            inner: Mutex::new(fs),
+            inner: FsLock::new(fs),
             read_only,
             root,
             this: Mutex::new(Weak::new()),
@@ -438,6 +479,20 @@ impl EclipseMountINode {
 
 impl INode for EclipseMountINode {
     fn read_at(&self, offset: usize, buf: &mut [u8]) -> Result<usize> {
+        // Shared first: a regular file whose read needs nothing the
+        // exclusive path has (see `EclipseFS::read_shared`).
+        if let Some(fs) = self.fs.inner.shared() {
+            if let Some(st) = fs.stat_shared(self.ino).map_err(map_err)? {
+                if st.kind == FileKind::Regular {
+                    if let Some(n) = fs
+                        .read_shared(self.ino, offset as u64, buf)
+                        .map_err(map_err)?
+                    {
+                        return Ok(n);
+                    }
+                }
+            }
+        }
         let mut fs = self.fs.inner.lock();
         let st = fs.stat(self.ino).map_err(map_err)?;
         match st.kind {
@@ -477,6 +532,11 @@ impl INode for EclipseMountINode {
     }
 
     fn metadata(&self) -> Result<Metadata> {
+        if let Some(fs) = self.fs.inner.shared() {
+            if let Some(st) = fs.stat_shared(self.ino).map_err(map_err)? {
+                return Ok(stat_to_metadata(&st));
+            }
+        }
         let st = self.fs.inner.lock().stat(self.ino).map_err(map_err)?;
         Ok(stat_to_metadata(&st))
     }
@@ -605,8 +665,9 @@ impl INode for EclipseMountINode {
 }
 
 /// Whether `inode` is one of a mounted EclipseFS. Its reads hold
-/// `EclipseMountFs::inner`, an interrupts-off spinlock, across the device
-/// command, which is why `File` queues them first (`disk_read_gate`).
+/// `EclipseMountFs::inner`, an interrupts-off spinlock (shared when they
+/// can), across the device command, which is why `File` queues them first
+/// (`disk_read_gate`, with a slot per CPU but one).
 pub(super) fn owns(inode: &dyn INode) -> bool {
     inode.downcast_ref::<EclipseMountINode>().is_some()
 }
@@ -871,5 +932,46 @@ mod tests {
         );
         assert!(matches!(etc.find("data"), Err(FsError::EntryNotFound)));
         root.unlink("etc").unwrap();
+    }
+
+    /// Reads take the lock shared and see what exclusive reads see; while a
+    /// writer waits they take it exclusively, behind the writer.
+    #[test]
+    fn reads_share_the_lock_and_give_way_to_a_waiting_writer() {
+        let disk = formatted(16 * 1024 * 1024);
+        let fs = EclipseMountFs::open(&MountBackend::Block(disk), false).unwrap();
+        let root = fs.root_inode();
+        let f = root.create("f", FileType::File, 0o644).unwrap();
+        let data: Vec<u8> = (0..70_000).map(|i| (i * 7 % 253) as u8).collect();
+        assert_eq!(f.write_at(0, &data).unwrap(), data.len());
+        let ino = f.downcast_ref::<EclipseMountINode>().unwrap().ino;
+        {
+            // Two readers at once.
+            let a = fs.inner.shared().unwrap();
+            let b = fs.inner.shared().unwrap();
+            let mut x = vec![0u8; 1000];
+            let mut y = vec![0u8; 1000];
+            assert_eq!(a.read_shared(ino, 5000, &mut x).unwrap(), Some(1000));
+            assert_eq!(b.read_shared(ino, 5000, &mut y).unwrap(), Some(1000));
+            assert_eq!((&x[..], &y[..]), (&data[5000..6000], &data[5000..6000]));
+        }
+        let mut back = vec![0u8; data.len() + 10];
+        assert_eq!(f.read_at(0, &mut back).unwrap(), data.len());
+        assert_eq!(&back[..data.len()], &data[..]);
+        assert_eq!(f.metadata().unwrap().size, data.len());
+        // A writer waiting: readers do not get in ahead of it.
+        fs.inner.writers.fetch_add(1, Ordering::SeqCst);
+        assert!(fs.inner.shared().is_none());
+        assert_eq!(f.read_at(100, &mut back[..10]).unwrap(), 10);
+        assert_eq!(&back[..10], &data[100..110]);
+        fs.inner.writers.fetch_sub(1, Ordering::SeqCst);
+        assert!(fs.inner.shared().is_some());
+        // Directories and symlinks still read through the exclusive path.
+        let l = root.create("l", FileType::SymLink, 0o777).unwrap();
+        l.write_at(0, b"target").unwrap();
+        let mut t = [0u8; 16];
+        let n = l.read_at(0, &mut t).unwrap();
+        assert_eq!(&t[..n], b"target");
+        assert!(matches!(root.read_at(0, &mut t), Err(FsError::IsDir)));
     }
 }

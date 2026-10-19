@@ -617,6 +617,11 @@ pub(crate) fn cache_overlay_read(inode: &Arc<dyn INode>, offset: usize, buf: &mu
 /// address; two that land on the same slot only share a queue).
 static DISK_READ_GATES: [TurnGate; 8] = [const { TurnGate::new() }; 8];
 
+/// The same for EclipseFS, whose readers share its lock (see
+/// [`disk_read_slots`]), apart so that its gates are only ever asked with
+/// that many slots.
+static ECLIPSEFS_READ_GATES: [TurnGate; 8] = [const { TurnGate::new() }; 8];
+
 /// The queue a read of `inode` waits in, when it is a file of a disk
 /// filesystem.
 ///
@@ -631,21 +636,36 @@ static DISK_READ_GATES: [TurnGate; 8] = [const { TurnGate::new() }; 8];
 /// kept a 10 ms sleep waiting 5.2 s; one thread, 52 ms at worst. A read that
 /// waits here is a parked task instead, and the other CPUs stay free.
 pub(super) fn disk_read_gate(inode: &Arc<dyn INode>) -> Option<&'static TurnGate> {
-    let disk = super::btrfs_mount::owns(&**inode)
-        || super::eclipsefs_mount::owns(&**inode)
-        || super::fat_mount::owns(&**inode);
-    if !disk {
+    let gates = if super::eclipsefs_mount::owns(&**inode) {
+        &ECLIPSEFS_READ_GATES
+    } else if super::btrfs_mount::owns(&**inode) || super::fat_mount::owns(&**inode) {
+        &DISK_READ_GATES
+    } else {
         return None;
-    }
+    };
     let fs = Arc::as_ptr(&inode.fs()) as *const () as usize;
-    Some(&DISK_READ_GATES[(fs >> 4) % DISK_READ_GATES.len()])
+    Some(&gates[(fs >> 4) % gates.len()])
+}
+
+/// How many reads of `inode`'s filesystem go through its gate at once.
+///
+/// EclipseFS reads hold its lock shared (`EclipseFS::read_shared`), so they
+/// run side by side: one per CPU but one, which keeps a CPU free of them for
+/// the timer and everything else. The others serve reads under an exclusive
+/// lock, where a second reader through would only spin.
+pub(super) fn disk_read_slots(inode: &Arc<dyn INode>) -> usize {
+    if super::eclipsefs_mount::owns(&**inode) {
+        kernel_hal::online_cpu_count().saturating_sub(1).max(1)
+    } else {
+        1
+    }
 }
 
 /// Wait for the turn to read `inode` (see [`disk_read_gate`]); a file that
 /// needs none gets `None` at once.
 async fn disk_read_turn(inode: &Arc<dyn INode>) -> Option<TurnGuard<'static>> {
     match disk_read_gate(inode) {
-        Some(gate) => Some(gate.turn().await),
+        Some(gate) => Some(gate.turn_of(disk_read_slots(inode)).await),
         None => None,
     }
 }

@@ -318,13 +318,47 @@ Con esto EclipseFS tiene todo lo de btrfs. Lo siguiente ya es propio.
   `EFS_IOC_GET_TIER` y `EFS_IOC_TIER_MIGRATE`. Los archivos pequeños no
   tienen trato aparte: van a los rápidos como todo dato nuevo y se mueven
   con su chunk.
+- **Log de fsync** (`cow/fsync_log.rs`, como el tree-log de btrfs o el
+  fast_commit de ext4): `fsync` de un archivo regular escribe un registro
+  en un área reservada (item `LOG_TREE` del árbol raíz, 1/256 del disco
+  entre 64 y 4096 bloques) en lugar de un commit entero: el inodo, los
+  rangos tocados y sus extents con el CRC32C de cada bloque, con una sola
+  sincronización. Al montar se aplican los registros de la generación
+  actual (en solo lectura, en memoria); uno roto por un corte se detecta
+  por su CRC y termina el log. Lo que no cabe en un registro (archivos
+  nuevos, nombres, directorios, reflinks, compresión, archivos en línea,
+  xattrs) hace un commit como antes. `tests/fsync_log.rs` corta la luz en
+  cada punto de una carga con fsync.
+- **Commits en segundo plano** (`set_commit_interval`, opción `commit=N`
+  del montaje, 5 s por defecto): la transacción abierta se confirma cada
+  N segundos desde una tarea del kernel (un hilo en el adaptador FUSE) en
+  lugar de cada 64 operaciones, como el txg de ZFS o el `commit=` de ext4.
+  `fsync` y `sync` siguen siendo inmediatos.
+- **Escrituras atómicas** (`write_atomic`, `RWF_ATOMIC` de Linux 6.11):
+  hasta 1 MiB (`ATOMIC_WRITE_MAX`) que, tras un corte, están enteros o no
+  están. `statx` da la unidad (`STATX_WRITE_ATOMIC`: de 4 KiB a 1 MiB) y
+  `pwritev2(RWF_ATOMIC)` comprueba tamaño potencia de dos y alineación.
+  Los archivos NOCOW no las admiten (se reescriben en su sitio).
+- **Lecturas en paralelo** (`cow/shared.rs`): `read_shared` y `stat_shared`
+  toman `&self`, así que varios lectores con el sistema de archivos
+  compartido leen a la vez. Usan la caché de nodos tal como está y una
+  caché lateral propia (`Store::get_shared`) que solo guarda nodos
+  confirmados y comprueba la generación que les da su padre, así un
+  bloque liberado y reutilizado nunca se sirve viejo. Lo que necesita el
+  camino exclusivo (extents comprimidos, claves de cifrado sin derivar, un
+  bloque que falla su checksum y hay que reparar, un subvolumen sin
+  cargar) responde `None` y el llamador repite con el cerrojo exclusivo.
+  En el kernel el cerrojo pasa a `RwLock`: un escritor que espera avisa y
+  los lectores nuevos se ponen detrás en vez de dejarlo esperando para
+  siempre, y la cola de lecturas de EclipseFS deja pasar una por CPU menos
+  una. `drop_caches()` vacía las cachés limpias.
 - TRIM/discard queda pendiente: los drivers de disco del kernel todavía no
   tienen discard.
 
 ## En el kernel (fase 8)
 
-- `mount -t eclipsefs` entiende `compress=`, `compress-force=`, `degraded`,
-  `device=`, `subvol=` y `subvolid=`. Busca los demás dispositivos del
+- `mount -t eclipsefs` entiende `commit=`, `compress=`, `compress-force=`,
+  `degraded`, `device=`, `subvol=` y `subvolid=`. Busca los demás dispositivos del
   volumen entre los discos registrados (`eclipsefs::probe`, sin montar).
 - ioctls con los números de Linux/btrfs (`linux-object/src/fs/eclipsefs_ioctl.rs`),
   así que `chattr`, `cp --reflink`, `btrfs subvolume|filesystem|device|scrub|balance|qgroup|send`
