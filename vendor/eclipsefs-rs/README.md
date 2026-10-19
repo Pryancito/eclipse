@@ -355,10 +355,40 @@ Con esto EclipseFS tiene todo lo de btrfs. Lo siguiente ya es propio.
 - TRIM/discard queda pendiente: los drivers de disco del kernel todavía no
   tienen discard.
 
+## Reparación (`check --repair`)
+
+`EclipseFS::repair()` arregla lo que `check()` encuentra, siempre con
+commits normales (un corte de luz a mitad lo termina la siguiente
+reparación) y devuelve un `RepairReport`. Lo que no puede arreglar lo
+informa (`unrepaired`, `still_damaged`); nunca entra en pánico. Solo v0.4
+y en montaje de escritura.
+
+- Primero un `scrub`: reescribe las copias malas desde una buena (DUP,
+  RAID1/10, paridad RAID5/6). Si un nodo de árbol no se puede leer, para.
+- Reconstruye los contadores de referencias y los mapas de bits desde lo
+  que los árboles apuntan: bloques perdidos (marcados en uso sin dueño) y
+  bloques usados marcados libres. Dos extents sobre los mismos bloques
+  pasan a ser compartidos (reflink). Un extent fuera del disco o encima
+  de metadatos se borra sin liberar nada.
+- Por subvolumen: borra ítems huérfanos o que no se decodifican, nombres
+  inválidos o colgantes, y rehace `DIR_ITEM`/`INODE_REF`. Arregla
+  `nlink`, tamaños, `nbytes`, tamaños de directorio, ciclos de
+  directorios, enlaces a subvolúmenes y los contadores (inodos, cuota).
+  Los inodos sin nombre van a `lost+found` como `#<ino>`.
+- Checksums: quita los que sobran y calcula los que faltan.
+- El área del log de `fsync` se respeta: cuenta como en uso y nunca se
+  libera ni se reescribe. En chunks RAID5/6 los mapas reconstruidos
+  conservan el tamaño de fila (lo nuevo nunca cae en una fila con datos
+  confirmados) y en volúmenes con niveles conservan el nivel.
+- Recorre los extents por lotes: un archivo con millones de extents no
+  necesita más memoria.
+- Kernel: `mount -o repair` repara antes de usar el sistema de archivos
+  (se rechaza con `ro`). Los fallos que no tienen arreglo quedan en el log.
+
 ## En el kernel (fase 8)
 
 - `mount -t eclipsefs` entiende `commit=`, `compress=`, `compress-force=`,
-  `degraded`, `device=`, `subvol=` y `subvolid=`. Busca los demás dispositivos del
+  `degraded`, `device=`, `repair`, `subvol=` y `subvolid=`. Busca los demás dispositivos del
   volumen entre los discos registrados (`eclipsefs::probe`, sin montar).
 - ioctls con los números de Linux/btrfs (`linux-object/src/fs/eclipsefs_ioctl.rs`),
   así que `chattr`, `cp --reflink`, `btrfs subvolume|filesystem|device|scrub|balance|qgroup|send`

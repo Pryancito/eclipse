@@ -87,6 +87,7 @@ mod encrypt;
 mod fsync_log;
 
 pub use encrypt::EncryptionPolicy;
+mod repair;
 mod resize;
 mod send;
 mod shared;
@@ -4412,11 +4413,10 @@ impl CowFs {
         &mut self,
         item: &RootItem,
     ) -> Result<(u64, u64, Vec<(u64, u64, Vec<u8>, u64)>, RangeSet)> {
-        let items = self
-            .st
-            .range(&item.root, &Key::MIN, &Key::MAX, usize::MAX)?;
         let mut links = Vec::new();
-        let mut regs = Vec::new();
+        // Blocks of files that keep checksums (an inode's item comes
+        // before its extents).
+        let mut need = RangeSet::default();
         let mut inodes: BTreeMap<u64, InodeItem> = BTreeMap::new();
         let mut names: BTreeMap<u64, u32> = BTreeMap::new();
         let mut refs: BTreeMap<u64, u32> = BTreeMap::new();
@@ -4429,95 +4429,114 @@ impl CowFs {
         let mut contexts: BTreeMap<u64, Vec<u8>> = BTreeMap::new();
         // Inodes with inline or compressed data.
         let mut packed: BTreeSet<u64> = BTreeSet::new();
-        for (k, d) in &items {
-            match k.ty {
-                INODE_ITEM => {
-                    inodes.insert(k.objectid, InodeItem::decode(d)?);
-                }
-                ENC_CONTEXT => {
-                    if k.offset != 0 {
-                        return Err(Error::Corrupt("fsck: encryption context key"));
+        // A batch of items at a time: a file of tens of GB has millions.
+        let mut lo = Key::MIN;
+        loop {
+            let items = self.st.range(&item.root, &lo, &Key::MAX, PURGE_BATCH)?;
+            let Some(last) = items.last().map(|(k, _)| *k) else {
+                break;
+            };
+            for (k, d) in &items {
+                let summed = inodes
+                    .get(&k.objectid)
+                    .is_some_and(|i| i.flags & FL_NOCOW as u64 == 0);
+                match k.ty {
+                    INODE_ITEM => {
+                        inodes.insert(k.objectid, InodeItem::decode(d)?);
                     }
-                    contexts.insert(k.objectid, d.clone());
-                }
-                INODE_REF => {
-                    *refs.entry(k.objectid).or_default() += 1;
-                    let e = decode_pair(d)?;
-                    if k.offset != ref_hash(e.ino, e.index) {
-                        return Err(Error::Corrupt("fsck: inode ref key"));
-                    }
-                }
-                DIR_ITEM => {
-                    for e in decode_dir_item(d)? {
-                        if name_hash(&e.name) != k.offset {
-                            return Err(Error::Corrupt("fsck: name hash"));
-                        }
-                        item_names.insert((k.objectid, e.index, e.name, e.ino));
-                    }
-                }
-                DIR_INDEX => {
-                    let e = decode_pair(d)?;
-                    if is_link(e.ino) {
-                        if e.kind != FileKind::Dir || split(e.ino).1 != FIRST_INO {
-                            return Err(Error::Corrupt("fsck: subvolume entry"));
-                        }
-                        links.push((k.objectid, k.offset, e.name.clone(), split(e.ino).0));
-                        index_names.insert((k.objectid, k.offset, e.name, e.ino));
-                        continue;
-                    }
-                    *names.entry(e.ino).or_default() += 1;
-                    if e.kind == FileKind::Dir {
-                        *subdirs.entry(k.objectid).or_default() += 1;
-                    }
-                    index_names.insert((k.objectid, k.offset, e.name, e.ino));
-                }
-                EXTENT_DATA => match FileExtent::decode(d)? {
-                    FileExtent::Reg { disk, blocks } => {
-                        regs.push((k.objectid, disk, blocks));
-                        let end = last_ext_end.entry(k.objectid).or_default();
-                        if k.offset % BS != 0 || k.offset / BS < *end {
-                            return Err(Error::Corrupt("fsck: overlapping extents"));
-                        }
-                        *end = k.offset / BS + blocks;
-                        *bytes.entry(k.objectid).or_default() += blocks * BS;
-                    }
-                    FileExtent::Inline(v) => {
+                    ENC_CONTEXT => {
                         if k.offset != 0 {
-                            return Err(Error::Corrupt("fsck: inline extent offset"));
+                            return Err(Error::Corrupt("fsck: encryption context key"));
                         }
-                        if v.len() > INLINE_MAX {
-                            return Err(Error::Corrupt("fsck: inline extent too large"));
+                        contexts.insert(k.objectid, d.clone());
+                    }
+                    INODE_REF => {
+                        *refs.entry(k.objectid).or_default() += 1;
+                        let e = decode_pair(d)?;
+                        if k.offset != ref_hash(e.ino, e.index) {
+                            return Err(Error::Corrupt("fsck: inode ref key"));
                         }
-                        packed.insert(k.objectid);
-                        *bytes.entry(k.objectid).or_default() += v.len() as u64;
                     }
-                    FileExtent::Comp(c) => {
-                        packed.insert(k.objectid);
-                        regs.push((k.objectid, c.disk, c.disk_blocks));
-                        let end = last_ext_end.entry(k.objectid).or_default();
-                        if k.offset % BS != 0 || k.offset / BS < *end {
-                            return Err(Error::Corrupt("fsck: overlapping extents"));
+                    DIR_ITEM => {
+                        for e in decode_dir_item(d)? {
+                            if name_hash(&e.name) != k.offset {
+                                return Err(Error::Corrupt("fsck: name hash"));
+                            }
+                            item_names.insert((k.objectid, e.index, e.name, e.ino));
                         }
-                        *end = k.offset / BS + c.blocks;
-                        *bytes.entry(k.objectid).or_default() += c.blocks * BS;
                     }
-                    FileExtent::Prealloc { blocks, .. } => {
-                        let end = last_ext_end.entry(k.objectid).or_default();
-                        if k.offset % BS != 0 || k.offset / BS < *end {
-                            return Err(Error::Corrupt("fsck: overlapping extents"));
+                    DIR_INDEX => {
+                        let e = decode_pair(d)?;
+                        if is_link(e.ino) {
+                            if e.kind != FileKind::Dir || split(e.ino).1 != FIRST_INO {
+                                return Err(Error::Corrupt("fsck: subvolume entry"));
+                            }
+                            links.push((k.objectid, k.offset, e.name.clone(), split(e.ino).0));
+                            index_names.insert((k.objectid, k.offset, e.name, e.ino));
+                            continue;
                         }
-                        *end = k.offset / BS + blocks;
-                        *bytes.entry(k.objectid).or_default() += blocks * BS;
+                        *names.entry(e.ino).or_default() += 1;
+                        if e.kind == FileKind::Dir {
+                            *subdirs.entry(k.objectid).or_default() += 1;
+                        }
+                        index_names.insert((k.objectid, k.offset, e.name, e.ino));
                     }
-                },
-                XATTR_ITEM => {
-                    let list = decode_xattrs(d)?;
-                    if list.is_empty() || list.iter().any(|(n, _)| name_hash(n) != k.offset) {
-                        return Err(Error::Corrupt("fsck: xattr item"));
+                    EXTENT_DATA => match FileExtent::decode(d)? {
+                        FileExtent::Reg { disk, blocks } => {
+                            if summed {
+                                need.insert(disk, blocks);
+                            }
+                            let end = last_ext_end.entry(k.objectid).or_default();
+                            if k.offset % BS != 0 || k.offset / BS < *end {
+                                return Err(Error::Corrupt("fsck: overlapping extents"));
+                            }
+                            *end = k.offset / BS + blocks;
+                            *bytes.entry(k.objectid).or_default() += blocks * BS;
+                        }
+                        FileExtent::Inline(v) => {
+                            if k.offset != 0 {
+                                return Err(Error::Corrupt("fsck: inline extent offset"));
+                            }
+                            if v.len() > INLINE_MAX {
+                                return Err(Error::Corrupt("fsck: inline extent too large"));
+                            }
+                            packed.insert(k.objectid);
+                            *bytes.entry(k.objectid).or_default() += v.len() as u64;
+                        }
+                        FileExtent::Comp(c) => {
+                            packed.insert(k.objectid);
+                            if summed {
+                                need.insert(c.disk, c.disk_blocks);
+                            }
+                            let end = last_ext_end.entry(k.objectid).or_default();
+                            if k.offset % BS != 0 || k.offset / BS < *end {
+                                return Err(Error::Corrupt("fsck: overlapping extents"));
+                            }
+                            *end = k.offset / BS + c.blocks;
+                            *bytes.entry(k.objectid).or_default() += c.blocks * BS;
+                        }
+                        FileExtent::Prealloc { blocks, .. } => {
+                            let end = last_ext_end.entry(k.objectid).or_default();
+                            if k.offset % BS != 0 || k.offset / BS < *end {
+                                return Err(Error::Corrupt("fsck: overlapping extents"));
+                            }
+                            *end = k.offset / BS + blocks;
+                            *bytes.entry(k.objectid).or_default() += blocks * BS;
+                        }
+                    },
+                    XATTR_ITEM => {
+                        let list = decode_xattrs(d)?;
+                        if list.is_empty() || list.iter().any(|(n, _)| name_hash(n) != k.offset) {
+                            return Err(Error::Corrupt("fsck: xattr item"));
+                        }
+                        xattr_owners.insert(k.objectid);
                     }
-                    xattr_owners.insert(k.objectid);
+                    _ => return Err(Error::Corrupt("fsck: unknown item")),
                 }
-                _ => return Err(Error::Corrupt("fsck: unknown item")),
+            }
+            match key_after(&last) {
+                Some(next) => lo = next,
+                None => break,
             }
         }
         if index_names != item_names {
@@ -4603,12 +4622,6 @@ impl CowFs {
         if !inodes.contains_key(&root) {
             return Err(Error::Corrupt("fsck: root"));
         }
-        let mut need = RangeSet::default();
-        for (ino, disk, blocks) in regs {
-            if inodes[&ino].flags & FL_NOCOW as u64 == 0 {
-                need.insert(disk, blocks);
-            }
-        }
         Ok((inodes.len() as u64, dirs.len() as u64, links, need))
     }
 }
@@ -4646,11 +4659,16 @@ impl CowFs {
                 Body::Leaf(items) => {
                     for (k, d) in &items {
                         if let Some((s, l)) = extent_of(k, d) {
-                            if matches!(
-                                FileExtent::decode(d),
-                                Ok(FileExtent::Reg { .. } | FileExtent::Comp(_))
-                            ) {
-                                data.insert(s, l);
+                            // A damaged extent pointing past the end has
+                            // nothing there to read (check reports it).
+                            let total = self.sb.total_blocks;
+                            if s < total
+                                && matches!(
+                                    FileExtent::decode(d),
+                                    Ok(FileExtent::Reg { .. } | FileExtent::Comp(_))
+                                )
+                            {
+                                data.insert(s, l.min(total - s));
                             }
                         } else if k.ty == ROOT_ITEM {
                             if let Ok(it) = RootItem::decode(d) {
