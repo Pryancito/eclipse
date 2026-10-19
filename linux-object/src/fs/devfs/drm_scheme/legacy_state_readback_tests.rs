@@ -94,6 +94,84 @@ fn set_crtc(c: &Client, fb: u32, mode: Option<(u32, u32, u32, u32)>) {
     c.ioctl(DRM_IOCTL_MODE_SETCRTC, &mut req).expect("SETCRTC");
 }
 
+/// `drm_mode_setcrtc`: a mode is set *on* connectors, so a request with
+/// a mode and an empty connector list is EINVAL ("Count connectors is 0
+/// but mode set"), after the viewport check and before the list is read;
+/// the call without a mode takes an empty list, since that is the one
+/// that turns the pipe off, and ignores its fb. A mode with no connectors
+/// was accepted and shown here, so GETCRTC reported a mode the
+/// connector's CRTC_ID had never routed.
+#[test]
+fn a_mode_with_no_connectors_is_refused_before_anything_is_set() {
+    let (_screen, c) = atomic_client(32, 8);
+    let buf = c.create_dumb(32, 8);
+    let fb = c.addfb2(&buf);
+    let mut req = DrmModeGetCrtc {
+        set_connectors_ptr: 0,
+        count_connectors: 0,
+        crtc_id: CRTC,
+        fb_id: fb,
+        x: 0,
+        y: 0,
+        gamma_size: 0,
+        mode_valid: 1,
+        mode: make_modeinfo(32, 8),
+    };
+    // What the CRTC reports before: the console's boot mode, no fb,
+    // nothing routed. The refused calls leave all of it as it was.
+    let before = get_crtc(&c);
+    let unchanged = |c: &Client, what: &str| {
+        let now = get_crtc(c);
+        assert_eq!(
+            (now.fb_id, now.mode_valid, now.mode),
+            (before.fb_id, before.mode_valid, before.mode),
+            "{}: nothing was set",
+            what
+        );
+        assert_eq!(crtc_prop(PROP_ACTIVE), 0, "{}", what);
+        assert_eq!(connector_crtc(), 0, "{}", what);
+    };
+    assert_eq!(before.fb_id, 0);
+    assert_eq!(
+        c.ioctl(DRM_IOCTL_MODE_SETCRTC, &mut req),
+        Err(FsError::InvalidParam),
+        "a mode with no connectors"
+    );
+    unchanged(&c, "a mode with no connectors");
+
+    // The viewport is measured first: a mode the fb cannot hold is
+    // ENOSPC whatever the list says.
+    req.mode = make_modeinfo(64, 8);
+    assert_eq!(
+        c.ioctl(DRM_IOCTL_MODE_SETCRTC, &mut req),
+        Err(FsError::NoDeviceSpace),
+        "the viewport comes first"
+    );
+    unchanged(&c, "the viewport comes first");
+
+    // Without a mode the empty list is the call that turns the pipe off,
+    // and the fb named beside it is not looked at.
+    req.mode_valid = 0;
+    assert_eq!(
+        c.ioctl(DRM_IOCTL_MODE_SETCRTC, &mut req),
+        Ok(0),
+        "no mode, no connectors"
+    );
+    assert_eq!(
+        get_crtc(&c).fb_id,
+        0,
+        "the fb beside a missing mode is ignored"
+    );
+
+    // With the connector in the list the same mode is set.
+    set_crtc(&c, fb, Some((32, 8, 0, 0)));
+    assert_eq!(get_crtc(&c).fb_id, fb);
+    assert_eq!(connector_crtc(), CRTC as u64);
+
+    c.rmfb(fb).expect("RMFB");
+    c.destroy_dumb(buf.handle).expect("DESTROY_DUMB");
+}
+
 #[test]
 fn a_legacy_setcrtc_is_a_commit_of_the_state_the_atomic_uapi_reads_back() {
     let (_screen, c) = atomic_client(32, 8);

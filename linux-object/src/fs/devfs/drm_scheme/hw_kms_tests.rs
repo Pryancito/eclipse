@@ -18,9 +18,19 @@ pub(super) fn paint(buf: &DrmModeCreateDumb, value: u32) {
 }
 
 fn set_crtc(c: &Client, crtc_id: u32, fb_id: u32, w: u32, h: u32) {
+    // A mode is set *on* connectors (`drm_mode_setcrtc`: "Count
+    // connectors is 0 but mode set", EINVAL), so the CRTC's own connector
+    // goes in the list, as every `drmModeSetCrtc` caller does.
+    // (The synthetic CRTC keeps its synthetic connector when a card
+    // with hardware KMS owns the resource list.)
+    let (_, crtcs, conns) = drm::get_resources();
+    let conn = [crtcs
+        .iter()
+        .position(|&id| id == crtc_id)
+        .map_or(drm::SYNTH_CONNECTOR_ID, |at| conns[at])];
     let mut req = DrmModeGetCrtc {
-        set_connectors_ptr: 0,
-        count_connectors: 0,
+        set_connectors_ptr: conn.as_ptr() as u64,
+        count_connectors: 1,
         crtc_id,
         fb_id,
         x: 0,

@@ -1755,6 +1755,17 @@ impl DrmDev {
                     }
                     active_area = Some((w, h));
                 }
+                // "Count connectors is 0 but mode set" (`drm_mode_setcrtc`,
+                // EINVAL): a mode is set *on* connectors, so a mode with an
+                // empty list is refused, after the viewport and before the
+                // list is read; the call without a mode is the one that
+                // takes an empty list, since it turns the pipe off. Accepted
+                // here: the mode was set and shown with nothing routed to
+                // the CRTC, so GETCRTC reported a mode the connector's
+                // CRTC_ID never had.
+                if req.count_connectors == 0 && req.mode_valid != 0 {
+                    return Err(FsError::InvalidParam);
+                }
                 if req.count_connectors > 0 {
                     if req.mode_valid == 0 || fb_id == 0 {
                         return Err(FsError::InvalidParam);
@@ -1767,7 +1778,11 @@ impl DrmDev {
                     ucheck_n::<u32>(req.set_connectors_ptr as usize, n)?;
                     for i in 0..n {
                         let id = unsafe { *(req.set_connectors_ptr as *const u32).add(i) };
-                        if !connectors.contains(&id) {
+                        // `drm_connector_lookup`: the object, by id, as
+                        // `get_crtc` above -- the synthetic connector stays
+                        // answerable beside a card that owns the resource
+                        // list, like its CRTC does.
+                        if drm::get_connector(id).is_none() {
                             return Err(FsError::EntryNotFound);
                         }
                     }
@@ -3592,57 +3607,8 @@ pub const DRM_CLOEXEC: u32 = 0o2000000;
 /// `DRM_RDWR`: the dma-buf fd is to be opened read-write.
 pub const DRM_RDWR: u32 = 0o2;
 
-/// What a PRIME ioctl asks for, decided the way `drm_ioctl` decides it: by
-/// the ioctl NUMBER. `PRIME_HANDLE_TO_FD` is an export of `handle`, whatever
-/// the caller left in `fd`; `PRIME_FD_TO_HANDLE` is an import of `fd`,
-/// whatever it left in `handle`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PrimeRequest {
-    /// `PRIME_HANDLE_TO_FD`: wrap GEM `handle` in a new dma-buf fd.
-    Export { handle: u32, flags: u32 },
-    /// `PRIME_FD_TO_HANDLE`: the dma-buf behind `fd`, as a GEM handle.
-    Import { fd: i32 },
-}
-
-/// Reads a PRIME request the way Linux does. `cmd` picks the operation (the
-/// caller has already matched it against [`nr::PRIME_HANDLE_TO_FD`] and
-/// [`nr::PRIME_FD_TO_HANDLE`], so anything else is `ENOTTY`), then each
-/// operation checks only the fields it reads: an export refuses a flag
-/// other than `DRM_CLOEXEC | DRM_RDWR` with `EINVAL`
-/// (`drm_prime_handle_to_fd_ioctl`), an import of a negative fd is `EBADF`
-/// (`dma_buf_get`).
-///
-/// The operation used to be read off the STRUCT instead: `fd < 0` meant an
-/// export, because libdrm's `drmPrimeHandleToFD` presets the output field to
-/// -1. That was a workaround for the two NRs being filed the wrong way
-/// round in [`nr`], and it broke every exporter that does not preset the
-/// field -- a `drm_prime_handle` zeroed by the caller (`fd = 0`) was taken
-/// for an import of fd 0, so the export answered `EINVAL` (stdin is not a
-/// dma-buf), or imported whatever dma-buf the client happened to hold at
-/// fd 0. Linux never looks at `fd` on an export: it is an output.
-pub fn prime_request(
-    cmd: u32,
-    args: DrmPrimeHandle,
-) -> core::result::Result<PrimeRequest, LxError> {
-    let (export, export_min) = nr::PRIME_HANDLE_TO_FD;
-    let (import, import_min) = nr::PRIME_FD_TO_HANDLE;
-    if is_drm_ioctl_nr(cmd, export, export_min) {
-        if args.flags & !(DRM_CLOEXEC | DRM_RDWR) != 0 {
-            return Err(LxError::EINVAL);
-        }
-        Ok(PrimeRequest::Export {
-            handle: args.handle,
-            flags: args.flags,
-        })
-    } else if is_drm_ioctl_nr(cmd, import, import_min) {
-        if args.fd < 0 {
-            return Err(LxError::EBADF);
-        }
-        Ok(PrimeRequest::Import { fd: args.fd })
-    } else {
-        Err(LxError::ENOTTY)
-    }
-}
+mod prime;
+pub use prime::{prime_request, PrimeRequest};
 
 /// How long a pre-present fence wait may hold the frame.
 ///
