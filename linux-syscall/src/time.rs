@@ -6,7 +6,7 @@ use crate::Syscall;
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use core::convert::TryFrom;
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use core::time::Duration;
 use kernel_hal::{user::UserInOutPtr, user::UserInPtr, user::UserOutPtr};
 use lazy_static::lazy_static;
@@ -831,19 +831,10 @@ impl Syscall<'_> {
             let mut slots = self.linux_process().itimers().lock();
             let slot = &mut slots[which];
             let old = itimerval_from_slot(slot, now);
-            slot.generation += 1;
-            let arm = if value.is_zero() {
-                // Disarm. POSIX: a zero it_value stops the timer regardless of
-                // what the interval field says.
-                slot.interval = Duration::ZERO;
-                slot.deadline = None;
-                None
-            } else {
-                slot.interval = interval;
-                let deadline = now + value;
-                slot.deadline = Some(deadline);
-                Some((deadline, slot.generation))
-            };
+            // A zero it_value disarms, whatever the interval says (POSIX).
+            let deadline = (!value.is_zero()).then(|| now + value);
+            let generation = rearm_itimer_slot(slot, deadline, interval);
+            let arm = deadline.map(|deadline| (deadline, generation));
             (old, arm)
         };
         // Reported LAST, after the timer is armed. Writing it here used to
@@ -893,16 +884,12 @@ impl Syscall<'_> {
             let mut slots = self.linux_process().itimers().lock();
             let slot = &mut slots[ITIMER_REAL];
             let remaining_secs = alarm_remaining_secs(slot_remaining(slot, now));
-            slot.generation += 1;
-            slot.interval = Duration::ZERO;
-            if seconds == 0 {
-                slot.deadline = None;
-                (remaining_secs, None)
-            } else {
-                let deadline = now + Duration::from_secs(seconds as u64);
-                slot.deadline = Some(deadline);
-                (remaining_secs, Some((deadline, slot.generation)))
-            }
+            let deadline = (seconds != 0).then(|| now + Duration::from_secs(seconds as u64));
+            let generation = rearm_itimer_slot(slot, deadline, Duration::ZERO);
+            (
+                remaining_secs,
+                deadline.map(|deadline| (deadline, generation)),
+            )
         };
         if let Some((deadline, generation)) = arm {
             arm_itimer(owner, ITIMER_REAL, deadline, generation);
@@ -1293,12 +1280,33 @@ fn slot_remaining(slot: &ItimerSlot, now: Duration) -> Duration {
         .unwrap_or_default()
 }
 
+/// Point `slot` at a new expiry (`None` disarms) and give it a generation
+/// that no slot of any process has had: what the timer armed for it carries.
+///
+/// The generation was the slot's own count from 0, so every process that ran
+/// the same code went through the same numbers, and the expiry finds its slot
+/// by pid, which is recycled. A dead process's alarm still pending matched the
+/// slot of whoever had been handed its pid and fired at it: `signal-probe`
+/// sections died of SIGALRM well inside their own 20 s alarm.
+fn rearm_itimer_slot(slot: &mut ItimerSlot, deadline: Option<Duration>, interval: Duration) -> u64 {
+    static GENERATION: AtomicU64 = AtomicU64::new(0);
+    slot.generation = GENERATION.fetch_add(1, Ordering::Relaxed) + 1;
+    slot.deadline = deadline;
+    slot.interval = if deadline.is_some() {
+        interval
+    } else {
+        Duration::ZERO
+    };
+    slot.generation
+}
+
 /// Schedule the one-shot that fires itimer `which` of process `owner` at
 /// `deadline`, valid only while the slot's generation still matches `gen`
 /// (the same protocol as [`arm_posix_timer`]). A periodic timer re-arms
 /// itself from the callback; the process is looked up by id each time, so an
-/// exited process just fails the lookup and the chain stops without the timer
-/// wheel keeping the process object alive.
+/// exited process fails the lookup, or finds the process its pid went to,
+/// whose slot never has `gen` (see [`rearm_itimer_slot`]), and the chain stops
+/// without the timer wheel keeping the process object alive.
 fn arm_itimer(owner: KoID, which: usize, deadline: Duration, gen: u64) {
     kernel_hal::timer::timer_set(
         deadline,
@@ -2943,6 +2951,53 @@ mod overrun_tests {
         assert!(thread.lock_linux().signals.contains(Signal::SIGALRM));
         // A stale generation is a slot that was re-armed since: nothing.
         assert_eq!(expire_itimer(proc.id(), ITIMER_REAL, 4, ms(1600)), None);
+    }
+
+    /// POSIX: a zero `it_value` stops the timer, whatever `it_interval` says,
+    /// and `getitimer` reports it stopped.
+    #[test]
+    fn a_disarmed_slot_keeps_no_interval() {
+        let mut slot = ItimerSlot::default();
+        rearm_itimer_slot(&mut slot, Some(ms(1000)), ms(50));
+        assert_eq!(slot.interval, ms(50));
+        rearm_itimer_slot(&mut slot, None, ms(50));
+        assert_eq!((slot.deadline, slot.interval), (None, Duration::ZERO));
+    }
+
+    /// The alarm a process left pending when it died expires against its
+    /// pid, which by then can be another process's, one that armed its own
+    /// alarm the same way.
+    #[test]
+    fn a_dead_process_alarm_does_not_fire_at_whoever_has_its_pid_now() {
+        let alarm_of = |proc: &Process, at| {
+            let lp = proc.linux();
+            let mut slots = lp.itimers().lock();
+            rearm_itimer_slot(&mut slots[ITIMER_REAL], Some(at), Duration::ZERO)
+        };
+        let dead = Process::create_with_fixed_id_ext(
+            &ROOT_JOB,
+            43_704,
+            "t",
+            LinuxProcess::new(RamFS::new(), 0),
+        )
+        .unwrap();
+        let pending = alarm_of(&dead, ms(1000));
+        dead.exit(0);
+        drop(dead);
+
+        let (heir, thread) = a_process(43_704);
+        alarm_of(&heir, ms(20_000));
+
+        assert_eq!(expire_itimer(43_704, ITIMER_REAL, pending, ms(1000)), None);
+        assert!(
+            !thread.lock_linux().signals.contains(Signal::SIGALRM),
+            "the dead process's alarm went off in the one with its pid"
+        );
+        assert_eq!(
+            heir.linux().itimers().lock()[ITIMER_REAL].deadline,
+            Some(ms(20_000)),
+            "and took the alarm of its own with it"
+        );
     }
 }
 

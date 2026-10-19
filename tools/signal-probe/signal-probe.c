@@ -24,6 +24,8 @@
 //   * a zombie gave its pid back before it was reaped, so a fork could be
 //     handed it while the zombie still waited, and a `waitpid` for the new
 //     child collected the dead one.
+//   * an alarm a process left pending when it died went off in the process
+//     its pid went to next, which died of it.
 //   * a SIGSTOP (or Ctrl-Z's SIGTSTP) to a process blocked in a syscall did
 //     not stop it until the syscall returned by itself -- never, for a child
 //     in `pause()` -- and its parent's `waitpid(WUNTRACED)` waited with it.
@@ -1085,6 +1087,38 @@ static void sec_wait(void) {
     else
         check(got == c, "a zombie's pid is not handed out again", "none of %d forks; waitpid: %s",
               forks, got == c ? "the zombie" : "not the zombie");
+
+    // An alarm dies with the process that set it. Once its pid is free, a
+    // fork can be handed it: that one arms an alarm of its own the same way
+    // and lives past the dead one's. Linux takes too long to come round to
+    // the pid for this to be asked there.
+    c = fork();
+    if (c == 0) {
+        alarm(1);
+        _exit(0);
+    }
+    waitpid(c, &st, 0);
+    int heir = 0, heir_st = 0;
+    for (int i = 0; i < forks && !heir; i++) {
+        pid_t k = fork();
+        if (k == 0) {
+            if (getpid() != c) _exit(0);
+            alarm(5);
+            sleep_ms(1500);
+            alarm(0);
+            _exit(42);
+        }
+        if (k == c) heir = i + 1;
+        if (k > 0) waitpid(k, &heir_st, 0);
+    }
+    if (!heir)
+        check(1, "a dead process's alarm dies with it", "no fork of %d was handed its pid", forks);
+    else
+        check(WIFEXITED(heir_st) && WEXITSTATUS(heir_st) == 42, "a dead process's alarm dies with it",
+              "fork %d was handed its pid and %s", heir,
+              WIFSIGNALED(heir_st) && WTERMSIG(heir_st) == SIGALRM ? "died of its alarm"
+              : WIFEXITED(heir_st) && WEXITSTATUS(heir_st) == 42 ? "lived past it"
+                                                                 : "ended some other way");
 }
 
 // ------------------------------------------------------------------- stop

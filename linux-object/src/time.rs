@@ -94,9 +94,11 @@ pub struct ItimerSlot {
     pub interval: Duration,
     /// Absolute expiry on the boot-monotonic clock; `None` while disarmed.
     pub deadline: Option<Duration>,
-    /// Bumped on every arm/disarm. A timer callback captures the value it was
-    /// armed with and compares before firing, so a replaced or cancelled timer
-    /// expires silently instead of delivering a stale signal.
+    /// New on every arm/disarm, and never the same in two processes. A timer
+    /// callback captures the value it was armed with and compares before
+    /// firing, so a replaced or cancelled timer, or one of a dead process
+    /// whose pid went to another, expires silently instead of delivering a
+    /// stale signal.
     pub generation: u64,
 }
 
