@@ -52,6 +52,9 @@
 //   * a forked child and a new thread started at nice 0, on SCHED_OTHER and
 //     free to run on any CPU, whatever their parent had: `nice make` only
 //     reniced make. And SCHED_RESET_ON_FORK was accepted and thrown away.
+//   * a static-pie -- what musl's `gcc -static` builds, this probe included
+//     -- was loaded at address 0, so a null pointer read its ELF header
+//     instead of faulting.
 //
 // Every section states what Linux does and checks it, printing the numbers
 // whether it passes or fails. Each section runs in a child of its own, so a
@@ -109,6 +112,9 @@
 //              the parent set SCHED_RESET_ON_FORK, which the parent keeps,
 //              reports, and cannot take off without privilege. And the size
 //              `sched_getaffinity` wants: whole longs.
+//   image      the program is mapped above the null page, and reading
+//              through a null pointer kills with SIGSEGV, however it was
+//              linked (static, static-pie, dynamic).
 //
 // Build:  make                 (x86_64-linux-musl-gcc -O2 -static)
 // Run:    ./signal-probe [--only SECTION]
@@ -1609,6 +1615,29 @@ static void sec_sched(void) {
     check(r > 0 && r <= 16 && r % 8 == 0, "getaffinity: a 16-byte buffer", "ret %ld", r);
 }
 
+// ------------------------------------------------------------------- image
+
+static void sec_image(void) {
+    // Linux keeps the low 64 KiB unmappable (`vm.mmap_min_addr`); an image
+    // loaded at 0 has its first function in the first few pages.
+    uintptr_t code = (uintptr_t)&sec_image;
+    check(code >= 0x10000, "the program is above the null page", "sec_image at %#lx",
+          (unsigned long)code);
+    pid_t c = fork();
+    if (c == 0) {
+        signal(SIGSEGV, SIG_DFL);
+        volatile int word = *g_unmapped;
+        (void)word;
+        _exit(3);  // the read came back
+    }
+    int st = 0;
+    while (waitpid(c, &st, 0) == -1 && errno == EINTR) {
+    }
+    check(WIFSIGNALED(st) && WTERMSIG(st) == SIGSEGV, "a null read is a SIGSEGV",
+          "status %#x%s", st,
+          WIFEXITED(st) && WEXITSTATUS(st) == 3 ? " (the read came back)" : "");
+}
+
 // ------------------------------------------------------------------- main
 
 static const struct {
@@ -1630,6 +1659,7 @@ static const struct {
     {"spawn", "a vfork child runs in its parent's memory", sec_spawn},
     {"badexec", "a failed execve returns, with Linux's errno", sec_badexec},
     {"sched", "what a fork hands down to the scheduler", sec_sched},
+    {"image", "the program is not mapped at the null page", sec_image},
 };
 
 int main(int argc, char **argv) {
