@@ -449,15 +449,7 @@ fn proc_task_stat(proc: &Process, thread: Option<&Arc<Thread>>) -> String {
     const NS_PER_TICK: u64 = 10_000_000; // 1e7 ns = 10 ms = 1 / USER_HZ(100)
     let (utime_ns, stime_ns) = match thread {
         Some(t) => (t.get_time(), t.get_sys_time()),
-        None => {
-            let mut u = proc.dead_threads_time();
-            let mut s = proc.dead_threads_sys_time();
-            for t in proc.threads() {
-                u += t.get_time();
-                s += t.get_sys_time();
-            }
-            (u, s)
-        }
+        None => proc.cpu_time_ns(),
     };
     let utime = (utime_ns / NS_PER_TICK) as i64;
     let stime = (stime_ns / NS_PER_TICK) as i64;

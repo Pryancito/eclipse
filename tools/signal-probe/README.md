@@ -81,6 +81,12 @@ en este kernel ha pasado de maneras que ningun test de syscalls ve:
     enlace a un enlace (el de un `PT_INTERP`, cuatro), asi que un guion cuyo
     interprete pasa por `/etc/alternatives` daba `ELOOP`. Y un interprete que
     nadie puede ejecutar corria igual.
+20. El tiempo de sistema de `getrusage` y `times` era el tiempo de reloj de
+    una syscall de cada dieciseis, multiplicado por dieciseis: una shell que
+    habia esperado medio segundo a un hijo llevaba segundos de CPU. `wait4`
+    daba casi nada por un hijo que salia con `exit`, porque contaba solo los
+    hilos que ya habian salido, y el reloj de CPU de un hilo dejaba fuera el
+    tiempo en el kernel.
 
 ## Compilar
 
@@ -127,3 +133,4 @@ FAIL solo en Eclipse es un fallo de Eclipse.
 | `badexec` | un `execve` de lo que no es un programa vuelve, con el errno de Linux: `EACCES` sin bit de ejecucion, para un directorio o con un `PT_INTERP` que es un directorio; `ENOEXEC` para basura, un guion sin `#!`, un `#!` vacio o que nombra basura, y un ELF de otra maquina; `ENOENT` para un `#!` o un `PT_INTERP` que no existen; `EIO` para un `PT_INTERP` de 10 bytes y `ELIBBAD` para uno de 128 bytes de basura; un `#!` o un `PT_INTERP` que nombran un fichero sin bit de ejecucion dan `EACCES`, y un `#!` que pasa por tres enlaces corre; cinco guiones encadenados corren y seis dan `ELOOP`. Y `sh -c` de un guion sin `#!` lo corre |
 | `sched` | lo que un hijo de `fork` y un hilo nuevo heredan del padre: el nice, la mascara de CPUs y la politica. Con `SCHED_RESET_ON_FORK` el padre la conserva y la informa (`sched_getscheduler`, `sched_getattr`) y el hijo nace sin ella: en `SCHED_OTHER` si el padre era de tiempo real, con nice 0 si el suyo era negativo y con el suyo si era positivo. Sin privilegio no se quita, `sched_setattr` no la acepta en la palabra de politica y `sched_getaffinity` quiere un buffer de `long` enteros. La seccion corre como root |
 | `image` | el programa esta por encima de la pagina nula y leer por un puntero nulo mata con SIGSEGV, se enlazara como se enlazara (estatico, static-pie, dinamico). Compilada con el musl de `cargo image` la sonda es static-pie, que es el caso que fallaba |
+| `cputime` | el tiempo de CPU que cuentan `getrusage`, `times`, `wait4` y los relojes de CPU: nada para un proceso dormido o esperando; los 300 ms de un hijo que trabaja, en `wait4`, en `RUSAGE_CHILDREN` y en `times()`, tambien los de un hilo que sigue trabajando cuando el proceso llama a `exit_group`; y la parte del kernel de un bucle de syscalls en `CLOCK_THREAD_CPUTIME_ID` y `CLOCK_PROCESS_CPUTIME_ID` |

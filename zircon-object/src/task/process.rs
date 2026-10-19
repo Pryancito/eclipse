@@ -1247,6 +1247,21 @@ impl Process {
         self.dead_threads_sys_time.load(Ordering::Relaxed)
     }
 
+    /// The CPU time this process has used, `(user, kernel)` nanoseconds: its
+    /// exited threads' and its live threads' so far, read under the one hold
+    /// of the lock that [`remove_thread`](Self::remove_thread) moves a
+    /// thread's clocks under. What `getrusage(RUSAGE_SELF)`, `times(2)`, the
+    /// process CPU clocks and a parent's `wait4` report.
+    pub fn cpu_time_ns(&self) -> (u64, u64) {
+        let inner = self.inner.lock();
+        let (mut user, mut sys) = (self.dead_threads_time(), self.dead_threads_sys_time());
+        for t in inner.threads.iter() {
+            user += t.get_time();
+            sys += t.get_sys_time();
+        }
+        (user, sys)
+    }
+
     pub(super) fn remove_thread(&self, tid: KoID) {
         let mut inner = self.inner.lock();
         // `retain` asks every entry for its id, which is a load through it,
@@ -1254,7 +1269,18 @@ impl Process {
         // count. The same two hazards as the clone in `Process::exit`, on the
         // other teardown path.
         inner.sweep_corrupt_threads(self.base.id, "Process::remove_thread");
-        inner.threads.retain(|t| t.id() != tid);
+        // The thread's two clocks move to the process under the same hold
+        // that takes it off the list, so `cpu_time_ns` sees them in exactly
+        // one of the two places: credited outside it, a reader in between
+        // counted them twice, and its next reading went backwards.
+        inner.threads.retain(|t| {
+            if t.id() != tid {
+                return true;
+            }
+            self.dead_threads_time_add(t.get_time());
+            self.dead_threads_sys_time_add(t.get_sys_time());
+            false
+        });
         if inner.threads.is_empty() {
             if !matches!(inner.status, Status::Exited(_)) {
                 let hint = self.exit_code_hint.load(Ordering::Acquire);

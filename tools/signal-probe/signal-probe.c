@@ -65,6 +65,11 @@
 //   * a static-pie -- what musl's `gcc -static` builds, this probe included
 //     -- was loaded at address 0, so a null pointer read its ELF header
 //     instead of faulting.
+//   * the kernel time `getrusage` and `times` reported was the wall time of
+//     one syscall in sixteen, times sixteen, so a shell that had waited
+//     half a second used seconds of CPU; `wait4` reported almost nothing for
+//     a child that had called `exit`; and the thread CPU clock left the
+//     kernel out.
 //
 // Every section states what Linux does and checks it, printing the numbers
 // whether it passes or fails. Each section runs in a child of its own, so a
@@ -126,6 +131,10 @@
 //   image      the program is mapped above the null page, and reading
 //              through a null pointer kills with SIGSEGV, however it was
 //              linked (static, static-pie, dynamic).
+//   cputime    the CPU time `getrusage`, `times`, `wait4` and the CPU clocks
+//              report: none for a process asleep, the 300 ms a child worked
+//              (a thread still working at `exit_group` included), and the
+//              kernel's part of a loop of syscalls on the CPU clocks.
 //
 // Build:  make                 (x86_64-linux-musl-gcc -O2 -static)
 // Run:    ./signal-probe [--only SECTION]
@@ -157,6 +166,7 @@
 #include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
+#include <sys/times.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <ucontext.h>
@@ -1761,6 +1771,102 @@ static void sec_image(void) {
           WIFEXITED(st) && WEXITSTATUS(st) == 3 ? " (the read came back)" : "");
 }
 
+// ----------------------------------------------------------------- cputime
+
+static long ms_of(const struct timeval *a, const struct timeval *b) {
+    return (a->tv_sec + b->tv_sec) * 1000L + (a->tv_usec + b->tv_usec) / 1000;
+}
+
+static long ru_ms(int who) {
+    struct rusage ru;
+    getrusage(who, &ru);
+    return ms_of(&ru.ru_utime, &ru.ru_stime);
+}
+
+static long clock_ms(clockid_t clock) {
+    struct timespec t;
+    clock_gettime(clock, &t);
+    return t.tv_sec * 1000L + t.tv_nsec / 1000000;
+}
+
+// `ms` of wall time spent in a loop of syscalls, so half of it or more is
+// the kernel's: what a program that works through the kernel looks like.
+static void busy_ms(long ms) {
+    long end = clock_ms(CLOCK_MONOTONIC) + ms;
+    while (clock_ms(CLOCK_MONOTONIC) < end) syscall(SYS_getppid);
+}
+
+static void *busy_forever(void *arg) {
+    (void)arg;
+    for (;;) busy_ms(1000);
+    return NULL;
+}
+
+static void sec_cputime(void) {
+    // Asleep is not on the CPU: 32 sleeps of 10 ms and a wait for a child
+    // that sleeps 400 ms cost microseconds.
+    pid_t c = fork();
+    if (c == 0) {
+        sleep_ms(400);
+        _exit(0);
+    }
+    long before = ru_ms(RUSAGE_SELF);
+    for (int i = 0; i < 32; i++) sleep_ms(10);
+    status_of(c);
+    long slept = ru_ms(RUSAGE_SELF) - before;
+    check(slept < 50, "sleeping and waiting take no CPU", "%ld ms of CPU over ~400 ms asleep", slept);
+
+    // A child that works for 300 ms has used about 300 ms, which `wait4`
+    // reports and the reaper's RUSAGE_CHILDREN and times() add up.
+    long children = ru_ms(RUSAGE_CHILDREN);
+    struct tms t0, t1;
+    times(&t0);
+    c = fork();
+    if (c == 0) {
+        busy_ms(300);
+        _exit(0);
+    }
+    int st;
+    struct rusage ru;
+    pid_t w;
+    while ((w = wait4(c, &st, 0, &ru)) == -1 && errno == EINTR) {
+    }
+    long used = ms_of(&ru.ru_utime, &ru.ru_stime);
+    check(w == c && used >= 150 && used <= 450, "wait4 reports a child's 300 ms",
+          "%ld ms (user %ld.%03ld s)", used, (long)ru.ru_utime.tv_sec, (long)ru.ru_utime.tv_usec / 1000);
+    children = ru_ms(RUSAGE_CHILDREN) - children;
+    check(children >= 150 && children <= 450, "RUSAGE_CHILDREN adds it", "%ld ms", children);
+    times(&t1);
+    long hz = sysconf(_SC_CLK_TCK);
+    long ticks = (long)(t1.tms_cutime + t1.tms_cstime - t0.tms_cutime - t0.tms_cstime);
+    check(ticks >= hz * 15 / 100, "times() adds it", "%ld ticks at %ld Hz", ticks, hz);
+
+    // A thread still working when the process calls exit_group is counted:
+    // the main thread sleeps, the other one works.
+    c = fork();
+    if (c == 0) {
+        pthread_t th;
+        if (pthread_create(&th, NULL, busy_forever, NULL)) _exit(2);
+        sleep_ms(300);
+        _exit(0);
+    }
+    while ((w = wait4(c, &st, 0, &ru)) == -1 && errno == EINTR) {
+    }
+    used = ms_of(&ru.ru_utime, &ru.ru_stime);
+    check(w == c && WIFEXITED(st) && WEXITSTATUS(st) == 0 && used >= 150 && used <= 450,
+          "a thread busy at exit_group counts", "%ld ms, status %#x", used, st);
+
+    // And the two CPU clocks count the kernel's part of a loop of syscalls.
+    long a = clock_ms(CLOCK_THREAD_CPUTIME_ID);
+    busy_ms(100);
+    long d = clock_ms(CLOCK_THREAD_CPUTIME_ID) - a;
+    check(d >= 60 && d <= 150, "CLOCK_THREAD_CPUTIME_ID: 100 ms", "%ld ms", d);
+    a = clock_ms(CLOCK_PROCESS_CPUTIME_ID);
+    busy_ms(100);
+    d = clock_ms(CLOCK_PROCESS_CPUTIME_ID) - a;
+    check(d >= 60 && d <= 150, "CLOCK_PROCESS_CPUTIME_ID: 100 ms", "%ld ms", d);
+}
+
 // ------------------------------------------------------------------- main
 
 static const struct {
@@ -1783,6 +1889,7 @@ static const struct {
     {"badexec", "a failed execve returns, with Linux's errno", sec_badexec},
     {"sched", "what a fork hands down to the scheduler", sec_sched},
     {"image", "the program is not mapped at the null page", sec_image},
+    {"cputime", "what getrusage, times, wait4 and the CPU clocks count", sec_cputime},
 };
 
 int main(int argc, char **argv) {

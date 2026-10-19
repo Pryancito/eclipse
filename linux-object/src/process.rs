@@ -917,10 +917,9 @@ impl NewChild for Process {
 /// `RUSAGE_CHILDREN` totals when it reaps the child.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct ChildCpu {
-    /// User-mode nanoseconds (every thread is dead by exit, so the process's
-    /// dead-thread accumulator holds the complete figure).
+    /// User-mode nanoseconds.
     pub utime_ns: u64,
-    /// Kernel nanoseconds from the per-process syscall accounting.
+    /// Kernel-mode nanoseconds.
     pub stime_ns: u64,
 }
 
@@ -988,15 +987,14 @@ pub const WAIT_STATUS_CONTINUED: i32 = 0xffff;
 /// Zircon user signal used to wake threads parked in a job-control stop.
 const JOB_CONTINUE_SIGNAL: Signal = Signal::USER_SIGNAL_1;
 
-/// Read an exited child's final CPU usage off its still-live object.
+/// Read an exited child's final CPU usage off its still-live object: its
+/// threads' measured time, live ones included, since an `exit_group` makes
+/// the child waitable before they are gone. It was the exited threads' user
+/// time alone, which was nothing for a child that called `exit`, and the
+/// syscall estimate of `/proc/perf` as kernel time.
 fn child_cpu(child: &Arc<Process>) -> ChildCpu {
-    ChildCpu {
-        utime_ns: child.dead_threads_time(),
-        stime_ns: child
-            .try_linux()
-            .map(|lp| lp.perf().totals().1)
-            .unwrap_or(0),
-    }
+    let (utime_ns, stime_ns) = child.cpu_time_ns();
+    ChildCpu { utime_ns, stime_ns }
 }
 
 pub async fn wait_child(
@@ -6355,6 +6353,9 @@ mod exit_handover_tests;
 
 #[cfg(test)]
 mod zombie_pid_tests;
+
+#[cfg(test)]
+mod child_cpu_tests;
 
 #[cfg(test)]
 mod exit_path_benches;
