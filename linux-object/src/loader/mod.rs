@@ -259,12 +259,16 @@ mod preflight;
 
 pub use abi::AuxIdentity;
 
-/// How many symbolic links a `#!` interpreter's path may go through, and a
-/// `PT_INTERP`'s. One constant each, shared by [`LinuxElfLoader::preflight`]
-/// and the loader, because the preflight is only worth anything while it
-/// finds exactly the file the loader is going to open.
-const SHEBANG_FOLLOW: usize = 1;
-const PT_INTERP_FOLLOW: usize = 4;
+/// How many symbolic links an interpreter's path may go through, a `#!`
+/// one's or a `PT_INTERP`'s: as many as any other path, since `open_exec`
+/// looks it up like one. Shared by [`LinuxElfLoader::preflight`] and the
+/// loader, because the preflight is only worth anything while it finds
+/// exactly the file the loader is going to open.
+///
+/// It was 1 for a `#!` interpreter and 4 for a `PT_INTERP`, so a script
+/// whose interpreter is a link to a link (`/usr/bin/vi` through
+/// `/etc/alternatives`) was `ELOOP` where Linux runs it.
+const INTERP_FOLLOW: usize = crate::fs::FOLLOW_MAX_DEPTH;
 
 /// Linux ELF Program Loader.
 pub struct LinuxElfLoader {
@@ -397,7 +401,7 @@ impl LinuxElfLoader {
             let interp_rel = interp.trim_start_matches('/');
             let inode = self
                 .root_inode
-                .lookup_follow(interp_rel, SHEBANG_FOLLOW)
+                .lookup_follow(interp_rel, INTERP_FOLLOW)
                 .map_err(|e| {
                     error!("shebang: lookup interp {:?} failed: {:?}", interp_rel, e);
                     e
@@ -499,7 +503,7 @@ impl LinuxElfLoader {
             let interp_rel = interp.trim_start_matches('/');
             let inode = self
                 .root_inode
-                .lookup_follow(interp_rel, PT_INTERP_FOLLOW)
+                .lookup_follow(interp_rel, INTERP_FOLLOW)
                 .map_err(|e| {
                     error!(
                         "elf: lookup PT_INTERP {:?} failed: {:?} (check if file exists in rootfs)",

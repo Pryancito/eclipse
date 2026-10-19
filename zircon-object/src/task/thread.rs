@@ -1,3 +1,6 @@
+/// The CPU time a thread hands its process; see the module notes.
+#[cfg(test)]
+mod cpu_time_tests;
 mod published_state;
 /// That the word the return path reads is never wrong; see the module notes.
 #[cfg(test)]
@@ -622,7 +625,8 @@ pub struct Thread {
     /// cannot itself block, so every nanosecond inside it is real CPU time,
     /// and none of the (possibly very long) wall-clock a syscall spends
     /// suspended awaiting an event — which happens *between* `poll` calls —
-    /// is ever included. This is `/proc/[pid]/stat`'s `stime`.
+    /// is ever included. This is `/proc/[pid]/stat`'s `stime`, and
+    /// `getrusage`'s.
     sys_time_ns: AtomicU64,
     /// Logical CPU core this thread last ran on (field 39, `processor`, of
     /// `/proc/[pid]/stat`). Updated on every poll from `ThreadSwitchFuture`.
@@ -1417,9 +1421,9 @@ impl Thread {
     ///
     /// Called from `ThreadSwitchFuture::poll`, the one place that can measure
     /// it unambiguously — see [`Thread::sys_time_ns`]. Public like its
-    /// user-mode twin [`Thread::time_add`]: the pair is what `terminate`
-    /// credits to the process, and `/proc/<pid>/stat`'s field 15 is the only
-    /// reader of the kernel-mode half, in another crate.
+    /// user-mode twin [`Thread::time_add`]: the pair is what leaving the
+    /// process's list credits to it, and what `getrusage`, `times`, the CPU
+    /// clocks and `/proc/<pid>/stat` read, in other crates.
     pub fn sys_time_add(&self, time: u64) {
         self.sys_time_ns.fetch_add(time, Ordering::Relaxed);
     }
@@ -1485,13 +1489,9 @@ impl Thread {
         self.exceptionate.shutdown();
         self.lock_inner()
             .change_state(ThreadState::Dead, &self.base);
-        // Credit this thread's CPU time to the process before the thread
-        // disappears from its list, so process-level accounting
-        // (getrusage/times, the parent's wait4 rusage) keeps it.
-        let proc = self.proc();
-        proc.dead_threads_time_add(self.get_time());
-        proc.dead_threads_sys_time_add(self.get_sys_time());
-        proc.remove_thread(self.base.id);
+        // Leaving the list hands this thread's CPU time to the process, so
+        // getrusage, times and the parent's wait4 keep it.
+        self.proc().remove_thread(self.base.id);
     }
 
     /// Terminate a thread whose coroutine was abandoned and can never run again.
@@ -2059,7 +2059,14 @@ impl Future for ThreadSwitchFuture {
         let user_ns = self.thread.get_time().saturating_sub(user_before);
         let sys_ns = poll_ns.saturating_sub(user_ns);
         if sys_ns > 0 {
-            self.thread.sys_time_add(sys_ns);
+            // The poll that finishes the thread already took it off its
+            // process's list, with its clocks: what this poll spent in the
+            // kernel goes straight to the process, or nobody counts it.
+            if ret.is_ready() {
+                self.thread.proc().dead_threads_sys_time_add(sys_ns);
+            } else {
+                self.thread.sys_time_add(sys_ns);
+            }
             kernel_hal::kstats::note_sys_time(cpu, sys_ns);
         }
         if user_ns > 0 {

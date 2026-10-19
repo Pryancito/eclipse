@@ -60,9 +60,20 @@
 //   * a forked child and a new thread started at nice 0, on SCHED_OTHER and
 //     free to run on any CPU, whatever their parent had: `nice make` only
 //     reniced make. And SCHED_RESET_ON_FORK was accepted and thrown away.
+//   * a `#!` interpreter reached through two symbolic links was ELOOP (one
+//     was the most), and an interpreter nobody may execute still ran.
 //   * a static-pie -- what musl's `gcc -static` builds, this probe included
 //     -- was loaded at address 0, so a null pointer read its ELF header
 //     instead of faulting.
+//   * the kernel time `getrusage` and `times` reported was the wall time of
+//     one syscall in sixteen, times sixteen, so a shell that had waited
+//     half a second used seconds of CPU; `wait4` reported almost nothing for
+//     a child that had called `exit`; and the thread CPU clock left the
+//     kernel out.
+//   * `RLIMIT_FSIZE` held back `truncate`, `ftruncate` and `pwrite` only:
+//     `write`, `writev` and `fallocate` went past it, a `pwrite` across it
+//     failed instead of stopping at it, a file already past it could not be
+//     cut down, and no `SIGXFSZ` came with any `EFBIG`.
 //
 // Every section states what Linux does and checks it, printing the numbers
 // whether it passes or fails. Each section runs in a child of its own, so a
@@ -124,6 +135,14 @@
 //   image      the program is mapped above the null page, and reading
 //              through a null pointer kills with SIGSEGV, however it was
 //              linked (static, static-pie, dynamic).
+//   cputime    the CPU time `getrusage`, `times`, `wait4` and the CPU clocks
+//              report: none for a process asleep, the 300 ms a child worked
+//              (a thread still working at `exit_group` included), and the
+//              kernel's part of a loop of syscalls on the CPU clocks.
+//   fsize      `RLIMIT_FSIZE`: a write across it stops at it and one at it is
+//              EFBIG with a SIGXFSZ, which kills by default, whatever the
+//              call; a new length past it is refused only when it grows the
+//              file; and a pipe is not a file.
 //
 // Build:  make                 (x86_64-linux-musl-gcc -O2 -static)
 // Run:    ./signal-probe [--only SECTION]
@@ -155,6 +174,8 @@
 #include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
+#include <sys/times.h>
+#include <sys/uio.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <ucontext.h>
@@ -1476,6 +1497,31 @@ static void sec_badexec(void) {
     write_elf_with_interp("/tmp/bx-elf-other", "/no/such/ld.so", other);
     check_exec("/tmp/bx-elf-other", ENOEXEC, "an ELF for another machine: ENOEXEC");
 
+    // An interpreter is opened for execution like the program: one nobody
+    // may execute is EACCES before anything is read from it.
+    write_file("/tmp/bx-junk-rw", junk, sizeof junk, 0644);
+    write_file("/tmp/bx-rwinterp", "#!/tmp/bx-junk-rw\n", 18, 0755);
+    check_exec("/tmp/bx-rwinterp", EACCES, "#! naming no executable: EACCES");
+    write_elf_with_interp("/tmp/bx-elf-rw", "/tmp/bx-junk-rw", em);
+    check_exec("/tmp/bx-elf-rw", EACCES, "PT_INTERP of no executable: EACCES");
+
+    // And its path goes through links like any other path. The last one is
+    // called `sh`, because busybox picks what to be by the name it was run
+    // under, and an interpreter is run under the name in the `#!` line.
+    mkdir("/tmp/bx-links", 0755);
+    const char *links[][2] = {{"/bin/sh", "/tmp/bx-l1"}, {"/tmp/bx-l1", "/tmp/bx-l2"}, {"/tmp/bx-l2", "/tmp/bx-links/sh"}};
+    int linked_up = 1;
+    for (size_t i = 0; i < sizeof links / sizeof links[0] && linked_up; i++) {
+        unlink(links[i][1]);
+        linked_up = symlink(links[i][0], links[i][1]) == 0;
+    }
+    check(linked_up, "three links to /bin/sh", "%s", linked_up ? "" : strerror(errno));
+    write_file("/tmp/bx-linked", "#!/tmp/bx-links/sh\nexit 9\n", 26, 0755);
+    int linked = exec_status("/tmp/bx-linked");
+    check(WIFEXITED(linked) && WEXITSTATUS(linked) == 9, "#! through three links runs",
+          "st=%#x (exit %d, signal %d)", linked, WIFEXITED(linked) ? WEXITSTATUS(linked) : -1,
+          WIFSIGNALED(linked) ? WTERMSIG(linked) : 0);
+
     // Five scripts in front of /bin/sh run; six are ELOOP.
     for (int len = 5; len <= 6; len++) {
         char name[64], line[64];
@@ -1511,9 +1557,12 @@ static void sec_badexec(void) {
     const char *made[] = {
         "/tmp/bx-junk10",       "/tmp/bx-noshebang", "/tmp/bx-emptyshebang", "/tmp/bx-badinterp",
         "/tmp/bx-nointerp",     "/tmp/bx-junk128",   "/tmp/bx-elf-nointerp", "/tmp/bx-elf-junk",
-        "/tmp/bx-elf-short",    "/tmp/bx-elf-dir",   "/tmp/bx-elf-other",
+        "/tmp/bx-elf-short",    "/tmp/bx-elf-dir",   "/tmp/bx-elf-other",    "/tmp/bx-junk-rw",
+        "/tmp/bx-rwinterp",     "/tmp/bx-elf-rw",    "/tmp/bx-l1",           "/tmp/bx-l2",
+        "/tmp/bx-links/sh",     "/tmp/bx-linked",
     };
     for (size_t i = 0; i < sizeof made / sizeof made[0]; i++) unlink(made[i]);
+    rmdir("/tmp/bx-links");
 }
 
 // ------------------------------------------------------------------- sched
@@ -1731,6 +1780,269 @@ static void sec_image(void) {
           WIFEXITED(st) && WEXITSTATUS(st) == 3 ? " (the read came back)" : "");
 }
 
+// ----------------------------------------------------------------- cputime
+
+static long ms_of(const struct timeval *a, const struct timeval *b) {
+    return (a->tv_sec + b->tv_sec) * 1000L + (a->tv_usec + b->tv_usec) / 1000;
+}
+
+static long ru_ms(int who) {
+    struct rusage ru;
+    getrusage(who, &ru);
+    return ms_of(&ru.ru_utime, &ru.ru_stime);
+}
+
+static long clock_ms(clockid_t clock) {
+    struct timespec t;
+    clock_gettime(clock, &t);
+    return t.tv_sec * 1000L + t.tv_nsec / 1000000;
+}
+
+// `ms` of wall time spent in a loop of syscalls, so half of it or more is
+// the kernel's: what a program that works through the kernel looks like.
+static void busy_ms(long ms) {
+    long end = clock_ms(CLOCK_MONOTONIC) + ms;
+    while (clock_ms(CLOCK_MONOTONIC) < end) syscall(SYS_getppid);
+}
+
+static void *busy_forever(void *arg) {
+    (void)arg;
+    for (;;) busy_ms(1000);
+    return NULL;
+}
+
+static void sec_cputime(void) {
+    // Asleep is not on the CPU: 32 sleeps of 10 ms and a wait for a child
+    // that sleeps 400 ms cost microseconds.
+    pid_t c = fork();
+    if (c == 0) {
+        sleep_ms(400);
+        _exit(0);
+    }
+    long before = ru_ms(RUSAGE_SELF);
+    for (int i = 0; i < 32; i++) sleep_ms(10);
+    status_of(c);
+    long slept = ru_ms(RUSAGE_SELF) - before;
+    check(slept < 50, "sleeping and waiting take no CPU", "%ld ms of CPU over ~400 ms asleep", slept);
+
+    // A child that works for 300 ms has used about 300 ms, which `wait4`
+    // reports and the reaper's RUSAGE_CHILDREN and times() add up.
+    long children = ru_ms(RUSAGE_CHILDREN);
+    struct tms t0, t1;
+    times(&t0);
+    c = fork();
+    if (c == 0) {
+        busy_ms(300);
+        _exit(0);
+    }
+    int st;
+    struct rusage ru;
+    pid_t w;
+    while ((w = wait4(c, &st, 0, &ru)) == -1 && errno == EINTR) {
+    }
+    long used = ms_of(&ru.ru_utime, &ru.ru_stime);
+    check(w == c && used >= 150 && used <= 450, "wait4 reports a child's 300 ms",
+          "%ld ms (user %ld.%03ld s)", used, (long)ru.ru_utime.tv_sec, (long)ru.ru_utime.tv_usec / 1000);
+    children = ru_ms(RUSAGE_CHILDREN) - children;
+    check(children >= 150 && children <= 450, "RUSAGE_CHILDREN adds it", "%ld ms", children);
+    times(&t1);
+    long hz = sysconf(_SC_CLK_TCK);
+    long ticks = (long)(t1.tms_cutime + t1.tms_cstime - t0.tms_cutime - t0.tms_cstime);
+    check(ticks >= hz * 15 / 100, "times() adds it", "%ld ticks at %ld Hz", ticks, hz);
+
+    // A thread still working when the process calls exit_group is counted:
+    // the main thread sleeps, the other one works.
+    c = fork();
+    if (c == 0) {
+        pthread_t th;
+        if (pthread_create(&th, NULL, busy_forever, NULL)) _exit(2);
+        sleep_ms(300);
+        _exit(0);
+    }
+    while ((w = wait4(c, &st, 0, &ru)) == -1 && errno == EINTR) {
+    }
+    used = ms_of(&ru.ru_utime, &ru.ru_stime);
+    check(w == c && WIFEXITED(st) && WEXITSTATUS(st) == 0 && used >= 150 && used <= 450,
+          "a thread busy at exit_group counts", "%ld ms, status %#x", used, st);
+
+    // And the two CPU clocks count the kernel's part of a loop of syscalls.
+    long a = clock_ms(CLOCK_THREAD_CPUTIME_ID);
+    busy_ms(100);
+    long d = clock_ms(CLOCK_THREAD_CPUTIME_ID) - a;
+    check(d >= 60 && d <= 150, "CLOCK_THREAD_CPUTIME_ID: 100 ms", "%ld ms", d);
+    a = clock_ms(CLOCK_PROCESS_CPUTIME_ID);
+    busy_ms(100);
+    d = clock_ms(CLOCK_PROCESS_CPUTIME_ID) - a;
+    check(d >= 60 && d <= 150, "CLOCK_PROCESS_CPUTIME_ID: 100 ms", "%ld ms", d);
+}
+
+// ------------------------------------------------------------------- fsize
+
+static volatile sig_atomic_t g_xfsz;
+
+static void on_xfsz(int sig) {
+    (void)sig;
+    g_xfsz++;
+}
+
+static void fsize_checks(void) {
+    // Linux holds every write to a regular file to RLIMIT_FSIZE
+    // (`generic_write_check_limits`): a write across the limit stops at it,
+    // and one that starts at or past it is EFBIG and a SIGXFSZ. A call that
+    // sets a length (`inode_newsize_ok`) is held to it only when it grows the
+    // file.
+    static char buf[8192];
+    memset(buf, 'x', sizeof buf);
+    const char *path = "/tmp/fz-file", *big = "/tmp/fz-big";
+    write_file(big, buf, sizeof buf, 0644);  // made before the limit
+    unlink(path);
+    int fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0644);
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_handler = on_xfsz;
+    sigaction(SIGXFSZ, &sa, NULL);
+    struct rlimit rl = {4096, 4096};
+    int r = setrlimit(RLIMIT_FSIZE, &rl);
+    check(fd >= 0 && r == 0, "a file, and RLIMIT_FSIZE 4096", "fd %d, %s", fd,
+          r ? strerror(errno) : "");
+
+    g_xfsz = 0;
+    ssize_t n = write(fd, buf, sizeof buf);
+    check(n == 4096 && g_xfsz == 0, "write across the limit stops at it",
+          "ret %zd, %d SIGXFSZ", n, (int)g_xfsz);
+    errno = 0;
+    n = write(fd, buf, 1);
+    int e = errno;
+    check(n == -1 && e == EFBIG && g_xfsz == 1, "write at the limit: EFBIG and SIGXFSZ",
+          "ret %zd errno %d, %d SIGXFSZ", n, e, (int)g_xfsz);
+    g_xfsz = 0;
+    n = write(fd, buf, 0);
+    check(n == 0 && g_xfsz == 0, "an empty write at the limit is 0", "ret %zd, %d SIGXFSZ", n,
+          (int)g_xfsz);
+    n = pwrite(fd, buf, 200, 4000);
+    check(n == 96 && g_xfsz == 0, "pwrite across the limit stops at it", "ret %zd, %d SIGXFSZ",
+          n, (int)g_xfsz);
+    errno = 0;
+    n = pwrite(fd, buf, 10, 5000);
+    e = errno;
+    check(n == -1 && e == EFBIG && g_xfsz == 1, "pwrite past the limit: EFBIG and SIGXFSZ",
+          "ret %zd errno %d, %d SIGXFSZ", n, e, (int)g_xfsz);
+    g_xfsz = 0;
+    struct iovec iov[2] = {{buf, 3000}, {buf, 3000}};
+    lseek(fd, 0, SEEK_SET);
+    n = writev(fd, iov, 2);
+    check(n == 4096 && g_xfsz == 0, "writev across the limit stops at it", "ret %zd, %d SIGXFSZ",
+          n, (int)g_xfsz);
+    int fb = open(big, O_RDONLY);
+    loff_t in = 0, out = 0;
+    n = syscall(SYS_copy_file_range, fb, &in, fd, &out, sizeof buf, 0);
+    check(n == 4096 && g_xfsz == 0, "copy_file_range across the limit stops at it",
+          "ret %zd errno %d, %d SIGXFSZ", n, n < 0 ? errno : 0, (int)g_xfsz);
+    close(fb);
+
+    // A new length: growing past the limit is refused, cutting down is not,
+    // even to a length still past it.
+    errno = 0;
+    r = ftruncate(fd, 8192);
+    e = errno;
+    check(r == -1 && e == EFBIG && g_xfsz == 1, "ftruncate past the limit: EFBIG and SIGXFSZ",
+          "ret %d errno %d, %d SIGXFSZ", r, e, (int)g_xfsz);
+    g_xfsz = 0;
+    fb = open(big, O_RDWR);
+    r = ftruncate(fb, 6000);
+    check(r == 0 && g_xfsz == 0, "a file past the limit can be cut down",
+          "ret %d errno %d, %d SIGXFSZ", r, r ? errno : 0, (int)g_xfsz);
+    errno = 0;
+    r = ftruncate(fb, 7000);
+    e = errno;
+    check(r == -1 && e == EFBIG && g_xfsz == 1, "but not grown", "ret %d errno %d, %d SIGXFSZ",
+          r, e, (int)g_xfsz);
+    close(fb);
+    g_xfsz = 0;
+    errno = 0;
+    r = fallocate(fd, 0, 0, 8192);
+    e = errno;
+    check(r == -1 && e == EFBIG && g_xfsz == 1, "fallocate past the limit: EFBIG and SIGXFSZ",
+          "ret %d errno %d, %d SIGXFSZ", r, e, (int)g_xfsz);
+    g_xfsz = 0;
+    r = fallocate(fd, FALLOC_FL_KEEP_SIZE, 0, 8192);
+    struct stat st;
+    fstat(fd, &st);
+    check(r == 0 && g_xfsz == 0 && st.st_size == 4096,
+          "fallocate past it with FALLOC_FL_KEEP_SIZE is not growing",
+          "ret %d errno %d, %d SIGXFSZ, size %lld", r, r ? errno : 0, (int)g_xfsz,
+          (long long)st.st_size);
+
+    // A pipe has no size to limit.
+    int p[2];
+    r = pipe(p);
+    n = r ? -1 : write(p[1], buf, sizeof buf);
+    check(n == (ssize_t)sizeof buf && g_xfsz == 0, "a pipe is not held to it",
+          "ret %zd, %d SIGXFSZ", n, (int)g_xfsz);
+    if (!r) {
+        close(p[0]);
+        close(p[1]);
+    }
+    close(fd);
+
+    // And SIGXFSZ kills a process that has not asked to be told: an
+    // O_APPEND write to the file now at the limit.
+    pid_t c = fork();
+    if (c == 0) {
+        struct rlimit no_core = {0, 0};
+        setrlimit(RLIMIT_CORE, &no_core);
+        signal(SIGXFSZ, SIG_DFL);
+        int a = open(path, O_WRONLY | O_APPEND);
+        ssize_t w = write(a, buf, 1);
+        _exit(w == -1 && errno == EFBIG ? 3 : 4);  // came back
+    }
+    int status = status_of(c);
+    check(WIFSIGNALED(status) && WTERMSIG(status) == SIGXFSZ, "unhandled, SIGXFSZ kills",
+          "status %#x", status);
+    unlink(path);
+    unlink(big);
+}
+
+static void sec_fsize(void) {
+    // The probe's own output may be a file already past the limit, which
+    // would answer the section's lines with EFBIG and SIGXFSZ: the checks
+    // run in a child that prints through a pipe, which has no limit.
+    int out[2];
+    if (pipe(out)) {
+        check(0, "a pipe for the output", "%s", strerror(errno));
+        return;
+    }
+    pid_t c = fork();
+    if (c == 0) {
+        close(out[0]);
+        dup2(out[1], STDOUT_FILENO);
+        close(out[1]);
+        g_fail = 0;
+        fsize_checks();
+        fflush(stdout);
+        _exit(g_fail > 100 ? 100 : g_fail);
+    }
+    close(out[1]);
+    char chunk[512];
+    ssize_t n;
+    while ((n = read(out[0], chunk, sizeof chunk)) != 0) {
+        if (n > 0) {
+            fwrite(chunk, 1, (size_t)n, stdout);
+        } else if (errno != EINTR) {
+            break;
+        }
+    }
+    close(out[0]);
+    fflush(stdout);
+    int st = status_of(c);
+    if (WIFEXITED(st)) {
+        g_fail += WEXITSTATUS(st);
+    } else {
+        check(0, "the checks' process", "died of signal %d",
+              WIFSIGNALED(st) ? WTERMSIG(st) : 0);
+    }
+}
+
 // ------------------------------------------------------------------- main
 
 static const struct {
@@ -1753,6 +2065,8 @@ static const struct {
     {"badexec", "a failed execve returns, with Linux's errno", sec_badexec},
     {"sched", "what a fork hands down to the scheduler", sec_sched},
     {"image", "the program is not mapped at the null page", sec_image},
+    {"cputime", "what getrusage, times, wait4 and the CPU clocks count", sec_cputime},
+    {"fsize", "RLIMIT_FSIZE holds every write to a file, with SIGXFSZ", sec_fsize},
 };
 
 int main(int argc, char **argv) {

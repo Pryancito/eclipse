@@ -473,6 +473,17 @@ impl Syscall<'_> {
     /// otherwise (`write(2)` cannot say it): a writer whose reader has gone
     /// is killed unless it asked to be told instead. Without the signal,
     /// `yes | head -1` ran `yes` for ever.
+    /// `send_sig(SIGXFSZ, current, 0)`: what a call that would make a file
+    /// bigger than `RLIMIT_FSIZE` sends along with its `EFBIG`. The default
+    /// action ends the process, the way `SIGPIPE`'s does for a writer to a
+    /// closed pipe.
+    pub(crate) fn raise_sigxfsz(&self) {
+        self.thread
+            .lock_linux()
+            .signals
+            .insert(linux_object::signal::Signal::SIGXFSZ);
+    }
+
     pub(super) fn raise_sigpipe_if_due(&self, e: LxError, stream: bool) {
         if sigpipe_due(e, stream) {
             self.thread
@@ -551,9 +562,6 @@ impl Syscall<'_> {
             fd, base, len, offset
         );
         let offset = linux_object::fs::user_offset(offset)?;
-        // `generic_write_check_limits`: what the window ENDS at is what the
-        // file would have to grow to.
-        self.check_fsize_limit(offset.saturating_add(len as u64))?;
         let file_like = self.linux_process().get_file_like(fd)?;
         // Zero bytes still has to reach the file: that is where a descriptor
         // not open for writing answers EBADF.
@@ -895,32 +903,32 @@ impl Syscall<'_> {
         }
     }
 
-    /// `RLIMIT_FSIZE`, the largest file this process may make, or `EFBIG`.
+    /// `RLIMIT_FSIZE` on a call that sets a regular file's length
+    /// (`inode_newsize_ok`): growing it past the limit is `EFBIG`, and a
+    /// `SIGXFSZ`. A write's share of the limit is the file's to apply
+    /// (`linux_object::fs::File`), and its signal the dispatcher's.
     ///
-    /// Linux asks this of every call that can grow a regular file
-    /// (`inode_newsize_ok`, and `generic_write_check_limits` on the write
-    /// paths), and nothing here asked it at all: the limit was stored, read
-    /// back by `getrlimit` and never compared against anything, so
+    /// Nothing here asked it at all once: the limit was stored, read back by
+    /// `getrlimit` and never compared against anything, so
     /// `ftruncate(fd, 1 << 50)` from any process went straight to the
     /// filesystem. On the RAM-backed roots this kernel runs on, a `resize`
     /// commits every block it grows by, which is how one `ftruncate` to ~456
     /// MiB took the desktop out of memory (the incident this file's `warn!`
-    /// below was added for). A limit a program sets on itself, or that a
-    /// launcher sets for it, now means something.
-    ///
-    /// `RLIM_INFINITY` is not a very large limit: it is compared against
-    /// nothing at all.
-    fn check_fsize_limit(&self, len: u64) -> linux_object::error::LxResult {
+    /// below was added for). Then it was asked of every new length, so a file
+    /// already past the limit could not be cut down to one that still was,
+    /// and it came without the signal.
+    fn check_fsize_growth(&self, size: u64, new_len: u64) -> linux_object::error::LxResult {
         let limit =
             self.linux_process()
                 .rlimit(linux_object::process::RLIMIT_FSIZE, None, false)?;
-        if limit.cur != linux_object::process::RLIM_INFINITY && len > limit.cur {
+        if grows_past_fsize(limit.cur, size, new_len) {
             warn!(
                 "[rlimit] EFBIG: len={} > RLIMIT_FSIZE={} comm={}",
-                len,
+                new_len,
                 limit.cur,
                 self.zircon_process().name(),
             );
+            self.raise_sigxfsz();
             return Err(LxError::EFBIG);
         }
         Ok(())
@@ -936,7 +944,7 @@ impl Syscall<'_> {
         let metadata = inode.metadata()?;
         Self::truncate_type(metadata.type_)?;
         proc.check_access(&metadata, 0o2, true)?;
-        self.check_fsize_limit(len as u64)?;
+        self.check_fsize_growth(metadata.size as u64, len as u64)?;
         inode
             .resize(len)
             .map_err(|e| linux_object::fs::fs_grow_error(&inode, e))?;
@@ -952,8 +960,9 @@ impl Syscall<'_> {
         let len = linux_object::fs::user_len(len)?;
         let proc = self.linux_process();
         let file = proc.get_file(fd)?;
-        Self::ftruncate_type(file.metadata()?.type_)?;
-        self.check_fsize_limit(len as u64)?;
+        let metadata = file.metadata()?;
+        Self::ftruncate_type(metadata.type_)?;
+        self.check_fsize_growth(metadata.size as u64, len as u64)?;
         // The desktop OOM was a single ftruncate growing one RAM-backed file
         // to ~456 MiB (117k live 4 KiB ramfs blocks in one resize). Name any
         // suspicious-sized truncate loudly: which file, how big, and who.
@@ -1086,6 +1095,16 @@ impl Syscall<'_> {
             _ => return Err(LxError::ENODEV),
         };
         let end = offset.checked_add(len).ok_or(LxError::EFBIG)?;
+        let keep_size = match op {
+            FallocateOp::Allocate { keep_size } | FallocateOp::ZeroRange { keep_size } => keep_size,
+        };
+        let grows = resizable && !keep_size;
+        // Only a call that grows the file answers to `RLIMIT_FSIZE`
+        // (`shmem_fallocate`, `ext4_fallocate`: `inode_newsize_ok` when the
+        // new end is past `i_size`), and before anything is allocated.
+        if grows {
+            self.check_fsize_growth(meta.size as u64, end as u64)?;
+        }
         // EclipseFS has an extent map: real preallocation, and a punched
         // hole that gives its blocks back instead of a write of zeros.
         if resizable {
@@ -1096,10 +1115,6 @@ impl Syscall<'_> {
                 return Ok(0);
             }
         }
-        let keep_size = match op {
-            FallocateOp::Allocate { keep_size } | FallocateOp::ZeroRange { keep_size } => keep_size,
-        };
-        let grows = resizable && !keep_size;
         if grows && end > meta.size {
             file.set_len(end as u64)?;
         }
@@ -1112,7 +1127,7 @@ impl Syscall<'_> {
             let zeros = alloc::vec![0u8; FALLOCATE_ZERO_CHUNK.min(zero_end.saturating_sub(at))];
             while at < zero_end {
                 let n = zeros.len().min(zero_end - at);
-                let written = file.write_at(at as u64, &zeros[..n])?;
+                let written = file.fill_at(at as u64, &zeros[..n])?;
                 if written == 0 {
                     return Err(LxError::EIO);
                 }
@@ -3146,6 +3161,38 @@ pub(crate) fn sigpipe_due(e: LxError, stream: bool) -> bool {
     e == LxError::EPIPE && stream
 }
 
+/// The calls whose `EFBIG` comes with a `SIGXFSZ`: the ones that write a
+/// file's bytes (`generic_write_check_limits` sends it when a write starts at
+/// or past `RLIMIT_FSIZE`). The file answers `EFBIG` for the limit and the
+/// call sends the signal only when that is its answer: a call that wrote
+/// some bytes before reaching the limit returns their count, and no signal.
+///
+/// An `EFBIG` a filesystem gives for its own largest file comes with the
+/// signal here too, which Linux does not send; no filesystem this kernel
+/// mounts has a largest file this side of the 64-bit offsets.
+pub(crate) fn writes_a_file(sys: &crate::Sys) -> bool {
+    use crate::Sys;
+    matches!(
+        sys,
+        Sys::WRITE
+            | Sys::PWRITE64
+            | Sys::WRITEV
+            | Sys::PWRITEV
+            | Sys::PWRITEV2
+            | Sys::SENDFILE
+            | Sys::COPY_FILE_RANGE
+            | Sys::SPLICE
+    )
+}
+
+/// Whether setting a file of `size` bytes to `new_len` breaks a
+/// `RLIMIT_FSIZE` of `limit`. Only growing does: `inode_newsize_ok` looks at
+/// the limit when `i_size < offset`, so a file already past the limit can
+/// still be cut down to a length that is too.
+pub(crate) fn grows_past_fsize(limit: u64, size: u64, new_len: u64) -> bool {
+    limit != linux_object::process::RLIM_INFINITY && new_len > size && new_len > limit
+}
+
 #[cfg(test)]
 mod staging_tests {
     //! The staging buffer every write syscall copies its bytes through. Its
@@ -3236,7 +3283,36 @@ mod pipe_write_tests {
     //! for room, and a writer with no reader gets `SIGPIPE` with its
     //! `EPIPE`.
 
-    use super::{after_write_error, sigpipe_due, AfterWriteError, LxError};
+    use super::{after_write_error, grows_past_fsize, sigpipe_due, AfterWriteError, LxError};
+
+    #[test]
+    fn the_calls_that_write_a_file_send_sigxfsz_with_efbig() {
+        use crate::Sys;
+        for sys in [Sys::WRITE, Sys::PWRITE64, Sys::WRITEV, Sys::PWRITEV] {
+            assert!(super::writes_a_file(&sys), "{:?}", sys);
+        }
+        // `truncate` sends its own (`check_fsize_growth`), and a read none.
+        for sys in [Sys::READ, Sys::FTRUNCATE, Sys::TRUNCATE, Sys::IOCTL] {
+            assert!(!super::writes_a_file(&sys), "{:?}", sys);
+        }
+    }
+
+    #[test]
+    fn only_growing_a_file_past_its_limit_breaks_rlimit_fsize() {
+        assert!(grows_past_fsize(4096, 0, 8192));
+        assert!(grows_past_fsize(4096, 4096, 4097));
+        assert!(!grows_past_fsize(4096, 0, 4096), "up to the limit is fine");
+        assert!(
+            !grows_past_fsize(4096, 8192, 6000),
+            "cutting a file down is fine, whatever is left"
+        );
+        assert!(!grows_past_fsize(4096, 8192, 8192));
+        assert!(!grows_past_fsize(
+            linux_object::process::RLIM_INFINITY,
+            0,
+            u64::MAX
+        ));
+    }
 
     #[test]
     fn a_blocking_pipe_writer_waits_on_eagain_wherever_it_is() {

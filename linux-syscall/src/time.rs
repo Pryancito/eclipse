@@ -87,6 +87,19 @@ mod times_tests {
             3_153_600_000
         );
     }
+
+    /// `RUSAGE_THREAD` and a thread's CPU clock count its kernel time too:
+    /// they were its user time alone.
+    #[test]
+    fn a_thread_reports_its_kernel_time_too() {
+        let proc = zircon_object::task::Process::create(&ROOT_JOB, "cpu").unwrap();
+        let thread = Thread::create(&proc, "t").unwrap();
+        thread.time_add(5_000);
+        thread.sys_time_add(2_000);
+        let reported = thread_cpu_ns(&thread);
+        thread.terminate_abandoned();
+        assert_eq!(reported, (5_000, 2_000));
+    }
 }
 
 /// Linux `struct timex` (x86_64 / LP64): `adjtimex(2)` / `clock_adjtime(2)`.
@@ -495,16 +508,14 @@ impl Syscall<'_> {
     }
 
     /// What a CPU clock reads now, in nanoseconds: the accounting
-    /// `getrusage(2)` and `times(2)` report, user time per thread and the
-    /// process's kernel time from the syscall accounting (which is not split
-    /// per thread, so a thread clock counts user time alone, as
-    /// `RUSAGE_THREAD` does). Whose is resolved as `pid_for_clock` does:
-    /// `0` is the caller, a thread clock names a thread of the caller's own
-    /// process, a process clock names any process, and anything else is
-    /// `EINVAL`.
+    /// `getrusage(2)` and `times(2)` report, [`thread_cpu_ns`] for a thread
+    /// and `Process::cpu_time_ns` for a process. Whose is
+    /// resolved as `pid_for_clock` does: `0` is the caller, a thread clock
+    /// names a thread of the caller's own process, a process clock names any
+    /// process, and anything else is `EINVAL`.
     fn cpu_clock_ns(&self, clock: CpuClock) -> Result<u64, LxError> {
         let (utime_ns, stime_ns) = match clock.owner {
-            CpuClockOwner::Thread(0) => (self.thread.get_time(), 0),
+            CpuClockOwner::Thread(0) => thread_cpu_ns(self.thread),
             CpuClockOwner::Thread(tid) => {
                 let thread = self
                     .zircon_process()
@@ -512,7 +523,7 @@ impl Syscall<'_> {
                     .ok()
                     .and_then(|obj| obj.downcast_arc::<Thread>().ok())
                     .ok_or(LxError::EINVAL)?;
-                (thread.get_time(), 0)
+                thread_cpu_ns(&thread)
             }
             CpuClockOwner::Process(pid) => {
                 let proc = if pid == 0 {
@@ -520,11 +531,7 @@ impl Syscall<'_> {
                 } else {
                     linux_object::process::find_process(pid as KoID).ok_or(LxError::EINVAL)?
                 };
-                let stime_ns = proc
-                    .try_linux()
-                    .map(|linux| linux.perf().totals().1)
-                    .unwrap_or(0);
-                (process_user_time_ns(&proc), stime_ns)
+                proc.cpu_time_ns()
             }
         };
         Ok(clock.kind.value_ns(utime_ns, stime_ns))
@@ -677,14 +684,12 @@ impl Syscall<'_> {
     /// get resource usage
     /// (see [linux man getrusage(2)](https://www.man7.org/linux/man-pages/man2/getrusage.2.html)).
     ///
-    /// `ru_utime` is the accumulated user-mode time of the target's threads
-    /// (measured around every user-mode entry in the run loop); `ru_stime` is
-    /// the process's accumulated in-kernel syscall time from the perf
-    /// accounting. The previous implementation wrote the wall-clock
-    /// time-since-boot into both fields, which made any "CPU used" computation
-    /// (`time(1)`, build systems' self-profiling) nonsense.
-    /// `RUSAGE_CHILDREN` reports zeros: usage of reaped children is not
-    /// retained.
+    /// `ru_utime` and `ru_stime` are the CPU time of the caller's process
+    /// (`Process::cpu_time_ns`) or of its thread ([`thread_cpu_ns`]), and
+    /// `RUSAGE_CHILDREN` the reaped children's totals.
+    /// The previous implementation wrote the wall-clock time-since-boot into
+    /// both fields, which made any "CPU used" computation (`time(1)`, build
+    /// systems' self-profiling) nonsense.
     pub fn sys_getrusage(&mut self, who: usize, mut rusage: UserOutPtr<RUsage>) -> SysResult {
         info!("getrusage: who: {}, rusage: {:?}", who, rusage);
         use crate::intarg::RusageWho;
@@ -693,13 +698,8 @@ impl Syscall<'_> {
         // caller's compiler had zero-extended it, which is what a varargs
         // `syscall(SYS_getrusage, RUSAGE_CHILDREN, &ru)` does.
         let (utime_ns, stime_ns) = match getrusage_args(who, rusage.is_null())? {
-            RusageWho::Process => (
-                process_user_time_ns(self.zircon_process()),
-                self.linux_process().perf().totals().1,
-            ),
-            // Per-thread kernel time is not split out of the process total;
-            // report the thread's user time and zero kernel time.
-            RusageWho::Thread => (self.thread.get_time(), 0),
+            RusageWho::Process => self.zircon_process().cpu_time_ns(),
+            RusageWho::Thread => thread_cpu_ns(self.thread),
             // Totals of children this process has reaped, accumulated at
             // wait4/waitid time exactly like Linux does.
             RusageWho::Children => self.linux_process().children_cpu_ns(),
@@ -734,8 +734,7 @@ impl Syscall<'_> {
         let tick = clock_ticks_since_boot(kernel_hal::timer::timer_now());
 
         if !buf.is_null() {
-            let utime_ns = process_user_time_ns(self.zircon_process());
-            let stime_ns = self.linux_process().perf().totals().1;
+            let (utime_ns, stime_ns) = self.zircon_process().cpu_time_ns();
             let (cutime_ns, cstime_ns) = self.linux_process().children_cpu_ns();
             let new_buf = Tms {
                 tms_utime: utime_ns / NSEC_PER_TICK,
@@ -1233,14 +1232,19 @@ fn timespec_to_duration(ts: TimeSpec) -> Duration {
     Duration::from_secs(ts.sec as u64) + Duration::from_nanos(ts.nsec as u64)
 }
 
-/// Accumulated user-mode nanoseconds of `proc`: its live threads plus the
-/// process-level accumulator of already-exited ones (Linux keeps counting a
-/// joined thread's time in the process totals). This is the utime side of
-/// getrusage(2)/times(2); kernel-side time is accounted per-syscall by
-/// `linux_object::perf` and reported as stime.
-fn process_user_time_ns(proc: &alloc::sync::Arc<zircon_object::task::Process>) -> u64 {
-    let live: u64 = proc.threads().iter().map(|t| t.get_time()).sum();
-    live + proc.dead_threads_time()
+/// The CPU time of one thread, `(user, kernel)` nanoseconds, the way
+/// `Process::cpu_time_ns` adds up a whole process's: both halves measured on
+/// the CPU (`ThreadSwitchFuture::poll`), so a thread asleep in a syscall
+/// adds nothing.
+///
+/// The kernel half used to be `/proc/perf`'s syscall accounting, and only a
+/// process had one. That is the WALL time of one call in sixteen multiplied
+/// by sixteen: a `waitpid` or a `nanosleep` that happened to be sampled
+/// counted sixteen times what it slept, so a shell that had waited half a
+/// second for a child had used seconds of CPU. And a thread's clock was its
+/// user time alone, a quarter of a loop of syscalls.
+fn thread_cpu_ns(thread: &Thread) -> (u64, u64) {
+    (thread.get_time(), thread.get_sys_time())
 }
 
 /// `ITIMER_*` indices from the uapi.

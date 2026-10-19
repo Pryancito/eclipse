@@ -354,13 +354,15 @@ struct ExecPreflight(());
 /// [`LinuxElfLoader::preflight`].
 ///
 /// `image` is the file being executed, `root_inode` the process's root for
-/// resolving an interpreter path. Takes no process and no thread on purpose:
+/// resolving an interpreter path, `creds` the caller's, which an interpreter
+/// is opened for execution with. Takes no process and no thread on purpose:
 /// what it can reach is the whole of what makes it safe to run before
 /// [`de_thread`], so the signature is the guarantee and not the comment.
 fn execve_preflight(
     image: &Arc<dyn rcore_fs::vfs::INode>,
     syscall_entry: VirtAddr,
     root_inode: &Arc<dyn rcore_fs::vfs::INode>,
+    creds: &linux_object::process::Credentials,
 ) -> LxResult<ExecPreflight> {
     LinuxElfLoader {
         syscall_entry,
@@ -371,7 +373,7 @@ fn execve_preflight(
         // the set-user-ID transition that decides it has not happened.
         identity: Default::default(),
     }
-    .preflight(image)?;
+    .preflight(image, creds)?;
     Ok(ExecPreflight(()))
 }
 
@@ -1447,7 +1449,12 @@ impl Syscall<'_> {
         // as a script, prints "not found") instead of the process dying on
         // the instruction after the syscall. Linux draws the same line: the
         // `bprm` is fully built before `begin_new_exec` commits.
-        let past_every_check = execve_preflight(&inode, self.syscall_entry, proc.root_inode())?;
+        let past_every_check = execve_preflight(
+            &inode,
+            self.syscall_entry,
+            proc.root_inode(),
+            &proc.credentials(),
+        )?;
 
         // POSIX/Linux: execve in a multithreaded process kills every other
         // thread in the group before the address space is replaced. Leaving

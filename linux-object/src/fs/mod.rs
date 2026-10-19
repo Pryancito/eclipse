@@ -3380,7 +3380,7 @@ mod tests {
 /// When the budget ran out, `lookup_follow` left a symlink inode in place and
 /// the next component failed with ENOTDIR ("Failed to get DRM device: Not a
 /// directory").
-const FOLLOW_MAX_DEPTH: usize = 40;
+pub(crate) const FOLLOW_MAX_DEPTH: usize = 40;
 
 /// Fast path for virtual filesystems mounted at `/proc`, `/sys`, and `/dev`.
 /// Avoids ext2 directory scans on every access (VBox AHCI can stall there).

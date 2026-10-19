@@ -12,7 +12,7 @@ mod fd;
 pub(crate) use fd::{anon_fd_flags, open_flags, ANON_CLOEXEC, ANON_NONBLOCK};
 #[allow(clippy::module_inception)]
 mod file;
-pub(crate) use file::{after_write_error, sigpipe_due, AfterWriteError};
+pub(crate) use file::{after_write_error, sigpipe_due, writes_a_file, AfterWriteError};
 mod mount;
 #[cfg(target_arch = "x86_64")]
 mod nvidia;

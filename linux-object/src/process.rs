@@ -193,7 +193,7 @@ pub fn published_capabilities(euid: u32) -> u64 {
 const NO_ID: u32 = u32::MAX;
 const ACCESS_READ: u16 = 0o4;
 const ACCESS_WRITE: u16 = 0o2;
-const ACCESS_EXEC: u16 = 0o1;
+pub(crate) const ACCESS_EXEC: u16 = 0o1;
 const MODE_PERM_MASK: u16 = 0o7777;
 const MODE_SET_UID: u16 = 0o4000;
 const MODE_SET_GID: u16 = 0o2000;
@@ -917,10 +917,9 @@ impl NewChild for Process {
 /// `RUSAGE_CHILDREN` totals when it reaps the child.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct ChildCpu {
-    /// User-mode nanoseconds (every thread is dead by exit, so the process's
-    /// dead-thread accumulator holds the complete figure).
+    /// User-mode nanoseconds.
     pub utime_ns: u64,
-    /// Kernel nanoseconds from the per-process syscall accounting.
+    /// Kernel-mode nanoseconds.
     pub stime_ns: u64,
 }
 
@@ -988,15 +987,14 @@ pub const WAIT_STATUS_CONTINUED: i32 = 0xffff;
 /// Zircon user signal used to wake threads parked in a job-control stop.
 const JOB_CONTINUE_SIGNAL: Signal = Signal::USER_SIGNAL_1;
 
-/// Read an exited child's final CPU usage off its still-live object.
+/// Read an exited child's final CPU usage off its still-live object: its
+/// threads' measured time, live ones included, since an `exit_group` makes
+/// the child waitable before they are gone. It was the exited threads' user
+/// time alone, which was nothing for a child that called `exit`, and the
+/// syscall estimate of `/proc/perf` as kernel time.
 fn child_cpu(child: &Arc<Process>) -> ChildCpu {
-    ChildCpu {
-        utime_ns: child.dead_threads_time(),
-        stime_ns: child
-            .try_linux()
-            .map(|lp| lp.perf().totals().1)
-            .unwrap_or(0),
-    }
+    let (utime_ns, stime_ns) = child.cpu_time_ns();
+    ChildCpu { utime_ns, stime_ns }
 }
 
 pub async fn wait_child(
@@ -3146,7 +3144,7 @@ impl LinuxProcess {
     /// may `creds` do `requested` (an `0o7` mask) to a file owned by
     /// `owner_uid:owner_gid` with mode `mode`? `use_effective` selects the
     /// effective ids (every normal path) or the real ones (`access(2)`).
-    fn access_verdict(
+    pub(crate) fn access_verdict(
         creds: &Credentials,
         owner_uid: u32,
         owner_gid: u32,
@@ -6355,6 +6353,9 @@ mod exit_handover_tests;
 
 #[cfg(test)]
 mod zombie_pid_tests;
+
+#[cfg(test)]
+mod child_cpu_tests;
 
 #[cfg(test)]
 mod exit_path_benches;

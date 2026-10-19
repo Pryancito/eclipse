@@ -814,6 +814,11 @@ impl Syscall<'_> {
         // which would panic on a plain `Duration` subtraction.
         self.thread.set_current_syscall(None);
         self.check_ext_intact("after", num);
+        if matches!(ret, Err(LxError::EFBIG))
+            && Sys::try_from(num).is_ok_and(|sys| file::writes_a_file(&sys))
+        {
+            self.raise_sigxfsz();
+        }
         let elapsed_ns = match perf_start {
             Some(start) => kernel_hal::timer::timer_now()
                 .checked_sub(start)

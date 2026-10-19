@@ -27,6 +27,7 @@
 //! | neither `#!` nor an ELF this machine runs | `ENOEXEC` |
 //! | a `#!` line with no interpreter on it     | `ENOEXEC` |
 //! | an interpreter that is not a regular file | `EACCES`  |
+//! | an interpreter the caller may not execute | `EACCES`  |
 //! | a sixth `#!` script in one chain          | `ELOOP`   |
 //! | `PT_INTERP` not NUL-terminated, or empty  | `ENOEXEC` |
 //! | `PT_INTERP` naming nothing                | `ENOENT`  |
@@ -39,6 +40,7 @@
 
 use super::*;
 use crate::error::LxError;
+use crate::process::{Credentials, LinuxProcess, ACCESS_EXEC};
 use rcore_fs::vfs::FileType;
 
 /// `e_machine` of the images this kernel runs: `elf_check_arch`.
@@ -146,10 +148,17 @@ fn read_full(file: &Arc<dyn INode>, offset: usize, buf: &mut [u8]) -> LxResult<u
     Ok(done)
 }
 
-/// `do_open_execat`: `if (!S_ISREG(...)) return -EACCES`. A directory or a
-/// device named as an interpreter is refused like the image itself would be.
-fn regular(file: &Arc<dyn INode>) -> LxResult<()> {
-    if file.metadata()?.type_ == FileType::File {
+/// `do_open_execat`, which `open_exec` opens an interpreter with, as
+/// `execve` opens the program: `MAY_EXEC` for the caller, and then `if
+/// (!S_ISREG(...)) return -EACCES`. A directory or a device named as an
+/// interpreter is refused like the image itself would be, and so is one the
+/// caller may not execute -- root included, when it has no execute bit at
+/// all. That half was missing: a `chmod -x` interpreter still ran.
+fn opened_for_exec(file: &Arc<dyn INode>, creds: &Credentials) -> LxResult<()> {
+    let m = file.metadata()?;
+    let (uid, gid, is_dir) = (m.uid as u32, m.gid as u32, m.type_ == FileType::Dir);
+    LinuxProcess::access_verdict(creds, uid, gid, m.mode, is_dir, ACCESS_EXEC, true)?;
+    if m.type_ == FileType::File {
         Ok(())
     } else {
         Err(LxError::EACCES)
@@ -206,11 +215,12 @@ impl LinuxElfLoader {
     /// loading or mapping anything. See the [module documentation](self).
     ///
     /// `image` is the file the caller named, already checked for search and
-    /// execute permission and found to be a regular file. The `#!` chain is
-    /// walked from it, every interpreter is looked up and checked as the
-    /// loader will look it up, and the ELF at the end of it is checked
-    /// together with its `PT_INTERP`.
-    pub fn preflight(&self, image: &Arc<dyn INode>) -> LxResult<()> {
+    /// execute permission and found to be a regular file, and `creds` the
+    /// caller's, which every interpreter is opened for execution with. The
+    /// `#!` chain is walked from it, every interpreter is looked up and
+    /// checked as the loader will look it up, and the ELF at the end of it is
+    /// checked together with its `PT_INTERP`.
+    pub fn preflight(&self, image: &Arc<dyn INode>, creds: &Credentials) -> LxResult<()> {
         let mut file = image.clone();
         let mut buf = [0u8; 512];
         // `exec_binprm`: `if (depth > 5) return -ELOOP;`, asked before each
@@ -224,17 +234,17 @@ impl LinuxElfLoader {
             let head = &buf[..n];
             if !head.starts_with(b"#!") {
                 let phdrs = image_phdrs(&file, head, LxError::ENOEXEC)?;
-                return self.preflight_pt_interp(&file, &phdrs);
+                return self.preflight_pt_interp(&file, &phdrs, creds);
             }
             // `load_script`: "No interpreter name found".
             let interp = shebang_interp(head).ok_or(LxError::ENOEXEC)?;
             let next = self
                 .root_inode
-                .lookup_follow(interp.trim_start_matches('/'), SHEBANG_FOLLOW)
+                .lookup_follow(interp.trim_start_matches('/'), INTERP_FOLLOW)
                 .inspect_err(|e| {
                     warn!("execve: interpreter {:?} does not resolve: {:?}", interp, e);
                 })?;
-            regular(&next)?;
+            opened_for_exec(&next, creds)?;
             file = next;
         }
         unreachable!("the chain ends at a depth `MAX_INTERP_DEPTH` bounds")
@@ -243,7 +253,12 @@ impl LinuxElfLoader {
     /// The dynamic linker `image` names, checked as `load_elf_binary` checks
     /// it before `begin_new_exec`: looked up, a regular file, and the header
     /// and program headers of an ELF for this machine.
-    fn preflight_pt_interp(&self, image: &Arc<dyn INode>, phdrs: &[u8]) -> LxResult<()> {
+    fn preflight_pt_interp(
+        &self,
+        image: &Arc<dyn INode>,
+        phdrs: &[u8],
+        creds: &Credentials,
+    ) -> LxResult<()> {
         // The first `PT_INTERP`, as `get_interpreter` finds it.
         let ph = match phdrs
             .as_chunks::<PHDR_SIZE>()
@@ -275,11 +290,11 @@ impl LinuxElfLoader {
         };
         let file = self
             .root_inode
-            .lookup_follow(interp.trim_start_matches('/'), PT_INTERP_FOLLOW)
+            .lookup_follow(interp.trim_start_matches('/'), INTERP_FOLLOW)
             .inspect_err(|e| {
                 warn!("execve: PT_INTERP {:?} does not resolve: {:?}", interp, e);
             })?;
-        regular(&file)?;
+        opened_for_exec(&file, creds)?;
         let mut head = [0u8; EHDR_SIZE];
         if read_full(&file, 0, &mut head)? != EHDR_SIZE {
             return Err(LxError::EIO);
@@ -390,8 +405,13 @@ mod tests {
             l.write_at(0, target.as_bytes()).unwrap();
         }
 
-        /// `execve` of `/name`, as far as the preflight goes.
+        /// `execve` of `/name` by root, as far as the preflight goes.
         fn exec(&self, name: &str) -> LxResult<()> {
+            self.exec_as(name, &Credentials::default())
+        }
+
+        /// `execve` of `/name` by `creds`, as far as the preflight goes.
+        fn exec_as(&self, name: &str, creds: &Credentials) -> LxResult<()> {
             let image = self.root.lookup(name).unwrap();
             LinuxElfLoader {
                 syscall_entry: 0,
@@ -399,7 +419,7 @@ mod tests {
                 root_inode: self.root.clone(),
                 identity: Default::default(),
             }
-            .preflight(&image)
+            .preflight(&image, creds)
         }
 
         /// A file holding `bytes`, executed.
@@ -451,7 +471,7 @@ mod tests {
             root_inode: fs.root.clone(),
             identity: Default::default(),
         };
-        assert_eq!(loader.preflight(&image), Ok(()));
+        assert_eq!(loader.preflight(&image, &Credentials::default()), Ok(()));
     }
 
     #[test]
@@ -607,14 +627,81 @@ mod tests {
         fs.symlink("sh", "/busybox");
         fs.symlink("sh2", "/sh");
         assert_eq!(fs.run(b"#!/sh\n"), Ok(()));
-        // Two links is one more than `SHEBANG_FOLLOW`.
-        assert_eq!(SHEBANG_FOLLOW, 1);
-        assert_eq!(fs.run(b"#!/sh2\n"), Err(LxError::ELOOP));
-        // `PT_INTERP` goes through up to four, as `libc.musl` -> `ld-musl`
-        // and friends need.
+        assert_eq!(fs.run(b"#!/sh2\n"), Ok(()));
         fs.symlink("ld1", "/ld.so");
         fs.symlink("ld2", "/ld1");
         assert_eq!(fs.run(&dynamic("/ld2")), Ok(()));
+    }
+
+    /// An interpreter's path goes through as many links as any other path,
+    /// `MAXSYMLINKS`, and one more is `ELOOP`: a `#!` one and a `PT_INTERP`
+    /// alike. They went through 1 and 4.
+    #[test]
+    fn an_interpreter_goes_through_as_many_links_as_any_path() {
+        let fs = Fs::new();
+        fs.file("busybox", &image(&[]));
+        fs.symlink("l1", "/busybox");
+        fs.symlink("ld1", "/ld.so");
+        for i in 2..=crate::fs::FOLLOW_MAX_DEPTH + 1 {
+            fs.symlink(&format!("l{}", i), &format!("/l{}", i - 1));
+            fs.symlink(&format!("ld{}", i), &format!("/ld{}", i - 1));
+        }
+        let most = crate::fs::FOLLOW_MAX_DEPTH;
+        assert_eq!(fs.run(format!("#!/l{}\n", most).as_bytes()), Ok(()));
+        assert_eq!(
+            fs.run(format!("#!/l{}\n", most + 1).as_bytes()),
+            Err(LxError::ELOOP)
+        );
+        assert_eq!(fs.run(&dynamic(&format!("/ld{}", most))), Ok(()));
+        assert_eq!(
+            fs.run(&dynamic(&format!("/ld{}", most + 1))),
+            Err(LxError::ELOOP)
+        );
+    }
+
+    /// `open_exec` asks `MAY_EXEC` of an interpreter, so one the caller may
+    /// not execute is `EACCES`, as the program itself would be: a `#!` one
+    /// and a `PT_INTERP` alike, and for root when the file has no execute
+    /// bit at all. It used to run.
+    #[test]
+    fn an_interpreter_the_caller_may_not_execute_is_eacces() {
+        let fs = Fs::new();
+        let not_executable = |name: &str, bytes: &[u8], mode: u32| {
+            let f = fs.root.create(name, FileType::File, mode).unwrap();
+            f.write_at(0, bytes).unwrap();
+        };
+        not_executable("sh-rw", &image(&[]), 0o644);
+        not_executable("ld-rw", &image(&[]), 0o644);
+        assert_eq!(fs.run(b"#!/sh-rw\n"), Err(LxError::EACCES));
+        assert_eq!(fs.run(&dynamic("/ld-rw")), Err(LxError::EACCES));
+
+        // Execute for its owner only: root may (it has a bit), a stranger
+        // may not, through a link as much as by name.
+        not_executable("sh-owner", &image(&[]), 0o744);
+        fs.symlink("sh-link", "/sh-owner");
+        fs.file("script", b"#!/sh-link\n");
+        assert_eq!(fs.exec("script"), Ok(()));
+        let stranger = Credentials {
+            ruid: 1000,
+            euid: 1000,
+            suid: 1000,
+            fsuid: 1000,
+            rgid: 1000,
+            egid: 1000,
+            sgid: 1000,
+            fsgid: 1000,
+            groups: vec![1000],
+            ..Credentials::default()
+        };
+        assert_eq!(fs.exec_as("script", &stranger), Err(LxError::EACCES));
+        // Asked of the effective ids, as every open is: a set-user-ID root
+        // program run by that stranger may.
+        let set_uid_root = Credentials {
+            ruid: 1000,
+            rgid: 1000,
+            ..Credentials::default()
+        };
+        assert_eq!(fs.exec_as("script", &set_uid_root), Ok(()));
     }
 
     /// Five scripts may stand in front of the ELF, as on Linux; the sixth is
