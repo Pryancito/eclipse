@@ -24,8 +24,8 @@ pub use nvidia_rm_sys::frontend::events::{
 };
 pub use nvidia_rm_sys::frontend::{
     caching, copy_version, layout_mismatch, rm_version, set_user_range_validator, version_check,
-    Caller, CpuCaching, MmapContext, MmapMemory, LAYOUT, NV_ERR_STATE_IN_USE, VERSION_CMD_QUERY,
-    VERSION_REPLY_RECOGNIZED, VERSION_STRING_LENGTH,
+    Caller, CpuCaching, MmapContext, MmapMemory, GPU_UUID_LEN, LAYOUT, NV_ERR_STATE_IN_USE,
+    VERSION_CMD_QUERY, VERSION_REPLY_RECOGNIZED, VERSION_STRING_LENGTH,
 };
 use nvidia_rm_sys::types::{NV_ERR_NOT_READY, NV_OK, NV_STATUS};
 
@@ -132,6 +132,12 @@ impl Card {
             None => u32::MAX,
         }
     }
+
+    /// The GPU's binary UUID, the one a client reads with GET_GID_INFO and
+    /// UVM_REGISTER_GPU names it by; `None` for a GPU with no instance.
+    pub fn uuid(&self) -> Option<[u8; GPU_UUID_LEN]> {
+        self.instance.and_then(nvidia_rm_sys::frontend::gpu_uuid)
+    }
 }
 
 impl NvidiaGpu {
@@ -211,6 +217,7 @@ mod tests {
         let gpu = NvidiaGpu::for_test(0x1f06, 8192);
         assert_eq!(gpu.frontend_card(0).instance, None);
         assert_eq!(gpu.frontend_card(0).gpu_id(), u32::MAX);
+        assert_eq!(gpu.frontend_card(0).uuid(), None);
         *gpu.rm_device_instance.lock() = Some(1);
         assert_eq!(gpu.frontend_card(0).instance, Some(1));
     }

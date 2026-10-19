@@ -5,8 +5,10 @@
 //! On Linux it is a module of its own, kernel-open/nvidia-uvm. libcuda's
 //! `cuInit` opens it twice and makes three calls; if the file is missing, or
 //! any of the three fails, `cuInit` answers CUDA_ERROR_UNKNOWN (999) and no
-//! CUDA program gets a device. Those three are served here as uvm.c serves
-//! them:
+//! CUDA program gets a device. Once it has the devices it registers each
+//! GPU with UVM and makes a range group, and if either fails `cuInit`
+//! answers CUDA_ERROR_NOT_INITIALIZED (3). All of them are served here as
+//! uvm.c serves them:
 //!
 //! - UVM_INITIALIZE makes the open a VA space with the caller's flags. Asked
 //!   again with the same flags it changes nothing; with others, or with a
@@ -18,13 +20,17 @@
 //!   libcuda closes the second open on it.
 //! - UVM_PAGEABLE_MEM_ACCESS answers false: the GPU cannot reach ordinary
 //!   process memory here (no HMM, no ATS).
+//! - UVM_REGISTER_GPU registers, in the VA space, a GPU the RM brought up,
+//!   named by the UUID the RM hands a client; one it does not know, or one
+//!   registered already, is refused. UVM_UNREGISTER_GPU undoes it.
+//! - UVM_CREATE_RANGE_GROUP hands out a new range group id, which
+//!   UVM_DESTROY_RANGE_GROUP takes back. Nothing is put in a group yet.
 //!
 //! UVM_DEINITIALIZE succeeds and does nothing, as there. Every other command
 //! is ENOSYS, the module's answer to one it does not know, and is logged by
 //! name the first time it is asked for: that line says what the next batch
-//! needs. The first is expected at `cuCtxCreate`, which registers the GPU
-//! and its VA space with UVM, and from then on UVM owns that VA space's page
-//! tables.
+//! needs. The first is expected at `cuCtxCreate`: UVM_REGISTER_GPU_VASPACE,
+//! after which UVM owns that GPU VA space's page tables.
 //!
 //! A command is a plain number (`UVM_IOCTL_BASE(i)` is `i` on Linux), not an
 //! `_IOC` encoding. A served one answers through its params' `rmStatus`, and
@@ -34,7 +40,10 @@
 
 use alloc::collections::BTreeSet;
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 use core::any::Any;
+use core::fmt;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use kernel_hal::user::{UserInPtr, UserOutPtr};
 use lock::Mutex;
@@ -52,6 +61,10 @@ pub const MAJOR: usize = 510;
 pub mod cmd {
     pub const INITIALIZE: u32 = 0x3000_0001;
     pub const DEINITIALIZE: u32 = 0x3000_0002;
+    pub const CREATE_RANGE_GROUP: u32 = 23;
+    pub const DESTROY_RANGE_GROUP: u32 = 24;
+    pub const REGISTER_GPU: u32 = 37;
+    pub const UNREGISTER_GPU: u32 = 38;
     pub const PAGEABLE_MEM_ACCESS: u32 = 39;
     pub const MM_INITIALIZE: u32 = 75;
 }
@@ -66,14 +79,51 @@ const MM_INITIALIZE_STATUS: usize = 4;
 /// `NV_STATUS rmStatus`.
 const PAGEABLE_MEM_ACCESS_SIZE: usize = 8;
 const PAGEABLE_MEM_ACCESS_STATUS: usize = 4;
+/// `UVM_REGISTER_GPU_PARAMS`: `NvProcessorUuid gpu_uuid`, `NvBool
+/// numaEnabled`, `NvS32 numaNodeId`, `NvS32 rmCtrlFd`, `NvHandle hClient`,
+/// `NvHandle hSmcPartRef`, `NV_STATUS rmStatus`.
+const REGISTER_GPU_SIZE: usize = 40;
+const REGISTER_GPU_NUMA_ENABLED: usize = 16;
+const REGISTER_GPU_NUMA_NODE_ID: usize = 20;
+const REGISTER_GPU_STATUS: usize = 36;
+/// `UVM_UNREGISTER_GPU_PARAMS`: `NvProcessorUuid gpu_uuid`, `NV_STATUS
+/// rmStatus`.
+const UNREGISTER_GPU_SIZE: usize = 20;
+const UNREGISTER_GPU_STATUS: usize = 16;
+/// `UVM_CREATE_RANGE_GROUP_PARAMS` and `UVM_DESTROY_RANGE_GROUP_PARAMS`:
+/// `NvU64 rangeGroupId`, `NV_STATUS rmStatus`.
+const RANGE_GROUP_SIZE: usize = 16;
+const RANGE_GROUP_STATUS: usize = 8;
 
 /// `UVM_INIT_FLAGS_MASK`: DISABLE_HMM and MULTI_PROCESS_SHARING_MODE.
 const INIT_FLAGS_MASK: u64 = 0x3;
 
 const NV_OK: u32 = 0;
+const NV_ERR_GPU_UUID_NOT_FOUND: u32 = 0x12;
 const NV_ERR_ILLEGAL_ACTION: u32 = 0x16;
 const NV_ERR_INVALID_ARGUMENT: u32 = 0x1F;
+const NV_ERR_INVALID_DEVICE: u32 = 0x26;
+const NV_ERR_OBJECT_NOT_FOUND: u32 = 0x57;
 const NV_WARN_NOTHING_TO_DO: u32 = 0x0001_0006;
+
+/// A GPU's binary UUID (`NvProcessorUuid`).
+type Uuid = [u8; nvctl::GPU_UUID_LEN];
+
+/// The size of a served command's params and where their `rmStatus` is;
+/// `None` for one not served.
+fn layout(cmd: u32) -> Option<(usize, usize)> {
+    Some(match cmd {
+        cmd::INITIALIZE => (INITIALIZE_SIZE, INITIALIZE_STATUS),
+        cmd::MM_INITIALIZE => (MM_INITIALIZE_SIZE, MM_INITIALIZE_STATUS),
+        cmd::PAGEABLE_MEM_ACCESS => (PAGEABLE_MEM_ACCESS_SIZE, PAGEABLE_MEM_ACCESS_STATUS),
+        cmd::REGISTER_GPU => (REGISTER_GPU_SIZE, REGISTER_GPU_STATUS),
+        cmd::UNREGISTER_GPU => (UNREGISTER_GPU_SIZE, UNREGISTER_GPU_STATUS),
+        cmd::CREATE_RANGE_GROUP | cmd::DESTROY_RANGE_GROUP => {
+            (RANGE_GROUP_SIZE, RANGE_GROUP_STATUS)
+        }
+        _ => return None,
+    })
+}
 
 fn rdev() -> usize {
     make_rdev(MAJOR, 0)
@@ -149,10 +199,23 @@ enum FdType {
     VaSpace { flags: u64 },
 }
 
+/// What a VA space holds (`uvm_va_space_t`), of what is served: the GPUs
+/// registered in it and its range groups. Only reached once the open is a
+/// VA space.
+#[derive(Debug, Default)]
+struct VaSpace {
+    gpus: BTreeSet<Uuid>,
+    range_groups: BTreeSet<u64>,
+    /// `range_group_id_counter`: the last id handed out. The first is 1, as
+    /// 0 is UVM_RANGE_GROUP_ID_NONE, and none is handed out twice.
+    last_range_group: u64,
+}
+
 /// One open of `/dev/nvidia-uvm`.
 pub struct UvmOpen {
     inode_id: usize,
     fd_type: Mutex<FdType>,
+    va_space: Mutex<VaSpace>,
 }
 
 impl UvmOpen {
@@ -160,6 +223,7 @@ impl UvmOpen {
         UvmOpen {
             inode_id,
             fd_type: Mutex::new(FdType::Uninitialized),
+            va_space: Mutex::new(VaSpace::default()),
         }
     }
 
@@ -176,20 +240,17 @@ impl UvmOpen {
         arg: usize,
         open_of_fd: &dyn Fn(i32) -> Option<Arc<dyn INode>>,
     ) -> LxResult<usize> {
-        let size = match cmd {
-            cmd::DEINITIALIZE => return Ok(0),
-            cmd::INITIALIZE => INITIALIZE_SIZE,
-            cmd::MM_INITIALIZE => MM_INITIALIZE_SIZE,
-            cmd::PAGEABLE_MEM_ACCESS => PAGEABLE_MEM_ACCESS_SIZE,
-            _ => {
-                not_served(cmd);
-                return Err(LxError::ENOSYS);
-            }
+        if cmd == cmd::DEINITIALIZE {
+            return Ok(0);
+        }
+        let Some((size, _)) = layout(cmd) else {
+            not_served(cmd);
+            return Err(LxError::ENOSYS);
         };
         let mut params = UserInPtr::<u8>::from(arg)
             .read_array(size)
             .map_err(|_| LxError::EFAULT)?;
-        self.call(cmd, &mut params, open_of_fd);
+        self.call(cmd, &mut params, open_of_fd, &rm_gpus);
         UserOutPtr::<u8>::from(arg)
             .write_array(&params)
             .map_err(|_| LxError::EFAULT)?;
@@ -197,32 +258,32 @@ impl UvmOpen {
     }
 
     /// A served command on the kernel copy of its params: its answer goes in
-    /// their `rmStatus`.
+    /// their `rmStatus`. `gpus` are the UUIDs of the GPUs UVM can register.
     fn call(
         &self,
         cmd: u32,
         params: &mut [u8],
         open_of_fd: &dyn Fn(i32) -> Option<Arc<dyn INode>>,
+        gpus: &dyn Fn() -> Vec<Uuid>,
     ) {
-        let (status, at) = match cmd {
-            cmd::INITIALIZE => (self.initialize(u64_at(params, 0)), INITIALIZE_STATUS),
-            cmd::MM_INITIALIZE => (
-                mm_initialize(i32_at(params, 0), open_of_fd),
-                MM_INITIALIZE_STATUS,
-            ),
+        let status = match cmd {
+            cmd::INITIALIZE => self.initialize(u64_at(params, 0)),
+            cmd::MM_INITIALIZE => mm_initialize(i32_at(params, 0), open_of_fd),
+            // The INIT_CHECK of the module's route for every other one: not
+            // on an open that is not a VA space, whose params go back as
+            // they came.
+            _ if !self.is_va_space() => NV_ERR_ILLEGAL_ACTION,
             cmd::PAGEABLE_MEM_ACCESS => {
-                // The INIT_CHECK of the module's route: not on an open that
-                // is not a VA space, whose params go back as they came.
-                let status = if self.is_va_space() {
-                    params[0] = 0;
-                    NV_OK
-                } else {
-                    NV_ERR_ILLEGAL_ACTION
-                };
-                (status, PAGEABLE_MEM_ACCESS_STATUS)
+                params[0] = 0;
+                NV_OK
             }
+            cmd::REGISTER_GPU => self.register_gpu(params, gpus),
+            cmd::UNREGISTER_GPU => self.unregister_gpu(&uuid_at(params, 0)),
+            cmd::CREATE_RANGE_GROUP => self.create_range_group(params),
+            cmd::DESTROY_RANGE_GROUP => self.destroy_range_group(u64_at(params, 0)),
             _ => unreachable!("only served commands get here"),
         };
+        let (_, at) = layout(cmd).expect("only served commands get here");
         params[at..at + 4].copy_from_slice(&status.to_le_bytes());
     }
 
@@ -239,6 +300,95 @@ impl UvmOpen {
             FdType::VaSpace { flags: was } if was == flags => NV_OK,
             FdType::VaSpace { .. } => NV_ERR_INVALID_ARGUMENT,
         }
+    }
+
+    /// `uvm_api_register_gpu`: the GPU must be one the RM brought up
+    /// (`uvm_gpu_retain_by_uuid`), and not registered here already. Its UUID
+    /// goes back as it came (with no MIG, `gpu->uuid` is the one asked for),
+    /// and it is not a NUMA node: its memory is not onlined as system memory
+    /// here. rmCtrlFd, hClient and hSmcPartRef only matter to MIG.
+    fn register_gpu(&self, params: &mut [u8], gpus: &dyn Fn() -> Vec<Uuid>) -> u32 {
+        let uuid = uuid_at(params, 0);
+        let known = gpus();
+        if !known.contains(&uuid) {
+            unknown_gpu(&uuid, known.len());
+            return NV_ERR_GPU_UUID_NOT_FOUND;
+        }
+        if !self.va_space.lock().gpus.insert(uuid) {
+            return NV_ERR_INVALID_DEVICE;
+        }
+        params[REGISTER_GPU_NUMA_ENABLED] = 0;
+        params[REGISTER_GPU_NUMA_NODE_ID..REGISTER_GPU_NUMA_NODE_ID + 4]
+            .copy_from_slice(&(-1i32).to_le_bytes());
+        NV_OK
+    }
+
+    /// `uvm_api_unregister_gpu`: only a GPU registered in this VA space.
+    fn unregister_gpu(&self, uuid: &Uuid) -> u32 {
+        if self.va_space.lock().gpus.remove(uuid) {
+            NV_OK
+        } else {
+            NV_ERR_INVALID_DEVICE
+        }
+    }
+
+    /// `uvm_api_create_range_group`.
+    fn create_range_group(&self, params: &mut [u8]) -> u32 {
+        let mut va_space = self.va_space.lock();
+        va_space.last_range_group += 1;
+        let id = va_space.last_range_group;
+        va_space.range_groups.insert(id);
+        params[..8].copy_from_slice(&id.to_le_bytes());
+        NV_OK
+    }
+
+    /// `uvm_api_destroy_range_group`: only a group of this VA space.
+    fn destroy_range_group(&self, id: u64) -> u32 {
+        if self.va_space.lock().range_groups.remove(&id) {
+            NV_OK
+        } else {
+            NV_ERR_OBJECT_NOT_FOUND
+        }
+    }
+}
+
+/// The UUIDs of the GPUs the RM brought up, which are the ones UVM can
+/// register (`nvidia_dev_get_uuid` finds no other).
+fn rm_gpus() -> Vec<Uuid> {
+    nvctl::cards()
+        .iter()
+        .filter_map(nvctl::Card::uuid)
+        .collect()
+}
+
+/// Whether a refused UVM_REGISTER_GPU was logged already.
+static UNKNOWN_GPU_LOGGED: AtomicBool = AtomicBool::new(false);
+
+/// One log line the first time UVM_REGISTER_GPU names a GPU the RM does not
+/// know: `cuInit` then answers 3, and this line is what says why.
+fn unknown_gpu(uuid: &Uuid, known: usize) {
+    if !UNKNOWN_GPU_LOGGED.swap(true, Ordering::Relaxed) {
+        zcore_drivers::klog_warn!(
+            "[nvidia-uvm] UVM_REGISTER_GPU: {} is none of the {} GPUs the RM brought up: NV_ERR_GPU_UUID_NOT_FOUND",
+            ShowUuid(uuid),
+            known
+        );
+    }
+}
+
+/// A UUID as `nvidia-smi -L` writes it.
+struct ShowUuid<'a>(&'a Uuid);
+
+impl fmt::Display for ShowUuid<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_str("GPU-")?;
+        for (i, b) in self.0.iter().enumerate() {
+            if matches!(i, 4 | 6 | 8 | 10) {
+                f.write_str("-")?;
+            }
+            write!(f, "{:02x}", b)?;
+        }
+        Ok(())
     }
 }
 
@@ -293,6 +443,12 @@ fn u64_at(b: &[u8], at: usize) -> u64 {
 
 fn i32_at(b: &[u8], at: usize) -> i32 {
     i32::from_le_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]])
+}
+
+fn uuid_at(b: &[u8], at: usize) -> Uuid {
+    let mut v = [0u8; nvctl::GPU_UUID_LEN];
+    v.copy_from_slice(&b[at..at + nvctl::GPU_UUID_LEN]);
+    v
 }
 
 /// The commands uvm.c routes, by number, for the log.
@@ -386,7 +542,7 @@ pub fn create_node(root: &Arc<DevINode>) {
         return;
     }
     zcore_drivers::klog_warn!(
-        "[nvidia-uvm] /dev/nvidia-uvm: cuInit's three calls served, the rest logged"
+        "[nvidia-uvm] /dev/nvidia-uvm: cuInit's calls served, the rest logged"
     );
 }
 

@@ -232,6 +232,7 @@ extern "C" {
     fn eclipse_rm_frontend_release(os_info: *mut c_void);
     fn eclipse_rm_frontend_version() -> *const c_char;
     fn eclipse_rm_frontend_gpu_id(gpu_instance: NvU32) -> NvU32;
+    fn eclipse_rm_frontend_gpu_uuid(gpu_instance: NvU32, uuid: *mut NvU8) -> NV_STATUS;
     fn eclipse_rm_frontend_gpu_instance(gpu: *mut c_void) -> NvU32;
     fn eclipse_rm_frontend_layout(which: NvU32) -> NvU32;
 }
@@ -277,6 +278,10 @@ unsafe fn eclipse_rm_frontend_version() -> *const c_char {
 #[cfg(not(target_os = "none"))]
 unsafe fn eclipse_rm_frontend_gpu_id(_gpu_instance: NvU32) -> NvU32 {
     u32::MAX
+}
+#[cfg(not(target_os = "none"))]
+unsafe fn eclipse_rm_frontend_gpu_uuid(_gpu_instance: NvU32, _uuid: *mut NvU8) -> NV_STATUS {
+    NV_ERR_GPU_UUID_NOT_FOUND
 }
 #[cfg(not(target_os = "none"))]
 unsafe fn eclipse_rm_frontend_gpu_instance(_gpu: *mut c_void) -> NvU32 {
@@ -524,6 +529,19 @@ pub fn rm_version() -> &'static [u8] {
 pub fn gpu_id(instance: u32) -> u32 {
     let _gate = crate::rm_init::RmGate::lock();
     unsafe { eclipse_rm_frontend_gpu_id(instance) }
+}
+
+/// `GPU_UUID_LEN` (nv.h): the bytes of a GPU's binary UUID.
+pub const GPU_UUID_LEN: usize = 16;
+
+/// The binary UUID of GPU instance `instance`, the one
+/// `NV2080_CTRL_CMD_GPU_GET_GID_INFO` hands a client (SHA1, binary) and the
+/// one UVM names a GPU by; `None` when the instance names no GPU.
+pub fn gpu_uuid(instance: u32) -> Option<[u8; GPU_UUID_LEN]> {
+    let mut uuid = [0u8; GPU_UUID_LEN];
+    let _gate = crate::rm_init::RmGate::lock();
+    let status = unsafe { eclipse_rm_frontend_gpu_uuid(instance, uuid.as_mut_ptr()) };
+    (status == NV_OK).then_some(uuid)
 }
 
 /// The first nv-ioctl.h payload whose C `sizeof` disagrees with
