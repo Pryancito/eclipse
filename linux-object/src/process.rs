@@ -1018,7 +1018,11 @@ pub async fn wait_child_interest(
     let mut looked_since_clear = false;
     loop {
         check_signals()?;
-        {
+        // One hold of the lock for both looks: a death recorded between them
+        // moves the child from `children` to `reaped_children`, and two
+        // holds saw it in neither and answered ECHILD for a child that was
+        // just then dying.
+        let child = {
             let mut inner = proc.linux().inner.lock();
             if interest.exited {
                 if let Some(&ReapedChild { code, cpu, .. }) = inner.reaped_children.get(&pid) {
@@ -1029,9 +1033,6 @@ pub async fn wait_child_interest(
                     return Ok((wait_status_exited(code), cpu));
                 }
             }
-        }
-        let child = {
-            let inner = proc.linux().inner.lock();
             inner.children.get(&pid).cloned().ok_or(LxError::ECHILD)?
         };
         if interest.exited {
