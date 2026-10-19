@@ -70,6 +70,10 @@
 //     half a second used seconds of CPU; `wait4` reported almost nothing for
 //     a child that had called `exit`; and the thread CPU clock left the
 //     kernel out.
+//   * `RLIMIT_FSIZE` held back `truncate`, `ftruncate` and `pwrite` only:
+//     `write`, `writev` and `fallocate` went past it, a `pwrite` across it
+//     failed instead of stopping at it, a file already past it could not be
+//     cut down, and no `SIGXFSZ` came with any `EFBIG`.
 //
 // Every section states what Linux does and checks it, printing the numbers
 // whether it passes or fails. Each section runs in a child of its own, so a
@@ -135,6 +139,10 @@
 //              report: none for a process asleep, the 300 ms a child worked
 //              (a thread still working at `exit_group` included), and the
 //              kernel's part of a loop of syscalls on the CPU clocks.
+//   fsize      `RLIMIT_FSIZE`: a write across it stops at it and one at it is
+//              EFBIG with a SIGXFSZ, which kills by default, whatever the
+//              call; a new length past it is refused only when it grows the
+//              file; and a pipe is not a file.
 //
 // Build:  make                 (x86_64-linux-musl-gcc -O2 -static)
 // Run:    ./signal-probe [--only SECTION]
@@ -167,6 +175,7 @@
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/times.h>
+#include <sys/uio.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <ucontext.h>
@@ -1867,6 +1876,173 @@ static void sec_cputime(void) {
     check(d >= 60 && d <= 150, "CLOCK_PROCESS_CPUTIME_ID: 100 ms", "%ld ms", d);
 }
 
+// ------------------------------------------------------------------- fsize
+
+static volatile sig_atomic_t g_xfsz;
+
+static void on_xfsz(int sig) {
+    (void)sig;
+    g_xfsz++;
+}
+
+static void fsize_checks(void) {
+    // Linux holds every write to a regular file to RLIMIT_FSIZE
+    // (`generic_write_check_limits`): a write across the limit stops at it,
+    // and one that starts at or past it is EFBIG and a SIGXFSZ. A call that
+    // sets a length (`inode_newsize_ok`) is held to it only when it grows the
+    // file.
+    static char buf[8192];
+    memset(buf, 'x', sizeof buf);
+    const char *path = "/tmp/fz-file", *big = "/tmp/fz-big";
+    write_file(big, buf, sizeof buf, 0644);  // made before the limit
+    unlink(path);
+    int fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0644);
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_handler = on_xfsz;
+    sigaction(SIGXFSZ, &sa, NULL);
+    struct rlimit rl = {4096, 4096};
+    int r = setrlimit(RLIMIT_FSIZE, &rl);
+    check(fd >= 0 && r == 0, "a file, and RLIMIT_FSIZE 4096", "fd %d, %s", fd,
+          r ? strerror(errno) : "");
+
+    g_xfsz = 0;
+    ssize_t n = write(fd, buf, sizeof buf);
+    check(n == 4096 && g_xfsz == 0, "write across the limit stops at it",
+          "ret %zd, %d SIGXFSZ", n, (int)g_xfsz);
+    errno = 0;
+    n = write(fd, buf, 1);
+    int e = errno;
+    check(n == -1 && e == EFBIG && g_xfsz == 1, "write at the limit: EFBIG and SIGXFSZ",
+          "ret %zd errno %d, %d SIGXFSZ", n, e, (int)g_xfsz);
+    g_xfsz = 0;
+    n = write(fd, buf, 0);
+    check(n == 0 && g_xfsz == 0, "an empty write at the limit is 0", "ret %zd, %d SIGXFSZ", n,
+          (int)g_xfsz);
+    n = pwrite(fd, buf, 200, 4000);
+    check(n == 96 && g_xfsz == 0, "pwrite across the limit stops at it", "ret %zd, %d SIGXFSZ",
+          n, (int)g_xfsz);
+    errno = 0;
+    n = pwrite(fd, buf, 10, 5000);
+    e = errno;
+    check(n == -1 && e == EFBIG && g_xfsz == 1, "pwrite past the limit: EFBIG and SIGXFSZ",
+          "ret %zd errno %d, %d SIGXFSZ", n, e, (int)g_xfsz);
+    g_xfsz = 0;
+    struct iovec iov[2] = {{buf, 3000}, {buf, 3000}};
+    lseek(fd, 0, SEEK_SET);
+    n = writev(fd, iov, 2);
+    check(n == 4096 && g_xfsz == 0, "writev across the limit stops at it", "ret %zd, %d SIGXFSZ",
+          n, (int)g_xfsz);
+    int fb = open(big, O_RDONLY);
+    loff_t in = 0, out = 0;
+    n = syscall(SYS_copy_file_range, fb, &in, fd, &out, sizeof buf, 0);
+    check(n == 4096 && g_xfsz == 0, "copy_file_range across the limit stops at it",
+          "ret %zd errno %d, %d SIGXFSZ", n, n < 0 ? errno : 0, (int)g_xfsz);
+    close(fb);
+
+    // A new length: growing past the limit is refused, cutting down is not,
+    // even to a length still past it.
+    errno = 0;
+    r = ftruncate(fd, 8192);
+    e = errno;
+    check(r == -1 && e == EFBIG && g_xfsz == 1, "ftruncate past the limit: EFBIG and SIGXFSZ",
+          "ret %d errno %d, %d SIGXFSZ", r, e, (int)g_xfsz);
+    g_xfsz = 0;
+    fb = open(big, O_RDWR);
+    r = ftruncate(fb, 6000);
+    check(r == 0 && g_xfsz == 0, "a file past the limit can be cut down",
+          "ret %d errno %d, %d SIGXFSZ", r, r ? errno : 0, (int)g_xfsz);
+    errno = 0;
+    r = ftruncate(fb, 7000);
+    e = errno;
+    check(r == -1 && e == EFBIG && g_xfsz == 1, "but not grown", "ret %d errno %d, %d SIGXFSZ",
+          r, e, (int)g_xfsz);
+    close(fb);
+    g_xfsz = 0;
+    errno = 0;
+    r = fallocate(fd, 0, 0, 8192);
+    e = errno;
+    check(r == -1 && e == EFBIG && g_xfsz == 1, "fallocate past the limit: EFBIG and SIGXFSZ",
+          "ret %d errno %d, %d SIGXFSZ", r, e, (int)g_xfsz);
+    g_xfsz = 0;
+    r = fallocate(fd, FALLOC_FL_KEEP_SIZE, 0, 8192);
+    struct stat st;
+    fstat(fd, &st);
+    check(r == 0 && g_xfsz == 0 && st.st_size == 4096,
+          "fallocate past it with FALLOC_FL_KEEP_SIZE is not growing",
+          "ret %d errno %d, %d SIGXFSZ, size %lld", r, r ? errno : 0, (int)g_xfsz,
+          (long long)st.st_size);
+
+    // A pipe has no size to limit.
+    int p[2];
+    r = pipe(p);
+    n = r ? -1 : write(p[1], buf, sizeof buf);
+    check(n == (ssize_t)sizeof buf && g_xfsz == 0, "a pipe is not held to it",
+          "ret %zd, %d SIGXFSZ", n, (int)g_xfsz);
+    if (!r) {
+        close(p[0]);
+        close(p[1]);
+    }
+    close(fd);
+
+    // And SIGXFSZ kills a process that has not asked to be told: an
+    // O_APPEND write to the file now at the limit.
+    pid_t c = fork();
+    if (c == 0) {
+        struct rlimit no_core = {0, 0};
+        setrlimit(RLIMIT_CORE, &no_core);
+        signal(SIGXFSZ, SIG_DFL);
+        int a = open(path, O_WRONLY | O_APPEND);
+        ssize_t w = write(a, buf, 1);
+        _exit(w == -1 && errno == EFBIG ? 3 : 4);  // came back
+    }
+    int status = status_of(c);
+    check(WIFSIGNALED(status) && WTERMSIG(status) == SIGXFSZ, "unhandled, SIGXFSZ kills",
+          "status %#x", status);
+    unlink(path);
+    unlink(big);
+}
+
+static void sec_fsize(void) {
+    // The probe's own output may be a file already past the limit, which
+    // would answer the section's lines with EFBIG and SIGXFSZ: the checks
+    // run in a child that prints through a pipe, which has no limit.
+    int out[2];
+    if (pipe(out)) {
+        check(0, "a pipe for the output", "%s", strerror(errno));
+        return;
+    }
+    pid_t c = fork();
+    if (c == 0) {
+        close(out[0]);
+        dup2(out[1], STDOUT_FILENO);
+        close(out[1]);
+        g_fail = 0;
+        fsize_checks();
+        fflush(stdout);
+        _exit(g_fail > 100 ? 100 : g_fail);
+    }
+    close(out[1]);
+    char chunk[512];
+    ssize_t n;
+    while ((n = read(out[0], chunk, sizeof chunk)) != 0) {
+        if (n > 0) {
+            fwrite(chunk, 1, (size_t)n, stdout);
+        } else if (errno != EINTR) {
+            break;
+        }
+    }
+    close(out[0]);
+    fflush(stdout);
+    int st = status_of(c);
+    if (WIFEXITED(st)) {
+        g_fail += WEXITSTATUS(st);
+    } else {
+        check(0, "the checks' process", "died of signal %d",
+              WIFSIGNALED(st) ? WTERMSIG(st) : 0);
+    }
+}
+
 // ------------------------------------------------------------------- main
 
 static const struct {
@@ -1890,6 +2066,7 @@ static const struct {
     {"sched", "what a fork hands down to the scheduler", sec_sched},
     {"image", "the program is not mapped at the null page", sec_image},
     {"cputime", "what getrusage, times, wait4 and the CPU clocks count", sec_cputime},
+    {"fsize", "RLIMIT_FSIZE holds every write to a file, with SIGXFSZ", sec_fsize},
 };
 
 int main(int argc, char **argv) {

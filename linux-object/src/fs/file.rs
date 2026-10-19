@@ -12,6 +12,8 @@ use zircon_object::vm::{pages, VmObject, PAGE_SIZE};
 
 use super::FileLike;
 use crate::error::{LxError, LxResult};
+
+mod fsize;
 use crate::sync::{TurnGate, TurnGuard};
 
 bitflags::bitflags! {
@@ -942,11 +944,21 @@ impl FileInner {
         Ok(len)
     }
 
-    /// write to file at given offset
+    /// write to file at given offset, as far as the caller's `RLIMIT_FSIZE`
+    /// lets it (see `fsize`)
     fn write_at(&mut self, offset: u64, buf: &[u8]) -> LxResult<usize> {
+        self.write_at_limited(offset, buf, true)
+    }
+
+    fn write_at_limited(&mut self, offset: u64, buf: &[u8], limited: bool) -> LxResult<usize> {
         if !self.flags.writable() {
             return Err(LxError::EBADF);
         }
+        let buf = if limited {
+            &buf[..fsize::fsize_room(&self.inode, offset, buf.len())?]
+        } else {
+            buf
+        };
         // A memfd sealed against writes refuses them here, at the one
         // chokepoint every write(2)/pwrite(2)/writev(2) passes through
         // (fcntl(2), F_SEAL_WRITE / F_SEAL_FUTURE_WRITE).
@@ -1125,6 +1137,14 @@ impl File {
     pub fn sync_data(&self) -> LxResult {
         self.inner.read().inode.sync_data()?;
         Ok(())
+    }
+
+    /// Write `buf` at `offset` past the caller's `RLIMIT_FSIZE`: for what
+    /// the kernel writes that is not a write, `fallocate`'s zeroing, which
+    /// Linux checks against the limit only when it grows the file (and then
+    /// before it writes anything).
+    pub fn fill_at(&self, offset: u64, buf: &[u8]) -> LxResult<usize> {
+        self.inner.write().write_at_limited(offset, buf, false)
     }
 
     /// get metadata of file
