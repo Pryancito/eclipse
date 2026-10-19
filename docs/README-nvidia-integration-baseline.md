@@ -132,7 +132,10 @@ de verdad y no publica mmap CPU. GART y `GART|VRAM` siguen en sysmem
 ## 2c) El userspace de NVIDIA (`nvidia-smi`, NVML, `libcuda`)
 
 Los clientes de verdad de `/dev/nvidiactl` (la escotilla `nvidia.nvidiactl`
-de la cmdline) son los binarios de NVIDIA. `cargo image --arch x86_64` los
+de la cmdline) son los binarios de NVIDIA. `nvidia.cuda` enciende de una vez
+todas las escotillas que necesita CUDA: hoy `nvidia.nvidiactl` y
+`nvidia.uvm` (`/dev/nvidia-uvm`). Cada una sigue valiendo por su nombre, y
+su `=0` la deja apagada aunque esté `nvidia.cuda`. `cargo image --arch x86_64` los
 mete en la imagen sin pedirlos; para dejarlos fuera:
 
 ```sh
@@ -166,7 +169,8 @@ salida a `archive.ubuntu.com` basta con dejarlos ahí a mano; si no están, la
 construcción avisa y sigue sin ellos. Para desempaquetar hace falta `tar` de
 GNU con `zstd`, y `sha256sum`.
 
-Probarlo, arrancando con `nvidia.nvidiactl`:
+Probarlo, arrancando con `nvidia.cuda` (o solo `nvidia.nvidiactl` para
+`nvidia-smi`):
 
 ```sh
 nvidia-smi
