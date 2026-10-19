@@ -911,6 +911,108 @@ NV_STATUS osObjectEventNotification
     return NV_OK;
 }
 
+/*
+ * Client tokens.
+ *
+ * os.c's four security-token functions, transliterated. When a user-mode
+ * caller allocates a root client, rmclientConstruct caches two tokens on it
+ * (PDB_PROP_SYS_VALIDATE_CLIENT_HANDLE, on by default): a security token,
+ * the euid and pid that osValidateClientTokens later checks callers
+ * against, and a uid token that _registerUserInfo files the client's user
+ * under. The RM's own kernel clients skip both, and they were the only
+ * clients until /dev/nvidiactl, so the stubs that stood in os_boundary.rs
+ * answered NULL and nothing noticed. With /dev/nvidiactl, _registerUserInfo
+ * refused that NULL uid token with NV_ERR_INVALID_ARGUMENT, every root
+ * client a user-mode caller asked for failed, admin or not, and NVML
+ * reported "Failed to initialize NVML: Unknown Error".
+ *
+ * The RM frees these tokens with portMemFree, so they are allocated here
+ * with portMemAllocNonPaged and not on the Rust side.
+ *
+ * os_get_euid and os_get_current_process answer 0 for every caller for now,
+ * so every client carries the same token and osValidateClientTokens never
+ * refuses one. What keeps one open /dev/nvidiactl off another's clients is
+ * the OS-info check rmclientValidate makes instead, under
+ * PDB_PROP_SYS_VALIDATE_CLIENT_HANDLE_STRICT (also on by default), against
+ * the clientOSInfo every call here carries.
+ */
+typedef struct
+{
+    NvU32 euid;
+    NvU32 pid;
+} TOKEN_USER, *PTOKEN_USER;
+
+PSECURITY_TOKEN osGetSecurityToken(void)
+{
+    TOKEN_USER *pTokenUser;
+
+    pTokenUser = portMemAllocNonPaged(sizeof(TOKEN_USER));
+    if (pTokenUser == NULL)
+    {
+        return NULL;
+    }
+    if (os_get_euid(&pTokenUser->euid) != NV_OK)
+    {
+        portMemFree(pTokenUser);
+        return NULL;
+    }
+
+    pTokenUser->pid = os_get_current_process();
+
+    return (PSECURITY_TOKEN)pTokenUser;
+}
+
+PUID_TOKEN osGetCurrentUidToken(void)
+{
+    NvU32 *pUidToken;
+
+    pUidToken = portMemAllocNonPaged(sizeof(NvU32));
+    if (pUidToken == NULL)
+    {
+        return NULL;
+    }
+    if (os_get_euid(pUidToken) != NV_OK)
+    {
+        portMemFree(pUidToken);
+        return NULL;
+    }
+
+    return (PUID_TOKEN)pUidToken;
+}
+
+/* NV_OK when either the euid or the pid matches, as on Linux. */
+NV_STATUS osValidateClientTokens(
+    PSECURITY_TOKEN pClientSecurityToken,
+    PSECURITY_TOKEN pCurrentSecurityToken)
+{
+    PTOKEN_USER pClientTokenUser = (PTOKEN_USER)pClientSecurityToken;
+    PTOKEN_USER pCurrentTokenUser = (PTOKEN_USER)pCurrentSecurityToken;
+
+    if ((pClientTokenUser == NULL) || (pCurrentTokenUser == NULL))
+    {
+        return NV_ERR_INVALID_POINTER;
+    }
+
+    if ((pClientTokenUser->euid != pCurrentTokenUser->euid) &&
+        (pClientTokenUser->pid != pCurrentTokenUser->pid))
+    {
+        return NV_ERR_INVALID_CLIENT;
+    }
+
+    return NV_OK;
+}
+
+NvBool osUidTokensEqual(PUID_TOKEN pUidToken1, PUID_TOKEN pUidToken2)
+{
+    NvU32 *pTokenUser1 = (NvU32 *)pUidToken1;
+    NvU32 *pTokenUser2 = (NvU32 *)pUidToken2;
+
+    NV_ASSERT_OR_RETURN((pTokenUser1 != NULL), NV_FALSE);
+    NV_ASSERT_OR_RETURN((pTokenUser2 != NULL), NV_FALSE);
+
+    return (*pTokenUser1 == *pTokenUser2) ? NV_TRUE : NV_FALSE;
+}
+
 /* The security info of a user-mode client's call, as RmIoctl builds it. */
 static API_SECURITY_INFO _eclipse_rm_frontend_sec_info(void *pOsInfo, NvU32 bAdmin)
 {

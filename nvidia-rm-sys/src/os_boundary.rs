@@ -1576,10 +1576,9 @@ pub extern "C" fn osGetCurrentProcessName(pName: *mut c_char, maxLength: NvU32) 
     crate::os_interface::write_process_name(pName, maxLength);
 }
 
-#[no_mangle]
-pub extern "C" fn osGetCurrentUidToken() -> *mut c_void {
-    core::ptr::null_mut()
-}
+// osGetCurrentUidToken: real impl in vendor/eclipse_rm_frontend.c. This stub
+// answered NULL, which made the RM refuse every root client a user-mode
+// caller allocated.
 
 #[no_mangle]
 pub extern "C" fn osGetDriverBlock(arg0: *mut c_void, arg1: *mut c_void) -> NV_STATUS {
@@ -1790,10 +1789,7 @@ pub extern "C" fn osGetRandomBytes(pBytes: *mut NvU8, numBytes: NvU16) -> NV_STA
     crate::os_interface::os_get_random_bytes(pBytes, numBytes)
 }
 
-#[no_mangle]
-pub extern "C" fn osGetSecurityToken() -> *mut c_void {
-    core::ptr::null_mut()
-}
+// osGetSecurityToken: real impl in vendor/eclipse_rm_frontend.c.
 
 /// Every power-of-two sysmem page size this OS supports, as a bitmask.
 ///
@@ -2707,12 +2703,7 @@ pub extern "C" fn osTestPcieExtendedConfigAccess(handle: *mut c_void, offset: Nv
     NV_FALSE
 }
 
-#[no_mangle]
-pub extern "C" fn osUidTokensEqual(arg1: *mut c_void, arg2: *mut c_void) -> NvBool {
-    let _ = arg1;
-    let _ = arg2;
-    NV_FALSE
-}
+// osUidTokensEqual: real impl in vendor/eclipse_rm_frontend.c.
 
 #[no_mangle]
 pub extern "C" fn osUnlockMem(arg0: *mut c_void) -> NV_STATUS {
@@ -2762,12 +2753,7 @@ pub extern "C" fn osUnrefGpuAccessNeeded(pOsGpuInfo: *mut c_void) {
 
 // osUserHandleToKernelPtr: real impl in frontend/events.rs.
 
-#[no_mangle]
-pub extern "C" fn osValidateClientTokens(arg1: *mut c_void, arg2: *mut c_void) -> NV_STATUS {
-    let _ = arg1;
-    let _ = arg2;
-    NV_ERR_NOT_SUPPORTED
-}
+// osValidateClientTokens: real impl in vendor/eclipse_rm_frontend.c.
 
 #[no_mangle]
 pub extern "C" fn osWaitInterruptible(pWq: *mut c_void) {
